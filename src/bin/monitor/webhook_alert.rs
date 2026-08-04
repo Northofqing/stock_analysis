@@ -3,6 +3,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebhookDelivery {
     Disabled,
+    TestIsolated,
     Delivered,
 }
 
@@ -16,7 +17,15 @@ fn normalize_webhook_url(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn webhook_delivery_enabled_for_env(env: stock_analysis::risk::env_guard::TradingEnv) -> bool {
+    env == stock_analysis::risk::env_guard::TradingEnv::Prod
+}
+
 pub async fn send_webhook_alert(event: &str, message: &str) -> Result<WebhookDelivery, String> {
+    if !webhook_delivery_enabled_for_env(stock_analysis::risk::env_guard::current_env()) {
+        log::info!("[webhook][BR-051][BR-196] test environment notification isolated: {event}");
+        return Ok(WebhookDelivery::TestIsolated);
+    }
     let Some(url) = configured_webhook_url() else {
         log::warn!("[webhook] ALERT_WEBHOOK_URL 未配置, 告警渠道已禁用: {event}");
         return Ok(WebhookDelivery::Disabled);
@@ -67,5 +76,13 @@ mod tests {
             normalize_webhook_url(Some(" https://example.invalid/hook ".to_string())),
             Some("https://example.invalid/hook".to_string())
         );
+    }
+
+    #[test]
+    fn test_environment_disables_webhook_before_url_resolution() {
+        use stock_analysis::risk::env_guard::TradingEnv;
+
+        assert!(!webhook_delivery_enabled_for_env(TradingEnv::Test));
+        assert!(webhook_delivery_enabled_for_env(TradingEnv::Prod));
     }
 }

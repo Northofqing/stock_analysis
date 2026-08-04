@@ -195,16 +195,6 @@ impl Default for LimitStatusCalculator {
     }
 }
 
-/// 修复 P2.2: 判断某股在指定交易日是否处于"注册制新股上市前 5 个交易日"
-/// 这 5 天内 创业板/科创板/北交所新股 不设涨跌幅
-///
-/// **v11-P0-3 commit 1 修订**: 原实现用本地空 HashMap (`IPO_WHITELIST`), 永远 false.
-/// 现在改为调用 `data_quality::is_within_5_days_of_ipo`, 数据来自东方财富 f26 HTTP (`ipo_date::fetch_ipo_date`).
-/// `IPO_WHITELIST` 已废弃 (删除).
-pub fn is_ipo_first_5_days(code: &str, trade_date: chrono::NaiveDate) -> bool {
-    crate::monitor::data_quality::is_within_5_days_of_ipo(code, trade_date)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,14 +257,6 @@ mod tests {
         assert_eq!(detect_board("830799"), Board::Bj);
         assert_eq!(detect_board("400001"), Board::Bj);
         assert_eq!(detect_board("920001"), Board::Bj);
-    }
-
-    #[test]
-    fn is_ipo_first_5_days_default_false() {
-        // 白名单为空, 默认 false
-        let d = chrono::NaiveDate::from_ymd_opt(2026, 6, 27).unwrap();
-        assert!(!is_ipo_first_5_days("300750", d));
-        assert!(!is_ipo_first_5_days("688981", d));
     }
 
     #[test]

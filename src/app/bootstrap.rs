@@ -1,3 +1,4 @@
+//! Registered business rules: BR-162, BR-213.
 //! 启动前处理：配置校验、自选股列表装配（含宏观 AI 推荐 / 龙虎榜 / 涨停 / 持仓）。
 
 use anyhow::Result;
@@ -114,20 +115,6 @@ pub async fn build_stock_list(args: &Args) -> Result<(Vec<String>, HashSet<Strin
         String::new()
     };
 
-    // 2.5 板块共振引擎（涨幅榜 ∩ 主力净流入榜 ∩ 宏观新闻）
-    let sector_resonance_enabled = if args.deep_analysis {
-        false
-    } else {
-        std::env::var("SECTOR_RESONANCE_ENABLED")
-            .map(|v| v.to_lowercase() != "false")
-            .unwrap_or(true)
-    };
-    if sector_resonance_enabled {
-        append_sector_resonance(&mut stock_codes, &macro_news_context);
-    } else {
-        info!("⚙️ SECTOR_RESONANCE_ENABLED=false：跳过板块共振追加");
-    }
-
     // 3. 龙虎榜 Top 10（受 LHB_APPEND_ENABLED 控制，默认开启）
     let lhb_append_enabled = if args.deep_analysis {
         false
@@ -151,7 +138,26 @@ pub async fn build_stock_list(args: &Args) -> Result<(Vec<String>, HashSet<Strin
             .unwrap_or(true)
     };
     let limit_up_codes = if limit_up_append_enabled {
-        append_limit_up(&mut stock_codes)
+        let observed_at = chrono::Local::now().naive_local();
+        let trading_date = match stock_analysis::calendar::current_session() {
+            stock_analysis::calendar::MarketSession::Auction
+            | stock_analysis::calendar::MarketSession::Morning
+            | stock_analysis::calendar::MarketSession::LunchBreak
+            | stock_analysis::calendar::MarketSession::Afternoon
+            | stock_analysis::calendar::MarketSession::AfterHours => observed_at.date(),
+            stock_analysis::calendar::MarketSession::Closed => {
+                stock_analysis::calendar::latest_completed_trading_day_at(observed_at)
+            }
+        };
+        let mut owned_codes = std::mem::take(&mut stock_codes);
+        let (resolved_codes, limit_up_codes) = tokio::task::spawn_blocking(move || {
+            let limit_up_codes = append_limit_up(&mut owned_codes, trading_date);
+            (owned_codes, limit_up_codes)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("BR-213 涨停池 blocking worker 失败: {error}"))?;
+        stock_codes = resolved_codes;
+        limit_up_codes
     } else {
         info!("⚙️ LIMIT_UP_APPEND_ENABLED=false：跳过当日涨停追加");
         HashSet::new()
@@ -168,7 +174,7 @@ pub async fn build_stock_list(args: &Args) -> Result<(Vec<String>, HashSet<Strin
     }
 
     // 6. 过滤退市股票（默认开启，可通过 STOCK_FILTER_DELISTED=false 关闭）
-    filter_delisted_stocks(&mut stock_codes);
+    filter_delisted_stocks(&mut stock_codes).await?;
 
     if stock_codes.is_empty() {
         info!("⚠️ 未配置自选股列表且宏观AI未推荐股票，将仅执行大盘复盘");
@@ -177,47 +183,110 @@ pub async fn build_stock_list(args: &Args) -> Result<(Vec<String>, HashSet<Strin
     Ok((stock_codes, limit_up_codes, macro_news_context))
 }
 
-fn filter_delisted_stocks(stock_codes: &mut Vec<String>) {
+#[derive(Debug)]
+struct DelistedFilterProjection {
+    retained_codes: Vec<String>,
+    removed: Vec<(String, String)>,
+    evidence: stock_analysis::data_gateway::BatchEvidence,
+}
+
+fn project_delisted_filter(
+    requested_codes: &[String],
+    batch: stock_analysis::data_gateway::GatewayBatch<
+        stock_analysis::data_gateway::market_capabilities::MarketSecurityIdentity,
+    >,
+) -> std::result::Result<DelistedFilterProjection, String> {
+    use stock_analysis::data_gateway::GatewayBatch;
+
+    let (records, evidence) = match batch {
+        GatewayBatch::Available { records, evidence } if !records.is_empty() => (records, evidence),
+        GatewayBatch::Available { evidence, .. } | GatewayBatch::VerifiedEmpty(evidence) => {
+            return Err(format!(
+                "证券身份批次没有可用于退市判定的记录: source={} batch_id={}",
+                evidence.source, evidence.batch_id
+            ));
+        }
+    };
+    if records.len() != requested_codes.len() {
+        return Err(format!(
+            "证券身份批次不完整: requested={} actual={} source={} batch_id={}",
+            requested_codes.len(),
+            records.len(),
+            evidence.source,
+            evidence.batch_id
+        ));
+    }
+
+    let mut retained_codes = Vec::with_capacity(records.len());
+    let mut removed = Vec::new();
+    for (requested_code, metadata) in requested_codes.iter().zip(records) {
+        if metadata.code != *requested_code
+            || metadata.provider != evidence.provider
+            || metadata.batch_id != evidence.batch_id
+        {
+            return Err(format!(
+                "证券身份/证据不匹配: requested={} actual={} source={} batch_id={}",
+                requested_code, metadata.code, evidence.source, evidence.batch_id
+            ));
+        }
+        if metadata.name.trim().is_empty() {
+            return Err(format!(
+                "证券身份名称缺失: code={} source={} batch_id={}",
+                requested_code, evidence.source, evidence.batch_id
+            ));
+        }
+        if is_delisted_name(&metadata.name) {
+            removed.push((requested_code.clone(), metadata.name));
+        } else {
+            retained_codes.push(requested_code.clone());
+        }
+    }
+
+    Ok(DelistedFilterProjection {
+        retained_codes,
+        removed,
+        evidence,
+    })
+}
+
+async fn filter_delisted_stocks(stock_codes: &mut Vec<String>) -> Result<()> {
     let filter_enabled = std::env::var("STOCK_FILTER_DELISTED")
         .map(|v| v.to_lowercase() != "false")
         .unwrap_or(true);
     if !filter_enabled {
         info!("⚙️ STOCK_FILTER_DELISTED=false：跳过退市股票过滤");
-        return;
+        return Ok(());
     }
-
-    use stock_analysis::data_provider::DataFetcherManager;
-
-    let fetcher = match DataFetcherManager::new() {
-        Ok(f) => f,
-        Err(e) => {
-            info!("⚠️ 初始化数据获取器失败，跳过退市过滤: {}", e);
-            return;
-        }
-    };
+    if stock_codes.is_empty() {
+        return Ok(());
+    }
 
     let before = stock_codes.len();
-    let mut removed: Vec<(String, String)> = Vec::new();
-    stock_codes.retain(|code| match fetcher.get_stock_name(code) {
-        Some(name) if is_delisted_name(&name) => {
-            removed.push((code.clone(), name));
-            false
-        }
-        _ => true,
-    });
+    let batch = stock_analysis::data_gateway::MarketCapabilitiesGateway::new()
+        .security_identities(stock_codes)
+        .await
+        .map_err(|error| anyhow::anyhow!("退市过滤证券身份数据不可用: {error}"))?;
+    let projection = project_delisted_filter(stock_codes, batch).map_err(anyhow::Error::msg)?;
+    info!(
+        "[BR-164] 退市过滤采用统一证券身份批次: provider={:?} source={} batch_id={} records={}",
+        projection.evidence.provider,
+        projection.evidence.source,
+        projection.evidence.batch_id,
+        before
+    );
 
-    if removed.is_empty() {
-        return;
-    }
-
-    for (code, name) in &removed {
+    for (code, name) in &projection.removed {
         info!("🚫 过滤退市票: {}({})", name, code);
     }
-    info!(
-        "🚫 退市过滤完成：移除 {} 只，剩余 {} 只",
-        before - stock_codes.len(),
-        stock_codes.len()
-    );
+    *stock_codes = projection.retained_codes;
+    if !projection.removed.is_empty() {
+        info!(
+            "🚫 退市过滤完成：移除 {} 只，剩余 {} 只",
+            before - stock_codes.len(),
+            stock_codes.len()
+        );
+    }
+    Ok(())
 }
 
 fn is_delisted_name(name: &str) -> bool {
@@ -226,45 +295,57 @@ fn is_delisted_name(name: &str) -> bool {
 }
 
 async fn append_lhb_top10(stock_codes: &mut Vec<String>) -> Result<()> {
-    use stock_analysis::lhb_analyzer::LhbDataFetcher;
+    use stock_analysis::data_gateway::{DragonTigerGateway, GatewayBatch};
 
-    let fetcher = LhbDataFetcher::new()?;
-    match fetcher.get_today_lhb().await {
-        Ok(mut records) if !records.is_empty() => {
-            records.sort_by(|a, b| {
-                b.net_amount
-                    .partial_cmp(&a.net_amount)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let top_n = 10;
+    const TOP_N: usize = 10;
+    let trading_date = stock_analysis::calendar::latest_completed_trading_day_at(
+        chrono::Local::now().naive_local(),
+    );
+    let batch = DragonTigerGateway::new()
+        .market_review(trading_date, TOP_N as u32, TOP_N)
+        .await?;
+    match batch {
+        GatewayBatch::Available { records, evidence } => {
+            info!(
+                "🐉 龙虎榜统一批次: date={} provider={:?} source={} batch_id={} records={}",
+                trading_date,
+                evidence.provider,
+                evidence.source,
+                evidence.batch_id,
+                records.len()
+            );
             let before = stock_codes.len();
-            for record in records.iter().take(top_n) {
+            for record in records {
                 if record.code.starts_with("92") {
                     continue; // 过滤北交所
                 }
                 if !stock_codes.contains(&record.code) {
                     info!(
-                        "🐉 龙虎榜追加: {}({}) 净买入{:.0}万",
-                        record.name,
+                        "🐉 龙虎榜追加: {} 排名净买入{:.0}万",
                         record.code,
-                        record.net_amount / 10000.0
+                        record.ranking_net_amount_yuan / 10_000.0
                     );
-                    stock_codes.push(record.code.clone());
+                    stock_codes.push(record.code);
                 }
             }
             info!(
                 "🐉 龙虎榜Top{} 新增追加 {} 只（去重后）",
-                top_n,
+                TOP_N,
                 stock_codes.len() - before
             );
         }
-        Ok(_) => info!("📋 今日暂无龙虎榜数据"),
-        Err(e) => info!("⚠️ 获取龙虎榜数据失败（不影响正常分析）: {}", e),
+        GatewayBatch::VerifiedEmpty(evidence) => info!(
+            "📋 {} 龙虎榜为来源确认空批次: provider={:?} source={} batch_id={}",
+            trading_date, evidence.provider, evidence.source, evidence.batch_id
+        ),
     }
     Ok(())
 }
 
-fn append_limit_up(stock_codes: &mut Vec<String>) -> HashSet<String> {
+fn append_limit_up(
+    stock_codes: &mut Vec<String>,
+    trading_date: chrono::NaiveDate,
+) -> HashSet<String> {
     use stock_analysis::market_analyzer::MarketAnalyzer;
 
     let mut set = HashSet::new();
@@ -275,7 +356,7 @@ fn append_limit_up(stock_codes: &mut Vec<String>) -> HashSet<String> {
             return set;
         }
     };
-    match analyzer.get_limit_up_stocks() {
+    match analyzer.get_limit_up_stocks(trading_date) {
         Ok(stocks) if !stocks.is_empty() => {
             let before = stock_codes.len();
             for stock in &stocks {
@@ -298,83 +379,6 @@ fn append_limit_up(stock_codes: &mut Vec<String>) -> HashSet<String> {
         Err(e) => info!("⚠️ 获取涨停股票失败（不影响正常分析）: {}", e),
     }
     set
-}
-
-/// 板块共振追加：基于东方财富概念板块榜（涨幅 + 主力净流入）与宏观新闻共振，
-/// 找出真正在涨、有真金白银且新闻匹配的板块，注入其龙头股。
-fn append_sector_resonance(stock_codes: &mut Vec<String>, macro_news: &str) {
-    use stock_analysis::market_analyzer::sector_monitor;
-
-    let rank_top = std::env::var("SECTOR_RANK_TOP")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(20usize);
-    let max_sectors = std::env::var("SECTOR_RESONANCE_MAX")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(5usize);
-    let leaders_per_sector = std::env::var("SECTOR_LEADERS_PER")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(5usize);
-
-    match sector_monitor::detect_resonance_sectors(
-        macro_news,
-        rank_top,
-        max_sectors,
-        leaders_per_sector,
-    ) {
-        Ok(sectors) if !sectors.is_empty() => {
-            let leader_codes = sector_monitor::collect_leader_codes(&sectors);
-            let before = stock_codes.len();
-            for code in &leader_codes {
-                if !stock_codes.contains(code) {
-                    stock_codes.push(code.clone());
-                }
-            }
-            info!(
-                "🎯 板块共振命中 {} 个板块，候选龙头 {} 只，新增追加 {} 只（去重后）",
-                sectors.len(),
-                leader_codes.len(),
-                stock_codes.len() - before
-            );
-            for s in &sectors {
-                let leaders_desc = s
-                    .leaders
-                    .iter()
-                    .map(|l| format!("{}({} {:+.1}%)", l.name, l.code, l.change_pct))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                info!(
-                    "   ↳ {}({}) [{:?}] 涨幅{:.2}% 主力{:.2}亿 加速{:+.2}pp 量比{:.2} 点火涨停{}只 龙头[{}]",
-                    s.board.name,
-                    s.board.code,
-                    s.hit_dims,
-                    s.board.change_pct,
-                    s.board.main_inflow / 1e8,
-                    s.board.inflow_accel(),
-                    s.board.vol_ratio,
-                    s.ignition.limit_up_count,
-                    leaders_desc
-                );
-            }
-        }
-        Ok(_) => info!("📋 今日板块共振未命中（涨幅榜与资金榜交集为空）"),
-        Err(e) => info!("⚠️ 板块共振检测失败（不影响正常分析）: {:#}", e),
-    }
-
-    // 2.6 量价反向发现（BR-021）：板块量价异动但无新闻归因 → 提示人工核查
-    // 兜底新闻源永远不全（如财经快讯漏掉"长十乙火箭回收"）：任何值钱的题材最终反映在成交量上。
-    match sector_monitor::detect_unexplained_moves(macro_news, rank_top) {
-        Ok(moves) if !moves.is_empty() => {
-            info!(
-                "🛰️ 反向发现：{} 个板块量价异动但无新闻归因（详见 [反向发现] warn 日志），建议人工核查",
-                moves.len()
-            );
-        }
-        Ok(_) => info!("📋 反向发现：无异动无归因板块"),
-        Err(e) => info!("⚠️ 反向发现失败（不影响正常分析）: {:#}", e),
-    }
 }
 
 fn append_open_positions(stock_codes: &mut Vec<String>) {
@@ -524,6 +528,34 @@ fn extract_stock_codes(rec_text: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use clap::Parser;
+    use magic_market_core::ProviderId;
+    use stock_analysis::data_gateway::market_capabilities::MarketSecurityIdentity;
+    use stock_analysis::data_gateway::{BatchEvidence, GatewayBatch};
+
+    fn metadata_evidence() -> BatchEvidence {
+        BatchEvidence {
+            provider: ProviderId::Tdx,
+            source: "TEST_CODE_magic_tdx_metadata".to_string(),
+            source_at: Some("2026-07-26T01:00:00Z".to_string()),
+            observed_at: "2026-07-26T01:00:01Z".to_string(),
+            batch_id: "TEST_CODE_metadata_batch".to_string(),
+        }
+    }
+
+    fn security_metadata(code: &str, name: &str) -> MarketSecurityIdentity {
+        let source_at = chrono::DateTime::parse_from_rfc3339("2026-07-26T01:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        MarketSecurityIdentity {
+            code: code.to_string(),
+            name: name.to_string(),
+            is_st: false,
+            source_at,
+            observed_at: source_at + chrono::Duration::seconds(1),
+            provider: ProviderId::Tdx,
+            batch_id: "TEST_CODE_metadata_batch".to_string(),
+        }
+    }
 
     #[test]
     fn stock_code_extraction_prefers_registered_line_then_falls_back_and_deduplicates() {
@@ -546,6 +578,53 @@ mod tests {
         assert!(is_delisted_name("退测试"));
         assert!(is_delisted_name("测试终止上市"));
         assert!(!is_delisted_name("普通测试股"));
+    }
+
+    #[test]
+    fn br164_delisted_filter_uses_complete_available_metadata_and_retains_evidence() {
+        let requested = vec![
+            "TEST_CODE_600001".to_string(),
+            "TEST_CODE_600002".to_string(),
+        ];
+        let projection = project_delisted_filter(
+            &requested,
+            GatewayBatch::Available {
+                records: vec![
+                    security_metadata("TEST_CODE_600001", "普通测试股"),
+                    security_metadata("TEST_CODE_600002", "退市测试"),
+                ],
+                evidence: metadata_evidence(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            projection.retained_codes,
+            vec!["TEST_CODE_600001".to_string()]
+        );
+        assert_eq!(
+            projection.removed,
+            vec![("TEST_CODE_600002".to_string(), "退市测试".to_string())]
+        );
+        assert_eq!(projection.evidence.batch_id, "TEST_CODE_metadata_batch");
+    }
+
+    #[test]
+    fn br164_delisted_filter_rejects_verified_empty_or_partial_metadata() {
+        let requested = vec!["TEST_CODE_600001".to_string()];
+        assert!(project_delisted_filter(
+            &requested,
+            GatewayBatch::<MarketSecurityIdentity>::VerifiedEmpty(metadata_evidence())
+        )
+        .is_err());
+        assert!(project_delisted_filter(
+            &requested,
+            GatewayBatch::Available {
+                records: Vec::new(),
+                evidence: metadata_evidence(),
+            },
+        )
+        .is_err());
     }
 
     #[tokio::test]

@@ -11,7 +11,9 @@
 #   STOCK_DB=data/stock_analysis.db STOCK_LIST=000001,600519 bash tools/one_shot/backfill_daily.sh
 #   STOCK_DB=data/stock_analysis.db bash tools/one_shot/backfill_daily.sh 000001,600519
 #
-# 数据源: Magic TDX (主) → GtimgProvider (备) → HttpProvider (备)
+# 数据边界: HistoricalBarsGateway
+# 固定路由: Magic TDX → Magic Tencent → Magic Sina → Magic Baidu
+# 任一来源只有完整、身份一致、来源时间有效的批次才能获胜。
 # 写表: stock_daily (UPSERT, ON CONFLICT DO UPDATE)
 #
 # 与 backfill_predictions.sh 风格保持一致 (一次性脚本, 不入 monitor 主循环).

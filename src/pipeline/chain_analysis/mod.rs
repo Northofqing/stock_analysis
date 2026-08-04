@@ -20,6 +20,7 @@ use fetchers::{
 };
 
 use crate::analyzer::{AgentMode, GeminiAnalyzer};
+use crate::data_gateway::{BatchEvidence, GatewayBatch};
 use crate::database::DatabaseManager;
 use crate::market_data::TopStock;
 
@@ -215,7 +216,8 @@ pub struct ChainCluster {
     pub stocks: Vec<TopStock>,
     /// 簇内带"昨日涨停/昨日连板"标签的家数（主线生命周期参考）
     pub continuation_count: usize,
-    /// 该主线最近 10 天内上榜天数（含今日，来自 chain_daily 表）
+    /// 该主线最近 10 个自然日内出现的天数（含业务日期，来自 chain_daily 表）。
+    /// 兼容字段名，不表示连续 streak；BR-160 切换时随旧表删除。
     pub streak_days: i64,
     /// 同概念板块内未涨停的补涨候选（今日涨幅适中，供 LLM 筛选）
     pub candidates: Vec<TopStock>,
@@ -225,12 +227,162 @@ pub struct ChainCluster {
     pub scenario: Option<ScenarioAnalysis>,
 }
 
+#[derive(Debug, Clone)]
+enum CandidateSupplementStatus {
+    Available {
+        board_evidence: Vec<BatchEvidence>,
+        candidate_evidence: BatchEvidence,
+    },
+    VerifiedEmpty {
+        board_evidence: Vec<BatchEvidence>,
+        candidate_evidence: BatchEvidence,
+    },
+    Unavailable {
+        reason: String,
+        board_evidence: Vec<BatchEvidence>,
+    },
+    NotRequested(String),
+}
+
+type CandidateSupplementStatuses = HashMap<String, CandidateSupplementStatus>;
+
+fn commit_laggard_candidate_batch(
+    cluster: &mut ChainCluster,
+    batch: Result<GatewayBatch<TopStock>, String>,
+    board_evidence: &[BatchEvidence],
+) -> CandidateSupplementStatus {
+    match batch {
+        Ok(GatewayBatch::Available { records, evidence }) if !records.is_empty() => {
+            cluster.candidates = records;
+            CandidateSupplementStatus::Available {
+                board_evidence: board_evidence.to_vec(),
+                candidate_evidence: evidence,
+            }
+        }
+        Ok(GatewayBatch::Available { evidence, .. }) => {
+            cluster.candidates.clear();
+            CandidateSupplementStatus::Unavailable {
+                reason: format!(
+                    "统一 Gateway 返回 Available 但记录为空: provider={:?} source={} batch_id={}",
+                    evidence.provider, evidence.source, evidence.batch_id
+                ),
+                board_evidence: board_evidence.to_vec(),
+            }
+        }
+        Ok(GatewayBatch::VerifiedEmpty(evidence)) => {
+            cluster.candidates.clear();
+            CandidateSupplementStatus::VerifiedEmpty {
+                board_evidence: board_evidence.to_vec(),
+                candidate_evidence: evidence,
+            }
+        }
+        Err(reason) => {
+            cluster.candidates.clear();
+            CandidateSupplementStatus::Unavailable {
+                reason,
+                board_evidence: board_evidence.to_vec(),
+            }
+        }
+    }
+}
+
+fn batch_evidence_label(evidence: &BatchEvidence) -> String {
+    format!(
+        "provider={:?} source={} source_at={} observed_at={} batch_id={}",
+        evidence.provider,
+        evidence.source,
+        evidence.source_at.as_deref().unwrap_or("absent"),
+        evidence.observed_at,
+        evidence.batch_id
+    )
+}
+
+fn board_evidence_label(evidence: &[BatchEvidence]) -> String {
+    if evidence.is_empty() {
+        return "board_evidence=unavailable".to_string();
+    }
+    evidence
+        .iter()
+        .map(batch_evidence_label)
+        .collect::<Vec<_>>()
+        .join("；")
+}
+
+fn render_candidate_supplement_context(
+    cluster: &ChainCluster,
+    status: Option<&CandidateSupplementStatus>,
+) -> String {
+    match status {
+        Some(CandidateSupplementStatus::Available {
+            board_evidence,
+            candidate_evidence,
+        }) => {
+            let mut block = format!(
+                "板块目录证据：{}\n候选批次证据：{}\n\n| 代码 | 名称 | 今日涨幅% |\n|---|---|---|\n",
+                board_evidence_label(board_evidence),
+                batch_evidence_label(candidate_evidence)
+            );
+            for stock in &cluster.candidates {
+                block.push_str(&format!(
+                    "| {} | {} | {:.2} |\n",
+                    stock.code, stock.name, stock.change_pct
+                ));
+            }
+            block
+        }
+        Some(CandidateSupplementStatus::VerifiedEmpty {
+            board_evidence,
+            candidate_evidence,
+        }) => format!(
+            "（补涨候选完整批次已验证为空；板块目录证据：{}；候选批次证据：{}）",
+            board_evidence_label(board_evidence),
+            batch_evidence_label(candidate_evidence)
+        ),
+        Some(CandidateSupplementStatus::Unavailable {
+            reason,
+            board_evidence,
+        }) => {
+            format!(
+                "（补涨候选数据不可用：{}；板块目录证据：{}；不得解释为已验证为空）",
+                reason.replace(['\n', '\r'], " "),
+                board_evidence_label(board_evidence)
+            )
+        }
+        Some(CandidateSupplementStatus::NotRequested(reason)) => format!(
+            "（补涨候选未请求：{}；不得解释为已验证为空）",
+            reason.replace(['\n', '\r'], " ")
+        ),
+        None => "（补涨候选状态缺失；数据不可用，不得解释为已验证为空）".to_string(),
+    }
+}
+
+fn candidate_supplement_summary(
+    status: Option<&CandidateSupplementStatus>,
+    model_candidates: String,
+) -> String {
+    match status {
+        Some(CandidateSupplementStatus::Available { .. }) => {
+            if model_candidates == "-" || model_candidates == "无" {
+                "-".to_string()
+            } else {
+                model_candidates
+            }
+        }
+        Some(CandidateSupplementStatus::VerifiedEmpty { .. }) => "已验证为空".to_string(),
+        Some(CandidateSupplementStatus::Unavailable { .. }) => "数据不可用".to_string(),
+        Some(CandidateSupplementStatus::NotRequested(_)) => "未请求".to_string(),
+        None => "状态缺失".to_string(),
+    }
+}
+
 fn cluster_and_persist(
     date: &str,
     limit_ups: &[TopStock],
     concepts: &HashMap<String, Vec<String>>,
     min_size: usize,
 ) -> Result<(Vec<ChainCluster>, Vec<TopStock>)> {
+    let as_of = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map_err(|error| anyhow::anyhow!("产业链聚类业务日期非法 {date:?}: {error}"))?;
     let (mut clusters, isolated) = cluster_by_concept(limit_ups, concepts, min_size);
     info!(
         "[产业链] 识别主线簇 {} 个，孤立涨停 {} 只",
@@ -260,7 +412,7 @@ fn cluster_and_persist(
         .map_err(anyhow::Error::msg)?;
     for cluster in &mut clusters {
         cluster.streak_days = db
-            .get_chain_streak_days_strict(&cluster.concept, 10)
+            .get_chain_appearance_days_as_of_strict(&cluster.concept, 10, as_of)
             .map_err(anyhow::Error::msg)?;
     }
     Ok((clusters, isolated))
@@ -293,12 +445,13 @@ fn resolve_cluster_board_code<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn render_resolved_chain_analysis(
+async fn render_resolved_chain_analysis_with_candidate_statuses(
     analyzer: &GeminiAnalyzer,
     date: &str,
     limit_ups: &[TopStock],
     concepts: &HashMap<String, Vec<String>>,
     clusters: &[ChainCluster],
+    candidate_statuses: &CandidateSupplementStatuses,
     isolated: &[TopStock],
     position_diags: &[PositionDiag],
     lhb_map: &HashMap<String, f64>,
@@ -329,11 +482,14 @@ async fn render_resolved_chain_analysis(
             match analyze_cluster_deep(
                 analyzer,
                 cluster,
-                concepts,
-                lhb_map,
-                macro_ctx,
-                &cluster_news,
-                date,
+                DeepClusterAnalysisContext {
+                    concepts,
+                    lhb_map,
+                    macro_news: macro_ctx,
+                    cluster_news: &cluster_news,
+                    date,
+                    candidate_status: candidate_statuses.get(&cluster.concept),
+                },
             )
             .await
             {
@@ -348,7 +504,16 @@ async fn render_resolved_chain_analysis(
             }
         } else if stock_count >= TIER2_MIN && llm_ok && simple_count < MAX_SIMPLE_ANALYSIS {
             simple_count += 1;
-            match analyze_cluster_simple(analyzer, cluster, concepts, lhb_map, date).await {
+            match analyze_cluster_simple(
+                analyzer,
+                cluster,
+                concepts,
+                lhb_map,
+                date,
+                candidate_statuses.get(&cluster.concept),
+            )
+            .await
+            {
                 Ok(text) => Some(text),
                 Err(error) => {
                     warn!(
@@ -404,6 +569,7 @@ async fn render_resolved_chain_analysis(
         limit_ups,
         clusters,
         &cluster_sections,
+        candidate_statuses,
         isolated,
         overview.as_deref(),
         &after_market_section,
@@ -412,12 +578,55 @@ async fn render_resolved_chain_analysis(
     ))
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn render_resolved_chain_analysis(
+    analyzer: &GeminiAnalyzer,
+    date: &str,
+    limit_ups: &[TopStock],
+    concepts: &HashMap<String, Vec<String>>,
+    clusters: &[ChainCluster],
+    isolated: &[TopStock],
+    position_diags: &[PositionDiag],
+    lhb_map: &HashMap<String, f64>,
+    macro_ctx: &str,
+    evidence_source: ChainEvidenceSource,
+) -> Result<String> {
+    let candidate_statuses = clusters
+        .iter()
+        .map(|cluster| {
+            (
+                cluster.concept.clone(),
+                CandidateSupplementStatus::Unavailable {
+                    reason: "TEST_CODE_调用方未提供补涨候选批次证据".to_string(),
+                    board_evidence: Vec::new(),
+                },
+            )
+        })
+        .collect();
+    render_resolved_chain_analysis_with_candidate_statuses(
+        analyzer,
+        date,
+        limit_ups,
+        concepts,
+        clusters,
+        &candidate_statuses,
+        isolated,
+        position_diags,
+        lhb_map,
+        macro_ctx,
+        evidence_source,
+    )
+    .await
+}
+
 /// 入口：对当日涨停池做产业链联动分析，返回完整 Markdown 报告。
 pub async fn run_chain_analysis(
+    business_date: chrono::NaiveDate,
     limit_ups: Vec<TopStock>,
     macro_news: Option<String>,
 ) -> Result<String> {
-    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let date = business_date.format("%Y-%m-%d").to_string();
 
     if limit_ups.is_empty() {
         return Ok(format!(
@@ -440,20 +649,60 @@ pub async fn run_chain_analysis(
     let (mut clusters, isolated) =
         cluster_and_persist(&date, &limit_ups, &concepts, min_cluster_size())?;
 
-    // 2.6 补涨候选：从东财概念板块成分股中找未涨停、涨幅适中的标的
-    {
-        let limit_codes: HashSet<String> = limit_ups.iter().map(|s| s.code.clone()).collect();
-        let board_map = fetch_board_code_map().await.map_err(anyhow::Error::msg)?;
-        info!("[产业链] 概念板块索引 {} 个", board_map.len());
-        for c in clusters
-            .iter_mut()
-            .take(MAX_DEEP_ANALYSIS + MAX_SIMPLE_ANALYSIS)
-        {
-            let code = resolve_cluster_board_code(c, &board_map)?;
-            c.candidates = fetch_laggard_candidates(code, &limit_codes)
-                .await
-                .map_err(anyhow::Error::msg)?;
+    // 2.6 补涨候选是可选 supplement。统一 Gateway 尚未发布完整同批次
+    // 身份/名称/价格/涨幅合同时，核心产业链事实继续分析，但 unavailable
+    // 必须显式保留，不能用空列表冒充 verified-empty。
+    let mut candidate_statuses = CandidateSupplementStatuses::new();
+    let supplement_limit = MAX_DEEP_ANALYSIS + MAX_SIMPLE_ANALYSIS;
+    let limit_codes: HashSet<String> = limit_ups.iter().map(|stock| stock.code.clone()).collect();
+    match fetch_board_code_map().await {
+        Ok(board_batch) => {
+            info!("[产业链] 概念板块索引 {} 个", board_batch.codes.len());
+            for cluster in clusters.iter_mut().take(supplement_limit) {
+                let status = match resolve_cluster_board_code(cluster, &board_batch.codes) {
+                    Ok(board_code) => commit_laggard_candidate_batch(
+                        cluster,
+                        fetch_laggard_candidates(board_code, &limit_codes).await,
+                        &board_batch.evidence,
+                    ),
+                    Err(error) => commit_laggard_candidate_batch(
+                        cluster,
+                        Err(error.to_string()),
+                        &board_batch.evidence,
+                    ),
+                };
+                if let CandidateSupplementStatus::Unavailable { reason, .. } = &status {
+                    warn!(
+                        "[产业链] 核心主线「{}」可用，补涨候选 supplement 不可用: {}",
+                        cluster.concept, reason
+                    );
+                }
+                candidate_statuses.insert(cluster.concept.clone(), status);
+            }
         }
+        Err(error) => {
+            warn!(
+                "[产业链] 核心主线可用，补涨候选板块目录 supplement 不可用: {}",
+                error
+            );
+            for cluster in clusters.iter().take(supplement_limit) {
+                candidate_statuses.insert(
+                    cluster.concept.clone(),
+                    CandidateSupplementStatus::Unavailable {
+                        reason: format!("补涨候选板块目录不可用: {error}"),
+                        board_evidence: Vec::new(),
+                    },
+                );
+            }
+        }
+    }
+    for cluster in clusters.iter().skip(supplement_limit) {
+        candidate_statuses.insert(
+            cluster.concept.clone(),
+            CandidateSupplementStatus::NotRequested(
+                "超出已登记的深度/简化分析数量上限".to_string(),
+            ),
+        );
     }
 
     // 2.7 持仓主线诊断
@@ -467,12 +716,13 @@ pub async fn run_chain_analysis(
 
     // 5. LLM 逐簇分析 + 5.5 盘后催化 + 6. 报告组装
     let analyzer = GeminiAnalyzer::from_env();
-    render_resolved_chain_analysis(
+    render_resolved_chain_analysis_with_candidate_statuses(
         &analyzer,
         &date,
         &limit_ups,
         &concepts,
         &clusters,
+        &candidate_statuses,
         &isolated,
         &position_diags,
         &lhb_map,
@@ -599,13 +849,6 @@ fn cluster_by_concept(
 // 辅助数据：板块成分股(补涨候选) / 持仓诊断 / 龙虎榜 / 宏观新闻
 // ============================================================================
 
-/// push2 子域列表：单主机限流时回退。
-pub(crate) const PUSH2_HOSTS: &[&str] = &[
-    "https://push2.eastmoney.com",
-    "https://17.push2.eastmoney.com",
-    "https://82.push2.eastmoney.com",
-];
-
 /// 概念名 → 东财板块名的同义词/简称映射。
 fn resolve_concept_alias<'a>(
     concept: &str,
@@ -671,8 +914,6 @@ fn resolve_concept_alias<'a>(
 }
 
 // fetch_board_code_map 已抽到 chain_analysis/fetchers.rs (修复 Top10#3+#4)
-
-// push2_get 已抽到 chain_analysis/fetchers.rs (修复 Top10#3+#4)
 
 // fetch_laggard_candidates 已抽到 chain_analysis/fetchers.rs (修复 Top10#3+#4)
 
@@ -779,25 +1020,32 @@ const CHAIN_SYSTEM_PROMPT: &str = r#"你是 A 股产业链结构分析专家，�
 
 // fetch_cluster_news 已抽到 chain_analysis/fetchers.rs (修复 Top10#3+#4)
 
+struct DeepClusterAnalysisContext<'a> {
+    concepts: &'a HashMap<String, Vec<String>>,
+    lhb_map: &'a HashMap<String, f64>,
+    macro_news: &'a str,
+    cluster_news: &'a str,
+    date: &'a str,
+    candidate_status: Option<&'a CandidateSupplementStatus>,
+}
+
 /// 对单个主线簇做深度 LLM 产业链分析（含五维评分 + 三情景推演）。
 async fn analyze_cluster_deep(
     analyzer: &GeminiAnalyzer,
     cluster: &ChainCluster,
-    concepts: &HashMap<String, Vec<String>>,
-    lhb_map: &HashMap<String, f64>,
-    macro_news: &str,
-    cluster_news: &str,
-    date: &str,
+    context: DeepClusterAnalysisContext<'_>,
 ) -> Result<String> {
     let mut table = String::from(
         "| 代码 | 名称 | 涨幅% | 龙虎榜净买入(万) | 其他概念标签 |\n|---|---|---|---|---|\n",
     );
     for s in &cluster.stocks {
-        let lhb = lhb_map
+        let lhb = context
+            .lhb_map
             .get(&s.code)
             .map(|v| format!("{:.0}", v))
             .unwrap_or_else(|| "-".to_string());
-        let others: Vec<&str> = concepts
+        let others: Vec<&str> = context
+            .concepts
             .get(&s.code)
             .map(|bs| {
                 bs.iter()
@@ -823,39 +1071,27 @@ async fn analyze_cluster_deep(
         format!("（同义概念：{}）", cluster.aliases.join("、"))
     };
 
-    let macro_block = if macro_news.trim().is_empty() {
+    let macro_block = if context.macro_news.trim().is_empty() {
         String::from("（今日无宏观新闻上下文）")
     } else {
-        let truncated: String = macro_news.chars().take(2500).collect();
+        let truncated: String = context.macro_news.chars().take(2500).collect();
         format!("<macro_news>\n{}\n</macro_news>", truncated)
     };
 
-    let cluster_news_block = if cluster_news.trim().is_empty() {
+    let cluster_news_block = if context.cluster_news.trim().is_empty() {
         String::from("（未检索到该主线的定向新闻）")
     } else {
-        let truncated: String = cluster_news.chars().take(1500).collect();
+        let truncated: String = context.cluster_news.chars().take(1500).collect();
         format!("<主线定向新闻>\n{}\n</主线定向新闻>", truncated)
     };
 
-    // 补涨候选块：同板块内未涨停、涨幅适中的标的
-    let candidate_block = if cluster.candidates.is_empty() {
-        String::from("（未获取到同板块未涨停成分股，候选评估跳过）")
-    } else {
-        let mut b = String::from("| 代码 | 名称 | 今日涨幅% |\n|---|---|---|\n");
-        for s in &cluster.candidates {
-            b.push_str(&format!(
-                "| {} | {} | {:.2} |\n",
-                s.code, s.name, s.change_pct
-            ));
-        }
-        b
-    };
+    let candidate_block = render_candidate_supplement_context(cluster, context.candidate_status);
 
     let prompt = format!(
         r#"今天是 {date}。今日 A 股涨停池中，概念「{concept}」{aliases}聚集了 {n} 只涨停股：
 
 {table}
-簇内带"昨日涨停/昨日连板"标签的家数：{cont}；该主线最近 10 个交易日内上榜天数：{streak}（含今日，天数越多越老）
+簇内带"昨日涨停/昨日连板"标签的家数：{cont}；该主线最近 10 个自然日内上榜天数：{streak}（含业务日期，天数越多越老）
 
 同板块内今日**未涨停**、涨幅适中的股票（补涨候选池，仅供筛选）：
 {candidates}
@@ -888,13 +1124,13 @@ async fn analyze_cluster_deep(
 
 ### 补涨候选评估
 从上面的候选池中挑出最多 3 只位于"价值迁移指向环节"的标的，每只一行：名称(代码)｜所处环节｜证据等级｜一句理由。候选池里没有真正在链上的公司就写"候选池内无合适标的"，不要凑数。[C] 级不得入选。这些候选必须与第一行【结论】中的候选一致。"#,
-        date = date,
+        date = context.date,
         concept = cluster.concept,
         aliases = aliases,
         n = cluster.stocks.len(),
         table = table,
         cont = cluster.continuation_count,
-        streak = cluster.streak_days.max(1),
+        streak = cluster.streak_days,
         candidates = candidate_block,
         cluster_news = cluster_news_block,
         macro_block = macro_block,
@@ -912,6 +1148,7 @@ async fn analyze_cluster_simple(
     _concepts: &HashMap<String, Vec<String>>,
     lhb_map: &HashMap<String, f64>,
     date: &str,
+    candidate_status: Option<&CandidateSupplementStatus>,
 ) -> Result<String> {
     let leaders: Vec<String> = cluster
         .stocks
@@ -931,22 +1168,11 @@ async fn analyze_cluster_simple(
         .take(3)
         .collect();
 
-    let candidate_block = if cluster.candidates.is_empty() {
-        String::from("（无补涨候选）")
-    } else {
-        let mut b = String::from("| 代码 | 名称 | 今日涨幅% |\n|---|---|---|\n");
-        for s in cluster.candidates.iter().take(5) {
-            b.push_str(&format!(
-                "| {} | {} | {:.2} |\n",
-                s.code, s.name, s.change_pct
-            ));
-        }
-        b
-    };
+    let candidate_block = render_candidate_supplement_context(cluster, candidate_status);
 
     let prompt = format!(
         r#"今天是 {date}。概念「{concept}」聚集了 {n} 只涨停股，领头羊：{leaders}。
-连板家数：{cont}，近10日上榜 {streak} 天。
+连板家数：{cont}，近10个自然日上榜 {streak} 天。
 
 补涨候选池：
 {candidates}
@@ -963,7 +1189,7 @@ async fn analyze_cluster_simple(
         n = cluster.stocks.len(),
         leaders = leaders.join("、"),
         cont = cluster.continuation_count,
-        streak = cluster.streak_days.max(1),
+        streak = cluster.streak_days,
         candidates = candidate_block,
         lhb = if lhb_note.is_empty() {
             "无".to_string()
@@ -1037,11 +1263,11 @@ async fn synthesize_overview(
     let mut ctx = String::new();
     for ((concept, analysis), cluster) in sections.iter().zip(clusters.iter()) {
         ctx.push_str(&format!(
-            "### 主线「{}」（{} 只涨停，昨日涨停标签 {} 家，近 10 日上榜 {} 天）\n",
+            "### 主线「{}」（{} 只涨停，昨日涨停标签 {} 家，近 10 个自然日上榜 {} 天）\n",
             concept,
             cluster.stocks.len(),
             cluster.continuation_count,
-            cluster.streak_days.max(1)
+            cluster.streak_days
         ));
         if let Some(a) = analysis {
             let truncated: String = a.chars().take(1200).collect();
@@ -1178,6 +1404,7 @@ fn build_report(
     limit_ups: &[TopStock],
     clusters: &[ChainCluster],
     sections: &[(String, Option<String>)],
+    candidate_statuses: &CandidateSupplementStatuses,
     isolated: &[TopStock],
     overview: Option<&str>,
     after_market_section: &str,
@@ -1209,7 +1436,7 @@ fn build_report(
 
     // ---- 一页纸决策摘要（含五维评分）----
     md.push_str("## 一页纸决策摘要\n\n");
-    md.push_str("| 主线 | 涨停数 | 上榜天 | 评分 | 阶段 | 参与 | 补涨候选 |\n|---|---|---|---|---|---|---|\n");
+    md.push_str("| 主线 | 涨停数 | 近10自然日上榜 | 评分 | 阶段 | 参与 | 补涨候选 |\n|---|---|---|---|---|---|---|\n");
     for (i, ((concept, analysis), cluster)) in sections.iter().zip(clusters.iter()).enumerate() {
         let (stage, rating, cands) = analysis
             .as_deref()
@@ -1221,19 +1448,27 @@ fn build_report(
             .map(|s| format!("{:.0}", s.total()))
             .unwrap_or_else(|| "-".into());
         let rating_display = if rating == "-" { "-" } else { &rating };
+        let candidate_summary =
+            candidate_supplement_summary(candidate_statuses.get(&cluster.concept), cands);
         md.push_str(&format!(
             "| {} | {} | {}天 | {} | {} | {} | {} |\n",
             concept,
             cluster.stocks.len(),
-            cluster.streak_days.max(1),
+            cluster.streak_days,
             score_str,
             stage,
             rating_display,
-            if cands == "-" || cands == "无" {
-                "-".to_string()
-            } else {
-                cands
-            }
+            candidate_summary
+        ));
+    }
+    md.push('\n');
+
+    md.push_str("## 补涨候选数据状态\n\n");
+    for cluster in clusters {
+        md.push_str(&format!(
+            "- **{}**：{}\n",
+            cluster.concept,
+            render_candidate_supplement_context(cluster, candidate_statuses.get(&cluster.concept))
         ));
     }
     md.push('\n');
@@ -1260,7 +1495,7 @@ fn build_report(
     // ---- 持仓主线诊断（本地确定性匹配）----
     if !position_diags.is_empty() {
         md.push_str("## 持仓主线诊断\n\n");
-        md.push_str("| 持仓 | 收益% | 今日涨停 | 主线归属 | 主线评分 | 上榜天数 |\n|---|---|---|---|---|---|\n");
+        md.push_str("| 持仓 | 收益% | 今日涨停 | 主线归属 | 主线评分 | 近10自然日上榜 |\n|---|---|---|---|---|---|\n");
         for d in position_diags {
             let return_rate = d
                 .return_rate
@@ -1461,6 +1696,32 @@ mod tests {
             request_delay: 0.0,
             ..crate::analyzer::GeminiConfig::default()
         })
+    }
+
+    fn unavailable_candidate_status(concept: &str) -> CandidateSupplementStatuses {
+        HashMap::from([(
+            concept.to_string(),
+            CandidateSupplementStatus::Unavailable {
+                reason: "TEST_CODE_补涨候选合同不可用".to_string(),
+                board_evidence: Vec::new(),
+            },
+        )])
+    }
+
+    fn available_candidate_status(concept: &str) -> CandidateSupplementStatuses {
+        HashMap::from([(
+            concept.to_string(),
+            CandidateSupplementStatus::Available {
+                board_evidence: Vec::new(),
+                candidate_evidence: BatchEvidence {
+                    provider: magic_market_core::ProviderId::Tdx,
+                    source: "TEST_CODE_magic_tdx_candidate_batch".to_string(),
+                    source_at: Some("2026-07-19T07:00:00Z".to_string()),
+                    observed_at: "2026-07-19T07:00:01Z".to_string(),
+                    batch_id: format!("TEST_CODE_candidate_batch_{concept}"),
+                },
+            },
+        )])
     }
 
     #[test]
@@ -1721,12 +1982,14 @@ mod tests {
         let sections = vec![("测试概念".into(), Some(analysis.to_string()))];
         let concepts: HashMap<String, Vec<String>> = HashMap::new();
         let diags: Vec<PositionDiag> = vec![];
+        let candidate_statuses = unavailable_candidate_status("测试概念");
 
         let report = build_report(
             date,
             &stocks,
             &[cluster],
             &sections,
+            &candidate_statuses,
             &[],
             None,
             "",
@@ -1779,12 +2042,14 @@ mod tests {
         let sections = vec![("弱主线".into(), None::<String>)]; // no analysis = tier 3
         let concepts: HashMap<String, Vec<String>> = HashMap::new();
         let diags: Vec<PositionDiag> = vec![];
+        let candidate_statuses = unavailable_candidate_status("弱主线");
 
         let report = build_report(
             date,
             &stocks,
             &[cluster],
             &sections,
+            &candidate_statuses,
             &[],
             None,
             "",
@@ -1835,12 +2100,14 @@ mod tests {
             mainline: Some(("电池技术".into(), 2)),
             in_limit_pool: true,
         }];
+        let candidate_statuses = unavailable_candidate_status("电池技术");
 
         let report = build_report(
             date,
             &stocks,
             &[cluster],
             &sections,
+            &candidate_statuses,
             &[],
             None,
             "",
@@ -1920,10 +2187,102 @@ mod tests {
 
     #[tokio::test]
     async fn empty_limit_up_batch_returns_explicit_empty_report_without_external_calls() {
-        let report = run_chain_analysis(Vec::new(), Some("本地宏观上下文".into()))
+        let business_date = chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap();
+        let report = run_chain_analysis(business_date, Vec::new(), Some("本地宏观上下文".into()))
             .await
             .expect("empty complete batch");
         assert!(report.contains("涨停池批次成功返回 0 只"));
+        assert!(report.contains("2026-07-21"));
+    }
+
+    #[test]
+    fn unavailable_laggard_supplement_does_not_erase_available_core_analysis() {
+        let mut cluster = ChainCluster {
+            concept: "TEST_CODE_补涨合同未发布".to_string(),
+            aliases: Vec::new(),
+            stocks: vec![top("TEST_CODE_000001", "测试核心标的", 10.0)],
+            continuation_count: 0,
+            streak_days: 1,
+            candidates: Vec::new(),
+            score: None,
+            scenario: None,
+        };
+        let status = commit_laggard_candidate_batch(
+            &mut cluster,
+            Err("TEST_CODE_统一Gateway未发布完整补涨合同".to_string()),
+            &[],
+        );
+
+        assert_eq!(cluster.stocks.len(), 1);
+        assert!(cluster.candidates.is_empty());
+        assert!(matches!(
+            status,
+            CandidateSupplementStatus::Unavailable { ref reason, .. }
+                if reason.contains("统一Gateway未发布完整补涨合同")
+        ));
+        let rendered = render_candidate_supplement_context(&cluster, Some(&status));
+        assert!(rendered.contains("数据不可用"));
+        assert!(rendered.contains("不得解释为已验证为空"));
+        assert!(!rendered.contains("无补涨候选"));
+    }
+
+    #[test]
+    fn laggard_supplement_preserves_available_and_verified_empty_evidence() {
+        let evidence = BatchEvidence {
+            provider: magic_market_core::ProviderId::Tdx,
+            source: "TEST_CODE_magic_tdx_laggard".to_string(),
+            source_at: Some("2026-07-19T07:00:00Z".to_string()),
+            observed_at: "2026-07-19T07:00:01Z".to_string(),
+            batch_id: "TEST_CODE_laggard_batch".to_string(),
+        };
+        let mut cluster = ChainCluster {
+            concept: "TEST_CODE_补涨证据".to_string(),
+            aliases: Vec::new(),
+            stocks: vec![top("TEST_CODE_000001", "测试核心标的", 10.0)],
+            continuation_count: 0,
+            streak_days: 1,
+            candidates: Vec::new(),
+            score: None,
+            scenario: None,
+        };
+        let available = commit_laggard_candidate_batch(
+            &mut cluster,
+            Ok(GatewayBatch::Available {
+                records: vec![top("TEST_CODE_000002", "测试补涨标的", 3.0)],
+                evidence: evidence.clone(),
+            }),
+            &[],
+        );
+        assert!(matches!(
+            available,
+            CandidateSupplementStatus::Available {
+                candidate_evidence: ref kept,
+                ..
+            }
+                if kept.batch_id == evidence.batch_id
+        ));
+        assert_eq!(cluster.candidates.len(), 1);
+        let rendered = render_candidate_supplement_context(&cluster, Some(&available));
+        assert!(rendered.contains("TEST_CODE_laggard_batch"));
+        assert!(rendered.contains("TEST_CODE_000002"));
+
+        let verified_empty = commit_laggard_candidate_batch(
+            &mut cluster,
+            Ok(GatewayBatch::VerifiedEmpty(evidence.clone())),
+            &[],
+        );
+        assert!(matches!(
+            verified_empty,
+            CandidateSupplementStatus::VerifiedEmpty {
+                candidate_evidence: ref kept,
+                ..
+            }
+                if kept.batch_id == evidence.batch_id
+        ));
+        assert!(cluster.candidates.is_empty());
+        let rendered = render_candidate_supplement_context(&cluster, Some(&verified_empty));
+        assert!(rendered.contains("已验证为空"));
+        assert!(!rendered.contains("数据不可用"));
     }
 
     #[tokio::test]
@@ -1954,7 +2313,7 @@ mod tests {
                 vec!["TEST_CODE_独立逻辑".to_string()],
             ),
         ]);
-        let (mut clusters, isolated) = cluster_and_persist("2026-07-19", &stocks, &concepts, 2)
+        let (mut clusters, isolated) = cluster_and_persist("2026-07-20", &stocks, &concepts, 2)
             .expect("complete parsed cluster facts");
         assert_eq!(clusters.len(), 1);
         assert_eq!(isolated.len(), 1);
@@ -1987,12 +2346,14 @@ mod tests {
             mainline: Some(("TEST_CODE_固态电池".to_string(), 1)),
             in_limit_pool: true,
         }];
-        let report = render_resolved_chain_analysis(
+        let candidate_statuses = available_candidate_status("TEST_CODE_固态电池");
+        let report = render_resolved_chain_analysis_with_candidate_statuses(
             &unavailable_analyzer(),
             "2026-07-19",
             &stocks,
             &concepts,
             &clusters,
+            &candidate_statuses,
             &isolated,
             &positions,
             &HashMap::from([("TEST_CODE_CHAIN_230001".to_string(), 100.0)]),
@@ -2081,13 +2442,16 @@ mod tests {
             )]),
             after_market: "## 盘后催化\nTEST_CODE_已验证盘后证据".to_string(),
         };
+        let mut candidate_statuses = available_candidate_status(&deep.concept);
+        candidate_statuses.extend(available_candidate_status(&simple.concept));
 
-        let report = render_resolved_chain_analysis(
+        let report = render_resolved_chain_analysis_with_candidate_statuses(
             &analyzer,
             "2026-07-19",
             &limit_ups,
             &concepts,
             &[deep, simple],
+            &candidate_statuses,
             &[],
             &[],
             &HashMap::new(),
@@ -2245,12 +2609,14 @@ mod tests {
             mainline: None,
             in_limit_pool: false,
         }];
+        let candidate_statuses = unavailable_candidate_status("固态电池");
 
         let report = build_report(
             "2026-07-18",
             &[clustered, isolated.clone()],
             &[cluster],
             &sections,
+            &candidate_statuses,
             &[isolated],
             Some("# 今日主线全景研判\n\n全景正文"),
             "## 盘后催化\n真实催化",
@@ -2296,24 +2662,35 @@ mod tests {
             scenario: None,
         };
         let lhb = HashMap::from([("TEST_CODE_000001".to_string(), 1234.0)]);
+        let candidate_statuses = available_candidate_status("测试主线");
+        let candidate_status = candidate_statuses.get("测试主线");
 
         let deep_error = analyze_cluster_deep(
             &analyzer,
             &cluster,
-            &concepts,
-            &lhb,
-            "真实宏观上下文",
-            "真实主线新闻",
-            "2026-07-18",
+            DeepClusterAnalysisContext {
+                concepts: &concepts,
+                lhb_map: &lhb,
+                macro_news: "真实宏观上下文",
+                cluster_news: "真实主线新闻",
+                date: "2026-07-18",
+                candidate_status,
+            },
         )
         .await
         .expect_err("missing provider must be explicit");
         assert!(deep_error.to_string().contains("API Key 未配置"));
 
-        let simple_error =
-            analyze_cluster_simple(&analyzer, &cluster, &concepts, &lhb, "2026-07-18")
-                .await
-                .expect_err("missing provider must be explicit");
+        let simple_error = analyze_cluster_simple(
+            &analyzer,
+            &cluster,
+            &concepts,
+            &lhb,
+            "2026-07-18",
+            candidate_status,
+        )
+        .await
+        .expect_err("missing provider must be explicit");
         assert!(simple_error.to_string().contains("API Key 未配置"));
 
         let positions = vec![PositionDiag {
@@ -2348,14 +2725,21 @@ mod tests {
             score: None,
             scenario: None,
         };
+        let candidate_statuses = unavailable_candidate_status("测试主线");
+        let candidate_status = candidate_statuses.get("测试主线");
+        let empty_concepts = HashMap::new();
+        let empty_lhb = HashMap::new();
         assert!(analyze_cluster_deep(
             &analyzer,
             &cluster,
-            &HashMap::new(),
-            &HashMap::new(),
-            "",
-            "",
-            "2026-07-18",
+            DeepClusterAnalysisContext {
+                concepts: &empty_concepts,
+                lhb_map: &empty_lhb,
+                macro_news: "",
+                cluster_news: "",
+                date: "2026-07-18",
+                candidate_status,
+            },
         )
         .await
         .is_err());
@@ -2365,6 +2749,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             "2026-07-18",
+            candidate_status,
         )
         .await
         .is_err());

@@ -4,8 +4,8 @@
 //!
 //! 包含:
 //! - monitor_freshness_config(): 从全局 config 构造 FreshnessConfig
-//! - validate_position_freshness / validate_quote_freshness:
-//!   数据新鲜度校验, 过期数据阻断推送 (AGENTS §2.4 红线)
+//! - validate_position_freshness:
+//!   持仓新鲜度校验；实时行情由统一 Gateway 执行 5 秒门禁。
 //!
 //! 拆分后 main.rs 从 1934 → ~1820 行
 
@@ -26,29 +26,6 @@ pub fn validate_position_freshness(fetch_time: DateTime<Local>) -> bool {
         Err(reason) => {
             log::warn!(
                 "[DQ_FRESHNESS] rule_id=AGENTS-2.4 data_type=position action=reject reason={} timestamp={}",
-                reason.label(),
-                chrono::Utc::now().timestamp()
-            );
-            false
-        }
-    }
-}
-
-pub fn validate_quote_freshness(update_time: DateTime<Local>, source: &str, code: &str) -> bool {
-    let stats = DqStats::new();
-    let freshness = monitor_freshness_config();
-    match data_quality::validate_freshness(
-        FreshnessDataType::Quote,
-        update_time,
-        &freshness,
-        &stats,
-    ) {
-        Ok(()) => true,
-        Err(reason) => {
-            log::warn!(
-                "[DQ_FRESHNESS] rule_id=AGENTS-2.4 data_type=quote source={} code={} action=reject reason={} timestamp={}",
-                source,
-                code,
                 reason.label(),
                 chrono::Utc::now().timestamp()
             );

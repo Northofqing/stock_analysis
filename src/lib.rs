@@ -1,17 +1,23 @@
 // A股自选股智能分析系统 - 库入口
 
 pub mod analyzer;
+pub mod announcement;
 pub mod auth;
 pub mod breakout;
 pub mod broker;
 // v16.4 Commit 1: 3 Bus 拆分 (SignalBus/TradingBus/SystemBus) + UUID ID
 pub mod bus;
 pub mod calendar;
+pub mod capital_flow;
 pub mod chart_generator;
+pub mod company_financials;
+pub mod company_metrics;
 pub mod config;
+pub mod data_gateway;
 pub mod data_provider;
 pub mod database;
 pub mod decision;
+pub mod durable_delivery;
 pub mod enums;
 pub mod errors;
 pub mod indicators;
@@ -57,8 +63,8 @@ pub use strategy::core as backtest;
 pub use strategy::multi_factor as multi_factor_strategy;
 
 pub use search_service::{
-    get_search_service, BochaSearchProvider, SearchProvider, SearchResponse, SearchResult,
-    SearchService, SerpAPISearchProvider, TavilySearchProvider,
+    get_search_service, GeneralWebSearchProvider, SearchEvidence, SearchProvider, SearchResponse,
+    SearchResult, SearchService,
 };
 
 pub use analyzer::{get_analyzer, AnalysisResult, GeminiAnalyzer, GeminiConfig};
@@ -74,7 +80,7 @@ pub use models::{
     AnalysisResultRecord, MaStatus, NewAnalysisResult, NewStockDaily, StockDaily, UpdateStockDaily,
 };
 
-pub use lhb_analyzer::{LhbAnalysis, LhbDataFetcher, LhbRecord, LhbSeat};
+pub use lhb_analyzer::{analyze_dragon_tiger_review, parse_dragon_tiger_date, LhbAnalysis};
 pub mod agent;
 pub mod deep_analyzer;
 pub mod trading;
@@ -83,16 +89,12 @@ pub mod trading;
 // 修复 Top10#5 (2026-06-29 audit): block_on 统一桥接
 // ========================================================================
 //
-// 背景: 全代码库有 25+ 处 `block_on` / `Runtime::new` / `Handle::try_current`,
-// 在不同文件用 4 种不同 pattern:
-//   1. `let rt = tokio::runtime::Runtime::new()?; rt.block_on(fut)` (RsiOptimize)
-//   2. `match Handle::try_current() { Ok(h) => h.block_on(fut), Err(_) => rt.block_on(fut) }`
-//      (gtimg_provider 4 处)
-//   3. `let handle = Handle::try_current().ok()?; handle.block_on(fut)` (8 个 data_provider 文件)
-//   4. `Handle::current().block_on(fut)` (statistics.rs, eastmoney_provider.rs)
+// 背景: 历史代码曾在多个模块手写 `block_on` / `Runtime::new` /
+// `Handle::try_current`。外部数据获取已迁移到异步 `data_gateway`，当前桥接只为仍然
+// 存在的同步领域入口提供单一、可审计的 runtime 边界。
 //
 // 问题:
-//   - 每处手写 pattern,容易出错 (e.g. gtimg_provider 第 100 行错误处理)
+//   - 每处手写 pattern 容易出错
 //   - 多 Runtime 嵌套 = 40 个空闲 worker
 //   - `block_on` 不带超时,可能永久阻塞 worker
 //

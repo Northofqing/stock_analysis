@@ -399,4 +399,87 @@ mod tests {
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("BR-084"));
     }
+
+    #[test]
+    fn rejects_each_invalid_realtime_quote_shape() {
+        let s = signal(AccountMode::Normal, DataMode::Full, Direction::Buy);
+        for quote in [0.0, -0.01, f64::NAN, f64::INFINITY] {
+            let error = pre_trade_check(&s, quote, 50_000.0, 100_000.0, 5.0)
+                .expect_err("invalid quote must fail closed");
+            assert!(error.contains("BR-084 invalid realtime quote"));
+        }
+    }
+
+    #[test]
+    fn rejects_each_invalid_account_metric_shape() {
+        let s = signal(AccountMode::Normal, DataMode::Full, Direction::Buy);
+        for (cash, total, position, expected) in [
+            (
+                f64::NAN,
+                100_000.0,
+                5.0,
+                "BR-084 buy requires valid available cash",
+            ),
+            (
+                -1.0,
+                100_000.0,
+                5.0,
+                "BR-084 buy requires valid available cash",
+            ),
+            (50_000.0, f64::NAN, 5.0, "BR-084 invalid account state"),
+            (50_000.0, -1.0, 5.0, "BR-084 invalid account state"),
+            (100_001.0, 100_000.0, 5.0, "BR-084 invalid account state"),
+            (
+                50_000.0,
+                100_000.0,
+                f64::NAN,
+                "BR-084 invalid account state",
+            ),
+            (50_000.0, 100_000.0, -0.01, "BR-084 invalid account state"),
+        ] {
+            let error = pre_trade_check(&s, 50.0, cash, total, position)
+                .expect_err("invalid account metric must fail closed");
+            assert!(error.contains(expected), "unexpected rejection: {error}");
+        }
+    }
+
+    #[test]
+    fn snapshot_path_accepts_only_full_valid_paper_evidence() {
+        let valid = signal(AccountMode::Frozen, DataMode::Full, Direction::Buy);
+        assert!(pre_trade_check_snapshot(&valid, 50.0, 50_000.0, 100_000.0, 10.0).is_ok());
+
+        for mode in [DataMode::Degraded, DataMode::Unsafe] {
+            let degraded = signal(AccountMode::Frozen, mode, Direction::Sell);
+            let error = pre_trade_check_snapshot(&degraded, 50.0, 50_000.0, 100_000.0, 50.0)
+                .expect_err("snapshot paper requires complete settled data");
+            assert_eq!(error, "BR-146 snapshot paper requires Full settled data");
+        }
+    }
+
+    #[test]
+    fn snapshot_path_rejects_invalid_account_and_buy_concentration() {
+        let buy = signal(AccountMode::Frozen, DataMode::Full, Direction::Buy);
+        let invalid = pre_trade_check_snapshot(&buy, f64::NAN, 50_000.0, 100_000.0, 5.0)
+            .expect_err("invalid snapshot quote must fail");
+        assert_eq!(invalid, "BR-146 invalid snapshot paper account state");
+
+        let concentrated = pre_trade_check_snapshot(&buy, 50.0, 50_000.0, 100_000.0, 10.001)
+            .expect_err("snapshot buy over the position limit must fail");
+        assert!(concentrated.contains("exceeds limit"));
+
+        let sell = signal(AccountMode::Frozen, DataMode::Full, Direction::Sell);
+        assert!(pre_trade_check_snapshot(&sell, 50.0, 50_000.0, 100_000.0, 75.0).is_ok());
+    }
+
+    #[test]
+    fn snapshot_path_preserves_order_safety_rejections() {
+        let mut buy = signal(AccountMode::Frozen, DataMode::Full, Direction::Buy);
+        buy.price = 56.0;
+        let error = pre_trade_check_snapshot(&buy, 50.0, 50_000.0, 100_000.0, 5.0)
+            .expect_err("limit-up violation must be rejected before paper evaluation");
+        assert!(
+            error.contains("daily range") || error.contains("limit"),
+            "{error}"
+        );
+    }
 }

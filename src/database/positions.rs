@@ -32,22 +32,19 @@ impl DatabaseManager {
             );
             return Err(env_reject_error(reason));
         }
+        if position.chain_name.is_some() {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "BR-170 save_position rejects raw chain_name without immutable assignment evidence",
+            )));
+        }
 
         use diesel::dsl::sql;
         use diesel::upsert::excluded;
 
         let mut conn = self.get_conn()?;
-        // BR-123: normalize legacy missing sentinels before Diesel binds the row.
-        let mut normalized = position.clone();
-        normalized.chain_name = position
-            .chain_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|chain| !chain.is_empty() && *chain != "其他")
-            .map(str::to_string);
-
         diesel::insert_into(stock_position::table)
-            .values(&normalized)
+            .values(position)
             .on_conflict((stock_position::code, stock_position::buy_date))
             .do_update()
             .set((
@@ -62,18 +59,12 @@ impl DatabaseManager {
                 >(
                     "COALESCE(excluded.st_type, stock_position.st_type)"
                 )),
-                // BR-123: 缺失/旧“其他”哨兵不覆盖既有明确产业链。
-                stock_position::chain_name.eq(sql::<
-                    diesel::sql_types::Nullable<diesel::sql_types::Text>,
-                >(
-                    "COALESCE(NULLIF(NULLIF(trim(excluded.chain_name), ''), '其他'), stock_position.chain_name)",
-                )),
             ))
             .execute(&mut conn)?;
 
         info!(
             "[{}] 模拟买入记录已保存（价格: {:.2}, 数量: {}）",
-            normalized.code, normalized.buy_price, normalized.quantity
+            position.code, position.buy_price, position.quantity
         );
         Ok(())
     }
@@ -221,65 +212,6 @@ impl DatabaseManager {
         .execute(&mut conn)?;
         Ok(star_updated + st_updated)
     }
-
-    /// v14.1 BR-015: 回填 stock_position.chain_name
-    ///   1. 优先查 stock_concepts 缓存 (东财/同花顺拉过)
-    ///   2. 回退到 chain_registry 静态映射 (80+ 龙头股)
-    ///   3. 都查不到保持 NULL/其他 (不强行填)
-    ///
-    ///   只在 chain_name IS NULL OR '' OR '其他' 时更新, 重复跑幂等.
-    ///   返回 (updated, missing_after) — 更新行数 + 仍缺失数.
-    pub fn backfill_chain_name(&self) -> Result<(usize, i64), Box<dyn std::error::Error>> {
-        use crate::data_provider::chain_registry;
-        let mut conn = self.get_conn()?;
-
-        // 1. 拉所有缺失 chain_name 的 (code, name) 列表
-        #[derive(diesel::QueryableByName)]
-        struct PosRow {
-            #[diesel(sql_type = diesel::sql_types::Text)]
-            code: String,
-        }
-        let rows: Vec<PosRow> = diesel::sql_query(
-            "SELECT code FROM stock_position
-             WHERE status = 'open'
-               AND (chain_name IS NULL OR chain_name = '' OR chain_name = '其他')",
-        )
-        .load(&mut conn)?;
-
-        // 2. 查 registry, 找到的 UPDATE
-        let mut updated = 0;
-        for row in &rows {
-            if let Some(chain) = chain_registry::lookup(&row.code) {
-                let n = diesel::sql_query(
-                    "UPDATE stock_position SET chain_name = ?1 \
-                     WHERE code = ?2 AND status = 'open' \
-                       AND (chain_name IS NULL OR chain_name = '' OR chain_name = '其他')",
-                )
-                .bind::<diesel::sql_types::Text, _>(chain)
-                .bind::<diesel::sql_types::Text, _>(&row.code)
-                .execute(&mut conn)?;
-                updated += n;
-            }
-        }
-
-        // 3. 统计仍缺失数
-        let missing_after: i64 = diesel::sql_query(
-            "SELECT COUNT(*) AS cnt FROM stock_position
-             WHERE status = 'open'
-               AND (chain_name IS NULL OR chain_name = '' OR chain_name = '其他')",
-        )
-        .get_result::<CountRow>(&mut conn)
-        .map(|r| r.cnt)?;
-
-        Ok((updated, missing_after))
-    }
-}
-
-/// v14.1 BR-015: count helper (Query 复用)
-#[derive(diesel::QueryableByName)]
-struct CountRow {
-    #[diesel(sql_type = diesel::sql_types::BigInt)]
-    cnt: i64,
 }
 
 #[cfg(test)]
@@ -316,7 +248,7 @@ mod tests {
             quantity: 200,
             status: "open".to_string(),
             st_type: Some("*ST".to_string()),
-            chain_name: Some("TEST_CODE_CHAIN".to_string()),
+            chain_name: None,
         })
         .expect("save position");
 
@@ -340,7 +272,7 @@ mod tests {
         assert_eq!(row.buy_price, 10.0);
         assert_eq!(row.quantity, 300);
         assert_eq!(row.st_type.as_deref(), Some("*ST"));
-        assert_eq!(row.chain_name.as_deref(), Some("TEST_CODE_CHAIN"));
+        assert_eq!(row.chain_name, None);
         assert!(db
             .get_all_open_positions()
             .expect("list positions")
@@ -398,6 +330,27 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn position_repository_rejects_unverified_chain_projection() {
+        let db = init_test_db();
+        let code = unique_code("RAW_CHAIN");
+        let error = db
+            .save_position(&NewStockPosition {
+                code,
+                name: "不得写裸产业链".to_string(),
+                buy_date: "2026-07-03".to_string(),
+                buy_price: 10.0,
+                quantity: 100,
+                status: "open".to_string(),
+                st_type: None,
+                chain_name: Some("TEST_CODE_RAW_CHAIN".to_string()),
+            })
+            .expect_err("raw position chain must require immutable assignment evidence")
+            .to_string();
+        assert!(error.contains("BR-170"), "{error}");
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn position_backfills_only_supported_evidence() {
         let db = init_test_db();
         let star_code = unique_code("STAR_ST");
@@ -417,8 +370,6 @@ mod tests {
         }
 
         db.backfill_st_type().expect("backfill ST type");
-        db.backfill_chain_name().expect("backfill chain name");
-
         let star = db
             .get_open_position(&star_code)
             .expect("query star position")

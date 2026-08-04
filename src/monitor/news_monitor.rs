@@ -2,11 +2,11 @@
 //! 消息监控中枢（Phase 1.5 独立子系统）。
 //!
 //! 与价格扫描器平级，共用 SignalStateMachine + AlertRouter。
-//! 运行窗口独立：消息通知时段可由 `config/monitor.toml` 配置，默认 08:00-22:00。
+//! 运行窗口独立：消息通知时段来自启动时加载的 `config/strategy.toml`。
 //!
 //! 核心流程：采集 → 去重 → 实体关联 → 分类分级 → 衰减策略 → 告警
 
-use crate::data_provider::announcement::{self, AnnLevel};
+use crate::announcement::{self, AnnLevel};
 use crate::monitor::detector::{AlertCategory, AlertDetail, AlertEvent, AlertLevel};
 use crate::monitor::entity_linker::EntityLinker;
 use chrono::{Local, Timelike};
@@ -65,7 +65,7 @@ pub struct NewsMonitor {
     linker: EntityLinker,
     /// 已处理的事件标题（去重用）
     seen_titles: HashSet<String>,
-    /// 被动源统计（金十/见闻/公告，用于舆情放量）
+    /// 被动统一新闻/公告源统计（用于舆情放量）
     passive_count_today: u64,
     /// 主动搜索统计（SerpAPI等，不计入舆情放量）
     active_count_today: u64,
@@ -101,9 +101,9 @@ impl NewsMonitor {
         }
     }
 
-    /// 新闻监控运行窗口由 `config/strategy.toml [monitor]` 控制，默认 08:00 — 22:00。
+    /// 新闻监控运行窗口由启动时加载的 `config/strategy.toml` 控制，默认 08:00 — 22:00。
     /// 覆盖盘前隔夜消息 + 盘中快讯 + 盘后公告高峰(21:00)。
-    /// SIGHUP 热加载, 修改 news_window_start_hour / news_window_end_hour 后无需重启.
+    /// 修改 news_window_start_hour / news_window_end_hour 后需重启 monitor。
     pub fn should_run() -> bool {
         Self::should_run_at(Local::now().hour())
     }
@@ -461,55 +461,104 @@ impl NewsMonitor {
     }
 }
 
-/// L2 概念索引刷新（独立函数，在 spawn_blocking 中执行，避免 reqwest::blocking runtime 冲突）
-/// 返回新的 concept_index 供主线程注入
+/// L2 概念索引刷新（独立函数，在 blocking worker 中执行同步 Gateway 调用）。
+///
+/// BR-188: 对完整监控代码集合逐证券取得 Magic TDX memberships；任一请求
+/// 失败即拒绝本轮，不能安装部分索引。全体来源确认空是可提交的空索引。
 pub fn refresh_concept_index_blocking(
     our_codes: &std::collections::HashSet<String>,
-) -> Option<std::collections::HashMap<String, Vec<String>>> {
-    use crate::market_analyzer::sector_monitor;
-    let mut new_index: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
+) -> Result<std::collections::HashMap<String, Vec<String>>, String> {
+    let gateway = crate::data_gateway::BoardDataGateway::production_tdx();
+    build_concept_index_from_memberships(our_codes, |code| {
+        gateway
+            .memberships_blocking(code)
+            .map_err(|error| format!("code={code} memberships Gateway 失败: {error}"))
+    })
+}
 
-    let boards = match sector_monitor::fetch_board_ranking("f3", 15) {
-        Ok(b) => b,
-        Err(e) => {
-            log::warn!("[NewsMonitor] 概念板块拉取失败: {}", e);
-            return None;
-        }
-    };
-    if boards.is_empty() {
-        return None;
-    }
-    log::info!(
-        "[NewsMonitor] L2 拉取 {} 个概念板块，构建反向索引...",
-        boards.len()
-    );
+fn build_concept_index_from_memberships<F>(
+    our_codes: &std::collections::HashSet<String>,
+    mut fetch: F,
+) -> Result<std::collections::HashMap<String, Vec<String>>, String>
+where
+    F: FnMut(
+        &str,
+    ) -> Result<
+        crate::data_gateway::GatewayBatch<crate::data_gateway::BoardMembershipRecord>,
+        String,
+    >,
+{
+    use crate::data_gateway::{BoardKind, GatewayBatch};
+    use std::collections::{BTreeMap, BTreeSet};
 
-    for board in &boards {
-        let stocks = match sector_monitor::fetch_board_components(&board.code, 30) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let matched: Vec<String> = stocks
-            .iter()
-            .filter_map(|s| {
-                if our_codes.contains(&s.code) {
-                    Some(s.code.clone())
-                } else {
-                    None
+    let mut codes: Vec<&str> = our_codes.iter().map(String::as_str).collect();
+    codes.sort_unstable();
+    let mut by_board: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+
+    for code in &codes {
+        let batch = fetch(code)?;
+        let evidence = batch.evidence();
+        match &batch {
+            GatewayBatch::Available { records, .. } => {
+                if records.is_empty() {
+                    return Err(format!("code={code} memberships 返回非法 Available 空批次"));
                 }
-            })
-            .collect();
-        if !matched.is_empty() {
-            log::info!(
-                "[NewsMonitor] L2 板块'{}'命中 {} 只标的",
-                board.name,
-                matched.len()
-            );
-            new_index.insert(board.name.clone(), matched);
+                for record in records {
+                    if record.instrument_code != *code {
+                        return Err(format!(
+                            "code={code} memberships 身份不一致: returned={}",
+                            record.instrument_code
+                        ));
+                    }
+                    if record.kind != BoardKind::Concept {
+                        continue;
+                    }
+                    if record.board_name.trim() != record.board_name
+                        || record.board_name.is_empty()
+                        || record.board_code.trim() != record.board_code
+                        || record.board_code.is_empty()
+                    {
+                        return Err(format!(
+                            "code={code} memberships 含非法概念板块身份: code={:?} name={:?}",
+                            record.board_code, record.board_name
+                        ));
+                    }
+                    by_board
+                        .entry(record.board_name.clone())
+                        .or_default()
+                        .insert((*code).to_owned());
+                }
+                log::info!(
+                    "[NewsMonitor][BR-188] code={} status=available records={} provider={:?} observed_at={} batch_id={}",
+                    code,
+                    records.len(),
+                    evidence.provider,
+                    evidence.observed_at,
+                    evidence.batch_id
+                );
+            }
+            GatewayBatch::VerifiedEmpty(_) => {
+                log::info!(
+                    "[NewsMonitor][BR-188] code={} status=verified_empty provider={:?} observed_at={} batch_id={}",
+                    code,
+                    evidence.provider,
+                    evidence.observed_at,
+                    evidence.batch_id
+                );
+            }
         }
     }
-    Some(new_index)
+
+    let index = by_board
+        .into_iter()
+        .map(|(board, codes)| (board, codes.into_iter().collect()))
+        .collect::<std::collections::HashMap<_, _>>();
+    log::info!(
+        "[NewsMonitor][BR-188] L2 membership index status=available tracked_codes={} concept_boards={}",
+        codes.len(),
+        index.len()
+    );
+    Ok(index)
 }
 
 impl Default for NewsMonitor {
@@ -561,47 +610,148 @@ fn strip_company_prefix(title: &str, name: &str) -> String {
     title.to_string()
 }
 
-/// 通过东方财富搜索 API 反查股票代码（公司名 → 代码），异步版本
-pub async fn resolve_code_by_name(name: &str, client: &reqwest::Client) -> Option<String> {
-    if name.is_empty() || name.chars().count() < 2 {
-        return None;
+/// Resolve a company name only through the unified identity contract.
+///
+/// The in-process linker is attempted by the caller first. The released Magic
+/// contracts do not yet expose a verified name-to-code lookup, so a miss stays
+/// explicit instead of reintroducing a consumer-owned suggestion protocol.
+pub async fn resolve_code_by_name(name: &str) -> anyhow::Result<Option<String>> {
+    let name = name.trim();
+    if name.chars().count() < 2 {
+        anyhow::bail!("公告公司名过短，无法反查证券身份: {name:?}");
     }
-    let url = format!(
-        "https://searchapi.eastmoney.com/api/suggest/get?input={}&type=14&token=D43BF722C8E33BDC906FB84D85E326E8&count=3",
-        urlencoding::encode(name)
-    );
-    let resp = client
-        .get(&url)
-        .header("User-Agent", "Mozilla/5.0")
-        .timeout(std::time::Duration::from_secs(3))
-        .send()
-        .await
-        .ok()?;
-    let body: serde_json::Value = resp.json().await.ok()?;
-    body["Result"]["QuotationCodeTable"]["Data"]
-        .as_array()?
-        .iter()
-        .filter_map(|item| {
-            let code = item["Code"].as_str()?;
-            let market = item["MarketId"].as_str()?;
-            if code.len() == 6
-                && code.chars().all(|c| c.is_ascii_digit())
-                && !code.starts_with('8')
-                && !code.starts_with('4')
-                && !code.starts_with('9')
-            {
-                let _ = market; // 仅保留A股
-                Some(code.to_string())
-            } else {
-                None
-            }
-        })
-        .next()
+    anyhow::bail!(
+        "公告公司名 {name:?} 未命中本地 Linker，且当前 Magic 数据契约不支持可验证的公司名反查；BR-164 禁止旧协议回退"
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn membership_batch(
+        batch_id: &str,
+        records: Vec<crate::data_gateway::BoardMembershipRecord>,
+    ) -> crate::data_gateway::GatewayBatch<crate::data_gateway::BoardMembershipRecord> {
+        crate::data_gateway::GatewayBatch::Available {
+            records,
+            evidence: crate::data_gateway::BatchEvidence {
+                provider: magic_market_core::ProviderId::Tdx,
+                source: "TEST_CODE_tdx-block-files".to_owned(),
+                source_at: None,
+                observed_at: "1785290400.000000000".to_owned(),
+                batch_id: batch_id.to_owned(),
+            },
+        }
+    }
+
+    fn membership(
+        instrument_code: &str,
+        board_code: &str,
+        board_name: &str,
+        kind: crate::data_gateway::BoardKind,
+    ) -> crate::data_gateway::BoardMembershipRecord {
+        crate::data_gateway::BoardMembershipRecord {
+            instrument_code: instrument_code.to_owned(),
+            board_code: board_code.to_owned(),
+            board_name: board_name.to_owned(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn br188_concept_index_consumes_complete_target_memberships_only() {
+        use crate::data_gateway::BoardKind;
+
+        let codes = std::collections::HashSet::from([
+            "TEST_CODE_000002".to_owned(),
+            "TEST_CODE_000001".to_owned(),
+        ]);
+        let index = build_concept_index_from_memberships(&codes, |code| {
+            let records = match code {
+                "TEST_CODE_000001" => vec![
+                    membership(code, "tdx:concept:机器人", "机器人", BoardKind::Concept),
+                    membership(code, "tdx:industry:工业", "工业", BoardKind::Industry),
+                    membership(code, "tdx:region:深圳", "深圳", BoardKind::Region),
+                ],
+                "TEST_CODE_000002" => vec![
+                    membership(code, "tdx:concept:机器人", "机器人", BoardKind::Concept),
+                    membership(code, "tdx:concept:人工智能", "人工智能", BoardKind::Concept),
+                ],
+                other => panic!("unexpected TEST_CODE identity {other}"),
+            };
+            Ok(membership_batch(
+                &format!("TEST_CODE_batch_{code}"),
+                records,
+            ))
+        })
+        .unwrap();
+
+        assert_eq!(
+            index["机器人"],
+            vec!["TEST_CODE_000001", "TEST_CODE_000002"]
+        );
+        assert_eq!(index["人工智能"], vec!["TEST_CODE_000002"]);
+        assert!(!index.contains_key("工业"));
+        assert!(!index.contains_key("深圳"));
+    }
+
+    #[test]
+    fn br188_concept_index_accepts_complete_verified_empty_and_rejects_partial_failure() {
+        let codes = std::collections::HashSet::from(["TEST_CODE_000001".to_owned()]);
+        let empty = build_concept_index_from_memberships(&codes, |_| {
+            Ok(crate::data_gateway::GatewayBatch::VerifiedEmpty(
+                crate::data_gateway::BatchEvidence {
+                    provider: magic_market_core::ProviderId::Tdx,
+                    source: "TEST_CODE_tdx-block-files".to_owned(),
+                    source_at: None,
+                    observed_at: "1785290400.000000000".to_owned(),
+                    batch_id: "TEST_CODE_empty_memberships".to_owned(),
+                },
+            ))
+        })
+        .unwrap();
+        assert!(empty.is_empty());
+
+        let codes = std::collections::HashSet::from([
+            "TEST_CODE_000001".to_owned(),
+            "TEST_CODE_000002".to_owned(),
+        ]);
+        let error = build_concept_index_from_memberships(&codes, |code| {
+            if code == "TEST_CODE_000002" {
+                return Err("TEST_CODE provider unavailable".to_owned());
+            }
+            Ok(membership_batch(
+                "TEST_CODE_first",
+                vec![membership(
+                    code,
+                    "tdx:concept:机器人",
+                    "机器人",
+                    crate::data_gateway::BoardKind::Concept,
+                )],
+            ))
+        })
+        .unwrap_err();
+        assert!(error.contains("provider unavailable"));
+    }
+
+    #[test]
+    fn br188_concept_index_rejects_mismatched_returned_instrument() {
+        let codes = std::collections::HashSet::from(["TEST_CODE_000001".to_owned()]);
+        let error = build_concept_index_from_memberships(&codes, |_| {
+            Ok(membership_batch(
+                "TEST_CODE_mismatch",
+                vec![membership(
+                    "TEST_CODE_000002",
+                    "tdx:concept:机器人",
+                    "机器人",
+                    crate::data_gateway::BoardKind::Concept,
+                )],
+            ))
+        })
+        .unwrap_err();
+        assert!(error.contains("身份不一致"));
+    }
 
     #[test]
     fn test_news_type_decay() {

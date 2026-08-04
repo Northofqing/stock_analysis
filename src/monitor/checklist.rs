@@ -22,7 +22,7 @@ pub fn build_pre_market_checklist(
 
     // 外盘环境
     lines.push("## 🌍 外盘环境".into());
-    lines.push("（数据源：金十快讯 + 华尔街见闻，08:45自动刷新）".into());
+    lines.push("（数据源：统一 GlobalNewsGateway 完整批次，08:45自动刷新）".into());
     if macro_events.is_empty() {
         lines.push("- 暂无重大宏观事件".into());
     } else {

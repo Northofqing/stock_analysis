@@ -1,160 +1,196 @@
 # stock_analysis
 
-`stock_analysis` 是一个用 Rust 构建的 A 股研究、监控、纸面交易与复盘系统。它把真实公共
-行情/新闻、可选的本地真实账户快照、量化分析、AI 研判、风险门、不可变审计和多通道通知
-串成一条可验证的数据链。
+`stock_analysis` 是一个面向 A 股的研究、监控、纸面交易和盘后复盘系统。公共金融与新闻事实统一经过强类型 Gateway，账户事实走独立证据边界。
 
-当前系统的交易闭环是**受安全门约束的纸面交易**。IB、TQS、QMT 等券商 SDK 尚未接入，
-系统不会把未实现的券商源伪装成可用，也不会自动提交真实账户订单。缺失、坏值或过期证据
-会显式失败，不会替换为 mock、0、成本价或“中性”占位值。
+当前统一数据迁移仍处于 **Gate B / In Progress**。模块存在或能够编译不代表发布完成；在全量测试、合规、覆盖率和真实数据门禁通过前，不宣称 Gate D 就绪。
 
-## 项目作用
+## 系统边界
 
-这个项目用于回答四类问题：
+系统用于研究市场事件、筛选候选、执行风险门、记录纸面决策并复原审计链。它不承诺收益，也不把 AI、回测或公共行情当作券商成交确认。
 
-- **市场发生了什么**：采集并校验日线、实时行情、资金流、板块、公告和财经新闻。
-- **哪些标的值得进一步研究**：运行指标、策略、产业链、机会评分、多 Agent 研判和否决链。
-- **一个决策是否允许执行**：结合账户模式、数据模式、涨跌停、现金、仓位、手数和幂等规则。
-- **事后能否复原过程**：持久化行情、决策、纸面成交、事件投递、绩效和哈希链审计证据。
+当前没有自动实盘订单出口。IB、TQS、QMT 等真实券商合同未接入时，账户、现金、持仓、净值和订单能力必须显式不可用。
 
-它不是承诺收益的选股器，也不是已经连接券商的自动实盘机器人。回测、AI 输出和纸面成交
-都是研究证据，不能替代投资判断或实时券商确认。
+本地导入的真实账户快照只是一份历史证据，不是持续券商连接。超过 30 秒的持仓或现金证据不能授权实时动作。
 
-## 端到端架构
+## 统一数据架构
 
-```mermaid
-flowchart LR
-  S[真实公共行情与新闻] --> V[Provider 校验与新鲜度门]
-  A[本地真实账户快照] --> E[账户证据校验与新鲜度门]
-  V --> R[分析 / 机会 / 决策]
-  V -. 尽力缓存 .-> C[(SQLite 市场数据缓存)]
-  C --> R
-  E --> G[风险门与订单安全]
-  R --> G
-  G --> P[纸面交易]
-  G --> N[受治理的事件与通知]
-  E --> D[(SQLite + JSONL 强审计)]
-  P --> D
-  N --> D
-  D --> Q[复盘 / 绩效 / 历史回放]
-  B[IB / TQS / QMT] -. 未实现时显式拒绝 .-> G
+```text
+官方或公共来源
+  -> magic-market-data-rs 固定 Git revision 的 Provider
+  -> magic-market-core DataBatch + SourceEvidence
+  -> magic-market-router 完整批次 admission
+  -> stock_analysis::data_gateway
+  -> persistence / research / selection / risk / review / notification
 ```
 
-### 分层职责
+只有 `src/data_gateway/**` 可以构造 Magic Provider。业务模块不得保留金融源 URL、HTTP transport、协议 parser 或自建跨源 fallback。
 
-| 层 | 主要路径 | 职责 |
-| --- | --- | --- |
-| 应用入口 | `src/main.rs`, `src/bin/monitor/`, `src/bin/*.rs` | 装配运行模式、一次性任务、监控、复盘、回测和数据导入 |
-| 数据接入 | `src/data_provider/`, `src/search_service/`, `src/news/`, `src/broker.rs` | 连接真实公共源，解析协议，校验完整批次、价格、时间与来源 |
-| 持久化与审计 | `src/database/`, `migrations/`, `src/event/`, `src/push_l7/` | SQLite 市场数据缓存，以及账户快照、JSONL 历史、订单哈希链、投递结果和五年强审计边界 |
-| 研究与决策 | `src/analyzer/`, `src/indicators/`, `src/strategy/`, `src/pipeline/`, `src/opportunity/`, `src/decision/`, `src/agent/` | 技术/基本面分析、策略回测、机会发现、多 Agent 研判与最终决策 |
-| 风险与纸面执行 | `src/risk/`, `src/trading/`, `src/portfolio/`, `src/performance/` | 环境隔离、订单安全、账户/数据模式、纸面成交、持仓和绩效 |
-| 事件、通知与复盘 | `src/bus/`, `src/push_l1/`, `src/push_l2/`, `src/push_l4/`–`push_l7/`, `src/notification/`, `src/review/` | 事件标准化、去重、治理、路由、通道确认、统计与事后复盘 |
+Magic TDX 是 A 股行情路由的第一个候选，不是每次请求都必然采用的来源。只有通过完整性、新鲜度和证据门禁的批次才能胜出；其他公开候选只由 Magic Router 选择。
 
-依赖方向以事实链为主：公共数据先通过 Provider 校验；有效批次可以直接进入研究，写市场数据
-缓存失败时会告警但不会把事实替换成假数据。本地账户快照走独立证据校验，不经过 Provider。
-风险层决定决策能否进入纸面执行或通知；账户、订单、成交与投递结果则必须进入对应的强审计
-边界。调用方不能绕过风险层自行制造成交事实。
+消费者不能直接连接腾讯、Sina、百度、东方财富、巨潮或交易所接口。
 
-## 关键数据流
+每次请求只接纳一个完整批次。缺失、过期、部分、冲突和未支持必须保持显式，禁止跨来源拼字段、补零或用本地观察时间冒充 provider 时间。
 
-### 研究与监控
+### 当前 Gateway 能力
 
-1. Provider 从腾讯、东方财富、Sina、BaoStock、RustDX 等真实公共源取得数据。
-2. 批次进入计算前检查身份、价格、涨跌幅、时间连续性、重复/缺口和复权跳变。
-3. `pipeline`、`opportunity`、`decision` 和 `agent` 组合量化与文本证据。
-4. `risk` 根据账户状态、数据完整性和否决规则收紧或拒绝动作。
-5. 允许展示的结果经事件/推送治理层记录并发送；失败结果同样可追溯。
+下表描述当前代码边界，不代表 Gate D 已通过：
 
-### 纸面交易
+| 领域 | Gateway | 上游合同 | 当前语义 |
+| --- | --- | --- | --- |
+| A 股实时行情 | `MarketDataGateway` | Magic TDX → Tencent → Sina | TDX 当前缺少足以证明 5 秒 SLA 的高精度 `source_at`，严格路由会继续尝试 Tencent/Sina |
+| A 股日线 | `HistoricalBarsGateway` | Magic TDX → Tencent → Sina → Baidu | 未复权完整 OHLCV/amount；日线新鲜度不超过 1 个交易日 |
+| A 股指数 | `IndexDataGateway` | Magic Tencent | 强类型指数报价；不保留本地腾讯协议解析器 |
+| 分钟线、五档 | `MarketCapabilitiesGateway` | Magic TDX → Tencent → Sina | 任一来源不能证明完整批次时返回显式失败；不降级填值 |
+| A 股证券身份 | `MarketCapabilitiesGateway` | Magic Tencent → Magic Sina | 解析代码、名称与交易所；完整证券元数据仍可能 Unsupported |
+| 上市日与公司行动 | `SecurityLifecycleGateway` | Magic TDX | 上市日、除权除息等生命周期证据逐批次校验，不由身份解析器补造 |
+| 财务报表、估值统计 | `CompanyDataGateway` | Magic Sina / Tencent | 原始报表行与可选 PE/PB/市值等字段保持上游语义 |
+| 个股/盘后资金、北向统计 | `CapitalDataGateway` | Magic Eastmoney / HKEX | 资金分层与官方北向统计分开建模，禁止把成交额改称净买额 |
+| 研报、一致预期 | `ResearchDataGateway` / `ConsensusDataGateway` | Magic Eastmoney | 报告与一致预期使用各自强类型批次，不把研报预测拼成共识 |
+| 板块 | `BoardDataGateway` | Magic TDX / Eastmoney | TDX 提供目录/成员，Eastmoney 提供日资金流；两类证据不拼字段 |
+| 龙虎榜 | `DragonTigerGateway` | Magic Eastmoney | 当前没有交易所直连来源；不完整席位保持缺失 |
+| 公告 | `EventCalendarGateway` | Magic CNInfo | 全市场公告身份、代码、标题、provider 时间和规范 URL |
+| 全球财经新闻 | `GlobalNewsGateway` | Magic Eastmoney / CLS / Jin10 / The Paper | 各源独立完整批次；缺摘要或正文保持缺失 |
+| 个股新闻 | `SinaInstrumentNewsGateway` | Magic Sina | 按证券和时间窗口读取，区分空批次与来源不可用 |
+| 宏观发布 | `EconomicCalendarGateway` | Magic Jin10 | 当前是已发布经济数据，不冒充未来事件日历 |
+| 股指期货交割 | `FuturesDeliveryGateway` | Magic CFFEX 官方通知 | 当前真实 admission 未通过，生产保持 Disabled/Unsupported；未来也只覆盖 IF/IH/IC/IM，不使用公式推算 |
+| 全球市场 | `GlobalMarketGateway` | Magic Sina | 实时外汇保留上游时间；指数包当前缺 provider `source_at`，因此不能冒充完成时段/隔夜批次，R-08 保持显式降级 |
+| 通用 Web 研究 | `GeneralWebResearchGateway` | 已登记搜索 Provider | 研究结果保持搜索证据，不提升为金融成交事实 |
+| 盘后复盘 | `ReviewDataGateway` | Magic Eastmoney / Tonghuashun | 复盘事实按来源独立准入，不跨来源拼批次 |
 
-`broker.rs` 当前只注册真实腾讯公共行情作为执行报价来源，并要求报价不超过 5 秒。纸面订单
-随后经过 `order_safety`、账户/数据模式和不可变订单审计；`Filled`、`NotFilled`、
-`Invalidated` 是不同事实，未成交或重复写入不会发布虚假的 `ExecutionFilled`。
+### 显式未支持或尚未验收
 
-### 真实账户快照
+- 严格完整的证券主数据若上游批次不完整，会返回 exhausted/unsupported，不使用本地名称缓存补齐。
+- 通用标准化 `MoneyFlow` 需要当前未链接的授权 Provider；已接入的 Eastmoney `FundFlowSeries` 是独立合同。
+- 通用逐笔、THS/iWencai 自然语言搜索、投资者问答和国务院/工信部政策当前没有生产 Gateway；保持 unsupported，不把搜索结果提升为金融事实。THS 的 exact-date 涨停池只作为 R-03 已登记的完整批次回退。
+- CFFEX、交易所或 Eastmoney 的真实网络门禁失败仍是 Gate D 阻塞项；代码不会把网络失败改写成空数据。
+- CFFEX 之外的期货交易所交割日没有在本项目中宣称覆盖。
 
-真实账户证据由用户选择的、Git 忽略的本地 JSON 文件一次性导入 `real_account_snapshot`。
-账户号等非必要字段可以保持 SQL `NULL`；快照可作为历史审计证据，但超过 30 秒不能授权
-实时动作。这个导入边界不是券商连接，也不会读取或上传账户截图。
+## 数据与资金安全
 
-### 事件与通知
+这些约束来自 [AGENTS.md](AGENTS.md)，对开发、测试和发布都是阻塞门：
 
-事件以 `EventEnvelope` 标准化，经 dispatcher、去重和治理层进入 Console、飞书、企业微信、
-邮件或其他已配置 sink。只有通道确认成功且审计落盘后才算投递成功；历史查询和 replay
-读取同一类 `push.delivery.audit` 事实。
-
-## 数据与资金安全合同
-
-这些约束来自 [`AGENTS.md`](AGENTS.md)，是代码、测试和发布共同的阻塞门：
-
-| 领域 | 当前合同 |
+| 领域 | 合同 |
 | --- | --- |
-| 数据真实性 | 生产路径禁止 mock；来源失败必须返回显式错误，缺失字段保持空值/告警 |
-| 真实实现 | `verify/save/notify/push/sync/update_result/reconcile` 必须真实操作目标数据源；只记录日志即由 `check_fake_impl.sh` 阻塞合并 |
-| 数据质量 | 价格必须大于 0；相邻有效值变化超过 ±20%、时间缺口/重复、复权异常都必须拒绝或人工确认 |
-| 新鲜度 | 实时报价 ≤5 秒，持仓/现金 ≤30 秒，净值为同一交易日，日线最多落后 1 个交易日；周末和休市日不计交易日 |
-| 测试隔离 | 测试身份使用 `TEST_CODE`；生产拒绝测试代码，测试环境拒绝真实代码订单，测试数据库物理隔离 |
-| 订单安全 | 数量为正且是 100 股整数倍；金额不超过可用现金和 100 万元；价格在涨跌停范围内；60 秒业务 ID 防重；50 万元起要求二次确认 |
-| 审计 | 关键数据流和订单记录来源、时间与依据；订单审计不可更新/删除，保留期不少于 5 年 |
-| 规则一致性 | 去重、互斥、过滤、排序和限额先登记业务规则；配置阈值与设计文档必须互相引用 |
+| 数据真实性 | 生产路径禁止 mock；来源失败返回显式错误，缺失字段保持空值或告警 |
+| 数据质量 | 价格必须大于 0；时间缺口/重复和拆分、分红异常必须显式拒绝；BR-171 对相邻收盘变化超过 ±20% 的批次要求人工证据准入 |
+| 新鲜度 | 实时报价 ≤5 秒；持仓/现金 ≤30 秒；净值同交易日；日线最多落后 1 个交易日 |
+| 测试隔离 | 测试使用 `TEST_CODE` 和物理隔离的数据库、日志、审计与通知路径 |
+| 订单安全 | 数量为正且是 100 股整数倍；金额不超过可用现金和 100 万元；60 秒业务 ID 防重；50 万元起二次确认 |
+| 审计 | 关键采集、决策、投递和订单保留来源、时间、依据与不可逆身份；强审计保留不少于 5 年 |
+| 规则登记 | 去重、互斥、过滤、排序和 limit 必须先登记到 `docs/business_rules.md` |
 
-## 主要入口
+## 持久化职责
 
-先用 `--help` 核对当前命令，不依赖 README 中可能随版本变化的参数细节：
+项目有三个职责不同的 SQLite 数据库，不能相互替代：
 
-```bash
-cargo run --bin stock_analysis -- --help
-cargo run --bin monitor -- --help
-```
-
-| 入口 | 用途 |
+| 路径 | 职责 |
 | --- | --- |
-| `cargo run --bin stock_analysis -- ...` | 单次股票分析、市场复盘、龙虎榜、产业链或定时分析 |
-| `cargo run --bin monitor` | 常驻盘中/盘后监控；可能访问真实数据和已配置通知通道 |
-| `cargo run --bin monitor -- --review` | 一次盘后复盘，完成后退出 |
-| `cargo run --bin monitor -- --history --date=YYYY-MM-DD` | 只读事件历史查询，不进入常驻循环 |
-| `cargo run --bin rsi_optimize -- compare` | 对比全部 RSI 预设并生成策略研究、回测报告和图表 |
-| `cargo run --bin lhb_query -- ...` | 龙虎榜查询 |
-| `cargo run --bin import_real_account_snapshot -- ...` | 从用户指定的本地忽略文件导入一份严格校验、追加不可变的账户快照 |
-| `tools/one_shot/backfill_daily.sh` | 日线新鲜度门失败时回补真实公共数据 |
+| `data/stock_analysis.db` | 主业务库：行情缓存、研究结果、纸面交易、用户快照、复盘和采集审计 |
+| `data/push_analytics.db` | 推送分析库：L7 投递与治理统计。测试使用 `data/test/push_analytics.db` |
+| `data/durable_delivery.sqlite3` | BR-192 计数型投递账本：预算、冷却、去重、尝试、receipt、恢复和人工处置。路径固定在编译期仓库根，不能由 `DATABASE_PATH`、运行时 CWD 或环境覆盖 |
 
-`--replay-force`、生产 `--push` 和常驻 monitor 都可能产生外部效果，不属于无副作用的快速
-体验命令。`--test --e2e` 只允许配合隔离数据库和 `TEST_CODE` 数据使用。
+JSONL 事件、投递、选择和复盘审计是独立文件边界，不属于上述 SQLite。测试使用独立的
+`data/test/TEST_CODE*/...` 数据库、日志和审计根；生产与测试必须物理隔离，回滚不得删除任何账户、持仓、订单或审计证据。
 
-## 本地准备
+## 配置
 
-### 1. 安装依赖并创建配置
-
-需要稳定版 Rust、Cargo 和 SQLite。复制环境模板后只填写实际使用的源/通道；不要把 `.env`
-或真实账户证据加入 Git。
+需要可用的 Rust/Cargo、SQLite CLI 和真实网络访问。仓库不限定单独的 `rust-toolchain` 文件；实际兼容性以锁文件、CI 和本地门禁为准。
 
 ```bash
 cp .env.example .env
 cargo build --workspace --all-features
 ```
 
-核心配置包括 `STOCK_LIST`、数据库路径、所选 LLM 凭据和通知通道。未配置的外部能力应保持
-不可用，而不是使用演示值。
+常用配置：
 
-### 2. 运行只读或研究入口
+- `STOCK_LIST`：六位 A 股代码，逗号分隔；
+- `DATABASE_PATH`：monitor、通知与运行时主业务库路径；
+- `STOCK_DB`：仅供显式读取它的回填、模拟器和合规脚本等离线工具使用；monitor 不读取此变量；
+- `MONITOR_ENABLED`：仅控制裸 `monitor` 是否进入长驻服务，默认 `false`；`--test`、`--review` 等显式终端命令不受此开关拦截；
+- `MONITOR_REVIEW_TIMEOUT_SECS`：严格复盘顶层超时，默认 300 秒；
+- `SCHEDULE_ENABLED`、`LHB_MODE`、`MARKET_REVIEW_ENABLED`：属于 `stock_analysis` 二进制的模式选择，不控制 `monitor`；同名 CLI 参数与环境开关按实现的优先级解析，并非全局互斥配置；
+- `BROKER_SOURCE`：执行行情入口，当前 `magic_tdx`、`magic`、`public` 都指向同一统一 Gateway；
+- `NEWS_POLL_INTERVAL`：统一新闻 Gateway 的轮询间隔，默认 120 秒；
+- `STOCK_ANALYSIS_NEWS_AI_SHADOW_ENABLE`：BR-172 不推送的 NewsAI 不可变审计影子链路，默认 `false`；启用时需配置 `LLM_ROLE_NEWS_AI` 及对应真实模型凭据；
+- LLM、搜索和通知变量：只在对应能力实际启用时填写。
+
+不要提交 `.env`、API Key、Webhook、账户截图或本地账户证据。未配置的能力保持不可用，不能使用示例值进入生产。
+
+QMT 仅作为尚未接入的券商执行边界保留，不包含 `qmt-parser` 数据解析依赖。
+
+## 运行
+
+先查看当前参数，避免依赖历史文档中的旧命令：
 
 ```bash
-# 盘后复盘（会访问真实数据；配置通知后可能发送消息）
-cargo run --bin monitor -- --review
-
-# 查看某日事件历史
-cargo run --bin monitor -- --history --date=2026-07-17
-
-# 参数研究与回测
-cargo run --bin rsi_optimize -- compare
+cargo run --bin stock_analysis -- --help
+cargo run --bin monitor -- --help
 ```
 
-### 3. 本地导入真实账户历史证据
+常用入口：
 
-证据文件必须位于 Git 忽略路径。成功摘要只输出记录 ID、插入状态和当日盈亏是否为空，不会
-输出账户金额或证券身份；校验失败信息可能包含输入的会计数值，只应在受保护的本地终端
-查看，不得复制到 Issue、PR 或公共日志：
+```bash
+# 隔离 E2E：完整渲染 48 个 active monitor 模板，并向独立的非生产飞书
+# 会话发送带 TEST_CODE 标签的验收批次；任一回执缺失即非零退出。
+# 运行前必须配置 BR196_FEISHU_TENANT_ID / BR196_FEISHU_APP_ID /
+# BR196_FEISHU_CONVERSATION_ID，将该目标的身份哈希登记到 release-pinned
+# non_production_acceptance allowlist；MAGICLAW_BIN/HOME 必须指向同一独立
+# 非生产 app/account 配置，并显式开启验收外发。
+BR196_LIVE_FEISHU_ACCEPTANCE=1 cargo run --bin monitor -- --test
+
+# 同一完整模板目录只渲染并写 TEST_CODE 审计，不向飞书发送
+cargo run --bin monitor -- --test --push-dry-run
+
+# 隔离验证严格复盘会在没有真实账户证据时失败关闭；不访问生产库、不外发
+cargo run --bin monitor -- --test --review
+
+# 严格盘后复盘；可能访问真实数据并使用已配置的通知通道
+cargo run --bin monitor -- --review
+
+# 常驻监控；会访问真实数据并可能产生外部通知
+MONITOR_ENABLED=true cargo run --bin monitor
+
+# 日线超过一个交易日时执行真实回填
+STOCK_DB=data/stock_analysis.db STOCK_LIST=000001 \
+  bash tools/one_shot/backfill_daily.sh
+```
+
+登记独立测试目标时，只输出域分离后的目标哈希，不输出三个原始标识：
+
+```bash
+printf '%s\0tenant_id=%s\napp_id=%s\nconversation_id=%s\n' \
+  'stock_analysis.br196.feishu_target_identity.v1' \
+  "$BR196_FEISHU_TENANT_ID" "$BR196_FEISHU_APP_ID" \
+  "$BR196_FEISHU_CONVERSATION_ID" | shasum -a 256
+```
+
+把得到的 64 位小写哈希登记到
+`config/br196_non_production_feishu_targets.toml` 后，还必须同步更新并评审
+`br196_transport.rs` 中的 release-pinned allowlist 文件哈希。没有独立测试会话时，
+裸 `--test` 按设计退出 2；使用 `--test --push-dry-run` 完成本地全模板检查。
+三个 `BR196_FEISHU_*` 字段不会回退读取默认 MagicLaw 或仓库 `.env`；每批外发前
+还会复验 `MAGICLAW_HOME/.env` 中的 `FEISHU_ACCOUNT_ID`、`FEISHU_APP_ID` 与许可
+目标一致。测试环境即使继承 `ALERT_WEBHOOK_URL`，启动健康告警也会在解析 URL
+或构造 HTTP 请求前隔离。
+
+`monitor --review` 只执行已登记的严格盘后 dispatcher 子集，不等于常驻服务中的完整 19:00 深度 AI 分析。它可能请求真实公开数据、读写主业务库和审计，并通过已配置的真实通知通道投递。
+
+`V10_DRY_RUN_PUSH=1` 只属于 `--test` 的 TEST_CODE 隔离运行时；`--test`
+会自动设置该变量并把 durable delivery 固定到
+`data/test/TEST_CODE*/durable_delivery.sqlite3`。普通 `--review` 或常驻生产
+monitor 携带该变量会在打开 durable delivery 数据库、预留计数投递或调用
+authoritative sink 之前显式退出（exit 2），避免测试回执进入生产审计。BR-196
+只有在 TEST_CODE 命名空间、显式 live-acceptance opt-in、三个精确测试目标字段
+以及 release-pinned 非生产目标 allowlist 全部成立时，才允许 `--test` 的模板验收
+批次绕过该 dry-run 开关。普通生产飞书目标在 denylist 中，不能用于模板测试。
+每批均要求飞书 CLI 返回可验证的 `message_id` 与 `platform_msg_id`，且不会写入
+生产 counted-delivery 审计。没有独立测试目标时使用
+`--test --push-dry-run`，它仍会完整渲染并核对 48 个 active 模板，但不进行任何
+外部发送。`--test --review` 是严格复盘的测试隔离入口，不等价于完整模板检查。
+
+`monitor --test`、`monitor --review` 和常驻 monitor 的成功退出含义不同。严格复盘没有任何确认投递时可以按合同非零退出，不能把“无数据”改写成成功。
+
+导入本地真实账户历史证据：
 
 ```bash
 cargo run --bin import_real_account_snapshot -- \
@@ -162,54 +198,62 @@ cargo run --bin import_real_account_snapshot -- \
   --evidence <ignored-local-manifest.json>
 ```
 
-### 4. 回补日线新鲜度
-
-周末不产生交易数据；脚本和合规门按交易日历判断。如果最新日线超过 1 个交易日：
+BR-171 日线跳变确认是人工数据准入，不是选股过滤。先只读取得当前
+日线与证券生命周期证据：
 
 ```bash
-STOCK_DB=data/stock_analysis.db STOCK_LIST=000001 \
-  bash tools/one_shot/backfill_daily.sh
+cargo run --bin confirm_daily_change -- \
+  --code 600396 --days 60 \
+  --database data/stock_analysis.db
 ```
 
-生产运行应把 `STOCK_LIST` 换成明确需要维护的标的集合，并检查整批成功结果。
+输出中的 `evidence_token` 绑定代码、相邻日期/价格、涨跌幅、日线
+provider/source/batch 以及上市日/公司行动批次。复核后必须显式提交完全
+相同的日期和 token；命令会重新采集并在证据变化时拒绝写入：
 
-## 工程门禁
+只读审查的 `--database` 可省略，此时使用 `DATABASE_PATH` 或默认主库；
+`--confirm` 写入不可变确认记录时必须显式提供 `--database`。
 
-仓库按 Gate A → B → C → D 发布：设计与业务规则先行，随后是实现/失败路径、合规，最后是
-覆盖率和真实数据证据。核心命令是：
+```bash
+cargo run --bin confirm_daily_change -- \
+  --code 600396 --days 60 --confirm \
+  --previous-date 2026-07-23 --current-date 2026-07-24 \
+  --evidence-token <64位小写SHA-256> \
+  --database data/stock_analysis.db \
+  --operator <操作员身份> \
+  --reason <复核依据>
+```
+
+确认记录只追加、不可更新或删除。禁止用环境变量、静态 IPO/除权缓存
+或自动脚本代替这次显式人工决定。
+
+## 开发与发布门禁
+
+统一数据切换遵循 BR-158、BR-159、BR-164 和 BR-168。当前设计见 [最终切换设计](docs/superpowers/specs/2026-07-25-unified-data-final-cutover-design.md)。
+
+最低验证命令：
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features -- --test-threads=1
 bash tools/compliance/check.sh
-cargo build --release --workspace --all-features
+git diff --check
 
 cargo llvm-cov --workspace --all-features --json \
   --output-path target/coverage/coverage.json -- --test-threads=1
 python3 tools/coverage/check_thresholds.py target/coverage/coverage.json
+cargo build --release --bin monitor
 ```
 
-Gate D 要求全仓行覆盖率至少 80%，核心交易/数据链路至少 95%。覆盖阈值不能下调，也不能
-通过排除生产代码、删除分母或调用真实下单来换取通过。
+Gate D 还要求全仓行覆盖率至少 80%、核心交易/数据链路至少 95%、真实数据门禁、独立审查和完整 PR 证据。任一项未通过时，状态只能是 In Progress 或 Blocked。
 
-## 当前限制
+## 文档
 
-- IB、TQS、QMT 券商 SDK 尚未接入；`BROKER_SOURCE` 当前只支持 `public|tencent`。
-- 真实账户快照是本地、人工选择的历史证据，不是持续券商同步。
-- 系统没有自动实盘订单出口；纸面交易结果不能视为券商成交确认。
-- 部分公共数据源和 LLM/通知通道依赖网络、凭据与第三方可用性，失败时会显式拒绝对应批次。
-- `docs/v9.x`–`docs/v18.x` 记录架构演进，其中的提案和历史完成声明不覆盖当前代码事实。
-
-## 文档导航
-
-- [仓库强制规则](AGENTS.md)
+- [工程规则](docs/ENGINEERING_RULES_V2.md)
 - [业务规则注册表](docs/business_rules.md)
-- [文档总索引](docs/README.md)
-- [v16.x 当前可执行合同](docs/v16.x/README.md)
-- [v16.x 完整性审计](docs/v16.x/v16.x-completion-audit-2026-07-19.md)
-- [Gate D 设计与数据安全收口](docs/superpowers/specs/2026-07-17-repository-history-and-gate-remediation-design.md)
-- [Gate D 覆盖率实施计划](docs/superpowers/plans/2026-07-18-gate-d-coverage-closure.md)
+- [文档索引](docs/README.md)
+- [统一 Gateway / Magic TDX 接入](docs/integrations/magic-tdx-stock-analysis.md)
+- [最终数据切换设计](docs/superpowers/specs/2026-07-25-unified-data-final-cutover-design.md)
 
-历史文档用于理解决策背景；生产行为以当前代码、业务规则、合规脚本和最近一次可复验门禁
-结果为准。
+版本目录记录历史决策，不代表当前生产路径。生产行为以当前代码、业务规则、合规脚本和最近一次可复验门禁结果为准。

@@ -4,7 +4,9 @@ use diesel::prelude::*;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use super::position_chain::{append_assignment_and_link_on_conn, PositionChainStoreError};
 use super::DatabaseManager;
+use crate::data_gateway::PositionChainAssignment;
 use crate::models::NewStockPosition;
 use crate::schema::stock_position;
 
@@ -63,6 +65,14 @@ struct AuditChainRow {
     previous_hash: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     record_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OrderAuditAppendReceipt {
+    pub order_audit_id: i64,
+    pub previous_hash: String,
+    pub record_hash: String,
+    pub created_at: String,
 }
 
 fn audit_chain_error(message: impl Into<String>) -> diesel::result::Error {
@@ -176,10 +186,10 @@ pub(super) fn initialize_order_audit_chain(conn: &mut SqliteConnection) -> diese
     })
 }
 
-pub(crate) fn insert_order_audit_query(
+pub(crate) fn insert_order_audit_with_receipt_query(
     conn: &mut SqliteConnection,
     record: &OrderAuditRecord<'_>,
-) -> diesel::QueryResult<usize> {
+) -> diesel::QueryResult<OrderAuditAppendReceipt> {
     let previous_hash = validate_order_audit_chain(conn)?;
     let rows = diesel::sql_query(
         "INSERT INTO order_audit
@@ -212,7 +222,20 @@ pub(crate) fn insert_order_audit_query(
     )
     .get_result::<PersistedOrderAudit>(conn)?;
     append_chain_row(conn, &previous_hash, &audit)?;
-    Ok(rows)
+    let record_hash = calculate_record_hash(&previous_hash, &audit)?;
+    Ok(OrderAuditAppendReceipt {
+        order_audit_id: audit.id,
+        previous_hash,
+        record_hash,
+        created_at: audit.created_at,
+    })
+}
+
+pub(crate) fn insert_order_audit_query(
+    conn: &mut SqliteConnection,
+    record: &OrderAuditRecord<'_>,
+) -> diesel::QueryResult<usize> {
+    insert_order_audit_with_receipt_query(conn, record).map(|_| 1)
 }
 
 pub(super) fn insert_order_audit(
@@ -229,6 +252,7 @@ pub(super) fn insert_order_audit(
     .map_err(|error| format!("insert order_audit and hash evidence: {error}"))
 }
 
+#[cfg(test)]
 fn save_position_with_audit_on_conn(
     conn: &mut SqliteConnection,
     position: &NewStockPosition,
@@ -241,6 +265,37 @@ fn save_position_with_audit_on_conn(
         if insert_order_audit_query(conn, audit)? != 1 {
             return Err(diesel::result::Error::RollbackTransaction);
         }
+        Ok(())
+    })
+}
+
+fn save_position_with_audit_and_assignment_on_conn(
+    conn: &mut SqliteConnection,
+    position: &NewStockPosition,
+    audit: &OrderAuditRecord<'_>,
+    assignment: &PositionChainAssignment,
+) -> Result<(), PositionChainStoreError> {
+    if position.code != assignment.code || position.code != audit.code {
+        return Err(PositionChainStoreError::InvalidInput(format!(
+            "position/audit/assignment code mismatch: position={} audit={} assignment={}",
+            position.code, audit.code, assignment.code
+        )));
+    }
+    if position.chain_name.is_some() {
+        return Err(PositionChainStoreError::InvalidInput(
+            "BR-170 new position must not carry a raw chain_name".to_string(),
+        ));
+    }
+    conn.immediate_transaction::<_, PositionChainStoreError, _>(|conn| {
+        let inserted = diesel::insert_into(stock_position::table)
+            .values(position)
+            .execute(conn)?;
+        if inserted != 1 || insert_order_audit_query(conn, audit)? != 1 {
+            return Err(PositionChainStoreError::Database(
+                diesel::result::Error::RollbackTransaction,
+            ));
+        }
+        append_assignment_and_link_on_conn(conn, assignment)?;
         Ok(())
     })
 }
@@ -282,17 +337,18 @@ impl DatabaseManager {
         insert_order_audit(&mut conn, record)
     }
 
-    pub fn save_position_with_audit(
+    pub fn save_position_with_audit_and_assignment(
         &self,
         position: &NewStockPosition,
         audit: &OrderAuditRecord<'_>,
+        assignment: &PositionChainAssignment,
     ) -> Result<(), String> {
         crate::risk::env_guard::validate_symbol_for_current_env(&position.code)?;
         let mut conn = self
             .get_conn()
-            .map_err(|error| format!("audited position DB connection: {error}"))?;
-        save_position_with_audit_on_conn(&mut conn, position, audit)
-            .map_err(|error| format!("audited open-position transaction: {error}"))
+            .map_err(|error| format!("audited position-chain DB connection: {error}"))?;
+        save_position_with_audit_and_assignment_on_conn(&mut conn, position, audit, assignment)
+            .map_err(|error| format!("BR-170 atomic open-position transaction: {error}"))
     }
 
     pub fn close_position_with_audit(
@@ -493,7 +549,7 @@ mod tests {
             quantity: 100,
             status: "open".to_string(),
             st_type: None,
-            chain_name: Some("TEST_CODE_CHAIN".to_string()),
+            chain_name: None,
         };
         let audit = OrderAuditRecord {
             business_order_id: "TEST_ORDER_BR086_ROLLBACK",
@@ -514,5 +570,108 @@ mod tests {
         assert_eq!(table_count(&mut conn, "stock_position"), 0);
         assert_eq!(table_count(&mut conn, "order_audit"), 0);
         assert_eq!(table_count(&mut conn, "order_audit_chain"), 0);
+    }
+
+    fn br170_assignment() -> crate::data_gateway::PositionChainAssignment {
+        crate::data_gateway::derive_position_chain(
+            "TEST_CODE_600396",
+            crate::data_gateway::GatewayBatch::Available {
+                records: vec![crate::data_gateway::BoardMembershipRecord {
+                    instrument_code: "TEST_CODE_600396".to_string(),
+                    board_code: "TEST_CODE_INDUSTRY".to_string(),
+                    board_name: "测试电力".to_string(),
+                    kind: crate::data_gateway::BoardKind::Industry,
+                }],
+                evidence: crate::data_gateway::BatchEvidence {
+                    provider: magic_market_core::ProviderId::Tdx,
+                    source: "TEST_CODE_tdx-board-memberships".to_string(),
+                    source_at: None,
+                    observed_at: "2026-07-27T09:30:01+08:00".to_string(),
+                    batch_id: "TEST_CODE_BR170_ATOMIC_BATCH".to_string(),
+                },
+            },
+        )
+        .expect("valid assignment batch")
+        .expect("one assignment")
+    }
+
+    fn br170_position() -> NewStockPosition {
+        NewStockPosition {
+            code: "TEST_CODE_600396".to_string(),
+            name: "原子开仓测试".to_string(),
+            buy_date: "2026-07-27".to_string(),
+            buy_price: 10.0,
+            quantity: 100,
+            status: "open".to_string(),
+            st_type: None,
+            chain_name: None,
+        }
+    }
+
+    fn br170_audit() -> OrderAuditRecord<'static> {
+        OrderAuditRecord {
+            business_order_id: "TEST_ORDER_BR170_ATOMIC",
+            source: "DatabaseTest",
+            decision_basis: "TEST_CODE complete candidate assignment",
+            side: "buy",
+            code: "TEST_CODE_600396",
+            requested_price: 10.0,
+            execution_price: Some(10.0),
+            quantity: 100,
+            quote_observed_at: Some("2026-07-27T09:30:00+08:00"),
+            outcome: "Filled",
+            failure_reason: None,
+        }
+    }
+
+    #[test]
+    fn br170_open_fill_atomically_commits_audit_position_assignment_and_link() {
+        let mut conn = isolated_connection();
+        let assignment = br170_assignment();
+
+        save_position_with_audit_and_assignment_on_conn(
+            &mut conn,
+            &br170_position(),
+            &br170_audit(),
+            &assignment,
+        )
+        .expect("atomic BR-170 open fill");
+
+        assert_eq!(table_count(&mut conn, "stock_position"), 1);
+        assert_eq!(table_count(&mut conn, "order_audit"), 1);
+        assert_eq!(table_count(&mut conn, "order_audit_chain"), 1);
+        assert_eq!(table_count(&mut conn, "position_chain_assignment"), 1);
+        let linked = crate::database::position_chain::PositionChainStore::new(&mut conn)
+            .linked("TEST_CODE_600396")
+            .expect("linked assignment")
+            .expect("linked position");
+        assert_eq!(linked.assignment_id, assignment.assignment_id);
+        assert_eq!(linked.board_name, "测试电力");
+        validate_order_audit_chain(&mut conn).expect("order chain remains valid");
+    }
+
+    #[test]
+    fn br170_assignment_failure_rolls_back_audit_position_and_link() {
+        let mut conn = isolated_connection();
+        diesel::sql_query(
+            "CREATE TRIGGER test_fail_position_chain_assignment_insert
+             BEFORE INSERT ON position_chain_assignment
+             BEGIN SELECT RAISE(ABORT, 'TEST_CODE forced assignment failure'); END",
+        )
+        .execute(&mut conn)
+        .expect("install assignment failure trigger");
+
+        save_position_with_audit_and_assignment_on_conn(
+            &mut conn,
+            &br170_position(),
+            &br170_audit(),
+            &br170_assignment(),
+        )
+        .expect_err("assignment failure must roll back the full fill");
+
+        assert_eq!(table_count(&mut conn, "stock_position"), 0);
+        assert_eq!(table_count(&mut conn, "order_audit"), 0);
+        assert_eq!(table_count(&mut conn, "order_audit_chain"), 0);
+        assert_eq!(table_count(&mut conn, "position_chain_assignment"), 0);
     }
 }

@@ -1,5 +1,5 @@
 use super::*;
-use crate::data_provider::financials::FinancialPeriod;
+use crate::company_financials::FinancialPeriod;
 use crate::data_provider::{AdjustType, KlineData};
 
 fn kline() -> KlineData {

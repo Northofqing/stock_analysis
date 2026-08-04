@@ -15,6 +15,7 @@
 use anyhow::{Context, Result};
 use log::{info, warn};
 
+use crate::data_gateway::{AdmittedDailyBars, HistoricalBarsGateway};
 use crate::data_provider::KlineData;
 use crate::database::DatabaseManager;
 use crate::monitor::data_quality::{validate_daily_freshness, DqStats, FreshnessConfig};
@@ -29,31 +30,29 @@ impl AnalysisPipeline {
     pub(super) async fn fetch_and_save_data(&self, code: &str) -> Result<Vec<KlineData>> {
         info!("[{}] 开始获取数据...", code);
 
-        // 从数据源获取数据
-        // 使用 spawn_blocking 将同步 TCP/HTTP 调用放到独立的阻塞线程池，
-        // 不占用 tokio worker 线程，避免饿死异步任务（timeout/新闻搜索/AI 调用）。
-        let dm = self.data_manager.clone();
-        let code_owned = code.to_string();
-        let (data, source) =
-            tokio::task::spawn_blocking(move || dm.get_daily_data(&code_owned, 30))
-                .await
-                .context("spawn_blocking panicked")?
-                .context("获取数据失败")?;
+        // HistoricalBarsGateway owns provider construction, routing,
+        // validation and blocking isolation. Requiring AdmittedDailyBars keeps
+        // the records inseparable from the batch evidence that admitted them.
+        let batch = HistoricalBarsGateway::new()
+            .required_daily_bars_async(code, 30)
+            .await
+            .with_context(|| format!("[{code}] 获取统一日线批次失败"))?;
+        crate::monitor::data_mode::mark_capability_success(
+            crate::monitor::data_mode::Capability::Kline,
+        )
+        .map_err(anyhow::Error::msg)?;
 
-        self.finalize_fetched_data(code, data, source, chrono::Local::now())
+        self.finalize_fetched_data(code, &batch, chrono::Local::now())
     }
 
     fn finalize_fetched_data(
         &self,
         code: &str,
-        data: Vec<KlineData>,
-        source: &str,
+        batch: &AdmittedDailyBars,
         observed_at: chrono::DateTime<chrono::Local>,
     ) -> Result<Vec<KlineData>> {
-        if data.is_empty() {
-            warn!("[{}] 获取到的数据为空", code);
-            return Ok(data);
-        }
+        let data = batch.records();
+        let evidence = batch.evidence();
 
         // AGENTS 2.4: 日线/历史数据超过 1 个交易日直接阻断。
         let latest_date = data[0].date;
@@ -76,29 +75,38 @@ impl AnalysisPipeline {
         }
 
         // Codex review P0 #2 修复: 删掉 pipeline 路径的二次质检.
-        // 之前: pipeline/data.rs:68 重复调 validate_daily_kline_quality
-        //   → 但 dm.get_daily_data 内部已走 fallback::fetch_kline_with_fallback, 每个 provider 都跑过质检.
-        //   → 二次校验是纯重复计算, 且注释"pipeline 路径不走 fallback"从 commit 2 (8cab678) 起已失真.
-        // 现在: 校验统一在 fallback.rs 入口做, pipeline 拿到的就是已通过质检的 data.
+        // 校验统一由 HistoricalBarsGateway admission 完成，pipeline
+        // 拿到的就是已通过质检且保留批次证据的 data。
 
-        info!("[{}] 从 {} 获取到 {} 条数据", code, source, data.len());
+        info!(
+            "[{}][BR-159] 日线证据 provider={:?} source={} source_at={} observed_at={} batch_id={} records={}",
+            code,
+            evidence.provider,
+            evidence.source,
+            evidence.source_at.as_deref().unwrap_or("absent"),
+            evidence.observed_at,
+            evidence.batch_id,
+            data.len()
+        );
 
         // 保存到数据库
         if let Some(db) = DatabaseManager::try_get() {
-            match db.save_kline_data(code, &data, source) {
+            match db.save_kline_data(code, data, &evidence.source) {
                 Ok(count) => info!("[{}] 已保存 {} 条K线数据到数据库", code, count),
                 Err(e) => warn!("[{}] 保存K线数据到数据库失败: {}", code, e),
             }
         }
 
-        Ok(data)
+        Ok(data.to_vec())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data_gateway::BatchEvidence;
     use crate::data_provider::AdjustType;
+    use magic_market_core::ProviderId;
 
     fn kline(date: chrono::NaiveDate) -> KlineData {
         KlineData {
@@ -135,37 +143,57 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn resolved_daily_batch_preserves_empty_and_rejects_stale_evidence() {
+    fn admitted(records: Vec<KlineData>) -> AdmittedDailyBars {
+        AdmittedDailyBars::from_test_fixture(
+            "TEST_CODE_600000",
+            records,
+            BatchEvidence {
+                provider: ProviderId::Tdx,
+                source: "TEST_CODE_magic_tdx_daily".to_string(),
+                source_at: Some("2026-07-26T01:00:00Z".to_string()),
+                observed_at: "2026-07-26T01:00:01Z".to_string(),
+                batch_id: "TEST_CODE_daily_batch".to_string(),
+            },
+        )
+        .expect("TEST_CODE admitted daily batch")
+    }
+
+    #[test]
+    fn resolved_daily_batch_rejects_empty_and_stale_evidence() {
         let pipeline = AnalysisPipeline::new(super::super::PipelineConfig::default()).unwrap();
         let now = chrono::Local::now();
-        assert!(pipeline
-            .finalize_fetched_data("TEST_CODE_EMPTY", Vec::new(), "test", now)
-            .unwrap()
-            .is_empty());
+        assert!(AdmittedDailyBars::from_test_fixture(
+            "TEST_CODE_600000",
+            Vec::new(),
+            BatchEvidence {
+                provider: ProviderId::Tdx,
+                source: "TEST_CODE_magic_tdx_empty".to_string(),
+                source_at: Some("2026-07-26T01:00:00Z".to_string()),
+                observed_at: "2026-07-26T01:00:01Z".to_string(),
+                batch_id: "TEST_CODE_empty_batch".to_string(),
+            }
+        )
+        .is_err());
 
         let stale = now.date_naive() - chrono::Duration::days(30);
+        let batch = admitted(vec![kline(stale)]);
         assert!(pipeline
-            .finalize_fetched_data("TEST_CODE_STALE", vec![kline(stale)], "test", now)
+            .finalize_fetched_data("TEST_CODE_STALE", &batch, now)
             .unwrap_err()
             .to_string()
             .contains("日线新鲜度校验失败"));
     }
 
-    #[tokio::test]
+    #[test]
     #[serial_test::serial(database)]
-    async fn resolved_fresh_daily_batch_reaches_existing_persistence_boundary() {
+    fn resolved_fresh_daily_batch_reaches_existing_persistence_boundary() {
         let pipeline = AnalysisPipeline::new(super::super::PipelineConfig::default()).unwrap();
         let now = chrono::Local::now();
         let latest = crate::calendar::recent_trading_days(now.date_naive(), 1)[0];
         let data = vec![kline(latest)];
+        let batch = admitted(data.clone());
         let resolved = pipeline
-            .finalize_fetched_data(
-                "TEST_CODE_PIPELINE_DATA",
-                data.clone(),
-                "test_provider",
-                now,
-            )
+            .finalize_fetched_data("TEST_CODE_PIPELINE_DATA", &batch, now)
             .unwrap();
         assert_eq!(resolved[0].date, data[0].date);
         assert_eq!(resolved[0].close, 10.1);

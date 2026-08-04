@@ -297,7 +297,7 @@ impl Detector {
     pub fn check_index_plunge(&self, idx: &IndexSnapshot) -> Option<AlertEvent> {
         // 修复 P3.5: 阈值从 -1.0 写死 → ATR 自适应
         // 之前: 5 分钟跌 ≥ 1% 告警 (无视大盘波动率, 牛市震荡市都触发)
-        // 现在: 阈值 = -ATR(20) × 2.0 (默认配置, P3.1 集中 risk.toml)
+        // 现在: 阈值 = -ATR(20) × 2.0；ATR 缺失时使用已加载的 AlertConfig 回退值
         // 牛市: ATR 小 → 阈值小 (-0.6% 即可)
         // 熊市: ATR 大 → 阈值大 (-1.5% 才算崩盘)
         // 量化分析师角度: 静态 -1% 在不同波动率时期信号质量差异巨大

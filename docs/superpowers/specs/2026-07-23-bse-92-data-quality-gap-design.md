@@ -1,5 +1,10 @@
 # 北交所 92 代码段日 K 跳变阈值一致性设计
 
+> **Superseded on 2026-07-27.** `max_gap_for` 的按板块自动放行模型不符合当前
+> AGENTS.md 2.3。所有相邻有效日值绝对变化超过 20% 统一进入 BR-171
+> 人工确认门；板块、上市与公司行动证据只提供背景，不能自动确认。活动设计见
+> `2026-07-27-security-lifecycle-and-manual-daily-change-confirmation-design.md`。
+
 日期：2026-07-23
 
 状态：Gate A 已批准（全量测试失败后的根因回退修复）

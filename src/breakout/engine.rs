@@ -3,7 +3,7 @@
 use super::position;
 use super::signal::*;
 
-/// 盘中模式：仅需东财 push2 数据 + ignition，不需要 K 线
+/// 盘中模式：仅需统一 Gateway 接纳的量价/资金事实 + ignition，不需要 K 线
 pub fn screen_intraday(
     code: &str,
     name: &str,

@@ -26,23 +26,24 @@ crontab -e
 CRON_TZ=Asia/Shanghai
 # 09:00 盘前 (P-01 盘前新闻)
 0 9 * * 1-5  cd /path/to/stock_analysis && ./target/release/monitor --push  >> /tmp/monitor_push.log 2>&1
-# 10:30 盘中 (I-01/I-02/I-03/D-01)
+# 10:30 盘中 (I-01/I-02/I-03/I-04/D-01)
 30 10 * * 1-5 cd /path/to/stock_analysis && ./target/release/monitor --push  >> /tmp/monitor_push.log 2>&1
 # 11:00 盘中
 0 11 * * 1-5  cd /path/to/stock_analysis && ./target/release/monitor --push  >> /tmp/monitor_push.log 2>&1
 # 14:30 盘中
 30 14 * * 1-5 cd /path/to/stock_analysis && ./target/release/monitor --push  >> /tmp/monitor_push.log 2>&1
-# 19:00 盘后 (A-01 虚拟仓复盘)
+# 19:00 盘后 (A-01 虚拟仓复盘 + A-10 催化复盘)
 0 19 * * 1-5  cd /path/to/stock_analysis && ./target/release/monitor --push  >> /tmp/monitor_push.log 2>&1
 ```
 
-## 部署前健康检查 (--push-dry-run)
+## Legacy dispatcher smoke（`--push-dry-run`）
 
 ```bash
-# 验证 6 dispatcher 加载 (不实际推送)
+# 只验证历史 6-dispatcher 数据源/渲染链，不实际推送。
+# 它不覆盖当前 active set 新增的 I-04/A-10，不能作为完整部署健康证明。
 cd /path/to/stock_analysis && ./target/release/monitor --push-dry-run 2>&1 | head -20
 
-# 期望: 6 行 dispatcher_log 记录
+# 期望: 仅以下 6 行 legacy dispatcher_log 记录
 tail -6 data/dispatcher_log.jsonl | jq '{kind, success, snapshot_size}'
 # {"kind":"P-01-dry","success":true,"snapshot_size":3}
 # {"kind":"I-01-dry","success":true,"snapshot_size":3}
@@ -51,6 +52,10 @@ tail -6 data/dispatcher_log.jsonl | jq '{kind, success, snapshot_size}'
 # {"kind":"D-01-dry","success":true,"snapshot_size":3}
 # {"kind":"A-01-dry","success":true,"snapshot_size":1}
 ```
+
+完整的隔离模板目录可用 `monitor --test --push-dry-run` 验证；它覆盖当前登记的
+40 个 renderer 且不外发，但仍不等于生产 active dispatcher 的真实来源、准入、
+治理和 sink 健康检查。发布结论必须结合仓库 Gate C/D 命令与真实数据证据。
 
 ## logrotate 配置
 
@@ -108,7 +113,7 @@ crontab -l | grep winrate_review
 - <5% 主题清单 (建议关停)
 - 历史对比表
 
-如果新发现需要关停/加权的主题, 手动修改 `config/chain_rules.toml`:
+如果新发现需要关停/加权的主题, 手动修改 `config/chain.toml`:
 1. 关停: 加 `enabled = false` + AGENTS §2.9 边界证明注释
 2. 加权: 改 `priority` (≥80 = 加权) + 边界证明注释
 3. 跑 `bash tools/compliance/check.sh` 验证

@@ -1,0 +1,5 @@
+[net]
+# The unified market-data release is hosted in a private Git repository.
+# Use the operator's existing Git credential helper instead of libgit2 so
+# every magic-market-data crate resolves from the same immutable revision.
+git-fetch-with-cli = true

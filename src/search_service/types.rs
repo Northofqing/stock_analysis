@@ -1,15 +1,62 @@
 //! 搜索服务共享类型与抽象（原 search_service.rs 头部）
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-
 use async_trait::async_trait;
-use log::warn;
+use magic_market_core::ProviderId;
 use serde::{Deserialize, Serialize};
+
+use crate::data_gateway::{BatchEvidence, GlobalNewsRecord};
 
 // ============================================================================
 // 数据结构
 // ============================================================================
+
+/// One current-day global-news fact with the exact immutable Gateway batch
+/// that admitted it.
+///
+/// The record retains its provider-owned [`magic_market_core::SourceEvidence`].
+/// Keeping both levels together prevents downstream candidate scoring from
+/// turning a title into an unattributed string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreshFlashFact {
+    pub record: GlobalNewsRecord,
+    pub batch_evidence: BatchEvidence,
+}
+
+/// Explicit outcome for every independently requested global-news provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlashSourceStatus {
+    Available {
+        evidence: BatchEvidence,
+        admitted_records: usize,
+        stale_records: usize,
+        macro_records: usize,
+    },
+    VerifiedEmpty(BatchEvidence),
+    Unavailable {
+        provider: ProviderId,
+        source: String,
+        reason_code: String,
+        retryable: bool,
+        message: String,
+    },
+}
+
+/// Evidence-preserving aggregate over independently complete provider batches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlashFactBatch {
+    pub facts: Vec<FreshFlashFact>,
+    pub source_statuses: Vec<FlashSourceStatus>,
+}
+
+/// All global-news providers were unavailable or returned invalid projection
+/// evidence. A verified empty batch is not represented by this error.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("flash facts unavailable reason_code={reason_code} retryable={retryable}")]
+pub struct FlashFactsUnavailable {
+    pub reason_code: &'static str,
+    pub retryable: bool,
+    pub source_statuses: Vec<FlashSourceStatus>,
+}
 
 /// 新闻类型
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -43,6 +90,54 @@ pub enum Sentiment {
     Unknown,
 }
 
+/// Provenance and allowed use carried by a legacy search-shaped record.
+///
+/// BR-175: deserialized legacy values are deliberately `Unverified`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum SearchEvidence {
+    #[default]
+    Unverified,
+    ResearchOnly {
+        provider: crate::data_gateway::GeneralWebResearchProvider,
+        source: String,
+        observed_at: String,
+        batch_id: String,
+        item_id: String,
+        publication_quality: crate::data_gateway::PublicationTimeQuality,
+    },
+    GovernedSourceFact {
+        provider: String,
+        source: String,
+        observed_at: String,
+        source_at: String,
+        batch_id: String,
+        item_id: String,
+    },
+}
+
+impl SearchEvidence {
+    pub fn is_research_only(&self) -> bool {
+        matches!(self, Self::ResearchOnly { .. })
+    }
+
+    pub fn is_complete_governed_source_fact(&self) -> bool {
+        match self {
+            Self::GovernedSourceFact {
+                provider,
+                source,
+                observed_at,
+                source_at,
+                batch_id,
+                item_id,
+            } => [provider, source, observed_at, source_at, batch_id, item_id]
+                .into_iter()
+                .all(|value| !value.trim().is_empty()),
+            Self::Unverified | Self::ResearchOnly { .. } => false,
+        }
+    }
+}
+
 /// 搜索结果数据
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
@@ -66,6 +161,9 @@ pub struct SearchResult {
     pub relevance: f32,
     /// 提取的关键词
     pub keywords: Vec<String>,
+    /// 来源证据和允许用途。
+    #[serde(default)]
+    pub evidence: SearchEvidence,
 }
 
 impl SearchResult {
@@ -123,6 +221,7 @@ impl SearchResult {
             importance: 5,
             relevance: 0.5,
             keywords: Vec::new(),
+            evidence: SearchEvidence::Unverified,
         }
     }
 
@@ -322,6 +421,16 @@ pub struct SearchResponse {
     pub error_message: Option<String>,
     /// 搜索耗时（秒）
     pub search_time: f64,
+    /// 结构化失败；成功或 verified-empty 时为空。
+    #[serde(default)]
+    pub failure: Option<SearchFailureEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchFailureEvidence {
+    pub reason_code: String,
+    pub retryable: bool,
+    pub stage: String,
 }
 
 impl SearchResponse {
@@ -330,9 +439,19 @@ impl SearchResponse {
         if !self.success || self.results.is_empty() {
             return format!("搜索 '{}' 未找到相关结果。", self.query);
         }
+        if self
+            .results
+            .iter()
+            .any(|result| !result.evidence.is_research_only())
+        {
+            return format!(
+                "搜索 '{}' 的研究上下文被拒绝：缺少完整 ResearchOnly evidence。",
+                self.query
+            );
+        }
 
         let mut lines = vec![format!(
-            "【{} 搜索结果】（来源：{}）",
+            "【{} 研究发现】（ResearchOnly；来源：{}；不得作为金融事实或交易/选股依据）",
             self.query, self.provider
         )];
 
@@ -352,6 +471,34 @@ impl SearchResponse {
             success: false,
             error_message: Some(error_message),
             search_time: 0.0,
+            failure: Some(SearchFailureEvidence {
+                reason_code: "search_failed".to_string(),
+                retryable: true,
+                stage: "search_service".to_string(),
+            }),
+        }
+    }
+
+    pub fn typed_error(
+        query: String,
+        provider: String,
+        error_message: String,
+        reason_code: impl Into<String>,
+        retryable: bool,
+        stage: impl Into<String>,
+    ) -> Self {
+        Self {
+            query,
+            results: Vec::new(),
+            provider,
+            success: false,
+            error_message: Some(error_message),
+            search_time: 0.0,
+            failure: Some(SearchFailureEvidence {
+                reason_code: reason_code.into(),
+                retryable,
+                stage: stage.into(),
+            }),
         }
     }
 
@@ -364,6 +511,7 @@ impl SearchResponse {
             success: true,
             error_message: None,
             search_time: 0.0,
+            failure: None,
         }
     }
 }
@@ -389,175 +537,16 @@ pub trait SearchProvider: Send + Sync {
         true
     }
 
+    /// Whether this adapter is a user-authorized general web-search engine.
+    ///
+    /// Financial-source adapters stay false so they cannot become an implicit
+    /// fallback when a governed data Gateway is unavailable.
+    fn supports_general_web_search(&self) -> bool {
+        false
+    }
+
     /// 执行搜索
     async fn search(&self, query: &str, max_results: usize) -> SearchResponse;
-}
-
-// ============================================================================
-// API Key 管理器
-// ============================================================================
-
-/// API Key 管理器（负载均衡和故障转移）
-#[derive(Debug)]
-pub(crate) struct ApiKeyManager {
-    pub(crate) keys: Vec<String>,
-    current_index: usize,
-    usage_count: HashMap<String, usize>,
-    error_count: HashMap<String, usize>,
-}
-
-impl ApiKeyManager {
-    pub(crate) fn new(keys: Vec<String>) -> Self {
-        let usage_count = keys.iter().map(|k| (k.clone(), 0)).collect();
-        let error_count = keys.iter().map(|k| (k.clone(), 0)).collect();
-
-        Self {
-            keys,
-            current_index: 0,
-            usage_count,
-            error_count,
-        }
-    }
-
-    /// 获取下一个可用的 API Key（轮询 + 跳过错误过多的 key）
-    pub(crate) fn get_next_key(&mut self) -> Option<String> {
-        if self.keys.is_empty() {
-            return None;
-        }
-
-        // 最多尝试所有 key
-        for _ in 0..self.keys.len() {
-            let key = &self.keys[self.current_index];
-            self.current_index = (self.current_index + 1) % self.keys.len();
-
-            // 跳过错误次数过多的 key（超过 3 次）
-            if *self.error_count.get(key).unwrap_or(&0) < 3 {
-                return Some(key.clone());
-            }
-        }
-
-        // 所有 key 都有问题，重置错误计数并返回第一个
-        warn!("所有 API Key 都有错误记录，重置错误计数");
-        for count in self.error_count.values_mut() {
-            *count = 0;
-        }
-        self.keys.first().cloned()
-    }
-
-    /// 记录成功使用
-    pub(crate) fn record_success(&mut self, key: &str) {
-        *self.usage_count.entry(key.to_string()).or_insert(0) += 1;
-        // 成功后减少错误计数
-        if let Some(count) = self.error_count.get_mut(key) {
-            if *count > 0 {
-                *count -= 1;
-            }
-        }
-    }
-
-    /// 记录错误
-    pub(crate) fn record_error(&mut self, key: &str) {
-        *self.error_count.entry(key.to_string()).or_insert(0) += 1;
-        let error_count = self.error_count.get(key).unwrap_or(&0);
-        warn!(
-            "API Key {}... 错误计数: {}",
-            &key[..8.min(key.len())],
-            error_count
-        );
-    }
-}
-
-/// 提取 key 或返回错误响应（消除重复的 lock→get_next_key→unwrap 模式）
-pub(crate) fn get_key_or_error(
-    key_manager: &Arc<Mutex<ApiKeyManager>>,
-    provider_name: &str,
-    query: &str,
-) -> Result<String, SearchResponse> {
-    let mut manager = key_manager.lock().unwrap();
-    manager.get_next_key().ok_or_else(|| {
-        SearchResponse::error(
-            query.to_string(),
-            provider_name.to_string(),
-            format!("{provider_name} 未配置 API Key"),
-        )
-    })
-}
-
-/// 记录 API 调用结果到 key_manager
-pub(crate) fn record_key_result(
-    key_manager: &Arc<Mutex<ApiKeyManager>>,
-    api_key: &str,
-    success: bool,
-) {
-    let mut manager = key_manager.lock().unwrap();
-    if success {
-        manager.record_success(api_key);
-    } else {
-        manager.record_error(api_key);
-    }
-}
-
-/// key_manager 是否有可用 key（消除三个 provider 中重复的 is_available 锁模式）
-pub(crate) fn key_manager_available(key_manager: &Arc<Mutex<ApiKeyManager>>) -> bool {
-    !key_manager.lock().unwrap().keys.is_empty()
-}
-
-/// 模板方法：封装「取 key → do_search → 计时 → 记录成功/失败」统一流程，
-/// 消除 bocha / serpapi / tavily 三个 provider 中重复的编排代码。
-pub(crate) async fn run_key_managed_search<F, Fut>(
-    key_manager: &Arc<Mutex<ApiKeyManager>>,
-    provider_name: &str,
-    query: &str,
-    do_search: F,
-) -> SearchResponse
-where
-    F: FnOnce(String) -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<SearchResponse>> + Send,
-{
-    let api_key = match get_key_or_error(key_manager, provider_name, query) {
-        Ok(k) => k,
-        Err(resp) => return resp,
-    };
-
-    let start_time = std::time::Instant::now();
-    let mut response = match do_search(api_key.clone()).await {
-        Ok(resp) => resp,
-        Err(e) => {
-            record_key_result(key_manager, &api_key, false);
-            log::error!("[{}] 搜索 '{}' 失败: {}", provider_name, query, e);
-            return SearchResponse::error(
-                query.to_string(),
-                provider_name.to_string(),
-                e.to_string(),
-            );
-        }
-    };
-
-    response.search_time = start_time.elapsed().as_secs_f64();
-    record_key_result(key_manager, &api_key, response.success);
-    if response.success {
-        log::info!(
-            "[{}] 搜索 '{}' 成功，返回 {} 条结果，耗时 {:.2}s",
-            provider_name,
-            query,
-            response.results.len(),
-            response.search_time
-        );
-    }
-
-    response
-}
-
-// ============================================================================
-// 共享工具函数
-// ============================================================================
-
-/// 从 URL 提取域名作为来源（原 search_service.rs 中的 extract_domain）
-pub(crate) fn extract_domain(url: &str) -> String {
-    match url::Url::parse(url) {
-        Ok(parsed) => parsed.host_str().unwrap_or("未知来源").replace("www.", ""),
-        Err(_) => "未知来源".to_string(),
-    }
 }
 
 #[cfg(test)]
@@ -565,12 +554,21 @@ mod tests {
     use super::*;
 
     fn result(title: &str, snippet: &str) -> SearchResult {
-        SearchResult::new(
+        let mut result = SearchResult::new(
             title.to_string(),
             snippet.to_string(),
             "https://example.invalid/TEST_CODE".to_string(),
             "测试来源".to_string(),
-        )
+        );
+        result.evidence = SearchEvidence::ResearchOnly {
+            provider: crate::data_gateway::GeneralWebResearchProvider::Bocha,
+            source: "TEST_CODE_research".to_string(),
+            observed_at: "2026-07-28T08:00:00Z".to_string(),
+            batch_id: "TEST_CODE_batch".to_string(),
+            item_id: title.to_string(),
+            publication_quality: crate::data_gateway::PublicationTimeQuality::Missing,
+        };
+        result
     }
 
     #[test]
@@ -694,94 +692,21 @@ mod tests {
             vec![result("第一条", "摘要一"), result("第二条", "摘要二")],
         );
         let context = success.to_context(1);
-        assert!(context.contains("【测试查询 搜索结果】"));
+        assert!(context.contains("ResearchOnly"));
+        assert!(context.contains("不得作为金融事实"));
         assert!(context.contains("1. "));
         assert!(context.contains("第一条"));
         assert!(!context.contains("第二条"));
-    }
 
-    #[test]
-    fn api_key_manager_rotates_skips_resets_and_records_results() {
-        let mut manager = ApiKeyManager::new(vec!["key-a".to_string(), "key-b".to_string()]);
-        assert_eq!(manager.get_next_key().as_deref(), Some("key-a"));
-        assert_eq!(manager.get_next_key().as_deref(), Some("key-b"));
-        manager.record_error("key-a");
-        manager.record_error("key-a");
-        manager.record_error("key-a");
-        assert_eq!(manager.get_next_key().as_deref(), Some("key-b"));
-
-        let mut exhausted = ApiKeyManager::new(vec!["short".to_string()]);
-        for _ in 0..3 {
-            exhausted.record_error("short");
-        }
-        assert_eq!(exhausted.get_next_key().as_deref(), Some("short"));
-        assert_eq!(exhausted.error_count["short"], 0);
-        exhausted.record_error("short");
-        exhausted.record_success("short");
-        assert_eq!(exhausted.error_count["short"], 0);
-        assert_eq!(exhausted.usage_count["short"], 1);
-        assert_eq!(ApiKeyManager::new(Vec::new()).get_next_key(), None);
-    }
-
-    #[tokio::test]
-    async fn managed_search_preserves_success_failure_and_missing_key_states() {
-        let manager = Arc::new(Mutex::new(ApiKeyManager::new(vec![
-            "TEST_CODE_key".to_string()
-        ])));
-        assert!(key_manager_available(&manager));
-        assert_eq!(
-            get_key_or_error(&manager, "测试引擎", "测试查询").unwrap(),
-            "TEST_CODE_key"
-        );
-
-        let response = run_key_managed_search(&manager, "测试引擎", "成功查询", |key| async move {
-            assert_eq!(key, "TEST_CODE_key");
-            Ok(SearchResponse::success(
-                "成功查询".to_string(),
-                "测试引擎".to_string(),
-                vec![result("命中", "证据")],
-            ))
-        })
-        .await;
-        assert!(response.success);
-        assert!(response.search_time >= 0.0);
-
-        let response = run_key_managed_search(&manager, "测试引擎", "空查询", |_| async {
-            Ok(SearchResponse::error(
-                "空查询".to_string(),
-                "测试引擎".to_string(),
-                "明确无匹配".to_string(),
-            ))
-        })
-        .await;
-        assert!(!response.success);
-
-        let response = run_key_managed_search(&manager, "测试引擎", "失败查询", |_| async {
-            Err(anyhow::anyhow!("TEST_CODE transport failed"))
-        })
-        .await;
-        assert!(!response.success);
-        assert_eq!(
-            response.error_message.as_deref(),
-            Some("TEST_CODE transport failed")
-        );
-
-        record_key_result(&manager, "TEST_CODE_key", true);
-        record_key_result(&manager, "TEST_CODE_key", false);
-        let empty = Arc::new(Mutex::new(ApiKeyManager::new(Vec::new())));
-        assert!(!key_manager_available(&empty));
-        let missing = run_key_managed_search(&empty, "测试引擎", "缺密钥", |_| async {
-            unreachable!("missing key must stop before provider call")
-        })
-        .await;
-        assert!(!missing.success);
-        assert!(missing.error_message.unwrap().contains("未配置 API Key"));
-    }
-
-    #[test]
-    fn domain_extraction_handles_valid_missing_host_and_invalid_urls() {
-        assert_eq!(extract_domain("https://www.example.com/a"), "example.com");
-        assert_eq!(extract_domain("mailto:test@example.com"), "未知来源");
-        assert_eq!(extract_domain("not a url"), "未知来源");
+        let mut unverified = result("未验证", "摘要");
+        unverified.evidence = SearchEvidence::Unverified;
+        let rejected = SearchResponse::success(
+            "测试查询".to_string(),
+            "测试引擎".to_string(),
+            vec![unverified],
+        )
+        .to_context(1);
+        assert!(rejected.contains("被拒绝"));
+        assert!(rejected.contains("ResearchOnly evidence"));
     }
 }

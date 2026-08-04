@@ -17,7 +17,11 @@
 //!
 //! v16.3 Commit 1: evaluate 改签名接 quote_price, 加 5 态 Invalidated (滑点 > MAX_SLIPPAGE_PCT=2%)
 
+use chrono::NaiveDate;
 use diesel::prelude::*;
+use magic_market_core::InstrumentId;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::database::DatabaseManager;
 use crate::monitor::data_mode::DataMode;
@@ -114,6 +118,82 @@ fn validate_position_snapshot(
     Ok(())
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct TestPositionBatchEvidence {
+    pub source: String,
+    pub source_at: chrono::DateTime<chrono::Local>,
+    pub observed_at: chrono::DateTime<chrono::Utc>,
+    pub batch_id: String,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_POSITION_BATCH_EVIDENCE:
+        std::cell::RefCell<Option<TestPositionBatchEvidence>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only position evidence scope.
+///
+/// Production never compiles this seam. Tests must supply a TEST_CODE-labelled
+/// batch and may authorize only TEST_CODE positions, so a local database
+/// mutation timestamp can never regain source-evidence semantics.
+#[cfg(test)]
+pub(crate) struct TestPositionEvidenceGuard {
+    previous: Option<TestPositionBatchEvidence>,
+}
+
+#[cfg(test)]
+impl Drop for TestPositionEvidenceGuard {
+    fn drop(&mut self) {
+        TEST_POSITION_BATCH_EVIDENCE.with(|slot| {
+            slot.replace(self.previous.take());
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_position_batch_evidence(
+    evidence: TestPositionBatchEvidence,
+) -> Result<TestPositionEvidenceGuard, String> {
+    if !evidence.source.starts_with("TEST_CODE_") || !evidence.batch_id.starts_with("TEST_CODE_") {
+        return Err("test position evidence source/batch_id must use TEST_CODE prefix".to_string());
+    }
+    if evidence.observed_at < evidence.source_at.with_timezone(&chrono::Utc) {
+        return Err("test position evidence observed_at precedes source_at".to_string());
+    }
+    let previous = TEST_POSITION_BATCH_EVIDENCE.with(|slot| slot.replace(Some(evidence)));
+    Ok(TestPositionEvidenceGuard { previous })
+}
+
+fn effective_position_source_time(
+    positions: &[crate::portfolio::Position],
+    source_time: Option<chrono::DateTime<chrono::Local>>,
+) -> Result<Option<chrono::DateTime<chrono::Local>>, String> {
+    if source_time.is_some() {
+        return Ok(source_time);
+    }
+    #[cfg(not(test))]
+    let _ = positions;
+    #[cfg(test)]
+    {
+        let evidence = TEST_POSITION_BATCH_EVIDENCE.with(|slot| slot.borrow().clone());
+        if let Some(evidence) = evidence {
+            if positions
+                .iter()
+                .any(|position| !crate::risk::env_guard::is_test_code(&position.code))
+            {
+                return Err(
+                    "TEST_CODE position evidence cannot authorize a production symbol".to_string(),
+                );
+            }
+            return Ok(Some(evidence.source_at));
+        }
+    }
+    Ok(None)
+}
+
 fn position_pct(
     positions: &[crate::portfolio::Position],
     code: &str,
@@ -129,7 +209,7 @@ fn position_pct(
 }
 
 /// 虚拟盘状态
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize)]
 pub enum PaperTradeStatus {
     SignalTriggered,
     Filled,
@@ -146,6 +226,240 @@ impl PaperTradeStatus {
             PaperTradeStatus::Invalidated => "Invalidated",
         }
     }
+}
+
+const REALTIME_QUOTE_MAX_AGE_MILLIS: i64 = 5_000;
+
+/// AGENTS 2.4: a realtime quote may authorize a PaperTrade transition only
+/// while it is no more than five seconds old. Provider timestamps in the
+/// future are invalid evidence rather than "negative age" freshness.
+fn validate_realtime_quote_freshness(
+    quote_observed_at: chrono::DateTime<chrono::Utc>,
+    evaluated_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), String> {
+    if quote_observed_at > evaluated_at {
+        return Err(format!(
+            "realtime quote timestamp is in the future: quote_observed_at={quote_observed_at} evaluated_at={evaluated_at}"
+        ));
+    }
+    let age = evaluated_at
+        .signed_duration_since(quote_observed_at)
+        .num_milliseconds();
+    if age > REALTIME_QUOTE_MAX_AGE_MILLIS {
+        return Err(format!(
+            "realtime quote is stale: age_ms={age} max_ms={REALTIME_QUOTE_MAX_AGE_MILLIS}"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PaperTradeTerminalBindingV1 {
+    schema: &'static str,
+    paper_trade_id: i64,
+    plan_id: String,
+    instrument: InstrumentId,
+    business_date: NaiveDate,
+    direction: String,
+    requested_price: f64,
+    quantity: u32,
+    status: PaperTradeStatus,
+    fill_price: Option<f64>,
+    not_fill_reason: Option<String>,
+    virtual_reason: String,
+    account_mode: String,
+    data_mode: String,
+    quote_observed_at: chrono::DateTime<chrono::Utc>,
+    paper_trade_created_at: chrono::DateTime<chrono::Utc>,
+    order_audit_id: i64,
+    audit_previous_hash: String,
+    audit_record_hash: String,
+    terminal_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl PaperTradeTerminalBindingV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        paper_trade_id: i64,
+        plan_id: impl Into<String>,
+        instrument: InstrumentId,
+        business_date: NaiveDate,
+        direction: impl Into<String>,
+        requested_price: f64,
+        quantity: u32,
+        status: PaperTradeStatus,
+        fill_price: Option<f64>,
+        not_fill_reason: Option<String>,
+        virtual_reason: impl Into<String>,
+        account_mode: impl Into<String>,
+        data_mode: impl Into<String>,
+        quote_observed_at: chrono::DateTime<chrono::Utc>,
+        paper_trade_created_at: chrono::DateTime<chrono::Utc>,
+        order_audit_id: i64,
+        audit_previous_hash: impl Into<String>,
+        audit_record_hash: impl Into<String>,
+        terminal_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Self, String> {
+        let plan_id = plan_id.into();
+        let direction = direction.into();
+        let virtual_reason = virtual_reason.into();
+        let account_mode = account_mode.into();
+        let data_mode = data_mode.into();
+        let audit_previous_hash = audit_previous_hash.into();
+        let audit_record_hash = audit_record_hash.into();
+        if paper_trade_id <= 0 || order_audit_id <= 0 {
+            return Err(format!(
+                "paper terminal receipt IDs must be positive paper_trade_id={paper_trade_id} order_audit_id={order_audit_id}"
+            ));
+        }
+        if plan_id.trim().is_empty() {
+            return Err("paper terminal plan_id must be non-empty".to_owned());
+        }
+        if instrument.code().trim().is_empty() {
+            return Err("paper terminal instrument code must be non-empty".to_owned());
+        }
+        if business_date != quote_observed_at.with_timezone(&chrono::Local).date_naive() {
+            return Err(format!(
+                "paper terminal business_date differs from quote evidence business_date={business_date} quote_observed_at={quote_observed_at}"
+            ));
+        }
+        if !matches!(direction.as_str(), "buy" | "sell") {
+            return Err(format!("paper terminal direction is invalid: {direction}"));
+        }
+        if !requested_price.is_finite()
+            || requested_price <= 0.0
+            || quantity == 0
+            || !quantity.is_multiple_of(100)
+        {
+            return Err(format!(
+                "paper terminal price/quantity is invalid price={requested_price} quantity={quantity}"
+            ));
+        }
+        match status {
+            PaperTradeStatus::SignalTriggered => {
+                return Err("SignalTriggered is not a terminal paper transition".to_owned());
+            }
+            PaperTradeStatus::Filled
+                if fill_price.is_none_or(|value| !value.is_finite() || value <= 0.0)
+                    || not_fill_reason.is_some() =>
+            {
+                return Err("Filled paper terminal evidence is incomplete".to_owned());
+            }
+            PaperTradeStatus::NotFilled | PaperTradeStatus::Invalidated
+                if fill_price.is_some()
+                    || not_fill_reason
+                        .as_deref()
+                        .is_none_or(|reason| reason.trim().is_empty()) =>
+            {
+                return Err(format!(
+                    "{} paper terminal evidence is incomplete",
+                    status.as_str()
+                ));
+            }
+            _ => {}
+        }
+        if virtual_reason.trim().is_empty()
+            || !matches!(account_mode.as_str(), "Normal" | "ReduceOnly" | "Frozen")
+            || !matches!(data_mode.as_str(), "Full" | "Degraded" | "Unsafe")
+        {
+            return Err("paper terminal decision/risk context is incomplete".to_owned());
+        }
+        if audit_previous_hash != "BR086_ORDER_AUDIT_GENESIS_V1"
+            && !is_lower_sha256(&audit_previous_hash)
+        {
+            return Err("paper terminal audit previous hash is invalid".to_owned());
+        }
+        if !is_lower_sha256(&audit_record_hash) {
+            return Err("paper terminal audit record hash is invalid".to_owned());
+        }
+        validate_realtime_quote_freshness(quote_observed_at, terminal_at)?;
+        if terminal_at + chrono::Duration::seconds(1) < quote_observed_at
+            || paper_trade_created_at + chrono::Duration::seconds(1) < quote_observed_at
+        {
+            return Err("paper terminal persistence time precedes quote evidence".to_owned());
+        }
+        Ok(Self {
+            schema: "paper_trade_terminal_binding_v1",
+            paper_trade_id,
+            plan_id,
+            instrument,
+            business_date,
+            direction,
+            requested_price,
+            quantity,
+            status,
+            fill_price,
+            not_fill_reason,
+            virtual_reason,
+            account_mode,
+            data_mode,
+            quote_observed_at,
+            paper_trade_created_at,
+            order_audit_id,
+            audit_previous_hash,
+            audit_record_hash,
+            terminal_at,
+        })
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(self)
+            .map_err(|error| format!("serialize paper terminal binding: {error}"))
+    }
+
+    pub fn terminal_transition_id(&self) -> Result<String, String> {
+        domain_hash(
+            b"stock-analysis:paper-trade-terminal-transition:v1\0",
+            &self.canonical_bytes()?,
+        )
+    }
+
+    pub fn delivery_subject_hash(&self) -> Result<String, String> {
+        let subject = serde_json::to_vec(&(
+            "paper_trade_delivery_subject_v1",
+            &self.instrument,
+            self.business_date,
+            &self.plan_id,
+        ))
+        .map_err(|error| format!("serialize paper terminal delivery subject: {error}"))?;
+        domain_hash(
+            b"stock-analysis:paper-trade-delivery-subject:v1\0",
+            &subject,
+        )
+    }
+
+    pub fn instrument(&self) -> &InstrumentId {
+        &self.instrument
+    }
+
+    pub fn business_date(&self) -> NaiveDate {
+        self.business_date
+    }
+
+    pub fn plan_id(&self) -> &str {
+        &self.plan_id
+    }
+
+    pub fn quote_observed_at(&self) -> chrono::DateTime<chrono::Utc> {
+        self.quote_observed_at
+    }
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn domain_hash(domain: &[u8], canonical: &[u8]) -> Result<String, String> {
+    if canonical.is_empty() {
+        return Err("paper terminal canonical bytes must be non-empty".to_owned());
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(canonical);
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// 模拟方向
@@ -292,6 +606,7 @@ pub fn portfolio_state(code: &str, quote_price: f64) -> Result<(f64, f64, f64), 
     let today = chrono::Local::now().date_naive().to_string();
     validate_ledger_state(&ledger, &today, chrono::Utc::now().naive_utc())?;
     let (positions, position_source_time) = crate::portfolio::get_positions_with_source_time()?;
+    let position_source_time = effective_position_source_time(&positions, position_source_time)?;
     validate_position_snapshot(
         &positions,
         position_source_time,
@@ -309,6 +624,18 @@ pub struct PaperOutcome {
     pub result: PaperResult,
     /// true = INSERT 实际写入; false = INSERT OR IGNORE 跳过 (plan_id 重复)
     pub inserted: bool,
+    /// Exact immutable order-audit chain receipt for the newly persisted
+    /// terminal transition. Duplicate/no-insert outcomes have no receipt.
+    pub terminal_receipt: Option<PaperTradePersistenceReceipt>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaperTradePersistenceReceipt {
+    pub plan_id: String,
+    pub order_audit_id: i64,
+    pub audit_previous_hash: String,
+    pub audit_record_hash: String,
+    pub terminal_at: String,
 }
 
 fn persist_paper_trade_with_audit(
@@ -317,7 +644,7 @@ fn persist_paper_trade_with_audit(
     signal: &PaperSignal,
     result: &PaperResult,
     observed_at: &str,
-) -> diesel::QueryResult<usize> {
+) -> diesel::QueryResult<(usize, Option<PaperTradePersistenceReceipt>)> {
     conn.transaction::<_, diesel::result::Error, _>(|conn| {
         let rows = diesel::sql_query(sql).execute(conn)?;
         let duplicate_reason = "duplicate paper plan id";
@@ -338,16 +665,22 @@ fn persist_paper_trade_with_audit(
             side: signal.direction.as_str(),
             code: &signal.code,
             requested_price: signal.price,
-            execution_price: result.fill_price,
+            execution_price: if rows > 0 { result.fill_price } else { None },
             quantity: i64::from(signal.quantity),
             quote_observed_at: Some(observed_at),
             outcome,
             failure_reason,
         };
-        if crate::database::order_audit::insert_order_audit_query(conn, &audit)? != 1 {
-            return Err(diesel::result::Error::RollbackTransaction);
-        }
-        Ok(rows)
+        let receipt =
+            crate::database::order_audit::insert_order_audit_with_receipt_query(conn, &audit)?;
+        let terminal_receipt = (rows > 0).then(|| PaperTradePersistenceReceipt {
+            plan_id: signal.plan_id.clone(),
+            order_audit_id: receipt.order_audit_id,
+            audit_previous_hash: receipt.previous_hash,
+            audit_record_hash: receipt.record_hash,
+            terminal_at: receipt.created_at,
+        });
+        Ok((rows, terminal_receipt))
     })
 }
 
@@ -366,6 +699,14 @@ fn simulate_with_scope(
     current_position_pct: f64,
     snapshot_scope: bool,
 ) -> Result<PaperOutcome, String> {
+    if snapshot_scope {
+        return Err(
+            "settled daily PaperTrade capability_unavailable: daily close cannot authorize a realtime terminal transition"
+                .to_owned(),
+        );
+    }
+    validate_realtime_quote_freshness(signal.quote_observed_at, chrono::Utc::now())?;
+
     let db = DatabaseManager::try_get()
         .ok_or_else(|| "BR-086 paper-order audit database is not initialized".to_string())?;
     if !db
@@ -393,12 +734,7 @@ fn simulate_with_scope(
     }
 
     // v16.3 R1+R2: pre-trade gate 4 项硬检查 (拒 → 不入 paper_trades, 不调 evaluate)
-    let gate = if snapshot_scope {
-        crate::trading::risk_adapter::pre_trade_check_snapshot
-    } else {
-        crate::trading::risk_adapter::pre_trade_check
-    };
-    if let Err(reason) = gate(
+    if let Err(reason) = crate::trading::risk_adapter::pre_trade_check(
         signal,
         quote_price,
         current_cash,
@@ -459,12 +795,14 @@ fn simulate_with_scope(
         signal.risk_context.data_mode.label(),
     );
     let observed_at = signal.quote_observed_at.to_rfc3339();
-    let rows = persist_paper_trade_with_audit(&mut conn, &sql, signal, &result, &observed_at)
-        .map_err(|e| format!("BR-086 audited paper trade transaction: {e}"))?;
+    let (rows, terminal_receipt) =
+        persist_paper_trade_with_audit(&mut conn, &sql, signal, &result, &observed_at)
+            .map_err(|e| format!("BR-086 audited paper trade transaction: {e}"))?;
 
     Ok(PaperOutcome {
         result,
         inserted: rows > 0,
+        terminal_receipt,
     })
 }
 
@@ -493,13 +831,16 @@ pub fn simulate_snapshot(
     total_value: f64,
     current_position_pct: f64,
 ) -> Result<PaperOutcome, String> {
-    simulate_with_scope(
+    let _ = (
         signal,
         quote_price,
         current_cash,
         total_value,
         current_position_pct,
-        true,
+    );
+    Err(
+        "settled daily PaperTrade capability_unavailable: daily close cannot authorize a realtime terminal transition"
+            .to_owned(),
     )
 }
 
@@ -569,6 +910,124 @@ mod tests {
                 .count;
             assert_eq!(count, 0, "{table} must be rolled back");
         }
+    }
+
+    fn terminal_binding(record_hash: &str) -> PaperTradeTerminalBindingV1 {
+        let quote_observed_at = chrono::DateTime::parse_from_rfc3339("2026-07-30T09:31:00+08:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        PaperTradeTerminalBindingV1::new(
+            7,
+            "TEST_CODE_PLAN_BR192",
+            magic_market_core::InstrumentId::new(
+                magic_market_core::Exchange::Shanghai,
+                "TEST_CODE_600001",
+                magic_market_core::AssetClass::Equity,
+            )
+            .unwrap(),
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 30).unwrap(),
+            "buy",
+            10.0,
+            100,
+            PaperTradeStatus::Filled,
+            Some(10.01),
+            None,
+            "TEST_CODE NewsCatalyst",
+            "Normal",
+            "Full",
+            quote_observed_at,
+            quote_observed_at,
+            11,
+            "BR086_ORDER_AUDIT_GENESIS_V1",
+            record_hash,
+            quote_observed_at,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn br192_terminal_binding_is_stable_and_changes_with_immutable_receipt() {
+        let first = terminal_binding(&"a".repeat(64));
+        let identical = terminal_binding(&"a".repeat(64));
+        let changed_receipt = terminal_binding(&"b".repeat(64));
+
+        assert_eq!(
+            first.terminal_transition_id().unwrap(),
+            identical.terminal_transition_id().unwrap()
+        );
+        assert_ne!(
+            first.terminal_transition_id().unwrap(),
+            changed_receipt.terminal_transition_id().unwrap()
+        );
+        assert_eq!(
+            first.delivery_subject_hash().unwrap(),
+            changed_receipt.delivery_subject_hash().unwrap(),
+            "delivery subject remains the same plan/ticket/business-date identity"
+        );
+        assert_eq!(first.plan_id(), "TEST_CODE_PLAN_BR192");
+    }
+
+    #[test]
+    fn br192_realtime_quote_freshness_accepts_five_seconds_and_rejects_bad_time() {
+        let evaluated_at = chrono::DateTime::parse_from_rfc3339("2026-07-30T09:31:05+08:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(validate_realtime_quote_freshness(
+            evaluated_at - chrono::Duration::seconds(5),
+            evaluated_at
+        )
+        .is_ok());
+        assert!(validate_realtime_quote_freshness(
+            evaluated_at - chrono::Duration::milliseconds(5_001),
+            evaluated_at
+        )
+        .unwrap_err()
+        .contains("stale"));
+        assert!(validate_realtime_quote_freshness(
+            evaluated_at + chrono::Duration::milliseconds(1),
+            evaluated_at
+        )
+        .unwrap_err()
+        .contains("future"));
+    }
+
+    #[test]
+    fn br192_settled_daily_snapshot_cannot_create_a_realtime_terminal() {
+        let signal = signal_default(false, false, false);
+        let error = simulate_snapshot(&signal, 50.0, 100_000.0, 100_000.0, 0.0)
+            .expect_err("settled daily capability must remain unavailable");
+        assert!(error.contains("settled daily PaperTrade capability_unavailable"));
+    }
+
+    #[test]
+    fn br192_paper_persistence_returns_exact_audit_chain_receipt() {
+        let mut conn =
+            diesel::sqlite::SqliteConnection::establish(":memory:").expect("in-memory SQLite");
+        DatabaseManager::run_migrations_for_test(&mut conn).expect("test migrations");
+        let mut signal = signal_default(false, false, false);
+        signal.plan_id = "TEST_CODE_PLAN_BR192_RECEIPT".to_string();
+        let result = evaluate(&signal, signal.price);
+        let sql = "INSERT INTO paper_trades
+                   (plan_id, code, name, direction, price, quantity, status,
+                    fill_price, not_fill_reason, virtual_reason, account_mode, data_mode)
+                   VALUES ('TEST_CODE_PLAN_BR192_RECEIPT', 'TEST_CODE_688001', '测试', 'buy',
+                           50.0, 100, 'Filled', 50.0, NULL, 'NewsCatalyst', 'Normal', 'Full')";
+
+        let (rows, receipt) = persist_paper_trade_with_audit(
+            &mut conn,
+            sql,
+            &signal,
+            &result,
+            "2026-07-30T09:31:00+08:00",
+        )
+        .expect("atomic paper terminal persistence");
+        let receipt = receipt.expect("new terminal transition carries receipt");
+        assert_eq!(rows, 1);
+        assert_eq!(receipt.plan_id, signal.plan_id);
+        assert!(receipt.order_audit_id > 0);
+        assert_eq!(receipt.audit_previous_hash, "BR086_ORDER_AUDIT_GENESIS_V1");
+        assert_eq!(receipt.audit_record_hash.len(), 64);
+        assert!(!receipt.terminal_at.is_empty());
     }
 
     #[test]
@@ -814,6 +1273,7 @@ mod tests {
                 not_fill_reason: None,
             },
             inserted: true,
+            terminal_receipt: None,
         };
         assert!(o.inserted);
         assert!(matches!(o.result.status, PaperTradeStatus::Filled));
@@ -831,6 +1291,7 @@ mod tests {
                 not_fill_reason: None,
             },
             inserted: true,
+            terminal_receipt: None,
         };
         let inserted_false = PaperOutcome {
             result: PaperResult {
@@ -839,6 +1300,7 @@ mod tests {
                 not_fill_reason: Some("涨停不可买".to_string()),
             },
             inserted: false,
+            terminal_receipt: None,
         };
         assert!(inserted_true.inserted, "新建场景应 inserted=true");
         assert!(

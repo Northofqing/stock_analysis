@@ -100,6 +100,19 @@ fn paper_limit_flags(quote: &crate::broker::ExecutionQuote) -> (bool, bool) {
 impl IntradayMonitor {
     /// 每 30s 跑一次 (从 main_loop 调, 推送消费核心)
     pub fn tick(&self, risk_context: PaperRiskContext) -> Result<usize, String> {
+        self.tick_with_portfolio_state(risk_context, paper_trade::portfolio_state)
+    }
+
+    /// Keep the decision loop independently testable while the public production
+    /// entrypoint remains hard-wired to the freshness-gated account snapshot.
+    fn tick_with_portfolio_state<F>(
+        &self,
+        risk_context: PaperRiskContext,
+        mut portfolio_state: F,
+    ) -> Result<usize, String>
+    where
+        F: FnMut(&str, f64) -> Result<(f64, f64, f64), String>,
+    {
         let now = Local::now();
         let cutoff = now - Duration::hours(PUSH_AGE_MAX_HOURS);
         let mut conn = DatabaseManager::get()
@@ -181,7 +194,7 @@ impl IntradayMonitor {
                     risk_context,
                 };
                 let (cash, total, pos_pct) =
-                    match paper_trade::portfolio_state(&cand.code, execution_quote.price) {
+                    match portfolio_state(&cand.code, execution_quote.price) {
                         Ok(state) => state,
                         Err(error) => {
                             log::warn!(
@@ -362,6 +375,21 @@ static EVENING_LAST_FAIL: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>
 
 /// 盘后 15:30 整盘扫 (R5) — 复用 evaluate_candidate 评分, 跑 Momentum 整合
 pub fn evening_review(today: NaiveDate, risk_context: PaperRiskContext) -> Result<usize, String> {
+    evening_review_with_portfolio_state(today, risk_context, paper_trade::portfolio_state)
+}
+
+/// Production calls this only through `evening_review`, which supplies the real
+/// freshness-gated account loader. The private seam lets TEST_CODE fixtures
+/// exercise decision consumption without inheriting unrelated database rows
+/// left by other unit tests.
+fn evening_review_with_portfolio_state<F>(
+    today: NaiveDate,
+    risk_context: PaperRiskContext,
+    mut portfolio_state: F,
+) -> Result<usize, String>
+where
+    F: FnMut(&str, f64) -> Result<(f64, f64, f64), String>,
+{
     {
         let last = EVENING_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner());
         if *last == Some(today) {
@@ -458,19 +486,18 @@ pub fn evening_review(today: NaiveDate, risk_context: PaperRiskContext) -> Resul
             quote_observed_at: execution_quote.observed_at,
             risk_context,
         };
-        let (cash, total, pos_pct) =
-            match paper_trade::portfolio_state(&cand.code, execution_quote.price) {
-                Ok(state) => state,
-                Err(error) => {
-                    log::warn!(
-                        "[evening_review] 跳过 {}({}): 账户快照不可用: {}",
-                        cand.name,
-                        cand.code,
-                        error
-                    );
-                    continue;
-                }
-            };
+        let (cash, total, pos_pct) = match portfolio_state(&cand.code, execution_quote.price) {
+            Ok(state) => state,
+            Err(error) => {
+                log::warn!(
+                    "[evening_review] 跳过 {}({}): 账户快照不可用: {}",
+                    cand.name,
+                    cand.code,
+                    error
+                );
+                continue;
+            }
+        };
         match paper_trade::simulate(&paper_signal, execution_quote.price, cash, total, pos_pct) {
             Ok(_) => {
                 // review fix Issue #4: 参数化绑定
@@ -596,16 +623,28 @@ mod tests {
         .bind::<diesel::sql_types::Text, _>(&ledger_date)
         .execute(&mut conn)
         .expect("prepare same-day test ledger");
-        diesel::sql_query(
-            "UPDATE stock_position SET updated_at = CURRENT_TIMESTAMP WHERE status = 'open'",
-        )
-        .execute(&mut conn)
-        .expect("refresh isolated test position evidence");
         IntradayDbGuard {
             push_ids: Vec::new(),
             codes: Vec::new(),
             ledger_date,
         }
+    }
+
+    fn admitted_test_portfolio_state(
+        code: &str,
+        quote_price: f64,
+    ) -> Result<(f64, f64, f64), String> {
+        if !code.starts_with("TEST_CODE_") {
+            return Err(format!(
+                "test portfolio fixture rejects non-test symbol {code}"
+            ));
+        }
+        if !quote_price.is_finite() || quote_price <= 0.0 {
+            return Err(format!(
+                "test portfolio fixture rejects price {quote_price}"
+            ));
+        }
+        Ok((100_000.0, 100_000.0, 0.0))
     }
 
     #[derive(QueryableByName)]
@@ -895,7 +934,7 @@ mod tests {
 
         assert_eq!(
             IntradayMonitor
-                .tick(test_risk_context())
+                .tick_with_portfolio_state(test_risk_context(), admitted_test_portfolio_state,)
                 .expect("intraday tick"),
             1
         );
@@ -909,7 +948,7 @@ mod tests {
         assert!(bad.outcome.is_none());
         assert_eq!(
             IntradayMonitor
-                .tick(test_risk_context())
+                .tick_with_portfolio_state(test_risk_context(), admitted_test_portfolio_state,)
                 .expect("idempotent follow-up tick"),
             0
         );
@@ -953,7 +992,12 @@ mod tests {
             crate::risk::action_gate::AccountMode::ReduceOnly,
             crate::monitor::data_mode::DataMode::Full,
         );
-        assert_eq!(IntradayMonitor.tick(context).expect("risk-gated tick"), 0);
+        assert_eq!(
+            IntradayMonitor
+                .tick_with_portfolio_state(context, admitted_test_portfolio_state)
+                .expect("risk-gated tick"),
+            0
+        );
         let row = consumption(id);
         assert!(row.consumed_at.is_none());
         assert!(row.consumed_by.is_none());
@@ -993,7 +1037,12 @@ mod tests {
             .expect("place candidate before evening cutoff");
 
         assert_eq!(
-            evening_review(review_date, test_risk_context()).expect("evening review"),
+            evening_review_with_portfolio_state(
+                review_date,
+                test_risk_context(),
+                admitted_test_portfolio_state,
+            )
+            .expect("evening review"),
             1
         );
         let row = consumption(id);
@@ -1001,7 +1050,12 @@ mod tests {
         assert_eq!(row.consumed_by.as_deref(), Some("evening_review"));
         assert_eq!(row.outcome.as_deref(), Some("Momentum"));
         assert_eq!(
-            evening_review(review_date, test_risk_context()).expect("same-day reentry"),
+            evening_review_with_portfolio_state(
+                review_date,
+                test_risk_context(),
+                admitted_test_portfolio_state,
+            )
+            .expect("same-day reentry"),
             0
         );
     }

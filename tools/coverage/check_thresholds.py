@@ -10,12 +10,20 @@ import sys
 
 
 CORE_PREFIXES = (
+    "src/auth/",
+    "src/bin/monitor/",
+    "src/data_gateway/",
+    "src/durable_delivery/",
     "src/risk/",
     "src/trading/",
     "src/database/",
     "src/data_provider/",
     "src/decision/",
+    "src/market_analyzer/",
+    "src/monitor/",
     "src/pipeline/",
+    "src/portfolio/",
+    "src/selection/",
     "src/event/",
 )
 

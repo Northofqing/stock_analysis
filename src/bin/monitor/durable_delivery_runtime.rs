@@ -1,4 +1,5 @@
-//! BR-192 production adapter for counted delivery.
+//! BR-192 production adapter for counted delivery; BR-199 closes the R-08
+//! public SourceOnly binding and envelope revalidation path.
 //!
 //! The library coordinator owns reservations, budget, cooldown, attempts,
 //! fencing and immutable payloads.  This monitor adapter owns only runtime
@@ -363,7 +364,7 @@ impl CountedDeliveryBinding {
         let evidence_observed_at = evidence
             .get("observed_at")
             .and_then(serde_json::Value::as_str)
-            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .and_then(|value| crate::push_templates::parse_r04_observed_at(value).ok())
             .ok_or("counted_source_only_binding_invalid")?;
         let projection = object
             .get("ordered_projection")
@@ -377,7 +378,7 @@ impl CountedDeliveryBinding {
             .get("source")
             .and_then(serde_json::Value::as_str)
             .ok_or("counted_source_only_binding_invalid")?;
-        let expected_rule_ids = ["BR-110", "BR-140", "BR-162", "BR-192"];
+        let expected_rule_ids = ["BR-110", "BR-140", "BR-162", "BR-192", "BR-200"];
         let transition_rule_ids = transition_basis
             .get("rule_ids")
             .and_then(serde_json::Value::as_array)
@@ -433,6 +434,51 @@ impl CountedDeliveryBinding {
             .ok_or("counted_source_only_binding_invalid")?;
         if sha256_hex(text.as_bytes()) != expected_hash {
             return Err("counted_source_only_binding_invalid");
+        }
+        Ok(())
+    }
+
+    pub fn validate_r08_public_source_only(&self) -> Result<(), &'static str> {
+        const INVALID: &str = "counted_r08_source_only_binding_invalid";
+        let validated = super::push_templates::validate_r08_public_source_binding_canonical_bytes(
+            &self.source_binding_canonical,
+        )?;
+        if self.business_date != validated.business_date
+            || self.schedule_occurrence_identity != validated.task_identity
+            || self.delivery_subject_hash != validated.delivery_subject_identity
+            || !matches!(self.scope, CountedDeliveryScope::Global)
+            || sha256_hex(&self.source_binding_canonical) != self.source_evidence_fingerprint
+        {
+            return Err(INVALID);
+        }
+        let task_binding = self.task_binding.as_ref().ok_or(INVALID)?;
+        if task_binding.task_identity != validated.task_identity
+            || task_binding.transition_basis_canonical != validated.transition_basis_canonical
+            || sha256_hex(&task_binding.transition_basis_canonical)
+                != task_binding.transition_basis_sha256
+        {
+            return Err(INVALID);
+        }
+        match &self.origin {
+            CountedDeliveryOrigin::Provider {
+                observed_at: Some(observed_at),
+                as_of: Some(as_of),
+                ordered_batch_ids,
+            } if *as_of == validated.business_date
+                && *observed_at == validated.max_observed_at
+                && *ordered_batch_ids == validated.ordered_batch_ids => {}
+            _ => return Err(INVALID),
+        }
+        Ok(())
+    }
+
+    pub fn validate_r08_public_source_only_text(&self, text: &str) -> Result<(), &'static str> {
+        let validated = super::push_templates::validate_r08_public_source_binding_canonical_bytes(
+            &self.source_binding_canonical,
+        )?;
+        self.validate_r08_public_source_only()?;
+        if sha256_hex(text.as_bytes()) != validated.rendered_content_sha256 {
+            return Err("counted_r08_source_only_binding_invalid");
         }
         Ok(())
     }
@@ -814,14 +860,87 @@ pub async fn deliver_counted_binding(
     }
 }
 
-pub async fn deliver_envelope(
+/// BR-196 presentation-gated durable envelope entry. The descriptor token is
+/// consumed here and its notification kind must map to the envelope's exact
+/// durable kind/sub-kind before any persistence or sink side effect.
+pub async fn deliver_presented_envelope(
+    token: crate::presentation_registry::ProductionPresentationToken,
     envelope: DeliveryEnvelope,
 ) -> Result<DurableDispatchEvidence, String> {
+    let notification_kind = token.descriptor().push_kind;
+    let Some((expected_kind, expected_sub_kind)) = durable_kind_and_sub_kind(notification_kind)
+    else {
+        return Err("BR-196 presentation kind has no durable delivery mapping".to_string());
+    };
+    if envelope.push_kind != expected_kind || envelope.sub_kind != expected_sub_kind {
+        return Err("BR-196 presentation token/envelope kind mismatch".to_string());
+    }
+    deliver_envelope(envelope).await
+}
+
+async fn deliver_envelope(envelope: DeliveryEnvelope) -> Result<DurableDispatchEvidence, String> {
     ensure_startup_reconciled().await?;
     let state = runtime_state()?;
     tokio::task::spawn_blocking(move || deliver_envelope_blocking(state.as_ref(), envelope))
         .await
         .map_err(|error| format!("BR-192 counted delivery join failed: {error}"))?
+}
+
+/// Read the durable owner of an exact counted review occurrence.
+///
+/// BR-200 deliberately does not run startup reconciliation here: that phase
+/// may resume a sink. Review producers may call this only after the normal
+/// startup barrier has completed, preserving a strict read-only pre-provider
+/// and pre-sink seam.
+pub async fn inspect_review_task_occurrence(
+    business_date: NaiveDate,
+    push_kind: stock_analysis::durable_delivery::PushKind,
+    task_identity: String,
+) -> Result<Option<DurableDispatchEvidence>, String> {
+    if !matches!(
+        push_kind,
+        stock_analysis::durable_delivery::PushKind::ReviewLhb
+            | stock_analysis::durable_delivery::PushKind::EventCalendar
+            | stock_analysis::durable_delivery::PushKind::ReviewProviderTopN
+    ) {
+        return Err(format!(
+            "BR-200 unsupported review terminal preflight kind {push_kind}"
+        ));
+    }
+    let state = runtime_state()?;
+    if !state.producer_ready.load(Ordering::Acquire) {
+        return Err(
+            "BR-200 review terminal preflight requires completed startup reconciliation".to_owned(),
+        );
+    }
+    let query_state = Arc::clone(&state);
+    let date = business_date.format("%Y-%m-%d").to_string();
+    let evidence = tokio::task::spawn_blocking(move || {
+        query_state
+            .coordinator
+            .inspect_review_task_occurrence(
+                &date,
+                push_kind,
+                DeliverySubKind::None,
+                "GLOBAL",
+                &task_identity,
+            )
+            .map_err(|error| format!("inspect BR-200 review occurrence: {error}"))
+    })
+    .await
+    .map_err(|error| format!("BR-200 review terminal preflight join failed: {error}"))??;
+
+    let Some(evidence) = evidence else {
+        return Ok(None);
+    };
+    if let Some(hydration) = evidence.schedule_hydration.as_ref() {
+        queue_hydrations(state.as_ref(), std::slice::from_ref(hydration))?;
+    }
+    Ok(Some(DurableDispatchEvidence {
+        decision_identity: evidence.decision_identity,
+        state: evidence.state,
+        schedule_hydration: evidence.schedule_hydration,
+    }))
 }
 
 pub fn replay_terminal_envelope(
@@ -904,7 +1023,7 @@ where
             );
             (
                 ReviewTerminalReplayCompletionState::Failed,
-                "terminal_replay_classification_failed",
+                "terminal_replay_evidence_unavailable",
             )
         }
     };
@@ -1252,10 +1371,14 @@ fn envelope_from_binding(
     text: &str,
     requested_sub_kind: Option<DailyReportSubKind>,
 ) -> Result<DeliveryEnvelope, String> {
-    if kind == PushKind::ReviewLhb {
-        binding
+    match kind {
+        PushKind::ReviewLhb => binding
             .validate_r04_source_only_text(text)
-            .map_err(str::to_owned)?;
+            .map_err(str::to_owned)?,
+        PushKind::EventCalendar => binding
+            .validate_r08_public_source_only_text(text)
+            .map_err(str::to_owned)?,
+        _ => {}
     }
     let (push_kind, sub_kind) =
         durable_kind_and_sub_kind_with_override(kind, requested_sub_kind)
@@ -1846,7 +1969,7 @@ mod tests {
             "task": "R-04",
             "source": "TEST_CODE_eastmoney_market_dragon_tiger",
             "source_time": business_date_text,
-            "rule_ids": ["BR-110", "BR-140", "BR-162", "BR-192"],
+            "rule_ids": ["BR-110", "BR-140", "BR-162", "BR-192", "BR-200"],
             "snapshot_size": 1,
             "batch_ids": ["TEST_CODE_R04_BATCH"]
         });
@@ -2167,7 +2290,7 @@ mod tests {
             |_, _, _| Err("TEST_CODE classifier unavailable".to_owned()),
         )
         .expect_err("classification error must persist Failed terminal evidence");
-        assert_eq!(error, "terminal_replay_classification_failed");
+        assert_eq!(error, "terminal_replay_evidence_unavailable");
         drop(state);
 
         let connection =
@@ -2179,7 +2302,7 @@ mod tests {
                    (SELECT COUNT(*) FROM review_terminal_replay_attempts),
                    (SELECT COUNT(*) FROM review_terminal_replay_completions
                      WHERE state='Failed'
-                       AND reason_code='terminal_replay_classification_failed'),
+                       AND reason_code='terminal_replay_evidence_unavailable'),
                    (SELECT COUNT(*) FROM immutable_audit_outbox
                      WHERE audit_kind='ReviewTerminalReplayCompleted'
                        AND append_state='Appended')",
@@ -2188,6 +2311,47 @@ mod tests {
             )
             .expect("read failed terminal replay evidence");
         assert_eq!(evidence, (1, 1, 1));
+    }
+
+    #[test]
+    #[serial_test::serial(br194_replay_db)]
+    fn br194_terminal_replay_rejects_out_of_contract_failed_reason() {
+        let business_date = NaiveDate::from_ymd_opt(2026, 7, 29).expect("valid date");
+        let (_namespace, state) = replay_state("TEST_CODE_BR194_REASON_VOCABULARY");
+        let envelope = replay_envelope(
+            business_date,
+            crate::review_batch::ReviewTask::R09,
+            "REASON_VOCABULARY",
+        );
+        deliver_and_hydrate_replay(state.as_ref(), &envelope);
+        let input = replay_input(
+            state.as_ref(),
+            business_date,
+            crate::review_batch::ReviewTask::R09,
+        );
+        let attempt = state
+            .coordinator
+            .begin_review_terminal_replay(&input, Utc::now())
+            .expect("begin replay reason validation");
+
+        let error = state
+            .coordinator
+            .finish_review_terminal_replay(
+                &attempt,
+                ReviewTerminalReplayCompletionState::Failed,
+                "terminal_replay_classification_failed",
+                0,
+                0,
+                0,
+                0,
+                Utc::now(),
+            )
+            .expect_err("seventh replay reason must fail closed");
+        assert!(matches!(
+            error,
+            stock_analysis::durable_delivery::DurableDeliveryError::PolicyMismatch(reason)
+                if reason == "terminal_replay_evidence_unavailable"
+        ));
     }
 
     #[test]

@@ -130,7 +130,7 @@ pub enum SelectionRunOutcome {
 每条事件只使用自己的标题、摘要和来源上下文匹配一次固定的产业链配置快照。配置加载必须验证：
 
 - chain ID、名称和关键词非空。
-- 同一 chain ID 不重复。
+- 同一 chain ID 不重复；生产配置出现重复时必须由配置维护者合并为单条规则，运行时不得静默保留首条、末条或自动拼接。
 - 规则版本和完整文件 SHA-256 写入批次。
 - 解析或验证失败使本轮 `Unavailable`，不得回退到内置词表。
 
@@ -372,6 +372,7 @@ NewsAggregator tick
 - 审计锁、半行、坏哈希、`sync_data`/数据库失败均 fail closed。
 - T0 快照不被 T0Close/D1Settled 覆盖。
 - Magic TDX 客户端只在 blocking worker 生命周期内创建和销毁，不再触发 Tokio runtime drop panic。
+- 完整 `monitor` 验收同时覆盖相邻旧链路的 Tokio 边界：异步 MultiAgent 和 R-03 数据准备不得调用内部使用 `block_on` 的同步 K 线入口；它们必须直接 await 共享异步 fallback，并施加显式超时。收到关闭信号时，未完成的 HTTP future 必须可取消，不能在主 runtime 关闭后继续轮询 timer。
 
 ### Gate C：仓库检查
 

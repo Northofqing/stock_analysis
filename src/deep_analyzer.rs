@@ -28,6 +28,7 @@ use std::sync::Arc;
 // 之前 deep_analyzer 走 service::get_kline 拿缓存, 无任何新鲜度检查.
 // 现在加 daily freshness gate: 日线数据超过 1 交易日 (= dq_daily_stale_sec, 默认 86400s) 直接 bail.
 use crate::config;
+use crate::data_gateway::{daily_bar_provider_label, HistoricalBarsGateway};
 use crate::monitor::data_quality::{validate_daily_freshness, DqStats, FreshnessConfig};
 
 /// 构造 freshness 配置 (从 monitor config 读 dq_daily_stale_sec).
@@ -62,14 +63,31 @@ fn check_kline_freshness(code: &str, kline: &[KlineData]) -> Result<()> {
     Ok(())
 }
 
-/// 修复 v9.4.26 P3: 走 DataFetcherManager 路径 (Magic TDX 优先) 而不是 service::service().get_kline.
-/// 跟 backfill_daily 一致, 用 DataFetcherManager::new() 拿多源回落。
-async fn fetch_kline_via_manager(code: &str, days: usize) -> Result<Vec<KlineData>> {
-    let manager = crate::data_provider::DataFetcherManager::new()
-        .map_err(|e| anyhow::anyhow!("DataFetcherManager 初始化失败: {e}"))?;
-    let (kline, source) = manager
-        .get_daily_data(code, days)
-        .map_err(|e| anyhow::anyhow!("K 线获取失败: {e}"))?;
+#[cfg(test)]
+async fn await_kline_fetch<F>(
+    future: F,
+    timeout: std::time::Duration,
+) -> Result<(Vec<KlineData>, &'static str)>
+where
+    F: std::future::Future<Output = Result<(Vec<KlineData>, &'static str)>>,
+{
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| anyhow::anyhow!("K 线获取超过 {}ms", timeout.as_millis()))?
+}
+
+/// BR-010/BR-156/BR-164: async consumers call the unified Gateway directly.
+/// The Gateway owns the blocking isolation, provider routing and admission.
+async fn fetch_kline_via_gateway(code: &str, days: usize) -> Result<Vec<KlineData>> {
+    let batch = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        HistoricalBarsGateway::new().required_daily_bars_async(code, days),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("K 线获取超过 30000ms"))?
+    .map_err(anyhow::Error::from)?;
+    let (kline, evidence) = batch.into_parts();
+    let source = daily_bar_provider_label(evidence.provider);
     let Some(first) = kline.first() else {
         anyhow::bail!("K 线数据源 {source} 返回空序列: {code}");
     };
@@ -280,6 +298,34 @@ mod tests {
         })
         .is_empty());
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn br156_async_kline_path_does_not_nest_runtime() {
+        let (bars, source) = await_kline_fetch(
+            async { Ok((Vec::new(), "TEST_CODE_ASYNC_SOURCE")) },
+            std::time::Duration::from_millis(50),
+        )
+        .await
+        .expect("ready async result");
+        assert!(bars.is_empty());
+        assert_eq!(source, "TEST_CODE_ASYNC_SOURCE");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn br156_async_kline_timeout_is_explicit() {
+        let result = await_kline_fetch(
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                Ok((Vec::new(), "TEST_CODE_LATE_SOURCE"))
+            },
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        assert!(result
+            .expect_err("late source must time out")
+            .to_string()
+            .contains("1ms"));
+    }
 }
 
 fn build_client(cfg: &ModelConfig) -> Client<OpenAIConfig> {
@@ -359,9 +405,8 @@ pub async fn run_react_analysis(code: &str) -> Result<String> {
 pub async fn run_multi_agent_analysis(code: &str) -> Result<String> {
     log::info!("[MultiAgent] 开始抓取数据：{}", code);
 
-    // 1. K 线（修复 v9.4.26 P3）: 走 DataFetcherManager 路径
-    //    (Magic TDX → 腾讯 → 东方财富) 而不是 service::service().get_kline
-    let kline = fetch_kline_via_manager(code, 250).await?;
+    // 1. K 线（BR-010/BR-156/BR-164）：统一 Magic Gateway。
+    let kline = fetch_kline_via_gateway(code, 250).await?;
     if kline.is_empty() {
         anyhow::bail!("K 线数据为空，无法进行多角色分析");
     }

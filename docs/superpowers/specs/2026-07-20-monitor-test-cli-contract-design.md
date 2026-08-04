@@ -51,8 +51,10 @@ existing precedence and semantics. `--e2e` without `--test` remains a BR-051 err
 ## 5. Observability and help
 
 Help names normal monitoring, isolated test, production review, isolated strict-review verification,
-replay, and history. It states that `--test` never sends real notifications and that production
-`--review` can fail when current complete account evidence is unavailable.
+replay, and history. BR-196 supersedes this document's original notification default: bare `--test`
+sends only the complete, explicitly labelled TEST_CODE template-acceptance batches and requires
+validated Feishu receipts; `--test --push-dry-run` validates the same catalog without external
+delivery. Production `--review` can fail when current complete account evidence is unavailable.
 
 ## 6. Validation
 

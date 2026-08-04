@@ -1,0 +1,14 @@
+version = "BR196_FEISHU_TARGETS_V1"
+
+# BR-196: release-pinned non-production target authority; metadata only.
+# This release-pinned file contains hashes only.  A reviewed non-production
+# target must be added deliberately before bare `monitor --test` can send.
+[non_production_acceptance]
+target_sha256 = []
+
+# Production targets are denied explicitly.  Never place raw tenant, app or
+# conversation identifiers in this repository.
+[production_deny]
+target_sha256 = [
+  "0f5755c48e678964a6e3fe0179077f5d743b61d166b1357df49399b17d129bb5",
+]

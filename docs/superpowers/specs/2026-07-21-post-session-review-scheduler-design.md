@@ -1,7 +1,7 @@
 # 盘后复盘自动调度设计
 
 **日期：** 2026-07-21  
-**规则：** AGENTS 2.1、2.2、2.4、2.7、2.8、2.10；BR-049、BR-108、BR-110、BR-116、BR-139
+**规则：** AGENTS 2.1、2.2、2.4、2.7、2.8、2.10；BR-049、BR-103、BR-108、BR-110、BR-116、BR-139、BR-140
 
 ## 1. 问题与根因
 
@@ -26,6 +26,9 @@
 常驻 main
   -> post_session_review_scheduler (60s, MissedTickBehavior::Skip)
   -> due gate (交易日、>=19:00、当日未完成、无在途)
+  -> ReviewRunContext
+     review_date = latest_completed_trading_day_at(observed_at)
+     observed_at = 真实墙钟时间
   -> evaluate_account_mode_hook(true)
   -> run_strict_review_only_inner() + 顶层 timeout
   -> dispatch_post_session_review()
@@ -37,9 +40,18 @@
 
 调度完成状态只存在于进程内。进程在 19:00 后重启时会立即重新评估；L4/业务去重负责阻止同一真实消息重复外发。调度器不创建账户快照、不修改持仓、不补齐缺失字段。
 
+显式 `--review` 与常驻调度共用同一个 `ReviewRunContext` 日期所有者。
+周末、节假日或交易日收盘前执行显式复盘时，provider 请求日期、持仓
+freshness 比较、任务 identity 和审计文件日期必须统一为最近已完成交易日；
+真实触发时间只写入 `observed_at`。各 Gateway 不得通过放宽日期一致性来修复
+调用方传错日期。若 `observed_at.date > review_date`，R-04 等发布时间窗口
+使用业务日结束时刻判断资格；不得把次日凌晨的 `02:xx` 传成业务日的
+`02:xx` 并重新进入 ExpectedWait。
+
 ## 4. 失败模式
 
 - 非交易日或 19:00 前：正常等待，不调用复盘。
+- 周末/节假日显式 `--review`：复盘最近已完成交易日，不把休市日传入 provider。
 - AccountMode/banner 未建立：记录 BR-108/BR-139 错误，保留当日重试资格。
 - 严格批次超时：记录耗时和超时，释放在途状态，保留重试资格。
 - 数据源或全部 dispatcher 失败：沿用 BR-110 逐项 audit，不提交完成日期。

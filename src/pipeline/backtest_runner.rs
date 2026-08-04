@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use log::{info, warn};
 
 use super::{AnalysisPipeline, AnalysisResult};
+use crate::data_gateway::{BatchEvidence, HistoricalBarsGateway};
 use crate::strategy::bollinger_zscore::{
     BollingerZScoreBacktest, BollingerZScoreConfig, BollingerZScoreResult,
 };
@@ -48,23 +49,64 @@ impl AnalysisPipeline {
         Path::new("reports").join(filename)
     }
 
-    /// Read historical bars through the production manager. Test builds may reuse the
-    /// pipeline's existing isolated fetched-data slot; that slot is not compiled into
-    /// production and therefore cannot become a market-data fallback (AGENTS 2.1/2.5).
-    fn get_backtest_daily_data(
+    /// Read one admitted historical-bar batch through the unified Gateway.
+    ///
+    /// Test builds may reuse the pipeline's isolated fetched-data slot; that
+    /// slot is not compiled into production and therefore cannot become a
+    /// market-data fallback (AGENTS 2.1/2.5).
+    async fn get_backtest_daily_data(
         &self,
         code: &str,
         days: usize,
-    ) -> Result<(Vec<crate::data_provider::KlineData>, &'static str)> {
+    ) -> Result<(Vec<crate::data_provider::KlineData>, BatchEvidence)> {
         #[cfg(test)]
         if let Some(result) = self.test_fetched_data.as_ref() {
             return result
                 .clone()
-                .map(|data| (data, "test-isolated"))
+                .map(|data| {
+                    (
+                        data,
+                        BatchEvidence {
+                            provider: magic_market_core::ProviderId::Tdx,
+                            source: "TEST_CODE_isolated_backtest".to_string(),
+                            source_at: Some("2026-07-26T01:00:00Z".to_string()),
+                            observed_at: "2026-07-26T01:00:01Z".to_string(),
+                            batch_id: format!("TEST_CODE_backtest_{code}_{days}"),
+                        },
+                    )
+                })
                 .map_err(anyhow::Error::msg);
         }
 
-        self.data_manager.get_daily_data(code, days)
+        // HistoricalBarsGateway intentionally accepts equities only. Index
+        // benchmark codes keep their `sh`/`sz` identity and fail explicitly
+        // until a historical-index Gateway exists; they must not be relabelled
+        // as an A-share to force a response.
+        let canonical_code = code.strip_prefix("TEST_CODE_").unwrap_or(code);
+        if canonical_code.starts_with("sh") || canonical_code.starts_with("sz") {
+            anyhow::bail!("historical index bars unsupported by unified Gateway: code={code}");
+        }
+
+        let admitted = HistoricalBarsGateway::new()
+            .required_daily_bars_async(code, days)
+            .await
+            .with_context(|| format!("[{code}] 回测日线统一 Gateway 失败"))?;
+        crate::monitor::data_mode::mark_capability_success(
+            crate::monitor::data_mode::Capability::Kline,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let evidence = admitted.evidence().clone();
+        info!(
+            "[{}][BR-159] 回测日线证据 provider={:?} source={} source_at={} observed_at={} batch_id={} records={}",
+            code,
+            evidence.provider,
+            evidence.source,
+            evidence.source_at.as_deref().unwrap_or("absent"),
+            evidence.observed_at,
+            evidence.batch_id,
+            admitted.records().len()
+        );
+        Ok((admitted.records().to_vec(), evidence))
     }
 
     /// 多因子回测（使用真正的日频因子快照，无 look-ahead）
@@ -306,7 +348,7 @@ impl AnalysisPipeline {
             if chunk_days == 0 {
                 break;
             }
-            match self.get_backtest_daily_data(code, chunk_days) {
+            match self.get_backtest_daily_data(code, chunk_days).await {
                 Ok((data, _)) if !data.is_empty() => {
                     for k in &data {
                         all_closes.insert(k.date, k.close);
@@ -596,7 +638,7 @@ impl AnalysisPipeline {
         let top_n = 10;
         let mut stocks_data = Vec::new();
         for r in sorted.iter().take(top_n) {
-            match self.get_backtest_daily_data(&r.code, 60) {
+            match self.get_backtest_daily_data(&r.code, 60).await {
                 Ok((data, _)) if data.len() >= 30 => {
                     stocks_data.push((r.code.clone(), r.name.clone(), data));
                 }
@@ -726,7 +768,7 @@ impl AnalysisPipeline {
 
         let mut stocks_data = Vec::new();
         for r in sorted.iter().take(top_n) {
-            match self.get_backtest_daily_data(&r.code, days) {
+            match self.get_backtest_daily_data(&r.code, days).await {
                 Ok((data, _)) if !data.is_empty() => {
                     stocks_data.push((r.code.clone(), r.name.clone(), data));
                 }
@@ -1106,7 +1148,21 @@ mod tests {
         })
         .expect("isolated pipeline");
         let bars = factor_history(30)[0].2.clone();
+        let index_error = pipeline
+            .get_backtest_daily_data("TEST_CODE_sh000300", 30)
+            .await
+            .expect_err("TEST_CODE index identity must not enter equity daily Gateway");
+        assert!(index_error
+            .to_string()
+            .contains("historical index bars unsupported"));
+
         pipeline.test_fetched_data = Some(Ok(bars));
+        let (_, evidence) = pipeline
+            .get_backtest_daily_data("TEST_CODE_000001", 30)
+            .await
+            .expect("TEST_CODE isolated admitted history");
+        assert_eq!(evidence.source, "TEST_CODE_isolated_backtest");
+        assert!(evidence.batch_id.starts_with("TEST_CODE_backtest_"));
 
         let benchmark = pipeline
             .fetch_benchmark_series_with_code("TEST_CODE_000300", "TEST_CODE_基准", 366)
@@ -1152,7 +1208,7 @@ mod tests {
             .is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn isolated_backtest_commit_writes_all_reports_and_mandatory_audits() {
         let output = TempAuditDir::new("backtest_commit");
         let mut pipeline = AnalysisPipeline::new(super::super::PipelineConfig {

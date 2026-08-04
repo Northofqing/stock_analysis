@@ -79,6 +79,13 @@ pub fn save_user_position_snapshot(
 ) -> Result<SaveUserPositionSnapshotReceipt, String> {
     let db = crate::database::DatabaseManager::get();
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
+    save_user_position_snapshot_with_conn(&mut conn, input)
+}
+
+fn save_user_position_snapshot_with_conn(
+    conn: &mut SqliteConnection,
+    input: &UserPositionSnapshotInput,
+) -> Result<SaveUserPositionSnapshotReceipt, String> {
     conn.transaction(|conn| {
         let existing: Option<SnapshotIdentity> = diesel::sql_query("SELECT id AS id, evidence_sha256 AS evidence_sha256 FROM user_position_snapshot WHERE snapshot_id=? OR evidence_sha256=?")
             .bind::<diesel::sql_types::Text,_>(&input.snapshot_id).bind::<diesel::sql_types::Text,_>(&input.evidence_sha256).get_result(conn).optional()?;
@@ -94,7 +101,13 @@ pub fn save_user_position_snapshot(
 pub fn latest_user_position_snapshot() -> Result<Option<UserPositionSnapshot>, String> {
     let db = crate::database::DatabaseManager::get();
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
-    let row: Option<SnapshotRow> = diesel::sql_query("SELECT id,snapshot_id,effective_at,confirmed_at,source,confirm_empty,evidence_sha256 FROM user_position_snapshot ORDER BY effective_at DESC, confirmed_at DESC, snapshot_id DESC LIMIT 1").get_result(&mut conn).optional().map_err(|e| e.to_string())?;
+    latest_user_position_snapshot_with_conn(&mut conn)
+}
+
+fn latest_user_position_snapshot_with_conn(
+    conn: &mut SqliteConnection,
+) -> Result<Option<UserPositionSnapshot>, String> {
+    let row: Option<SnapshotRow> = diesel::sql_query("SELECT id,snapshot_id,effective_at,confirmed_at,source,confirm_empty,evidence_sha256 FROM user_position_snapshot ORDER BY effective_at DESC, confirmed_at DESC, snapshot_id DESC LIMIT 1").get_result(&mut *conn).optional().map_err(|e| e.to_string())?;
     let Some(row) = row else {
         return Ok(None);
     };
@@ -102,7 +115,7 @@ pub fn latest_user_position_snapshot() -> Result<Option<UserPositionSnapshot>, S
         DateTime::parse_from_rfc3339(&row.effective_at).map_err(|e| e.to_string())?;
     let confirmed_at =
         DateTime::parse_from_rfc3339(&row.confirmed_at).map_err(|e| e.to_string())?;
-    let items: Vec<SnapshotItem> = diesel::sql_query("SELECT code,name,quantity,cost_price FROM user_position_snapshot_item WHERE snapshot_id=? ORDER BY code").bind::<diesel::sql_types::Text,_>(&row.snapshot_id).load(&mut conn).map_err(|e|e.to_string())?;
+    let items: Vec<SnapshotItem> = diesel::sql_query("SELECT code,name,quantity,cost_price FROM user_position_snapshot_item WHERE snapshot_id=? ORDER BY code").bind::<diesel::sql_types::Text,_>(&row.snapshot_id).load(&mut *conn).map_err(|e|e.to_string())?;
     Ok(Some(UserPositionSnapshot {
         snapshot_row_id: row.id,
         snapshot_id: row.snapshot_id,
@@ -121,4 +134,125 @@ pub fn latest_user_position_snapshot() -> Result<Option<UserPositionSnapshot>, S
             })
             .collect(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::DateTime;
+    use diesel::connection::SimpleConnection;
+
+    fn connection() -> SqliteConnection {
+        let mut conn = SqliteConnection::establish(":memory:").expect("in-memory SQLite");
+        conn.batch_execute("PRAGMA foreign_keys = ON;")
+            .expect("foreign keys");
+        create_schema(&mut conn).expect("position snapshot schema");
+        conn
+    }
+
+    fn input(snapshot_id: &str, evidence: char) -> UserPositionSnapshotInput {
+        UserPositionSnapshotInput {
+            snapshot_id: snapshot_id.to_owned(),
+            effective_at: DateTime::parse_from_rfc3339("2026-07-24T15:00:00+08:00")
+                .expect("effective timestamp"),
+            confirmed_at: DateTime::parse_from_rfc3339("2026-07-24T15:01:00+08:00")
+                .expect("confirmed timestamp"),
+            source: "TEST_CODE_USER_CONFIRMED".to_owned(),
+            confirm_empty: false,
+            evidence_sha256: evidence.to_string().repeat(64),
+            items: vec![
+                UserPositionItemInput {
+                    code: "TEST_CODE_600000".to_owned(),
+                    name: "TEST_CODE_乙".to_owned(),
+                    quantity: 200,
+                    cost_price: 20.0,
+                },
+                UserPositionItemInput {
+                    code: "TEST_CODE_000001".to_owned(),
+                    name: "TEST_CODE_甲".to_owned(),
+                    quantity: 100,
+                    cost_price: 10.0,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn sqlite_round_trip_deduplicates_evidence_and_is_append_only() {
+        let mut conn = connection();
+        assert!(latest_user_position_snapshot_with_conn(&mut conn)
+            .expect("empty read")
+            .is_none());
+        let first = input("TEST_CODE_SNAPSHOT_A", 'a');
+        let inserted =
+            save_user_position_snapshot_with_conn(&mut conn, &first).expect("first insert");
+        assert!(inserted.inserted);
+
+        let mut same_evidence = first.clone();
+        same_evidence.snapshot_id = "TEST_CODE_SNAPSHOT_B".to_owned();
+        let duplicate = save_user_position_snapshot_with_conn(&mut conn, &same_evidence)
+            .expect("same evidence is idempotent");
+        assert!(!duplicate.inserted);
+        assert_eq!(duplicate.snapshot_row_id, inserted.snapshot_row_id);
+
+        let latest = latest_user_position_snapshot_with_conn(&mut conn)
+            .expect("latest read")
+            .expect("persisted snapshot");
+        assert_eq!(latest.snapshot_id, "TEST_CODE_SNAPSHOT_A");
+        assert_eq!(latest.items[0].code, "TEST_CODE_000001");
+        assert_eq!(latest.items[1].quantity, 200);
+
+        let mutation = diesel::sql_query(
+            "DELETE FROM user_position_snapshot_item
+             WHERE snapshot_id='TEST_CODE_SNAPSHOT_A'",
+        )
+        .execute(&mut conn)
+        .expect_err("append-only trigger");
+        assert!(mutation.to_string().contains("append-only"));
+    }
+
+    #[test]
+    fn conflicting_identity_and_duplicate_child_are_atomic_failures() {
+        let mut conn = connection();
+        let first = input("TEST_CODE_SNAPSHOT_A", 'a');
+        save_user_position_snapshot_with_conn(&mut conn, &first).expect("seed");
+        let conflicting = input("TEST_CODE_SNAPSHOT_A", 'b');
+        assert!(save_user_position_snapshot_with_conn(&mut conn, &conflicting).is_err());
+
+        let mut duplicate_child = input("TEST_CODE_SNAPSHOT_C", 'c');
+        duplicate_child.items[1].code = duplicate_child.items[0].code.clone();
+        assert!(save_user_position_snapshot_with_conn(&mut conn, &duplicate_child).is_err());
+        let count: i64 = diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM user_position_snapshot
+             WHERE snapshot_id='TEST_CODE_SNAPSHOT_C'",
+        )
+        .get_result::<SnapshotCount>(&mut conn)
+        .expect("count")
+        .count;
+        assert_eq!(count, 0);
+    }
+
+    #[derive(QueryableByName)]
+    struct SnapshotCount {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        count: i64,
+    }
+
+    #[test]
+    fn malformed_persisted_timestamp_fails_explicitly() {
+        let mut conn = connection();
+        diesel::sql_query(
+            "INSERT INTO user_position_snapshot(
+                snapshot_id,effective_at,confirmed_at,source,confirm_empty,evidence_sha256,item_count
+             ) VALUES (
+                'TEST_CODE_BAD_TIME','not-a-time','not-a-time','TEST_CODE_SOURCE',1,
+                'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',0
+             )",
+        )
+        .execute(&mut conn)
+        .expect("historical malformed row");
+        let error =
+            latest_user_position_snapshot_with_conn(&mut conn).expect_err("malformed stored time");
+        assert!(!error.is_empty());
+    }
 }

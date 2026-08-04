@@ -3,27 +3,112 @@
 use chrono::{NaiveDate, NaiveDateTime};
 use diesel::prelude::*;
 
+use crate::data_gateway::market_capabilities::MarketSecurityIdentity;
+use crate::data_gateway::{BatchEvidence, GatewayBatch, MarketCapabilitiesGateway};
+
 use super::{LedgerEntry, Position, PositionStatus, Trade, TradeDirection};
+
+#[derive(Debug)]
+struct WatchlistProjection {
+    positions: Vec<Position>,
+    evidence: BatchEvidence,
+}
+
+fn project_watchlist_batch(
+    requested_codes: &[String],
+    batch: GatewayBatch<MarketSecurityIdentity>,
+    added_at: NaiveDate,
+) -> Result<WatchlistProjection, String> {
+    let (records, evidence) = match batch {
+        GatewayBatch::Available { records, evidence } => (records, evidence),
+        GatewayBatch::VerifiedEmpty(evidence) => {
+            return Err(format!(
+                "自选证券身份数据为空: source={} batch_id={}",
+                evidence.source, evidence.batch_id
+            ));
+        }
+    };
+    if records.len() != requested_codes.len() {
+        return Err(format!(
+            "自选证券身份数据数量不完整: requested={} actual={} batch_id={}",
+            requested_codes.len(),
+            records.len(),
+            evidence.batch_id
+        ));
+    }
+
+    let mut positions = Vec::with_capacity(records.len());
+    for (requested_code, metadata) in requested_codes.iter().zip(records) {
+        if metadata.code != *requested_code
+            || metadata.provider != evidence.provider
+            || metadata.batch_id != evidence.batch_id
+        {
+            return Err(format!(
+                "自选证券身份/证据不一致: requested={} actual={} batch_id={}",
+                requested_code, metadata.code, evidence.batch_id
+            ));
+        }
+        if metadata.name.trim().is_empty() {
+            return Err(format!("自选 {requested_code} 缺少真实名称证据"));
+        }
+        positions.push(Position {
+            code: metadata.code,
+            name: metadata.name,
+            shares: 0,
+            cost_price: 0.0,
+            hard_stop: None,
+            added_at,
+            status: PositionStatus::Watching,
+            sector: String::new(),
+            is_st: metadata.is_st,
+            star_st: false,
+        });
+    }
+
+    Ok(WatchlistProjection {
+        positions,
+        evidence,
+    })
+}
+
+fn fetch_watchlist_metadata(
+    codes: Vec<String>,
+) -> Result<GatewayBatch<MarketSecurityIdentity>, String> {
+    std::thread::Builder::new()
+        .name("watchlist-security-metadata".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("创建自选名称 Gateway runtime 失败: {error}"))?;
+            runtime
+                .block_on(MarketCapabilitiesGateway::new().security_identities(&codes))
+                .map_err(|error| format!("自选证券身份数据不可用: {error}"))
+        })
+        .map_err(|error| format!("启动自选名称 Gateway 线程失败: {error}"))?
+        .join()
+        .map_err(|_| "自选名称 Gateway 线程异常退出".to_string())?
+}
 
 /// 从 stock_position 表加载持仓
 pub fn load_positions() -> Result<Vec<Position>, String> {
     load_positions_with_source_time().map(|(positions, _)| positions)
 }
 
-/// 加载持仓及整批最旧的来源更新时间；调用方据此执行 30 秒账户新鲜度门。
+fn local_projection_source_time() -> Option<chrono::DateTime<chrono::Local>> {
+    // BR-103/BR-138: `stock_position.updated_at` is a local projection
+    // mutation timestamp, not immutable broker acquisition evidence.
+    None
+}
+
+/// 加载本地持仓投影。第二项只允许携带真实券商批次的来源时间；
+/// `stock_position` 没有该证据，因此明确返回 `None`。
 pub fn load_positions_with_source_time(
 ) -> Result<(Vec<Position>, Option<chrono::DateTime<chrono::Local>>), String> {
     let db = crate::database::DatabaseManager::try_get()
         .ok_or_else(|| "DB 未初始化，无法加载持仓".to_string())?;
     let records = db.get_all_open_positions().map_err(|e| e.to_string())?;
-    let oldest_source_time = records
-        .iter()
-        .map(|record| record.updated_at)
-        .min()
-        .map(|time| {
-            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(time, chrono::Utc)
-                .with_timezone(&chrono::Local)
-        });
+    let source_time = local_projection_source_time();
     let positions = records
         .into_iter()
         .map(|r| -> Result<Position, String> {
@@ -50,12 +135,9 @@ pub fn load_positions_with_source_time(
                     return Err(format!("持仓 {} st_type 非法: {other:?}", r.code));
                 }
             };
-            let sector = r
-                .chain_name
-                .filter(|chain| !chain.trim().is_empty())
-                .or_else(|| {
-                    crate::data_provider::chain_registry::lookup(&r.code).map(str::to_string)
-                })
+            let sector = db
+                .linked_position_chain(&r.code)?
+                .map(|assignment| assignment.board_name)
                 .unwrap_or_default();
             if sector.trim().is_empty() {
                 log::warn!("[portfolio] 持仓 {} 产业链缺失，保留空值", r.code);
@@ -74,7 +156,7 @@ pub fn load_positions_with_source_time(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    Ok((positions, oldest_source_time))
+    Ok((positions, source_time))
 }
 
 /// 从环境变量加载自选（尝试解析真实名称）
@@ -84,22 +166,21 @@ pub fn load_watchlist() -> Result<Vec<Position>, String> {
         Err(std::env::VarError::NotPresent) => return Ok(Vec::new()),
         Err(error) => return Err(format!("STOCK_LIST 不是有效 Unicode: {error}")),
     };
-    let codes: Vec<&str> = list
+    let codes: Vec<String> = list
         .split(',')
         .map(str::trim)
         .filter(|code| !code.is_empty())
+        .map(str::to_string)
         .collect();
     if codes.is_empty() {
         return Ok(Vec::new());
     }
-    let name_fetcher = crate::data_provider::DataFetcherManager::new()
-        .map_err(|error| format!("初始化自选名称数据源失败: {error:#}"))?;
     let today = chrono::Local::now().date_naive();
     let mut seen = std::collections::HashSet::new();
-    let mut positions = Vec::with_capacity(codes.len());
+    let mut requested_codes = Vec::with_capacity(codes.len());
     for code in codes {
-        crate::risk::env_guard::validate_symbol_for_current_env(code)?;
-        let valid_shape = if crate::risk::env_guard::is_test_code(code) {
+        crate::risk::env_guard::validate_symbol_for_current_env(&code)?;
+        let valid_shape = if crate::risk::env_guard::is_test_code(&code) {
             code.len() > "TEST_CODE".len()
         } else {
             code.len() == 6 && code.bytes().all(|byte| byte.is_ascii_digit())
@@ -107,26 +188,24 @@ pub fn load_watchlist() -> Result<Vec<Position>, String> {
         if !valid_shape {
             return Err(format!("STOCK_LIST code 非法: {code:?}"));
         }
-        if !seen.insert(code) {
+        if !seen.insert(code.clone()) {
             continue;
         }
-        let name = name_fetcher
-            .get_stock_name(code)
-            .filter(|name| !name.trim().is_empty())
-            .ok_or_else(|| format!("自选 {code} 缺少真实名称证据"))?;
-        positions.push(Position {
-            code: code.to_string(),
-            name,
-            shares: 0,
-            cost_price: 0.0,
-            hard_stop: None,
-            added_at: today,
-            status: PositionStatus::Watching,
-            sector: String::new(),
-            ..Default::default()
-        });
+        requested_codes.push(code);
     }
-    Ok(positions)
+    let projected = project_watchlist_batch(
+        &requested_codes,
+        fetch_watchlist_metadata(requested_codes.clone())?,
+        today,
+    )?;
+    log::info!(
+        "[portfolio][BR-164] 自选名称批次已接纳 source={} provider={:?} batch_id={} records={}",
+        projected.evidence.source,
+        projected.evidence.provider,
+        projected.evidence.batch_id,
+        projected.positions.len(),
+    );
+    Ok(projected.positions)
 }
 
 /// 从 trades 表加载交易记录
@@ -447,6 +526,8 @@ struct LedgerRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{TimeZone, Utc};
+    use magic_market_core::ProviderId;
     use std::path::PathBuf;
 
     const TEST_DB: &str = "./test_data/test.db";
@@ -457,6 +538,78 @@ mod tests {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::database::DatabaseManager::init(Some(PathBuf::from(TEST_DB)))
         }));
+    }
+
+    fn metadata(code: &str, name: &str, batch_id: &str) -> MarketSecurityIdentity {
+        let at = Utc
+            .with_ymd_and_hms(2026, 7, 24, 15, 1, 0)
+            .single()
+            .unwrap();
+        MarketSecurityIdentity {
+            code: code.to_string(),
+            name: name.to_string(),
+            is_st: false,
+            source_at: at,
+            observed_at: at,
+            provider: ProviderId::Tencent,
+            batch_id: batch_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn watchlist_projection_keeps_names_and_batch_evidence() {
+        let codes = vec![
+            "TEST_CODE_000001".to_string(),
+            "TEST_CODE_600000".to_string(),
+        ];
+        let batch_id = "TEST_CODE_watchlist_batch";
+        let projected = project_watchlist_batch(
+            &codes,
+            GatewayBatch::Available {
+                records: vec![
+                    metadata(&codes[0], "测试平安", batch_id),
+                    metadata(&codes[1], "测试浦发", batch_id),
+                ],
+                evidence: BatchEvidence {
+                    provider: ProviderId::Tencent,
+                    source: "TEST_CODE_magic_tencent".to_string(),
+                    source_at: Some("2026-07-24T15:01:00Z".to_string()),
+                    observed_at: "2026-07-24T15:01:00Z".to_string(),
+                    batch_id: batch_id.to_string(),
+                },
+            },
+            NaiveDate::from_ymd_opt(2026, 7, 24).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(projected.positions.len(), 2);
+        assert_eq!(projected.positions[0].name, "测试平安");
+        assert_eq!(projected.positions[1].name, "测试浦发");
+        assert_eq!(projected.evidence.batch_id, batch_id);
+    }
+
+    #[test]
+    fn watchlist_projection_rejects_verified_empty_metadata() {
+        let error = project_watchlist_batch(
+            &["TEST_CODE_000001".to_string()],
+            GatewayBatch::VerifiedEmpty(BatchEvidence {
+                provider: ProviderId::Tencent,
+                source: "TEST_CODE_magic_tencent".to_string(),
+                source_at: Some("2026-07-24T15:01:00Z".to_string()),
+                observed_at: "2026-07-24T15:01:00Z".to_string(),
+                batch_id: "TEST_CODE_empty_watchlist".to_string(),
+            }),
+            NaiveDate::from_ymd_opt(2026, 7, 24).unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("证券身份数据为空"));
+        assert!(error.contains("TEST_CODE_empty_watchlist"));
+    }
+
+    #[test]
+    fn br103_local_position_projection_never_claims_broker_source_time() {
+        assert_eq!(local_projection_source_time(), None);
     }
 
     // ── load_positions ──

@@ -37,7 +37,11 @@ done
 # Canonical columns: id | status | intent | code.
 awk -F'|' -v source="$CANONICAL_FILE" '
   /^\| BR-[0-9]+ / {
-    id=$2; status=$3; intent=$4; code=$5;
+    # Markdown code spans may contain literal pipes.  The canonical code-path
+    # column is always the final non-empty field, so rebuild the intent from
+    # every field between status and code instead of truncating it at $4.
+    id=$2; status=$3; intent=$4; code=$(NF-1);
+    for (i=5; i<=NF-2; i++) intent=intent "|" $i;
     gsub(/^ +| +$/, "", id); gsub(/^ +| +$/, "", status);
     gsub(/^ +| +$/, "", intent); gsub(/^ +| +$/, "", code);
     print id "\t" status "\t" intent "\t" code "\t" source;

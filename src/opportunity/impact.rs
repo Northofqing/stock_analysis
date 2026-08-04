@@ -1,7 +1,7 @@
-//! Registered business rules: BR-069.
+//! Registered business rules: BR-069, BR-181.
 //! 持仓影响评估 — 每条新闻 × 每只持仓 → 利好/中性/利空。
 
-use super::chain_mapper::ChainHit;
+use super::chain_mapper::{ChainHit, ChainRulesUnavailable};
 use crate::portfolio::Position;
 
 #[derive(Debug, Clone)]
@@ -187,17 +187,20 @@ fn select_best_hit<'a>(
     best.map(|(hit, _, _)| hit)
 }
 
-fn build_static_chain_hit(chain: &str, concepts: &[String]) -> Option<ChainHit> {
+fn build_static_chain_hit(
+    chain: &str,
+    concepts: &[String],
+) -> Result<Option<ChainHit>, ChainRulesUnavailable> {
     let chain = chain.to_string();
-    // 与 chain_rules.toml 保持同源：通过 chain_mapper 规则实时反查 board_keyword。
-    let board_keyword = crate::opportunity::chain_mapper::map_news_to_chains(&chain)
+    // 与启动时已激活的 chain.toml 快照保持同源，禁止消费路径磁盘回读。
+    let board_keyword = crate::opportunity::chain_mapper::map_news_to_chains(&chain)?
         .into_iter()
         .find(|h| h.chain == chain)
         .map(|h| h.board_keyword)
         .unwrap_or_default();
 
     if board_keyword.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let matched_keywords: Vec<String> = concepts
@@ -215,10 +218,10 @@ fn build_static_chain_hit(chain: &str, concepts: &[String]) -> Option<ChainHit> 
         .collect();
 
     if matched_keywords.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    Some(ChainHit {
+    Ok(Some(ChainHit {
         chain,
         keywords: matched_keywords,
         logic: "静态主业概念归因".to_string(),
@@ -228,7 +231,7 @@ fn build_static_chain_hit(chain: &str, concepts: &[String]) -> Option<ChainHit> 
         fund_flow_pct: None,
         board_code: None,
         board_change_pct: None,
-    })
+    }))
 }
 
 fn load_cached_concepts_safe(max_age_days: i64) -> std::collections::HashMap<String, Vec<String>> {
@@ -253,7 +256,13 @@ fn load_cached_concepts_safe(max_age_days: i64) -> std::collections::HashMap<Str
 /// - 在命中标的中但资金平淡 → 中性
 /// - 在命中标的中但**无资金数据** → 中性·数据不足（不臆测多空）
 /// - 不在任何命中标的中 → 中性·无直接产业链关联
-pub fn assess_impact(hits: &[ChainHit], holdings: &[Position]) -> Vec<PositionImpact> {
+pub fn assess_impact(
+    hits: &[ChainHit],
+    holdings: &[Position],
+) -> Result<Vec<PositionImpact>, ChainRulesUnavailable> {
+    // Fail before concept-cache access so configuration absence cannot be
+    // presented as a neutral/no-association disposition.
+    crate::config::get_chain_rules().ok_or(ChainRulesUnavailable)?;
     let mut results = Vec::new();
     // 静态概念标签兜底：用于同股多链命中时优先选择更贴近主业的产业链。
     let concepts_map = load_cached_concepts_safe(14);
@@ -289,8 +298,10 @@ pub fn assess_impact(hits: &[ChainHit], holdings: &[Position]) -> Vec<PositionIm
     for pos in holdings {
         let concepts = concepts_map.get(&pos.code).cloned().unwrap_or_default();
         let preferred_chain = concept_preferred_chain(&concepts);
-        let static_hit = concept_preferred_chain(&concepts)
-            .and_then(|chain| build_static_chain_hit(chain, &concepts));
+        let static_hit = match concept_preferred_chain(&concepts) {
+            Some(chain) => build_static_chain_hit(chain, &concepts)?,
+            None => None,
+        };
 
         // 防误判：当持仓有主业概念标签时，动态命中的产业链必须与概念有对齐。
         // 否则容易把“板块成分股中的边缘标的”误判为直接受益标的。
@@ -378,13 +389,33 @@ pub fn assess_impact(hits: &[ChainHit], holdings: &[Position]) -> Vec<PositionIm
             }
         }
     }
-    results
+    Ok(results)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::NaiveDate;
+
+    fn repository_rule_snapshot() -> crate::config::ChainRulesTestGuard {
+        let parsed: crate::config::ChainRulesFile =
+            toml::from_str(include_str!("../../config/chain.toml"))
+                .expect("repository chain rules must parse");
+        crate::config::replace_chain_rules_for_test(Some(parsed.rules))
+    }
+
+    #[test]
+    fn impact_preserves_chain_rules_unavailable_before_other_lookups() {
+        let _snapshot = crate::config::replace_chain_rules_for_test(None);
+
+        let error = assess_impact(&[], &[pos("TEST_CODE_000001", "测试持仓")])
+            .expect_err("missing chain rules must not become a neutral impact");
+
+        assert_eq!(
+            error,
+            crate::opportunity::chain_mapper::ChainRulesUnavailable
+        );
+    }
 
     fn si(code: &str, name: &str) -> crate::opportunity::chain_mapper::StockInfo {
         crate::opportunity::chain_mapper::StockInfo {
@@ -425,40 +456,50 @@ mod tests {
 
     #[test]
     fn test_inflow_positive() {
+        let _snapshot = repository_rule_snapshot();
         let hits = vec![hit_with_flow("TEST_CODE_002579", "中京电子", Some(5.0))];
-        let impacts = assess_impact(&hits, &[pos("TEST_CODE_002579", "中京电子")]);
+        let impacts = assess_impact(&hits, &[pos("TEST_CODE_002579", "中京电子")])
+            .expect("explicit chain snapshot is available");
         assert_eq!(impacts[0].direction, ImpactDirection::Positive);
     }
 
     #[test]
     fn test_outflow_negative() {
+        let _snapshot = repository_rule_snapshot();
         // 消息利好但主力大幅净流出 → 利空（资金背离）
         let hits = vec![hit_with_flow("TEST_CODE_002579", "中京电子", Some(-6.0))];
-        let impacts = assess_impact(&hits, &[pos("TEST_CODE_002579", "中京电子")]);
+        let impacts = assess_impact(&hits, &[pos("TEST_CODE_002579", "中京电子")])
+            .expect("explicit chain snapshot is available");
         assert_eq!(impacts[0].direction, ImpactDirection::Negative);
     }
 
     #[test]
     fn test_flat_flow_neutral() {
+        let _snapshot = repository_rule_snapshot();
         let hits = vec![hit_with_flow("TEST_CODE_002579", "中京电子", Some(0.5))];
-        let impacts = assess_impact(&hits, &[pos("TEST_CODE_002579", "中京电子")]);
+        let impacts = assess_impact(&hits, &[pos("TEST_CODE_002579", "中京电子")])
+            .expect("explicit chain snapshot is available");
         assert_eq!(impacts[0].direction, ImpactDirection::Neutral);
     }
 
     #[test]
     fn test_missing_flow_neutral_not_assumed() {
+        let _snapshot = repository_rule_snapshot();
         // 缺资金数据 → 中性·数据不足，绝不臆测为利好/利空
         let hits = vec![hit_with_flow("TEST_CODE_002579", "中京电子", None)];
-        let impacts = assess_impact(&hits, &[pos("TEST_CODE_002579", "中京电子")]);
+        let impacts = assess_impact(&hits, &[pos("TEST_CODE_002579", "中京电子")])
+            .expect("explicit chain snapshot is available");
         assert_eq!(impacts[0].direction, ImpactDirection::Neutral);
         assert!(impacts[0].reason.contains("数据不足"));
     }
 
     #[test]
     fn test_unrelated_holding_neutral() {
+        let _snapshot = repository_rule_snapshot();
         let hits = vec![hit_with_flow("TEST_CODE_002579", "中京电子", Some(5.0))];
         let holdings = vec![pos("TEST_CODE_000813", "德展健康")];
-        let impacts = assess_impact(&hits, &holdings);
+        let impacts =
+            assess_impact(&hits, &holdings).expect("explicit chain snapshot is available");
         assert_eq!(impacts[0].direction, ImpactDirection::Neutral);
         assert!(impacts[0].reason.contains("无直接产业链关联"));
     }

@@ -5,18 +5,18 @@
 //! 但新闻内容详存 + 跨重启追溯 + 后续 LLM 复盘, 需要永久保存.
 //! `news_items` 表存原始条目; `content_hash` 用于重复检测 (同一 title+summary 不重复入库).
 //!
-//! 当前 task (Task 9) 只定义结构 + 迁移 + insert helper.
-//! 真正的 fetch (sina_financial / sina_stock) 在后续 task 接入.
+//! 本模块只定义 provider-neutral 的持久化记录与内容哈希；真实抓取由
+//! `GlobalNewsGateway` / `SinaInstrumentNewsGateway` 完成，consumer 不持有协议。
 
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
-/// 新闻条目 (sina_financial / sina_stock / 后续其他源)
+/// 统一 Gateway 接纳后的新闻持久化条目。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NewsItem {
-    /// 数据源标识: "sina_financial" | "sina_stock"
+    /// 数据源标识（由 Gateway/provider 批次给出）。
     pub source: String,
-    /// 外部 ID (目前用 url 作为 ID; 后续可换真实 ID)
+    /// Provider 外部 ID；若上游合同以 canonical URL 为身份则保存该 URL。
     pub external_id: String,
     /// 分类: "财经要闻" | "个股新闻"
     pub category: String,
@@ -24,7 +24,7 @@ pub struct NewsItem {
     pub code: Option<String>,
     /// 标题
     pub title: String,
-    /// 摘要 (来自 sina_rss 描述字段)
+    /// Provider 返回的摘要；缺失时保持空值语义，不臆造正文。
     pub summary: String,
     /// 原文 url
     pub url: String,

@@ -1,3 +1,6 @@
+//! Registered business rule: BR-175.
+//! Generic-search results must not cross the governed fact boundary.
+
 use crate::search_service::SearchResult;
 use chrono::{DateTime, Local, NaiveDateTime};
 
@@ -23,6 +26,20 @@ pub struct SearchResultAdapter;
 
 impl SearchResultAdapter {
     pub fn to_raw(sr: &SearchResult) -> Result<RawNewsItem, String> {
+        if sr.evidence.is_research_only() {
+            return Err(format!(
+                "E_RESEARCH_ONLY: 通用网页研究结果不得升级为 MarketEvent \
+                 (source={}, title={})",
+                sr.source, sr.title
+            ));
+        }
+        if !sr.evidence.is_complete_governed_source_fact() {
+            return Err(format!(
+                "E_UNVERIFIED_SOURCE_FACT: 缺少完整 governed source-fact evidence \
+                 (source={}, title={})",
+                sr.source, sr.title
+            ));
+        }
         let date_str = sr.published_date.as_deref().ok_or_else(|| {
             format!(
                 "E_INVALID_PUBLISHED_AT: published_date 缺失 (source={}, title={})",

@@ -1,168 +1,131 @@
-//! Registered business rules: BR-078, BR-082, BR-137.
-//! `news::aggregator` 在 monitor 主路径的初始化 + tick 接入
+//! Registered business rules: BR-078, BR-082, BR-137, BR-174.
+//! Unified global-news acquisition and receipt-gated notification projection.
 //!
-//! ## 目标 (v15.3 Phase D 收尾)
+//! The old scheduler projected `MarketEvent` and advanced simhash before the
+//! source facts had a durable ingress receipt. BR-174 splits that ownership:
 //!
-//! 把 `src/news/aggregator/feed.rs` 的 7 个通用新闻轮询 `NewsFeed` 适配 (Jin10 / WSCN /
-//! CLS / Sina / Weibo / Gel / 科创板日报) 注册到全局 `NewsAggregator`。GovPolicy 由
-//! BR-137 独立 producer 保留原始 `SearchResult`，不进入投递前 aggregator 去重。
-//! `news_monitor_loop` 每 tick 调一次 `tick_news_aggregator_batch(20)`,
-//! 把 dedup 后的事件喂给 BR-082 NewsFlashGate，同时为 BR-155 保留逐 feed 完整性证据。
-//!
-//! ## 调用链
-//!
-//! ```text
-//! monitor::main()
-//!   └─ init_news_aggregator()  ← 本文件
-//!        ├─ register_feeds(7 × Arc<dyn NewsFeed>)
-//!        ├─ take_all_for_aggregator()
-//!        └─ NewsAggregator::new(...).set_global()
-//!
-//! monitor::main()
-//!   └─ news_monitor_loop()
-//!        └─ tick_news_aggregator_batch(20).await  ← 本文件
-//!             └─ NewsAggregator::global().tick_batch(20) → 7 feed 取数 + simhash 去重
-//!                  → NewsAggregationBatch → BR-082 NewsFlashGate + BR-155 selection
-//! ```
-//!
-//! ## Idempotent
-//!
-//! 重复调 `init_news_aggregator()` 是 no-op (全局已 set_global 后直接 return).
+//! 1. [`fetch_raw_global_news_batch`] returns typed per-provider terminals and
+//!    exact `GlobalNewsRecord + BatchEvidence` without notification effects.
+//! 2. The selection ingress owner persists that batch and verifies a receipt.
+//! 3. [`project_notifications_after_ingress`] accepts only the sealed
+//!    `ReceiptedRawNewsBatch`, then projects BR-082/BR-137 `MarketEvent`s and
+//!    advances notification simhash.
 //!
 //! ## 红线约束
 //!
-//! - AGENTS.md §2.1: feed 失败显式 warn log, 不静默 panic
-//! - CLAUDE.md Completion Rule: 本模块由 `src/bin/monitor/` 集成 (grep ≥1),
-//!   不能只活在 `src/news/aggregator/feed.rs` 单测里
+//! - AGENTS.md §§2.1/2.2: provider failure remains `Unavailable`; it is never
+//!   converted to a successful empty notification batch.
+//! - AGENTS.md §§2.4/2.7: publication, observation, provider and batch identity
+//!   remain attached to raw source facts.
 
-use std::sync::Arc;
+#![allow(
+    dead_code,
+    reason = "BR-174 receipt-gated projection is retained for the selection-v2 release; BR-183 forbids constructing a production receipt while that capability is disabled"
+)]
 
-use stock_analysis::news::aggregator::{
-    self,
-    feed::{self},
-    FeedAttempt, FeedAttemptStatus, NewsAggregationBatch, NewsAggregator, NewsFeed,
+use once_cell::sync::Lazy;
+use sha2::{Digest, Sha256};
+use stock_analysis::news::aggregator::projection_v2::{
+    NotificationProjectionError, NotificationProjectionState, ReceiptedRawNewsBatch,
+};
+use stock_analysis::news::aggregator::raw_v2::{
+    self, registered_global_news_feeds, RawNewsAcquisitionError, RawNewsAggregationBatch,
 };
 use stock_analysis::signal::market_event::MarketEvent;
 
-/// 注册 7 个真实通用新闻轮询 NewsFeed 适配到全局 NewsAggregator.
-///
-/// 在 monitor 启动早期调一次 (main() 里 spawn task 之前). 重复调 no-op.
-///
-/// 返回注册的 feed 数 (供单测断言 + 启动 log).
-pub fn init_news_aggregator() -> usize {
-    // Idempotent: 已 set_global 直接 return (不重复注册, 避免 Mutex<Vec> 累积)
-    if aggregator::global().is_some() {
-        log::info!("[NewsAggregator] 已初始化, 跳过重复 init");
-        return feed_count_global();
-    }
+static NOTIFICATION_PROJECTION: Lazy<NotificationProjectionState> =
+    Lazy::new(NotificationProjectionState::new);
 
-    let feeds: Vec<Arc<dyn NewsFeed>> = vec![
-        // ===== 通用新闻源 (7 个, 真 HTTP; 每个 inner 调对应 Provider::new()) =====
-        Arc::new(feed::Jin10FlashFeed {
-            inner: stock_analysis::search_service::providers::jin10::Jin10Provider::new(),
-        }),
-        Arc::new(feed::WallStreetCnFeed {
-            inner:
-                stock_analysis::search_service::providers::wallstreetcn::WallStreetCnProvider::new(),
-        }),
-        Arc::new(feed::ClsFlashFeed {
-            inner: stock_analysis::search_service::providers::cls::ClsProvider::new(),
-        }),
-        Arc::new(feed::SinaFlashFeed {
-            inner: stock_analysis::search_service::providers::sina_flash::SinaFlashProvider::new(),
-        }),
-        Arc::new(feed::WeiboHotFeed {
-            inner: stock_analysis::search_service::providers::weibo_hot::WeiboHotProvider::new(),
-        }),
-        Arc::new(feed::GelonghuiFeed {
-            inner: stock_analysis::search_service::providers::gelonghui::GelonghuiProvider::new(),
-        }),
-        Arc::new(feed::KcbDailyFeed {
-            inner: stock_analysis::search_service::providers::kcb_daily::KcbDailyProvider::new(),
-        }),
-        // BR-078: 未实现/主动触发型 feed 不得伪装成成功轮询源。
-        // GovCn/MIIT/EarningsCalendar/Consensus/MarketAction/AnalystViews 不注册。
-        // GovPolicyFeed 不注册：BR-137 要求原始 SearchResult 由独立 producer
-        // 分类/投递，禁止 aggregator 在投递前提交 seen_simhash。
-        // EmAnnouncementFeed 也不注册，公告由下面说明的既有主路径消费。
-        // 公告直接来自 news_monitor_loop 中的真实 provider 批次，
-        // 通过 v17_sources::route_announcements 推送，绕过 NewsFlash 二次缓冲。
-    ];
-    let count = feeds.len();
-    log::info!(
-        "[v17.7 sources] gov_cn=disabled(parser_not_implemented) miit=disabled(parser_not_implemented)"
-    );
-
-    feed::register_feeds(feeds);
-    let drained = feed::take_all_for_aggregator();
-    let real_count = drained.len();
-    let agg = NewsAggregator::new(drained);
-    aggregator::set_global(Arc::new(agg));
-
-    log::info!(
-        "[NewsAggregator] init 完成: {} feeds registered, {} 喂入 aggregator",
-        count,
-        real_count
-    );
-    real_count
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalNewsPipelineRegistration {
+    pub feed_count: usize,
+    pub registered_feed_set_sha256: String,
 }
 
-/// 全局已注册 feed 数 (供调试 / 启动 banner).
-fn feed_count_global() -> usize {
-    aggregator::global()
-        .map(|agg| agg.feed_count())
-        .unwrap_or(0)
+pub fn uninitialized_global_news_pipeline_registration() -> GlobalNewsPipelineRegistration {
+    GlobalNewsPipelineRegistration {
+        feed_count: 0,
+        registered_feed_set_sha256: sha256_domain(
+            "stock_analysis.br196.registered_feed_set.v1",
+            b"state=uninitialized\n",
+        ),
+    }
 }
 
-/// 在 `news_monitor_loop` 中每 tick 调一次，保留逐 feed 完整性证据。
-///
-/// BR-082 继续消费 `events`；BR-155 selection 必须消费完整 batch。
-pub async fn tick_news_aggregator_batch(per_feed_limit: usize) -> NewsAggregationBatch {
-    match aggregator::global() {
-        Some(agg) => {
-            let batch = agg.tick_batch(per_feed_limit).await;
-            if batch.events.is_empty() {
-                log::debug!(
-                    "[NewsAggregator] tick 返回 0 事件 (per_feed_limit={} sources_complete={})",
-                    per_feed_limit,
-                    batch.sources_complete()
-                );
-                return batch;
-            }
-            let mut counts_by_type: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
-            for event in &batch.events {
-                *counts_by_type
-                    .entry(format!("{:?}", event.event_type))
-                    .or_insert(0) += 1;
-            }
-            log::info!(
-                "[NewsAggregator] tick 拿到 {} 事件, 按类型: {:?} (per_feed_limit={} sources_complete={})",
-                batch.events.len(),
-                counts_by_type,
-                per_feed_limit,
-                batch.sources_complete()
-            );
-            batch
-        }
-        None => {
-            log::warn!(
-                "[NewsAggregator] global() 尚未初始化, 调用方应在 main() 早期先调 init_news_aggregator()"
-            );
-            NewsAggregationBatch {
-                events: Vec::new(),
-                source_attempts: vec![FeedAttempt {
-                    feed_name: "global_aggregator".to_string(),
-                    source_kind: "system".to_string(),
-                    status: FeedAttemptStatus::Failed {
-                        reason_code: "aggregator_not_initialized".to_string(),
-                        message: "global aggregator is not initialized".to_string(),
-                    },
-                }],
-                observed_at: chrono::Local::now(),
-            }
-        }
-    }
+/// Initialize the notification-only state and report the immutable real
+/// provider registry size.
+pub fn init_global_news_pipeline() -> GlobalNewsPipelineRegistration {
+    Lazy::force(&NOTIFICATION_PROJECTION);
+    let registrations = registered_global_news_feeds();
+    let canonical = registrations
+        .iter()
+        .map(|feed| {
+            format!(
+                "{}|{}|{}|{}|{}|{}|{}",
+                feed.feed_name,
+                feed.gateway_provider,
+                feed.provider_id,
+                feed.source_contract,
+                feed.capability_name,
+                feed.max_limit,
+                feed.upstream_revision
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let registration = GlobalNewsPipelineRegistration {
+        feed_count: registrations.len(),
+        registered_feed_set_sha256: sha256_domain(
+            "stock_analysis.br196.registered_feed_set.v1",
+            canonical.as_bytes(),
+        ),
+    };
+    log::info!(
+        "[NewsAggregator][BR-174] raw acquisition + receipted notification projection ready: {} unified Gateway feeds registered",
+        registration.feed_count
+    );
+    registration
+}
+
+fn sha256_domain(domain: &str, payload: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(domain.as_bytes());
+    hasher.update([0]);
+    hasher.update(payload);
+    format!("{:x}", hasher.finalize())
+}
+
+/// Fetch the complete registered real-provider set without constructing
+/// notification events or mutating simhash.
+pub async fn fetch_raw_global_news_batch(
+    per_feed_limit: u32,
+) -> Result<RawNewsAggregationBatch, RawNewsAcquisitionError> {
+    let batch = raw_v2::fetch_raw_global_news_batch(per_feed_limit).await?;
+    log::info!(
+        "[NewsAggregator][BR-174] raw batch acquired attempts={} records={} sources_complete={} per_feed_limit={}",
+        batch.attempts().len(),
+        batch.source_record_count(),
+        batch.sources_complete(),
+        per_feed_limit
+    );
+    Ok(batch)
+}
+
+/// Project BR-082/BR-137 notification events only after the selection ingress
+/// owner has returned a verified receipt capability.
+pub fn project_notifications_after_ingress(
+    batch: ReceiptedRawNewsBatch,
+) -> Result<Vec<MarketEvent>, NotificationProjectionError> {
+    let source_batch_content_hash = batch.source_batch_content_hash().to_owned();
+    let ingress_receipt_hash = batch.ingress_receipt_hash().to_owned();
+    let events = NOTIFICATION_PROJECTION.project_after_ingress(batch)?;
+    log::info!(
+        "[NewsAggregator][BR-174] receipted notification projection events={} source_batch_content_hash={} ingress_receipt_hash={}",
+        events.len(),
+        source_batch_content_hash,
+        ingress_receipt_hash
+    );
+    Ok(events)
 }
 
 // ============================================================================
@@ -320,15 +283,14 @@ impl NewsFlashGate {
                     stale: e.stale,
                     strength: e.strength,
                     certainty: e.certainty,
-                    text: format!(
-                        "🚨 高分新闻快讯 ({})\n[{}] {}\n强度 {} | 确定性 {} | 今日第 {}/{} 条",
-                        now.format("%H:%M"),
+                    text: assemble_news_flash_critical(
+                        &now.format("%H:%M").to_string(),
                         e.event_type.label(),
                         &e.full_title,
                         e.strength,
                         e.certainty,
                         self.critical_pushed_today,
-                        max_critical_per_day
+                        max_critical_per_day,
                     ),
                 });
             }
@@ -357,16 +319,50 @@ impl NewsFlashGate {
                 }
                 let mut sorted: Vec<&(u8, String)> = self.buffer.iter().collect();
                 sorted.sort_by_key(|item| std::cmp::Reverse(item.0));
-                let mut text = format!("📰 新闻时段聚合 ({}) Top3:\n", label);
-                for (rank, (_, line)) in sorted.iter().take(3).enumerate() {
-                    text.push_str(&format!("{}. {}\n", rank + 1, line));
-                }
+                let lines = sorted
+                    .iter()
+                    .take(3)
+                    .map(|(_, line)| line.clone())
+                    .collect::<Vec<_>>();
+                let text = assemble_news_flash_aggregated(&label, &lines)
+                    .expect("nonempty NewsFlash buffer produces a card");
                 out.push(FlashDecision::Aggregated(label, text));
             }
         }
 
         out
     }
+}
+
+pub(super) fn assemble_news_flash_critical(
+    hhmm: &str,
+    event_label: &str,
+    headline: &str,
+    strength: u8,
+    certainty: u8,
+    ordinal: u32,
+    daily_limit: u32,
+) -> String {
+    format!(
+        "🚨 高分新闻快讯 ({hhmm})\n[{event_label}] {headline}\n强度 {strength} | 确定性 {certainty} | 今日第 {ordinal}/{daily_limit} 条"
+    )
+}
+
+pub(super) fn assemble_news_flash_aggregated(
+    window: &str,
+    lines: &[String],
+) -> Result<String, String> {
+    if window.trim().is_empty()
+        || lines.is_empty()
+        || lines.iter().any(|line| line.trim().is_empty())
+    {
+        return Err("BR-196 NewsFlash aggregate requires window and nonempty lines".to_string());
+    }
+    let mut text = format!("📰 新闻时段聚合 ({window}) Top3:\n");
+    for (rank, line) in lines.iter().take(3).enumerate() {
+        text.push_str(&format!("{}. {line}\n", rank + 1));
+    }
+    Ok(text)
 }
 
 /// 推送包装: 把 FlashDecision 走现有 push_governor_v3 (L4 dedup: critical 按
@@ -387,6 +383,18 @@ pub async fn push_flash_decisions(decisions: Vec<FlashDecision>) -> (usize, usiz
                 certainty,
                 text,
             } => {
+                let presentation_token = match crate::presentation_registry::acquire_token(
+                    "N-01-news-flash-critical",
+                    crate::notify::PushKind::NewsFlashCritical,
+                    "news_flash_critical_dispatcher",
+                    "assemble_news_flash_critical",
+                ) {
+                    Ok(token) => token,
+                    Err(error) => {
+                        log::error!("[NewsFlashGate][BR-196] critical token rejected: {error}");
+                        continue;
+                    }
+                };
                 let outcome = match crate::v14_adapter::SourceFactEvidence::new(
                     crate::notify::PushKind::NewsFlashCritical,
                     event_id,
@@ -399,7 +407,14 @@ pub async fn push_flash_decisions(decisions: Vec<FlashDecision>) -> (usize, usiz
                     certainty,
                     stale,
                 ) {
-                    Ok(evidence) => crate::notify::push_source_fact_v3(&text, &evidence).await,
+                    Ok(evidence) => {
+                        crate::notify::push_presented_source_fact_v3(
+                            presentation_token,
+                            &text,
+                            &evidence,
+                        )
+                        .await
+                    }
                     Err(error) => {
                         log::error!(
                             "[NewsFlashGate][BR-137] critical source fact rejected: {error}"
@@ -414,12 +429,21 @@ pub async fn push_flash_decisions(decisions: Vec<FlashDecision>) -> (usize, usiz
                 }
             }
             FlashDecision::Aggregated(window, text) => {
-                let outcome = crate::notify::push_governor_v3(
-                    &text,
+                let presentation_token = match crate::presentation_registry::acquire_token(
+                    "N-02-news-flash-aggregated",
                     crate::notify::PushKind::NewsFlashAggregated,
-                    Some(&window),
-                )
-                .await;
+                    "news_flash_aggregate_dispatcher",
+                    "assemble_news_flash_aggregated",
+                ) {
+                    Ok(token) => token,
+                    Err(error) => {
+                        log::error!("[NewsFlashGate][BR-196] aggregate token rejected: {error}");
+                        continue;
+                    }
+                };
+                let outcome =
+                    crate::notify::push_presented_v3(presentation_token, &text, Some(&window))
+                        .await;
                 if outcome.is_pushed() {
                     n_agg += 1;
                 } else {
@@ -614,32 +638,19 @@ mod tests {
     }
 
     #[test]
-    fn init_news_aggregator_short_circuits_when_global_set() {
-        // F5 修复 (review #5): 旧名 `init_news_aggregator_is_idempotent` 名不副实 — 二次调
-        // 走 early-return (line 52),不真创建 feeds. 测 short-circuit 行为而非"幂等注册".
-        let c1 = init_news_aggregator();
-        let c2 = init_news_aggregator();
-        assert!(c1 > 0, "首次 init 应返回 >0 feed 数, 实际 {}", c1);
-        assert_eq!(
-            c1, c2,
-            "short-circuit: 二次 init 应返回相同 feed 数 (实际 {} vs {})",
-            c1, c2
-        );
+    fn global_news_pipeline_reports_the_fixed_real_provider_registry() {
+        let first = init_global_news_pipeline();
+        let second = init_global_news_pipeline();
+        assert_eq!(first.feed_count, 4);
+        assert_eq!(first, second);
+        assert_eq!(first.registered_feed_set_sha256.len(), 64);
     }
 
-    #[test]
-    fn global_aggregator_has_feeds_after_init() {
-        let count = feed_count_global();
-        log::info!("[test] global aggregator 现有 {} feeds", count);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn tick_news_aggregator_returns_typed_batch_evidence() {
-        let batch = tick_news_aggregator_batch(5).await;
-        log::info!(
-            "[test] tick 拿到 {} 个 MarketEvent / {} 个 source attempts",
-            batch.events.len(),
-            batch.source_attempts.len()
-        );
+    #[tokio::test]
+    async fn raw_fetch_rejects_zero_limit_before_provider_work() {
+        let error = fetch_raw_global_news_batch(0)
+            .await
+            .expect_err("TEST_CODE zero limit must fail before provider work");
+        assert!(matches!(error, RawNewsAcquisitionError::InvalidLimit(0)));
     }
 }

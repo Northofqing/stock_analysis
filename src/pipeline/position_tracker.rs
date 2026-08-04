@@ -12,16 +12,15 @@
 //! - 保留铁律2/3/4/5 作为额外保护层
 //! - 配置 `[position_sizing] use_dynamic = false` 可回退到旧逻辑
 //!
-//! ## BR-015: 产业链集中度检查当前禁用 (2026-06-30 codex review)
+//! ## BR-170: 产业链集中度证据
 //!
-//! `track_position` 中 `risk_ctx.sizer.max_position(_, _, 0, 0, _)` 两个
-//! 0 均为 placeholder (line 327-333), 当前监控无法拒绝同产业链第 N+1 只建仓.
-//! 完整启用需要: (1) stock_position 表加 chain_name 列 (2) open_position
-//! 时存 chain_name (3) DB 查同 chain 持仓 / T+1 冻结数 (4) chain_mapper
-//! 关键词表算 chain. 待 v9.4+ 接 broker API 时统一处理.
+//! 集中度只消费已链接、不可变的 Magic TDX position-chain assignment。
+//! 静态映射与无 assignment 链接的概念缓存均不是下单证据。
 
 use log::{info, warn};
 
+use crate::data_gateway::position_chain::validate_position_chain_assignment;
+use crate::data_gateway::PositionChainAssignment;
 use crate::data_provider::KlineData;
 use crate::database::DatabaseManager;
 use crate::monitor::risk::{MarketRegime, PositionSizer, StopLoss};
@@ -103,49 +102,45 @@ fn validate_trade_symbol_env(code: &str) -> Result<(), String> {
     crate::risk::env_guard::validate_symbol_for_current_env(code)
 }
 
-/// BR-085: resolve a current chain classification and its real open/frozen exposure.
-fn query_chain_exposure(code: &str) -> Result<(String, usize, usize), String> {
-    let mut conn = DatabaseManager::get()
-        .get_conn()
-        .map_err(|e| format!("DB: {}", e))?;
+fn buy_triggered(result: &AnalysisResult) -> bool {
+    result
+        .boll_macd
+        .as_ref()
+        .is_some_and(|signal| signal.action.is_buy())
+        || result.contrarian_signal
+}
 
-    #[derive(diesel::QueryableByName)]
-    struct ConceptCacheRow {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        concepts: String,
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        updated_at: String,
+pub(super) fn candidate_position_chain_required(
+    code: &str,
+    result: &AnalysisResult,
+    risk_ctx: &RiskContext,
+) -> Result<bool, String> {
+    if !risk_ctx.regime.allow_new_position() || !buy_triggered(result) {
+        return Ok(false);
     }
-    let cache: Option<ConceptCacheRow> =
-        diesel::sql_query("SELECT concepts, updated_at FROM stock_concepts WHERE code = ? LIMIT 1")
-            .bind::<diesel::sql_types::Text, _>(code)
-            .get_result(&mut conn)
-            .optional()
-            .map_err(|e| format!("query stock_concepts: {e}"))?;
+    DatabaseManager::get()
+        .get_open_position(code)
+        .map(|position| position.is_none())
+        .map_err(|error| format!("BR-170 query candidate position state: {error}"))
+}
 
-    let effective_today = if crate::calendar::is_trading_day(chrono::Local::now().date_naive()) {
-        chrono::Local::now().date_naive()
-    } else {
-        crate::calendar::prev_trading_day(chrono::Local::now().date_naive())
-    };
-    let allowed_dates = crate::calendar::recent_trading_days(effective_today, 2);
-    let cached_chain = cache.and_then(|row| {
-        let updated_date =
-            chrono::NaiveDateTime::parse_from_str(&row.updated_at, "%Y-%m-%d %H:%M:%S")
-                .ok()
-                .map(|value| value.date());
-        if updated_date.is_some_and(|date| allowed_dates.contains(&date)) {
-            serde_json::from_str::<Vec<String>>(&row.concepts)
-                .ok()
-                .and_then(|values| values.into_iter().find(|value| !value.trim().is_empty()))
-        } else {
-            None
-        }
-    });
-    let chain = cached_chain
-        .or_else(|| crate::data_provider::chain_registry::lookup(code).map(str::to_string))
-        .filter(|value| value != "其他")
-        .ok_or_else(|| format!("BR-085 chain classification unavailable for {code}"))?;
+/// BR-170: resolve concentration from the candidate's admitted assignment and
+/// already-linked real open positions. This reader never owns network transport.
+fn query_chain_exposure(
+    code: &str,
+    assignment: &PositionChainAssignment,
+) -> Result<(String, usize, usize), String> {
+    validate_position_chain_assignment(assignment)
+        .map_err(|error| format!("BR-170 invalid candidate assignment: {error}"))?;
+    if assignment.code != code {
+        return Err(format!(
+            "BR-170 candidate assignment code mismatch: request={code} assignment={}",
+            assignment.code
+        ));
+    }
+    let database = DatabaseManager::get();
+    let chain = assignment.primary.board_name.clone();
+    let mut conn = database.get_conn().map_err(|e| format!("DB: {}", e))?;
 
     #[derive(diesel::QueryableByName)]
     struct ExposureRow {
@@ -158,7 +153,12 @@ fn query_chain_exposure(code: &str) -> Result<(String, usize, usize), String> {
     let exposure: ExposureRow = diesel::sql_query(
         "SELECT COUNT(*) AS held,
                 COALESCE(SUM(CASE WHEN buy_date = ? THEN 1 ELSE 0 END), 0) AS frozen
-         FROM stock_position WHERE chain_name = ? AND status = 'open'",
+         FROM stock_position AS position
+         INNER JOIN position_chain_assignment AS assignment
+                 ON assignment.assignment_id = position.chain_assignment_id
+                AND assignment.code = position.code
+                AND assignment.board_name = position.chain_name
+         WHERE assignment.board_name = ? AND position.status = 'open'",
     )
     .bind::<diesel::sql_types::Text, _>(&today)
     .bind::<diesel::sql_types::Text, _>(&chain)
@@ -168,11 +168,22 @@ fn query_chain_exposure(code: &str) -> Result<(String, usize, usize), String> {
 }
 
 /// 对单只股票跟踪模拟持仓并在满足条件时开/平仓。
+#[cfg(test)]
 pub(super) fn track_position(
     code: &str,
     data: &[KlineData],
     result: &mut AnalysisResult,
     risk_ctx: &RiskContext,
+) -> Result<(), String> {
+    track_position_with_assignment(code, data, result, risk_ctx, None)
+}
+
+pub(super) fn track_position_with_assignment(
+    code: &str,
+    data: &[KlineData],
+    result: &mut AnalysisResult,
+    risk_ctx: &RiskContext,
+    candidate_assignment: Option<&PositionChainAssignment>,
 ) -> Result<(), String> {
     let gateway = SimulatedExecutionGateway::new();
 
@@ -375,8 +386,7 @@ pub(super) fn track_position(
                 .map(|s| s.reason.clone())
                 .unwrap_or_default();
 
-            let bm_buy = bm_action.is_buy();
-            let buy_triggered = bm_buy || result.contrarian_signal;
+            let buy_triggered = buy_triggered(result);
 
             if !buy_triggered {
                 if result.operation_advice.contains("买入") {
@@ -390,7 +400,10 @@ pub(super) fn track_position(
                 return Ok(());
             }
 
-            let (chain_name, chain_held, chain_frozen) = query_chain_exposure(code)
+            let assignment = candidate_assignment.ok_or_else(|| {
+                format!("BR-170 {code} candidate assignment unavailable before position sizing")
+            })?;
+            let (_chain_name, chain_held, chain_frozen) = query_chain_exposure(code, assignment)
                 .map_err(|error| format!("BR-124 {code} chain exposure unavailable: {error}"))?;
             let (available_cash, _, _) =
                 crate::trading::paper_trade::portfolio_state(code, current_price).map_err(
@@ -434,7 +447,7 @@ pub(super) fn track_position(
                 price: current_price,
                 quantity: shares,
                 secondary_confirmed: false,
-                chain_name,
+                position_chain_assignment: assignment.clone(),
                 decision_basis: if !bm_reason.is_empty() {
                     bm_reason.clone()
                 } else {
@@ -554,8 +567,9 @@ pub(super) fn save_analysis_result(
 mod tests {
     use super::{
         position_shares, query_chain_exposure, save_analysis_result, track_position,
-        validate_trade_symbol_env, AnalysisResult, RiskContext,
+        track_position_with_assignment, validate_trade_symbol_env, AnalysisResult, RiskContext,
     };
+    use crate::data_gateway::PositionChainAssignment;
     use crate::data_provider::{AdjustType, KlineData};
     use crate::database::DatabaseManager;
     use crate::indicators::DivergenceType;
@@ -595,15 +609,16 @@ mod tests {
         DatabaseManager::get()
     }
 
-    fn unique(label: &str) -> String {
-        format!(
-            "TEST_CODE_TRACK_{label}_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock after epoch")
-                .as_nanos()
-        )
+    fn unique(_label: &str) -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .subsec_nanos()
+            % 800_000;
+        let suffix = 100_000 + (seed + NEXT.fetch_add(1, Ordering::Relaxed)) % 800_000;
+        format!("TEST_CODE_{suffix:06}")
     }
 
     fn result(code: &str) -> AnalysisResult {
@@ -684,7 +699,8 @@ mod tests {
     }
 
     fn save_position(code: &str, buy_date: String, buy_price: f64, chain: Option<String>) {
-        init_test_db()
+        let database = init_test_db();
+        database
             .save_position(&NewStockPosition {
                 code: code.to_string(),
                 name: "TEST_CODE_持仓".to_string(),
@@ -693,32 +709,42 @@ mod tests {
                 quantity: 100,
                 status: "open".to_string(),
                 st_type: None,
-                chain_name: chain,
+                chain_name: None,
             })
             .expect("save test position");
+        if let Some(chain) = chain {
+            database
+                .commit_position_chain_assignment(&assignment(code, &chain))
+                .expect("link test position-chain assignment");
+        }
     }
 
-    fn save_fresh_chain(code: &str, chain: &str) {
-        let today = Local::now().date_naive();
-        let effective = if crate::calendar::is_trading_day(today) {
-            today
-        } else {
-            crate::calendar::prev_trading_day(today)
-        };
-        let mut conn = init_test_db().get_conn().expect("test database connection");
-        diesel::sql_query(
-            "INSERT OR REPLACE INTO stock_concepts (code, concepts, updated_at)
-             VALUES (?, ?, ?)",
+    fn assignment(code: &str, chain: &str) -> PositionChainAssignment {
+        crate::data_gateway::derive_position_chain(
+            code,
+            crate::data_gateway::GatewayBatch::Available {
+                records: vec![crate::data_gateway::BoardMembershipRecord {
+                    instrument_code: code.to_string(),
+                    board_code: "TEST_CODE_INDUSTRY".to_string(),
+                    board_name: chain.to_string(),
+                    kind: crate::data_gateway::BoardKind::Industry,
+                }],
+                evidence: crate::data_gateway::BatchEvidence {
+                    provider: magic_market_core::ProviderId::Tdx,
+                    source: "TEST_CODE_tdx-board-memberships".to_string(),
+                    source_at: None,
+                    observed_at: "2026-07-27T09:30:01+08:00".to_string(),
+                    batch_id: format!("TEST_CODE_position_chain_{code}_{chain}"),
+                },
+            },
         )
-        .bind::<diesel::sql_types::Text, _>(code)
-        .bind::<diesel::sql_types::Text, _>(serde_json::json!([chain]).to_string())
-        .bind::<diesel::sql_types::Text, _>(format!("{effective} 12:00:00"))
-        .execute(&mut conn)
-        .expect("save fresh chain evidence");
+        .expect("valid test membership batch")
+        .expect("test position-chain assignment")
     }
 
     struct TestLedgerGuard {
         date: String,
+        _position_evidence: crate::trading::paper_trade::TestPositionEvidenceGuard,
     }
 
     impl Drop for TestLedgerGuard {
@@ -733,6 +759,21 @@ mod tests {
 
     fn prepare_execution_account() -> TestLedgerGuard {
         crate::broker::ensure_test_quote_provider();
+        let source_at = chrono::Utc::now().with_timezone(&chrono::Local);
+        let position_evidence = crate::trading::paper_trade::install_test_position_batch_evidence(
+            crate::trading::paper_trade::TestPositionBatchEvidence {
+                source: "TEST_CODE_broker_position_fixture".to_string(),
+                source_at,
+                observed_at: chrono::Utc::now(),
+                batch_id: format!(
+                    "TEST_CODE_position_tracker_{}",
+                    chrono::Utc::now()
+                        .timestamp_nanos_opt()
+                        .expect("test clock is representable in nanoseconds")
+                ),
+            },
+        )
+        .expect("install isolated TEST_CODE broker-position evidence");
         let today = Local::now().date_naive().to_string();
         let mut conn = init_test_db().get_conn().expect("test database connection");
         diesel::sql_query(
@@ -753,7 +794,10 @@ mod tests {
         )
         .execute(&mut conn)
         .expect("refresh test position evidence");
-        TestLedgerGuard { date: today }
+        TestLedgerGuard {
+            date: today,
+            _position_evidence: position_evidence,
+        }
     }
 
     #[test]
@@ -798,30 +842,13 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn chain_exposure_uses_fresh_complete_cache_and_real_open_positions() {
-        let db = init_test_db();
+    fn chain_exposure_uses_candidate_assignment_and_linked_open_positions() {
+        init_test_db();
         let target = unique("CHAIN_TARGET");
         let chain = unique("CHAIN");
         let held_old = unique("CHAIN_OLD");
         let held_today = unique("CHAIN_TODAY");
         let today = Local::now().date_naive();
-        let effective = if crate::calendar::is_trading_day(today) {
-            today
-        } else {
-            crate::calendar::prev_trading_day(today)
-        };
-        let cache_time = format!("{effective} 12:00:00");
-        let mut conn = db.get_conn().expect("test database connection");
-        diesel::sql_query(
-            "INSERT OR REPLACE INTO stock_concepts (code, concepts, updated_at)
-             VALUES (?, ?, ?)",
-        )
-        .bind::<diesel::sql_types::Text, _>(&target)
-        .bind::<diesel::sql_types::Text, _>(serde_json::json!([chain]).to_string())
-        .bind::<diesel::sql_types::Text, _>(&cache_time)
-        .execute(&mut conn)
-        .expect("save fresh concept evidence");
-        drop(conn);
         save_position(
             &held_old,
             (today - Duration::days(2)).to_string(),
@@ -830,29 +857,11 @@ mod tests {
         );
         save_position(&held_today, today.to_string(), 10.0, Some(chain.clone()));
 
-        assert_eq!(query_chain_exposure(&target), Ok((chain, 2, 1)));
+        let candidate = assignment(&target, &chain);
+        assert_eq!(query_chain_exposure(&target, &candidate), Ok((chain, 2, 1)));
 
-        let malformed = unique("CHAIN_BAD_JSON");
-        let mut conn = db.get_conn().expect("test database connection");
-        diesel::sql_query(
-            "INSERT OR REPLACE INTO stock_concepts (code, concepts, updated_at)
-             VALUES (?, 'not-json', ?)",
-        )
-        .bind::<diesel::sql_types::Text, _>(&malformed)
-        .bind::<diesel::sql_types::Text, _>(&cache_time)
-        .execute(&mut conn)
-        .expect("save malformed concept evidence");
-        assert!(query_chain_exposure(&malformed).is_err());
-
-        let stale = unique("CHAIN_STALE");
-        diesel::sql_query(
-            "INSERT OR REPLACE INTO stock_concepts (code, concepts, updated_at)
-             VALUES (?, '[\"TEST_CODE_STALE\"]', '2000-01-01 00:00:00')",
-        )
-        .bind::<diesel::sql_types::Text, _>(&stale)
-        .execute(&mut conn)
-        .expect("save stale concept evidence");
-        assert!(query_chain_exposure(&stale).is_err());
+        let wrong_code = unique("CHAIN_WRONG");
+        assert!(query_chain_exposure(&wrong_code, &candidate).is_err());
     }
 
     #[test]
@@ -902,7 +911,7 @@ mod tests {
             &risk(MarketRegime::Structural),
         )
         .unwrap_err()
-        .contains("chain exposure"));
+        .contains("candidate assignment unavailable"));
 
         let holding = unique("HOLDING");
         save_position(
@@ -1031,17 +1040,18 @@ mod tests {
 
         let buy_code = unique("EXEC_BUY_STATIC");
         let buy_chain = unique("BUY_CHAIN");
-        save_fresh_chain(&buy_code, &buy_chain);
+        let buy_assignment = assignment(&buy_code, &buy_chain);
         let _buy_ledger = prepare_execution_account();
         let mut buy_result = result(&buy_code);
         buy_result.current_price = Some(10.0);
         buy_result.contrarian_signal = true;
         buy_result.contrarian_reason = Some("TEST_CODE_反向企稳".to_string());
-        track_position(
+        track_position_with_assignment(
             &buy_code,
             &[kline(10.0, 1.0)],
             &mut buy_result,
             &risk(MarketRegime::Structural),
+            Some(&buy_assignment),
         )
         .expect("audited static open");
         assert_eq!(buy_result.position_status.as_deref(), Some("new"));
@@ -1145,15 +1155,16 @@ mod tests {
             ("BOTTOM_OPEN", BollMacdAction::BottomBuy),
         ] {
             let code = unique(label);
-            save_fresh_chain(&code, &unique(&format!("{label}_CHAIN")));
+            let open_assignment = assignment(&code, &unique(&format!("{label}_CHAIN")));
             let mut value = result(&code);
             value.current_price = Some(10.0);
             value.boll_macd = Some(boll_signal(action, "TEST_CODE_技术共振"));
-            track_position(
+            track_position_with_assignment(
                 &code,
                 &[kline(10.0, 1.0)],
                 &mut value,
                 &risk(MarketRegime::Structural),
+                Some(&open_assignment),
             )
             .expect("audited Bollinger/MACD open");
             assert_eq!(value.position_status.as_deref(), Some("new"));
@@ -1165,7 +1176,7 @@ mod tests {
     fn dynamic_tracking_requires_volatility_and_one_lot() {
         let _ledger = prepare_execution_account();
         let missing_vol_code = unique("DYNAMIC_MISSING_VOL");
-        save_fresh_chain(&missing_vol_code, &unique("DYNAMIC_CHAIN"));
+        let missing_vol_assignment = assignment(&missing_vol_code, &unique("DYNAMIC_CHAIN"));
         let mut missing_vol = result(&missing_vol_code);
         missing_vol.current_price = Some(10.0);
         missing_vol.contrarian_signal = true;
@@ -1173,40 +1184,46 @@ mod tests {
             use_dynamic: true,
             ..risk(MarketRegime::Structural)
         };
-        assert!(track_position(
+        assert!(track_position_with_assignment(
             &missing_vol_code,
             &[kline(10.0, 0.0)],
             &mut missing_vol,
             &dynamic_risk,
+            Some(&missing_vol_assignment),
         )
         .unwrap_err()
         .contains("volatility"));
 
         let tiny_code = unique("DYNAMIC_TINY");
-        save_fresh_chain(&tiny_code, &unique("TINY_CHAIN"));
+        let tiny_assignment = assignment(&tiny_code, &unique("TINY_CHAIN"));
         let _tiny_ledger = prepare_execution_account();
         let mut tiny = result(&tiny_code);
         tiny.current_price = Some(10.0);
         tiny.contrarian_signal = true;
         tiny.volatility = Some(1_000_000.0);
-        assert!(
-            track_position(&tiny_code, &[kline(10.0, 0.0)], &mut tiny, &dynamic_risk,)
-                .unwrap_err()
-                .contains("one lot")
-        );
+        assert!(track_position_with_assignment(
+            &tiny_code,
+            &[kline(10.0, 0.0)],
+            &mut tiny,
+            &dynamic_risk,
+            Some(&tiny_assignment),
+        )
+        .unwrap_err()
+        .contains("one lot"));
 
         let dynamic_code = unique("DYNAMIC_OPEN");
-        save_fresh_chain(&dynamic_code, &unique("OPEN_CHAIN"));
+        let dynamic_assignment = assignment(&dynamic_code, &unique("OPEN_CHAIN"));
         let _dynamic_ledger = prepare_execution_account();
         let mut dynamic = result(&dynamic_code);
         dynamic.current_price = Some(10.0);
         dynamic.contrarian_signal = true;
         dynamic.volatility = Some(2.0);
-        track_position(
+        track_position_with_assignment(
             &dynamic_code,
             &[kline(10.0, 0.0)],
             &mut dynamic,
             &dynamic_risk,
+            Some(&dynamic_assignment),
         )
         .expect("dynamic open");
         assert_eq!(dynamic.position_status.as_deref(), Some("new"));

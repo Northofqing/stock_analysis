@@ -1,4 +1,4 @@
-//! Registered business rules: BR-043, BR-091, BR-130, BR-142.
+//! Registered business rules: BR-043, BR-091, BR-130, BR-142, BR-160, BR-192.
 //! PushRecord and ReplayablePushEvent — v17.3 Task 1
 //!
 //! Normalized domain events for the delivery observation seam (`push.delivery.audit`)
@@ -28,7 +28,7 @@ impl PushOutcomeLabel {
     pub fn from_audit_str(s: &str) -> Option<Self> {
         Some(match s {
             "Pushed" => PushOutcomeLabel::Pushed,
-            "SinkError" | "Failed" => PushOutcomeLabel::Failed,
+            "SinkError" | "Failed" | "Uncertain" => PushOutcomeLabel::Failed,
             "Deduped" => PushOutcomeLabel::Deduped,
             "Denied" => PushOutcomeLabel::Denied,
             _ => return None,
@@ -54,7 +54,7 @@ pub struct PushRecord {
     pub channel: String,
     pub rendered_len: usize,
     pub latency_ms: u64,
-    /// Present only for v2 redacted authoritative delivery audits.
+    /// Present for v2/v3 redacted authoritative delivery audits.
     pub subject_hash: Option<String>,
     pub identity_hash: Option<String>,
     pub decision_status: Option<PushOutcomeLabel>,
@@ -63,6 +63,17 @@ pub struct PushRecord {
     pub reason_code: Option<String>,
     pub source_as_of: Option<chrono::DateTime<chrono::FixedOffset>>,
     pub audit_schema_version: Option<u32>,
+    pub decision_identity_hash: Option<String>,
+    pub attempt_identity_hash: Option<String>,
+    pub artifact_sha256: Option<String>,
+    pub sink_result_sha256: Option<String>,
+    pub receipt_sha256: Option<String>,
+    pub counted_join_hash: Option<String>,
+    pub durable_push_kind: Option<String>,
+    pub stable_template_id: Option<String>,
+    pub source_business_date: Option<chrono::NaiveDate>,
+    pub source_batch_id: Option<String>,
+    pub source_content_sha256: Option<String>,
 }
 
 /// Errors when extracting a `PushRecord` from an `EventEnvelope`.
@@ -118,8 +129,8 @@ impl PushRecord {
                     })?,
             ),
         };
-        let expected_fields: &[&str] = if audit_schema_version.is_some() {
-            &[
+        let expected_fields: &[&str] = match audit_schema_version {
+            Some(super::envelope::COUNTED_DELIVERY_AUDIT_SCHEMA_VERSION) => &[
                 "kind",
                 "outcome",
                 "decision_status",
@@ -133,16 +144,56 @@ impl PushRecord {
                 "channel",
                 "rendered_len",
                 "latency_ms",
-            ]
-        } else {
-            &[
+                "decision_identity_hash",
+                "attempt_identity_hash",
+                "artifact_sha256",
+                "sink_result_sha256",
+                "receipt_sha256",
+                "counted_join_hash",
+                "durable_push_kind",
+                "stable_template_id",
+            ],
+            Some(super::envelope::SOURCE_BATCH_DELIVERY_AUDIT_SCHEMA_VERSION) => &[
+                "kind",
+                "outcome",
+                "decision_status",
+                "retryable",
+                "rule_ids",
+                "reason_code",
+                "subject_hash",
+                "identity_hash",
+                "source_as_of",
+                "audit_schema_version",
+                "channel",
+                "rendered_len",
+                "latency_ms",
+                "source_business_date",
+                "source_batch_id",
+                "source_content_sha256",
+            ],
+            Some(_) => &[
+                "kind",
+                "outcome",
+                "decision_status",
+                "retryable",
+                "rule_ids",
+                "reason_code",
+                "subject_hash",
+                "identity_hash",
+                "source_as_of",
+                "audit_schema_version",
+                "channel",
+                "rendered_len",
+                "latency_ms",
+            ],
+            None => &[
                 "kind",
                 "code",
                 "outcome",
                 "channel",
                 "rendered_len",
                 "latency_ms",
-            ]
+            ],
         };
         validate_closed_payload(&env.payload, expected_fields)?;
 
@@ -218,7 +269,12 @@ impl PushRecord {
             reason_code,
             source_as_of,
         ) = if let Some(version) = audit_schema_version {
-            if version != super::envelope::DELIVERY_AUDIT_SCHEMA_VERSION {
+            if !matches!(
+                version,
+                super::envelope::DELIVERY_AUDIT_SCHEMA_VERSION
+                    | super::envelope::COUNTED_DELIVERY_AUDIT_SCHEMA_VERSION
+                    | super::envelope::SOURCE_BATCH_DELIVERY_AUDIT_SCHEMA_VERSION
+            ) {
                 return Err(PushRecordError::InvalidFieldValue(format!(
                     "audit_schema_version={version}"
                 )));
@@ -298,10 +354,21 @@ impl PushRecord {
                     .ok_or_else(|| PushRecordError::InvalidFieldValue("rule_ids".into()))?;
                 rule_ids.push(rule.to_string());
             }
-            let expected_rules = super::envelope::DELIVERY_AUDIT_RULE_IDS
-                .iter()
-                .map(|rule| (*rule).to_string())
-                .collect::<Vec<_>>();
+            let expected_rules = match version {
+                super::envelope::COUNTED_DELIVERY_AUDIT_SCHEMA_VERSION => {
+                    super::envelope::COUNTED_DELIVERY_AUDIT_RULE_IDS.as_slice()
+                }
+                super::envelope::SOURCE_BATCH_DELIVERY_AUDIT_SCHEMA_VERSION => {
+                    super::envelope::SOURCE_BATCH_DELIVERY_AUDIT_RULE_IDS.as_slice()
+                }
+                super::envelope::DELIVERY_AUDIT_SCHEMA_VERSION => {
+                    super::envelope::DELIVERY_AUDIT_RULE_IDS.as_slice()
+                }
+                _ => unreachable!("schema version checked above"),
+            }
+            .iter()
+            .map(|rule| (*rule).to_string())
+            .collect::<Vec<_>>();
             if rule_ids != expected_rules {
                 return Err(PushRecordError::InvalidFieldValue("rule_ids".into()));
             }
@@ -332,6 +399,132 @@ impl PushRecord {
             (None, None, None, None, Vec::new(), None, None)
         };
 
+        let (
+            decision_identity_hash,
+            attempt_identity_hash,
+            artifact_sha256,
+            sink_result_sha256,
+            receipt_sha256,
+            counted_join_hash,
+            durable_push_kind,
+            stable_template_id,
+        ) = if audit_schema_version == Some(super::envelope::COUNTED_DELIVERY_AUDIT_SCHEMA_VERSION)
+        {
+            let decision_identity_hash = required_text("decision_identity_hash")?;
+            let attempt_identity_hash = required_text("attempt_identity_hash")?;
+            let artifact_sha256 = required_text("artifact_sha256")?;
+            let sink_result_sha256 = required_text("sink_result_sha256")?;
+            let receipt_sha256 = required_text("receipt_sha256")?;
+            let counted_join_hash = required_text("counted_join_hash")?;
+            let durable_push_kind = required_text("durable_push_kind")?;
+            let stable_template_id = required_text("stable_template_id")?;
+            let canonical_template = crate::durable_delivery::PushKind::ALL
+                .iter()
+                .copied()
+                .find(|candidate| candidate.as_str() == durable_push_kind)
+                .map(crate::durable_delivery::PushKind::stable_template_id);
+            if kind != stable_template_id || canonical_template != Some(stable_template_id.as_str())
+            {
+                return Err(PushRecordError::InvalidFieldValue(
+                    "durable push kind/template binding".into(),
+                ));
+            }
+            for (field, value) in [
+                ("decision_identity_hash", &decision_identity_hash),
+                ("attempt_identity_hash", &attempt_identity_hash),
+                ("artifact_sha256", &artifact_sha256),
+                ("sink_result_sha256", &sink_result_sha256),
+                ("receipt_sha256", &receipt_sha256),
+                ("counted_join_hash", &counted_join_hash),
+            ] {
+                if !super::envelope::is_lower_hex_sha256(value) {
+                    return Err(PushRecordError::InvalidFieldValue(field.into()));
+                }
+            }
+            let expected_join = super::envelope::counted_delivery_join_hash(
+                &kind,
+                &outcome_str,
+                &channel,
+                &decision_identity_hash,
+                &attempt_identity_hash,
+                &artifact_sha256,
+                &sink_result_sha256,
+                &receipt_sha256,
+            );
+            if counted_join_hash != expected_join {
+                return Err(PushRecordError::InvalidFieldValue(
+                    "counted_join_hash".into(),
+                ));
+            }
+            if env.id != counted_join_hash {
+                return Err(PushRecordError::InvalidFieldValue(
+                    "schema-v3 envelope id must equal counted_join_hash".into(),
+                ));
+            }
+            if subject_hash.as_deref() != Some(decision_identity_hash.as_str()) {
+                return Err(PushRecordError::InvalidFieldValue(
+                    "subject_hash does not match decision_identity_hash".into(),
+                ));
+            }
+            (
+                Some(decision_identity_hash),
+                Some(attempt_identity_hash),
+                Some(artifact_sha256),
+                Some(sink_result_sha256),
+                Some(receipt_sha256),
+                Some(counted_join_hash),
+                Some(durable_push_kind),
+                Some(stable_template_id),
+            )
+        } else {
+            (None, None, None, None, None, None, None, None)
+        };
+
+        let (source_business_date, source_batch_id, source_content_sha256) = if audit_schema_version
+            == Some(super::envelope::SOURCE_BATCH_DELIVERY_AUDIT_SCHEMA_VERSION)
+        {
+            let business_date = chrono::NaiveDate::parse_from_str(
+                &required_text("source_business_date")?,
+                "%Y-%m-%d",
+            )
+            .map_err(|_| PushRecordError::InvalidFieldValue("source_business_date".into()))?;
+            let batch_id = required_text("source_batch_id")?;
+            if batch_id.trim() != batch_id
+                || !batch_id.starts_with("chain-batch:")
+                || batch_id.len() <= "chain-batch:".len()
+            {
+                return Err(PushRecordError::InvalidFieldValue("source_batch_id".into()));
+            }
+            let content_sha256 = required_text("source_content_sha256")?;
+            if !super::envelope::is_lower_hex_sha256(&content_sha256) {
+                return Err(PushRecordError::InvalidFieldValue(
+                    "source_content_sha256".into(),
+                ));
+            }
+            let observed_at = source_as_of
+                .as_ref()
+                .ok_or_else(|| PushRecordError::InvalidFieldValue("source_as_of".into()))?;
+            if observed_at.date_naive() < business_date {
+                return Err(PushRecordError::InvalidFieldValue(
+                    "source_as_of predates source_business_date".into(),
+                ));
+            }
+            let expected_subject = super::envelope::source_batch_delivery_subject_hash(
+                business_date,
+                observed_at,
+                &batch_id,
+                &content_sha256,
+            );
+            if subject_hash.as_deref() != Some(expected_subject.as_str()) {
+                return Err(PushRecordError::InvalidFieldValue(
+                    "subject_hash is not bound to source batch lineage".into(),
+                ));
+            }
+            (Some(business_date), Some(batch_id), Some(content_sha256))
+        } else {
+            (None, None, None)
+        };
+
         Ok(PushRecord {
             id,
             kind,
@@ -350,6 +543,17 @@ impl PushRecord {
             reason_code,
             source_as_of,
             audit_schema_version,
+            decision_identity_hash,
+            attempt_identity_hash,
+            artifact_sha256,
+            sink_result_sha256,
+            receipt_sha256,
+            counted_join_hash,
+            durable_push_kind,
+            stable_template_id,
+            source_business_date,
+            source_batch_id,
+            source_content_sha256,
         })
     }
 
@@ -359,9 +563,16 @@ impl PushRecord {
         env: &super::envelope::EventEnvelope,
     ) -> Result<Self, PushRecordError> {
         let record = Self::try_from(env)?;
-        if record.audit_schema_version != Some(super::envelope::DELIVERY_AUDIT_SCHEMA_VERSION) {
+        if !matches!(
+            record.audit_schema_version,
+            Some(
+                super::envelope::DELIVERY_AUDIT_SCHEMA_VERSION
+                    | super::envelope::COUNTED_DELIVERY_AUDIT_SCHEMA_VERSION
+                    | super::envelope::SOURCE_BATCH_DELIVERY_AUDIT_SCHEMA_VERSION
+            )
+        ) {
             return Err(PushRecordError::InvalidFieldValue(
-                "authoritative delivery audit requires schema v2".into(),
+                "authoritative delivery audit requires schema v2, v3 or v4".into(),
             ));
         }
         Ok(record)
@@ -569,6 +780,133 @@ mod tests {
             .unwrap()
             .remove("retryable");
         assert!(PushRecord::try_from_authoritative(&incomplete).is_err());
+    }
+
+    #[test]
+    fn br192_authoritative_record_requires_the_exact_counted_join() {
+        let event = crate::event::PushDeliveryEvent::new_counted(
+            "HoldingEvent".into(),
+            "holding_event_v1".into(),
+            "Pushed".into(),
+            "TEST_CODE_DRY_RUN".into(),
+            12,
+            37,
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
+            "d".repeat(64),
+            "e".repeat(64),
+        );
+        let counted_join_hash = event
+            .counted_join_hash
+            .clone()
+            .expect("counted event has a canonical envelope id");
+        let mut envelope = EventEnvelope::from_event(
+            &event,
+            counted_join_hash,
+            "TEST_CODE_COUNTED_TRACE".into(),
+            chrono::Local::now(),
+        )
+        .expect("valid counted event");
+        let record = PushRecord::try_from_authoritative(&envelope)
+            .expect("counted delivery must be authoritative");
+
+        assert_eq!(record.audit_schema_version, Some(3));
+        assert_eq!(
+            record.decision_identity_hash.as_deref(),
+            Some(&*"a".repeat(64))
+        );
+        assert_eq!(
+            record.attempt_identity_hash.as_deref(),
+            Some(&*"b".repeat(64))
+        );
+        assert_eq!(record.artifact_sha256.as_deref(), Some(&*"c".repeat(64)));
+        assert!(record.counted_join_hash.is_some());
+
+        envelope.payload["receipt_sha256"] = serde_json::json!("f".repeat(64));
+        assert!(matches!(
+            PushRecord::try_from_authoritative(&envelope),
+            Err(PushRecordError::InvalidFieldValue(field)) if field == "counted_join_hash"
+        ));
+    }
+
+    #[test]
+    fn br192_authoritative_record_rejects_noncanonical_counted_event_id() {
+        let event = crate::event::PushDeliveryEvent::new_counted(
+            "HoldingEvent".into(),
+            "holding_event_v1".into(),
+            "Pushed".into(),
+            "TEST_CODE_DRY_RUN".into(),
+            12,
+            37,
+            "1".repeat(64),
+            "2".repeat(64),
+            "3".repeat(64),
+            "4".repeat(64),
+            "5".repeat(64),
+        );
+        let envelope = EventEnvelope::from_event(
+            &event,
+            "TEST_CODE_NONCANONICAL_COUNTED_EVENT".into(),
+            "TEST_CODE_NONCANONICAL_COUNTED_TRACE".into(),
+            chrono::Local::now(),
+        )
+        .expect("the generic envelope is structurally valid");
+
+        assert!(matches!(
+            PushRecord::try_from_authoritative(&envelope),
+            Err(PushRecordError::InvalidFieldValue(field))
+                if field == "schema-v3 envelope id must equal counted_join_hash"
+        ));
+    }
+
+    #[test]
+    fn br160_authoritative_record_preserves_and_revalidates_source_batch_lineage() {
+        let observed_at = chrono::DateTime::parse_from_rfc3339("2026-07-31T15:01:02+08:00")
+            .expect("valid source observation");
+        let event = crate::event::PushDeliveryEvent::new_source_batch(
+            "catalyst_review_v1".into(),
+            "Pushed".into(),
+            "TEST_CODE_DRY_RUN".into(),
+            12,
+            37,
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 31).unwrap(),
+            observed_at,
+            "chain-batch:TEST_CODE_A10_RECORD".into(),
+            "a".repeat(64),
+        );
+        let mut envelope = EventEnvelope::from_event(
+            &event,
+            "TEST_CODE_A10_RECORD_EVENT".into(),
+            "TEST_CODE_A10_RECORD_TRACE".into(),
+            chrono::Local::now(),
+        )
+        .expect("valid source batch delivery envelope");
+        let record = PushRecord::try_from_authoritative(&envelope)
+            .expect("source batch delivery is authoritative");
+
+        assert_eq!(record.audit_schema_version, Some(4));
+        assert_eq!(
+            record.source_business_date,
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 31)
+        );
+        assert_eq!(
+            record.source_batch_id.as_deref(),
+            Some("chain-batch:TEST_CODE_A10_RECORD")
+        );
+        assert_eq!(
+            record.source_content_sha256.as_deref(),
+            Some(&*"a".repeat(64))
+        );
+        assert_eq!(record.source_as_of, Some(observed_at));
+        assert!(record.rule_ids.iter().any(|rule| rule == "BR-160"));
+
+        envelope.payload["source_batch_id"] = serde_json::json!("chain-batch:TEST_CODE_TAMPERED");
+        assert!(matches!(
+            PushRecord::try_from_authoritative(&envelope),
+            Err(PushRecordError::InvalidFieldValue(field))
+                if field == "subject_hash is not bound to source batch lineage"
+        ));
     }
 
     #[test]

@@ -906,6 +906,19 @@ fn migrate_schema_v3_to_v4(transaction: &Transaction<'_>) -> Result<()> {
 }
 
 fn migrate_schema_v4_to_v5(transaction: &Transaction<'_>) -> Result<()> {
+    type MigratedAuditOutboxRow = (
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        Vec<u8>,
+        String,
+        String,
+        Option<String>,
+        String,
+    );
+
     transaction.execute_batch(r#"PRAGMA defer_foreign_keys=ON;"#)?;
     transaction.execute_batch(
         r#"
@@ -937,18 +950,7 @@ fn migrate_schema_v4_to_v5(transaction: &Transaction<'_>) -> Result<()> {
         );
         "#,
     )?;
-    let insert_rows: Vec<(
-        String,
-        String,
-        Option<String>,
-        String,
-        Option<String>,
-        Vec<u8>,
-        String,
-        String,
-        Option<String>,
-        String,
-    )> = {
+    let insert_rows: Vec<MigratedAuditOutboxRow> = {
         let mut stmt = transaction.prepare(
             "SELECT
                audit_identity, decision_identity, attempt_identity, audit_kind,

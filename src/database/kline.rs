@@ -5,6 +5,7 @@ use chrono::{Local, NaiveDate};
 use diesel::prelude::*;
 use log::{info, warn};
 
+use crate::data_gateway::historical_bars::AdmittedDailyBars;
 use crate::models::{AnalysisResultRecord, NewAnalysisResult, NewStockDaily, StockDaily};
 use crate::schema::{analysis_result, stock_daily};
 
@@ -12,6 +13,43 @@ use super::DatabaseManager;
 use super::{AnalysisContext, DbConnection, StockDailyRecord};
 
 impl DatabaseManager {
+    fn persist_validated_kline_data(
+        &self,
+        code: &str,
+        data: &[crate::data_provider::KlineData],
+        source: &str,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let mut conn = self.get_conn()?;
+        let saved = conn.transaction::<usize, Box<dyn std::error::Error>, _>(|conn| {
+            for kline in data {
+                Self::upsert_daily_record(
+                    conn,
+                    code,
+                    kline.date,
+                    Some(kline.open),
+                    Some(kline.high),
+                    Some(kline.low),
+                    Some(kline.close),
+                    Some(kline.volume),
+                    Some(kline.amount),
+                    Some(kline.pct_chg),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(source),
+                )?;
+            }
+            Ok(data.len())
+        })?;
+
+        info!(
+            "[{}] 已保存 {} 条K线数据到数据库（数据源: {}）",
+            code, saved, source
+        );
+        Ok(saved)
+    }
+
     pub fn has_data_for_date(
         &self,
         code: &str,
@@ -297,37 +335,47 @@ impl DatabaseManager {
             .into());
         }
         let mut checked = data.to_vec();
-        crate::data_provider::validate_kline_series_strict(&mut checked, code)?;
+        crate::monitor::data_quality::validate_daily_kline_quality(&mut checked, code).map_err(
+            |error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("BR-092 K 线批次拒绝: {error}"),
+                )
+            },
+        )?;
 
-        let mut conn = self.get_conn()?;
-        let saved = conn.transaction::<usize, Box<dyn std::error::Error>, _>(|conn| {
-            for kline in &checked {
-                Self::upsert_daily_record(
-                    conn,
-                    code,
-                    kline.date,
-                    Some(kline.open),
-                    Some(kline.high),
-                    Some(kline.low),
-                    Some(kline.close),
-                    Some(kline.volume),
-                    Some(kline.amount),
-                    Some(kline.pct_chg),
-                    None, // ma5 由趋势分析模块计算
-                    None, // ma10
-                    None, // ma20
-                    None, // volume_ratio
-                    Some(source),
-                )?;
-            }
-            Ok(checked.len())
-        })?;
+        self.persist_validated_kline_data(code, &checked, source)
+    }
 
-        info!(
-            "[{}] 已保存 {} 条K线数据到数据库（数据源: {}）",
-            code, saved, source
-        );
-        Ok(saved)
+    /// Persist an immutable daily-bar capability after the Gateway has
+    /// completed structural, lifecycle, confirmation, freshness and audit
+    /// admission. The private fields of `AdmittedDailyBars` prevent raw
+    /// records from entering this path without that authority.
+    pub fn save_admitted_kline_data(
+        &self,
+        batch: &AdmittedDailyBars,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let code = batch.target_code();
+        let evidence = batch.evidence();
+        if code.trim().is_empty()
+            || evidence.source.trim().is_empty()
+            || evidence.batch_id.trim().is_empty()
+            || evidence.observed_at.trim().is_empty()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "BR-171 admitted K-line batch has incomplete target/source/batch evidence",
+            )
+            .into());
+        }
+        if batch.records().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "BR-171 admitted K-line batch is unexpectedly empty",
+            )
+            .into());
+        }
+        self.persist_validated_kline_data(code, batch.records(), &evidence.source)
     }
 
     /// 保存分析结果到数据库（使用 ON CONFLICT DO UPDATE，单条 SQL）
@@ -419,7 +467,9 @@ impl DatabaseManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data_gateway::{AdmittedDailyBars, BatchEvidence};
     use crate::data_provider::{AdjustType, KlineData};
+    use magic_market_core::ProviderId;
 
     fn unique_code(label: &str) -> String {
         format!(
@@ -482,6 +532,98 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn br092_database_persistence_requires_confirmation_for_tick_rounding_over_twenty_percent() {
+        DatabaseManager::init(None).expect("test database init");
+        let code = "TEST_CODE_688548".to_string();
+        let _guard = KlineGuard(vec![code.clone()]);
+        let db = DatabaseManager::get();
+        let day1 = NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        let day2 = NaiveDate::from_ymd_opt(2026, 7, 21).unwrap();
+        let day3 = NaiveDate::from_ymd_opt(2026, 7, 22).unwrap();
+        let day1_close = 10.0;
+        let day2_close = 12.000_52;
+        let day3_close = day2_close * 1.200_917;
+        let bars = vec![
+            kline(day1, day1_close, 0.0),
+            kline(day2, day2_close, 20.0052),
+            kline(day3, day3_close, 20.0917),
+        ];
+
+        let error = db
+            .save_kline_data(&code, &bars, "TEST_PROVIDER")
+            .expect_err("20.0052% still requires BR-171 confirmation");
+        assert!(error.to_string().contains("manual_confirmation_required"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn br092_database_persistence_rejects_unconfirmed_large_main_board_move() {
+        DatabaseManager::init(None).expect("test database init");
+        let code = "TEST_CODE_600548".to_string();
+        let _guard = KlineGuard(vec![code.clone()]);
+        let db = DatabaseManager::get();
+        let day1 = NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        let day2 = NaiveDate::from_ymd_opt(2026, 7, 21).unwrap();
+        let bars = vec![kline(day1, 10.0, 0.0), kline(day2, 12.000_52, 20.0052)];
+
+        let error = db
+            .save_kline_data(&code, &bars, "TEST_PROVIDER")
+            .expect_err("结构完整的大幅行情仍需 BR-171 人工确认");
+        assert!(error.to_string().contains("manual_confirmation_required"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn br092_database_persistence_rejects_unconfirmed_large_star_market_move() {
+        DatabaseManager::init(None).expect("test database init");
+        let code = "TEST_CODE_688690".to_string();
+        let _guard = KlineGuard(vec![code.clone()]);
+        let db = DatabaseManager::get();
+        let day1 = NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        let day2 = NaiveDate::from_ymd_opt(2026, 7, 21).unwrap();
+        let bars = vec![kline(day1, 10.0, 0.0), kline(day2, 12.051, 20.51)];
+
+        let error = db
+            .save_kline_data(&code, &bars, "TEST_PROVIDER")
+            .expect_err("科创板大幅变化也需 BR-171 证据绑定确认");
+        assert!(error.to_string().contains("manual_confirmation_required"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn br171_admitted_daily_batch_preserves_gateway_authority_through_persistence() {
+        DatabaseManager::init(None).expect("test database init");
+        let code = unique_code("ADMITTED");
+        let _guard = KlineGuard(vec![code.clone()]);
+        let day1 = NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        let day2 = NaiveDate::from_ymd_opt(2026, 7, 21).unwrap();
+        let bars = vec![kline(day1, 10.0, 0.0), kline(day2, 12.5, 25.0)];
+        let admitted = AdmittedDailyBars::from_test_fixture(
+            &code,
+            bars,
+            BatchEvidence {
+                provider: ProviderId::Tdx,
+                source: "TEST_CODE_magic_tdx".to_string(),
+                source_at: Some("2026-07-21".to_string()),
+                observed_at: "2026-07-21T15:01:00+08:00".to_string(),
+                batch_id: "TEST_CODE_admitted_daily_batch".to_string(),
+            },
+        )
+        .expect("test-only admitted capability");
+
+        assert_eq!(
+            DatabaseManager::get()
+                .save_admitted_kline_data(&admitted)
+                .expect("persist admitted batch"),
+            2
+        );
+        assert!(DatabaseManager::get()
+            .has_data_for_date(&code, day2)
+            .expect("persisted latest day"));
     }
 
     #[test]

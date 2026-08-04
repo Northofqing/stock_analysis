@@ -304,7 +304,7 @@ mod tests {
     //! 修复: intra-batch simhash 汉明距离 ≤ 3 去重 + 跨批次 seen_simhashes 去重.
 
     use super::*;
-    use crate::search_service::{NewsType, Sentiment};
+    use crate::search_service::{NewsType, SearchEvidence, Sentiment};
     use chrono::{Duration, Local};
 
     /// 构造 SearchResult (含 published_date 才能过 adapter).
@@ -318,12 +318,20 @@ mod tests {
             snippet: String::new(),
             url: String::new(),
             source: source.to_string(),
-            published_date: Some(published_at),
+            published_date: Some(published_at.clone()),
             news_type: NewsType::Industry,
             sentiment: Sentiment::Positive,
             importance: 5,
             relevance: 0.5,
             keywords: vec![],
+            evidence: SearchEvidence::GovernedSourceFact {
+                provider: "TEST_CODE_provider".to_string(),
+                source: source.to_string(),
+                observed_at: Local::now().to_rfc3339(),
+                source_at: published_at.clone(),
+                batch_id: "TEST_CODE_batch".to_string(),
+                item_id: title.to_string(),
+            },
         }
     }
 

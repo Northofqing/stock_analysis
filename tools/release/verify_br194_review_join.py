@@ -17,6 +17,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 DATABASE = ROOT / "data/durable_delivery.sqlite3"
 EXPECTED_SCHEMA_VERSION = 5
+EXPECTED_PASSED_REPLAY_REASON = "existing_terminal_hydrated"
+EXPECTED_FAILED_REPLAY_REASONS = frozenset(
+    {
+        "terminal_replay_identity_invalid",
+        "terminal_replay_not_delivered",
+        "terminal_replay_hydration_not_applied",
+        "terminal_replay_would_require_sink",
+        "terminal_replay_watermark_changed",
+        "terminal_replay_evidence_unavailable",
+    }
+)
 MANIFEST = {
     "database": "data/durable_delivery.sqlite3",
     "durable_audit_dir": "data/durable_delivery_audit/",
@@ -659,10 +670,34 @@ def verify_schema(connection: sqlite3.Connection) -> None:
             fail(f"missing exact immutable-audit FK {table}.{column}")
 
 
+def verify_replay_completion_reason_vocabulary(
+    connection: sqlite3.Connection,
+) -> None:
+    rows = connection.execute(
+        """
+        SELECT attempt_identity,state,reason_code
+        FROM review_terminal_replay_completions
+        ORDER BY attempt_identity ASC
+        """
+    ).fetchall()
+    for attempt_identity, state, reason_code in rows:
+        valid = (
+            state == "Passed" and reason_code == EXPECTED_PASSED_REPLAY_REASON
+        ) or (
+            state == "Failed" and reason_code in EXPECTED_FAILED_REPLAY_REASONS
+        )
+        if not valid:
+            fail(
+                "out-of-contract replay completion reason: "
+                f"attempt={attempt_identity} state={state} reason={reason_code}"
+            )
+
+
 def verify_connection(
     connection: sqlite3.Connection, args: argparse.Namespace
 ) -> dict:
     verify_schema(connection)
+    verify_replay_completion_reason_vocabulary(connection)
     expected_task_identity = review_task_identity(args.business_date, args.task)
 
     attempt_row = connection.execute(
@@ -825,7 +860,7 @@ def verify_connection(
                 delivery_audit_appends,
             )
         )
-        or reason_code != "existing_terminal_hydrated"
+        or reason_code != EXPECTED_PASSED_REPLAY_REASON
     ):
         fail("Passed replay counters or authority watermarks are invalid")
 

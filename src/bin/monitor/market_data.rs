@@ -1,9 +1,9 @@
-//! 行情数据抓取 — 从 main.rs 提取
+//! 行情数据抓取 — 从 main.rs 提取（BR-210 evidence timestamp contract）
 
 use crate::freshness::validate_daily_snapshot_freshness;
-use crate::{validate_position_freshness, validate_quote_freshness};
+use crate::validate_position_freshness;
 
-fn validate_quote_batch_codes(
+pub(super) fn validate_quote_batch_codes(
     requested: &[String],
     quotes: &[stock_analysis::market_data::TopStock],
     source: &str,
@@ -38,7 +38,7 @@ fn mark_capability_success(
     stock_analysis::monitor::data_mode::mark_capability_success(capability)
 }
 
-/// 持仓实时行情：东财 push2 为主（多主机轮询），新浪兜底
+/// BR-164 持仓实时行情：只消费统一 Magic provider Gateway。
 pub fn fetch_position_quotes() -> Result<Vec<stock_analysis::market_data::TopStock>, String> {
     let (positions, source_time) = stock_analysis::portfolio::get_positions_with_source_time()
         .map_err(|error| format!("持仓批次查询失败: {error}"))?;
@@ -56,13 +56,7 @@ pub fn fetch_position_quotes() -> Result<Vec<stock_analysis::market_data::TopSto
         ));
     }
 
-    let quotes = match fetch_eastmoney_quotes(&codes) {
-        Ok(q) if !q.is_empty() => q,
-        Ok(_) => fetch_sina_quotes(&codes)?,
-        Err(primary_error) => fetch_sina_quotes(&codes).map_err(|fallback_error| {
-            format!("持仓行情主备源均失败: 东财={primary_error}; 新浪={fallback_error}")
-        })?,
-    };
+    let quotes = fetch_realtime_quotes(&codes)?;
     if quotes.is_empty() {
         return Err("持仓行情源成功响应但无有效行".to_string());
     }
@@ -70,124 +64,105 @@ pub fn fetch_position_quotes() -> Result<Vec<stock_analysis::market_data::TopSto
     Ok(quotes)
 }
 
-/// 东方财富 push2 实时行情（多主机轮询，含 volume_ratio + main_net_yi）
-pub fn fetch_eastmoney_quotes(
+/// BR-164 public quote projection over the evidence-preserving Gateway batch.
+pub fn fetch_realtime_quotes(
     codes: &[String],
 ) -> Result<Vec<stock_analysis::market_data::TopStock>, String> {
-    use chrono::TimeZone;
+    Ok(fetch_realtime_quote_batch(codes)?.stocks)
+}
+
+/// BR-159 evidence-preserving quote batch for downstream atomic joins.
+pub(super) fn fetch_realtime_quote_batch(codes: &[String]) -> Result<TopStockBatch, String> {
+    let batch = stock_analysis::data_gateway::MarketDataGateway::new()
+        .realtime_quotes(codes)
+        .map_err(|error| format!("统一实时行情 Gateway 不可用: {error}"))?;
+    let projected = project_top_stock_batch(codes, batch)?;
+    audit_top_stock_projection(&projected);
+    mark_capability_success(stock_analysis::monitor::data_mode::Capability::Quote)?;
+    Ok(projected)
+}
+
+#[derive(Debug)]
+pub(super) struct TopStockBatch {
+    pub(super) stocks: Vec<stock_analysis::market_data::TopStock>,
+    pub(super) evidence: stock_analysis::data_gateway::BatchEvidence,
+}
+
+fn project_top_stock_batch(
+    codes: &[String],
+    batch: stock_analysis::data_gateway::GatewayBatch<
+        stock_analysis::data_gateway::RealtimeMarketQuote,
+    >,
+) -> Result<TopStockBatch, String> {
+    use stock_analysis::data_gateway::GatewayBatch;
     use stock_analysis::market_data::TopStock;
-    // secids: 0.000547,1.603618 (0=深交所,1=上交所)
-    let secids: Vec<String> = codes
-        .iter()
-        .map(|c| {
-            if c.starts_with('6') || c.starts_with('5') {
-                format!("1.{}", c)
-            } else {
-                format!("0.{}", c)
-            }
-        })
-        .collect();
-    let url_path = format!(
-        "/api/qt/ulist.np/get?secids={}&fields=f2,f3,f10,f12,f14,f62,f124&fltt=2&invt=2",
-        secids.join(",")
-    );
 
-    const HOSTS: &[&str] = &[
-        "push2delay.eastmoney.com",
-        "push2.eastmoney.com",
-        "82.push2.eastmoney.com",
-    ];
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    for host in HOSTS {
-        let url = format!("https://{}{}", host, url_path);
-        let resp = client
-            .get(&url)
-            .header(
-                "User-Agent",
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-            )
-            .header("Referer", "https://quote.eastmoney.com/")
-            .send();
-        match resp.and_then(|r| r.json::<serde_json::Value>()) {
-            Ok(json) => {
-                if let Some(arr) = json
-                    .get("data")
-                    .and_then(|d| d.get("diff"))
-                    .and_then(|d| d.as_array())
-                {
-                    let stocks: Result<Vec<TopStock>, String> = arr
-                        .iter()
-                        .enumerate()
-                        .map(|(index, item)| {
-                            let code = item
-                                .get("f12")
-                                .and_then(|value| value.as_str())
-                                .filter(|value| !value.is_empty())
-                                .ok_or_else(|| format!("东财持仓行情第 {} 行缺少 code", index + 1))?
-                                .to_string();
-                            let name = item
-                                .get("f14")
-                                .and_then(|value| value.as_str())
-                                .filter(|value| !value.is_empty())
-                                .ok_or_else(|| format!("东财持仓行情 {code} 缺少 name"))?
-                                .to_string();
-                            let price = item
-                                .get("f2")
-                                .and_then(|value| value.as_f64())
-                                .filter(|value| value.is_finite() && *value > 0.0)
-                                .ok_or_else(|| format!("东财持仓行情 {code} price 缺失/非法"))?;
-                            let change_pct = item
-                                .get("f3")
-                                .and_then(|value| value.as_f64())
-                                .ok_or_else(|| format!("东财持仓行情 {code} change_pct 缺失"))
-                                .and_then(|value| {
-                                    validate_change_pct(&code, &name, value, "东财持仓行情")
-                                })?;
-                            let update_time = item
-                                .get("f124")
-                                .and_then(|v| v.as_i64())
-                                .and_then(|secs| chrono::Local.timestamp_opt(secs, 0).single())
-                                .ok_or_else(|| format!("东财持仓行情 {code} 缺少有效更新时间"))?;
-                            if !validate_quote_freshness(update_time, "eastmoney", &code) {
-                                return Err(format!("东财持仓行情 {code} 超过 5 秒新鲜度"));
-                            }
-                            let volume_ratio = item
-                                .get("f10")
-                                .and_then(|value| value.as_f64())
-                                .filter(|value| value.is_finite() && *value >= 0.0);
-                            let main_net_yi = item
-                                .get("f62")
-                                .and_then(|value| value.as_f64())
-                                .filter(|value| value.is_finite())
-                                .map(|value| value / 1e8);
-                            Ok(TopStock {
-                                code,
-                                name,
-                                price,
-                                change_pct,
-                                volume_ratio,
-                                main_net_yi,
-                            })
-                        })
-                        .collect();
-                    let stocks = stocks?;
-                    if !stocks.is_empty() {
-                        validate_quote_batch_codes(codes, &stocks, "eastmoney")?;
-                        mark_capability_success(
-                            stock_analysis::monitor::data_mode::Capability::Quote,
-                        )?;
-                        return Ok(stocks);
-                    }
-                }
-            }
-            Err(_) => continue,
+    let (quotes, evidence) = match batch {
+        GatewayBatch::Available { records, evidence } if !records.is_empty() => (records, evidence),
+        GatewayBatch::Available { .. } | GatewayBatch::VerifiedEmpty(_) => {
+            return Err("统一实时行情 Gateway 返回不允许的空批次".to_string());
         }
-    }
-    Err("所有东财主机请求失败".into())
+    };
+    let evidence_observed_at = stock_analysis::data_gateway::parse_evidence_instant(
+        "RealtimeMarketQuotes",
+        evidence.provider,
+        "observed_at",
+        &evidence.observed_at,
+    )
+    .map_err(|error| {
+        format!(
+            "统一实时行情批次 observed_at 非法: {:?}: {error}",
+            evidence.observed_at
+        )
+    })?;
+    let stocks = quotes
+        .into_iter()
+        .map(|quote| {
+            if quote.provider != evidence.provider
+                || quote.batch_id != evidence.batch_id
+                || quote.observed_at != evidence_observed_at
+            {
+                return Err(format!(
+                    "统一实时行情 {} 批次身份与证据不一致 provider={:?} batch_id={}",
+                    quote.code, quote.provider, quote.batch_id
+                ));
+            }
+            if !quote.price.is_finite() || quote.price <= 0.0 {
+                return Err(format!(
+                    "统一实时行情 {}({}) price 缺失/非法: {:?}",
+                    quote.code, quote.name, quote.price
+                ));
+            }
+            let change_pct = validate_change_pct(
+                &quote.code,
+                &quote.name,
+                quote.change_percent,
+                "统一实时行情",
+            )?;
+            Ok(TopStock {
+                code: quote.code,
+                name: quote.name,
+                price: quote.price,
+                change_pct,
+                volume_ratio: None,
+                main_net_yi: None,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    validate_quote_batch_codes(codes, &stocks, "unified_market_gateway")?;
+    Ok(TopStockBatch { stocks, evidence })
+}
+
+fn audit_top_stock_projection(batch: &TopStockBatch) {
+    log::info!(
+        "[BR-159][BR-164][TopStockProjection] records={} provider={:?} source={} source_at={} observed_at={} batch_id={}",
+        batch.stocks.len(),
+        batch.evidence.provider,
+        batch.evidence.source,
+        batch.evidence.source_at.as_deref().unwrap_or("absent"),
+        batch.evidence.observed_at,
+        batch.evidence.batch_id
+    );
 }
 
 pub fn infer_limit_pct(code: &str, name: &str) -> f64 {
@@ -217,364 +192,149 @@ fn validate_change_pct(
         ));
     }
     if change_pct.abs() > limit {
-        log::warn!(
-            "[DQ-2.3] {source} {code}({name}) change_pct={change_pct:.2}% 超过常规板块±{limit:.0}%，保留真实值并标记需人工确认"
-        );
+        return Err(format!(
+            "[DQ-2.3] {source} {code}({name}) change_pct={change_pct:.2}% 超过证券板块±{limit:.0}%规则阈值"
+        ));
     }
     Ok(change_pct)
 }
 
 /// 批量查询连板数，返回 1=首板 / 2=二板 / 3=三板+
 /// 仅向前看 4 个交易日的 K 线，够判断三板就够了。
+#[derive(Debug)]
+struct BoardLevelFact {
+    code: String,
+    level: u8,
+    evidence: stock_analysis::data_gateway::BatchEvidence,
+}
+
+fn classify_board_level(
+    code: &str,
+    name: &str,
+    batch: &stock_analysis::data_gateway::AdmittedDailyBars,
+    today: chrono::NaiveDate,
+) -> Result<BoardLevelFact, String> {
+    classify_board_level_from_parts(code, name, batch.records(), batch.evidence(), today)
+}
+
+fn classify_board_level_from_parts(
+    code: &str,
+    name: &str,
+    kline: &[stock_analysis::data_provider::KlineData],
+    evidence: &stock_analysis::data_gateway::BatchEvidence,
+    today: chrono::NaiveDate,
+) -> Result<BoardLevelFact, String> {
+    if kline.len() < 3 {
+        return Err(format!(
+            "[连板识别] {name}({code}) 日线样本不足: required>=3 actual={} source={} batch_id={}",
+            kline.len(),
+            evidence.source,
+            evidence.batch_id
+        ));
+    }
+    let latest = kline
+        .first()
+        .ok_or_else(|| format!("[连板识别] {name}({code}) K 线为空"))?;
+    let threshold = infer_limit_pct(code, name) - 0.2;
+    let history_start = usize::from(latest.date == today);
+    let prior_limit_days = kline
+        .iter()
+        .skip(history_start)
+        .take(2)
+        .take_while(|bar| bar.is_limit_up || bar.pct_chg >= threshold)
+        .count();
+    let level = u8::try_from(1 + prior_limit_days)
+        .map_err(|_| format!("[连板识别] {name}({code}) 连板数溢出"))?;
+    Ok(BoardLevelFact {
+        code: code.to_string(),
+        level,
+        evidence: evidence.clone(),
+    })
+}
+
+fn lookup_board_level_facts(codes: &[(String, String)]) -> Result<Vec<BoardLevelFact>, String> {
+    let mut seen = std::collections::HashSet::with_capacity(codes.len());
+    for (code, _) in codes {
+        if !seen.insert(code.as_str()) {
+            return Err(format!("[连板识别] 请求代码包含重复项: {code}"));
+        }
+    }
+    let gateway = stock_analysis::data_gateway::HistoricalBarsGateway::new();
+    let today = chrono::Local::now().date_naive();
+    let mut facts = Vec::with_capacity(codes.len());
+
+    for (code, name) in codes {
+        let batch = gateway
+            .required_daily_bars(code, 5)
+            .map_err(|error| format!("[连板识别] {name}({code}) 统一日线不可用: {error}"))?;
+        let latest = batch
+            .records()
+            .first()
+            .ok_or_else(|| format!("[连板识别] {name}({code}) K 线为空"))?;
+        if !validate_daily_snapshot_freshness(latest.date, &batch.evidence().source, code) {
+            return Err(format!(
+                "[连板识别] {name}({code}) 最新日 K {} 不满足时效门 source={} batch_id={}",
+                latest.date,
+                batch.evidence().source,
+                batch.evidence().batch_id
+            ));
+        }
+        facts.push(classify_board_level(code, name, &batch, today)?);
+    }
+    Ok(facts)
+}
+
 pub fn lookup_board_level_batch(
     codes: &[(String, String)],
 ) -> Result<std::collections::HashMap<String, u8>, String> {
-    let mut out = std::collections::HashMap::new();
-    let fetcher = stock_analysis::data_provider::DataFetcherManager::new()
-        .map_err(|error| format!("[连板识别] 初始化数据抓取失败: {error:#}"))?;
-    let today = chrono::Local::now().date_naive();
-
-    for (code, name) in codes {
-        let (kline, source) = fetcher
-            .get_daily_data(code, 5)
-            .map_err(|error| format!("[连板识别] {name}({code}) 拉 K 线失败: {error:#}"))?;
-        let latest = kline
-            .first()
-            .ok_or_else(|| format!("[连板识别] {name}({code}) K 线为空"))?;
-        if !validate_daily_snapshot_freshness(latest.date, source, code) {
+    let facts = lookup_board_level_facts(codes)?;
+    let mut out = std::collections::HashMap::with_capacity(facts.len());
+    for fact in facts {
+        log::info!(
+            "[BR-159][BR-164][连板识别] code={} level={} provider={:?} source={} source_at={} observed_at={} batch_id={}",
+            fact.code,
+            fact.level,
+            fact.evidence.provider,
+            fact.evidence.source,
+            fact.evidence.source_at.as_deref().unwrap_or("absent"),
+            fact.evidence.observed_at,
+            fact.evidence.batch_id
+        );
+        if out.insert(fact.code.clone(), fact.level).is_some() {
             return Err(format!(
-                "[连板识别] {name}({code}) 最新日 K {} 不满足时效门",
-                latest.date
+                "[连板识别] 已分类批次出现重复代码，拒绝覆盖: {}",
+                fact.code
             ));
         }
-        let threshold = infer_limit_pct(code, name) - 0.2;
-        let history_start = usize::from(latest.date == today);
-        let prior_limit_days = kline
-            .iter()
-            .skip(history_start)
-            .take(2)
-            .take_while(|bar| bar.is_limit_up || bar.pct_chg >= threshold)
-            .count();
-        let level = u8::try_from(1 + prior_limit_days)
-            .map_err(|_| format!("[连板识别] {name}({code}) 连板数溢出"))?;
-        out.insert(code.clone(), level);
     }
     Ok(out)
 }
 
-pub fn fetch_market_top_by_fid(
-    fid: &str,
-    top_n: usize,
-) -> Result<Vec<stock_analysis::market_data::TopStock>, String> {
-    use chrono::TimeZone;
-    use stock_analysis::market_data::TopStock;
+pub(super) const FULL_MARKET_RANKINGS_UNAVAILABLE_REASON: &str =
+    "provider_capability_not_live_admitted";
+pub(super) const FULL_MARKET_RANKINGS_UNAVAILABLE_AUDIT: &str =
+    "capability_unavailable:provider_capability_not_live_admitted";
 
-    let pz = top_n.clamp(20, 200).to_string();
-    let params = [
-        ("pn", "1"),
-        ("pz", pz.as_str()),
-        ("po", "1"),
-        ("np", "1"),
-        ("ut", "bd1d9ddb04089700cf9c27f6f7426281"),
-        ("fltt", "2"),
-        ("invt", "2"),
-        ("fid", fid),
-        ("fs", "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"),
-        ("fields", "f2,f3,f10,f12,f14,f62,f124"),
-    ];
-
-    const HOSTS: &[&str] = &[
-        "push2delay.eastmoney.com",
-        "push2.eastmoney.com",
-        "82.push2.eastmoney.com",
-    ];
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    for host in HOSTS {
-        let url = format!("https://{}/api/qt/clist/get", host);
-        let resp = client
-            .get(&url)
-            .query(&params)
-            .header(
-                "User-Agent",
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-            )
-            .header("Referer", "https://quote.eastmoney.com/")
-            .send();
-        match resp.and_then(|r| r.json::<serde_json::Value>()) {
-            Ok(json) => {
-                if let Some(arr) = json
-                    .get("data")
-                    .and_then(|d| d.get("diff"))
-                    .and_then(|d| d.as_array())
-                {
-                    let stocks: Result<Vec<TopStock>, String> = arr
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, item)| {
-                            let code = match item.get("f12").and_then(|value| value.as_str()) {
-                                Some(value) if !value.is_empty() => value.to_string(),
-                                _ => {
-                                    return Some(Err(format!(
-                                        "东财市场榜第 {} 行缺少 code",
-                                        index + 1
-                                    )))
-                                }
-                            };
-                            let name = match item.get("f14").and_then(|value| value.as_str()) {
-                                Some(value) if !value.is_empty() => value.to_string(),
-                                _ => return Some(Err(format!("东财市场榜 {code} 缺少 name"))),
-                            };
-                            if name.contains("ST") || name.contains("st") {
-                                return None;
-                            }
-                            if code.starts_with('8')
-                                || code.starts_with('4')
-                                || code.starts_with('9')
-                            {
-                                return None;
-                            }
-                            let price = match item
-                                .get("f2")
-                                .and_then(|value| value.as_f64())
-                                .filter(|value| value.is_finite() && *value > 0.0)
-                            {
-                                Some(value) => value,
-                                None => {
-                                    return Some(Err(format!("东财市场榜 {code} price 缺失/非法")))
-                                }
-                            };
-                            let change_pct = match item.get("f3").and_then(|value| value.as_f64()) {
-                                Some(value) => {
-                                    match validate_change_pct(&code, &name, value, "东财市场榜")
-                                    {
-                                        Ok(value) => value,
-                                        Err(error) => return Some(Err(error)),
-                                    }
-                                }
-                                None => {
-                                    return Some(Err(format!("东财市场榜 {code} change_pct 缺失")))
-                                }
-                            };
-                            let update_time = item
-                                .get("f124")
-                                .and_then(|v| v.as_i64())
-                                .and_then(|secs| chrono::Local.timestamp_opt(secs, 0).single());
-                            let Some(update_time) = update_time else {
-                                return Some(Err(format!("东财市场榜 {code} 缺少有效更新时间")));
-                            };
-                            if !validate_quote_freshness(update_time, "eastmoney_market", &code) {
-                                return Some(Err(format!("东财市场榜 {code} 超过 5 秒新鲜度")));
-                            }
-                            let volume_ratio = item
-                                .get("f10")
-                                .and_then(|value| value.as_f64())
-                                .filter(|value| value.is_finite() && *value >= 0.0);
-                            let main_net_yi = item
-                                .get("f62")
-                                .and_then(|value| value.as_f64())
-                                .filter(|value| value.is_finite())
-                                .map(|value| value / 1e8);
-                            Some(Ok(TopStock {
-                                code,
-                                name,
-                                price,
-                                change_pct,
-                                volume_ratio,
-                                main_net_yi,
-                            }))
-                        })
-                        .collect();
-                    let stocks = stocks?;
-                    if !stocks.is_empty() {
-                        mark_capability_success(
-                            stock_analysis::monitor::data_mode::Capability::Quote,
-                        )?;
-                        return Ok(stocks);
-                    }
-                }
-            }
-            Err(_) => continue,
-        }
-    }
-    Err("全市场榜单请求失败（所有东财主机）".to_string())
-}
-
-pub fn fetch_market_main_inflow_top(
-    top_n: usize,
-) -> Result<Vec<stock_analysis::market_data::TopStock>, String> {
-    let mut stocks = fetch_market_top_by_fid("f62", top_n * 4)?;
-    if stocks.iter().any(|stock| stock.main_net_yi.is_none()) {
-        return Err("主力净流入榜成功响应包含缺失 f62 的行".to_string());
-    }
-    mark_capability_success(stock_analysis::monitor::data_mode::Capability::MoneyFlow)?;
-    stocks.retain(|s| s.main_net_yi.is_some_and(|value| value > 0.0) && s.price > 0.0);
-    stocks.sort_by(|a, b| match (a.main_net_yi, b.main_net_yi) {
-        (Some(a_value), Some(b_value)) => b_value.total_cmp(&a_value),
-        _ => std::cmp::Ordering::Equal,
-    });
-    stocks.truncate(top_n);
-    Ok(stocks)
-}
-
-pub fn fetch_market_volume_ratio_leaders(
-    top_n: usize,
-) -> Result<Vec<stock_analysis::market_data::TopStock>, String> {
-    let mut stocks = fetch_market_top_by_fid("f10", top_n * 6)?;
-    stocks.retain(|s| {
-        s.price > 0.0
-            && s.volume_ratio.is_some_and(|value| value >= 1.8)
-            && s.change_pct >= 0.5
-            && s.change_pct <= 9.5
-    });
-    stocks.sort_by(|a, b| {
-        b.volume_ratio
-            .partial_cmp(&a.volume_ratio)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    stocks.truncate(top_n);
-    Ok(stocks)
-}
-
-/// 新浪行情 API：免费、稳定、无频率限制、无需 Referer/Cookie/Token。
-/// URL: http://hq.sinajs.cn/list=sz000547,sh603618
-/// 返回: var hq_str_sz000547="名称,今开,昨收,现价,最高,最低,..."
-pub fn fetch_sina_quotes(
-    codes: &[String],
-) -> Result<Vec<stock_analysis::market_data::TopStock>, String> {
-    // 新浪 A 股符号映射：深交所 sz，上交所(6/5开头) sh
-    let symbols: Vec<String> = codes
-        .iter()
-        .map(|c| {
-            if c.starts_with('6') || c.starts_with('5') {
-                format!("sh{}", c)
-            } else {
-                format!("sz{}", c)
-            }
-        })
-        .collect();
-    let url = format!("http://hq.sinajs.cn/list={}", symbols.join(","));
-
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-    {
-        Ok(c) => c,
-        Err(error) => return Err(format!("新浪行情 HTTP 客户端构建失败: {error}")),
-    };
-
-    fetch_sina_quotes_with_client(&client, codes, &url)
-}
-
-fn fetch_sina_quotes_with_client(
-    client: &reqwest::blocking::Client,
-    codes: &[String],
-    url: &str,
-) -> Result<Vec<stock_analysis::market_data::TopStock>, String> {
-    use stock_analysis::market_data::TopStock;
-    let symbols: Vec<String> = codes
-        .iter()
-        .map(|code| {
-            if code.starts_with('6') || code.starts_with('5') {
-                format!("sh{code}")
-            } else {
-                format!("sz{code}")
-            }
-        })
-        .collect();
-
-    let text = match client.get(url)
-        .header("User-Agent", "Mozilla/5.0")
-        .header("Referer", "https://finance.sina.com.cn/")
-        .send().and_then(|r| r.text()) // 新浪返回 GBK 文本，reqwest 自动解码
-    { Ok(t) => t, Err(e) => return Err(format!("新浪行情请求/读取失败: {e}")) };
-
-    // 逐行解析：var hq_str_sz000547="名称,今开,昨收,...";
-    let mut results = Vec::new();
-    for (symbol, code) in symbols.iter().zip(codes.iter()) {
-        // 从文本中提取该股票的数据行
-        let prefix = format!("var hq_str_{}=\"", symbol);
-        let start = match text.find(&prefix) {
-            Some(p) => p + prefix.len(),
-            None => return Err(format!("新浪行情缺少 {code} 数据行")),
-        };
-        let end = match text[start..].find('"') {
-            Some(p) => start + p,
-            None => return Err(format!("新浪行情 {code} 响应引号不完整")),
-        };
-        let data = &text[start..end];
-        let fields: Vec<&str> = data.split(',').collect();
-        if fields.len() < 32 {
-            return Err(format!("新浪行情 {code} 字段不足: {}", fields.len()));
-        }
-
-        let name = fields[0].trim().to_string();
-        if name.is_empty() {
-            return Err(format!("新浪行情 {code} 缺少名称"));
-        }
-        let prev_close = fields[2]
-            .parse::<f64>()
-            .map_err(|error| format!("新浪行情 {code} 昨收解析失败: {error}"))?;
-        let price = fields[3]
-            .parse::<f64>()
-            .map_err(|error| format!("新浪行情 {code} 现价解析失败: {error}"))?;
-        if !prev_close.is_finite() || prev_close <= 0.0 || !price.is_finite() || price <= 0.0 {
-            return Err(format!("新浪行情 {code} 现价/昨收非法"));
-        }
-        let change_pct = (price - prev_close) / prev_close * 100.0;
-        let change_pct = validate_change_pct(code, &name, change_pct, "新浪行情")?;
-        let source_time = chrono::NaiveDateTime::parse_from_str(
-            &format!("{} {}", fields[30], fields[31]),
-            "%Y-%m-%d %H:%M:%S",
-        )
-        .map_err(|error| format!("新浪行情 {code} 源时间非法: {error}"))?;
-        let source_time = chrono::TimeZone::from_local_datetime(&chrono::Local, &source_time)
-            .single()
-            .ok_or_else(|| format!("新浪行情 {code} 源时间存在时区歧义"))?;
-        if !validate_quote_freshness(source_time, "sina", code) {
-            return Err(format!("新浪行情 {code} 未通过 5 秒新鲜度"));
-        }
-
-        results.push(TopStock {
-            code: code.clone(),
-            name,
-            price,
-            change_pct,
-            volume_ratio: None, // 新浪不提供量比
-            main_net_yi: None,  // 新浪不提供主力净流入
-        });
-    }
-    validate_quote_batch_codes(codes, &results, "sina")?;
-    mark_capability_success(stock_analysis::monitor::data_mode::Capability::Quote)?;
-    Ok(results)
+/// BR-190: one explicit state marker for the retired full-market ranking paths.
+///
+/// This is deliberately not a fetch facade: provider admission is false, so a
+/// request would be a dead call and an empty result would misstate unavailable
+/// evidence as a verified empty ranking.
+pub(super) fn log_full_market_rankings_unavailable(owner: &str) {
+    log::warn!(
+        "[BR-190][FullMarketRankings] owner={} status=unavailable reason_code={} metrics=volume_ratio,main_net_inflow retryable=false",
+        owner,
+        FULL_MARKET_RANKINGS_UNAVAILABLE_REASON
+    );
 }
 
 #[cfg(test)]
 mod quote_batch_tests {
     use super::*;
+    use magic_market_core::ProviderId;
+    use stock_analysis::data_gateway::{BatchEvidence, GatewayBatch, RealtimeMarketQuote};
+    use stock_analysis::data_provider::{AdjustType, KlineData};
     use stock_analysis::market_data::TopStock;
-
-    fn http_fixture_once(body: String) -> (String, std::thread::JoinHandle<String>) {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 8192];
-            let n = stream.read(&mut request).unwrap();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-            String::from_utf8_lossy(&request[..n]).into_owned()
-        });
-        (format!("http://{addr}"), handle)
-    }
 
     fn quote(code: &str) -> TopStock {
         TopStock {
@@ -584,6 +344,65 @@ mod quote_batch_tests {
             price: 10.0,
             volume_ratio: None,
             main_net_yi: None,
+        }
+    }
+
+    #[test]
+    fn br190_unavailable_disposition_is_not_empty_or_retryable() {
+        assert_eq!(
+            FULL_MARKET_RANKINGS_UNAVAILABLE_REASON,
+            "provider_capability_not_live_admitted"
+        );
+        assert_eq!(
+            FULL_MARKET_RANKINGS_UNAVAILABLE_AUDIT,
+            "capability_unavailable:provider_capability_not_live_admitted"
+        );
+        assert!(!FULL_MARKET_RANKINGS_UNAVAILABLE_AUDIT.contains("empty"));
+        assert!(!FULL_MARKET_RANKINGS_UNAVAILABLE_AUDIT.contains("retry"));
+    }
+
+    fn daily_evidence() -> BatchEvidence {
+        BatchEvidence {
+            provider: ProviderId::Tdx,
+            source: "TEST_CODE_magic_tdx_daily".to_string(),
+            source_at: Some("2026-07-26".to_string()),
+            observed_at: "2026-07-26T08:00:00Z".to_string(),
+            batch_id: "TEST_CODE_daily_batch".to_string(),
+        }
+    }
+
+    fn daily_bar(date: chrono::NaiveDate, pct_chg: f64, is_limit_up: bool) -> KlineData {
+        KlineData {
+            date,
+            open: 10.0,
+            high: 10.5,
+            low: 9.8,
+            close: 10.4,
+            volume: 1_000.0,
+            amount: 10_000.0,
+            pct_chg,
+            intraday_price: None,
+            settled: true,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            eps: None,
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
+            is_limit_up,
+            is_limit_down: false,
+            is_suspended: false,
+            adjust: AdjustType::None,
         }
     }
 
@@ -630,101 +449,192 @@ mod quote_batch_tests {
     fn board_aware_change_pct_validation_accepts_real_values_and_flags_overrun() {
         assert!(validate_change_pct("TEST_CODE_300001", "创业板测试股", 20.0, "test").is_ok());
         assert!(validate_change_pct("TEST_CODE_920305", "北交所测试股", 30.0, "test").is_ok());
-        assert!(validate_change_pct("TEST_CODE_920305", "北交所测试股", 30.01, "test").is_ok());
+        assert!(validate_change_pct("TEST_CODE_920305", "北交所测试股", 30.01, "test").is_err());
+        assert!(validate_change_pct("TEST_CODE_600001", "普通测试股", f64::NAN, "test").is_err());
     }
 
     #[test]
-    fn sina_transport_parses_complete_batch_and_rejects_incomplete_protocol() {
-        let client = reqwest::blocking::Client::builder()
-            .no_proxy()
-            .build()
-            .unwrap();
-        let now = chrono::Local::now();
-        let mut fields = vec!["0".to_string(); 32];
-        fields[0] = "测试行情".to_string();
-        fields[1] = "10.00".to_string();
-        fields[2] = "10.00".to_string();
-        fields[3] = "10.50".to_string();
-        fields[4] = "10.60".to_string();
-        fields[5] = "9.90".to_string();
-        fields[30] = now.format("%Y-%m-%d").to_string();
-        fields[31] = now.format("%H:%M:%S").to_string();
-        let body = format!("var hq_str_szTEST_CODE_000001=\"{}\";", fields.join(","));
-        let (url, request) = http_fixture_once(body);
-        let quotes =
-            fetch_sina_quotes_with_client(&client, &["TEST_CODE_000001".to_string()], &url)
-                .unwrap();
-        assert_eq!(quotes.len(), 1);
-        assert_eq!(quotes[0].name, "测试行情");
-        assert!((quotes[0].change_pct - 5.0).abs() < 1e-9);
-        assert!(request.join().unwrap().starts_with("GET / HTTP/1.1"));
+    fn br159_top_stock_projection_retains_evidence_and_rejects_bad_market_data_without_network() {
+        let observed_at = chrono::DateTime::parse_from_rfc3339("2026-07-26T08:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let evidence = BatchEvidence {
+            provider: ProviderId::Tencent,
+            source: "TEST_CODE_magic_tencent_quote".to_string(),
+            source_at: Some("2026-07-26T08:00:00Z".to_string()),
+            observed_at: "2026-07-26T08:00:00Z".to_string(),
+            batch_id: "TEST_CODE_quote_batch".to_string(),
+        };
+        let quote = RealtimeMarketQuote {
+            code: "TEST_CODE_600001".to_string(),
+            name: "普通测试股".to_string(),
+            price: 10.0,
+            previous_close: 9.5,
+            change_percent: 5.0,
+            source_at: observed_at,
+            observed_at,
+            provider: ProviderId::Tencent,
+            batch_id: evidence.batch_id.clone(),
+        };
+        let projected = project_top_stock_batch(
+            &["TEST_CODE_600001".to_string()],
+            GatewayBatch::Available {
+                records: vec![quote.clone()],
+                evidence: evidence.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(projected.stocks.len(), 1);
+        assert_eq!(projected.evidence, evidence);
 
-        let (url, request) =
-            http_fixture_once("var hq_str_szTEST_CODE_000001=\"测试行情,10,10\";".to_string());
-        let error = fetch_sina_quotes_with_client(&client, &["TEST_CODE_000001".to_string()], &url)
-            .unwrap_err();
-        assert!(error.contains("字段不足"));
-        request.join().unwrap();
+        let bad_quote = RealtimeMarketQuote {
+            change_percent: 10.01,
+            ..quote
+        };
+        let error = project_top_stock_batch(
+            &["TEST_CODE_600001".to_string()],
+            GatewayBatch::Available {
+                records: vec![bad_quote],
+                evidence: projected.evidence,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("超过证券板块"));
     }
-}
 
-/// 拉取上证指数涨跌幅；不将客户端/数据源/字段失败改成 0。
-pub fn fetch_sh_index_change() -> Result<f64, String> {
-    let analyzer = stock_analysis::market_analyzer::MarketAnalyzer::new(None)
-        .map_err(|error| format!("上证指数 analyzer 初始化失败: {error}"))?;
-    let overview = analyzer
-        .get_market_overview()
-        .map_err(|error| format!("上证指数快照获取失败: {error}"))?;
-    let value = overview
-        .get_sh_index()
-        .map(|index| index.change_pct)
-        .filter(|value| value.is_finite() && value.abs() <= 20.0)
-        .ok_or_else(|| "上证指数涨跌幅缺失/超过±20%".to_string())?;
-    Ok(value)
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct MarketReviewSnapshot {
-    pub sh_chg: f64,
-    pub chinext_chg: f64,
-    pub star_chg: f64,
-    pub amount_yi: f64,
-    pub limit_up_n: u32,
-    pub limit_down_n: u32,
-}
-
-/// BR-093: 从同一次 MarketOverview 构造 R-02 必填快照。
-pub fn fetch_market_review_snapshot() -> Result<MarketReviewSnapshot, String> {
-    let analyzer = stock_analysis::market_analyzer::MarketAnalyzer::new(None)
-        .map_err(|error| format!("create market analyzer: {error}"))?;
-    let overview = analyzer
-        .get_market_overview()
-        .map_err(|error| format!("fetch market overview: {error}"))?;
-    let find_change = |suffix: &str, label: &str| -> Result<f64, String> {
-        let value = overview
-            .indices
-            .iter()
-            .find(|index| index.code.ends_with(suffix))
-            .map(|index| index.change_pct)
-            .ok_or_else(|| format!("missing {label} index"))?;
-        if !value.is_finite() || value.abs() > 20.0 {
-            return Err(format!("invalid {label} change_pct: {value}"));
+    fn projection_batch_with_observed_at(
+        provider: ProviderId,
+        encoded_observed_at: &str,
+        observed_at: chrono::DateTime<chrono::Utc>,
+    ) -> GatewayBatch<RealtimeMarketQuote> {
+        let batch_id = format!("TEST_CODE_BR210_{provider:?}_BATCH");
+        GatewayBatch::Available {
+            records: vec![RealtimeMarketQuote {
+                code: "TEST_CODE_600001".to_string(),
+                name: "普通测试股".to_string(),
+                price: 10.0,
+                previous_close: 9.5,
+                change_percent: 5.0,
+                source_at: observed_at,
+                observed_at,
+                provider,
+                batch_id: batch_id.clone(),
+            }],
+            evidence: BatchEvidence {
+                provider,
+                source: format!("TEST_CODE_magic_{provider:?}_quote"),
+                source_at: Some(encoded_observed_at.to_string()),
+                observed_at: encoded_observed_at.to_string(),
+                batch_id,
+            },
         }
-        Ok(value)
-    };
-    if !overview.total_amount.is_finite() || overview.total_amount <= 0.0 {
-        return Err(format!("invalid market amount: {}", overview.total_amount));
     }
-    let limit_up_n = u32::try_from(overview.limit_up_count)
-        .map_err(|_| format!("invalid limit_up_count: {}", overview.limit_up_count))?;
-    let limit_down_n = u32::try_from(overview.limit_down_count)
-        .map_err(|_| format!("invalid limit_down_count: {}", overview.limit_down_count))?;
-    Ok(MarketReviewSnapshot {
-        sh_chg: find_change("000001", "上证")?,
-        chinext_chg: find_change("399006", "创业板")?,
-        star_chg: find_change("000688", "科创50")?,
-        amount_yi: overview.total_amount,
-        limit_up_n,
-        limit_down_n,
-    })
+
+    #[test]
+    fn br210_projection_accepts_magic_tdx_integer_epoch_seconds() {
+        let observed_at = chrono::DateTime::<chrono::Utc>::from_timestamp(1_785_799_979, 0)
+            .expect("valid TEST_CODE epoch seconds");
+        let projected = project_top_stock_batch(
+            &["TEST_CODE_600001".to_string()],
+            projection_batch_with_observed_at(ProviderId::Tdx, "1785799979", observed_at),
+        )
+        .expect("Magic TDX integer epoch evidence must project");
+
+        assert_eq!(projected.stocks.len(), 1);
+        assert_eq!(projected.evidence.observed_at, "1785799979");
+    }
+
+    #[test]
+    fn br210_projection_accepts_tencent_and_sina_fractional_epoch_seconds() {
+        for (provider, encoded, nanos) in [
+            (ProviderId::Tencent, "1785799979.851045000", 851_045_000),
+            (ProviderId::Sina, "1785799979.3", 300_000_000),
+        ] {
+            let observed_at = chrono::DateTime::<chrono::Utc>::from_timestamp(1_785_799_979, nanos)
+                .expect("valid TEST_CODE fractional epoch seconds");
+            let projected = project_top_stock_batch(
+                &["TEST_CODE_600001".to_string()],
+                projection_batch_with_observed_at(provider, encoded, observed_at),
+            )
+            .unwrap_or_else(|error| panic!("provider={provider:?} encoding={encoded}: {error}"));
+
+            assert_eq!(projected.stocks.len(), 1);
+            assert_eq!(projected.evidence.observed_at, encoded);
+        }
+    }
+
+    #[test]
+    fn br210_projection_rejects_malformed_magic_observation_evidence() {
+        let observed_at = chrono::DateTime::<chrono::Utc>::from_timestamp(1_785_799_979, 0)
+            .expect("valid TEST_CODE epoch seconds");
+        let error = project_top_stock_batch(
+            &["TEST_CODE_600001".to_string()],
+            projection_batch_with_observed_at(
+                ProviderId::Tencent,
+                "1785799979.8510450000",
+                observed_at,
+            ),
+        )
+        .expect_err("over-precision Magic observation evidence must fail closed");
+
+        assert!(error.contains("observed_at 非法"), "{error}");
+        assert!(error.contains("invalid_evidence"), "{error}");
+    }
+
+    #[test]
+    fn br164_board_level_uses_admitted_daily_bars_and_retains_evidence() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 26).unwrap();
+        let records = vec![
+            daily_bar(today, 10.0, true),
+            daily_bar(today - chrono::Duration::days(1), 10.0, true),
+            daily_bar(today - chrono::Duration::days(2), 10.0, true),
+        ];
+        let evidence = daily_evidence();
+
+        let fact = classify_board_level_from_parts(
+            "TEST_CODE_600001",
+            "普通测试股",
+            &records,
+            &evidence,
+            today,
+        )
+        .unwrap();
+
+        assert_eq!(fact.code, "TEST_CODE_600001");
+        assert_eq!(fact.level, 3);
+        assert_eq!(fact.evidence.batch_id, "TEST_CODE_daily_batch");
+        assert_eq!(fact.evidence.source, "TEST_CODE_magic_tdx_daily");
+    }
+
+    #[test]
+    fn br106_board_level_rejects_insufficient_admitted_sample() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 26).unwrap();
+        let records = vec![
+            daily_bar(today, 10.0, true),
+            daily_bar(today - chrono::Duration::days(1), 10.0, true),
+        ];
+        let evidence = daily_evidence();
+
+        let error = classify_board_level_from_parts(
+            "TEST_CODE_600001",
+            "普通测试股",
+            &records,
+            &evidence,
+            today,
+        )
+        .expect_err("short sample must be rejected");
+
+        assert!(error.contains("日线样本不足"));
+        assert!(error.contains("TEST_CODE_daily_batch"));
+    }
+
+    #[test]
+    fn br164_duplicate_board_request_is_rejected_before_any_network_call() {
+        let duplicate = vec![
+            ("TEST_CODE_600001".to_string(), "协议测试股".to_string()),
+            ("TEST_CODE_600001".to_string(), "协议测试股".to_string()),
+        ];
+        let error = lookup_board_level_facts(&duplicate).unwrap_err();
+        assert!(error.contains("请求代码包含重复项"));
+    }
 }

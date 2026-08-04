@@ -8,8 +8,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 cargo build                             # compilation
 cargo test --lib                        # all unit tests (~289)
 cargo run --bin monitor                 # live monitoring
-cargo run --bin monitor -- --test       # full pipeline smoke test
-cargo run --bin monitor -- --review     # manual post-market review
+cargo run --bin monitor -- --test --push-dry-run  # full pipeline smoke test (isolated audit, no external delivery)
+cargo run --bin monitor -- --test       # same catalog but requires BR196_LIVE_FEISHU_ACCEPTANCE=1 (real delivery)
+cargo run --bin monitor -- --review     # manual post-market review (do NOT set V10_DRY_RUN_PUSH=1: BR-192 rejects it)
 ```
 
 ## Architecture (v3–v6)
@@ -21,7 +22,7 @@ The system is an **event-driven live trading monitor** for A-share (Chinese stoc
 | Context | Directory | Job |
 |---------|-----------|-----|
 | Portfolio | `portfolio/` | Single source of truth for positions, trades, ledger |
-| Market | `monitor/` + `data_provider/` + `market_analyzer/` | Quotes, announcements, detection |
+| Market | `data_gateway/` + `monitor/` + `market_analyzer/` | Typed public facts, announcements, detection |
 | Signal | `signal/` | Unified Signal/SignalSet data structures |
 | Opportunity | `opportunity/` | News → industry chain → candidate discovery |
 | Review | `review/` | Daily/weekly post-trade review & falsification |
@@ -29,7 +30,10 @@ The system is an **event-driven live trading monitor** for A-share (Chinese stoc
 | Risk | `risk/` | Hard position/sector/cash limits (parallel to monitor/risk.rs) |
 | Breakout | `breakout/` | Multi-dimensional volume breakout analysis (v6) |
 
-**Data sources** (multi-host fallback): Eastmoney push2 (3 hosts) → Sina → Yahoo. Flash news from Jin10 + WallStreetCN.
+**Public data ownership**: all financial/news acquisition enters `src/data_gateway/**`
+and consumes the pinned `magic-market-data-rs` revision. Magic TDX is the first
+A-share market-data route candidate; only Magic Router may select another registered provider.
+Missing, stale, partial, conflicting or unsupported batches remain explicit.
 
 ## Critical Rules (from AGENTS.md, MUST priority)
 
@@ -87,7 +91,7 @@ grep -c '"event_type":"<event_type>' data/event_bus/${DATE}.jsonl 2>&1
 # If 0: either the audit pipeline is dead OR the producer is dead. Identify which before claiming done.
 
 # 4c. Cross-check the producer→adapter→push→audit chain end-to-end
-# Trace from the upstream producer (Eastmoney / SearchService / monitor event bus) →
+# Trace from the upstream producer (unified data_gateway / generic SearchService / monitor event bus) →
 # through classify_* / classify_announcement / handle_monitor_event →
 # through v17_sources::push_normalized_event →
 # to push_governor_v3 → publish_delivery → JSONL audit.
@@ -174,8 +178,8 @@ Do not design infrastructure layers (buses, registries, replay, ACK protocols) i
 ## Configuration
 
 - `.env`: `STOCK_LIST` (watchlist codes), `WECHAT_SEND_SCRIPT`, `DATABASE_PATH`
-- `config/*.toml`: chain rules, exclusion boards, announcement keywords, monitor timers — SIGHUP hot-reloadable
-- All config files have code-level `const` fallbacks if toml is missing
+- Runtime TOML inputs are exactly `config/strategy.toml` and `config/chain.toml`, read once by `config::load_all()` during monitor startup; signal hot reload is not implemented.
+- A missing or invalid projection follows its registered typed failure/retention semantics; production consumers must not invent a `const`, disk, embedded, or empty-result fallback.
 
 ## v15.x Lessons Learned (post-mortem)
 

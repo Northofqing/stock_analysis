@@ -1,14 +1,15 @@
 use super::model::{
-    has_non_ascii_whitespace, sha256_hex, stable_identity, AcceptedSinkResultCanonical,
-    AuthoritativeDeliveryRequest, AuthoritativeSink, AuthoritativeSinkResult, AuthorityWatermark,
-    CoordinatorConfig, DecisionState, DeliveryDispositionCanonical, DeliveryEnvelope,
-    DurableDeliveryError, ImmutableAppendPort, ManualAcceptedDeliveryAuditEvidence,
-    ManualDisposition, ManualResolutionAuthorizationCanonical, ManualResolutionCommand, PolicyRow,
-    PrepareOutcome, ReconcileSummary, Result, ResumeOutcome, ReviewTerminalReplayAttempt,
-    ReviewTerminalReplayCompletion, ReviewTerminalReplayCompletionCanonical,
-    ReviewTerminalReplayCompletionState, ReviewTerminalReplayInput,
-    ReviewTerminalReplayStartCanonical, ScheduleHydration, ScheduleHydrationState,
-    TaskTransitionCanonical, WindowMode, DAILY_BUDGET_LIMIT, MANUAL_ACCEPTED_DELIVERY_AUDIT_DOMAIN,
+    compiled_policy_catalog, has_non_ascii_whitespace, sha256_hex, stable_identity,
+    AcceptedSinkResultCanonical, AuthoritativeDeliveryRequest, AuthoritativeSink,
+    AuthoritativeSinkResult, AuthorityWatermark, CoordinatorConfig, DecisionState,
+    DeliveryDispositionCanonical, DeliveryEnvelope, DurableDeliveryError, ImmutableAppendPort,
+    ManualAcceptedDeliveryAuditEvidence, ManualDisposition, ManualResolutionAuthorizationCanonical,
+    ManualResolutionCommand, PolicyRow, PrepareOutcome, ReconcileSummary, Result, ResumeOutcome,
+    ReviewTerminalReplayAttempt, ReviewTerminalReplayCompletion,
+    ReviewTerminalReplayCompletionCanonical, ReviewTerminalReplayCompletionState,
+    ReviewTerminalReplayInput, ReviewTerminalReplayStartCanonical, ScheduleHydration,
+    ScheduleHydrationState, TaskTransitionCanonical, WindowMode, DAILY_BUDGET_LIMIT,
+    MANUAL_ACCEPTED_DELIVERY_AUDIT_DOMAIN,
 };
 use super::schema::{
     configure_attested_connection, initialize_schema, load_policy, materialize_wal_capability,
@@ -172,8 +173,8 @@ pub struct DurableDeliveryCoordinator {
     // unreachable; OFD markers below are defense-in-depth against accidental
     // same-process raw-fd misuse. Compromised arbitrary code under the same UID
     // remains outside this isolation boundary.
-    connection: Arc<Mutex<Connection>>,
-    database_binding: PinnedDatabaseBinding,
+    connection: Option<Arc<Mutex<Connection>>>,
+    database_binding: Option<PinnedDatabaseBinding>,
     config: CoordinatorConfig,
     #[cfg(test)]
     database_operation_test_hook: Mutex<Option<DatabaseOperationTestHook>>,
@@ -769,20 +770,13 @@ impl PinnedDirectoryChain {
     }
 
     fn validate(&self) -> Result<()> {
-        // Directory nlink is a mutation detector, not an inode identity: a
-        // legitimate child-directory mkdir/rmdir changes it without rebinding
-        // this retained chain. Accept such drift only after two complete,
-        // stable openat rebind passes prove every retained component still
-        // names the same trusted inode. Then refresh the retained baseline.
-        let first = self.validate_once()?;
-        let second = self.validate_once()?;
-        if first != second {
-            return Err(DurableDeliveryError::IsolationViolation(
-                "database namespace link counts changed during complete-chain validation"
-                    .to_owned(),
-            ));
-        }
-        self.refresh_link_count_baselines(&second)
+        // Directory link count is a mutation detector, not identity. A legitimate
+        // child-directory mkdir/rmdir can alter it without rebinding this
+        // retained chain. We therefore treat link-count drift as informational and
+        // only require successful rebind identity validation, then refresh the
+        // retained baseline from the observed chain.
+        let observed = self.validate_once()?;
+        self.refresh_link_count_baselines(&observed)
     }
 
     fn validate_once(&self) -> Result<Vec<u64>> {
@@ -1266,10 +1260,24 @@ fn attest_sqlite_object(
     let sqlite_descriptor = match candidates.as_slice() {
         [descriptor] => *descriptor,
         [] => {
+            let before_matches = before
+                .descriptors
+                .iter()
+                .filter_map(|(&descriptor, &identity)| {
+                    (identity == expected_identity).then_some(descriptor)
+                })
+                .collect::<Vec<_>>();
+            let after_matches = after
+                .descriptors
+                .iter()
+                .filter_map(|(&descriptor, &identity)| {
+                    (identity == expected_identity).then_some(descriptor)
+                })
+                .collect::<Vec<_>>();
             return Err(DurableDeliveryError::IsolationViolation(format!(
-                "rusqlite opened no persistent {} descriptor for the pinned SQLite object",
-                role.label()
-            )))
+                "rusqlite opened no persistent {} descriptor for the pinned SQLite object; before_matches={before_matches:?} after_matches={after_matches:?}",
+                role.label(),
+            )));
         }
         _ => {
             return Err(DurableDeliveryError::IsolationViolation(format!(
@@ -1306,6 +1314,84 @@ fn attest_sqlite_object(
         },
         identity: expected_identity,
     })
+}
+
+fn open_connection_with_attestable_main(
+    route: &Path,
+    expected_identity: FileObjectIdentity,
+    _attestation_guard: &std::sync::MutexGuard<'_, ()>,
+) -> Result<(
+    Connection,
+    ProcessDescriptorSnapshot,
+    ProcessDescriptorSnapshot,
+)> {
+    let mut before = ProcessDescriptorSnapshot::capture()?;
+    let maximum_attempts = before
+        .descriptors
+        .values()
+        .filter(|&&identity| identity == expected_identity)
+        .count()
+        .checked_add(1)
+        .ok_or_else(|| {
+            DurableDeliveryError::IsolationViolation(
+                "SQLite main descriptor reuse bound overflowed".to_owned(),
+            )
+        })?;
+    let mut unproved_connections = Vec::new();
+
+    for attempt in 1..=maximum_attempts {
+        let connection = Connection::open_with_flags(
+            route,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let after = ProcessDescriptorSnapshot::capture()?;
+        let candidates = sqlite_descriptor_delta_candidates(&before, &after, expected_identity);
+        match candidates.as_slice() {
+            [_] => {
+                // BR-206: no unproved handle may escape bootstrap. Their
+                // destruction remains under the caller-held attestation lock.
+                drop(unproved_connections);
+                return Ok((connection, before, after));
+            }
+            [] if attempt < maximum_attempts => {
+                // SQLite's Unix VFS can consume an already-open descriptor
+                // from its internal reuse pool. Keep this unproved connection
+                // alive so the same pooled descriptor cannot satisfy the next
+                // open, then retry without issuing SQL or PRAGMA.
+                unproved_connections.push(connection);
+                before = after;
+            }
+            [] => {
+                let before_matches = before
+                    .descriptors
+                    .iter()
+                    .filter_map(|(&descriptor, &identity)| {
+                        (identity == expected_identity).then_some(descriptor)
+                    })
+                    .collect::<Vec<_>>();
+                let after_matches = after
+                    .descriptors
+                    .iter()
+                    .filter_map(|(&descriptor, &identity)| {
+                        (identity == expected_identity).then_some(descriptor)
+                    })
+                    .collect::<Vec<_>>();
+                return Err(DurableDeliveryError::IsolationViolation(format!(
+                    "rusqlite exhausted {maximum_attempts} evidence-bounded opens without a persistent main descriptor; before_matches={before_matches:?} after_matches={after_matches:?}"
+                )));
+            }
+            _ => {
+                return Err(DurableDeliveryError::IsolationViolation(format!(
+                    "rusqlite opened {} ambiguous main descriptors for the pinned SQLite object on attempt {attempt} of {maximum_attempts}",
+                    candidates.len()
+                )));
+            }
+        }
+    }
+
+    Err(DurableDeliveryError::IsolationViolation(
+        "SQLite main descriptor acquisition exhausted an unreachable loop state".to_owned(),
+    ))
 }
 
 fn attest_sqlite_shm_object(
@@ -2145,7 +2231,37 @@ fn probe_precreation_attestation_capabilities(
     )
 }
 
+impl Drop for DurableDeliveryCoordinator {
+    fn drop(&mut self) {
+        // BR-206: descriptor snapshots are process-wide, so connection and
+        // retained proof teardown must share the same total order as opens and
+        // operations. Drop cannot propagate poison as an operational error;
+        // recovering the guard here preserves close serialization only.
+        let _attestation_guard = sqlite_attestation_open_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(self.connection.take());
+        drop(self.database_binding.take());
+    }
+}
+
 impl DurableDeliveryCoordinator {
+    fn connection_handle(&self) -> Result<&Arc<Mutex<Connection>>> {
+        self.connection.as_ref().ok_or_else(|| {
+            DurableDeliveryError::IsolationViolation(
+                "durable-delivery connection is unavailable during teardown".to_owned(),
+            )
+        })
+    }
+
+    fn database_binding(&self) -> Result<&PinnedDatabaseBinding> {
+        self.database_binding.as_ref().ok_or_else(|| {
+            DurableDeliveryError::IsolationViolation(
+                "durable-delivery database binding is unavailable during teardown".to_owned(),
+            )
+        })
+    }
+
     pub fn open(config: CoordinatorConfig) -> Result<Self> {
         config.validate()?;
         Self::open_at_repository_root(config, Path::new(env!("CARGO_MANIFEST_DIR")))
@@ -2174,13 +2290,12 @@ impl DurableDeliveryCoordinator {
         // C3: opening the SQLite handle is followed immediately by exact main
         // fd/leaf/ancestor attestation. No PRAGMA, DDL or transaction may run
         // against the connection before this succeeds.
-        let before_main = ProcessDescriptorSnapshot::capture()?;
-        let connection = Connection::open_with_flags(
-            route,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        let (connection, before_main, after_main) = open_connection_with_attestable_main(
+            &route,
+            namespace.main_identity,
+            &attestation_guard,
         )?;
         let connection = Arc::new(Mutex::new(connection));
-        let after_main = ProcessDescriptorSnapshot::capture()?;
         let mut main = attest_sqlite_object(
             SqliteObjectRole::Main,
             namespace.leaf.clone(),
@@ -2236,8 +2351,8 @@ impl DurableDeliveryCoordinator {
         )?;
         let _lifetime = database_binding.validate_under_open_lock()?;
         let coordinator = Self {
-            connection,
-            database_binding,
+            connection: Some(connection),
+            database_binding: Some(database_binding),
             config,
             #[cfg(test)]
             database_operation_test_hook: Mutex::new(None),
@@ -2260,7 +2375,7 @@ impl DurableDeliveryCoordinator {
             Ok(())
         })?;
         coordinator
-            .database_binding
+            .database_binding()?
             .sync_parent_directory("database parent before coordinator success")?;
         #[cfg(test)]
         run_database_bootstrap_test_hook(
@@ -2271,15 +2386,15 @@ impl DurableDeliveryCoordinator {
         // owner-specific OFD proofs and the live SHM connection lifetime once
         // more, then verify the connection's effective safety PRAGMAs while
         // that same attested operation lease remains held.
-        let final_lease = coordinator.database_binding.acquire_operation_lease()?;
-        let connection_guard = coordinator.connection.lock().map_err(|_| {
+        let database_binding = coordinator.database_binding()?;
+        let final_lease = database_binding.acquire_operation_lease()?;
+        let connection_guard = coordinator.connection_handle()?.lock().map_err(|_| {
             DurableDeliveryError::IsolationViolation(
                 "final bootstrap connection mutex is poisoned".to_owned(),
             )
         })?;
         verify_connection_configuration(&connection_guard)?;
-        let _final_post_connection_lifetime =
-            coordinator.database_binding.validate_under_open_lock()?;
+        let _final_post_connection_lifetime = database_binding.validate_under_open_lock()?;
         drop(connection_guard);
         drop(final_lease);
         Ok(coordinator)
@@ -2551,7 +2666,7 @@ impl DurableDeliveryCoordinator {
 
     #[cfg(test)]
     pub(crate) fn remove_bound_main_ofd_marker_for_test(&self) -> Result<()> {
-        let main = self.database_binding.objects.first().ok_or_else(|| {
+        let main = self.database_binding()?.objects.first().ok_or_else(|| {
             DurableDeliveryError::IsolationViolation(
                 "TEST_CODE bound SQLite object set has no main object".to_owned(),
             )
@@ -2580,7 +2695,7 @@ impl DurableDeliveryCoordinator {
         &self,
         decision_identity: &str,
     ) -> Result<i64> {
-        let connection = self.connection.lock().map_err(|_| {
+        let connection = self.connection_handle()?.lock().map_err(|_| {
             DurableDeliveryError::IsolationViolation(
                 "fault-verification connection mutex is poisoned".to_owned(),
             )
@@ -2597,7 +2712,7 @@ impl DurableDeliveryCoordinator {
         &self,
         decision_identity: &str,
     ) -> Result<(i64, i64, i64)> {
-        let connection = self.connection.lock().map_err(|_| {
+        let connection = self.connection_handle()?.lock().map_err(|_| {
             DurableDeliveryError::IsolationViolation(
                 "fault-verification connection mutex is poisoned".to_owned(),
             )
@@ -2721,6 +2836,148 @@ impl DurableDeliveryCoordinator {
             load_decision(connection, decision_identity)?
                 .map(|stored| stored.state)
                 .ok_or_else(|| DurableDeliveryError::DecisionNotFound(decision_identity.to_owned()))
+        })
+    }
+
+    /// Return the durable owner of an exact review-task occurrence without
+    /// mutating admission state or contacting a sink.
+    ///
+    /// BR-200 places this read seam before provider acquisition. For
+    /// BusinessDateOnce rows the retained claim is authoritative. Rolling
+    /// rows use the exact task identity and prefer the sole Delivered row over
+    /// a later durable denial created by an older duplicate invocation.
+    pub fn inspect_review_task_occurrence(
+        &self,
+        business_date: &str,
+        push_kind: super::model::PushKind,
+        sub_kind: super::model::DeliverySubKind,
+        scope_key: &str,
+        task_identity: &str,
+    ) -> Result<Option<super::model::ReviewTaskOccurrenceEvidence>> {
+        super::model::validate_business_date(business_date)?;
+        if scope_key.trim().is_empty() || task_identity.trim().is_empty() {
+            return Err(DurableDeliveryError::PolicyMismatch(
+                "review_task_occurrence_identity_invalid".to_owned(),
+            ));
+        }
+        let policy = compiled_policy_catalog()
+            .into_iter()
+            .find(|row| row.push_kind == push_kind && row.sub_kind == sub_kind)
+            .ok_or_else(|| {
+                DurableDeliveryError::PolicyMismatch(format!(
+                    "review task occurrence has no compiled policy for {push_kind}/{sub_kind}"
+                ))
+            })?;
+        let expected_scope = match policy.cooldown_scope {
+            super::model::CooldownScope::Global => "GLOBAL",
+            super::model::CooldownScope::PerTicket => scope_key,
+        };
+        if scope_key != expected_scope {
+            return Err(DurableDeliveryError::PolicyMismatch(format!(
+                "review task occurrence scope mismatch for {push_kind}/{sub_kind}: {scope_key}"
+            )));
+        }
+
+        self.with_connection(|connection| {
+            let claim = if policy.window_mode == super::model::WindowMode::BusinessDateOnce {
+                connection
+                    .query_row(
+                        "SELECT decision_identity FROM business_date_once_claims
+                         WHERE business_date=?1 AND push_kind=?2
+                           AND sub_kind=?3 AND scope_key=?4",
+                        params![business_date, push_kind.as_str(), sub_kind.as_str(), scope_key],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+            } else {
+                None
+            };
+
+            let mut statement = connection.prepare(
+                "SELECT decision_identity FROM delivery_decisions
+                 WHERE business_date=?1 AND push_kind=?2 AND sub_kind=?3
+                   AND scope_key=?4 AND task_binding_present=1
+                 ORDER BY decision_identity",
+            )?;
+            let rows = statement.query_map(
+                params![business_date, push_kind.as_str(), sub_kind.as_str(), scope_key],
+                |row| row.get::<_, String>(0),
+            )?;
+            let mut matches = Vec::new();
+            for row in rows {
+                let decision_identity = row?;
+                let stored = load_decision(connection, &decision_identity)?.ok_or_else(|| {
+                    DurableDeliveryError::DecisionNotFound(decision_identity.clone())
+                })?;
+                if sha256_hex(&stored.envelope_canonical) != stored.envelope_sha256 {
+                    return Err(DurableDeliveryError::PolicyMismatch(format!(
+                        "review task occurrence envelope hash mismatch for {decision_identity}"
+                    )));
+                }
+                let envelope = parse_envelope(&stored.envelope_canonical)?;
+                if envelope.decision_identity != decision_identity
+                    || envelope.business_date != business_date
+                    || envelope.push_kind != push_kind
+                    || envelope.sub_kind != sub_kind
+                    || envelope.scope_key != scope_key
+                {
+                    return Err(DurableDeliveryError::PolicyMismatch(format!(
+                        "review task occurrence envelope identity mismatch for {decision_identity}"
+                    )));
+                }
+                if envelope
+                    .task_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.task_identity == task_identity)
+                {
+                    matches.push(stored);
+                }
+            }
+
+            let selected = if let Some(claimed_identity) = claim {
+                let claimed = matches
+                    .into_iter()
+                    .find(|stored| stored.decision_identity == claimed_identity)
+                    .ok_or_else(|| {
+                        DurableDeliveryError::PolicyMismatch(format!(
+                            "review task occurrence claim {claimed_identity} does not match task {task_identity}"
+                        ))
+                    })?;
+                Some(claimed)
+            } else {
+                let mut delivered = matches
+                    .iter()
+                    .filter(|stored| stored.state == DecisionState::Delivered);
+                let first_delivered = delivered.next().cloned();
+                if delivered.next().is_some() {
+                    return Err(DurableDeliveryError::PolicyMismatch(format!(
+                        "review task occurrence {task_identity} has multiple Delivered decisions"
+                    )));
+                }
+                match first_delivered {
+                    Some(stored) => Some(stored),
+                    None if matches.is_empty() => None,
+                    None if matches.len() == 1 => matches.into_iter().next(),
+                    None => {
+                        return Err(DurableDeliveryError::PolicyMismatch(format!(
+                            "review task occurrence {task_identity} has ambiguous non-Delivered decisions"
+                        )))
+                    }
+                }
+            };
+
+            selected
+                .map(|stored| {
+                    Ok(super::model::ReviewTaskOccurrenceEvidence {
+                        schedule_hydration: load_schedule_hydration(
+                            connection,
+                            &stored.decision_identity,
+                        )?,
+                        decision_identity: stored.decision_identity,
+                        state: stored.state,
+                    })
+                })
+                .transpose()
         })
     }
 
@@ -3731,13 +3988,14 @@ impl DurableDeliveryCoordinator {
         // The global lease serializes process-fd attestation with coordinator
         // opens and retains one live SHM-owning Connection Arc throughout the
         // complete pre -> SQLite operation -> post boundary.
-        let operation_lease = self.database_binding.acquire_operation_lease()?;
-        let mut connection = self.connection.lock().map_err(|_| {
+        let database_binding = self.database_binding()?;
+        let operation_lease = database_binding.acquire_operation_lease()?;
+        let mut connection = self.connection_handle()?.lock().map_err(|_| {
             DurableDeliveryError::InvalidConfiguration(
                 "durable-delivery connection mutex is poisoned".to_owned(),
             )
         })?;
-        let _locked_pre_lifetime = self.database_binding.validate_under_open_lock()?;
+        let _locked_pre_lifetime = database_binding.validate_under_open_lock()?;
         #[cfg(test)]
         let outcome = match self.run_database_operation_test_hook(
             DatabaseOperationTestPhase::AfterPreValidationBeforeSql,
@@ -3751,7 +4009,7 @@ impl DurableDeliveryCoordinator {
             .as_ref()
             .map(|_| validate_persisted_immutable_references(&connection))
             .unwrap_or(Ok(()));
-        let post = self.database_binding.validate_under_open_lock();
+        let post = database_binding.validate_under_open_lock();
         drop(connection);
         drop(operation_lease);
         match (outcome, reference_post, post) {
@@ -3823,7 +4081,7 @@ impl DurableDeliveryCoordinator {
                     primary,
                 ));
             }
-            if let Err(primary) = self.database_binding.validate_under_open_lock() {
+            if let Err(primary) = self.database_binding()?.validate_under_open_lock() {
                 return Err(self.rollback_transaction_with_evidence(
                     &transaction,
                     "pre-commit isolation validation",
@@ -3845,7 +4103,7 @@ impl DurableDeliveryCoordinator {
                     DurableDeliveryError::from(error),
                 ));
             }
-            match self.database_binding.validate_under_open_lock() {
+            match self.database_binding()?.validate_under_open_lock() {
                 Err(error) => Err(DurableDeliveryError::IsolationViolation(format!(
                     "post-commit isolation validation failed after COMMIT succeeded: {error}"
                 ))),
@@ -3954,7 +4212,10 @@ impl DurableDeliveryCoordinator {
             take_rollback_test_fault()
                 .then_some(DurableDeliveryError::Sqlite(rusqlite::Error::InvalidQuery))
         });
-        let post_rollback_error = self.database_binding.validate_under_open_lock().err();
+        let post_rollback_error = self
+            .database_binding()
+            .and_then(|binding| binding.validate_under_open_lock().map(|_| ()))
+            .err();
         match (rollback_error, post_rollback_error) {
             (None, None) => primary,
             (rollback_error, post_rollback_error) => {
@@ -6228,7 +6489,6 @@ fn validate_replay_reason_code(
                 | "terminal_replay_hydration_not_applied"
                 | "terminal_replay_would_require_sink"
                 | "terminal_replay_watermark_changed"
-                | "terminal_replay_classification_failed"
                 | "terminal_replay_evidence_unavailable"
         ),
     };

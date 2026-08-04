@@ -14,7 +14,9 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 
-use stock_analysis::data_provider::DataFetcherManager;
+use stock_analysis::data_gateway::HistoricalBarsGateway;
+use stock_analysis::data_provider::KlineData;
+use stock_analysis::database::DatabaseManager;
 use stock_analysis::strategy::{detect_boll_macd_signal, BollMacdAction};
 
 #[derive(Debug, Clone)]
@@ -158,15 +160,22 @@ fn action_label(a: BollMacdAction) -> &'static str {
     }
 }
 
+fn locate_trade_slice(records: &[KlineData], buy_date: NaiveDate) -> Option<&[KlineData]> {
+    records
+        .iter()
+        .position(|bar| bar.date == buy_date)
+        .map(|index| &records[index..])
+}
+
 fn main() -> Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    let _guard = rt.enter();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    let db_path = std::env::var("STOCK_DB").ok().map(std::path::PathBuf::from);
+    DatabaseManager::init(db_path).map_err(|error| anyhow::anyhow!("DB init error: {error}"))?;
 
     let trades = parse_csv("reports/analysis/closed_positions_with_ai.csv")?;
     println!("📊 共加载 {} 笔已平仓交易\n", trades.len());
 
-    let manager = DataFetcherManager::new()?;
+    let gateway = HistoricalBarsGateway::new();
 
     let mut stats: BTreeMap<&'static str, ActionStats> = BTreeMap::new();
     let mut returns_by_action: BTreeMap<&'static str, Vec<f64>> = BTreeMap::new();
@@ -191,8 +200,8 @@ fn main() -> Result<()> {
             t.return_pct
         );
 
-        let data = match manager.get_daily_data(&t.code, need_days) {
-            Ok((d, _)) => d,
+        let batch = match gateway.required_daily_bars(&t.code, need_days) {
+            Ok(batch) => batch,
             Err(e) => {
                 println!("❌ 数据失败: {}", e);
                 data_failures += 1;
@@ -200,10 +209,10 @@ fn main() -> Result<()> {
             }
         };
 
-        // data 倒序：data[0] = 最新。找到 date == buy_date 的位置
-        let idx = data.iter().position(|k| k.date == t.buy_date);
-        let idx = match idx {
-            Some(i) => i,
+        // records 倒序：records[0] = 最新。找到 date == buy_date 后，
+        // 保留 admitted batch，以便结果始终可追溯到同一 source/batch_id。
+        let slice = match locate_trade_slice(batch.records(), t.buy_date) {
+            Some(slice) => slice,
             None => {
                 println!("⚠️  无 {} 当日数据", t.buy_date);
                 date_misses += 1;
@@ -211,8 +220,6 @@ fn main() -> Result<()> {
             }
         };
 
-        // 切片：[buy_date, ..., 最早]，模拟买入日当日的视角
-        let slice = &data[idx..];
         if slice.len() < 35 {
             println!("⚠️  历史不足 {} < 35", slice.len());
             continue;
@@ -236,8 +243,15 @@ fn main() -> Result<()> {
         ));
 
         println!(
-            "{} (DIF={:.3} hist={:+.3} bw={:.1}% Δbw={:+.1}%)",
-            label, sig.macd_dif, sig.macd_hist, sig.band_width_pct, sig.band_change_pct
+            "{} (DIF={:.3} hist={:+.3} bw={:.1}% Δbw={:+.1}% source={} provider={:?} batch_id={})",
+            label,
+            sig.macd_dif,
+            sig.macd_hist,
+            sig.band_width_pct,
+            sig.band_change_pct,
+            batch.evidence().source,
+            batch.evidence().provider,
+            batch.evidence().batch_id,
         );
     }
 
@@ -321,4 +335,60 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::locate_trade_slice;
+    use chrono::NaiveDate;
+    use stock_analysis::data_provider::{AdjustType, KlineData};
+
+    fn kline(date: &str) -> KlineData {
+        KlineData {
+            date: NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
+            open: 10.0,
+            high: 10.5,
+            low: 9.8,
+            close: 10.2,
+            volume: 100.0,
+            amount: 1_020.0,
+            pct_chg: 2.0,
+            intraday_price: None,
+            settled: true,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            eps: None,
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
+            is_limit_up: false,
+            is_limit_down: false,
+            is_suspended: false,
+            adjust: AdjustType::None,
+        }
+    }
+
+    #[test]
+    fn trade_slice_keeps_the_admitted_batch_evidence() {
+        let records = vec![
+            kline("2026-07-24"),
+            kline("2026-07-23"),
+            kline("2026-07-22"),
+        ];
+
+        let slice =
+            locate_trade_slice(&records, NaiveDate::from_ymd_opt(2026, 7, 23).unwrap()).unwrap();
+        assert_eq!(slice.len(), 2);
+        assert_eq!(slice[0].date.to_string(), "2026-07-23");
+    }
 }

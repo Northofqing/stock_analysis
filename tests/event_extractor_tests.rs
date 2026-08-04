@@ -1,5 +1,16 @@
 use stock_analysis::opportunity::event_extractor::adapter::*;
-use stock_analysis::search_service::{NewsType, SearchResult, Sentiment};
+use stock_analysis::search_service::{NewsType, SearchEvidence, SearchResult, Sentiment};
+
+fn governed_evidence() -> SearchEvidence {
+    SearchEvidence::GovernedSourceFact {
+        provider: "TEST_CODE_provider".into(),
+        source: "TEST_CODE_source".into(),
+        observed_at: "2026-06-27T10:31:00+08:00".into(),
+        source_at: "2026-06-27T10:30:00+08:00".into(),
+        batch_id: "TEST_CODE_batch".into(),
+        item_id: "TEST_CODE_item".into(),
+    }
+}
 
 fn minimal_sr() -> SearchResult {
     SearchResult {
@@ -13,6 +24,7 @@ fn minimal_sr() -> SearchResult {
         importance: 0,
         relevance: 0.0,
         keywords: vec![],
+        evidence: governed_evidence(),
     }
 }
 
@@ -29,6 +41,7 @@ fn test_adapter_search_result_to_raw() {
         importance: 8,
         relevance: 0.9,
         keywords: vec![],
+        evidence: governed_evidence(),
     };
     let raw = SearchResultAdapter::to_raw(&sr).unwrap();
     assert_eq!(raw.title, "CO2激光突破");
@@ -183,7 +196,36 @@ fn search_result(title: &str, date: &str) -> SearchResult {
         importance: 0,
         relevance: 0.0,
         keywords: vec![],
+        evidence: governed_evidence(),
     }
+}
+
+#[test]
+fn test_adapter_research_only_result_fails_closed() {
+    let mut sr = minimal_sr();
+    sr.title = "通用网页研究结果".into();
+    sr.source = "Bocha".into();
+    sr.evidence = SearchEvidence::ResearchOnly {
+        provider: stock_analysis::data_gateway::GeneralWebResearchProvider::Bocha,
+        source: "bocha-general-web".into(),
+        observed_at: "2026-06-27T10:31:00Z".into(),
+        batch_id: "TEST_CODE_research_batch".into(),
+        item_id: "TEST_CODE_research_item".into(),
+        publication_quality:
+            stock_analysis::data_gateway::PublicationTimeQuality::ExactProviderTime,
+    };
+    let error = SearchResultAdapter::to_raw(&sr).unwrap_err();
+    assert!(error.contains("E_RESEARCH_ONLY"));
+}
+
+#[test]
+fn test_adapter_unverified_result_fails_closed() {
+    let mut sr = minimal_sr();
+    sr.title = "无证据结果".into();
+    sr.source = "unknown".into();
+    sr.evidence = SearchEvidence::Unverified;
+    let error = SearchResultAdapter::to_raw(&sr).unwrap_err();
+    assert!(error.contains("E_UNVERIFIED_SOURCE_FACT"));
 }
 
 #[test]

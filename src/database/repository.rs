@@ -109,11 +109,11 @@ impl StockRepository for DatabaseManager {
             .into_iter()
             .map(stock_daily_to_kline)
             .collect::<Result<_, _>>()?;
-        crate::data_provider::validate_kline_series_strict(&mut data, code).map_err(|error| {
-            DbError::QueryFailed {
+        crate::monitor::data_quality::validate_daily_kline_quality(&mut data, code).map_err(
+            |error| DbError::QueryFailed {
                 sql: format!("validate stock_daily({code}): {error}"),
-            }
-        })?;
+            },
+        )?;
         Ok(data)
     }
 
@@ -268,7 +268,7 @@ mod tests {
 
         // 使用 TEST_ 前缀代码与真实标的硬隔离（AGENTS.md 2.5）
         let code = unique_code("KLINE");
-        let d = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+        let d = NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
         let saved = StockRepository::save_kline(db, &code, &[make_kline(d, 12.34)])
             .await
             .expect("save_kline 应成功");

@@ -1,5 +1,5 @@
-//! Registered business rules: BR-046, BR-134.
-//! v16.3 Commit 4a — 4 铁律 + 1 bonus 接入 paper_trade 卖出路径.
+//! Registered business rules: BR-046, BR-134, BR-211.
+//! v16.3 legacy 4 铁律卖出实现（BR-211 后仅测试编译）。
 //!
 //! 业务: position_tracker::track_position 已实现 4 铁律
 //! (StopLoss/TakeProfit/TimeExit/BollingTop)，但只写 analysis_result 表，
@@ -14,21 +14,28 @@
 //! (主循环在 main.rs 调 track_position 已有, 写 analysis_result)
 //! → paper_engine 只读 analysis_result, 0 调 track_position, 0 重造 4 铁律
 
-use crate::data_provider::DataProvider;
+use crate::trading::paper_trade::PaperRiskContext;
+
+#[cfg(test)]
 use crate::database::DatabaseManager;
-use crate::trading::paper_trade::{self, Direction, PaperRiskContext, PaperSignal};
+#[cfg(test)]
+use crate::trading::paper_trade::{self, Direction, PaperSignal};
+#[cfg(test)]
 use chrono::{Local, Timelike};
+#[cfg(test)]
 use diesel::prelude::*;
+#[cfg(test)]
 use std::collections::{HashMap, VecDeque};
 
 /// 单个 active paper position 卖出检查输入
 #[derive(Debug, Clone)]
-pub struct PaperPositionSellCheck {
+#[cfg(test)]
+struct PaperPositionSellCheck {
     pub code: String,
     pub name: String,
     pub avg_cost: f64,
     pub quantity: u32,
-    /// 当前市价来自实时 provider；收盘后允许使用已验证日收盘价。
+    /// 当前市价仅来自符合实时 freshness contract 的 provider。
     pub current_price: f64,
     pub limit_up_price: f64,
     pub limit_down_price: f64,
@@ -36,7 +43,8 @@ pub struct PaperPositionSellCheck {
 }
 
 /// 4 铁律检查结果
-pub struct SellDecision {
+#[cfg(test)]
+struct SellDecision {
     pub code: String,
     pub name: String,
     pub reason: String,
@@ -50,6 +58,7 @@ pub struct SellDecision {
 }
 
 #[derive(diesel::QueryableByName, Debug)]
+#[cfg(test)]
 struct FilledTradeRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     id: i64,
@@ -68,12 +77,14 @@ struct FilledTradeRow {
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 struct OpenLot {
     quantity: u32,
     price: f64,
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 struct OpenPositionState {
     name: String,
     lots: VecDeque<OpenLot>,
@@ -81,7 +92,8 @@ struct OpenPositionState {
 
 /// BR-134: 从已成交 paper ledger 按 `(ts,id)` 做数量感知 FIFO，重建未平仓持仓。
 /// 任一坏行或超卖都拒绝整个批次；禁止汇总 SQL 用 0 或部分行掩盖坏证据。
-pub fn load_open_positions() -> Result<Vec<PaperPositionSellCheck>, String> {
+#[cfg(test)]
+fn load_open_positions() -> Result<Vec<PaperPositionSellCheck>, String> {
     let mut conn = DatabaseManager::get()
         .get_conn()
         .map_err(|e| format!("DB 连接失败: {}", e))?;
@@ -186,15 +198,10 @@ pub fn load_open_positions() -> Result<Vec<PaperPositionSellCheck>, String> {
         let quote = match crate::broker::execution_quote(&code) {
             Ok(quote) => quote,
             Err(realtime_error) if chrono::Local::now().hour() >= 15 => {
-                match load_latest_daily_close_quote(&code, &state.name) {
-                    Ok(quote) => quote,
-                    Err(close_error) => {
-                        log::warn!(
-                            "[BR-154] paper position {code} isolated after-close: realtime={realtime_error}; daily_close={close_error}"
-                        );
-                        continue;
-                    }
-                }
+                log::warn!(
+                    "[BR-154] paper position {code} isolated after-close: realtime={realtime_error}; SettledDaily capability_unavailable: settled daily PaperTrade capability_unavailable"
+                );
+                continue;
             }
             Err(error) => {
                 return Err(format!("paper position {code} quote unavailable: {error}"));
@@ -215,63 +222,9 @@ pub fn load_open_positions() -> Result<Vec<PaperPositionSellCheck>, String> {
     Ok(positions)
 }
 
-/// BR-151: after the market closes, a paper-only exit may use the latest
-/// validated daily close when realtime execution quotes are unavailable.
-/// This never supplies a real-account quote or creates a broker order.
-fn load_latest_daily_close_quote(
-    code: &str,
-    name: &str,
-) -> Result<crate::broker::ExecutionQuote, String> {
-    #[derive(diesel::QueryableByName)]
-    struct DailyCloseRow {
-        #[diesel(sql_type = diesel::sql_types::Double)]
-        close: f64,
-    }
-    let mut conn = DatabaseManager::get()
-        .get_conn()
-        .map_err(|error| format!("daily close DB connection failed: {error}"))?;
-    let rows: Vec<DailyCloseRow> = diesel::sql_query(
-        "SELECT close FROM stock_daily WHERE code=? AND close>0 ORDER BY date DESC LIMIT 2",
-    )
-    .bind::<diesel::sql_types::Text, _>(code)
-    .load(&mut conn)
-    .map_err(|error| format!("daily close query failed: {error}"))?;
-    let mut close = rows
-        .first()
-        .map(|row| row.close)
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .ok_or_else(|| "validated daily close missing".to_string());
-    let mut prev_close = rows.get(1).map(|row| row.close);
-    if close.is_err() {
-        let provider = crate::data_provider::MagicTdxProvider::new()
-            .map_err(|error| format!("magic TDX initialization failed: {error}"))?;
-        let bars = provider
-            .get_daily_data(code, 2)
-            .map_err(|error| format!("magic TDX daily close unavailable: {error}"))?;
-        close = bars
-            .first()
-            .map(|bar| bar.close)
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .ok_or_else(|| "validated daily close missing".to_string());
-        prev_close = bars.get(1).map(|bar| bar.close);
-    }
-    let close = close?;
-    let prev_close = prev_close.unwrap_or(close);
-    let limits = crate::data_provider::limit_status::LimitStatusCalculator::new()
-        .calculate(code, prev_close, name);
-    log::warn!(
-        "[BR-151] paper position {code} realtime quote unavailable; using validated daily close={close}"
-    );
-    Ok(crate::broker::ExecutionQuote {
-        price: close,
-        limit_down_price: limits.limit_down_price,
-        limit_up_price: limits.limit_up_price,
-        observed_at: chrono::Utc::now(),
-    })
-}
-
 /// 4 铁律检查入口 — 读 analysis_result 表 (由 position_tracker::track_position 写)
-pub fn check_4_iron_rules(checks: &[PaperPositionSellCheck]) -> Result<Vec<SellDecision>, String> {
+#[cfg(test)]
+fn check_4_iron_rules(checks: &[PaperPositionSellCheck]) -> Result<Vec<SellDecision>, String> {
     // Fix review (HIGH): 真正 1 SQL batch (diesel 0.5 不支持 Vec bind, 用 format! 拼接 + escape)
     // 原始 50 持仓 → 50 次 SQL; 优化后 50 持仓 → 1 次 SQL (50 IN clause)
     use std::collections::HashMap;
@@ -335,6 +288,7 @@ pub fn check_4_iron_rules(checks: &[PaperPositionSellCheck]) -> Result<Vec<SellD
     Ok(decisions)
 }
 
+#[cfg(test)]
 fn quote_sql_code(code: &str) -> String {
     format!("'{}'", code.replace('\'', "''"))
 }
@@ -343,10 +297,8 @@ fn quote_sql_code(code: &str) -> String {
 ///
 /// Fix 3: SellDecision 加 quantity 字段, 不再硬编码 100
 /// Price is the validated realtime quote captured by `load_open_positions`.
-pub fn emit_sell_signal(
-    decision: &SellDecision,
-    risk_context: PaperRiskContext,
-) -> Result<(), String> {
+#[cfg(test)]
+fn emit_sell_signal(decision: &SellDecision, risk_context: PaperRiskContext) -> Result<(), String> {
     let now = Local::now();
     let effective_price = decision.current_price;
     let signal = PaperSignal {
@@ -415,6 +367,7 @@ pub fn emit_sell_signal(
 /// A rejected/non-filled attempt may create an order event, but it must never
 /// masquerade as an execution. Duplicate `INSERT OR IGNORE` outcomes publish
 /// nothing because no new paper-trade fact was committed.
+#[cfg(test)]
 fn paper_trading_events(
     decision: &SellDecision,
     outcome: &paper_trade::PaperOutcome,
@@ -446,29 +399,18 @@ fn paper_trading_events(
     Ok(events)
 }
 
-/// One complete four-iron-rule attempt. The caller may advance its success
-/// debounce only when this function returns `Ok`.
-pub fn run_once(risk_context: PaperRiskContext) -> Result<usize, String> {
-    let checks = load_open_positions()?;
-    let decisions = check_4_iron_rules(&checks)?;
-    let count = decisions.len();
-    let mut failures = Vec::new();
-    for decision in &decisions {
-        if let Err(error) = emit_sell_signal(decision, risk_context) {
-            failures.push(format!("{}: {error}", decision.code));
-        }
-    }
-    if !failures.is_empty() {
-        return Err(format!(
-            "BR-134 paper exit batch had {} failed attempt(s): {}",
-            failures.len(),
-            failures.join("; ")
-        ));
-    }
-    Ok(count)
+/// BR-211 fail-closed compatibility shim.
+///
+/// The legacy owner cannot establish the BR-201 guarded session or consume the
+/// BR-205 source-backed daily price-limit state. It must therefore fail before
+/// database, provider, order, outbox, or sink I/O. The public signature remains
+/// stable while callers migrate to the guarded owner.
+pub fn run_once(_risk_context: PaperRiskContext) -> Result<usize, String> {
+    Err("BR-201 legacy paper_engine::run_once disabled; guarded owner unavailable".to_string())
 }
 
 /// 判断 operation_advice 是否含 4 铁律关键词
+#[cfg(test)]
 fn is_iron_rule_triggered(advice: &str) -> bool {
     advice.contains("铁律")
         || advice.contains("止损")
@@ -478,6 +420,7 @@ fn is_iron_rule_triggered(advice: &str) -> bool {
 }
 
 /// 提取具体原因
+#[cfg(test)]
 fn extract_reason(advice: &str) -> String {
     if advice.contains("铁律1") {
         "铁律1:止损(-8%)".to_string()
@@ -511,9 +454,26 @@ mod tests {
         )
     }
 
+    #[test]
+    fn br211_run_once_fails_closed_before_legacy_paper_io() {
+        let risk_context = PaperRiskContext::new(
+            crate::risk::action_gate::AccountMode::Normal,
+            crate::monitor::data_mode::DataMode::Full,
+        );
+
+        let error = run_once(risk_context)
+            .expect_err("legacy paper owner must remain unavailable until BR-201 and BR-205");
+
+        assert_eq!(
+            error,
+            "BR-201 legacy paper_engine::run_once disabled; guarded owner unavailable"
+        );
+    }
+
     struct PaperEngineGuard {
         codes: Vec<String>,
         ledger_date: String,
+        _position_evidence: paper_trade::TestPositionEvidenceGuard,
     }
 
     impl Drop for PaperEngineGuard {
@@ -537,6 +497,21 @@ mod tests {
     fn prepare_account(codes: Vec<String>) -> PaperEngineGuard {
         DatabaseManager::init(None).expect("test database init");
         crate::broker::ensure_test_quote_provider();
+        let source_at = chrono::Utc::now().with_timezone(&chrono::Local);
+        let position_evidence = paper_trade::install_test_position_batch_evidence(
+            paper_trade::TestPositionBatchEvidence {
+                source: "TEST_CODE_broker_position_fixture".to_string(),
+                source_at,
+                observed_at: chrono::Utc::now(),
+                batch_id: format!(
+                    "TEST_CODE_paper_engine_{}",
+                    chrono::Utc::now()
+                        .timestamp_nanos_opt()
+                        .expect("test clock is representable in nanoseconds")
+                ),
+            },
+        )
+        .expect("install isolated TEST_CODE broker-position evidence");
         let ledger_date = Local::now().date_naive().to_string();
         let mut conn = DatabaseManager::get()
             .get_conn()
@@ -559,7 +534,11 @@ mod tests {
         )
         .execute(&mut conn)
         .expect("refresh test position evidence");
-        PaperEngineGuard { codes, ledger_date }
+        PaperEngineGuard {
+            codes,
+            ledger_date,
+            _position_evidence: position_evidence,
+        }
     }
 
     #[test]
@@ -663,6 +642,7 @@ mod tests {
                 not_fill_reason: Some("跌停不可卖".to_string()),
             },
             inserted: true,
+            terminal_receipt: None,
         };
         let events = paper_trading_events(
             &decision,
@@ -704,6 +684,7 @@ mod tests {
                 not_fill_reason: None,
             },
             inserted: true,
+            terminal_receipt: None,
         };
         let events = paper_trading_events(
             &decision,
@@ -730,6 +711,7 @@ mod tests {
                 not_fill_reason: None,
             },
             inserted: true,
+            terminal_receipt: None,
         };
         assert!(paper_trading_events(
             &decision,
@@ -739,6 +721,27 @@ mod tests {
             "execution-missing".to_string(),
         )
         .is_err());
+
+        for invalid_fill in [0.0, -0.01, f64::NAN, f64::INFINITY] {
+            let invalid = paper_trade::PaperOutcome {
+                result: paper_trade::PaperResult {
+                    status: paper_trade::PaperTradeStatus::Filled,
+                    fill_price: Some(invalid_fill),
+                    not_fill_reason: None,
+                },
+                inserted: true,
+                terminal_receipt: None,
+            };
+            let error = paper_trading_events(
+                &decision,
+                &invalid,
+                "decision-invalid".to_string(),
+                "order-invalid".to_string(),
+                "execution-invalid".to_string(),
+            )
+            .expect_err("invalid persisted fill must never become an execution");
+            assert!(error.contains("missing fill_price"), "{error}");
+        }
     }
 
     #[test]

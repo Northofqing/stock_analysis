@@ -1,405 +1,370 @@
-//! limit_up（从 market_analyzer.rs 拆分）
+//! Registered business rule: BR-213.
+//! Evidence-preserving upper-limit market projection.
 
-use anyhow::Result;
-use log::info;
-use serde_json::Value;
-use std::time::Duration;
+use anyhow::{bail, Result};
+use magic_market_core::{LimitPoolEntry, LimitPoolKind, RatioUnit};
+
+use crate::data_gateway::market_data::{AdmittedRealtimeQuotes, MarketDataGateway};
+use crate::data_gateway::{BatchEvidence, GatewayBatch, GatewayError, ReviewDataGateway};
+use crate::market_data::TopStock;
 
 use super::MarketAnalyzer;
 
-impl MarketAnalyzer {
-    /// 通过新浪API按涨幅排序获取涨停股票（作为东方财富API的备用）
-    pub(super) fn get_limit_up_from_sina(&self) -> Result<Vec<crate::market_data::TopStock>> {
-        use crate::market_data::TopStock;
+/// A verified-empty limit-pool response cannot carry quote evidence because no
+/// quote request is permitted for that state.
+#[derive(Debug)]
+pub(crate) enum LimitUpStockBatch {
+    Available {
+        stocks: Vec<TopStock>,
+        limit_pool_evidence: BatchEvidence,
+        quote_evidence: BatchEvidence,
+    },
+    VerifiedEmpty {
+        limit_pool_evidence: BatchEvidence,
+    },
+}
 
-        let url = "http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData";
-        let mut stocks = Vec::new();
-
-        // 按涨幅倒序，每页200条，翻页到涨幅低于4.85%（ST涨停阈值下限）为止
-        for page in 1..=5 {
-            let page_str = page.to_string();
-            let params = [
-                ("page", page_str.as_str()),
-                ("num", "200"),
-                ("sort", "changepercent"),
-                ("asc", "0"), // 降序
-                ("node", "hs_a"),
-                ("symbol", ""),
-                ("_s_r_a", "page"),
-            ];
-
-            let response = self
-                .client
-                .get(url)
-                .query(&params)
-                .header(
-                    "User-Agent",
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-                )
-                .timeout(Duration::from_secs(15))
-                .send();
-
-            let response =
-                response.map_err(|e| anyhow::anyhow!("新浪 API 第{page}页请求失败: {e}"))?;
-
-            let text = response
-                .text()
-                .map_err(|e| anyhow::anyhow!("新浪 API 第{page}页读取失败: {e}"))?;
-
-            let json: Value = serde_json::from_str(&text)
-                .map_err(|e| anyhow::anyhow!("新浪 API 第{page}页 JSON 解析失败: {e}"))?;
-
-            let items = match json.as_array() {
-                Some(arr) if !arr.is_empty() => arr,
-                _ => break,
-            };
-
-            let mut min_pct = f64::MAX;
-
-            for (row_index, item) in items.iter().enumerate() {
-                let change_pct = item
-                    .get("changepercent")
-                    .and_then(|v| v.as_f64())
-                    .filter(|value| value.is_finite())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "新浪涨停榜第{page}页第{}行 changepercent 缺失/非法",
-                            row_index + 1
-                        )
-                    })?;
-                let stock_name = item
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("新浪涨停榜第{page}页第{}行缺少 name", row_index + 1)
-                    })?;
-                let raw_code = item
-                    .get("symbol")
-                    .and_then(|v| v.as_str())
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("新浪涨停榜第{page}页第{}行缺少 symbol", row_index + 1)
-                    })?;
-                let code = raw_code
-                    .trim_start_matches("sh")
-                    .trim_start_matches("sz")
-                    .trim_start_matches("bj");
-                let limit_pct = Self::get_limit_pct(code, stock_name);
-                if change_pct.abs() > limit_pct {
-                    log::warn!(
-                        "[DQ-2.3] 新浪涨停榜 {code}({stock_name}) changepercent={change_pct}% 超过常规板块±{limit_pct}%，保留真实值并标记需人工确认"
-                    );
-                }
-                let price = item
-                    .get("trade")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .filter(|value| value.is_finite() && *value > 0.0)
-                    .ok_or_else(|| anyhow::anyhow!("新浪涨停榜 {code} trade 缺失/非法"))?;
-
-                if change_pct < min_pct {
-                    min_pct = change_pct;
-                }
-
-                // 过滤ST股票
-                if crate::data_provider::limit_status::is_st_stock(stock_name) {
-                    continue;
-                }
-                // 过滤北交所
-                if code.starts_with("8") || code.starts_with("4") || code.starts_with("9") {
-                    continue;
-                }
-
-                let limit_pct = Self::get_limit_pct(code, stock_name);
-                if change_pct >= limit_pct - 0.15 {
-                    stocks.push(TopStock {
-                        code: code.to_string(),
-                        name: stock_name.to_string(),
-                        change_pct,
-                        price,
-                        volume_ratio: None, // 新浪API无此字段
-                        main_net_yi: None,
-                    });
-                }
-            }
-
-            // 本页最低涨幅低于ST涨停阈值(5%)，不用继续翻页
-            if min_pct < 4.85 {
-                break;
-            }
+impl LimitUpStockBatch {
+    fn into_stocks(self) -> Vec<TopStock> {
+        match self {
+            Self::Available { stocks, .. } => stocks,
+            Self::VerifiedEmpty { .. } => Vec::new(),
         }
+    }
+}
 
-        info!(
-            "[大盘] 新浪API发现 {} 只涨停股票（已排除ST/北交所）",
-            stocks.len()
+fn compose_limit_up_batch<LoadQuotes>(
+    limit_pool: GatewayBatch<LimitPoolEntry>,
+    load_quotes: LoadQuotes,
+) -> Result<LimitUpStockBatch>
+where
+    LoadQuotes: FnOnce(&[String]) -> std::result::Result<AdmittedRealtimeQuotes, GatewayError>,
+{
+    let (records, limit_pool_evidence) = match limit_pool {
+        GatewayBatch::VerifiedEmpty(limit_pool_evidence) => {
+            return Ok(LimitUpStockBatch::VerifiedEmpty {
+                limit_pool_evidence,
+            });
+        }
+        GatewayBatch::Available { records, evidence } if records.is_empty() => {
+            bail!(
+                "BR-213 invalid available upper-limit batch: source={} batch_id={} records=0",
+                evidence.source,
+                evidence.batch_id
+            );
+        }
+        GatewayBatch::Available { records, evidence } => (records, evidence),
+    };
+
+    let mut requested_codes = Vec::with_capacity(records.len());
+    let mut limit_codes = std::collections::BTreeSet::new();
+    for record in &records {
+        let code = record.instrument.code().to_owned();
+        if record.kind != LimitPoolKind::Upper
+            || record.evidence.provider() != limit_pool_evidence.provider
+            || record.evidence.batch_id() != limit_pool_evidence.batch_id
+            || record.evidence.source_at() != limit_pool_evidence.source_at.as_deref()
+            || record.evidence.observed_at() != limit_pool_evidence.observed_at
+        {
+            bail!("BR-213 limit-pool record evidence mismatch for {code}");
+        }
+        if !limit_codes.insert(code.clone()) {
+            bail!("BR-213 duplicate limit-pool security {code}");
+        }
+        requested_codes.push(code);
+    }
+
+    let quotes = load_quotes(&requested_codes)?;
+    let quote_evidence = quotes.evidence().clone();
+    let mut quote_by_code = std::collections::BTreeMap::new();
+    for quote in quotes.quotes() {
+        if quote.evidence() != &quote_evidence {
+            bail!("BR-213 quote record evidence mismatch for {}", quote.code());
+        }
+        if quote_by_code
+            .insert(quote.code().to_owned(), quote)
+            .is_some()
+        {
+            bail!("BR-213 duplicate realtime quote security {}", quote.code());
+        }
+    }
+    let quote_codes = quote_by_code
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if quote_codes != limit_codes {
+        bail!(
+            "BR-213 exact-code join mismatch limit_codes={limit_codes:?} quote_codes={quote_codes:?}"
         );
-        Ok(stocks)
     }
 
-    /// 通过东方财富push2 API获取当日涨停股票
-    /// 按涨幅降序分页获取，根据各板块涨跌停阈值筛选真正涨停的
-    /// - 主板(10%) / 创业板+科创板(20%) / ST(5%) / 北交所(30%)
-    pub(super) fn get_limit_up_from_eastmoney(&self) -> Result<Vec<crate::market_data::TopStock>> {
-        use crate::market_data::TopStock;
-
-        // 多主机轮询（与 sector_monitor 一致，解决单主机 RST/断流）
-        const PUSH2_HOSTS: &[&str] = &[
-            "push2delay.eastmoney.com",
-            "push2.eastmoney.com",
-            "82.push2.eastmoney.com",
-        ];
-        let mut stocks = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-
-        for page in 1..=5 {
-            let page_str = page.to_string();
-            let params = [
-                ("pn", page_str.as_str()),
-                ("pz", "100"),
-                ("po", "1"),
-                ("np", "1"),
-                ("ut", "bd1d9ddb04089700cf9c27f6f7426281"),
-                ("fltt", "2"),
-                ("invt", "2"),
-                ("fid", "f3"),
-                ("fs", "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"),
-                ("fields", "f2,f3,f10,f12,f14,f62"),
-            ];
-
-            let mut json: Option<Value> = None;
-            for host in PUSH2_HOSTS {
-                let url = format!("https://{}/api/qt/clist/get", host);
-                let resp = self
-                    .client
-                    .get(&url)
-                    .query(&params)
-                    .header(
-                        "User-Agent",
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-                    )
-                    .header("Referer", "https://quote.eastmoney.com/")
-                    .timeout(Duration::from_secs(10))
-                    .send();
-                match resp.and_then(|r| r.text()) {
-                    Ok(t) => match serde_json::from_str::<Value>(&t) {
-                        Ok(j) if j.get("data").is_some() => {
-                            json = Some(j);
-                            break;
-                        }
-                        _ => continue,
-                    },
-                    Err(_) => continue,
-                }
-            }
-            let json = match json {
-                Some(j) => j,
-                None => return Err(anyhow::anyhow!("东方财富push2 API所有主机请求失败")),
-            };
-
-            let diff = match json
-                .get("data")
-                .and_then(|d| d.get("diff"))
-                .and_then(|d| d.as_array())
-            {
-                Some(arr) if !arr.is_empty() => arr,
-                _ => break,
-            };
-
-            let mut min_pct = f64::MAX;
-            for (row_index, item) in diff.iter().enumerate() {
-                let code = item
-                    .get("f12")
-                    .and_then(|v| v.as_str())
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("东财涨停榜第{page}页第{}行缺少 code", row_index + 1)
-                    })?;
-                let name = item
-                    .get("f14")
-                    .and_then(|v| v.as_str())
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("东财涨停榜 {code} 缺少 name"))?;
-                let change_pct = item
-                    .get("f3")
-                    .and_then(|v| v.as_f64())
-                    .filter(|value| value.is_finite())
-                    .ok_or_else(|| anyhow::anyhow!("东财涨停榜 {code} change_pct 缺失/非法"))?;
-                let limit_pct = Self::get_limit_pct(code, name);
-                if change_pct.abs() > limit_pct {
-                    log::warn!(
-                        "[DQ-2.3] 东财涨停榜 {code}({name}) change_pct={change_pct}% 超过常规板块±{limit_pct}%，保留真实值并标记需人工确认"
-                    );
-                }
-                let price = item
-                    .get("f2")
-                    .and_then(|v| v.as_f64())
-                    .filter(|value| value.is_finite() && *value > 0.0)
-                    .ok_or_else(|| anyhow::anyhow!("东财涨停榜 {code} price 缺失/非法"))?;
-                let volume_ratio = item
-                    .get("f10")
-                    .and_then(|v| v.as_f64())
-                    .filter(|value| value.is_finite() && *value >= 0.0);
-                let main_net_yi = item
-                    .get("f62")
-                    .and_then(|v| v.as_f64())
-                    .filter(|value| value.is_finite())
-                    .map(|value| value / 1e8);
-
-                if change_pct < min_pct {
-                    min_pct = change_pct;
-                }
-
-                if seen.contains(code) {
-                    continue;
-                }
-
-                // 过滤ST股票
-                if crate::data_provider::limit_status::is_st_stock(name) {
-                    continue;
-                }
-                // 过滤北交所 (8xxxx/4xxxx/9xxxx开头)
-                if code.starts_with("8") || code.starts_with("4") || code.starts_with("9") {
-                    continue;
-                }
-
-                let limit_pct = Self::get_limit_pct(code, name);
-                if change_pct < limit_pct - 0.15 {
-                    continue;
-                }
-
-                seen.insert(code.to_string());
-                stocks.push(TopStock {
-                    code: code.to_string(),
-                    name: name.to_string(),
-                    change_pct,
-                    price,
-                    volume_ratio,
-                    main_net_yi,
-                });
-            }
-
-            // 本页最低涨幅已低于ST涨停阈值(5%)，无需继续翻页
-            if min_pct < 4.85 {
-                break;
-            }
+    let mut stocks = Vec::with_capacity(records.len());
+    for record in records {
+        let code = record.instrument.code().to_owned();
+        if record.change.unit() != RatioUnit::Percent {
+            bail!("BR-213 upper-limit change unit mismatch for {code}");
         }
-
-        Ok(stocks)
+        let quote = quote_by_code
+            .get(&code)
+            .ok_or_else(|| anyhow::anyhow!("BR-213 missing realtime quote for {code}"))?;
+        stocks.push(TopStock {
+            code,
+            name: quote.name().to_owned(),
+            change_pct: record.change.get(),
+            price: record.price.get(),
+            volume_ratio: None,
+            main_net_yi: None,
+        });
     }
 
-    /// 根据股票代码和名称获取涨跌停幅度限制
-    ///
-    /// 修复 P2.2: 增加新股上市前 5 日识别
-    /// - ST 股票: 5%
-    /// - 创业板 (30xxxx): 20%
-    /// - 科创板 (688xxx): 20%
-    /// - 北交所 (8xxxxx/4xxxxx): 30%
-    /// - 主板 (60xxxx/00xxxx): 10%
-    ///
-    /// 新股前 5 个交易日（注册制创业板/科创板/北交所）不设涨跌幅。
-    /// 调用方需在 list 业务里检查并特殊处理。
-    pub(super) fn get_limit_pct(code: &str, name: &str) -> f64 {
-        if crate::data_provider::limit_status::is_st_stock(name) {
-            5.0
-        } else if code.starts_with("30") || code.starts_with("688") {
-            20.0
-        } else if code.starts_with("8") || code.starts_with("4") {
-            30.0
-        } else {
-            10.0
+    Ok(LimitUpStockBatch::Available {
+        stocks,
+        limit_pool_evidence,
+        quote_evidence,
+    })
+}
+
+impl MarketAnalyzer {
+    /// Return current-session upper-limit membership. Limit-pool facts remain
+    /// authoritative; the quote batch contributes the display name only.
+    pub(super) fn get_limit_up_from_gateway(
+        &self,
+        trading_date: chrono::NaiveDate,
+    ) -> Result<Vec<TopStock>> {
+        let limit_pool = ReviewDataGateway::new().current_upper_limit_pool(trading_date)?;
+        let batch = compose_limit_up_batch(limit_pool, |codes| {
+            MarketDataGateway::new().required_realtime_quotes(codes)
+        })?;
+        match &batch {
+            LimitUpStockBatch::Available {
+                stocks,
+                limit_pool_evidence,
+                quote_evidence,
+            } => {
+                let receipt = crate::data_gateway::review::audit_limit_up_projection(
+                    trading_date,
+                    limit_pool_evidence,
+                    quote_evidence,
+                    stocks.len(),
+                )?;
+                log::info!(
+                    "[DataGateway][BR-213] status=available date={} records={} limit_provider={:?} limit_batch={} quote_provider={:?} quote_batch={} composition_audit_id={} composition_record_hash={}",
+                    trading_date,
+                    stocks.len(),
+                    limit_pool_evidence.provider,
+                    limit_pool_evidence.batch_id,
+                    quote_evidence.provider,
+                    quote_evidence.batch_id,
+                    receipt.audit_id,
+                    receipt.record_hash
+                );
+            }
+            LimitUpStockBatch::VerifiedEmpty {
+                limit_pool_evidence,
+            } => log::info!(
+                "[DataGateway][BR-213] status=verified_empty date={} records=0 limit_provider={:?} limit_batch={} quote_request=not_called",
+                trading_date,
+                limit_pool_evidence.provider,
+                limit_pool_evidence.batch_id
+            ),
         }
+        Ok(batch.into_stocks())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
-    fn http_proxy_once(body: &'static str) -> (String, std::thread::JoinHandle<String>) {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 8192];
-            let n = stream.read(&mut request).unwrap();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-            String::from_utf8_lossy(&request[..n]).into_owned()
-        });
-        (format!("http://{addr}"), handle)
+    use chrono::Utc;
+    use magic_market_core::{
+        AssetClass, Exchange, InstrumentId, IsoDate, Price, ProviderId, Ratio, SourceEvidence,
+    };
+
+    use crate::data_gateway::market_data::{AdmittedRealtimeQuote, RealtimeMarketQuote};
+
+    const TEST_DATE: &str = "2099-01-02";
+    const TEST_OBSERVED_AT: &str = "2099-01-02T10:00:01+08:00";
+
+    fn evidence(provider: ProviderId, source: &str, batch_id: &str) -> BatchEvidence {
+        BatchEvidence {
+            provider,
+            source: source.to_owned(),
+            source_at: Some(TEST_DATE.to_owned()),
+            observed_at: TEST_OBSERVED_AT.to_owned(),
+            batch_id: batch_id.to_owned(),
+        }
     }
 
-    #[test]
-    #[serial_test::serial(http_proxy_env)]
-    fn sina_limit_up_transport_filters_registered_exclusions_and_rejects_bad_rows() {
-        let keys = [
-            "HTTP_PROXY",
-            "http_proxy",
-            "HTTPS_PROXY",
-            "https_proxy",
-            "ALL_PROXY",
-            "all_proxy",
-            "NO_PROXY",
-            "no_proxy",
-        ];
-        let previous: Vec<_> = keys
+    fn limit_entry(code: &str, batch_id: &str, price: f64, change: f64) -> LimitPoolEntry {
+        LimitPoolEntry {
+            kind: LimitPoolKind::Upper,
+            instrument: InstrumentId::new(Exchange::Shanghai, code, AssetClass::Equity).unwrap(),
+            trading_date: IsoDate::new(TEST_DATE).unwrap(),
+            price: Price::new(price).unwrap(),
+            change: Ratio::new(change, RatioUnit::Percent).unwrap(),
+            volume: None,
+            turnover: None,
+            sealed_amount: None,
+            first_seal_at: None,
+            last_seal_at: None,
+            break_count: None,
+            streak: None,
+            industry: None,
+            board_name: None,
+            seal_state: None,
+            reseal_count: None,
+            reason: None,
+            evidence: SourceEvidence::new(ProviderId::Eastmoney, TEST_OBSERVED_AT, batch_id)
+                .unwrap()
+                .with_source_at(TEST_DATE)
+                .unwrap(),
+        }
+    }
+
+    fn quote_batch(rows: &[(&str, &str)]) -> AdmittedRealtimeQuotes {
+        let now = Utc::now();
+        let batch_evidence = BatchEvidence {
+            provider: ProviderId::Tencent,
+            source: "TEST_CODE_quote".to_owned(),
+            source_at: Some(now.to_rfc3339()),
+            observed_at: now.to_rfc3339(),
+            batch_id: "TEST_CODE_quote_batch".to_owned(),
+        };
+        let quotes = rows
             .iter()
-            .map(|key| (*key, std::env::var_os(key)))
+            .map(|(code, name)| {
+                AdmittedRealtimeQuote::from_test_fixture(
+                    RealtimeMarketQuote {
+                        code: (*code).to_owned(),
+                        name: (*name).to_owned(),
+                        price: 10.0,
+                        previous_close: 9.0,
+                        change_percent: 11.11,
+                        source_at: now,
+                        observed_at: now,
+                        provider: ProviderId::Tencent,
+                        batch_id: "TEST_CODE_quote_batch".to_owned(),
+                    },
+                    batch_evidence.clone(),
+                )
+                .unwrap()
+            })
             .collect();
-        for key in keys {
-            std::env::remove_var(key);
-        }
+        AdmittedRealtimeQuotes::from_test_fixtures(quotes).unwrap()
+    }
 
-        let body = r#"[
-            {"symbol":"sh600000","name":"测试主板","changepercent":9.9,"trade":"10.50"},
-            {"symbol":"sh600001","name":"*ST测试","changepercent":5.0,"trade":"3.00"},
-            {"symbol":"bj920001","name":"北交所测试","changepercent":19.0,"trade":"20.00"},
-            {"symbol":"sz000002","name":"未涨停测试","changepercent":4.0,"trade":"8.00"}
-        ]"#;
-        let (proxy, request) = http_proxy_once(body);
-        std::env::set_var("HTTP_PROXY", &proxy);
-        std::env::set_var("http_proxy", &proxy);
-        let analyzer = MarketAnalyzer::new(None).unwrap();
-        let stocks = analyzer.get_limit_up_from_sina().unwrap();
-        assert_eq!(stocks.len(), 1);
-        assert_eq!(stocks[0].code, "600000");
-        assert!(request
-            .join()
-            .unwrap()
-            .contains("vip.stock.finance.sina.com.cn"));
-
-        let bad = r#"[{"symbol":"sh600000","changepercent":9.9,"trade":"10.50"}]"#;
-        let (proxy, request) = http_proxy_once(bad);
-        std::env::set_var("HTTP_PROXY", &proxy);
-        std::env::set_var("http_proxy", &proxy);
-        let analyzer = MarketAnalyzer::new(None).unwrap();
-        assert!(analyzer
-            .get_limit_up_from_sina()
-            .unwrap_err()
-            .to_string()
-            .contains("缺少 name"));
-        request.join().unwrap();
-
-        for (key, value) in previous {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
+    fn available_limit_pool(
+        records: Vec<LimitPoolEntry>,
+        batch_id: &str,
+    ) -> GatewayBatch<LimitPoolEntry> {
+        GatewayBatch::Available {
+            records,
+            evidence: evidence(ProviderId::Eastmoney, "TEST_CODE_limit_pool", batch_id),
         }
     }
 
     #[test]
-    fn limit_percent_covers_st_growth_star_bse_and_main_board() {
-        assert_eq!(MarketAnalyzer::get_limit_pct("600000", "*ST测试"), 5.0);
-        assert_eq!(MarketAnalyzer::get_limit_pct("300001", "创业板测试"), 20.0);
-        assert_eq!(MarketAnalyzer::get_limit_pct("688001", "科创板测试"), 20.0);
-        assert_eq!(MarketAnalyzer::get_limit_pct("830001", "北交所测试"), 30.0);
-        assert_eq!(MarketAnalyzer::get_limit_pct("600000", "主板测试"), 10.0);
+    fn br213_verified_empty_does_not_load_realtime_quotes() {
+        let quote_load_calls = Cell::new(0_u32);
+        let limit_pool_evidence = evidence(
+            ProviderId::Eastmoney,
+            "TEST_CODE_limit_pool",
+            "TEST_CODE_limit_empty",
+        );
+        let batch = compose_limit_up_batch(
+            GatewayBatch::VerifiedEmpty(limit_pool_evidence.clone()),
+            |_| -> std::result::Result<AdmittedRealtimeQuotes, GatewayError> {
+                quote_load_calls.set(quote_load_calls.get() + 1);
+                unreachable!("verified-empty limit pool must not request quotes")
+            },
+        )
+        .unwrap();
+
+        assert_eq!(quote_load_calls.get(), 0);
+        assert!(matches!(
+            batch,
+            LimitUpStockBatch::VerifiedEmpty { limit_pool_evidence: actual }
+                if actual == limit_pool_evidence
+        ));
+    }
+
+    #[test]
+    fn br213_available_batch_uses_pool_facts_and_quote_name_only() {
+        let batch_id = "TEST_CODE_limit_available";
+        let batch = compose_limit_up_batch(
+            available_limit_pool(
+                vec![limit_entry("TEST_CODE_600001", batch_id, 12.34, 10.0)],
+                batch_id,
+            ),
+            |_| Ok(quote_batch(&[("TEST_CODE_600001", "TEST_CODE Name")])),
+        )
+        .unwrap();
+        let LimitUpStockBatch::Available {
+            stocks,
+            limit_pool_evidence,
+            quote_evidence,
+        } = batch
+        else {
+            panic!("expected available batch")
+        };
+
+        assert_eq!(stocks.len(), 1);
+        assert_eq!(stocks[0].code, "TEST_CODE_600001");
+        assert_eq!(stocks[0].name, "TEST_CODE Name");
+        assert_eq!(stocks[0].price, 12.34);
+        assert_eq!(stocks[0].change_pct, 10.0);
+        assert_eq!(stocks[0].volume_ratio, None);
+        assert_eq!(stocks[0].main_net_yi, None);
+        assert_eq!(limit_pool_evidence.batch_id, batch_id);
+        assert_eq!(quote_evidence.batch_id, "TEST_CODE_quote_batch");
+    }
+
+    #[test]
+    fn br213_exact_code_join_rejects_missing_extra_and_duplicate_quotes() {
+        let batch_id = "TEST_CODE_limit_join";
+        let pool = || {
+            available_limit_pool(
+                vec![
+                    limit_entry("TEST_CODE_600001", batch_id, 10.0, 10.0),
+                    limit_entry("TEST_CODE_600002", batch_id, 20.0, 10.0),
+                ],
+                batch_id,
+            )
+        };
+
+        for rows in [
+            vec![("TEST_CODE_600001", "TEST_CODE One")],
+            vec![
+                ("TEST_CODE_600001", "TEST_CODE One"),
+                ("TEST_CODE_600002", "TEST_CODE Two"),
+                ("TEST_CODE_600003", "TEST_CODE Extra"),
+            ],
+            vec![
+                ("TEST_CODE_600001", "TEST_CODE One"),
+                ("TEST_CODE_600001", "TEST_CODE Duplicate"),
+            ],
+        ] {
+            assert!(compose_limit_up_batch(pool(), |_| Ok(quote_batch(&rows))).is_err());
+        }
+    }
+
+    #[test]
+    fn br213_rejects_limit_record_with_conflicting_observed_at() {
+        let batch_id = "TEST_CODE_limit_observed_at";
+        let mut record = limit_entry("TEST_CODE_600001", batch_id, 10.0, 10.0);
+        record.evidence =
+            SourceEvidence::new(ProviderId::Eastmoney, "2099-01-02T10:00:02+08:00", batch_id)
+                .unwrap()
+                .with_source_at(TEST_DATE)
+                .unwrap();
+
+        let error = compose_limit_up_batch(available_limit_pool(vec![record], batch_id), |_| {
+            Ok(quote_batch(&[("TEST_CODE_600001", "TEST_CODE Name")]))
+        })
+        .expect_err("conflicting record observed_at must reject the projection");
+
+        assert!(error.to_string().contains("record evidence mismatch"));
     }
 }

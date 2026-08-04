@@ -9,8 +9,8 @@
 
 use stock_analysis::opportunity::discover::Candidate;
 
-/// 修复 F15 (2026-06-29 BR-004): final_score 降序测试.
-/// 模拟 run_post_close_candidates 的 sort_by 逻辑, 验证排序正确性.
+/// 修复 F15 (2026-06-29 BR-004): 候选 final_score 降序纯函数测试。
+/// 旧 run_post_close_candidates consumer 已删除；本测试只保留排序契约。
 fn sort_by_final_score_and_push_time(
     mut candidates: Vec<(Candidate, f64)>,
 ) -> Vec<(Candidate, f64)> {

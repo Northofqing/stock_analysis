@@ -1,5 +1,14 @@
 # Remove Adjacent Daily-Change Threshold Implementation Plan
 
+> **Retired on 2026-07-27. Do not execute.** The current repository-wide
+> **Retired by BR-205 on 2026-08-04.** Do not execute this plan. The replacement
+> implementation plan is generated from
+> `docs/superpowers/specs/2026-08-04-source-backed-dynamic-price-limits-design.md`.
+>
+> Historical note: AGENTS.md 2.3 formerly required alert plus manual confirmation beyond ±20%. See
+> `docs/superpowers/specs/2026-07-27-security-lifecycle-and-manual-daily-change-confirmation-design.md`
+> and BR-171.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Remove percentage-based rejection of adjacent historical daily values while retaining structural, continuity, adjustment, source-evidence, and freshness validation.

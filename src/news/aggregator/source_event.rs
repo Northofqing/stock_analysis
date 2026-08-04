@@ -1,4 +1,4 @@
-//! Registered business rules: BR-137.
+//! Registered business rules: BR-137, BR-210.
 //! v17.7 Task 1: Normalized source event contracts
 //!
 //! Data contracts for six retained PushKinds (Announcement / PolicyHit /
@@ -6,8 +6,9 @@
 //! These types are consumed by the v17.7 adapter (Task 5) and downstream
 //! classifier tasks (Task 3 earnings, Task 4 analyst).
 
-use crate::signal::market_event::Direction;
+use crate::{data_gateway::parse_evidence_instant, signal::market_event::Direction};
 use chrono::{DateTime, Local, NaiveDate};
+use magic_market_core::ProviderId;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -37,9 +38,14 @@ pub enum NormalizedSourceError {
     CertaintyOutOfRange(u8),
     MissingPublishedDate,
     InvalidPublishedDate,
+    ResearchOnly,
+    UnverifiedSourceFact,
     Stale,
     FutureObservedAt,
     FuturePublishedDate,
+    MissingBatchEvidence,
+    InvalidBatchEvidence,
+    BatchEvidenceMismatch,
 }
 
 impl fmt::Display for NormalizedSourceError {
@@ -68,6 +74,12 @@ impl fmt::Display for NormalizedSourceError {
             NormalizedSourceError::InvalidPublishedDate => {
                 write!(f, "provider published date is invalid")
             }
+            NormalizedSourceError::ResearchOnly => {
+                write!(f, "research-only search result cannot become a source fact")
+            }
+            NormalizedSourceError::UnverifiedSourceFact => {
+                write!(f, "complete governed source-fact evidence is required")
+            }
             NormalizedSourceError::Stale => write!(f, "source event is stale"),
             NormalizedSourceError::FutureObservedAt => {
                 write!(f, "observed_at must not be in the future")
@@ -75,11 +87,90 @@ impl fmt::Display for NormalizedSourceError {
             NormalizedSourceError::FuturePublishedDate => {
                 write!(f, "provider published date must not be in the future")
             }
+            NormalizedSourceError::MissingBatchEvidence => {
+                write!(f, "complete admitted Gateway batch evidence is required")
+            }
+            NormalizedSourceError::InvalidBatchEvidence => {
+                write!(f, "admitted Gateway batch evidence is invalid")
+            }
+            NormalizedSourceError::BatchEvidenceMismatch => {
+                write!(f, "source event and admitted Gateway batch evidence differ")
+            }
         }
     }
 }
 
 impl std::error::Error for NormalizedSourceError {}
+
+/// Exact identity retained from one admitted Gateway batch.
+///
+/// `source_at` is provider-owned and intentionally optional. `observed_at` is
+/// the original Gateway acquisition timestamp string, not a timestamp created
+/// by the source-event adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceBatchEvidence {
+    pub provider: ProviderId,
+    pub source: String,
+    pub source_at: Option<String>,
+    pub observed_at: String,
+    pub batch_id: String,
+    pub content_sha256: String,
+}
+
+impl SourceBatchEvidence {
+    pub fn new(
+        provider: ProviderId,
+        source: String,
+        source_at: Option<String>,
+        observed_at: String,
+        batch_id: String,
+        content_sha256: String,
+    ) -> Result<Self, NormalizedSourceError> {
+        let evidence = Self {
+            provider,
+            source,
+            source_at,
+            observed_at,
+            batch_id,
+            content_sha256,
+        };
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
+    fn validate(&self) -> Result<(), NormalizedSourceError> {
+        if self.source.trim().is_empty()
+            || self.batch_id.trim().is_empty()
+            || self
+                .source_at
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            || self.content_sha256.len() != 64
+            || !self
+                .content_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(NormalizedSourceError::InvalidBatchEvidence);
+        }
+        let observed_at = self.observed_at_local()?;
+        if observed_at > Local::now() {
+            return Err(NormalizedSourceError::FutureObservedAt);
+        }
+        Ok(())
+    }
+
+    fn observed_at_local(&self) -> Result<DateTime<Local>, NormalizedSourceError> {
+        parse_evidence_instant(
+            "news.source_batch",
+            self.provider,
+            "observed_at",
+            &self.observed_at,
+        )
+        .map(|value| value.with_timezone(&Local))
+        .map_err(|_| NormalizedSourceError::InvalidBatchEvidence)
+    }
+}
 
 /// A normalized event produced by a source adapter before PushKind mapping.
 ///
@@ -111,6 +202,10 @@ pub struct NormalizedSourceEvent {
     pub stale: bool,
     /// Source name, e.g. "eastmoney", "ndrc", "em_announcement".
     pub source: String,
+    /// Ordered source batches used to compute this event. Earnings carries the
+    /// financial batch first and consensus batch second; analyst changes carry
+    /// the consensus batch.
+    pub source_batches: Vec<SourceBatchEvidence>,
     /// Optional canonical URL for the event.
     pub url: Option<String>,
     /// Arbitrary key-value metadata (BTreeMap preserves insertion order).
@@ -157,9 +252,55 @@ impl NormalizedSourceEvent {
             source_published_on,
             stale: upstream_stale,
             source,
+            source_batches: Vec::new(),
             url,
             metadata: BTreeMap::new(),
         };
+        event.validate()?;
+        Ok(event)
+    }
+
+    /// Construct an evidence-backed financial/research event. The adapter
+    /// timestamp must equal the latest retained Gateway observation; this
+    /// prevents callers from replacing acquisition time with `Local::now()`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "validated source-event constructor mirrors the normalized event envelope"
+    )]
+    pub fn new_with_batch_evidence(
+        push_kind: SourcePushKind,
+        event_id: String,
+        code: Option<String>,
+        title: String,
+        summary: String,
+        direction: Direction,
+        strength: u8,
+        certainty: u8,
+        observed_at: DateTime<Local>,
+        source_published_on: Option<NaiveDate>,
+        upstream_stale: bool,
+        source: String,
+        url: Option<String>,
+        source_batches: Vec<SourceBatchEvidence>,
+    ) -> Result<Self, NormalizedSourceError> {
+        let mut event = Self {
+            push_kind,
+            event_id,
+            code,
+            title,
+            summary,
+            direction,
+            strength,
+            certainty,
+            observed_at,
+            source_published_on,
+            stale: upstream_stale,
+            source,
+            source_batches,
+            url,
+            metadata: BTreeMap::new(),
+        };
+        event.attach_batch_audit_metadata();
         event.validate()?;
         Ok(event)
     }
@@ -211,6 +352,34 @@ impl NormalizedSourceEvent {
         if self.stale {
             return Err(NormalizedSourceError::Stale);
         }
+        let batch_evidence_required = matches!(
+            self.push_kind,
+            SourcePushKind::EarningsBeat
+                | SourcePushKind::EarningsMiss
+                | SourcePushKind::AnalystUpgrade
+        );
+        if batch_evidence_required && self.source_batches.is_empty() {
+            return Err(NormalizedSourceError::MissingBatchEvidence);
+        }
+        for evidence in &self.source_batches {
+            evidence.validate()?;
+        }
+        if let Some(primary) = self.source_batches.first() {
+            let latest_observed_at = self
+                .source_batches
+                .iter()
+                .map(SourceBatchEvidence::observed_at_local)
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .max()
+                .ok_or(NormalizedSourceError::MissingBatchEvidence)?;
+            if self.source != primary.source || self.observed_at != latest_observed_at {
+                return Err(NormalizedSourceError::BatchEvidenceMismatch);
+            }
+            if !self.batch_audit_metadata_matches() {
+                return Err(NormalizedSourceError::BatchEvidenceMismatch);
+            }
+        }
         Ok(())
     }
 
@@ -218,6 +387,60 @@ impl NormalizedSourceEvent {
     pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.metadata.insert(key.into(), value.into());
         self
+    }
+
+    fn attach_batch_audit_metadata(&mut self) {
+        for (index, evidence) in self.source_batches.iter().enumerate() {
+            let prefix = format!("evidence.{index}");
+            self.metadata.insert(
+                format!("{prefix}.provider"),
+                format!("{:?}", evidence.provider),
+            );
+            self.metadata
+                .insert(format!("{prefix}.source"), evidence.source.clone());
+            if let Some(source_at) = &evidence.source_at {
+                self.metadata
+                    .insert(format!("{prefix}.source_at"), source_at.clone());
+            }
+            self.metadata.insert(
+                format!("{prefix}.observed_at"),
+                evidence.observed_at.clone(),
+            );
+            self.metadata
+                .insert(format!("{prefix}.batch_id"), evidence.batch_id.clone());
+            self.metadata.insert(
+                format!("{prefix}.content_sha256"),
+                evidence.content_sha256.clone(),
+            );
+        }
+    }
+
+    fn batch_audit_metadata_matches(&self) -> bool {
+        let mut expected = BTreeMap::new();
+        for (index, evidence) in self.source_batches.iter().enumerate() {
+            let prefix = format!("evidence.{index}");
+            expected.insert(
+                format!("{prefix}.provider"),
+                format!("{:?}", evidence.provider),
+            );
+            expected.insert(format!("{prefix}.source"), evidence.source.clone());
+            if let Some(source_at) = &evidence.source_at {
+                expected.insert(format!("{prefix}.source_at"), source_at.clone());
+            }
+            expected.insert(
+                format!("{prefix}.observed_at"),
+                evidence.observed_at.clone(),
+            );
+            expected.insert(format!("{prefix}.batch_id"), evidence.batch_id.clone());
+            expected.insert(
+                format!("{prefix}.content_sha256"),
+                evidence.content_sha256.clone(),
+            );
+        }
+        self.metadata
+            .iter()
+            .filter(|(key, _)| key.starts_with("evidence."))
+            .eq(expected.iter())
     }
 }
 
@@ -252,6 +475,153 @@ mod tests {
         assert_eq!(event.event_id, "ann-1");
         assert_eq!(event.code.as_deref(), Some("TEST_CODE_SOURCE_EVENT"));
         assert_eq!(event.url.as_deref(), Some("https://example.invalid/ann-1"));
+    }
+
+    #[test]
+    fn source_batch_evidence_accepts_eastmoney_unix_milliseconds_without_rewriting() {
+        let evidence = SourceBatchEvidence::new(
+            magic_market_core::ProviderId::Eastmoney,
+            "TEST_CODE_eastmoney-research".into(),
+            None,
+            "unix-ms:1785799979851".into(),
+            "TEST_CODE_consensus_batch".into(),
+            "c".repeat(64),
+        )
+        .expect("Eastmoney unix-ms observation evidence must remain admissible");
+
+        assert_eq!(evidence.observed_at, "unix-ms:1785799979851");
+    }
+
+    #[test]
+    fn source_batch_evidence_rejects_malformed_observed_at() {
+        let error = SourceBatchEvidence::new(
+            magic_market_core::ProviderId::Eastmoney,
+            "TEST_CODE_eastmoney-research".into(),
+            None,
+            "1785799979.8510450000".into(),
+            "TEST_CODE_consensus_batch".into(),
+            "c".repeat(64),
+        )
+        .expect_err("over-precision observation evidence must fail closed");
+
+        assert_eq!(error, NormalizedSourceError::InvalidBatchEvidence);
+    }
+
+    #[test]
+    fn earnings_event_preserves_each_admitted_batch_evidence() {
+        let now = Local::now();
+        let financial = SourceBatchEvidence::new(
+            magic_market_core::ProviderId::Sina,
+            "TEST_CODE_sina-financial".into(),
+            Some(now.date_naive().to_string()),
+            now.to_rfc3339(),
+            "TEST_CODE_financial_batch".into(),
+            "a".repeat(64),
+        )
+        .expect("financial evidence");
+        let consensus = SourceBatchEvidence::new(
+            magic_market_core::ProviderId::Eastmoney,
+            "TEST_CODE_eastmoney-research".into(),
+            None,
+            now.to_rfc3339(),
+            "TEST_CODE_consensus_batch".into(),
+            "b".repeat(64),
+        )
+        .expect("consensus evidence");
+
+        let mut event = NormalizedSourceEvent::new_with_batch_evidence(
+            SourcePushKind::EarningsBeat,
+            "TEST_CODE_earnings_event".into(),
+            Some("TEST_CODE_600519".into()),
+            "业绩超预期".into(),
+            "actual EPS exceeds consensus".into(),
+            Direction::Bull,
+            80,
+            90,
+            now,
+            Some(now.date_naive()),
+            false,
+            "TEST_CODE_sina-financial".into(),
+            None,
+            vec![financial.clone(), consensus.clone()],
+        )
+        .expect("complete evidence-backed event");
+
+        assert_eq!(event.source_batches, vec![financial, consensus]);
+        assert_eq!(
+            event
+                .metadata
+                .get("evidence.0.batch_id")
+                .map(String::as_str),
+            Some("TEST_CODE_financial_batch")
+        );
+        assert_eq!(
+            event
+                .metadata
+                .get("evidence.1.batch_id")
+                .map(String::as_str),
+            Some("TEST_CODE_consensus_batch")
+        );
+        event.metadata.insert(
+            "evidence.1.batch_id".into(),
+            "TEST_CODE_tampered_batch".into(),
+        );
+        assert_eq!(
+            event.validate(),
+            Err(NormalizedSourceError::BatchEvidenceMismatch)
+        );
+    }
+
+    #[test]
+    fn earnings_event_rejects_absent_or_mismatched_batch_evidence() {
+        let now = Local::now();
+        let without_evidence = NormalizedSourceEvent::new(
+            SourcePushKind::EarningsBeat,
+            "TEST_CODE_earnings_event".into(),
+            Some("TEST_CODE_600519".into()),
+            "业绩超预期".into(),
+            "summary".into(),
+            Direction::Bull,
+            80,
+            90,
+            now,
+            Some(now.date_naive()),
+            false,
+            "TEST_CODE_sina-financial".into(),
+            None,
+        );
+        assert_eq!(
+            without_evidence,
+            Err(NormalizedSourceError::MissingBatchEvidence)
+        );
+
+        let wrong_source = SourceBatchEvidence::new(
+            magic_market_core::ProviderId::Sina,
+            "TEST_CODE_other-source".into(),
+            Some(now.date_naive().to_string()),
+            now.to_rfc3339(),
+            "TEST_CODE_financial_batch".into(),
+            "a".repeat(64),
+        )
+        .expect("batch evidence");
+        let error = NormalizedSourceEvent::new_with_batch_evidence(
+            SourcePushKind::EarningsBeat,
+            "TEST_CODE_earnings_event".into(),
+            Some("TEST_CODE_600519".into()),
+            "业绩超预期".into(),
+            "summary".into(),
+            Direction::Bull,
+            80,
+            90,
+            now,
+            Some(now.date_naive()),
+            false,
+            "TEST_CODE_sina-financial".into(),
+            None,
+            vec![wrong_source],
+        )
+        .expect_err("event source must equal primary evidence source");
+        assert_eq!(error, NormalizedSourceError::BatchEvidenceMismatch);
     }
 
     #[test]

@@ -19,6 +19,7 @@
 //!   - account locked / expired → fail closed (PAM 拒绝)
 
 use std::io::{self, IsTerminal, Write};
+use zeroize::Zeroize;
 
 pub const MAX_ATTEMPTS: usize = 3;
 
@@ -101,12 +102,12 @@ pub fn require_monitor_operator_auth() -> Result<(), OperatorAuthError> {
     for attempt in 1..=MAX_ATTEMPTS {
         eprint!("  password: ");
         io::stdout().flush().ok();
-        let password = rpassword::read_password()?;
+        let mut password = rpassword::read_password()?;
 
         let result = try_pam_auth(&cfg, &password);
 
-        // 密码 buffer best-effort 擦除 (zeroize crate 限制, 实际效果取决于平台 + 是否真 drop)
-        drop(password);
+        // PAM 调用返回后立即覆盖本地密码缓冲区；第三方 PAM 内部副本不在本进程控制范围内。
+        password.zeroize();
 
         match result {
             Ok(()) => {

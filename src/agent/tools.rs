@@ -25,7 +25,7 @@ impl Tool for FetchFinancialTool {
     }
 
     fn description(&self) -> &str {
-        "获取指定 A 股的最新一期核心财务指标，包含每股收益、ROE、毛利率、净利率、营收同比和净利润同比。"
+        "通过 CompanyDataGateway 获取指定 A 股已验证财报；仅返回上游可精确映射的指标，未提供的 ROE、利润率和同比字段保持 null。"
     }
 
     fn parameters(&self) -> serde_json::Value {

@@ -11,7 +11,8 @@ use anyhow::Result;
 use chrono::Local;
 use std::fs::OpenOptions;
 use std::io::Write;
-use stock_analysis::data_provider::{DataFetcherManager, KlineData};
+use stock_analysis::data_gateway::{AdmittedDailyBars, BatchEvidence, HistoricalBarsGateway};
+use stock_analysis::database::DatabaseManager;
 use stock_analysis::strategy::rsi::{RsiBacktest, RsiConfig, SingleRsiResult};
 use stock_analysis::strategy::TradeAction;
 
@@ -68,6 +69,14 @@ struct PresetStats {
     stocks_tested: usize,
     per_stock: Vec<SingleStockStat>,
     avg_return_pct: f64,
+    data_evidence: Vec<(String, BatchEvidence)>,
+}
+
+#[derive(Debug)]
+struct StockHistory {
+    code: String,
+    name: String,
+    bars: AdmittedDailyBars,
 }
 
 struct SingleStockStat {
@@ -127,16 +136,45 @@ fn compute_stock_stat(r: &SingleRsiResult) -> SingleStockStat {
     }
 }
 
-fn fetch_pool(dm: &DataFetcherManager) -> Vec<(String, String, Vec<KlineData>)> {
+fn retain_pool_entry(
+    code: &str,
+    name: &str,
+    bars: AdmittedDailyBars,
+) -> Result<StockHistory, usize> {
+    if !pool_record_count_is_sufficient(bars.records().len()) {
+        return Err(bars.records().len());
+    }
+    Ok(StockHistory {
+        code: code.to_string(),
+        name: name.to_string(),
+        bars,
+    })
+}
+
+const fn pool_record_count_is_sufficient(record_count: usize) -> bool {
+    record_count >= 250
+}
+
+fn fetch_pool(gateway: &HistoricalBarsGateway) -> Vec<StockHistory> {
     let mut out = Vec::new();
     for (code, name) in STOCK_POOL.iter() {
-        match dm.get_daily_data(code, 7000) {
-            Ok((data, _)) if data.len() >= 250 => {
-                out.push((code.to_string(), name.to_string(), data));
-            }
-            Ok(d) => {
-                eprintln!("  [skip] {} {} 数据不足 ({} 条)", code, name, d.0.len());
-            }
+        match gateway.required_daily_bars(code, 7000) {
+            Ok(bars) => match retain_pool_entry(code, name, bars) {
+                Ok(history) => {
+                    eprintln!(
+                        "  [load] {} {} source={} provider={:?} batch_id={}",
+                        code,
+                        name,
+                        history.bars.evidence().source,
+                        history.bars.evidence().provider,
+                        history.bars.evidence().batch_id,
+                    );
+                    out.push(history);
+                }
+                Err(record_count) => {
+                    eprintln!("  [skip] {} {} 数据不足 ({} 条)", code, name, record_count);
+                }
+            },
             Err(e) => {
                 eprintln!("  [skip] {} {} 拉取失败: {}", code, name, e);
             }
@@ -145,11 +183,7 @@ fn fetch_pool(dm: &DataFetcherManager) -> Vec<(String, String, Vec<KlineData>)> 
     out
 }
 
-fn run_preset(
-    name: &str,
-    config: RsiConfig,
-    pool: &[(String, String, Vec<KlineData>)],
-) -> Result<PresetStats> {
+fn run_preset(name: &str, config: RsiConfig, pool: &[StockHistory]) -> Result<PresetStats> {
     let engine = RsiBacktest::new(config.clone());
     let mut per_stock = Vec::new();
     let mut total_trades = 0;
@@ -158,8 +192,8 @@ fn run_preset(
     let mut stocks_with_trades = 0;
     let mut total_return_sum = 0.0f64;
 
-    for (code, sname, data) in pool {
-        match engine.run_single(code, sname, data) {
+    for history in pool {
+        match engine.run_single(&history.code, &history.name, history.bars.records()) {
             Ok(res) => {
                 let st = compute_stock_stat(&res);
                 if st.round_trips > 0 {
@@ -172,7 +206,7 @@ fn run_preset(
                 per_stock.push(st);
             }
             Err(e) => {
-                eprintln!("  [{}] 回测失败: {}", code, e);
+                eprintln!("  [{}] 回测失败: {}", history.code, e);
             }
         }
     }
@@ -194,6 +228,10 @@ fn run_preset(
         stocks_tested,
         per_stock,
         avg_return_pct: avg_return,
+        data_evidence: pool
+            .iter()
+            .map(|history| (history.code.clone(), history.bars.evidence().clone()))
+            .collect(),
     })
 }
 
@@ -229,6 +267,20 @@ fn format_preset_report(s: &PresetStats) -> String {
         }
     ));
     out.push_str(&format!("- 平均收益：{:.2}%\n", s.avg_return_pct));
+    if !s.data_evidence.is_empty() {
+        out.push_str("- 数据批次：\n");
+        for (code, evidence) in &s.data_evidence {
+            out.push_str(&format!(
+                "  - {} source={} provider={:?} source_at={} observed_at={} batch_id={}\n",
+                code,
+                evidence.source,
+                evidence.provider,
+                evidence.source_at.as_deref().unwrap_or("缺失"),
+                evidence.observed_at,
+                evidence.batch_id,
+            ));
+        }
+    }
     out.push_str(&format!(
         "- 关键参数：RSI({}) oversold={} overbought={} exit_level={} cooldown={} trend_filter={}(MA{}) stop={:.1}% tp={:.1}% min_hold={} require_all={} add_on_delta={}\n\n",
         s.config.rsi_period,
@@ -311,10 +363,8 @@ fn all_presets() -> Vec<(&'static str, RsiConfig)> {
 fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
-
-    // gtimg 等 provider 使用 tokio runtime，需要在 tokio context 下运行
-    let rt = tokio::runtime::Runtime::new()?;
-    let _guard = rt.enter();
+    let db_path = std::env::var("STOCK_DB").ok().map(std::path::PathBuf::from);
+    DatabaseManager::init(db_path).map_err(|error| anyhow::anyhow!("DB init error: {error}"))?;
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -337,8 +387,8 @@ fn main() -> Result<()> {
                 .map(|(_, c)| c)
                 .ok_or_else(|| anyhow::anyhow!("未找到 preset: {}", name))?;
             println!("📊 拉取股票池数据 …");
-            let dm = DataFetcherManager::new()?;
-            let pool = fetch_pool(&dm);
+            let gateway = HistoricalBarsGateway::new();
+            let pool = fetch_pool(&gateway);
             println!("✓ 有效股票 {} 只\n", pool.len());
             println!("📈 跑 preset: {}", name);
             let stats = run_preset(name, cfg, &pool)?;
@@ -349,8 +399,8 @@ fn main() -> Result<()> {
         }
         "compare" => {
             println!("📊 拉取股票池数据 …");
-            let dm = DataFetcherManager::new()?;
-            let pool = fetch_pool(&dm);
+            let gateway = HistoricalBarsGateway::new();
+            let pool = fetch_pool(&gateway);
             println!("✓ 有效股票 {} 只\n", pool.len());
             let mut combined = String::new();
             combined.push_str(&format!(
@@ -399,6 +449,13 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use stock_analysis::strategy::Trade;
+
+    #[test]
+    fn pool_requires_at_least_250_admitted_records() {
+        assert!(pool_record_count_is_sufficient(250));
+        assert!(pool_record_count_is_sufficient(251));
+        assert!(!pool_record_count_is_sufficient(249));
+    }
 
     fn trade(action: TradeAction, shares: f64, price: f64) -> Trade {
         Trade {
@@ -452,6 +509,7 @@ mod tests {
             stocks_tested: 1,
             per_stock: vec![stat],
             avg_return_pct: 5.0,
+            data_evidence: Vec::new(),
         };
         let report = format_preset_report(&stats);
         assert!(report.contains("✅ 达标"));

@@ -1,7 +1,25 @@
-//! Registered business rules: BR-047, BR-048, BR-077, BR-137.
+//! Registered business rules: BR-047, BR-048, BR-077, BR-137, BR-192.
 //! 通知推送 + MagicLaw 守护进程 + Token 管理
 //!
 //! 从 main.rs 提取，减少单文件体积。
+//!
+//! BR-192 push-log namespace isolation assumes an exclusive production service
+//! UID. Portable Unix APIs cannot stop a hostile same-UID process in the final
+//! instant after identity revalidation; deployment must pair these pinned
+//! descriptors with owner-only writable manifest data directories.
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+)))]
+compile_error!(
+    "BR-192 pinned push-log persistence requires openat/mkdirat Unix semantics; \
+     supported targets: Linux, macOS/iOS, FreeBSD, OpenBSD and NetBSD"
+);
 
 use serde::Deserialize;
 use std::process::Stdio;
@@ -96,6 +114,8 @@ pub enum PushKind {
     TomorrowWatch,
     /// 明日事件日历 (R-08) [MVP-4]
     EventCalendar,
+    /// BR-192: Eastmoney 来源限定量比/主力净流入双 TopN (R-09)
+    ReviewProviderTopN,
     // ============= v13 §14 新增 PushKind (PR #1) =============
     /// v13 §14.1 P-01 盘前新闻热点 (⚡ 15min 冷却)
     PreopenNewsHot,
@@ -188,15 +208,15 @@ impl PushKind {
         )
     }
 
-    /// v17.6 §2.2: 3 个 spec 标记为低优 / 子段治理候选.
+    /// v17.6 §2.2: 3 个 spec 标记为低优 / durable 子类型治理候选.
     ///
-    /// 注: 这 3 个 variants **与 v17.5 不同** — 它们仍有 production caller
-    /// (main.rs:8523 FactorIC). 因此本方法不标 legacy, 而是标 `is_low_priority_v17_6`
-    /// — 在 push_governor_inner 命中时给 info log 但不强制出声 warn.
+    /// 注: 这 3 个 variants **与 v17.5 不同** — 它们仍是 durable delivery
+    /// catalog 的稳定语义映射。因此本方法不标 legacy，而是保留
+    /// `is_low_priority_v17_6` metadata；生产发送必须走 BR-192 binding 入口.
     ///
     /// 3 个 variants: FactorIC, SectorTier, CapitalVerify.
-    /// 后续 (dev plan v2 §3.7): DailyReport 子段拆分时把这些 variants
-    /// 收纳进 DailyReportSubKind 子枚举.
+    /// 它们的稳定投递子类型由 `DailyReportSubKind` 表达；实际投递必须通过
+    /// BR-192 explicit binding 入口，不能回退到 generic governor.
     pub fn is_low_priority_v17_6(self) -> bool {
         matches!(
             self,
@@ -236,12 +256,10 @@ impl PushKind {
     }
 
     /// v17.6 §5.1: 3 个 low-priority variants (FactorIC / SectorTier / CapitalVerify)
-    /// 现在是 DailyReport 的"子段" — 推送时通过 `DailyReportSubKind` 标识子类型.
+    /// 使用 `DailyReportSubKind` 表达 durable delivery 子类型.
     ///
-    /// 设计取舍: 不删 enum 变体 (向后兼容 + 现有 9 callsite 不破), 仅在 metadata
-    /// 层 (本方法) 标"它们是 DailyReport 的子段". 后续 `daily_report_router` 模块
-    /// 用本方法分流, 推送时仍走 PushKind::DailyReport 主路径 (cooldown 24h),
-    /// 但 sub_kind 在 title prefix 区分 (e.g. "[FactorIC] ...") 避免合并后丢失语义.
+    /// 该映射只提供稳定类型元数据；BR-192 counted delivery 仍要求调用方提交
+    /// 完整的 immutable source binding，不能据此构造或发送 generic DailyReport.
     pub fn daily_report_sub_kind(self) -> Option<DailyReportSubKind> {
         match self {
             Self::FactorIC => Some(DailyReportSubKind::FactorIC),
@@ -269,6 +287,7 @@ impl PushKind {
             | PushKind::ReviewSignal
             | PushKind::TomorrowWatch
             | PushKind::EventCalendar
+            | PushKind::ReviewProviderTopN
             | PushKind::DailyReport
             | PushKind::CandidateBoard
             | PushKind::NewsRanked
@@ -322,6 +341,7 @@ impl PushKind {
                 | PushKind::ReviewFailure
                 | PushKind::TomorrowWatch
                 | PushKind::EventCalendar
+                | PushKind::ReviewProviderTopN
                 | PushKind::DailyReport
                 | PushKind::AuctionVolume
                 // v13 新增 (P-01 盘前无持仓语义, 不要 banner; I-01/I-02 盘中交易建议类, 要 banner)
@@ -357,6 +377,7 @@ impl PushKind {
             | PushKind::ReviewFailure
             | PushKind::TomorrowWatch
             | PushKind::EventCalendar
+            | PushKind::ReviewProviderTopN
             | PushKind::DailyReport => Some(86_400),
             // 复用现有冷却配置
             PushKind::AuctionVolume | PushKind::AuctionRepush => Some(600),
@@ -458,6 +479,7 @@ impl PushKind {
             PushKind::ReviewFailure => "失败归因",
             PushKind::TomorrowWatch => "明日观察池",
             PushKind::EventCalendar => "事件日历",
+            PushKind::ReviewProviderTopN => "盘后量能与主力净流入",
             // v13 新增
             PushKind::PreopenNewsHot => "盘前热点",
             PushKind::IntradayMarket => "盘中轮动",
@@ -514,13 +536,11 @@ impl PushKind {
     }
 }
 
-/// v17.6 §5.1: DailyReport 子段枚举.
+/// v17.6 §5.1 / BR-192: durable DailyReport 子类型.
 ///
-/// 收纳原 PushKind 中 3 个 low-priority variants (FactorIC / SectorTier / CapitalVerify).
-/// 它们都归属于"日报类"推送 (DailyReport), 但语义不同需在 title 区分, 因此引入子枚举.
-///
-/// 用法: `daily_report_router::push_factor_ic(text)` 内部走 `PushKind::DailyReport` 主路径
-/// + title prefix "[FactorIC] ..." 标识子类型. cooldown 复用 `PushKind::DailyReport` 的 24h.
+/// 保留 FactorIC / SectorTier / CapitalVerify 的显式 durable 映射。该类型只能随
+/// `CountedDeliveryBinding` 进入 `push_counted_with_binding`; 它不提供 generic
+/// DailyReport 路由或隐式 source evidence.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DailyReportSubKind {
     /// 因子 IC (grill Q6 改)
@@ -554,9 +574,9 @@ impl DailyReportSubKind {
         }
     }
 
-    /// 子段独立冷却 (秒). None = 跟随 DailyReport 主 24h.
-    /// 设计: 默认 None, 让 sub_kind 共享 DailyReport 1次/日窗口 (避免重复噪声).
-    /// 个别场景可 override: SectorTier/CapitalVerify 偏实时 → 30min 独立窗口.
+    /// 历史模板冷却 metadata（仅用于审计/兼容性检查）。
+    /// BR-192 durable coordinator 是 counted delivery 的唯一准入/去重 owner；
+    /// 本值不得重新接入 generic governor.
     pub fn cooldown_secs(self) -> Option<u32> {
         match self {
             Self::FactorIC => None,
@@ -860,6 +880,7 @@ fn push_log_suffix_at(now: std::time::SystemTime) -> Result<String, String> {
     ))
 }
 
+#[cfg(test)]
 fn create_push_log_file(path: &std::path::Path) -> Result<std::fs::File, String> {
     std::fs::OpenOptions::new()
         .write(true)
@@ -868,91 +889,1122 @@ fn create_push_log_file(path: &std::path::Path) -> Result<std::fs::File, String>
         .map_err(|error| format!("push_log 不可覆盖创建失败 {}: {error}", path.display()))
 }
 
-fn save_push_log(text: &str) -> Result<std::path::PathBuf, String> {
-    use std::io::Write;
+#[derive(Debug)]
+pub(super) enum PushLogError {
+    NamespaceOverrideRejected { namespace: String },
+    NamespaceIsolation(String),
+    Persistence(String),
+}
+
+impl PushLogError {
+    fn reason_code(&self) -> &'static str {
+        match self {
+            Self::NamespaceOverrideRejected { .. } => "push_log_namespace_override_rejected",
+            Self::NamespaceIsolation(_) => "push_log_namespace_isolation_rejected",
+            Self::Persistence(_) => "push_log_persistence_failed",
+        }
+    }
+
+    fn retry_authorized(&self) -> bool {
+        matches!(self, Self::Persistence(_))
+    }
+
+    fn from_io(
+        operation: &str,
+        path: &std::path::Path,
+        error: std::io::Error,
+        namespace_sensitive: bool,
+    ) -> Self {
+        let detail = format!("{operation} {}: {error}", path.display());
+        if is_retryable_persistence_errno(&error) || !namespace_sensitive {
+            Self::Persistence(detail)
+        } else {
+            Self::NamespaceIsolation(detail)
+        }
+    }
+}
+
+fn is_retryable_persistence_errno(error: &std::io::Error) -> bool {
+    // Portable `std::io::ErrorKind` does not distinguish quota, process-wide
+    // descriptor exhaustion or device I/O. These Unix errno values are stable
+    // across the supported targets (EDQUOT is 69 on BSD/macOS and 122 on Linux).
+    matches!(error.raw_os_error(), Some(5 | 23 | 24 | 28 | 69 | 122))
+}
+
+impl std::fmt::Display for PushLogError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NamespaceOverrideRejected { namespace } => write!(
+                formatter,
+                "PUSH_LOG_DIR override is forbidden for bound namespace {namespace}"
+            ),
+            Self::NamespaceIsolation(error) => formatter.write_str(error),
+            Self::Persistence(error) => formatter.write_str(error),
+        }
+    }
+}
+
+const PUSH_LOG_O_RDONLY: i32 = 0;
+const PUSH_LOG_O_WRONLY: i32 = 1;
+const PUSH_LOG_O_RDWR: i32 = 2;
+const PUSH_LOG_LOCK_FILE: &str = ".push_log.lock";
+
+#[cfg(target_os = "linux")]
+const PUSH_LOG_O_NOFOLLOW: i32 = 0x0002_0000;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+const PUSH_LOG_O_NOFOLLOW: i32 = 0x0000_0100;
+#[cfg(target_os = "linux")]
+const PUSH_LOG_O_NONBLOCK: i32 = 0x0000_0800;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+const PUSH_LOG_O_NONBLOCK: i32 = 0x0000_0004;
+#[cfg(target_os = "linux")]
+const PUSH_LOG_O_CREAT: i32 = 0x0000_0040;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+const PUSH_LOG_O_CREAT: i32 = 0x0000_0200;
+#[cfg(target_os = "linux")]
+const PUSH_LOG_O_EXCL: i32 = 0x0000_0080;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+const PUSH_LOG_O_EXCL: i32 = 0x0000_0800;
+#[cfg(target_os = "linux")]
+const PUSH_LOG_O_CLOEXEC: i32 = 0x0008_0000;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const PUSH_LOG_O_CLOEXEC: i32 = 0x0100_0000;
+#[cfg(target_os = "freebsd")]
+const PUSH_LOG_O_CLOEXEC: i32 = 0x0010_0000;
+#[cfg(target_os = "openbsd")]
+const PUSH_LOG_O_CLOEXEC: i32 = 0x0001_0000;
+#[cfg(target_os = "netbsd")]
+const PUSH_LOG_O_CLOEXEC: i32 = 0x0040_0000;
+
+unsafe extern "C" {
+    fn openat(directory_fd: i32, path: *const std::ffi::c_char, flags: i32, ...) -> i32;
+    fn mkdirat(directory_fd: i32, path: *const std::ffi::c_char, mode: u32) -> i32;
+    fn geteuid() -> u32;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PushLogFileIdentity {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    uid: u32,
+    is_directory: bool,
+    is_file: bool,
+}
+
+struct PinnedPushLogDirectory {
+    anchor: std::fs::File,
+    anchor_identity: PushLogFileIdentity,
+    components: Vec<std::ffi::OsString>,
+    identities: Vec<PushLogFileIdentity>,
+    directories: Vec<std::fs::File>,
+}
+
+impl PinnedPushLogDirectory {
+    fn push(
+        &mut self,
+        component: std::ffi::OsString,
+        identity: PushLogFileIdentity,
+        directory: std::fs::File,
+    ) {
+        self.components.push(component);
+        self.identities.push(identity);
+        self.directories.push(directory);
+    }
+
+    fn try_clone(&self) -> Result<Self, PushLogError> {
+        let anchor = self.anchor.try_clone().map_err(|error| {
+            PushLogError::Persistence(format!("clone pinned push_log anchor: {error}"))
+        })?;
+        let directories = self
+            .directories
+            .iter()
+            .enumerate()
+            .map(|(index, directory)| {
+                directory.try_clone().map_err(|error| {
+                    PushLogError::Persistence(format!(
+                        "clone pinned push_log directory component {index}: {error}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            anchor,
+            anchor_identity: self.anchor_identity,
+            components: self.components.clone(),
+            identities: self.identities.clone(),
+            directories,
+        })
+    }
+}
+
+pub(super) struct PinnedPushLogWriter {
+    namespace_label: String,
+    root: std::path::PathBuf,
+    root_binding: PinnedPushLogDirectory,
+    lock: std::sync::Arc<std::fs::File>,
+    lock_identity: PushLogFileIdentity,
+}
+
+#[derive(Clone, Copy)]
+enum PushLogWritePhase {
+    DirectoriesBound,
+    ArtifactSynced,
+}
+
+fn push_log_component_cstring(
+    component: &std::ffi::OsStr,
+) -> Result<std::ffi::CString, PushLogError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    std::ffi::CString::new(component.as_bytes()).map_err(|_| {
+        PushLogError::NamespaceIsolation("push_log path component contains NUL".to_owned())
+    })
+}
+
+fn push_log_openat(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    flags: i32,
+    mode: u32,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "push_log path component contains NUL",
+        )
+    })?;
+    // SAFETY: `name` is a live NUL-terminated single component, `parent`
+    // owns a directory descriptor, and a successful descriptor is moved
+    // exactly once into `File`.
+    let descriptor = unsafe {
+        openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            flags | PUSH_LOG_O_NOFOLLOW | PUSH_LOG_O_NONBLOCK | PUSH_LOG_O_CLOEXEC,
+            mode,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: successful `openat` returned one newly owned descriptor.
+    Ok(unsafe { std::fs::File::from_raw_fd(descriptor) })
+}
+
+fn validate_push_log_directory(
+    directory: &std::fs::File,
+    path: &std::path::Path,
+) -> Result<PushLogFileIdentity, PushLogError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = directory
+        .metadata()
+        .map_err(|error| PushLogError::from_io("inspect push_log directory", path, error, true))?;
+    if !metadata.is_dir() {
+        return Err(PushLogError::NamespaceIsolation(format!(
+            "push_log namespace component is not a directory: {}",
+            path.display()
+        )));
+    }
+    if metadata.nlink() == 0 {
+        return Err(PushLogError::NamespaceIsolation(format!(
+            "push_log namespace component has no physical links: {}",
+            path.display()
+        )));
+    }
+    // SAFETY: `geteuid` has no preconditions and does not retain pointers.
+    let effective_uid = unsafe { geteuid() };
+    if !push_log_directory_owner_allowed(metadata.uid(), effective_uid) {
+        return Err(PushLogError::NamespaceIsolation(format!(
+            "push_log directory owner uid={} is neither root nor effective uid={effective_uid}: {}",
+            metadata.uid(),
+            path.display()
+        )));
+    }
+    if metadata.mode() & 0o022 != 0 {
+        return Err(PushLogError::NamespaceIsolation(format!(
+            "push_log directory is group/other writable mode={:o}: {}",
+            metadata.mode() & 0o7777,
+            path.display()
+        )));
+    }
+    Ok(PushLogFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        mode: metadata.mode(),
+        uid: metadata.uid(),
+        is_directory: metadata.is_dir(),
+        is_file: metadata.is_file(),
+    })
+}
+
+fn push_log_directory_owner_allowed(uid: u32, effective_uid: u32) -> bool {
+    uid == 0 || uid == effective_uid
+}
+
+fn open_or_create_push_log_child(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    path: &std::path::Path,
+) -> Result<(std::fs::File, PushLogFileIdentity), PushLogError> {
+    open_or_create_push_log_child_with_hook(parent, name, path, || {})
+}
+
+fn open_or_create_push_log_child_with_hook<F>(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    path: &std::path::Path,
+    before_mkdir: F,
+) -> Result<(std::fs::File, PushLogFileIdentity), PushLogError>
+where
+    F: FnOnce(),
+{
+    use std::io::ErrorKind;
+    use std::os::fd::AsRawFd;
+
+    let directory = match push_log_openat(parent, name, PUSH_LOG_O_RDONLY, 0) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            before_mkdir();
+            let component = push_log_component_cstring(name)?;
+            // SAFETY: `name` is one live NUL-terminated component and
+            // `parent` retains a valid directory descriptor.
+            let created = unsafe { mkdirat(parent.as_raw_fd(), component.as_ptr(), 0o700_u32) };
+            if created < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != ErrorKind::AlreadyExists {
+                    return Err(PushLogError::from_io(
+                        "create fixed push_log directory",
+                        path,
+                        error,
+                        true,
+                    ));
+                }
+            }
+            // Sync after both create and `EEXIST`: the process that won a
+            // concurrent mkdir may have crashed before syncing the parent.
+            parent.sync_all().map_err(|error| {
+                PushLogError::Persistence(format!(
+                    "fsync push_log parent for {}: {error}",
+                    path.display()
+                ))
+            })?;
+            push_log_openat(parent, name, PUSH_LOG_O_RDONLY, 0).map_err(|error| {
+                PushLogError::from_io(
+                    "open fixed push_log directory without symlink traversal",
+                    path,
+                    error,
+                    true,
+                )
+            })?
+        }
+        Err(error) => {
+            return Err(PushLogError::from_io(
+                "open fixed push_log directory without symlink traversal",
+                path,
+                error,
+                true,
+            ));
+        }
+    };
+    let identity = validate_push_log_directory(&directory, path)?;
+    Ok((directory, identity))
+}
+
+fn push_log_absolute_components(
+    path: &std::path::Path,
+    label: &str,
+) -> Result<Vec<std::ffi::OsString>, PushLogError> {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return Err(PushLogError::NamespaceIsolation(format!(
+            "{label} must be absolute: {}",
+            path.display()
+        )));
+    }
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => components.push(name.to_os_string()),
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                return Err(PushLogError::NamespaceIsolation(format!(
+                    "{label} is not lexically exact: {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(components)
+}
+
+fn open_or_create_push_log_root(
+    root: &std::path::Path,
+    creation_boundary: &std::path::Path,
+) -> Result<PinnedPushLogDirectory, PushLogError> {
+    let normal_components = push_log_absolute_components(root, "fixed push_log namespace")?;
+    let boundary_components =
+        push_log_absolute_components(creation_boundary, "fixed push_log creation boundary")?;
+    if normal_components.len() <= boundary_components.len()
+        || !normal_components.starts_with(&boundary_components)
+    {
+        return Err(PushLogError::NamespaceIsolation(format!(
+            "fixed push_log namespace must be below its creation boundary: {}",
+            root.display()
+        )));
+    }
+    let anchor = std::fs::OpenOptions::new()
+        .read(true)
+        .open("/")
+        .map_err(|error| {
+            PushLogError::from_io(
+                "open push_log filesystem anchor",
+                std::path::Path::new("/"),
+                error,
+                false,
+            )
+        })?;
+    let anchor_identity = validate_push_log_directory(&anchor, std::path::Path::new("/"))?;
+    let mut directory = anchor.try_clone().map_err(|error| {
+        PushLogError::Persistence(format!("clone pinned push_log filesystem anchor: {error}"))
+    })?;
+    let mut traversed = std::path::PathBuf::from("/");
+    let mut components = Vec::new();
+    let mut identities = Vec::new();
+    let mut directories = Vec::new();
+    for (index, name) in normal_components.iter().enumerate() {
+        traversed.push(name);
+        let (next, identity) = match push_log_openat(&directory, name, PUSH_LOG_O_RDONLY, 0) {
+            Ok(next) => {
+                let identity = validate_push_log_directory(&next, &traversed)?;
+                (next, identity)
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && index >= boundary_components.len() =>
+            {
+                open_or_create_push_log_child(&directory, name, &traversed)?
+            }
+            Err(error) => {
+                return Err(PushLogError::from_io(
+                    "traverse fixed push_log namespace without symlink traversal",
+                    &traversed,
+                    error,
+                    true,
+                ));
+            }
+        };
+        components.push(name.to_os_string());
+        identities.push(identity);
+        directories.push(next.try_clone().map_err(|error| {
+            PushLogError::Persistence(format!(
+                "clone pinned push_log directory {}: {error}",
+                traversed.display()
+            ))
+        })?);
+        directory = next;
+    }
+    Ok(PinnedPushLogDirectory {
+        anchor,
+        anchor_identity,
+        components,
+        identities,
+        directories,
+    })
+}
+
+fn revalidate_push_log_directory_chain(
+    binding: &PinnedPushLogDirectory,
+) -> Result<std::fs::File, PushLogError> {
+    let anchor_identity = validate_push_log_directory(&binding.anchor, std::path::Path::new("/"))?;
+    if anchor_identity != binding.anchor_identity {
+        return Err(PushLogError::NamespaceIsolation(
+            "push_log filesystem anchor identity changed".to_owned(),
+        ));
+    }
+    if binding.components.len() != binding.identities.len()
+        || binding.components.len() != binding.directories.len()
+    {
+        return Err(PushLogError::NamespaceIsolation(
+            "push_log retained directory binding is internally inconsistent".to_owned(),
+        ));
+    }
+    let mut directory = binding.anchor.try_clone().map_err(|error| {
+        PushLogError::Persistence(format!(
+            "clone pinned push_log filesystem anchor for revalidation: {error}"
+        ))
+    })?;
+    let mut traversed = std::path::PathBuf::from("/");
+    for ((component, expected_identity), retained) in binding
+        .components
+        .iter()
+        .zip(&binding.identities)
+        .zip(&binding.directories)
+    {
+        traversed.push(component);
+        let retained_identity = validate_push_log_directory(retained, &traversed)?;
+        if retained_identity != *expected_identity {
+            return Err(PushLogError::NamespaceIsolation(format!(
+                "retained push_log directory identity changed: {}",
+                traversed.display()
+            )));
+        }
+        let rebound =
+            push_log_openat(&directory, component, PUSH_LOG_O_RDONLY, 0).map_err(|error| {
+                PushLogError::from_io(
+                    "re-open fixed push_log directory without symlink traversal",
+                    &traversed,
+                    error,
+                    true,
+                )
+            })?;
+        let actual_identity = validate_push_log_directory(&rebound, &traversed)?;
+        if actual_identity != *expected_identity {
+            return Err(PushLogError::NamespaceIsolation(format!(
+                "push_log directory identity changed while bound: {}",
+                traversed.display()
+            )));
+        }
+        directory = rebound;
+    }
+    Ok(directory)
+}
+
+fn validate_push_log_leaf(
+    file: &std::fs::File,
+    path: &std::path::Path,
+) -> Result<PushLogFileIdentity, PushLogError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| PushLogError::from_io("inspect push_log artifact", path, error, true))?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(PushLogError::NamespaceIsolation(format!(
+            "push_log artifact must be a regular file with exactly one physical link: {}",
+            path.display()
+        )));
+    }
+    // SAFETY: `geteuid` has no preconditions and does not retain pointers.
+    let effective_uid = unsafe { geteuid() };
+    if metadata.uid() != effective_uid {
+        return Err(PushLogError::NamespaceIsolation(format!(
+            "push_log artifact owner uid={} differs from effective uid={effective_uid}: {}",
+            metadata.uid(),
+            path.display()
+        )));
+    }
+    if metadata.mode() & 0o022 != 0 {
+        return Err(PushLogError::NamespaceIsolation(format!(
+            "push_log artifact is group/other writable mode={:o}: {}",
+            metadata.mode() & 0o7777,
+            path.display()
+        )));
+    }
+    Ok(PushLogFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        mode: metadata.mode(),
+        uid: metadata.uid(),
+        is_directory: metadata.is_dir(),
+        is_file: metadata.is_file(),
+    })
+}
+
+fn revalidate_push_log_leaf_at(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    path: &std::path::Path,
+    flags: i32,
+    expected: PushLogFileIdentity,
+) -> Result<std::fs::File, PushLogError> {
+    let reopened = push_log_openat(parent, name, flags, 0).map_err(|error| {
+        PushLogError::from_io(
+            "re-open pinned push_log leaf without symlink traversal",
+            path,
+            error,
+            true,
+        )
+    })?;
+    let observed = validate_push_log_leaf(&reopened, path)?;
+    if observed != expected {
+        return Err(PushLogError::NamespaceIsolation(format!(
+            "pinned push_log leaf identity changed: {}",
+            path.display()
+        )));
+    }
+    Ok(reopened)
+}
+
+fn push_log_process_mutex() -> &'static std::sync::Mutex<()> {
+    static MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    MUTEX.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+impl PinnedPushLogWriter {
+    pub(super) fn for_namespace(
+        namespace: &crate::durable_delivery_runtime::RuntimeNamespace,
+    ) -> Result<Self, PushLogError> {
+        if std::env::var_os("PUSH_LOG_DIR").is_some() {
+            return Err(PushLogError::NamespaceOverrideRejected {
+                namespace: namespace.label(),
+            });
+        }
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (namespace_label, relative_root) = match namespace {
+            crate::durable_delivery_runtime::RuntimeNamespace::Production => (
+                "production".to_owned(),
+                std::path::PathBuf::from("data/push_log"),
+            ),
+            crate::durable_delivery_runtime::RuntimeNamespace::Test { test_code } => {
+                validate_push_log_test_code(test_code)?;
+                (
+                    format!("test:{test_code}"),
+                    std::path::PathBuf::from("data/test")
+                        .join(test_code)
+                        .join("push_log"),
+                )
+            }
+        };
+        Self::bind(namespace_label, manifest.join(relative_root), manifest)
+    }
+
+    fn bind(
+        namespace_label: String,
+        root: std::path::PathBuf,
+        creation_boundary: &std::path::Path,
+    ) -> Result<Self, PushLogError> {
+        let root_binding = open_or_create_push_log_root(&root, creation_boundary)?;
+        let rebound_root = revalidate_push_log_directory_chain(&root_binding)?;
+        let lock_path = root.join(PUSH_LOG_LOCK_FILE);
+        let lock = push_log_openat(
+            &rebound_root,
+            std::ffi::OsStr::new(PUSH_LOG_LOCK_FILE),
+            PUSH_LOG_O_RDWR | PUSH_LOG_O_CREAT,
+            0o600_u32,
+        )
+        .map_err(|error| {
+            PushLogError::from_io("open pinned push_log lock", &lock_path, error, true)
+        })?;
+        let lock_identity = validate_push_log_leaf(&lock, &lock_path)?;
+        rebound_root.sync_all().map_err(|error| {
+            PushLogError::from_io("sync push_log root after lock bind", &root, error, false)
+        })?;
+        revalidate_push_log_leaf_at(
+            &rebound_root,
+            std::ffi::OsStr::new(PUSH_LOG_LOCK_FILE),
+            &lock_path,
+            PUSH_LOG_O_RDWR,
+            lock_identity,
+        )?;
+        revalidate_push_log_directory_chain(&root_binding)?;
+        Ok(Self {
+            namespace_label,
+            root,
+            root_binding,
+            lock: std::sync::Arc::new(lock),
+            lock_identity,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test_anchor(
+        namespace_label: &str,
+        anchor: &std::path::Path,
+        relative_root: &std::path::Path,
+    ) -> Result<Self, PushLogError> {
+        Self::bind(
+            namespace_label.to_owned(),
+            anchor.join(relative_root),
+            anchor,
+        )
+    }
+
+    fn save(&self, text: &str) -> Result<std::path::PathBuf, PushLogError> {
+        self.save_with_hook(text, |_, _, _, _| {})
+    }
+
+    fn save_with_hook<F>(&self, text: &str, mut hook: F) -> Result<std::path::PathBuf, PushLogError>
+    where
+        F: FnMut(PushLogWritePhase, &std::path::Path, &std::path::Path, Option<&std::path::Path>),
+    {
+        self.save_payload_with_hook(text.as_bytes(), "md", |phase, root, date_path, artifact| {
+            hook(phase, root, date_path, artifact);
+        })
+    }
+
+    fn save_payload_with_hook<F>(
+        &self,
+        payload: &[u8],
+        extension: &str,
+        mut hook: F,
+    ) -> Result<std::path::PathBuf, PushLogError>
+    where
+        F: FnMut(PushLogWritePhase, &std::path::Path, &std::path::Path, Option<&std::path::Path>),
+    {
+        use fs2::FileExt;
+        if extension.is_empty() || !extension.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return Err(PushLogError::NamespaceIsolation(
+                "push_log artifact extension must be non-empty ASCII alphanumeric".to_owned(),
+            ));
+        }
+        let now = chrono::Local::now();
+        let time_prefix = now.format("%H%M%S").to_string();
+        let unique_suffix =
+            push_log_suffix_at(std::time::SystemTime::now()).map_err(PushLogError::Persistence)?;
+        let file_name = format!("{time_prefix}_{unique_suffix}.{extension}");
+        let _process_guard = push_log_process_mutex()
+            .lock()
+            .map_err(|_| PushLogError::Persistence("push_log process mutex poisoned".to_owned()))?;
+        self.lock.lock_exclusive().map_err(|error| {
+            PushLogError::from_io(
+                "lock push_log namespace",
+                &self.root.join(PUSH_LOG_LOCK_FILE),
+                error,
+                false,
+            )
+        })?;
+        let outcome = self.save_named_payload_while_locked(payload, &file_name, &mut hook);
+        let unlock = FileExt::unlock(&*self.lock).map_err(|error| {
+            PushLogError::from_io(
+                "unlock push_log namespace",
+                &self.root.join(PUSH_LOG_LOCK_FILE),
+                error,
+                false,
+            )
+        });
+        match (outcome, unlock) {
+            (Ok(path), Ok(())) => Ok(path),
+            (Err(error), Ok(())) => Err(error),
+            (_, Err(error)) => Err(error),
+        }
+    }
+
+    fn save_named_payload(
+        &self,
+        payload: &[u8],
+        file_name: &str,
+    ) -> Result<std::path::PathBuf, PushLogError> {
+        use fs2::FileExt;
+        let _process_guard = push_log_process_mutex()
+            .lock()
+            .map_err(|_| PushLogError::Persistence("push_log process mutex poisoned".to_owned()))?;
+        self.lock.lock_exclusive().map_err(|error| {
+            PushLogError::from_io(
+                "lock push_log namespace",
+                &self.root.join(PUSH_LOG_LOCK_FILE),
+                error,
+                false,
+            )
+        })?;
+        let outcome =
+            self.save_named_payload_while_locked(payload, file_name, &mut |_, _, _, _| {});
+        let unlock = FileExt::unlock(&*self.lock).map_err(|error| {
+            PushLogError::from_io(
+                "unlock push_log namespace",
+                &self.root.join(PUSH_LOG_LOCK_FILE),
+                error,
+                false,
+            )
+        });
+        match (outcome, unlock) {
+            (Ok(path), Ok(())) => Ok(path),
+            (Err(error), Ok(())) => Err(error),
+            (_, Err(error)) => Err(error),
+        }
+    }
+
+    /// Read one exact artifact back through the retained push-log capability.
+    /// The caller-provided path is accepted only when it is the exact
+    /// `<pinned-root>/YYYY-MM-DD/<one-component>` shape.
+    fn read_exact_payload(&self, path: &std::path::Path) -> Result<Vec<u8>, PushLogError> {
+        use fs2::FileExt;
+        use std::io::Read;
+        use std::path::Component;
+
+        let relative = path.strip_prefix(&self.root).map_err(|_| {
+            PushLogError::NamespaceIsolation(format!(
+                "push_log verifier path escapes pinned root: {}",
+                path.display()
+            ))
+        })?;
+        let mut components = relative.components();
+        let (date_component, file_component) =
+            match (components.next(), components.next(), components.next()) {
+                (Some(Component::Normal(date)), Some(Component::Normal(file_name)), None) => {
+                    (date.to_os_string(), file_name.to_os_string())
+                }
+                _ => {
+                    return Err(PushLogError::NamespaceIsolation(format!(
+                        "push_log verifier path is not date/artifact: {}",
+                        path.display()
+                    )));
+                }
+            };
+        let date_text = date_component.to_string_lossy();
+        if date_text.len() != 10
+            || !date_text.bytes().enumerate().all(|(index, byte)| {
+                matches!(index, 4 | 7) && byte == b'-'
+                    || !matches!(index, 4 | 7) && byte.is_ascii_digit()
+            })
+        {
+            return Err(PushLogError::NamespaceIsolation(
+                "push_log verifier date component is invalid".to_owned(),
+            ));
+        }
+
+        let _process_guard = push_log_process_mutex()
+            .lock()
+            .map_err(|_| PushLogError::Persistence("push_log process mutex poisoned".to_owned()))?;
+        self.lock.lock_exclusive().map_err(|error| {
+            PushLogError::from_io(
+                "lock push_log namespace for verifier",
+                &self.root.join(PUSH_LOG_LOCK_FILE),
+                error,
+                false,
+            )
+        })?;
+        let outcome = (|| {
+            let rebound_root = revalidate_push_log_directory_chain(&self.root_binding)?;
+            revalidate_push_log_leaf_at(
+                &rebound_root,
+                std::ffi::OsStr::new(PUSH_LOG_LOCK_FILE),
+                &self.root.join(PUSH_LOG_LOCK_FILE),
+                PUSH_LOG_O_RDWR,
+                self.lock_identity,
+            )?;
+            let date_path = self.root.join(&date_component);
+            let date_directory =
+                push_log_openat(&rebound_root, &date_component, PUSH_LOG_O_RDONLY, 0).map_err(
+                    |error| {
+                        PushLogError::from_io(
+                            "open existing push_log date directory for verifier",
+                            &date_path,
+                            error,
+                            true,
+                        )
+                    },
+                )?;
+            let date_identity = validate_push_log_directory(&date_directory, &date_path)?;
+            let mut binding = self.root_binding.try_clone()?;
+            binding.push(
+                date_component.clone(),
+                date_identity,
+                date_directory.try_clone().map_err(|error| {
+                    PushLogError::Persistence(format!(
+                        "clone push_log verifier date directory: {error}"
+                    ))
+                })?,
+            );
+            let rebound_date = revalidate_push_log_directory_chain(&binding)?;
+            let mut artifact = push_log_openat(
+                &rebound_date,
+                &file_component,
+                PUSH_LOG_O_RDONLY,
+                0,
+            )
+            .map_err(|error| {
+                PushLogError::from_io("open exact push_log verifier artifact", path, error, true)
+            })?;
+            let artifact_identity = validate_push_log_leaf(&artifact, path)?;
+            let mut bytes = Vec::new();
+            artifact.read_to_end(&mut bytes).map_err(|error| {
+                PushLogError::Persistence(format!(
+                    "read exact push_log verifier artifact {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let post_date = revalidate_push_log_directory_chain(&binding)?;
+            revalidate_push_log_leaf_at(
+                &post_date,
+                &file_component,
+                path,
+                PUSH_LOG_O_RDONLY,
+                artifact_identity,
+            )?;
+            revalidate_push_log_directory_chain(&self.root_binding)?;
+            Ok(bytes)
+        })();
+        let unlock = FileExt::unlock(&*self.lock).map_err(|error| {
+            PushLogError::from_io(
+                "unlock push_log namespace after verifier",
+                &self.root.join(PUSH_LOG_LOCK_FILE),
+                error,
+                false,
+            )
+        });
+        match (outcome, unlock) {
+            (Ok(bytes), Ok(())) => Ok(bytes),
+            (Err(error), Ok(())) => Err(error),
+            (_, Err(error)) => Err(error),
+        }
+    }
+
+    fn save_named_payload_while_locked<F>(
+        &self,
+        payload: &[u8],
+        file_name: &str,
+        hook: &mut F,
+    ) -> Result<std::path::PathBuf, PushLogError>
+    where
+        F: FnMut(PushLogWritePhase, &std::path::Path, &std::path::Path, Option<&std::path::Path>),
+    {
+        use std::io::Write;
+
+        if file_name.is_empty()
+            || file_name.as_bytes().contains(&b'/')
+            || file_name.as_bytes().contains(&0)
+            || !file_name.ends_with(".json") && !file_name.ends_with(".md")
+        {
+            return Err(PushLogError::NamespaceIsolation(
+                "push_log artifact name must be one .json/.md component".to_owned(),
+            ));
+        }
+        if std::env::var_os("PUSH_LOG_DIR").is_some() {
+            return Err(PushLogError::NamespaceOverrideRejected {
+                namespace: self.namespace_label.clone(),
+            });
+        }
+        let now = chrono::Local::now();
+        let date_component = now.format("%Y-%m-%d").to_string();
+        let rebound_root = revalidate_push_log_directory_chain(&self.root_binding)?;
+        revalidate_push_log_leaf_at(
+            &rebound_root,
+            std::ffi::OsStr::new(PUSH_LOG_LOCK_FILE),
+            &self.root.join(PUSH_LOG_LOCK_FILE),
+            PUSH_LOG_O_RDWR,
+            self.lock_identity,
+        )?;
+        let mut binding = self.root_binding.try_clone()?;
+        let date_path = self.root.join(&date_component);
+        let (date_directory, date_identity) = open_or_create_push_log_child(
+            &rebound_root,
+            std::ffi::OsStr::new(&date_component),
+            &date_path,
+        )?;
+        binding.push(
+            std::ffi::OsString::from(&date_component),
+            date_identity,
+            date_directory,
+        );
+        let path = date_path.join(file_name);
+        hook(
+            PushLogWritePhase::DirectoriesBound,
+            &self.root,
+            &date_path,
+            None,
+        );
+        let pre_write_date_directory = revalidate_push_log_directory_chain(&binding)?;
+        let mut file = push_log_openat(
+            &pre_write_date_directory,
+            std::ffi::OsStr::new(file_name),
+            PUSH_LOG_O_WRONLY | PUSH_LOG_O_CREAT | PUSH_LOG_O_EXCL,
+            0o600_u32,
+        )
+        .map_err(|error| {
+            PushLogError::from_io(
+                "create push_log artifact without symlink traversal",
+                &path,
+                error,
+                true,
+            )
+        })?;
+        let artifact_identity = validate_push_log_leaf(&file, &path)?;
+        file.write_all(payload).map_err(|error| {
+            PushLogError::Persistence(format!("push_log 写入失败 {}: {error}", path.display()))
+        })?;
+        file.sync_all().map_err(|error| {
+            PushLogError::Persistence(format!("push_log fsync 失败 {}: {error}", path.display()))
+        })?;
+        let synced_identity = validate_push_log_leaf(&file, &path)?;
+        if synced_identity != artifact_identity {
+            return Err(PushLogError::NamespaceIsolation(format!(
+                "push_log artifact identity changed while open: {}",
+                path.display()
+            )));
+        }
+        pre_write_date_directory.sync_all().map_err(|error| {
+            PushLogError::Persistence(format!(
+                "push_log 目录 fsync 失败 {}: {error}",
+                date_path.display()
+            ))
+        })?;
+        hook(
+            PushLogWritePhase::ArtifactSynced,
+            &self.root,
+            &date_path,
+            Some(&path),
+        );
+        let post_write_date_directory = revalidate_push_log_directory_chain(&binding)?;
+        let reopened = push_log_openat(
+            &post_write_date_directory,
+            std::ffi::OsStr::new(file_name),
+            PUSH_LOG_O_RDONLY,
+            0,
+        )
+        .map_err(|error| {
+            PushLogError::from_io("re-open push_log artifact after fsync", &path, error, true)
+        })?;
+        let reopened_identity = validate_push_log_leaf(&reopened, &path)?;
+        if reopened_identity != artifact_identity {
+            return Err(PushLogError::NamespaceIsolation(format!(
+                "push_log artifact identity changed before final validation: {}",
+                path.display()
+            )));
+        }
+        let final_root = revalidate_push_log_directory_chain(&self.root_binding)?;
+        revalidate_push_log_leaf_at(
+            &final_root,
+            std::ffi::OsStr::new(PUSH_LOG_LOCK_FILE),
+            &self.root.join(PUSH_LOG_LOCK_FILE),
+            PUSH_LOG_O_RDWR,
+            self.lock_identity,
+        )?;
+        // A hostile process running under the same UID can still mutate the
+        // namespace after this final validation. Production therefore requires
+        // an exclusive service UID and owner-only writable manifest data roots.
+        Ok(path)
+    }
+}
+
+fn validate_push_log_test_code(test_code: &str) -> Result<(), PushLogError> {
+    if !test_code.starts_with("TEST_CODE")
+        || !test_code
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    {
+        return Err(PushLogError::NamespaceIsolation(
+            "push_log TEST_CODE must be one path-safe TEST_CODE-prefixed component".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn generic_push_log_writers() -> &'static std::sync::Mutex<
+    std::collections::BTreeMap<String, std::sync::Arc<PinnedPushLogWriter>>,
+> {
+    static WRITERS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<String, std::sync::Arc<PinnedPushLogWriter>>>,
+    > = std::sync::OnceLock::new();
+    WRITERS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+pub(super) fn eager_bind_push_log_capability(
+    namespace: &crate::durable_delivery_runtime::RuntimeNamespace,
+) -> Result<std::sync::Arc<PinnedPushLogWriter>, PushLogError> {
+    if std::env::var_os("PUSH_LOG_DIR").is_some() {
+        return Err(PushLogError::NamespaceOverrideRejected {
+            namespace: namespace.label(),
+        });
+    }
+    let namespace_label = namespace.label();
+    let mut writers = generic_push_log_writers().lock().map_err(|_| {
+        PushLogError::Persistence("push_log writer registry mutex poisoned".to_owned())
+    })?;
+    if let Some(writer) = writers.get(&namespace_label) {
+        revalidate_push_log_directory_chain(&writer.root_binding)?;
+        return Ok(std::sync::Arc::clone(writer));
+    }
+    let writer = std::sync::Arc::new(PinnedPushLogWriter::for_namespace(namespace)?);
+    writers.insert(namespace_label, std::sync::Arc::clone(&writer));
+    Ok(writer)
+}
+
+#[cfg(test)]
+fn save_push_log_at_root(
+    root: &std::path::Path,
+    text: &str,
+) -> Result<std::path::PathBuf, PushLogError> {
+    let boundary = root.parent().ok_or_else(|| {
+        PushLogError::NamespaceIsolation(format!(
+            "test push_log root has no creation boundary: {}",
+            root.display()
+        ))
+    })?;
+    PinnedPushLogWriter::bind("TEST_CODE_FIXTURE".to_owned(), root.to_path_buf(), boundary)?
+        .save(text)
+}
+
+#[cfg(test)]
+fn save_push_log_at_root_with_hook<F>(
+    root: &std::path::Path,
+    text: &str,
+    mut hook: F,
+) -> Result<std::path::PathBuf, PushLogError>
+where
+    F: FnMut(PushLogWritePhase, &std::path::Path, &std::path::Path, Option<&std::path::Path>),
+{
+    let boundary = root.parent().ok_or_else(|| {
+        PushLogError::NamespaceIsolation(format!(
+            "test push_log root has no creation boundary: {}",
+            root.display()
+        ))
+    })?;
+    PinnedPushLogWriter::bind("TEST_CODE_FIXTURE".to_owned(), root.to_path_buf(), boundary)?
+        .save_with_hook(text, |phase, root, date_path, artifact| {
+            hook(phase, root, date_path, artifact);
+        })
+}
+
+fn save_push_log(
+    bound_namespace: &crate::durable_delivery_runtime::RuntimeNamespace,
+    text: &str,
+) -> Result<std::path::PathBuf, PushLogError> {
     log::info!(
         "[v69] save_push_log entered, text len={}",
         text.chars().count()
     );
-    let now = chrono::Local::now();
-    let date_dir = now.format("%Y-%m-%d").to_string();
-    let time_prefix = now.format("%H%M%S").to_string();
-    let unique_suffix = push_log_suffix_at(std::time::SystemTime::now())?;
-    let root = std::env::var("PUSH_LOG_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            if cfg!(test) || std::env::var("STOCK_ENV_MODE").ok().as_deref() == Some("test") {
-                std::path::PathBuf::from("data/test/push_log")
-            } else {
-                std::path::PathBuf::from("data/push_log")
-            }
+    if std::env::var_os("PUSH_LOG_DIR").is_some() {
+        return Err(PushLogError::NamespaceOverrideRejected {
+            namespace: bound_namespace.label(),
         });
-    let dir = root.join(&date_dir);
-    std::fs::create_dir_all(&dir)
-        .map_err(|error| format!("push_log 目录创建失败 {}: {error}", dir.display()))?;
-    let path = dir.join(format!("{time_prefix}_{unique_suffix}.md"));
-    let mut file = create_push_log_file(&path)?;
-    file.write_all(text.as_bytes())
-        .map_err(|error| format!("push_log 写入失败 {}: {error}", path.display()))?;
-    file.sync_data()
-        .map_err(|error| format!("push_log fsync 失败 {}: {error}", path.display()))?;
+    }
+    let namespace_label = bound_namespace.label();
+    let writer = {
+        let writers = generic_push_log_writers().lock().map_err(|_| {
+            PushLogError::Persistence("push_log writer registry mutex poisoned".to_owned())
+        })?;
+        writers
+            .get(&namespace_label)
+            .map(std::sync::Arc::clone)
+            .ok_or_else(|| {
+                PushLogError::Persistence(format!(
+                    "push_log capability was not eagerly bound for namespace {namespace_label}"
+                ))
+            })?
+    };
+    let path = writer.save(text)?;
     log::info!("[v69] push_log 写入: {}", path.display());
     Ok(path)
-}
-
-/// v70+: 新闻推荐落盘 (D-01 / I-02 推荐时 → D+1 兑现 关联)
-///   - 文件: data/d01_recommendations_YYYY-MM-DD.jsonl (按天)
-///   - 字段: ts (推送时间), template (D-01/I-02), code, name, theme, reason (3 条), action, price
-///   - 后续: 跟 news_outcome_YYYY-MM-DD.md 关联 (D+1 兑现 → 胜率)
-///   - 调用: push_news_recommendation() 在 notify::push_governor(D-01/I-02) 后调
-pub fn record_news_recommendation(
-    template: &str,
-    code: &str,
-    name: &str,
-    theme: &str,
-    reason: &[&str],
-    action: Option<&str>,
-    price: Option<f64>,
-) {
-    use std::fs::{create_dir_all, OpenOptions};
-    use std::io::Write;
-    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let dir = std::path::PathBuf::from("data").join("d01_recommendations");
-    if let Err(e) = create_dir_all(&dir) {
-        log::warn!("[v70+] d01_recommendations 目录创建失败: {}", e);
-        return;
-    }
-    let path = dir.join(format!("{}.jsonl", date));
-    let reason_json: Vec<String> = reason.iter().map(|s| s.to_string()).collect();
-    let entry = serde_json::json!({
-        "ts": ts,
-        "template": template,
-        "code": code,
-        "name": name,
-        "theme": theme,
-        "reason": reason_json,
-        "action": action.unwrap_or(""),
-        // W1.16 / B-010 P0-5: price 缺失必须显式为 null, 不允许 0.0 fallback
-        // 下游读取时用 .is_null() 判缺失, 避免被误认为合法报价
-        "price": price,
-        "outcome": null, // 后续回填
-    });
-    match OpenOptions::new().create(true).append(true).open(&path) {
-        Ok(mut f) => {
-            if let Err(e) = writeln!(f, "{}", entry) {
-                log::warn!("[v70+] d01_recommendations 写入失败: {}", e);
-            } else {
-                log::info!(
-                    "[v70+] 落盘推荐: {} ({}) → {}",
-                    template,
-                    code,
-                    path.display()
-                );
-            }
-        }
-        Err(e) => log::warn!("[v70+] d01_recommendations 创建文件失败: {}", e),
-    }
 }
 
 /// v11-P0-4 commit D: 推送治理入口
@@ -988,16 +2040,25 @@ impl PushOutcome {
 ///     gate/analytics 全链路照走 → --test 能测到完整推送治理路径)
 ///   - sink_name 不再硬编码 "wechat" (b011 P0-1), 取实际通道
 async fn push_governor_inner(text: &str, kind: PushKind, code: Option<&str>) -> PushOutcome {
-    push_governor_inner_with_source_fact(text, kind, code, None).await
+    push_governor_inner_with_source_evidence(text, kind, code, None, None, None).await
 }
 
-async fn push_governor_inner_with_source_fact(
+async fn push_governor_inner_with_source_evidence(
     text: &str,
     kind: PushKind,
     code: Option<&str>,
     source_fact: Option<&crate::v14_adapter::SourceFactEvidence>,
+    source_batch: Option<&crate::v14_adapter::SourceBatchEvidence>,
+    br196_smoke: Option<&crate::br196_test_delivery::GovernanceSmokeDispatch<'_>>,
 ) -> PushOutcome {
     use crate::v14_adapter::{self, V14Gate};
+
+    if crate::durable_delivery_runtime::is_counted_kind(kind) {
+        log::error!(
+            "[DurableDelivery][BR-192] generic PushKind::{kind:?} rejected: counted_binding_required"
+        );
+        return PushOutcome::Denied("counted_binding_required".to_owned());
+    }
 
     // v17.5 §2.2: 命中 v17.5-legacy variants 时按 env 控制可见性
     //   默认 warn 出声 (v15.x 4 铁律 — 默认值必须出声状态);
@@ -1052,9 +2113,19 @@ async fn push_governor_inner_with_source_fact(
     if !launch_gate_check(kind) {
         return PushOutcome::Denied("launch_gate_stage".to_string());
     }
-    let gate = match source_fact {
-        Some(evidence) => v14_adapter::v14_gate_source_fact(evidence),
-        None => v14_adapter::v14_gate(kind, code),
+    let gate = match (source_fact, source_batch, br196_smoke) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) | (_, Some(_), Some(_)) => {
+            return PushOutcome::Denied("multiple_source_evidence_bindings".to_owned());
+        }
+        (Some(evidence), None, None) => v14_adapter::v14_gate_source_fact(evidence),
+        (None, Some(evidence), None) => v14_adapter::v14_gate_source_batch(evidence),
+        (None, None, Some(dispatch)) => {
+            if dispatch.push_kind() != kind || dispatch.code() != code {
+                return PushOutcome::Denied("br196_governance_smoke_binding_mismatch".to_owned());
+            }
+            v14_adapter::v14_gate_br196_smoke(dispatch)
+        }
+        (None, None, None) => v14_adapter::v14_gate(kind, code),
     };
     let event = match gate {
         V14Gate::Deduped => return PushOutcome::Deduped,
@@ -1062,47 +2133,11 @@ async fn push_governor_inner_with_source_fact(
         V14Gate::Approved(event) => *event,
     };
     let start = std::time::Instant::now();
-    deliver_and_record(event, kind, text, start, None, None).await
-}
-
-/// v17.6 §5.1: push_governor_inner 的 sub_kind-aware 版本.
-/// cooldown 取 sub_kind.cooldown_secs() override (None 时跟随 kind 默认).
-async fn push_governor_inner_with_sub_kind(
-    text: &str,
-    kind: PushKind,
-    code: Option<&str>,
-    sub_kind: Option<DailyReportSubKind>,
-) -> PushOutcome {
-    use crate::v14_adapter::{self, V14Gate};
-    // 复用 push_governor_inner 的 audit log / launch_gate (kind-only)
-    // 然后在 L4 dedup 步改用 v14_gate_with_sub_kind
-    if !launch_gate_check(kind) {
-        return PushOutcome::Denied("launch_gate_stage".to_string());
-    }
-    let sub_kind_str = sub_kind.map(|s| s.label());
-    // cooldown override: sub_kind.cooldown_secs() 优先, None 时回退 kind 默认
-    let override_cooldown = sub_kind.and_then(|s| s.cooldown_secs());
-    let event =
-        match v14_adapter::v14_gate_with_sub_kind(kind, code, sub_kind_str, override_cooldown) {
-            V14Gate::Deduped => return PushOutcome::Deduped,
-            V14Gate::Denied(reason) => return PushOutcome::Denied(reason),
-            V14Gate::Approved(event) => {
-                if let Some(cd) = override_cooldown {
-                    log::info!(
-                        "[v17.6 §5.1] sub_kind {:?} 使用 {}s 独立冷却窗口",
-                        sub_kind_str,
-                        cd
-                    );
-                }
-                *event
-            }
-        };
-    let start = std::time::Instant::now();
-    deliver_and_record(event, kind, text, start, sub_kind_str, override_cooldown).await
+    deliver_and_record(event, kind, text, start, None, None, source_batch).await
 }
 
 /// 公共尾段: L5/L6 投递 + L7/哈希链留痕 + commit/rollback.
-/// push_governor_inner + push_governor_inner_with_sub_kind 共用 (DRY).
+/// 仅供非 counted generic governor 使用；counted delivery 走 BR-192 binding 链.
 async fn deliver_and_record(
     event: stock_analysis::push_l1::SignalEvent,
     kind: PushKind,
@@ -1110,16 +2145,25 @@ async fn deliver_and_record(
     start: std::time::Instant,
     sub_kind: Option<&str>,
     cooldown_override_secs: Option<u32>,
+    source_batch: Option<&crate::v14_adapter::SourceBatchEvidence>,
 ) -> PushOutcome {
     use crate::v14_adapter;
-    // BR-144: never emit a physical push while the durable audit chain is
-    // already degraded; doing so would create an untraceable delivery.
+    // Defensive BR-192 boundary. Public generic governors reject counted kinds
+    // before constructing a synthetic event; this keeps future internal
+    // call-sites from accidentally regaining the retired path.
+    if crate::durable_delivery_runtime::is_counted_kind(kind) {
+        return PushOutcome::Denied("counted_binding_required".to_owned());
+    }
+
+    // BR-144 governs the legacy delivery audit chain only. Counted kinds have
+    // already branched into BR-192's exact-byte append/reconcile chain above.
     if let stock_analysis::event::AuditHealth::Degraded { reason_code } =
         stock_analysis::event::runtime_delivery_audit_health()
     {
         log::error!("[AuditDegraded][BR-144] delivery blocked before sink: {reason_code}");
         return PushOutcome::SinkError(format!("delivery audit unavailable: {reason_code}"));
     }
+
     // v15.1 A3: 把 reserve/commit 拆分, 失败时 rollback 不占 cooldown 窗口
     // v17.1-r2 §3.6: env opt-in 走 L6 SinkRouter (env=STOCK_ANALYSIS_PUSH_V6_ENABLE=1).
     let delivered = if std::env::var("STOCK_ANALYSIS_PUSH_V6_ENABLE")
@@ -1147,14 +2191,27 @@ async fn deliver_and_record(
     // channel 已在上方取过: let channel = current_send_channel();
     // v17.3 Task 1 F1: 用实际投递耗时 (从 deliver_and_record 入口的 Instant 计算)
     let latency_ms = start.elapsed().as_millis() as u64;
-    let audit_result = stock_analysis::event::publish_delivery(
-        &kind.stable_template_id(),
-        event.code.as_deref(),
-        outcome_str,
-        channel,
-        text.len(),
-        latency_ms,
-    );
+    let audit_result = match source_batch {
+        Some(evidence) => stock_analysis::event::publish_source_batch_delivery(
+            &kind.stable_template_id(),
+            outcome_str,
+            channel,
+            text.len(),
+            latency_ms,
+            evidence.business_date(),
+            evidence.observed_at(),
+            evidence.batch_id(),
+            evidence.content_hash(),
+        ),
+        None => stock_analysis::event::publish_delivery(
+            &kind.stable_template_id(),
+            event.code.as_deref(),
+            outcome_str,
+            channel,
+            text.len(),
+            latency_ms,
+        ),
+    };
     let dedup_result = settle_dedup_after_delivery(
         &event,
         kind,
@@ -1233,7 +2290,8 @@ fn current_send_channel() -> &'static str {
 
 /// 无票号的全局模板入口。票级模板必须使用 `push_governor_v3` 并传真实代码；
 /// 若误用本入口会显式拒绝，避免不同股票共享一个伪代码冷却桶。
-pub async fn push_governor(text: &str, kind: PushKind) -> bool {
+#[cfg(test)]
+async fn push_governor(text: &str, kind: PushKind) -> bool {
     if requires_ticket_code(kind) {
         log::error!(
             "[push_governor] {:?} 需要真实 code，拒绝无票号兼容调用",
@@ -1246,40 +2304,245 @@ pub async fn push_governor(text: &str, kind: PushKind) -> bool {
 
 /// v14.2 单入口 (b011 P1-2 收敛后 + b013 review P0-1): 返回 enum 区分 4 种结果.
 /// `code`: 票级冷却键 (§14.3 "/票" 类 kind 必传 real 票号, 否则 L4 不做票级冷却).
-pub async fn push_governor_v3(text: &str, kind: PushKind, code: Option<&str>) -> PushOutcome {
+pub(super) async fn push_governor_v3(
+    text: &str,
+    kind: PushKind,
+    code: Option<&str>,
+) -> PushOutcome {
     push_governor_inner(text, kind, code).await
+}
+
+/// Dedicated BR-196 exact-six governance smoke entry.
+///
+/// The dispatch is minted only by the invocation-scoped BR-196 context; the
+/// generic governor remains bound to the ordinary process clock and quiet-hour
+/// policy.
+pub(super) async fn push_br196_governance_smoke_v3(
+    text: &str,
+    dispatch: crate::br196_test_delivery::GovernanceSmokeDispatch<'_>,
+) -> PushOutcome {
+    let kind = dispatch.push_kind();
+    let code = dispatch.code();
+    push_governor_inner_with_source_evidence(text, kind, code, None, None, Some(&dispatch)).await
+}
+
+/// BR-196 presentation-token gateway for registered production card shapes.
+/// The token is non-cloneable and consumed by this dispatch.
+pub async fn push_presented_v3(
+    token: crate::presentation_registry::ProductionPresentationToken,
+    text: &str,
+    code: Option<&str>,
+) -> PushOutcome {
+    let kind = token.descriptor().push_kind;
+    push_governor_inner(text, kind, code).await
+}
+
+/// BR-192 sole generic counted-delivery entry.
+///
+/// Launch/L5 governance receives a stable SignalEvent derived from the
+/// caller-supplied occurrence identity. The durable runtime receives only the
+/// immutable binding, never that governance event.
+pub async fn push_counted_with_binding(
+    token: crate::presentation_registry::ProductionPresentationToken,
+    text: &str,
+    sub_kind: Option<DailyReportSubKind>,
+    binding: crate::durable_delivery_runtime::CountedDeliveryBinding,
+) -> PushOutcome {
+    use crate::v14_adapter::V14Gate;
+
+    let kind = token.descriptor().push_kind;
+    if !crate::durable_delivery_runtime::is_counted_kind(kind) {
+        return PushOutcome::Denied("counted_kind_required".to_owned());
+    }
+    if !launch_gate_check(kind) {
+        return PushOutcome::Denied("launch_gate_stage".to_owned());
+    }
+    let sub_kind_label = sub_kind.map(DailyReportSubKind::label);
+    let gate = crate::v14_adapter::v14_gate_counted_binding(
+        kind,
+        binding.governance_code(),
+        sub_kind_label,
+        binding.schedule_occurrence_identity(),
+        binding.business_date(),
+    );
+    let governance_event = match gate {
+        V14Gate::Deduped => {
+            return PushOutcome::Denied("counted_gate_returned_legacy_dedup".to_owned());
+        }
+        V14Gate::Denied(reason) => return PushOutcome::Denied(reason),
+        V14Gate::Approved(event) => event,
+    };
+    log::debug!(
+        "[DurableDelivery][BR-192] stable governance event approved event_id={} occurrence={}",
+        governance_event.event_id,
+        binding.schedule_occurrence_identity()
+    );
+    crate::durable_delivery_runtime::deliver_counted_binding(
+        binding,
+        kind,
+        text.to_owned(),
+        sub_kind,
+    )
+    .await
+}
+
+/// BR-194 sole counted SourceOnly entry. The profile is derived from the
+/// canonical R-04 binding and cannot be selected by a caller.
+pub async fn push_counted_source_only_with_binding(
+    token: crate::presentation_registry::ProductionPresentationToken,
+    text: &str,
+    binding: crate::durable_delivery_runtime::CountedDeliveryBinding,
+) -> PushOutcome {
+    let kind = token.descriptor().push_kind;
+    if !crate::durable_delivery_runtime::is_counted_kind(kind) || kind != PushKind::ReviewLhb {
+        return PushOutcome::Denied("counted_source_only_kind_not_allowed".to_owned());
+    }
+    if let Err(reason) = binding.validate_r04_source_only_text(text) {
+        return PushOutcome::Denied(reason.to_owned());
+    }
+    push_counted_source_only_after_validation_with(
+        text,
+        kind,
+        binding,
+        launch_gate_check,
+        crate::v14_adapter::v14_gate_counted_source_only_binding,
+        |binding, kind, text| async move {
+            crate::durable_delivery_runtime::deliver_counted_binding(binding, kind, text, None)
+                .await
+        },
+    )
+    .await
+}
+
+/// BR-199 sole public-only R-08 entry. The caller cannot select another kind
+/// or route this binding through the combined-account counted gate.
+async fn push_r08_source_only_with_binding(
+    text: &str,
+    binding: crate::durable_delivery_runtime::CountedDeliveryBinding,
+) -> PushOutcome {
+    let kind = PushKind::EventCalendar;
+    if let Err(reason) = binding.validate_r08_public_source_only_text(text) {
+        return PushOutcome::Denied(reason.to_owned());
+    }
+    push_counted_source_only_after_validation_with(
+        text,
+        kind,
+        binding,
+        launch_gate_check,
+        crate::v14_adapter::v14_gate_r08_source_only_binding,
+        |binding, kind, text| async move {
+            crate::durable_delivery_runtime::deliver_counted_binding(binding, kind, text, None)
+                .await
+        },
+    )
+    .await
+}
+
+pub async fn push_r08_presented_source_only_with_binding(
+    token: crate::presentation_registry::ProductionPresentationToken,
+    text: &str,
+    binding: crate::durable_delivery_runtime::CountedDeliveryBinding,
+) -> PushOutcome {
+    if token.descriptor().push_kind != PushKind::EventCalendar {
+        return PushOutcome::Denied("presentation_token_kind_mismatch".to_owned());
+    }
+    push_r08_source_only_with_binding(text, binding).await
+}
+
+async fn push_counted_source_only_after_validation_with<Launch, Gate, Deliver, DeliveryFuture>(
+    text: &str,
+    kind: PushKind,
+    binding: crate::durable_delivery_runtime::CountedDeliveryBinding,
+    launch: Launch,
+    gate: Gate,
+    deliver: Deliver,
+) -> PushOutcome
+where
+    Launch: FnOnce(PushKind) -> bool,
+    Gate: FnOnce(
+        PushKind,
+        &crate::durable_delivery_runtime::CountedDeliveryBinding,
+    ) -> crate::v14_adapter::V14Gate,
+    Deliver: FnOnce(
+        crate::durable_delivery_runtime::CountedDeliveryBinding,
+        PushKind,
+        String,
+    ) -> DeliveryFuture,
+    DeliveryFuture: std::future::Future<Output = PushOutcome>,
+{
+    use crate::v14_adapter::V14Gate;
+
+    if !launch(kind) {
+        return PushOutcome::Denied("launch_gate_stage".to_owned());
+    }
+    let governance_event = match gate(kind, &binding) {
+        V14Gate::Deduped => {
+            return PushOutcome::Denied("counted_gate_returned_legacy_dedup".to_owned());
+        }
+        V14Gate::Denied(reason) => return PushOutcome::Denied(reason),
+        V14Gate::Approved(event) => event,
+    };
+    log::debug!(
+        "[DurableDelivery][BR-194] source-only governance approved event_id={} occurrence={}",
+        governance_event.event_id,
+        binding.schedule_occurrence_identity()
+    );
+    deliver(binding, kind, text.to_owned()).await
 }
 
 /// BR-137 sole delivery entry for a validated source-self-contained fact.
 /// Kind and dedup identity are derived from the evidence so callers cannot
 /// pair a relaxed source profile with an unrelated PushKind.
-pub async fn push_source_fact_v3(
+async fn push_source_fact_v3(
     text: &str,
     evidence: &crate::v14_adapter::SourceFactEvidence,
 ) -> PushOutcome {
-    push_governor_inner_with_source_fact(
+    push_governor_inner_with_source_evidence(
         text,
         evidence.kind(),
         evidence.security_code(),
         Some(evidence),
+        None,
+        None,
     )
     .await
 }
 
-/// v17.6 §5.1: push_governor_v3 的 sub_kind-aware 版本.
-/// daily_report_router 三个公开函数 (route_factor_ic / route_sector_tier /
-/// route_capital_verify) 调用 — 让 3 个 sub_kind 在 L4 dedup key 第三元组独立.
-pub async fn push_governor_v3_with_sub_kind(
+pub async fn push_presented_source_fact_v3(
+    token: crate::presentation_registry::ProductionPresentationToken,
     text: &str,
-    kind: PushKind,
-    code: Option<&str>,
-    sub_kind: Option<DailyReportSubKind>,
+    evidence: &crate::v14_adapter::SourceFactEvidence,
 ) -> PushOutcome {
-    push_governor_inner_with_sub_kind(text, kind, code, sub_kind).await
+    if token.descriptor().push_kind != evidence.kind() {
+        return PushOutcome::Denied("presentation_token_kind_mismatch".to_owned());
+    }
+    push_source_fact_v3(text, evidence).await
+}
+
+/// BR-160 sole delivery entry for an immutable, already committed A-10 source
+/// batch. Kind and governance identity are derived from the binding.
+pub async fn push_source_batch_v3(
+    token: crate::presentation_registry::ProductionPresentationToken,
+    text: &str,
+    evidence: &crate::v14_adapter::SourceBatchEvidence,
+) -> PushOutcome {
+    if token.descriptor().push_kind != evidence.kind() {
+        return PushOutcome::Denied("presentation_token_kind_mismatch".to_owned());
+    }
+    push_governor_inner_with_source_evidence(
+        text,
+        evidence.kind(),
+        None,
+        None,
+        Some(evidence),
+        None,
+    )
+    .await
 }
 
 /// b013 P0-1 兜底: PerTicket 类 kind 在缺 code 时塞占位, 让 L4 走全局 key,
 /// 至少防止"无限重发同一票"。b014 应把所有 caller 改成 push_governor_v3 显式传 code。
+#[cfg(test)]
 fn requires_ticket_code(kind: PushKind) -> bool {
     use PushKind::*;
     matches!(
@@ -1299,21 +2562,36 @@ fn requires_ticket_code(kind: PushKind) -> bool {
 }
 
 pub async fn push_wechat(text: &str) -> bool {
+    let bound_namespace = match crate::durable_delivery_runtime::current_runtime_namespace() {
+        Ok(namespace) => namespace,
+        Err(error) => {
+            log::error!("[BR-192] push-log namespace binding rejected: {error}");
+            return false;
+        }
+    };
     // v10 P6 5 要素接入: V10_DRY_RUN_PUSH=1 时跳过实际推送, 仅 log
     // 用于开发/验证推送内容变化, 不骚扰飞书
     if dry_run_push_active() {
         log::info!("[V10_DRY_RUN_PUSH] 跳过飞书推送, 内容预览:\n{}", text);
         // v69: 沙箱 dry-run 也保存 push_log
-        if let Err(error) = save_push_log(text) {
-            log::error!("[BR-086] dry-run push audit failed: {error}");
+        if let Err(error) = save_push_log(&bound_namespace, text) {
+            log::error!(
+                "[BR-086] dry-run push audit failed: reason_code={} retry_authorized={} {error}",
+                error.reason_code(),
+                error.retry_authorized()
+            );
             return false;
         }
         return true;
     }
 
     // v69: 不管走哪条推送路径 (magiclaw cli / feishu http / 后续), 都先保存 push_log
-    if let Err(error) = save_push_log(text) {
-        log::error!("[BR-086] push audit failed; delivery blocked: {error}");
+    if let Err(error) = save_push_log(&bound_namespace, text) {
+        log::error!(
+            "[BR-086] push audit failed; delivery blocked: reason_code={} retry_authorized={} {error}",
+            error.reason_code(),
+            error.retry_authorized()
+        );
         return false;
     }
 
@@ -1409,7 +2687,11 @@ pub async fn push_wechat(text: &str) -> bool {
                         verify_daemon_auth(&client, &api_base, &active_token, &active_token_source)
                             .await
                     {
-                        log::warn!("[{}] daemon 鉴权预检重试仍失败，但已重新签发 token，将继续尝试发送: {}", send_type.label(), e);
+                        log::warn!(
+                            "[{}] daemon 鉴权预检重试仍失败，但已重新签发 token，将继续尝试发送: {}",
+                            send_type.label(),
+                            e
+                        );
                     }
                 }
                 Err(issue_err) => {
@@ -1499,6 +2781,814 @@ pub async fn push_wechat(text: &str) -> bool {
             }
         }
     }
+}
+
+/// BR-192 single authoritative counted-delivery adapter.
+///
+/// This function is intentionally synchronous: the durable coordinator calls
+/// it only from `spawn_blocking`, so no nested Tokio runtime is constructed or
+/// dropped inside an async worker.  Production accepts only the CLI transport
+/// because it is the sole current transport that returns both a validated
+/// local message ID and the remote platform message ID.
+pub(super) fn deliver_authoritative_blocking(
+    bound_namespace: &crate::durable_delivery_runtime::RuntimeNamespace,
+    push_log_writer: &PinnedPushLogWriter,
+    delivery_audit: &stock_analysis::event::AuditDispatcher,
+    request: &stock_analysis::durable_delivery::AuthoritativeDeliveryRequest,
+) -> stock_analysis::durable_delivery::AuthoritativeSinkResult {
+    use stock_analysis::durable_delivery::{
+        AuthoritativeSinkResult, TypedReceipt, TypedRejection, TypedUncertainty,
+    };
+
+    let observed_at = chrono::Utc::now();
+    let test_namespace = match bound_namespace {
+        crate::durable_delivery_runtime::RuntimeNamespace::Production => None,
+        crate::durable_delivery_runtime::RuntimeNamespace::Test { test_code } => {
+            Some(test_code.as_str())
+        }
+    };
+    let canonical_template_id = request.push_kind.stable_template_id();
+    if request.stable_template_id != canonical_template_id {
+        let result = AuthoritativeSinkResult::Rejected(TypedRejection {
+            reason_code: "durable_template_binding_invalid".to_owned(),
+            evidence: format!(
+                "push_kind={} expected_template={} supplied_template={}",
+                request.push_kind.as_str(),
+                canonical_template_id,
+                request.stable_template_id
+            )
+            .into_bytes(),
+            retry_authorized: false,
+            observed_at,
+        });
+        return finalize_counted_delivery(push_log_writer, delivery_audit, request, "", result);
+    }
+    let invalid_utf8_placeholder;
+    let text = match std::str::from_utf8(&request.rendered_content) {
+        Ok(text) if !text.trim().is_empty() => text,
+        Ok(_) => {
+            let result = AuthoritativeSinkResult::Rejected(TypedRejection {
+                reason_code: "empty_rendered_content".to_owned(),
+                evidence: b"rendered content is empty".to_vec(),
+                retry_authorized: false,
+                observed_at,
+            });
+            return finalize_counted_delivery(push_log_writer, delivery_audit, request, "", result);
+        }
+        Err(error) => {
+            let result = AuthoritativeSinkResult::Rejected(TypedRejection {
+                reason_code: "rendered_content_not_utf8".to_owned(),
+                evidence: error.to_string().into_bytes(),
+                retry_authorized: false,
+                observed_at,
+            });
+            invalid_utf8_placeholder = format!(
+                "<non-UTF8 rendered content; sha256={}>",
+                request.rendered_content_sha256
+            );
+            return finalize_counted_delivery(
+                push_log_writer,
+                delivery_audit,
+                request,
+                &invalid_utf8_placeholder,
+                result,
+            );
+        }
+    };
+
+    let raw_result = if let Some(test_code) = test_namespace {
+        log::info!(
+            "[V10_DRY_RUN_PUSH][BR-192] authoritative test delivery skipped network namespace={} decision={}",
+            test_code,
+            request.decision_identity,
+        );
+        AuthoritativeSinkResult::Accepted(TypedReceipt {
+            channel: "TEST_CODE_DRY_RUN".to_owned(),
+            provider: "TEST_CODE_MAGICLAW_DRY_RUN".to_owned(),
+            message_id: format!(
+                "TEST_CODE_DRY_RUN_{}",
+                request
+                    .decision_identity
+                    .chars()
+                    .take(24)
+                    .collect::<String>()
+            ),
+            platform_message_id: Some(format!(
+                "TEST_CODE_PLATFORM_{}",
+                request
+                    .attempt_identity
+                    .chars()
+                    .take(24)
+                    .collect::<String>()
+            )),
+            accepted_at: observed_at,
+            latency_ms: Some(0),
+        })
+    } else {
+        let send_type = resolve_send_type();
+        let send_transport = resolve_send_transport(send_type);
+        if !matches!(send_transport, MessageSendTransport::Cli) {
+            AuthoritativeSinkResult::Rejected(TypedRejection {
+                reason_code: "typed_receipt_transport_unavailable".to_owned(),
+                evidence: format!(
+                    "channel={} transport={} does not return a typed remote receipt",
+                    send_type.as_str(),
+                    send_transport.as_str()
+                )
+                .into_bytes(),
+                retry_authorized: true,
+                observed_at,
+            })
+        } else {
+            let started = std::time::Instant::now();
+            match push_via_magiclaw_cli_receipt_blocking(send_type, text) {
+                Ok(receipt) => AuthoritativeSinkResult::Accepted(TypedReceipt {
+                    channel: send_type.as_str().to_owned(),
+                    provider: "magiclaw-cli".to_owned(),
+                    message_id: receipt.message_id,
+                    platform_message_id: Some(receipt.platform_msg_id),
+                    accepted_at: chrono::Utc::now(),
+                    latency_ms: Some(
+                        i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+                    ),
+                }),
+                Err(BlockingCliDeliveryFailure::Rejected {
+                    reason_code,
+                    evidence,
+                }) => AuthoritativeSinkResult::Rejected(TypedRejection {
+                    reason_code,
+                    evidence,
+                    retry_authorized: true,
+                    observed_at: chrono::Utc::now(),
+                }),
+                Err(BlockingCliDeliveryFailure::Uncertain {
+                    reason_code,
+                    evidence,
+                }) => AuthoritativeSinkResult::Uncertain(TypedUncertainty {
+                    reason_code,
+                    evidence,
+                    observed_at: chrono::Utc::now(),
+                }),
+            }
+        }
+    };
+    let finalized =
+        finalize_counted_delivery(push_log_writer, delivery_audit, request, text, raw_result);
+    #[cfg(test)]
+    maybe_crash_after_test_counted_accept(test_namespace, &finalized);
+    finalized
+}
+
+#[cfg(test)]
+fn maybe_crash_after_test_counted_accept(
+    test_namespace: Option<&str>,
+    result: &stock_analysis::durable_delivery::AuthoritativeSinkResult,
+) {
+    use std::io::Write;
+
+    if std::env::var_os("BR192_FULL_CHAIN_CRASH_AFTER_ACCEPTED").is_none()
+        || !matches!(
+            result,
+            stock_analysis::durable_delivery::AuthoritativeSinkResult::Accepted(_)
+        )
+    {
+        return;
+    }
+    let test_code =
+        test_namespace.expect("BR-192 accepted-crash injection is restricted to TEST_CODE");
+    assert!(
+        test_code.starts_with("TEST_CODE")
+            && test_code
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')),
+        "BR-192 accepted-crash injection requires one path-safe TEST_CODE component"
+    );
+    let namespace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("data/test")
+        .join(test_code);
+    let ready_path = namespace.join("br192_remote_accepted.ready");
+    let release_path = namespace.join("br192_remote_accepted.release");
+    let pending_ready_path = namespace.join(format!(
+        ".br192_remote_accepted.ready.{}.tmp",
+        std::process::id()
+    ));
+    let mut marker = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pending_ready_path)
+        .expect("create private BR-192 accepted marker");
+    let canonical = serde_json::to_vec(&authoritative_sink_result_value(result))
+        .expect("serialize BR-192 accepted marker");
+    marker
+        .write_all(&canonical)
+        .expect("write BR-192 accepted marker");
+    marker.sync_all().expect("fsync BR-192 accepted marker");
+    drop(marker);
+    std::fs::hard_link(&pending_ready_path, &ready_path)
+        .expect("atomically publish complete BR-192 accepted marker without overwrite");
+    std::fs::File::open(&namespace)
+        .and_then(|directory| directory.sync_all())
+        .expect("fsync TEST_CODE namespace after accepted marker");
+    std::fs::remove_file(&pending_ready_path)
+        .expect("remove private BR-192 accepted marker after publication");
+    std::fs::File::open(&namespace)
+        .and_then(|directory| directory.sync_all())
+        .expect("fsync TEST_CODE namespace after private marker cleanup");
+    for _ in 0..3_000 {
+        if release_path.is_file() {
+            std::process::exit(86);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("BR-192 accepted-crash parent did not release TEST_CODE child");
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct CountedPushLogPending {
+    schema: String,
+    state: String,
+    durable_push_kind: String,
+    stable_template_id: String,
+    decision_identity: String,
+    attempt_identity: String,
+    decision_identity_hash: String,
+    attempt_identity_hash: String,
+    fence_token: i64,
+    rendered_content_sha256: String,
+    rendered_content: String,
+    sink_result: serde_json::Value,
+    sink_result_sha256: String,
+    receipt_sha256: String,
+    observed_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CountedPushLogCommit {
+    schema: String,
+    state: String,
+    durable_push_kind: String,
+    stable_template_id: String,
+    decision_identity_hash: String,
+    attempt_identity_hash: String,
+    pending_artifact_sha256: String,
+    delivery_audit_event_id: String,
+    counted_join_hash: String,
+    committed_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CountedFinalizationStage {
+    Pending,
+    Audit,
+    Commit,
+    TerminalVerify,
+}
+
+fn finalize_counted_delivery(
+    push_log_writer: &PinnedPushLogWriter,
+    delivery_audit: &stock_analysis::event::AuditDispatcher,
+    request: &stock_analysis::durable_delivery::AuthoritativeDeliveryRequest,
+    text: &str,
+    raw_result: stock_analysis::durable_delivery::AuthoritativeSinkResult,
+) -> stock_analysis::durable_delivery::AuthoritativeSinkResult {
+    finalize_counted_delivery_with_hook(
+        push_log_writer,
+        delivery_audit,
+        request,
+        text,
+        raw_result,
+        |_| Ok(()),
+    )
+}
+
+fn finalize_counted_delivery_with_hook<F>(
+    push_log_writer: &PinnedPushLogWriter,
+    delivery_audit: &stock_analysis::event::AuditDispatcher,
+    request: &stock_analysis::durable_delivery::AuthoritativeDeliveryRequest,
+    text: &str,
+    raw_result: stock_analysis::durable_delivery::AuthoritativeSinkResult,
+    mut hook: F,
+) -> stock_analysis::durable_delivery::AuthoritativeSinkResult
+where
+    F: FnMut(CountedFinalizationStage) -> Result<(), String>,
+{
+    use stock_analysis::durable_delivery::AuthoritativeSinkResult;
+    let canonical_template_id = request.push_kind.stable_template_id();
+    if request.stable_template_id != canonical_template_id {
+        return counted_delivery_persistence_uncertain(
+            &raw_result,
+            "durable_template_binding",
+            &format!(
+                "push_kind={} expected={} supplied={}",
+                request.push_kind.as_str(),
+                canonical_template_id,
+                request.stable_template_id
+            ),
+            None,
+        );
+    }
+    let result_value = authoritative_sink_result_value(&raw_result);
+    let result_canonical = match serde_json::to_vec(&result_value) {
+        Ok(value) => value,
+        Err(error) => {
+            return counted_delivery_persistence_uncertain(
+                &raw_result,
+                "sink_result_serialization",
+                &error.to_string(),
+                None,
+            );
+        }
+    };
+    let sink_result_sha256 =
+        sha256_domain("stock_analysis.counted_sink_result.v1", &result_canonical);
+    let receipt_sha256 = match &raw_result {
+        AuthoritativeSinkResult::Accepted(receipt) => match serde_json::to_vec(receipt) {
+            Ok(value) => sha256_domain("stock_analysis.counted_receipt.v1", &value),
+            Err(error) => {
+                return counted_delivery_persistence_uncertain(
+                    &raw_result,
+                    "receipt_serialization",
+                    &error.to_string(),
+                    None,
+                );
+            }
+        },
+        _ => sha256_domain(
+            "stock_analysis.counted_receipt.none.v1",
+            b"NO_VALIDATED_RECEIPT",
+        ),
+    };
+    let decision_identity_hash = sha256_domain(
+        "stock_analysis.counted_decision_identity.v1",
+        request.decision_identity.as_bytes(),
+    );
+    let attempt_identity_hash = sha256_domain(
+        "stock_analysis.counted_attempt_identity.v1",
+        request.attempt_identity.as_bytes(),
+    );
+    let pending = CountedPushLogPending {
+        schema: "stock_analysis.counted_push_log.v1".to_owned(),
+        state: "AuditPending".to_owned(),
+        durable_push_kind: request.push_kind.as_str().to_owned(),
+        stable_template_id: canonical_template_id.to_owned(),
+        decision_identity: request.decision_identity.clone(),
+        attempt_identity: request.attempt_identity.clone(),
+        decision_identity_hash: decision_identity_hash.clone(),
+        attempt_identity_hash: attempt_identity_hash.clone(),
+        fence_token: request.fence_token,
+        rendered_content_sha256: request.rendered_content_sha256.clone(),
+        rendered_content: text.to_owned(),
+        sink_result: result_value,
+        sink_result_sha256: sink_result_sha256.clone(),
+        receipt_sha256: receipt_sha256.clone(),
+        observed_at: chrono::Utc::now(),
+    };
+    let pending_bytes = match serde_json::to_vec(&pending) {
+        Ok(value) => value,
+        Err(error) => {
+            return counted_delivery_persistence_uncertain(
+                &raw_result,
+                "artifact_serialization",
+                &error.to_string(),
+                None,
+            );
+        }
+    };
+    let pending_artifact_sha256 = sha256_domain(
+        "stock_analysis.counted_push_log_artifact.v1",
+        &pending_bytes,
+    );
+    if let Err(error) = hook(CountedFinalizationStage::Pending) {
+        return counted_delivery_persistence_uncertain(
+            &raw_result,
+            "artifact_audit_pending_injected",
+            &error,
+            Some(&pending_artifact_sha256),
+        );
+    }
+    let artifact_prefix = format!("{decision_identity_hash}_{attempt_identity_hash}");
+    let pending_name = format!("{artifact_prefix}_audit_pending.json");
+    let pending_path = match push_log_writer.save_named_payload(&pending_bytes, &pending_name) {
+        Ok(path) => path,
+        Err(error) => {
+            return counted_delivery_persistence_uncertain(
+                &raw_result,
+                "artifact_audit_pending",
+                &error.to_string(),
+                Some(&pending_artifact_sha256),
+            );
+        }
+    };
+
+    let (outcome, channel, latency_ms) = counted_audit_outcome(&raw_result);
+    let event = stock_analysis::event::PushDeliveryEvent::new_counted(
+        request.push_kind.as_str().to_owned(),
+        canonical_template_id.to_owned(),
+        outcome.to_owned(),
+        channel,
+        text.len(),
+        latency_ms,
+        decision_identity_hash.clone(),
+        attempt_identity_hash.clone(),
+        pending_artifact_sha256.clone(),
+        sink_result_sha256,
+        receipt_sha256,
+    );
+    let event_id = event
+        .counted_join_hash
+        .clone()
+        .expect("new_counted always sets counted_join_hash");
+    let trace_id = sha256_domain(
+        "stock_analysis.counted_delivery_trace.v1",
+        format!(
+            "{}\0{}\0{}",
+            request.decision_identity, request.attempt_identity, request.fence_token
+        )
+        .as_bytes(),
+    );
+    if let Err(error) = hook(CountedFinalizationStage::Audit) {
+        return counted_delivery_persistence_uncertain(
+            &raw_result,
+            "delivery_audit_injected",
+            &error,
+            Some(&pending_artifact_sha256),
+        );
+    }
+    let audit_envelope = match stock_analysis::event::publish_counted_delivery_with(
+        delivery_audit,
+        event.clone(),
+        event_id.clone(),
+        trace_id,
+    ) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            return counted_delivery_persistence_uncertain(
+                &raw_result,
+                "delivery_audit",
+                &error,
+                Some(&pending_artifact_sha256),
+            );
+        }
+    };
+    let commit = CountedPushLogCommit {
+        schema: "stock_analysis.counted_push_log.v1".to_owned(),
+        state: "Committed".to_owned(),
+        durable_push_kind: request.push_kind.as_str().to_owned(),
+        stable_template_id: canonical_template_id.to_owned(),
+        decision_identity_hash: decision_identity_hash.clone(),
+        attempt_identity_hash: attempt_identity_hash.clone(),
+        pending_artifact_sha256: pending_artifact_sha256.clone(),
+        delivery_audit_event_id: event_id.clone(),
+        counted_join_hash: event
+            .counted_join_hash
+            .as_deref()
+            .expect("new_counted always sets counted_join_hash")
+            .to_owned(),
+        committed_at: chrono::Utc::now(),
+    };
+    let commit_bytes = match serde_json::to_vec(&commit) {
+        Ok(value) => value,
+        Err(error) => {
+            return counted_delivery_persistence_uncertain(
+                &raw_result,
+                "commit_marker_serialization",
+                &error.to_string(),
+                Some(&pending_artifact_sha256),
+            );
+        }
+    };
+    if let Err(error) = hook(CountedFinalizationStage::Commit) {
+        return counted_delivery_persistence_uncertain(
+            &raw_result,
+            "commit_marker_injected",
+            &error,
+            Some(&pending_artifact_sha256),
+        );
+    }
+    let commit_name = format!("{artifact_prefix}_committed.json");
+    let commit_path = match push_log_writer.save_named_payload(&commit_bytes, &commit_name) {
+        Ok(path) => path,
+        Err(error) => {
+            return counted_delivery_persistence_uncertain(
+                &raw_result,
+                "commit_marker",
+                &error.to_string(),
+                Some(&pending_artifact_sha256),
+            );
+        }
+    };
+    if let Err(error) = hook(CountedFinalizationStage::TerminalVerify) {
+        return counted_delivery_persistence_uncertain(
+            &raw_result,
+            "terminal_verifier_injected",
+            &error,
+            Some(&pending_artifact_sha256),
+        );
+    }
+    if let Err(error) = verify_counted_delivery_terminal(
+        push_log_writer,
+        delivery_audit,
+        &pending_path,
+        &pending_bytes,
+        &pending,
+        &audit_envelope,
+        &commit_path,
+        &commit_bytes,
+        &commit,
+    ) {
+        return counted_delivery_persistence_uncertain(
+            &raw_result,
+            "terminal_verifier",
+            &error,
+            Some(&pending_artifact_sha256),
+        );
+    }
+    raw_result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_counted_delivery_terminal(
+    push_log_writer: &PinnedPushLogWriter,
+    delivery_audit: &stock_analysis::event::AuditDispatcher,
+    pending_path: &std::path::Path,
+    expected_pending_bytes: &[u8],
+    expected_pending: &CountedPushLogPending,
+    expected_audit: &stock_analysis::event::EventEnvelope,
+    commit_path: &std::path::Path,
+    expected_commit_bytes: &[u8],
+    expected_commit: &CountedPushLogCommit,
+) -> Result<(), String> {
+    let pending_bytes = verify_exact_push_log_bytes(
+        push_log_writer,
+        pending_path,
+        expected_pending_bytes,
+        "pending",
+    )?;
+    let parsed_pending: CountedPushLogPending = serde_json::from_slice(&pending_bytes)
+        .map_err(|error| format!("parse exact pending artifact: {error}"))?;
+    if &parsed_pending != expected_pending {
+        return Err("pending artifact semantic binding changed".to_owned());
+    }
+
+    let audit_record = delivery_audit.verify_exact_counted_event(expected_audit)?;
+    verify_counted_audit_pending_binding(&audit_record, expected_pending, expected_commit)?;
+
+    let commit_bytes = verify_exact_push_log_bytes(
+        push_log_writer,
+        commit_path,
+        expected_commit_bytes,
+        "committed",
+    )?;
+    let parsed_commit: CountedPushLogCommit = serde_json::from_slice(&commit_bytes)
+        .map_err(|error| format!("parse exact committed artifact: {error}"))?;
+    if &parsed_commit != expected_commit {
+        return Err("committed artifact semantic binding changed".to_owned());
+    }
+    if expected_commit.delivery_audit_event_id != expected_audit.id
+        || expected_commit.counted_join_hash
+            != expected_audit
+                .payload
+                .get("counted_join_hash")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+    {
+        return Err("committed artifact does not bind the exact audit event".to_owned());
+    }
+    Ok(())
+}
+
+fn verify_counted_audit_pending_binding(
+    audit_record: &stock_analysis::event::PushRecord,
+    expected_pending: &CountedPushLogPending,
+    expected_commit: &CountedPushLogCommit,
+) -> Result<(), String> {
+    if audit_record.decision_identity_hash.as_deref()
+        != Some(expected_pending.decision_identity_hash.as_str())
+    {
+        return Err(
+            "schema-v3 audit decision_identity_hash does not match pending artifact".to_owned(),
+        );
+    }
+    if audit_record.attempt_identity_hash.as_deref()
+        != Some(expected_pending.attempt_identity_hash.as_str())
+    {
+        return Err(
+            "schema-v3 audit attempt_identity_hash does not match pending artifact".to_owned(),
+        );
+    }
+    if audit_record.artifact_sha256.as_deref()
+        != Some(expected_commit.pending_artifact_sha256.as_str())
+    {
+        return Err(
+            "schema-v3 audit artifact_sha256 does not match committed pending artifact".to_owned(),
+        );
+    }
+    if audit_record.sink_result_sha256.as_deref()
+        != Some(expected_pending.sink_result_sha256.as_str())
+    {
+        return Err(
+            "schema-v3 audit sink_result_sha256 does not match pending artifact".to_owned(),
+        );
+    }
+    if audit_record.receipt_sha256.as_deref() != Some(expected_pending.receipt_sha256.as_str()) {
+        return Err("schema-v3 audit receipt_sha256 does not match pending artifact".to_owned());
+    }
+    if audit_record.durable_push_kind.as_deref()
+        != Some(expected_pending.durable_push_kind.as_str())
+    {
+        return Err("schema-v3 audit durable_push_kind does not match pending artifact".to_owned());
+    }
+    if audit_record.stable_template_id.as_deref()
+        != Some(expected_pending.stable_template_id.as_str())
+    {
+        return Err(
+            "schema-v3 audit stable_template_id does not match pending artifact".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn verify_exact_push_log_bytes(
+    push_log_writer: &PinnedPushLogWriter,
+    path: &std::path::Path,
+    expected: &[u8],
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    let observed = push_log_writer
+        .read_exact_payload(path)
+        .map_err(|error| format!("read exact {label} artifact: {error}"))?;
+    if observed != expected {
+        return Err(format!("{label} artifact bytes changed after fsync"));
+    }
+    Ok(observed)
+}
+
+fn authoritative_sink_result_value(
+    result: &stock_analysis::durable_delivery::AuthoritativeSinkResult,
+) -> serde_json::Value {
+    use stock_analysis::durable_delivery::AuthoritativeSinkResult;
+    match result {
+        AuthoritativeSinkResult::Accepted(receipt) => {
+            serde_json::json!({"kind": "Accepted", "receipt": receipt})
+        }
+        AuthoritativeSinkResult::Rejected(rejection) => {
+            serde_json::json!({"kind": "Rejected", "rejection": rejection})
+        }
+        AuthoritativeSinkResult::Uncertain(uncertainty) => {
+            serde_json::json!({"kind": "Uncertain", "uncertainty": uncertainty})
+        }
+    }
+}
+
+fn counted_audit_outcome(
+    result: &stock_analysis::durable_delivery::AuthoritativeSinkResult,
+) -> (&'static str, String, u64) {
+    use stock_analysis::durable_delivery::AuthoritativeSinkResult;
+    match result {
+        AuthoritativeSinkResult::Accepted(receipt) => (
+            "Pushed",
+            receipt.channel.clone(),
+            receipt
+                .latency_ms
+                .and_then(|value| u64::try_from(value).ok())
+                .unwrap_or(0),
+        ),
+        AuthoritativeSinkResult::Rejected(rejection) if rejection.retry_authorized => {
+            ("SinkError", "authoritative".to_owned(), 0)
+        }
+        AuthoritativeSinkResult::Rejected(_) => ("Denied", "authoritative".to_owned(), 0),
+        AuthoritativeSinkResult::Uncertain(_) => ("Uncertain", "authoritative".to_owned(), 0),
+    }
+}
+
+fn counted_delivery_persistence_uncertain(
+    original: &stock_analysis::durable_delivery::AuthoritativeSinkResult,
+    stage: &str,
+    error: &str,
+    artifact_sha256: Option<&str>,
+) -> stock_analysis::durable_delivery::AuthoritativeSinkResult {
+    let evidence = serde_json::to_vec(&serde_json::json!({
+        "stage": stage,
+        "error": error,
+        "artifact_sha256": artifact_sha256,
+        "original_sink_result": authoritative_sink_result_value(original),
+    }))
+    .unwrap_or_else(|_| {
+        format!(
+            "stage={stage}; artifact_sha256={}; error={error}",
+            artifact_sha256.unwrap_or("unavailable")
+        )
+        .into_bytes()
+    });
+    stock_analysis::durable_delivery::AuthoritativeSinkResult::Uncertain(
+        stock_analysis::durable_delivery::TypedUncertainty {
+            reason_code: "counted_delivery_persistence_uncertain".to_owned(),
+            evidence,
+            observed_at: chrono::Utc::now(),
+        },
+    )
+}
+
+fn sha256_domain(domain: &str, payload: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(domain.as_bytes());
+    hasher.update([0]);
+    hasher.update(payload);
+    format!("{:x}", hasher.finalize())
+}
+
+enum BlockingCliDeliveryFailure {
+    Rejected {
+        reason_code: String,
+        evidence: Vec<u8>,
+    },
+    Uncertain {
+        reason_code: String,
+        evidence: Vec<u8>,
+    },
+}
+
+fn push_via_magiclaw_cli_receipt_blocking(
+    send_type: MessageSendType,
+    text: &str,
+) -> Result<CliDeliveryReceipt, BlockingCliDeliveryFailure> {
+    let to =
+        match send_type {
+            MessageSendType::Wechat => None,
+            MessageSendType::Feishu => Some(resolve_feishu_target().ok_or_else(|| {
+                BlockingCliDeliveryFailure::Rejected {
+                    reason_code: "missing_feishu_target".to_owned(),
+                    evidence: b"FEISHU_TO or an equivalent target is required".to_vec(),
+                }
+            })?),
+        };
+    let magiclaw_bin = resolve_magiclaw_bin();
+    let mut command = std::process::Command::new(&magiclaw_bin);
+    command
+        .arg("send")
+        .arg("--channel")
+        .arg(send_type.as_str())
+        .arg("--message")
+        .arg(text)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(to) = to.as_deref() {
+        command.arg("--to").arg(to);
+    }
+    if let Some(home) = resolve_magiclaw_home(&magiclaw_bin) {
+        command.current_dir(home);
+    }
+    if let Ok(db_path) = std::env::var("MAGICLAW_DB_PATH") {
+        let db_path = db_path.trim();
+        if !db_path.is_empty() {
+            let path = std::path::Path::new(db_path);
+            let absolute = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(path))
+                    .unwrap_or_else(|_| path.to_path_buf())
+            };
+            command.env("MAGICLAW_DB_PATH", absolute);
+        }
+    }
+    if let Ok(receive_id_type) = std::env::var("FEISHU_RECEIVE_ID_TYPE") {
+        let receive_id_type = receive_id_type.trim();
+        if !receive_id_type.is_empty() {
+            command.arg("--receive-id-type").arg(receive_id_type);
+        }
+    }
+
+    let output = command
+        .output()
+        .map_err(|error| BlockingCliDeliveryFailure::Rejected {
+            reason_code: "magiclaw_cli_spawn_failed".to_owned(),
+            evidence: error.to_string().into_bytes(),
+        })?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(BlockingCliDeliveryFailure::Uncertain {
+            reason_code: "magiclaw_cli_nonzero_after_send_attempt".to_owned(),
+            evidence: format!(
+                "exit={} stderr={} stdout={}",
+                output.status,
+                tail_lines(&stderr, 8),
+                tail_lines(&stdout, 3)
+            )
+            .into_bytes(),
+        });
+    }
+    parse_magiclaw_cli_delivery_receipt(send_type, &stdout).map_err(|error| {
+        BlockingCliDeliveryFailure::Uncertain {
+            reason_code: "magiclaw_cli_receipt_invalid".to_owned(),
+            evidence: error.into_bytes(),
+        }
+    })
 }
 
 fn dry_run_push_active() -> bool {
@@ -2350,8 +4440,7 @@ pub async fn ensure_magiclaw_daemon(
                 };
                 return Err(format!(
                     "daemon 进程提前退出(exit={})，请检查 MAGICLAW_BIN/MAGICLAW_API_ADDR/MAGICLAW_API_TOKEN 配置{}",
-                    status,
-                    extra
+                    status, extra
                 ));
             }
             Ok(None) => {}
@@ -2484,7 +4573,9 @@ pub async fn verify_daemon_auth(
             ApiTokenSource::Env => {
                 "当前 monitor 使用环境变量 MAGICLAW_API_TOKEN，但 daemon 侧 token 不一致"
             }
-            ApiTokenSource::DynamicMemCache | ApiTokenSource::DynamicFileCache | ApiTokenSource::DynamicIssued => {
+            ApiTokenSource::DynamicMemCache
+            | ApiTokenSource::DynamicFileCache
+            | ApiTokenSource::DynamicIssued => {
                 "当前 monitor 使用动态 token(数据库签发)。可能该 token 已过期/被吊销，monitor 将自动续签"
             }
         };
@@ -2497,6 +4588,287 @@ pub async fn verify_daemon_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn br194_test_binding(label: &str) -> crate::durable_delivery_runtime::CountedDeliveryBinding {
+        crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+            chrono::NaiveDate::from_ymd_opt(2099, 1, 2).unwrap(),
+            format!("TEST_CODE_{label}_OCCURRENCE"),
+            format!("TEST_CODE_{label}_CANONICAL").into_bytes(),
+            crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+            "a".repeat(64),
+            crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+            None,
+            false,
+        )
+        .expect("valid TEST_CODE orchestration binding")
+    }
+
+    fn br194_approved_event() -> Box<stock_analysis::push_l1::SignalEvent> {
+        Box::new(stock_analysis::push_l1::SignalEvent::new(
+            stock_analysis::push_l1::SignalSource::PostSessionReview,
+            "review_lhb",
+            None,
+            chrono::Local::now(),
+            stock_analysis::push_l1::SignalPayload::PostSessionReview(Default::default()),
+            stock_analysis::push_l1::Severity::Normal,
+        ))
+    }
+
+    #[tokio::test]
+    async fn br194_r04_source_only_gate_never_reads_banner() {
+        let launch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let durable_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let outcome = push_counted_source_only_after_validation_with(
+            "TEST_CODE_BODY",
+            PushKind::ReviewLhb,
+            br194_test_binding("NO_BANNER"),
+            {
+                let calls = launch_calls.clone();
+                move |_| {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    true
+                }
+            },
+            {
+                let calls = gate_calls.clone();
+                move |_, _| {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    crate::v14_adapter::V14Gate::Approved(br194_approved_event())
+                }
+            },
+            {
+                let calls = durable_calls.clone();
+                move |_, _, _| async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    PushOutcome::Pushed
+                }
+            },
+        )
+        .await;
+        assert_eq!(outcome, PushOutcome::Pushed);
+        assert_eq!(launch_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(gate_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(durable_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn br194_r04_source_only_preserves_l5_and_durable_entry() {
+        let trace = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let approved = push_counted_source_only_after_validation_with(
+            "TEST_CODE_BODY",
+            PushKind::ReviewLhb,
+            br194_test_binding("ORDER"),
+            {
+                let trace = trace.clone();
+                move |_| {
+                    trace.lock().unwrap().push("launch");
+                    true
+                }
+            },
+            {
+                let trace = trace.clone();
+                move |_, _| {
+                    trace.lock().unwrap().push("l5");
+                    crate::v14_adapter::V14Gate::Approved(br194_approved_event())
+                }
+            },
+            {
+                let trace = trace.clone();
+                move |_, _, _| async move {
+                    trace.lock().unwrap().push("durable");
+                    PushOutcome::Pushed
+                }
+            },
+        )
+        .await;
+        assert_eq!(approved, PushOutcome::Pushed);
+        assert_eq!(*trace.lock().unwrap(), ["launch", "l5", "durable"]);
+
+        let durable_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let denied = push_counted_source_only_after_validation_with(
+            "TEST_CODE_BODY",
+            PushKind::ReviewLhb,
+            br194_test_binding("L5_DENIED"),
+            |_| true,
+            |_, _| crate::v14_adapter::V14Gate::Denied("TEST_CODE_L5_DENIED".to_owned()),
+            {
+                let calls = durable_calls.clone();
+                move |_, _, _| async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    PushOutcome::Pushed
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            denied,
+            PushOutcome::Denied("TEST_CODE_L5_DENIED".to_owned())
+        );
+        assert_eq!(durable_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn br194_r04_source_only_denied_launch_has_zero_durable_and_sink() {
+        let gate_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let durable_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let outcome = push_counted_source_only_after_validation_with(
+            "TEST_CODE_BODY",
+            PushKind::ReviewLhb,
+            br194_test_binding("LAUNCH_DENIED"),
+            |_| false,
+            {
+                let calls = gate_calls.clone();
+                move |_, _| {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    crate::v14_adapter::V14Gate::Approved(br194_approved_event())
+                }
+            },
+            {
+                let calls = durable_calls.clone();
+                move |_, _, _| async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    PushOutcome::Pushed
+                }
+            },
+        )
+        .await;
+        assert_eq!(outcome, PushOutcome::Denied("launch_gate_stage".to_owned()));
+        assert_eq!(gate_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(durable_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    struct TestBannerGuard(Option<crate::push_templates::BannerCtx>);
+
+    struct TestNotifyDir(std::path::PathBuf);
+
+    struct TestPushLogNamespace {
+        root: std::path::PathBuf,
+        retained: std::fs::File,
+        device: u64,
+        inode: u64,
+    }
+
+    impl TestPushLogNamespace {
+        fn new(label: &str) -> Self {
+            use std::os::unix::fs::MetadataExt;
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            assert!(
+                label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')),
+                "push-log fixture label must remain one path component"
+            );
+            let parent = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/test");
+            std::fs::create_dir_all(&parent).expect("create TEST_CODE fixture parent");
+            let root = parent.join(format!(
+                "TEST_CODE_PUSH_LOG_ALIAS_{label}_{}_{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&root).expect("create fresh isolated push-log namespace");
+            let retained = std::fs::File::open(&root).expect("retain push-log namespace inode");
+            let metadata = retained
+                .metadata()
+                .expect("inspect retained namespace inode");
+            Self {
+                root,
+                retained,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.root
+        }
+
+        fn test_code(&self) -> &str {
+            self.root
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .expect("TEST_CODE push-log fixture name")
+        }
+    }
+
+    impl Drop for TestPushLogNamespace {
+        fn drop(&mut self) {
+            use std::os::unix::fs::MetadataExt;
+            let retained = self
+                .retained
+                .metadata()
+                .expect("inspect retained push-log namespace before cleanup");
+            let current = std::fs::symlink_metadata(&self.root)
+                .expect("push-log namespace must still exist before cleanup");
+            assert!(
+                current.file_type().is_dir()
+                    && current.dev() == self.device
+                    && current.ino() == self.inode
+                    && retained.dev() == self.device
+                    && retained.ino() == self.inode,
+                "refuse to remove a replaced push-log TEST_CODE namespace"
+            );
+            std::fs::remove_dir_all(&self.root)
+                .expect("remove retained exact push-log TEST_CODE namespace");
+        }
+    }
+
+    fn push_log_json_artifacts(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut artifacts = Vec::new();
+        if !root.exists() {
+            return artifacts;
+        }
+        for entry in std::fs::read_dir(root).expect("read TEST_CODE push-log root") {
+            let path = entry.expect("read TEST_CODE push-log entry").path();
+            if path.is_dir() {
+                for artifact in
+                    std::fs::read_dir(&path).expect("read TEST_CODE push-log date directory")
+                {
+                    let artifact = artifact.expect("read TEST_CODE artifact").path();
+                    if artifact.extension().and_then(std::ffi::OsStr::to_str) == Some("json") {
+                        artifacts.push(artifact);
+                    }
+                }
+            }
+        }
+        artifacts.sort();
+        artifacts
+    }
+
+    impl TestNotifyDir {
+        fn new(label: &str) -> Self {
+            Self(notify_temp_dir(label))
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestNotifyDir {
+        fn drop(&mut self) {
+            if self.0.exists() {
+                std::fs::remove_dir_all(&self.0).expect("remove isolated notify directory");
+            }
+        }
+    }
+
+    impl TestBannerGuard {
+        fn full() -> Self {
+            let previous = crate::LATEST_BANNER
+                .lock()
+                .expect("test banner lock")
+                .replace(crate::push_templates::BannerCtx::test_default());
+            Self(previous)
+        }
+    }
+
+    impl Drop for TestBannerGuard {
+        fn drop(&mut self) {
+            *crate::LATEST_BANNER.lock().expect("restore banner lock") = self.0.take();
+        }
+    }
 
     #[test]
     fn push_log_suffix_rejects_pre_epoch_clock_and_is_unique() {
@@ -2520,6 +4892,836 @@ mod tests {
 
         assert!(create_push_log_file(&path).is_err());
         std::fs::remove_file(path).expect("remove isolated audit fixture");
+    }
+
+    fn counted_test_request(
+        label: &str,
+    ) -> stock_analysis::durable_delivery::AuthoritativeDeliveryRequest {
+        let rendered_content = format!("TEST_CODE_COUNTED_{label}").into_bytes();
+        stock_analysis::durable_delivery::AuthoritativeDeliveryRequest {
+            decision_identity: sha256_domain(
+                "TEST_CODE.counted.decision",
+                format!("decision:{label}").as_bytes(),
+            ),
+            attempt_identity: sha256_domain(
+                "TEST_CODE.counted.attempt",
+                format!("attempt:{label}").as_bytes(),
+            ),
+            fence_token: 7,
+            push_kind: stock_analysis::durable_delivery::PushKind::HoldingEvent,
+            stable_template_id: stock_analysis::durable_delivery::PushKind::HoldingEvent
+                .stable_template_id()
+                .to_owned(),
+            rendered_content_sha256: sha256_domain("TEST_CODE.counted.rendered", &rendered_content),
+            rendered_content,
+        }
+    }
+
+    fn counted_test_accepted(
+        label: &str,
+    ) -> stock_analysis::durable_delivery::AuthoritativeSinkResult {
+        stock_analysis::durable_delivery::AuthoritativeSinkResult::Accepted(
+            stock_analysis::durable_delivery::TypedReceipt {
+                channel: "TEST_CODE_DRY_RUN".to_owned(),
+                provider: "TEST_CODE_PROVIDER".to_owned(),
+                message_id: format!("TEST_CODE_MESSAGE_{label}"),
+                platform_message_id: Some(format!("TEST_CODE_PLATFORM_{label}")),
+                accepted_at: chrono::Utc::now(),
+                latency_ms: Some(1),
+            },
+        )
+    }
+
+    fn counted_audit_binding_fixture() -> (
+        stock_analysis::event::PushRecord,
+        CountedPushLogPending,
+        CountedPushLogCommit,
+    ) {
+        let decision_identity_hash = "a".repeat(64);
+        let attempt_identity_hash = "b".repeat(64);
+        let artifact_sha256 = "c".repeat(64);
+        let sink_result_sha256 = "d".repeat(64);
+        let receipt_sha256 = "e".repeat(64);
+        let event = stock_analysis::event::PushDeliveryEvent::new_counted(
+            "HoldingEvent".to_owned(),
+            "holding_event_v1".to_owned(),
+            "Pushed".to_owned(),
+            "TEST_CODE_DRY_RUN".to_owned(),
+            12,
+            37,
+            decision_identity_hash.clone(),
+            attempt_identity_hash.clone(),
+            artifact_sha256.clone(),
+            sink_result_sha256.clone(),
+            receipt_sha256.clone(),
+        );
+        let counted_join_hash = event
+            .counted_join_hash
+            .clone()
+            .expect("counted fixture has a canonical join hash");
+        let envelope = stock_analysis::event::EventEnvelope::from_event(
+            &event,
+            counted_join_hash.clone(),
+            "TEST_CODE_COUNTED_BINDING_TRACE".to_owned(),
+            chrono::Local::now(),
+        )
+        .expect("valid counted fixture envelope");
+        let record = stock_analysis::event::PushRecord::try_from_authoritative(&envelope)
+            .expect("valid counted fixture audit record");
+        let pending = CountedPushLogPending {
+            schema: "stock_analysis.counted_push_log.v1".to_owned(),
+            state: "AuditPending".to_owned(),
+            durable_push_kind: "HoldingEvent".to_owned(),
+            stable_template_id: "holding_event_v1".to_owned(),
+            decision_identity: "TEST_CODE_DECISION_IDENTITY".to_owned(),
+            attempt_identity: "TEST_CODE_ATTEMPT_IDENTITY".to_owned(),
+            decision_identity_hash,
+            attempt_identity_hash,
+            fence_token: 7,
+            rendered_content_sha256: "f".repeat(64),
+            rendered_content: "TEST_CODE_COUNTED_BINDING".to_owned(),
+            sink_result: serde_json::json!({"kind": "Accepted"}),
+            sink_result_sha256,
+            receipt_sha256,
+            observed_at: chrono::Utc::now(),
+        };
+        let commit = CountedPushLogCommit {
+            schema: "stock_analysis.counted_push_log.v1".to_owned(),
+            state: "Committed".to_owned(),
+            durable_push_kind: "HoldingEvent".to_owned(),
+            stable_template_id: "holding_event_v1".to_owned(),
+            decision_identity_hash: pending.decision_identity_hash.clone(),
+            attempt_identity_hash: pending.attempt_identity_hash.clone(),
+            pending_artifact_sha256: artifact_sha256,
+            delivery_audit_event_id: counted_join_hash.clone(),
+            counted_join_hash,
+            committed_at: chrono::Utc::now(),
+        };
+        assert_eq!(
+            verify_counted_audit_pending_binding(&record, &pending, &commit),
+            Ok(()),
+            "the canonical counted fixture must satisfy every terminal binding"
+        );
+        (record, pending, commit)
+    }
+
+    #[test]
+    fn br192_counted_terminal_verifier_rejects_sink_result_hash_mismatch() {
+        let (record, mut pending, commit) = counted_audit_binding_fixture();
+        pending.sink_result_sha256 = "0".repeat(64);
+
+        assert_eq!(
+            verify_counted_audit_pending_binding(&record, &pending, &commit),
+            Err("schema-v3 audit sink_result_sha256 does not match pending artifact".to_owned())
+        );
+    }
+
+    #[test]
+    fn br192_counted_terminal_verifier_rejects_receipt_hash_mismatch() {
+        let (record, mut pending, commit) = counted_audit_binding_fixture();
+        pending.receipt_sha256 = "0".repeat(64);
+
+        assert_eq!(
+            verify_counted_audit_pending_binding(&record, &pending, &commit),
+            Err("schema-v3 audit receipt_sha256 does not match pending artifact".to_owned())
+        );
+    }
+
+    #[test]
+    fn br192_counted_finalization_failures_are_uncertain_and_never_auto_retryable() {
+        use stock_analysis::durable_delivery::AuthoritativeSinkResult;
+
+        for (label, failed_stage, expected_artifacts, audit_expected) in [
+            ("PENDING_FAIL", CountedFinalizationStage::Pending, 0, false),
+            ("AUDIT_FAIL", CountedFinalizationStage::Audit, 1, false),
+            ("COMMIT_FAIL", CountedFinalizationStage::Commit, 1, true),
+        ] {
+            let fixture = TestPushLogNamespace::new(label);
+            let writer = PinnedPushLogWriter::for_test_anchor(
+                "test",
+                fixture.path(),
+                std::path::Path::new("push_log"),
+            )
+            .expect("bind counted TEST_CODE push-log");
+            let audit = stock_analysis::event::AuditDispatcher::for_test_code(fixture.test_code())
+                .expect("bind counted TEST_CODE audit");
+            let request = counted_test_request(label);
+            let text = std::str::from_utf8(&request.rendered_content).unwrap();
+            let mut injected = false;
+            let result = finalize_counted_delivery_with_hook(
+                &writer,
+                &audit,
+                &request,
+                text,
+                counted_test_accepted(label),
+                |stage| {
+                    if stage == failed_stage {
+                        injected = true;
+                        Err(format!("TEST_CODE injected {label}"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(injected, "failure stage must be reached exactly once");
+            let uncertainty = match result {
+                AuthoritativeSinkResult::Uncertain(value) => value,
+                other => panic!("persistence failure must be Uncertain, got {other:?}"),
+            };
+            assert_eq!(
+                uncertainty.reason_code,
+                "counted_delivery_persistence_uncertain"
+            );
+            let evidence = String::from_utf8_lossy(&uncertainty.evidence);
+            assert!(
+                evidence.contains("\"kind\":\"Accepted\""),
+                "accepted receipt evidence must survive without a resend: {evidence}"
+            );
+
+            let artifact_count = push_log_json_artifacts(&fixture.path().join("push_log")).len();
+            assert_eq!(artifact_count, expected_artifacts, "{label}");
+            let audit_path = fixture
+                .path()
+                .join("event_audit")
+                .join(format!("{}.jsonl", chrono::Local::now().format("%Y")));
+            assert_eq!(audit_path.exists(), audit_expected, "{label}");
+        }
+    }
+
+    #[test]
+    fn br192_counted_terminal_verifier_requires_pending_audit_and_commit() {
+        use stock_analysis::durable_delivery::AuthoritativeSinkResult;
+
+        let fixture = TestPushLogNamespace::new("TERMINAL_SUCCESS");
+        let writer = PinnedPushLogWriter::for_test_anchor(
+            "test",
+            fixture.path(),
+            std::path::Path::new("push_log"),
+        )
+        .expect("bind counted TEST_CODE push-log");
+        let audit = stock_analysis::event::AuditDispatcher::for_test_code(fixture.test_code())
+            .expect("bind counted TEST_CODE audit");
+        let request = counted_test_request("TERMINAL_SUCCESS");
+        let text = std::str::from_utf8(&request.rendered_content).unwrap();
+        let result = finalize_counted_delivery(
+            &writer,
+            &audit,
+            &request,
+            text,
+            counted_test_accepted("TERMINAL_SUCCESS"),
+        );
+        assert!(
+            matches!(result, AuthoritativeSinkResult::Accepted(_)),
+            "all three exact terminal records must verify"
+        );
+        let artifacts = push_log_json_artifacts(&fixture.path().join("push_log"));
+        assert_eq!(artifacts.len(), 2);
+        assert!(artifacts.iter().any(|path| {
+            path.file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| name.ends_with("_audit_pending.json"))
+        }));
+        assert!(artifacts.iter().any(|path| {
+            path.file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| name.ends_with("_committed.json"))
+        }));
+
+        let duplicate = finalize_counted_delivery(
+            &writer,
+            &audit,
+            &request,
+            text,
+            counted_test_accepted("TERMINAL_SUCCESS_DUPLICATE"),
+        );
+        assert!(
+            matches!(duplicate, AuthoritativeSinkResult::Uncertain(_)),
+            "the deterministic Pending name must make a duplicate terminal attempt uncertain"
+        );
+        assert_eq!(
+            push_log_json_artifacts(&fixture.path().join("push_log")).len(),
+            2,
+            "a duplicate terminal attempt must not append another artifact"
+        );
+    }
+
+    #[test]
+    fn br192_counted_terminal_verifier_rejects_in_place_pending_tamper() {
+        use std::io::Write;
+        use stock_analysis::durable_delivery::AuthoritativeSinkResult;
+
+        let fixture = TestPushLogNamespace::new("TERMINAL_TAMPER");
+        let writer = PinnedPushLogWriter::for_test_anchor(
+            "test",
+            fixture.path(),
+            std::path::Path::new("push_log"),
+        )
+        .expect("bind counted TEST_CODE push-log");
+        let audit = stock_analysis::event::AuditDispatcher::for_test_code(fixture.test_code())
+            .expect("bind counted TEST_CODE audit");
+        let request = counted_test_request("TERMINAL_TAMPER");
+        let text = std::str::from_utf8(&request.rendered_content).unwrap();
+        let result = finalize_counted_delivery_with_hook(
+            &writer,
+            &audit,
+            &request,
+            text,
+            counted_test_accepted("TERMINAL_TAMPER"),
+            |stage| {
+                if stage != CountedFinalizationStage::TerminalVerify {
+                    return Ok(());
+                }
+                let pending_path = push_log_json_artifacts(&fixture.path().join("push_log"))
+                    .into_iter()
+                    .find(|path| {
+                        path.file_name()
+                            .and_then(std::ffi::OsStr::to_str)
+                            .is_some_and(|name| name.ends_with("_audit_pending.json"))
+                    })
+                    .ok_or_else(|| "TEST_CODE pending artifact missing".to_owned())?;
+                let mut pending = std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&pending_path)
+                    .map_err(|error| format!("open pending tamper fixture: {error}"))?;
+                pending
+                    .write_all(br#"{"state":"TEST_CODE_TAMPERED"}"#)
+                    .map_err(|error| format!("tamper pending fixture: {error}"))?;
+                pending
+                    .sync_all()
+                    .map_err(|error| format!("fsync pending tamper fixture: {error}"))
+            },
+        );
+        let uncertainty = match result {
+            AuthoritativeSinkResult::Uncertain(value) => value,
+            other => panic!("terminal tamper must be Uncertain, got {other:?}"),
+        };
+        assert_eq!(
+            uncertainty.reason_code,
+            "counted_delivery_persistence_uncertain"
+        );
+        assert!(
+            String::from_utf8_lossy(&uncertainty.evidence)
+                .contains("pending artifact bytes changed after fsync"),
+            "terminal verifier must report the exact tampered record"
+        );
+    }
+
+    #[test]
+    fn br192_push_log_mkdir_eexist_race_is_reopened_after_parent_sync() {
+        let fixture = TestPushLogNamespace::new("EEXIST_PARENT_SYNC");
+        let parent = std::fs::File::open(fixture.path()).unwrap();
+        let path = fixture.path().join("race_child");
+        let (directory, _) = open_or_create_push_log_child_with_hook(
+            &parent,
+            std::ffi::OsStr::new("race_child"),
+            &path,
+            || std::fs::create_dir(&path).expect("TEST_CODE wins mkdir race"),
+        )
+        .expect("EEXIST winner must be reopened after parent fsync");
+        assert!(directory.metadata().unwrap().is_dir());
+    }
+
+    #[test]
+    fn br192_push_log_directory_safe_mode_drift_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = TestPushLogNamespace::new("SAFE_MODE_DRIFT");
+        let writer = PinnedPushLogWriter::for_test_anchor(
+            "test",
+            fixture.path(),
+            std::path::Path::new("push_log"),
+        )
+        .expect("bind TEST_CODE push-log");
+        let path = fixture.path().join("push_log");
+        let original = std::fs::metadata(&path).unwrap().permissions();
+        let original_mode = original.mode() & 0o7777;
+        let drifted_mode = if original_mode == 0o700 { 0o750 } else { 0o700 };
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(drifted_mode))
+            .expect("apply another safe TEST_CODE push-log mode");
+        let result = revalidate_push_log_directory_chain(&writer.root_binding);
+        std::fs::set_permissions(&path, original).expect("restore push-log permissions");
+        assert!(
+            matches!(result, Err(PushLogError::NamespaceIsolation(_))),
+            "allowed-to-allowed mode drift must invalidate the push-log binding: {result:?}"
+        );
+    }
+
+    #[test]
+    fn br192_push_log_directory_allowed_owner_drift_is_rejected() {
+        let effective_uid = 501;
+        assert!(push_log_directory_owner_allowed(0, effective_uid));
+        assert!(push_log_directory_owner_allowed(
+            effective_uid,
+            effective_uid
+        ));
+        let root_owned = PushLogFileIdentity {
+            device: 1,
+            inode: 2,
+            mode: 0o040700,
+            uid: 0,
+            is_directory: true,
+            is_file: false,
+        };
+        let effective_owned = PushLogFileIdentity {
+            uid: effective_uid,
+            ..root_owned
+        };
+        assert_ne!(
+            root_owned, effective_owned,
+            "two individually allowed owners are not the same retained authority"
+        );
+    }
+
+    #[test]
+    fn br192_push_log_exact_verifier_rejects_tamper_and_duplicate_name() {
+        use std::io::Write;
+
+        let fixture = TestPushLogNamespace::new("TAMPER_DUPLICATE");
+        let writer = PinnedPushLogWriter::for_test_anchor(
+            "test",
+            fixture.path(),
+            std::path::Path::new("push_log"),
+        )
+        .expect("bind TEST_CODE push-log");
+        let original = br#"{"state":"AuditPending","value":"TEST_CODE_ORIGINAL"}"#;
+        let path = writer
+            .save_named_payload(original, "TEST_CODE_exact_audit_pending.json")
+            .expect("write immutable TEST_CODE artifact");
+        assert!(
+            writer
+                .save_named_payload(original, "TEST_CODE_exact_audit_pending.json")
+                .is_err(),
+            "O_EXCL must reject duplicate terminal artifact names"
+        );
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .expect("open TEST_CODE artifact for tamper injection");
+        file.write_all(br#"{"state":"tampered"}"#).unwrap();
+        file.sync_all().unwrap();
+        let error = verify_exact_push_log_bytes(&writer, &path, original, "pending")
+            .expect_err("terminal byte verifier must reject in-place tampering");
+        assert!(error.contains("bytes changed"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "invoked as a child by the cross-process push-log locking test"]
+    fn br192_push_log_process_writer_helper() {
+        let Ok(root) = std::env::var("BR192_PUSH_LOG_HELPER_ROOT") else {
+            return;
+        };
+        let identity = std::env::var("BR192_PUSH_LOG_HELPER_ID").unwrap();
+        let writer = PinnedPushLogWriter::for_test_anchor(
+            "test-child",
+            std::path::Path::new(&root),
+            std::path::Path::new("push_log"),
+        )
+        .expect("bind child TEST_CODE push-log");
+        writer
+            .save_named_payload(
+                format!("{{\"writer\":\"{identity}\"}}").as_bytes(),
+                &format!("TEST_CODE_child_{identity}.json"),
+            )
+            .expect("child writes exact immutable artifact");
+    }
+
+    #[test]
+    fn br192_push_log_serializes_cross_process_writers_from_foreign_cwd() {
+        let fixture = TestPushLogNamespace::new("CROSS_PROCESS");
+        let executable = std::env::current_exe().unwrap();
+        let mut children = (0..4)
+            .map(|index| {
+                std::process::Command::new(&executable)
+                    .args([
+                        "--exact",
+                        "notify::tests::br192_push_log_process_writer_helper",
+                        "--ignored",
+                    ])
+                    .env("BR192_PUSH_LOG_HELPER_ROOT", fixture.path())
+                    .env("BR192_PUSH_LOG_HELPER_ID", index.to_string())
+                    .env_remove("PUSH_LOG_DIR")
+                    .current_dir(std::env::temp_dir())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for child in &mut children {
+            assert!(child.wait().unwrap().success());
+        }
+        let artifacts = push_log_json_artifacts(&fixture.path().join("push_log")).len();
+        assert_eq!(artifacts, 4);
+    }
+
+    #[test]
+    #[serial_test::serial(cooldown_memo)]
+    fn br192_test_push_log_rejects_a_production_shaped_override_before_writing() {
+        let _env_guard = crate::TestEnvGuard::capture(&[
+            "STOCK_ENV_MODE",
+            "V10_DRY_RUN_PUSH",
+            "DURABLE_DELIVERY_TEST_CODE",
+            "PUSH_LOG_DIR",
+        ]);
+        let isolated = TestNotifyDir::new("br192_test_push_log_override");
+        let test_code = format!(
+            "TEST_CODE_PUSH_LOG_SCOPE_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        );
+        let production_shaped_override = isolated.path().join("data/push_log");
+        std::env::set_var("STOCK_ENV_MODE", "test");
+        std::env::set_var("V10_DRY_RUN_PUSH", "1");
+        std::env::set_var("DURABLE_DELIVERY_TEST_CODE", &test_code);
+        std::env::set_var("PUSH_LOG_DIR", &production_shaped_override);
+
+        let result = save_push_log(
+            &crate::durable_delivery_runtime::RuntimeNamespace::Test {
+                test_code: test_code.clone(),
+            },
+            "TEST_CODE push log must stay in its bound namespace",
+        );
+
+        assert!(
+            matches!(
+                &result,
+                Err(PushLogError::NamespaceOverrideRejected { namespace })
+                    if namespace == &format!("test:{test_code}")
+            ),
+            "test push logging must return a typed override rejection before creating any \
+             artifact; expected fixed data/test/{test_code}/push_log, got {result:?}"
+        );
+        assert!(
+            !production_shaped_override.exists(),
+            "rejected cross-namespace override must not create a directory"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(cooldown_memo)]
+    fn br192_production_push_log_rejects_a_cross_namespace_override_before_writing() {
+        let _env_guard = crate::TestEnvGuard::capture(&[
+            "STOCK_ENV_MODE",
+            "V10_DRY_RUN_PUSH",
+            "DURABLE_DELIVERY_TEST_CODE",
+            "PUSH_LOG_DIR",
+        ]);
+        let isolated = TestNotifyDir::new("br192_production_push_log_override");
+        let cross_namespace_override = isolated.path().join("TEST_CODE/push_log");
+        std::env::set_var("STOCK_ENV_MODE", "prod");
+        std::env::remove_var("V10_DRY_RUN_PUSH");
+        std::env::remove_var("DURABLE_DELIVERY_TEST_CODE");
+        std::env::set_var("PUSH_LOG_DIR", &cross_namespace_override);
+
+        let result = save_push_log(
+            &crate::durable_delivery_runtime::RuntimeNamespace::Production,
+            "production push log must stay in data/push_log",
+        );
+
+        assert!(
+            matches!(
+                &result,
+                Err(PushLogError::NamespaceOverrideRejected { namespace })
+                    if namespace == "production"
+            ),
+            "production push logging must return a typed override rejection before creating any \
+             artifact; expected fixed data/push_log, got {result:?}"
+        );
+        assert!(
+            !cross_namespace_override.exists(),
+            "rejected production override must not create a directory"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(cooldown_memo)]
+    fn br192_push_log_rejects_test_root_symlink_to_a_foreign_namespace() {
+        use std::os::unix::fs::symlink;
+
+        let namespace = TestPushLogNamespace::new("TEST_ROOT_ALIAS");
+        let foreign = namespace.path().join("foreign_production_log");
+        std::fs::create_dir(&foreign).expect("create foreign log target");
+        let fixed_test_root = namespace.path().join("push_log");
+        symlink(
+            std::fs::canonicalize(&foreign).expect("canonical foreign target"),
+            &fixed_test_root,
+        )
+        .expect("alias fixed test root");
+
+        let result = save_push_log_at_root(
+            &fixed_test_root,
+            "TEST_CODE root alias must fail before writing",
+        );
+
+        assert!(
+            matches!(result, Err(PushLogError::NamespaceIsolation(_))),
+            "test root symlink must be a typed physical-isolation rejection: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&foreign)
+                .expect("read untouched foreign target")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(cooldown_memo)]
+    fn br192_push_log_rejects_production_root_symlink_to_a_test_namespace() {
+        use std::os::unix::fs::symlink;
+
+        let namespace = TestPushLogNamespace::new("PRODUCTION_ROOT_ALIAS");
+        let test_target = namespace.path().join("test_namespace_log");
+        std::fs::create_dir(&test_target).expect("create test log target");
+        let production_semantic_root = namespace.path().join("production_push_log");
+        symlink(
+            std::fs::canonicalize(&test_target).expect("canonical test target"),
+            &production_semantic_root,
+        )
+        .expect("alias production-semantic root");
+
+        let result = save_push_log_at_root(
+            &production_semantic_root,
+            "production root alias must fail before writing",
+        );
+
+        assert!(
+            matches!(result, Err(PushLogError::NamespaceIsolation(_))),
+            "production root symlink must be a typed physical-isolation rejection: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&test_target)
+                .expect("read untouched test target")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(cooldown_memo)]
+    fn br192_push_log_rejects_a_symlinked_date_directory() {
+        use std::os::unix::fs::symlink;
+
+        let namespace = TestPushLogNamespace::new("DATE_ALIAS");
+        let fixed_root = namespace.path().join("push_log");
+        std::fs::create_dir(&fixed_root).expect("create fixed push-log root");
+        let foreign = namespace.path().join("foreign_date_log");
+        std::fs::create_dir(&foreign).expect("create foreign date target");
+        let date_dir = chrono::Local::now().format("%Y-%m-%d").to_string();
+        symlink(
+            std::fs::canonicalize(&foreign).expect("canonical foreign date target"),
+            fixed_root.join(date_dir),
+        )
+        .expect("alias push-log date directory");
+
+        let result = save_push_log_at_root(&fixed_root, "date alias must fail before writing");
+
+        assert!(
+            matches!(result, Err(PushLogError::NamespaceIsolation(_))),
+            "date-directory symlink must be a typed physical-isolation rejection: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&foreign)
+                .expect("read untouched foreign date target")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(cooldown_memo)]
+    fn br192_push_log_rejects_a_root_directory_swap_before_artifact_creation() {
+        let namespace = TestPushLogNamespace::new("ROOT_SWAP");
+        let fixed_root = namespace.path().join("push_log");
+        let displaced_root = namespace.path().join("displaced_push_log");
+        let mut swapped = false;
+        let mut displaced_date = None;
+
+        let result = save_push_log_at_root_with_hook(
+            &fixed_root,
+            "root swap must fail before writing",
+            |phase, root, date_path, _| {
+                if matches!(phase, PushLogWritePhase::DirectoriesBound) && !swapped {
+                    displaced_date = Some(
+                        displaced_root.join(
+                            date_path
+                                .file_name()
+                                .expect("bound date path has a final component"),
+                        ),
+                    );
+                    std::fs::rename(root, &displaced_root).expect("displace bound push-log root");
+                    std::fs::create_dir(root).expect("install replacement push-log root");
+                    swapped = true;
+                }
+            },
+        );
+
+        assert!(
+            matches!(result, Err(PushLogError::NamespaceIsolation(_))),
+            "root swap must be a typed physical-isolation rejection: {result:?}"
+        );
+        assert!(swapped, "root-swap hook did not run");
+        assert_eq!(
+            std::fs::read_dir(&fixed_root)
+                .expect("read replacement root")
+                .count(),
+            0,
+            "replacement namespace must not receive an artifact"
+        );
+        assert_eq!(
+            std::fs::read_dir(displaced_date.expect("capture displaced date path"))
+                .expect("read displaced bound date directory")
+                .count(),
+            0,
+            "displaced namespace must not receive an artifact"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(cooldown_memo)]
+    fn br192_push_log_rejects_a_date_directory_swap_before_artifact_creation() {
+        let namespace = TestPushLogNamespace::new("DATE_SWAP");
+        let fixed_root = namespace.path().join("push_log");
+        let displaced_date = namespace.path().join("displaced_date");
+        let mut swapped = false;
+
+        let result = save_push_log_at_root_with_hook(
+            &fixed_root,
+            "date swap must fail before writing",
+            |phase, _, date_path, _| {
+                if matches!(phase, PushLogWritePhase::DirectoriesBound) && !swapped {
+                    std::fs::rename(date_path, &displaced_date)
+                        .expect("displace bound push-log date directory");
+                    std::fs::create_dir(date_path)
+                        .expect("install replacement push-log date directory");
+                    swapped = true;
+                }
+            },
+        );
+
+        assert!(
+            matches!(result, Err(PushLogError::NamespaceIsolation(_))),
+            "date swap must be a typed physical-isolation rejection: {result:?}"
+        );
+        assert!(swapped, "date-swap hook did not run");
+        assert_eq!(
+            std::fs::read_dir(&displaced_date)
+                .expect("read displaced date directory")
+                .count(),
+            0,
+            "displaced date directory must not receive an artifact"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(cooldown_memo)]
+    fn br192_push_log_writer_rejects_a_root_swap_between_saves() {
+        let namespace = TestPushLogNamespace::new("CROSS_SAVE_ROOT_SWAP");
+        let writer = PinnedPushLogWriter::for_test_anchor(
+            "TEST_CODE_CROSS_SAVE",
+            namespace.path(),
+            std::path::Path::new("push_log"),
+        )
+        .expect("bind persistent TEST_CODE push-log writer");
+        writer
+            .save("first physically bound push-log artifact")
+            .expect("first push-log save");
+
+        let fixed_root = namespace.path().join("push_log");
+        let displaced_root = namespace.path().join("displaced_push_log");
+        std::fs::rename(&fixed_root, &displaced_root).expect("displace bound push-log root");
+        std::fs::create_dir(&fixed_root).expect("install replacement push-log root");
+
+        let result = writer.save("replacement root must never be accepted");
+        assert!(
+            matches!(result, Err(PushLogError::NamespaceIsolation(_))),
+            "persistent writer must reject a root identity change between saves: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&fixed_root)
+                .expect("read replacement push-log root")
+                .count(),
+            0,
+            "replacement root must not receive an artifact"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(cooldown_memo)]
+    fn br192_push_log_rejects_an_artifact_swap_after_fsync() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let namespace = TestPushLogNamespace::new("ARTIFACT_SWAP");
+        let fixed_root = namespace.path().join("push_log");
+        let displaced_artifact = namespace.path().join("displaced_artifact.md");
+        let mut swapped = false;
+
+        let result = save_push_log_at_root_with_hook(
+            &fixed_root,
+            "original durable delivery evidence",
+            |phase, _, _, artifact_path| {
+                if matches!(phase, PushLogWritePhase::ArtifactSynced) && !swapped {
+                    let artifact_path = artifact_path.expect("artifact path at synced phase");
+                    std::fs::rename(artifact_path, &displaced_artifact)
+                        .expect("displace synced push-log artifact");
+                    let mut replacement = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(artifact_path)
+                        .expect("install replacement push-log artifact");
+                    replacement
+                        .set_permissions(std::fs::Permissions::from_mode(0o600))
+                        .expect("secure replacement permissions");
+                    replacement
+                        .write_all(b"replacement")
+                        .expect("write replacement artifact");
+                    replacement.sync_data().expect("sync replacement artifact");
+                    swapped = true;
+                }
+            },
+        );
+
+        assert!(
+            matches!(result, Err(PushLogError::NamespaceIsolation(_))),
+            "artifact swap must be a typed physical-isolation rejection: {result:?}"
+        );
+        assert!(swapped, "artifact-swap hook did not run");
+        assert_eq!(
+            std::fs::read_to_string(displaced_artifact).expect("read displaced original artifact"),
+            "original durable delivery evidence"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(cooldown_memo)]
+    fn br192_push_log_rejects_an_artifact_hard_link_after_fsync() {
+        let namespace = TestPushLogNamespace::new("ARTIFACT_HARD_LINK");
+        let fixed_root = namespace.path().join("push_log");
+        let extra_link = namespace.path().join("extra_artifact_link.md");
+        let mut linked = false;
+
+        let result = save_push_log_at_root_with_hook(
+            &fixed_root,
+            "hard-linked evidence must be rejected",
+            |phase, _, _, artifact_path| {
+                if matches!(phase, PushLogWritePhase::ArtifactSynced) && !linked {
+                    std::fs::hard_link(
+                        artifact_path.expect("artifact path at synced phase"),
+                        &extra_link,
+                    )
+                    .expect("create hostile artifact hard link");
+                    linked = true;
+                }
+            },
+        );
+
+        assert!(
+            matches!(result, Err(PushLogError::NamespaceIsolation(_))),
+            "artifact hard link must be a typed physical-isolation rejection: {result:?}"
+        );
+        assert!(linked, "artifact-hard-link hook did not run");
     }
 
     /// PushKind::is_deprecated: 9 保留 + 4 降级 (grill Q2/Q6 修订)
@@ -2570,24 +5772,6 @@ mod tests {
     /// v19.12 起所有变体均保留, 此测试验证 push_governor 对保留的 AuctionVolume 返回 true
     /// (旧测试期望降级返回 false, 已废弃; commit 6cffecf fix(v19.12))
     /// b011: 静默期 (02:00-06:00) 非紧急 kind 会被 L5 Deny — 测试对时钟做容错:
-    /// 非静默期断言 Pushed, 静默期断言 Denied (两者都证明链路走通且不假成功)
-    fn assert_pushed_or_quiet_denied(outcome: &PushOutcome, ctx: &str) {
-        let in_quiet = {
-            use chrono::Timelike;
-            (2..6).contains(&chrono::Local::now().hour())
-        };
-        if in_quiet {
-            assert!(
-                matches!(outcome, PushOutcome::Denied(r) if r == "quiet_hour"),
-                "{}: 静默期应 Denied(quiet_hour), got {:?}",
-                ctx,
-                outcome
-            );
-        } else {
-            assert!(outcome.is_pushed(), "{}: got {:?}", ctx, outcome);
-        }
-    }
-
     // ============== v17.5 §2.2: is_legacy_v17_5 标 4 variants (2026-07-16 审计后) ==============
 
     #[test]
@@ -2914,81 +6098,152 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(cooldown_memo)]
     async fn push_governor_deprecated_no_push() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         crate::v14_adapter::_reset_dedup_for_test();
-        std::env::set_var("V10_DRY_RUN_PUSH", "1"); // dry-run 模式返回 true
         let r = push_governor_v3("test kept auction", PushKind::AuctionVolume, None).await;
-        assert_pushed_or_quiet_denied(&r, "v19.12 起 AuctionVolume 保留 (dry-run)");
-        std::env::remove_var("V10_DRY_RUN_PUSH");
+        assert_eq!(r, PushOutcome::Pushed);
     }
 
-    /// push_governor 保留时调 push_wechat (返回 V10_DRY_RUN_PUSH=true 时为 true)
-    /// HoldingEvent 是紧急级 (静默期豁免) → 与时钟无关恒 true
     #[tokio::test]
     #[serial_test::serial(cooldown_memo)]
-    async fn push_governor_kept_calls_push_wechat() {
+    async fn br192_explicit_counted_binding_reaches_durable_dry_run() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        let _banner_guard = TestBannerGuard::full();
+        let test_code =
+            std::env::var("DURABLE_DELIVERY_TEST_CODE").expect("isolated TEST_CODE namespace");
+        let binding = crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+            chrono::Local::now().date_naive(),
+            "TEST_CODE_NOTIFY_EXPLICIT_OCCURRENCE",
+            b"{\"source\":\"TEST_CODE_INTERNAL\"}".to_vec(),
+            crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+            "f8d53518ba6725c98450d031208450e7f8eb2dbdff2b9c71b21c14085e5d90ea",
+            crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let token = crate::presentation_registry::acquire_token(
+            "T-04-holding-event",
+            PushKind::HoldingEvent,
+            "holding_event_dispatcher",
+            "render_holding_event",
+        )
+        .unwrap();
+        let outcome =
+            push_counted_with_binding(token, "TEST_CODE explicit counted body", None, binding)
+                .await;
+
+        assert_eq!(outcome, PushOutcome::Pushed);
+        let durable_database = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("data/test")
+            .join(test_code)
+            .join("durable_delivery.sqlite3");
+        let connection =
+            rusqlite::Connection::open(&durable_database).expect("open isolated durable database");
+        let receipt: (String, String, String) = connection
+            .query_row(
+                "SELECT result_kind,provider,channel FROM sink_results ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("load isolated dry-run receipt");
+        assert_eq!(
+            receipt,
+            (
+                "Accepted".to_owned(),
+                "TEST_CODE_MAGICLAW_DRY_RUN".to_owned(),
+                "TEST_CODE_DRY_RUN".to_owned(),
+            )
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(cooldown_memo)]
+    fn br192_production_environment_never_synthesizes_a_test_receipt() {
+        use stock_analysis::durable_delivery::{
+            AuthoritativeDeliveryRequest, AuthoritativeSinkPort, AuthoritativeSinkResult,
+        };
+
+        let _env_guard = crate::TestEnvGuard::capture(&[
+            "STOCK_ENV_MODE",
+            "V10_DRY_RUN_PUSH",
+            "DURABLE_DELIVERY_TEST_CODE",
+            "PUSH_LOG_DIR",
+        ]);
+        std::env::set_var("STOCK_ENV_MODE", "prod");
+        std::env::set_var("V10_DRY_RUN_PUSH", "1");
+        std::env::remove_var("DURABLE_DELIVERY_TEST_CODE");
+        std::env::remove_var("PUSH_LOG_DIR");
+        let request = AuthoritativeDeliveryRequest {
+            decision_identity: "a".repeat(64),
+            attempt_identity: "b".repeat(64),
+            fence_token: 1,
+            push_kind: stock_analysis::durable_delivery::PushKind::HoldingEvent,
+            stable_template_id: stock_analysis::durable_delivery::PushKind::HoldingEvent
+                .stable_template_id()
+                .to_owned(),
+            rendered_content: b"TEST_CODE must remain isolated".to_vec(),
+            rendered_content_sha256:
+                "709d96924d3b16a33caf6171bd5a9bc547f166739bd6854b585d1cc155a8f473".to_owned(),
+        };
+
+        let push_log_fixture = TestPushLogNamespace::new("PRODUCTION_SINK_REJECTION");
+        let sink = crate::durable_delivery_runtime::MagiclawAuthoritativeSink::from_test_artifacts(
+            crate::durable_delivery_runtime::RuntimeNamespace::Production,
+            PinnedPushLogWriter::for_test_anchor(
+                "production",
+                push_log_fixture.path(),
+                std::path::Path::new("push_log"),
+            )
+            .expect("bind production-semantic test push-log"),
+            stock_analysis::event::AuditDispatcher::for_test_code(push_log_fixture.test_code())
+                .expect("bind production-semantic TEST_CODE audit"),
+        );
+        let result = sink.deliver(&request);
+
+        match result {
+            AuthoritativeSinkResult::Rejected(rejection) => {
+                assert_eq!(
+                    rejection.reason_code,
+                    "production_dry_run_configuration_rejected"
+                );
+                assert!(!rejection.retry_authorized);
+            }
+            other => panic!("production dry-run returned non-rejection: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
+    async fn br192_bool_governor_rejects_counted_kind_without_binding() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         crate::v14_adapter::_reset_dedup_for_test();
-        std::env::set_var("V10_DRY_RUN_PUSH", "1"); // push_wechat 走 dry-run 返回 true
         let r = push_governor("test kept holding", PushKind::HoldingEvent).await;
-        assert!(r, "保留应调 push_wechat (V10_DRY_RUN_PUSH=true 返回 true)");
-        std::env::remove_var("V10_DRY_RUN_PUSH");
+        assert!(!r);
     }
 
-    // b011 P1-2: (kind, code) 票级冷却收敛到 L4 后语义不变 — 同票重复被挡
     #[tokio::test]
     #[serial_test::serial(cooldown_memo)]
-    async fn push_governor_cooldown_blocks_rapid_repeat() {
-        use std::env;
+    async fn br192_v3_governor_rejects_counted_kind_without_binding() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         crate::v14_adapter::_reset_dedup_for_test();
-        env::set_var("V10_DRY_RUN_PUSH", "1");
-        let r1 = push_governor_v3("first", PushKind::HoldingPlan, Some("TEST_CODE_000001")).await;
-        if r1.is_pushed() {
-            let r2 =
-                push_governor_v3("second", PushKind::HoldingPlan, Some("TEST_CODE_000001")).await;
-            assert_eq!(
-                r2,
-                PushOutcome::Deduped,
-                "30 min 冷却内同票重复调应被 L4 挡"
-            );
-        } else {
-            assert_pushed_or_quiet_denied(&r1, "首次");
-        }
-        env::remove_var("V10_DRY_RUN_PUSH");
-    }
-
-    // v59 F1 语义保持 — 不同 code 同一 PushKind 不应被 30 min 冷却挡
-    #[tokio::test]
-    #[serial_test::serial(cooldown_memo)]
-    async fn push_governor_v3_per_code_cooldown() {
-        use std::env;
-        crate::v14_adapter::_reset_dedup_for_test();
-        env::set_var("V10_DRY_RUN_PUSH", "1");
-        // 同一 kind (HoldingPlan 30 min) 不同 code
-        let r1 = push_governor_v3("first", PushKind::HoldingPlan, Some("TEST_CODE_000001")).await;
-        if r1.is_pushed() {
-            let r2 =
-                push_governor_v3("second", PushKind::HoldingPlan, Some("TEST_CODE_000002")).await;
-            assert!(
-                r2.is_pushed(),
-                "000002 不同 code 不应被 30 min 冷却挡 (F1 语义), got {:?}",
-                r2
-            );
-        } else {
-            assert_pushed_or_quiet_denied(&r1, "首次");
-        }
-        env::remove_var("V10_DRY_RUN_PUSH");
+        let outcome =
+            push_governor_v3("first", PushKind::HoldingPlan, Some("TEST_CODE_000001")).await;
+        assert_eq!(
+            outcome,
+            PushOutcome::Denied("counted_binding_required".to_owned())
+        );
     }
 
     /// PUSH_VERBOSE=true 覆盖降级 → 调 push_wechat
     #[tokio::test]
     #[serial_test::serial(cooldown_memo)]
     async fn push_verbose_true_overrides_deprecated() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         crate::v14_adapter::_reset_dedup_for_test();
-        std::env::set_var("V10_DRY_RUN_PUSH", "1");
-        std::env::set_var("PUSH_VERBOSE", "true");
         let r = push_governor_v3("test verbose auction", PushKind::AuctionVolume, None).await;
-        assert_pushed_or_quiet_denied(&r, "PUSH_VERBOSE=true 应覆盖降级");
-        std::env::remove_var("V10_DRY_RUN_PUSH");
-        std::env::remove_var("PUSH_VERBOSE");
+        assert_eq!(r, PushOutcome::Pushed);
     }
 
     fn notify_temp_dir(label: &str) -> std::path::PathBuf {
@@ -3426,5 +6681,30 @@ mod tests {
         };
         crate::v14_adapter::rollback_dedup_for_event(&retry, PushKind::Announcement, None, None)
             .expect("test cleanup rollback");
+    }
+
+    #[test]
+    fn br160_source_batch_governor_routes_lineage_to_authoritative_audit() {
+        let source = include_str!("notify.rs");
+        let start = source
+            .find("async fn deliver_and_record")
+            .expect("delivery tail exists");
+        let end = source[start..]
+            .find("/// BR-137: a source-fact identity")
+            .expect("delivery tail boundary");
+        let delivery_tail = &source[start..start + end];
+
+        assert!(delivery_tail.contains("publish_source_batch_delivery"));
+        for accessor in [
+            "evidence.business_date()",
+            "evidence.observed_at()",
+            "evidence.batch_id()",
+            "evidence.content_hash()",
+        ] {
+            assert!(
+                delivery_tail.contains(accessor),
+                "A-10 delivery audit must retain {accessor}"
+            );
+        }
     }
 }

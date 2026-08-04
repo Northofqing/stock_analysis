@@ -10,7 +10,7 @@
 
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, Weekday};
 use once_cell::sync::Lazy;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::RwLock;
 
 // ============================================================================
@@ -111,6 +111,97 @@ static HOLIDAYS: Lazy<RwLock<HashSet<NaiveDate>>> = Lazy::new(|| {
     }
     RwLock::new(set)
 });
+
+#[derive(Debug)]
+struct VerifiedTradingCalendar {
+    coverage_year: i32,
+    closures: BTreeSet<NaiveDate>,
+}
+
+const VERIFIED_TRADING_CALENDAR_AUTHORITY_ORIGIN: &str =
+    crate::data_gateway::OFFICIAL_SSE_AUTHORITY_ROOT;
+
+static VERIFIED_TRADING_CALENDAR: Lazy<Result<VerifiedTradingCalendar, String>> = Lazy::new(|| {
+    parse_verified_trading_calendar(include_str!("../config/a_share_market_holidays.csv"))
+});
+
+fn parse_verified_trading_calendar(raw: &str) -> Result<VerifiedTradingCalendar, String> {
+    let mut coverage_year = None;
+    let mut source = None;
+    let mut closures = BTreeSet::new();
+    for (line_index, line) in raw.lines().enumerate() {
+        let value = line.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if let Some(year) = value.strip_prefix("# year=") {
+            if coverage_year.is_some() {
+                return Err("duplicate checked-in trading-calendar coverage year".to_owned());
+            }
+            coverage_year = Some(
+                year.parse::<i32>()
+                    .map_err(|_| "invalid checked-in trading-calendar coverage year".to_owned())?,
+            );
+            continue;
+        }
+        if let Some(authority) = value.strip_prefix("# source=") {
+            if source.is_some() {
+                return Err("duplicate checked-in trading-calendar authority".to_owned());
+            }
+            if !authority.starts_with(VERIFIED_TRADING_CALENDAR_AUTHORITY_ORIGIN)
+                || crate::data_gateway::validate_canonical_sse_announcement_url(authority).is_err()
+            {
+                return Err("checked-in trading-calendar authority is not SSE".to_owned());
+            }
+            source = Some(authority.to_owned());
+            continue;
+        }
+        if value.starts_with('#') {
+            continue;
+        }
+        let date = NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| {
+            format!(
+                "invalid checked-in trading-calendar date at line {}",
+                line_index + 1
+            )
+        })?;
+        if !closures.insert(date) {
+            return Err(format!("duplicate checked-in trading-calendar date {date}"));
+        }
+    }
+    let coverage_year = coverage_year
+        .ok_or_else(|| "checked-in trading-calendar coverage is missing".to_owned())?;
+    if source.is_none() {
+        return Err("checked-in trading-calendar authority is missing".to_owned());
+    }
+    if closures.is_empty() || closures.iter().any(|date| date.year() != coverage_year) {
+        return Err("checked-in trading-calendar coverage is inconsistent".to_owned());
+    }
+    Ok(VerifiedTradingCalendar {
+        coverage_year,
+        closures,
+    })
+}
+
+/// Fail-closed, immutable A-share trading-day authority for audited replay.
+///
+/// Unlike [`is_trading_day`], this API never reads runtime environment
+/// overrides and rejects dates outside the checked-in exchange-calendar year.
+pub fn verified_a_share_trading_day(date: NaiveDate) -> Result<bool, String> {
+    let calendar = VERIFIED_TRADING_CALENDAR
+        .as_ref()
+        .map_err(std::clone::Clone::clone)?;
+    if date.year() != calendar.coverage_year {
+        return Err(format!(
+            "checked-in A-share trading-calendar coverage unavailable for {}",
+            date.year()
+        ));
+    }
+    Ok(
+        !matches!(date.weekday(), Weekday::Sat | Weekday::Sun)
+            && !calendar.closures.contains(&date),
+    )
+}
 
 /// 添加节假日（运行时注入，用于测试或动态更新）
 /// review #14: poison 时 log error 而非静默丢弃, 让调用方知道 add 失败.
@@ -297,6 +388,46 @@ mod tests {
         // 2026-06-20 is a Saturday
         let sat = NaiveDate::from_ymd_opt(2026, 6, 20).unwrap();
         assert!(!is_trading_day(sat));
+    }
+
+    #[test]
+    fn br194_verified_calendar_is_immutable_fail_closed_and_coverage_bounded() {
+        let trading_day = NaiveDate::from_ymd_opt(2026, 7, 30).unwrap();
+        let exchange_holiday = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        let weekend = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        assert_eq!(verified_a_share_trading_day(trading_day), Ok(true));
+        assert_eq!(verified_a_share_trading_day(exchange_holiday), Ok(false));
+        assert_eq!(verified_a_share_trading_day(weekend), Ok(false));
+        assert!(
+            verified_a_share_trading_day(NaiveDate::from_ymd_opt(2027, 1, 4).unwrap()).is_err()
+        );
+
+        add_holidays(&[trading_day]);
+        assert!(
+            !is_trading_day(trading_day),
+            "legacy runtime calendar accepts dynamic overrides"
+        );
+        assert_eq!(
+            verified_a_share_trading_day(trading_day),
+            Ok(true),
+            "audited replay authority must ignore runtime overrides"
+        );
+        if let Ok(mut guard) = HOLIDAYS.write() {
+            guard.remove(&trading_day);
+        }
+    }
+
+    #[test]
+    fn br194_verified_calendar_authority_origin_is_sse() {
+        assert_eq!(
+            VERIFIED_TRADING_CALENDAR_AUTHORITY_ORIGIN,
+            crate::data_gateway::OFFICIAL_SSE_AUTHORITY_ROOT
+        );
+        let spoofed = "# year=2026\n# source=https://example.com/sse-calendar\n2026-01-01\n";
+        assert_eq!(
+            parse_verified_trading_calendar(spoofed).unwrap_err(),
+            "checked-in trading-calendar authority is not SSE"
+        );
     }
 
     #[test]

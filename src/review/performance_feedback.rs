@@ -2,7 +2,7 @@
 //!
 //! 设计: 胜率/盈亏比/最大回撤/MFE/MAE/执行率. 样本不足显式标注.
 
-use crate::opportunity::news_ranker::HeatStage;
+use crate::review::market_stage::HeatStage;
 use chrono::Local;
 
 /// 三维分组

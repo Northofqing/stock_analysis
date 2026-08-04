@@ -1,5 +1,13 @@
 # Gate D Coverage Closure Implementation Plan
 
+> **Historical evidence only (superseded 2026-08-02):** Do not execute the
+> remaining checklist against the current tree. It references retired
+> `src/data_provider/**`, RustDX, and PR #2. Current coverage ownership, scope,
+> failure semantics, and closure slices are defined by
+> `docs/superpowers/specs/2026-08-02-gate-d-coverage-closure-design.md` and its
+> future post-review implementation plan. Completed entries below are retained
+> only as audit history.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use TDD to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Raise registered core line coverage to at least 95% and repository-wide line coverage to at least 80%, add truthful nullable same-day account evidence, pass Gate A-D, and merge PR #2 into `master`.

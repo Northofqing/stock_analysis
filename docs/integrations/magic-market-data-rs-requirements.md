@@ -1,4 +1,15 @@
-# `magic-market-data-rs` 外部行情需求交接
+# 【历史】`magic-market-data-rs` 外部行情需求交接
+
+> **历史状态（不得作为当前实现或验收合同）**：本文是统一 Gateway 切换前的
+> 外部需求交接，已被
+> [`2026-07-25-unified-data-final-cutover-design.md`](../superpowers/specs/2026-07-25-unified-data-final-cutover-design.md)
+> 和当前 `src/data_gateway/**` 所取代。本文提到的旧 provider/service 分工、
+> v17 source 路径和接入顺序仅用于追溯，不得据此新增第二套采集路径。
+>
+> **数据红线优先**：正文中“超过 20% 只提示、不硬拦截”以及“20% 以上原样
+> 保留”的旧要求不得覆盖仓库根 `AGENTS.md` §2.3。当前规则要求相邻有效值变化
+> 超过 ±20% 时告警并由人工确认；在确认前不得把该序列静默送入计算。上市日、
+> 板块涨跌幅制度或公司行动只能作为可追溯证据参与人工确认，不能自动绕过门禁。
 
 ## 目标与边界
 

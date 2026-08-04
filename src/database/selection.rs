@@ -8,7 +8,12 @@ use diesel::prelude::*;
 use diesel::sql_types::{Integer, Nullable, Text};
 use thiserror::Error;
 
-const TABLES: [&str; 7] = [
+/// Exact legacy selection graph covered by the BR-174 cutover.
+///
+/// This is crate-visible only so config activation can validate a persisted
+/// cutover snapshot against the same closed table set as the legacy store.
+/// Callers cannot supply or extend this registry.
+pub(crate) const LEGACY_SELECTION_TABLES: [&str; 7] = [
     "selection_event_inbox",
     "selection_event_completions",
     "selection_runs",
@@ -171,6 +176,25 @@ pub struct VisibleSample {
     pub d1_outcome_payload_json: Option<String>,
 }
 
+/// BR-169: committed candidate identity and the immutable Magic TDX batch
+/// evidence that admitted its feature snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibleCandidateEvidence {
+    pub candidate_id: String,
+    pub event_id: String,
+    pub stock_code: String,
+    pub stock_name: String,
+    pub ordinal: i32,
+    pub evaluation_market_date: NaiveDate,
+    pub event_provider: String,
+    pub event_source_batch_id: String,
+    pub event_source_batch_hash: String,
+    pub event_observed_at: DateTime<FixedOffset>,
+    pub source_batch_id: String,
+    pub source_batch_hash: String,
+    pub observed_at: DateTime<FixedOffset>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportFilter {
     pub from_market_date: Option<NaiveDate>,
@@ -329,7 +353,7 @@ pub fn create_schema(conn: &mut SqliteConnection) -> Result<(), String> {
     );
     conn.batch_execute(&schema)
         .map_err(|error| error.to_string())?;
-    for table in TABLES {
+    for table in LEGACY_SELECTION_TABLES {
         for action in ["UPDATE", "DELETE"] {
             let suffix = action.to_ascii_lowercase();
             let sql = format!(
@@ -468,6 +492,110 @@ struct VisibleRow {
     t0_outcome_payload_json: Option<String>,
     #[diesel(sql_type = Nullable<Text>)]
     d1_outcome_payload_json: Option<String>,
+}
+
+#[derive(QueryableByName)]
+struct VisibleCandidateEvidenceRow {
+    #[diesel(sql_type = Text)]
+    candidate_id: String,
+    #[diesel(sql_type = Text)]
+    event_id: String,
+    #[diesel(sql_type = Text)]
+    stock_code: String,
+    #[diesel(sql_type = Text)]
+    stock_name: String,
+    #[diesel(sql_type = Integer)]
+    ordinal: i32,
+    #[diesel(sql_type = Text)]
+    evaluation_market_date: String,
+    #[diesel(sql_type = Text)]
+    event_provider: String,
+    #[diesel(sql_type = Text)]
+    event_source_batch_id: String,
+    #[diesel(sql_type = Text)]
+    event_source_batch_hash: String,
+    #[diesel(sql_type = Text)]
+    event_observed_at: String,
+    #[diesel(sql_type = Text)]
+    source_batch_id: String,
+    #[diesel(sql_type = Text)]
+    source_batch_hash: String,
+    #[diesel(sql_type = Text)]
+    observed_at: String,
+    #[diesel(sql_type = Text)]
+    run_batch_id: String,
+    #[diesel(sql_type = Text)]
+    run_batch_hash: String,
+}
+
+impl VisibleCandidateEvidenceRow {
+    fn into_evidence(self) -> SelectionStoreResult<VisibleCandidateEvidence> {
+        for (field, value) in [
+            ("persisted candidate_id", self.candidate_id.as_str()),
+            ("persisted event_id", self.event_id.as_str()),
+            ("persisted stock_name", self.stock_name.as_str()),
+            ("persisted event provider", self.event_provider.as_str()),
+            (
+                "persisted event source_batch_id",
+                self.event_source_batch_id.as_str(),
+            ),
+            (
+                "persisted event source_batch_hash",
+                self.event_source_batch_hash.as_str(),
+            ),
+            (
+                "persisted feature source_batch_id",
+                self.source_batch_id.as_str(),
+            ),
+            (
+                "persisted feature source_batch_hash",
+                self.source_batch_hash.as_str(),
+            ),
+        ] {
+            require_non_empty(field, value)?;
+        }
+        if !is_valid_selection_stock_code(&self.stock_code) {
+            return Err(SelectionStoreError::InvalidInput(format!(
+                "persisted candidate stock_code is invalid for this environment: {:?}",
+                self.stock_code
+            )));
+        }
+        if self.ordinal < 0 {
+            return Err(SelectionStoreError::InvalidInput(format!(
+                "persisted candidate ordinal must not be negative: {}",
+                self.ordinal
+            )));
+        }
+        if self.source_batch_id != self.run_batch_id
+            || self.source_batch_hash != self.run_batch_hash
+        {
+            return Err(SelectionStoreError::InvalidInput(format!(
+                "persisted candidate {} feature evidence does not match its Magic TDX run",
+                self.candidate_id
+            )));
+        }
+        Ok(VisibleCandidateEvidence {
+            candidate_id: self.candidate_id,
+            event_id: self.event_id,
+            stock_code: self.stock_code,
+            stock_name: self.stock_name,
+            ordinal: self.ordinal,
+            evaluation_market_date: parse_date(
+                "persisted candidate evaluation_market_date",
+                &self.evaluation_market_date,
+            )?,
+            event_provider: self.event_provider,
+            event_source_batch_id: self.event_source_batch_id,
+            event_source_batch_hash: self.event_source_batch_hash,
+            event_observed_at: parse_timestamp(
+                "persisted event observed_at",
+                &self.event_observed_at,
+            )?,
+            source_batch_id: self.source_batch_id,
+            source_batch_hash: self.source_batch_hash,
+            observed_at: parse_timestamp("persisted feature observed_at", &self.observed_at)?,
+        })
+    }
 }
 
 impl VisibleRow {
@@ -1105,6 +1233,52 @@ impl<'a> SelectionRepository<'a> {
             .map(|content_hash| content_hash.is_some())
     }
 
+    /// Return every committed formal candidate for one source event.
+    ///
+    /// The visibility join is the authoritative boundary: staged or rejected
+    /// candidates are not outcome identities. Ordering is BR-169 stable and is
+    /// applied only after the committed candidate/evidence join is complete.
+    pub fn visible_candidates_for_event(
+        &mut self,
+        event_id: &str,
+    ) -> SelectionStoreResult<Vec<VisibleCandidateEvidence>> {
+        require_non_empty("visible candidate event_id", event_id)?;
+        diesel::sql_query(
+            "SELECT
+                candidate.candidate_id,
+                candidate.event_id,
+                candidate.stock_code,
+                candidate.stock_name,
+                candidate.ordinal,
+                candidate.evaluation_market_date,
+                inbox.provider AS event_provider,
+                inbox.source_batch_id AS event_source_batch_id,
+                inbox.source_batch_hash AS event_source_batch_hash,
+                inbox.observed_at AS event_observed_at,
+                feature.source_batch_id,
+                feature.source_batch_hash,
+                feature.observed_at,
+                run.magic_tdx_batch_id AS run_batch_id,
+                run.magic_tdx_batch_hash AS run_batch_hash
+             FROM selection_candidates AS candidate
+             INNER JOIN selection_visibility_receipts AS visibility
+               ON visibility.run_id = candidate.run_id
+             INNER JOIN selection_feature_snapshots AS feature
+               ON feature.candidate_id = candidate.candidate_id
+             INNER JOIN selection_event_inbox AS inbox
+               ON inbox.event_id = candidate.event_id
+             INNER JOIN selection_runs AS run
+               ON run.run_id = candidate.run_id
+             WHERE candidate.event_id = ?
+             ORDER BY candidate.ordinal ASC, candidate.candidate_id ASC",
+        )
+        .bind::<Text, _>(event_id)
+        .load::<VisibleCandidateEvidenceRow>(self.conn)?
+        .into_iter()
+        .map(VisibleCandidateEvidenceRow::into_evidence)
+        .collect()
+    }
+
     pub fn append_completion(
         &mut self,
         completion: &EventCompletion,
@@ -1490,7 +1664,10 @@ mod tests {
         .get_result::<CountRow>(&mut conn)
         .expect("count triggers")
         .count;
-        assert_eq!(triggers, i64::try_from(TABLES.len() * 2).expect("count"));
+        assert_eq!(
+            triggers,
+            i64::try_from(LEGACY_SELECTION_TABLES.len() * 2).expect("count")
+        );
     }
 
     #[test]
@@ -1620,6 +1797,54 @@ mod tests {
             })
             .expect("provider-filtered samples");
         assert!(wrong_provider.is_empty());
+    }
+
+    #[test]
+    fn visible_event_candidates_retain_persisted_security_and_magic_tdx_evidence() {
+        let mut conn = connection();
+        seed_staged(&mut conn);
+
+        let mut repo = SelectionRepository::new(&mut conn);
+        assert!(repo
+            .visible_candidates_for_event("event-1")
+            .expect("hidden candidate lookup")
+            .is_empty());
+
+        repo.publish_visibility(&VisibilityReceiptInput {
+            receipt_id: "visibility-1".to_owned(),
+            run_id: "run-1".to_owned(),
+            audit_record_hash: "audit-record-hash-1".to_owned(),
+            content_hash: "visibility-hash-1".to_owned(),
+            published_at: ts(11),
+        })
+        .expect("visibility");
+
+        let candidates = repo
+            .visible_candidates_for_event("event-1")
+            .expect("visible candidate lookup");
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.candidate_id, "candidate-1");
+        assert_eq!(candidate.event_id, "event-1");
+        assert_eq!(candidate.stock_code, "TEST_CODE_600396");
+        assert_eq!(candidate.stock_name, "华电辽能");
+        assert_eq!(candidate.ordinal, 0);
+        assert_eq!(
+            candidate.evaluation_market_date,
+            NaiveDate::from_ymd_opt(2026, 7, 23).expect("date")
+        );
+        assert_eq!(candidate.event_provider, "provider-a");
+        assert_eq!(candidate.event_source_batch_id, "source-batch-1");
+        assert_eq!(candidate.event_source_batch_hash, "source-batch-hash-1");
+        assert_eq!(candidate.event_observed_at, ts(9));
+        assert_eq!(candidate.source_batch_id, "tdx-batch-1");
+        assert_eq!(candidate.source_batch_hash, "tdx-batch-hash-1");
+        assert_eq!(candidate.observed_at, ts(10));
+
+        let error = repo
+            .visible_candidates_for_event(" ")
+            .expect_err("blank event identity must fail");
+        assert!(matches!(error, SelectionStoreError::InvalidInput(_)));
     }
 
     #[test]
@@ -1783,5 +2008,53 @@ mod tests {
             persisted[0].observed_at.with_timezone(&Utc),
             DateTime::<Utc>::UNIX_EPOCH
         );
+    }
+
+    #[test]
+    fn invalid_event_batch_and_report_filters_fail_before_sql_writes() {
+        let mut conn = connection();
+        let mut both_publication_fields = event("event-invalid", "event-hash-invalid");
+        both_publication_fields.provider_published_on =
+            Some(NaiveDate::from_ymd_opt(2026, 7, 23).expect("date"));
+        let mut repo = SelectionRepository::new(&mut conn);
+        assert!(matches!(
+            repo.ingest_event(&both_publication_fields),
+            Err(SelectionStoreError::InvalidInput(_))
+        ));
+        assert!(repo.pending_events(10).expect("pending").is_empty());
+
+        repo.ingest_event(&event("event-1", "event-hash-1"))
+            .expect("seed event");
+        let mut invalid_batch = batch("run-invalid", "candidate-invalid");
+        invalid_batch.feature_snapshots[0].source_batch_hash = "TEST_CODE_WRONG_BATCH".to_owned();
+        assert!(matches!(
+            repo.stage_batch(&invalid_batch),
+            Err(SelectionStoreError::InvalidInput(_))
+        ));
+
+        for filter in [
+            ReportFilter {
+                limit: 0,
+                ..ReportFilter::default()
+            },
+            ReportFilter {
+                from_market_date: Some(NaiveDate::from_ymd_opt(2026, 7, 24).expect("from date")),
+                to_market_date: Some(NaiveDate::from_ymd_opt(2026, 7, 23).expect("to date")),
+                ..ReportFilter::default()
+            },
+            ReportFilter {
+                provider: Some(" ".to_owned()),
+                ..ReportFilter::default()
+            },
+            ReportFilter {
+                stock_code: Some("600396".to_owned()),
+                ..ReportFilter::default()
+            },
+        ] {
+            assert!(matches!(
+                repo.visible_samples(&filter),
+                Err(SelectionStoreError::InvalidInput(_))
+            ));
+        }
     }
 }

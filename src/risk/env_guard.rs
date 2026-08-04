@@ -64,6 +64,20 @@ pub fn validate_symbol_for_current_env(code: &str) -> Result<(), String> {
     validate_symbol_for_env(code, current_env())
 }
 
+/// Resolve a persistent runtime artifact below the physically isolated data
+/// namespace selected by BR-051.
+pub fn runtime_data_path_for_env(env: TradingEnv, leaf: &str) -> std::path::PathBuf {
+    let root = match env {
+        TradingEnv::Prod => "data",
+        TradingEnv::Test => "data/test",
+    };
+    std::path::PathBuf::from(root).join(leaf)
+}
+
+pub fn runtime_data_path(leaf: &str) -> std::path::PathBuf {
+    runtime_data_path_for_env(current_env(), leaf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,6 +104,18 @@ mod tests {
     fn test_test_accepts_test_code() {
         let r = validate_symbol_for_env("TEST_CODE_000001", TradingEnv::Test);
         assert!(r.is_ok());
+    }
+
+    #[test]
+    fn runtime_artifacts_use_physically_separate_roots() {
+        assert_eq!(
+            runtime_data_path_for_env(TradingEnv::Test, "d01_recommendations"),
+            std::path::PathBuf::from("data/test/d01_recommendations")
+        );
+        assert_eq!(
+            runtime_data_path_for_env(TradingEnv::Prod, "d01_recommendations"),
+            std::path::PathBuf::from("data/d01_recommendations")
+        );
     }
 
     #[test]

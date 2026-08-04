@@ -59,6 +59,7 @@ pub struct SaveClosingValuationReceipt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClosingValuationView {
     pub persisted_run_row_id: i64,
+    pub run_id: String,
     pub valuation: PortfolioValuationView,
 }
 
@@ -89,9 +90,16 @@ fn run_id(v: &PortfolioValuationView) -> String {
 pub fn save_closing_valuation(
     v: &PortfolioValuationView,
 ) -> Result<SaveClosingValuationReceipt, String> {
-    let rid = run_id(v);
     let db = crate::database::DatabaseManager::get();
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
+    save_closing_valuation_with_conn(&mut conn, v)
+}
+
+fn save_closing_valuation_with_conn(
+    conn: &mut SqliteConnection,
+    v: &PortfolioValuationView,
+) -> Result<SaveClosingValuationReceipt, String> {
+    let rid = run_id(v);
     conn.transaction(|c| {
         if diesel::sql_query("SELECT id AS _id FROM closing_valuation_run WHERE run_id=?").bind::<diesel::sql_types::Text,_>(&rid).get_result::<IdRow>(c).optional()?.is_some() { return Ok(SaveClosingValuationReceipt { run_id: rid, inserted: false }); }
         diesel::sql_query("INSERT INTO closing_valuation_run(run_id,price_date,provider,covered,total,total_market_value,total_unrealized_pnl) VALUES (?,?,?,?,?,?,?)").bind::<diesel::sql_types::Text,_>(&rid).bind::<diesel::sql_types::Text,_>(v.price_date.to_string()).bind::<diesel::sql_types::Text,_>(&v.provider).bind::<diesel::sql_types::Integer,_>(v.covered as i32).bind::<diesel::sql_types::Integer,_>(v.total as i32).bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>,_>(v.total_market_value).bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>,_>(v.total_unrealized_pnl).execute(c)?;
@@ -103,13 +111,20 @@ pub fn save_closing_valuation(
 pub fn latest_persisted_valuation_view() -> Result<Option<ClosingValuationView>, String> {
     let db = crate::database::DatabaseManager::get();
     let mut c = db.get_conn().map_err(|e| e.to_string())?;
-    let row: Option<RunRow> = diesel::sql_query("SELECT id,run_id,price_date,provider,covered,total,total_market_value,total_unrealized_pnl FROM closing_valuation_run ORDER BY price_date DESC,id DESC LIMIT 1").get_result(&mut c).optional().map_err(|e| e.to_string())?;
+    latest_persisted_valuation_view_with_conn(&mut c)
+}
+
+fn latest_persisted_valuation_view_with_conn(
+    c: &mut SqliteConnection,
+) -> Result<Option<ClosingValuationView>, String> {
+    let row: Option<RunRow> = diesel::sql_query("SELECT id,run_id,price_date,provider,covered,total,total_market_value,total_unrealized_pnl FROM closing_valuation_run ORDER BY price_date DESC,id DESC LIMIT 1").get_result(&mut *c).optional().map_err(|e| e.to_string())?;
     let Some(row) = row else {
         return Ok(None);
     };
-    let items: Vec<ClosingValuationItem> = diesel::sql_query("SELECT code,name,quantity,cost_price,close,market_value,unrealized_pnl,unrealized_return_pct,daily_price_pnl FROM closing_valuation_item WHERE run_id=? ORDER BY code").bind::<diesel::sql_types::Text,_>(&row.run_id).load::<ItemRow>(&mut c).map_err(|e| e.to_string())?.into_iter().map(|i| ClosingValuationItem{code:i.code,name:i.name,quantity:i.quantity as u64,cost_price:i.cost_price,close:i.close,market_value:i.market_value,unrealized_pnl:i.unrealized_pnl,unrealized_return_pct:i.unrealized_return_pct,daily_price_pnl:i.daily_price_pnl}).collect();
+    let items: Vec<ClosingValuationItem> = diesel::sql_query("SELECT code,name,quantity,cost_price,close,market_value,unrealized_pnl,unrealized_return_pct,daily_price_pnl FROM closing_valuation_item WHERE run_id=? ORDER BY code").bind::<diesel::sql_types::Text,_>(&row.run_id).load::<ItemRow>(&mut *c).map_err(|e| e.to_string())?.into_iter().map(|i| ClosingValuationItem{code:i.code,name:i.name,quantity:i.quantity as u64,cost_price:i.cost_price,close:i.close,market_value:i.market_value,unrealized_pnl:i.unrealized_pnl,unrealized_return_pct:i.unrealized_return_pct,daily_price_pnl:i.daily_price_pnl}).collect();
     Ok(Some(ClosingValuationView {
         persisted_run_row_id: row.id,
+        run_id: row.run_id,
         valuation: PortfolioValuationView {
             price_date: chrono::NaiveDate::parse_from_str(&row.price_date, "%Y-%m-%d")
                 .map_err(|e| e.to_string())?,
@@ -121,4 +136,104 @@ pub fn latest_persisted_valuation_view() -> Result<Option<ClosingValuationView>,
             total_unrealized_pnl: row.total_unrealized_pnl,
         },
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+    use diesel::connection::SimpleConnection;
+
+    fn connection() -> SqliteConnection {
+        let mut conn = SqliteConnection::establish(":memory:").expect("in-memory SQLite");
+        conn.batch_execute("PRAGMA foreign_keys = ON;")
+            .expect("foreign keys");
+        create_schema(&mut conn).expect("closing valuation schema");
+        conn
+    }
+
+    fn item(code: &str, close: Option<f64>) -> ClosingValuationItem {
+        ClosingValuationItem {
+            code: code.to_owned(),
+            name: format!("TEST_CODE_{code}"),
+            quantity: 100,
+            cost_price: 10.0,
+            close,
+            market_value: close.map(|value| value * 100.0),
+            unrealized_pnl: close.map(|value| (value - 10.0) * 100.0),
+            unrealized_return_pct: close.map(|value| (value / 10.0 - 1.0) * 100.0),
+            daily_price_pnl: None,
+        }
+    }
+
+    fn view(items: Vec<ClosingValuationItem>) -> PortfolioValuationView {
+        PortfolioValuationView {
+            price_date: NaiveDate::from_ymd_opt(2026, 7, 24).expect("date"),
+            provider: "TEST_CODE_MAGIC_TDX".to_owned(),
+            covered: items.iter().filter(|item| item.close.is_some()).count(),
+            total: items.len(),
+            total_market_value: None,
+            total_unrealized_pnl: None,
+            items,
+        }
+    }
+
+    #[test]
+    fn sqlite_round_trip_is_idempotent_and_append_only() {
+        let mut conn = connection();
+        assert!(latest_persisted_valuation_view_with_conn(&mut conn)
+            .expect("empty read")
+            .is_none());
+
+        let value = view(vec![
+            item("TEST_CODE_000001", Some(11.0)),
+            item("TEST_CODE_600000", None),
+        ]);
+        let inserted =
+            save_closing_valuation_with_conn(&mut conn, &value).expect("first immutable insert");
+        assert!(inserted.inserted);
+        let duplicate =
+            save_closing_valuation_with_conn(&mut conn, &value).expect("idempotent insert");
+        assert!(!duplicate.inserted);
+        assert_eq!(duplicate.run_id, inserted.run_id);
+
+        let persisted = latest_persisted_valuation_view_with_conn(&mut conn)
+            .expect("latest read")
+            .expect("persisted view");
+        assert_eq!(persisted.run_id, inserted.run_id);
+        assert_eq!(persisted.valuation.provider, "TEST_CODE_MAGIC_TDX");
+        assert_eq!(persisted.valuation.items.len(), 2);
+        assert_eq!(persisted.valuation.items[0].code, "TEST_CODE_000001");
+        assert_eq!(persisted.valuation.items[1].close, None);
+
+        let mutation =
+            diesel::sql_query("UPDATE closing_valuation_run SET provider='TEST_CODE_TAMPERED'")
+                .execute(&mut conn)
+                .expect_err("append-only trigger");
+        assert!(mutation.to_string().contains("append-only"));
+    }
+
+    #[test]
+    fn duplicate_item_rolls_back_parent_and_invalid_stored_date_is_explicit() {
+        let mut conn = connection();
+        let duplicate = view(vec![
+            item("TEST_CODE_000001", Some(11.0)),
+            item("TEST_CODE_000001", Some(12.0)),
+        ]);
+        assert!(save_closing_valuation_with_conn(&mut conn, &duplicate).is_err());
+        assert!(latest_persisted_valuation_view_with_conn(&mut conn)
+            .expect("rollback leaves no run")
+            .is_none());
+
+        diesel::sql_query(
+            "INSERT INTO closing_valuation_run(
+                run_id,price_date,provider,covered,total,total_market_value,total_unrealized_pnl
+             ) VALUES ('TEST_CODE_BAD_DATE','not-a-date','TEST_CODE_PROVIDER',0,0,NULL,NULL)",
+        )
+        .execute(&mut conn)
+        .expect("malformed historical row");
+        let error = latest_persisted_valuation_view_with_conn(&mut conn)
+            .expect_err("invalid persisted date must fail");
+        assert!(!error.is_empty());
+    }
 }

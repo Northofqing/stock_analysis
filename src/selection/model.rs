@@ -202,4 +202,63 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.as_str().starts_with("selection_candidate_v1_"));
     }
+
+    #[test]
+    fn security_master_rejects_blank_empty_and_duplicate_identities() {
+        let observed_at = Local::now();
+        let security = SecurityIdentity {
+            code: "TEST_CODE_000001".to_owned(),
+            name: "测试股份".to_owned(),
+            market: SecurityMarket::Shanghai,
+        };
+
+        let cases = [
+            SecurityMasterSnapshot::new(vec![security.clone()], " ".to_owned(), observed_at),
+            SecurityMasterSnapshot::new(Vec::new(), "TEST_CODE_batch".to_owned(), observed_at),
+            SecurityMasterSnapshot::new(
+                vec![SecurityIdentity {
+                    code: " ".to_owned(),
+                    ..security.clone()
+                }],
+                "TEST_CODE_batch".to_owned(),
+                observed_at,
+            ),
+            SecurityMasterSnapshot::new(
+                vec![security.clone(), security],
+                "TEST_CODE_batch".to_owned(),
+                observed_at,
+            ),
+        ];
+        for result in cases {
+            let error = result.expect_err("invalid master");
+            assert!(!error.reason_code().is_empty());
+            assert!(!error.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn only_direct_relation_evidence_can_create_formal_candidate() {
+        let security = SecurityIdentity {
+            code: "TEST_CODE_000001".to_owned(),
+            name: "测试股份".to_owned(),
+            market: SecurityMarket::Shenzhen,
+        };
+        assert!(RelationEvidence::DirectMention(DirectMentionEvidence {
+            security: security.clone(),
+            matched_by: DirectMentionKind::ExactSecurityCode,
+            master_batch_id: "TEST_CODE_master".to_owned(),
+        })
+        .formal_candidate_allowed());
+        assert!(!RelationEvidence::BoardMembership(BoardMembershipEvidence {
+            security,
+            board_name: "TEST_CODE_board".to_owned(),
+            master_batch_id: "TEST_CODE_master".to_owned(),
+        })
+        .formal_candidate_allowed());
+        assert!(!RelationEvidence::AiProposed(AiProposedEvidence {
+            proposed_code: Some("TEST_CODE_000001".to_owned()),
+            rationale_hash: "TEST_CODE_hash".to_owned(),
+        })
+        .formal_candidate_allowed());
+    }
 }

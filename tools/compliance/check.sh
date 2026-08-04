@@ -8,6 +8,7 @@
 #   - check_design_contradiction.sh (AGENTS §2.9 设计矛盾禁令, PR-3)
 #   - check_business_rules.sh (AGENTS §2.10 业务规则文档化, PR-4)
 #   - check_backfill_failure_propagation.sh (BR-009 / AGENTS §2.8)
+#   - check_br194_review_dependency.sh (BR-194 复盘依赖、日历与终态重放)
 #
 # 后续 PR 会扩展:
 #   - check_*.sh (PR-5+)
@@ -49,6 +50,8 @@ run_check "check_business_rules.sh"
 run_check "check_backfill_failure_propagation.sh"
 run_check "check_no_silent_fallback_push.sh"
 run_check "check_no_silent_fallback_global.sh"
+run_check "check_br174_legacy_callers.sh"
+run_check "check_br194_review_dependency.sh"
 
 if [ $OVERALL_EXIT -eq 0 ]; then
     echo "[compliance] ALL CHECKS PASSED"

@@ -1504,3 +1504,40 @@ durable 数据、push log、dispatcher log 或 hash-chain audit。回滚后 R-04
 `C0 / I0 / M0`。本勾选只确认 Gate A 设计可实施；Gate B 独立代码复审已发现
 schema migration、DB canonical hash authority 等阻塞项，Gate B/C/D 与真实生产
 push/audit join 仍保持未完成，不得据此宣告 release-ready。
+
+## 11. 2026-08-01 独立依赖审计修订
+
+本节是 BR-194 的后续窄化修订；与首版任务分类冲突时，以本节为准。审计生产
+outcome 的实际调用图后，分类闭集修订为：
+
+| 任务 | 修订后依赖 | 代码事实 |
+|---|---|---|
+| R-04 | `SourceOnly` | 保持首版合同 |
+| R-08 | `SourceOnly` | BR-199 公共事件日历合同，不读取持仓 |
+| R-09 | `SourceOnly` | 保持首版合同 |
+| A-10 | `SourceOnly` | 只读取复盘业务日的 immutable `ChainIntelligenceBatch` |
+| A-01 | `SourceOnly` | 只读取复盘业务日的 virtual observation 与 HistoricalBars Gateway |
+| R-03 | `LegacyAccountGate` | 仍调用 `portfolio::get_positions`，本地 projection 不是 verified broker batch |
+| R-02/R-05/R-06 | `UnclassifiedConservative` | 保持静态 Disabled，不访问 provider |
+
+中央 dispatcher 必须先执行既有 static preflight，再并行运行
+R-04/R-08/R-09/A-10/A-01 的各自 source-only producer。每条路径继续执行自己的
+Launch/L5/durable/sink/audit 合同；本修订只移除无关账户失败，不提供数据质量或
+投递治理豁免。source phase 完成后，只能为仍 runnable 的 R-03 生成 typed
+`account_metrics_incomplete`。任一 source task 的失败不得改写其他任务 outcome。
+`--test --review` 必须在 provider 前禁用全部五个 source-only task，确保测试环境
+不读取生产来源、不进入真实 sink；测试隔离不得再依赖账户失败间接阻断 provider。
+
+复盘业务日期由 `ReviewRunContext::business_date()` 唯一提供；该方法与历史
+`review_date()` 返回同一冻结值，后者仅作为兼容 accessor 保留。A-10/A-01 的
+provider request、任务 identity、报告日期必须使用此值，禁止重新读取墙钟。
+
+### 11.1 失败模式与回滚
+
+- A-10/A-01 来源不可用、部分、冲突或过期：返回各自 typed source failure，保留
+  重试资格；不得降级成账户失败、空批次或默认值。
+- R-03 缺 verified broker batch：保持 typed account dependency failure；不得用
+  本地 projection 补证。
+- 回滚仅恢复本节涉及的 dependency mapping、dispatcher 分支和测试；不得删除或
+  重写 durable、复盘、持仓、行情或投递审计数据，也不得触碰 R-04 runtime 或交割日
+  Gateway。

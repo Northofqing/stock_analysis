@@ -11,16 +11,51 @@
 
 use chrono::NaiveDate;
 use diesel::prelude::*;
-use diesel::r2d2::{ConnectionManager, Pool, PooledConnection};
+use diesel::r2d2::ManageConnection;
+use diesel::r2d2::{
+    ConnectionManager, CustomizeConnection, Error as ConnectionManagerError, Pool, PoolError,
+    PooledConnection,
+};
 use log::info;
 use once_cell::sync::OnceCell;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::ffi::{CString, OsStr, OsString};
+use std::fs::{File, Metadata};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+#[cfg(target_os = "macos")]
+use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
+use self::sqlite_descriptor_attestation::{
+    validate_wal_journal_mode, AttestedSqliteHandles, DescriptorAttestationError,
+    FileObjectIdentity, PinnedSqliteObjectSet, ProcessDescriptorSnapshot, SqliteObjectRole,
+};
 use crate::models::MaStatus;
 
-pub(super) type DbPool = Pool<ConnectionManager<SqliteConnection>>;
-pub(super) type DbConnection = PooledConnection<ConnectionManager<SqliteConnection>>;
+pub(super) type DbPool = Pool<SqliteConnectionManager>;
+
+#[cfg(target_os = "linux")]
+const O_NOFOLLOW_FLAG: i32 = 0x0002_0000;
+#[cfg(target_os = "macos")]
+const O_NOFOLLOW_FLAG: i32 = 0x0000_0100;
+#[cfg(target_os = "linux")]
+const O_NONBLOCK_FLAG: i32 = 0x0000_0800;
+#[cfg(target_os = "macos")]
+const O_NONBLOCK_FLAG: i32 = 0x0000_0004;
+#[cfg(target_os = "linux")]
+const O_CLOEXEC_FLAG: i32 = 0x0008_0000;
+#[cfg(target_os = "macos")]
+const O_CLOEXEC_FLAG: i32 = 0x0100_0000;
+
+unsafe extern "C" {
+    fn openat(directory_fd: i32, path: *const std::ffi::c_char, flags: i32, ...) -> i32;
+}
+
+pub type DbConnection = PooledConnection<SqliteConnectionManager>;
 
 // ============================================================================
 // 数据库管理器 - 单例模式
@@ -33,7 +68,14 @@ pub(super) type DbConnection = PooledConnection<ConnectionManager<SqliteConnecti
 /// 2. 提供数据存取操作
 /// 3. 实现断点续传逻辑
 pub struct DatabaseManager {
+    // Drop order is a safety contract: all pooled SQLite connections close
+    // before the owner capability releases its database/audit descriptors and
+    // exclusive GlobalSchema maintenance lease.
     pool: DbPool,
+    #[allow(dead_code)]
+    selection_connection_source: Option<Arc<DescriptorSqliteSource>>,
+    #[allow(dead_code)]
+    selection_schema_authority: Option<Box<global_schema_v1::VerifiedAmendedSelectionSchema>>,
 }
 
 static DB_INSTANCE: OnceCell<DatabaseManager> = OnceCell::new();
@@ -69,7 +111,807 @@ struct JournalModeRow {
     journal_mode: String,
 }
 
+#[derive(QueryableByName)]
+struct ForeignKeysPragmaRow {
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    foreign_keys: i32,
+}
+
+#[derive(QueryableByName)]
+struct SynchronousPragmaRow {
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    synchronous: i32,
+}
+
+#[derive(QueryableByName)]
+struct BusyTimeoutPragmaRow {
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    timeout: i32,
+}
+
+#[derive(QueryableByName)]
+struct WalAutocheckpointPragmaRow {
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    wal_autocheckpoint: i32,
+}
+
+#[derive(QueryableByName)]
+struct SqliteDatabaseListRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    name: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    file: String,
+}
+
+#[derive(QueryableByName)]
+struct SqliteAttestationTokenRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    token: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SqliteFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl SqliteFileIdentity {
+    fn from_metadata(metadata: &Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SqliteObjectIdentity {
+    device: u64,
+    inode: u64,
+    mode: u32,
+}
+
+impl SqliteObjectIdentity {
+    fn from_metadata(metadata: &Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum DatabaseAuthorityError {
+    #[error("descriptor_attestation_unavailable: {detail}")]
+    DescriptorAttestationUnavailable { detail: String },
+}
+
+impl DatabaseAuthorityError {
+    #[allow(dead_code)]
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::DescriptorAttestationUnavailable { .. } => "descriptor_attestation_unavailable",
+        }
+    }
+}
+
+/// Internal hand-off from the GlobalSchema owner to the connection pool.
+///
+/// This value has no pathname constructor. The only non-test producer is the
+/// owner-issued amended capability, which clones its already pinned root,
+/// database-parent and database descriptors.
+pub(super) struct PinnedSqliteDatabase {
+    root: File,
+    parent: File,
+    leaf: OsString,
+    #[cfg(not(test))]
+    relative_identity: PathBuf,
+    database_file: File,
+    root_identity: SqliteObjectIdentity,
+    parent_identity: SqliteObjectIdentity,
+    database_object_identity: SqliteObjectIdentity,
+    identity: SqliteFileIdentity,
+}
+
+impl PinnedSqliteDatabase {
+    pub(super) fn from_owner_descriptors(
+        root: File,
+        parent: File,
+        leaf: OsString,
+        relative_identity: PathBuf,
+        database_file: File,
+    ) -> Result<Self, std::io::Error> {
+        if leaf.is_empty() || Path::new(&leaf).components().count() != 1 {
+            return Err(std::io::Error::other(
+                "GlobalSchema database leaf is not one path component",
+            ));
+        }
+        if relative_identity.is_absolute()
+            || relative_identity.components().count() == 0
+            || relative_identity
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(std::io::Error::other(
+                "GlobalSchema database relative identity is not a normal relative path",
+            ));
+        }
+        let root_metadata = root.metadata()?;
+        if !root_metadata.is_dir() {
+            return Err(std::io::Error::other(
+                "GlobalSchema root descriptor is not a directory",
+            ));
+        }
+        let parent_metadata = parent.metadata()?;
+        if !parent_metadata.is_dir() {
+            return Err(std::io::Error::other(
+                "GlobalSchema database parent descriptor is not a directory",
+            ));
+        }
+        let metadata = database_file.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::other(
+                "GlobalSchema database descriptor is not a regular file",
+            ));
+        }
+        Ok(Self {
+            root,
+            parent,
+            leaf,
+            #[cfg(not(test))]
+            relative_identity,
+            database_file,
+            root_identity: SqliteObjectIdentity::from_metadata(&root_metadata),
+            parent_identity: SqliteObjectIdentity::from_metadata(&parent_metadata),
+            database_object_identity: SqliteObjectIdentity::from_metadata(&metadata),
+            identity: SqliteFileIdentity::from_metadata(&metadata),
+        })
+    }
+
+    #[cfg(test)]
+    fn from_test_descriptors(
+        root: File,
+        parent: File,
+        leaf: OsString,
+        relative_identity: PathBuf,
+        database_file: File,
+    ) -> Result<Self, std::io::Error> {
+        Self::from_owner_descriptors(root, parent, leaf, relative_identity, database_file)
+    }
+}
+
+#[derive(Debug)]
+struct DescriptorConnectionProof {
+    handles: AttestedSqliteHandles,
+    expected_objects: Arc<PinnedSqliteObjectSet>,
+    shared_shm_anchor: Arc<File>,
+}
+
+#[derive(Debug, Clone)]
+struct DescriptorPoolEvidence {
+    expected_objects: Arc<PinnedSqliteObjectSet>,
+    shared_shm_anchor: Arc<File>,
+}
+
+/// One checkout-scoped proof that the actual Diesel connection is attached to
+/// the database inode retained by the GlobalSchema owner.
+#[cfg(not(test))]
+pub(super) struct SelectionConnectionBoundProof {
+    root: SqliteObjectIdentity,
+    parent: SqliteObjectIdentity,
+    database: SqliteObjectIdentity,
+    database_relative_identity: String,
+}
+
+#[cfg(not(test))]
+impl SelectionConnectionBoundProof {
+    pub(super) fn into_preimage(
+        self,
+    ) -> crate::selection::schema_v2::VerifiedOutcomeDueDatabaseObjectBindingPreimage {
+        crate::selection::schema_v2::VerifiedOutcomeDueDatabaseObjectBindingPreimage {
+            domain: crate::selection::schema_v2::DOMAIN_OUTCOME_DUE_DATABASE_OBJECT.into(),
+            // This legacy field now carries an owner-scoped logical identity,
+            // not a reopened/canonicalized filesystem path. Device/inode/mode
+            // values below are all fstat results from retained descriptors.
+            manifest_root_canonical_path: format!(
+                "owner-retained://root/{:x}:{:x}:{:x}/parent/{:x}:{:x}:{:x}",
+                self.root.device,
+                self.root.inode,
+                self.root.mode,
+                self.parent.device,
+                self.parent.inode,
+                self.parent.mode,
+            ),
+            manifest_root_device: self.root.device,
+            manifest_root_inode: self.root.inode,
+            manifest_root_mode: self.root.mode,
+            database_relative_path: self.database_relative_identity,
+            database_device: self.database.device,
+            database_inode: self.database.inode,
+            database_mode: self.database.mode,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DescriptorSqliteSource {
+    health: ConnectionManager<SqliteConnection>,
+    root: Arc<File>,
+    parent: Arc<File>,
+    leaf: OsString,
+    root_identity: SqliteObjectIdentity,
+    parent_identity: SqliteObjectIdentity,
+    database_object_identity: SqliteObjectIdentity,
+    identity: SqliteFileIdentity,
+    database_anchor: Arc<File>,
+    connect_lock: Mutex<()>,
+    pool_evidence: Mutex<Option<DescriptorPoolEvidence>>,
+    connection_proofs: Mutex<HashMap<String, DescriptorConnectionProof>>,
+    next_connection_id: AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+enum SqliteConnectionSource {
+    Legacy(Arc<ConnectionManager<SqliteConnection>>),
+    Descriptor(Arc<DescriptorSqliteSource>),
+}
+
+/// r2d2 manager whose descriptor variant proves every newly established
+/// SQLite connection is attached to the GlobalSchema owner's pinned inode.
+///
+/// The legacy path variant exists only for the pre-existing initializer. The
+/// amended-schema constructor below cannot accept a path and always selects
+/// the descriptor variant.
+#[derive(Debug, Clone)]
+#[doc(hidden)]
+pub struct SqliteConnectionManager {
+    source: SqliteConnectionSource,
+}
+
+impl SqliteConnectionManager {
+    fn legacy(database_url: String) -> Self {
+        Self {
+            source: SqliteConnectionSource::Legacy(Arc::new(ConnectionManager::new(database_url))),
+        }
+    }
+
+    fn descriptor(database: PinnedSqliteDatabase) -> Result<Self, DatabaseAuthorityError> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = database;
+            return Err(DatabaseAuthorityError::DescriptorAttestationUnavailable {
+                detail: format!(
+                    "platform {} has no implemented SQLite descriptor attestation route",
+                    std::env::consts::OS
+                ),
+            });
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        Ok(Self {
+            source: SqliteConnectionSource::Descriptor(Arc::new(DescriptorSqliteSource {
+                health: ConnectionManager::new(":memory:"),
+                root: Arc::new(database.root),
+                parent: Arc::new(database.parent),
+                leaf: database.leaf,
+                root_identity: database.root_identity,
+                parent_identity: database.parent_identity,
+                database_object_identity: database.database_object_identity,
+                identity: database.identity,
+                database_anchor: Arc::new(database.database_file),
+                connect_lock: Mutex::new(()),
+                pool_evidence: Mutex::new(None),
+                connection_proofs: Mutex::new(HashMap::new()),
+                next_connection_id: AtomicU64::new(0),
+            })),
+        })
+    }
+
+    fn descriptor_source(&self) -> Option<Arc<DescriptorSqliteSource>> {
+        match &self.source {
+            SqliteConnectionSource::Legacy(_) => None,
+            SqliteConnectionSource::Descriptor(source) => Some(Arc::clone(source)),
+        }
+    }
+
+    fn verify_descriptor_connection(
+        source: &DescriptorSqliteSource,
+        connection: &mut SqliteConnection,
+        expected_route: &Path,
+    ) -> Result<SqliteFileIdentity, ConnectionManagerError> {
+        verify_sqlite_connection_object(source.identity, connection, expected_route)
+    }
+}
+
+fn verify_sqlite_connection_object(
+    expected_identity: SqliteFileIdentity,
+    connection: &mut SqliteConnection,
+    expected_route: &Path,
+) -> Result<SqliteFileIdentity, ConnectionManagerError> {
+    let main = diesel::sql_query("PRAGMA database_list")
+        .load::<SqliteDatabaseListRow>(connection)
+        .map_err(|error| sqlite_configuration_error("read database_list", error))?
+        .into_iter()
+        .find(|row| row.name == "main")
+        .ok_or_else(|| {
+            sqlite_manager_error("descriptor-anchored SQLite connection has no main database")
+        })?;
+    if Path::new(&main.file) != expected_route {
+        return Err(sqlite_manager_error(format!(
+            "descriptor-anchored SQLite connection escaped owner route: expected {:?}, got {:?}",
+            expected_route, main.file
+        )));
+    }
+    let actual = std::fs::metadata(&main.file)
+        .map(|metadata| SqliteFileIdentity::from_metadata(&metadata))
+        .map_err(|error| {
+            sqlite_manager_error(format!(
+                "stat SQLite main descriptor route {:?}: {error}",
+                main.file
+            ))
+        })?;
+    if actual != expected_identity {
+        return Err(sqlite_manager_error(format!(
+            "descriptor-anchored SQLite inode mismatch: expected {:?}, got {:?}",
+            expected_identity, actual
+        )));
+    }
+    Ok(actual)
+}
+
+#[cfg(target_os = "macos")]
+const F_GETPATH_COMMAND: i32 = 50;
+#[cfg(target_os = "macos")]
+const DARWIN_MAX_PATH_BYTES: usize = 1_024;
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn fcntl(descriptor: i32, command: i32, ...) -> i32;
+}
+
+/// Produces only the transient pathname SQLite needs to invoke its native VFS.
+/// It is never identity evidence; descriptor attestation proves the actual
+/// main/WAL/SHM objects opened by that VFS.
+pub(super) fn sqlite_open_route_from_retained_parent(
+    parent: &File,
+    leaf: &std::ffi::OsStr,
+) -> Result<PathBuf, ConnectionManagerError> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(PathBuf::from(format!(
+            "/proc/self/fd/{}/{}",
+            parent.as_raw_fd(),
+            leaf.to_string_lossy()
+        )))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut bytes = [0_u8; DARWIN_MAX_PATH_BYTES];
+        // SAFETY: F_GETPATH writes a NUL-terminated path into the supplied
+        // writable buffer for this live retained directory descriptor.
+        let result = unsafe { fcntl(parent.as_raw_fd(), F_GETPATH_COMMAND, bytes.as_mut_ptr()) };
+        if result < 0 {
+            return Err(sqlite_manager_error(format!(
+                "descriptor_attestation_unavailable: resolve retained parent for SQLite open: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let length = bytes.iter().position(|byte| *byte == 0).ok_or_else(|| {
+            sqlite_manager_error(
+                "descriptor_attestation_unavailable: F_GETPATH returned no NUL terminator",
+            )
+        })?;
+        Ok(PathBuf::from(OsString::from_vec(bytes[..length].to_vec())).join(leaf))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (parent, leaf);
+        Err(sqlite_manager_error(
+            "descriptor_attestation_unavailable: SQLite open route is unsupported on this platform",
+        ))
+    }
+}
+
+fn sqlite_open_route(source: &DescriptorSqliteSource) -> Result<PathBuf, ConnectionManagerError> {
+    sqlite_open_route_from_retained_parent(&source.parent, &source.leaf)
+}
+
+fn sqlite_sidecar_leaf(database_leaf: &OsStr, suffix: &str) -> OsString {
+    let mut leaf = database_leaf.to_os_string();
+    leaf.push(suffix);
+    leaf
+}
+
+fn openat_regular_for_attestation(
+    parent: &File,
+    leaf: &OsStr,
+    role: &str,
+) -> Result<File, ConnectionManagerError> {
+    let name = CString::new(leaf.as_bytes()).map_err(|_| {
+        sqlite_manager_error(format!(
+            "descriptor_attestation_unavailable: {role} leaf contains NUL"
+        ))
+    })?;
+    // SAFETY: name is NUL-terminated, parent is a retained directory fd, and
+    // success returns a new owned descriptor.
+    let descriptor = unsafe {
+        openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            O_NOFOLLOW_FLAG | O_NONBLOCK_FLAG | O_CLOEXEC_FLAG,
+        )
+    };
+    if descriptor < 0 {
+        return Err(sqlite_manager_error(format!(
+            "descriptor_attestation_unavailable: open pinned {role} with openat(O_NOFOLLOW): {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: openat returned a new owned descriptor.
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    if !file
+        .metadata()
+        .map_err(|error| {
+            sqlite_manager_error(format!(
+                "descriptor_attestation_unavailable: fstat pinned {role}: {error}"
+            ))
+        })?
+        .is_file()
+    {
+        return Err(sqlite_manager_error(format!(
+            "descriptor_identity_changed: pinned {role} is not a regular file"
+        )));
+    }
+    Ok(file)
+}
+
+fn capture_pinned_sqlite_object_set(
+    source: &DescriptorSqliteSource,
+) -> Result<PinnedSqliteObjectSet, ConnectionManagerError> {
+    let wal_leaf = sqlite_sidecar_leaf(&source.leaf, "-wal");
+    let shm_leaf = sqlite_sidecar_leaf(&source.leaf, "-shm");
+    let wal = openat_regular_for_attestation(&source.parent, &wal_leaf, "SQLite WAL")?;
+    let shm = openat_regular_for_attestation(&source.parent, &shm_leaf, "SQLite SHM")?;
+    PinnedSqliteObjectSet::from_files(&source.database_anchor, &wal, &shm)
+        .map_err(descriptor_attestation_manager_error)
+}
+
+fn open_shared_shm_anchor(
+    source: &DescriptorSqliteSource,
+    expected: &PinnedSqliteObjectSet,
+) -> Result<File, ConnectionManagerError> {
+    let shm_leaf = sqlite_sidecar_leaf(&source.leaf, "-shm");
+    let file =
+        openat_regular_for_attestation(&source.parent, &shm_leaf, "SQLite shared SHM anchor")?;
+    let actual =
+        FileObjectIdentity::from_file(&file).map_err(descriptor_attestation_manager_error)?;
+    if actual != expected.identity(SqliteObjectRole::Shm) {
+        return Err(sqlite_manager_error(
+            "descriptor_identity_changed: separately pinned SHM anchor differs from attested SQLite SHM",
+        ));
+    }
+    Ok(file)
+}
+
+fn current_descriptor_pool_evidence(
+    source: &DescriptorSqliteSource,
+) -> Result<Option<DescriptorPoolEvidence>, ConnectionManagerError> {
+    source
+        .pool_evidence
+        .lock()
+        .map(|evidence| evidence.clone())
+        .map_err(|_| sqlite_manager_error("descriptor pool-evidence lock is poisoned"))
+}
+
+fn commit_descriptor_pool_evidence(
+    source: &DescriptorSqliteSource,
+    proposed: DescriptorPoolEvidence,
+) -> Result<DescriptorPoolEvidence, ConnectionManagerError> {
+    let mut state = source
+        .pool_evidence
+        .lock()
+        .map_err(|_| sqlite_manager_error("descriptor pool-evidence lock is poisoned"))?;
+    match state.as_ref() {
+        Some(existing) if existing.expected_objects != proposed.expected_objects => {
+            Err(sqlite_manager_error(
+                "descriptor_identity_changed: SQLite main/WAL/SHM objects changed between connections",
+            ))
+        }
+        Some(existing) => {
+            let actual = FileObjectIdentity::from_file(&existing.shared_shm_anchor)
+                .map_err(descriptor_attestation_manager_error)?;
+            if actual != existing.expected_objects.identity(SqliteObjectRole::Shm) {
+                return Err(sqlite_manager_error(
+                    "descriptor_identity_changed: process-shared SHM anchor changed identity",
+                ));
+            }
+            Ok(existing.clone())
+        }
+        None => {
+            *state = Some(proposed.clone());
+            Ok(proposed)
+        }
+    }
+}
+
+const DESCRIPTOR_ATTESTATION_TEMP_TABLE: &str =
+    "__stock_analysis_descriptor_connection_attestation";
+
+fn install_connection_attestation_token(
+    connection: &mut SqliteConnection,
+    token: &str,
+) -> Result<(), ConnectionManagerError> {
+    diesel::sql_query(format!(
+        "CREATE TEMP TABLE {DESCRIPTOR_ATTESTATION_TEMP_TABLE} \
+         (slot INTEGER NOT NULL PRIMARY KEY CHECK(slot = 1), \
+          token TEXT NOT NULL UNIQUE)"
+    ))
+    .execute(connection)
+    .map_err(|error| sqlite_configuration_error("create attestation token table", error))?;
+    diesel::sql_query(format!(
+        "INSERT INTO {DESCRIPTOR_ATTESTATION_TEMP_TABLE}(slot, token) VALUES (1, ?)"
+    ))
+    .bind::<diesel::sql_types::Text, _>(token)
+    .execute(connection)
+    .map_err(|error| sqlite_configuration_error("install attestation token", error))?;
+    Ok(())
+}
+
+fn connection_attestation_token(
+    connection: &mut SqliteConnection,
+) -> Result<String, ConnectionManagerError> {
+    diesel::sql_query(format!(
+        "SELECT token FROM {DESCRIPTOR_ATTESTATION_TEMP_TABLE} WHERE slot = 1"
+    ))
+    .get_result::<SqliteAttestationTokenRow>(connection)
+    .map(|row| row.token)
+    .map_err(|error| sqlite_configuration_error("read attestation token", error))
+}
+
+fn validate_registered_descriptor_connection(
+    source: &DescriptorSqliteSource,
+    connection: &mut SqliteConnection,
+) -> Result<SqliteFileIdentity, ConnectionManagerError> {
+    validate_retained_namespace(source)?;
+    let route = sqlite_open_route(source)?;
+    let actual = SqliteConnectionManager::verify_descriptor_connection(source, connection, &route)?;
+    let token = connection_attestation_token(connection)?;
+    let proofs = source
+        .connection_proofs
+        .lock()
+        .map_err(|_| sqlite_manager_error("descriptor connection-proof lock is poisoned"))?;
+    let proof = proofs.get(&token).ok_or_else(|| {
+        sqlite_manager_error("descriptor-bound connection has no registered fd attestation")
+    })?;
+    proof
+        .handles
+        .validate(&proof.expected_objects)
+        .map_err(descriptor_attestation_manager_error)?;
+    let shared_shm = FileObjectIdentity::from_file(&proof.shared_shm_anchor)
+        .map_err(descriptor_attestation_manager_error)?;
+    if shared_shm != proof.expected_objects.identity(SqliteObjectRole::Shm) {
+        return Err(sqlite_manager_error(
+            "descriptor_identity_changed: process-shared SHM proof changed identity",
+        ));
+    }
+    let current_objects = capture_pinned_sqlite_object_set(source)?;
+    if &current_objects != proof.expected_objects.as_ref() {
+        return Err(sqlite_manager_error(
+            "descriptor_identity_changed: current main/WAL/SHM leaves differ from retained connection proof",
+        ));
+    }
+    Ok(actual)
+}
+
+fn validate_retained_namespace(
+    source: &DescriptorSqliteSource,
+) -> Result<(), ConnectionManagerError> {
+    let root = SqliteObjectIdentity::from_metadata(&source.root.metadata().map_err(|error| {
+        sqlite_manager_error(format!(
+            "descriptor_identity_changed: fstat retained root: {error}"
+        ))
+    })?);
+    let parent =
+        SqliteObjectIdentity::from_metadata(&source.parent.metadata().map_err(|error| {
+            sqlite_manager_error(format!(
+                "descriptor_identity_changed: fstat retained database parent: {error}"
+            ))
+        })?);
+    let database = SqliteObjectIdentity::from_metadata(
+        &source.database_anchor.metadata().map_err(|error| {
+            sqlite_manager_error(format!(
+                "descriptor_identity_changed: fstat retained database: {error}"
+            ))
+        })?,
+    );
+    if root != source.root_identity
+        || parent != source.parent_identity
+        || database != source.database_object_identity
+    {
+        return Err(sqlite_manager_error(
+            "descriptor_identity_changed: retained owner namespace changed identity",
+        ));
+    }
+    let reopened =
+        openat_regular_for_attestation(&source.parent, &source.leaf, "SQLite main database")?;
+    if FileObjectIdentity::from_file(&reopened).map_err(descriptor_attestation_manager_error)?
+        != FileObjectIdentity::from_file(&source.database_anchor)
+            .map_err(descriptor_attestation_manager_error)?
+    {
+        return Err(sqlite_manager_error(
+            "descriptor_identity_changed: fixed database leaf no longer names owner database",
+        ));
+    }
+    Ok(())
+}
+
+fn descriptor_attestation_manager_error(
+    error: DescriptorAttestationError,
+) -> ConnectionManagerError {
+    sqlite_manager_error(error.to_string())
+}
+
+impl ManageConnection for SqliteConnectionManager {
+    type Connection = SqliteConnection;
+    type Error = ConnectionManagerError;
+
+    fn connect(&self) -> Result<Self::Connection, Self::Error> {
+        match &self.source {
+            SqliteConnectionSource::Legacy(manager) => manager.connect(),
+            SqliteConnectionSource::Descriptor(source) => {
+                let _guard = source
+                    .connect_lock
+                    .lock()
+                    .map_err(|_| sqlite_manager_error("descriptor connect lock is poisoned"))?;
+                source
+                    .connection_proofs
+                    .lock()
+                    .map_err(|_| {
+                        sqlite_manager_error("descriptor connection-proof lock is poisoned")
+                    })?
+                    .retain(|_, proof| {
+                        proof.handles.validate(&proof.expected_objects).is_ok()
+                            && FileObjectIdentity::from_file(&proof.shared_shm_anchor)
+                                .map(|identity| {
+                                    identity
+                                        == proof.expected_objects.identity(SqliteObjectRole::Shm)
+                                })
+                                .unwrap_or(false)
+                    });
+                validate_retained_namespace(source)?;
+                let before = ProcessDescriptorSnapshot::capture()
+                    .map_err(descriptor_attestation_manager_error)?;
+                let route = sqlite_open_route(source)?;
+                let manager = ConnectionManager::<SqliteConnection>::new(format!(
+                    "file:{}?mode=rw",
+                    route.to_string_lossy()
+                ));
+                let mut connection = manager.connect()?;
+                configure_sqlite_connection(&mut connection)?;
+                let actual = Self::verify_descriptor_connection(source, &mut connection, &route)?;
+                if actual != source.identity {
+                    return Err(sqlite_manager_error(
+                        "descriptor_identity_changed: SQLite main connection escaped owner inode",
+                    ));
+                }
+                let journal_mode = diesel::sql_query("PRAGMA journal_mode")
+                    .get_result::<JournalModeRow>(&mut connection)
+                    .map_err(|error| sqlite_configuration_error("read journal_mode", error))?
+                    .journal_mode;
+                validate_wal_journal_mode(&journal_mode)
+                    .map_err(descriptor_attestation_manager_error)?;
+                diesel::sql_query("BEGIN IMMEDIATE")
+                    .execute(&mut connection)
+                    .map_err(|error| sqlite_configuration_error("prime WAL begin", error))?;
+                diesel::sql_query("ROLLBACK")
+                    .execute(&mut connection)
+                    .map_err(|error| sqlite_configuration_error("prime WAL rollback", error))?;
+                let after = ProcessDescriptorSnapshot::capture()
+                    .map_err(descriptor_attestation_manager_error)?;
+                // Open pins only after the fd snapshot. Otherwise our own
+                // no-follow pins would enter the delta and make ownership
+                // ambiguous.
+                let observed_objects = capture_pinned_sqlite_object_set(source)?;
+                let existing_evidence = current_descriptor_pool_evidence(source)?;
+                let expected_objects = match existing_evidence.as_ref() {
+                    Some(existing) if existing.expected_objects.as_ref() != &observed_objects => {
+                        return Err(sqlite_manager_error(
+                            "descriptor_identity_changed: SQLite main/WAL/SHM objects changed between connections",
+                        ));
+                    }
+                    Some(existing) => Arc::clone(&existing.expected_objects),
+                    None => Arc::new(observed_objects),
+                };
+                let handles = AttestedSqliteHandles::from_delta_with_shared_shm(
+                    &before,
+                    &after,
+                    &expected_objects,
+                    existing_evidence
+                        .as_ref()
+                        .map(|evidence| evidence.shared_shm_anchor.as_ref()),
+                )
+                .map_err(descriptor_attestation_manager_error)?;
+                handles
+                    .validate(&expected_objects)
+                    .map_err(descriptor_attestation_manager_error)?;
+                let shared_shm_anchor = match existing_evidence {
+                    Some(evidence) => evidence.shared_shm_anchor,
+                    None => Arc::new(open_shared_shm_anchor(source, &expected_objects)?),
+                };
+                let pool_evidence = commit_descriptor_pool_evidence(
+                    source,
+                    DescriptorPoolEvidence {
+                        expected_objects,
+                        shared_shm_anchor,
+                    },
+                )?;
+                validate_retained_namespace(source)?;
+                Self::verify_descriptor_connection(source, &mut connection, &route)?;
+                let token = format!(
+                    "descriptor-connection-{:016x}",
+                    source.next_connection_id.fetch_add(1, Ordering::Relaxed)
+                );
+                install_connection_attestation_token(&mut connection, &token)?;
+                source
+                    .connection_proofs
+                    .lock()
+                    .map_err(|_| {
+                        sqlite_manager_error("descriptor connection-proof lock is poisoned")
+                    })?
+                    .insert(
+                        token,
+                        DescriptorConnectionProof {
+                            handles,
+                            expected_objects: Arc::clone(&pool_evidence.expected_objects),
+                            shared_shm_anchor: Arc::clone(&pool_evidence.shared_shm_anchor),
+                        },
+                    );
+                validate_registered_descriptor_connection(source, &mut connection)?;
+                Ok(connection)
+            }
+        }
+    }
+
+    fn is_valid(&self, connection: &mut Self::Connection) -> Result<(), Self::Error> {
+        match &self.source {
+            SqliteConnectionSource::Legacy(manager) => manager.is_valid(connection),
+            SqliteConnectionSource::Descriptor(source) => {
+                validate_registered_descriptor_connection(source, connection)?;
+                source.health.is_valid(connection)
+            }
+        }
+    }
+
+    fn has_broken(&self, connection: &mut Self::Connection) -> bool {
+        match &self.source {
+            SqliteConnectionSource::Legacy(manager) => manager.has_broken(connection),
+            SqliteConnectionSource::Descriptor(source) => source.health.has_broken(connection),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SqliteConnectionConfiguration {
+    foreign_keys: i32,
+    synchronous: i32,
+    busy_timeout: i32,
+    wal_autocheckpoint: i32,
+}
+
+#[derive(Debug)]
+struct SqliteConnectionCustomizer;
+
 const SQLITE_POOL_SIZE: u32 = 10;
+const REQUIRED_SQLITE_CONFIGURATION: SqliteConnectionConfiguration =
+    SqliteConnectionConfiguration {
+        foreign_keys: 1,
+        synchronous: 2,
+        busy_timeout: 5_000,
+        wal_autocheckpoint: 1_000,
+    };
 
 fn validate_required_text(field: &str, value: &str) -> Result<(), String> {
     if value.trim().is_empty() {
@@ -101,12 +943,11 @@ fn invalid_input(error: String) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
 }
 
-fn configure_sqlite_connection(
-    conn: &mut SqliteConnection,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn configure_sqlite_connection(conn: &mut SqliteConnection) -> Result<(), ConnectionManagerError> {
     for (label, statement) in [
+        ("foreign_keys=ON", "PRAGMA foreign_keys = ON"),
         ("busy_timeout=5000", "PRAGMA busy_timeout = 5000"),
-        ("synchronous=NORMAL", "PRAGMA synchronous = NORMAL"),
+        ("synchronous=FULL", "PRAGMA synchronous = FULL"),
         (
             "wal_autocheckpoint=1000",
             "PRAGMA wal_autocheckpoint = 1000",
@@ -114,24 +955,105 @@ fn configure_sqlite_connection(
     ] {
         diesel::sql_query(statement)
             .execute(conn)
-            .map_err(|error| {
-                std::io::Error::other(format!("SQLite PRAGMA {label} failed: {error}"))
-            })?;
+            .map_err(|error| sqlite_configuration_error(label, error))?;
+    }
+    let actual = read_sqlite_connection_configuration(conn)?;
+    if actual != REQUIRED_SQLITE_CONFIGURATION {
+        return Err(sqlite_configuration_mismatch(actual));
     }
     Ok(())
+}
+
+fn read_sqlite_connection_configuration(
+    conn: &mut SqliteConnection,
+) -> Result<SqliteConnectionConfiguration, ConnectionManagerError> {
+    let foreign_keys = diesel::sql_query("PRAGMA foreign_keys")
+        .get_result::<ForeignKeysPragmaRow>(conn)
+        .map_err(|error| sqlite_configuration_error("read foreign_keys", error))?
+        .foreign_keys;
+    let synchronous = diesel::sql_query("PRAGMA synchronous")
+        .get_result::<SynchronousPragmaRow>(conn)
+        .map_err(|error| sqlite_configuration_error("read synchronous", error))?
+        .synchronous;
+    let busy_timeout = diesel::sql_query("PRAGMA busy_timeout")
+        .get_result::<BusyTimeoutPragmaRow>(conn)
+        .map_err(|error| sqlite_configuration_error("read busy_timeout", error))?
+        .timeout;
+    let wal_autocheckpoint = diesel::sql_query("PRAGMA wal_autocheckpoint")
+        .get_result::<WalAutocheckpointPragmaRow>(conn)
+        .map_err(|error| sqlite_configuration_error("read wal_autocheckpoint", error))?
+        .wal_autocheckpoint;
+    Ok(SqliteConnectionConfiguration {
+        foreign_keys,
+        synchronous,
+        busy_timeout,
+        wal_autocheckpoint,
+    })
+}
+
+fn sqlite_configuration_error(label: &str, error: diesel::result::Error) -> ConnectionManagerError {
+    ConnectionManagerError::QueryError(diesel::result::Error::QueryBuilderError(Box::new(
+        std::io::Error::other(format!("SQLite PRAGMA {label} failed: {error}")),
+    )))
+}
+
+fn sqlite_configuration_mismatch(actual: SqliteConnectionConfiguration) -> ConnectionManagerError {
+    ConnectionManagerError::QueryError(diesel::result::Error::QueryBuilderError(Box::new(
+        std::io::Error::other(format!(
+            "SQLite PRAGMA verification failed: expected {REQUIRED_SQLITE_CONFIGURATION:?}, got {actual:?}"
+        )),
+    )))
+}
+
+fn sqlite_manager_error(detail: impl Into<String>) -> ConnectionManagerError {
+    ConnectionManagerError::QueryError(diesel::result::Error::QueryBuilderError(Box::new(
+        std::io::Error::other(detail.into()),
+    )))
+}
+
+impl CustomizeConnection<SqliteConnection, ConnectionManagerError> for SqliteConnectionCustomizer {
+    fn on_acquire(&self, conn: &mut SqliteConnection) -> Result<(), ConnectionManagerError> {
+        configure_sqlite_connection(conn)
+    }
+}
+
+fn build_sqlite_pool(database_url: String) -> Result<DbPool, PoolError> {
+    build_sqlite_pool_with_size(database_url, SQLITE_POOL_SIZE)
+}
+
+fn build_sqlite_pool_with_size(database_url: String, max_size: u32) -> Result<DbPool, PoolError> {
+    build_sqlite_pool_from_manager(SqliteConnectionManager::legacy(database_url), max_size)
+}
+
+fn build_sqlite_pool_from_manager(
+    manager: SqliteConnectionManager,
+    max_size: u32,
+) -> Result<DbPool, PoolError> {
+    Pool::builder()
+        .max_size(max_size)
+        .test_on_check_out(true)
+        .connection_customizer(Box::new(SqliteConnectionCustomizer))
+        .build(manager)
 }
 
 pub mod factor_snapshot;
 pub mod repository;
 // v12 MVP-5 §8.1
 pub(crate) mod agent_logs;
+pub mod chain_intelligence;
 pub mod concepts; // v15.1: 公开供 push_templates 集成使用
+pub mod daily_change_confirmation;
+pub mod data_acquisition_audit;
 pub mod execution_tracking;
+pub(crate) mod global_schema_catalog_v1;
+pub(crate) mod global_schema_v1;
 mod kline;
 mod lhb;
-pub(crate) use lhb::validate_lhb_records;
+pub mod news_ai;
 pub mod order_audit;
+pub mod position_chain;
 mod positions;
+mod sqlite_descriptor_attestation;
 // v12 PR1-1.5 (BR-021)
 pub mod account_mode_log;
 /// BR-103 real-account evidence boundary; nullable fields stay nullable.
@@ -140,8 +1062,25 @@ pub mod account_snapshot;
 pub mod closing_valuation;
 pub mod position_shares;
 pub mod selection;
+pub mod selection_v2;
+pub(crate) mod selection_v2_generation_journal;
+pub mod selection_v2_read_model;
+pub mod selection_v2_repository;
 pub mod user_account_summary;
 pub mod user_position_snapshot;
+
+/// BR-180 migration operator façade.
+///
+/// The binary receives only rendered diagnostics. The global schema owner
+/// retains every lock, descriptor, SQLite transaction and audit snapshot; no
+/// raw migration authority crosses this public boundary.
+pub fn run_selection_v2_migration_command<I, S>(args: I) -> Result<String, String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<std::ffi::OsString>,
+{
+    global_schema_v1::run_selection_v2_migration_command(args)
+}
 
 // ============================================================================
 // 数据库管理器 - 单例模式
@@ -193,30 +1132,19 @@ impl DatabaseManager {
                 format!("SQLite journal_mode mismatch: expected WAL, got {journal_mode}").into(),
             );
         }
+        configure_sqlite_connection(&mut bootstrap_conn)?;
         drop(bootstrap_conn);
 
-        let manager = ConnectionManager::<SqliteConnection>::new(database_url);
-        let pool = Pool::builder().max_size(SQLITE_POOL_SIZE).build(manager)?;
-
-        // r2d2 retries `CustomizeConnection::on_acquire` errors. Configure
-        // every initial connection directly instead, keeping all of them
-        // checked out so each of the ten distinct connections is verified.
-        // Any PRAGMA failure therefore propagates from `init` immediately.
-        let mut initial_connections = Vec::with_capacity(SQLITE_POOL_SIZE as usize);
-        for _ in 0..SQLITE_POOL_SIZE {
-            let mut conn = pool.get()?;
-            configure_sqlite_connection(&mut conn)?;
-            initial_connections.push(conn);
-        }
+        let pool = build_sqlite_pool(database_url)?;
 
         // 运行迁移
-        let mut conn = initial_connections
-            .pop()
-            .ok_or_else(|| std::io::Error::other("SQLite pool initialized without connections"))?;
-        drop(initial_connections);
+        let mut conn = pool.get()?;
+        configure_sqlite_connection(&mut conn)?;
         Self::run_migrations(&mut conn)?;
 
-        info!("SQLite PRAGMAs 已设置: WAL + busy_timeout=5000");
+        info!(
+            "SQLite PRAGMAs 已设置: WAL + foreign_keys=ON + synchronous=FULL + busy_timeout=5000"
+        );
 
         // 创建 agent_scratchpad 表 (Agent 内部思考和工具执行记录)
         diesel::sql_query(
@@ -366,11 +1294,117 @@ impl DatabaseManager {
         .execute(&mut *conn)?;
 
         drop(conn);
-        let db = DatabaseManager { pool };
+        let db = DatabaseManager {
+            pool,
+            selection_connection_source: None,
+            selection_schema_authority: None,
+        };
         DB_INSTANCE.set(db).map_err(|_| "数据库已经初始化")?;
         info!("数据库初始化完成");
 
         Ok(())
+    }
+
+    /// Construct the operational pool from the opaque GlobalSchema owner
+    /// capability. No caller path, canonical path, environment value, or CWD
+    /// participates in this binding.
+    ///
+    /// Unlike the legacy initializer this does not run DDL: the capability is
+    /// issued only after the owner verified the exact final catalog and its
+    /// audit receipt closure inside one retained snapshot.
+    #[allow(dead_code)]
+    pub(crate) fn from_verified_amended_selection_schema(
+        authority: Box<global_schema_v1::VerifiedAmendedSelectionSchema>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let database = authority.pinned_database_for_pool()?;
+        let manager = SqliteConnectionManager::descriptor(database)?;
+        let selection_connection_source = manager.descriptor_source().ok_or_else(|| {
+            DatabaseAuthorityError::DescriptorAttestationUnavailable {
+                detail: "descriptor manager did not retain its attestation source".into(),
+            }
+        })?;
+        let pool = build_sqlite_pool_from_manager(manager, SQLITE_POOL_SIZE)?;
+        {
+            let mut connection = pool.get()?;
+            configure_sqlite_connection(&mut connection)?;
+        }
+        Ok(Self {
+            pool,
+            selection_connection_source: Some(selection_connection_source),
+            selection_schema_authority: Some(authority),
+        })
+    }
+
+    /// Proves the exact checkout used by an authoritative selection read is
+    /// attached to the GlobalSchema owner's retained database inode.
+    ///
+    /// The returned material is derived from retained descriptors plus
+    /// `PRAGMA database_list` on `connection`; no caller path can mint it.
+    #[cfg(not(test))]
+    pub(super) fn selection_connection_bound_proof(
+        &self,
+        connection: &mut DbConnection,
+    ) -> Result<SelectionConnectionBoundProof, Box<dyn std::error::Error>> {
+        let authority = self.selection_schema_authority.as_ref().ok_or_else(|| {
+            std::io::Error::other(
+                "authoritative selection reads require amended-schema descriptor authority",
+            )
+        })?;
+        let source = self.selection_connection_source.as_ref().ok_or_else(|| {
+            std::io::Error::other(
+                "authoritative selection reads require descriptor connection source",
+            )
+        })?;
+        let pinned = authority.pinned_database_for_pool()?;
+        let actual = validate_registered_descriptor_connection(source, &mut *connection)?;
+        let evidence = current_descriptor_pool_evidence(source)?.ok_or_else(|| {
+            std::io::Error::other("authoritative selection pool has no descriptor evidence")
+        })?;
+        let attested_main = evidence.expected_objects.identity(SqliteObjectRole::Main);
+        if attested_main.device() != actual.device
+            || attested_main.inode() != actual.inode
+            || attested_main.mode() != pinned.database_object_identity.mode
+        {
+            return Err(std::io::Error::other(
+                "authoritative selection checkout descriptor proof changed identity",
+            )
+            .into());
+        }
+        let root_metadata = pinned.root.metadata()?;
+        let parent_metadata = pinned.parent.metadata()?;
+        let database_metadata = pinned.database_file.metadata()?;
+        let root_identity = SqliteObjectIdentity::from_metadata(&root_metadata);
+        let parent_identity = SqliteObjectIdentity::from_metadata(&parent_metadata);
+        let database_identity = SqliteObjectIdentity::from_metadata(&database_metadata);
+        if !root_metadata.is_dir()
+            || !parent_metadata.is_dir()
+            || !database_metadata.is_file()
+            || SqliteFileIdentity::from_metadata(&database_metadata) != actual
+            || root_identity != pinned.root_identity
+            || parent_identity != pinned.parent_identity
+            || database_identity != pinned.database_object_identity
+        {
+            return Err(std::io::Error::other(
+                "selection connection proof changed retained descriptor identity",
+            )
+            .into());
+        }
+        let database_relative_identity = pinned.relative_identity.to_str().ok_or_else(|| {
+            std::io::Error::other(
+                "owner-fixed database relative identity cannot be represented as UTF-8",
+            )
+        })?;
+        Ok(SelectionConnectionBoundProof {
+            root: root_identity,
+            parent: parent_identity,
+            database: database_identity,
+            database_relative_identity: database_relative_identity.to_owned(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retains_verified_selection_authority(&self) -> bool {
+        self.selection_schema_authority.is_some()
     }
 
     /// 获取数据库管理器单例
@@ -480,6 +1514,7 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         user_account_summary::create_schema(conn).map_err(std::io::Error::other)?;
         closing_valuation::create_schema(conn).map_err(std::io::Error::other)?;
         selection::create_schema(conn).map_err(std::io::Error::other)?;
+        chain_intelligence::create_schema(conn).map_err(std::io::Error::other)?;
         // 创建 stock_daily 表
         diesel::sql_query(
             r#"
@@ -707,6 +1742,10 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         .execute(&mut *conn)
         .ok();
 
+        // BR-170: only a linked, immutable Magic TDX assignment may populate
+        // the current chain_name projection.
+        position_chain::create_schema(conn).map_err(std::io::Error::other)?;
+
         // trades 表（v3 每笔买卖独立记录，与 stock_position 互补）
         diesel::sql_query(
             r#"
@@ -820,6 +1859,17 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         )
         .execute(&mut *conn)?;
         order_audit::initialize_order_audit_chain(&mut *conn)?;
+
+        // BR-159: every unified-Gateway acquisition attempt is append-only,
+        // hash-chained, and retains provider/batch evidence plus aggregate
+        // acceptance counters. Initialization fails on any chain mismatch.
+        data_acquisition_audit::create_schema(&mut *conn)?;
+        // BR-171: exact operator confirmations for >±20% adjacent daily-close
+        // moves are immutable, hash-chained and validated at startup.
+        daily_change_confirmation::create_schema(&mut *conn)?;
+        // BR-172 rollout step 3: NewsAI assessments are appended before any
+        // delivery reservation and validated as an immutable SHA-256 chain.
+        news_ai::create_schema(&mut *conn)?;
 
         // ledger 表（v3 每日净值快照）
         diesel::sql_query(
@@ -1718,6 +2768,12 @@ mod tests {
     }
 
     #[derive(QueryableByName)]
+    struct ForeignKeysValue {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        foreign_keys: i32,
+    }
+
+    #[derive(QueryableByName)]
     struct SynchronousValue {
         #[diesel(sql_type = diesel::sql_types::Integer)]
         synchronous: i32,
@@ -1734,6 +2790,26 @@ mod tests {
     impl Drop for TestDbGuard {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(self.0);
+        }
+    }
+
+    struct TemporarySqliteDatabase(PathBuf);
+
+    impl TemporarySqliteDatabase {
+        fn new(prefix: &str) -> Self {
+            Self(std::env::temp_dir().join(format!("{}.db", unique_test_label(prefix))))
+        }
+
+        fn database_url(&self) -> String {
+            self.0.to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for TemporarySqliteDatabase {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", self.0.to_string_lossy()));
+            }
         }
     }
 
@@ -1820,6 +2896,10 @@ mod tests {
             .get_result::<BusyTimeoutValue>(&mut conn)
             .expect("read configured busy_timeout")
             .timeout;
+        let foreign_keys = diesel::sql_query("PRAGMA foreign_keys")
+            .get_result::<ForeignKeysValue>(&mut conn)
+            .expect("read configured foreign_keys")
+            .foreign_keys;
         let synchronous = diesel::sql_query("PRAGMA synchronous")
             .get_result::<SynchronousValue>(&mut conn)
             .expect("read configured synchronous")
@@ -1830,8 +2910,260 @@ mod tests {
             .wal_autocheckpoint;
 
         assert_eq!(busy_timeout, 5000);
-        assert_eq!(synchronous, 1);
+        assert_eq!(foreign_keys, 1);
+        assert_eq!(synchronous, 2);
         assert_eq!(wal_autocheckpoint, 1000);
+    }
+
+    #[test]
+    fn newly_created_and_rebuilt_pool_connections_have_required_sqlite_pragmas() {
+        let database = TemporarySqliteDatabase::new("sqlite_pool_rebuild");
+        let database_url = database.database_url();
+        let mut bootstrap =
+            SqliteConnection::establish(&database_url).expect("create temporary SQLite database");
+        let journal_mode = diesel::sql_query("PRAGMA journal_mode = WAL")
+            .get_result::<JournalModeRow>(&mut bootstrap)
+            .expect("enable WAL for temporary SQLite database")
+            .journal_mode;
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        drop(bootstrap);
+
+        let pool =
+            build_sqlite_pool_with_size(database_url, 1).expect("build one-connection SQLite pool");
+        let mut initial = pool.get().expect("get newly created pool connection");
+        assert_eq!(
+            read_sqlite_connection_configuration(&mut initial)
+                .expect("read newly created connection configuration"),
+            REQUIRED_SQLITE_CONFIGURATION
+        );
+        drop(initial);
+
+        let panic_pool = pool.clone();
+        let panic_result = std::thread::spawn(move || {
+            let mut conn = panic_pool.get().expect("get connection to discard");
+            diesel::sql_query("PRAGMA foreign_keys = OFF")
+                .execute(&mut conn)
+                .expect("alter foreign_keys before discard");
+            diesel::sql_query("PRAGMA synchronous = NORMAL")
+                .execute(&mut conn)
+                .expect("alter synchronous before discard");
+            panic!("discard pooled connection");
+        })
+        .join();
+        assert!(
+            panic_result.is_err(),
+            "test thread must discard its connection"
+        );
+
+        let mut rebuilt = pool.get().expect("get replacement pool connection");
+        assert_eq!(
+            read_sqlite_connection_configuration(&mut rebuilt)
+                .expect("read rebuilt connection configuration"),
+            REQUIRED_SQLITE_CONFIGURATION
+        );
+    }
+
+    #[derive(QueryableByName)]
+    struct MarkerValue {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        value: String,
+    }
+
+    #[test]
+    fn descriptor_manager_supports_wal_reopen_multi_connection_and_namespace_swap() {
+        let namespace = std::env::temp_dir().join(unique_test_label("descriptor_pool_namespace"));
+        let moved_namespace = namespace.with_extension("owner-pinned");
+        std::fs::create_dir(&namespace).expect("create owner namespace");
+        let database_path = namespace.join("stock_analysis.db");
+        let database_url = database_path.to_string_lossy().into_owned();
+        let mut bootstrap =
+            SqliteConnection::establish(&database_url).expect("create empty owner SQLite database");
+        let journal_mode = diesel::sql_query("PRAGMA journal_mode = WAL")
+            .get_result::<JournalModeRow>(&mut bootstrap)
+            .expect("enable WAL before descriptor attestation")
+            .journal_mode;
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        drop(bootstrap);
+
+        let parent_file = File::open(&namespace).expect("pin owner database parent");
+        let owner_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&database_path)
+            .expect("pin owner database descriptor");
+        let expected = SqliteFileIdentity::from_metadata(
+            &owner_file.metadata().expect("fstat owner descriptor"),
+        );
+        let root_file = parent_file
+            .try_clone()
+            .expect("clone owner root descriptor");
+        let manager = SqliteConnectionManager::descriptor(
+            PinnedSqliteDatabase::from_test_descriptors(
+                root_file,
+                parent_file,
+                OsString::from("stock_analysis.db"),
+                PathBuf::from("stock_analysis.db"),
+                owner_file,
+            )
+            .expect("bind test owner descriptors"),
+        )
+        .expect("Linux has a descriptor-relative SQLite sidecar route");
+
+        std::fs::rename(&namespace, &moved_namespace).expect("move owner namespace away");
+        std::fs::create_dir(&namespace).expect("create replacement namespace");
+        let replacement_url = namespace
+            .join("stock_analysis.db")
+            .to_string_lossy()
+            .into_owned();
+        let mut replacement = SqliteConnection::establish(&replacement_url)
+            .expect("create replacement SQLite database");
+        diesel::sql_query("CREATE TABLE marker (value TEXT NOT NULL)")
+            .execute(&mut replacement)
+            .expect("create replacement marker");
+        diesel::sql_query("INSERT INTO marker(value) VALUES ('replacement')")
+            .execute(&mut replacement)
+            .expect("insert replacement marker");
+        drop(replacement);
+
+        let pool = build_sqlite_pool_from_manager(manager.clone(), 2)
+            .expect("build descriptor-anchored pool after path swap");
+        let mut first = pool.get().expect("get first descriptor-bound connection");
+        let journal_mode = diesel::sql_query("PRAGMA journal_mode = WAL")
+            .get_result::<JournalModeRow>(&mut first)
+            .expect("enable WAL through descriptor-bound route")
+            .journal_mode;
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        diesel::sql_query("CREATE TABLE marker (value TEXT NOT NULL)")
+            .execute(&mut first)
+            .expect("create owner marker through descriptor-bound route");
+        diesel::sql_query("INSERT INTO marker(value) VALUES ('owner')")
+            .execute(&mut first)
+            .expect("insert owner marker through descriptor-bound route");
+
+        let mut second = pool
+            .get()
+            .expect("get simultaneous second descriptor-bound connection");
+        let marker = diesel::sql_query("SELECT value FROM marker")
+            .get_result::<MarkerValue>(&mut second)
+            .expect("read owner marker from second connection");
+        assert_eq!(marker.value, "owner");
+        diesel::sql_query("INSERT INTO marker(value) VALUES ('owner-second')")
+            .execute(&mut second)
+            .expect("write owner marker from second connection");
+        assert!(moved_namespace.join("stock_analysis.db-wal").exists());
+        assert!(moved_namespace.join("stock_analysis.db-shm").exists());
+
+        manager
+            .is_valid(&mut *first)
+            .expect("checkout revalidates registered descriptor proof");
+        let source = manager
+            .descriptor_source()
+            .expect("descriptor manager retains proof registry");
+        let first_token =
+            connection_attestation_token(&mut first).expect("read first connection token");
+        {
+            let proofs = source
+                .connection_proofs
+                .lock()
+                .expect("lock descriptor proof registry");
+            let proof = proofs
+                .get(&first_token)
+                .expect("first connection retains registered fd proof");
+            proof
+                .handles
+                .validate(&proof.expected_objects)
+                .expect("main/WAL/SHM fds remain attested");
+            let attested_main = proof.expected_objects.identity(SqliteObjectRole::Main);
+            assert_eq!(attested_main.device(), expected.device);
+            assert_eq!(attested_main.inode(), expected.inode);
+            assert_ne!(
+                proof.handles.main().descriptor(),
+                proof.handles.wal().descriptor()
+            );
+            assert_ne!(
+                proof.handles.main().descriptor(),
+                proof.handles.shm().descriptor()
+            );
+        }
+
+        drop(second);
+        drop(first);
+        let mut reopened_connection = pool.get().expect("recheckout pooled connection");
+        let count = diesel::sql_query("SELECT value FROM marker ORDER BY value")
+            .load::<MarkerValue>(&mut reopened_connection)
+            .expect("read owner rows after pooled connection reopen");
+        assert_eq!(
+            count.into_iter().map(|row| row.value).collect::<Vec<_>>(),
+            vec!["owner".to_owned(), "owner-second".to_owned()]
+        );
+        drop(reopened_connection);
+        drop(pool);
+        drop(manager);
+
+        let mut replacement =
+            SqliteConnection::establish(&replacement_url).expect("reopen replacement database");
+        let replacement_marker = diesel::sql_query("SELECT value FROM marker")
+            .get_result::<MarkerValue>(&mut replacement)
+            .expect("replacement database remains readable");
+        assert_eq!(replacement_marker.value, "replacement");
+        drop(replacement);
+
+        std::fs::remove_dir_all(&namespace).expect("remove replacement namespace");
+        std::fs::remove_dir_all(&moved_namespace).expect("remove owner namespace");
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn descriptor_manager_fails_closed_without_descriptor_relative_wal_vfs() {
+        let namespace = std::env::temp_dir().join(unique_test_label("descriptor_pool_fail_closed"));
+        std::fs::create_dir(&namespace).expect("create isolated namespace");
+        let database_path = namespace.join("stock_analysis.db");
+        let database_url = database_path.to_string_lossy().into_owned();
+        drop(SqliteConnection::establish(&database_url).expect("create isolated SQLite database"));
+        let root_file = File::open(&namespace).expect("pin owner root");
+        let parent_file = root_file.try_clone().expect("pin owner database parent");
+        let database_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&database_path)
+            .expect("pin owner database");
+
+        let error = SqliteConnectionManager::descriptor(
+            PinnedSqliteDatabase::from_test_descriptors(
+                root_file,
+                parent_file,
+                OsString::from("stock_analysis.db"),
+                PathBuf::from("stock_analysis.db"),
+                database_file,
+            )
+            .expect("bind owner descriptors"),
+        )
+        .expect_err("unproven descriptor-relative WAL routing must fail closed");
+        assert!(matches!(
+            error,
+            DatabaseAuthorityError::DescriptorAttestationUnavailable { .. }
+        ));
+        assert!(!namespace.join("stock_analysis.db-wal").exists());
+        assert!(!namespace.join("stock_analysis.db-shm").exists());
+        std::fs::remove_dir_all(&namespace).expect("remove isolated namespace");
+    }
+
+    #[test]
+    fn sqlite_customizer_propagates_configuration_failure() {
+        let mut conn =
+            SqliteConnection::establish(":memory:").expect("establish in-memory SQLite connection");
+        diesel::sql_query("BEGIN IMMEDIATE")
+            .execute(&mut conn)
+            .expect("open transaction that forbids synchronous PRAGMA changes");
+
+        let error = SqliteConnectionCustomizer
+            .on_acquire(&mut conn)
+            .expect_err("configuration failure must be propagated");
+        let message = error.to_string();
+        assert!(
+            message.contains("SQLite PRAGMA synchronous=FULL failed"),
+            "unexpected customizer error: {message}"
+        );
     }
 
     fn unique_test_label(prefix: &str) -> String {
@@ -2298,22 +3630,23 @@ mod tests {
 
         init_db_for_test();
         let db = DatabaseManager::get();
+        let code = "TEST_CODE_600398";
         let position = NewStockPosition {
-            code: "TEST_CODE_AUDIT_ATOMIC".to_string(),
+            code: code.to_string(),
             name: "审计测试".to_string(),
             buy_date: "2026-07-17".to_string(),
             buy_price: 10.0,
             quantity: 100,
             status: "open".to_string(),
             st_type: None,
-            chain_name: Some("测试产业链".to_string()),
+            chain_name: None,
         };
         let audit = OrderAuditRecord {
             business_order_id: "TEST_ORDER_AUDIT_ATOMIC",
             source: "DatabaseTest",
             decision_basis: "test",
             side: "buy",
-            code: "TEST_CODE_AUDIT_ATOMIC",
+            code,
             requested_price: 10.0,
             execution_price: Some(10.0),
             quantity: 100,
@@ -2321,7 +3654,27 @@ mod tests {
             outcome: "Filled",
             failure_reason: None,
         };
-        db.save_position_with_audit(&position, &audit)
+        let assignment = crate::data_gateway::derive_position_chain(
+            code,
+            crate::data_gateway::GatewayBatch::Available {
+                records: vec![crate::data_gateway::BoardMembershipRecord {
+                    instrument_code: code.to_string(),
+                    board_code: "TEST_CODE_INDUSTRY".to_string(),
+                    board_name: "测试产业链".to_string(),
+                    kind: crate::data_gateway::BoardKind::Industry,
+                }],
+                evidence: crate::data_gateway::BatchEvidence {
+                    provider: magic_market_core::ProviderId::Tdx,
+                    source: "TEST_CODE_tdx-board-memberships".to_string(),
+                    source_at: None,
+                    observed_at: "2026-07-27T09:30:01+08:00".to_string(),
+                    batch_id: "TEST_CODE_AUDIT_ATOMIC_BATCH".to_string(),
+                },
+            },
+        )
+        .expect("valid position-chain batch")
+        .expect("position-chain assignment");
+        db.save_position_with_audit_and_assignment(&position, &audit, &assignment)
             .expect("atomic audited position fill");
 
         let mut conn = db.get_conn().expect("test DB connection");
@@ -2468,7 +3821,7 @@ mod tests {
             quantity: 1500,
             status: "open".to_string(),
             st_type: Some("ST".to_string()), // 改 ST
-            chain_name: Some("化工".to_string()),
+            chain_name: None,
         };
         db.save_position(&update_pos).expect("upsert 失败");
 
@@ -2477,11 +3830,7 @@ mod tests {
             .first(&mut conn)
             .expect("re-query 失败");
         assert_eq!(row2.st_type.as_deref(), Some("ST"), "upsert st_type 未同步");
-        assert_eq!(
-            row2.chain_name.as_deref(),
-            Some("化工"),
-            "upsert chain_name 未同步"
-        );
+        assert_eq!(row2.chain_name, None, "raw chain_name must remain absent");
         assert_eq!(row2.name, "*ST测试改名", "upsert name 未同步");
 
         diesel::delete(stock_position::table.filter(stock_position::code.eq("TEST_CODE_600090")))

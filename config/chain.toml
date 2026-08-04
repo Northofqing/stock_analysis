@@ -1,7 +1,7 @@
 # =====================================================================
 # v12 Chain 综合配置 — 产业链规则 + 公告关键词 + 排除板块
-# SIGHUP 热加载；BR-138 公告关键词缺失/格式错误时公告批次显式停用，禁止生产 fallback
-# 整合自原 chain_rules.toml + announce_keywords.toml + exclusion.toml (3 → 1)
+# monitor 启动时由 config::load_all() 单次加载；BR-138 公告关键词缺失/格式错误时
+# 公告批次显式停用，禁止生产 fallback。此文件统一拥有产业链、公告与排除板块配置。
 # 加载入口: src/config.rs::load_all() 读此文件 + strategy.toml
 # =====================================================================
 
@@ -19,21 +19,6 @@ enabled = true
 keywords = [
     "液冷", "液冷服务器", "冷板", "冷板式液冷", "浸没式冷却", "浸没式液冷",
     "数据中心散热", "AI散热",
-]
-# ═══════════════════════════════════════════════════════════════════
-# 一、AI硬件 — 算力基础设施各环节
-# ═══════════════════════════════════════════════════════════════════
-
-[[rules]]
-chain = "AI硬件-液冷"
-category = "AI硬件"
-priority = 100
-logic = "高功率密度算力集群驱动散热全面向液冷升级"
-board_keyword = "液冷"
-# BR-006: 0% 胜率 (6 推送 / 0 命中), 关停. 等回测证据或关键词集扩充后再启.
-enabled = true
-keywords = [
-    "液冷", "液冷服务器", "冷板", "冷板式液冷", "浸没式冷却", "浸没式液冷",
     "冷却液", "冷却液服务器", "液冷机柜", "液冷散热", "喷淋式液冷",
     "CDU", "液冷板", "散热", "液冷数据中心",
     "金刚石散热", "金刚石薄膜散热", "CVD金刚石", "金刚石热沉",
@@ -810,7 +795,40 @@ keywords = [
 ]
 
 # ═══════════════════════════════════════════════════════════════════
-# BR-138 公告关键词分级 (原 announce_keywords.toml)
+# BR-160 A-10 产业链聚类合同
+# Threshold-Proof:
+# - `min_members = 3` matches
+#   `docs/superpowers/specs/2026-07-25-chain-intelligence-gateway-a10-design.md §5`.
+# - The append-only store rejects fewer than three members; raising this value
+#   changes only admission, never rewrites historical batches.
+# - Exclusions are exact source-backed board names. Substring/fuzzy inference
+#   is forbidden, and the taxonomy version is part of every batch identity.
+# ═══════════════════════════════════════════════════════════════════
+
+[chain_intelligence]
+# `chain-intelligence-v2` introduces parent-scoped child identities for every
+# append-only row. This prevents one stable upstream batch from colliding when
+# it participates in multiple immutable derived batches; thresholds are
+# unchanged. See the BR-160 design §5-§6.
+calculation_version = "chain-intelligence-v2"
+taxonomy_version = "tdx-board-exclusions-v1"
+min_members = 3
+excluded_board_names = [
+    "东方财富热股",
+    "昨日涨停",
+    "昨日涨停_含一字",
+    "昨日连板",
+    "最近多板",
+    "近期新高",
+    "融资融券",
+    "沪股通",
+    "深股通",
+    "标准普尔",
+    "富时罗素",
+]
+
+# ═══════════════════════════════════════════════════════════════════
+# BR-138 公告关键词分级
 # 匹配规则：标题 substring contains, 按 emergency → important → positive 顺序扫描, 首次命中即停。
 # 特殊逻辑：减持类仅 >= 1% 才告警 (代码内置百分比过滤)。
 # ═══════════════════════════════════════════════════════════════════
@@ -853,7 +871,7 @@ positive = [
 ]
 
 # ═══════════════════════════════════════════════════════════════════
-# 排除板块 (原 exclusion.toml) — 一票否决, 绝不关注
+# 排除板块 — 一票否决, 绝不关注
 # ═══════════════════════════════════════════════════════════════════
 
 [[boards]]

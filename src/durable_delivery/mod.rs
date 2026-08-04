@@ -15,12 +15,12 @@ pub use model::{
     AuthoritativeSinkPort, AuthoritativeSinkResult, AuthorityWatermark, CooldownScope,
     CoordinatorConfig, DecisionState, DeliveryEnvelope, DeliverySubKind, DurableDeliveryError,
     ImmutableAppendPort, ManualDisposition, ManualResolutionCommand, PolicyRow, PrepareOutcome,
-    PushKind, ReconcileSummary, Result, ResumeOutcome, ReviewTerminalReplayAttempt,
-    ReviewTerminalReplayCompletion, ReviewTerminalReplayCompletionCanonical,
-    ReviewTerminalReplayCompletionState, ReviewTerminalReplayInput,
-    ReviewTerminalReplayStartCanonical, ScheduleHydration, ScheduleHydrationState,
-    StoreEnvironment, TaskBinding, TypedReceipt, TypedRejection, TypedUncertainty, WindowMode,
-    DAILY_BUDGET_LIMIT, ENVELOPE_VERSION, POLICY_VERSION,
+    PushKind, ReconcileSummary, Result, ResumeOutcome, ReviewTaskOccurrenceEvidence,
+    ReviewTerminalReplayAttempt, ReviewTerminalReplayCompletion,
+    ReviewTerminalReplayCompletionCanonical, ReviewTerminalReplayCompletionState,
+    ReviewTerminalReplayInput, ReviewTerminalReplayStartCanonical, ScheduleHydration,
+    ScheduleHydrationState, StoreEnvironment, TaskBinding, TypedReceipt, TypedRejection,
+    TypedUncertainty, WindowMode, DAILY_BUDGET_LIMIT, ENVELOPE_VERSION, POLICY_VERSION,
 };
 
 #[cfg(test)]

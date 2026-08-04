@@ -1,4 +1,5 @@
 // -*- coding: utf-8 -*-
+//! Registered business rule: BR-213.
 //! 大盘复盘分析模块
 //!
 //! 职责：
@@ -6,14 +7,9 @@
 //! 2. 搜索市场新闻形成复盘情报
 //! 3. 使用大模型生成每日大盘复盘报告
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{Datelike, Local};
-use log::{error, info, warn};
-use reqwest::blocking::Client;
-use serde_json::Value;
-use std::collections::HashMap;
-use std::thread;
-use std::time::Duration;
+use log::{info, warn};
 
 use crate::market_data::MarketOverview;
 use crate::search_service::{SearchResponse, SearchService};
@@ -25,26 +21,20 @@ pub use crate::traits::AiContentGenerator as AiAnalyzer;
 
 /// 大盘复盘分析器
 pub struct MarketAnalyzer {
-    /// HTTP客户端
-    client: Client,
     /// 搜索服务（可选）
     search_service: Option<&'static SearchService>,
     /// AI分析器（可选）
     ai_analyzer: Option<Box<dyn AiAnalyzer>>,
-    /// 主要指数代码映射
-    main_indices: HashMap<String, String>,
 }
 
 pub mod async_overview;
 mod indices;
-pub mod lhb_review; // v12 MVP4-4.3
 pub mod limit_chain_review; // v12 MVP4-4.2
 mod limit_up;
 pub mod market_stage_confidence; // v12 MVP4-4.1
 pub mod performance_feedback; // v12 MVP5-5.1
 pub mod post_close_review; // v12 MVP4-4.4
 pub mod review;
-pub mod sector_history;
 pub mod sector_monitor;
 mod statistics;
 
@@ -62,23 +52,10 @@ impl MarketAnalyzer {
     ];
 
     /// 创建新的大盘分析器
-    /// 创建新的大盘分析器
     pub fn new(search_service: Option<&'static SearchService>) -> Result<Self> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .context("创建HTTP客户端失败")?;
-
-        let mut main_indices = HashMap::new();
-        for (code, name) in Self::MAIN_INDICES_LIST {
-            main_indices.insert(code.to_string(), name.to_string());
-        }
-
         Ok(Self {
-            client,
             search_service,
             ai_analyzer: None,
-            main_indices,
         })
     }
 
@@ -102,92 +79,24 @@ impl MarketAnalyzer {
         // 3. 获取板块涨跌榜
         self.get_sector_rankings(&mut overview)?;
 
-        // 4. 获取北向资金（修复 QUANT_ANALYST_REVIEW §1.4）
-        overview.north_flow = match self.fetch_north_flow_latest() {
-            Ok(value) => value,
-            Err(error) => {
-                warn!("[大盘] 北向资金不可用: {error}");
-                None
-            }
-        };
+        // 4. 统一 HKEX 契约仅提供成交额/配额，不提供净买入。
+        // `north_flow` 的语义是净流入（亿元），禁止将成交额错误映射为净流入。
+        overview.north_flow = None;
+        warn!("[大盘][BR-164] 北向净流入缺失：统一 HKEX 契约仅提供成交额/配额");
 
         Ok(overview)
     }
 
-    /// 拉取最新一日北向资金合计净流入（亿元）。
-    /// 失败时返回 0.0 并 warn —— 符合 AGENTS.md "缺失数据 → warn log, 不静默填充"
-    /// 但不阻断主流程（北向资金是次要指标，缺失不应让整个市场概览失败）。
+    /// 获取当日涨停股票列表。
     ///
-    /// 修复 P1.1 hotfix: 用 `NorthFlowClient::fetch_blocking` 同步 HTTP
-    /// 不要在 async 上下文中用 `block_in_place + block_on`, 会触发
-    /// tokio runtime drop panic: "Cannot drop a runtime in a context
-    /// where blocking is not allowed" (P1.1 引入的回归).
-    fn fetch_north_flow_latest(&self) -> Result<Option<f64>> {
-        use crate::data_provider::north_flow::NorthFlowClient;
-        let client = NorthFlowClient::new();
-        match client.fetch_blocking() {
-            Ok(series) => {
-                let value = series.latest_total();
-                if let Some(value) = value {
-                    info!("[大盘] 北向资金: {value:+.2}亿");
-                } else {
-                    warn!("[大盘] 北向资金源成功但序列为空");
-                }
-                Ok(value)
-            }
-            Err(error) => Err(anyhow::anyhow!("北向资金获取失败: {error}")),
-        }
-    }
-
-    /// 获取当日涨停股票列表
-    /// 优先使用东方财富行情API（覆盖沪深两市），失败时回退到新浪API
-    pub fn get_limit_up_stocks(&self) -> Result<Vec<crate::market_data::TopStock>> {
-        info!("[大盘] 获取当日涨停股票列表...");
-
-        // 优先使用东方财富行情API
-        match self.get_limit_up_from_eastmoney() {
-            Ok(stocks) if !stocks.is_empty() => {
-                info!("[大盘] 东方财富API发现 {} 只涨停股票", stocks.len());
-                return Ok(stocks);
-            }
-            Ok(_) => {
-                info!("[大盘] 东方财富API返回空，回退到新浪API");
-            }
-            Err(e) => {
-                warn!("[大盘] 东方财富API失败: {}，回退到新浪API", e);
-            }
-        }
-
-        // 回退：从新浪API按涨幅倒序获取涨停股票
-        self.get_limit_up_from_sina()
-    }
-
-    /// 带重试的API调用
-    pub(super) fn call_api_with_retry<F>(&self, name: &str, attempts: u32, f: F) -> Option<Value>
-    where
-        F: Fn() -> Result<Value>,
-    {
-        let mut last_error: Option<anyhow::Error> = None;
-
-        for attempt in 1..=attempts {
-            match f() {
-                Ok(data) => return Some(data),
-                Err(e) => {
-                    last_error = Some(e);
-                    warn!(
-                        "[大盘] {} 获取失败 (attempt {}/{}): {:?}",
-                        name, attempt, attempts, last_error
-                    );
-                    if attempt < attempts {
-                        let sleep_duration = Duration::from_secs(2u64.pow(attempt).min(5));
-                        thread::sleep(sleep_duration);
-                    }
-                }
-            }
-        }
-
-        error!("[大盘] {} 最终失败: {:?}", name, last_error);
-        None
+    /// 只允许统一 Gateway 提供完整批次；当前上游契约不完整时显式失败，
+    /// 不再在分析层维护第二套协议或跨来源拼字段。
+    pub fn get_limit_up_stocks(
+        &self,
+        trading_date: chrono::NaiveDate,
+    ) -> Result<Vec<crate::market_data::TopStock>> {
+        info!("[大盘] 获取 {trading_date} 涨停股票列表...");
+        self.get_limit_up_from_gateway(trading_date)
     }
 
     /// 搜索市场新闻（异步方法）
@@ -258,17 +167,4 @@ impl MarketAnalyzer {
 
         Ok(report)
     }
-}
-
-#[cfg(test)]
-mod tests {
-
-    // #[test]
-    // fn test_parse_sina_line() {
-    //     let analyzer = MarketAnalyzer::new(None).unwrap();
-    //     let line = r#"var hq_str_sh000001="上证指数,3089.26,3104.14,3077.65";"#;
-    //     let result = analyzer.parse_sina_line(line);
-    //     assert!(result.is_some());
-    //     assert_eq!(result.unwrap(), "上证指数,3089.26,3104.14,3077.65");
-    // }
 }

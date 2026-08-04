@@ -1,3 +1,4 @@
+//! Registered business rules: BR-045, BR-181.
 //! v10 P1 G5a 异动即时归因 (规则快归因, P95 ≤ 2s)
 //!
 //! 设计 (v10 §4.5 + BC-2 + BC-4):
@@ -13,7 +14,9 @@
 //! `AttributionCompleted` → 回写 `AlertDetail.ai_decision` → 单次审计 → 推送。
 
 use crate::monitor::detector::AlertEvent;
-use crate::opportunity::chain_mapper::{is_generic_rule_hit, map_news_to_chains};
+use crate::opportunity::chain_mapper::{
+    is_generic_rule_hit, map_news_to_chains, ChainRulesUnavailable,
+};
 use crate::opportunity::real_alpha::Confidence;
 use log::warn;
 use std::time::{Duration, Instant};
@@ -53,6 +56,15 @@ pub struct FourViews {
     pub fund: String,
     pub technical: String,
     pub sentiment: String,
+}
+
+/// Typed failure at the deterministic attribution boundary.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AttributionFailure {
+    #[error(transparent)]
+    ChainRulesUnavailable(#[from] ChainRulesUnavailable),
+    #[error("chain_mapper timed out after {elapsed_ms}ms (budget {timeout_ms}ms)")]
+    Timeout { elapsed_ms: u128, timeout_ms: u64 },
 }
 
 impl AttributionResult {
@@ -100,26 +112,25 @@ pub fn has_strong_evidence(
 }
 
 /// 1.5s timeout 包装 (chain_mapper 规则路径)
-/// 返回: Ok(Vec<ChainHit>) 或 Err (超时)
+/// 返回命中、配置不可用或超时；配置不可用绝不折叠成空命中。
 pub fn chain_mapper_with_timeout(
     title: &str,
     timeout_ms: u64,
-) -> Result<Vec<crate::opportunity::chain_mapper::ChainHit>, String> {
+) -> Result<Vec<crate::opportunity::chain_mapper::ChainHit>, AttributionFailure> {
     let start = Instant::now();
-    let hits = map_news_to_chains(title);
+    let hits = map_news_to_chains(title)?;
     let elapsed = start.elapsed();
     if elapsed > Duration::from_millis(timeout_ms) {
-        return Err(format!(
-            "chain_mapper 超时: {}ms > {}ms",
-            elapsed.as_millis(),
-            timeout_ms
-        ));
+        return Err(AttributionFailure::Timeout {
+            elapsed_ms: elapsed.as_millis(),
+            timeout_ms,
+        });
     }
     Ok(hits)
 }
 
 /// G5a main entry: deterministic, no network, no LLM, no T+1 data.
-pub fn attribute_event(event: &AlertEvent) -> AttributionResult {
+pub fn attribute_event(event: &AlertEvent) -> Result<AttributionResult, AttributionFailure> {
     let title = event
         .detail
         .news_title
@@ -132,17 +143,13 @@ pub fn attribute_event(event: &AlertEvent) -> AttributionResult {
             Ok(Vec::new())
         }
     };
-    let (chain_hits, chain_generic) = match chain_result {
-        Ok(hits) => {
-            let names: Vec<String> = hits.iter().map(|h| h.chain.clone()).collect();
-            let generic: Vec<bool> = hits.iter().map(is_generic_rule_hit).collect();
-            (names, generic)
-        }
-        Err(e) => {
-            warn!("[G5a] chain_mapper 超时/失败: {}", e);
-            (vec![], vec![])
-        }
-    };
+    let hits = chain_result?;
+    let names: Vec<String> = hits.iter().map(|h| h.chain.clone()).collect();
+    let generic: Vec<bool> = hits
+        .iter()
+        .map(is_generic_rule_hit)
+        .collect::<Result<_, _>>()?;
+    let (chain_hits, chain_generic) = (names, generic);
 
     // Only accept source/classifier evidence carried by the event. Never infer it
     // from alert level, keywords, or missing fields.
@@ -209,19 +216,21 @@ pub fn attribute_event(event: &AlertEvent) -> AttributionResult {
         missing.push("chain_rule_hit".into());
     }
 
-    AttributionResult {
+    Ok(AttributionResult {
         has_catalyst,
         main_reason,
         confidence,
         four_views,
         missing,
-    }
+    })
 }
 
 /// Handle the attribution domain message and retain latency evidence.
-pub fn handle_attribution_requested(request: AttributionRequested<'_>) -> AttributionCompleted {
+pub fn handle_attribution_requested(
+    request: AttributionRequested<'_>,
+) -> Result<AttributionCompleted, AttributionFailure> {
     let started = Instant::now();
-    let result = attribute_event(request.event);
+    let result = attribute_event(request.event)?;
     let elapsed = started.elapsed();
     if elapsed > ATTRIBUTION_BUDGET {
         warn!(
@@ -230,20 +239,42 @@ pub fn handle_attribution_requested(request: AttributionRequested<'_>) -> Attrib
             ATTRIBUTION_BUDGET.as_millis()
         );
     }
-    AttributionCompleted { result, elapsed }
+    Ok(AttributionCompleted { result, elapsed })
 }
 
 /// Enrich an alert in place before audit and notification delivery.
-pub fn apply_attribution(event: &mut AlertEvent) -> AttributionCompleted {
-    let completed = handle_attribution_requested(AttributionRequested { event });
+pub fn apply_attribution(
+    event: &mut AlertEvent,
+) -> Result<AttributionCompleted, AttributionFailure> {
+    let completed = handle_attribution_requested(AttributionRequested { event })?;
     event.detail.ai_decision = Some(completed.result.decision_text());
-    completed
+    Ok(completed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::monitor::detector::{AlertCategory, AlertDetail, AlertLevel};
+
+    fn repository_rule_snapshot() -> crate::config::ChainRulesTestGuard {
+        let parsed: crate::config::ChainRulesFile =
+            toml::from_str(include_str!("../../config/chain.toml"))
+                .expect("repository chain rules must parse");
+        crate::config::replace_chain_rules_for_test(Some(parsed.rules))
+    }
+
+    #[test]
+    fn chain_mapper_preserves_configuration_unavailable() {
+        let _snapshot = crate::config::replace_chain_rules_for_test(None);
+
+        let error = chain_mapper_with_timeout("TEST_CODE_CHAIN_NEWS", 1_500)
+            .expect_err("missing chain rules must not become an empty attribution");
+
+        assert!(matches!(
+            error,
+            AttributionFailure::ChainRulesUnavailable(_)
+        ));
+    }
 
     fn make_event(code: &str, change_pct: f64, vol: f64) -> AlertEvent {
         AlertEvent {
@@ -308,6 +339,7 @@ mod tests {
 
     #[test]
     fn test_chain_mapper_with_timeout_under_limit() {
+        let _snapshot = repository_rule_snapshot();
         // 正常情况 < 1.5s
         let result = chain_mapper_with_timeout("AI 算力 涨价", 1500);
         assert!(result.is_ok());
@@ -315,6 +347,7 @@ mod tests {
 
     #[test]
     fn test_chain_mapper_with_timeout_short_limit() {
+        let _snapshot = repository_rule_snapshot();
         // 设 0ms 极短超时, 应触发 timeout (chain_mapper < 1ms 通常, 但 0ms 必超时)
         // 注: 实测 chain_mapper < 1ms, 0ms 容易触发, 但不保证. 这个测试不太稳定
         // 改为测试"短超时" 也不失败 (只要 elapsed < timeout)
@@ -326,7 +359,7 @@ mod tests {
     fn test_attribute_event_no_catalyst() {
         // 不命中 chain, news_ai = None → 查无催化
         let event = make_event("TEST_CODE_999999", 1.0, 1.0);
-        let result = attribute_event(&event);
+        let result = attribute_event(&event).expect("missing title does not require chain rules");
         assert!(!result.has_catalyst);
         assert!(result.main_reason.contains("⚠️ 异动查无催化"));
         assert_eq!(result.confidence, Confidence::C);
@@ -334,11 +367,12 @@ mod tests {
 
     #[test]
     fn source_importance_is_real_strong_evidence_without_llm() {
+        let _snapshot = repository_rule_snapshot();
         let mut event = make_event("TEST_CODE_001", 3.0, 2.0);
         event.detail.news_title = Some("无产业链关键词的公司快讯".into());
         event.detail.news_importance = Some(3);
 
-        let result = attribute_event(&event);
+        let result = attribute_event(&event).expect("explicit chain snapshot is available");
 
         assert!(result.has_catalyst);
         assert_eq!(result.confidence, Confidence::B);
@@ -347,11 +381,12 @@ mod tests {
 
     #[test]
     fn missing_importance_is_not_inferred_from_alert_level_or_text() {
+        let _snapshot = repository_rule_snapshot();
         let mut event = make_event("TEST_CODE_002", 9.9, 8.0);
         event.level = AlertLevel::Emergency;
         event.detail.news_title = Some("重大紧急消息但没有已登记产业链关键词".into());
 
-        let result = attribute_event(&event);
+        let result = attribute_event(&event).expect("explicit chain snapshot is available");
 
         assert!(!result.has_catalyst);
         assert!(result.missing.contains(&"news_importance".to_string()));
@@ -362,7 +397,8 @@ mod tests {
     fn apply_attribution_writes_decision_and_meets_synchronous_budget() {
         let mut event = make_event("TEST_CODE_003", 4.0, 3.0);
 
-        let completed = apply_attribution(&mut event);
+        let completed =
+            apply_attribution(&mut event).expect("missing title does not require chain rules");
 
         assert!(completed.elapsed <= ATTRIBUTION_BUDGET);
         let decision = event
@@ -377,7 +413,7 @@ mod tests {
     fn test_attribute_event_with_catalyst_chain() {
         // 命中非 generic chain
         let event = make_event("TEST_CODE_300750", 5.0, 6.0); // 宁德时代
-        let result = attribute_event(&event);
+        let result = attribute_event(&event).expect("missing title does not require chain rules");
         // 实际: chain_mapper 命中与否取决于 chain_rules 关键词表
         // 不强求, 只测 has_catalyst 决定 main_reason
         if result.has_catalyst {

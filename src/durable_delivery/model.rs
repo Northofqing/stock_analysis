@@ -1138,6 +1138,17 @@ pub struct ScheduleHydration {
     pub hydration_state: ScheduleHydrationState,
 }
 
+/// Read-only evidence for an already-owned review-task occurrence.
+///
+/// BR-200 consumers use this before provider acquisition. Returning this type
+/// never reserves budget/cooldown, creates a decision, or calls a sink.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewTaskOccurrenceEvidence {
+    pub decision_identity: String,
+    pub state: DecisionState,
+    pub schedule_hydration: Option<ScheduleHydration>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrepareOutcome {
     pub decision_identity: String,

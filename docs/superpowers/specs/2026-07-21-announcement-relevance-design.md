@@ -48,11 +48,13 @@ Eastmoney announcement batch
   -> LaunchGate / quiet hours / L4 / daily limit / real sink / L7 / hash-chain
 ```
 
-Every provider item with a complete external identity remains owned by the normalized route once it
-is classified. The route returns a typed disposition for each owned identity. A relevance-filtered
-item is recorded as skipped/handled so the legacy state machine cannot send it as a fallback, but it
-is not eligible to trigger D-01, I-02, or another downstream notification. Only a `Pushed`
-disposition can feed those downstream triggers.
+Every provider item with a complete external identity remains owned by the normalized route. Before
+any handled/filter outcome, the route validates the security code, non-empty title, non-empty source,
+provider publication date, immutable observation time and freshness. The route then returns a typed
+disposition for each owned identity. A keyword-unmatched item is `FilteredClassification`; a narrow
+procedural lifecycle item is `FilteredLifecycle`. Both are recorded as skipped/handled so the legacy
+state machine cannot send them as a fallback, but neither is eligible to trigger D-01, I-02, or
+another downstream notification. Only a `Pushed` disposition can feed those downstream triggers.
 
 ## 4. Required configuration
 
@@ -98,7 +100,8 @@ universe gate.
   lifecycle exclusions and is deterministic.
 - `announcement_is_immediate_notification_candidate(&Announcement) -> bool` is the shared consumer
   gate. NewsMonitor, NewsAggregator, R-08 summaries/holding events, and future renderers must apply it;
-  only the normalized route consumes `LocalOnly/Skip` rows for `FilteredLifecycle` accounting.
+  only the normalized route consumes `LocalOnly/Skip` rows: lifecycle-only rows become
+  `FilteredLifecycle`, while ordinary keyword-unmatched rows become `FilteredClassification`.
 - Provider assembly retains a lifecycle-only row even when ordinary keyword classification is
   `Skip`; it does not fetch risk detail for that row and never upgrades it to notification-eligible.
 - `route_announcements(&[Announcement], &HashSet<String>)` receives the real eligible universe
@@ -109,8 +112,8 @@ universe gate.
   connected, production explicitly excludes the position component and continues with independent
   watch codes.
 - `AnnouncementSourceRouteReport.dispositions` maps every owned external ID to a typed `Pushed`,
-  `FilteredLifecycle`, `FilteredAudience`, or `Failed` result. All four prevent legacy fallback;
-  only `Pushed` participates in downstream notification triggers.
+  `FilteredClassification`, `FilteredLifecycle`, `FilteredAudience`, or `Failed` result. All five
+  prevent legacy fallback; only `Pushed` participates in downstream notification triggers.
 
 ## 7. Failure modes
 
@@ -119,7 +122,9 @@ universe gate.
   or older than 30 seconds: exclude the position component explicitly while retaining the
   independently validated explicit-watch audience; never infer freshness from a local database
   write time or replace either component with a fake universe.
-- Incomplete provider identity/date/code: existing explicit BR-137 rejection.
+- Incomplete provider identity/date/code/title/source, invalid provider date, stale provider date, or
+  future provider/observation time: explicit BR-137 rejection before any classification/lifecycle
+  filter can claim the row as handled.
 - Relevance-filtered event: `skipped += 1`, a typed filtered disposition, reason-only log without
   message body or account values, legacy suppression via owned provider identity, and no D-01/I-02
   downstream trigger.
@@ -134,8 +139,9 @@ universe gate.
   Its first failure is logged during startup/first tick. The production outer loop must route these
   decisions through a phase coordinator: Pending/Failed watch readiness suppresses only the
   Announcement phase, and a missing or duplicate unrelated phase is an explicit tick-contract error.
-- Each route aggregate reports counts for Pushed, FilteredLifecycle, FilteredAudience, and Failed so
-  a live canary can verify selection without logging bodies, account values, or security identities.
+- Each route aggregate separately reports counts for Pushed, FilteredClassification,
+  FilteredLifecycle, FilteredAudience, and Failed so a live canary can verify selection without
+  logging bodies, account values, or security identities.
 
 ## 8. Validation
 
@@ -143,6 +149,10 @@ universe gate.
 - A procedural capital-reduction creditor notice is not immediately actionable.
 - The same creditor notice survives provider assembly as local-only evidence and reaches the route's
   `FilteredLifecycle` disposition without requiring a risk-detail request.
+- A structurally valid ordinary announcement that does not match the immutable keyword snapshot
+  reaches `FilteredClassification`, never `FilteredLifecycle` or `Failed`.
+- A `Skip` row with missing title/code/source or an invalid, stale, or future publication date is
+  `Failed` before either filtered disposition is considered.
 - NewsMonitor, NewsAggregator, both R-08 paths, and the event-calendar summary cannot render or push
   that local-only row.
 - A reduction-plan expiry/completion notice is not immediately actionable.

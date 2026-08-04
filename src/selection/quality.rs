@@ -2,7 +2,6 @@ use chrono::{DateTime, Local, NaiveDate};
 use serde::{Deserialize, Serialize};
 
 const MAX_QUOTE_AGE_SECONDS: i64 = 5;
-const MAX_ADJACENT_CHANGE: f64 = 0.20;
 const CONTINUITY_RELATIVE_TOLERANCE: f64 = 0.000_001;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,16 +47,11 @@ pub struct SelectionBar {
 pub struct QualityError {
     code: &'static str,
     message: String,
-    manual_confirmation_required: bool,
 }
 
 impl QualityError {
     pub fn code(&self) -> &'static str {
         self.code
-    }
-
-    pub fn manual_confirmation_required(&self) -> bool {
-        self.manual_confirmation_required
     }
 }
 
@@ -205,14 +199,16 @@ pub fn validate_daily(bars: &[SelectionBar]) -> Result<ValidatedDailyBars<'_>, Q
                 ));
             }
         }
-
-        let change = pair[1].close / pair[0].close - 1.0;
-        if change.abs() > MAX_ADJACENT_CHANGE + f64::EPSILON {
-            return Err(manual_error(
-                "adjacent_change_gt_20pct",
+        let change_pct = (pair[1].close / pair[0].close - 1.0) * 100.0;
+        if change_pct.abs()
+            > crate::monitor::data_quality::MAX_UNCONFIRMED_ADJACENT_DAILY_CHANGE_PCT
+        {
+            return Err(error(
+                "manual_confirmation_required",
                 format!(
-                    "adjacent settled close change {:.6}% exceeds ±20%",
-                    change * 100.0
+                    "BR-171 daily close change {}→{} is {change_pct:.4}% and has no \
+                     evidence-bound manual confirmation",
+                    previous_date, current_date
                 ),
             ));
         }
@@ -331,15 +327,6 @@ fn error(code: &'static str, message: impl Into<String>) -> QualityError {
     QualityError {
         code,
         message: message.into(),
-        manual_confirmation_required: false,
-    }
-}
-
-fn manual_error(code: &'static str, message: impl Into<String>) -> QualityError {
-    QualityError {
-        code,
-        message: message.into(),
-        manual_confirmation_required: true,
     }
 }
 
@@ -382,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_positive_price_duplicate_day_and_large_unexplained_jump() {
+    fn rejects_non_positive_price_and_duplicate_day() {
         let mut invalid_price = consecutive_bars(2);
         invalid_price[1].close = 0.0;
         assert_eq!(
@@ -395,16 +382,6 @@ mod tests {
         assert_eq!(
             validate_daily(&duplicate).unwrap_err().code(),
             "duplicate_bar"
-        );
-
-        let mut jump = consecutive_bars(2);
-        jump[1].open = jump[0].close * 1.205;
-        jump[1].high = jump[1].open;
-        jump[1].low = jump[1].open;
-        jump[1].close = jump[1].open;
-        assert_eq!(
-            validate_daily(&jump).unwrap_err().code(),
-            "adjacent_change_gt_20pct"
         );
     }
 
@@ -504,6 +481,141 @@ mod tests {
                 .unwrap_err()
                 .code(),
             "daily_stale"
+        );
+    }
+
+    fn quote(now: DateTime<Local>) -> SelectionQuote {
+        SelectionQuote {
+            code: "TEST_CODE_000001".to_owned(),
+            price: 10.0,
+            previous_close: 9.8,
+            open: 9.9,
+            high: 10.1,
+            low: 9.8,
+            observed_at: now,
+            source_at: now,
+            volume: 1_000.0,
+            amount: 10_000.0,
+        }
+    }
+
+    #[test]
+    fn quote_validation_covers_identity_ohlc_time_and_flow_boundaries() {
+        let now = at(2026, 7, 23, 10, 0);
+        let valid = quote(now);
+        assert_eq!(
+            validate_quote(&valid, now)
+                .expect("valid quote")
+                .quote()
+                .code,
+            "TEST_CODE_000001"
+        );
+
+        let mut cases = Vec::new();
+        let mut empty_code = valid.clone();
+        empty_code.code = " ".to_owned();
+        cases.push((empty_code, "security_code_empty"));
+
+        let mut ohlc = valid.clone();
+        ohlc.high = 9.0;
+        cases.push((ohlc, "quote_ohlc_inconsistent"));
+
+        let mut reversed_time = valid.clone();
+        reversed_time.source_at = now;
+        reversed_time.observed_at = now - chrono::Duration::seconds(1);
+        cases.push((reversed_time, "quote_time_inconsistent"));
+
+        let mut future = valid.clone();
+        future.observed_at = now + chrono::Duration::seconds(1);
+        future.source_at = now + chrono::Duration::seconds(1);
+        cases.push((future, "quote_time_future"));
+
+        let mut negative_volume = valid.clone();
+        negative_volume.volume = -1.0;
+        cases.push((negative_volume, "volume_negative"));
+
+        let mut negative_amount = valid;
+        negative_amount.amount = -1.0;
+        cases.push((negative_amount, "amount_negative"));
+
+        for (input, expected) in cases {
+            let error = validate_quote(&input, now).expect_err("invalid quote");
+            assert_eq!(error.code(), expected);
+            assert!(!error.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn daily_validation_covers_empty_mixed_order_calendar_and_future_paths() {
+        assert_eq!(
+            validate_daily(&[]).expect_err("empty").code(),
+            "daily_empty"
+        );
+
+        let mut empty_code = consecutive_bars(1);
+        empty_code[0].code = " ".to_owned();
+        assert_eq!(
+            validate_daily(&empty_code).expect_err("empty code").code(),
+            "security_code_empty"
+        );
+
+        let mut mixed = consecutive_bars(2);
+        mixed[1].code = "TEST_CODE_000002".to_owned();
+        assert_eq!(
+            validate_daily(&mixed).expect_err("mixed").code(),
+            "mixed_security_batch"
+        );
+
+        let mut reversed = consecutive_bars(2);
+        reversed.reverse();
+        assert_eq!(
+            validate_daily(&reversed).expect_err("order").code(),
+            "bar_out_of_order"
+        );
+
+        let mut weekend = consecutive_bars(1);
+        weekend[0].market_date = NaiveDate::from_ymd_opt(2026, 7, 25).expect("Saturday");
+        assert_eq!(
+            validate_daily(&weekend).expect_err("calendar").code(),
+            "bar_non_trading_day"
+        );
+
+        let bars = consecutive_bars(2);
+        let before_latest =
+            crate::calendar::prev_trading_day(bars.last().expect("latest").market_date);
+        assert_eq!(
+            validate_daily_freshness(&bars, before_latest)
+                .expect_err("future bar")
+                .code(),
+            "daily_future"
+        );
+    }
+
+    #[test]
+    fn large_change_requires_manual_confirmation() {
+        let mut jump = consecutive_bars(2);
+        let price = jump[0].close * 1.30;
+        jump[1].open = price;
+        jump[1].high = price;
+        jump[1].low = price;
+        jump[1].close = price;
+
+        assert_eq!(
+            validate_daily(&jump)
+                .expect_err("large adjacent change requires confirmation")
+                .code(),
+            "manual_confirmation_required"
+        );
+    }
+
+    #[test]
+    fn reference_previous_close_mismatch_still_fails() {
+        let mut bars = consecutive_bars(2);
+        bars[1].reference_previous_close = Some(bars[0].close * 0.90);
+
+        assert_eq!(
+            validate_daily(&bars).unwrap_err().code(),
+            "split_continuity_unverified"
         );
     }
 }

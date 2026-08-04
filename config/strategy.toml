@@ -1,8 +1,8 @@
+# Registered business rule: BR-181
 # =====================================================================
 # v12 Strategy 综合配置 — 交易策略/风控/调度/告警/账户模式
-# SIGHUP 热加载, 缺 toml 时 Rust const fallback 生效
-# 整合自原 risk.toml + monitor.toml + opportunity.toml (3 文件 → 1)
-# 加载入口: src/config.rs::load_all() 读此文件 + chain.toml
+# monitor 启动时由 src/config.rs::load_all() 读取一次；不支持信号热重载。
+# runtime TOML 输入只有此文件和 config/chain.toml。
 #
 # 字段值单位/范围约定:
 #   - 时间字段: 秒 (sec) / 分钟 (min) / 小时 (hours) / 24h "HH:MM"
@@ -14,19 +14,13 @@
 # ── 数据新鲜度阈值 (AGENTS 2.4) ──
 # 数据陈旧时间超过阈值 → 视为缺失 (AGENTS.md 2.2: 缺失数据禁止静默填充)
 # 影响: 触发器 (T-01) 决策依据, 缺失时降级到 Hold 模式
-dq_quote_stale_sec = 6         # 实时行情 (秒): tick 数据, 默认 6s 过期 (含网络延迟)
+dq_quote_stale_sec = 5         # 实时行情 (秒): AGENTS 2.4 / BR-148 / BR-153 / BR-156
 dq_position_stale_sec = 30     # 持仓/资金 (秒): 30s 容忍
 dq_nav_stale_sec = 86400       # 净值 (秒): 1 个交易日, 86400 = 24h
 dq_daily_stale_sec = 86400     # 日线/历史数据 (秒): 1 个交易日
-opportunity_min_confidence = 45  # 候选最低置信度阈值 (0-100), 低于不入候选
-opportunity_require_cross_source = false  # true=必须快讯+Web双源共振, 降低单源假信号
-                                      # 沙盘/灰度阶段推荐 false, 实盘阶段改 true
 opportunity_push_threshold = 75  # BR-014/BR-096: 数据完整的 event_risk_score 达到此值才实时推送
 
-# ── 监控定时器 ──
-# 调度间隔, 影响 monitor_loop 主动轮询频率
-screener_interval_min = 5       # 扫描器轮询间隔 (分钟): 5min = K 线节奏
-opportunity_scan_interval_min = 10  # 机会发现扫描间隔 (分钟)
+# ── 主题新闻时间窗口 ──
 news_window_start_hour = 0      # 主题新闻推送窗口起始 (24h 时, 0 = 0:00)
 news_window_end_hour = 24      # 主题新闻推送窗口结束 (24 = 24:00, 即不限制)
 
@@ -44,7 +38,8 @@ topic_news_max_age_days = 3   # 新闻新鲜度窗口 (天), 超过即丢弃
 
 # ── 实时否决链 (VetoChain, 监控盘中止损/反模式拦截) ──
 # 上线首周建议 dry_run 观察拦截率, 再切 live.
-# 缺省 toml 时 const fallback: enabled=true, mode="live", 4 个开关均启用
+# 缺少 [live_veto] 或 mode 时默认 enabled=true、mode="dry_run"，4 个开关均启用；
+# checked-in 配置显式选择当前活动值 mode="live"。
 [live_veto]
 enabled = true              # 总开关: false 时跳过整个否决链
 mode = "live"               # "dry_run" | "live": dry_run 仅记日志不拦截; live 真拦截
@@ -78,67 +73,6 @@ confirm_lots = 10            # confirm 模式: 每只虚拟记录手数 (10 手 
 pilot_lots = 3              # pilot 模式: 每只虚拟记录手数 (3 手 = 300 股)
 next_day_review_enabled = true  # 复盘时统计上一交易日虚拟观察仓表现
 
-# ── v9 机会发现调度 ──
-# batch 模式: 盘前/盘后整批跑; incremental: 盘中增量跑
-# 缺省 toml 时 const fallback 保持原 v9 行为
-[schedule]
-# v22: batch_*_time 已被 OpportunitySchedule::default() 取代 (Rust 代码内 default)
-# v22: incremental_*_min 已被 src/bin/monitor/main.rs 调度的 incremental_interval 取代
-# v22: push_*_time 已被 src/opportunity/scheduler.rs 的 push_preopen/push_intraday/push_evening 取代
-# 注: 配置字段名 vs Rust 字段名不一致, 实际未引用 (v23 审计)
-
-# ── A 股交易费率 (2024 监管标准) ──
-# 缺省 const fallback: 0.0003 / 0.001 / 0.001 / 5.0 / 100
-# 影响: paper_trade + actual trade 的成本计算 (P&L 准确性)
-[trading]
-commission_rate = 0.0003  # 佣金率 (万三, 0.03%): 含规费
-stamp_tax_rate  = 0.001   # 印花税率 (千一, 0.1%): 仅卖出时收取
-slippage_rate   = 0.001   # 滑点率 (千一, 0.1%): 固定默认, 启用 dynamic_slippage 后用 sqrt-rule
-min_commission  = 5.0      # 最低佣金 (元): A 股单笔最低 5 元
-lot_size        = 100     # 1 手 = 100 股 (A 股固定)
-
-# ── 动态滑点 (修复 P1.4 / P3.M1) ──
-# 缺省 const fallback: dynamic_enabled=false
-# 启用条件: 大额订单或低流动性股票
-[slippage]
-dynamic_enabled = false  # true 启用 sqrt-rule 滑点: slippage = alpha * sqrt(订单/ADV)
-alpha = 0.1              # sqrt-rule 系数 (0.1~0.5): 0.1 保守, 0.5 激进
-adv_days = 20            # ADV (日均成交量) 计算窗口 (天)
-
-# ── Sharpe / Sortino ──
-# 缺省 const fallback: 0.03 / 252 / 60 / 30
-[performance]
-risk_free_rate = 0.03   # 无风险利率 (10Y 国债 2026 水平): 年化
-trading_days_year = 252 # 年交易日数: A 股 2026 实际
-sharpe_window = 60      # Sharpe 滚动窗口 (天)
-sortino_min_period = 30  # Sortino 最小计算周期 (天)
-
-# ── 风险检测阈值 (市场状态判断) ──
-# 缺省 const fallback 保持原值
-[regime]
-window_days = 20        # 市场状态检测窗口 (天): 20 日均涨幅
-bull_threshold = 0.03   # 牛: 20 日涨幅 > 3%
-bear_threshold = -0.03  # 熊: 20 日跌幅 < -3%
-index_plunge_atr_mult = 2.0  # 大盘崩盘阈值: ATR × 2.0 替代写死 -1%
-flow_outflow_threshold = 0.5  # 主力净流出阈值 (亿)
-flow_lookback_min = 15   # 资金流回溯窗口 (分钟)
-
-# ── 板块限制 (持仓上限) ──
-# 缺省 const fallback: 0.10 / 0.40 / 0.15 / -0.10
-[exposure]
-single_stock_max = 0.10   # 单票上限 (10% 资金)
-single_sector_max = 0.40  # 单板块上限 (40% 资金)
-cash_floor = 0.15        # 现金底限 (15% 资金): 留弹药
-stop_loss_default = -0.10 # 默认止损 (-10% 跌幅触发)
-
-# ── 推送/告警阈值 ──
-# 缺省 const fallback 保持原值
-[alert]
-min_importance_score = 70  # 重要告警最低分 (0-100): 低于不推
-min_emergency_score = 85   # 紧急告警最低分
-index_plunge_window_min = 5  # 大盘崩盘检测窗口 (分钟)
-stale_data_max_age_sec = 30  # 行情数据最大陈旧时间 (秒, 老 codex review 上限)
-
 # ── v12 PR1 账户模式三态 (BR-021) ──
 # 缺省 const fallback 保持原值 (-1.5 / -2.0 / 3 / 8)
 # 影响: monitor_loop 每次 tick 评估, 决定 ActionGate 权限
@@ -150,22 +84,10 @@ consecutive_stop_loss_n = 3  # 连续止损笔数 ≥ 此值 → ReduceOnly (默
 position_overload_cheng = 8  # 总仓位 > 此值 (成) → Frozen (默认 8 成)
 # 解除: 下一交易日盘前重置为 Normal (由 monitor_loop 09:25 前调 reset())
 
-# ── v13.1 新规 2026-07-06 生效 (沪深北《交易规则（2026 修订）》) ──
-# 缺省 const fallback: 0.10 / 0.10 / 0.65
-# 受控例外: AGENTS §8 (新规紧急, 24h 内补 PR #13)
-# 影响: 持仓 ST 票的止损/止盈阈值; 中小盘流动性评估
-[st_price_limit]
-st_daily_limit = 0.10      # 主板 ST/*ST 涨跌幅上限 (新规 5%→10%, 2026-07-06 生效)
-# v23: st_take_profit + st_stop_loss 已在代码中硬编码 (T-16 模板直接用 0.10 比例), 字段废弃
-# 注: 原 5% 阈值自 2026-07-06 起作废, 所有 ST/*ST 持仓重算
-
-[gem_market_maker]
-liquidity_threshold = 0.65 # 创业板做市商流动性阈值 (原 0.50 + 0.15 校准)
-# v23: small_cap_lookback 字段废弃 (代码硬编码 20 日)
-# 注: 2026-07-06 创业板引入做市商制度生效, 中小盘流动性增强, 阈值上修 15%
-
 # ── v17.7 earnings classification ──
-[v17_7_sources.earnings]
+# Threshold-Proof: docs/superpowers/specs/2026-07-25-unified-data-final-cutover-design.md §4.1
+# 本次只修正 MonitorConfig 的直接表名；四个值及其符号约束均未改变。
+[v17_7_earnings]
 metric = "eps"
 beat_threshold_pct = 10.0
 miss_threshold_pct = -10.0

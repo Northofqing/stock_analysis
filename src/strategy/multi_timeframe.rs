@@ -12,10 +12,21 @@
 //!
 //! 输入：60min / 15min K 线，按时间**升序**排列（最新在末尾）。
 
-use crate::data_provider::intraday_kline::MinuteBar;
 use crate::indicators::{
     calc_macd, calc_rsi, calc_skdj, MACD_FAST, MACD_SIGNAL, MACD_SLOW, SKDJ_M, SKDJ_N,
 };
+
+/// A completed intraday candle admitted by the unified market Gateway and
+/// aggregated from its continuous one-minute source series.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MinuteBar {
+    pub timestamp: String,
+    pub open: f64,
+    pub close: f64,
+    pub high: f64,
+    pub low: f64,
+    pub volume: f64,
+}
 
 /// 多周期入场评估结果
 #[derive(Debug, Clone, Default)]

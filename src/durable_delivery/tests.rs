@@ -842,10 +842,42 @@ struct RetainedProductionAncestor {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProductionObjectState {
+    identity: FilesystemIdentity,
+    length: u64,
+    modified_nanos: i128,
+}
+
+#[cfg(unix)]
+impl ProductionObjectState {
+    /// `None` means the object is absent; absence is itself part of the contract.
+    fn capture(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        match path.symlink_metadata() {
+            Ok(metadata) => Some(Self {
+                identity: FilesystemIdentity::capture(path).unwrap_or_else(|error| {
+                    panic!("stat production SQLite object {}: {error}", path.display())
+                }),
+                length: metadata.len(),
+                modified_nanos: i128::from(metadata.mtime()) * 1_000_000_000
+                    + i128::from(metadata.mtime_nsec()),
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!(
+                "stat production SQLite namespace entry {}: {error}",
+                path.display()
+            ),
+        }
+    }
+}
+
+#[cfg(unix)]
 #[derive(Debug)]
 struct ProductionStorageSnapshot {
     ancestors: Vec<RetainedProductionAncestor>,
-    absent_objects: Vec<PathBuf>,
+    production_objects: Vec<(PathBuf, Option<ProductionObjectState>)>,
 }
 
 #[cfg(unix)]
@@ -887,24 +919,17 @@ impl ProductionStorageSnapshot {
             .collect::<Vec<_>>();
 
         let main = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/durable_delivery.sqlite3");
-        let absent_objects = ["", "-journal", "-shm", "-wal"]
+        let production_objects = ["", "-journal", "-shm", "-wal"]
             .into_iter()
-            .map(|suffix| PathBuf::from(format!("{}{suffix}", main.display())))
-            .inspect(|path| match path.symlink_metadata() {
-                Ok(_) => panic!(
-                    "BR-192 tests refuse to run while a production SQLite artifact exists; no production file was opened or read: {}",
-                    path.display()
-                ),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => panic!(
-                    "stat production SQLite namespace entry {}: {error}",
-                    path.display()
-                ),
+            .map(|suffix| {
+                let path = PathBuf::from(format!("{}{suffix}", main.display()));
+                let state = ProductionObjectState::capture(&path);
+                (path, state)
             })
             .collect();
         Self {
             ancestors,
-            absent_objects,
+            production_objects,
         }
     }
 
@@ -933,15 +958,22 @@ impl ProductionStorageSnapshot {
                 ancestor.path.display()
             );
         }
-        for path in &self.absent_objects {
-            match path.symlink_metadata() {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Ok(_) => panic!(
+        for (path, before) in &self.production_objects {
+            let after = ProductionObjectState::capture(path);
+            match (before, after) {
+                (None, None) => {}
+                (None, Some(_)) => panic!(
                     "TEST_CODE fixture created a production SQLite artifact: {}",
                     path.display()
                 ),
-                Err(error) => panic!(
-                    "restat production SQLite namespace entry {}: {error}",
+                (Some(_), None) => panic!(
+                    "TEST_CODE fixture deleted a production SQLite artifact: {}",
+                    path.display()
+                ),
+                (Some(before), Some(after)) => assert_eq!(
+                    *before,
+                    after,
+                    "TEST_CODE fixture mutated a production SQLite artifact: {}",
                     path.display()
                 ),
             }
@@ -1709,7 +1741,7 @@ fn br192_cross_process_ofd_owner_cannot_be_borrowed_and_is_reusable_after_drop()
 #[cfg(unix)]
 #[serial_test::serial(durable_physical_isolation)]
 #[test]
-fn br192_concurrent_coordinator_open_use_and_drop_preserves_attestation() {
+fn br206_repeated_concurrent_coordinator_open_use_and_drop_preserves_attestation() {
     let fixture = Fixture::new("CONCURRENT_OPEN_DROP");
     let database_path = fixture.database_path.clone();
     let test_code = database_path
@@ -1718,35 +1750,39 @@ fn br192_concurrent_coordinator_open_use_and_drop_preserves_attestation() {
         .and_then(|value| value.to_str())
         .expect("TEST_CODE namespace")
         .to_owned();
-    let start = Arc::new(Barrier::new(5));
-    let mut handles = Vec::new();
-    for worker in 0..4 {
-        let database_path = database_path.clone();
-        let test_code = test_code.clone();
-        let start = start.clone();
-        handles.push(std::thread::spawn(move || {
-            start.wait();
-            let coordinator = DurableDeliveryCoordinator::open(CoordinatorConfig::test(
-                database_path,
-                test_code,
-                format!("owner-concurrent-{worker}-0123456789abcdef"),
-            ))
-            .expect("concurrent coordinator open");
-            assert!(coordinator
-                .inspect_pending_for_date("2026-07-30")
-                .expect("concurrent coordinator operation")
-                .is_empty());
-        }));
+    // BR-206: repeat inside the committed regression so SQLite VFS descriptor
+    // reuse is exercised by CI rather than only by an external stress loop.
+    for round in 0..16 {
+        let start = Arc::new(Barrier::new(5));
+        let mut handles = Vec::new();
+        for worker in 0..4 {
+            let database_path = database_path.clone();
+            let test_code = test_code.clone();
+            let start = start.clone();
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                let coordinator = DurableDeliveryCoordinator::open(CoordinatorConfig::test(
+                    database_path,
+                    test_code,
+                    format!("owner-concurrent-{round}-{worker}-0123456789abcdef"),
+                ))
+                .expect("concurrent coordinator open");
+                assert!(coordinator
+                    .inspect_pending_for_date("2026-07-30")
+                    .expect("concurrent coordinator operation")
+                    .is_empty());
+            }));
+        }
+        start.wait();
+        for handle in handles {
+            handle.join().expect("concurrent coordinator worker");
+        }
+        assert!(fixture
+            .coordinator
+            .inspect_pending_for_date("2026-07-30")
+            .expect("original coordinator after concurrent open/drop")
+            .is_empty());
     }
-    start.wait();
-    for handle in handles {
-        handle.join().expect("concurrent coordinator worker");
-    }
-    assert!(fixture
-        .coordinator
-        .inspect_pending_for_date("2026-07-30")
-        .expect("original coordinator after concurrent open/drop")
-        .is_empty());
 }
 
 #[cfg(unix)]
@@ -2327,6 +2363,9 @@ fn br192_schema_v2_migration_rejects_historical_blank_manual_accepted_audit_refs
         initialize_test_schema(&mut connection).expect("materialize complete reference schema");
         downgrade_manual_resolution_schema_for_test(&mut connection, 2);
         connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .expect("disable FK while seeding historical v2 blank ref regression");
+        connection
             .execute(
                 "INSERT INTO manual_resolutions(
                    resolution_identity,decision_identity,attempt_identity,disposition,
@@ -2344,6 +2383,9 @@ fn br192_schema_v2_migration_rejects_historical_blank_manual_accepted_audit_refs
                 [whitespace],
             )
             .unwrap_or_else(|error| panic!("v2 permits {label} historical blank ref: {error}"));
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("restore FK before migration validation");
 
         assert!(matches!(
             initialize_test_schema(&mut connection),
@@ -2378,6 +2420,9 @@ fn br192_schema_v1_migration_rejects_historical_manual_acceptance() {
     initialize_test_schema(&mut connection).expect("materialize complete reference schema");
     downgrade_manual_resolution_schema_for_test(&mut connection, 1);
     connection
+        .pragma_update(None, "foreign_keys", "OFF")
+        .expect("disable FK while seeding historical v1 acceptance regression");
+    connection
         .execute(
             "INSERT INTO manual_resolutions(
                resolution_identity,decision_identity,attempt_identity,disposition,
@@ -2394,6 +2439,9 @@ fn br192_schema_v1_migration_rejects_historical_manual_acceptance() {
             [],
         )
         .expect("v1 stores acceptance without an append acknowledgement");
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .expect("restore FK before migration validation");
 
     assert!(matches!(
         initialize_test_schema(&mut connection),
@@ -3690,6 +3738,34 @@ fn envelope(
     .expect("valid envelope")
 }
 
+fn review_envelope_with_task_identity(
+    label: &str,
+    push_kind: PushKind,
+    business_date: &str,
+    task_identity: &str,
+) -> DeliveryEnvelope {
+    DeliveryEnvelope::new(
+        business_date,
+        push_kind,
+        DeliverySubKind::None,
+        "GLOBAL",
+        format!("TEST_CODE_OCCURRENCE_{label}"),
+        format!("TEST_CODE_EVIDENCE_{label}"),
+        format!("TEST_CODE_SOURCE_BINDING_{label}").into_bytes(),
+        format!("TEST_CODE_SUBJECT_HASH_{label}"),
+        format!("TEST_CODE_RENDERED_BODY_{label}").into_bytes(),
+        true,
+        Some(
+            TaskBinding::new(
+                task_identity,
+                format!("TEST_CODE_TRANSITION_BASIS_{label}").into_bytes(),
+            )
+            .expect("valid review task binding"),
+        ),
+    )
+    .expect("valid review envelope")
+}
+
 fn prepare_reserved(
     fixture: &Fixture,
     envelope: &DeliveryEnvelope,
@@ -3766,6 +3842,126 @@ fn establish_authoritative_delivered_projection(
         &candidate.decision_identity,
     );
     candidate
+}
+
+#[test]
+fn br200_r09_business_date_once_preflight_reuses_delivered_without_writes() {
+    let fixture = Fixture::new("BR200_R09_DELIVERED");
+    let append = MemoryAppendPort::default();
+    let task_identity = "TEST_CODE_TASK_BR200_R09";
+    let candidate = review_envelope_with_task_identity(
+        "BR200_R09_DELIVERED",
+        PushKind::ReviewProviderTopN,
+        "2026-07-30",
+        task_identity,
+    );
+    prepare_reserved(&fixture, &candidate, &append);
+    let sink = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(now())));
+    let sinks: Vec<AuthoritativeSink> = vec![sink.clone()];
+    fixture
+        .coordinator
+        .resume_deliverable(&candidate.decision_identity, &sinks, now())
+        .expect("deliver R-09");
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::Delivered,
+        &candidate.decision_identity,
+    );
+    let decision_count = fixture.query_i64("SELECT COUNT(*) FROM delivery_decisions");
+
+    let evidence = fixture
+        .coordinator
+        .inspect_review_task_occurrence(
+            "2026-07-30",
+            PushKind::ReviewProviderTopN,
+            DeliverySubKind::None,
+            "GLOBAL",
+            task_identity,
+        )
+        .expect("read R-09 occurrence")
+        .expect("existing R-09 occurrence");
+
+    assert_eq!(evidence.decision_identity, candidate.decision_identity);
+    assert_eq!(evidence.state, DecisionState::Delivered);
+    assert!(evidence.schedule_hydration.is_some());
+    assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_decisions"),
+        decision_count,
+        "read-only preflight must not create a second decision"
+    );
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM business_date_once_claims"),
+        1
+    );
+}
+
+#[test]
+fn br200_r04_rolling_preflight_prefers_original_delivered_over_later_denial() {
+    let fixture = Fixture::new("BR200_R04_DELIVERED");
+    let append = MemoryAppendPort::default();
+    let task_identity = "TEST_CODE_TASK_BR200_R04";
+    let delivered = review_envelope_with_task_identity(
+        "BR200_R04_DELIVERED",
+        PushKind::ReviewLhb,
+        "2026-07-30",
+        task_identity,
+    );
+    prepare_reserved(&fixture, &delivered, &append);
+    let sink = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(now())));
+    let sinks: Vec<AuthoritativeSink> = vec![sink.clone()];
+    fixture
+        .coordinator
+        .resume_deliverable(&delivered.decision_identity, &sinks, now())
+        .expect("deliver R-04");
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::Delivered,
+        &delivered.decision_identity,
+    );
+
+    let duplicate = review_envelope_with_task_identity(
+        "BR200_R04_DUPLICATE",
+        PushKind::ReviewLhb,
+        "2026-07-30",
+        task_identity,
+    );
+    let denied = fixture
+        .coordinator
+        .prepare(&duplicate, 1, now())
+        .expect("freeze duplicate R-04 denial");
+    assert_eq!(denied.state, DecisionState::RejectedAuditPending);
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::RejectedDurable,
+        &duplicate.decision_identity,
+    );
+    let decision_count = fixture.query_i64("SELECT COUNT(*) FROM delivery_decisions");
+
+    let evidence = fixture
+        .coordinator
+        .inspect_review_task_occurrence(
+            "2026-07-30",
+            PushKind::ReviewLhb,
+            DeliverySubKind::None,
+            "GLOBAL",
+            task_identity,
+        )
+        .expect("read R-04 occurrence")
+        .expect("existing R-04 occurrence");
+
+    assert_eq!(evidence.decision_identity, delivered.decision_identity);
+    assert_eq!(evidence.state, DecisionState::Delivered);
+    assert!(evidence.schedule_hydration.is_some());
+    assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_decisions"),
+        decision_count,
+        "read-only preflight must not create a third decision"
+    );
 }
 
 fn manual_accepted_pending_fixture(

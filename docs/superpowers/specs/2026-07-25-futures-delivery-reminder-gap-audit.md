@@ -1,206 +1,166 @@
-# Futures Delivery-Day Advance Reminder — Capability Gap Audit
+# Futures Delivery-Day Advance Reminder — Updated Capability Audit
 
-**Status:** Gate A blocked on unified upstream provider contract
-**Date:** 2026-07-25
-**Scope:** CFFEX, SHFE, DCE, CZCE, INE, GFEX
+Business rule: BR-165.
+
+**Status:** Gate B integrated; CFFEX production capability remains unadmitted
+**Date:** 2026-08-01 (live admission rechecked)
+**Scope:** CFFEX implemented; SHFE, DCE, CZCE, INE and GFEX remain explicit gaps
 **Data red lines:** 2.1, 2.2, 2.3, 2.4, 2.7, 2.8, 2.10
 
-## 1. Outcome
+## 1. Corrected outcome
 
-The requested advance reminder is not implemented in the production monitor.
-The live event-calendar path does not acquire or render futures delivery
-schedules, and the unified `magic-market-data-rs` upstream does not expose a
-source-backed futures-delivery contract for any of the six requested
-exchanges.
+The earlier audit concluded that the unified upstream had no futures-delivery
+contract. That conclusion is superseded by the contract retained in the
+currently fixed upstream revision
+`5f1ce93656a55854c844065390520cd4aecd9a14`.
 
-No downstream Gateway or reminder is added in this slice. A local calendar
-formula, contract-code month inference, option expiry, or process time cannot
-replace exchange evidence. Doing so would violate rules 2.1, 2.2, 2.4, 2.7,
-and 2.8.
+`magic-market-data-rs` now exposes:
 
-## 2. Reproducible production evidence
+- `magic_market_core::FuturesDeliveryRequest`;
+- `magic_market_core::FuturesDeliveryEvent`;
+- `magic_market_core::FuturesDeliveryCalendar`;
+- `magic_exchange_rs::CffexClient`;
+- `ProviderId::Cffex` and a strict `cffex-official-notice` diagnostic batch;
+- a production capability flag that remains false until a bounded live probe
+  succeeds and its evidence is reviewed.
 
-The red-capable production check is:
+The diagnostic provider reads only the official HTTPS CFFEX notice path and
+validates IF, IH, IC and IM delivery facts. The notice does not independently
+prove settlement method or last trading date, so those values remain
+`NotProvided` and `None`. It explicitly refuses to infer a date from the common
+“third Friday” convention.
 
-```bash
-rg -n -i -U -S \
-  '((CFFEX|SHFE|DCE|CZCE|INE|GFEX).{0,160}(delivery[_ -]?(date|day)|交割日))|((delivery[_ -]?(date|day)|交割日).{0,160}(CFFEX|SHFE|DCE|CZCE|INE|GFEX))' \
-  src/bin/monitor src/data_gateway
-```
+This closes the typed-contract and downstream-integration blocker for CFFEX,
+but it does not claim that the production capability is currently available.
+It also does not prove delivery-calendar coverage for SHFE, DCE, CZCE, INE or
+GFEX.
 
-Observed output:
+## 2. Current production-admission evidence
 
-```text
-exit_code=1
-<zero matches>
-```
-
-The broad repository check is:
-
-```bash
-rg -n -i -S -g '*.rs' -g '*.toml' -g '*.md' \
-  '交割日|交割日期|delivery.?day|delivery.?date|last.?trade|CFFEX|SHFE|DCE|CZCE|INE|GFEX|期货' \
-  src docs config tests scratchpad
-```
-
-The only requested-behavior match is the explicit P2 backlog in
-`docs/handoffs/HANDOFF_2026-07-22_MONITOR_AND_REMAINING_WORK.md`. No Rust
-producer, scheduler, Gateway, renderer, or delivery call exists.
-
-The current governed event-calendar call chain is:
-
-```text
-BR-139 post-session scheduler
-  -> dispatch_post_session_review
-  -> dispatch_r08_event_calendar_outcome
-  -> prepare_r08_event_calendar
-  -> dispatch_outcome(PushKind::EventCalendar)
-```
-
-Its four inputs are announcements, real holdings, virtual holdings, and Yahoo
-overnight market data. None is a futures delivery schedule. Consequently,
-`PushKind::EventCalendar` existing in production is not evidence that the
-requested reminder exists.
-
-## 3. Reproducible upstream evidence
-
-The upstream capability scan used both the formal checkout and the current
-unified worktree:
+The downstream dependency and remote release were checked again on 2026-08-01:
 
 ```bash
-rg -n -i -S -g '*.rs' -g '*.md' -g '*.toml' \
-  '交割日|交割日期|delivery.?date|delivery.?day|last.?trade.?date|expire.?date|expiry.?date|CFFEX|SHFE|DCE|CZCE|INE|GFEX' \
-  ../magic-market-data-rs target/magic_market_unified_work
+rg -n 'magic-exchange-rs' Cargo.toml Cargo.lock
+git ls-remote https://github.com/Northofqing/magic-market-data-rs.git \
+  refs/heads/main
 ```
 
-Observed result: no futures-delivery record, request, provider trait, provider
-implementation, or six-exchange identity. Incidental matches are K-line names,
-test words such as “future source time”, and stock-option endpoints; none
-provides a futures delivery schedule.
-
-The typed core currently proves the gap:
+The downstream dependency resolves to:
 
 ```text
-magic-market-core::Exchange =
-  Shanghai | Shenzhen | Beijing
-
-magic-market-core::AssetClass =
-  Equity | Index | Fund | Bond | Option
+5f1ce93656a55854c844065390520cd4aecd9a14
 ```
 
-There is no futures asset class or CFFEX/SHFE/DCE/CZCE/INE/GFEX venue. The
-upstream `OptionContract { expiry_month, expiry, ... }` is restricted by its
-Sina adapter to Shanghai ETF options and must not be reinterpreted as a futures
-delivery date.
+The fixed checkout, local upstream HEAD
+`546c59761a9488179d22a9f365f6e11078c6272f`, and remote `main`
+`06b4d0f6295f3d138e06733927c1114c7ded146c` were inspected with:
 
-## 4. Required upstream contract
+```bash
+rg -n 'futures_delivery: false|futures_delivery_calendar' \
+  crates/magic-exchange-rs/src/cffex.rs \
+  crates/magic-exchange-rs/tests/capabilities.rs
+```
 
-Downstream implementation is blocked until the unified upstream exposes, at
-minimum, a typed contract equivalent to:
+Both retain `calendar_capabilities().futures_delivery == false`, and the
+formal trait returns `ExchangeError::Unsupported` before provider I/O. The
+upstream immutable evidence file
+`docs/evidence/2026-07-27-cffex-delivery.md` records:
 
 ```text
-FuturesDeliveryCalendarRequest {
-  from_date,
-  through_date,
-  exchanges,
-}
-
-FuturesDeliverySchedule {
-  exchange,                 // CFFEX/SHFE/DCE/CZCE/INE/GFEX
-  contract_code,
-  product_code,
-  last_trading_date,        // optional only when provider omits it
-  delivery_window_start,    // source fact, not formula output
-  delivery_window_end,      // supports single-day and multi-day delivery
-  settlement_method,        // optional source fact
-  source_document_id,
-  source_document_url,
-  source_document_version,  // publication revision/version, never local code version
-  source_published_at,      // optional only when provider omits it
-  exchange_calendar_ref,    // official calendar/holiday revision supporting the dates
-  special_rule_refs,        // product/contract/holiday/emergency adjustment notices
-  supersedes,               // prior source identity when an exchange amends a schedule
-  evidence,                 // provider, observed_at, immutable batch_id
-}
-
-FuturesDeliveryCalendar::delivery_schedules(request)
-  -> DataBatch<FuturesDeliverySchedule>
+admission_state=failed_transport
+calendar_capabilities.futures_delivery=false
+formal_trait=Unsupported
 ```
 
-The provider implementation must:
+The bounded live probe was rerun on 2026-08-01 for the 2026-08 contract month.
+Both Rustls and Native TLS failed while initializing the official HTTPS
+connection, before an authenticated response. A separate `curl -4` handshake
+failed at the same boundary. Therefore this execution environment still has no
+successful official HTTPS acceptance evidence, the upstream capability remains
+false, and production must continue to return `provider_unsupported`. A
+plain-HTTP result, a local formula, or calling the diagnostic probe from the
+production Gateway is not an authorized workaround.
 
-1. acquire official or explicitly approved exchange-source evidence for all
-   requested venues;
-2. prove pagination/completeness for the requested date interval;
-3. preserve exchange publication time separately from local observation time;
-4. validate exchange, contract identity, date order, duplicate/conflicting
-   identities, and future source time;
-5. retain the exchange publication revision, official holiday-calendar
-   revision, and any product-specific, contract-specific, holiday-adjustment,
-   or emergency-adjustment notice that determines the published dates;
-6. treat a newer exchange amendment as a new immutable source version linked
-   to the superseded record, never an in-place overwrite;
-7. distinguish `Available`, `VerifiedEmpty`, `Partial`, `Unsupported`,
-   `Stale`, `Conflict`, and `Unavailable`;
-8. retain immutable provider/batch evidence suitable for BR-159 acquisition
-   audit.
+## 3. Downstream contract
 
-Missing one exchange cannot be reported as six-exchange coverage. A partial
-batch cannot drive a whole-market “no upcoming delivery” conclusion.
+`stock_analysis` consumes the released client through
+`src/data_gateway/futures_delivery.rs`. Business code must not construct the
+client or retain the exchange URL/parser.
 
-The accepted source must publish actual per-contract dates. Neither the
-downstream nor the unified provider may turn a generic “nth trading day”
-formula into exchange evidence. Holiday calendars and special-rule notices are
-retained to prove why the exchange-published date is applicable and which
-revision was used, not to authorize local date invention.
+Production calls only the formal
+`FuturesDeliveryCalendar::futures_delivery_calendar` trait. The Provider owns
+the capability admission decision; the Gateway must not duplicate its static
+capability flag and must never invoke the diagnostic probe. While the fixed
+revision remains unadmitted, the formal trait returns typed `Unsupported`,
+which the Gateway preserves as `provider_unsupported`.
 
-## 5. Additional downstream prerequisites
+If a later reviewed upstream release admits the production capability, the
+Gateway may accept a batch only when all of the following hold:
 
-Even after the upstream source contract exists, two consumer decisions remain
-explicit:
+1. provenance is complete, sourced from `cffex-official-notice`, and has a
+   non-empty immutable batch ID;
+2. exactly one IF, IH, IC and IM contract exists for the requested year/month;
+3. every record has `ProviderId::Cffex`, the same batch ID and observation
+   time, an official HTTPS notice URL, and `NotProvided` delivery-method
+   semantics;
+4. last trading date is absent unless a future official notice explicitly
+   proves it; it is never copied from delivery date;
+5. all four records agree on the delivery date and the batch `source_at`
+   equals the official notice publication date;
+6. duplicate/conflicting contract identities reject the whole batch;
+7. every provider outcome is committed to the BR-159 acquisition audit.
 
-- **Relevant universe:** there is no typed real futures-position snapshot or
-  user-confirmed futures watchlist in `stock_analysis`. The reminder must state
-  whether it covers all listed contracts, a configured product set, or verified
-  account positions. It must not infer relevance from A-share holdings.
-- **Advance window and ownership:** the requested lead time, dispatch time,
-  same-event dedup identity, retry rules, and notification owner require a new
-  business rule before implementation. The existing 19:00 R-08 scheduler alone
-  does not prove a one-day-advance operational alert will be timely.
+Missing, partial, conflicting or unauditable data is not an empty calendar.
 
-Operation guidance must be derived only from source-backed settlement method
-and verified user exposure. Generic “close or roll” advice without those facts
-is not authorized.
+## 4. Advance-reminder semantics
 
-## 6. Old-module disposition
+The review owner requests the contract month containing the day after the
+review date. R-08 renders a reminder only when the accepted official batch
+states that its delivery date is exactly the next calendar day. A complete
+batch whose delivery date is not the next day is a verified “no reminder”
+result.
 
-| Existing module | Decision |
-| --- | --- |
-| R-08 renderer, governed delivery, BR-139/BR-140 outcomes | retain; possible future consumer after upstream parity |
-| local A-share trading calendar | reject as futures delivery evidence |
-| Sina ETF option expiry contract | reject as futures delivery evidence |
-| generic contract-month/date formulas | reject |
-| downstream direct HTTP to six exchanges | reject; data acquisition belongs in unified upstream |
+While the production capability is unadmitted, downstream reports the
+component as unsupported and does not run the diagnostic parser. If a future
+admitted provider has not yet published the source notice, it returns an
+explicit incomplete/unavailable outcome. Downstream must show that component
+as waiting/unavailable and must not invent the date. Therefore the system can
+provide a one-day-ahead reminder only after both capability admission and an
+official notice published before that reminder.
 
-## 7. Acceptance criteria for a future implementation
+The reminder identity is `(CFFEX, delivery_date, contract_code)`. R-08 derives
+one canonical projection used by both rendering and durable binding: only rows
+whose `delivery_date` exactly equals the reminder session are included, ordered
+by contract code with product code, notice URL and optional last-trading-date
+tie-breakers, and bounded to the four admitted stock-index contracts. Other
+same-month rows remain covered by their immutable provider batch but are not
+reminder facts.
 
-Implementation may start only when:
+## 5. Remaining exchange gap
 
-- all six venue identities and `Futures` exist in the unified typed core;
-- at least one provider adapter returns complete source-backed schedule batches
-  for every requested venue, with an explicit unsupported state where parity is
-  not yet reached;
-- live probes preserve provider time, observed time, batch ID, contract ID, and
-  delivery window, source revision, holiday-calendar reference, and applicable
-  contract/product exception notices;
-- the relevant universe and lead-time business rule are registered;
-- a production test proves one source-backed schedule becomes one governed
-  reminder and the immutable acquisition/delivery audits both commit;
-- unavailable, partial, stale, conflicting, or unauditable evidence fails
-  closed and never becomes a guessed reminder.
+No released typed provider currently proves schedules for:
 
-## 8. Rollback
+- Shanghai Futures Exchange (SHFE);
+- Dalian Commodity Exchange (DCE);
+- Zhengzhou Commodity Exchange (CZCE);
+- Shanghai International Energy Exchange (INE);
+- Guangzhou Futures Exchange (GFEX).
 
-This audit changes no production behavior. Rollback removes only this document
-and its planning records. It must not delete or rewrite market data, positions,
-notifications, or audit evidence.
+The CFFEX result must never be labelled “all futures exchanges.” Those five
+venues require their own official provider contracts and live evidence before
+downstream integration.
+
+## 6. Failure and rollback
+
+- An unadmitted production capability is the formal Provider trait's explicit
+  non-retryable `provider_unsupported`, not a downstream-invented capability
+  result or a diagnostic network attempt.
+- TLS, HTTP, rate-limit and anti-bot failures from the explicit diagnostic
+  probe remain typed and do not admit production capability.
+- Schema, identity, completeness and evidence failures reject the batch.
+- HTTP downgrade, a local calendar formula and cross-source field filling are
+  prohibited.
+- Rollback reverts the CFFEX Gateway and R-08 consumer as one change. It does
+  not delete positions, notifications, provider evidence or acquisition
+  audit records, and it must not restore formula inference or an unsupported
+  capability claim.

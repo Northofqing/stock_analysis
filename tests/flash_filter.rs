@@ -1,8 +1,7 @@
 //! BR-003: 宏观新闻入 macro 通道, 不入 chain_mapper 流
 //!
-//! 修复 R-6: fetch_flash_titles() 必须在去重后、return 前过滤宏观关键词。
-//! 修复 M3: 测试用 filter_macro_titles 纯函数 + 注入已知输入, 不依赖真实网络
-//! (原版依赖 SearchService::fetch_flash_titles 是退化测试 — CI 无网时 trivially pass).
+//! 宏观标题过滤必须发生在已准入的新闻事实投影之后。
+//! 测试用纯函数和已知输入，不依赖真实网络空结果获得退化成功。
 
 use stock_analysis::search_service::service::filter_macro_titles;
 

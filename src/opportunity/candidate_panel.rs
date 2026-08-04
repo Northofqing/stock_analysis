@@ -25,7 +25,7 @@ pub enum CandidateSource {
     VolumeWatchlist,
     VolumeRealTrade,
     IndustryChain,
-    /// P2-News Commit 1: 新闻催化来源 (news_ranker 输出的 A/B 档)
+    /// 新闻催化来源（正式生成由 selection-v2 证据链负责）
     NewsCatalyst,
 }
 

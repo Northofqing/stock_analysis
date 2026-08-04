@@ -89,7 +89,11 @@ pub(super) fn build_rsi_lazy(lf: LazyFrame, period: usize, close_col: &str) -> L
                 lit(100.0f64) - lit(100.0f64) / (lit(1.0f64) + col("_avg_gain") / col("_avg_loss")),
             )
             .alias(alias)])
-        .drop(["_delta", "_gain", "_loss", "_avg_gain", "_avg_loss"])
+        .drop(by_name(
+            ["_delta", "_gain", "_loss", "_avg_gain", "_avg_loss"],
+            true,
+            false,
+        ))
 }
 
 // ────────────────────────────── 辅助指标计算（Vec 版） ──────────────────────────────

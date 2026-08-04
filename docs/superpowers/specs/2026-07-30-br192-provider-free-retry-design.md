@@ -1,7 +1,10 @@
 # BR-192 Provider-Free Authorized Retry Design
 
-**Status:** Gate A independently reviewed `Critical=0 / Important=0 /
-Minor=1`; Minor-1 exact cached-row packaging closed; Gate B/C/D pending
+**Status:** corrective Gate A candidate after multiple historical formal
+reviews and the current three-way read-only precheck. All findings identified
+through the current precheck are repaired in these worktree bytes, but no
+worktree or prior staged identity is accepted authority. Exact staging plus two
+fresh independent C0/I0 reviews remain required; Gate B/C/D pending.
 **Date:** 2026-07-30
 **Rule:** BR-192
 **Data red lines:** 2.1-2.10; exact applicability and DoD are frozen in §0.2
@@ -18,17 +21,66 @@ directly in §0.3 rather than incorporated by reference from any untracked or
 unaccepted document. The retry authorization, scheduling, filtering,
 mutex/ownership, cycle recovery, manual command and evidence contracts below
 are the sole corrective source of truth.
-Contract Gate A passed against design blob
+The earlier contract Gate A review passed against design blob
 `cdeec30f46c18bcbdb45ef12782943b90d1533e6`, plan blob
 `6d04e26f563c9fbb455faef789daf84c17221fab` and BR-192 row SHA-256
 `d3010a1a7a408f8b4ba976de32a0fc046ba6b4f09907d3f2374e1029106cb8ce`
 with `Critical=0 / Important=0 / Minor=1`. Minor-1 was packaging-only and
-is closed by the root's exact cached-row proof: index blob
+was closed by the root's exact cached-row proof: index blob
 `1682b36b3d52ab15c3326ea4d7ebee5628a22db7` contains that reviewed BR-192
 row while the masked non-BR-192 digest was unchanged before and after
-staging. This metadata closure changes no contract. Implementation may enter
-Gate B against those exact accepted identities; Gate B/C/D and live evidence
-remain pending.
+staging. This metadata closure changes no contract. A later metadata review
+found one Important defect: the contract did not freeze the startup behavior
+for counted PushKinds without a real binding producer. The first attempted
+correction then treated five dirty-worktree/later-gate seams as fixed-HEAD
+facts and retained a schema-v4 baseline after HEAD had reached schema v5. Its
+formal verdict was `C0/I2/M0`. That revision attempted to repair both defects
+directly against `HEAD=b4aeee68d2c0259cc968914b3d39e3a89a18a496`; the later
+reviews below found additional blocking gaps in that attempted correction.
+Two fresh reviews of the later exact staged identities returned C1/I6/M1 and
+C0/I3/M0. They rejected the all-disabled speculative stack, missing admission-
+time freshness terminal, incomplete caller enforcement/evidence paths, a
+nonexistent migration-test rename, contradictory v6/newer-version criteria,
+an incoherent RED/GREEN test recipe and an inaccurate new-test file action.
+Sections 0.2, 0.4, 1.1, 1.2, 2.0, 12, 14 and the matching plan/business-rule
+row now repair those findings directly. The resulting identities require a
+fresh independent Gate A review before implementation; Gate B/C/D and live
+evidence remain pending.
+The next exact reviews returned C0/I4/M0 and C1/I3/M1. They found that the
+opaque permit was not implementably specified, expired rows could evade
+terminalization, the written RED bodies actually passed, the first Gate-B file
+action was not the required cutover-test creation, legacy/non-R-09 decisions
+could bypass the producer catalog during retry, the fixed-HEAD multiline
+command was invalid and incomplete, the clean HEAD dependency delta was not
+frozen, and seven entrypoints were called six. Sections 1.1.2, 1.2, 2.1-2.4,
+10 and the matching plan/business-rule row repair those findings; their new
+identities require another fresh review.
+The following fixed-object reviews returned C1/I7/M0 and C1/I3/M1. They found
+that final pre-call no-call expiry had no legal durable attempt terminal, sink
+results could race the expiry authority, cycle evidence remained
+`Indeterminate`, Rule 2.3/R-09 empty semantics and fixed-HEAD caller/R-09
+inventories were contradictory, freshness-clock and typed-outcome ownership
+diverged, the public constant manifest was incomplete, and Task 1/Task 8
+catalog ownership was reversed. Sections 0.2, 0.4, 1.1.2, 2.1-2.4, 4, 5, 9,
+10.1 and the matching plan/business-rule row repair those findings. These
+repairs have new identities and still require fresh independent C0/I0.
+The next two independent reviews returned C1/I3/M0 and C2/I4/M0. They found a
+wrong exact-row hash, floating fixed-source commands, an incomplete caller
+inventory, an unconditional final pre-call recount, no exact Task-1 RED
+command, BR-198 date and BR-200 occurrence-preflight contradictions, a
+one-directional result/ownership relation, rollback exposure to legacy resume,
+and a second begin-error-channel ambiguity. Sections 0.3-0.4, 1.1-1.2, 2.1,
+4, 10-11 and 14 plus the matching plan/business-rule row repair those findings;
+the new staged object identities require a fresh two-reviewer C0/I0 decision.
+The subsequent three-way read-only precheck returned C2/I5/M0, C0/I1/M0 and
+C0/I4/M1 across cross-rule, state-machine and executable-plan audits. It found
+SourceOnly banner authority leakage, BR-198 dependency-closure drift, missing
+BR-200 state mapping/rule IDs/capture tests, an unenforceable terminal-result
+bijection, an unexecutable prerequisite exception, ambiguous initial-versus-
+retry expiry, missing exact RED bodies, BR-202 Gate-D conflict and review-
+history wording drift. Sections 0.1-0.4, 2, 10-12 and 14 plus the matching plan
+and business-rule row repair those findings. Only the next exact staged
+two-reviewer result may be called the current Gate-A decision.
 
 ### 0.2 Data-red-line applicability and Gate A DoD
 
@@ -39,8 +91,8 @@ does not consume the corresponding financial domain:
 | --- | --- | --- |
 | 2.1 Data source | Applies | Retry consumes only the already-frozen canonical envelope and calls zero Provider/Gateway/producer/renderer paths. Provider or storage failure is typed and never becomes mock/default/empty evidence. |
 | 2.2 Missing data | Applies | Missing authorization, disposition, schedule, binding, audit ref, hash, timestamp or terminal payload remains missing and fails closed; no value is synthesized. |
-| 2.3 Bad market data | N/A to new computation | Retry performs no price/return/continuity/split computation and must not reinterpret frozen payload data. The original producer's validated immutable bytes remain unchanged; integrity validation here is covered by 2.7. |
-| 2.4 Market-data freshness | N/A to acquisition | Retry acquires no quote, position, net-value or daily series. Persistent schedule eligibility is delivery governance, not a substitute market timestamp; frozen business-date/source evidence is not refreshed locally. |
+| 2.3 Bad market data | Applies | The R-09 producer rejects an empty or partial pair, non-finite values, missing provider/source/metric/unit/date/order evidence, any row date unequal to the requested review-calendar business date, or internally inconsistent rows before rendering/freezing; verified empty is a typed `Failed`, never `NoData`. Retry does not recompute or reinterpret those validated immutable bytes. The price-positive, adjacent-change, time-continuity and split/dividend subchecks are N/A because this payload contains no price series. |
+| 2.4 Market-data freshness | Applies | Retry acquires no new market data and must never relabel frozen evidence. `ReviewProviderTopN` persists its source business date and exact expiry; retry-candidate discovery, automatic retry admission and manual retry authorization reject `now >= expires_at`, atomically terminalize the retry schedule as audited `ExpiredFreshness`, and call zero sink. This retry expiry does not reject a BR-198 dispatcher-resolved prior-date initial acquisition. Manual authorization cannot extend or revive expiry. |
 | 2.5 Test/live isolation | Applies | Production and invocation-unique `TEST_CODE` database, audit, push-log, lock and command authorities are physically disjoint as frozen in §0.3; cross-mode open is rejected before mutation. |
 | 2.6 Order safety | N/A | This slice cannot create, validate or execute an order and has no cash/quantity/price authority. Its only external effect is delivery through the already-bound notification sink. |
 | 2.7 Audit trail | Applies | Authorization, admission, ownership, uncertainty, cycle terminal slot and sink result are immutable/hash-bound and retained for at least five years. |
@@ -60,8 +112,9 @@ must not be cited to satisfy an acceptance criterion.
 
 - The only upstream data eligible for the frozen
   `ReviewProviderTopN` envelope is one source-ordered, non-empty, complete
-  `ProviderTopNRankings` page from zero-argument
-  `EastmoneyProviderTopNRankingRouter::new()`: current Shanghai business date,
+  `ProviderTopNRankings` page from
+  `EastmoneyProviderTopNRankingRouter::new()` for the dispatcher's exact
+  review-calendar `business_date`,
   canonical A-share identities, `limit=20`, and either `VolumeRatio` or
   `MainNetInflow`. The immutable envelope retains provider order, row business
   date, provider-declared total, inspected count, batch identity and observed
@@ -85,6 +138,139 @@ must not be cited to satisfy an acceptance criterion.
   does not accept an external path, provider, renderer, clock, database,
   append port or sink selector on any production CLI.
 
+### 0.4 Corrective release slice and real consumer
+
+This Gate B slice is not provider-free infrastructure without a consumer. It
+must create and enable exactly one real counted producer:
+`push_templates::dispatch_r09_provider_top_n_outcome`, backed by
+`CapitalDataGateway::provider_top_n_pair`. Those names are **TO BE BUILT**
+against the fixed HEAD and are target-state contract, not evidence that dirty-
+worktree code has been accepted. Candidate worktree code may be adopted only
+after conformance to this design and all Gate B/C checks.
+
+R-09 first performs the BR-194/BR-198 static date preflight and then the
+accepted BR-200 durable occurrence preflight, both before catalog permit
+acquisition, provider construction/acquisition, rendering or sink access.
+BR-198 is not a separately executable prerequisite: this BR-192 Gate-B slice
+owns its implementation atomically with the R-09 gateway/producer and unified
+Magic dependency closure. The date preflight consumes an explicit
+Asia/Shanghai observation created at the monitor context boundary; host-local
+`chrono::Local` and the host `TZ` setting are not authorities. It rejects a
+future review date as
+`provider_top_n_future_date`; returns `ExpectedWait` for the current Shanghai
+business date before 15:35; and permits the current date at/after 15:35 or the
+dispatcher-resolved latest-settled prior review-calendar business date. This is
+not a caller-selected arbitrary historical replay. Every returned ranking row
+must bind its provider `f297` business date exactly to that requested review
+date. The gateway records trusted `request_started_at` and
+`capture_completed_at` observations,
+preserves the provider capture timestamp's raw bytes, parses the complete
+provider value, and requires `request_started_at <= provider_captured_at <=
+capture_completed_at` in addition to business-date/Shanghai-midnight checks.
+A same-date capture before request start or after completion is invalid.
+Cached, current-date-substituted or fallback rows are forbidden. The durable
+preflight
+retains two closed `ProviderCaptureEvidenceV1` values, one per metric. Its
+field manifest is exactly `raw_timestamp_bytes: Box<[u8]>`,
+`parsed_timestamp: DateTime<FixedOffset>` and
+`raw_timestamp_sha256: String`; the constructor/read validator requires
+exactly 64 lowercase ASCII hex characters. The hash is
+`SHA-256("stock_analysis.br198.provider_capture_raw.v1\0" ||
+u64_be(raw_timestamp_bytes.len()) || raw_timestamp_bytes)`; parsing may not
+trim, normalize, re-encode or replace the bytes. The closed pair field manifest
+is exactly `volume_ratio_capture: ProviderCaptureEvidenceV1` followed by
+`main_net_inflow_capture: ProviderCaptureEvidenceV1`; it is stored as the
+single `capture_binding: ProviderTopNPairCaptureBindingV1` field in the
+canonical counted binding. Compact serde JSON uses struct declaration order
+and serializes each boxed byte slice as its exact integer array. There is no
+second pair-only hash: the containing counted-binding canonical SHA-256 binds
+the complete nested values, while read validation independently re-hashes both
+raw fields. A byte mutation, even when it
+parses to the same instant, invalidates the pair before durable prepare/sink.
+calls `inspect_review_task_occurrence` for the exact business-date/R-09
+occurrence. `Some(evidence)` maps exclusively through
+`review_outcome_from_existing_durable`, and preflight error, missing hydration,
+corrupt authority or ambiguous authority fails closed; all such branches use
+zero permit/provider/renderer/sink. Only `None` may obtain the catalog-issued,
+seam-bound `CountedProducerPermit`, call the provider, validate one complete
+`ProviderTopNPair`, render once, freeze a `CountedDeliveryBinding`, and call the
+durable counted entry. The full retry stack therefore has one concrete
+consumer and one Gate-D receipt target. The other fourteen counted kinds
+remain fail-closed. No second counted kind may be enabled in this slice.
+
+The BR-200 occurrence mapping is executable and closed:
+
+| occurrence evidence | R-09 outcome | retryable | next attempt | exact reason code | side effects |
+| --- | --- | --- | --- | --- | --- |
+| unique Delivered with valid hydration | reuse original Delivered | false | none | original durable reason | zero permit/provider/renderer/sink |
+| Delivered with missing hydration | Failed | true | reconciliation schedule | `durable_occurrence_delivered_hydration_pending` | zero permit/provider/renderer/sink |
+| Rejected or Uncertain | Failed | false | none | `durable_occurrence_terminal_failure` plus exact stored terminal state | zero permit/provider/renderer/sink |
+| non-terminal decision | Failed | true | reconciliation schedule | `durable_occurrence_nonterminal_reconciliation_pending` | zero permit/provider/renderer/sink |
+| corrupt, mismatched or ambiguous authority | Failed | false | none | exact typed durable invariant reason | zero permit/provider/renderer/sink |
+| no occurrence | continue normal R-09 path | n/a | n/a | none | permit then provider then renderer then durable sink |
+
+Producer, schedule-transition and hydration evidence for R-09 persist the
+ordered rule ID vector exactly as `[BR-110, BR-140, BR-192, BR-194, BR-198,
+BR-200]`. Missing, duplicate, reordered or additional IDs fail the verifier;
+hydration must join the same frozen vector.
+
+The consumer is reachable from the accepted BR-194 SourceOnly review phase,
+not merely defined as a helper. Fixed HEAD already contains
+`ReviewTask::R09`, its unique membership in the closed `ReviewTask::ALL` set
+after `R08` and before `A10`, label `R-09`, and dependency class `SourceOnly`.
+Gate B preserves those enum/`ALL`/label/classification bytes and semantics; it
+only wires the real R-09 producer and its central dispatch under the combined
+BR-194/BR-198/BR-200 rules above and the existing `--test --review`
+dual-disable before any durable/provider access. The central
+`dispatch_post_session_review` SourceOnly phase invokes
+`dispatch_r09_provider_top_n_outcome(business_date, observed_at)` exactly once
+when R09 is runnable and merges its typed outcome by stable `ReviewTask` order
+with duplicate rejection. The function accepts no `BannerCtx`, banner text,
+AccountMode value or broker snapshot, and neither reads nor constructs those
+authorities.
+The dispatcher returns `Failed` for provider-verified empty, missing, partial,
+stale or invalid evidence, and `Delivered` only after the durable receipt is
+confirmed. It never maps an empty dual batch to `NoData`. R-09 validates finite
+values, non-empty dual
+batches and exact provider/source/metric/unit/date/order evidence as frozen by
+BR-194; missing fields remain missing and fail closed. Initial delivery for a
+valid prior review-calendar date remains runnable even when the envelope's
+retry expiry is already past; `expires_at` is still the first Asia/Shanghai
+midnight after `source_business_date` and governs retry only. A rejected
+closed-day initial delivery therefore has zero retry eligibility and expiry is
+never extended. Gate A/B/C/PR evidence therefore names BR-192, BR-194, BR-198,
+BR-200 and the future BR-202 release-evidence batch. Every planned BR-192
+Gate-B source path cites literal `BR-202` so the later coverage owner can find
+the accepted surface, but BR-192 does not claim or mutate the current BR-202
+Code cell and does not treat the current BR-202 candidate as accepted
+authority. The no-spec-on-unverified-gate rule postpones BR-202 Gate A and all
+later BR-202 progression until BR-192 Gate C. That later, independently
+accepted BR-202 Gate-A object may register the already-accepted BR-192 paths
+and its Gate B may create the isolated wrapper. BR-192 Gate D is then minted
+only by `tools/coverage/run_isolated_gate.sh`; raw coverage commands are
+diagnostic.
+BR-192 Gate B and release are blocked until BR-200 has independently accepted
+Gate C evidence while R-09 remains disabled. BR-198's supporting design records
+the date/capture contract but has no standalone Gate B/C progression: its code,
+tests and evidence are part of this BR-192 Task-8/Gate-B atomic change because
+the required R-09 artifacts do not exist before BR-192 creates them. Untracked
+candidate implementations are not accepted authority, and no BR-198 status may
+claim completion before the containing BR-192 gate is accepted.
+
+Clean fixed HEAD has only a path-based `magic-tdx-rs` declaration and cannot
+build this target by itself. The combined BR-192/BR-198 release closure must
+preserve BR-198's complete unified dependency identity: fourteen direct Magic
+manifest rows and exactly fifteen Magic lockfile packages, including only the
+transitive `magic-market-transport`. Every package is version `0.2.0` from Git
+repository `https://github.com/Northofqing/magic-market-data-rs.git` at exact
+revision `5f1ce93656a55854c844065390520cd4aecd9a14`; the transport crate must not
+become an application-level provider API. Task 8 therefore replaces the
+fixed-HEAD path row and installs/verifies the complete fourteen-direct/fifteen-
+lockfile release set atomically rather than shrinking it to the five packages
+that R-09 itself imports. No dirty-worktree dependency row is an accepted
+prerequisite, and this slice does not adopt unrelated capital gateway
+capabilities merely because their crates are present.
+
 ## 1. Scope and invariants
 
 This change lets a long-lived monitor retry a counted delivery only from the
@@ -95,7 +281,10 @@ admission audit bytes have reached the immutable append authority.
 
 The following are hard invariants:
 
-1. Only `RejectedDurable` can be considered for retry.
+1. Only `RejectedDurable` with exact persisted R-09 producer provenance from
+   the current enabled catalog can be considered for retry. v5/null provenance
+   and all fourteen disabled kinds are ineligible before automatic/manual
+   authorization append.
 2. A row-level boolean is never sufficient authority. Admission must validate
    the decision's unique active `retry_authorization_bindings` row, its
    appended and applied `retry_authorizations` record, the current appended
@@ -131,76 +320,717 @@ The following are hard invariants:
     the transaction proves zero proposed cycle/`Started` rows, rolls back and
     returns definite `RetryCycleAlreadyRunning` plus an exact bound
     `NoRetryCycleCommitted`; no insert or write occurs.
+11. `ReviewProviderTopN` binds `source_business_date` and `expires_at` into the
+    immutable envelope, decision, authorization binding and retry schedule.
+    `expires_at` is the first Asia/Shanghai midnight strictly after
+    `source_business_date`, represented as the exact corresponding UTC
+    instant. Retry-candidate discovery excludes `now >= expires_at`; automatic
+    retry admission and manual retry authorization recheck in the same
+    `BEGIN IMMEDIATE` transaction. Initial R-09 acquisition is outside this
+    retry-expiry gate and follows the BR-198 review-date preflight above.
+    An expired eligible/rejected row transitions once to retained terminal
+    `ExpiredFreshness`, appends/acknowledges immutable
+    `RetryExpiredFreshness`, clears active authorization/schedule ownership,
+    and performs zero provider, renderer and sink calls. Manual authority
+    cannot change this instant or revive the row.
 
 No financial, market-data or order threshold changes. Retry scheduling
 constants govern delivery recovery only.
+
+### 1.1 Closed counted-producer startup catalog
+
+Gate B must materialize one immutable startup catalog whose key set is exactly
+`PushKind::ALL`. Every one of the 15 counted kinds appears exactly once and is
+in exactly one closed state:
+
+- `EnabledDurableBinding { producer_seam }` means the named production seam
+  constructs a real immutable `CountedDeliveryBinding` or canonical durable
+  envelope before it can enter the counted sink;
+- `DisabledNoProducer { reason_code }` means no admitted producer currently
+  satisfies that evidence contract. It must fail visibly before provider/data
+  acquisition and before any sink call. It may not fall back to the generic
+  governor or synthesize a binding.
+
+Startup validates the catalog before any counted producer, acquisition or
+sink is enabled. A missing kind, duplicate kind, unknown state, empty producer
+seam or empty reason is fatal. After validation it emits exactly one line per
+kind in `PushKind::ALL` order. Enabled lines use this exact schema:
+
+The accepted BR-200 prerequisite deliberately leaves
+`ReviewTask::R09.br200_production_capability()` at
+`ReviewTaskProductionCapability::DisabledNoProducer`. BR-192 Gate B must change
+that capability to `EnabledSourceOnly` in the same atomic Task-8 source state
+that installs the exact enabled catalog row, `CapitalDataGateway` pair loader
+and complete R-09 producer. Changing only the capability, only the catalog or
+only the producer is an invalid partial release and must fail tests/checkers
+before provider I/O. R-04/R-08 capability values remain unchanged.
+
+```text
+[BR-192][counted-producer] push_kind=<PushKind> enabled=durable_binding producer=<producer_seam>
+```
+
+Disabled lines use this exact schema:
+
+```text
+[BR-192][counted-producer] push_kind=<PushKind> disabled=no_producer reason=capability_unavailable:<reason_code>
+```
+
+The first Gate B catalog is frozen as follows. This is a target-state contract,
+not a claim of Gate D production evidence:
+
+| PushKind | Startup state | Exact producer seam or reason code |
+| --- | --- | --- |
+| `HoldingPlan` | `DisabledNoProducer` | `holding_plan_counted_binding_unavailable` |
+| `HoldingEvent` | `DisabledNoProducer` | `holding_event_counted_binding_unavailable` |
+| `T0Advice` | `DisabledNoProducer` | `t0_advice_counted_binding_unavailable` |
+| `CandidateTriggered` | `DisabledNoProducer` | `candidate_triggered_counted_binding_unavailable` |
+| `CloseCall` | `DisabledNoProducer` | `close_call_counted_binding_unavailable` |
+| `ForbiddenOps` | `DisabledNoProducer` | `forbidden_ops_counted_binding_unavailable` |
+| `PaperTrade` | `DisabledNoProducer` | `paper_trade_counted_binding_unavailable` |
+| `ReviewMarket` | `DisabledNoProducer` | `provider_capability_not_live_admitted` |
+| `ReviewLhb` | `DisabledNoProducer` | `review_lhb_counted_binding_unavailable` |
+| `ReviewSignal` | `DisabledNoProducer` | `review_signal_counted_binding_unavailable` |
+| `ReviewFailure` | `DisabledNoProducer` | `review_failure_counted_binding_unavailable` |
+| `TomorrowWatch` | `DisabledNoProducer` | `tomorrow_watch_counted_binding_unavailable` |
+| `EventCalendar` | `DisabledNoProducer` | `event_calendar_counted_binding_unavailable` |
+| `DailyReport` | `DisabledNoProducer` | `daily_report_counted_binding_unavailable` |
+| `ReviewProviderTopN` | `EnabledDurableBinding` | `push_templates::dispatch_r09_provider_top_n_outcome` |
+
+The enabled seam is a Gate-B deliverable and has no accepted fixed-HEAD
+implementation. Gate B must build it together with
+`CapitalDataGateway::provider_top_n_pair`; until that atomic change passes,
+startup remains blocked rather than silently treating the row as enabled.
+
+#### 1.1.1 Rejected worktree snapshot (non-authoritative history)
+
+The following 2026-08-01 output is retained only to make the rejected metadata
+attempt auditable. It came from a dirty worktree, is not a fixed-HEAD fact and
+does not authorize any enabled catalog row. In particular, the R-08/R-09 names
+have since changed even in the worktree. None of these lines may be cited by
+Gate B/C/D or by a later design.
+
+```text
+$ nl -ba src/durable_delivery/model.rs | sed -n '155,192p'
+   155	#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
+   156	#[serde(rename_all = "PascalCase")]
+   157	pub enum PushKind {
+   158	    HoldingPlan,
+   159	    HoldingEvent,
+   160	    T0Advice,
+   161	    CandidateTriggered,
+   162	    CloseCall,
+   163	    ForbiddenOps,
+   164	    PaperTrade,
+   165	    ReviewMarket,
+   166	    ReviewLhb,
+   167	    ReviewSignal,
+   168	    ReviewFailure,
+   169	    TomorrowWatch,
+   170	    EventCalendar,
+   171	    DailyReport,
+   172	    ReviewProviderTopN,
+   173	}
+   174
+   175	impl PushKind {
+   176	    pub const ALL: [Self; 15] = [
+   177	        Self::HoldingPlan,
+   178	        Self::HoldingEvent,
+   179	        Self::T0Advice,
+   180	        Self::CandidateTriggered,
+   181	        Self::CloseCall,
+   182	        Self::ForbiddenOps,
+   183	        Self::PaperTrade,
+   184	        Self::ReviewMarket,
+   185	        Self::ReviewLhb,
+   186	        Self::ReviewSignal,
+   187	        Self::ReviewFailure,
+   188	        Self::TomorrowWatch,
+   189	        Self::EventCalendar,
+   190	        Self::DailyReport,
+   191	        Self::ReviewProviderTopN,
+   192	    ];
+```
+
+T0Advice constructs and then transfers the immutable binding:
+
+```text
+$ nl -ba src/bin/monitor/main.rs | sed -n '6077,6096p;7477,7483p'
+  6077	                let binding = durable_delivery_runtime::CountedDeliveryBinding::new(
+  6078	                    business_date,
+  6079	                    decision_id,
+  6080	                    source_binding_canonical,
+  6081	                    durable_delivery_runtime::CountedDeliveryScope::Ticket {
+  6082	                        instrument: decision_binding.instrument().clone(),
+  6083	                    },
+  6084	                    delivery_subject_hash,
+  6085	                    durable_delivery_runtime::CountedDeliveryOrigin::Provider {
+  6086	                        observed_at: Some(evidence.observed_at),
+  6087	                        as_of: Some(business_date),
+  6088	                        ordered_batch_ids: vec![decision_binding.evidence_batch_id().to_owned()],
+  6089	                    },
+  6090	                    None,
+  6091	                    true,
+  6092	                )?;
+  6093	                messages.push(PreparedT0Advice {
+  6094	                    code: plan.code,
+  6095	                    text,
+  6096	                    binding,
+  7477	                                        let outcome = notify::push_counted_with_binding(
+  7478	                                            &prepared.text,
+  7479	                                            notify::PushKind::T0Advice,
+  7480	                                            None,
+  7481	                                            prepared.binding,
+  7482	                                        )
+  7483	                                        .await;
+```
+
+PaperTrade constructs and then transfers the immutable binding:
+
+```text
+$ nl -ba src/bin/monitor/push_templates.rs | sed -n '5503,5514p;5545,5551p'
+  5503	            let binding = crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+  5504	                report.terminal_binding.business_date(),
+  5505	                schedule_occurrence_identity,
+  5506	                source_binding_canonical,
+  5507	                crate::durable_delivery_runtime::CountedDeliveryScope::Ticket {
+  5508	                    instrument: report.terminal_binding.instrument().clone(),
+  5509	                },
+  5510	                delivery_subject_hash,
+  5511	                crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+  5512	                None,
+  5513	                true,
+  5514	            )?;
+  5545	        match crate::notify::push_counted_with_binding(
+  5546	            &item.text,
+  5547	            crate::notify::PushKind::PaperTrade,
+  5548	            None,
+  5549	            item.binding,
+  5550	        )
+  5551	        .await
+```
+
+ReviewLhb constructs a provider/task binding and transfers it through the
+source-only counted entry:
+
+```text
+$ nl -ba src/bin/monitor/push_templates.rs | sed -n '9070,9096p'
+  9070	    let counted_binding = match crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+  9071	        prepared.business_date,
+  9072	        prepared.task_identity,
+  9073	        prepared.source_binding_canonical,
+  9074	        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+  9075	        prepared.delivery_subject_identity,
+  9076	        crate::durable_delivery_runtime::CountedDeliveryOrigin::Provider {
+  9077	            observed_at: Some(prepared.provider_observed_at),
+  9078	            as_of: Some(prepared.business_date),
+  9079	            ordered_batch_ids: vec![prepared.batch_id],
+  9080	        },
+  9081	        Some(task_binding),
+  9082	        true,
+  9083	    ) {
+  9084	        Ok(binding) => binding,
+  9085	        Err(reason) => {
+  9086	            log::error!("[R-04][BR-140][BR-192] counted binding rejected: {reason}");
+  9087	            log_dispatcher_attempt("R-04", false, entries.len(), &reason);
+  9088	            return ReviewTaskOutcome::failed(false, reason);
+  9089	        }
+  9090	    };
+  9091	    let push_result = crate::notify::push_counted_source_only_with_binding(
+  9092	        &prepared.rendered,
+  9093	        crate::notify::PushKind::ReviewLhb,
+  9094	        counted_binding,
+  9095	    )
+  9096	    .await;
+```
+
+EventCalendar constructs a provider/task binding and transfers it through the
+generic counted entry:
+
+```text
+$ nl -ba src/bin/monitor/push_templates.rs | sed -n '8017,8044p'
+  8017	    let counted_binding = match crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+  8018	        prepared.business_date,
+  8019	        prepared.task_identity,
+  8020	        prepared.source_binding_canonical,
+  8021	        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+  8022	        prepared.delivery_subject_identity,
+  8023	        crate::durable_delivery_runtime::CountedDeliveryOrigin::Provider {
+  8024	            observed_at: Some(prepared.provider_observed_at),
+  8025	            as_of: Some(prepared.business_date),
+  8026	            ordered_batch_ids: prepared.ordered_batch_ids,
+  8027	        },
+  8028	        Some(task_binding),
+  8029	        true,
+  8030	    ) {
+  8031	        Ok(binding) => binding,
+  8032	        Err(reason) => {
+  8033	            log::error!("[R-08][BR-140][BR-192] counted binding rejected: {reason}");
+  8034	            log_dispatcher_attempt("R-08", false, prepared.item_count, &reason);
+  8035	            return ReviewTaskOutcome::failed(false, reason);
+  8036	        }
+  8037	    };
+  8038	    let push_result = crate::notify::push_counted_with_binding(
+  8039	        &prepared.rendered,
+  8040	        crate::notify::PushKind::EventCalendar,
+  8041	        None,
+  8042	        counted_binding,
+  8043	    )
+  8044	    .await;
+```
+
+ReviewProviderTopN constructs the canonical task/provider envelope and passes
+it to the only public durable envelope entry:
+
+```text
+$ nl -ba src/bin/monitor/push_templates.rs | sed -n '6386,6406p;6517,6526p'
+  6386	    let envelope = DeliveryEnvelope::new(
+  6387	        prepared.binding.business_date.clone(),
+  6388	        PushKind::ReviewProviderTopN,
+  6389	        DeliverySubKind::None,
+  6390	        "GLOBAL",
+  6391	        prepared.binding.review_task_identity.clone(),
+  6392	        prepared.binding.source_evidence_fingerprint.clone(),
+  6393	        source_binding_canonical,
+  6394	        prepared.binding.delivery_subject_identity.clone(),
+  6395	        prepared.binding.rendered_content.clone(),
+  6396	        false,
+  6397	        Some(task_binding),
+  6398	    )
+  6399	    .and_then(|envelope| {
+  6400	        envelope.with_provider_evidence(
+  6401	            provider_observed_at,
+  6402	            Some(prepared.binding.business_date.clone()),
+  6403	            original_batch_ids,
+  6404	        )
+  6405	    })
+  6406	    .map_err(|error| format!("R-09 durable delivery envelope rejected: {error}"))?;
+  6517	    let envelope = match build_r09_delivery_envelope(&prepared) {
+  6518	        Ok(envelope) => envelope,
+  6519	        Err(error) => {
+  6520	            return ReviewTaskOutcome::failed(
+  6521	                false,
+  6522	                format!("provider_top_n delivery envelope rejected: {error}"),
+  6523	            );
+  6524	        }
+  6525	    };
+  6526	    match crate::durable_delivery_runtime::deliver_envelope(envelope).await {
+
+$ nl -ba src/bin/monitor/durable_delivery_runtime.rs | sed -n '817,824p'
+   817	pub async fn deliver_envelope(
+   818	    envelope: DeliveryEnvelope,
+   819	) -> Result<DurableDispatchEvidence, String> {
+   820	    ensure_startup_reconciled().await?;
+   821	    let state = runtime_state()?;
+   822	    tokio::task::spawn_blocking(move || deliver_envelope_blocking(state.as_ref(), envelope))
+   823	        .await
+   824	        .map_err(|error| format!("BR-192 counted delivery join failed: {error}"))?
+```
+
+#### 1.1.2 Authoritative fixed-HEAD baseline and target delta
+
+The baseline is
+`HEAD=b4aeee68d2c0259cc968914b3d39e3a89a18a496`. The enabled R-09 row is the
+explicit Gate-B target delta in §0.4, not a claim about this baseline. Its
+bounded source blobs are:
+
+```text
+src/durable_delivery/model.rs                 1b5561865674a09266971469f703649c8d299c38
+src/bin/monitor/main.rs                       80be9ddea0eb088194e2daab9a40bfa3067f00a5
+src/bin/monitor/push_templates.rs             2388dce7887a95feee13eadbef6129efdb942f61
+src/bin/monitor/notify.rs                     b7a15cbd46ef7620ec341d2eee98dd76f62560d8
+src/bin/monitor/review_batch.rs               99d89da9454a13af6adc52cc239cc690b8770029
+src/bin/monitor/v14_adapter.rs                535d17d964b40f97fa89adb765a0ecb9f02441bf
+src/bin/monitor/durable_delivery_runtime.rs   a635b90237413577a51d5bc92ae29c40ae2afac4
+src/durable_delivery/schema.rs                794491f8445374af44ee52e57ba2358db7f9c262
+```
+
+Reproduce the source binding and the 15-value closed key set with:
+
+```bash
+git rev-parse b4aeee68d2c0259cc968914b3d39e3a89a18a496
+git rev-parse \
+  b4aeee68d2c0259cc968914b3d39e3a89a18a496:src/durable_delivery/model.rs \
+  b4aeee68d2c0259cc968914b3d39e3a89a18a496:src/bin/monitor/main.rs \
+  b4aeee68d2c0259cc968914b3d39e3a89a18a496:src/bin/monitor/push_templates.rs \
+  b4aeee68d2c0259cc968914b3d39e3a89a18a496:src/bin/monitor/notify.rs \
+  b4aeee68d2c0259cc968914b3d39e3a89a18a496:src/bin/monitor/review_batch.rs \
+  b4aeee68d2c0259cc968914b3d39e3a89a18a496:src/bin/monitor/v14_adapter.rs \
+  b4aeee68d2c0259cc968914b3d39e3a89a18a496:src/bin/monitor/durable_delivery_runtime.rs \
+  b4aeee68d2c0259cc968914b3d39e3a89a18a496:src/durable_delivery/schema.rs
+git show b4aeee68d2c0259cc968914b3d39e3a89a18a496:src/durable_delivery/model.rs | sed -n '155,192p'
+```
+
+Fixed HEAD has no accepted R-09 producer and still exposes generic counted
+entrypoints. The baseline audit therefore inventories actual entrypoints and
+every counted kind; it is not a three-name zero-match proof:
+
+```bash
+for name in push_governor push_governor_v3 push_governor_v3_with_sub_kind \
+            dispatch dispatch_outcome deliver_counted_binding deliver_envelope; do
+  git grep -n -E "(fn|\\.)[[:space:]]*${name}[[:space:]]*\\(" b4aeee68d2c0259cc968914b3d39e3a89a18a496 -- \
+    src/bin/monitor/main.rs src/bin/monitor/review_batch.rs \
+    src/bin/monitor/push_templates.rs src/bin/monitor/notify.rs \
+    src/bin/monitor/v14_adapter.rs src/bin/monitor/durable_delivery_runtime.rs || true
+done
+for kind in $(git show b4aeee68d2c0259cc968914b3d39e3a89a18a496:src/durable_delivery/model.rs |
+  sed -n '/pub const ALL:/,/];/p' |
+  sed -n 's/.*Self::\([A-Za-z0-9_]*\),/\1/p'); do
+  git grep -n -E "PushKind::${kind}|\"${kind}\"" b4aeee68d2c0259cc968914b3d39e3a89a18a496 -- src/bin/monitor || true
+done
+for path in src/bin/monitor/main.rs src/bin/monitor/review_batch.rs \
+            src/bin/monitor/push_templates.rs src/bin/monitor/notify.rs \
+            src/bin/monitor/v14_adapter.rs \
+            src/bin/monitor/durable_delivery_runtime.rs; do
+  git show "b4aeee68d2c0259cc968914b3d39e3a89a18a496:${path}" | rg -n -U \
+    'PushKind::(HoldingPlan|HoldingEvent|T0Advice|CandidateTriggered|CloseCall|ForbiddenOps|PaperTrade|ReviewMarket|ReviewLhb|ReviewSignal|ReviewFailure|TomorrowWatch|EventCalendar|DailyReport|ReviewProviderTopN)[\s\S]{0,1200}(push_governor|dispatch|deliver_counted_binding|deliver_envelope)' || true
+done
+```
+
+The checked-in Gate-B compliance checker replaces this exploratory inventory
+with a syntax-aware/multiline-aware, `cfg(test)`-aware closed classification and
+fails if any of the 15 kinds is absent from its report. The complete fixed-HEAD
+classification below records every direct production call to the seven
+generic/durable entries per kind unless it is explicitly marked test-only;
+line numbers are bound to the source blobs above.
+`support-only` means the kind exists in mapping or hydration code but has no
+producer call into any of the seven generic/durable entries. Test-only callers
+below are not production evidence and the checked-in classifier must exclude
+the lexical `#[cfg(test)] mod tests` region rather than promoting its calls.
+
+| Kind | Complete fixed-HEAD direct producer/caller classification |
+| --- | --- |
+| `HoldingPlan` | `push_templates.rs:2103` `dispatch_outcome` |
+| `HoldingEvent` | `push_templates.rs:2122` `dispatch`; `main.rs:7783` `push_governor_v3`; `main.rs:7863` `notify::push_governor_v3` |
+| `T0Advice` | `push_templates.rs:2140,2146` `dispatch`; `main.rs:8107` `notify::push_governor_v3` |
+| `CandidateTriggered` | `push_templates.rs:7408` `dispatch` |
+| `CloseCall` | test-only: `push_templates.rs:13985` `push_governor`; no fixed-HEAD production caller proven |
+| `ForbiddenOps` | test-only: `push_templates.rs:13882` generic counted caller; no fixed-HEAD production caller proven |
+| `PaperTrade` | `push_templates.rs:4932` `dispatch` |
+| `ReviewMarket` | `main.rs:4638` `push_governor` |
+| `ReviewLhb` | `main.rs:5452` `push_governor`; `push_templates.rs:6790` `dispatch_outcome` |
+| `ReviewSignal` | `main.rs:5484,5679,8200` `push_governor` |
+| `ReviewFailure` | test-only: `push_templates.rs:14246` `push_governor`; no fixed-HEAD production caller proven |
+| `TomorrowWatch` | `main.rs:4689` `push_governor` |
+| `EventCalendar` | `main.rs:4809` `push_governor`; `push_templates.rs:6481` `dispatch_outcome` |
+| `DailyReport` | `main.rs:701,4592,6685,8550,8558,8567,9017` `push_governor_v3`/`push_governor_v3_with_sub_kind` |
+| `ReviewProviderTopN` | support-only: `durable_delivery_runtime.rs:1661,1703`, `v14_adapter.rs:822`; zero producer call |
+
+No production `ReviewProviderTopN` producer/dispatcher exists in fixed HEAD.
+Enum mappings, hydration and tests are consumer/support code. Gate B must
+create the named R-09 producer and gateway atomically with the permit guard;
+a worktree-only wrapper, presentation token or delivery call is not accepted
+evidence and cannot enable startup by itself.
+
+An enabled catalog row still requires Gate D proof from a real push-log and
+delivery audit join; otherwise release remains blocked rather than silently
+reclassifying it as operational. A disabled row must emit its exact startup
+banner even when no attempt occurs. If a disabled path is invoked later, it
+must emit the same reason code and return before acquisition/sink. Enabling
+any row other than the one R-09 row above is a business-rule change: update
+BR-192 and this table first, name the real producer seam, add an end-to-end
+binding test, and obtain fresh Gate A review.
+
+### 1.2 Exhaustive permit and caller enforcement
+
+The catalog is executable authority, not a startup banner registry. Its only
+successful admission product is a non-serializable, non-cloneable
+`CountedProducerPermit` bound to exact `PushKind`, exact `producer_seam` and
+the validated process-lifetime catalog identity. Only the catalog module may
+construct it. `ReviewProviderTopN` must acquire the permit before invoking
+`CapitalDataGateway::provider_top_n_pair`; every disabled counted-specific
+loader, including R-04 and R-08, checks the catalog before its provider call
+and returns its exact reason without acquisition.
+
+Every production counted entrypoint is covered, including multiline calls and
+indirection through template IDs or labels. The enforced set is:
+
+```text
+notify::{push_governor,push_governor_v3,push_governor_v3_with_sub_kind}
+push_templates::{dispatch,dispatch_outcome}
+durable_delivery_runtime::{deliver_counted_binding,deliver_envelope}
+all counted-specific loaders/callers in main.rs, review_batch.rs,
+push_templates.rs, notify.rs and v14_adapter.rs
+```
+
+This is seven generic/durable entrypoints: three governors, two dispatchers
+and two durable-delivery entries.
+
+The generic governor/dispatch entries cannot manufacture a permit. For a
+counted kind they accept only a previously validated durable binding carrying
+the same catalog permit identity; otherwise they return exact
+`counted_binding_required` before sink. `deliver_counted_binding` and
+`deliver_envelope` revalidate kind/seam/permit/binding before reservation or
+sink. This closes direct calls as well as startup wiring. “Before acquisition”
+means before any provider/data call caused solely by that counted producer;
+shared market data acquired for an independent non-counted business purpose
+is not reclassified, but it cannot reach a counted sink without the permit.
+
+The owning module and crossing API are frozen, not left to implementation
+choice. `src/durable_delivery/counted_producer_catalog.rs` is the single
+library authority used by the monitor, coordinator and production
+authorization CLI. The module remains private, while only the exact opaque
+types/functions listed in the root manifest are re-exported:
+
+Implementation ownership is also exact. Task 1 privately creates the catalog
+module, closed catalog, permit, attestation, denial, acquisition function and
+the private `CountedDeliveryBinding::new_permitted` consumption wiring, and may
+use them only through private library paths while that task is incomplete.
+Task 1 may edit the durable-delivery root only to add the private
+`mod counted_producer_catalog;` declaration; it does **not** change the public
+root surface or expose a partial public API. Task 8 is the sole owner of the
+atomic public root re-export and monitor/CLI integration edit: it re-exports
+the already-defined items byte-for-byte from the final manifest in §9 and then
+connects their production consumers. No intermediate task may duplicate,
+rename or independently construct the permit.
+
+```rust
+pub struct CountedProducerPermit {
+    push_kind: PushKind,
+    producer_seam: &'static str,
+    catalog_identity_sha256: String,
+    private: CountedProducerPermitPrivate,
+}
+
+struct CountedProducerPermitPrivate(());
+
+pub struct CountedProducerAttestation {
+    push_kind: PushKind,
+    producer_seam: String,
+    catalog_identity_sha256: String,
+    attestation_sha256: String,
+    source_business_date: NaiveDate,
+    expires_at: DateTime<Utc>,
+}
+
+pub enum CountedProducerDenied {
+    CatalogInvalid { reason_code: &'static str },
+    ProducerNotEnabled {
+        push_kind: PushKind,
+        producer_seam: String,
+        reason_code: &'static str,
+    },
+}
+
+pub fn acquire_counted_producer_permit(
+    push_kind: PushKind,
+    producer_seam: &'static str,
+) -> Result<CountedProducerPermit, CountedProducerDenied>;
+
+impl CountedProducerPermit {
+    pub fn into_attestation(
+        self,
+        source_business_date: NaiveDate,
+        expires_at: DateTime<Utc>,
+    ) -> Result<CountedProducerAttestation, CountedProducerDenied>;
+}
+```
+
+`CountedProducerPermit` has private fields and constructor, implements no
+`Clone`, `Copy`, `Serialize`, `Deserialize` or `Default`, and is consumed once
+by `CountedDeliveryBinding::new_permitted(permit, ...)`. That constructor is
+the sole non-test binding constructor and persists a private
+`CountedProducerAttestation`; fixed HEAD's public `CountedDeliveryBinding::new`
+is removed from production visibility. A cfg(test)-only factory can mint a
+TEST_CODE permit but cannot produce a production catalog identity. Compile-
+fail contract tests prove external/private construction, `.clone()`, serde
+serialization and use of the old constructor all fail.
+
+The public permit, attestation and acquisition items above are usable across
+the library/binary crate boundary, but only the permit and attestation are
+authority-bearing opaque values: their fields and all constructors stay private
+to the library module. `CountedProducerDenied` is intentionally a public,
+constructible closed error enum, not an authority value; constructing or
+matching a denial can never mint a permit or attestation. The private marker is
+exactly the zero-sized
+`CountedProducerPermitPrivate(())`; no constructor or field is visible outside
+the catalog module. The sole permitted production caller of the public
+consuming method is `CountedDeliveryBinding::new_permitted`; the all-caller
+checker rejects any other call. That constructor calls
+`CountedProducerPermit::into_attestation(self, source_business_date,
+expires_at)` internally. The method validates the current catalog again,
+requires `expires_at` to be the first
+Asia/Shanghai midnight after `source_business_date`,
+computes the exact attestation hash and returns the opaque
+`CountedProducerAttestation`; the attestation implements no `Deserialize` or
+public constructor and exposes only read-only accessors used by
+`new_permitted`. `CountedProducerDenied` is the closed enum above: catalog
+shape/hash failures use `CatalogInvalid`, while disabled kinds and seam
+mismatch use `ProducerNotEnabled` with the catalog's exact reason code. No
+caller may convert either case to a successful binding or infer a permit from
+persisted bytes.
+
+The coordinator and `authorize_delivery_retry_production` call the same
+module-private `validate_persisted_counted_producer_attestation`; there is no
+second catalog copy in a binary. This validator recomputes the exact catalog
+and attestation hashes from the persisted companion row, accepts only the
+enabled R-09 tuple, and returns typed `RetryProducerNotEnabled` otherwise.
+
+`CountedDeliveryBinding` freezes
+`push_kind,producer_seam,catalog_identity_sha256,attestation_sha256` into the
+canonical `DeliveryEnvelope`. Hash construction uses a separate private
+`CountedProducerAttestationPreimageV1` which contains exactly
+`schema_version,rule_id,push_kind,producer_seam,
+producer_catalog_identity_sha256,source_business_date,expires_at` in that
+declared order and contains no digest field. The stored
+`attestation_canonical` BLOB and hash preimage are the literal domain bytes
+`stock_analysis.durable_delivery.br192.counted_producer_attestation.v1\0`
+followed by compact UTF-8 canonical JSON for that preimage.
+`producer_attestation_sha256=sha256_hex(attestation_canonical)` is computed
+first and is then copied into the separate persisted/envelope evidence
+projection. The evidence projection is never itself the hash preimage. The
+private validator rebuilds the preimage from the projection, requires and
+strips the exact prefix, decodes and reserializes the JSON suffix byte-for-byte,
+recomputes the digest and compares projection, typed columns and SQL UDF;
+domain omission, duplication, alternate prefix or digest self-inclusion fails
+closed.
+The startup catalog identity is the lowercase SHA-256 of its exact 15 ordered
+rows under domain
+`stock_analysis.durable_delivery.br192.counted_producer_catalog.v1\0`.
+`deliver_counted_binding` consumes the binding and produces a private
+`PermittedDeliveryEnvelope`; raw `deliver_envelope(DeliveryEnvelope)` loses
+production visibility and the private envelope entry accepts only that
+wrapper. It rederives the catalog and attestation hashes and requires the
+active catalog row to be the same enabled kind/seam before reservation or
+sink. Terminal replay remains a separate typed replay API and cannot create a
+new counted delivery.
+
+`DeliveryEnvelope` gains one private compatibility-safe field owned by
+`src/durable_delivery/model.rs`:
+
+```rust
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CountedProducerAttestationPreimageV1 {
+    schema_version: u8,
+    rule_id: String,
+    push_kind: PushKind,
+    producer_seam: String,
+    producer_catalog_identity_sha256: String,
+    source_business_date: NaiveDate,
+    expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CountedProducerAttestationEvidenceV1 {
+    schema_version: u8,
+    rule_id: String,
+    push_kind: PushKind,
+    producer_seam: String,
+    producer_catalog_identity_sha256: String,
+    producer_attestation_sha256: String,
+    source_business_date: NaiveDate,
+    expires_at: DateTime<Utc>,
+}
+
+// inside DeliveryEnvelope
+#[serde(default, skip_serializing_if = "Option::is_none")]
+counted_producer_attestation: Option<CountedProducerAttestationEvidenceV1>,
+```
+
+The sole setter is a public consuming
+`DeliveryEnvelope::with_counted_producer_attestation(attestation)` whose only
+permitted production caller is `CountedDeliveryBinding::new_permitted`; the
+all-caller checker rejects every other caller. It validates kind, business
+date, exact expiry and attestation hash before storing the private projection.
+Legacy v5 canonical bytes deserialize to `None` and reserialize byte-identically
+because `None` is skipped. The coordinator reads this private projection to
+insert `counted_producer_attestations` before the decision in the same
+transaction. No public raw-field setter, serde builder or binary-local mirror
+exists.
+
+Only the attestation bytes—not the live permit—are persisted. Provider-free
+retry revalidates those bytes against the active catalog. A v5 row or any
+envelope without the four exact attestation fields is permanently typed
+`RetryProducerNotEnabled { reason_code: "legacy_unpermitted_producer" }`;
+migration leaves the companion row absent and never backfills or promotes it. Manual
+authorization, automatic authorization,
+candidate discovery and transactional admission all require exact
+`PushKind::ReviewProviderTopN`, seam
+`push_templates::dispatch_r09_provider_top_n_outcome`, current catalog hash
+and attestation hash before creating/applying authorization or reserving a
+sink attempt. The other fourteen kinds return typed
+`RetryProducerNotEnabled` with zero authorization append, provider, renderer
+or sink. `RetryCandidate` carries all four values so admission can rederive
+them; it never trusts only a decision identity.
+
+Gate B generates a multiline-aware, reproducible inventory over every value in
+`PushKind::ALL`, all seven generic entry names above, template IDs and display
+labels. The checker fails on an unclassified counted call, a missing kind, an
+extra public counted entry, a disabled loader that acquires first, or an
+enabled seam other than exact R-09. Single-line grep or a three-name zero-match
+claim is insufficient.
 
 ## 2. Authoritative data model
 
 ### 2.0 Versioned additive migration
 
-The repository is already at durable-delivery SQLite `SCHEMA_VERSION=4`.
-Schema v4 owns every pre-BR-192 authority, including the BR-194 terminal-replay
+Fixed HEAD is already at durable-delivery SQLite `SCHEMA_VERSION=5`.
+Schema v5 owns every pre-BR-192 authority, including the BR-194 terminal-replay
 attempt/completion tables, both replay audit kinds, their foreign keys and the
-fixed authority-manifest semantics. This slice participates in the single
-shared `v4 -> v5` migration; it must not reuse v4, allocate a competing schema
-version, or drop/rebuild/weaken any BR-194 object or audit kind.
-Schema initialization has six explicit paths, all inside the coordinator's
+fixed authority-manifest semantics. BR-192 adds exactly one `v5 -> v6`
+migration; it must not reuse v5, rewrite the accepted v4-to-v5 migration,
+allocate a competing schema version, or drop/rebuild/weaken any BR-194 object
+or audit kind. Schema initialization has seven explicit paths, all inside the
+coordinator's
 existing migration transaction:
 
-- a fresh `user_version=0` database creates the complete v5 schema directly;
-- v1 migrates `v1 -> v2 -> v3 -> v4 -> v5` without skipping validation;
-- v2 migrates `v2 -> v3 -> v4 -> v5`;
-- v3 migrates `v3 -> v4 -> v5`;
-- v4 runs the one shared additive `v4 -> v5` migration; and
-- v5 performs validation only and is safe to initialize repeatedly.
+- a fresh `user_version=0` database creates the complete v6 schema directly;
+- v1 migrates `v1 -> v2 -> v3 -> v4 -> v5 -> v6` without skipping validation;
+- v2 migrates `v2 -> v3 -> v4 -> v5 -> v6`;
+- v3 migrates `v3 -> v4 -> v5 -> v6`;
+- v4 runs the accepted `v4 -> v5` migration, validates v5, then migrates to v6;
+- v5 runs the one additive `v5 -> v6` migration; and
+- v6 performs validation only and is safe to initialize repeatedly.
 
-Any `user_version > 5` fails closed before schema mutation. SQLite cannot add a
+Any `user_version > 6` fails closed before schema mutation. SQLite cannot add a
 validated foreign-key-bearing current-authorization column to the existing
 `delivery_decisions` table with this migration's required semantics. The
-v4-to-v5 migration therefore does **not** use `ALTER TABLE ... ADD COLUMN` for
+v5-to-v6 migration therefore does **not** use `ALTER TABLE ... ADD COLUMN` for
 that reference and does not rebuild the live decision authority. It creates the
-v5 companion authorities `retry_authorization_bindings` and
+v6 companion authorities `retry_authorization_bindings` and
 `retry_attempt_bindings` plus authorization, authorization-event, schedule,
 cycle, immutable cycle-failure-payload and cycle-audit objects. The unique
 `Active` companion binding is the current authorization reference.
 
-Fresh v5 and every upgrade path have the same manifest: neither has a
+Fresh v6 and every upgrade path have the same manifest: neither has a
 `delivery_decisions.current_retry_authorization_identity` column, and both have
 the same companion tables, foreign keys, partial unique index and lifecycle
-triggers. The v5 manifest also contains every byte-compatible v4 BR-194 replay
-table/index/audit-kind definition and replaces only its two authority INSERT
-trigger definitions with the shared deterministic canonical-hash check defined
-below. In every path `retry_cycles.cycle_ordinal` is
+triggers. The v6 manifest contains every byte-compatible v5 BR-194 replay
+table/index/audit-kind/trigger definition unchanged. BR-192 must not silently
+redefine an accepted BR-194 trigger; any shared hash strengthening requires a
+separately registered rule and fresh review. In every path
+`retry_cycles.cycle_ordinal` is
 `INTEGER NOT NULL UNIQUE CHECK(cycle_ordinal >= 1)`; ordinal/identity/
 canonical-preimage fields are immutable, the retained row is nondeletable and
 cycle insertion must rederive the identity from the exact ordinal and frozen
-fields. The v4-to-v5 transaction:
+fields. The v5-to-v6 transaction:
 
 1. begins with foreign-key enforcement enabled and snapshots all existing
-   v4 schema objects, BR-194 replay/audit definitions, decision identities, row
+   v5 schema objects, BR-194 replay/audit definitions, decision identities, row
    counts and canonical/hash columns;
-2. creates every v5 companion object and atomically strengthens the shared
-   canonical-hash authority triggers inside that one transaction;
+2. creates every v6 BR-192 companion object without rewriting pre-existing v5
+   objects;
 3. deliberately copies **zero** legacy `retry_authorized` booleans into the new
    authority tables, because a boolean is not authorization evidence;
-4. leaves all v4 data, including BR-194 replay attempts/completions and replay
+4. leaves all v5 data, including BR-194 replay attempts/completions and replay
    audit rows, in place and verifies their snapshotted values are byte-for-byte
    unchanged;
-5. validates the complete fresh-v5 manifest, `foreign_key_check`, indexes,
+5. validates the complete fresh-v6 manifest, `foreign_key_check`, indexes,
    deterministic function-backed triggers and all new-table invariants; and
-6. sets `user_version=5` only as the final statement before commit.
+6. sets `user_version=6` only as the final statement before commit.
 
 Any create, snapshot comparison, data-preservation or validation failure rolls
 the whole migration back, including `user_version`. Object detection is used
-only to diagnose an invalid/repeated initialization; a database claiming v4
+only to diagnose an invalid/repeated initialization; a database claiming v5
 with a missing or incompatible required baseline object fails before migration,
-and a database claiming v5 with a missing or incompatible object fails closed.
+and a database claiming v6 with a missing or incompatible object fails closed.
 
-Because historical v2/v3/v4 binaries reject or cannot validate the newer schema
-contract, rollback must not launch them against a v5 database. Section 14 uses
+Because historical v2/v3/v4/v5 binaries reject or cannot validate the newer
+schema contract, rollback must not launch them against a v6 database. Section
+14 uses
 a newly built forward-compatible rollback binary that understands and validates
-v5, retains all v4 baseline and v5 objects and records, but restores the
+v6, retains all v5 baseline and v6 objects and records, but restores the
 previous runtime behavior
 with the retry runner disabled.
 
@@ -216,7 +1046,11 @@ fixture connections call that seam at one descriptor-attestation-safe point:
 ```text
 open SQLite handle
   -> attest and retain the main database descriptor
-  -> materialize WAL/SHM only through the existing journaling capability
+  -> run only the audited journaling-capability bootstrap sequence:
+     install the fixed 5-second busy timeout; set journal_mode=WAL; set
+     synchronous=FULL; execute BEGIN IMMEDIATE; ROLLBACK; read back only
+     journal_mode and synchronous
+  -> materialize WAL/SHM through that sequence
   -> re-attest main and attest/retain WAL/SHM
   -> validate the complete bound live connection
   -> register and self-test sha256_hex
@@ -224,10 +1058,17 @@ open SQLite handle
   -> inspect/create/migrate/validate schema
 ```
 
-No UDF callback, PRAGMA configuration, schema read, DDL or transaction runs
-before the existing main/WAL/SHM descriptor binding is complete. No schema
-inspection, migration, trigger execution or application query runs before UDF
-registration/self-test. No caller may register an alias or a different
+Before the existing main/WAL/SHM descriptor binding is complete, the sole
+exception is the audited journaling-capability bootstrap sequence above, whose
+only purpose is to materialize and validate WAL/SHM. No UDF callback, other
+PRAGMA/configuration, schema read, DDL or application transaction/query may run
+before complete binding. No schema inspection, migration, trigger execution or
+application query runs before UDF registration/self-test. The sequence is
+centralized, source-checked and tested to reject any additional statement. It
+may not enable foreign keys, read `user_version`, `sqlite_master` or application
+rows, execute DDL, register/invoke a UDF, or perform another PRAGMA/query/
+transaction. Omitting or reordering any of its five steps fails sidecar
+attestation and bootstrap. No caller may register an alias or a different
 callback.
 
 The registered scalar function has this frozen contract:
@@ -255,18 +1096,18 @@ callback failure or self-test mismatch fails the connection open with the
 existing typed configuration channel and stable reason
 `durable_sha256_udf_unavailable`; it is never a WARN-only degradation.
 
-Every v5 authority trigger that joins canonical bytes to a stored digest,
+Every v6 BR-192 authority trigger that joins canonical bytes to a stored digest,
 including the retained BR-194 replay Started/Completed audit triggers and the
 new BR-192 authorization/cycle/failure triggers, requires both byte-exact joins
-and `sha256_hex(canonical_blob)=stored_lowercase_sha256`. The v4-to-v5 migration
-drops and recreates only the two BR-194 INSERT trigger definitions that lacked
-this recomputation; replay tables, rows, audit kinds, foreign keys and manifest
+and `sha256_hex(canonical_blob)=stored_lowercase_sha256`. The v5-to-v6 migration
+does not drop/recreate accepted BR-194 trigger definitions; replay tables, rows,
+audit kinds, foreign keys and manifest
 identities remain unchanged. The v5 validator compares normalized trigger SQL
 against this exact function name/arity and rejects a trigger that merely
 compares two caller-supplied hash columns.
 
 The checked-in BR-192 evidence verifier independently hashes every canonical
-BLOB in Rust and validates the v5 trigger catalog. The BR-194 Python release
+BLOB in Rust and validates the v6 trigger catalog. The BR-194 Python release
 verifier does **not** call the Rust connection-local seam, register a Python
 SQLite callback or execute any DML/trigger. It opens only its isolated
 read-only verification copy, reads `PRAGMA user_version`, table rows and
@@ -278,7 +1119,8 @@ does not claim or emulate rusqlite `FunctionFlags`, including
 
 The shared compliance checker validates `Cargo.toml`, the attestation-safe
 central Rust registration order, every Rust/rusqlite connection constructor,
-the v4-to-v5 migration, both verifiers and the trigger catalog. Its mutation
+the accepted v4-to-v5 migration, the new v5-to-v6 migration, both verifiers and
+the trigger catalog. Its mutation
 suite must reject removal/renaming of the `functions` feature, registration or
 self-test; registration before complete descriptor binding or after schema
 work; Python `create_function`/DML/trigger execution; TEXT/NULL coercion;
@@ -288,6 +1130,36 @@ BR-194 verifier; and a fresh/migrated manifest mismatch.
 
 ### 2.1 Frozen rejection disposition
 
+Add one immutable `counted_producer_attestations` companion row in the same
+`BEGIN IMMEDIATE` transaction that first inserts an enabled counted decision:
+
+```text
+decision_identity                         PRIMARY KEY; deferred FK to delivery_decisions
+push_kind                                 immutable; exactly ReviewProviderTopN
+producer_seam                             immutable exact R-09 seam
+producer_catalog_identity_sha256          immutable lowercase SHA-256
+producer_attestation_sha256               immutable lowercase SHA-256
+source_business_date                      immutable non-null ISO date
+expires_at                                immutable non-null UTC timestamp
+attestation_canonical                     immutable BLOB
+created_at
+```
+
+The FK is `DEFERRABLE INITIALLY DEFERRED`. The companion must be inserted first
+while no decision with that identity exists; its insert trigger rejects an
+already-existing decision. The subsequent `delivery_decisions` insert trigger
+requires the exact companion for every `ReviewProviderTopN` decision and joins
+its kind/canonical identity before the transaction can commit. This
+companion-first/deferred-FK protocol makes “same transaction as first decision
+insert” database-enforceable rather than a repository convention. The
+companion trigger recomputes `producer_attestation_sha256` from
+`attestation_canonical` with `sha256_hex`, requires the exact field order/domain
+from §1.2 and requires `expires_at` to be the first Asia/Shanghai midnight after
+`source_business_date`. Every update or delete is rejected. The v5-to-v6 migration creates the empty companion table;
+it does not synthesize rows for existing decisions. Consequently v5 decisions
+and any new unpermitted decision have no attestation row and are typed
+`RetryProducerNotEnabled`, never inferred from their envelope bytes or kind.
+
 `delivery_disposition_payloads` remains the authority for a definite
 rejection. A retry-eligible disposition must be:
 
@@ -296,7 +1168,10 @@ rejection. A retry-eligible disposition must be:
 - appended successfully with a non-empty `immutable_audit_ref`;
 - hash-valid against its stored canonical bytes;
 - bound to the same decision identity and frozen envelope hash;
-- definite rather than uncertain; and
+- definite rather than uncertain;
+- bound in its frozen envelope to exact enabled-producer provenance:
+  `push_kind=ReviewProviderTopN`, exact R-09 seam, current catalog identity
+  hash and valid producer-attestation hash; and
 - either the source of an automatically-created frozen-rejection
   authorization or the target of one authenticated manual authorization.
 
@@ -309,6 +1184,10 @@ The producer-supplied `DeliveryEnvelope.retry_authorized` is not an admission
 authority. Existing callers may continue constructing old envelopes during
 the migration, but initial envelope insertion cannot make a decision a retry
 candidate.
+Existing v5 decisions have no producer-attestation companion row after
+migration. They are never inferred from `push_kind`, template ID, task
+identity, content or historical caller location and therefore cannot receive
+either automatic or manual retry authorization.
 
 ### 2.2 Append-only retry authorization state machine
 
@@ -320,6 +1199,10 @@ decision_identity                         REFERENCES delivery_decisions
 rejection_disposition_identity             REFERENCES delivery_disposition_payloads
 source_kind                               FrozenRejection | ManualOperator
 command_identity                           nullable; required for ManualOperator
+push_kind                                  immutable; exactly ReviewProviderTopN
+producer_seam                              immutable exact R-09 seam
+producer_catalog_identity_sha256           immutable lowercase SHA-256
+producer_attestation_sha256                immutable lowercase SHA-256
 authorization_canonical                    immutable BLOB
 authorization_sha256                       immutable TEXT
 append_state                               PendingAppend | Appended
@@ -330,6 +1213,12 @@ created_at
 applied_at
 UNIQUE(decision_identity, rejection_disposition_identity)
 ```
+
+Creation first joins these four producer fields to the frozen envelope and
+current catalog. A mismatch, missing/null migrated-v5 field, disabled kind or
+non-R-09 seam returns typed `RetryProducerNotEnabled` before inserting the
+authorization row. Recovery repeats that join before append, apply and active-
+binding creation; it never retargets an authorization to a later catalog.
 
 Canonical identity/hash/source/decision/disposition/command/`authorized_at`
 fields are immutable by trigger. For `ManualOperator`, `authorized_at` must
@@ -436,14 +1325,38 @@ from the start/binding fields and advances it to `InterruptedUncertain`; no
 `Started` quarantine row is externally observable. The row stores exact
 decision, attempt-binding, execution-cycle, reservation generation, owner
 identity, positive `i64` fence token, persisted `send_started_at`,
-`send_consumed=true`, state
-`Started|TerminalRecorded|InterruptedUncertain` and terminal timestamp/reason
-when present. Identity/generation/owner/fence/start time and `send_consumed`
-are immutable; the row cannot be deleted or reset. Only monotonic
-`Started -> TerminalRecorded|InterruptedUncertain` is legal; the only direct
+`send_consumed=true`, nullable exact `pre_call_freshness_observed_at`, nullable
+write-once `terminal_sink_result_identity`, state
+`Started|FreshnessExpiredBeforeExternalCall|TerminalRecorded|
+InterruptedUncertain` and terminal timestamp/reason when present.
+Identity/generation/owner/fence/start time and `send_consumed` are immutable;
+`terminal_sink_result_identity` is NULL before terminal-result persistence and
+may be written exactly once by the transaction that advances to
+`TerminalRecorded`; it is immutable thereafter and references
+`sink_results.result_event_identity` through a `UNIQUE DEFERRABLE INITIALLY
+DEFERRED` foreign key. The terminal transaction updates the ownership pointer
+first and inserts the result before commit. The deferred FK makes a missing
+result fail commit, while the unique constraint prevents two ownership rows
+from naming one result. The row cannot be deleted or reset. Only monotonic
+`Started -> FreshnessExpiredBeforeExternalCall|TerminalRecorded|
+InterruptedUncertain` is legal; the only direct
 terminal insert is the atomic appended-start quarantine described above.
-`TerminalRecorded` must be created in the same transaction as the exact
-authoritative terminal sink result. `InterruptedUncertain` requires no terminal
+`FreshnessExpiredBeforeExternalCall` requires the private pre-call observation
+at/after expiry, exact terminal reason/time, no sink result and the
+same-transaction deferred `retry_pre_call_expiry_authorities` companion plus
+Pending expiry authority. Its transition trigger rechecks absence of an exact
+attempt/decision sink result immediately before the ownership update; an
+earlier application read is insufficient. `TerminalRecorded` must persist the
+pre-call observation and exact `terminal_sink_result_identity` in the same
+transaction as the authoritative terminal sink result. The ownership update
+trigger permits only a one-time `Started/NULL -> TerminalRecorded/non-NULL`
+transition and freezes the pointer and terminal fields thereafter. The reverse
+`sink_results` insert trigger applies to every retry-attempt result satisfying
+the exact predicate `authoritative_for_state=1 AND late_after_fence=0`; it
+requires one same-attempt ownership already in `TerminalRecorded` with the
+same result identity, decision identity and fence token. Late or
+non-authoritative results never satisfy this terminal relation. Every other ownership
+state requires that identity to remain NULL. `InterruptedUncertain` requires no terminal
 sink result and the exact typed reason
 `ProcessInterruptedAfterSinkStart`.
 
@@ -460,6 +1373,8 @@ both one `FrozenRejection` authorization row **and** the decision's initial
 rejection disposition. That initial schedule is exactly
 `automatic_attempts_started=0`,
 `next_eligible_at=rejection.observed_at + 30s`, `exhausted_at=NULL`,
+`source_business_date=envelope.source_business_date`,
+`expires_at=envelope.expires_at`, `terminal_state='Active'`,
 `last_attempt_binding_identity=NULL`, `version=0`. A committed frozen
 rejection authorization without that exact schedule, or a schedule created in
 a later transaction, is invalid and cannot be reconciled into an active
@@ -517,6 +1432,20 @@ Recovery drains authorizations to a fixed point before building candidates:
   row; both may append the same bytes, but only one acknowledgement/application
   CAS wins.
 
+Pre-call expiry authority has stricter recovery precedence than generic retry
+orphan quarantine. Before classifying any prior-boot `AttemptInFlight`, appended
+start or consumed ownership as uncertain, recovery looks for the exact
+same-attempt conjunction of immutable pre-call companion,
+`FreshnessExpiredBeforeExternalCall` ownership and matching Pending/Appended
+`ReservedExpiredBeforeSink` expiry. An exact conjunction resumes only the
+stored expiry: append if Pending, acknowledge, then execute Transaction B in
+§4. It is definite zero-call evidence and must never be changed to
+`InterruptedUncertain` or `ProcessInterruptedAfterSinkStart`. A missing member,
+identity/generation/fence/observation/canonical/hash mismatch, a result row, or
+a partial Transaction-B after-state returns a typed `DurableDeliveryError` with
+zero rewrite. Exact complete after-state is idempotent
+`RetryExpiryDisposition::AlreadyTerminalized`.
+
 The drain is a deterministic one-row state machine, not an unordered scan.
 `PendingAppend` has strict priority. It rejects a row whose `created_at` or
 `authorization_identity` is null, empty or ASCII-whitespace-only, and selects
@@ -567,6 +1496,9 @@ decision_identity                         PRIMARY KEY
 automatic_attempts_started                non-negative
 next_eligible_at                          nullable
 exhausted_at                              nullable
+source_business_date                      non-null ISO date
+expires_at                                non-null UTC timestamp
+terminal_state                            Active|ExpiredFreshness|Exhausted|Completed
 last_attempt_binding_identity             nullable UNIQUE
                                           REFERENCES retry_attempt_bindings(attempt_identity)
 version
@@ -595,6 +1527,10 @@ trigger:
 - requires each authority-changing update to increment `version` by exactly
   one;
 - rejects clearing or changing a non-null `exhausted_at`;
+- requires `expires_at` to equal the first Asia/Shanghai midnight after the
+  immutable `source_business_date` and rejects every update to either field;
+- allows only the monotonic `Active -> ExpiredFreshness|Exhausted|Completed`
+  terminal transition and rejects deletion/reset;
 - permits the first `exhausted_at` only when the attempt count is three; and
 - rejects clearing or moving a non-null `next_eligible_at` earlier.
 
@@ -626,6 +1562,373 @@ already started. An accepted result is terminal. Any uncertain result is
 terminal for automatic retry and retains its normal uncertain reservation
 semantics.
 
+The coordinator-owned expiry DTOs are public only through the sealed
+`durable_delivery` root. They have no public constructors, `Default`,
+`Deserialize` or writable fields; callers can only inspect read-only accessors
+and pass the exact value back to the coordinator:
+
+```rust
+pub struct ExpirableRetrySchedule {
+    decision_identity: String,
+    rejection_disposition_identity: String,
+    authorization_identity: Option<String>,
+    push_kind: PushKind,
+    producer_seam: String,
+    producer_catalog_identity_sha256: String,
+    producer_attestation_sha256: String,
+    source_business_date: NaiveDate,
+    expires_at: DateTime<Utc>,
+    pre_start_reserved_attempt_identity: Option<String>,
+}
+
+pub struct CompleteRetryExpirySnapshot {
+    ordered_rows: Vec<ExpirableRetrySchedule>,
+    row_count: usize,
+    ordered_rows_sha256: String,
+}
+
+pub struct PreparedRetryExpiredFreshness {
+    expiry_event_identity: String,
+    decision_identity: String,
+    rejection_disposition_identity: String,
+    authorization_identity: Option<String>,
+    attempt_identity: Option<String>,
+    source_business_date: NaiveDate,
+    expires_at: DateTime<Utc>,
+    freshness_observed_at: DateTime<Utc>,
+    terminal_kind: RetryExpiryTerminalKind,
+    event_canonical: Vec<u8>,
+    event_sha256: String,
+}
+
+pub enum RetryExpiryUncertaintyReason {
+    PendingStartAuthority,
+    AppendedStartAuthority,
+    SendOwnershipAuthority,
+}
+
+pub struct PreparedRetryExpiryUncertainty {
+    decision_identity: String,
+    attempt_identity: String,
+    execution_cycle_identity: String,
+    start_event_identity: Option<String>,
+    ownership_identity: Option<String>,
+    source_business_date: NaiveDate,
+    expires_at: DateTime<Utc>,
+    freshness_observed_at: DateTime<Utc>,
+    reason: RetryExpiryUncertaintyReason,
+    prepared_state_sha256: String,
+}
+
+pub enum RetryExpiryPreparationOutcome {
+    ExpiryPrepared(PreparedRetryExpiredFreshness),
+    StartAuthorityWins(PreparedRetryExpiryUncertainty),
+}
+
+pub enum RetryExpiryDisposition {
+    AppendedAndTerminalized {
+        decision_identity: String,
+        terminal_state: RetryScheduleTerminalState,
+    },
+    AlreadyTerminalized {
+        decision_identity: String,
+        terminal_state: RetryScheduleTerminalState,
+    },
+    RoutedToUncertainty {
+        decision_identity: String,
+        attempt_identity: String,
+        reason: RetryExpiryUncertaintyReason,
+    },
+}
+```
+
+`RetryExpiryTerminalKind` is the closed
+`RejectedDurableExpired|ReservedExpiredBeforeSink|
+ManualTargetExpiredBeforeAuthorization` set and
+`RetryScheduleTerminalState` is the closed schedule state set above.
+`PreparedRetryExpiredFreshness` is materialized from, and must byte-for-byte
+match, one durable `retry_expiry_audit_outbox` row; acknowledgement accepts no
+caller-supplied replacement bytes, hash, terminal kind or timestamp.
+
+`PreparedRetryExpiryUncertainty` has no public constructor, `Clone`,
+`Deserialize` or `Default`; it is coordinator-derived retained-state evidence,
+not authority to call a sink. `RoutedToUncertainty` is returned only after its
+uncertainty outboxes are append/acknowledged to a fixed point, the active
+binding is cleared and the schedule leaves `Active`. That branch writes no
+expiry-outbox row. Reason precedence is exactly `SendOwnershipAuthority >
+AppendedStartAuthority > PendingStartAuthority`.
+
+Expiry is actively drained; it is never implemented only as a candidate SQL
+filter. `DurableDeliveryCoordinator` owns:
+
+```rust
+fn select_expirable_retry_schedules(
+    &self,
+) -> Result<CompleteRetryExpirySnapshot>;
+
+fn prepare_retry_expired_freshness(
+    &self,
+    row: &ExpirableRetrySchedule,
+) -> Result<RetryExpiryPreparationOutcome>;
+
+fn reconcile_retry_expiry_preparation(
+    &self,
+    append: &dyn ImmutableAppendPort,
+    prepared: RetryExpiryPreparationOutcome,
+) -> Result<RetryExpiryDisposition>;
+```
+
+Every freshness-bearing coordinator operation (expiry selection/preparation,
+admission, start preparation, ownership claim and the final pre-sink gate)
+reads the coordinator's private `ProductionFreshnessClock`; none accepts a
+caller timestamp. The production constructor always installs the system clock
+and exposes no clock setter. Only a cfg(test)-only TEST_CODE constructor can
+install a deterministic clock. Observation timestamps needed for decisions are
+persisted in their canonical authority rows.
+
+The `now`/`started_at`/`failed_at` parameters on cycle-lifecycle, append-
+acknowledgement and quarantine APIs are audit ordering metadata only. They are
+never read by schedule eligibility, source-business-date expiry, manual
+authorization, candidate selection, start admission, ownership claim or the
+pre-call freshness decision, and cannot satisfy or override any freshness
+gate. Those gates exclusively read `ProductionFreshnessClock`.
+
+`ExpiryPrepared` persists one immutable expiry outbox authority, so expiry can
+be resumed outside the cycle that discovered it (including after manual
+authorization or process restart). `StartAuthorityWins` instead persists and
+append/acknowledges the existing uncertainty authority to a terminal fixed
+point, clears the active binding and moves the schedule out of `Active`; it
+writes no expiry-outbox row and can mint neither a send permit nor a sink call.
+Its reason precedence is exactly `SendOwnershipAuthority >
+AppendedStartAuthority > PendingStartAuthority`:
+
+```text
+retry_expiry_audit_outbox
+  expiry_event_identity                    PRIMARY KEY
+  decision_identity                        FK delivery_decisions
+  rejection_disposition_identity           FK delivery_disposition_payloads
+  authorization_identity                   nullable FK retry_authorizations
+  attempt_identity                         nullable FK retry_attempt_bindings
+  source_business_date                     non-null ISO date
+  expires_at                               non-null UTC timestamp
+  freshness_observed_at                    non-null UTC timestamp, >= expires_at
+  terminal_kind                            RejectedDurableExpired|
+                                           ReservedExpiredBeforeSink|
+                                           ManualTargetExpiredBeforeAuthorization
+  event_canonical                          immutable BLOB
+  event_sha256                             lowercase SHA-256
+  append_state                             Pending|Appended
+  immutable_audit_ref                      nullable
+  created_at                               immutable ordering metadata
+  UNIQUE(decision_identity, expires_at)
+```
+
+The final pre-call no-sink exception additionally uses one private immutable
+commit companion:
+
+```text
+retry_pre_call_expiry_authorities
+  authority_identity                       PRIMARY KEY = authority_sha256
+  expiry_event_identity                    UNIQUE deferred FK expiry outbox
+  decision_identity                        FK delivery_decisions
+  attempt_identity                         UNIQUE FK retry_send_ownership
+  execution_cycle_identity                 FK retry_cycles
+  reservation_generation                   positive INTEGER/Rust i64
+  source_business_date                     non-null ISO date
+  expires_at                               non-null UTC timestamp
+  freshness_observed_at                    non-null UTC timestamp, >= expires_at
+  authority_canonical                      immutable BLOB
+  authority_sha256                         lowercase SHA-256
+  created_at                               = freshness_observed_at
+```
+
+`expiry_event_identity` is a `DEFERRABLE INITIALLY DEFERRED` foreign key to
+the expiry row. The companion is therefore allowed to be inserted first
+inside the owning transaction, but that transaction cannot commit unless the
+exact expiry row also exists. Its canonical bytes are
+`b"stock_analysis.durable_delivery.br192.pre_call_expiry_authority.v1\0" ||
+serde_json::to_vec` of the ordered fields
+`schema_version=1,rule_id="BR-192",expiry_event_identity,
+decision_identity,attempt_identity,
+execution_cycle_identity,reservation_generation,source_business_date,
+expires_at,freshness_observed_at`. `authority_identity` is deliberately not a
+canonical input, so the identity rule is non-self-referential;
+`authority_sha256=sha256_hex(authority_canonical)` and
+`authority_identity=authority_sha256`. The private validator performs exact
+domain removal, deny-unknown-fields decode, decode→reserialize equality and
+typed-column equality before insert. Update/delete are forbidden.
+
+The companion insert trigger requires the exact Active schedule, exact
+`AttemptInFlight` attempt, exact `Started` ownership with null pre-call and
+terminal fields, its exact Appended `SinkAttemptStarted` for the same execution
+cycle/reservation generation, no terminal sink result and no existing expiry
+row. Production code cannot construct or insert the companion outside
+`execute_prepared_retry_sink`; no public DTO, constructor or raw connection is
+exposed for it.
+
+`event_canonical` is exactly
+`b"stock_analysis.durable_delivery.br192.retry_expired_freshness.v1\0" ||
+serde_json::to_vec` of the ordered fields
+`schema_version=1,rule_id="BR-192",decision_identity,
+rejection_disposition_identity,authorization_identity(nullable),attempt_identity,
+source_business_date,expires_at,freshness_observed_at,terminal_kind`. Dates use ISO `YYYY-MM-DD` and
+timestamps use UTC `Z` with nine fractional digits. The stored
+`event_sha256=sha256_hex(event_canonical)` and
+`expiry_event_identity=event_sha256`; the PK therefore names the exact typed
+bytes, while the logical UNIQUE prevents different bytes for the same
+decision/expiry. The private validator requires/strips the exact domain prefix
+and decode→reserialize equality of the JSON suffix.
+
+For ordinary drain, admission and manual authorization,
+`freshness_observed_at` is captured from the coordinator-owned production
+clock inside the owning `BEGIN IMMEDIATE` immediately before the freshness-
+dependent write. The final pre-call gate is the sole timing exception: the
+coordinator samples that same private clock at the external-call linearization
+point and, when expired, begins Transaction A in §4 immediately with no await,
+I/O or caller code between the sample and `BEGIN IMMEDIATE`; Transaction A
+revalidates every current authority before persisting the exact sample.
+Production callers cannot provide it. Every insert requires
+`freshness_observed_at >= expires_at`, and the exact value is duplicated in the
+typed row and canonical bytes. Insert otherwise requires the exact current Active schedule, exact current appended
+rejection disposition, appended/applied authorization and enabled producer
+attestation. The database recomputes `sha256_hex(event_canonical)` and validates
+private decode→canonical reserialization plus every duplicated typed field.
+`RejectedDurableExpired` requires a non-null authorization and no attempt.
+`ReservedExpiredBeforeSink` requires a non-null authorization and names the
+exact current retry attempt. Normal expiry preparation is legal only while no
+prepared Pending/Appended `SinkAttemptStarted` logical slot and no send-
+ownership row exists. The sole exception is the final pre-call freshness
+transaction in §4: it may atomically pair the exact attempt's
+`FreshnessExpiredBeforeExternalCall` ownership terminal with the expiry row,
+because the live single-use permit was consumed without beginning the external
+call. Payload/key fields
+are immutable, delete is forbidden, and only exact `Pending -> Appended` with a
+valid immutable ref is allowed. Schedule terminalization, active-binding clear
+and optional pre-start reservation release occur only after the same row is
+Appended. A crash after prepare or append acknowledgement resumes the same
+identity/bytes; no cycle identity or caller timestamp is needed to reconstruct
+it.
+
+`ManualTargetExpiredBeforeAuthorization` requires both authorization and
+attempt to be null. It is prepared only when an authenticated manual command
+targets a valid current R-09 definite rejection that has no prior
+FrozenRejection authorization/schedule and is already expired at the owning
+transaction's freshness observation. That same transaction inserts the
+zero-attempt Active schedule and Pending expiry outbox together, inserts no
+authorization/binding, then the ordinary append/ack/terminalize protocol makes
+the schedule `ExpiredFreshness`. This closes the audit path without inventing
+an authorization that never became eligible.
+
+The selector materializes every `terminal_state=Active AND expires_at<=now`
+row in one validated snapshot, rejects missing keys and orders
+`expires_at,decision_identity,rejection_disposition_identity` with BINARY text
+order and no `LIMIT`, `OFFSET`,
+cursor or caller cardinality. The runner drains this snapshot to an empty
+fixed point before Reserved processing and before each candidate snapshot.
+Candidate acquisition is a closed `Candidates|ExpiredFound` result: in the
+same read transaction it checks for expired Active rows first and may never
+silently exclude one. `ExpiredFound` returns the complete expiry snapshot,
+which is reconciled before candidate query is retried.
+
+For `RejectedDurable`, expiry append/ack terminalizes the schedule, clears the
+active authorization binding and retains the definite rejection. For a
+pre-start `Reserved` retry with neither a prepared `SinkAttemptStarted` logical
+slot nor send ownership, it additionally records retained attempt terminal
+authority whose effective state is `ExpiredFreshnessBeforeSink`, retains the
+schema-v5-compatible base attempt row, releases the retained reservation and
+then terminalizes the schedule under the exact relation defined in §4.
+
+Expiry preparation, `SinkAttemptStarted` preparation/acknowledgement and send-
+ownership claim form one SQLite-enforced total order. Each is performed in an
+owning `BEGIN IMMEDIATE` and rechecks the opposing authority before its write:
+
+For every rule in this total order, **current attempt** has one exact meaning:
+the `retry_schedules.last_attempt_binding_identity` names the immutable attempt
+binding for the same decision and ordinal, the decision's current retry attempt
+and reservation generation match that binding, and the current `Active`
+authorization binding/generation, owner and fence all match. A start slot
+belongs to that attempt only when its validated canonical
+`attempt_identity` and its typed decision/cycle/event ordinal resolve to that
+same binding and reservation generation. Rows for an older attempt that is no
+longer the schedule's current binding are historical and are ignored by the
+current-attempt predicate; a partially mismatched row is corruption, not
+history, and fails closed.
+
+The exact migration trigger set is
+`trg_retry_expiry_insert_requires_no_start_or_ownership`,
+`trg_retry_start_insert_rejects_expiry_authority`,
+`trg_retry_start_append_rejects_expiry_authority` and
+`trg_retry_send_ownership_rejects_expiry_authority`, plus
+`trg_retry_pre_call_expiry_authority_insert_requires_started_ownership`,
+`trg_retry_pre_call_expiry_authority_update_immutable`,
+`trg_retry_pre_call_expiry_authority_delete_immutable` and
+`trg_retry_send_ownership_pre_call_expiry_requires_authority`, plus
+`trg_retry_sink_result_insert_rejects_pre_call_expiry_authority`, and the
+terminal-result bijection triggers
+`trg_retry_send_ownership_terminal_result_once`,
+`trg_retry_send_ownership_terminal_result_immutable` and
+`trg_retry_sink_result_requires_terminal_ownership`.
+Post-validation requires all twelve exact SQL definitions. The expiry reverse trigger is
+`BEFORE INSERT ON sink_results` and rejects the exact attempt/decision when
+**any one** of these already exists: its pre-call expiry companion, its
+`FreshnessExpiredBeforeExternalCall` ownership, or its
+`ReservedExpiredBeforeSink` expiry outbox. It does not wait for the complete
+triple; this makes the reverse sink-result ordering safe at every intermediate
+statement inside the transaction. The ownership-transition trigger and the
+expiry-insert exception independently recheck that no exact attempt/decision
+sink result exists at their own write boundaries. The expiry trigger
+permits an existing
+ownership row only for the same transaction's exact attempt/observation in
+state `FreshnessExpiredBeforeExternalCall`, the exact deferred companion and
+the exact Appended start for that ownership's execution cycle/reservation
+generation. Start rows from an
+older terminal attempt are historical evidence and do not conflict with the
+current attempt; any Pending or different-cycle start for the current attempt
+still conflicts.
+
+- if any Pending/Appended `SinkAttemptStarted` logical slot or ownership row
+  for the current attempt
+  already exists, ordinary expiry preparation writes no expiry-outbox row and
+  routes the retained attempt to the existing uncertainty/quarantine path. A Pending slot
+  is conservative evidence because the immutable append may already have
+  happened even when SQLite acknowledgement has not;
+- if the Pending/Appended expiry-outbox row is inserted first, database
+  triggers reject every later start-slot insertion, `Pending -> Appended` start
+  acknowledgement and ownership insertion for that decision/attempt. The
+  expiry row therefore remains reconcilable to terminal state and can never be
+  superseded or stranded; and
+- the only exception is the same-transaction pre-call protocol: insert the
+  immutable deferred companion, transition exact ownership `Started` to
+  `FreshnessExpiredBeforeExternalCall`, then insert the exact expiry row. The
+  ownership-update trigger requires that companion and zero result; the expiry-
+  insert trigger requires both companion and terminal ownership and again
+  requires zero result; the reverse sink-result trigger rejects a result after
+  any member exists; and the deferred foreign key rejects commit unless all
+  three exist. That protocol is not available to
+  recovery, callers or an already uncertain attempt and invokes zero external
+  sink calls; and
+- Reserved processing checks current time and absence of expiry authority
+  before start preparation, then checks both again in the ownership-claim
+  transaction. Equality with expiry is ineligible for start.
+
+Thus, outside the exact live-permit final-pre-call exception, only a start
+preparation/ownership transaction that committed before ordinary expiry
+preparation dominates and routes to uncertainty. The exact exception instead
+commits the complete no-call triple and follows Transaction B, never
+uncertainty. A later start cannot dominate an already prepared expiry and is
+never relabelled as valid.
+
+Admission and manual authorization repeat the exact comparison and producer-
+provenance join in their owning `BEGIN IMMEDIATE`. At `now >= expires_at`, the
+coordinator prepares and reconciles the immutable `RetryExpiredFreshness`
+event, then atomically changes the retained schedule from `Active` to
+`ExpiredFreshness`, invalidates/clears the active binding and returns typed
+`NoLongerEligible::ExpiredFreshness { expires_at }`. It neither increments the
+attempt count nor calls provider, renderer or sink. Repeated discovery/drain/
+reconciliation is byte-identical and produces no second logical event. Each
+future enabled counted kind must first register an explicit source-owned
+expiry derivation; there is no generic/default expiry.
+
 After three automatic attempts, admission returns
 `NoLongerEligible::RetryAttemptsExhausted` exactly once, persists an exhausted
 projection and removes the identity from future candidate lists. Manual
@@ -646,9 +1949,9 @@ length(trim(
 ```
 
 This applies to authorization, authorization-event, cycle-audit,
-`SinkAttemptStarted` and every other v5 immutable-ref column. `Pending` requires
+`SinkAttemptStarted` and every other v6 immutable-ref column. `Pending` requires
 the ref to be null. The schema-v3 Rust predicate is reused/centralized rather
-than duplicated and is called before every v5 acknowledgement; SQL
+than duplicated and is called before every v6 acknowledgement; SQL
 constraints/triggers remain the final authority. Migration tests cover `NULL`,
 empty, space-only, tab-only, LF-only, CR-only, mixed ASCII whitespace and a
 valid non-whitespace ref for every new table.
@@ -677,6 +1980,7 @@ pub enum RetryIneligibility {
         reservation_generation: i64,
     },
     RetryAttemptsExhausted,
+    ExpiredFreshness { expires_at: DateTime<Utc> },
     UncertainAuditPending,
     UncertainTaskTransitionPending,
     UncertainManualReview,
@@ -698,14 +2002,36 @@ pub enum RetryAdmission {
         fence_token: i64,
     },
     Deferred(RetryDeferral),
+    ExpiredFreshnessPrepared {
+        expires_at: DateTime<Utc>,
+        prepared: PreparedRetryExpiredFreshness,
+    },
     NoLongerEligible(RetryIneligibility),
 }
 ```
 
 ```text
-admit_authorized_retry(cycle_identity, decision_identity, now)
+admit_authorized_retry(cycle_identity, decision_identity)
   -> Result<RetryAdmission, DurableDeliveryError>
 ```
+
+Freshness expiry is an expected business outcome, not an operational error.
+If automatic admission itself first observes expiry, it returns
+`RetryAdmission::ExpiredFreshnessPrepared { expires_at, prepared }`. The runner
+must append/ack/reconcile those exact prepared bytes before it may persist and
+report the final cycle
+`RetryAdmission::NoLongerEligible(RetryIneligibility::ExpiredFreshness {
+expires_at })`; append/reconcile failure typed-fails the cycle and never claims
+terminal expiry. The manual entry owns its append/reconcile capabilities and returns
+`ProductionRetryAuthorizationOutcome::NoLongerEligible` carrying the same
+typed ineligibility; an expiry drain returns
+`RetryExpiryDisposition::AppendedAndTerminalized|AlreadyTerminalized`; and the
+final pre-call gate returns
+`RetrySinkExecutionOutcome::ExpiredBeforeExternalCall(prepared)` before the
+normal expiry reconcile. The implementation must not add
+`DurableDeliveryError::RetryExpiredFreshness` or encode expected expiry in an
+error string. `DurableDeliveryError` remains reserved for operational failure
+to validate, persist, append, acknowledge or CAS those authorities.
 
 The existing `DurableDeliveryError` gains one retry-specific variant:
 
@@ -1023,6 +2349,12 @@ no typed admission variants.
 
 Post-validation distinguishes active authority from history:
 
+- before applying generic base-attempt predicates, an exact effective
+  `ExpiredFreshnessBeforeSink` relation from §4 is validated as terminal
+  compatibility history: its decision no longer points to the attempt, its
+  fence is revoked, reservations are released, schedule/binding are terminal,
+  no result exists and its optional pre-call companion/ownership triple is
+  exact; no current-attempt or uncertainty rule may select it;
 - every `Active` binding must be unique for its decision, target the decision's
   current appended rejection, reference an `Appended/Applied` authorization
   with its appended `Applied` event, and belong either to `RejectedDurable` or
@@ -1040,9 +2372,13 @@ Post-validation distinguishes active authority from history:
   execution-cycle/reservation-generation/owner/positive-i64-fence equality,
   and every such `Started` ownership row must point to the current
   `AttemptInFlight`;
-- every `TerminalRecorded` ownership must join its exact authoritative
-  terminal sink result, while every `InterruptedUncertain` ownership must have
-  no terminal result and exact `ProcessInterruptedAfterSinkStart` reason;
+- every `TerminalRecorded` ownership must have non-NULL
+  `terminal_sink_result_identity` and join exactly that authoritative terminal
+  sink result by result, decision and attempt identity; every authoritative
+  retry sink result must reverse-join exactly one such same-cycle ownership;
+  every other ownership state must have NULL result identity and zero terminal
+  results, while every `InterruptedUncertain` ownership also requires exact
+  `ProcessInterruptedAfterSinkStart` reason;
 - there is no committed retry-origin `Reserved` state without that binding, and
   no committed binding/schedule increment without the matching `Reserved`
   state; and
@@ -1069,7 +2405,11 @@ exactly `NotStarted/NULL`, `Confirmed/n` or
 record `Confirmed/0`; panic, cancellation, process death or `JoinError` after
 start/claim evidence records `Indeterminate/NULL`. Recovery may separately
 prove that it made zero new sink calls, but must not rewrite an interrupted
-cycle to `Confirmed/0`.
+cycle to `Confirmed/0`. The §4 Transaction-A recount is not such an inference:
+after the exact no-call ownership terminal is durable, it derives
+the exact ownership/result bijection from all same-cycle rows. If any other
+`Started` or `InterruptedUncertain` ownership remains it checked-updates
+`Indeterminate/NULL` to itself; otherwise it restores `Confirmed(n)`.
 
 Cycle identity has one canonical construction. Inside the same
 `BEGIN IMMEDIATE`, before the global Running check and before any insert or
@@ -1273,13 +2613,13 @@ The retry sink boundary is deliberately split:
 
 ```text
 coordinator.prepare_retry_attempt(...)
-  -> PreparedRetryAttempt
-coordinator.reconcile_prepared_retry_attempt_audit(prepared, append, now)
+  -> RetryAttemptPreparationOutcome
+coordinator.reconcile_prepared_retry_attempt_audit(prepared, append)
   -> AppendedSinkAttemptStarted
-coordinator.claim_retry_sink_execution(prepared, appended_start, now)
-  -> SinkExecutionPermit
+coordinator.claim_retry_sink_execution(prepared, appended_start)
+  -> RetrySinkClaimOutcome
 coordinator.execute_prepared_retry_sink(permit, sink)
-  -> PersistedRetrySinkOutcome
+  -> RetrySinkExecutionOutcome
 ```
 
 These are `DurableDeliveryCoordinator` methods. None is a free function and
@@ -1315,6 +2655,7 @@ pub struct AppendedSinkAttemptStarted {
 #[serde(deny_unknown_fields)]
 pub enum RetrySendOwnershipState {
     Started,
+    FreshnessExpiredBeforeExternalCall,
     TerminalRecorded,
     InterruptedUncertain,
 }
@@ -1327,6 +2668,22 @@ pub struct PersistedRetrySinkOutcome {
     pub sink_result_identity: String,
     pub decision_state: DecisionState,
     pub ownership_state: RetrySendOwnershipState,
+    pub pre_call_freshness_observed_at: DateTime<Utc>,
+}
+
+pub enum RetryAttemptPreparationOutcome {
+    Prepared(PreparedRetryAttempt),
+    Expiry(RetryExpiryPreparationOutcome),
+}
+
+pub enum RetrySinkClaimOutcome {
+    Claimed(SinkExecutionPermit),
+    Expiry(RetryExpiryPreparationOutcome),
+}
+
+pub enum RetrySinkExecutionOutcome {
+    Persisted(PersistedRetrySinkOutcome),
+    ExpiredBeforeExternalCall(PreparedRetryExpiredFreshness),
 }
 ```
 
@@ -1373,53 +2730,166 @@ because it exists. `started_at` must equal the persisted outbox row's
 normalization. The append acknowledgement carries no append-authority
 timestamp because that authority does not provide one.
 
-`coordinator.prepare_retry_attempt(execution_cycle_identity, attempt_identity,
-now)` never calls
+`coordinator.prepare_retry_attempt(execution_cycle_identity, attempt_identity)`
+never calls
 `begin_attempt`, selects a generation, creates an attempt/binding or changes the
 schedule. It loads the immutable binding installed by admission, revalidates its
 admission cycle, authorization, disposition, generation, ordinal, owner and
 fence against the already-`Reserved` decision/attempt/schedule, validates the
 current execution cycle is `Running`, idempotently inserts that execution
-cycle's exact `SinkAttemptStarted` outbox row and returns a prepared token
-carrying both cycle identities and the persisted outbox `created_at` as
-`started_at`. It has no sink capability.
+cycle's exact `SinkAttemptStarted` outbox row and returns
+`RetryAttemptPreparationOutcome::Prepared`, carrying both cycle identities and
+the persisted outbox `created_at` as `started_at`. If the private clock instead
+observes expiry before any current-attempt start authority exists, the same
+transaction writes only the exact Pending expiry authority and returns
+`Expiry(ExpiryPrepared(...))`. If a Pending/Appended current-attempt start or
+ordinary ownership already exists, it writes no expiry row and returns
+`Expiry(StartAuthorityWins(...))`. It has no sink capability.
 `coordinator.reconcile_prepared_retry_attempt_audit` appends and acknowledges
 that exact row and has no sink capability. Appending `SinkAttemptStarted` is
 audit evidence, not permission to send.
 
-`coordinator.claim_retry_sink_execution(prepared, appended_start, now)` has no
+`coordinator.claim_retry_sink_execution(prepared, appended_start)` has no
 sink capability. In one `BEGIN IMMEDIATE` it revalidates the complete
-prepared/start DTO and database read-back, CASes exactly
+prepared/start DTO and database read-back. If its private clock now observes
+expiry, the already-Pending/Appended start wins: the method returns
+`RetrySinkClaimOutcome::Expiry(StartAuthorityWins(...))`, writes no expiry row,
+mints no permit and routes the retained attempt through uncertainty. Otherwise
+it CASes exactly
 `Reserved -> AttemptInFlight` for the current attempt/binding/reservation
 generation/owner/positive-i64 fence, and inserts the matching immutable
 `retry_send_ownership` with `send_consumed=true` and the persisted start time.
 The same transaction changes cycle sink-call evidence from `NotStarted` or
 `Confirmed(n)` to `Indeterminate/NULL`; once a consumed permit exists, a later
 panic/crash may not report zero merely because no result was recorded.
-Only that CAS winner receives a non-`Clone`, non-serializable,
-single-consumption `SinkExecutionPermit`; a loser returns a typed state/fence
+Only that CAS winner receives
+`RetrySinkClaimOutcome::Claimed(SinkExecutionPermit)` with a non-`Clone`,
+non-serializable, single-consumption permit; a loser returns a typed state/fence
 loss and makes zero sink calls.
 
 `coordinator.execute_prepared_retry_sink(permit, sink)` takes the permit by
 value and is the only retry API with a sink capability. It performs one final
 read-only validation that the decision is `AttemptInFlight`, the exact
 ownership remains `Started`, and attempt/binding/fence/start evidence still
-match, then invokes the external sink once. Before returning to its caller it
-immediately invokes `self.record_sink_result` on the same coordinator; that
-transaction continues to require `AttemptInFlight`, inserts the authoritative
-result and advances ownership to `TerminalRecorded` atomically. The same
-transaction proves no nonterminal consumed ownership remains for the cycle,
-counts its joined authoritative retry sink results, and changes
+match. After that validation and with no intervening await, provider, renderer,
+filesystem, database transaction or other blocking operation, it reads the
+private production clock at the external-call linearization point.
+
+If `pre_call_freshness_observed_at >= expires_at`, it invokes no external sink
+and executes the following exact two-transaction protocol.
+
+**Transaction A — establish immutable no-call expiry authority.** In one
+`BEGIN IMMEDIATE`, the coordinator revalidates the unchanged consumed permit
+and all of these preconditions: the decision is `AttemptInFlight` and names the
+exact current attempt; the attempt/binding/generation/owner/fence agree; the
+schedule is `Active` and its last binding is that attempt; its exact
+`SinkAttemptStarted` is `Appended`; ownership is `Started`; the execution cycle
+is `Running/NotPrepared`; no authoritative sink result exists; and no pre-call
+companion or expiry authority exists. It then, in order:
+
+1. inserts the immutable deferred `retry_pre_call_expiry_authorities` row;
+2. advances ownership exactly once to
+   `FreshnessExpiredBeforeExternalCall`, persisting the observation and exact
+   terminal reason/time;
+3. inserts the matching Pending `ReservedExpiredBeforeSink` expiry outbox; and
+4. recomputes and CASes the cycle's sink-call evidence from retained rows.
+
+That recount treats a same-cycle `Started` or `InterruptedUncertain` ownership
+as ambiguous. If any exists, the only valid evidence is
+`Indeterminate/NULL`. Otherwise `n` is the count of same-cycle
+`TerminalRecorded` ownership rows. Each `TerminalRecorded` ownership must join
+exactly one authoritative sink result, and every authoritative sink result for
+the cycle must join exactly one same-cycle `TerminalRecorded` ownership. An
+orphan/extra result, an ownership with zero or multiple results, or a result
+joined to zero or multiple ownership rows is corruption and rolls the
+transaction back. Only that bijection may produce `Confirmed(n)`.
+`FreshnessExpiredBeforeExternalCall` contributes zero and is not ambiguous, so
+the all-expiry case closes to `Confirmed(0)` while earlier definite same-cycle
+results produce `Confirmed(n>0)`. A missing/double result, stale evidence CAS,
+failed statement or post-validation mismatch rolls back the companion,
+ownership, expiry and cycle-evidence changes together. The decision, schedule,
+reservation and base attempt state intentionally remain unchanged until the
+exact expiry bytes are appended. On commit the method returns
+`ExpiredBeforeExternalCall(prepared)`; its caller may only append/acknowledge
+and reconcile those exact persisted bytes.
+
+**Transaction B — terminalize only appended expiry authority.** After the
+exact Pending row is appended and acknowledged as `Appended`, normal expiry
+reconciliation enters one `BEGIN IMMEDIATE`. It requires the exact appended
+expiry ref/hash/canonical bytes and `ReservedExpiredBeforeSink` kind; exact
+decision/current-attempt/binding/generation/owner/fence and original rejection;
+the `Active` schedule and authorization binding; the exact companion plus
+freshness-terminal ownership; no sink result; the current reserved budget,
+cooldown and reservation generation; and cycle evidence equal to the recount
+defined above. It then performs only these checked mutations:
+
+- retain `delivery_attempts.state='AttemptInFlight'` for schema-v5
+  compatibility, but CAS `fence_revoked_at` from null to the exact freshness
+  observation;
+- release each exact current `Reserved` reservation, set its `released_at` to
+  that observation, release the current rolling head, and retain all rows and
+  generations;
+- use the sole restricted direct decision transition
+  `AttemptInFlight -> RejectedDurable`, preserve the original current rejection
+  disposition, clear current attempt/budget/cooldown pointers, checked-
+  increment the fence generation, and persist exact reason
+  `retry_expired_freshness_before_external_call`;
+- clear the exact `Active` authorization binding with
+  `cleared_reason='expired_freshness'`, `cleared_at` equal to the observation
+  and `retry_authorized=false`, retaining the authorization and its event; and
+- CAS the schedule `Active -> ExpiredFreshness`, clear `next_eligible_at`,
+  increment `version` exactly once, and preserve attempts started, last binding,
+  source date and expiry.
+
+Every affected-row count is exactly one and full post-validation rederives all
+joins before commit; otherwise Transaction B rolls back completely. A replay
+that observes the exact full after-state returns
+`RetryExpiryDisposition::AlreadyTerminalized`. Any partial after-state,
+mismatched reason/time/ref/hash/generation or drift is a typed
+`DurableDeliveryError` and is never patched piecemeal.
+
+Because schema v5 restricts the base attempt state to its existing closed set,
+the retained `AttemptInFlight` attempt row is compatibility history, not live
+send authority. Adding a new base state would require a table rebuild;
+`Rejected` would falsely claim a sink result and `Uncertain` would contradict
+the definite zero-call proof. The effective terminal state
+`ExpiredFreshnessBeforeSink` is therefore defined by the exact conjunction of:
+an appended `ReservedExpiredBeforeSink` expiry; schedule
+`ExpiredFreshness`; decision no longer pointing to the attempt; revoked fence
+at the exact observation; released reservations; no sink result; and either
+no start/ownership for ordinary pre-start expiry or the exact companion plus
+`FreshnessExpiredBeforeExternalCall` ownership for final pre-call expiry. All
+selectors, recovery classifiers, post-validators and cycle evidence rules must
+recognize and exclude this effective terminal relation **before** inspecting
+the base attempt state. It cannot be claimed, resent or relabelled uncertain.
+
+Otherwise the same observed timestamp is retained in memory and the method
+immediately invokes the external sink exactly once. `record_sink_result` then
+derives the prospective authoritative/non-late sink-result identity and opens
+one transaction that continues to require `AttemptInFlight`. It first persists
+the exact pre-call timestamp and prospective result identity in the ownership
+row while advancing `Started -> TerminalRecorded`, then inserts the matching
+authoritative/non-late sink result, and finally validates the cycle-wide
+result/`TerminalRecorded` ownership relation is bijective before commit. The
+deferred FK makes the temporary pointer-first state legal only inside that
+transaction, while the reverse trigger rejects any result-first insert
+immediately. A crash before commit leaves no claimed freshness fact and follows
+the existing conservative `InterruptedUncertain` recovery; it can never be
+converted into a definite expiry. Before returning to its caller the method
+proves no
+nonterminal consumed ownership remains, counts that joined authoritative retry
+sink-result set, and changes
 `Indeterminate/NULL -> Confirmed(n)`. A later claim may change
 `Confirmed(n) -> Indeterminate/NULL` again. Execute
-returns only `PersistedRetrySinkOutcome`, including the stored sink-result
-identity, decision state and ownership state. It never returns the bare port
-result.
+returns only `RetrySinkExecutionOutcome`, whose successful variant contains
+the stored sink-result identity, decision state, ownership state and exact
+pre-call freshness observation. It never returns the bare port result.
 
-A failpoint after authoritative-result insert but before the ownership update
-must roll back that entire result transaction. The decision remains
-`AttemptInFlight`, no authoritative result row exists, ownership remains
-`Started`, and recovery conservatively records
+A failpoint after the ownership pointer/state update but before the matching
+authoritative/non-late result insert must roll back that entire result
+transaction. The decision remains `AttemptInFlight`, no authoritative result
+row exists, ownership remains `Started` with a NULL terminal-result pointer,
+and recovery conservatively records
 `ProcessInterruptedAfterSinkStart`, reaches manual review and makes zero sink
 calls while the interrupted cycle remains `Indeterminate/NULL`. A
 pending/missing/mismatched start event, lost CAS, repeated execute or
@@ -1441,19 +2911,24 @@ One provider-free cycle is:
 2. reconcile pending disposition, authorization, state, task and cycle audit
    bytes to a fixed point; a blocked authorization records
    `AuthorizationReconciliationBlocked`, fails the cycle and yields zero sinks;
-3. first resume every recoverable terminal slot, then quarantine prior-boot
-   retry send starts/in-flight attempts with no terminal authoritative result,
-   then snapshot only safely recoverable already-`Reserved` identities in the
-   exact order frozen below;
+3. first resume every recoverable terminal slot, then reconcile every exact
+   pre-call companion + `FreshnessExpiredBeforeExternalCall` ownership +
+   Pending/Appended `ReservedExpiredBeforeSink` expiry through append/ack and
+   Transaction B; only after that higher-priority pass may it quarantine any
+   remaining prior-boot retry send starts/in-flight attempts with no terminal
+   authoritative result, then snapshot only safely recoverable already-
+   `Reserved` identities in the exact order frozen below;
 4. create one cycle-global `BTreeSet<String> attempted_decision_identities`;
 5. for each already-`Reserved` identity:
    - insert it into the attempted set before any sink call;
    - if already present, record a duplicate suppression event;
    - if it is retry-origin with no prior-boot start/ownership, use the
      four-stage prepare -> append/ack -> claim -> execute seam;
-   - if any prior-boot `SinkAttemptStarted` is pending/appended or the decision
-     is `AttemptInFlight` without a terminal authoritative result, append/ack
-     the retained bytes, transition through typed
+   - if an exact pre-call expiry triple is present, resume expiry and never
+     enter this generic branch; otherwise, if any prior-boot
+     `SinkAttemptStarted` is pending/appended or the decision is
+     `AttemptInFlight` without a terminal authoritative result, append/ack the
+     retained bytes, transition through typed
      `ProcessInterruptedAfterSinkStart` uncertainty and make zero sink calls;
    - otherwise preserve the existing ordinary Reserved recovery seam;
    - resume it at most once;
@@ -1528,7 +3003,8 @@ canonical identity strings and RFC3339 UTC timestamps:
    `scheduled_for ASC, started_at ASC, cycle_identity ASC`; and
 3. authorized retry candidates require
    `next_eligible_at IS NOT NULL`, `next_eligible_at<=now`,
-   `exhausted_at IS NULL` and non-null decision/disposition/authorization
+   `exhausted_at IS NULL`, `terminal_state='Active'`, `now < expires_at` and
+   non-null source-date/expiry/decision/disposition/authorization
    identities, then order by
    `next_eligible_at ASC, decision_identity ASC,
    rejection_disposition_identity ASC, authorization_identity ASC`.
@@ -1722,12 +3198,18 @@ begin_retry_cycle_before_spawn(
   scheduled_for,
   now
 )
-  -> Result<
-       Started(cycle_identity)
-       | NotCommitted(error, NoRetryCycleCommitted),
-       CommitAmbiguousError
-     >
+  -> durable_delivery::Result<RetryCycleBeginOutcome>
+
+RetryCycleBeginOutcome =
+  Started(cycle_identity)
+  | NotCommitted(error: DurableDeliveryError, proof: NoRetryCycleCommitted)
 ```
+
+`Ok(NotCommitted { .. })` is the only definite no-commit branch and carries
+the single-use release proof. `Err(DurableDeliveryError)` is the sole
+commit-ambiguous operational channel, carries no release proof and leaves the
+guard latched. No `CommitAmbiguousError` or second operational error enum
+exists.
 
 The coordinator validates the explicit boot identity again. In the same
 `BEGIN IMMEDIATE`, before any insert/write, it computes the next ordinal and
@@ -1833,6 +3315,12 @@ the independent terminal CAS, before the closure verifies the guard-release
 postcondition and returns. The boundary classification is derived from
 persisted state, never a runtime boolean, and acknowledged-start or consumed
 ownership always dominates the reason code.
+Before that selection inspects the compatibility base attempt state, it must
+exclude every exact effective `ExpiredFreshnessBeforeSink` relation from §4.
+If its expiry is only Pending/Appended but not yet terminalized, the higher-
+priority expiry resumer completes Transaction B first; it is never quarantine
+input. A partial or mismatched purported relation fails closed instead of
+falling through to uncertainty.
 If uncertainty append/reconciliation fails, the exact pending outbox remains
 and the cycle is not falsely finalized as `Failed`; recovery resumes this
 ordering. Because that state has not reached `FailurePending`, the unsafe Drop
@@ -2071,13 +3559,20 @@ pub struct ProductionRetryAuthorizationRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProductionRetryAuthorizationOutcome {
-    pub authorization_identity: String,
-    pub authorization_event_identity: String,
-    pub namespace_sha256: String,
-    pub evidence_sha256: String,
-    pub immutable_ref: String,
-    pub authorized_at: DateTime<Utc>,
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ProductionRetryAuthorizationOutcome {
+    Authorized {
+        authorization_identity: String,
+        authorization_event_identity: String,
+        namespace_sha256: String,
+        evidence_sha256: String,
+        immutable_ref: String,
+        authorized_at: DateTime<Utc>,
+    },
+    NoLongerEligible {
+        decision_identity: String,
+        ineligibility: RetryIneligibility,
+    },
 }
 
 pub fn authorize_delivery_retry_production(
@@ -2093,26 +3588,49 @@ internally, reads evidence only after authentication, applies the authorization
 and returns redacted persisted identities/hashes/ref. The binary and retry
 command cannot construct or inject any part of that authority graph.
 
+Before inserting manual authority, the entry validates the persisted producer
+companion against the current library catalog and asks its
+`DurableDeliveryCoordinator` to drain persisted expiry outboxes to a fixed
+point. The coordinator's owning `BEGIN IMMEDIATE` then rechecks exact current
+disposition/companion/schedule and obtains a fresh
+`freshness_observed_at` from its private `ProductionFreshnessClock` immediately
+before the freshness-dependent write, after all blocking I/O. Freshness requires
+`freshness_observed_at < expires_at`; PAM `validated_at` remains only
+`authorized_at` and can never satisfy this gate. Equality or later atomically
+creates the zero-attempt schedule when absent, prepares only the stable Pending
+expiry outbox, commits it, append/acknowledges the exact bytes and terminalizes
+freshness before returning typed `NoLongerEligible::ExpiredFreshness`; no
+authorization row is inserted. A crash resumes that persisted outbox before a
+later command can apply authority.
+
+The coordinator is the sole owner and reader of the production freshness
+clock. `retry_command.rs`, the binary and the public authorization wrapper own
+no clock and cannot sample, construct, inject or forward a freshness timestamp;
+after blocking authentication/evidence work they invoke the coordinator's
+freshness-bearing method. The production clock is private and non-injectable
+from request/CLI/env/root exports. Only a cfg(test)-bound TEST_CODE coordinator
+clock exists for equality and midnight race tests. No provider, PAM, evidence
+or filesystem I/O occurs between the coordinator's final freshness observation
+and its transaction write; the rejection event persists that exact
+observation.
+
 Task 6 extends `src/auth/operator.rs` with the only production attestation
 factory:
 
-Current source fact at Gate A was verified against the then-current worktree:
+Current source fact at Gate A is reproducible only from fixed baseline
+`b4aeee68d2c0259cc968914b3d39e3a89a18a496`, whose
+`src/auth/operator.rs` blob is
+`b0ec1f0b218466493dabb0a6e560099d07e19cf2`:
 
 ```text
-$ rg -n "pub fn require_monitor_operator_auth|fn try_pam_auth|struct OperatorAuthConfig|pam_service" src/auth/operator.rs
-27:pub struct OperatorAuthConfig {
-31:    pub pam_service: String,
-58:        pam_service: std::env::var("MONITOR_PAM_SERVICE").unwrap_or_else(|_| "login".to_string()),
-79:pub fn require_monitor_operator_auth() -> Result<(), OperatorAuthError> {
-99:        cfg.expected_operator, cfg.pam_service
-116:                    cfg.expected_operator, cfg.pam_service
-138:fn try_pam_auth(cfg: &OperatorAuthConfig, password: &str) -> Result<(), pam::PamError> {
-141:    let mut auth = pam::Authenticator::with_password(&cfg.pam_service)?;
-149:fn try_pam_auth(_cfg: &OperatorAuthConfig, _password: &str) -> Result<(), pam::PamError> {
-173:    fn config_pam_service_defaults_to_login() {
-176:        assert_eq!(cfg.pam_service, "login");
-181:    fn config_pam_service_uses_env_override() {
-186:        assert_eq!(cfg.pam_service, "stock_analysis");
+$ git show b4aeee68d2c0259cc968914b3d39e3a89a18a496:src/auth/operator.rs | rg -n 'pub struct OperatorAuthConfig|pub fn load_auth_config|pub fn require_monitor_operator_auth|fn try_pam_auth|pam::Authenticator::with_password|auth\.authenticate\(\)'
+26:pub struct OperatorAuthConfig {
+51:pub fn load_auth_config() -> OperatorAuthConfig {
+78:pub fn require_monitor_operator_auth() -> Result<(), OperatorAuthError> {
+137:fn try_pam_auth(cfg: &OperatorAuthConfig, password: &str) -> Result<(), pam::PamError> {
+140:    let mut auth = pam::Authenticator::with_password(&cfg.pam_service)?;
+143:    auth.authenticate()
+148:fn try_pam_auth(_cfg: &OperatorAuthConfig, _password: &str) -> Result<(), pam::PamError> {
 ```
 
 Therefore the existing API authenticates but discards success evidence. Task 6
@@ -2291,7 +3809,8 @@ unit test. `clap::CommandFactory` must report exactly
 `decision_identity,operator_identity,reason,evidence_path`. This compile-time
 literal plus structured key comparison rejects a request timestamp or injected
 capability without banning the legitimate
-`ProductionRetryAuthorizationOutcome.authorized_at` output field.
+`ProductionRetryAuthorizationOutcome::Authorized { authorized_at, .. }`
+output field.
 
 Tests prove the Production command and cfg(test)-only nonce-bound application
 produce distinct namespace preimages/hashes, any test-code/root/preimage/hash
@@ -2305,8 +3824,9 @@ originates only from the real auth function—the CLI source constructs only
 authority-owned authorization time.
 
 Owning tasks define their types/constants first and use private module paths
-internally. The final integration task performs the sole atomic root-export
-edit for BR-192. Existing unrelated `durable_delivery` root exports remain
+internally. Task 1 privately owns the catalog/permit definitions and performs
+no root export; Task 8, the final integration task, performs the sole atomic
+root-export edit for BR-192. Existing unrelated `durable_delivery` root exports remain
 unchanged; no current symbol is deleted or duplicated. The exact ordered
 BR-192 cross-module contract that must be present after that edit is:
 
@@ -2316,10 +3836,24 @@ ImmutableAppendPort
 AuthoritativeSink
 AuthoritativeSinkPort
 DecisionState
+CountedProducerPermit
+CountedProducerAttestation
+CountedProducerDenied
+acquire_counted_producer_permit
 MAX_AUTOMATIC_RETRY_ATTEMPTS
 RETRY_BACKOFF_SECONDS
 RetryAuthorizationSource
 RetryCandidate
+ExpirableRetrySchedule
+CompleteRetryExpirySnapshot
+PreparedRetryExpiredFreshness
+PreparedRetryExpiryUncertainty
+RetryExpiryUncertaintyReason
+RetryExpiryPreparationOutcome
+RetryExpiryDisposition
+RetryExpiryTerminalKind
+RetryScheduleTerminalState
+RetryCandidateSnapshot
 RetryCycleEvidence
 RetryCycleSinkCalls
 RetryCycleFailureReason
@@ -2335,15 +3869,19 @@ RetryDeferral
 RetryIneligibility
 RetryAdmission
 PreparedRetryAttempt
+RetryAttemptPreparationOutcome
 AppendedSinkAttemptStarted
 RetrySendOwnershipState
 SinkExecutionPermit
+RetrySinkClaimOutcome
 PersistedRetrySinkOutcome
+RetrySinkExecutionOutcome
 OperatorAuthAttestation
 authenticate_monitor_operator
 ProductionRetryAuthorizationRequest
 ProductionRetryAuthorizationOutcome
 authorize_delivery_retry_production
+pub const MAX_RETRY_EVIDENCE_RESULTS: usize = 256
 RetryEvidencePushKind
 RetryEvidenceQuery
 VerifiedRetryEvidence
@@ -2480,6 +4018,28 @@ schema, so Gate D's required
 `durable_push_kind`/`verified_retry_count`/`exact_join` fields cannot diverge
 from the library contract.
 
+The normative production authorities are exact and are not caller-selectable:
+
+```text
+counted pending/commit artifacts:
+  data/push_log/YYYY-MM-DD/<artifact>_audit_pending.json
+  data/push_log/YYYY-MM-DD/<artifact>_committed.json
+counted delivery observation envelope:
+  data/event_bus/YYYY-MM-DD.jsonl
+  event_type = "push.delivery.audit"
+retry-cycle observation envelope:
+  data/event_bus/YYYY-MM-DD.jsonl
+  event_type = "delivery.retry.cycle"
+```
+
+The counted Markdown pre-send log may coexist at
+`data/push_log/YYYY-MM-DD/HHMMSS_<unique>.md`, but it is not a receipt. The
+authoritative receipt is the typed remote receipt joined through SQLite,
+pending/commit artifacts, immutable append refs and the exact
+`push.delivery.audit` envelope. There is no standalone receipt file or fallback
+event type. All production paths are below the compile-time manifest root;
+TEST_CODE mirrors them only below its invocation-unique isolated root.
+
 The verifier streams artifact candidates rather than collecting an unbounded
 filesystem/path/result vector. It validates each complete join and inserts it
 into a bounded map keyed by the typed
@@ -2510,8 +4070,9 @@ final vector length to every `verified_retry_count` and serialize the vector.
    `serde(deny_unknown_fields)`;
 2. filters the exact JSON field
    `durable_push_kind == "ReviewProviderTopN"`;
-3. validates the pending artifact hash, exact commit marker and counted
-   delivery audit event;
+3. validates the pending artifact hash, exact commit marker and exact
+   `data/event_bus/YYYY-MM-DD.jsonl` event with
+   `event_type="push.delivery.audit"`;
 4. opens durable SQLite read-only and joins the terminal decision to the
    immutable retry-attempt binding, the historical rejection disposition,
    appended/applied authorization and its immutable transition event, binding
@@ -2585,12 +4146,15 @@ same file or within a fixed character distance.
     admission atomically creates the attempt/binding/schedule/`Reserved`
     relation, and a crash after that commit but before prepare resumes the same
     attempt without a new generation, ordinal, schedule increment or second
-    sink call;
-12. fresh v0 creation, v1-to-v5, v2-to-v5, v3-to-v5, the single shared
-    v4-to-v5 migration, repeated v5 initialization and newer-version
-    rejection all converge to one byte-compatible v5 manifest; every path
+    sink call; exact source-date-to-next-Shanghai-midnight expiry is immutable,
+    candidate and admission/manual transaction boundaries both reject equality
+    and later times, terminalize one audited `ExpiredFreshness`, cannot be
+    revived by PAM authority and make zero provider/renderer/sink calls;
+12. fresh v0 creation, v1-to-v6, v2-to-v6, v3-to-v6, v4-to-v6 and the single
+    v5-to-v6 migration, repeated v6 initialization and newer-version
+    rejection all converge to one byte-compatible v6 manifest; every path
     registers and self-tests the same deterministic `sha256_hex(BLOB)` UDF
-    before schema creation/migration/validation; v4-to-v5 preserves every
+    before schema creation/migration/validation; v5-to-v6 preserves every
     BR-194 replay row, terminal-replay object, audit-kind definition and
     manifest semantic; canonical-byte/hash trigger mutations fail closed;
 13. frozen envelope hash and all policy fields are revalidated;
@@ -2622,7 +4186,7 @@ same file or within a fixed character distance.
     DTO/canonical/outbox `started_at` values exactly match;
 20. every real accepted/manual terminal and pending terminal state receives
     zero retry sink calls;
-21. all v5 immutable refs reject empty and space/tab/LF/CR-only values in SQL
+21. all v6 immutable refs reject empty and space/tab/LF/CR-only values in SQL
     and Rust;
 22. namespace preimages are deterministic across UTF-8 input, separate
     Production/Test, preserve field boundaries and reject invalid/tampered
@@ -2661,12 +4225,15 @@ same file or within a fixed character distance.
     owner resumes that exact same-boot slot before begin and the begin
     transaction independently proves no global Running row before inserting
     the sole next `Started`;
-26. successful execution returns `PersistedRetrySinkOutcome`, whose result
+26. successful execution returns
+    `RetrySinkExecutionOutcome::Persisted(PersistedRetrySinkOutcome)`, whose result
     identity, terminal decision state and `TerminalRecorded` ownership state
-    match one transactionally persisted join; a failpoint after authoritative
-    result insert but before ownership-state update rolls back both writes,
-    leaves `AttemptInFlight`/`Started`, and recovery conservatively reaches
-    uncertainty with zero resend;
+    match one transactionally persisted join; a failpoint after the ownership
+    pointer/state update but before the authoritative/non-late result insert
+    rolls back both writes, leaves `AttemptInFlight`/`Started` with a NULL
+    terminal-result pointer, and recovery conservatively reaches uncertainty
+    with zero resend; a separate negative test proves a result-first insert is
+    rejected immediately by the reverse trigger;
 27. the public root re-export compile contract imports every runtime/CLI retry
     command, prepared/appended/claim/execute DTO and API without private-module
     access; a monitor-boundary compile/use test imports
@@ -2701,7 +4268,89 @@ same file or within a fixed character distance.
     encoding mutations;
     and
 30. every protected production artifact is unchanged before/after each test
-    group.
+    group;
+31. the counted-producer registry covers `PushKind::ALL` exactly once in its
+    stable order and rejects a missing kind, duplicate kind, unknown state,
+    empty producer seam or empty reason before any acquisition/sink;
+32. all fourteen disabled rows emit the exact design §1.1
+    `disabled=no_producer reason=capability_unavailable:<reason_code>` startup
+    line once and before acquisition/sink, and a later attempted invocation
+    returns the identical reason with provider/data/sink counters all zero;
+33. the sole enabled `ReviewProviderTopN` row emits only exact
+    `enabled=durable_binding producer=push_templates::dispatch_r09_provider_top_n_outcome`,
+    obtains a kind/seam-bound permit before gateway acquisition, freezes the
+    source expiry, and remains Gate D blocked until a real push-log plus exact
+    `push.delivery.audit` join exists; and
+34. the syntax/multiline-aware all-15 inventory covers every generic counted
+    entrypoint, template ID/label and caller in §1.2, rejecting an unclassified
+    call, acquisition-before-guard or a second enabled producer;
+35. fixed-HEAD `ReviewTask::R09`, its unique `ALL` position, `R-09` label and
+    `SourceOnly` classification remain byte/semantically unchanged; Gate B
+    wires only the producer/central-dispatch edges, and a provider-verified
+    empty pair returns typed `Failed` with zero binding and zero sink calls;
+36. final-pre-call expiry exercises Transaction-A failpoints after companion
+    insert, ownership transition, expiry insert and cycle recount, proving every
+    earlier write rolls back; successful cases prove `Confirmed(0)` and
+    `Confirmed(n>0)` from exact ownership/result joins, then crash after
+    Transaction A, Pending append and Appended acknowledgement in separate real
+    child processes and prove recovery resumes expiry before quarantine;
+37. Transaction-B failpoints after fence revocation, reservation/head release,
+    direct decision CAS, binding clear and schedule CAS prove full rollback;
+    exact replay is `AlreadyTerminalized`, partial/drift is a typed error, and
+    every selector/recovery/post-validator ignores the effective terminal base
+    `AttemptInFlight` row before generic state classification;
+38. real two-connection result/expiry races cover both orders: a committed
+    authoritative result makes companion/ownership/expiry writes fail, while
+    any committed companion, freshness-terminal ownership or expiry row makes
+    `trg_retry_sink_result_insert_rejects_pre_call_expiry_authority` reject the
+    result; ownership and expiry triggers each independently recheck zero result
+    and the all-twelve-trigger manifest is exact;
+39. compile/source tests prove only `DurableDeliveryCoordinator` owns and reads
+    `ProductionFreshnessClock`, while `retry_command.rs` owns no clock and
+    cannot pass a freshness timestamp; and
+40. the root compile contract imports
+    `pub const MAX_RETRY_EVIDENCE_RESULTS: usize = 256`, and fixed-HEAD inventory
+    tests bind the `review_batch.rs`/`v14_adapter.rs` blobs and classify
+    `CloseCall`, `ForbiddenOps` and `ReviewFailure` calls after
+    `#[cfg(test)] mod tests` as test-only rather than production callers;
+41. the fixed-HEAD inventory test accounts for every direct production call in
+    §1.2, including all repeated HoldingEvent, T0Advice, ReviewSignal and
+    DailyReport call sites, and fails on any omitted or extra entry;
+42. BR-198 tests prove future/same-day-15:35/prior-review-calendar ordering,
+    every provider `f297` equals the requested review date, host `TZ` cannot
+    change the explicit Asia/Shanghai review date or 15:35 boundary, closed-day
+    initial acquisition remains runnable, and retry expiry is never extended;
+43. BR-200 tests prove durable occurrence inspection precedes permit/provider/
+    renderer/sink, terminal evidence replays without reacquisition, corrupt or
+    ambiguous authority fails closed, and one business-date occurrence cannot
+    create a second R-09 decision;
+44. every authoritative result and `TerminalRecorded` ownership form an exact
+    bidirectional join through write-once `terminal_sink_result_identity`, with
+    orphan, duplicate, mismatch, second-result and result-on-nonterminal cases
+    rolling back atomically; and
+45. the public begin signature uses only
+    `durable_delivery::Result<RetryCycleBeginOutcome>`, while rollback tests
+    prove retry-origin Reserved work either retains the four-stage seam or
+    remains untouched and never reaches legacy `resume_deliverable`;
+46. BR-198 tests independently reject capture before the requested date,
+    before the trusted request-start observation, after the trusted request-
+    completion observation, capture crossing the Shanghai observation-date
+    midnight and invalid provider capture timestamps; the exact raw provider
+    timestamp bytes remain bound to evidence, with atomic pair rejection and
+    zero durable/sink writes;
+    a separate round-trip/mutation test proves both exact raw timestamp arrays
+    and their domain-separated hashes survive the pair binding and any byte
+    change is rejected before durable/sink;
+47. a prior-date initial R-09 acquisition is explicitly admitted despite an
+    elapsed retry expiry, while retry-candidate discovery, automatic retry
+    admission and manual retry authorization reject the same elapsed expiry;
+48. BR-200 tests separately assert Delivered-missing-hydration retryability,
+    Rejected/Uncertain terminal behavior and nonterminal retryability,
+    including exact reason, next-attempt and zero-call fields;
+49. producer, transition and hydration evidence preserve exact ordered rule
+    IDs `[BR-110,BR-140,BR-192,BR-194,BR-198,BR-200]`; and
+50. SourceOnly R-09 accepts only `(business_date, observed_at)` and static tests
+    reject `BannerCtx`, banner text, AccountMode and broker-snapshot authority.
 
 The selector inventory also contains one owning library test per exact
 full-snapshot contract:
@@ -2717,18 +4366,48 @@ br192_authorization_reconcile_bound_returns_exact_typed_variant
 br192_cycle_audit_reconcile_bound_returns_exact_typed_variant
 br192_retry_cycle_ordinal_is_positive_unique_immutable_and_non_deletable
 br192_retry_cycle_identity_rederives_from_retained_ordinal_and_exact_fields
-br192_schema_v5_fresh_and_v1_v2_v3_v4_upgrade_paths_validate
-br192_schema_v5_cycle_ordinal_manifest_is_identical_across_v0_v1_v2_v3_v4
-br192_schema_v5_repeated_initialization_is_idempotent
-br192_schema_newer_than_v5_fails_before_mutation
-br192_v4_to_v5_preserves_br194_replay_manifest_audit_kinds_and_rows
+br192_counted_producer_attestation_is_same_transaction_immutable_and_hash_valid
+br192_counted_producer_attestation_preimage_excludes_digest_and_has_golden_hash
+br192_counted_producer_attestation_projection_rejects_preimage_or_digest_mutation
+br192_v5_decisions_gain_no_synthetic_producer_attestation
+br192_delivery_envelope_none_attestation_preserves_v5_canonical_bytes
+br192_delivery_envelope_attestation_setter_has_one_permitted_production_caller
+br192_retry_schedule_persists_exact_source_date_expiry_and_terminal_state
+br192_retry_expiry_outbox_replays_prepare_append_ack_and_terminalize_crashes
+br192_expiry_preparation_outcome_is_total_and_never_uses_durable_error_for_business_expiry
+br192_prepare_retry_attempt_expired_before_start_returns_expiry_prepared_without_start
+br192_claim_retry_sink_execution_expired_after_appended_start_returns_uncertainty_without_permit
+br192_start_first_uncertainty_reconciliation_clears_active_schedule_to_fixed_point
+br192_admission_expiry_is_appended_and_terminalized_before_cycle_advances
+br192_historical_terminal_start_does_not_block_current_attempt_expiry
+br192_pre_call_expiry_companion_requires_complete_same_transaction_triple
+br192_pre_call_expiry_companion_is_canonical_immutable_and_commit_deferred
+br192_pre_call_expiry_transaction_a_rolls_back_every_failpoint
+br192_pre_call_expiry_cycle_recount_confirms_zero_and_prior_results
+br192_pre_call_expiry_with_other_started_keeps_cycle_indeterminate_atomically
+br192_pre_call_expiry_with_interrupted_uncertain_keeps_cycle_indeterminate_atomically
+br192_pre_call_expiry_recovery_precedes_prior_boot_uncertainty
+br192_pre_call_expiry_transaction_b_rolls_back_every_failpoint
+br192_pre_call_expiry_transaction_b_is_exactly_idempotent
+br192_effective_expired_attempt_is_excluded_before_base_state_classification
+br192_sink_result_and_pre_call_expiry_race_is_total_in_both_orders
+br192_sink_result_reverse_trigger_rejects_each_partial_expiry_authority
+br192_pre_call_ownership_and_expiry_triggers_each_recheck_zero_result
+br192_schema_v6_contains_all_nine_expiry_ordering_triggers
+br192_schema_v6_fresh_and_v1_v2_v3_v4_v5_upgrade_paths_validate
+br192_schema_v6_cycle_ordinal_manifest_is_identical_across_v0_v1_v2_v3_v4_v5
+br192_schema_v6_repeated_initialization_is_idempotent
+br192_schema_newer_than_v6_fails_before_mutation
+br192_v5_to_v6_preserves_br194_replay_manifest_audit_kinds_and_rows
 br192_durable_sha256_udf_is_registered_before_every_schema_path
 br192_durable_sha256_udf_registration_follows_complete_descriptor_binding
 br192_durable_sha256_udf_never_runs_before_wal_shm_attestation
+br192_wal_materialization_is_the_only_pre_binding_sqlite_exception
+br192_wal_materialization_rejects_omitted_reordered_or_extra_sqlite_steps
 br192_rusqlite_031_exposes_utf8_deterministic_and_innocuous_function_flags
 br192_durable_sha256_udf_rejects_null_text_and_wrong_type
-br192_v5_authority_triggers_recompute_canonical_sha256
-br192_v5_authority_triggers_reject_bytes_hash_and_combined_mutations
+br192_v6_authority_triggers_recompute_canonical_sha256
+br192_v6_authority_triggers_reject_bytes_hash_and_combined_mutations
 br192_python_br194_verifier_uses_hashlib_without_sql_callback_or_trigger_execution
 br192_cycle_begin_derives_identity_before_running_check_and_binds_no_commit_proof
 br192_no_commit_branch_queries_zero_proposed_cycle_and_started_before_rollback
@@ -2756,6 +4435,37 @@ br192_retry_runtime_boundary_uses_only_durable_result_and_exact_failure_construc
 br192_begin_not_committed_propagates_exact_typed_error_after_proof_release
 br192_begin_commit_ambiguous_propagates_exact_typed_error_and_latches_guard
 br192_guard_failures_return_exact_typed_variants_without_string_downgrade
+br192_counted_producer_registry_covers_all_kinds_once
+br192_counted_producer_registry_rejects_missing_duplicate_and_empty_state
+br192_missing_producers_emit_exact_startup_banners_before_acquisition
+br192_enabled_producers_name_binding_seams_and_never_emit_disabled_banner
+br192_disabled_producer_attempt_returns_before_acquisition_and_sink
+br192_r09_enabled_producer_acquires_permit_before_gateway_and_freezes_expiry
+br192_r09_fixed_head_task_surface_is_preserved_and_empty_is_failed
+br192_expired_freshness_terminal_is_single_audited_and_not_revivable
+br192_all_counted_callers_require_catalog_permit_or_binding
+br192_production_freshness_clock_is_coordinator_owned_only
+br192_root_exports_max_retry_evidence_results_as_256
+br192_fixed_head_inventory_excludes_cfg_test_counted_callers
+br192_fixed_head_inventory_classifies_every_counted_entry_call
+br192_pre_call_expiry_requires_result_terminal_ownership_bijection
+br192_cycle_begin_public_signature_uses_only_durable_result_error_channel
+br192_rollback_preserves_four_stage_retry_origin_reserved_recovery
+br192_rollback_never_routes_retry_origin_reserved_to_resume_deliverable
+br192_br198_closed_day_r09_uses_review_business_date_and_exact_f297
+br192_br198_future_r09_fails_before_durable_preflight_permit_provider_renderer_sink
+br192_br198_same_day_1535_boundary_precedes_terminal_preflight
+br192_br198_closed_day_rejection_does_not_extend_source_expiry_or_retry
+br192_br198_host_tz_cannot_change_shanghai_review_date_or_1535_boundary
+br192_br198_capture_before_trusted_request_start_fails_pair_before_durable_sink
+br192_br198_capture_after_trusted_request_completion_fails_pair_before_durable_sink
+br192_br198_capture_raw_bytes_round_trip_and_mutation_rejects_pair_before_durable_sink
+br192_br200_r09_delivered_preflight_precedes_permit_gateway_renderer_and_sink
+br192_br200_r09_rejected_uncertain_and_nonterminal_preflight_are_provider_free
+br192_br200_r09_missing_hydration_and_corrupt_or_ambiguous_authority_fail_closed
+br192_br200_r09_no_occurrence_orders_preflight_then_permit_then_provider_then_renderer_then_sink
+br192_br200_r09_startup_barrier_failure_is_provider_free
+br192_br200_business_date_once_claim_prevents_second_r09_decision
 ```
 
 The reboot suite is a real parent/child-process protocol, not two in-process
@@ -2823,6 +4533,12 @@ regression and cannot substitute for the reboot parent.
 | claim owned elsewhere | `Deferred::BusinessDateClaimedByOther`; zero calls |
 | rolling head reserved/uncertain | exact typed deferral; zero calls |
 | cooldown/backoff active | exact persisted `eligible_at`; zero calls |
+| source evidence reaches `expires_at` before discovery, admission or manual authorization | append/ack exact `RetryExpiredFreshness`; retained schedule becomes terminal `ExpiredFreshness`, active binding is cleared, typed `NoLongerEligible::ExpiredFreshness { expires_at }`; zero provider/renderer/sink calls and no manual revival |
+| manual target is already expired and has no authorization/schedule | one `BEGIN IMMEDIATE` creates the zero-attempt schedule plus nullable-authorization `ManualTargetExpiredBeforeAuthorization` Pending expiry, no authorization; exact append/ack/CAS returns typed expired ineligibility |
+| expiry prepare wins before start prepare | Pending expiry authority commits first; all later start insertion/ack and ownership writes are rejected by exact triggers; expiry resumes to terminal fixed point |
+| Pending/Appended start or ordinary ownership wins before ordinary expiry prepare | expiry writes no outbox row; retained attempt follows uncertainty because immutable start append may already have happened, except that the live permit holder may still execute the exact final-pre-call Transaction-A no-call protocol |
+| ownership was claimed fresh but final pre-call observation reaches expiry | invoke zero sink; Transaction A atomically persists companion, `FreshnessExpiredBeforeExternalCall`, Pending `ReservedExpiredBeforeSink` and the exact cycle recount (`Indeterminate/NULL` if another same-cycle `Started|InterruptedUncertain` remains, otherwise `Confirmed(0)` or prior-result `Confirmed(n)`); append/ack exact expiry; Transaction B revalidates the same branch, revokes fence, releases reservation/head, restores the decision's original `RejectedDurable`, clears binding and terminalizes schedule while retaining the schema-v5 base attempt as effective terminal history |
+| sink result races pre-call expiry authority | `BEGIN IMMEDIATE` plus all twelve triggers establish a total order: result first makes every expiry member fail its zero-result recheck; any companion/expiry-terminal ownership/expiry row first makes the reverse `BEFORE INSERT ON sink_results` trigger reject the result; never both |
 | retry count exhausted | one durable `RetryAttemptsExhausted`; removed from candidates |
 | competing process wins | loser observes changed state/generation; zero sink calls |
 | namespace/preimage/hash or owner-boot validation fails before guard acquisition | no guard, cycle or `Started` slot exists; return the typed error |
@@ -2838,11 +4554,11 @@ regression and cannot substitute for the reboot parent.
 | completion outbox is acknowledged but terminal CAS has not run | cycle remains `Running/CompletionAppended`; same-boot/startup/JoinError recovery validates exact stored completion bytes and performs only the Completed CAS before a later cycle can begin |
 | failure outbox append or acknowledgement fails | cycle remains `Running/FailurePending` with complete immutable typed-preimage/envelope bytes and exact Pending outbox; guard may release only after validating this safety point; the next same-boot guard owner resumes only Failed to terminal before begin; never reports terminal Failed early |
 | failure outbox is acknowledged but terminal CAS has not run | cycle remains `Running/FailureAppended`; same-boot/startup/JoinError recovery uses only persisted failure payload/outbox bytes, recomputes both hashes and performs the CAS before a later cycle can begin |
-| crash after prior-boot start append or pre-call CAS, including before actual call | appended start and/or retained `send_consumed` force typed `ProcessInterruptedAfterSinkStart` uncertainty; recovery zero sink calls |
+| crash after prior-boot start append or pre-call CAS, including before actual call | an exact companion + `FreshnessExpiredBeforeExternalCall` + Pending/Appended expiry is reconciled first as definite zero-call expiry through Transaction B; only a remaining unmatched appended start/consumed ownership forces typed `ProcessInterruptedAfterSinkStart` uncertainty; recovery makes zero sink calls |
 | ordinary cycle error or caught panic after same-cycle start/claim | common failure finalizer quarantines every qualifying same-cycle attempt, append/acks all uncertainty before `Failed`, and makes zero sink calls; pending uncertainty prevents premature `Failed` |
 | remote accepts, process dies before result recording | same conservative uncertainty; never infer rejection/acceptance and never resend |
 | repeated/current or competing process execute | only `Reserved -> AttemptInFlight` CAS winner receives the consumed permit; losers make zero sink calls |
-| `record_sink_result` fails after authoritative-result insert but before ownership becomes `TerminalRecorded` | the single result/ownership transaction rolls back completely; no sink result remains, decision stays `AttemptInFlight`, ownership stays `Started`, and recovery records `ProcessInterruptedAfterSinkStart` uncertainty with zero resend |
+| `record_sink_result` fails after ownership becomes `TerminalRecorded` with its prospective result pointer but before the authoritative/non-late result insert | the single ownership/result transaction rolls back completely; no sink result remains, decision stays `AttemptInFlight`, ownership stays `Started` with a NULL terminal-result pointer, and recovery records `ProcessInterruptedAfterSinkStart` uncertainty with zero resend |
 | definite sink rejection | new frozen rejection; later retry only through its appended/applied authorization |
 | sink timeout/transport/cancel/write-after-loss | uncertainty; retained reservation; never auto-retry |
 | result/disposition/task append fails after sink | exact pending/uncertain recovery only; never resend |
@@ -2860,8 +4576,8 @@ regression and cannot substitute for the reboot parent.
 | deterministic `sha256_hex` UDF registration or fixed-vector self-test fails after complete main/WAL/SHM descriptor binding | coordinator bootstrap fails with `durable_sha256_udf_unavailable` before connection configuration/schema inspection/migration/validation and before any business mutation; retained descriptor lifecycle is closed normally |
 | UDF registration is attempted before main/WAL/SHM binding or after schema work | bootstrap-order test/checker rejects the implementation; no coordinator is published |
 | Python BR-194 verifier attempts `create_function`, DML or trigger execution | release checker/verifier source gate rejects it; Python remains a read-only catalog/row reader and uses `hashlib.sha256` on returned BLOB bytes |
-| v5 authority trigger observes canonical bytes whose recomputed digest differs from the stored lowercase SHA-256 | triggering mutation is rejected atomically; no authority projection, outbox or manifest state advances |
-| shared schema v4-to-v5 migration/post-validation fails | transaction rolls back; `user_version` remains v4 and every pre-existing BR-194 row/object/audit-kind/manifest semantic remains unchanged |
+| v6 BR-192 authority trigger observes canonical bytes whose recomputed digest differs from the stored lowercase SHA-256 | triggering mutation is rejected atomically; no authority projection, outbox or manifest state advances |
+| schema v5-to-v6 migration/post-validation fails | transaction rolls back; `user_version` remains v5 and every pre-existing BR-194 row/object/audit-kind/manifest semantic remains unchanged |
 
 ## 13. Old-module disposition
 
@@ -2872,6 +4588,9 @@ regression and cannot substitute for the reboot parent.
 | existing `ReconcileSummary` | adopt unchanged | Its current eight fields and single constructor remain startup reconciliation evidence; retry candidates use a new coordinator query and `RetryCycleEvidence`, avoiding a fabricated non-existent summary field. |
 | monolithic retry use of `resume_deliverable` | replace for retry origin | Retry must use prepare -> append/ack start -> pre-call ownership CAS -> execute; indeterminate starts quarantine and ordinary non-retry Reserved recovery is unchanged. |
 | existing disposition/state/task immutable outboxes | adopt | Preserve exact-byte recovery and append acknowledgement. |
+| fixed-HEAD R-09 hydration/support code | adopt | It supplies task identity only; Gate B still builds and tests the real producer seam. |
+| worktree `CapitalDataGateway::provider_top_n_pair` and `dispatch_r09_provider_top_n_outcome` candidates | inspect then conform | They are useful candidate code but have no authority until the exact Gate-B implementation, permit, expiry and tests pass. |
+| generic counted callers in `notify.rs`, `push_templates.rs`, `main.rs`, `review_batch.rs` and `v14_adapter.rs` | guard/disable | Every call must be classified by the catalog; fourteen paths stop before counted-specific acquisition and R-09 alone receives a permit. |
 | `Fixture`, `MemoryAppendPort`, `StaticSink`, existing helper functions | adopt | Extend established physical-isolation and deterministic sink patterns. |
 | producer `DeliveryEnvelope.retry_authorized` | reject as authority | Compatibility projection only; cannot authorize admission. |
 | observer-only retry summaries | replace | Governance decisions require durable cycle-bound audit. |
@@ -2880,58 +4599,115 @@ regression and cannot substitute for the reboot parent.
 
 ## 14. Rollback
 
-Rollback restores the previous runtime behavior in new v5-aware code; it is not
+Rollback restores the previous runtime behavior in new v6-aware code; it is not
 a schema downgrade or data deletion:
 
+Task 8 creates the reviewed forward patch
+`tools/release/disable_br192_periodic_retry.patch`. Its only `diff --git`
+target is `src/bin/monitor/main.rs`, and its only semantic change removes the
+single periodic retry-runner installation while retaining the startup catalog,
+R-09 producer/gateway, BR-200 occurrence preflight, v6 schema/UDF/manifest,
+retry-origin classifier and all reconciliation APIs. The release gate runs
+`git apply --check` against the exact accepted release source and rejects a
+second file, catalog edit, dependency edit, schema edit, R-09 edit or generic-
+delivery restoration. Rollback applies this artifact forward from the accepted
+release SHA; it never reverts the atomic Task-8 commit.
+
+Task 8 also creates
+`tools/release/verify_br192_forward_rollback.sh`. Normal Gate B and Gate C run
+this verifier against either the literal fully staged Task-8 candidate commit
+object or the literal accepted release commit before deployment, not against a
+pre-Task-8 branch HEAD and not only after an incident. The candidate commit is
+created with `git write-tree` + `git commit-tree` without moving the branch;
+its tree must equal the subsequent reviewed implementation commit tree. The
+verifier enforces one exact patch target, applies the patch in an isolated
+detached worktree, rejects edits to R-09/BR-200/catalog/dependency/schema/UDF/
+manifest/reconciliation/audit/startup-cycle authorities, builds the rollback
+release binary, and runs all twelve exact `br192_br198_*` tests, the seven exact
+`br192_br200_r09_*` tests plus the BusinessDateOnce claim test, schema-v6 and
+v5-preservation tests, the complete counted-producer catalog suite, exact Magic
+release-identity test, the two exact v6 four-stage retry-origin recovery tests,
+and exact startup-cycle isolation test
+`durable_delivery_runtime::tests::br192_startup_and_periodic_paths_share_one_cycle_algorithm`.
+A stale, multi-file,
+semantically broad, unbuildable or zero-test patch blocks release.
+
 1. stop the monitor;
-2. build and deploy a new forward-compatible rollback binary from the previous
-   runtime behavior while retaining v5 schema recognition, deterministic
+2. create a rollback branch at the exact accepted release SHA, apply and stage
+   the reviewed forward patch, then build and deploy that new forward-compatible
+   rollback binary while retaining v6 schema recognition, deterministic
    `sha256_hex` registration and complete shared-manifest validation;
-3. disable the periodic BR-192 runner at its single main startup call site;
-4. retain `retry_authorizations`, authorization/attempt bindings,
-   `retry_schedules`, `retry_cycles`, `retry_cycle_failure_payloads` and all
-   authorization/cycle audit event outboxes for the five-year audit period;
+3. disable only the periodic BR-192 retry runner at its single main startup
+   call site. Preserve the exact validated 15-row catalog bytes, identity and
+   enabled R-09 row unchanged so retained attestations, expiry outboxes and
+   initial R-09 durable delivery remain verifiable; never route R-09 to legacy
+   generic delivery. A catalog change is a new Gate-A decision and is forbidden
+   until every retained/pending authority has terminalized;
+4. retain `counted_producer_attestations`, `retry_authorizations`,
+   authorization events/bindings, attempt bindings, `retry_schedules`,
+   `retry_expiry_audit_outbox`, `retry_pre_call_expiry_authorities`,
+   `retry_send_ownership`, `retry_cycles`,
+   `retry_cycle_failure_payloads` and every authorization/expiry/cycle audit
+   outbox for the five-year audit period;
 5. do not restore automatic `reacquire_rejected`;
-6. leave authorized rejections non-deliverable until a corrected release; and
-7. restart the v5-aware rollback binary and verify the previous reconciliation
-   path handles only already Reserved/terminal pending bytes.
+6. leave authorized rejections non-deliverable until a corrected release,
+   while preserving every `ExpiredFreshness` terminal and its audit; and
+7. restart the v6-aware rollback binary with a retained retry-origin
+   classifier. Every retry-origin `Reserved` row must continue through the
+   four-stage `prepare_retry_attempt -> append/ack start ->
+   claim_retry_sink_execution -> execute_prepared_retry_sink` path, including
+   its expiry and uncertainty branches; it must never enter legacy
+   `resume_deliverable`. If the rollback binary cannot provide that four-stage
+   seam, it leaves the retry-origin row untouched and fail-closed for the next
+   corrected release. Existing pending terminal bytes continue only through
+   their exact idempotent reconciliation path.
 
 Rollback must never delete a reservation generation, attempt fence,
 authorization, receipt, disposition or audit record.
-An historical v2/v3/v4 binary must never be launched against the v5 database,
+An historical v2/v3/v4/v5 binary must never be launched against the v6 database,
 and rollback must not lower `user_version`, unregister `sha256_hex`, or remove
-v4 baseline or v5 companion columns, tables, triggers or indexes. The rollback
+v5 baseline or v6 companion columns, tables, triggers or indexes. The rollback
 binary must preserve all BR-194 replay objects, audit kinds and manifest
 semantics introduced before or alongside BR-192.
 
 ## 15. Gate A evidence
 
-Fresh independent review of the exact identities recorded in §0.1 found
-`Critical=0 / Important=0 / Minor=1`. The checklist below is the accepted
-Gate A contract. Minor-1 concerned mixed-file packaging only and was closed
-by the exact cached-row and masked-non-row equality proof recorded in §0.1.
-Gate B implementation may begin only against those accepted identities;
-Gate B/C/D and live evidence remain pending. The reviewer confirmed:
+The historical independent review of the exact identities recorded in §0.1
+found `Critical=0 / Important=0 / Minor=1`; its packaging-only Minor-1 was
+closed by the cached-row proof there. Later exact reviews found C0/I1, C0/I2,
+C1/I6/M1, C0/I3/M0 and then a final RED over the newer staged contract. This
+revision closes the identified design-side findings with the exact two-transaction
+effective expiry terminal, precedence-safe recovery, atomic cycle recount,
+exact reverse result triggers, typed expiry, coordinator-only clock, fixed-HEAD
+R09/test caller truth, current-attempt predicate, permit-task ownership, public
+evidence bound and complete blob binding. These amendments invalidate all
+earlier identities for Gate
+progression. A fresh independent review of the new exact design/plan/row
+identities must return C0/I0 before Gate B may resume. Gate B/C/D and live
+evidence remain pending.
+The historical reviewer confirmed the following unchanged baseline:
 
 - all state transitions and append/apply recovery paths above are represented
   in the implementation plan;
 - this corrective document explicitly replaces every unaccepted BR-192 retry
   Gate A/B draft instead of depending on one as an accepted specification;
 - BR-192 in `docs/business_rules.md` will be updated before logic changes;
-- every changed/new file is listed;
-- validation commands are executable and use JSON coverage; and
+- every changed/new file is listed and every planned Gate-B source path cites
+  BR-202 in the same staged slice;
+- validation commands are executable; raw JSON coverage is diagnostic and
+  only the BR-202 isolated wrapper can mint Gate-D authority; and
 - no task relies on an undefined helper, silent zero-test filter or production
   artifact access;
-- the repository baseline is schema v4 and BR-192 plus BR-194 companion
-  authority objects land through exactly one coherent v4-to-v5 transaction;
-  fresh/v1/v2/v3/v4 paths converge to one v5 manifest while preserving every
-  v4 BR-194 replay object, audit kind, row and manifest semantic;
+- the fixed-HEAD repository baseline is schema v5 and BR-192 companion
+  authority objects land through exactly one coherent v5-to-v6 transaction;
+  fresh/v1/v2/v3/v4/v5 paths converge to one v6 manifest while preserving every
+  v5 BR-194 replay object, audit kind, row and manifest semantic;
 - `rusqlite` enables its `functions` feature, one central
   `register_durable_sql_functions(&Connection)` seam registers and self-tests
   deterministic BLOB-only `sha256_hex` only after complete main/WAL/SHM
   descriptor binding and before connection configuration/fresh-schema
   creation/migration/validation on every Rust/rusqlite durable connection;
-  every v5 authority trigger, the BR-192 Rust verifier and shared checker
+  every v6 BR-192 authority trigger, the BR-192 Rust verifier and shared checker
   recompute the same canonical SHA-256, while the Python BR-194 read-only
   verifier uses `hashlib.sha256` and catalog inspection without registering a
   SQL callback or firing a trigger;
@@ -2943,13 +4719,15 @@ Gate B/C/D and live evidence remain pending. The reviewer confirmed:
   single-use permit and coordinator-owned
   `record_sink_result(AttemptInFlight)` precondition close the
   post-send/pre-result double-send window; the public execute method returns
-  only `PersistedRetrySinkOutcome`, never a bare sink result;
+  only `RetrySinkExecutionOutcome`, never a bare sink result;
 - all prepare/reconcile/validate/claim/execute operations are
   `DurableDeliveryCoordinator` methods with explicit database authority;
 - the authoritative-result/`TerminalRecorded` fault point proves full
   transaction rollback and conservative zero-resend recovery;
-- startup and JoinError recovery quarantine every qualifying prior-boot
-  attempt, while both ordinary cycle error and caught panic use one common
+- startup and JoinError recovery first resume every exact pre-call expiry
+  triple through Transaction B and exclude its effective terminal attempt;
+  they quarantine only remaining qualifying prior-boot attempts, while both
+  ordinary cycle error and caught panic use one common
   finalizer to quarantine every qualifying same-cycle appended-start,
   consumed/`Started` ownership or in-flight attempt without a terminal result
   as `ProcessInterruptedAfterSinkStart`; all uncertainty is append/acknowledged

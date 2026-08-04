@@ -496,4 +496,64 @@ mod tests {
             1
         );
     }
+
+    #[test]
+    fn chain_snapshot_rejects_each_invalid_rule_contract() {
+        let mut empty_id = test_rule("chip", 100, &["芯片"]);
+        empty_id.chain = " ".to_owned();
+        let mut empty_logic = test_rule("chip", 100, &["芯片"]);
+        empty_logic.logic = " ".to_owned();
+        let too_high = test_rule("chip", 101, &["芯片"]);
+        let empty_keywords = test_rule("chip", 100, &[]);
+        let blank_keyword = test_rule("chip", 100, &[" "]);
+        let mut disabled = test_rule("chip", 100, &["芯片"]);
+        disabled.enabled = false;
+
+        for (rule, expected) in [
+            (empty_id, "chain_id_empty"),
+            (empty_logic, "chain_logic_empty"),
+            (too_high, "chain_priority_out_of_range"),
+            (empty_keywords, "chain_keywords_invalid"),
+            (blank_keyword, "chain_keywords_invalid"),
+            (disabled, "no_enabled_chain_rules"),
+        ] {
+            let error = ChainConfigSnapshot::from_rules(&[rule]).expect_err("invalid chain rule");
+            assert_eq!(error.reason_code(), expected);
+            assert!(!error.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn event_object_participates_in_mapping_and_direct_error_is_displayable() {
+        let snapshot = ChainConfigSnapshot::from_rules(&[test_rule("chip", 100, &["芯片"])])
+            .expect("snapshot");
+        let mut event = test_event("TEST_CODE_event", "普通公告");
+        event.object = Some("芯片".to_owned());
+        assert_eq!(map_events(&[event], &snapshot)[0].chain_ids(), ["chip"]);
+
+        let observed_at = Local
+            .with_ymd_and_hms(2026, 7, 23, 8, 30, 0)
+            .single()
+            .expect("time");
+        let master = SecurityMasterSnapshot::new(
+            vec![
+                SecurityIdentity {
+                    code: "TEST_CODE_000001".to_owned(),
+                    name: "同名".to_owned(),
+                    market: SecurityMarket::Shanghai,
+                },
+                SecurityIdentity {
+                    code: "TEST_CODE_000002".to_owned(),
+                    name: "同名".to_owned(),
+                    market: SecurityMarket::Shenzhen,
+                },
+            ],
+            "TEST_CODE_master".to_owned(),
+            observed_at,
+        )
+        .expect("master");
+        let error = direct_mentions("同名", &master).expect_err("ambiguous");
+        assert_eq!(error.reason_code(), "ambiguous_security_name");
+        assert!(!error.to_string().is_empty());
+    }
 }

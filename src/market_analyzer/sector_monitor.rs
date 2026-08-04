@@ -2,9 +2,9 @@
 // -*- coding: utf-8 -*-
 //! 板块监控与共振引擎
 //!
-//! 通过东方财富 push2 API 实时拉取概念板块涨幅榜与主力净流入榜，
-//! 与宏观新闻 / AI 提示中出现的板块名称做共振判断，
-//! 输出共振板块的龙头股，供候选股票池注入使用。
+//! 消费统一 Gateway 接纳的板块与资金证据，
+//! 与宏观新闻 / AI 提示中出现的板块名称做共振判断。
+//! 当前缺少完整排行合同的入口显式返回 Unsupported。
 //!
 //! 设计目标：解决“AI 不敢喊代码 → 风口被错过”的痛点：
 //! - AI 只需要给出**板块名**（机器人、低空经济、固态电池…）
@@ -16,14 +16,11 @@
 //!  B. 主力资金净流入排名前 N （表明真金白银在买）
 //!  C. 板块名称命中宏观新闻 / AI 推荐文本（可选加权）
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use log::{info, warn};
-use reqwest::blocking::Client;
-use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
 
-/// 东方财富概念板块条目
+/// 已接纳概念板块条目
 #[derive(Debug, Clone)]
 pub struct ConceptBoard {
     /// 板块代码，例如 "BK0815"
@@ -215,321 +212,40 @@ pub struct ResonanceSector {
     pub ignition: IgnitionStats,
 }
 
-/// 概念板块端点 (m:90+t:3 即"概念板块")
-///
-/// 东方财富 push2 主域名近期对部分公网出口存在 RST/断流问题，
-/// 这里按优先级尝试多个候选主机，第一个返回有效 JSON 的胜出。
-const BOARD_LIST_HOSTS: &[&str] = &[
-    "push2delay.eastmoney.com",
-    "push2.eastmoney.com",
-    "82.push2.eastmoney.com",
-];
-
-fn build_client() -> Result<Client> {
-    Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .context("创建HTTP客户端失败(sector_monitor)")
-}
-
-/// 在多个候选主机上依次发起同一 query，第一个成功的胜出。
-fn get_with_fallback(client: &Client, params: &[(&str, &str)]) -> Result<Value> {
-    let mut last_err: Option<anyhow::Error> = None;
-    for host in BOARD_LIST_HOSTS {
-        let url = format!("https://{}/api/qt/clist/get", host);
-        let resp = client
-            .get(&url)
-            .query(params)
-            .header(
-                "User-Agent",
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-            )
-            .header("Referer", "https://quote.eastmoney.com/")
-            .send();
-        match resp.and_then(|r| r.text()) {
-            Ok(text) => match serde_json::from_str::<Value>(&text) {
-                Ok(json) => {
-                    if json.get("data").map(|d| !d.is_null()).unwrap_or(false) {
-                        return Ok(json);
-                    }
-                    last_err = Some(anyhow::anyhow!("{} 响应 data=null", host));
-                }
-                Err(e) => last_err = Some(anyhow::anyhow!("{} JSON解析失败: {}", host, e)),
-            },
-            Err(e) => last_err = Some(anyhow::anyhow!("{} 请求失败: {}", host, e)),
-        }
-    }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("所有候选主机均不可达")))
-}
-
-/// 按指定字段从东财概念板块榜拉取前 `top_n` 名
-///
-/// `fid` 取值：
-/// - "f3"  按涨跌幅排序
-/// - "f62" 按主力净流入排序
-///
-/// 两路调用均请求完整字段集（涨幅/净流入 + 量比/换手 + 今日/5日主力净占比），
-/// 保证无论板块来自哪一路榜单都携带完整的领先信号，便于后续共振判定。
+/// 旧 `ConceptBoard` 需要量比、换手、今日/5日资金占比等同批次字段。
+/// 当前发布的统一板块资金合同没有这些字段，因此不能把不完整 Gateway
+/// 结果伪装成可用于领先信号计算的完整记录。
 pub fn fetch_board_ranking(fid: &str, top_n: usize) -> Result<Vec<ConceptBoard>> {
-    let client = build_client()?;
-    let pz = top_n.clamp(10, 200).to_string();
-    let params: [(&str, &str); 11] = [
-        ("pn", "1"),
-        ("pz", pz.as_str()),
-        ("po", "1"),
-        ("np", "1"),
-        ("ut", "bd1d9ddb04089700cf9c27f6f7426281"),
-        ("fltt", "2"),
-        ("invt", "2"),
-        ("fid", fid),
-        ("fs", "m:90+t:3+f:!50"),
-        // f3=涨幅, f8=换手率, f10=量比, f12=代码, f14=名称, f62=主力净流入,
-        // f128=领涨股名, f184=今日主力净占比, f165=5日主力净占比
-        ("fields", "f3,f8,f10,f12,f14,f62,f128,f184,f165"),
-        ("_", "1"),
-    ];
-
-    let json = get_with_fallback(&client, &params).context("拉取概念板块榜失败")?;
-
-    let diff = json
-        .get("data")
-        .and_then(|d| d.get("diff"))
-        .and_then(|d| d.as_array())
-        .ok_or_else(|| anyhow::anyhow!("概念板块榜响应缺少 data.diff 数组"))?;
-
-    let mut boards = Vec::with_capacity(diff.len());
-    for (index, item) in diff.iter().enumerate() {
-        let code = required_board_text(item, "f12", index)?;
-        if !code.starts_with("BK") || code.len() < 4 {
-            return Err(anyhow::anyhow!(
-                "概念板块榜第 {} 行 code 非法: {code:?}",
-                index + 1
-            ));
-        }
-        let name = required_board_text(item, "f14", index)?;
-        let change_pct = required_board_number(item, "f3", index)?;
-        if change_pct.abs() > 20.0 {
-            log::warn!(
-                "[DQ-2.3] 概念板块榜第 {} 行涨跌幅={change_pct}% 超过常规±20%，保留真实值并标记需人工确认",
-                index + 1
-            );
-        }
-        let main_inflow = required_board_number(item, "f62", index)?;
-        let leader_name = required_board_text(item, "f128", index)?.to_string();
-        let vol_ratio = required_board_number(item, "f10", index)?;
-        let turnover = required_board_number(item, "f8", index)?;
-        let main_net_pct_today = required_board_number(item, "f184", index)?;
-        let main_net_pct_5d = required_board_number(item, "f165", index)?;
-        if vol_ratio < 0.0 || turnover < 0.0 {
-            return Err(anyhow::anyhow!(
-                "概念板块榜第 {} 行量比/换手率非法: vol_ratio={vol_ratio} turnover={turnover}",
-                index + 1
-            ));
-        }
-        if main_net_pct_today.abs() > 100.0 || main_net_pct_5d.abs() > 100.0 {
-            return Err(anyhow::anyhow!(
-                "概念板块榜第 {} 行主力净占比越界: today={main_net_pct_today} five_day={main_net_pct_5d}",
-                index + 1
-            ));
-        }
-
-        boards.push(ConceptBoard {
-            code: code.to_string(),
-            name: name.to_string(),
-            change_pct,
-            main_inflow,
-            leader_name,
-            vol_ratio,
-            turnover,
-            main_net_pct_today,
-            main_net_pct_5d,
-        });
+    if !matches!(fid, "f3" | "f62") || top_n == 0 {
+        anyhow::bail!("板块排行请求非法: fid={fid:?} top_n={top_n}");
     }
-    crate::monitor::data_mode::mark_capability_success(
-        crate::monitor::data_mode::Capability::MoneyFlow,
+    anyhow::bail!(
+        "sector ranking unsupported: released BoardDataGateway lacks complete \
+         vol_ratio/turnover/day1_ratio/day5_ratio fields required by ConceptBoard"
     )
-    .map_err(anyhow::Error::msg)?;
-    Ok(boards)
 }
 
-/// 通过东财 suggest 接口按关键词查询板块代码（BKxxxx）。
-///
-/// 该接口可补齐「不在当下热点榜前N」但确实存在的板块，避免机会链路仅依赖榜单池。
+/// 同步关键词检索没有已发布的统一合同；显式返回不可用。
 pub fn search_board_code_by_keyword(keyword: &str) -> Result<Option<(String, String)>> {
     let key = keyword.trim();
     if key.is_empty() {
         return Ok(None);
     }
-
-    let client = build_client()?;
-    let url = format!(
-        "https://searchapi.eastmoney.com/api/suggest/get?input={}&type=14&token=D43BF722C8E33BDC906FB84D85E326E8&count=20",
-        urlencoding::encode(key)
-    );
-
-    let body: Value = client
-        .get(&url)
-        .header("User-Agent", "Mozilla/5.0")
-        .send()
-        .context("请求东财 suggest 失败")?
-        .json()
-        .context("解析东财 suggest JSON 失败")?;
-
-    // 接口历史上存在两种包裹层，兼容两者。
-    let data = body
-        .get("QuotationCodeTable")
-        .and_then(|v| v.get("Data"))
-        .and_then(|v| v.as_array())
-        .or_else(|| {
-            body.get("Result")
-                .and_then(|v| v.get("QuotationCodeTable"))
-                .and_then(|v| v.get("Data"))
-                .and_then(|v| v.as_array())
-        });
-
-    let Some(items) = data else {
-        return Ok(None);
-    };
-
-    // 评分：优先精确命中，其次包含命中。
-    let mut best: Option<(u8, String, String)> = None;
-    for item in items {
-        let code = item
-            .get("Code")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        let name = item
-            .get("Name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        let classify = item
-            .get("Classify")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        let sec_type_name = item
-            .get("SecurityTypeName")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-
-        if code.is_empty() || name.is_empty() {
-            continue;
-        }
-        let is_board = classify == "BK" || sec_type_name == "板块" || code.starts_with("BK");
-        if !is_board {
-            continue;
-        }
-
-        let score = if name == key {
-            3
-        } else if name.contains(key) || key.contains(name) {
-            2
-        } else {
-            1
-        };
-
-        match &best {
-            Some((best_score, _, _)) if score <= *best_score => {}
-            _ => best = Some((score, code.to_string(), name.to_string())),
-        }
-    }
-
-    Ok(best.map(|(_, code, name)| (code, name)))
+    anyhow::bail!(
+        "board keyword lookup unsupported for {key:?}: no released unified name-search contract"
+    )
 }
 
-/// 拉取板块成份股，按成交额降序，取前 `top_n` 名
+/// 旧成分股结构要求同批次名称、价格、涨幅、成交额、量比和换手率。
+/// Magic TDX 当前只发布成分身份，因此拒绝跨源拼接。
 pub fn fetch_board_components(board_code: &str, top_n: usize) -> Result<Vec<BoardStock>> {
-    let client = build_client()?;
-    let pz = top_n.clamp(5, 100).to_string();
-    let fs = format!("b:{}", board_code);
-    let params: [(&str, &str); 11] = [
-        ("pn", "1"),
-        ("pz", pz.as_str()),
-        ("po", "1"),
-        ("np", "1"),
-        ("ut", "bd1d9ddb04089700cf9c27f6f7426281"),
-        ("fltt", "2"),
-        ("invt", "2"),
-        ("fid", "f6"), // 按成交额排序
-        ("fs", fs.as_str()),
-        // f2=价, f3=涨跌幅, f6=成交额, f8=换手率, f10=量比, f12=代码, f14=名称
-        ("fields", "f2,f3,f6,f8,f10,f12,f14"),
-        ("_", "1"),
-    ];
-
-    let json = get_with_fallback(&client, &params)
-        .with_context(|| format!("拉取板块 {} 成份股失败", board_code))?;
-
-    let diff = json
-        .get("data")
-        .and_then(|d| d.get("diff"))
-        .and_then(|d| d.as_array())
-        .ok_or_else(|| anyhow::anyhow!("板块 {board_code} 成份响应缺少 data.diff 数组"))?;
-
-    let mut stocks = Vec::with_capacity(diff.len());
-    for (index, item) in diff.iter().enumerate() {
-        let code = required_board_text(item, "f12", index)?;
-        let name = required_board_text(item, "f14", index)?;
-        if code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(anyhow::anyhow!(
-                "板块 {board_code} 第 {} 行股票代码非法: {code:?}",
-                index + 1
-            ));
-        }
-        let price = required_board_number(item, "f2", index)?;
-        let change_pct = required_board_number(item, "f3", index)?;
-        let amount = required_board_number(item, "f6", index)?;
-        let vol_ratio = required_board_number(item, "f10", index)?;
-        let turnover = required_board_number(item, "f8", index)?;
-        if price <= 0.0 || amount < 0.0 || vol_ratio < 0.0 || turnover < 0.0 {
-            return Err(anyhow::anyhow!(
-                "板块 {board_code} 第 {} 行数值越界: price={price} change={change_pct} amount={amount} vol_ratio={vol_ratio} turnover={turnover}",
-                index + 1
-            ));
-        }
-        if change_pct.abs() > 20.0 {
-            log::warn!(
-                "[DQ-2.3] 板块 {board_code} 第 {} 行股票 {} 涨跌幅={change_pct}% 超过常规±20%，保留真实值并标记需人工确认",
-                index + 1,
-                code
-            );
-        }
-        // 过滤 ST / 北交所 (保持与 limit_up 一致的口径)
-        if crate::data_provider::limit_status::is_st_stock(name) {
-            continue;
-        }
-        if code.starts_with('8') || code.starts_with('4') || code.starts_with('9') {
-            continue;
-        }
-        stocks.push(BoardStock {
-            code: code.to_string(),
-            name: name.to_string(),
-            price,
-            change_pct,
-            amount,
-            vol_ratio,
-            turnover,
-        });
+    if board_code.trim().is_empty() || top_n == 0 {
+        anyhow::bail!("板块成分请求非法: board={board_code:?} top_n={top_n}");
     }
-    Ok(stocks)
-}
-
-fn required_board_text<'a>(item: &'a Value, field: &str, index: usize) -> Result<&'a str> {
-    item.get(field)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("板块响应第 {} 行缺少非空 {field}", index + 1))
-}
-
-fn required_board_number(item: &Value, field: &str, index: usize) -> Result<f64> {
-    item.get(field)
-        .and_then(Value::as_f64)
-        .filter(|value| value.is_finite())
-        .ok_or_else(|| anyhow::anyhow!("板块响应第 {} 行缺少有限数值 {field}", index + 1))
+    anyhow::bail!(
+        "board component ranking unsupported for {board_code}: Magic TDX membership \
+         contract lacks same-batch name/price/change/amount/volume-ratio/turnover"
+    )
 }
 
 /// 检测共振板块
@@ -1083,7 +799,7 @@ fn classify_unexplained(
 
 /// 反向发现入口：拉取概念板块榜（涨幅 + 资金），找出量价异动但无新闻归因的板块。
 ///
-/// - `news_text`：当日/近段真实新闻聚合文本（宏观 + 快讯 + 微博热搜等），用于归因匹配
+/// - `news_text`：当日/近段统一 Gateway 新闻聚合文本，用于归因匹配
 /// - `rank_top`：涨幅榜 / 资金榜各取前 N 名
 ///
 /// 失败（板块榜为空/网络）返回 `Err`，由调用方按 best-effort 处理，不编造异动。
@@ -1126,7 +842,6 @@ pub fn detect_unexplained_moves(news_text: &str, rank_top: usize) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn news_match_basic() {
@@ -1147,24 +862,6 @@ mod tests {
             vol_ratio: vol,
             turnover: 0.0,
         }
-    }
-
-    #[test]
-    fn strict_board_fields_reject_missing_and_non_finite_values() {
-        let row = json!({"f12": "BK0001", "f3": 1.5});
-        assert_eq!(
-            required_board_text(&row, "f12", 0).expect("valid text"),
-            "BK0001"
-        );
-        assert_eq!(
-            required_board_number(&row, "f3", 0).expect("valid number"),
-            1.5
-        );
-        assert!(required_board_text(&row, "f14", 0).is_err());
-        assert!(required_board_number(&row, "f62", 0).is_err());
-
-        let non_finite = json!({"f3": "NaN"});
-        assert!(required_board_number(&non_finite, "f3", 0).is_err());
     }
 
     #[test]

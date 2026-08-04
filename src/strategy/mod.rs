@@ -47,7 +47,9 @@ pub use multi_factor::{
     Factor, FactorDirection, MultiFactorConfig, MultiFactorEngine, MultiFactorStrategy,
     StockFactors, StockScore,
 };
-pub use multi_timeframe::{assess_entry as assess_multi_timeframe_entry, EntryAssessment};
+pub use multi_timeframe::{
+    assess_entry as assess_multi_timeframe_entry, EntryAssessment, MinuteBar,
+};
 pub use rsi::{
     PrecisionRsiBacktest, PrecisionRsiConfig, PrecisionRsiResult, PrecisionRsiStrategy,
     SinglePrecisionRsiResult,

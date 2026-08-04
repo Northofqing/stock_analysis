@@ -20,7 +20,7 @@
 
 use log::{info, warn};
 
-use crate::data_provider::money_flow::MoneyFlowDay;
+use crate::capital_flow::MoneyFlowDay;
 
 // ============================================================================
 // VetoContext — 跨规则共享的评估上下文
@@ -194,7 +194,7 @@ impl VetoOutcome {
 // 配置
 // ============================================================================
 
-/// VetoChain 配置 (来自 config/monitor.toml [live_veto])
+/// VetoChain 配置（来自启动时加载的 config/strategy.toml [live_veto]）。
 #[derive(Debug, Clone)]
 pub struct VetoChainConfig {
     /// 总开关

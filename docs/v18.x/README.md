@@ -20,6 +20,13 @@ v17.x 继续完成事件与推送迁移；v18.x 不替代该工作。v18.x 为�
 | [平台评估](v18.0-2026-07-16-review-quant-platform-assessment.md) | 工程、数据、产品与公开实践评估来源 | 来源文档 |
 | [四核心模块详细设计](v18.0-2026-07-16-codebase-design-four-core-modules.md) | 接口、状态机、持久化、失败语义与测试 seam | 活跃来源 |
 | [实施路线图](v18.0-2026-07-16-writing-plans-implementation-roadmap.md) | 工作流顺序与合并门禁来源 | 待逐工作流批准 |
+| | | |
+| **战略设计 (v18.1-v18.5)** | | |
+| [v18.1 战略差距分析](v18.1-strategic-gap-analysis.md) | 对接量化机构缺什么？真正挣钱缺什么？ | 新增 |
+| [v18.2 回测体系设计](v18.2-backtest-direction.md) | 事件驱动引擎、成本模型、4层回测架构 | 新增 |
+| [v18.3 回测引擎实现](v18.3-backtest-implementation.md) | 引擎核心、事件类型、成本/涨跌停 ~1150行 Rust | 新增 |
+| [v18.4 因子库设计](v18.4-factor-zoo-design.md) | 55因子×7类×5种回测模式，polars批量引擎 | 新增 |
+| [v18.5 生产就绪设计](v18.5-production-readiness-design.md) | Gateway联邦、熔断、监控、API、部署 | 新增 |
 
 ## 不可妥协的边界
 

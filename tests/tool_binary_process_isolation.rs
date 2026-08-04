@@ -84,7 +84,7 @@ fn winrate_simulator_runs_against_an_isolated_real_sqlite_fixture() {
         ])
         .current_dir(&root)
         .env("STOCK_DB", &database)
-        .env("MONITOR_OPERATOR_AUTH_REQUIRED", "false")
+        .env("MONITOR_AUTH_REQUIRED", "0")
         .output()
         .expect("run winrate simulator");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -103,7 +103,7 @@ fn command_line_failure_and_help_paths_are_explicit() {
     let winrate_help = Command::new(env!("CARGO_BIN_EXE_winrate_simulator"))
         .arg("--help")
         .current_dir(&root)
-        .env("MONITOR_OPERATOR_AUTH_REQUIRED", "false")
+        .env("MONITOR_AUTH_REQUIRED", "0")
         .output()
         .expect("run winrate help");
     assert!(winrate_help.status.success());
@@ -123,7 +123,9 @@ fn command_line_failure_and_help_paths_are_explicit() {
         .output()
         .expect("run lhb help");
     assert!(lhb_help.status.success());
-    assert!(String::from_utf8_lossy(&lhb_help.stdout).contains("龙虎榜数据查询工具"));
+    assert!(
+        String::from_utf8_lossy(&lhb_help.stdout).contains("统一 Gateway 龙虎榜真实批次查询工具")
+    );
     std::fs::remove_dir_all(root).expect("remove isolated CLI directory");
 }
 
@@ -135,7 +137,7 @@ fn isolated_main_command(root: &std::path::Path) -> Command {
         .env("STOCK_ENV_MODE", "test")
         .env("STOCK_LIST", "")
         .env("DEEPSEEK_API_KEY", "TEST_CODE_KEY")
-        .env("MONITOR_OPERATOR_AUTH_REQUIRED", "false")
+        .env("MONITOR_AUTH_REQUIRED", "0")
         .env("MACRO_AI_ENABLED", "false")
         .env("SECTOR_RESONANCE_ENABLED", "false")
         .env("LHB_APPEND_ENABLED", "false")

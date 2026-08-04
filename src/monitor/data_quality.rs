@@ -1,11 +1,10 @@
 //! 数据质量门（DQ Gate）。
 //!
-//! 每条进入检测引擎的 tick 必须先过这五道校验：
+//! 每条进入检测引擎的 tick 必须先过这四道校验：
 //! 1. staleness  — 数据是否过期（超过 N 秒未更新）
 //! 2. halt       — 股票是否停牌
 //! 3. jump       — 价格是否发生异常跳空
-//! 4. ex_rights  — 当日是否为除权除息日
-//! 5. price_ok   — 价格是否在合理范围（非零、非负、涨跌幅合理）
+//! 4. price_ok   — 价格是否在合理范围（非零、非负、涨跌幅合理）
 //!
 //! 脏数据 → 丢弃 + 计数（供系统自监控），不进检测引擎。
 
@@ -30,8 +29,6 @@ pub enum DqRejectReason {
     Halted,
     /// 价格跳空异常（相对前值的变动超过阈值百分比）
     Jump { change_pct: f64, threshold_pct: f64 },
-    /// 除权除息日（复权价格可能异常）
-    ExRights,
     /// 价格不合理（零、负、涨跌幅超限）
     UnreasonablePrice { price: f64, last_close: f64 },
 }
@@ -61,7 +58,6 @@ impl DqRejectReason {
             DqRejectReason::Stale { .. } => "数据过期",
             DqRejectReason::Halted => "停牌",
             DqRejectReason::Jump { .. } => "价格跳空",
-            DqRejectReason::ExRights => "除权除息",
             DqRejectReason::UnreasonablePrice { .. } => "价格异常",
         }
     }
@@ -78,7 +74,6 @@ pub struct DqStats {
     pub rejected_stale: AtomicU64,
     pub rejected_halted: AtomicU64,
     pub rejected_jump: AtomicU64,
-    pub rejected_ex_rights: AtomicU64,
     pub rejected_price: AtomicU64,
 }
 
@@ -103,7 +98,6 @@ impl DqStats {
             rejected_stale: self.rejected_stale.load(Ordering::Relaxed),
             rejected_halted: self.rejected_halted.load(Ordering::Relaxed),
             rejected_jump: self.rejected_jump.load(Ordering::Relaxed),
-            rejected_ex_rights: self.rejected_ex_rights.load(Ordering::Relaxed),
             rejected_price: self.rejected_price.load(Ordering::Relaxed),
         }
     }
@@ -116,7 +110,6 @@ pub struct DqStatsSnapshot {
     pub rejected_stale: u64,
     pub rejected_halted: u64,
     pub rejected_jump: u64,
-    pub rejected_ex_rights: u64,
     pub rejected_price: u64,
 }
 
@@ -130,14 +123,13 @@ impl DqStatsSnapshot {
 
     pub fn summary(&self) -> String {
         format!(
-            "DQ: total={} passed={} ({}%) stale={} halt={} jump={} ex_rights={} price={}",
+            "DQ: total={} passed={} ({}%) stale={} halt={} jump={} price={}",
             self.total,
             self.passed,
             (100.0 - self.dirty_rate() * 100.0).round(),
             self.rejected_stale,
             self.rejected_halted,
             self.rejected_jump,
-            self.rejected_ex_rights,
             self.rejected_price,
         )
     }
@@ -201,76 +193,6 @@ pub fn is_halted_period(code: &str, date: NaiveDate) -> bool {
         Some(ps) => ps.iter().any(|&(from, to)| date >= from && date <= to),
         None => false,
     }
-}
-
-// ============================================================================
-// IPO 日期缓存 (v11-P0-3 commit 1 新建)
-// ============================================================================
-//
-// 与 EX_RIGHTS_DATES / HALTED_CODES 同模式 (Lazy<RwLock<...>>).
-// 数据来源: 东方财富 f26 HTTP (src/data_provider/ipo_date.rs::fetch_ipo_date).
-// 查询接口: is_within_5_days_of_ipo (新股前 5 日无涨跌停识别).
-// 缓存空时: 走 limit_status::is_ipo_first_5_days 的"未知→非新股" 兜底.
-
-static IPO_DATES: Lazy<RwLock<HashMap<String, NaiveDate>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
-
-/// 喂入 IPO 日期 (来自东方财富 f26 HTTP 或其它源).
-pub fn mark_ipo(code: &str, date: NaiveDate) {
-    if let Ok(mut guard) = IPO_DATES.write() {
-        guard.insert(code.to_string(), date);
-    }
-}
-
-/// 查询某股在某日是否处于"上市后 5 个交易日内" (注册制新股前 5 日无涨跌停).
-///
-/// 内部迭代 `next_trading_day` (calendar.rs) 算 5 个交易日窗口, 避免用 `recent_trading_days`
-/// (它是倒推, 语义不符). 缓存空 (没 IPO 日期数据) 返回 false, 兜底"按非新股处理".
-pub fn is_within_5_days_of_ipo(code: &str, date: NaiveDate) -> bool {
-    use crate::calendar::is_trading_day;
-    use crate::calendar::next_trading_day;
-    let ipo_date = match IPO_DATES.read() {
-        Ok(g) => match g.get(code).copied() {
-            Some(d) => d,
-            None => return false,
-        },
-        Err(_) => return false,
-    };
-    if date < ipo_date {
-        return false;
-    }
-    // 从 ipo_date 起, 往后数 5 个交易日, date 在窗口内 → true
-    let mut d = ipo_date;
-    for _ in 0..5 {
-        if is_trading_day(d) && d == date {
-            return true;
-        }
-        if d > date {
-            return false;
-        }
-        d = next_trading_day(d);
-    }
-    false
-}
-
-// ============================================================================
-// 除权除息日缓存
-// ============================================================================
-
-static EX_RIGHTS_DATES: Lazy<RwLock<HashSet<(String, NaiveDate)>>> =
-    Lazy::new(|| RwLock::new(HashSet::new()));
-
-pub fn mark_ex_rights(code: &str, date: NaiveDate) {
-    if let Ok(mut guard) = EX_RIGHTS_DATES.write() {
-        guard.insert((code.to_string(), date));
-    }
-}
-
-fn is_ex_rights(code: &str, date: NaiveDate) -> bool {
-    EX_RIGHTS_DATES
-        .read()
-        .map(|g| g.contains(&(code.to_string(), date)))
-        .unwrap_or(false)
 }
 
 // ============================================================================
@@ -432,14 +354,7 @@ pub fn validate_tick(
         return Err(DqRejectReason::Halted);
     }
 
-    // Gate 3: Ex-rights
-    let today = now.date_naive();
-    if is_ex_rights(&tick.code, today) {
-        stats.rejected_ex_rights.fetch_add(1, Ordering::Relaxed);
-        return Err(DqRejectReason::ExRights);
-    }
-
-    // Gate 4: Price reasonability
+    // Gate 3: Price reasonability
     if tick.price <= 0.0 || tick.price.is_nan() || tick.price.is_infinite() {
         let r = DqRejectReason::UnreasonablePrice {
             price: tick.price,
@@ -458,7 +373,7 @@ pub fn validate_tick(
         return Err(r);
     }
 
-    // Gate 5: Jump detection (needs previous tick)
+    // Gate 4: Jump detection (needs previous tick)
     if let Some(prev) = prev {
         let jump_pct = ((tick.price - prev.price) / prev.price * 100.0).abs();
         if jump_pct > config.jump_threshold_pct {
@@ -481,37 +396,33 @@ pub fn quick_validate(tick: &Tick, config: &DqConfig) -> Result<(), DqRejectReas
     validate_tick(tick, None, config, &stats)
 }
 
-/// 返回交易所板块的常规涨跌停幅度（含少量接口精度容差）。
-///
-/// 这不是“放行任意异常”的开关：超过此板块上限仍会拒绝；
-/// 超过 20% 但在创业板/科创板/北交所上限内时会记录人工确认告警。
-pub fn max_gap_for(code: &str) -> f64 {
-    let code = code.strip_prefix("TEST_CODE_").unwrap_or(code);
-    let code = code.split('.').next().unwrap_or(code);
-    if code.starts_with("300") || code.starts_with("688") {
-        20.5
-    } else if code.starts_with('8') || code.starts_with('4') || code.starts_with("92") {
-        30.5
-    } else {
-        10.5
-    }
+pub const MAX_UNCONFIRMED_ADJACENT_DAILY_CHANGE_PCT: f64 = 20.0;
+
+/// One structurally valid adjacent daily move that requires BR-171 operator confirmation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdjacentDailyChange {
+    pub code: String,
+    pub previous_date: NaiveDate,
+    pub current_date: NaiveDate,
+    pub previous_close: f64,
+    pub current_close: f64,
+    pub change_pct: f64,
 }
 
-/// BR-092：日线整批严格质检。坏行、重复日期、交易日断档与未确认跳变均失败；
-/// 不删除或填充任何源数据。成功后仅把输出统一为最新日期在前。
-pub fn validate_daily_kline_quality(
+/// BR-092 structural validation stage.
+///
+/// This stage validates prices, volume, amount, trading-day continuity and the
+/// provider's reported percentage. It does **not** admit moves above the BR-171
+/// threshold: every such move is returned to the final evidence-bound admission
+/// stage. Keeping this function crate-private prevents a transport router from
+/// turning structural validation into a production admission shortcut.
+pub(crate) fn validate_daily_kline_structure(
     kline: &mut [KlineData],
     code: &str,
-    max_gap_pct: f64,
-) -> Result<(), String> {
+) -> Result<Vec<AdjacentDailyChange>, String> {
     if kline.is_empty() {
         return Err("日线数据为空".to_string());
     }
-    if !max_gap_pct.is_finite() || max_gap_pct <= 0.0 {
-        return Err(format!("[{code}] 非法跳变阈值: {max_gap_pct}"));
-    }
-    // 调用方通常通过 max_gap_for(code) 传入板块阈值。不得再统一 clamp 到 20%，
-    // 否则创业板/科创板真实 ±20% 以及北交所 ±30% 会被误判为脏数据。
     for b in kline.iter() {
         if !b.open.is_finite() || !b.high.is_finite() || !b.low.is_finite() || !b.close.is_finite()
         {
@@ -543,6 +454,7 @@ pub fn validate_daily_kline_quality(
     }
 
     kline.sort_by_key(|b| b.date);
+    let mut pending_confirmations = Vec::new();
     for w in kline.windows(2) {
         let prev = &w[0];
         let cur = &w[1];
@@ -563,33 +475,15 @@ pub fn validate_daily_kline_quality(
                 cur.date, cur.pct_chg
             ));
         }
-        let gap_pct = ((cur.open - prev.close) / prev.close * 100.0).abs();
-        let close_change_pct = ((cur.close - prev.close) / prev.close * 100.0).abs();
-        if gap_pct > max_gap_pct || close_change_pct > max_gap_pct {
-            if is_ex_rights(code, cur.date) {
-                log::warn!(
-                    "[{code}] {} 跳变已由除权登记确认: open={gap_pct:.2}% close={close_change_pct:.2}%",
-                    cur.date
-                );
-                continue;
-            }
-            if is_within_5_days_of_ipo(code, cur.date) {
-                log::warn!(
-                    "[{code}] {} 跳变已由 IPO 登记确认: open={gap_pct:.2}% close={close_change_pct:.2}%",
-                    cur.date
-                );
-                continue;
-            }
-            return Err(format!(
-                "[{code}] {} 相邻跳变未确认: open={gap_pct:.2}% close={close_change_pct:.2}% (> {max_gap_pct:.2}%), prev_close={:.3}",
-                cur.date, prev.close
-            ));
-        }
-        if gap_pct > 20.0 || close_change_pct > 20.0 {
-            log::warn!(
-                "[{code}] {} 相邻涨跌幅超过常规±20%，已按板块上限 {:.1}% 校验: open={gap_pct:.2}% close={close_change_pct:.2}%",
-                cur.date, max_gap_pct
-            );
+        if computed_pct.abs() > MAX_UNCONFIRMED_ADJACENT_DAILY_CHANGE_PCT {
+            pending_confirmations.push(AdjacentDailyChange {
+                code: code.to_owned(),
+                previous_date: prev.date,
+                current_date: cur.date,
+                previous_close: prev.close,
+                current_close: cur.close,
+                change_pct: computed_pct,
+            });
         }
     }
 
@@ -598,7 +492,59 @@ pub fn validate_daily_kline_quality(
     // chip_distribution.rs:94 / financials.rs:155 (用 .rev() 假设降序) 全错位.
     kline.sort_by_key(|item| std::cmp::Reverse(item.date));
 
+    Ok(pending_confirmations)
+}
+
+/// BR-092 strict daily validation with an evidence-bound BR-171 confirmation resolver.
+///
+/// The resolver must return `true` only for a durable confirmation matching the
+/// current provider/lifecycle evidence. This function owns value/date validation;
+/// callers own the provider/batch identity used by their confirmation store.
+pub fn validate_daily_kline_quality_with_confirmation<Confirm>(
+    kline: &mut [KlineData],
+    code: &str,
+    mut confirm: Confirm,
+) -> Result<(), String>
+where
+    Confirm: FnMut(&AdjacentDailyChange) -> Result<bool, String>,
+{
+    for change in validate_daily_kline_structure(kline, code)? {
+        let confirmed = confirm(&change).map_err(|error| {
+            format!(
+                "[{}] BR-171 manual_confirmation_lookup_failed {}→{}: {error}",
+                change.code, change.previous_date, change.current_date
+            )
+        })?;
+        if !confirmed {
+            log::warn!(
+                "[BR-171] manual_confirmation_required code={} dates={}→{} \
+                 closes={:.6}→{:.6} change={:.4}%",
+                change.code,
+                change.previous_date,
+                change.current_date,
+                change.previous_close,
+                change.current_close,
+                change.change_pct
+            );
+            return Err(format!(
+                "[{}] BR-171 manual_confirmation_required {}→{} \
+                 closes={:.6}→{:.6} change={:.4}%",
+                change.code,
+                change.previous_date,
+                change.current_date,
+                change.previous_close,
+                change.current_close,
+                change.change_pct
+            ));
+        }
+    }
+
     Ok(())
+}
+
+/// BR-092 default boundary. No caller may silently auto-confirm a large move.
+pub fn validate_daily_kline_quality(kline: &mut [KlineData], code: &str) -> Result<(), String> {
+    validate_daily_kline_quality_with_confirmation(kline, code, |_| Ok(false))
 }
 
 #[cfg(test)]
@@ -755,18 +701,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ex_rights_rejected() {
-        let today = Local::now().date_naive();
-        mark_ex_rights("TEST_CODE_000003", today);
-        let config = DqConfig::default();
-        let tick = make_tick("TEST_CODE_000003", 10.0, -2.0);
-        let stats = DqStats::new();
-        let r = validate_tick(&tick, None, &config, &stats);
-        assert!(r.is_err());
-        assert_eq!(r.unwrap_err(), DqRejectReason::ExRights);
-    }
-
-    #[test]
     fn test_dq_stats_snapshot() {
         let stats = DqStats::new();
         let config = DqConfig::default();
@@ -808,7 +742,6 @@ mod tests {
             .label(),
             "价格跳空"
         );
-        assert_eq!(DqRejectReason::ExRights.label(), "除权除息");
         assert_eq!(
             DqRejectReason::UnreasonablePrice {
                 price: 0.0,
@@ -863,21 +796,25 @@ mod tests {
     fn test_daily_kline_quality_ohlc_invalid_rejected() {
         let d = NaiveDate::from_ymd_opt(2026, 6, 20).unwrap();
         let mut bars = vec![make_kline(d, 10.0, 9.8, 9.5, 9.9)];
-        let r = validate_daily_kline_quality(&mut bars, "TEST_CODE_000001", 20.0);
+        let r = validate_daily_kline_quality(&mut bars, "TEST_CODE_000001");
         assert!(r.is_err(), "OHLC 不一致必须整批失败");
         assert_eq!(bars.len(), 1, "失败不得静默删除源行");
     }
 
     #[test]
-    fn test_daily_kline_quality_gap_jump_rejected() {
+    fn br092_large_adjacent_move_requires_manual_confirmation() {
         let d1 = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
         let d2 = NaiveDate::from_ymd_opt(2026, 7, 7).unwrap();
         let mut bars = vec![
             make_kline(d1, 10.0, 10.5, 9.8, 10.0),
-            make_kline(d2, 13.0, 13.2, 12.8, 13.1), // 开盘相对前收 +30% > 20% 主板阈值
+            make_kline(d2, 13.0, 13.2, 12.8, 13.0),
         ];
-        let r = validate_daily_kline_quality(&mut bars, "TEST_CODE_000001", 20.0);
-        assert!(r.is_err(), "主板 20% 阈值, +30% 跳空应 reject");
+        bars[1].pct_chg = 30.0;
+
+        let error = validate_daily_kline_quality(&mut bars, "TEST_CODE_000001")
+            .expect_err("结构完整的 30% 行情仍须进入人工确认门");
+        assert!(error.contains("manual_confirmation_required"));
+        assert!(error.contains("30.0000%"));
     }
 
     #[test]
@@ -889,7 +826,7 @@ mod tests {
             make_kline(d1, 10.0, 10.5, 9.8, 10.0),
             make_kline(d2, 10.3, 10.6, 10.1, 10.4),
         ];
-        assert!(validate_daily_kline_quality(&mut bars, "TEST_CODE_000001", 20.0).is_ok());
+        assert!(validate_daily_kline_quality(&mut bars, "TEST_CODE_000001").is_ok());
         assert!(
             bars[0].date > bars[1].date,
             "出参必须降序 (最新在前), 实际: {} vs {}",
@@ -904,7 +841,7 @@ mod tests {
         let mut missing_amount = vec![make_kline(date, 10.0, 10.5, 9.8, 10.0)];
         missing_amount[0].amount = 0.0;
         assert!(
-            validate_daily_kline_quality(&mut missing_amount, "TEST_CODE_000001", 20.0)
+            validate_daily_kline_quality(&mut missing_amount, "TEST_CODE_000001")
                 .expect_err("positive volume with zero amount must fail")
                 .contains("成交额")
         );
@@ -912,7 +849,7 @@ mod tests {
         let mut bad_pct = vec![make_kline(date, 10.0, 10.5, 9.8, 10.0)];
         bad_pct[0].pct_chg = f64::NAN;
         assert!(
-            validate_daily_kline_quality(&mut bad_pct, "TEST_CODE_000001", 20.0)
+            validate_daily_kline_quality(&mut bad_pct, "TEST_CODE_000001")
                 .expect_err("non-finite pct_chg must fail")
                 .contains("涨跌幅")
         );
@@ -927,11 +864,9 @@ mod tests {
             make_kline(second, 10.0, 10.2, 9.8, 10.1),
         ];
         bars[1].pct_chg = 9.0;
-        assert!(
-            validate_daily_kline_quality(&mut bars, "TEST_CODE_000001", 20.0)
-                .expect_err("source pct_chg must agree with adjacent closes")
-                .contains("涨跌幅不一致")
-        );
+        assert!(validate_daily_kline_quality(&mut bars, "TEST_CODE_000001")
+            .expect_err("source pct_chg must agree with adjacent closes")
+            .contains("涨跌幅不一致"));
     }
 
     /// Codex review P0 #1 修复验证: 入参是降序, 质检后必须保持降序 (下游契约)
@@ -944,43 +879,9 @@ mod tests {
             make_kline(d2, 10.3, 10.6, 10.1, 10.4), // 最新在前
             make_kline(d1, 10.0, 10.5, 9.8, 10.0),
         ];
-        validate_daily_kline_quality(&mut bars, "TEST_CODE_000001", 20.0).expect("ok");
+        validate_daily_kline_quality(&mut bars, "TEST_CODE_000001").expect("ok");
         assert_eq!(bars[0].date, d2, "出参 [0] 必须是最新 d2");
         assert_eq!(bars[1].date, d1, "出参 [1] 必须是次新 d1");
-    }
-
-    /// BR-092: 板块阈值区分主板、创业/科创板和北交所。
-    #[test]
-    fn test_max_gap_for_by_code_prefix() {
-        assert!((max_gap_for("TEST_CODE_600519") - 10.5).abs() < 1e-9);
-        assert!((max_gap_for("TEST_CODE_000001") - 10.5).abs() < 1e-9);
-        assert!((max_gap_for("TEST_CODE_002413") - 10.5).abs() < 1e-9);
-        assert!((max_gap_for("TEST_CODE_300750") - 20.5).abs() < 1e-9);
-        assert!((max_gap_for("TEST_CODE_688981") - 20.5).abs() < 1e-9);
-        assert!((max_gap_for("TEST_CODE_830799") - 30.5).abs() < 1e-9);
-        assert!((max_gap_for("TEST_CODE_920001") - 30.5).abs() < 1e-9);
-    }
-
-    /// BR-092: 主板仍拒绝 +25%，创业板按板块阈值保留真实数据。
-    #[test]
-    fn test_daily_kline_quality_clamps_board_threshold_to_redline() {
-        let d1 = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
-        let d2 = NaiveDate::from_ymd_opt(2026, 7, 7).unwrap();
-        let mut bars = vec![
-            make_kline(d1, 10.0, 10.5, 9.8, 10.0),
-            make_kline(d2, 12.5, 12.7, 12.3, 12.6), // +25% 跳空
-        ];
-        // 主板 (000001) 用 20% 阈值: 应 reject
-        let r_main = validate_daily_kline_quality(&mut bars, "TEST_CODE_000001", 20.0);
-        assert!(r_main.is_err(), "主板 20% 阈值, +25% 应 reject");
-
-        // 创业板调用方传入板块阈值后，真实 +25% 仍超出 20.5% 上限，必须拒绝。
-        let mut bars2 = vec![
-            make_kline(d1, 10.0, 10.5, 9.8, 10.0),
-            make_kline(d2, 12.5, 12.7, 12.3, 12.6),
-        ];
-        let r_gem = validate_daily_kline_quality(&mut bars2, "TEST_CODE_300750", 25.0);
-        assert!(r_gem.is_err(), "超过创业板板块上限仍应 reject");
     }
 
     /// BR-092: 重复日期是源数据错误，不允许自动去重后继续计算。
@@ -991,7 +892,7 @@ mod tests {
             make_kline(d, 10.0, 10.5, 9.8, 10.0),
             make_kline(d, 11.0, 11.5, 10.8, 11.0), // 重复日期 (11.00 应该是后到的)
         ];
-        let r = validate_daily_kline_quality(&mut bars, "TEST_CODE_000001", 20.0);
+        let r = validate_daily_kline_quality(&mut bars, "TEST_CODE_000001");
         assert!(r.is_err());
         assert_eq!(bars.len(), 2, "失败不得删除任一重复源行");
     }
@@ -1004,104 +905,41 @@ mod tests {
             make_kline(d1, 10.0, 10.5, 9.8, 10.0),
             make_kline(d3, 10.2, 10.6, 10.1, 10.4),
         ];
-        let error = validate_daily_kline_quality(&mut bars, "TEST_CODE_000001", 20.0)
+        let error = validate_daily_kline_quality(&mut bars, "TEST_CODE_000001")
             .expect_err("missing Monday must fail");
         assert!(error.contains("交易日断档"));
     }
 
     #[test]
-    fn test_daily_kline_quality_rejects_adjacent_close_jump() {
+    fn test_daily_kline_quality_rejects_unconfirmed_adjacent_close_jump() {
         let d1 = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
         let d2 = NaiveDate::from_ymd_opt(2026, 7, 7).unwrap();
         let mut bars = vec![
             make_kline(d1, 10.0, 10.5, 9.8, 10.0),
-            make_kline(d2, 10.1, 13.1, 10.0, 13.0),
+            make_kline(d2, 13.0, 13.1, 12.9, 13.0),
         ];
-        let error = validate_daily_kline_quality(&mut bars, "TEST_CODE_000001", 20.0)
-            .expect_err("30% close jump must fail");
-        assert!(error.contains("close=30.00%"));
+        bars[1].pct_chg = 30.0;
+
+        let error = validate_daily_kline_quality(&mut bars, "TEST_CODE_000001")
+            .expect_err("30% close change requires explicit manual confirmation");
+        assert!(error.contains("manual_confirmation_required"));
     }
 
-    /// v11 commit 3: 除权除息日豁免跳空 (即使 EX_RIGHTS_DATES 永远空, 跳空检测逻辑仍跑)
-    /// 注: 此测试不调 mark_ex_rights, 验证"无豁免时正常 reject"; 豁免路径需先 mark 才能测
-    ///
-    /// Codex review P1 #3 修复: 用 (000002, 2026-07-01) 避开 test_daily_kline_quality_gap_jump_rejected
-    /// 用的 (000001, 2026-06-20), 防止 cargo test 并行时 EX_RIGHTS_DATES 全局污染造成 flaky.
     #[test]
-    fn test_daily_kline_quality_no_exemption_marks_then_jump() {
-        // 先 mark 一个除权日 (用 000002/2026-07-01, 不与其他测试重叠)
-        let d1 = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
-        let d2 = NaiveDate::from_ymd_opt(2026, 7, 2).unwrap();
-        mark_ex_rights("TEST_CODE_000002", d2);
-
+    fn br171_exact_resolver_can_confirm_structurally_valid_large_move() {
+        let d1 = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2026, 7, 7).unwrap();
         let mut bars = vec![
             make_kline(d1, 10.0, 10.5, 9.8, 10.0),
-            make_kline(d2, 13.0, 13.2, 12.8, 13.1), // d2 已 mark 000002 除权, +30% 跳空应豁免
+            make_kline(d2, 13.0, 13.1, 12.9, 13.0),
         ];
-        let r = validate_daily_kline_quality(&mut bars, "TEST_CODE_000002", 20.0);
-        assert!(r.is_ok(), "除权日豁免, +30% 跳空应通过");
-    }
+        bars[1].pct_chg = 30.0;
 
-    /// v11-P0-3 commit 1: `is_within_5_days_of_ipo` 缓存空 → false (兜底)
-    #[test]
-    fn test_is_within_5_days_of_ipo_empty_cache_returns_false() {
-        // 缓存从未 mark_ipo → is_within_5_days_of_ipo 返回 false
-        // 用独特 code 避免与其他测试污染
-        let ipo_date = NaiveDate::from_ymd_opt(2026, 6, 22).unwrap(); // 周一
-        let query_date = NaiveDate::from_ymd_opt(2026, 6, 23).unwrap(); // 周二
-        assert!(
-            !is_within_5_days_of_ipo("TEST_CODE_999998", query_date),
-            "缓存空, 即使日期合理也应 false (兜底)"
-        );
-        let _ = ipo_date;
-    }
-
-    /// v11-P0-3 commit 1: `is_within_5_days_of_ipo` 同一天命中
-    #[test]
-    fn test_is_within_5_days_of_ipo_same_day() {
-        let code = "TEST_CODE_999997";
-        let ipo_date = NaiveDate::from_ymd_opt(2026, 6, 22).unwrap(); // 周一
-        mark_ipo(code, ipo_date);
-        // IPO 当天 (date == ipo_date) → true
-        assert!(is_within_5_days_of_ipo(code, ipo_date), "IPO 当天应命中");
-    }
-
-    /// v11-P0-3 commit 1: `is_within_5_days_of_ipo` 跨周末 (5 自然日内只有 3 交易日)
-    #[test]
-    fn test_is_within_5_days_of_ipo_cross_weekend() {
-        let code = "TEST_CODE_999996";
-        // IPO 周三 2026-06-24
-        let ipo_date = NaiveDate::from_ymd_opt(2026, 6, 24).unwrap();
-        mark_ipo(code, ipo_date);
-
-        // 5 个交易日内: 周三/周四/周五/下周一/下周二 (跨周末)
-        // 2026-06-29 (周一) → 在窗口内 → true
-        assert!(
-            is_within_5_days_of_ipo(code, NaiveDate::from_ymd_opt(2026, 6, 29).unwrap()),
-            "IPO+5 自然日 (周一) 应在 5 交易日窗口内"
-        );
-        // 2026-06-30 (周二) → 在窗口内 → true
-        assert!(
-            is_within_5_days_of_ipo(code, NaiveDate::from_ymd_opt(2026, 6, 30).unwrap()),
-            "IPO+6 自然日 (周二) 应在 5 交易日窗口内"
-        );
-        // 2026-07-01 (周三) → 超 5 交易日窗口 → false
-        assert!(
-            !is_within_5_days_of_ipo(code, NaiveDate::from_ymd_opt(2026, 7, 1).unwrap()),
-            "IPO+7 自然日 (周三) 应超 5 交易日窗口"
-        );
-    }
-
-    /// v11-P0-3 commit 1: `is_within_5_days_of_ipo` 早于 IPO
-    #[test]
-    fn test_is_within_5_days_of_ipo_before_ipo() {
-        let code = "TEST_CODE_999995";
-        let ipo_date = NaiveDate::from_ymd_opt(2026, 6, 22).unwrap(); // 周一
-        mark_ipo(code, ipo_date);
-        // date < ipo_date → false
-        assert!(
-            !is_within_5_days_of_ipo(code, NaiveDate::from_ymd_opt(2026, 6, 19).unwrap()),
-            "date 早于 IPO 应 false"
-        );
+        validate_daily_kline_quality_with_confirmation(&mut bars, "TEST_CODE_000001", |change| {
+            Ok(change.previous_date == d1
+                && change.current_date == d2
+                && (change.change_pct - 30.0).abs() < 1e-9)
+        })
+        .expect("an exact external confirmation may admit the real move");
     }
 }

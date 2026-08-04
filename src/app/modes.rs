@@ -1,3 +1,4 @@
+//! Registered business rules: BR-162, BR-213.
 //! 三种运行模式：单次分析 / 仅大盘复盘 / 龙虎榜选股分析。
 
 use anyhow::Result;
@@ -108,20 +109,27 @@ pub async fn run_chain_analysis_mode(send_notify: bool) -> Result<()> {
 
     info!("模式: 产业链联动分析");
 
+    let observed_at = Local::now().naive_local();
+    let business_date = stock_analysis::calendar::latest_completed_trading_day_at(observed_at);
+
     // 涨停池获取使用阻塞 HTTP 客户端，通过 spawn_blocking 离线程
-    let (_analyzer, limit_ups) = tokio::task::spawn_blocking(|| {
+    let (_analyzer, limit_ups) = tokio::task::spawn_blocking(move || {
         let analyzer = MarketAnalyzer::new(None)?;
-        let limit_ups = analyzer.get_limit_up_stocks()?;
+        let limit_ups = analyzer.get_limit_up_stocks(business_date)?;
         Ok::<(MarketAnalyzer, Vec<_>), anyhow::Error>((analyzer, limit_ups))
     })
     .await??;
     info!("今日涨停池共 {} 只", limit_ups.len());
 
-    let report =
-        stock_analysis::pipeline::chain_analysis::run_chain_analysis(limit_ups, None).await?;
+    let report = stock_analysis::pipeline::chain_analysis::run_chain_analysis(
+        business_date,
+        limit_ups,
+        None,
+    )
+    .await?;
 
     let notifier = NotificationService::from_env();
-    let filename = format!("chain_analysis_{}.md", Local::now().format("%Y%m%d"));
+    let filename = format!("chain_analysis_{}.md", business_date.format("%Y%m%d"));
     let path = notifier.save_report_to_file(&report, Some(&filename))?;
     info!("产业链联动分析报告已保存: {}", path);
 
@@ -137,22 +145,8 @@ pub async fn run_chain_analysis_mode(send_notify: bool) -> Result<()> {
 
 /// 龙虎榜选股分析模式。
 pub async fn run_lhb_analysis(args: &Args) -> Result<()> {
-    use stock_analysis::database::DatabaseManager;
-    use stock_analysis::lhb_analyzer::LhbDataFetcher;
-
-    let db = DatabaseManager::get();
-    if let Ok(deleted) = db.clean_old_lhb_data(60) {
-        if deleted > 0 {
-            info!("已清理 {} 条过期龙虎榜缓存", deleted);
-        }
-    }
-    if let Ok(deleted) = db.dedupe_lhb_data() {
-        if deleted > 0 {
-            info!("已去重 {} 条龙虎榜缓存", deleted);
-        }
-    }
-
-    info!("开始获取龙虎榜数据...");
+    use stock_analysis::data_gateway::{DragonTigerGateway, GatewayBatch};
+    use stock_analysis::lhb_analyzer::{analyze_dragon_tiger_review, parse_dragon_tiger_date};
 
     let lhb_date = args.lhb_date.clone().or_else(|| {
         std::env::var("LHB_DATE")
@@ -162,50 +156,54 @@ pub async fn run_lhb_analysis(args: &Args) -> Result<()> {
     let lhb_min_score = if args.lhb_min_score != 60 {
         args.lhb_min_score
     } else {
-        std::env::var("LHB_MIN_SCORE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(60)
+        match std::env::var("LHB_MIN_SCORE") {
+            Ok(value) if !value.trim().is_empty() => value
+                .parse()
+                .map_err(|error| anyhow::anyhow!("LHB_MIN_SCORE 非法 {value:?}: {error}"))?,
+            _ => 60,
+        }
     };
+    anyhow::ensure!(
+        (0..=100).contains(&lhb_min_score),
+        "龙虎榜最低评分必须位于 0..=100，当前={lhb_min_score}"
+    );
 
-    let fetcher = LhbDataFetcher::new()?;
-
-    let today_lhb = if let Some(date) = &lhb_date {
-        info!("正在获取 {} 的龙虎榜数据...", date);
-        fetcher.get_lhb_by_date(date).await?
+    let trading_date = if let Some(date) = lhb_date.as_deref() {
+        parse_dragon_tiger_date(date)?
     } else {
-        let today = Local::now().format("%Y%m%d").to_string();
-        info!("正在获取今日 ({}) 的龙虎榜数据...", today);
-        fetcher.get_today_lhb().await?
+        stock_analysis::calendar::latest_completed_trading_day_at(Local::now().naive_local())
+    };
+    const TOP_N: usize = 10;
+    info!("开始获取 {} 龙虎榜统一批次...", trading_date);
+    let batch = DragonTigerGateway::new()
+        .market_review(trading_date, TOP_N as u32, TOP_N)
+        .await?;
+    let records = match batch {
+        GatewayBatch::Available { records, evidence } => {
+            info!(
+                "龙虎榜统一批次可用: provider={:?} source={} batch_id={} records={}",
+                evidence.provider,
+                evidence.source,
+                evidence.batch_id,
+                records.len()
+            );
+            records
+        }
+        GatewayBatch::VerifiedEmpty(evidence) => {
+            info!(
+                "{} 龙虎榜为来源确认空批次: provider={:?} source={} batch_id={}",
+                trading_date, evidence.provider, evidence.source, evidence.batch_id
+            );
+            return Ok(());
+        }
     };
 
-    if today_lhb.is_empty() {
-        info!("今日无龙虎榜数据");
-        return Ok(());
-    }
-
-    // 同股票去重
-    let mut seen = std::collections::HashSet::new();
-    let unique_lhb: Vec<_> = today_lhb
-        .into_iter()
-        .filter(|r| seen.insert(r.code.clone()))
-        .collect();
-    info!("获取到 {} 只龙虎榜股票（去重后）", unique_lhb.len());
-
-    let total = unique_lhb.len();
     let mut good_stocks = Vec::new();
-    for (i, record) in unique_lhb.into_iter().enumerate() {
-        if i > 0 && i % 10 == 0 {
-            info!("已处理 {}/{} 只股票", i, total);
+    for record in records {
+        let analysis = analyze_dragon_tiger_review(&record)?;
+        if analysis.total_score >= lhb_min_score {
+            good_stocks.push((record, analysis));
         }
-        match fetcher.analyze_stock_lhb(&record.code).await {
-            Ok(analysis) if analysis.total_score >= lhb_min_score => {
-                good_stocks.push((record, analysis));
-            }
-            Ok(_) => {}
-            Err(e) => log::warn!("分析 {} 失败: {}", record.code, e),
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     }
 
     if good_stocks.is_empty() {
@@ -217,12 +215,13 @@ pub async fn run_lhb_analysis(args: &Args) -> Result<()> {
     info!("\n筛选到 {} 只优质股票:", good_stocks.len());
     for (record, analysis) in &good_stocks {
         info!(
-            "  {} {} 评分:{} (机构:{} 游资:{})",
+            "  {} 龙虎榜事实评分:{} 披露:{} 显式净额:{} 正净额:{} 排名净买入:{:.0}万",
             record.code,
-            record.name,
             analysis.total_score,
-            analysis.inst_score,
-            analysis.hot_money_score
+            analysis.disclosure_count,
+            analysis.explicit_net_count,
+            analysis.positive_net_count,
+            record.ranking_net_amount_yuan / 10_000.0
         );
     }
 

@@ -6,8 +6,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::data_provider::money_flow::MoneyFlowSummary;
-use crate::data_provider::{assess_quality, KlineData};
+use crate::capital_flow::MoneyFlowSummary;
+use crate::company_financials::assess_quality;
+use crate::data_provider::KlineData;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FactorAction {
@@ -344,11 +345,10 @@ pub fn compute_ranking_score(sb: &ScoreBreakdown) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capital_flow::{MoneyFlowDay, MoneyFlowSummary};
+    use crate::company_financials::FinancialPeriod;
+    use crate::company_metrics::{IndustryBenchmark, ValuationHistory};
     use crate::data_provider::consensus::ConsensusData;
-    use crate::data_provider::financials::FinancialPeriod;
-    use crate::data_provider::industry::IndustryBenchmark;
-    use crate::data_provider::money_flow::{MoneyFlowDay, MoneyFlowSummary};
-    use crate::data_provider::valuation_history::ValuationHistory;
     use crate::data_provider::{AdjustType, KlineData};
     use chrono::NaiveDate;
 
@@ -413,7 +413,7 @@ mod tests {
                 xl_net: 0.0,
                 big_net: 0.0,
                 main_pct: 0.0,
-                pct_chg: 0.0,
+                pct_chg: Some(0.0),
             }],
         }
     }

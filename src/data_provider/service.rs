@@ -1,4 +1,4 @@
-//! Registered business rules: BR-057, BR-115.
+//! Registered business rules: BR-057, BR-115, BR-187.
 //! 数据获取服务（进程级缓存，单飞抓取，带 TTL）
 //!
 //! 目标：消除"快速分析流水线"与"ReAct Agent 工具"之间对同一只股票同一份数据的重复抓取。
@@ -8,20 +8,25 @@
 //! 设计原则（遵循 AGENTS.md "Simplicity First"）：
 //! - 进程级单例（`Lazy`），**带 TTL**（修复 2026-06-30 P1）: 盘内 5min / 盘后 1day。
 //!   跨日期 process 重启前老缓存不会无限期有效，过期后下次调用重抓。
+//!   BR-187 盘中形态例外：缓存携带原始 `source_at`，命中时仍必须满足 5 秒实时门。
 //! - 每个 cache key 一个 `tokio::sync::RwLock<Option<(Instant, Arc<V>)>>`，
 //!   读时检查 TTL，过期则 invalidate。
-//! - 多源回落：Magic TDX → 东方财富 → 腾讯。**P2 ban 检测**：empty reply / 4xx / 持续超时
-//!   立即跳下一个源，不重试已 ban 域。
+//! - 数据获取只委托统一 Gateway；provider 路由、完整性和失败类型由 Gateway
+//!   所有，缓存层不得实现第二套源顺序或把失败降级为空批次。
 //! - 只缓存确实出现跨模块复用的字段；新增字段时再扩展，不预先抽象。
 //! - 缓存值 `Arc<T>`，避免重复克隆大数据（K 线 250 行）。
 
-use crate::data_provider::financials::{fetch_with_fallback_async, Financials};
-use crate::data_provider::money_flow::{
-    fetch_flow_history_async, fetch_intraday_shape_async, IntradayShape, MoneyFlowSummary,
+use crate::capital_flow::{IntradayShape, MoneyFlowSummary};
+use crate::company_financials::{project_income_statements, Financials};
+use crate::data_gateway::{
+    daily_bar_provider_label, CapitalDataGateway, CompanyDataGateway, GatewayBatch,
+    HistoricalBarsGateway, IntradayShapeFact, IntradayShapeGateway,
 };
 use crate::data_provider::KlineData;
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use magic_market_core::FlowInterval;
 use once_cell::sync::Lazy;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -29,6 +34,12 @@ use tokio::sync::RwLock;
 
 /// 缓存条目：value + 写入时间。读时检查 TTL，过期则 invalidate。
 type CachedSlot<T> = Arc<RwLock<Option<(Instant, Arc<T>)>>>;
+
+#[derive(Clone)]
+struct CachedIntradayShape {
+    shape: IntradayShape,
+    source_at: DateTime<Utc>,
+}
 
 /// 盘内 TTL = 5 分钟。盘后 / 午休 / 隔夜 → TTL = 1 day。
 /// 让已收盘的数据活到次日盘前，盘后跑 --review 不需要重抓。
@@ -46,26 +57,17 @@ fn ttl_for_now() -> Duration {
 }
 
 pub struct DataFetchService {
-    client: reqwest::Client,
     // review #14: 原 Mutex<HashMap<...>> 串行化所有缓存访问, 100 并发请求全排队.
     // 改 DashMap (分片锁): 4 个字段独立分片, 同 key 串行 + 跨 key 并行.
     klines: DashMap<(String, usize), CachedSlot<Vec<KlineData>>>,
     financials: DashMap<String, CachedSlot<Financials>>,
     money_flow: DashMap<(String, usize), CachedSlot<MoneyFlowSummary>>,
-    intraday: DashMap<String, CachedSlot<IntradayShape>>,
+    intraday: DashMap<String, CachedSlot<CachedIntradayShape>>,
 }
 
 impl DataFetchService {
     fn new() -> Self {
-        // review #15: 复用 SHARED_HTTP_CLIENT (30s timeout + Arc 内核),
-        // 替代每次 new Client. 多 DataFetchService 实例 + 频繁 new 会浪费 TLS handshake.
-        let client = crate::http_client::SHARED_HTTP_CLIENT.clone();
-        Self::with_client(client)
-    }
-
-    fn with_client(client: reqwest::Client) -> Self {
         Self {
-            client,
             klines: DashMap::new(),
             financials: DashMap::new(),
             money_flow: DashMap::new(),
@@ -114,7 +116,12 @@ impl DataFetchService {
         cell: &CachedSlot<Financials>,
         result: Result<Financials>,
     ) -> Result<Arc<Financials>> {
-        let value = Arc::new(result?);
+        let value = result?;
+        if !value.any() {
+            anyhow::bail!("BR-115 financial projection has no supported metric");
+        }
+        value.require_projection_evidence()?;
+        let value = Arc::new(value);
         Self::write_cache(cell, value.clone()).await;
         Ok(value)
     }
@@ -134,38 +141,67 @@ impl DataFetchService {
     }
 
     async fn cache_intraday_result(
-        cell: &CachedSlot<IntradayShape>,
+        cell: &CachedSlot<CachedIntradayShape>,
         code: &str,
-        result: Result<IntradayShape>,
+        result: Result<(IntradayShape, DateTime<Utc>)>,
     ) -> Result<Arc<IntradayShape>> {
-        let value = result?;
-        if !value.present {
+        let (shape, source_at) = result?;
+        if !shape.present {
             anyhow::bail!("[{code}] 分时来源未提供有效形态");
         }
-        let value = Arc::new(value);
+        validate_cached_intraday_freshness(code, source_at)?;
+        let value = Arc::new(CachedIntradayShape { shape, source_at });
         Self::write_cache(cell, value.clone()).await;
-        Ok(value)
+        Ok(Arc::new(value.shape.clone()))
+    }
+
+    async fn read_intraday_cache(
+        code: &str,
+        cell: &CachedSlot<CachedIntradayShape>,
+    ) -> Result<Option<IntradayShape>> {
+        let snapshot = {
+            let guard = cell.read().await;
+            guard.as_ref().map(|(_, value)| value.clone())
+        };
+        let Some(value) = snapshot else {
+            return Ok(None);
+        };
+        if validate_cached_intraday_freshness(code, value.source_at).is_ok() {
+            return Ok(Some(value.shape.clone()));
+        }
+        *cell.write().await = None;
+        Ok(None)
     }
 
     /// 获取 K 线数据（缓存 by `(code, days)`，带 TTL).
     ///
     /// P1: 盘内 5min / 盘后 1day, 过期自动 invalidate 重抓.
-    /// P2: 多源回落统一走 `fallback::fetch_kline_with_fallback` (v11 commit 2 抽取共享函数)
+    /// Provider routing and validation are owned by `HistoricalBarsGateway`.
     pub async fn get_kline(&self, code: &str, days: usize) -> Result<Arc<Vec<KlineData>>> {
         let cell = Self::slot(&self.klines, (code.to_string(), days)).await;
         // 1. TTL 读缓存
         if let Some(cached) = Self::read_cache(&cell).await {
             return Ok(Arc::new(cached));
         }
-        // 2. cache miss / 过期 → 抓 (共享 fallback: Magic TDX → 腾讯 → 东财)
+        // 2. cache miss / 过期 → 统一 Gateway。
         let cell_for_write = cell.clone();
-        let (data, source) =
-            crate::data_provider::fallback::fetch_kline_with_fallback(code, days).await?;
+        let batch = HistoricalBarsGateway::new()
+            .required_daily_bars_async(code, days)
+            .await
+            .map_err(anyhow::Error::from)?;
+        let (data, evidence) = batch.into_parts();
+        crate::monitor::data_mode::mark_capability_success(
+            crate::monitor::data_mode::Capability::Kline,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let source = daily_bar_provider_label(evidence.provider);
         log::info!(
-            "[DataFetch] {} OK (source={}), {} 条",
+            "[DataFetch][BR-164] {} OK provider={:?} source={} batch_id={} records={}",
             code,
+            evidence.provider,
             source,
-            data.len()
+            evidence.batch_id,
+            data.len(),
         );
         // 3. 写缓存 (仅成功结果)
         let arc = Arc::new(data);
@@ -179,10 +215,12 @@ impl DataFetchService {
         if let Some(cached) = Self::read_cache(&cell).await {
             return Ok(Arc::new(cached));
         }
-        let code_owned = code.to_string();
-        let client = self.client.clone();
         let cell_for_write = cell.clone();
-        let result = fetch_with_fallback_async(&client, &code_owned).await;
+        let result = CompanyDataGateway::new()
+            .income_statements(&[code.to_string()])
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(project_income_statements);
         Self::cache_financial_result(&cell_for_write, result).await
     }
 
@@ -192,25 +230,95 @@ impl DataFetchService {
         if let Some(cached) = Self::read_cache(&cell).await {
             return Ok(Arc::new(cached));
         }
-        let code_owned = code.to_string();
-        let client = self.client.clone();
         let cell_for_write = cell.clone();
-        let result = fetch_flow_history_async(&client, &code_owned, lmt).await;
+        let limit = u32::try_from(lmt)
+            .map_err(|_| anyhow::anyhow!("[{code}] 资金流条数超出 u32 范围: {lmt}"))?;
+        let result = CapitalDataGateway::new()
+            .instrument_fund_flow(code, FlowInterval::Day1, limit)
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(MoneyFlowSummary::from_gateway);
         Self::cache_money_flow_result(&cell_for_write, code, result).await
     }
 
     /// 获取今日日内分时形态（缓存 by `code`，带 TTL).
     pub async fn get_intraday_shape(&self, code: &str) -> Result<Arc<IntradayShape>> {
         let cell = Self::slot(&self.intraday, code.to_string()).await;
-        if let Some(cached) = Self::read_cache(&cell).await {
+        if let Some(cached) = Self::read_intraday_cache(code, &cell).await? {
             return Ok(Arc::new(cached));
         }
-        let code_owned = code.to_string();
-        let client = self.client.clone();
         let cell_for_write = cell.clone();
-        let result = fetch_intraday_shape_async(&client, &code_owned).await;
+        let result = IntradayShapeGateway::new()
+            .current_shape(code)
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(project_intraday_shape);
         Self::cache_intraday_result(&cell_for_write, code, result).await
     }
+}
+
+fn project_intraday_shape(
+    batch: GatewayBatch<IntradayShapeFact>,
+) -> Result<(IntradayShape, DateTime<Utc>)> {
+    let (mut records, evidence) = match batch {
+        GatewayBatch::Available { records, evidence } => (records, evidence),
+        GatewayBatch::VerifiedEmpty(evidence) => {
+            anyhow::bail!(
+                "[BR-187] intraday shape verified empty provider={:?} batch_id={}",
+                evidence.provider,
+                evidence.batch_id
+            )
+        }
+    };
+    if records.len() != 1 {
+        anyhow::bail!(
+            "[BR-187] intraday shape requires exactly one admitted fact, actual={}",
+            records.len()
+        );
+    }
+    let fact = records
+        .pop()
+        .expect("intraday-shape cardinality checked above");
+    let source_at = evidence
+        .source_at
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("[BR-187] intraday shape source_at is absent"))
+        .and_then(|value| {
+            DateTime::parse_from_rfc3339(value)
+                .map(|parsed| parsed.with_timezone(&Utc))
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "[BR-187] intraday shape source_at is invalid value={value:?}: {error}"
+                    )
+                })
+        })?;
+    Ok((
+        IntradayShape {
+            date: fact.date,
+            pre_close: fact.pre_close,
+            open_pct: fact.open_pct,
+            high_pct: fact.high_pct,
+            low_pct: fact.low_pct,
+            close_pct: fact.close_pct,
+            amplitude: fact.amplitude,
+            tail_30m_pct: fact.tail_30m_pct,
+            shape_label: fact.shape_label,
+            present: true,
+        },
+        source_at,
+    ))
+}
+
+fn validate_cached_intraday_freshness(code: &str, source_at: DateTime<Utc>) -> Result<()> {
+    let age_millis = Utc::now()
+        .signed_duration_since(source_at)
+        .num_milliseconds();
+    if !(0..=5_000).contains(&age_millis) {
+        anyhow::bail!(
+            "[BR-187] cached intraday shape is stale code={code} age_ms={age_millis} max_ms=5000"
+        );
+    }
+    Ok(())
 }
 
 static SERVICE: Lazy<DataFetchService> = Lazy::new(DataFetchService::new);
@@ -222,12 +330,18 @@ pub fn service() -> &'static DataFetchService {
 
 #[cfg(test)]
 mod tests {
-    // review #15: 把测试 only 的 import (brief/is_ban_error) 移进 test mod,
-    // 避免 lib build 的 #[allow(unused_imports)] smell.
     use super::*;
-    #[allow(unused_imports)]
-    use crate::data_provider::brief;
-    use crate::data_provider::is_ban_error;
+
+    fn financial_evidence(source: &str) -> crate::company_financials::FinancialProjectionEvidence {
+        crate::company_financials::FinancialProjectionEvidence {
+            provider: magic_market_core::ProviderId::Sina,
+            source: source.to_string(),
+            source_at: Some("2026-06-30".to_string()),
+            observed_at: "2026-07-18T10:00:00+08:00".to_string(),
+            batch_id: "TEST_CODE_FINANCIAL_BATCH".to_string(),
+            content_sha256: "a".repeat(64),
+        }
+    }
 
     fn kline() -> KlineData {
         KlineData {
@@ -285,28 +399,6 @@ mod tests {
         assert_eq!(ttl_for_now_at(wed_morning), Duration::from_secs(5 * 60));
     }
 
-    #[test]
-    fn test_is_ban_error_detects_known_patterns() {
-        assert!(is_ban_error("HTTP 429 Too Many Requests"));
-        assert!(is_ban_error("Empty reply from server"));
-        assert!(is_ban_error("connection timeout after 8s"));
-        assert!(is_ban_error("HTTP 502 Bad Gateway"));
-        assert!(is_ban_error("peer closed connection"));
-        // 不是 ban 的情况
-        assert!(!is_ban_error("parse error"));
-        assert!(!is_ban_error("NotFound"));
-    }
-
-    #[test]
-    fn test_brief_truncates_long_error() {
-        let long = "a".repeat(200);
-        let truncated = brief(&long);
-        assert!(truncated.len() < 200);
-        assert!(truncated.contains("截断"));
-        let short = "short";
-        assert_eq!(brief(short), "short");
-    }
-
     #[tokio::test]
     async fn br115_cache_hit_paths_share_values_and_expire_without_transport() {
         let fetch_service = DataFetchService::new();
@@ -329,7 +421,8 @@ mod tests {
         let finance = Financials {
             report_date: Some("2026-06-30".to_string()),
             eps: Some(1.25),
-            source: Some("TEST_CODE_LOCAL_PROTOCOL"),
+            source: Some("TEST_CODE_LOCAL_PROTOCOL".to_string()),
+            evidence: Some(financial_evidence("TEST_CODE_LOCAL_PROTOCOL")),
             ..Financials::default()
         };
         DataFetchService::write_cache(&finance_cell, Arc::new(finance)).await;
@@ -342,13 +435,13 @@ mod tests {
         let flow_key = ("TEST_CODE_CACHE_FLOW".to_string(), 1);
         let flow_cell = DataFetchService::slot(&fetch_service.money_flow, flow_key.clone()).await;
         let flow = MoneyFlowSummary {
-            days: vec![crate::data_provider::money_flow::MoneyFlowDay {
+            days: vec![crate::capital_flow::MoneyFlowDay {
                 date: "2026-07-18".to_string(),
                 main_net: 10.0,
                 xl_net: 4.0,
                 big_net: 6.0,
                 main_pct: 1.0,
-                pct_chg: 2.0,
+                pct_chg: Some(2.0),
             }],
         };
         DataFetchService::write_cache(&flow_cell, Arc::new(flow)).await;
@@ -373,7 +466,14 @@ mod tests {
             shape_label: "TEST_CODE 本地形态",
             present: true,
         };
-        DataFetchService::write_cache(&intraday_cell, Arc::new(intraday)).await;
+        DataFetchService::write_cache(
+            &intraday_cell,
+            Arc::new(CachedIntradayShape {
+                shape: intraday,
+                source_at: Utc::now(),
+            }),
+        )
+        .await;
         let intraday = fetch_service
             .get_intraday_shape(&intraday_code)
             .await
@@ -403,7 +503,8 @@ mod tests {
             Ok(Financials {
                 report_date: Some("2026-06-30".to_string()),
                 eps: Some(1.0),
-                source: Some("TEST_CODE_真实协议解析"),
+                source: Some("TEST_CODE_真实协议解析".to_string()),
+                evidence: Some(financial_evidence("TEST_CODE_真实协议解析")),
                 ..Financials::default()
             }),
         )
@@ -420,6 +521,19 @@ mod tests {
         .await
         .is_err());
         assert!(failed_financial.read().await.is_none());
+        let missing_evidence: CachedSlot<Financials> = Arc::new(RwLock::new(None));
+        assert!(DataFetchService::cache_financial_result(
+            &missing_evidence,
+            Ok(Financials {
+                report_date: Some("2026-06-30".to_string()),
+                eps: Some(1.0),
+                source: Some("TEST_CODE_真实协议解析".to_string()),
+                ..Financials::default()
+            }),
+        )
+        .await
+        .is_err());
+        assert!(missing_evidence.read().await.is_none());
 
         let flow_cell: CachedSlot<MoneyFlowSummary> = Arc::new(RwLock::new(None));
         assert!(DataFetchService::cache_money_flow_result(
@@ -431,13 +545,13 @@ mod tests {
         .is_err());
         assert!(flow_cell.read().await.is_none());
         let flow = MoneyFlowSummary {
-            days: vec![crate::data_provider::money_flow::MoneyFlowDay {
+            days: vec![crate::capital_flow::MoneyFlowDay {
                 date: "2026-07-18".to_string(),
                 main_net: 10.0,
                 xl_net: 4.0,
                 big_net: 6.0,
                 main_pct: 1.0,
-                pct_chg: 2.0,
+                pct_chg: Some(2.0),
             }],
         };
         assert_eq!(
@@ -449,11 +563,11 @@ mod tests {
             1
         );
 
-        let intraday_cell: CachedSlot<IntradayShape> = Arc::new(RwLock::new(None));
+        let intraday_cell: CachedSlot<CachedIntradayShape> = Arc::new(RwLock::new(None));
         assert!(DataFetchService::cache_intraday_result(
             &intraday_cell,
             "TEST_CODE_000001",
-            Ok(IntradayShape::default()),
+            Ok((IntradayShape::default(), Utc::now())),
         )
         .await
         .is_err());
@@ -474,42 +588,58 @@ mod tests {
             DataFetchService::cache_intraday_result(
                 &intraday_cell,
                 "TEST_CODE_000001",
-                Ok(present),
+                Ok((present, Utc::now())),
             )
             .await
             .unwrap()
             .present
         );
+
+        let stale_intraday: CachedSlot<CachedIntradayShape> = Arc::new(RwLock::new(Some((
+            Instant::now(),
+            Arc::new(CachedIntradayShape {
+                shape: IntradayShape {
+                    present: true,
+                    ..IntradayShape::default()
+                },
+                source_at: Utc::now() - chrono::Duration::milliseconds(5_001),
+            }),
+        ))));
+        assert!(
+            DataFetchService::read_intraday_cache("TEST_CODE_000001", &stale_intraday)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(stale_intraday.read().await.is_none());
     }
 
     #[tokio::test]
-    async fn unreachable_real_provider_transports_do_not_populate_caches() {
-        let fetch_service = DataFetchService::with_client(super::super::unreachable_http_client());
+    async fn rejected_gateway_requests_do_not_populate_caches() {
+        let fetch_service = DataFetchService::new();
+        let rejected_code = "TEST_CODE_BAD";
+        assert!(fetch_service.get_financials(rejected_code).await.is_err());
         assert!(fetch_service
-            .get_financials("TEST_CODE_000001")
+            .get_money_flow(rejected_code, 1)
             .await
             .is_err());
         assert!(fetch_service
-            .get_money_flow("TEST_CODE_000001", 1)
-            .await
-            .is_err());
-        assert!(fetch_service
-            .get_intraday_shape("TEST_CODE_000001")
+            .get_intraday_shape(rejected_code)
             .await
             .is_err());
         let financial_slot = fetch_service
             .financials
-            .get("TEST_CODE_000001")
+            .get(rejected_code)
             .expect("failed request still owns an empty single-flight slot")
             .clone();
         let flow_slot = fetch_service
             .money_flow
-            .get(&("TEST_CODE_000001".to_string(), 1))
+            .get(&(rejected_code.to_string(), 1))
             .expect("failed request still owns an empty single-flight slot")
             .clone();
         let intraday_slot = fetch_service
             .intraday
-            .get("TEST_CODE_000001")
+            .get(rejected_code)
             .expect("failed request still owns an empty single-flight slot")
             .clone();
         assert!(financial_slot.read().await.is_none());

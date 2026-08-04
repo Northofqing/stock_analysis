@@ -3,7 +3,7 @@
 //! 设计: 把 push_templates 已有模板的渲染数据从 main 循环抽出来.
 //!       数据来源:
 //!         - R-05: prediction_tracker (已有) + execution_tracking (PR3 新增)
-//!         - R-07: news_audit + candidate_state.shadow_rank_hits
+//!         - R-07: 已由 BR-191 退役，禁止读取旧本地新闻排序审计
 //!         - R-08: announcement 公告 + 经济日历 (轻量版)
 
 use serde::{Deserialize, Serialize};
@@ -41,22 +41,6 @@ pub struct WatchItemInput {
     pub hi: f64,
     pub stop: f64,
     pub reason: String,
-}
-
-/// R-08 事件日历
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct HoldingEventItem {
-    pub name: String,
-    pub kind: String, // "解禁{n}亿" / "财报预告" / "减持到期"
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct EventCalendarInput {
-    pub date: String,
-    pub holdings: Vec<HoldingEventItem>,
-    pub macro_events: String,
-    pub us_chg: String,
-    pub fx: String,
 }
 
 /// MVP4-4.4: R-05 数据聚合 (从 prediction_tracker + paper_trades)

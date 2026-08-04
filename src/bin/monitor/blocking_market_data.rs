@@ -63,8 +63,6 @@ mod tests {
         for direct_call in [
             "match load_news_catalyst_snapshot_real(hhmm)",
             "match load_industry_chain_snapshot_real(hhmm)",
-            "match load_news_to_idea_snapshot_real(hhmm)",
-            "match load_real_candidate_batch()",
             "match load_auction_volume_snapshot_real(hhmm)",
         ] {
             assert!(
@@ -72,5 +70,32 @@ mod tests {
                 "async dispatcher still uses direct blocking call: {direct_call}"
             );
         }
+        assert!(push_source.contains("async fn load_real_candidate_batch()"));
+        assert!(push_source.contains("load_real_candidate_batch().await"));
+        assert!(push_source.contains("pub async fn load_news_to_idea_snapshot_real"));
+        assert!(push_source.contains("load_news_to_idea_snapshot_real(hhmm).await"));
+    }
+
+    #[test]
+    fn br153_t0_path_uses_magic_tdx_only() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("// BR-151 / BR-153 T0 START")
+            .expect("BR-153 T0 start marker");
+        let end = source[start..]
+            .find("// BR-153 T0 END")
+            .map(|offset| start + offset)
+            .expect("BR-153 T0 end marker");
+        let t0_source = &source[start..end];
+
+        assert!(t0_source.contains("MagicTdxGateway"));
+        assert!(t0_source.contains("BR-153 Magic TDX Gateway T0 evidence"));
+        assert!(t0_source.contains("run_blocking_market_data"));
+        assert!(t0_source.contains("evaluate_structured"));
+        assert!(!t0_source.contains("fetch_eastmoney_quotes"));
+        assert!(!t0_source.contains("fetch_sina_quotes"));
+        assert!(!t0_source.contains("monitor::detector"));
+        assert!(!t0_source.contains("change_pct.abs().max"));
+        assert!(!t0_source.contains("回退旧持仓源"));
     }
 }

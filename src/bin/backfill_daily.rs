@@ -1,7 +1,7 @@
 //! 一次性回填 stock_daily 数据 (R-3 修复)
 //!
 //! 用途: stock_daily 停更超过 1 个交易日时, 触发一次全量拉取 + 落盘。
-//! 数据源: Magic TDX (主) → GtimgProvider (备) → HttpProvider (备)。
+//! 数据源: Magic TDX (主) → Magic Tencent → Magic Sina → Magic Baidu。
 //!
 //! 用法:
 //!   STOCK_DB=data/stock_analysis.db cargo run --bin backfill_daily
@@ -12,7 +12,7 @@
 
 use std::env;
 use std::path::PathBuf;
-use stock_analysis::data_provider::DataFetcherManager;
+use stock_analysis::data_gateway::HistoricalBarsGateway;
 use stock_analysis::database::DatabaseManager;
 
 fn validate_batch_completion(
@@ -56,10 +56,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = env::var("STOCK_DB").ok().map(PathBuf::from);
     DatabaseManager::init(db_path.clone())?;
     let db = DatabaseManager::get();
-    let source = "backfill_daily";
 
-    // 3. 初始化数据获取器
-    let fetcher = DataFetcherManager::new()?;
+    // 3. 初始化统一历史日线 Gateway
+    let gateway = HistoricalBarsGateway::new();
 
     // 4. 拉 90 天 K线 (保证能覆盖周末/节假日的滞后窗口)
     let days: usize = env::var("BACKFILL_DAYS")
@@ -71,15 +70,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut fail_count = 0usize;
 
     for code in &stock_codes {
-        match fetcher.get_daily_data(code, days) {
-            Ok((data, _src)) if !data.is_empty() => match db.save_kline_data(code, &data, source) {
+        match gateway.required_daily_bars_async(code, days).await {
+            Ok(batch) => match db.save_admitted_kline_data(&batch) {
                 Ok(n) => {
                     ok_count += 1;
                     println!(
-                        "[backfill_daily] {} OK: 写入 {} 条 (latest={})",
+                        "[backfill_daily] {} OK: 写入 {} 条 (latest={} source={} batch_id={})",
                         code,
                         n,
-                        data.first().map(|k| k.date.to_string()).unwrap_or_default()
+                        batch
+                            .records()
+                            .first()
+                            .map(|k| k.date.to_string())
+                            .unwrap_or_default(),
+                        batch.evidence().source,
+                        batch.evidence().batch_id,
                     );
                 }
                 Err(e) => {
@@ -87,10 +92,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("[backfill_daily] {} 写入失败: {}", code, e);
                 }
             },
-            Ok((_, _)) => {
-                fail_count += 1;
-                eprintln!("[backfill_daily] {} 数据为空", code);
-            }
             Err(e) => {
                 fail_count += 1;
                 eprintln!("[backfill_daily] {} 拉取失败: {}", code, e);

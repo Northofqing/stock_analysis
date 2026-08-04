@@ -6,11 +6,14 @@
 //!
 //! Rust 允许跨模块 impl, 所以这里直接 `impl AnalysisPipeline { ... }`.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use log::{error, info, warn};
 use std::sync::Arc;
 
-use crate::data_provider::financials::FinancialPeriod;
+use crate::company_financials::FinancialPeriod;
+use crate::data_gateway::{
+    BatchEvidence, GatewayBatch, MarketCapabilitiesGateway, MarketSecurityMetadata,
+};
 use crate::data_provider::KlineData;
 use crate::search_service::get_search_service;
 
@@ -22,6 +25,61 @@ use super::{
     extra_context, multi_timeframe, position_tracker, price_stats, score_breakdown,
     technical_report, trade_type, veto_rules,
 };
+
+fn project_stock_name(
+    requested_code: &str,
+    batch: GatewayBatch<MarketSecurityMetadata>,
+) -> Result<(String, BatchEvidence), String> {
+    let (records, evidence) = match batch {
+        GatewayBatch::Available { records, evidence } => (records, evidence),
+        GatewayBatch::VerifiedEmpty(evidence) => {
+            return Err(format!(
+                "[{requested_code}] 证券元数据 verified_empty: source={} batch_id={}",
+                evidence.source, evidence.batch_id
+            ));
+        }
+    };
+    if records.len() != 1 {
+        return Err(format!(
+            "[{requested_code}] 证券元数据批次数量不完整: expected=1 actual={} batch_id={}",
+            records.len(),
+            evidence.batch_id
+        ));
+    }
+    let metadata = &records[0];
+    if metadata.code != requested_code
+        || metadata.provider != evidence.provider
+        || metadata.batch_id != evidence.batch_id
+    {
+        return Err(format!(
+            "[{requested_code}] 证券元数据身份/证据不一致: actual={} batch_id={}",
+            metadata.code, evidence.batch_id
+        ));
+    }
+    let name = metadata.name.trim();
+    if name.is_empty() {
+        return Err(format!("[{requested_code}] 证券元数据缺少真实名称证据"));
+    }
+    Ok((name.to_owned(), evidence))
+}
+
+async fn fetch_stock_name(code: &str) -> Result<String, String> {
+    let batch = MarketCapabilitiesGateway::new()
+        .security_metadata(&[code.to_owned()])
+        .await
+        .map_err(|error| format!("[{code}] 证券元数据统一 Gateway 失败: {error}"))?;
+    let (name, evidence) = project_stock_name(code, batch)?;
+    info!(
+        "[{}][BR-159] 证券元数据证据 provider={:?} source={} source_at={} observed_at={} batch_id={}",
+        code,
+        evidence.provider,
+        evidence.source,
+        evidence.source_at.as_deref().unwrap_or("absent"),
+        evidence.observed_at,
+        evidence.batch_id
+    );
+    Ok(name)
+}
 
 /// BR-121: apply the already validated Boll/MACD evidence without IO or fallback data.
 fn apply_boll_macd_adjustment(
@@ -83,7 +141,7 @@ fn apply_fundamental_adjustments(
     let mut total_delta: i32 = 0;
 
     if let Some(hist) = latest.financials_history.as_ref() {
-        if let Some(q) = crate::data_provider::assess_quality(hist) {
+        if let Some(q) = crate::company_financials::assess_quality(hist) {
             if q.risk_score >= 60 {
                 total_delta -= 20;
                 let summary = q
@@ -237,9 +295,7 @@ fn apply_fundamental_adjustments(
 }
 
 /// BR-121: render complete industry evidence; missing values remain explicit `-`.
-fn render_industry_section(
-    ib: &crate::data_provider::industry::IndustryBenchmark,
-) -> Option<String> {
+fn render_industry_section(ib: &crate::company_metrics::IndustryBenchmark) -> Option<String> {
     if ib.peer_count < 3 {
         return None;
     }
@@ -310,7 +366,7 @@ fn render_industry_section(
     Some(s)
 }
 
-fn render_quality_report(q: &crate::data_provider::financials::QualityReport) -> Option<String> {
+fn render_quality_report(q: &crate::company_financials::QualityReport) -> Option<String> {
     if q.flags.is_empty() && q.risk_score == 0 {
         return None;
     }
@@ -336,7 +392,7 @@ fn render_quality_report(q: &crate::data_provider::financials::QualityReport) ->
 }
 
 fn render_valuation_history_section(
-    vh: &crate::data_provider::valuation_history::ValuationHistory,
+    vh: &crate::company_metrics::ValuationHistory,
 ) -> Option<String> {
     if vh.sample_days < 30 {
         return None;
@@ -630,14 +686,10 @@ impl AnalysisPipeline {
         };
 
         let name_news_fut = async {
-            // 股票名称（同步 HTTP，放 blocking 线程池）
-            let dm = self.data_manager.clone();
-            let code_owned = code.to_string();
-            let stock_name = tokio::task::spawn_blocking(move || dm.get_stock_name(&code_owned))
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| format!("股票{}", code));
+            // MarketCapabilitiesGateway owns the blocking provider lifecycle.
+            // Missing/partial metadata is explicit and never becomes a
+            // fabricated `股票{code}` display name.
+            let stock_name = fetch_stock_name(code).await?;
 
             info!("[{}] 搜索最新新闻...", code);
             let news_context = if self.use_news_search {
@@ -665,7 +717,7 @@ impl AnalysisPipeline {
             } else {
                 None
             };
-            (stock_name, news_context)
+            Ok::<_, String>((stock_name, news_context))
         };
 
         let mtf_fut = async {
@@ -678,11 +730,14 @@ impl AnalysisPipeline {
         };
 
         #[cfg(test)]
-        let ((stock_name, news_context), extra, mtf_section_opt) =
+        let (name_news, extra, mtf_section_opt) =
             if let Some(context) = self.test_resolved_context.as_ref() {
                 let name_news = match context.name_news.as_ref() {
-                    Some(resolved) => resolved.clone(),
-                    None => name_news_fut.await,
+                    Some(resolved) => Ok(resolved.clone()),
+                    None => Err(
+                        "TEST_CODE name/news context must be injected; live metadata is disabled"
+                            .to_string(),
+                    ),
                 };
                 (
                     name_news,
@@ -697,11 +752,20 @@ impl AnalysisPipeline {
                 )
             };
         #[cfg(not(test))]
-        let ((stock_name, news_context), extra, mtf_section_opt) = tokio::join!(
+        let (name_news, extra, mtf_section_opt) = tokio::join!(
             name_news_fut,
             extra_context::fetch_extra_context(code, data),
             mtf_fut
         );
+
+        #[cfg(test)]
+        let (stock_name, news_context) = name_news
+            .map_err(anyhow::Error::msg)
+            .context("证券元数据/新闻上下文不可用")?;
+        #[cfg(not(test))]
+        let (stock_name, news_context) = name_news
+            .map_err(anyhow::Error::msg)
+            .context("证券元数据/新闻上下文不可用")?;
 
         let extra = extra.map_err(anyhow::Error::msg)?;
         let mut extra_context = extra.section;
@@ -862,7 +926,7 @@ impl AnalysisPipeline {
         let quality_section = data[0]
             .financials_history
             .as_ref()
-            .and_then(|hist| crate::data_provider::assess_quality(hist))
+            .and_then(|hist| crate::company_financials::assess_quality(hist))
             .and_then(|q| render_quality_report(&q));
 
         // 10. 估值历史分位渲染
@@ -1144,9 +1208,34 @@ impl AnalysisPipeline {
         if position_tracking_enabled {
             if let Some((regime, atr)) = position_risk_evidence(&data) {
                 let risk_ctx = position_tracker::RiskContext::from_env(regime, atr);
-                if let Err(error) =
-                    position_tracker::track_position(&code, &data, &mut result, &risk_ctx)
-                {
+                let candidate_assignment = match position_tracker::candidate_position_chain_required(
+                    &code, &result, &risk_ctx,
+                ) {
+                    Ok(true) => {
+                        match crate::data_gateway::acquire_candidate_position_chain(&code).await {
+                            Ok(assignment) => Some(assignment),
+                            Err(error) => {
+                                error!(
+                                    "[{}] BR-170 候选产业链证据不可用，拒绝本次建仓: {}",
+                                    code, error
+                                );
+                                return None;
+                            }
+                        }
+                    }
+                    Ok(false) => None,
+                    Err(error) => {
+                        error!("[{}] BR-170 候选状态检查失败: {}", code, error);
+                        return None;
+                    }
+                };
+                if let Err(error) = position_tracker::track_position_with_assignment(
+                    &code,
+                    &data,
+                    &mut result,
+                    &risk_ctx,
+                    candidate_assignment.as_ref(),
+                ) {
                     error!("[{}] BR-124 持仓跟踪失败: {}", code, error);
                     return None;
                 }
@@ -1177,20 +1266,21 @@ impl AnalysisPipeline {
 mod tests {
     use super::{
         apply_boll_macd_adjustment, apply_fundamental_adjustments, position_risk_evidence,
-        render_consensus_section, render_financial_history_section, render_industry_section,
-        render_quality_report, render_valuation_history_section,
+        project_stock_name, render_consensus_section, render_financial_history_section,
+        render_industry_section, render_quality_report, render_valuation_history_section,
     };
+    use crate::company_financials::{FinancialPeriod, QualityReport};
+    use crate::company_metrics::{IndustryBenchmark, ValuationHistory};
+    use crate::data_gateway::{BatchEvidence, GatewayBatch, MarketSecurityMetadata, SecurityBoard};
     use crate::data_provider::consensus::{ConsensusData, RecentReport};
-    use crate::data_provider::financials::{FinancialPeriod, QualityReport};
-    use crate::data_provider::industry::IndustryBenchmark;
-    use crate::data_provider::valuation_history::ValuationHistory;
-    use crate::data_provider::{AdjustType, DataFetcherManager, KlineData};
+    use crate::data_provider::{AdjustType, KlineData};
     use crate::indicators::DivergenceType;
     use crate::notification::NotificationService;
     use crate::strategy::{BollMacdAction, BollMacdSignal};
     use crate::trend_analyzer::{BuySignal, StockTrendAnalyzer, TrendAnalysisResult};
-    use chrono::NaiveDate;
+    use chrono::{NaiveDate, TimeZone, Utc};
     use diesel::prelude::*;
+    use magic_market_core::ProviderId;
     use std::sync::Arc;
 
     use super::AnalysisPipeline;
@@ -1694,7 +1784,6 @@ mod tests {
         limit_up: bool,
     ) -> AnalysisPipeline {
         AnalysisPipeline {
-            data_manager: Arc::new(DataFetcherManager::new().expect("test data manager")),
             trend_analyzer: Arc::new(StockTrendAnalyzer::new()),
             ai_analyzer: None,
             use_news_search: false,
@@ -1714,6 +1803,58 @@ mod tests {
             test_backtest_output_dir: None,
             test_summary_context: None,
         }
+    }
+
+    fn metadata_evidence() -> BatchEvidence {
+        BatchEvidence {
+            provider: ProviderId::Tencent,
+            source: "TEST_CODE_magic_tencent_metadata".to_string(),
+            source_at: Some("2026-07-26T01:00:00Z".to_string()),
+            observed_at: "2026-07-26T01:00:01Z".to_string(),
+            batch_id: "TEST_CODE_metadata_batch".to_string(),
+        }
+    }
+
+    fn metadata(code: &str, name: &str) -> MarketSecurityMetadata {
+        let source_at = Utc
+            .with_ymd_and_hms(2026, 7, 26, 1, 0, 0)
+            .single()
+            .expect("TEST_CODE metadata source time");
+        MarketSecurityMetadata {
+            code: code.to_string(),
+            name: name.to_string(),
+            board: SecurityBoard::Main,
+            is_st: false,
+            listed_on: NaiveDate::from_ymd_opt(2000, 1, 1).expect("TEST_CODE listed date"),
+            price_limit_percent: 10.0,
+            price_limit_version: "TEST_CODE_limit_v1".to_string(),
+            source_at,
+            observed_at: source_at + chrono::Duration::seconds(1),
+            provider: ProviderId::Tencent,
+            batch_id: "TEST_CODE_metadata_batch".to_string(),
+        }
+    }
+
+    #[test]
+    fn br159_stock_name_projection_requires_complete_matching_evidence() {
+        let code = "TEST_CODE_000001";
+        let (name, evidence) = project_stock_name(
+            code,
+            GatewayBatch::Available {
+                records: vec![metadata(code, "TEST_CODE_示例公司")],
+                evidence: metadata_evidence(),
+            },
+        )
+        .expect("TEST_CODE complete metadata");
+        assert_eq!(name, "TEST_CODE_示例公司");
+        assert_eq!(evidence.batch_id, "TEST_CODE_metadata_batch");
+
+        assert!(project_stock_name(
+            code,
+            GatewayBatch::<MarketSecurityMetadata>::VerifiedEmpty(metadata_evidence())
+        )
+        .expect_err("TEST_CODE empty metadata cannot supply a name")
+        .contains("verified_empty"));
     }
 
     fn analysis_bars() -> Vec<KlineData> {
@@ -1881,12 +2022,8 @@ mod tests {
             }),
             Ok(None),
         );
-        context.name_news = None;
-        let mut pipeline = test_pipeline(context, false);
-        pipeline.data_manager = Arc::new(DataFetcherManager::with_cached_name(
-            "TEST_CODE_000001",
-            "TEST_CODE_缓存公司",
-        ));
+        context.name_news = Some(("TEST_CODE_缓存公司".to_string(), None));
+        let pipeline = test_pipeline(context, false);
         let bars = Arc::new(analysis_bars());
         let result = pipeline
             .analyze_stock("TEST_CODE_000001", bars.as_slice(), bars.clone(), None)
@@ -1978,7 +2115,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     #[serial_test::serial]
     async fn full_pipeline_run_commits_local_backtests_without_external_side_effects() {
         crate::database::DatabaseManager::init(None).expect("test database initialization");

@@ -1,5 +1,11 @@
 # Remove Adjacent Daily-Change Threshold Design
 
+> **Superseded by BR-205 on 2026-08-04.** Its historical-series conclusion is
+> adopted by
+> `2026-08-04-source-backed-dynamic-price-limits-design.md`: a structurally
+> valid source move is preserved without a fixed magnitude gate. BR-205 also
+> adds the separate source-backed current-session price-limit contract.
+
 ## 1. Goal
 
 Remove percentage-based rejection of adjacent historical daily values. A legitimate

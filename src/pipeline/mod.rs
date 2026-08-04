@@ -1,3 +1,4 @@
+//! Registered business rule: BR-213.
 //! 股票分析流程调度器
 //!
 //! 负责协调各模块完成完整的分析流程：
@@ -32,7 +33,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::analyzer::GeminiAnalyzer;
-use crate::data_provider::DataFetcherManager;
 use crate::notification::NotificationService;
 use crate::search_service::get_search_service;
 use crate::traits::ScoreDisplay;
@@ -184,7 +184,7 @@ pub struct AnalysisResult {
     pub trade_type: Option<String>,
     /// Phase 3: 原始资金流时序（仅运行时使用，不持久化）
     #[serde(default, skip_serializing)]
-    pub money_flow: Option<crate::data_provider::money_flow::MoneyFlowSummary>,
+    pub money_flow: Option<crate::capital_flow::MoneyFlowSummary>,
     /// 深度研判复用种子：携带主流程已抓取的 K线/资金/新闻/财务 + 趋势快照，
     /// 供重点股多智能体深度分析复用，避免重复抓取。仅运行时使用，不持久化。
     #[serde(default, skip)]
@@ -248,7 +248,6 @@ impl Default for PipelineConfig {
 
 /// 股票分析流程调度器
 pub struct AnalysisPipeline {
-    data_manager: Arc<DataFetcherManager>,
     trend_analyzer: Arc<StockTrendAnalyzer>,
     ai_analyzer: Option<GeminiAnalyzer>,
     use_news_search: bool, // 是否使用新闻搜索
@@ -339,10 +338,18 @@ fn key_stock_priority(r: &AnalysisResult) -> Option<i32> {
     }
 }
 
+/// Preserve the provider's three-state exact-date result. `Ok(None)` means the
+/// provider proved the requested date is empty; `Err` remains unavailable and
+/// must never be rendered as "今日无数据".
+fn preserve_exact_date_limit_up_state<T, E>(
+    result: std::result::Result<Vec<T>, E>,
+) -> std::result::Result<Option<Vec<T>>, E> {
+    result.map(|records| (!records.is_empty()).then_some(records))
+}
+
 impl AnalysisPipeline {
     /// 创建新的分析流程
     pub fn new(config: PipelineConfig) -> Result<Self> {
-        let data_manager = Arc::new(DataFetcherManager::new()?);
         let trend_analyzer = Arc::new(StockTrendAnalyzer::new());
         let notifier = Arc::new(NotificationService::from_env());
 
@@ -368,7 +375,6 @@ impl AnalysisPipeline {
         }
 
         Ok(Self {
-            data_manager,
             trend_analyzer,
             ai_analyzer,
             use_news_search,
@@ -663,51 +669,57 @@ impl AnalysisPipeline {
         // 产业链联动分析：仅在当日有涨停数据时执行，作为报告第一部分
         // MarketAnalyzer 使用阻塞 HTTP，必须在 spawn_blocking 中执行
         let chain_section = {
-            let limit_up_stocks = tokio::task::spawn_blocking(|| {
-                match crate::market_analyzer::MarketAnalyzer::new(None) {
-                    Ok(analyzer) => match analyzer.get_limit_up_stocks() {
-                        Ok(stocks) => stocks,
-                        Err(e) => {
-                            log::warn!("[产业链] 获取涨停股列表失败: {}", e);
-                            Vec::new()
-                        }
-                    },
-                    Err(e) => {
-                        log::warn!("[产业链] 创建 MarketAnalyzer 失败: {}", e);
-                        Vec::new()
-                    }
-                }
+            let observed_at = chrono::Local::now().naive_local();
+            let business_date = crate::calendar::latest_completed_trading_day_at(observed_at);
+            let limit_up_result = match tokio::task::spawn_blocking(move || {
+                let analyzer = crate::market_analyzer::MarketAnalyzer::new(None)?;
+                analyzer.get_limit_up_stocks(business_date)
             })
             .await
-            .unwrap_or_default();
-            if limit_up_stocks.is_empty() {
-                info!("[产业链] 今日无涨停数据，跳过产业链分析");
-                None
-            } else {
-                info!(
-                    "[产业链] 获取到 {} 只涨停股，开始联动分析...",
-                    limit_up_stocks.len()
-                );
-                match chain_analysis::run_chain_analysis(limit_up_stocks, None).await {
-                    Ok(report) if !report.trim().is_empty() => {
-                        info!("[产业链] 联动分析完成，将并入主报告");
-                        Some(report)
+            {
+                Ok(result) => result,
+                Err(error) => Err(anyhow::anyhow!(
+                    "BR-213 upper-limit provider worker failed: {error}"
+                )),
+            };
+            match preserve_exact_date_limit_up_state(limit_up_result) {
+                Ok(None) => {
+                    info!("[产业链][BR-213] 当日涨停池经数据源验证为空，跳过产业链分析");
+                    None
+                }
+                Ok(Some(limit_up_stocks)) => {
+                    info!(
+                        "[产业链] 获取到 {} 只涨停股，开始联动分析...",
+                        limit_up_stocks.len()
+                    );
+                    match chain_analysis::run_chain_analysis(business_date, limit_up_stocks, None)
+                        .await
+                    {
+                        Ok(report) if !report.trim().is_empty() => {
+                            info!("[产业链] 联动分析完成，将并入主报告");
+                            Some(report)
+                        }
+                        Ok(_) => {
+                            warn!("[产业链] 联动分析返回空，跳过");
+                            None
+                        }
+                        Err(e) => {
+                            warn!("[产业链] 联动分析失败: {}", e);
+                            None
+                        }
                     }
-                    Ok(_) => {
-                        warn!("[产业链] 联动分析返回空，跳过");
-                        None
-                    }
-                    Err(e) => {
-                        warn!("[产业链] 联动分析失败: {}", e);
-                        None
-                    }
+                }
+                Err(error) => {
+                    warn!("[产业链][BR-213] 当日涨停池不可用，未当作空数据: {}", error);
+                    None
                 }
             }
         };
 
         // BR-122 大盘状态门控：普跌日豁免跑赢指数个股的机械减仓建议，并在日报头部输出市场定性
-        let regime_section =
-            market_regime::apply(&self.data_manager, results).map_err(anyhow::Error::msg)?;
+        let regime_section = market_regime::apply(results)
+            .await
+            .map_err(anyhow::Error::msg)?;
         summary_notify::send_summary_notification(
             &self.notifier,
             results,
@@ -729,7 +741,8 @@ impl AnalysisPipeline {
 mod tests {
     use super::section_utils::normalize_ai_sections;
     use super::{
-        key_stock_priority, score_to_advice, AnalysisPipeline, AnalysisResult, PipelineConfig,
+        key_stock_priority, preserve_exact_date_limit_up_state, score_to_advice, AnalysisPipeline,
+        AnalysisResult, PipelineConfig,
     };
     use crate::data_provider::{AdjustType, KlineData};
     use crate::notification::{NotificationConfig, NotificationService};
@@ -817,6 +830,19 @@ mod tests {
         assert_eq!(key_stock_priority(&combined), Some(280));
         combined.veto_flags = Some(Vec::new());
         assert_eq!(key_stock_priority(&combined), Some(180));
+    }
+
+    #[test]
+    fn br213_exact_date_limit_up_state_keeps_unavailable_distinct_from_verified_empty() {
+        let verified_empty = preserve_exact_date_limit_up_state::<u8, &str>(Ok(Vec::new()));
+        assert_eq!(verified_empty, Ok(None));
+
+        let available = preserve_exact_date_limit_up_state::<u8, &str>(Ok(vec![1]));
+        assert_eq!(available, Ok(Some(vec![1])));
+
+        let unavailable =
+            preserve_exact_date_limit_up_state::<u8, &str>(Err("TEST_CODE_provider_down"));
+        assert_eq!(unavailable, Err("TEST_CODE_provider_down"));
     }
 
     #[tokio::test]

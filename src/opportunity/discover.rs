@@ -153,7 +153,7 @@ fn reason_summary(hit: &ChainHit, s: &super::chain_mapper::StockInfo, b: ScoreBr
 /// (注: 实际按日历日计算, 非交易日 — 见 业务规则清单-registry.md BR-001 YAGNI 说明)
 /// 修复 v9.2 M1 性能: 改成批量查询 (HashSet O(1)) 替代每次 sync DB round-trip.
 /// 旧版本 `is_recently_pushed` 每个 stock 1 次 SQLite 查询, N×M 个 query 阻塞
-/// async runtime (discover 被 run_opportunity_scan / run_post_close_candidates 调).
+/// async runtime（保留给显式 discover 调用者；旧 opportunity scan consumers 已删除）。
 fn load_recently_pushed_codes(
     candidate_codes: &[String],
     days: i64,
@@ -331,9 +331,8 @@ mod tests {
     }
 
     // 修复 F19 (2026-06-29 codex review): discover() 多次调用 next_push_time() 严格递增.
-    // 注: discover() 内部 sort_by 只按 score (不放 push_time), 实际 BR-004 同分排序
-    // 在 run_post_close_candidates 的 PostCloseCandidate sort_by (tests/ranking.rs 已覆盖).
-    // 这里只验证 next_push_time 单调 (counter atomic +1).
+    // 注: discover() 内部 sort_by 只按 score (不放 push_time)；旧盘后 consumer 已删除。
+    // 这里只验证候选证据中的 next_push_time 单调 (counter atomic +1).
     #[test]
     fn test_discover_push_time_distinct_per_candidate() {
         let hits = vec![ChainHit {

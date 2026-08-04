@@ -20,9 +20,9 @@ pub struct OpportunitySchedule {
     // v22: push 推送窗口 (替代 v17.6 写死的 09:00-19:00)
     /// 盘前 push 时刻 (默认 09:00, 触发 P-01)
     pub push_preopen: NaiveTime,
-    /// 盘中 push 时刻列表 (默认 [10:30, 11:00, 14:30], 触发 4 个盘中 dispatcher)
+    /// 盘中 push 时刻列表 (默认 [10:30, 11:00, 14:30], 触发 I-01/I-02/I-03/I-04/D-01)
     pub push_intraday: Vec<NaiveTime>,
-    /// 盘后 push 时刻 (默认 19:00, 触发 A-01)
+    /// 盘后 push 时刻 (默认 19:00, 触发 A-01/A-10)
     pub push_evening: NaiveTime,
 }
 
@@ -109,11 +109,11 @@ impl OpportunitySchedule {
 pub enum PushWindow {
     /// 盘前 (P-01 触发)
     Preopen,
-    /// 盘中 (4 个 dispatcher: I-01/I-02/I-03/D-01)
+    /// 盘中 (I-01/I-02/I-03/I-04/D-01)
     Intraday,
-    /// 盘后 (A-01 触发, 无时间窗)
+    /// 盘后 (A-01/A-10 触发)
     Evening,
-    /// 窗口外 (仅 A-01 兜底 + 提示)
+    /// 窗口外 (仅 A-01/A-10 兜底 + 提示)
     Outside,
 }
 

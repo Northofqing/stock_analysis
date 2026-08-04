@@ -2,7 +2,7 @@
 //!
 //! 设计: 主线/龙头/后排/退潮警示 (阶段字段用 HeatStage).
 
-use crate::opportunity::news_ranker::HeatStage;
+use crate::review::market_stage::HeatStage;
 
 /// 涨停产业链复盘条目
 #[derive(Debug, Clone)]

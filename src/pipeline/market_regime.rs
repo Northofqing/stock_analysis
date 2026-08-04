@@ -17,7 +17,7 @@
 
 use log::{info, warn};
 
-use crate::data_provider::DataFetcherManager;
+use crate::data_gateway::{GatewayBatch, IndexDataGateway, RealtimeIndexQuote};
 
 use super::AnalysisResult;
 
@@ -51,21 +51,81 @@ impl RegimeKind {
 ///
 /// 返回渲染好的 Markdown 区块（插入日报头部）；
 /// 指数或广度数据不足时返回 `None`，不做任何调整。
-pub(super) fn apply(
-    data_manager: &DataFetcherManager,
-    results: &mut [AnalysisResult],
-) -> Result<Option<String>, String> {
-    apply_with_index_change(results, || {
-        data_manager
-            .get_daily_data(INDEX_CODE, 5)
-            .map(|(data, _)| data.first().map(|row| row.pct_chg))
-            .map_err(|error| {
-                format!(
-                    "BR-122 {}({}) data source failed: {error:#}",
-                    INDEX_NAME, INDEX_CODE
-                )
-            })
+pub(super) async fn apply(results: &mut [AnalysisResult]) -> Result<Option<String>, String> {
+    if results.is_empty() {
+        return Ok(None);
+    }
+
+    // `sh000300` is an index identity, not an A-share equity. Keep creation,
+    // acquisition and destruction of the blocking Magic provider inside the
+    // blocking worker; feeding this code to HistoricalBarsGateway would
+    // incorrectly relabel the instrument as an equity.
+    let codes = vec![INDEX_CODE.to_owned()];
+    let batch = tokio::task::spawn_blocking(move || {
+        IndexDataGateway::new().realtime_quotes(codes.as_slice())
     })
+    .await
+    .map_err(|error| {
+        format!(
+            "BR-122 {}({}) index gateway task failed: {error}",
+            INDEX_NAME, INDEX_CODE
+        )
+    })?
+    .map_err(|error| {
+        format!(
+            "BR-122 {}({}) index gateway failed: {error}",
+            INDEX_NAME, INDEX_CODE
+        )
+    })?;
+    let index_change = project_index_change(INDEX_CODE, batch)?;
+    crate::monitor::data_mode::mark_capability_success(
+        crate::monitor::data_mode::Capability::Quote,
+    )
+    .map_err(|error| format!("BR-122 指数行情能力状态提交失败: {error}"))?;
+    apply_with_index_change(results, || Ok(Some(index_change)))
+}
+
+fn project_index_change(
+    requested_code: &str,
+    batch: GatewayBatch<RealtimeIndexQuote>,
+) -> Result<f64, String> {
+    let (records, evidence) = match batch {
+        GatewayBatch::Available { records, evidence } => (records, evidence),
+        GatewayBatch::VerifiedEmpty(evidence) => {
+            return Err(format!(
+                "BR-122 {}({}) index gateway verified_empty: source={} batch_id={}",
+                INDEX_NAME, requested_code, evidence.source, evidence.batch_id
+            ));
+        }
+    };
+    if records.len() != 1 {
+        return Err(format!(
+            "BR-122 {}({}) index batch cardinality mismatch: expected=1 actual={} batch_id={}",
+            INDEX_NAME,
+            requested_code,
+            records.len(),
+            evidence.batch_id
+        ));
+    }
+    let quote = &records[0];
+    if quote.code != requested_code
+        || quote.provider != evidence.provider
+        || quote.batch_id != evidence.batch_id
+    {
+        return Err(format!(
+            "BR-122 {}({}) index identity/evidence mismatch: actual={} batch_id={}",
+            INDEX_NAME, requested_code, quote.code, evidence.batch_id
+        ));
+    }
+    info!(
+        "[大盘门控][BR-122] 指数证据 provider={:?} source={} source_at={} observed_at={} batch_id={}",
+        evidence.provider,
+        evidence.source,
+        evidence.source_at.as_deref().unwrap_or("absent"),
+        evidence.observed_at,
+        evidence.batch_id
+    );
+    Ok(quote.change_percent)
 }
 
 /// BR-122: separate real index acquisition from deterministic validation and gating.
@@ -216,8 +276,11 @@ fn render_section(
 
 #[cfg(test)]
 mod tests {
-    use super::apply_with_index_change;
+    use super::{apply_with_index_change, project_index_change};
+    use crate::data_gateway::{BatchEvidence, GatewayBatch, RealtimeIndexQuote};
     use crate::pipeline::AnalysisResult;
+    use chrono::{TimeZone, Utc};
+    use magic_market_core::ProviderId;
 
     fn result(code: &str, advice: &str, change: Option<f64>) -> AnalysisResult {
         let mut result: AnalysisResult = serde_json::from_value(serde_json::json!({
@@ -234,6 +297,61 @@ mod tests {
         .expect("valid result fixture");
         result.chg_1d = change;
         result
+    }
+
+    fn index_evidence() -> BatchEvidence {
+        BatchEvidence {
+            provider: ProviderId::Tencent,
+            source: "TEST_CODE_magic_tencent_index".to_string(),
+            source_at: Some("2026-07-26T01:00:00Z".to_string()),
+            observed_at: "2026-07-26T01:00:01Z".to_string(),
+            batch_id: "TEST_CODE_index_batch".to_string(),
+        }
+    }
+
+    fn index_quote(code: &str) -> RealtimeIndexQuote {
+        let source_at = Utc
+            .with_ymd_and_hms(2026, 7, 26, 1, 0, 0)
+            .single()
+            .expect("TEST_CODE source time");
+        RealtimeIndexQuote {
+            code: code.to_string(),
+            name: "TEST_CODE_沪深300".to_string(),
+            current: 4_100.0,
+            change: -50.0,
+            change_percent: -1.2,
+            open: 4_140.0,
+            high: 4_150.0,
+            low: 4_090.0,
+            previous_close: 4_150.0,
+            volume: 1_000.0,
+            amount: 10_000.0,
+            source_at,
+            observed_at: source_at + chrono::Duration::seconds(1),
+            provider: ProviderId::Tencent,
+            batch_id: "TEST_CODE_index_batch".to_string(),
+        }
+    }
+
+    #[test]
+    fn br122_index_projection_preserves_identity_status_and_batch_evidence() {
+        let code = "TEST_CODE_sh000300";
+        let change = project_index_change(
+            code,
+            GatewayBatch::Available {
+                records: vec![index_quote(code)],
+                evidence: index_evidence(),
+            },
+        )
+        .expect("TEST_CODE complete index batch");
+        assert_eq!(change, -1.2);
+
+        assert!(project_index_change(
+            code,
+            GatewayBatch::<RealtimeIndexQuote>::VerifiedEmpty(index_evidence())
+        )
+        .expect_err("TEST_CODE verified empty cannot drive regime")
+        .contains("verified_empty"));
     }
 
     #[test]

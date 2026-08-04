@@ -225,24 +225,26 @@ impl DatabaseManager {
         .map_err(|error| format!("查询 chain_daily 失败: {error}"))
     }
 
-    /// 查某概念主线在最近 N 天内出现的天数（生命周期参考）。
-    pub fn get_chain_streak_days(&self, concept: &str, days: i64) -> i64 {
-        match self.get_chain_streak_days_strict(concept, days) {
-            Ok(days) => days,
-            Err(error) => {
-                warn!("[主线生命周期] {}", error);
-                0
-            }
-        }
-    }
-
-    /// 严格查询某概念主线在最近 N 天内出现的天数。
-    pub fn get_chain_streak_days_strict(&self, concept: &str, days: i64) -> Result<i64, String> {
+    /// BR-195: 严格查询某概念主线在截至 `as_of` 的最近 N 个自然日内出现的天数。
+    pub fn get_chain_appearance_days_as_of_strict(
+        &self,
+        concept: &str,
+        days: i64,
+        as_of: chrono::NaiveDate,
+    ) -> Result<i64, String> {
         if concept.trim().is_empty() || days <= 0 {
             return Err(format!(
-                "主线生命周期参数非法: concept={concept:?} days={days}"
+                "主线近窗出现天数参数非法: concept={concept:?} days={days} as_of={as_of}"
             ));
         }
+        let offset_days = days
+            .checked_sub(1)
+            .ok_or_else(|| format!("主线近窗天数减一溢出: days={days}"))?;
+        let offset = chrono::TimeDelta::try_days(offset_days)
+            .ok_or_else(|| format!("主线近窗天数不可表示: days={days}"))?;
+        let cutoff = as_of
+            .checked_sub_signed(offset)
+            .ok_or_else(|| format!("主线近窗日期下界溢出: days={days} as_of={as_of}"))?;
         let mut conn = match self.get_conn() {
             Ok(connection) => connection,
             Err(error) => return Err(format!("获取 chain_daily 连接失败: {error}")),
@@ -252,19 +254,20 @@ impl DatabaseManager {
             #[diesel(sql_type = diesel::sql_types::BigInt)]
             n: i64,
         }
-        let cutoff = (Local::now() - Duration::days(days))
-            .format("%Y-%m-%d")
-            .to_string();
+        let cutoff = cutoff.format("%Y-%m-%d").to_string();
+        let as_of = as_of.format("%Y-%m-%d").to_string();
         let rows: Vec<CountRow> = diesel::sql_query(
-            "SELECT COUNT(DISTINCT date) AS n FROM chain_daily WHERE concept = ? AND date >= ?",
+            "SELECT COUNT(DISTINCT date) AS n FROM chain_daily \
+             WHERE concept = ? AND date >= ? AND date <= ?",
         )
         .bind::<Text, _>(concept)
         .bind::<Text, _>(&cutoff)
+        .bind::<Text, _>(&as_of)
         .load(&mut conn)
-        .map_err(|error| format!("查询 chain_daily 主线生命周期失败: {error}"))?;
+        .map_err(|error| format!("查询 chain_daily 主线近窗出现天数失败: {error}"))?;
         rows.first()
             .map(|row| row.n)
-            .ok_or_else(|| "chain_daily 主线生命周期聚合结果缺失".to_string())
+            .ok_or_else(|| "chain_daily 主线近窗出现天数聚合结果缺失".to_string())
     }
 
     // ===== B-003 事件抽取去重 (simhash) DAO =====
@@ -656,13 +659,53 @@ mod tests {
                 && serde_json::from_str::<Vec<String>>(&row.stocks).unwrap() == vec![code.clone()]
         }));
         assert_eq!(db.get_latest_chain_clusters().len(), 2);
+        let row_date = chrono::NaiveDate::parse_from_str(&chain_date, "%Y-%m-%d")
+            .expect("valid chain business date");
         assert_eq!(
-            db.get_chain_streak_days_strict("算力", 1)
-                .expect("chain streak"),
+            db.get_chain_appearance_days_as_of_strict("算力", 1, row_date)
+                .expect("row at as-of is included"),
             1
         );
-        assert_eq!(db.get_chain_streak_days("算力", 1), 1);
-        assert_eq!(db.get_chain_streak_days("", 0), 0);
+        assert_eq!(
+            db.get_chain_appearance_days_as_of_strict(
+                "算力",
+                10,
+                row_date
+                    .checked_add_signed(chrono::Duration::days(9))
+                    .expect("lower-bound as-of"),
+            )
+            .expect("row at lower bound is included"),
+            1
+        );
+        assert_eq!(
+            db.get_chain_appearance_days_as_of_strict(
+                "算力",
+                10,
+                row_date
+                    .checked_add_signed(chrono::Duration::days(10))
+                    .expect("outside-window as-of"),
+            )
+            .expect("row below lower bound is excluded"),
+            0
+        );
+        assert_eq!(
+            db.get_chain_appearance_days_as_of_strict(
+                "算力",
+                1,
+                row_date.pred_opt().expect("previous date"),
+            )
+            .expect("row after as-of is excluded"),
+            0
+        );
+        assert!(db
+            .get_chain_appearance_days_as_of_strict("", 1, row_date)
+            .is_err());
+        assert!(db
+            .get_chain_appearance_days_as_of_strict("算力", 0, row_date)
+            .is_err());
+        assert!(db
+            .get_chain_appearance_days_as_of_strict("算力", i64::MAX, row_date)
+            .is_err());
     }
 
     #[test]

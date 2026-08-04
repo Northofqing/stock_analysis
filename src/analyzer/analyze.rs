@@ -505,16 +505,25 @@ impl GeminiAnalyzer {
                 }
 
                 // 趋势判定：ROE / 毛利率 / 营收YoY 是否单调上升或下降
-                let trend = |get: fn(&crate::data_provider::FinancialPeriod) -> Option<f64>| -> Option<&'static str> {
+                let trend = |get: fn(
+                    &crate::company_financials::FinancialPeriod,
+                ) -> Option<f64>|
+                 -> Option<&'static str> {
                     let vals: Vec<f64> = show.iter().filter_map(|p| get(p)).collect();
-                    if vals.len() < 3 { return None; }
+                    if vals.len() < 3 {
+                        return None;
+                    }
                     // hist 是从新到旧，反转为时间正序后做趋势判断
                     let chrono: Vec<f64> = vals.iter().rev().cloned().collect();
                     let up = chrono.windows(2).all(|w| w[1] >= w[0] - 0.01);
                     let down = chrono.windows(2).all(|w| w[1] <= w[0] + 0.01);
-                    if up && !down { Some("持续上行") }
-                    else if down && !up { Some("持续下行") }
-                    else { None }
+                    if up && !down {
+                        Some("持续上行")
+                    } else if down && !up {
+                        Some("持续下行")
+                    } else {
+                        None
+                    }
                 };
                 if let Some(t) = trend(|p| p.roe) {
                     context.push_str(&format!("ROE趋势: {}\n", t));
@@ -624,7 +633,7 @@ impl GeminiAnalyzer {
             }
 
             // ========== 财务异常信号（启发式红旗评分） ==========
-            if let Some(q) = crate::data_provider::assess_quality(hist) {
+            if let Some(q) = crate::company_financials::assess_quality(hist) {
                 if !q.flags.is_empty() {
                     context.push_str(&format!(
                         "\n【财务异常信号】风险评分 {}/100 ({})\n",
@@ -973,10 +982,9 @@ impl GeminiAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_provider::{
-        consensus::ConsensusData, financials::FinancialPeriod, industry::IndustryBenchmark,
-        valuation_history::ValuationHistory, AdjustType, KlineData,
-    };
+    use crate::company_financials::FinancialPeriod;
+    use crate::company_metrics::{IndustryBenchmark, ValuationHistory};
+    use crate::data_provider::{consensus::ConsensusData, AdjustType, KlineData};
     use crate::pipeline::score_breakdown::ScoreBreakdown;
     use std::collections::HashMap;
 

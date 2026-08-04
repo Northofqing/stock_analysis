@@ -1,838 +1,255 @@
-//! Registered business rules: BR-078, BR-137.
-//! v15.3 Phase D1.2-D1.4: 12 个 NewsFeed 适配层
-//!
-//! 把现有 `search_service::providers::*` (8 个 flash) + 新建 4 个数据源
-//! (GovCn / Miit / Earnings / Consensus / MarketAction / AnalystViews) 适配为 NewsFeed
-//!
-//! 设计: 每个 feed 只是薄壳, fetch 内部委托给现有数据源 provider, 然后 SearchResult → MarketEvent
+//! BR-166 typed global-news feeds backed only by the unified data Gateway.
 
-use super::{NewsFeed, SourceKind};
+use super::{NewsFeed, NewsFeedOutput, SourceKind};
+use crate::data_gateway::{GatewayBatch, GlobalNewsGateway, GlobalNewsProvider, GlobalNewsRecord};
 use crate::signal::market_event::{
-    Direction, EventType, MarketEvent, ProviderPublication, SourceRef,
+    compute_simhash, Direction, EventType, MarketEvent, ProviderPublication, SourceRef,
 };
-use crate::util::recover_lock_or_warn;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex, OnceLock};
+use chrono::Local;
+use sha2::{Digest, Sha256};
 
-/// 把任意 `SearchResult` (现有 search_service 类型) 转成 MarketEvent
-fn search_result_to_event(
-    r: &crate::search_service::SearchResult,
-    source_kind: SourceKind,
-    event_type: EventType,
+/// One thin registered feed over a released typed upstream provider.
+#[derive(Debug, Clone, Copy)]
+pub struct UnifiedGlobalNewsFeed {
+    provider: GlobalNewsProvider,
+    gateway: GlobalNewsGateway,
+}
+
+impl UnifiedGlobalNewsFeed {
+    pub const fn new(provider: GlobalNewsProvider) -> Self {
+        Self {
+            provider,
+            gateway: GlobalNewsGateway::new(),
+        }
+    }
+
+    pub const fn provider(&self) -> GlobalNewsProvider {
+        self.provider
+    }
+}
+
+#[async_trait]
+impl NewsFeed for UnifiedGlobalNewsFeed {
+    fn name(&self) -> &str {
+        self.provider.feed_name()
+    }
+
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::Flash
+    }
+
+    async fn fetch(&self, limit: usize) -> Result<NewsFeedOutput> {
+        let limit = u32::try_from(limit).context("global-news limit exceeds u32")?;
+        let batch = self
+            .gateway
+            .global_news(self.provider, limit)
+            .await
+            .with_context(|| format!("{} fetch failed", self.provider.feed_name()))?;
+        project_gateway_batch(self.provider, batch)
+    }
+}
+
+fn project_gateway_batch(
+    provider: GlobalNewsProvider,
+    batch: GatewayBatch<GlobalNewsRecord>,
+) -> Result<NewsFeedOutput> {
+    match batch {
+        GatewayBatch::Available { records, evidence } => {
+            let events = records
+                .iter()
+                .map(|record| record_to_market_event(provider, record))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(NewsFeedOutput::from_global_gateway(
+                events, records, evidence,
+            ))
+        }
+        GatewayBatch::VerifiedEmpty(_) => Ok(NewsFeedOutput::default()),
+    }
+}
+
+pub(super) fn record_to_market_event(
+    provider: GlobalNewsProvider,
+    record: &GlobalNewsRecord,
 ) -> Result<MarketEvent> {
-    if r.title.trim().is_empty() {
-        bail!("BR-137 SearchResult title is empty");
-    }
-    if r.source.trim().is_empty() {
-        bail!("BR-137 SearchResult source is empty");
-    }
-    if r.importance > 10 {
-        bail!(
-            "BR-137 SearchResult importance out of range: {}",
-            r.importance
+    let occurred_at = record.published_at.with_timezone(&Local);
+    let fetched_at = record.observed_at.with_timezone(&Local);
+    if fetched_at < occurred_at {
+        anyhow::bail!(
+            "BR-166 {} observation precedes publication",
+            provider.feed_name()
         );
     }
-    let now = Utc::now();
-    let observed_at = now.with_timezone(&Local);
-    let source_time =
-        parse_source_time(r.published_date.as_deref(), observed_at, r.source.as_str());
-    let simhash = {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut h = DefaultHasher::new();
-        r.title.hash(&mut h);
-        r.url.hash(&mut h);
-        h.finish()
-    };
-    let dir = match r.sentiment {
-        crate::search_service::Sentiment::Positive => Direction::Bull,
-        crate::search_service::Sentiment::Negative => Direction::Bear,
-        _ => Direction::Neutral,
-    };
-    let importance = r.importance;
-    let simhash_str = format!("{:x}", simhash);
-    let _ = simhash_str;
+
+    let body = record
+        .summary
+        .as_deref()
+        .or(record.content.as_deref())
+        .unwrap_or("");
+    let simhash = compute_simhash(&record.title, body);
+    let mut event_hasher = Sha256::new();
+    event_hasher.update(b"BR166_GLOBAL_NEWS_EVENT_V1\0");
+    event_hasher.update(provider.source().as_bytes());
+    event_hasher.update(b"\0");
+    event_hasher.update(record.item_id.as_bytes());
+    let event_id = hex::encode(event_hasher.finalize());
+    let stale = occurred_at.date_naive() != fetched_at.date_naive();
+
     Ok(MarketEvent {
-        event_id: format!("{}-{:x}", source_kind.label(), simhash),
+        event_id,
         simhash,
-        full_title: r.title.clone(),
-        event_type,
-        subject: r.source.clone(),
-        object: Some(r.title.clone()),
-        direction: dir,
-        strength: importance.saturating_mul(10),
-        certainty: 60,
-        chains: vec![],
-        occurred_at: source_time.occurred_at,
-        provider_publication: source_time.provider_publication,
-        provenance: vec![SourceRef {
-            provider: r.source.clone(),
-            url: if r.url.is_empty() {
-                None
-            } else {
-                Some(r.url.clone())
-            },
-            fetched_at: observed_at,
-        }],
-        ai_degraded: false,
-        stale: source_time.stale,
-    })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SourceTimeEvidence {
-    occurred_at: DateTime<Local>,
-    provider_publication: Option<ProviderPublication>,
-    stale: bool,
-}
-
-/// Preserve a real provider timestamp when one exists. Date-only sources use
-/// the real adapter observation time, while freshness is derived from the
-/// provider date. Missing/invalid dates are explicitly stale and cannot enter
-/// BR-137 critical or aggregate decisions.
-fn parse_source_time(
-    raw: Option<&str>,
-    observed_at: DateTime<Local>,
-    provider: &str,
-) -> SourceTimeEvidence {
-    fn warn_once(provider: &str, reason: &str) {
-        static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-        let key = format!("{provider}:{reason}");
-        let mut warned = WARNED
-            .get_or_init(|| Mutex::new(HashSet::new()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if warned.insert(key) {
-            log::warn!(
-                "[NewsFeed][BR-137] provider published_date {reason}; provider={provider}; event marked stale"
-            );
-        }
-    }
-    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
-        warn_once(provider, "missing");
-        return SourceTimeEvidence {
-            occurred_at: observed_at,
-            provider_publication: None,
-            stale: true,
-        };
-    };
-    if let Ok(timestamp) = DateTime::parse_from_rfc3339(raw) {
-        let timestamp = timestamp.with_timezone(&Local);
-        let stale = timestamp > observed_at || timestamp.date_naive() != observed_at.date_naive();
-        return SourceTimeEvidence {
-            occurred_at: timestamp,
-            provider_publication: Some(ProviderPublication {
-                published_on: timestamp.date_naive(),
-                published_at: Some(timestamp),
-            }),
-            stale,
-        };
-    }
-    for format in [
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%dT%H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S",
-    ] {
-        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(raw, format) {
-            if let Some(timestamp) = Local.from_local_datetime(&naive).single() {
-                let stale =
-                    timestamp > observed_at || timestamp.date_naive() != observed_at.date_naive();
-                return SourceTimeEvidence {
-                    occurred_at: timestamp,
-                    provider_publication: Some(ProviderPublication {
-                        published_on: timestamp.date_naive(),
-                        published_at: Some(timestamp),
-                    }),
-                    stale,
-                };
-            }
-        }
-    }
-    if let Ok(date) = NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
-        return SourceTimeEvidence {
-            occurred_at: observed_at,
-            provider_publication: Some(ProviderPublication {
-                published_on: date,
-                published_at: None,
-            }),
-            stale: date != observed_at.date_naive(),
-        };
-    }
-    warn_once(provider, "invalid");
-    SourceTimeEvidence {
-        occurred_at: observed_at,
-        provider_publication: None,
-        stale: true,
-    }
-}
-
-#[cfg(test)]
-fn source_time_and_stale(
-    raw: Option<&str>,
-    observed_at: DateTime<Local>,
-    provider: &str,
-) -> (DateTime<Local>, bool) {
-    let evidence = parse_source_time(raw, observed_at, provider);
-    (evidence.occurred_at, evidence.stale)
-}
-
-// ============================================================================
-// 8 flash wraps — 全部用 SearchResult 接口
-// ============================================================================
-
-pub struct Jin10FlashFeed {
-    pub inner: crate::search_service::providers::jin10::Jin10Provider,
-}
-#[async_trait]
-impl NewsFeed for Jin10FlashFeed {
-    fn name(&self) -> &str {
-        "jin10_flash"
-    }
-    fn source_kind(&self) -> SourceKind {
-        SourceKind::Flash
-    }
-    async fn fetch(&self, limit: usize) -> Result<Vec<MarketEvent>> {
-        let v = self
-            .inner
-            .fetch_flash_news(limit, false)
-            .await
-            .context("jin10_flash fetch failed")?;
-        v.iter()
-            .map(|r| search_result_to_event(r, SourceKind::Flash, EventType::Other))
-            .collect()
-    }
-}
-
-pub struct WallStreetCnFeed {
-    pub inner: crate::search_service::providers::wallstreetcn::WallStreetCnProvider,
-}
-#[async_trait]
-impl NewsFeed for WallStreetCnFeed {
-    fn name(&self) -> &str {
-        "wallstreetcn_flash"
-    }
-    fn source_kind(&self) -> SourceKind {
-        SourceKind::Flash
-    }
-    async fn fetch(&self, limit: usize) -> Result<Vec<MarketEvent>> {
-        let v = self
-            .inner
-            .fetch_live_news(limit)
-            .await
-            .context("wallstreetcn_flash fetch failed")?;
-        v.iter()
-            .map(|r| search_result_to_event(r, SourceKind::Flash, EventType::Other))
-            .collect()
-    }
-}
-
-pub struct ClsFlashFeed {
-    pub inner: crate::search_service::providers::cls::ClsProvider,
-}
-#[async_trait]
-impl NewsFeed for ClsFlashFeed {
-    fn name(&self) -> &str {
-        "cls_flash"
-    }
-    fn source_kind(&self) -> SourceKind {
-        SourceKind::Flash
-    }
-    async fn fetch(&self, limit: usize) -> Result<Vec<MarketEvent>> {
-        let v = self
-            .inner
-            .fetch_live_news(limit)
-            .await
-            .context("cls_flash fetch failed")?;
-        v.iter()
-            .map(|r| search_result_to_event(r, SourceKind::Flash, EventType::Other))
-            .collect()
-    }
-}
-
-pub struct SinaFlashFeed {
-    pub inner: crate::search_service::providers::sina_flash::SinaFlashProvider,
-}
-#[async_trait]
-impl NewsFeed for SinaFlashFeed {
-    fn name(&self) -> &str {
-        "sina_flash"
-    }
-    fn source_kind(&self) -> SourceKind {
-        SourceKind::Flash
-    }
-    async fn fetch(&self, limit: usize) -> Result<Vec<MarketEvent>> {
-        let v = self.inner.fetch_flash_news(limit).await;
-        v.iter()
-            .map(|r| search_result_to_event(r, SourceKind::Flash, EventType::Other))
-            .collect()
-    }
-}
-
-pub struct WeiboHotFeed {
-    pub inner: crate::search_service::providers::weibo_hot::WeiboHotProvider,
-}
-#[async_trait]
-impl NewsFeed for WeiboHotFeed {
-    fn name(&self) -> &str {
-        "weibo_hot"
-    }
-    fn source_kind(&self) -> SourceKind {
-        SourceKind::Flash
-    }
-    async fn fetch(&self, limit: usize) -> Result<Vec<MarketEvent>> {
-        let v = self
-            .inner
-            .fetch_hot_search(limit)
-            .await
-            .context("weibo_hot fetch failed")?;
-        v.iter()
-            .map(|r| search_result_to_event(r, SourceKind::Flash, EventType::Other))
-            .collect()
-    }
-}
-
-pub struct GelonghuiFeed {
-    pub inner: crate::search_service::providers::gelonghui::GelonghuiProvider,
-}
-#[async_trait]
-impl NewsFeed for GelonghuiFeed {
-    fn name(&self) -> &str {
-        "gelonghui"
-    }
-    fn source_kind(&self) -> SourceKind {
-        SourceKind::Flash
-    }
-    async fn fetch(&self, limit: usize) -> Result<Vec<MarketEvent>> {
-        let v = self
-            .inner
-            .fetch_live(limit)
-            .await
-            .context("gelonghui fetch failed")?;
-        v.iter()
-            .map(|r| search_result_to_event(r, SourceKind::Flash, EventType::Other))
-            .collect()
-    }
-}
-
-pub struct KcbDailyFeed {
-    pub inner: crate::search_service::providers::kcb_daily::KcbDailyProvider,
-}
-#[async_trait]
-impl NewsFeed for KcbDailyFeed {
-    fn name(&self) -> &str {
-        "kcb_daily"
-    }
-    fn source_kind(&self) -> SourceKind {
-        SourceKind::ActiveSearch
-    }
-    async fn fetch(&self, limit: usize) -> Result<Vec<MarketEvent>> {
-        let v = self
-            .inner
-            .fetch_latest(limit)
-            .await
-            .context("kcb_daily fetch failed")?;
-        v.iter()
-            .map(|r| search_result_to_event(r, SourceKind::ActiveSearch, EventType::Other))
-            .collect()
-    }
-}
-
-pub struct GovPolicyFeed {
-    pub inner: crate::search_service::providers::gov_policy::GovPolicyProvider,
-}
-#[async_trait]
-impl NewsFeed for GovPolicyFeed {
-    fn name(&self) -> &str {
-        "gov_policy"
-    }
-    fn source_kind(&self) -> SourceKind {
-        SourceKind::Policy
-    }
-    async fn fetch(&self, limit: usize) -> Result<Vec<MarketEvent>> {
-        let v = self
-            .inner
-            .fetch_latest(limit)
-            .await
-            .context("gov_policy fetch failed")?;
-        v.iter()
-            .map(|r| search_result_to_event(r, SourceKind::Policy, EventType::Policy))
-            .collect()
-    }
-}
-
-// ============================================================================
-// 未实现的政策 feed：不进入生产注册表，误调用显式 unavailable
-// ============================================================================
-
-pub struct GovCnFeed;
-#[async_trait]
-impl NewsFeed for GovCnFeed {
-    fn name(&self) -> &str {
-        "gov_cn_yaowen"
-    }
-    fn source_kind(&self) -> SourceKind {
-        SourceKind::Policy
-    }
-    async fn fetch(&self, _limit: usize) -> Result<Vec<MarketEvent>> {
-        bail!("gov_cn_yaowen unavailable: parser not implemented")
-    }
-}
-
-pub struct MiitFeed;
-#[async_trait]
-impl NewsFeed for MiitFeed {
-    fn name(&self) -> &str {
-        "miit_policy"
-    }
-    fn source_kind(&self) -> SourceKind {
-        SourceKind::Policy
-    }
-    async fn fetch(&self, _limit: usize) -> Result<Vec<MarketEvent>> {
-        bail!("miit_policy unavailable: parser not implemented")
-    }
-}
-
-// ============================================================================
-// D1.3: 3 个财报 / 公告 / 共识 feed
-// ============================================================================
-
-#[cfg(test)]
-pub struct EmAnnouncementFeed;
-
-#[cfg(test)]
-fn announcement_to_market_event(
-    announcement: &crate::data_provider::announcement::Announcement,
-    observed_at: chrono::DateTime<Local>,
-    provider: &str,
-) -> Option<MarketEvent> {
-    if !crate::data_provider::announcement::announcement_is_immediate_notification_candidate(
-        announcement,
-    ) {
-        return None;
-    }
-    let source_time = parse_source_time(Some(&announcement.date), observed_at, provider);
-    let simhash = {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        announcement.code.hash(&mut hasher);
-        announcement.title.hash(&mut hasher);
-        hasher.finish()
-    };
-    Some(MarketEvent {
-        event_id: format!("earnings-{:x}", simhash),
-        simhash,
-        full_title: announcement.title.clone(),
-        event_type: EventType::Announcement,
-        subject: announcement.code.clone(),
-        object: Some(announcement.code.clone()),
+        full_title: record.title.clone(),
+        event_type: EventType::Other,
+        subject: record.publisher.clone(),
+        object: Some(record.title.clone()),
+        // The source contract proves publication, not price direction or
+        // impact. Keep those semantics explicit until downstream classifiers
+        // add independently audited evidence.
         direction: Direction::Neutral,
-        strength: 70,
-        certainty: 80,
-        chains: vec![],
-        occurred_at: source_time.occurred_at,
-        provider_publication: source_time.provider_publication,
+        strength: 0,
+        certainty: 100,
+        chains: Vec::new(),
+        occurred_at,
+        provider_publication: Some(ProviderPublication {
+            published_on: occurred_at.date_naive(),
+            published_at: Some(occurred_at),
+        }),
         provenance: vec![SourceRef {
-            provider: provider.to_string(),
-            url: announcement.url.clone(),
-            fetched_at: observed_at,
+            provider: provider.source().to_string(),
+            url: Some(record.canonical_url.clone()),
+            fetched_at,
         }],
         ai_degraded: false,
-        stale: source_time.stale,
+        stale,
     })
-}
-
-#[cfg(test)]
-#[async_trait]
-impl NewsFeed for EmAnnouncementFeed {
-    fn name(&self) -> &str {
-        "em_announcement"
-    }
-    fn source_kind(&self) -> SourceKind {
-        SourceKind::Earnings
-    }
-    async fn fetch(&self, _limit: usize) -> Result<Vec<MarketEvent>> {
-        let batch = crate::data_provider::announcement::fetch_announcements(None)
-            .await
-            .context("em_announcement fetch failed")?;
-        if batch.announcements.is_empty() {
-            log::info!("[EmAnnouncementFeed] no announcements this cycle");
-            return Ok(vec![]);
-        }
-        let observed_at = batch.provenance.observed_at.with_timezone(&Local);
-        let provider = batch.provenance.provider_label();
-        let events = batch
-            .announcements
-            .iter()
-            .filter_map(|announcement| {
-                announcement_to_market_event(announcement, observed_at, provider)
-            })
-            .collect::<Vec<_>>();
-        if events.is_empty() {
-            log::info!("[EmAnnouncementFeed][BR-138] only local lifecycle evidence this cycle");
-        }
-        Ok(events)
-    }
-}
-
-pub struct EarningsCalendarFeed;
-#[async_trait]
-impl NewsFeed for EarningsCalendarFeed {
-    fn name(&self) -> &str {
-        "earnings_calendar"
-    }
-    fn source_kind(&self) -> SourceKind {
-        SourceKind::Earnings
-    }
-    async fn fetch(&self, _limit: usize) -> Result<Vec<MarketEvent>> {
-        bail!("earnings_calendar unavailable: polling source not implemented")
-    }
-}
-
-pub struct ConsensusFeed;
-#[async_trait]
-impl NewsFeed for ConsensusFeed {
-    fn name(&self) -> &str {
-        "consensus"
-    }
-    fn source_kind(&self) -> SourceKind {
-        SourceKind::AnalystView
-    }
-    async fn fetch(&self, _limit: usize) -> Result<Vec<MarketEvent>> {
-        bail!("consensus unavailable: polling source not implemented")
-    }
-}
-
-// ============================================================================
-// D1.4: MarketActionFeed + AnalystViewsFeed (主动触发，禁止按轮询源调用)
-// ============================================================================
-
-pub struct MarketActionFeed;
-#[async_trait]
-impl NewsFeed for MarketActionFeed {
-    fn name(&self) -> &str {
-        "market_action"
-    }
-    fn source_kind(&self) -> SourceKind {
-        SourceKind::MarketAction
-    }
-    async fn fetch(&self, _limit: usize) -> Result<Vec<MarketEvent>> {
-        bail!("market_action is push-driven and cannot be polled")
-    }
-}
-
-pub struct AnalystViewsFeed;
-#[async_trait]
-impl NewsFeed for AnalystViewsFeed {
-    fn name(&self) -> &str {
-        "analyst_views"
-    }
-    fn source_kind(&self) -> SourceKind {
-        SourceKind::AnalystView
-    }
-    async fn fetch(&self, _limit: usize) -> Result<Vec<MarketEvent>> {
-        bail!("analyst_views is push-driven and cannot be polled")
-    }
-}
-
-// ============================================================================
-// 全局注册 (D1.5 wire)
-// ============================================================================
-
-pub type RegisteredFeeds = std::sync::Arc<Mutex<Vec<Arc<dyn NewsFeed>>>>;
-static ALL_FEEDS: once_cell::sync::OnceCell<RegisteredFeeds> = once_cell::sync::OnceCell::new();
-
-pub fn all_feeds() -> Option<RegisteredFeeds> {
-    ALL_FEEDS.get().cloned()
-}
-
-pub fn register_feeds(feeds: Vec<Arc<dyn NewsFeed>>) {
-    let g = ALL_FEEDS.get_or_init(|| std::sync::Arc::new(Mutex::new(Vec::new())));
-    let mut g = recover_lock_or_warn("news::aggregator::register_feeds", g.lock());
-    for f in feeds {
-        g.push(f);
-    }
-}
-
-/// 一次性取出已注册 feeds → 喂给 NewsAggregator
-pub fn take_all_for_aggregator() -> Vec<Arc<dyn NewsFeed>> {
-    match ALL_FEEDS.get() {
-        Some(arc) => match arc.lock() {
-            Ok(mut g) => std::mem::take(&mut *g),
-            Err(p) => {
-                log::warn!("[feed::take] lock poisoned, take inner");
-                let mut inner = p.into_inner();
-                std::mem::take(&mut *inner)
-            }
-        },
-        None => vec![],
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data_gateway::BatchEvidence;
+    use chrono::{DateTime, Utc};
+    use magic_market_core::{ProviderId, SourceEvidence};
 
-    #[test]
-    fn br138_local_only_announcement_never_becomes_market_event() {
-        let announcement = crate::data_provider::announcement::Announcement {
-            code: "TEST_CODE_000001".into(),
-            name: "TEST_CODE_本地证据公司".into(),
-            title: "关于注销部分回购股份并减少注册资本通知债权人的公告".into(),
-            date: Local::now().format("%Y-%m-%d").to_string(),
-            summary: String::new(),
-            content: String::new(),
-            level: crate::data_provider::announcement::AnnLevel::Skip,
-            reason: "BR-138 lifecycle-only local evidence".into(),
-            external_id: Some("TEST_CODE_LOCAL_ONLY".into()),
-            url: Some("https://example.invalid/TEST_CODE_LOCAL_ONLY".into()),
-        };
-
-        assert!(
-            announcement_to_market_event(&announcement, Local::now(), "test/provider").is_none()
-        );
+    fn test_record(provider: GlobalNewsProvider) -> GlobalNewsRecord {
+        let published_at = DateTime::parse_from_rfc3339("2026-07-25T10:00:00+08:00")
+            .expect("TEST_CODE publication")
+            .with_timezone(&Utc);
+        let observed_at = DateTime::parse_from_rfc3339("2026-07-25T10:00:01+08:00")
+            .expect("TEST_CODE observation")
+            .with_timezone(&Utc);
+        GlobalNewsRecord {
+            item_id: "TEST_CODE_item".to_string(),
+            title: "TEST_CODE global news title".to_string(),
+            summary: Some("TEST_CODE summary".to_string()),
+            content: None,
+            publisher: "TEST_CODE publisher".to_string(),
+            canonical_url: "https://example.com/TEST_CODE_item".to_string(),
+            published_at,
+            observed_at,
+            instruments: Vec::new(),
+            topics: Vec::new(),
+            language: "zh-CN".to_string(),
+            evidence: SourceEvidence::new(
+                provider.provider_id(),
+                format!(
+                    "{}.{:09}",
+                    published_at.timestamp(),
+                    published_at.timestamp_subsec_nanos()
+                ),
+                "TEST_CODE_batch",
+            )
+            .expect("TEST_CODE evidence"),
+        }
     }
 
     #[test]
-    fn search_result_adapter_preserves_direction_identity_url_and_strength_bounds() {
+    fn released_feeds_report_exact_provider_identity() {
         let cases = [
             (
-                crate::search_service::Sentiment::Positive,
-                Direction::Bull,
-                SourceKind::Policy,
-                EventType::Policy,
+                GlobalNewsProvider::Eastmoney,
+                ProviderId::Eastmoney,
+                "eastmoney_global_news",
             ),
             (
-                crate::search_service::Sentiment::Negative,
-                Direction::Bear,
-                SourceKind::Earnings,
-                EventType::Announcement,
+                GlobalNewsProvider::Cailianpress,
+                ProviderId::Cailianpress,
+                "cls_global_news",
             ),
             (
-                crate::search_service::Sentiment::Neutral,
-                Direction::Neutral,
-                SourceKind::ActiveSearch,
-                EventType::Other,
+                GlobalNewsProvider::Jin10,
+                ProviderId::Jin10,
+                "jin10_global_news",
             ),
             (
-                crate::search_service::Sentiment::Unknown,
-                Direction::Neutral,
-                SourceKind::Flash,
-                EventType::Other,
+                GlobalNewsProvider::ThePaper,
+                ProviderId::ThePaper,
+                "thepaper_global_news",
             ),
         ];
-
-        for (sentiment, direction, source_kind, event_type) in cases {
-            let mut result = crate::search_service::SearchResult::new(
-                "TEST_CODE 测试事件".to_string(),
-                "测试来源证据".to_string(),
-                "https://example.invalid/TEST_CODE".to_string(),
-                "测试提供方".to_string(),
-            );
-            result.sentiment = sentiment;
-            result.importance = 10;
-            result.published_date = Some(Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
-            let event = search_result_to_event(&result, source_kind, event_type).unwrap();
-            assert_eq!(event.direction, direction);
-            assert_eq!(event.event_type, event_type);
-            assert_eq!(event.subject, "测试提供方");
-            assert_eq!(event.object.as_deref(), Some("TEST_CODE 测试事件"));
-            assert_eq!(event.strength, 100);
-            assert_eq!(event.certainty, 60);
-            assert!(event.event_id.starts_with(source_kind.label()));
-            assert_eq!(event.provenance[0].provider, "测试提供方");
-            assert_eq!(
-                event.provenance[0].url.as_deref(),
-                Some("https://example.invalid/TEST_CODE")
-            );
-            assert!(!event.ai_degraded);
-            assert!(!event.stale);
-            assert_eq!(
-                event
-                    .provider_publication
-                    .as_ref()
-                    .map(|publication| publication.published_on),
-                Some(Local::now().date_naive())
-            );
-
-            let repeat = search_result_to_event(&result, source_kind, event_type).unwrap();
-            assert_eq!(repeat.simhash, event.simhash);
-            result.url.clear();
-            let without_url =
-                search_result_to_event(&result, source_kind, EventType::Other).unwrap();
-            assert_eq!(without_url.provenance[0].url, None);
-        }
-    }
-
-    #[test]
-    fn search_result_adapter_rejects_missing_identity_provenance_and_score_overflow() {
-        let mut result = crate::search_service::SearchResult::new(
-            String::new(),
-            "evidence".to_string(),
-            String::new(),
-            "provider".to_string(),
-        );
-        result.published_date = Some(Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
-        assert!(search_result_to_event(&result, SourceKind::Flash, EventType::Other).is_err());
-        result.title = "headline".to_string();
-        result.source.clear();
-        assert!(search_result_to_event(&result, SourceKind::Flash, EventType::Other).is_err());
-        result.source = "provider".to_string();
-        result.importance = 11;
-        assert!(search_result_to_event(&result, SourceKind::Flash, EventType::Other).is_err());
-    }
-
-    #[test]
-    fn source_time_marks_missing_and_old_records_stale_without_now_fallback_approval() {
-        let observed_at = Local::now();
-        assert!(source_time_and_stale(None, observed_at, "TEST_CODE_provider").1);
-        let yesterday = (observed_at.date_naive() - chrono::Duration::days(1))
-            .format("%Y-%m-%d")
-            .to_string();
-        assert!(source_time_and_stale(Some(&yesterday), observed_at, "TEST_CODE_provider").1);
-        let today = observed_at.format("%Y-%m-%d %H:%M:%S").to_string();
-        let (source_time, stale) =
-            source_time_and_stale(Some(&today), observed_at, "TEST_CODE_provider");
-        assert!(!stale);
-        assert_eq!(source_time.timestamp(), observed_at.timestamp());
-        let malformed = format!("{}garbage", observed_at.format("%Y-%m-%d"));
-        assert!(
-            source_time_and_stale(Some(&malformed), observed_at, "TEST_CODE_provider").1,
-            "a valid date prefix must not make a malformed provider timestamp fresh"
-        );
-    }
-
-    #[test]
-    fn date_only_publication_preserves_provider_date_without_inventing_a_time() {
-        let observed_at = Local
-            .with_ymd_and_hms(2026, 7, 23, 8, 30, 0)
-            .single()
-            .expect("fixed local test time");
-
-        let evidence = parse_source_time(Some("2026-07-23"), observed_at, "TEST_CODE_provider");
-
-        assert_eq!(evidence.occurred_at, observed_at);
-        assert_eq!(
-            evidence.provider_publication,
-            Some(crate::signal::market_event::ProviderPublication {
-                published_on: NaiveDate::from_ymd_opt(2026, 7, 23).expect("valid test date"),
-                published_at: None,
-            })
-        );
-        assert!(!evidence.stale);
-    }
-
-    #[test]
-    fn missing_and_invalid_publication_never_gain_provider_evidence() {
-        let observed_at = Local
-            .with_ymd_and_hms(2026, 7, 23, 8, 30, 0)
-            .single()
-            .expect("fixed local test time");
-
-        for raw in [None, Some(""), Some("2026-07-23 trailing-input")] {
-            let evidence = parse_source_time(raw, observed_at, "TEST_CODE_provider");
-            assert_eq!(evidence.provider_publication, None);
-            assert_eq!(evidence.occurred_at, observed_at);
-            assert!(evidence.stale);
-        }
-    }
-
-    #[test]
-    fn real_feed_wrappers_report_their_registered_identity_without_network_access() {
-        let feeds: Vec<(Box<dyn NewsFeed>, &str, SourceKind)> = vec![
-            (
-                Box::new(Jin10FlashFeed {
-                    inner: crate::search_service::providers::jin10::Jin10Provider::new(),
-                }),
-                "jin10_flash",
-                SourceKind::Flash,
-            ),
-            (
-                Box::new(WallStreetCnFeed {
-                    inner:
-                        crate::search_service::providers::wallstreetcn::WallStreetCnProvider::new(),
-                }),
-                "wallstreetcn_flash",
-                SourceKind::Flash,
-            ),
-            (
-                Box::new(ClsFlashFeed {
-                    inner: crate::search_service::providers::cls::ClsProvider::new(),
-                }),
-                "cls_flash",
-                SourceKind::Flash,
-            ),
-            (
-                Box::new(SinaFlashFeed {
-                    inner: crate::search_service::providers::sina_flash::SinaFlashProvider::new(),
-                }),
-                "sina_flash",
-                SourceKind::Flash,
-            ),
-            (
-                Box::new(WeiboHotFeed {
-                    inner: crate::search_service::providers::weibo_hot::WeiboHotProvider::new(),
-                }),
-                "weibo_hot",
-                SourceKind::Flash,
-            ),
-            (
-                Box::new(GelonghuiFeed {
-                    inner: crate::search_service::providers::gelonghui::GelonghuiProvider::new(),
-                }),
-                "gelonghui",
-                SourceKind::Flash,
-            ),
-            (
-                Box::new(KcbDailyFeed {
-                    inner: crate::search_service::providers::kcb_daily::KcbDailyProvider::new(),
-                }),
-                "kcb_daily",
-                SourceKind::ActiveSearch,
-            ),
-            (
-                Box::new(GovPolicyFeed {
-                    inner: crate::search_service::providers::gov_policy::GovPolicyProvider::new(),
-                }),
-                "gov_policy",
-                SourceKind::Policy,
-            ),
-        ];
-        for (feed, name, source_kind) in feeds {
+        for (provider, provider_id, name) in cases {
+            let feed = UnifiedGlobalNewsFeed::new(provider);
+            assert_eq!(feed.provider().provider_id(), provider_id);
             assert_eq!(feed.name(), name);
-            assert_eq!(feed.source_kind(), source_kind);
+            assert_eq!(feed.source_kind(), SourceKind::Flash);
         }
     }
 
-    #[tokio::test]
-    async fn unimplemented_and_push_driven_feeds_fail_explicitly() {
-        let feeds: Vec<Box<dyn NewsFeed>> = vec![
-            Box::new(GovCnFeed),
-            Box::new(MiitFeed),
-            Box::new(EarningsCalendarFeed),
-            Box::new(ConsensusFeed),
-            Box::new(MarketActionFeed),
-            Box::new(AnalystViewsFeed),
-        ];
+    #[test]
+    fn gateway_projection_retains_records_with_the_same_batch_evidence() {
+        let provider = GlobalNewsProvider::Eastmoney;
+        let record = test_record(provider);
+        let evidence = BatchEvidence {
+            provider: provider.provider_id(),
+            source: provider.source().to_owned(),
+            source_at: record.evidence.source_at().map(str::to_owned),
+            observed_at: record.observed_at.to_rfc3339(),
+            batch_id: record.evidence.batch_id().to_owned(),
+        };
 
-        for feed in feeds {
-            assert!(matches!(
-                feed.source_kind(),
-                SourceKind::Policy
-                    | SourceKind::Earnings
-                    | SourceKind::AnalystView
-                    | SourceKind::MarketAction
-            ));
-            let result = feed.fetch(10).await;
-            assert!(
-                result.is_err(),
-                "{} must not masquerade as an empty successful polling source",
-                feed.name()
-            );
-        }
+        let output = project_gateway_batch(
+            provider,
+            GatewayBatch::Available {
+                records: vec![record.clone()],
+                evidence: evidence.clone(),
+            },
+        )
+        .expect("TEST_CODE projection");
+
+        assert_eq!(output.events().len(), 1);
+        assert_eq!(output.admitted_global_news().len(), 1);
+        assert_eq!(output.admitted_global_news()[0].records(), &[record]);
+        assert_eq!(output.admitted_global_news()[0].evidence(), &evidence);
+    }
+
+    #[test]
+    fn event_projection_does_not_invent_direction_or_impact() {
+        let provider = GlobalNewsProvider::Jin10;
+        let record = test_record(provider);
+        let event = record_to_market_event(provider, &record).expect("TEST_CODE event projection");
+
+        assert_eq!(event.event_type, EventType::Other);
+        assert_eq!(event.direction, Direction::Neutral);
+        assert_eq!(event.strength, 0);
+        assert_eq!(event.certainty, 100);
+        assert_eq!(event.provenance[0].provider, provider.source());
+        assert!(!event.stale);
+        assert!(event.provider_publication.is_some());
+    }
+
+    #[test]
+    fn event_identity_is_stable_and_old_publication_is_stale() {
+        let provider = GlobalNewsProvider::ThePaper;
+        let current = test_record(provider);
+        let first = record_to_market_event(provider, &current).expect("TEST_CODE first event");
+        let second = record_to_market_event(provider, &current).expect("TEST_CODE second event");
+        assert_eq!(first.event_id, second.event_id);
+        assert_eq!(first.simhash, second.simhash);
+
+        let mut old = test_record(provider);
+        old.published_at -= chrono::Duration::days(1);
+        let old = record_to_market_event(provider, &old).expect("TEST_CODE old event");
+        assert!(old.stale);
     }
 }

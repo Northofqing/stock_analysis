@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 // 修复 Top10#6 (2026-06-29 audit): 保留 std::sync::Mutex — `recent_topic_signatures: VecDeque`,
 // `source_health: HashMap`, `source_health_ticks: u64` 都是微秒级内存修改, lock 持有 < 100ns.
-// 改 tokio Mutex 会要求所有调用方 (e.g. fetch_flash_titles sync) 改 async, 影响面过大.
+// 改 tokio Mutex 会要求所有调用方改 async；当前锁只保护微秒级内存状态，保留 std.
 // audit 列的 5 处 std::sync::Mutex 中 analyzer/mod.rs:454 **实际已是** tokio::sync::Mutex.
 // 其他 4 处 (本文件 + adaptive + rate_budget + industry) 都是 sync API + 微秒级持有, 保留 std.
 use std::sync::Mutex;
@@ -12,14 +12,124 @@ use std::time::Duration;
 use log::{debug, info, warn};
 
 use crate::config::get_monitor_config;
-
-use super::providers::{
-    BochaSearchProvider, ClsProvider, CninfoProvider, EastmoneyNewsProvider,
-    EmAnnouncementProvider, EmIndustryNewsProvider, GelonghuiProvider, GovPolicyProvider,
-    Jin10CalendarEvent, Jin10Provider, KcbDailyProvider, SerpAPISearchProvider, SinaFlashProvider,
-    SseSzseProvider, TavilySearchProvider, WallStreetCnProvider, WeiboHotProvider, XueqiuProvider,
+use crate::data_gateway::{
+    EconomicCalendarGateway, GatewayBatch, GatewayError, GeneralWebResearchProvider,
+    GlobalNewsGateway, GlobalNewsProvider, GlobalNewsRecord,
 };
-use super::types::{SearchProvider, SearchResponse, SearchResult};
+
+use super::macro_news::render_gateway_sections;
+use super::providers::GeneralWebSearchProvider;
+use super::types::{
+    FlashFactBatch, FlashFactsUnavailable, FlashSourceStatus, FreshFlashFact, SearchProvider,
+    SearchResponse, SearchResult,
+};
+
+#[derive(Debug)]
+struct ProjectedFlashOutcome {
+    facts: Vec<FreshFlashFact>,
+    status: FlashSourceStatus,
+}
+
+fn project_gateway_flash_outcome(
+    provider: GlobalNewsProvider,
+    outcome: Result<GatewayBatch<GlobalNewsRecord>, GatewayError>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<ProjectedFlashOutcome, String> {
+    let expected_provider = provider.provider_id();
+    let expected_source = provider.source();
+    match outcome {
+        Ok(GatewayBatch::Available { records, evidence }) => {
+            if evidence.provider != expected_provider
+                || evidence.source != expected_source
+                || evidence.source_at.as_deref().is_none_or(str::is_empty)
+                || evidence.observed_at.trim().is_empty()
+                || evidence.batch_id.trim().is_empty()
+            {
+                return Err(format!(
+                    "{} returned mismatched or incomplete batch evidence",
+                    provider.feed_name()
+                ));
+            }
+
+            let mut facts = Vec::with_capacity(records.len());
+            let mut stale_records = 0usize;
+            let mut macro_records = 0usize;
+            for record in records {
+                if record.evidence.provider() != evidence.provider
+                    || record.evidence.batch_id() != evidence.batch_id
+                    || record.evidence.observed_at() != evidence.observed_at
+                    || record.evidence.source_at().is_none_or(str::is_empty)
+                {
+                    return Err(format!(
+                        "{} record {} evidence differs from batch",
+                        provider.feed_name(),
+                        record.item_id
+                    ));
+                }
+                if record.published_at > now || record.observed_at > now {
+                    return Err(format!(
+                        "{} record {} has future publication or observation time",
+                        provider.feed_name(),
+                        record.item_id
+                    ));
+                }
+                if record
+                    .published_at
+                    .with_timezone(&chrono::Local)
+                    .date_naive()
+                    != now.with_timezone(&chrono::Local).date_naive()
+                {
+                    stale_records += 1;
+                    continue;
+                }
+                if is_macro_title(&record.title) {
+                    macro_records += 1;
+                    continue;
+                }
+                facts.push(FreshFlashFact {
+                    record,
+                    batch_evidence: evidence.clone(),
+                });
+            }
+            Ok(ProjectedFlashOutcome {
+                status: FlashSourceStatus::Available {
+                    evidence,
+                    admitted_records: facts.len(),
+                    stale_records,
+                    macro_records,
+                },
+                facts,
+            })
+        }
+        Ok(GatewayBatch::VerifiedEmpty(evidence)) => {
+            if evidence.provider != expected_provider
+                || evidence.source != expected_source
+                || evidence.source_at.as_deref().is_none_or(str::is_empty)
+                || evidence.observed_at.trim().is_empty()
+                || evidence.batch_id.trim().is_empty()
+            {
+                return Err(format!(
+                    "{} returned mismatched or incomplete empty-batch evidence",
+                    provider.feed_name()
+                ));
+            }
+            Ok(ProjectedFlashOutcome {
+                facts: Vec::new(),
+                status: FlashSourceStatus::VerifiedEmpty(evidence),
+            })
+        }
+        Err(error) => Ok(ProjectedFlashOutcome {
+            facts: Vec::new(),
+            status: FlashSourceStatus::Unavailable {
+                provider: expected_provider,
+                source: expected_source.to_string(),
+                reason_code: error.reason_code().to_string(),
+                retryable: error.retryable(),
+                message: error.to_string(),
+            },
+        }),
+    }
+}
 
 // ============================================================================
 // SearchService 主服务
@@ -33,26 +143,6 @@ use super::types::{SearchProvider, SearchResponse, SearchResult};
 /// 3. 结果聚合和格式化
 pub struct SearchService {
     providers: Vec<Box<dyn SearchProvider>>,
-    /// 华尔街见闻直连（免费，用于宏观新闻）
-    wscn: WallStreetCnProvider,
-    /// 财联社直连（免费，A股电报）
-    cls: ClsProvider,
-    /// 科创板日报直连（CLS 同源，走快讯池）
-    kcb: KcbDailyProvider,
-    /// 金十数据直连（免费，快讯 + 财经日历）
-    jin10: Jin10Provider,
-    /// 新浪财经全球快讯（免费，4 lid 并发: 国际/国内/A股/港股）
-    sina_flash: SinaFlashProvider,
-    /// 微博热搜榜（正交源：全民级突发/科技/政策热点，补财经快讯的盲区）
-    weibo_hot: WeiboHotProvider,
-    /// 格隆汇快讯（市场与公司层面高频资讯）
-    gelonghui: GelonghuiProvider,
-    /// 政府/监管公告（发改委等公开政策信息）
-    gov_policy: GovPolicyProvider,
-    /// 东财全市场公告流（免费，A 股 5000+ 公司公告流）
-    em_announcement: EmAnnouncementProvider,
-    /// 东财行业新闻流（免费，10 个 BOM 行业关键词并发）
-    em_industry_news: EmIndustryNewsProvider,
     /// 最近入选主题新闻标题特征（用于抑制重复推送）
     recent_topic_signatures: Mutex<VecDeque<String>>,
     /// 新闻源健康统计（成功/超时/失败/空结果）
@@ -72,7 +162,6 @@ struct TopicRerankParams {
 struct SourceHealthStats {
     attempts: u64,
     success: u64,
-    timeout: u64,
     error: u64,
     empty: u64,
     items: u64,
@@ -81,7 +170,6 @@ struct SourceHealthStats {
 #[derive(Clone, Copy)]
 enum SourceFetchOutcome {
     Success,
-    Timeout,
     Error,
     Empty,
 }
@@ -92,47 +180,18 @@ impl SearchService {
         bocha_keys: Option<Vec<String>>,
         tavily_keys: Option<Vec<String>>,
         serpapi_keys: Option<Vec<String>>,
-        enable_eastmoney: bool,
     ) -> Self {
         let mut providers: Vec<Box<dyn SearchProvider>> = Vec::new();
 
-        // 按优先级添加搜索引擎
-        // 修复 P1.4: 免费源先于付费源, 避免 429/403/432 时无谓重试
-        // 原因: SerpAPI/Bocha/Tavily 都是有额度的付费/限免 API, 失败率高
-        //        而 东方财富/华尔街见闻/财联社 是免费直连, 优先用它们能保证稳定
-
-        // 1. 东方财富（免费，A股专业，无需API Key）
-        if enable_eastmoney {
-            info!("已启用 东方财富 新闻搜索（免费，无限制）");
-            providers.push(Box::new(EastmoneyNewsProvider::new()));
-        }
-
-        // 2. 华尔街见闻（免费直连，补充全球财经资讯）
-        providers.push(Box::new(WallStreetCnProvider::new()));
-
-        // 3. 财联社（免费直连，补充A股电报）
-        providers.push(Box::new(ClsProvider::new()));
-
-        // 3c. 巨潮资讯（免费直连，A 股法定信披平台，沪深公告全覆盖）
-        providers.push(Box::new(CninfoProvider::new()));
-
-        // 3c. 沪深交易所（免费直连，上交所/深交所官方公告，按代码路由）
-        providers.push(Box::new(SseSzseProvider::new()));
-
-        // 3d. 雪球 (v21: 用户/机构观点, 默认启用, 需 XUEQIU_COOKIE env 否则反爬)
-        //   - 启用: export XUEQIU_COOKIE="xq_a_token=...; xq_r_token=..."
-        //   - 注意: 之前 v25 暂时禁用, 现恢复 (用户提供有效 token)
-        providers.push(Box::new(XueqiuProvider::new()));
-        info!("已启用 雪球 公共时间线（免费，A股+全部 category）");
-
-        // 4. 金十数据（免费直连，补充快讯）
-        // 见 providers/jin10.rs - 默认就是免费直连, 无 API Key
-
-        // 5. SerpAPI（付费，Google搜索结果，作为质量补充）
+        // BR-164: this registry is only generic, user-authorized web research.
+        // Governed financial facts are acquired exclusively by data_gateway.
         if let Some(keys) = serpapi_keys {
             if !keys.is_empty() {
                 info!("已配置 SerpAPI 搜索，共 {} 个 API Key", keys.len());
-                providers.push(Box::new(SerpAPISearchProvider::new(keys)));
+                providers.push(Box::new(GeneralWebSearchProvider::new(
+                    GeneralWebResearchProvider::SerpApi,
+                    keys,
+                )));
             }
         }
 
@@ -140,7 +199,10 @@ impl SearchService {
         if let Some(keys) = bocha_keys {
             if !keys.is_empty() {
                 info!("已配置 Bocha 搜索，共 {} 个 API Key", keys.len());
-                providers.push(Box::new(BochaSearchProvider::new(keys)));
+                providers.push(Box::new(GeneralWebSearchProvider::new(
+                    GeneralWebResearchProvider::Bocha,
+                    keys,
+                )));
             }
         }
 
@@ -148,7 +210,10 @@ impl SearchService {
         if let Some(keys) = tavily_keys {
             if !keys.is_empty() {
                 info!("已配置 Tavily 搜索，共 {} 个 API Key", keys.len());
-                providers.push(Box::new(TavilySearchProvider::new(keys)));
+                providers.push(Box::new(GeneralWebSearchProvider::new(
+                    GeneralWebResearchProvider::Tavily,
+                    keys,
+                )));
             }
         }
 
@@ -156,28 +221,38 @@ impl SearchService {
             warn!("未配置任何搜索引擎，新闻搜索功能将不可用");
         }
 
-        info!("已启用 华尔街见闻 直连（免费，全球财经快讯）");
-        info!("已启用 科创板日报 直连（免费，快讯池错峰抓取）");
-        info!("已启用 格隆汇快讯（免费，页面内嵌实时流）");
-        info!("已启用 政府监管公告（发改委 RSS）");
-        info!("已启用 金十数据 直连（免费，快讯 + 财经日历）");
-        info!("已启用 新浪财经 直连（免费，国际/国内/A股/港股 4 lid 并发）");
-        info!("已启用 微博热搜 直连（免费，正交源：全民/科技/政策突发热点）");
-        info!("已启用 东财全市场公告流（免费，A 股 5000+ 公司公告）");
-        info!("已启用 东财行业新闻流（免费，10 个 BOM 行业关键词并发）");
         let cfg = get_monitor_config();
         Self {
             providers,
-            wscn: WallStreetCnProvider::new(),
-            cls: ClsProvider::new(),
-            kcb: KcbDailyProvider::new(),
-            jin10: Jin10Provider::new(),
-            sina_flash: SinaFlashProvider::new(),
-            weibo_hot: WeiboHotProvider::new(),
-            gelonghui: GelonghuiProvider::new(),
-            gov_policy: GovPolicyProvider::new(),
-            em_announcement: EmAnnouncementProvider::new(),
-            em_industry_news: EmIndustryNewsProvider::new(),
+            recent_topic_signatures: Mutex::new(VecDeque::with_capacity(
+                cfg.topic_history_memory_size.max(50),
+            )),
+            source_health: Mutex::new(HashMap::new()),
+            source_health_ticks: Mutex::new(0),
+        }
+    }
+
+    /// Production factory. BR-175 keeps credential names and parsing inside
+    /// `GeneralWebResearchGateway`.
+    pub fn from_environment() -> Self {
+        let mut providers: Vec<Box<dyn SearchProvider>> = Vec::new();
+        for provider in [
+            GeneralWebResearchProvider::SerpApi,
+            GeneralWebResearchProvider::Bocha,
+            GeneralWebResearchProvider::Tavily,
+        ] {
+            let adapter = GeneralWebSearchProvider::from_environment(provider);
+            if adapter.is_available() {
+                info!("已配置 {} 通用网页研究 Gateway", adapter.name());
+                providers.push(Box::new(adapter));
+            }
+        }
+        if providers.is_empty() {
+            warn!("未配置任何通用网页研究 Gateway");
+        }
+        let cfg = get_monitor_config();
+        Self {
+            providers,
             recent_topic_signatures: Mutex::new(VecDeque::with_capacity(
                 cfg.topic_history_memory_size.max(50),
             )),
@@ -193,7 +268,6 @@ impl SearchService {
             stat.items += items as u64;
             match outcome {
                 SourceFetchOutcome::Success => stat.success += 1,
-                SourceFetchOutcome::Timeout => stat.timeout += 1,
                 SourceFetchOutcome::Error => stat.error += 1,
                 SourceFetchOutcome::Empty => stat.empty += 1,
             }
@@ -223,12 +297,11 @@ impl SearchService {
                 }
                 let success_rate = stat.success as f64 * 100.0 / stat.attempts as f64;
                 lines.push(format!(
-                    "{}: 成功 {}/{} ({:.1}%), 超时 {}, 错误 {}, 空结果 {}, 累计条数 {}",
+                    "{}: 成功 {}/{} ({:.1}%), 错误 {}, 空结果 {}, 累计条数 {}",
                     source,
                     stat.success,
                     stat.attempts,
                     success_rate,
-                    stat.timeout,
                     stat.error,
                     stat.empty,
                     stat.items
@@ -241,342 +314,135 @@ impl SearchService {
         }
     }
 
-    /// 获取金十财经日历（未来 `days_ahead` 天，重要性 >= `min_star`）
-    pub async fn fetch_financial_calendar(
+    /// Fetch four independently audited global-news batches without reducing
+    /// records to unattributed title strings.
+    ///
+    /// Independent source failures remain in `source_statuses`. The aggregate
+    /// is unavailable only when every source failed; a verified empty response
+    /// remains distinguishable from unavailability.
+    pub async fn fetch_flash_facts(
         &self,
-        days_ahead: u32,
-        min_star: u8,
-    ) -> Vec<Jin10CalendarEvent> {
-        match self.jin10.fetch_calendar(days_ahead, min_star).await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("[金十日历] 抓取失败: {}", e);
-                Vec::new()
-            }
+        per_source_limit: usize,
+    ) -> Result<FlashFactBatch, FlashFactsUnavailable> {
+        if !(1..=20).contains(&per_source_limit) {
+            return Err(FlashFactsUnavailable {
+                reason_code: "invalid_limit",
+                retryable: false,
+                source_statuses: Vec::new(),
+            });
         }
-    }
-
-    /// 抓取东财全市场今日公告（盘后/盘前定时调度使用）
-    ///
-    /// 注意：这是「公告流」而非「快讯」，建议在盘前/盘后触发，不要高频拉取。
-    /// 内部已用 15s 超时；失败不重试，记 source_health("em_ann")。
-    ///
-    /// - `limit`: 单次最多 100 条（API 单页上限）
-    /// - 返回: 标题已带 `[公司名] (分类) 标题` 前缀
-    pub async fn fetch_announcements_today(&self, limit: usize) -> Vec<SearchResult> {
-        let source_timeout = Duration::from_secs(15);
-        match tokio::time::timeout(source_timeout, self.em_announcement.fetch_today(limit)).await {
-            Ok(Ok(lst)) => {
-                info!("[ann][em] 今日公告 {} 条", lst.len());
-                if lst.is_empty() {
-                    self.record_source_health("em_ann", SourceFetchOutcome::Empty, 0);
-                } else {
-                    self.record_source_health("em_ann", SourceFetchOutcome::Success, lst.len());
-                }
-                lst
-            }
-            Ok(Err(e)) => {
-                self.record_source_health("em_ann", SourceFetchOutcome::Error, 0);
-                warn!("[ann][em] 抓取失败: {}", e);
-                Vec::new()
-            }
-            Err(_) => {
-                self.record_source_health("em_ann", SourceFetchOutcome::Timeout, 0);
-                warn!("[ann][em] 超时（>15s）");
-                Vec::new()
-            }
-        }
-    }
-
-    /// 抓取某只股票最近公告（用于个股研究）
-    pub async fn fetch_announcements_by_stock(
-        &self,
-        stock_code: &str,
-        limit: usize,
-    ) -> Vec<SearchResult> {
-        match self.em_announcement.fetch_by_stock(stock_code, limit).await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("[ann][em] 个股 {stock_code} 抓取失败: {}", e);
-                Vec::new()
-            }
-        }
-    }
-
-    /// 抓取指定行业的最新新闻（按关键词，6h 内）
-    ///
-    /// 直接对接 BOM 链路：chain_mapper 拿到 event.chains 后，
-    /// 用行业名（如 "半导体"/"光伏"）查 em_industry_news，
-    /// 拿到该行业最近 6h 的全网新闻标题。
-    ///
-    /// - `industry`: BOM 行业名（必须是 INDUSTRY_KEYWORDS 里的）
-    /// - `limit`: 最大返回条数
-    pub async fn fetch_industry_news(&self, industry: &str, limit: usize) -> Vec<SearchResult> {
-        let source_timeout = Duration::from_secs(15);
-        match tokio::time::timeout(
-            source_timeout,
-            self.em_industry_news.fetch_by_keyword(industry, limit),
-        )
-        .await
-        {
-            Ok(Ok(lst)) => {
-                info!("[ind][em] {industry} 命中 {} 条", lst.len());
-                if lst.is_empty() {
-                    self.record_source_health("em_ind", SourceFetchOutcome::Empty, 0);
-                } else {
-                    self.record_source_health("em_ind", SourceFetchOutcome::Success, lst.len());
-                }
-                lst
-            }
-            Ok(Err(e)) => {
-                self.record_source_health("em_ind", SourceFetchOutcome::Error, 0);
-                warn!("[ind][em] {industry} 抓取失败: {}", e);
-                Vec::new()
-            }
-            Err(_) => {
-                self.record_source_health("em_ind", SourceFetchOutcome::Timeout, 0);
-                warn!("[ind][em] {industry} 超时");
-                Vec::new()
-            }
-        }
-    }
-
-    /// 一次性拉取所有 BOM 行业关键词的新闻（盘后/盘前调度用）
-    pub async fn fetch_all_industry_news(&self, per_keyword_limit: usize) -> Vec<SearchResult> {
-        let started = std::time::Instant::now();
-        let items = self
-            .em_industry_news
-            .fetch_all_industries(per_keyword_limit)
-            .await;
-        let elapsed = started.elapsed().as_secs();
-        info!(
-            "[ind][em] 10 行业全量扫描完成 {} 条（{}s）",
-            items.len(),
-            elapsed
+        let per_source_limit =
+            u32::try_from(per_source_limit).expect("validated global-news limit <= 20");
+        let gateway = GlobalNewsGateway::new();
+        let (eastmoney, cailianpress, jin10, thepaper) = tokio::join!(
+            gateway.global_news(GlobalNewsProvider::Eastmoney, per_source_limit),
+            gateway.global_news(GlobalNewsProvider::Cailianpress, per_source_limit),
+            gateway.global_news(GlobalNewsProvider::Jin10, per_source_limit),
+            gateway.global_news(GlobalNewsProvider::ThePaper, per_source_limit),
         );
-        items
-    }
-
-    /// 获取原始快讯标题列表（供 NewsMonitor 路径A 使用）
-    pub async fn fetch_flash_titles(&self, limit: usize) -> Vec<String> {
-        let source_timeout =
-            Duration::from_secs(get_monitor_config().topic_search_timeout_sec.max(3));
-        // BR-037: kcb 与 cls 同源，kcb 只走快讯池并错峰抓取，避免同源并发拥塞。
-        let kcb_timeout = source_timeout + Duration::from_secs(2);
-        let (jin10_res, wscn_res, cls_res, kcb_res, sina_res, weibo_res, gel_res, gov_res) = tokio::join!(
-            tokio::time::timeout(source_timeout, self.jin10.fetch_flash_news(limit, true)),
-            tokio::time::timeout(source_timeout, self.wscn.fetch_live_news(limit)),
-            tokio::time::timeout(source_timeout, self.cls.fetch_live_news(limit)),
-            tokio::time::timeout(kcb_timeout, async {
-                tokio::time::sleep(Duration::from_millis(1000)).await;
-                self.kcb.fetch_latest(limit).await
-            }),
-            tokio::time::timeout(source_timeout, async {
-                self.sina_flash.fetch_flash_news(limit).await
-            }),
-            tokio::time::timeout(source_timeout, self.weibo_hot.fetch_hot_search(limit)),
-            tokio::time::timeout(source_timeout, self.gelonghui.fetch_live(limit)),
-            tokio::time::timeout(source_timeout, self.gov_policy.fetch_latest(limit)),
-        );
-
-        let mut titles = Vec::new();
-
-        match jin10_res {
-            Ok(Ok(lst)) => {
-                info!("[flash][jin10] 成功 {} 条", lst.len());
-                if lst.is_empty() {
-                    self.record_source_health("jin10", SourceFetchOutcome::Empty, 0);
-                } else {
-                    self.record_source_health("jin10", SourceFetchOutcome::Success, lst.len());
+        let now = chrono::Utc::now();
+        let outcomes = [
+            (GlobalNewsProvider::Eastmoney, eastmoney),
+            (GlobalNewsProvider::Cailianpress, cailianpress),
+            (GlobalNewsProvider::Jin10, jin10),
+            (GlobalNewsProvider::ThePaper, thepaper),
+        ];
+        let mut facts = Vec::new();
+        let mut source_statuses = Vec::with_capacity(outcomes.len());
+        let mut complete_sources = 0usize;
+        for (provider, outcome) in outcomes {
+            let projected = match project_gateway_flash_outcome(provider, outcome, now) {
+                Ok(projected) => projected,
+                Err(message) => ProjectedFlashOutcome {
+                    facts: Vec::new(),
+                    status: FlashSourceStatus::Unavailable {
+                        provider: provider.provider_id(),
+                        source: provider.source().to_string(),
+                        reason_code: "invalid_projection_evidence".to_string(),
+                        retryable: false,
+                        message,
+                    },
+                },
+            };
+            match &projected.status {
+                FlashSourceStatus::Available {
+                    evidence,
+                    admitted_records,
+                    stale_records,
+                    macro_records,
+                } => {
+                    complete_sources += 1;
+                    self.record_source_health(
+                        provider.feed_name(),
+                        SourceFetchOutcome::Success,
+                        *admitted_records,
+                    );
+                    info!(
+                        "[flash][gateway][BR-164] provider={} source={} batch_id={} \
+                         admitted={} stale_excluded={} macro_excluded={}",
+                        provider.feed_name(),
+                        evidence.source,
+                        evidence.batch_id,
+                        admitted_records,
+                        stale_records,
+                        macro_records
+                    );
                 }
-                for r in lst {
-                    titles.push(r.title);
+                FlashSourceStatus::VerifiedEmpty(evidence) => {
+                    complete_sources += 1;
+                    self.record_source_health(provider.feed_name(), SourceFetchOutcome::Empty, 0);
+                    info!(
+                        "[flash][gateway][BR-164] provider={} verified_empty source={} batch_id={}",
+                        provider.feed_name(),
+                        evidence.source,
+                        evidence.batch_id
+                    );
+                }
+                FlashSourceStatus::Unavailable {
+                    reason_code,
+                    retryable,
+                    message,
+                    ..
+                } => {
+                    self.record_source_health(provider.feed_name(), SourceFetchOutcome::Error, 0);
+                    warn!(
+                        "[flash][gateway][BR-164] provider={} unavailable \
+                         reason_code={} retryable={}",
+                        provider.feed_name(),
+                        reason_code,
+                        retryable,
+                    );
+                    debug!(
+                        "[flash][gateway][BR-164] provider={} unavailable_detail={}",
+                        provider.feed_name(),
+                        message
+                    );
                 }
             }
-            Ok(Err(e)) => {
-                self.record_source_health("jin10", SourceFetchOutcome::Error, 0);
-                warn!("[flash][jin10] 失败: {}", e)
-            }
-            Err(_) => {
-                self.record_source_health("jin10", SourceFetchOutcome::Timeout, 0);
-                warn!("[flash][jin10] 超时（>{}s）", source_timeout.as_secs())
-            }
+            facts.extend(projected.facts);
+            source_statuses.push(projected.status);
         }
 
-        match wscn_res {
-            Ok(Ok(lst)) => {
-                info!("[flash][wscn] 成功 {} 条", lst.len());
-                if lst.is_empty() {
-                    self.record_source_health("wscn", SourceFetchOutcome::Empty, 0);
-                } else {
-                    self.record_source_health("wscn", SourceFetchOutcome::Success, lst.len());
-                }
-                for r in lst {
-                    titles.push(r.title);
-                }
-            }
-            Ok(Err(e)) => {
-                self.record_source_health("wscn", SourceFetchOutcome::Error, 0);
-                warn!("[flash][wscn] 失败: {}", e)
-            }
-            Err(_) => {
-                self.record_source_health("wscn", SourceFetchOutcome::Timeout, 0);
-                warn!("[flash][wscn] 超时（>{}s）", source_timeout.as_secs())
-            }
+        self.maybe_log_source_health_summary("fetch_flash_facts");
+        if complete_sources == 0 {
+            return Err(FlashFactsUnavailable {
+                reason_code: "all_sources_unavailable",
+                retryable: source_statuses.iter().any(|status| {
+                    matches!(
+                        status,
+                        FlashSourceStatus::Unavailable {
+                            retryable: true,
+                            ..
+                        }
+                    )
+                }),
+                source_statuses,
+            });
         }
-
-        match cls_res {
-            Ok(Ok(lst)) => {
-                info!("[flash][cls] 成功 {} 条", lst.len());
-                if lst.is_empty() {
-                    self.record_source_health("cls", SourceFetchOutcome::Empty, 0);
-                } else {
-                    self.record_source_health("cls", SourceFetchOutcome::Success, lst.len());
-                }
-                for r in lst {
-                    titles.push(r.title);
-                }
-            }
-            Ok(Err(e)) => {
-                self.record_source_health("cls", SourceFetchOutcome::Error, 0);
-                warn!("[flash][cls] 失败: {}", e)
-            }
-            Err(_) => {
-                self.record_source_health("cls", SourceFetchOutcome::Timeout, 0);
-                warn!("[flash][cls] 超时（>{}s）", source_timeout.as_secs())
-            }
-        }
-
-        match kcb_res {
-            Ok(Ok(lst)) => {
-                info!("[flash][kcb] 成功 {} 条", lst.len());
-                if lst.is_empty() {
-                    self.record_source_health("kcb", SourceFetchOutcome::Empty, 0);
-                } else {
-                    self.record_source_health("kcb", SourceFetchOutcome::Success, lst.len());
-                }
-                for r in lst {
-                    titles.push(r.title);
-                }
-            }
-            Ok(Err(e)) => {
-                self.record_source_health("kcb", SourceFetchOutcome::Error, 0);
-                warn!("[flash][kcb] 失败: {}", e)
-            }
-            Err(_) => {
-                self.record_source_health("kcb", SourceFetchOutcome::Timeout, 0);
-                warn!("[flash][kcb] 超时（>{}s）", source_timeout.as_secs())
-            }
-        }
-
-        match sina_res {
-            Ok(lst) => {
-                info!("[flash][sina] 成功 {} 条", lst.len());
-                if lst.is_empty() {
-                    self.record_source_health("sina", SourceFetchOutcome::Empty, 0);
-                } else {
-                    self.record_source_health("sina", SourceFetchOutcome::Success, lst.len());
-                }
-                for r in lst {
-                    titles.push(r.title);
-                }
-            }
-            Err(e) => {
-                self.record_source_health("sina", SourceFetchOutcome::Error, 0);
-                warn!("[flash][sina] 失败: {}", e)
-            }
-        }
-
-        match weibo_res {
-            Ok(Ok(lst)) => {
-                info!("[flash][weibo] 成功 {} 条", lst.len());
-                if lst.is_empty() {
-                    self.record_source_health("weibo", SourceFetchOutcome::Empty, 0);
-                } else {
-                    self.record_source_health("weibo", SourceFetchOutcome::Success, lst.len());
-                }
-                for r in lst {
-                    titles.push(r.title);
-                }
-            }
-            Ok(Err(e)) => {
-                self.record_source_health("weibo", SourceFetchOutcome::Error, 0);
-                warn!("[flash][weibo] 失败: {}", e)
-            }
-            Err(_) => {
-                self.record_source_health("weibo", SourceFetchOutcome::Timeout, 0);
-                warn!("[flash][weibo] 超时（>{}s）", source_timeout.as_secs())
-            }
-        }
-
-        match gel_res {
-            Ok(Ok(lst)) => {
-                info!("[flash][gel] 成功 {} 条", lst.len());
-                if lst.is_empty() {
-                    self.record_source_health("gel", SourceFetchOutcome::Empty, 0);
-                } else {
-                    self.record_source_health("gel", SourceFetchOutcome::Success, lst.len());
-                }
-                for r in lst {
-                    titles.push(r.title);
-                }
-            }
-            Ok(Err(e)) => {
-                self.record_source_health("gel", SourceFetchOutcome::Error, 0);
-                warn!("[flash][gel] 失败: {}", e)
-            }
-            Err(_) => {
-                self.record_source_health("gel", SourceFetchOutcome::Timeout, 0);
-                warn!("[flash][gel] 超时（>{}s）", source_timeout.as_secs())
-            }
-        }
-
-        match gov_res {
-            Ok(Ok(lst)) => {
-                info!("[flash][gov] 成功 {} 条", lst.len());
-                if lst.is_empty() {
-                    self.record_source_health("gov", SourceFetchOutcome::Empty, 0);
-                } else {
-                    self.record_source_health("gov", SourceFetchOutcome::Success, lst.len());
-                }
-                for r in lst {
-                    titles.push(r.title);
-                }
-            }
-            Ok(Err(e)) => {
-                self.record_source_health("gov", SourceFetchOutcome::Error, 0);
-                warn!("[flash][gov] 失败: {}", e)
-            }
-            Err(_) => {
-                self.record_source_health("gov", SourceFetchOutcome::Timeout, 0);
-                warn!("[flash][gov] 超时（>{}s）", source_timeout.as_secs())
-            }
-        }
-
-        let mut seen = HashSet::new();
-        let mut deduped = Vec::new();
-        for title in titles {
-            let sig = Self::normalize_text(&title);
-            if sig.is_empty() || !seen.insert(sig) {
-                continue;
-            }
-            deduped.push(title);
-            if deduped.len() >= limit {
-                break;
-            }
-        }
-
-        // 修复 v9.2 BR-003: 宏观新闻 (美联储/美股/汇率/大宗) 入 macro 通道, 不入 chain_mapper
-        // 这里只标记 + 过滤, 实际 macro 通道分流在 run_opportunity_scan 路径
-        // 抽到 filter_macro_titles 纯函数, 便于测试 (M3 修复)
-        let (deduped, macro_count) = filter_macro_titles(deduped);
-        if macro_count > 0 {
-            log::info!("[flash] BR-003 过滤 {} 条宏观新闻", macro_count);
-        }
-
-        self.maybe_log_source_health_summary("fetch_flash_titles");
-
-        deduped
+        Ok(FlashFactBatch {
+            facts,
+            source_statuses,
+        })
     }
 
     /// 检查是否有可用的搜索引擎
@@ -1222,6 +1088,7 @@ impl SearchService {
             provider: success_provider,
             error_message: None,
             search_time: total_search_time,
+            failure: None,
         }
     }
 
@@ -1413,13 +1280,22 @@ impl SearchService {
         intel_results: &HashMap<String, SearchResponse>,
         stock_name: &str,
     ) -> String {
-        let mut lines = vec![format!("【{} 情报搜索结果】", stock_name)];
+        let mut lines = vec![format!(
+            "【{} 通用网页研究发现】\nResearchOnly：未经 Magic 金融数据 Gateway 证实，不得作为金融事实或交易/选股依据。",
+            stock_name
+        )];
 
         // 最新消息
         if let Some(resp) = intel_results.get("latest_news") {
             lines.push(format!("\n📰 最新消息 (来源: {}):", resp.provider));
             if resp.success && !resp.results.is_empty() {
-                for (i, r) in resp.results.iter().take(3).enumerate() {
+                for (i, r) in resp
+                    .results
+                    .iter()
+                    .filter(|result| result.evidence.is_research_only())
+                    .take(3)
+                    .enumerate()
+                {
                     let date_str = r
                         .published_date
                         .as_ref()
@@ -1440,7 +1316,13 @@ impl SearchService {
         if let Some(resp) = intel_results.get("risk_check") {
             lines.push(format!("\n⚠️ 风险排查 (来源: {}):", resp.provider));
             if resp.success && !resp.results.is_empty() {
-                for (i, r) in resp.results.iter().take(3).enumerate() {
+                for (i, r) in resp
+                    .results
+                    .iter()
+                    .filter(|result| result.evidence.is_research_only())
+                    .take(3)
+                    .enumerate()
+                {
                     lines.push(format!("  {}. {}", i + 1, r.title));
                     lines.push(format!(
                         "     {}...",
@@ -1456,7 +1338,13 @@ impl SearchService {
         if let Some(resp) = intel_results.get("earnings") {
             lines.push(format!("\n📊 业绩预期 (来源: {}):", resp.provider));
             if resp.success && !resp.results.is_empty() {
-                for (i, r) in resp.results.iter().take(3).enumerate() {
+                for (i, r) in resp
+                    .results
+                    .iter()
+                    .filter(|result| result.evidence.is_research_only())
+                    .take(3)
+                    .enumerate()
+                {
                     lines.push(format!("  {}. {}", i + 1, r.title));
                     lines.push(format!(
                         "     {}...",
@@ -1483,147 +1371,25 @@ impl SearchService {
 
         let mut sections: Vec<String> = Vec::new();
 
-        // ── 第一步：免费直连源（华尔街见闻 + 金十数据）并发拉取 ──
-        let (live_res, article_res, cls_res, jin10_flash_res, jin10_imp_res, calendar_res) = tokio::join!(
-            self.wscn.fetch_live_news(30),
-            self.wscn.fetch_articles(10),
-            self.cls.fetch_live_news(30),
-            self.jin10.fetch_flash_news(20, false),
-            self.jin10.fetch_flash_news(10, true),
-            self.jin10.fetch_calendar(1, 2), // 今天+明天，重要性≥2
+        // ── 第一步：统一 Gateway 的独立真实批次 ──
+        let news_gateway = GlobalNewsGateway::new();
+        let economic_gateway = EconomicCalendarGateway::new();
+        let (eastmoney, cls, jin10, thepaper, releases) = tokio::join!(
+            news_gateway.global_news(GlobalNewsProvider::Eastmoney, 20),
+            news_gateway.global_news(GlobalNewsProvider::Cailianpress, 20),
+            news_gateway.global_news(GlobalNewsProvider::Jin10, 20),
+            news_gateway.global_news(GlobalNewsProvider::ThePaper, 20),
+            economic_gateway.latest_releases(20, None),
         );
-        let mut wscn_items: Vec<String> = Vec::new();
-        if let Ok(lives) = live_res {
-            for r in lives.iter().take(5) {
-                let t = r.published_date.as_deref().unwrap_or("");
-                let snippet: String = r.snippet.chars().take(120).collect();
-                wscn_items.push(format!("- **{}** {}  \n  {}", r.title, t, snippet));
-            }
-        }
-        if let Ok(articles) = article_res {
-            for r in articles.iter().take(3) {
-                let t = r.published_date.as_deref().unwrap_or("");
-                let snippet: String = r.snippet.chars().take(120).collect();
-                wscn_items.push(format!("- **{}** {}  \n  {}", r.title, t, snippet));
-            }
-        }
-        if !wscn_items.is_empty() {
-            sections.push(format!(
-                "### 🌐 华尔街见闻快讯（今日实时）\n{}",
-                wscn_items.join("\n")
-            ));
-            info!("[宏观新闻][wscn] 华尔街见闻获取 {} 条", wscn_items.len());
-        } else {
-            warn!("[宏观新闻][wscn] 华尔街见闻返回为空或超时");
-        }
-
-        let mut cls_items: Vec<String> = Vec::new();
-        if let Ok(lst) = cls_res {
-            for r in lst.iter().take(8) {
-                let t = r.published_date.as_deref().unwrap_or("");
-                let snippet: String = r.snippet.chars().take(120).collect();
-                cls_items.push(format!("- **{}** {}  \n  {}", r.title, t, snippet));
-            }
-        }
-        if !cls_items.is_empty() {
-            sections.push(format!(
-                "### 🧭 财联社电报（今日实时）\n{}",
-                cls_items.join("\n")
-            ));
-            info!("[宏观新闻][cls] 财联社获取 {} 条", cls_items.len());
-        } else {
-            warn!("[宏观新闻][cls] 财联社返回为空或超时");
-        }
-
-        // ── 金十快讯（标星重要优先，普通快讯补充）──
-        let mut jin10_imp_items: Vec<String> = Vec::new();
-        if let Ok(lst) = jin10_imp_res {
-            for r in lst.iter().take(5) {
-                let t = r.published_date.as_deref().unwrap_or("");
-                let snippet: String = r.snippet.chars().take(160).collect();
-                jin10_imp_items.push(format!("- **{}** {}  \n  {}", r.title, t, snippet));
-            }
-        }
-        if !jin10_imp_items.is_empty() {
-            sections.push(format!(
-                "### ⭐ 金十重磅快讯（近6小时标星）\n{}",
-                jin10_imp_items.join("\n")
-            ));
-            info!("[宏观新闻][jin10] 金十标星 {} 条", jin10_imp_items.len());
-        }
-
-        let mut jin10_flash_items: Vec<String> = Vec::new();
-        if let Ok(lst) = jin10_flash_res {
-            // 去重：不再包含已在 important 列表里的
-            let imp_titles: std::collections::HashSet<String> = jin10_imp_items
-                .iter()
-                .map(|s| s.chars().take(40).collect())
-                .collect();
-            for r in lst.iter() {
-                let key: String = format!("- **{}**", r.title).chars().take(40).collect();
-                if imp_titles.contains(&key) {
-                    continue;
-                }
-                let t = r.published_date.as_deref().unwrap_or("");
-                let snippet: String = r.snippet.chars().take(140).collect();
-                jin10_flash_items.push(format!("- **{}** {}  \n  {}", r.title, t, snippet));
-                if jin10_flash_items.len() >= 6 {
-                    break;
-                }
-            }
-        }
-        if !jin10_flash_items.is_empty() {
-            sections.push(format!(
-                "### 📣 金十快讯（今日实时）\n{}",
-                jin10_flash_items.join("\n")
-            ));
-            info!(
-                "[宏观新闻][jin10] 金十快讯补充 {} 条",
-                jin10_flash_items.len()
-            );
-        } else if jin10_imp_items.is_empty() {
-            warn!("[宏观新闻][jin10] 金十快讯为空或超时");
-        }
-
-        // ── 金十财经日历（今天 + 明天的重要经济数据 / 事件）──
-        match calendar_res {
-            Ok(events) if !events.is_empty() => {
-                let mut cal_lines: Vec<String> = Vec::new();
-                for ev in events.iter().take(15) {
-                    let stars = "★".repeat(ev.star.min(3) as usize);
-                    let mut extra: Vec<String> = Vec::new();
-                    if let Some(p) = &ev.previous {
-                        extra.push(format!("前值 {}", p));
-                    }
-                    if let Some(f) = &ev.forecast {
-                        extra.push(format!("预期 {}", f));
-                    }
-                    if let Some(a) = &ev.actual {
-                        extra.push(format!("公布 {}", a));
-                    }
-                    let tail = if extra.is_empty() {
-                        String::new()
-                    } else {
-                        format!("  \n  {}", extra.join(" | "))
-                    };
-                    cal_lines.push(format!(
-                        "- `{} {}` {} **[{}]** {}{}",
-                        ev.date, ev.time, stars, ev.country, ev.name, tail
-                    ));
-                }
-                sections.push(format!(
-                    "### 📅 财经日历（金十，未来48h重要事件）\n{}",
-                    cal_lines.join("\n")
-                ));
-                info!("[宏观新闻][jin10] 财经日历 {} 条", events.len());
-            }
-            Ok(_) => {
-                info!("[宏观新闻][jin10] 财经日历窗口内无重要事件");
-            }
-            Err(e) => {
-                warn!("[宏观新闻][jin10] 财经日历抓取失败: {}", e);
-            }
-        }
+        sections.extend(render_gateway_sections(
+            [
+                (GlobalNewsProvider::Eastmoney, eastmoney),
+                (GlobalNewsProvider::Cailianpress, cls),
+                (GlobalNewsProvider::Jin10, jin10),
+                (GlobalNewsProvider::ThePaper, thepaper),
+            ],
+            releases,
+        ));
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -1668,22 +1434,30 @@ impl SearchService {
         for (dim, query, header) in &search_dims {
             let mut found = false;
             for provider in &self.providers {
-                if !provider.is_available() {
+                if !provider.supports_general_web_search() || !provider.is_available() {
                     continue;
                 }
                 let resp = provider.search(query, max_results.min(3)).await;
-                if resp.success && !resp.results.is_empty() {
-                    let lines: Vec<String> = resp
-                        .results
+                let lines: Vec<String> = if resp.success {
+                    resp.results
                         .iter()
+                        .filter(|result| result.evidence.is_research_only())
                         .take(3)
                         .map(|r| {
                             let date_tag = r.published_date.as_deref().unwrap_or("");
                             let snippet_short: String = r.snippet.chars().take(150).collect();
                             format!("- **{}** {}  \n  {}", r.title, date_tag, snippet_short)
                         })
-                        .collect();
-                    sections.push(format!("{}\n{}", header, lines.join("\n")));
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                if !lines.is_empty() {
+                    sections.push(format!(
+                        "### 🔎 通用网页研究发现（ResearchOnly；不得作为金融事实）\n{}\n{}",
+                        header,
+                        lines.join("\n")
+                    ));
                     info!(
                         "[宏观新闻][{}] {} 获取 {} 条",
                         dim,
@@ -1781,7 +1555,7 @@ pub fn filter_macro_titles(titles: Vec<String>) -> (Vec<String>, usize) {
     let filtered: Vec<String> = titles
         .into_iter()
         .filter(|t| {
-            if MACRO_KEYWORDS.iter().any(|kw| t.contains(kw)) {
+            if is_macro_title(t) {
                 macro_count += 1;
                 log::debug!(
                     "[flash] 宏观新闻 (BR-003): {}",
@@ -1796,6 +1570,10 @@ pub fn filter_macro_titles(titles: Vec<String>) -> (Vec<String>, usize) {
     (filtered, macro_count)
 }
 
+fn is_macro_title(title: &str) -> bool {
+    MACRO_KEYWORDS.iter().any(|keyword| title.contains(keyword))
+}
+
 // ============================================================================
 // 单例服务
 // ============================================================================
@@ -1806,31 +1584,7 @@ static SEARCH_SERVICE: OnceCell<SearchService> = OnceCell::new();
 
 /// 获取搜索服务单例
 pub fn get_search_service() -> &'static SearchService {
-    SEARCH_SERVICE.get_or_init(|| {
-        // 从环境变量读取配置
-        let bocha_keys = std::env::var("BOCHA_API_KEYS")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.split(',').map(|k| k.trim().to_string()).collect());
-
-        let tavily_keys = std::env::var("TAVILY_API_KEYS")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.split(',').map(|k| k.trim().to_string()).collect());
-
-        let serpapi_keys = std::env::var("SERPAPI_KEYS")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.split(',').map(|k| k.trim().to_string()).collect());
-
-        // 东方财富默认启用（免费无限制）
-        let enable_eastmoney = std::env::var("ENABLE_EASTMONEY_NEWS")
-            .unwrap_or_else(|_| "true".to_string())
-            .to_lowercase()
-            != "false";
-
-        SearchService::new(bocha_keys, tavily_keys, serpapi_keys, enable_eastmoney)
-    })
+    SEARCH_SERVICE.get_or_init(SearchService::from_environment)
 }
 
 #[cfg(test)]
@@ -1887,14 +1641,147 @@ mod tests {
                 success: true,
                 error_message: None,
                 search_time: 0.01,
+                failure: None,
             }
         }
     }
 
     fn fixture_service() -> SearchService {
-        let mut service = SearchService::new(None, None, None, false);
+        let mut service = SearchService::new(None, None, None);
         service.providers = vec![Box::new(FixtureProvider::available())];
         service
+    }
+
+    fn flash_gateway_fixture(
+        published_at_raw: &str,
+        batch_id: &str,
+    ) -> (
+        GlobalNewsProvider,
+        GlobalNewsRecord,
+        crate::data_gateway::BatchEvidence,
+    ) {
+        use chrono::{DateTime, Utc};
+        use magic_market_core::{ProviderId, SourceEvidence};
+
+        let provider = GlobalNewsProvider::Jin10;
+        let published_at = DateTime::parse_from_rfc3339(published_at_raw)
+            .expect("TEST_CODE publication")
+            .with_timezone(&Utc);
+        let observed_at = DateTime::parse_from_rfc3339("2026-07-27T09:30:01+08:00")
+            .expect("TEST_CODE observation")
+            .with_timezone(&Utc);
+        let observed_raw = format!(
+            "{}.{:09}",
+            observed_at.timestamp(),
+            observed_at.timestamp_subsec_nanos()
+        );
+        let batch_evidence = crate::data_gateway::BatchEvidence {
+            provider: ProviderId::Jin10,
+            source: provider.source().to_string(),
+            source_at: Some(published_at_raw.to_string()),
+            observed_at: observed_raw.clone(),
+            batch_id: batch_id.to_string(),
+        };
+        let record = GlobalNewsRecord {
+            item_id: "TEST_CODE_FLASH_ITEM".to_string(),
+            title: "TEST_CODE 芯片设备订单增长".to_string(),
+            summary: None,
+            content: None,
+            publisher: "TEST_CODE_PROVIDER".to_string(),
+            canonical_url: "https://example.com/TEST_CODE_FLASH_ITEM".to_string(),
+            published_at,
+            observed_at,
+            instruments: Vec::new(),
+            topics: Vec::new(),
+            language: "zh-CN".to_string(),
+            evidence: SourceEvidence::new(ProviderId::Jin10, observed_raw, batch_id)
+                .and_then(|evidence| evidence.with_source_at(published_at_raw))
+                .expect("TEST_CODE record evidence"),
+        };
+        (provider, record, batch_evidence)
+    }
+
+    #[test]
+    fn admitted_flash_fact_keeps_exact_batch_evidence() {
+        use chrono::{DateTime, Utc};
+        let (provider, record, batch_evidence) =
+            flash_gateway_fixture("2026-07-27T09:30:00+08:00", "TEST_CODE_FLASH_BATCH");
+
+        let projected = project_gateway_flash_outcome(
+            provider,
+            Ok(GatewayBatch::Available {
+                records: vec![record],
+                evidence: batch_evidence.clone(),
+            }),
+            DateTime::parse_from_rfc3339("2026-07-27T09:31:00+08:00")
+                .expect("TEST_CODE now")
+                .with_timezone(&Utc),
+        )
+        .expect("TEST_CODE admitted flash facts");
+
+        assert_eq!(projected.facts.len(), 1);
+        assert_eq!(projected.facts[0].batch_evidence, batch_evidence);
+        assert_eq!(projected.facts[0].record.item_id, "TEST_CODE_FLASH_ITEM");
+    }
+
+    #[test]
+    fn stale_flash_fact_is_explicitly_excluded() {
+        use chrono::{DateTime, Utc};
+
+        let (provider, record, batch_evidence) =
+            flash_gateway_fixture("2026-07-26T23:59:00+08:00", "TEST_CODE_STALE_BATCH");
+        let projected = project_gateway_flash_outcome(
+            provider,
+            Ok(GatewayBatch::Available {
+                records: vec![record],
+                evidence: batch_evidence,
+            }),
+            DateTime::parse_from_rfc3339("2026-07-27T09:31:00+08:00")
+                .expect("TEST_CODE now")
+                .with_timezone(&Utc),
+        )
+        .expect("TEST_CODE stale exclusion");
+
+        assert!(projected.facts.is_empty());
+        assert!(matches!(
+            projected.status,
+            FlashSourceStatus::Available {
+                admitted_records: 0,
+                stale_records: 1,
+                macro_records: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn flash_fact_with_mismatched_record_batch_is_rejected() {
+        use chrono::{DateTime, Utc};
+        use magic_market_core::{ProviderId, SourceEvidence};
+
+        let (provider, mut record, batch_evidence) =
+            flash_gateway_fixture("2026-07-27T09:30:00+08:00", "TEST_CODE_FLASH_BATCH");
+        record.evidence = SourceEvidence::new(
+            ProviderId::Jin10,
+            batch_evidence.observed_at.clone(),
+            "TEST_CODE_OTHER_BATCH",
+        )
+        .and_then(|evidence| evidence.with_source_at("2026-07-27T09:30:00+08:00"))
+        .expect("TEST_CODE mismatched record evidence");
+
+        let error = project_gateway_flash_outcome(
+            provider,
+            Ok(GatewayBatch::Available {
+                records: vec![record],
+                evidence: batch_evidence,
+            }),
+            DateTime::parse_from_rfc3339("2026-07-27T09:31:00+08:00")
+                .expect("TEST_CODE now")
+                .with_timezone(&Utc),
+        )
+        .expect_err("TEST_CODE mismatched record evidence must be rejected");
+
+        assert!(error.contains("evidence differs from batch"), "{error}");
     }
 
     #[tokio::test]
@@ -1950,12 +1837,25 @@ mod tests {
     }
 
     #[test]
+    fn registry_contains_only_general_web_search_adapters() {
+        let service = SearchService::new(
+            Some(vec!["TEST_CODE_bocha".to_owned()]),
+            Some(vec!["TEST_CODE_tavily".to_owned()]),
+            Some(vec!["TEST_CODE_serpapi".to_owned()]),
+        );
+        assert_eq!(service.providers.len(), 3);
+        assert!(service
+            .providers
+            .iter()
+            .all(|provider| provider.supports_general_web_search()));
+    }
+
+    #[test]
     fn topic_helpers_cover_query_similarity_rerank_and_health_states() {
         let service = fixture_service();
         assert!(service.is_available());
         for outcome in [
             SourceFetchOutcome::Success,
-            SourceFetchOutcome::Timeout,
             SourceFetchOutcome::Error,
             SourceFetchOutcome::Empty,
         ] {
@@ -2061,6 +1961,8 @@ mod tests {
             .await;
         assert_eq!(intel.len(), 3);
         let report = SearchService::format_intel_report(&intel, "测试科技");
+        assert!(report.contains("ResearchOnly"));
+        assert!(report.contains("不得作为金融事实"));
         assert!(report.contains("最新消息"));
         assert!(report.contains("风险排查"));
         assert!(report.contains("业绩预期"));
@@ -2080,7 +1982,7 @@ mod tests {
 
     #[tokio::test]
     async fn unavailable_provider_and_empty_reports_remain_explicit() {
-        let mut service = SearchService::new(None, None, None, false);
+        let mut service = SearchService::new(None, None, None);
         service.providers = vec![Box::new(FixtureProvider {
             available: false,
             topic: false,

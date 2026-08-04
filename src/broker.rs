@@ -3,9 +3,8 @@
 //! The previous module registered logging-only broker implementations and a
 //! `MockQuoteProvider` returning zero. That made an unavailable data source look
 //! healthy and encouraged callers to substitute cost/push prices. This module
-//! keeps one fail-closed, real provider seam.
+//! keeps one fail-closed, evidence-preserving Magic provider Gateway seam.
 
-use crate::data_provider::gtimg_provider::GtimgProvider;
 use std::sync::OnceLock;
 
 /// Broker-reported stock status stored by position modules.
@@ -52,7 +51,7 @@ pub struct ExecutionQuote {
 impl BrokerSource {
     pub fn label(self) -> &'static str {
         match self {
-            Self::PublicData => "腾讯财经实时行情",
+            Self::PublicData => "Magic统一实时行情（TDX主源）",
         }
     }
 }
@@ -62,48 +61,36 @@ pub trait QuoteProvider: Send + Sync {
     fn get_execution_quote(&self, code: &str) -> Result<ExecutionQuote, String>;
 }
 
-struct PublicQuoteProvider {
-    provider: GtimgProvider,
-}
-
-impl PublicQuoteProvider {
-    fn new() -> Result<Self, String> {
-        GtimgProvider::new()
-            .map(|provider| Self { provider })
-            .map_err(|error| format!("construct Tencent quote provider: {error}"))
-    }
-}
+struct PublicQuoteProvider;
 
 impl QuoteProvider for PublicQuoteProvider {
     fn get_execution_quote(&self, code: &str) -> Result<ExecutionQuote, String> {
-        let quote = self
-            .provider
-            .fetch_realtime_quote(code)
-            .map_err(|error| format!("Tencent realtime quote {code}: {error}"))?
-            .ok_or_else(|| format!("Tencent realtime quote {code}: empty response"))?;
+        let requested = vec![code.to_string()];
+        let batch = crate::data_gateway::MarketDataGateway::new()
+            .realtime_quotes(&requested)
+            .map_err(|error| format!("Magic realtime quote {code}: {error}"))?;
+        let quote = batch.records().first().ok_or_else(|| {
+            format!("Magic realtime quote {code}: verified-empty is invalid for execution")
+        })?;
         let price = validate_quote_price(code, quote.price)?;
-        let limit_down_price = validate_quote_price(
+        let previous_close = validate_quote_price(code, quote.previous_close)?;
+        let limit = crate::data_provider::limit_status::LimitStatusCalculator::new().calculate(
             code,
-            quote
-                .limit_down_price
-                .ok_or_else(|| format!("Tencent realtime quote {code}: missing limit-down"))?,
-        )?;
-        let limit_up_price = validate_quote_price(
-            code,
-            quote
-                .limit_up_price
-                .ok_or_else(|| format!("Tencent realtime quote {code}: missing limit-up"))?,
-        )?;
+            previous_close,
+            &quote.name,
+        );
+        let limit_down_price = validate_quote_price(code, limit.limit_down_price)?;
+        let limit_up_price = validate_quote_price(code, limit.limit_up_price)?;
         if limit_down_price > limit_up_price {
             return Err(format!(
-                "Tencent realtime quote {code}: invalid daily range {limit_down_price}..{limit_up_price}"
+                "Magic realtime quote {code}: invalid daily range {limit_down_price}..{limit_up_price}"
             ));
         }
         Ok(ExecutionQuote {
             price,
             limit_down_price,
             limit_up_price,
-            observed_at: quote.source_time,
+            observed_at: quote.source_at,
         })
     }
 }
@@ -175,14 +162,14 @@ pub fn execution_quote(code: &str) -> Result<ExecutionQuote, String> {
 /// Unsupported selections are rejected instead of silently downgrading to a
 /// no-op or a different source.
 pub fn detect_and_register() -> Result<BrokerSource, String> {
-    let choice = std::env::var("BROKER_SOURCE").unwrap_or_else(|_| "public".to_string());
+    let choice = std::env::var("BROKER_SOURCE").unwrap_or_else(|_| "magic_tdx".to_string());
     match choice.trim().to_ascii_lowercase().as_str() {
-        "" | "public" | "tencent" => {
-            register_quote_provider(Box::new(PublicQuoteProvider::new()?))?;
+        "" | "public" | "magic" | "magic_tdx" => {
+            register_quote_provider(Box::new(PublicQuoteProvider))?;
             Ok(BrokerSource::PublicData)
         }
         unsupported => Err(format!(
-            "BROKER_SOURCE={unsupported} is not implemented; supported values: public, tencent"
+            "BROKER_SOURCE={unsupported} is not implemented; supported values: public, magic, magic_tdx"
         )),
     }
 }
@@ -219,6 +206,7 @@ mod tests {
 
     #[test]
     fn source_label_names_the_real_provider() {
-        assert!(BrokerSource::PublicData.label().contains("腾讯"));
+        assert!(BrokerSource::PublicData.label().contains("Magic"));
+        assert!(BrokerSource::PublicData.label().contains("TDX"));
     }
 }

@@ -146,7 +146,9 @@ impl VetoRule for MainFlowRule {
         }
 
         // 条件 2: 价涨量增但资金大幅流出（诱多）
-        if last_day.pct_chg > self.lure_pct_threshold
+        if last_day
+            .pct_chg
+            .is_some_and(|pct_chg| pct_chg > self.lure_pct_threshold)
             && last_day.main_net < -self.lure_outflow_threshold
         {
             verdict.risk_flags.push(
@@ -270,7 +272,7 @@ pub fn build_chain(config: &VetoChainConfig) -> Option<VetoChain> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_provider::money_flow::MoneyFlowDay;
+    use crate::capital_flow::MoneyFlowDay;
 
     fn make_ctx(overrides: impl FnOnce(&mut VetoContext)) -> VetoContext {
         let mut ctx = VetoContext {
@@ -354,7 +356,7 @@ mod tests {
                 xl_net: -30_000_000.0,
                 big_net: -30_000_000.0,
                 main_pct: -10.0,
-                pct_chg: -2.0,
+                pct_chg: Some(-2.0),
             }]);
         });
         let v = rule.evaluate(&ctx);
@@ -371,7 +373,7 @@ mod tests {
                 xl_net: -10_000_000.0,
                 big_net: -5_000_000.0,
                 main_pct: -8.0,
-                pct_chg: 5.0, // +5% 大涨
+                pct_chg: Some(5.0), // +5% 大涨
             }]);
         });
         let v = rule.evaluate(&ctx);
@@ -389,7 +391,7 @@ mod tests {
                 xl_net: 0.0,
                 big_net: -5_000_000.0,
                 main_pct: -2.0,
-                pct_chg: 0.5,
+                pct_chg: Some(0.5),
             }]);
         });
         let v = rule.evaluate(&ctx);

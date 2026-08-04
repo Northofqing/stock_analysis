@@ -10,6 +10,7 @@ pub mod paper_engine; // v16.3 Commit 4a: 4 铁律接入 paper_trade 卖出
 pub mod paper_trade; // v12 PR3-3.5
 pub mod risk_adapter; // v16.3 Commit 1: pre-trade gate (4 项硬检查)
 
+use crate::data_gateway::PositionChainAssignment;
 use crate::database::DatabaseManager;
 use crate::errors::TradeError;
 use crate::models::{NewStockPosition, StockPosition};
@@ -48,7 +49,7 @@ pub struct OpenPositionCmd {
     pub price: f64,
     pub quantity: i32,
     pub secondary_confirmed: bool,
-    pub chain_name: String,
+    pub position_chain_assignment: PositionChainAssignment,
     pub decision_basis: String,
 }
 
@@ -217,13 +218,6 @@ impl TradeExecutionGateway for SimulatedExecutionGateway {
                 limit_up_price: Some(quote.limit_up_price),
                 secondary_confirmed: cmd.secondary_confirmed,
             })?;
-            if cmd.chain_name.trim().is_empty() || cmd.chain_name == "其他" {
-                return Err(format!(
-                    "BR-085 missing explicit chain classification for {}",
-                    cmd.code
-                ));
-            }
-
             let new_position = NewStockPosition {
                 code: cmd.code.clone(),
                 name: cmd.name.clone(),
@@ -233,8 +227,8 @@ impl TradeExecutionGateway for SimulatedExecutionGateway {
                 status: "open".to_string(),
                 // v14.1 F7: 默认 None, 由 name LIKE 推断 (--backfill-st-type) 或 broker 推送
                 st_type: None,
-                // BR-123: gateway 已要求明确 chain；仓储层仍保留 Option 缺失语义。
-                chain_name: Some(cmd.chain_name.clone()),
+                // BR-170: only the atomic assignment transaction may populate this projection.
+                chain_name: None,
             };
 
             let observed_at = quote.observed_at.to_rfc3339();
@@ -251,7 +245,11 @@ impl TradeExecutionGateway for SimulatedExecutionGateway {
                 outcome: "Filled",
                 failure_reason: None,
             };
-            match self.db().save_position_with_audit(&new_position, &audit) {
+            match self.db().save_position_with_audit_and_assignment(
+                &new_position,
+                &audit,
+                &cmd.position_chain_assignment,
+            ) {
                 Ok(()) => Ok(OrderReceipt {
                     business_order_id: cmd.business_order_id.clone(),
                     side: OrderSide::Buy,
@@ -403,12 +401,21 @@ mod tests {
         )
     }
 
-    fn unique_code(label: &str) -> String {
-        unique_id(label).replace("TEST_ORDER", "TEST_CODE")
+    fn unique_code(_label: &str) -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .subsec_nanos()
+            % 800_000;
+        let suffix = 100_000 + (seed + NEXT.fetch_add(1, Ordering::Relaxed)) % 800_000;
+        format!("TEST_CODE_{suffix:06}")
     }
 
     struct TestLedgerGuard {
         date: String,
+        _position_evidence: paper_trade::TestPositionEvidenceGuard,
     }
 
     impl Drop for TestLedgerGuard {
@@ -424,6 +431,21 @@ mod tests {
     fn prepare_fresh_account_state() -> TestLedgerGuard {
         init_test_db();
         crate::broker::ensure_test_quote_provider();
+        let source_at = chrono::Utc::now().with_timezone(&chrono::Local);
+        let position_evidence = paper_trade::install_test_position_batch_evidence(
+            paper_trade::TestPositionBatchEvidence {
+                source: "TEST_CODE_broker_position_fixture".to_string(),
+                source_at,
+                observed_at: chrono::Utc::now(),
+                batch_id: format!(
+                    "TEST_CODE_trading_gateway_{}",
+                    chrono::Utc::now()
+                        .timestamp_nanos_opt()
+                        .expect("test clock is representable in nanoseconds")
+                ),
+            },
+        )
+        .expect("install isolated TEST_CODE broker-position evidence");
         let today = chrono::Local::now().date_naive().to_string();
         let mut conn = DatabaseManager::get()
             .get_conn()
@@ -446,7 +468,10 @@ mod tests {
         )
         .execute(&mut conn)
         .expect("refresh isolated test-position evidence");
-        TestLedgerGuard { date: today }
+        TestLedgerGuard {
+            date: today,
+            _position_evidence: position_evidence,
+        }
     }
 
     fn audit_outcome(business_order_id: &str) -> String {
@@ -468,16 +493,39 @@ mod tests {
         .outcome
     }
 
-    fn cmd_buy(id: &str) -> OpenPositionCmd {
+    fn assignment(code: &str) -> PositionChainAssignment {
+        crate::data_gateway::derive_position_chain(
+            code,
+            crate::data_gateway::GatewayBatch::Available {
+                records: vec![crate::data_gateway::BoardMembershipRecord {
+                    instrument_code: code.to_string(),
+                    board_code: "TEST_CODE_INDUSTRY".to_string(),
+                    board_name: "测试产业链".to_string(),
+                    kind: crate::data_gateway::BoardKind::Industry,
+                }],
+                evidence: crate::data_gateway::BatchEvidence {
+                    provider: magic_market_core::ProviderId::Tdx,
+                    source: "TEST_CODE_tdx-board-memberships".to_string(),
+                    source_at: None,
+                    observed_at: "2026-07-27T09:30:01+08:00".to_string(),
+                    batch_id: format!("TEST_CODE_assignment_{code}"),
+                },
+            },
+        )
+        .expect("valid assignment batch")
+        .expect("position assignment")
+    }
+
+    fn cmd_buy(id: &str, code: &str) -> OpenPositionCmd {
         OpenPositionCmd {
             business_order_id: id.to_string(),
-            code: "TEST_CODE_000001".to_string(),
+            code: code.to_string(),
             name: "测试股".to_string(),
             trade_date: "2026-06-30".to_string(),
             price: 10.0,
             quantity: 100,
             secondary_confirmed: false,
-            chain_name: "测试产业链".to_string(),
+            position_chain_assignment: assignment(code),
             decision_basis: "测试决策".to_string(),
         }
     }
@@ -536,8 +584,7 @@ mod tests {
         let gateway = SimulatedExecutionGateway::new();
         let code = unique_code("ROUND_TRIP");
         let open_id = unique_id("OPEN_FILL");
-        let mut open = cmd_buy(&open_id);
-        open.code.clone_from(&code);
+        let open = cmd_buy(&open_id, &code);
 
         let opened = gateway.open_position(&open).expect("safe open fills");
         assert_eq!(opened.business_order_id, open_id);
@@ -548,6 +595,14 @@ mod tests {
         assert_eq!(opened.price, 10.0);
         assert!(opened.message.contains("filled"));
         assert_eq!(audit_outcome(&open_id), "Filled");
+        let linked = DatabaseManager::get()
+            .linked_position_chain(&code)
+            .expect("read position-chain link")
+            .expect("open fill links assignment");
+        assert_eq!(
+            linked.assignment_id,
+            open.position_chain_assignment.assignment_id
+        );
 
         let position = gateway
             .get_open_position(&code)
@@ -587,25 +642,25 @@ mod tests {
         let _ledger = prepare_fresh_account_state();
         let gateway = SimulatedExecutionGateway::new();
 
-        let missing_chain_id = unique_id("MISSING_CHAIN");
-        let mut missing_chain = cmd_buy(&missing_chain_id);
-        missing_chain.code = unique_code("MISSING_CHAIN");
-        missing_chain.chain_name = "其他".to_string();
-        let error = gateway.open_position(&missing_chain).unwrap_err();
-        assert!(error.contains("BR-085"));
-        assert_eq!(audit_outcome(&missing_chain_id), "Rejected");
+        let mismatched_chain_id = unique_id("MISMATCHED_CHAIN");
+        let mismatched_code = unique_code("MISMATCHED_CHAIN");
+        let mut mismatched_chain = cmd_buy(&mismatched_chain_id, &mismatched_code);
+        mismatched_chain.position_chain_assignment = assignment(&unique_code("OTHER_CHAIN"));
+        let error = gateway.open_position(&mismatched_chain).unwrap_err();
+        assert!(error.contains("BR-170"));
+        assert_eq!(audit_outcome(&mismatched_chain_id), "Rejected");
 
         let bad_quantity_id = unique_id("BAD_QUANTITY");
-        let mut bad_quantity = cmd_buy(&bad_quantity_id);
-        bad_quantity.code = unique_code("BAD_QUANTITY");
+        let bad_quantity_code = unique_code("BAD_QUANTITY");
+        let mut bad_quantity = cmd_buy(&bad_quantity_id, &bad_quantity_code);
         bad_quantity.quantity = 99;
         let error = gateway.open_position(&bad_quantity).unwrap_err();
         assert!(error.contains("divisible by 100"));
         assert_eq!(audit_outcome(&bad_quantity_id), "Rejected");
 
         let stale_request_id = unique_id("PRICE_DEVIATION");
-        let mut stale_request = cmd_buy(&stale_request_id);
-        stale_request.code = unique_code("PRICE_DEVIATION");
+        let stale_request_code = unique_code("PRICE_DEVIATION");
+        let mut stale_request = cmd_buy(&stale_request_id, &stale_request_code);
         stale_request.price = 10.3;
         let error = gateway.open_position(&stale_request).unwrap_err();
         assert!(error.contains("deviation"));
@@ -642,6 +697,6 @@ mod tests {
     // 保留对命令结构的最小引用, 防止 unused import 警告
     #[allow(dead_code)]
     fn _cmd_silence() -> OpenPositionCmd {
-        cmd_buy("X")
+        cmd_buy("X", "TEST_CODE_000001")
     }
 }

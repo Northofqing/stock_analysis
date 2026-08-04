@@ -262,4 +262,33 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code(), "intraday_volume_baseline_missing");
     }
+
+    #[test]
+    fn intraday_volume_rejects_invalid_observation_and_baseline_values() {
+        for cumulative_volume in [f64::NAN, -1.0] {
+            let error = compute_intraday_volume_pace(&IntradayVolumeEvidence {
+                cumulative_volume,
+                historical_same_slot_volumes: vec![100.0],
+            })
+            .expect_err("invalid current volume");
+            assert_eq!(error.code(), "intraday_volume_invalid");
+            assert!(!error.to_string().is_empty());
+        }
+
+        for historical_same_slot_volumes in [vec![-1.0, 100.0], vec![f64::NAN], vec![0.0, 0.0]] {
+            assert_eq!(
+                compute_intraday_volume_pace(&IntradayVolumeEvidence {
+                    cumulative_volume: 100.0,
+                    historical_same_slot_volumes,
+                })
+                .expect_err("invalid baseline")
+                .code(),
+                "intraday_volume_baseline_missing"
+            );
+        }
+
+        let error = FeatureError::new("TEST_CODE_feature", "feature failure");
+        assert_eq!(error.code(), "TEST_CODE_feature");
+        assert_eq!(error.to_string(), "feature failure");
+    }
 }

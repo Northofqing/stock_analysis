@@ -105,10 +105,6 @@ pub fn parse_args(args: &[&str]) -> Result<Option<EventCommand>, CliError> {
                 // Known monitor flags may be combined with terminal event commands.
                 // Ignore them here; if no event command is present we still return None.
             }
-            s if s.starts_with("--backfill-outcome=") => {
-                let date_str = &s["--backfill-outcome=".len()..];
-                parse_date(date_str)?;
-            }
             "--replay" => {
                 has_replay = true;
             }
@@ -384,7 +380,6 @@ mod tests {
 
         for flag in [
             "--push-dry-run",
-            "--backfill-outcome=2026-07-21",
             "--backfill-st-type",
             "--backfill-chain-name",
         ] {
@@ -394,10 +389,14 @@ mod tests {
     }
 
     #[test]
-    fn cli_rejects_empty_or_malformed_backfill_outcome_dates() {
-        for flag in ["--backfill-outcome=", "--backfill-outcome=not-a-date"] {
-            let error = parse_args(&["monitor", flag]).expect_err("invalid date must fail");
-            assert!(error.to_string().contains("malformed date"), "{error}");
+    fn cli_rejects_removed_legacy_outcome_backfill_flag() {
+        for flag in [
+            "--backfill-outcome=",
+            "--backfill-outcome=not-a-date",
+            "--backfill-outcome=2026-07-21",
+        ] {
+            let error = parse_args(&["monitor", flag]).expect_err("legacy flag must fail");
+            assert!(error.to_string().contains("unrecognized flag"), "{error}");
         }
     }
 

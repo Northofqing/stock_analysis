@@ -22,8 +22,8 @@ use std::env;
 use std::path::PathBuf;
 use stock_analysis::database::DatabaseManager;
 
-/// BR-006 默认黑名单 + 主题 priority + generic 标记: 从 config/chain.toml 动态读取.
-/// v14.3: 文件名修正 (原 chain_rules.toml 已合并入 chain.toml).
+/// BR-006 默认黑名单 + 主题 priority + generic 标记：从编译时固定的
+/// config/chain.toml 读取；该只读模拟器不参与 monitor runtime 配置激活。
 fn load_br006_default_blacklist() -> (
     Vec<String>,
     std::collections::HashMap<String, u32>,
@@ -71,7 +71,7 @@ fn load_br006_default_blacklist() -> (
             // 修复 I-10 (2026-06-29 codex review): 原 silently fallback 到空 list,
             // operator 看到的"全库 0% / 全库 100% 主题"会误以为没数据, 违反 §2.2.
             // 改为 fail-fast exit 2 让 CI / cron 立刻知道配置出问题.
-            eprintln!("[winrate_simulator] 解析 chain_rules.toml 失败: {}", e);
+            eprintln!("[winrate_simulator] 解析 config/chain.toml 失败: {}", e);
             eprintln!("[winrate_simulator] 拒绝输出错误结果, exit 2 (修复 I-10)");
             std::process::exit(2);
         }
@@ -340,7 +340,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //   - winrate ∈ [0, 100] 真实胜率
     //   - log(samples + 1) ∈ [0.7, ~3.7] 样本量加权 (1 推送 → 0.7, 100 推送 → 2.3, 1000 → 3.0)
     //   - scale = 25 让 winrate=30% samples=20 → 75, winrate=50% samples=100 → 115 (clamp 100)
-    // 输出推荐 priority, operator 手动复制到 chain_rules.toml.
+    // 输出推荐 priority，operator 经 2.9 设计/配置互证后手动更新 chain.toml。
     const PRIORITY_SCALE: f64 = 25.0;
     println!("【F17 dynamic_priority 推荐】 (修复 v9.3 批量 priority=100 注入破坏提示)");
     println!(
@@ -370,7 +370,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     if !dyn_recommendations.is_empty() {
-        println!("\n  建议: 把上述 dyn_prior 复制到 config/chain_rules.toml 的 priority 字段.");
+        println!("\n  建议: 经 2.9 设计/配置互证后更新 config/chain.toml 的 priority 字段.");
         println!("  注意: dyn_prior 只反映历史胜率, 不包含 forward-looking 因子 (市场风格切换 / 政策催化).");
         println!("  使用 AGENTS §2.9 边界证明模板: dyn_prior=? ± ? (95% CI), 与样本量=?");
     }

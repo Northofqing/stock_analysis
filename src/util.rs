@@ -13,9 +13,9 @@ pub fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
-/// CR-9 (review): 简单 HTML 标签剥离, 复用给 xueqiu/em_industry_news/cninfo/event_extractor.
+/// CR-9 (review): 简单 HTML 标签剥离，供需要处理上游高亮片段的事件抽取调用方复用。
 ///   处理 `<em>关键词</em>` `<strong>x</strong>` 等简单高亮, 不处理嵌套 / 自闭合 / HTML 实体.
-///   之前 3 个 provider 各有一份私有实现 + event_extractor 又有第 4 份 inline 实现, 现在统一调用此处.
+///   来源采集由 Gateway 负责；此处只做共享的文本投影，不持有 provider 协议。
 pub fn strip_html_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_tag = false;

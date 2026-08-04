@@ -68,7 +68,13 @@ If pre-flight is missing, the task is **not allowed to proceed**.
 Before data enters computation, the following **MUST** be validated:
 
 - Price > 0
-- Adjacent valid-value change > ±20%: alert + manual confirmation
+- Daily/historical percentage magnitude **MUST NOT** be rejected against a fixed
+  ceiling. Preserve the source-backed actual change. Price-limit and order-range
+  checks **MUST** use evidence for that instrument and trading session: exact
+  source-supplied upper/lower prices or an explicit `NoLimit` state. A complete
+  response with no supported rule is `Unavailable`; stale, one-sided or
+  conflicting evidence is an explicit error. Code-prefix, board-name, ST-name,
+  or a default percentage **MUST NOT** be used as authority.
 - Time continuity: gaps/duplicates return error
 - Split/dividend consistency: series continuity, jumps within expectation
 
@@ -98,7 +104,13 @@ Bad data is treated as a failure: explicit error, not silent computation with ba
 
 - Single order amount ≤ available cash, **AND** ≤ 1,000,000 RMB.
 - Single order quantity > 0 **AND** a multiple of 100 shares.
-- Order price **MUST** be within the daily limit-up/limit-down range.
+- Order price safety **MUST** consume a source-backed limit state for the same
+  canonical instrument and trading session. `Bounded` requires the price to be
+  inside the exact source-supplied lower/upper prices. `NoLimit` is valid only
+  with explicit same-session provider evidence and then has no daily-range
+  comparison; positive price, cash, quantity and all other safety checks still
+  apply. `Unavailable` **MUST** reject the order. Zero, infinity, code/board/ST
+  inference and default percentages **MUST NOT** represent `NoLimit`.
 - The same business order ID within 60 seconds **MUST** be rejected (idempotency).
 - Single order ≥ 500,000 RMB **MUST** require secondary confirmation.
 

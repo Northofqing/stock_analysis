@@ -676,7 +676,7 @@ fn build_fundamental_slice(latest: &KlineData) -> String {
         }
 
         // 财务异常信号
-        if let Some(q) = crate::data_provider::assess_quality(hist) {
+        if let Some(q) = crate::company_financials::assess_quality(hist) {
             if !q.flags.is_empty() {
                 s.push_str(&format!(
                     "【财务异常】评分 {}/100 ({})\n",
@@ -882,10 +882,9 @@ fn build_sector_slice(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_provider::{
-        consensus::ConsensusData, financials::FinancialPeriod, industry::IndustryBenchmark,
-        valuation_history::ValuationHistory, AdjustType,
-    };
+    use crate::company_financials::FinancialPeriod;
+    use crate::company_metrics::{IndustryBenchmark, ValuationHistory};
+    use crate::data_provider::{consensus::ConsensusData, AdjustType};
     use std::collections::HashMap;
 
     fn rich_history(days: usize) -> Vec<KlineData> {

@@ -16,7 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::data_provider::money_flow::MoneyFlowSummary;
+use crate::capital_flow::MoneyFlowSummary;
 use crate::data_provider::KlineData;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -181,10 +181,10 @@ pub fn render_section(outcome: &VetoOutcome, original_advice: &str) -> Option<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capital_flow::{MoneyFlowDay, MoneyFlowSummary};
+    use crate::company_financials::FinancialPeriod;
+    use crate::company_metrics::ValuationHistory;
     use crate::data_provider::consensus::ConsensusData;
-    use crate::data_provider::financials::FinancialPeriod;
-    use crate::data_provider::money_flow::{MoneyFlowDay, MoneyFlowSummary};
-    use crate::data_provider::valuation_history::ValuationHistory;
     use crate::data_provider::{AdjustType, KlineData};
     use chrono::NaiveDate;
 
@@ -360,7 +360,7 @@ mod tests {
                 xl_net: 0.0,
                 big_net: 0.0,
                 main_pct: 0.0,
-                pct_chg: 0.0,
+                pct_chg: Some(0.0),
             })
             .collect();
         let flow = MoneyFlowSummary { days };
@@ -405,7 +405,7 @@ mod tests {
                     xl_net: 0.0,
                     big_net: 0.0,
                     main_pct: 0.0,
-                    pct_chg: 0.0,
+                    pct_chg: Some(0.0),
                 })
                 .collect(),
         };

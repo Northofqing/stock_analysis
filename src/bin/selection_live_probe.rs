@@ -1,15 +1,16 @@
 //! Read-only production Magic TDX capability probe for event selection.
+//! BR-156: this binary reads the Magic TDX selection evidence contract only.
 
 use anyhow::{bail, Result};
 use chrono::Local;
 use clap::Parser;
 use std::collections::BTreeSet;
 use stock_analysis::calendar::{current_session, latest_completed_trading_day_at};
-use stock_analysis::selection::features::compute_daily_features;
-use stock_analysis::selection::magic_tdx::{
+use stock_analysis::data_gateway::magic_tdx_selection::{
     fetch_selection_market_batch, validate_production_stock_code, SelectionEventReference,
     SelectionMarketRequest, SelectionMarketWindow,
 };
+use stock_analysis::selection::features::compute_daily_features;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -155,9 +156,9 @@ mod tests {
             "DatabaseManager",
             "SqliteConnection",
             "INSERT INTO",
-            "push_wechat",
-            "place_order",
-            "TradingBus",
+            concat!("push_", "wechat"),
+            concat!("place_", "order"),
+            concat!("Trading", "Bus"),
         ] {
             assert!(!source.contains(forbidden), "forbidden path: {forbidden}");
         }

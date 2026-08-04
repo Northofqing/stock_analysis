@@ -84,52 +84,41 @@ pub async fn run_v13_diag() -> V13DiagReport {
     }));
 
     // D-01 新闻驱动个股 (依赖 chain_daily)
-    steps.push(check_step("D-01", "load_news_to_idea", || {
-        let snap = match load_news_to_idea_snapshot_real("10:30") {
-            Ok(snapshot) => snapshot,
-            Err(error) => return format!("error: {error}"),
-        };
-        if snap.headline.is_empty() {
-            "empty".into()
-        } else {
-            format!("ok: headline={}, name={}", snap.headline, snap.name)
-        }
-    }));
+    let d01_detail = match load_news_to_idea_snapshot_real("10:30").await {
+        Ok(snapshot) if snapshot.headline.is_empty() => "empty".to_string(),
+        Ok(snapshot) => format!("ok: headline={}, name={}", snapshot.headline, snapshot.name),
+        Err(error) => format!("error: {error}"),
+    };
+    steps.push(check_step("D-01", "load_news_to_idea", move || d01_detail));
 
     // A-01 虚拟仓复盘 (依赖 virtual_observation JSON)
-    steps.push(check_step(
-        "A-01",
-        "load_paper_review",
-        || match load_paper_review_snapshot_real("2026-07-07") {
-            Ok(Some(snapshot)) => {
-                format!("ok: name={}, pnl={:?}", snapshot.name, snapshot.pnl)
-            }
-            Ok(None) => "empty".into(),
-            Err(error) => format!("error: {error}"),
-        },
-    ));
+    let a01_detail = match load_paper_review_snapshot_real("2026-07-07").await {
+        Ok(Some(snapshot)) => {
+            format!("ok: name={}, pnl={:?}", snapshot.name, snapshot.pnl)
+        }
+        Ok(None) => "empty".into(),
+        Err(error) => format!("error: {error}"),
+    };
+    steps.push(check_step("A-01", "load_paper_review", move || a01_detail));
 
     // v37: P-02 竞价热点量能 (依赖 limit_up_stocks)
     steps.push(check_step("P-02", "load_auction_volume", || {
         "unavailable: BR-051 isolated diagnostics skip external auction source".into()
     }));
 
-    // v35: A-10 盘后催化复盘 (依赖 chain_daily cluster)
-    steps.push(check_step("A-10", "load_catalyst_review", || {
-        let snapshot = match load_catalyst_review_snapshot_real("2026-07-07") {
-            Ok(snapshot) => snapshot,
-            Err(error) => return format!("error: {error}"),
-        };
-        if snapshot.started.is_empty() {
-            "empty".into()
-        } else {
+    // BR-160: A-10 盘后催化复盘（统一 Gateway 可见批次）
+    let a10_detail = match load_catalyst_review_snapshot_real("2026-07-07").await {
+        Ok(snapshot) if snapshot.leading_members.is_empty() => "empty".to_string(),
+        Ok(snapshot) => {
             format!(
-                "ok: date={}, score={:?}, started={}",
-                snapshot.date,
-                snapshot.score,
-                snapshot.started.len()
+                "ok: date={}, score={:?}, members={}, continuous={}",
+                snapshot.date, snapshot.score, snapshot.member_count, snapshot.continuous_count
             )
         }
+        Err(error) => format!("error: {error}"),
+    };
+    steps.push(check_step("A-10", "load_catalyst_review", move || {
+        a10_detail
     }));
 
     // v44: T-14 盘后固定价格申报 (数据源 = 委托回报, 沙箱无)

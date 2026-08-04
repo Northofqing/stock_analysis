@@ -1,4 +1,4 @@
-//! Registered business rules: BR-112, BR-137, BR-138.
+//! Registered business rules: BR-112, BR-137, BR-138, BR-210.
 //! v17.7 Task 5: Monitor-only source-to-push adapter
 //!
 //! Consumes `NormalizedSourceEvent` from the news aggregator and dispatches
@@ -7,21 +7,144 @@
 //! v17.7 Task 7: Adds bounded polling for earnings and analyst data on the watchlist.
 
 use crate::notify::{self, PushKind, PushOutcome};
-use chrono::Local;
+use chrono::{DateTime, Local};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use stock_analysis::company_financials;
 use stock_analysis::data_provider::consensus;
-use stock_analysis::data_provider::financials;
 use stock_analysis::monitor::event_bus::MonitorEvent;
 use stock_analysis::news::aggregator::analyst_state::{
     AnalystKey, AnalystObservation, AnalystStateStore,
 };
 use stock_analysis::news::aggregator::classifier::{
-    classify_announcement_with_provenance, classify_earnings, classify_policy,
-    EarningsClassification, EarningsConfig, EarningsKind,
+    classify_announcement_with_provenance, classify_earnings,
+    validate_announcement_source_fact_with_provenance, EarningsClassification, EarningsConfig,
+    EarningsKind,
 };
-use stock_analysis::news::aggregator::{NormalizedSourceEvent, SourcePushKind};
+use stock_analysis::news::aggregator::source_event::SourceBatchEvidence;
+use stock_analysis::news::aggregator::{
+    NormalizedSourceError, NormalizedSourceEvent, SourcePushKind,
+};
+
+#[derive(Debug, Clone)]
+pub struct EvidenceBackedConsensus {
+    pub data: consensus::ConsensusData,
+    pub evidence: SourceBatchEvidence,
+}
+
+fn source_batch_from_gateway(
+    evidence: stock_analysis::data_gateway::BatchEvidence,
+    content_sha256: String,
+) -> anyhow::Result<SourceBatchEvidence> {
+    SourceBatchEvidence::new(
+        evidence.provider,
+        evidence.source,
+        evidence.source_at,
+        evidence.observed_at,
+        evidence.batch_id,
+        content_sha256,
+    )
+    .map_err(anyhow::Error::from)
+}
+
+fn financial_batch_evidence(
+    financials: &company_financials::Financials,
+) -> anyhow::Result<SourceBatchEvidence> {
+    let evidence = financials.require_projection_evidence()?;
+    SourceBatchEvidence::new(
+        evidence.provider,
+        evidence.source.clone(),
+        evidence.source_at.clone(),
+        evidence.observed_at.clone(),
+        evidence.batch_id.clone(),
+        evidence.content_sha256.clone(),
+    )
+    .map_err(anyhow::Error::from)
+}
+
+fn consensus_content_sha256(data: &consensus::ConsensusData) -> anyhow::Result<String> {
+    let ratings = data
+        .rating_distribution
+        .iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let reports = data
+        .recent_reports
+        .iter()
+        .map(|report| {
+            serde_json::json!({
+                "title": report.title,
+                "organization": report.org_name,
+                "published_on": report.publish_date,
+                "rating": report.rating,
+            })
+        })
+        .collect::<Vec<_>>();
+    let canonical = serde_json::to_vec(&serde_json::json!({
+        "report_count": data.report_count,
+        "broker_count": data.broker_count,
+        "eps_this_year_avg": data.eps_this_year_avg,
+        "eps_next_year_avg": data.eps_next_year_avg,
+        "eps_next2_year_avg": data.eps_next2_year_avg,
+        "rating_distribution": ratings,
+        "target_price_high_avg": data.target_price_high_avg,
+        "target_price_low_avg": data.target_price_low_avg,
+        "latest_report_date": data.latest_report_date,
+        "recent_reports": reports,
+    }))
+    .map_err(|error| anyhow::anyhow!("BR-159 consensus content serialization failed: {error}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"stock_analysis.consensus_projection_content.v1\0");
+    hasher.update(canonical);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn project_consensus_batch(
+    batch: stock_analysis::data_gateway::GatewayBatch<consensus::ConsensusData>,
+) -> anyhow::Result<EvidenceBackedConsensus> {
+    match batch {
+        stock_analysis::data_gateway::GatewayBatch::Available {
+            mut records,
+            evidence,
+        } if records.len() == 1 => {
+            let data = records.remove(0);
+            let content_sha256 = consensus_content_sha256(&data)?;
+            let evidence = source_batch_from_gateway(evidence, content_sha256)?;
+            Ok(EvidenceBackedConsensus { data, evidence })
+        }
+        stock_analysis::data_gateway::GatewayBatch::Available { records, .. } => {
+            anyhow::bail!(
+                "BR-164 consensus gateway cardinality invalid: expected=1 actual={}",
+                records.len()
+            )
+        }
+        stock_analysis::data_gateway::GatewayBatch::VerifiedEmpty(_) => {
+            anyhow::bail!("BR-164 consensus gateway returned verified empty")
+        }
+    }
+}
+
+fn latest_batch_observed_at(
+    batches: &[SourceBatchEvidence],
+) -> Result<DateTime<Local>, NormalizedSourceError> {
+    batches
+        .iter()
+        .map(|evidence| {
+            stock_analysis::data_gateway::parse_evidence_instant(
+                "v17-source-batch-observed-at",
+                evidence.provider,
+                "observed_at",
+                &evidence.observed_at,
+            )
+            .map(|value| value.with_timezone(&Local))
+            .map_err(|_| NormalizedSourceError::InvalidBatchEvidence)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .ok_or(NormalizedSourceError::MissingBatchEvidence)
+}
 
 /// Bounded state map for deduping OrderUpdate events.
 /// Tracks (action, shares) per code; only emits if the tuple changes.
@@ -115,6 +238,7 @@ pub struct SourcePollReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnnouncementDisposition {
     Pushed,
+    FilteredClassification,
     FilteredLifecycle,
     FilteredAudience,
     Failed,
@@ -123,6 +247,7 @@ pub enum AnnouncementDisposition {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct AnnouncementDispositionCounts {
     pub pushed: usize,
+    pub filtered_classification: usize,
     pub filtered_lifecycle: usize,
     pub filtered_audience: usize,
     pub failed: usize,
@@ -147,6 +272,9 @@ impl AnnouncementSourceRouteReport {
         for disposition in &self.input_dispositions {
             match disposition {
                 AnnouncementDisposition::Pushed => counts.pushed += 1,
+                AnnouncementDisposition::FilteredClassification => {
+                    counts.filtered_classification += 1;
+                }
                 AnnouncementDisposition::FilteredLifecycle => counts.filtered_lifecycle += 1,
                 AnnouncementDisposition::FilteredAudience => counts.filtered_audience += 1,
                 AnnouncementDisposition::Failed => counts.failed += 1,
@@ -177,28 +305,60 @@ fn record_source_attempt(report: &mut SourcePollReport, outcome: &PushOutcome) {
 /// the explicit outcome. The next provider poll remains the retry boundary.
 #[cfg(test)]
 pub async fn route_announcements(
-    announcements: &[stock_analysis::data_provider::announcement::Announcement],
-    eligible_codes: &HashSet<String>,
-) -> AnnouncementSourceRouteReport {
-    route_announcements_with_provenance(announcements, eligible_codes, Local::now(), "eastmoney")
-        .await
-}
-
-pub async fn route_announcement_batch(
-    batch: &stock_analysis::data_provider::announcement::AnnouncementFetchBatch,
+    announcements: &[stock_analysis::announcement::Announcement],
     eligible_codes: &HashSet<String>,
 ) -> AnnouncementSourceRouteReport {
     route_announcements_with_provenance(
+        announcements,
+        eligible_codes,
+        Local::now(),
+        "cninfo-market",
+    )
+    .await
+}
+
+pub async fn route_announcement_batch(
+    batch: &stock_analysis::announcement::AnnouncementBatch,
+    eligible_codes: &HashSet<String>,
+) -> AnnouncementSourceRouteReport {
+    let observed_at = match stock_analysis::data_gateway::parse_evidence_instant(
+        "R-08-announcements",
+        batch.evidence.provider,
+        "observed_at",
+        &batch.evidence.observed_at,
+    ) {
+        Ok(value) => value.with_timezone(&Local),
+        Err(error) => {
+            log::error!(
+                "[v17.7][BR-159][BR-168][BR-210] announcement batch observed_at invalid: {error}"
+            );
+            return AnnouncementSourceRouteReport {
+                source: SourcePollReport {
+                    attempted: batch.announcements.len(),
+                    // A malformed batch envelope remains machine-visible even
+                    // when it contains no rows. Per-input dispositions still
+                    // remain exactly aligned with the input cardinality.
+                    failed: batch.announcements.len().max(1),
+                    ..SourcePollReport::default()
+                },
+                input_dispositions: vec![
+                    AnnouncementDisposition::Failed;
+                    batch.announcements.len()
+                ],
+            };
+        }
+    };
+    route_announcements_with_provenance(
         &batch.announcements,
         eligible_codes,
-        batch.provenance.observed_at.with_timezone(&Local),
-        batch.provenance.provider_label(),
+        observed_at,
+        &batch.evidence.source,
     )
     .await
 }
 
 async fn route_announcements_with_provenance(
-    announcements: &[stock_analysis::data_provider::announcement::Announcement],
+    announcements: &[stock_analysis::announcement::Announcement],
     eligible_codes: &HashSet<String>,
     observed_at: chrono::DateTime<Local>,
     source: &str,
@@ -221,7 +381,22 @@ async fn route_announcements_with_provenance(
             );
             continue;
         };
-        if !stock_analysis::data_provider::announcement::announcement_title_is_immediately_actionable(
+        // BR-137/BR-138: no handled/filter outcome may hide malformed, stale,
+        // or future provider evidence. This validation intentionally precedes
+        // both the lifecycle and immutable-keyword dispositions.
+        if let Err(error) =
+            validate_announcement_source_fact_with_provenance(announcement, observed_at, source)
+        {
+            routed.source.failed += 1;
+            routed
+                .input_dispositions
+                .push(AnnouncementDisposition::Failed);
+            log::warn!(
+                "[v17.7][BR-137] announcement source fact rejected before filtering: reason={error}"
+            );
+            continue;
+        }
+        if !stock_analysis::announcement::announcement_title_is_immediately_actionable(
             &announcement.title,
         ) {
             routed.source.classified += 1;
@@ -231,6 +406,23 @@ async fn route_announcements_with_provenance(
                 .push(AnnouncementDisposition::FilteredLifecycle);
             log::info!(
                 "[v17.7][BR-138] announcement normalized route filtered: reason=lifecycle_only"
+            );
+            continue;
+        }
+        // BR-138: ordinary announcements that did not match the immutable
+        // notification keyword snapshot remain owned and handled without
+        // polluting lifecycle audit counts.
+        if matches!(
+            announcement.level,
+            stock_analysis::announcement::AnnLevel::Skip
+        ) {
+            routed.source.classified += 1;
+            routed.source.skipped += 1;
+            routed
+                .input_dispositions
+                .push(AnnouncementDisposition::FilteredClassification);
+            log::info!(
+                "[v17.7][BR-138] announcement normalized route filtered: reason=classification_skip"
             );
             continue;
         }
@@ -278,41 +470,6 @@ async fn route_announcements_with_provenance(
     routed
 }
 
-/// Classify and push the original government-policy provider results without
-/// converting them to generic MarketEvent values first.
-pub async fn push_policy_results(
-    results: Vec<stock_analysis::search_service::SearchResult>,
-) -> SourcePollReport {
-    let mut report = SourcePollReport::default();
-    for result in results {
-        report.attempted += 1;
-        let event = match classify_policy(&result) {
-            Ok(event) => event,
-            Err(error) => {
-                report.skipped += 1;
-                log::warn!("[v17.7][BR-137] policy classification rejected: reason={error}");
-                continue;
-            }
-        };
-        report.classified += 1;
-        let attempt = push_normalized_event(event).await;
-        record_source_attempt(&mut report, &attempt.outcome);
-        log::info!(
-            "[v17.7][BR-137] policy normalized outcome={:?}",
-            attempt.outcome
-        );
-    }
-    report
-}
-
-pub async fn poll_policy_provider(
-    provider: &stock_analysis::search_service::providers::gov_policy::GovPolicyProvider,
-    limit: usize,
-) -> anyhow::Result<SourcePollReport> {
-    let results = provider.fetch_latest(limit).await?;
-    Ok(push_policy_results(results).await)
-}
-
 /// Maps SourcePushKind 1:1 to the corresponding PushKind variant.
 fn source_push_kind_to_push_kind(kind: SourcePushKind) -> PushKind {
     match kind {
@@ -322,6 +479,41 @@ fn source_push_kind_to_push_kind(kind: SourcePushKind) -> PushKind {
         SourcePushKind::EarningsMiss => PushKind::EarningsMiss,
         SourcePushKind::AnalystUpgrade => PushKind::AnalystUpgrade,
         SourcePushKind::MarketActionAlert => PushKind::MarketActionAlert,
+    }
+}
+
+fn source_presentation_tuple(kind: SourcePushKind) -> (&'static str, &'static str, &'static str) {
+    match kind {
+        SourcePushKind::Announcement => (
+            "S-01-announcement",
+            "v17_source_dispatcher",
+            "v17_sources_render_message_announcement",
+        ),
+        SourcePushKind::PolicyHit => (
+            "S-02-policy-hit",
+            "v17_source_dispatcher",
+            "v17_sources_render_message_policy_hit",
+        ),
+        SourcePushKind::EarningsBeat => (
+            "S-03-earnings-beat",
+            "v17_source_dispatcher",
+            "v17_sources_render_message_earnings_beat",
+        ),
+        SourcePushKind::EarningsMiss => (
+            "S-04-earnings-miss",
+            "v17_source_dispatcher",
+            "v17_sources_render_message_earnings_miss",
+        ),
+        SourcePushKind::AnalystUpgrade => (
+            "S-05-analyst-upgrade",
+            "v17_source_dispatcher",
+            "v17_sources_render_message_analyst_upgrade",
+        ),
+        SourcePushKind::MarketActionAlert => (
+            "S-06-market-action-alert",
+            "v17_source_dispatcher",
+            "v17_sources_render_message_market_action_alert",
+        ),
     }
 }
 
@@ -357,10 +549,121 @@ fn render_message(event: &NormalizedSourceEvent) -> String {
     s
 }
 
+/// BR-196 typed TEST_CODE fixtures for all six normalized-source presentation
+/// shapes.  This exercises the production `render_message` seam without
+/// entering governance or a provider.
+pub(super) fn build_br196_normalized_source_previews() -> Result<Vec<(&'static str, String)>, String>
+{
+    use stock_analysis::signal::market_event::Direction;
+
+    let identity =
+        crate::br196_test_delivery::TestSecurityIdentity::parse("TEST_CODE_SOURCE_ALPHA")?;
+    let now = Local::now();
+    let specs = [
+        ("S-01-announcement", SourcePushKind::Announcement),
+        ("S-02-policy-hit", SourcePushKind::PolicyHit),
+        ("S-03-earnings-beat", SourcePushKind::EarningsBeat),
+        ("S-04-earnings-miss", SourcePushKind::EarningsMiss),
+        ("S-05-analyst-upgrade", SourcePushKind::AnalystUpgrade),
+        (
+            "S-06-market-action-alert",
+            SourcePushKind::MarketActionAlert,
+        ),
+    ];
+    specs
+        .into_iter()
+        .map(|(template_id, source_kind)| {
+            let code = if source_kind == SourcePushKind::PolicyHit {
+                None
+            } else {
+                Some(identity.as_str().to_string())
+            };
+            let source = "TEST_CODE_NORMALIZED_SOURCE".to_string();
+            let published_on = if source_kind == SourcePushKind::MarketActionAlert {
+                None
+            } else {
+                Some(now.date_naive())
+            };
+            let common = (
+                source_kind,
+                format!("{}_{}", identity.as_str(), template_id),
+                code,
+                format!("TEST_CODE {:?} 标题", source_kind),
+                "TEST_CODE 标准化来源摘要".to_string(),
+                Direction::Neutral,
+                80,
+                80,
+                now,
+                published_on,
+                false,
+                source.clone(),
+                None,
+            );
+            let event = if matches!(
+                source_kind,
+                SourcePushKind::EarningsBeat
+                    | SourcePushKind::EarningsMiss
+                    | SourcePushKind::AnalystUpgrade
+            ) {
+                let evidence = SourceBatchEvidence::new(
+                    magic_market_core::ProviderId::Eastmoney,
+                    source,
+                    Some(now.date_naive().to_string()),
+                    now.to_rfc3339(),
+                    format!("TEST_CODE_BATCH_{source_kind:?}"),
+                    "a".repeat(64),
+                )
+                .map_err(|error| format!("BR-196 batch fixture rejected: {error}"))?;
+                NormalizedSourceEvent::new_with_batch_evidence(
+                    common.0,
+                    common.1,
+                    common.2,
+                    common.3,
+                    common.4,
+                    common.5,
+                    common.6,
+                    common.7,
+                    common.8,
+                    common.9,
+                    common.10,
+                    common.11,
+                    common.12,
+                    vec![evidence],
+                )
+            } else {
+                NormalizedSourceEvent::new(
+                    common.0, common.1, common.2, common.3, common.4, common.5, common.6, common.7,
+                    common.8, common.9, common.10, common.11, common.12,
+                )
+            }
+            .map_err(|error| format!("BR-196 normalized fixture rejected: {error}"))?;
+            Ok((template_id, render_message(&event)))
+        })
+        .collect()
+}
+
 /// Pushes a single NormalizedSourceEvent through the monitor push pipeline.
 /// Calls `push_governor_v3` exactly once; no retry, no fallback PushKind.
 pub async fn push_normalized_event(event: NormalizedSourceEvent) -> PushAttempt {
     let kind = source_push_kind_to_push_kind(event.push_kind);
+    let (family_key, producer_seam_id, renderer_seam_id) =
+        source_presentation_tuple(event.push_kind);
+    let presentation_token = match crate::presentation_registry::acquire_token(
+        family_key,
+        kind,
+        producer_seam_id,
+        renderer_seam_id,
+    ) {
+        Ok(token) => token,
+        Err(error) => {
+            return PushAttempt {
+                kind,
+                code: event.code.clone(),
+                outcome: PushOutcome::Denied(error),
+                rendered_len: 0,
+            };
+        }
+    };
     let code_str = event.code.clone();
     if let Err(error) = event.validate() {
         log::error!(
@@ -394,14 +697,17 @@ pub async fn push_normalized_event(event: NormalizedSourceEvent) -> PushAttempt 
             event.certainty,
             event.stale,
         ) {
-            Ok(evidence) => notify::push_source_fact_v3(&rendered, &evidence).await,
+            Ok(evidence) => {
+                notify::push_presented_source_fact_v3(presentation_token, &rendered, &evidence)
+                    .await
+            }
             Err(error) => {
                 log::error!("[v17.7][BR-137] source fact rejected: kind={kind:?} reason={error}");
                 PushOutcome::Denied(format!("source_fact_invalid:{error}"))
             }
         }
     } else {
-        notify::push_governor_v3(&rendered, kind, code_str.as_deref()).await
+        notify::push_presented_v3(presentation_token, &rendered, code_str.as_deref()).await
     };
     let rendered_len = rendered.len();
     PushAttempt {
@@ -438,7 +744,7 @@ fn earnings_classification_to_event(
     code: &str,
     classification: &EarningsClassification,
     source_published_on: chrono::NaiveDate,
-    source: &str,
+    source_batches: Vec<SourceBatchEvidence>,
 ) -> Result<NormalizedSourceEvent, stock_analysis::news::aggregator::NormalizedSourceError> {
     let push_kind = match classification.kind {
         EarningsKind::Beat => SourcePushKind::EarningsBeat,
@@ -480,7 +786,13 @@ fn earnings_classification_to_event(
         classification.delta_pct.to_string(),
     );
 
-    Ok(NormalizedSourceEvent::new(
+    let source = source_batches
+        .first()
+        .ok_or(NormalizedSourceError::MissingBatchEvidence)?
+        .source
+        .clone();
+    let observed_at = latest_batch_observed_at(&source_batches)?;
+    Ok(NormalizedSourceEvent::new_with_batch_evidence(
         push_kind,
         event_id,
         Some(code.to_string()),
@@ -489,11 +801,12 @@ fn earnings_classification_to_event(
         direction,
         80,
         90,
-        Local::now(),
+        observed_at,
         Some(source_published_on),
         false,
-        source.to_string(),
+        source,
         None,
+        source_batches,
     )?
     .with_metadata("actual", metadata["actual"].clone())
     .with_metadata("reference", metadata["reference"].clone())
@@ -508,7 +821,7 @@ fn analyst_upgrade_event(
     to: &str,
     report_id: &str,
     publish_date: chrono::NaiveDate,
-    source: &str,
+    source_evidence: SourceBatchEvidence,
 ) -> Result<NormalizedSourceEvent, stock_analysis::news::aggregator::NormalizedSourceError> {
     let event_id = format!("analyst:{}:{}:{}", code, broker, report_id);
     let title = format!("{} 券商上调评级", broker);
@@ -518,7 +831,9 @@ fn analyst_upgrade_event(
     metadata.insert("from_rating".to_string(), from.to_string());
     metadata.insert("to_rating".to_string(), to.to_string());
 
-    Ok(NormalizedSourceEvent::new(
+    let observed_at = latest_batch_observed_at(std::slice::from_ref(&source_evidence))?;
+    let source = source_evidence.source.clone();
+    Ok(NormalizedSourceEvent::new_with_batch_evidence(
         SourcePushKind::AnalystUpgrade,
         event_id,
         Some(code.to_string()),
@@ -527,11 +842,12 @@ fn analyst_upgrade_event(
         stock_analysis::signal::market_event::Direction::Bull,
         70,
         80,
-        Local::now(),
+        observed_at,
         Some(publish_date),
         false,
-        source.to_string(),
+        source,
         None,
+        vec![source_evidence],
     )?
     .with_metadata("broker", metadata["broker"].clone())
     .with_metadata("from_rating", metadata["from_rating"].clone())
@@ -539,37 +855,28 @@ fn analyst_upgrade_event(
 }
 
 /// Trait for fetching earnings and consensus data.
-/// Allows test stubs without real HTTP calls.
+/// Allows deterministic tests without opening provider transports.
 pub trait EarningsFetcher: Send + Sync {
-    async fn fetch_financials(
-        &self,
-        client: &reqwest::Client,
-        code: &str,
-    ) -> anyhow::Result<stock_analysis::data_provider::financials::Financials>;
-    async fn fetch_consensus(
-        &self,
-        client: &reqwest::Client,
-        code: &str,
-    ) -> anyhow::Result<consensus::ConsensusData>;
+    async fn fetch_financials(&self, code: &str) -> anyhow::Result<company_financials::Financials>;
+    async fn fetch_consensus(&self, code: &str) -> anyhow::Result<EvidenceBackedConsensus>;
 }
 
 /// Real fetcher using the existing data providers.
 pub struct RealEarningsFetcher;
 
 impl EarningsFetcher for RealEarningsFetcher {
-    async fn fetch_financials(
-        &self,
-        client: &reqwest::Client,
-        code: &str,
-    ) -> anyhow::Result<stock_analysis::data_provider::financials::Financials> {
-        financials::fetch_with_fallback_async(client, code).await
+    async fn fetch_financials(&self, code: &str) -> anyhow::Result<company_financials::Financials> {
+        let batch = stock_analysis::data_gateway::CompanyDataGateway::new()
+            .income_statements(&[code.to_string()])
+            .await?;
+        company_financials::project_income_statements(batch)
     }
-    async fn fetch_consensus(
-        &self,
-        client: &reqwest::Client,
-        code: &str,
-    ) -> anyhow::Result<consensus::ConsensusData> {
-        consensus::fetch_async(client, code).await
+    async fn fetch_consensus(&self, code: &str) -> anyhow::Result<EvidenceBackedConsensus> {
+        let batch = stock_analysis::data_gateway::ConsensusDataGateway::new()
+            .fetch(code)
+            .await?;
+        log::info!("[v17_sources][BR-164] admitted consensus batch: {batch}");
+        project_consensus_batch(batch)
     }
 }
 
@@ -595,20 +902,6 @@ pub async fn poll_earnings_and_analyst(
         return SourcePollReport::default();
     }
 
-    let http = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            log::warn!("[v17_sources] failed to build HTTP client: {}", e);
-            return SourcePollReport {
-                failed: 1,
-                ..SourcePollReport::default()
-            };
-        }
-    };
-
     let fetcher = RealEarningsFetcher;
     let mut events: Vec<NormalizedSourceEvent> = Vec::new();
     let mut source_failures = 0usize;
@@ -633,16 +926,14 @@ pub async fn poll_earnings_and_analyst(
 
             if should_poll {
                 let (financials_result, consensus_result) = tokio::join!(
-                    fetcher.fetch_financials(&http, code_str),
-                    fetcher.fetch_consensus(&http, code_str)
+                    fetcher.fetch_financials(code_str),
+                    fetcher.fetch_consensus(code_str)
                 );
                 match (financials_result, consensus_result) {
                     (Ok(financials), Ok(consensus)) => {
-                        let source_evidence = financials
-                            .source
-                            .filter(|source| !source.trim().is_empty())
-                            .ok_or_else(|| "financial provider source missing".to_string())
-                            .and_then(|source| {
+                        let source_evidence = financial_batch_evidence(&financials)
+                            .map_err(|error| error.to_string())
+                            .and_then(|financial_evidence| {
                                 let raw = financials
                                     .published_date
                                     .as_deref()
@@ -651,18 +942,21 @@ pub async fn poll_earnings_and_analyst(
                                     chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d").map_err(
                                         |error| format!("financial NOTICE_DATE invalid: {error}"),
                                     )?;
-                                Ok((source, published_on))
+                                Ok((
+                                    vec![financial_evidence, consensus.evidence.clone()],
+                                    published_on,
+                                ))
                             });
                         match (financials.history.first(), source_evidence) {
-                            (Some(latest_period), Ok((source, published_on))) => {
+                            (Some(latest_period), Ok((source_batches, published_on))) => {
                                 if let Some(classification) =
-                                    classify_earnings(latest_period, &consensus, earnings_cfg)
+                                    classify_earnings(latest_period, &consensus.data, earnings_cfg)
                                 {
                                     match earnings_classification_to_event(
                                         code_str,
                                         &classification,
                                         published_on,
-                                        source,
+                                        source_batches,
                                     ) {
                                         Ok(event) => events.push(event),
                                         Err(error) => {
@@ -720,9 +1014,9 @@ pub async fn poll_earnings_and_analyst(
             };
 
             if should_poll {
-                match fetcher.fetch_consensus(&http, code_str).await {
-                    Ok(consensus_data) => {
-                        for report in &consensus_data.recent_reports {
+                match fetcher.fetch_consensus(code_str).await {
+                    Ok(consensus) => {
+                        for report in &consensus.data.recent_reports {
                             let key = AnalystKey {
                                 code: code_str.to_string(),
                                 broker: report.org_name.clone(),
@@ -757,7 +1051,7 @@ pub async fn poll_earnings_and_analyst(
                                     &to,
                                     &report.title,
                                     publish_date,
-                                    "东方财富研报",
+                                    consensus.evidence.clone(),
                                 ) {
                                     Ok(event) => events.push(event),
                                     Err(error) => {
@@ -819,7 +1113,8 @@ mod tests {
             observed_at: Local::now(),
             source_published_on: Some(Local::now().date_naive()),
             stale: false,
-            source: "eastmoney".into(),
+            source: "cninfo-market".into(),
+            source_batches: Vec::new(),
             url: Some("https://example.invalid/ann-1".into()),
             metadata: Default::default(),
         }
@@ -841,6 +1136,7 @@ mod tests {
             source_published_on: Some(Local::now().date_naive()),
             stale: false,
             source: "test".into(),
+            source_batches: Vec::new(),
             url: None,
             metadata: Default::default(),
         }
@@ -862,14 +1158,14 @@ mod tests {
     async fn br137_real_announcement_batch_has_a_production_source_fact_owner() {
         let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         crate::v14_adapter::_reset_dedup_for_test();
-        let announcement = stock_analysis::data_provider::announcement::Announcement {
+        let announcement = stock_analysis::announcement::Announcement {
             code: "TEST_CODE_ANN_PRODUCER".to_string(),
             name: "测试公司".to_string(),
             title: "关于回购股份方案的公告".to_string(),
             date: Local::now().date_naive().format("%Y-%m-%d").to_string(),
             summary: "回购".to_string(),
             content: "真实公告正文协议夹具".to_string(),
-            level: stock_analysis::data_provider::announcement::AnnLevel::Important,
+            level: stock_analysis::announcement::AnnLevel::Important,
             reason: "标题含回购".to_string(),
             external_id: Some("TEST_CODE_ANN_EXTERNAL".to_string()),
             url: Some("https://example.invalid/TEST_CODE_ANN_EXTERNAL".to_string()),
@@ -891,14 +1187,14 @@ mod tests {
     async fn br137_repeated_real_announcement_batch_is_not_pushed_twice() {
         let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         crate::v14_adapter::_reset_dedup_for_test();
-        let announcement = stock_analysis::data_provider::announcement::Announcement {
+        let announcement = stock_analysis::announcement::Announcement {
             code: "TEST_CODE_ANN_REPEAT".to_string(),
             name: "测试公司".to_string(),
             title: "关于同一真实公告重复轮询的公告".to_string(),
             date: Local::now().date_naive().format("%Y-%m-%d").to_string(),
             summary: "重复轮询".to_string(),
             content: "真实公告正文协议夹具".to_string(),
-            level: stock_analysis::data_provider::announcement::AnnLevel::Important,
+            level: stock_analysis::announcement::AnnLevel::Important,
             reason: "重复轮询测试".to_string(),
             external_id: Some("TEST_CODE_ANN_REPEAT_EXTERNAL".to_string()),
             url: Some("https://example.invalid/TEST_CODE_ANN_REPEAT_EXTERNAL".to_string()),
@@ -915,19 +1211,108 @@ mod tests {
     fn br138_important_announcement(
         external_id: &str,
         code: &str,
-    ) -> stock_analysis::data_provider::announcement::Announcement {
-        stock_analysis::data_provider::announcement::Announcement {
+    ) -> stock_analysis::announcement::Announcement {
+        stock_analysis::announcement::Announcement {
             code: code.to_string(),
             name: "测试公司".to_string(),
             title: "重大监管问询公告".to_string(),
             date: Local::now().date_naive().format("%Y-%m-%d").to_string(),
             summary: "监管问询".to_string(),
             content: "真实公告正文协议夹具".to_string(),
-            level: stock_analysis::data_provider::announcement::AnnLevel::Important,
+            level: stock_analysis::announcement::AnnLevel::Important,
             reason: "标题含监管问询".to_string(),
             external_id: Some(external_id.to_string()),
             url: Some(format!("https://example.invalid/{external_id}")),
         }
+    }
+
+    fn br210_announcement_batch(
+        observed_at: &str,
+        lifecycle_only: bool,
+    ) -> stock_analysis::announcement::AnnouncementBatch {
+        let mut announcement = br138_important_announcement(
+            "TEST_CODE_BR210_EXTERNAL",
+            "TEST_CODE_BR210_ANNOUNCEMENT",
+        );
+        if lifecycle_only {
+            announcement.title = "关于注销部分回购股份并减少注册资本通知债权人的公告".to_string();
+            announcement.level = stock_analysis::announcement::AnnLevel::Skip;
+        }
+        stock_analysis::announcement::AnnouncementBatch {
+            announcements: vec![announcement],
+            evidence: stock_analysis::data_gateway::BatchEvidence {
+                provider: magic_market_core::ProviderId::Cninfo,
+                source: "TEST_CODE_cninfo-market".to_string(),
+                source_at: Some("2026-08-04T00:00:00+08:00".to_string()),
+                observed_at: observed_at.to_string(),
+                batch_id: "TEST_CODE_BR210_BATCH".to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn br210_announcement_batch_accepts_magic_fractional_epoch_observation() {
+        let report = route_announcement_batch(
+            &br210_announcement_batch("1785799979.851045000", true),
+            &HashSet::new(),
+        )
+        .await;
+
+        assert_eq!(report.source.attempted, 1);
+        assert_eq!(report.source.failed, 0);
+        assert_eq!(report.source.skipped, 1);
+        assert_eq!(
+            report.disposition_for_input(0),
+            Some(AnnouncementDisposition::FilteredLifecycle)
+        );
+    }
+
+    #[tokio::test]
+    async fn br210_announcement_batch_rejects_malformed_observation() {
+        let report = route_announcement_batch(
+            &br210_announcement_batch("1785799979.8510450000", true),
+            &HashSet::new(),
+        )
+        .await;
+
+        assert_eq!(report.source.attempted, 1);
+        assert_eq!(report.source.failed, 1);
+        assert_eq!(
+            report.disposition_for_input(0),
+            Some(AnnouncementDisposition::Failed)
+        );
+    }
+
+    #[tokio::test]
+    async fn br210_actionable_announcement_reaches_audience_filter_with_fractional_epoch() {
+        let now = Local::now();
+        let observed_at = format!("{}.{:09}", now.timestamp(), now.timestamp_subsec_nanos());
+        let report = route_announcement_batch(
+            &br210_announcement_batch(&observed_at, false),
+            &HashSet::new(),
+        )
+        .await;
+
+        assert_eq!(report.source.attempted, 1);
+        assert_eq!(report.source.classified, 1);
+        assert_eq!(report.source.failed, 0);
+        assert_eq!(report.source.skipped, 1);
+        assert_eq!(
+            report.disposition_for_input(0),
+            Some(AnnouncementDisposition::FilteredAudience)
+        );
+    }
+
+    #[tokio::test]
+    async fn br210_malformed_empty_batch_is_machine_visible_without_fake_input() {
+        let mut batch = br210_announcement_batch("1785799979.8510450000", true);
+        batch.announcements.clear();
+
+        let report = route_announcement_batch(&batch, &HashSet::new()).await;
+
+        assert_eq!(report.source.attempted, 0);
+        assert_eq!(report.source.failed, 1);
+        assert!(report.input_dispositions.is_empty());
     }
 
     #[tokio::test]
@@ -961,7 +1346,7 @@ mod tests {
         let eligible = HashSet::from([code.to_string()]);
         let mut announcement = br138_important_announcement("TEST_CODE_LIFECYCLE_EXTERNAL", code);
         announcement.title = "关于注销部分回购股份并减少注册资本通知债权人的公告".to_string();
-        announcement.level = stock_analysis::data_provider::announcement::AnnLevel::Skip;
+        announcement.level = stock_analysis::announcement::AnnLevel::Skip;
         announcement.content.clear();
 
         let report = route_announcements(&[announcement], &eligible).await;
@@ -975,10 +1360,119 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn br138_keyword_unmatched_announcement_is_handled_without_false_empty_title_failure() {
+        let code = "TEST_CODE_KEYWORD_SKIP";
+        let eligible = HashSet::from([code.to_string()]);
+        let mut announcement =
+            br138_important_announcement("TEST_CODE_KEYWORD_SKIP_EXTERNAL", code);
+        announcement.title = "关于召开年度股东大会的通知".to_string();
+        announcement.level = stock_analysis::announcement::AnnLevel::Skip;
+        announcement.reason.clear();
+
+        let report = route_announcements(&[announcement], &eligible).await;
+
+        assert_eq!(report.source.attempted, 1);
+        assert_eq!(report.source.classified, 1);
+        assert_eq!(report.source.pushed, 0);
+        assert_eq!(report.source.skipped, 1);
+        assert_eq!(report.source.failed, 0);
+        assert_eq!(
+            report.disposition_for_input(0),
+            Some(AnnouncementDisposition::FilteredClassification)
+        );
+    }
+
+    #[tokio::test]
+    async fn br138_skip_rows_must_pass_source_fact_validation_before_filtering() {
+        let observed_at = Local::now();
+        let eligible = HashSet::new();
+        let base = br138_important_announcement(
+            "TEST_CODE_SKIP_VALIDATION_EXTERNAL",
+            "TEST_CODE_SKIP_VALIDATION",
+        );
+
+        let mut empty_title = base.clone();
+        empty_title.title = "   ".to_string();
+        empty_title.level = stock_analysis::announcement::AnnLevel::Skip;
+
+        let mut empty_code = base.clone();
+        empty_code.code = "   ".to_string();
+        empty_code.level = stock_analysis::announcement::AnnLevel::Skip;
+
+        let mut invalid_date = base.clone();
+        invalid_date.date = "not-a-provider-date".to_string();
+        invalid_date.level = stock_analysis::announcement::AnnLevel::Skip;
+
+        let mut stale_date = base.clone();
+        stale_date.date = (observed_at.date_naive() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        stale_date.level = stock_analysis::announcement::AnnLevel::Skip;
+
+        let mut future_date = base.clone();
+        future_date.date = (observed_at.date_naive() + chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        future_date.level = stock_analysis::announcement::AnnLevel::Skip;
+
+        let mut empty_source = base;
+        empty_source.level = stock_analysis::announcement::AnnLevel::Skip;
+
+        for (announcement, source) in [
+            (empty_title, "TEST_CODE_cninfo-market"),
+            (empty_code, "TEST_CODE_cninfo-market"),
+            (invalid_date, "TEST_CODE_cninfo-market"),
+            (stale_date, "TEST_CODE_cninfo-market"),
+            (future_date, "TEST_CODE_cninfo-market"),
+            (empty_source, "   "),
+        ] {
+            let report = route_announcements_with_provenance(
+                &[announcement],
+                &eligible,
+                observed_at,
+                source,
+            )
+            .await;
+            assert_eq!(report.source.attempted, 1);
+            assert_eq!(report.source.classified, 0);
+            assert_eq!(report.source.skipped, 0);
+            assert_eq!(report.source.failed, 1);
+            assert_eq!(
+                report.disposition_for_input(0),
+                Some(AnnouncementDisposition::Failed)
+            );
+        }
+
+        let old_observed_at = observed_at - chrono::Duration::days(1);
+        let mut old_observation_and_publication = br138_important_announcement(
+            "TEST_CODE_SKIP_OLD_OBSERVATION_EXTERNAL",
+            "TEST_CODE_SKIP_OLD_OBSERVATION",
+        );
+        old_observation_and_publication.date =
+            old_observed_at.date_naive().format("%Y-%m-%d").to_string();
+        old_observation_and_publication.level = stock_analysis::announcement::AnnLevel::Skip;
+        let report = route_announcements_with_provenance(
+            &[old_observation_and_publication],
+            &eligible,
+            old_observed_at,
+            "TEST_CODE_cninfo-market",
+        )
+        .await;
+        assert_eq!(report.source.classified, 0);
+        assert_eq!(report.source.skipped, 0);
+        assert_eq!(report.source.failed, 1);
+        assert_eq!(
+            report.disposition_for_input(0),
+            Some(AnnouncementDisposition::Failed)
+        );
+    }
+
     #[test]
     fn br138_disposition_counts_are_explicit_for_canary_evidence() {
         let report = AnnouncementSourceRouteReport::with_dispositions_for_test(vec![
             AnnouncementDisposition::Pushed,
+            AnnouncementDisposition::FilteredClassification,
             AnnouncementDisposition::FilteredLifecycle,
             AnnouncementDisposition::FilteredAudience,
             AnnouncementDisposition::Failed,
@@ -986,6 +1480,7 @@ mod tests {
 
         let counts = report.disposition_counts();
         assert_eq!(counts.pushed, 1);
+        assert_eq!(counts.filtered_classification, 1);
         assert_eq!(counts.filtered_lifecycle, 1);
         assert_eq!(counts.filtered_audience, 1);
         assert_eq!(counts.failed, 1);
@@ -1023,7 +1518,7 @@ mod tests {
         let mut lifecycle =
             br138_important_announcement("TEST_CODE_LIFECYCLE_2", "TEST_CODE_ALLOWED");
         lifecycle.title = "关于注销部分回购股份并减少注册资本通知债权人的公告".to_string();
-        lifecycle.level = stock_analysis::data_provider::announcement::AnnLevel::Skip;
+        lifecycle.level = stock_analysis::announcement::AnnLevel::Skip;
         let outside = br138_important_announcement("TEST_CODE_OUTSIDE", "TEST_CODE_OTHER");
 
         let report = route_announcements(&[missing_id, stale, lifecycle, outside], &eligible).await;
@@ -1104,22 +1599,33 @@ mod tests {
     async fn analyst_upgrade_maps_to_analyst_upgrade_kind() {
         let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         crate::v14_adapter::_reset_dedup_for_test();
-        let event = NormalizedSourceEvent {
-            push_kind: SourcePushKind::AnalystUpgrade,
-            event_id: "analyst-1".into(),
-            code: Some("TEST_CODE_ANALYST".into()),
-            title: "券商上调评级".into(),
-            summary: "上调至买入".into(),
-            direction: Direction::Bull,
-            strength: 70,
-            certainty: 80,
-            observed_at: Local::now(),
-            source_published_on: Some(Local::now().date_naive()),
-            stale: false,
-            source: " Wind".into(),
-            url: None,
-            metadata: Default::default(),
-        };
+        let observed_at = Local::now();
+        let source_evidence = SourceBatchEvidence::new(
+            magic_market_core::ProviderId::Eastmoney,
+            " Wind".into(),
+            None,
+            observed_at.to_rfc3339(),
+            "TEST_CODE_ANALYST_BATCH".into(),
+            "a".repeat(64),
+        )
+        .expect("analyst evidence");
+        let event = NormalizedSourceEvent::new_with_batch_evidence(
+            SourcePushKind::AnalystUpgrade,
+            "analyst-1".into(),
+            Some("TEST_CODE_ANALYST".into()),
+            "券商上调评级".into(),
+            "上调至买入".into(),
+            Direction::Bull,
+            70,
+            80,
+            observed_at,
+            Some(Local::now().date_naive()),
+            false,
+            " Wind".into(),
+            None,
+            vec![source_evidence],
+        )
+        .expect("evidence-backed analyst event");
         let attempt = push_normalized_event(event).await;
         assert_eq!(attempt.kind, PushKind::AnalystUpgrade);
         assert_eq!(attempt.outcome, PushOutcome::Pushed);
@@ -1143,6 +1649,7 @@ mod tests {
             source_published_on: Some(Local::now().date_naive()),
             stale: false,
             source: "ndrc".into(),
+            source_batches: Vec::new(),
             url: Some("https://example.invalid/pol-1".into()),
             metadata: Default::default(),
         };
@@ -1152,33 +1659,13 @@ mod tests {
         assert_eq!(attempt.outcome, PushOutcome::Pushed);
     }
 
-    #[tokio::test]
-    #[serial_test::serial(cooldown_memo)]
-    async fn br137_real_policy_results_have_a_production_policy_hit_owner() {
-        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
-        crate::v14_adapter::_reset_dedup_for_test();
-        let mut result = stock_analysis::search_service::SearchResult::new(
-            "促进数字经济高质量发展的通知".to_string(),
-            "政策正文摘要".to_string(),
-            "https://example.invalid/TEST_CODE_POLICY".to_string(),
-            "政府监管".to_string(),
-        );
-        result.published_date = Some(Local::now().date_naive().format("%Y-%m-%d").to_string());
-
-        let report = push_policy_results(vec![result]).await;
-        assert_eq!(report.attempted, 1);
-        assert_eq!(report.classified, 1);
-        assert_eq!(report.pushed, 1);
-        assert_eq!(report.failed, 0);
-    }
-
     /// Helper: build a FinancialPeriod for testing.
     fn test_financial_period(
         _code: &str,
         eps: f64,
         report_date: &str,
-    ) -> stock_analysis::data_provider::financials::FinancialPeriod {
-        stock_analysis::data_provider::financials::FinancialPeriod {
+    ) -> company_financials::FinancialPeriod {
+        company_financials::FinancialPeriod {
             report_date: Some(report_date.to_string()),
             eps: Some(eps),
             roe: None,
@@ -1221,6 +1708,95 @@ mod tests {
         }
     }
 
+    fn test_source_batch(
+        provider: magic_market_core::ProviderId,
+        source: &str,
+        batch_id: &str,
+        content_byte: char,
+    ) -> SourceBatchEvidence {
+        SourceBatchEvidence::new(
+            provider,
+            source.to_string(),
+            Some(Local::now().date_naive().to_string()),
+            Local::now().to_rfc3339(),
+            batch_id.to_string(),
+            content_byte.to_string().repeat(64),
+        )
+        .expect("test source batch")
+    }
+
+    #[test]
+    fn br210_latest_batch_observation_accepts_mixed_magic_encodings() {
+        let financial = SourceBatchEvidence::new(
+            magic_market_core::ProviderId::Sina,
+            "TEST_CODE_sina-financial".to_string(),
+            None,
+            "1785799979.851045000".to_string(),
+            "TEST_CODE_BR210_FINANCIAL".to_string(),
+            "a".repeat(64),
+        )
+        .expect("Sina fractional epoch evidence");
+        let consensus = SourceBatchEvidence::new(
+            magic_market_core::ProviderId::Eastmoney,
+            "TEST_CODE_eastmoney-consensus".to_string(),
+            None,
+            "unix-ms:1785799980851".to_string(),
+            "TEST_CODE_BR210_CONSENSUS".to_string(),
+            "b".repeat(64),
+        )
+        .expect("Eastmoney millisecond epoch evidence");
+
+        let latest = latest_batch_observed_at(&[financial, consensus])
+            .expect("mixed Magic evidence encodings must remain comparable");
+
+        assert_eq!(latest.timestamp_millis(), 1_785_799_980_851);
+    }
+
+    #[test]
+    fn consensus_projection_keeps_gateway_evidence_and_content_identity() {
+        let data = test_consensus_data("TEST_CODE_CONSENSUS", "TEST_CODE券商", "买入", 1.25);
+        let observed_at = Local::now().to_rfc3339();
+        let batch = stock_analysis::data_gateway::GatewayBatch::Available {
+            records: vec![data],
+            evidence: stock_analysis::data_gateway::BatchEvidence {
+                provider: magic_market_core::ProviderId::Eastmoney,
+                source: "TEST_CODE_eastmoney-research".into(),
+                source_at: None,
+                observed_at: observed_at.clone(),
+                batch_id: "TEST_CODE_CONSENSUS_BATCH".into(),
+            },
+        };
+
+        let projected = project_consensus_batch(batch).expect("evidence-backed projection");
+        assert_eq!(
+            projected.evidence.provider,
+            magic_market_core::ProviderId::Eastmoney
+        );
+        assert_eq!(projected.evidence.source, "TEST_CODE_eastmoney-research");
+        assert_eq!(projected.evidence.source_at, None);
+        assert_eq!(projected.evidence.observed_at, observed_at);
+        assert_eq!(projected.evidence.batch_id, "TEST_CODE_CONSENSUS_BATCH");
+        assert_eq!(projected.evidence.content_sha256.len(), 64);
+    }
+
+    #[test]
+    fn consensus_projection_rejects_cardinality_without_dropping_evidence() {
+        let data = test_consensus_data("TEST_CODE_CONSENSUS", "TEST_CODE券商", "买入", 1.25);
+        let batch = stock_analysis::data_gateway::GatewayBatch::Available {
+            records: vec![data.clone(), data],
+            evidence: stock_analysis::data_gateway::BatchEvidence {
+                provider: magic_market_core::ProviderId::Eastmoney,
+                source: "TEST_CODE_eastmoney-research".into(),
+                source_at: None,
+                observed_at: Local::now().to_rfc3339(),
+                batch_id: "TEST_CODE_CONSENSUS_BATCH".into(),
+            },
+        };
+
+        let error = project_consensus_batch(batch).expect_err("cardinality must fail closed");
+        assert!(error.to_string().contains("expected=1 actual=2"));
+    }
+
     #[tokio::test]
     async fn earnings_beat_and_miss_map_to_distinct_push_kinds() {
         let earnings_cfg = EarningsConfig {
@@ -1247,7 +1823,20 @@ mod tests {
             "TEST_CODE_EARNINGS_BEAT",
             beat_classification.as_ref().unwrap(),
             Local::now().date_naive(),
-            "TEST_CODE_FINANCIAL_PROVIDER",
+            vec![
+                test_source_batch(
+                    magic_market_core::ProviderId::Sina,
+                    "TEST_CODE_FINANCIAL_PROVIDER",
+                    "TEST_CODE_FINANCIAL_BATCH",
+                    'a',
+                ),
+                test_source_batch(
+                    magic_market_core::ProviderId::Eastmoney,
+                    "TEST_CODE_CONSENSUS_PROVIDER",
+                    "TEST_CODE_CONSENSUS_BATCH",
+                    'b',
+                ),
+            ],
         )
         .expect("same-day earnings source fact");
         assert_eq!(beat_event.push_kind, SourcePushKind::EarningsBeat);
@@ -1275,7 +1864,20 @@ mod tests {
             "TEST_CODE_EARNINGS_MISS",
             miss_classification.as_ref().unwrap(),
             Local::now().date_naive(),
-            "TEST_CODE_FINANCIAL_PROVIDER",
+            vec![
+                test_source_batch(
+                    magic_market_core::ProviderId::Sina,
+                    "TEST_CODE_FINANCIAL_PROVIDER",
+                    "TEST_CODE_FINANCIAL_BATCH",
+                    'c',
+                ),
+                test_source_batch(
+                    magic_market_core::ProviderId::Eastmoney,
+                    "TEST_CODE_CONSENSUS_PROVIDER",
+                    "TEST_CODE_CONSENSUS_BATCH",
+                    'd',
+                ),
+            ],
         )
         .expect("same-day earnings source fact");
         assert_eq!(miss_event.push_kind, SourcePushKind::EarningsMiss);

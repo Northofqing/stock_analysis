@@ -1,68 +1,18 @@
-//! 真正的 sync 版 get_market_overview (P1.1 真正修复 v4)
+//! Synchronous post-session market-overview adapter.
 //!
-//! 与 `MarketAnalyzer::get_market_overview` 的区别：所有 HTTP 用
-//! `reqwest::blocking`，完全不用 Tokio machinery；不需要 async runtime 上下文或
-//! `block_in_place`，在 `--review` 这种“调一次就退出”的场景下安全。
-//!
-//! 历史：v1 用 async client 触发 runtime drop panic；v2 改 blocking 后，构造器仍会
-//! 间接创建 runtime；v3 改为不引用 `MarketAnalyzer` 的 free function，只用 blocking client。
+//! Acquisition belongs to `data_gateway`. This adapter deliberately fails
+//! until a released Magic contract can prove one complete A-share market
+//! breadth snapshot; it never falls back to consumer-owned wire protocols.
 
-use crate::data_provider::north_flow::NorthFlowClient;
-use crate::market_data::{MarketIndex, MarketOverview, SectorInfo};
-use anyhow::{Context, Result};
-use chrono::Local;
-use log::{info, warn};
-use std::time::Duration;
+use crate::market_data::MarketOverview;
+use anyhow::Result;
+use log::warn;
 
-/// 同步版 get_market_overview, 纯 free function
-/// 不接受 MarketAnalyzer 引用, 避免 Client::builder().build() 触发 panic
+/// Synchronous review entry.
 pub fn get_market_overview_blocking() -> Result<MarketOverview> {
-    let today = Local::now().format("%Y-%m-%d").to_string();
-    let mut overview = MarketOverview::new(today);
-
-    // 1. 指数 (同步)
-    match fetch_indices_blocking() {
-        Ok(indices) => overview.indices = indices,
-        Err(e) => warn!("[大盘 blocking] 指数拉取失败: {}", e),
-    }
-
-    // 2. 北向资金 (同步)
-    match fetch_north_flow_blocking() {
-        Ok(n) => {
-            info!("[大盘 blocking] 北向资金: {:+.2}亿", n);
-            overview.north_flow = Some(n);
-        }
-        Err(e) => warn!("[大盘 blocking] 北向资金拉取失败: {}", e),
-    }
-    // 修复 P1-3: 0.0 视为数据缺失 (unwrap_or 兜底假成功), 不写入 overview
-    if let Some(0.0) = overview.north_flow {
-        warn!("[大盘 blocking] 北向资金返回 0.0 (疑似 unwrap_or 假成功), 标记为缺失");
-        overview.north_flow = None;
-    }
-
-    // 3. 板块涨跌榜 (同步)
-    match fetch_sectors_blocking() {
-        Ok((top, bottom)) => {
-            overview.top_sectors = top;
-            overview.bottom_sectors = bottom;
-        }
-        Err(e) => warn!("[大盘 blocking] 板块涨跌榜失败: {}", e),
-    }
-
-    // 4. 涨跌统计 (同步, 取首页 500 只)
-    match fetch_market_stats_blocking() {
-        Ok((up, down, flat, lim_up, lim_down, amount)) => {
-            overview.up_count = up;
-            overview.down_count = down;
-            overview.flat_count = flat;
-            overview.limit_up_count = lim_up;
-            overview.limit_down_count = lim_down;
-            overview.total_amount = amount;
-        }
-        Err(e) => warn!("[大盘 blocking] 涨跌统计失败: {}", e),
-    }
-
-    Ok(overview)
+    anyhow::bail!(
+        "盘后市场概览不可用: 当前 Magic 数据契约没有提供同一完整批次的 A 股指数、全市场广度、成交额与北向资金；BR-164 禁止回退到复盘消费端直连协议"
+    )
 }
 
 /// 生成市场概览报告文本 (在 --review 模式直接调用, 不需要 MarketAnalyzer)
@@ -75,235 +25,9 @@ pub fn generate_market_overview_text_blocking() -> String {
         }
         Err(e) => {
             warn!("[大盘 blocking] 获取失败: {}", e);
-            String::new()
+            format!("# 📊 A股市场概览\n\n数据不可用：{e}")
         }
     }
-}
-
-/// 同步拉主要指数 (腾讯财经)
-fn fetch_indices_blocking() -> Result<Vec<MarketIndex>> {
-    let url = "http://qt.gtimg.cn/q=sh000001,sz399001,sz399006,sh000300,sh000688";
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .build()
-        .context("指数 HTTP 客户端构建失败")?;
-    let text = client
-        .get(url)
-        .send()
-        .context("指数 HTTP 请求失败")?
-        .text()
-        .context("指数响应读取失败")?;
-    parse_tencent_indices(&text)
-}
-
-/// 解析腾讯财经指数响应 (v_sh000001="1~上证指数~...";)
-fn parse_tencent_indices(text: &str) -> Result<Vec<MarketIndex>> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        if let Some(start) = line.find('"') {
-            if let Some(end) = line.rfind('"') {
-                if start < end {
-                    let data = &line[start + 1..end];
-                    let parts: Vec<&str> = data.split('~').collect();
-                    if parts.len() < 5 {
-                        anyhow::bail!("腾讯指数字段不足: {}", parts.len());
-                    }
-                    let required_text = |index: usize, label: &str| -> Result<&str> {
-                        parts
-                            .get(index)
-                            .copied()
-                            .filter(|value| !value.trim().is_empty())
-                            .ok_or_else(|| anyhow::anyhow!("腾讯指数缺少 {label}"))
-                    };
-                    let required_positive = |index: usize, label: &str| -> Result<f64> {
-                        let value = required_text(index, label)?
-                            .parse::<f64>()
-                            .with_context(|| format!("腾讯指数 {label} 无法解析"))?;
-                        if !value.is_finite() || value <= 0.0 {
-                            anyhow::bail!("腾讯指数 {label} 非法: {value}");
-                        }
-                        Ok(value)
-                    };
-                    let optional_non_negative =
-                        |index: usize, label: &str| -> Result<Option<f64>> {
-                            let Some(raw) = parts
-                                .get(index)
-                                .copied()
-                                .filter(|value| !value.trim().is_empty())
-                            else {
-                                return Ok(None);
-                            };
-                            let value = raw
-                                .parse::<f64>()
-                                .with_context(|| format!("腾讯指数 {label} 无法解析"))?;
-                            if !value.is_finite() || value < 0.0 {
-                                anyhow::bail!("腾讯指数 {label} 非法: {value}");
-                            }
-                            Ok(Some(value))
-                        };
-
-                    let name = required_text(1, "name")?.to_string();
-                    let code = required_text(2, "code")?.to_string();
-                    let current = required_positive(3, "current")?;
-                    let prev = required_positive(4, "prev_close")?;
-                    let open = optional_non_negative(5, "open")?;
-                    let volume = optional_non_negative(6, "volume")?;
-                    let amount = optional_non_negative(7, "amount")?;
-                    let high = optional_non_negative(33, "high")?;
-                    let low = optional_non_negative(34, "low")?;
-                    let pct = (current - prev) / prev * 100.0;
-                    out.push(MarketIndex {
-                        code,
-                        name,
-                        current,
-                        change: current - prev,
-                        change_pct: pct,
-                        open,
-                        high,
-                        low,
-                        prev_close: prev,
-                        volume,
-                        amount,
-                        amplitude: match (high, low) {
-                            (Some(high), Some(low)) => Some((high - low) / prev * 100.0),
-                            _ => None,
-                        },
-                    });
-                }
-            }
-        }
-    }
-    if out.is_empty() {
-        anyhow::bail!("指数解析无结果");
-    }
-    Ok(out)
-}
-
-/// 同步拉北向资金
-fn fetch_north_flow_blocking() -> Result<f64> {
-    let client = NorthFlowClient::new();
-    let series = client
-        .fetch_blocking()
-        .map_err(|e| anyhow::anyhow!("北向资金拉取失败: {e}"))?;
-    let v = series.latest_total().unwrap_or(0.0);
-    Ok(v)
-}
-
-/// 同步拉板块涨跌榜 (东财 clist/get, m:90+t:2)
-fn fetch_sectors_blocking() -> Result<(Vec<SectorInfo>, Vec<SectorInfo>)> {
-    let url = "https://push2.eastmoney.com/api/qt/clist/get";
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
-        .build()
-        .context("板块 HTTP 客户端构建失败")?;
-    let resp = client
-        .get(url)
-        .query(&[
-            ("pn", "1"),
-            ("pz", "20"),
-            ("po", "1"),
-            ("np", "1"),
-            ("fltt", "2"),
-            ("invt", "2"),
-            ("fid", "f3"),
-            ("fs", "m:90+t:2"),
-            ("fields", "f1,f2,f3,f4,f12,f14"),
-        ])
-        .header("Referer", "https://quote.eastmoney.com/")
-        .send()
-        .context("板块 HTTP 请求失败")?;
-    let json: serde_json::Value = resp.json().context("板块响应非 JSON")?;
-    let diff = json
-        .get("data")
-        .and_then(|d| d.get("diff"))
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow::anyhow!("板块响应无 data.diff"))?;
-    let mut entries: Vec<(String, f64)> = Vec::new();
-    for item in diff {
-        let name = item
-            .get("f14")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("板块项缺 f14"))?
-            .to_string();
-        let change_pct = item
-            .get("f3")
-            .and_then(|v| v.as_f64())
-            .ok_or_else(|| anyhow::anyhow!("板块项缺 f3"))?;
-        entries.push((name, change_pct));
-    }
-    entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let top: Vec<SectorInfo> = entries
-        .iter()
-        .take(5)
-        .map(|(name, change_pct)| SectorInfo {
-            name: name.clone(),
-            change_pct: *change_pct,
-        })
-        .collect();
-    let bottom: Vec<SectorInfo> = entries
-        .iter()
-        .rev()
-        .take(5)
-        .map(|(name, change_pct)| SectorInfo {
-            name: name.clone(),
-            change_pct: *change_pct,
-        })
-        .collect();
-    Ok((top, bottom))
-}
-
-/// 同步拉涨跌统计 (新浪 API, 取首页 500 只)
-fn fetch_market_stats_blocking() -> Result<(i32, i32, i32, i32, i32, f64)> {
-    let url = "http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData";
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .context("涨跌统计 HTTP 客户端构建失败")?;
-    let resp = client
-        .get(url)
-        .query(&[
-            ("page", "1"),
-            ("num", "500"),
-            ("sort", "symbol"),
-            ("asc", "1"),
-            ("node", "hs_a"),
-            ("symbol", ""),
-            ("_s_r_a", "page"),
-        ])
-        .send()
-        .context("涨跌统计 HTTP 请求失败")?;
-    let json: serde_json::Value = resp.json().context("涨跌统计响应非 JSON")?;
-    let arr = json
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("涨跌统计响应不是数组"))?;
-    let mut up = 0;
-    let mut down = 0;
-    let mut flat = 0;
-    let mut lim_up = 0;
-    let mut lim_down = 0;
-    let mut amount = 0.0;
-    for stock in arr {
-        let change_pct: f64 = stock
-            .get("changepercent")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        if change_pct > 0.0 {
-            up += 1;
-        } else if change_pct < 0.0 {
-            down += 1;
-        } else {
-            flat += 1;
-        }
-        if change_pct >= 9.9 {
-            lim_up += 1;
-        } else if change_pct <= -9.9 {
-            lim_down += 1;
-        }
-        let a: f64 = stock.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        amount += a;
-    }
-    Ok((up, down, flat, lim_up, lim_down, amount / 1e8))
 }
 
 /// 生成市场概览报告 (替代 MarketAnalyzer::generate_market_review)
@@ -541,33 +265,13 @@ fn judge_market_sentiment(overview: &MarketOverview) -> MarketSentiment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::market_data::MarketIndex;
 
     #[test]
-    fn parse_tencent_indices_basic() {
-        // Provider-protocol exception: Tencent responses contain native
-        // six-digit index identifiers, which must round-trip unchanged.
-        let text = r#"v_sh000001="1~上证指数~000001~4139.90~4132.61~4125.22~50000000~5000000000";
-v_sz399001="1~深证成指~399001~12500.00~12450.00~12400.00~80000000~9000000000";"#;
-        let indices = parse_tencent_indices(text).unwrap();
-        assert_eq!(indices.len(), 2);
-        assert_eq!(indices[0].code, "000001");
-        assert!((indices[0].current - 4139.90).abs() < 1e-6);
-        assert!(indices[0].change_pct > 0.0);
-        assert!((indices[0].prev_close - 4132.61).abs() < 1e-6);
-    }
-
-    #[test]
-    fn parse_tencent_indices_empty() {
-        let text = "";
-        let result = parse_tencent_indices(text);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_tencent_indices_malformed() {
-        let text = "garbage data without quotes";
-        let result = parse_tencent_indices(text);
-        assert!(result.is_err());
+    fn blocking_overview_fails_explicitly_without_complete_magic_contract() {
+        let error = get_market_overview_blocking().unwrap_err().to_string();
+        assert!(error.contains("Magic 数据契约"));
+        assert!(generate_market_overview_text_blocking().contains("数据不可用"));
     }
 
     #[test]

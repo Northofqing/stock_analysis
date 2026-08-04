@@ -458,11 +458,11 @@ impl SelectionAuditWriter {
         // that approach turned 47 pre-existing failures into 134 by
         // silently swallowing the poison and letting the next test run
         // on partially-corrupted DB state from a prior test's panic.
-        // The cascade error is preferable to silent state corruption;
-        // the real fix is to make TestAuditRoot::new / TestFixture::new
-        // per-namespace and atomic-counter-unique (database owner work,
-        // see .planning/2026-07-31-br193-cadence-acquisition-gate-b-fix3/
-        // database-owner-brief-47-pre-existing-failures.md §3.1).
+        // The cascade error is preferable to silent state corruption. Test
+        // fixtures must physically isolate mutable SQLite files (including
+        // journal/WAL/SHM sidecars) from this marker-enforced audit container;
+        // uniqueness alone cannot prevent a sibling database mutation from
+        // invalidating the namespace marker.
         let process_guard = process_audit_lock()
             .lock()
             .map_err(|_| SelectionAuditError::Lock("process audit mutex is poisoned".to_owned()))?;

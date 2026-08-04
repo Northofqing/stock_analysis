@@ -1,5 +1,308 @@
 # Progress log
 
+## 2026-08-03 BR-203 P2-F executable recovery
+
+- Reconstructed the ignored `target/br203-candidate` compile foundation while
+  keeping the product source tree frozen. This candidate is not a Git worktree
+  or accepted commit and remains non-release evidence.
+- Closed the typed counted-binding compatibility path and the 20-template E2E
+  classification: five non-counted templates reach isolated dry-run delivery;
+  fifteen counted templates without an admitted producer are explicitly
+  `DisabledNoProducer` before the generic governor.
+- Diagnosed default-thread monitor failures as legitimate BR-192 ancestor
+  link-count revalidation colliding with concurrent sibling creation/removal
+  below `data/test`. All physical namespace/environment mutators now share the
+  existing `cooldown_memo` serial domain; the security check was not relaxed.
+- Candidate evidence: `cargo fmt --all -- --check` PASS; strict workspace
+  all-target/all-feature Clippy PASS; `cargo test --locked --bin monitor`
+  `509 passed, 0 failed, 4 ignored`; the same suite with
+  `--test-threads=1` has the identical result.
+- The first full-workspace serial run exposed a real CLI defect: `monitor
+  --test` selected Test mode before BR-144 preflight but did not install
+  `DURABLE_DELIVERY_TEST_CODE`. P2-H13 now requires a path-safe per-invocation
+  code before audit binding, separately from P2-H12's test-runtime serialization.
+  The repaired exact integration suite passes
+  `19/19`. After quarantining the candidate-only production-shaped SQLite
+  artifact to a recoverable `/private/tmp` directory, the locked library suite
+  passes `2032/0/5` and the complete locked workspace serial run exits zero.
+  The latest `cargo fmt --all -- --check` and strict workspace
+  all-target/all-feature Clippy both pass after the CLI repair.
+- Re-ran the exact Gate-C command
+  `cargo test --locked --workspace --all-targets --all-features -- --test-threads=1`.
+  The sandboxed attempt failed only because loopback fixtures could not bind
+  local ports (`Operation not permitted`); the required unsandboxed rerun
+  exited zero. Library result is `2032 passed / 0 failed / 5 ignored`, monitor
+  is `509 / 0 / 4`, `monitor_help_isolation` is `19 / 0 / 0`, and every other
+  integration/bench target completed. The process suite created no fixed
+  production durable SQLite artifact in the candidate.
+- Read-only dependency audit confirms BR-164 is still absent from the candidate:
+  only two local Magic path dependencies exist; qmt-parser is present and is
+  the sole Polars 0.52 introducer alongside root Polars 0.46; old provider
+  callers, RustDX test text and the old BR-203 dependency checker remain.
+- Remaining authority blockers are unchanged: refreeze/accept P0-A3 or P0-A4,
+  materialize P2-F as a reachable clean commit, complete BR-164/P1/P3/P4, then
+  rerun final Gate C/D, live commands, authenticated delivery, cleanup and PR.
+
+## 2026-08-03 BR-203 P0-A3 continuation
+
+- Re-read repository pre-flight rules and restored the persistent production
+  closure plan before editing.
+- Reused two independent reviewers in parallel: one owns BR-164/BR-203 commit
+  ordering and one owns exact argv/test-filter realizability. A third read-only
+  reviewer is partitioning the broad BR-164 worktree into compile-closed,
+  reversible commits.
+- Confirmed current HEAD is `96da674`; P0-M0/P0-A1/P0-A2 exist, while P0-A3
+  remains uncommitted and Gate A remains RED.
+- Confirmed Polars is already 0.54/0.54.4 and qmt-parser is absent from the
+  current target. The active blocker is commit closure and review authority,
+  not a TOML version correction.
+- Product source remains frozen while the three-document P0-A3 correction is
+  prepared. No user worktree cleanup/reset was performed.
+
+## 2026-08-02 BR-196/BR-201 and coverage convergence
+
+- Latest formal Gate-A results remain RED: BR-196 C1/I4/M1 and BR-202
+  C2/I2/M0. Their fifth scoped repairs are running in parallel, while a fresh
+  independent BR-201 reviewer recomputes the repaired design. No product-code
+  implementation has been authorized from these RED designs.
+- BR-196's current blockers are the missing BR citation on its target allowlist,
+  false-active VirtualWatch state, an omitted direct health-webhook
+  presentation, non-reproducible evidence/source binding and incomplete public
+  API migration inventory.
+- BR-202's current blockers are an incomplete compilation/test input manifest,
+  non-terminal publication durability, missing exported object/executable bytes
+  and a circular behavior denominator that cannot detect an omitted decision.
+- The first BR-201 v5 reviewer completion message accidentally answered the
+  user's concurrency question instead of returning a formal verdict. It was
+  rejected as review evidence and the reviewer was immediately reopened with a
+  mandatory C/I/M verdict contract; Gate A remains RED/pending.
+- The latest in-flight Rule-2.10 checker now fails only three hard paths, all
+  BR-201 future Gate-B files (`br201_paper_exit_store.rs`, the rollback verifier
+  and its integration test), plus 132 historical/non-blocking citation
+  warnings. BR-196's config citation and BR-202's current-doc-only row no longer
+  contribute hard errors. This remains a Gate-A blocker for BR-201, not a pass.
+- BR-201 v5 formal review is RED C2/I5/M0. The fifth repair now owns Git
+  tracking/spec-only registration, missing total account reasons, the public
+  `paper_trade::simulate` bypass, legacy UTC/timezone/idempotency normalization,
+  coherent DualRead/V1Primary eligibility and rollback from an exact clean
+  deployed source tree. Previously verified hash/debounce/supersession facts are
+  retained but are not enough to cross Gate A.
+- BR-201's fifth docs/rule repair is complete: its exact design is staged,
+  current Rule 2.10 passes with 198 rules/130 historical warnings and no BR-201
+  hard error, while shared business rules remain unstaged. A fresh v6 reviewer
+  is independently rechecking the repaired reason totality, private execution
+  authority, legacy time/cutover and detached rollback contracts.
+- BR-201 v6 formal review is RED C1/I7/M0. Its sixth repair is now confined to
+  the deployed rollback trust root, admission terminology, nested private
+  SQLite owner, takeover transitions, nonoverlapping reason/result mapping,
+  atomic Confirmed-audit sequencing, Rule 2.3 PR evidence and bounded current
+  API commands. Gate B remains closed.
+- BR-202's fifth docs/rule repair is complete. The exact design file is now
+  staged and `git ls-files --error-unmatch`, staged/unstaged whitespace checks
+  pass; the shared `business_rules.md` remains MM and was not broadly staged.
+  A fresh v6 independent reviewer is active. No Cargo, production-evidence or
+  Gate-A success claim was inherited from the repairer.
+- BR-196's fifth docs/rule/config-citation repair is complete. The exact design
+  is staged and passes tracking/whitespace checks; shared business rules and the
+  empty allowlist config were not broadly staged. A fresh v5 independent formal
+  reviewer is active. The known manual-contains Clippy debt, absent banners and
+  absent 2026-08-02 production evidence remain explicit blockers.
+- BR-196 v5 formal review is RED C1/I2/M0. Its sixth repair is confined to the
+  exact PR-tracked source/config/rule preimage, a path-bounded full public API
+  audit beyond push/dispatch functions, and refreshed compliance output bound
+  to checker/rule/config bytes. Gate B remains closed.
+- While the three design/review lanes remained docs-only, the shared product
+  state was recompiled with `cargo check --locked --bin monitor`; it passed in
+  8.00s. This is a build-regression checkpoint only, not Gate-A, runtime-data,
+  delivery or release evidence.
+- The first BR-202 v6 reviewer turn failed at the external agent service with
+  HTTP 403 before reviewing files. It was recorded as infrastructure failure
+  and immediately retriggered; it provides no Gate-A evidence.
+- The v6 retry hit the same external 403. A new v7 reviewer was started with an
+  isolated, self-contained context to avoid carrying the oversized history;
+  the two failed turns still provide zero review evidence.
+- BR-202 v7 formal review is RED C1/I4/M1. The sixth repair now owns portable
+  archive/terminal semantics across CI permission loss, linker/SDK/host-tool
+  input closure, a concrete D/M extractor CLI, tracked-only invocation rows,
+  complete top-20 evidence and index-ready BR registration. Gate B remains
+  closed.
+- BR-201 v7 formal review is RED C1/I7/M1. A seventh docs-only repair now owns
+  the immutable race-free rollback bootstrap, closed private Admission handoff,
+  reason-specific nullable provenance, exhaustive symbol/path/schema inventory,
+  durable legacy alias inputs, deterministic proposal ordering and one minimal
+  shared-registry GFM repair. Shared BR-201/BR-134 rows remain unstaged until all
+  concurrent business-rule writers finish; Gate B remains closed.
+- While these reviews remained docs-only, the root baseline also passed
+  `cargo fmt --all --check`, `cargo check --locked --bin monitor` and
+  `cargo test --locked --bin monitor --no-run`. These checks prove formatting
+  and buildability only, not runtime delivery or same-day production evidence.
+
+- Fresh independent reviews are still active and have already found new
+  candidate Important defects in every repaired design. BR-196's 36-chain
+  count appears to retain at least eleven callerless shapes; BR-201 has
+  reason/state/generation/audit-atomicity candidates; BR-202 has CI and
+  artifact-lifecycle candidates. All three remain at Gate A pending final
+  evidence and rework.
+- BR-196 formal review is final RED C2/I2/M0. At least eleven additional
+  retained shapes have no non-test upstream caller; the proposed registry
+  bijection cannot prove reachability; no complete startup no-producer banner
+  contract exists; and Gate C still has the allowlist BR citation failure. A
+  third docs/business-rule repair is active with no Gate B edits authorized.
+
+- Re-audited the shared worktree before continuing parallel edits. It remains
+  an intentionally broad migration (231 tracked paths in the current diff plus
+  untracked design/source/test artifacts); no cleanup/reset is authorized.
+  `git diff --check` passes. Active agents are confined to separate BR-196,
+  BR-201 and BR-202 design paths, with only BR-201 authorized to touch the
+  BR-134/BR-201 business-rule rows.
+- Re-ran the current shared-state binary compilation while the three Gate A
+  repairs were docs-only: `cargo check --locked --bin monitor` passed in 0.82s.
+  This is a compile regression check only and does not override any RED Gate A
+  or prove production delivery.
+- Re-ran `cargo test --locked --bin monitor br196_ -- --test-threads=1`:
+  21/21 pass. These tests still encode the lifecycle/cardinality model that
+  production-caller evidence has invalidated, so they are regression-only and
+  must be revised after BR-196 Gate A is accepted; a green self-consistency
+  suite is not lifecycle truth.
+- `cargo fmt --all -- --check` passes against the current shared code state.
+  This is an interim formatting gate; it must be repeated after all accepted
+  Gate B changes converge.
+- BR-196 Gate-A repair has provisionally reconciled the caller graph to 36
+  existing proved chains, 14 Disabled legacy declarations and two newly
+  registered real inline shapes, for 38 proposed production descriptors. The
+  exact design/row and independent review are still pending.
+- Synchronized the repaired BR-196 rule into `docs/business_rules.md` after one
+  non-mutating failed long-line match. The corrected exact replacement leaves
+  one BR-196 row, removes the stale 50-descriptor/A48/A50 authority claims, and
+  passes scoped `git diff --check`.
+- Interim strict Clippy is RED with one observed error:
+  `src/bin/monitor/br196_test_delivery.rs:278` uses `iter().any()` where
+  `GOVERNANCE_SMOKE_IDENTITIES.contains(...)` is required by
+  `clippy::manual_contains`. The repair is deferred until BR-196 Gate A passes;
+  no lint allow will be added.
+- Rechecked current-date production evidence for 2026-08-02: both
+  `data/push_log/2026-08-02/` and `data/event_bus/2026-08-02.jsonl` are absent.
+  BR-196/BR-201 therefore have no current-date production Gate-D evidence;
+  tests and dry-run logs remain ineligible substitutes.
+
+- A production-caller audit superseded the previously claimed BR-196 manifest
+  cardinalities: at most 36 registered shapes have proved production callers;
+  two initially counted shapes lack their claimed production owner, the other
+  false-active descriptors must be disabled, and two real production shapes are absent.
+  A design-only Gate A repair is recomputing shape/cardinality contracts before
+  formal re-review; the earlier passing dry-run is retained only as regression
+  evidence.
+- BR-201's prior six Important and one Minor findings were remediated in the
+  design, but fresh formal review returned C0/I6/M0 on six new contradictions:
+  canonical-record cardinality, the two required five-second quote gates,
+  JSONL durability recovery, crashed-reconciler takeover, BR-134 fixed-20
+  semantics and release-manifest preimage. A docs/business-rule repair is now
+  active; implementation remains prohibited until a later review returns C0/I0.
+- BR-202 formal Gate A review returned C0/I4/M0. The four blocking defects are
+  an evidence command that self-counts, impossible same-commit self-SHA
+  attestation, missing inventory generation in the wrapper, and an unfrozen
+  zero-instrumented exception that omits 35/408 current Rust sources. A
+  design-only repair is active in parallel.
+- Independently inspected the current coverage checker and tests. The current
+  code still uses 15 raw core prefixes and three basic regression cases; it has
+  none of the proposed complete inventory, exact report schema/sum checks,
+  zero-instrumented proof, compiler/show/hash reconciliation or isolated
+  fixed-SHA wrapper. This confirms implementation has not silently outrun Gate
+  A and defines the later Gate B change surface.
+- BR-202's docs/business-rule repair now specifies a non-self-counting debt
+  probe, source-SHA-bound dep-info/show/zero proof, artifact generation before
+  hashing, fail-closed empty bootstrap and a physically possible source commit
+  followed by docs-only attestation. Scoped uniqueness/byte-equality and diff
+  checks pass; a fresh independent reviewer is active.
+- BR-201's second docs/business-rule repair now claims exact 26-field audit
+  records, two five-second quote gates, repeat-sync JSONL recovery, same-phase
+  reconciler takeover, manual-confirmed/N-A >20% admission and a typed ordered
+  commit preimage. A fresh independent reviewer is recomputing all hashes and
+  transitions; Gate B remains closed.
+- Independently reproduced the claimed BR-201 and BR-134 rule-line hashes by
+  hashing exact matched row bytes after removing the line terminator. This
+  resolves the apparent mismatch with newline-inclusive `rg | shasum`, while
+  leaving formal review to verify that the preimage is documented unambiguously.
+- The old coverage checker baseline suite passes 3/3 with
+  `cargo test --locked --test test_coverage_thresholds -- --test-threads=1`.
+  Because those tests cover only prefix inclusion/basic threshold behavior,
+  the pass is not evidence for the proposed BR-202 contracts.
+- `bash tools/compliance/lib/check_business_rules.sh` is currently RED with 3
+  blocking errors and 124 historical warnings. Blocking debt is exact: the
+  coverage test lacks a BR-202 citation, the BR-202 isolated wrapper does not
+  exist yet, and the BR-196 allowlist config lacks a BR-196 citation. These are
+  deferred to their accepted Gate B implementations; both formal reviewers
+  received the evidence.
+
+- BR-196 formatting and focused acceptance tests pass 20/20. The production
+  registry/closed manifest, six-governance-smoke validator, pinned target
+  authority, production-target deny, ephemeral batch permit, spawn-time clock
+  recheck, receipt audit and layered summary are present.
+- The BR-196 quiet-hour repair is complete: invocation-scoped typed smoke
+  authority uses a fixed verified Shanghai daytime instant only for the exact
+  six governance tuples, while the ordinary governor remains quiet-hour
+  denied. Focused tests pass 21/21 and `monitor_help_isolation` passes 26/26.
+  The bounded `--test --push-dry-run` command exits zero with A48/D13/R3/T64,
+  rendered=48, smoke=6/6 and zero process/batch/receipt activity.
+- Live BR-196 Gate D remains externally blocked because no separately reviewed
+  non-production Feishu conversation is configured. The current real target is
+  hash-only classified as `production_deny`; no live message was sent.
+- The earlier BR-201 Gate-A review was RED with 0 Critical, 6 Important and 1
+  Minor. Those findings are now represented as remediated design debt pending
+  the fresh formal review above.
+- Added the Gate-D coverage closure design and marked the 2026-07-18 plan
+  historical. The honest planning baseline includes `src/broker.rs` and
+  `src/calendar.rs`: global 149,200/189,647 (78.67%) and core
+  121,404/155,308 (78.17%), leaving at least 2,518 global and 26,139 core
+  covered lines. BR-202 registration and independent Gate-A review are still
+  blocking.
+
+## 2026-08-01 R-08/A-10 closure and runtime-gap audit
+
+- Closed all five Important findings from the independent R-08/A-10 review:
+  verified-empty terminal replay, exact CFFEX reminder-date projection and
+  canonical ordering, truthful missing CNInfo category rendering, public-only
+  R-08 transition lineage, and schema-v4 A-10 source-batch delivery binding.
+- Focused evidence passes: R-08 26/26, BR-160 source-batch envelope/durability
+  3/3, monitor governor lineage 1/1, CFFEX formal-admission 1/1 and startup
+  reconciliation 1/1. `cargo fmt --check` and `git diff --check` pass.
+- Added the missing BR-199 citation to the CFFEX gateway. The business-rule
+  checker now exits zero; its remaining output is historical warning-only.
+- BR-201 Gate A was revised after four Important objections. It now specifies
+  fixed `+08:00` fail-closed calendar authority, an unforgeable engine permit,
+  lazy risk-context loading, pre-provider and pre-side-effect revalidation,
+  11:30/15:00 TOCTOU behavior and explicit legacy/BR-154 disposition. Fresh
+  independent acceptance is still running; implementation has not crossed the
+  Gate A boundary.
+- The `--test` audit confirmed that 40 renderer previews are not the production
+  template closed set. LimitBoards, six normalized source cards and the real
+  R-08 renderer are omitted; six smoke paths discard PushOutcome. BR-196 Gate A
+  is being repaired in parallel before production code changes.
+- The existing coverage snapshot is a real Gate-D blocker and is stale relative
+  to the current worktree. It reports 149,200/189,647 global lines (78.67%, at
+  least 2,518 additional covered lines needed for 80%) and 67,101/84,179
+  registered core lines (79.71%, at least 12,870 needed for 95%). The core gap
+  is systemic, concentrated in `data_gateway` and `database`; thresholds and
+  denominators will not be weakened.
+- Broadened the core coverage registry to include the omitted production
+  `auth`, monitor binary, durable-delivery, market-analyzer, monitor, portfolio
+  and selection paths. Against the stale snapshot the honest core result is
+  121,025/154,838 = 78.16%; this remains diagnostic until coverage is regenerated.
+
+## 2026-08-01 root continuation recovery
+
+- Re-read the repository-wide mandatory instructions and restored the persistent
+  unified-migration plan before changing product code.
+- Confirmed the worktree is intentionally large and dirty; unrelated user
+  changes will be preserved and no destructive Git cleanup will be used.
+- The active closure order is BR-192 metadata review, BR-193 cadence/acquisition
+  Gate B, BR-194 durable-delivery Gate B, then dynamic price-limit Gate A and
+  complete Gate C/D runtime evidence.
+- Fixed-20% behavior remains frozen at Gate A because current `AGENTS.md` 2.3
+  mandates manual confirmation while the user has explicitly requested a
+  market-regime-aware rule. No implementation change will cross that unresolved
+  design/authority boundary.
+
 ## 2026-07-29 BR-192 recovery-state Gate A repair
 
 - Parallel independent re-review returned 0 Critical / 2 Important, so BR-192
@@ -766,3 +1069,958 @@ B. 让 `inspect_selection_with_audit_for_test` 增加 contradiction 检测：当
 ### 剩余 45 个 selection_v2_repository 失败
 
 单独跑 PASS、namespace 内跑 FAIL（与 global_schema_v1 同模式）。根因未深入调查；可能是 process-local OnceLock、temp 文件竞争、或 wall clock 影响。需独立 PR 由 database context owner 调查（不能在 BR-193 scope 内静默修复、削弱断言或 `#[ignore]`）。
+## 2026-08-01 BR-192 metadata correction
+
+- Fresh reviewer result was RED C0/I1/M0 because counted PushKinds without a
+  real producer had no closed exact startup banner contract.
+- Amended and exact-staged only the BR-192 design, plan, and BR-192 business
+  rule row. The catalog now covers all 15 `PushKind::ALL` values exactly once,
+  freezes five enabled target seams and ten disabled reason codes, validates
+  before acquisition/sink, and defines executable static/runtime tests.
+- Staged identities awaiting fresh independent review: design blob
+  `1577ca552239340143ece07cfb03415e621dfea3`, plan blob
+  `5a6e230a9b06b299eb66ca095b56234c10cfd845`, BR-192 row SHA-256
+  `9dde6d41e24d265ab1f102ec103166ff1ab90d9493864f49251f32de15525c11`.
+- BR-193 Gate B remains blocked by its own current-spec fresh Gate A review;
+  existing scheduler tests 10/10 and cadence journal tests 3/3 pass, but only
+  cadence receipt persistence exists.
+## 2026-08-01 BR-194 minimal Gate B correction
+
+- Removed out-of-contract `terminal_replay_classification_failed`; infra
+  classification failure now maps to the frozen
+  `terminal_replay_evidence_unavailable` reason.
+- Release verifier now checks all historical completion reasons; compliance
+  mutation logic locks the exact six-reason set; focused BR-194 tests,
+  `cargo fmt --all -- --check`, monitor check and focused clippy passed in the
+  implementer run.
+- Fresh independent Gate B review is in progress. Full workspace Gate C/D,
+  coverage and production replay evidence remain pending.
+## 2026-08-01 continuation: independent review infrastructure
+
+- BR-193 fresh Gate A review returned RED `C3/I4/M1`; production implementation
+  remains blocked. A read-only revision-proposal agent is preparing alternatives
+  that address every finding before any spec edit.
+- BR-192 fourth independent review failed before sampling with backend HTTP 403.
+  The same reviewer was retriggered against the unchanged staged identities; no
+  Gate was bypassed.
+- BR-194 first independent review also failed before sampling with backend HTTP
+  403. A new independent reviewer instance was dispatched against the current
+  five-file Gate B diff. Gate B remains unapproved until an independent report
+  reaches `C0/I0`.
+- Root independently rechecked the unchanged BR-192 staged identities:
+  design `44fd3a8c...`, plan `fd3dd424...`, and exact BR row
+  `9dde6d41...`; all match the review brief and `git diff --cached --check`
+  passes. This is dispatcher evidence only and does not replace fresh review.
+- BR-192 independent review failed a third time at the same backend HTTP 403,
+  including a fresh alternate-model instance. Further identical retries are
+  paused under the three-strike protocol; Gate A remains open.
+- Root BR-194 pre-review validation is green: static checker PASS, monitor
+  terminal replay tests `14/14`, library BR-194 tests `3/3`, and process
+  isolation tests `3/3`. These results do not replace fresh Gate B review.
+- Root also confirmed `cargo fmt --all -- --check`, `git diff --check`,
+  `cargo check --bin monitor`, and `cargo clippy --bin monitor -- -D warnings`
+  all exit 0 against the current worktree.
+
+## 2026-08-01 BR-192 focused RED-to-GREEN repair
+
+- Reproduced all three deterministic failures independently before editing.
+- Updated the R-08 observable binding assertion to preserve the explicit missing
+  broker placeholder and verify the following user-confirmed holding.
+- Updated the R-04 static assertion to require only the source-only counted seam.
+- Added an internal `CountedCombinedAccount` governance-context marker so generic
+  counted calls fail closed while explicit counted bindings retain the same account
+  governance context.
+- The three exact regression tests now pass individually; full BR-192/BR-194
+  regression and Gate C checks are running next.
+- Full BR-192 monitor regression: 67 passed, 0 failed, 3 ignored.
+- BR-194 regression: monitor 32/32, library 3/3, process isolation 3/3;
+  independent Gate B review returned GREEN C0/I0/M0.
+- `cargo fmt --all -- --check`, `git diff --check`, `cargo check --bin monitor`,
+  and `cargo clippy --bin monitor -- -D warnings` pass after the repair.
+- Full compliance is still RED only at §2.10: five BR-193 active-path citation
+  errors and one unparseable BR-192 code-path entry. All other compliance
+  checks in that run passed. Two independent read-only audits are resolving the
+  registration root causes before any metadata edit.
+- Independent audits confirmed the §2.10 roots. BR-193 is now truthfully marked
+  `spec-only`; no future target source file received a false BR-193 citation.
+- The business-rule parser now preserves literal pipes in intent text and reads
+  the final code-path column. BR-192 worktree/index row hashes remain identical.
+- `bash tools/compliance/check.sh` now exits 0 with all blocking checks PASS.
+
+## 2026-08-01 full library regression
+
+- Ran `cargo test --lib -- --test-threads=1` against the current worktree.
+- Result: 2266 passed, 44 failed, 7 ignored (exit 101).
+- The failures are being split by first-cause ownership: two global-schema
+  fixture/sidecar failures; a selection audit namespace failure followed by
+  process-mutex poison cascades; and independent event, chain, activation,
+  outcome, persistence, and schema fixture/interface regressions.
+- No assertion was weakened or ignored. Three independent read-only diagnosis
+  tasks are reproducing the first failures before any Gate B repair.
+
+## 2026-08-01 runtime command validation and R-04 diagnosis
+
+- A later serialized full-workspace run is current GREEN: library 2313 passed
+  with 7 ignored, monitor 523 passed with 4 ignored, and all other workspace
+  targets exited zero.
+- `cargo run --bin monitor -- --test` exits zero in an isolated TEST_CODE
+  namespace and completes the v70 E2E marker.
+- `cargo run --bin monitor -- --review` remains RED with exit two. The R-04
+  `unix-ms` provenance parser defect is fixed test-first; the next run proves
+  provider acquisition and canonical preparation succeed.
+- Root-cause tracing now places the remaining R-04 failure before BR-194 L5:
+  preparation accepts and preserves canonical `unix-ms:<epoch>`, while the
+  durable binding revalidator accepts only RFC3339. The exact review audit
+  reports `counted_source_only_binding_invalid`; the earlier DataMode hypothesis
+  was rejected before any governance change. A shared strict parser and a
+  prepare-to-durable regression are the active repair.
+- R-09 remains an explicit current-date-only provider capability failure on a
+  weekend effective review date. Account-bound tasks remain separately blocked
+  by the missing verified broker batch plus same-batch trade-sync watermark.
+
+## 2026-08-01 BR-199 R-08 public SourceOnly Gate B
+
+- R-08 is now a real `SourceOnly` review task and executes in the public-source
+  phase before account-gated outcomes.
+- Production R-08 reads only CNInfo announcements, the mandatory CFFEX official
+  delivery batch, Sina indices and Sina FX; account, local portfolio and virtual
+  holding inputs are absent from its dispatcher, binding and renderer.
+- The reminder date uses the next trading day rather than the next calendar day.
+- A dedicated fixed-kind delivery entry validates exact canonical provider,
+  batch, projection, transition, origin and rendered-text bindings again before
+  Launch/L5, durable admission or sink access.
+- Focused evidence is green: BR-199 monitor tests `10/10`, BR-194 monitor tests
+  `32/32`, futures-delivery library tests `8/8`, monitor suite `538/538`, focused
+  static compliance PASS, and `cargo clippy --bin monitor -- -D warnings` PASS.
+- The first full-workspace run exposed one unrelated stale BR-174 frozen-hash
+  fixture (`2315` passed, `1` failed, `7` ignored); its schema and nested
+  evidence match the frozen design, so the deterministic golden is being
+  corrected before Gate C is rerun. BR-199 Gate C/D and real review evidence
+  remain pending and are not claimed complete.
+
+## 2026-08-01 business-runtime closure evidence
+
+- BR-200 adds a read-only durable terminal preflight keyed by the exact review
+  occurrence. R-04 and R-09 now hydrate the original delivered snapshot without
+  provider acquisition, durable admission, or another physical sink call.
+- BR-160 A-10 delivery now uses a narrow `SourceBatchEvidence` gate that binds
+  the business date, `chain-batch:` identifier and lower-case SHA-256 content
+  hash. It does not synthesize or require account metrics, and its L7 payload
+  retains the exact source-batch identity.
+- A real `cargo run --bin monitor -- --review` run for effective review date
+  2026-07-31 exited zero: R-04 delivered by terminal reuse, R-09 delivered by
+  terminal reuse, and A-10 rebuilt 98 Magic TDX metadata records plus 1,899
+  memberships and obtained a validated Feishu receipt. R-03 remained an
+  explicit missing-broker-evidence failure and R-08 remained an explicit
+  CFFEX-Unsupported failure.
+- A subsequent `cargo run --bin monitor -- --test` exited zero in the isolated
+  test database: 40/40 templates rendered and all three real Feishu validation
+  batches returned validated receipts with zero skipped or failed batches.
+- The process-isolation regression uses the real `MONITOR_AUTH_REQUIRED=0`
+  switch instead of the nonexistent `MONITOR_OPERATOR_AUTH_REQUIRED`; its
+  focused suite passes 8/8.
+- These runtime results prove the business command paths, but Gate D remains
+  open until the final merged worktree passes strict Clippy, full workspace
+  tests, compliance and fresh 80%/95% coverage thresholds.
+
+## 2026-08-01 BR-196 / BR-201 final closure work
+
+- Historical note superseded on 2026-08-02: an earlier review accepted BR-196
+  at C0/I0 and Gate B added a 64-family/58-kind projection, but fresh complete
+  production-presentation review invalidated that acceptance. The registry
+  still contains 50 descriptors and focused tests remain useful regression
+  evidence; neither proves the complete current presentation inventory.
+- BR-196 is not complete: 38 production presentation callers still bypass the
+  token gateway; the exact six governance-smoke outcomes are not yet a closed
+  prerequisite; and the current direct test transport still lacks the accepted
+  opt-in, non-production target allowlist, one-shot permit and Command-spawn
+  TOCTOU checks.
+- BR-201's latest design revision closes the unsafe reconciler takeover by
+  requiring an exclusive process-owner lock plus an explicit durable handoff or
+  a persisted prior-owner-death proof. Live `Collecting`/`Sealed` attempts are
+  not eligible for freezing based on age, PID or retry count. Exact Gate-D
+  canary commands and current-code evidence are being finalized before a fresh
+  independent Gate-A review.
+- Cleanup audit confirms production source, config and Cargo metadata contain
+  no RustDX or qmt-parser dependency; all 14 Magic crates use `=0.2.0` at one
+  revision. Remaining cleanup is historical provider prose, unused
+  `PUSH_VERBOSE` semantics, four dead configuration fields and README runtime
+  claims. Threshold/config removals require a separate Rule 2.9/2.10 Gate A;
+  historical incident/audit evidence must be preserved or explicitly marked
+  superseded rather than silently deleted.
+- The current release Feishu identity was resolved without spawning a process
+  or network call and only its domain-separated hash was stored in BR-196's
+  `production_deny` manifest. No distinct test conversation exists, so the
+  non-production allowlist stays empty and bare live `--test` remains correctly
+  fail-closed; it must not relabel the production destination to make Gate D
+  green.
+- The latest available coverage report is stale but quantifies the lower bound:
+  global 149,200/189,647 (78.67%, 2,518 lines short) and core
+  121,025/154,838 (78.16%, 26,072 lines short). A new report is mandatory after
+  BR-196/BR-201 because their files change both coverage and the denominator.
+
+## 2026-08-02 BR-202 second formal Gate A review
+
+- Independent review returned `C0/I5/M1`; Gate B remains closed.
+- The reviewer independently confirmed the repaired inventory facts: 36
+  directory entries, 29 root files, 16 top-level bins, all 408 Rust sources
+  uniquely classified, 12 non-self historical-plan grep matches, and one
+  byte-identical BR-202 rule row in the design and business-rule registry.
+- Six design defects remain: `.github/workflows/coverage.yml` and README still
+  invoke the raw gate; the isolated wrapper lacks trap/export/cleanup ordering;
+  the five capability categories are not a complete machine-enforced behavior
+  registry; attestation checks Git shape but does not recompute the JSON claims;
+  production stores, credentials and environment variables are not frozen into
+  closed deny/allow sets; and the strict integer parser lacks an exact maximum.
+- Current implementation/compliance evidence is still RED: the BR-202 test file
+  lacks its rule citation, the declared isolated wrapper does not exist, no
+  current-date Gate-D push/event evidence exists, and no fresh full coverage run
+  has been produced.
+
+## 2026-08-02 — Gate baseline and focused failure isolation
+
+- `cargo fmt --all --check`, `cargo check --locked --bin monitor`, and
+  `cargo test --locked --bin monitor --no-run` pass.
+- Full monitor tests are RED: 568 total, 562 passed, 2 failed, 4 ignored.
+  The failures are the BR-196 allowlist release hash assertion and the R-08
+  counted-binding dispatcher contract assertion.
+- Both failures reproduce as one-test focused runs with the full module path.
+  A prior abbreviated `--exact` command selected zero tests and is not counted
+  as evidence.
+- Rule 2.10 currently passes, while the dedicated BR-194 checker fails because
+  it still searches for the removed public
+  `push_r08_source_only_with_binding` marker.
+- `docs/business_rules.md` plus the three BR-196/201/202 designs now form a
+  whitespace-clean staged Gate-A candidate. Independent reviewers remain
+  unavailable because fresh agent starts return HTTP 403; no Gate-A acceptance
+  is claimed.
+
+## 2026-08-02 — BR-202 seventh formal Gate-A review
+
+- Formal verdict: `REJECT C3/I2/M0`; Gate B remains closed.
+- HEAD inventory is `391 Rust files / 35 directories / 26 roots`, while the
+  design's `408/36/29` figures came from the dirty worktree and chain through
+  unfinished BR-196/BR-201. CLAUDE's no-spec-on-unverified-gate rule blocks
+  BR-202 until prior gates close.
+- The frozen extractor has no successful path on stable Rust 1.95 because both
+  `-Zunpretty=expanded` and rustdoc JSON need unstable support while the design
+  forbids bootstrap/a second compiler.
+- The critical `target/coverage` lifecycle JSONL lacks cross-process locking,
+  full-chain/tail validation, hash chaining and five-year retention.
+- The actual combined index cannot satisfy the design's BR-202-only two-blob
+  premise. The PR template also omits a spec section and red lines 2.2/2.8/2.9.
+- No fresh Gate-D behavior evidence or same-covered-binary Disabled banner
+  exists; no release-readiness claim was made.
+
+## 2026-08-02 BR-201 third formal Gate A review
+
+- Independent review returned `C0/I9/M0`; Gate B remains closed.
+- The reviewer reproduced all 23 current-state evidence commands and all four
+  frozen hashes, and confirmed the 26-field first-record/hash-chain contract,
+  double quote-freshness boundary, and unique BR-134/BR-201 rows.
+- Nine Important defects remain: the audit type cannot be chosen before reading
+  debounce; `manual_confirmation_required` is absent from the closed reason
+  set; basis-point rounding/residue rules are missing; BR-086 requires both
+  preconfirmed and atomic audit identities; JSONL `Claimed` recovery has no
+  exclusive owner/generation/death-proof contract; exact `old+1` generation
+  wedges after consecutive recovery crashes; joined-order fact kinds and row
+  cardinality are open; rollback incorrectly treats a local rebuild as release
+  authority and creates no new signed attestation; and no admitted real adapter
+  can emit `Br134AccountEvaluationBatchV1`.
+- There is no current-date BR-201 push/event evidence, implementation symbol or
+  disabled banner. This truthfully proves Gate B has not begun, not readiness.
+
+## 2026-08-02 BR-196 fresh formal Gate A review
+
+- Formal verdict is `C0/I4/M0`; Gate B remains closed.
+- The 50 declared descriptors independently reproduce as 26 Active and 24
+  Disabled, but a third registry-external Active presentation exists: forced
+  replay assembles in `src/event/replay.rs`, routes through `main.rs`, and sends
+  through raw `notify::push_wechat`. Therefore the proposed 66-shape inventory
+  is incomplete and any target matrices must include or explicitly govern it.
+- The audit table stops several Active chains before their actual gateway and
+  uses a non-executable `<symbol>` command without pasted output or a source
+  revision/tree binding. It is not reproducible evidence under CLAUDE.md.
+- Current public visibility/removal/replacement changes in notification and
+  wrapper APIs contradict the design's no-API-change claim and require an
+  explicit compatibility/migration/rollback disposition.
+- The canonical BR-196 row includes literal `<Disabled|SpecOnly>`; the pipe
+  splits a GFM table cell. Its Code/old-module paths also omit replay and the
+  public API migration.
+
+## 2026-08-02 BR-202 fresh formal Gate A review
+
+- Formal verdict is `C0/I7/M0`; Gate B remains closed.
+- Inventory and math remain valid planning facts: 408 Rust files, 36 directory
+  classes, 29 roots, 16 bins, Core 398/GlobalOnly 10, global deficit 2,518 and
+  provisional core deficit 30,654. They are not fresh Gate D evidence.
+- Raw llvm-cov can remain diagnostic; an external binary cannot be forced to
+  exit 2 by the wrapper. The enforceable boundary is that only the wrapper can
+  mint verified release authority/PASS, reconciled with the engineering rules.
+- Failure evidence needs a durable diagnostic root pinned before any temporary
+  worktree/export. File membership is not behavior completeness; authoritative
+  business registries and audited residual identities must generate clusters.
+- Report hashes/counters are insufficient without covered binary/object,
+  profraw/profdata, mapping/build-manifest and toolchain/source bindings.
+- A new empty CARGO_HOME plus offline mode cannot build Git-pinned Magic crates;
+  a verified vendor or read-only dependency snapshot is required.
+- BR-202 omitted its entrypoint test path, and the standalone JSON to verified
+  bundle upload is a real artifact/caller migration that must be versioned.
+
+## 2026-08-02 BR-201 fresh formal Gate A review
+
+- Formal verdict is `C1/I7/M0`; Gate B remains closed.
+- Critical: current four-rule orders use legacy `plan_id` directly for the
+  reservation, while the design proposed a domain-separated V1 intent hash.
+  Without dual lookup/uniqueness and a cutover fence, the same business intent
+  can cross the deployment boundary under two identities and evade the 60-second
+  idempotency rule.
+- Account decimal/fen/bps validation failure paths lack one-to-one closed reason
+  codes. Signed rollback bytes do not yet prove that every named deep change was
+  exactly reversed without piggyback edits.
+- BR-134 still requires eager `PaperRiskContext` and attempting all exits while
+  BR-201 requires lazy real account capture and stopping side effects after a
+  permit expires. A scoped supersession is required rather than competing MUSTs.
+- Persistent debounce lacks a first-deployment genesis/null/seed contract, and
+  public `run_once(PaperRiskContext)` lacks a versioned permit entry plus a
+  source-compatible fail-closed shim/caller migration.
+- Rule 2.10 omits order safety, risk adapter, order audit, concrete storage/
+  migration and rollback-verifier paths. Real provider/banner/current production
+  evidence remains absent and cannot count as green.
+- Previously repaired scheduler ordering, 27-field hashes, integer allocation,
+  BR-086 atomicity, recovery generations and joined-fact contracts independently
+  passed and must not regress.
+
+## 2026-08-02 BR-201 latest realizability review
+
+- Fresh independent verdict is `REJECT C2/I3/M0`; Gate B remains closed.
+- The authoritative open-attempt schema cannot represent the required engine
+  phase, reconciliation ownership/generation, snapshot and pending-terminal
+  recovery state. The delivery schema likewise cannot represent attempt/claim
+  identities or pending receipts for the required
+  `Sending -> AckPending -> DeliveredAcked` transition.
+- The claimed exhaustive identifier inventory omits
+  `PaperExitSessionAudit`, `PaperExitAttemptReconciler` and
+  `PaperExitEventOutbox`; its extractor cannot discover those suffixes.
+- The external root-owned rollback bootstrap has no tracked source/package/
+  installation path in the proposed Gate-B slice, and the design asks it to
+  write a private-bin type it cannot own reproducibly.
+- The design defines AC-01 through AC-14 but its exact marker check requires
+  13 markers. This makes the current acceptance predicate self-contradictory.
+- Independent checks still reproduced the staged canonical registry text and
+  frozen hashes and confirmed no current implementation/evidence exists; these
+  are planning integrity facts, not Gate-A acceptance.
+
+## 2026-08-02 corrected closure order
+
+- Repository rule `CLAUDE.md` section 2 forbids spec-on-unverified-gate
+  chaining. BR-192 is the earliest unclosed batch, so BR-196, BR-201 and
+  BR-202 cannot enter implementation before the preceding batch reaches Gate C.
+- The active order is now BR-192 Gate A/B/C, BR-196 Gate A/B/C, BR-201
+  Gate A/B/C, then BR-202 Gate A/B/C/D and live `--review`/`--test` evidence.
+- BR-192's enabled counted-producer catalog is being independently re-audited
+  against `HEAD`; dirty-worktree seams from later batches cannot be used as its
+  Gate-A authority.
+
+## 2026-08-02 BR-192 corrective metadata formal review
+
+- Formal verdict is `REJECT C0/I2/M0`; Gate A remains open.
+- Fixed `HEAD=b4aeee68d2c0259cc968914b3d39e3a89a18a496` has no admitted
+  production counted producer for the five rows currently marked enabled:
+  T0/Paper still use the generic governor/dispatcher, R-04/R-08 use generic
+  `dispatch_outcome`, and no production R-09 dispatcher exists. Worktree-only
+  later-gate seams are not valid current-code evidence.
+- The second defect is independently blocking: fixed HEAD already has durable
+  schema v5 and the accepted BR-194 v4-to-v5 migration/checker baseline, while
+  BR-192 still proposes another shared v4-to-v5 migration. Existing v5
+  databases could never acquire the new BR-192 objects under that plan.
+- Repair is limited to the tracked BR-192 design/plan/row: rebuild the 15-kind
+  catalog from HEAD, use 15 `DisabledNoProducer` rows for the first release,
+  and redesign the additive migration as v5-to-v6 with fresh/v1..v5
+  convergence and BR-194 v5 preservation. A new independent C0/I0 is required.
+
+## 2026-08-02 BR-192 C0/I2 repair candidate
+
+- Repaired the staged design/plan/BR-192 row against fixed HEAD: catalog is
+  exactly 15 rows, all `DisabledNoProducer`, and records zero accepted current
+  producers; rejected worktree seam output is explicitly non-authoritative.
+- Rebased every identified schema/migration/test/checker/rollback contract on
+  the real v5 baseline and one additive v5-to-v6 migration. Fresh/v1..v5 paths
+  converge on v6 while preserving the accepted BR-194 v5 objects/rows/triggers.
+- Current staged identities are design
+  `20a87d2f88e71c7f4fa5705293dd4a62435085cf`, plan
+  `d70bfb95ab34c7c9bde72e6457e49bf8cacac9cc`, and BR-192 row
+  SHA-256 `9d763b136ece9d38901bdf4c1831c763532ed11c08bf8c0d96a5212b288a7212`.
+- `git diff --check`, cached diff check and Rule-2.10 pass; the checker reports
+  131 repository-wide historical warnings and no BR-192 hard error.
+- Root review found and repaired a final Task-9 contradiction: the first
+  catalog cannot simultaneously freeze all 15 kinds disabled and require an
+  active `ReviewProviderTopN` producer. The cross-version check now requires
+  that kind to remain disabled until a later producer-specific rule reaches
+  Gate C and a fresh Gate-A C0/I0 review authorizes the catalog change.
+- Three fresh independent reviewer starts failed with external HTTP 403 and
+  receive zero acceptance credit. Gate A remains open until an actual C0/I0
+  verdict arrives.
+
+## 2026-08-02 BR-192 C1/I6/M1 + C0/I3/M0 repair
+
+- Two exact independent reviews completed after the earlier reviewer-service
+  failures and rejected the staged all-disabled identities. Their previous
+  design/plan/row hashes are now obsolete and receive no Gate progression.
+- Reworked the tracked Gate-A triple to one real R-09 producer consumer, 14
+  disabled kinds, immutable freshness expiry/terminal audit, full permit/caller
+  enforcement, exact production evidence authorities, preserved fixed-HEAD
+  migration-test identity, coherent all-eight Task-1 tests and correct file
+  create/modify ownership.
+- No production code was changed. Next: run scoped whitespace/Rule-2.10 checks,
+  stage only the repaired authority triple, compute fresh identities, and send
+  those exact objects to parallel independent Gate-A reviewers. Gate B remains
+  closed until C0/I0.
+
+## 2026-08-02 BR-192 C0/I4/M0 + C1/I3/M1 repair
+
+- Kept Gate B closed after both independent RED verdicts.
+- Repaired the tracked design/plan/BR-192 row for the concrete permit API,
+  exact persisted producer provenance, active expiry drain, pre-start Reserved
+  terminalization, genuine RED tests, mandatory first Gate-B file action,
+  exhaustive fixed-HEAD caller inventory and unified five-crate dependency
+  pin.
+- Corrected the deferred Task-8 file action and final integration staging list
+  to include `Cargo.lock` and the counted-producer catalog module.
+- No production Rust path was changed in this corrective Gate-A step. Next is
+  scoped validation, exact staging/hash capture and fresh parallel C0/I0
+  review.
+
+## 2026-08-02 BR-192 C3/I2/M0 preliminary repair
+
+- Kept Gate B closed and repaired only the tracked design/plan/BR-192 rule.
+- Closed manual-before-authorization expiry persistence, replaced caller/PAM
+  freshness with a private production clock, and specified the exact
+  expiry/start/ownership SQLite total order.
+- Added the final pre-external-call freshness gate and its zero-sink terminal
+  authority so a claim obtained before midnight cannot send stale data after
+  midnight.
+- Removed denial-opacity and rollback-catalog contradictions; preserved the
+  exact enabled R-09 catalog identity during rollback.
+- `git diff --check`: PASS.
+- `bash tools/compliance/lib/check_business_rules.sh`: PASS with 131 historical
+  warnings and zero hard errors.
+- Next: stage only the authority triple, capture fresh object identities, and
+  run two fresh independent exact-object reviews. No production code changed.
+
+## 2026-08-02 BR-192 final-pre-call terminal repair
+
+- Two independent exact-object reviews returned C1/I7/M0 and C1/I3/M1; Gate B
+  stayed closed.
+- Repaired only the tracked design/plan/BR-192 row. The contract now uses a
+  two-transaction no-call expiry terminal, nine exact ordering triggers,
+  result-absence rechecks, exact `Confirmed(n)` recount, and a derived
+  `ExpiredFreshnessBeforeSink` terminal compatible with the fixed v5 attempt
+  table.
+- Unified R-09 bad-data/verified-empty handling as typed `Failed`, preserved
+  fixed-HEAD R09 enum/order/label/SourceOnly identity, reclassified cfg(test)
+  callers, made the coordinator the sole production freshness-clock owner,
+  unified expiry outcomes, completed the public constant manifest, and moved
+  private catalog creation to Task 1.
+- Scoped/staged whitespace and Rule-2.10 checks pass; Rule-2.10 reports 131
+  historical warnings and zero hard errors.
+- Exact staged identities: design
+  `6ba1d63f569f5c4c79afb2b7fbbcbceb61b1b592`, plan
+  `ce18d4e5657b1f58a4e5716d9f7d5272d45834f9`, BR index blob
+  `fa282bac9c2282877e0291bd8218681ce809af59`, BR-192 row SHA-256
+  `9a6e8ee81fb16b570b55891668b6545ce1ba59be096e7b37df915c38aec4b6d0`.
+- Two fresh independent read-only reviews are active; no production Rust was
+  changed in this Gate-A repair.
+
+## 2026-08-02 BR-192 cross-rule/state/executable repair
+
+- Three independent read-only prechecks rejected the prior candidate with
+  `C2/I5/M0`, `C0/I1/M0`, and `C0/I4/M1`; those earlier staged identities no
+  longer carry Gate-A authority.
+- The docs-only repair removes `BannerCtx` and all account/broker coupling from
+  R-09, reconciles BR-198 to 14 direct Magic dependencies and 15 lockfile
+  packages at one immutable revision, and freezes the exact BR-200 durable
+  occurrence outcome/retryability map plus ordered rule IDs.
+- Retry expiry now applies only to retry discovery/admission/authorization;
+  initial settled-date acquisition remains separately admissible. Dedicated
+  capture-before-request, cross-Shanghai-midnight and invalid provider-time
+  cases are included.
+- The terminal-result relation now specifies a unique deferred foreign key,
+  write-once/immutable ownership pointer, exact authoritative reverse join and
+  race/mutation tests. The trigger catalog increases from nine to twelve.
+- BR-192 Gate D now delegates release authority only to the BR-202 isolated
+  wrapper. Gate B remains closed pending command/declaration audit, scoped
+  validation and two fresh independent C0/I0 reviews.
+- Removed a newly detected gate-order deadlock: BR-192 Gate-B paths must cite
+  and register under BR-202 now, but BR-202 Gate A/B/C implementation starts
+  only after BR-192 Gate C. Final BR-192 Gate D still waits for the BR-202
+  isolated wrapper.
+- Mechanical exact-test audit passes after the capability/rollback additions:
+  BR-192 has 245 unique `cargo test ... --exact` targets, all with unique plan
+  declarations; BR-200 has 25 such targets, all with unique declarations.
+  BR-192's four declaration-shaped non-command names are three parent-invoked
+  ignored child helpers and one quoted fixed-HEAD BR-194 evidence snippet.
+- Scoped `git diff --check` passes. Rule 2.10 exits zero with 198 rules and 131
+  historical warnings. The exact BR-198 dependency test executes one test and
+  passes, proving the 14-direct/15-lock Magic closure at the pinned revision.
+
+## 2026-08-02 BR-192 three-way precheck RED repair
+
+- Fresh read-only prechecks returned state `C1/I0/M0`, cross-rule
+  `C1/I1/M0`, and executable `C1/I2/M0`; BR-192 Gate B remains closed.
+- The state blocker is a stale result-first positive recipe that contradicts
+  the reverse trigger. The only allowed positive order is ownership pointer
+  update, failpoint, authoritative result insert, bijection validation, commit;
+  result-first remains a negative immediate-rejection test.
+- BR-198 rollback incorrectly named revision `660902...`, which cannot compile
+  the retained enabled R09 API. The repair keeps the full 14-direct/15-lock
+  `5f1ce936...` dependency identity and rolls back only closed-day behavior.
+- BR-192 now requires only literal future `BR-202` citations in Gate-B source.
+  It neither mutates nor claims the current BR-202 Code cell; BR-202 Gate A and
+  all later progression wait until BR-192 Gate C.
+- The fixed-HEAD-absent `tests/magic_market_release_revision.rs` is now an
+  explicit Task-8 Create path and is included in the atomic commit recipe.
+- Separate executable BR-198 and BR-200 plans are being authored in parallel;
+  neither untracked candidate has Gate-A or Gate-C acceptance credit.
+
+## 2026-08-02 BR-192/BR-198/BR-200 dependency-cycle repair
+
+- A fresh BR-198 review returned `C2/I8/M1`. The decisive blocker was physical:
+  BR-198 required R-09 gateway/producer/preflight objects that only BR-192 Task
+  8 creates, while BR-192 simultaneously required BR-198 Gate C first.
+- BR-198 is now a supporting contract incorporated into BR-192 Task 8/Gate B.
+  It owns no independent Gate B/C, commit or prerequisite. Its exact Shanghai
+  date, 15:35, trusted request-start/capture/completion, raw timestamp and
+  14-direct/15-lock requirements remain mandatory inside BR-192.
+- BR-200 is narrowed to a generic typed read-only durable occurrence API plus
+  real R-04/R-08 production consumers. R-09 remains disabled throughout its
+  independent progression; BR-192 later consumes the accepted API.
+- BR-192 now requires only BR-200 accepted Gate C before Gate B. Its new tests
+  also prove host `TZ` cannot change Shanghai semantics and reject same-date
+  provider capture before trusted request start or after completion.
+- Scoped whitespace and Rule-2.10 checks pass; fresh independent exact-object
+  reviews are running. No production code was accepted or modified by this
+  Gate-A repair.
+
+## 2026-08-02 BR-200 checker investigation
+
+- Opened three authorized parallel lanes: BR-198 forward rollback repair,
+  BR-192 raw-capture/rollback re-review, and BR-200/BR-194 checker fact check.
+- Locally inspected the full shared BR-194/199/200 checker and current task/
+  push-kind references. Confirmed that retaining R-09 enum, SourceOnly mapping,
+  dispatcher membership and date-policy tests is compatible with BR-200
+  keeping the actual R-09 provider disabled. No checker weakening is needed.
+- Recorded the fact in `findings.md`; Gate A remains open and no production
+  Rust path was edited.
+
+## 2026-08-02 BR-192/198/200 final Gate-A normalization
+
+- Independent prechecks converged on one provider-free BR-200 prerequisite:
+  R-04/R-08 are `EnabledSourceOnly`, R-09 preserves durable identity and
+  SourceOnly classification but remains typed `DisabledNoProducer` with zero
+  provider/renderer/new-decision/sink calls.
+- BR-198 now uses a checked-in forward patch that disables only BR-192 periodic
+  retry discovery; it never reverts the atomic R-09/BR-200/schema/catalog work.
+- BR-192 now owns a normal Gate-B/Gate-C forward-rollback verifier rather than
+  relying on an incident-time `git apply --check` recipe.
+- Scoped whitespace validation passes. The first Rule-2.10 run correctly
+  rejected future artifacts listed as if they already existed; after limiting
+  the BR-200 Code cell to current authority paths, the checker passes with 198
+  rules and zero hard errors (historical warnings remain non-blocking here).
+- Gate A remains open for exact command/declaration audit and fresh independent
+  C0/I0 reviews; no production Rust path was edited in this normalization.
+
+## 2026-08-02 Formal-review repair round
+
+- BR-198 review found one field-name split; BR-192 now uses the BR-198-owned
+  `capture_completed_at` name everywhere and no longer mentions
+  `request_completed_at`.
+- BR-192 review proved the initial rollback verifier call targeted pre-Task-8
+  HEAD. Task 8 now freezes the fully staged tree as a `commit-tree` candidate,
+  verifies that exact object, requires the real commit tree to match, and reruns
+  the verifier on committed HEAD.
+- The same verifier contract now includes all 12 BR-198 tests, seven BR-200 R09
+  tests plus claim, schema/catalog/revision, retry recovery and startup-cycle
+  tests after applying the one-file forward patch.
+- BR-200 review found R-08 is still `LegacyAccountGate` at fixed HEAD and cannot
+  be silently promoted. The corrective docs-only lane narrows this independent
+  slice to live R-04; R-08/R-09 retain identity but fail closed until their own
+  BR-199/BR-192 atomic releases.
+
+## 2026-08-02 BR-200 R-04-only Gate-A repair completed
+
+- The BR-200 design and plan now expose only R-04 as a live production
+  consumer. R-08 is `DisabledNoProducer(Br199NotReleased)` and R-09 is
+  `DisabledNoProducer(NoProducer)` before partition, with exact reason codes and
+  zero provider/renderer/new-decision/sink work.
+- The capability API is a closed nine-arm typed `Result`; `Option`, wildcard
+  matching and identity-as-permission are forbidden. The shared BR-194 checker
+  contract is additive against its fixed-HEAD SHA and rollback disables only
+  R-04.
+- Mechanical audit reports 25 exact commands matching 25 unique declarations,
+  no stale live-R08 wording, no whitespace errors, and Rule 2.10 passes with 198
+  rules plus 132 historical warnings. Fresh independent reviews remain open.
+
+## 2026-08-02 Formal review status after R-04-only repair
+
+- BR-198 passed independent review at C0/I0/M1. BR-192 passed two independent
+  reviews at C0/I0; its remaining findings are staging/readability-only.
+- BR-200 remained RED at C0/I5. Gate B stays closed while a bounded docs-only
+  repair fixes candidate-tree rollback verification, byte-prefix checker
+  preservation, a true command/declaration bijection, R-08/BR-199 authority
+  separation and task-specific rule vectors.
+- The repair now treats R-08 as typed Unsupported inside BR-200 rather than
+  inventing a BR-199 enable transition. Only R-04 is enabled; R-09 remains
+  typed disabled for the later BR-192 atomic slice.
+
+## 2026-08-02 BR-200 second-review repair
+
+- Two independent reviews remained RED at C0/I2 and C0/I5. The common
+  blockers were a permanently baseline-only R-08 checker, a caller-supplied
+  checker append digest, source-text-only test cardinality, and missing
+  production/debt evidence. The R-09 startup banner and Gate-D evidence were
+  repaired first.
+- The current Gate-A documents now define two closed checker profiles:
+  BR-200 baseline R-08 Unsupported and a complete separately accepted BR-199
+  SourceOnly profile. Partial or mixed states fail and BR-200 still owns no
+  R-08 transition.
+- The forward verifier must own literal prefix/append digests and execute both
+  mutation matrices before and after rollback patch application. The canonical
+  25-test gate now compares source declarations, exact commands and Cargo
+  registration, then requires each command to run exactly one test.
+- Gate B remains closed pending scoped validation and fresh exact-object
+  independent C0/I0 review. No production Rust path was edited in this repair.
+
+## 2026-08-02 BR-200 final-hash review remained RED
+
+- Exact staged hashes matched, but the Standards and realizability reviews
+  returned C0/I8 and C0/I5. Gate B remains closed.
+- Blocking themes are now bounded: stable Gate-A status/row-scoped registry
+  authority, an accepted BR-194 Gate-C execution base, an owned exact-once R-09
+  startup installation, ignored-test rejection, candidate-tree verifier bytes,
+  fail-closed shell blocks, causal real-review evidence, accepted baseline
+  coverage commands, and a variable-length validated rule vector.
+- The next repair is docs/tests-command only. It will not absorb unaccepted
+  BR-194 production changes into BR-200 and will not use BR-202 as authority.
+
+## 2026-08-02 BR-200 final Gate-A repair in progress
+
+- Three parallel read-only reviewers supplied realizability, shell/test, and
+  causal Gate-D repair drafts. No production Rust path was changed.
+- Design/plan now make BR-194 Gate C a literal accepted base prerequisite, own
+  the exact-once R-09 startup call/test, use 26 exact tests, validate variable
+  ordered rules, execute verifiers from committed trees, use fail-closed
+  pipelines, and use repository baseline coverage rather than BR-202.
+- The remaining Gate-A work is the canonical BR-200 row rewrite/hash, scoped
+  validation, staging of exact authority objects, and fresh C0/I0 reviews.
+- A concurrent read-only upstream probe ran the current
+  `check_br194_review_dependency.sh`; it failed immediately because the checker
+  still requires the removed `push_r08_source_only_with_binding` marker. BR-194
+  Gate C remains RED and BR-200 Gate B remains correctly blocked.
+# 2026-08-02 BR-200 prerequisite repair
+
+- Repaired the BR-194/BR-199 compliance checker to match the production R-08
+  public-presented/private-source-only call chain.
+- `bash tools/compliance/lib/check_br194_review_dependency.sh`: PASS.
+- Parallel realizability review found three BR-200 Gate-A blockers: Task-4
+  staged-path order mismatch, missing implementation/commit lifecycle for the
+  repeated-review verifier, and an impossible fixed-HEAD checker-prefix
+  prerequisite. Gate A is still in progress; no BR-200 production Rust change
+  has started.
+
+## 2026-08-02 BR-194 master-baseline recovery
+
+- Confirmed context recovery from the persisted plan and retained BR-200
+  blocked behind literal BR-194 Gate C.
+- The clean master baseline `9307b67` is not Gate-C reproducible: one event
+  audit schema constant is referenced but absent, and the BR-194 checker
+  expects an R-04 preparation seam missing from the committed source.
+- The focused BR-194 test did not reach Rust assertions. Cargo failed with
+  `No space left on device` while compiling dependencies in the isolated
+  candidate target.
+- Disk inspection found 6.9/7.1 GiB targets in two abandoned BR-194 worktrees.
+  `cargo clean` removed 7.0 GiB from each; the active 21 GiB project target,
+  source files and databases were preserved.
+- Two independent read-only audits are running in parallel: R-04 SourceOnly
+  implementation versus checker/spec, and the counted-delivery audit schema
+  constant versus BR-160/BR-192 authority.
+- Root tracing confirmed the frozen BR-194 spec marks the missing R-04
+  SourceOnly/prepare/context work as Gate B, while commit `9307b67` changed the
+  checker but did not include the required production entry files. The later
+  `b4aeee6` tree has those symbols, but its broad diff is being decomposed by
+  ownership before any code is transplanted.
+## 2026-08-03 continuation
+
+- Re-read the mandatory systematic-debugging and persistent-planning skills.
+- Polled the previously running isolated candidate build; it completed with
+  exit 101 on the missing counted-delivery schema constant, matching the clean
+  baseline and BR-192 audit.
+- Received the independent R-04 audit: `9307b67` has an incomplete commit
+  boundary, not a stale checker. No source file was modified by the auditor.
+- Next action: inspect the pre-merge Git snapshot read-only and recover only the
+  pure BR-192/BR-194 slice before any production edit.
+- Inspected the pre-merge stash object read-only. It contains the exact missing
+  counted-delivery and R-04 production symbols and does not contain BR-199 or
+  BR-200 in the scoped production/test paths. This is now the preferred
+  recovery reference; no stash or worktree content has been applied yet.
+- Scoped the tracked recovery file set. The gateway/exact-byte append modules
+  are absent from the stash working tree because they were untracked; next
+  inspection targets the stash untracked-files parent.
+- Verified the third parent holds the exact missing gateway, immutable-append
+  and BR-192 test files. No files have been restored yet; the next step is a
+  disposable reconstruction/compile to prove that this snapshot is coherent.
+- Created a disposable local clone and restored the complete pre-merge stash
+  on its exact parent without conflicts. The reconstructed tree is ready for a
+  shared-target `cargo check --lib`; no production path or database was used.
+- `env CARGO_TARGET_DIR=<main-target> cargo check --lib` on the reconstructed
+  snapshot completed successfully. Next: exact BR-192 tests and BR-194 checker.
+- First exact BR-192 envelope test passed after a 1m36s shared-target build.
+- Parallel follow-up auditor returned an unrelated context-status response
+  instead of the requested extraction manifest; no evidence from that response
+  is being used. Root continues from the authoritative Git snapshot.
+- Exact push-record test passed. Exact persistence test exited 101 before its
+  assertions because the disposable clone lived below world-writable
+  `/private/tmp`; logged as an environment setup failure, not retried there.
+- Reconstructed the snapshot under `target/br194-stash-audit-20260803` and
+  reran the persistence test; it passed. All three exact BR-192 tests are now
+  green on the recovered snapshot.
+- Frozen BR-194 static checker passed on the recovered snapshot. Counted 33
+  in-crate BR-194 tests and three process-isolation tests for the next focused
+  validation stage.
+- Focused monitor BR-194 suite passed 31/31. Next focused gate is the three
+  `monitor_help_isolation` process tests.
+- Process-isolation BR-194 suite passed 3/3. Root cause and source snapshot are
+  proven; moving to minimal extraction on a clean `9307b67` base.
+- Began dependency-boundary audit. R-04 and R-09 both depend on earlier unified
+  gateway/counted-delivery slices that were likewise left uncommitted. Whole
+  `review.rs` or whole 213-file stash import is rejected as an extraction plan.
+- Re-read the BR-192/BR-194 frozen design headings and BR-162/194 rule rows.
+  Gate A is still formally open; recovery will be split into predecessor
+  authority/gateway slice and BR-194 orchestration slice before implementation.
+- Measured diff scope and rechecked the authoritative worktree. Main remains a
+  broad dirty branch and is preserved. Parallel audit now computes the exact
+  R-04/R-09 gateway predecessor closure in the reconstructed clone.
+- Added Gate A draft
+  `docs/superpowers/specs/2026-08-03-br192-br194-incomplete-commit-recovery-design.md`.
+  It freezes immutable recovery objects, splits source prerequisites / counted
+  audit / BR-194 orchestration, forbids whole-stash import and later BR-160/
+  197-200 content, and lists focused/full/runtime gates plus reverse rollback.
+- Requested a fresh independent C/I/M review; Gate B remains prohibited.
+- Rule-2.10 checker passed with existing warnings. Audited P1 imports and found
+  the acquisition-audit database dependency plus the stale snapshot Magic
+  revision; both are now explicit Gate A closure items.
+- Updated the recovery design to pin authoritative Magic revision `5f1ce936...`
+  and require BR-159 acquisition-audit persistence while rejecting accidental
+  coupling to A-01/R-03/THS/historical bars.
+- Applied the deep-module vocabulary to the shared Gateway seam: keep provider
+  adapters private, make evidence/audit an internal deep module, and retain
+  `CapitalDataGateway::provider_top_n_pair` as the R-09 interface. No code edit
+  is authorized yet.
+- Added an exact P1/P2/P3 module-and-hunk path matrix to the Gate A design. P1
+  now defines `data_gateway/admission.rs` as an internal deep module and locks
+  database/Cargo/lib edits to the acquisition-audit/provider closure.
+- Integrated the parallel path-closure audit: replaced broad `capital.rs` with
+  narrow `provider_top_n.rs`, excluded `magic-exchange-rs`, added
+  `rusqlite/functions`, and fixed the generic-counted → SourceOnly transition to
+  occur only in P3.
+## 2026-08-03 Gate A static validation refresh
+
+- `git diff --check -- docs/superpowers/specs/2026-08-03-br192-br194-incomplete-commit-recovery-design.md`: PASS.
+- `bash tools/compliance/lib/check_business_rules.sh`: PASS (198 rules; 134 pre-existing citation warnings). The warnings remain separate follow-up debt and are not treated as a clean full Gate C result.
+- Re-read the complete latest recovery design after the P1 path-closure refinement. Its status remains `Gate A draft`; no Gate B source edit has started.
+- Scoped status confirms the recovery design and planning ledgers are the only new/modified planning artifacts in this stream; the broad user worktree remains untouched by recovery code.
+## 2026-08-03 Gate A independent review blockers
+
+- Independent review reported at least two Critical design defects; Gate B remains prohibited.
+- C1: §2 says no database migration while P1 restores the BR-159 append-only acquisition-audit table/triggers; the design must explicitly classify, validate, and roll back this additive schema installation without deleting audit evidence.
+- C2: simple P3 → P2 → P1 `git revert` is unsafe for counted delivery. Rollback must first freeze new reservations, reconcile pending attempts, manually dispose `Uncertain`, prove zero active/pending authority, and only then revert/disable producers and schema-v3 authority.
+- A broad rollback search confirmed the durable layer has explicit all-date reconciliation, manual uncertainty, pending-inspection and active reservation states. The first narrowed spec search failed before reading files because zsh expanded a nonexistent glob; it produced no evidence and will be retried with literal paths.
+- Literal-path review of the frozen BR-192 plan confirms rollback is forward-compatible, not a reverse commit sequence: preserve schema recognition, tables/triggers/indexes/outboxes/immutable records, never lower `user_version`, never launch an older binary, and let pending bytes continue only through exact idempotent reconciliation.
+## 2026-08-03 Gate A C2/I5 remediation evidence
+
+- Current authoritative `docs/business_rules.md` BR-192 row, `Cargo.toml`, `Cargo.lock`, the revision test, and newer BR-192 specs all already freeze Magic revision `5f1ce936...`; the review's revision contradiction came from the historical stash design at `d7dfa314...`, which this recovery explicitly supersedes.
+- Located the checked-in positive join verifier at `tools/release/verify_br194_review_join.py`; Gate D will invoke it rather than relying on ordinary process exit.
+- Confirmed hard evidence requirements: code-fact claims in the recovery design must include exact commands plus pasted output; full Gate C tests must be serial, and Gate D additionally requires llvm-cov threshold checks and a release monitor build.
+## 2026-08-03 reproducible recovery evidence rerun
+
+- Safe clone: `/Users/zhangzhen/Desktop/Quant/stock_analysis/target/br194-stash-audit-20260803`.
+- `env CARGO_TARGET_DIR=/Users/zhangzhen/Desktop/Quant/stock_analysis/target cargo check --lib`: PASS; exact terminal output ended with `Finished dev profile [unoptimized + debuginfo] target(s) in 1m 00s`.
+- Re-ran the three exact counted schema-v3 tests: each reported `1 passed; 0 failed`; envelope/push-record had 2316 filtered, persistence completed in 0.11s.
+- Frozen BR-194 checker: `BR-194 review dependency static contract: PASS`.
+- Monitor BR-194 filter: exactly `31 passed; 0 failed; 495 filtered out`.
+- Process-isolation BR-194 filter: exactly `3 passed; 0 failed; 21 filtered out`.
+## 2026-08-03 frozen Gate-D command recovery
+
+- Recovered the exact frozen Gate-D sequence: normal authentic R-09/R-04 delivery and same-cycle hydration, then `--br194-audited-terminal-replay` once per task, then `tools/release/verify_br194_review_join.py --require-passed-replay 1` once per task.
+- The replay success line must prove attempts=1, provider/resume/sink/delivery-audit-appends=0, and equal sink/delivery-audit watermarks. Ordinary `--review` output is insufficient.
+## 2026-08-03 Gate-A remediation validation
+
+- Latest recovery design remains clean under `git diff --check`.
+- Exact immutable append filter rerun: `9 passed; 0 failed; 0 ignored; 2308 filtered out`; the nine parent tests exercise isolated child cases where required.
+## 2026-08-03 P1 reproducible baseline
+
+- Reconstructed BR-159 acquisition-audit filter: exactly `4 passed; 0 failed; 2313 filtered out`.
+- Reconstructed BR-162 DragonTiger filter: exactly `6 passed; 0 failed; 2311 filtered out`.
+- Historical capital-facade Provider Top-N filter: exactly `3 passed; 0 failed; 2314 filtered out`; P1 must migrate these three semantics into the narrow `provider_top_n` module and add three shared-admission failure tests.
+## 2026-08-03 post-remediation static checks
+
+- Scoped `git diff --check` across the recovery design and planning ledgers: PASS.
+- Rule 2.10 checker after remediation: PASS, 198 rules and the same 134 historical warnings; no new blocking rule error.
+## 2026-08-03 recovery-object semantic contamination check
+
+- The historical `push_templates.rs` contains BR-160 A-10 content at lines 5941 and 14550, so whole-file recovery is conclusively forbidden.
+- Allowed monitor paths contain the BR-194 R-04 dedicated SourceOnly helper/caller, plus an older R-08 combined-banner implementation. No searched BR-197/198/199/200 semantic API marker appeared, but marker absence remains non-authoritative.
+## 2026-08-03 fixed-HEAD Magic revision correction
+
+- `git show b4aeee68:Cargo.toml` and `git show 9307b67:Cargo.toml` both show `rusqlite` with only `chrono` and a sibling path dependency for `magic-tdx-rs`; neither fixed tree contains the 14 direct `5f1ce936...` pins.
+- The current worktree's BR-192 row, Cargo files and revision test are candidate bytes, not committed authority. P1 must treat the release-revision closure as an atomic prerequisite amendment and obtain exact-blob review before Gate B.
+## 2026-08-03 candidate authority blob inventory
+
+- Working-tree Git blob IDs in order design/rules/Cargo/lock/revision-test: `f8ec9b5704f8a97a3bfdb31e64529183bf31e403`, `ec52754ace19f5e09341416abd37c4876963943e`, `17e4ff819323d1126f434875d4098681578243c8`, `24b2e7d0e4d912404213ad23a1abdf62792b5ad3`, `e79ac5a5d159e8cb534fd9778c5043dd65935f50`.
+- All five are uncommitted candidates; `docs/business_rules.md` is both staged and further modified (`MM`), so Gate-A review must bind the working-tree blob explicitly and must not assume index equality.
+## 2026-08-03 exact-hunk audit interim RED
+
+- Segment hashing is reproducible from immutable objects, but the current closure is not complete.
+- No immutable source object contains the final `5f1ce936...` Cargo/lock state; Cargo must be an accepted target amendment and lockfile regeneration, not an exact-copy recovery hunk.
+- `admission.rs` and `provider_top_n.rs` are extraction/refactors with new fail-closed tests. Historical `dragon_tiger.rs` imports `super::review`, so even its whole-file blob needs a controlled seam adaptation.
+- P2 notify closure is larger than designed: the committed durable runtime depends on the secure pinned push-log writer, eager binding, authoritative blocking delivery adapter and CLI receipt helper. Exact intervals/hashes are pending.
+- Historical R-09 producer calls `CapitalDataGateway::provider_top_n_pair`; P3 must refactor it to `ProviderTopNDataGateway::pair`, not exact-copy the caller.
+## 2026-08-03 notify dependency audit continuation
+
+- Exact symbol search confirmed the baseline durable runtime calls the recovered secure push-log/eager-bind/authoritative-blocking APIs, so the P2 design's earlier narrow `notify` ownership is incomplete.
+- Recovered `notify.rs` inspection confirms that authoritative counted delivery also depends on pending-byte persistence, schema-v3 audit publication, committed-marker verification, receipt joins, and the blocking CLI receipt helper. No production code was changed; the exact-hunk agent is computing immutable intervals and hashes before the Gate-A architecture choice.
+- Re-read all mandatory repository companions (`docs/ENGINEERING_RULES_V2.md`, `.github/copilot-instructions.md`, `CLAUDE.md`) and reconfirmed Gate B is prohibited while the independent Gate-A review is RED. The broad dirty worktree is still preserved; recovery edits remain docs/planning only.
+- Diff/definition audit narrowed the tracked WIP: its `notify.rs` contains many unrelated transport/token/daemon rewrites, so whole-file or broad tail admission is forbidden. Baseline helper definitions are sufficient for a smaller exact closure; remaining work is to hash the secure-writer, counted-interface, counted-finalizer and blocking-receipt intervals separately.
+- Computed preliminary immutable SHA-256 hashes for four bounded `notify.rs` candidate segments and confirmed the two large authority segments are marker-clean with respect to excluded BR-160/197–200 behavior. Exact dependency closure and independent review remain open.
+- P2 manifest work now has reproducible source object, full line range and SHA-256 identities for all three schema-v3 event files and the immutable append file. Two parallel agents were re-scoped to P1 Gateway and P3 producer manifests while the root agent closes P2.
+- Added the tracked hunk-manifest draft and corrected the Gate-A design/working plan from impossible P1→P2 ordering to P2→P1→P3. The manifest binds P2 event files, bounded notify authority/test intervals and the P3 SourceOnly notify seam; P1/P3 producer rows remain pending parallel audit.
+- Re-ran all P2-focused filters in the reconstructed clone: 3 envelope + 2 push-record + 3 persistence + 9 immutable-append + 24 monitor notify tests passed; the single ignored notify helper is exercised by a passing cross-process parent. Results are pasted into the manifest.
+- Integrated the completed P3 immutable audit into the manifest: 11 production rows, seven in-process test rows and three process-isolation rows, including exact rejected enclosing ranges and two controlled test adaptations. Only P1 rows and fresh independent review remain before Gate B.
+- Integrated the completed P1 audit into the hunk manifest, including the
+  14-direct/15-lock target amendment identities, admission/Provider Top-N/
+  DragonTiger ranges, BR-159 database authority and narrow glue. Corrected the
+  historical admission capability/source pollution in the design and added a
+  fourth attribution test requirement.
+- Revalidated the four candidate blobs directly from the working tree:
+  `ec52754a...`, `17e4ff81...`, `24b2e7d0...`, `e79ac5a5...`; all SHA-256
+  values match the manifest. Scoped `git diff --check` passed and Rule 2.10
+  passed with 198 rules plus the same 134 historical warnings.
+- Froze the complete Gate-A review packet without changing its bytes: design
+  Git blob/SHA-256 `261af572...` / `66f3823e...`; manifest
+  `67a7686c...` / `5666a851...`; candidate rule/Cargo/lock/revision-test blobs
+  remain `ec52754a...`, `17e4ff81...`, `24b2e7d0...`, `e79ac5a5...` with the
+  exact SHA-256 values listed in the manifest. Fresh independent reviewers must
+  name these identities; any drift invalidates their verdict.
+- Executed the frozen revision-test candidate: it passes 1/1 in the broad
+  current worktree. A fixed-baseline path audit then proved four files it reads
+  do not exist at `9307b67` and are outside P1. Reported the resulting false-
+  green/scope-expansion defect to all three fresh reviewers; the frozen packet
+  is expected RED and Gate B remains closed.
+- Recorded all three first-packet RED verdicts (`C2/I5/M0`, `C3/I1/M0`,
+  `C1/I4/M0`) and kept production code closed.
+- Repaired the Gate-A design/manifest only: rejected polluted rule/Cargo/lock/
+  revision-test blobs; required a minimal `9307b67` delta; added BR-159 old-
+  module disposition, explicit admission test rows, unconditional P3 test
+  adaptations, exact-count verifier ownership, per-hunk splice/owner/test
+  ledger and release-binary replay. No production source/database/provider/
+  sink was changed or called.
+- Next: materialize these exact docs in a temporary real Git commit, run scoped
+  checks, then obtain fresh parallel `C0/I0/M0` review before Gate B.
+- Ran three additional independent read-only closure audits. P2 was RED because
+  13 required compile/runtime/test hunks were absent; P3 was RED because its
+  SourceOnly tests, scheduler import and counted catalog were incomplete; the
+  dependency/coverage review was RED because package identities and lock drift
+  were not closed.
+- Repaired only the Gate-A design and hunk manifest: added all verified P2/P3
+  immutable ranges/hashes, moved the final cutover test to P3, separated M31
+  from scheduler/R-09/R-04/catalog counts, froze V4/V5 test names, named all
+  14 direct/15 lock Magic packages, assigned the dependency transition to
+  BR-203 and added a fail-closed locked/offline checker contract.
+- Recomputed fixed baseline identities: `Cargo.toml` blob
+  `2118a3e490efe2d3416b2554559ca0347947c533`, SHA-256
+  `521c3b24795288ddce453e714a74e23fe96afe348dfa49c5d68681f0fdf2adfa`;
+  `Cargo.lock` blob `95481362e8061a1724cd1682d23b4e8a14f16377`, SHA-256
+  `cd86df085943a710c17ec2cb5aceaef0acc0bde949443dce3fe802e99fbe74fd`.
+- V3 remains Gate-A RED until the isolated generated target lock hashes/record
+  whitelist and P2 compatibility-test closure arrive, are integrated, and a
+  new real packet receives fresh independent `C0/I0/M0`. No production code,
+  database, provider or sink was changed/called in this repair.
+- Integrated the isolated Magic lock resolution into the Gate-A documents:
+  exact target manifest/lock hashes, the 14-direct/15-lock Magic closure and
+  every allowed package-record delta are now frozen. Locked/offline metadata
+  resolution passed in the temporary baseline-derived repository; the main
+  worktree was not modified by lock generation. Gate A now awaits only the
+  fixed-baseline P2 compatibility goldens plus fresh packet review.
+- Exported the P2 schema-v2 publication, parser-output and non-counted
+  push-log artifact from a fixed-baseline mini probe with exact lengths and
+  SHA-256 identities; no real provider or sink was called. The first attempt
+  exposed an environmental ENOSPC during full monitor linking, so only the
+  confirmed-unused recovery-audit target directory was cleaned (4.9 GiB of
+  regenerable artifacts), after which the minimal probe succeeded.
+- A fresh independent placeholder/realizability audit returned `C7/I5/M2`.
+  Two parallel docs-only repair streams now cover the missing module/startup/
+  P0/spy/exact-object contracts and the 95% coverage/bounded-startup evidence.
+  Production source remains closed until the repaired immutable packet is
+  independently `C0/I0/M0`.
+- Executed the tracked-WIP schema-v2 mini probe and reproduced an actual
+  parser-output byte regression caused by newly serialized `null` counted
+  fields. Verified in the temporary clone that omitting absent schema-v3
+  fields restores the fixed-baseline byte/hash exactly. This is now a required
+  P2 compatibility hunk, not an allowed golden update.
+
+## 2026-08-03 clean-lineage recovery proof
+
+- Confirmed current worktree dependency state is the desired Polars 0.54
+  family with no qmt-parser; corrected status reporting so historical parent
+  versions are never presented as current blockers.
+- Exported clean `96da674` to
+  `/private/tmp/stock-analysis-head-check.Cd2KGl` and ran
+  `cargo check --locked --lib`. It failed on five deterministic compile errors:
+  four stale selection-audit callers and one missing counted schema constant.
+- Ran `cargo check --locked --lib` in the isolated P2 candidate. The counted
+  error disappeared and the same four selection caller errors remained,
+  proving both problem slices independently.
+- Collected three read-only parallel audit results. They confirm the current
+  mixed worktree is green but cannot be committed atomically, the BR-164
+  cutover must be partitioned by data domain, and the current Gate-A packet is
+  RED until its implementation lineage is corrected.
+- No production source, provider, database or sink was changed or invoked.
+  Next action is a docs-only Gate-A rewrite followed by two fresh independent
+  green reviews.
+- Built two additional isolated dependency experiments. The current 0.54
+  Cargo bytes over old source failed on 15 deterministic legacy/API errors and
+  were rejected as a compile-foundation. The minimal historical-Cargo delta
+  (`rusqlite/functions` plus direct same-path `magic-market-core`) passed
+  locked/offline metadata and `cargo check --locked --offline --lib` with only
+  one known warning. No repository production file was changed.
+
+## 2026-08-03 P2-F evidence reconciliation
+
+- Independent static review confirmed the candidate has exactly 19 CLI
+  isolation tests and the full workspace has exactly the manifest-listed 16
+  ignored tests, with all six ignored child helpers exercised by passing
+  parents.
+- Reconciled the manifest/design with the actual provisional selection targets:
+  `outcome.rs` SHA-256 `13f3cbb8...` and `pipeline.rs` SHA-256 `bc345454...`.
+  Removed the false claim that ignored `target/` blobs are already reachable.
+- Strengthened the CLI fixed-production SQLite fingerprint with no-follow
+  size/mode/mtime/ctime metadata, without reading or printing production DB
+  contents. The exact CLI suite remains green: 19 passed, 0 failed/ignored.
+- Narrowed the evidence claim to the exact SQLite trio and three named CLI
+  regressions; event-audit/push-log namespace placement remains owned by the
+  focused module tests. Updated candidate test identity to blob `1df27a0d...`,
+  SHA-256 `a52f92c1...`.
+- Restored P0-A3 business-ledger scope to only the BR-203 row. Rule 2.10 passes
+  with 134 historical warnings and no blocking error; targeted diff check is
+  clean. Fresh independent Gate-A review is still required before staging.
+- Expanded the provisional P2-V0 structured verifier to hash every H11/H12/H13
+  whole target and both raw inclusive `main.rs` hunks. The verifier compiles and
+  the fail-closed wrapper passes; its exact mode/blob/SHA and runner-line hunk
+  are now frozen in the manifest.
+- Materialized P0-A3 as commit `4cf1573762e029b3fc90af91e8f7368322cdfabc`,
+  direct child of `96da674...`, containing exactly the three authorized docs.
+  Independent object review returned C0/I0/M0.
+- The object review exposed a residual manifest defect: it still required P2-F
+  to parent historical `96da674`, which would bypass P0-A3. Returned to Gate A
+  and prepared P0-A4, limited to the two recovery docs, to require P2-F to be
+  the direct child of the accepted Gate-A authority HEAD.

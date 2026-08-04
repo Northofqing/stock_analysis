@@ -1,4 +1,4 @@
-//! Registered business rules: BR-137.
+//! Registered business rules: BR-137, BR-175.
 //! v17.7 Task 1: Classification result types
 //!
 //! Skeleton types for earnings and analyst rating classification results.
@@ -7,7 +7,7 @@
 //! code (Task 5 adapter) will consume.
 
 use super::{NormalizedSourceError, NormalizedSourceEvent, SourcePushKind};
-use crate::data_provider::announcement::Announcement;
+use crate::announcement::Announcement;
 use crate::search_service::SearchResult;
 use chrono::{Datelike, Local, NaiveDate};
 
@@ -56,8 +56,7 @@ impl EarningsClassification {
 
 /// Result of analyst rating classification (previous vs current).
 ///
-/// Task 4 will populate the `kind`, `previous`, and `current` fields based
-/// on xueqiu / sina analyst data.
+/// The caller supplies admitted consensus-report evidence and its source provenance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RatingClassification {
     /// The source push kind (AnalystUpgrade or AnalystDowngrade).
@@ -142,7 +141,7 @@ impl EarningsConfig {
 /// - The consensus reference is missing, non-finite, or zero.
 /// - The delta is within the no-push zone (between miss and beat thresholds).
 pub fn classify_earnings(
-    actual: &crate::data_provider::financials::FinancialPeriod,
+    actual: &crate::company_financials::FinancialPeriod,
     consensus: &crate::data_provider::consensus::ConsensusData,
     config: &EarningsConfig,
 ) -> Option<EarningsClassification> {
@@ -220,7 +219,7 @@ pub fn classify_earnings(
 pub fn classify_announcement(
     a: &Announcement,
 ) -> Result<NormalizedSourceEvent, NormalizedSourceError> {
-    classify_announcement_with_provenance(a, chrono::Local::now(), "eastmoney")
+    classify_announcement_with_provenance(a, chrono::Local::now(), "cninfo-market")
 }
 
 pub fn classify_announcement_with_provenance(
@@ -228,21 +227,15 @@ pub fn classify_announcement_with_provenance(
     observed_at: chrono::DateTime<chrono::Local>,
     source: &str,
 ) -> Result<NormalizedSourceEvent, NormalizedSourceError> {
-    if a.title.is_empty() {
-        return Err(NormalizedSourceError::EmptyTitle);
-    }
-    if a.code.is_empty() {
-        return Err(NormalizedSourceError::CodeRequired {
-            kind: SourcePushKind::Announcement,
-        });
-    }
+    let published_on = validate_announcement_source_fact_with_provenance(a, observed_at, source)?;
 
     // Direction from level
     let direction = match a.level {
-        crate::data_provider::announcement::AnnLevel::Emergency
-        | crate::data_provider::announcement::AnnLevel::Important => Direction::Bull,
-        crate::data_provider::announcement::AnnLevel::Info => Direction::Neutral,
-        crate::data_provider::announcement::AnnLevel::Skip => {
+        crate::announcement::AnnLevel::Emergency | crate::announcement::AnnLevel::Important => {
+            Direction::Bull
+        }
+        crate::announcement::AnnLevel::Info => Direction::Neutral,
+        crate::announcement::AnnLevel::Skip => {
             return Err(NormalizedSourceError::EmptyTitle);
         }
     };
@@ -257,9 +250,6 @@ pub fn classify_announcement_with_provenance(
         return Err(NormalizedSourceError::EmptySource);
     }
     let url = a.url.clone();
-    let published_on = a
-        .published_on()
-        .map_err(|_| NormalizedSourceError::InvalidPublishedDate)?;
 
     NormalizedSourceEvent::new(
         SourcePushKind::Announcement,
@@ -278,11 +268,58 @@ pub fn classify_announcement_with_provenance(
     )
 }
 
+/// Validate the common provider-owned announcement fact before any
+/// classification, lifecycle, or audience filter claims the row as handled.
+///
+/// The batch observation is immutable provenance. Publication freshness is
+/// therefore evaluated against that observation date before the normalized
+/// event constructor performs its final live-delivery validation.
+pub fn validate_announcement_source_fact_with_provenance(
+    a: &Announcement,
+    observed_at: chrono::DateTime<chrono::Local>,
+    source: &str,
+) -> Result<chrono::NaiveDate, NormalizedSourceError> {
+    if a.title.trim().is_empty() {
+        return Err(NormalizedSourceError::EmptyTitle);
+    }
+    if a.code.trim().is_empty() {
+        return Err(NormalizedSourceError::CodeRequired {
+            kind: SourcePushKind::Announcement,
+        });
+    }
+    if source.trim().is_empty() {
+        return Err(NormalizedSourceError::EmptySource);
+    }
+    let now = chrono::Local::now();
+    if observed_at > now {
+        return Err(NormalizedSourceError::FutureObservedAt);
+    }
+    let published_on = a
+        .published_on()
+        .map_err(|_| NormalizedSourceError::InvalidPublishedDate)?;
+    if published_on > observed_at.date_naive() {
+        return Err(NormalizedSourceError::FuturePublishedDate);
+    }
+    if published_on < observed_at.date_naive() {
+        return Err(NormalizedSourceError::Stale);
+    }
+    if published_on < now.date_naive() {
+        return Err(NormalizedSourceError::Stale);
+    }
+    Ok(published_on)
+}
+
 /// Classify a policy `SearchResult` into a `NormalizedSourceEvent`.
 ///
 /// Policy events have `code=None` (global, not stock-specific).
 /// Rejects if title or source is empty.
 pub fn classify_policy(r: &SearchResult) -> Result<NormalizedSourceEvent, NormalizedSourceError> {
+    if r.evidence.is_research_only() {
+        return Err(NormalizedSourceError::ResearchOnly);
+    }
+    if !r.evidence.is_complete_governed_source_fact() {
+        return Err(NormalizedSourceError::UnverifiedSourceFact);
+    }
     if r.title.is_empty() {
         return Err(NormalizedSourceError::EmptyTitle);
     }
@@ -343,7 +380,7 @@ fn parse_provider_publication_date(raw: &str) -> Result<NaiveDate, NormalizedSou
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_provider::announcement::AnnLevel;
+    use crate::announcement::AnnLevel;
     use chrono::Local;
 
     // -------------------------------------------------------------------------
@@ -362,7 +399,7 @@ mod tests {
             reason: "重要公告".to_string(),
             external_id: Some(external_id.to_string()),
             url: Some(format!(
-                "https://data.eastmoney.com/notices/detail/{}.html",
+                "https://announcements.test.invalid/{}.html",
                 external_id
             )),
         }
@@ -380,7 +417,43 @@ mod tests {
             importance: 5,
             relevance: 1.0,
             keywords: vec![],
+            evidence: crate::search_service::SearchEvidence::GovernedSourceFact {
+                provider: "TEST_CODE_provider".to_string(),
+                source: source.to_string(),
+                observed_at: Local::now().to_rfc3339(),
+                source_at: Local::now().to_rfc3339(),
+                batch_id: "TEST_CODE_batch".to_string(),
+                item_id: title.to_string(),
+            },
         }
+    }
+
+    #[test]
+    fn policy_rejects_research_only_and_unverified_search_results() {
+        let mut research = test_search_result(
+            "支持先进制造政策",
+            "Bocha",
+            "https://example.invalid/policy",
+        );
+        research.evidence = crate::search_service::SearchEvidence::ResearchOnly {
+            provider: crate::data_gateway::GeneralWebResearchProvider::Bocha,
+            source: "bocha-general-web".to_string(),
+            observed_at: Local::now().to_rfc3339(),
+            batch_id: "TEST_CODE_research_batch".to_string(),
+            item_id: "TEST_CODE_research_item".to_string(),
+            publication_quality: crate::data_gateway::PublicationTimeQuality::ExactProviderTime,
+        };
+        assert_eq!(
+            classify_policy(&research),
+            Err(NormalizedSourceError::ResearchOnly)
+        );
+
+        let mut unverified = research;
+        unverified.evidence = crate::search_service::SearchEvidence::Unverified;
+        assert_eq!(
+            classify_policy(&unverified),
+            Err(NormalizedSourceError::UnverifiedSourceFact)
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -483,11 +556,8 @@ mod tests {
     // =========================================================================
 
     /// Test helper: build a FinancialPeriod with given report_date and EPS.
-    fn financial_period(
-        date_str: &str,
-        eps: f64,
-    ) -> crate::data_provider::financials::FinancialPeriod {
-        crate::data_provider::financials::FinancialPeriod {
+    fn financial_period(date_str: &str, eps: f64) -> crate::company_financials::FinancialPeriod {
+        crate::company_financials::FinancialPeriod {
             report_date: Some(date_str.to_string()),
             eps: Some(eps),
             roe: None,
