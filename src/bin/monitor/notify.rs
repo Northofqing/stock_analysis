@@ -197,16 +197,14 @@ impl PushKind {
     /// 走 Ipo* precedent: enum 变体**保留** (不改 level/cooldown_secs/label match),
     /// 仅在此方法中"标 legacy", 在 push_governor_inner 中按 env 控制可见性.
     ///
-    /// 4 个 variants: AuctionRepush, CandidateTriggered, CandidateInvalidated, VirtualWatch.
-    /// (2026-07-16 审计: OptimalClose/VolumeWatchlist/VolumeRealTrade 已删;
+    /// 3 个 variants: CandidateTriggered, CandidateInvalidated, VirtualWatch.
+    /// (BR-223: AuctionRepush 已恢复生产接线, 移出 legacy; 2026-07-16 审计:
+    ///  OptimalClose/VolumeWatchlist/VolumeRealTrade 已删;
     ///  CandidateTriggered/VirtualWatch 实为活链路, 仅保留 legacy 标记待后续迁移评估)
     pub fn is_legacy_v17_5(self) -> bool {
         matches!(
             self,
-            Self::AuctionRepush
-                | Self::CandidateTriggered
-                | Self::CandidateInvalidated
-                | Self::VirtualWatch
+            Self::CandidateTriggered | Self::CandidateInvalidated | Self::VirtualWatch
         )
     }
 
@@ -293,6 +291,7 @@ impl PushKind {
             | PushKind::PositionReview
             | PushKind::DailyReport
             | PushKind::CandidateBoard
+            | PushKind::AuctionRepush
             | PushKind::NewsRanked
             // v13 新增
             | PushKind::PreopenNewsHot
@@ -5781,17 +5780,17 @@ mod tests {
     // ============== v17.5 §2.2: is_legacy_v17_5 标 4 variants (2026-07-16 审计后) ==============
 
     #[test]
-    fn is_legacy_v17_5_marks_four_remaining_variants() {
+    fn is_legacy_v17_5_marks_three_remaining_variants() {
+        // BR-223: AuctionRepush 已恢复生产接线, 移出 legacy (剩 3 个)
         let legacy_variants = [
-            PushKind::AuctionRepush,
             PushKind::CandidateTriggered,
             PushKind::CandidateInvalidated,
             PushKind::VirtualWatch,
         ];
         assert_eq!(
             legacy_variants.len(),
-            4,
-            "v17.5 §2.2 审计后应剩 4 个 variants (3 项已删)"
+            3,
+            "v17.5 §2.2 审计后应剩 3 个 variants (BR-223 移出 AuctionRepush)"
         );
         for k in legacy_variants {
             assert!(k.is_legacy_v17_5(), "{:?} 应被标为 legacy", k);
@@ -5830,10 +5829,9 @@ mod tests {
     #[test]
     fn is_legacy_v17_5_count_matches_v17_5_spec_section_2_2() {
         // v17.5 §2.2 (2026-07-16 勘误后): OptimalClose/VolumeWatchlist/VolumeRealTrade
-        // 已经过调用链审计确认删除; 剩余 4 项 legacy 标记
-        // (AuctionRepush + CandidateTriggered + CandidateInvalidated + VirtualWatch)
+        // 已经过调用链审计确认删除; BR-223 恢复 AuctionRepush 后剩 3 项 legacy 标记
+        // (CandidateTriggered + CandidateInvalidated + VirtualWatch)
         let all_legacy_hits: Vec<PushKind> = [
-            PushKind::AuctionRepush,
             PushKind::CandidateTriggered,
             PushKind::CandidateInvalidated,
             PushKind::VirtualWatch,
@@ -5841,7 +5839,7 @@ mod tests {
         .into_iter()
         .filter(|k| k.is_legacy_v17_5())
         .collect();
-        assert_eq!(all_legacy_hits.len(), 4);
+        assert_eq!(all_legacy_hits.len(), 3);
     }
 
     // ============== v17.6 §2.2: is_low_priority_v17_6 标 3 variants ==============

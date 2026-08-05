@@ -23,6 +23,7 @@ pub mod magic_tdx;
 pub mod magic_tdx_selection;
 pub mod magic_tdx_t0;
 pub mod market_capabilities;
+pub mod block_trade;
 pub mod market_data;
 pub mod outcome_daily_bars;
 pub mod position_chain;
@@ -82,6 +83,7 @@ pub use market_capabilities::{
     MarketOrderBook, MarketSecurityMetadata, SecurityBoard, METADATA_PROVIDER_ORDER,
     MINUTE_PROVIDER_ORDER, MONEY_FLOW_PROVIDER_ORDER, ORDER_BOOK_PROVIDER_ORDER,
 };
+pub use block_trade::{BlockTradeReview, BlockTradesGateway};
 pub use market_data::{MarketDataGateway, RealtimeMarketQuote};
 pub use outcome_daily_bars::{AdmittedOutcomeDailyBars, OutcomeDailyBarsGateway};
 pub use position_chain::{

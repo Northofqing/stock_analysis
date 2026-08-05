@@ -4289,6 +4289,15 @@ async fn run_review_only() -> Result<(), String> {
         review_timeout_secs
     );
 
+    // BR-223: 无生产者 PushKind 启动声明 (Once 保护, 每次进程只打一次)
+    static IPO_NO_PRODUCER_BANNER: std::sync::Once = std::sync::Once::new();
+    IPO_NO_PRODUCER_BANNER.call_once(|| {
+        log::warn!(
+            "[BR-223] PushKind::IpoListingApproval / IpoProspectus disabled=no_producer; \
+             仅 IpoCatalyst 有静态供应链表生产者"
+        );
+    });
+
     let review_start = std::time::Instant::now();
 
     let due: std::collections::BTreeSet<_> = review_batch::ReviewTask::ALL.into_iter().collect();
@@ -4787,16 +4796,16 @@ fn build_template_test_batches(
 
 impl TemplateTestSummary {
     fn validate(self) -> Result<(), String> {
-        let activated_news = self.family_active_total == 51;
+        let activated_news = self.family_active_total == 54;
         let expected_family = if activated_news {
-            (51, 11, 3, 65)
+            (54, 11, 3, 68)
         } else {
-            (49, 13, 3, 65)
+            (52, 13, 3, 68)
         };
         let expected_kind = if activated_news {
-            (47, 11, 1, 59)
+            (50, 9, 0, 59)
         } else {
-            (45, 13, 1, 59)
+            (48, 11, 0, 59)
         };
         let lifecycle_complete = self.manifest_version == br196_test_delivery::MANIFEST_VERSION
             && self.manifest_sha256.len() == 64
@@ -5070,15 +5079,15 @@ mod tests_br196_monitor_test_acceptance {
             manifest_sha256: "a".repeat(64),
             news_capability_generation: 1,
             news_capability_sha256: "b".repeat(64),
-            family_active_total: 49,
+            family_active_total: 52,
             family_disabled_total: 13,
             family_retired_total: 3,
-            family_total: 65,
+            family_total: 68,
             push_kind_active_total: 45,
             push_kind_disabled_total: 13,
             push_kind_retired_total: 1,
             push_kind_total: 59,
-            rendered_family_total: 49,
+            rendered_family_total: 52,
             governance_smoke_attempted: 6,
             governance_smoke_passed: 6,
             live_acceptance_opted_in: false,
@@ -5090,7 +5099,7 @@ mod tests_br196_monitor_test_acceptance {
             batches_pushed: 0,
             families_pushed: 0,
             receipt_audit_appended: 0,
-            explicit_dry_run_family_total: 49,
+            explicit_dry_run_family_total: 52,
             failed: 0,
         }
     }
@@ -5135,7 +5144,7 @@ mod tests_br196_monitor_test_acceptance {
     fn br196_renderer_catalog_is_closed_unique_and_nonempty() {
         let catalog = push_templates::build_test_template_catalog("2026-07-31", "10:30")
             .expect("complete TEST_CODE renderer catalog");
-        assert_eq!(catalog.len(), 49);
+        assert_eq!(catalog.len(), 52);
         let ids = catalog
             .iter()
             .map(|preview| preview.template_id)
@@ -6779,26 +6788,23 @@ async fn monitor_loop() {
                             }
                         }
 
-                        // ▶ v13.10.1 P0-#3: 9:20-9:25 不再独立推送优选候选,
-
-                        // 候选台(CandidateBoard)统一承载, 这里仅拉取用于虚拟观察.
-
+                        // BR-223: 9:20-9:25 竞价优选重推恢复 (A-02 AuctionRepush)。
+                        // 复用统一网关候选链路 load_real_candidate_batch (CandidateBoard 同源)。
                         if !post_close_candidates_notified {
                             post_close_candidates_notified = true;
 
-                            log::warn!(
-                            "[竞价][BR-112] opportunity observation disabled=incomplete_source_contract"
-                        );
+                            let repush_ts =
+                                chrono::Local::now().format("%H:%M:%S").to_string();
+                            let repushed =
+                                push_templates::dispatch_auction_repush(&repush_ts).await;
+                            log::info!("[竞价][BR-223] A-02 auction repush pushed={repushed}");
+                            let board_date =
+                                chrono::Local::now().format("%Y-%m-%d").to_string();
+                            let board_pushed =
+                                push_templates::dispatch_candidate_board(&board_date).await;
+                            log::info!("[竞价][BR-223] P-05 candidate board pushed={board_pushed}");
 
-                            // Keep the downstream parser inert until the producer exposes a
-                            // strict Result contract; an empty verified no-input cannot create
-                            // records or notifications.
                             let post_close = String::new();
-
-                            // 删 v13.10.1: notify::push_governor(&post_close, notify::PushKind::AuctionRepush).await;
-
-                            // CandidateBoard production assembly now occurs only in
-                            // push_templates::load_real_candidate_batch via the unified Gateway.
 
                             // 提取候选的code和name以便后续虚拟记录（简单方式：从推送文案中正则提取）
 

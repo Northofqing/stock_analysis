@@ -39,7 +39,7 @@ const fn descriptor(
     }
 }
 
-const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 51] = [
+const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 54] = [
     descriptor(
         "T-01-account-mode",
         PushKind::AccountMode,
@@ -183,6 +183,24 @@ const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 51
         PushKind::ReviewProviderTopN,
         "provider_top_n_dispatcher",
         "render_r09_provider_top_n",
+    ),
+    descriptor(
+        "A-11-ipo-catalyst",
+        PushKind::IpoCatalyst,
+        "ipo_catalyst_dispatcher",
+        "render_ipo_catalyst",
+    ),
+    descriptor(
+        "P-05-candidate-board",
+        PushKind::CandidateBoard,
+        "candidate_board_dispatcher",
+        "format_candidate_board",
+    ),
+    descriptor(
+        "A-02-auction-repush",
+        PushKind::AuctionRepush,
+        "auction_repush_dispatcher",
+        "render_auction_repush",
     ),
     descriptor(
         "R-11-position-review",
@@ -348,7 +366,7 @@ const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 51
     ),
 ];
 
-pub(super) fn descriptors() -> &'static [ProductionPresentationDescriptor; 51] {
+pub(super) fn descriptors() -> &'static [ProductionPresentationDescriptor; 54] {
     &PRODUCTION_PRESENTATION_DESCRIPTORS
 }
 

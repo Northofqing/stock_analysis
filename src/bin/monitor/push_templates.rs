@@ -7199,6 +7199,276 @@ mod br192_provider_top_n_tests {
 /// 不依赖 --push 命令行模式, 让生产 monitor 自动出盘后报告.
 /// 各 R-series dispatcher 内部分别走自己的数据源，并逐项记录成功/失败。
 /// BR-140 返回逐任务强类型结果；等待、禁用与失败均不得冒充投递成功。
+/// BR-223: A-02 竞价优选重推模板渲染 (9:20-9:25 竞价优选 Top5)。
+pub fn render_auction_repush(
+    hhmm: &str,
+    top5: &[stock_analysis::opportunity::candidate_panel::CandidateEntry],
+) -> String {
+    let mut text = format!("🔔 竞价优选 Top{}（{}）\n", top5.len(), hhmm);
+    for (index, entry) in top5.iter().enumerate() {
+        let price = entry.current_price.unwrap_or(0.0);
+        text.push_str(&format!(
+            "{}. {}({}) {} | 现价 {:.2} | 热度 {:+.0}\n",
+            index + 1,
+            entry.name,
+            entry.code,
+            entry
+                .sources
+                .first()
+                .map(|source| source.label())
+                .unwrap_or("候选"),
+            price,
+            entry.heat_score.unwrap_or(0.0)
+        ));
+    }
+    text.push_str("竞价阶段, 以开盘实际成交为准 | 辅助建议, 非下单指令");
+    text
+}
+
+/// BR-223: A-02 竞价优选重推 (9:20-9:25, v13.10.1 曾停用, 现恢复)。
+/// 复用统一网关候选链路 load_real_candidate_batch, 按 Strong 档优先 + 热度排序取 Top5。
+pub async fn dispatch_auction_repush(hhmm: &str) -> bool {
+    let entries = match load_real_candidate_batch().await {
+        Ok(batch) => batch.entries,
+        Err(error) => {
+            log::warn!("[A-02][BR-223] 候选源不可用: {error}");
+            return false;
+        }
+    };
+    if entries.is_empty() {
+        log_dispatcher_attempt("A-02", false, 0, "no candidates at auction");
+        return false;
+    }
+    let mut ranked: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| entry.current_price.is_some())
+        .collect();
+    ranked.sort_by(|a, b| {
+        let tier_a = a.tier == stock_analysis::opportunity::candidate_panel::EvidenceTier::Strong;
+        let tier_b = b.tier == stock_analysis::opportunity::candidate_panel::EvidenceTier::Strong;
+        tier_b
+            .cmp(&tier_a)
+            .then_with(|| {
+                b.heat_score
+                    .unwrap_or(0.0)
+                    .partial_cmp(&a.heat_score.unwrap_or(0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    let top5: Vec<_> = ranked.into_iter().take(5).collect();
+    if top5.is_empty() {
+        log_dispatcher_attempt("A-02", false, 0, "no priced candidates at auction");
+        return false;
+    }
+    let text = render_auction_repush(hhmm, &top5);
+    let result = dispatch_registered_outcome!(
+        "A-02-auction-repush",
+        crate::notify::PushKind::AuctionRepush,
+        "auction_repush_dispatcher",
+        "render_auction_repush",
+        "",
+        None,
+        text
+    );
+    log_dispatcher_attempt("A-02", result.is_pushed(), top5.len(), "");
+    result.is_pushed()
+}
+
+/// BR-223: A-11 IPO 阶段催化模板渲染 (静态供应链表)。
+pub fn render_ipo_catalyst(
+    date: &str,
+    companies: &[stock_analysis::news::ipo::supply_chain::IpoCompany],
+) -> String {
+    let mut text = format!("🛰️ IPO 产业链催化（{}）\n", date);
+    for company in companies {
+        text.push_str(&format!(
+            "· {} — 阶段 {:?}\n  关联: ",
+            company.pre_ipo_name, company.ipo_stage
+        ));
+        let related = company
+            .related_stocks
+            .iter()
+            .map(|(code, name, _)| format!("{name}({code})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        text.push_str(&related);
+        text.push('\n');
+    }
+    text.push_str("数据源: 维护的 IPO 供应链静态表 (阶段变化需人工更新) | 非实时事件 | 辅助建议, 非下单指令");
+    text
+}
+
+/// BR-223: A-11 IPO 阶段催化 — 静态供应链表 + 关联 A 股 (每日一次)。
+pub async fn dispatch_ipo_catalyst(date: &str) -> bool {
+    use stock_analysis::news::ipo::supply_chain::ipo_companies;
+    let companies = ipo_companies();
+    if companies.is_empty() {
+        log_dispatcher_attempt("A-11", false, 0, "no ipo companies");
+        return false;
+    }
+    let text = render_ipo_catalyst(date, companies);
+    let result = dispatch_registered_outcome!(
+        "A-11-ipo-catalyst",
+        crate::notify::PushKind::IpoCatalyst,
+        "ipo_catalyst_dispatcher",
+        "render_ipo_catalyst",
+        "",
+        None,
+        text
+    );
+    log_dispatcher_attempt("A-11", result.is_pushed(), companies.len(), "");
+    result.is_pushed()
+}
+
+/// BR-223: 盘后大宗交易推送 — BlockTradesGateway → 既有 BR-033/BR-034 dispatcher。
+/// 过滤规则: 创业板(300/301)/科创板(688) → 协议大宗实时确认;
+/// 北交所(8xx/4xx/920) → 大宗价格区间。名称以自选/持仓为准 (gateway 不带名称)。
+pub async fn dispatch_block_trade_review(
+    codes: &[String],
+    trading_date: chrono::NaiveDate,
+) -> usize {
+    let batch = match stock_analysis::data_gateway::BlockTradesGateway::new()
+        .market_review(codes, trading_date)
+        .await
+    {
+        Ok(batch) => batch,
+        Err(error) => {
+            log::warn!("[BR-033/034][BR-223] 大宗交易 gateway 失败: {error}");
+            return 0;
+        }
+    };
+    let hhmm = chrono::Local::now().format("%H:%M:%S").to_string();
+    let mut pushed = 0;
+    for review in batch.records() {
+        let code = &review.code;
+        let is_gem = code.starts_with("300") || code.starts_with("301");
+        let is_star = code.starts_with("688");
+        let is_bse = code.starts_with('8') || code.starts_with('4') || code.starts_with("920");
+        let name = code.clone();
+        if is_gem || is_star {
+            let board = if is_star { Board::Star } else { Board::Gem };
+            let qty = review.volume as u32;
+            if dispatch_block_trade_intraday_confirm(
+                &hhmm,
+                &name,
+                code,
+                qty,
+                review.price,
+                BlockType::Agreed,
+                board,
+                true,
+                SettleType::NextSession,
+            )
+            .await
+            {
+                pushed += 1;
+            }
+        } else if is_bse {
+            if dispatch_block_trade_price_range(
+                &hhmm,
+                &name,
+                code,
+                review.close_price,
+                review.price,
+                None,
+                "北交所大宗价格区间 (东财 RPT_DATA_BLOCKTRADE)",
+            )
+            .await
+            {
+                pushed += 1;
+            }
+        }
+    }
+    if pushed == 0 {
+        log_dispatcher_attempt("BR-033/034", false, batch.records().len(), "no matching block trades");
+    }
+    pushed
+}
+
+/// BR-223: P-05 候选台推送 + 候选失效 diff。
+/// 每次推送前把候选 code 集快照落盘 (data/candidate_board_snapshot/<date>.jsonl,
+/// 每行一轮), 与上一轮 diff: 上轮有本轮无 → push_candidate_invalidated。
+fn candidate_snapshot_path(date: &str) -> std::path::PathBuf {
+    let is_test = stock_analysis::risk::env_guard::runtime_is_test_process()
+        || stock_analysis::risk::env_guard::current_env()
+            == stock_analysis::risk::env_guard::TradingEnv::Test;
+    let base = if is_test { "data/test" } else { "data" };
+    std::path::PathBuf::from(base)
+        .join("candidate_board_snapshot")
+        .join(format!("{date}.jsonl"))
+}
+
+fn candidate_snapshot_previous(date: &str) -> Option<std::collections::BTreeSet<String>> {
+    let path = candidate_snapshot_path(date);
+    let content = std::fs::read_to_string(&path).ok()?;
+    let last_line = content.lines().next_back()?;
+    let codes: std::collections::BTreeSet<String> = serde_json::from_str(last_line).ok()?;
+    Some(codes)
+}
+
+fn candidate_snapshot_persist(date: &str, codes: &std::collections::BTreeSet<String>) {
+    let path = candidate_snapshot_path(date);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(line) = serde_json::to_string(codes) {
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(line.as_bytes())?;
+                f.write_all(b"\n")
+            });
+    }
+}
+
+/// BR-223: P-05 候选筛选台 (v11-P0-5++) — 统一网关候选链路 + 失效 diff。
+pub async fn dispatch_candidate_board(date: &str) -> bool {
+    let batch = match load_real_candidate_batch().await {
+        Ok(batch) => batch,
+        Err(error) => {
+            log::warn!("[P-05][BR-223] 候选源不可用: {error}");
+            return false;
+        }
+    };
+    if batch.entries.is_empty() {
+        log_dispatcher_attempt("P-05", false, 0, "no candidates");
+        return false;
+    }
+    let codes_now: std::collections::BTreeSet<String> =
+        batch.entries.iter().map(|entry| entry.code.clone()).collect();
+    // 失效 diff: 上轮有本轮无 → 推送失效 (renderer 已有 push_candidate_invalidated)
+    if let Some(previous) = candidate_snapshot_previous(date) {
+        let hhmm = chrono::Local::now().format("%H:%M:%S").to_string();
+        for code in previous.difference(&codes_now) {
+            let name = batch
+                .entries
+                .iter()
+                .find(|entry| &entry.code == code)
+                .map(|entry| entry.name.clone())
+                .unwrap_or_else(|| code.clone());
+            let _ = push_candidate_invalidated(code, &hhmm, &name, "候选", "从候选台消失").await;
+        }
+    }
+    candidate_snapshot_persist(date, &codes_now);
+    let text = stock_analysis::opportunity::candidate_panel::format_candidate_board(
+        &batch.entries,
+    );
+    let result = dispatch_registered_outcome!(
+        "P-05-candidate-board",
+        crate::notify::PushKind::CandidateBoard,
+        "candidate_board_dispatcher",
+        "format_candidate_board",
+        "",
+        None,
+        text
+    );
+    log_dispatcher_attempt("P-05", result.is_pushed(), batch.entries.len(), "");
+    result.is_pushed()
+}
+
 /// BR-222: R-07 明日观察池 (v12 MVP-4 §7.6) — 4 类来源装配 + 按 code 去重 (首胜)。
 ///
 /// 来源: A档未触发(Strong 候选) / 龙虎榜强票(净买入 Top5) / 涨停链龙头(前 3 链) /
@@ -7696,6 +7966,28 @@ pub async fn dispatch_post_session_review(
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
+
+    // BR-223: 盘后大宗交易推送 (自选+持仓代码集, 非 ReviewTask 侧推)
+    let mut block_trade_codes: Vec<String> =
+        stock_analysis::portfolio::get_positions()
+            .map(|positions| positions.into_iter().map(|position| position.code).collect())
+            .unwrap_or_default();
+    if let Ok(list) = std::env::var("STOCK_LIST") {
+        for code in list.split(',') {
+            let code = code.trim().to_string();
+            if !code.is_empty() && !block_trade_codes.contains(&code) {
+                block_trade_codes.push(code);
+            }
+        }
+    }
+    if !block_trade_codes.is_empty() {
+        let block_trade_pushed =
+            dispatch_block_trade_review(&block_trade_codes, business_date).await;
+        log::info!("[BR-223] 盘后大宗交易推送 pushed={block_trade_pushed}");
+    }
+    // BR-223: A-11 IPO 阶段催化 (每日一次, 盘后侧推)
+    let ipo_pushed = dispatch_ipo_catalyst(&date).await;
+    log::info!("[BR-223] IPO 产业链催化 pushed={ipo_pushed}");
     let observed_at = chrono::Local::now().fixed_offset();
     let account_required = account_dependency_outcomes(&phases.account_required, observed_at);
     if !account_required.is_empty() {
@@ -12976,7 +13268,7 @@ pub fn build_test_template_catalog(
         AnomalyReason, ConceptBoard, UnexplainedMove,
     };
 
-    const EXPECTED_CATALOG_TOTAL: usize = 49;
+    const EXPECTED_CATALOG_TOTAL: usize = 52;
     let banner = BannerCtx {
         account_mode: AccountMode::Normal,
         total_pos: Some(0),
@@ -13430,6 +13722,44 @@ pub fn build_test_template_catalog(
                 ("其他".to_string(), 25.0),
             ],
         }),
+    );
+    push(
+        "A-02-auction-repush",
+        render_auction_repush(
+            "09:20",
+            &[stock_analysis::opportunity::candidate_panel::CandidateEntry {
+                code: "TEST_CODE_000001".to_string(),
+                name: "TEST_CODE 候选".to_string(),
+                sources: Vec::new(),
+                tier: stock_analysis::opportunity::candidate_panel::EvidenceTier::Strong,
+                evidence: Vec::new(),
+                current_price: Some(10.0),
+                change_pct: None,
+                heat_score: Some(80.0),
+            }],
+        ),
+    );
+    push(
+        "P-05-candidate-board",
+        stock_analysis::opportunity::candidate_panel::format_candidate_board(&[
+            stock_analysis::opportunity::candidate_panel::CandidateEntry {
+                code: "TEST_CODE_000001".to_string(),
+                name: "TEST_CODE 候选".to_string(),
+                sources: Vec::new(),
+                tier: stock_analysis::opportunity::candidate_panel::EvidenceTier::Strong,
+                evidence: Vec::new(),
+                current_price: Some(10.0),
+                change_pct: None,
+                heat_score: Some(80.0),
+            },
+        ]),
+    );
+    push(
+        "A-11-ipo-catalyst",
+        render_ipo_catalyst(
+            date,
+            stock_analysis::news::ipo::supply_chain::ipo_companies(),
+        ),
     );
     push(
         "R-08-public-event-calendar",
