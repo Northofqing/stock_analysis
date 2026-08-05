@@ -349,7 +349,7 @@ type PresentationTuple = (&'static str, PushKind, &'static str, &'static str);
 // This inventory is the test manifest authority.  The production registry
 // below intentionally duplicates the canonical tuples instead of deriving
 // them, allowing either side to drift and the bijection test to catch it.
-const ACTIVE_PRESENTATIONS: [PresentationTuple; 48] = [
+const ACTIVE_PRESENTATIONS: [PresentationTuple; 49] = [
     (
         "T-01-account-mode",
         PushKind::AccountMode,
@@ -493,6 +493,12 @@ const ACTIVE_PRESENTATIONS: [PresentationTuple; 48] = [
         PushKind::ReviewProviderTopN,
         "provider_top_n_dispatcher",
         "render_r09_provider_top_n",
+    ),
+    (
+        "R-11-position-review",
+        PushKind::PositionReview,
+        "position_review_dispatcher",
+        "render_position_review",
     ),
     (
         "P-01-preopen-news-hot",
@@ -669,7 +675,7 @@ const FIXED_DISABLED_KINDS: [PushKind; 11] = [
     PushKind::IpoCatalyst,
 ];
 
-const ALL_PUSH_KINDS: [PushKind; 58] = [
+const ALL_PUSH_KINDS: [PushKind; 59] = [
     PushKind::HoldingEvent,
     PushKind::DailyReport,
     PushKind::Announcement,
@@ -703,6 +709,7 @@ const ALL_PUSH_KINDS: [PushKind; 58] = [
     PushKind::TomorrowWatch,
     PushKind::EventCalendar,
     PushKind::ReviewProviderTopN,
+    PushKind::PositionReview,
     PushKind::PreopenNewsHot,
     PushKind::IntradayMarket,
     PushKind::NewsCatalyst,
@@ -918,7 +925,7 @@ fn validate_manifest(
     families: Vec<TemplateFamily>,
     news: &NewsFlashProcessCapabilitySnapshot,
 ) -> Result<ValidatedManifest, String> {
-    if families.len() != 64 {
+    if families.len() != 65 {
         return Err(format!("BR-196 family total drift: {}", families.len()));
     }
     let mut family_keys = HashSet::new();
@@ -976,31 +983,31 @@ fn validate_manifest(
     let expected = if news.selection_v2_enabled && news.registered_feed_count > 0 {
         (
             LifecycleCounts {
-                active: 50,
+                active: 51,
                 disabled: 11,
                 retired: 3,
-                total: 64,
+                total: 65,
             },
             LifecycleCounts {
-                active: 46,
+                active: 47,
                 disabled: 11,
                 retired: 1,
-                total: 58,
+                total: 59,
             },
         )
     } else {
         (
             LifecycleCounts {
-                active: 48,
+                active: 49,
                 disabled: 13,
                 retired: 3,
-                total: 64,
+                total: 65,
             },
             LifecycleCounts {
-                active: 44,
+                active: 45,
                 disabled: 13,
                 retired: 1,
-                total: 58,
+                total: 59,
             },
         )
     };
@@ -1069,8 +1076,8 @@ fn validate_descriptor_bijection(
     families: &[TemplateFamily],
     descriptors: &[ProductionPresentationDescriptor],
 ) -> Result<(), String> {
-    if descriptors.len() != 50 {
-        return Err("BR-196 production descriptor count must be 50".to_string());
+    if descriptors.len() != 51 {
+        return Err("BR-196 production descriptor count must be 51".to_string());
     }
     let descriptor_set = descriptors.iter().copied().collect::<HashSet<_>>();
     if descriptor_set.len() != descriptors.len() {
@@ -1135,15 +1142,15 @@ fn project_push_kind_lifecycle(families: &[TemplateFamily]) -> Result<LifecycleC
         }
     }
     let all = ALL_PUSH_KINDS.into_iter().collect::<HashSet<_>>();
-    if all.len() != 58 || projected.len() != 58 || projected.keys().any(|kind| !all.contains(kind))
+    if all.len() != 59 || projected.len() != 59 || projected.keys().any(|kind| !all.contains(kind))
     {
-        return Err("BR-196 PushKind inventory is not an exact 58-kind cover".to_string());
+        return Err("BR-196 PushKind inventory is not an exact 59-kind cover".to_string());
     }
     let mut result = LifecycleCounts {
         active: 0,
         disabled: 0,
         retired: 0,
-        total: 58,
+        total: 59,
     };
     for counts in projected.values() {
         if counts.active > 0 {
@@ -1187,19 +1194,19 @@ mod tests {
         assert_eq!(
             default.family_counts,
             LifecycleCounts {
-                active: 48,
+                active: 49,
                 disabled: 13,
                 retired: 3,
-                total: 64
+                total: 65
             }
         );
         assert_eq!(
             default.push_kind_counts,
             LifecycleCounts {
-                active: 44,
+                active: 45,
                 disabled: 13,
                 retired: 1,
-                total: 58
+                total: 59
             }
         );
 
@@ -1207,19 +1214,19 @@ mod tests {
         assert_eq!(
             active.family_counts,
             LifecycleCounts {
-                active: 50,
+                active: 51,
                 disabled: 11,
                 retired: 3,
-                total: 64
+                total: 65
             }
         );
         assert_eq!(
             active.push_kind_counts,
             LifecycleCounts {
-                active: 46,
+                active: 47,
                 disabled: 11,
                 retired: 1,
-                total: 58
+                total: 59
             }
         );
         assert_eq!(
@@ -1277,7 +1284,7 @@ mod tests {
     #[test]
     fn br196_descriptor_registry_is_independent_exact_bijection() {
         let manifest = build_manifest(&snapshot(false, 0));
-        assert_eq!(crate::presentation_registry::descriptors().len(), 50);
+        assert_eq!(crate::presentation_registry::descriptors().len(), 51);
         validate_descriptor_bijection(&manifest, crate::presentation_registry::descriptors())
             .unwrap();
 

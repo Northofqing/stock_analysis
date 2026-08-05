@@ -153,8 +153,10 @@ fn review_reason_category(task: ReviewTask, outcome: &ReviewTaskOutcome) -> Stri
                 ReviewTask::R04 => "lhb_review_failed",
                 ReviewTask::R05 => "signal_outcome_review_failed",
                 ReviewTask::R06 => "failure_outcome_review_failed",
+                ReviewTask::R07 => "tomorrow_watch_failed",
                 ReviewTask::R08 => "event_calendar_review_failed",
                 ReviewTask::R09 => "provider_top_n_review_failed",
+                ReviewTask::R11 => "position_review_failed",
                 ReviewTask::A10 => "catalyst_review_failed",
                 ReviewTask::A01 => "virtual_observation_review_failed",
             }
@@ -365,8 +367,10 @@ pub enum ReviewTask {
     R04,
     R05,
     R06,
+    R07,
     R08,
     R09,
+    R11,
     A10,
     A01,
 }
@@ -379,14 +383,16 @@ pub enum ReviewTaskDependency {
 }
 
 impl ReviewTask {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::R02,
         Self::R03,
         Self::R04,
         Self::R05,
         Self::R06,
+        Self::R07,
         Self::R08,
         Self::R09,
+        Self::R11,
         Self::A10,
         Self::A01,
     ];
@@ -398,8 +404,10 @@ impl ReviewTask {
             Self::R04 => "R-04",
             Self::R05 => "R-05",
             Self::R06 => "R-06",
+            Self::R07 => "R-07",
             Self::R08 => "R-08",
             Self::R09 => "R-09",
+            Self::R11 => "R-11",
             Self::A10 => "A-10",
             Self::A01 => "A-01",
         }
@@ -416,8 +424,10 @@ impl ReviewTask {
             Self::R04 => "lhb_producer",
             Self::R05 => "signal_outcome",
             Self::R06 => "classified_failure_outcome",
+            Self::R07 => "tomorrow_watch_sources",
             Self::R08 => "event_calendar_public_component_batches",
             Self::R09 => "eastmoney_provider_top_n",
+            Self::R11 => "user_confirmed_position_summary",
             Self::A10 => "chain_rotation_security_master",
             Self::A01 => "virtual_observation_kline",
         }
@@ -425,7 +435,7 @@ impl ReviewTask {
 
     pub fn dependency(self) -> ReviewTaskDependency {
         match self {
-            Self::R04 | Self::R08 | Self::R09 | Self::A10 | Self::A01 => {
+            Self::R04 | Self::R07 | Self::R08 | Self::R09 | Self::R11 | Self::A10 | Self::A01 => {
                 ReviewTaskDependency::SourceOnly
             }
             // BR-194 §4.2: R-03 读的是 portfolio projection，不是 verified broker
@@ -1568,6 +1578,16 @@ pub fn review_preflight(
             ReviewTaskOutcome::expected_wait(lhb_ready, "LHB source not published before 21:00"),
         ));
     }
+    // BR-222: R-07 明日观察的龙虎榜来源同样依赖 21:00 发布, 与 R-04 同门等待。
+    if context.eligibility_time() < lhb_ready && runnable.remove(&ReviewTask::R07) {
+        outcomes.push((
+            ReviewTask::R07,
+            ReviewTaskOutcome::expected_wait(
+                lhb_ready,
+                "LHB source not published before 21:00 (R-07 watchlist needs it)",
+            ),
+        ));
+    }
 
     if runnable.contains(&ReviewTask::R09) {
         let current_date = context.observed_at().date();
@@ -2373,7 +2393,15 @@ mod tests {
             ReviewTaskDependency::SourceOnly
         );
         assert_eq!(
+            ReviewTask::R07.dependency(),
+            ReviewTaskDependency::SourceOnly
+        );
+        assert_eq!(
             ReviewTask::R09.dependency(),
+            ReviewTaskDependency::SourceOnly
+        );
+        assert_eq!(
+            ReviewTask::R11.dependency(),
             ReviewTaskDependency::SourceOnly
         );
         assert_eq!(
@@ -2574,8 +2602,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 ReviewTask::R04,
+                ReviewTask::R07,
                 ReviewTask::R08,
                 ReviewTask::R09,
+                ReviewTask::R11,
                 ReviewTask::A10,
                 ReviewTask::A01,
                 ReviewTask::R02,
@@ -2586,8 +2616,10 @@ mod tests {
         );
         for task in [
             ReviewTask::R04,
+            ReviewTask::R07,
             ReviewTask::R08,
             ReviewTask::R09,
+            ReviewTask::R11,
             ReviewTask::A10,
             ReviewTask::A01,
         ] {
@@ -2677,8 +2709,10 @@ mod tests {
         let phases = partition_review_tasks(&std::collections::BTreeSet::from([
             ReviewTask::R03,
             ReviewTask::R04,
+            ReviewTask::R07,
             ReviewTask::R08,
             ReviewTask::R09,
+            ReviewTask::R11,
             ReviewTask::A10,
             ReviewTask::A01,
         ]));
@@ -2686,8 +2720,10 @@ mod tests {
             phases.source_only,
             std::collections::BTreeSet::from([
                 ReviewTask::R04,
+                ReviewTask::R07,
                 ReviewTask::R08,
                 ReviewTask::R09,
+                ReviewTask::R11,
                 ReviewTask::A10,
                 ReviewTask::A01,
             ])
@@ -2718,7 +2754,9 @@ mod tests {
     #[test]
     fn br192_r09_catalog_identity_and_audit_source_are_stable() {
         assert!(ReviewTask::ALL.contains(&ReviewTask::R09));
-        assert_eq!(ReviewTask::ALL.len(), 9);
+        assert_eq!(ReviewTask::ALL.len(), 11);
+        assert!(ReviewTask::ALL.contains(&ReviewTask::R07));
+        assert!(ReviewTask::ALL.contains(&ReviewTask::R11));
         assert_eq!(ReviewTask::R09.label(), "R-09");
         assert_eq!(ReviewTask::R09.source_label(), "eastmoney_provider_top_n");
         assert_eq!(

@@ -4787,16 +4787,16 @@ fn build_template_test_batches(
 
 impl TemplateTestSummary {
     fn validate(self) -> Result<(), String> {
-        let activated_news = self.family_active_total == 50;
+        let activated_news = self.family_active_total == 51;
         let expected_family = if activated_news {
-            (50, 11, 3, 64)
+            (51, 11, 3, 65)
         } else {
-            (48, 13, 3, 64)
+            (49, 13, 3, 65)
         };
         let expected_kind = if activated_news {
-            (46, 11, 1, 58)
+            (47, 11, 1, 59)
         } else {
-            (44, 13, 1, 58)
+            (45, 13, 1, 59)
         };
         let lifecycle_complete = self.manifest_version == br196_test_delivery::MANIFEST_VERSION
             && self.manifest_sha256.len() == 64
@@ -5070,15 +5070,15 @@ mod tests_br196_monitor_test_acceptance {
             manifest_sha256: "a".repeat(64),
             news_capability_generation: 1,
             news_capability_sha256: "b".repeat(64),
-            family_active_total: 48,
+            family_active_total: 49,
             family_disabled_total: 13,
             family_retired_total: 3,
-            family_total: 64,
-            push_kind_active_total: 44,
+            family_total: 65,
+            push_kind_active_total: 45,
             push_kind_disabled_total: 13,
             push_kind_retired_total: 1,
-            push_kind_total: 58,
-            rendered_family_total: 48,
+            push_kind_total: 59,
+            rendered_family_total: 49,
             governance_smoke_attempted: 6,
             governance_smoke_passed: 6,
             live_acceptance_opted_in: false,
@@ -5090,7 +5090,7 @@ mod tests_br196_monitor_test_acceptance {
             batches_pushed: 0,
             families_pushed: 0,
             receipt_audit_appended: 0,
-            explicit_dry_run_family_total: 48,
+            explicit_dry_run_family_total: 49,
             failed: 0,
         }
     }
@@ -5135,7 +5135,7 @@ mod tests_br196_monitor_test_acceptance {
     fn br196_renderer_catalog_is_closed_unique_and_nonempty() {
         let catalog = push_templates::build_test_template_catalog("2026-07-31", "10:30")
             .expect("complete TEST_CODE renderer catalog");
-        assert_eq!(catalog.len(), 48);
+        assert_eq!(catalog.len(), 49);
         let ids = catalog
             .iter()
             .map(|preview| preview.template_id)

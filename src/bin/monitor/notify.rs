@@ -116,6 +116,8 @@ pub enum PushKind {
     EventCalendar,
     /// BR-192: Eastmoney 来源限定量比/主力净流入双 TopN (R-09)
     ReviewProviderTopN,
+    /// BR-222: 持仓复盘 (R-11, 用户确认持仓摘要, 盘后 1次/日)
+    PositionReview,
     // ============= v13 §14 新增 PushKind (PR #1) =============
     /// v13 §14.1 P-01 盘前新闻热点 (⚡ 15min 冷却)
     PreopenNewsHot,
@@ -288,6 +290,7 @@ impl PushKind {
             | PushKind::TomorrowWatch
             | PushKind::EventCalendar
             | PushKind::ReviewProviderTopN
+            | PushKind::PositionReview
             | PushKind::DailyReport
             | PushKind::CandidateBoard
             | PushKind::NewsRanked
@@ -342,6 +345,7 @@ impl PushKind {
                 | PushKind::TomorrowWatch
                 | PushKind::EventCalendar
                 | PushKind::ReviewProviderTopN
+                | PushKind::PositionReview
                 | PushKind::DailyReport
                 | PushKind::AuctionVolume
                 // v13 新增 (P-01 盘前无持仓语义, 不要 banner; I-01/I-02 盘中交易建议类, 要 banner)
@@ -378,6 +382,7 @@ impl PushKind {
             | PushKind::TomorrowWatch
             | PushKind::EventCalendar
             | PushKind::ReviewProviderTopN
+            | PushKind::PositionReview
             | PushKind::DailyReport => Some(86_400),
             // 复用现有冷却配置
             PushKind::AuctionVolume | PushKind::AuctionRepush => Some(600),
@@ -480,6 +485,7 @@ impl PushKind {
             PushKind::TomorrowWatch => "明日观察池",
             PushKind::EventCalendar => "事件日历",
             PushKind::ReviewProviderTopN => "盘后量能与主力净流入",
+            PushKind::PositionReview => "持仓复盘",
             // v13 新增
             PushKind::PreopenNewsHot => "盘前热点",
             PushKind::IntradayMarket => "盘中轮动",

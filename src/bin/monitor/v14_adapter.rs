@@ -1078,6 +1078,7 @@ fn map_push_kind(kind: PushKind) -> (SignalSource, &'static str, Severity) {
         PushKind::ReviewMarket => (HoldingHealth, "review_market", Severity::Normal),
         PushKind::ReviewLhb => (HoldingHealth, "review_lhb", Severity::Normal),
         PushKind::ReviewProviderTopN => (HoldingHealth, "review_provider_top_n", Severity::Normal),
+        PushKind::PositionReview => (HoldingHealth, "position_review", Severity::Normal),
         PushKind::ReviewSignal => (HoldingHealth, "review_signal", Severity::Normal),
         PushKind::ReviewFailure => (HoldingHealth, "review_failure", Severity::High),
         PushKind::TomorrowWatch => (HoldingHealth, "tomorrow_watch", Severity::Normal),

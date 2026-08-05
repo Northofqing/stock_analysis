@@ -7199,6 +7199,411 @@ mod br192_provider_top_n_tests {
 /// 不依赖 --push 命令行模式, 让生产 monitor 自动出盘后报告.
 /// 各 R-series dispatcher 内部分别走自己的数据源，并逐项记录成功/失败。
 /// BR-140 返回逐任务强类型结果；等待、禁用与失败均不得冒充投递成功。
+/// BR-222: R-07 明日观察池 (v12 MVP-4 §7.6) — 4 类来源装配 + 按 code 去重 (首胜)。
+///
+/// 来源: A档未触发(Strong 候选) / 龙虎榜强票(净买入 Top5) / 涨停链龙头(前 3 链) /
+/// 可做T持仓(整百股结构过滤)。龙虎榜/涨停链条目无价格字段, 按 BR-222 规则置 0.0
+/// 并在理由中注明 "以明日竞价为准, 按 T-11 复核" (红线 2.2: 不虚构价格)。
+async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::ReviewTaskOutcome {
+    use stock_analysis::opportunity::candidate_panel::EvidenceTier;
+    use stock_analysis::review::tomorrow_watchlist::{
+        dedup, WatchItem as OwnedWatchItem, WatchSource,
+    };
+
+    let trading_date = match chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            let reason = format!("invalid review date {date}: {error}");
+            log_dispatcher_attempt("R-07", false, 0, &reason);
+            return crate::review_batch::ReviewTaskOutcome::failed(false, reason);
+        }
+    };
+
+    let mut items: Vec<OwnedWatchItem> = Vec::new();
+
+    // 1. A档未触发 (EvidenceTier::Strong 候选, DB-only)
+    match tokio::task::spawn_blocking(load_candidate_source_context).await {
+        Ok(Ok(context)) => {
+            for entry in context.entries {
+                if entry.tier != EvidenceTier::Strong {
+                    continue;
+                }
+                let Some(price) = entry.current_price else {
+                    continue;
+                };
+                items.push(OwnedWatchItem {
+                    code: entry.code,
+                    name: entry.name,
+                    topic: entry
+                        .sources
+                        .first()
+                        .map(|source| source.label().to_string())
+                        .unwrap_or_else(|| "A档候选".to_string()),
+                    source: WatchSource::AGradeNotTriggered,
+                    trigger: entry
+                        .evidence
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "A档候选未触发".to_string()),
+                    lo_price: price * 0.97,
+                    hi_price: price * 1.03,
+                    stop: price * 0.95,
+                    reason: "A档候选未触发: 现价未进入触发区间".to_string(),
+                });
+            }
+        }
+        Ok(Err(error)) => log::warn!("[R-07][BR-222] A档候选源不可用, 跳过该来源: {error}"),
+        Err(error) => log::warn!("[R-07][BR-222] A档候选 join 失败: {error}"),
+    }
+
+    // 2. 龙虎榜强票 (净买入 > 0 Top5; 无价格 → 0.0 + T-11 复核注记)
+    match stock_analysis::data_gateway::dragon_tiger::DragonTigerGateway::new()
+        .market_review(trading_date, 5, 5)
+        .await
+    {
+        Ok(batch) => {
+            let mut strong: Vec<_> = batch
+                .records()
+                .iter()
+                .filter(|record| record.ranking_net_amount_yuan > 0.0)
+                .collect();
+            strong.sort_by(|a, b| {
+                b.ranking_net_amount_yuan
+                    .partial_cmp(&a.ranking_net_amount_yuan)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for record in strong.iter().take(5) {
+                items.push(OwnedWatchItem {
+                    code: record.code.clone(),
+                    name: record.code.clone(),
+                    topic: "龙虎榜强票".to_string(),
+                    source: WatchSource::LhbStrong,
+                    trigger: format!("净买入 {:.0} 万", record.ranking_net_amount_yuan / 10000.0),
+                    lo_price: 0.0,
+                    hi_price: 0.0,
+                    stop: 0.0,
+                    reason: "龙虎榜净买入为正; 价格以明日竞价为准, 按 T-11 复核".to_string(),
+                });
+            }
+        }
+        Err(error) => log::warn!("[R-07][BR-222] 龙虎榜源不可用, 跳过该来源: {error}"),
+    }
+
+    // 3. 涨停链龙头 (前 3 链 leader)
+    match stock_analysis::data_gateway::review::ReviewDataGateway::new()
+        .r03_upper_limit_pool(trading_date)
+        .await
+    {
+        Ok(batch) => {
+            let stocks: Vec<stock_analysis::market_analyzer::limit_chain_review::StockLimitStats> =
+                batch
+                    .records()
+                    .iter()
+                    .map(|record| {
+                        stock_analysis::market_analyzer::limit_chain_review::StockLimitStats {
+                            code: record.code.clone(),
+                            name: String::new(),
+                            chain: record
+                                .theme
+                                .clone()
+                                .unwrap_or_else(|| "未分类".to_string()),
+                            board_level: record.streak.unwrap_or(1).min(3) as u8,
+                            is_limit_up_today: true,
+                            is_first_board: record.streak.unwrap_or(1) <= 1,
+                            consecutive_days: record.streak.unwrap_or(1),
+                        }
+                    })
+                    .collect();
+            let input = stock_analysis::market_analyzer::limit_chain_review::LimitChainInput {
+                stocks,
+                source_complete: !batch.is_verified_empty(),
+            };
+            let chains = stock_analysis::market_analyzer::limit_chain_review::aggregate(&input);
+            for chain in chains.iter().take(3) {
+                let name = if chain.leader_name.is_empty() {
+                    chain.leader_code.clone()
+                } else {
+                    chain.leader_name.clone()
+                };
+                items.push(OwnedWatchItem {
+                    code: chain.leader_code.clone(),
+                    name,
+                    topic: chain.chain.clone(),
+                    source: WatchSource::LimitChainLeader,
+                    trigger: format!("{}-板", chain.leader_boards),
+                    lo_price: 0.0,
+                    hi_price: 0.0,
+                    stop: 0.0,
+                    reason: format!(
+                        "涨停链龙头({}家涨停); 价格以明日竞价为准, 按 T-11 复核",
+                        chain.limit_up_n
+                    ),
+                });
+            }
+        }
+        Err(error) => log::warn!("[R-07][BR-222] 涨停链源不可用, 跳过该来源: {error}"),
+    }
+
+    // 4. 可做T持仓 (结构过滤: Holding + 整百股 + 成本价 > 0)
+    match tokio::task::spawn_blocking(stock_analysis::portfolio::get_positions).await {
+        Ok(Ok(positions)) => {
+            for position in positions {
+                if position.status != stock_analysis::portfolio::PositionStatus::Holding {
+                    continue;
+                }
+                if position.shares < 100
+                    || position.shares % 100 != 0
+                    || position.cost_price <= 0.0
+                {
+                    continue;
+                }
+                items.push(OwnedWatchItem {
+                    code: position.code,
+                    name: position.name,
+                    topic: "做T候选".to_string(),
+                    source: WatchSource::T0Candidate,
+                    trigger: "持仓做T".to_string(),
+                    lo_price: position.cost_price * 0.98,
+                    hi_price: position.cost_price * 1.02,
+                    stop: position.cost_price * 0.95,
+                    reason: "整百股持仓满足做T结构条件".to_string(),
+                });
+            }
+        }
+        Ok(Err(error)) => log::warn!("[R-07][BR-222] 持仓源不可用, 跳过该来源: {error}"),
+        Err(error) => log::warn!("[R-07][BR-222] 持仓 join 失败: {error}"),
+    }
+
+    let items = dedup(items);
+    if items.is_empty() {
+        log_dispatcher_attempt("R-07", false, 0, "tomorrow watchlist empty");
+        return crate::review_batch::ReviewTaskOutcome::no_data(
+            "tomorrow watchlist empty: no candidate source available",
+        );
+    }
+
+    let mut borrowed: Vec<WatchItem<'_>> = Vec::with_capacity(items.len());
+    for item in &items {
+        borrowed.push(WatchItem {
+            name: &item.name,
+            code: &item.code,
+            topic: &item.topic,
+            source: item.source.label(),
+            trigger: &item.trigger,
+            lo: item.lo_price,
+            hi: item.hi_price,
+            stop: item.stop,
+            reason: &item.reason,
+        });
+    }
+    let text = render_tomorrow_watch(date, &borrowed);
+    let result = dispatch_registered_outcome!(
+        "R-07-tomorrow-watch",
+        crate::notify::PushKind::TomorrowWatch,
+        "tomorrow_watch_dispatcher",
+        "render_tomorrow_watch",
+        "",
+        None,
+        text
+    );
+    log_dispatcher_attempt("R-07", result.is_pushed(), items.len(), "");
+    crate::review_batch::ReviewTaskOutcome::from_push_outcome(result, items.len())
+}
+
+/// R-11 持仓复盘渲染入参 (BR-222)。
+#[derive(Debug)]
+pub struct PositionReviewParams<'a> {
+    pub date: &'a str,
+    pub total_assets: f64,
+    pub position_ratio_pct: f64,
+    pub available_cash: f64,
+    pub daily_pnl: f64,
+    pub unrealized_pnl: f64,
+    pub unrealized_return_pct: f64,
+    pub position_count: usize,
+    pub market_value: f64,
+    /// (行业, 市值占比 %) — 按市值加权, top5 + 其他 (BR-222 排序规则)
+    pub sectors: &'a [(String, f64)],
+}
+
+/// BR-222: R-11 持仓复盘模板渲染 (用户确认持仓摘要, 盘后 1次/日)。
+pub fn render_position_review(p: PositionReviewParams<'_>) -> String {
+    let mut out = format!("🏦 持仓复盘（{}）\n", p.date);
+    out.push_str(&format!(
+        "总资产 {:.0} | 仓位 {:.1}% | 可用现金 {:.0}\n",
+        p.total_assets, p.position_ratio_pct, p.available_cash
+    ));
+    out.push_str(&format!(
+        "日盈亏 {:+.2} | 未实现盈亏 {:+.2}（{:.2}%）\n",
+        p.daily_pnl, p.unrealized_pnl, p.unrealized_return_pct
+    ));
+    out.push_str(&format!(
+        "持仓 {} 只 | 持仓市值 {:.0}\n",
+        p.position_count, p.market_value
+    ));
+    out.push_str("行业分布（按市值）: ");
+    if p.sectors.is_empty() {
+        out.push_str("(无持仓)\n");
+    } else {
+        for (index, (sector, pct)) in p.sectors.iter().enumerate() {
+            out.push_str(&format!(
+                "{}{} {:.0}%",
+                if index == 0 { "" } else { ", " },
+                sector,
+                pct
+            ));
+        }
+        out.push('\n');
+    }
+    out.push_str("仅结构化事实, 非下单指令");
+    out
+}
+
+/// BR-222: R-11 持仓复盘 (用户确认持仓摘要, 盘后 1次/日)。
+///
+/// 数据门: `user_account_summary` 无用户确认行 → no_data (不虚构账户状态);
+/// 收盘估值未持久化 → no_data。空持仓仍投递 (显示 "无持仓"), 用户确认摘要本身
+/// 是权威信息。行业分布按市值加权聚合, top5 + 其余归入 "其他"。
+async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::ReviewTaskOutcome {
+    use stock_analysis::database::closing_valuation::{
+        latest_persisted_valuation_view, ClosingValuationView,
+    };
+    use stock_analysis::database::user_account_summary::latest as latest_user_account_summary;
+
+    let summary = match tokio::task::spawn_blocking(latest_user_account_summary).await {
+        Ok(Ok(Some(summary))) => summary,
+        Ok(Ok(None)) => {
+            log_dispatcher_attempt("R-11", false, 0, "user account summary not confirmed");
+            return crate::review_batch::ReviewTaskOutcome::no_data(
+                "user account summary not confirmed",
+            );
+        }
+        Ok(Err(error)) => {
+            let reason = format!("user account summary read failed: {error}");
+            log_dispatcher_attempt("R-11", false, 0, &reason);
+            return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
+        }
+        Err(error) => {
+            let reason = format!("user account summary join failed: {error}");
+            return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
+        }
+    };
+
+    let valuation: Option<ClosingValuationView> =
+        match tokio::task::spawn_blocking(latest_persisted_valuation_view).await {
+            Ok(Ok(valuation)) => valuation,
+            Ok(Err(error)) => {
+                let reason = format!("closing valuation read failed: {error}");
+                log_dispatcher_attempt("R-11", false, 0, &reason);
+                return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
+            }
+            Err(error) => {
+                let reason = format!("closing valuation join failed: {error}");
+                return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
+            }
+        };
+    let Some(valuation) = valuation else {
+        log_dispatcher_attempt("R-11", false, 0, "closing valuation not persisted");
+        return crate::review_batch::ReviewTaskOutcome::no_data("closing valuation not persisted");
+    };
+
+    let positions =
+        match tokio::task::spawn_blocking(stock_analysis::portfolio::get_positions).await {
+            Ok(Ok(positions)) => positions,
+            Ok(Err(error)) => {
+                let reason = format!("positions read failed: {error}");
+                log_dispatcher_attempt("R-11", false, 0, &reason);
+                return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
+            }
+            Err(error) => {
+                let reason = format!("positions join failed: {error}");
+                return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
+            }
+        };
+
+    // 行业分布: 持仓市值 = 收盘估值 market_value (优先) 或 shares * cost_price; 按 Position.sector 聚合
+    let mut sector_value: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+    let mut total_position_value = 0.0_f64;
+    for position in &positions {
+        if position.status != stock_analysis::portfolio::PositionStatus::Holding {
+            continue;
+        }
+        let market_value = valuation
+            .valuation
+            .items
+            .iter()
+            .find(|item| item.code == position.code)
+            .map(|item| item.market_value.unwrap_or(0.0))
+            .unwrap_or_else(|| position.shares as f64 * position.cost_price);
+        total_position_value += market_value;
+        *sector_value
+            .entry(position.sector.clone())
+            .or_insert(0.0) += market_value;
+    }
+    let mut sector_rows: Vec<(String, f64)> = sector_value
+        .into_iter()
+        .map(|(sector, value)| {
+            let pct = if total_position_value > 0.0 {
+                value / total_position_value * 100.0
+            } else {
+                0.0
+            };
+            (sector, pct)
+        })
+        .collect();
+    sector_rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut top_sectors: Vec<(String, f64)> = Vec::new();
+    let mut remainder = 0.0_f64;
+    for (index, (sector, pct)) in sector_rows.into_iter().enumerate() {
+        if index < 5 {
+            top_sectors.push((sector, pct));
+        } else {
+            remainder += pct;
+        }
+    }
+    if remainder > 0.0 {
+        top_sectors.push(("其他".to_string(), remainder));
+    }
+
+    let unrealized_return_pct = if summary.securities_market_value > 0.0 {
+        valuation
+            .valuation
+            .total_unrealized_pnl
+            .unwrap_or(0.0)
+            / summary.securities_market_value
+            * 100.0
+    } else {
+        0.0
+    };
+    let params = PositionReviewParams {
+        date,
+        total_assets: summary.total_assets,
+        position_ratio_pct: summary.position_ratio_pct,
+        available_cash: summary.available_cash,
+        daily_pnl: summary.daily_pnl,
+        unrealized_pnl: valuation.valuation.total_unrealized_pnl.unwrap_or(0.0),
+        unrealized_return_pct,
+        position_count: positions
+            .iter()
+            .filter(|p| p.status == stock_analysis::portfolio::PositionStatus::Holding)
+            .count(),
+        market_value: valuation.valuation.total_market_value.unwrap_or(total_position_value),
+        sectors: &top_sectors,
+    };
+    let text = render_position_review(params);
+    let result = dispatch_registered_outcome!(
+        "R-11-position-review",
+        crate::notify::PushKind::PositionReview,
+        "position_review_dispatcher",
+        "render_position_review",
+        "",
+        None,
+        text
+    );
+    log_dispatcher_attempt("R-11", result.is_pushed(), 1, "");
+    crate::review_batch::ReviewTaskOutcome::from_push_outcome(result, 1)
+}
+
 pub async fn dispatch_post_session_review(
     context: crate::review_batch::ReviewRunContext,
     due: &std::collections::BTreeSet<crate::review_batch::ReviewTask>,
@@ -7218,10 +7623,20 @@ pub async fn dispatch_post_session_review(
             == stock_analysis::risk::env_guard::TradingEnv::Test;
     let preflight = review_preflight(context, due, is_test);
     let phases = partition_review_tasks(&preflight.runnable);
-    let (r04, r08, r09, a10, a01) = tokio::join!(
+    let (r04, r07, r08, r09, r11, a10, a01) = tokio::join!(
         async {
             if phases.source_only.contains(&ReviewTask::R04) {
                 Some((ReviewTask::R04, dispatch_r04_lhb_outcome(&date, now).await))
+            } else {
+                None
+            }
+        },
+        async {
+            if phases.source_only.contains(&ReviewTask::R07) {
+                Some((
+                    ReviewTask::R07,
+                    dispatch_tomorrow_watch_outcome(&date).await,
+                ))
             } else {
                 None
             }
@@ -7241,6 +7656,16 @@ pub async fn dispatch_post_session_review(
                 Some((
                     ReviewTask::R09,
                     dispatch_r09_provider_top_n_outcome(business_date).await,
+                ))
+            } else {
+                None
+            }
+        },
+        async {
+            if phases.source_only.contains(&ReviewTask::R11) {
+                Some((
+                    ReviewTask::R11,
+                    dispatch_position_review_outcome(&date).await,
                 ))
             } else {
                 None
@@ -7267,7 +7692,7 @@ pub async fn dispatch_post_session_review(
             }
         },
     );
-    let source_only_outcomes = [r04, r08, r09, a10, a01]
+    let source_only_outcomes = [r04, r07, r08, r09, r11, a10, a01]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
@@ -12551,7 +12976,7 @@ pub fn build_test_template_catalog(
         AnomalyReason, ConceptBoard, UnexplainedMove,
     };
 
-    const EXPECTED_CATALOG_TOTAL: usize = 48;
+    const EXPECTED_CATALOG_TOTAL: usize = 49;
     let banner = BannerCtx {
         account_mode: AccountMode::Normal,
         total_pos: Some(0),
@@ -12986,6 +13411,25 @@ pub fn build_test_template_catalog(
                 reason: "TEST_CODE 多源共振",
             }],
         ),
+    );
+    push(
+        "R-11-position-review",
+        render_position_review(PositionReviewParams {
+            date,
+            total_assets: 100_000.0,
+            position_ratio_pct: 61.3,
+            available_cash: 38_700.0,
+            daily_pnl: 1_864.60,
+            unrealized_pnl: -21_729.90,
+            unrealized_return_pct: -3.51,
+            position_count: 7,
+            market_value: 61_300.0,
+            sectors: &[
+                ("TEST_CODE 算力".to_string(), 45.0),
+                ("TEST_CODE 半导体".to_string(), 30.0),
+                ("其他".to_string(), 25.0),
+            ],
+        }),
     );
     push(
         "R-08-public-event-calendar",
