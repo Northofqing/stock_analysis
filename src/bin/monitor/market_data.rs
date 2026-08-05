@@ -32,6 +32,47 @@ pub(super) fn validate_quote_batch_codes(
     Ok(())
 }
 
+/// BR-218: a freshness-partitioned quote batch may legitimately be a strict
+/// subset of the request. Consumers that only monitor a list of instruments
+/// accept the subset; excluded codes stay absent (AGENTS §2.2) and are
+/// re-acquired next round. Duplicates and unrequested codes remain failures.
+pub(super) fn validate_quote_batch_subset(
+    requested: &[String],
+    quotes: &[stock_analysis::market_data::TopStock],
+    source: &str,
+) -> Result<(), String> {
+    use std::collections::HashSet;
+
+    let requested_set: HashSet<&str> = requested.iter().map(String::as_str).collect();
+    if requested_set.len() != requested.len() {
+        return Err(format!("{source} 请求代码包含重复项"));
+    }
+    if quotes.is_empty() {
+        return Err(format!("{source} 行情批次为空"));
+    }
+    let mut returned_set = HashSet::new();
+    for quote in quotes {
+        if !returned_set.insert(quote.code.as_str()) {
+            return Err(format!("{source} 行情重复代码: {}", quote.code));
+        }
+    }
+    let mut extra: Vec<&str> = returned_set.difference(&requested_set).copied().collect();
+    if !extra.is_empty() {
+        extra.sort_unstable();
+        return Err(format!("{source} 行情批次含未请求代码: extra={extra:?}"));
+    }
+    if returned_set.len() != requested_set.len() {
+        let mut missing: Vec<&str> = requested_set.difference(&returned_set).copied().collect();
+        missing.sort_unstable();
+        log::warn!(
+            "[BR-218][{source}] 行情批次为请求子集 requested={} admitted={} missing={missing:?}",
+            requested_set.len(),
+            returned_set.len()
+        );
+    }
+    Ok(())
+}
+
 fn mark_capability_success(
     capability: stock_analysis::monitor::data_mode::Capability,
 ) -> Result<(), String> {
@@ -149,7 +190,7 @@ fn project_top_stock_batch(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    validate_quote_batch_codes(codes, &stocks, "unified_market_gateway")?;
+    validate_quote_batch_subset(codes, &stocks, "unified_market_gateway")?;
     Ok(TopStockBatch { stocks, evidence })
 }
 

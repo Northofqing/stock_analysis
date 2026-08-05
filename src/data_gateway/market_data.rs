@@ -18,8 +18,8 @@ use magic_market_router::{
 use magic_sina_rs::{SinaClient, SinaError};
 use magic_tdx_rs::{TdxError, TdxSmartClient};
 use magic_tencent_rs::{TencentClient, TencentError};
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::instrument_identity::{resolve_production_equity, EquitySegment};
 use super::parse_evidence_instant;
@@ -376,8 +376,14 @@ fn route_quotes(
     // providers registered behind a systematically-late one.
     let policy = realtime_quote_acceptance_policy();
     let mut last_failure: Option<(ProviderId, GatewayError)> = None;
+    // BR-219: proven-dead providers are skipped so their retry budget is not
+    // paid on every acquisition.
+    let skips = quote_breaker_skips(Utc::now());
 
     for provider in QUOTE_PROVIDER_CHAIN {
+        if skips.contains(&provider) {
+            continue;
+        }
         let source = match quote_chain_source(provider) {
             Ok(source) => source,
             Err(error) => return (provider, Err(router_gateway_error(error, provider))),
@@ -391,7 +397,10 @@ fn route_quotes(
             Ok(outcome) => {
                 let selected = outcome.selected_provider();
                 match admit_quote_batch(storage_codes, selected, outcome.into_batch()) {
-                    Ok(batch) => return (selected, Ok(batch)),
+                    Ok(batch) => {
+                        record_quote_provider_success(selected);
+                        return (selected, Ok(batch));
+                    }
                     Err(error) => Some((selected, error)),
                 }
             }
@@ -400,12 +409,14 @@ fn route_quotes(
                 // provider, so its terminal-looking verdict describes one
                 // route, never the whole chain. Always advance; treating it as
                 // final is what let a broken primary shadow the fallbacks.
+                record_quote_provider_failure(provider, Utc::now());
                 last_failure = Some((provider, router_gateway_error(error, provider)));
                 None
             }
         };
 
         if let Some((selected, error)) = admission {
+            record_quote_provider_failure(selected, Utc::now());
             // A non-retryable admission failure is a definitive statement about
             // the request itself, not about this provider's liveness; trying
             // the next source would only relabel the same rejection.
@@ -434,6 +445,90 @@ fn route_quotes(
 /// A-share route candidate; the HTTP providers behind it are fallbacks only.
 const QUOTE_PROVIDER_CHAIN: [ProviderId; 3] =
     [ProviderId::Tdx, ProviderId::Tencent, ProviderId::Sina];
+
+/// BR-219: consecutive failures before a proven-dead provider is skipped.
+const QUOTE_BREAKER_FAILURE_THRESHOLD: u32 = 3;
+/// BR-219: how long a tripped provider stays skipped before it is retried.
+const QUOTE_BREAKER_COOLDOWN_SECS: i64 = 300;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct QuoteBreakerState {
+    consecutive_failures: u32,
+    opened_at: Option<DateTime<Utc>>,
+}
+
+fn quote_breakers() -> &'static Mutex<HashMap<ProviderId, QuoteBreakerState>> {
+    static BREAKERS: OnceLock<Mutex<HashMap<ProviderId, QuoteBreakerState>>> = OnceLock::new();
+    BREAKERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// BR-219: providers whose retry budget is currently not worth paying.
+///
+/// Skipping only reorders attempts; it never fabricates a batch and never
+/// turns an unattempted provider into a successful or empty one. If the whole
+/// chain is tripped the skip set is discarded so that a transient outage can
+/// never escalate into permanently not acquiring anything.
+fn quote_breaker_skips(now: DateTime<Utc>) -> HashSet<ProviderId> {
+    let mut guard = match quote_breakers().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let mut skips = HashSet::new();
+    for provider in QUOTE_PROVIDER_CHAIN {
+        let Some(state) = guard.get_mut(&provider) else {
+            continue;
+        };
+        let Some(opened_at) = state.opened_at else {
+            continue;
+        };
+        let elapsed = now.signed_duration_since(opened_at).num_seconds();
+        if elapsed >= QUOTE_BREAKER_COOLDOWN_SECS {
+            state.opened_at = None;
+            state.consecutive_failures = 0;
+            continue;
+        }
+        log::warn!(
+            "[DataGateway][RealtimeMarketQuotes][BR-219] skipping provider={provider:?} \
+             consecutive_failures={} cooldown_remaining_secs={}",
+            state.consecutive_failures,
+            QUOTE_BREAKER_COOLDOWN_SECS - elapsed
+        );
+        skips.insert(provider);
+    }
+    if skips.len() == QUOTE_PROVIDER_CHAIN.len() {
+        log::warn!(
+            "[DataGateway][RealtimeMarketQuotes][BR-219] every provider is tripped; \
+             ignoring the breaker and attempting the whole chain"
+        );
+        return HashSet::new();
+    }
+    skips
+}
+
+fn record_quote_provider_success(provider: ProviderId) {
+    let mut guard = match quote_breakers().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.insert(provider, QuoteBreakerState::default());
+}
+
+fn record_quote_provider_failure(provider: ProviderId, now: DateTime<Utc>) {
+    let mut guard = match quote_breakers().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let state = guard.entry(provider).or_default();
+    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+    if state.consecutive_failures >= QUOTE_BREAKER_FAILURE_THRESHOLD && state.opened_at.is_none() {
+        state.opened_at = Some(now);
+        log::warn!(
+            "[DataGateway][RealtimeMarketQuotes][BR-219] tripped provider={provider:?} \
+             consecutive_failures={} cooldown_secs={QUOTE_BREAKER_COOLDOWN_SECS}",
+            state.consecutive_failures
+        );
+    }
+}
 
 fn quote_chain_source(
     provider: ProviderId,
@@ -510,6 +605,7 @@ fn admit_quote_batch(
         batch.provenance().fetched_at(),
     )?;
     let mut records = Vec::with_capacity(batch.records().len());
+    let mut stale_exclusions: Vec<String> = Vec::new();
     for (storage_code, quote) in storage_codes.iter().zip(batch.records()) {
         let expected = build_instrument(storage_code)?;
         if quote.instrument() != &expected
@@ -570,14 +666,12 @@ fn admit_quote_batch(
         )?;
         let age_ms = now.signed_duration_since(source_at).num_milliseconds();
         if !(0..=5_000).contains(&age_ms) {
-            return Err(GatewayError::classified(
-                CAPABILITY,
-                Some(provider),
-                "stale",
-                "quote_stale",
-                true,
-                format!("quote {storage_code} failed five-second freshness gate age_ms={age_ms}"),
-            ));
+            // BR-218: the five-second red line is judged per record. A stale
+            // record is excluded outright — never repaired, back-filled or
+            // served from a previous round — but it must not discard the
+            // records that did meet the gate.
+            stale_exclusions.push(format!("{storage_code}@{age_ms}ms"));
+            continue;
         }
 
         records.push(RealtimeMarketQuote {
@@ -591,6 +685,32 @@ fn admit_quote_batch(
             provider,
             batch_id: quote.batch_id().to_owned(),
         });
+    }
+
+    if records.is_empty() {
+        // BR-218: every requested instrument was stale. This is still a
+        // whole-batch, retryable staleness verdict so BR-217 fails over.
+        return Err(GatewayError::classified(
+            CAPABILITY,
+            Some(provider),
+            "stale",
+            "quote_stale",
+            true,
+            format!(
+                "every quote failed the five-second freshness gate: {}",
+                stale_exclusions.join(",")
+            ),
+        ));
+    }
+    if !stale_exclusions.is_empty() {
+        log::warn!(
+            "[DataGateway][RealtimeMarketQuotes][BR-218] provider={provider:?} batch_id={} \
+             admitted={} excluded_stale={} excluded=[{}]",
+            evidence.batch_id,
+            records.len(),
+            stale_exclusions.len(),
+            stale_exclusions.join(",")
+        );
     }
 
     Ok(GatewayBatch::Available { records, evidence })
@@ -733,6 +853,179 @@ mod tests {
             .with_batch_id(batch_id)
             .unwrap();
         DataBatch::strict(vec![quote], provenance)
+    }
+
+    /// BR-218: a multi-record batch whose members carry independent source
+    /// times, matching how free A-share feeds actually behave.
+    fn quote_batch_multi(
+        entries: &[(&str, DateTime<Utc>)],
+        provider: ProviderId,
+        batch_id: &str,
+    ) -> DataBatch<Quote> {
+        let observed_at = Utc::now().to_rfc3339();
+        let quotes = entries
+            .iter()
+            .map(|(code, source_at)| {
+                let timestamp = source_at.to_rfc3339();
+                let instrument =
+                    InstrumentId::new(Exchange::Shanghai, *code, AssetClass::Equity).unwrap();
+                Quote::from_parts(
+                    instrument,
+                    Some("协议测试股票".to_owned()),
+                    Price::new(10.0).unwrap(),
+                    Some(Price::new(9.5).unwrap()),
+                    Some(Price::new(9.6).unwrap()),
+                    Some(Price::new(10.1).unwrap()),
+                    Some(Price::new(9.4).unwrap()),
+                    Some(Ratio::new(5.263_157_894_7, RatioUnit::Percent).unwrap()),
+                    Quantity::new(100.0).unwrap(),
+                    Some(Money::new(1_000_000.0).unwrap()),
+                    DataStatus::Available,
+                    Some(timestamp),
+                    observed_at.clone(),
+                    provider,
+                    batch_id,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let provenance = Provenance::new("TEST_CODE_quote", &observed_at)
+            .unwrap()
+            .with_source_at(&observed_at)
+            .unwrap()
+            .with_batch_id(batch_id)
+            .unwrap();
+        DataBatch::strict(quotes, provenance)
+    }
+
+    /// BR-218 / AGENTS §2.4 + §2.2: one instrument whose feed lagged past five
+    /// seconds must be excluded, not allowed to discard the fresh records
+    /// alongside it. This is the defect that produced zero live quotes: free
+    /// feeds lag 0.5–5s per instrument independently, so an all-or-nothing
+    /// batch verdict almost never passes for a realistic watchlist.
+    #[test]
+    fn br218_stale_record_is_excluded_without_discarding_fresh_records() {
+        let now = Utc::now();
+        let codes = vec![
+            "600396".to_owned(),
+            "600519".to_owned(),
+            "600036".to_owned(),
+        ];
+        let batch = quote_batch_multi(
+            &[
+                ("600396", now - chrono::Duration::milliseconds(500)),
+                ("600519", now - chrono::Duration::seconds(30)),
+                ("600036", now - chrono::Duration::milliseconds(900)),
+            ],
+            ProviderId::Tencent,
+            "TEST_CODE_partition_batch",
+        );
+
+        let admitted = admit_quote_batch(&codes, ProviderId::Tencent, batch)
+            .expect("fresh records must survive a stale sibling");
+        let kept = admitted
+            .records()
+            .iter()
+            .map(|record| record.code.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kept,
+            vec!["600396", "600036"],
+            "the stale instrument stays absent; it is never repaired or back-filled"
+        );
+    }
+
+    /// BR-218: excluding stale records must not weaken the red line. When every
+    /// record is stale the batch still fails retryably so BR-217 fails over.
+    #[test]
+    fn br218_all_stale_records_still_fail_the_batch_retryably() {
+        let now = Utc::now();
+        let codes = vec!["600396".to_owned(), "600519".to_owned()];
+        let batch = quote_batch_multi(
+            &[
+                ("600396", now - chrono::Duration::seconds(6)),
+                ("600519", now - chrono::Duration::seconds(30)),
+            ],
+            ProviderId::Tencent,
+            "TEST_CODE_all_stale_batch",
+        );
+
+        let error = admit_quote_batch(&codes, ProviderId::Tencent, batch)
+            .expect_err("an entirely stale batch must remain an explicit failure");
+        assert!(error.retryable(), "staleness must keep failing over");
+        assert!(
+            error.to_string().contains("quote_stale"),
+            "reason code must stay quote_stale: {error}"
+        );
+    }
+
+    /// BR-219: a proven-dead provider must stop costing its full retry budget
+    /// on every acquisition, and any success must immediately re-arm it.
+    #[test]
+    fn br219_breaker_trips_after_threshold_and_resets_on_success() {
+        reset_quote_breakers();
+        let now = Utc::now();
+        for _ in 0..QUOTE_BREAKER_FAILURE_THRESHOLD {
+            record_quote_provider_failure(ProviderId::Tdx, now);
+        }
+        assert!(
+            quote_breaker_skips(now).contains(&ProviderId::Tdx),
+            "a provider failing {QUOTE_BREAKER_FAILURE_THRESHOLD} times in a row must be skipped"
+        );
+
+        record_quote_provider_success(ProviderId::Tdx);
+        assert!(
+            !quote_breaker_skips(now).contains(&ProviderId::Tdx),
+            "one success must re-arm the provider immediately"
+        );
+        reset_quote_breakers();
+    }
+
+    /// BR-219: the breaker only reorders attempts. If every provider is tripped
+    /// it must be ignored, otherwise a transient full outage escalates into
+    /// permanently acquiring nothing.
+    #[test]
+    fn br219_fully_tripped_chain_is_attempted_in_full() {
+        reset_quote_breakers();
+        let now = Utc::now();
+        for provider in QUOTE_PROVIDER_CHAIN {
+            for _ in 0..QUOTE_BREAKER_FAILURE_THRESHOLD {
+                record_quote_provider_failure(provider, now);
+            }
+        }
+        assert!(
+            quote_breaker_skips(now).is_empty(),
+            "a fully tripped chain must still be attempted end to end"
+        );
+        reset_quote_breakers();
+    }
+
+    /// BR-219: the cooldown must expire on its own so a recovered provider is
+    /// retried without needing a process restart.
+    #[test]
+    fn br219_cooldown_expires_and_the_provider_is_retried() {
+        reset_quote_breakers();
+        let tripped_at = Utc::now();
+        for _ in 0..QUOTE_BREAKER_FAILURE_THRESHOLD {
+            record_quote_provider_failure(ProviderId::Tencent, tripped_at);
+        }
+        assert!(quote_breaker_skips(tripped_at).contains(&ProviderId::Tencent));
+
+        let after_cooldown =
+            tripped_at + chrono::Duration::seconds(QUOTE_BREAKER_COOLDOWN_SECS + 1);
+        assert!(
+            !quote_breaker_skips(after_cooldown).contains(&ProviderId::Tencent),
+            "the breaker must re-arm once the cooldown elapses"
+        );
+        reset_quote_breakers();
+    }
+
+    fn reset_quote_breakers() {
+        let mut guard = match quote_breakers().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clear();
     }
 
     /// BR-217: `AcceptancePolicy::with_max_source_age` bounds the provider's
