@@ -2414,6 +2414,37 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         Ok(rows)
     }
 
+    /// BR-224: 候选样本证据聚合 (SignalTracker, pred_detail='candidate-strong')。
+    /// 返回 (去重样本数, 命中数); 按 (pred_date, stock_code) 去重取首行,
+    /// 只统计已回填 (actual_change NOT NULL) 且 pred_date <= business_date 的行。
+    pub fn candidate_promotion_samples(
+        &self,
+        business_date: &str,
+    ) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+        validate_date_text("business_date", business_date).map_err(invalid_input)?;
+        let mut conn = self.get_conn()?;
+        #[derive(QueryableByName, Debug)]
+        struct SampleCounts {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            sample_count: i64,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            hit_sum: i64,
+        }
+        let row = diesel::sql_query(
+            "SELECT COUNT(*) AS sample_count, COALESCE(SUM(hit), 0) AS hit_sum \
+             FROM prediction_tracker \
+             WHERE id IN ( \
+               SELECT MIN(id) FROM prediction_tracker \
+               WHERE pred_detail = 'candidate-strong' AND actual_change IS NOT NULL \
+                 AND pred_date <= ?1 \
+               GROUP BY pred_date, stock_code \
+             )",
+        )
+        .bind::<diesel::sql_types::Text, _>(business_date)
+        .get_result::<SampleCounts>(&mut *conn)?;
+        Ok((row.sample_count as usize, row.hit_sum as usize))
+    }
+
     /// 获取近 `days` 天已验证预测的真实命中率。
     pub fn get_prediction_hit_rate(&self, days: i32) -> Result<f64, Box<dyn std::error::Error>> {
         if days <= 0 {

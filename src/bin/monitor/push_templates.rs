@@ -5705,7 +5705,30 @@ pub async fn dispatch_candidate_triggered_daily(hhmm: &str, banner: &BannerCtx) 
     use stock_analysis::opportunity::candidate_panel::EvidenceTier;
     use stock_analysis::opportunity::candidate_state::require_live_promotion;
 
-    if let Err(error) = require_live_promotion(None, None) {
+    // BR-224: SignalTracker 证据门 — 候选样本 ≥30 且强档胜率 ≥30% 才转正推送
+    let promotion_evidence = match tokio::task::spawn_blocking(|| {
+        use stock_analysis::database::DatabaseManager;
+        let db = DatabaseManager::get();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        db.candidate_promotion_samples(&today).map_err(|e| e.to_string())
+    })
+    .await
+    {
+        Ok(Ok((count, hits))) if count >= 30 => {
+            let win_rate = hits as f64 / count as f64;
+            if win_rate >= 0.30 {
+                Some(stock_analysis::opportunity::candidate_state::PromotionEvidence {
+                    sample_count: count as u32,
+                    win_rate_strong: win_rate,
+                    win_rate_weak: 0.0,
+                })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    if let Err(error) = require_live_promotion(promotion_evidence, None) {
         log_dispatcher_attempt("P-03", false, 0, &error);
         log::info!("[P-03] 候选触发保持 Shadow: {error}");
         return false;
@@ -7517,6 +7540,7 @@ fn candidate_snapshot_persist(date: &str, codes: &std::collections::BTreeSet<Str
 
 /// BR-223: P-05 候选筛选台 (v11-P0-5++) — 统一网关候选链路 + 失效 diff。
 pub async fn dispatch_candidate_board(date: &str) -> bool {
+    use stock_analysis::opportunity::candidate_panel::EvidenceTier;
     let batch = match load_real_candidate_batch().await {
         Ok(batch) => batch,
         Err(error) => {
@@ -7546,6 +7570,37 @@ pub async fn dispatch_candidate_board(date: &str) -> bool {
             let _ = push_candidate_invalidated(code, &hhmm, &name, "候选", "从候选台消失").await;
         }
     }
+    // BR-224: SignalTracker 采样 — Strong 候选写入 prediction_tracker (5 日后回填)
+    let strong_samples: Vec<(String, f64)> = batch
+        .entries
+        .iter()
+        .filter(|entry| entry.tier == EvidenceTier::Strong && entry.current_price.is_some())
+        .map(|entry| (entry.code.clone(), entry.heat_score.unwrap_or(50.0)))
+        .collect();
+    if !strong_samples.is_empty() {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let target = (chrono::Local::now().date_naive() + chrono::Duration::days(5))
+            .format("%Y-%m-%d")
+            .to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            use stock_analysis::database::DatabaseManager;
+            let db = DatabaseManager::get();
+            for (code, score) in strong_samples {
+                let _ = db.save_prediction(
+                    &today,
+                    &target,
+                    None,
+                    Some(&code),
+                    "up",
+                    score,
+                    Some("candidate-strong"),
+                    None,
+                    None,
+                );
+            }
+        })
+        .await;
+    }
     candidate_snapshot_persist(date, &codes_now);
     let text = stock_analysis::opportunity::candidate_panel::format_candidate_board(&batch.entries);
     let result = dispatch_registered_outcome!(
@@ -7559,6 +7614,77 @@ pub async fn dispatch_candidate_board(date: &str) -> bool {
     );
     log_dispatcher_attempt("P-05", result.is_pushed(), batch.entries.len(), "");
     result.is_pushed()
+}
+
+/// BR-222: R-07 counted 投递材料 (BR-140/BR-192 counted ceremony)。
+/// TomorrowWatch 是 counted kind, 必须走 CountedDeliveryBinding;
+/// counted source = 龙虎榜批次证据 (与 R-04 同源)。
+fn prepare_tomorrow_watch_delivery(
+    business_date: chrono::NaiveDate,
+    evidence: &stock_analysis::data_gateway::BatchEvidence,
+    lhb_records: &[stock_analysis::data_gateway::DragonTigerStockReview],
+    rendered: String,
+) -> Result<PreparedReviewLhbDelivery, String> {
+    use magic_market_core::ProviderId;
+    if evidence.provider != ProviderId::Eastmoney {
+        return Err(format!(
+            "R-07 provider mismatch: expected Eastmoney, got {:?}",
+            evidence.provider
+        ));
+    }
+    if evidence.batch_id.trim().is_empty() {
+        return Err("R-07 accepted batch ID is missing".to_string());
+    }
+    let source_at = evidence
+        .source_at
+        .as_deref()
+        .ok_or_else(|| "R-07 provider source_at is missing".to_string())?;
+    let source_date = chrono::NaiveDate::parse_from_str(source_at, "%Y-%m-%d")
+        .map_err(|error| format!("R-07 provider source_at is invalid: {error}"))?;
+    if source_date != business_date {
+        return Err(format!(
+            "R-07 provider source_at {source_date} differs from business date {business_date}"
+        ));
+    }
+    let provider_observed_at = parse_r04_observed_at(&evidence.observed_at)?;
+    if lhb_records.is_empty() {
+        return Err("R-07 counted LHB source contains no records".to_string());
+    }
+    // 有序投影: code|net_amount (按 source order)
+    let mut source_binding = String::new();
+    for record in lhb_records {
+        if record.code.trim().is_empty()
+            || !record.ranking_net_amount_yuan.is_finite()
+            || record.ranking_net_amount_yuan <= 0.0
+        {
+            return Err(format!(
+                "R-07 LHB projection {} is incomplete or invalid",
+                record.code
+            ));
+        }
+        source_binding.push_str(&format!("{}|{}\n", record.code, record.ranking_net_amount_yuan));
+    }
+    let task_identity = crate::review_batch::review_task_identity(
+        business_date,
+        crate::review_batch::ReviewTask::R07,
+    );
+    let delivery_subject_identity = {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"stock_analysis.r07.watchlist.v1\0");
+        hasher.update(source_binding.as_bytes());
+        format!("{:x}", hasher.finalize())
+    };
+    Ok(PreparedReviewLhbDelivery {
+        rendered,
+        business_date,
+        task_identity,
+        delivery_subject_identity,
+        source_binding_canonical: source_binding.as_bytes().to_vec(),
+        task_transition_basis_canonical: source_binding.into_bytes(),
+        provider_observed_at,
+        batch_id: evidence.batch_id.clone(),
+    })
 }
 
 /// BR-222: R-07 明日观察池 (v12 MVP-4 §7.6) — 4 类来源装配 + 按 code 去重 (首胜)。
@@ -7619,11 +7745,16 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
     }
 
     // 2. 龙虎榜强票 (净买入 > 0 Top5; 无价格 → 0.0 + T-11 复核注记)
+    //    龙虎榜批次同时是 R-07 counted ceremony 的 counted source (BR-140/BR-192)。
+    let mut lhb_evidence: Option<stock_analysis::data_gateway::BatchEvidence> = None;
+    let mut lhb_records: Vec<stock_analysis::data_gateway::DragonTigerStockReview> = Vec::new();
     match stock_analysis::data_gateway::dragon_tiger::DragonTigerGateway::new()
         .market_review(trading_date, 5, 5)
         .await
     {
         Ok(batch) => {
+            lhb_evidence = Some(batch.evidence().clone());
+            lhb_records = batch.records().to_vec();
             let mut strong: Vec<_> = batch
                 .records()
                 .iter()
@@ -7754,17 +7885,80 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
         });
     }
     let text = render_tomorrow_watch(date, &borrowed);
-    let result = dispatch_registered_outcome!(
+    let prepared = match (&lhb_evidence, lhb_records.is_empty()) {
+        (Some(evidence), false) => {
+            match prepare_tomorrow_watch_delivery(trading_date, evidence, &lhb_records, text) {
+                Ok(prepared) => prepared,
+                Err(reason) => {
+                    log::warn!("[R-07][BR-140][BR-192] counted binding rejected: {reason}");
+                    log_dispatcher_attempt("R-07", false, items.len(), &reason);
+                    return crate::review_batch::ReviewTaskOutcome::failed(false, reason);
+                }
+            }
+        }
+        _ => {
+            let reason = "LHB counted source unavailable for R-07 binding";
+            log::warn!("[R-07][BR-140][BR-192] {reason}");
+            log_dispatcher_attempt("R-07", false, items.len(), reason);
+            return crate::review_batch::ReviewTaskOutcome::no_data(reason);
+        }
+    };
+    let task_binding = match stock_analysis::durable_delivery::TaskBinding::new(
+        prepared.task_identity.clone(),
+        prepared.task_transition_basis_canonical.clone(),
+    ) {
+        Ok(binding) => binding,
+        Err(error) => {
+            let reason = format!("R-07 task binding rejected: {error}");
+            log::warn!("[R-07][BR-140][BR-192] {reason}");
+            log_dispatcher_attempt("R-07", false, items.len(), &reason);
+            return crate::review_batch::ReviewTaskOutcome::failed(false, reason);
+        }
+    };
+    let counted_binding = match crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        prepared.business_date,
+        prepared.task_identity,
+        prepared.source_binding_canonical,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        prepared.delivery_subject_identity,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::Provider {
+            observed_at: Some(prepared.provider_observed_at),
+            as_of: Some(prepared.business_date),
+            ordered_batch_ids: vec![prepared.batch_id],
+        },
+        Some(task_binding),
+        true,
+    ) {
+        Ok(binding) => binding,
+        Err(reason) => {
+            let reason = format!("R-07 counted binding rejected: {reason}");
+            log::warn!("[R-07][BR-140][BR-192] {reason}");
+            log_dispatcher_attempt("R-07", false, items.len(), &reason);
+            return crate::review_batch::ReviewTaskOutcome::failed(false, reason);
+        }
+    };
+    let presentation_token = match crate::presentation_registry::acquire_token(
         "R-07-tomorrow-watch",
         crate::notify::PushKind::TomorrowWatch,
         "tomorrow_watch_dispatcher",
         "render_tomorrow_watch",
-        "",
-        None,
-        text
-    );
-    log_dispatcher_attempt("R-07", result.is_pushed(), items.len(), "");
-    crate::review_batch::ReviewTaskOutcome::from_push_outcome(result, items.len())
+    ) {
+        Ok(token) => token,
+        Err(reason) => {
+            log::warn!("[R-07][BR-196] presentation token rejected: {reason}");
+            log_dispatcher_attempt("R-07", false, items.len(), &reason);
+            return crate::review_batch::ReviewTaskOutcome::failed(false, reason);
+        }
+    };
+    let push_result = crate::notify::push_counted_source_only_with_binding(
+        presentation_token,
+        &prepared.rendered,
+        counted_binding,
+    )
+    .await;
+    let dispatcher_error = push_outcome_dispatcher_error(&push_result);
+    log_dispatcher_attempt("R-07", push_result.is_pushed(), items.len(), &dispatcher_error);
+    crate::review_batch::ReviewTaskOutcome::from_push_outcome(push_result, items.len())
 }
 
 /// R-11 持仓复盘渲染入参 (BR-222)。
@@ -7959,6 +8153,59 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
     crate::review_batch::ReviewTaskOutcome::from_push_outcome(result, 1)
 }
 
+/// BR-224: 候选/预测样本 5 日收益回填 (SignalTracker 闭环)。
+/// 对近 days 天的 pending prediction 用日线收盘价验证 (复用 backfill_predictions 逻辑)。
+async fn backfill_pending_predictions(days: i64) -> (usize, usize) {
+    use chrono::Duration;
+    let today = chrono::Local::now().date_naive();
+    let mut total = 0usize;
+    let mut hit_count = 0usize;
+    for offset in 1..=days {
+        let pred_date = today - Duration::days(offset);
+        let target_date = pred_date + Duration::days(1);
+        let pred_date_s = pred_date.format("%Y-%m-%d").to_string();
+        let target_date_s = target_date.format("%Y-%m-%d").to_string();
+        let db = stock_analysis::database::DatabaseManager::get();
+        let Ok(pending) = db.get_pending_predictions(&pred_date_s) else {
+            continue;
+        };
+        for pred in pending {
+            let Some(code) = pred.stock_code.as_deref() else {
+                continue;
+            };
+            if code.is_empty() {
+                continue;
+            }
+            let Some(outcome) = stock_analysis::monitor::prediction::verify_one(
+                db,
+                code,
+                &pred_date_s,
+                &target_date_s,
+                &pred.pred_direction,
+            )
+            .await
+            else {
+                continue;
+            };
+            if db
+                .update_prediction_result(
+                    &pred_date_s,
+                    Some(code),
+                    outcome.actual_change,
+                    outcome.hit,
+                )
+                .is_ok()
+            {
+                total += 1;
+                if outcome.hit {
+                    hit_count += 1;
+                }
+            }
+        }
+    }
+    (total, hit_count)
+}
+
 pub async fn dispatch_post_session_review(
     context: crate::review_batch::ReviewRunContext,
     due: &std::collections::BTreeSet<crate::review_batch::ReviewTask>,
@@ -8051,6 +8298,14 @@ pub async fn dispatch_post_session_review(
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
+
+    // BR-224: SignalTracker 样本回填 (5 日收益验证, 每日复盘时执行)
+    let (backfilled_total, backfilled_hits) = backfill_pending_predictions(14).await;
+    if backfilled_total > 0 {
+        log::info!(
+            "[BR-224] 预测样本回填 verified={backfilled_total} hits={backfilled_hits}"
+        );
+    }
 
     // BR-223: 盘后大宗交易推送 (自选+持仓代码集, 非 ReviewTask 侧推)
     let mut block_trade_codes: Vec<String> = stock_analysis::portfolio::get_positions()
