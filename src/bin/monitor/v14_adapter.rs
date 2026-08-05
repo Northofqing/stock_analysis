@@ -1246,6 +1246,11 @@ fn default_profile_for_kind(kind: PushKind) -> TemplateMetadata {
                 | PushKind::ReviewProviderTopN
                 | PushKind::EventCalendar
                 | PushKind::CatalystReview
+                // BR-225: R-07/R-11 同为独立来源盘后报告 —
+                // 龙虎榜/候选/持仓快照/收盘估值批次是自身数据门,
+                // 盘后陈旧 Quote 不得否决 (BR-197 同款理由)
+                | PushKind::TomorrowWatch
+                | PushKind::PositionReview
         ) {
             DataMode::Down
         } else {

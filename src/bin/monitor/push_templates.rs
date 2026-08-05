@@ -7668,6 +7668,32 @@ fn prepare_tomorrow_watch_delivery(
         business_date,
         crate::review_batch::ReviewTask::R07,
     );
+    // transition basis 必须是 JSON (durable hydration 按 DurableTaskBasis 解析)
+    #[derive(serde::Serialize)]
+    struct TomorrowWatchTaskTransitionBasis {
+        task_identity: String,
+        business_date: String,
+        task: String,
+        source: String,
+        rule_ids: Vec<String>,
+        snapshot_size: usize,
+        batch_ids: Vec<String>,
+    }
+    let task_transition_basis_canonical = serde_json::to_vec(&TomorrowWatchTaskTransitionBasis {
+        task_identity: task_identity.clone(),
+        business_date: business_date.format("%Y-%m-%d").to_string(),
+        task: "R-07".to_string(),
+        source: evidence.source.clone(),
+        rule_ids: vec![
+            "BR-110".to_string(),
+            "BR-140".to_string(),
+            "BR-192".to_string(),
+            "BR-222".to_string(),
+        ],
+        snapshot_size: lhb_records.len(),
+        batch_ids: vec![evidence.batch_id.clone()],
+    })
+    .map_err(|error| format!("R-07 task transition serialization failed: {error}"))?;
     let delivery_subject_identity = {
         use sha2::Digest;
         let mut hasher = sha2::Sha256::new();
@@ -7680,8 +7706,8 @@ fn prepare_tomorrow_watch_delivery(
         business_date,
         task_identity,
         delivery_subject_identity,
-        source_binding_canonical: source_binding.as_bytes().to_vec(),
-        task_transition_basis_canonical: source_binding.into_bytes(),
+        source_binding_canonical: source_binding.into_bytes(),
+        task_transition_basis_canonical,
         provider_observed_at,
         batch_id: evidence.batch_id.clone(),
     })
@@ -7950,9 +7976,10 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
             return crate::review_batch::ReviewTaskOutcome::failed(false, reason);
         }
     };
-    let push_result = crate::notify::push_counted_source_only_with_binding(
+    let push_result = crate::notify::push_counted_with_binding(
         presentation_token,
         &prepared.rendered,
+        None,
         counted_binding,
     )
     .await;
@@ -7975,6 +8002,22 @@ pub struct PositionReviewParams<'a> {
     pub market_value: f64,
     /// (行业, 市值占比 %) — 按市值加权, top5 + 其他 (BR-222 排序规则)
     pub sectors: &'a [(String, f64)],
+    /// 个股明细 (BR-225: 逐个复盘)
+    pub items: &'a [PositionReviewItem],
+}
+
+/// BR-225: 单只持仓复盘行。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PositionReviewItem {
+    pub code: String,
+    pub name: String,
+    pub quantity: i64,
+    pub cost_price: f64,
+    pub close: Option<f64>,
+    pub market_value: f64,
+    pub unrealized_pnl: f64,
+    pub unrealized_return_pct: Option<f64>,
+    pub daily_price_pnl: Option<f64>,
 }
 
 /// BR-222: R-11 持仓复盘模板渲染 (用户确认持仓摘要, 盘后 1次/日)。
@@ -7992,6 +8035,33 @@ pub fn render_position_review(p: PositionReviewParams<'_>) -> String {
         "持仓 {} 只 | 持仓市值 {:.0}\n",
         p.position_count, p.market_value
     ));
+    if !p.items.is_empty() {
+        out.push_str("\n逐个复盘:\n");
+        for (index, item) in p.items.iter().enumerate() {
+            let close = item.close.map(|v| format!("{v:.2}")).unwrap_or_else(|| "-".to_string());
+            let ret = item
+                .unrealized_return_pct
+                .map(|v| format!("{v:+.2}%"))
+                .unwrap_or_else(|| "-".to_string());
+            let daily = item
+                .daily_price_pnl
+                .map(|v| format!("{v:+.2}"))
+                .unwrap_or_else(|| "-".to_string());
+            out.push_str(&format!(
+                "{}. {}({}) {}股 | 成本{:.2} 现价{} | 市值{:.0}\n   未实现{:+.0}({}) | 当日{}\n",
+                index + 1,
+                item.name,
+                item.code,
+                item.quantity,
+                item.cost_price,
+                close,
+                item.market_value,
+                item.unrealized_pnl,
+                ret,
+                daily
+            ));
+        }
+    }
     out.push_str("行业分布（按市值）: ");
     if p.sectors.is_empty() {
         out.push_str("(无持仓)\n");
@@ -8121,6 +8191,28 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
     } else {
         0.0
     };
+    // BR-225: 个股明细 (逐个复盘, 按市值降序)
+    let mut items: Vec<PositionReviewItem> = valuation
+        .valuation
+        .items
+        .iter()
+        .map(|item| PositionReviewItem {
+            code: item.code.clone(),
+            name: item.name.clone(),
+            quantity: i64::try_from(item.quantity).unwrap_or(0),
+            cost_price: item.cost_price,
+            close: item.close,
+            market_value: item.market_value.unwrap_or(0.0),
+            unrealized_pnl: item.unrealized_pnl.unwrap_or(0.0),
+            unrealized_return_pct: item.unrealized_return_pct,
+            daily_price_pnl: item.daily_price_pnl,
+        })
+        .collect();
+    items.sort_by(|a, b| {
+        b.market_value
+            .partial_cmp(&a.market_value)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let params = PositionReviewParams {
         date,
         total_assets: summary.total_assets,
@@ -8138,6 +8230,7 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
             .total_market_value
             .unwrap_or(total_position_value),
         sectors: &top_sectors,
+        items: &items,
     };
     let text = render_position_review(params);
     let result = dispatch_registered_outcome!(
@@ -11987,16 +12080,36 @@ async fn dispatch_catalyst_review_daily_outcome(
         .iter()
         .map(|name| name.as_str())
         .collect();
+    // BR-225: 题材评分/观察点推导 (无独立评分批次时用当日涨停结构, 确定性规则)
+    let derived_score = snapshot.score.or_else(|| {
+        let structure = (snapshot.member_count as f32).min(100.0) * 0.30
+            + (snapshot.continuous_count as f32).min(60.0) * 0.50
+            + match snapshot.persistent {
+                PersistentLevel::High => 20.0,
+                PersistentLevel::Med => 10.0,
+                PersistentLevel::Low => 0.0,
+            };
+        Some(structure.min(100.0))
+    });
+    let derived_watch_point = snapshot.watch_point.as_deref().filter(|v| !v.trim().is_empty()).or_else(|| {
+        Some(if snapshot.continuous_count >= 10 {
+            "连板结构高位, 明日关注前排是否扩散与是否退潮 (基于当日涨停结构推导)"
+        } else if snapshot.continuous_count >= 3 {
+            "连板梯队成型, 明日关注前排延续性与后排补涨 (基于当日涨停结构推导)"
+        } else {
+            "连板梯队偏弱, 明日关注题材是否出现新催化 (基于当日涨停结构推导)"
+        })
+    });
     let params = CatalystReviewParams {
         date: &snapshot.date,
         theme: &snapshot.theme,
-        score: snapshot.score,
+        score: derived_score,
         persistent: snapshot.persistent,
         member_count: snapshot.member_count,
         continuous_count: snapshot.continuous_count,
         leading_names: leading_refs,
         other_names: other_refs,
-        watch_point: snapshot.watch_point.as_deref(),
+        watch_point: derived_watch_point,
     };
     let text = render_catalyst_review(params);
     let business_date = match chrono::NaiveDate::parse_from_str(&snapshot.date, "%Y-%m-%d") {
@@ -14065,6 +14178,17 @@ pub fn build_test_template_catalog(
                 ("TEST_CODE 半导体".to_string(), 30.0),
                 ("其他".to_string(), 25.0),
             ],
+            items: &[PositionReviewItem {
+                code: "TEST_CODE_000001".to_string(),
+                name: "TEST_CODE 持仓".to_string(),
+                quantity: 700,
+                cost_price: 60.2,
+                close: Some(61.54),
+                market_value: 43_078.0,
+                unrealized_pnl: 938.0,
+                unrealized_return_pct: Some(2.22),
+                daily_price_pnl: Some(120.0),
+            }],
         }),
     );
     push(
