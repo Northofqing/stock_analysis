@@ -1,23 +1,27 @@
-//! Registered business rule: BR-213.
+//! Registered business rules: BR-213, BR-220.
 //! Evidence-preserving upper-limit market projection.
 
 use anyhow::{bail, Result};
 use magic_market_core::{LimitPoolEntry, LimitPoolKind, RatioUnit};
 
-use crate::data_gateway::market_data::{AdmittedRealtimeQuotes, MarketDataGateway};
-use crate::data_gateway::{BatchEvidence, GatewayBatch, GatewayError, ReviewDataGateway};
+use crate::data_gateway::market_capabilities::{MarketCapabilitiesGateway, MarketSecurityIdentity};
+use crate::data_gateway::{
+    parse_evidence_instant, BatchEvidence, GatewayBatch, GatewayError, ReviewDataGateway,
+};
 use crate::market_data::TopStock;
 
 use super::MarketAnalyzer;
 
-/// A verified-empty limit-pool response cannot carry quote evidence because no
-/// quote request is permitted for that state.
+/// A verified-empty limit-pool response cannot carry name evidence because no
+/// identity request is permitted for that state.
 #[derive(Debug)]
 pub(crate) enum LimitUpStockBatch {
     Available {
         stocks: Vec<TopStock>,
         limit_pool_evidence: BatchEvidence,
-        quote_evidence: BatchEvidence,
+        /// BR-220: display names come from the daily `SecurityIdentity`
+        /// capability, never from a five-second-gated realtime quote batch.
+        name_evidence: BatchEvidence,
     },
     VerifiedEmpty {
         limit_pool_evidence: BatchEvidence,
@@ -33,12 +37,15 @@ impl LimitUpStockBatch {
     }
 }
 
-fn compose_limit_up_batch<LoadQuotes>(
+fn compose_limit_up_batch<LoadNames>(
     limit_pool: GatewayBatch<LimitPoolEntry>,
-    load_quotes: LoadQuotes,
+    load_names: LoadNames,
 ) -> Result<LimitUpStockBatch>
 where
-    LoadQuotes: FnOnce(&[String]) -> std::result::Result<AdmittedRealtimeQuotes, GatewayError>,
+    LoadNames: FnOnce(
+        &[String],
+    )
+        -> std::result::Result<GatewayBatch<MarketSecurityIdentity>, GatewayError>,
 {
     let (records, limit_pool_evidence) = match limit_pool {
         GatewayBatch::VerifiedEmpty(limit_pool_evidence) => {
@@ -74,27 +81,71 @@ where
         requested_codes.push(code);
     }
 
-    let quotes = load_quotes(&requested_codes)?;
-    let quote_evidence = quotes.evidence().clone();
-    let mut quote_by_code = std::collections::BTreeMap::new();
-    for quote in quotes.quotes() {
-        if quote.evidence() != &quote_evidence {
-            bail!("BR-213 quote record evidence mismatch for {}", quote.code());
+    // BR-220: names are reference data on a daily freshness budget. Binding a
+    // pure display field to the §2.4 five-second quote gate made the entire
+    // authoritative limit-pool projection fail whenever any single member's
+    // tick lagged, which is a capability mismatch, not a safety property.
+    let (identities, name_evidence) = match load_names(&requested_codes)? {
+        GatewayBatch::Available { records, evidence } if !records.is_empty() => (records, evidence),
+        GatewayBatch::Available { evidence, .. } | GatewayBatch::VerifiedEmpty(evidence) => {
+            bail!(
+                "BR-220 security identity batch carries no display names: source={} batch_id={}",
+                evidence.source,
+                evidence.batch_id
+            );
         }
-        if quote_by_code
-            .insert(quote.code().to_owned(), quote)
+    };
+    let name_evidence_observed_at = parse_evidence_instant(
+        "BR-220-UpperLimitNames",
+        name_evidence.provider,
+        "observed_at",
+        &name_evidence.observed_at,
+    )?;
+    let name_evidence_source_at = name_evidence
+        .source_at
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("BR-220 security identity batch has no source time"))
+        .and_then(|value| {
+            parse_evidence_instant(
+                "BR-220-UpperLimitNames",
+                name_evidence.provider,
+                "source_at",
+                value,
+            )
+            .map_err(anyhow::Error::from)
+        })?;
+    let mut name_by_code = std::collections::BTreeMap::new();
+    for identity in identities {
+        if identity.provider != name_evidence.provider
+            || identity.batch_id != name_evidence.batch_id
+            || identity.observed_at != name_evidence_observed_at
+            || identity.source_at != name_evidence_source_at
+        {
+            bail!(
+                "BR-220 security identity evidence mismatch for {}",
+                identity.code
+            );
+        }
+        if identity.name.trim().is_empty() {
+            bail!(
+                "BR-220 security identity carries no name for {}",
+                identity.code
+            );
+        }
+        if name_by_code
+            .insert(identity.code.clone(), identity.name.clone())
             .is_some()
         {
-            bail!("BR-213 duplicate realtime quote security {}", quote.code());
+            bail!("BR-220 duplicate security identity {}", identity.code);
         }
     }
-    let quote_codes = quote_by_code
+    let name_codes = name_by_code
         .keys()
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
-    if quote_codes != limit_codes {
+    if name_codes != limit_codes {
         bail!(
-            "BR-213 exact-code join mismatch limit_codes={limit_codes:?} quote_codes={quote_codes:?}"
+            "BR-220 exact-code join mismatch limit_codes={limit_codes:?} name_codes={name_codes:?}"
         );
     }
 
@@ -104,12 +155,13 @@ where
         if record.change.unit() != RatioUnit::Percent {
             bail!("BR-213 upper-limit change unit mismatch for {code}");
         }
-        let quote = quote_by_code
+        let name = name_by_code
             .get(&code)
-            .ok_or_else(|| anyhow::anyhow!("BR-213 missing realtime quote for {code}"))?;
+            .ok_or_else(|| anyhow::anyhow!("BR-220 missing security identity for {code}"))?
+            .clone();
         stocks.push(TopStock {
             code,
-            name: quote.name().to_owned(),
+            name,
             change_pct: record.change.get(),
             price: record.price.get(),
             volume_ratio: None,
@@ -120,8 +172,49 @@ where
     Ok(LimitUpStockBatch::Available {
         stocks,
         limit_pool_evidence,
-        quote_evidence,
+        name_evidence,
     })
+}
+
+/// BR-213/BR-220: the identity gateway is async and owns a blocking client, so
+/// its creation, use and destruction all happen inside one dedicated thread.
+fn load_upper_limit_names(
+    codes: &[String],
+) -> std::result::Result<GatewayBatch<MarketSecurityIdentity>, GatewayError> {
+    let codes = codes.to_vec();
+    std::thread::Builder::new()
+        .name("upper-limit-security-identity".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    GatewayError::unavailable(
+                        "BR-220-UpperLimitNames",
+                        None,
+                        true,
+                        format!("create security identity runtime: {error}"),
+                    )
+                })?;
+            runtime.block_on(MarketCapabilitiesGateway::new().security_identities(&codes))
+        })
+        .map_err(|error| {
+            GatewayError::unavailable(
+                "BR-220-UpperLimitNames",
+                None,
+                true,
+                format!("spawn security identity thread: {error}"),
+            )
+        })?
+        .join()
+        .map_err(|_| {
+            GatewayError::unavailable(
+                "BR-220-UpperLimitNames",
+                None,
+                true,
+                "security identity thread panicked".to_owned(),
+            )
+        })?
 }
 
 impl MarketAnalyzer {
@@ -132,29 +225,27 @@ impl MarketAnalyzer {
         trading_date: chrono::NaiveDate,
     ) -> Result<Vec<TopStock>> {
         let limit_pool = ReviewDataGateway::new().current_upper_limit_pool(trading_date)?;
-        let batch = compose_limit_up_batch(limit_pool, |codes| {
-            MarketDataGateway::new().required_realtime_quotes(codes)
-        })?;
+        let batch = compose_limit_up_batch(limit_pool, load_upper_limit_names)?;
         match &batch {
             LimitUpStockBatch::Available {
                 stocks,
                 limit_pool_evidence,
-                quote_evidence,
+                name_evidence,
             } => {
                 let receipt = crate::data_gateway::review::audit_limit_up_projection(
                     trading_date,
                     limit_pool_evidence,
-                    quote_evidence,
+                    name_evidence,
                     stocks.len(),
                 )?;
                 log::info!(
-                    "[DataGateway][BR-213] status=available date={} records={} limit_provider={:?} limit_batch={} quote_provider={:?} quote_batch={} composition_audit_id={} composition_record_hash={}",
+                    "[DataGateway][BR-213][BR-220] status=available date={} records={} limit_provider={:?} limit_batch={} name_provider={:?} name_batch={} composition_audit_id={} composition_record_hash={}",
                     trading_date,
                     stocks.len(),
                     limit_pool_evidence.provider,
                     limit_pool_evidence.batch_id,
-                    quote_evidence.provider,
-                    quote_evidence.batch_id,
+                    name_evidence.provider,
+                    name_evidence.batch_id,
                     receipt.audit_id,
                     receipt.record_hash
                 );
@@ -162,7 +253,7 @@ impl MarketAnalyzer {
             LimitUpStockBatch::VerifiedEmpty {
                 limit_pool_evidence,
             } => log::info!(
-                "[DataGateway][BR-213] status=verified_empty date={} records=0 limit_provider={:?} limit_batch={} quote_request=not_called",
+                "[DataGateway][BR-213][BR-220] status=verified_empty date={} records=0 limit_provider={:?} limit_batch={} name_request=not_called",
                 trading_date,
                 limit_pool_evidence.provider,
                 limit_pool_evidence.batch_id
@@ -177,14 +268,13 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
-    use chrono::Utc;
+    use chrono::{DateTime, Utc};
     use magic_market_core::{
         AssetClass, Exchange, InstrumentId, IsoDate, Price, ProviderId, Ratio, SourceEvidence,
     };
 
-    use crate::data_gateway::market_data::{AdmittedRealtimeQuote, RealtimeMarketQuote};
-
     const TEST_DATE: &str = "2099-01-02";
+    const TEST_DATE_TIME: &str = "2099-01-02T10:00:00+08:00";
     const TEST_OBSERVED_AT: &str = "2099-01-02T10:00:01+08:00";
 
     fn evidence(provider: ProviderId, source: &str, batch_id: &str) -> BatchEvidence {
@@ -223,36 +313,37 @@ mod tests {
         }
     }
 
-    fn quote_batch(rows: &[(&str, &str)]) -> AdmittedRealtimeQuotes {
-        let now = Utc::now();
+    /// BR-220: display names now arrive as a daily `SecurityIdentity` batch.
+    fn identity_batch(rows: &[(&str, &str)]) -> GatewayBatch<MarketSecurityIdentity> {
+        let source_at = DateTime::parse_from_rfc3339(TEST_DATE_TIME)
+            .unwrap()
+            .with_timezone(&Utc);
+        let observed_at = DateTime::parse_from_rfc3339(TEST_OBSERVED_AT)
+            .unwrap()
+            .with_timezone(&Utc);
         let batch_evidence = BatchEvidence {
             provider: ProviderId::Tencent,
-            source: "TEST_CODE_quote".to_owned(),
-            source_at: Some(now.to_rfc3339()),
-            observed_at: now.to_rfc3339(),
-            batch_id: "TEST_CODE_quote_batch".to_owned(),
+            source: "TEST_CODE_identity".to_owned(),
+            source_at: Some(TEST_DATE_TIME.to_owned()),
+            observed_at: TEST_OBSERVED_AT.to_owned(),
+            batch_id: "TEST_CODE_identity_batch".to_owned(),
         };
-        let quotes = rows
+        let records = rows
             .iter()
-            .map(|(code, name)| {
-                AdmittedRealtimeQuote::from_test_fixture(
-                    RealtimeMarketQuote {
-                        code: (*code).to_owned(),
-                        name: (*name).to_owned(),
-                        price: 10.0,
-                        previous_close: 9.0,
-                        change_percent: 11.11,
-                        source_at: now,
-                        observed_at: now,
-                        provider: ProviderId::Tencent,
-                        batch_id: "TEST_CODE_quote_batch".to_owned(),
-                    },
-                    batch_evidence.clone(),
-                )
-                .unwrap()
+            .map(|(code, name)| MarketSecurityIdentity {
+                code: (*code).to_owned(),
+                name: (*name).to_owned(),
+                is_st: false,
+                source_at,
+                observed_at,
+                provider: ProviderId::Tencent,
+                batch_id: "TEST_CODE_identity_batch".to_owned(),
             })
             .collect();
-        AdmittedRealtimeQuotes::from_test_fixtures(quotes).unwrap()
+        GatewayBatch::Available {
+            records,
+            evidence: batch_evidence,
+        }
     }
 
     fn available_limit_pool(
@@ -266,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn br213_verified_empty_does_not_load_realtime_quotes() {
+    fn br213_verified_empty_does_not_load_display_names() {
         let quote_load_calls = Cell::new(0_u32);
         let limit_pool_evidence = evidence(
             ProviderId::Eastmoney,
@@ -275,9 +366,9 @@ mod tests {
         );
         let batch = compose_limit_up_batch(
             GatewayBatch::VerifiedEmpty(limit_pool_evidence.clone()),
-            |_| -> std::result::Result<AdmittedRealtimeQuotes, GatewayError> {
+            |_| -> std::result::Result<GatewayBatch<MarketSecurityIdentity>, GatewayError> {
                 quote_load_calls.set(quote_load_calls.get() + 1);
-                unreachable!("verified-empty limit pool must not request quotes")
+                unreachable!("verified-empty limit pool must not request display names")
             },
         )
         .unwrap();
@@ -291,20 +382,20 @@ mod tests {
     }
 
     #[test]
-    fn br213_available_batch_uses_pool_facts_and_quote_name_only() {
+    fn br220_available_batch_uses_pool_facts_and_identity_name_only() {
         let batch_id = "TEST_CODE_limit_available";
         let batch = compose_limit_up_batch(
             available_limit_pool(
                 vec![limit_entry("TEST_CODE_600001", batch_id, 12.34, 10.0)],
                 batch_id,
             ),
-            |_| Ok(quote_batch(&[("TEST_CODE_600001", "TEST_CODE Name")])),
+            |_| Ok(identity_batch(&[("TEST_CODE_600001", "TEST_CODE Name")])),
         )
         .unwrap();
         let LimitUpStockBatch::Available {
             stocks,
             limit_pool_evidence,
-            quote_evidence,
+            name_evidence,
         } = batch
         else {
             panic!("expected available batch")
@@ -318,11 +409,11 @@ mod tests {
         assert_eq!(stocks[0].volume_ratio, None);
         assert_eq!(stocks[0].main_net_yi, None);
         assert_eq!(limit_pool_evidence.batch_id, batch_id);
-        assert_eq!(quote_evidence.batch_id, "TEST_CODE_quote_batch");
+        assert_eq!(name_evidence.batch_id, "TEST_CODE_identity_batch");
     }
 
     #[test]
-    fn br213_exact_code_join_rejects_missing_extra_and_duplicate_quotes() {
+    fn br220_exact_code_join_rejects_missing_extra_and_duplicate_names() {
         let batch_id = "TEST_CODE_limit_join";
         let pool = || {
             available_limit_pool(
@@ -346,7 +437,7 @@ mod tests {
                 ("TEST_CODE_600001", "TEST_CODE Duplicate"),
             ],
         ] {
-            assert!(compose_limit_up_batch(pool(), |_| Ok(quote_batch(&rows))).is_err());
+            assert!(compose_limit_up_batch(pool(), |_| Ok(identity_batch(&rows))).is_err());
         }
     }
 
@@ -361,7 +452,7 @@ mod tests {
                 .unwrap();
 
         let error = compose_limit_up_batch(available_limit_pool(vec![record], batch_id), |_| {
-            Ok(quote_batch(&[("TEST_CODE_600001", "TEST_CODE Name")]))
+            Ok(identity_batch(&[("TEST_CODE_600001", "TEST_CODE Name")]))
         })
         .expect_err("conflicting record observed_at must reject the projection");
 

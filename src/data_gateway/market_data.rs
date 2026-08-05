@@ -149,31 +149,6 @@ impl AdmittedRealtimeQuotes {
         &self.quotes
     }
 
-    /// Batch evidence shared by every sealed record.
-    pub(crate) fn evidence(&self) -> &BatchEvidence {
-        &self.quotes[0].evidence
-    }
-
-    /// Test-only construction seam for exercising downstream exact-set
-    /// rejection. Individual fixtures have already passed the TEST_CODE and
-    /// record/evidence validation in [`AdmittedRealtimeQuote::from_test_fixture`].
-    #[cfg(test)]
-    pub(crate) fn from_test_fixtures(
-        quotes: Vec<AdmittedRealtimeQuote>,
-    ) -> Result<Self, GatewayError> {
-        if quotes.is_empty()
-            || quotes
-                .iter()
-                .any(|quote| !quote.code().starts_with("TEST_CODE_"))
-        {
-            return Err(GatewayError::invalid_request(
-                CAPABILITY,
-                "admitted realtime quote batch fixtures must be non-empty TEST_CODE records",
-            ));
-        }
-        Ok(Self { quotes })
-    }
-
     /// Consume the sealed batch and return the exact requested quote. Absence
     /// is an identity/evidence failure, never a default quote.
     pub fn into_required_quote(
