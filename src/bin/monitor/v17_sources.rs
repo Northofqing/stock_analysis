@@ -1252,8 +1252,14 @@ mod tests {
 
     #[tokio::test]
     async fn br210_announcement_batch_accepts_magic_fractional_epoch_observation() {
+        // §2.4: observed_at must stay inside the freshness window. A hardcoded
+        // wall-clock epoch made this test pass only on the day it was written
+        // and fail every day after, so derive it from the current instant like
+        // the sibling fractional-epoch test does.
+        let now = Local::now();
+        let observed_at = format!("{}.{:09}", now.timestamp(), now.timestamp_subsec_nanos());
         let report = route_announcement_batch(
-            &br210_announcement_batch("1785799979.851045000", true),
+            &br210_announcement_batch(&observed_at, true),
             &HashSet::new(),
         )
         .await;

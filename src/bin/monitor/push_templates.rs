@@ -7218,7 +7218,7 @@ pub async fn dispatch_post_session_review(
             == stock_analysis::risk::env_guard::TradingEnv::Test;
     let preflight = review_preflight(context, due, is_test);
     let phases = partition_review_tasks(&preflight.runnable);
-    let (r04, r08, r09, r03, a10, a01) = tokio::join!(
+    let (r04, r08, r09, a10, a01) = tokio::join!(
         async {
             if phases.source_only.contains(&ReviewTask::R04) {
                 Some((ReviewTask::R04, dispatch_r04_lhb_outcome(&date, now).await))
@@ -7247,16 +7247,6 @@ pub async fn dispatch_post_session_review(
             }
         },
         async {
-            if phases.source_only.contains(&ReviewTask::R03) {
-                Some((
-                    ReviewTask::R03,
-                    dispatch_r03_industry_chain_outcome(&date).await,
-                ))
-            } else {
-                None
-            }
-        },
-        async {
             if phases.source_only.contains(&ReviewTask::A10) {
                 Some((
                     ReviewTask::A10,
@@ -7277,7 +7267,7 @@ pub async fn dispatch_post_session_review(
             }
         },
     );
-    let source_only_outcomes = [r04, r08, r09, r03, a10, a01]
+    let source_only_outcomes = [r04, r08, r09, a10, a01]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
@@ -9370,9 +9360,6 @@ mod tests_br140_r08_partial_components {
         let r08 = dispatcher
             .find("dispatch_r08_event_calendar_outcome")
             .expect("R-08 source-only call");
-        let r03 = dispatcher
-            .find("dispatch_r03_industry_chain_outcome")
-            .expect("R-03 source-only call");
         let a10 = dispatcher
             .find("dispatch_catalyst_review_daily_outcome")
             .expect("A-10 source-only call");
@@ -9383,9 +9370,15 @@ mod tests_br140_r08_partial_components {
             .find("let account_required = account_dependency_outcomes")
             .expect("account phase");
         assert!(r08 < account);
-        assert!(r03 < account);
         assert!(a10 < account);
         assert!(a01 < account);
+        // BR-194: R-03 is a LegacyAccountGate task, so `partition_review_tasks`
+        // can never place it in `source_only`. Dispatching it from the
+        // source-only join was dead code that also broke the BR-194 gate.
+        assert!(
+            !dispatcher.contains("dispatch_r03_industry_chain_outcome"),
+            "R-03 must stay on the account-gated path, not the source-only join"
+        );
     }
 
     #[test]

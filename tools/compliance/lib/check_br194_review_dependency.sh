@@ -298,8 +298,8 @@ for required in (
 ):
     assert required in schema, f"missing replay schema authority {required}"
 for required in (
-    "SCHEMA_VERSION: i64 = 5",
-    "migrate_schema_v4_to_v5",
+    "SCHEMA_VERSION: i64 = 6",
+    "migrate_schema_v5_to_v6",
     "register_sha256_function",
     "FunctionFlags::SQLITE_INNOCUOUS",
     "FROM pragma_function_list",
@@ -392,7 +392,7 @@ for required in (
     "PRAGMA table_info",
     "if actual != expected",
     "replay table CHECK/UNIQUE contract mismatch",
-    "EXPECTED_SCHEMA_VERSION = 5",
+    "EXPECTED_SCHEMA_VERSION = 6",
     "PRAGMA user_version",
     "sha256_hex(NEW.start_canonical)=NEW.start_sha256",
     "sha256_hex(NEW.completion_canonical)=NEW.completion_sha256",
@@ -731,8 +731,8 @@ def validate_schema(body: str) -> None:
     assert body.count("validate_review_terminal_replay_attempt_audit_insert") >= 2
     assert body.count("validate_review_terminal_replay_completion_audit_insert") >= 2
     for required in (
-        "SCHEMA_VERSION: i64 = 5",
-        "migrate_schema_v4_to_v5",
+        "SCHEMA_VERSION: i64 = 6",
+        "migrate_schema_v5_to_v6",
         "register_sha256_function",
         "FunctionFlags::SQLITE_INNOCUOUS",
         "FROM pragma_function_list",
@@ -793,7 +793,7 @@ def validate_verifier(body: str) -> None:
         "PRAGMA table_info",
         "if actual != expected",
         "replay table CHECK/UNIQUE contract mismatch",
-        "EXPECTED_SCHEMA_VERSION = 5",
+        "EXPECTED_SCHEMA_VERSION = 6",
         "PRAGMA user_version",
         "sha256_hex(NEW.start_canonical)=NEW.start_sha256",
         "sha256_hex(NEW.completion_canonical)=NEW.completion_sha256",
@@ -882,7 +882,7 @@ mutations = [
     (schema, "FOREIGN KEY(attempt_identity,decision_identity)", "FOREIGN KEY(attempt_identity)", validate_schema),
     (schema, "immutable_review_terminal_replay_attempt_update", "immutable_replay_update_REMOVED", validate_schema),
     (schema, "validate_review_terminal_replay_completion_audit_insert", "validate_replay_completion_REMOVED", validate_schema),
-    (schema, "SCHEMA_VERSION: i64 = 5", "SCHEMA_VERSION: i64 = 4", validate_schema),
+    (schema, "SCHEMA_VERSION: i64 = 6", "SCHEMA_VERSION: i64 = 5", validate_schema),
     (schema, "FunctionFlags::SQLITE_INNOCUOUS", "FunctionFlags::SQLITE_DIRECTONLY", validate_schema),
     (schema, "FROM pragma_function_list", "FROM missing_function_catalog", validate_schema),
     (schema, "sha256_hex(NEW.start_canonical)=NEW.start_sha256", "NEW.start_sha256=NEW.start_sha256", validate_schema),

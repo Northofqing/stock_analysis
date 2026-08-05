@@ -214,6 +214,149 @@ impl DatabaseManager {
     }
 }
 
+/// BR-215: outcome of reconciling the local `stock_position` projection
+/// against the latest user-confirmed complete position snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PositionReconciliation {
+    pub snapshot_id: String,
+    /// Open rows whose quantity/cost/name actually differed and were rewritten.
+    pub updated: usize,
+    /// Confirmed codes that had no open local row and were created.
+    pub inserted: usize,
+    /// Confirmed codes whose local row already matched.
+    pub unchanged: usize,
+    /// Locally open codes absent from the confirmed snapshot. BR-215 forbids
+    /// closing them here: a close needs a real sell price and date, which a
+    /// position snapshot does not carry.
+    pub unconfirmed_open: Vec<String>,
+}
+
+/// BR-215: rewrite the local `stock_position` projection from the latest
+/// user-confirmed complete snapshot.
+///
+/// The projection is not broker evidence, so it may only ever be derived from
+/// a confirmed snapshot — never hand-edited or estimated. The whole batch is
+/// validated before the first write so a rejected row cannot leave the table
+/// half-reconciled.
+pub fn reconcile_stock_position_from_confirmed_snapshot() -> Result<PositionReconciliation, String>
+{
+    let snapshot = crate::database::user_position_snapshot::latest_user_position_snapshot()?
+        .ok_or_else(|| {
+            "BR-215 no user-confirmed position snapshot: refusing to reconcile the local projection"
+                .to_string()
+        })?;
+    if snapshot.confirm_empty {
+        return Err(
+            "BR-215 confirmed-empty snapshot carries no sell price or date: close the open \
+             positions through the real trade path instead of the projection reconciler"
+                .to_string(),
+        );
+    }
+
+    // Validate the entire confirmed batch up front (env guard + BR-084 order
+    // safety) so a later RAISE(ABORT) cannot leave a partial rewrite behind.
+    for item in &snapshot.items {
+        crate::risk::env_guard::validate_symbol_for_current_env(&item.code)?;
+        if item.name.trim().is_empty() {
+            return Err(format!(
+                "BR-215 confirmed item {} has an empty name",
+                item.code
+            ));
+        }
+        if !item.cost_price.is_finite() || item.cost_price <= 0.0 {
+            return Err(format!(
+                "BR-215 confirmed item {} cost_price invalid: {}",
+                item.code, item.cost_price
+            ));
+        }
+        if item.quantity == 0 || !item.quantity.is_multiple_of(100) {
+            return Err(format!(
+                "BR-215 confirmed item {} quantity violates BR-084: {}",
+                item.code, item.quantity
+            ));
+        }
+        let quantity = i32::try_from(item.quantity)
+            .map_err(|_| format!("BR-215 confirmed item {} quantity overflows i32", item.code))?;
+        if item.cost_price * f64::from(quantity) > 1_000_000.0 {
+            return Err(format!(
+                "BR-215 confirmed item {} notional exceeds the BR-084 1,000,000 limit",
+                item.code
+            ));
+        }
+    }
+
+    let db =
+        DatabaseManager::try_get().ok_or_else(|| "BR-215 database not initialized".to_string())?;
+    let open = db.get_all_open_positions().map_err(|e| e.to_string())?;
+    let effective_date = snapshot
+        .effective_at
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+
+    let mut outcome = PositionReconciliation {
+        snapshot_id: snapshot.snapshot_id.clone(),
+        ..Default::default()
+    };
+    let mut conn = db.get_conn().map_err(|e| e.to_string())?;
+
+    for item in &snapshot.items {
+        let quantity = i32::try_from(item.quantity).expect("validated above");
+        match open.iter().find(|row| row.code == item.code) {
+            Some(row) => {
+                if row.quantity == quantity
+                    && (row.buy_price - item.cost_price).abs() < f64::EPSILON
+                    && row.name == item.name
+                {
+                    outcome.unchanged += 1;
+                    continue;
+                }
+                diesel::sql_query(
+                    "UPDATE stock_position
+                     SET name = ?, quantity = ?, buy_price = ?, updated_at = CURRENT_TIMESTAMP
+                     WHERE id = ?",
+                )
+                .bind::<diesel::sql_types::Text, _>(&item.name)
+                .bind::<diesel::sql_types::Integer, _>(quantity)
+                .bind::<diesel::sql_types::Double, _>(item.cost_price)
+                .bind::<diesel::sql_types::Integer, _>(row.id)
+                .execute(&mut conn)
+                .map_err(|e| format!("BR-215 update {} failed: {e}", item.code))?;
+                outcome.updated += 1;
+            }
+            None => {
+                db.save_position(&NewStockPosition {
+                    code: item.code.clone(),
+                    name: item.name.clone(),
+                    buy_date: effective_date.clone(),
+                    buy_price: item.cost_price,
+                    quantity,
+                    status: "open".to_string(),
+                    st_type: None,
+                    chain_name: None,
+                })
+                .map_err(|e| format!("BR-215 insert {} failed: {e}", item.code))?;
+                outcome.inserted += 1;
+            }
+        }
+    }
+
+    for row in &open {
+        if !snapshot.items.iter().any(|item| item.code == row.code) {
+            // §2.2: report, never silently close or delete.
+            log::warn!(
+                "[BR-215] open position {} is absent from confirmed snapshot {}; \
+                 left untouched because closing needs a real sell price and date",
+                row.code,
+                snapshot.snapshot_id
+            );
+            outcome.unconfirmed_open.push(row.code.clone());
+        }
+    }
+
+    Ok(outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +375,121 @@ mod tests {
                 .expect("clock after epoch")
                 .as_nanos()
         )
+    }
+
+    /// BR-215: the local projection must follow the confirmed snapshot, and a
+    /// locally open code the snapshot does not confirm must survive untouched.
+    #[test]
+    #[serial_test::serial]
+    fn br215_reconciliation_rewrites_projection_from_confirmed_snapshot() {
+        use crate::portfolio::user_position_snapshot::{
+            UserPositionItemInput, UserPositionSnapshotInput,
+        };
+
+        let db = init_test_db();
+        let drifted = unique_code("BR215_DRIFT");
+        let missing = unique_code("BR215_MISSING");
+        let orphan = unique_code("BR215_ORPHAN");
+
+        // Local projection drifted away from what the user later confirmed.
+        db.save_position(&NewStockPosition {
+            code: drifted.clone(),
+            name: "旧名".to_string(),
+            buy_date: "2026-06-01".to_string(),
+            buy_price: 4.0,
+            quantity: 3000,
+            status: "open".to_string(),
+            st_type: None,
+            chain_name: None,
+        })
+        .expect("save drifted position");
+        // Open locally but absent from the confirmed snapshot.
+        db.save_position(&NewStockPosition {
+            code: orphan.clone(),
+            name: "未确认持仓".to_string(),
+            buy_date: "2026-06-02".to_string(),
+            buy_price: 5.0,
+            quantity: 100,
+            status: "open".to_string(),
+            st_type: None,
+            chain_name: None,
+        })
+        .expect("save orphan position");
+
+        let effective_at = chrono::DateTime::parse_from_rfc3339("2026-08-04T15:00:00+08:00")
+            .expect("valid effective_at");
+        let items = vec![
+            UserPositionItemInput {
+                code: drifted.clone(),
+                name: "新名".to_string(),
+                quantity: 500,
+                cost_price: 10.5,
+            },
+            UserPositionItemInput {
+                code: missing.clone(),
+                name: "新增持仓".to_string(),
+                quantity: 200,
+                cost_price: 7.25,
+            },
+        ];
+        crate::database::user_position_snapshot::save_user_position_snapshot(
+            &UserPositionSnapshotInput {
+                snapshot_id: format!("ups_v1_{}", unique_code("BR215_SNAP")),
+                effective_at,
+                confirmed_at: effective_at,
+                source: "TEST_CODE_br215".to_string(),
+                confirm_empty: false,
+                evidence_sha256: "0".repeat(64),
+                items,
+            },
+        )
+        .expect("save confirmed snapshot");
+
+        let outcome =
+            reconcile_stock_position_from_confirmed_snapshot().expect("reconcile projection");
+
+        assert_eq!(outcome.updated, 1, "drifted row must be rewritten");
+        assert_eq!(
+            outcome.inserted, 1,
+            "confirmed-but-absent code must be created"
+        );
+        assert!(
+            outcome.unconfirmed_open.contains(&orphan),
+            "unconfirmed open code must be reported, got {:?}",
+            outcome.unconfirmed_open
+        );
+
+        let rewritten = db
+            .get_open_position(&drifted)
+            .expect("query drifted")
+            .expect("drifted still open");
+        assert_eq!(rewritten.quantity, 500);
+        assert!((rewritten.buy_price - 10.5).abs() < 1e-9);
+        assert_eq!(rewritten.name, "新名");
+        assert_eq!(
+            rewritten.buy_date, "2026-06-01",
+            "reconciliation must not rewrite the original buy_date"
+        );
+
+        let created = db
+            .get_open_position(&missing)
+            .expect("query created")
+            .expect("created position exists");
+        assert_eq!(created.quantity, 200);
+        assert_eq!(created.buy_date, "2026-08-04");
+
+        // §2.2: the unconfirmed code is reported, never silently closed.
+        let untouched = db
+            .get_open_position(&orphan)
+            .expect("query orphan")
+            .expect("orphan still open");
+        assert_eq!(untouched.quantity, 100);
+
+        // Re-running is idempotent: nothing differs any more.
+        let repeat = reconcile_stock_position_from_confirmed_snapshot().expect("reconcile again");
+        assert_eq!(repeat.updated, 0);
+        assert_eq!(repeat.inserted, 0);
+        assert_eq!(repeat.unchanged, 2);
     }
 
     #[test]

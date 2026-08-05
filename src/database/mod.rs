@@ -1053,6 +1053,8 @@ pub mod news_ai;
 pub mod order_audit;
 pub mod position_chain;
 mod positions;
+// BR-215: projection reconciliation is a tool-facing entry point.
+pub use positions::{reconcile_stock_position_from_confirmed_snapshot, PositionReconciliation};
 mod sqlite_descriptor_attestation;
 // v12 PR1-1.5 (BR-021)
 pub mod account_mode_log;

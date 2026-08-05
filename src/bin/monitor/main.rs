@@ -1832,6 +1832,11 @@ pub async fn refresh_banner_state_with_metrics(
     lib_mode: stock_analysis::risk::action_gate::AccountMode,
 ) -> Result<(), String> {
     let data_health = evaluated_data_health()?;
+    // BR-147: this is the only banner path the live monitor and `--review`
+    // actually take. Without refreshing the note here the cached slot stays
+    // None for the whole process, so a persisted valuation is rendered as
+    // "收盘估值不可用" — reporting known data as missing.
+    refresh_closing_valuation_note();
     store_banner(build_banner(am_metrics, lib_mode, &data_health))
 }
 
@@ -3887,6 +3892,34 @@ async fn main() {
 
     if review_mode {
         log::info!("[复盘] --review 终端模式启动，完成后退出，不进入常驻监控");
+        // BR-147: 收盘估值原本只在常驻主循环的盘后分支计算。--review 在主循环
+        // 启动前返回，因此手动复盘永远拿不到当日估值，banner 与复盘正文只能显示
+        // 上一交易日的结果。此处复用与主循环完全相同的入口，且必须在
+        // evaluate_account_mode_hook 之前执行，使刷新出的 note 携带当日估值。
+        // 落库按 run_id 内容哈希幂等，重复执行不会产生重复批次。
+        {
+            let now = chrono::Local::now();
+            if stock_analysis::calendar::is_trading_day(now.date_naive())
+                && closing_valuation_runtime::eligible_after_close(now.fixed_offset())
+            {
+                match closing_valuation_runtime::run_closing_valuation_once(now.date_naive()).await
+                {
+                    Ok(receipt) => log::info!(
+                        "[BR-147] closing valuation persisted: run_id={} inserted={}",
+                        receipt.run_id,
+                        receipt.inserted
+                    ),
+                    // §2.2: 估值失败保持显式，不用旧批次或 0 值冒充当日结果。
+                    Err(error) => log::error!("[BR-147] closing valuation failed: {error}"),
+                }
+            } else {
+                log::info!(
+                    "[BR-147] closing valuation skipped: trading_day={} after_close={}",
+                    stock_analysis::calendar::is_trading_day(now.date_naive()),
+                    closing_valuation_runtime::eligible_after_close(now.fixed_offset())
+                );
+            }
+        }
         // BR-108/BR-116: --review 与常驻监控一样需要真实治理上下文。该分支在主循环
         // 启动前返回，若不在此评估 AccountMode/DataMode，LATEST_BANNER 恒为 None，
         // 依赖 banner 的复盘推送会以 "governance banner unavailable" 被跳过。
