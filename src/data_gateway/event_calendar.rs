@@ -53,7 +53,18 @@ impl EventCalendarGateway {
         .await;
 
         match joined {
-            Ok(result) => result,
+            Ok(result) => {
+                let batch = result?;
+                // BR-216: a completed announcement poll proves the News source
+                // is alive. A legitimately empty batch still counts as success;
+                // only failed acquisitions skip the marker, so freshness is
+                // never fabricated.
+                crate::monitor::data_mode::mark_capability_success(
+                    crate::monitor::data_mode::Capability::News,
+                )
+                .map_err(|error| GatewayError::unavailable(CAPABILITY, None, false, error))?;
+                Ok(batch)
+            }
             Err(error) => {
                 audit_blocking_join_failure(
                     CAPABILITY,

@@ -17853,9 +17853,14 @@ mod tests {
         let input = DataHealthInput {
             capabilities: vec![
                 CapabilityStatus::fresh(Capability::Quote, 30),
-                CapabilityStatus::fresh(Capability::Kline, 200), // 超过 120s
+                // BR-216: Kline 预算是 1 个交易日, 必须真正越过该档才算过期,
+                // 否则本用例会因 News 缺失而"以错误原因通过"。
+                CapabilityStatus::fresh(
+                    Capability::Kline,
+                    stock_analysis::monitor::data_mode::KLINE_MAX_AGE_SECS + 1,
+                ),
                 CapabilityStatus::missing(Capability::MoneyFlow),
-                CapabilityStatus::missing(Capability::News),
+                CapabilityStatus::fresh(Capability::News, 30),
                 CapabilityStatus::missing(Capability::OrderBook),
             ],
             critical_max_age_secs: 120,

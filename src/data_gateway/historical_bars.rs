@@ -45,6 +45,18 @@ use super::security_lifecycle::{
 
 const CAPABILITY: &str = "HistoricalDailyBars";
 
+/// BR-216: record Kline liveness at the gateway admission point.
+///
+/// Sinking the marker here (instead of at each business call site) is what
+/// keeps "a production fetch exists but nobody marked the capability" from
+/// recurring: every admitted daily-bar batch, whatever the caller, proves the
+/// Kline source is alive. Only an admitted batch reaches this point, so the
+/// marker never fabricates freshness for a failed acquisition.
+fn mark_daily_bars_capability_live() -> Result<(), GatewayError> {
+    crate::monitor::data_mode::mark_capability_success(crate::monitor::data_mode::Capability::Kline)
+        .map_err(|error| GatewayError::unavailable(CAPABILITY, None, false, error))
+}
+
 /// Exact lifecycle proof retained by schema-v2 outcome admission.
 #[derive(Debug, Clone)]
 pub(super) struct OutcomeLifecycleAdmission {
@@ -214,7 +226,9 @@ impl HistoricalBarsGateway {
         code: &str,
         days: usize,
     ) -> Result<AdmittedDailyBars, GatewayError> {
-        self.daily_bars(code, days)
+        let admitted = self.daily_bars(code, days)?;
+        mark_daily_bars_capability_live()?;
+        Ok(admitted)
     }
 
     /// Async counterpart of [`Self::required_daily_bars`].
@@ -223,7 +237,9 @@ impl HistoricalBarsGateway {
         code: &str,
         days: usize,
     ) -> Result<AdmittedDailyBars, GatewayError> {
-        self.daily_bars_async(code, days).await
+        let admitted = self.daily_bars_async(code, days).await?;
+        mark_daily_bars_capability_live()?;
+        Ok(admitted)
     }
 
     /// Acquire source and lifecycle evidence for every adjacent close that is

@@ -345,6 +345,20 @@ fn build_instrument(storage_code: &str) -> Result<InstrumentId, GatewayError> {
     })
 }
 
+/// BR-217: acquisition-time freshness cannot be expressed by the router.
+///
+/// `AcceptancePolicy::with_max_source_age` bounds `fetched_at - source_at`,
+/// i.e. the provider's *internal* lag, not how old the data is when this
+/// process consumes it. The AGENTS §2.4 five-second red line is the latter,
+/// so it stays in [`admit_quote_batch`]. To keep that gate from terminating
+/// the whole acquisition, each provider is routed on its own and a retryable
+/// admission failure falls over to the next one instead of aborting.
+fn realtime_quote_acceptance_policy() -> AcceptancePolicy {
+    AcceptancePolicy::new()
+        .with_require_complete(true)
+        .with_require_source_at(true)
+}
+
 fn route_quotes(
     storage_codes: &[String],
     instruments: &[InstrumentId],
@@ -352,64 +366,111 @@ fn route_quotes(
     ProviderId,
     Result<GatewayBatch<RealtimeMarketQuote>, GatewayError>,
 ) {
-    let mut router = QuoteRouter::new(
-        AcceptancePolicy::new()
-            .with_require_complete(true)
-            .with_require_source_at(true),
-    );
+    // BR-217: the AGENTS §2.4 five-second quote red line belongs inside the
+    // BR-217: route each provider on its own so that an acquisition-time
+    // staleness rejection in `admit_quote_batch` falls over to the next
+    // provider instead of terminating the whole acquisition. A single
+    // multi-source router cannot do this: it selects the first batch that
+    // satisfies the acceptance policy and returns, after which the §2.4
+    // five-second gate can only abort, permanently shadowing the healthier
+    // providers registered behind a systematically-late one.
+    let policy = realtime_quote_acceptance_policy();
+    let mut last_failure: Option<(ProviderId, GatewayError)> = None;
 
-    let registration = router
-        .register(quote_source(
+    for provider in QUOTE_PROVIDER_CHAIN {
+        let source = match quote_chain_source(provider) {
+            Ok(source) => source,
+            Err(error) => return (provider, Err(router_gateway_error(error, provider))),
+        };
+        let mut router = QuoteRouter::new(policy);
+        if let Err(error) = router.register(source) {
+            return (provider, Err(router_gateway_error(error, provider)));
+        }
+
+        let admission = match router.route(instruments) {
+            Ok(outcome) => {
+                let selected = outcome.selected_provider();
+                match admit_quote_batch(storage_codes, selected, outcome.into_batch()) {
+                    Ok(batch) => return (selected, Ok(batch)),
+                    Err(error) => Some((selected, error)),
+                }
+            }
+            Err(error) => {
+                // A single-source router can only be exhausted by this very
+                // provider, so its terminal-looking verdict describes one
+                // route, never the whole chain. Always advance; treating it as
+                // final is what let a broken primary shadow the fallbacks.
+                last_failure = Some((provider, router_gateway_error(error, provider)));
+                None
+            }
+        };
+
+        if let Some((selected, error)) = admission {
+            // A non-retryable admission failure is a definitive statement about
+            // the request itself, not about this provider's liveness; trying
+            // the next source would only relabel the same rejection.
+            if !error.retryable() {
+                return (selected, Err(error));
+            }
+            last_failure = Some((selected, error));
+        }
+    }
+
+    match last_failure {
+        Some((provider, error)) => (provider, Err(error)),
+        None => (
+            ProviderId::Tdx,
+            Err(GatewayError::unavailable(
+                CAPABILITY,
+                None,
+                true,
+                "no realtime quote provider is registered".to_owned(),
+            )),
+        ),
+    }
+}
+
+/// BR-217: failover order for realtime quotes. Magic TDX stays the first
+/// A-share route candidate; the HTTP providers behind it are fallbacks only.
+const QUOTE_PROVIDER_CHAIN: [ProviderId; 3] =
+    [ProviderId::Tdx, ProviderId::Tencent, ProviderId::Sina];
+
+fn quote_chain_source(
+    provider: ProviderId,
+) -> Result<magic_market_router::SourceFn<[InstrumentId], magic_market_core::Quote>, RouterError> {
+    match provider {
+        ProviderId::Tdx => Ok(quote_source(
             ProviderId::Tdx,
             Arc::new(TdxSmartClient::new()),
             classify_tdx_error,
-        ))
-        .and_then(|router| {
+        )),
+        ProviderId::Tencent => {
             let client = TencentClient::new().map_err(|error| {
                 RouterError::InvalidConfiguration(format!(
                     "Magic Tencent quote client initialization failed: {error}"
                 ))
             })?;
-            router.register(quote_source(
+            Ok(quote_source(
                 ProviderId::Tencent,
                 Arc::new(client),
                 classify_tencent_error,
             ))
-        })
-        .and_then(|router| {
+        }
+        ProviderId::Sina => {
             let client = SinaClient::new().map_err(|error| {
                 RouterError::InvalidConfiguration(format!(
                     "Magic Sina quote client initialization failed: {error}"
                 ))
             })?;
-            router.register(quote_source(
+            Ok(quote_source(
                 ProviderId::Sina,
                 Arc::new(client),
                 classify_sina_error,
             ))
-        });
-
-    if let Err(error) = registration {
-        return (
-            ProviderId::Tdx,
-            Err(router_gateway_error(error, ProviderId::Tdx)),
-        );
-    }
-
-    match router.route(instruments) {
-        Ok(outcome) => {
-            let provider = outcome.selected_provider();
-            let batch = outcome.into_batch();
-            (provider, admit_quote_batch(storage_codes, provider, batch))
         }
-        Err(error) => {
-            let provider = error
-                .attempts()
-                .last()
-                .map(|attempt| attempt.provider_id())
-                .unwrap_or(ProviderId::Tdx);
-            (provider, Err(router_gateway_error(error, provider)))
-        }
+        other => Err(RouterError::InvalidConfiguration(format!(
+            "provider {other:?} is not a registered realtime quote route"
+        ))),
     }
 }
 
@@ -672,6 +733,105 @@ mod tests {
             .with_batch_id(batch_id)
             .unwrap();
         DataBatch::strict(vec![quote], provenance)
+    }
+
+    /// BR-217: `AcceptancePolicy::with_max_source_age` bounds the provider's
+    /// internal lag (`fetched_at - source_at`), not how old the data is when
+    /// this process consumes it, so it cannot express the AGENTS §2.4
+    /// five-second red line. This pins that distinction: a batch whose source
+    /// time is six seconds behind the wall clock but internally consistent is
+    /// accepted by the router and must be rejected by `admit_quote_batch`.
+    #[test]
+    fn br217_router_policy_cannot_express_acquisition_time_freshness() {
+        use magic_market_router::quote_source;
+
+        struct FixedQuoteProvider {
+            batch: DataBatch<Quote>,
+        }
+
+        #[derive(Debug)]
+        struct NeverFails;
+
+        impl std::fmt::Display for NeverFails {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("unreachable")
+            }
+        }
+
+        impl std::error::Error for NeverFails {}
+
+        impl magic_market_core::RealtimeQuotes for FixedQuoteProvider {
+            type Quote = Quote;
+            type Error = NeverFails;
+
+            fn realtime_quotes(
+                &self,
+                _instruments: &[InstrumentId],
+            ) -> Result<DataBatch<Self::Quote>, Self::Error> {
+                Ok(self.batch.clone())
+            }
+        }
+
+        let stale = quote_batch(
+            "600396",
+            ProviderId::Tencent,
+            "TEST_CODE_stale_batch",
+            Utc::now() - chrono::Duration::seconds(6),
+        );
+
+        let mut router = QuoteRouter::new(realtime_quote_acceptance_policy());
+        router
+            .register(quote_source(
+                ProviderId::Tencent,
+                Arc::new(FixedQuoteProvider { batch: stale }),
+                |error: NeverFails| SourceError::try_next(FailureKind::Protocol, error.to_string()),
+            ))
+            .expect("the fixed provider registers");
+
+        let instruments = build_instruments(&["600396".to_owned()]).unwrap();
+        let outcome = router
+            .route(&instruments)
+            .expect("router freshness is provider-internal, so it accepts this batch");
+
+        let admission = admit_quote_batch(
+            &["600396".to_owned()],
+            outcome.selected_provider(),
+            outcome.into_batch(),
+        );
+        let error = admission.expect_err("§2.4 five-second gate must reject a six-second quote");
+        assert!(
+            error.retryable(),
+            "a stale quote must stay retryable so BR-217 failover can try the next provider"
+        );
+    }
+
+    /// BR-217 / AGENTS §2.4: the five-second bound must not be relocated into
+    /// the router policy, and provider source time stays mandatory.
+    #[test]
+    fn br217_realtime_quote_policy_keeps_source_evidence_without_widening_the_red_line() {
+        let policy = realtime_quote_acceptance_policy();
+        assert_eq!(
+            policy.max_source_age(),
+            None,
+            "router freshness measures provider-internal lag; §2.4 lives in admit_quote_batch"
+        );
+        assert!(policy.require_source_at());
+        assert!(policy.require_complete());
+    }
+
+    /// BR-217: the failover chain keeps Magic TDX first and every entry must be
+    /// a constructible quote route, otherwise a stale primary silently becomes
+    /// terminal again.
+    #[test]
+    fn br217_quote_provider_chain_is_ordered_and_constructible() {
+        assert_eq!(QUOTE_PROVIDER_CHAIN[0], ProviderId::Tdx);
+        for provider in QUOTE_PROVIDER_CHAIN {
+            assert!(
+                quote_chain_source(provider).is_ok(),
+                "provider {provider:?} must be a registered realtime quote route"
+            );
+        }
+        assert!(quote_chain_source(ProviderId::Cninfo).is_err());
     }
 
     #[test]

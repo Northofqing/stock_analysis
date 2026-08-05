@@ -321,11 +321,25 @@ impl Capability {
     /// 该 capability 缺失是否影响"价格型建议" (PR2-2.1 关键)
     ///
     /// true = 关键能力, 缺失降级 DataMode
-    /// false = 辅助能力 (盘口), 缺失只挂横幅, 不降级
+    /// false = 辅助能力, 缺失只挂横幅, 不降级
+    ///
+    /// BR-216: 判定依据是"是否已接入真实 provider", 不是"是否重要"。
+    /// MoneyFlow 与 OrderBook 在 monitor 进程内均无生产取数路径
+    /// (BR-190 记 `provider_capability_not_live_admitted`), 若继续算关键能力,
+    /// `critical_stale` 恒非空、Full 分支永不可达, 安全门恒红即等于失效,
+    /// 反而掩盖 Quote 真实断流。二者一旦接入真实 provider 必须改回 true。
     pub fn is_critical(self) -> bool {
-        !matches!(self, Capability::OrderBook)
+        !matches!(self, Capability::OrderBook | Capability::MoneyFlow)
     }
 }
+
+/// BR-216: Kline 属 AGENTS §2.4 的"日线/历史"档, 新鲜度按 1 个交易日计。
+/// 沿用 120s 关键窗口会让日频数据结构上不可能新鲜。
+pub const KLINE_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+
+/// BR-216: News 采集节律由 `NEWS_POLL_INTERVAL` 决定 (默认 120s)。
+/// 预算必须显著大于轮询周期, 否则每轮之间必然抖出 stale。
+pub const NEWS_MAX_AGE_SECS: u64 = 300;
 
 /// 三态数据模式
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -434,6 +448,21 @@ pub struct DataHealthInput {
     pub orderbook_max_age_secs: u64,
 }
 
+impl DataHealthInput {
+    /// BR-216: 按采集节律给出该 capability 的新鲜度预算。
+    ///
+    /// 分级后仍保留调用方语义: 放大 `critical_max_age_secs` 可整体放宽,
+    /// 但不得把日频/新闻档收窄到低于其自身节律。
+    pub fn max_age_for(&self, cap: Capability) -> u64 {
+        match cap {
+            Capability::Quote => self.critical_max_age_secs,
+            Capability::Kline => KLINE_MAX_AGE_SECS.max(self.critical_max_age_secs),
+            Capability::News => NEWS_MAX_AGE_SECS.max(self.critical_max_age_secs),
+            Capability::MoneyFlow | Capability::OrderBook => self.orderbook_max_age_secs,
+        }
+    }
+}
+
 impl Default for DataHealthInput {
     fn default() -> Self {
         Self {
@@ -482,11 +511,7 @@ pub fn evaluate(input: &DataHealthInput, prev: Option<DataMode>) -> DataHealth {
     let mut quote_stale = false;
 
     for cs in &input.capabilities {
-        let max_age = if cs.cap.is_critical() {
-            input.critical_max_age_secs
-        } else {
-            input.orderbook_max_age_secs
-        };
+        let max_age = input.max_age_for(cs.cap);
 
         if cs.is_ok(max_age) {
             continue;
@@ -754,12 +779,51 @@ mod tests {
     #[test]
     fn degraded_when_kline_stale() {
         let mut input = input_all_fresh();
-        input.capabilities[1] = CapabilityStatus::fresh(Capability::Kline, 200);
+        input.capabilities[1] = CapabilityStatus::fresh(Capability::Kline, KLINE_MAX_AGE_SECS + 1);
         let h = evaluate(&input, Some(DataMode::Full));
         assert_eq!(h.mode, DataMode::Degraded);
         assert!(h.is_changed(), "Full → Degraded 应算变更");
         assert!(h.missing.contains(&Capability::Kline));
         assert!(h.eta.as_ref().unwrap().contains("Kline"));
+    }
+
+    /// BR-216: 日频数据不得套用 120s 关键窗口, 否则结构上不可能新鲜。
+    #[test]
+    fn br216_kline_within_one_trading_day_stays_fresh() {
+        let mut input = input_all_fresh();
+        input.capabilities[1] = CapabilityStatus::fresh(Capability::Kline, 4 * 60 * 60);
+        let h = evaluate(&input, Some(DataMode::Full));
+        assert_eq!(h.mode, DataMode::Full);
+        assert!(!h.missing.contains(&Capability::Kline));
+    }
+
+    /// BR-216: News 预算必须显著大于 `NEWS_POLL_INTERVAL` 默认 120s,
+    /// 否则每两轮轮询之间必然抖出一次 stale。
+    #[test]
+    fn br216_news_survives_one_poll_interval() {
+        let mut input = input_all_fresh();
+        input.capabilities[3] = CapabilityStatus::fresh(Capability::News, 121);
+        let h = evaluate(&input, Some(DataMode::Full));
+        assert_eq!(h.mode, DataMode::Full);
+
+        input.capabilities[3] = CapabilityStatus::fresh(Capability::News, NEWS_MAX_AGE_SECS + 1);
+        assert_eq!(
+            evaluate(&input, Some(DataMode::Full)).mode,
+            DataMode::Degraded
+        );
+    }
+
+    /// BR-216: 调用方放大 `critical_max_age_secs` 仍可整体放宽, 但不得收窄分级档。
+    #[test]
+    fn br216_widened_critical_window_never_narrows_graded_budgets() {
+        let mut input = input_all_fresh();
+        input.critical_max_age_secs = 2 * KLINE_MAX_AGE_SECS;
+        assert_eq!(input.max_age_for(Capability::Kline), 2 * KLINE_MAX_AGE_SECS);
+        assert_eq!(input.max_age_for(Capability::News), 2 * KLINE_MAX_AGE_SECS);
+        input.critical_max_age_secs = 1;
+        assert_eq!(input.max_age_for(Capability::Kline), KLINE_MAX_AGE_SECS);
+        assert_eq!(input.max_age_for(Capability::News), NEWS_MAX_AGE_SECS);
+        assert_eq!(input.max_age_for(Capability::Quote), 1);
     }
 
     #[test]
@@ -771,12 +835,19 @@ mod tests {
         assert!(h.missing.contains(&Capability::News));
     }
 
+    /// BR-216: MoneyFlow 在 monitor 进程内无准入 provider
+    /// (BR-190 `provider_capability_not_live_admitted`), 归为辅助能力:
+    /// 只上横幅提示"未接入", 不得把 DataMode 永久压在 Degraded。
     #[test]
-    fn degraded_when_moneyflow_stale() {
+    fn br216_moneyflow_stale_surfaces_in_missing_without_degrading() {
         let mut input = input_all_fresh();
-        input.capabilities[2] = CapabilityStatus::fresh(Capability::MoneyFlow, 130);
+        input.capabilities[2] = CapabilityStatus::missing(Capability::MoneyFlow);
         let h = evaluate(&input, Some(DataMode::Full));
-        assert_eq!(h.mode, DataMode::Degraded);
+        assert_eq!(h.mode, DataMode::Full);
+        assert!(
+            h.missing.contains(&Capability::MoneyFlow),
+            "未接入必须仍然可见, 不得静默 (§2.2)"
+        );
     }
 
     // ---- Unsafe 场景 ----
@@ -803,7 +874,7 @@ mod tests {
         let mut input = input_all_fresh();
         // Kline stale (Degraded) + Quote stale (Unsafe) → Unsafe
         input.capabilities[0] = CapabilityStatus::fresh(Capability::Quote, 200);
-        input.capabilities[1] = CapabilityStatus::fresh(Capability::Kline, 200);
+        input.capabilities[1] = CapabilityStatus::fresh(Capability::Kline, KLINE_MAX_AGE_SECS + 1);
         let h = evaluate(&input, Some(DataMode::Full));
         assert_eq!(h.mode, DataMode::Unsafe);
     }
@@ -825,7 +896,7 @@ mod tests {
     #[test]
     fn full_to_degraded_changed() {
         let mut input = input_all_fresh();
-        input.capabilities[1] = CapabilityStatus::fresh(Capability::Kline, 200);
+        input.capabilities[1] = CapabilityStatus::fresh(Capability::Kline, KLINE_MAX_AGE_SECS + 1);
         let h = evaluate(&input, Some(DataMode::Full));
         assert!(h.is_changed());
     }
@@ -836,8 +907,12 @@ mod tests {
     fn capability_critical_classification() {
         assert!(Capability::Quote.is_critical());
         assert!(Capability::Kline.is_critical());
-        assert!(Capability::MoneyFlow.is_critical());
         assert!(Capability::News.is_critical());
+        // BR-216: 无准入 provider 的能力归辅助, 否则安全门恒红即失效。
+        assert!(
+            !Capability::MoneyFlow.is_critical(),
+            "MoneyFlow 未接入真实 provider, 不得永久压低 DataMode"
+        );
         assert!(
             !Capability::OrderBook.is_critical(),
             "OrderBook 辅助, 缺失不降级"
