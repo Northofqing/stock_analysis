@@ -7861,6 +7861,26 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
     }
 
     // 4. 可做T持仓 (结构过滤: Holding + 整百股 + 成本价 > 0)
+    //    做T 区间以**收盘价**为基准 (BR-225 修正: 此前误用成本价,
+    //    现价远低于成本时给出荒谬低吸位)
+    let closes: std::collections::HashMap<String, f64> =
+        match tokio::task::spawn_blocking(|| {
+            use stock_analysis::database::closing_valuation::latest_persisted_valuation_view;
+            match latest_persisted_valuation_view() {
+                Ok(Some(view)) => view
+                    .valuation
+                    .items
+                    .iter()
+                    .filter_map(|item| item.close.map(|close| (item.code.clone(), close)))
+                    .collect(),
+                _ => std::collections::HashMap::new(),
+            }
+        })
+        .await
+        {
+            Ok(closes) => closes,
+            Err(_) => std::collections::HashMap::new(),
+        };
     match tokio::task::spawn_blocking(stock_analysis::portfolio::get_positions).await {
         Ok(Ok(positions)) => {
             for position in positions {
@@ -7871,17 +7891,34 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
                 {
                     continue;
                 }
-                items.push(OwnedWatchItem {
-                    code: position.code,
-                    name: position.name,
-                    topic: "做T候选".to_string(),
-                    source: WatchSource::T0Candidate,
-                    trigger: "持仓做T".to_string(),
-                    lo_price: position.cost_price * 0.98,
-                    hi_price: position.cost_price * 1.02,
-                    stop: position.cost_price * 0.95,
-                    reason: "整百股持仓满足做T结构条件".to_string(),
-                });
+                match closes.get(&position.code).copied() {
+                    Some(base) if base > 0.0 => {
+                        items.push(OwnedWatchItem {
+                            code: position.code,
+                            name: position.name,
+                            topic: "做T候选".to_string(),
+                            source: WatchSource::T0Candidate,
+                            trigger: "持仓做T".to_string(),
+                            lo_price: base * 0.98,
+                            hi_price: base * 1.02,
+                            stop: base * 0.95,
+                            reason: format!("整百股持仓满足做T结构条件; 以收盘价 {base:.2} 为基准"),
+                        });
+                    }
+                    _ => {
+                        items.push(OwnedWatchItem {
+                            code: position.code,
+                            name: position.name,
+                            topic: "做T候选".to_string(),
+                            source: WatchSource::T0Candidate,
+                            trigger: "持仓做T".to_string(),
+                            lo_price: 0.0,
+                            hi_price: 0.0,
+                            stop: 0.0,
+                            reason: "整百股持仓满足做T结构条件; 无收盘价, 竞价后按 T-11 复核".to_string(),
+                        });
+                    }
+                }
             }
         }
         Ok(Err(error)) => log::warn!("[R-07][BR-222] 持仓源不可用, 跳过该来源: {error}"),
