@@ -2085,11 +2085,78 @@ pub async fn push_preopen_news_hot(code: &str, params: PreopenNewsHotParams<'_>)
     .is_pushed()
 }
 
+/// BR-225: 取前三条主线簇的头股代码。`chain_daily.stocks` 只存代码，名称必须
+/// 由外部权威来源解析，因此调用方需要先拿到这份代码集合。
+pub fn preopen_head_codes(
+    clusters: &[stock_analysis::database::concepts::ChainDailyRow],
+) -> Result<Vec<String>, String> {
+    let mut codes = Vec::new();
+    for (cluster_index, cluster) in clusters.iter().take(3).enumerate() {
+        let parsed = serde_json::from_str::<Vec<String>>(&cluster.stocks).map_err(|error| {
+            format!(
+                "P-01 chain_daily 第 {} 个主线 stocks JSON 非法: {error}",
+                cluster_index + 1
+            )
+        })?;
+        let code = parsed
+            .first()
+            .map(|value| value.trim())
+            .filter(|code| valid_source_stock_code(code))
+            .ok_or_else(|| {
+                format!(
+                    "P-01 chain_daily 第 {} 个主线缺少有效头股",
+                    cluster_index + 1
+                )
+            })?;
+        codes.push(code.to_string());
+    }
+    Ok(codes)
+}
+
+/// BR-225: 通过统一 Gateway 的已接纳 security identity 能力解析头股真实名称。
+///
+/// `chain_daily` 与 `board_rotation_daily` 是两张互相独立的表，头股不必出现在
+/// 板块异动股列表里；把板块表当作唯一名称来源会让整条 P-01 推送因一只股票缺名
+/// 而全量失败。这里保留板块表内的 provider 名称为首选证据，缺失项才回落到
+/// security identity 批次，仍然不合成任何本地名称。
+pub async fn resolve_preopen_head_names(
+    codes: &[String],
+) -> Result<std::collections::HashMap<String, String>, String> {
+    use stock_analysis::data_gateway::{GatewayBatch, MarketCapabilitiesGateway};
+    if codes.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let batch = MarketCapabilitiesGateway::new()
+        .security_identities(codes)
+        .await
+        .map_err(|error| format!("P-01 证券身份统一 Gateway 失败: {error}"))?;
+    let (records, evidence) = match batch {
+        GatewayBatch::Available { records, evidence } => (records, evidence),
+        GatewayBatch::VerifiedEmpty(evidence) => (Vec::new(), evidence),
+    };
+    let mut names = std::collections::HashMap::new();
+    for record in records {
+        if record.batch_id != evidence.batch_id {
+            return Err(format!(
+                "P-01 证券身份批次身份不一致: code={} batch_id={}",
+                record.code, evidence.batch_id
+            ));
+        }
+        let name = record.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        names.insert(record.code.clone(), name.to_string());
+    }
+    Ok(names)
+}
+
 /// BR-101: 从主线簇与板块联动归因构造可证的盘前新闻快照。
 pub fn build_preopen_news_hot_from_db<'a>(
     hhmm: &'a str,
     clusters: &'a [stock_analysis::database::concepts::ChainDailyRow],
     rotations: &'a [stock_analysis::database::concepts::BoardRotationRow],
+    resolved_names: &std::collections::HashMap<String, String>,
 ) -> Result<PreopenNewsHotParams<'a>, String> {
     if clusters.is_empty() {
         return Err("P-01 chain_daily 无主线簇".to_string());
@@ -2176,6 +2243,7 @@ pub fn build_preopen_news_hot_from_db<'a>(
             })?;
         let name = names
             .get(code)
+            .or_else(|| resolved_names.get(code))
             .ok_or_else(|| format!("P-01 主线 {} 头股 {code} 缺少真实名称证据", cluster.concept))?;
         watch_stocks.push((name.clone(), code.to_string(), cluster.concept.clone()));
     }
@@ -2223,7 +2291,25 @@ pub async fn dispatch_preopen_news_hot_daily() -> bool {
     }
     let now = chrono::Local::now();
     let hhmm = now.format("%H:%M").to_string();
-    let params = match build_preopen_news_hot_from_db(&hhmm, &clusters, &rotations) {
+    // BR-225: 头股名称先由统一 Gateway 的 security identity 批次解析，作为板块
+    // 异动股名称之外的独立回落证据。解析失败不合成名称，只记录后交由构造函数
+    // 按缺失代码显式失败。
+    let resolved_names = match preopen_head_codes(&clusters) {
+        Ok(codes) => match resolve_preopen_head_names(&codes).await {
+            Ok(names) => names,
+            Err(error) => {
+                log::warn!("[P-01][BR-225] 头股名称回落解析失败: {error}");
+                std::collections::HashMap::new()
+            }
+        },
+        Err(error) => {
+            log::error!("[P-01] 快照批次拒绝: {error}");
+            log_dispatcher_attempt("P-01", false, 0, &error);
+            return false;
+        }
+    };
+    let params = match build_preopen_news_hot_from_db(&hhmm, &clusters, &rotations, &resolved_names)
+    {
         Ok(params) => params,
         Err(error) => {
             log::error!("[P-01] 快照批次拒绝: {error}");
@@ -7246,14 +7332,12 @@ pub async fn dispatch_auction_repush(hhmm: &str) -> bool {
     ranked.sort_by(|a, b| {
         let tier_a = a.tier == stock_analysis::opportunity::candidate_panel::EvidenceTier::Strong;
         let tier_b = b.tier == stock_analysis::opportunity::candidate_panel::EvidenceTier::Strong;
-        tier_b
-            .cmp(&tier_a)
-            .then_with(|| {
-                b.heat_score
-                    .unwrap_or(0.0)
-                    .partial_cmp(&a.heat_score.unwrap_or(0.0))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+        tier_b.cmp(&tier_a).then_with(|| {
+            b.heat_score
+                .unwrap_or(0.0)
+                .partial_cmp(&a.heat_score.unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     });
     let top5: Vec<_> = ranked.into_iter().take(5).collect();
     if top5.is_empty() {
@@ -7294,7 +7378,9 @@ pub fn render_ipo_catalyst(
         text.push_str(&related);
         text.push('\n');
     }
-    text.push_str("数据源: 维护的 IPO 供应链静态表 (阶段变化需人工更新) | 非实时事件 | 辅助建议, 非下单指令");
+    text.push_str(
+        "数据源: 维护的 IPO 供应链静态表 (阶段变化需人工更新) | 非实时事件 | 辅助建议, 非下单指令",
+    );
     text
 }
 
@@ -7380,7 +7466,12 @@ pub async fn dispatch_block_trade_review(
         }
     }
     if pushed == 0 {
-        log_dispatcher_attempt("BR-033/034", false, batch.records().len(), "no matching block trades");
+        log_dispatcher_attempt(
+            "BR-033/034",
+            false,
+            batch.records().len(),
+            "no matching block trades",
+        );
     }
     pushed
 }
@@ -7437,8 +7528,11 @@ pub async fn dispatch_candidate_board(date: &str) -> bool {
         log_dispatcher_attempt("P-05", false, 0, "no candidates");
         return false;
     }
-    let codes_now: std::collections::BTreeSet<String> =
-        batch.entries.iter().map(|entry| entry.code.clone()).collect();
+    let codes_now: std::collections::BTreeSet<String> = batch
+        .entries
+        .iter()
+        .map(|entry| entry.code.clone())
+        .collect();
     // 失效 diff: 上轮有本轮无 → 推送失效 (renderer 已有 push_candidate_invalidated)
     if let Some(previous) = candidate_snapshot_previous(date) {
         let hhmm = chrono::Local::now().format("%H:%M:%S").to_string();
@@ -7453,9 +7547,7 @@ pub async fn dispatch_candidate_board(date: &str) -> bool {
         }
     }
     candidate_snapshot_persist(date, &codes_now);
-    let text = stock_analysis::opportunity::candidate_panel::format_candidate_board(
-        &batch.entries,
-    );
+    let text = stock_analysis::opportunity::candidate_panel::format_candidate_board(&batch.entries);
     let result = dispatch_registered_outcome!(
         "P-05-candidate-board",
         crate::notify::PushKind::CandidateBoard,
@@ -7573,10 +7665,7 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
                         stock_analysis::market_analyzer::limit_chain_review::StockLimitStats {
                             code: record.code.clone(),
                             name: String::new(),
-                            chain: record
-                                .theme
-                                .clone()
-                                .unwrap_or_else(|| "未分类".to_string()),
+                            chain: record.theme.clone().unwrap_or_else(|| "未分类".to_string()),
                             board_level: record.streak.unwrap_or(1).min(3) as u8,
                             is_limit_up_today: true,
                             is_first_board: record.streak.unwrap_or(1) <= 1,
@@ -7621,9 +7710,7 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
                 if position.status != stock_analysis::portfolio::PositionStatus::Holding {
                     continue;
                 }
-                if position.shares < 100
-                    || position.shares % 100 != 0
-                    || position.cost_price <= 0.0
+                if position.shares < 100 || position.shares % 100 != 0 || position.cost_price <= 0.0
                 {
                     continue;
                 }
@@ -7792,7 +7879,8 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
         };
 
     // 行业分布: 持仓市值 = 收盘估值 market_value (优先) 或 shares * cost_price; 按 Position.sector 聚合
-    let mut sector_value: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+    let mut sector_value: std::collections::BTreeMap<String, f64> =
+        std::collections::BTreeMap::new();
     let mut total_position_value = 0.0_f64;
     for position in &positions {
         if position.status != stock_analysis::portfolio::PositionStatus::Holding {
@@ -7806,9 +7894,7 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
             .map(|item| item.market_value.unwrap_or(0.0))
             .unwrap_or_else(|| position.shares as f64 * position.cost_price);
         total_position_value += market_value;
-        *sector_value
-            .entry(position.sector.clone())
-            .or_insert(0.0) += market_value;
+        *sector_value.entry(position.sector.clone()).or_insert(0.0) += market_value;
     }
     let mut sector_rows: Vec<(String, f64)> = sector_value
         .into_iter()
@@ -7836,11 +7922,7 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
     }
 
     let unrealized_return_pct = if summary.securities_market_value > 0.0 {
-        valuation
-            .valuation
-            .total_unrealized_pnl
-            .unwrap_or(0.0)
-            / summary.securities_market_value
+        valuation.valuation.total_unrealized_pnl.unwrap_or(0.0) / summary.securities_market_value
             * 100.0
     } else {
         0.0
@@ -7857,7 +7939,10 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
             .iter()
             .filter(|p| p.status == stock_analysis::portfolio::PositionStatus::Holding)
             .count(),
-        market_value: valuation.valuation.total_market_value.unwrap_or(total_position_value),
+        market_value: valuation
+            .valuation
+            .total_market_value
+            .unwrap_or(total_position_value),
         sectors: &top_sectors,
     };
     let text = render_position_review(params);
@@ -7968,10 +8053,14 @@ pub async fn dispatch_post_session_review(
         .collect::<Vec<_>>();
 
     // BR-223: 盘后大宗交易推送 (自选+持仓代码集, 非 ReviewTask 侧推)
-    let mut block_trade_codes: Vec<String> =
-        stock_analysis::portfolio::get_positions()
-            .map(|positions| positions.into_iter().map(|position| position.code).collect())
-            .unwrap_or_default();
+    let mut block_trade_codes: Vec<String> = stock_analysis::portfolio::get_positions()
+        .map(|positions| {
+            positions
+                .into_iter()
+                .map(|position| position.code)
+                .collect()
+        })
+        .unwrap_or_default();
     if let Ok(list) = std::env::var("STOCK_LIST") {
         for code in list.split(',') {
             let code = code.trim().to_string();
@@ -13727,16 +13816,18 @@ pub fn build_test_template_catalog(
         "A-02-auction-repush",
         render_auction_repush(
             "09:20",
-            &[stock_analysis::opportunity::candidate_panel::CandidateEntry {
-                code: "TEST_CODE_000001".to_string(),
-                name: "TEST_CODE 候选".to_string(),
-                sources: Vec::new(),
-                tier: stock_analysis::opportunity::candidate_panel::EvidenceTier::Strong,
-                evidence: Vec::new(),
-                current_price: Some(10.0),
-                change_pct: None,
-                heat_score: Some(80.0),
-            }],
+            &[
+                stock_analysis::opportunity::candidate_panel::CandidateEntry {
+                    code: "TEST_CODE_000001".to_string(),
+                    name: "TEST_CODE 候选".to_string(),
+                    sources: Vec::new(),
+                    tier: stock_analysis::opportunity::candidate_panel::EvidenceTier::Strong,
+                    evidence: Vec::new(),
+                    current_price: Some(10.0),
+                    change_pct: None,
+                    heat_score: Some(80.0),
+                },
+            ],
         ),
     );
     push(
@@ -16446,8 +16537,13 @@ mod tests {
                     .to_string(),
             },
         ];
-        let p = build_preopen_news_hot_from_db("09:05", &clusters, &rotations)
-            .expect("build strict preopen snapshot");
+        let p = build_preopen_news_hot_from_db(
+            "09:05",
+            &clusters,
+            &rotations,
+            &std::collections::HashMap::new(),
+        )
+        .expect("build strict preopen snapshot");
         assert_eq!(p.hhmm, "09:05");
         assert_eq!(p.theme_1, Some("AI算力"));
         assert_eq!(p.theme_2, Some("机器人"));
@@ -16464,7 +16560,13 @@ mod tests {
     fn v15_build_preopen_news_hot_empty_db() {
         use stock_analysis::database::concepts::ChainDailyRow;
         let clusters: Vec<ChainDailyRow> = vec![];
-        assert!(build_preopen_news_hot_from_db("09:05", &clusters, &[]).is_err());
+        assert!(build_preopen_news_hot_from_db(
+            "09:05",
+            &clusters,
+            &[],
+            &std::collections::HashMap::new()
+        )
+        .is_err());
     }
 
     #[test]
@@ -16473,7 +16575,13 @@ mod tests {
         // 实际需要 DB, 此处仅验证 build_* 函数路径, dispatch 行为在 e2e
         use stock_analysis::database::concepts::ChainDailyRow;
         let clusters: Vec<ChainDailyRow> = vec![];
-        assert!(build_preopen_news_hot_from_db("09:05", &clusters, &[]).is_err());
+        assert!(build_preopen_news_hot_from_db(
+            "09:05",
+            &clusters,
+            &[],
+            &std::collections::HashMap::new()
+        )
+        .is_err());
     }
 
     // ====== v15.2: I-01 业务层集成测试 (sector_score 抽口) ======

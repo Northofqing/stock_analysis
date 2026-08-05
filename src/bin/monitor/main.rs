@@ -1237,8 +1237,25 @@ async fn run_daily_pushes_dry_run() -> Result<(), String> {
     let hhmm = now.format("%H:%M").to_string();
     let a01_snapshot = push_templates::load_paper_review_snapshot_real(&date).await;
     let d01_snapshot = push_templates::load_news_to_idea_snapshot_real(&hhmm).await;
+    // BR-225: security identity 解析是异步统一 Gateway 调用，必须在进入
+    // blocking 段之前完成。
+    let p01_names = match stock_analysis::database::DatabaseManager::get()
+        .get_latest_chain_clusters_strict()
+        .and_then(|clusters| push_templates::preopen_head_codes(&clusters))
+    {
+        Ok(codes) => push_templates::resolve_preopen_head_names(&codes)
+            .await
+            .unwrap_or_else(|error| {
+                log::warn!("[dry-run][P-01][BR-225] 头股名称回落解析失败: {error}");
+                std::collections::HashMap::new()
+            }),
+        Err(error) => {
+            log::warn!("[dry-run][P-01][BR-225] 头股代码集合不可用: {error}");
+            std::collections::HashMap::new()
+        }
+    };
     tokio::task::spawn_blocking(move || {
-        run_daily_pushes_dry_run_blocking(a01_snapshot, d01_snapshot)
+        run_daily_pushes_dry_run_blocking(a01_snapshot, d01_snapshot, p01_names)
     })
     .await
     .map_err(|error| format!("dry-run blocking task failed: {error}"))?
@@ -1247,6 +1264,7 @@ async fn run_daily_pushes_dry_run() -> Result<(), String> {
 fn run_daily_pushes_dry_run_blocking(
     a01_snapshot: Result<Option<push_templates::PaperReviewSnapshot>, String>,
     d01_snapshot: Result<push_templates::NewsToIdeaSnapshot, String>,
+    p01_names: std::collections::HashMap<String, String>,
 ) -> Result<(), String> {
     use push_templates::{
         build_industry_chain_intraday_from_snapshot, build_intraday_market_from_snapshot,
@@ -1275,7 +1293,7 @@ fn run_daily_pushes_dry_run_blocking(
         db.get_latest_board_rotations_strict(),
     ) {
         (Ok(clusters), Ok(rotations)) if !clusters.is_empty() && !rotations.is_empty() => {
-            match build_preopen_news_hot_from_db(&hhmm, &clusters, &rotations) {
+            match build_preopen_news_hot_from_db(&hhmm, &clusters, &rotations, &p01_names) {
                 Ok(_params) => {
                     log_dispatcher_attempt("P-01-dry", true, clusters.len(), "");
                     log::info!("[dry-run] P-01 OK: {} clusters", clusters.len());
@@ -5719,6 +5737,7 @@ fn announcement_alert_action(
             v17_sources::AnnouncementDisposition::FilteredClassification
             | v17_sources::AnnouncementDisposition::FilteredLifecycle
             | v17_sources::AnnouncementDisposition::FilteredAudience
+            | v17_sources::AnnouncementDisposition::FilteredDuplicate
             | v17_sources::AnnouncementDisposition::Failed,
         ) => AnnouncementAlertAction::Suppress,
         None => {
@@ -6793,13 +6812,11 @@ async fn monitor_loop() {
                         if !post_close_candidates_notified {
                             post_close_candidates_notified = true;
 
-                            let repush_ts =
-                                chrono::Local::now().format("%H:%M:%S").to_string();
+                            let repush_ts = chrono::Local::now().format("%H:%M:%S").to_string();
                             let repushed =
                                 push_templates::dispatch_auction_repush(&repush_ts).await;
                             log::info!("[竞价][BR-223] A-02 auction repush pushed={repushed}");
-                            let board_date =
-                                chrono::Local::now().format("%Y-%m-%d").to_string();
+                            let board_date = chrono::Local::now().format("%Y-%m-%d").to_string();
                             let board_pushed =
                                 push_templates::dispatch_candidate_board(&board_date).await;
                             log::info!("[竞价][BR-223] P-05 candidate board pushed={board_pushed}");

@@ -15,6 +15,7 @@ use std::time::Instant;
 use stock_analysis::company_financials;
 use stock_analysis::data_provider::consensus;
 use stock_analysis::monitor::event_bus::MonitorEvent;
+use stock_analysis::monitor::news_monitor::{DedupClaim, NewsMonitor};
 use stock_analysis::news::aggregator::analyst_state::{
     AnalystKey, AnalystObservation, AnalystStateStore,
 };
@@ -241,6 +242,7 @@ pub enum AnnouncementDisposition {
     FilteredClassification,
     FilteredLifecycle,
     FilteredAudience,
+    FilteredDuplicate,
     Failed,
 }
 
@@ -250,6 +252,7 @@ pub struct AnnouncementDispositionCounts {
     pub filtered_classification: usize,
     pub filtered_lifecycle: usize,
     pub filtered_audience: usize,
+    pub filtered_duplicate: usize,
     pub failed: usize,
 }
 
@@ -277,6 +280,7 @@ impl AnnouncementSourceRouteReport {
                 }
                 AnnouncementDisposition::FilteredLifecycle => counts.filtered_lifecycle += 1,
                 AnnouncementDisposition::FilteredAudience => counts.filtered_audience += 1,
+                AnnouncementDisposition::FilteredDuplicate => counts.filtered_duplicate += 1,
                 AnnouncementDisposition::Failed => counts.failed += 1,
             }
         }
@@ -366,7 +370,7 @@ async fn route_announcements_with_provenance(
     let mut routed = AnnouncementSourceRouteReport::default();
     for announcement in announcements {
         routed.source.attempted += 1;
-        let Some(_) = announcement
+        let Some(external_id) = announcement
             .external_id
             .as_deref()
             .map(str::trim)
@@ -448,7 +452,52 @@ async fn route_announcements_with_provenance(
             );
             continue;
         }
+        // BR-224: 同一公告一天内只投递一次。上游 `market_announcements` 每轮
+        // (NEWS_POLL_INTERVAL 默认 120s) 都返回当日全量公告；L4 进程内 source-fact
+        // 冷却是主去重权威，本持久认领提供跨重启的同日纵深防御。
+        // §3 测试隔离：持久认领是生产运行时关注点，测试只覆盖 L4 内存层，
+        // 否则残留键会让测试跨运行非幂等。
+        let dedup_key = format!(
+            "annroute:{}:{source}:{external_id}",
+            observed_at.date_naive()
+        );
+        let production_dedup = stock_analysis::risk::env_guard::current_env()
+            != stock_analysis::risk::env_guard::TradingEnv::Test;
+        match if production_dedup {
+            NewsMonitor::claim_dedup_key(&dedup_key)
+        } else {
+            DedupClaim::Claimed
+        } {
+            DedupClaim::Claimed => {}
+            DedupClaim::AlreadyClaimed => {
+                routed.source.skipped += 1;
+                routed
+                    .input_dispositions
+                    .push(AnnouncementDisposition::FilteredDuplicate);
+                log::info!(
+                    "[v17.7][BR-224] announcement normalized route filtered: reason=already_delivered_today"
+                );
+                continue;
+            }
+            DedupClaim::Unavailable => {
+                // L4 进程内冷却仍是主去重权威（BR-137 source-fact 键）；持久层
+                // 只提供跨重启的纵深防御。存储不可用时不得静默吞掉真实公告，
+                // 但必须以 error 级显式可见。
+                log::error!(
+                    "[v17.7][BR-224] durable dedup store unavailable; falling back to L4 in-memory cooldown only"
+                );
+            }
+        }
         let attempt = push_normalized_event(event).await;
+        if production_dedup && attempt.outcome != PushOutcome::Pushed {
+            // 保持「下一轮 provider 轮询即重试边界」的既有契约：投递未成功时
+            // 释放认领，否则该公告会被永久吞掉。释放失败必须显式可见。
+            if !NewsMonitor::release_dedup_key(&dedup_key) {
+                log::error!(
+                    "[v17.7][BR-224] dedup claim release failed after unsuccessful delivery; announcement will not retry today"
+                );
+            }
+        }
         record_source_attempt(&mut routed.source, &attempt.outcome);
         routed
             .input_dispositions

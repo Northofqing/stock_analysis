@@ -61,6 +61,17 @@ pub struct NewsEvent {
 
 // ── 消息监控器 ──
 
+/// BR-224: 持久去重键的一次性认领结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DedupClaim {
+    /// 本次调用是该键的第一个认领者。
+    Claimed,
+    /// 该键此前已被认领（同进程重复轮询或跨进程重启）。
+    AlreadyClaimed,
+    /// 去重存储不可用，认领结果未知；调用方必须显式失败，不得放行。
+    Unavailable,
+}
+
 pub struct NewsMonitor {
     linker: EntityLinker,
     /// 已处理的事件标题（去重用）
@@ -428,6 +439,45 @@ impl NewsMonitor {
             }
             Ok(())
         });
+    }
+
+    /// BR-224: 一次性认领持久去重键。返回 `Claimed` 表示本进程是第一个认领者。
+    ///
+    /// 与 `seen_titles` 的进程内 `HashSet` 不同，本方法直接落 `news_dedup`
+    /// 表并依赖 `INSERT OR IGNORE` 的受影响行数判定，因此对同一天内的重复轮询
+    /// 和进程重启都成立。数据库不可用时返回 `Unavailable`，**不得**被调用方
+    /// 当作 `Claimed` 处理。
+    pub fn claim_dedup_key(key: &str) -> DedupClaim {
+        let Some(db) = crate::database::DatabaseManager::try_get() else {
+            return DedupClaim::Unavailable;
+        };
+        let mut conn = match db.get_conn() {
+            Ok(conn) => conn,
+            Err(_) => return DedupClaim::Unavailable,
+        };
+        let inserted = diesel::sql_query("INSERT OR IGNORE INTO news_dedup(key) VALUES (?)")
+            .bind::<diesel::sql_types::Text, _>(key)
+            .execute(&mut *conn);
+        match inserted {
+            Ok(1) => DedupClaim::Claimed,
+            Ok(_) => DedupClaim::AlreadyClaimed,
+            Err(_) => DedupClaim::Unavailable,
+        }
+    }
+
+    /// BR-224: 释放此前认领的去重键。返回 `false` 表示释放未确认成功。
+    pub fn release_dedup_key(key: &str) -> bool {
+        let Some(db) = crate::database::DatabaseManager::try_get() else {
+            return false;
+        };
+        let mut conn = match db.get_conn() {
+            Ok(conn) => conn,
+            Err(_) => return false,
+        };
+        diesel::sql_query("DELETE FROM news_dedup WHERE key = ?")
+            .bind::<diesel::sql_types::Text, _>(key)
+            .execute(&mut *conn)
+            .is_ok()
     }
 
     /// 启动时从 news_dedup 恢复今天的 seen_titles，清理过期 key
