@@ -227,6 +227,32 @@ cargo run --bin confirm_daily_change -- \
 确认记录只追加、不可更新或删除。禁止用环境变量、静态 IPO/除权缓存
 或自动脚本代替这次显式人工决定。
 
+## 运行时日志解读
+
+常驻 monitor（`./target/release/monitor > /tmp/monitor.log 2>&1 &`）输出到日志。
+以下行是**正常行为**，不是故障：
+
+| 日志行 | 含义 |
+|---|---|
+| `[intraday_monitor] tick: 扫到 0 候选 (now=…, cutoff=…)` | 过去 1 小时 `pushed_stocks` 无新信号可消费进虚拟盘（休市/无事件时正常；伴随 ERROR 才是问题） |
+| `[BR-151] SnapshotPaper 使用用户确认持仓进入虚拟盘引擎` | 虚拟盘用用户确认快照（BR-226，24h 新鲜度） |
+| `[NewsMonitor][BR-226] 持仓受众证据: …快照 (N 只, …)` | 持仓已进新闻受众（快照新鲜时）；"快照过期/缺失"则是持仓身份被排除，需更新快照 |
+| `[v17.7][BR-226] 公告过滤摘要: 共 N 条 \| 生命周期 X / 分类跳过 Y / 范围外 Z / 推送 P` | 公告按 BR-138 四层门过滤的每轮聚合（每轮 1 行；P>0 才有推送） |
+| `[BR-213][BR-220][BR-221] status=available … records=N` | 涨停池批次正常（N=涨停家数） |
+| `[连板识别] code=… level=N` | 连板识别正常输出（N=连板高度） |
+| `[DataMode-hook] 模式 … → Degraded/Full` | 数据模式恢复（Unsafe 时行情依赖类推送被拒，属 fail-closed 设计） |
+| `[T-16] ST 涨跌幅变更已推 0 只持仓` | 当日无 ST 涨跌幅变更事件 |
+| `[涨停板] N 行缺少主力净流，排除在主力排序之外` | 主力净流能力未接入（BR-190），按设计排除 |
+| `[做T-持仓] 数据批次拒绝…quote_source_time_invalid` | BR-230 逐代码隔离：单只缺 servertime 只跳过该代码；**整批拒绝消失即修复生效** |
+
+**需要关注的行**（出现时才是问题）：
+- `ERROR [盘中监控] …数据批次拒绝` 反复出现 → 对应数据源故障
+- `ERROR [连板识别] 数据批次拒绝` → BR-092/BR-171/BR-228/BR-229 链路问题
+- `[DataMode-hook] … → Unsafe` 持续 → 行情能力未建立
+- `parse durable task basis … exit 2` → durable 投递行损坏（需按 BR 规则处理）
+
+判断标准：**INFO/WARN 且无伴随 ERROR = 正常；ERROR 反复出现 = 排查对应数据源。**
+
 ## 开发与发布门禁
 
 统一数据切换遵循 BR-158、BR-159、BR-164 和 BR-168。当前设计见 [最终切换设计](docs/superpowers/specs/2026-07-25-unified-data-final-cutover-design.md)。
