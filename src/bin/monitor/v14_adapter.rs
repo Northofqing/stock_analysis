@@ -1232,30 +1232,14 @@ fn default_profile_for_kind(kind: PushKind) -> TemplateMetadata {
         // Frozen 状态保留在 ctx.is_frozen, 模板自行渲染 ⚠️ 警告
         // 4 铁律: 通知层保持出声, 仓位风险控制在 broker 下单层
         frozen_mode_respect: false,
-        // A-01/R-03/R-04/R-08/A-10 are independently sourced after-close
-        // reports. Their gates are the admitted event/component batches
-        // (BR-158/BR-159/BR-110/BR-161/BR-160), not intraday
-        // quote/order-book capabilities represented by the global mode.
-        // Missing inputs remain explicit at their own acquisition gates.
-        data_mode_min: if matches!(
-            kind,
-            PushKind::AccountMode
-                | PushKind::PaperReview
-                | PushKind::IndustryChain
-                | PushKind::ReviewLhb
-                | PushKind::ReviewProviderTopN
-                | PushKind::EventCalendar
-                | PushKind::CatalystReview
-                // BR-225: R-07/R-11 同为独立来源盘后报告 —
-                // 龙虎榜/候选/持仓快照/收盘估值批次是自身数据门,
-                // 盘后陈旧 Quote 不得否决 (BR-197 同款理由)
-                | PushKind::TomorrowWatch
-                | PushKind::PositionReview
-        ) {
-            DataMode::Down
-        } else {
-            DataMode::Degraded
-        },
+        // 2026-08-06 用户决策 (C 方案): 未接入券商, 全部推送为参考级 —
+        // 全局 data_mode_min 从 Degraded 放宽到 Down (L5 data_quality 门禁
+        // 不再拦任何推送)。实证: 收盘后 Quote 停止 → DataMode=Unsafe 是
+        // 每日 15:00-次日 9:15 常态, 快照预警/行情预检等运维提醒被误伤
+        // (Denied("data_quality"))。交易建议类 (做T/候选/持有) 行情不可信
+        // 时仍会推送, 但 DataMode banner (T-02) 保持出声, 数据模式状态
+        // 始终可见 — "出声"原则保留, 仅移除推送拦截。
+        data_mode_min: DataMode::Down,
         // b011: 不再硬编码 60, 与 §14.3 治理表一致 (0 = 无冷却)
         cooldown_secs: kind.cooldown_secs().map(u64::from).unwrap_or(0),
         max_per_user_per_day: matches!(kind, PushKind::CandidateBoard).then_some(5),
@@ -1875,7 +1859,10 @@ mod tests {
 
     #[test]
     #[serial_test::serial(cooldown_memo)]
-    fn br137_generic_mixed_news_remains_denied_at_data_mode_down() {
+    /// 2026-08-06 用户决策 (C 方案): 未接券商 → data_mode_min 全局放宽到 Down,
+    /// data_quality 门禁不再拦任何推送 (DataMode banner 仍出声)。
+    /// 原 BR-137 契约 (Unsafe 拒 generic news) 被该决策取代。
+    fn br137_generic_mixed_news_approved_at_data_mode_unsafe_after_c_decision() {
         let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         _reset_dedup_for_test();
         crate::LATEST_BANNER
@@ -1885,10 +1872,13 @@ mod tests {
             .expect("test banner")
             .data_mode = crate::push_templates::DataMode::Unsafe;
 
-        assert!(matches!(
-            v14_gate(PushKind::NewsCatalyst, Some("TEST_CODE_MIXED_NEWS")),
-            V14Gate::Denied(reason) if reason == "data_quality"
-        ));
+        assert!(
+            matches!(
+                v14_gate(PushKind::NewsCatalyst, Some("TEST_CODE_MIXED_NEWS")),
+                V14Gate::Approved(_)
+            ),
+            "C 方案后 Unsafe 下 generic news 应放行 (data_quality 门禁已移除)"
+        );
     }
 
     #[test]

@@ -13315,27 +13315,19 @@ fn record_uncounted_cooldown(kind: crate::notify::PushKind, code: &str) {
 
 /// §14.3 治理规则: Frozen/Unsafe 停发判定
 ///
-/// 返回 true = 应停发该条交易建议类推送.
-/// 当前实现: T-03/T-05/T-07 (持有建议 / 做T / 候选触发) 在 Frozen/Unsafe 停发,
-///           T-04 (紧急风险) / T-09 (禁止操作) 仍照发 (风险类不受限).
+/// 2026-08-06 用户决策 (未接入券商): 全部推送为参考级, 无任何账户/数据模式
+/// 停发 → 恒 false。Frozen/Unsafe 状态仍由 banner 出声 (Frozen 横幅 +
+/// DataMode banner), "出声"原则保留, 仅移除推送拦截。
+/// 原实现: T-03/T-05/T-07 (持有建议/做T/候选触发) 在 Frozen/Unsafe 停发,
+///         风险类照发 — 与 L5 data_quality 门禁一并移除 (C 方案)。
+/// 签名保留 (调用点不变); 若未来接入券商需要恢复, 恢复原 match 即可。
 pub fn should_block_on_mode(
     kind: crate::notify::PushKind,
     mode: AccountMode,
     dm: DataMode,
 ) -> bool {
-    use crate::notify::PushKind as K;
-    match kind {
-        // 风险类: 永远照发
-        K::HoldingEvent | K::ForbiddenOps | K::DataMode | K::AccountMode => false,
-        // 交易建议类: Frozen 全停, Unsafe 全停
-        K::HoldingPlan | K::T0Advice | K::CandidateTriggered => {
-            matches!(mode, AccountMode::Frozen) || matches!(dm, DataMode::Unsafe)
-        }
-        // v14.5 G-03: PaperTrade 虚拟盘演示, 永远照发 (不因 Frozen 阻断)
-        K::PaperTrade => false,
-        // 其它 (T-12 尾盘, 盘后系列): 不停
-        _ => false,
-    }
+    let _ = (kind, mode, dm); // 参数保留签名兼容 (调用点不变)
+    false
 }
 
 /// 一站式便捷入口: 已注册生产展示令牌 → 治理检查 → 通知网关.
@@ -15028,6 +15020,14 @@ pub async fn dispatch_sector_anomaly_daily(hhmm: &str, news_text: &str) -> bool 
         return false;
     }
     let result = push_sector_anomaly(hhmm, &moves).await;
+    log_dispatcher_attempt("I-09A", result, moves.len(), "");
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
     #[test]
     fn extract_company_name_handles_cjk_byte_boundaries() {
         // 2026-08-06 panic 回归: 中文标题字节边界 (原 pos+chars().count() 越界)
@@ -15051,14 +15051,6 @@ pub async fn dispatch_sector_anomaly_daily(hhmm: &str, news_text: &str) -> bool 
         assert!(ipo_keyword_stage("上市公告书").is_some());
         assert_eq!(ipo_keyword_stage("例行董事会决议公告"), None);
     }
-
-    log_dispatcher_attempt("I-09A", result, moves.len(), "");
-    result
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     #[test]
     fn br192_terminal_template_status_maps_exactly_to_durable_audit_status() {
@@ -18234,8 +18226,9 @@ mod tests {
             DataMode::Degraded
         ));
 
-        // G-03 验证对照: HoldingPlan 仍按 spec 阻断
-        assert!(should_block_on_mode(
+        // G-03 验证对照: 2026-08-06 用户决策 (未接券商) — 账户限制全移除,
+        // HoldingPlan 在 Frozen 也不阻断 (Frozen 状态由 banner 出声)
+        assert!(!should_block_on_mode(
             PushKind::HoldingPlan,
             AccountMode::Frozen,
             DataMode::Full
@@ -18571,9 +18564,11 @@ mod tests {
     // ---- §14.3 治理: Frozen/Unsafe 停发规则 ----
 
     #[test]
-    fn should_block_holding_plan_on_frozen() {
+    /// 2026-08-06 用户决策 (未接券商): 账户限制全移除 — HoldingPlan 在
+    /// Frozen/Unsafe 均不阻断 (状态由 banner 出声)。
+    fn should_not_block_holding_plan_on_frozen() {
         use super::super::notify::PushKind;
-        assert!(should_block_on_mode(
+        assert!(!should_block_on_mode(
             PushKind::HoldingPlan,
             AccountMode::Frozen,
             DataMode::Full,
@@ -18581,9 +18576,9 @@ mod tests {
     }
 
     #[test]
-    fn should_block_holding_plan_on_unsafe() {
+    fn should_not_block_holding_plan_on_unsafe() {
         use super::super::notify::PushKind;
-        assert!(should_block_on_mode(
+        assert!(!should_block_on_mode(
             PushKind::HoldingPlan,
             AccountMode::Normal,
             DataMode::Unsafe,
