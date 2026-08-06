@@ -81,20 +81,34 @@ fn mark_capability_success(
 
 /// BR-164 持仓实时行情：只消费统一 Magic provider Gateway。
 pub fn fetch_position_quotes() -> Result<Vec<stock_analysis::market_data::TopStock>, String> {
-    let (positions, source_time) = stock_analysis::portfolio::get_positions_with_source_time()
-        .map_err(|error| format!("持仓批次查询失败: {error}"))?;
-    let codes: Vec<String> = positions
-        .into_iter()
-        .map(|position| position.code)
-        .collect();
+    // BR-227: 无券商时持仓代码来自 BR-226 用户确认快照 (24h 新鲜度),
+    // 行情经统一网关获取 (自带 source_at 证据); 持仓批次来源时间门
+    // 不再连坐行情获取 (BR-217 的券商批次要求由用户快照替代)。
+    let codes: Vec<String> =
+        match stock_analysis::database::user_position_snapshot::latest_user_position_snapshot() {
+            Ok(Some(snapshot))
+                if !snapshot.confirm_empty
+                    && chrono::Local::now()
+                        .signed_duration_since(snapshot.effective_at.with_timezone(&chrono::Local))
+                        .num_hours()
+                        <= 24 =>
+            {
+                snapshot.items.iter().map(|item| item.code.clone()).collect()
+            }
+            Ok(Some(_)) | Ok(None) => {
+                // 快照缺失/过期: 回退本地持仓代码 (仅行情展示用途, 行情自带来源时间)
+                stock_analysis::portfolio::get_positions()
+                    .map_err(|error| format!("持仓批次查询失败: {error}"))?
+                    .into_iter()
+                    .map(|position| position.code)
+                    .collect()
+            }
+            Err(error) => {
+                return Err(format!("用户持仓快照读取失败: {error}"));
+            }
+        };
     if codes.is_empty() {
         return Ok(vec![]);
-    }
-    let source_time = source_time.ok_or_else(|| "持仓批次缺少来源时间".to_string())?;
-    if !validate_position_freshness(source_time) {
-        return Err(format!(
-            "持仓批次未通过 30 秒新鲜度门: oldest_source_time={source_time}"
-        ));
     }
 
     let quotes = fetch_realtime_quotes(&codes)?;
