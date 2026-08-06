@@ -463,6 +463,22 @@ pub(crate) fn validate_daily_kline_structure(
         }
         let expected = calendar::next_trading_day(prev.date);
         if cur.date != expected {
+            // BR-228: 停牌容忍 — 缺失交易日按停牌处理 (单次 ≤ 5 个交易日),
+            // 跳过该相邻对 (不计算涨跌幅), 记录警告; 超过阈值仍硬拒。
+            let mut gap_days = 0usize;
+            let mut probe = expected;
+            while probe < cur.date && gap_days <= 5 {
+                probe = calendar::next_trading_day(probe);
+                gap_days += 1;
+            }
+            if gap_days <= 5 {
+                log::warn!(
+                    "[{code}] 停牌容忍: {} 后为 {} (缺失 {gap_days} 个交易日, 视为停牌)",
+                    prev.date,
+                    cur.date
+                );
+                continue;
+            }
             return Err(format!(
                 "[{code}] 交易日断档: {} 后应为 {}, 实际为 {}",
                 prev.date, expected, cur.date
@@ -898,15 +914,28 @@ mod tests {
     }
 
     #[test]
-    fn test_daily_kline_quality_rejects_trading_day_gap() {
+    fn test_daily_kline_quality_tolerates_single_day_gap_as_suspension() {
+        // BR-228: 单次 ≤5 个交易日的缺口视为停牌, 不再硬拒
         let d1 = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
         let d3 = NaiveDate::from_ymd_opt(2026, 7, 8).unwrap();
         let mut bars = vec![
             make_kline(d1, 10.0, 10.5, 9.8, 10.0),
             make_kline(d3, 10.2, 10.6, 10.1, 10.4),
         ];
+        validate_daily_kline_quality(&mut bars, "TEST_CODE_000001").expect("suspension gap tolerated");
+    }
+
+    #[test]
+    fn test_daily_kline_quality_rejects_long_gap() {
+        // BR-228: 超过 5 个交易日的缺口仍硬拒
+        let d1 = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+        let d3 = NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        let mut bars = vec![
+            make_kline(d1, 10.0, 10.5, 9.8, 10.0),
+            make_kline(d3, 10.2, 10.6, 10.1, 10.4),
+        ];
         let error = validate_daily_kline_quality(&mut bars, "TEST_CODE_000001")
-            .expect_err("missing Monday must fail");
+            .expect_err("long gap must fail");
         assert!(error.contains("交易日断档"));
     }
 
