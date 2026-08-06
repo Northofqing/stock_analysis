@@ -349,7 +349,7 @@ type PresentationTuple = (&'static str, PushKind, &'static str, &'static str);
 // This inventory is the test manifest authority.  The production registry
 // below intentionally duplicates the canonical tuples instead of deriving
 // them, allowing either side to drift and the bijection test to catch it.
-const ACTIVE_PRESENTATIONS: [PresentationTuple; 52] = [
+const ACTIVE_PRESENTATIONS: [PresentationTuple; 53] = [
     (
         "T-01-account-mode",
         PushKind::AccountMode,
@@ -379,6 +379,13 @@ const ACTIVE_PRESENTATIONS: [PresentationTuple; 52] = [
         PushKind::HoldingEvent,
         "holding_event_dispatcher",
         "render_holding_event",
+    ),
+    (
+        // 2026-08-07 BR-192 收尾: 盘中指标告警 counted 接线 (与 registry 同步)。
+        "T-04B-intraday-alert",
+        PushKind::HoldingEvent,
+        "intraday_alert_dispatcher",
+        "render_intraday_alert",
     ),
     (
         "T-05-t0-advice",
@@ -943,7 +950,7 @@ fn validate_manifest(
     families: Vec<TemplateFamily>,
     news: &NewsFlashProcessCapabilitySnapshot,
 ) -> Result<ValidatedManifest, String> {
-    if families.len() != 68 {
+    if families.len() != 69 {
         return Err(format!("BR-196 family total drift: {}", families.len()));
     }
     let mut family_keys = HashSet::new();
@@ -1001,10 +1008,10 @@ fn validate_manifest(
     let expected = if news.selection_v2_enabled && news.registered_feed_count > 0 {
         (
             LifecycleCounts {
-                active: 54,
+                active: 55,
                 disabled: 11,
                 retired: 3,
-                total: 68,
+                total: 69,
             },
             LifecycleCounts {
                 active: 50,
@@ -1016,10 +1023,10 @@ fn validate_manifest(
     } else {
         (
             LifecycleCounts {
-                active: 52,
+                active: 53,
                 disabled: 13,
                 retired: 3,
-                total: 68,
+                total: 69,
             },
             LifecycleCounts {
                 active: 48,
@@ -1094,8 +1101,8 @@ fn validate_descriptor_bijection(
     families: &[TemplateFamily],
     descriptors: &[ProductionPresentationDescriptor],
 ) -> Result<(), String> {
-    if descriptors.len() != 54 {
-        return Err("BR-196 production descriptor count must be 54".to_string());
+    if descriptors.len() != 55 {
+        return Err("BR-196 production descriptor count must be 55".to_string());
     }
     let descriptor_set = descriptors.iter().copied().collect::<HashSet<_>>();
     if descriptor_set.len() != descriptors.len() {
@@ -1212,10 +1219,10 @@ mod tests {
         assert_eq!(
             default.family_counts,
             LifecycleCounts {
-                active: 52,
+                active: 53,
                 disabled: 13,
                 retired: 3,
-                total: 68
+                total: 69
             }
         );
         assert_eq!(
@@ -1232,10 +1239,10 @@ mod tests {
         assert_eq!(
             active.family_counts,
             LifecycleCounts {
-                active: 54,
+                active: 55,
                 disabled: 11,
                 retired: 3,
-                total: 68
+                total: 69
             }
         );
         assert_eq!(
@@ -1302,7 +1309,7 @@ mod tests {
     #[test]
     fn br196_descriptor_registry_is_independent_exact_bijection() {
         let manifest = build_manifest(&snapshot(false, 0));
-        assert_eq!(crate::presentation_registry::descriptors().len(), 54);
+        assert_eq!(crate::presentation_registry::descriptors().len(), 55);
         validate_descriptor_bijection(&manifest, crate::presentation_registry::descriptors())
             .unwrap();
 

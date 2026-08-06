@@ -7408,7 +7408,9 @@ async fn monitor_loop() {
                                 if let Some(event) = state_machine.process(e) {
                                     alert_count += 1;
 
-                                    reject_unbound_alert_delivery(&event);
+                                    // BR-192 收尾: 指标告警走 counted binding 投递
+                                    // (失败不重试 — 竞价窗口内数据快速变化)。
+                                    deliver_intraday_alert(&event).await;
                                 }
                             }
                         }
@@ -7945,6 +7947,19 @@ async fn monitor_loop() {
                                 if matches!(e.category, AlertCategory::BoardBreak) {
                                     emergency_note = "⚠️ 炸板！".to_string();
                                 }
+
+                                // BR-192 收尾 (2026-08-07): 指标告警走 counted 投递。
+                                // LimitUp/LimitDown 除外 — 下方显式构造的涨停/跌停
+                                // 突变事件负责投递 (避免同一触达双推)。
+                                if !matches!(
+                                    e.category,
+                                    AlertCategory::LimitUp | AlertCategory::LimitDown
+                                ) {
+                                    if let Some(ev) = state_machine.process(e) {
+                                        alert_count += 1;
+                                        deliver_intraday_alert(&ev).await;
+                                    }
+                                }
                             }
 
                             // 信号融合
@@ -8019,13 +8034,15 @@ async fn monitor_loop() {
                                 if let Some(ev) = state_machine.process(event) {
                                     alert_count += 1;
 
-                                    reject_unbound_alert_delivery(&ev);
+                                    // BR-192 收尾: 涨停/跌停突变走 counted 投递。
+                                    deliver_intraday_alert(&ev).await;
                                 }
                             }
 
-                            // BR-192: the in-memory board-break transition has no
-                            // immutable occurrence/provider binding, so it cannot
-                            // enter counted HoldingEvent delivery.
+                            // 2026-08-07 BR-192 收尾: BoardBreak 指标告警已由上方
+                            // scan_stock 循环走 counted binding 投递 (origin=
+                            // InternalDurable)。emergency_note 仅保留给信号融合
+                            // 共振文本使用, 不再承担投递职责。
                             if !emergency_note.is_empty() {
                                 log::warn!(
                                     "[炸板][BR-192] capability_unavailable=holding_event_counted_binding_unavailable; \
@@ -8636,14 +8653,117 @@ async fn post_close_news_scheduler() {
     }
 }
 
-fn reject_unbound_alert_delivery(event: &AlertEvent) {
-    log::warn!(
-        "[告警][BR-192] capability_unavailable=alert_daily_report_counted_binding_unavailable; \
-         skipped before attribution, persistence, and delivery code={} category={} level={}",
+/// BR-192 收尾 (2026-08-07): 盘中指标告警 → counted binding 投递。
+/// 事件型推送无定时调度身份, 以 {date}:{code}:{category} 作为 occurrence
+/// identity (同一标的同类型告警当日只投递一次, counted 层去重; 状态机另做
+/// 5 分钟去重)。source 证据 = 事件核心事实序列化 (message 含实际数值,
+/// detail 含快照字段), origin=InternalDurable (内部派生证据接缝)。
+/// 失败不重试: 告警时效性强, 30s 后快照已变化; 同日同类再次触发由 counted
+/// 去重/状态机放行新 occurrence。
+async fn deliver_intraday_alert(event: &AlertEvent) -> bool {
+    use magic_market_core::{AssetClass, Exchange, InstrumentId};
+    use sha2::{Digest, Sha256};
+
+    let business_date = chrono::Local::now().date_naive();
+    let occurrence = format!(
+        "intraday-alert:{}:{}:{}",
+        business_date,
         event.code,
-        event.category.key(),
-        event.level.label()
+        event.category.key()
     );
+    let canonical = serde_json::json!({
+        "code": event.code,
+        "category": event.category.key(),
+        "level": event.level.label(),
+        "message": event.message,
+        "triggered_at": event.triggered_at.to_rfc3339(),
+        "price": event.detail.price,
+        "change_pct": event.detail.change_pct,
+        "volume_ratio": event.detail.volume_ratio,
+        "main_flow_yi": event.detail.main_flow_yi,
+        "t1_locked": event.detail.t1_locked,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    let exchange = if event.code.starts_with('6') {
+        Exchange::Shanghai
+    } else {
+        Exchange::Shenzhen
+    };
+    let instrument = match InstrumentId::new(exchange, event.code.clone(), AssetClass::Equity) {
+        Ok(id) => id,
+        Err(error) => {
+            log::error!("[盘中告警] instrument 构造失败 code={}: {error}", event.code);
+            return false;
+        }
+    };
+    let binding =
+        match durable_delivery_runtime::CountedDeliveryBinding::new(
+            business_date,
+            occurrence,
+            canonical_bytes,
+            durable_delivery_runtime::CountedDeliveryScope::Ticket { instrument },
+            subject_hash,
+            durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+            None,
+            true,
+        ) {
+            Ok(binding) => binding,
+            Err(error) => {
+                log::error!(
+                    "[盘中告警] counted binding 构造失败 code={} category={}: {error}",
+                    event.code,
+                    event.category.key()
+                );
+                return false;
+            }
+        };
+    let token = match crate::presentation_registry::acquire_token(
+        "T-04B-intraday-alert",
+        PushKind::HoldingEvent,
+        "intraday_alert_dispatcher",
+        "render_intraday_alert",
+    ) {
+        Ok(token) => token,
+        Err(reason) => {
+            log::error!(
+                "[盘中告警][BR-196] presentation token rejected code={} category={} reason={}",
+                event.code,
+                event.category.key(),
+                reason
+            );
+            return false;
+        }
+    };
+    let text = push_templates::render_intraday_alert(event);
+    let outcome = notify::push_counted_with_binding(token, &text, None, binding).await;
+    match outcome {
+        notify::PushOutcome::Pushed => {
+            log::info!(
+                "[盘中告警] delivered code={} category={}",
+                event.code,
+                event.category.key()
+            );
+            true
+        }
+        notify::PushOutcome::Deduped => {
+            log::info!(
+                "[盘中告警] deduped (当日同类已投递) code={} category={}",
+                event.code,
+                event.category.key()
+            );
+            true
+        }
+        other => {
+            log::warn!(
+                "[盘中告警] 投递未确认 code={} category={} outcome={:?}",
+                event.code,
+                event.category.key(),
+                other
+            );
+            false
+        }
+    }
 }
 
 #[cfg(test)]

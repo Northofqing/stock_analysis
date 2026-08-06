@@ -513,6 +513,30 @@ pub struct HoldingEventParams<'a> {
     pub avail: u32,
 }
 
+/// 盘中指标告警 (BR-192 counted 收尾): 12 类 detector 告警 → 推送文本。
+/// 与 T-04 render_holding_event (持仓紧急风险) 区分: 本模板渲染 detector 产出
+/// 的 AlertEvent (涨停突破/主力突袭/量比爆发/炸板/竞价异动等指标触发),
+/// 供 intraday_alert_dispatcher 走 counted binding 投递。
+pub fn render_intraday_alert(event: &stock_analysis::monitor::detector::AlertEvent) -> String {
+    let hhmm = event.triggered_at.format("%H:%M");
+    let extra = event
+        .detail
+        .extra
+        .as_deref()
+        .map(|e| format!("\n{e}"))
+        .unwrap_or_default();
+    format!(
+        "{} {} {}({}) {}\n{}\n{}辅助建议, 非下单指令",
+        event.level.emoji(),
+        event.category.label(),
+        event.name,
+        event.code,
+        hhmm,
+        event.message,
+        extra
+    )
+}
+
 /// BR-151/BR-153: Magic TDX evidence-backed reverse-T observation.
 pub fn render_t0_advice(banner: &BannerCtx, p: T0AdviceParams<'_>) -> String {
     let plan = p.plan;
@@ -10934,16 +10958,19 @@ mod tests_br140_r08_partial_components {
             .find("dispatch_paper_review_daily_outcome")
             .expect("A-01 source-only call");
         let account = dispatcher
-            .find("let account_required = account_dependency_outcomes")
+            .find("let mut account_required_outcomes = Vec::new()")
             .expect("account phase");
         assert!(r08 < account);
         assert!(a10 < account);
         assert!(a01 < account);
         // BR-194: R-03 is a LegacyAccountGate task, so `partition_review_tasks`
-        // can never place it in `source_only`. Dispatching it from the
-        // source-only join was dead code that also broke the BR-194 gate.
+        // can never place it in `source_only`. 2026-08-06 R-03 解除 (a9f006a):
+        // R-03 在 account phase 之后的 account_required 循环内走真实数据
+        // (dispatch_r03_industry_chain_outcome), 仍属 account-gated 路径 —
+        // 约束: 调用位置必须位于 account phase 之后 (绝不能在 source-only join)。
+        let r03 = dispatcher.find("dispatch_r03_industry_chain_outcome");
         assert!(
-            !dispatcher.contains("dispatch_r03_industry_chain_outcome"),
+            r03.map(|pos| pos > account).unwrap_or(false),
             "R-03 must stay on the account-gated path, not the source-only join"
         );
     }
@@ -15027,6 +15054,70 @@ pub async fn dispatch_sector_anomaly_daily(hhmm: &str, news_text: &str) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_intraday_alert_includes_category_and_extra() {
+        use stock_analysis::monitor::detector::{AlertCategory, AlertDetail, AlertEvent, AlertLevel};
+        let event = AlertEvent {
+            level: AlertLevel::Important,
+            category: AlertCategory::MainInflow,
+            code: "000001".to_string(),
+            name: "平安银行".to_string(),
+            message: "平安银行 主力净流入 1.2 亿".to_string(),
+            detail: AlertDetail {
+                price: Some(10.5),
+                change_pct: Some(2.3),
+                volume_ratio: Some(3.2),
+                main_flow_yi: Some(1.2),
+                threshold: None,
+                news_title: None,
+                news_summary: None,
+                news_importance: None,
+                ai_decision: None,
+                t1_locked: false,
+                extra: Some("主力排名 3/50 | 共振 85 强".to_string()),
+            },
+            triggered_at: chrono::Local::now(),
+            routed_external_id: None,
+        };
+        let text = render_intraday_alert(&event);
+        assert!(text.contains("主力突袭"), "缺失告警类别: {text}");
+        assert!(text.contains("平安银行(000001)"), "缺失标的: {text}");
+        assert!(text.contains("主力净流入 1.2 亿"), "缺失消息: {text}");
+        assert!(text.contains("主力排名 3/50"), "缺失 extra: {text}");
+        assert!(text.contains("辅助建议, 非下单指令"), "缺失免责声明: {text}");
+    }
+
+    #[test]
+    fn render_intraday_alert_handles_empty_extra() {
+        use stock_analysis::monitor::detector::{AlertCategory, AlertDetail, AlertEvent, AlertLevel};
+        let event = AlertEvent {
+            level: AlertLevel::Emergency,
+            category: AlertCategory::LimitDown,
+            code: "600000".to_string(),
+            name: "浦发银行".to_string(),
+            message: "浦发银行 跌停 -10.0%".to_string(),
+            detail: AlertDetail {
+                price: Some(9.0),
+                change_pct: Some(-10.0),
+                volume_ratio: Some(2.0),
+                main_flow_yi: Some(-0.8),
+                threshold: None,
+                news_title: None,
+                news_summary: None,
+                news_importance: None,
+                ai_decision: None,
+                t1_locked: false,
+                extra: None,
+            },
+            triggered_at: chrono::Local::now(),
+            routed_external_id: None,
+        };
+        let text = render_intraday_alert(&event);
+        assert!(text.contains("🔴"), "缺失紧急级别 emoji: {text}");
+        assert!(text.contains("跌停扫雷"), "缺失类别: {text}");
+        assert!(!text.contains("null"), "extra=None 不应渲染 null: {text}");
+    }
 
     #[test]
     fn extract_company_name_handles_cjk_byte_boundaries() {

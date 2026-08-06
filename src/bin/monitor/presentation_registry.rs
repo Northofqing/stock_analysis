@@ -39,7 +39,7 @@ const fn descriptor(
     }
 }
 
-const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 54] = [
+const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 55] = [
     descriptor(
         "T-01-account-mode",
         PushKind::AccountMode,
@@ -69,6 +69,16 @@ const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 54
         PushKind::HoldingEvent,
         "holding_event_dispatcher",
         "render_holding_event",
+    ),
+    descriptor(
+        // 2026-08-07: 盘中指标告警 counted 接线 (BR-192 收尾) —
+        // detector 12 类指标 (涨停突破/主力突袭/量比爆发/炸板等) 走 counted
+        // binding 投递, 与 T-04 (持仓紧急风险) 共用 HoldingEvent kind 但独立
+        // producer/renderer seam (BR-196 精确 tuple)。
+        "T-04B-intraday-alert",
+        PushKind::HoldingEvent,
+        "intraday_alert_dispatcher",
+        "render_intraday_alert",
     ),
     descriptor(
         "T-05-t0-advice",
@@ -366,7 +376,7 @@ const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 54
     ),
 ];
 
-pub(super) fn descriptors() -> &'static [ProductionPresentationDescriptor; 54] {
+pub(super) fn descriptors() -> &'static [ProductionPresentationDescriptor; 55] {
     &PRODUCTION_PRESENTATION_DESCRIPTORS
 }
 

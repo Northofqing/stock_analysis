@@ -1633,7 +1633,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(cooldown_memo)]
-    async fn br137_market_action_remains_strict_when_global_data_mode_is_down() {
+    async fn br137_market_action_approved_at_data_mode_unsafe_after_c_decision() {
+        // 2026-08-06 C 方案 (commit a9f006a): data_mode_min 全局放宽为 Down,
+        // Unsafe 不再拦截 (仅数据全挂才拦, 且 Down 为最大枚举值 → 实际永不拦,
+        // 状态出声由 DataMode banner 承担)。原 br137 market_action 严格断言
+        // 反转 (与 br137_complete_announcement 同步)。
         let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         crate::v14_adapter::_reset_dedup_for_test();
         crate::LATEST_BANNER
@@ -1648,7 +1652,7 @@ mod tests {
                 .expect("normalized market action");
         assert_eq!(
             push_normalized_event(event).await.outcome,
-            PushOutcome::Denied("data_quality".to_string())
+            PushOutcome::Pushed
         );
     }
 
