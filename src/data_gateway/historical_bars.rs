@@ -814,6 +814,17 @@ fn finalize_with_lifecycle(
         }
     };
     validate_daily_kline_quality_with_confirmation(records, code, |change| {
+        // BR-229: 板内涨停跳空自动确认 — 相邻跳空恰为板内涨停幅
+        // (创业板/科创板 20%, 北交所 30%, 主板 10%, 容差 ±0.5%) 是市场事实
+        // (涨停日), 不是除权/数据错误, 无需 DB 确认; BR-171 只针对需
+        // 生命周期证据的跳空 (送转/除权等)。
+        if change.change_pct > 0.0 {
+            if let Some(limit_pct) = board_limit_up_pct_for_code(&change.code) {
+                if (change.change_pct - limit_pct).abs() <= 0.5 {
+                    return Ok(true);
+                }
+            }
+        }
         let lifecycle = lifecycle
             .confirmation_evidence_for(change.previous_date, change.current_date)
             .map_err(|error| error.to_string())?;
@@ -823,6 +834,19 @@ fn finalize_with_lifecycle(
         database.has_exact_daily_change_confirmation(&query)
     })
     .map_err(|error| final_admission_error(provider, error))
+}
+
+/// BR-229: 按代码前缀判定板别涨停幅 (创业板/科创板 20%, 北交所 30%, 主板 10%)。
+fn board_limit_up_pct_for_code(code: &str) -> Option<f64> {
+    if code.starts_with("300") || code.starts_with("301") || code.starts_with("688") {
+        Some(20.0)
+    } else if code.starts_with('8') || code.starts_with('4') || code.starts_with("920") {
+        Some(30.0)
+    } else if code.starts_with("60") || code.starts_with("00") || code.starts_with("001") {
+        Some(10.0)
+    } else {
+        None
+    }
 }
 
 fn finalize_without_pending_change(
