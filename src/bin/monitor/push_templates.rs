@@ -5846,13 +5846,15 @@ pub async fn dispatch_candidate_triggered_daily(hhmm: &str, banner: &BannerCtx) 
     }
 }
 
-/// I-04 remains disabled until a durable, freshness-bound position and quote
-/// acquisition can produce a BR-192 counted-delivery binding.
+/// 2026-08-07 BR-192 收尾: T-03 已由 main.rs prepare_holding_plan_messages
+/// (快照 cost/qty + 统一行情 → Intent 判定 → counted binding) 承担真实投递,
+/// 本占位退役 (不再有生产调用者)。保留函数避免破坏既有测试, 不可复用 —
+/// 新接线一律走 main.rs 实现。
 async fn dispatch_holding_plan_daily_result(
     _hhmm: &str,
     _banner: &BannerCtx,
 ) -> PeriodicDispatchResult {
-    let reason = "capability_unavailable=holding_plan_counted_binding_unavailable; skipped before position and quote acquisition";
+    let reason = "retired=holding_plan_counted_binding_implemented_in_main; no production caller";
     log_dispatcher_attempt("I-04", false, 0, reason);
     log::warn!("[I-04][BR-192] {reason}");
     PeriodicDispatchResult::Failed(reason.to_string())
@@ -13060,6 +13062,9 @@ pub async fn push_candidate_triggered(
     promotion_evidence: Option<stock_analysis::opportunity::candidate_state::PromotionEvidence>,
     live_override: Option<bool>,
 ) -> Result<bool, String> {
+    use magic_market_core::{AssetClass, Exchange, InstrumentId};
+    use sha2::{Digest, Sha256};
+    use stock_analysis::database::DatabaseManager;
     use stock_analysis::opportunity::candidate_state::require_live_promotion;
 
     if let Err(error) = require_live_promotion(promotion_evidence, live_override) {
@@ -13067,12 +13072,66 @@ pub async fn push_candidate_triggered(
         return Ok(false);
     }
 
-    // Keep the render inputs in the signature so the missing evidence cannot
-    // accidentally be "fixed" by routing this counted kind through the old
-    // generic dispatcher.  They become usable only after the durable
-    // candidate lifecycle producer supplies the contract documented above.
-    let _ = (banner, params);
-    Err(CANDIDATE_COUNTED_BINDING_UNAVAILABLE.to_string())
+    // BR-192 收尾 (2026-08-07): 原恒 CANDIDATE_COUNTED_BINDING_UNAVAILABLE —
+    // 候选选择无 durable 生命周期所有者, 无法构造不可变审计。现先持久化
+    // 选中决策 (candidate_trigger_selection: 谁/何时/依据), binding 以此为
+    // 真实证据 (origin=InternalDurable), 不再伪造批次身份。
+    let trigger_date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let basis = params.trigger_desc.to_string();
+    let db = DatabaseManager::get();
+    db.record_candidate_trigger(&trigger_date, code, &params.name, &basis)?;
+
+    let canonical = serde_json::json!({
+        "code": code,
+        "name": params.name,
+        "grade": params.grade.label(),
+        "topic": params.topic,
+        "price": params.price,
+        "trigger_desc": basis,
+        "triggered_at": chrono::Local::now().to_rfc3339(),
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    let exchange = if code.starts_with('6') {
+        Exchange::Shanghai
+    } else {
+        Exchange::Shenzhen
+    };
+    let instrument = InstrumentId::new(exchange, code.to_string(), AssetClass::Equity)
+        .map_err(|error| format!("instrument 构造失败 code={code}: {error}"))?;
+    let binding = crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        chrono::Local::now().date_naive(),
+        format!("candidate-trigger:{trigger_date}:{code}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Ticket { instrument },
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        true,
+    )
+    .map_err(|error| format!("counted binding 构造失败 code={code}: {error}"))?;
+
+    let token = crate::presentation_registry::acquire_token(
+        "T-07-candidate-triggered",
+        crate::notify::PushKind::CandidateTriggered,
+        "candidate_dispatcher",
+        "render_candidate_triggered",
+    )
+    .map_err(|reason| format!("[BR-196] presentation token rejected code={code}: {reason}"))?;
+    let text = render_candidate_triggered(banner, params);
+    let outcome = crate::notify::push_counted_with_binding(token, &text, None, binding).await;
+    match outcome {
+        crate::notify::PushOutcome::Pushed | crate::notify::PushOutcome::Deduped => {
+            log::info!(
+                "[T-07] candidate triggered delivered code={code} outcome={outcome:?}"
+            );
+            Ok(true)
+        }
+        other => {
+            log::warn!("[T-07] candidate triggered delivery unconfirmed code={code} outcome={other:?}");
+            Ok(false)
+        }
+    }
 }
 
 /// MVP3-3.2 T-08 候选失效 (ℹ️参考, 复用 CandidateBoard).

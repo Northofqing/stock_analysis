@@ -1937,6 +1937,22 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         )
         .execute(&mut *conn)?;
 
+        // 2026-08-07 BR-192 收尾 (T-07): P-03 候选触发选中决策持久化 —
+        // counted binding 的真实证据 (见 record_candidate_trigger 文档)。
+        diesel::sql_query(
+            r#"
+            CREATE TABLE IF NOT EXISTS candidate_trigger_selection (
+                trigger_date TEXT NOT NULL,
+                code TEXT NOT NULL,
+                name TEXT NOT NULL,
+                basis TEXT NOT NULL,
+                selected_at TEXT NOT NULL,
+                PRIMARY KEY (trigger_date, code)
+            )
+            "#,
+        )
+        .execute(&mut *conn)?;
+
         // v10 P0.1 (G0) — prediction_tracker 加 12 列 (idempotent ALTER, 2026-07-01)
         // 设计: BR-016/017/020 落表; 12 列 = 1+1+3+3+3+1
         // 1+1 = reason / reason_secondary (主/副理由, 枚举, v10 §10.3)
@@ -2443,6 +2459,67 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         .bind::<diesel::sql_types::Text, _>(business_date)
         .get_result::<SampleCounts>(&mut *conn)?;
         Ok((row.sample_count as usize, row.hit_sum as usize))
+    }
+
+    /// BR-192 收尾 (2026-08-07): P-03/T-07 候选触发的选中决策持久化。
+    /// 原 push_candidate_triggered 恒 CANDIDATE_COUNTED_BINDING_UNAVAILABLE —
+    /// 候选选择 (从 chain_daily + P5 文件组装的批次) 无 durable 生命周期
+    /// 所有者, 无法构造不可变审计 binding。本表记录"哪个候选在何时被选中
+    /// 及其真实选择依据" (basis = sources_label/trigger_desc), 使 counted
+    /// binding 有真实持久化证据 (不伪造批次身份), origin=InternalDurable。
+    /// (trigger_date, code) 主键: 同一候选当日只触发一次 (与 counted
+    /// occurrence 一致)。
+    pub fn record_candidate_trigger(
+        &self,
+        trigger_date: &str,
+        code: &str,
+        name: &str,
+        basis: &str,
+    ) -> Result<(), String> {
+        validate_date_text("trigger_date", trigger_date)?;
+        if code.trim().is_empty() || name.trim().is_empty() || basis.trim().is_empty() {
+            return Err("candidate_trigger 行非法: code/name/basis 均不可空".to_string());
+        }
+        let mut conn = self.get_conn().map_err(|e| e.to_string())?;
+        diesel::sql_query(
+            "INSERT OR REPLACE INTO candidate_trigger_selection \
+             (trigger_date, code, name, basis, selected_at) \
+             VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .bind::<diesel::sql_types::Text, _>(trigger_date)
+        .bind::<diesel::sql_types::Text, _>(code)
+        .bind::<diesel::sql_types::Text, _>(name)
+        .bind::<diesel::sql_types::Text, _>(basis)
+        .execute(&mut *conn)
+        .map_err(|e| format!("候选触发选中落库失败: {e}"))?;
+        Ok(())
+    }
+
+    /// 读取当日候选触发选中记录 (counted binding 证据)。
+    pub fn latest_candidate_trigger(
+        &self,
+        trigger_date: &str,
+        code: &str,
+    ) -> Result<Option<(String, String)>, String> {
+        validate_date_text("trigger_date", trigger_date)?;
+        let mut conn = self.get_conn().map_err(|e| e.to_string())?;
+        #[derive(QueryableByName, Debug)]
+        struct TriggerRow {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            name: String,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            basis: String,
+        }
+        let row = diesel::sql_query(
+            "SELECT name, basis FROM candidate_trigger_selection \
+             WHERE trigger_date = ?1 AND code = ?2 LIMIT 1",
+        )
+        .bind::<diesel::sql_types::Text, _>(trigger_date)
+        .bind::<diesel::sql_types::Text, _>(code)
+        .get_result::<TriggerRow>(&mut *conn)
+        .optional()
+        .map_err(|e| format!("候选触发选中读取失败: {e}"))?;
+        Ok(row.map(|r| (r.name, r.basis)))
     }
 
     /// 获取近 `days` 天已验证预测的真实命中率。

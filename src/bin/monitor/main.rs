@@ -1452,10 +1452,9 @@ fn report_dispatch_outcome(name: &str, delivered: bool, failures: &mut Vec<Strin
 
 async fn run_daily_pushes() -> Result<(), String> {
     use push_templates::{
-        dispatch_catalyst_review_daily, dispatch_holding_plan_daily,
-        dispatch_industry_chain_intraday_daily, dispatch_intraday_market_daily,
-        dispatch_news_catalyst_daily, dispatch_news_to_idea_daily, dispatch_paper_review_daily,
-        dispatch_preopen_news_hot_daily,
+        dispatch_catalyst_review_daily, dispatch_industry_chain_intraday_daily,
+        dispatch_intraday_market_daily, dispatch_news_catalyst_daily,
+        dispatch_news_to_idea_daily, dispatch_paper_review_daily, dispatch_preopen_news_hot_daily,
     };
 
     use stock_analysis::opportunity::scheduler::{OpportunitySchedule, PushWindow};
@@ -1520,11 +1519,54 @@ async fn run_daily_pushes() -> Result<(), String> {
                 dispatch_news_to_idea_daily(&hhmm, &banner).await,
                 &mut failures,
             );
-            report_dispatch_outcome(
-                "I-04",
-                dispatch_holding_plan_daily(&hhmm, &banner).await,
-                &mut failures,
-            );
+            // BR-192 收尾: T-03 真实 counted 投递 (原恒 unavailable)。
+            // 与运行时 I-04 计时器同一实现 (prepare_holding_plan_messages)。
+            match prepare_holding_plan_messages(&banner).await {
+                Ok(messages) => {
+                    let mut all_confirmed = true;
+                    for prepared in messages {
+                        let token = match crate::presentation_registry::acquire_token(
+                            "T-03-holding-plan",
+                            PushKind::HoldingPlan,
+                            "holding_plan_dispatcher",
+                            "render_holding_plan",
+                        ) {
+                            Ok(token) => token,
+                            Err(reason) => {
+                                failures.push(format!(
+                                    "I-04 T-03 token rejected code={}: {reason}",
+                                    prepared.code
+                                ));
+                                all_confirmed = false;
+                                continue;
+                            }
+                        };
+                        let outcome = notify::push_counted_with_binding(
+                            token,
+                            &prepared.text,
+                            None,
+                            prepared.binding,
+                        )
+                        .await;
+                        if !matches!(
+                            outcome,
+                            notify::PushOutcome::Pushed | notify::PushOutcome::Deduped
+                        ) {
+                            failures.push(format!(
+                                "I-04 T-03 delivery unconfirmed code={}: {:?}",
+                                prepared.code, outcome
+                            ));
+                            all_confirmed = false;
+                        }
+                    }
+                    if all_confirmed {
+                        report_dispatch_outcome("I-04", true, &mut failures);
+                    }
+                }
+                Err(error) => {
+                    failures.push(format!("I-04 T-03 batch rejected: {error}"));
+                }
+            }
         }
 
         PushWindow::Evening => {
@@ -6416,6 +6458,218 @@ fn t0_delivery_outcomes_confirmed(outcomes: &[notify::PushOutcome]) -> bool {
 }
 // BR-153 T0 END
 
+// ═══════════════════════════════════════════════════════════════
+// BR-192 收尾 (2026-08-07): T-03 持仓操作建议 counted 接线。
+// 原 dispatch_holding_plan_daily_result 恒 capability_unavailable
+// (holding_plan_counted_binding_unavailable)。真实实现:
+//   数据源: BR-226 用户确认快照 (cost/quantity) + 统一行情
+//          (market_data::fetch_position_quotes, BR-227)。
+//   判定规则 (v12 §14.1 简化, 与 I-04 注释一致): 现价相对成本 >+5% 减仓,
+//          <-3% 加仓, 否则持有观望。
+//   binding: occurrence = holding-plan:{date}:{code} (当日一票一推, counted
+//          去重), scope=Ticket, origin=InternalDurable (快照+行情为真实证据,
+//          不伪造批次身份)。失败保留重试资格 (定时器不前进), 成功才封口。
+// ═══════════════════════════════════════════════════════════════
+
+struct PreparedHoldingPlan {
+    code: String,
+    text: String,
+    binding: durable_delivery_runtime::CountedDeliveryBinding,
+}
+
+async fn prepare_holding_plan_messages(
+    banner: &push_templates::BannerCtx,
+) -> Result<Vec<PreparedHoldingPlan>, String> {
+    use magic_market_core::{AssetClass, Exchange, InstrumentId};
+    use sha2::{Digest, Sha256};
+    use stock_analysis::database::user_position_snapshot::latest_user_position_snapshot;
+
+    let snapshot = latest_user_position_snapshot()
+        .map_err(|error| format!("持仓快照读取失败: {error}"))?
+        .ok_or_else(|| "无用户确认持仓快照 (BR-226)".to_string())?;
+    if snapshot.confirm_empty || snapshot.items.is_empty() {
+        return Ok(Vec::new()); // 空持仓 → 无受众, 静默
+    }
+    let quotes = market_data::fetch_position_quotes()
+        .map_err(|error| format!("持仓行情批次拒绝: {error}"))?;
+    let quote_map: std::collections::HashMap<String, &stock_analysis::market_data::TopStock> =
+        quotes.iter().map(|q| (q.code.clone(), q)).collect();
+
+    let business_date = chrono::Local::now().date_naive();
+    let hhmm = chrono::Local::now().format("%H:%M").to_string();
+    let mut out = Vec::new();
+    for item in &snapshot.items {
+        let Some(quote) = quote_map.get(&item.code) else {
+            log::warn!(
+                "[T-03] code={} 行情缺失, 跳过该票 (其余照常)",
+                item.code
+            );
+            continue;
+        };
+        if item.cost_price <= 0.0 {
+            log::warn!("[T-03] code={} 成本价非法, 跳过", item.code);
+            continue;
+        }
+        let pnl_pct = (quote.price / item.cost_price - 1.0) * 100.0;
+        let intent = if pnl_pct > 5.0 {
+            push_templates::Intent::Reduce
+        } else if pnl_pct < -3.0 {
+            push_templates::Intent::Add
+        } else {
+            push_templates::Intent::Hold
+        };
+        let reason = match intent {
+            push_templates::Intent::Reduce => {
+                format!("浮盈 {pnl_pct:.1}% 触发减仓观察 (>+5%)")
+            }
+            push_templates::Intent::Add => format!("浮亏 {pnl_pct:.1}% 触发加仓观察 (<-3%)"),
+            push_templates::Intent::Hold => format!("浮盈 {pnl_pct:.1}%, 持有观望区间"),
+            _ => unreachable!("T-03 只产出 Reduce/Add/Hold"),
+        };
+        let reasons = vec![reason];
+        let text = push_templates::render_holding_plan(
+            banner,
+            push_templates::HoldingPlanParams {
+                name: &item.name,
+                code: &item.code,
+                hhmm: &hhmm,
+                intent,
+                price: quote.price,
+                cost: item.cost_price,
+                avail: u32::try_from(item.quantity).unwrap_or(u32::MAX),
+                reduce_zone: Some((item.cost_price * 1.02, item.cost_price * 1.05)),
+                support: item.cost_price * 0.95,
+                pressure: item.cost_price * 1.10,
+                stop: item.cost_price * 0.92,
+                invalidations: &[],
+                reasons: &reasons,
+            },
+        );
+        let canonical = serde_json::json!({
+            "code": item.code,
+            "intent": intent.label(),
+            "price": quote.price,
+            "cost": item.cost_price,
+            "quantity": item.quantity,
+            "pnl_pct": pnl_pct,
+            "observed_at": chrono::Local::now().to_rfc3339(),
+        });
+        let canonical_bytes = canonical.to_string().into_bytes();
+        let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+        let exchange = if item.code.starts_with('6') {
+            Exchange::Shanghai
+        } else {
+            Exchange::Shenzhen
+        };
+        let instrument = InstrumentId::new(exchange, item.code.clone(), AssetClass::Equity)
+            .map_err(|error| format!("instrument 构造失败 code={}: {error}", item.code))?;
+        let binding = durable_delivery_runtime::CountedDeliveryBinding::new(
+            business_date,
+            format!("holding-plan:{business_date}:{}", item.code),
+            canonical_bytes,
+            durable_delivery_runtime::CountedDeliveryScope::Ticket { instrument },
+            subject_hash,
+            durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+            None,
+            true,
+        )
+        .map_err(|error| format!("counted binding 构造失败 code={}: {error}", item.code))?;
+        out.push(PreparedHoldingPlan {
+            code: item.code.clone(),
+            text,
+            binding,
+        });
+    }
+    Ok(out)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 2026-08-07 审计接入: T-12 尾盘提示 (CloseCall) counted 接线。
+// 原 render_close_call 模板存在但生产零调度。数据源与 T-03 同
+// (快照 cost + 统一行情), 判定: 现价相对成本 ≤-3% → 尾盘跳水提示
+// (只推跳水, 正常票不推减少噪音)。binding: occurrence =
+// close-call:{date}:{code}, origin=InternalDurable。
+// ═══════════════════════════════════════════════════════════════
+
+struct PreparedCloseCall {
+    code: String,
+    text: String,
+    binding: durable_delivery_runtime::CountedDeliveryBinding,
+}
+
+async fn prepare_close_call_messages(
+    banner: &push_templates::BannerCtx,
+) -> Result<Vec<PreparedCloseCall>, String> {
+    use magic_market_core::{AssetClass, Exchange, InstrumentId};
+    use sha2::{Digest, Sha256};
+    use stock_analysis::database::user_position_snapshot::latest_user_position_snapshot;
+
+    let snapshot = latest_user_position_snapshot()
+        .map_err(|error| format!("持仓快照读取失败: {error}"))?
+        .ok_or_else(|| "无用户确认持仓快照 (BR-226)".to_string())?;
+    if snapshot.confirm_empty || snapshot.items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let quotes = market_data::fetch_position_quotes()
+        .map_err(|error| format!("持仓行情批次拒绝: {error}"))?;
+    let quote_map: std::collections::HashMap<String, &stock_analysis::market_data::TopStock> =
+        quotes.iter().map(|q| (q.code.clone(), q)).collect();
+
+    let business_date = chrono::Local::now().date_naive();
+    let hhmm = chrono::Local::now().format("%H:%M").to_string();
+    let mut out = Vec::new();
+    for item in &snapshot.items {
+        let Some(quote) = quote_map.get(&item.code) else {
+            continue;
+        };
+        if item.cost_price <= 0.0 {
+            continue;
+        }
+        let pnl_pct = (quote.price / item.cost_price - 1.0) * 100.0;
+        if pnl_pct > -3.0 {
+            continue; // 非跳水不推
+        }
+        let holding = push_templates::CloseCallHolding {
+            name: &item.name,
+            state: "尾盘跳水-建议处理",
+        };
+        let text = push_templates::render_close_call(banner, &hhmm, Some(&holding), None);
+        let canonical = serde_json::json!({
+            "code": item.code,
+            "price": quote.price,
+            "cost": item.cost_price,
+            "pnl_pct": pnl_pct,
+            "observed_at": chrono::Local::now().to_rfc3339(),
+        });
+        let canonical_bytes = canonical.to_string().into_bytes();
+        let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+        let exchange = if item.code.starts_with('6') {
+            Exchange::Shanghai
+        } else {
+            Exchange::Shenzhen
+        };
+        let instrument = InstrumentId::new(exchange, item.code.clone(), AssetClass::Equity)
+            .map_err(|error| format!("instrument 构造失败 code={}: {error}", item.code))?;
+        let binding = durable_delivery_runtime::CountedDeliveryBinding::new(
+            business_date,
+            format!("close-call:{business_date}:{}", item.code),
+            canonical_bytes,
+            durable_delivery_runtime::CountedDeliveryScope::Ticket { instrument },
+            subject_hash,
+            durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+            None,
+            true,
+        )
+        .map_err(|error| format!("counted binding 构造失败 code={}: {error}", item.code))?;
+        out.push(PreparedCloseCall {
+            code: item.code.clone(),
+            text,
+            binding,
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests_br153_t0_delivery {
     use super::{notify::PushOutcome, t0_delivery_outcomes_confirmed};
@@ -6884,14 +7138,16 @@ async fn monitor_loop() {
 
             let mut last_t0_scan = std::time::Instant::now(); // 持仓做 T 扫描（30秒）
 
-            log::warn!(
-                "[持仓健康度][BR-192] capability_unavailable=holding_event_counted_binding_unavailable; \
-                 summary disabled before rendering"
-            );
+            // 2026-08-07 BR-192 收尾: 持仓健康度 summary 由 T-03 counted 投递
+            // (prepare_holding_plan_messages) 承担, 原 unavailable 占位已移除。
 
             let mut last_industry_chain_intraday = std::time::Instant::now(); // v34: I-03 涨停扩散 (15 min)
 
             let mut last_holding_plan = std::time::Instant::now(); // v38: I-04 持仓操作建议 (30 min)
+
+            let mut last_sector_top = std::time::Instant::now(); // 2026-08-07: I-09 板块 TOP (60 min)
+
+            let mut last_sector_anomaly = std::time::Instant::now(); // 2026-08-07: I-09A 量价反向 (60 min)
 
             // v44: T-14 盘后固定价格申报 (15 min, 申报窗口 9:30-15:30)
 
@@ -6908,6 +7164,10 @@ async fn monitor_loop() {
             // v47: T-17 ETF 收盘集合竞价 (14:57-15:00 一次)
 
             let mut etf_closing_pushed = false;
+
+            // 2026-08-07 审计接入: T-12 尾盘提示 (14:55-14:57 一次)
+
+            let mut close_call_pushed = false;
 
             // 产业链扫描已移至 news_monitor_loop 的 8:00-22:00 窗口统一调度。
 
@@ -8245,16 +8505,124 @@ async fn monitor_loop() {
                         if last_holding_plan.elapsed().as_secs() >= 1800 {
                             let hhmm = chrono::Local::now().format("%H:%M").to_string();
 
+                            // BR-192 收尾: T-03 真实 counted 投递 (原恒 unavailable)。
                             if let Some(banner) = current_banner_for("I-04 holding plan") {
-                                if push_templates::dispatch_holding_plan_periodic(&hhmm, &banner)
-                                    .await
-                                {
-                                    last_holding_plan = std::time::Instant::now();
-                                } else {
-                                    log::error!(
-                                    "[I-04][BR-091] dispatcher did not confirm delivery; timer not advanced"
-                                );
+                                match prepare_holding_plan_messages(&banner).await {
+                                    Ok(messages) => {
+                                        let mut confirmed = true;
+                                        for prepared in messages {
+                                            let token =
+                                                match crate::presentation_registry::acquire_token(
+                                                    "T-03-holding-plan",
+                                                    PushKind::HoldingPlan,
+                                                    "holding_plan_dispatcher",
+                                                    "render_holding_plan",
+                                                ) {
+                                                    Ok(token) => token,
+                                                    Err(reason) => {
+                                                        log::error!(
+                                                        "[T-03][BR-196] presentation token rejected code={} reason={}",
+                                                        prepared.code,
+                                                        reason
+                                                    );
+                                                        confirmed = false;
+                                                        continue;
+                                                    }
+                                                };
+                                            let outcome = notify::push_counted_with_binding(
+                                                token,
+                                                &prepared.text,
+                                                None,
+                                                prepared.binding,
+                                            )
+                                            .await;
+                                            if !matches!(
+                                                outcome,
+                                                notify::PushOutcome::Pushed
+                                                    | notify::PushOutcome::Deduped
+                                            ) {
+                                                log::error!(
+                                                    "[T-03][BR-116] 持仓建议投递未确认 code={} outcome={:?}",
+                                                    prepared.code,
+                                                    outcome
+                                                );
+                                                confirmed = false;
+                                            } else {
+                                                log::info!(
+                                                    "[T-03] delivered code={} outcome={:?}",
+                                                    prepared.code,
+                                                    outcome
+                                                );
+                                            }
+                                        }
+                                        if confirmed {
+                                            last_holding_plan = std::time::Instant::now();
+                                        } else {
+                                            log::error!(
+                                            "[I-04][BR-091] dispatcher did not confirm delivery; timer not advanced"
+                                        );
+                                        }
+                                    }
+                                    Err(error) => log::error!(
+                                        "[I-04][T-03] 持仓建议批次拒绝, 保留重试资格: {error}"
+                                    ),
                                 }
+                            }
+                        }
+
+                        // ═══════════════════════════════════════════════════════════════
+
+                        // 2026-08-07 审计接入 (A 组孤儿): I-09 板块 TOP + I-09A 量价反向。
+                        // 原实现 (push_templates) 数据源/渲染/token 完整但生产零调度 —
+                        // 运行时接入, 60 min 周期 (fetch_board_ranking 实时数据,
+                        // 板块异动需新闻归因文本, 空快讯 → 空文本兜底模式)。
+
+                        // I-09 板块 TOP: 板块涨跌排行 TOP5 (f3=涨幅榜)
+
+                        if last_sector_top.elapsed().as_secs() >= 3600 {
+                            let hhmm = chrono::Local::now().format("%H:%M").to_string();
+
+                            if push_templates::dispatch_sector_top_daily(&hhmm).await {
+                                last_sector_top = std::time::Instant::now();
+                            } else {
+                                log::error!(
+                                    "[I-09][BR-091] dispatcher did not confirm delivery; timer not advanced"
+                                );
+                            }
+                        }
+
+                        // I-09A 量价反向: 板块异动无新闻归因 → 推送 (仅异动, 空归因说明)
+
+                        if last_sector_anomaly.elapsed().as_secs() >= 3600 {
+                            use stock_analysis::data_gateway::{
+                                GatewayBatch, GlobalNewsGateway, GlobalNewsProvider,
+                            };
+                            let news_text = match GlobalNewsGateway::new()
+                                .global_news(GlobalNewsProvider::Cailianpress, 20)
+                                .await
+                            {
+                                Ok(GatewayBatch::Available { records, .. })
+                                    if !records.is_empty() =>
+                                {
+                                    records
+                                        .iter()
+                                        .take(10)
+                                        .map(|r| r.title.clone())
+                                        .collect::<Vec<_>>()
+                                        .join("; ")
+                                }
+                                _ => String::new(),
+                            };
+                            let hhmm = chrono::Local::now().format("%H:%M").to_string();
+
+                            if push_templates::dispatch_sector_anomaly_daily(&hhmm, &news_text)
+                                .await
+                            {
+                                last_sector_anomaly = std::time::Instant::now();
+                            } else {
+                                log::error!(
+                                    "[I-09A][BR-091] dispatcher did not confirm delivery; timer not advanced"
+                                );
                             }
                         }
 
@@ -8345,6 +8713,80 @@ async fn monitor_loop() {
                         //   - 真实数据源: portfolio ETF 持仓 + 集合竞价行情 (后续 PR)
 
                         // ═══════════════════════════════════════════════════════════════
+
+                        // 2026-08-07 审计接入: T-12 尾盘提示 (14:55-14:57, 每日一次)。
+                        // 原 render_close_call 模板无生产调度 — 现走 counted 投递
+                        // (跳水票才推)。成功才封口, 失败保留当日重试。
+                        if !close_call_pushed {
+                            let now_time = chrono::Local::now().time();
+
+                            let close_call_trigger =
+                                chrono::NaiveTime::from_hms_opt(14, 55, 0).unwrap();
+
+                            if now_time >= close_call_trigger {
+                                if let Some(banner) = current_banner_for("T-12 close call") {
+                                    match prepare_close_call_messages(&banner).await {
+                                        Ok(messages) => {
+                                            let mut confirmed = true;
+                                            for prepared in messages {
+                                                let token = match crate::presentation_registry::acquire_token(
+                                                    "T-12-close-call",
+                                                    PushKind::CloseCall,
+                                                    "close_call_dispatcher",
+                                                    "render_close_call",
+                                                ) {
+                                                    Ok(token) => token,
+                                                    Err(reason) => {
+                                                        log::error!(
+                                                        "[T-12][BR-196] token rejected code={} reason={}",
+                                                        prepared.code,
+                                                        reason
+                                                    );
+                                                        confirmed = false;
+                                                        continue;
+                                                    }
+                                                };
+                                                let outcome = notify::push_counted_with_binding(
+                                                    token,
+                                                    &prepared.text,
+                                                    None,
+                                                    prepared.binding,
+                                                )
+                                                .await;
+                                                if !matches!(
+                                                    outcome,
+                                                    notify::PushOutcome::Pushed
+                                                        | notify::PushOutcome::Deduped
+                                                ) {
+                                                    log::error!(
+                                                    "[T-12][BR-116] 尾盘提示投递未确认 code={} outcome={:?}",
+                                                    prepared.code,
+                                                    outcome
+                                                );
+                                                    confirmed = false;
+                                                } else {
+                                                    log::info!(
+                                                        "[T-12] delivered code={} outcome={:?}",
+                                                        prepared.code,
+                                                        outcome
+                                                    );
+                                                }
+                                            }
+                                            if confirmed {
+                                                close_call_pushed = true;
+                                            } else {
+                                                log::error!(
+                                                    "[T-12][BR-091] dispatcher did not confirm; retry kept"
+                                                );
+                                            }
+                                        }
+                                        Err(error) => log::error!(
+                                            "[T-12] 尾盘提示批次拒绝, 保留重试资格: {error}"
+                                        ),
+                                    }
+                                }
+                            }
+                        }
 
                         if !etf_closing_pushed {
                             let now_time = chrono::Local::now().time();
