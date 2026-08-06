@@ -7407,26 +7407,351 @@ pub fn render_ipo_catalyst(
     text
 }
 
-/// BR-223: A-11 IPO 阶段催化 — 静态供应链表 + 关联 A 股 (每日一次)。
+/// 2026-08-06 改造: 动态查询最近 IPO (cninfo 公告实时批次), 不再用静态长鑫表兜底。
+/// 静态供应链表降级为 "公司名 → A 股标的" 映射字典。
+/// 未命中字典 → 行业关键词 → TDX 真实概念板块 → 成分股 (产业链影响)。
+/// R-08 已拉取的当日公告批次缓存 (A-11 复用, 避免 cninfo 重复拉取限流)。
+static REVIEW_ANNOUNCEMENTS_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<Option<(String, Vec<stock_analysis::data_gateway::EventAnnouncement>)>>,
+> = std::sync::OnceLock::new();
+
+#[derive(Debug, Clone)]
+pub struct DynamicIpoHit {
+    pub company: String,
+    pub stage: stock_analysis::news::ipo::supply_chain::IpoStage,
+    pub keyword: String,
+    pub mapped_stocks: Vec<(String, String)>, // 静态字典命中 (code, name) 或空
+    pub industry: Vec<IndustryBoard>,         // 动态板块推断 (产业链影响)
+    pub announcement_code: String,
+}
+
+/// 产业链影响: 板块名 + 成分股 (code, name)。
+#[derive(Debug, Clone)]
+pub struct IndustryBoard {
+    pub board_name: String,
+    pub stocks: Vec<(String, String)>,
+}
+
+/// 公司名 → 行业关键词组 (公司词 → TDX 板块名匹配词)。
+/// 2026-08-06 校准 (board_directory_probe 实证): TDX 概念板块是题材简称
+/// (AIGC/CPO/存储芯片), "激光/半导体/机器人" 无同名概念板块;
+/// "存储"→"存储芯片", "芯片"→"MCU芯片/存储芯片", "光伏"→"光伏",
+/// "航天"→"商业航天" 可命中。行业板块 (Industry) 补概念板块的盲区。
+const INDUSTRY_KEYWORD_GROUPS: [(&str, &[&str]); 14] = [
+    ("激光", &["激光", "光学", "光电子"]),
+    ("存储", &["存储", "内存"]),
+    ("芯片", &["芯片", "半导体"]),
+    ("半导体", &["芯片", "半导体"]),
+    ("机器人", &["机器人", "人形"]),
+    ("电池", &["电池", "锂电"]),
+    ("光伏", &["光伏", "太阳能"]),
+    ("新能源", &["新能源", "锂电", "光伏"]),
+    ("航天", &["航天", "卫星"]),
+    ("卫星", &["卫星", "航天"]),
+    ("算力", &["算力", "服务器", "AIGC", "CPO"]),
+    ("人工智能", &["人工智能", "AI", "AIGC", "DeepSeek", "ChatGPT"]),
+    ("军工", &["军工", "国防", "商业航天"]),
+    ("医疗", &["医疗", "创新药", "CXO"]),
+];
+
+/// 目录里板块名含公司名行业关键词 → (板块 code, 板块名)。首个命中关键词的板块族。
+fn infer_industry_boards(
+    directory: &[stock_analysis::data_gateway::BoardDirectoryFact],
+    company: &str,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (company_kw, board_words) in INDUSTRY_KEYWORD_GROUPS {
+        if !company.contains(company_kw) {
+            continue;
+        }
+        for fact in directory {
+            if board_words.iter().any(|w| fact.name.contains(w)) {
+                out.push((fact.code.clone(), fact.name.clone()));
+            }
+        }
+        if !out.is_empty() {
+            break;
+        }
+    }
+    out
+}
+
+/// 公告标题 → IPO 阶段 + 命中关键词。
+/// 阶段推断: 上市公告书=上市, 招股意向书/发行=发行中, 注册=过会, 受理/问询=在审。
+fn ipo_keyword_stage(title: &str) -> Option<(stock_analysis::news::ipo::supply_chain::IpoStage, String)> {
+    use stock_analysis::news::ipo::supply_chain::IpoStage;
+    let t = title.to_ascii_lowercase();
+    let pick = |k: &str, s: IpoStage| t.contains(k).then(|| (s, k.to_string()));
+    use IpoStage::*;
+    pick("上市公告书", Listed)
+        .or_else(|| pick("招股意向书", Registered))
+        .or_else(|| pick("招股说明书", Registered))
+        .or_else(|| pick("首次公开发行", InReview))
+        .or_else(|| pick("ipo", InReview))
+}
+
+/// 公告标题 → 公司名: "XX股份有限公司..." 前缀提取。
+/// 2026-08-06 修复: `pos + s.chars().count()` 字符数混入字节切片, 中文标题
+/// (如 "上海频准激光科技股份有限公司") panic (end byte index not a char
+/// boundary)。`find` 返回字节索引, 必须用 `pos + s.len()` (字节长度)。
+/// 公司名取 "关于" 之后的块 (A 股公告标题惯例), 去掉律所/中介前缀。
+fn extract_company_name(title: &str) -> String {
+    const SUFFIXES: [&str; 4] = ["股份有限公司", "有限责任公司", "有限公司", "集团"];
+    let mut best = String::new();
+    for s in SUFFIXES {
+        if let Some(pos) = title.find(s) {
+            let end = pos + s.len();
+            if end > title.len() {
+                continue;
+            }
+            let start = title.find("关于").map(|p| p + "关于".len()).unwrap_or(0);
+            if start >= end {
+                continue;
+            }
+            let cand = title[start..end].trim().to_string();
+            if cand.chars().count() > best.chars().count() {
+                best = cand;
+            }
+        }
+    }
+    best
+}
+
+/// BR-223: A-11 IPO 阶段催化 — 动态查询最近 IPO (每日一次, 盘后复盘链内)。
+/// 数据流: 今日 cninfo 公告批次 (limit=300, 断点 B 覆盖全天) → IPO 关键词过滤
+/// → 公司名提取 → 静态映射字典 (长鑫等) → 渲染。无 IPO 公告 → 短路不推。
 pub async fn dispatch_ipo_catalyst(date: &str) -> bool {
-    use stock_analysis::news::ipo::supply_chain::ipo_companies;
-    let companies = ipo_companies();
-    if companies.is_empty() {
-        log_dispatcher_attempt("A-11", false, 0, "no ipo companies");
+    use chrono::NaiveDate;
+    use stock_analysis::data_gateway::{EventCalendarGateway, GatewayBatch};
+    use stock_analysis::news::ipo::supply_chain::lookup;
+
+    let date_naive = match NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+        Ok(d) => d,
+        Err(error) => {
+            log::warn!("[A-11][BR-223] 非法日期 {date:?}: {error}");
+            return false;
+        }
+    };
+    // 2026-08-06: 优先复用 R-08 已拉取的当日公告批次 (同日期命中 → 不重复拉
+    // cninfo, 避免复盘内两次拉取触发限流 router_batch_rejected)。未命中 → 拉取。
+    let cached: Option<Vec<stock_analysis::data_gateway::EventAnnouncement>> = REVIEW_ANNOUNCEMENTS_CACHE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|mut cache| match cache.as_ref() {
+            Some((cached_date, records)) if cached_date == date => Some(records.clone()),
+            _ => None,
+        });
+    let records: Vec<stock_analysis::data_gateway::EventAnnouncement> = match cached {
+        Some(records) => {
+            log::info!(
+                "[A-11][BR-223] 复用 R-08 公告批次: {} 条 (缓存命中, 未重复拉取)",
+                records.len()
+            );
+            records
+        }
+        None => {
+            let batch = match EventCalendarGateway::new()
+                .market_announcements(date_naive, 300)
+                .await
+            {
+                Ok(batch) => batch,
+                Err(error) => {
+                    log::warn!("[A-11][BR-223] 公告批次不可用: {error}");
+                    return false;
+                }
+            };
+            match batch {
+                GatewayBatch::Available { records, .. } => records,
+                GatewayBatch::VerifiedEmpty(evidence) => {
+                    log::info!("[A-11][BR-223] 公告已验证为空: {:?}", evidence.batch_id);
+                    return false;
+                }
+            }
+        }
+    };
+
+    let mut hits: Vec<DynamicIpoHit> = Vec::new();
+    for ann in records {
+        let Some((stage, keyword)) = ipo_keyword_stage(&ann.title) else {
+            continue;
+        };
+        let company = extract_company_name(&ann.title);
+        if company.is_empty() {
+            continue;
+        }
+        let mapped = match lookup(&company) {
+            Some(known) => known
+                .related_stocks
+                .iter()
+                .map(|(c, n, _)| ((*c).to_string(), (*n).to_string()))
+                .collect(),
+            None => Vec::new(), // 未命中字典 → 动态板块推断
+        };
+        hits.push(DynamicIpoHit {
+            company,
+            stage,
+            keyword,
+            mapped_stocks: mapped,
+            industry: Vec::new(),
+            announcement_code: ann.code.clone(),
+        });
+    }
+    hits.dedup_by(|a, b| a.company == b.company && a.keyword == b.keyword);
+    if hits.is_empty() {
+        log_dispatcher_attempt("A-11", false, 0, "no IPO announcements today");
         return false;
     }
-    let text = render_ipo_catalyst(date, companies);
+
+    // 产业链影响 (2026-08-06): 静态字典未命中的公司 → 行业关键词 →
+    // TDX 真实概念板块 → 成分股 (名称经 security_identities 补齐)。
+    // 板块/成分/身份任一失败 → 该板块跳过, 不影响其余 (尽力而为, 出声)。
+    for hit in hits.iter_mut().filter(|h| h.mapped_stocks.is_empty()) {
+        let company = hit.company.clone();
+        let directory = match (
+            stock_analysis::data_gateway::BoardDataGateway::production_tdx()
+                .directory(stock_analysis::data_gateway::BoardKind::Concept, 200)
+                .await,
+            stock_analysis::data_gateway::BoardDataGateway::production_tdx()
+                .directory(stock_analysis::data_gateway::BoardKind::Industry, 200)
+                .await,
+        ) {
+            (
+                Ok(stock_analysis::data_gateway::GatewayBatch::Available {
+                    records: concept, ..
+                }),
+                Ok(stock_analysis::data_gateway::GatewayBatch::Available {
+                    records: industry,
+                    ..
+                }),
+            ) => {
+                let mut all = concept;
+                all.extend(industry);
+                all
+            }
+            (Ok(stock_analysis::data_gateway::GatewayBatch::Available { records, .. }), _) => {
+                records
+            }
+            (_, Ok(stock_analysis::data_gateway::GatewayBatch::Available { records, .. })) => {
+                records
+            }
+            (Ok(stock_analysis::data_gateway::GatewayBatch::VerifiedEmpty(evidence)), _)
+            | (_, Ok(stock_analysis::data_gateway::GatewayBatch::VerifiedEmpty(evidence))) => {
+                log::warn!(
+                    "[A-11][BR-223] 板块目录已验证为空: {:?}",
+                    evidence.batch_id
+                );
+                continue;
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                log::warn!("[A-11][BR-223] 板块目录不可用: {error}");
+                continue;
+            }
+        };
+        let boards = infer_industry_boards(&directory, &company);
+        if boards.is_empty() {
+            continue;
+        }
+        let mut industry: Vec<IndustryBoard> = Vec::new();
+        for (board_code, board_name) in boards.iter().take(3) {
+            let member_codes: Vec<String> =
+                match stock_analysis::data_gateway::BoardDataGateway::production_tdx()
+                    .memberships(board_code)
+                    .await
+                {
+                    Ok(stock_analysis::data_gateway::GatewayBatch::Available {
+                        records, ..
+                    }) => records
+                        .iter()
+                        .map(|r| r.instrument_code.clone())
+                        .collect(),
+                    Ok(_) | Err(_) => Vec::new(),
+                };
+            if member_codes.is_empty() {
+                continue;
+            }
+            let member_codes = member_codes.into_iter().take(10).collect::<Vec<_>>();
+            let named: Vec<(String, String)> =
+                match stock_analysis::data_gateway::MarketCapabilitiesGateway::new()
+                    .security_identities(&member_codes)
+                    .await
+                {
+                    Ok(stock_analysis::data_gateway::GatewayBatch::Available {
+                        records, ..
+                    }) => records
+                        .iter()
+                        .map(|i| (i.code.clone(), i.name.clone()))
+                        .collect(),
+                    Ok(_) | Err(_) => Vec::new(),
+                };
+            industry.push(IndustryBoard {
+                board_name: board_name.clone(),
+                stocks: named,
+            });
+        }
+        hit.industry = industry;
+    }
+
+    let text = render_ipo_catalyst_dynamic(date, &hits);
     let result = dispatch_registered_outcome!(
         "A-11-ipo-catalyst",
         crate::notify::PushKind::IpoCatalyst,
         "ipo_catalyst_dispatcher",
+        // renderer seam id 保持原注册名 (BR-196 token 按 family+renderer 派生,
+        // 2026-08-06 曾改名为 _dynamic 导致 token 拒绝)
         "render_ipo_catalyst",
         "",
         None,
         text
     );
-    log_dispatcher_attempt("A-11", result.is_pushed(), companies.len(), "");
+    log_dispatcher_attempt("A-11", result.is_pushed(), hits.len(), "");
     result.is_pushed()
+}
+
+/// 动态 IPO 催化渲染: 最近 IPO 公告 → 公司 + 阶段 + 供应链关联 + 产业链影响。
+fn render_ipo_catalyst_dynamic(date: &str, hits: &[DynamicIpoHit]) -> String {
+    let mut text = format!("🛰️ IPO 产业链催化（{} 动态）\n", date);
+    for hit in hits {
+        text.push_str(&format!(
+            "· {} — 阶段 {:?} (公告: {})\n  关联: ",
+            hit.company, hit.stage, hit.keyword
+        ));
+        if !hit.mapped_stocks.is_empty() {
+            let related = hit
+                .mapped_stocks
+                .iter()
+                .map(|(c, n)| format!("{n}({c})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            text.push_str(&related);
+            text.push('\n');
+            continue;
+        }
+        if hit.industry.is_empty() {
+            text.push_str("无 (供应链字典未收录, 板块推断未命中)");
+            text.push('\n');
+            continue;
+        }
+        for board in &hit.industry {
+            text.push_str(&format!("  产业链 {}: ", board.board_name));
+            if board.stocks.is_empty() {
+                text.push_str("成分数据不可用");
+            } else {
+                let stocks = board
+                    .stocks
+                    .iter()
+                    .map(|(c, n)| format!("{n}({c})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                text.push_str(&stocks);
+            }
+            text.push('\n');
+        }
+    }
+    text.push_str(
+        "数据源: cninfo 当日公告实时批次 | 供应链: 维护字典 + TDX 真实板块成分 | 辅助建议, 非下单指令",
+    );
+    text
 }
 
 /// BR-223: 盘后大宗交易推送 — BlockTradesGateway → 既有 BR-033/BR-034 dispatcher。
@@ -8347,8 +8672,19 @@ pub async fn dispatch_post_session_review(
 
     let business_date = context.business_date();
     let date = business_date.format("%Y-%m-%d").to_string();
-    let now = context.eligibility_time();
-    log::info!("[B-005-C] 盘后批量 dispatcher 开始 ({})", date);
+    // 2026-08-06: 手动 --review 跳过 21:00 龙虎榜发布门 (R-04 立即尝试;
+    // 未发布数据 gateway 返回空 → dispatcher 降级)。自动调度保持真实时钟。
+    let now = if context.manual_override() {
+        chrono::NaiveTime::from_hms_opt(23, 59, 59)
+            .expect("BR-140 manual review time must be valid")
+    } else {
+        context.eligibility_time()
+    };
+    log::info!(
+        "[B-005-C] 盘后批量 dispatcher 开始 ({}) manual_override={}",
+        date,
+        context.manual_override()
+    );
 
     let is_test = stock_analysis::risk::env_guard::runtime_is_test_process()
         || stock_analysis::risk::env_guard::current_env()
@@ -8463,15 +8799,34 @@ pub async fn dispatch_post_session_review(
     let ipo_pushed = dispatch_ipo_catalyst(&date).await;
     log::info!("[BR-223] IPO 产业链催化 pushed={ipo_pushed}");
     let observed_at = chrono::Local::now().fixed_offset();
-    let account_required = account_dependency_outcomes(&phases.account_required, observed_at);
-    if !account_required.is_empty() {
+    // 2026-08-06 用户决策 (未接券商): R-03 (涨停产业链复盘) 解除账户 gate。
+    // 其 dispatcher 数据源为 portfolio 持仓 + 涨停链 (不依赖 real_account_snapshot),
+    // 直接走真实数据路径; 其余 account_required 任务保持 account_metrics_incomplete。
+    let mut account_required_outcomes = Vec::new();
+    for task in &phases.account_required {
+        if *task == ReviewTask::R03 {
+            account_required_outcomes.push((
+                ReviewTask::R03,
+                dispatch_r03_industry_chain_outcome(&date).await,
+            ));
+        } else {
+            account_required_outcomes.push((
+                *task,
+                ReviewTaskOutcome::account_metrics_incomplete(observed_at),
+            ));
+        }
+    }
+    if !account_required_outcomes.is_empty() {
         log::warn!(
-            "[复盘依赖][BR-194] dependency=legacy_account_gate status=unavailable affected_count={} stage=acquire_batch reason_code=account_metrics_incomplete retryable=true source_provider=none source_time=none",
-            account_required.len()
+            "[复盘依赖][BR-194] dependency=legacy_account_gate status=unavailable affected_count={} stage=acquire_batch reason_code=account_metrics_incomplete retryable=true source_provider=none source_time=none (R-03 已解除, 走持仓+涨停链)",
+            account_required_outcomes.len()
         );
     }
-    let batch =
-        merge_review_task_outcomes(preflight.outcomes, source_only_outcomes, account_required)?;
+    let batch = merge_review_task_outcomes(
+        preflight.outcomes,
+        source_only_outcomes,
+        account_required_outcomes,
+    )?;
     let delivered = batch.delivered_count();
     let waiting = batch.waiting_tasks();
     let deferred = batch.deferred_tasks();
@@ -9716,7 +10071,28 @@ pub async fn dispatch_r08_event_calendar_outcome(
             let futures_gateway = stock_analysis::data_gateway::FuturesDeliveryGateway::new();
             let global_market_gateway = stock_analysis::data_gateway::GlobalMarketGateway::new();
             tokio::join!(
-                announcement_gateway.market_announcements(review_date, 300),
+                async {
+                    let result = announcement_gateway
+                        .market_announcements(review_date, 300)
+                        .await;
+                    // 2026-08-06: 缓存公告批次供 A-11 复用 (避免复盘内 44s 两次
+                    // cninfo 拉取触发限流 router_batch_rejected)。失败不写缓存。
+                    if let Ok(stock_analysis::data_gateway::GatewayBatch::Available {
+                        records, ..
+                    }) = &result
+                    {
+                        if let Ok(mut cache) = REVIEW_ANNOUNCEMENTS_CACHE
+                            .get_or_init(|| std::sync::Mutex::new(None))
+                            .lock()
+                        {
+                            *cache = Some((
+                                review_date.format("%Y-%m-%d").to_string(),
+                                records.clone(),
+                            ));
+                        }
+                    }
+                    result
+                },
                 futures_gateway
                     .cffex_contract_month(reminder_year, chrono::Datelike::month(&reminder_date),),
                 global_market_gateway.us_indices(),
@@ -14652,6 +15028,30 @@ pub async fn dispatch_sector_anomaly_daily(hhmm: &str, news_text: &str) -> bool 
         return false;
     }
     let result = push_sector_anomaly(hhmm, &moves).await;
+    #[test]
+    fn extract_company_name_handles_cjk_byte_boundaries() {
+        // 2026-08-06 panic 回归: 中文标题字节边界 (原 pos+chars().count() 越界)
+        let with_lawyer_prefix = "上海市锦天城律师事务所关于上海频准激光科技股份有限公司首次公开发行股票并在科创板上市之参与战略配售的投资者核查事项的法律意见书";
+        assert_eq!(
+            extract_company_name(with_lawyer_prefix),
+            "上海频准激光科技股份有限公司"
+        );
+        assert_eq!(
+            extract_company_name("温州宏丰电工合金股份有限公司2026年度向特定对象发行股票"),
+            "温州宏丰电工合金股份有限公司"
+        );
+        assert_eq!(extract_company_name("某公司集团公告"), "某公司集团");
+        assert_eq!(extract_company_name("无后缀标题"), "");
+    }
+
+    #[test]
+    fn ipo_keyword_stage_maps_announcement_keywords() {
+        assert!(ipo_keyword_stage("首次公开发行股票并在科创板上市").is_some());
+        assert!(ipo_keyword_stage("招股意向书").is_some());
+        assert!(ipo_keyword_stage("上市公告书").is_some());
+        assert_eq!(ipo_keyword_stage("例行董事会决议公告"), None);
+    }
+
     log_dispatcher_attempt("I-09A", result, moves.len(), "");
     result
 }

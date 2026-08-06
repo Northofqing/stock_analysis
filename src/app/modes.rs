@@ -121,10 +121,43 @@ pub async fn run_chain_analysis_mode(send_notify: bool) -> Result<()> {
     .await??;
     info!("今日涨停池共 {} 只", limit_ups.len());
 
+    // 2026-08-06: 新闻收集 → AI 产业链分析。拉取主流快讯源今日新闻摘要,
+    // 作为 LLM 产业链分析的宏背景 (macro_news)。任一源失败 → 显式 warn,
+    // 不阻塞链分析 (聚类/落库照常, 仅 LLM 无新闻背景)。
+    use stock_analysis::data_gateway::{GatewayBatch, GlobalNewsGateway, GlobalNewsProvider};
+    let macro_news = match GlobalNewsGateway::new()
+        .global_news(GlobalNewsProvider::Cailianpress, 20)
+        .await
+    {
+        Ok(GatewayBatch::Available { records, .. }) if !records.is_empty() => {
+            info!("[产业链] 已收集 {} 条快讯进 LLM 背景", records.len());
+            Some(
+                records
+                    .iter()
+                    .take(15)
+                    .map(|r| r.title.clone())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )
+        }
+        Ok(GatewayBatch::Available { .. }) => {
+            log::warn!("[产业链] 快讯批次为空, LLM 无新闻背景");
+            None
+        }
+        Ok(GatewayBatch::VerifiedEmpty(evidence)) => {
+            log::warn!("[产业链] 快讯已验证为空: {:?}", evidence.batch_id);
+            None
+        }
+        Err(error) => {
+            log::warn!("[产业链] 快讯收集失败, LLM 无新闻背景: {error}");
+            None
+        }
+    };
+
     let report = stock_analysis::pipeline::chain_analysis::run_chain_analysis(
         business_date,
         limit_ups,
-        None,
+        macro_news,
     )
     .await?;
 

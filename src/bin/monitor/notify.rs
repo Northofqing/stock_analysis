@@ -82,7 +82,12 @@ pub enum PushKind {
     /// 保留: 候选筛选台卡片 (P5 §五 输出形态, 强证据>多源>题材)
     CandidateBoard,
     // P2-News Commit 4 加: 新闻 Ranker 输出卡片 (A/B/C/Drop 4 档, 阶段判断+风险过滤)
-    /// 保留: 新闻 Ranker 候选卡片 (P2-News 阶段判断+风险过滤后的输出)
+    /// 退役 (BR-191, Gate B in progress): shadow NewsRanker 无生产调用、默认
+    /// MarketContext 评分, BR-191/BR-112 判退役, v19.15 已删演示模板。
+    /// 生产证据 (2026-08-06 审计): src/ 内 0 生产 dispatcher/调用点; 仅存
+    /// level=Important (notify.rs:295)、v14 适配表 (v14_adapter.rs:1069)、
+    /// BR-196 FIXED_DISABLED_KINDS 清单引用。不删变体 (BR-196 契约依赖),
+    /// 启动时 dispatch_table_init_audit 输出退役状态 (no_producer)。
     NewsRanked,
     // ============= v12 §14.3 新增 PushKind =============
     /// 账户模式变更 (T-01, ⚡ 无冷却) [MVP-1]
@@ -820,6 +825,12 @@ pub fn dispatch_table_init_audit() {
         emergency_count,
         important_count,
         info_count
+    );
+    // Completion Rule 4d: Spec-only PushKind 无真实生产者必须启动声明。
+    // NewsRanked: BR-191 退役 (shadow NewsRanker), 0 生产 dispatcher —
+    // 有生产者接入前不得声称活动。若未来接入, 必须先撤此声明。
+    log::info!(
+        "[v17.x][NewsRanked] disabled=no_producer reason=BR-191-shadow-news-ranker-retired"
     );
 }
 

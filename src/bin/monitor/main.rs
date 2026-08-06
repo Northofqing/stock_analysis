@@ -4319,9 +4319,11 @@ async fn run_review_only() -> Result<(), String> {
     let review_start = std::time::Instant::now();
 
     let due: std::collections::BTreeSet<_> = review_batch::ReviewTask::ALL.into_iter().collect();
-    let context = review_batch::ReviewRunContext::at(chrono::Local::now().naive_local());
+    // 2026-08-06: --review CLI 手动触发 → at_manual (跳过 21:00 龙虎榜门,
+    // R-04/R-07 立即尝试; 未发布数据 dispatcher 降级 + 出声)。
+    let context = review_batch::ReviewRunContext::at_manual(chrono::Local::now().naive_local());
     log::info!(
-        "[复盘][BR-140] effective_review_date={} observed_at={}",
+        "[复盘][BR-140] effective_review_date={} observed_at={} manual_override=true",
         context.review_date(),
         context.observed_at().format("%Y-%m-%dT%H:%M:%S")
     );
@@ -4515,7 +4517,9 @@ async fn attempt_post_session_review(
     due: &std::collections::BTreeSet<review_batch::ReviewTask>,
 ) -> Result<review_batch::ReviewBatchOutcome, String> {
     let timeout_secs = review_timeout_secs();
-    let context = review_batch::ReviewRunContext::at(chrono::Local::now().naive_local());
+    // 2026-08-06: 手动 --review 用 at_manual — 跳过 21:00 龙虎榜发布门,
+    // R-04/R-07 立即尝试 (未发布数据 dispatcher 内部降级)。
+    let context = review_batch::ReviewRunContext::at_manual(chrono::Local::now().naive_local());
     tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
         run_strict_review_only_inner(due, context),
@@ -6030,7 +6034,13 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
                 Some(keywords) => {
                     let query_date = chrono::Local::now().date_naive();
                     match stock_analysis::data_gateway::EventCalendarGateway::new()
-                        .market_announcements(query_date, 100)
+                        // 断点 B (2026-08-06): 公告分页覆盖不足。
+                        // probe 实证: cninfo 当日 936 条 (30 页), 排序倒序(最新优先),
+                        // limit=300 = max_pages=10 上限 = 覆盖 11:44→00:00 全天时段。
+                        // 原 limit=100 只取前 100 条, 受众公告命中率低 (08-06 实证
+                        // 100 条里 0 条命中持仓/自选 39 只)。300 条 ×3 覆盖。
+                        // 彻底修复 (上游 max_pages 放开 + 全量拉取) 见断点 B-2。
+                        .market_announcements(query_date, 300)
                         .await
                     {
                         Ok(batch) => {
@@ -6567,6 +6577,136 @@ async fn monitor_loop() {
                     }
                 }
             }
+            // BR-226: 持仓快照 24h 新鲜度 — 收盘后主动预警。
+            // 快照 effective_at 超过 6h (即非今日导入) → 次日 9:20 竞价时必过期
+            // (age > 24h), 公告受众将静默降级。2026-08-06 实证: 08-05 15:02 快照
+            // 08-07 9:20 时 42h 过期。预警让用户在过期前完成导入 (数据仍由用户
+            // 每日提供, 此处仅出声提醒, 不改变 BR-226 fail-closed 语义)。
+            if now.hour() == 15 && now.minute() == 5 {
+                use stock_analysis::database::user_position_snapshot::latest_user_position_snapshot;
+                static SNAP_REMIND_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                    std::sync::Mutex::new(None);
+                let today = now.date_naive();
+                let already_reminded = SNAP_REMIND_LAST
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .map(|d| d == today)
+                    .unwrap_or(false);
+                if !already_reminded {
+                    let reminder = match latest_user_position_snapshot() {
+                        Ok(Some(snapshot)) if !snapshot.confirm_empty => {
+                            let age_hours = chrono::Local::now()
+                                .signed_duration_since(
+                                    snapshot.effective_at.with_timezone(&chrono::Local),
+                                )
+                                .num_minutes() as f64
+                                / 60.0;
+                            (age_hours > 6.0).then(|| {
+                                format!(
+                                    "⚠️ 持仓快照 24h 新鲜度预警: effective_at={} 已 {:.0}h。\n请导入今日收盘后快照 (import_user_position_snapshot)，否则明日 09:20 竞价时公告受众将降级 (BR-226)。",
+                                    snapshot.effective_at, age_hours
+                                )
+                            })
+                        }
+                        Ok(Some(_)) => None, // confirm_empty = 用户确认空仓, 合法状态
+                        Ok(None) => Some(
+                            "⚠️ 持仓快照从未导入 (BR-226): 公告受众当前无持仓证据，请运行 import_user_position_snapshot"
+                                .to_string(),
+                        ),
+                        Err(error) => Some(format!(
+                            "⚠️ 持仓快照读取失败 (BR-226): {error}"
+                        )),
+                    };
+                    if let Some(text) = reminder {
+                        log::warn!("[BR-226] {text}");
+                        let outcome = push_governor_v3(&text, PushKind::IntradayMarket, None).await;
+                        log::info!(
+                            "[BR-226] 持仓快照预警推送: outcome={:?} pushed={}",
+                            outcome,
+                            outcome.is_pushed()
+                        );
+                    } else {
+                        log::info!("[BR-226] 持仓快照今日已更新, 无需预警");
+                    }
+                    // 每日一次, 尽力而为; 推送失败不重试 (次日再检)
+                    *SNAP_REMIND_LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some(today);
+                }
+            }
+            // 断点 A (2026-08-06): 产业链分析接线 — chain_daily 生产者。
+            // 排查: pipeline::chain_analysis 生产路径零调用 → chain_daily 恒空
+            // → I-03 盘中产业链恒 "chain_daily 无数据" 短路。盘后 15:10 跑一次
+            // 涨停池 → 概念聚类 → 写 chain_daily (cluster_and_persist 不依赖 LLM,
+            // llm_ok=false 时仅聚类降级, chain_daily 仍落库); 当日/次日 I-03
+            // 即读到 MAX(date) 数据。失败保留重试资格 (v15.x 静默路径出声)。
+            // 15:10-15:15 窗口 (原只 15:10 整分钟, 失败后无法重试 — 2026-08-06 实证)
+            if now.hour() == 15 && now.minute() <= 15 {
+                static CHAIN_LAST_RUN: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                    std::sync::Mutex::new(None);
+                let today = now.date_naive();
+                let already_run = CHAIN_LAST_RUN
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .map(|d| d == today)
+                    .unwrap_or(false);
+                if !already_run {
+                    let observed_at = chrono::Local::now().naive_local();
+                    let business_date =
+                        stock_analysis::calendar::latest_completed_trading_day_at(observed_at);
+                    let limit_ups: Option<Vec<stock_analysis::market_data::TopStock>> =
+                        match tokio::task::spawn_blocking(move || {
+                            let analyzer =
+                                stock_analysis::market_analyzer::MarketAnalyzer::new(None)?;
+                            analyzer.get_limit_up_stocks(business_date)
+                        })
+                        .await
+                        {
+                            Ok(Ok(stocks)) => Some(stocks),
+                            Ok(Err(error)) => {
+                                log::error!("[产业链][断点A] 涨停池批次失败: {error}");
+                                None
+                            }
+                            Err(error) => {
+                                log::error!("[产业链][断点A] 涨停池 worker 失败: {error}");
+                                None
+                            }
+                        };
+                    if let Some(limit_ups) = limit_ups {
+                        let stock_count = limit_ups.len();
+                        if stock_count == 0 {
+                            log::warn!(
+                                "[产业链][断点A] 涨停池为空, 跳过链分析 (chain_daily 保留旧数据)"
+                            );
+                        } else {
+                            match stock_analysis::pipeline::chain_analysis::run_chain_analysis(
+                                business_date,
+                                limit_ups,
+                                None,
+                            )
+                            .await
+                            {
+                                Ok(report) => {
+                                    log::info!(
+                                        "[产业链][断点A] 链分析完成: date={} stocks={} report_bytes={} (chain_daily 已写入, I-03 数据源就绪)",
+                                        business_date,
+                                        stock_count,
+                                        report.len()
+                                    );
+                                    *CHAIN_LAST_RUN
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner()) = Some(today);
+                                }
+                                Err(error) => {
+                                    log::error!(
+                                        "[产业链][断点A] 链分析失败, 保留重试资格: {error}"
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        log::warn!("[产业链][断点A] 涨停池不可用, 保留重试资格");
+                    }
+                }
+            }
             // BR-021 §5.10 / commit 08cca47 + caller wire: 8:30 盘前重置 cron.
             // 调一次 push_account_mode_change 触发 evaluate(), 内部 should_reset_at_8_30
             // (Frozen + 8:30 窗口) → 强制 prev=None → evaluate 重判 → 落库 + 推 T-01.
@@ -6793,6 +6933,86 @@ async fn monitor_loop() {
                             }
                             preopen_pushed = preopen_ok && candidate_ok;
                         }
+
+                        // 2026-08-06 实证: 9:15-9:25 DNS 全挂 + TDX 不可达 →
+                        // A-02/P-05/涨停池全失败, 9:20 后才从日志发现。
+                        // 开盘前 5 分钟 (9:10-9:15) 对统一实时行情网关做一次健康
+                        // 探测 (与 A-02 同链路 MarketDataGateway::realtime_quotes):
+                        // 不可用 → 提前推送预警, 9:20 竞价前就知道窗口风险。
+                        // 瞬时故障的兜底是 9:20 BR-223 块 (成功才封口, 窗口内重试)。
+                        if now_time >= chrono::NaiveTime::from_hms_opt(9, 10, 0).unwrap()
+                            && now_time < preopen_end
+                        {
+                            static PREOPEN_PROBE_LAST: std::sync::Mutex<
+                                Option<chrono::NaiveDate>,
+                            > = std::sync::Mutex::new(None);
+                            let probe_today = chrono::Local::now().date_naive();
+                            let probe_done = PREOPEN_PROBE_LAST
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .map(|d| d == probe_today)
+                                .unwrap_or(false);
+                            if !probe_done {
+                                // 基准代码: 深主板 + 沪主板 + 创业板
+                                let probe_codes: Vec<String> = [
+                                    "000001", "600000", "300750",
+                                ]
+                                .iter()
+                                .map(|s| s.to_string())
+                                .collect();
+                                let probe_result = tokio::task::spawn_blocking(move || {
+                                    market_data::fetch_realtime_quotes(&probe_codes)
+                                })
+                                .await;
+                                *PREOPEN_PROBE_LAST
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner()) = Some(probe_today);
+                                match probe_result {
+                                    Ok(Ok(quotes)) if !quotes.is_empty() => {
+                                        log::info!(
+                                            "[预检][行情源] 统一实时行情可用: records={} (000001/600000/300750)",
+                                            quotes.len()
+                                        );
+                                    }
+                                    Ok(Ok(_)) => {
+                                        let text = "⚠️ 开盘前行情源预检失败: 统一实时行情返回空批次 (9:10)。\n若 9:20 竞价时行情未恢复, A-02 竞价优选/P-05 候选台将在窗口内重试。"
+                                            .to_string();
+                                        log::warn!("[预检][行情源] {text}");
+                                        let outcome = push_governor_v3(
+                                            &text,
+                                            PushKind::IntradayMarket,
+                                            None,
+                                        )
+                                        .await;
+                                        log::info!(
+                                            "[预检][行情源] 预警推送 pushed={}",
+                                            outcome.is_pushed()
+                                        );
+                                    }
+                                    Ok(Err(error)) => {
+                                        let text = format!(
+                                            "⚠️ 开盘前行情源预检失败 (9:10): {error}\n若 9:20 竞价时行情未恢复, A-02/P-05 将在窗口内重试。"
+                                        );
+                                        log::warn!("[预检][行情源] {text}");
+                                        let outcome = push_governor_v3(
+                                            &text,
+                                            PushKind::IntradayMarket,
+                                            None,
+                                        )
+                                        .await;
+                                        log::info!(
+                                            "[预检][行情源] 预警推送 pushed={}",
+                                            outcome.is_pushed()
+                                        );
+                                    }
+                                    Err(error) => {
+                                        log::warn!(
+                                            "[预检][行情源] 探测任务失败: {error}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -6881,9 +7101,11 @@ async fn monitor_loop() {
 
                         // BR-223: 9:20-9:25 竞价优选重推恢复 (A-02 AuctionRepush)。
                         // 复用统一网关候选链路 load_real_candidate_batch (CandidateBoard 同源)。
+                        // 2026-08-06 实证: 9:20 时刻 DNS 全挂 + TDX 不可达 → A-02/P-05
+                        // 一次性尝试双双失败, 整个竞价窗口错过。改为成功才封口:
+                        // 窗口内每次扫描 tick (约 30s) 保留重试资格; 重复推送由进程内
+                        // cooldown 拦截 (AuctionRepush=600s, CandidateBoard=1800s)。
                         if !post_close_candidates_notified {
-                            post_close_candidates_notified = true;
-
                             let repush_ts = chrono::Local::now().format("%H:%M:%S").to_string();
                             let repushed =
                                 push_templates::dispatch_auction_repush(&repush_ts).await;
@@ -6892,6 +7114,18 @@ async fn monitor_loop() {
                             let board_pushed =
                                 push_templates::dispatch_candidate_board(&board_date).await;
                             log::info!("[竞价][BR-223] P-05 candidate board pushed={board_pushed}");
+
+                            if repushed && board_pushed {
+                                post_close_candidates_notified = true;
+                            } else {
+                                // 失败不封口: 竞价窗口内下一 tick 重试, 直至成功或窗口结束。
+                                // 空候选 (entries.is_empty) 也在重试之列 — 上游候选可能
+                                // 晚于 9:20:20 才生成 (2026-08-06 09:20 候选链路即为空)。
+                                log::warn!(
+                                    "[竞价][BR-223] A-02={repushed} P-05={board_pushed} \
+                                     未全成功; 竞价窗口内保留重试资格"
+                                );
+                            }
 
                             let post_close = String::new();
 

@@ -178,9 +178,12 @@ pub(super) async fn fetch_laggard_candidates(
 }
 
 /// 今日龙虎榜净买入映射 code -> 净买额(万元)。
+/// 2026-08-06 实证: disclosure_limit 原传 5_000, R-04 gateway 上限 100
+/// (invalid request: market dragon-tiger limit must be at most 100) —
+/// 断点 A 接线后首次暴露, 改为上限内值。
 pub(super) async fn fetch_lhb_map() -> Result<HashMap<String, f64>, String> {
     let batch = DragonTigerGateway::new()
-        .market_review(chrono::Local::now().date_naive(), 5_000, 5_000)
+        .market_review(chrono::Local::now().date_naive(), 100, 5_000)
         .await
         .map_err(|error| format!("产业链龙虎榜 Gateway 不可用: {error}"))?;
     match batch {

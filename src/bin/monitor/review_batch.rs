@@ -10,6 +10,9 @@ use sha2::{Digest, Sha256};
 pub struct ReviewRunContext {
     review_date: chrono::NaiveDate,
     observed_at: chrono::NaiveDateTime,
+    /// 2026-08-06: 手动 --review 时跳过 21:00 龙虎榜发布门 (R-04/R-07 立即
+    /// 尝试, 未发布数据由 dispatcher 内部降级 + 出声)。自动调度保持等待。
+    manual_override: bool,
 }
 
 impl ReviewRunContext {
@@ -17,7 +20,21 @@ impl ReviewRunContext {
         Self {
             review_date: stock_analysis::calendar::latest_completed_trading_day_at(observed_at),
             observed_at,
+            manual_override: false,
         }
+    }
+
+    /// 手动触发 (--review CLI): 不等待 21:00 龙虎榜发布门。
+    pub fn at_manual(observed_at: chrono::NaiveDateTime) -> Self {
+        Self {
+            review_date: stock_analysis::calendar::latest_completed_trading_day_at(observed_at),
+            observed_at,
+            manual_override: true,
+        }
+    }
+
+    pub fn manual_override(self) -> bool {
+        self.manual_override
     }
 
     pub fn review_date(self) -> chrono::NaiveDate {
@@ -1114,6 +1131,7 @@ impl ReviewScheduleState {
             ReviewRunContext {
                 review_date: now.date(),
                 observed_at: now,
+                manual_override: false,
             },
         )
     }
@@ -1572,13 +1590,20 @@ pub fn review_preflight(
 
     let lhb_ready = chrono::NaiveTime::from_hms_opt(21, 0, 0)
         .expect("BR-140 LHB publication time must be valid");
-    if context.eligibility_time() < lhb_ready && runnable.remove(&ReviewTask::R04) {
+    // 2026-08-06: 手动 --review 跳过 21:00 门 (用户要求手动复盘即出明日关注/
+    // 龙虎榜; 未发布数据由 dispatcher 降级 + 出声)。自动调度保持等待。
+    let lhb_gate_open = context.manual_override() || context.eligibility_time() >= lhb_ready;
+    if !lhb_gate_open && runnable.remove(&ReviewTask::R04) {
         outcomes.push((
             ReviewTask::R04,
             ReviewTaskOutcome::expected_wait(lhb_ready, "LHB source not published before 21:00"),
         ));
     }
     // BR-222: R-07 明日观察的龙虎榜来源同样依赖 21:00 发布, 与 R-04 同门等待。
+    // 2026-08-06 回滚手动放行: R-07 是 counted ceremony (BR-140/BR-192),
+    // 手动立即跑会因 LHB 未发布产生 RejectedDurable 残留 (不可变审计, 无法
+    // 清理), 卡死当日 21:00 自动重试。R-07 保持 21:00 自动 (正确行为);
+    // 手动 --review 只放行 R-04 (非 counted 依赖路径)。
     if context.eligibility_time() < lhb_ready && runnable.remove(&ReviewTask::R07) {
         outcomes.push((
             ReviewTask::R07,
