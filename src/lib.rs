@@ -1,5 +1,13 @@
 // A股自选股智能分析系统 - 库入口
 
+// 库内文件用 use stock_analysis::... 自引用 (app 模块原属 CLI binary, 并入后
+// 保持路径不变), 需要 self-as-extern-crate 别名。
+extern crate self as stock_analysis;
+
+// 2026-08-07: app (运行模式) 与 cli (参数解析) 并入库存量 —
+// bin/monitor 时间线需要调用 modes::run_chain_analysis_mode (新闻+AI 链分析推送)。
+// CLI binary (src/main.rs) 保留本地 mod app; mod cli;, 与库路径互不冲突。
+pub mod app;
 pub mod analyzer;
 pub mod announcement;
 pub mod auth;
@@ -10,6 +18,8 @@ pub mod bus;
 pub mod calendar;
 pub mod capital_flow;
 pub mod chart_generator;
+// app/mod.rs 依赖 crate::cli::Args (参数解析, 纯 clap), 入库支撑 app 编译。
+pub mod cli;
 pub mod company_financials;
 pub mod company_metrics;
 pub mod config;

@@ -1863,6 +1863,7 @@ mod tests {
         let context = ReviewRunContext {
             review_date: day(),
             observed_at: observed_date.and_hms_opt(3, 0, 0).unwrap(),
+            manual_override: false,
         };
         let preflight = review_preflight(
             context,
@@ -1894,6 +1895,7 @@ mod tests {
             let context = ReviewRunContext {
                 review_date: day(),
                 observed_at: day().and_hms_opt(hour, minute, second).unwrap(),
+                manual_override: false,
             };
             let preflight = review_preflight(context, &a10, false);
             assert_eq!(
@@ -1911,6 +1913,7 @@ mod tests {
             ReviewRunContext {
                 review_date: day(),
                 observed_at: at_datetime(3, 0),
+                manual_override: false,
             },
             &a10,
             true,
@@ -1930,6 +1933,7 @@ mod tests {
         let context = ReviewRunContext {
             review_date: day(),
             observed_at: day().and_hms_opt(7, 0, 0).unwrap(),
+            manual_override: false,
         };
 
         std::env::set_var("STOCK_ANALYSIS_QUIET_HOUR_OVERRIDE", "0");
@@ -1960,6 +1964,7 @@ mod tests {
                 ReviewRunContext {
                     review_date: day(),
                     observed_at: day().succ_opt().unwrap().and_hms_opt(3, 0, 0).unwrap(),
+                    manual_override: false,
                 },
             )
             .pop()
@@ -2374,6 +2379,7 @@ mod tests {
             ReviewRunContext {
                 review_date: day(),
                 observed_at: at_datetime(19, 0),
+                manual_override: false,
             },
             &due,
             false,
@@ -2560,6 +2566,7 @@ mod tests {
                 ReviewRunContext {
                     review_date: day(),
                     observed_at: day().succ_opt().unwrap().and_hms_opt(3, 0, 0).unwrap(),
+                    manual_override: false,
                 },
             )
             .pop()
@@ -2616,6 +2623,7 @@ mod tests {
         let context = ReviewRunContext {
             review_date: day(),
             observed_at: at_datetime(15, 0),
+            manual_override: false,
         };
         let preflight = review_preflight(context, &due, true);
 
@@ -2674,6 +2682,7 @@ mod tests {
             observed_at: day()
                 .and_hms_opt(hour, minute, second)
                 .expect("valid TEST_CODE review time"),
+            manual_override: false,
         };
 
         assert!(matches!(
@@ -2930,6 +2939,7 @@ mod tests {
         let context = ReviewRunContext {
             review_date: day(),
             observed_at: at_datetime(15, 34),
+            manual_override: false,
         };
 
         let preflight = review_preflight(context, &due, false);
@@ -2952,6 +2962,7 @@ mod tests {
         let context = ReviewRunContext {
             review_date: chrono::NaiveDate::from_ymd_opt(2026, 7, 31).unwrap(),
             observed_at: saturday,
+            manual_override: false,
         };
 
         let preflight = review_preflight(context, &due, false);
@@ -2966,6 +2977,7 @@ mod tests {
         let context = ReviewRunContext {
             review_date: day().succ_opt().unwrap(),
             observed_at: at_datetime(19, 0),
+            manual_override: false,
         };
 
         let preflight = review_preflight(context, &due, false);
@@ -2988,6 +3000,7 @@ mod tests {
         let context = ReviewRunContext {
             review_date: day(),
             observed_at: at_datetime(19, 0),
+            manual_override: false,
         };
 
         let preflight = review_preflight(context, &due, true);

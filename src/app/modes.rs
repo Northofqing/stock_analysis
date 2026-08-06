@@ -162,7 +162,13 @@ pub async fn run_chain_analysis_mode(send_notify: bool) -> Result<()> {
     .await?;
 
     let notifier = NotificationService::from_env();
-    let filename = format!("chain_analysis_{}.md", business_date.format("%Y%m%d"));
+    // 文件名带时段: 9:05 盘前 (business_date=昨日) / 15:30 盘后 (当日) / CLI
+    // 各时段独立文件, 避免 9:05 盘前报告覆盖昨日盘后报告 (2026-08-07 接入时间线)。
+    let filename = format!(
+        "chain_analysis_{}_{}.md",
+        business_date.format("%Y%m%d"),
+        chrono::Local::now().format("%H%M")
+    );
     let path = notifier.save_report_to_file(&report, Some(&filename))?;
     info!("产业链联动分析报告已保存: {}", path);
 
