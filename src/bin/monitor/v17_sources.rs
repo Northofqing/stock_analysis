@@ -408,9 +408,7 @@ async fn route_announcements_with_provenance(
             routed
                 .input_dispositions
                 .push(AnnouncementDisposition::FilteredLifecycle);
-            log::info!(
-                "[v17.7][BR-138] announcement normalized route filtered: reason=lifecycle_only"
-            );
+
             continue;
         }
         // BR-138: ordinary announcements that did not match the immutable
@@ -425,9 +423,7 @@ async fn route_announcements_with_provenance(
             routed
                 .input_dispositions
                 .push(AnnouncementDisposition::FilteredClassification);
-            log::info!(
-                "[v17.7][BR-138] announcement normalized route filtered: reason=classification_skip"
-            );
+
             continue;
         }
         let event = match classify_announcement_with_provenance(announcement, observed_at, source) {
@@ -447,9 +443,7 @@ async fn route_announcements_with_provenance(
             routed
                 .input_dispositions
                 .push(AnnouncementDisposition::FilteredAudience);
-            log::info!(
-                "[v17.7][BR-138] announcement normalized route filtered: reason=outside_monitored_universe"
-            );
+
             continue;
         }
         // BR-224: 同一公告一天内只投递一次。上游 `market_announcements` 每轮
@@ -474,9 +468,6 @@ async fn route_announcements_with_provenance(
                 routed
                     .input_dispositions
                     .push(AnnouncementDisposition::FilteredDuplicate);
-                log::info!(
-                    "[v17.7][BR-224] announcement normalized route filtered: reason=already_delivered_today"
-                );
                 continue;
             }
             DedupClaim::Unavailable => {
@@ -516,6 +507,35 @@ async fn route_announcements_with_provenance(
         announcements.len(),
         "BR-137 every provider input must have one disposition"
     );
+    // BR-226: 每轮聚合摘要, 替代逐条 INFO (噪音治理)
+    {
+        let mut lifecycle = 0usize;
+        let mut classification = 0usize;
+        let mut audience = 0usize;
+        let mut duplicate = 0usize;
+        let mut failed = 0usize;
+        let mut pushed = 0usize;
+        for disposition in &routed.input_dispositions {
+            match disposition {
+                AnnouncementDisposition::FilteredLifecycle => lifecycle += 1,
+                AnnouncementDisposition::FilteredClassification => classification += 1,
+                AnnouncementDisposition::FilteredAudience => audience += 1,
+                AnnouncementDisposition::FilteredDuplicate => duplicate += 1,
+                AnnouncementDisposition::Failed => failed += 1,
+                AnnouncementDisposition::Pushed => pushed += 1,
+            }
+        }
+        log::info!(
+            "[v17.7][BR-226] 公告过滤摘要: 共 {} 条 | 生命周期 {} / 分类跳过 {} / 范围外 {} / 重复 {} / 失败 {} / 推送 {}",
+            announcements.len(),
+            lifecycle,
+            classification,
+            audience,
+            duplicate,
+            failed,
+            pushed
+        );
+    }
     routed
 }
 
