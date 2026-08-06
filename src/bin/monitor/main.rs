@@ -5699,14 +5699,62 @@ fn post_close_analysis_window_open(now: chrono::NaiveDateTime) -> bool {
 fn load_announcement_audience_codes(
     registered_watch_codes: &std::collections::HashSet<String>,
 ) -> (std::collections::HashSet<String>, Option<String>) {
-    // BR-138: `stock_position` is a mutable local simulation/projection table.
-    // Its `updated_at` changes during local return refreshes and is not broker
-    // source evidence. Until a broker position batch carries immutable provider,
-    // batch identity, and source time, positions are explicitly unavailable.
-    let audience = validate_announcement_watch_codes(registered_watch_codes).and_then(|_| {
-        Err("BR-138 verified broker position batch unavailable; local projection updated_at is not source evidence".to_string())
-    });
-    isolate_announcement_position_failure(audience, registered_watch_codes)
+    // BR-226: 券商未接入时, 用户每日确认的持仓快照
+    // (append-only + 不可变 snapshot_id + evidence_sha256 + 用户确认时间)
+    // 作为持仓受众证据, 24 小时新鲜度 (用户每日提供)。不满足条件时
+    // 回退到自选受众并显式声明 (BR-138 保持 fail-closed)。
+    use stock_analysis::database::user_position_snapshot::latest_user_position_snapshot;
+    let snapshot = match latest_user_position_snapshot() {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            return (
+                registered_watch_codes.clone(),
+                Some(
+                    "BR-226 user position snapshot not provided; excluded from announcement audience"
+                        .to_string(),
+                ),
+            );
+        }
+        Err(error) => {
+            return (
+                registered_watch_codes.clone(),
+                Some(format!(
+                    "BR-226 user position snapshot read failed: {error}; excluded from announcement audience"
+                )),
+            );
+        }
+    };
+    let snapshot_local = snapshot.effective_at.with_timezone(&chrono::Local);
+    let age_hours = chrono::Local::now().signed_duration_since(snapshot_local).num_hours();
+    if age_hours > 24 {
+        return (
+            registered_watch_codes.clone(),
+            Some(format!(
+                "BR-226 user position snapshot stale (effective_at {}, {age_hours}h ago); excluded from announcement audience",
+                snapshot.effective_at
+            )),
+        );
+    }
+    if snapshot.confirm_empty {
+        return (
+            registered_watch_codes.clone(),
+            Some(
+                "BR-226 user position snapshot confirms empty; excluded from announcement audience"
+                    .to_string(),
+            ),
+        );
+    }
+    let mut audience: std::collections::HashSet<String> =
+        snapshot.items.iter().map(|item| item.code.clone()).collect();
+    audience.extend(registered_watch_codes.iter().cloned());
+    log::info!(
+        "[NewsMonitor][BR-226] 用户确认持仓快照作为持仓受众: {} 只持仓 + {} 只自选 (snapshot_id={}, effective_at={})",
+        snapshot.items.len(),
+        registered_watch_codes.len(),
+        snapshot.snapshot_id,
+        snapshot.effective_at
+    );
+    (audience, None)
 }
 
 fn isolate_announcement_position_failure(
@@ -5762,9 +5810,33 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
         .unwrap_or(120);
 
     log::info!("[NewsMonitor] 启动（独立窗口，不随价格扫描器静默）");
-    log::warn!(
-        "[NewsMonitor][BR-138] verified broker position batch unavailable at startup; local projection is excluded from announcement audience"
-    );
+    // BR-226: 启动时声明持仓受众证据状态 (用户确认快照 vs 券商批次)
+    match stock_analysis::database::user_position_snapshot::latest_user_position_snapshot() {
+        Ok(Some(snapshot)) => {
+            let age_hours = chrono::Local::now()
+                .signed_duration_since(snapshot.effective_at.with_timezone(&chrono::Local))
+                .num_hours();
+            if age_hours <= 24 {
+                log::info!(
+                    "[NewsMonitor][BR-226] 持仓受众证据: 用户确认快照 ({} 只, effective_at {}, {}h 内)",
+                    snapshot.items.len(),
+                    snapshot.effective_at,
+                    age_hours
+                );
+            } else {
+                log::warn!(
+                    "[NewsMonitor][BR-226] 持仓受众证据过期: 快照 effective_at {} 已 {age_hours}h; 持仓身份排除, 自选受众继续",
+                    snapshot.effective_at
+                );
+            }
+        }
+        Ok(None) => log::warn!(
+            "[NewsMonitor][BR-226] 持仓受众证据缺失: 未提供用户持仓快照; 持仓身份排除, 自选受众继续"
+        ),
+        Err(error) => log::warn!(
+            "[NewsMonitor][BR-226] 持仓受众证据读取失败: {error}; 持仓身份排除, 自选受众继续"
+        ),
+    }
 
     let mut nm = NewsMonitor::new();
 
@@ -9280,13 +9352,14 @@ mod tests_v17_7_announcement_wiring {
     }
 
     #[test]
-    fn br138_fresh_local_projection_timestamp_never_authorizes_real_position_audience() {
+    fn br138_missing_user_snapshot_keeps_watch_audience_and_stays_explicit() {
+        // BR-226: 无券商且无用户确认快照时, 持仓身份显式排除, 自选受众继续
         let watch = std::collections::HashSet::from(["TEST_CODE_WATCH".to_string()]);
         let (audience, warning) = load_announcement_audience_codes(&watch);
         assert_eq!(audience, watch);
         assert!(warning
-            .expect("missing broker position source must remain explicit")
-            .contains("local projection updated_at is not source evidence"));
+            .expect("missing position evidence must remain explicit")
+            .contains("user position snapshot not provided"));
     }
 
     #[test]
