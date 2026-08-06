@@ -296,7 +296,7 @@ impl ReviewDataGateway {
 pub(crate) fn audit_limit_up_projection(
     trading_date: NaiveDate,
     limit_pool: &BatchEvidence,
-    quotes: &BatchEvidence,
+    names: &[BatchEvidence],
     record_count: usize,
 ) -> Result<crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt, GatewayError> {
     use crate::database::data_acquisition_audit::DataAcquisitionAuditRecord;
@@ -312,7 +312,7 @@ pub(crate) fn audit_limit_up_projection(
         )
     })?;
     let canonical_evidence =
-        canonical_limit_up_projection_evidence(trading_date, limit_pool, quotes, record_count)?;
+        canonical_limit_up_projection_evidence(trading_date, limit_pool, names, record_count)?;
     let request_hash = acquisition_request_hash(CAPABILITY, &canonical_evidence);
     let batch_id = format!("BR-213:{request_hash}");
     let source_at = trading_date.format("%Y-%m-%d").to_string();
@@ -328,7 +328,7 @@ pub(crate) fn audit_limit_up_projection(
         observed_at: &observed_at,
         batch_id: Some(&batch_id),
         outcome: "available",
-        request_count: 2,
+        request_count: 1 + i64::try_from(names.len()).unwrap_or(i64::MAX),
         accepted_count,
         rejected_count: 0,
         reason_code: "exact_batch_join_accepted",
@@ -379,7 +379,9 @@ struct CanonicalLimitUpProjectionEvidence<'a> {
     trading_date: &'a str,
     record_count: usize,
     limit_pool: CanonicalProjectionBatchEvidence<'a>,
-    quotes: CanonicalProjectionBatchEvidence<'a>,
+    /// BR-221: one entry per acquisition shard, in acquisition order. Shard
+    /// evidence is retained separately and never merged into one identity.
+    names: Vec<CanonicalProjectionBatchEvidence<'a>>,
 }
 
 /// A struct-backed JSON document gives each value an explicit field boundary;
@@ -389,17 +391,17 @@ struct CanonicalLimitUpProjectionEvidence<'a> {
 fn canonical_limit_up_projection_evidence(
     trading_date: NaiveDate,
     limit_pool: &BatchEvidence,
-    quotes: &BatchEvidence,
+    names: &[BatchEvidence],
     record_count: usize,
 ) -> Result<String, GatewayError> {
     const CAPABILITY: &str = "BR-213-UpperLimitProjection";
     let trading_date = trading_date.format("%Y-%m-%d").to_string();
     serde_json::to_string(&CanonicalLimitUpProjectionEvidence {
-        schema: "BR213_LIMIT_UP_PROJECTION_V1",
+        schema: "BR213_LIMIT_UP_PROJECTION_V2",
         trading_date: &trading_date,
         record_count,
         limit_pool: limit_pool.into(),
-        quotes: quotes.into(),
+        names: names.iter().map(Into::into).collect(),
     })
     .map_err(|error| {
         GatewayError::audit_failure(
@@ -1203,10 +1205,15 @@ mod tests {
         let mut quotes = evidence(ProviderId::Tencent, "TEST_CODE_quote_batch");
         quotes.source = "TEST_CODE_quote_source".to_string();
 
-        let canonical =
-            canonical_limit_up_projection_evidence(date, &limit_pool, &quotes, 1).unwrap();
+        let canonical = canonical_limit_up_projection_evidence(
+            date,
+            &limit_pool,
+            std::slice::from_ref(&quotes),
+            1,
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&canonical).unwrap();
-        assert_eq!(parsed["schema"], "BR213_LIMIT_UP_PROJECTION_V1");
+        assert_eq!(parsed["schema"], "BR213_LIMIT_UP_PROJECTION_V2");
         assert_eq!(
             parsed["limit_pool"]["batch_id"],
             "TEST_CODE_batch|quote_source=x"
@@ -1219,9 +1226,13 @@ mod tests {
         let mut different_limit_pool = limit_pool.clone();
         different_limit_pool.source = "TEST_CODE_source".to_string();
         different_limit_pool.batch_id = "TEST_CODE_batch|quote_source=x|quote_batch=y".to_string();
-        let different =
-            canonical_limit_up_projection_evidence(date, &different_limit_pool, &quotes, 1)
-                .unwrap();
+        let different = canonical_limit_up_projection_evidence(
+            date,
+            &different_limit_pool,
+            std::slice::from_ref(&quotes),
+            1,
+        )
+        .unwrap();
         assert_ne!(canonical, different);
         assert_ne!(
             acquisition_request_hash("BR-213-UpperLimitProjection", &canonical),
@@ -1236,12 +1247,18 @@ mod tests {
         let date = NaiveDate::from_ymd_opt(2099, 1, 2).unwrap();
         let limit_pool = evidence(ProviderId::Eastmoney, "TEST_CODE_limit_batch");
         let quotes = evidence(ProviderId::Tencent, "TEST_CODE_quote_batch");
-        let canonical =
-            canonical_limit_up_projection_evidence(date, &limit_pool, &quotes, 2).unwrap();
+        let canonical = canonical_limit_up_projection_evidence(
+            date,
+            &limit_pool,
+            std::slice::from_ref(&quotes),
+            2,
+        )
+        .unwrap();
         let expected_hash = acquisition_request_hash("BR-213-UpperLimitProjection", &canonical);
 
-        let receipt = audit_limit_up_projection(date, &limit_pool, &quotes, 2)
-            .expect("TEST_CODE canonical composition audit");
+        let receipt =
+            audit_limit_up_projection(date, &limit_pool, std::slice::from_ref(&quotes), 2)
+                .expect("TEST_CODE canonical composition audit");
         let mut connection = DatabaseManager::get().get_conn().unwrap();
         let row = diesel::sql_query(
             "SELECT source, request_hash, batch_id FROM data_acquisition_audit WHERE id = ?",

@@ -354,8 +354,10 @@ mod tests {
         }
     }
 
-    /// BR-220: display names now arrive as a daily `SecurityIdentity` batch.
-    fn identity_batch(rows: &[(&str, &str)]) -> GatewayBatch<MarketSecurityIdentity> {
+    /// BR-220: display names now arrive as daily `SecurityIdentity` shards.
+    /// BR-221: the projection consumes `Vec<GatewayBatch<...>>` (one entry per
+    /// acquisition shard, retained separately), so tests build shards too.
+    fn identity_batches(rows: &[(&str, &str)]) -> Vec<GatewayBatch<MarketSecurityIdentity>> {
         let source_at = DateTime::parse_from_rfc3339(TEST_DATE_TIME)
             .unwrap()
             .with_timezone(&Utc);
@@ -381,10 +383,10 @@ mod tests {
                 batch_id: "TEST_CODE_identity_batch".to_owned(),
             })
             .collect();
-        GatewayBatch::Available {
+        vec![GatewayBatch::Available {
             records,
             evidence: batch_evidence,
-        }
+        }]
     }
 
     fn available_limit_pool(
@@ -407,7 +409,7 @@ mod tests {
         );
         let batch = compose_limit_up_batch(
             GatewayBatch::VerifiedEmpty(limit_pool_evidence.clone()),
-            |_| -> std::result::Result<GatewayBatch<MarketSecurityIdentity>, GatewayError> {
+            |_| -> std::result::Result<Vec<GatewayBatch<MarketSecurityIdentity>>, GatewayError> {
                 quote_load_calls.set(quote_load_calls.get() + 1);
                 unreachable!("verified-empty limit pool must not request display names")
             },
@@ -430,7 +432,7 @@ mod tests {
                 vec![limit_entry("TEST_CODE_600001", batch_id, 12.34, 10.0)],
                 batch_id,
             ),
-            |_| Ok(identity_batch(&[("TEST_CODE_600001", "TEST_CODE Name")])),
+            |_| Ok(identity_batches(&[("TEST_CODE_600001", "TEST_CODE Name")])),
         )
         .unwrap();
         let LimitUpStockBatch::Available {
@@ -450,7 +452,8 @@ mod tests {
         assert_eq!(stocks[0].volume_ratio, None);
         assert_eq!(stocks[0].main_net_yi, None);
         assert_eq!(limit_pool_evidence.batch_id, batch_id);
-        assert_eq!(name_evidence.batch_id, "TEST_CODE_identity_batch");
+        assert_eq!(name_evidence.len(), 1);
+        assert_eq!(name_evidence[0].batch_id, "TEST_CODE_identity_batch");
     }
 
     #[test]
@@ -478,7 +481,7 @@ mod tests {
                 ("TEST_CODE_600001", "TEST_CODE Duplicate"),
             ],
         ] {
-            assert!(compose_limit_up_batch(pool(), |_| Ok(identity_batch(&rows))).is_err());
+            assert!(compose_limit_up_batch(pool(), |_| Ok(identity_batches(&rows))).is_err());
         }
     }
 
@@ -493,7 +496,7 @@ mod tests {
                 .unwrap();
 
         let error = compose_limit_up_batch(available_limit_pool(vec![record], batch_id), |_| {
-            Ok(identity_batch(&[("TEST_CODE_600001", "TEST_CODE Name")]))
+            Ok(identity_batches(&[("TEST_CODE_600001", "TEST_CODE Name")]))
         })
         .expect_err("conflicting record observed_at must reject the projection");
 
