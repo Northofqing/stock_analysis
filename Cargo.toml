@@ -48,20 +48,20 @@ lettre = { version = "0.11.19", features = ["smtp-transport", "sendmail-transpor
 clap = { version = "4.5.54", features = ["derive"] }
 # BR-164: every public market/news provider is resolved from one immutable
 # upstream release commit. Do not mix path/crates.io/Git revisions.
-magic-tdx-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "7b870ee25e59f250ba847922ffa3d34cdd07e674", version = "=0.2.0" }
-magic-market-core = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "7b870ee25e59f250ba847922ffa3d34cdd07e674", version = "=0.2.0" }
-magic-market-router = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "7b870ee25e59f250ba847922ffa3d34cdd07e674", version = "=0.2.0" }
-magic-market-composition = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "7b870ee25e59f250ba847922ffa3d34cdd07e674", version = "=0.2.0" }
-magic-eastmoney-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "7b870ee25e59f250ba847922ffa3d34cdd07e674", version = "=0.2.0" }
-magic-ths-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "7b870ee25e59f250ba847922ffa3d34cdd07e674", version = "=0.2.0" }
-magic-sina-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "7b870ee25e59f250ba847922ffa3d34cdd07e674", version = "=0.2.0" }
-magic-cninfo-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "7b870ee25e59f250ba847922ffa3d34cdd07e674", version = "=0.2.0" }
-magic-tencent-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "7b870ee25e59f250ba847922ffa3d34cdd07e674", version = "=0.2.0" }
-magic-cls-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "7b870ee25e59f250ba847922ffa3d34cdd07e674", version = "=0.2.0" }
-magic-jin10-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "7b870ee25e59f250ba847922ffa3d34cdd07e674", version = "=0.2.0" }
-magic-thepaper-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "7b870ee25e59f250ba847922ffa3d34cdd07e674", version = "=0.2.0" }
-magic-exchange-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "7b870ee25e59f250ba847922ffa3d34cdd07e674", version = "=0.2.0" }
-magic-baidu-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "7b870ee25e59f250ba847922ffa3d34cdd07e674", version = "=0.2.0" }
+magic-tdx-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
+magic-market-core = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
+magic-market-router = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
+magic-market-composition = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
+magic-eastmoney-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
+magic-ths-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
+magic-sina-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
+magic-cninfo-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
+magic-tencent-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
+magic-cls-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
+magic-jin10-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
+magic-thepaper-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
+magic-exchange-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
+magic-baidu-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
 plotters = "0.3"
 futures = "0.3"
 fs2 = "0.4.3"

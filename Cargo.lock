@@ -1150,7 +1150,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1293,7 +1293,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2023,7 +2023,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "system-configuration 0.7.0",
  "tokio",
  "tower-service",
@@ -2229,7 +2229,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2520,7 +2520,7 @@ dependencies = [
 [[package]]
 name = "magic-baidu-rs"
 version = "0.2.0"
-source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=7b870ee25e59f250ba847922ffa3d34cdd07e674#7b870ee25e59f250ba847922ffa3d34cdd07e674"
+source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e#75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e"
 dependencies = [
  "magic-market-core",
  "serde_json",
@@ -2531,7 +2531,7 @@ dependencies = [
 [[package]]
 name = "magic-cls-rs"
 version = "0.2.0"
-source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=7b870ee25e59f250ba847922ffa3d34cdd07e674#7b870ee25e59f250ba847922ffa3d34cdd07e674"
+source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e#75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e"
 dependencies = [
  "magic-market-core",
  "md-5",
@@ -2544,7 +2544,7 @@ dependencies = [
 [[package]]
 name = "magic-cninfo-rs"
 version = "0.2.0"
-source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=7b870ee25e59f250ba847922ffa3d34cdd07e674#7b870ee25e59f250ba847922ffa3d34cdd07e674"
+source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e#75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e"
 dependencies = [
  "magic-market-core",
  "serde",
@@ -2557,7 +2557,7 @@ dependencies = [
 [[package]]
 name = "magic-eastmoney-rs"
 version = "0.2.0"
-source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=7b870ee25e59f250ba847922ffa3d34cdd07e674#7b870ee25e59f250ba847922ffa3d34cdd07e674"
+source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e#75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e"
 dependencies = [
  "magic-market-core",
  "ring",
@@ -2570,7 +2570,7 @@ dependencies = [
 [[package]]
 name = "magic-exchange-rs"
 version = "0.2.0"
-source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=7b870ee25e59f250ba847922ffa3d34cdd07e674#7b870ee25e59f250ba847922ffa3d34cdd07e674"
+source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e#75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e"
 dependencies = [
  "magic-market-core",
  "magic-market-transport",
@@ -2584,7 +2584,7 @@ dependencies = [
 [[package]]
 name = "magic-jin10-rs"
 version = "0.2.0"
-source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=7b870ee25e59f250ba847922ffa3d34cdd07e674#7b870ee25e59f250ba847922ffa3d34cdd07e674"
+source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e#75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e"
 dependencies = [
  "magic-market-core",
  "serde_json",
@@ -2595,7 +2595,7 @@ dependencies = [
 [[package]]
 name = "magic-market-composition"
 version = "0.2.0"
-source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=7b870ee25e59f250ba847922ffa3d34cdd07e674#7b870ee25e59f250ba847922ffa3d34cdd07e674"
+source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e#75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e"
 dependencies = [
  "magic-eastmoney-rs",
  "magic-market-core",
@@ -2607,7 +2607,7 @@ dependencies = [
 [[package]]
 name = "magic-market-core"
 version = "0.2.0"
-source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=7b870ee25e59f250ba847922ffa3d34cdd07e674#7b870ee25e59f250ba847922ffa3d34cdd07e674"
+source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e#75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -2616,7 +2616,7 @@ dependencies = [
 [[package]]
 name = "magic-market-router"
 version = "0.2.0"
-source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=7b870ee25e59f250ba847922ffa3d34cdd07e674#7b870ee25e59f250ba847922ffa3d34cdd07e674"
+source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e#75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e"
 dependencies = [
  "magic-market-core",
  "thiserror 2.0.18",
@@ -2625,7 +2625,7 @@ dependencies = [
 [[package]]
 name = "magic-market-transport"
 version = "0.2.0"
-source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=7b870ee25e59f250ba847922ffa3d34cdd07e674#7b870ee25e59f250ba847922ffa3d34cdd07e674"
+source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e#75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e"
 dependencies = [
  "reqwest 0.13.4",
  "rustls 0.23.42",
@@ -2636,7 +2636,7 @@ dependencies = [
 [[package]]
 name = "magic-sina-rs"
 version = "0.2.0"
-source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=7b870ee25e59f250ba847922ffa3d34cdd07e674#7b870ee25e59f250ba847922ffa3d34cdd07e674"
+source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e#75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e"
 dependencies = [
  "encoding_rs",
  "magic-market-core",
@@ -2650,7 +2650,7 @@ dependencies = [
 [[package]]
 name = "magic-tdx-rs"
 version = "0.2.0"
-source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=7b870ee25e59f250ba847922ffa3d34cdd07e674#7b870ee25e59f250ba847922ffa3d34cdd07e674"
+source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e#75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e"
 dependencies = [
  "crc32fast",
  "encoding_rs",
@@ -2666,7 +2666,7 @@ dependencies = [
 [[package]]
 name = "magic-tencent-rs"
 version = "0.2.0"
-source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=7b870ee25e59f250ba847922ffa3d34cdd07e674#7b870ee25e59f250ba847922ffa3d34cdd07e674"
+source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e#75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e"
 dependencies = [
  "encoding_rs",
  "magic-market-core",
@@ -2678,7 +2678,7 @@ dependencies = [
 [[package]]
 name = "magic-thepaper-rs"
 version = "0.2.0"
-source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=7b870ee25e59f250ba847922ffa3d34cdd07e674#7b870ee25e59f250ba847922ffa3d34cdd07e674"
+source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e#75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e"
 dependencies = [
  "magic-market-core",
  "serde_json",
@@ -2689,7 +2689,7 @@ dependencies = [
 [[package]]
 name = "magic-ths-rs"
 version = "0.2.0"
-source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=7b870ee25e59f250ba847922ffa3d34cdd07e674#7b870ee25e59f250ba847922ffa3d34cdd07e674"
+source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e#75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e"
 dependencies = [
  "encoding_rs",
  "magic-market-core",
@@ -3917,7 +3917,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.42",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3955,9 +3955,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4448,7 +4448,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4539,7 +4539,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5175,7 +5175,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5889,7 +5889,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
