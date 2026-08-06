@@ -900,26 +900,45 @@ pub fn fetch_magic_tdx_t0_batch(
         .get_security_quotes(&request)
         .map_err(|error| anyhow!("magic-tdx T0 quote batch failed: {error}"))?;
     validate_quote_identities(&identities, &quotes)?;
-    let mut quote_times = Vec::with_capacity(quotes.len());
+    // BR-230: quote source_time 逐代码隔离 — 单只 quote 缺 servertime
+    // (上游 magic-tdx-rs 契约缺口) 只跳过该代码 (显式 rejection),
+    // 不再整批失败; 批次 source_at = 有效 quote 的最小值。
+    let mut quote_times: Vec<(String, DateTime<Utc>)> = Vec::with_capacity(quotes.len());
+    let mut quote_rejections = Vec::new();
     let quote_observed_at = Utc::now();
-    for quote in &quotes {
-        quote_times.push(
-            source_time(&quote.servertime, quote_observed_at)
-                .map_err(|error| anyhow!("{} {}", error.reason_code, error.detail))?,
-        );
+    for (identity, quote) in identities.iter().zip(&quotes) {
+        match source_time(&quote.servertime, quote_observed_at) {
+            Ok(time) => quote_times.push((identity.instrument.code().to_string(), time)),
+            Err(mut error) => {
+                error.code = identity.instrument.code().to_string();
+                quote_rejections.push(error);
+            }
+        }
     }
     let source_at = quote_times
-        .into_iter()
+        .iter()
+        .map(|(_, time)| *time)
         .min()
-        .ok_or_else(|| anyhow!("magic-tdx T0 quote batch empty"))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "magic-tdx T0 quote batch has no valid source time: all quotes lack server time ({} codes rejected)",
+                quote_rejections.len()
+            )
+        })?;
+    let skip_codes: std::collections::HashSet<String> =
+        quote_rejections.iter().map(|rejection| rejection.code.clone()).collect();
     let mut records = Vec::new();
     let mut rejections = Vec::new();
     for (identity, quote) in identities.iter().zip(quotes) {
+        if skip_codes.contains(identity.instrument.code()) {
+            continue;
+        }
         match evidence_for_quote(&client, identity, quote, requested_at) {
             Ok(record) => records.push(record),
             Err(error) => rejections.push(error),
         }
     }
+    rejections.extend(quote_rejections);
     let observed_at = Utc::now();
     finalize_t0_batch(
         requested_at,
