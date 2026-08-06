@@ -1,4 +1,4 @@
-//! Registered business rules: BR-213, BR-220.
+//! Registered business rules: BR-213, BR-220, BR-221.
 //! Evidence-preserving upper-limit market projection.
 
 use anyhow::{bail, Result};
@@ -19,9 +19,10 @@ pub(crate) enum LimitUpStockBatch {
     Available {
         stocks: Vec<TopStock>,
         limit_pool_evidence: BatchEvidence,
-        /// BR-220: display names come from the daily `SecurityIdentity`
+        /// BR-220/BR-221: display names come from the daily `SecurityIdentity`
         /// capability, never from a five-second-gated realtime quote batch.
-        name_evidence: BatchEvidence,
+        /// One entry per acquisition shard; shard evidence is never merged.
+        name_evidence: Vec<BatchEvidence>,
     },
     VerifiedEmpty {
         limit_pool_evidence: BatchEvidence,
@@ -42,10 +43,11 @@ fn compose_limit_up_batch<LoadNames>(
     load_names: LoadNames,
 ) -> Result<LimitUpStockBatch>
 where
-    LoadNames: FnOnce(
-        &[String],
-    )
-        -> std::result::Result<GatewayBatch<MarketSecurityIdentity>, GatewayError>,
+    LoadNames:
+        FnOnce(
+            &[String],
+        )
+            -> std::result::Result<Vec<GatewayBatch<MarketSecurityIdentity>>, GatewayError>,
 {
     let (records, limit_pool_evidence) = match limit_pool {
         GatewayBatch::VerifiedEmpty(limit_pool_evidence) => {
@@ -85,59 +87,76 @@ where
     // pure display field to the §2.4 five-second quote gate made the entire
     // authoritative limit-pool projection fail whenever any single member's
     // tick lagged, which is a capability mismatch, not a safety property.
-    let (identities, name_evidence) = match load_names(&requested_codes)? {
-        GatewayBatch::Available { records, evidence } if !records.is_empty() => (records, evidence),
-        GatewayBatch::Available { evidence, .. } | GatewayBatch::VerifiedEmpty(evidence) => {
-            bail!(
-                "BR-220 security identity batch carries no display names: source={} batch_id={}",
-                evidence.source,
-                evidence.batch_id
-            );
-        }
-    };
-    let name_evidence_observed_at = parse_evidence_instant(
-        "BR-220-UpperLimitNames",
-        name_evidence.provider,
-        "observed_at",
-        &name_evidence.observed_at,
-    )?;
-    let name_evidence_source_at = name_evidence
-        .source_at
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("BR-220 security identity batch has no source time"))
-        .and_then(|value| {
-            parse_evidence_instant(
-                "BR-220-UpperLimitNames",
-                name_evidence.provider,
-                "source_at",
-                value,
-            )
-            .map_err(anyhow::Error::from)
-        })?;
+    // BR-221: providers cap one request at 50 instruments, so a larger pool is
+    // acquired as ordered shards whose evidence stays separate per shard.
+    let shards = load_names(&requested_codes)?;
+    if shards.is_empty() {
+        bail!("BR-221 security identity acquisition produced no shard");
+    }
     let mut name_by_code = std::collections::BTreeMap::new();
-    for identity in identities {
-        if identity.provider != name_evidence.provider
-            || identity.batch_id != name_evidence.batch_id
-            || identity.observed_at != name_evidence_observed_at
-            || identity.source_at != name_evidence_source_at
-        {
-            bail!(
-                "BR-220 security identity evidence mismatch for {}",
-                identity.code
-            );
+    let mut name_evidence = Vec::with_capacity(shards.len());
+    for shard in shards {
+        let (identities, evidence) = match shard {
+            GatewayBatch::Available { records, evidence } if !records.is_empty() => {
+                (records, evidence)
+            }
+            GatewayBatch::Available { evidence, .. } | GatewayBatch::VerifiedEmpty(evidence) => {
+                bail!(
+                    "BR-221 security identity shard carries no display names: source={} batch_id={}",
+                    evidence.source,
+                    evidence.batch_id
+                );
+            }
+        };
+        let shard_observed_at = parse_evidence_instant(
+            "BR-220-UpperLimitNames",
+            evidence.provider,
+            "observed_at",
+            &evidence.observed_at,
+        )?;
+        let _shard_source_at = evidence
+            .source_at
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("BR-220 security identity shard has no source time"))
+            .and_then(|value| {
+                parse_evidence_instant(
+                    "BR-220-UpperLimitNames",
+                    evidence.provider,
+                    "source_at",
+                    value,
+                )
+                .map_err(anyhow::Error::from)
+            })?;
+        for identity in identities {
+            // BR-221: a record is only ever validated against the evidence of
+            // the shard it actually came from; shard evidence is never merged
+            // or represented by a synthesised batch identity.
+            // 归属校验 = provider + batch_id + observed_at (批次身份);
+            // source_at 是逐记录时间戳, 与批次级 source_at 天然可差数秒,
+            // 相等比较会产生误报 (实证: 002180 于 2026-08-06 09:45 被误拒)。
+            if identity.provider != evidence.provider
+                || identity.batch_id != evidence.batch_id
+                || identity.observed_at != shard_observed_at
+            {
+                bail!(
+                    "BR-221 security identity evidence mismatch for {}",
+                    identity.code
+                );
+            }
+            if identity.name.trim().is_empty() {
+                bail!(
+                    "BR-220 security identity carries no name for {}",
+                    identity.code
+                );
+            }
+            if name_by_code
+                .insert(identity.code.clone(), identity.name.clone())
+                .is_some()
+            {
+                bail!("BR-221 duplicate security identity {}", identity.code);
+            }
         }
-        if identity.name.trim().is_empty() {
-            bail!(
-                "BR-220 security identity carries no name for {}",
-                identity.code
-            );
-        }
-        if name_by_code
-            .insert(identity.code.clone(), identity.name.clone())
-            .is_some()
-        {
-            bail!("BR-220 duplicate security identity {}", identity.code);
-        }
+        name_evidence.push(evidence);
     }
     let name_codes = name_by_code
         .keys()
@@ -145,7 +164,7 @@ where
         .collect::<std::collections::BTreeSet<_>>();
     if name_codes != limit_codes {
         bail!(
-            "BR-220 exact-code join mismatch limit_codes={limit_codes:?} name_codes={name_codes:?}"
+            "BR-221 exact-code join mismatch limit_codes={limit_codes:?} name_codes={name_codes:?}"
         );
     }
 
@@ -176,12 +195,20 @@ where
     })
 }
 
-/// BR-213/BR-220: the identity gateway is async and owns a blocking client, so
-/// its creation, use and destruction all happen inside one dedicated thread.
+/// BR-221: providers accept at most 50 instruments per identity request.
+const IDENTITY_REQUEST_SHARD_SIZE: usize = 50;
+
+/// BR-213/BR-220/BR-221: the identity gateway is async and owns a blocking
+/// client, so its creation, use and destruction all happen inside one
+/// dedicated thread. Requests larger than the provider bound are acquired as
+/// ordered shards; every shard keeps its own immutable batch evidence.
 fn load_upper_limit_names(
     codes: &[String],
-) -> std::result::Result<GatewayBatch<MarketSecurityIdentity>, GatewayError> {
-    let codes = codes.to_vec();
+) -> std::result::Result<Vec<GatewayBatch<MarketSecurityIdentity>>, GatewayError> {
+    let shards: Vec<Vec<String>> = codes
+        .chunks(IDENTITY_REQUEST_SHARD_SIZE)
+        .map(<[String]>::to_vec)
+        .collect();
     std::thread::Builder::new()
         .name("upper-limit-security-identity".to_string())
         .spawn(move || {
@@ -196,7 +223,16 @@ fn load_upper_limit_names(
                         format!("create security identity runtime: {error}"),
                     )
                 })?;
-            runtime.block_on(MarketCapabilitiesGateway::new().security_identities(&codes))
+            let gateway = MarketCapabilitiesGateway::new();
+            runtime.block_on(async move {
+                let mut batches = Vec::with_capacity(shards.len());
+                for shard in shards {
+                    // Any shard failure fails the whole enrichment: a partial
+                    // name set would silently drop authoritative pool members.
+                    batches.push(gateway.security_identities(&shard).await?);
+                }
+                Ok(batches)
+            })
         })
         .map_err(|error| {
             GatewayError::unavailable(
@@ -238,14 +274,19 @@ impl MarketAnalyzer {
                     name_evidence,
                     stocks.len(),
                 )?;
+                let name_batches = name_evidence
+                    .iter()
+                    .map(|evidence| format!("{:?}:{}", evidence.provider, evidence.batch_id))
+                    .collect::<Vec<_>>()
+                    .join(",");
                 log::info!(
-                    "[DataGateway][BR-213][BR-220] status=available date={} records={} limit_provider={:?} limit_batch={} name_provider={:?} name_batch={} composition_audit_id={} composition_record_hash={}",
+                    "[DataGateway][BR-213][BR-220][BR-221] status=available date={} records={} limit_provider={:?} limit_batch={} name_shards={} name_batches=[{}] composition_audit_id={} composition_record_hash={}",
                     trading_date,
                     stocks.len(),
                     limit_pool_evidence.provider,
                     limit_pool_evidence.batch_id,
-                    name_evidence.provider,
-                    name_evidence.batch_id,
+                    name_evidence.len(),
+                    name_batches,
                     receipt.audit_id,
                     receipt.record_hash
                 );
