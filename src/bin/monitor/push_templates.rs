@@ -14260,8 +14260,9 @@ pub fn build_test_template_catalog(
     use stock_analysis::market_analyzer::sector_monitor::{
         AnomalyReason, ConceptBoard, UnexplainedMove,
     };
+    use stock_analysis::monitor::detector::{AlertCategory, AlertDetail, AlertEvent, AlertLevel};
 
-    const EXPECTED_CATALOG_TOTAL: usize = 52;
+    const EXPECTED_CATALOG_TOTAL: usize = 53;
     let banner = BannerCtx {
         account_mode: AccountMode::Normal,
         total_pos: Some(0),
@@ -14348,6 +14349,32 @@ pub fn build_test_template_catalog(
                 avail: 500,
             },
         ),
+    );
+    push(
+        // 2026-08-07: T-04B 盘中指标告警 (BR-192 收尾) fixture。
+        "T-04B-intraday-alert",
+        render_intraday_alert(&AlertEvent {
+            level: AlertLevel::Important,
+            category: AlertCategory::MainInflow,
+            code: "TEST_CODE_000001".to_string(),
+            name: "TEST_CODE 平安银行".to_string(),
+            message: "TEST_CODE 主力净流入 1.2 亿".to_string(),
+            detail: AlertDetail {
+                price: Some(10.5),
+                change_pct: Some(2.3),
+                volume_ratio: Some(3.2),
+                main_flow_yi: Some(1.2),
+                threshold: None,
+                news_title: None,
+                news_summary: None,
+                news_importance: None,
+                ai_decision: None,
+                t1_locked: false,
+                extra: Some("TEST_CODE 主力排名 3/50".to_string()),
+            },
+            triggered_at: chrono::Local::now(),
+            routed_external_id: None,
+        }),
     );
 
     let t0_plan = T0StructuredPlan {
