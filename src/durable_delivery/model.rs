@@ -174,10 +174,12 @@ pub enum PushKind {
     EventCalendar,
     DailyReport,
     ReviewProviderTopN,
+    SectorTop,
+    SectorAnomaly,
 }
 
 impl PushKind {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 17] = [
         Self::HoldingPlan,
         Self::HoldingEvent,
         Self::T0Advice,
@@ -193,6 +195,8 @@ impl PushKind {
         Self::EventCalendar,
         Self::DailyReport,
         Self::ReviewProviderTopN,
+        Self::SectorTop,
+        Self::SectorAnomaly,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -212,6 +216,8 @@ impl PushKind {
             Self::EventCalendar => "EventCalendar",
             Self::DailyReport => "DailyReport",
             Self::ReviewProviderTopN => "ReviewProviderTopN",
+            Self::SectorTop => "SectorTop",
+            Self::SectorAnomaly => "SectorAnomaly",
         }
     }
 
@@ -232,6 +238,8 @@ impl PushKind {
             Self::EventCalendar => "event_calendar_v1",
             Self::DailyReport => "daily_report_v1",
             Self::ReviewProviderTopN => "review_provider_top_n_v1",
+            Self::SectorTop => "sector_top_v1",
+            Self::SectorAnomaly => "sector_anomaly_v1",
         }
     }
 
@@ -389,6 +397,9 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         (ReviewFailure, Global, Some(86_400), BusinessDateOnce),
         (TomorrowWatch, Global, Some(86_400), Rolling),
         (EventCalendar, Global, Some(86_400), Rolling),
+        // 2026-08-07: I-09/I-09A 板块参考类升级 counted — 当日一次。
+        (SectorTop, Global, Some(86_400), BusinessDateOnce),
+        (SectorAnomaly, Global, Some(86_400), BusinessDateOnce),
     ]
     .into_iter()
     .map(

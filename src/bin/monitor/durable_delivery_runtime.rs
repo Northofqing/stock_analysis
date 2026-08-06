@@ -1460,6 +1460,10 @@ fn durable_kind_and_sub_kind_with_override(
         K::TomorrowWatch => (D::TomorrowWatch, DeliverySubKind::None),
         K::EventCalendar => (D::EventCalendar, DeliverySubKind::None),
         K::ReviewProviderTopN => (D::ReviewProviderTopN, DeliverySubKind::None),
+        // 2026-08-07 用户决策: I-09 板块 TOP / I-09A 量价反向升级 counted
+        // (板块级全局事件, scope=Global, origin=InternalDurable)。
+        K::SectorTop => (D::SectorTop, DeliverySubKind::None),
+        K::SectorAnomaly => (D::SectorAnomaly, DeliverySubKind::None),
         K::FactorIC => (D::DailyReport, DeliverySubKind::FactorIC),
         K::SectorTier => (D::DailyReport, DeliverySubKind::SectorTier),
         K::CapitalVerify => (D::DailyReport, DeliverySubKind::CapitalVerify),

@@ -12948,16 +12948,61 @@ pub async fn push_sector_anomaly(
         return false;
     }
     let text = render_sector_anomaly(hhmm, moves);
-    dispatch_registered_outcome!(
+    // 2026-08-07 用户决策: I-09A 升级 counted — 板块级全局事件,
+    // occurrence=sector-anomaly:{date}, scope=Global, InternalDurable。
+    push_sector_anomaly_counted(hhmm, moves, &text).await.is_pushed()
+}
+
+/// I-09A counted 投递 (SectorAnomaly 白名单, 2026-08-07)。
+async fn push_sector_anomaly_counted(
+    _hhmm: &str,
+    moves: &[stock_analysis::market_analyzer::sector_monitor::UnexplainedMove],
+    text: &str,
+) -> crate::notify::PushOutcome {
+    use sha2::{Digest, Sha256};
+
+    let business_date = chrono::Local::now().date_naive();
+    let canonical = serde_json::json!({
+        "moves": moves.iter().map(|m| {
+            serde_json::json!({
+                "board": m.board.name,
+                "change_pct": m.board.change_pct,
+                "main_inflow_yi": m.board.main_inflow / 1e8,
+            })
+        }).collect::<Vec<_>>(),
+        "observed_at": chrono::Local::now().to_rfc3339(),
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    let binding = match crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("sector-anomaly:{business_date}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        true,
+    ) {
+        Ok(binding) => binding,
+        Err(error) => {
+            log::error!("[I-09A] counted binding 构造失败: {error}");
+            return crate::notify::PushOutcome::Denied("sector_anomaly_binding_failed".to_owned());
+        }
+    };
+    let token = match crate::presentation_registry::acquire_token(
         "I-09-sector-anomaly",
         crate::notify::PushKind::SectorAnomaly,
         "sector_anomaly_dispatcher",
         "render_sector_anomaly",
-        "",
-        None,
-        text
-    )
-    .is_pushed()
+    ) {
+        Ok(token) => token,
+        Err(reason) => {
+            log::error!("[I-09A][BR-196] presentation token rejected: {reason}");
+            return crate::notify::PushOutcome::Denied(reason);
+        }
+    };
+    crate::notify::push_counted_with_binding(token, text, None, binding).await
 }
 
 /// v13 §14.2 I-03 盘中涨停扩散 (⚡交易建议类, 带 banner, 审计多发现)
@@ -15054,17 +15099,60 @@ async fn dispatch_sector_top_daily_result(hhmm: &str) -> PeriodicDispatchResult 
         .map(|b| (b.name.clone(), b.change_pct, b.main_inflow / 1e8))
         .collect();
     let text = render_sector_top(hhmm, &items);
-    let outcome = dispatch_registered_outcome!(
+    // 2026-08-07 用户决策: I-09 升级 counted — 板块级全局事件, occurrence=
+    // sector-top:{date} (当日一次, counted 去重), scope=Global, origin=
+    // InternalDurable (板块排行真实数据为证据)。
+    let outcome = push_sector_top_counted(hhmm, &items, &text).await;
+    log_dispatcher_attempt("I-09", outcome.is_pushed(), items.len(), "");
+    PeriodicDispatchResult::Delivery(outcome)
+}
+
+/// I-09 counted 投递 (SectorTop 白名单, 2026-08-07)。
+async fn push_sector_top_counted(
+    _hhmm: &str,
+    items: &[(String, f64, f64)],
+    text: &str,
+) -> crate::notify::PushOutcome {
+    use sha2::{Digest, Sha256};
+
+    let business_date = chrono::Local::now().date_naive();
+    let canonical = serde_json::json!({
+        "boards": items.iter().map(|(name, chg, inflow)| {
+            serde_json::json!({"name": name, "change_pct": chg, "main_inflow_yi": inflow})
+        }).collect::<Vec<_>>(),
+        "observed_at": chrono::Local::now().to_rfc3339(),
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    let binding = match crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("sector-top:{business_date}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        true,
+    ) {
+        Ok(binding) => binding,
+        Err(error) => {
+            log::error!("[I-09] counted binding 构造失败: {error}");
+            return crate::notify::PushOutcome::Denied("sector_top_binding_failed".to_owned());
+        }
+    };
+    let token = match crate::presentation_registry::acquire_token(
         "I-09-sector-top",
         crate::notify::PushKind::SectorTop,
         "sector_top_dispatcher",
         "render_sector_top",
-        "",
-        None,
-        text
-    );
-    log_dispatcher_attempt("I-09", outcome.is_pushed(), items.len(), "");
-    PeriodicDispatchResult::Delivery(outcome)
+    ) {
+        Ok(token) => token,
+        Err(reason) => {
+            log::error!("[I-09][BR-196] presentation token rejected: {reason}");
+            return crate::notify::PushOutcome::Denied(reason);
+        }
+    };
+    crate::notify::push_counted_with_binding(token, text, None, binding).await
 }
 
 pub async fn dispatch_sector_top_daily(hhmm: &str) -> bool {
