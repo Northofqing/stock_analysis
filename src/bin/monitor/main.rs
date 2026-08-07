@@ -8513,8 +8513,6 @@ async fn monitor_loop() {
                         // ═══════════════════════════════════════════════════════════════
 
                         if last_holding_plan.elapsed().as_secs() >= 1800 {
-                            let hhmm = chrono::Local::now().format("%H:%M").to_string();
-
                             // BR-192 收尾: T-03 真实 counted 投递 (原恒 unavailable)。
                             // 2026-08-07 实测修正: counted identity 是内容级
                             // (文本/证据含价格时间戳, 内容变 → 新决策 → 再推),
