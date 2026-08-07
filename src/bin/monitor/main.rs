@@ -6999,7 +6999,11 @@ async fn monitor_loop() {
             // 调一次 push_account_mode_change 触发 evaluate(), 内部 should_reset_at_8_30
             // (Frozen + 8:30 窗口) → 强制 prev=None → evaluate 重判 → 落库 + 推 T-01.
             // 用 Mutex<Option<NaiveDate>> 防当日重复 (跟 15:05 / 15:30 同 pattern).
-            if now.hour() == 8 && now.minute() == 30 {
+            // 2026-08-07 用户决策 (补偿原则): 错过 8:30 不放弃 — 条件放宽为
+            // "本地时间 >= 8:30 且当日未跑" (含启动时补偿: 8:30 后启动会立即
+            // 补做当日重置)。8:30 之前启动时仍需等到 8:30 (重置语义依赖
+            // 盘前窗口)。仅约束: 当日一次 + 失败保留重试。
+            if now.time() >= chrono::NaiveTime::from_hms_opt(8, 30, 0).unwrap() {
                 static BR021_LAST_RUN: std::sync::Mutex<Option<chrono::NaiveDate>> =
                     std::sync::Mutex::new(None);
                 let today = now.date_naive();
@@ -7009,7 +7013,7 @@ async fn monitor_loop() {
                     .map(|d| d == today)
                     .unwrap_or(false);
                 if !already_run {
-                    log::info!("[BR-021][BR-108] 8:30 cron 触发真实 AccountMode 评估");
+                    log::info!("[BR-021][BR-108] 8:30 盘前重置 (含错过补偿) 触发真实 AccountMode 评估");
                     if evaluate_account_mode_hook(false).await {
                         *BR021_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some(today);
                     } else {
@@ -7022,7 +7026,9 @@ async fn monitor_loop() {
             // 涨停池 + 最新新闻背景) → 报告推送, 竞价参考。失败保留重试资格,
             // 成功才封口 (v15.x 出声原则)。注意 business_date 为昨日已完成
             // 交易日, 与 15:30 盘后 (当日) 各自独立报告文件。
-            if now.hour() == 9 && (5..10).contains(&now.minute()) {
+            // 2026-08-07 补偿原则: 窗口放宽到 9:05-9:14 (9:15 后错过竞价参考
+            // 意义, 且 9:10 预检/9:20 竞价紧随) — 9:09 后启动的 monitor 仍补做。
+            if now.hour() == 9 && (5..15).contains(&now.minute()) {
                 static CHAIN_PREOPEN_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
                     std::sync::Mutex::new(None);
                 let today = now.date_naive();
