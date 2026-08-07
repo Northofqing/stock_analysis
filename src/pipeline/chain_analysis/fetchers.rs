@@ -182,10 +182,22 @@ pub(super) async fn fetch_laggard_candidates(
 /// (invalid request: market dragon-tiger limit must be at most 100) —
 /// 断点 A 接线后首次暴露, 改为上限内值。
 pub(super) async fn fetch_lhb_map() -> Result<HashMap<String, f64>, String> {
-    let batch = DragonTigerGateway::new()
+    let batch = match DragonTigerGateway::new()
         .market_review(chrono::Local::now().date_naive(), 100, 5_000)
         .await
-        .map_err(|error| format!("产业链龙虎榜 Gateway 不可用: {error}"))?;
+    {
+        Ok(batch) => batch,
+        // 2026-08-07: 龙虎榜是 LLM 分析的增强背景 (净买入), 缺失不阻断核心
+        // 聚类/落库/报告 — Gateway Err 降级为 warn + 空背景 (与 VerifiedEmpty
+        // 同语义, 出声不静默)。盘前时段 Eastmoney 接口常返回 no usable
+        // records (09:07 实证), 原 map_err 硬失败导致整条链分析推送失败。
+        Err(error) => {
+            log::warn!(
+                "[产业链][BR-164] 龙虎榜 Gateway 不可用, 降级为空背景 (LLM 无净买入): {error}"
+            );
+            return Ok(HashMap::new());
+        }
+    };
     match batch {
         GatewayBatch::Available { records, .. } => map_lhb_reviews(records),
         GatewayBatch::VerifiedEmpty(evidence) => {
