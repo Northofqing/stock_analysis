@@ -6516,6 +6516,66 @@ struct PreparedHoldingPlan {
     binding: durable_delivery_runtime::CountedDeliveryBinding,
 }
 
+/// T-03 当日一票一推 (DB 级, 跨重启): 当日已投递的 code 集合。
+fn holding_plan_daily_pushed(plan_date: chrono::NaiveDate) -> std::collections::HashSet<String> {
+    use diesel::RunQueryDsl;
+    let Ok(mut conn) = stock_analysis::database::DatabaseManager::get().get_conn() else {
+        log::error!("[T-03] holding_plan_daily 查询: 数据库连接失败");
+        return std::collections::HashSet::new(); // 连接失败不拦截, 由写入路径暴露
+    };
+    if let Err(error) = diesel::sql_query(
+        "CREATE TABLE IF NOT EXISTS holding_plan_daily (\
+             plan_date TEXT NOT NULL, code TEXT NOT NULL, pushed_at TEXT NOT NULL, \
+             PRIMARY KEY (plan_date, code))",
+    )
+    .execute(&mut conn)
+    {
+        log::error!("[T-03] holding_plan_daily 建表失败: {error}");
+        return std::collections::HashSet::new();
+    }
+    let date_str = plan_date.format("%Y-%m-%d").to_string();
+    let rows: Vec<HoldingPlanDailyRow> = match diesel::sql_query(
+        "SELECT plan_date, code FROM holding_plan_daily WHERE plan_date = ?",
+    )
+    .bind::<diesel::sql_types::Text, _>(&date_str)
+    .load(&mut conn)
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            log::error!("[T-03] holding_plan_daily 查询失败: {error}");
+            return std::collections::HashSet::new();
+        }
+    };
+    rows.into_iter().map(|row| row.code).collect()
+}
+
+/// 记录当日已推 (INSERT OR REPLACE, 幂等)。
+fn holding_plan_daily_record(plan_date: chrono::NaiveDate, code: &str) {
+    use diesel::RunQueryDsl;
+    let Ok(mut conn) = stock_analysis::database::DatabaseManager::get().get_conn() else {
+        log::error!("[T-03] holding_plan_daily 记录: 数据库连接失败 code={code}");
+        return;
+    };
+    let date_str = plan_date.format("%Y-%m-%d").to_string();
+    let pushed_at = chrono::Local::now().to_rfc3339();
+    if let Err(error) = diesel::sql_query(
+        "INSERT OR REPLACE INTO holding_plan_daily (plan_date, code, pushed_at) VALUES (?, ?, ?)",
+    )
+    .bind::<diesel::sql_types::Text, _>(&date_str)
+    .bind::<diesel::sql_types::Text, _>(code)
+    .bind::<diesel::sql_types::Text, _>(&pushed_at)
+    .execute(&mut conn)
+    {
+        log::error!("[T-03] holding_plan_daily 记录失败 code={code}: {error}");
+    }
+}
+
+#[derive(diesel::QueryableByName)]
+struct HoldingPlanDailyRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    code: String,
+}
+
 async fn prepare_holding_plan_messages(
     banner: &push_templates::BannerCtx,
 ) -> Result<Vec<PreparedHoldingPlan>, String> {
@@ -8556,37 +8616,18 @@ async fn monitor_loop() {
                             // 2026-08-07 实测修正: counted identity 是内容级
                             // (文本/证据含价格时间戳, 内容变 → 新决策 → 再推),
                             // 频率控制靠 cooldown(1800s) — 但 9:45/10:15 实测同票
-                            // 重复推送。"当日一票一推"由本层当日去重保证:
-                            // 同票当日只投递一次 (价格微变不反复打扰)。
-                            static T03_DAILY_PUSHED: std::sync::Mutex<
-                                Option<(
-                                    chrono::NaiveDate,
-                                    std::collections::HashSet<String>,
-                                )>,
-                            > = std::sync::Mutex::new(None);
+                            // 重复推送。"当日一票一推"由 holding_plan_daily 表
+                            // (DB 级) 保证: 同票当日只投递一次, 跨进程重启不丢
+                            // (10:27 重启实测内存 static 清空 → 10:57 重推)。
                             if let Some(banner) = current_banner_for("I-04 holding plan") {
                                 match prepare_holding_plan_messages(&banner).await {
                                     Ok(messages) => {
                                         let today = chrono::Local::now().date_naive();
-                                        let pending: Vec<PreparedHoldingPlan> = {
-                                            let mut guard = T03_DAILY_PUSHED
-                                                .lock()
-                                                .unwrap_or_else(|e| e.into_inner());
-                                            if guard
-                                                .as_ref()
-                                                .map(|(d, _)| *d != today)
-                                                .unwrap_or(true)
-                                            {
-                                                *guard =
-                                                    Some((today, std::collections::HashSet::new()));
-                                            }
-                                            let (_, pushed_codes) =
-                                                guard.as_mut().expect("just initialized");
-                                            messages
-                                                .into_iter()
-                                                .filter(|m| !pushed_codes.contains(&m.code))
-                                                .collect()
-                                        };
+                                        let already_pushed = holding_plan_daily_pushed(today);
+                                        let pending: Vec<PreparedHoldingPlan> = messages
+                                            .into_iter()
+                                            .filter(|m| !already_pushed.contains(&m.code))
+                                            .collect();
                                         let mut confirmed = true;
                                         let mut delivered_codes: Vec<String> = Vec::new();
                                         for prepared in pending {
@@ -8635,16 +8676,9 @@ async fn monitor_loop() {
                                                 delivered_codes.push(prepared.code.clone());
                                             }
                                         }
-                                        // 记录当日已推 (成功才记录, 失败保留重试资格)
-                                        {
-                                            let mut guard = T03_DAILY_PUSHED
-                                                .lock()
-                                                .unwrap_or_else(|e| e.into_inner());
-                                            if let Some((_, pushed_codes)) = guard.as_mut() {
-                                                for code in delivered_codes {
-                                                    pushed_codes.insert(code);
-                                                }
-                                            }
+                                        // 记录当日已推 (成功才记录, 失败保留重试资格; DB 级跨重启)
+                                        for code in delivered_codes {
+                                            holding_plan_daily_record(today, &code);
                                         }
                                         if confirmed {
                                             last_holding_plan = std::time::Instant::now();
