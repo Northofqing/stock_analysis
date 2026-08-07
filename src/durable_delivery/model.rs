@@ -384,7 +384,10 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         ),
         (T0Advice, PerTicket, Some(1_800), Rolling),
         (CandidateTriggered, PerTicket, Some(86_400), Rolling),
-        (CloseCall, Global, Some(86_400), Rolling),
+        // 2026-08-07 实测修正: T-12 binding 是 Ticket scope (跳水票各自独立),
+        // policy 原为 Global → "Global cooldown scope requires scope_key=GLOBAL"
+        // 拒绝。改 PerTicket 与 T-03 HoldingPlan 语义一致。
+        (CloseCall, PerTicket, Some(86_400), Rolling),
         (ForbiddenOps, PerTicket, Some(3_600), Rolling),
         (PaperTrade, PerTicket, Some(300), Rolling),
         // BR-214: daily review deliveries are idempotent per business date, not per
