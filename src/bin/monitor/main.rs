@@ -7267,12 +7267,16 @@ async fn monitor_loop() {
 
                         // 2026-08-06 实证: 9:15-9:25 DNS 全挂 + TDX 不可达 →
                         // A-02/P-05/涨停池全失败, 9:20 后才从日志发现。
-                        // 开盘前 5 分钟 (9:10-9:15) 对统一实时行情网关做一次健康
-                        // 探测 (与 A-02 同链路 MarketDataGateway::realtime_quotes):
-                        // 不可用 → 提前推送预警, 9:20 竞价前就知道窗口风险。
+                        // 开盘前对统一实时行情网关做一次健康探测 (与 A-02 同链路
+                        // MarketDataGateway::realtime_quotes): 不可用 → 提前推送
+                        // 预警, 9:20 竞价前就知道窗口风险。
                         // 瞬时故障的兜底是 9:20 BR-223 块 (成功才封口, 窗口内重试)。
+                        // 2026-08-07 补偿原则: 窗口从 9:10-9:15 放宽到 9:10-9:20 —
+                        // 9:15 后启动/错过旧窗口的 monitor 仍补做探测 (探测只需
+                        // 数十秒, 9:20 竞价前完成即可; 9:20 后探测意义消失,
+                        // 由 BR-223 窗口兜底)。
                         if now_time >= chrono::NaiveTime::from_hms_opt(9, 10, 0).unwrap()
-                            && now_time < preopen_end
+                            && now_time < chrono::NaiveTime::from_hms_opt(9, 20, 0).unwrap()
                         {
                             static PREOPEN_PROBE_LAST: std::sync::Mutex<
                                 Option<chrono::NaiveDate>,
