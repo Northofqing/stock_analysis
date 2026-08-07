@@ -5210,7 +5210,7 @@ mod tests_br196_monitor_test_acceptance {
     fn br196_renderer_catalog_is_closed_unique_and_nonempty() {
         let catalog = push_templates::build_test_template_catalog("2026-07-31", "10:30")
             .expect("complete TEST_CODE renderer catalog");
-        assert_eq!(catalog.len(), 52);
+        assert_eq!(catalog.len(), 53);
         let ids = catalog
             .iter()
             .map(|preview| preview.template_id)
@@ -8516,11 +8516,43 @@ async fn monitor_loop() {
                             let hhmm = chrono::Local::now().format("%H:%M").to_string();
 
                             // BR-192 收尾: T-03 真实 counted 投递 (原恒 unavailable)。
+                            // 2026-08-07 实测修正: counted identity 是内容级
+                            // (文本/证据含价格时间戳, 内容变 → 新决策 → 再推),
+                            // 频率控制靠 cooldown(1800s) — 但 9:45/10:15 实测同票
+                            // 重复推送。"当日一票一推"由本层当日去重保证:
+                            // 同票当日只投递一次 (价格微变不反复打扰)。
+                            static T03_DAILY_PUSHED: std::sync::Mutex<
+                                Option<(
+                                    chrono::NaiveDate,
+                                    std::collections::HashSet<String>,
+                                )>,
+                            > = std::sync::Mutex::new(None);
                             if let Some(banner) = current_banner_for("I-04 holding plan") {
                                 match prepare_holding_plan_messages(&banner).await {
                                     Ok(messages) => {
+                                        let today = chrono::Local::now().date_naive();
+                                        let pending: Vec<PreparedHoldingPlan> = {
+                                            let mut guard = T03_DAILY_PUSHED
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner());
+                                            if guard
+                                                .as_ref()
+                                                .map(|(d, _)| *d != today)
+                                                .unwrap_or(true)
+                                            {
+                                                *guard =
+                                                    Some((today, std::collections::HashSet::new()));
+                                            }
+                                            let (_, pushed_codes) =
+                                                guard.as_mut().expect("just initialized");
+                                            messages
+                                                .into_iter()
+                                                .filter(|m| !pushed_codes.contains(&m.code))
+                                                .collect()
+                                        };
                                         let mut confirmed = true;
-                                        for prepared in messages {
+                                        let mut delivered_codes: Vec<String> = Vec::new();
+                                        for prepared in pending {
                                             let token =
                                                 match crate::presentation_registry::acquire_token(
                                                     "T-03-holding-plan",
@@ -8563,6 +8595,18 @@ async fn monitor_loop() {
                                                     prepared.code,
                                                     outcome
                                                 );
+                                                delivered_codes.push(prepared.code.clone());
+                                            }
+                                        }
+                                        // 记录当日已推 (成功才记录, 失败保留重试资格)
+                                        {
+                                            let mut guard = T03_DAILY_PUSHED
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner());
+                                            if let Some((_, pushed_codes)) = guard.as_mut() {
+                                                for code in delivered_codes {
+                                                    pushed_codes.insert(code);
+                                                }
                                             }
                                         }
                                         if confirmed {
@@ -8595,8 +8639,12 @@ async fn monitor_loop() {
                             if push_templates::dispatch_sector_top_daily(&hhmm).await {
                                 last_sector_top = std::time::Instant::now();
                             } else {
-                                log::error!(
-                                    "[I-09][BR-091] dispatcher did not confirm delivery; timer not advanced"
+                                // 2026-08-07: 失败也推进计时器 — 数据源不可用
+                                // (上游 BoardDataGateway 合同缺口实证) 每 30s 重试
+                                // 轰炸日志, 改 1 小时后重试 (成功恢复时效可接受)。
+                                last_sector_top = std::time::Instant::now();
+                                log::warn!(
+                                    "[I-09] dispatcher did not confirm; 1 小时后重试 (失败节流)"
                                 );
                             }
                         }
@@ -8630,8 +8678,10 @@ async fn monitor_loop() {
                             {
                                 last_sector_anomaly = std::time::Instant::now();
                             } else {
-                                log::error!(
-                                    "[I-09A][BR-091] dispatcher did not confirm delivery; timer not advanced"
+                                // 2026-08-07: 同 I-09 — 失败也推进计时器 (1 小时重试节流)。
+                                last_sector_anomaly = std::time::Instant::now();
+                                log::warn!(
+                                    "[I-09A] dispatcher did not confirm; 1 小时后重试 (失败节流)"
                                 );
                             }
                         }
