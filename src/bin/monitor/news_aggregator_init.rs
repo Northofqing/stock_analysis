@@ -478,7 +478,9 @@ pub async fn candidate_ingest_from_news(
         );
         return (0, 0);
     };
-    let batch: Vec<String> = titles.iter().take(20).cloned().collect();
+    // 2026-08-08 实测: 20 条标题 → 输出超 8192 tokens 仍可能截断; 10 条
+    // 覆盖单轮 tick 的头部新闻, 输出稳定收敛。
+    let batch: Vec<String> = titles.iter().take(10).cloned().collect();
     let hits = match stock_analysis::llm::extract_tickers(provider, batch).await {
         Ok(hits) => hits,
         Err(error) => {

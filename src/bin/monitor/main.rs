@@ -5946,6 +5946,15 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
                 // 不依赖 BR-180 receipt: 直接取 raw 标题 → LLM 提取受益个股 →
                 // pushed_stocks 候选池 (DB 级当日去重), intraday_monitor 消费。
                 // critical 闪送仍待 receipt 链路 (Phase 4)。
+                // 2026-08-08 实测: 红线 2.2 报价门 (5s 新鲜度) 在非交易时段
+                // 永远失败 (收盘后报价 = 9 小时前) → 只在 9:15-15:00 入池。
+                let session = stock_analysis::calendar::current_session();
+                if !session.is_trading() && !session.is_auction() {
+                    log::debug!(
+                        "[GlobalNews][BR-183] Track A 跳过: 非交易时段 session={:?}, 无实时报价",
+                        session
+                    );
+                } else {
                 match stock_analysis::news::aggregator::raw_v2::fetch_raw_global_news_batch(20)
                     .await
                 {
@@ -5978,6 +5987,7 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
                             "[GlobalNews][BR-183] raw batch 获取失败, 本轮候选不入池: {error}"
                         );
                     }
+                }
                 }
             }
         }

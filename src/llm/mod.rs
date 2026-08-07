@@ -329,7 +329,10 @@ async fn openai_compatible_chat_json_raw(
             r#type: ChatCompletionResponseFormatType::JsonObject,
         })
         .temperature(0.1)
-        .max_tokens(2048u16)
+        // 2026-08-08 实测: ticker 提取响应在 2048/4096 tokens 均截断
+        // (JSON EOF, 14301 字符处) → 候选入池全失败。8192 覆盖长 hits 数组
+        // (deepseek 输出上限; 输入侧另限 10 条标题)。
+        .max_tokens(8192u16)
         .build()
         .map_err(|e| LlmError::Http(format!("req build: {}", e)))?;
 
