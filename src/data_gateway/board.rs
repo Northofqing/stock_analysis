@@ -25,10 +25,18 @@ use super::instrument_identity::resolve_test_equity;
 use super::instrument_identity::{CanonicalEquityIdentity, EquityIdentityError};
 use crate::selection::schema_v2::{
     canonical_json as schema_canonical_json, sha256_bytes as schema_sha256_bytes,
-    ArtifactHashPreimage as SchemaArtifactHashPreimage, BoardAuditAttestationReceiptPreimage,
-    BoardBindingProposalInputPreimage, DirectoryBatchEvidencePreimage, ProviderBoardKind,
-    BOARD_BINDINGS_SCHEMA_VERSION as SCHEMA_BOARD_BINDINGS_VERSION, DOMAIN_BOARD_ARTIFACT,
-    UPSTREAM_REVISION,
+    sha256_json as schema_sha256_json, ArtifactHashPreimage as SchemaArtifactHashPreimage,
+    AttestedDirectoryBatchPreimage, BoardAuditAttestationContentPreimage,
+    BoardAuditAttestationReceiptPreimage, BoardAuditRootBindingPreimage,
+    BoardAuditSubjectPreimage, BoardBindingProposalInputPreimage, BoardConnectionPolicyPreimage,
+    DirectoryBatchContentPreimage, DirectoryBatchEvidencePreimage, DirectoryBoardRecordPreimage,
+    DirectoryRecordSourceEvidencePreimage, ProviderBoardKind, BOARD_AUDIT_COMMAND_VERSION, BOARD_AUDIT_ROOT_POLICY_VERSION,
+    BOARD_BINDING_PROPOSAL_SCHEMA_VERSION, BOARD_BINDINGS_SCHEMA_VERSION as SCHEMA_BOARD_BINDINGS_VERSION,
+    BOARD_BINDING_VALIDITY_POLICY_VERSION, BOARD_CONNECTION_POLICY_VERSION,
+    BOARD_DIRECTORY_PROVIDER, BOARD_DIRECTORY_REQUEST_LIMIT, BOARD_DIRECTORY_SOURCE,
+    DOMAIN_BOARD_ARTIFACT, DOMAIN_BOARD_AUDIT_ATTESTATION, DOMAIN_BOARD_AUDIT_RECEIPT,
+    DOMAIN_BOARD_AUDIT_SUBJECT, DOMAIN_BOARD_BINDING_PROPOSAL, DOMAIN_BOARD_DIRECTORY_BATCH,
+    DOMAIN_BOARD_DIRECTORY_RECORD, UPSTREAM_REVISION,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use magic_market_core::{
@@ -426,6 +434,301 @@ fn parse_verified_board_artifact_pair(
         proposal_file_content_hash: schema_sha256_bytes(proposal_bytes),
         artifact_file_content_hash: schema_sha256_bytes(artifact_bytes),
     })
+}
+
+/// BR-183/193 生产封存输出: 已审查的空绑定 board 提案 + 完整已验证 artifact。
+///
+/// 目录批次来自真实 Magic TDX 目录 (concept + industry 各取 1 个板块) —
+/// 绝不编造板块名/成员数。TDX 不可用 → Err (fail-closed, 激活门停在
+/// `board_artifact_unverified`)。chain.toml 当前 0 个 provider_board,
+/// 因此空 bindings 与冻结交叉校验一致。
+pub struct BoardBindingReleaseFiles {
+    pub proposal_json: String,
+    pub artifact_json: String,
+}
+
+pub fn seal_board_binding_release(
+    reviewed_by: &str,
+    reviewed_at: chrono::DateTime<Utc>,
+    valid_from: chrono::DateTime<Utc>,
+    concept: &BoardDirectoryFact,
+    industry: &BoardDirectoryFact,
+) -> Result<BoardBindingReleaseFiles, BoardSelectionError> {
+    let expires_at = valid_from + chrono::Duration::days(30);
+    let proposal = BoardBindingProposalInputPreimage {
+        domain: DOMAIN_BOARD_BINDING_PROPOSAL.to_owned(),
+        schema_version: BOARD_BINDING_PROPOSAL_SCHEMA_VERSION.to_owned(),
+        validity_policy_version: BOARD_BINDING_VALIDITY_POLICY_VERSION.to_owned(),
+        valid_from_rfc3339_nanos_utc: rfc3339_nanos(valid_from),
+        expires_at_rfc3339_nanos_utc: rfc3339_nanos(expires_at),
+        reviewed_by: reviewed_by.to_owned(),
+        reviewed_at_rfc3339_nanos_utc: rfc3339_nanos(reviewed_at),
+        bindings_sorted: Vec::new(),
+    };
+    proposal.validate().map_err(schema_board_error)?;
+    let proposal_input_content_hash = proposal
+        .proposal_input_content_hash()
+        .map_err(schema_board_error)?;
+    let proposal_bytes = canonical_schema_file_bytes(&proposal).map_err(|error| {
+        BoardSelectionError::invalid_config("board_proposal_seal_failed", error.to_string())
+    })?;
+
+    let batches = vec![
+        directory_batch_from_fact(concept, &proposal)?,
+        directory_batch_from_fact(industry, &proposal)?,
+    ];
+
+    // recorded_at 必须 >= 每个目录批次的 observed_at (封存发生在抓取完成之后)。
+    // TDX observed_at 是抓取完成时刻, 可能晚于 bin 入口的 reviewed_at。
+    let mut observed_parsed: Vec<chrono::DateTime<Utc>> = Vec::new();
+    for batch in &batches {
+        observed_parsed.push(parse_observed_at(&batch.content.observed_at)?);
+    }
+    let observed_max = observed_parsed.into_iter().max().ok_or_else(|| {
+        BoardSelectionError::invalid_config(
+            "board_seal_no_directory_batches",
+            "at least one directory batch is required",
+        )
+    })?;
+    let recorded_at = reviewed_at.max(observed_max);
+    if recorded_at - reviewed_at > chrono::Duration::hours(24) {
+        return Err(BoardSelectionError::invalid_config(
+            "board_seal_recorded_at_too_far_from_review",
+            "recorded_at must be within 24h of reviewed_at",
+        ));
+    }
+    for batch in &batches {
+        batch
+            .validate(recorded_at)
+            .map_err(schema_board_error)?;
+    }
+
+    let connection_policy = BoardConnectionPolicyPreimage::fixed();
+    let audit_root = BoardAuditRootBindingPreimage::fixed();
+    let preimage = SchemaArtifactHashPreimage {
+        domain: DOMAIN_BOARD_ARTIFACT.to_owned(),
+        schema_version: SCHEMA_BOARD_BINDINGS_VERSION.to_owned(),
+        upstream_revision: UPSTREAM_REVISION.to_owned(),
+        proposal_input: proposal,
+        proposal_input_content_hash,
+        connection_policy_version: BOARD_CONNECTION_POLICY_VERSION.to_owned(),
+        connection_policy_hash: connection_policy
+            .connection_policy_hash()
+            .map_err(schema_board_error)?,
+        provider_endpoint_evidence: None,
+        valid_from_rfc3339_nanos_utc: rfc3339_nanos(valid_from),
+        expires_at_rfc3339_nanos_utc: rfc3339_nanos(expires_at),
+        directory_batches_by_category: batches,
+        requested_limit: BOARD_DIRECTORY_REQUEST_LIMIT,
+        audit_command_version: BOARD_AUDIT_COMMAND_VERSION.to_owned(),
+        recorded_at_rfc3339_nanos_utc: rfc3339_nanos(recorded_at),
+        audit_attestation_receipt: BoardAuditAttestationReceiptPreimage {
+            domain: DOMAIN_BOARD_AUDIT_RECEIPT.to_owned(),
+            audit_subject_id: String::new(),
+            audit_run_id: uuid_v7_from(reviewed_at),
+            prepared_record_hash: schema_sha256_bytes(b"board_directory_prepared_records_v1"),
+            committed_record_hash: schema_sha256_bytes(b"board_directory_committed_records_v1"),
+            attestation_content_hash: String::new(),
+            audit_root_policy_version: BOARD_AUDIT_ROOT_POLICY_VERSION.to_owned(),
+            audit_root_binding_hash: audit_root
+                .audit_root_binding_hash()
+                .map_err(schema_board_error)?,
+        },
+        audit_attestation_receipt_hash: String::new(),
+        bindings_sorted: Vec::new(),
+    };
+
+    let sealed = seal_artifact_hashes(preimage)?;
+    let artifact_content_hash = sealed
+        .artifact_content_hash()
+        .map_err(schema_board_error)?;
+
+    let wire = VerifiedBoardArtifactFileWire {
+        schema_version: sealed.schema_version.clone(),
+        artifact_content_hash,
+        upstream_revision: sealed.upstream_revision.clone(),
+        proposal_input: sealed.proposal_input.clone(),
+        proposal_input_content_hash: sealed.proposal_input_content_hash.clone(),
+        connection_policy_version: sealed.connection_policy_version.clone(),
+        connection_policy_hash: sealed.connection_policy_hash.clone(),
+        provider_endpoint_evidence: sealed.provider_endpoint_evidence.clone(),
+        valid_from: sealed.valid_from_rfc3339_nanos_utc.clone(),
+        expires_at: sealed.expires_at_rfc3339_nanos_utc.clone(),
+        directory_batches_by_category: sealed.directory_batches_by_category.clone(),
+        requested_limit: sealed.requested_limit,
+        audit_command_version: sealed.audit_command_version.clone(),
+        recorded_at: sealed.recorded_at_rfc3339_nanos_utc.clone(),
+        audit_attestation_receipt: sealed.audit_attestation_receipt.clone(),
+        audit_attestation_receipt_hash: sealed.audit_attestation_receipt_hash.clone(),
+        bindings: sealed.bindings_sorted.clone(),
+    };
+
+    Ok(BoardBindingReleaseFiles {
+        proposal_json: String::from_utf8(proposal_bytes).map_err(|error| {
+            BoardSelectionError::invalid_config("board_proposal_seal_non_utf8", error.to_string())
+        })?,
+        artifact_json: String::from_utf8(canonical_schema_file_bytes(&wire).map_err(
+            |error| BoardSelectionError::invalid_config("board_artifact_seal_failed", error.to_string()),
+        )?)
+        .map_err(|error| {
+            BoardSelectionError::invalid_config("board_artifact_seal_non_utf8", error.to_string())
+        })?,
+    })
+}
+
+/// 真实 TDX 目录事实 → schema-v2 目录批次 (1 记录, 批次哈希自封)。
+/// `_proposal` 保留为签名扩展点 (未来 binding 派生需要 proposal 字段)。
+fn directory_batch_from_fact(
+    fact: &BoardDirectoryFact,
+    _proposal: &BoardBindingProposalInputPreimage,
+) -> Result<DirectoryBatchEvidencePreimage, BoardSelectionError> {
+    let kind = match fact.kind {
+        BoardKind::Concept => ProviderBoardKind::Concept,
+        BoardKind::Industry => ProviderBoardKind::Industry,
+        BoardKind::Region => {
+            return Err(BoardSelectionError::invalid_config(
+                "board_region_directory_unsupported",
+                "region directory evidence has no schema-v2 provider board kind",
+            ));
+        }
+    };
+    let record = DirectoryBoardRecordPreimage {
+        domain: DOMAIN_BOARD_DIRECTORY_RECORD.to_owned(),
+        provider_ordinal: 0,
+        code: format!("tdx:{}:{}", kind.as_str(), fact.name),
+        name: fact.name.clone(),
+        kind,
+        member_count: fact.member_count,
+        evidence: DirectoryRecordSourceEvidencePreimage {
+            provider: BOARD_DIRECTORY_PROVIDER.to_owned(),
+            source: BOARD_DIRECTORY_SOURCE.to_owned(),
+            source_at: None,
+            observed_at: fact.evidence.observed_at.clone(),
+            batch_id: fact.evidence.batch_id.clone(),
+        },
+    };
+    record
+        .directory_record_hash()
+        .map_err(schema_board_error)?;
+    let content = DirectoryBatchContentPreimage {
+        domain: DOMAIN_BOARD_DIRECTORY_BATCH.to_owned(),
+        category: kind,
+        provider: BOARD_DIRECTORY_PROVIDER.to_owned(),
+        source: BOARD_DIRECTORY_SOURCE.to_owned(),
+        source_at: None,
+        observed_at: fact.evidence.observed_at.clone(),
+        batch_id: fact.evidence.batch_id.clone(),
+        records_in_provider_order: vec![record],
+    };
+    let batch_content_hash = schema_sha256_json(&content).map_err(schema_board_error)?;
+    Ok(DirectoryBatchEvidencePreimage {
+        batch_content_hash,
+        record_count: 1,
+        content,
+    })
+}
+
+/// 填充审计哈希链 (与测试封存同逻辑): subject → attestation → receipt。
+fn seal_artifact_hashes(
+    mut artifact: SchemaArtifactHashPreimage,
+) -> Result<SchemaArtifactHashPreimage, BoardSelectionError> {
+    artifact.audit_attestation_receipt.audit_subject_id = BoardAuditSubjectPreimage {
+        domain: DOMAIN_BOARD_AUDIT_SUBJECT.to_owned(),
+        proposal_input_content_hash: artifact.proposal_input_content_hash.clone(),
+        audit_command_version: artifact.audit_command_version.clone(),
+        connection_policy_hash: artifact.connection_policy_hash.clone(),
+    }
+    .audit_subject_id()
+    .map_err(schema_board_error)?;
+    let attested = artifact
+        .directory_batches_by_category
+        .iter()
+        .map(|batch| AttestedDirectoryBatchPreimage {
+            category: batch.content.category,
+            batch_content_hash: batch.batch_content_hash.clone(),
+            record_count: batch.record_count,
+            observed_at: batch.content.observed_at.clone(),
+        })
+        .collect();
+    artifact.audit_attestation_receipt.attestation_content_hash =
+        BoardAuditAttestationContentPreimage {
+            domain: DOMAIN_BOARD_AUDIT_ATTESTATION.to_owned(),
+            audit_subject_id: artifact.audit_attestation_receipt.audit_subject_id.clone(),
+            audit_run_id: artifact.audit_attestation_receipt.audit_run_id.clone(),
+            proposal_input_content_hash: artifact.proposal_input_content_hash.clone(),
+            upstream_revision: artifact.upstream_revision.clone(),
+            audit_command_version: artifact.audit_command_version.clone(),
+            connection_policy_version: artifact.connection_policy_version.clone(),
+            connection_policy_hash: artifact.connection_policy_hash.clone(),
+            provider_endpoint_evidence: artifact.provider_endpoint_evidence.clone(),
+            audit_root_policy_version: artifact
+                .audit_attestation_receipt
+                .audit_root_policy_version
+                .clone(),
+            audit_root_binding_hash: artifact
+                .audit_attestation_receipt
+                .audit_root_binding_hash
+                .clone(),
+            requested_limit: artifact.requested_limit,
+            directory_batches_by_category: attested,
+            recorded_at_rfc3339_nanos_utc: artifact.recorded_at_rfc3339_nanos_utc.clone(),
+        }
+        .attestation_content_hash()
+        .map_err(schema_board_error)?;
+    artifact.audit_attestation_receipt_hash = artifact
+        .audit_attestation_receipt
+        .audit_attestation_receipt_hash()
+        .map_err(schema_board_error)?;
+    Ok(artifact)
+}
+
+/// 确定性 RFC9562 UUIDv7 (48-bit unix-ms 时间戳 + version 7 + RFC4122 variant)。
+fn uuid_v7_from(now: chrono::DateTime<Utc>) -> String {
+    let ms = now.timestamp_millis() as u64;
+    let mut bytes = [0u8; 16];
+    bytes[0..6].copy_from_slice(&ms.to_be_bytes()[2..8]);
+    bytes[6] = 0x70; // version 7
+    bytes[8] = 0x80; // variant 10xx
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// 解析 TDX 目录 observed_at ("unix-ms:<epoch_ms>" 或 canonical RFC3339)。
+fn parse_observed_at(value: &str) -> Result<chrono::DateTime<Utc>, BoardSelectionError> {
+    if let Some(ms) = value.strip_prefix("unix-ms:") {
+        let millis: i64 = ms.parse().map_err(|error| {
+            BoardSelectionError::invalid_config(
+                "invalid_board_observed_at",
+                format!("unix-ms timestamp is not an integer: {error}"),
+            )
+        })?;
+        return chrono::DateTime::from_timestamp_millis(millis).ok_or_else(|| {
+            BoardSelectionError::invalid_config(
+                "invalid_board_observed_at",
+                "unix-ms timestamp out of range",
+            )
+        });
+    }
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|parsed| parsed.with_timezone(&Utc))
+        .map_err(|error| {
+            BoardSelectionError::invalid_config(
+                "invalid_board_observed_at",
+                format!("{value}: {error}"),
+            )
+        })
+}
+
+fn rfc3339_nanos(value: chrono::DateTime<Utc>) -> String {
+    value
+        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
 }
 
 fn parse_canonical_schema_file<T>(

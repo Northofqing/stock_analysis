@@ -190,14 +190,38 @@ pub(crate) fn prepare_checked_in_config_activation(
 /// BR-180. Consumed by `activation_gate` to decide the production
 /// selection-v2 capability verdict.
 #[derive(Debug)]
-pub(crate) struct PreparedActivationMaterials {
+pub struct PreparedActivationMaterials {
     pub config_hash: String,
     pub config_snapshot_json_hash: String,
     pub board_artifact_valid_from: String,
     pub board_artifact_expires_at: String,
 }
 
-pub(crate) fn prepare_activation_materials(
+/// Release-gate materials preparation, public for the
+/// `selection_activation_prepare` binary (read-only; never persists).
+///
+/// Stages 1-3 only: gate contract + chain/board snapshot → config hash and
+/// board release window, without requiring an activation file. Used to
+/// *produce* the activation file (a file cannot require itself to exist).
+pub fn prepare_activation_config_hash(
+    repository_root: impl AsRef<Path>,
+    activated_at: DateTime<Utc>,
+) -> Result<PreparedActivationMaterials, ConfigActivationPreparationError> {
+    let contract = ConfigActivationGateContract::checked_in();
+    contract.validate()?;
+    let repository_root = validate_repository_root(repository_root.as_ref())?;
+    let snapshot = prepare_snapshot(&repository_root, activated_at, &contract)?;
+    Ok(PreparedActivationMaterials {
+        config_hash: snapshot.config_hash,
+        config_snapshot_json_hash: snapshot.config_snapshot_json_hash,
+        board_artifact_valid_from: snapshot.board_artifact_valid_from,
+        board_artifact_expires_at: snapshot.board_artifact_expires_at,
+    })
+}
+
+/// Full gate materials: stages 1-5 including the activation file's existence,
+/// config-hash match and chronology (used by the production activation gate).
+pub fn prepare_activation_materials(
     repository_root: impl AsRef<Path>,
     activated_at: DateTime<Utc>,
 ) -> Result<PreparedActivationMaterials, ConfigActivationPreparationError> {
