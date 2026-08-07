@@ -15,7 +15,6 @@ use std::sync::OnceLock;
 
 static BOOTSTRAP_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static BOUND_SELECTION_PROCESS: OnceLock<BoundSelectionProcess> = OnceLock::new();
-const SELECTION_V2_DISABLED_REASON: &str = "selection_v2_activation_not_released";
 
 /// Opaque proof that the real process argv was parsed exactly once.
 ///
@@ -107,7 +106,12 @@ impl VerifiedParsedSelectionCli {
                 selection: SelectionCapabilityState::Disabled { reason_code },
                 ..
             } => Some(*reason_code),
-            BoundSelectionProcess::Terminal { .. } | BoundSelectionProcess::Disabled { .. } => None,
+            BoundSelectionProcess::Operational {
+                selection: SelectionCapabilityState::Enabled,
+                ..
+            }
+            | BoundSelectionProcess::Terminal { .. }
+            | BoundSelectionProcess::Disabled { .. } => None,
             BoundSelectionProcess::Rejected { .. } => {
                 unreachable!("a rejected bootstrap cannot create a verified CLI proof")
             }
@@ -264,8 +268,14 @@ fn classify_parsed_invocation(
     BoundSelectionProcess::Operational {
         generation: 1,
         parsed,
-        selection: SelectionCapabilityState::Disabled {
-            reason_code: SELECTION_V2_DISABLED_REASON,
+        selection: match crate::selection::activation_gate::evaluate_production_selection_v2_activation()
+        {
+            crate::selection::activation_gate::SelectionV2ActivationVerdict::Enabled => {
+                SelectionCapabilityState::Enabled
+            }
+            crate::selection::activation_gate::SelectionV2ActivationVerdict::Disabled {
+                reason_code,
+            } => SelectionCapabilityState::Disabled { reason_code },
         },
     }
 }
@@ -314,6 +324,7 @@ enum BoundSelectionProcess {
 }
 
 enum SelectionCapabilityState {
+    Enabled,
     Disabled { reason_code: &'static str },
 }
 
@@ -577,14 +588,17 @@ mod tests {
     }
 
     #[test]
-    fn operational_invocation_disables_only_unreleased_selection() {
+    fn operational_invocation_gates_selection_against_release_materials() {
         let parsed = parse(&["monitor", "--review"]).expect("review invocation");
         let state = classify_parsed_invocation(parsed, true);
+        // The checked-in repository ships no activation file, so the BR-193
+        // gate must fail closed with the concrete missing token (never the
+        // old placeholder "selection_v2_activation_not_released").
         assert!(matches!(
             state,
             BoundSelectionProcess::Operational {
                 selection: SelectionCapabilityState::Disabled {
-                    reason_code: "selection_v2_activation_not_released",
+                    reason_code: "activation_missing",
                 },
                 ..
             }

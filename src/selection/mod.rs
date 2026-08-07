@@ -1,6 +1,7 @@
 //! BR-174 receipt-verified schema-v2 selection.
 
 pub mod acquisition_v2;
+pub mod activation_gate;
 pub mod activation_runtime;
 pub mod admission;
 pub mod audit;

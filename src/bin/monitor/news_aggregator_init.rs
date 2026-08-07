@@ -23,6 +23,7 @@
     reason = "BR-174 receipt-gated projection is retained for the selection-v2 release; BR-183 forbids constructing a production receipt while that capability is disabled"
 )]
 
+use diesel::RunQueryDsl;
 use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
 use stock_analysis::news::aggregator::projection_v2::{
@@ -455,6 +456,142 @@ pub async fn push_flash_decisions(decisions: Vec<FlashDecision>) -> (usize, usiz
     (n_critical, n_agg)
 }
 
+/// BR-183 Track A 候选入池: 新闻标题 → LLM 提取受益个股 → pushed_stocks
+/// 候选池 (复用 D-01/NewsCatalyst 已注册评分路径, intraday_monitor 直接消费)。
+///
+/// 当日一票一入: 入池前查 pushed_stocks 当日该 code 是否已有 (DB 级去重,
+/// 吸取 T-03 内存去重重启丢失教训)。同票跨 tick 重复新闻不重复入池。
+///
+/// 红线 2.2: 无真实实时报价 (执行报价新鲜度 ≤5s) 的票不入池, 不造价格。
+/// LLM 不可用 / 提取失败 → 出声 warn, 本轮不入池 (v15.x 静默路径可见)。
+/// 返回 (入池数, 因无报价/已入池跳过数)。
+pub async fn candidate_ingest_from_news(
+    titles: &[String],
+) -> (usize, usize) {
+    if titles.is_empty() {
+        return (0, 0);
+    }
+    let registry = stock_analysis::llm::LlmRegistry::from_env();
+    let Some(provider) = registry.select("ticker") else {
+        log::warn!(
+            "[候选入池][BR-183] LLM role=ticker 无可用 provider (env 未配置), 本轮不入池"
+        );
+        return (0, 0);
+    };
+    let batch: Vec<String> = titles.iter().take(20).cloned().collect();
+    let hits = match stock_analysis::llm::extract_tickers(provider, batch).await {
+        Ok(hits) => hits,
+        Err(error) => {
+            log::warn!("[候选入池][BR-183] LLM 提取失败, 本轮不入池: {error}");
+            return (0, 0);
+        }
+    };
+    let mut recorded = 0usize;
+    let mut skipped = 0usize;
+    for hit in hits {
+        if already_pooled_today(&hit.code) {
+            skipped += 1;
+            log::debug!(
+                "[候选入池][BR-183] {}({}) 当日已入池, 跳过 (DB 级去重)",
+                hit.name,
+                hit.code
+            );
+            continue;
+        }
+        match stock_analysis::broker::execution_quote(&hit.code) {
+            Ok(quote) => {
+                let theme = json_escape(&hit.chain);
+                let headline = json_escape(&hit.reason);
+                let metric_json = format!(
+                    "{{\"push_subkind\":\"NewsCatalyst\",\"theme\":\"{theme}\",\
+                     \"headline\":\"{headline}\",\"llm_importance\":{}}}",
+                    hit.importance
+                );
+                let outcome = stock_analysis::signal::push_recorder::record(
+                    &stock_analysis::signal::push_recorder::PushRecordMeta {
+                        code: hit.code.clone(),
+                        name: hit.name.clone(),
+                        push_kind: "D-01".to_string(),
+                        push_price: quote.price,
+                        metric_json,
+                        source: "news_flash".to_string(),
+                    },
+                );
+                match outcome {
+                    Ok(_) => {
+                        recorded += 1;
+                        log::info!(
+                            "[候选入池][BR-183] {}({}) 入池 importance={} chain={}",
+                            hit.name,
+                            hit.code,
+                            hit.importance,
+                            hit.chain
+                        );
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "[候选入池][BR-183] {}({}) pushed_stocks 写入失败: {error}",
+                            hit.name,
+                            hit.code
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                skipped += 1;
+                log::warn!(
+                    "[候选入池][BR-183] {}({}) 无真实实时报价, 跳过入池 (红线 2.2): {error}",
+                    hit.name,
+                    hit.code
+                );
+            }
+        }
+    }
+    log::info!(
+        "[候选入池][BR-183] recorded={} skipped={} titles={}",
+        recorded,
+        skipped,
+        titles.len()
+    );
+    (recorded, skipped)
+}
+
+/// pushed_stocks 当日该 code 是否已有 (DB 级当日去重)。
+fn already_pooled_today(code: &str) -> bool {
+    let Ok(mut conn) = stock_analysis::database::DatabaseManager::get().get_conn() else {
+        return false; // 连接失败 → 不拦截, 由写入路径暴露错误
+    };
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    diesel::sql_query(
+        "SELECT COUNT(*) AS count FROM pushed_stocks \
+         WHERE code = ? AND substr(push_time, 1, 10) = ?",
+    )
+    .bind::<diesel::sql_types::Text, _>(code)
+    .bind::<diesel::sql_types::Text, _>(&today)
+    .get_result::<PooledCountRow>(&mut conn)
+    .map(|row| row.count > 0)
+    .unwrap_or_else(|error| {
+        log::error!("[候选入池][BR-183] 当日去重查询失败: {error}");
+        false
+    })
+}
+
+#[derive(diesel::QueryableByName)]
+struct PooledCountRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    count: i64,
+}
+
+/// JSON 字符串转义 (候选 metric_json 内联字段用)
+fn json_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .chars()
+        .take(120)
+        .collect()
+}
+
 // ============================================================================
 // 单元测试
 // ============================================================================
@@ -620,6 +757,20 @@ mod tests {
         }
         // 9:33 再 tick → 同窗口不重复触发
         assert!(g.process(&[], at(9, 33), 80, 20).is_empty(), "窗口当日一次");
+    }
+
+    /// Track A: 空标题列表 → 不入池 (0, 0), 不触发 LLM
+    #[tokio::test]
+    async fn candidate_ingest_empty_titles_is_noop() {
+        let (recorded, skipped) = candidate_ingest_from_news(&[]).await;
+        assert_eq!((recorded, skipped), (0, 0));
+    }
+
+    /// Track A: JSON 转义不产生畸形 metric_json
+    #[test]
+    fn json_escape_handles_quotes_and_backslashes() {
+        let escaped = json_escape("PCB \"涨价\" \\ 事件");
+        assert_eq!(escaped, "PCB \\\"涨价\\\" \\\\ 事件");
     }
 
     /// 红线 2.2: 窗口无事件不臆造推送

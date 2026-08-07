@@ -5935,12 +5935,51 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
         // that capability is unreleased, do not call a provider or advance
         // notification simhash; independent policy/announcement business
         // below continues.
-        if outer_tick.enter(NewsOuterTickPhase::CriticalFlash) && !selection_v2_enabled {
-            log::debug!(
-                "[GlobalNews][BR-174][BR-183] disabled \
-                 reason_code=selection_v2_activation_not_released \
-                 provider_calls=0 notification_projection=0 news_ai=0"
-            );
+        if outer_tick.enter(NewsOuterTickPhase::CriticalFlash) {
+            if !selection_v2_enabled {
+                log::debug!(
+                    "[GlobalNews][BR-174][BR-183] disabled \
+                     provider_calls=0 notification_projection=0 news_ai=0"
+                );
+            } else {
+                // BR-183 Track A (2026-08-07): 新闻 → 候选入池。
+                // 不依赖 BR-180 receipt: 直接取 raw 标题 → LLM 提取受益个股 →
+                // pushed_stocks 候选池 (DB 级当日去重), intraday_monitor 消费。
+                // critical 闪送仍待 receipt 链路 (Phase 4)。
+                match stock_analysis::news::aggregator::raw_v2::fetch_raw_global_news_batch(20)
+                    .await
+                {
+                    Ok(batch) => {
+                        let titles: Vec<String> = batch
+                            .attempts()
+                            .iter()
+                            .flat_map(|attempt| {
+                                attempt
+                                    .terminal()
+                                    .records()
+                                    .map(|records| {
+                                        records.iter().map(|record| record.title.clone())
+                                    })
+                                    .into_iter()
+                                    .flatten()
+                            })
+                            .collect();
+                        let (recorded, skipped) =
+                            crate::news_aggregator_init::candidate_ingest_from_news(&titles).await;
+                        log::info!(
+                            "[GlobalNews][BR-183] Track A tick records={} recorded={} skipped={}",
+                            titles.len(),
+                            recorded,
+                            skipped
+                        );
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "[GlobalNews][BR-183] raw batch 获取失败, 本轮候选不入池: {error}"
+                        );
+                    }
+                }
+            }
         }
 
         // BR-138: policy and critical flash have completed before watch

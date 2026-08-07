@@ -184,6 +184,67 @@ pub(crate) fn prepare_checked_in_config_activation(
     prepare_config_activation_from_root(Path::new(env!("CARGO_MANIFEST_DIR")), context)
 }
 
+/// BR-183/193 release-gate materials: stages 1-4 of the full activation
+/// preparation (chain snapshot + board artifact + config hash), without the
+/// legacy-cutover snapshot and envelope persistence that remain gated behind
+/// BR-180. Consumed by `activation_gate` to decide the production
+/// selection-v2 capability verdict.
+#[derive(Debug)]
+pub(crate) struct PreparedActivationMaterials {
+    pub config_hash: String,
+    pub config_snapshot_json_hash: String,
+    pub board_artifact_valid_from: String,
+    pub board_artifact_expires_at: String,
+}
+
+pub(crate) fn prepare_activation_materials(
+    repository_root: impl AsRef<Path>,
+    activated_at: DateTime<Utc>,
+) -> Result<PreparedActivationMaterials, ConfigActivationPreparationError> {
+    let contract = ConfigActivationGateContract::checked_in();
+    contract.validate()?;
+    let repository_root = validate_repository_root(repository_root.as_ref())?;
+    let snapshot = prepare_snapshot(&repository_root, activated_at, &contract)?;
+
+    // Stage 4-5: activation file must exist, match the exact checked-in
+    // config hash, and satisfy the frozen chronology against the board
+    // artifact release window.
+    let activation_path = repository_root.join(ACTIVATION_FILE_RELATIVE_PATH);
+    let activation_bytes = read_required_file(&activation_path, "activation_file")?;
+    let activation_file = parse_activation_file(&activation_bytes)?;
+    if activation_file.expected_config_hash != snapshot.config_hash {
+        return Err(ConfigActivationPreparationError::new(
+            "activation_expected_config_hash_mismatch",
+            "activation file expected_config_hash does not match exact checked-in inputs",
+        ));
+    }
+    let effective_from =
+        parse_canonical_timestamp(&activation_file.effective_from, "effective_from")?;
+    let reviewed_at = parse_canonical_timestamp(&activation_file.reviewed_at, "reviewed_at")?;
+    let artifact_valid_from =
+        parse_canonical_timestamp(&snapshot.board_artifact_valid_from, "artifact_valid_from")?;
+    let artifact_expires_at =
+        parse_canonical_timestamp(&snapshot.board_artifact_expires_at, "artifact_expires_at")?;
+    if reviewed_at > activated_at
+        || effective_from < activated_at
+        || effective_from < reviewed_at
+        || effective_from < artifact_valid_from
+        || effective_from >= artifact_expires_at
+    {
+        return Err(ConfigActivationPreparationError::new(
+            "activation_chronology_invalid",
+            "reviewed_at <= activated_at <= effective_from and artifact validity at effective_from are required",
+        ));
+    }
+
+    Ok(PreparedActivationMaterials {
+        config_hash: snapshot.config_hash,
+        config_snapshot_json_hash: snapshot.config_snapshot_json_hash,
+        board_artifact_valid_from: snapshot.board_artifact_valid_from,
+        board_artifact_expires_at: snapshot.board_artifact_expires_at,
+    })
+}
+
 fn prepare_config_activation_from_root(
     repository_root: impl AsRef<Path>,
     context: ConfigActivationPreparationContext,
