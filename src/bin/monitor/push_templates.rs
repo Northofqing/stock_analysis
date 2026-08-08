@@ -8490,9 +8490,20 @@ pub fn render_position_review(p: PositionReviewParams<'_>) -> String {
 /// 是权威信息。行业分布按市值加权聚合, top5 + 其余归入 "其他"。
 async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::ReviewTaskOutcome {
     use stock_analysis::database::closing_valuation::{
-        latest_persisted_valuation_view, ClosingValuationView,
+        persisted_valuation_view_for_date, ClosingValuationView,
     };
     use stock_analysis::database::user_account_summary::latest as latest_user_account_summary;
+    // BR-225b: R-11 与 R-07 同因 — latest 在 review_date 估值缺失时 (数据
+    // Unsafe 未生成) 会 fallback 到上一交易日, 把 8/6 收盘价冒充 8/7。
+    // 按 review_date 精确取数, 缺失时出声 no_data (不用旧价冒充)。
+    let trading_date = match chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            let reason = format!("invalid review date {date}: {error}");
+            log_dispatcher_attempt("R-11", false, 0, &reason);
+            return crate::review_batch::ReviewTaskOutcome::failed(false, reason);
+        }
+    };
 
     let summary = match tokio::task::spawn_blocking(latest_user_account_summary).await {
         Ok(Ok(Some(summary))) => summary,
@@ -8514,7 +8525,11 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
     };
 
     let valuation: Option<ClosingValuationView> =
-        match tokio::task::spawn_blocking(latest_persisted_valuation_view).await {
+        match tokio::task::spawn_blocking(move || {
+            persisted_valuation_view_for_date(trading_date)
+        })
+        .await
+        {
             Ok(Ok(valuation)) => valuation,
             Ok(Err(error)) => {
                 let reason = format!("closing valuation read failed: {error}");
