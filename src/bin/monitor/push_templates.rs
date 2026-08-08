@@ -8214,24 +8214,39 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
     // 4. 可做T持仓 (结构过滤: Holding + 整百股 + 成本价 > 0)
     //    做T 区间以**收盘价**为基准 (BR-225 修正: 此前误用成本价,
     //    现价远低于成本时给出荒谬低吸位)
-    let closes: std::collections::HashMap<String, f64> =
-        match tokio::task::spawn_blocking(|| {
-            use stock_analysis::database::closing_valuation::latest_persisted_valuation_view;
-            match latest_persisted_valuation_view() {
+    //    BR-225b (2026-08-08): 基准必须用 review_date 对应收盘估值 —
+    //    此前用 latest, 周五估值缺失(数据 Unsafe)时周六补投会 fallback
+    //    到 8/6 估值, 把周四收盘价冒充周五价。缺失 → fail-closed 跳过
+    //    做T 候选 + warn, 不用上一交易日价格冒充。
+    let closes: std::collections::HashMap<String, f64> = match tokio::task::spawn_blocking(
+        move || {
+            use stock_analysis::database::closing_valuation::persisted_valuation_view_for_date;
+            match persisted_valuation_view_for_date(trading_date) {
                 Ok(Some(view)) => view
                     .valuation
                     .items
                     .iter()
                     .filter_map(|item| item.close.map(|close| (item.code.clone(), close)))
                     .collect(),
-                _ => std::collections::HashMap::new(),
+                Ok(None) => {
+                    log::warn!(
+                        "[R-07][BR-225b] 收盘估值缺失 price_date={} 做T 候选跳过 (不用上一交易日价格冒充)",
+                        trading_date
+                    );
+                    std::collections::HashMap::new()
+                }
+                Err(error) => {
+                    log::warn!("[R-07][BR-225b] 收盘估值读取失败: {error}");
+                    std::collections::HashMap::new()
+                }
             }
-        })
-        .await
-        {
-            Ok(closes) => closes,
-            Err(_) => std::collections::HashMap::new(),
-        };
+        },
+    )
+    .await
+    {
+        Ok(closes) => closes,
+        Err(_) => std::collections::HashMap::new(),
+    };
     match tokio::task::spawn_blocking(stock_analysis::portfolio::get_positions).await {
         Ok(Ok(positions)) => {
             for position in positions {

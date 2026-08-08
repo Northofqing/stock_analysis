@@ -114,6 +114,34 @@ pub fn latest_persisted_valuation_view() -> Result<Option<ClosingValuationView>,
     latest_persisted_valuation_view_with_conn(&mut c)
 }
 
+/// 指定价格日期的收盘估值 (BR-225 修复: R-07 做T 基准必须用 review_date
+/// 对应的估值, 不能 fallback 到上一交易日 — 周六补投场景 latest 是 8/6,
+/// 会把周四收盘价冒充周五价)。缺失返回 None, 调用方负责出声。
+pub fn persisted_valuation_view_for_date(
+    price_date: chrono::NaiveDate,
+) -> Result<Option<ClosingValuationView>, String> {
+    let db = crate::database::DatabaseManager::get();
+    let mut c = db.get_conn().map_err(|e| e.to_string())?;
+    persisted_valuation_view_for_date_conn(&mut c, price_date)
+}
+
+fn persisted_valuation_view_for_date_conn(
+    c: &mut SqliteConnection,
+    price_date: chrono::NaiveDate,
+) -> Result<Option<ClosingValuationView>, String> {
+    let row: Option<RunRow> = diesel::sql_query(
+        "SELECT id,run_id,price_date,provider,covered,total,total_market_value,total_unrealized_pnl FROM closing_valuation_run WHERE price_date=?1 ORDER BY id DESC LIMIT 1",
+    )
+    .bind::<diesel::sql_types::Text, _>(price_date.format("%Y-%m-%d").to_string())
+    .get_result(c)
+    .optional()
+    .map_err(|e| e.to_string())?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    materialize_valuation_view(c, row)
+}
+
 fn latest_persisted_valuation_view_with_conn(
     c: &mut SqliteConnection,
 ) -> Result<Option<ClosingValuationView>, String> {
@@ -121,6 +149,13 @@ fn latest_persisted_valuation_view_with_conn(
     let Some(row) = row else {
         return Ok(None);
     };
+    materialize_valuation_view(c, row)
+}
+
+fn materialize_valuation_view(
+    c: &mut SqliteConnection,
+    row: RunRow,
+) -> Result<Option<ClosingValuationView>, String> {
     let items: Vec<ClosingValuationItem> = diesel::sql_query("SELECT code,name,quantity,cost_price,close,market_value,unrealized_pnl,unrealized_return_pct,daily_price_pnl FROM closing_valuation_item WHERE run_id=? ORDER BY code").bind::<diesel::sql_types::Text,_>(&row.run_id).load::<ItemRow>(&mut *c).map_err(|e| e.to_string())?.into_iter().map(|i| ClosingValuationItem{code:i.code,name:i.name,quantity:i.quantity as u64,cost_price:i.cost_price,close:i.close,market_value:i.market_value,unrealized_pnl:i.unrealized_pnl,unrealized_return_pct:i.unrealized_return_pct,daily_price_pnl:i.daily_price_pnl}).collect();
     Ok(Some(ClosingValuationView {
         persisted_run_row_id: row.id,
@@ -176,6 +211,67 @@ mod tests {
             total_unrealized_pnl: None,
             items,
         }
+    }
+
+    #[test]
+    fn for_date_returns_exact_price_date_not_latest() {
+        let mut conn = connection();
+        let mut prior = view(vec![item("TEST_CODE_000001", Some(11.0))]);
+        prior.price_date = NaiveDate::from_ymd_opt(2026, 8, 6).expect("date");
+        let inserted_prior =
+            save_closing_valuation_with_conn(&mut conn, &prior).expect("insert prior date");
+        assert!(inserted_prior.inserted);
+
+        let mut latest = view(vec![item("TEST_CODE_000001", Some(22.0))]);
+        latest.price_date = NaiveDate::from_ymd_opt(2026, 8, 7).expect("date");
+        let inserted_latest =
+            save_closing_valuation_with_conn(&mut conn, &latest).expect("insert latest date");
+        assert!(inserted_latest.inserted);
+
+        // latest 是 8/7; for_date(8/6) 必须返回 8/6 而不是 latest (BR-225b)
+        let prior_view = persisted_valuation_view_for_date_conn(
+            &mut conn,
+            NaiveDate::from_ymd_opt(2026, 8, 6).expect("date"),
+        )
+        .expect("for_date read")
+        .expect("prior persisted");
+        assert_eq!(prior_view.valuation.price_date, prior.price_date);
+        assert_eq!(
+            prior_view
+                .valuation
+                .items
+                .first()
+                .expect("item")
+                .close,
+            Some(11.0)
+        );
+
+        let latest_view = persisted_valuation_view_for_date_conn(
+            &mut conn,
+            NaiveDate::from_ymd_opt(2026, 8, 7).expect("date"),
+        )
+        .expect("for_date read")
+        .expect("latest persisted");
+        assert_eq!(latest_view.valuation.price_date, latest.price_date);
+        assert_eq!(
+            latest_view
+                .valuation
+                .items
+                .first()
+                .expect("item")
+                .close,
+            Some(22.0)
+        );
+
+        // 不存在的日期 → None (调用方出声, 不用 latest 冒充)
+        assert!(
+            persisted_valuation_view_for_date_conn(
+                &mut conn,
+                NaiveDate::from_ymd_opt(2026, 8, 8).expect("date")
+            )
+            .expect("for_date read")
+            .is_none()
+        );
     }
 
     #[test]
