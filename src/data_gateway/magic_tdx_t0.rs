@@ -700,9 +700,10 @@ fn evidence_for_quote(
     identity: &T0RequestIdentity,
     quote: SecurityQuote,
     requested_at: DateTime<Utc>,
+    clock: Option<DateTime<Utc>>,
 ) -> std::result::Result<ValidatedT0Evidence, MagicTdxT0Rejection> {
     let code = identity.instrument.code().to_owned();
-    let quote_received_at = Utc::now();
+    let quote_received_at = clock.unwrap_or_else(Utc::now);
     let source_at = source_time(&quote.servertime, quote_received_at).map_err(|mut error| {
         error.code.clone_from(&code);
         error
@@ -875,9 +876,24 @@ fn finalize_t0_batch(
     })
 }
 
+/// 生产入口: 以当前墙钟作为观测时刻。
 pub fn fetch_magic_tdx_t0_batch(
     codes: &[String],
     requested_at: DateTime<Utc>,
+) -> Result<MagicTdxT0Batch> {
+    fetch_magic_tdx_t0_batch_with_clock(codes, requested_at, None)
+}
+
+/// 回放入口: 注入观测时钟 (None = 墙钟)。
+///
+/// `source_time` 用观测时刻的**日期**解码 TDX servertime (HH:MM:SS 无日期),
+/// freshness 门也用观测时刻计算 age — 回放周五历史数据时必须把时钟注入
+/// 到周五盘中/收盘时刻, 否则周六墙钟会把周五收盘快照判定为 quote_stale
+/// (age≈9.5h) 或未来时间。生产路径传 None, 行为与注入前完全一致。
+pub fn fetch_magic_tdx_t0_batch_with_clock(
+    codes: &[String],
+    requested_at: DateTime<Utc>,
+    clock: Option<DateTime<Utc>>,
 ) -> Result<MagicTdxT0Batch> {
     if codes.is_empty() {
         return Err(anyhow!(
@@ -905,7 +921,7 @@ pub fn fetch_magic_tdx_t0_batch(
     // 不再整批失败; 批次 source_at = 有效 quote 的最小值。
     let mut quote_times: Vec<(String, DateTime<Utc>)> = Vec::with_capacity(quotes.len());
     let mut quote_rejections = Vec::new();
-    let quote_observed_at = Utc::now();
+    let quote_observed_at = clock.unwrap_or_else(Utc::now);
     for (identity, quote) in identities.iter().zip(&quotes) {
         match source_time(&quote.servertime, quote_observed_at) {
             Ok(time) => quote_times.push((identity.instrument.code().to_string(), time)),
@@ -933,13 +949,13 @@ pub fn fetch_magic_tdx_t0_batch(
         if skip_codes.contains(identity.instrument.code()) {
             continue;
         }
-        match evidence_for_quote(&client, identity, quote, requested_at) {
+        match evidence_for_quote(&client, identity, quote, requested_at, clock) {
             Ok(record) => records.push(record),
             Err(error) => rejections.push(error),
         }
     }
     rejections.extend(quote_rejections);
-    let observed_at = Utc::now();
+    let observed_at = clock.unwrap_or_else(Utc::now);
     finalize_t0_batch(
         requested_at,
         source_at,
