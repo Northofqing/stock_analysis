@@ -16,7 +16,7 @@
 //!  B. 主力资金净流入排名前 N （表明真金白银在买）
 //!  C. 板块名称命中宏观新闻 / AI 推荐文本（可选加权）
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use log::{info, warn};
 use std::collections::{HashMap, HashSet};
 
@@ -219,10 +219,26 @@ pub fn fetch_board_ranking(fid: &str, top_n: usize) -> Result<Vec<ConceptBoard>>
     if !matches!(fid, "f3" | "f62") || top_n == 0 {
         anyhow::bail!("板块排行请求非法: fid={fid:?} top_n={top_n}");
     }
-    anyhow::bail!(
-        "sector ranking unsupported: released BoardDataGateway lacks complete \
-         vol_ratio/turnover/day1_ratio/day5_ratio fields required by ConceptBoard"
-    )
+    // I-09 修复 (2026-08-09): 走统一边界 BoardRankingGateway (真实 Eastmoney
+    // 板块排行, ConceptBoard 全字段)。6f4b601 起旧实现被替换为硬编码 bail,
+    // 当前二进制板块样本必失败 — 8/7 生产正常只因跑的是旧二进制。
+    let facts = crate::data_gateway::board_ranking::BoardRankingGateway::new()
+        .fetch_top(fid, top_n)
+        .context("板块排行网关失败")?;
+    Ok(facts
+        .into_iter()
+        .map(|fact| ConceptBoard {
+            code: fact.code,
+            name: fact.name,
+            change_pct: fact.change_pct,
+            main_inflow: fact.main_inflow,
+            leader_name: fact.leader_name,
+            vol_ratio: fact.vol_ratio,
+            turnover: fact.turnover,
+            main_net_pct_today: fact.day1_ratio,
+            main_net_pct_5d: fact.day5_ratio,
+        })
+        .collect())
 }
 
 /// 同步关键词检索没有已发布的统一合同；显式返回不可用。

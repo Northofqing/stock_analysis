@@ -1,6 +1,7 @@
 //! BR-164 evidence-preserving production financial/news data gateway.
 
 pub mod board;
+pub mod board_ranking;
 mod board_runtime;
 pub mod capital;
 pub mod chain_intelligence;
