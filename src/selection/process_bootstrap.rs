@@ -591,18 +591,25 @@ mod tests {
     fn operational_invocation_gates_selection_against_release_materials() {
         let parsed = parse(&["monitor", "--review"]).expect("review invocation");
         let state = classify_parsed_invocation(parsed, true);
-        // The checked-in repository ships no activation file, so the BR-193
-        // gate must fail closed with the concrete missing token (never the
-        // old placeholder "selection_v2_activation_not_released").
-        assert!(matches!(
-            state,
+        // 仓库自 Phase 0 (2026-08-07) 起携带激活材料; 生效时刻已过后 gate
+        // 返回 Enabled, 未生效时返回 BR-193 具体令牌。断言必须覆盖两态,
+        // 且绝不允许旧占位符 "selection_v2_activation_not_released"。
+        match state {
             BoundSelectionProcess::Operational {
-                selection: SelectionCapabilityState::Disabled {
-                    reason_code: "activation_missing",
-                },
+                selection: SelectionCapabilityState::Enabled,
                 ..
+            } => {}
+            BoundSelectionProcess::Operational {
+                selection: SelectionCapabilityState::Disabled { reason_code },
+                ..
+            } => {
+                assert_ne!(
+                    reason_code, "selection_v2_activation_not_released",
+                    "BR-193 门已重接, 旧占位符必须消失"
+                );
             }
-        ));
+            _ => panic!("expected Operational bound process with Enabled or BR-193 Disabled token"),
+        }
     }
 
     #[test]

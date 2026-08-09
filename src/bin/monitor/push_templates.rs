@@ -13254,10 +13254,16 @@ enum DataModeNotificationPlan {
     },
 }
 
+/// BR-225c 抖动抑制稳定窗口: Full↔Degraded 互切与 Unsafe→恢复需状态稳定
+/// 该时长后才推送 (8/7 实测 Sina 报价延迟波动导致每 1-5min 切换一次,
+/// 全天 62 条状态通知占 83%)。→Unsafe 恶化不受窗口限制 (风险通知立即)。
+const DATA_MODE_STABLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+
 fn data_mode_notification_plan(
     input: &stock_analysis::monitor::data_mode::DataHealthInput,
     prev: Option<stock_analysis::monitor::data_mode::DataMode>,
     persistent_reminder_due: bool,
+    pending_stable_since: Option<std::time::Instant>,
 ) -> DataModeNotificationPlan {
     use stock_analysis::monitor::data_mode::{evaluate as dm_evaluate, DataMode as LibDM};
 
@@ -13269,11 +13275,27 @@ fn data_mode_notification_plan(
             current,
             reason: DataModeDispatchReason::Transition,
         },
-        (Some(previous), current) if previous != current => DataModeNotificationPlan::Dispatch {
-            previous: Some(previous),
-            current,
-            reason: DataModeDispatchReason::Transition,
-        },
+        (Some(previous), current) if previous != current => {
+            // BR-225c: 恶化 →Unsafe 立即推 (风险不延迟);
+            // 其他切换 (Full↔Degraded 抖动 / Unsafe→恢复) 需稳定窗口已过。
+            if current == LibDM::Unsafe {
+                DataModeNotificationPlan::Dispatch {
+                    previous: Some(previous),
+                    current,
+                    reason: DataModeDispatchReason::Transition,
+                }
+            } else if pending_stable_since.is_some_and(|at| {
+                at.elapsed() >= DATA_MODE_STABLE_WINDOW
+            }) {
+                DataModeNotificationPlan::Dispatch {
+                    previous: Some(previous),
+                    current,
+                    reason: DataModeDispatchReason::Transition,
+                }
+            } else {
+                DataModeNotificationPlan::EstablishSilently
+            }
+        }
         (Some(LibDM::Unsafe), LibDM::Unsafe) if persistent_reminder_due => {
             DataModeNotificationPlan::Dispatch {
                 previous: Some(LibDM::Unsafe),
@@ -13305,13 +13327,15 @@ pub async fn push_data_mode_change(
     prev: Option<stock_analysis::monitor::data_mode::DataMode>,
     persistent_reminder_due: bool,
     banner: Option<&BannerCtx>,
+    pending_stable_since: Option<std::time::Instant>,
 ) -> Result<ModeDispatchResult, String> {
     use stock_analysis::monitor::data_mode::{evaluate as dm_evaluate, DataMode as LibDM};
 
     let health = dm_evaluate(input, prev);
 
     let (prev_mode, new_mode, dispatch_reason) =
-        match data_mode_notification_plan(input, prev, persistent_reminder_due) {
+        match data_mode_notification_plan(input, prev, persistent_reminder_due, pending_stable_since)
+        {
             DataModeNotificationPlan::EstablishSilently => {
                 return Ok(ModeDispatchResult::EstablishedSilently);
             }
@@ -19860,6 +19884,7 @@ mod tests {
             Some(LibDM::Full),
             false,
             Some(&banner_normal_full()),
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(301)),
         )
         .await;
         assert!(result.is_ok(), "T-02 orchestrator: {:?}", result);
@@ -19896,6 +19921,7 @@ mod tests {
             Some(LibDM::Full),
             false,
             Some(&banner_normal_full()),
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(301)),
         )
         .await;
         assert!(result.is_ok());
@@ -19909,7 +19935,7 @@ mod tests {
     fn initial_unsafe_data_mode_requires_a_status_delivery_plan() {
         use stock_analysis::monitor::data_mode::{DataHealthInput, DataMode as LibDM};
 
-        let plan = data_mode_notification_plan(&DataHealthInput::default(), None, false);
+        let plan = data_mode_notification_plan(&DataHealthInput::default(), None, false, None);
         assert!(matches!(
             plan,
             DataModeNotificationPlan::Dispatch {
@@ -19925,7 +19951,7 @@ mod tests {
         use stock_analysis::monitor::data_mode::{DataHealthInput, DataMode as LibDM};
 
         assert!(matches!(
-            data_mode_notification_plan(&DataHealthInput::default(), Some(LibDM::Unsafe), true,),
+            data_mode_notification_plan(&DataHealthInput::default(), Some(LibDM::Unsafe), true, None),
             DataModeNotificationPlan::Dispatch {
                 current: LibDM::Unsafe,
                 reason: DataModeDispatchReason::PersistentUnsafeReminder,
@@ -19933,7 +19959,7 @@ mod tests {
             }
         ));
         assert_eq!(
-            data_mode_notification_plan(&DataHealthInput::default(), Some(LibDM::Unsafe), false,),
+            data_mode_notification_plan(&DataHealthInput::default(), Some(LibDM::Unsafe), false, None),
             DataModeNotificationPlan::EstablishSilently
         );
     }
@@ -19960,7 +19986,7 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner()) = Some(banner.clone());
 
         assert_eq!(
-            push_data_mode_change(&input, Some(LibDM::Unsafe), true, Some(&banner))
+            push_data_mode_change(&input, Some(LibDM::Unsafe), true, Some(&banner), None)
                 .await
                 .expect("due persistent Unsafe reminder must use the governed path"),
             ModeDispatchResult::Delivery(crate::notify::PushOutcome::Pushed)
@@ -19991,7 +20017,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(banner.clone());
 
-        let result = push_data_mode_change(&input, None, false, Some(&banner))
+        let result = push_data_mode_change(&input, None, false, Some(&banner), None)
             .await
             .expect("initial Unsafe mode must use the governed status path");
 
@@ -20014,7 +20040,7 @@ mod tests {
             orderbook_max_age_secs: 600,
         };
         assert_eq!(
-            data_mode_notification_plan(&input, None, false),
+            data_mode_notification_plan(&input, None, false, None),
             DataModeNotificationPlan::EstablishSilently
         );
     }
@@ -20061,6 +20087,7 @@ mod tests {
             Some(LibDM::Full),
             false,
             Some(&degraded_banner),
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(301)),
         )
         .await
         .expect("Full to Degraded delivery");
@@ -20079,6 +20106,7 @@ mod tests {
             Some(LibDM::Degraded),
             false,
             Some(&unsafe_banner),
+            None, // →Unsafe 恶化立即推, 不受稳定窗口限制
         )
         .await
         .expect("Degraded to Unsafe delivery");

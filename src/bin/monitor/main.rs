@@ -2190,6 +2190,18 @@ pub static LATEST_DATA_MODE: Lazy<
     std::sync::Mutex<Option<stock_analysis::monitor::data_mode::DataMode>>,
 > = Lazy::new(|| std::sync::Mutex::new(None));
 
+/// BR-225c: 抖动抑制 — 记录"待确认切换"的观测时刻。模式在稳定窗口
+/// (300s) 内反复横跳时不推, 稳定后才通知 (→Unsafe 恶化除外, 立即推)。
+#[derive(Clone, Copy)]
+pub(crate) struct DataModePendingStable {
+    mode: stock_analysis::monitor::data_mode::DataMode,
+    since: std::time::Instant,
+}
+
+static DATA_MODE_PENDING_STABLE: Lazy<
+    std::sync::Mutex<Option<DataModePendingStable>>,
+> = Lazy::new(|| std::sync::Mutex::new(None));
+
 static DATA_MODE_UNSAFE_REMINDER: Lazy<
     std::sync::Mutex<stock_analysis::monitor::data_mode::PersistentUnsafeReminder>,
 > = Lazy::new(|| std::sync::Mutex::new(Default::default()));
@@ -2293,10 +2305,71 @@ async fn evaluate_data_mode_hook() {
         return;
     }
 
+    // BR-225c: 抖动抑制 — 非恶化切换需稳定 300s 才推。pending 记录首个
+    // 不同模式的观测时刻; 窗口内静默 (warn 一次, v15 出声规则); 投递后清空。
+    let pending_since = {
+        let mut pending = match DATA_MODE_PENDING_STABLE.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                log::error!("[DataMode-hook] pending stable lock poisoned");
+                return;
+            }
+        };
+        match pending.as_mut() {
+            Some(state) => {
+                if state.mode != health.mode {
+                    *state = DataModePendingStable {
+                        mode: health.mode,
+                        since: std::time::Instant::now(),
+                    };
+                }
+                Some(state.since)
+            }
+            None => None,
+        }
+    };
     let result =
-        match pt::push_data_mode_change(&input, prev, persistent_reminder_due, Some(&banner)).await
+        match pt::push_data_mode_change(
+            &input,
+            prev,
+            persistent_reminder_due,
+            Some(&banner),
+            pending_since,
+        )
+        .await
         {
-            Ok(result) => result,
+            Ok(result) => {
+                let mut pending = match DATA_MODE_PENDING_STABLE.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        log::error!("[DataMode-hook] pending stable lock poisoned");
+                        return;
+                    }
+                };
+                match &result {
+                    pt::ModeDispatchResult::EstablishedSilently => {
+                        // 抖动窗口内跳过 → 出声 (BR-225c, v15 静默路径可见)
+                        if pending_since.is_none() && prev.is_some() && prev != Some(health.mode)
+                        {
+                            log::warn!(
+                                "[DataMode-hook][BR-225c] 状态切换 {:?} → {:?} 在 300s 稳定窗口内, 跳过通知 (模式仍生效, 仅推送节流)",
+                                prev,
+                                health.mode
+                            );
+                        }
+                        if pending.is_none() {
+                            *pending = Some(DataModePendingStable {
+                                mode: health.mode,
+                                since: std::time::Instant::now(),
+                            });
+                        }
+                    }
+                    pt::ModeDispatchResult::Delivery(_) => {
+                        *pending = None;
+                    }
+                }
+                result
+            }
             Err(error) => {
                 log::error!("[DataMode-hook] change push failed: {error}");
                 return;
