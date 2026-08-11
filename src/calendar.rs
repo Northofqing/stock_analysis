@@ -114,7 +114,7 @@ static HOLIDAYS: Lazy<RwLock<HashSet<NaiveDate>>> = Lazy::new(|| {
 
 #[derive(Debug)]
 struct VerifiedTradingCalendar {
-    coverage_year: i32,
+    coverage_years: Vec<i32>,
     closures: BTreeSet<NaiveDate>,
 }
 
@@ -126,7 +126,7 @@ static VERIFIED_TRADING_CALENDAR: Lazy<Result<VerifiedTradingCalendar, String>> 
 });
 
 fn parse_verified_trading_calendar(raw: &str) -> Result<VerifiedTradingCalendar, String> {
-    let mut coverage_year = None;
+    let mut coverage_years: Vec<i32> = Vec::new();
     let mut source = None;
     let mut closures = BTreeSet::new();
     for (line_index, line) in raw.lines().enumerate() {
@@ -134,14 +134,17 @@ fn parse_verified_trading_calendar(raw: &str) -> Result<VerifiedTradingCalendar,
         if value.is_empty() {
             continue;
         }
-        if let Some(year) = value.strip_prefix("# year=") {
-            if coverage_year.is_some() {
+        if let Some(years) = value.strip_prefix("# year=") {
+            // 多覆盖年: 逗号分隔, 如 "# year=2025,2026" (250 天 K 线窗口跨年必需)。
+            if !coverage_years.is_empty() {
                 return Err("duplicate checked-in trading-calendar coverage year".to_owned());
             }
-            coverage_year = Some(
-                year.parse::<i32>()
-                    .map_err(|_| "invalid checked-in trading-calendar coverage year".to_owned())?,
-            );
+            for y in years.split(',') {
+                coverage_years.push(
+                    y.trim().parse::<i32>()
+                        .map_err(|_| "invalid checked-in trading-calendar coverage year".to_owned())?,
+                );
+            }
             continue;
         }
         if let Some(authority) = value.strip_prefix("# source=") {
@@ -169,16 +172,17 @@ fn parse_verified_trading_calendar(raw: &str) -> Result<VerifiedTradingCalendar,
             return Err(format!("duplicate checked-in trading-calendar date {date}"));
         }
     }
-    let coverage_year = coverage_year
-        .ok_or_else(|| "checked-in trading-calendar coverage is missing".to_owned())?;
+    if coverage_years.is_empty() {
+        return Err("checked-in trading-calendar coverage is missing".to_owned());
+    }
     if source.is_none() {
         return Err("checked-in trading-calendar authority is missing".to_owned());
     }
-    if closures.is_empty() || closures.iter().any(|date| date.year() != coverage_year) {
+    if closures.is_empty() || closures.iter().any(|date| !coverage_years.contains(&date.year())) {
         return Err("checked-in trading-calendar coverage is inconsistent".to_owned());
     }
     Ok(VerifiedTradingCalendar {
-        coverage_year,
+        coverage_years,
         closures,
     })
 }
@@ -191,7 +195,7 @@ pub fn verified_a_share_trading_day(date: NaiveDate) -> Result<bool, String> {
     let calendar = VERIFIED_TRADING_CALENDAR
         .as_ref()
         .map_err(std::clone::Clone::clone)?;
-    if date.year() != calendar.coverage_year {
+    if !calendar.coverage_years.contains(&date.year()) {
         return Err(format!(
             "checked-in A-share trading-calendar coverage unavailable for {}",
             date.year()
