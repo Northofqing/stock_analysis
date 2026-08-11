@@ -1797,6 +1797,66 @@ fn store_banner(banner: push_templates::BannerCtx) -> Result<(), String> {
     Ok(())
 }
 
+/// 最近交易日（今天若周一至五则为今天，否则回溯到上一工作日）。
+fn latest_trading_date(today: chrono::NaiveDate) -> chrono::NaiveDate {
+    use chrono::Datelike;
+    let mut day = today;
+    loop {
+        match day.weekday() {
+            chrono::Weekday::Sat | chrono::Weekday::Sun => {
+                day = day.pred_opt().expect("date before year 1");
+            }
+            _ => return day,
+        }
+    }
+}
+
+/// 任务#3: 持仓快照过期检查 — 最近交易日收盘后仍无当日快照 → 推送提醒。
+/// 触发点: 启动时 + 每日 15:10（收盘后，快照应在 15:00 后上传）。
+/// 每日最多推 1 次（静态日期去重）；快照新鲜或无记录时仅日志，不出声推送。
+async fn check_snapshot_staleness_and_notify() {
+    use stock_analysis::database::user_account_summary;
+    let Some(summary) = user_account_summary::latest().ok().flatten() else {
+        log::warn!("[快照提醒] user_account_summary 无记录 — 从未上传快照，跳过提醒");
+        return;
+    };
+    let today = chrono::Local::now().date_naive();
+    let last_trading = latest_trading_date(today);
+    let Ok(snapshot_date) =
+        chrono::NaiveDate::parse_from_str(&summary.effective_at[..10], "%Y-%m-%d")
+    else {
+        log::warn!(
+            "[快照提醒] effective_at 解析失败: {}（格式应为 YYYY-MM-DDTHH:MM:SS+08:00）",
+            summary.effective_at
+        );
+        return;
+    };
+    if snapshot_date >= last_trading {
+        log::debug!(
+            "[快照提醒] 快照新鲜: effective_at={}",
+            summary.effective_at
+        );
+        return;
+    }
+    // 每日一推去重
+    static LAST: std::sync::Mutex<Option<chrono::NaiveDate>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if *last == Some(today) {
+        return;
+    }
+    *last = Some(today);
+    let days_behind = (last_trading - snapshot_date).num_days();
+    let text = format!(
+        "[快照提醒] 持仓快照已过期 {} 个交易日：最新 {}（总资产 {:.2}）。请上传今日收盘快照，虚拟盘资金口径才会更新。",
+        days_behind, summary.effective_at, summary.total_assets
+    );
+    log::warn!("[快照提醒] {}", text);
+    let outcome = push_governor_v3(&text, PushKind::SnapshotStale, None).await;
+    if !outcome.is_pushed() {
+        log::warn!("[快照提醒] 推送未投递: {:?}", outcome);
+    }
+}
+
 fn refresh_closing_valuation_note() {
     let account = stock_analysis::database::user_account_summary::latest()
         .ok()
@@ -4291,6 +4351,9 @@ async fn main() {
         }
         evaluate_data_mode_hook().await;
         audit_full_market_rankings_unavailable("monitor_startup");
+
+        // 任务#3: 启动时快照过期检查（stale 则推提醒；每日去重）
+        check_snapshot_staleness_and_notify().await;
 
         let main_loops = async {
             // Phase 3: 移除 news_pipeline_loop_v15_3 (#2)；统一新闻 Gateway
@@ -6972,8 +7035,12 @@ async fn monitor_loop() {
                     Err(e) => log::warn!("[paper_sell] 盘中扫描失败: {}", e),
                 }
             }
-            // 15:30 整盘扫 (R5) — evening_review 内部有当日防重入 (review fix Issue #7)
+            // 任务#3: 每日 15:10 快照过期检查（收盘后用户应上传当日快照）
             let now = chrono::Local::now();
+            if now.hour() == 15 && (10..=13).contains(&now.minute()) {
+                check_snapshot_staleness_and_notify().await;
+            }
+            // 15:30 整盘扫 (R5) — evening_review 内部有当日防重入 (review fix Issue #7)
             if now.hour() == 15 && now.minute() == 30 {
                 let today = now.date_naive();
                 match risk_context {

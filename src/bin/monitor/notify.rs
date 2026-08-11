@@ -106,6 +106,8 @@ pub enum PushKind {
     PaperTrade,
     /// 虚拟盘卖出 (BR-234, ℹ️ 5min批, 默认降级) [MVP-1]
     PaperSell,
+    /// 持仓快照过期提醒 (任务#3, ℹ️ 每日1次, 默认降级) [MVP-1]
+    SnapshotStale,
     /// 尾盘决策 (T-12, ⚡ 1次/日) [MVP-4]
     CloseCall,
     // ============= v12 §14.2 盘后 PushKind =============
@@ -344,6 +346,7 @@ impl PushKind {
                 | PushKind::ForbiddenOps
                 | PushKind::PaperTrade
                 | PushKind::PaperSell
+                | PushKind::SnapshotStale
                 | PushKind::CloseCall
                 | PushKind::ReviewMarket
                 | PushKind::ReviewLhb
@@ -381,6 +384,8 @@ impl PushKind {
             PushKind::PaperTrade => Some(300),
             // 5 min / 票 (BR-234 虚拟盘卖出)
             PushKind::PaperSell => Some(300),
+            // 每日快照提醒 (调用方已按日去重)
+            PushKind::SnapshotStale => Some(300),
             // 1次/日
             PushKind::CloseCall => Some(86_400),
             // 盘后系列 1次/日 (推送时机控制而非冷却)
@@ -488,6 +493,7 @@ impl PushKind {
             PushKind::ForbiddenOps => "禁止操作",
             PushKind::PaperTrade => "虚拟盘",
             PushKind::PaperSell => "虚拟盘卖出",
+            PushKind::SnapshotStale => "快照过期提醒",
             PushKind::CloseCall => "尾盘决策",
             PushKind::ReviewMarket => "盘面走向",
             PushKind::ReviewLhb => "龙虎榜",
@@ -817,6 +823,17 @@ pub const DISPATCH_TABLE: &[(PushKind, DispatchRow)] = &[
             cooldown_scope: CooldownScope::PerTicket,
             label: "虚拟盘卖出",
             stable_template_id: "papersell_v1",
+        },
+    ),
+    // ============== 任务#3: 持仓快照过期提醒 ==============
+    (
+        PushKind::SnapshotStale,
+        DispatchRow {
+            level: PushLevel::Info,
+            cooldown_secs: Some(300),
+            cooldown_scope: CooldownScope::Global,
+            label: "快照过期提醒",
+            stable_template_id: "snapshotstale_v1",
         },
     ),
 ];
@@ -6018,14 +6035,14 @@ mod tests {
         }
     }
 
-    // ============== v17.x: DISPATCH_TABLE 16 rows 完整性 (BR-234 +1) ==============
+    // ============== v17.x: DISPATCH_TABLE 17 rows 完整性 (BR-234 + 任务#3) ==============
 
     #[test]
-    fn dispatch_table_size_is_sixteen() {
+    fn dispatch_table_size_is_seventeen() {
         assert_eq!(
             DISPATCH_TABLE.len(),
-            16,
-            "v17.x DISPATCH_TABLE 应 16 rows (3 v17.6 + 6 v17.7 + 6 v17.8 + 1 BR-234)"
+            17,
+            "v17.x DISPATCH_TABLE 应 17 rows (3 v17.6 + 6 v17.7 + 6 v17.8 + 1 BR-234 + 1 #3)"
         );
     }
 
@@ -6058,8 +6075,9 @@ mod tests {
             PushKind::BlockTradeIntradayConfirm,
             PushKind::BlockTradePriceRange,
             PushKind::PaperSell,
+            PushKind::SnapshotStale,
         ];
-        assert_eq!(expected.len(), 16);
+        assert_eq!(expected.len(), 17);
         for k in expected {
             assert!(k.dispatch_row().is_some(), "{:?} 应在 DISPATCH_TABLE 内", k);
         }
