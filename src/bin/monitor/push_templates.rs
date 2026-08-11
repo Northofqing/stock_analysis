@@ -2861,6 +2861,43 @@ fn fetch_realtime_quote_batch_strict(
     Ok(quotes)
 }
 
+/// BR-233 (2026-08-10): R-07 晚间明日观察池专用 — 盘后收盘静态快照。
+/// 实时行情 5s 红线 (BR-218) 盘中不变; 收市后 (21:00 晚间装配) 最后成交
+/// 时间必然超龄, 但价格=当日收盘价, 走 settled-close 准入
+/// (source_at 日期==trading_date 且该时段已收盘; 盘中误调 fail-closed)。
+fn fetch_settled_close_batch_strict(
+    codes: &[&str],
+    trading_date: chrono::NaiveDate,
+) -> Result<
+    std::collections::HashMap<String, stock_analysis::data_gateway::RealtimeMarketQuote>,
+    String,
+> {
+    if codes.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let requested: Vec<String> = codes.iter().map(|code| (*code).to_string()).collect();
+    let batch = stock_analysis::data_gateway::MarketDataGateway::new()
+        .settled_close_quotes(&requested, trading_date)
+        .map_err(|error| format!("盘后收盘快照 Gateway 不可用: {error}"))?;
+    if batch.is_verified_empty() {
+        return Err("盘后收盘快照 Gateway 返回不允许的 verified-empty".to_string());
+    }
+    let quotes: std::collections::HashMap<_, _> = batch
+        .records()
+        .iter()
+        .cloned()
+        .map(|quote| (quote.code.clone(), quote))
+        .collect();
+    if quotes.len() != requested.len() {
+        return Err(format!(
+            "盘后收盘快照 Gateway 批次不完整: requested={} actual={}",
+            requested.len(),
+            quotes.len()
+        ));
+    }
+    Ok(quotes)
+}
+
 pub fn fetch_realtime_quotes_batch(
     codes: &[&str],
 ) -> Result<std::collections::HashMap<String, f32>, String> {
@@ -8121,8 +8158,40 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
         Err(error) => log::warn!("[R-07][BR-222] A档候选 join 失败: {error}"),
     }
 
-    // 2. 龙虎榜强票 (净买入 > 0 Top5; 无价格 → 0.0 + T-11 复核注记)
+    // 2. 龙虎榜强票 (净买入 > 0 Top5)
+    //    BR-232 修复 (2026-08-10): 上游 record 无 name/价格契约 —
+    //    name 与收盘价从 closing_valuation 视图补齐 (同做T候选基准);
+    //    视图缺失的 code → name 退化 code + 0.0 价格 + T-11 复核注记 (fail-closed)。
     //    龙虎榜批次同时是 R-07 counted ceremony 的 counted source (BR-140/BR-192)。
+    let closes: std::collections::HashMap<String, (String, f64)> = match tokio::task::spawn_blocking(
+        move || {
+            use stock_analysis::database::closing_valuation::persisted_valuation_view_for_date;
+            match persisted_valuation_view_for_date(trading_date) {
+                Ok(Some(view)) => view
+                    .valuation
+                    .items
+                    .iter()
+                    .filter_map(|item| item.close.map(|close| (item.code.clone(), (item.name.clone(), close))))
+                    .collect(),
+                Ok(None) => {
+                    log::warn!(
+                        "[R-07][BR-225b] 收盘估值缺失 price_date={} 做T 候选跳过 (不用上一交易日价格冒充)",
+                        trading_date
+                    );
+                    std::collections::HashMap::new()
+                }
+                Err(error) => {
+                    log::warn!("[R-07][BR-225b] 收盘估值读取失败: {error}");
+                    std::collections::HashMap::new()
+                }
+            }
+        },
+    )
+    .await
+    {
+        Ok(closes) => closes,
+        Err(_) => std::collections::HashMap::new(),
+    };
     let mut lhb_evidence: Option<stock_analysis::data_gateway::BatchEvidence> = None;
     let mut lhb_records: Vec<stock_analysis::data_gateway::DragonTigerStockReview> = Vec::new();
     match stock_analysis::data_gateway::dragon_tiger::DragonTigerGateway::new()
@@ -8142,17 +8211,57 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
                     .partial_cmp(&a.ranking_net_amount_yuan)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
+            // BR-232/BR-233: 盘后收盘快照补名补价 (21:00 晚间最后成交时间
+            // 必然超龄, 5s 红线走 settled-close 准入: 收盘价+中文名)。
+            // 失败/缺失 → closes 视图兜底 → 0.0 退化 (fail-closed, 红线 2.2 不虚构价格)。
+            let strong_codes: Vec<String> = strong
+                .iter()
+                .take(5)
+                .map(|record| record.code.clone())
+                .collect();
+            let strong_quotes = tokio::task::spawn_blocking(move || {
+                let refs: Vec<&str> = strong_codes.iter().map(|code| code.as_str()).collect();
+                fetch_settled_close_batch_strict(&refs, trading_date)
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("R-07 龙虎榜收盘快照 join 失败: {error}")));
             for record in strong.iter().take(5) {
+                let (name, base) = strong_quotes
+                    .as_ref()
+                    .ok()
+                    .and_then(|quotes| quotes.get(&record.code))
+                    .map(|quote| (quote.name.clone(), quote.price))
+                    .or_else(|| {
+                        closes
+                            .get(&record.code)
+                            .map(|(name, close)| (name.clone(), *close))
+                    })
+                    .unwrap_or_else(|| (record.code.clone(), 0.0));
+                let (lo, hi, stop, reason) = if base > 0.0 {
+                    (
+                        base * 0.98,
+                        base * 1.02,
+                        base * 0.95,
+                        format!("龙虎榜净买入为正; 以收盘价 {base:.2} 为基准, 竞价后按 T-11 复核"),
+                    )
+                } else {
+                    (
+                        0.0,
+                        0.0,
+                        0.0,
+                        "龙虎榜净买入为正; 价格以明日竞价为准, 按 T-11 复核".to_string(),
+                    )
+                };
                 items.push(OwnedWatchItem {
                     code: record.code.clone(),
-                    name: record.code.clone(),
+                    name,
                     topic: "龙虎榜强票".to_string(),
                     source: WatchSource::LhbStrong,
                     trigger: format!("净买入 {:.0} 万", record.ranking_net_amount_yuan / 10000.0),
-                    lo_price: 0.0,
-                    hi_price: 0.0,
-                    stop: 0.0,
-                    reason: "龙虎榜净买入为正; 价格以明日竞价为准, 按 T-11 复核".to_string(),
+                    lo_price: lo,
+                    hi_price: hi,
+                    stop,
+                    reason,
                 });
             }
         }
@@ -8186,11 +8295,63 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
                 source_complete: !batch.is_verified_empty(),
             };
             let chains = stock_analysis::market_analyzer::limit_chain_review::aggregate(&input);
+            // BR-232/BR-233: 盘后收盘快照补名补价; leader_name 优先, 缺失才查行情。
+            let leader_codes: Vec<String> = chains
+                .iter()
+                .take(3)
+                .filter(|chain| chain.leader_name.is_empty())
+                .map(|chain| chain.leader_code.clone())
+                .collect();
+            let leader_quotes = tokio::task::spawn_blocking(move || {
+                let refs: Vec<&str> = leader_codes.iter().map(|code| code.as_str()).collect();
+                fetch_settled_close_batch_strict(&refs, trading_date)
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("R-07 涨停链收盘快照 join 失败: {error}")));
             for chain in chains.iter().take(3) {
-                let name = if chain.leader_name.is_empty() {
-                    chain.leader_code.clone()
-                } else {
+                // name 优先级 leader_name → 实时行情 → 收盘估值视图 → code
+                let name = if !chain.leader_name.is_empty() {
                     chain.leader_name.clone()
+                } else {
+                    leader_quotes
+                        .as_ref()
+                        .ok()
+                        .and_then(|quotes| quotes.get(&chain.leader_code))
+                        .map(|quote| quote.name.clone())
+                        .or_else(|| {
+                            closes
+                                .get(&chain.leader_code)
+                                .map(|(name, _)| name.clone())
+                        })
+                        .unwrap_or_else(|| chain.leader_code.clone())
+                };
+                let base = leader_quotes
+                    .as_ref()
+                    .ok()
+                    .and_then(|quotes| quotes.get(&chain.leader_code))
+                    .map(|quote| quote.price)
+                    .or_else(|| closes.get(&chain.leader_code).map(|(_, close)| *close))
+                    .unwrap_or(0.0);
+                let (lo, hi, stop, reason) = if base > 0.0 {
+                    (
+                        base * 0.98,
+                        base * 1.02,
+                        base * 0.95,
+                        format!(
+                            "涨停链龙头({}家涨停); 以收盘价 {base:.2} 为基准, 竞价后按 T-11 复核",
+                            chain.limit_up_n
+                        ),
+                    )
+                } else {
+                    (
+                        0.0,
+                        0.0,
+                        0.0,
+                        format!(
+                            "涨停链龙头({}家涨停); 价格以明日竞价为准, 按 T-11 复核",
+                            chain.limit_up_n
+                        ),
+                    )
                 };
                 items.push(OwnedWatchItem {
                     code: chain.leader_code.clone(),
@@ -8198,13 +8359,10 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
                     topic: chain.chain.clone(),
                     source: WatchSource::LimitChainLeader,
                     trigger: format!("{}-板", chain.leader_boards),
-                    lo_price: 0.0,
-                    hi_price: 0.0,
-                    stop: 0.0,
-                    reason: format!(
-                        "涨停链龙头({}家涨停); 价格以明日竞价为准, 按 T-11 复核",
-                        chain.limit_up_n
-                    ),
+                    lo_price: lo,
+                    hi_price: hi,
+                    stop,
+                    reason,
                 });
             }
         }
@@ -8218,35 +8376,7 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
     //    此前用 latest, 周五估值缺失(数据 Unsafe)时周六补投会 fallback
     //    到 8/6 估值, 把周四收盘价冒充周五价。缺失 → fail-closed 跳过
     //    做T 候选 + warn, 不用上一交易日价格冒充。
-    let closes: std::collections::HashMap<String, f64> = match tokio::task::spawn_blocking(
-        move || {
-            use stock_analysis::database::closing_valuation::persisted_valuation_view_for_date;
-            match persisted_valuation_view_for_date(trading_date) {
-                Ok(Some(view)) => view
-                    .valuation
-                    .items
-                    .iter()
-                    .filter_map(|item| item.close.map(|close| (item.code.clone(), close)))
-                    .collect(),
-                Ok(None) => {
-                    log::warn!(
-                        "[R-07][BR-225b] 收盘估值缺失 price_date={} 做T 候选跳过 (不用上一交易日价格冒充)",
-                        trading_date
-                    );
-                    std::collections::HashMap::new()
-                }
-                Err(error) => {
-                    log::warn!("[R-07][BR-225b] 收盘估值读取失败: {error}");
-                    std::collections::HashMap::new()
-                }
-            }
-        },
-    )
-    .await
-    {
-        Ok(closes) => closes,
-        Err(_) => std::collections::HashMap::new(),
-    };
+    //    closes 视图已在步骤 2 加载 (BR-232: 龙虎榜/涨停链同源补名补价)。
     match tokio::task::spawn_blocking(stock_analysis::portfolio::get_positions).await {
         Ok(Ok(positions)) => {
             for position in positions {
@@ -8257,7 +8387,7 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
                 {
                     continue;
                 }
-                match closes.get(&position.code).copied() {
+                match closes.get(&position.code).map(|(_, close)| *close) {
                     Some(base) if base > 0.0 => {
                         items.push(OwnedWatchItem {
                             code: position.code,
@@ -8483,6 +8613,108 @@ pub fn render_position_review(p: PositionReviewParams<'_>) -> String {
     out
 }
 
+/// BR-xxx: R-11 复盘 AI 研判段 — 持仓市值 Top-N 调 deep_analyzer 多角色研判。
+///
+/// 默认 Top-3（env REVIEW_AI_TOP_N 可调）。规则：
+/// - `--test` 进程不真跑 LLM（隔离）。
+/// - 未配置 DOUBAO/DEEPSEEK/GEMINI 任一 key → warn 出声跳过（fail-open，不阻塞复盘）。
+/// - 单只失败/超时（90s）→ warn 出声跳过该只。
+/// - 报告写 `reports/details/{date}_{code}.md`，推送文本只带摘要路径（全文过长）。
+async fn build_review_ai_section(date: &str, items: &[PositionReviewItem]) -> String {
+    if stock_analysis::risk::env_guard::runtime_is_test_process() {
+        log::info!("[复盘AI] --test 进程隔离, 跳过 AI 研判段");
+        return String::new();
+    }
+    let has_key = ["DOUBAO_API_KEY", "DEEPSEEK_API_KEY", "GEMINI_API_KEY"]
+        .iter()
+        .any(|k| std::env::var(k).map(|v| !v.trim().is_empty()).unwrap_or(false));
+    if !has_key {
+        log::warn!(
+            "[复盘AI] 未配置 DOUBAO/DEEPSEEK/GEMINI_API_KEY 任一 key, 跳过 AI 研判段 (fail-open)"
+        );
+        return String::new();
+    }
+    let top_n = std::env::var("REVIEW_AI_TOP_N")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(3);
+    let targets: Vec<&PositionReviewItem> = items.iter().take(top_n).collect();
+    if targets.is_empty() {
+        return String::new();
+    }
+    log::info!(
+        "[复盘AI] 开始 AI 研判 top{}: {}",
+        targets.len(),
+        targets
+            .iter()
+            .map(|item| item.code.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+
+    let tasks = targets.iter().map(|item| {
+        let code = item.code.clone();
+        let display_code = code.clone();
+        async move {
+            let started = std::time::Instant::now();
+            // GeminiAnalyzer 含 RefCell (non-Sync)，其 async future 不满足外层
+            // tokio::spawn 的 Send 约束 → 在 spawn_blocking 内建独立 current_thread
+            // runtime 跑研判，外层只等 Result (Send)。
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(90),
+                tokio::task::spawn_blocking(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|error| error.to_string())?;
+                    rt.block_on(stock_analysis::deep_analyzer::run_and_save(&code))
+                        .map_err(|error| error.to_string())
+                }),
+            )
+            .await;
+            (display_code, started.elapsed().as_secs(), outcome)
+        }
+    });
+    let results = futures::future::join_all(tasks).await;
+
+    let mut lines: Vec<String> = Vec::new();
+    for (item, (code, secs, outcome)) in targets.iter().zip(results) {
+        match outcome {
+            Ok(Ok(Ok(path))) => {
+                log::info!(
+                    "[复盘AI] {}({}) 研判完成 {}s → {}",
+                    item.name,
+                    code,
+                    secs,
+                    path.display()
+                );
+                lines.push(format!(
+                    "AI研判 {}({}) 报告: {}",
+                    item.name,
+                    code,
+                    path.display()
+                ));
+            }
+            Ok(Ok(Err(error))) => {
+                log::warn!("[复盘AI] {}({}) 研判失败: {error} (跳过该只)", item.name, code);
+            }
+            Ok(Err(error)) => {
+                log::warn!("[复盘AI] {}({}) 研判任务失败: {error} (跳过该只)", item.name, code);
+            }
+            Err(_) => {
+                log::warn!("[复盘AI] {}({}) 研判超时 90s (跳过该只)", item.name, code);
+            }
+        }
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n\nAI 研判（deep_analyzer 多角色, 报告见 reports/details/）:\n");
+    out.push_str(&lines.join("\n"));
+    out
+}
+
 /// BR-222: R-11 持仓复盘 (用户确认持仓摘要, 盘后 1次/日)。
 ///
 /// 数据门: `user_account_summary` 无用户确认行 → no_data (不虚构账户状态);
@@ -8650,7 +8882,13 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
         sectors: &top_sectors,
         items: &items,
     };
-    let text = render_position_review(params);
+    let mut text = render_position_review(params);
+    // BR-xxx: R-11 复盘接入 deep_analyzer 多角色 AI 研判（市值 Top-N）。
+    // 失败/无 key → warn 出声跳过，不阻塞复盘推送本身。
+    let ai_section = build_review_ai_section(date, &items).await;
+    if !ai_section.is_empty() {
+        text.push_str(&ai_section);
+    }
     let result = dispatch_registered_outcome!(
         "R-11-position-review",
         crate::notify::PushKind::PositionReview,
@@ -15277,6 +15515,43 @@ pub async fn dispatch_sector_anomaly_daily(hhmm: &str, news_text: &str) -> bool 
     let result = push_sector_anomaly(hhmm, &moves).await;
     log_dispatcher_attempt("I-09A", result, moves.len(), "");
     result
+}
+
+/// BR-232 (2026-08-10): R-07 明日观察池补名补价 — 生产 8/10 21:00 推送
+/// 中龙虎榜/涨停链 8 只票名字=代码、低吸/止损 0.00 (用户投诉)。
+/// 修复 = 统一实时行情 gateway 补齐 name+price; strict 批次任一票失败
+/// 会整批退化 → name=code + 0.00。此测试用生产推送的真实 code 清单
+/// 验证盘后 (21:5x) 实时行情仍返回完整中文名+收盘价。
+#[cfg(test)]
+mod tests_br232_tomorrow_watch_quotes {
+    use super::*;
+
+    #[tokio::test]
+    async fn br233_tomorrow_watch_codes_have_settled_close_names_and_prices() {
+        // gateway 审计需要 DB (audit_gateway_result 写库; 测试模式 init 幂等)
+        let _ = stock_analysis::database::DatabaseManager::init(None);
+        let codes = [
+            "000636", "002842", "001258", "301583", "601700", // 龙虎榜 Top5 (净买入>0)
+            "002474", "600327", "002541", // 涨停链龙头 (前 3 链)
+        ];
+        // 生产推送的 trading_date = 2026-08-10 (8/10 21:00 晚间装配)
+        let trading_date = chrono::NaiveDate::from_ymd_opt(2026, 8, 10).expect("fixed date");
+        let quotes = fetch_settled_close_batch_strict(&codes, trading_date)
+            .expect("盘后收盘快照 Gateway 必须对 8 只票返回完整批次 (strict 批不允许部分)");
+        for code in codes {
+            let quote = &quotes[code];
+            assert_ne!(
+                quote.name, *code,
+                "{code} 名字仍是代码 — BR-232/BR-233 补名未生效"
+            );
+            assert!(
+                quote.price > 0.0,
+                "{code} 价格缺失 (price={}) — 低吸/止损仍会是 0.00",
+                quote.price
+            );
+            println!("{code} {} close={}", quote.name, quote.price);
+        }
+    }
 }
 
 #[cfg(test)]

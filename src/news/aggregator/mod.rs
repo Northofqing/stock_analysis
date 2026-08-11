@@ -78,6 +78,12 @@ impl AdmittedGlobalNewsBatch {
         (self.records, self.evidence)
     }
 
+    /// 从同一 tick 的 raw acquisition 终端状态构造 admitted batch（BR-172 shadow
+    /// 接线用）。仅接受来源已绑定 records + evidence，不伪造。
+    pub fn from_parts(records: Vec<GlobalNewsRecord>, evidence: BatchEvidence) -> Self {
+        Self { records, evidence }
+    }
+
     #[cfg(test)]
     pub fn test_fixture(records: Vec<GlobalNewsRecord>, evidence: BatchEvidence) -> Self {
         Self { records, evidence }

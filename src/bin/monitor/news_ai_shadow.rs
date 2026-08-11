@@ -1,14 +1,9 @@
-//! BR-172 opt-in NewsAI shadow producer.
+//! BR-172 NewsAI shadow producer（默认启用，2026-08-11 起取消 env 开关）。
 //!
 //! This adapter consumes only source-bound batches from the same aggregator
 //! tick, acquires audited market evidence, performs one receipt-bearing model
 //! call and appends the immutable assessment audit. It has no delivery,
 //! prediction, reservation or trading capability.
-
-#![allow(
-    dead_code,
-    reason = "BR-172 NewsAI consumes only BR-174 receipted batches; BR-183 keeps that producer disabled until selection-v2 release"
-)]
 
 use once_cell::sync::Lazy;
 use std::collections::BTreeMap;
@@ -25,58 +20,19 @@ use stock_analysis::monitor::news_ai::{
 use stock_analysis::news::aggregator::AdmittedGlobalNewsBatch;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-const ENABLE_ENV: &str = "STOCK_ANALYSIS_NEWS_AI_SHADOW_ENABLE";
 const MAX_ASSESSMENTS_PER_TICK: usize = 5;
 const DAILY_HISTORY_DAYS: usize = 60;
 
 static SHADOW_BATCH_PERMIT: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(1)));
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShadowEnableError {
-    value: String,
-}
-
-impl std::fmt::Display for ShadowEnableError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "{ENABLE_ENV} must be one of 1/true/0/false, got {:?}",
-            self.value
-        )
-    }
-}
-
-pub fn parse_news_ai_shadow_enable(value: Option<&str>) -> Result<bool, ShadowEnableError> {
-    match value.map(str::trim) {
-        None => Ok(false),
-        Some("1" | "true") => Ok(true),
-        Some("0" | "false") => Ok(false),
-        Some(value) => Err(ShadowEnableError {
-            value: value.to_owned(),
-        }),
-    }
-}
-
 /// Spawn one bounded worker without delaying existing flash/selection
 /// governance. A concurrent batch is skipped without writing completion state.
 pub fn spawn_from_same_tick(batches: &[AdmittedGlobalNewsBatch]) {
-    let enabled = match std::env::var(ENABLE_ENV) {
-        Ok(value) => parse_news_ai_shadow_enable(Some(&value)),
-        Err(std::env::VarError::NotPresent) => parse_news_ai_shadow_enable(None),
-        Err(error) => {
-            log::error!("[NewsAI-shadow][BR-172] enable flag unreadable: {error}");
-            return;
-        }
-    };
-    match enabled {
-        Ok(false) => return,
-        Err(error) => {
-            log::error!("[NewsAI-shadow][BR-172] disabled: {error}");
-            return;
-        }
-        Ok(true) => {}
+    // v15 隔离: --test 进程不真调 LLM, 也不写评估审计。
+    if stock_analysis::risk::env_guard::runtime_is_test_process() {
+        log::debug!("[NewsAI-shadow][BR-172] --test 进程隔离, 跳过 AI 评估");
+        return;
     }
-
     let permit = match SHADOW_BATCH_PERMIT.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
@@ -269,14 +225,6 @@ const fn news_market_context(session: MarketSession) -> NewsMarketContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn shadow_is_opt_in_and_invalid_values_fail_closed() {
-        assert_eq!(parse_news_ai_shadow_enable(None), Ok(false));
-        assert_eq!(parse_news_ai_shadow_enable(Some("1")), Ok(true));
-        assert_eq!(parse_news_ai_shadow_enable(Some("false")), Ok(false));
-        assert!(parse_news_ai_shadow_enable(Some("yes")).is_err());
-    }
 
     #[test]
     fn session_mapping_requires_realtime_only_during_market_windows() {

@@ -6049,7 +6049,7 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
     nm.restore_dedup();
 
     log::info!(
-        "[NewsAI-shadow][BR-112][BR-172] governed delivery remains disabled; opt-in immutable assessment shadow is available"
+        "[NewsAI-shadow][BR-112][BR-172] governed delivery remains disabled; immutable assessment shadow enabled by default (env 开关已取消, 2026-08-11)"
     );
 
     let mut sm = SignalStateMachine::default();
@@ -6117,6 +6117,30 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
                     .await
                 {
                     Ok(batch) => {
+                        // BR-172: NewsAI shadow 默认启用（2026-08-11 取消
+                        // STOCK_ANALYSIS_NEWS_AI_SHADOW_ENABLE 开关）。与 Track A
+                        // 同 tick 消费 admitted batches；模型未配置时 shadow 内部
+                        // warn 出声跳过，不影响候选入池。
+                        let admitted: Vec<
+                            stock_analysis::news::aggregator::AdmittedGlobalNewsBatch,
+                        > = batch
+                            .attempts()
+                            .iter()
+                            .filter_map(|attempt| {
+                                let terminal = attempt.terminal();
+                                let records = terminal.records()?;
+                                let evidence = terminal.evidence()?;
+                                Some(
+                                    stock_analysis::news::aggregator::AdmittedGlobalNewsBatch::from_parts(
+                                        records.to_vec(),
+                                        evidence.clone(),
+                                    ),
+                                )
+                            })
+                            .collect();
+                        if !admitted.is_empty() {
+                            crate::news_ai_shadow::spawn_from_same_tick(&admitted);
+                        }
                         let titles: Vec<String> = batch
                             .attempts()
                             .iter()

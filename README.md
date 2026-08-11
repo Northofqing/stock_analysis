@@ -13,7 +13,7 @@
 | 💰 虚拟盘成交 | 候选经风险门（现金/仓位/账户模式）后模拟买入，写 `paper_trades` + 不可变 `order_audit` 审计链；卖出一侧按**四大铁律**（ATR 止损 / -8% 硬止损 / 三级止损 / 破位减仓）自动扫描，盘中 30s tick + 15:30 收盘各一次 |
 | 🏦 账户自估值 | 用户上传券商截图（快照）后，系统以快照为准；**不传则用持仓明细 × 实时行情自动估值**，每日收益 = 今日总资产 − 昨日（连续 5 个交易日无新快照才提醒上传） |
 | 📲 推送治理 | 17 类 PushKind 经预算/冷却/去重/审计四层治理投递飞书微信，投递账本不可变 |
-| 📋 盘后复盘 | 收盘/晚间复盘 + 交易复盘（R-07/R-11），按 `review_date` 取估值 |
+| 📋 盘后复盘 | 收盘/晚间复盘 + 交易复盘（R-07/R-11），按 `review_date` 取估值；持仓市值 Top-N 附 deep_analyzer 多角色 AI 研判（报告存 `reports/details/`，`REVIEW_AI_TOP_N` 可调） |
 | 🛡️ 风险门 | 硬持仓/仓位/现金限制、账户模式（Frozen/ReduceOnly/Full）、数据模式（Unsafe 时行情依赖推送 fail-closed） |
 
 ## 项目结构
@@ -61,6 +61,9 @@ MONITOR_ENABLED=true ./target/release/monitor
 
 # 手动盘后复盘
 ./target/release/monitor --review
+
+# 个股深度 AI 研判（多角色分析，报告写 reports/details/）
+cargo run --release --bin deep_analyze -- 600519
 ```
 
 `.env` 常用项：`STOCK_LIST` 监控代码、`DATABASE_PATH` 主库路径、`WECHAT_SEND_SCRIPT` 推送脚本、`BROKER_SOURCE` 行情入口（默认 `magic_tdx`）。**不要提交 `.env` 与账户证据。**
