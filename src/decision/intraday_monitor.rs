@@ -99,8 +99,17 @@ fn paper_limit_flags(quote: &crate::broker::ExecutionQuote) -> (bool, bool) {
 
 impl IntradayMonitor {
     /// 每 30s 跑一次 (从 main_loop 调, 推送消费核心)
+    ///
+    /// BR-151 快照模式：生产账户证据 = 用户确认的真实账户快照
+    /// （portfolio_state_snapshot：user_account_summary + user_position_snapshot，
+    /// upsert 当日 ledger）。实时账户模式（portfolio_state，30s 券商门）在生产
+    /// 无盘中刷新者，恒拦虚拟盘成交（7/17 起零成交缺陷，2026-08-10 修复）。
     pub fn tick(&self, risk_context: PaperRiskContext) -> Result<usize, String> {
-        self.tick_with_portfolio_state(risk_context, paper_trade::portfolio_state)
+        // 无条件刷新当日 ledger（BR-097 结构门 age≤30s）——候选到达前 ledger
+        // 即已新鲜。无候选 tick 也必须刷新：ledger 门要求 date==today 且
+        // created_at 新（7/17 起零成交根因之一：ledger 无生产写入者）。
+        paper_trade::refresh_account_ledger_from_snapshot()?;
+        self.tick_with_portfolio_state(risk_context, paper_trade::portfolio_state_snapshot)
     }
 
     /// Keep the decision loop independently testable while the public production
@@ -374,8 +383,10 @@ static EVENING_LAST_FAIL: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>
     std::sync::Mutex::new(None);
 
 /// 盘后 15:30 整盘扫 (R5) — 复用 evaluate_candidate 评分, 跑 Momentum 整合
+/// BR-151 快照模式：与 tick 同源（portfolio_state_snapshot），见 tick 注释。
 pub fn evening_review(today: NaiveDate, risk_context: PaperRiskContext) -> Result<usize, String> {
-    evening_review_with_portfolio_state(today, risk_context, paper_trade::portfolio_state)
+    paper_trade::refresh_account_ledger_from_snapshot()?;
+    evening_review_with_portfolio_state(today, risk_context, paper_trade::portfolio_state_snapshot)
 }
 
 /// Production calls this only through `evening_review`, which supplies the real
@@ -623,6 +634,44 @@ mod tests {
         .bind::<diesel::sql_types::Text, _>(&ledger_date)
         .execute(&mut conn)
         .expect("prepare same-day test ledger");
+
+        // 生产入口 (tick/evening_review) 先 refresh_account_ledger_from_snapshot：
+        // 测试 DB 需券商账户汇总 + 用户确认持仓快照（同生产 8/7 快照语义）。
+        // 值与原 ledger 行一致（total=100000, cash=100000）→ 对注入路径零影响。
+        diesel::sql_query(
+            "INSERT INTO user_account_summary \
+                (effective_at, total_assets, securities_market_value, available_cash, \
+                 position_ratio_pct, daily_pnl, source) \
+             VALUES (?, 100000.0, 0.0, 100000.0, 0.0, 0.0, 'test-fixture') \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind::<diesel::sql_types::Text, _>(&format!(
+            "{}T15:46:00+08:00",
+            chrono::Local::now().date_naive()
+        ))
+        .execute(&mut conn)
+        .expect("prepare test account summary");
+        use crate::portfolio::user_position_snapshot::{
+            UserPositionItemInput, UserPositionSnapshotInput,
+        };
+        let effective = chrono::Local::now();
+        let input = UserPositionSnapshotInput {
+            snapshot_id: unique_code("SNAPSHOT"),
+            effective_at: effective.with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap()),
+            confirmed_at: effective.with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap()),
+            source: "test-fixture".to_string(),
+            confirm_empty: false,
+            evidence_sha256: "TEST_CODE_EVIDENCE".to_string(),
+            items: vec![UserPositionItemInput {
+                code: unique_code("HOLD"),
+                name: "测试持仓".to_string(),
+                quantity: 100,
+                cost_price: 10.0,
+            }],
+        };
+        crate::database::user_position_snapshot::save_user_position_snapshot(&input)
+            .expect("prepare confirmed position snapshot");
+
         IntradayDbGuard {
             push_ids: Vec::new(),
             codes: Vec::new(),

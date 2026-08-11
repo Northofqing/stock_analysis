@@ -14,7 +14,8 @@ use magic_tdx_rs::protocol::types::{MinuteTimePrice, SecurityBar, SecurityQuote}
 use magic_tdx_rs::TdxHqClient;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::instrument_identity::{resolve_production_equity, EquitySegment};
 
@@ -22,6 +23,22 @@ pub const T0_QUOTE_MAX_AGE_SECS: i64 = 5;
 pub const T0_DAILY_MIN_BARS: usize = 20;
 pub const T0_TODAY_MIN_COMPLETED_BARS: usize = 6;
 pub const T0_HISTORY_MIN_SESSIONS: usize = 3;
+
+/// BR-231 价格变动感知缓存：code → 最近一次通过 freshness 门的最新价。
+///
+/// TDX servertime 结构性滞后 6-63s（median ~18s, 2026-08-10 全天 0 次通过
+/// T0_QUOTE_MAX_AGE_SECS=5 门）。做T需要的是「价格新鲜」而非「时钟新鲜」：
+/// servertime 滞后窗口内价格未变（无成交变动）= 等价新鲜。缓存仅存储
+/// 通过判定路径的 quote 价格（stale 拒绝的数据不污染缓存）。
+static LAST_T0_QUOTE_PRICES: OnceLock<Mutex<HashMap<String, f64>>> = OnceLock::new();
+
+/// 缓存容量上限：超出时重建（保最近语义, 低频事件损失可接受; 候选池
+/// 代码数量级远低于此, 正常路径永不触发）。
+const LAST_T0_QUOTE_CACHE_MAX: usize = 500;
+
+fn last_t0_quote_prices() -> &'static Mutex<HashMap<String, f64>> {
+    LAST_T0_QUOTE_PRICES.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct T0BookLevel {
@@ -154,21 +171,56 @@ fn valid_ohlc(open: f64, high: f64, low: f64, close: f64) -> bool {
         && high >= low
 }
 
+/// BR-231 价格变动感知 freshness 门（做T语义：价格新鲜而非时钟新鲜）。
+///
+/// 判定链（`quote_price` = 当前 batch 归一化价格, `None` 表示无价格可比）:
+/// 1. age ∈ [0, T0_QUOTE_MAX_AGE_SECS] → 新鲜, 更新缓存, Ok
+/// 2. age 超限 + 缓存有同 code 价格且相等 → 等价新鲜（滞后窗口内无成交
+///    变动）→ **warn 出声** + 更新缓存 + Ok
+/// 3. 其余（含未来时间、首次见 code、价格已变）→ quote_stale（不更新缓存）
+///
+/// TDX servertime 结构性滞后 6-63s（median ~18s）恒超 5s 门, 但滞后窗口内
+/// 价格未变时对做T等价于新鲜数据。首次见 code 无价格可比 → 保持原门
+/// （无证据 = 出声拒绝）。
 pub fn validate_quote_freshness(
     code: &str,
     source_at: DateTime<Utc>,
     observed_at: DateTime<Utc>,
+    quote_price: Option<f64>,
 ) -> std::result::Result<(), MagicTdxT0Rejection> {
     let age = observed_at.signed_duration_since(source_at).num_seconds();
-    if !(0..=T0_QUOTE_MAX_AGE_SECS).contains(&age) {
-        return Err(rejection(
-            code,
-            "quote_stale",
-            format!("age_secs={age} max_secs={T0_QUOTE_MAX_AGE_SECS}"),
-            true,
-        ));
+    if (0..=T0_QUOTE_MAX_AGE_SECS).contains(&age) {
+        if let Some(price) = quote_price {
+            record_last_quote_price(code, price);
+        }
+        return Ok(());
     }
-    Ok(())
+    if let (Some(price), Some(last)) = (quote_price, last_t0_quote_prices().lock().ok().and_then(|mut cache| cache.get(code).copied())) {
+        if last == price {
+            // 价格未变 = 等价新鲜：servertime 滞后但滞后窗口内无成交变动。
+            // 出声（warn）——例外放行必须可见（v15.x 规则 4）。
+            log::warn!(
+                "[magic-tdx-t0] {code} 价格不变放行: age_secs={age} max_secs={T0_QUOTE_MAX_AGE_SECS} price={price}"
+            );
+            record_last_quote_price(code, price);
+            return Ok(());
+        }
+    }
+    Err(rejection(
+        code,
+        "quote_stale",
+        format!("age_secs={age} max_secs={T0_QUOTE_MAX_AGE_SECS}"),
+        true,
+    ))
+}
+
+fn record_last_quote_price(code: &str, price: f64) {
+    if let Ok(mut cache) = last_t0_quote_prices().lock() {
+        if cache.len() >= LAST_T0_QUOTE_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(code.to_string(), price);
+    }
 }
 
 fn complete_batch_id(binding: &CompleteT0BatchBinding<'_>) -> Result<String> {
@@ -708,8 +760,10 @@ fn evidence_for_quote(
         error.code.clone_from(&code);
         error
     })?;
-    validate_quote_freshness(&code, source_at, quote_received_at)?;
+    // BR-231: normalize 先行（纯本地校验, 无网络）→ 价格参与 freshness 判定
+    // （价格不变放行）。网络调用（daily/minute）仍在 freshness 门后。
     let normalized_quote = normalize_quote(&code, &quote)?;
+    validate_quote_freshness(&code, source_at, quote_received_at, Some(normalized_quote.price))?;
     let daily_raw = client
         .get_security_bars(KLINE_RI_K, quote.market, &code, 0, 40, fq_type::NONE)
         .map_err(|error| rejection(&code, "daily_fetch_failed", error.to_string(), true))?;
@@ -797,7 +851,12 @@ fn finalize_t0_batch(
                 record.instrument.code()
             ));
         }
-        match validate_quote_freshness(&record.code, record.source_at, observed_at) {
+        match validate_quote_freshness(
+            &record.code,
+            record.source_at,
+            observed_at,
+            Some(record.quote.price),
+        ) {
             Ok(()) => fresh_records.push(record),
             Err(error) => rejections.push(error),
         }
@@ -890,6 +949,32 @@ pub fn fetch_magic_tdx_t0_batch(
 /// freshness 门也用观测时刻计算 age — 回放周五历史数据时必须把时钟注入
 /// 到周五盘中/收盘时刻, 否则周六墙钟会把周五收盘快照判定为 quote_stale
 /// (age≈9.5h) 或未来时间。生产路径传 None, 行为与注入前完全一致。
+/// 进程级共享 TDX 行情 client — 连接复用。做T 每 30s tick 全量重连
+/// (单次握手实测 150-222ms, 2026-08-11 全天 222 次 batch); 上游
+/// connect_to_any 已连接即短路 (v0.6.7), 断线后下次调用自动重连
+/// (last_server → PRIMARY), 跨请求共享安全。连接失败时不缓存, 下轮
+/// 重建重试 — fail-closed 语义不变。
+///
+/// pub(super): data_gateway 内共享 — R-12 盘后回测 (historical_bars::fifteen_min_bars)
+/// 复用同一连接, 避免盘后 60 只票回测各建一条 TCP。
+pub(super) fn cached_tdx_hq_client() -> Result<Arc<TdxHqClient>> {
+    static CACHE: OnceLock<Mutex<Option<Arc<TdxHqClient>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(client) = guard.as_ref() {
+        return Ok(client.clone());
+    }
+    let client = Arc::new(TdxHqClient::new());
+    client
+        .connect_to_any(Some(5.0))
+        .map_err(|error| anyhow!("magic-tdx T0 connect failed: {error}"))?;
+    *guard = Some(client.clone());
+    Ok(client)
+}
+
 pub fn fetch_magic_tdx_t0_batch_with_clock(
     codes: &[String],
     requested_at: DateTime<Utc>,
@@ -904,10 +989,7 @@ pub fn fetch_magic_tdx_t0_batch_with_clock(
         .iter()
         .map(|code| normalized_identity(code))
         .collect::<Result<Vec<_>>>()?;
-    let client = TdxHqClient::new();
-    client
-        .connect_to_any(Some(5.0))
-        .map_err(|error| anyhow!("magic-tdx T0 connect failed: {error}"))?;
+    let client = cached_tdx_hq_client()?;
     let request = identities
         .iter()
         .map(|identity| (identity.market, identity.canonical_code.as_str()))
@@ -1065,8 +1147,66 @@ mod tests {
         let observed_at = Utc.with_ymd_and_hms(2026, 7, 23, 2, 0, 1).unwrap();
         let source_at = Utc.with_ymd_and_hms(2026, 7, 23, 1, 59, 55).unwrap();
 
-        let result = validate_quote_freshness("TEST_CODE_600396", source_at, observed_at);
+        // 首次见 code（无历史价格可比）→ 保持原门拒绝。
+        // code 独立于其他测试（BR-231 缓存是模块级 static, 共享 code 会串扰）。
+        let result =
+            validate_quote_freshness("TEST_CODE_STALE_ONLY_1", source_at, observed_at, Some(10.0));
 
+        assert_eq!(result.unwrap_err().reason_code, "quote_stale");
+    }
+
+    #[test]
+    fn stale_quote_with_unchanged_price_is_admitted_as_equivalent_fresh() {
+        // BR-231: servertime 滞后但价格未变 = 等价新鲜
+        let observed_at = Utc.with_ymd_and_hms(2026, 7, 23, 2, 0, 30).unwrap();
+        let stale_source_at = Utc.with_ymd_and_hms(2026, 7, 23, 2, 0, 10).unwrap(); // age=20s
+
+        // 1. 第一次判定 age=20s 且无历史价 → 拒绝
+        let first = validate_quote_freshness(
+            "TEST_CODE_BR231_1",
+            stale_source_at,
+            observed_at,
+            Some(12.34),
+        );
+        assert_eq!(first.unwrap_err().reason_code, "quote_stale");
+
+        // 2. 新鲜价 12.34 通过 → 缓存记录
+        let fresh_source_at = observed_at - chrono::Duration::seconds(2);
+        validate_quote_freshness(
+            "TEST_CODE_BR231_1",
+            fresh_source_at,
+            observed_at,
+            Some(12.34),
+        )
+        .expect("fresh quote admitted");
+
+        // 3. 再次滞后（age=20s）但价格仍 12.34 → 价格不变放行
+        validate_quote_freshness(
+            "TEST_CODE_BR231_1",
+            stale_source_at,
+            observed_at,
+            Some(12.34),
+        )
+        .expect("unchanged stale price admitted");
+
+        // 4. 价格已变 12.35 → 拒绝（滞后窗口内真实变动, 不配做T）
+        let changed = validate_quote_freshness(
+            "TEST_CODE_BR231_1",
+            stale_source_at,
+            observed_at,
+            Some(12.35),
+        );
+        assert_eq!(changed.unwrap_err().reason_code, "quote_stale");
+    }
+
+    #[test]
+    fn stale_quote_without_price_history_stays_rejected_and_does_not_pollute_cache() {
+        // 价格不变放行路径必须落在「缓存有历史价」的前提下；
+        // 无价格参数（None）时退化为原门（纯时钟判定）。
+        let observed_at = Utc.with_ymd_and_hms(2026, 7, 23, 2, 1, 0).unwrap();
+        let stale_source_at = Utc.with_ymd_and_hms(2026, 7, 23, 2, 0, 30).unwrap();
+        let result =
+            validate_quote_freshness("TEST_CODE_BR231_2", stale_source_at, observed_at, None);
         assert_eq!(result.unwrap_err().reason_code, "quote_stale");
     }
 

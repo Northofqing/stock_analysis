@@ -7,7 +7,7 @@
 //! under the five-second freshness rule and continues to the next Magic
 //! provider. No consumer-owned HTTP or legacy parser is retained.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 #[cfg(test)]
 use magic_market_core::Exchange;
 use magic_market_core::{AssetClass, DataStatus, InstrumentId, ProviderId, Quote, RatioUnit};
@@ -28,6 +28,18 @@ use super::review::{
 };
 
 const CAPABILITY: &str = "RealtimeMarketQuotes";
+
+/// BR-233 (2026-08-10): 实时行情准入模式。
+/// - `RealtimeFiveSecond`: BR-218 盘中 5s 红线 — 默认, 所有盘中消费者不变。
+/// - `SettledClose { trading_date }`: 盘后收盘静态快照 — 仅收市后消费者
+///   (R-07 晚间明日观察池) 使用。收市后最后成交时间必然超龄 (Tencent/Sina
+///   source_at = 最后成交时间, TDX 缺高精度 source_at), 但价格=当日收盘价,
+///   是合法盘后快照; 时段未收盘 (盘中误调) 仍 fail-closed。
+#[derive(Debug, Clone, Copy)]
+enum QuoteAdmissionMode {
+    RealtimeFiveSecond,
+    SettledClose { trading_date: NaiveDate },
+}
 
 /// One admitted quote projection used by monitor consumers.
 #[derive(Debug, Clone, PartialEq)]
@@ -194,7 +206,11 @@ impl MarketDataGateway {
             }
         };
 
-        let (terminal_provider, result) = route_quotes(codes, &instruments);
+        let (terminal_provider, result) = route_quotes(
+            codes,
+            &instruments,
+            QuoteAdmissionMode::RealtimeFiveSecond,
+        );
         audit_gateway_result(CAPABILITY, terminal_provider, &request_hash, result)
     }
 
@@ -214,6 +230,39 @@ impl MarketDataGateway {
     ) -> Result<AdmittedRealtimeQuote, GatewayError> {
         self.required_realtime_quotes(&[code.to_owned()])?
             .into_required_quote(code)
+    }
+
+    /// BR-233 (2026-08-10): 盘后收盘静态快照 — 收市后消费者 (R-07 明日观察池
+    /// 21:00 晚间装配) 获取最后交易时段 (trading_date) 的收盘价+中文名。
+    /// 准入规则: source_at 日期 == trading_date 且 observed_at 已过该日
+    /// 北京时间 15:00 (UTC 07:00) 收盘时刻; 盘中调用 fail-closed。
+    /// 盘中路径仍走 [`Self::realtime_quotes`] 的 BR-218 五秒红线, 不受影响。
+    pub fn settled_close_quotes(
+        &self,
+        codes: &[String],
+        trading_date: NaiveDate,
+    ) -> Result<GatewayBatch<RealtimeMarketQuote>, GatewayError> {
+        let request_hash = acquisition_request_hash(
+            CAPABILITY,
+            &format!("settled:{trading_date}:{}", codes.join(",")),
+        );
+        let instruments = match build_instruments(codes) {
+            Ok(instruments) => instruments,
+            Err(error) => {
+                return audit_gateway_result(
+                    CAPABILITY,
+                    ProviderId::Tdx,
+                    &request_hash,
+                    Err(error),
+                );
+            }
+        };
+        let (terminal_provider, result) = route_quotes(
+            codes,
+            &instruments,
+            QuoteAdmissionMode::SettledClose { trading_date },
+        );
+        audit_gateway_result(CAPABILITY, terminal_provider, &request_hash, result)
     }
 }
 
@@ -337,6 +386,7 @@ fn realtime_quote_acceptance_policy() -> AcceptancePolicy {
 fn route_quotes(
     storage_codes: &[String],
     instruments: &[InstrumentId],
+    mode: QuoteAdmissionMode,
 ) -> (
     ProviderId,
     Result<GatewayBatch<RealtimeMarketQuote>, GatewayError>,
@@ -371,7 +421,7 @@ fn route_quotes(
         let admission = match router.route(instruments) {
             Ok(outcome) => {
                 let selected = outcome.selected_provider();
-                match admit_quote_batch(storage_codes, selected, outcome.into_batch()) {
+                match admit_quote_batch(storage_codes, selected, outcome.into_batch(), mode) {
                     Ok(batch) => {
                         record_quote_provider_success(selected);
                         return (selected, Ok(batch));
@@ -423,13 +473,34 @@ const QUOTE_PROVIDER_CHAIN: [ProviderId; 3] =
 
 /// BR-219: consecutive failures before a proven-dead provider is skipped.
 const QUOTE_BREAKER_FAILURE_THRESHOLD: u32 = 3;
-/// BR-219: how long a tripped provider stays skipped before it is retried.
+/// BR-219: how long a tripped provider stays skipped before it is retried
+/// (level 0 的初始冷却)。
 const QUOTE_BREAKER_COOLDOWN_SECS: i64 = 300;
+/// BR-219 退避: 冷却 = 300s × 3^level, 封顶 45 分钟。结构性失败 (如 TDX
+/// 免费主站 servertime 滞后 6-63s 恒超 5s 门, 2026-08-11 全天每 5 分钟
+/// 白试 3 次) 下固定 300s 冷却 = 每 5 分钟全量重连一次全失败; 指数退避
+/// 让重试频率随连败增长, 把重试预算留给可能恢复的瞬时故障。
+const QUOTE_BREAKER_COOLDOWN_MAX_SECS: i64 = 2700;
+/// BR-219 退避级别上限: 300s → 900s → 2700s 后不再增长。
+const QUOTE_BREAKER_BACKOFF_MAX_LEVEL: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct QuoteBreakerState {
     consecutive_failures: u32,
     opened_at: Option<DateTime<Utc>>,
+    /// 连败退避级别: trip 一次 +1, 成功恢复归零, 冷却到期重置时保留。
+    backoff_level: u32,
+    /// 本次 trip 固化的冷却时长 (秒) — trip 时刻用当时 level 计算后固化,
+    /// skip 判定用同一值, 避免 trip 后 level 递增导致两次计算不一致。
+    cooldown_secs: i64,
+}
+
+/// BR-219: 退避级别对应的冷却时长 (秒)。
+fn breaker_cooldown_secs(level: u32) -> i64 {
+    let exponent = level.min(QUOTE_BREAKER_BACKOFF_MAX_LEVEL);
+    QUOTE_BREAKER_COOLDOWN_SECS
+        .saturating_mul(3_i64.pow(exponent))
+        .min(QUOTE_BREAKER_COOLDOWN_MAX_SECS)
 }
 
 fn quote_breakers() -> &'static Mutex<HashMap<ProviderId, QuoteBreakerState>> {
@@ -456,17 +527,19 @@ fn quote_breaker_skips(now: DateTime<Utc>) -> HashSet<ProviderId> {
         let Some(opened_at) = state.opened_at else {
             continue;
         };
+        let cooldown = state.cooldown_secs;
         let elapsed = now.signed_duration_since(opened_at).num_seconds();
-        if elapsed >= QUOTE_BREAKER_COOLDOWN_SECS {
+        if elapsed >= cooldown {
             state.opened_at = None;
             state.consecutive_failures = 0;
+            // backoff_level 保留: 冷却到期后重试, 若再次连败 3 次则继续退避
             continue;
         }
         log::warn!(
             "[DataGateway][RealtimeMarketQuotes][BR-219] skipping provider={provider:?} \
              consecutive_failures={} cooldown_remaining_secs={}",
             state.consecutive_failures,
-            QUOTE_BREAKER_COOLDOWN_SECS - elapsed
+            cooldown - elapsed
         );
         skips.insert(provider);
     }
@@ -496,13 +569,78 @@ fn record_quote_provider_failure(provider: ProviderId, now: DateTime<Utc>) {
     let state = guard.entry(provider).or_default();
     state.consecutive_failures = state.consecutive_failures.saturating_add(1);
     if state.consecutive_failures >= QUOTE_BREAKER_FAILURE_THRESHOLD && state.opened_at.is_none() {
+        // 本次冷却按当前 level 计算后固化 (首次 trip = 0 → 300s), 然后
+        // 退避 +1: 连续 trip 冷却 300s → 900s → 2700s cap, 结构性失败
+        // (如 TDX servertime 恒超龄) 不再每 5 分钟全量重连白试。
+        let cooldown = breaker_cooldown_secs(state.backoff_level);
+        state.cooldown_secs = cooldown;
         state.opened_at = Some(now);
+        state.backoff_level = state.backoff_level.saturating_add(1);
         log::warn!(
             "[DataGateway][RealtimeMarketQuotes][BR-219] tripped provider={provider:?} \
-             consecutive_failures={} cooldown_secs={QUOTE_BREAKER_COOLDOWN_SECS}",
-            state.consecutive_failures
+             consecutive_failures={} cooldown_secs={}",
+            state.consecutive_failures,
+            cooldown
         );
     }
+}
+
+/// 进程级共享的 provider client — 连接复用。
+///
+/// 背景: 每次行情请求都新建 client + 全链路由 = 每次全量 TCP 握手
+/// (探针实测 150-222ms/台)。2026-08-11 半天日志 4152 次 RealtimeMarketQuotes
+/// 请求, 纯握手开销显著。三个 client 均为 Send+Sync, 跨请求共享安全:
+/// - TdxSmartClient: 内部自带故障转移/自动重连 (try_next_server), new() 不失败;
+/// - TencentClient/SinaClient: new() 可能失败 (初始化配置错误), 失败时不缓存,
+///   下轮重建重试。
+/// 断线自愈由上游负责 (Tdx 切换服务器 / HTTP client 无状态), 本项目侧不感知
+/// 连接生命周期; 请求失败仍按原 fail-closed + breaker 语义处理。
+fn cached_tdx_smart_client() -> Arc<TdxSmartClient> {
+    static CACHE: OnceLock<Mutex<Option<Arc<TdxSmartClient>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard
+        .get_or_insert_with(|| Arc::new(TdxSmartClient::new()))
+        .clone()
+}
+
+fn cached_tencent_client() -> Result<Arc<TencentClient>, String> {
+    static CACHE: OnceLock<Mutex<Option<Arc<TencentClient>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(client) = guard.as_ref() {
+        return Ok(client.clone());
+    }
+    let client = Arc::new(
+        TencentClient::new()
+            .map_err(|error| format!("Magic Tencent quote client initialization failed: {error}"))?,
+    );
+    *guard = Some(client.clone());
+    Ok(client)
+}
+
+fn cached_sina_client() -> Result<Arc<SinaClient>, String> {
+    static CACHE: OnceLock<Mutex<Option<Arc<SinaClient>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(client) = guard.as_ref() {
+        return Ok(client.clone());
+    }
+    let client = Arc::new(
+        SinaClient::new()
+            .map_err(|error| format!("Magic Sina quote client initialization failed: {error}"))?,
+    );
+    *guard = Some(client.clone());
+    Ok(client)
 }
 
 fn quote_chain_source(
@@ -511,30 +649,23 @@ fn quote_chain_source(
     match provider {
         ProviderId::Tdx => Ok(quote_source(
             ProviderId::Tdx,
-            Arc::new(TdxSmartClient::new()),
+            cached_tdx_smart_client(),
             classify_tdx_error,
         )),
         ProviderId::Tencent => {
-            let client = TencentClient::new().map_err(|error| {
-                RouterError::InvalidConfiguration(format!(
-                    "Magic Tencent quote client initialization failed: {error}"
-                ))
-            })?;
+            let client = cached_tencent_client()
+                .map_err(RouterError::InvalidConfiguration)?;
             Ok(quote_source(
                 ProviderId::Tencent,
-                Arc::new(client),
+                client,
                 classify_tencent_error,
             ))
         }
         ProviderId::Sina => {
-            let client = SinaClient::new().map_err(|error| {
-                RouterError::InvalidConfiguration(format!(
-                    "Magic Sina quote client initialization failed: {error}"
-                ))
-            })?;
+            let client = cached_sina_client().map_err(RouterError::InvalidConfiguration)?;
             Ok(quote_source(
                 ProviderId::Sina,
-                Arc::new(client),
+                client,
                 classify_sina_error,
             ))
         }
@@ -548,6 +679,7 @@ fn admit_quote_batch(
     storage_codes: &[String],
     provider: ProviderId,
     batch: magic_market_core::DataBatch<Quote>,
+    mode: QuoteAdmissionMode,
 ) -> Result<GatewayBatch<RealtimeMarketQuote>, GatewayError> {
     let evidence = BatchEvidence::from_provenance(provider, batch.provenance())?;
     if batch.records().is_empty() {
@@ -639,14 +771,54 @@ fn admit_quote_batch(
                 )
             })?,
         )?;
-        let age_ms = now.signed_duration_since(source_at).num_milliseconds();
-        if !(0..=5_000).contains(&age_ms) {
-            // BR-218: the five-second red line is judged per record. A stale
-            // record is excluded outright — never repaired, back-filled or
-            // served from a previous round — but it must not discard the
-            // records that did meet the gate.
-            stale_exclusions.push(format!("{storage_code}@{age_ms}ms"));
-            continue;
+        match mode {
+            QuoteAdmissionMode::RealtimeFiveSecond => {
+                let age_ms = now.signed_duration_since(source_at).num_milliseconds();
+                if !(0..=5_000).contains(&age_ms) {
+                    // BR-218: the five-second red line is judged per record. A stale
+                    // record is excluded outright — never repaired, back-filled or
+                    // served from a previous round — but it must not discard the
+                    // records that did meet the gate.
+                    stale_exclusions.push(format!("{storage_code}@{age_ms}ms"));
+                    continue;
+                }
+            }
+            QuoteAdmissionMode::SettledClose { trading_date } => {
+                // BR-233: 盘后收盘快照 — 价格必须是最后交易时段 (trading_date)
+                // 的收盘价 (source_at 日期一致), 且该时段已收盘
+                // (北京时间 15:00 = UTC 07:00)。
+                if source_at.date_naive() != trading_date {
+                    stale_exclusions.push(format!(
+                        "{storage_code}@source_at={}≠trading_date={trading_date}",
+                        source_at.date_naive()
+                    ));
+                    continue;
+                }
+                let Some(session_close) = trading_date.and_hms_opt(7, 0, 0) else {
+                    return Err(GatewayError::classified(
+                        CAPABILITY,
+                        Some(provider),
+                        "invalid_request",
+                        "settled_close_session_invalid",
+                        false,
+                        format!("trading_date {trading_date} cannot form a close instant"),
+                    ));
+                };
+                if observed_at < session_close.and_utc() {
+                    // 盘中误调 — fail-closed, 不用盘中价冒充收盘价
+                    return Err(GatewayError::classified(
+                        CAPABILITY,
+                        Some(provider),
+                        "stale",
+                        "settled_close_session_not_closed",
+                        true,
+                        format!(
+                            "settled-close snapshot requested before {trading_date} session close \
+                             (observed_at={observed_at})"
+                        ),
+                    ));
+                }
+            }
         }
 
         records.push(RealtimeMarketQuote {
@@ -896,7 +1068,12 @@ mod tests {
             "TEST_CODE_partition_batch",
         );
 
-        let admitted = admit_quote_batch(&codes, ProviderId::Tencent, batch)
+        let admitted = admit_quote_batch(
+            &codes,
+            ProviderId::Tencent,
+            batch,
+            QuoteAdmissionMode::RealtimeFiveSecond,
+        )
             .expect("fresh records must survive a stale sibling");
         let kept = admitted
             .records()
@@ -925,7 +1102,12 @@ mod tests {
             "TEST_CODE_all_stale_batch",
         );
 
-        let error = admit_quote_batch(&codes, ProviderId::Tencent, batch)
+        let error = admit_quote_batch(
+            &codes,
+            ProviderId::Tencent,
+            batch,
+            QuoteAdmissionMode::RealtimeFiveSecond,
+        )
             .expect_err("an entirely stale batch must remain an explicit failure");
         assert!(error.retryable(), "staleness must keep failing over");
         assert!(
@@ -938,6 +1120,9 @@ mod tests {
     /// on every acquisition, and any success must immediately re-arm it.
     #[test]
     fn br219_breaker_trips_after_threshold_and_resets_on_success() {
+        let _serial = quote_breaker_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         reset_quote_breakers();
         let now = Utc::now();
         for _ in 0..QUOTE_BREAKER_FAILURE_THRESHOLD {
@@ -956,11 +1141,22 @@ mod tests {
         reset_quote_breakers();
     }
 
+    /// 全局 quote_breakers() 是进程级共享状态 — 访问它的测试必须串行,
+    /// 否则并行测试互相 reset 导致断言失败 (2026-08-11 加退避测试后暴露)。
+    fn quote_breaker_test_lock() -> &'static std::sync::Mutex<()> {
+        use once_cell::sync::Lazy;
+        static LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
+        &LOCK
+    }
+
     /// BR-219: the breaker only reorders attempts. If every provider is tripped
     /// it must be ignored, otherwise a transient full outage escalates into
     /// permanently acquiring nothing.
     #[test]
     fn br219_fully_tripped_chain_is_attempted_in_full() {
+        let _serial = quote_breaker_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         reset_quote_breakers();
         let now = Utc::now();
         for provider in QUOTE_PROVIDER_CHAIN {
@@ -979,6 +1175,9 @@ mod tests {
     /// retried without needing a process restart.
     #[test]
     fn br219_cooldown_expires_and_the_provider_is_retried() {
+        let _serial = quote_breaker_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         reset_quote_breakers();
         let tripped_at = Utc::now();
         for _ in 0..QUOTE_BREAKER_FAILURE_THRESHOLD {
@@ -991,6 +1190,73 @@ mod tests {
         assert!(
             !quote_breaker_skips(after_cooldown).contains(&ProviderId::Tencent),
             "the breaker must re-arm once the cooldown elapses"
+        );
+        reset_quote_breakers();
+    }
+
+    /// BR-219 退避: 冷却随连败指数增长 (300s → 900s → 2700s cap), 成功恢复
+    /// 归零后从 300s 重新开始 — 结构性失败不再每 5 分钟白试 3 次。
+    #[test]
+    fn br219_backoff_scales_with_repeated_trips_and_resets_on_success() {
+        let _serial = quote_breaker_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reset_quote_breakers();
+        let t0 = Utc::now();
+
+        // 第一次 trip: level 0 → 冷却 300s
+        for _ in 0..QUOTE_BREAKER_FAILURE_THRESHOLD {
+            record_quote_provider_failure(ProviderId::Tencent, t0);
+        }
+        assert!(quote_breaker_skips(t0).contains(&ProviderId::Tencent));
+
+        // 冷却到期后重试又连败 → 第二次 trip: level 1 → 冷却 900s
+        let after_first = t0 + chrono::Duration::seconds(QUOTE_BREAKER_COOLDOWN_SECS + 1);
+        assert!(!quote_breaker_skips(after_first).contains(&ProviderId::Tencent));
+        for _ in 0..QUOTE_BREAKER_FAILURE_THRESHOLD {
+            record_quote_provider_failure(ProviderId::Tencent, after_first);
+        }
+        // 600s 时仍在冷却 (900s 未满) — 固定 300s 冷却下此时已可重试
+        let mid_second = after_first + chrono::Duration::seconds(600);
+        assert!(
+            quote_breaker_skips(mid_second).contains(&ProviderId::Tencent),
+            "second trip must back off to 900s"
+        );
+
+        // 第三次 trip: level 2 → 冷却 2700s (cap)
+        let after_second = after_first + chrono::Duration::seconds(900 + 1);
+        quote_breaker_skips(after_second);
+        for _ in 0..QUOTE_BREAKER_FAILURE_THRESHOLD {
+            record_quote_provider_failure(ProviderId::Tencent, after_second);
+        }
+        let mid_third = after_second + chrono::Duration::seconds(1800);
+        assert!(
+            quote_breaker_skips(mid_third).contains(&ProviderId::Tencent),
+            "third trip must back off to 2700s cap"
+        );
+
+        // 成功恢复 → 状态归零 (含 backoff_level)
+        record_quote_provider_success(ProviderId::Tencent);
+        let after_success = mid_third + chrono::Duration::seconds(1);
+        assert!(
+            !quote_breaker_skips(after_success).contains(&ProviderId::Tencent),
+            "success must reset the breaker including backoff level"
+        );
+        // 恢复后再次连败 → 从 300s 重新开始 (trip 后 100s 仍在冷却,
+        // 若沿用 2700s 退避级别此处也会成立 — 由 trip 固化值区分)
+        for _ in 0..QUOTE_BREAKER_FAILURE_THRESHOLD {
+            record_quote_provider_failure(ProviderId::Tencent, after_success);
+        }
+        let mid_fourth = after_success + chrono::Duration::seconds(100);
+        assert!(
+            quote_breaker_skips(mid_fourth).contains(&ProviderId::Tencent),
+            "post-recovery cooldown must restart at level 0 (300s)"
+        );
+        // 且 301s 时冷却已到期重置 — 验证固化冷却确实是 300s 而非 2700s
+        let after_fourth = after_success + chrono::Duration::seconds(301);
+        assert!(
+            !quote_breaker_skips(after_fourth).contains(&ProviderId::Tencent),
+            "post-recovery cooldown must expire at 300s, not 2700s"
         );
         reset_quote_breakers();
     }
@@ -1065,6 +1331,7 @@ mod tests {
             &["600396".to_owned()],
             outcome.selected_provider(),
             outcome.into_batch(),
+            QuoteAdmissionMode::RealtimeFiveSecond,
         );
         let error = admission.expect_err("§2.4 five-second gate must reject a six-second quote");
         assert!(
@@ -1148,9 +1415,13 @@ mod tests {
             .unwrap();
         let batch = DataBatch::strict(vec![quote], provenance);
 
-        let admitted =
-            admit_quote_batch(&["TEST_CODE_600396".to_owned()], ProviderId::Tencent, batch)
-                .unwrap();
+        let admitted = admit_quote_batch(
+            &["TEST_CODE_600396".to_owned()],
+            ProviderId::Tencent,
+            batch,
+            QuoteAdmissionMode::RealtimeFiveSecond,
+        )
+        .unwrap();
         assert_eq!(admitted.records()[0].code, "TEST_CODE_600396");
         assert_eq!(admitted.records()[0].provider, ProviderId::Tencent);
         assert_eq!(admitted.records()[0].price, 10.0);
@@ -1163,6 +1434,7 @@ mod tests {
             &["TEST_CODE_600396".to_owned()],
             ProviderId::Tencent,
             quote_batch("600396", ProviderId::Tencent, "TEST_CODE_sealed_quote", now),
+            QuoteAdmissionMode::RealtimeFiveSecond,
         )
         .expect("TEST_CODE quote batch must pass transport admission");
 
@@ -1322,6 +1594,7 @@ mod tests {
             &["TEST_CODE_600396".to_owned()],
             ProviderId::Tencent,
             DataBatch::strict(Vec::new(), empty_provenance),
+            QuoteAdmissionMode::RealtimeFiveSecond,
         )
         .unwrap_err();
         assert_eq!(empty.reason_code(), "verified_quote_batch_empty");
@@ -1331,6 +1604,7 @@ mod tests {
             &["TEST_CODE_600396".to_owned(), "TEST_CODE_000001".to_owned()],
             ProviderId::Tencent,
             quote_batch("600396", ProviderId::Tencent, "TEST_CODE_cardinality", now),
+            QuoteAdmissionMode::RealtimeFiveSecond,
         )
         .unwrap_err();
         assert_eq!(cardinality.reason_code(), "invalid_evidence");
@@ -1339,6 +1613,7 @@ mod tests {
             &["TEST_CODE_600396".to_owned()],
             ProviderId::Tencent,
             quote_batch("600000", ProviderId::Tencent, "TEST_CODE_identity", now),
+            QuoteAdmissionMode::RealtimeFiveSecond,
         )
         .unwrap_err();
         assert_eq!(identity.reason_code(), "invalid_evidence");
@@ -1352,10 +1627,101 @@ mod tests {
                 "TEST_CODE_stale",
                 now - chrono::Duration::seconds(6),
             ),
+            QuoteAdmissionMode::RealtimeFiveSecond,
         )
         .unwrap_err();
         assert_eq!(stale.reason_code(), "quote_stale");
         assert!(stale.retryable());
+    }
+
+    /// BR-233: 盘后收盘静态快照 — 收市后 (observed_at 已过 trading_date
+    /// 北京时间 15:00 = UTC 07:00) 的超龄 quote 被准入为当日收盘快照,
+    /// 名字+价格完整, 且不要求 5s 新鲜度。
+    #[test]
+    fn br233_settled_close_admits_after_hours_quote_for_trading_date() {
+        let trading_date = NaiveDate::from_ymd_opt(2026, 8, 10).expect("fixed date");
+        // 15:00 +08 = 07:00 UTC; 收市后 21:00 +08 = 13:00 UTC 请求
+        let source_at = chrono::NaiveDateTime::new(trading_date, chrono::NaiveTime::from_hms_opt(15, 0, 0).unwrap())
+            .and_local_timezone(chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+            .unwrap()
+            .with_timezone(&Utc);
+        // 与 br218 测试同款真实样式代码 (TEST_CODE_ 前缀会被 build_instrument 解析)
+        let codes = vec!["600396".to_owned()];
+        let batch = quote_batch(
+            "600396",
+            ProviderId::Tencent,
+            "TEST_CODE_settled_close",
+            source_at,
+        );
+
+        let admitted = admit_quote_batch(
+            &codes,
+            ProviderId::Tencent,
+            batch,
+            QuoteAdmissionMode::SettledClose { trading_date },
+        )
+        .expect("收市后同交易时段的收盘价必须准入");
+        assert_eq!(admitted.records()[0].price, 10.0);
+        assert_eq!(admitted.records()[0].name, "协议测试股票");
+        assert_eq!(admitted.records()[0].source_at, source_at);
+    }
+
+    /// BR-233 fail-closed 1: quote 的 source_at 日期 != trading_date
+    /// (隔日/昨日数据) → 排除, 整批空 → quote_stale。
+    #[test]
+    fn br233_settled_close_rejects_wrong_source_date() {
+        let trading_date = NaiveDate::from_ymd_opt(2026, 8, 10).expect("fixed date");
+        let other_day = NaiveDate::from_ymd_opt(2026, 8, 7).expect("fixed date");
+        let source_at = chrono::NaiveDateTime::new(other_day, chrono::NaiveTime::from_hms_opt(15, 0, 0).unwrap())
+            .and_local_timezone(chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+            .unwrap()
+            .with_timezone(&Utc);
+        let codes = vec!["600396".to_owned()];
+        let batch = quote_batch(
+            "600396",
+            ProviderId::Tencent,
+            "TEST_CODE_wrong_date",
+            source_at,
+        );
+
+        let error = admit_quote_batch(
+            &codes,
+            ProviderId::Tencent,
+            batch,
+            QuoteAdmissionMode::SettledClose { trading_date },
+        )
+        .unwrap_err();
+        assert_eq!(error.reason_code(), "quote_stale");
+        assert!(error.retryable());
+    }
+
+    /// BR-233 fail-closed 2: 盘中 (observed_at 未过 15:00 +08) 调用 settled-close
+    /// → settled_close_session_not_closed, 不用盘中价冒充收盘价。
+    #[test]
+    fn br233_settled_close_rejects_intraday_request() {
+        let trading_date = NaiveDate::from_ymd_opt(2026, 8, 10).expect("fixed date");
+        // 盘中 13:00 +08 = 05:00 UTC → 未过 07:00 UTC 收盘时刻
+        let source_at = chrono::NaiveDateTime::new(trading_date, chrono::NaiveTime::from_hms_opt(13, 0, 0).unwrap())
+            .and_local_timezone(chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+            .unwrap()
+            .with_timezone(&Utc);
+        let codes = vec!["600396".to_owned()];
+        let batch = quote_batch(
+            "600396",
+            ProviderId::Tencent,
+            "TEST_CODE_intraday",
+            source_at,
+        );
+
+        let error = admit_quote_batch(
+            &codes,
+            ProviderId::Tencent,
+            batch,
+            QuoteAdmissionMode::SettledClose { trading_date },
+        )
+        .unwrap_err();
+        assert_eq!(error.reason_code(), "settled_close_session_not_closed");
+        assert!(error.retryable());
     }
 
     #[test]
