@@ -1811,8 +1811,9 @@ fn latest_trading_date(today: chrono::NaiveDate) -> chrono::NaiveDate {
     }
 }
 
-/// 任务#3: 持仓快照过期检查 — 最近交易日收盘后仍无当日快照 → 推送提醒。
-/// 触发点: 启动时 + 每日 15:10（收盘后，快照应在 15:00 后上传）。
+/// 任务#3: 持仓快照过期检查 — BR-234b 后快照过期时系统自动估值（持仓×实时价），
+/// 快照的唯一用途是反映真实持仓变动。连续 5 个交易日无新快照 → 推送提醒
+/// （低频率交易者一周一检；1-4 个交易日仅日志）。触发点: 启动时 + 每日 15:10。
 /// 每日最多推 1 次（静态日期去重）；快照新鲜或无记录时仅日志，不出声推送。
 async fn check_snapshot_staleness_and_notify() {
     use stock_analysis::database::user_account_summary;
@@ -1838,6 +1839,14 @@ async fn check_snapshot_staleness_and_notify() {
         );
         return;
     }
+    // 累计过期交易日数 ≥ 5 才提醒（BR-234b：未传时系统已自动估值，无需每日打扰）
+    let days_behind = trading_days_since(snapshot_date, last_trading);
+    if days_behind < 5 {
+        log::debug!(
+            "[快照提醒] 快照过期 {days_behind} 个交易日（<5 不提醒）：系统按持仓×实时价自动估值中"
+        );
+        return;
+    }
     // 每日一推去重
     static LAST: std::sync::Mutex<Option<chrono::NaiveDate>> = std::sync::Mutex::new(None);
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
@@ -1845,16 +1854,29 @@ async fn check_snapshot_staleness_and_notify() {
         return;
     }
     *last = Some(today);
-    let days_behind = (last_trading - snapshot_date).num_days();
     let text = format!(
-        "[快照提醒] 持仓快照已过期 {} 个交易日：最新 {}（总资产 {:.2}）。请上传今日收盘快照，虚拟盘资金口径才会更新。",
-        days_behind, summary.effective_at, summary.total_assets
+        "[快照提醒] 持仓快照已 {days_behind} 个交易日未更新：最新 {}（总资产 {:.2}）。期间收益为自动估算（持仓×实时行情）；若真实持仓有变动，请上传最新截图。",
+        summary.effective_at, summary.total_assets
     );
     log::warn!("[快照提醒] {}", text);
     let outcome = push_governor_v3(&text, PushKind::SnapshotStale, None).await;
     if !outcome.is_pushed() {
         log::warn!("[快照提醒] 推送未投递: {:?}", outcome);
     }
+}
+
+/// (start, end] 区间内的交易日数（排除周末；不含 start 当天，含 end）。
+fn trading_days_since(start: chrono::NaiveDate, end: chrono::NaiveDate) -> i64 {
+    use chrono::Datelike;
+    let mut days = 0;
+    let mut day = start;
+    while day < end {
+        day = day.succ_opt().expect("date overflow");
+        if !matches!(day.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun) {
+            days += 1;
+        }
+    }
+    days
 }
 
 fn refresh_closing_valuation_note() {

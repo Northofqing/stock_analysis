@@ -617,6 +617,241 @@ pub fn portfolio_state(code: &str, quote_price: f64) -> Result<(f64, f64, f64), 
     Ok((ledger.cash, ledger.total_value, pos_pct))
 }
 
+/// 最新券商账户汇总（append-only user_account_summary）。
+/// 返回 (total_assets, available_cash, securities_market_value, daily_pnl)。
+fn account_snapshot_summary() -> Result<(f64, f64, f64, f64), String> {
+    let db = DatabaseManager::try_get().ok_or_else(|| "DB 未初始化".to_string())?;
+    let mut conn = db
+        .get_conn()
+        .map_err(|error| format!("DB 连接失败: {error}"))?;
+    #[derive(diesel::QueryableByName)]
+    struct AccountSummaryRow {
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        total_assets: f64,
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        available_cash: f64,
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        securities_market_value: f64,
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        daily_pnl: f64,
+    }
+    let summary: AccountSummaryRow = diesel::sql_query(
+        "SELECT total_assets, available_cash, securities_market_value, daily_pnl \
+         FROM user_account_summary ORDER BY id DESC LIMIT 1",
+    )
+    .get_result(&mut conn)
+    .map_err(|error| format!("account summary unavailable: {error}"))?;
+    Ok((
+        summary.total_assets,
+        summary.available_cash,
+        summary.securities_market_value,
+        summary.daily_pnl,
+    ))
+}
+
+/// BR-151 快照模式 ledger 刷新（intraday_monitor tick 生产入口每 30s 无条件调用）。
+///
+/// 用最新券商账户汇总 upsert 当日 ledger（created_at=CURRENT_TIMESTAMP 刷新，
+/// 满足 BR-097 ledger 结构门）——候选到达前 ledger 即已新鲜，虚拟盘成交不再
+/// 被 "ledger stale" 拦截。30s 实时门对静态快照不适用：账户授权来自用户确认
+/// 动作（confirmed_at），生产盘中无快照刷新者（BR-146/147）。
+///
+/// BR-234b 每日收益双口径（用户指令：「我传了 就以我的为准 / 我不传 你自己
+/// 计算出来」）：
+/// - 最新券商汇总 effective_at 日期 == 今天 → 用户当天上传 → 以快照 4 字段
+///   为准（真实账户证据：total_assets/cash/market_value/daily_pnl）。
+/// - 快照过期 → `estimate_ledger_from_positions`：持仓明细 × 实时行情估值 +
+///   快照现金；daily_pnl = 今日总资产 − 昨日 ledger（自动计算每日收益）。
+pub fn refresh_account_ledger_from_snapshot() -> Result<(), String> {
+    let (snapshot_total, available_cash, snapshot_market, snapshot_pnl) =
+        account_snapshot_summary()?;
+    let db = DatabaseManager::try_get().ok_or_else(|| "DB 未初始化".to_string())?;
+    let mut conn = db
+        .get_conn()
+        .map_err(|error| format!("DB 连接失败: {error}"))?;
+    let today = chrono::Local::now().date_naive();
+    let today_str = today.to_string();
+
+    // 口径分派：快照新鲜（用户当天上传）→ 快照为准；过期 → 持仓 × 实时价自算。
+    let (total_assets, cash, market_value, daily_pnl) =
+        if latest_snapshot_effective_date(&mut conn)?.map_or(false, |d| d == today) {
+            (snapshot_total, available_cash, snapshot_market, snapshot_pnl)
+        } else {
+            estimate_ledger_from_positions(&mut conn, available_cash, today)?
+        };
+
+    // upsert 当日 ledger（created_at 每 tick 刷新 → age≤30s 结构门通过）
+    diesel::sql_query(
+        "INSERT INTO ledger (date, total_value, cash, market_value, daily_pnl, created_at) \
+         VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP) \
+         ON CONFLICT(date) DO UPDATE SET total_value=excluded.total_value, \
+             cash=excluded.cash, market_value=excluded.market_value, \
+             daily_pnl=excluded.daily_pnl, created_at=CURRENT_TIMESTAMP",
+    )
+    .bind::<diesel::sql_types::Text, _>(&today_str)
+    .bind::<diesel::sql_types::Double, _>(total_assets)
+    .bind::<diesel::sql_types::Double, _>(cash)
+    .bind::<diesel::sql_types::Double, _>(market_value)
+    .bind::<diesel::sql_types::Double, _>(daily_pnl)
+    .execute(&mut conn)
+    .map_err(|error| format!("ledger upsert failed: {error}"))?;
+
+    // 复读当日行并过 BR-097 结构门（自我验证 upsert 生效）
+    let ledger: LedgerState = diesel::sql_query(
+        "SELECT date, total_value, cash, market_value, created_at FROM ledger WHERE date = ?",
+    )
+    .bind::<diesel::sql_types::Text, _>(&today_str)
+    .get_result(&mut conn)
+    .map_err(|error| format!("account ledger unavailable: {error}"))?;
+    validate_ledger_state(&ledger, &today_str, chrono::Utc::now().naive_utc())
+}
+
+/// 最新券商汇总 effective_at 的日期（东八区，作为「用户是否当天上传」判据）。
+/// 无汇总行 → None（`account_snapshot_summary` 前置已保证有行，防御性返回）。
+fn latest_snapshot_effective_date(
+    conn: &mut SqliteConnection,
+) -> Result<Option<NaiveDate>, String> {
+    #[derive(QueryableByName)]
+    struct EffectiveDateRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        effective_at: String,
+    }
+    let row: Option<EffectiveDateRow> = diesel::sql_query(
+        "SELECT effective_at FROM user_account_summary ORDER BY id DESC LIMIT 1",
+    )
+    .get_result(conn)
+    .optional()
+    .map_err(|error| format!("snapshot effective_at unavailable: {error}"))?;
+    row.map(|r| {
+        chrono::DateTime::parse_from_rfc3339(&r.effective_at)
+            .map(|dt| dt.date_naive())
+            .map_err(|error| format!("snapshot effective_at invalid: {error}"))
+    })
+    .transpose()
+}
+
+/// 快照过期自算路径：最新持仓明细 × 估值价 → 市值；总资产 = 市值 + 快照现金；
+/// daily_pnl = 总资产 − 昨日 ledger（无昨日行 → 0，首日）。
+/// 持仓快照缺失 → Err 出声（无授权证据不臆造估值）。
+fn estimate_ledger_from_positions(
+    conn: &mut SqliteConnection,
+    cash: f64,
+    today: NaiveDate,
+) -> Result<(f64, f64, f64, f64), String> {
+    let snapshot = crate::database::user_position_snapshot::latest_user_position_snapshot()
+        .map_err(|error| format!("持仓快照读取失败: {error}"))?
+        .ok_or_else(|| "无持仓快照，无法自算估值 (BR-234b)".to_string())?;
+    estimate_ledger_from_snapshot(&snapshot, conn, cash, today)
+}
+
+/// 估值纯函数（自算口径主体）：给定持仓快照 → (total, cash, market, daily_pnl)。
+/// 与 DB 读取解耦，便于不落库的确定性测试。
+fn estimate_ledger_from_snapshot(
+    snapshot: &crate::database::user_position_snapshot::UserPositionSnapshot,
+    conn: &mut SqliteConnection,
+    cash: f64,
+    today: NaiveDate,
+) -> Result<(f64, f64, f64, f64), String> {
+    let mut market_value = 0.0;
+    for item in &snapshot.items {
+        market_value += item.quantity as f64 * valuation_price(&item.code)?;
+    }
+    let total = market_value + cash;
+
+    #[derive(QueryableByName)]
+    struct PrevTotalRow {
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        total_value: f64,
+    }
+    let prev: Option<PrevTotalRow> = diesel::sql_query(
+        "SELECT total_value AS total_value FROM ledger WHERE date < ? ORDER BY date DESC LIMIT 1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&today.to_string())
+    .get_result(conn)
+    .optional()
+    .map_err(|error| format!("prev ledger unavailable: {error}"))?;
+    let daily_pnl = total - prev.map_or(0.0, |row| row.total_value);
+    Ok((total, cash, market_value, daily_pnl))
+}
+
+/// 单只估值价：实时价优先（broker::quote_price，BR-218 5s 门）；
+/// 失败降级日K最新收盘价（warn 出声说明口径降级，K 线 5 根即可取最新收盘）；
+/// 两者都失败 → Err（fail-closed，不写失真估值，成本价永不作估值价）。
+fn valuation_price(code: &str) -> Result<f64, String> {
+    match crate::broker::quote_price(code) {
+        Ok(price) => Ok(price),
+        Err(realtime_error) => {
+            let bars = crate::data_gateway::historical_bars::HistoricalBarsGateway::new()
+                .daily_bars(code, 5)
+                .map_err(|error| {
+                    format!("{code} 估值价获取失败: 实时={realtime_error}, 日K={error}")
+                })?;
+            let close = bars
+                .records()
+                .first()
+                .map(|bar| bar.close)
+                .filter(|p| p.is_finite() && *p > 0.0)
+                .ok_or_else(|| {
+                    format!("{code} 估值价获取失败: 实时={realtime_error}, 日K无有效收盘价")
+                })?;
+            log::warn!(
+                "[paper_valuation] {code} 实时行情不可用({realtime_error})，估值降级为日K最新收盘价 {close:.2}"
+            );
+            Ok(close)
+        }
+    }
+}
+
+/// BR-151 快照模式账户证据（intraday_monitor 生产注入源）。
+///
+/// 虚拟盘账户 = 用户确认的真实账户快照：user_account_summary（券商汇总：
+/// 总资产/可用现金/证券市值）+ user_position_snapshot（用户确认持仓明细）。
+/// 先刷新当日 ledger（refresh_account_ledger_from_snapshot），再返回
+/// (cash, total, pos_pct)。
+///
+/// BR-234b：口径统一为 refresh 后当日 ledger（快照为准或持仓×实时价自算），
+/// 不再直接读快照汇总——自算路径下快照总资产已过期，会算错仓位占比。
+pub fn portfolio_state_snapshot(code: &str, quote_price: f64) -> Result<(f64, f64, f64), String> {
+    if !quote_price.is_finite() || quote_price <= 0.0 {
+        return Err(format!(
+            "invalid quote price for portfolio state: {quote_price}"
+        ));
+    }
+    refresh_account_ledger_from_snapshot()?;
+
+    // 权威口径：当日 ledger（refresh 刚写入；cash/total_value 为快照或自算值）
+    let db = DatabaseManager::try_get().ok_or_else(|| "DB 未初始化".to_string())?;
+    let mut conn = db
+        .get_conn()
+        .map_err(|error| format!("DB 连接失败: {error}"))?;
+    let ledger: LedgerState = diesel::sql_query(
+        "SELECT date, total_value, cash, market_value, created_at FROM ledger \
+         WHERE date = ?",
+    )
+    .bind::<diesel::sql_types::Text, _>(&chrono::Local::now().date_naive().to_string())
+    .get_result(&mut conn)
+    .map_err(|error| format!("account ledger unavailable: {error}"))?;
+    let (total_assets, available_cash) = (ledger.total_value, ledger.cash);
+
+    // 4. 用户确认持仓快照（账户持仓明细；缺失/空 = 无授权证据 → 出声拒绝）
+    let snapshot = crate::database::user_position_snapshot::latest_user_position_snapshot()
+        .map_err(|error| format!("持仓快照读取失败: {error}"))?
+        .ok_or_else(|| "无用户确认持仓快照 (BR-226)".to_string())?;
+    if snapshot.confirm_empty || snapshot.items.is_empty() {
+        return Err("account snapshot has no confirmed positions (BR-226)".to_string());
+    }
+
+    // 5. 单票仓位（买入前状态：候选已有持仓则计占比，新仓 = 0）
+    let pos_pct = snapshot
+        .items
+        .iter()
+        .filter(|item| item.code == code)
+        .map(|item| item.quantity as f64 * quote_price / total_assets * 100.0)
+        .sum::<f64>();
+
+    Ok((available_cash, total_assets, pos_pct))
+}
+
 /// 模拟成交结果 (含 DB 写入状态)
 #[derive(Clone, Debug)]
 pub struct PaperOutcome {
@@ -1326,5 +1561,162 @@ mod tests {
         let second = simulate(&signal, 50.0, 100_000.0, 100_000.0, 0.0)
             .expect_err("same rejected business id must be deduplicated");
         assert!(second.contains("duplicate business order id within 60 seconds"));
+    }
+
+    /// BR-151 快照模式账户证据：user_account_summary + user_position_snapshot
+    /// → upsert 当日 ledger → (cash, total, pos_pct)。
+    #[test]
+    fn portfolio_state_snapshot_upserts_today_ledger_from_confirmed_snapshot() {
+        let _ = DatabaseManager::init(None);
+        let mut conn = DatabaseManager::get()
+            .get_conn()
+            .expect("test db conn");
+
+        // 1. 券商账户汇总（synthetic 值，结构同生产：eastmoney-app-screenshot）。
+        //    effective_at=今天 → BR-234b 快照新鲜分支：以快照 4 字段为准。
+        let today = chrono::Local::now().date_naive();
+        diesel::sql_query(
+            "INSERT INTO user_account_summary \
+                (effective_at, total_assets, securities_market_value, available_cash, \
+                 position_ratio_pct, daily_pnl, source) \
+             VALUES (?, 100000.0, 60000.0, 40000.0, \
+                     60.0, 123.45, 'eastmoney-app-screenshot')",
+        )
+        .bind::<diesel::sql_types::Text, _>(&format!("{today}T15:46:00+08:00"))
+        .execute(&mut conn)
+        .expect("insert account summary");
+
+        // 2a. 快照缺失 = 无授权证据 → 出声拒绝（不静默）
+        let missing = portfolio_state_snapshot("TEST_CODE_600519", 50.0)
+            .expect_err("missing snapshot must fail loudly");
+        assert!(missing.contains("持仓快照"), "missing={missing}");
+
+        // 2b. 用户确认持仓快照 + 明细（synthetic TEST_CODE 持仓）
+        use crate::portfolio::user_position_snapshot::{
+            UserPositionItemInput, UserPositionSnapshotInput,
+        };
+        let effective = chrono::DateTime::parse_from_rfc3339(&format!("{today}T15:46:00+08:00"))
+            .expect("parse effective_at");
+        let input = UserPositionSnapshotInput {
+            snapshot_id: "TEST_CODE_SNAPSHOT_001".to_string(),
+            effective_at: effective,
+            confirmed_at: effective,
+            source: "test-fixture".to_string(),
+            confirm_empty: false,
+            evidence_sha256: "TEST_CODE_EVIDENCE_001".to_string(),
+            items: vec![UserPositionItemInput {
+                code: "TEST_CODE_600519".to_string(),
+                name: "测试持仓".to_string(),
+                quantity: 1_000,
+                cost_price: 50.0,
+            }],
+        };
+        crate::database::user_position_snapshot::save_user_position_snapshot(&input)
+            .expect("save snapshot");
+
+        // 3. 调用：返回快照账户 (cash, total, pos_pct)
+        let (cash, total, pos_pct) =
+            portfolio_state_snapshot("TEST_CODE_600519", 60.0).expect("snapshot account ok");
+        assert_eq!(cash, 40_000.0);
+        assert_eq!(total, 100_000.0);
+        // 已有 1000 股 × 60 元 / 10 万 = 60.0%
+        assert!((pos_pct - 60.0).abs() < 1e-9, "pos_pct={pos_pct}");
+
+        // 4. 当日 ledger 已 upsert 且过结构门（date==today, created_at≤30s）
+        let ledger: LedgerState = diesel::sql_query(
+            "SELECT date, total_value, cash, market_value, created_at FROM ledger \
+             WHERE date = (SELECT date('now','localtime'))",
+        )
+        .get_result(&mut conn)
+        .expect("today ledger row");
+        validate_ledger_state(
+            &ledger,
+            &chrono::Local::now().date_naive().to_string(),
+            chrono::Utc::now().naive_utc(),
+        )
+        .expect("BR-097 ledger structure gate");
+
+        // 5. 非候选 code → 新仓 pos_pct = 0（买入前状态）
+        let (_, _, fresh_pos) =
+            portfolio_state_snapshot("TEST_CODE_688999", 10.0).expect("fresh code ok");
+        assert_eq!(fresh_pos, 0.0);
+    }
+
+    /// BR-234b 自算路径：快照过期 → 持仓明细 × 实时价估值（测试 provider 10 元/只）；
+    /// daily_pnl = 今日总资产 − 昨日 ledger。直测纯函数 estimate_ledger_from_snapshot
+    /// （构造快照结构体不落库，避免并行测试污染共享 DB 的「快照缺失」断言）。
+    #[test]
+    fn estimate_ledger_from_snapshot_uses_live_prices_and_prev_ledger() {
+        let _ = DatabaseManager::init(None);
+        crate::broker::ensure_test_quote_provider(); // 实时价 10.0/只
+        let mut conn = DatabaseManager::get()
+            .get_conn()
+            .expect("test db conn");
+        let today = chrono::Local::now().date_naive();
+        let yesterday = today.pred_opt().expect("yesterday");
+
+        // 昨日 ledger 基准（daily_pnl 对比锚；ON CONFLICT 防并行测试同日期）
+        diesel::sql_query(
+            "INSERT INTO ledger (date, total_value, cash, market_value, daily_pnl, created_at) \
+             VALUES (?, 48000.0, 40000.0, 8000.0, -2000.0, CURRENT_TIMESTAMP) \
+             ON CONFLICT(date) DO UPDATE SET \
+                 total_value=excluded.total_value, cash=excluded.cash, \
+                 market_value=excluded.market_value, daily_pnl=excluded.daily_pnl, \
+                 created_at=CURRENT_TIMESTAMP",
+        )
+        .bind::<diesel::sql_types::Text, _>(&yesterday.to_string())
+        .execute(&mut conn)
+        .expect("insert prev ledger");
+
+        use crate::database::user_position_snapshot::UserPositionSnapshot;
+        use crate::portfolio::user_position_snapshot::UserPositionItemInput;
+        // 昨天确认的持仓快照（自算输入：明细数量 × 实时价）
+        let snapshot = UserPositionSnapshot {
+            snapshot_row_id: 1,
+            snapshot_id: "TEST_CODE_SNAPSHOT_STALE".to_string(),
+            effective_at: chrono::DateTime::parse_from_rfc3339(
+                &format!("{yesterday}T15:46:00+08:00"),
+            )
+            .expect("parse effective"),
+            confirmed_at: chrono::DateTime::parse_from_rfc3339(
+                &format!("{yesterday}T15:47:00+08:00"),
+            )
+            .expect("parse confirmed"),
+            source: "test-fixture".to_string(),
+            confirm_empty: false,
+            evidence_sha256: "TEST_CODE_EVIDENCE_STALE".to_string(),
+            items: vec![UserPositionItemInput {
+                code: "TEST_CODE_600519".to_string(),
+                name: "测试持仓".to_string(),
+                quantity: 1_000,
+                cost_price: 50.0,
+            }],
+        };
+
+        // 自算：market = Σ(明细 × 实时价10) = 10000，total = 10000 + 现金40000 = 50000，
+        // daily_pnl = 50000 − 昨日48000 = 2000。
+        let (total, cash, market, pnl) = estimate_ledger_from_snapshot(
+            &snapshot,
+            &mut conn,
+            40_000.0,
+            today,
+        )
+        .expect("estimate ok");
+        assert_eq!(market, 10_000.0);
+        assert_eq!(total, 50_000.0);
+        assert_eq!(cash, 40_000.0);
+        assert!((pnl - 2_000.0).abs() < 1e-9, "pnl={pnl}");
+    }
+
+    /// BR-234b fail-closed：实时行情不可用（无 provider）且日K无数据 →
+    /// 估值价获取整体 Err，不写失真估值（成本价永不作估值价）。
+    /// 并行测试可能已注册全局 provider（Once）→ 该分支不可复现时跳过。
+    #[test]
+    fn valuation_price_fails_closed_without_quote_source() {
+        if crate::broker::quote_provider_registered() {
+            return; // 其他并行测试已注册 provider，分支不可复现
+        }
+        let err = valuation_price("TEST_CODE_NO_QUOTE_SOURCE").expect_err("fail closed");
+        assert!(err.contains("估值价获取失败"), "err={err}");
     }
 }
