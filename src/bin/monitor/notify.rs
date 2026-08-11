@@ -127,6 +127,8 @@ pub enum PushKind {
     ReviewProviderTopN,
     /// BR-222: 持仓复盘 (R-11, 用户确认持仓摘要, 盘后 1次/日)
     PositionReview,
+    /// R-12: 盘后策略回测 (15min K线回测虚拟仓信号 + boll_macd, 盘后 1次/日)
+    ReviewBacktest,
     // ============= v13 §14 新增 PushKind (PR #1) =============
     /// v13 §14.1 P-01 盘前新闻热点 (⚡ 15min 冷却)
     PreopenNewsHot,
@@ -327,6 +329,8 @@ impl PushKind {
             | PushKind::NewsFlashCritical => PushLevel::Important,
             // v15.3 D5: 实盘异常是紧急级
             | PushKind::MarketActionAlert => PushLevel::Emergency,
+            // R-12 盘后回测: 参考级 (非交易建议, 仅统计)
+            PushKind::ReviewBacktest => PushLevel::Info,
             // ℹ️参考 (降级 + ForbiddenOps/PaperTrade)
             _ => PushLevel::Info,
         }
@@ -434,6 +438,8 @@ impl PushKind {
             // v17.4 能力1 (BR-082)
             PushKind::NewsFlashCritical => Some(300), // 5 min/事件 (code=event_id 前缀)
             PushKind::NewsFlashAggregated => Some(3600), // 1h/窗口 (code=窗口标签)
+            // R-12 盘后回测: 1次/日 (60 min 冷却, 防重复调度触发)
+            PushKind::ReviewBacktest => Some(3600),
             _ => Some(1800),                          // 默认 30min
         }
     }
@@ -503,6 +509,7 @@ impl PushKind {
             PushKind::EventCalendar => "事件日历",
             PushKind::ReviewProviderTopN => "盘后量能与主力净流入",
             PushKind::PositionReview => "持仓复盘",
+            PushKind::ReviewBacktest => "15min回测",
             // v13 新增
             PushKind::PreopenNewsHot => "盘前热点",
             PushKind::IntradayMarket => "盘中轮动",
@@ -834,6 +841,17 @@ pub const DISPATCH_TABLE: &[(PushKind, DispatchRow)] = &[
             cooldown_scope: CooldownScope::Global,
             label: "快照过期提醒",
             stable_template_id: "snapshotstale_v1",
+        },
+    ),
+    // ============== R-12: 盘后 15min 回测段 ==============
+    (
+        PushKind::ReviewBacktest,
+        DispatchRow {
+            level: PushLevel::Info,
+            cooldown_secs: Some(3600),
+            cooldown_scope: CooldownScope::Global,
+            label: "15min回测",
+            stable_template_id: "r12_15min_backtest_v1",
         },
     ),
 ];
@@ -6035,14 +6053,14 @@ mod tests {
         }
     }
 
-    // ============== v17.x: DISPATCH_TABLE 17 rows 完整性 (BR-234 + 任务#3) ==============
+    // ============== v17.x: DISPATCH_TABLE 18 rows 完整性 (BR-234 + 任务#3 + R-12) ==============
 
     #[test]
-    fn dispatch_table_size_is_seventeen() {
+    fn dispatch_table_size_is_eighteen() {
         assert_eq!(
             DISPATCH_TABLE.len(),
-            17,
-            "v17.x DISPATCH_TABLE 应 17 rows (3 v17.6 + 6 v17.7 + 6 v17.8 + 1 BR-234 + 1 #3)"
+            18,
+            "v17.x DISPATCH_TABLE 应 18 rows (3 v17.6 + 6 v17.7 + 6 v17.8 + 1 BR-234 + 1 #3 + 1 R-12)"
         );
     }
 
@@ -6057,7 +6075,7 @@ mod tests {
 
     #[test]
     fn dispatch_table_covers_all_audit_marked() {
-        // v17.6 low-priority 3 + v17.7 6 + v17.8 6 + BR-234 1 = 16
+        // v17.6 low-priority 3 + v17.7 6 + v17.8 6 + BR-234 1 + 任务#3 1 + R-12 1 = 18
         let expected: Vec<PushKind> = vec![
             PushKind::FactorIC,
             PushKind::SectorTier,
@@ -6076,8 +6094,9 @@ mod tests {
             PushKind::BlockTradePriceRange,
             PushKind::PaperSell,
             PushKind::SnapshotStale,
+            PushKind::ReviewBacktest,
         ];
-        assert_eq!(expected.len(), 17);
+        assert_eq!(expected.len(), 18);
         for k in expected {
             assert!(k.dispatch_row().is_some(), "{:?} 应在 DISPATCH_TABLE 内", k);
         }

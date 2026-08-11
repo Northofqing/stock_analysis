@@ -8902,6 +8902,53 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
     crate::review_batch::ReviewTaskOutcome::from_push_outcome(result, 1)
 }
 
+/// R-12: 盘后 15min 回测段 — 用 15 分钟 K线回测虚拟仓买卖信号 + boll_macd 信号。
+/// T0 做T 信号依赖实时五档盘口 (MagicTdxT0Evidence bid/ask + 分时均价), 历史不可得 →
+/// 由 render_r12 文本标注"不可回测" (用户已确认)。
+/// 回测窗口 = 近 30 自然日 (覆盖虚拟仓 7/14 起全部信号); 网络拉取 + SQLite 读表在
+/// spawn_blocking 内, 失败出声 (failed), 单只拉取失败在模块内 warn 跳过。
+async fn dispatch_r12_backtest_outcome(date: &str) -> crate::review_batch::ReviewTaskOutcome {
+    if let Err(error) = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+        let reason = format!("invalid review date {date}: {error}");
+        log_dispatcher_attempt("R-12", false, 0, &reason);
+        return crate::review_batch::ReviewTaskOutcome::failed(false, reason);
+    }
+    let result = match tokio::task::spawn_blocking(|| {
+        stock_analysis::review::backtest::run_full_backtest(30)
+    })
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(reason)) => {
+            log_dispatcher_attempt("R-12", false, 0, &reason);
+            return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
+        }
+        Err(error) => {
+            let reason = format!("backtest join failed: {error}");
+            return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
+        }
+    };
+    let has_signals = !result.virtual_buy.is_empty()
+        || !result.virtual_sell.is_empty()
+        || !result.boll_macd.is_empty();
+    if !has_signals {
+        log_dispatcher_attempt("R-12", false, 0, "no backtest signals in window");
+        return crate::review_batch::ReviewTaskOutcome::no_data("no backtest signals in window");
+    }
+    let text = stock_analysis::review::backtest::render_r12(&result);
+    let outcome = dispatch_registered_outcome!(
+        "R-12-backtest-review",
+        crate::notify::PushKind::ReviewBacktest,
+        "review_backtest_dispatcher",
+        "render_r12_backtest",
+        "",
+        None,
+        text
+    );
+    log_dispatcher_attempt("R-12", outcome.is_pushed(), 1, "");
+    crate::review_batch::ReviewTaskOutcome::from_push_outcome(outcome, 1)
+}
+
 /// BR-224: 候选/预测样本 5 日收益回填 (SignalTracker 闭环)。
 /// 对近 days 天的 pending prediction 用日线收盘价验证 (复用 backfill_predictions 逻辑)。
 async fn backfill_pending_predictions(days: i64) -> (usize, usize) {
@@ -8985,7 +9032,7 @@ pub async fn dispatch_post_session_review(
             == stock_analysis::risk::env_guard::TradingEnv::Test;
     let preflight = review_preflight(context, due, is_test);
     let phases = partition_review_tasks(&preflight.runnable);
-    let (r04, r07, r08, r09, r11, a10, a01) = tokio::join!(
+    let (r04, r07, r08, r09, r11, r12, a10, a01) = tokio::join!(
         async {
             if phases.source_only.contains(&ReviewTask::R04) {
                 Some((ReviewTask::R04, dispatch_r04_lhb_outcome(&date, now).await))
@@ -9034,6 +9081,16 @@ pub async fn dispatch_post_session_review(
             }
         },
         async {
+            if phases.source_only.contains(&ReviewTask::R12) {
+                Some((
+                    ReviewTask::R12,
+                    dispatch_r12_backtest_outcome(&date).await,
+                ))
+            } else {
+                None
+            }
+        },
+        async {
             if phases.source_only.contains(&ReviewTask::A10) {
                 Some((
                     ReviewTask::A10,
@@ -9054,7 +9111,7 @@ pub async fn dispatch_post_session_review(
             }
         },
     );
-    let source_only_outcomes = [r04, r07, r08, r09, r11, a10, a01]
+    let source_only_outcomes = [r04, r07, r08, r09, r11, r12, a10, a01]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();

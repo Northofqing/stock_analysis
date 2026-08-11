@@ -174,6 +174,7 @@ fn review_reason_category(task: ReviewTask, outcome: &ReviewTaskOutcome) -> Stri
                 ReviewTask::R08 => "event_calendar_review_failed",
                 ReviewTask::R09 => "provider_top_n_review_failed",
                 ReviewTask::R11 => "position_review_failed",
+                ReviewTask::R12 => "paper_backtest_failed",
                 ReviewTask::A10 => "catalyst_review_failed",
                 ReviewTask::A01 => "virtual_observation_review_failed",
             }
@@ -388,6 +389,7 @@ pub enum ReviewTask {
     R08,
     R09,
     R11,
+    R12,
     A10,
     A01,
 }
@@ -400,7 +402,7 @@ pub enum ReviewTaskDependency {
 }
 
 impl ReviewTask {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::R02,
         Self::R03,
         Self::R04,
@@ -410,6 +412,7 @@ impl ReviewTask {
         Self::R08,
         Self::R09,
         Self::R11,
+        Self::R12,
         Self::A10,
         Self::A01,
     ];
@@ -425,6 +428,7 @@ impl ReviewTask {
             Self::R08 => "R-08",
             Self::R09 => "R-09",
             Self::R11 => "R-11",
+            Self::R12 => "R-12",
             Self::A10 => "A-10",
             Self::A01 => "A-01",
         }
@@ -445,6 +449,7 @@ impl ReviewTask {
             Self::R08 => "event_calendar_public_component_batches",
             Self::R09 => "eastmoney_provider_top_n",
             Self::R11 => "user_confirmed_position_summary",
+            Self::R12 => "paper_trades_15min_backtest",
             Self::A10 => "chain_rotation_security_master",
             Self::A01 => "virtual_observation_kline",
         }
@@ -452,9 +457,14 @@ impl ReviewTask {
 
     pub fn dependency(self) -> ReviewTaskDependency {
         match self {
-            Self::R04 | Self::R07 | Self::R08 | Self::R09 | Self::R11 | Self::A10 | Self::A01 => {
-                ReviewTaskDependency::SourceOnly
-            }
+            Self::R04
+            | Self::R07
+            | Self::R08
+            | Self::R09
+            | Self::R11
+            | Self::R12
+            | Self::A10
+            | Self::A01 => ReviewTaskDependency::SourceOnly,
             // BR-194 §4.2: R-03 读的是 portfolio projection，不是 verified broker
             // batch + 同批 trade-sync watermark，因此必须留在账户依赖闸门内。
             Self::R03 => ReviewTaskDependency::LegacyAccountGate,
@@ -2639,6 +2649,7 @@ mod tests {
                 ReviewTask::R08,
                 ReviewTask::R09,
                 ReviewTask::R11,
+                ReviewTask::R12,
                 ReviewTask::A10,
                 ReviewTask::A01,
                 ReviewTask::R02,
@@ -2653,6 +2664,7 @@ mod tests {
             ReviewTask::R08,
             ReviewTask::R09,
             ReviewTask::R11,
+            ReviewTask::R12,
             ReviewTask::A10,
             ReviewTask::A01,
         ] {
@@ -2788,9 +2800,16 @@ mod tests {
     #[test]
     fn br192_r09_catalog_identity_and_audit_source_are_stable() {
         assert!(ReviewTask::ALL.contains(&ReviewTask::R09));
-        assert_eq!(ReviewTask::ALL.len(), 11);
+        assert_eq!(ReviewTask::ALL.len(), 12);
         assert!(ReviewTask::ALL.contains(&ReviewTask::R07));
         assert!(ReviewTask::ALL.contains(&ReviewTask::R11));
+        assert!(ReviewTask::ALL.contains(&ReviewTask::R12));
+        assert_eq!(ReviewTask::R12.label(), "R-12");
+        assert_eq!(ReviewTask::R12.source_label(), "paper_trades_15min_backtest");
+        assert_eq!(
+            ReviewTask::R12.dependency(),
+            ReviewTaskDependency::SourceOnly
+        );
         assert_eq!(ReviewTask::R09.label(), "R-09");
         assert_eq!(ReviewTask::R09.source_label(), "eastmoney_provider_top_n");
         assert_eq!(

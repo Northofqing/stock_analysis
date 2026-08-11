@@ -21,6 +21,8 @@ use magic_market_router::{
     AcceptancePolicy, AttemptStatus, BarsRouter, FailureKind, RouterError, SourceError, SourceFn,
 };
 use magic_sina_rs::{SinaClient, SinaError};
+use magic_tdx_rs::protocol::constants::{fq_type, KLINE_15MIN};
+use magic_tdx_rs::protocol::types::SecurityBar;
 use magic_tdx_rs::{TdxError, TdxSmartClient};
 use magic_tencent_rs::{TencentClient, TencentError};
 use std::sync::Arc;
@@ -168,6 +170,61 @@ impl AdmittedDailyBars {
 impl HistoricalBarsGateway {
     pub const fn new() -> Self {
         Self
+    }
+
+    /// 15 分钟 K线（升序，旧→新）。R-12 盘后回测取数，覆盖虚拟仓全部
+    /// 历史信号 (7/14 起, 800 根 ≈ 50 交易日)。走 magic-tdx 直连
+    /// (与 magic_tdx_t0 同构), 复用进程级 cached_tdx_hq_client 连接,
+    /// 不参与 daily-bars router (router 只承载日K语义)。
+    ///
+    /// 失败/空 batch 显式返回 GatewayError, 不静默填零。
+    pub fn fifteen_min_bars(
+        &self,
+        code: &str,
+        count: usize,
+    ) -> Result<Vec<SecurityBar>, GatewayError> {
+        if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
+            return Err(GatewayError::invalid_request(
+                CAPABILITY,
+                format!("fifteen_min_bars invalid code: {code}"),
+            ));
+        }
+        if count == 0 || count > 800 {
+            return Err(GatewayError::invalid_request(
+                CAPABILITY,
+                format!("fifteen_min_bars invalid count: {count} (1..=800)"),
+            ));
+        }
+        let market = if code.starts_with('6') { 1u8 } else { 0u8 };
+        let client = super::magic_tdx_t0::cached_tdx_hq_client().map_err(|error| {
+            GatewayError::unavailable(CAPABILITY, None, true, error.to_string())
+        })?;
+        let bars = client
+            .get_security_bars(
+                KLINE_15MIN,
+                market,
+                code,
+                0,
+                count as u16,
+                fq_type::NONE,
+            )
+            .map_err(|error| {
+                GatewayError::unavailable(
+                    CAPABILITY,
+                    None,
+                    true,
+                    format!("magic-tdx 15min bars failed for {code}: {error}"),
+                )
+            })?;
+        if bars.is_empty() {
+            return Err(GatewayError::unavailable(
+                CAPABILITY,
+                None,
+                false,
+                format!("magic-tdx 15min bars empty for {code}"),
+            ));
+        }
+        Ok(bars)
     }
 
     pub fn daily_bars(&self, code: &str, days: usize) -> Result<AdmittedDailyBars, GatewayError> {

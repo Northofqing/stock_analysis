@@ -1134,6 +1134,8 @@ fn map_push_kind(kind: PushKind) -> (SignalSource, &'static str, Severity) {
             "market_action_alert",
             Severity::High,
         ),
+        // R-12 盘后回测: 走 HoldingHealth 通配 (回测统计非交易建议)
+        PushKind::ReviewBacktest => (HoldingHealth, "review_backtest", Severity::Normal),
     }
 }
 

@@ -13,6 +13,8 @@ pub mod factor_report;
 pub mod journal;
 pub mod report;
 pub mod sop;
+// R-12 盘后回测 — 用 15 分钟 K线数据回测策略信号
+pub mod backtest;
 // v12 MVP-4 §7 + MVP-5 §8
 pub mod failure_attribution; // §8.4 R-06
 pub mod lhb_review; // §7.4 R-04
