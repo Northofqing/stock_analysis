@@ -12,8 +12,8 @@
 | 🎯 候选发现 | 涨停池、连板识别、新闻 → 产业链 → 候选，按 7 个上下文（Selection/Breakout/Signal 等）筛选 |
 | 💰 虚拟盘成交 | 候选经风险门（现金/仓位/账户模式）后模拟买入，写 `paper_trades` + 不可变 `order_audit` 审计链；卖出一侧按**四大铁律**（ATR 止损 / -8% 硬止损 / 三级止损 / 破位减仓）自动扫描，盘中 30s tick + 15:30 收盘各一次 |
 | 🏦 账户自估值 | 用户上传券商截图（快照）后，系统以快照为准；**不传则用持仓明细 × 实时行情自动估值**，每日收益 = 今日总资产 − 昨日（连续 5 个交易日无新快照才提醒上传） |
-| 📲 推送治理 | 17 类 PushKind 经预算/冷却/去重/审计四层治理投递飞书微信，投递账本不可变 |
-| 📋 盘后复盘 | 收盘/晚间复盘 + 交易复盘（R-07/R-11），按 `review_date` 取估值；持仓市值 Top-N 附 deep_analyzer 多角色 AI 研判（报告存 `reports/details/`，`REVIEW_AI_TOP_N` 可调） |
+| 📲 推送治理 | 18 类 PushKind 经预算/冷却/去重/审计四层治理投递飞书微信，投递账本不可变 |
+| 📋 盘后复盘 | 收盘/晚间复盘 + 交易复盘（R-07/R-11/R-12），按 `review_date` 取估值；R-12 用 **15 分钟 K线回测**虚拟仓买卖信号与 boll_macd 信号（T0 依赖实时五档盘口不可回测）；持仓市值 Top-N 附 deep_analyzer 多角色 AI 研判（报告存 `reports/details/`，`REVIEW_AI_TOP_N` 可调） |
 | 🛡️ 风险门 | 硬持仓/仓位/现金限制、账户模式（Frozen/ReduceOnly/Full）、数据模式（Unsafe 时行情依赖推送 fail-closed） |
 
 ## 项目结构
@@ -29,7 +29,7 @@ src/
 ├── pipeline/           # 信号链分析、持仓追踪（四大铁律卖出规则）
 ├── signal/             # 统一 Signal/SignalSet 结构
 ├── opportunity/        # 新闻 → 产业链 → 候选发现
-├── review/             # 盘后复盘与证伪
+├── review/             # 盘后复盘、证伪与 15min K线回测（backtest）
 ├── breakout/           # 量能突破分析
 ├── selection/          # 候选选择（v2 激活门控）
 ├── risk/               # 硬性仓位/现金/账户限制
@@ -80,7 +80,7 @@ Magic 数据源 ──> data_gateway（强类型批次+证据）──> 候选�
 
 ## 日志快速参考
 
-正常现象（无需处理）：`[paper_sell] … T+1锁仓无法卖出`（今日买入触发规则但锁仓）、`[paper_valuation] … 估值降级为日K最新收盘价`（单只实时行情超 5s 门）、`[BR-151] SnapshotPaper 使用用户确认持仓`、`[涨停板] N 行缺少主力净流`（能力未接入按设计排除）。
+正常现象（无需处理）：`[paper_sell] … T+1锁仓无法卖出`（今日买入触发规则但锁仓）、`[paper_valuation] … 估值降级为日K最新收盘价`（单只实时行情超 5s 门）、`[BR-151] SnapshotPaper 使用用户确认持仓`、`[magic-tdx-t0] … 价格不变放行`（TDX servertime 滞后窗口内价格未变 = 等价新鲜，BR-231）、`[涨停板] N 行缺少主力净流`（能力未接入按设计排除）。
 
 需要关注：`ERROR` 反复出现（数据源故障）、`[DataMode-hook] → Unsafe` 持续（行情能力未建立）。
 
