@@ -1,6 +1,6 @@
 # stock_analysis
 
-`stock_analysis` 是一个面向 A 股的研究、监控、纸面交易和盘后复盘系统。公共金融与新闻事实统一经过强类型 Gateway，账户事实走独立证据边界。
+`stock_analysis` 是一个面向 A 股的事件驱动实时监控系统：统一 Gateway 采集公共金融与新闻事实，按业务规则筛选候选，经风险门执行**虚拟盘纸面交易**（含卖出闭环与账户自动估值），并输出盘后复盘与审计。账户事实（用户确认快照）与公共数据（Magic Gateway）走独立证据边界。
 
 当前统一数据迁移仍处于 **Gate B / In Progress**。模块存在或能够编译不代表发布完成；在全量测试、合规、覆盖率和真实数据门禁通过前，不宣称 Gate D 就绪。
 
@@ -65,6 +65,39 @@ Magic TDX 是 A 股行情路由的第一个候选，不是每次请求都必然�
 - CFFEX、交易所或 Eastmoney 的真实网络门禁失败仍是 Gate D 阻塞项；代码不会把网络失败改写成空数据。
 - CFFEX 之外的期货交易所交割日没有在本项目中宣称覆盖。
 
+## 账户与虚拟盘（BR-151 / BR-234 / BR-234b）
+
+虚拟盘账户以**用户确认的真实账户快照**为证据，全部落 SQLite（append-only，不可更新或删除）：
+
+| 表 | 内容 |
+| --- | --- |
+| `user_account_summary` | 券商汇总：总资产 / 可用现金 / 证券市值 / 当日盈亏（东方财富截图逐字段导入） |
+| `user_position_snapshot` | 快照身份：effective_at / confirmed_at / 证据哈希 / 是否空仓确认 |
+| `user_position_snapshot_item` | 持仓明细：代码 / 名称 / 数量 / 成本价 |
+
+### 每日收益双口径（BR-234b）
+
+用户指令：「**我传了 就以我的为准 / 我不传 你自己计算出来**」。`refresh_account_ledger_from_snapshot` 每 30 秒 tick 分派：
+
+| 场景 | 口径 |
+| --- | --- |
+| 最新快照 effective_at 日期 == 当天 | 以快照 4 字段为准（真实账户证据） |
+| 快照过期（未上传） | 持仓明细 × 估值价自算：市值 = Σ(数量 × 价格)；总资产 = 市值 + 快照现金；当日盈亏 = 今日总资产 − 昨日 ledger |
+
+估值价优先级：`broker::quote_price` 实时价（5 秒门，BR-218）→ 日 K 最新收盘价（降级时 `[paper_valuation]` warn 出声）→ 两者都失败则整轮不更新（fail-closed，**成本价永不作估值价**）。虚拟盘成交的仓位占比统一读当日 ledger（自算口径），避免用过期的快照总资产算错占比。
+
+快照连续 **5 个交易日**未更新才推送提醒（`PushKind::SnapshotStale`）——收益已自动估算，仅真实持仓变动时才需要上传新截图。
+
+### 虚拟盘卖出闭环（BR-234）
+
+`paper_trades`（方向 buy/sell × 状态 SignalTriggered/Filled/NotFilled/Invalidated）的 buy Filled − sell Filled 聚合出虚拟持仓，每 30 秒 tick 与 **15:30 收盘后**各扫描一次（`trading::paper_sell`）：
+
+1. 按四大铁律评估（`position_tracker::evaluate_sell_rules`）：ATR 动态止损 / -8% 硬止损 / 三级止损 / 破位铁律 / 减仓铁律（K 线指标 MA5/20/60 + ATR14 + 布林 MACD，15 分钟缓存）
+2. 今日买入的持仓触发规则 → 仅 warn「T+1 锁仓，建议次日竞价挂单」
+3. 当日一票一卖幂等（`paper-sell-{code}-{date}` plan_id）
+4. 卖出走 `paper_trade::simulate(Direction::Sell, …)`：跌停/滑点评估 + 幂等 INSERT + `order_audit` 审计链
+5. 触发时推送 `[虚拟盘卖出]`（`PushKind::PaperSell`，票级冷却 300s）并写 `data/push_log/`
+
 ## 数据与资金安全
 
 这些约束来自 [AGENTS.md](AGENTS.md)，对开发、测试和发布都是阻塞门：
@@ -85,27 +118,12 @@ Magic TDX 是 A 股行情路由的第一个候选，不是每次请求都必然�
 
 | 路径 | 职责 |
 | --- | --- |
-| `data/stock_analysis.db` | 主业务库：行情缓存、研究结果、纸面交易、用户快照、复盘和采集审计 |
+| `data/stock_analysis.db` | 主业务库：行情缓存、研究结果、纸面交易（`paper_trades`/`ledger`/`order_audit`）、用户快照、复盘和采集审计 |
 | `data/push_analytics.db` | 推送分析库：L7 投递与治理统计。测试使用 `data/test/push_analytics.db` |
 | `data/durable_delivery.sqlite3` | BR-192 计数型投递账本：预算、冷却、去重、尝试、receipt、恢复和人工处置。路径固定在编译期仓库根，不能由 `DATABASE_PATH`、运行时 CWD 或环境覆盖 |
 
 JSONL 事件、投递、选择和复盘审计是独立文件边界，不属于上述 SQLite。测试使用独立的
 `data/test/TEST_CODE*/...` 数据库、日志和审计根；生产与测试必须物理隔离，回滚不得删除任何账户、持仓、订单或审计证据。
-
-## 虚拟盘账户口径与卖出闭环（BR-151 / BR-234 / BR-234b）
-
-虚拟盘账户以用户确认的真实账户快照为证据：`user_account_summary`（券商汇总：总资产/可用现金/证券市值/当日盈亏）+ `user_position_snapshot` + `user_position_snapshot_item`（持仓明细：代码/数量/成本价）。快照表 append-only，不可更新或删除。
-
-**每日收益双口径（BR-234b）**——用户指令：「我传了 就以我的为准 / 我不传 你自己计算出来」：
-
-| 场景 | 口径 |
-| --- | --- |
-| 最新快照 effective_at 日期 == 当天 | 以快照 4 字段为准（真实账户证据） |
-| 快照过期（未上传） | 持仓明细 × 估值价自算：市值 = Σ(数量 × 价格)；总资产 = 市值 + 快照现金；当日盈亏 = 今日总资产 − 昨日 ledger |
-
-估值价优先级：`broker::quote_price` 实时价（5 秒门）→ 日 K 最新收盘价（降级时 `[paper_valuation]` warn 出声）→ 两者都失败则整轮不更新（fail-closed，成本价永不作估值价）。快照连续 5 个交易日未更新才推送提醒（收益已自动估算，仅真实持仓变动需上传）。
-
-**虚拟盘卖出闭环（BR-234）**：`paper_trades` 的 buy Filled − sell Filled 聚合出虚拟持仓，每 30 秒 tick 与 15:30 收盘后各扫描一次，按四大铁律（ATR 动态止损 / -8% 硬止损 / 三级止损 / 破位铁律 / 减仓铁律，`position_tracker::evaluate_sell_rules`）评估。T+1 首日买入仅 warn 锁仓提示；当日一票一卖幂等；卖出走 `paper_trade::simulate(Direction::Sell, …)` 写 `paper_trades` + `order_audit`，触发时推送 `[虚拟盘卖出]`（PushKind::PaperSell）。
 
 ## 配置
 
@@ -145,7 +163,7 @@ cargo run --bin monitor -- --help
 常用入口：
 
 ```bash
-# 隔离 E2E：完整渲染 48 个 active monitor 模板，并向独立的非生产飞书
+# 隔离 E2E：完整渲染 active monitor 模板，并向独立的非生产飞书
 # 会话发送带 TEST_CODE 标签的验收批次；任一回执缺失即非零退出。
 # 运行前必须配置 BR196_FEISHU_TENANT_ID / BR196_FEISHU_APP_ID /
 # BR196_FEISHU_CONVERSATION_ID，将该目标的身份哈希登记到 release-pinned
@@ -200,7 +218,7 @@ authoritative sink 之前显式退出（exit 2），避免测试回执进入生�
 批次绕过该 dry-run 开关。普通生产飞书目标在 denylist 中，不能用于模板测试。
 每批均要求飞书 CLI 返回可验证的 `message_id` 与 `platform_msg_id`，且不会写入
 生产 counted-delivery 审计。没有独立测试目标时使用
-`--test --push-dry-run`，它仍会完整渲染并核对 48 个 active 模板，但不进行任何
+`--test --push-dry-run`，它仍会完整渲染并核对 active 模板，但不进行任何
 外部发送。`--test --review` 是严格复盘的测试隔离入口，不等价于完整模板检查。
 
 `monitor --test`、`monitor --review` 和常驻 monitor 的成功退出含义不同。严格复盘没有任何确认投递时可以按合同非零退出，不能把“无数据”改写成成功。
