@@ -6946,6 +6946,31 @@ async fn monitor_loop() {
                     Ok(_) => log::debug!("[v16.3] intraday_monitor tick: 0 候选"),
                     Err(e) => log::warn!("[v16.3] intraday_monitor tick 失败: {}", e),
                 }
+                // BR-234: 虚拟仓卖出闭环 — 四大铁律 30s tick 评估
+                // (paper_sell 内部含交易时段守卫/T+1 锁仓/当日一票一卖幂等)
+                match stock_analysis::trading::paper_sell::scan_and_sell(risk_context) {
+                    Ok(sold) if !sold.is_empty() => {
+                        for result in &sold {
+                            let text = format!(
+                                "[虚拟盘卖出] {}({}) 卖出{}股 @{:.2} | 收益率{:+.2}% | 原因:{}",
+                                result.name, result.code, result.quantity, result.price,
+                                result.return_rate_pct, result.reason
+                            );
+                            let outcome =
+                                push_governor_v3(&text, PushKind::PaperSell, Some(&result.code))
+                                    .await;
+                            if !outcome.is_pushed() {
+                                log::warn!(
+                                    "[paper_sell] {} 推送未投递: {:?}",
+                                    result.code,
+                                    outcome
+                                );
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => log::warn!("[paper_sell] 盘中扫描失败: {}", e),
+                }
             }
             // 15:30 整盘扫 (R5) — evening_review 内部有当日防重入 (review fix Issue #7)
             let now = chrono::Local::now();
@@ -6955,6 +6980,35 @@ async fn monitor_loop() {
                     Some(risk_context) => {
                         if let Err(e) = evening_review(today, risk_context) {
                             log::warn!("[evening_review] 失败: {}", e);
+                        }
+                        // BR-234: 收盘后卖出评估 — 无交易时段守卫，收盘 K 线完整评估
+                        match stock_analysis::trading::paper_sell::scan_and_sell_post_close(
+                            risk_context,
+                        ) {
+                            Ok(sold) if !sold.is_empty() => {
+                                for result in &sold {
+                                    let text = format!(
+                                        "[虚拟盘卖出] {}({}) 卖出{}股 @{:.2} | 收益率{:+.2}% | 原因:{}",
+                                        result.name, result.code, result.quantity, result.price,
+                                        result.return_rate_pct, result.reason
+                                    );
+                                    let outcome = push_governor_v3(
+                                        &text,
+                                        PushKind::PaperSell,
+                                        Some(&result.code),
+                                    )
+                                    .await;
+                                    if !outcome.is_pushed() {
+                                        log::warn!(
+                                            "[paper_sell] {} 推送未投递: {:?}",
+                                            result.code,
+                                            outcome
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => log::warn!("[paper_sell] 收盘后扫描失败: {}", e),
                         }
                     }
                     None => log::error!(

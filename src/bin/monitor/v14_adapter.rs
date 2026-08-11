@@ -1074,6 +1074,7 @@ fn map_push_kind(kind: PushKind) -> (SignalSource, &'static str, Severity) {
         PushKind::CandidateTriggered => (HoldingHealth, "candidate_triggered", Severity::Normal),
         PushKind::ForbiddenOps => (HoldingHealth, "forbidden_ops", Severity::Emergency),
         PushKind::PaperTrade => (HoldingHealth, "paper_trade", Severity::Normal),
+        PushKind::PaperSell => (HoldingHealth, "paper_sell", Severity::Normal),
         PushKind::CloseCall => (HoldingHealth, "close_call", Severity::High),
         PushKind::ReviewMarket => (HoldingHealth, "review_market", Severity::Normal),
         PushKind::ReviewLhb => (HoldingHealth, "review_lhb", Severity::Normal),

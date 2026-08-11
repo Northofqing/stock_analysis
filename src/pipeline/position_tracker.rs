@@ -25,7 +25,7 @@ use crate::data_provider::KlineData;
 use crate::database::DatabaseManager;
 use crate::monitor::risk::{MarketRegime, PositionSizer, StopLoss};
 use crate::risk::stop_loss::check_stops;
-use crate::strategy::BollMacdAction;
+use crate::strategy::{BollMacdAction, BollMacdSignal};
 use crate::trading::{
     ClosePositionCmd, OpenPositionCmd, SimulatedExecutionGateway, TradeExecutionGateway,
 };
@@ -167,6 +167,108 @@ fn query_chain_exposure(
     Ok((chain, exposure.held as usize, exposure.frozen as usize))
 }
 
+// ============================================================================
+// 卖出判定纯函数（BR-234 抽离，供模拟持仓 track_position 与虚拟盘
+// paper_trades 聚合持仓共用，避免两套卖出规则漂移）
+// ============================================================================
+
+/// 卖出评估输入（全部为内存值，不含 DB 访问）。
+pub struct SellEvaluation<'a> {
+    pub code: &'a str,
+    pub name: &'a str,
+    pub buy_price: f64,
+    pub buy_date: chrono::NaiveDate,
+    pub current_price: f64,
+    pub ma5: Option<f64>,
+    pub ma20: Option<f64>,
+    pub ma60: Option<f64>,
+    pub atr: Option<f64>,
+    pub boll_macd: Option<&'a BollMacdSignal>,
+    pub today: chrono::NaiveDate,
+}
+
+/// 四大铁律卖出判定（ATR 动态止损 / 三级止损 / 铁律2-5）。
+///
+/// - 返回 `None` = 继续持有；
+/// - 返回 `Some(reason)` = 触发卖出，reason 为决策依据文本。
+///
+/// T+1 锁仓（buy_date == today）不在此函数内判定，由调用方检查。
+pub fn evaluate_sell_rules(e: &SellEvaluation<'_>) -> Option<String> {
+    let gross_pct = (e.current_price / e.buy_price - 1.0) * 100.0;
+    let return_rate = net_return_rate(gross_pct);
+    let hold_days = (e.today - e.buy_date).num_days();
+
+    // P0-2: ATR 动态止损替代硬编码 8%
+    let stop_loss = if let Some(atr) = e.atr {
+        if atr > 0.0 {
+            let sl = StopLoss::new(e.buy_price, atr, e.ma20);
+            sl.triggered(e.current_price)
+        } else {
+            // ATR 异常 → 回退到固定 8%
+            warn!("[{}] ATR 异常({})，回退到固定 8% 止损", e.code, atr);
+            return_rate <= -8.0
+        }
+    } else {
+        // ATR 数据缺失 → 回退到固定 8%
+        return_rate <= -8.0
+    };
+
+    // P0-2: 三级止损补充检查
+    let tiered_stops = check_stops(
+        e.code,
+        e.name,
+        e.current_price,
+        e.buy_price,
+        Some(e.buy_price * 0.92), // strategy-derived hard stop
+        e.ma20,
+        e.ma60,
+    );
+
+    // 铁律2 盈利<20% 绝不主动止盈（不触发卖出）
+    // 铁律3 盈利 ≥ 20% 后，跌破 5 日均线
+    let profit_trend_exit = return_rate >= 20.0 && e.ma5.is_some_and(|ma5| e.current_price < ma5);
+    // 铁律4 持仓 >14 天仍亏损
+    let timeout_loss = hold_days > 14 && return_rate < 0.0;
+    // 铁律5 布林上轨减仓：触上轨 + MACD 顶背离/红柱缩短/死叉
+    let bm_top_sell = matches!(
+        e.boll_macd.map(|s| s.action),
+        Some(BollMacdAction::TopSell)
+    ) && return_rate >= 5.0
+        && hold_days >= 2;
+
+    let should_sell = stop_loss
+        || !tiered_stops.is_empty()
+        || profit_trend_exit
+        || timeout_loss
+        || bm_top_sell;
+
+    if !should_sell {
+        return None;
+    }
+
+    let reason = if stop_loss {
+        if e.atr.unwrap_or(0.0) > 0.0 {
+            let sl = StopLoss::new(e.buy_price, e.atr.unwrap_or(3.0), e.ma20);
+            format!("ATR动态止损(有效止损价 {:.2})", sl.effective())
+        } else {
+            "铁律1:止损(-8%)".to_string()
+        }
+    } else if !tiered_stops.is_empty() {
+        tiered_stops
+            .iter()
+            .map(|s| s.level.label().to_string())
+            .collect::<Vec<_>>()
+            .join("+")
+    } else if profit_trend_exit {
+        "铁律3:跌破5日线止盈".to_string()
+    } else if bm_top_sell {
+        "铁律5:布林上轨+MACD顶背离/红柱衰竭".to_string()
+    } else {
+        "铁律4:14天不涨换股".to_string()
+    };
+    Some(reason)
+}
+
 /// 对单只股票跟踪模拟持仓并在满足条件时开/平仓。
 #[cfg(test)]
 pub(super) fn track_position(
@@ -219,139 +321,80 @@ pub(super) fn track_position_with_assignment(
             result.position_quantity = Some(pos.quantity);
 
             // ====== 卖出判断: ATR 动态止损 + 三级止损 + 铁律2/3/4/5 ======
+            // 判定统一走 BR-234 抽离的 evaluate_sell_rules 纯函数。
 
-            // P0-2: ATR 动态止损替代硬编码 8%
-            let stop_loss = if let Some(atr) = risk_ctx.atr {
-                if atr > 0.0 {
-                    let sl = StopLoss::new(pos.buy_price, atr, result.ma20);
-                    sl.triggered(current_price)
-                } else {
-                    // ATR 异常 → 回退到固定 8%
-                    warn!("[{}] ATR 异常({})，回退到固定 8% 止损", code, atr);
-                    return_rate <= -8.0
-                }
-            } else {
-                // ATR 数据缺失 → 回退到固定 8%
-                return_rate <= -8.0
-            };
-
-            // P0-2: 三级止损补充检查
-            let tiered_stops = check_stops(
+            let eval = SellEvaluation {
                 code,
-                &result.name,
+                name: &result.name,
+                buy_price: pos.buy_price,
+                buy_date,
                 current_price,
-                pos.buy_price,
-                Some(pos.buy_price * 0.92), // strategy-derived hard stop
-                result.ma20,
-                result.ma60,
-            );
-
-            // 铁律2 盈利<20% 绝不主动止盈（不触发卖出）
-            // 铁律3 盈利 ≥ 20% 后，跌破 5 日均线
-            let profit_trend_exit =
-                return_rate >= 20.0 && result.ma5.is_some_and(|ma5| current_price < ma5);
-            // 铁律4 持仓 >14 天仍亏损
-            let hold_days = (today - buy_date).num_days();
-            let timeout_loss = hold_days > 14 && return_rate < 0.0;
-            // 铁律5 布林上轨减仓：触上轨 + MACD 顶背离/红柱缩短/死叉
-            let bm_top_sell = matches!(
-                result.boll_macd.as_ref().map(|s| s.action),
-                Some(BollMacdAction::TopSell)
-            ) && return_rate >= 5.0
-                && hold_days >= 2;
-
+                ma5: result.ma5,
+                ma20: result.ma20,
+                ma60: result.ma60,
+                atr: risk_ctx.atr,
+                boll_macd: result.boll_macd.as_ref(),
+                today,
+            };
             // P0-2: T+1 锁仓检查
             let t1_locked = buy_date == today;
 
-            let should_sell = stop_loss
-                || !tiered_stops.is_empty()
-                || profit_trend_exit
-                || timeout_loss
-                || bm_top_sell;
-
-            if should_sell {
-                // T+1 锁仓: A股当日买入不可卖出, 阻止所有平仓操作
-                if t1_locked {
-                    let reason_str = if stop_loss || !tiered_stops.is_empty() {
-                        "止损信号"
-                    } else if profit_trend_exit {
-                        "铁律3:跌破5日线止盈"
-                    } else if bm_top_sell {
-                        "铁律5:布林上轨减仓"
-                    } else {
-                        "铁律4:14天换股"
-                    };
-                    warn!(
-                        "[{}] T+1锁仓无法卖出(原因: {}) — 建议次日竞价挂单",
-                        code, reason_str
-                    );
-                    result.position_status = Some("open".to_string());
-                    return Ok(());
-                }
-
-                let reason = if stop_loss {
-                    if risk_ctx.atr.unwrap_or(0.0) > 0.0 {
-                        let sl =
-                            StopLoss::new(pos.buy_price, risk_ctx.atr.unwrap_or(3.0), result.ma20);
-                        format!("ATR动态止损(有效止损价 {:.2})", sl.effective())
-                    } else {
-                        "铁律1:止损(-8%)".to_string()
-                    }
-                } else if !tiered_stops.is_empty() {
-                    tiered_stops
-                        .iter()
-                        .map(|s| s.level.label().to_string())
-                        .collect::<Vec<_>>()
-                        .join("+")
-                } else if profit_trend_exit {
-                    "铁律3:跌破5日线止盈".to_string()
-                } else if bm_top_sell {
-                    "铁律5:布林上轨+MACD顶背离/红柱衰竭".to_string()
-                } else {
-                    "铁律4:14天不涨换股".to_string()
-                };
-                let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-                let close_cmd = ClosePositionCmd {
-                    business_order_id: format!(
-                        "SIM-SELL-{}-{}-{}",
-                        code,
-                        pos.id,
-                        chrono::Utc::now().timestamp()
-                    ),
-                    position_id: pos.id,
-                    code: code.to_string(),
-                    trade_date: today.clone(),
-                    price: current_price,
-                    quantity: pos.quantity,
-                    secondary_confirmed: false,
-                    decision_basis: reason.clone(),
-                };
-                match gateway.close_position(&close_cmd) {
-                    Ok(receipt) => {
-                        info!(
-                            "[{}] 触发平仓 [{}]，@ {:.2}，收益率: {:+.2}%",
-                            code, reason, receipt.price, return_rate
+            match evaluate_sell_rules(&eval) {
+                Some(reason) => {
+                    // T+1 锁仓: A股当日买入不可卖出, 阻止所有平仓操作
+                    if t1_locked {
+                        warn!(
+                            "[{}] T+1锁仓无法卖出(原因: {}) — 建议次日竞价挂单",
+                            code, reason
                         );
-                        result.position_status = Some("closed".to_string());
-                        result.position_sell_price = Some(receipt.price);
-                        result.position_sell_date = Some(today);
-                    }
-                    Err(e) => {
                         result.position_status = Some("open".to_string());
-                        return Err(format!("BR-124 {code} close position failed: {e}"));
+                        return Ok(());
+                    }
+
+                    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                    let close_cmd = ClosePositionCmd {
+                        business_order_id: format!(
+                            "SIM-SELL-{}-{}-{}",
+                            code,
+                            pos.id,
+                            chrono::Utc::now().timestamp()
+                        ),
+                        position_id: pos.id,
+                        code: code.to_string(),
+                        trade_date: today.clone(),
+                        price: current_price,
+                        quantity: pos.quantity,
+                        secondary_confirmed: false,
+                        decision_basis: reason.clone(),
+                    };
+                    match gateway.close_position(&close_cmd) {
+                        Ok(receipt) => {
+                            info!(
+                                "[{}] 触发平仓 [{}]，@ {:.2}，收益率: {:+.2}%",
+                                code, reason, receipt.price, return_rate
+                            );
+                            result.position_status = Some("closed".to_string());
+                            result.position_sell_price = Some(receipt.price);
+                            result.position_sell_date = Some(today);
+                        }
+                        Err(e) => {
+                            result.position_status = Some("open".to_string());
+                            return Err(format!("BR-124 {code} close position failed: {e}"));
+                        }
                     }
                 }
-            } else {
-                result.position_status = Some("open".to_string());
-                info!(
-                    "[{}] 持仓中，收益率: {:+.2}%（买入价 {:.2} → 现价 {:.2}）",
-                    code, return_rate, pos.buy_price, current_price
-                );
-                gateway
-                    .update_position_return(pos.id, current_price, return_rate)
-                    .map_err(|error| {
-                        format!("BR-124 {code} update position return failed: {error}")
-                    })?;
+                None => {
+                    result.position_status = Some("open".to_string());
+                    info!(
+                        "[{}] 持仓中，收益率: {:+.2}%（买入价 {:.2} → 现价 {:.2}）",
+                        code, return_rate, pos.buy_price, current_price
+                    );
+                    gateway
+                        .update_position_return(pos.id, current_price, return_rate)
+                        .map_err(|error| {
+                            format!("BR-124 {code} update position return failed: {error}")
+                        })?;
+                }
             }
         }
         Ok(None) => {

@@ -104,6 +104,8 @@ pub enum PushKind {
     ForbiddenOps,
     /// 虚拟盘成交回报 (T-10, ℹ️ 5min批, 默认降级) [MVP-1]
     PaperTrade,
+    /// 虚拟盘卖出 (BR-234, ℹ️ 5min批, 默认降级) [MVP-1]
+    PaperSell,
     /// 尾盘决策 (T-12, ⚡ 1次/日) [MVP-4]
     CloseCall,
     // ============= v12 §14.2 盘后 PushKind =============
@@ -341,6 +343,7 @@ impl PushKind {
                 | PushKind::CandidateTriggered
                 | PushKind::ForbiddenOps
                 | PushKind::PaperTrade
+                | PushKind::PaperSell
                 | PushKind::CloseCall
                 | PushKind::ReviewMarket
                 | PushKind::ReviewLhb
@@ -376,6 +379,8 @@ impl PushKind {
             PushKind::ForbiddenOps => Some(3600),
             // 5 min / 票 (批推)
             PushKind::PaperTrade => Some(300),
+            // 5 min / 票 (BR-234 虚拟盘卖出)
+            PushKind::PaperSell => Some(300),
             // 1次/日
             PushKind::CloseCall => Some(86_400),
             // 盘后系列 1次/日 (推送时机控制而非冷却)
@@ -441,6 +446,7 @@ impl PushKind {
             | CandidateTriggered
             | ForbiddenOps
             | PaperTrade
+            | PaperSell
             | NewsToIdea
             | PostFixedPriceOrder
             | PostFixedPriceFill
@@ -481,6 +487,7 @@ impl PushKind {
             PushKind::CandidateTriggered => "候选触发",
             PushKind::ForbiddenOps => "禁止操作",
             PushKind::PaperTrade => "虚拟盘",
+            PushKind::PaperSell => "虚拟盘卖出",
             PushKind::CloseCall => "尾盘决策",
             PushKind::ReviewMarket => "盘面走向",
             PushKind::ReviewLhb => "龙虎榜",
@@ -799,6 +806,17 @@ pub const DISPATCH_TABLE: &[(PushKind, DispatchRow)] = &[
             cooldown_scope: CooldownScope::PerTicket,
             label: "北交所大宗价格区间",
             stable_template_id: "blocktradepricerange_v1",
+        },
+    ),
+    // ============== BR-234: 虚拟盘卖出 ==============
+    (
+        PushKind::PaperSell,
+        DispatchRow {
+            level: PushLevel::Info,
+            cooldown_secs: Some(300),
+            cooldown_scope: CooldownScope::PerTicket,
+            label: "虚拟盘卖出",
+            stable_template_id: "papersell_v1",
         },
     ),
 ];
@@ -2568,6 +2586,7 @@ fn requires_ticket_code(kind: PushKind) -> bool {
             | CandidateTriggered
             | ForbiddenOps
             | PaperTrade
+            | PaperSell
             | NewsToIdea
             | PostFixedPriceOrder
             | PostFixedPriceFill
@@ -5999,14 +6018,14 @@ mod tests {
         }
     }
 
-    // ============== v17.x: DISPATCH_TABLE 15 rows 完整性 ==============
+    // ============== v17.x: DISPATCH_TABLE 16 rows 完整性 (BR-234 +1) ==============
 
     #[test]
-    fn dispatch_table_size_is_fifteen() {
+    fn dispatch_table_size_is_sixteen() {
         assert_eq!(
             DISPATCH_TABLE.len(),
-            15,
-            "v17.x DISPATCH_TABLE 应 15 rows (3 v17.6 + 6 v17.7 + 6 v17.8)"
+            16,
+            "v17.x DISPATCH_TABLE 应 16 rows (3 v17.6 + 6 v17.7 + 6 v17.8 + 1 BR-234)"
         );
     }
 
@@ -6021,7 +6040,7 @@ mod tests {
 
     #[test]
     fn dispatch_table_covers_all_audit_marked() {
-        // v17.6 low-priority 3 + v17.7 6 + v17.8 6 = 15
+        // v17.6 low-priority 3 + v17.7 6 + v17.8 6 + BR-234 1 = 16
         let expected: Vec<PushKind> = vec![
             PushKind::FactorIC,
             PushKind::SectorTier,
@@ -6038,8 +6057,9 @@ mod tests {
             PushKind::EtfClosingCallAuction,
             PushKind::BlockTradeIntradayConfirm,
             PushKind::BlockTradePriceRange,
+            PushKind::PaperSell,
         ];
-        assert_eq!(expected.len(), 15);
+        assert_eq!(expected.len(), 16);
         for k in expected {
             assert!(k.dispatch_row().is_some(), "{:?} 应在 DISPATCH_TABLE 内", k);
         }
