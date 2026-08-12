@@ -809,6 +809,42 @@ pub async fn push_normalized_events(events: Vec<NormalizedSourceEvent>) -> Sourc
 }
 
 /// Build a NormalizedSourceEvent for an earnings classification.
+/// EarningsBeat/Miss 生产 gate (v19 review 2026-08-12, report_period_unbound):
+/// classify_earnings 只按年份匹配实际 EPS 与一致预期 (classifier.rs:143), 6 月末
+/// 累计 EPS 会对全年预期相除; 模块测试 592-624 明确允许该组合; 08-12 生产推送
+/// 用过 06-18 的旧预期证据。暂停分类直到报告期/预测年度/口径合同完成。
+/// 默认禁用, 仅 `EARNINGS_BEAT_ENABLED=1` 显式启用 (v15.x 静默路径可见: 启动
+/// banner 一次 + 跳过 warn 节流 30 分钟)。
+fn earnings_classification_gate() -> bool {
+    if std::env::var("EARNINGS_BEAT_ENABLED")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    static BANNER: std::sync::Once = std::sync::Once::new();
+    BANNER.call_once(|| {
+        log::warn!(
+            "[v17_sources] earnings_classification disabled=report_period_unbound; \
+             EarningsBeat/Miss 分类暂停 (口径合同待绑定; EARNINGS_BEAT_ENABLED=1 显式启用)"
+        );
+    });
+    static LAST_WARN_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let last = LAST_WARN_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    if now_secs.saturating_sub(last) >= 1800 {
+        LAST_WARN_SECS.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+        log::warn!(
+            "[v17_sources] earnings_classification disabled=report_period_unbound; \
+             跳过盈亏分类扫描"
+        );
+    }
+    false
+}
+
 fn earnings_classification_to_event(
     code: &str,
     classification: &EarningsClassification,
@@ -1018,9 +1054,16 @@ pub async fn poll_earnings_and_analyst(
                             });
                         match (financials.history.first(), source_evidence) {
                             (Some(latest_period), Ok((source_batches, published_on))) => {
-                                if let Some(classification) =
-                                    classify_earnings(latest_period, &consensus.data, earnings_cfg)
-                                {
+                                // v19 review (2026-08-12): EarningsBeat/Miss 比较口径未绑定
+                                // 报告期 — 6 月末累计 EPS 直接对全年一致预期相除
+                                // (classifier.rs:143 只查年份相同), 模块测试 592-624 明确
+                                // 允许该组合; 且 08-12 生产推送用过 06-18 的旧预期证据。
+                                // 暂停分类直到报告期/预测年度/口径合同完成。
+                                // (gate 关闭时跳过分类, events 保持为空, 收尾照常)
+                                if earnings_classification_gate() {
+                                    if let Some(classification) =
+                                        classify_earnings(latest_period, &consensus.data, earnings_cfg)
+                                    {
                                     match earnings_classification_to_event(
                                         code_str,
                                         &classification,
@@ -1034,6 +1077,7 @@ pub async fn poll_earnings_and_analyst(
                                                 "[v17_sources][BR-137] earnings source fact rejected: {error}"
                                             );
                                         }
+                                    }
                                     }
                                 }
                             }
@@ -1874,6 +1918,24 @@ mod tests {
 
         let error = project_consensus_batch(batch).expect_err("cardinality must fail closed");
         assert!(error.to_string().contains("expected=1 actual=2"));
+    }
+
+    #[test]
+    fn earnings_classification_gate_defaults_to_disabled_and_env_opt_in() {
+        // v15.x 默认值出声规则: 默认禁用, 仅 EARNINGS_BEAT_ENABLED=1 显式启用
+        std::env::remove_var("EARNINGS_BEAT_ENABLED");
+        assert!(
+            !earnings_classification_gate(),
+            "default must be disabled until 口径合同 bound"
+        );
+        std::env::set_var("EARNINGS_BEAT_ENABLED", "1");
+        assert!(earnings_classification_gate(), "explicit opt-in must enable");
+        std::env::set_var("EARNINGS_BEAT_ENABLED", "0");
+        assert!(
+            !earnings_classification_gate(),
+            "non-1 value must stay disabled"
+        );
+        std::env::remove_var("EARNINGS_BEAT_ENABLED");
     }
 
     #[tokio::test]

@@ -6853,6 +6853,39 @@ struct PreparedT0Advice {
     binding: durable_delivery_runtime::CountedDeliveryBinding,
 }
 
+/// PaperSell 生产 gate (v19 review 2026-08-12, invalid_position_ledger):
+/// 成本为全部历史买入混合摊薄 (Σamt/Σqty), T+1 用 MIN(ts) 最早买入日, 无批次
+/// 账本 → 生产 100 笔虚拟卖出含 3 笔收益率 >100% (最高 +22751% 为买价记录错误)、
+/// 11 笔当日买入即卖、7 笔买入后 60s 内卖出 (最短 5s)。暂停投递直到批次账本重建。
+/// 默认禁用, 仅 `PAPER_SELL_ENABLED=1` 显式启用 (v15.x 静默路径可见: 启动 banner
+/// 一次 + 跳过 warn 节流 30 分钟)。
+fn paper_sell_paused(phase: &str) -> bool {
+    if std::env::var("PAPER_SELL_ENABLED")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    static BANNER: std::sync::Once = std::sync::Once::new();
+    BANNER.call_once(|| {
+        log::warn!(
+            "[paper_sell] disabled=invalid_position_ledger; 虚拟盘卖出投递暂停 \
+             (成本摊薄/T+1 账本错误待批次账本重建; PAPER_SELL_ENABLED=1 显式启用)"
+        );
+    });
+    static LAST_WARN_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let last = LAST_WARN_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    if now_secs.saturating_sub(last) >= 1800 {
+        LAST_WARN_SECS.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+        log::warn!("[paper_sell] {phase} disabled=invalid_position_ledger; 跳过虚拟盘卖出扫描");
+    }
+    true
+}
+
 async fn prepare_magic_tdx_t0_messages() -> Result<Vec<PreparedT0Advice>, String> {
     use stock_analysis::data_gateway::MagicTdxGateway;
     use stock_analysis::decision::t0_advisor::{
@@ -7364,28 +7397,37 @@ async fn monitor_loop() {
                 }
                 // BR-234: 虚拟仓卖出闭环 — 四大铁律 30s tick 评估
                 // (paper_sell 内部含交易时段守卫/T+1 锁仓/当日一票一卖幂等)
-                match stock_analysis::trading::paper_sell::scan_and_sell(risk_context) {
-                    Ok(sold) if !sold.is_empty() => {
-                        for result in &sold {
-                            let text = format!(
-                                "[虚拟盘卖出] {}({}) 卖出{}股 @{:.2} | 收益率{:+.2}% | 原因:{}",
-                                result.name, result.code, result.quantity, result.price,
-                                result.return_rate_pct, result.reason
-                            );
-                            let outcome =
-                                push_governor_v3(&text, PushKind::PaperSell, Some(&result.code))
-                                    .await;
-                            if !outcome.is_pushed() {
-                                log::warn!(
-                                    "[paper_sell] {} 推送未投递: {:?}",
-                                    result.code,
-                                    outcome
+                // v19 review (2026-08-12): 账本实质错误 — 成本为全部历史买入混合摊薄
+                // (Σamt/Σqty), T+1 用 MIN(ts) 最早买入日, 无批次账本; 生产 100 笔虚拟
+                // 卖出含 3 笔收益率 >100% (最高 +22751% 为买价记录错误), 11 笔当日
+                // 买入即卖, 7 笔买入后 60s 内卖出。暂停投递直到批次账本重建。
+                if !paper_sell_paused("盘中") {
+                    match stock_analysis::trading::paper_sell::scan_and_sell(risk_context) {
+                        Ok(sold) if !sold.is_empty() => {
+                            for result in &sold {
+                                let text = format!(
+                                    "[虚拟盘卖出] {}({}) 卖出{}股 @{:.2} | 收益率{:+.2}% | 原因:{}",
+                                    result.name, result.code, result.quantity, result.price,
+                                    result.return_rate_pct, result.reason
                                 );
+                                let outcome = push_governor_v3(
+                                    &text,
+                                    PushKind::PaperSell,
+                                    Some(&result.code),
+                                )
+                                .await;
+                                if !outcome.is_pushed() {
+                                    log::warn!(
+                                        "[paper_sell] {} 推送未投递: {:?}",
+                                        result.code,
+                                        outcome
+                                    );
+                                }
                             }
                         }
+                        Ok(_) => {}
+                        Err(e) => log::warn!("[paper_sell] 盘中扫描失败: {}", e),
                     }
-                    Ok(_) => {}
-                    Err(e) => log::warn!("[paper_sell] 盘中扫描失败: {}", e),
                 }
             }
             // 任务#3: 每日 15:10 快照过期检查（收盘后用户应上传当日快照）
@@ -7402,6 +7444,8 @@ async fn monitor_loop() {
                             log::warn!("[evening_review] 失败: {}", e);
                         }
                         // BR-234: 收盘后卖出评估 — 无交易时段守卫，收盘 K 线完整评估
+                        // (v19 review 同盘中: invalid_position_ledger 暂停, 见 paper_sell_paused)
+                        if !paper_sell_paused("盘后") {
                         match stock_analysis::trading::paper_sell::scan_and_sell_post_close(
                             risk_context,
                         ) {
@@ -7429,6 +7473,7 @@ async fn monitor_loop() {
                             }
                             Ok(_) => {}
                             Err(e) => log::warn!("[paper_sell] 收盘后扫描失败: {}", e),
+                        }
                         }
                     }
                     None => log::error!(
