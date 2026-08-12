@@ -1065,6 +1065,7 @@ pub mod closing_valuation;
 pub mod position_shares;
 pub mod selection;
 pub mod selection_v2;
+pub mod catalyst_watchlist;
 pub(crate) mod selection_v2_generation_journal;
 pub mod selection_v2_read_model;
 pub mod selection_v2_repository;
@@ -1515,6 +1516,7 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         user_position_snapshot::create_schema(conn).map_err(std::io::Error::other)?;
         user_account_summary::create_schema(conn).map_err(std::io::Error::other)?;
         closing_valuation::create_schema(conn).map_err(std::io::Error::other)?;
+        catalyst_watchlist::create_schema(conn).map_err(std::io::Error::other)?;
         selection::create_schema(conn).map_err(std::io::Error::other)?;
         chain_intelligence::create_schema(conn).map_err(std::io::Error::other)?;
         // 创建 stock_daily 表

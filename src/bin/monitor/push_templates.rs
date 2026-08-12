@@ -6064,161 +6064,14 @@ pub async fn dispatch_auction_volume_daily(hhmm: &str, banner: &BannerCtx) -> bo
     result
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct CatalystReviewSnapshot {
-    pub date: String,
-    pub source_batch_id: String,
-    pub source_content_hash: String,
-    pub source_observed_at: Option<chrono::DateTime<chrono::FixedOffset>>,
-    pub theme: String,
-    pub score: Option<f32>,
-    pub persistent: PersistentLevel,
-    pub member_count: usize,
-    pub continuous_count: usize,
-    pub leading_members: Vec<String>,
-    pub other_members: Vec<String>,
-    pub watch_point: Option<String>,
-}
-
-fn parse_a10_source_observed_at(
-    value: &str,
-) -> Result<chrono::DateTime<chrono::FixedOffset>, String> {
-    if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(value) {
-        return Ok(timestamp);
-    }
-    let utc = if let Some(milliseconds) = value.strip_prefix("unix-ms:") {
-        let milliseconds = milliseconds
-            .parse::<i64>()
-            .map_err(|_| format!("A-10 source observed_at is invalid: {value:?}"))?;
-        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(milliseconds)
-    } else if let Some((seconds, nanos)) = value.split_once('.') {
-        if seconds.is_empty()
-            || nanos.is_empty()
-            || nanos.len() > 9
-            || !nanos.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            return Err(format!("A-10 source observed_at is invalid: {value:?}"));
-        }
-        let seconds = seconds
-            .parse::<i64>()
-            .map_err(|_| format!("A-10 source observed_at is invalid: {value:?}"))?;
-        let padded_nanos = format!("{nanos:0<9}")
-            .parse::<u32>()
-            .map_err(|_| format!("A-10 source observed_at is invalid: {value:?}"))?;
-        chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, padded_nanos)
-    } else {
-        let raw = value
-            .parse::<i64>()
-            .map_err(|_| format!("A-10 source observed_at is invalid: {value:?}"))?;
-        if raw.unsigned_abs() >= 100_000_000_000_000_000 {
-            let seconds = raw.div_euclid(1_000_000_000);
-            let nanos = u32::try_from(raw.rem_euclid(1_000_000_000))
-                .map_err(|_| format!("A-10 source observed_at is invalid: {value:?}"))?;
-            chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, nanos)
-        } else if raw.unsigned_abs() >= 100_000_000_000 {
-            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(raw)
-        } else {
-            chrono::DateTime::<chrono::Utc>::from_timestamp(raw, 0)
-        }
-    }
-    .ok_or_else(|| format!("A-10 source observed_at is out of range: {value:?}"))?;
-    Ok(utc.fixed_offset())
-}
-
-fn catalyst_review_from_chain_batch(
-    batch: &stock_analysis::database::chain_intelligence::VisibleChainBatch,
-) -> Result<CatalystReviewSnapshot, String> {
-    let Some(top) = batch.chains.first() else {
-        return Ok(CatalystReviewSnapshot {
-            date: batch.trading_date.format("%Y-%m-%d").to_string(),
-            ..CatalystReviewSnapshot::default()
-        });
-    };
-    if top.board_name.trim().is_empty() {
-        return Err("A-10 visible chain has an empty source-backed board name".to_string());
-    }
-    if top.members.len() < 3 || top.upper_limit_count != top.members.len() as i32 {
-        return Err(format!(
-            "A-10 visible chain {} violates member-count contract",
-            top.chain_id
-        ));
-    }
-    let names = top
-        .members
-        .iter()
-        .map(|member| member.security_name.trim())
-        .map(|name| {
-            (!name.is_empty())
-                .then(|| name.to_string())
-                .ok_or_else(|| "A-10 visible chain contains an empty security name".to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let continuous_count = usize::try_from(top.continuous_count).map_err(|_| {
-        format!(
-            "A-10 visible chain {} has negative continuous count",
-            top.chain_id
-        )
-    })?;
-    if continuous_count > names.len() {
-        return Err(format!(
-            "A-10 visible chain {} has continuous count above member count",
-            top.chain_id
-        ));
-    }
-    let persistent = if continuous_count >= 3 {
-        PersistentLevel::High
-    } else if continuous_count >= 1 {
-        PersistentLevel::Med
-    } else {
-        PersistentLevel::Low
-    };
-    let source_observed_at = batch
-        .inputs
-        .iter()
-        .map(|input| parse_a10_source_observed_at(&input.observed_at))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .max()
-        .ok_or_else(|| "A-10 visible chain batch has no input observation time".to_string())?;
-    Ok(CatalystReviewSnapshot {
-        date: batch.trading_date.format("%Y-%m-%d").to_string(),
-        source_batch_id: batch.batch_id.clone(),
-        source_content_hash: batch.content_hash.clone(),
-        source_observed_at: Some(source_observed_at),
-        theme: top.board_name.clone(),
-        score: None,
-        persistent,
-        member_count: names.len(),
-        continuous_count,
-        leading_members: names.iter().take(3).cloned().collect(),
-        other_members: names.iter().skip(3).take(3).cloned().collect(),
-        // The admitted chain batch has no independent next-day volume/trend
-        // evidence. Keep the field absent instead of fabricating advice from
-        // the board name.
-        watch_point: None,
-    })
-}
-
-/// BR-160: A-10 only consumes the exact visible batch published by the
-/// unified Gateway. Stale `chain_daily`, local rotation caches, and direct
-/// name lookups are not fallback sources.
-pub async fn load_catalyst_review_snapshot_real(
-    date: &str,
-) -> Result<CatalystReviewSnapshot, String> {
-    let review_date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-        .map_err(|error| format!("A-10 非法复盘日期 {date}: {error}"))?;
-    let batch = stock_analysis::data_gateway::ChainIntelligenceGateway::new()
-        .build_for_date(review_date)
-        .await
-        .map_err(|error| error.to_string())?;
-    if batch.trading_date != review_date {
-        return Err(format!(
-            "A-10 visible batch as_of={} differs from requested {}",
-            batch.trading_date, review_date
-        ));
-    }
-    catalyst_review_from_chain_batch(&batch)
-}
+// A-10 名单快照装载已迁至 lib (src/review/catalyst_review.rs) — backfill 工具与
+// 生产 dispatcher 共用同一条 Gateway 装载路径。re-export 保持本文件全部现有
+// 引用 (load_catalyst_review_snapshot_real:12933, PersistentLevel:12976/14328
+// 等) 与 main.rs `pt::PersistentLevel` 不变。
+pub use stock_analysis::review::catalyst_review::{
+    catalyst_review_from_chain_batch, load_catalyst_review_snapshot_real,
+    CatalystReviewSnapshot, PersistentLevel,
+};
 
 // ============================================================================
 // B-005-C (2026-07-09): 盘后批量 dispatcher (R-02..R-08 + TomorrowWatch)
@@ -9002,6 +8855,96 @@ async fn backfill_pending_predictions(days: i64) -> (usize, usize) {
     (total, hit_count)
 }
 
+/// R-13: T+1 关注票核对 — 读昨日 A-10 名单快照, 核对今日行情, 推送回填。
+/// 无名单 → no_data (出声不推, 非缺陷); 单只取数失败在模块内 warn 跳过;
+/// 全部跳过 → failed (可重试, 盘后数据就绪后重跑)。推送成功后核对结果落库。
+async fn dispatch_r13_watchlist_tracking_outcome(
+    date: &str,
+) -> crate::review_batch::ReviewTaskOutcome {
+    let today = match chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+        Ok(date) => date,
+        Err(error) => {
+            let reason = format!("invalid review date {date}: {error}");
+            log_dispatcher_attempt("R-13", false, 0, &reason);
+            return crate::review_batch::ReviewTaskOutcome::failed(false, reason);
+        }
+    };
+    let snapshot =
+        match stock_analysis::database::catalyst_watchlist::latest_watchlist_before(today) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                log_dispatcher_attempt("R-13", false, 0, "no watchlist snapshot before date");
+                return crate::review_batch::ReviewTaskOutcome::no_data(format!(
+                    "T+1 no watchlist snapshot before {date}"
+                ));
+            }
+            Err(error) => {
+                log_dispatcher_attempt("R-13", false, 0, &error);
+                return crate::review_batch::ReviewTaskOutcome::failed(true, error);
+            }
+        };
+    // clone: 核对在 spawn_blocking 中持有快照, 渲染还需用原快照 (日期/名单)
+    let snapshot_for_check = snapshot.clone();
+    let (outcomes, skipped) = match tokio::task::spawn_blocking(move || {
+        stock_analysis::review::watchlist_tracking::check_watchlist_today(
+            &snapshot_for_check,
+            today,
+        )
+    })
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(reason)) => {
+            log_dispatcher_attempt("R-13", false, 0, &reason);
+            return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
+        }
+        Err(error) => {
+            let reason = format!("R-13 check join failed: {error}");
+            return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
+        }
+    };
+    let text = stock_analysis::review::watchlist_tracking::render_watchlist_tracking(
+        &snapshot,
+        &outcomes,
+    );
+    let result = dispatch_registered_outcome!(
+        "T1-watch-tracking",
+        crate::notify::PushKind::WatchlistTracking,
+        "watchlist_tracking_dispatcher",
+        "render_watchlist_tracking",
+        "",
+        None,
+        text
+    );
+    log_dispatcher_attempt("R-13", result.is_pushed(), outcomes.len(), "");
+    if result.is_pushed() && !skipped.is_empty() {
+        log::warn!(
+            "[R-13] skipped {} entries (data unavailable): {}",
+            skipped.len(),
+            skipped.join(",")
+        );
+    }
+    let outcome = crate::review_batch::ReviewTaskOutcome::from_push_outcome(
+        result,
+        outcomes.len(),
+    );
+    if matches!(
+        outcome,
+        crate::review_batch::ReviewTaskOutcome::Delivered { .. }
+    ) {
+        // 核对结果落盘 (UNIQUE 幂等), 失败仅 warn 不改变已推送状态。
+        match stock_analysis::database::catalyst_watchlist::save_outcomes(&outcomes) {
+            Ok(receipt) => log::info!(
+                "[R-13][T+1] outcomes saved inserted={} skipped={}",
+                receipt.inserted,
+                receipt.skipped
+            ),
+            Err(error) => log::warn!("[R-13][T+1] outcomes save failed: {error}"),
+        }
+    }
+    outcome
+}
+
 pub async fn dispatch_post_session_review(
     context: crate::review_batch::ReviewRunContext,
     due: &std::collections::BTreeSet<crate::review_batch::ReviewTask>,
@@ -9032,7 +8975,7 @@ pub async fn dispatch_post_session_review(
             == stock_analysis::risk::env_guard::TradingEnv::Test;
     let preflight = review_preflight(context, due, is_test);
     let phases = partition_review_tasks(&preflight.runnable);
-    let (r04, r07, r08, r09, r11, r12, a10, a01) = tokio::join!(
+    let (r04, r07, r08, r09, r11, r12, r13, a10, a01) = tokio::join!(
         async {
             if phases.source_only.contains(&ReviewTask::R04) {
                 Some((ReviewTask::R04, dispatch_r04_lhb_outcome(&date, now).await))
@@ -9091,6 +9034,16 @@ pub async fn dispatch_post_session_review(
             }
         },
         async {
+            if phases.source_only.contains(&ReviewTask::R13) {
+                Some((
+                    ReviewTask::R13,
+                    dispatch_r13_watchlist_tracking_outcome(&date).await,
+                ))
+            } else {
+                None
+            }
+        },
+        async {
             if phases.source_only.contains(&ReviewTask::A10) {
                 Some((
                     ReviewTask::A10,
@@ -9111,7 +9064,7 @@ pub async fn dispatch_post_session_review(
             }
         },
     );
-    let source_only_outcomes = [r04, r07, r08, r09, r11, r12, a10, a01]
+    let source_only_outcomes = [r04, r07, r08, r09, r11, r12, r13, a10, a01]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
@@ -12847,6 +12800,16 @@ async fn dispatch_catalyst_review_daily_outcome(
         .iter()
         .map(|name| name.as_str())
         .collect();
+    let leading_code_refs: Vec<&str> = snapshot
+        .leading_entries
+        .iter()
+        .map(|entry| entry.code.as_str())
+        .collect();
+    let other_code_refs: Vec<&str> = snapshot
+        .other_entries
+        .iter()
+        .map(|entry| entry.code.as_str())
+        .collect();
     // BR-225: 题材评分/观察点推导 (无独立评分批次时用当日涨停结构, 确定性规则)
     let derived_score = snapshot.score.or_else(|| {
         let structure = (snapshot.member_count as f32).min(100.0) * 0.30
@@ -12876,6 +12839,8 @@ async fn dispatch_catalyst_review_daily_outcome(
         continuous_count: snapshot.continuous_count,
         leading_names: leading_refs,
         other_names: other_refs,
+        leading_codes: leading_code_refs,
+        other_codes: other_code_refs,
         watch_point: derived_watch_point,
     };
     let text = render_catalyst_review(params);
@@ -12923,6 +12888,36 @@ async fn dispatch_catalyst_review_daily_outcome(
     };
     let result =
         crate::notify::push_source_batch_v3(presentation_token, &text, &source_evidence).await;
+    if result.is_pushed() {
+        // T+1 跟踪: A-10 名单 (含代码/连板) 落库快照, 次日 R-13 盘后核对。
+        // 失败仅 warn 不阻断推送 (黑盒闭环的记录侧不能卡推送本身)。
+        let entries_leading = snapshot.leading_entries.clone();
+        let entries_other = snapshot.other_entries.clone();
+        let entry_count = entries_leading.len() + entries_other.len();
+        match tokio::task::spawn_blocking(move || {
+            stock_analysis::database::catalyst_watchlist::save_watchlist(
+                business_date,
+                &entries_leading,
+                &entries_other,
+            )
+        })
+        .await
+        {
+            Ok(Ok(receipt)) => {
+                if receipt.inserted {
+                    log::info!(
+                        "[A-10][T+1] watchlist snapshot saved run_id={} entries={}",
+                        receipt.run_id,
+                        entry_count
+                    );
+                } else {
+                    log::info!("[A-10][T+1] watchlist snapshot already saved (idempotent)");
+                }
+            }
+            Ok(Err(error)) => log::warn!("[A-10][T+1] watchlist save failed: {error}"),
+            Err(error) => log::warn!("[A-10][T+1] watchlist save join failed: {error}"),
+        }
+    }
     let dispatcher_error = push_outcome_dispatcher_error(&result);
     log_dispatcher_attempt(
         "A-10",
@@ -14158,15 +14153,6 @@ pub fn render_news_to_idea(banner: &BannerCtx, p: NewsToIdeaParams<'_>) -> Strin
     s
 }
 
-/// v13 §14.3 A-10 题材催化复盘 — 持续性
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub enum PersistentLevel {
-    High,
-    Med,
-    #[default]
-    Low,
-}
-
 /// v13 §14.3 A-10 盘后题材催化复盘
 pub struct CatalystReviewParams<'a> {
     pub date: &'a str,
@@ -14177,7 +14163,20 @@ pub struct CatalystReviewParams<'a> {
     pub continuous_count: usize,
     pub leading_names: Vec<&'a str>,
     pub other_names: Vec<&'a str>,
+    /// 与 leading_names/other_names 同序的 6 位代码 (渲染「名称(代码)」+ T+1 跟踪)
+    pub leading_codes: Vec<&'a str>,
+    pub other_codes: Vec<&'a str>,
     pub watch_point: Option<&'a str>,
+}
+
+/// 「名称(代码)」渲染: names 与 codes 同序, 长度不一致时仅拼名字 (不 panic)。
+fn name_code_pairs(names: &[&str], codes: &[&str]) -> String {
+    names
+        .iter()
+        .zip(codes.iter())
+        .map(|(name, code)| format!("{name}({code})"))
+        .collect::<Vec<_>>()
+        .join("、")
 }
 
 /// v13 §14.3 A-10 盘后题材催化复盘
@@ -14198,11 +14197,14 @@ pub fn render_catalyst_review(p: CatalystReviewParams<'_>) -> String {
     if !p.leading_names.is_empty() {
         s.push_str(&format!(
             "前排成员（按连板数）: {}\n",
-            p.leading_names.join("、")
+            name_code_pairs(&p.leading_names, &p.leading_codes)
         ));
     }
     if !p.other_names.is_empty() {
-        s.push_str(&format!("其余同题材成员: {}\n", p.other_names.join("、")));
+        s.push_str(&format!(
+            "其余同题材成员: {}\n",
+            name_code_pairs(&p.other_names, &p.other_codes)
+        ));
     }
     let watch_point = p
         .watch_point
@@ -14611,7 +14613,7 @@ pub fn build_test_template_catalog(
     };
     use stock_analysis::monitor::detector::{AlertCategory, AlertDetail, AlertEvent, AlertLevel};
 
-    const EXPECTED_CATALOG_TOTAL: usize = 53;
+    const EXPECTED_CATALOG_TOTAL: usize = 55;
     let banner = BannerCtx {
         account_mode: AccountMode::Normal,
         total_pos: Some(0),
@@ -15104,6 +15106,35 @@ pub fn build_test_template_catalog(
         }),
     );
     push(
+        "R-12-backtest-review",
+        stock_analysis::review::backtest::render_r12(
+            &stock_analysis::review::backtest::R12BacktestResult {
+                virtual_buy: vec![stock_analysis::review::backtest::SignalGroup {
+                    reason: "TEST_CODE NewsCatalyst".to_string(),
+                    window_bars: 4,
+                    count: 50,
+                    win_rate: Some(0.36),
+                    avg_ret: Some(0.0031),
+                    mfe: Some(0.089),
+                    mae: Some(-0.026),
+                }],
+                virtual_sell: Vec::new(),
+                broken_excluded: 190,
+                boll_macd: vec![stock_analysis::review::backtest::SignalGroup {
+                    reason: "TEST_CODE BottomBuy".to_string(),
+                    window_bars: 4,
+                    count: 10224,
+                    win_rate: Some(0.44),
+                    avg_ret: Some(-0.0003),
+                    mfe: Some(0.2),
+                    mae: Some(-0.103),
+                }],
+                skipped_codes: Vec::new(),
+                unaligned_signals: 0,
+            },
+        ),
+    );
+    push(
         "A-02-auction-repush",
         render_auction_repush(
             "09:20",
@@ -15300,7 +15331,9 @@ pub fn build_test_template_catalog(
             member_count: 3,
             continuous_count: 2,
             leading_names: vec!["TEST_CODE 龙头"],
+            leading_codes: vec!["TEST_CODE_600004"],
             other_names: vec!["TEST_CODE 后排"],
+            other_codes: vec!["TEST_CODE_300002"],
             watch_point: Some("TEST_CODE 次日量能"),
         }),
     );
@@ -15418,6 +15451,55 @@ pub fn build_test_template_catalog(
             plan_flat: Some("TEST_CODE 观察"),
             plan_low: Some("TEST_CODE 止损"),
         }),
+    );
+    // R-13: T+1 昨日关注回填 (TEST_CODE 名单 → 行情核对)
+    push(
+        "T1-watch-tracking",
+        stock_analysis::review::watchlist_tracking::render_watchlist_tracking(
+            &stock_analysis::database::catalyst_watchlist::WatchlistSnapshot {
+                watch_date: chrono::NaiveDate::from_ymd_opt(2026, 7, 30).unwrap(),
+                leading: vec![stock_analysis::database::catalyst_watchlist::WatchEntry {
+                    code: "TEST_CODE_600001".into(),
+                    name: "TEST_CODE 龙头".into(),
+                    streak: 1,
+                }],
+                other: vec![stock_analysis::database::catalyst_watchlist::WatchEntry {
+                    code: "TEST_CODE_300002".into(),
+                    name: "TEST_CODE 后排".into(),
+                    streak: 1,
+                }],
+            },
+            &[
+                stock_analysis::database::catalyst_watchlist::WatchOutcome {
+                    watch_date: chrono::NaiveDate::from_ymd_opt(2026, 7, 30).unwrap(),
+                    checked_date: chrono::NaiveDate::from_ymd_opt(2026, 7, 31).unwrap(),
+                    code: "TEST_CODE_600001".into(),
+                    name: "TEST_CODE 龙头".into(),
+                    close: 11.0,
+                    prev_close: 10.0,
+                    change_pct: 10.0,
+                    limit_up: true,
+                    limit_up_type: "封板".into(),
+                    streak_today: 2,
+                    high: Some(11.0),
+                    open: Some(10.5),
+                },
+                stock_analysis::database::catalyst_watchlist::WatchOutcome {
+                    watch_date: chrono::NaiveDate::from_ymd_opt(2026, 7, 30).unwrap(),
+                    checked_date: chrono::NaiveDate::from_ymd_opt(2026, 7, 31).unwrap(),
+                    code: "TEST_CODE_300002".into(),
+                    name: "TEST_CODE 后排".into(),
+                    close: 10.3,
+                    prev_close: 10.0,
+                    change_pct: 3.0,
+                    limit_up: false,
+                    limit_up_type: "".into(),
+                    streak_today: 0,
+                    high: Some(10.5),
+                    open: Some(10.1),
+                },
+            ],
+        ),
     );
 
     if catalog.len() != EXPECTED_CATALOG_TOTAL {
@@ -17325,7 +17407,9 @@ mod tests {
             member_count: 3,
             continuous_count: 3,
             leading_names: vec!["A", "B"],
+            leading_codes: vec!["600001", "600002"],
             other_names: vec!["C"],
+            other_codes: vec!["600003"],
             watch_point: Some("明日是否扩散"),
         };
         let out = render_catalyst_review(p);
@@ -17333,8 +17417,8 @@ mod tests {
         assert!(out.contains("主线: AI算力"));
         assert!(out.contains("涨停成员: 3家 | 连板成员: 3家 | 持续性结构: 高"));
         assert!(out.contains("题材评分: 85.0"));
-        assert!(out.contains("前排成员（按连板数）: A、B"));
-        assert!(out.contains("其余同题材成员: C"));
+        assert!(out.contains("前排成员（按连板数）: A(600001)、B(600002)"));
+        assert!(out.contains("其余同题材成员: C(600003)"));
         assert!(out.contains("明日观察点: 明日是否扩散"));
         assert!(!out.contains("已启动"));
         assert!(!out.contains("待启动"));
@@ -17351,7 +17435,9 @@ mod tests {
             member_count: 0,
             continuous_count: 0,
             leading_names: vec![],
+            leading_codes: vec![],
             other_names: vec![],
+            other_codes: vec![],
             watch_point: None,
         };
         let out = render_catalyst_review(p);
@@ -17362,137 +17448,8 @@ mod tests {
         assert!(out.contains("明日观察点: 数据缺失（未接入独立量能/走势批次）"));
     }
 
-    fn visible_chain_batch(
-        names: &[&str],
-    ) -> stock_analysis::database::chain_intelligence::VisibleChainBatch {
-        use stock_analysis::database::chain_intelligence::{
-            ChainInputEvidenceInput, VisibleChain, VisibleChainBatch, VisibleChainMember,
-        };
-        VisibleChainBatch {
-            batch_id: "TEST_CODE_chain_batch".to_string(),
-            content_hash: "a".repeat(64),
-            trading_date: chrono::NaiveDate::from_ymd_opt(2099, 1, 2).unwrap(),
-            calculation_version: "TEST_CODE_v1".to_string(),
-            taxonomy_version: "TEST_CODE_taxonomy_v1".to_string(),
-            inputs: vec![ChainInputEvidenceInput {
-                input_id: "TEST_CODE_chain_input".to_string(),
-                ordinal: 0,
-                capability: "TEST_CODE_limit_pool".to_string(),
-                provider: "TEST_CODE_provider".to_string(),
-                source: "TEST_CODE_source".to_string(),
-                source_at: Some("2099-01-02".to_string()),
-                observed_at: "2099-01-02T15:00:00+08:00".to_string(),
-                source_batch_id: "TEST_CODE_input_batch".to_string(),
-                source_batch_hash: "b".repeat(64),
-                content_hash: "c".repeat(64),
-            }],
-            chains: vec![VisibleChain {
-                chain_id: "TEST_CODE_chain".to_string(),
-                canonical_board_id: "TEST_CODE_board".to_string(),
-                board_name: "测试主线".to_string(),
-                upper_limit_count: i32::try_from(names.len()).unwrap(),
-                continuous_count: 3,
-                members: names
-                    .iter()
-                    .enumerate()
-                    .map(|(index, name)| VisibleChainMember {
-                        instrument_id: format!("TEST_CODE_{index:06}"),
-                        security_name: (*name).to_string(),
-                        source_event_id: format!("TEST_CODE_event_{index}"),
-                        streak: i32::try_from(names.len() - index).unwrap(),
-                    })
-                    .collect(),
-            }],
-            rejections: vec![],
-        }
-    }
-
-    #[test]
-    fn br160_a10_maps_only_the_visible_gateway_batch() {
-        let batch = visible_chain_batch(&["测试一", "测试二", "测试三", "测试四"]);
-        let snapshot =
-            catalyst_review_from_chain_batch(&batch).expect("visible batch maps to A-10");
-        assert_eq!(snapshot.date, "2099-01-02");
-        assert_eq!(snapshot.source_batch_id, batch.batch_id);
-        assert_eq!(snapshot.source_content_hash, batch.content_hash);
-        assert_eq!(
-            snapshot.source_observed_at,
-            Some(chrono::DateTime::parse_from_rfc3339("2099-01-02T15:00:00+08:00").unwrap())
-        );
-        assert_eq!(snapshot.theme, "测试主线");
-        assert_eq!(snapshot.persistent, PersistentLevel::High);
-        assert_eq!(snapshot.member_count, 4);
-        assert_eq!(snapshot.continuous_count, 3);
-        assert_eq!(snapshot.leading_members, ["测试一", "测试二", "测试三"]);
-        assert_eq!(snapshot.other_members, ["测试四"]);
-        assert_eq!(snapshot.score, None);
-        assert_eq!(snapshot.watch_point, None);
-    }
-
-    #[test]
-    fn br160_a10_rejects_visible_batch_count_contradiction() {
-        let mut batch = visible_chain_batch(&["测试一", "测试二", "测试三"]);
-        batch.chains[0].upper_limit_count = 4;
-        let error = catalyst_review_from_chain_batch(&batch)
-            .expect_err("contradictory visible batch must fail");
-        assert!(error.contains("member-count contract"));
-    }
-
-    #[test]
-    fn br160_a10_rejects_missing_or_invalid_input_observation_time() {
-        let mut batch = visible_chain_batch(&["测试一", "测试二", "测试三"]);
-        batch.inputs[0].observed_at = "TEST_CODE_invalid_observation".to_string();
-        let error = catalyst_review_from_chain_batch(&batch)
-            .expect_err("invalid source observation must fail before delivery");
-        assert!(error.contains("source observed_at is invalid"), "{error}");
-
-        batch.inputs.clear();
-        let error = catalyst_review_from_chain_batch(&batch)
-            .expect_err("missing source observation must fail before delivery");
-        assert!(error.contains("no input observation time"), "{error}");
-    }
-
-    #[test]
-    fn br160_a10_rejects_invalid_continuous_counts() {
-        let mut above_member_count = visible_chain_batch(&["测试一", "测试二", "测试三"]);
-        above_member_count.chains[0].continuous_count = 4;
-        let error = catalyst_review_from_chain_batch(&above_member_count)
-            .expect_err("continuous count above member count must fail");
-        assert!(error.contains("continuous count above member count"));
-
-        let mut negative = visible_chain_batch(&["测试一", "测试二", "测试三"]);
-        negative.chains[0].continuous_count = -1;
-        let error = catalyst_review_from_chain_batch(&negative)
-            .expect_err("negative continuous count must fail");
-        assert!(error.contains("negative continuous count"));
-    }
-
-    #[test]
-    fn br160_a10_loader_has_no_legacy_source_fallback() {
-        let source = include_str!("push_templates.rs");
-        let start = source
-            .find("pub async fn load_catalyst_review_snapshot_real")
-            .expect("A-10 loader");
-        let end = source[start..]
-            .find("// ============================================================================")
-            .map(|offset| start + offset)
-            .expect("A-10 loader boundary");
-        let loader = &source[start..end];
-        for forbidden in [
-            "chain_daily",
-            "board_rotation_daily",
-            "DataFetcherManager",
-            "get_latest_chain_clusters",
-            "get_latest_board_rotations",
-        ] {
-            assert!(
-                !loader.contains(forbidden),
-                "legacy A-10 source: {forbidden}"
-            );
-        }
-        assert!(loader.contains("ChainIntelligenceGateway"));
-    }
-
+    // A-10 br160 映射/拒绝/loader-guard 测试已随装载函数迁至
+    // src/review/catalyst_review.rs (与代码同住, 不再在此重复)。
     // ====== v13 治理元信息测试 (A-10) ======
     #[test]
     fn gov_catalyst_review_cooldown() {
@@ -19096,7 +19053,9 @@ mod tests {
             member_count: 3,
             continuous_count: 3,
             leading_names: vec!["中科曙光", "浪潮信息"],
+            leading_codes: vec!["603019", "000977"],
             other_names: vec!["紫光股份"],
+            other_codes: vec!["000938"],
             watch_point: Some("明日是否扩散"),
         });
         assert!(a10.contains("📰 题材催化复盘"));

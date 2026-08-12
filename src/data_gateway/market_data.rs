@@ -7,7 +7,7 @@
 //! under the five-second freshness rule and continues to the next Magic
 //! provider. No consumer-owned HTTP or legacy parser is retained.
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveTime, Utc};
 #[cfg(test)]
 use magic_market_core::Exchange;
 use magic_market_core::{AssetClass, DataStatus, InstrumentId, ProviderId, Quote, RatioUnit};
@@ -675,7 +675,47 @@ fn quote_chain_source(
     }
 }
 
+const SHANGHAI_OFFSET_SECONDS: i32 = 8 * 60 * 60;
+
+/// BR-236 (2026-08-12): 午休/盘后静态快照放行的节流状态 — 每个 (北京日期,
+/// 会话) 首次放行 warn 一次, 后续 debug。盘后 9 小时 ≈ 540 批次, 逐批
+/// warn 会刷屏; v15.x 规则要求出声, 会话级一次即满足。
+static OFF_SESSION_WARN_STATE: OnceLock<Mutex<Option<(NaiveDate, bool)>>> = OnceLock::new();
+
+/// BR-236: 北京时间午休 [11:30, 13:00) 或盘后 [15:00, 24:00)。
+/// 与 machine 时区解耦 (显式 +08, company.rs:29 同款), 测试确定性强。
+fn in_lunch_or_after_hours(now: DateTime<Utc>) -> bool {
+    let t = now
+        .with_timezone(&FixedOffset::east_opt(SHANGHAI_OFFSET_SECONDS).expect("+08 offset"))
+        .time();
+    (t >= NaiveTime::from_hms_opt(11, 30, 0).expect("11:30")
+        && t < NaiveTime::from_hms_opt(13, 0, 0).expect("13:00"))
+        || t >= NaiveTime::from_hms_opt(15, 0, 0).expect("15:00")
+}
+
+/// BR-236: 超龄 quote 在午休/盘后且 source_at 与 now 同为今日北京时间 →
+/// 当日最后成交价 = 合法静态快照 (BR-233 同源语义, 非实时价)。盘中/盘前
+/// (source_at 为上一交易日) 一律 false → 维持 BR-218 5s 红线。
+fn off_session_static_quote_eligible(now: DateTime<Utc>, source_at: DateTime<Utc>) -> bool {
+    if !in_lunch_or_after_hours(now) {
+        return false;
+    }
+    let zone = FixedOffset::east_opt(SHANGHAI_OFFSET_SECONDS).expect("+08 offset");
+    now.with_timezone(&zone).date_naive() == source_at.with_timezone(&zone).date_naive()
+}
+
 fn admit_quote_batch(
+    storage_codes: &[String],
+    provider: ProviderId,
+    batch: magic_market_core::DataBatch<Quote>,
+    mode: QuoteAdmissionMode,
+) -> Result<GatewayBatch<RealtimeMarketQuote>, GatewayError> {
+    admit_quote_batch_at(Utc::now(), storage_codes, provider, batch, mode)
+}
+
+/// BR-236: `now` 注入版 — 测试可固定时钟; 生产入口是 [`admit_quote_batch`]。
+fn admit_quote_batch_at(
+    now: DateTime<Utc>,
     storage_codes: &[String],
     provider: ProviderId,
     batch: magic_market_core::DataBatch<Quote>,
@@ -704,7 +744,6 @@ fn admit_quote_batch(
         ));
     }
 
-    let now = Utc::now();
     let observed_at = parse_evidence_instant(
         CAPABILITY,
         provider,
@@ -713,6 +752,7 @@ fn admit_quote_batch(
     )?;
     let mut records = Vec::with_capacity(batch.records().len());
     let mut stale_exclusions: Vec<String> = Vec::new();
+    let mut off_session_admissions: Vec<String> = Vec::new();
     for (storage_code, quote) in storage_codes.iter().zip(batch.records()) {
         let expected = build_instrument(storage_code)?;
         if quote.instrument() != &expected
@@ -779,8 +819,16 @@ fn admit_quote_batch(
                     // record is excluded outright — never repaired, back-filled or
                     // served from a previous round — but it must not discard the
                     // records that did meet the gate.
-                    stale_exclusions.push(format!("{storage_code}@{age_ms}ms"));
-                    continue;
+                    if off_session_static_quote_eligible(now, source_at) {
+                        // BR-236: 午休/盘后 — source_at 与 now 同为今日北京日期,
+                        // 价格 = 当日最后成交价, 是合法静态快照 (BR-233 同源
+                        // 语义), 只是非实时。放行而非排除; 盘中真断流走
+                        // router/provider 层错误, 不会到达此处。
+                        off_session_admissions.push(format!("{storage_code}@{age_ms}ms"));
+                    } else {
+                        stale_exclusions.push(format!("{storage_code}@{age_ms}ms"));
+                        continue;
+                    }
                 }
             }
             QuoteAdmissionMode::SettledClose { trading_date } => {
@@ -858,6 +906,36 @@ fn admit_quote_batch(
             stale_exclusions.len(),
             stale_exclusions.join(",")
         );
+    }
+    if !off_session_admissions.is_empty() {
+        // BR-236: 每 (北京日期, 会话) 首次 warn, 后续 debug — 盘后 9 小时
+        // ≈540 批次不刷屏, 同时满足 v15.x 出声原则 (会话级一次)。
+        let zone = FixedOffset::east_opt(SHANGHAI_OFFSET_SECONDS).expect("+08 offset");
+        let today = now.with_timezone(&zone).date_naive();
+        let t = now.with_timezone(&zone).time();
+        let is_lunch = t >= NaiveTime::from_hms_opt(11, 30, 0).expect("11:30")
+            && t < NaiveTime::from_hms_opt(13, 0, 0).expect("13:00");
+        let mut state = OFF_SESSION_WARN_STATE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("off-session warn state");
+        if *state != Some((today, is_lunch)) {
+            *state = Some((today, is_lunch));
+            log::warn!(
+                "[DataGateway][RealtimeMarketQuotes][BR-236] 午休/盘后静态快照放行 \
+                 provider={provider:?} batch_id={} admitted={} off_session=[{}]",
+                evidence.batch_id,
+                records.len(),
+                off_session_admissions.join(",")
+            );
+        } else {
+            log::debug!(
+                "[DataGateway][RealtimeMarketQuotes][BR-236] 午休/盘后静态快照放行 \
+                 admitted={} off_session=[{}]",
+                records.len(),
+                off_session_admissions.join(",")
+            );
+        }
     }
 
     Ok(GatewayBatch::Available { records, evidence })
@@ -1113,6 +1191,181 @@ mod tests {
         assert!(
             error.to_string().contains("quote_stale"),
             "reason code must stay quote_stale: {error}"
+        );
+    }
+
+    /// 北京时间固定时钟构造器（BR-236 测试共用）。
+    fn bj(y: i32, m: u32, d: u32, hh: u32, mm: u32, ss: u32) -> DateTime<Utc> {
+        let zone = FixedOffset::east_opt(SHANGHAI_OFFSET_SECONDS).expect("+08 offset");
+        chrono::NaiveDate::from_ymd_opt(y, m, d)
+            .expect("date")
+            .and_hms_opt(hh, mm, ss)
+            .expect("time")
+            .and_local_timezone(zone)
+            .earliest()
+            .expect("zone conversion")
+            .with_timezone(&Utc)
+    }
+
+    /// BR-236: 午休/盘后时段边界 — [11:30,13:00) ∪ [15:00,24:00) (北京时间)。
+    #[test]
+    fn br236_session_boundaries() {
+        // 午休前 1 秒 → 否
+        assert!(!in_lunch_or_after_hours(bj(2026, 8, 12, 11, 29, 59)));
+        // 午休起点/终点
+        assert!(in_lunch_or_after_hours(bj(2026, 8, 12, 11, 30, 0)));
+        assert!(in_lunch_or_after_hours(bj(2026, 8, 12, 12, 59, 59)));
+        assert!(!in_lunch_or_after_hours(bj(2026, 8, 12, 13, 0, 0)));
+        // 下午盘中 → 否
+        assert!(!in_lunch_or_after_hours(bj(2026, 8, 12, 14, 59, 59)));
+        // 盘后起点/深夜
+        assert!(in_lunch_or_after_hours(bj(2026, 8, 12, 15, 0, 0)));
+        assert!(in_lunch_or_after_hours(bj(2026, 8, 12, 23, 59, 59)));
+        // 盘前 → 否
+        assert!(!in_lunch_or_after_hours(bj(2026, 8, 12, 9, 15, 0)));
+        assert!(!in_lunch_or_after_hours(bj(2026, 8, 12, 9, 30, 0)));
+    }
+
+    /// BR-236: eligibility — 仅当 now 处于午休/盘后且 source_at 与 now 同为
+    /// 今日北京日期才放行。
+    #[test]
+    fn br236_off_session_eligibility() {
+        let lunch_now = bj(2026, 8, 12, 11, 45, 0);
+        let today_source = bj(2026, 8, 12, 11, 30, 0);
+        let yesterday_source = bj(2026, 8, 11, 15, 0, 0);
+        // 午休 + 当日 source → 放行
+        assert!(off_session_static_quote_eligible(lunch_now, today_source));
+        // 午休 + 昨日 source → 拒绝
+        assert!(!off_session_static_quote_eligible(lunch_now, yesterday_source));
+        // 盘中 → 拒绝 (即使当日 source)
+        assert!(!off_session_static_quote_eligible(
+            bj(2026, 8, 12, 10, 0, 0),
+            today_source
+        ));
+        // 盘前 → 拒绝
+        assert!(!off_session_static_quote_eligible(
+            bj(2026, 8, 12, 9, 15, 0),
+            today_source
+        ));
+        // 盘后 + 当日 source → 放行
+        assert!(off_session_static_quote_eligible(
+            bj(2026, 8, 12, 15, 30, 0),
+            bj(2026, 8, 12, 15, 0, 0)
+        ));
+    }
+
+    /// BR-236: 午休 30s/40s 超龄的当日静态快照 → 放行且记录保真
+    /// (落在 records, 不是 stale 排除)。
+    #[test]
+    fn br236_lunch_admits_same_day_stale_quote() {
+        let now = bj(2026, 8, 12, 11, 45, 0);
+        let codes = vec!["600396".to_owned(), "600519".to_owned()];
+        let batch = quote_batch_multi(
+            &[
+                ("600396", now - chrono::Duration::seconds(30)),
+                ("600519", now - chrono::Duration::seconds(40)),
+            ],
+            ProviderId::Tencent,
+            "TEST_CODE_br236_lunch",
+        );
+        let admitted = admit_quote_batch_at(
+            now,
+            &codes,
+            ProviderId::Tencent,
+            batch,
+            QuoteAdmissionMode::RealtimeFiveSecond,
+        )
+        .expect("lunch same-day static snapshot must be admitted");
+        let kept = admitted
+            .records()
+            .iter()
+            .map(|record| record.code.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kept,
+            vec!["600396", "600519"],
+            "off-session admission keeps the same-day quotes"
+        );
+    }
+
+    /// BR-236: 盘后整批超龄当日快照 → 放行 (BR-218 的整批 quote_stale 仅在
+    /// 排除为空时兜底, 此处应走 off-session 放行而非失败)。
+    #[test]
+    fn br236_after_hours_admits_same_day_stale_quote() {
+        let now = bj(2026, 8, 12, 15, 30, 0);
+        let codes = vec!["600396".to_owned()];
+        let batch = quote_batch_multi(
+            &[("600396", now - chrono::Duration::minutes(5))],
+            ProviderId::Tencent,
+            "TEST_CODE_br236_after_hours",
+        );
+        let admitted = admit_quote_batch_at(
+            now,
+            &codes,
+            ProviderId::Tencent,
+            batch,
+            QuoteAdmissionMode::RealtimeFiveSecond,
+        )
+        .expect("after-hours same-day static snapshot must be admitted");
+        assert_eq!(admitted.records().len(), 1);
+    }
+
+    /// BR-236: 盘前超龄 → 不适用 off-session 放行, 维持 BR-218 整批 quote_stale
+    /// (显式失败, 供 BR-217 failover)。
+    #[test]
+    fn br236_preopen_stale_batch_still_fails() {
+        let now = bj(2026, 8, 12, 9, 15, 0);
+        let codes = vec!["600396".to_owned()];
+        let batch = quote_batch_multi(
+            &[("600396", now - chrono::Duration::seconds(30))],
+            ProviderId::Tencent,
+            "TEST_CODE_br236_preopen",
+        );
+        let error = admit_quote_batch_at(
+            now,
+            &codes,
+            ProviderId::Tencent,
+            batch,
+            QuoteAdmissionMode::RealtimeFiveSecond,
+        )
+        .expect_err("preopen stale batch must keep failing retryably");
+        assert!(error.retryable(), "staleness must keep failing over");
+        assert!(
+            error.to_string().contains("quote_stale"),
+            "reason code must stay quote_stale: {error}"
+        );
+    }
+
+    /// BR-236: 盘中维持 BR-218 语义 — 超龄排除、新鲜保留 (注入固定 now)。
+    #[test]
+    fn br236_intraday_keeps_br218_semantics() {
+        let now = bj(2026, 8, 12, 10, 30, 0);
+        let codes = vec!["600396".to_owned(), "600519".to_owned()];
+        let batch = quote_batch_multi(
+            &[
+                ("600396", now - chrono::Duration::milliseconds(500)),
+                ("600519", now - chrono::Duration::seconds(30)),
+            ],
+            ProviderId::Tencent,
+            "TEST_CODE_br236_intraday",
+        );
+        let admitted = admit_quote_batch_at(
+            now,
+            &codes,
+            ProviderId::Tencent,
+            batch,
+            QuoteAdmissionMode::RealtimeFiveSecond,
+        )
+        .expect("fresh record must survive a stale sibling intraday");
+        let kept = admitted
+            .records()
+            .iter()
+            .map(|record| record.code.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kept,
+            vec!["600396"],
+            "intraday keeps BR-218 per-record exclusion semantics"
         );
     }
 

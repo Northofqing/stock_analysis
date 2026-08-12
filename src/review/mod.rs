@@ -15,6 +15,10 @@ pub mod report;
 pub mod sop;
 // R-12 盘后回测 — 用 15 分钟 K线数据回测策略信号
 pub mod backtest;
+// R-13 T+1 关注票核对 — 昨日题材复盘名单 → 次日盘后行情回填
+pub mod watchlist_tracking;
+// A-10 题材催化复盘 — snapshot 装载 (自 push_templates.rs 迁入, backfill 与生产共用)
+pub mod catalyst_review;
 // v12 MVP-4 §7 + MVP-5 §8
 pub mod failure_attribution; // §8.4 R-06
 pub mod lhb_review; // §7.4 R-04

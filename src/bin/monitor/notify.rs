@@ -129,6 +129,8 @@ pub enum PushKind {
     PositionReview,
     /// R-12: 盘后策略回测 (15min K线回测虚拟仓信号 + boll_macd, 盘后 1次/日)
     ReviewBacktest,
+    /// R-13: T+1 昨日关注回填 (A-10 名单次日行情核对, 盘后 1次/日)
+    WatchlistTracking,
     // ============= v13 §14 新增 PushKind (PR #1) =============
     /// v13 §14.1 P-01 盘前新闻热点 (⚡ 15min 冷却)
     PreopenNewsHot,
@@ -331,6 +333,8 @@ impl PushKind {
             | PushKind::MarketActionAlert => PushLevel::Emergency,
             // R-12 盘后回测: 参考级 (非交易建议, 仅统计)
             PushKind::ReviewBacktest => PushLevel::Info,
+            // R-13 昨日关注回填: 参考级 (非交易建议, 仅行情核对)
+            PushKind::WatchlistTracking => PushLevel::Info,
             // ℹ️参考 (降级 + ForbiddenOps/PaperTrade)
             _ => PushLevel::Info,
         }
@@ -510,6 +514,7 @@ impl PushKind {
             PushKind::ReviewProviderTopN => "盘后量能与主力净流入",
             PushKind::PositionReview => "持仓复盘",
             PushKind::ReviewBacktest => "15min回测",
+            PushKind::WatchlistTracking => "昨日关注回填",
             // v13 新增
             PushKind::PreopenNewsHot => "盘前热点",
             PushKind::IntradayMarket => "盘中轮动",
@@ -852,6 +857,17 @@ pub const DISPATCH_TABLE: &[(PushKind, DispatchRow)] = &[
             cooldown_scope: CooldownScope::Global,
             label: "15min回测",
             stable_template_id: "r12_15min_backtest_v1",
+        },
+    ),
+    // ============== R-13: T+1 昨日关注回填段 ==============
+    (
+        PushKind::WatchlistTracking,
+        DispatchRow {
+            level: PushLevel::Info,
+            cooldown_secs: Some(3600),
+            cooldown_scope: CooldownScope::Global,
+            label: "昨日关注回填",
+            stable_template_id: "t1_watchlist_tracking_v1",
         },
     ),
 ];
@@ -6095,8 +6111,9 @@ mod tests {
             PushKind::PaperSell,
             PushKind::SnapshotStale,
             PushKind::ReviewBacktest,
+            PushKind::WatchlistTracking,
         ];
-        assert_eq!(expected.len(), 18);
+        assert_eq!(expected.len(), 19);
         for k in expected {
             assert!(k.dispatch_row().is_some(), "{:?} 应在 DISPATCH_TABLE 内", k);
         }

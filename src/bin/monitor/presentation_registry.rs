@@ -39,7 +39,7 @@ const fn descriptor(
     }
 }
 
-const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 56] = [
+const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 57] = [
     descriptor(
         "T-01-account-mode",
         PushKind::AccountMode,
@@ -225,6 +225,12 @@ const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 56
         "render_r12_backtest",
     ),
     descriptor(
+        "T1-watch-tracking",
+        PushKind::WatchlistTracking,
+        "watchlist_tracking_dispatcher",
+        "render_watchlist_tracking",
+    ),
+    descriptor(
         "P-01-preopen-news-hot",
         PushKind::PreopenNewsHot,
         "preopen_news_dispatcher",
@@ -382,7 +388,7 @@ const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 56
     ),
 ];
 
-pub(super) fn descriptors() -> &'static [ProductionPresentationDescriptor; 56] {
+pub(super) fn descriptors() -> &'static [ProductionPresentationDescriptor; 57] {
     &PRODUCTION_PRESENTATION_DESCRIPTORS
 }
 

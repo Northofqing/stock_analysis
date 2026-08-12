@@ -349,7 +349,7 @@ type PresentationTuple = (&'static str, PushKind, &'static str, &'static str);
 // This inventory is the test manifest authority.  The production registry
 // below intentionally duplicates the canonical tuples instead of deriving
 // them, allowing either side to drift and the bijection test to catch it.
-const ACTIVE_PRESENTATIONS: [PresentationTuple; 53] = [
+const ACTIVE_PRESENTATIONS: [PresentationTuple; 55] = [
     (
         "T-01-account-mode",
         PushKind::AccountMode,
@@ -506,6 +506,18 @@ const ACTIVE_PRESENTATIONS: [PresentationTuple; 53] = [
         PushKind::PositionReview,
         "position_review_dispatcher",
         "render_position_review",
+    ),
+    (
+        "R-12-backtest-review",
+        PushKind::ReviewBacktest,
+        "review_backtest_dispatcher",
+        "render_r12_backtest",
+    ),
+    (
+        "T1-watch-tracking",
+        PushKind::WatchlistTracking,
+        "watchlist_tracking_dispatcher",
+        "render_watchlist_tracking",
     ),
     (
         "A-02-auction-repush",
@@ -700,7 +712,7 @@ const FIXED_DISABLED_KINDS: [PushKind; 11] = [
     PushKind::IpoCatalyst,
 ];
 
-const ALL_PUSH_KINDS: [PushKind; 59] = [
+const ALL_PUSH_KINDS: [PushKind; 61] = [
     PushKind::HoldingEvent,
     PushKind::DailyReport,
     PushKind::Announcement,
@@ -760,6 +772,8 @@ const ALL_PUSH_KINDS: [PushKind; 59] = [
     PushKind::MarketActionAlert,
     PushKind::NewsFlashCritical,
     PushKind::NewsFlashAggregated,
+    PushKind::ReviewBacktest,
+    PushKind::WatchlistTracking,
 ];
 
 pub(super) fn build_validated_manifest(
@@ -950,7 +964,8 @@ fn validate_manifest(
     families: Vec<TemplateFamily>,
     news: &NewsFlashProcessCapabilitySnapshot,
 ) -> Result<ValidatedManifest, String> {
-    if families.len() != 69 {
+    if families.len() != 71 {
+        // R-13 补录 manifest family 后 70 → 71 (ACTIVE 55 + DISABLED 13 + RETIRED 3)
         return Err(format!("BR-196 family total drift: {}", families.len()));
     }
     let mut family_keys = HashSet::new();
@@ -1008,31 +1023,31 @@ fn validate_manifest(
     let expected = if news.selection_v2_enabled && news.registered_feed_count > 0 {
         (
             LifecycleCounts {
-                active: 55,
+                active: 57,
                 disabled: 11,
                 retired: 3,
-                total: 69,
+                total: 71,
             },
             LifecycleCounts {
-                active: 50,
+                active: 52,
                 disabled: 9,
                 retired: 0,
-                total: 59,
+                total: 61,
             },
         )
     } else {
         (
             LifecycleCounts {
-                active: 53,
+                active: 55,
                 disabled: 13,
                 retired: 3,
-                total: 69,
+                total: 71,
             },
             LifecycleCounts {
-                active: 48,
+                active: 50,
                 disabled: 11,
                 retired: 0,
-                total: 59,
+                total: 61,
             },
         )
     };
@@ -1101,8 +1116,11 @@ fn validate_descriptor_bijection(
     families: &[TemplateFamily],
     descriptors: &[ProductionPresentationDescriptor],
 ) -> Result<(), String> {
-    if descriptors.len() != 55 {
-        return Err("BR-196 production descriptor count must be 55".to_string());
+    if descriptors.len() != 57 {
+        // R-13 新增 WatchlistTracking descriptor 后需同步此门 → --test 启动即拒。
+        // 57 = PRODUCTION_PRESENTATION_DESCRIPTORS 数组编译期长度
+        // (presentation_registry.rs:42), 以此为准。
+        return Err("BR-196 production descriptor count must be 57".to_string());
     }
     let descriptor_set = descriptors.iter().copied().collect::<HashSet<_>>();
     if descriptor_set.len() != descriptors.len() {
@@ -1167,15 +1185,16 @@ fn project_push_kind_lifecycle(families: &[TemplateFamily]) -> Result<LifecycleC
         }
     }
     let all = ALL_PUSH_KINDS.into_iter().collect::<HashSet<_>>();
-    if all.len() != 59 || projected.len() != 59 || projected.keys().any(|kind| !all.contains(kind))
+    if all.len() != 61 || projected.len() != 61 || projected.keys().any(|kind| !all.contains(kind))
     {
-        return Err("BR-196 PushKind inventory is not an exact 59-kind cover".to_string());
+        // R-13 新增 WatchlistTracking PushKind 后 ALL_PUSH_KINDS 60 → 61
+        return Err("BR-196 PushKind inventory is not an exact 61-kind cover".to_string());
     }
     let mut result = LifecycleCounts {
         active: 0,
         disabled: 0,
         retired: 0,
-        total: 59,
+        total: 61,
     };
     for counts in projected.values() {
         if counts.active > 0 {
@@ -1216,22 +1235,24 @@ mod tests {
     #[test]
     fn br196_default_and_active_newsflash_matrices_are_exact() {
         let default = build_validated_manifest(&snapshot(false, 0)).unwrap();
+        // R-13 新增 T1-watch-tracking 家族 (Active) + WatchlistTracking kind 后
+        // 家族 70 → 71, kind 60 → 61。
         assert_eq!(
             default.family_counts,
             LifecycleCounts {
-                active: 53,
+                active: 55,
                 disabled: 13,
                 retired: 3,
-                total: 69
+                total: 71
             }
         );
         assert_eq!(
             default.push_kind_counts,
             LifecycleCounts {
-                active: 48,
+                active: 50,
                 disabled: 11,
                 retired: 0,
-                total: 59
+                total: 61
             }
         );
 
@@ -1239,19 +1260,19 @@ mod tests {
         assert_eq!(
             active.family_counts,
             LifecycleCounts {
-                active: 55,
+                active: 57,
                 disabled: 11,
                 retired: 3,
-                total: 69
+                total: 71
             }
         );
         assert_eq!(
             active.push_kind_counts,
             LifecycleCounts {
-                active: 50,
+                active: 52,
                 disabled: 9,
                 retired: 0,
-                total: 59
+                total: 61
             }
         );
         assert_eq!(
@@ -1309,7 +1330,11 @@ mod tests {
     #[test]
     fn br196_descriptor_registry_is_independent_exact_bijection() {
         let manifest = build_manifest(&snapshot(false, 0));
-        assert_eq!(crate::presentation_registry::descriptors().len(), 55);
+        assert_eq!(
+            crate::presentation_registry::descriptors().len(),
+            56,
+            "descriptor count must match PRODUCTION_PRESENTATION_DESCRIPTORS array"
+        );
         validate_descriptor_bijection(&manifest, crate::presentation_registry::descriptors())
             .unwrap();
 

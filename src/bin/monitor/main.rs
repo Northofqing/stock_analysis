@@ -1879,6 +1879,40 @@ fn trading_days_since(start: chrono::NaiveDate, end: chrono::NaiveDate) -> i64 {
     days
 }
 
+/// BR-236 Fix A (2026-08-12): 快照过期时昨日盈亏按持仓市值差自算。
+/// - 估值日 > 快照日（快照后未上传）→ 自算 = 估值总市值 − 快照确认市值，
+///   出声标注「按持仓市值差」口径（未计交易/现金变动；上传新快照即恢复确认值）。
+/// - 否则（估值日 ≤ 快照日）→ 用快照确认值 account.daily_pnl（当日精确）。
+/// 纯函数，可单测。
+fn closing_valuation_account_note(
+    account: &stock_analysis::database::user_account_summary::UserAccountSummary,
+    valuation_price_date: chrono::NaiveDate,
+    valuation_market_value: Option<f64>,
+) -> String {
+    let snapshot_date = account
+        .effective_at
+        .get(..10)
+        .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
+    match snapshot_date {
+        Some(snapshot_date) if valuation_price_date > snapshot_date => {
+            match valuation_market_value {
+                Some(mv) => format!(
+                    "用户确认账户 {:.1}%仓位，昨日盈亏自算 {:+.2}（快照 {snapshot_date} 后未上传，按持仓市值差）",
+                    account.position_ratio_pct, mv - account.securities_market_value
+                ),
+                None => format!(
+                    "用户确认账户 {:.1}%仓位，昨日盈亏自算不可用（估值市值缺失）",
+                    account.position_ratio_pct
+                ),
+            }
+        }
+        _ => format!(
+            "用户确认账户 {:.1}%仓位，昨日盈亏 {:+.2}",
+            account.position_ratio_pct, account.daily_pnl
+        ),
+    }
+}
+
 fn refresh_closing_valuation_note() {
     let account = stock_analysis::database::user_account_summary::latest()
         .ok()
@@ -1887,9 +1921,10 @@ fn refresh_closing_valuation_note() {
     {
         Ok(Some(view)) => {
             let account_note = match account.as_ref() {
-                Some(account) => format!(
-                    "用户确认账户 {:.1}%仓位，昨日盈亏 {:+.2}",
-                    account.position_ratio_pct, account.daily_pnl
+                Some(account) => closing_valuation_account_note(
+                    account,
+                    view.valuation.price_date,
+                    view.valuation.total_market_value,
                 ),
                 None => "用户确认账户摘要缺失（仓位/昨日盈亏不可用）".to_string(),
             };
@@ -1913,6 +1948,152 @@ fn refresh_closing_valuation_note() {
         }
     };
     push_templates::set_closing_valuation_note(note);
+}
+
+#[cfg(test)]
+mod tests_br236_valuation_note {
+    use super::closing_valuation_account_note;
+    use chrono::NaiveDate;
+
+    /// 快照 8/10 确认 -426.05；估值日 8/11 市值 49399 → 自算 49399-50269 = -870
+    #[test]
+    fn stale_snapshot_self_calcs_daily_pnl() {
+        let account = stock_analysis::database::user_account_summary::UserAccountSummary {
+            effective_at: "2026-08-10T15:00:00+08:00".to_string(),
+            total_assets: 50269.0,
+            securities_market_value: 50269.0,
+            available_cash: 0.0,
+            position_ratio_pct: 67.2,
+            daily_pnl: -426.05,
+            source: "user_upload".to_string(),
+        };
+        let note = closing_valuation_account_note(
+            &account,
+            NaiveDate::from_ymd_opt(2026, 8, 11).expect("date"),
+            Some(49399.0),
+        );
+        assert!(
+            note.contains("昨日盈亏自算 -870.00"),
+            "unexpected note: {note}"
+        );
+        assert!(
+            note.contains("快照 2026-08-10 后未上传，按持仓市值差"),
+            "unexpected note: {note}"
+        );
+    }
+
+    /// 同日（快照 8/10 确认 -426.05，估值日 8/10）→ 用确认值
+    #[test]
+    fn same_day_snapshot_uses_confirmed_pnl() {
+        let account = stock_analysis::database::user_account_summary::UserAccountSummary {
+            effective_at: "2026-08-10T15:00:00+08:00".to_string(),
+            total_assets: 50269.0,
+            securities_market_value: 50269.0,
+            available_cash: 0.0,
+            position_ratio_pct: 67.2,
+            daily_pnl: -426.05,
+            source: "user_upload".to_string(),
+        };
+        let note = closing_valuation_account_note(
+            &account,
+            NaiveDate::from_ymd_opt(2026, 8, 10).expect("date"),
+            Some(44741.0),
+        );
+        assert!(
+            note.contains("昨日盈亏 -426.05"),
+            "unexpected note: {note}"
+        );
+        assert!(
+            !note.contains("自算"),
+            "same-day snapshot must not self-calc: {note}"
+        );
+    }
+
+    /// 快照新于估值日（当天新上传快照，估值还是昨天）→ 确认值
+    #[test]
+    fn newer_snapshot_uses_confirmed_pnl() {
+        let account = stock_analysis::database::user_account_summary::UserAccountSummary {
+            effective_at: "2026-08-12T09:00:00+08:00".to_string(),
+            total_assets: 48000.0,
+            securities_market_value: 47000.0,
+            available_cash: 1000.0,
+            position_ratio_pct: 97.9,
+            daily_pnl: 123.45,
+            source: "user_upload".to_string(),
+        };
+        let note = closing_valuation_account_note(
+            &account,
+            NaiveDate::from_ymd_opt(2026, 8, 11).expect("date"),
+            Some(49399.0),
+        );
+        assert!(
+            note.contains("昨日盈亏 +123.45"),
+            "unexpected note: {note}"
+        );
+    }
+
+    /// 快照过期 + 估值市值缺失 → 出声「自算不可用」，不静默回落确认值
+    #[test]
+    fn stale_snapshot_without_valuation_value_announces_unavailable() {
+        let account = stock_analysis::database::user_account_summary::UserAccountSummary {
+            effective_at: "2026-08-10T15:00:00+08:00".to_string(),
+            total_assets: 50269.0,
+            securities_market_value: 50269.0,
+            available_cash: 0.0,
+            position_ratio_pct: 67.2,
+            daily_pnl: -426.05,
+            source: "user_upload".to_string(),
+        };
+        let note = closing_valuation_account_note(
+            &account,
+            NaiveDate::from_ymd_opt(2026, 8, 11).expect("date"),
+            None,
+        );
+        assert!(
+            note.contains("昨日盈亏自算不可用（估值市值缺失）"),
+            "unexpected note: {note}"
+        );
+    }
+
+    /// effective_at 非标准格式 → 回落确认值（不出 panic）
+    #[test]
+    fn malformed_effective_at_falls_back_to_confirmed() {
+        let account = stock_analysis::database::user_account_summary::UserAccountSummary {
+            effective_at: "garbage".to_string(),
+            total_assets: 50269.0,
+            securities_market_value: 50269.0,
+            available_cash: 0.0,
+            position_ratio_pct: 67.2,
+            daily_pnl: -426.05,
+            source: "user_upload".to_string(),
+        };
+        let note = closing_valuation_account_note(
+            &account,
+            NaiveDate::from_ymd_opt(2026, 8, 11).expect("date"),
+            Some(49399.0),
+        );
+        assert!(
+            note.contains("昨日盈亏 -426.05"),
+            "unexpected note: {note}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_br236_keepalive_gate {
+    use super::off_session_keepalive_due;
+    use stock_analysis::calendar::MarketSession;
+
+    /// BR-236: 六枚举门控全表 — 仅午休/盘后需要 keepalive 保活。
+    #[test]
+    fn gate_table_all_six_sessions() {
+        assert!(off_session_keepalive_due(MarketSession::LunchBreak));
+        assert!(off_session_keepalive_due(MarketSession::AfterHours));
+        assert!(!off_session_keepalive_due(MarketSession::Closed));
+        assert!(!off_session_keepalive_due(MarketSession::Auction));
+        assert!(!off_session_keepalive_due(MarketSession::Morning));
+        assert!(!off_session_keepalive_due(MarketSession::Afternoon));
+    }
 }
 
 /// v41 + v51: 周期刷新 banner (从 AccountMode + DataMode 评估结果合并)
@@ -2515,6 +2696,98 @@ async fn data_mode_monitor_loop() {
     run_data_mode_scheduler(
         data_mode_evaluation_interval(DATA_MODE_EVALUATION_PERIOD),
         evaluate_data_mode_hook,
+    )
+    .await;
+}
+
+/// BR-236 (2026-08-12): 午休/盘后保持 Quote capability 新鲜 (DataMode Full)。
+/// tick 循环在午休 sleep / 盘后 break (main.rs:9187-9197), 无调用者执行
+/// fetch_position_quotes → 无 Quote mark → 120s 门过期 → Unsafe。keepalive
+/// 在这两个时段每 60s 拉一次持仓行情 (网关层 BR-236 二级判定放行当日
+/// 最后成交价), 成功即 mark。失败 warn 出声且不 mark → DataMode 诚实降级。
+/// 周末/节假日 current_session()==Closed → 不运行 (零调用)。
+fn off_session_keepalive_due(session: MarketSession) -> bool {
+    matches!(
+        session,
+        MarketSession::LunchBreak | MarketSession::AfterHours
+    )
+}
+
+const OFF_SESSION_KEEPALIVE_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 会话边界 info 节流 — 每 (北京日期, 会话) 进入时打一次, 避免 60s 周期
+/// 重复刷信息。
+static OFF_SESSION_KEEPALIVE_ANNOUNCED: std::sync::Mutex<Option<(chrono::NaiveDate, bool)>> =
+    std::sync::Mutex::new(None);
+
+async fn off_session_quote_keepalive_loop() {
+    log::info!(
+        "[BR-236] off-session quote keepalive scheduler started period={}s",
+        OFF_SESSION_KEEPALIVE_PERIOD.as_secs()
+    );
+    run_data_mode_scheduler(
+        data_mode_evaluation_interval(OFF_SESSION_KEEPALIVE_PERIOD),
+        || async {
+            let session = stock_analysis::calendar::current_session();
+            if !off_session_keepalive_due(session) {
+                return;
+            }
+            let today = chrono::Local::now().date_naive();
+            let is_lunch = matches!(session, MarketSession::LunchBreak);
+            if let Ok(mut announced) = OFF_SESSION_KEEPALIVE_ANNOUNCED.lock() {
+                if *announced != Some((today, is_lunch)) {
+                    *announced = Some((today, is_lunch));
+                    log::info!(
+                        "[BR-236] off-session quote keepalive active session={:?} date={today}",
+                        session
+                    );
+                }
+            }
+            match tokio::task::spawn_blocking(crate::market_data::fetch_position_quotes).await {
+                Ok(Ok(quotes)) if !quotes.is_empty() => {
+                    // mark 在 fetch_position_quotes 内部完成 (bin/monitor/market_data.rs:118)
+                    log::debug!(
+                        "[BR-236] off-session keepalive refreshed positions={}",
+                        quotes.len()
+                    );
+                }
+                Ok(Ok(_)) => {
+                    // 快照缺失/过期且本地无持仓: 兜底探测基准代码 (与盘前
+                    // 探测 main.rs:7641 同款, mark 在 fetch_realtime_quote_batch :136)。
+                    let probe = ["000001", "600000", "300750"]
+                        .iter()
+                        .map(|code| code.to_string())
+                        .collect::<Vec<_>>();
+                    match tokio::task::spawn_blocking(move || {
+                        crate::market_data::fetch_realtime_quotes(&probe)
+                    })
+                    .await
+                    {
+                        Ok(Ok(rows)) if !rows.is_empty() => {
+                            log::debug!(
+                                "[BR-236] off-session keepalive probe fallback rows={}",
+                                rows.len()
+                            );
+                        }
+                        Ok(Ok(_)) => {
+                            log::warn!("[BR-236] off-session keepalive probe returned no rows");
+                        }
+                        Ok(Err(error)) => {
+                            log::warn!("[BR-236] off-session keepalive probe failed: {error}");
+                        }
+                        Err(error) => {
+                            log::warn!("[BR-236] off-session keepalive probe join failed: {error}");
+                        }
+                    }
+                }
+                Ok(Err(error)) => {
+                    log::warn!("[BR-236] off-session quote keepalive failed: {error}");
+                }
+                Err(error) => {
+                    log::warn!("[BR-236] off-session keepalive join failed: {error}");
+                }
+            }
+        },
     )
     .await;
 }
@@ -4383,7 +4656,8 @@ async fn main() {
             tokio::join!(
                 monitor_loop(),
                 news_monitor_loop(selection_v2_enabled),
-                data_mode_monitor_loop()
+                data_mode_monitor_loop(),
+                off_session_quote_keepalive_loop()
             );
         };
 
@@ -4734,7 +5008,8 @@ async fn post_session_review_scheduler(selection_v2_enabled: bool) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut state: Option<review_batch::ReviewScheduleState> = None;
-    let mut valuation_date: Option<chrono::NaiveDate> = None;
+    // BR-236 Fix B (2026-08-12): (估值日, 快照 evidence_sha256) — 快照变化即重算
+    let mut valuation_state: Option<(chrono::NaiveDate, String)> = None;
     let mut ai_analysis_date: Option<chrono::NaiveDate> = None;
 
     log::info!("[复盘调度][BR-139] started threshold=19:00 interval=60s");
@@ -4791,20 +5066,45 @@ async fn post_session_review_scheduler(selection_v2_enabled: bool) {
             continue;
         }
 
-        if valuation_date != Some(now.date_naive())
-            && closing_valuation_runtime::eligible_after_close(now.fixed_offset())
-        {
-            match closing_valuation_runtime::run_closing_valuation_once(now.date_naive()).await {
-                Ok(receipt) => {
-                    log::info!(
-                        "[BR-147] closing valuation persisted: run_id={} inserted={}",
-                        receipt.run_id,
-                        receipt.inserted
-                    );
-                    valuation_date = Some(now.date_naive());
-                    refresh_closing_valuation_note();
+        if closing_valuation_runtime::eligible_after_close(now.fixed_offset()) {
+            // BR-236 Fix B: 估值基准随快照重算 — 快照 evidence_sha256 变化（新快照
+            // 导入）→ 重跑当日估值。幂等 insert（内容哈希 run_id），快照变了 →
+            // run_id 变 → 新行；latest view 按 price_date DESC, id DESC → 新行胜出
+            // (database/closing_valuation.rs:104/145-153)。失败不更新 state → 下
+            // tick 重试（现状语义）。竞态：本 tick 取的 sha 与 run 内部实际快照差
+            // 一个 tick，幂等 + 下 tick 自愈。
+            let snapshot_sha =
+                match stock_analysis::database::user_position_snapshot::latest_user_position_snapshot()
+                {
+                    Ok(Some(s)) => s.evidence_sha256,
+                    Ok(None) => {
+                        log::debug!("[BR-147] no user position snapshot — valuation uses derived positions");
+                        String::new()
+                    }
+                    Err(error) => {
+                        log::warn!("[BR-147] snapshot lookup failed ({error}); retrying next tick");
+                        String::new()
+                    }
+                };
+            let due_for_date = valuation_state.as_ref().map(|(d, _)| *d) != Some(now.date_naive())
+                || valuation_state
+                    .as_ref()
+                    .map(|(_, sha)| sha != &snapshot_sha)
+                    .unwrap_or(false);
+            if due_for_date {
+                match closing_valuation_runtime::run_closing_valuation_once(now.date_naive()).await {
+                    Ok(receipt) => {
+                        log::info!(
+                            "[BR-147] closing valuation persisted: run_id={} inserted={} snapshot_sha={}",
+                            receipt.run_id,
+                            receipt.inserted,
+                            snapshot_sha
+                        );
+                        valuation_state = Some((now.date_naive(), snapshot_sha));
+                        refresh_closing_valuation_note();
+                    }
+                    Err(error) => log::error!("[BR-147] closing valuation failed: {error}"),
                 }
-                Err(error) => log::error!("[BR-147] closing valuation failed: {error}"),
             }
         }
 
@@ -4812,7 +5112,9 @@ async fn post_session_review_scheduler(selection_v2_enabled: bool) {
         // provider-batch, or canonical decision identity. Mark the daily
         // occurrence handled without entering model/quote acquisition or a
         // counted ReviewSignal sink.
-        if valuation_date == Some(now.date_naive()) && ai_analysis_date != Some(now.date_naive()) {
+        if valuation_state.as_ref().map(|(d, _)| *d) == Some(now.date_naive())
+            && ai_analysis_date != Some(now.date_naive())
+        {
             ai_analysis_date = Some(now.date_naive());
             log::warn!(
                 "[复盘调度][AI][BR-192] capability_unavailable=review_signal_counted_binding_unavailable; \
@@ -5020,16 +5322,19 @@ fn build_template_test_batches(
 
 impl TemplateTestSummary {
     fn validate(self) -> Result<(), String> {
-        let activated_news = self.family_active_total == 54;
+        // BR-236 同步: R-13 补录 manifest family (br196_test_delivery) 后
+        // active 54→55 (未激活 news) / 56→57 (激活), total 70→71;
+        // WatchlistTracking PushKind 入 ALL_PUSH_KINDS 后 kind total 60→61。
+        let activated_news = self.family_active_total == 57;
         let expected_family = if activated_news {
-            (54, 11, 3, 68)
+            (57, 11, 3, 71)
         } else {
-            (52, 13, 3, 68)
+            (55, 13, 3, 71)
         };
         let expected_kind = if activated_news {
-            (50, 9, 0, 59)
+            (52, 9, 0, 61)
         } else {
-            (48, 11, 0, 59)
+            (50, 11, 0, 61)
         };
         let lifecycle_complete = self.manifest_version == br196_test_delivery::MANIFEST_VERSION
             && self.manifest_sha256.len() == 64
@@ -5303,15 +5608,15 @@ mod tests_br196_monitor_test_acceptance {
             manifest_sha256: "a".repeat(64),
             news_capability_generation: 1,
             news_capability_sha256: "b".repeat(64),
-            family_active_total: 52,
+            family_active_total: 55,
             family_disabled_total: 13,
             family_retired_total: 3,
-            family_total: 68,
-            push_kind_active_total: 48,
+            family_total: 71,
+            push_kind_active_total: 50,
             push_kind_disabled_total: 11,
             push_kind_retired_total: 0,
-            push_kind_total: 59,
-            rendered_family_total: 52,
+            push_kind_total: 61,
+            rendered_family_total: 55,
             governance_smoke_attempted: 6,
             governance_smoke_passed: 6,
             live_acceptance_opted_in: false,
@@ -5323,7 +5628,7 @@ mod tests_br196_monitor_test_acceptance {
             batches_pushed: 0,
             families_pushed: 0,
             receipt_audit_appended: 0,
-            explicit_dry_run_family_total: 52,
+            explicit_dry_run_family_total: 55,
             failed: 0,
         }
     }
@@ -5368,7 +5673,7 @@ mod tests_br196_monitor_test_acceptance {
     fn br196_renderer_catalog_is_closed_unique_and_nonempty() {
         let catalog = push_templates::build_test_template_catalog("2026-07-31", "10:30")
             .expect("complete TEST_CODE renderer catalog");
-        assert_eq!(catalog.len(), 53);
+        assert_eq!(catalog.len(), 54);
         let ids = catalog
             .iter()
             .map(|preview| preview.template_id)
@@ -5689,8 +5994,10 @@ async fn push_e2e_14x_templates(
         continuous_count: 3,
 
         leading_names: vec!["深南电路", "沪电股份"],
+        leading_codes: vec!["002916", "002463"],
 
         other_names: vec!["兴森科技"],
+        other_codes: vec!["002436"],
         watch_point: Some("放量后回踩关注"),
     });
 

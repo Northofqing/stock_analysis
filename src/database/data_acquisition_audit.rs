@@ -215,8 +215,12 @@ fn calculate_record_hash(
 pub(super) fn validate_data_acquisition_audit_chain(
     conn: &mut SqliteConnection,
 ) -> diesel::QueryResult<String> {
-    let audits = load_audit_rows(conn)?;
-    let chain = load_chain_rows(conn)?;
+    // 2026-08-12: 两次 SELECT 包进同一 DEFERRED 事务, 保证同一快照 —
+    // 并发写者 (如回填工具 vs 运行中 monitor) 在两次读取之间提交时,
+    // 裸 SELECT 会看到 audit/chain 各一瞬, 误报 length mismatch。
+    let (audits, chain) = conn.transaction::<_, diesel::result::Error, _>(|conn| {
+        Ok((load_audit_rows(conn)?, load_chain_rows(conn)?))
+    })?;
     if audits.len() != chain.len() {
         return Err(audit_error(format!(
             "BR-159 acquisition audit hash chain length mismatch: audit_rows={}, chain_rows={}",

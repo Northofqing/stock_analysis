@@ -175,6 +175,7 @@ fn review_reason_category(task: ReviewTask, outcome: &ReviewTaskOutcome) -> Stri
                 ReviewTask::R09 => "provider_top_n_review_failed",
                 ReviewTask::R11 => "position_review_failed",
                 ReviewTask::R12 => "paper_backtest_failed",
+                ReviewTask::R13 => "watchlist_tracking_failed",
                 ReviewTask::A10 => "catalyst_review_failed",
                 ReviewTask::A01 => "virtual_observation_review_failed",
             }
@@ -390,6 +391,7 @@ pub enum ReviewTask {
     R09,
     R11,
     R12,
+    R13,
     A10,
     A01,
 }
@@ -402,7 +404,7 @@ pub enum ReviewTaskDependency {
 }
 
 impl ReviewTask {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::R02,
         Self::R03,
         Self::R04,
@@ -413,6 +415,7 @@ impl ReviewTask {
         Self::R09,
         Self::R11,
         Self::R12,
+        Self::R13,
         Self::A10,
         Self::A01,
     ];
@@ -429,6 +432,7 @@ impl ReviewTask {
             Self::R09 => "R-09",
             Self::R11 => "R-11",
             Self::R12 => "R-12",
+            Self::R13 => "R-13",
             Self::A10 => "A-10",
             Self::A01 => "A-01",
         }
@@ -450,6 +454,7 @@ impl ReviewTask {
             Self::R09 => "eastmoney_provider_top_n",
             Self::R11 => "user_confirmed_position_summary",
             Self::R12 => "paper_trades_15min_backtest",
+            Self::R13 => "catalyst_watchlist_t1_tracking",
             Self::A10 => "chain_rotation_security_master",
             Self::A01 => "virtual_observation_kline",
         }
@@ -463,6 +468,7 @@ impl ReviewTask {
             | Self::R09
             | Self::R11
             | Self::R12
+            | Self::R13
             | Self::A10
             | Self::A01 => ReviewTaskDependency::SourceOnly,
             // BR-194 §4.2: R-03 读的是 portfolio projection，不是 verified broker
