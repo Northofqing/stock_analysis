@@ -10,6 +10,7 @@ use chrono::NaiveDate;
 
 use crate::data_gateway::historical_bars::HistoricalBarsGateway;
 use crate::data_provider::limit_status::LimitStatusCalculator;
+use crate::data_provider::KlineData;
 use crate::database::catalyst_watchlist::{WatchEntry, WatchOutcome, WatchlistSnapshot};
 
 /// 涨停价容差: limit_status.rs fill_limit_flags 同款 ±0.005 (容忍浮点误差)
@@ -67,6 +68,27 @@ pub fn check_entry(
     }
 }
 
+/// 从日线批次取「最新 + 前一根」。
+/// 降序契约: `AdmittedDailyBars.records()` 经 validate_daily_kline_structure
+/// 还原为降序 (最新在前, data_quality.rs 还原降序契约), 即 [0]=今日, [1]=昨收。
+/// 防御: 若收到升序批次 (旧→新) 兼容识别并 warn 出声 (不静默), 取末尾两根。
+pub fn latest_and_prev(records: &[KlineData]) -> Option<(&KlineData, &KlineData)> {
+    if records.len() < 2 {
+        return None;
+    }
+    let first = &records[0];
+    let last = &records[records.len() - 1];
+    if first.date < last.date {
+        log::warn!(
+            "[R-13] daily batch ascending (oldest first), treating last bar {} as latest",
+            last.date
+        );
+        Some((last, &records[records.len() - 2]))
+    } else {
+        Some((first, &records[1]))
+    }
+}
+
 /// 核对整份名单 (网络/DB 薄壳, 调用方放入 spawn_blocking)。
 /// 每只拉 2 根日线: 最新 = 今日 (必须日期匹配且已 settled, 盘后 19:00 满足),
 /// 前一根 close = 昨收。单只失败/数据不齐 → warn 出声跳过 (skipped);
@@ -81,10 +103,9 @@ pub fn check_watchlist_today(
     for entry in snapshot.leading.iter().chain(snapshot.other.iter()) {
         match gateway.required_daily_bars(&entry.code, 2) {
             Ok(batch) => {
-                let bars = batch.records();
-                let Some(latest) = bars.last() else {
+                let Some((latest, prev)) = latest_and_prev(batch.records()) else {
                     log::warn!(
-                        "[R-13] {} {} empty daily batch, skip",
+                        "[R-13] {} {} fewer than 2 daily bars, skip",
                         entry.code,
                         entry.name
                     );
@@ -111,15 +132,6 @@ pub fn check_watchlist_today(
                     skipped.push(entry.code.clone());
                     continue;
                 }
-                let Some(prev) = bars.get(bars.len() - 2) else {
-                    log::warn!(
-                        "[R-13] {} {} fewer than 2 daily bars, skip",
-                        entry.code,
-                        entry.name
-                    );
-                    skipped.push(entry.code.clone());
-                    continue;
-                };
                 outcomes.push(check_entry(
                     snapshot.watch_date,
                     entry,
@@ -218,6 +230,7 @@ pub fn render_watchlist_tracking(snapshot: &WatchlistSnapshot, outcomes: &[Watch
 mod tests {
     use super::*;
     use crate::database::catalyst_watchlist::WatchEntry;
+    use crate::data_provider::KlineData;
 
     fn entry(code: &str, name: &str, streak: i64) -> WatchEntry {
         WatchEntry {
@@ -225,6 +238,68 @@ mod tests {
             name: name.to_string(),
             streak,
         }
+    }
+
+    fn kline(date: &str, close: f64) -> KlineData {
+        KlineData {
+            date: NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume: 100.0,
+            amount: 1000.0,
+            pct_chg: 0.0,
+            intraday_price: None,
+            settled: true,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            eps: None,
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
+            is_limit_up: false,
+            is_limit_down: false,
+            is_suspended: false,
+            adjust: crate::data_provider::AdjustType::None,
+        }
+    }
+
+    #[test]
+    fn latest_and_prev_descending_contract() {
+        // 生产契约: 降序 (最新在前, [0]=今日 8/12, [1]=昨日 8/11)
+        let bars = vec![kline("2026-08-12", 12.75), kline("2026-08-11", 11.59)];
+        let (latest, prev) = latest_and_prev(&bars).expect("2 bars");
+        assert_eq!(latest.date, NaiveDate::from_ymd_opt(2026, 8, 12).unwrap());
+        assert_eq!(latest.close, 12.75);
+        assert_eq!(prev.date, NaiveDate::from_ymd_opt(2026, 8, 11).unwrap());
+        assert_eq!(prev.close, 11.59);
+    }
+
+    #[test]
+    fn latest_and_prev_ascending_defensive() {
+        // 防御: 升序批次 (旧→新) 取末尾两根, 不静默
+        let bars = vec![kline("2026-08-11", 11.59), kline("2026-08-12", 12.75)];
+        let (latest, prev) = latest_and_prev(&bars).expect("2 bars");
+        assert_eq!(latest.date, NaiveDate::from_ymd_opt(2026, 8, 12).unwrap());
+        assert_eq!(latest.close, 12.75);
+        assert_eq!(prev.close, 11.59);
+    }
+
+    #[test]
+    fn latest_and_prev_fewer_than_two() {
+        assert!(latest_and_prev(&[]).is_none());
+        assert!(latest_and_prev(&[kline("2026-08-12", 12.75)]).is_none());
     }
 
     #[test]
