@@ -902,6 +902,13 @@ pub async fn inspect_review_task_occurrence(
         stock_analysis::durable_delivery::PushKind::ReviewLhb
             | stock_analysis::durable_delivery::PushKind::EventCalendar
             | stock_analysis::durable_delivery::PushKind::ReviewProviderTopN
+            // 2026-08-12: R-03/R-11/R-12/R-13/A-10 复盘 dispatcher 升级 counted,
+            // preflight 允许集与 durable_kind_and_sub_kind 的 review 映射同步。
+            | stock_analysis::durable_delivery::PushKind::IndustryChain
+            | stock_analysis::durable_delivery::PushKind::PositionReview
+            | stock_analysis::durable_delivery::PushKind::ReviewBacktest
+            | stock_analysis::durable_delivery::PushKind::WatchlistTracking
+            | stock_analysis::durable_delivery::PushKind::CatalystReview
     ) {
         return Err(format!(
             "BR-200 unsupported review terminal preflight kind {push_kind}"
@@ -1464,6 +1471,13 @@ fn durable_kind_and_sub_kind_with_override(
         // (板块级全局事件, scope=Global, origin=InternalDurable)。
         K::SectorTop => (D::SectorTop, DeliverySubKind::None),
         K::SectorAnomaly => (D::SectorAnomaly, DeliverySubKind::None),
+        // 2026-08-12: 复盘批量 R-03/R-11/R-12/R-13/A-10 升级 counted —
+        // 修复重启后错过补偿整批重跑导致 5 路重复推送 (R-13 首推验证时暴露)。
+        K::IndustryChain => (D::IndustryChain, DeliverySubKind::None),
+        K::PositionReview => (D::PositionReview, DeliverySubKind::None),
+        K::ReviewBacktest => (D::ReviewBacktest, DeliverySubKind::None),
+        K::WatchlistTracking => (D::WatchlistTracking, DeliverySubKind::None),
+        K::CatalystReview => (D::CatalystReview, DeliverySubKind::None),
         K::FactorIC => (D::DailyReport, DeliverySubKind::FactorIC),
         K::SectorTier => (D::DailyReport, DeliverySubKind::SectorTier),
         K::CapitalVerify => (D::DailyReport, DeliverySubKind::CapitalVerify),
@@ -2026,6 +2040,30 @@ mod tests {
             "task_transition_basis": transition_basis
         });
         r04_binding_from_canonical(business_date, canonical)
+    }
+
+    #[test]
+    fn br192_review_batch_dispatchers_are_counted_kinds() {
+        // 2026-08-12: R-03/R-11/R-12/R-13/A-10 复盘 dispatcher 升级 counted —
+        // 重启错过补偿整批重跑时 preflight 复用, 不再重复推送 (21:13:07 首现)。
+        use stock_analysis::durable_delivery::{DeliverySubKind, PushKind as DurableKind};
+        for (monitor_kind, durable_kind) in [
+            (PushKind::IndustryChain, DurableKind::IndustryChain),
+            (PushKind::PositionReview, DurableKind::PositionReview),
+            (PushKind::ReviewBacktest, DurableKind::ReviewBacktest),
+            (PushKind::WatchlistTracking, DurableKind::WatchlistTracking),
+            (PushKind::CatalystReview, DurableKind::CatalystReview),
+        ] {
+            assert_eq!(
+                durable_kind_and_sub_kind(monitor_kind),
+                Some((durable_kind, DeliverySubKind::None)),
+                "{monitor_kind:?} must map to a durable counted kind"
+            );
+            assert!(
+                is_counted_kind(monitor_kind),
+                "{monitor_kind:?} must be counted"
+            );
+        }
     }
 
     #[test]

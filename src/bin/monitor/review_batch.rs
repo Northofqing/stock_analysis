@@ -2656,6 +2656,7 @@ mod tests {
                 ReviewTask::R09,
                 ReviewTask::R11,
                 ReviewTask::R12,
+                ReviewTask::R13,
                 ReviewTask::A10,
                 ReviewTask::A01,
                 ReviewTask::R02,
@@ -2671,6 +2672,7 @@ mod tests {
             ReviewTask::R09,
             ReviewTask::R11,
             ReviewTask::R12,
+            ReviewTask::R13,
             ReviewTask::A10,
             ReviewTask::A01,
         ] {
@@ -2806,14 +2808,24 @@ mod tests {
     #[test]
     fn br192_r09_catalog_identity_and_audit_source_are_stable() {
         assert!(ReviewTask::ALL.contains(&ReviewTask::R09));
-        assert_eq!(ReviewTask::ALL.len(), 12);
+        assert_eq!(ReviewTask::ALL.len(), 13);
         assert!(ReviewTask::ALL.contains(&ReviewTask::R07));
         assert!(ReviewTask::ALL.contains(&ReviewTask::R11));
         assert!(ReviewTask::ALL.contains(&ReviewTask::R12));
+        assert!(ReviewTask::ALL.contains(&ReviewTask::R13));
         assert_eq!(ReviewTask::R12.label(), "R-12");
         assert_eq!(ReviewTask::R12.source_label(), "paper_trades_15min_backtest");
         assert_eq!(
             ReviewTask::R12.dependency(),
+            ReviewTaskDependency::SourceOnly
+        );
+        assert_eq!(ReviewTask::R13.label(), "R-13");
+        assert_eq!(
+            ReviewTask::R13.source_label(),
+            "catalyst_watchlist_t1_tracking"
+        );
+        assert_eq!(
+            ReviewTask::R13.dependency(),
             ReviewTaskDependency::SourceOnly
         );
         assert_eq!(ReviewTask::R09.label(), "R-09");

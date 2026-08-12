@@ -4979,19 +4979,21 @@ fn reconcile_terminal(
 }
 
 #[test]
-fn policy_catalog_has_seventeen_kinds_and_twenty_rows() {
+fn policy_catalog_has_twenty_two_kinds_and_twenty_five_rows() {
     // 2026-08-07: I-09 SectorTop / I-09A SectorAnomaly 升级 counted,
     // policy catalog 15 kind/18 row → 17 kind/20 row。
+    // 2026-08-12: R-03/R-11/R-12/R-13/A-10 复盘 dispatcher 升级 counted
+    // (重启错过补偿重复推送修复) → 17 kind/20 row → 22 kind/25 row。
     let fixture = Fixture::new("CATALOG");
     assert_eq!(
         fixture.query_i64("SELECT COUNT(*) FROM delivery_policy_catalog"),
-        20
+        25
     );
     assert_eq!(
         fixture.query_i64("SELECT COUNT(DISTINCT push_kind) FROM delivery_policy_catalog"),
-        17
+        22
     );
-    assert_eq!(compiled_policy_catalog().len(), 20);
+    assert_eq!(compiled_policy_catalog().len(), 25);
 }
 
 #[test]

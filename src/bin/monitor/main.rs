@@ -5353,8 +5353,8 @@ impl TemplateTestSummary {
                 self.push_kind_total,
             ) == expected_kind;
         let render_and_smoke_complete = self.rendered_family_total == self.family_active_total
-            && self.governance_smoke_attempted == 6
-            && self.governance_smoke_passed == 6;
+            && self.governance_smoke_attempted == 4
+            && self.governance_smoke_passed == 4;
         let explicit_dry_run = self.explicit_dry_run_family_total > 0;
         let disposition_complete = if explicit_dry_run {
             !self.live_acceptance_opted_in
@@ -5617,8 +5617,8 @@ mod tests_br196_monitor_test_acceptance {
             push_kind_retired_total: 0,
             push_kind_total: 61,
             rendered_family_total: 55,
-            governance_smoke_attempted: 6,
-            governance_smoke_passed: 6,
+            governance_smoke_attempted: 4,
+            governance_smoke_passed: 4,
             live_acceptance_opted_in: false,
             target_authority_status: "not_constructed_explicit_dry_run",
             target_identity_sha256: None,
@@ -5673,7 +5673,7 @@ mod tests_br196_monitor_test_acceptance {
     fn br196_renderer_catalog_is_closed_unique_and_nonempty() {
         let catalog = push_templates::build_test_template_catalog("2026-07-31", "10:30")
             .expect("complete TEST_CODE renderer catalog");
-        assert_eq!(catalog.len(), 54);
+        assert_eq!(catalog.len(), 55);
         let ids = catalog
             .iter()
             .map(|preview| preview.template_id)
@@ -5948,18 +5948,20 @@ async fn push_e2e_14x_templates(
         None,
     );
 
-    log::info!("[v70] R-03 推 ({} 字)", r03.chars().count());
+    log::info!("[v70] R-03 渲染 smoke ({} 字)", r03.chars().count());
 
-    let r03_outcome = notify::push_br196_governance_smoke_v3(
-        &r03,
-        smoke_context.dispatch("R-03-industry-chain", notify::PushKind::IndustryChain, None)?,
-    )
-    .await;
-
-    // BR-192: TEST_CODE constants cannot stand in for immutable provider
-    // batches, persisted review decisions, or exact delivery subjects.
-    // Preserve the non-counted renderer smoke below, but stop before
-    // assembling either counted review card.
+    // BR-192 (2026-08-12): R-03 升级 counted — TEST_CODE fixture 不能替代不可变
+    // binding (与 R-04/R-05 同规则), 保留渲染 smoke, 治理路径跳过出声。
+    log::warn!(
+        "[v70][BR-051][BR-192] capability_unavailable=review_industry_chain_counted_binding_unavailable; \
+         skipped before TEST_CODE fixture assembly"
+    );
+    push_templates::log_dispatcher_attempt(
+        "R-03",
+        false,
+        0,
+        "review_industry_chain_counted_binding_unavailable",
+    );
     log::warn!(
         "[v70][BR-051][BR-192] capability_unavailable=review_lhb_counted_binding_unavailable; \
          skipped before TEST_CODE fixture assembly"
@@ -6001,17 +6003,20 @@ async fn push_e2e_14x_templates(
         watch_point: Some("放量后回踩关注"),
     });
 
-    log::info!("[v70] A-10 推 ({} 字)", a10.chars().count());
+    log::info!("[v70] A-10 渲染 smoke ({} 字)", a10.chars().count());
 
-    let a10_outcome = notify::push_br196_governance_smoke_v3(
-        &a10,
-        smoke_context.dispatch(
-            "A-10-catalyst-review",
-            notify::PushKind::CatalystReview,
-            None,
-        )?,
-    )
-    .await;
+    // BR-192 (2026-08-12): A-10 升级 counted — TEST_CODE fixture 不能替代不可变
+    // binding (与 R-04/R-05 同规则), 保留渲染 smoke, 治理路径跳过出声。
+    log::warn!(
+        "[v70][BR-051][BR-192] capability_unavailable=review_catalyst_counted_binding_unavailable; \
+         skipped before TEST_CODE fixture assembly"
+    );
+    push_templates::log_dispatcher_attempt(
+        "A-10",
+        false,
+        0,
+        "review_catalyst_counted_binding_unavailable",
+    );
 
     log::info!("[v70] e2e 14x 模板跑完");
     Ok(vec![
@@ -6024,16 +6029,6 @@ async fn push_e2e_14x_templates(
             family_key: "T-11-auction-volume",
             push_kind: notify::PushKind::AuctionVolume,
             outcome: p02_outcome,
-        },
-        br196_test_delivery::GovernanceSmokeDisposition {
-            family_key: "R-03-industry-chain",
-            push_kind: notify::PushKind::IndustryChain,
-            outcome: r03_outcome,
-        },
-        br196_test_delivery::GovernanceSmokeDisposition {
-            family_key: "A-10-catalyst-review",
-            push_kind: notify::PushKind::CatalystReview,
-            outcome: a10_outcome,
         },
     ])
 }

@@ -1572,7 +1572,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial(cooldown_memo)]
-    fn br160_source_batch_gate_and_l7_do_not_require_account_banner() {
+    fn br160_legacy_source_batch_gate_fails_closed_for_counted_catalyst_review() {
         let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         _reset_dedup_for_test();
         let previous_banner = crate::LATEST_BANNER
@@ -1588,34 +1588,16 @@ mod tests {
         )
         .expect("valid A-10 source binding");
 
+        // 2026-08-12: CatalystReview 升级 counted (BR-192, A-10 迁移) →
+        // 旧 L4 source-batch 路径 fail-closed (counted_binding_required);
+        // 生产 A-10 已改走 push_counted_with_binding (counted 路径不要求 banner)。
         let gate = v14_gate_source_batch(&evidence);
-        let record_result = match &gate {
-            V14Gate::Approved(event) => {
-                match &event.payload {
-                    SignalPayload::PostSessionReview(payload) => {
-                        assert_eq!(payload.review_type.as_deref(), Some("catalyst_review"));
-                        let summary = payload.summary.as_deref().expect("source batch summary");
-                        assert!(summary.contains("chain-batch:TEST_CODE_A10_NO_BANNER"));
-                        assert!(summary.contains(&"b".repeat(64)));
-                    }
-                    other => panic!("A-10 must retain source-batch provenance, got {other:?}"),
-                }
-                v14_record_delivery(
-                    event,
-                    PushKind::CatalystReview,
-                    "TEST_CODE_A10",
-                    true,
-                    "dry_run",
-                )
-            }
-            other => Err(format!(
-                "source batch gate rejected without banner: {other:?}"
-            )),
-        };
+        assert!(
+            matches!(gate, V14Gate::Denied(ref reason) if reason == "counted_binding_required"),
+            "legacy source-batch gate must fail closed for counted kinds, gate={gate:?}"
+        );
 
         *crate::LATEST_BANNER.lock().expect("restore banner lock") = previous_banner;
-        assert!(matches!(gate, V14Gate::Approved(_)), "gate={gate:?}");
-        assert!(record_result.is_ok(), "record={record_result:?}");
     }
 
     #[test]

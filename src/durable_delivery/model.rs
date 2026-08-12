@@ -176,10 +176,19 @@ pub enum PushKind {
     ReviewProviderTopN,
     SectorTop,
     SectorAnomaly,
+    // 2026-08-12: 复盘批量 dispatcher 升级 counted — R-13 重启后重复推送根因
+    // (R-03/R-11/R-12/R-13/A-10 未走 BR-192 计数链, 错过补偿重跑整批时无
+    // durable 决策可复用 → 5 路重复推送)。以下 5 个每日复盘 kind 与
+    // ReviewLhb/ReviewProviderTopN 同级: BusinessDateOnce + dispatch-time preflight。
+    IndustryChain,
+    PositionReview,
+    ReviewBacktest,
+    WatchlistTracking,
+    CatalystReview,
 }
 
 impl PushKind {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 22] = [
         Self::HoldingPlan,
         Self::HoldingEvent,
         Self::T0Advice,
@@ -197,6 +206,11 @@ impl PushKind {
         Self::ReviewProviderTopN,
         Self::SectorTop,
         Self::SectorAnomaly,
+        Self::IndustryChain,
+        Self::PositionReview,
+        Self::ReviewBacktest,
+        Self::WatchlistTracking,
+        Self::CatalystReview,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -218,6 +232,11 @@ impl PushKind {
             Self::ReviewProviderTopN => "ReviewProviderTopN",
             Self::SectorTop => "SectorTop",
             Self::SectorAnomaly => "SectorAnomaly",
+            Self::IndustryChain => "IndustryChain",
+            Self::PositionReview => "PositionReview",
+            Self::ReviewBacktest => "ReviewBacktest",
+            Self::WatchlistTracking => "WatchlistTracking",
+            Self::CatalystReview => "CatalystReview",
         }
     }
 
@@ -240,6 +259,11 @@ impl PushKind {
             Self::ReviewProviderTopN => "review_provider_top_n_v1",
             Self::SectorTop => "sector_top_v1",
             Self::SectorAnomaly => "sector_anomaly_v1",
+            Self::IndustryChain => "industry_chain_v1",
+            Self::PositionReview => "position_review_v1",
+            Self::ReviewBacktest => "review_backtest_v1",
+            Self::WatchlistTracking => "watchlist_tracking_v1",
+            Self::CatalystReview => "catalyst_review_v1",
         }
     }
 
@@ -403,6 +427,14 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // 2026-08-07: I-09/I-09A 板块参考类升级 counted — 当日一次。
         (SectorTop, Global, Some(86_400), BusinessDateOnce),
         (SectorAnomaly, Global, Some(86_400), BusinessDateOnce),
+        // 2026-08-12: 复盘批量 R-03/R-11/R-12/R-13/A-10 升级 counted —
+        // 与 ReviewLhb 同级 (每日一次, BusinessDateOnce + task binding),
+        // 重启错过补偿时经 preflight 复用决策, 不再重复推送。
+        (IndustryChain, Global, Some(86_400), BusinessDateOnce),
+        (PositionReview, Global, Some(86_400), BusinessDateOnce),
+        (ReviewBacktest, Global, Some(86_400), BusinessDateOnce),
+        (WatchlistTracking, Global, Some(86_400), BusinessDateOnce),
+        (CatalystReview, Global, Some(86_400), BusinessDateOnce),
     ]
     .into_iter()
     .map(

@@ -6069,14 +6069,14 @@ mod tests {
         }
     }
 
-    // ============== v17.x: DISPATCH_TABLE 18 rows 完整性 (BR-234 + 任务#3 + R-12) ==============
+    // ============== v17.x: DISPATCH_TABLE 19 rows 完整性 (BR-234 + 任务#3 + R-12 + R-13) ==============
 
     #[test]
-    fn dispatch_table_size_is_eighteen() {
+    fn dispatch_table_size_is_nineteen() {
         assert_eq!(
             DISPATCH_TABLE.len(),
-            18,
-            "v17.x DISPATCH_TABLE 应 18 rows (3 v17.6 + 6 v17.7 + 6 v17.8 + 1 BR-234 + 1 #3 + 1 R-12)"
+            19,
+            "v17.x DISPATCH_TABLE 应 19 rows (3 v17.6 + 6 v17.7 + 6 v17.8 + 1 BR-234 + 1 #3 + 1 R-12 + 1 R-13)"
         );
     }
 

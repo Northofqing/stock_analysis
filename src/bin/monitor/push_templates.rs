@@ -6132,7 +6132,7 @@ struct ProviderTopNTaskTransitionBasis {
     batch_ids: [String; 2],
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct ExistingReviewTaskTransitionBasis {
     task_identity: String,
     business_date: String,
@@ -8589,6 +8589,32 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
             return crate::review_batch::ReviewTaskOutcome::failed(false, reason);
         }
     };
+    // BR-200: 已投递决策复用 — 重启错过补偿整批重跑防重复 (2026-08-12 21:13:07 首现)。
+    // R-11 文本含非确定性 AI 研判段, preflight 在渲染前短路, 是唯一可靠防线。
+    match crate::durable_delivery_runtime::inspect_review_task_occurrence(
+        trading_date,
+        stock_analysis::durable_delivery::PushKind::PositionReview,
+        crate::review_batch::review_task_identity(
+            trading_date,
+            crate::review_batch::ReviewTask::R11,
+        ),
+    )
+    .await
+    {
+        Ok(Some(evidence)) => {
+            return review_outcome_from_existing_durable(
+                evidence,
+                trading_date,
+                crate::review_batch::ReviewTask::R11,
+            )
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let reason = format!("R-11 durable terminal preflight failed: {error}");
+            log_dispatcher_attempt("R-11", false, 0, &reason);
+            return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
+        }
+    }
 
     let summary = match tokio::task::spawn_blocking(latest_user_account_summary).await {
         Ok(Ok(Some(summary))) => summary,
@@ -8742,15 +8768,43 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
     if !ai_section.is_empty() {
         text.push_str(&ai_section);
     }
-    let result = dispatch_registered_outcome!(
+    // BR-192 counted delivery: 个股明细投影来自持久化收盘估值 (确定性),
+    // 决策身份稳定 → 重启错过补偿批重跑时 preflight 复用, 不再重复推送。
+    let source_binding_canonical = match serde_json::to_vec(&(
+        date,
+        items
+            .iter()
+            .map(|item| {
+                (
+                    item.code.clone(),
+                    item.quantity,
+                    item.cost_price,
+                    item.close,
+                    item.unrealized_pnl,
+                )
+            })
+            .collect::<Vec<_>>(),
+    )) {
+        Ok(canonical) => canonical,
+        Err(error) => {
+            let reason = format!("R-11 source binding serialization failed: {error}");
+            log_dispatcher_attempt("R-11", false, 1, &reason);
+            return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
+        }
+    };
+    let result = dispatch_review_task_counted(
         "R-11-position-review",
         crate::notify::PushKind::PositionReview,
         "position_review_dispatcher",
         "render_position_review",
-        "",
-        None,
-        text
-    );
+        trading_date,
+        crate::review_batch::ReviewTask::R11,
+        items.len(),
+        format!("{date}:position-review"),
+        source_binding_canonical,
+        &text,
+    )
+    .await;
     log_dispatcher_attempt("R-11", result.is_pushed(), 1, "");
     crate::review_batch::ReviewTaskOutcome::from_push_outcome(result, 1)
 }
@@ -8761,10 +8815,38 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
 /// 回测窗口 = 近 30 自然日 (覆盖虚拟仓 7/14 起全部信号); 网络拉取 + SQLite 读表在
 /// spawn_blocking 内, 失败出声 (failed), 单只拉取失败在模块内 warn 跳过。
 async fn dispatch_r12_backtest_outcome(date: &str) -> crate::review_batch::ReviewTaskOutcome {
-    if let Err(error) = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") {
-        let reason = format!("invalid review date {date}: {error}");
-        log_dispatcher_attempt("R-12", false, 0, &reason);
-        return crate::review_batch::ReviewTaskOutcome::failed(false, reason);
+    let today = match chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+        Ok(date) => date,
+        Err(error) => {
+            let reason = format!("invalid review date {date}: {error}");
+            log_dispatcher_attempt("R-12", false, 0, &reason);
+            return crate::review_batch::ReviewTaskOutcome::failed(false, reason);
+        }
+    };
+    // BR-200: 已投递决策复用 — 重启错过补偿整批重跑防重复 (2026-08-12 21:13:07 首现)。
+    match crate::durable_delivery_runtime::inspect_review_task_occurrence(
+        today,
+        stock_analysis::durable_delivery::PushKind::ReviewBacktest,
+        crate::review_batch::review_task_identity(
+            today,
+            crate::review_batch::ReviewTask::R12,
+        ),
+    )
+    .await
+    {
+        Ok(Some(evidence)) => {
+            return review_outcome_from_existing_durable(
+                evidence,
+                today,
+                crate::review_batch::ReviewTask::R12,
+            )
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let reason = format!("R-12 durable terminal preflight failed: {error}");
+            log_dispatcher_attempt("R-12", false, 0, &reason);
+            return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
+        }
     }
     let result = match tokio::task::spawn_blocking(|| {
         stock_analysis::review::backtest::run_full_backtest(30)
@@ -8789,15 +8871,34 @@ async fn dispatch_r12_backtest_outcome(date: &str) -> crate::review_batch::Revie
         return crate::review_batch::ReviewTaskOutcome::no_data("no backtest signals in window");
     }
     let text = stock_analysis::review::backtest::render_r12(&result);
-    let outcome = dispatch_registered_outcome!(
+    // BR-192 counted delivery: 信号计数来自同一回测窗口 (确定性), 决策身份稳定 →
+    // 重启错过补偿批重跑时 preflight 复用, 不再重复推送。
+    let source_binding_canonical = match serde_json::to_vec(&(
+        date,
+        result.virtual_buy.len(),
+        result.virtual_sell.len(),
+        result.boll_macd.len(),
+    )) {
+        Ok(canonical) => canonical,
+        Err(error) => {
+            let reason = format!("R-12 source binding serialization failed: {error}");
+            log_dispatcher_attempt("R-12", false, 1, &reason);
+            return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
+        }
+    };
+    let outcome = dispatch_review_task_counted(
         "R-12-backtest-review",
         crate::notify::PushKind::ReviewBacktest,
         "review_backtest_dispatcher",
         "render_r12_backtest",
-        "",
-        None,
-        text
-    );
+        today,
+        crate::review_batch::ReviewTask::R12,
+        1,
+        format!("{date}:backtest"),
+        source_binding_canonical,
+        &text,
+    )
+    .await;
     log_dispatcher_attempt("R-12", outcome.is_pushed(), 1, "");
     crate::review_batch::ReviewTaskOutcome::from_push_outcome(outcome, 1)
 }
@@ -8855,6 +8956,215 @@ async fn backfill_pending_predictions(days: i64) -> (usize, usize) {
     (total, hit_count)
 }
 
+/// R-13 counted durable delivery — task binding + InternalDurable 证据。
+///
+/// 决策身份由 (business_date, task_identity, 稳定投影, 渲染哈希) 推导:
+/// - 同一核对日重复执行 → 同字节投影 → 同决策身份 → durable ledger 拦截
+///   (immutable conflict, R-07 同款双保险);
+/// - 跨进程重启 → 顶部 preflight (inspect_review_task_occurrence) 直接复用
+///   Delivered 决策, provider_calls=0 sink_calls=0。
+async fn dispatch_r13_counted_delivery(
+    snapshot: &stock_analysis::database::catalyst_watchlist::WatchlistSnapshot,
+    outcomes: &[stock_analysis::database::catalyst_watchlist::WatchOutcome],
+    text: &str,
+    business_date: chrono::NaiveDate,
+) -> crate::notify::PushOutcome {
+    use stock_analysis::database::catalyst_watchlist::WatchEntry;
+    use stock_analysis::durable_delivery::TaskBinding;
+
+    let date = business_date.format("%Y-%m-%d").to_string();
+    let task_identity = crate::review_batch::review_task_identity(
+        business_date,
+        crate::review_batch::ReviewTask::R13,
+    );
+    let transition_basis_canonical =
+        match serde_json::to_vec(&ExistingReviewTaskTransitionBasis {
+            task_identity: task_identity.clone(),
+            business_date: date.clone(),
+            task: "R-13".to_string(),
+            snapshot_size: outcomes.len(),
+        }) {
+            Ok(canonical) => canonical,
+            Err(error) => {
+                let reason = format!("R-13 transition basis serialization failed: {error}");
+                log::error!("[R-13][BR-140][BR-192] {reason}");
+                log_dispatcher_attempt("R-13", false, outcomes.len(), &reason);
+                return crate::notify::PushOutcome::Denied(reason);
+            }
+        };
+    let task_binding = match TaskBinding::new(task_identity.clone(), transition_basis_canonical)
+    {
+        Ok(binding) => binding,
+        Err(error) => {
+            let reason = format!("R-13 task binding rejected: {error}");
+            log::error!("[R-13][BR-140][BR-192] {reason}");
+            log_dispatcher_attempt("R-13", false, outcomes.len(), &reason);
+            return crate::notify::PushOutcome::Denied(reason);
+        }
+    };
+    // 稳定投影: 名单快照 + 核对结果 (同核对日 → 同字节)。WatchEntry/WatchOutcome
+    // 无 Serialize derive, 显式投影避免扩大库层 derive 面。
+    let watch_entries = |entries: &[WatchEntry]| {
+        entries
+            .iter()
+            .map(|entry| (entry.code.clone(), entry.name.clone(), entry.streak))
+            .collect::<Vec<_>>()
+    };
+    let source_binding_canonical = match serde_json::to_vec(&(
+        snapshot.watch_date.format("%Y-%m-%d").to_string(),
+        watch_entries(&snapshot.leading),
+        watch_entries(&snapshot.other),
+        outcomes
+            .iter()
+            .map(|outcome| {
+                (
+                    outcome.code.clone(),
+                    outcome.close,
+                    outcome.change_pct,
+                    outcome.limit_up,
+                    outcome.streak_today,
+                )
+            })
+            .collect::<Vec<_>>(),
+    )) {
+        Ok(canonical) => canonical,
+        Err(error) => {
+            let reason = format!("R-13 source binding serialization failed: {error}");
+            log::error!("[R-13][BR-140][BR-192] {reason}");
+            log_dispatcher_attempt("R-13", false, outcomes.len(), &reason);
+            return crate::notify::PushOutcome::Denied(reason);
+        }
+    };
+    let delivery_subject_hash = crate::review_batch::audit_identity_hash(
+        "watchlist-tracking-delivery-subject",
+        &format!("{date}:{}", snapshot.watch_date),
+    );
+    let counted_binding = match crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        task_identity,
+        source_binding_canonical,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        delivery_subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        Some(task_binding),
+        true,
+    ) {
+        Ok(binding) => binding,
+        Err(reason) => {
+            log::error!("[R-13][BR-140][BR-192] counted binding rejected: {reason}");
+            log_dispatcher_attempt("R-13", false, outcomes.len(), &reason);
+            return crate::notify::PushOutcome::Denied(reason);
+        }
+    };
+    let presentation_token = match crate::presentation_registry::acquire_token(
+        "T1-watch-tracking",
+        crate::notify::PushKind::WatchlistTracking,
+        "watchlist_tracking_dispatcher",
+        "render_watchlist_tracking",
+    ) {
+        Ok(token) => token,
+        Err(reason) => {
+            log::error!(
+                "[BR-196] production presentation token rejected family=T1-watch-tracking reason={}",
+                reason
+            );
+            return crate::notify::PushOutcome::Denied(reason);
+        }
+    };
+    crate::notify::push_counted_with_binding(presentation_token, text, None, counted_binding)
+        .await
+}
+
+/// BR-192 counted delivery shared by the review-batch dispatchers that were
+/// NOT part of the original counted migration (R-03/R-11/R-12/A-10; R-13 keeps
+/// its bespoke helper). Decision identity = (business_date, task identity,
+/// canonical source projection, subject hash) — stable for identical
+/// occurrences, so a restart missed-compensation re-run reuses the delivered
+/// decision via the dispatcher-top preflight instead of pushing a duplicate
+/// (2026-08-12 21:13:07 incident: 5 路未升级 counted 的复盘 dispatcher 各多推一次)。
+async fn dispatch_review_task_counted(
+    family: &str,
+    kind: crate::notify::PushKind,
+    producer: &str,
+    renderer: &str,
+    business_date: chrono::NaiveDate,
+    task: crate::review_batch::ReviewTask,
+    snapshot_size: usize,
+    subject_identity: String,
+    source_binding_canonical: Vec<u8>,
+    text: &str,
+) -> crate::notify::PushOutcome {
+    use stock_analysis::durable_delivery::TaskBinding;
+
+    let task_label = task.label().to_string();
+    let date = business_date.format("%Y-%m-%d").to_string();
+    let task_identity = crate::review_batch::review_task_identity(business_date, task);
+    let transition_basis_canonical =
+        match serde_json::to_vec(&ExistingReviewTaskTransitionBasis {
+            task_identity: task_identity.clone(),
+            business_date: date.clone(),
+            task: task_label.clone(),
+            snapshot_size,
+        }) {
+            Ok(canonical) => canonical,
+            Err(error) => {
+                let reason =
+                    format!("{task_label} transition basis serialization failed: {error}");
+                log::error!("[{task_label}][BR-140][BR-192] {reason}");
+                log_dispatcher_attempt(&task_label, false, snapshot_size, &reason);
+                return crate::notify::PushOutcome::Denied(reason);
+            }
+        };
+    let task_binding = match TaskBinding::new(task_identity.clone(), transition_basis_canonical) {
+        Ok(binding) => binding,
+        Err(error) => {
+            let reason = format!("{task_label} task binding rejected: {error}");
+            log::error!("[{task_label}][BR-140][BR-192] {reason}");
+            log_dispatcher_attempt(&task_label, false, snapshot_size, &reason);
+            return crate::notify::PushOutcome::Denied(reason);
+        }
+    };
+    let delivery_subject_hash = crate::review_batch::audit_identity_hash(
+        "review-task-delivery-subject",
+        &subject_identity,
+    );
+    let counted_binding = match crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        task_identity,
+        source_binding_canonical,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        delivery_subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        Some(task_binding),
+        true,
+    ) {
+        Ok(binding) => binding,
+        Err(reason) => {
+            log::error!("[{task_label}][BR-140][BR-192] counted binding rejected: {reason}");
+            log_dispatcher_attempt(&task_label, false, snapshot_size, &reason);
+            return crate::notify::PushOutcome::Denied(reason);
+        }
+    };
+    let presentation_token = match crate::presentation_registry::acquire_token(
+        family,
+        kind,
+        producer,
+        renderer,
+    ) {
+        Ok(token) => token,
+        Err(reason) => {
+            log::error!(
+                "[BR-196] production presentation token rejected family={} reason={}",
+                family,
+                reason
+            );
+            return crate::notify::PushOutcome::Denied(reason);
+        }
+    };
+    crate::notify::push_counted_with_binding(presentation_token, text, None, counted_binding)
+        .await
+}
+
 /// R-13: T+1 关注票核对 — 读昨日 A-10 名单快照, 核对今日行情, 推送回填。
 /// 无名单 → no_data (出声不推, 非缺陷); 单只取数失败在模块内 warn 跳过;
 /// 全部跳过 → failed (可重试, 盘后数据就绪后重跑)。推送成功后核对结果落库。
@@ -8869,6 +9179,32 @@ async fn dispatch_r13_watchlist_tracking_outcome(
             return crate::review_batch::ReviewTaskOutcome::failed(false, reason);
         }
     };
+    // BR-200: 已投递决策复用 — 重启错过补偿整批重跑时防止 R-13 重复推送
+    // (2026-08-12 21:13:07 首现: 5 个未升级 counted 的复盘 dispatcher 各多推一次)。
+    match crate::durable_delivery_runtime::inspect_review_task_occurrence(
+        today,
+        stock_analysis::durable_delivery::PushKind::WatchlistTracking,
+        crate::review_batch::review_task_identity(
+            today,
+            crate::review_batch::ReviewTask::R13,
+        ),
+    )
+    .await
+    {
+        Ok(Some(evidence)) => {
+            return review_outcome_from_existing_durable(
+                evidence,
+                today,
+                crate::review_batch::ReviewTask::R13,
+            )
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let reason = format!("R-13 durable terminal preflight failed: {error}");
+            log_dispatcher_attempt("R-13", false, 0, &reason);
+            return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
+        }
+    }
     let snapshot =
         match stock_analysis::database::catalyst_watchlist::latest_watchlist_before(today) {
             Ok(Some(snapshot)) => snapshot,
@@ -8907,15 +9243,9 @@ async fn dispatch_r13_watchlist_tracking_outcome(
         &snapshot,
         &outcomes,
     );
-    let result = dispatch_registered_outcome!(
-        "T1-watch-tracking",
-        crate::notify::PushKind::WatchlistTracking,
-        "watchlist_tracking_dispatcher",
-        "render_watchlist_tracking",
-        "",
-        None,
-        text
-    );
+    // BR-192 counted 推送: task binding + InternalDurable 证据入 durable ledger。
+    // 决策身份对同一核对日稳定 → 重启后 preflight 复用 + immutable conflict 双保险。
+    let result = dispatch_r13_counted_delivery(&snapshot, &outcomes, &text, today).await;
     log_dispatcher_attempt("R-13", result.is_pushed(), outcomes.len(), "");
     if result.is_pushed() && !skipped.is_empty() {
         log::warn!(
@@ -11503,6 +11833,40 @@ pub async fn dispatch_r03_industry_chain_outcome(
     use stock_analysis::market_analyzer::limit_chain_review::{aggregate, LimitChainInput};
 
     let review_date = date.to_string();
+    let today = match chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            let reason = format!("R-03 非法复盘日期 {date}: {error}");
+            log::error!("[R-03][BR-110] {reason}");
+            log_dispatcher_attempt("R-03", false, 0, &reason);
+            return ReviewTaskOutcome::failed(false, reason);
+        }
+    };
+    // BR-200: 已投递决策复用 — 重启错过补偿整批重跑防重复 (2026-08-12 21:13:07 首现)。
+    match crate::durable_delivery_runtime::inspect_review_task_occurrence(
+        today,
+        stock_analysis::durable_delivery::PushKind::IndustryChain,
+        crate::review_batch::review_task_identity(
+            today,
+            crate::review_batch::ReviewTask::R03,
+        ),
+    )
+    .await
+    {
+        Ok(Some(evidence)) => {
+            return review_outcome_from_existing_durable(
+                evidence,
+                today,
+                crate::review_batch::ReviewTask::R03,
+            )
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let reason = format!("R-03 durable terminal preflight failed: {error}");
+            log_dispatcher_attempt("R-03", false, 0, &reason);
+            return ReviewTaskOutcome::failed(true, reason);
+        }
+    }
     let positions =
         match tokio::task::spawn_blocking(stock_analysis::portfolio::get_positions).await {
             Ok(Ok(positions)) => positions,
@@ -11643,15 +12007,29 @@ pub async fn dispatch_r03_industry_chain_outcome(
             return ReviewTaskOutcome::failed(true, reason);
         }
     };
-    let push_result = dispatch_registered_outcome!(
+    // BR-192 counted delivery: 链数来自同一涨停池批次 (确定性), 决策身份稳定 →
+    // 重启错过补偿批重跑时 preflight 复用, 不再重复推送。
+    let source_binding_canonical = match serde_json::to_vec(&(date, count)) {
+        Ok(canonical) => canonical,
+        Err(error) => {
+            let reason = format!("R-03 source binding serialization failed: {error}");
+            log_dispatcher_attempt("R-03", false, count, &reason);
+            return ReviewTaskOutcome::failed(true, reason);
+        }
+    };
+    let push_result = dispatch_review_task_counted(
         "R-03-industry-chain",
         crate::notify::PushKind::IndustryChain,
         "industry_chain_review_dispatcher",
         "render_industry_chain",
-        "",
-        None,
-        text
-    );
+        today,
+        crate::review_batch::ReviewTask::R03,
+        count,
+        format!("{date}:industry-chain"),
+        source_binding_canonical,
+        &text,
+    )
+    .await;
     log_dispatcher_attempt("R-03", push_result.is_pushed(), count, "");
     ReviewTaskOutcome::from_push_outcome(push_result, 1)
 }
@@ -12772,6 +13150,39 @@ mod tests_r_dispatchers {
 async fn dispatch_catalyst_review_daily_outcome(
     date: &str,
 ) -> crate::review_batch::ReviewTaskOutcome {
+    let today = match chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            let reason = format!("invalid review date {date}: {error}");
+            log_dispatcher_attempt("A-10", false, 0, &reason);
+            return crate::review_batch::ReviewTaskOutcome::failed(false, reason);
+        }
+    };
+    // BR-200: 已投递决策复用 — 重启错过补偿整批重跑防重复 (2026-08-12 21:13:07 首现)。
+    match crate::durable_delivery_runtime::inspect_review_task_occurrence(
+        today,
+        stock_analysis::durable_delivery::PushKind::CatalystReview,
+        crate::review_batch::review_task_identity(
+            today,
+            crate::review_batch::ReviewTask::A10,
+        ),
+    )
+    .await
+    {
+        Ok(Some(evidence)) => {
+            return review_outcome_from_existing_durable(
+                evidence,
+                today,
+                crate::review_batch::ReviewTask::A10,
+            )
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let reason = format!("A-10 durable terminal preflight failed: {error}");
+            log_dispatcher_attempt("A-10", false, 0, &reason);
+            return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
+        }
+    }
     let snapshot = match load_catalyst_review_snapshot_real(date).await {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -12852,42 +13263,56 @@ async fn dispatch_catalyst_review_daily_outcome(
             return crate::review_batch::ReviewTaskOutcome::failed(false, reason);
         }
     };
-    let source_evidence = match crate::v14_adapter::SourceBatchEvidence::new(
-        crate::notify::PushKind::CatalystReview,
-        business_date,
-        match snapshot.source_observed_at {
-            Some(observed_at) => observed_at,
-            None => {
-                let reason = "A-10 source batch observation time missing".to_string();
-                log_dispatcher_attempt("A-10", false, snapshot.member_count, &reason);
-                return crate::review_batch::ReviewTaskOutcome::failed(false, reason);
-            }
-        },
-        snapshot.source_batch_id.clone(),
-        snapshot.source_content_hash.clone(),
-    ) {
-        Ok(evidence) => evidence,
-        Err(error) => {
-            let reason = format!("A-10 source batch binding rejected: {error}");
+    // BR-192: 数据质量守卫 (原 SourceBatchEvidence 校验保留): 观察时间缺失 → failed。
+    let source_observed_at = match snapshot.source_observed_at.as_ref() {
+        Some(observed_at) => observed_at.clone(),
+        None => {
+            let reason = "A-10 source batch observation time missing".to_string();
             log_dispatcher_attempt("A-10", false, snapshot.member_count, &reason);
             return crate::review_batch::ReviewTaskOutcome::failed(false, reason);
         }
     };
-    let presentation_token = match crate::presentation_registry::acquire_token(
+    // BR-192 counted delivery: A-10 升级 counted 路径 (InternalDurable) —
+    // 重启错过补偿整批重跑不再重复推送。证据字段显式投影 (快照来自 DB, 确定性)。
+    let source_binding_canonical = match serde_json::to_vec(&(
+        snapshot.date.clone(),
+        snapshot.theme.clone(),
+        source_observed_at,
+        snapshot.source_batch_id.clone(),
+        snapshot.source_content_hash.clone(),
+        snapshot.member_count,
+        snapshot.continuous_count,
+        snapshot
+            .leading_entries
+            .iter()
+            .map(|entry| (entry.code.clone(), entry.name.clone()))
+            .collect::<Vec<_>>(),
+        snapshot
+            .other_entries
+            .iter()
+            .map(|entry| (entry.code.clone(), entry.name.clone()))
+            .collect::<Vec<_>>(),
+    )) {
+        Ok(canonical) => canonical,
+        Err(error) => {
+            let reason = format!("A-10 source binding serialization failed: {error}");
+            log_dispatcher_attempt("A-10", false, snapshot.member_count, &reason);
+            return crate::review_batch::ReviewTaskOutcome::failed(false, reason);
+        }
+    };
+    let result = dispatch_review_task_counted(
         "A-10-catalyst-review",
         crate::notify::PushKind::CatalystReview,
         "catalyst_review_dispatcher",
         "render_catalyst_review",
-    ) {
-        Ok(token) => token,
-        Err(reason) => {
-            log::error!("[A-10][BR-196] presentation token rejected: {reason}");
-            log_dispatcher_attempt("A-10", false, snapshot.member_count, &reason);
-            return crate::review_batch::ReviewTaskOutcome::failed(false, reason);
-        }
-    };
-    let result =
-        crate::notify::push_source_batch_v3(presentation_token, &text, &source_evidence).await;
+        business_date,
+        crate::review_batch::ReviewTask::A10,
+        snapshot.member_count,
+        format!("{}:{}", snapshot.date, snapshot.source_batch_id),
+        source_binding_canonical,
+        &text,
+    )
+    .await;
     if result.is_pushed() {
         // T+1 跟踪: A-10 名单 (含代码/连板) 落库快照, 次日 R-13 盘后核对。
         // 失败仅 warn 不阻断推送 (黑盒闭环的记录侧不能卡推送本身)。

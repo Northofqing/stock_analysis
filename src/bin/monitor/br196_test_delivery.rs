@@ -197,13 +197,13 @@ pub(super) struct GovernanceSmokeDispatch<'context> {
     code: Option<TestSecurityIdentity>,
 }
 
-const GOVERNANCE_SMOKE_IDENTITIES: [(&str, PushKind); 6] = [
+// 2026-08-12: R-03/A-10 升级 counted (BR-192) — TEST_CODE fixtures 不能替代
+// 不可变 binding, 与 R-04/R-05 同规则移出 governance smoke (6 → 4)。
+const GOVERNANCE_SMOKE_IDENTITIES: [(&str, PushKind); 4] = [
     ("D-01-news-to-idea", PushKind::NewsToIdea),
     ("I-02-news-catalyst", PushKind::NewsCatalyst),
     ("P-01-preopen-news-hot", PushKind::PreopenNewsHot),
     ("T-11-auction-volume", PushKind::AuctionVolume),
-    ("R-03-industry-chain", PushKind::IndustryChain),
-    ("A-10-catalyst-review", PushKind::CatalystReview),
 ];
 
 impl GovernanceSmokeContext {
@@ -1332,7 +1332,7 @@ mod tests {
         let manifest = build_manifest(&snapshot(false, 0));
         assert_eq!(
             crate::presentation_registry::descriptors().len(),
-            56,
+            57,
             "descriptor count must match PRODUCTION_PRESENTATION_DESCRIPTORS array"
         );
         validate_descriptor_bijection(&manifest, crate::presentation_registry::descriptors())
@@ -1411,7 +1411,7 @@ mod tests {
     }
 
     #[test]
-    fn br196_governance_smoke_requires_exact_six_pushed_tuples() {
+    fn br196_governance_smoke_requires_exact_four_pushed_tuples() {
         let valid = GOVERNANCE_SMOKE_IDENTITIES
             .into_iter()
             .map(|(family_key, push_kind)| GovernanceSmokeDisposition {
@@ -1429,6 +1429,6 @@ mod tests {
         duplicate[0].family_key = duplicate[1].family_key;
         duplicate[0].push_kind = duplicate[1].push_kind;
         assert!(validate_governance_smoke(&duplicate).is_err());
-        assert!(validate_governance_smoke(&valid[..5]).is_err());
+        assert!(validate_governance_smoke(&valid[..3]).is_err());
     }
 }
