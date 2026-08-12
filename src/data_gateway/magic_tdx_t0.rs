@@ -9,7 +9,7 @@
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
 use magic_market_core::InstrumentId;
-use magic_tdx_rs::protocol::constants::{fq_type, KLINE_5MIN, KLINE_RI_K};
+use magic_tdx_rs::protocol::constants::{fq_type, KLINE_5MIN, KLINE_DAILY};
 use magic_tdx_rs::protocol::types::{MinuteTimePrice, SecurityBar, SecurityQuote};
 use magic_tdx_rs::TdxHqClient;
 use serde::Serialize;
@@ -764,8 +764,12 @@ fn evidence_for_quote(
     // （价格不变放行）。网络调用（daily/minute）仍在 freshness 门后。
     let normalized_quote = normalize_quote(&code, &quote)?;
     validate_quote_freshness(&code, source_at, quote_received_at, Some(normalized_quote.price))?;
+    // 2026-08-12 实测: TDX 主站 KLINE_RI_K(9) 在 fq_type::NONE 下只返回最新
+    // 1 根日K (count=40/800 均如此), 生产 8/11-8/12 全天 settled_daily
+    // actual=0 → 做T 证据 0 records。KLINE_DAILY(4) + NONE (不复权) 返回
+    // 完整 40 根 (探针: 40/800 根, 2026-06-17..2026-08-12), 语义不变。
     let daily_raw = client
-        .get_security_bars(KLINE_RI_K, quote.market, &code, 0, 40, fq_type::NONE)
+        .get_security_bars(KLINE_DAILY, quote.market, &code, 0, 40, fq_type::NONE)
         .map_err(|error| rejection(&code, "daily_fetch_failed", error.to_string(), true))?;
     let today = requested_at.with_timezone(&Local).date_naive();
     let daily = daily_raw

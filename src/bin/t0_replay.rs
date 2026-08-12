@@ -11,7 +11,7 @@
 //! 只读网络请求, 无写入、无推送。
 
 use chrono::TimeZone;
-use magic_tdx_rs::protocol::constants::{fq_type, KLINE_5MIN, KLINE_RI_K};
+use magic_tdx_rs::protocol::constants::{fq_type, KLINE_5MIN, KLINE_DAILY};
 use magic_tdx_rs::TdxHqClient;
 use stock_analysis::data_gateway::magic_tdx_t0::fetch_magic_tdx_t0_batch_with_clock;
 
@@ -79,7 +79,7 @@ fn main() {
                     (1u8, 1)
                 };
                 let daily = client
-                    .get_security_bars(KLINE_RI_K, market, &codes[0], 0, 40, fq_type::NONE);
+                    .get_security_bars(KLINE_DAILY, market, &codes[0], 0, 40, fq_type::NONE);
                 println!(
                     "DIRECT DAILY (TdxHqClient, market={}): {:?}",
                     market,
