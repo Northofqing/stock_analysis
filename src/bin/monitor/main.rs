@@ -6894,8 +6894,9 @@ async fn prepare_magic_tdx_t0_messages() -> Result<Vec<PreparedT0Advice>, String
         log::warn!("[做T-持仓][BR-153] skipped reason=user_snapshot_missing");
         return Ok(Vec::new());
     };
+    let snapshot_id = snapshot.snapshot_id.clone();
     let snapshot_binding = T0PositionSnapshotBindingV1::new(
-        snapshot.snapshot_id,
+        snapshot_id.clone(),
         snapshot.evidence_sha256,
         snapshot.effective_at,
         snapshot.confirmed_at,
@@ -6912,6 +6913,11 @@ async fn prepare_magic_tdx_t0_messages() -> Result<Vec<PreparedT0Advice>, String
         })
         .collect::<Vec<_>>();
     if positions.is_empty() {
+        // v15.x 规则 4: 静默路径必须出声。快照存在但无持仓项 = 做T 无标的,
+        // warn 让运营知道「快照导入成功但无内容」而非神秘无声。
+        log::warn!(
+            "[做T-持仓][BR-153] skipped reason=positions_empty snapshot_id={snapshot_id} (快照存在但无持仓项)"
+        );
         return Ok(Vec::new());
     }
     let codes = positions

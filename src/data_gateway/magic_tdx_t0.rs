@@ -20,24 +20,30 @@ use std::sync::{Arc, Mutex, OnceLock};
 use super::instrument_identity::{resolve_production_equity, EquitySegment};
 
 pub const T0_QUOTE_MAX_AGE_SECS: i64 = 5;
+/// BR-218 fail-closed 硬上限：servertime 滞后超过此值无论移动证据一律拒绝。
+/// TDX servertime 实测滞后 6-69s（8/12 最大值 69s）, 300s 提供 4 倍以上裕度；
+/// 午休窗口（11:30-13:00 无成交）quote 会老化过此线 → 正确 fail-closed,
+/// 午后首笔成交后 servertime 前进自愈。
+pub const T0_QUOTE_HARD_STALE_SECS: i64 = 300;
 pub const T0_DAILY_MIN_BARS: usize = 20;
 pub const T0_TODAY_MIN_COMPLETED_BARS: usize = 6;
 pub const T0_HISTORY_MIN_SESSIONS: usize = 3;
 
-/// BR-231 价格变动感知缓存：code → 最近一次通过 freshness 门的最新价。
+/// BR-231 移动证据缓存：code → (最近通过 freshness 门的最新价, 其 servertime)。
 ///
-/// TDX servertime 结构性滞后 6-63s（median ~18s, 2026-08-10 全天 0 次通过
-/// T0_QUOTE_MAX_AGE_SECS=5 门）。做T需要的是「价格新鲜」而非「时钟新鲜」：
-/// servertime 滞后窗口内价格未变（无成交变动）= 等价新鲜。缓存仅存储
-/// 通过判定路径的 quote 价格（stale 拒绝的数据不污染缓存）。
-static LAST_T0_QUOTE_PRICES: OnceLock<Mutex<HashMap<String, f64>>> = OnceLock::new();
+/// TDX servertime = 各股最后一笔成交时间（2026-08-10/12 实测恒滞后墙钟 6-69s,
+/// median ~18s, 全天 0 条通过 T0_QUOTE_MAX_AGE_SECS=5 门 → 旧缓存永未播种,
+/// 价格不变放行从未激活 = 做T 盘中恒 0 records）。做T需要「价格新鲜」而非
+/// 「时钟新鲜」：滞后窗口内价变 = 新成交 = 数据在动。缓存仅存储通过判定
+/// 路径的 quote（stale 拒绝的数据不污染缓存）。
+static LAST_T0_QUOTES: OnceLock<Mutex<HashMap<String, (f64, DateTime<Utc>)>>> = OnceLock::new();
 
 /// 缓存容量上限：超出时重建（保最近语义, 低频事件损失可接受; 候选池
 /// 代码数量级远低于此, 正常路径永不触发）。
 const LAST_T0_QUOTE_CACHE_MAX: usize = 500;
 
-fn last_t0_quote_prices() -> &'static Mutex<HashMap<String, f64>> {
-    LAST_T0_QUOTE_PRICES.get_or_init(|| Mutex::new(HashMap::new()))
+fn last_t0_quotes() -> &'static Mutex<HashMap<String, (f64, DateTime<Utc>)>> {
+    LAST_T0_QUOTES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -171,17 +177,28 @@ fn valid_ohlc(open: f64, high: f64, low: f64, close: f64) -> bool {
         && high >= low
 }
 
-/// BR-231 价格变动感知 freshness 门（做T语义：价格新鲜而非时钟新鲜）。
+/// BR-231 移动证据 freshness 门（做T语义：价格新鲜而非时钟新鲜）。
 ///
 /// 判定链（`quote_price` = 当前 batch 归一化价格, `None` 表示无价格可比）:
-/// 1. age ∈ [0, T0_QUOTE_MAX_AGE_SECS] → 新鲜, 更新缓存, Ok
-/// 2. age 超限 + 缓存有同 code 价格且相等 → 等价新鲜（滞后窗口内无成交
-///    变动）→ **warn 出声** + 更新缓存 + Ok
-/// 3. 其余（含未来时间、首次见 code、价格已变）→ quote_stale（不更新缓存）
+/// 1. age ∈ [0, T0_QUOTE_MAX_AGE_SECS] → 新鲜, 更新缓存, Ok（BR-218 5s 红线原样）
+/// 2. age ∈ (5, T0_QUOTE_HARD_STALE_SECS]（TDX 时钟滞后窗口, 移动证据裁决）:
+///    a. 首次见 code（无缓存）→ 播种接受（warn 出声）: 快照价即当前价;
+///       无锚点则缓存永远为空 → 后续分支永不激活（8/12 死锁实证:
+///       全天 0 条过 5s 门, 旧 BR-231 价格不变放行从未生效）
+///    b. 价格已变 + servertime 前进 → 接受（warn 出声）: 价变 = 新成交 =
+///       数据在动 —— 做T 信号路径
+///    c. 价格已变 + servertime 未前进 → clock_inconsistent 拒绝: 健康数据源
+///       价变必然带时间戳前进, 矛盾即异常（fail-closed）
+///    d. 价格未变 + servertime 前进 → 等价新鲜（warn 出声）: BR-231 语义,
+///       带「数据在动」证据
+///    e. 价格未变 + servertime 未前进 → quote_stale 拒绝: 同一快照重放 =
+///       数据源冻结（堵住旧 2 分支的死 feed 洞）
+/// 3. age > T0_QUOTE_HARD_STALE_SECS → quote_stale 拒绝（fail-closed 硬上限,
+///    午休无成交窗口正确老化, 午后自愈）
 ///
-/// TDX servertime 结构性滞后 6-63s（median ~18s）恒超 5s 门, 但滞后窗口内
-/// 价格未变时对做T等价于新鲜数据。首次见 code 无价格可比 → 保持原门
-/// （无证据 = 出声拒绝）。
+/// BR-218 5s red line 语义保留: 分支 1 原样; 5s 外的放行必须携带移动证据
+/// （价变 / servertime 前进）或为播种引导, 且封顶 300s; 无证据即拒绝。
+/// 所有例外放行均 warn 出声（v15.x 规则 4）。
 pub fn validate_quote_freshness(
     code: &str,
     source_at: DateTime<Utc>,
@@ -189,37 +206,94 @@ pub fn validate_quote_freshness(
     quote_price: Option<f64>,
 ) -> std::result::Result<(), MagicTdxT0Rejection> {
     let age = observed_at.signed_duration_since(source_at).num_seconds();
-    if (0..=T0_QUOTE_MAX_AGE_SECS).contains(&age) {
+    if age < 0 {
+        return Err(rejection(
+            code,
+            "quote_stale",
+            format!("future_time age_secs={age} max_secs={T0_QUOTE_MAX_AGE_SECS}"),
+            true,
+        ));
+    }
+    if age <= T0_QUOTE_MAX_AGE_SECS {
         if let Some(price) = quote_price {
-            record_last_quote_price(code, price);
+            record_last_quote(code, price, source_at);
         }
         return Ok(());
     }
-    if let (Some(price), Some(last)) = (quote_price, last_t0_quote_prices().lock().ok().and_then(|mut cache| cache.get(code).copied())) {
-        if last == price {
-            // 价格未变 = 等价新鲜：servertime 滞后但滞后窗口内无成交变动。
-            // 出声（warn）——例外放行必须可见（v15.x 规则 4）。
+    if age > T0_QUOTE_HARD_STALE_SECS {
+        return Err(rejection(
+            code,
+            "quote_stale",
+            format!("age_secs={age} max_secs={T0_QUOTE_HARD_STALE_SECS}"),
+            true,
+        ));
+    }
+    let Some(price) = quote_price else {
+        return Err(rejection(
+            code,
+            "quote_stale",
+            format!("age_secs={age} max_secs={T0_QUOTE_MAX_AGE_SECS}"),
+            true,
+        ));
+    };
+    let cached = last_t0_quotes()
+        .lock()
+        .ok()
+        .and_then(|mut cache| cache.get(code).copied());
+    let Some((last_price, last_source_at)) = cached else {
+        // 首次见 code: 播种接受 —— 无锚点则缓存永远为空（8/12 死锁实证）。
+        // 出声（warn）——例外放行必须可见（v15.x 规则 4）。
+        log::warn!(
+            "[magic-tdx-t0] {code} 播种放行: age_secs={age} price={price} (首次见 code, 无缓存锚点)"
+        );
+        record_last_quote(code, price, source_at);
+        return Ok(());
+    };
+    if price != last_price {
+        if source_at > last_source_at {
+            // 价变 + servertime 前进 = 新成交 = 数据在动。做T 信号路径。
             log::warn!(
-                "[magic-tdx-t0] {code} 价格不变放行: age_secs={age} max_secs={T0_QUOTE_MAX_AGE_SECS} price={price}"
+                "[magic-tdx-t0] {code} 价变+时间戳前进放行: age_secs={age} price={last_price}->{price}"
             );
-            record_last_quote_price(code, price);
+            record_last_quote(code, price, source_at);
             return Ok(());
         }
+        // 价变但时间戳未前进: 健康数据源不可能, fail-closed。
+        return Err(rejection(
+            code,
+            "clock_inconsistent",
+            format!(
+                "price_changed_without_source_advance age_secs={age} last_price={last_price} price={price}"
+            ),
+            true,
+        ));
     }
+    if source_at > last_source_at {
+        // 价格未变 + servertime 前进 = 等价新鲜（滞后窗口内无成交变动）。
+        // 出声（warn）——例外放行必须可见（v15.x 规则 4）。
+        log::warn!(
+            "[magic-tdx-t0] {code} 价格不变放行: age_secs={age} max_secs={T0_QUOTE_HARD_STALE_SECS} price={price}"
+        );
+        record_last_quote(code, price, source_at);
+        return Ok(());
+    }
+    // 价格未变 + servertime 未前进 = 同一快照重放 = 数据源冻结, fail-closed。
     Err(rejection(
         code,
         "quote_stale",
-        format!("age_secs={age} max_secs={T0_QUOTE_MAX_AGE_SECS}"),
+        format!(
+            "stale_replay age_secs={age} last_source_at={last_source_at} source_at={source_at}"
+        ),
         true,
     ))
 }
 
-fn record_last_quote_price(code: &str, price: f64) {
-    if let Ok(mut cache) = last_t0_quote_prices().lock() {
+fn record_last_quote(code: &str, price: f64, source_at: DateTime<Utc>) {
+    if let Ok(mut cache) = last_t0_quotes().lock() {
         if cache.len() >= LAST_T0_QUOTE_CACHE_MAX {
             cache.clear();
         }
-        cache.insert(code.to_string(), price);
+        cache.insert(code.to_string(), (price, source_at));
     }
 }
 
@@ -864,15 +938,24 @@ fn finalize_t0_batch(
                 record.instrument.code()
             ));
         }
-        match validate_quote_freshness(
-            &record.code,
-            record.source_at,
-            observed_at,
-            Some(record.quote.price),
-        ) {
-            Ok(()) => fresh_records.push(record),
-            Err(error) => rejections.push(error),
+        // 2026-08-13: finalize 二次门只做硬上限裁决。全链已在
+        // validate_t0_evidence 逐记录执行（含缓存更新, 移动证据放行在此处
+        // 会因同一记录 servertime 未前进而误杀已通过记录——两次门之间
+        // servertime 不可能前进）。此处只防 blocking 窗口过长: age > 硬上限
+        // 的过时数据 fail-closed 丢弃。
+        let completion_age = observed_at.signed_duration_since(record.source_at).num_seconds();
+        if completion_age < 0 || completion_age > T0_QUOTE_HARD_STALE_SECS {
+            rejections.push(rejection(
+                &record.code,
+                "quote_stale",
+                format!(
+                    "completion_stale age_secs={completion_age} max_secs={T0_QUOTE_HARD_STALE_SECS}"
+                ),
+                true,
+            ));
+            continue;
         }
+        fresh_records.push(record);
     }
     fresh_records.sort_by(|left, right| left.code.cmp(&right.code));
     rejections.sort_by(|left, right| left.code.cmp(&right.code));
@@ -1156,71 +1239,97 @@ mod tests {
     }
 
     #[test]
-    fn quote_older_than_five_seconds_is_rejected() {
+    fn first_sighting_seeds_cache_without_anchor() {
+        // 2026-08-13 设计变更（移动证据放行）: 首次见 code 播种接受, 否则
+        // 缓存永远为空（8/12 死锁实证: 全天 0 条过 5s 门, 旧 BR-231 价格
+        // 不变放行从未激活）。code 独立于其他测试（缓存是模块级 static）。
         let observed_at = Utc.with_ymd_and_hms(2026, 7, 23, 2, 0, 1).unwrap();
-        let source_at = Utc.with_ymd_and_hms(2026, 7, 23, 1, 59, 55).unwrap();
+        let source_at = Utc.with_ymd_and_hms(2026, 7, 23, 1, 59, 55).unwrap(); // age=6s
 
-        // 首次见 code（无历史价格可比）→ 保持原门拒绝。
-        // code 独立于其他测试（BR-231 缓存是模块级 static, 共享 code 会串扰）。
-        let result =
-            validate_quote_freshness("TEST_CODE_STALE_ONLY_1", source_at, observed_at, Some(10.0));
+        validate_quote_freshness("TEST_CODE_SEED_1", source_at, observed_at, Some(10.0))
+            .expect("first sighting seeds cache");
 
-        assert_eq!(result.unwrap_err().reason_code, "quote_stale");
+        // 播种后同价同时间戳重放（数据源冻结, 无移动证据）→ fail-closed
+        let replay =
+            validate_quote_freshness("TEST_CODE_SEED_1", source_at, observed_at, Some(10.0));
+        let replay_err = replay.unwrap_err();
+        assert_eq!(replay_err.reason_code, "quote_stale");
+        assert!(replay_err.detail.contains("stale_replay"));
     }
 
     #[test]
-    fn stale_quote_with_unchanged_price_is_admitted_as_equivalent_fresh() {
-        // BR-231: servertime 滞后但价格未变 = 等价新鲜
-        let observed_at = Utc.with_ymd_and_hms(2026, 7, 23, 2, 0, 30).unwrap();
-        let stale_source_at = Utc.with_ymd_and_hms(2026, 7, 23, 2, 0, 10).unwrap(); // age=20s
+    fn movement_evidence_governs_stale_window_admissions_and_rejections() {
+        // BR-231/BR-218 移动证据链（2026-08-13 设计）:
+        // 播种 → 价变+前进接受 → 价不变+前进等价新鲜 → 价变+未前进拒绝
+        // （clock_inconsistent）→ 价不变+未前进拒绝（冻结重放）。
+        let code = "TEST_CODE_BR231_1";
 
-        // 1. 第一次判定 age=20s 且无历史价 → 拒绝
-        let first = validate_quote_freshness(
-            "TEST_CODE_BR231_1",
-            stale_source_at,
-            observed_at,
-            Some(12.34),
-        );
-        assert_eq!(first.unwrap_err().reason_code, "quote_stale");
+        // 1. 首次见 code age=20s 无锚点 → 播种接受
+        let observed_1 = Utc.with_ymd_and_hms(2026, 7, 23, 2, 0, 30).unwrap();
+        let source_1 = Utc.with_ymd_and_hms(2026, 7, 23, 2, 0, 10).unwrap();
+        validate_quote_freshness(code, source_1, observed_1, Some(12.34))
+            .expect("first sighting seeded");
 
-        // 2. 新鲜价 12.34 通过 → 缓存记录
-        let fresh_source_at = observed_at - chrono::Duration::seconds(2);
-        validate_quote_freshness(
-            "TEST_CODE_BR231_1",
-            fresh_source_at,
-            observed_at,
-            Some(12.34),
-        )
-        .expect("fresh quote admitted");
+        // 2. 价变 12.34→12.35 + servertime 前进 → 接受（做T 信号路径）
+        let observed_2 = Utc.with_ymd_and_hms(2026, 7, 23, 2, 0, 50).unwrap();
+        let source_2 = Utc.with_ymd_and_hms(2026, 7, 23, 2, 0, 30).unwrap();
+        validate_quote_freshness(code, source_2, observed_2, Some(12.35))
+            .expect("price moved with source advance admitted");
 
-        // 3. 再次滞后（age=20s）但价格仍 12.34 → 价格不变放行
-        validate_quote_freshness(
-            "TEST_CODE_BR231_1",
-            stale_source_at,
-            observed_at,
-            Some(12.34),
-        )
-        .expect("unchanged stale price admitted");
+        // 3. 价不变 + servertime 前进 → 等价新鲜
+        let observed_3 = Utc.with_ymd_and_hms(2026, 7, 23, 2, 1, 10).unwrap();
+        let source_3 = Utc.with_ymd_and_hms(2026, 7, 23, 2, 0, 50).unwrap();
+        validate_quote_freshness(code, source_3, observed_3, Some(12.35))
+            .expect("unchanged price with source advance admitted");
 
-        // 4. 价格已变 12.35 → 拒绝（滞后窗口内真实变动, 不配做T）
-        let changed = validate_quote_freshness(
-            "TEST_CODE_BR231_1",
-            stale_source_at,
-            observed_at,
-            Some(12.35),
-        );
-        assert_eq!(changed.unwrap_err().reason_code, "quote_stale");
+        // 4. 价变 12.35→12.36 但 servertime 未前进（≤ 缓存时间戳）→ 异常
+        let source_4 = Utc.with_ymd_and_hms(2026, 7, 23, 2, 0, 40).unwrap();
+        let inconsistent = validate_quote_freshness(code, source_4, observed_3, Some(12.36));
+        assert_eq!(inconsistent.unwrap_err().reason_code, "clock_inconsistent");
+
+        // 5. 价不变 + servertime 未前进（同一快照重放）→ 冻结拒绝
+        let replay = validate_quote_freshness(code, source_4, observed_3, Some(12.35));
+        let replay_err = replay.unwrap_err();
+        assert_eq!(replay_err.reason_code, "quote_stale");
+        assert!(replay_err.detail.contains("stale_replay"));
     }
 
     #[test]
     fn stale_quote_without_price_history_stays_rejected_and_does_not_pollute_cache() {
-        // 价格不变放行路径必须落在「缓存有历史价」的前提下；
-        // 无价格参数（None）时退化为原门（纯时钟判定）。
+        // 播种与移动证据放行都必须落在「有价格可比」的前提下；
+        // 无价格参数（None）时保持严格拒绝（无证据 = 出声拒绝）。
         let observed_at = Utc.with_ymd_and_hms(2026, 7, 23, 2, 1, 0).unwrap();
         let stale_source_at = Utc.with_ymd_and_hms(2026, 7, 23, 2, 0, 30).unwrap();
         let result =
             validate_quote_freshness("TEST_CODE_BR231_2", stale_source_at, observed_at, None);
         assert_eq!(result.unwrap_err().reason_code, "quote_stale");
+    }
+
+    #[test]
+    fn quote_beyond_hard_stale_limit_is_rejected_even_without_anchor() {
+        // BR-218 fail-closed 硬上限: age > 300s 一律拒绝（优先于播种分支）。
+        let observed_at = Utc.with_ymd_and_hms(2026, 7, 23, 2, 6, 0).unwrap();
+        let source_at = Utc.with_ymd_and_hms(2026, 7, 23, 2, 0, 55).unwrap(); // age=305s
+        let result = validate_quote_freshness(
+            "TEST_CODE_HARD_STALE_1",
+            source_at,
+            observed_at,
+            Some(10.0),
+        );
+        let err = result.unwrap_err();
+        assert_eq!(err.reason_code, "quote_stale");
+        assert!(err.detail.contains("max_secs=300"));
+    }
+
+    #[test]
+    fn future_quote_time_is_rejected() {
+        let observed_at = Utc.with_ymd_and_hms(2026, 7, 23, 2, 0, 0).unwrap();
+        let source_at = observed_at + chrono::Duration::seconds(3);
+        let result =
+            validate_quote_freshness("TEST_CODE_FUTURE_1", source_at, observed_at, Some(10.0));
+        let err = result.unwrap_err();
+        assert_eq!(err.reason_code, "quote_stale");
+        assert!(err.detail.contains("future_time"));
     }
 
     #[test]
@@ -1313,10 +1422,13 @@ mod tests {
     }
 
     #[test]
-    fn actual_completion_freshness_moves_stale_record_to_explicit_rejection() {
+    fn completion_freshness_applies_hard_cap_backstop_only() {
+        // 2026-08-13: finalize 二次门只做硬上限裁决（全链已在 validate_t0_evidence
+        // 逐记录执行; 同一记录 servertime 在两次门之间不会前进, 重跑全链会
+        // 误杀已通过记录）。此处验证 blocking 窗口超长 → fail-closed 丢弃。
         let requested_at = Utc.with_ymd_and_hms(2026, 7, 23, 2, 0, 0).unwrap();
         let source_at = requested_at + chrono::Duration::seconds(1);
-        let completion_at = source_at + chrono::Duration::seconds(T0_QUOTE_MAX_AGE_SECS + 1);
+        let completion_at = source_at + chrono::Duration::seconds(T0_QUOTE_HARD_STALE_SECS + 1);
         let identity = normalized_identity("TEST_CODE_600396").unwrap();
         let record = validated_record(&identity, source_at, requested_at);
 
@@ -1333,7 +1445,7 @@ mod tests {
         assert!(batch.records.is_empty());
         assert_eq!(batch.rejections.len(), 1);
         assert_eq!(batch.rejections[0].reason_code, "quote_stale");
-        assert!(batch.rejections[0].detail.contains("age_secs=6"));
+        assert!(batch.rejections[0].detail.contains("completion_stale"));
         assert_eq!(batch.observed_at, completion_at);
         assert_eq!(batch.batch_id.len(), 64);
     }
