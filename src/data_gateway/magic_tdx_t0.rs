@@ -633,7 +633,16 @@ pub fn validate_five_minute_bars(
     let allowed_slots = trading_slots();
     let allowed = allowed_slots.iter().copied().collect::<BTreeSet<_>>();
     let cutoff = completed_slot_cutoff(observed_at);
-    bars.retain(|bar| bar.at.date() < today || (bar.at.date() == today && bar.at.time() <= cutoff));
+    // 2026-08-12 探针确认: TDX 盘中流在午后开盘时多发一根 13:00:00 快照 bar
+    // (open=13:00 瞬间, vol 仅竞价量 62300), 已收盘数据无此 bar (8/11: 11:30 →
+    // 13:05 直接衔接)。13:00-13:05 完整窗口由 13:05 bar 承载 (vol=579800),
+    // 丢弃 13:00 后今日 bars 与 trading_slots() 48 槽位对齐, 且历史日比较
+    // (day_bars.len() >= today_bars.len()) 不受 25 根午后 vs 24 根的错位影响。
+    let afternoon_open_snapshot = NaiveTime::from_hms_opt(13, 0, 0).expect("static slot");
+    bars.retain(|bar| {
+        bar.at.time() != afternoon_open_snapshot
+            && (bar.at.date() < today || (bar.at.date() == today && bar.at.time() <= cutoff))
+    });
     bars.sort_by_key(|bar| bar.at);
 
     let mut seen = BTreeSet::new();
@@ -1451,6 +1460,61 @@ mod tests {
                 .reason_code,
             "history_slots_insufficient"
         );
+    }
+
+    #[test]
+    fn afternoon_open_snapshot_bar_13_00_is_dropped_and_gap_check_stays_aligned() {
+        let observed_at = Local
+            .with_ymd_and_hms(2026, 7, 23, 14, 5, 0)
+            .single()
+            .expect("fixture time")
+            .with_timezone(&Utc);
+
+        // TDX 盘中流: 午后开盘多一根 13:00:00 快照 bar (仅竞价量), 已收盘日无此 bar。
+        // 构造与真实盘中流一致的全 48 槽位数据 (今天 + 3 个历史交易日)。
+        let today = observed_at.with_timezone(&Local).date_naive();
+        let mut live = Vec::new();
+        let mut date = today;
+        for _ in 0..=T0_HISTORY_MIN_SESSIONS {
+            for time in trading_slots() {
+                live.push(MagicTdxT0FiveMinuteBar {
+                    at: date.and_time(time),
+                    open: 10.0,
+                    high: 10.2,
+                    low: 9.8,
+                    close: 10.0,
+                    volume: 1_000.0,
+                    amount: 10_000.0,
+                });
+            }
+            date = crate::calendar::prev_trading_day(date);
+        }
+        let snapshot_at = today
+            .and_hms_opt(13, 0, 0)
+            .expect("afternoon open snapshot slot");
+        live.push(MagicTdxT0FiveMinuteBar {
+            at: snapshot_at,
+            open: 10.0,
+            high: 10.1,
+            low: 9.95,
+            close: 10.0,
+            volume: 62_300.0,
+            amount: 62_300.0 * 10.0,
+        });
+
+        let validated =
+            validate_five_minute_bars("TEST_CODE_600396", live, observed_at).expect("live bars ok");
+        assert!(
+            validated.iter().all(|bar| bar.at.time() != NaiveTime::from_hms_opt(13, 0, 0).unwrap()),
+            "13:00 快照 bar 必须被丢弃"
+        );
+        let today_bars: Vec<_> = validated.iter().filter(|bar| bar.at.date() == today).collect();
+        // 丢弃后今日 bars 与 trading_slots() 槽位逐一对齐 (five_minute_gap 检查)。
+        let slots = trading_slots();
+        assert_eq!(today_bars.len(), 37); // 24 上午 (9:35-11:30) + 13 午后 (13:05-14:05)
+        for (index, bar) in today_bars.iter().enumerate() {
+            assert_eq!(slots.get(index).copied(), Some(bar.at.time()));
+        }
     }
 
     #[test]
