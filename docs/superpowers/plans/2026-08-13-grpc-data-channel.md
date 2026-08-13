@@ -29,7 +29,8 @@
 **Files:**
 - Modify: `Cargo.toml`（[dependencies] 加 tonic/prost/tokio-stream；[build-dependencies] 加 tonic-build）
 - Create: `build.rs`
-- Create: `src/grpc_client/mod.rs`、`src/grpc_client/pb.rs`
+- Create: `src/grpc_client/mod.rs`、`src/grpc_client/pb.rs`、`src/grpc_client/auth.rs`、`src/grpc_client/client.rs`、`src/grpc_client/envelope.rs`、`src/grpc_client/errors.rs`、`src/grpc_client/retry.rs`（后 5 个为空骨架，Task 4-7 填充）
+- Create: `src/grpc_contract/mod.rs`、`src/grpc_contract/ops.rs`、`src/grpc_contract/schema.rs`、`src/grpc_contract/validate.rs`（后 3 个为空骨架，Task 2/3 填充）
 - Modify: `src/lib.rs`（加 `pub mod grpc_contract; pub mod grpc_client;`）
 
 **Interfaces:**
@@ -99,10 +100,18 @@ pub mod retry;
 
 ```rust
 //! gRPC 合同注册表 (schema 名/版本/校验, 服务端与客户端共享)。
-pub mod ops;
-pub mod schema;
-pub mod validate;
+//! Task 2 加 `pub mod ops;`; Task 3 加 `pub mod schema; pub mod validate;`
+//! (先建对应空文件, 否则 `pub mod` 声明导致编译失败)。
 ```
+
+同时创建 5 个空骨架文件（各只含一行文档注释，Task 4-7 逐个替换为完整实现）：
+
+```rust
+//! 待 Task 4 填充: request_id + QueryRequest/QueryResponse 信封。
+```
+（`src/grpc_client/envelope.rs` 同上格式；`auth.rs`/`client.rs`/`errors.rs`/`retry.rs` 分别标注 Task 6/7/5/5。）
+
+以及 `src/grpc_contract/ops.rs`/`schema.rs`/`validate.rs` 三个空骨架（各含 `//! 待 Task 2/3 填充` 文档注释）。
 
 `src/lib.rs` 追加：
 
