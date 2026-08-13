@@ -1,0 +1,289 @@
+syntax = "proto3";
+
+package magic.market.v1;
+
+enum Operation {
+  OPERATION_UNSPECIFIED = 0;
+  OPERATION_HISTORICAL_BARS = 1;
+  OPERATION_MINUTE_DATA = 2;
+  OPERATION_REALTIME_QUOTES = 3;
+  OPERATION_MONEY_FLOWS = 4;
+  OPERATION_ORDER_BOOKS = 5;
+  OPERATION_AUCTIONS = 6;
+  OPERATION_TRADES = 7;
+  OPERATION_SECURITY_METADATA = 8;
+  OPERATION_GLOBAL_INDICES = 9;
+  OPERATION_FOREIGN_EXCHANGE = 10;
+  OPERATION_ECONOMIC_CALENDAR = 11;
+  OPERATION_FUTURES_DELIVERY = 12;
+  OPERATION_REFERENCE_RATES = 13;
+  OPERATION_OFFICIAL_FX_FIXINGS = 14;
+  OPERATION_ECONOMIC_SERIES = 15;
+  OPERATION_COMPANY_FILINGS = 16;
+  OPERATION_GLOBAL_NEWS = 17;
+  OPERATION_ANNOUNCEMENTS = 18;
+  OPERATION_MARKET_ANNOUNCEMENTS = 19;
+  OPERATION_INVESTOR_QUESTIONS = 20;
+  OPERATION_POLICY_DOCUMENTS = 21;
+  OPERATION_SECURITY_PROFILES = 22;
+  OPERATION_FINANCIAL_STATEMENTS = 23;
+  OPERATION_MARKET_STATISTICS = 24;
+  OPERATION_TECHNICAL_BARS = 25;
+  OPERATION_CORPORATE_ACTIONS = 26;
+  OPERATION_BOARD_DIRECTORY = 27;
+  OPERATION_BOARD_CONSTITUENTS = 28;
+  OPERATION_BOARD_MEMBERSHIPS = 29;
+  OPERATION_RESEARCH_REPORTS = 30;
+  OPERATION_RESEARCH_DOCUMENTS = 31;
+  OPERATION_CONSENSUS = 32;
+  OPERATION_TARGET_PRICES = 33;
+  OPERATION_SEMANTIC_SEARCH = 34;
+  OPERATION_FUND_FLOW_SERIES = 35;
+  OPERATION_BOARD_FLOWS = 36;
+  OPERATION_MARGIN_DATA = 37;
+  OPERATION_BLOCK_TRADES = 38;
+  OPERATION_HOLDER_COUNTS = 39;
+  OPERATION_LOCKUP_EVENTS = 40;
+  OPERATION_DIVIDEND_PLANS = 41;
+  OPERATION_POST_CLOSE_FLOWS = 42;
+  OPERATION_NORTHBOUND_DAILY = 43;
+  OPERATION_LIMIT_POOLS = 44;
+  OPERATION_STRONG_STOCK_REASONS = 45;
+  OPERATION_DRAGON_TIGER = 46;
+  OPERATION_MARKET_DRAGON_TIGER = 47;
+  OPERATION_DRAGON_TIGER_DISCOVERY = 48;
+  OPERATION_MARKET_RANKINGS = 49;
+  OPERATION_MARKET_BREADTH = 50;
+  OPERATION_POPULARITY = 51;
+  OPERATION_CONCEPT_HITS = 52;
+  OPERATION_OPTION_DATA = 53;
+  OPERATION_PROVIDER_TOP_N_RANKINGS = 54;
+}
+
+enum AdmissionState {
+  ADMISSION_STATE_UNSPECIFIED = 0;
+  ADMISSION_STATE_ADMITTED = 1;
+  ADMISSION_STATE_UNADMITTED = 2;
+}
+
+message RequestContext {
+  uint32 protocol_version = 1;
+  string request_id = 2;
+}
+
+message CanonicalPayload {
+  string schema = 1;
+  uint32 schema_version = 2;
+  string content_type = 3;
+  bytes data = 4;
+}
+
+message QueryRequest {
+  RequestContext context = 1;
+  string preferred_provider = 2;
+  CanonicalPayload payload = 3;
+}
+
+message QueryResponse {
+  string request_id = 1;
+  Operation operation = 2;
+  AdmissionState admission = 3;
+  string selected_provider = 4;
+  string batch_id = 5;
+  bool complete = 6;
+  string observed_at = 7;
+  string source_at = 8;
+  repeated CanonicalPayload records = 9;
+}
+
+message Capability {
+  Operation operation = 1;
+  AdmissionState repository_admission = 2;
+  bool runtime_available = 3;
+  string provider = 4;
+  string exact_scope = 5;
+  string blocker = 6;
+}
+
+message CapabilitiesRequest {
+  RequestContext context = 1;
+}
+
+message CapabilitiesResponse {
+  string request_id = 1;
+  repeated Capability capabilities = 2;
+}
+
+message HealthRequest {
+  RequestContext context = 1;
+}
+
+message HealthResponse {
+  string request_id = 1;
+  bool live = 2;
+  bool ready = 3;
+  string state = 4;
+}
+
+message ErrorDetail {
+  string request_id = 1;
+  Operation operation = 2;
+  string provider = 3;
+  string reason_code = 4;
+  bool retryable = 5;
+}
+
+message EventCursor {
+  string generation = 1;
+  uint64 sequence = 2;
+}
+
+message EventFilter {
+  repeated string instruments = 1;
+  repeated string event_kinds = 2;
+}
+
+message SubscribeRequest {
+  RequestContext context = 1;
+  EventFilter filter = 2;
+  EventCursor after = 3;
+}
+
+message ReplayRequest {
+  RequestContext context = 1;
+  EventFilter filter = 2;
+  EventCursor after = 3;
+}
+
+message MarketEventEnvelope {
+  uint32 protocol_version = 1;
+  string event_id = 2;
+  EventCursor cursor = 3;
+  string event_kind = 4;
+  string provider = 5;
+  string instrument = 6;
+  string observed_at = 7;
+  string source_at = 8;
+  AdmissionState admission = 9;
+  CanonicalPayload payload = 10;
+}
+
+message ListenerStatusRequest {
+  RequestContext context = 1;
+}
+
+message ListenerStatusResponse {
+  string request_id = 1;
+  string state = 2;
+  string terminal_generation = 3;
+  EventCursor latest = 4;
+  repeated Capability capabilities = 5;
+}
+
+message AgentHello {
+  uint32 protocol_version = 1;
+  string agent_id = 2;
+  string terminal_generation = 3;
+  CanonicalPayload terminal_evidence = 4;
+}
+
+message AgentHeartbeat {
+  string terminal_generation = 1;
+  uint64 last_sequence = 2;
+}
+
+message AgentMessage {
+  oneof body {
+    AgentHello hello = 1;
+    MarketEventEnvelope event = 2;
+    AgentHeartbeat heartbeat = 3;
+  }
+}
+
+message AgentAck {
+  string terminal_generation = 1;
+  uint64 accepted_sequence = 2;
+}
+
+message AgentStop {
+  string reason_code = 1;
+}
+
+message AgentCommand {
+  oneof body {
+    AgentAck ack = 1;
+    AgentStop stop = 2;
+  }
+}
+
+service SystemService {
+  rpc GetCapabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
+  rpc GetHealth(HealthRequest) returns (HealthResponse);
+}
+
+service MarketDataService {
+  rpc HistoricalBars(QueryRequest) returns (QueryResponse);
+  rpc MinuteData(QueryRequest) returns (QueryResponse);
+  rpc RealtimeQuotes(QueryRequest) returns (QueryResponse);
+  rpc MoneyFlows(QueryRequest) returns (QueryResponse);
+  rpc OrderBooks(QueryRequest) returns (QueryResponse);
+  rpc Auctions(QueryRequest) returns (QueryResponse);
+  rpc Trades(QueryRequest) returns (QueryResponse);
+  rpc SecurityMetadata(QueryRequest) returns (QueryResponse);
+  rpc GlobalIndices(QueryRequest) returns (QueryResponse);
+  rpc ForeignExchange(QueryRequest) returns (QueryResponse);
+  rpc EconomicCalendar(QueryRequest) returns (QueryResponse);
+  rpc FuturesDelivery(QueryRequest) returns (QueryResponse);
+  rpc ReferenceRates(QueryRequest) returns (QueryResponse);
+  rpc OfficialFxFixings(QueryRequest) returns (QueryResponse);
+  rpc EconomicSeries(QueryRequest) returns (QueryResponse);
+  rpc CompanyFilings(QueryRequest) returns (QueryResponse);
+  rpc GlobalNews(QueryRequest) returns (QueryResponse);
+  rpc Announcements(QueryRequest) returns (QueryResponse);
+  rpc MarketAnnouncements(QueryRequest) returns (QueryResponse);
+  rpc InvestorQuestions(QueryRequest) returns (QueryResponse);
+  rpc PolicyDocuments(QueryRequest) returns (QueryResponse);
+  rpc SecurityProfiles(QueryRequest) returns (QueryResponse);
+  rpc FinancialStatements(QueryRequest) returns (QueryResponse);
+  rpc MarketStatistics(QueryRequest) returns (QueryResponse);
+  rpc TechnicalBars(QueryRequest) returns (QueryResponse);
+  rpc CorporateActions(QueryRequest) returns (QueryResponse);
+  rpc BoardDirectory(QueryRequest) returns (QueryResponse);
+  rpc BoardConstituents(QueryRequest) returns (QueryResponse);
+  rpc BoardMemberships(QueryRequest) returns (QueryResponse);
+  rpc ResearchReports(QueryRequest) returns (QueryResponse);
+  rpc ResearchDocuments(QueryRequest) returns (QueryResponse);
+  rpc Consensus(QueryRequest) returns (QueryResponse);
+  rpc TargetPrices(QueryRequest) returns (QueryResponse);
+  rpc SemanticSearch(QueryRequest) returns (QueryResponse);
+  rpc FundFlowSeries(QueryRequest) returns (QueryResponse);
+  rpc BoardFlows(QueryRequest) returns (QueryResponse);
+  rpc MarginData(QueryRequest) returns (QueryResponse);
+  rpc BlockTrades(QueryRequest) returns (QueryResponse);
+  rpc HolderCounts(QueryRequest) returns (QueryResponse);
+  rpc LockupEvents(QueryRequest) returns (QueryResponse);
+  rpc DividendPlans(QueryRequest) returns (QueryResponse);
+  rpc PostCloseFlows(QueryRequest) returns (QueryResponse);
+  rpc NorthboundDaily(QueryRequest) returns (QueryResponse);
+  rpc LimitPools(QueryRequest) returns (QueryResponse);
+  rpc StrongStockReasons(QueryRequest) returns (QueryResponse);
+  rpc DragonTiger(QueryRequest) returns (QueryResponse);
+  rpc MarketDragonTiger(QueryRequest) returns (QueryResponse);
+  rpc DragonTigerDiscovery(QueryRequest) returns (QueryResponse);
+  rpc MarketRankings(QueryRequest) returns (QueryResponse);
+  rpc MarketBreadth(QueryRequest) returns (QueryResponse);
+  rpc Popularity(QueryRequest) returns (QueryResponse);
+  rpc ConceptHits(QueryRequest) returns (QueryResponse);
+  rpc OptionData(QueryRequest) returns (QueryResponse);
+  rpc ProviderTopNRankings(QueryRequest) returns (QueryResponse);
+}
+
+service MarketEventService {
+  rpc Subscribe(SubscribeRequest) returns (stream MarketEventEnvelope);
+  rpc Replay(ReplayRequest) returns (stream MarketEventEnvelope);
+  rpc GetListenerStatus(ListenerStatusRequest) returns (ListenerStatusResponse);
+}
+
+service TdxAgentService {
+  rpc OpenStream(stream AgentMessage) returns (stream AgentCommand);
+}
