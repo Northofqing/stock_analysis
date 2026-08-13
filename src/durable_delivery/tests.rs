@@ -4024,8 +4024,10 @@ fn br214_daily_review_kinds_are_business_date_once() {
         );
     }
     assert_eq!(
-        POLICY_VERSION, 2,
-        "BR-214: window-mode semantics changed, POLICY_VERSION must be bumped because it is decision_identity hash material"
+        POLICY_VERSION, 3,
+        "BR-237: review-kind daily-budget exemption (counts_against_daily_budget=false) changed \
+         policy semantics, POLICY_VERSION must be bumped because it is decision_identity hash \
+         material (bumped 2 -> 3 on 2026-08-13)"
     );
 }
 
@@ -5097,7 +5099,9 @@ fn prepare_binding_cooldown_and_budget_are_one_transaction() {
     let append = MemoryAppendPort::default();
     let envelope = envelope(
         "ATOMIC_PREPARE",
-        PushKind::ReviewProviderTopN,
+        // BR-237: ReviewProviderTopN 已豁免日预算, budget 原子性改用
+        // SectorTop (BusinessDateOnce + counts_against_daily_budget=true)。
+        PushKind::SectorTop,
         DeliverySubKind::None,
         "2026-07-30",
         true,
@@ -5114,6 +5118,138 @@ fn prepare_binding_cooldown_and_budget_are_one_transaction() {
     );
     assert_eq!(
         fixture.query_i64("SELECT COUNT(*) FROM business_date_once_claims"),
+        1
+    );
+}
+
+#[test]
+fn br237_review_kinds_exempt_from_daily_budget_signal_kinds_compete() {
+    // catalog 语义: 10 个复盘类 (BusinessDateOnce 每日必达) 豁免日预算,
+    // 盘中信号类继续竞争 30 槽 (8/13 复盘被做T T0Advice 烧满预算饿死事故)。
+    let catalog = compiled_policy_catalog();
+    for kind in [
+        PushKind::ReviewMarket,
+        PushKind::ReviewLhb,
+        PushKind::ReviewSignal,
+        PushKind::ReviewFailure,
+        PushKind::ReviewProviderTopN,
+        PushKind::IndustryChain,
+        PushKind::PositionReview,
+        PushKind::ReviewBacktest,
+        PushKind::WatchlistTracking,
+        PushKind::CatalystReview,
+    ] {
+        let row = catalog
+            .iter()
+            .find(|row| row.push_kind == kind)
+            .expect("policy");
+        assert!(
+            !row.counts_against_daily_budget,
+            "BR-237: {kind} 复盘类必须豁免日预算"
+        );
+    }
+    for kind in [
+        PushKind::T0Advice,
+        PushKind::HoldingPlan,
+        PushKind::SectorTop,
+        PushKind::SectorAnomaly,
+        PushKind::CloseCall,
+        PushKind::TomorrowWatch,
+    ] {
+        let row = catalog
+            .iter()
+            .find(|row| row.push_kind == kind)
+            .expect("policy");
+        assert!(
+            row.counts_against_daily_budget,
+            "BR-237: {kind} 信号类必须计入日预算"
+        );
+    }
+
+    // 行为: 30 槽填满后, 信号类第 31 个被 DailyBudgetFull 拒, 复盘类仍可投递且不占槽
+    let fixture = Fixture::new("BR237_BUDGET_EXEMPT");
+    let append = MemoryAppendPort::default();
+    for slot in 0..DAILY_BUDGET_LIMIT {
+        let signal = envelope(
+            &format!("BR237_SIGNAL_{slot}"),
+            PushKind::HoldingPlan,
+            DeliverySubKind::None,
+            "2026-07-30",
+            false,
+        );
+        prepare_reserved(&fixture, &signal, &append);
+    }
+    assert_eq!(
+        fixture.query_i64(
+            "SELECT COUNT(*) FROM daily_budget_reservations
+             WHERE state='Reserved'"
+        ),
+        DAILY_BUDGET_LIMIT,
+        "30 槽应全部被信号类占用"
+    );
+
+    // 信号类第 31 个 → 预算满拒绝 (DailyBudgetFull → Rejected 终态链)
+    let overflow = envelope(
+        "BR237_SIGNAL_OVERFLOW",
+        PushKind::HoldingPlan,
+        DeliverySubKind::None,
+        "2026-07-30",
+        false,
+    );
+    let outcome = fixture
+        .coordinator
+        .prepare(&overflow, 1, now())
+        .expect("prepare overflow");
+    assert!(
+        matches!(
+            outcome.state,
+            DecisionState::RejectedAuditPending
+                | DecisionState::RejectedTaskTransitionPending
+                | DecisionState::RejectedDurable
+        ),
+        "BR-237: 预算满时信号类必须被拒绝, got {:?}",
+        outcome.state
+    );
+    fixture
+        .coordinator
+        .reconcile_all_pending(&append, now())
+        .expect("reconcile overflow");
+
+    // 复盘类 (豁免) 预算满时仍成功 Reserved → Delivered, 且不占新槽
+    let review = envelope(
+        "BR237_REVIEW",
+        PushKind::ReviewBacktest,
+        DeliverySubKind::None,
+        "2026-07-30",
+        true,
+    );
+    prepare_reserved(&fixture, &review, &append);
+    let sink = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(now())));
+    let sinks: Vec<AuthoritativeSink> = vec![sink];
+    fixture
+        .coordinator
+        .resume_deliverable(&review.decision_identity, &sinks, now())
+        .expect("review deliver");
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::Delivered,
+        &review.decision_identity,
+    );
+    assert_eq!(
+        fixture.query_i64(
+            "SELECT COUNT(*) FROM daily_budget_reservations
+             WHERE state='Reserved'"
+        ),
+        DAILY_BUDGET_LIMIT,
+        "BR-237: 豁免类投递不得占用预算槽"
+    );
+    assert_eq!(
+        fixture.query_i64(&format!(
+            "SELECT COUNT(*) FROM delivery_decisions
+             WHERE decision_identity='{}' AND state='Delivered'",
+            review.decision_identity
+        )),
         1
     );
 }
@@ -6378,7 +6514,9 @@ fn released_budget_generations_remain_queryable() {
     let append = MemoryAppendPort::default();
     let envelope = envelope(
         "GENERATIONS",
-        PushKind::ReviewProviderTopN,
+        // BR-237: ReviewProviderTopN 已豁免日预算, 换 SectorTop
+        // (BusinessDateOnce + counts_against_daily_budget=true)。
+        PushKind::SectorTop,
         DeliverySubKind::None,
         "2026-07-30",
         true,

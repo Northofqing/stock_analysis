@@ -10,7 +10,11 @@ pub const ENVELOPE_VERSION: i64 = 1;
 // BusinessDateOnce. `policy_version` is part of the `decision_identity` hash
 // material, so a semantic policy change must bump it; otherwise a new-policy
 // decision would collide with an old-policy decision identity.
-pub const POLICY_VERSION: i64 = 2;
+// BR-237 (2026-08-13): v3 — 复盘类 (BusinessDateOnce 每日必达) 豁免日预算。
+// 做T T0Advice 上线后盘中烧满 30 槽, 19:00 复盘被 DailyBudgetFull 饿死
+// (8/13 实证 7 路全 failed, delivered=0)。version bump 触发 policy catalog
+// 重播 (schema v7 DELETE + 重建) + 新 envelope decision_identity 刷新。
+pub const POLICY_VERSION: i64 = 3;
 pub const DAILY_BUDGET_LIMIT: i64 = 30;
 pub(crate) const MANUAL_ACCEPTED_DELIVERY_AUDIT_DOMAIN: &str = "manual-delivery-accepted-audit-v1";
 
@@ -445,7 +449,21 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
             base_cooldown_secs,
             override_cooldown_secs: std::option::Option::None,
             window_mode,
-            counts_against_daily_budget: true,
+            // BR-237 (2026-08-13): 复盘类 (BusinessDateOnce 每日必达) 豁免日预算,
+            // 盘中信号类 (T0Advice/HoldingPlan/SectorTop 等) 继续竞争 30 槽。
+            // 复盘推送永不被盘中信号挤掉 (8/13 饿死事故根因)。用户批准豁免方案。
+            counts_against_daily_budget: !matches!(
+                push_kind,
+                PushKind::ReviewMarket
+                    | PushKind::ReviewLhb
+                    | PushKind::ReviewSignal
+                    | PushKind::ReviewFailure
+                    | PushKind::IndustryChain
+                    | PushKind::PositionReview
+                    | PushKind::ReviewBacktest
+                    | PushKind::WatchlistTracking
+                    | PushKind::CatalystReview
+            ),
             policy_version: POLICY_VERSION,
         },
     )
@@ -499,7 +517,8 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
             base_cooldown_secs: Some(86_400),
             override_cooldown_secs: std::option::Option::None,
             window_mode: BusinessDateOnce,
-            counts_against_daily_budget: true,
+            // BR-237: 复盘类豁免日预算 (见 compiled_policy_catalog 批量部分注释)。
+            counts_against_daily_budget: false,
             policy_version: POLICY_VERSION,
         },
     ]);

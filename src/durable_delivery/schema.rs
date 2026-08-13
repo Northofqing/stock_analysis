@@ -6,7 +6,7 @@ use rusqlite::{functions::FunctionFlags, params, Connection, OptionalExtension, 
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
-pub(crate) const SCHEMA_VERSION: i64 = 6;
+pub(crate) const SCHEMA_VERSION: i64 = 7;
 
 #[cfg(test)]
 thread_local! {
@@ -104,23 +104,31 @@ pub(crate) fn initialize_schema(transaction: &Transaction<'_>) -> Result<()> {
             migrate_schema_v3_to_v4(transaction)?;
             migrate_schema_v4_to_v5(transaction)?;
             migrate_schema_v5_to_v6(transaction)?;
+            migrate_schema_v6_to_v7(transaction)?;
         }
         2 => {
             migrate_schema_v2_to_v3(transaction)?;
             migrate_schema_v3_to_v4(transaction)?;
             migrate_schema_v4_to_v5(transaction)?;
             migrate_schema_v5_to_v6(transaction)?;
+            migrate_schema_v6_to_v7(transaction)?;
         }
         3 => {
             migrate_schema_v3_to_v4(transaction)?;
             migrate_schema_v4_to_v5(transaction)?;
             migrate_schema_v5_to_v6(transaction)?;
+            migrate_schema_v6_to_v7(transaction)?;
         }
         4 => {
             migrate_schema_v4_to_v5(transaction)?;
             migrate_schema_v5_to_v6(transaction)?;
+            migrate_schema_v6_to_v7(transaction)?;
         }
-        5 => migrate_schema_v5_to_v6(transaction)?,
+        5 => {
+            migrate_schema_v5_to_v6(transaction)?;
+            migrate_schema_v6_to_v7(transaction)?;
+        }
+        6 => migrate_schema_v6_to_v7(transaction)?,
         _ => {}
     }
     transaction.execute_batch(
@@ -173,7 +181,7 @@ pub(crate) fn initialize_schema(transaction: &Transaction<'_>) -> Result<()> {
           window_mode TEXT NOT NULL CHECK(window_mode IN
             ('None','Rolling','BusinessDateOnce')),
           counts_against_daily_budget INTEGER NOT NULL CHECK(
-            counts_against_daily_budget=1),
+            counts_against_daily_budget IN (0,1)),
           policy_version INTEGER NOT NULL,
           PRIMARY KEY(push_kind,sub_kind)
         );
@@ -1096,6 +1104,55 @@ fn migrate_schema_v4_to_v5(transaction: &Transaction<'_>) -> Result<()> {
 /// business-date claims and audit rows are left untouched: the `POLICY_VERSION`
 /// bump already yields fresh `decision_identity` values for new envelopes, and
 /// historical rows must remain readable for audit (AGENTS §2.7).
+/// BR-237 (2026-08-13): rebuild `delivery_policy_catalog` with the relaxed
+/// `counts_against_daily_budget IN (0,1)` CHECK.
+///
+/// The v6 table still enforces `CHECK(counts_against_daily_budget=1)`, which
+/// would reject the review-kind exemption rows (flag=0) seeded after this
+/// migration. SQLite cannot ALTER a CHECK constraint, so the table is rebuilt
+/// via the standard 12-step rename/create/copy/drop. No FK references the
+/// policy catalog, so the rebuild is safe. Existing decisions, cooldown heads,
+/// claims and audit rows are untouched (AGENTS §2.7), mirroring the v5→v6
+/// replay semantics: the `POLICY_VERSION` bump yields fresh decision identity.
+fn migrate_schema_v6_to_v7(transaction: &Transaction<'_>) -> Result<()> {
+    let table_exists: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type='table' AND name='delivery_policy_catalog'",
+        [],
+        |row| row.get(0),
+    )?;
+    if table_exists == 0 {
+        return Ok(());
+    }
+    transaction.execute(
+        "ALTER TABLE delivery_policy_catalog
+           RENAME TO delivery_policy_catalog_v6",
+        [],
+    )?;
+    transaction.execute_batch(
+        "CREATE TABLE delivery_policy_catalog(
+          push_kind TEXT NOT NULL,
+          sub_kind TEXT NOT NULL,
+          cooldown_scope TEXT NOT NULL,
+          base_cooldown_secs INTEGER,
+          override_cooldown_secs INTEGER,
+          window_mode TEXT NOT NULL CHECK(window_mode IN
+            ('None','Rolling','BusinessDateOnce')),
+          counts_against_daily_budget INTEGER NOT NULL CHECK(
+            counts_against_daily_budget IN (0,1)),
+          policy_version INTEGER NOT NULL,
+          PRIMARY KEY(push_kind,sub_kind)
+        );
+        INSERT INTO delivery_policy_catalog
+          SELECT push_kind,sub_kind,cooldown_scope,base_cooldown_secs,
+                 override_cooldown_secs,window_mode,counts_against_daily_budget,
+                 policy_version
+          FROM delivery_policy_catalog_v6;
+        DROP TABLE delivery_policy_catalog_v6;",
+    )?;
+    Ok(())
+}
+
 fn migrate_schema_v5_to_v6(transaction: &Transaction<'_>) -> Result<()> {
     let table_exists: i64 = transaction.query_row(
         "SELECT COUNT(*) FROM sqlite_master
@@ -1274,11 +1331,20 @@ fn validate_historical_manual_accepted_semantics(transaction: &Transaction<'_>) 
 fn seed_and_verify_policy_catalog(transaction: &Transaction<'_>) -> Result<()> {
     let expected = compiled_policy_catalog();
     for row in &expected {
+        // BR-237: OR IGNORE → upsert, 否则存量行 (旧 CHECK 时代 counts=1)
+        // 不会被刷新为豁免 flag, 启动即 PolicyMismatch。
         transaction.execute(
-            "INSERT OR IGNORE INTO delivery_policy_catalog(
+            "INSERT INTO delivery_policy_catalog(
                 push_kind,sub_kind,cooldown_scope,base_cooldown_secs,
                 override_cooldown_secs,window_mode,counts_against_daily_budget,policy_version
-             ) VALUES (?1,?2,?3,?4,?5,?6,1,?7)",
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(push_kind,sub_kind) DO UPDATE SET
+               cooldown_scope=excluded.cooldown_scope,
+               base_cooldown_secs=excluded.base_cooldown_secs,
+               override_cooldown_secs=excluded.override_cooldown_secs,
+               window_mode=excluded.window_mode,
+               counts_against_daily_budget=excluded.counts_against_daily_budget,
+               policy_version=excluded.policy_version",
             params![
                 row.push_kind.as_str(),
                 row.sub_kind.as_str(),
@@ -1286,6 +1352,7 @@ fn seed_and_verify_policy_catalog(transaction: &Transaction<'_>) -> Result<()> {
                 row.base_cooldown_secs,
                 row.override_cooldown_secs,
                 row.window_mode.as_str(),
+                i64::from(row.counts_against_daily_budget),
                 row.policy_version,
             ],
         )?;

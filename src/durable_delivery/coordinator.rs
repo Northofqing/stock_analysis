@@ -4253,7 +4253,6 @@ impl DurableDeliveryCoordinator {
     ) -> Result<Option<PrepareDenial>> {
         if envelope.policy_version != policy.policy_version
             || envelope.cooldown_scope != policy.cooldown_scope
-            || !policy.counts_against_daily_budget
         {
             return Ok(Some(PrepareDenial::InvalidPolicy(format!(
                 "envelope policy/version differs from registered {}/{} policy",
@@ -4324,7 +4323,11 @@ impl DurableDeliveryCoordinator {
                 }
             }
         }
-        if first_available_budget_slot(transaction, &envelope.business_date)?.is_none() {
+        // BR-237: 复盘类 (counts_against_daily_budget=false) 豁免日预算,
+        // 不被盘中信号烧满 30 槽后饿死 (8/13 复盘 7 路全失败事故)。
+        if policy.counts_against_daily_budget
+            && first_available_budget_slot(transaction, &envelope.business_date)?.is_none()
+        {
             return Ok(Some(PrepareDenial::DailyBudgetFull));
         }
         Ok(None)
@@ -4463,42 +4466,49 @@ impl DurableDeliveryCoordinator {
             Some(identity)
         };
 
-        let slot_no = first_available_budget_slot(transaction, &envelope.business_date)?
-            .ok_or_else(|| {
-                DurableDeliveryError::PolicyMismatch(
-                    "daily budget became full inside reservation transaction".to_owned(),
-                )
-            })?;
-        let budget_identity = stable_identity(
-            "delivery-budget-reservation-v1",
-            &[&envelope.decision_identity, &generation.to_string()],
-        );
-        transaction.execute(
-            "INSERT INTO daily_budget_reservations(
-               budget_reservation_identity,decision_identity,reservation_generation,
-               attempt_identity,business_date,slot_no,reserved_at,accepted_at,released_at,state
-             ) VALUES (?1,?2,?3,NULL,?4,?5,?6,NULL,NULL,'Reserved')",
-            params![
-                budget_identity,
-                envelope.decision_identity,
-                generation,
-                envelope.business_date,
-                slot_no,
-                timestamp(reserved_at)
-            ],
-        )?;
-        record_budget_event(
-            transaction,
-            &budget_identity,
-            &envelope.decision_identity,
-            None,
-            "Reserved",
-            canonical_json(&json!({
-                "reservation_generation": generation,
-                "slot_no": slot_no,
-            }))?,
-            reserved_at,
-        )?;
+        // BR-237: 复盘类 (counts_against_daily_budget=false) 不占预算槽,
+        // current_budget_reservation_identity=NULL, release 路径已容忍 None。
+        let budget_identity = if policy.counts_against_daily_budget {
+            let slot_no = first_available_budget_slot(transaction, &envelope.business_date)?
+                .ok_or_else(|| {
+                    DurableDeliveryError::PolicyMismatch(
+                        "daily budget became full inside reservation transaction".to_owned(),
+                    )
+                })?;
+            let budget_identity = stable_identity(
+                "delivery-budget-reservation-v1",
+                &[&envelope.decision_identity, &generation.to_string()],
+            );
+            transaction.execute(
+                "INSERT INTO daily_budget_reservations(
+                   budget_reservation_identity,decision_identity,reservation_generation,
+                   attempt_identity,business_date,slot_no,reserved_at,accepted_at,released_at,state
+                 ) VALUES (?1,?2,?3,NULL,?4,?5,?6,NULL,NULL,'Reserved')",
+                params![
+                    budget_identity,
+                    envelope.decision_identity,
+                    generation,
+                    envelope.business_date,
+                    slot_no,
+                    timestamp(reserved_at)
+                ],
+            )?;
+            record_budget_event(
+                transaction,
+                &budget_identity,
+                &envelope.decision_identity,
+                None,
+                "Reserved",
+                canonical_json(&json!({
+                    "reservation_generation": generation,
+                    "slot_no": slot_no,
+                }))?,
+                reserved_at,
+            )?;
+            Some(budget_identity)
+        } else {
+            None
+        };
         transaction.execute(
             "UPDATE delivery_decisions SET reservation_generation=?1,
                current_budget_reservation_identity=?2,
@@ -4548,7 +4558,10 @@ impl DurableDeliveryCoordinator {
             {
                 return Ok(false);
             }
-            if first_available_budget_slot(transaction, &envelope.business_date)?.is_none() {
+            // BR-237: 豁免类 (counts_against_daily_budget=false) 重试不占预算。
+            if policy.counts_against_daily_budget
+                && first_available_budget_slot(transaction, &envelope.business_date)?.is_none()
+            {
                 return Ok(false);
             }
             let generation = current.reservation_generation + 1;
@@ -7142,44 +7155,40 @@ fn attach_attempt_to_reservations(
     attempt_no: i64,
     occurred_at: DateTime<Utc>,
 ) -> Result<()> {
-    let budget_identity = stored
-        .current_budget_reservation_identity
-        .as_deref()
-        .ok_or_else(|| {
-            DurableDeliveryError::PolicyMismatch(
-                "Reserved decision has no active budget reservation".to_owned(),
-            )
-        })?;
-    let changed = transaction.execute(
-        "UPDATE daily_budget_reservations SET attempt_identity=?1
-         WHERE budget_reservation_identity=?2 AND decision_identity=?3
-           AND reservation_generation=?4 AND attempt_identity IS NULL
-           AND state='Reserved'",
-        params![
-            attempt_identity,
+    // BR-237: 豁免类 (counts_against_daily_budget=false) 无 budget reservation,
+    // attempt 只附加到 cooldown reservation; 信号类照旧 CAS 附加。
+    if let Some(budget_identity) = stored.current_budget_reservation_identity.as_deref() {
+        let changed = transaction.execute(
+            "UPDATE daily_budget_reservations SET attempt_identity=?1
+             WHERE budget_reservation_identity=?2 AND decision_identity=?3
+               AND reservation_generation=?4 AND attempt_identity IS NULL
+               AND state='Reserved'",
+            params![
+                attempt_identity,
+                budget_identity,
+                stored.decision_identity,
+                stored.reservation_generation
+            ],
+        )?;
+        if changed != 1 {
+            return Err(DurableDeliveryError::PolicyMismatch(
+                "budget attempt compare-and-set failed".to_owned(),
+            ));
+        }
+        record_budget_event(
+            transaction,
             budget_identity,
-            stored.decision_identity,
-            stored.reservation_generation
-        ],
-    )?;
-    if changed != 1 {
-        return Err(DurableDeliveryError::PolicyMismatch(
-            "budget attempt compare-and-set failed".to_owned(),
-        ));
+            &stored.decision_identity,
+            Some("Reserved"),
+            "Reserved",
+            canonical_json(&json!({
+                "attempt_identity": attempt_identity,
+                "attempt_no": attempt_no,
+                "reservation_generation": stored.reservation_generation,
+            }))?,
+            occurred_at,
+        )?;
     }
-    record_budget_event(
-        transaction,
-        budget_identity,
-        &stored.decision_identity,
-        Some("Reserved"),
-        "Reserved",
-        canonical_json(&json!({
-            "attempt_identity": attempt_identity,
-            "attempt_no": attempt_no,
-            "reservation_generation": stored.reservation_generation,
-        }))?,
-        occurred_at,
-    )?;
     if let Some(cooldown_identity) = stored.current_cooldown_reservation_identity.as_deref() {
         let changed = transaction.execute(
             "UPDATE cooldown_reservations SET attempt_identity=?1
@@ -7266,11 +7275,11 @@ fn mutate_reservations(
                 occurred_at,
             )?;
         }
-    } else if stored.reservation_generation != 0 {
-        return Err(DurableDeliveryError::PolicyMismatch(
-            "positive reservation generation has no budget identity".to_owned(),
-        ));
     }
+    // BR-237: 豁免类 (counts_against_daily_budget=false) 的决策有 generation
+    // (重试代数) 但无 budget identity — 合法状态, 不再视为完整性违反。
+    // 信号类 (counts=true) 无 budget identity 时上方 budget 分支被跳过,
+    // 该场景仅存在于 prepare 后 budget 行被外部删除的 bug 情形。
     if let Some(cooldown_identity) = stored.current_cooldown_reservation_identity.as_deref() {
         let (from_state, window_mode, cooldown_secs): (String, String, Option<i64>) = transaction
             .query_row(
