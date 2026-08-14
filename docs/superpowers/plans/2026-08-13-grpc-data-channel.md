@@ -27,7 +27,7 @@
 ### Task 1: 依赖 + build.rs + 生成代码接入
 
 **Files:**
-- Modify: `Cargo.toml`（[dependencies] 加 tonic/prost/tokio-stream；[build-dependencies] 加 tonic-build）
+- Modify: `Cargo.toml`（[dependencies] 加 tonic/tonic-prost/prost/tokio-stream；[build-dependencies] 加 tonic-prost-build）
 - Create: `build.rs`
 - Create: `src/grpc_client/mod.rs`、`src/grpc_client/pb.rs`、`src/grpc_client/auth.rs`、`src/grpc_client/client.rs`、`src/grpc_client/envelope.rs`、`src/grpc_client/errors.rs`、`src/grpc_client/retry.rs`（后 5 个为空骨架，Task 4-7 填充）
 - Create: `src/grpc_contract/mod.rs`、`src/grpc_contract/ops.rs`、`src/grpc_contract/schema.rs`、`src/grpc_contract/validate.rs`（后 3 个为空骨架，Task 2/3 填充）
@@ -37,7 +37,7 @@
 - Consumes: 无（第一个任务）
 - Produces: 生成代码模块 `crate::grpc_client::pb::magic::market::v1`，含 `QueryRequest`/`QueryResponse`/`CanonicalPayload`/`RequestContext`/`Operation`/`AdmissionState`/`MarketEventEnvelope`/`EventCursor`/`EventFilter`/`SubscribeRequest`/`ReplayRequest`/`ListenerStatusRequest`/`ListenerStatusResponse`/`HealthRequest`/`HealthResponse`/`CapabilitiesRequest`/`CapabilitiesResponse`/`Capability`/`ErrorDetail`；服务 trait `system_service_server::SystemService`、`market_data_service_server::MarketDataService`、`market_event_service_server::MarketEventService`；客户端 `system_service_client::SystemServiceClient`、`market_data_service_client::MarketDataServiceClient`、`market_event_service_client::MarketEventServiceClient`。
 
-- [ ] **Step 1: 加依赖**
+- [x] **Step 1: 加依赖**
 
 `Cargo.toml` 的 `[dependencies]` 追加：
 
@@ -54,7 +54,7 @@ tokio-stream = "0.1"
 tonic-build = "0.14"
 ```
 
-- [ ] **Step 2: 写 build.rs**
+- [x] **Step 2: 写 build.rs**
 
 ```rust
 fn main() {
@@ -67,7 +67,7 @@ fn main() {
 }
 ```
 
-- [ ] **Step 3: 建模块**
+- [x] **Step 3: 建模块**
 
 `src/grpc_client/pb.rs`：
 
@@ -120,12 +120,12 @@ pub mod grpc_contract;
 pub mod grpc_client;
 ```
 
-- [ ] **Step 4: 编译验证**
+- [x] **Step 4: 编译验证**
 
 Run: `cargo build --lib 2>&1 | tail -5`
 Expected: exit 0。若 tonic/prost 版本解析失败，改用 `cargo add tonic@0.14 prost@0.14 tonic-build@0.14 --build` 让 cargo 解析，保持 0.14 大版本。
 
-- [ ] **Step 5: 生成代码冒烟测试**
+- [x] **Step 5: 生成代码冒烟测试**
 
 `src/grpc_client/pb.rs` 末尾加单测：
 
@@ -162,17 +162,26 @@ mod tests {
 }
 ```
 
-- [ ] **Step 6: 跑测试**
+- [x] **Step 6: 跑测试**
 
 Run: `cargo test --lib grpc_client::pb:: 2>&1 | tail -5`
 Expected: PASS（1 passed）。同时 `cargo build --lib` exit 0。
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add Cargo.toml Cargo.lock build.rs src/lib.rs src/grpc_client/
 git commit -m "feat(grpc): P0 tonic 依赖 + market.proto 生成代码接入 (pb 模块 + 冒烟测试)"
 ```
+
+**实施偏差记录（0.14 实测，2026-08-15）** — 计划草拟时基于 0.14 前 API 假设，实施时实测修正：
+
+1. **`tonic_build::configure()` 在 0.14 不存在** — tonic 0.14 破坏性重构把 prost 集成拆到 `tonic-prost-build`（"Prost functionality has been moved to tonic-prost-build" — tonic-build-0.14.6 lib.rs 注释）。build.rs 用 `tonic_prost_build::configure().compile_protos(...)`（API 等价）。Cargo.toml: [build-dependencies] 只留 `tonic-prost-build = "0.14"`（传递依赖 tonic-build）。
+2. **额外运行时依赖 `tonic-prost = "0.14"`** — tonic-prost-build 生成代码默认 codec_path = `tonic_prost::ProstCodec`，缺它会报 120×E0433。
+3. **生成文件是扁平结构，无 `mod magic` 嵌套** — tonic-prost-build 0.14 实测生成 magic.market.v1.rs 顶层直接是 message struct + service 模块（计划注释假设的 generate-modules 嵌套默认行为不成立）。`src/grpc_client/pb.rs` 手写 `pub mod magic { pub mod market { pub mod v1 { tonic::include_proto!(...) } } }` 包装，`crate::grpc_client::pb::magic::market::v1` 路径保持计划不变。
+4. **Step 5 测试代码需 `use prost::Message;`** — `encode_to_vec`/`decode` 是 `prost::Message` trait 方法，计划草稿漏了 import（E0599）。
+
+验证：`cargo build --lib` exit 0（4m56s 首次全量）；`cargo test --lib grpc_client::pb::` → `generated_types_roundtrip ... ok`，1 passed 0 failed。
 
 ---
 

@@ -76,6 +76,18 @@ aho-corasick = "1.1.4"
 rpassword = "7"        # 隐藏式密码输入
 whoami = "1"          # 当前 Unix 用户 fallback
 zeroize = "1"         # 密码 buffer 擦除
+# grpc 数据通道 (docs/superpowers/plans/2026-08-13-grpc-data-channel.md Task 1):
+# 唯一合同源 grpc/market.proto, 由 build.rs + tonic-prost-build 生成代码, 本文件不改 proto
+# tonic 0.14 拆分: tonic-prost (codec 运行时, 生成代码引用 tonic_prost::ProstCodec)
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+tokio-stream = "0.1"
+
+[build-dependencies]
+# tonic 0.14 重构: configure()/compile() 移入 tonic-prost-build
+# (tonic-build 0.14 只保留 Service codegen; tonic-prost-build 传递依赖 tonic-build)
+tonic-prost-build = "0.14"
 
 [target.'cfg(unix)'.dependencies]
 pam = "0.7"           # PAM 跨平台认证 (Linux/macOS, 用 0.7 因 0.8 与 rustc 1.97+ 编译失败)

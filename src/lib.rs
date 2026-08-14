@@ -222,6 +222,11 @@ where
 // 修复 Top10#7 (2026-06-29 audit): 共享 HTTP client (4 个预配置, 避免 28 处散落 builder)
 pub mod http_client;
 
+// grpc 数据通道 (docs/superpowers/plans/2026-08-13-grpc-data-channel.md Task 1):
+// 合同注册表 (服务端/客户端共享) + 客户端网络层; 唯一合同源 grpc/market.proto
+pub mod grpc_contract;
+pub mod grpc_client;
+
 #[cfg(test)]
 mod tests {
     use super::*;
