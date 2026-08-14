@@ -1,1 +1,66 @@
-//! 待 Task 3 填充: schema_for 合同 schema 注册表。
+//! canonical JSON schema 注册表 (合同 §5: 每方法 schema 名/版本冻结;
+//! 调用方遇到未知 schema/version 必须停止解析, 不能忽略或猜字段)。
+//!
+//! 初始以 data_gateway 返回类型的 JSON 为准, 冻结 24 个生产 op;
+//! schema 名约定: "<域>.<数据族>", 版本从 1 起。
+use crate::grpc_client::pb::magic::market::v1::Operation;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpSchema {
+    pub operation: Operation,
+    pub schema_name: &'static str,
+    pub schema_version: u32,
+}
+
+const SCHEMAS: &[OpSchema] = &[
+    OpSchema { operation: Operation::RealtimeQuotes, schema_name: "market.realtime_quotes", schema_version: 1 },
+    OpSchema { operation: Operation::HistoricalBars, schema_name: "market.historical_bars", schema_version: 1 },
+    OpSchema { operation: Operation::MinuteData, schema_name: "market.minute_data", schema_version: 1 },
+    OpSchema { operation: Operation::OrderBooks, schema_name: "market.order_books", schema_version: 1 },
+    OpSchema { operation: Operation::MoneyFlows, schema_name: "market.money_flows", schema_version: 1 },
+    OpSchema { operation: Operation::SecurityMetadata, schema_name: "market.security_metadata", schema_version: 1 },
+    OpSchema { operation: Operation::Announcements, schema_name: "news.announcements", schema_version: 1 },
+    OpSchema { operation: Operation::GlobalNews, schema_name: "news.global_news", schema_version: 1 },
+    OpSchema { operation: Operation::EconomicCalendar, schema_name: "market.economic_calendar", schema_version: 1 },
+    OpSchema { operation: Operation::FuturesDelivery, schema_name: "market.futures_delivery", schema_version: 1 },
+    OpSchema { operation: Operation::GlobalIndices, schema_name: "market.global_indices", schema_version: 1 },
+    OpSchema { operation: Operation::BoardDirectory, schema_name: "board.directory", schema_version: 1 },
+    OpSchema { operation: Operation::BoardConstituents, schema_name: "board.constituents", schema_version: 1 },
+    OpSchema { operation: Operation::BoardFlows, schema_name: "board.flows", schema_version: 1 },
+    OpSchema { operation: Operation::LimitPools, schema_name: "market.limit_pools", schema_version: 1 },
+    OpSchema { operation: Operation::StrongStockReasons, schema_name: "market.strong_stock_reasons", schema_version: 1 },
+    OpSchema { operation: Operation::DragonTiger, schema_name: "market.dragon_tiger", schema_version: 1 },
+    OpSchema { operation: Operation::MarketDragonTiger, schema_name: "market.market_dragon_tiger", schema_version: 1 },
+    OpSchema { operation: Operation::MarketRankings, schema_name: "market.market_rankings", schema_version: 1 },
+    OpSchema { operation: Operation::ConceptHits, schema_name: "market.concept_hits", schema_version: 1 },
+    OpSchema { operation: Operation::Consensus, schema_name: "market.consensus", schema_version: 1 },
+    OpSchema { operation: Operation::ResearchReports, schema_name: "research.reports", schema_version: 1 },
+    OpSchema { operation: Operation::BlockTrades, schema_name: "market.block_trades", schema_version: 1 },
+    OpSchema { operation: Operation::NorthboundDaily, schema_name: "market.northbound_daily", schema_version: 1 },
+];
+
+pub fn schema_for(op: Operation) -> Option<&'static OpSchema> {
+    SCHEMAS.iter().find(|s| s.operation == op)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_implemented_op_has_frozen_schema() {
+        // 24 个已实现 op 全部有 schema (spec 验收标准 3)。
+        assert_eq!(SCHEMAS.len(), 24);
+        for op in crate::grpc_contract::ops::implemented_operations() {
+            assert!(schema_for(op).is_some(), "op {op:?} 缺 schema");
+        }
+    }
+
+    #[test]
+    fn schema_names_are_unique() {
+        let mut names: Vec<&str> = SCHEMAS.iter().map(|s| s.schema_name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), SCHEMAS.len());
+    }
+}
