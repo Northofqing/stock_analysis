@@ -356,7 +356,7 @@ git commit -m "feat(grpc): P0 Operation↔方法名映射表 + 24 op 已实现�
   - `pub fn validate_payload(schema: &str, version: u32, data: &[u8]) -> Result<serde_json::Value, SchemaError>` — 未知 schema/version 拒绝（合同 §5）；返回解析后的 JSON
   - `pub enum SchemaError { UnknownSchema, UnsupportedVersion, NotJson }`
 
-- [ ] **Step 1: 写 schema 注册表（先测后码）**
+- [x] **Step 1: 写 schema 注册表（先测后码）**
 
 `src/grpc_contract/schema.rs`：
 
@@ -429,7 +429,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 写 validate.rs（先测后码）**
+- [x] **Step 2: 写 validate.rs（先测后码）**
 
 `src/grpc_contract/validate.rs`：
 
@@ -522,12 +522,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: 补 mod 声明 + 跑测试**
+- [x] **Step 3: 补 mod 声明 + 跑测试**
 
 `src/grpc_contract/mod.rs` 已声明 `pub mod schema; pub mod validate;`（Task 1 骨架），确认。Run: `cargo test --lib grpc_contract:: 2>&1 | tail -8`
 Expected: PASS（schema 2 + validate 5 通过；Task 2 的 3 个也过）。`cargo build --lib` exit 0。
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add src/grpc_contract/schema.rs src/grpc_contract/validate.rs
@@ -550,7 +550,7 @@ git commit -m "feat(grpc): P0 schema 注册表 (24 op 冻结) + canonical payloa
   - `pub fn parse_query_response(expected_request_id: &str, resp: QueryResponse) -> Result<QueryResult, EnvelopeError>` — request_id 必须匹配
   - `pub enum EnvelopeError { RequestIdMismatch, MissingContext, InvalidPayload }`
 
-- [ ] **Step 1: 写 envelope.rs（先测后码）**
+- [x] **Step 1: 写 envelope.rs（先测后码）**
 
 ```rust
 //! QueryRequest/QueryResponse 信封 (合同 §5/§6)。
@@ -735,12 +735,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 跑测试**
+- [x] **Step 2: 跑测试**
 
 Run: `cargo test --lib grpc_client::envelope:: 2>&1 | tail -6`
 Expected: PASS（6 passed）。`cargo build --lib` exit 0。
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/grpc_client/envelope.rs
