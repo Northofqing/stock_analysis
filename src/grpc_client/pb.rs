@@ -2,20 +2,20 @@
 //! tonic 0.14 实测: tonic-prost-build 生成的 magic.market.v1.rs 是**扁平**结构
 //! (message struct + service 模块全在顶层, 无 `mod magic` 嵌套 — 与计划注释的
 //! 0.14 前 prost-build generate-modules 默认行为不同), 所以这里手写包嵌套包装。
+//! 注意: 本文件是 grpc_client/mod.rs `pub mod pb;` 挂载的**文件本身**就是 pb 模块
+//! (mod.rs 声明即模块入口, 这里不能再写 `pub mod pb { }` 否则双重嵌套 pb::pb)。
 //! 用法: `use crate::grpc_client::pb::magic::market::v1::QueryRequest;`
-pub mod pb {
-    pub mod magic {
-        pub mod market {
-            pub mod v1 {
-                tonic::include_proto!("magic.market.v1");
-            }
+pub mod magic {
+    pub mod market {
+        pub mod v1 {
+            tonic::include_proto!("magic.market.v1");
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::pb::magic::market::v1::{AdmissionState, CanonicalPayload, QueryResponse};
+    use super::magic::market::v1::{AdmissionState, CanonicalPayload, QueryResponse};
     use prost::Message; // encode_to_vec/decode 是 prost::Message trait 方法
 
     #[test]

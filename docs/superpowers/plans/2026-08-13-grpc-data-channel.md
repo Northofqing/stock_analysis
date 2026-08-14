@@ -197,7 +197,7 @@ git commit -m "feat(grpc): P0 tonic 依赖 + market.proto 生成代码接入 (pb
   - `pub fn implemented_operations() -> Vec<Operation>` — 服务端已实现集合（24 个生产 op）
   - `pub fn is_implemented(op: Operation) -> bool`
 
-- [ ] **Step 1: 写映射表（先测后码）**
+- [x] **Step 1: 写映射表（先测后码）**
 
 `src/grpc_contract/ops.rs`：
 
@@ -319,7 +319,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认先失败**
+- [x] **Step 2: 跑测试确认先失败**
 
 Run: `cargo test --lib grpc_contract::ops:: 2>&1 | tail -8`
 Expected: FAIL（`method_name` 未定义）。若 pb 模块或 Operation 枚举未生成（Task 1 未完成），先回 Task 1。
@@ -328,12 +328,12 @@ Expected: FAIL（`method_name` 未定义）。若 pb 模块或 Operation 枚举�
 
 `src/grpc_contract/mod.rs` 已有 `pub mod ops;`（Task 1 写了骨架），确认存在即可。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cargo test --lib grpc_contract::ops:: 2>&1 | tail -5`
 Expected: PASS（3 passed）。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/grpc_contract/ops.rs
