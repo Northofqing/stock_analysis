@@ -763,7 +763,7 @@ git commit -m "feat(grpc): P0 request_id + QueryRequest/QueryResponse 信封 (�
   - `pub enum RetryDecision { RetryBackoff, RetryBounded, NoRetry }` + `pub fn retry_decision(err: &GrpcError) -> RetryDecision`（§10 表）
   - `pub struct RetryPolicy { pub max_attempts: u32, pub base_delay_ms: u64, pub max_delay_ms: u64, pub jitter_ms: u64 }` + `impl Default`（4 次 / 1s / 60s / 200ms）+ `pub fn backoff(&self, attempt: u32) -> Duration`（指数退避 1s→60s 封顶）
 
-- [ ] **Step 1: 写 errors.rs（先测后码）**
+- [x] **Step 1: 写 errors.rs（先测后码）**
 
 ```rust
 //! gRPC status code → 项目错误类型 (合同 §10 错误映射表)。
@@ -866,7 +866,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 写 retry.rs（先测后码）**
+- [x] **Step 2: 写 retry.rs（先测后码）**
 
 ```rust
 //! 有界重试与指数退避 (合同 §10)。
@@ -945,12 +945,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: 跑测试**
+- [x] **Step 3: 跑测试**
 
 Run: `cargo test --lib grpc_client::errors:: grpc_client::retry:: 2>&1 | tail -6`
 Expected: PASS（2 passed）。`cargo build --lib` exit 0。
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add src/grpc_client/errors.rs src/grpc_client/retry.rs
