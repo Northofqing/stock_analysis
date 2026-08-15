@@ -1310,6 +1310,37 @@ pub fn fund_flow_series(
     Ok(GatewayBatch::Available { records, evidence: ev })
 }
 
+/// 单条头部排行记录解析 (双路 provider_top_n_pair 与全量视图共用)。
+fn parse_provider_top_n_record(
+    v: &Value,
+    capability: &'static str,
+) -> Result<ProviderTopNFact, GatewayError> {
+    Ok(ProviderTopNFact {
+        metric: parse_market_ranking_kind(&as_str(v, "metric", capability)?, capability)?,
+        source_order_ordinal: PositiveU32::new(as_u64(v, "ordinal", capability)? as u32)
+            .map_err(|e| core_err(capability, e))?,
+        instrument: instrument_for(&as_str(v, "code", capability)?, capability)?,
+        label: NonEmptyText::new(as_str(v, "label", capability)?)
+            .map_err(|e| core_err(capability, e))?,
+        value: FiniteNumber::new(as_f64(v, "value", capability)?)
+            .map_err(|e| core_err(capability, e))?,
+        unit: parse_market_ranking_unit(&as_str(v, "unit", capability)?, capability)?,
+        trading_date: IsoDate::new(as_str(v, "trading_date", capability)?)
+            .map_err(|e| core_err(capability, e))?,
+        filter_identity: NonEmptyText::new(as_str(v, "filter_identity", capability)?)
+            .map_err(|e| core_err(capability, e))?,
+        provider_declared_total: PositiveU32::new(
+            as_u64(v, "provider_declared_total", capability)? as u32,
+        )
+        .map_err(|e| core_err(capability, e))?,
+        // 服务端视图含真实 inspected_row_count (delegate 原样传递, 本地路径语义对等)。
+        inspected_row_count: PositiveU32::new(
+            as_u64(v, "inspected_row_count", capability)? as u32,
+        )
+        .map_err(|e| core_err(capability, e))?,
+    })
+}
+
 pub fn provider_top_n_rankings(
     q: &QueryResult,
 ) -> Result<GatewayBatch<ProviderTopNFact>, GatewayError> {
@@ -1320,31 +1351,53 @@ pub fn provider_top_n_rankings(
     }
     let records: Vec<ProviderTopNFact> = parsed
         .iter()
-        .map(|v| {
-            Ok(ProviderTopNFact {
-                metric: parse_market_ranking_kind(&as_str(v, "metric", capability)?, capability)?,
-                source_order_ordinal: PositiveU32::new(as_u64(v, "ordinal", capability)? as u32)
-                    .map_err(|e| core_err(capability, e))?,
-                instrument: instrument_for(&as_str(v, "code", capability)?, capability)?,
-                label: NonEmptyText::new(as_str(v, "label", capability)?)
-                    .map_err(|e| core_err(capability, e))?,
-                value: FiniteNumber::new(as_f64(v, "value", capability)?)
-                    .map_err(|e| core_err(capability, e))?,
-                unit: parse_market_ranking_unit(&as_str(v, "unit", capability)?, capability)?,
-                trading_date: IsoDate::new(as_str(v, "trading_date", capability)?)
-                    .map_err(|e| core_err(capability, e))?,
-                filter_identity: NonEmptyText::new(as_str(v, "filter_identity", capability)?)
-                    .map_err(|e| core_err(capability, e))?,
-                provider_declared_total: PositiveU32::new(
-                    as_u64(v, "provider_declared_total", capability)? as u32,
-                )
-                .map_err(|e| core_err(capability, e))?,
-                inspected_row_count: PositiveU32::new(0)
-                    .map_err(|e| core_err(capability, e))?,
-            })
-        })
+        .map(|v| parse_provider_top_n_record(v, capability))
         .collect::<Result<_, _>>()?;
     Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+/// 头部排行双路 (ProviderTopNPair 视角): 服务端视图合流输出 (无分路顺序
+/// 保证), 客户端按 metric 分组重建 volume_ratio / main_net_inflow 两个
+/// GatewayBatch — 与本地 CapitalDataGateway::provider_top_n_pair 的
+/// `GatewayBatch<ProviderTopNFact> × 2` 结构对齐。
+pub fn provider_top_n_pair(
+    q: &QueryResult,
+) -> Result<
+    (
+        GatewayBatch<ProviderTopNFact>,
+        GatewayBatch<ProviderTopNFact>,
+    ),
+    GatewayError,
+> {
+    let capability = "ProviderTopNRankings";
+    let (parsed, ev) = parse_records_parts(q, capability)?;
+    if parsed.is_empty() {
+        return Ok((
+            GatewayBatch::VerifiedEmpty(ev.clone()),
+            GatewayBatch::VerifiedEmpty(ev),
+        ));
+    }
+    let mut volume: Vec<ProviderTopNFact> = Vec::new();
+    let mut inflow: Vec<ProviderTopNFact> = Vec::new();
+    for v in &parsed {
+        let record = parse_provider_top_n_record(v, capability)?;
+        match record.metric {
+            MarketRankingKind::VolumeRatio => volume.push(record),
+            MarketRankingKind::MainNetInflow => inflow.push(record),
+            other => return Err(err(capability, format!("头部排行未知 metric: {other:?}"))),
+        }
+    }
+    let partition = |records: Vec<ProviderTopNFact>| {
+        if records.is_empty() {
+            GatewayBatch::VerifiedEmpty(ev.clone())
+        } else {
+            GatewayBatch::Available {
+                records,
+                evidence: ev.clone(),
+            }
+        }
+    };
+    Ok((partition(volume), partition(inflow)))
 }
 
 pub fn index_quotes(q: &QueryResult) -> Result<GatewayBatch<RealtimeIndexQuote>, GatewayError> {

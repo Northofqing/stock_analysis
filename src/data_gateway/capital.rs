@@ -153,6 +153,28 @@ impl CapitalDataGateway {
         let storage_code = code.to_owned();
         let canonical = format!("{storage_code}:{interval:?}:{limit}");
         let request_hash = acquisition_request_hash(FUND_FLOW_CAPABILITY, &canonical);
+        // P4 M4b: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
+        match super::grpc_source::bridge_for("FundFlowSeries") {
+            Ok(Some(bridge)) => {
+                let result = bridge
+                    .fund_flow_series_async(&storage_code, interval, limit)
+                    .await;
+                let audit_provider = result
+                    .as_ref()
+                    .map(|b| b.evidence().provider)
+                    .unwrap_or(ProviderId::Eastmoney);
+                return audit_gateway_result(FUND_FLOW_CAPABILITY, audit_provider, &request_hash, result);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_gateway_result(
+                    FUND_FLOW_CAPABILITY,
+                    ProviderId::Eastmoney,
+                    &request_hash,
+                    Err(error),
+                );
+            }
+        }
         let worker_hash = request_hash.clone();
         let joined = tokio::task::spawn_blocking(move || {
             let result = build_fund_flow_request(&storage_code, interval, limit).and_then(
@@ -213,6 +235,84 @@ impl CapitalDataGateway {
         );
         let volume_request_hash = volume_request_evidence.request_hash.clone();
         let inflow_request_hash = inflow_request_evidence.request_hash.clone();
+        // P4 M4b: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; 双路 audit 留
+        // 客户端, request evidence 是本地构造的 (桥只换 transport 数据)。
+        match super::grpc_source::bridge_for("ProviderTopNRankings") {
+            Ok(Some(bridge)) => {
+                return match bridge.provider_top_n_pair_async(trading_date).await {
+                    Ok((volume, inflow)) => {
+                        let volume_audited = audit_gateway_result(
+                            PROVIDER_TOP_N_VOLUME_RATIO_CAPABILITY,
+                            ProviderId::Eastmoney,
+                            &volume_request_evidence.request_hash,
+                            Ok(volume),
+                        );
+                        let inflow_audited = audit_gateway_result(
+                            PROVIDER_TOP_N_MAIN_NET_INFLOW_CAPABILITY,
+                            ProviderId::Eastmoney,
+                            &inflow_request_evidence.request_hash,
+                            Ok(inflow),
+                        );
+                        match (volume_audited, inflow_audited) {
+                            (Ok(volume), Ok(inflow)) => Ok(ProviderTopNPair {
+                                volume_ratio_request: volume_request_evidence,
+                                volume_ratio: volume,
+                                main_net_inflow_request: inflow_request_evidence,
+                                main_net_inflow: inflow,
+                            }),
+                            (Err(error), _) | (_, Err(error)) => Err(error),
+                        }
+                    }
+                    Err(error) => {
+                        let volume_audited = audit_gateway_result::<ProviderTopNFact>(
+                            PROVIDER_TOP_N_VOLUME_RATIO_CAPABILITY,
+                            ProviderId::Eastmoney,
+                            &volume_request_evidence.request_hash,
+                            Err(error.clone()),
+                        );
+                        let inflow_audited = audit_gateway_result::<ProviderTopNFact>(
+                            PROVIDER_TOP_N_MAIN_NET_INFLOW_CAPABILITY,
+                            ProviderId::Eastmoney,
+                            &inflow_request_evidence.request_hash,
+                            Err(error),
+                        );
+                        match (volume_audited, inflow_audited) {
+                            (Err(error), _) | (_, Err(error)) => Err(error),
+                            (Ok(_), Ok(_)) => Err(GatewayError::unavailable(
+                                PROVIDER_TOP_N_VOLUME_RATIO_CAPABILITY,
+                                Some(ProviderId::Eastmoney),
+                                true,
+                                "头部排行 gRPC 桥失败且双路 audit 落库 (原始错误见上一条 audit 行)",
+                            )),
+                        }
+                    }
+                };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let volume_audited = audit_gateway_result::<ProviderTopNFact>(
+                    PROVIDER_TOP_N_VOLUME_RATIO_CAPABILITY,
+                    ProviderId::Eastmoney,
+                    &volume_request_evidence.request_hash,
+                    Err(error.clone()),
+                );
+                let inflow_audited = audit_gateway_result::<ProviderTopNFact>(
+                    PROVIDER_TOP_N_MAIN_NET_INFLOW_CAPABILITY,
+                    ProviderId::Eastmoney,
+                    &inflow_request_evidence.request_hash,
+                    Err(error),
+                );
+                return match (volume_audited, inflow_audited) {
+                    (Err(error), _) | (_, Err(error)) => Err(error),
+                    (Ok(_), Ok(_)) => Err(GatewayError::unavailable(
+                        PROVIDER_TOP_N_VOLUME_RATIO_CAPABILITY,
+                        Some(ProviderId::Eastmoney),
+                        true,
+                        "头部排行 gRPC 桥不可用且双路 audit 落库 (原始错误见上一条 audit 行)",
+                    )),
+                };
+            }
+        }
         let worker_volume_request_hash = volume_request_hash.clone();
         let worker_inflow_request_hash = inflow_request_hash.clone();
         let joined = tokio::task::spawn_blocking(move || {
@@ -248,6 +348,26 @@ impl CapitalDataGateway {
     ) -> Result<GatewayBatch<NorthboundDailyFact>, GatewayError> {
         let canonical = format!("{trading_date}:{channel:?}");
         let request_hash = acquisition_request_hash(NORTHBOUND_CAPABILITY, &canonical);
+        // P4 M4b: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
+        match super::grpc_source::bridge_for("NorthboundDaily") {
+            Ok(Some(bridge)) => {
+                let result = bridge.northbound_daily_async(trading_date, channel).await;
+                let audit_provider = result
+                    .as_ref()
+                    .map(|b| b.evidence().provider)
+                    .unwrap_or(ProviderId::Hkex);
+                return audit_gateway_result(NORTHBOUND_CAPABILITY, audit_provider, &request_hash, result);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_gateway_result(
+                    NORTHBOUND_CAPABILITY,
+                    ProviderId::Hkex,
+                    &request_hash,
+                    Err(error),
+                );
+            }
+        }
         let worker_hash = request_hash.clone();
         let joined = tokio::task::spawn_blocking(move || {
             let result = iso_date(trading_date, NORTHBOUND_CAPABILITY)

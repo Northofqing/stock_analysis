@@ -9,16 +9,19 @@
 //! 本地网关 (fetch_technical_bars → fifteen_min_bars 等), 若继承 env 会形成
 //! 桥 → 服务端 → 本地网关 → 桥 的无限递归。这是生产部署的强制约束 (M4 banner 文档化)。
 use chrono::{Duration, NaiveDate, Utc};
-use magic_market_core::ProviderId;
+use magic_market_core::{
+    FlowInterval, MarketRankingKind, NorthboundChannel, ProviderId, StatementKind,
+};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration as StdDuration, Instant};
 use stock_analysis::database::DatabaseManager;
 use stock_analysis::data_gateway::board_ranking::BoardRankingGateway;
 use stock_analysis::data_gateway::{
-    grpc_source, BlockTradesGateway, BoardDataGateway, BoardKind, CompanyDataGateway,
-    ConsensusDataGateway, DragonTigerGateway, HistoricalBarsGateway, IndexDataGateway,
-    MagicTdxGateway, MarketDataGateway, ReviewDataGateway, SinaInstrumentNewsGateway,
+    grpc_source, BlockTradesGateway, BoardDataGateway, BoardKind, CapitalDataGateway,
+    CompanyDataGateway, ConsensusDataGateway, DragonTigerGateway, HistoricalBarsGateway,
+    IndexDataGateway, IntradayShapeGateway, MagicTdxGateway, MarketDataGateway,
+    ResearchDataGateway, ReviewDataGateway, SinaInstrumentNewsGateway,
 };
 
 /// 拿空闲端口 (绑定后 drop; 竞态窗口对测试可接受)。
@@ -234,6 +237,73 @@ async fn bridge_all_hooked_ops_fixture_roundtrip() {
         Some("600519"),
         "InstrumentNews 保真"
     );
+
+    // ---- M4b 批次 1A: 6 个新桥 op (fixture 视图与 delegate fetch_* 对齐) ----
+    let reports = ResearchDataGateway::new()
+        .instrument_reports("600519", 5)
+        .await
+        .expect("ResearchReports 桥");
+    assert_eq!(reports.records()[0].report_id, "fixture-r1", "ResearchReports 保真");
+    assert_eq!(
+        reports.records()[0].source_target_price_upper,
+        Some(1600.0),
+        "ResearchReports target_price_upper 解析"
+    );
+
+    let northbound = CapitalDataGateway::new()
+        .northbound_daily(date, NorthboundChannel::Shanghai)
+        .await
+        .expect("NorthboundDaily 桥");
+    assert_eq!(northbound.records()[0].channel, NorthboundChannel::Shanghai, "NorthboundDaily channel 保真");
+    assert_eq!(northbound.records()[0].total_turnover, 5.2e10, "NorthboundDaily 保真");
+    assert_eq!(
+        northbound.records()[0].top_turnover[0].name, "贵州茅台",
+        "NorthboundDaily top_turnover 解析"
+    );
+
+    let statements = CompanyDataGateway::new()
+        .financial_statements(&["600519".to_string()], StatementKind::Balance)
+        .await
+        .expect("FinancialStatements 桥");
+    assert_eq!(
+        statements.records()[0].kind,
+        StatementKind::Balance,
+        "FinancialStatements kind 保真"
+    );
+    assert_eq!(
+        statements.records()[0].lines[0].key.as_str(),
+        "total_assets",
+        "FinancialStatements lines 保真"
+    );
+
+    let flows = CapitalDataGateway::new()
+        .instrument_fund_flow("600519", FlowInterval::Day1, 20)
+        .await
+        .expect("FundFlowSeries 桥");
+    assert_eq!(flows.records()[0].main_net, 5e7, "FundFlowSeries 保真");
+    assert_eq!(
+        flows.records()[0].interval,
+        FlowInterval::Day1,
+        "FundFlowSeries interval 保真"
+    );
+
+    let pair = CapitalDataGateway::new()
+        .provider_top_n_pair(date)
+        .await
+        .expect("ProviderTopNRankings 桥");
+    assert_eq!(
+        pair.volume_ratio.records()[0].instrument.code().to_string(),
+        "600519",
+        "ProviderTopNRankings volume 保真"
+    );
+    assert_eq!(pair.volume_ratio.records()[0].metric, MarketRankingKind::VolumeRatio);
+    assert_eq!(pair.main_net_inflow.records()[0].metric, MarketRankingKind::MainNetInflow);
+
+    let shape = IntradayShapeGateway::new()
+        .current_shape("600519")
+        .await
+        .expect("IntradayShape 桥");
+    assert_eq!(shape.records()[0].shape_label, "稳步推高", "IntradayShape 保真");
 
     server.kill().expect("kill server");
     grpc_source::reset_bridge();

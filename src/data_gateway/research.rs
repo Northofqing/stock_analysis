@@ -42,6 +42,26 @@ impl ResearchDataGateway {
     ) -> Result<GatewayBatch<ResearchReportFact>, GatewayError> {
         let code = validate_code(code)?.to_owned();
         let request_hash = acquisition_request_hash(CAPABILITY, &format!("{code}:1:{page_size}"));
+        // P4 M4b: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
+        match super::grpc_source::bridge_for("ResearchReports") {
+            Ok(Some(bridge)) => {
+                let result = bridge.research_reports_async(&code, page_size).await;
+                let audit_provider = result
+                    .as_ref()
+                    .map(|b| b.evidence().provider)
+                    .unwrap_or(ProviderId::Eastmoney);
+                return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_gateway_result(
+                    CAPABILITY,
+                    ProviderId::Eastmoney,
+                    &request_hash,
+                    Err(error),
+                );
+            }
+        }
         let worker_request_hash = request_hash.clone();
         let joined = tokio::task::spawn_blocking(move || {
             let result = build_request(&code, page_size).and_then(fetch_reports);

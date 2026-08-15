@@ -190,6 +190,48 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
                 r#"[{"open":1490.0,"close":1500.0,"high":1505.0,"low":1488.0,"vol":1234567.0,"amount":1.85e9,"at":"2026-08-15T10:30:00+08:00"}]"#,
             )],
         )),
+        // P4 M4b: 批次 1A 新增 fixture (视图字段与 delegate fetch_* 一一对应)。
+        Operation::ResearchReports => Some(resp(
+            "fixture-rr",
+            vec![payload(
+                r#"[{"code":"600519","report_id":"fixture-r1","title":"贵州茅台:2026年中报点评","organization":"国泰君安","rating":"增持","published_at":"2026-08-13T09:00:00+08:00","canonical_url":"https://example.com/r1","target_price_upper":1600.0,"target_price_lower":1500.0}]"#,
+            )],
+        )),
+        Operation::NorthboundDaily => Some(resp(
+            "fixture-nbd",
+            vec![payload(
+                r#"[{"trading_date":"2026-08-13","channel":"Shanghai","total_turnover":5.2e10,"total_trade_count":4200.0,"quota_balance":8e9,"etf_turnover":1.2e9,"top_turnover":[{"rank":1,"code":"600519","name":"贵州茅台","total_turnover":1.8e9}]}]"#,
+            )],
+        )),
+        Operation::FinancialStatements => Some(resp(
+            "fixture-fs",
+            vec![payload(
+                r#"[{"instrument":{"exchange":"Shanghai","code":"600519","asset_class":"Equity"},"kind":"Balance","report_period":"2026-06-30","announced_on":"2026-08-15","currency":"CNY","lines":[{"key":"total_assets","source_label":"总资产","value":3.2e11,"unit":"元"}],"evidence":{"provider":"Tdx","source_at":"2026-08-13T10:00:00+08:00","observed_at":"2026-08-13T10:00:00+08:00","batch_id":"fixture-b1"}}]"#,
+            )],
+        )),
+        Operation::FundFlowSeries => Some(resp(
+            "fixture-ffs",
+            vec![payload(
+                r#"[{"code":"600519","interval":"Day1","period_at":"2026-08-13","main_net":5e7,"main_ratio_percent":12.3,"super_large_net":4e7,"large_net":1e7,"medium_net":-2e6,"small_net":-3e6}]"#,
+            )],
+        )),
+        Operation::ProviderTopNRankings => Some(QueryResponse {
+            // 该 op 客户端双路 audit 锚定 Eastmoney (request evidence 语义) →
+            // selected_provider 必须 = Eastmoney, 否则 audit_gateway_result 判
+            // "batch provider differs from the admitted provider"。
+            request_id: "fixture-ptr".to_string(),
+            operation: Operation::ProviderTopNRankings as i32,
+            admission: AdmissionState::Admitted as i32,
+            selected_provider: "Eastmoney".to_string(),
+            batch_id: "fixture-b1".to_string(),
+            complete: true,
+            observed_at: "2026-08-13T10:00:00+08:00".to_string(),
+            source_at: "2026-08-13T10:00:00+08:00".to_string(),
+            records: vec![payload(
+                r#"[{"metric":"VolumeRatio","ordinal":1,"code":"600519","label":"贵州茅台","value":3.2,"unit":"Multiple","trading_date":"2026-08-13","filter_identity":"volume_ratio_top20","provider_declared_total":20,"inspected_row_count":20},{"metric":"MainNetInflow","ordinal":1,"code":"600519","label":"贵州茅台","value":1.5e9,"unit":"Yuan","trading_date":"2026-08-13","filter_identity":"main_net_inflow_top20","provider_declared_total":20,"inspected_row_count":20}]"#,
+            )],
+            source: "fixture".to_string(),
+        }),
         _ => None,
     }
 }

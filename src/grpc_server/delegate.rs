@@ -150,7 +150,7 @@ pub async fn fetch(
         Operation::MarketRankings => fetch_market_rankings(params).await.map_err(DelegateError::Fetch),
         Operation::ConceptHits => fetch_concept_hits(params).await.map_err(DelegateError::Fetch),
         Operation::ResearchReports => fetch_research_reports(params).await.map_err(DelegateError::Fetch),
-        Operation::NorthboundDaily => fetch_northbound_daily().await.map_err(DelegateError::Fetch),
+        Operation::NorthboundDaily => fetch_northbound_daily(params).await.map_err(DelegateError::Fetch),
         // M1 扩展 (P4): 8 个 proto 已有 op (直接返回 DelegateError, Params 可映射 400)。
         Operation::ForeignExchange => fetch_foreign_exchange(params).await,
         Operation::FinancialStatements => fetch_financial_statements(params).await,
@@ -959,27 +959,32 @@ async fn fetch_research_reports(params: &Value) -> Result<Fetched, String> {
 }
 
 /// 北向资金: 沪股通 + 深股通 两 channel 并发 (逐 channel 查询)。
-async fn fetch_northbound_daily() -> Result<Fetched, String> {
+/// 北向日数据: P4 M4b 升级 — 收 date + channel params (默认今天/Shanghai),
+/// 与客户端桥 CapitalDataGateway::northbound_daily(trading_date, channel) 对齐
+/// (此前固定 today()+双 channel 合流, 无法满足指定日期/单通道请求)。
+async fn fetch_northbound_daily(params: &Value) -> Result<Fetched, String> {
+    let date = crate::grpc_contract::params::resolve_date(params)
+        .map_err(|e| format!("params 无效: {e}"))?;
+    let channel = match crate::grpc_contract::params::resolve_enum_str(
+        params,
+        "channel",
+        &["Shanghai", "Shenzhen"],
+        "Shanghai",
+    )
+    .map_err(|e| format!("params 无效: {e}"))?
+    {
+        "Shenzhen" => NorthboundChannel::Shenzhen,
+        _ => NorthboundChannel::Shanghai,
+    };
     let gateway = CapitalDataGateway::new();
-    let mut set = tokio::task::JoinSet::new();
-    for channel in [NorthboundChannel::Shanghai, NorthboundChannel::Shenzhen] {
-        let gateway = gateway;
-        set.spawn(async move {
-            let batch = gateway
-                .northbound_daily(today(), channel)
-                .await
-                .map_err(|e| format!("北向资金 Gateway 不可用 ({channel:?}): {e}"))?;
-            Ok::<_, String>((channel, batch))
-        });
-    }
-    let mut records: Vec<Value> = Vec::new();
-    let mut source_at = String::new();
-    while let Some(joined) = set.join_next().await {
-        let (_channel, batch) = joined.map_err(|e| format!("北向资金 task 失败: {e}"))??;
-        if source_at.is_empty() {
-            source_at = source_at_of(&batch);
-        }
-        records.extend(batch.records().iter().map(|r| {
+    let batch = gateway
+        .northbound_daily(date, channel)
+        .await
+        .map_err(|e| format!("北向资金 Gateway 不可用: {e}"))?;
+    let records: Vec<Value> = batch
+        .records()
+        .iter()
+        .map(|r| {
             json!({
                 "trading_date": r.trading_date.to_string(),
                 "channel": format!("{:?}", r.channel),
@@ -1003,9 +1008,9 @@ async fn fetch_northbound_daily() -> Result<Fetched, String> {
                     })
                     .collect::<Vec<_>>(),
             })
-        }));
-    }
-    pack(records, source_at)
+        })
+        .collect();
+    pack(records, source_at_of(&batch))
 }
 
 // ---------- M1 扩展 (P4): 8 个 proto 已有 op ----------
@@ -1259,6 +1264,7 @@ async fn fetch_provider_top_n_rankings(params: &Value) -> Result<Fetched, Delega
                 "trading_date": r.trading_date.as_str(),
                 "filter_identity": r.filter_identity.as_str(),
                 "provider_declared_total": r.provider_declared_total.get(),
+                "inspected_row_count": r.inspected_row_count.get(),
             }));
         }
     }

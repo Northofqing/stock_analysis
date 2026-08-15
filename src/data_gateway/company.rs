@@ -54,6 +54,33 @@ impl CompanyDataGateway {
             FINANCIAL_CAPABILITY,
             &format!("{kind:?}:{}", storage_codes.join(",")),
         );
+        // P4 M4b: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
+        match super::grpc_source::bridge_for("FinancialStatements") {
+            Ok(Some(bridge)) => {
+                let result = bridge
+                    .financial_statements_async(&storage_codes, kind)
+                    .await;
+                let audit_provider = result
+                    .as_ref()
+                    .map(|b| b.evidence().provider)
+                    .unwrap_or(ProviderId::Sina);
+                return audit_gateway_result(
+                    FINANCIAL_CAPABILITY,
+                    audit_provider,
+                    &request_hash,
+                    result,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_gateway_result(
+                    FINANCIAL_CAPABILITY,
+                    ProviderId::Sina,
+                    &request_hash,
+                    Err(error),
+                );
+            }
+        }
         let worker_hash = request_hash.clone();
         let joined = tokio::task::spawn_blocking(move || {
             let result = build_instruments(&storage_codes, FINANCIAL_CAPABILITY)

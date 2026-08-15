@@ -24,7 +24,9 @@ use crate::grpc_client::client::GrpcMarketClient;
 use crate::grpc_client::envelope::QueryResult;
 use crate::grpc_client::pb::magic::market::v1::Operation;
 use chrono::NaiveDate;
-use magic_market_core::{FinancialStatement, MarketStatistics};
+use magic_market_core::{
+    FinancialStatement, FlowInterval, MarketStatistics, NorthboundChannel, StatementKind,
+};
 use magic_tdx_rs::protocol::types::SecurityBar;
 use serde_json::Value;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -51,17 +53,23 @@ pub const HOOKED_OPS: &[&str] = &[
     "Consensus",
     "DragonTiger",
     "EconomicCalendar",
+    "FinancialStatements",
     "ForeignExchange",
+    "FundFlowSeries",
     "FuturesDelivery",
     "GlobalNews",
     "HistoricalBars",
     "IndexQuotes",
     "InstrumentNews",
+    "IntradayShape",
     "MarketStatistics",
     "MinuteData",
     "MoneyFlows",
+    "NorthboundDaily",
     "OrderBooks",
+    "ProviderTopNRankings",
     "RealtimeQuotes",
+    "ResearchReports",
     "SecurityMetadata",
     "T0Evidence",
     "TechnicalBars",
@@ -77,12 +85,6 @@ pub const KEEP_LOCAL_OPS: &[&str] = &[
     "limit_pools",
     "strong_stock_reasons",
     "corporate_actions",
-    "provider_top_n_pair",
-    "instrument_fund_flow",
-    "northbound_daily",
-    "financial_statements",
-    "research_reports",
-    "intraday_shape",
 ];
 
 /// 网关钩子入口: DATA_GATEWAY_GRPC=1 且 op 未被 DISABLED → Some(Arc<GrpcSource>)
@@ -543,29 +545,64 @@ impl GrpcSource {
         block_on(self.board_ranking_async(fid, top_n))
     }
 
+    /// 研报: 逐代码 + page_size (与本地 ResearchDataGateway::instrument_reports
+    /// 对齐; 服务端 fetch_research_reports 收 codes+page_size)。
     pub async fn research_reports_async(
         &self,
+        code: &str,
+        page_size: u32,
     ) -> Result<GatewayBatch<ResearchReportFact>, GatewayError> {
         let q = self
-            .query_op(Operation::ResearchReports, serde_json::json!({}))
+            .query_op(
+                Operation::ResearchReports,
+                serde_json::json!({ "codes": [code], "page_size": page_size }),
+            )
             .await?;
         convert::research_reports(&q)
     }
 
+    /// 北向日数据: date + channel (与本地 CapitalDataGateway::northbound_daily
+    /// 对齐; 服务端 fetch_northbound_daily 收 date+channel)。
     pub async fn northbound_daily_async(
         &self,
+        trading_date: NaiveDate,
+        channel: NorthboundChannel,
     ) -> Result<GatewayBatch<NorthboundDailyFact>, GatewayError> {
         let q = self
-            .query_op(Operation::NorthboundDaily, serde_json::json!({}))
+            .query_op(
+                Operation::NorthboundDaily,
+                serde_json::json!({
+                    "date": trading_date.format("%Y-%m-%d").to_string(),
+                    "channel": format!("{channel:?}"),
+                }),
+            )
             .await?;
         convert::northbound_daily(&q)
     }
 
+    /// 财务报告: codes + kind (与本地 CompanyDataGateway::financial_statements
+    /// 对齐; 服务端 fetch_financial_statements 的 kind 是 snake_case 字面量)。
     pub async fn financial_statements_async(
         &self,
+        codes: &[String],
+        kind: StatementKind,
     ) -> Result<GatewayBatch<FinancialStatement>, GatewayError> {
+        let kind = match kind {
+            StatementKind::Balance => "balance",
+            StatementKind::Income => "income",
+            StatementKind::CashFlow => "cash_flow",
+            other => {
+                return Err(GatewayError::invalid_request(
+                    "GrpcBridge",
+                    format!("财务报告 kind 不支持走桥: {other:?}"),
+                ))
+            }
+        };
         let q = self
-            .query_op(Operation::FinancialStatements, serde_json::json!({}))
+            .query_op(
+                Operation::FinancialStatements,
+                serde_json::json!({ "codes": codes, "kind": kind }),
+            )
             .await?;
         convert::financial_statements(&q)
     }
@@ -606,23 +643,49 @@ impl GrpcSource {
         block_on(self.technical_bars_async(codes, count))
     }
 
+    /// 资金流序列: 逐代码 + interval + limit (与本地
+    /// CapitalDataGateway::instrument_fund_flow 对齐; 服务端
+    /// fetch_fund_flow_series 收 codes+interval+limit)。
     pub async fn fund_flow_series_async(
         &self,
+        code: &str,
+        interval: FlowInterval,
         limit: u32,
     ) -> Result<GatewayBatch<InstrumentFundFlowFact>, GatewayError> {
         let q = self
-            .query_op(Operation::FundFlowSeries, serde_json::json!({ "limit": limit }))
+            .query_op(
+                Operation::FundFlowSeries,
+                serde_json::json!({
+                    "codes": [code],
+                    "interval": format!("{interval:?}"),
+                    "limit": limit,
+                }),
+            )
             .await?;
         convert::fund_flow_series(&q)
     }
 
-    pub async fn provider_top_n_rankings_async(
+    /// 头部排行双路 (volume_ratio + main_net_inflow): 与本地
+    /// CapitalDataGateway::provider_top_n_pair 对齐 — 客户端 convert 按 metric
+    /// 分组重建两个 GatewayBatch (request evidence 由本地方法构造, 桥只换
+    /// transport 数据)。
+    pub async fn provider_top_n_pair_async(
         &self,
-    ) -> Result<GatewayBatch<ProviderTopNFact>, GatewayError> {
+        trading_date: NaiveDate,
+    ) -> Result<
+        (
+            GatewayBatch<ProviderTopNFact>,
+            GatewayBatch<ProviderTopNFact>,
+        ),
+        GatewayError,
+    > {
         let q = self
-            .query_op(Operation::ProviderTopNRankings, serde_json::json!({}))
+            .query_op(
+                Operation::ProviderTopNRankings,
+                serde_json::json!({ "date": trading_date.format("%Y-%m-%d").to_string() }),
+            )
             .await?;
-        convert::provider_top_n_rankings(&q)
+        convert::provider_top_n_pair(&q)
     }
 
     /// 指数实时行情: codes (与本地 IndexDataGateway::realtime_quotes 对齐)。
@@ -660,11 +723,14 @@ impl GrpcSource {
         convert::instrument_news(&q)
     }
 
+    /// 日内形态: 逐代码 (与本地 IntradayShapeGateway::current_shape 对齐;
+    /// 服务端 fetch_intraday_shape 收 codes)。
     pub async fn intraday_shape_async(
         &self,
+        code: &str,
     ) -> Result<GatewayBatch<IntradayShapeFact>, GatewayError> {
         let q = self
-            .query_op(Operation::IntradayShape, serde_json::json!({}))
+            .query_op(Operation::IntradayShape, serde_json::json!({ "codes": [code] }))
             .await?;
         convert::intraday_shape(&q)
     }
@@ -778,7 +844,7 @@ mod tests {
         assert!(b.contains("数据源模式 = library"), "默认必须 library (v15.x 出声): {b}");
         assert!(b.contains("server = http://127.0.0.1:18082"), "默认地址: {b}");
         assert!(b.contains("禁用 = 无"), "无禁用: {b}");
-        assert!(b.contains("保持本地 11 ops"), "keep-local 计数: {b}");
+        assert!(b.contains("保持本地 5 ops"), "keep-local 计数: {b}");
     }
 
     #[test]
