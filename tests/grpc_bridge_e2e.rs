@@ -10,7 +10,8 @@
 //! 桥 → 服务端 → 本地网关 → 桥 的无限递归。这是生产部署的强制约束 (M4 banner 文档化)。
 use chrono::{Duration, NaiveDate, Utc};
 use magic_market_core::{
-    FlowInterval, MarketRankingKind, NorthboundChannel, ProviderId, StatementKind,
+    CorporateActionCategory, FlowInterval, MarketRankingKind, NorthboundChannel, ProviderId,
+    StatementKind,
 };
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -19,9 +20,10 @@ use stock_analysis::database::DatabaseManager;
 use stock_analysis::data_gateway::board_ranking::BoardRankingGateway;
 use stock_analysis::data_gateway::{
     grpc_source, BlockTradesGateway, BoardDataGateway, BoardKind, CapitalDataGateway,
-    CompanyDataGateway, ConsensusDataGateway, DragonTigerGateway, HistoricalBarsGateway,
+    CompanyDataGateway, ConsensusDataGateway, DragonTigerGateway, GeneralWebResearchBatch,
+    GeneralWebResearchGateway, GeneralWebResearchProvider, HistoricalBarsGateway,
     IndexDataGateway, IntradayShapeGateway, MagicTdxGateway, MarketDataGateway,
-    ResearchDataGateway, ReviewDataGateway, SinaInstrumentNewsGateway,
+    ResearchDataGateway, ReviewDataGateway, SecurityLifecycleGateway, SinaInstrumentNewsGateway,
 };
 
 /// 拿空闲端口 (绑定后 drop; 竞态窗口对测试可接受)。
@@ -304,6 +306,48 @@ async fn bridge_all_hooked_ops_fixture_roundtrip() {
         .await
         .expect("IntradayShape 桥");
     assert_eq!(shape.records()[0].shape_label, "稳步推高", "IntradayShape 保真");
+
+    // ---- M4b 批次 1B: semantic_search + corporate_actions (新桥方法) ----
+    let ws = GeneralWebResearchGateway::from_environment(GeneralWebResearchProvider::Bocha)
+        .search("白酒 景气", 10)
+        .await
+        .expect("SemanticSearch 桥");
+    assert_eq!(
+        ws.evidence().provider,
+        GeneralWebResearchProvider::Bocha,
+        "SemanticSearch 批级 provider 保真"
+    );
+    let ws_records = match &ws {
+        GeneralWebResearchBatch::Available { records, .. } => records,
+        GeneralWebResearchBatch::VerifiedEmpty(_) => panic!("SemanticSearch 不应为空 (fixture)"),
+    };
+    assert_eq!(ws_records[0].title, "白酒行业景气度跟踪", "SemanticSearch 保真");
+    assert_eq!(
+        ws_records[0].evidence.batch_id, "fixture-b1",
+        "SemanticSearch 记录级 evidence.batch_id 保真"
+    );
+
+    let ctx = SecurityLifecycleGateway::new()
+        .acquire("600519", date - Duration::days(180), date)
+        .await
+        .expect("CorporateActions 桥");
+    assert_eq!(
+        ctx.instrument.code().to_string(),
+        "600519",
+        "CorporateActions instrument 保真"
+    );
+    let actions = ctx.corporate_actions.records();
+    assert_eq!(actions.len(), 1, "CorporateActions records");
+    assert_eq!(
+        actions[0].category,
+        CorporateActionCategory::Distribution,
+        "CorporateActions category 保真"
+    );
+    assert_eq!(
+        actions[0].effective_on.to_string(),
+        "2026-08-20",
+        "CorporateActions effective_on 保真"
+    );
 
     server.kill().expect("kill server");
     grpc_source::reset_bridge();

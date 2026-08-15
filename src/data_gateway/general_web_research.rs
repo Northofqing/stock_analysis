@@ -245,7 +245,10 @@ impl GeneralWebResearchGateway {
     }
 
     pub fn is_available(&self) -> bool {
-        !self.api_keys.is_empty()
+        // P4 M4b 批次 1B: grpc 模式桥存在即视为可用 (API key 服务端持有)。
+        // 保持 SearchService 路由语义 — 桥故障在调用时显式报错, 不静默回退。
+        matches!(super::grpc_source::bridge_for("SemanticSearch"), Ok(Some(_)))
+            || !self.api_keys.is_empty()
     }
 
     pub async fn search(
@@ -262,6 +265,31 @@ impl GeneralWebResearchGateway {
                 GeneralWebResearchStage::Request,
                 format!("query must be non-empty and limit must be within 1..={MAX_RESULTS}"),
             ));
+        }
+        // P4 M4b 批次 1B: grpc 模式走桥 (服务端 Bocha 直连, API key 服务端持有)。
+        match super::grpc_source::bridge_for("SemanticSearch") {
+            Ok(Some(bridge)) => {
+                return match bridge.semantic_search_async(query, limit).await {
+                    Ok(batch) => Ok(batch),
+                    Err(e) => Err(GeneralWebResearchError::new(
+                        self.provider,
+                        e.reason_code(),
+                        e.retryable(),
+                        GeneralWebResearchStage::Transport,
+                        e.to_string(),
+                    )),
+                };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(GeneralWebResearchError::new(
+                    self.provider,
+                    "grpc_bridge",
+                    true,
+                    GeneralWebResearchStage::Transport,
+                    format!("SemanticSearch 桥初始化失败: {error}"),
+                ));
+            }
         }
         let api_key = self.next_key().ok_or_else(|| {
             GeneralWebResearchError::new(

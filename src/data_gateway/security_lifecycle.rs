@@ -24,6 +24,7 @@ use super::review::{
     acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result, BatchEvidence,
     GatewayBatch, GatewayError,
 };
+use super::MarketSecurityMetadata;
 
 const LIFECYCLE_CAPABILITY: &str = "SecurityLifecycle";
 const LISTING_CAPABILITY: &str = "SecurityLifecycleListing";
@@ -261,6 +262,53 @@ impl SecurityLifecycleGateway {
         let actions_hash = acquisition_request_hash(ACTIONS_CAPABILITY, &canonical);
         let worker_lifecycle_hash = lifecycle_hash.clone();
 
+        // P4 M4b 批次 1B: grpc 模式走桥 (服务端 SecurityLifecycleGateway 直连)。
+        // 本地验证先行复制 (fail-fast, 与 acquire_blocking 语义一致):
+        // window 顺序 + build_instrument (含 Beijing 拒绝)。审计留客户端
+        // (audit_gateway_result), 与服务端审计双写 — ProviderTopNRankings 先例。
+        match super::grpc_source::bridge_for("CorporateActions") {
+            Ok(Some(bridge)) => {
+                if window_start > window_end {
+                    return Err(GatewayError::invalid_request(
+                        LIFECYCLE_CAPABILITY,
+                        "lifecycle window start must not exceed end",
+                    ));
+                }
+                let instrument = build_instrument(&code)?;
+                let metadata = bridge
+                    .security_metadata_async(std::slice::from_ref(&code))
+                    .await
+                    .map(bridge_listing_projection);
+                let metadata = audit_gateway_result(
+                    LISTING_CAPABILITY,
+                    ProviderId::Tdx,
+                    &listing_hash,
+                    metadata,
+                );
+                let actions = bridge
+                    .corporate_actions_async(&code, window_start, window_end)
+                    .await;
+                let actions =
+                    audit_gateway_result(ACTIONS_CAPABILITY, ProviderId::Tdx, &actions_hash, actions);
+                return Ok(SecurityLifecycleContext {
+                    instrument,
+                    window_start,
+                    window_end,
+                    listing: listing_state(metadata),
+                    corporate_actions: action_state(actions),
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(GatewayError::unavailable(
+                    LIFECYCLE_CAPABILITY,
+                    Some(ProviderId::Tdx),
+                    true,
+                    format!("CorporateActions 桥初始化失败: {error}"),
+                ));
+            }
+        }
+
         let joined = tokio::task::spawn_blocking(move || {
             acquire_blocking(code, window_start, window_end, listing_hash, actions_hash)
         })
@@ -407,6 +455,24 @@ fn admit_listing_metadata(
         records: vec![ListingProjection { listed_on }],
         evidence,
     })
+}
+
+/// 桥路径 listing 映射: 服务端 SecurityMetadata 视图 listed_on 恒为 to_string()
+/// (非 Option) → 记录恒携带日期; 空批 (VerifiedEmpty) 原样传递, 由 listing_state
+/// 统一映射为 Unavailable-with-evidence (fail-closed, 与本地 "omitted" 语义等效)。
+fn bridge_listing_projection(
+    batch: GatewayBatch<MarketSecurityMetadata>,
+) -> GatewayBatch<ListingProjection> {
+    match batch {
+        GatewayBatch::Available { records, evidence } => {
+            let listed_on = records.first().map(|r| r.listed_on);
+            GatewayBatch::Available {
+                records: vec![ListingProjection { listed_on }],
+                evidence,
+            }
+        }
+        GatewayBatch::VerifiedEmpty(evidence) => GatewayBatch::VerifiedEmpty(evidence),
+    }
 }
 
 fn listing_state(

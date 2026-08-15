@@ -14,10 +14,11 @@ use crate::data_gateway::{
     board_ranking::BoardRankingFact, BlockTradeReview, BoardDirectoryFact, BoardFlowFact,
     BoardKind, BoardMembershipRecord, DragonTigerStockReview, EconomicReleaseFact,
     EventAnnouncement, ForeignExchangeFact, FuturesDeliveryFact, GatewayBatch, GatewayError,
-    GlobalIndexFact, GlobalNewsRecord, InstrumentFundFlowFact, IntradayShapeFact,
-    MagicTdxT0Batch, MarketMinutePoint, MarketMoneyFlow, MarketOrderBook,
-    MarketSecurityMetadata, NorthboundDailyFact, ProviderTopNFact, RealtimeIndexQuote,
-    RealtimeMarketQuote, ResearchReportFact, SinaInstrumentNewsRecord, UpperLimitRecord,
+    GeneralWebResearchBatch, GlobalIndexFact, GlobalNewsRecord, ImplementedCorporateAction,
+    InstrumentFundFlowFact, IntradayShapeFact, MagicTdxT0Batch, MarketMinutePoint,
+    MarketMoneyFlow, MarketOrderBook, MarketSecurityMetadata, NorthboundDailyFact,
+    ProviderTopNFact, RealtimeIndexQuote, RealtimeMarketQuote, ResearchReportFact,
+    SinaInstrumentNewsRecord, UpperLimitRecord,
 };
 use crate::data_provider::{consensus::ConsensusData, KlineData};
 use crate::grpc_client::client::GrpcMarketClient;
@@ -51,6 +52,7 @@ pub const HOOKED_OPS: &[&str] = &[
     "BoardFlows",
     "BoardRanking",
     "Consensus",
+    "CorporateActions",
     "DragonTiger",
     "EconomicCalendar",
     "FinancialStatements",
@@ -71,6 +73,7 @@ pub const HOOKED_OPS: &[&str] = &[
     "RealtimeQuotes",
     "ResearchReports",
     "SecurityMetadata",
+    "SemanticSearch",
     "T0Evidence",
     "TechnicalBars",
     "UpperLimitPoolReview",
@@ -80,11 +83,9 @@ pub const HOOKED_OPS: &[&str] = &[
 /// 半实现, 但桥保真未经验证 → 不静默切换, 出声 banner 列 follow-up。
 /// 接桥时从本表删除并移入 HOOKED_OPS。
 pub const KEEP_LOCAL_OPS: &[&str] = &[
-    "semantic_search",
     "outcome_daily_bars",
     "limit_pools",
     "strong_stock_reasons",
-    "corporate_actions",
 ];
 
 /// 网关钩子入口: DATA_GATEWAY_GRPC=1 且 op 未被 DISABLED → Some(Arc<GrpcSource>)
@@ -768,6 +769,44 @@ impl GrpcSource {
     ) -> Result<MagicTdxT0Batch, GatewayError> {
         block_on(self.t0_evidence_batch_async(codes))
     }
+
+    /// 联网检索: query + limit (与本地 GeneralWebResearchGateway::search
+    /// 对齐; 服务端 fetch_semantic_search 收 query+limit, API key 在服务端持有)。
+    pub async fn semantic_search_async(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<GeneralWebResearchBatch, GatewayError> {
+        let q = self
+            .query_op(
+                Operation::SemanticSearch,
+                serde_json::json!({ "query": query, "limit": limit }),
+            )
+            .await?;
+        convert::semantic_search(&q, query)
+    }
+
+    /// 公司行动: code + window (与本地 SecurityLifecycleGateway::acquire 的
+    /// corporate_actions 部分对齐; 服务端 fetch_corporate_actions 收
+    /// code+window_start+window_end, 已服务端侧完成 Implemented 投影)。
+    pub async fn corporate_actions_async(
+        &self,
+        code: &str,
+        window_start: NaiveDate,
+        window_end: NaiveDate,
+    ) -> Result<GatewayBatch<ImplementedCorporateAction>, GatewayError> {
+        let q = self
+            .query_op(
+                Operation::CorporateActions,
+                serde_json::json!({
+                    "code": code,
+                    "window_start": window_start.format("%Y-%m-%d").to_string(),
+                    "window_end": window_end.format("%Y-%m-%d").to_string(),
+                }),
+            )
+            .await?;
+        convert::corporate_actions(&q)
+    }
 }
 
 #[cfg(test)]
@@ -844,7 +883,7 @@ mod tests {
         assert!(b.contains("数据源模式 = library"), "默认必须 library (v15.x 出声): {b}");
         assert!(b.contains("server = http://127.0.0.1:18082"), "默认地址: {b}");
         assert!(b.contains("禁用 = 无"), "无禁用: {b}");
-        assert!(b.contains("保持本地 5 ops"), "keep-local 计数: {b}");
+        assert!(b.contains("保持本地 3 ops"), "keep-local 计数: {b}");
     }
 
     #[test]

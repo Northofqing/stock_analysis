@@ -232,6 +232,30 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
             )],
             source: "fixture".to_string(),
         }),
+        Operation::SemanticSearch => Some(QueryResponse {
+            // convert::parse_general_web_provider 只认 GeneralWebResearchProvider
+            // Debug 名 ("Bocha"); 通用 resp() 硬编码 "Tdx" 会解析失败 → 自定义。
+            request_id: "fixture-ws".to_string(),
+            operation: Operation::SemanticSearch as i32,
+            admission: AdmissionState::Admitted as i32,
+            selected_provider: "Bocha".to_string(),
+            batch_id: "fixture-b1".to_string(),
+            complete: true,
+            observed_at: "2026-08-15T09:00:00+08:00".to_string(),
+            source_at: "2026-08-15T09:00:00+08:00".to_string(),
+            records: vec![payload(
+                // GeneralWebResearchRecord 直出 (snake_case serde round-trip);
+                // record 级 evidence.batch_id 必须 == 信封 batch_id (convert 校验)。
+                r#"[{"title":"白酒行业景气度跟踪","snippet":"2026年中报白酒板块营收同比增长 8.2%","url":"https://example.com/ws1","publisher":"国泰君安证券","published_at_raw":"2026-08-15T09:00:00+08:00","published_at":"2026-08-15T09:00:00+08:00","evidence":{"provider":"bocha","observed_at":"2026-08-15T09:00:00+08:00","batch_id":"fixture-b1","item_id":"ws-1","publication_quality":"exact_provider_time","use_scope":"research_only"}}]"#,
+            )],
+            source: "bocha-general-web".to_string(),
+        }),
+        Operation::CorporateActions => Some(resp(
+            "fixture-ca",
+            vec![payload(
+                r#"[{"code":"600519","category":"Distribution","effective_on":"2026-08-20","record_on":"2026-08-13","ex_on":"2026-08-19","payable_on":"2026-08-21","terms":{"Distribution":{"cash_per_share":0.15,"bonus_per_share":null,"rights_per_share":null,"rights_price":null}}}]"#,
+            )],
+        )),
         _ => None,
     }
 }

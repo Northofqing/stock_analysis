@@ -11,22 +11,24 @@ use crate::data_gateway::{
     BoardDirectoryRecordEvidence, BoardFlowFact, BoardKind, BoardMembershipRecord,
     DragonTigerSeatReview, DragonTigerSourceDisclosure, DragonTigerStockReview,
     EconomicReleaseFact, EventAnnouncement, ForeignExchangeFact, FuturesDeliveryFact,
-    GatewayBatch, GatewayError, GlobalIndexFact, GlobalNewsRecord, InstrumentFundFlowFact,
-    IntradayShapeFact, MagicTdxT0Batch, MagicTdxT0DailyBar, MagicTdxT0Evidence,
-    MagicTdxT0FiveMinuteBar, MagicTdxT0Quote, MagicTdxT0Rejection, MarketBookLevel,
-    MarketMinutePoint, MarketMoneyFlow, MarketOrderBook, MarketSecurityMetadata,
-    NorthboundDailyFact, NorthboundQuotaFact, NorthboundTopTurnoverFact, ProviderTopNFact,
-    RealtimeIndexQuote, RealtimeMarketQuote, ResearchReportFact, SecurityBoard,
-    SinaInstrumentNewsRecord, T0BookLevel, UpperLimitRecord,
+    GatewayBatch, GatewayError, GeneralWebResearchBatch, GeneralWebResearchBatchEvidence,
+    GeneralWebResearchProvider, GeneralWebResearchRecord, GlobalIndexFact, GlobalNewsRecord,
+    ImplementedCorporateAction, InstrumentFundFlowFact, IntradayShapeFact, MagicTdxT0Batch,
+    MagicTdxT0DailyBar, MagicTdxT0Evidence, MagicTdxT0FiveMinuteBar, MagicTdxT0Quote,
+    MagicTdxT0Rejection, MarketBookLevel, MarketMinutePoint, MarketMoneyFlow, MarketOrderBook,
+    MarketSecurityMetadata, NorthboundDailyFact, NorthboundQuotaFact,
+    NorthboundTopTurnoverFact, ProviderTopNFact, RealtimeIndexQuote, RealtimeMarketQuote,
+    ResearchReportFact, ResearchUseScope, SecurityBoard, SinaInstrumentNewsRecord, T0BookLevel,
+    UpperLimitRecord,
 };
 use crate::data_provider::{consensus::ConsensusData, news_item::NewsItem, AdjustType, KlineData};
 use crate::grpc_client::envelope::QueryResult;
 use chrono::{DateTime, NaiveDate, Utc};
 use magic_market_core::{
-    AssetClass, DragonTigerSide, Exchange, FinancialStatement, FiniteNumber, FlowInterval,
-    FxPair, GlobalIndexCode, InstrumentId, IsoDate, MarketRankingKind, MarketRankingUnit,
-    MarketStatistics, Money, NorthboundChannel, NonEmptyText, PositiveU32, Price, ProviderId,
-    Ratio, SourceEvidence,
+    AssetClass, CorporateActionCategory, CorporateActionTerms, DragonTigerSide, Exchange,
+    FinancialStatement, FiniteNumber, FlowInterval, FxPair, GlobalIndexCode, InstrumentId,
+    IsoDate, MarketRankingKind, MarketRankingUnit, MarketStatistics, Money, NorthboundChannel,
+    NonEmptyText, PositiveU32, Price, ProviderId, Ratio, SourceEvidence,
 };
 use magic_tdx_rs::protocol::types::SecurityBar;
 use serde_json::Value;
@@ -1700,6 +1702,112 @@ fn as_optional_u32(
     }
 }
 
+/// Debug 名 → GeneralWebResearchProvider。服务端 pack_ev 用 format!("{:?}", provider)
+/// 写 JSON ("Bocha"/"Tavily"/"SerpApi" — 不在 ProviderId 解析表内, 不能复用 parse_provider)。
+/// 未知/空 → Err (fail-closed)。
+fn parse_general_web_provider(s: &str) -> Result<GeneralWebResearchProvider, GatewayError> {
+    Ok(match s {
+        "Bocha" => GeneralWebResearchProvider::Bocha,
+        "Tavily" => GeneralWebResearchProvider::Tavily,
+        "SerpApi" => GeneralWebResearchProvider::SerpApi,
+        _ => {
+            return Err(err(
+                "SemanticSearch",
+                format!("selected_provider 无法解析为 GeneralWebResearchProvider: {s}"),
+            ))
+        }
+    })
+}
+
+/// 语义检索桥。视图: delegate.rs fetch_semantic_search (:1170) — 服务端
+/// records = serde_json::to_value(GeneralWebResearchRecord) 直出 (snake_case serde,
+/// 含 record 级 evidence 子对象), selected_provider = Debug 名。批级 evidence
+/// 客户端重建 (query 客户端已知; use_scope 恒 ResearchOnly — 本地 admit_records 语义)。
+/// record 级 wire 完整性: serde round-trip + evidence 归属 (batch_id/provider) 与批级一致。
+pub fn semantic_search(
+    q: &QueryResult,
+    query: &str,
+) -> Result<GeneralWebResearchBatch, GatewayError> {
+    let capability = "SemanticSearch";
+    let provider = parse_general_web_provider(&q.selected_provider)?;
+    if q.source.is_empty() {
+        return Err(err(capability, "source 空 (服务端未回填证据链)"));
+    }
+    if q.batch_id.is_empty() {
+        return Err(err(capability, "batch_id 空 (服务端未回填证据链)"));
+    }
+    let evidence = GeneralWebResearchBatchEvidence {
+        provider,
+        source: q.source.clone(),
+        query: query.to_string(),
+        observed_at: record_observed_at(q, capability)?,
+        batch_id: q.batch_id.clone(),
+        use_scope: ResearchUseScope::ResearchOnly,
+    };
+    let parsed = parse_records(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GeneralWebResearchBatch::VerifiedEmpty(evidence));
+    }
+    let records: Vec<GeneralWebResearchRecord> = parsed
+        .iter()
+        .map(|v| {
+            let record: GeneralWebResearchRecord = serde_json::from_value(v.clone())
+                .map_err(|e| err(capability, format!("记录非 GeneralWebResearchRecord: {e}")))?;
+            if record.evidence.batch_id != evidence.batch_id {
+                return Err(err(capability, "记录 evidence.batch_id 与批级不一致"));
+            }
+            if record.evidence.provider != evidence.provider {
+                return Err(err(capability, "记录 evidence.provider 与批级不一致"));
+            }
+            Ok(record)
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GeneralWebResearchBatch::Available { records, evidence })
+}
+
+/// 公司行动桥。视图: delegate.rs fetch_corporate_actions (:1132)
+/// {"code","category"(Debug 名),"effective_on","record_on","ex_on","payable_on",
+/// "terms"(serde_json::to_value(CorporateActionTerms))}。
+/// 注意: 视图无法区分 Available-空 与 VerifiedEmpty (服务端只回 state.records());
+/// 消费方 (historical_bars.rs:1156-1173) 对两者同等对待 — 仅 Unavailable 失败,
+/// 与 evidence_of 的 evidence 存在性语义一致 → 空批统一映射 VerifiedEmpty。
+pub fn corporate_actions(
+    q: &QueryResult,
+) -> Result<GatewayBatch<ImplementedCorporateAction>, GatewayError> {
+    let capability = "CorporateActions";
+    let (parsed, ev) = parse_records_parts(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records: Vec<ImplementedCorporateAction> = parsed
+        .iter()
+        .map(|v| {
+            let category: CorporateActionCategory = serde_json::from_value(
+                v.get("category")
+                    .cloned()
+                    .ok_or_else(|| err(capability, "字段 category 缺失"))?,
+            )
+            .map_err(|e| err(capability, format!("category 非合法行动类别: {e}")))?;
+            let terms: CorporateActionTerms = serde_json::from_value(
+                v.get("terms")
+                    .cloned()
+                    .ok_or_else(|| err(capability, "字段 terms 缺失"))?,
+            )
+            .map_err(|e| err(capability, format!("terms 非合法条款: {e}")))?;
+            Ok(ImplementedCorporateAction {
+                code: as_str(v, "code", capability)?,
+                category,
+                effective_on: as_date(v, "effective_on", capability)?,
+                record_on: as_optional_date(v, "record_on", capability)?,
+                ex_on: as_optional_date(v, "ex_on", capability)?,
+                payable_on: as_optional_date(v, "payable_on", capability)?,
+                terms,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1871,5 +1979,50 @@ mod tests {
         assert_eq!(r.main_net, 1.0);
         assert_eq!(r.small_net, 5.0);
         assert_eq!(r.provider, ProviderId::Tdx);
+    }
+
+    #[test]
+    fn semantic_search_canned_roundtrip() {
+        // 视图: delegate.rs fetch_semantic_search — to_value(GeneralWebResearchRecord)
+        // 直出 (snake_case serde, 含 record 级 evidence 子对象)。
+        let q = mk_q(
+            r#"[{"title":"白酒行业景气度跟踪","snippet":"2026年中报白酒板块营收同比增长 8.2%","url":"https://example.com/ws1","publisher":"国泰君安证券","published_at_raw":"2026-08-15T09:00:00+08:00","published_at":"2026-08-15T09:00:00+08:00","evidence":{"provider":"bocha","observed_at":"2026-08-15T09:00:00+08:00","batch_id":"b-1","item_id":"ws-1","publication_quality":"exact_provider_time","use_scope":"research_only"}}]"#,
+            "Bocha",
+            "bocha-general-web",
+        );
+        let batch = semantic_search(&q, "白酒 景气").unwrap();
+        let (records, evidence) = match batch {
+            GeneralWebResearchBatch::Available { records, evidence } => (records, evidence),
+            GeneralWebResearchBatch::VerifiedEmpty(_) => panic!("fixture 不应为空"),
+        };
+        assert_eq!(evidence.provider, GeneralWebResearchProvider::Bocha);
+        assert_eq!(evidence.query, "白酒 景气");
+        assert_eq!(evidence.use_scope, ResearchUseScope::ResearchOnly);
+        assert_eq!(records[0].title, "白酒行业景气度跟踪");
+        assert_eq!(records[0].evidence.batch_id, "b-1");
+    }
+
+    #[test]
+    fn corporate_actions_canned_roundtrip() {
+        // 视图: delegate.rs fetch_corporate_actions — category = Debug 名,
+        // terms = to_value(CorporateActionTerms) (externally-tagged)。
+        let q = mk_q(
+            r#"[{"code":"600519","category":"Distribution","effective_on":"2026-08-20","record_on":"2026-08-13","ex_on":"2026-08-19","payable_on":"2026-08-21","terms":{"Distribution":{"cash_per_share":0.15,"bonus_per_share":null,"rights_per_share":null,"rights_price":null}}}]"#,
+            "Tdx",
+            "tdx",
+        );
+        let batch = corporate_actions(&q).unwrap();
+        let r = &batch.records()[0];
+        assert_eq!(r.code, "600519");
+        assert_eq!(r.category, CorporateActionCategory::Distribution);
+        assert_eq!(r.effective_on, NaiveDate::from_ymd_opt(2026, 8, 20).unwrap());
+        assert_eq!(r.ex_on, Some(NaiveDate::from_ymd_opt(2026, 8, 19).unwrap()));
+        assert_eq!(r.payable_on, Some(NaiveDate::from_ymd_opt(2026, 8, 21).unwrap()));
+        match &r.terms {
+            CorporateActionTerms::Distribution { cash_per_share, .. } => {
+                assert_eq!(cash_per_share.map(|c| c.get()), Some(0.15));
+            }
+            _ => panic!("terms 变体不符"),
+        }
     }
 }
