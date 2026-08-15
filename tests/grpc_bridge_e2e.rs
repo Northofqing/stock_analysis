@@ -41,9 +41,11 @@ fn spawn_fixture_server(port: u16) -> std::process::Child {
     cmd.spawn().expect("spawn grpc_market_server")
 }
 
-/// sync 网关方法 (realtime_quotes/fifteen_min_bars/fetch_top/index/t0) 的调用契约:
-/// 只能在 spawn_blocking / 纯同步线程调用 (桥 block_on 判别器在 async worker
-/// 上下文会 panic — 与本地 sync 网关方法语义一致)。
+/// sync 网关方法 (realtime_quotes/fifteen_min_bars/fetch_top/index/t0) 的调用
+/// 契约: block_on 判别器三路安全 (async worker → 独立线程; spawn_blocking →
+/// Handle::block_on; 纯同步线程 → BRIDGE_RUNTIME), 任何上下文都不 panic
+/// (2026-08-15 生产事故修复)。这里仍用 spawn_blocking 保持与真实调用方
+/// (monitor 盘后调度在 blocking 线程执行) 一致, 且不阻塞测试 worker。
 async fn blocking<T>(f: impl FnOnce() -> T + Send + 'static, what: &str) -> T
 where
     T: Send + 'static,

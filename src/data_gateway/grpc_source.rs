@@ -145,11 +145,36 @@ pub fn startup_banner() -> String {
     )
 }
 
-/// block_on 判别器: 有 runtime 线程 (spawn_blocking) → Handle::block_on;
-/// 纯同步线程 → 静态 BRIDGE_RUNTIME。
-fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+/// block_on 判别器 (两路, 任何线程上下文都安全 — 生产 monitor 的同步网关调用
+/// 直接在 runtime 线程上发生, library 模式就是阻塞该线程, 桥必须保持同语义
+/// 而不是 panic):
+/// - runtime 上下文 (Handle 命中): 一律走独立 std 线程 + BRIDGE_RUNTIME 并
+///   join。不做 Handle::block_on 是因为这些线程里它要么必 panic — worker task
+///   (tokio 红线 "Cannot start a runtime from within a runtime", 2026-08-15
+///   生产事故根因) 或 block_on 驱动主线程 (#[tokio::main]/#[tokio::test],
+///   try_id 无法区分) — 要么只是碰巧合法 (spawn_blocking)。统一独立线程无
+///   上下文误判风险; 本线程 join 阻塞到网络完成 = library 模式同步方法行为。
+/// - 纯同步线程 (Handle 未命中): 静态 BRIDGE_RUNTIME 直接 block_on。
+fn block_on<F: std::future::Future + Send>(fut: F) -> F::Output
+where
+    F::Output: Send,
+{
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) => handle.block_on(fut),
+        Ok(_) => std::thread::scope(|s| {
+            s.spawn(move || {
+                BRIDGE_RUNTIME
+                    .get_or_init(|| {
+                        tokio::runtime::Builder::new_multi_thread()
+                            .enable_all()
+                            .worker_threads(2)
+                            .build()
+                            .expect("grpc bridge runtime 创建失败")
+                    })
+                    .block_on(fut)
+            })
+            .join()
+            .unwrap_or_else(|_| panic!("grpc 桥 blocking 线程 panic (runtime 上下文路径)"))
+        }),
         Err(_) => BRIDGE_RUNTIME
             .get_or_init(|| {
                 tokio::runtime::Builder::new_multi_thread()
@@ -720,6 +745,24 @@ mod tests {
         let bridge = bridge_for("RealtimeQuotes").unwrap().expect("bridge 实例存在");
         let err = bridge.realtime_quotes(&["600519".to_string()]).unwrap_err();
         assert!(err.retryable(), "服务端不可达必须 retryable");
+        std::env::remove_var("DATA_GATEWAY_GRPC");
+        std::env::remove_var("GRPC_MARKET_ADDR");
+        reset_bridge();
+    }
+
+    #[tokio::test]
+    async fn sync_method_from_async_worker_does_not_panic() {
+        // 生产事故回归 (2026-08-15 21:07 主线程 panic 杀进程): monitor 同步
+        // 网关调用直接在 async worker 上发生, 旧判别器 Handle::block_on 触发
+        // tokio "Cannot start a runtime from within a runtime"。修复后 async
+        // worker 走独立 std 线程路径 → 服务端不可达返回 Err 而非 panic。
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("DATA_GATEWAY_GRPC", "1");
+        std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:1");
+        reset_bridge();
+        let bridge = bridge_for("RealtimeQuotes").unwrap().expect("bridge 实例存在");
+        let err = bridge.realtime_quotes(&["600519".to_string()]).unwrap_err();
+        assert!(err.retryable(), "async worker 路径也必须 fail-closed retryable");
         std::env::remove_var("DATA_GATEWAY_GRPC");
         std::env::remove_var("GRPC_MARKET_ADDR");
         reset_bridge();
