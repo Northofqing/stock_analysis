@@ -100,6 +100,8 @@ message QueryResponse {
   string observed_at = 7;
   string source_at = 8;
   repeated CanonicalPayload records = 9;
+  // P4 M2: 证据链 source 透传 (客户端桥构造 BatchEvidence.source; 旧 op 空 = 缺证据)。
+  string source = 10;
 }
 
 message Capability {

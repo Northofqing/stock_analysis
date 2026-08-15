@@ -91,12 +91,29 @@ fn pack_ev(
     batch: &crate::data_gateway::GatewayBatch<impl Sized>,
 ) -> Result<Fetched, String> {
     let ev = batch.evidence();
+    pack_ev_from(
+        records,
+        ev.source_at.clone().unwrap_or_default(),
+        format!("{:?}", ev.provider),
+        ev.source.clone(),
+        ev.batch_id.clone(),
+    )
+}
+
+/// P4 M2: 通用证据回填打包 (非 GatewayBatch 载体如 AdmittedDailyBars 手动调用)。
+fn pack_ev_from(
+    records: Vec<Value>,
+    source_at: String,
+    provider: String,
+    source: String,
+    batch_id: String,
+) -> Result<Fetched, String> {
     Ok(Fetched {
         data: serde_json::to_vec(&records).map_err(|e| e.to_string())?,
-        source_at: ev.source_at.clone().unwrap_or_default(),
-        provider: format!("{:?}", ev.provider),
-        source: ev.source.clone(),
-        batch_id: ev.batch_id.clone(),
+        source_at,
+        provider,
+        source,
+        batch_id,
     })
 }
 
@@ -115,12 +132,13 @@ pub async fn fetch(
     params: &Value,
 ) -> Result<Fetched, DelegateError> {
     match op {
-        Operation::RealtimeQuotes => fetch_realtime_quotes().map_err(DelegateError::Fetch),
-        Operation::HistoricalBars => fetch_historical_bars().await.map_err(DelegateError::Fetch),
-        Operation::MinuteData => fetch_minute_data().await.map_err(DelegateError::Fetch),
-        Operation::OrderBooks => fetch_order_books().await.map_err(DelegateError::Fetch),
-        Operation::MoneyFlows => fetch_money_flows().await.map_err(DelegateError::Fetch),
-        Operation::SecurityMetadata => fetch_security_metadata().await.map_err(DelegateError::Fetch),
+        // P4 M2: 首批 6 op 升级收 params (客户端桥按 codes/days 精确请求)。
+        Operation::RealtimeQuotes => fetch_realtime_quotes(params),
+        Operation::HistoricalBars => fetch_historical_bars(params).await,
+        Operation::MinuteData => fetch_minute_data(params).await,
+        Operation::OrderBooks => fetch_order_books(params).await,
+        Operation::MoneyFlows => fetch_money_flows(params).await,
+        Operation::SecurityMetadata => fetch_security_metadata(params).await,
         Operation::GlobalIndices => fetch_global_indices().await.map_err(DelegateError::Fetch),
         Operation::Announcements => fetch_announcements().await.map_err(DelegateError::Fetch),
         Operation::GlobalNews => fetch_global_news().await.map_err(DelegateError::Fetch),
@@ -163,12 +181,12 @@ pub async fn fetch(
 
 /// 字段映射以实际 struct 为准: RealtimeMarketQuote 有
 /// code/name/price/previous_close/change_percent (无 volume/amount)。
-pub fn fetch_realtime_quotes() -> Result<Fetched, String> {
-    let codes = watchlist_codes();
+/// P4 M2: 升级收 params (codes 缺省 watchlist)。
+pub fn fetch_realtime_quotes(params: &Value) -> Result<Fetched, DelegateError> {
+    let codes = crate::grpc_contract::params::resolve_codes(params)?;
     let batch = crate::data_gateway::MarketDataGateway::new()
         .realtime_quotes(&codes)
-        .map_err(|e| format!("统一实时行情 Gateway 不可用: {e}"))?;
-    let source_at = source_at_of(&batch);
+        .map_err(|e| DelegateError::Fetch(format!("统一实时行情 Gateway 不可用: {e}")))?;
     let records: Vec<Value> = batch
         .records()
         .iter()
@@ -182,14 +200,16 @@ pub fn fetch_realtime_quotes() -> Result<Fetched, String> {
             })
         })
         .collect();
-    pack(records, source_at)
+    // P4 M2: 证据链回填 (客户端桥需要真实 provider/source/batch_id)。
+    pack_ev(records, &batch).map_err(DelegateError::Fetch)
 }
 
 // ---------- 核心 12 op (Task 9) ----------
 
-async fn fetch_minute_data() -> Result<Fetched, String> {
+/// P4 M2: 升级收 params (codes 缺省 watchlist)。
+async fn fetch_minute_data(params: &Value) -> Result<Fetched, DelegateError> {
     let gateway = MarketCapabilitiesGateway::new();
-    let codes = watchlist_codes();
+    let codes = crate::grpc_contract::params::resolve_codes(params)?;
     let mut set = tokio::task::JoinSet::new();
     for code in codes {
         let gateway = gateway;
@@ -197,15 +217,16 @@ async fn fetch_minute_data() -> Result<Fetched, String> {
             gateway
                 .minute_data(&code, None)
                 .await
-                .map_err(|e| format!("分钟线 Gateway 不可用 ({code}): {e}"))
+                .map_err(|e| DelegateError::Fetch(format!("分钟线 Gateway 不可用 ({code}): {e}")))
         });
     }
     let mut records: Vec<Value> = Vec::new();
-    let mut source_at = String::new();
+    let mut evidence_first: Option<crate::data_gateway::BatchEvidence> = None;
     while let Some(joined) = set.join_next().await {
-        let batch = joined.map_err(|e| format!("分钟线 task 失败: {e}"))??;
-        if source_at.is_empty() {
-            source_at = source_at_of(&batch);
+        let batch = joined.map_err(|e| DelegateError::Fetch(format!("分钟线 task 失败: {e}")))?;
+        let batch = batch?;
+        if evidence_first.is_none() {
+            evidence_first = Some(batch.evidence().clone());
         }
         records.extend(batch.records().iter().map(|r| {
             json!({
@@ -218,16 +239,28 @@ async fn fetch_minute_data() -> Result<Fetched, String> {
             })
         }));
     }
-    pack(records, source_at)
+    // P4 M2: 证据链回填 (取首个 batch 的 evidence; 全部失败时 evidence_first 为 None
+    // → 显式错误, 不静默填默认证据)。
+    let ev = evidence_first
+        .ok_or_else(|| DelegateError::Fetch("分钟线: 无任何 batch 成功".to_string()))?;
+    pack_ev_from(
+        records,
+        ev.source_at.clone().unwrap_or_default(),
+        format!("{:?}", ev.provider),
+        ev.source.clone(),
+        ev.batch_id.clone(),
+    )
+    .map_err(DelegateError::Fetch)
 }
 
-async fn fetch_order_books() -> Result<Fetched, String> {
+/// P4 M2: 升级收 params (codes 缺省 watchlist)。
+async fn fetch_order_books(params: &Value) -> Result<Fetched, DelegateError> {
     let gateway = MarketCapabilitiesGateway::new();
+    let codes = crate::grpc_contract::params::resolve_codes(params)?;
     let batch = gateway
-        .order_books(&watchlist_codes())
+        .order_books(&codes)
         .await
-        .map_err(|e| format!("盘口 Gateway 不可用: {e}"))?;
-    let source_at = source_at_of(&batch);
+        .map_err(|e| DelegateError::Fetch(format!("盘口 Gateway 不可用: {e}")))?;
     let records: Vec<Value> = batch
         .records()
         .iter()
@@ -245,16 +278,18 @@ async fn fetch_order_books() -> Result<Fetched, String> {
             })
         })
         .collect();
-    pack(records, source_at)
+    // P4 M2: 证据链回填。
+    pack_ev(records, &batch).map_err(DelegateError::Fetch)
 }
 
-async fn fetch_money_flows() -> Result<Fetched, String> {
+/// P4 M2: 升级收 params (codes 缺省 watchlist)。
+async fn fetch_money_flows(params: &Value) -> Result<Fetched, DelegateError> {
     let gateway = MarketCapabilitiesGateway::new();
+    let codes = crate::grpc_contract::params::resolve_codes(params)?;
     let batch = gateway
-        .money_flows(&watchlist_codes())
+        .money_flows(&codes)
         .await
-        .map_err(|e| format!("资金流 Gateway 不可用: {e}"))?;
-    let source_at = source_at_of(&batch);
+        .map_err(|e| DelegateError::Fetch(format!("资金流 Gateway 不可用: {e}")))?;
     let records: Vec<Value> = batch
         .records()
         .iter()
@@ -270,16 +305,18 @@ async fn fetch_money_flows() -> Result<Fetched, String> {
             })
         })
         .collect();
-    pack(records, source_at)
+    // P4 M2: 证据链回填。
+    pack_ev(records, &batch).map_err(DelegateError::Fetch)
 }
 
-async fn fetch_security_metadata() -> Result<Fetched, String> {
+/// P4 M2: 升级收 params (文档 §8 instruments 格式, 缺省 watchlist)。
+async fn fetch_security_metadata(params: &Value) -> Result<Fetched, DelegateError> {
     let gateway = MarketCapabilitiesGateway::new();
+    let codes = crate::grpc_contract::params::resolve_instruments(params)?;
     let batch = gateway
-        .security_metadata(&watchlist_codes())
+        .security_metadata(&codes)
         .await
-        .map_err(|e| format!("证券元数据 Gateway 不可用: {e}"))?;
-    let source_at = source_at_of(&batch);
+        .map_err(|e| DelegateError::Fetch(format!("证券元数据 Gateway 不可用: {e}")))?;
     let records: Vec<Value> = batch
         .records()
         .iter()
@@ -295,7 +332,8 @@ async fn fetch_security_metadata() -> Result<Fetched, String> {
             })
         })
         .collect();
-    pack(records, source_at)
+    // P4 M2: 证据链回填。
+    pack_ev(records, &batch).map_err(DelegateError::Fetch)
 }
 
 async fn fetch_global_indices() -> Result<Fetched, String> {
@@ -514,25 +552,28 @@ async fn fetch_consensus() -> Result<Fetched, String> {
 
 /// 日线: 逐代码 daily_bars_async (AdmittedDailyBars, 非 GatewayBatch →
 /// source_at 从 evidence 取, 不能走 source_at_of)。
-async fn fetch_historical_bars() -> Result<Fetched, String> {
+/// P4 M2: 升级收 params (codes 缺省 watchlist; days 缺省 120)。
+async fn fetch_historical_bars(params: &Value) -> Result<Fetched, DelegateError> {
     let gateway = HistoricalBarsGateway::new();
-    let codes = watchlist_codes();
+    let codes = crate::grpc_contract::params::resolve_codes(params)?;
+    let days = crate::grpc_contract::params::resolve_u32(params, "days", 120)? as usize;
     let mut set = tokio::task::JoinSet::new();
     for code in codes {
         let gateway = gateway;
         set.spawn(async move {
             gateway
-                .daily_bars_async(&code, 120)
+                .daily_bars_async(&code, days)
                 .await
-                .map_err(|e| format!("日线 Gateway 不可用 ({code}): {e}"))
+                .map_err(|e| DelegateError::Fetch(format!("日线 Gateway 不可用 ({code}): {e}")))
         });
     }
     let mut records: Vec<Value> = Vec::new();
-    let mut source_at = String::new();
+    let mut evidence_first: Option<crate::data_gateway::BatchEvidence> = None;
     while let Some(joined) = set.join_next().await {
-        let batch = joined.map_err(|e| format!("日线 task 失败: {e}"))??;
-        if source_at.is_empty() {
-            source_at = batch.evidence().source_at.clone().unwrap_or_default();
+        let batch = joined.map_err(|e| DelegateError::Fetch(format!("日线 task 失败: {e}")))?;
+        let batch = batch?;
+        if evidence_first.is_none() {
+            evidence_first = Some(batch.evidence().clone());
         }
         let code = batch.target_code().to_string();
         records.extend(batch.records().iter().map(|k| {
@@ -550,7 +591,17 @@ async fn fetch_historical_bars() -> Result<Fetched, String> {
             })
         }));
     }
-    pack(records, source_at)
+    // P4 M2: 证据链回填 (AdmittedDailyBars 载体, 手动 pack_ev_from)。
+    let ev = evidence_first
+        .ok_or_else(|| DelegateError::Fetch("日线: 无任何 batch 成功".to_string()))?;
+    pack_ev_from(
+        records,
+        ev.source_at.clone().unwrap_or_default(),
+        format!("{:?}", ev.provider),
+        ev.source.clone(),
+        ev.batch_id.clone(),
+    )
+    .map_err(DelegateError::Fetch)
 }
 
 async fn fetch_board_directory() -> Result<Fetched, String> {

@@ -85,6 +85,75 @@ pub fn resolve_codes(p: &Value) -> Result<Vec<String>, ParamsError> {
     Ok(codes)
 }
 
+/// 文档 §8 证券资料请求 (SecurityMetadata/SecurityProfiles 契约):
+/// `{"instruments":[{"exchange":"Shanghai","code":"600396","asset_class":"Equity"}]}`
+/// (grpc/grpc-external-api.md §8「已接入的证券资料请求」)。
+/// 解析 → codes; 缺省 → watchlist_codes()。exchange 必须是文档枚举
+/// (Shanghai/Shenzhen/Beijing), 未知值 fail-closed 拒绝 (不静默猜市场)。
+pub fn resolve_instruments(p: &Value) -> Result<Vec<String>, ParamsError> {
+    let Some(value) = p.get("instruments") else {
+        return Ok(watchlist_codes());
+    };
+    let arr = value.as_array().ok_or_else(|| {
+        ParamsError::InvalidArgument("instruments 必须是对象数组".into())
+    })?;
+    let mut codes = Vec::with_capacity(arr.len());
+    for item in arr {
+        let obj = item.as_object().ok_or_else(|| {
+            ParamsError::InvalidArgument("instruments 元素必须是对象".into())
+        })?;
+        let exchange = obj
+            .get("exchange")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ParamsError::InvalidArgument("instrument.exchange 缺失".into()))?;
+        if !matches!(exchange, "Shanghai" | "Shenzhen" | "Beijing") {
+            return Err(ParamsError::InvalidArgument(format!(
+                "instrument.exchange 未知: {exchange}"
+            )));
+        }
+        let code = obj
+            .get("code")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ParamsError::InvalidArgument("instrument.code 缺失".into()))?;
+        let asset_class = obj
+            .get("asset_class")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ParamsError::InvalidArgument("instrument.asset_class 缺失".into()))?;
+        if asset_class != "Equity" {
+            return Err(ParamsError::InvalidArgument(format!(
+                "instrument.asset_class 未知: {asset_class}"
+            )));
+        }
+        if !code.is_empty() {
+            codes.push(code.to_string());
+        }
+    }
+    Ok(codes)
+}
+
+/// 请求构造方向 (桥用): codes → 文档 §8 instruments 数组。
+/// exchange 由 code 前缀推导 (6→Shanghai, 0/3→Shenzhen, 4/8/9→Beijing)。
+pub fn instruments_for(codes: &[String]) -> Value {
+    serde_json::json!({
+        "instruments": codes.iter().map(|c| {
+            serde_json::json!({
+                "exchange": exchange_of(c),
+                "code": c,
+                "asset_class": "Equity",
+            })
+        }).collect::<Vec<_>>()
+    })
+}
+
+fn exchange_of(code: &str) -> &'static str {
+    match code.as_bytes().first() {
+        Some(b'6') => "Shanghai",
+        Some(b'0' | b'3') => "Shenzhen",
+        Some(b'4' | b'8' | b'9') => "Beijing",
+        _ => "Unknown",
+    }
+}
+
 /// params["date"]: "YYYY-MM-DD"; 缺省 → 今天 (Local 时区)。
 pub fn resolve_date(p: &Value) -> Result<NaiveDate, ParamsError> {
     match p.get("date") {
@@ -270,5 +339,54 @@ mod tests {
     fn main_indices_has_exactly_six() {
         assert_eq!(MAIN_INDICES.len(), 6);
         assert_eq!(MAIN_INDICES[0], ("sh000001", "上证指数"));
+    }
+
+    #[test]
+    fn instruments_defaults_to_watchlist_and_parses_doc_format() {
+        // 缺省 → watchlist (与 codes 语义一致; watchlist 值由 codes_defaults 测试覆盖)。
+        assert!(resolve_instruments(&json!({})).is_ok());
+        // 文档 §8 例子。
+        assert_eq!(
+            resolve_instruments(&json!({
+                "instruments": [
+                    {"exchange": "Shanghai", "code": "600396", "asset_class": "Equity"},
+                    {"exchange": "Shenzhen", "code": "000001", "asset_class": "Equity"}
+                ]
+            }))
+            .unwrap(),
+            vec!["600396".to_string(), "000001".to_string()]
+        );
+        // 未知 exchange fail-closed。
+        assert!(matches!(
+            resolve_instruments(&json!({
+                "instruments": [{"exchange": "Tokyo", "code": "600396", "asset_class": "Equity"}]
+            })),
+            Err(ParamsError::InvalidArgument(_))
+        ));
+        // 非 Equity 拒绝。
+        assert!(matches!(
+            resolve_instruments(&json!({
+                "instruments": [{"exchange": "Shanghai", "code": "600396", "asset_class": "Bond"}]
+            })),
+            Err(ParamsError::InvalidArgument(_))
+        ));
+        // 缺字段拒绝。
+        assert!(matches!(
+            resolve_instruments(&json!({
+                "instruments": [{"exchange": "Shanghai", "asset_class": "Equity"}]
+            })),
+            Err(ParamsError::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn instruments_for_derives_exchange_by_prefix() {
+        let p = instruments_for(&["600396".into(), "000001".into(), "430001".into()]);
+        let arr = p["instruments"].as_array().unwrap();
+        assert_eq!(arr[0]["exchange"], "Shanghai");
+        assert_eq!(arr[0]["code"], "600396");
+        assert_eq!(arr[0]["asset_class"], "Equity");
+        assert_eq!(arr[1]["exchange"], "Shenzhen");
+        assert_eq!(arr[2]["exchange"], "Beijing");
     }
 }

@@ -16,6 +16,7 @@ pub mod futures_delivery;
 pub mod general_web_research;
 pub mod global_market;
 pub mod global_news;
+pub mod grpc_source;
 pub mod historical_bars;
 pub mod index;
 pub mod instrument_identity;

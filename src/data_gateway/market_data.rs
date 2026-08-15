@@ -194,6 +194,21 @@ impl MarketDataGateway {
         codes: &[String],
     ) -> Result<GatewayBatch<RealtimeMarketQuote>, GatewayError> {
         let request_hash = acquisition_request_hash(CAPABILITY, &codes.join(","));
+        // P4 M2 钩子: DATA_GATEWAY_GRPC=1 → gRPC 通道 (fail-closed, audit 对等)。
+        match super::grpc_source::bridge_for("RealtimeQuotes") {
+            Ok(Some(bridge)) => {
+                let result = bridge.realtime_quotes(codes);
+                let audit_provider = result
+                    .as_ref()
+                    .map(|b| b.evidence().provider)
+                    .unwrap_or(ProviderId::Tdx);
+                return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_gateway_result(CAPABILITY, ProviderId::Tdx, &request_hash, Err(error));
+            }
+        }
         let instruments = match build_instruments(codes) {
             Ok(instruments) => instruments,
             Err(error) => {

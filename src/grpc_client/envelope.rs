@@ -61,6 +61,8 @@ pub struct QueryResult {
     pub observed_at: String,
     pub source_at: String,
     pub records: Vec<CanonicalPayload>,
+    /// P4 M2: 证据链 source (服务端 Fetched.source; 旧 op 空串 = 缺证据)。
+    pub source: String,
 }
 
 pub fn parse_query_response(
@@ -86,6 +88,7 @@ pub fn parse_query_response(
         observed_at: resp.observed_at,
         source_at: resp.source_at,
         records: resp.records,
+        source: resp.source,
     })
 }
 
@@ -140,11 +143,13 @@ mod tests {
             observed_at: "t1".to_string(),
             source_at: "t2".to_string(),
             records: vec![],
+            source: "tdx".to_string(),
         };
         let result = parse_query_response("r-1", resp).unwrap();
         assert_eq!(result.admission, AdmissionState::Admitted);
         assert!(result.complete);
         assert_eq!(result.selected_provider, "tdx-dev");
+        assert_eq!(result.source, "tdx");
     }
 
     #[test]
@@ -159,6 +164,7 @@ mod tests {
             observed_at: "".to_string(),
             source_at: "".to_string(),
             records: vec![],
+            source: String::new(),
         };
         let err = parse_query_response("r-1", resp).unwrap_err();
         assert!(matches!(err, EnvelopeError::RequestIdMismatch(_, _)));
@@ -176,6 +182,7 @@ mod tests {
             observed_at: "".to_string(),
             source_at: "".to_string(),
             records: vec![],
+            source: String::new(),
         };
         assert_eq!(parse_query_response("r-1", resp).unwrap_err(), EnvelopeError::MissingRequestId);
     }

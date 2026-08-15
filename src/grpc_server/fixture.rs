@@ -20,6 +20,7 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
         observed_at: "2026-08-13T10:00:00+08:00".to_string(),
         source_at: "2026-08-13T10:00:00+08:00".to_string(),
         records,
+        source: "fixture".to_string(),
     };
     match op {
         Operation::RealtimeQuotes => Some(resp(

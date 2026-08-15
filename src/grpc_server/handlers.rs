@@ -104,6 +104,7 @@ impl DataService {
             complete: true,
             observed_at: chrono::Local::now().to_rfc3339(),
             source_at: result.source_at,
+            source: result.source,
             records: vec![CanonicalPayload {
                 schema: frozen.schema_name.to_string(),
                 schema_version: frozen.schema_version,

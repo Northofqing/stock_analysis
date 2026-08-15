@@ -230,6 +230,7 @@ mod tests {
                 complete: true,
                 observed_at: "2026-08-13T10:00:00+08:00".into(),
                 source_at: "2026-08-13T10:00:00+08:00".into(),
+                source: "mock".into(),
                 records: vec![CanonicalPayload {
                     schema: "market.realtime_quotes".into(),
                     schema_version: 1,

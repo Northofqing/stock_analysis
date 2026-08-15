@@ -170,6 +170,22 @@ impl MarketCapabilitiesGateway {
                 .unwrap_or_else(|| "current".to_owned())
         );
         let request_hash = acquisition_request_hash(MINUTE_CAPABILITY, &canonical);
+        // P4 M2 钩子: DATA_GATEWAY_GRPC=1 → gRPC 通道 (fail-closed, 连接失败
+        // 也走 audit 对等, 不绕过 DataAcquisitionAuditRecord)。
+        match super::grpc_source::bridge_for("MinuteData") {
+            Ok(Some(bridge)) => {
+                let result = bridge.minute_data_async(&storage_code).await;
+                let audit_provider = result
+                    .as_ref()
+                    .map(|b| b.evidence().provider)
+                    .unwrap_or(ProviderId::Tdx);
+                return audit_gateway_result(MINUTE_CAPABILITY, audit_provider, &request_hash, result);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_gateway_result(MINUTE_CAPABILITY, ProviderId::Tdx, &request_hash, Err(error));
+            }
+        }
         let worker_hash = request_hash.clone();
         let joined = tokio::task::spawn_blocking(move || {
             let result = build_instrument(&storage_code, MINUTE_CAPABILITY)
@@ -204,6 +220,26 @@ impl MarketCapabilitiesGateway {
         let storage_codes = codes.to_vec();
         let request_hash =
             acquisition_request_hash(ORDER_BOOK_CAPABILITY, &storage_codes.join(","));
+        // P4 M2 钩子: gRPC 通道 (fail-closed, audit 对等)。
+        match super::grpc_source::bridge_for("OrderBooks") {
+            Ok(Some(bridge)) => {
+                let result = bridge.order_books_async(&storage_codes).await;
+                let audit_provider = result
+                    .as_ref()
+                    .map(|b| b.evidence().provider)
+                    .unwrap_or(ProviderId::Tdx);
+                return audit_gateway_result(ORDER_BOOK_CAPABILITY, audit_provider, &request_hash, result);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_gateway_result(
+                    ORDER_BOOK_CAPABILITY,
+                    ProviderId::Tdx,
+                    &request_hash,
+                    Err(error),
+                );
+            }
+        }
         let worker_hash = request_hash.clone();
         let joined = tokio::task::spawn_blocking(move || {
             let result = build_instruments(&storage_codes, ORDER_BOOK_CAPABILITY)
@@ -242,6 +278,26 @@ impl MarketCapabilitiesGateway {
         let storage_codes = codes.to_vec();
         let request_hash =
             acquisition_request_hash(MONEY_FLOW_CAPABILITY, &storage_codes.join(","));
+        // P4 M2 钩子: gRPC 通道 (fail-closed, audit 对等)。
+        match super::grpc_source::bridge_for("MoneyFlows") {
+            Ok(Some(bridge)) => {
+                let result = bridge.money_flows_async(&storage_codes).await;
+                let audit_provider = result
+                    .as_ref()
+                    .map(|b| b.evidence().provider)
+                    .unwrap_or(ProviderId::Eastmoney);
+                return audit_gateway_result(MONEY_FLOW_CAPABILITY, audit_provider, &request_hash, result);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_gateway_result(
+                    MONEY_FLOW_CAPABILITY,
+                    ProviderId::Eastmoney,
+                    &request_hash,
+                    Err(error),
+                );
+            }
+        }
         let worker_hash = request_hash.clone();
         let joined = tokio::task::spawn_blocking(move || {
             let result = build_instruments(&storage_codes, MONEY_FLOW_CAPABILITY).and_then(|_| {
@@ -285,6 +341,32 @@ impl MarketCapabilitiesGateway {
     ) -> Result<GatewayBatch<MarketSecurityMetadata>, GatewayError> {
         let storage_codes = codes.to_vec();
         let request_hash = acquisition_request_hash(METADATA_CAPABILITY, &storage_codes.join(","));
+        // P4 M2 钩子: gRPC 通道 (fail-closed, audit 对等; library 路径仍是
+        // unsupported_security_metadata 显式错误)。
+        match super::grpc_source::bridge_for("SecurityMetadata") {
+            Ok(Some(bridge)) => {
+                let result = bridge.security_metadata_async(&storage_codes).await;
+                let audit_provider = result
+                    .as_ref()
+                    .map(|b| b.evidence().provider)
+                    .unwrap_or(ProviderId::Tdx);
+                return audit_gateway_result(
+                    METADATA_CAPABILITY,
+                    audit_provider,
+                    &request_hash,
+                    result,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_gateway_result(
+                    METADATA_CAPABILITY,
+                    ProviderId::Tdx,
+                    &request_hash,
+                    Err(error),
+                );
+            }
+        }
         let worker_hash = request_hash.clone();
         let joined = tokio::task::spawn_blocking(move || {
             let result = unsupported_security_metadata(&storage_codes);
