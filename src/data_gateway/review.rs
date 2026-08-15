@@ -186,6 +186,20 @@ impl GatewayError {
         self.audit_outcome
     }
 
+    /// 桥错误路径 wire 序列化需要 (delegate 视图 → convert 重建)。
+    pub fn capability(&self) -> &'static str {
+        self.capability
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// 桥错误路径 wire 序列化需要 (delegate 视图 → convert 重建)。
+    pub fn provider(&self) -> Option<ProviderId> {
+        self.provider
+    }
+
     pub(super) fn classified(
         capability: &'static str,
         provider: Option<ProviderId>,

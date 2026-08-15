@@ -10,8 +10,8 @@
 //! 桥 → 服务端 → 本地网关 → 桥 的无限递归。这是生产部署的强制约束 (M4 banner 文档化)。
 use chrono::{Duration, NaiveDate, Utc};
 use magic_market_core::{
-    CorporateActionCategory, FlowInterval, MarketRankingKind, NorthboundChannel, ProviderId,
-    StatementKind,
+    AssetClass, CorporateActionCategory, Exchange, FlowInterval, InstrumentId,
+    MarketRankingKind, NorthboundChannel, ProviderId, StatementKind,
 };
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -348,6 +348,39 @@ async fn bridge_all_hooked_ops_fixture_roundtrip() {
         "2026-08-20",
         "CorporateActions effective_on 保真"
     );
+
+    // ---- P4 M3 批次 2: outcome_daily_bars 服务端真实现 (adaptive 视图重建) ----
+    let raw = blocking(
+        move || {
+            grpc_source::bridge_for("OutcomeDailyBars")
+                .expect("bridge")
+                .expect("桥未启用")
+                .outcome_daily_bars_adaptive(
+                    InstrumentId::new(Exchange::Shanghai, "600519", AssetClass::Equity)
+                        .expect("instrument"),
+                    "SH".to_string(),
+                    "600519".to_string(),
+                    1,
+                    256,
+                    date,
+                )
+                .expect("OutcomeDailyBars 桥")
+        },
+        "OutcomeDailyBars",
+    )
+    .await;
+    assert_eq!(raw.batch.records().len(), 1, "OutcomeDailyBars batch 保真");
+    assert_eq!(
+        raw.batch.records()[0].close().get(),
+        1500.0,
+        "OutcomeDailyBars close 保真"
+    );
+    assert_eq!(
+        raw.batch.records()[0].instrument().code(),
+        "600519",
+        "OutcomeDailyBars instrument 保真"
+    );
+    assert!(raw.batch.quality().is_complete(), "OutcomeDailyBars quality 保真");
 
     server.kill().expect("kill server");
     grpc_source::reset_bridge();

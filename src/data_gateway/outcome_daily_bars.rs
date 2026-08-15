@@ -382,19 +382,19 @@ struct OutcomeAcquisitionPlan {
 }
 
 #[derive(Debug)]
-struct RawOutcomeFetch {
-    batch: DataBatch<Bar>,
-    attempts: Vec<OutcomeTransportAttemptPreimage>,
+pub struct RawOutcomeFetch {
+    pub batch: DataBatch<Bar>,
+    pub attempts: Vec<OutcomeTransportAttemptPreimage>,
 }
 
 #[derive(Debug)]
-struct OutcomeTransportFailure {
-    error: GatewayError,
-    attempts: Vec<OutcomeTransportAttemptPreimage>,
+pub struct OutcomeTransportFailure {
+    pub error: GatewayError,
+    pub attempts: Vec<OutcomeTransportAttemptPreimage>,
 }
 
 impl OutcomeTransportFailure {
-    fn new(error: GatewayError, attempts: Vec<OutcomeTransportAttemptPreimage>) -> Self {
+    pub(crate) fn new(error: GatewayError, attempts: Vec<OutcomeTransportAttemptPreimage>) -> Self {
         Self { error, attempts }
     }
 }
@@ -602,14 +602,37 @@ impl OutcomeDailyBarsGateway {
         let maximum_latest_n = plan.maximum_latest_n;
         let window_start = plan.window_start;
         let fetched = tokio::task::spawn_blocking(move || {
-            fetch_magic_tdx_outcome_adaptive(
-                instrument,
-                wire_market,
-                wire_code,
-                expected_bar_count,
-                maximum_latest_n,
-                window_start,
-            )
+            // P4 M3 transport seam: bridge 可用时 (DATA_GATEWAY_GRPC=1) 走 gRPC
+            // 通道 — 服务端执行同一 adaptive transport, 客户端 convert 重建
+            // RawOutcomeFetch / OutcomeTransportFailure (error+attempts 保真)。
+            // claim 台账与 audit (下方 audit_gateway_result) 始终留客户端。
+            match super::grpc_source::bridge_for("OutcomeDailyBars") {
+                Ok(Some(bridge)) => bridge.outcome_daily_bars_adaptive(
+                    instrument.clone(),
+                    wire_market.clone(),
+                    wire_code.clone(),
+                    expected_bar_count,
+                    maximum_latest_n,
+                    window_start,
+                ),
+                Ok(None) => fetch_magic_tdx_outcome_adaptive(
+                    instrument,
+                    wire_market,
+                    wire_code,
+                    expected_bar_count,
+                    maximum_latest_n,
+                    window_start,
+                ),
+                Err(error) => Err(OutcomeTransportFailure::new(
+                    GatewayError::unavailable(
+                        CAPABILITY,
+                        Some(ProviderId::Tdx),
+                        true,
+                        format!("outcome_daily_bars bridge unavailable: {error}"),
+                    ),
+                    Vec::new(),
+                )),
+            }
         })
         .await
         .map_err(|error| {
@@ -1220,7 +1243,9 @@ fn outcome_transport_attempts_preimage(
     }
 }
 
-fn fetch_magic_tdx_outcome_adaptive(
+/// 服务端 delegate 直调点 (P4 M3): 客户端 acquire() 走桥时由 grpc_market_server
+/// 在 spawn_blocking 内调用本函数, 序列化视图后由客户端 convert 重建。
+pub(crate) fn fetch_magic_tdx_outcome_adaptive(
     instrument: InstrumentId,
     canonical_market: String,
     canonical_stock_code: String,

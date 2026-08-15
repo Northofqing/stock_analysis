@@ -20,7 +20,10 @@ use crate::data_gateway::{
     company::CompanyDataGateway,
     general_web_research::{GeneralWebResearchGateway, GeneralWebResearchProvider},
 };
-use magic_market_core::{FlowInterval, NorthboundChannel, StatementKind};
+use crate::data_gateway::outcome_daily_bars::{
+    fetch_magic_tdx_outcome_adaptive, OutcomeTransportFailure, RawOutcomeFetch,
+};
+use magic_market_core::{FlowInterval, InstrumentId, NorthboundChannel, ProviderId, StatementKind};
 use crate::grpc_client::pb::magic::market::v1::Operation;
 use chrono::{Datelike, Local, NaiveDate};
 use serde_json::{json, Value};
@@ -165,7 +168,7 @@ pub async fn fetch(
         Operation::InstrumentNews => fetch_instrument_news(params).await,
         Operation::IntradayShape => fetch_intraday_shape(params).await,
         Operation::T0Evidence => fetch_t0_evidence(params).await,
-        Operation::OutcomeDailyBars => fetch_outcome_daily_bars(),
+        Operation::OutcomeDailyBars => fetch_outcome_daily_bars(params).await,
         Operation::UpperLimitPoolReview => fetch_upper_limit_pool_review(params).await,
         _ => not_yet(op).map_err(DelegateError::Fetch),
     }
@@ -1426,14 +1429,112 @@ async fn fetch_t0_evidence(params: &Value) -> Result<Fetched, DelegateError> {
     })
 }
 
-/// 复盘 outcome 日线: M1 不直连 — 取数依赖 claim 台账 (VerifiedOutcomeDue 字段
-/// 私有, delegate 无法构造; fetch_magic_tdx_outcome_adaptive 是私有 transport)。
-/// M3 transport seam 落地后补真实现; 现在显式失败 (fail-closed, 不静默填充)。
-fn fetch_outcome_daily_bars() -> Result<Fetched, DelegateError> {
-    Err(DelegateError::Fetch(
-        "outcome_daily_bars: M1 服务端不直连 (claim 台账在客户端, M3 transport seam 补全)"
-            .into(),
-    ))
+/// 复盘 outcome 日线 (P4 M3 transport seam): 服务端在 spawn_blocking 内执行
+/// 自适应抓取 (fetch_magic_tdx_outcome_adaptive — claim 台账/audit 始终留客户端,
+/// 这里只迁移 provider transport)。视图 = {"batch": to_value(DataBatch<Bar>),
+/// "attempts": to_value(Preimage), "error": {...}|null}; error 分支保留完整
+/// attempts, 客户端 convert::outcome_daily_bars 重建 OutcomeTransportFailure。
+/// 参数: code/market/expected_bar_count/maximum_latest_n/window_start/instrument
+/// (InstrumentId 对象 round-trip)。
+async fn fetch_outcome_daily_bars(params: &Value) -> Result<Fetched, DelegateError> {
+    let code = crate::grpc_contract::params::resolve_required_string(params, "code")?;
+    let market = crate::grpc_contract::params::resolve_required_string(params, "market")?;
+    let expected_bar_count = params
+        .get("expected_bar_count")
+        .and_then(Value::as_u64)
+        .map(|v| v as u16)
+        .ok_or_else(|| {
+            DelegateError::Params(crate::grpc_contract::params::ParamsError::InvalidArgument(
+                "outcome_daily_bars: expected_bar_count 必填".into(),
+            ))
+        })?;
+    let maximum_latest_n = params
+        .get("maximum_latest_n")
+        .and_then(Value::as_u64)
+        .map(|v| v as u16)
+        .ok_or_else(|| {
+            DelegateError::Params(crate::grpc_contract::params::ParamsError::InvalidArgument(
+                "outcome_daily_bars: maximum_latest_n 必填".into(),
+            ))
+        })?;
+    let window_start = crate::grpc_contract::params::resolve_required_date(params, "window_start")?;
+    let instrument: InstrumentId = serde_json::from_value(
+        params
+            .get("instrument")
+            .cloned()
+            .ok_or_else(|| {
+                DelegateError::Params(
+                    crate::grpc_contract::params::ParamsError::InvalidArgument(
+                        "outcome_daily_bars: instrument 必填".into(),
+                    ),
+                )
+            })?,
+    )
+    .map_err(|e| {
+        DelegateError::Params(crate::grpc_contract::params::ParamsError::InvalidArgument(
+            format!("outcome_daily_bars: instrument 非法: {e}"),
+        ))
+    })?;
+
+    let result = tokio::task::spawn_blocking(move || {
+        fetch_magic_tdx_outcome_adaptive(
+            instrument,
+            market,
+            code,
+            expected_bar_count,
+            maximum_latest_n,
+            window_start,
+        )
+    })
+    .await
+    .map_err(|e| DelegateError::Fetch(format!("outcome_daily_bars worker join 失败: {e}")))?;
+
+    match result {
+        Ok(RawOutcomeFetch { batch, attempts }) => {
+            let batch_json = serde_json::to_value(&batch)
+                .map_err(|e| DelegateError::Fetch(format!("outcome batch 序列化失败: {e}")))?;
+            let attempts_json = serde_json::to_value(&attempts).map_err(|e| {
+                DelegateError::Fetch(format!("outcome attempts 序列化失败: {e}"))
+            })?;
+            let provenance = batch.provenance();
+            Ok(Fetched {
+                data: serde_json::to_vec(&json!({
+                    "batch": batch_json,
+                    "attempts": attempts_json,
+                    "error": Value::Null,
+                }))
+                .map_err(|e| DelegateError::Fetch(e.to_string()))?,
+                source_at: provenance.source_at().unwrap_or_default().to_string(),
+                provider: format!("{:?}", ProviderId::Tdx),
+                source: provenance.source().to_string(),
+                batch_id: provenance.batch_id().unwrap_or_default().to_string(),
+            })
+        }
+        Err(OutcomeTransportFailure { error, attempts }) => {
+            let attempts_json = serde_json::to_value(&attempts).map_err(|e| {
+                DelegateError::Fetch(format!("outcome attempts 序列化失败: {e}"))
+            })?;
+            Ok(Fetched {
+                data: serde_json::to_vec(&json!({
+                    "batch": Value::Null,
+                    "attempts": attempts_json,
+                    "error": {
+                        "capability": error.capability(),
+                        "provider": error.provider().map(|p| format!("{:?}", p)),
+                        "audit_outcome": error.audit_outcome(),
+                        "reason_code": error.reason_code(),
+                        "retryable": error.retryable(),
+                        "message": error.message(),
+                    },
+                }))
+                .map_err(|e| DelegateError::Fetch(e.to_string()))?,
+                source_at: String::new(),
+                provider: format!("{:?}", ProviderId::Tdx),
+                source: String::new(),
+                batch_id: String::new(),
+            })
+        }
+    }
 }
 
 /// 涨停池复盘: ReviewDataGateway::r03_upper_limit_pool (date 默认今天)。

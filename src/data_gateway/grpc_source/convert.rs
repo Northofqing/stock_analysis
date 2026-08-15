@@ -22,13 +22,15 @@ use crate::data_gateway::{
     UpperLimitRecord,
 };
 use crate::data_provider::{consensus::ConsensusData, news_item::NewsItem, AdjustType, KlineData};
+use crate::data_gateway::outcome_daily_bars::{OutcomeTransportFailure, RawOutcomeFetch};
+use crate::selection::schema_v2::OutcomeTransportAttemptPreimage;
 use crate::grpc_client::envelope::QueryResult;
 use chrono::{DateTime, NaiveDate, Utc};
 use magic_market_core::{
-    AssetClass, CorporateActionCategory, CorporateActionTerms, DragonTigerSide, Exchange,
-    FinancialStatement, FiniteNumber, FlowInterval, FxPair, GlobalIndexCode, InstrumentId,
-    IsoDate, MarketRankingKind, MarketRankingUnit, MarketStatistics, Money, NorthboundChannel,
-    NonEmptyText, PositiveU32, Price, ProviderId, Ratio, SourceEvidence,
+    AssetClass, Bar, CorporateActionCategory, CorporateActionTerms, DataBatch, DragonTigerSide,
+    Exchange, FinancialStatement, FiniteNumber, FlowInterval, FxPair, GlobalIndexCode,
+    InstrumentId, IsoDate, MarketRankingKind, MarketRankingUnit, MarketStatistics, Money,
+    NorthboundChannel, NonEmptyText, PositiveU32, Price, ProviderId, Ratio, SourceEvidence,
 };
 use magic_tdx_rs::protocol::types::SecurityBar;
 use serde_json::Value;
@@ -1808,6 +1810,93 @@ pub fn corporate_actions(
     Ok(GatewayBatch::Available { records, evidence: ev })
 }
 
+/// outcome 错误 wire 分类 → 静态常量对。服务端只发 review.rs GatewayError 构造器
+/// 集合 (unavailable/partial/invalid_request/audit_failure + map_tdx_error 的
+/// provider_* 对); 未知对 = 版本偏移 → 兜底 ("unavailable", "no_verified_batch")
+/// 保持 fail-closed 重试语义 (retryable 由 wire 原样重建, 不受影响)。
+fn rebuild_outcome_classification(
+    audit_outcome: &str,
+    reason_code: &str,
+) -> (&'static str, &'static str) {
+    match (audit_outcome, reason_code) {
+        ("partial", "invalid_evidence") => ("partial", "invalid_evidence"),
+        ("invalid_request", "invalid_request") => ("invalid_request", "invalid_request"),
+        ("invalid_request", "unsupported_window") => ("invalid_request", "unsupported_window"),
+        ("partial", "provider_invalid_data") => ("partial", "provider_invalid_data"),
+        ("unavailable", "provider_unavailable") => ("unavailable", "provider_unavailable"),
+        ("unavailable", "acquisition_audit_unavailable") => {
+            ("unavailable", "acquisition_audit_unavailable")
+        }
+        _ => ("unavailable", "no_verified_batch"),
+    }
+}
+
+/// outcome 复盘日线 (P4 M3): 服务端 adaptive 抓取完整视图
+/// {"batch": DataBatch<Bar> 直出, "attempts": [Preimage], "error": {...}|null}。
+/// batch/attempts 双向 serde 保真重建 (Bar 有 manual Deserialize, provider.rs:1469);
+/// error 视图 → GatewayError::classified 重建 (capability 恒为本网关静态
+/// "OutcomeDailyBarsV2", provider 经 parse_provider 回映, 分类经
+/// rebuild_outcome_classification)。
+pub fn outcome_daily_bars(
+    q: &QueryResult,
+) -> Result<RawOutcomeFetch, OutcomeTransportFailure> {
+    let capability = "OutcomeDailyBarsV2";
+    let payload = q.records.first().ok_or_else(|| {
+        OutcomeTransportFailure::new(
+            err(capability, "records 空 (服务端无 canonical payload)"),
+            Vec::new(),
+        )
+    })?;
+    let parsed: Value = serde_json::from_slice(&payload.data)
+        .map_err(|e| OutcomeTransportFailure::new(err(capability, format!("视图非 JSON: {e}")), Vec::new()))?;
+    let view = parsed
+        .as_object()
+        .ok_or_else(|| OutcomeTransportFailure::new(err(capability, "outcome 视图不是对象"), Vec::new()))?;
+    let attempts = serde_json::from_value::<Vec<OutcomeTransportAttemptPreimage>>(
+        view.get("attempts").cloned().unwrap_or(Value::Null),
+    )
+    .map_err(|e| {
+        OutcomeTransportFailure::new(
+            err(capability, format!("attempts 重建失败: {e}")),
+            Vec::new(),
+        )
+    })?;
+    if let Some(error_view) = view.get("error") {
+        if !error_view.is_null() {
+            let provider = error_view
+                .get("provider")
+                .and_then(Value::as_str)
+                .and_then(|s| parse_provider(s).ok());
+            let (audit_outcome, reason_code) = rebuild_outcome_classification(
+                error_view.get("audit_outcome").and_then(Value::as_str).unwrap_or("unavailable"),
+                error_view.get("reason_code").and_then(Value::as_str).unwrap_or("no_verified_batch"),
+            );
+            let retryable = error_view.get("retryable").and_then(Value::as_bool).unwrap_or(true);
+            let message = error_view
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("(no message)")
+                .to_string();
+            return Err(OutcomeTransportFailure::new(
+                GatewayError::classified(capability, provider, audit_outcome, reason_code, retryable, message),
+                attempts,
+            ));
+        }
+    }
+    let batch = serde_json::from_value::<DataBatch<Bar>>(
+        view.get("batch")
+            .cloned()
+            .ok_or_else(|| OutcomeTransportFailure::new(err(capability, "outcome 视图缺 batch"), Vec::new()))?,
+    )
+    .map_err(|e| {
+        OutcomeTransportFailure::new(
+            err(capability, format!("batch 重建失败: {e}")),
+            Vec::new(),
+        )
+    })?;
+    Ok(RawOutcomeFetch { batch, attempts })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2024,5 +2113,55 @@ mod tests {
             }
             _ => panic!("terms 变体不符"),
         }
+    }
+
+    #[test]
+    fn outcome_daily_bars_canned_roundtrip() {
+        // 视图: delegate.rs fetch_outcome_daily_bars — batch = to_value(DataBatch<Bar>)
+        // (Bar serde 字段 = provider.rs Repr), attempts = to_value(Preimage), error null。
+        let q = mk_q(
+            r#"{"batch":{"records":[{"instrument":{"exchange":"Shanghai","code":"600519","asset_class":"Equity"},"interval":"Day","bar_start":"2026-08-14","bar_end":"2026-08-14","open":1480.0,"high":1510.0,"low":1475.0,"close":1500.0,"volume":123456.0,"amount":1.85e9,"adjustment":"Unadjusted","source_at":null,"provider":"Tdx","batch_id":"fixture-ob"}],"provenance":{"source":"tdx","source_at":null,"fetched_at":"2026-08-15T10:00:00+08:00","batch_id":"fixture-ob"},"quality":{"complete":true,"issues":[]}},"attempts":[],"error":null}"#,
+            "Tdx",
+            "tdx",
+        );
+        let raw = outcome_daily_bars(&q).unwrap();
+        assert_eq!(raw.batch.records().len(), 1, "batch 重建保真");
+        let bar = &raw.batch.records()[0];
+        assert_eq!(bar.instrument().code(), "600519", "bar instrument 保真");
+        assert_eq!(bar.bar_start(), "2026-08-14", "bar_start 保真");
+        assert_eq!(bar.close().get(), 1500.0, "bar close 保真");
+        assert!(raw.batch.quality().is_complete(), "quality 保真");
+        assert!(raw.attempts.is_empty(), "attempts 保真");
+    }
+
+    #[test]
+    fn outcome_daily_bars_error_view_rebuild() {
+        // error 视图 → OutcomeTransportFailure { error: classified 重建, attempts }。
+        let q = mk_q(
+            r#"{"batch":null,"attempts":[],"error":{"capability":"OutcomeDailyBarsV2","provider":"Tdx","audit_outcome":"unavailable","reason_code":"provider_unavailable","retryable":true,"message":"Magic TDX outcome bars failed: boom"}}"#,
+            "Tdx",
+            "tdx",
+        );
+        let failure = outcome_daily_bars(&q).unwrap_err();
+        assert_eq!(failure.error.reason_code(), "provider_unavailable", "reason_code 重建");
+        assert_eq!(failure.error.audit_outcome(), "unavailable", "audit_outcome 重建");
+        assert!(failure.error.retryable(), "retryable 重建");
+        assert_eq!(failure.error.provider(), Some(ProviderId::Tdx), "provider 回映");
+        assert_eq!(failure.error.capability(), "OutcomeDailyBarsV2", "capability 静态");
+        assert!(failure.attempts.is_empty(), "attempts 保真");
+    }
+
+    #[test]
+    fn outcome_daily_bars_unknown_classification_falls_back_fail_closed() {
+        // 未知 audit_outcome/reason_code 对 (版本偏移) → 兜底 no_verified_batch,
+        // retryable 仍按 wire 原样 (fail-closed 语义不因版本偏移丢失)。
+        let q = mk_q(
+            r#"{"batch":null,"attempts":[],"error":{"capability":"OutcomeDailyBarsV9","provider":"Tdx","audit_outcome":"mystery","reason_code":"mystery","retryable":true,"message":"skew"}}"#,
+            "Tdx",
+            "tdx",
+        );
+        let failure = outcome_daily_bars(&q).unwrap_err();
+        assert_eq!(failure.error.reason_code(), "no_verified_batch");
+        assert!(failure.error.retryable());
     }
 }

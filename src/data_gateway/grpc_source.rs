@@ -20,13 +20,15 @@ use crate::data_gateway::{
     ProviderTopNFact, RealtimeIndexQuote, RealtimeMarketQuote, ResearchReportFact,
     SinaInstrumentNewsRecord, UpperLimitRecord,
 };
+use crate::data_gateway::outcome_daily_bars::{OutcomeTransportFailure, RawOutcomeFetch};
 use crate::data_provider::{consensus::ConsensusData, KlineData};
 use crate::grpc_client::client::GrpcMarketClient;
 use crate::grpc_client::envelope::QueryResult;
 use crate::grpc_client::pb::magic::market::v1::Operation;
 use chrono::NaiveDate;
 use magic_market_core::{
-    FinancialStatement, FlowInterval, MarketStatistics, NorthboundChannel, StatementKind,
+    FinancialStatement, FlowInterval, InstrumentId, MarketStatistics, NorthboundChannel,
+    StatementKind,
 };
 use magic_tdx_rs::protocol::types::SecurityBar;
 use serde_json::Value;
@@ -69,6 +71,7 @@ pub const HOOKED_OPS: &[&str] = &[
     "MoneyFlows",
     "NorthboundDaily",
     "OrderBooks",
+    "OutcomeDailyBars",
     "ProviderTopNRankings",
     "RealtimeQuotes",
     "ResearchReports",
@@ -82,11 +85,7 @@ pub const HOOKED_OPS: &[&str] = &[
 /// 保持本地 (library 模式) 的网关能力 — P4 M3 风险条款: 服务端 op 已实现或
 /// 半实现, 但桥保真未经验证 → 不静默切换, 出声 banner 列 follow-up。
 /// 接桥时从本表删除并移入 HOOKED_OPS。
-pub const KEEP_LOCAL_OPS: &[&str] = &[
-    "outcome_daily_bars",
-    "limit_pools",
-    "strong_stock_reasons",
-];
+pub const KEEP_LOCAL_OPS: &[&str] = &["limit_pools", "strong_stock_reasons"];
 
 /// 网关钩子入口: DATA_GATEWAY_GRPC=1 且 op 未被 DISABLED → Some(Arc<GrpcSource>)
 /// (惰性连接, 失败不缓存); 否则 Ok(None) (library 路径)。
@@ -807,6 +806,55 @@ impl GrpcSource {
             .await?;
         convert::corporate_actions(&q)
     }
+
+    /// outcome 复盘日线 (P4 M3): 服务端执行 adaptive 抓取 (claim 台账留客户端),
+    /// 视图重建 RawOutcomeFetch / OutcomeTransportFailure (error+attempts 保真)。
+    /// 参数与 fetch_magic_tdx_outcome_adaptive 对齐 (instrument 对象 round-trip)。
+    pub async fn outcome_daily_bars_async(
+        &self,
+        instrument: InstrumentId,
+        market: String,
+        code: String,
+        expected_bar_count: u16,
+        maximum_latest_n: u16,
+        window_start: NaiveDate,
+    ) -> Result<RawOutcomeFetch, OutcomeTransportFailure> {
+        let q = self
+            .query_op(
+                Operation::OutcomeDailyBars,
+                serde_json::json!({
+                    "instrument": instrument,
+                    "market": market,
+                    "code": code,
+                    "expected_bar_count": expected_bar_count,
+                    "maximum_latest_n": maximum_latest_n,
+                    "window_start": window_start.format("%Y-%m-%d").to_string(),
+                }),
+            )
+            .await
+            .map_err(|e| OutcomeTransportFailure::new(e, Vec::new()))?;
+        convert::outcome_daily_bars(&q)
+    }
+
+    /// 同步包装 (spawn_blocking / 纯同步线程)。
+    pub fn outcome_daily_bars_adaptive(
+        &self,
+        instrument: InstrumentId,
+        market: String,
+        code: String,
+        expected_bar_count: u16,
+        maximum_latest_n: u16,
+        window_start: NaiveDate,
+    ) -> Result<RawOutcomeFetch, OutcomeTransportFailure> {
+        block_on(self.outcome_daily_bars_async(
+            instrument,
+            market,
+            code,
+            expected_bar_count,
+            maximum_latest_n,
+            window_start,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -883,7 +931,7 @@ mod tests {
         assert!(b.contains("数据源模式 = library"), "默认必须 library (v15.x 出声): {b}");
         assert!(b.contains("server = http://127.0.0.1:18082"), "默认地址: {b}");
         assert!(b.contains("禁用 = 无"), "无禁用: {b}");
-        assert!(b.contains("保持本地 3 ops"), "keep-local 计数: {b}");
+        assert!(b.contains("保持本地 2 ops"), "keep-local 计数: {b}");
     }
 
     #[test]

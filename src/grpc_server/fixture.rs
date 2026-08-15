@@ -120,7 +120,10 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
         Operation::OutcomeDailyBars => Some(resp(
             "fixture-ob",
             vec![payload(
-                r#"[{"market_date":"2026-08-14","open":1480.0,"high":1510.0,"low":1475.0,"close":1500.0,"volume":123456,"amount":1.85e9}]"#,
+                // P4 M3 视图: delegate.rs fetch_outcome_daily_bars —
+                // batch = to_value(DataBatch<Bar>) (Bar serde 字段 = provider.rs Repr),
+                // attempts = to_value(Preimage), error = null。
+                r#"{"batch":{"records":[{"instrument":{"exchange":"Shanghai","code":"600519","asset_class":"Equity"},"interval":"Day","bar_start":"2026-08-14","bar_end":"2026-08-14","open":1480.0,"high":1510.0,"low":1475.0,"close":1500.0,"volume":123456.0,"amount":1.85e9,"adjustment":"Unadjusted","source_at":null,"provider":"Tdx","batch_id":"fixture-ob"}],"provenance":{"source":"tdx","source_at":null,"fetched_at":"2026-08-15T10:00:00+08:00","batch_id":"fixture-ob"},"quality":{"complete":true,"issues":[]}},"attempts":[],"error":null}"#,
             )],
         )),
         Operation::UpperLimitPoolReview => Some(resp(
