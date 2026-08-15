@@ -324,7 +324,7 @@ mod tests {
 Run: `cargo test --lib grpc_contract::ops:: 2>&1 | tail -8`
 Expected: FAIL（`method_name` 未定义）。若 pb 模块或 Operation 枚举未生成（Task 1 未完成），先回 Task 1。
 
-- [ ] **Step 3: 补 `mod ops;`**
+- [x] **Step 3: 补 `mod ops;`**
 
 `src/grpc_contract/mod.rs` 已有 `pub mod ops;`（Task 1 写了骨架），确认存在即可。
 
@@ -968,7 +968,7 @@ git commit -m "feat(grpc): P0 gRPC 错误码映射 (§10 表) + 指数退避/有
 - Consumes: 无
 - Produces: `pub fn attach_bearer<T>(request: &mut tonic::Request<T>) -> Result<(), AuthError>` — 从 `GRPC_MARKET_TOKEN` 读 token，注入 `authorization: Bearer <token>`；未设置 → 不注入（dev 服务端接受）；`pub enum AuthError { InvalidTokenValue }`
 
-- [ ] **Step 1: 写 auth.rs（先测后码）**
+- [x] **Step 1: 写 auth.rs（先测后码）**
 
 ```rust
 //! 认证 (合同 §4): 业务客户端通过 gRPC metadata 发送 `authorization: Bearer <token>`。
@@ -1028,12 +1028,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 跑测试**
+- [x] **Step 2: 跑测试**
 
 Run: `cargo test --lib grpc_client::auth:: 2>&1 | tail -5`
 Expected: PASS（2 passed）。`cargo build --lib` exit 0。
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/grpc_client/auth.rs
@@ -1057,7 +1057,7 @@ git commit -m "feat(grpc): P0 Bearer token 注入 (GRPC_MARKET_TOKEN, 只进 met
   - `pub async fn query(&mut self, op: Operation, payload: serde_json::Value) -> Result<QueryResult, GrpcError>` — 未实现 op 客户端直接 `GrpcError::Unimplemented`（不发起调用）；§10 重试保留原 request_id
   - `pub async fn subscribe(&mut self, filter: EventFilter, after: Option<EventCursor>) -> Result<tonic::Streaming<MarketEventEnvelope>, GrpcError>`（Task 11 消费）
 
-- [ ] **Step 1: 写 client.rs（先测后码）**
+- [x] **Step 1: 写 client.rs（先测后码）**
 
 ```rust
 //! GrpcMarketClient: 54 op 的 gRPC 查询客户端 (合同 §5-§7)。
@@ -1319,12 +1319,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 跑测试**
+- [x] **Step 2: 跑测试**
 
 Run: `cargo test --lib grpc_client::client:: 2>&1 | tail -8`
 Expected: PASS（2 passed）。若 tonic trait 方法签名报错（缺方法 / 方法名不同），按 Step 1 注释的补桩规则补齐后重跑。`cargo build --lib` exit 0。
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/grpc_client/client.rs
@@ -1354,7 +1354,7 @@ git commit -m "feat(grpc): P0 GrpcMarketClient (query 24 op + health/capabilitie
   - `pub(crate) mod delegate { pub struct Fetched { pub data: Vec<u8>, pub source_at: String }; pub fn fetch(op, schema) -> Result<Fetched, String> }`
   - `pub(crate) fn fixture_response(op: Operation, request_schema: &str, request_version: u32) -> Option<QueryResponse>`
 
-- [ ] **Step 1: 写 ServerConfig + ServerState + start() + SystemService**
+- [x] **Step 1: 写 ServerConfig + ServerState + start() + SystemService**
 
 先建 `src/grpc_server/events.rs` 空骨架（Task 11 填充全部实现）：
 
@@ -1504,7 +1504,7 @@ pub(crate) fn listener_status_placeholder(
 }
 ```
 
-- [ ] **Step 2: 写 handlers.rs + delegate.rs + fixture.rs**
+- [x] **Step 2: 写 handlers.rs + delegate.rs + fixture.rs**
 
 `src/grpc_server/handlers.rs`：
 
@@ -1815,7 +1815,7 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
 }
 ```
 
-- [ ] **Step 3: 写薄二进制**
+- [x] **Step 3: 写薄二进制**
 
 `src/bin/grpc_market_server.rs`：
 
@@ -1840,7 +1840,7 @@ async fn main() -> anyhow::Result<()> {
 
 `src/lib.rs` 追加 `pub mod grpc_server;`。
 
-- [ ] **Step 4: 写集成测试**
+- [x] **Step 4: 写集成测试**
 
 `tests/grpc_channel_e2e.rs`：
 
@@ -1924,17 +1924,17 @@ async fn unknown_schema_rejected() {
 }
 ```
 
-- [ ] **Step 5: 跑测试**
+- [x] **Step 5: 跑测试**
 
 Run: `cargo test --test grpc_channel_e2e 2>&1 | tail -8`
 Expected: PASS（3 passed）。`cargo build --lib` 与 `cargo build --bin grpc_market_server` exit 0。
 
-- [ ] **Step 6: 手工真实模式冒烟（可选，需网络）**
+- [x] **Step 6: 手工真实模式冒烟（可选，需网络）**
 
 Run: `cargo run --bin grpc_market_server 2>&1 | head -3`（另开终端）
 Expected: 启动日志 `[grpc_server] 监听 127.0.0.1:18082`。真实 provider 路径在 Task 9/10 后验证。
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/grpc_server/ src/bin/grpc_market_server.rs src/lib.rs tests/grpc_channel_e2e.rs
@@ -1952,7 +1952,7 @@ git commit -m "feat(grpc): P1 grpc_market_server 骨架 (SystemService + 6 代�
 - Consumes: `data_gateway` 各 Gateway（现有库代码，只读调用）
 - Produces: `pub fn fetch(op, schema) -> Result<Fetched, String>` 覆盖 18 个 op（6 代表 + 12 核心）
 
-- [ ] **Step 1: 核对 data_gateway 入口与字段**
+- [x] **Step 1: 核对 data_gateway 入口与字段**
 
 Run: `grep -n "pub async fn\|pub fn" src/data_gateway/market_capabilities.rs | head -20` 及 `grep -rn "pub struct TopStock" -A 15 src/`
 Expected: 记录 12 个 op 对应的 Gateway 入口函数名与返回结构体字段（写进 delegate.rs 的注释，禁止凭记忆写字段）。
@@ -1971,7 +1971,7 @@ Expected: 记录 12 个 op 对应的 Gateway 入口函数名与返回结构体�
 - BlockTrades → (src/data_gateway/block_trade.rs:72)
 - Consensus → (src/data_gateway/consensus.rs:77)
 
-- [ ] **Step 2: 逐个实现 fetch_xxx**
+- [x] **Step 2: 逐个实现 fetch_xxx**
 
 `delegate.rs` 的 `fetch()` match 扩到 18 个 op。每个 fetch 模式（以 minute_data 为例）：
 
@@ -2007,12 +2007,12 @@ fn watchlist_codes() -> Vec<String> {
 
 规则：每个 op 的 JSON 字段名 = 该 Gateway 返回结构体的 serde 序列化字段（用 `serde_json::to_value` 直出，保持 schema 稳定）；`source_at` 取 evidence 的可信源时间，缺则空。
 
-- [ ] **Step 3: 编译 + 现有测试回归**
+- [x] **Step 3: 编译 + 现有测试回归**
 
 Run: `cargo build --lib 2>&1 | tail -3` 和 `cargo test --test grpc_channel_e2e 2>&1 | tail -3`
 Expected: 都通过（fixture 集成测试不受 delegate 改动影响）。
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add src/grpc_server/delegate.rs
@@ -2030,7 +2030,7 @@ git commit -m "feat(grpc): P2 delegate 委托层 核心 12 op 走真实 data_gat
 - Consumes: 同 Task 9
 - Produces: `fetch()` 覆盖全部 24 个生产 op
 
-- [ ] **Step 1: 核对剩余 12 op 的 Gateway 锚点**
+- [x] **Step 1: 核对剩余 12 op 的 Gateway 锚点**
 
 - BoardDirectory / BoardConstituents → `BoardDataGateway` (src/data_gateway/board_runtime.rs:392/:452)
 - BoardFlows → Eastmoney 板块资金流 (src/data_gateway/capital.rs:335)
@@ -2043,17 +2043,17 @@ git commit -m "feat(grpc): P2 delegate 委托层 核心 12 op 走真实 data_gat
 
 每个入口 grep 签名后实现 fetch_xxx，规则同 Task 9 Step 2。
 
-- [ ] **Step 2: 实现 + 编译 + 测试**
+- [x] **Step 2: 实现 + 编译 + 测试**
 
 Run: `cargo build --lib`、`cargo test --test grpc_channel_e2e`、`cargo test --lib grpc_contract::`
 Expected: 全绿。
 
-- [ ] **Step 3: 真实模式手工冒烟（24 op 逐个 probe）**
+- [x] **Step 3: 真实模式手工冒烟（24 op 逐个 probe）**
 
 最简做法：`cargo run --bin grpc_market_server` 后用一个临时集成测试（`#[ignore]`）或临时 test 二进制逐个 op 查询断言 `admission=ADMITTED, complete=true`。不修改 monitor 与生产路径。
 Expected: 真实模式下 24 op 返回 `admission=ADMITTED, complete=true`（网络可用时）。
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add src/grpc_server/delegate.rs
@@ -2081,7 +2081,7 @@ git commit -m "feat(grpc): P2 delegate 委托层 24 个生产 op 全量覆盖"
   - `pub fn poll_interval_ms() -> u64`（`EVENT_POLL_INTERVAL_MS`，默认 3000）/ `pub fn thresholds() -> (f64, f64)`（`EVENT_PRICE_THRESHOLD_PCT` 默认 0.5 pp、`EVENT_VOLUME_THRESHOLD_X` 默认 1.5x，spec §4.5 可配置）
   - `EventKind::Reset` 为合同定义事件（§8）：服务重启/代次切换由 generation 变化表达（Replay FAILED_PRECONDITION），reset 事件的消费侧语义在 P3 listener 落地
 
-- [ ] **Step 1: diff 检测器（先测后码）**
+- [x] **Step 1: diff 检测器（先测后码）**
 
 `src/grpc_server/events.rs` 上半部分：
 
@@ -2289,12 +2289,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 跑 diff 单测**
+- [x] **Step 2: 跑 diff 单测**
 
 Run: `cargo test --lib grpc_server::events:: 2>&1 | tail -6`
 Expected: PASS（5 passed）。
 
-- [ ] **Step 3: 写 EventHub + MarketEventService impl**
+- [x] **Step 3: 写 EventHub + MarketEventService impl**
 
 继续 `src/grpc_server/events.rs`：
 
@@ -2518,7 +2518,7 @@ pub fn thresholds() -> (f64, f64) {
 }
 ```
 
-- [ ] **Step 4: start() 返回 hub + 轮询循环注入**
+- [x] **Step 4: start() 返回 hub + 轮询循环注入**
 
 `src/grpc_server/mod.rs` 改 `start()` 签名：`-> anyhow::Result<(SocketAddr, JoinHandle<Result<(), tonic::transport::Error>>, Arc<events::EventHub>)>`，构造 `events::EventService::new(state.clone(), config.fixture_mode)` 并 `add_service`。同步修改 Task 8 集成测试的元组解构（`let (addr, handle, _hub) = start(...)`）。
 
@@ -2573,7 +2573,7 @@ tokio::spawn(async move {
 });
 ```
 
-- [ ] **Step 5: 订阅流集成测试**
+- [x] **Step 5: 订阅流集成测试**
 
 `tests/grpc_channel_e2e.rs` 追加：
 
@@ -2659,12 +2659,12 @@ async fn replay_returns_bounded_events_same_generation() {
 
 （`futures = "0.3"` 已在 Cargo.toml [dependencies]，集成测试可直接使用，无需新增 dev-dependency。）
 
-- [ ] **Step 6: 跑测试**
+- [x] **Step 6: 跑测试**
 
 Run: `cargo test --test grpc_channel_e2e 2>&1 | tail -8` 和 `cargo test --lib grpc_server:: 2>&1 | tail -5`
 Expected: 全绿。
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/grpc_server/ src/bin/grpc_market_server.rs tests/grpc_channel_e2e.rs Cargo.toml Cargo.lock
