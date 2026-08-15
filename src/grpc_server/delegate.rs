@@ -63,12 +63,6 @@ fn today() -> NaiveDate {
     Local::now().date_naive()
 }
 
-/// codes 默认: STOCK_LIST env (watchlist)。M1 起统一走 grpc_contract::params
-/// (既有 24 个 fetch 的调用点保持此薄转发, 不做 24 处就地替换)。
-fn watchlist_codes() -> Vec<String> {
-    crate::grpc_contract::params::watchlist_codes()
-}
-
 /// batch 的 evidence 可信源时间 (合同 §6: 缺则不填充)。
 fn source_at_of(batch: &crate::data_gateway::GatewayBatch<impl Sized>) -> String {
     batch.evidence().source_at.clone().unwrap_or_default()

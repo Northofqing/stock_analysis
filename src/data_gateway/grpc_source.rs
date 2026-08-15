@@ -38,6 +38,53 @@ static BRIDGE_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 const DEFAULT_ADDR: &str = "http://127.0.0.1:18082";
 
+/// 已挂桥的 op 清单 (与各网关文件内 `super::grpc_source::bridge_for("X")` 调用
+/// 一一对应)。变更时必须同步 — hooked_ops_match_bridge_for_call_sites 单测
+/// 直接扫 src/data_gateway 源码断言集合相等, 防 rot (Spec Evidence Rule)。
+pub const HOOKED_OPS: &[&str] = &[
+    "Announcements",
+    "BlockTrades",
+    "BoardConstituents",
+    "BoardDirectory",
+    "BoardFlows",
+    "BoardRanking",
+    "Consensus",
+    "DragonTiger",
+    "EconomicCalendar",
+    "ForeignExchange",
+    "FuturesDelivery",
+    "GlobalNews",
+    "HistoricalBars",
+    "IndexQuotes",
+    "InstrumentNews",
+    "MarketStatistics",
+    "MinuteData",
+    "MoneyFlows",
+    "OrderBooks",
+    "RealtimeQuotes",
+    "SecurityMetadata",
+    "T0Evidence",
+    "TechnicalBars",
+    "UpperLimitPoolReview",
+];
+
+/// 保持本地 (library 模式) 的网关能力 — P4 M3 风险条款: 服务端 op 已实现或
+/// 半实现, 但桥保真未经验证 → 不静默切换, 出声 banner 列 follow-up。
+/// 接桥时从本表删除并移入 HOOKED_OPS。
+pub const KEEP_LOCAL_OPS: &[&str] = &[
+    "semantic_search",
+    "outcome_daily_bars",
+    "limit_pools",
+    "strong_stock_reasons",
+    "corporate_actions",
+    "provider_top_n_pair",
+    "instrument_fund_flow",
+    "northbound_daily",
+    "financial_statements",
+    "research_reports",
+    "intraday_shape",
+];
+
 /// 网关钩子入口: DATA_GATEWAY_GRPC=1 且 op 未被 DISABLED → Some(Arc<GrpcSource>)
 /// (惰性连接, 失败不缓存); 否则 Ok(None) (library 路径)。
 /// 连接失败 → Err(unavailable retryable) (fail-closed)。
@@ -71,6 +118,31 @@ pub fn reset_bridge() {
     if let Some(cell) = SOURCE.get() {
         *cell.lock().unwrap() = None;
     }
+}
+
+/// M4 启动 banner (v15.x 出声原则): 数据源模式必须打印, 默认 library。
+/// 语义与 bridge_for 完全一致 (DATA_GATEWAY_GRPC=1 才走 gRPC)。
+/// main.rs [broker] 启动完成后调用。
+pub fn startup_banner() -> String {
+    let mode = if std::env::var("DATA_GATEWAY_GRPC").as_deref() == Ok("1") {
+        "grpc"
+    } else {
+        "library"
+    };
+    let server = std::env::var("GRPC_MARKET_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
+    let disabled = std::env::var("DATA_GATEWAY_GRPC_DISABLED").unwrap_or_default();
+    let disabled = if disabled.is_empty() {
+        "无".to_string()
+    } else {
+        disabled
+    };
+    format!(
+        "[data_gateway] 数据源模式 = {mode} | server = {server} | 桥接 {} ops | \
+         禁用 = {disabled} | 保持本地 {} ops (P4 follow-up): {}",
+        HOOKED_OPS.len(),
+        KEEP_LOCAL_OPS.len(),
+        KEEP_LOCAL_OPS.join(",")
+    )
 }
 
 /// block_on 判别器: 有 runtime 线程 (spawn_blocking) → Handle::block_on;
@@ -651,5 +723,82 @@ mod tests {
         std::env::remove_var("DATA_GATEWAY_GRPC");
         std::env::remove_var("GRPC_MARKET_ADDR");
         reset_bridge();
+    }
+
+    #[test]
+    fn startup_banner_defaults_to_library() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("DATA_GATEWAY_GRPC");
+        std::env::remove_var("DATA_GATEWAY_GRPC_DISABLED");
+        std::env::remove_var("GRPC_MARKET_ADDR");
+        let b = startup_banner();
+        assert!(b.contains("数据源模式 = library"), "默认必须 library (v15.x 出声): {b}");
+        assert!(b.contains("server = http://127.0.0.1:18082"), "默认地址: {b}");
+        assert!(b.contains("禁用 = 无"), "无禁用: {b}");
+        assert!(b.contains("保持本地 11 ops"), "keep-local 计数: {b}");
+    }
+
+    #[test]
+    fn startup_banner_grpc_mode_and_disabled() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("DATA_GATEWAY_GRPC", "1");
+        std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:19001");
+        std::env::set_var("DATA_GATEWAY_GRPC_DISABLED", "T0Evidence,InstrumentNews");
+        let b = startup_banner();
+        assert!(b.contains("数据源模式 = grpc"), "grpc 模式: {b}");
+        assert!(b.contains("server = http://127.0.0.1:19001"), "显式地址: {b}");
+        assert!(b.contains("禁用 = T0Evidence,InstrumentNews"), "禁用列表: {b}");
+        std::env::remove_var("DATA_GATEWAY_GRPC");
+        std::env::remove_var("DATA_GATEWAY_GRPC_DISABLED");
+        std::env::remove_var("GRPC_MARKET_ADDR");
+    }
+
+    #[test]
+    fn hooked_ops_disjoint_from_keep_local() {
+        for op in HOOKED_OPS {
+            assert!(
+                !KEEP_LOCAL_OPS.contains(&op),
+                "{op} 同时出现在 HOOKED_OPS 和 KEEP_LOCAL_OPS — 必须只在一处"
+            );
+        }
+    }
+
+    #[test]
+    fn hooked_ops_match_bridge_for_call_sites() {
+        // Spec Evidence Rule: banner 的 HOOKED_OPS 必须与真实钩子一致, 防 rot。
+        // 扫 src/data_gateway/ 下除 grpc_source.rs 外各文件的 bridge_for 调用
+        // (grpc_source.rs 自身的 bridge_for 是单测不是钩子), 去重后集合断言相等。
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/data_gateway");
+        let mut found: Vec<String> = Vec::new();
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)
+            .expect("src/data_gateway 可读")
+            .filter_map(|e| e.ok())
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            if path.file_name().and_then(|n| n.to_str()) == Some("grpc_source.rs") {
+                continue; // 定义模块: 钩子调用在其他网关文件
+            }
+            let text = std::fs::read_to_string(&path).expect("读网关源文件");
+            for (idx, _) in text.match_indices("bridge_for(\"") {
+                let rest = &text[idx + "bridge_for(\"".len()..];
+                let end = rest.find('"').unwrap_or_else(|| panic!("bridge_for 名称未闭合: {path:?}"));
+                found.push(rest[..end].to_string());
+            }
+        }
+        // 一个 op 可有多个钩子调用点 (day1_flows/day5_flows 等) → 去重。
+        found.sort();
+        found.dedup();
+        let mut expected: Vec<&str> = HOOKED_OPS.to_vec();
+        expected.sort();
+        assert_eq!(
+            found, expected,
+            "HOOKED_OPS 与真实 bridge_for 调用不一致 (banner 会撒谎)。\
+             改钩子时同步 const, 改 const 时同步钩子。"
+        );
     }
 }

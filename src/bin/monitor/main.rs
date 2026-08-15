@@ -4264,6 +4264,10 @@ async fn main() {
 
     log::info!("[broker] 启动完成 | 当前数据源 = {}", broker_src.label());
 
+    // P4 M4: data_gateway 数据源模式 banner (v15.x 出声 — 默认 library,
+    // DATA_GATEWAY_GRPC=1 才走 gRPC 桥; 桥接/禁用/保持本地清单一目了然)。
+    log::info!("{}", stock_analysis::data_gateway::grpc_source::startup_banner());
+
     stock_analysis::strategy::v16_4::register_all();
 
     let startup_health = health::health_check().await;
