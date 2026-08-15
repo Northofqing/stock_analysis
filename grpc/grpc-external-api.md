@@ -99,6 +99,31 @@ data           = UTF-8 JSON 字节
 规范化业务 payload。每个方法的 schema 名称和 JSON 字段在服务端 Provider 接入时
 单独冻结；调用方遇到未知 schema/version 必须停止解析，不能忽略或猜字段。
 
+### 请求 params (M1 起)
+
+`payload.data` 是 **params JSON 对象**（UTF-8 JSON 对象，不是数组）：
+
+- `{}` = 全默认 = 与 library 模式生产行为一致；
+- 显式字段才改变行为（服务端不发明调用方未声明的默认）；
+- 字段解析失败 → `Status::invalid_argument`（400 语义，错误消息含字段名）。
+
+参数表（op → 字段 → 默认）：
+
+| 字段 | 含义 | 默认 |
+|------|------|------|
+| codes | 逐代码 op 的代码列表（字符串数组） | STOCK_LIST env (watchlist) |
+| days | HistoricalBars 天数 | 120 |
+| count | TechnicalBars 15min K 线条数 | 48 |
+| date | UpperLimitPoolReview / ProviderTopNRankings 日期 YYYY-MM-DD | 今天 |
+| from_days | InstrumentNews 回溯天数 | 30 |
+| interval / limit | FundFlowSeries 周期 (day1/minute1) / 条数 | "day1" / 20 |
+| kind | FinancialStatements (balance/income/cash_flow) | 必填，缺失报错 |
+| code / window_start / window_end | CorporateActions 代码与窗口 (YYYY-MM-DD) | 必填，缺失报错 |
+| query | SemanticSearch 检索词 | 必填，缺失报错 |
+| observed_at | T0Evidence 观测时刻 (RFC3339) | 服务端现在时刻 |
+
+实现：`src/grpc_contract/params.rs`（服务端与客户端共享契约，默认值表即该模块文档）。
+
 ## 6. 通用响应合同
 
 `QueryResponse` 包含：

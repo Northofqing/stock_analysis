@@ -58,6 +58,12 @@ enum Operation {
   OPERATION_CONCEPT_HITS = 52;
   OPERATION_OPTION_DATA = 53;
   OPERATION_PROVIDER_TOP_N_RANKINGS = 54;
+  OPERATION_INDEX_QUOTES = 55;
+  OPERATION_INSTRUMENT_NEWS = 56;
+  OPERATION_INTRADAY_SHAPE = 57;
+  OPERATION_T0_EVIDENCE = 58;
+  OPERATION_OUTCOME_DAILY_BARS = 59;
+  OPERATION_UPPER_LIMIT_POOL_REVIEW = 60;
 }
 
 enum AdmissionState {
@@ -276,6 +282,12 @@ service MarketDataService {
   rpc ConceptHits(QueryRequest) returns (QueryResponse);
   rpc OptionData(QueryRequest) returns (QueryResponse);
   rpc ProviderTopNRankings(QueryRequest) returns (QueryResponse);
+  rpc IndexQuotes(QueryRequest) returns (QueryResponse);
+  rpc InstrumentNews(QueryRequest) returns (QueryResponse);
+  rpc IntradayShape(QueryRequest) returns (QueryResponse);
+  rpc T0Evidence(QueryRequest) returns (QueryResponse);
+  rpc OutcomeDailyBars(QueryRequest) returns (QueryResponse);
+  rpc UpperLimitPoolReview(QueryRequest) returns (QueryResponse);
 }
 
 service MarketEventService {

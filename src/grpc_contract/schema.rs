@@ -37,6 +37,22 @@ const SCHEMAS: &[OpSchema] = &[
     OpSchema { operation: Operation::ResearchReports, schema_name: "research.reports", schema_version: 1 },
     OpSchema { operation: Operation::BlockTrades, schema_name: "market.block_trades", schema_version: 1 },
     OpSchema { operation: Operation::NorthboundDaily, schema_name: "market.northbound_daily", schema_version: 1 },
+    // M1 扩展 (P4): 8 个 proto 已有 op。
+    OpSchema { operation: Operation::ForeignExchange, schema_name: "market.foreign_exchange", schema_version: 1 },
+    OpSchema { operation: Operation::FinancialStatements, schema_name: "market.financial_statements", schema_version: 1 },
+    OpSchema { operation: Operation::MarketStatistics, schema_name: "market.market_statistics", schema_version: 1 },
+    OpSchema { operation: Operation::TechnicalBars, schema_name: "market.technical_bars", schema_version: 1 },
+    OpSchema { operation: Operation::CorporateActions, schema_name: "market.corporate_actions", schema_version: 1 },
+    OpSchema { operation: Operation::SemanticSearch, schema_name: "market.semantic_search", schema_version: 1 },
+    OpSchema { operation: Operation::FundFlowSeries, schema_name: "market.fund_flow_series", schema_version: 1 },
+    OpSchema { operation: Operation::ProviderTopNRankings, schema_name: "market.provider_top_n_rankings", schema_version: 1 },
+    // M1 扩展 (P4): 6 个新 op (proto 编号 55-60)。
+    OpSchema { operation: Operation::IndexQuotes, schema_name: "market.index_quotes", schema_version: 1 },
+    OpSchema { operation: Operation::InstrumentNews, schema_name: "news.instrument_news", schema_version: 1 },
+    OpSchema { operation: Operation::IntradayShape, schema_name: "market.intraday_shape", schema_version: 1 },
+    OpSchema { operation: Operation::T0Evidence, schema_name: "market.t0_evidence", schema_version: 1 },
+    OpSchema { operation: Operation::OutcomeDailyBars, schema_name: "market.outcome_daily_bars", schema_version: 1 },
+    OpSchema { operation: Operation::UpperLimitPoolReview, schema_name: "market.upper_limit_pool_review", schema_version: 1 },
 ];
 
 pub fn schema_for(op: Operation) -> Option<&'static OpSchema> {
@@ -49,8 +65,8 @@ mod tests {
 
     #[test]
     fn every_implemented_op_has_frozen_schema() {
-        // 24 个已实现 op 全部有 schema (spec 验收标准 3)。
-        assert_eq!(SCHEMAS.len(), 24);
+        // 38 个已实现 op 全部有 schema (M1 扩展后)。
+        assert_eq!(SCHEMAS.len(), 38);
         for op in crate::grpc_contract::ops::implemented_operations() {
             assert!(schema_for(op).is_some(), "op {op:?} 缺 schema");
         }

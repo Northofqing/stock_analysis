@@ -60,11 +60,17 @@ pub fn method_name(op: Operation) -> &'static str {
         ConceptHits => "ConceptHits",
         OptionData => "OptionData",
         ProviderTopNRankings => "ProviderTopNRankings",
+        IndexQuotes => "IndexQuotes",
+        InstrumentNews => "InstrumentNews",
+        IntradayShape => "IntradayShape",
+        T0Evidence => "T0Evidence",
+        OutcomeDailyBars => "OutcomeDailyBars",
+        UpperLimitPoolReview => "UpperLimitPoolReview",
         Unspecified => "OPERATION_UNSPECIFIED",
     }
 }
 
-/// 生产实际用到的 24 个 op (spec §4.2 清单, P2 冻结)。
+/// 生产实际用到的 38 个 op (P2 冻结 24 + M1 扩展 14, P4)。
 pub fn implemented_operations() -> Vec<Operation> {
     use Operation::*;
     vec![
@@ -74,6 +80,13 @@ pub fn implemented_operations() -> Vec<Operation> {
         BoardFlows, LimitPools, StrongStockReasons, DragonTiger,
         MarketDragonTiger, MarketRankings, ConceptHits, Consensus,
         ResearchReports, BlockTrades, NorthboundDaily,
+        // M1 扩展: 8 个 proto 已有 op 补齐 delegate 实现。
+        ForeignExchange, FinancialStatements, MarketStatistics,
+        TechnicalBars, CorporateActions, SemanticSearch,
+        FundFlowSeries, ProviderTopNRankings,
+        // M1 扩展: 6 个新 op (proto 编号 55-60)。
+        IndexQuotes, InstrumentNews, IntradayShape, T0Evidence,
+        OutcomeDailyBars, UpperLimitPoolReview,
     ]
 }
 
@@ -87,10 +100,10 @@ mod tests {
     use crate::grpc_client::pb::magic::market::v1::Operation;
 
     #[test]
-    fn method_name_covers_all_54_operations() {
-        // 从 proto 的 Operation 枚举全量遍历 (0..=54), 每个都映射到非空方法名。
+    fn method_name_covers_all_60_operations() {
+        // 从 proto 的 Operation 枚举全量遍历 (0..=60), 每个都映射到非空方法名。
         // prost 0.14 标记 from_i32 deprecated → 用 TryFrom<i32> (语义等价)。
-        for value in 0..=54 {
+        for value in 0..=60 {
             if let Ok(op) = Operation::try_from(value) {
                 assert!(!method_name(op).is_empty(), "op {value} 缺少方法名映射");
             }
@@ -98,8 +111,8 @@ mod tests {
     }
 
     #[test]
-    fn implemented_set_is_24_and_within_54() {
-        assert_eq!(implemented_operations().len(), 24);
+    fn implemented_set_is_38_and_within_60() {
+        assert_eq!(implemented_operations().len(), 38);
         assert!(implemented_operations()
             .iter()
             .all(|op| !matches!(op, Operation::Unspecified)));

@@ -19,7 +19,7 @@ async fn health_and_capabilities() {
     let health = client.get_health().await.unwrap();
     assert!(health.live && health.ready);
     let caps = client.get_capabilities().await.unwrap();
-    assert_eq!(caps.len(), 24, "24 个生产 op 全部在 capability 表");
+    assert_eq!(caps.len(), 38, "M1: 38 个生产 op (24 既有 + 8 已有编号 + 6 新编号) 全部在 capability 表");
     handle.abort();
 }
 
@@ -41,6 +41,13 @@ async fn six_representative_ops_fixture_roundtrip() {
         (Operation::Announcements, "news.announcements", "600519"),
         (Operation::GlobalNews, "news.global_news", "央行"),
         (Operation::SecurityMetadata, "market.security_metadata", "600519"),
+        // M1 扩展 (P4): 6 个新 op fixture roundtrip。
+        (Operation::IndexQuotes, "market.index_quotes", "sh000001"),
+        (Operation::InstrumentNews, "news.instrument_news", "600519"),
+        (Operation::IntradayShape, "market.intraday_shape", "稳步推高"),
+        (Operation::T0Evidence, "market.t0_evidence", "600519"),
+        (Operation::OutcomeDailyBars, "market.outcome_daily_bars", "2026-08-14"),
+        (Operation::UpperLimitPoolReview, "market.upper_limit_pool_review", "600519"),
     ];
     for (op, schema, probe) in cases {
         let result = client
@@ -51,7 +58,14 @@ async fn six_representative_ops_fixture_roundtrip() {
         assert_eq!(result.records.len(), 1, "{schema} 1 条 fixture 记录");
         assert_eq!(result.records[0].schema, schema);
         let parsed: serde_json::Value = serde_json::from_slice(&result.records[0].data).unwrap();
-        assert!(parsed[0].to_string().contains(probe), "{schema} 内容含 {probe}");
+        // 多数 op 视图是数组; T0Evidence 是 {"records": [...], "rejections": [...]} 对象,
+        // 非数组时整体检查 (serde_json Index<usize> 对非数组返回 Null)。
+        let haystack = if parsed.is_array() {
+            parsed[0].to_string()
+        } else {
+            parsed.to_string()
+        };
+        assert!(haystack.contains(probe), "{schema} 内容含 {probe}");
     }
     handle.abort();
 }

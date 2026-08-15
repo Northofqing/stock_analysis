@@ -69,9 +69,20 @@ impl DataService {
 
         // 真实路径: 委托 data_gateway。gateway 全部是 async fn 且内部自行
         // spawn_blocking (见 delegate.rs 头注释), 直接 await, 不套 spawn_blocking。
-        let result = delegate::fetch(op, &request_schema)
+        // 请求方向 payload.data = params JSON 对象 ({} = 全默认, 合同 §5 与
+        // grpc_contract::params 默认值表); 缺失/非法 → invalid_argument。
+        let params: serde_json::Value = match payload.data.as_slice() {
+            [] => serde_json::json!({}),
+            bytes => serde_json::from_slice(bytes).map_err(|e| {
+                Status::invalid_argument(format!("payload.data 不是合法 JSON: {e}"))
+            })?,
+        };
+        let result = delegate::fetch(op, &request_schema, &params)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| match e {
+                delegate::DelegateError::Params(pe) => Status::invalid_argument(pe.to_string()),
+                delegate::DelegateError::Fetch(msg) => Status::internal(msg),
+            })?;
 
         let request_id = req
             .context
@@ -82,7 +93,13 @@ impl DataService {
             request_id,
             operation: op as i32,
             admission: AdmissionState::Admitted as i32,
-            selected_provider: "tdx-dev".to_string(),
+            // M1: 新 14 op 回填真值 (evidence.provider); 既有 24 op 走 pack()
+            // 证据留空 → 保留 "tdx-dev" 兼容 (M2 全量升级后移除)。
+            selected_provider: if result.provider.is_empty() {
+                "tdx-dev".to_string()
+            } else {
+                result.provider
+            },
             batch_id: format!("{}-{}", frozen.schema_name, crate::grpc_client::envelope::new_request_id()),
             complete: true,
             observed_at: chrono::Local::now().to_rfc3339(),
@@ -169,4 +186,10 @@ impl_market_data_service!(
     concept_hits => ConceptHits,
     option_data => OptionData,
     provider_top_n_rankings => ProviderTopNRankings,
+    index_quotes => IndexQuotes,
+    instrument_news => InstrumentNews,
+    intraday_shape => IntradayShape,
+    t0_evidence => T0Evidence,
+    outcome_daily_bars => OutcomeDailyBars,
+    upper_limit_pool_review => UpperLimitPoolReview,
 );

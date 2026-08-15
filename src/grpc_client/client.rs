@@ -135,6 +135,22 @@ impl GrpcMarketClient {
             Operation::ResearchReports => self.data.research_reports(req).await,
             Operation::BlockTrades => self.data.block_trades(req).await,
             Operation::NorthboundDaily => self.data.northbound_daily(req).await,
+            // M1 扩展 (P4): 8 个 proto 已有 op。
+            Operation::ForeignExchange => self.data.foreign_exchange(req).await,
+            Operation::FinancialStatements => self.data.financial_statements(req).await,
+            Operation::MarketStatistics => self.data.market_statistics(req).await,
+            Operation::TechnicalBars => self.data.technical_bars(req).await,
+            Operation::CorporateActions => self.data.corporate_actions(req).await,
+            Operation::SemanticSearch => self.data.semantic_search(req).await,
+            Operation::FundFlowSeries => self.data.fund_flow_series(req).await,
+            Operation::ProviderTopNRankings => self.data.provider_top_n_rankings(req).await,
+            // M1 扩展 (P4): 6 个新 op (proto 编号 55-60)。
+            Operation::IndexQuotes => self.data.index_quotes(req).await,
+            Operation::InstrumentNews => self.data.instrument_news(req).await,
+            Operation::IntradayShape => self.data.intraday_shape(req).await,
+            Operation::T0Evidence => self.data.t0_evidence(req).await,
+            Operation::OutcomeDailyBars => self.data.outcome_daily_bars(req).await,
+            Operation::UpperLimitPoolReview => self.data.upper_limit_pool_review(req).await,
             _ => return Err(GrpcError::Unimplemented), // 防御: is_implemented 已拦截
         };
         match resp {
@@ -248,6 +264,8 @@ mod tests {
         post_close_flows, northbound_daily, limit_pools, strong_stock_reasons,
         dragon_tiger, market_dragon_tiger, dragon_tiger_discovery, market_rankings,
         market_breadth, popularity, concept_hits, option_data, provider_top_n_rankings,
+        index_quotes, instrument_news, intraday_shape, t0_evidence,
+        outcome_daily_bars, upper_limit_pool_review,
     );
 
     async fn spawn_mock() -> String {
