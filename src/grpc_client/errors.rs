@@ -73,6 +73,23 @@ impl From<tonic::Status> for GrpcError {
     }
 }
 
+impl From<crate::grpc_client::auth::AuthError> for GrpcError {
+    fn from(_: crate::grpc_client::auth::AuthError) -> Self {
+        // token 含非法字符无法注入 metadata → 请求根本到不了服务端, 语义上等同认证失败。
+        GrpcError::Unauthenticated
+    }
+}
+
+impl From<crate::grpc_client::envelope::EnvelopeError> for GrpcError {
+    fn from(_: crate::grpc_client::envelope::EnvelopeError) -> Self {
+        // 信封构造失败是客户端本地错误 (序列化失败/未冻结 schema), 非服务端状态。
+        // 映射 Unknown + code=envelope, 与响应侧信封校验失败同码 (见 client.rs query)。
+        GrpcError::Unknown {
+            details: ErrorDetail { code: "envelope".to_string(), ..Default::default() },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
