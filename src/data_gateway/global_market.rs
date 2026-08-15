@@ -102,6 +102,21 @@ impl GlobalMarketGateway {
             )
         })?;
         let request_hash = acquisition_request_hash(FX_CAPABILITY, "UsdCny");
+        // P4 M3 钩子: DATA_GATEWAY_GRPC=1 → gRPC 通道 (fail-closed, audit 对等)。
+        match super::grpc_source::bridge_for("ForeignExchange") {
+            Ok(Some(bridge)) => {
+                let result = bridge.foreign_exchange_async().await;
+                let audit_provider = result
+                    .as_ref()
+                    .map(|b| b.evidence().provider)
+                    .unwrap_or(ProviderId::Sina);
+                return audit_gateway_result(FX_CAPABILITY, audit_provider, &request_hash, result);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_gateway_result(FX_CAPABILITY, ProviderId::Sina, &request_hash, Err(error));
+            }
+        }
         let worker_request_hash = request_hash.clone();
         let joined = tokio::task::spawn_blocking(move || {
             let result = fetch_and_admit_fx(request);

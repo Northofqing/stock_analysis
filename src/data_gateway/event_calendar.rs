@@ -44,6 +44,21 @@ impl EventCalendarGateway {
         limit: u32,
     ) -> Result<GatewayBatch<EventAnnouncement>, GatewayError> {
         let request_hash = acquisition_request_hash(CAPABILITY, &format!("{trading_date}:{limit}"));
+        // P4 M3 钩子: DATA_GATEWAY_GRPC=1 → gRPC 通道 (fail-closed, audit 对等)。
+        match super::grpc_source::bridge_for("Announcements") {
+            Ok(Some(bridge)) => {
+                let result = bridge.announcements_async().await;
+                let audit_provider = result
+                    .as_ref()
+                    .map(|b| b.evidence().provider)
+                    .unwrap_or(ProviderId::Cninfo);
+                return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_gateway_result(CAPABILITY, ProviderId::Cninfo, &request_hash, Err(error));
+            }
+        }
         let worker_request_hash = request_hash.clone();
         let joined = tokio::task::spawn_blocking(move || {
             let result = build_request(trading_date, limit)

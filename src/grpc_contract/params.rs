@@ -145,7 +145,9 @@ pub fn instruments_for(codes: &[String]) -> Value {
     })
 }
 
-fn exchange_of(code: &str) -> &'static str {
+/// exchange 前缀推导 (6→Shanghai, 0/3→Shenzhen, 4/8/9→Beijing)。
+/// pub(crate): grpc_source convert 构造 InstrumentId 复用 (M3)。
+pub(crate) fn exchange_of(code: &str) -> &'static str {
     match code.as_bytes().first() {
         Some(b'6') => "Shanghai",
         Some(b'0' | b'3') => "Shenzhen",
@@ -230,9 +232,12 @@ pub fn resolve_enum_str<'a>(
 mod tests {
     use super::*;
     use serde_json::json;
+    // env 是进程级: STOCK_LIST 敏感的测试并行时会 race (M3 全量并行跑时暴露)。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn codes_defaults_to_watchlist() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // 不设 STOCK_LIST 时 → 空 (不静默填充)。
         std::env::remove_var("STOCK_LIST");
         assert_eq!(resolve_codes(&json!({})).unwrap(), Vec::<String>::new());
@@ -240,6 +245,7 @@ mod tests {
 
     #[test]
     fn codes_explicit_overrides_watchlist() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("STOCK_LIST", "600519,000001");
         let codes = resolve_codes(&json!({"codes": ["600519"]})).unwrap();
         assert_eq!(codes, vec!["600519"]);

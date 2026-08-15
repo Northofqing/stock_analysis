@@ -7,14 +7,28 @@
 //! 空 records → GatewayBatch::VerifiedEmpty (服务端 proven empty, 不 collapse
 //! 成 unavailable)。
 use crate::data_gateway::{
-    BatchEvidence, GatewayBatch, GatewayError, MarketBookLevel, MarketMinutePoint,
-    MarketMoneyFlow, MarketOrderBook, MarketSecurityMetadata, RealtimeMarketQuote,
-    SecurityBoard,
+    board_ranking::BoardRankingFact, BatchEvidence, BlockTradeReview, BoardDirectoryFact,
+    BoardDirectoryRecordEvidence, BoardFlowFact, BoardKind, BoardMembershipRecord,
+    DragonTigerSeatReview, DragonTigerSourceDisclosure, DragonTigerStockReview,
+    EconomicReleaseFact, EventAnnouncement, ForeignExchangeFact, FuturesDeliveryFact,
+    GatewayBatch, GatewayError, GlobalIndexFact, GlobalNewsRecord, InstrumentFundFlowFact,
+    IntradayShapeFact, MagicTdxT0Batch, MagicTdxT0DailyBar, MagicTdxT0Evidence,
+    MagicTdxT0FiveMinuteBar, MagicTdxT0Quote, MagicTdxT0Rejection, MarketBookLevel,
+    MarketMinutePoint, MarketMoneyFlow, MarketOrderBook, MarketSecurityMetadata,
+    NorthboundDailyFact, NorthboundQuotaFact, NorthboundTopTurnoverFact, ProviderTopNFact,
+    RealtimeIndexQuote, RealtimeMarketQuote, ResearchReportFact, SecurityBoard,
+    SinaInstrumentNewsRecord, T0BookLevel, UpperLimitRecord,
 };
-use crate::data_provider::{AdjustType, KlineData};
+use crate::data_provider::{consensus::ConsensusData, news_item::NewsItem, AdjustType, KlineData};
 use crate::grpc_client::envelope::QueryResult;
 use chrono::{DateTime, NaiveDate, Utc};
-use magic_market_core::ProviderId;
+use magic_market_core::{
+    AssetClass, DragonTigerSide, Exchange, FinancialStatement, FiniteNumber, FlowInterval,
+    FxPair, GlobalIndexCode, InstrumentId, IsoDate, MarketRankingKind, MarketRankingUnit,
+    MarketStatistics, Money, NorthboundChannel, NonEmptyText, PositiveU32, Price, ProviderId,
+    Ratio, SourceEvidence,
+};
+use magic_tdx_rs::protocol::types::SecurityBar;
 use serde_json::Value;
 
 /// bridge 缺证据时的 capability 标记 (audit_outcome=invalid_evidence)。
@@ -423,6 +437,1214 @@ pub fn historical_bars(code: &str, q: &QueryResult) -> Result<GatewayBatch<Kline
         })
         .collect::<Result<_, _>>()?;
     Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+// ---------- M3 批次 1: 全球市场/日历/公告/新闻/交割 ----------
+
+/// 全球指数。视图: delegate.rs fetch_global_indices (:339-361)
+/// {"code"(Debug),"name","value","change","change_percent","source_at"}。
+pub fn global_indices(q: &QueryResult) -> Result<GatewayBatch<GlobalIndexFact>, GatewayError> {
+    let capability = "GlobalIndices";
+    let ev = evidence_of(q, capability)?;
+    let parsed = parse_records(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records = parsed
+        .iter()
+        .map(|v| {
+            Ok(GlobalIndexFact {
+                code: parse_global_index_code(&as_str(v, "code", capability)?)?,
+                name: as_str(v, "name", capability)?,
+                value: as_f64(v, "value", capability)?,
+                change: as_f64(v, "change", capability)?,
+                change_percent: as_f64(v, "change_percent", capability)?,
+                source_at: as_rfc3339(v, "source_at", capability)?,
+                observed_at: record_observed_at(q, capability)?,
+                provider: ev.provider,
+                batch_id: ev.batch_id.clone(),
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+/// 外汇。视图: delegate.rs fetch_foreign_exchange (:900-921)
+/// {"pair"(Debug),"name","rate","change","change_percent","source_at"}。
+/// change/change_percent 是可空数值 (JSON null → None, 不补零)。
+pub fn foreign_exchange(q: &QueryResult) -> Result<GatewayBatch<ForeignExchangeFact>, GatewayError> {
+    let capability = "ForeignExchange";
+    let ev = evidence_of(q, capability)?;
+    let parsed = parse_records(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records = parsed
+        .iter()
+        .map(|v| {
+            Ok(ForeignExchangeFact {
+                pair: parse_fx_pair(&as_str(v, "pair", capability)?)?,
+                name: as_str(v, "name", capability)?,
+                rate: as_f64(v, "rate", capability)?,
+                change: as_optional_f64(v, "change", capability)?,
+                change_percent: as_optional_f64(v, "change_percent", capability)?,
+                source_at: as_rfc3339(v, "source_at", capability)?,
+                observed_at: record_observed_at(q, capability)?,
+                provider: ev.provider,
+                batch_id: ev.batch_id.clone(),
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+/// 公告。视图: delegate.rs fetch_announcements (:363-385)
+/// {"announcement_id","code","category","title","published_at","url"}。
+/// category 可空 (JSON null → None)。
+pub fn announcements(q: &QueryResult) -> Result<GatewayBatch<EventAnnouncement>, GatewayError> {
+    let capability = "Announcements";
+    let ev = evidence_of(q, capability)?;
+    let parsed = parse_records(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records = parsed
+        .iter()
+        .map(|v| {
+            Ok(EventAnnouncement {
+                announcement_id: as_str(v, "announcement_id", capability)?,
+                code: as_str(v, "code", capability)?,
+                category: as_optional_str(v, "category", capability)?,
+                title: as_str(v, "title", capability)?,
+                published_at: as_str(v, "published_at", capability)?,
+                canonical_url: as_str(v, "url", capability)?,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+/// 全球新闻。视图: delegate.rs fetch_global_news (:387-411)
+/// {"item_id","title","summary","publisher","url","published_at",
+///  "instruments","topics","content","language"}。
+pub fn global_news(q: &QueryResult) -> Result<GatewayBatch<GlobalNewsRecord>, GatewayError> {
+    let capability = "GlobalNews";
+    let ev = evidence_of(q, capability)?;
+    let parsed = parse_records(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records = parsed
+        .iter()
+        .map(|v| {
+            Ok(GlobalNewsRecord {
+                item_id: as_str(v, "item_id", capability)?,
+                title: as_str(v, "title", capability)?,
+                summary: as_optional_str(v, "summary", capability)?,
+                content: as_optional_str(v, "content", capability)?,
+                publisher: as_str(v, "publisher", capability)?,
+                canonical_url: as_str(v, "url", capability)?,
+                published_at: as_rfc3339(v, "published_at", capability)?,
+                observed_at: record_observed_at(q, capability)?,
+                instruments: as_str_array(v, "instruments", capability)?,
+                topics: as_str_array(v, "topics", capability)?,
+                language: as_str(v, "language", capability)?,
+                evidence: record_evidence(&ev, q)?,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+/// 财经日历。视图: delegate.rs fetch_economic_calendar (:413-439)
+/// {"event_id","country","name","period","scheduled_at","previous","consensus",
+///  "actual","unit","importance","released_at","revised","impact","indicator_id"}。
+pub fn economic_calendar(q: &QueryResult) -> Result<GatewayBatch<EconomicReleaseFact>, GatewayError> {
+    let capability = "EconomicCalendar";
+    let ev = evidence_of(q, capability)?;
+    let parsed = parse_records(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records = parsed
+        .iter()
+        .map(|v| {
+            Ok(EconomicReleaseFact {
+                event_id: as_str(v, "event_id", capability)?,
+                indicator_id: as_u64(v, "indicator_id", capability)? as u32,
+                country: as_str(v, "country", capability)?,
+                name: as_str(v, "name", capability)?,
+                period: as_optional_str(v, "period", capability)?,
+                scheduled_at: as_rfc3339(v, "scheduled_at", capability)?,
+                released_at: as_rfc3339(v, "released_at", capability)?,
+                previous: as_optional_str(v, "previous", capability)?,
+                consensus: as_optional_str(v, "consensus", capability)?,
+                actual: as_optional_str(v, "actual", capability)?,
+                revised: as_optional_str(v, "revised", capability)?,
+                unit: as_optional_str(v, "unit", capability)?,
+                importance: as_u64(v, "importance", capability)? as u32,
+                impact: as_optional_str(v, "impact", capability)?,
+                evidence: record_evidence(&ev, q)?,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+/// 交割日历。视图: delegate.rs fetch_futures_delivery (:441-463)
+/// {"contract_code","product_code","last_trading_date","delivery_date","notice_url"}。
+/// last_trading_date 可空 (JSON null → None)。
+pub fn futures_delivery(q: &QueryResult) -> Result<GatewayBatch<FuturesDeliveryFact>, GatewayError> {
+    let capability = "FuturesDelivery";
+    let ev = evidence_of(q, capability)?;
+    let parsed = parse_records(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records = parsed
+        .iter()
+        .map(|v| {
+            Ok(FuturesDeliveryFact {
+                contract_code: as_str(v, "contract_code", capability)?,
+                product_code: as_str(v, "product_code", capability)?,
+                last_trading_date: as_optional_date(v, "last_trading_date", capability)?,
+                delivery_date: as_date(v, "delivery_date", capability)?,
+                notice_url: as_str(v, "notice_url", capability)?,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+/// Debug 名 → GlobalIndexCode (服务端 format!("{:?}", code))。未知 → Err。
+fn parse_global_index_code(s: &str) -> Result<GlobalIndexCode, GatewayError> {
+    Ok(match s {
+        "DowJones" => GlobalIndexCode::DowJones,
+        "NasdaqComposite" => GlobalIndexCode::NasdaqComposite,
+        "Sp500" => GlobalIndexCode::Sp500,
+        "Nikkei225" => GlobalIndexCode::Nikkei225,
+        "HangSeng" => GlobalIndexCode::HangSeng,
+        "Ftse100" => GlobalIndexCode::Ftse100,
+        _ => return Err(err("GlobalIndices", format!("未知 GlobalIndexCode: {s}"))),
+    })
+}
+
+/// Debug 名 → FxPair。未知 → Err。
+fn parse_fx_pair(s: &str) -> Result<FxPair, GatewayError> {
+    Ok(match s {
+        "UsdCny" => FxPair::UsdCny,
+        "EurUsd" => FxPair::EurUsd,
+        "UsdJpy" => FxPair::UsdJpy,
+        "GbpUsd" => FxPair::GbpUsd,
+        "AudUsd" => FxPair::AudUsd,
+        "UsdChf" => FxPair::UsdChf,
+        "UsdCad" => FxPair::UsdCad,
+        "NzdUsd" => FxPair::NzdUsd,
+        _ => return Err(err("ForeignExchange", format!("未知 FxPair: {s}"))),
+    })
+}
+
+/// record 级证据: 用批级 evidence 构造 (视图无逐条证据字段)。
+fn record_evidence(ev: &BatchEvidence, q: &QueryResult) -> Result<SourceEvidence, GatewayError> {
+    let mut evidence = SourceEvidence::new(
+        ev.provider,
+        ev.observed_at.clone(),
+        ev.batch_id.clone(),
+    )
+    .map_err(|e| err(BRIDGE_CAPABILITY, format!("record evidence 构造失败: {e}")))?;
+    if let Some(source_at) = &ev.source_at {
+        evidence = evidence
+            .with_source_at(source_at.clone())
+            .map_err(|e| err(BRIDGE_CAPABILITY, format!("record evidence source_at 失败: {e}")))?;
+    }
+    let _ = q;
+    Ok(evidence)
+}
+
+/// 视图可空数值字段 (JSON null → None; 缺失 → Err fail-closed)。
+fn as_optional_f64(
+    v: &Value,
+    key: &str,
+    capability: &'static str,
+) -> Result<Option<f64>, GatewayError> {
+    let value = v.get(key).ok_or_else(|| err(capability, format!("record 缺数值字段 {key}")))?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_f64()
+        .map(Some)
+        .ok_or_else(|| err(capability, format!("字段 {key} 非数值")))
+}
+
+/// 视图可空字符串字段 (JSON null → None; 缺失 → Err fail-closed)。
+fn as_optional_str(
+    v: &Value,
+    key: &str,
+    capability: &'static str,
+) -> Result<Option<String>, GatewayError> {
+    let value = v.get(key).ok_or_else(|| err(capability, format!("record 缺字符串字段 {key}")))?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_str()
+        .map(|s| s.to_string())
+        .map(Some)
+        .ok_or_else(|| err(capability, format!("字段 {key} 非字符串")))
+}
+
+/// 视图可空日期字段 ("YYYY-MM-DD" 或 null)。
+fn as_optional_date(
+    v: &Value,
+    key: &str,
+    capability: &'static str,
+) -> Result<Option<NaiveDate>, GatewayError> {
+    let value = v.get(key).ok_or_else(|| err(capability, format!("record 缺日期字段 {key}")))?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    let s = value
+        .as_str()
+        .ok_or_else(|| err(capability, format!("字段 {key} 非字符串")))?;
+    NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .map(Some)
+        .map_err(|e| err(capability, format!("字段 {key} 非 YYYY-MM-DD: {s} ({e})")))
+}
+
+/// 视图整数字段。
+fn as_u64(v: &Value, key: &str, capability: &'static str) -> Result<u64, GatewayError> {
+    let value = v.get(key).ok_or_else(|| err(capability, format!("record 缺数值字段 {key}")))?;
+    value
+        .as_u64()
+        .ok_or_else(|| err(capability, format!("字段 {key} 非整数")))
+}
+
+/// 视图字符串数组字段。
+fn as_str_array(v: &Value, key: &str, capability: &'static str) -> Result<Vec<String>, GatewayError> {
+    let value = v.get(key).ok_or_else(|| err(capability, format!("record 缺数组字段 {key}")))?;
+    let arr = value
+        .as_array()
+        .ok_or_else(|| err(capability, format!("字段 {key} 非数组")))?;
+    arr.iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| err(capability, format!("字段 {key} 元素非字符串")))
+        })
+        .collect()
+}
+
+// ---------- M3 批次 2: 龙虎榜/大宗/一致预期/板块/研报/北向/财务/技术/资金流/排行/指数/个股新闻/形态/涨停复盘/T0 ----------
+
+/// core 验证类型构造错误 → GatewayError (fail-closed)。
+fn core_err(capability: &'static str, e: impl std::fmt::Display) -> GatewayError {
+    err(capability, format!("core 验证失败: {e}"))
+}
+
+/// 枚举 Debug 名反解析 (视图 format!("{:?}", ...) 契约)。
+fn parse_exchange(s: &str, capability: &'static str) -> Result<Exchange, GatewayError> {
+    match s {
+        "Shanghai" => Ok(Exchange::Shanghai),
+        "Shenzhen" => Ok(Exchange::Shenzhen),
+        "Beijing" => Ok(Exchange::Beijing),
+        _ => Err(err(capability, format!("未知 Exchange: {s}"))),
+    }
+}
+
+fn parse_board_kind(s: &str, capability: &'static str) -> Result<BoardKind, GatewayError> {
+    match s {
+        "Industry" => Ok(BoardKind::Industry),
+        "Concept" => Ok(BoardKind::Concept),
+        "Region" => Ok(BoardKind::Region),
+        _ => Err(err(capability, format!("未知 BoardKind: {s}"))),
+    }
+}
+
+fn parse_flow_interval(s: &str, capability: &'static str) -> Result<FlowInterval, GatewayError> {
+    match s {
+        "Minute1" => Ok(FlowInterval::Minute1),
+        "Day1" => Ok(FlowInterval::Day1),
+        "Day5" => Ok(FlowInterval::Day5),
+        "Day10" => Ok(FlowInterval::Day10),
+        "Day120" => Ok(FlowInterval::Day120),
+        _ => Err(err(capability, format!("未知 FlowInterval: {s}"))),
+    }
+}
+
+fn parse_northbound_channel(
+    s: &str,
+    capability: &'static str,
+) -> Result<NorthboundChannel, GatewayError> {
+    match s {
+        "Shanghai" => Ok(NorthboundChannel::Shanghai),
+        "Shenzhen" => Ok(NorthboundChannel::Shenzhen),
+        _ => Err(err(capability, format!("未知 NorthboundChannel: {s}"))),
+    }
+}
+
+fn parse_dragon_tiger_side(
+    s: &str,
+    capability: &'static str,
+) -> Result<DragonTigerSide, GatewayError> {
+    match s {
+        "Buy" => Ok(DragonTigerSide::Buy),
+        "Sell" => Ok(DragonTigerSide::Sell),
+        _ => Err(err(capability, format!("未知 DragonTigerSide: {s}"))),
+    }
+}
+
+/// Custom("xxx") → 内嵌 NonEmptyText (视图 Debug 名契约)。
+fn parse_custom_string(s: &str, capability: &'static str) -> Result<NonEmptyText, GatewayError> {
+    let inner = s
+        .strip_prefix("Custom(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .ok_or_else(|| err(capability, format!("非 Custom Debug 名: {s}")))?;
+    let value: String = serde_json::from_str(inner)
+        .map_err(|e| err(capability, format!("Custom 内嵌值解析失败 ({e}): {s}")))?;
+    NonEmptyText::new(value).map_err(|e| core_err(capability, e))
+}
+
+fn parse_market_ranking_kind(
+    s: &str,
+    capability: &'static str,
+) -> Result<MarketRankingKind, GatewayError> {
+    match s {
+        "VolumeRatio" => Ok(MarketRankingKind::VolumeRatio),
+        "MainNetInflow" => Ok(MarketRankingKind::MainNetInflow),
+        "Industry" => Ok(MarketRankingKind::Industry),
+        "Concept" => Ok(MarketRankingKind::Concept),
+        "Region" => Ok(MarketRankingKind::Region),
+        "Popularity" => Ok(MarketRankingKind::Popularity),
+        _ if s.starts_with("Custom(") => {
+            Ok(MarketRankingKind::Custom(parse_custom_string(s, capability)?))
+        }
+        _ => Err(err(capability, format!("未知 MarketRankingKind: {s}"))),
+    }
+}
+
+fn parse_market_ranking_unit(
+    s: &str,
+    capability: &'static str,
+) -> Result<MarketRankingUnit, GatewayError> {
+    match s {
+        "Multiple" => Ok(MarketRankingUnit::Multiple),
+        "Yuan" => Ok(MarketRankingUnit::Yuan),
+        "Percent" => Ok(MarketRankingUnit::Percent),
+        "Score" => Ok(MarketRankingUnit::Score),
+        _ if s.starts_with("Custom(") => {
+            Ok(MarketRankingUnit::Custom(parse_custom_string(s, capability)?))
+        }
+        _ => Err(err(capability, format!("未知 MarketRankingUnit: {s}"))),
+    }
+}
+
+fn instrument_for(code: &str, capability: &'static str) -> Result<InstrumentId, GatewayError> {
+    let exchange = match crate::grpc_contract::params::exchange_of(code) {
+        "Shanghai" => Exchange::Shanghai,
+        "Shenzhen" => Exchange::Shenzhen,
+        "Beijing" => Exchange::Beijing,
+        other => return Err(err(capability, format!("未知 exchange 前缀: {other}"))),
+    };
+    InstrumentId::new(exchange, code, AssetClass::Equity).map_err(|e| core_err(capability, e))
+}
+
+fn parse_disclosures(
+    v: &Value,
+    capability: &'static str,
+) -> Result<Vec<DragonTigerSourceDisclosure>, GatewayError> {
+    let arr = v
+        .get("disclosures")
+        .and_then(Value::as_array)
+        .ok_or_else(|| err(capability, "字段 disclosures 非数组"))?;
+    arr.iter()
+        .map(|d| {
+            let seats = d
+                .get("seats")
+                .and_then(Value::as_array)
+                .ok_or_else(|| err(capability, "字段 seats 非数组"))?
+                .iter()
+                .map(|s| {
+                    Ok(DragonTigerSeatReview {
+                        side: parse_dragon_tiger_side(&as_str(s, "side", capability)?, capability)?,
+                        rank: as_u64(s, "rank", capability)? as u32,
+                        seat_name: as_str(s, "seat_name", capability)?,
+                        amount_yuan: as_f64(s, "amount_yuan", capability)?,
+                        buy_amount_yuan: as_optional_f64(s, "buy_amount_yuan", capability)?,
+                        sell_amount_yuan: as_optional_f64(s, "sell_amount_yuan", capability)?,
+                        net_amount_yuan: as_optional_f64(s, "net_amount_yuan", capability)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(DragonTigerSourceDisclosure {
+                entry_id: as_str(d, "entry_id", capability)?,
+                trade_id: as_str(d, "trade_id", capability)?,
+                reason: as_optional_str(d, "reason", capability)?,
+                buy_amount_yuan: as_optional_f64(d, "buy_amount_yuan", capability)?,
+                sell_amount_yuan: as_optional_f64(d, "sell_amount_yuan", capability)?,
+                net_amount_yuan: as_optional_f64(d, "net_amount_yuan", capability)?,
+                turnover_rate_pct: as_optional_f64(d, "turnover_rate_pct", capability)?,
+                seats,
+            })
+        })
+        .collect()
+}
+
+pub fn dragon_tiger(q: &QueryResult) -> Result<GatewayBatch<DragonTigerStockReview>, GatewayError> {
+    let capability = "DragonTiger";
+    let (parsed, ev) = parse_records_parts(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records: Vec<DragonTigerStockReview> = parsed
+        .iter()
+        .map(|v| {
+            Ok(DragonTigerStockReview {
+                exchange: parse_exchange(&as_str(v, "exchange", capability)?, capability)?,
+                code: as_str(v, "code", capability)?,
+                ranking_net_amount_yuan: as_f64(v, "ranking_net_amount_yuan", capability)?,
+                disclosures: parse_disclosures(v, capability)?,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+pub fn market_dragon_tiger(
+    q: &QueryResult,
+) -> Result<GatewayBatch<DragonTigerStockReview>, GatewayError> {
+    let capability = "MarketDragonTiger";
+    let (parsed, ev) = parse_records_parts(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records: Vec<DragonTigerStockReview> = parsed
+        .iter()
+        .map(|v| {
+            Ok(DragonTigerStockReview {
+                exchange: parse_exchange(&as_str(v, "exchange", capability)?, capability)?,
+                code: as_str(v, "code", capability)?,
+                ranking_net_amount_yuan: as_f64(v, "ranking_net_amount_yuan", capability)?,
+                disclosures: parse_disclosures(v, capability)?,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+pub fn block_trades(q: &QueryResult) -> Result<GatewayBatch<BlockTradeReview>, GatewayError> {
+    let capability = "BlockTrades";
+    let (parsed, ev) = parse_records_parts(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records: Vec<BlockTradeReview> = parsed
+        .iter()
+        .map(|v| {
+            Ok(BlockTradeReview {
+                code: as_str(v, "code", capability)?,
+                traded_at: as_optional_str(v, "traded_at", capability)?,
+                price: as_f64(v, "price", capability)?,
+                close_price: as_optional_f64(v, "close_price", capability)?,
+                premium_ratio: as_optional_f64(v, "premium_ratio", capability)?,
+                volume: as_f64(v, "volume", capability)?,
+                amount: as_optional_f64(v, "amount", capability)?,
+                buyer: as_optional_str(v, "buyer", capability)?,
+                seller: as_optional_str(v, "seller", capability)?,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+pub fn consensus(q: &QueryResult) -> Result<GatewayBatch<ConsensusData>, GatewayError> {
+    let capability = "Consensus";
+    let (parsed, ev) = parse_records_parts(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records: Vec<ConsensusData> = parsed
+        .iter()
+        .map(|v| {
+            let rating_distribution = v
+                .get("rating_distribution")
+                .and_then(Value::as_object)
+                .ok_or_else(|| err(capability, "字段 rating_distribution 非对象"))?
+                .iter()
+                .map(|(k, val)| {
+                    Ok((
+                        k.clone(),
+                        val.as_u64().ok_or_else(|| {
+                            err(capability, format!("rating_distribution[{k}] 非整数"))
+                        })? as u32,
+                    ))
+                })
+                .collect::<Result<std::collections::HashMap<String, u32>, _>>()?;
+            Ok(ConsensusData {
+                report_count: as_u64(v, "report_count", capability)? as usize,
+                broker_count: as_u64(v, "broker_count", capability)? as usize,
+                eps_this_year_avg: as_optional_f64(v, "eps_this_year_avg", capability)?,
+                eps_next_year_avg: as_optional_f64(v, "eps_next_year_avg", capability)?,
+                eps_next2_year_avg: as_optional_f64(v, "eps_next2_year_avg", capability)?,
+                rating_distribution,
+                target_price_high_avg: None,
+                target_price_low_avg: None,
+                latest_report_date: None,
+                recent_reports: Vec::new(),
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+pub fn board_directory(q: &QueryResult) -> Result<GatewayBatch<BoardDirectoryFact>, GatewayError> {
+    let capability = "BoardDirectory";
+    let (parsed, ev) = parse_records_parts(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records: Vec<BoardDirectoryFact> = parsed
+        .iter()
+        .map(|v| {
+            Ok(BoardDirectoryFact {
+                code: as_str(v, "code", capability)?,
+                name: as_str(v, "name", capability)?,
+                kind: parse_board_kind(&as_str(v, "kind", capability)?, capability)?,
+                member_count: as_u64(v, "member_count", capability)? as u32,
+                evidence: directory_evidence(&ev, capability)?,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+pub fn board_constituents(
+    q: &QueryResult,
+) -> Result<GatewayBatch<BoardMembershipRecord>, GatewayError> {
+    let capability = "BoardConstituents";
+    let (parsed, ev) = parse_records_parts(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records: Vec<BoardMembershipRecord> = parsed
+        .iter()
+        .map(|v| {
+            Ok(BoardMembershipRecord {
+                instrument_code: as_str(v, "instrument_code", capability)?,
+                board_code: as_str(v, "board_code", capability)?,
+                board_name: as_str(v, "board_name", capability)?,
+                kind: parse_board_kind(&as_str(v, "kind", capability)?, capability)?,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+pub fn board_flows(q: &QueryResult) -> Result<GatewayBatch<BoardFlowFact>, GatewayError> {
+    let capability = "BoardFlows";
+    let (parsed, ev) = parse_records_parts(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records: Vec<BoardFlowFact> = parsed
+        .iter()
+        .map(|v| {
+            Ok(BoardFlowFact {
+                code: as_str(v, "code", capability)?,
+                name: as_str(v, "name", capability)?,
+                kind: parse_board_kind(&as_str(v, "kind", capability)?, capability)?,
+                rank: as_u64(v, "rank", capability)? as u32,
+                return_pct: as_optional_f64(v, "return_pct", capability)?,
+                main_net_yuan: as_optional_f64(v, "main_net_yuan", capability)?,
+                leader_code: as_optional_str(v, "leader_code", capability)?,
+                leader_name: as_optional_str(v, "leader_name", capability)?,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+pub fn board_ranking(q: &QueryResult) -> Result<GatewayBatch<BoardRankingFact>, GatewayError> {
+    let capability = "MarketRankings";
+    let (parsed, ev) = parse_records_parts(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records: Vec<BoardRankingFact> = parsed
+        .iter()
+        .map(|v| {
+            Ok(BoardRankingFact {
+                code: as_str(v, "code", capability)?,
+                name: as_str(v, "name", capability)?,
+                change_pct: as_f64(v, "change_pct", capability)?,
+                main_inflow: as_f64(v, "main_inflow", capability)?,
+                leader_name: as_str(v, "leader_name", capability)?,
+                vol_ratio: as_f64(v, "vol_ratio", capability)?,
+                turnover: as_f64(v, "turnover", capability)?,
+                day1_ratio: as_f64(v, "day1_ratio", capability)?,
+                day5_ratio: as_f64(v, "day5_ratio", capability)?,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+pub fn research_reports(q: &QueryResult) -> Result<GatewayBatch<ResearchReportFact>, GatewayError> {
+    let capability = "ResearchReports";
+    let (parsed, ev) = parse_records_parts(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records: Vec<ResearchReportFact> = parsed
+        .iter()
+        .map(|v| {
+            Ok(ResearchReportFact {
+                report_id: as_str(v, "report_id", capability)?,
+                title: as_str(v, "title", capability)?,
+                organization: as_str(v, "organization", capability)?,
+                organization_id: None,
+                author: None,
+                rating: as_optional_str(v, "rating", capability)?,
+                industry_code: None,
+                industry_name: None,
+                published_at: as_str(v, "published_at", capability)?,
+                canonical_url: as_str(v, "canonical_url", capability)?,
+                pdf_url: None,
+                source_target_price_upper: as_optional_f64(v, "target_price_upper", capability)?,
+                source_target_price_lower: as_optional_f64(v, "target_price_lower", capability)?,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+/// BoardDirectoryRecordEvidence 构造 (批级 evidence 映射, 视图无逐条证据)。
+fn directory_evidence(
+    ev: &BatchEvidence,
+    capability: &'static str,
+) -> Result<BoardDirectoryRecordEvidence, GatewayError> {
+    let _ = capability;
+    Ok(BoardDirectoryRecordEvidence {
+        provider: ev.provider,
+        source: ev.source.clone(),
+        source_at: ev.source_at.clone(),
+        observed_at: ev.observed_at.clone(),
+        batch_id: ev.batch_id.clone(),
+    })
+}
+
+/// 视图级证据 parse (evidence_of + parse_records 合并)。
+fn parse_records_parts(
+    q: &QueryResult,
+    capability: &'static str,
+) -> Result<(Vec<Value>, BatchEvidence), GatewayError> {
+    let ev = evidence_of(q, capability)?;
+    let parsed = parse_records(q, capability)?;
+    Ok((parsed, ev))
+}
+
+pub fn northbound_daily(q: &QueryResult) -> Result<GatewayBatch<NorthboundDailyFact>, GatewayError> {
+    let capability = "NorthboundDaily";
+    let (parsed, ev) = parse_records_parts(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records: Vec<NorthboundDailyFact> = parsed
+        .iter()
+        .map(|v| {
+            let quota_balance = match v.get("quota_balance") {
+                Some(Value::Number(n)) => {
+                    NorthboundQuotaFact::Amount(n.as_f64().ok_or_else(|| {
+                        err(capability, "quota_balance 非有限数字")
+                    })?)
+                }
+                Some(Value::String(s)) if s == "unavailable" => NorthboundQuotaFact::Unavailable,
+                _ => return Err(err(capability, "quota_balance 必须是数字或 unavailable")),
+            };
+            let top_turnover = v
+                .get("top_turnover")
+                .and_then(Value::as_array)
+                .ok_or_else(|| err(capability, "字段 top_turnover 非数组"))?
+                .iter()
+                .map(|t| {
+                    Ok(NorthboundTopTurnoverFact {
+                        rank: as_u64(t, "rank", capability)? as u32,
+                        code: as_str(t, "code", capability)?,
+                        name: as_str(t, "name", capability)?,
+                        total_turnover: as_f64(t, "total_turnover", capability)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(NorthboundDailyFact {
+                trading_date: as_date(v, "trading_date", capability)?,
+                channel: parse_northbound_channel(&as_str(v, "channel", capability)?, capability)?,
+                total_turnover: as_f64(v, "total_turnover", capability)?,
+                total_trade_count: as_f64(v, "total_trade_count", capability)?,
+                quota_balance,
+                etf_turnover: as_f64(v, "etf_turnover", capability)?,
+                top_turnover,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+pub fn financial_statements(
+    q: &QueryResult,
+) -> Result<GatewayBatch<FinancialStatement>, GatewayError> {
+    let capability = "FinancialStatements";
+    let (parsed, ev) = parse_records_parts(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records: Vec<FinancialStatement> = parsed
+        .iter()
+        .map(|v| {
+            serde_json::from_value(v.clone())
+                .map_err(|e| err(capability, format!("FinancialStatement 反序列化失败: {e}")))
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+pub fn market_statistics(q: &QueryResult) -> Result<GatewayBatch<MarketStatistics>, GatewayError> {
+    let capability = "MarketStatistics";
+    let (parsed, ev) = parse_records_parts(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records: Vec<MarketStatistics> = parsed
+        .iter()
+        .map(|v| {
+            let code = as_str(v, "code", capability)?;
+            let instrument = instrument_for(&code, capability)?;
+            MarketStatistics::new(
+                instrument,
+                as_optional_f64(v, "turnover_rate", capability)?
+                    .map(|x| Ratio::decimal(x).map_err(|e| core_err(capability, e)))
+                    .transpose()?,
+                as_optional_f64(v, "trailing_pe", capability)?
+                    .map(|x| FiniteNumber::new(x).map_err(|e| core_err(capability, e)))
+                    .transpose()?,
+                as_optional_f64(v, "static_pe", capability)?
+                    .map(|x| FiniteNumber::new(x).map_err(|e| core_err(capability, e)))
+                    .transpose()?,
+                as_optional_f64(v, "pb", capability)?
+                    .map(|x| FiniteNumber::new(x).map_err(|e| core_err(capability, e)))
+                    .transpose()?,
+                as_optional_f64(v, "total_market_cap", capability)?
+                    .map(|x| Money::new(x).map_err(|e| core_err(capability, e)))
+                    .transpose()?,
+                as_optional_f64(v, "floating_market_cap", capability)?
+                    .map(|x| Money::new(x).map_err(|e| core_err(capability, e)))
+                    .transpose()?,
+                as_optional_f64(v, "upper_limit", capability)?
+                    .map(|x| Price::new(x).map_err(|e| core_err(capability, e)))
+                    .transpose()?,
+                as_optional_f64(v, "lower_limit", capability)?
+                    .map(|x| Price::new(x).map_err(|e| core_err(capability, e)))
+                    .transpose()?,
+                as_optional_f64(v, "volume_ratio", capability)?
+                    .map(|x| FiniteNumber::new(x).map_err(|e| core_err(capability, e)))
+                    .transpose()?,
+                record_evidence(&ev, q)?,
+            )
+            .map_err(|e| core_err(capability, e))
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+pub fn technical_bars(q: &QueryResult) -> Result<GatewayBatch<SecurityBar>, GatewayError> {
+    let capability = "TechnicalBars";
+    let (parsed, ev) = parse_records_parts(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records: Vec<SecurityBar> = parsed
+        .iter()
+        .map(|v| {
+            Ok(SecurityBar {
+                open: as_f64(v, "open", capability)?,
+                close: as_f64(v, "close", capability)?,
+                high: as_f64(v, "high", capability)?,
+                low: as_f64(v, "low", capability)?,
+                vol: as_f64(v, "vol", capability)?,
+                amount: as_f64(v, "amount", capability)?,
+                year: 0,
+                month: 0,
+                day: 0,
+                hour: 0,
+                minute: 0,
+                datetime: as_str(v, "at", capability)?,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+pub fn fund_flow_series(
+    q: &QueryResult,
+) -> Result<GatewayBatch<InstrumentFundFlowFact>, GatewayError> {
+    let capability = "FundFlowSeries";
+    let (parsed, ev) = parse_records_parts(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records: Vec<InstrumentFundFlowFact> = parsed
+        .iter()
+        .map(|v| {
+            Ok(InstrumentFundFlowFact {
+                code: as_str(v, "code", capability)?,
+                interval: parse_flow_interval(&as_str(v, "interval", capability)?, capability)?,
+                period_at: as_str(v, "period_at", capability)?,
+                main_net: as_f64(v, "main_net", capability)?,
+                main_ratio_percent: as_f64(v, "main_ratio_percent", capability)?,
+                super_large_net: as_f64(v, "super_large_net", capability)?,
+                large_net: as_f64(v, "large_net", capability)?,
+                medium_net: as_f64(v, "medium_net", capability)?,
+                small_net: as_f64(v, "small_net", capability)?,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+pub fn provider_top_n_rankings(
+    q: &QueryResult,
+) -> Result<GatewayBatch<ProviderTopNFact>, GatewayError> {
+    let capability = "ProviderTopNRankings";
+    let (parsed, ev) = parse_records_parts(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records: Vec<ProviderTopNFact> = parsed
+        .iter()
+        .map(|v| {
+            Ok(ProviderTopNFact {
+                metric: parse_market_ranking_kind(&as_str(v, "metric", capability)?, capability)?,
+                source_order_ordinal: PositiveU32::new(as_u64(v, "ordinal", capability)? as u32)
+                    .map_err(|e| core_err(capability, e))?,
+                instrument: instrument_for(&as_str(v, "code", capability)?, capability)?,
+                label: NonEmptyText::new(as_str(v, "label", capability)?)
+                    .map_err(|e| core_err(capability, e))?,
+                value: FiniteNumber::new(as_f64(v, "value", capability)?)
+                    .map_err(|e| core_err(capability, e))?,
+                unit: parse_market_ranking_unit(&as_str(v, "unit", capability)?, capability)?,
+                trading_date: IsoDate::new(as_str(v, "trading_date", capability)?)
+                    .map_err(|e| core_err(capability, e))?,
+                filter_identity: NonEmptyText::new(as_str(v, "filter_identity", capability)?)
+                    .map_err(|e| core_err(capability, e))?,
+                provider_declared_total: PositiveU32::new(
+                    as_u64(v, "provider_declared_total", capability)? as u32,
+                )
+                .map_err(|e| core_err(capability, e))?,
+                inspected_row_count: PositiveU32::new(0)
+                    .map_err(|e| core_err(capability, e))?,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+pub fn index_quotes(q: &QueryResult) -> Result<GatewayBatch<RealtimeIndexQuote>, GatewayError> {
+    let capability = "IndexQuotes";
+    let (parsed, ev) = parse_records_parts(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records: Vec<RealtimeIndexQuote> = parsed
+        .iter()
+        .map(|v| {
+            Ok(RealtimeIndexQuote {
+                code: as_str(v, "code", capability)?,
+                name: as_str(v, "name", capability)?,
+                current: as_f64(v, "current", capability)?,
+                change: as_f64(v, "change", capability)?,
+                change_percent: as_f64(v, "change_percent", capability)?,
+                open: as_f64(v, "open", capability)?,
+                high: as_f64(v, "high", capability)?,
+                low: as_f64(v, "low", capability)?,
+                previous_close: as_f64(v, "previous_close", capability)?,
+                volume: as_f64(v, "volume", capability)?,
+                amount: as_f64(v, "amount", capability)?,
+                source_at: as_rfc3339(v, "source_at", capability)?,
+                observed_at: record_observed_at(q, capability)?,
+                provider: ev.provider,
+                batch_id: ev.batch_id.clone(),
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+pub fn instrument_news(
+    q: &QueryResult,
+) -> Result<GatewayBatch<SinaInstrumentNewsRecord>, GatewayError> {
+    let capability = "InstrumentNews";
+    let (parsed, ev) = parse_records_parts(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records: Vec<SinaInstrumentNewsRecord> = parsed
+        .iter()
+        .map(|v| {
+            let item = NewsItem {
+                source: as_str(v, "source", capability)?,
+                external_id: as_str(v, "external_id", capability)?,
+                category: as_str(v, "category", capability)?,
+                code: as_optional_str(v, "code", capability)?,
+                title: as_str(v, "title", capability)?,
+                summary: as_str(v, "summary", capability)?,
+                url: as_str(v, "url", capability)?,
+                source_name: as_str(v, "source_name", capability)?,
+                published_at: as_rfc3339(v, "published_at", capability)?,
+                fetched_at: as_rfc3339(v, "fetched_at", capability)?,
+                content_hash: as_str(v, "content_hash", capability)?,
+            };
+            Ok(SinaInstrumentNewsRecord::new(item, record_evidence(&ev, q)?))
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+pub fn intraday_shape(q: &QueryResult) -> Result<GatewayBatch<IntradayShapeFact>, GatewayError> {
+    let capability = "IntradayShape";
+    let (parsed, ev) = parse_records_parts(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records: Vec<IntradayShapeFact> = parsed
+        .iter()
+        .map(|v| {
+            // shape_label 是 &'static str (视图字符串) → Box::leak 保生命周期
+            // (每批 record 数有限, 形状标签来自服务端已验证值, 非用户输入)。
+            let label: &'static str = Box::leak(as_str(v, "shape_label", capability)?.into_boxed_str());
+            Ok(IntradayShapeFact {
+                date: as_str(v, "date", capability)?,
+                pre_close: as_f64(v, "pre_close", capability)?,
+                open_pct: as_f64(v, "open_pct", capability)?,
+                high_pct: as_f64(v, "high_pct", capability)?,
+                low_pct: as_f64(v, "low_pct", capability)?,
+                close_pct: as_f64(v, "close_pct", capability)?,
+                amplitude: as_f64(v, "amplitude", capability)?,
+                tail_30m_pct: as_optional_f64(v, "tail_30m_pct", capability)?,
+                shape_label: label,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+pub fn upper_limit_pool_review(
+    q: &QueryResult,
+) -> Result<GatewayBatch<UpperLimitRecord>, GatewayError> {
+    let capability = "UpperLimitPoolReview";
+    let (parsed, ev) = parse_records_parts(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records: Vec<UpperLimitRecord> = parsed
+        .iter()
+        .map(|v| {
+            Ok(UpperLimitRecord {
+                code: as_str(v, "code", capability)?,
+                trading_date: as_date(v, "trading_date", capability)?,
+                theme: as_optional_str(v, "theme", capability)?,
+                streak: as_optional_u32(v, "streak", capability)?,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available { records, evidence: ev })
+}
+
+/// T0 证据批: 视图是 {"records": [...], "rejections": [...]} 对象 (delegate
+/// fetch_t0_evidence 契约; record 字段 serde 直出)。
+/// 返回 MagicTdxT0Batch (records + rejections 全量) — 与本地
+/// MagicTdxGateway::get_t0_evidence_batch 对齐, rejections 绝不丢弃。
+/// 空 records → 空批 (本地语义: get_t0_evidence_batch 返回空批而非错误)。
+pub fn t0_evidence_batch(q: &QueryResult) -> Result<MagicTdxT0Batch, GatewayError> {
+    let capability = "T0Evidence";
+    let ev = evidence_of(q, capability)?;
+    let Some(payload) = q.records.first() else {
+        return Err(err(
+            capability,
+            "records 空 (服务端无 canonical payload)",
+        ));
+    };
+    // 合同 (M1): 视图是对象 {"records","rejections"} (非数组);
+    // 防御性兼容数组包对象 (parse_records 的数组路径)。
+    let value: Value = serde_json::from_slice(&payload.data)
+        .map_err(|e| err(capability, format!("T0Evidence 视图非 JSON: {e}")))?;
+    let view = value.as_array().and_then(|arr| arr.first()).unwrap_or(&value);
+    let records = view
+        .get("records")
+        .and_then(Value::as_array)
+        .ok_or_else(|| err(capability, "T0Evidence records 非数组"))?;
+    let mut out = Vec::new();
+    for v in records {
+        let quote_obj = v
+            .get("quote")
+            .and_then(Value::as_object)
+            .ok_or_else(|| err(capability, "T0Evidence quote 非对象"))?;
+        let book = |key: &str| -> Result<[T0BookLevel; 5], GatewayError> {
+            let arr = quote_obj
+                .get(key)
+                .and_then(Value::as_array)
+                .ok_or_else(|| err(capability, format!("T0 quote.{key} 非数组")))?;
+            let mut levels: Vec<T0BookLevel> = Vec::new();
+            for item in arr {
+                let obj = item
+                    .as_object()
+                    .ok_or_else(|| err(capability, format!("T0 quote.{key} 元素非对象")))?;
+                levels.push(T0BookLevel {
+                    price: obj
+                        .get("price")
+                        .and_then(Value::as_f64)
+                        .ok_or_else(|| err(capability, format!("T0 quote.{key}[].price 非法")))?,
+                    volume: obj
+                        .get("volume")
+                        .and_then(Value::as_f64)
+                        .ok_or_else(|| err(capability, format!("T0 quote.{key}[].volume 非法")))?,
+                });
+            }
+            <[T0BookLevel; 5]>::try_from(levels)
+                .map_err(|_| err(capability, format!("T0 quote.{key} 长度必须为 5")))
+        };
+        let settled_daily = v
+            .get("settled_daily")
+            .and_then(Value::as_array)
+            .ok_or_else(|| err(capability, "T0Evidence settled_daily 非数组"))?
+            .iter()
+            .map(|b| {
+                Ok(MagicTdxT0DailyBar {
+                    date: as_date(b, "date", capability)?,
+                    open: as_f64(b, "open", capability)?,
+                    high: as_f64(b, "high", capability)?,
+                    low: as_f64(b, "low", capability)?,
+                    close: as_f64(b, "close", capability)?,
+                    volume: as_f64(b, "volume", capability)?,
+                    amount: as_f64(b, "amount", capability)?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let completed_five_minute = v
+            .get("completed_five_minute")
+            .and_then(Value::as_array)
+            .ok_or_else(|| err(capability, "T0Evidence completed_five_minute 非数组"))?
+            .iter()
+            .map(|b| {
+                Ok(MagicTdxT0FiveMinuteBar {
+                    at: as_rfc3339(b, "at", capability)?.naive_utc(),
+                    open: as_f64(b, "open", capability)?,
+                    high: as_f64(b, "high", capability)?,
+                    low: as_f64(b, "low", capability)?,
+                    close: as_f64(b, "close", capability)?,
+                    volume: as_f64(b, "volume", capability)?,
+                    amount: as_f64(b, "amount", capability)?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let code = as_str(v, "code", capability)?;
+        out.push(MagicTdxT0Evidence {
+            instrument: instrument_for(&code, capability)?,
+            code,
+            requested_at: as_rfc3339(v, "requested_at", capability)?,
+            source_at: as_rfc3339(v, "source_at", capability)?,
+            observed_at: as_rfc3339(v, "observed_at", capability)?,
+            batch_id: as_str(v, "batch_id", capability)?,
+            quote: MagicTdxT0Quote {
+                price: quote_obj
+                    .get("price")
+                    .and_then(Value::as_f64)
+                    .ok_or_else(|| err(capability, "T0 quote.price 非法"))?,
+                last_close: quote_obj
+                    .get("last_close")
+                    .and_then(Value::as_f64)
+                    .ok_or_else(|| err(capability, "T0 quote.last_close 非法"))?,
+                open: quote_obj
+                    .get("open")
+                    .and_then(Value::as_f64)
+                    .ok_or_else(|| err(capability, "T0 quote.open 非法"))?,
+                high: quote_obj
+                    .get("high")
+                    .and_then(Value::as_f64)
+                    .ok_or_else(|| err(capability, "T0 quote.high 非法"))?,
+                low: quote_obj
+                    .get("low")
+                    .and_then(Value::as_f64)
+                    .ok_or_else(|| err(capability, "T0 quote.low 非法"))?,
+                volume: quote_obj
+                    .get("volume")
+                    .and_then(Value::as_f64)
+                    .ok_or_else(|| err(capability, "T0 quote.volume 非法"))?,
+                amount: quote_obj
+                    .get("amount")
+                    .and_then(Value::as_f64)
+                    .ok_or_else(|| err(capability, "T0 quote.amount 非法"))?,
+                bids: book("bids")?,
+                asks: book("asks")?,
+            },
+            settled_daily,
+            completed_five_minute,
+            intraday_average_price: as_f64(v, "intraday_average_price", capability)?,
+        });
+    }
+    let rejections = view
+        .get("rejections")
+        .and_then(Value::as_array)
+        .ok_or_else(|| err(capability, "T0Evidence rejections 非数组"))?
+        .iter()
+        .map(|r| {
+            let code = as_str(r, "code", capability)?;
+            Ok(MagicTdxT0Rejection {
+                code,
+                reason_code: Box::leak(
+                    as_str(r, "reason_code", capability)?.into_boxed_str(),
+                ),
+                detail: as_str(r, "detail", capability)?,
+                retryable: as_bool(r, "retryable", capability)?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // 批级时间戳: source_at/observed_at 从批级证据取 (服务端 pack_ev 来源);
+    // requested_at 记录级有 (同批一致), 空批时以 observed_at 兜底 (同机取数时刻)。
+    let requested_at = out
+        .first()
+        .map(|r| r.requested_at)
+        .unwrap_or_else(|| ev.observed_at.parse().unwrap_or_else(|_| Utc::now()));
+    Ok(MagicTdxT0Batch {
+        requested_at,
+        source_at: ev
+            .source_at
+            .as_deref()
+            .ok_or_else(|| err(capability, "T0Evidence source_at 缺失"))?
+            .parse()
+            .map_err(|e| err(capability, format!("T0Evidence source_at 非法 ({e})")))?,
+        observed_at: ev
+            .observed_at
+            .parse()
+            .map_err(|e| err(capability, format!("T0Evidence observed_at 非法 ({e})")))?,
+        batch_id: ev.batch_id.clone(),
+        records: out,
+        rejections,
+    })
+}
+
+/// as_optional_u32: JSON null → None; 缺失 → Err fail-closed。
+fn as_optional_u32(
+    v: &Value,
+    key: &str,
+    capability: &'static str,
+) -> Result<Option<u32>, GatewayError> {
+    match v.get(key) {
+        None => Err(err(capability, format!("字段 {key} 缺失"))),
+        Some(Value::Null) => Ok(None),
+        Some(x) => Ok(Some(
+            x.as_u64()
+                .ok_or_else(|| err(capability, format!("字段 {key} 非整数")))? as u32,
+        )),
+    }
 }
 
 #[cfg(test)]

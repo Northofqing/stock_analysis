@@ -96,6 +96,21 @@ impl GlobalNewsGateway {
         let provider_id = provider.provider_id();
         let request_hash =
             acquisition_request_hash(capability, &format!("{}:{limit}", provider.source()));
+        // P4 M3 钩子: DATA_GATEWAY_GRPC=1 → gRPC 通道 (fail-closed, audit 对等)。
+        match super::grpc_source::bridge_for("GlobalNews") {
+            Ok(Some(bridge)) => {
+                let result = bridge.global_news_async().await;
+                let audit_provider = result
+                    .as_ref()
+                    .map(|b| b.evidence().provider)
+                    .unwrap_or(provider_id);
+                return audit_gateway_result(capability, audit_provider, &request_hash, result);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_gateway_result(capability, provider_id, &request_hash, Err(error));
+            }
+        }
         let worker_hash = request_hash.clone();
         let joined = tokio::task::spawn_blocking(move || {
             let result =

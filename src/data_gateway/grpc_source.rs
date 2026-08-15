@@ -11,13 +11,21 @@
 pub mod convert;
 
 use crate::data_gateway::{
-    GatewayBatch, GatewayError, MarketMinutePoint, MarketMoneyFlow, MarketOrderBook,
-    MarketSecurityMetadata, RealtimeMarketQuote,
+    board_ranking::BoardRankingFact, BlockTradeReview, BoardDirectoryFact, BoardFlowFact,
+    BoardKind, BoardMembershipRecord, DragonTigerStockReview, EconomicReleaseFact,
+    EventAnnouncement, ForeignExchangeFact, FuturesDeliveryFact, GatewayBatch, GatewayError,
+    GlobalIndexFact, GlobalNewsRecord, InstrumentFundFlowFact, IntradayShapeFact,
+    MagicTdxT0Batch, MarketMinutePoint, MarketMoneyFlow, MarketOrderBook,
+    MarketSecurityMetadata, NorthboundDailyFact, ProviderTopNFact, RealtimeIndexQuote,
+    RealtimeMarketQuote, ResearchReportFact, SinaInstrumentNewsRecord, UpperLimitRecord,
 };
-use crate::data_provider::KlineData;
+use crate::data_provider::{consensus::ConsensusData, KlineData};
 use crate::grpc_client::client::GrpcMarketClient;
 use crate::grpc_client::envelope::QueryResult;
 use crate::grpc_client::pb::magic::market::v1::Operation;
+use chrono::NaiveDate;
+use magic_market_core::{FinancialStatement, MarketStatistics};
+use magic_tdx_rs::protocol::types::SecurityBar;
 use serde_json::Value;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::Mutex as AsyncMutex;
@@ -242,14 +250,373 @@ impl GrpcSource {
     ) -> Result<GatewayBatch<KlineData>, GatewayError> {
         block_on(self.daily_bars_async(code, days))
     }
+
+    // ---------- M3 批次 1: 全球市场/日历/公告/新闻/交割 ----------
+
+    pub async fn global_indices_async(
+        &self,
+    ) -> Result<GatewayBatch<GlobalIndexFact>, GatewayError> {
+        let q = self
+            .query_op(Operation::GlobalIndices, serde_json::json!({}))
+            .await?;
+        convert::global_indices(&q)
+    }
+
+    pub async fn foreign_exchange_async(
+        &self,
+    ) -> Result<GatewayBatch<ForeignExchangeFact>, GatewayError> {
+        let q = self
+            .query_op(Operation::ForeignExchange, serde_json::json!({}))
+            .await?;
+        convert::foreign_exchange(&q)
+    }
+
+    pub async fn announcements_async(
+        &self,
+    ) -> Result<GatewayBatch<EventAnnouncement>, GatewayError> {
+        let q = self
+            .query_op(Operation::Announcements, serde_json::json!({}))
+            .await?;
+        convert::announcements(&q)
+    }
+
+    pub async fn global_news_async(
+        &self,
+    ) -> Result<GatewayBatch<GlobalNewsRecord>, GatewayError> {
+        let q = self
+            .query_op(Operation::GlobalNews, serde_json::json!({}))
+            .await?;
+        convert::global_news(&q)
+    }
+
+    pub async fn economic_calendar_async(
+        &self,
+    ) -> Result<GatewayBatch<EconomicReleaseFact>, GatewayError> {
+        let q = self
+            .query_op(Operation::EconomicCalendar, serde_json::json!({}))
+            .await?;
+        convert::economic_calendar(&q)
+    }
+
+    pub async fn futures_delivery_async(
+        &self,
+    ) -> Result<GatewayBatch<FuturesDeliveryFact>, GatewayError> {
+        let q = self
+            .query_op(Operation::FuturesDelivery, serde_json::json!({}))
+            .await?;
+        convert::futures_delivery(&q)
+    }
+
+    // ---------- M3 批次 2: 龙虎榜/大宗/一致预期/板块/研报/北向/财务/技术/资金流/排行/指数/个股新闻/形态/涨停复盘/T0 ----------
+
+    /// 龙虎榜: 参数与本地 DragonTigerGateway::market_review 对齐 (date +
+    /// disclosure_limit + stock_limit)。
+    pub async fn dragon_tiger_async(
+        &self,
+        trading_date: NaiveDate,
+        disclosure_limit: u32,
+        stock_limit: usize,
+    ) -> Result<GatewayBatch<DragonTigerStockReview>, GatewayError> {
+        let q = self
+            .query_op(
+                Operation::DragonTiger,
+                serde_json::json!({
+                    "date": trading_date.format("%Y-%m-%d").to_string(),
+                    "disclosure_limit": disclosure_limit,
+                    "stock_limit": stock_limit,
+                }),
+            )
+            .await?;
+        convert::dragon_tiger(&q)
+    }
+
+    pub async fn market_dragon_tiger_async(
+        &self,
+    ) -> Result<GatewayBatch<DragonTigerStockReview>, GatewayError> {
+        let q = self
+            .query_op(Operation::MarketDragonTiger, serde_json::json!({}))
+            .await?;
+        convert::market_dragon_tiger(&q)
+    }
+
+    /// 大宗交易: 参数与本地 BlockTradesGateway::market_review 对齐 (codes + date)。
+    pub async fn block_trades_async(
+        &self,
+        codes: &[String],
+        trading_date: NaiveDate,
+    ) -> Result<GatewayBatch<BlockTradeReview>, GatewayError> {
+        let q = self
+            .query_op(
+                Operation::BlockTrades,
+                serde_json::json!({
+                    "codes": codes,
+                    "date": trading_date.format("%Y-%m-%d").to_string(),
+                }),
+            )
+            .await?;
+        convert::block_trades(&q)
+    }
+
+    /// 一致预期: 逐代码 (与本地 ConsensusDataGateway::fetch 对齐)。
+    pub async fn consensus_async(
+        &self,
+        code: &str,
+    ) -> Result<GatewayBatch<ConsensusData>, GatewayError> {
+        let q = self
+            .query_op(Operation::Consensus, serde_json::json!({ "codes": [code] }))
+            .await?;
+        convert::consensus(&q)
+    }
+
+    /// 板块目录: kind + limit (与本地 BoardDataGateway::directory 对齐)。
+    pub async fn board_directory_async(
+        &self,
+        kind: BoardKind,
+        limit: u32,
+    ) -> Result<GatewayBatch<BoardDirectoryFact>, GatewayError> {
+        let q = self
+            .query_op(
+                Operation::BoardDirectory,
+                serde_json::json!({ "kind": format!("{kind:?}"), "limit": limit }),
+            )
+            .await?;
+        convert::board_directory(&q)
+    }
+
+    /// 板块成分归属: 逐代码 (与本地 BoardDataGateway::memberships 对齐)。
+    pub async fn board_constituents_async(
+        &self,
+        code: &str,
+    ) -> Result<GatewayBatch<BoardMembershipRecord>, GatewayError> {
+        let q = self
+            .query_op(Operation::BoardConstituents, serde_json::json!({ "codes": [code] }))
+            .await?;
+        convert::board_constituents(&q)
+    }
+
+    /// 板块资金流: kind + limit (与本地 BoardDataGateway::day1_flows 对齐)。
+    pub async fn board_flows_async(
+        &self,
+        kind: BoardKind,
+        limit: u32,
+    ) -> Result<GatewayBatch<BoardFlowFact>, GatewayError> {
+        let q = self
+            .query_op(
+                Operation::BoardFlows,
+                serde_json::json!({ "kind": format!("{kind:?}"), "limit": limit }),
+            )
+            .await?;
+        convert::board_flows(&q)
+    }
+
+    /// 同步包装 (spawn_blocking / 纯同步线程), 与本地 day1_flows_blocking 对齐。
+    pub fn board_flows(&self, kind: BoardKind, limit: u32) -> Result<GatewayBatch<BoardFlowFact>, GatewayError> {
+        block_on(self.board_flows_async(kind, limit))
+    }
+
+    /// 板块排行: fid 路由 (f3 → ConceptHits, f62 → MarketRankings) + top_n
+    /// (与本地 BoardRankingGateway::fetch_top 对齐; 非法 fid fail-closed)。
+    pub async fn board_ranking_async(
+        &self,
+        fid: &str,
+        top_n: usize,
+    ) -> Result<GatewayBatch<BoardRankingFact>, GatewayError> {
+        let operation = match fid {
+            "f3" => Operation::ConceptHits,
+            "f62" => Operation::MarketRankings,
+            _ => {
+                return Err(GatewayError::invalid_request(
+                    "GrpcBridge",
+                    format!("板块排行 fid 非法: {fid:?} (允许 f3/f62)"),
+                ))
+            }
+        };
+        let q = self
+            .query_op(operation, serde_json::json!({ "top_n": top_n }))
+            .await?;
+        convert::board_ranking(&q)
+    }
+
+    /// 同步包装 (spawn_blocking / 纯同步线程)。
+    pub fn board_ranking(
+        &self,
+        fid: &str,
+        top_n: usize,
+    ) -> Result<GatewayBatch<BoardRankingFact>, GatewayError> {
+        block_on(self.board_ranking_async(fid, top_n))
+    }
+
+    pub async fn research_reports_async(
+        &self,
+    ) -> Result<GatewayBatch<ResearchReportFact>, GatewayError> {
+        let q = self
+            .query_op(Operation::ResearchReports, serde_json::json!({}))
+            .await?;
+        convert::research_reports(&q)
+    }
+
+    pub async fn northbound_daily_async(
+        &self,
+    ) -> Result<GatewayBatch<NorthboundDailyFact>, GatewayError> {
+        let q = self
+            .query_op(Operation::NorthboundDaily, serde_json::json!({}))
+            .await?;
+        convert::northbound_daily(&q)
+    }
+
+    pub async fn financial_statements_async(
+        &self,
+    ) -> Result<GatewayBatch<FinancialStatement>, GatewayError> {
+        let q = self
+            .query_op(Operation::FinancialStatements, serde_json::json!({}))
+            .await?;
+        convert::financial_statements(&q)
+    }
+
+    /// 估值统计: codes (与本地 CompanyDataGateway::market_statistics 对齐)。
+    pub async fn market_statistics_async(
+        &self,
+        codes: &[String],
+    ) -> Result<GatewayBatch<MarketStatistics>, GatewayError> {
+        let q = self
+            .query_op(Operation::MarketStatistics, serde_json::json!({ "codes": codes }))
+            .await?;
+        convert::market_statistics(&q)
+    }
+
+    /// 15 分钟线: codes + count (与本地 HistoricalBarsGateway::fifteen_min_bars
+    /// 对齐)。
+    pub async fn technical_bars_async(
+        &self,
+        codes: &[String],
+        count: u32,
+    ) -> Result<GatewayBatch<SecurityBar>, GatewayError> {
+        let q = self
+            .query_op(
+                Operation::TechnicalBars,
+                serde_json::json!({ "codes": codes, "count": count }),
+            )
+            .await?;
+        convert::technical_bars(&q)
+    }
+
+    /// 同步包装 (spawn_blocking / 纯同步线程)。
+    pub fn technical_bars(
+        &self,
+        codes: &[String],
+        count: u32,
+    ) -> Result<GatewayBatch<SecurityBar>, GatewayError> {
+        block_on(self.technical_bars_async(codes, count))
+    }
+
+    pub async fn fund_flow_series_async(
+        &self,
+        limit: u32,
+    ) -> Result<GatewayBatch<InstrumentFundFlowFact>, GatewayError> {
+        let q = self
+            .query_op(Operation::FundFlowSeries, serde_json::json!({ "limit": limit }))
+            .await?;
+        convert::fund_flow_series(&q)
+    }
+
+    pub async fn provider_top_n_rankings_async(
+        &self,
+    ) -> Result<GatewayBatch<ProviderTopNFact>, GatewayError> {
+        let q = self
+            .query_op(Operation::ProviderTopNRankings, serde_json::json!({}))
+            .await?;
+        convert::provider_top_n_rankings(&q)
+    }
+
+    /// 指数实时行情: codes (与本地 IndexDataGateway::realtime_quotes 对齐)。
+    pub async fn index_quotes_async(
+        &self,
+        codes: &[String],
+    ) -> Result<GatewayBatch<RealtimeIndexQuote>, GatewayError> {
+        let q = self
+            .query_op(Operation::IndexQuotes, serde_json::json!({ "codes": codes }))
+            .await?;
+        convert::index_quotes(&q)
+    }
+
+    /// 同步包装 (spawn_blocking / 纯同步线程)。
+    pub fn index_quotes(
+        &self,
+        codes: &[String],
+    ) -> Result<GatewayBatch<RealtimeIndexQuote>, GatewayError> {
+        block_on(self.index_quotes_async(codes))
+    }
+
+    /// 个股新闻: codes + from_days (与本地 SinaInstrumentNewsGateway
+    /// instrument_news_in_range 对齐; 范围终点=服务端当前时刻, 同机等价)。
+    pub async fn instrument_news_async(
+        &self,
+        codes: &[String],
+        from_days: u32,
+    ) -> Result<GatewayBatch<SinaInstrumentNewsRecord>, GatewayError> {
+        let q = self
+            .query_op(
+                Operation::InstrumentNews,
+                serde_json::json!({ "codes": codes, "from_days": from_days }),
+            )
+            .await?;
+        convert::instrument_news(&q)
+    }
+
+    pub async fn intraday_shape_async(
+        &self,
+    ) -> Result<GatewayBatch<IntradayShapeFact>, GatewayError> {
+        let q = self
+            .query_op(Operation::IntradayShape, serde_json::json!({}))
+            .await?;
+        convert::intraday_shape(&q)
+    }
+
+    /// 涨停复盘: date (与本地 ReviewGateway::r03_upper_limit_pool 对齐)。
+    pub async fn upper_limit_pool_review_async(
+        &self,
+        trading_date: NaiveDate,
+    ) -> Result<GatewayBatch<UpperLimitRecord>, GatewayError> {
+        let q = self
+            .query_op(
+                Operation::UpperLimitPoolReview,
+                serde_json::json!({ "date": trading_date.format("%Y-%m-%d").to_string() }),
+            )
+            .await?;
+        convert::upper_limit_pool_review(&q)
+    }
+
+    /// T0 证据批: 返回 MagicTdxT0Batch (records + rejections 全量, 与本地
+    /// MagicTdxGateway::get_t0_evidence_batch 对齐 — rejections 不能丢)。
+    pub async fn t0_evidence_batch_async(
+        &self,
+        codes: &[String],
+    ) -> Result<MagicTdxT0Batch, GatewayError> {
+        let q = self
+            .query_op(Operation::T0Evidence, serde_json::json!({ "codes": codes }))
+            .await?;
+        convert::t0_evidence_batch(&q)
+    }
+
+    /// 同步包装 (spawn_blocking / 纯同步线程)。
+    pub fn t0_evidence_batch(
+        &self,
+        codes: &[String],
+    ) -> Result<MagicTdxT0Batch, GatewayError> {
+        block_on(self.t0_evidence_batch_async(codes))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // env 是进程级: 这些测试并行时会互相看到对方的 env (race)。
+    // 共享锁串行化 env 敏感的测试 (M3 全量并行跑时暴露)。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn bridge_disabled_without_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("DATA_GATEWAY_GRPC");
         std::env::remove_var("DATA_GATEWAY_GRPC_DISABLED");
         std::env::remove_var("GRPC_MARKET_ADDR");
@@ -258,6 +625,7 @@ mod tests {
 
     #[test]
     fn bridge_disabled_by_op_name() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("DATA_GATEWAY_GRPC", "1");
         std::env::set_var("DATA_GATEWAY_GRPC_DISABLED", "RealtimeQuotes");
         std::env::remove_var("GRPC_MARKET_ADDR");
@@ -273,6 +641,7 @@ mod tests {
     fn bridge_enabled_but_unreachable_is_fail_closed() {
         // 连接是惰性的: bridge_for 只注册实例, fail-closed 在方法层
         // (首个查询 ensure_connected 失败 → unavailable retryable)。
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("DATA_GATEWAY_GRPC", "1");
         std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:1");
         reset_bridge();

@@ -144,18 +144,18 @@ pub async fn fetch(
         Operation::GlobalNews => fetch_global_news().await.map_err(DelegateError::Fetch),
         Operation::EconomicCalendar => fetch_economic_calendar().await.map_err(DelegateError::Fetch),
         Operation::FuturesDelivery => fetch_futures_delivery().await.map_err(DelegateError::Fetch),
-        Operation::DragonTiger => fetch_dragon_tiger().await.map_err(DelegateError::Fetch),
-        Operation::BlockTrades => fetch_block_trades().await.map_err(DelegateError::Fetch),
-        Operation::Consensus => fetch_consensus().await.map_err(DelegateError::Fetch),
-        Operation::BoardDirectory => fetch_board_directory().await.map_err(DelegateError::Fetch),
-        Operation::BoardConstituents => fetch_board_constituents().await.map_err(DelegateError::Fetch),
-        Operation::BoardFlows => fetch_board_flows().await.map_err(DelegateError::Fetch),
+        Operation::DragonTiger => fetch_dragon_tiger(params).await.map_err(DelegateError::Fetch),
+        Operation::BlockTrades => fetch_block_trades(params).await.map_err(DelegateError::Fetch),
+        Operation::Consensus => fetch_consensus(params).await.map_err(DelegateError::Fetch),
+        Operation::BoardDirectory => fetch_board_directory(params).await.map_err(DelegateError::Fetch),
+        Operation::BoardConstituents => fetch_board_constituents(params).await.map_err(DelegateError::Fetch),
+        Operation::BoardFlows => fetch_board_flows(params).await.map_err(DelegateError::Fetch),
         Operation::LimitPools => fetch_limit_pools().await.map_err(DelegateError::Fetch),
         Operation::StrongStockReasons => fetch_strong_stock_reasons().await.map_err(DelegateError::Fetch),
-        Operation::MarketDragonTiger => fetch_market_dragon_tiger().await.map_err(DelegateError::Fetch),
-        Operation::MarketRankings => fetch_market_rankings().await.map_err(DelegateError::Fetch),
-        Operation::ConceptHits => fetch_concept_hits().await.map_err(DelegateError::Fetch),
-        Operation::ResearchReports => fetch_research_reports().await.map_err(DelegateError::Fetch),
+        Operation::MarketDragonTiger => fetch_market_dragon_tiger(params).await.map_err(DelegateError::Fetch),
+        Operation::MarketRankings => fetch_market_rankings(params).await.map_err(DelegateError::Fetch),
+        Operation::ConceptHits => fetch_concept_hits(params).await.map_err(DelegateError::Fetch),
+        Operation::ResearchReports => fetch_research_reports(params).await.map_err(DelegateError::Fetch),
         Operation::NorthboundDaily => fetch_northbound_daily().await.map_err(DelegateError::Fetch),
         // M1 扩展 (P4): 8 个 proto 已有 op (直接返回 DelegateError, Params 可映射 400)。
         Operation::ForeignExchange => fetch_foreign_exchange(params).await,
@@ -399,11 +399,13 @@ async fn fetch_global_news() -> Result<Fetched, String> {
                 "item_id": r.item_id,
                 "title": r.title,
                 "summary": r.summary,
+                "content": r.content,
                 "publisher": r.publisher,
                 "url": r.canonical_url,
                 "published_at": r.published_at.to_rfc3339(),
                 "instruments": r.instruments,
                 "topics": r.topics,
+                "language": r.language,
             })
         })
         .collect();
@@ -423,15 +425,19 @@ async fn fetch_economic_calendar() -> Result<Fetched, String> {
         .map(|r| {
             json!({
                 "event_id": r.event_id,
+                "indicator_id": r.indicator_id,
                 "country": r.country,
                 "name": r.name,
                 "period": r.period,
                 "scheduled_at": r.scheduled_at.to_rfc3339(),
+                "released_at": r.released_at.to_rfc3339(),
                 "previous": r.previous,
                 "consensus": r.consensus,
                 "actual": r.actual,
+                "revised": r.revised,
                 "unit": r.unit,
                 "importance": r.importance,
+                "impact": r.impact,
             })
         })
         .collect();
@@ -462,10 +468,21 @@ async fn fetch_futures_delivery() -> Result<Fetched, String> {
     pack(records, source_at)
 }
 
-async fn fetch_dragon_tiger() -> Result<Fetched, String> {
+/// 龙虎榜: 生产调用方传 trading_date + disclosure_limit + stock_limit
+/// (push_templates r04, main.rs 12411) — 参数默认值保持 M1 行为 (今天/100/20),
+/// 显式字段才改变行为 (v15.x)。
+async fn fetch_dragon_tiger(params: &Value) -> Result<Fetched, String> {
+    let trading_date = crate::grpc_contract::params::resolve_date(params)
+        .map_err(|e| format!("params 无效: {e}"))?;
+    let disclosure_limit =
+        crate::grpc_contract::params::resolve_u32(params, "disclosure_limit", 100)
+            .map_err(|e| format!("params 无效: {e}"))?;
+    let stock_limit =
+        crate::grpc_contract::params::resolve_u32(params, "stock_limit", 20)
+            .map_err(|e| format!("params 无效: {e}"))?;
     let gateway = DragonTigerGateway::new();
     let batch = gateway
-        .market_review(today(), 100, 20)
+        .market_review(trading_date, disclosure_limit, stock_limit as usize)
         .await
         .map_err(|e| format!("龙虎榜 Gateway 不可用: {e}"))?;
     let source_at = source_at_of(&batch);
@@ -477,17 +494,44 @@ async fn fetch_dragon_tiger() -> Result<Fetched, String> {
                 "exchange": format!("{:?}", r.exchange),
                 "code": r.code,
                 "ranking_net_amount_yuan": r.ranking_net_amount_yuan,
-                "disclosures": r.disclosures.len(),
+                "disclosures": r.disclosures.iter().map(|d| {
+                    json!({
+                        "entry_id": d.entry_id,
+                        "trade_id": d.trade_id,
+                        "reason": d.reason,
+                        "buy_amount_yuan": d.buy_amount_yuan,
+                        "sell_amount_yuan": d.sell_amount_yuan,
+                        "net_amount_yuan": d.net_amount_yuan,
+                        "turnover_rate_pct": d.turnover_rate_pct,
+                        "seats": d.seats.iter().map(|s| {
+                            json!({
+                                "side": format!("{:?}", s.side),
+                                "rank": s.rank,
+                                "seat_name": s.seat_name,
+                                "amount_yuan": s.amount_yuan,
+                                "buy_amount_yuan": s.buy_amount_yuan,
+                                "sell_amount_yuan": s.sell_amount_yuan,
+                                "net_amount_yuan": s.net_amount_yuan,
+                            })
+                        }).collect::<Vec<_>>(),
+                    })
+                }).collect::<Vec<_>>(),
             })
         })
         .collect();
     pack(records, source_at)
 }
 
-async fn fetch_block_trades() -> Result<Fetched, String> {
+/// 大宗交易: 生产调用方传 codes + trading_date (push_templates r05) —
+/// codes 缺省 watchlist, date 缺省今天。
+async fn fetch_block_trades(params: &Value) -> Result<Fetched, String> {
+    let codes = crate::grpc_contract::params::resolve_codes(params)
+        .map_err(|e| format!("params 无效: {e}"))?;
+    let trading_date = crate::grpc_contract::params::resolve_date(params)
+        .map_err(|e| format!("params 无效: {e}"))?;
     let gateway = BlockTradesGateway::new();
     let batch = gateway
-        .market_review(&watchlist_codes(), today())
+        .market_review(&codes, trading_date)
         .await
         .map_err(|e| format!("大宗交易 Gateway 不可用: {e}"))?;
     let source_at = source_at_of(&batch);
@@ -511,9 +555,11 @@ async fn fetch_block_trades() -> Result<Fetched, String> {
     pack(records, source_at)
 }
 
-async fn fetch_consensus() -> Result<Fetched, String> {
+/// 一致预期: 生产调用方逐代码 fetch(code) (v17_sources) — codes 缺省 watchlist。
+async fn fetch_consensus(params: &Value) -> Result<Fetched, String> {
     let gateway = ConsensusDataGateway::new();
-    let codes = watchlist_codes();
+    let codes = crate::grpc_contract::params::resolve_codes(params)
+        .map_err(|e| format!("params 无效: {e}"))?;
     let mut set = tokio::task::JoinSet::new();
     for code in codes {
         let gateway = gateway;
@@ -604,10 +650,26 @@ async fn fetch_historical_bars(params: &Value) -> Result<Fetched, DelegateError>
     .map_err(DelegateError::Fetch)
 }
 
-async fn fetch_board_directory() -> Result<Fetched, String> {
+/// 板块目录: 生产调用方传 kind + limit (push_templates A-11, 200 只) —
+/// kind 缺省 Concept, limit 缺省 50 (M1 行为)。
+async fn fetch_board_directory(params: &Value) -> Result<Fetched, String> {
+    let kind_str = crate::grpc_contract::params::resolve_enum_str(
+        params,
+        "kind",
+        &["Industry", "Concept", "Region"],
+        "Concept",
+    )
+    .map_err(|e| format!("params 无效: {e}"))?;
+    let kind = match kind_str {
+        "Industry" => BoardKind::Industry,
+        "Concept" => BoardKind::Concept,
+        _ => BoardKind::Region,
+    };
+    let limit = crate::grpc_contract::params::resolve_u32(params, "limit", 50)
+        .map_err(|e| format!("params 无效: {e}"))?;
     let gateway = BoardDataGateway::new();
     let batch = gateway
-        .directory(BoardKind::Concept, 50)
+        .directory(kind, limit)
         .await
         .map_err(|e| format!("板块目录 Gateway 不可用: {e}"))?;
     let source_at = source_at_of(&batch);
@@ -629,9 +691,12 @@ async fn fetch_board_directory() -> Result<Fetched, String> {
 /// 板块成分: board 模块无公开「板块→成分」生产入口 (board_constituents_raw
 /// 需内部 BoardConstituentRequest, 未导出) → 用 memberships(code) 对 watchlist
 /// 逐代码查「个股→所属板块」, 输出成分归属视图。
-async fn fetch_board_constituents() -> Result<Fetched, String> {
+/// 板块成分归属: 生产调用方传板块 code (push_templates A-11 memberships) —
+/// codes 缺省 watchlist。
+async fn fetch_board_constituents(params: &Value) -> Result<Fetched, String> {
     let gateway = BoardDataGateway::new();
-    let codes = watchlist_codes();
+    let codes = crate::grpc_contract::params::resolve_codes(params)
+        .map_err(|e| format!("params 无效: {e}"))?;
     let mut set = tokio::task::JoinSet::new();
     for code in codes {
         let gateway = gateway;
@@ -661,10 +726,26 @@ async fn fetch_board_constituents() -> Result<Fetched, String> {
     pack(records, source_at)
 }
 
-async fn fetch_board_flows() -> Result<Fetched, String> {
+/// 板块资金流: 生产调用方传 kind + limit (statistics.rs / main.rs
+/// day1_flows_blocking, Industry/20) — kind 缺省 Concept, limit 缺省 20。
+async fn fetch_board_flows(params: &Value) -> Result<Fetched, String> {
+    let kind_str = crate::grpc_contract::params::resolve_enum_str(
+        params,
+        "kind",
+        &["Industry", "Concept", "Region"],
+        "Concept",
+    )
+    .map_err(|e| format!("params 无效: {e}"))?;
+    let kind = match kind_str {
+        "Industry" => BoardKind::Industry,
+        "Concept" => BoardKind::Concept,
+        _ => BoardKind::Region,
+    };
+    let limit = crate::grpc_contract::params::resolve_u32(params, "limit", 20)
+        .map_err(|e| format!("params 无效: {e}"))?;
     let gateway = BoardDataGateway::new();
     let batch = gateway
-        .day1_flows(BoardKind::Concept, 20)
+        .day1_flows(kind, limit)
         .await
         .map_err(|e| format!("板块资金流 Gateway 不可用: {e}"))?;
     let source_at = source_at_of(&batch);
@@ -745,10 +826,19 @@ async fn fetch_strong_stock_reasons() -> Result<Fetched, String> {
 
 /// 全市场龙虎榜: 与 DragonTiger op 共用 market_review (唯一生产入口),
 /// 区别仅在 schema 视图。
-async fn fetch_market_dragon_tiger() -> Result<Fetched, String> {
+/// 全市场龙虎榜 (R-04 视图别名): 参数语义与 fetch_dragon_tiger 一致。
+async fn fetch_market_dragon_tiger(params: &Value) -> Result<Fetched, String> {
+    let trading_date = crate::grpc_contract::params::resolve_date(params)
+        .map_err(|e| format!("params 无效: {e}"))?;
+    let disclosure_limit =
+        crate::grpc_contract::params::resolve_u32(params, "disclosure_limit", 100)
+            .map_err(|e| format!("params 无效: {e}"))?;
+    let stock_limit =
+        crate::grpc_contract::params::resolve_u32(params, "stock_limit", 20)
+            .map_err(|e| format!("params 无效: {e}"))?;
     let gateway = DragonTigerGateway::new();
     let batch = gateway
-        .market_review(today(), 100, 20)
+        .market_review(trading_date, disclosure_limit, stock_limit as usize)
         .await
         .map_err(|e| format!("龙虎榜 Gateway 不可用: {e}"))?;
     let source_at = source_at_of(&batch);
@@ -760,7 +850,28 @@ async fn fetch_market_dragon_tiger() -> Result<Fetched, String> {
                 "exchange": format!("{:?}", r.exchange),
                 "code": r.code,
                 "ranking_net_amount_yuan": r.ranking_net_amount_yuan,
-                "disclosures": r.disclosures.len(),
+                "disclosures": r.disclosures.iter().map(|d| {
+                    json!({
+                        "entry_id": d.entry_id,
+                        "trade_id": d.trade_id,
+                        "reason": d.reason,
+                        "buy_amount_yuan": d.buy_amount_yuan,
+                        "sell_amount_yuan": d.sell_amount_yuan,
+                        "net_amount_yuan": d.net_amount_yuan,
+                        "turnover_rate_pct": d.turnover_rate_pct,
+                        "seats": d.seats.iter().map(|s| {
+                            json!({
+                                "side": format!("{:?}", s.side),
+                                "rank": s.rank,
+                                "seat_name": s.seat_name,
+                                "amount_yuan": s.amount_yuan,
+                                "buy_amount_yuan": s.buy_amount_yuan,
+                                "sell_amount_yuan": s.sell_amount_yuan,
+                                "net_amount_yuan": s.net_amount_yuan,
+                            })
+                        }).collect::<Vec<_>>(),
+                    })
+                }).collect::<Vec<_>>(),
             })
         })
         .collect();
@@ -794,26 +905,36 @@ async fn fetch_board_ranking(fid: &str, top_n: usize) -> Result<Fetched, String>
     pack(records, String::new())
 }
 
-/// 主力净流入排行 (fid=f62)。
-async fn fetch_market_rankings() -> Result<Fetched, String> {
-    fetch_board_ranking("f62", 20).await
+/// 主力净流入排行 (fid=f62): 生产调用方传 top_n (sector_monitor rank_top) —
+/// 缺省 20 (M1 行为)。
+async fn fetch_market_rankings(params: &Value) -> Result<Fetched, String> {
+    let top_n = crate::grpc_contract::params::resolve_u32(params, "top_n", 20)
+        .map_err(|e| format!("params 无效: {e}"))?;
+    fetch_board_ranking("f62", top_n as usize).await
 }
 
-/// 概念涨幅榜 (东财概念板块排行 fid=f3)。
-async fn fetch_concept_hits() -> Result<Fetched, String> {
-    fetch_board_ranking("f3", 30).await
+/// 概念涨幅榜 (东财概念板块排行 fid=f3): 生产调用方传 top_n
+/// (sector_monitor rank_top, push_templates 5/10/30) — 缺省 30 (M1 行为)。
+async fn fetch_concept_hits(params: &Value) -> Result<Fetched, String> {
+    let top_n = crate::grpc_contract::params::resolve_u32(params, "top_n", 30)
+        .map_err(|e| format!("params 无效: {e}"))?;
+    fetch_board_ranking("f3", top_n as usize).await
 }
 
 /// 研报: 逐代码 instrument_reports (记录无 code 字段 → 带 code 回传)。
-async fn fetch_research_reports() -> Result<Fetched, String> {
+/// 研报: codes 缺省 watchlist, page_size 缺省 5 (M1 行为; agent 工具传 20)。
+async fn fetch_research_reports(params: &Value) -> Result<Fetched, String> {
+    let codes = crate::grpc_contract::params::resolve_codes(params)
+        .map_err(|e| format!("params 无效: {e}"))?;
+    let page_size = crate::grpc_contract::params::resolve_u32(params, "page_size", 5)
+        .map_err(|e| format!("params 无效: {e}"))?;
     let gateway = ResearchDataGateway::new();
-    let codes = watchlist_codes();
     let mut set = tokio::task::JoinSet::new();
     for code in codes {
         let gateway = gateway;
         set.spawn(async move {
             let batch = gateway
-                .instrument_reports(&code, 5)
+                .instrument_reports(&code, page_size)
                 .await
                 .map_err(|e| format!("研报 Gateway 不可用 ({code}): {e}"))?;
             Ok::<_, String>((code, batch))
@@ -1227,6 +1348,11 @@ async fn fetch_instrument_news(params: &Value) -> Result<Fetched, DelegateError>
                 "url": item.url,
                 "source_name": item.source_name,
                 "published_at": item.published_at.to_rfc3339(),
+                "source": item.source,
+                "external_id": item.external_id,
+                "category": item.category,
+                "fetched_at": item.fetched_at.to_rfc3339(),
+                "content_hash": item.content_hash,
             })
         }));
     }

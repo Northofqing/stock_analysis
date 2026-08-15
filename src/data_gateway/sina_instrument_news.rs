@@ -30,6 +30,14 @@ pub struct SinaInstrumentNewsRecord {
 }
 
 impl SinaInstrumentNewsRecord {
+    /// P4 M3: gRPC convert 构造用 (视图字段已全, 无静默填充)。
+    pub fn new(persistence_item: NewsItem, evidence: SourceEvidence) -> Self {
+        Self {
+            persistence_item,
+            evidence,
+        }
+    }
+
     pub fn persistence_item(&self) -> &NewsItem {
         &self.persistence_item
     }
@@ -63,6 +71,30 @@ impl SinaInstrumentNewsGateway {
                 to.to_rfc3339()
             ),
         );
+        // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
+        // from_days 契约: 生产调用方传 now-30d..now, 等价服务端"近 N 日"语义。
+        match super::grpc_source::bridge_for("InstrumentNews") {
+            Ok(Some(bridge)) => {
+                let from_days = (to - from).num_days().clamp(1, 30) as u32;
+                let result = bridge
+                    .instrument_news_async(&[code.clone()], from_days)
+                    .await;
+                let audit_provider = result
+                    .as_ref()
+                    .map(|b| b.evidence().provider)
+                    .unwrap_or(ProviderId::Sina);
+                return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_gateway_result(
+                    CAPABILITY,
+                    ProviderId::Sina,
+                    &request_hash,
+                    Err(error),
+                );
+            }
+        }
         let worker_hash = request_hash.clone();
         let joined = tokio::task::spawn_blocking(move || {
             let result = build_request(&code, &from, &to).and_then(|(request, storage_code)| {

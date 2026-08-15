@@ -115,6 +115,31 @@ impl CompanyDataGateway {
         let storage_codes = codes.to_vec();
         let request_hash =
             acquisition_request_hash(STATISTICS_CAPABILITY, &storage_codes.join(","));
+        // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
+        match super::grpc_source::bridge_for("MarketStatistics") {
+            Ok(Some(bridge)) => {
+                let result = bridge.market_statistics_async(&storage_codes).await;
+                let audit_provider = result
+                    .as_ref()
+                    .map(|b| b.evidence().provider)
+                    .unwrap_or(ProviderId::Tencent);
+                return audit_gateway_result(
+                    STATISTICS_CAPABILITY,
+                    audit_provider,
+                    &request_hash,
+                    result,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_gateway_result(
+                    STATISTICS_CAPABILITY,
+                    ProviderId::Tencent,
+                    &request_hash,
+                    Err(error),
+                );
+            }
+        }
         let worker_hash = request_hash.clone();
         let joined = tokio::task::spawn_blocking(move || {
             let result = build_instruments(&storage_codes, STATISTICS_CAPABILITY)

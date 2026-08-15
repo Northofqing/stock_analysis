@@ -55,6 +55,32 @@ impl IndexDataGateway {
         storage_codes: &[String],
     ) -> Result<GatewayBatch<RealtimeIndexQuote>, GatewayError> {
         let request_hash = acquisition_request_hash(CAPABILITY, &storage_codes.join(","));
+        // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
+        match super::grpc_source::bridge_for("IndexQuotes") {
+            Ok(Some(bridge)) => {
+                if storage_codes.is_empty() {
+                    return Err(GatewayError::invalid_request(
+                        CAPABILITY,
+                        "index quote request must contain at least one code",
+                    ));
+                }
+                let result = bridge.index_quotes(storage_codes);
+                let audit_provider = result
+                    .as_ref()
+                    .map(|b| b.evidence().provider)
+                    .unwrap_or(ProviderId::Tencent);
+                return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_gateway_result(
+                    CAPABILITY,
+                    ProviderId::Tencent,
+                    &request_hash,
+                    Err(error),
+                );
+            }
+        }
         let result = build_index_instruments(storage_codes).and_then(|instruments| {
             let client = TencentClient::new().map_err(tencent_gateway_error)?;
             let batch = client

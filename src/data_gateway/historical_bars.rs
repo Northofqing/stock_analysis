@@ -195,6 +195,36 @@ impl HistoricalBarsGateway {
                 format!("fifteen_min_bars invalid count: {count} (1..=800)"),
             ));
         }
+        // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; 本地无 audit,
+        // 桥路径亦不 audit — 与本地行为一致)。
+        match super::grpc_source::bridge_for("TechnicalBars") {
+            Ok(Some(bridge)) => {
+                let batch = bridge
+                    .technical_bars(&[code.to_string()], count as u32)
+                    .map_err(|error| {
+                        GatewayError::unavailable(
+                            CAPABILITY,
+                            None,
+                            true,
+                            format!("15min bars gRPC 桥失败 ({code}): {error}"),
+                        )
+                    })?;
+                let records: Vec<SecurityBar> = batch.records().to_vec();
+                if records.is_empty() {
+                    return Err(GatewayError::unavailable(
+                        CAPABILITY,
+                        None,
+                        false,
+                        format!("15min bars gRPC 空 for {code}"),
+                    ));
+                }
+                return Ok(records);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(GatewayError::unavailable(CAPABILITY, None, true, error.to_string()));
+            }
+        }
         let market = if code.starts_with('6') { 1u8 } else { 0u8 };
         let client = super::magic_tdx_t0::cached_tdx_hq_client().map_err(|error| {
             GatewayError::unavailable(CAPABILITY, None, true, error.to_string())

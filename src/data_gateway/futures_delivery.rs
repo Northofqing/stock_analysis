@@ -46,6 +46,21 @@ impl FuturesDeliveryGateway {
         month: u32,
     ) -> Result<GatewayBatch<FuturesDeliveryFact>, GatewayError> {
         let request_hash = acquisition_request_hash(CAPABILITY, &format!("{year:04}-{month:02}"));
+        // P4 M3 钩子: DATA_GATEWAY_GRPC=1 → gRPC 通道 (fail-closed, audit 对等)。
+        match super::grpc_source::bridge_for("FuturesDelivery") {
+            Ok(Some(bridge)) => {
+                let result = bridge.futures_delivery_async().await;
+                let audit_provider = result
+                    .as_ref()
+                    .map(|b| b.evidence().provider)
+                    .unwrap_or(ProviderId::Cffex);
+                return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_gateway_result(CAPABILITY, ProviderId::Cffex, &request_hash, Err(error));
+            }
+        }
         let worker_request_hash = request_hash.clone();
         let joined = tokio::task::spawn_blocking(move || {
             let result = build_request(year, month).and_then(fetch_and_admit_cffex_batch);

@@ -25,6 +25,18 @@ impl MagicTdxGateway {
         codes: &[String],
         observed_at: DateTime<Utc>,
     ) -> Result<MagicTdxT0Batch> {
+        // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; 本地无 audit,
+        // 桥路径亦不 audit — MagicTdxT0Batch 自带 requested_at/source_at/observed_at)。
+        match super::grpc_source::bridge_for("T0Evidence") {
+            Ok(Some(bridge)) => {
+                let batch = bridge.t0_evidence_batch(codes).map_err(|error| {
+                    anyhow::anyhow!("T0 证据批 gRPC 桥失败 ({} codes): {error}", codes.len())
+                })?;
+                return Ok(batch);
+            }
+            Ok(None) => {}
+            Err(error) => return Err(anyhow::anyhow!("T0 证据批 gRPC 桥不可用: {error}")),
+        }
         fetch_magic_tdx_t0_batch(codes, observed_at)
     }
 }

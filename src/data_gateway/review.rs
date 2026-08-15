@@ -251,6 +251,18 @@ impl ReviewDataGateway {
     ) -> Result<GatewayBatch<UpperLimitRecord>, GatewayError> {
         let request_hash =
             acquisition_request_hash("R-03", &format!("{trading_date}:{WHOLE_LIMIT_POOL_BOUND}"));
+        // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端,
+        // audit_routed 不校验 provider 一致性 — 与本地 Custom provider 对等)。
+        match super::grpc_source::bridge_for("UpperLimitPoolReview") {
+            Ok(Some(bridge)) => {
+                let result = bridge.upper_limit_pool_review_async(trading_date).await;
+                return audit_routed_gateway_result("R-03", &request_hash, result);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_routed_gateway_result("R-03", &request_hash, Err(error));
+            }
+        }
         let worker_request_hash = request_hash.clone();
         let joined = tokio::task::spawn_blocking(move || {
             let result = route_exact_date_upper_limit_pool("R-03", trading_date)

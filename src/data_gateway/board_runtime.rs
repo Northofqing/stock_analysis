@@ -154,6 +154,26 @@ impl BoardDataGateway {
     ) -> Result<GatewayBatch<BoardDirectoryFact>, GatewayError> {
         let request_hash =
             acquisition_request_hash(DIRECTORY_CAPABILITY, &format!("{kind:?}:{limit}"));
+        // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
+        match super::grpc_source::bridge_for("BoardDirectory") {
+            Ok(Some(bridge)) => {
+                let result = bridge.board_directory_async(kind, limit).await;
+                let audit_provider = result
+                    .as_ref()
+                    .map(|b| b.evidence().provider)
+                    .unwrap_or(ProviderId::Tdx);
+                return audit_gateway_result(DIRECTORY_CAPABILITY, audit_provider, &request_hash, result);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_gateway_result(
+                    DIRECTORY_CAPABILITY,
+                    ProviderId::Tdx,
+                    &request_hash,
+                    Err(error),
+                );
+            }
+        }
         let worker_hash = request_hash.clone();
         let gateway = *self;
         let joined = tokio::task::spawn_blocking(move || {
@@ -182,6 +202,26 @@ impl BoardDataGateway {
     ) -> Result<GatewayBatch<BoardMembershipRecord>, GatewayError> {
         let code = validate_code(code, MEMBERSHIP_CAPABILITY)?.to_owned();
         let request_hash = acquisition_request_hash(MEMBERSHIP_CAPABILITY, &code);
+        // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
+        match super::grpc_source::bridge_for("BoardConstituents") {
+            Ok(Some(bridge)) => {
+                let result = bridge.board_constituents_async(&code).await;
+                let audit_provider = result
+                    .as_ref()
+                    .map(|b| b.evidence().provider)
+                    .unwrap_or(ProviderId::Tdx);
+                return audit_gateway_result(MEMBERSHIP_CAPABILITY, audit_provider, &request_hash, result);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_gateway_result(
+                    MEMBERSHIP_CAPABILITY,
+                    ProviderId::Tdx,
+                    &request_hash,
+                    Err(error),
+                );
+            }
+        }
         let gateway = *self;
         let joined =
             tokio::task::spawn_blocking(move || fetch_memberships_audited(gateway, code)).await;
@@ -220,6 +260,26 @@ impl BoardDataGateway {
     ) -> Result<GatewayBatch<BoardFlowFact>, GatewayError> {
         let request_hash =
             acquisition_request_hash(FLOW_CAPABILITY, &format!("{kind:?}:Day1:{limit}"));
+        // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
+        match super::grpc_source::bridge_for("BoardFlows") {
+            Ok(Some(bridge)) => {
+                let result = bridge.board_flows_async(kind, limit).await;
+                let audit_provider = result
+                    .as_ref()
+                    .map(|b| b.evidence().provider)
+                    .unwrap_or(ProviderId::Eastmoney);
+                return audit_gateway_result(FLOW_CAPABILITY, audit_provider, &request_hash, result);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_gateway_result(
+                    FLOW_CAPABILITY,
+                    ProviderId::Eastmoney,
+                    &request_hash,
+                    Err(error),
+                );
+            }
+        }
         let worker_hash = request_hash.clone();
         let joined = tokio::task::spawn_blocking(move || {
             let result = build_flow_request(kind, limit).and_then(fetch_flows);
@@ -251,6 +311,26 @@ impl BoardDataGateway {
     ) -> Result<GatewayBatch<BoardFlowFact>, GatewayError> {
         let request_hash =
             acquisition_request_hash(FLOW_CAPABILITY, &format!("{kind:?}:Day1:{limit}"));
+        // P4 M3: gRPC 桥 (同步路径, spawn_blocking 内调用 → block_on)。
+        match super::grpc_source::bridge_for("BoardFlows") {
+            Ok(Some(bridge)) => {
+                let result = bridge.board_flows(kind, limit);
+                let audit_provider = result
+                    .as_ref()
+                    .map(|b| b.evidence().provider)
+                    .unwrap_or(ProviderId::Eastmoney);
+                return audit_gateway_result(FLOW_CAPABILITY, audit_provider, &request_hash, result);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_gateway_result(
+                    FLOW_CAPABILITY,
+                    ProviderId::Eastmoney,
+                    &request_hash,
+                    Err(error),
+                );
+            }
+        }
         let result = build_flow_request(kind, limit).and_then(fetch_flows);
         audit_gateway_result(
             FLOW_CAPABILITY,

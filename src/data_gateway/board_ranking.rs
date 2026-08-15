@@ -54,6 +54,18 @@ impl BoardRankingGateway {
         if !matches!(fid, "f3" | "f62") || top_n == 0 {
             anyhow::bail!("板块排行请求非法: fid={fid:?} top_n={top_n}");
         }
+        // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; 本地无 audit,
+        // 桥路径亦不 audit — 与本地行为一致)。
+        match super::grpc_source::bridge_for("BoardRanking") {
+            Ok(Some(bridge)) => {
+                let batch = bridge.board_ranking(fid, top_n).map_err(|error| {
+                    anyhow::anyhow!("板块排行 gRPC 桥失败 (fid={fid} top_n={top_n}): {error}")
+                })?;
+                return Ok(batch.records().to_vec());
+            }
+            Ok(None) => {}
+            Err(error) => return Err(anyhow::anyhow!("板块排行 gRPC 桥不可用: {error}")),
+        }
         let params = [
             ("pn", "1"),
             ("pz", &top_n.to_string()),

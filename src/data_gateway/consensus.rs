@@ -37,6 +37,26 @@ impl ConsensusDataGateway {
             CAPABILITY,
             &format!("{code}:{REPORT_WINDOW_DAYS}:{REPORT_LIMIT}"),
         );
+        // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
+        match super::grpc_source::bridge_for("Consensus") {
+            Ok(Some(bridge)) => {
+                let result = bridge.consensus_async(&code).await;
+                let audit_provider = result
+                    .as_ref()
+                    .map(|b| b.evidence().provider)
+                    .unwrap_or(ProviderId::Eastmoney);
+                return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_gateway_result(
+                    CAPABILITY,
+                    ProviderId::Eastmoney,
+                    &request_hash,
+                    Err(error),
+                );
+            }
+        }
         let worker_hash = request_hash.clone();
         let joined = tokio::task::spawn_blocking(move || {
             let result = a_share_instrument(&code).and_then(fetch_consensus_batch);

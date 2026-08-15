@@ -68,6 +68,28 @@ impl DragonTigerGateway {
             CAPABILITY,
             &format!("{trading_date}:{disclosure_limit}:{stock_limit}"),
         );
+        // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
+        match super::grpc_source::bridge_for("DragonTiger") {
+            Ok(Some(bridge)) => {
+                let result = bridge
+                    .dragon_tiger_async(trading_date, disclosure_limit, stock_limit)
+                    .await;
+                let audit_provider = result
+                    .as_ref()
+                    .map(|b| b.evidence().provider)
+                    .unwrap_or(ProviderId::Eastmoney);
+                return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_gateway_result(
+                    CAPABILITY,
+                    ProviderId::Eastmoney,
+                    &request_hash,
+                    Err(error),
+                );
+            }
+        }
         let worker_request_hash = request_hash.clone();
         let joined = tokio::task::spawn_blocking(move || {
             let result = build_request(trading_date, disclosure_limit).and_then(|request| {

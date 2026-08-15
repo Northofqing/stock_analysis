@@ -45,6 +45,26 @@ impl BlockTradesGateway {
         trading_date: NaiveDate,
     ) -> Result<GatewayBatch<BlockTradeReview>, GatewayError> {
         let request_hash = acquisition_request_hash(CAPABILITY, &codes.join(","));
+        // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
+        match super::grpc_source::bridge_for("BlockTrades") {
+            Ok(Some(bridge)) => {
+                let result = bridge.block_trades_async(codes, trading_date).await;
+                let audit_provider = result
+                    .as_ref()
+                    .map(|b| b.evidence().provider)
+                    .unwrap_or(ProviderId::Eastmoney);
+                return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_gateway_result(
+                    CAPABILITY,
+                    ProviderId::Eastmoney,
+                    &request_hash,
+                    Err(error),
+                );
+            }
+        }
         let codes_owned = codes.to_vec();
         let result: Result<GatewayBatch<BlockTradeReview>, GatewayError> =
             match tokio::task::spawn_blocking(move || {
