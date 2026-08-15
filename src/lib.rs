@@ -226,6 +226,7 @@ pub mod http_client;
 // 合同注册表 (服务端/客户端共享) + 客户端网络层; 唯一合同源 grpc/market.proto
 pub mod grpc_contract;
 pub mod grpc_client;
+pub mod grpc_server;
 
 #[cfg(test)]
 mod tests {
