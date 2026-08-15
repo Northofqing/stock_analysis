@@ -56,12 +56,13 @@ impl Default for ServerConfig {
     }
 }
 
-/// 启动 gRPC 服务端。返回实际绑定地址 (port=0 时随机) 与 serve task。
+/// 启动 gRPC 服务端。返回实际绑定地址 (port=0 时随机)、serve task 与事件 hub。
 pub async fn start(
     config: ServerConfig,
 ) -> anyhow::Result<(
     std::net::SocketAddr,
     tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    std::sync::Arc<events::EventHub>,
 )> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], config.port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -78,18 +79,22 @@ pub async fn start(
         shadow_events: config.shadow_events,
     });
 
+    // Task 11: 事件服务注册。fixture 模式 hub 只接受注入, 不启动轮询。
+    let event_svc = events::EventService::new(state.clone(), config.fixture_mode);
+    let hub = event_svc.hub.clone();
+
     let handle = tokio::spawn(async move {
         let health_svc = HealthService { state: state.clone() };
         let data_svc = handlers::DataService::new(state.clone(), config.fixture_mode);
         tonic::transport::Server::builder()
             .add_service(SystemServiceServer::new(health_svc))
             .add_service(handlers::market_data_service_server::MarketDataServiceServer::new(data_svc))
-            // 注: MarketEventService 与 TdxAgentService 未注册 → tonic 对未注册服务
-            // 返回 UNIMPLEMENTED (合同 §2 不做项)。MarketEventService 在 Task 11 注册。
+            .add_service(events::market_event_service_server::MarketEventServiceServer::new(event_svc))
+            // 注: TdxAgentService 未注册 → tonic 对未注册服务返回 UNIMPLEMENTED (合同 §2 不做项)。
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await
     });
-    Ok((bound, handle))
+    Ok((bound, handle, hub))
 }
 
 struct HealthService {

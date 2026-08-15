@@ -1,15 +1,74 @@
 //! gRPC mock 服务端 (合同 grpc/grpc-external-api.md, 方案 A 委托 data_gateway)。
 //! 默认 127.0.0.1:18082; GRPC_MARKET_PORT / GRPC_GATEWAY_TEST_FIXTURE / GRPC_EVENTS_SHADOW 可配。
 //! 只读数据服务 + TDX 异动事件订阅。无账户/持仓/委托写接口。
+//! 事件轮询: EVENT_POLL_INTERVAL_MS / EVENT_PRICE_THRESHOLD_PCT / EVENT_VOLUME_THRESHOLD_X 可配。
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let config = stock_analysis::grpc_server::ServerConfig::default();
-    let (addr, handle) = stock_analysis::grpc_server::start(config).await?;
+    let (addr, handle, hub) = stock_analysis::grpc_server::start(config).await?;
     log::info!("[grpc_market_server] 就绪: {addr} (Ctrl-C 退出)");
+
+    // ---- 事件轮询 (Task 11 Step 4) ----
+    let poll = stock_analysis::grpc_server::events::poll_interval_ms();
+    let (price_t, vol_t) = stock_analysis::grpc_server::events::thresholds();
+    // v15.x 出声: 统一行情 RealtimeMarketQuote 合同无 volume/amount 字段 →
+    // 真实轮询仅产生 Price 事件; Volume/Amount/Status 事件在注入路径可用。
+    log::info!(
+        "[grpc_market_server] 事件轮询间隔 {poll}ms, 阈值 {price_t:.2}pp/{vol_t:.2}x; \
+         volume/amount 无上游字段 → 真实轮询仅 Price 事件 (Volume/Amount/Status 走注入)"
+    );
+
+    let hub_for_poll = hub.clone();
+    let poll_task = tokio::spawn(async move {
+        let mut prev: Vec<stock_analysis::grpc_server::events::Quote> = Vec::new();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(poll)).await;
+            let codes: Vec<String> = std::env::var("STOCK_LIST")
+                .map(|s| {
+                    s.split(',')
+                        .map(|c| c.trim().to_string())
+                        .filter(|c| !c.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if codes.is_empty() {
+                continue;
+            }
+            let Ok(batch) = stock_analysis::data_gateway::MarketDataGateway::new()
+                .realtime_quotes(&codes)
+            else {
+                continue; // 拉取失败跳过本周期, 保留上一快照
+            };
+            let next: Vec<stock_analysis::grpc_server::events::Quote> = batch
+                .records()
+                .iter()
+                .map(|s| stock_analysis::grpc_server::events::Quote {
+                    code: s.code.clone(),
+                    name: s.name.clone(),
+                    price: s.price,
+                    prev_close: s.previous_close,
+                    volume: 0,
+                    amount: 0.0,
+                })
+                .collect();
+            let events = stock_analysis::grpc_server::events::diff_snapshots(
+                &prev,
+                &next,
+                price_t,
+                vol_t,
+            );
+            for e in events {
+                hub_for_poll.push_event(&e);
+            }
+            prev = next;
+        }
+    });
+
     tokio::select! {
         r = handle => r??,
+        r = poll_task => { r?; },
         _ = tokio::signal::ctrl_c() => log::info!("[grpc_market_server] 收到 Ctrl-C, 退出"),
     }
     Ok(())
