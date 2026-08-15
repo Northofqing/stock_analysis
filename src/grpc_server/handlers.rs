@@ -67,15 +67,11 @@ impl DataService {
             )));
         }
 
-        // 真实路径: 委托 data_gateway (spawn_blocking 包同步调用)。
-        let result = tokio::task::spawn_blocking({
-            let op = op;
-            let request_schema = request_schema.clone();
-            move || delegate::fetch(op, &request_schema)
-        })
-        .await
-        .map_err(|e| Status::internal(format!("gateway task 失败: {e}")))?
-        .map_err(|e| Status::internal(e.to_string()))?;
+        // 真实路径: 委托 data_gateway。gateway 全部是 async fn 且内部自行
+        // spawn_blocking (见 delegate.rs 头注释), 直接 await, 不套 spawn_blocking。
+        let result = delegate::fetch(op, &request_schema)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         let request_id = req
             .context
