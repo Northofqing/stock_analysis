@@ -140,7 +140,9 @@ pub fn startup_banner() -> String {
     };
     format!(
         "[data_gateway] 数据源模式 = {mode} | server = {server} | 桥接 {} ops | \
-         禁用 = {disabled} | 保持本地 {} ops (P4 follow-up): {}",
+         禁用 = {disabled} | 保持本地 {} ops: {} \
+         (limit_pools/strong_stock_reasons 是 A-10 chain 计算+DB 发布, 非数据请求 \
+          — 服务端仅为同一共享表投影, 接桥会搬迁计算副作用, 违背 P4 只迁移 transport)",
         HOOKED_OPS.len(),
         KEEP_LOCAL_OPS.len(),
         KEEP_LOCAL_OPS.join(",")
@@ -944,6 +946,11 @@ mod tests {
         assert!(b.contains("数据源模式 = grpc"), "grpc 模式: {b}");
         assert!(b.contains("server = http://127.0.0.1:19001"), "显式地址: {b}");
         assert!(b.contains("禁用 = T0Evidence,InstrumentNews"), "禁用列表: {b}");
+        assert!(b.contains("保持本地 2 ops"), "keep-local 计数: {b}");
+        assert!(
+            b.contains("A-10 chain 计算+DB 发布"),
+            "keep-local 原因出声: {b}"
+        );
         std::env::remove_var("DATA_GATEWAY_GRPC");
         std::env::remove_var("DATA_GATEWAY_GRPC_DISABLED");
         std::env::remove_var("GRPC_MARKET_ADDR");
