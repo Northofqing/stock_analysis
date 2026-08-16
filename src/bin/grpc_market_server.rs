@@ -30,6 +30,13 @@ async fn main() -> anyhow::Result<()> {
         stock_analysis::database::DatabaseManager::init(Some(std::path::PathBuf::from(&db_path)))
             .map_err(|e| anyhow::anyhow!("DatabaseManager::init({db_path}) 失败: {e}"))?;
         log::info!("[grpc_market_server] 数据库已初始化: {db_path} (A-10 链 delegate 依赖)");
+        // M4c: build_for_date 的 BR-160 聚类合同来自 config/chain.toml
+        // (config::load_chain_combined, monitor 启动时经 config::load_all() 加载)。
+        // 服务端不加载 → get_chain_intelligence_config()=None → op 61 必失败
+        // (chain_policy_unavailable, Task #75 生产探针实证)。load_all 与 monitor
+        // 同语义: 读失败 → 合同 None → delegate 查询时 fail-closed 出声, 无静默兜底。
+        stock_analysis::config::load_all();
+        log::info!("[grpc_market_server] config::load_all() 完成 (chain.toml 合同, A-10 delegate 依赖)");
     }
 
     let config = stock_analysis::grpc_server::ServerConfig::default();
