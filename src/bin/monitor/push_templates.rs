@@ -2404,21 +2404,35 @@ fn write_dispatcher_attempt(
     use std::fs::OpenOptions;
     use std::io::Write;
 
+    #[derive(serde::Serialize)]
+    struct DispatcherAttempt<'a> {
+        ts: String,
+        kind: &'a str,
+        success: bool,
+        snapshot_size: usize,
+        error: &'a str,
+    }
+
     std::fs::create_dir_all(dir)?;
     let now = chrono::Local::now();
     let path = dir.join(format!("{}.jsonl", now.format("%Y-%m-%d")));
 
-    let ts = now.format("%Y-%m-%dT%H:%M:%S%.3f").to_string();
-    let line = format!(
-        "{{\"ts\":\"{}\",\"kind\":\"{}\",\"success\":{},\"snapshot_size\":{},\"error\":\"{}\"}}\n",
-        ts,
+    let record = DispatcherAttempt {
+        ts: now.format("%Y-%m-%dT%H:%M:%S%.3f").to_string(),
         kind,
         success,
         snapshot_size,
-        error.replace('"', "'")
-    );
+        error,
+    };
+    let mut line = serde_json::to_vec(&record).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("dispatcher attempt serialization failed: {error}"),
+        )
+    })?;
+    line.push(b'\n');
     let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-    file.write_all(line.as_bytes())?;
+    file.write_all(&line)?;
     Ok(path)
 }
 
@@ -5766,7 +5780,7 @@ pub async fn dispatch_candidate_triggered_daily(hhmm: &str, banner: &BannerCtx) 
     use stock_analysis::opportunity::candidate_panel::EvidenceTier;
     use stock_analysis::opportunity::candidate_state::require_live_promotion;
 
-    // BR-224: SignalTracker 证据门 — 候选样本 ≥30 且强档胜率 ≥30% 才转正推送
+    // BR-232: SignalTracker 证据门 — 候选样本 ≥30 且强档胜率 ≥30% 才转正推送
     let promotion_evidence = match tokio::task::spawn_blocking(|| {
         use stock_analysis::database::DatabaseManager;
         let db = DatabaseManager::get();
@@ -6069,8 +6083,7 @@ pub async fn dispatch_auction_volume_daily(hhmm: &str, banner: &BannerCtx) -> bo
 // 引用 (load_catalyst_review_snapshot_real:12933, PersistentLevel:12976/14328
 // 等) 与 main.rs `pt::PersistentLevel` 不变。
 pub use stock_analysis::review::catalyst_review::{
-    catalyst_review_from_chain_batch, load_catalyst_review_snapshot_real,
-    CatalystReviewSnapshot, PersistentLevel,
+    load_catalyst_review_snapshot_real, PersistentLevel,
 };
 
 // ============================================================================
@@ -7324,9 +7337,9 @@ pub fn render_ipo_catalyst(
 /// 静态供应链表降级为 "公司名 → A 股标的" 映射字典。
 /// 未命中字典 → 行业关键词 → TDX 真实概念板块 → 成分股 (产业链影响)。
 /// R-08 已拉取的当日公告批次缓存 (A-11 复用, 避免 cninfo 重复拉取限流)。
-static REVIEW_ANNOUNCEMENTS_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<Option<(String, Vec<stock_analysis::data_gateway::EventAnnouncement>)>>,
-> = std::sync::OnceLock::new();
+type ReviewAnnouncementsCache =
+    Mutex<Option<(String, Vec<stock_analysis::data_gateway::EventAnnouncement>)>>;
+static REVIEW_ANNOUNCEMENTS_CACHE: OnceLock<ReviewAnnouncementsCache> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct DynamicIpoHit {
@@ -7451,7 +7464,7 @@ pub async fn dispatch_ipo_catalyst(date: &str) -> bool {
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
         .ok()
-        .and_then(|mut cache| match cache.as_ref() {
+        .and_then(|cache| match cache.as_ref() {
             Some((cached_date, records)) if cached_date == date => Some(records.clone()),
             _ => None,
         });
@@ -7521,46 +7534,44 @@ pub async fn dispatch_ipo_catalyst(date: &str) -> bool {
     // 板块/成分/身份任一失败 → 该板块跳过, 不影响其余 (尽力而为, 出声)。
     for hit in hits.iter_mut().filter(|h| h.mapped_stocks.is_empty()) {
         let company = hit.company.clone();
-        let directory = match (
-            stock_analysis::data_gateway::BoardDataGateway::production_tdx()
-                .directory(stock_analysis::data_gateway::BoardKind::Concept, 200)
-                .await,
-            stock_analysis::data_gateway::BoardDataGateway::production_tdx()
-                .directory(stock_analysis::data_gateway::BoardKind::Industry, 200)
-                .await,
-        ) {
+        let mut directory = Vec::new();
+        for (kind, result) in [
             (
-                Ok(stock_analysis::data_gateway::GatewayBatch::Available {
-                    records: concept, ..
-                }),
-                Ok(stock_analysis::data_gateway::GatewayBatch::Available {
-                    records: industry,
-                    ..
-                }),
-            ) => {
-                let mut all = concept;
-                all.extend(industry);
-                all
+                "concept",
+                stock_analysis::data_gateway::BoardDataGateway::production_tdx()
+                    .directory(stock_analysis::data_gateway::BoardKind::Concept, 200)
+                    .await,
+            ),
+            (
+                "industry",
+                stock_analysis::data_gateway::BoardDataGateway::production_tdx()
+                    .directory(stock_analysis::data_gateway::BoardKind::Industry, 200)
+                    .await,
+            ),
+        ] {
+            match result {
+                Ok(stock_analysis::data_gateway::GatewayBatch::Available { records, .. }) => {
+                    directory.extend(records);
+                }
+                Ok(stock_analysis::data_gateway::GatewayBatch::VerifiedEmpty(evidence)) => {
+                    log::warn!(
+                        "[A-11][BR-223] 板块目录已验证为空: kind={} batch_id={}",
+                        kind,
+                        evidence.batch_id
+                    );
+                }
+                Err(error) => {
+                    log::warn!(
+                        "[A-11][BR-223] 板块目录不可用: kind={} error={}",
+                        kind,
+                        error
+                    );
+                }
             }
-            (Ok(stock_analysis::data_gateway::GatewayBatch::Available { records, .. }), _) => {
-                records
-            }
-            (_, Ok(stock_analysis::data_gateway::GatewayBatch::Available { records, .. })) => {
-                records
-            }
-            (Ok(stock_analysis::data_gateway::GatewayBatch::VerifiedEmpty(evidence)), _)
-            | (_, Ok(stock_analysis::data_gateway::GatewayBatch::VerifiedEmpty(evidence))) => {
-                log::warn!(
-                    "[A-11][BR-223] 板块目录已验证为空: {:?}",
-                    evidence.batch_id
-                );
-                continue;
-            }
-            (Err(error), _) | (_, Err(error)) => {
-                log::warn!("[A-11][BR-223] 板块目录不可用: {error}");
-                continue;
-            }
-        };
+        }
+        if directory.is_empty() {
+            continue;
+        }
         let boards = infer_industry_boards(&directory, &company);
         if boards.is_empty() {
             continue;
@@ -7578,25 +7589,52 @@ pub async fn dispatch_ipo_catalyst(date: &str) -> bool {
                         .iter()
                         .map(|r| r.instrument_code.clone())
                         .collect(),
-                    Ok(_) | Err(_) => Vec::new(),
+                    Ok(stock_analysis::data_gateway::GatewayBatch::VerifiedEmpty(evidence)) => {
+                        log::warn!(
+                            "[A-11][BR-223] 板块成分已验证为空: board={} batch_id={}",
+                            board_code,
+                            evidence.batch_id
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "[A-11][BR-223] 板块成分不可用，跳过该板块: board={} error={}",
+                            board_code,
+                            error
+                        );
+                        continue;
+                    }
                 };
             if member_codes.is_empty() {
                 continue;
             }
             let member_codes = member_codes.into_iter().take(10).collect::<Vec<_>>();
-            let named: Vec<(String, String)> =
-                match stock_analysis::data_gateway::MarketCapabilitiesGateway::new()
-                    .security_identities(&member_codes)
-                    .await
-                {
-                    Ok(stock_analysis::data_gateway::GatewayBatch::Available {
-                        records, ..
-                    }) => records
-                        .iter()
-                        .map(|i| (i.code.clone(), i.name.clone()))
-                        .collect(),
-                    Ok(_) | Err(_) => Vec::new(),
-                };
+            let named: Vec<(String, String)> = match stock_analysis::data_gateway::MarketCapabilitiesGateway::new()
+                .security_identities(&member_codes)
+                .await
+            {
+                Ok(stock_analysis::data_gateway::GatewayBatch::Available { records, .. }) => records
+                    .iter()
+                    .map(|identity| (identity.code.clone(), identity.name.clone()))
+                    .collect(),
+                Ok(stock_analysis::data_gateway::GatewayBatch::VerifiedEmpty(evidence)) => {
+                    log::warn!(
+                        "[A-11][BR-223] 证券身份已验证为空，跳过该板块: board={} batch_id={}",
+                        board_code,
+                        evidence.batch_id
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    log::warn!(
+                        "[A-11][BR-223] 证券身份不可用，跳过该板块: board={} error={}",
+                        board_code,
+                        error
+                    );
+                    continue;
+                }
+            };
             industry.push(IndustryBoard {
                 board_name: board_name.clone(),
                 stocks: named,
@@ -7710,8 +7748,8 @@ pub async fn dispatch_block_trade_review(
             {
                 pushed += 1;
             }
-        } else if is_bse {
-            if dispatch_block_trade_price_range(
+        } else if is_bse
+            && dispatch_block_trade_price_range(
                 &hhmm,
                 &name,
                 code,
@@ -7721,9 +7759,8 @@ pub async fn dispatch_block_trade_review(
                 "北交所大宗价格区间 (东财 RPT_DATA_BLOCKTRADE)",
             )
             .await
-            {
-                pushed += 1;
-            }
+        {
+            pushed += 1;
         }
     }
     if pushed == 0 {
@@ -7808,7 +7845,7 @@ pub async fn dispatch_candidate_board(date: &str) -> bool {
             let _ = push_candidate_invalidated(code, &hhmm, &name, "候选", "从候选台消失").await;
         }
     }
-    // BR-224: SignalTracker 采样 — Strong 候选写入 prediction_tracker (5 日后回填)
+    // BR-232: SignalTracker 采样 — Strong 候选写入 prediction_tracker (5 日后回填)
     let strong_samples: Vec<(String, f64)> = batch
         .entries
         .iter()
@@ -8009,11 +8046,11 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
     }
 
     // 2. 龙虎榜强票 (净买入 > 0 Top5)
-    //    BR-232 修复 (2026-08-10): 上游 record 无 name/价格契约 —
+    //    BR-233 修复 (2026-08-10): 上游 record 无 name/价格契约 —
     //    name 与收盘价从 closing_valuation 视图补齐 (同做T候选基准);
     //    视图缺失的 code → name 退化 code + 0.0 价格 + T-11 复核注记 (fail-closed)。
     //    龙虎榜批次同时是 R-07 counted ceremony 的 counted source (BR-140/BR-192)。
-    let closes: std::collections::HashMap<String, (String, f64)> = match tokio::task::spawn_blocking(
+    let closes: std::collections::HashMap<String, (String, f64)> = tokio::task::spawn_blocking(
         move || {
             use stock_analysis::database::closing_valuation::persisted_valuation_view_for_date;
             match persisted_valuation_view_for_date(trading_date) {
@@ -8025,23 +8062,20 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
                     .collect(),
                 Ok(None) => {
                     log::warn!(
-                        "[R-07][BR-225b] 收盘估值缺失 price_date={} 做T 候选跳过 (不用上一交易日价格冒充)",
+                        "[R-07][BR-233] 收盘估值缺失 price_date={} 做T 候选跳过 (不用上一交易日价格冒充)",
                         trading_date
                     );
                     std::collections::HashMap::new()
                 }
                 Err(error) => {
-                    log::warn!("[R-07][BR-225b] 收盘估值读取失败: {error}");
+                    log::warn!("[R-07][BR-233] 收盘估值读取失败: {error}");
                     std::collections::HashMap::new()
                 }
             }
         },
     )
     .await
-    {
-        Ok(closes) => closes,
-        Err(_) => std::collections::HashMap::new(),
-    };
+    .unwrap_or_default();
     let mut lhb_evidence: Option<stock_analysis::data_gateway::BatchEvidence> = None;
     let mut lhb_records: Vec<stock_analysis::data_gateway::DragonTigerStockReview> = Vec::new();
     match stock_analysis::data_gateway::dragon_tiger::DragonTigerGateway::new()
@@ -8061,7 +8095,7 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
                     .partial_cmp(&a.ranking_net_amount_yuan)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            // BR-232/BR-233: 盘后收盘快照补名补价 (21:00 晚间最后成交时间
+            // BR-233: 盘后收盘快照补名补价 (21:00 晚间最后成交时间
             // 必然超龄, 5s 红线走 settled-close 准入: 收盘价+中文名)。
             // 失败/缺失 → closes 视图兜底 → 0.0 退化 (fail-closed, 红线 2.2 不虚构价格)。
             let strong_codes: Vec<String> = strong
@@ -8145,7 +8179,7 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
                 source_complete: !batch.is_verified_empty(),
             };
             let chains = stock_analysis::market_analyzer::limit_chain_review::aggregate(&input);
-            // BR-232/BR-233: 盘后收盘快照补名补价; leader_name 优先, 缺失才查行情。
+            // BR-233: 盘后收盘快照补名补价; leader_name 优先, 缺失才查行情。
             let leader_codes: Vec<String> = chains
                 .iter()
                 .take(3)
@@ -8220,13 +8254,13 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
     }
 
     // 4. 可做T持仓 (结构过滤: Holding + 整百股 + 成本价 > 0)
-    //    做T 区间以**收盘价**为基准 (BR-225 修正: 此前误用成本价,
+    //    做T 区间以**收盘价**为基准 (BR-233 修正: 此前误用成本价,
     //    现价远低于成本时给出荒谬低吸位)
-    //    BR-225b (2026-08-08): 基准必须用 review_date 对应收盘估值 —
+    //    BR-233 (2026-08-08): 基准必须用 review_date 对应收盘估值 —
     //    此前用 latest, 周五估值缺失(数据 Unsafe)时周六补投会 fallback
     //    到 8/6 估值, 把周四收盘价冒充周五价。缺失 → fail-closed 跳过
     //    做T 候选 + warn, 不用上一交易日价格冒充。
-    //    closes 视图已在步骤 2 加载 (BR-232: 龙虎榜/涨停链同源补名补价)。
+    //    closes 视图已在步骤 2 加载 (BR-233: 龙虎榜/涨停链同源补名补价)。
     match tokio::task::spawn_blocking(stock_analysis::portfolio::get_positions).await {
         Ok(Ok(positions)) => {
             for position in positions {
@@ -8385,11 +8419,11 @@ pub struct PositionReviewParams<'a> {
     pub market_value: f64,
     /// (行业, 市值占比 %) — 按市值加权, top5 + 其他 (BR-222 排序规则)
     pub sectors: &'a [(String, f64)],
-    /// 个股明细 (BR-225: 逐个复盘)
+    /// 个股明细 (BR-233: 逐个复盘)
     pub items: &'a [PositionReviewItem],
 }
 
-/// BR-225: 单只持仓复盘行。
+/// BR-233: 单只持仓复盘行。
 #[derive(Debug, Clone, PartialEq)]
 pub struct PositionReviewItem {
     pub code: String,
@@ -8470,7 +8504,7 @@ pub fn render_position_review(p: PositionReviewParams<'_>) -> String {
 /// - 未配置 DOUBAO/DEEPSEEK/GEMINI 任一 key → warn 出声跳过（fail-open，不阻塞复盘）。
 /// - 单只失败/超时（90s）→ warn 出声跳过该只。
 /// - 报告写 `reports/details/{date}_{code}.md`，推送文本只带摘要路径（全文过长）。
-async fn build_review_ai_section(date: &str, items: &[PositionReviewItem]) -> String {
+async fn build_review_ai_section(items: &[PositionReviewItem]) -> String {
     if stock_analysis::risk::env_guard::runtime_is_test_process() {
         log::info!("[复盘AI] --test 进程隔离, 跳过 AI 研判段");
         return String::new();
@@ -8575,7 +8609,7 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
         persisted_valuation_view_for_date, ClosingValuationView,
     };
     use stock_analysis::database::user_account_summary::latest as latest_user_account_summary;
-    // BR-225b: R-11 与 R-07 同因 — latest 在 review_date 估值缺失时 (数据
+    // BR-233: R-11 与 R-07 同因 — latest 在 review_date 估值缺失时 (数据
     // Unsafe 未生成) 会 fallback 到上一交易日, 把 8/6 收盘价冒充 8/7。
     // 按 review_date 精确取数, 缺失时出声 no_data (不用旧价冒充)。
     let trading_date = match chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") {
@@ -8717,7 +8751,7 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
     } else {
         0.0
     };
-    // BR-225: 个股明细 (逐个复盘, 按市值降序)
+    // BR-233: 个股明细 (逐个复盘, 按市值降序)
     let mut items: Vec<PositionReviewItem> = valuation
         .valuation
         .items
@@ -8761,7 +8795,7 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
     let mut text = render_position_review(params);
     // BR-xxx: R-11 复盘接入 deep_analyzer 多角色 AI 研判（市值 Top-N）。
     // 失败/无 key → warn 出声跳过，不阻塞复盘推送本身。
-    let ai_section = build_review_ai_section(date, &items).await;
+    let ai_section = build_review_ai_section(&items).await;
     if !ai_section.is_empty() {
         text.push_str(&ai_section);
     }
@@ -8900,7 +8934,7 @@ async fn dispatch_r12_backtest_outcome(date: &str) -> crate::review_batch::Revie
     crate::review_batch::ReviewTaskOutcome::from_push_outcome(outcome, 1)
 }
 
-/// BR-224: 候选/预测样本 5 日收益回填 (SignalTracker 闭环)。
+/// BR-232: 候选/预测样本 5 日收益回填 (SignalTracker 闭环)。
 /// 对近 days 天的 pending prediction 用日线收盘价验证 (复用 backfill_predictions 逻辑)。
 async fn backfill_pending_predictions(days: i64) -> (usize, usize) {
     use chrono::Duration;
@@ -9079,6 +9113,10 @@ async fn dispatch_r13_counted_delivery(
 /// occurrences, so a restart missed-compensation re-run reuses the delivered
 /// decision via the dispatcher-top preflight instead of pushing a duplicate
 /// (2026-08-12 21:13:07 incident: 5 路未升级 counted 的复盘 dispatcher 各多推一次)。
+#[allow(
+    clippy::too_many_arguments,
+    reason = "stable counted-delivery ceremony API keeps each audited identity and counter input explicit at every review dispatcher call site"
+)]
 async fn dispatch_review_task_counted(
     family: &str,
     kind: crate::notify::PushKind,
@@ -9277,8 +9315,8 @@ pub async fn dispatch_post_session_review(
     due: &std::collections::BTreeSet<crate::review_batch::ReviewTask>,
 ) -> Result<crate::review_batch::ReviewBatchOutcome, String> {
     use crate::review_batch::{
-        account_dependency_outcomes, merge_review_task_outcomes, partition_review_tasks,
-        review_preflight, ReviewTask, ReviewTaskOutcome,
+        merge_review_task_outcomes, partition_review_tasks, review_preflight, ReviewTask,
+        ReviewTaskOutcome,
     };
 
     let business_date = context.business_date();
@@ -9302,20 +9340,13 @@ pub async fn dispatch_post_session_review(
             == stock_analysis::risk::env_guard::TradingEnv::Test;
     let preflight = review_preflight(context, due, is_test);
     let phases = partition_review_tasks(&preflight.runnable);
-    let (r04, r07, r08, r09, r11, r12, r13, a10, a01) = tokio::join!(
+    // BR-139/BR-199/BR-200: the initial SourceOnly phase is a closed set.
+    // It must reach terminal outcomes before any registered follow-up task can
+    // acquire a provider, renderer, or sink.
+    let (r04, r08, r09) = tokio::join!(
         async {
             if phases.source_only.contains(&ReviewTask::R04) {
                 Some((ReviewTask::R04, dispatch_r04_lhb_outcome(&date, now).await))
-            } else {
-                None
-            }
-        },
-        async {
-            if phases.source_only.contains(&ReviewTask::R07) {
-                Some((
-                    ReviewTask::R07,
-                    dispatch_tomorrow_watch_outcome(&date).await,
-                ))
             } else {
                 None
             }
@@ -9335,6 +9366,25 @@ pub async fn dispatch_post_session_review(
                 Some((
                     ReviewTask::R09,
                     dispatch_r09_provider_top_n_outcome(business_date).await,
+                ))
+            } else {
+                None
+            }
+        },
+    );
+    let source_only_outcomes = [r04, r08, r09]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+    // BR-222/BR-232/BR-233 keep these registered task semantics intact, but
+    // they are downstream of the closed BR-139 SourceOnly phase above.
+    let (r07, r11, r12, r13, a10, a01) = tokio::join!(
+        async {
+            if phases.source_only.contains(&ReviewTask::R07) {
+                Some((
+                    ReviewTask::R07,
+                    dispatch_tomorrow_watch_outcome(&date).await,
                 ))
             } else {
                 None
@@ -9391,16 +9441,16 @@ pub async fn dispatch_post_session_review(
             }
         },
     );
-    let source_only_outcomes = [r04, r07, r08, r09, r11, r12, r13, a10, a01]
+    let registered_followup_outcomes = [r07, r11, r12, r13, a10, a01]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
 
-    // BR-224: SignalTracker 样本回填 (5 日收益验证, 每日复盘时执行)
+    // BR-232: SignalTracker 样本回填 (5 日收益验证, 每日复盘时执行)
     let (backfilled_total, backfilled_hits) = backfill_pending_predictions(14).await;
     if backfilled_total > 0 {
         log::info!(
-            "[BR-224] 预测样本回填 verified={backfilled_total} hits={backfilled_hits}"
+            "[BR-232] 预测样本回填 verified={backfilled_total} hits={backfilled_hits}"
         );
     }
 
@@ -9453,9 +9503,13 @@ pub async fn dispatch_post_session_review(
             account_required_outcomes.len()
         );
     }
+    let staged_source_outcomes = source_only_outcomes
+        .into_iter()
+        .chain(registered_followup_outcomes)
+        .collect();
     let batch = merge_review_task_outcomes(
         preflight.outcomes,
-        source_only_outcomes,
+        staged_source_outcomes,
         account_required_outcomes,
     )?;
     let delivered = batch.delivered_count();
@@ -11546,6 +11600,60 @@ mod tests_br140_r08_partial_components {
     }
 
     #[test]
+    fn br139_initial_source_only_phase_is_closed_and_precedes_registered_followups() {
+        let source = include_str!("push_templates.rs");
+        let start = source
+            .find("pub async fn dispatch_post_session_review(")
+            .expect("post-session dispatcher");
+        let end = source[start..]
+            .find("// ============================================================================")
+            .expect("post-session dispatcher boundary");
+        let dispatcher = &source[start..start + end];
+
+        let initial_phase_start = dispatcher
+            .find("let (r04, r08, r09) = tokio::join!(")
+            .expect("closed BR-139 source-only phase");
+        let initial_phase_end = dispatcher
+            .find("let source_only_outcomes = [r04, r08, r09]")
+            .expect("closed BR-139 source-only outcomes");
+        let initial_phase = &dispatcher[initial_phase_start..initial_phase_end];
+
+        for dispatcher_name in [
+            "dispatch_r04_lhb_outcome",
+            "dispatch_r08_event_calendar_outcome",
+            "dispatch_r09_provider_top_n_outcome",
+        ] {
+            assert!(
+                initial_phase.contains(dispatcher_name),
+                "initial source-only phase must contain {dispatcher_name}"
+            );
+        }
+        for dispatcher_name in [
+            "dispatch_tomorrow_watch_outcome",
+            "dispatch_position_review_outcome",
+            "dispatch_r12_backtest_outcome",
+            "dispatch_r13_watchlist_tracking_outcome",
+            "dispatch_catalyst_review_daily_outcome",
+            "dispatch_paper_review_daily_outcome",
+            "dispatch_r03_industry_chain_outcome",
+        ] {
+            assert!(
+                !initial_phase.contains(dispatcher_name),
+                "initial source-only phase must not contain {dispatcher_name}"
+            );
+        }
+
+        let followup_phase_start = dispatcher
+            .find("let (r07, r11, r12, r13, a10, a01) = tokio::join!(")
+            .expect("registered follow-up phase");
+        let account_phase_start = dispatcher
+            .find("let mut account_required_outcomes = Vec::new()")
+            .expect("account phase");
+        assert!(initial_phase_end < followup_phase_start);
+        assert!(followup_phase_start < account_phase_start);
+    }
+
+    #[test]
     fn br199_r08_dispatch_is_joined_before_account_dependency_outcomes() {
         let source = include_str!("push_templates.rs");
         let start = source
@@ -13218,7 +13326,7 @@ async fn dispatch_catalyst_review_daily_outcome(
         .iter()
         .map(|entry| entry.code.as_str())
         .collect();
-    // BR-225: 题材评分/观察点推导 (无独立评分批次时用当日涨停结构, 确定性规则)
+    // BR-233: 题材评分/观察点推导 (无独立评分批次时用当日涨停结构, 确定性规则)
     let derived_score = snapshot.score.or_else(|| {
         let structure = (snapshot.member_count as f32).min(100.0) * 0.30
             + (snapshot.continuous_count as f32).min(60.0) * 0.50
@@ -13229,15 +13337,17 @@ async fn dispatch_catalyst_review_daily_outcome(
             };
         Some(structure.min(100.0))
     });
-    let derived_watch_point = snapshot.watch_point.as_deref().filter(|v| !v.trim().is_empty()).or_else(|| {
-        Some(if snapshot.continuous_count >= 10 {
+    let derived_watch_point = snapshot
+        .watch_point
+        .as_deref()
+        .filter(|v| !v.trim().is_empty())
+        .or(Some(if snapshot.continuous_count >= 10 {
             "连板结构高位, 明日关注前排是否扩散与是否退潮 (基于当日涨停结构推导)"
         } else if snapshot.continuous_count >= 3 {
             "连板梯队成型, 明日关注前排延续性与后排补涨 (基于当日涨停结构推导)"
         } else {
             "连板梯队偏弱, 明日关注题材是否出现新催化 (基于当日涨停结构推导)"
-        })
-    });
+        }));
     let params = CatalystReviewParams {
         date: &snapshot.date,
         theme: &snapshot.theme,
@@ -13262,7 +13372,7 @@ async fn dispatch_catalyst_review_daily_outcome(
     };
     // BR-192: 数据质量守卫 (原 SourceBatchEvidence 校验保留): 观察时间缺失 → failed。
     let source_observed_at = match snapshot.source_observed_at.as_ref() {
-        Some(observed_at) => observed_at.clone(),
+        Some(observed_at) => *observed_at,
         None => {
             let reason = "A-10 source batch observation time missing".to_string();
             log_dispatcher_attempt("A-10", false, snapshot.member_count, &reason);
@@ -13866,7 +13976,7 @@ pub async fn push_candidate_triggered(
     let trigger_date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let basis = params.trigger_desc.to_string();
     let db = DatabaseManager::get();
-    db.record_candidate_trigger(&trigger_date, code, &params.name, &basis)?;
+    db.record_candidate_trigger(&trigger_date, code, params.name, &basis)?;
 
     let canonical = serde_json::json!({
         "code": code,
@@ -13990,15 +14100,9 @@ fn data_mode_notification_plan(
         (Some(previous), current) if previous != current => {
             // BR-225c: 恶化 →Unsafe 立即推 (风险不延迟);
             // 其他切换 (Full↔Degraded 抖动 / Unsafe→恢复) 需稳定窗口已过。
-            if current == LibDM::Unsafe {
-                DataModeNotificationPlan::Dispatch {
-                    previous: Some(previous),
-                    current,
-                    reason: DataModeDispatchReason::Transition,
-                }
-            } else if pending_stable_since.is_some_and(|at| {
-                at.elapsed() >= DATA_MODE_STABLE_WINDOW
-            }) {
+            if current == LibDM::Unsafe
+                || pending_stable_since.is_some_and(|at| at.elapsed() >= DATA_MODE_STABLE_WINDOW)
+            {
                 DataModeNotificationPlan::Dispatch {
                     previous: Some(previous),
                     current,
@@ -16078,7 +16182,7 @@ pub async fn dispatch_sector_anomaly_daily(hhmm: &str, news_text: &str) -> bool 
     result
 }
 
-/// BR-232 (2026-08-10): R-07 明日观察池补名补价 — 生产 8/10 21:00 推送
+/// BR-233 (2026-08-10): R-07 明日观察池补名补价 — 生产 8/10 21:00 推送
 /// 中龙虎榜/涨停链 8 只票名字=代码、低吸/止损 0.00 (用户投诉)。
 /// 修复 = 统一实时行情 gateway 补齐 name+price; strict 批次任一票失败
 /// 会整批退化 → name=code + 0.00。此测试用生产推送的真实 code 清单
@@ -16103,7 +16207,7 @@ mod tests_br232_tomorrow_watch_quotes {
             let quote = &quotes[code];
             assert_ne!(
                 quote.name, *code,
-                "{code} 名字仍是代码 — BR-232/BR-233 补名未生效"
+                "{code} 名字仍是代码 — BR-233 补名未生效"
             );
             assert!(
                 quote.price > 0.0,
@@ -19094,6 +19198,36 @@ mod tests {
         assert!(lines[2].contains("\"kind\":\"A-01\""));
 
         // 清理
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial_test::serial(dispatcher_log_env)]
+    fn br132_dispatcher_log_escapes_arbitrary_error_text_as_json() {
+        use std::fs;
+
+        let dir = std::env::temp_dir().join(format!(
+            "TEST_CODE_dispatcher_log_escape_{}_{}",
+            std::process::id(),
+            chrono::Local::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
+        ));
+        let error = "TEST_CODE Change #[tokio::main] to \\\'multi_thread\\\'\npath=C:\\\\tmp and \\\"quoted\\\"";
+
+        write_dispatcher_attempt(&dir, "TEST_CODE-BR-132", false, 0, error)
+            .expect("write escaped dispatcher attempt");
+
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let raw = fs::read_to_string(dir.join(format!("{today}.jsonl")))
+            .expect("read escaped dispatcher log");
+        assert!(raw.ends_with('\n'));
+        assert_eq!(raw.lines().count(), 1);
+        let record: serde_json::Value =
+            serde_json::from_str(raw.trim()).expect("writer must always emit valid JSON");
+        assert_eq!(record["kind"].as_str(), Some("TEST_CODE-BR-132"));
+        assert_eq!(record["error"].as_str(), Some(error));
+
         let _ = fs::remove_dir_all(&dir);
     }
 

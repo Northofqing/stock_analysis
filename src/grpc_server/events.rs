@@ -299,17 +299,17 @@ impl MarketEventService for EventService {
         let replay = hub.replay_after(inner.after)?;
         tokio::spawn(async move {
             for envelope in replay {
-                if envelope_matches(&envelope, &filter) {
-                    if tx.send(Ok(envelope)).await.is_err() {
-                        return;
-                    }
+                if envelope_matches(&envelope, &filter)
+                    && tx.send(Ok(envelope)).await.is_err()
+                {
+                    return;
                 }
             }
             while let Ok(envelope) = live_rx.recv().await {
-                if envelope_matches(&envelope, &filter) {
-                    if tx.send(Ok(envelope)).await.is_err() {
-                        return;
-                    }
+                if envelope_matches(&envelope, &filter)
+                    && tx.send(Ok(envelope)).await.is_err()
+                {
+                    return;
                 }
             }
         });

@@ -6,35 +6,41 @@
 //! 缺字段/缺证据 → GatewayError::invalid_evidence (fail-closed, 绝不静默填充)。
 //! 空 records → GatewayBatch::VerifiedEmpty (服务端 proven empty, 不 collapse
 //! 成 unavailable)。
+use crate::data_gateway::market_capabilities::MarketSecurityIdentity;
+use crate::data_gateway::outcome_daily_bars::{OutcomeTransportFailure, RawOutcomeFetch};
 use crate::data_gateway::{
     board_ranking::BoardRankingFact, BatchEvidence, BlockTradeReview, BoardDirectoryFact,
     BoardDirectoryRecordEvidence, BoardFlowFact, BoardKind, BoardMembershipRecord,
     DragonTigerSeatReview, DragonTigerSourceDisclosure, DragonTigerStockReview,
-    EconomicReleaseFact, EventAnnouncement, ForeignExchangeFact, FuturesDeliveryFact,
-    GatewayBatch, GatewayError, GeneralWebResearchBatch, GeneralWebResearchBatchEvidence,
+    EconomicReleaseFact, EventAnnouncement, ForeignExchangeFact, FuturesDeliveryFact, GatewayBatch,
+    GatewayError, GeneralWebResearchBatch, GeneralWebResearchBatchEvidence,
     GeneralWebResearchProvider, GeneralWebResearchRecord, GlobalIndexFact, GlobalNewsRecord,
     ImplementedCorporateAction, InstrumentFundFlowFact, IntradayShapeFact, MagicTdxT0Batch,
     MagicTdxT0DailyBar, MagicTdxT0Evidence, MagicTdxT0FiveMinuteBar, MagicTdxT0Quote,
     MagicTdxT0Rejection, MarketBookLevel, MarketMinutePoint, MarketMoneyFlow, MarketOrderBook,
-    MarketSecurityMetadata, NorthboundDailyFact, NorthboundQuotaFact,
-    NorthboundTopTurnoverFact, ProviderTopNFact, RealtimeIndexQuote, RealtimeMarketQuote,
-    ResearchReportFact, ResearchUseScope, SecurityBoard, SinaInstrumentNewsRecord, T0BookLevel,
-    UpperLimitRecord,
+    MarketSecurityMetadata, NorthboundDailyFact, NorthboundQuotaFact, NorthboundTopTurnoverFact,
+    ProviderTopNFact, RealtimeIndexQuote, RealtimeMarketQuote, ResearchReportFact,
+    ResearchUseScope, SecurityBoard, SinaInstrumentNewsRecord, T0BookLevel, UpperLimitRecord,
 };
 use crate::data_provider::{consensus::ConsensusData, news_item::NewsItem, AdjustType, KlineData};
-use crate::data_gateway::outcome_daily_bars::{OutcomeTransportFailure, RawOutcomeFetch};
-use crate::selection::schema_v2::OutcomeTransportAttemptPreimage;
 use crate::grpc_client::envelope::QueryResult;
-use chrono::{DateTime, NaiveDate, Utc};
+use crate::magic_compat::SecurityBar;
 use crate::magic_compat::{
     AssetClass, Exchange, InstrumentId, NonEmptyText, ProviderId, SourceEvidence,
 };
-use crate::magic_compat::{Bar, CorporateActionCategory, CorporateActionTerms, DataBatch, DragonTigerSide, FinancialStatement, FiniteNumber, FlowInterval, FxPair, GlobalIndexCode, IsoDate, MarketRankingKind, MarketRankingUnit, MarketStatistics, Money, NorthboundChannel, PositiveU32, Price, Ratio};
-use crate::magic_compat::SecurityBar;
+use crate::magic_compat::{
+    Bar, CorporateActionCategory, CorporateActionTerms, DataBatch, DragonTigerSide,
+    FinancialStatement, FiniteNumber, FlowInterval, FxPair, GlobalIndexCode, IsoDate,
+    MarketRankingKind, MarketRankingUnit, MarketStatistics, Money, NorthboundChannel, PositiveU32,
+    Price, Ratio,
+};
+use crate::selection::schema_v2::OutcomeTransportAttemptPreimage;
+use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
 
 /// bridge 缺证据时的 capability 标记 (audit_outcome=invalid_evidence)。
 const BRIDGE_CAPABILITY: &str = "GrpcBridge";
+const MAX_CLOCK_SKEW: chrono::TimeDelta = chrono::TimeDelta::seconds(2);
 
 fn err(capability: &'static str, msg: impl Into<String>) -> GatewayError {
     GatewayError::invalid_evidence(capability, None, msg)
@@ -45,8 +51,6 @@ fn err(capability: &'static str, msg: impl Into<String>) -> GatewayError {
 pub fn parse_provider(s: &str) -> Result<ProviderId, GatewayError> {
     Ok(match s {
         "Tdx" => ProviderId::Tdx,
-        // 服务端兼容值 (handlers.rs M1 fallback): Magic TDX 开发实例, 语义即 Tdx。
-        "tdx-dev" => ProviderId::Tdx,
         "Tencent" => ProviderId::Tencent,
         "Eastmoney" => ProviderId::Eastmoney,
         "Sina" => ProviderId::Sina,
@@ -112,6 +116,15 @@ fn parse_board(s: &str) -> Result<SecurityBoard, GatewayError> {
 /// 从 QueryResult 信封构造 BatchEvidence。
 /// source_at 空 → None (合同 §6 缺则不填充); provider/source/batch_id 空 → Err。
 fn evidence_of(q: &QueryResult, capability: &'static str) -> Result<BatchEvidence, GatewayError> {
+    if q.admission != crate::grpc_client::pb::magic::market::v1::AdmissionState::Admitted {
+        return Err(err(capability, "响应未获 repository admission"));
+    }
+    if !q.diagnostic_blocker.is_empty() {
+        return Err(err(
+            capability,
+            "响应携带 diagnostic_blocker, 不得进入生产证据转换",
+        ));
+    }
     let provider = parse_provider(&q.selected_provider)
         .map_err(|e| err(capability, format!("selected_provider 无法解析: {e}")))?;
     if q.source.is_empty() {
@@ -135,11 +148,14 @@ fn evidence_of(q: &QueryResult, capability: &'static str) -> Result<BatchEvidenc
 
 /// records data 字节 → Value 数组。
 fn parse_records(q: &QueryResult, capability: &'static str) -> Result<Vec<Value>, GatewayError> {
-    let Some(payload) = q.records.first() else {
+    if !q.complete {
         return Err(err(
             capability,
-            "records 空 (服务端无 canonical payload)",
+            "响应 complete=false, 完整数据转换不得接纳 partial batch",
         ));
+    }
+    let Some(payload) = q.records.first() else {
+        return Err(err(capability, "records 空 (服务端无 canonical payload)"));
     };
     serde_json::from_slice(&payload.data)
         .map_err(|e| err(capability, format!("records 非 JSON 数组: {e}")))
@@ -164,7 +180,11 @@ fn as_bool(v: &Value, key: &str, capability: &'static str) -> Result<bool, Gatew
         .ok_or_else(|| err(capability, format!("record 缺布尔字段 {key}")))
 }
 
-fn as_rfc3339(v: &Value, key: &str, capability: &'static str) -> Result<DateTime<Utc>, GatewayError> {
+fn as_rfc3339(
+    v: &Value,
+    key: &str,
+    capability: &'static str,
+) -> Result<DateTime<Utc>, GatewayError> {
     let s = as_str(v, key, capability)?;
     DateTime::parse_from_rfc3339(&s)
         .map(|dt| dt.with_timezone(&Utc))
@@ -202,19 +222,35 @@ fn per_code_records<'a>(
 }
 
 /// record 时间戳: 视图无逐条 source_at 的 op → 用证据链 source_at (fail-closed: 空 = Err)。
-fn record_source_at(q: &QueryResult, capability: &'static str) -> Result<DateTime<Utc>, GatewayError> {
+fn record_source_at(
+    q: &QueryResult,
+    capability: &'static str,
+) -> Result<DateTime<Utc>, GatewayError> {
     if q.source_at.is_empty() {
         return Err(err(capability, "source_at 空 (服务端未回填证据链)"));
     }
     DateTime::parse_from_rfc3339(&q.source_at)
         .map(|dt| dt.with_timezone(&Utc))
-        .map_err(|e| err(capability, format!("source_at 非 RFC3339: {} ({e})", q.source_at)))
+        .map_err(|e| {
+            err(
+                capability,
+                format!("source_at 非 RFC3339: {} ({e})", q.source_at),
+            )
+        })
 }
 
-fn record_observed_at(q: &QueryResult, capability: &'static str) -> Result<DateTime<Utc>, GatewayError> {
+fn record_observed_at(
+    q: &QueryResult,
+    capability: &'static str,
+) -> Result<DateTime<Utc>, GatewayError> {
     DateTime::parse_from_rfc3339(&q.observed_at)
         .map(|dt| dt.with_timezone(&Utc))
-        .map_err(|e| err(capability, format!("observed_at 非 RFC3339: {} ({e})", q.observed_at)))
+        .map_err(|e| {
+            err(
+                capability,
+                format!("observed_at 非 RFC3339: {} ({e})", q.observed_at),
+            )
+        })
 }
 
 // ---------- 6 个首批 op (M2) ----------
@@ -244,7 +280,10 @@ pub fn realtime_quotes(q: &QueryResult) -> Result<GatewayBatch<RealtimeMarketQuo
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 /// 分钟线。视图: delegate.rs fetch_minute_data (:211-219)
@@ -272,7 +311,10 @@ pub fn minute_data(q: &QueryResult) -> Result<GatewayBatch<MarketMinutePoint>, G
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 /// 盘口 5 档。视图: delegate.rs fetch_order_books (:235-244)
@@ -294,7 +336,10 @@ fn book_levels(
             format!("{key} 档位数 {} 超过 5 (服务端视图违约)", arr.len()),
         ));
     }
-    let mut levels = [MarketBookLevel { price: 0.0, quantity: 0.0 }; 5];
+    let mut levels = [MarketBookLevel {
+        price: 0.0,
+        quantity: 0.0,
+    }; 5];
     for (i, item) in arr.iter().enumerate() {
         levels[i] = MarketBookLevel {
             price: as_f64(item, "price", capability)?,
@@ -327,7 +372,10 @@ pub fn order_books(q: &QueryResult) -> Result<GatewayBatch<MarketOrderBook>, Gat
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 /// 资金流。视图: delegate.rs fetch_money_flows (:262-270)
@@ -356,12 +404,17 @@ pub fn money_flows(q: &QueryResult) -> Result<GatewayBatch<MarketMoneyFlow>, Gat
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 /// 证券元数据。视图: delegate.rs fetch_security_metadata (:282-291)
 /// {"code","name","board"(Debug),"is_st","listed_on","price_limit_percent","source_at"}。
-pub fn security_metadata(q: &QueryResult) -> Result<GatewayBatch<MarketSecurityMetadata>, GatewayError> {
+pub fn security_metadata(
+    q: &QueryResult,
+) -> Result<GatewayBatch<MarketSecurityMetadata>, GatewayError> {
     let capability = "SecurityMetadata";
     let ev = evidence_of(q, capability)?;
     let parsed = parse_records(q, capability)?;
@@ -389,7 +442,371 @@ pub fn security_metadata(q: &QueryResult) -> Result<GatewayBatch<MarketSecurityM
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
+}
+
+const LOCAL_SECURITY_METADATA_SCHEMA: &str = "market.security_metadata";
+const EXTERNAL_SECURITY_METADATA_SCHEMA: &str = "magic.market.security_metadata";
+const CANONICAL_JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
+
+/// Security identity is the only SecurityMetadata projection allowed to
+/// consume an admitted partial ExternalV1 response. It retains the immutable
+/// record/envelope evidence and does not inspect or synthesize listing/limit
+/// fields that the provider did not prove.
+fn parse_security_identities(
+    q: &QueryResult,
+) -> Result<GatewayBatch<MarketSecurityIdentity>, GatewayError> {
+    let capability = "SecurityIdentity";
+    let ev = evidence_of(q, capability)?;
+    let observed_at = crate::data_gateway::parse_evidence_instant(
+        capability,
+        ev.provider,
+        "observed_at",
+        &q.observed_at,
+    )?;
+    if q.source_at.is_empty() {
+        return Err(err(capability, "source_at 空, 不得以 observed_at 补值"));
+    }
+    let source_at = crate::data_gateway::parse_evidence_instant(
+        capability,
+        ev.provider,
+        "source_at",
+        &q.source_at,
+    )?;
+    if source_at > observed_at {
+        return Err(err(capability, "source_at 晚于 observed_at"));
+    }
+
+    let Some(first) = q.records.first() else {
+        return Err(err(
+            capability,
+            "records 空 (无 canonical identity payload)",
+        ));
+    };
+    let records = match first.schema.as_str() {
+        LOCAL_SECURITY_METADATA_SCHEMA => {
+            if !q.complete {
+                return Err(err(
+                    capability,
+                    "local security metadata complete=false, 不得接纳 partial array",
+                ));
+            }
+            if q.records.len() != 1 {
+                return Err(err(
+                    capability,
+                    "local security metadata 必须是单 payload JSON 数组",
+                ));
+            }
+            validate_identity_payload(first, LOCAL_SECURITY_METADATA_SCHEMA, capability)?;
+            let values: Vec<Value> = serde_json::from_slice(&first.data).map_err(|e| {
+                err(
+                    capability,
+                    format!("local identity payload 非 JSON 数组: {e}"),
+                )
+            })?;
+            values
+                .iter()
+                .map(|record| {
+                    let record_source_at =
+                        required_evidence_time(record, "source_at", capability, ev.provider)?;
+                    if record_source_at != source_at {
+                        return Err(err(capability, "local record source_at 与 envelope 冲突"));
+                    }
+                    Ok(MarketSecurityIdentity {
+                        code: non_empty_identity_text(
+                            as_str(record, "code", capability)?,
+                            "code",
+                            capability,
+                        )?,
+                        name: non_empty_identity_text(
+                            as_str(record, "name", capability)?,
+                            "name",
+                            capability,
+                        )?,
+                        is_st: as_bool(record, "is_st", capability)?,
+                        source_at,
+                        observed_at,
+                        provider: ev.provider,
+                        batch_id: ev.batch_id.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        EXTERNAL_SECURITY_METADATA_SCHEMA => q
+            .records
+            .iter()
+            .map(|payload| {
+                validate_identity_payload(payload, EXTERNAL_SECURITY_METADATA_SCHEMA, capability)?;
+                let record: Value = serde_json::from_slice(&payload.data).map_err(|e| {
+                    err(
+                        capability,
+                        format!("external identity payload 非 JSON object: {e}"),
+                    )
+                })?;
+                if !record.is_object() {
+                    return Err(err(
+                        capability,
+                        "external identity payload 必须一 payload 一 object",
+                    ));
+                }
+                let instrument: InstrumentId = serde_json::from_value(
+                    record
+                        .get("instrument")
+                        .cloned()
+                        .ok_or_else(|| err(capability, "record 缺 instrument"))?,
+                )
+                .map_err(|e| err(capability, format!("instrument 无效: {e}")))?;
+                if instrument.asset_class() != AssetClass::Equity {
+                    return Err(err(capability, "security identity 非 Equity"));
+                }
+                let raw_code = record
+                    .get("instrument")
+                    .and_then(|value| value.get("code"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| err(capability, "instrument 缺 code"))?;
+                if raw_code != instrument.code() {
+                    return Err(err(capability, "instrument code 非 canonical 原值"));
+                }
+
+                let record_provider = parse_provider(&as_str(&record, "provider", capability)?)?;
+                if record_provider != ev.provider {
+                    return Err(err(capability, "record provider 与 envelope 冲突"));
+                }
+                if as_str(&record, "batch_id", capability)? != ev.batch_id {
+                    return Err(err(capability, "record batch_id 与 envelope 冲突"));
+                }
+                let record_observed_at =
+                    required_evidence_time(&record, "observed_at", capability, ev.provider)?;
+                if record_observed_at != observed_at {
+                    return Err(err(capability, "record observed_at 与 envelope 冲突"));
+                }
+                let record_source_at =
+                    required_evidence_time(&record, "source_at", capability, ev.provider)?;
+                if record_source_at != source_at {
+                    return Err(err(capability, "record source_at 与 envelope 冲突"));
+                }
+                match as_str(&record, "status", capability)?.as_str() {
+                    "Available" | "Unavailable" => {}
+                    _ => return Err(err(capability, "record status 不可用于 identity 投影")),
+                }
+
+                Ok(MarketSecurityIdentity {
+                    code: non_empty_identity_text(
+                        instrument.code().to_string(),
+                        "code",
+                        capability,
+                    )?,
+                    name: non_empty_identity_text(
+                        as_str(&record, "name", capability)?,
+                        "name",
+                        capability,
+                    )?,
+                    is_st: as_bool(&record, "is_st", capability)?,
+                    source_at: record_source_at,
+                    observed_at: record_observed_at,
+                    provider: record_provider,
+                    batch_id: ev.batch_id.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => return Err(err(capability, "未知 SecurityMetadata schema")),
+    };
+
+    if records.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
+}
+
+/// Binds a SecurityMetadata identity projection to the exact request that
+/// authorized it. ExternalV1 does not promise response order, so a complete
+/// exact set is returned in request order without changing any record evidence.
+pub fn security_identities(
+    requested_codes: &[String],
+    q: &QueryResult,
+    now: DateTime<Utc>,
+) -> Result<GatewayBatch<MarketSecurityIdentity>, GatewayError> {
+    let capability = "SecurityIdentity";
+    if !(1..=50).contains(&requested_codes.len()) {
+        return Err(err(
+            capability,
+            "security identity request size must be within 1..=50",
+        ));
+    }
+    let mut requested = std::collections::HashSet::with_capacity(requested_codes.len());
+    if requested_codes
+        .iter()
+        .any(|code| !requested.insert(code.as_str()))
+    {
+        return Err(err(
+            capability,
+            "security identity request contains duplicate codes",
+        ));
+    }
+
+    let batch = parse_security_identities(q)?;
+    let (records, evidence) = match batch {
+        GatewayBatch::Available { records, evidence } => (records, evidence),
+        GatewayBatch::VerifiedEmpty(_) => {
+            return Err(err(
+                capability,
+                "security identity response is empty for a non-empty request",
+            ));
+        }
+    };
+    validate_identity_observed_freshness(&evidence, now)?;
+    validate_identity_source_freshness(&evidence, now)?;
+    let mut by_code = std::collections::HashMap::with_capacity(records.len());
+    for record in records {
+        let code = record.code.clone();
+        if by_code.insert(code, record).is_some() {
+            return Err(err(
+                capability,
+                "security identity response contains duplicate codes",
+            ));
+        }
+    }
+    let mut ordered = Vec::with_capacity(requested_codes.len());
+    for code in requested_codes {
+        let record = by_code.remove(code).ok_or_else(|| {
+            err(
+                capability,
+                format!("security identity response is missing requested code {code:?}"),
+            )
+        })?;
+        ordered.push(record);
+    }
+    if !by_code.is_empty() {
+        return Err(err(
+            capability,
+            "security identity response contains unrequested codes",
+        ));
+    }
+    Ok(GatewayBatch::Available {
+        records: ordered,
+        evidence,
+    })
+}
+
+fn validate_identity_observed_freshness(
+    evidence: &BatchEvidence,
+    now: DateTime<Utc>,
+) -> Result<(), GatewayError> {
+    const MAX_AGE: chrono::TimeDelta = chrono::TimeDelta::seconds(30);
+    let observed_at = crate::data_gateway::parse_evidence_instant(
+        "SecurityIdentity",
+        evidence.provider,
+        "observed_at",
+        &evidence.observed_at,
+    )?;
+    let age = now.signed_duration_since(observed_at);
+    if age < -MAX_CLOCK_SKEW || age > MAX_AGE {
+        let age_millis = age.num_milliseconds();
+        return Err(GatewayError::classified(
+            "SecurityIdentity",
+            Some(evidence.provider),
+            "stale",
+            "observation_stale",
+            true,
+            format!(
+                "security identity observation failed freshness gate age_ms={age_millis} max_age_ms={} max_clock_skew_ms={}",
+                MAX_AGE.num_milliseconds(),
+                MAX_CLOCK_SKEW.num_milliseconds()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_identity_source_freshness(
+    evidence: &BatchEvidence,
+    now: DateTime<Utc>,
+) -> Result<(), GatewayError> {
+    let source_at = evidence.source_at.as_deref().ok_or_else(|| {
+        err(
+            "SecurityIdentity",
+            "security identity batch has no source timestamp",
+        )
+    })?;
+    let source_at = crate::data_gateway::parse_evidence_instant(
+        "SecurityIdentity",
+        evidence.provider,
+        "source_at",
+        source_at,
+    )?;
+    if source_at > now + MAX_CLOCK_SKEW {
+        return Err(GatewayError::invalid_evidence(
+            "SecurityIdentity",
+            Some(evidence.provider),
+            "security identity source timestamp exceeds maximum clock skew",
+        ));
+    }
+
+    let shanghai = chrono::FixedOffset::east_opt(8 * 60 * 60)
+        .expect("Shanghai UTC offset is a compile-time valid constant");
+    let source_date = source_at.with_timezone(&shanghai).date_naive();
+    let today = now.with_timezone(&shanghai).date_naive();
+    let oldest_allowed = crate::calendar::prev_trading_day(today);
+    if source_date < oldest_allowed {
+        return Err(GatewayError::classified(
+            "SecurityIdentity",
+            Some(evidence.provider),
+            "stale",
+            "daily_source_stale",
+            true,
+            format!(
+                "security identity source date {source_date} is older than one trading day; oldest_allowed={oldest_allowed}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_identity_payload(
+    payload: &crate::grpc_client::pb::magic::market::v1::CanonicalPayload,
+    schema: &str,
+    capability: &'static str,
+) -> Result<(), GatewayError> {
+    if payload.schema != schema
+        || payload.schema_version != 1
+        || payload.content_type != CANONICAL_JSON_CONTENT_TYPE
+    {
+        return Err(err(
+            capability,
+            "SecurityMetadata schema/version/content-type 冲突",
+        ));
+    }
+    Ok(())
+}
+
+fn required_evidence_time(
+    record: &Value,
+    field: &'static str,
+    capability: &'static str,
+    provider: ProviderId,
+) -> Result<DateTime<Utc>, GatewayError> {
+    let value = record
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| err(capability, format!("record 缺 {field}, 不得补值")))?;
+    crate::data_gateway::parse_evidence_instant(capability, provider, field, value)
+}
+
+fn non_empty_identity_text(
+    value: String,
+    field: &'static str,
+    capability: &'static str,
+) -> Result<String, GatewayError> {
+    if value.trim().is_empty() {
+        return Err(err(capability, format!("identity {field} 空")));
+    }
+    Ok(value)
 }
 
 /// 日线 K 线。视图: delegate.rs fetch_historical_bars (:538-550)
@@ -397,7 +814,10 @@ pub fn security_metadata(q: &QueryResult) -> Result<GatewayBatch<MarketSecurityM
 /// 视图只含 KlineData 的 10 个字段子集 → 其余 Option 字段 = None、bool = false、
 /// adjust = None (视图冻结, 消费者需要的字段由 M3+ 扩展服务端视图, 不在客户端
 /// 发明数据)。
-pub fn historical_bars(code: &str, q: &QueryResult) -> Result<GatewayBatch<KlineData>, GatewayError> {
+pub fn historical_bars(
+    code: &str,
+    q: &QueryResult,
+) -> Result<GatewayBatch<KlineData>, GatewayError> {
     let capability = "HistoricalDailyBars";
     let (parsed, ev) = per_code_records(q, capability, code)?;
     if parsed.is_empty() {
@@ -440,7 +860,10 @@ pub fn historical_bars(code: &str, q: &QueryResult) -> Result<GatewayBatch<Kline
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 // ---------- M3 批次 1: 全球市场/日历/公告/新闻/交割 ----------
@@ -470,13 +893,18 @@ pub fn global_indices(q: &QueryResult) -> Result<GatewayBatch<GlobalIndexFact>, 
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 /// 外汇。视图: delegate.rs fetch_foreign_exchange (:900-921)
 /// {"pair"(Debug),"name","rate","change","change_percent","source_at"}。
 /// change/change_percent 是可空数值 (JSON null → None, 不补零)。
-pub fn foreign_exchange(q: &QueryResult) -> Result<GatewayBatch<ForeignExchangeFact>, GatewayError> {
+pub fn foreign_exchange(
+    q: &QueryResult,
+) -> Result<GatewayBatch<ForeignExchangeFact>, GatewayError> {
     let capability = "ForeignExchange";
     let ev = evidence_of(q, capability)?;
     let parsed = parse_records(q, capability)?;
@@ -499,7 +927,10 @@ pub fn foreign_exchange(q: &QueryResult) -> Result<GatewayBatch<ForeignExchangeF
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 /// 公告。视图: delegate.rs fetch_announcements (:363-385)
@@ -525,7 +956,10 @@ pub fn announcements(q: &QueryResult) -> Result<GatewayBatch<EventAnnouncement>,
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 /// 全球新闻。视图: delegate.rs fetch_global_news (:387-411)
@@ -557,13 +991,18 @@ pub fn global_news(q: &QueryResult) -> Result<GatewayBatch<GlobalNewsRecord>, Ga
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 /// 财经日历。视图: delegate.rs fetch_economic_calendar (:413-439)
 /// {"event_id","country","name","period","scheduled_at","previous","consensus",
 ///  "actual","unit","importance","released_at","revised","impact","indicator_id"}。
-pub fn economic_calendar(q: &QueryResult) -> Result<GatewayBatch<EconomicReleaseFact>, GatewayError> {
+pub fn economic_calendar(
+    q: &QueryResult,
+) -> Result<GatewayBatch<EconomicReleaseFact>, GatewayError> {
     let capability = "EconomicCalendar";
     let ev = evidence_of(q, capability)?;
     let parsed = parse_records(q, capability)?;
@@ -592,13 +1031,18 @@ pub fn economic_calendar(q: &QueryResult) -> Result<GatewayBatch<EconomicRelease
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 /// 交割日历。视图: delegate.rs fetch_futures_delivery (:441-463)
 /// {"contract_code","product_code","last_trading_date","delivery_date","notice_url"}。
 /// last_trading_date 可空 (JSON null → None)。
-pub fn futures_delivery(q: &QueryResult) -> Result<GatewayBatch<FuturesDeliveryFact>, GatewayError> {
+pub fn futures_delivery(
+    q: &QueryResult,
+) -> Result<GatewayBatch<FuturesDeliveryFact>, GatewayError> {
     let capability = "FuturesDelivery";
     let ev = evidence_of(q, capability)?;
     let parsed = parse_records(q, capability)?;
@@ -617,7 +1061,10 @@ pub fn futures_delivery(q: &QueryResult) -> Result<GatewayBatch<FuturesDeliveryF
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 /// Debug 名 → GlobalIndexCode (服务端 format!("{:?}", code))。未知 → Err。
@@ -650,16 +1097,16 @@ fn parse_fx_pair(s: &str) -> Result<FxPair, GatewayError> {
 
 /// record 级证据: 用批级 evidence 构造 (视图无逐条证据字段)。
 fn record_evidence(ev: &BatchEvidence, q: &QueryResult) -> Result<SourceEvidence, GatewayError> {
-    let mut evidence = SourceEvidence::new(
-        ev.provider,
-        ev.observed_at.clone(),
-        ev.batch_id.clone(),
-    )
-    .map_err(|e| err(BRIDGE_CAPABILITY, format!("record evidence 构造失败: {e}")))?;
+    let mut evidence =
+        SourceEvidence::new(ev.provider, ev.observed_at.clone(), ev.batch_id.clone())
+            .map_err(|e| err(BRIDGE_CAPABILITY, format!("record evidence 构造失败: {e}")))?;
     if let Some(source_at) = &ev.source_at {
-        evidence = evidence
-            .with_source_at(source_at.clone())
-            .map_err(|e| err(BRIDGE_CAPABILITY, format!("record evidence source_at 失败: {e}")))?;
+        evidence = evidence.with_source_at(source_at.clone()).map_err(|e| {
+            err(
+                BRIDGE_CAPABILITY,
+                format!("record evidence source_at 失败: {e}"),
+            )
+        })?;
     }
     let _ = q;
     Ok(evidence)
@@ -671,7 +1118,9 @@ fn as_optional_f64(
     key: &str,
     capability: &'static str,
 ) -> Result<Option<f64>, GatewayError> {
-    let value = v.get(key).ok_or_else(|| err(capability, format!("record 缺数值字段 {key}")))?;
+    let value = v
+        .get(key)
+        .ok_or_else(|| err(capability, format!("record 缺数值字段 {key}")))?;
     if value.is_null() {
         return Ok(None);
     }
@@ -687,7 +1136,9 @@ fn as_optional_str(
     key: &str,
     capability: &'static str,
 ) -> Result<Option<String>, GatewayError> {
-    let value = v.get(key).ok_or_else(|| err(capability, format!("record 缺字符串字段 {key}")))?;
+    let value = v
+        .get(key)
+        .ok_or_else(|| err(capability, format!("record 缺字符串字段 {key}")))?;
     if value.is_null() {
         return Ok(None);
     }
@@ -704,7 +1155,9 @@ fn as_optional_date(
     key: &str,
     capability: &'static str,
 ) -> Result<Option<NaiveDate>, GatewayError> {
-    let value = v.get(key).ok_or_else(|| err(capability, format!("record 缺日期字段 {key}")))?;
+    let value = v
+        .get(key)
+        .ok_or_else(|| err(capability, format!("record 缺日期字段 {key}")))?;
     if value.is_null() {
         return Ok(None);
     }
@@ -718,15 +1171,23 @@ fn as_optional_date(
 
 /// 视图整数字段。
 fn as_u64(v: &Value, key: &str, capability: &'static str) -> Result<u64, GatewayError> {
-    let value = v.get(key).ok_or_else(|| err(capability, format!("record 缺数值字段 {key}")))?;
+    let value = v
+        .get(key)
+        .ok_or_else(|| err(capability, format!("record 缺数值字段 {key}")))?;
     value
         .as_u64()
         .ok_or_else(|| err(capability, format!("字段 {key} 非整数")))
 }
 
 /// 视图字符串数组字段。
-fn as_str_array(v: &Value, key: &str, capability: &'static str) -> Result<Vec<String>, GatewayError> {
-    let value = v.get(key).ok_or_else(|| err(capability, format!("record 缺数组字段 {key}")))?;
+fn as_str_array(
+    v: &Value,
+    key: &str,
+    capability: &'static str,
+) -> Result<Vec<String>, GatewayError> {
+    let value = v
+        .get(key)
+        .ok_or_else(|| err(capability, format!("record 缺数组字段 {key}")))?;
     let arr = value
         .as_array()
         .ok_or_else(|| err(capability, format!("字段 {key} 非数组")))?;
@@ -820,9 +1281,9 @@ fn parse_market_ranking_kind(
         "Concept" => Ok(MarketRankingKind::Concept),
         "Region" => Ok(MarketRankingKind::Region),
         "Popularity" => Ok(MarketRankingKind::Popularity),
-        _ if s.starts_with("Custom(") => {
-            Ok(MarketRankingKind::Custom(parse_custom_string(s, capability)?))
-        }
+        _ if s.starts_with("Custom(") => Ok(MarketRankingKind::Custom(parse_custom_string(
+            s, capability,
+        )?)),
         _ => Err(err(capability, format!("未知 MarketRankingKind: {s}"))),
     }
 }
@@ -836,9 +1297,9 @@ fn parse_market_ranking_unit(
         "Yuan" => Ok(MarketRankingUnit::Yuan),
         "Percent" => Ok(MarketRankingUnit::Percent),
         "Score" => Ok(MarketRankingUnit::Score),
-        _ if s.starts_with("Custom(") => {
-            Ok(MarketRankingUnit::Custom(parse_custom_string(s, capability)?))
-        }
+        _ if s.starts_with("Custom(") => Ok(MarketRankingUnit::Custom(parse_custom_string(
+            s, capability,
+        )?)),
         _ => Err(err(capability, format!("未知 MarketRankingUnit: {s}"))),
     }
 }
@@ -911,7 +1372,10 @@ pub fn dragon_tiger(q: &QueryResult) -> Result<GatewayBatch<DragonTigerStockRevi
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 pub fn market_dragon_tiger(
@@ -933,7 +1397,10 @@ pub fn market_dragon_tiger(
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 pub fn block_trades(q: &QueryResult) -> Result<GatewayBatch<BlockTradeReview>, GatewayError> {
@@ -958,7 +1425,10 @@ pub fn block_trades(q: &QueryResult) -> Result<GatewayBatch<BlockTradeReview>, G
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 pub fn consensus(q: &QueryResult) -> Result<GatewayBatch<ConsensusData>, GatewayError> {
@@ -998,7 +1468,10 @@ pub fn consensus(q: &QueryResult) -> Result<GatewayBatch<ConsensusData>, Gateway
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 pub fn board_directory(q: &QueryResult) -> Result<GatewayBatch<BoardDirectoryFact>, GatewayError> {
@@ -1019,7 +1492,10 @@ pub fn board_directory(q: &QueryResult) -> Result<GatewayBatch<BoardDirectoryFac
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 pub fn board_constituents(
@@ -1041,7 +1517,10 @@ pub fn board_constituents(
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 pub fn board_flows(q: &QueryResult) -> Result<GatewayBatch<BoardFlowFact>, GatewayError> {
@@ -1065,7 +1544,10 @@ pub fn board_flows(q: &QueryResult) -> Result<GatewayBatch<BoardFlowFact>, Gatew
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 pub fn board_ranking(q: &QueryResult) -> Result<GatewayBatch<BoardRankingFact>, GatewayError> {
@@ -1090,7 +1572,10 @@ pub fn board_ranking(q: &QueryResult) -> Result<GatewayBatch<BoardRankingFact>, 
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 pub fn research_reports(q: &QueryResult) -> Result<GatewayBatch<ResearchReportFact>, GatewayError> {
@@ -1119,7 +1604,10 @@ pub fn research_reports(q: &QueryResult) -> Result<GatewayBatch<ResearchReportFa
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 /// BoardDirectoryRecordEvidence 构造 (批级 evidence 映射, 视图无逐条证据)。
@@ -1147,7 +1635,9 @@ fn parse_records_parts(
     Ok((parsed, ev))
 }
 
-pub fn northbound_daily(q: &QueryResult) -> Result<GatewayBatch<NorthboundDailyFact>, GatewayError> {
+pub fn northbound_daily(
+    q: &QueryResult,
+) -> Result<GatewayBatch<NorthboundDailyFact>, GatewayError> {
     let capability = "NorthboundDaily";
     let (parsed, ev) = parse_records_parts(q, capability)?;
     if parsed.is_empty() {
@@ -1157,11 +1647,10 @@ pub fn northbound_daily(q: &QueryResult) -> Result<GatewayBatch<NorthboundDailyF
         .iter()
         .map(|v| {
             let quota_balance = match v.get("quota_balance") {
-                Some(Value::Number(n)) => {
-                    NorthboundQuotaFact::Amount(n.as_f64().ok_or_else(|| {
-                        err(capability, "quota_balance 非有限数字")
-                    })?)
-                }
+                Some(Value::Number(n)) => NorthboundQuotaFact::Amount(
+                    n.as_f64()
+                        .ok_or_else(|| err(capability, "quota_balance 非有限数字"))?,
+                ),
                 Some(Value::String(s)) if s == "unavailable" => NorthboundQuotaFact::Unavailable,
                 _ => return Err(err(capability, "quota_balance 必须是数字或 unavailable")),
             };
@@ -1190,7 +1679,10 @@ pub fn northbound_daily(q: &QueryResult) -> Result<GatewayBatch<NorthboundDailyF
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 pub fn financial_statements(
@@ -1208,7 +1700,10 @@ pub fn financial_statements(
                 .map_err(|e| err(capability, format!("FinancialStatement 反序列化失败: {e}")))
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 pub fn market_statistics(q: &QueryResult) -> Result<GatewayBatch<MarketStatistics>, GatewayError> {
@@ -1256,7 +1751,10 @@ pub fn market_statistics(q: &QueryResult) -> Result<GatewayBatch<MarketStatistic
             .map_err(|e| core_err(capability, e))
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 pub fn technical_bars(q: &QueryResult) -> Result<GatewayBatch<SecurityBar>, GatewayError> {
@@ -1284,7 +1782,10 @@ pub fn technical_bars(q: &QueryResult) -> Result<GatewayBatch<SecurityBar>, Gate
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 pub fn fund_flow_series(
@@ -1311,7 +1812,10 @@ pub fn fund_flow_series(
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 /// 单条头部排行记录解析 (双路 provider_top_n_pair 与全量视图共用)。
@@ -1338,10 +1842,8 @@ fn parse_provider_top_n_record(
         )
         .map_err(|e| core_err(capability, e))?,
         // 服务端视图含真实 inspected_row_count (delegate 原样传递, 本地路径语义对等)。
-        inspected_row_count: PositiveU32::new(
-            as_u64(v, "inspected_row_count", capability)? as u32,
-        )
-        .map_err(|e| core_err(capability, e))?,
+        inspected_row_count: PositiveU32::new(as_u64(v, "inspected_row_count", capability)? as u32)
+            .map_err(|e| core_err(capability, e))?,
     })
 }
 
@@ -1357,7 +1859,10 @@ pub fn provider_top_n_rankings(
         .iter()
         .map(|v| parse_provider_top_n_record(v, capability))
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 /// 头部排行双路 (ProviderTopNPair 视角): 服务端视图合流输出 (无分路顺序
@@ -1432,7 +1937,10 @@ pub fn index_quotes(q: &QueryResult) -> Result<GatewayBatch<RealtimeIndexQuote>,
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 pub fn instrument_news(
@@ -1459,10 +1967,16 @@ pub fn instrument_news(
                 fetched_at: as_rfc3339(v, "fetched_at", capability)?,
                 content_hash: as_str(v, "content_hash", capability)?,
             };
-            Ok(SinaInstrumentNewsRecord::new(item, record_evidence(&ev, q)?))
+            Ok(SinaInstrumentNewsRecord::new(
+                item,
+                record_evidence(&ev, q)?,
+            ))
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 pub fn intraday_shape(q: &QueryResult) -> Result<GatewayBatch<IntradayShapeFact>, GatewayError> {
@@ -1476,7 +1990,8 @@ pub fn intraday_shape(q: &QueryResult) -> Result<GatewayBatch<IntradayShapeFact>
         .map(|v| {
             // shape_label 是 &'static str (视图字符串) → Box::leak 保生命周期
             // (每批 record 数有限, 形状标签来自服务端已验证值, 非用户输入)。
-            let label: &'static str = Box::leak(as_str(v, "shape_label", capability)?.into_boxed_str());
+            let label: &'static str =
+                Box::leak(as_str(v, "shape_label", capability)?.into_boxed_str());
             Ok(IntradayShapeFact {
                 date: as_str(v, "date", capability)?,
                 pre_close: as_f64(v, "pre_close", capability)?,
@@ -1490,7 +2005,10 @@ pub fn intraday_shape(q: &QueryResult) -> Result<GatewayBatch<IntradayShapeFact>
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 pub fn upper_limit_pool_review(
@@ -1512,7 +2030,10 @@ pub fn upper_limit_pool_review(
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 /// T0 证据批: 视图是 {"records": [...], "rejections": [...]} 对象 (delegate
@@ -1524,16 +2045,16 @@ pub fn t0_evidence_batch(q: &QueryResult) -> Result<MagicTdxT0Batch, GatewayErro
     let capability = "T0Evidence";
     let ev = evidence_of(q, capability)?;
     let Some(payload) = q.records.first() else {
-        return Err(err(
-            capability,
-            "records 空 (服务端无 canonical payload)",
-        ));
+        return Err(err(capability, "records 空 (服务端无 canonical payload)"));
     };
     // 合同 (M1): 视图是对象 {"records","rejections"} (非数组);
     // 防御性兼容数组包对象 (parse_records 的数组路径)。
     let value: Value = serde_json::from_slice(&payload.data)
         .map_err(|e| err(capability, format!("T0Evidence 视图非 JSON: {e}")))?;
-    let view = value.as_array().and_then(|arr| arr.first()).unwrap_or(&value);
+    let view = value
+        .as_array()
+        .and_then(|arr| arr.first())
+        .unwrap_or(&value);
     let records = view
         .get("records")
         .and_then(Value::as_array)
@@ -1544,30 +2065,29 @@ pub fn t0_evidence_batch(q: &QueryResult) -> Result<MagicTdxT0Batch, GatewayErro
             .get("quote")
             .and_then(Value::as_object)
             .ok_or_else(|| err(capability, "T0Evidence quote 非对象"))?;
-        let book = |key: &str| -> Result<[T0BookLevel; 5], GatewayError> {
-            let arr = quote_obj
-                .get(key)
-                .and_then(Value::as_array)
-                .ok_or_else(|| err(capability, format!("T0 quote.{key} 非数组")))?;
-            let mut levels: Vec<T0BookLevel> = Vec::new();
-            for item in arr {
-                let obj = item
-                    .as_object()
-                    .ok_or_else(|| err(capability, format!("T0 quote.{key} 元素非对象")))?;
-                levels.push(T0BookLevel {
-                    price: obj
-                        .get("price")
-                        .and_then(Value::as_f64)
-                        .ok_or_else(|| err(capability, format!("T0 quote.{key}[].price 非法")))?,
-                    volume: obj
-                        .get("volume")
-                        .and_then(Value::as_f64)
-                        .ok_or_else(|| err(capability, format!("T0 quote.{key}[].volume 非法")))?,
-                });
-            }
-            <[T0BookLevel; 5]>::try_from(levels)
-                .map_err(|_| err(capability, format!("T0 quote.{key} 长度必须为 5")))
-        };
+        let book =
+            |key: &str| -> Result<[T0BookLevel; 5], GatewayError> {
+                let arr = quote_obj
+                    .get(key)
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| err(capability, format!("T0 quote.{key} 非数组")))?;
+                let mut levels: Vec<T0BookLevel> = Vec::new();
+                for item in arr {
+                    let obj = item
+                        .as_object()
+                        .ok_or_else(|| err(capability, format!("T0 quote.{key} 元素非对象")))?;
+                    levels.push(T0BookLevel {
+                        price: obj.get("price").and_then(Value::as_f64).ok_or_else(|| {
+                            err(capability, format!("T0 quote.{key}[].price 非法"))
+                        })?,
+                        volume: obj.get("volume").and_then(Value::as_f64).ok_or_else(|| {
+                            err(capability, format!("T0 quote.{key}[].volume 非法"))
+                        })?,
+                    });
+                }
+                <[T0BookLevel; 5]>::try_from(levels)
+                    .map_err(|_| err(capability, format!("T0 quote.{key} 长度必须为 5")))
+            };
         let settled_daily = v
             .get("settled_daily")
             .and_then(Value::as_array)
@@ -1656,9 +2176,7 @@ pub fn t0_evidence_batch(q: &QueryResult) -> Result<MagicTdxT0Batch, GatewayErro
             let code = as_str(r, "code", capability)?;
             Ok(MagicTdxT0Rejection {
                 code,
-                reason_code: Box::leak(
-                    as_str(r, "reason_code", capability)?.into_boxed_str(),
-                ),
+                reason_code: Box::leak(as_str(r, "reason_code", capability)?.into_boxed_str()),
                 detail: as_str(r, "detail", capability)?,
                 retryable: as_bool(r, "retryable", capability)?,
             })
@@ -1807,7 +2325,10 @@ pub fn corporate_actions(
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available { records, evidence: ev })
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
 }
 
 /// outcome 错误 wire 分类 → 静态常量对。服务端只发 review.rs GatewayError 构造器
@@ -1837,9 +2358,7 @@ fn rebuild_outcome_classification(
 /// error 视图 → GatewayError::classified 重建 (capability 恒为本网关静态
 /// "OutcomeDailyBarsV2", provider 经 parse_provider 回映, 分类经
 /// rebuild_outcome_classification)。
-pub fn outcome_daily_bars(
-    q: &QueryResult,
-) -> Result<RawOutcomeFetch, OutcomeTransportFailure> {
+pub fn outcome_daily_bars(q: &QueryResult) -> Result<RawOutcomeFetch, OutcomeTransportFailure> {
     let capability = "OutcomeDailyBarsV2";
     let payload = q.records.first().ok_or_else(|| {
         OutcomeTransportFailure::new(
@@ -1847,11 +2366,12 @@ pub fn outcome_daily_bars(
             Vec::new(),
         )
     })?;
-    let parsed: Value = serde_json::from_slice(&payload.data)
-        .map_err(|e| OutcomeTransportFailure::new(err(capability, format!("视图非 JSON: {e}")), Vec::new()))?;
-    let view = parsed
-        .as_object()
-        .ok_or_else(|| OutcomeTransportFailure::new(err(capability, "outcome 视图不是对象"), Vec::new()))?;
+    let parsed: Value = serde_json::from_slice(&payload.data).map_err(|e| {
+        OutcomeTransportFailure::new(err(capability, format!("视图非 JSON: {e}")), Vec::new())
+    })?;
+    let view = parsed.as_object().ok_or_else(|| {
+        OutcomeTransportFailure::new(err(capability, "outcome 视图不是对象"), Vec::new())
+    })?;
     let attempts = serde_json::from_value::<Vec<OutcomeTransportAttemptPreimage>>(
         view.get("attempts").cloned().unwrap_or(Value::Null),
     )
@@ -1868,32 +2388,47 @@ pub fn outcome_daily_bars(
                 .and_then(Value::as_str)
                 .and_then(|s| parse_provider(s).ok());
             let (audit_outcome, reason_code) = rebuild_outcome_classification(
-                error_view.get("audit_outcome").and_then(Value::as_str).unwrap_or("unavailable"),
-                error_view.get("reason_code").and_then(Value::as_str).unwrap_or("no_verified_batch"),
+                error_view
+                    .get("audit_outcome")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unavailable"),
+                error_view
+                    .get("reason_code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("no_verified_batch"),
             );
-            let retryable = error_view.get("retryable").and_then(Value::as_bool).unwrap_or(true);
+            let retryable = error_view
+                .get("retryable")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
             let message = error_view
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("(no message)")
                 .to_string();
             return Err(OutcomeTransportFailure::new(
-                GatewayError::classified(capability, provider, audit_outcome, reason_code, retryable, message),
+                GatewayError::classified(
+                    capability,
+                    provider,
+                    audit_outcome,
+                    reason_code,
+                    retryable,
+                    message,
+                ),
                 attempts,
             ));
         }
     }
-    let batch = serde_json::from_value::<DataBatch<Bar>>(
-        view.get("batch")
-            .cloned()
-            .ok_or_else(|| OutcomeTransportFailure::new(err(capability, "outcome 视图缺 batch"), Vec::new()))?,
-    )
-    .map_err(|e| {
-        OutcomeTransportFailure::new(
-            err(capability, format!("batch 重建失败: {e}")),
-            Vec::new(),
-        )
-    })?;
+    let batch =
+        serde_json::from_value::<DataBatch<Bar>>(view.get("batch").cloned().ok_or_else(|| {
+            OutcomeTransportFailure::new(err(capability, "outcome 视图缺 batch"), Vec::new())
+        })?)
+        .map_err(|e| {
+            OutcomeTransportFailure::new(
+                err(capability, format!("batch 重建失败: {e}")),
+                Vec::new(),
+            )
+        })?;
     Ok(RawOutcomeFetch { batch, attempts })
 }
 
@@ -1917,14 +2452,91 @@ mod tests {
                 data: data.as_bytes().to_vec(),
             }],
             source: source.to_string(),
+            diagnostic_blocker: String::new(),
         }
+    }
+
+    fn external_identity_record(code: &str, listed_and_limit_fields: bool) -> CanonicalPayload {
+        let mut data = serde_json::json!({
+            "instrument": {
+                "exchange": "Shanghai",
+                "code": code,
+                "asset_class": "Equity"
+            },
+            "name": format!("TEST_CODE_name_{code}"),
+            "board": "Main",
+            "is_st": false,
+            "status": "Unavailable",
+            "source_at": "1786931999.125000000",
+            "observed_at": "1786932000.250000000",
+            "provider": "Tencent",
+            "batch_id": "TEST_CODE_external_security_batch"
+        });
+        if listed_and_limit_fields {
+            let object = data.as_object_mut().expect("fixture object");
+            object.insert("listed_on".to_string(), Value::Null);
+            object.insert(
+                "price_limit".to_string(),
+                serde_json::json!({"percent": null, "version": null}),
+            );
+        }
+        CanonicalPayload {
+            schema: "magic.market.security_metadata".to_string(),
+            schema_version: 1,
+            content_type: "application/json; charset=utf-8".to_string(),
+            data: serde_json::to_vec(&data).expect("fixture JSON"),
+        }
+    }
+
+    fn external_identity_q() -> QueryResult {
+        QueryResult {
+            admission: AdmissionState::Admitted,
+            selected_provider: "Tencent".to_string(),
+            batch_id: "TEST_CODE_external_security_batch".to_string(),
+            complete: false,
+            observed_at: "1786932000.250000000".to_string(),
+            source_at: "1786931999.125000000".to_string(),
+            records: vec![
+                external_identity_record("TEST_CODE_SECURITY_001", true),
+                external_identity_record("TEST_CODE_SECURITY_002", false),
+            ],
+            source: "grpc-mtls:TEST_CODE_market.local".to_string(),
+            diagnostic_blocker: String::new(),
+        }
+    }
+
+    fn external_identity_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-08-17T10:00:20+08:00")
+            .expect("fixed external identity clock")
+            .with_timezone(&Utc)
+    }
+
+    fn external_identity_requested() -> Vec<String> {
+        vec![
+            "TEST_CODE_SECURITY_001".to_string(),
+            "TEST_CODE_SECURITY_002".to_string(),
+        ]
+    }
+
+    fn local_identity_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-08-15T10:00:20+08:00")
+            .expect("fixed local identity clock")
+            .with_timezone(&Utc)
+    }
+
+    fn replace_external_record_field(q: &mut QueryResult, index: usize, key: &str, value: Value) {
+        let mut data: Value =
+            serde_json::from_slice(&q.records[index].data).expect("fixture record JSON");
+        data.as_object_mut()
+            .expect("fixture record object")
+            .insert(key.to_string(), value);
+        q.records[index].data = serde_json::to_vec(&data).expect("fixture record JSON");
     }
 
     #[test]
     fn provider_debug_names_roundtrip() {
         assert_eq!(parse_provider("Tdx").unwrap(), ProviderId::Tdx);
-        // 服务端 M1 兼容 fallback (handlers.rs), 语义 = Tdx。
-        assert_eq!(parse_provider("tdx-dev").unwrap(), ProviderId::Tdx);
+        assert!(parse_provider("tdx-dev").is_err());
         assert_eq!(parse_provider("Eastmoney").unwrap(), ProviderId::Eastmoney);
         assert!(parse_provider("").is_err());
         assert!(parse_provider("Mystery").is_err());
@@ -1987,6 +2599,23 @@ mod tests {
     }
 
     #[test]
+    fn common_converters_reject_partial_unadmitted_and_diagnostic_responses() {
+        let data = r#"[{"code":"TEST_CODE_QUOTE_001","name":"TEST_CODE_name","price":1.0,"change_pct":0.0,"previous_close":1.0}]"#;
+
+        let mut partial = mk_q(data, "Tdx", "tdx");
+        partial.complete = false;
+        assert!(realtime_quotes(&partial).is_err());
+
+        let mut unadmitted = mk_q(data, "Tdx", "tdx");
+        unadmitted.admission = AdmissionState::Unadmitted;
+        assert!(realtime_quotes(&unadmitted).is_err());
+
+        let mut diagnostic = mk_q(data, "Tdx", "tdx");
+        diagnostic.diagnostic_blocker = "TEST_CODE_runtime_blocker".to_string();
+        assert!(realtime_quotes(&diagnostic).is_err());
+    }
+
+    #[test]
     fn order_books_five_levels_padded() {
         // 视图 bids/asks 各 2 档 → 补足 5 档 (空档 = 无挂单)。
         let q = mk_q(
@@ -2017,6 +2646,333 @@ mod tests {
         assert!(!r.is_st);
         // 视图无 price_limit_version → 留空 (消费方按缺证据感知)。
         assert!(r.price_limit_version.is_empty());
+    }
+
+    #[test]
+    fn external_partial_security_metadata_projects_identity_only() {
+        let q = external_identity_q();
+        let batch =
+            security_identities(&external_identity_requested(), &q, external_identity_now())
+                .expect("identity subset remains complete");
+        assert!(
+            !q.complete,
+            "fixture must exercise partial metadata envelope"
+        );
+        assert_eq!(batch.records().len(), 2);
+        assert_eq!(batch.records()[0].code, "TEST_CODE_SECURITY_001");
+        assert_eq!(batch.records()[1].code, "TEST_CODE_SECURITY_002");
+        assert_eq!(batch.records()[0].provider, ProviderId::Tencent);
+        assert_eq!(
+            batch.records()[0].batch_id,
+            "TEST_CODE_external_security_batch"
+        );
+        assert_eq!(
+            batch.records()[0].source_at.timestamp_subsec_nanos(),
+            125_000_000
+        );
+        assert_eq!(
+            batch.records()[0].observed_at.timestamp_subsec_nanos(),
+            250_000_000
+        );
+        assert_eq!(batch.evidence().source, "grpc-mtls:TEST_CODE_market.local");
+        assert_eq!(
+            batch.evidence().source_at.as_deref(),
+            Some("1786931999.125000000")
+        );
+    }
+
+    #[test]
+    fn external_identity_accepts_reordered_exact_requested_set_and_returns_request_order() {
+        let mut q = external_identity_q();
+        q.records.reverse();
+        let requested = vec![
+            "TEST_CODE_SECURITY_001".to_string(),
+            "TEST_CODE_SECURITY_002".to_string(),
+        ];
+
+        let batch = security_identities(&requested, &q, external_identity_now())
+            .expect("wire order is not part of the external contract");
+
+        assert_eq!(batch.records()[0].code, "TEST_CODE_SECURITY_001");
+        assert_eq!(batch.records()[1].code, "TEST_CODE_SECURITY_002");
+    }
+
+    #[test]
+    fn external_identity_rejects_non_exact_or_duplicate_code_sets() {
+        let requested = external_identity_requested();
+
+        let mut missing = external_identity_q();
+        missing.records.pop();
+        assert!(security_identities(&requested, &missing, external_identity_now()).is_err());
+
+        let mut extra = external_identity_q();
+        extra
+            .records
+            .push(external_identity_record("TEST_CODE_SECURITY_003", true));
+        assert!(security_identities(&requested, &extra, external_identity_now()).is_err());
+
+        let mut duplicate = external_identity_q();
+        duplicate.records.push(duplicate.records[0].clone());
+        assert!(security_identities(&requested, &duplicate, external_identity_now()).is_err());
+    }
+
+    #[test]
+    fn external_identity_rejects_request_outside_unique_one_to_fifty_contract() {
+        let q = external_identity_q();
+        assert!(security_identities(&[], &q, external_identity_now()).is_err());
+
+        let duplicate = vec![
+            "TEST_CODE_SECURITY_001".to_string(),
+            "TEST_CODE_SECURITY_001".to_string(),
+        ];
+        assert!(security_identities(&duplicate, &q, external_identity_now()).is_err());
+
+        let oversized = (0..51)
+            .map(|index| format!("TEST_CODE_SECURITY_{index:03}"))
+            .collect::<Vec<_>>();
+        assert!(security_identities(&oversized, &q, external_identity_now()).is_err());
+    }
+
+    #[test]
+    fn external_identity_rejects_observation_older_than_thirty_seconds() {
+        let mut q = external_identity_q();
+        q.observed_at = "1786931900.000000000".to_string();
+        q.source_at = "1786931800.000000000".to_string();
+        for index in 0..q.records.len() {
+            replace_external_record_field(
+                &mut q,
+                index,
+                "observed_at",
+                Value::String("1786931900.000000000".to_string()),
+            );
+            replace_external_record_field(
+                &mut q,
+                index,
+                "source_at",
+                Value::String("1786931800.000000000".to_string()),
+            );
+        }
+        let requested = vec![
+            "TEST_CODE_SECURITY_001".to_string(),
+            "TEST_CODE_SECURITY_002".to_string(),
+        ];
+
+        let error = security_identities(&requested, &q, external_identity_now()).unwrap_err();
+        assert_eq!(error.reason_code(), "observation_stale");
+    }
+
+    #[test]
+    fn external_identity_rejects_source_older_than_one_trading_day() {
+        let mut q = external_identity_q();
+        q.source_at = "2026-08-13T15:00:00+08:00".to_string();
+        for index in 0..q.records.len() {
+            replace_external_record_field(
+                &mut q,
+                index,
+                "source_at",
+                Value::String("2026-08-13T15:00:00+08:00".to_string()),
+            );
+        }
+        let requested = vec![
+            "TEST_CODE_SECURITY_001".to_string(),
+            "TEST_CODE_SECURITY_002".to_string(),
+        ];
+
+        let error = security_identities(&requested, &q, external_identity_now()).unwrap_err();
+        assert_eq!(error.reason_code(), "daily_source_stale");
+    }
+
+    #[test]
+    fn external_identity_accepts_exact_freshness_boundaries() {
+        let q = external_identity_q();
+        let exactly_thirty_seconds =
+            DateTime::parse_from_rfc3339("2026-08-17T10:00:30.250000000+08:00")
+                .expect("fixed 30-second boundary")
+                .with_timezone(&Utc);
+        security_identities(&external_identity_requested(), &q, exactly_thirty_seconds)
+            .expect("exactly 30 seconds remains fresh");
+
+        let mut previous_trading_day = external_identity_q();
+        previous_trading_day.source_at = "2026-08-14T15:00:00+08:00".to_string();
+        for index in 0..previous_trading_day.records.len() {
+            replace_external_record_field(
+                &mut previous_trading_day,
+                index,
+                "source_at",
+                Value::String("2026-08-14T15:00:00+08:00".to_string()),
+            );
+        }
+        security_identities(
+            &external_identity_requested(),
+            &previous_trading_day,
+            external_identity_now(),
+        )
+        .expect("the immediately previous trading day remains fresh");
+    }
+
+    #[test]
+    fn external_identity_accepts_one_second_future_evidence_within_clock_skew() {
+        let mut q = external_identity_q();
+        q.observed_at = "2026-08-17T10:00:21+08:00".to_string();
+        q.source_at = "2026-08-17T10:00:21+08:00".to_string();
+        for index in 0..q.records.len() {
+            replace_external_record_field(
+                &mut q,
+                index,
+                "observed_at",
+                Value::String("2026-08-17T10:00:21+08:00".to_string()),
+            );
+            replace_external_record_field(
+                &mut q,
+                index,
+                "source_at",
+                Value::String("2026-08-17T10:00:21+08:00".to_string()),
+            );
+        }
+
+        security_identities(&external_identity_requested(), &q, external_identity_now())
+            .expect("one second of positive clock skew remains admissible");
+    }
+
+    #[test]
+    fn external_identity_rejects_future_evidence_time() {
+        let mut future_observation = external_identity_q();
+        future_observation.observed_at = "2026-08-17T10:00:23+08:00".to_string();
+        for index in 0..future_observation.records.len() {
+            replace_external_record_field(
+                &mut future_observation,
+                index,
+                "observed_at",
+                Value::String("2026-08-17T10:00:23+08:00".to_string()),
+            );
+        }
+        assert!(security_identities(
+            &external_identity_requested(),
+            &future_observation,
+            external_identity_now()
+        )
+        .is_err());
+
+        let mut future_source = external_identity_q();
+        future_source.source_at = "2026-08-17T10:00:23+08:00".to_string();
+        for index in 0..future_source.records.len() {
+            replace_external_record_field(
+                &mut future_source,
+                index,
+                "source_at",
+                Value::String("2026-08-17T10:00:23+08:00".to_string()),
+            );
+        }
+        assert!(security_identities(
+            &external_identity_requested(),
+            &future_source,
+            external_identity_now()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn full_security_metadata_rejects_external_partial_identity_payloads() {
+        assert!(security_metadata(&external_identity_q()).is_err());
+    }
+
+    #[test]
+    fn security_identities_accepts_existing_local_array_shape() {
+        let mut q = mk_q(
+            r#"[{"code":"TEST_CODE_LOCAL_001","name":"TEST_CODE_local_name","board":"Main","is_st":true,"listed_on":"2026-08-01","price_limit_percent":10.0,"source_at":"2026-08-15T09:35:00+08:00"}]"#,
+            "Tdx",
+            "tdx",
+        );
+        q.records[0].schema = "market.security_metadata".to_string();
+        let requested = vec!["TEST_CODE_LOCAL_001".to_string()];
+        let batch = security_identities(&requested, &q, local_identity_now())
+            .expect("existing local identity shape");
+        assert_eq!(batch.records()[0].code, "TEST_CODE_LOCAL_001");
+        assert_eq!(batch.records()[0].name, "TEST_CODE_local_name");
+        assert!(batch.records()[0].is_st);
+
+        q.complete = false;
+        assert!(
+            security_identities(&requested, &q, local_identity_now()).is_err(),
+            "partial exception is ExternalV1-only"
+        );
+    }
+
+    #[test]
+    fn security_identities_reject_unknown_mixed_schema_and_version() {
+        let mut unknown = external_identity_q();
+        for payload in &mut unknown.records {
+            payload.schema = "TEST_CODE.unknown.security_metadata".to_string();
+        }
+        assert!(security_identities(
+            &external_identity_requested(),
+            &unknown,
+            external_identity_now()
+        )
+        .is_err());
+
+        let mut mixed = external_identity_q();
+        mixed.records[1].schema = "market.security_metadata".to_string();
+        assert!(security_identities(
+            &external_identity_requested(),
+            &mixed,
+            external_identity_now()
+        )
+        .is_err());
+
+        let mut wrong_version = external_identity_q();
+        wrong_version.records[0].schema_version = 2;
+        assert!(security_identities(
+            &external_identity_requested(),
+            &wrong_version,
+            external_identity_now()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn security_identities_reject_record_evidence_conflicts_and_missing_source_time() {
+        for (field, value) in [
+            ("provider", Value::String("Sina".to_string())),
+            (
+                "batch_id",
+                Value::String("TEST_CODE_conflicting_batch".to_string()),
+            ),
+            (
+                "observed_at",
+                Value::String("1786932001.250000000".to_string()),
+            ),
+            (
+                "source_at",
+                Value::String("1786931998.125000000".to_string()),
+            ),
+        ] {
+            let mut q = external_identity_q();
+            replace_external_record_field(&mut q, 0, field, value);
+            assert!(
+                security_identities(&external_identity_requested(), &q, external_identity_now())
+                    .is_err(),
+                "record {field} conflict must fail closed"
+            );
+        }
+
+        let mut missing_record_source_at = external_identity_q();
+        replace_external_record_field(&mut missing_record_source_at, 0, "source_at", Value::Null);
+        assert!(security_identities(
+            &external_identity_requested(),
+            &missing_record_source_at,
+            external_identity_now()
+        )
+        .is_err());
+
+        let mut missing_envelope_source_at = external_identity_q();
+        missing_envelope_source_at.source_at.clear();
+        assert!(security_identities(
+            &external_identity_requested(),
+            &missing_envelope_source_at,
+            external_identity_now()
+        )
+        .is_err());
     }
 
     #[test]
@@ -2106,9 +3062,15 @@ mod tests {
         let r = &batch.records()[0];
         assert_eq!(r.code, "600519");
         assert_eq!(r.category, CorporateActionCategory::Distribution);
-        assert_eq!(r.effective_on, NaiveDate::from_ymd_opt(2026, 8, 20).unwrap());
+        assert_eq!(
+            r.effective_on,
+            NaiveDate::from_ymd_opt(2026, 8, 20).unwrap()
+        );
         assert_eq!(r.ex_on, Some(NaiveDate::from_ymd_opt(2026, 8, 19).unwrap()));
-        assert_eq!(r.payable_on, Some(NaiveDate::from_ymd_opt(2026, 8, 21).unwrap()));
+        assert_eq!(
+            r.payable_on,
+            Some(NaiveDate::from_ymd_opt(2026, 8, 21).unwrap())
+        );
         match &r.terms {
             CorporateActionTerms::Distribution { cash_per_share, .. } => {
                 assert_eq!(cash_per_share.map(|c| c.get()), Some(0.15));
@@ -2145,11 +3107,27 @@ mod tests {
             "tdx",
         );
         let failure = outcome_daily_bars(&q).unwrap_err();
-        assert_eq!(failure.error.reason_code(), "provider_unavailable", "reason_code 重建");
-        assert_eq!(failure.error.audit_outcome(), "unavailable", "audit_outcome 重建");
+        assert_eq!(
+            failure.error.reason_code(),
+            "provider_unavailable",
+            "reason_code 重建"
+        );
+        assert_eq!(
+            failure.error.audit_outcome(),
+            "unavailable",
+            "audit_outcome 重建"
+        );
         assert!(failure.error.retryable(), "retryable 重建");
-        assert_eq!(failure.error.provider(), Some(ProviderId::Tdx), "provider 回映");
-        assert_eq!(failure.error.capability(), "OutcomeDailyBarsV2", "capability 静态");
+        assert_eq!(
+            failure.error.provider(),
+            Some(ProviderId::Tdx),
+            "provider 回映"
+        );
+        assert_eq!(
+            failure.error.capability(),
+            "OutcomeDailyBarsV2",
+            "capability 静态"
+        );
         assert!(failure.attempts.is_empty(), "attempts 保真");
     }
 

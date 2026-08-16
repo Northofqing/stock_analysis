@@ -16,6 +16,7 @@ pub struct ReviewRunContext {
 }
 
 impl ReviewRunContext {
+    #[cfg(test)]
     pub fn at(observed_at: chrono::NaiveDateTime) -> Self {
         Self {
             review_date: stock_analysis::calendar::latest_completed_trading_day_at(observed_at),
@@ -1084,6 +1085,7 @@ pub fn partition_review_tasks(
     }
 }
 
+#[cfg(test)]
 pub fn account_dependency_outcomes(
     tasks: &std::collections::BTreeSet<ReviewTask>,
     observed_at: chrono::DateTime<chrono::FixedOffset>,

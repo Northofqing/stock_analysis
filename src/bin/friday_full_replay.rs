@@ -87,15 +87,13 @@ fn main() {
         code: String,
         #[diesel(sql_type = diesel::sql_types::Text)]
         name: String,
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        quantity: i64,
         #[diesel(sql_type = diesel::sql_types::Double)]
         cost_price: f64,
     }
     let db = stock_analysis::database::DatabaseManager::get();
     let mut conn = db.get_conn().expect("conn");
     let rows: Vec<PosRow> = diesel::sql_query(
-        "SELECT code, name, quantity, cost_price FROM user_position_snapshot_item ORDER BY code",
+        "SELECT code, name, cost_price FROM user_position_snapshot_item ORDER BY code",
     )
     .load::<PosRow>(&mut conn)
     .expect("position snapshot read");

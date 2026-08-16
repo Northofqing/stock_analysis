@@ -671,6 +671,7 @@ fn record_quote_provider_failure(provider: ProviderId, now: DateTime<Utc>) {
 /// - TdxSmartClient: 内部自带故障转移/自动重连 (try_next_server), new() 不失败;
 /// - TencentClient/SinaClient: new() 可能失败 (初始化配置错误), 失败时不缓存,
 ///   下轮重建重试。
+///
 /// 断线自愈由上游负责 (Tdx 切换服务器 / HTTP client 无状态), 本项目侧不感知
 /// 连接生命周期; 请求失败仍按原 fail-closed + breaker 语义处理。
 #[cfg(feature = "magic-gateway")]

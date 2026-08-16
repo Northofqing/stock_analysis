@@ -2432,7 +2432,7 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         Ok(rows)
     }
 
-    /// BR-224: 候选样本证据聚合 (SignalTracker, pred_detail='candidate-strong')。
+    /// BR-232: 候选样本证据聚合 (SignalTracker, pred_detail='candidate-strong')。
     /// 返回 (去重样本数, 命中数); 按 (pred_date, stock_code) 去重取首行,
     /// 只统计已回填 (actual_change NOT NULL) 且 pred_date <= business_date 的行。
     pub fn candidate_promotion_samples(

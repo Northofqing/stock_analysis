@@ -1,7 +1,6 @@
 //! 行情数据抓取 — 从 main.rs 提取（BR-210 evidence timestamp contract）
 
 use crate::freshness::validate_daily_snapshot_freshness;
-use crate::validate_position_freshness;
 
 pub(super) fn validate_quote_batch_codes(
     requested: &[String],

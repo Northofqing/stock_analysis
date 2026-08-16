@@ -3,6 +3,7 @@
 //! - `DATA_GATEWAY_GRPC=1` 启用 (缺省 library 模式, 出声默认 v15.x);
 //! - `GRPC_MARKET_ADDR` 服务端地址 (默认 http://127.0.0.1:18082);
 //! - `DATA_GATEWAY_GRPC_DISABLED=RealtimeQuotes,HistoricalBars` 按 op 名 opt-out。
+//!
 //! fail-closed: 服务端不可达 / 证据链缺失 → GatewayError::unavailable
 //! (retryable=true) 或 invalid_evidence, 绝不静默回退 library。
 //!
@@ -20,17 +21,20 @@ use crate::data_gateway::{
     ProviderTopNFact, RealtimeIndexQuote, RealtimeMarketQuote, ResearchReportFact,
     SinaInstrumentNewsRecord, UpperLimitRecord,
 };
+use crate::data_gateway::market_capabilities::MarketSecurityIdentity;
 use crate::data_gateway::outcome_daily_bars::{OutcomeTransportFailure, RawOutcomeFetch};
 use crate::data_provider::{consensus::ConsensusData, KlineData};
 use crate::grpc_client::client::GrpcMarketClient;
 use crate::grpc_client::envelope::QueryResult;
 use crate::grpc_client::errors::GrpcError;
-use crate::grpc_client::pb::magic::market::v1::Operation;
+use crate::grpc_client::pb::magic::market::v1::{AdmissionState, Operation};
 use chrono::NaiveDate;
 use crate::magic_compat::ProviderId;
 use crate::magic_compat::{FinancialStatement, FlowInterval, InstrumentId, MarketStatistics, NorthboundChannel, StatementKind};
 use crate::magic_compat::SecurityBar;
 use serde_json::Value;
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -76,6 +80,151 @@ fn map_query_error(op: Operation, e: &GrpcError) -> GatewayError {
             )
         }
     }
+}
+
+fn map_external_connection_error(error: GrpcError) -> GatewayError {
+    let details = error.details();
+    let provider = details
+        .provider
+        .as_deref()
+        .and_then(|value| convert::parse_provider(value).ok());
+    let fixed_non_retryable = matches!(
+        &error,
+        GrpcError::InvalidArgument { .. }
+            | GrpcError::Unauthenticated { .. }
+            | GrpcError::PermissionDenied { .. }
+            | GrpcError::Unimplemented { .. }
+            | GrpcError::FailedPrecondition { .. }
+    );
+    let default_reason = match &error {
+        GrpcError::InvalidArgument { .. } => "external_bundle_invalid",
+        GrpcError::Unauthenticated { .. } => "external_authentication_failed",
+        GrpcError::PermissionDenied { .. } => "external_permission_denied",
+        GrpcError::Unimplemented { .. } | GrpcError::FailedPrecondition { .. } => {
+            "external_contract_unavailable"
+        }
+        GrpcError::ResourceExhausted { .. }
+        | GrpcError::DeadlineExceeded { .. }
+        | GrpcError::Unavailable { .. } => "external_transport_unavailable",
+        GrpcError::Internal { .. } | GrpcError::Unknown { .. } => "external_connection_failed",
+    };
+    let reason_code = details
+        .reason_code
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(reason_code_static)
+        .unwrap_or(default_reason);
+    let retryable = if fixed_non_retryable {
+        false
+    } else {
+        details.retryable.unwrap_or(matches!(
+            &error,
+            GrpcError::ResourceExhausted { .. }
+                | GrpcError::DeadlineExceeded { .. }
+                | GrpcError::Unavailable { .. }
+        ))
+    };
+    GatewayError::classified(
+        "GrpcExternalV1",
+        provider,
+        "unavailable",
+        reason_code,
+        retryable,
+        "ExternalV1 client-bundle 连接或 readiness 检查失败",
+    )
+}
+
+fn map_external_query_error(operation: Operation, error: &GrpcError) -> GatewayError {
+    let details = error.details();
+    let provider = details
+        .provider
+        .as_deref()
+        .and_then(|value| convert::parse_provider(value).ok());
+    let fixed_non_retryable = matches!(
+        error,
+        GrpcError::InvalidArgument { .. }
+            | GrpcError::Unauthenticated { .. }
+            | GrpcError::PermissionDenied { .. }
+            | GrpcError::Unimplemented { .. }
+    );
+    let retryable = if fixed_non_retryable {
+        false
+    } else {
+        details.retryable.unwrap_or(matches!(
+            error,
+            GrpcError::ResourceExhausted { .. }
+                | GrpcError::DeadlineExceeded { .. }
+                | GrpcError::Unavailable { .. }
+        ))
+    };
+    let reason_code = details
+        .reason_code
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(reason_code_static)
+        .unwrap_or(if fixed_non_retryable {
+            "external_query_rejected"
+        } else {
+            "external_query_unavailable"
+        });
+    GatewayError::classified(
+        "GrpcExternalV1",
+        provider,
+        if fixed_non_retryable {
+            "invalid_request"
+        } else if matches!(error, GrpcError::FailedPrecondition { .. }) {
+            "partial"
+        } else {
+            "unavailable"
+        },
+        reason_code,
+        retryable,
+        format!("ExternalV1 {operation:?} 查询失败"),
+    )
+}
+
+fn require_external_capability(
+    capabilities: &[crate::grpc_client::pb::magic::market::v1::Capability],
+    operation: Operation,
+) -> Result<(), GatewayError> {
+    if capabilities.iter().any(|capability| {
+        capability.operation == operation as i32
+            && capability.repository_admission == AdmissionState::Admitted as i32
+            && capability.runtime_available
+    }) {
+        return Ok(());
+    }
+    Err(GatewayError::classified(
+        "GrpcExternalV1",
+        None,
+        "unavailable",
+        "external_capability_unavailable",
+        true,
+        format!("ExternalV1 {operation:?} 没有 ADMITTED runtime provider"),
+    ))
+}
+
+const OPENING_REQUIRED_EXTERNAL_CAPABILITIES: &[Operation] = &[
+    Operation::RealtimeQuotes,
+    Operation::OrderBooks,
+    Operation::SecurityMetadata,
+    Operation::GlobalNews,
+    Operation::Announcements,
+    Operation::MarketAnnouncements,
+    Operation::BoardConstituents,
+    Operation::BoardMemberships,
+    Operation::LimitPools,
+    Operation::InstrumentNews,
+    Operation::UpperLimitPoolReview,
+];
+
+fn require_external_opening_capabilities(
+    capabilities: &[crate::grpc_client::pb::magic::market::v1::Capability],
+) -> Result<(), GatewayError> {
+    for &operation in OPENING_REQUIRED_EXTERNAL_CAPABILITIES {
+        require_external_capability(capabilities, operation)?;
+    }
+    Ok(())
 }
 
 /// reason_code 需要 &'static (GatewayError 字段); wire 值来自服务端。
@@ -169,6 +318,10 @@ pub fn bridge_for(op: &str) -> Result<Option<Arc<GrpcSource>>, GatewayError> {
     let arc = Arc::new(GrpcSource {
         addr: std::env::var("GRPC_MARKET_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string()),
         client: AsyncMutex::new(None),
+        external_bundle: std::env::var_os("GRPC_MARKET_CLIENT_BUNDLE")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+        external_client: AsyncMutex::new(None),
     });
     *cell.lock().unwrap() = Some(arc.clone());
     Ok(Some(arc))
@@ -179,6 +332,36 @@ pub fn reset_bridge() {
     if let Some(cell) = SOURCE.get() {
         *cell.lock().unwrap() = None;
     }
+}
+
+/// BR-231 opening gate: prove the authenticated bundle with a real, read-only
+/// SecurityMetadata canary before monitor producer loops are allowed to start.
+pub async fn external_opening_readiness(
+) -> Result<GatewayBatch<MarketSecurityIdentity>, GatewayError> {
+    let source = bridge_for("SecurityMetadata")?.ok_or_else(|| {
+        GatewayError::classified(
+            "GrpcExternalV1",
+            None,
+            "unavailable",
+            "external_bridge_disabled",
+            false,
+            "开盘 readiness 要求 DATA_GATEWAY_GRPC=1 且 SecurityMetadata 未被禁用",
+        )
+    })?;
+    source.ensure_external_connected(Operation::SecurityMetadata).await?;
+    {
+        let mut guard = source.external_client.lock().await;
+        let state = guard
+            .as_mut()
+            .expect("ensure_external_connected 后必有 external client");
+        let capabilities = state
+            .client
+            .get_capabilities()
+            .await
+            .map_err(map_external_connection_error)?;
+        require_external_opening_capabilities(&capabilities)?;
+    }
+    source.security_identities_async(&["600396".to_string()]).await
 }
 
 /// M4 启动 banner (v15.x 出声原则): 数据源模式必须打印, 默认 library。
@@ -197,8 +380,15 @@ pub fn startup_banner() -> String {
     } else {
         disabled
     };
+    let external = if std::env::var_os("GRPC_MARKET_CLIENT_BUNDLE")
+        .is_some_and(|value| !value.is_empty())
+    {
+        "configured"
+    } else {
+        "unconfigured"
+    };
     format!(
-        "[data_gateway] 数据源模式 = {mode} | server = {server} | 桥接 {} ops | \
+        "[data_gateway] 数据源模式 = {mode} | server = {server} | external-v1 = {external} | 桥接 {} ops | \
          禁用 = {disabled} | 保持本地 {} ops: {} \
          (M4c: limit_pools/strong_stock_reasons 的 44/45 视图扁平不消费; monitor 复盘 \
           经 chain_batch op 61 拿完整 VisibleChainBatch, A-10 计算+DB 发布在服务端)",
@@ -259,6 +449,15 @@ pub struct GrpcSource {
     /// 连接态缓存: None = 尚未连接成功 (失败不缓存, 下次调用重试)。
     /// tokio Mutex: 跨 await 持有 (Send) — delegate JoinSet spawn 要求。
     client: AsyncMutex<Option<GrpcMarketClient>>,
+    /// Optional authenticated ExternalV1 bundle. The path is never logged.
+    external_bundle: Option<PathBuf>,
+    /// ExternalV1 has a separate channel/profile from the normalized local bridge.
+    external_client: AsyncMutex<Option<ExternalClientState>>,
+}
+
+struct ExternalClientState {
+    client: GrpcMarketClient,
+    ready_operations: HashSet<i32>,
 }
 
 impl GrpcSource {
@@ -289,6 +488,102 @@ impl GrpcSource {
         let mut guard = self.client.lock().await;
         let client = guard.as_mut().expect("ensure_connected 后必有 client");
         client.query(op, params).await.map_err(|e| map_query_error(op, &e))
+    }
+
+    async fn ensure_external_connected(&self, operation: Operation) -> Result<(), GatewayError> {
+        let mut guard = self.external_client.lock().await;
+        if let Some(state) = guard.as_mut() {
+            if state.ready_operations.contains(&(operation as i32)) {
+                return Ok(());
+            }
+            let capabilities = state
+                .client
+                .get_capabilities()
+                .await
+                .map_err(map_external_connection_error)?;
+            require_external_capability(&capabilities, operation)?;
+            state.ready_operations.insert(operation as i32);
+            return Ok(());
+        }
+        let bundle = self.external_bundle.as_ref().ok_or_else(|| {
+            GatewayError::classified(
+                "GrpcExternalV1",
+                None,
+                "unavailable",
+                "external_bundle_unconfigured",
+                false,
+                "ExternalV1 client-bundle 未配置",
+            )
+        })?;
+        if !bundle.is_absolute() {
+            return Err(GatewayError::classified(
+                "GrpcExternalV1",
+                None,
+                "invalid_request",
+                "external_bundle_invalid",
+                false,
+                "ExternalV1 client-bundle 必须是绝对路径",
+            ));
+        }
+
+        let mut client = GrpcMarketClient::connect_client_bundle(bundle)
+            .await
+            .map_err(map_external_connection_error)?;
+        let health = client
+            .get_health()
+            .await
+            .map_err(map_external_connection_error)?;
+        if !health.live || !health.ready {
+            return Err(GatewayError::classified(
+                "GrpcExternalV1",
+                None,
+                "unavailable",
+                "external_health_not_ready",
+                true,
+                "ExternalV1 health 未达到 live+ready",
+            ));
+        }
+        let capabilities = client
+            .get_capabilities()
+            .await
+            .map_err(map_external_connection_error)?;
+        require_external_capability(&capabilities, operation)?;
+        log::info!(
+            "[data_gateway] ExternalV1 已通过 health/capability gate: operation={operation:?}"
+        );
+        *guard = Some(ExternalClientState {
+            client,
+            ready_operations: HashSet::from([operation as i32]),
+        });
+        Ok(())
+    }
+
+    async fn query_external_op(
+        &self,
+        operation: Operation,
+        params: Value,
+    ) -> Result<QueryResult, GatewayError> {
+        crate::grpc_client::external_v1::build_external_query_request(operation, params.clone())
+            .map_err(|_| {
+                GatewayError::classified(
+                    "GrpcExternalV1",
+                    None,
+                    "invalid_request",
+                    "external_contract_rejected",
+                    false,
+                    "ExternalV1 operation 或参数未在交付合同中冻结",
+                )
+            })?;
+        self.ensure_external_connected(operation).await?;
+        let mut guard = self.external_client.lock().await;
+        let state = guard
+            .as_mut()
+            .expect("ensure_external_connected 后必有 external client");
+        state
+            .client
+            .query(operation, params)
+            .await
+            .map_err(|error| map_external_query_error(operation, &error))
     }
 
     // ---------- 6 个首批 op (M2) ----------
@@ -376,6 +671,21 @@ impl GrpcSource {
         codes: &[String],
     ) -> Result<GatewayBatch<MarketSecurityMetadata>, GatewayError> {
         block_on(self.security_metadata_async(codes))
+    }
+
+    /// BR-231: the narrow identity projection is the only metadata consumer
+    /// permitted to use the authenticated ExternalV1 partial contract.
+    pub async fn security_identities_async(
+        &self,
+        codes: &[String],
+    ) -> Result<GatewayBatch<MarketSecurityIdentity>, GatewayError> {
+        let result = self
+            .query_external_op(
+                Operation::SecurityMetadata,
+                serde_json::json!({ "codes": codes }),
+            )
+            .await?;
+        convert::security_identities(codes, &result, chrono::Utc::now())
     }
 
     pub async fn daily_bars_async(
@@ -544,6 +854,14 @@ impl GrpcSource {
         convert::board_constituents(&q)
     }
 
+    /// 同步包装：供已经位于 blocking 调用链的板块归属消费者复用同一桥。
+    pub fn board_constituents(
+        &self,
+        code: &str,
+    ) -> Result<GatewayBatch<BoardMembershipRecord>, GatewayError> {
+        block_on(self.board_constituents_async(code))
+    }
+
     /// 板块资金流: kind + limit (与本地 BoardDataGateway::day1_flows 对齐)。
     pub async fn board_flows_async(
         &self,
@@ -642,12 +960,6 @@ impl GrpcSource {
             StatementKind::Balance => "balance",
             StatementKind::Income => "income",
             StatementKind::CashFlow => "cash_flow",
-            other => {
-                return Err(GatewayError::invalid_request(
-                    "GrpcBridge",
-                    format!("财务报告 kind 不支持走桥: {other:?}"),
-                ))
-            }
         };
         let q = self
             .query_op(
@@ -1069,6 +1381,61 @@ mod tests {
         assert!(g.retryable());
     }
 
+    #[test]
+    fn br231_external_errors_preserve_remote_retry_evidence() {
+        let detail = ErrorDetail {
+            provider: Some("Sina".to_string()),
+            reason_code: Some("TEST_CODE_upstream_retry".to_string()),
+            retryable: Some(true),
+            ..Default::default()
+        };
+        let query = map_external_query_error(
+            Operation::SecurityMetadata,
+            &GrpcError::Internal {
+                details: detail.clone(),
+            },
+        );
+        assert_eq!(query.provider(), Some(ProviderId::Sina));
+        assert_eq!(query.reason_code(), "TEST_CODE_upstream_retry");
+        assert!(query.retryable());
+
+        let connection = map_external_connection_error(GrpcError::Internal { details: detail });
+        assert_eq!(connection.provider(), Some(ProviderId::Sina));
+        assert_eq!(connection.reason_code(), "TEST_CODE_upstream_retry");
+        assert!(connection.retryable());
+    }
+
+    #[test]
+    fn br231_opening_readiness_requires_every_admitted_runtime_capability() {
+        let admitted = |operation: Operation| pb::Capability {
+            operation: operation as i32,
+            repository_admission: AdmissionState::Admitted as i32,
+            runtime_available: true,
+            provider: "TEST_CODE_provider".to_string(),
+            exact_scope: "TEST_CODE_scope".to_string(),
+            blocker: String::new(),
+            diagnostic_available: false,
+        };
+        let mut capabilities = OPENING_REQUIRED_EXTERNAL_CAPABILITIES
+            .iter()
+            .copied()
+            .map(admitted)
+            .collect::<Vec<_>>();
+        require_external_opening_capabilities(&capabilities)
+            .expect("the complete admitted runtime set is opening-ready");
+
+        capabilities.retain(|row| row.operation != Operation::InstrumentNews as i32);
+        let error = require_external_opening_capabilities(&capabilities)
+            .expect_err("one missing opening capability must fail closed");
+        assert_eq!(error.reason_code(), "external_capability_unavailable");
+
+        let mut diagnostic_only = admitted(Operation::InstrumentNews);
+        diagnostic_only.repository_admission = AdmissionState::Unadmitted as i32;
+        diagnostic_only.diagnostic_available = true;
+        capabilities.push(diagnostic_only);
+        assert!(require_external_opening_capabilities(&capabilities).is_err());
+    }
+
     /// D2 wire round-trip: proto ErrorDetail → GrpcError::details() → map_query_error
     /// 全链路保真 (与 grpc_server::handlers.rs Fetch 分支编码端对应)。
     #[test]
@@ -1182,10 +1549,91 @@ mod tests {
     }
 
     #[test]
+    fn br231_external_bundle_is_captured_but_never_printed() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let secret_marker = "/TEST_CODE_private_bundle_marker";
+        std::env::set_var("DATA_GATEWAY_GRPC", "1");
+        std::env::set_var("GRPC_MARKET_CLIENT_BUNDLE", secret_marker);
+        reset_bridge();
+
+        let bridge = bridge_for("SecurityMetadata")
+            .expect("bridge config")
+            .expect("bridge enabled");
+        assert_eq!(
+            bridge.external_bundle.as_deref(),
+            Some(std::path::Path::new(secret_marker))
+        );
+        let banner = startup_banner();
+        assert!(banner.contains("external-v1 = configured"), "{banner}");
+        assert!(!banner.contains(secret_marker), "bundle path must stay secret-safe: {banner}");
+
+        std::env::remove_var("DATA_GATEWAY_GRPC");
+        std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
+        reset_bridge();
+    }
+
+    #[test]
+    fn br231_security_identity_requires_external_bundle() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("DATA_GATEWAY_GRPC", "1");
+        std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
+        reset_bridge();
+
+        let bridge = bridge_for("SecurityMetadata")
+            .expect("bridge config")
+            .expect("bridge enabled");
+        let error = block_on(bridge.ensure_external_connected(Operation::SecurityMetadata))
+            .expect_err("identity must not fall back to the local bridge contract");
+        assert_eq!(error.capability(), "GrpcExternalV1");
+        assert_eq!(error.reason_code(), "external_bundle_unconfigured");
+        assert!(!error.retryable());
+
+        std::env::remove_var("DATA_GATEWAY_GRPC");
+        reset_bridge();
+    }
+
+    #[test]
+    fn br231_opening_readiness_requires_external_bundle() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("DATA_GATEWAY_GRPC", "1");
+        std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
+        reset_bridge();
+
+        let error = block_on(external_opening_readiness())
+            .expect_err("opening readiness must fail before producer startup");
+        assert_eq!(error.capability(), "GrpcExternalV1");
+        assert_eq!(error.reason_code(), "external_bundle_unconfigured");
+
+        std::env::remove_var("DATA_GATEWAY_GRPC");
+        reset_bridge();
+    }
+
+    #[test]
+    fn br231_undelivered_external_contract_is_rejected_before_connection() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("DATA_GATEWAY_GRPC", "1");
+        std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
+        reset_bridge();
+
+        let bridge = bridge_for("BoardConstituents")
+            .expect("bridge config")
+            .expect("bridge enabled");
+        let error = block_on(
+            bridge.query_external_op(Operation::BoardConstituents, serde_json::json!({})),
+        )
+        .expect_err("undelivered contract must be rejected before I/O");
+        assert_eq!(error.reason_code(), "external_contract_rejected");
+        assert!(!error.retryable());
+
+        std::env::remove_var("DATA_GATEWAY_GRPC");
+        reset_bridge();
+    }
+
+    #[test]
     fn hooked_ops_disjoint_from_keep_local() {
         for op in HOOKED_OPS {
             assert!(
-                !KEEP_LOCAL_OPS.contains(&op),
+                !KEEP_LOCAL_OPS.contains(op),
                 "{op} 同时出现在 HOOKED_OPS 和 KEEP_LOCAL_OPS — 必须只在一处"
             );
         }

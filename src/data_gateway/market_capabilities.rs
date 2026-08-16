@@ -465,13 +465,43 @@ impl MarketCapabilitiesGateway {
         &self,
         codes: &[String],
     ) -> Result<GatewayBatch<MarketSecurityIdentity>, GatewayError> {
-        // P4 M5: 无 gRPC 桥 op + no-feature 构建不携带 library transport →
-        // 显式失败 (fail-closed), 绝不静默回退。
+        let storage_codes = codes.to_vec();
+        let request_hash = acquisition_request_hash(
+            SECURITY_IDENTITY_CAPABILITY,
+            &storage_codes.join(","),
+        );
+        // BR-231: identity is a narrow projection of the authenticated
+        // ExternalV1 SecurityMetadata contract. A configured bridge failure is
+        // audited and returned; it never falls back to a different provider.
+        match super::grpc_source::bridge_for("SecurityMetadata") {
+            Ok(Some(bridge)) => {
+                let result = bridge.security_identities_async(&storage_codes).await;
+                let audit_provider = match &result {
+                    Ok(batch) => batch.evidence().provider,
+                    Err(error) => error.provider().unwrap_or(ProviderId::Custom),
+                };
+                return audit_gateway_result(
+                    SECURITY_IDENTITY_CAPABILITY,
+                    audit_provider,
+                    &request_hash,
+                    result,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let audit_provider = error.provider().unwrap_or(ProviderId::Custom);
+                return audit_gateway_result(
+                    SECURITY_IDENTITY_CAPABILITY,
+                    audit_provider,
+                    &request_hash,
+                    Err(error),
+                );
+            }
+        }
+        // no-feature builds have no library transport. Without the bridge,
+        // fail explicitly rather than fabricating an identity.
         #[cfg(not(feature = "magic-gateway"))]
         {
-            // 参数仅被 library transport (feature 模式) 消费; 显式引用以消除
-            // no-feature 构建的 unused 警告, 行为不变 (fail-closed)。
-            let _ = codes;
             return Err(GatewayError::classified(
                 SECURITY_IDENTITY_CAPABILITY,
                 Some(ProviderId::Tencent),
@@ -483,11 +513,6 @@ impl MarketCapabilitiesGateway {
         }
         #[cfg(feature = "magic-gateway")]
         {
-            let storage_codes = codes.to_vec();
-            let request_hash = acquisition_request_hash(
-                SECURITY_IDENTITY_CAPABILITY,
-                &storage_codes.join(","),
-            );
             let worker_hash = request_hash.clone();
             let joined = tokio::task::spawn_blocking(move || {
                 let result = build_instruments(&storage_codes, SECURITY_IDENTITY_CAPABILITY)

@@ -1,9 +1,9 @@
 //! QueryRequest/QueryResponse 信封 (合同 §5/§6)。
 //! request_id: 调用方生成的非空唯一请求 ID; 同一业务重试保留原 ID。
+use crate::grpc_client::pb::magic::market::v1::Operation;
 use crate::grpc_client::pb::magic::market::v1::{
     AdmissionState, CanonicalPayload, QueryRequest, QueryResponse, RequestContext,
 };
-use crate::grpc_client::pb::magic::market::v1::Operation;
 use crate::grpc_contract::schema::schema_for;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -34,8 +34,7 @@ pub fn build_query_request(
     payload: serde_json::Value,
 ) -> Result<QueryRequest, EnvelopeError> {
     let schema = schema_for(op).ok_or(EnvelopeError::SchemaNotFrozen)?;
-    let data = serde_json::to_vec(&payload)
-        .map_err(|e| EnvelopeError::Serialize(e.to_string()))?;
+    let data = serde_json::to_vec(&payload).map_err(|e| EnvelopeError::Serialize(e.to_string()))?;
     Ok(QueryRequest {
         context: Some(RequestContext {
             protocol_version: PROTOCOL_VERSION,
@@ -43,9 +42,10 @@ pub fn build_query_request(
         }),
         // 合同 §5: 普通调用保持 preferred_provider 为空, 由服务端 Composition 选择。
         preferred_provider: String::new(),
-        // 合同字段 4: allow_unadmitted 只显式许可诊断 handler, 不改变准入;
-        // 用户指令 2026-08-16: 客户端一律显式许可 (诊断 handler 全量可用)。
-        allow_unadmitted: true,
+        // BR-231: production gateway requests never opt into diagnostic data.
+        // A separately named operator probe may build an explicit diagnostic
+        // request, but the shared production constructor stays fail-closed.
+        allow_unadmitted: false,
         payload: Some(CanonicalPayload {
             schema: schema.schema_name.to_string(),
             schema_version: schema.schema_version,
@@ -66,6 +66,8 @@ pub struct QueryResult {
     pub records: Vec<CanonicalPayload>,
     /// P4 M2: 证据链 source (服务端 Fetched.source; 旧 op 空串 = 缺证据)。
     pub source: String,
+    /// 非空表示服务端执行的是诊断读取；生产消费者即使收到 records 也必须拒绝。
+    pub diagnostic_blocker: String,
 }
 
 pub fn parse_query_response(
@@ -83,8 +85,7 @@ pub fn parse_query_response(
     }
     Ok(QueryResult {
         // prost 0.14 from_i32 deprecated → try_from (语义等价, 未知值回落 Unspecified)。
-        admission: AdmissionState::try_from(resp.admission)
-            .unwrap_or(AdmissionState::Unspecified),
+        admission: AdmissionState::try_from(resp.admission).unwrap_or(AdmissionState::Unspecified),
         selected_provider: resp.selected_provider,
         batch_id: resp.batch_id,
         complete: resp.complete,
@@ -92,6 +93,7 @@ pub fn parse_query_response(
         source_at: resp.source_at,
         records: resp.records,
         source: resp.source,
+        diagnostic_blocker: resp.diagnostic_blocker,
     })
 }
 
@@ -118,6 +120,10 @@ mod tests {
         assert_eq!(ctx.protocol_version, 1);
         assert!(!ctx.request_id.is_empty());
         assert_eq!(req.preferred_provider, "");
+        assert!(
+            !req.allow_unadmitted,
+            "BR-231 production requests must not opt into diagnostic data"
+        );
         let payload = req.payload.unwrap();
         assert_eq!(payload.schema, "market.realtime_quotes");
         assert_eq!(payload.schema_version, 1);
@@ -147,13 +153,14 @@ mod tests {
             source_at: "t2".to_string(),
             records: vec![],
             source: "tdx".to_string(),
-            diagnostic_blocker: String::new(),
+            diagnostic_blocker: "TEST_CODE_diagnostic_blocker".to_string(),
         };
         let result = parse_query_response("r-1", resp).unwrap();
         assert_eq!(result.admission, AdmissionState::Admitted);
         assert!(result.complete);
         assert_eq!(result.selected_provider, "tdx-dev");
         assert_eq!(result.source, "tdx");
+        assert_eq!(result.diagnostic_blocker, "TEST_CODE_diagnostic_blocker");
     }
 
     #[test]
@@ -190,6 +197,9 @@ mod tests {
             source: String::new(),
             diagnostic_blocker: String::new(),
         };
-        assert_eq!(parse_query_response("r-1", resp).unwrap_err(), EnvelopeError::MissingRequestId);
+        assert_eq!(
+            parse_query_response("r-1", resp).unwrap_err(),
+            EnvelopeError::MissingRequestId
+        );
     }
 }

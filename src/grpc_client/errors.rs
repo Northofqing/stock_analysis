@@ -66,19 +66,37 @@ impl From<tonic::Status> for GrpcError {
         // 用 prost::Message::decode 直接解码; 解码失败则忽略, 用 code 分支即可。
         // 空 details → 纯默认 (prost 会把空 bytes 解码为全默认值, 语义上等于没有 ErrorDetail)。
         let detail = if status.details().is_empty() {
-            ErrorDetail { code: status.code().to_string(), ..Default::default() }
+            ErrorDetail {
+                code: status.code().to_string(),
+                ..Default::default()
+            }
         } else {
             crate::grpc_client::pb::magic::market::v1::ErrorDetail::decode(status.details())
                 .ok()
                 .map(|d| ErrorDetail {
                     code: status.code().to_string(),
-                    request_id: if d.request_id.is_empty() { None } else { Some(d.request_id.clone()) },
+                    request_id: if d.request_id.is_empty() {
+                        None
+                    } else {
+                        Some(d.request_id.clone())
+                    },
                     operation: Some(d.operation),
-                    provider: if d.provider.is_empty() { None } else { Some(d.provider.clone()) },
-                    reason_code: if d.reason_code.is_empty() { None } else { Some(d.reason_code.clone()) },
+                    provider: if d.provider.is_empty() {
+                        None
+                    } else {
+                        Some(d.provider.clone())
+                    },
+                    reason_code: if d.reason_code.is_empty() {
+                        None
+                    } else {
+                        Some(d.reason_code.clone())
+                    },
                     retryable: Some(d.retryable),
                 })
-                .unwrap_or_else(|| ErrorDetail { code: status.code().to_string(), ..Default::default() })
+                .unwrap_or_else(|| ErrorDetail {
+                    code: status.code().to_string(),
+                    ..Default::default()
+                })
         };
 
         // D2: 每个变体都携带 detail — 即便非 Fetch 错误码也保留 request_id 供日志/审计。
@@ -101,7 +119,10 @@ impl From<crate::grpc_client::auth::AuthError> for GrpcError {
     fn from(_: crate::grpc_client::auth::AuthError) -> Self {
         // token 含非法字符无法注入 metadata → 请求根本到不了服务端, 语义上等同认证失败。
         GrpcError::Unauthenticated {
-            details: ErrorDetail { code: "unauthenticated".to_string(), ..Default::default() },
+            details: ErrorDetail {
+                code: "unauthenticated".to_string(),
+                ..Default::default()
+            },
         }
     }
 }
@@ -111,7 +132,10 @@ impl From<crate::grpc_client::envelope::EnvelopeError> for GrpcError {
         // 信封构造失败是客户端本地错误 (序列化失败/未冻结 schema), 非服务端状态。
         // 映射 Unknown + code=envelope, 与响应侧信封校验失败同码 (见 client.rs query)。
         GrpcError::Unknown {
-            details: ErrorDetail { code: "envelope".to_string(), ..Default::default() },
+            details: ErrorDetail {
+                code: "envelope".to_string(),
+                ..Default::default()
+            },
         }
     }
 }
@@ -122,23 +146,79 @@ mod tests {
     use tonic::Code;
 
     fn detail_for(code: Code) -> ErrorDetail {
-        ErrorDetail { code: code.to_string(), ..Default::default() }
+        ErrorDetail {
+            code: code.to_string(),
+            ..Default::default()
+        }
     }
 
     #[test]
     fn maps_all_contract_codes() {
         let cases = [
-            (Code::InvalidArgument, GrpcError::InvalidArgument { details: detail_for(Code::InvalidArgument) }),
-            (Code::Unauthenticated, GrpcError::Unauthenticated { details: detail_for(Code::Unauthenticated) }),
-            (Code::PermissionDenied, GrpcError::PermissionDenied { details: detail_for(Code::PermissionDenied) }),
-            (Code::Unimplemented, GrpcError::Unimplemented { details: detail_for(Code::Unimplemented) }),
-            (Code::ResourceExhausted, GrpcError::ResourceExhausted { details: detail_for(Code::ResourceExhausted) }),
-            (Code::DeadlineExceeded, GrpcError::DeadlineExceeded { details: detail_for(Code::DeadlineExceeded) }),
-            (Code::Unavailable, GrpcError::Unavailable { details: detail_for(Code::Unavailable) }),
-            (Code::FailedPrecondition, GrpcError::FailedPrecondition { details: detail_for(Code::FailedPrecondition) }),
-            (Code::Internal, GrpcError::Internal { details: detail_for(Code::Internal) }),
+            (
+                Code::InvalidArgument,
+                GrpcError::InvalidArgument {
+                    details: detail_for(Code::InvalidArgument),
+                },
+            ),
+            (
+                Code::Unauthenticated,
+                GrpcError::Unauthenticated {
+                    details: detail_for(Code::Unauthenticated),
+                },
+            ),
+            (
+                Code::PermissionDenied,
+                GrpcError::PermissionDenied {
+                    details: detail_for(Code::PermissionDenied),
+                },
+            ),
+            (
+                Code::Unimplemented,
+                GrpcError::Unimplemented {
+                    details: detail_for(Code::Unimplemented),
+                },
+            ),
+            (
+                Code::ResourceExhausted,
+                GrpcError::ResourceExhausted {
+                    details: detail_for(Code::ResourceExhausted),
+                },
+            ),
+            (
+                Code::DeadlineExceeded,
+                GrpcError::DeadlineExceeded {
+                    details: detail_for(Code::DeadlineExceeded),
+                },
+            ),
+            (
+                Code::Unavailable,
+                GrpcError::Unavailable {
+                    details: detail_for(Code::Unavailable),
+                },
+            ),
+            (
+                Code::FailedPrecondition,
+                GrpcError::FailedPrecondition {
+                    details: detail_for(Code::FailedPrecondition),
+                },
+            ),
+            (
+                Code::Internal,
+                GrpcError::Internal {
+                    details: detail_for(Code::Internal),
+                },
+            ),
             // tonic 0.14: Code::Unknown.to_string() = "Unknown error" (grpc 规范英文描述)。
-            (Code::Unknown, GrpcError::Unknown { details: ErrorDetail { code: "Unknown error".into(), ..Default::default() } }),
+            (
+                Code::Unknown,
+                GrpcError::Unknown {
+                    details: ErrorDetail {
+                        code: "Unknown error".into(),
+                        ..Default::default()
+                    },
+                },
+            ),
         ];
         for (code, expected) in cases {
             let status = tonic::Status::new(code, "msg");
@@ -163,13 +243,20 @@ mod tests {
         let err = GrpcError::from(status);
         assert!(matches!(err, GrpcError::Internal { .. }));
         assert_eq!(err.details().provider.as_deref(), Some("Tdx"));
-        assert_eq!(err.details().reason_code.as_deref(), Some("no_verified_batch"));
+        assert_eq!(
+            err.details().reason_code.as_deref(),
+            Some("no_verified_batch")
+        );
         assert_eq!(err.details().retryable, Some(true));
         assert_eq!(err.details().request_id.as_deref(), Some("req-42"));
 
         // Unavailable 也带 detail (非 Fetch 路径同样保留 request_id 供审计)。
         detail.request_id = "req-43".to_string();
-        let status = tonic::Status::with_details(Code::Unavailable, "连接被拒绝", detail.encode_to_vec().into());
+        let status = tonic::Status::with_details(
+            Code::Unavailable,
+            "连接被拒绝",
+            detail.encode_to_vec().into(),
+        );
         let err = GrpcError::from(status);
         assert!(matches!(err, GrpcError::Unavailable { .. }));
         assert_eq!(err.details().request_id.as_deref(), Some("req-43"));
@@ -181,7 +268,9 @@ mod tests {
         let status = tonic::Status::with_details(
             Code::Unimplemented,
             "未实现",
-            crate::grpc_client::pb::magic::market::v1::ErrorDetail::default().encode_to_vec().into(),
+            crate::grpc_client::pb::magic::market::v1::ErrorDetail::default()
+                .encode_to_vec()
+                .into(),
         );
         let err = GrpcError::from(status);
         assert!(matches!(err, GrpcError::Unimplemented { .. }));

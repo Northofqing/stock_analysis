@@ -13,7 +13,7 @@ use crate::grpc_client::pb::magic::market::v1::{
     HealthResponse, ListenerStatusRequest, ListenerStatusResponse,
 };
 use crate::grpc_contract::ops::implemented_operations;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::Mutex;
 use tonic::{Request, Response, Status};
 
@@ -92,7 +92,7 @@ pub async fn start(
     let hub = event_svc.hub.clone();
 
     let handle = tokio::spawn(async move {
-        let health_svc = HealthService { state: state.clone() };
+        let health_svc = HealthService;
         let data_svc = handlers::DataService::new(state.clone(), config.fixture_mode);
         tonic::transport::Server::builder()
             .add_service(SystemServiceServer::new(health_svc))
@@ -105,9 +105,7 @@ pub async fn start(
     Ok((bound, handle, hub))
 }
 
-struct HealthService {
-    state: std::sync::Arc<ServerState>,
-}
+struct HealthService;
 
 #[tonic::async_trait]
 impl SystemService for HealthService {

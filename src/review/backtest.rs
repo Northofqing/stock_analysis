@@ -14,12 +14,12 @@
 //!
 //! 纯计算函数与网络/DB 薄壳分离: 单测不依赖网络。
 
-use chrono::{Duration, NaiveDate, NaiveDateTime, Utc};
 use crate::magic_compat::SecurityBar;
+use chrono::{Duration, NaiveDate, NaiveDateTime};
 
 use crate::data_gateway::historical_bars::HistoricalBarsGateway;
 use crate::data_provider::{AdjustType, KlineData};
-use crate::strategy::boll_macd::{BollMacdAction, BollMacdSignal, detect_boll_macd_signal};
+use crate::strategy::boll_macd::{detect_boll_macd_signal, BollMacdAction, BollMacdSignal};
 
 /// 一组信号的统计结果 (单窗口)。reason 为信号来源, window_bars 为
 /// forward return 窗口 (4 根 = 1h, 16 根 = 1 交易日)。
@@ -121,12 +121,7 @@ pub fn locate_signal_bar(bars: &[SecurityBar], signal_utc: NaiveDateTime) -> Opt
 
 /// 计算 forward return: (bars[idx+n].close - base_price) / base_price。
 /// idx+n 越界或 base_price <= 0 返回 None。
-pub fn forward_return(
-    bars: &[SecurityBar],
-    idx: usize,
-    n: usize,
-    base_price: f64,
-) -> Option<f64> {
+pub fn forward_return(bars: &[SecurityBar], idx: usize, n: usize, base_price: f64) -> Option<f64> {
     if base_price <= 0.0 {
         return None;
     }
@@ -211,7 +206,7 @@ pub fn bars_to_desc_kline(bars: &[SecurityBar]) -> Vec<KlineData> {
             }
         })
         .collect();
-    out.sort_by(|a, b| b.date.cmp(&a.date));
+    out.sort_by_key(|bar| std::cmp::Reverse(bar.date));
     out
 }
 
@@ -360,7 +355,8 @@ pub fn backtest_virtual_signals(days: usize) -> Result<R12BacktestResult, String
             unaligned += 1;
             continue;
         };
-        let is_sell = entry.virtual_reason.starts_with(SELL_REASON_PREFIX) || entry.direction == "sell";
+        let is_sell =
+            entry.virtual_reason.starts_with(SELL_REASON_PREFIX) || entry.direction == "sell";
         for (wi, window) in WINDOWS_BARS.iter().enumerate() {
             if let Some(ret) = forward_return(bars, idx, *window, entry.price) {
                 if is_sell {
@@ -395,9 +391,11 @@ pub fn backtest_virtual_signals(days: usize) -> Result<R12BacktestResult, String
         if sell_rets[wi].is_empty() {
             continue;
         }
-        result
-            .virtual_sell
-            .push(aggregate_group("虚拟仓卖出(四大铁律)", *window, &sell_rets[wi]));
+        result.virtual_sell.push(aggregate_group(
+            "虚拟仓卖出(四大铁律)",
+            *window,
+            &sell_rets[wi],
+        ));
     }
     Ok(result)
 }
@@ -664,7 +662,7 @@ mod tests {
         let mut bars = sample_bars();
         bars[5].close = 11.0; // 10:45 bar
         bars[9].close = 12.5; // 13:00 bar
-        // idx 5, n=4 → bars[9].close = 12.5, base 11.0 → +13.64%
+                              // idx 5, n=4 → bars[9].close = 12.5, base 11.0 → +13.64%
         let ret = forward_return(&bars, 5, 4, 11.0).expect("ret");
         assert!((ret - 0.13636).abs() < 0.001);
         // 越界
@@ -683,7 +681,7 @@ mod tests {
         assert_eq!(g.mfe, Some(0.05));
         assert_eq!(g.mae, Some(-0.02));
         assert!(g.is_under_sampled());
-        let g2 = aggregate_group("Breakout", 16, &vec![0.1; 10]);
+        let g2 = aggregate_group("Breakout", 16, &[0.1; 10]);
         assert!(!g2.is_under_sampled());
         let empty = aggregate_group("x", 4, &[]);
         assert_eq!(empty.count, 0);
@@ -780,8 +778,14 @@ mod tests {
             .and_hms_opt(10, 0, 0)
             .unwrap();
         assert!(is_broken_fill(&d15, 0.07), "窗口内低价必须排除");
-        assert!(is_broken_fill(&d15, 10.0), "窗口内正常价也须排除 (沪电真实 121 元)");
-        assert!(is_broken_fill(&d15, 1680.0), "窗口内放大价也须排除 (Momentum)");
+        assert!(
+            is_broken_fill(&d15, 10.0),
+            "窗口内正常价也须排除 (沪电真实 121 元)"
+        );
+        assert!(
+            is_broken_fill(&d15, 1680.0),
+            "窗口内放大价也须排除 (Momentum)"
+        );
         // 窗口外: 仅 <1.0 排除, 低价股 (如 3 元) 保留
         let d20 = NaiveDate::from_ymd_opt(2026, 7, 20)
             .unwrap()

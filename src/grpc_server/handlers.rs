@@ -12,13 +12,12 @@ use tonic::{Request, Response, Status};
 pub use crate::grpc_client::pb::magic::market::v1::market_data_service_server;
 
 pub struct DataService {
-    state: Arc<ServerState>,
     fixture_mode: bool,
 }
 
 impl DataService {
-    pub fn new(state: Arc<ServerState>, fixture_mode: bool) -> Self {
-        Self { state, fixture_mode }
+    pub fn new(_state: Arc<ServerState>, fixture_mode: bool) -> Self {
+        Self { fixture_mode }
     }
 
     /// 统一查询入口: 校验 → 取数 → 包装 QueryResponse。
@@ -107,32 +106,51 @@ impl DataService {
                     )
                 }
             })?;
-        Ok(Response::new(QueryResponse {
+        response_from_fetched(
             request_id,
-            operation: op as i32,
-            admission: AdmissionState::Admitted as i32,
-            // M1: 新 14 op 回填真值 (evidence.provider); 既有 24 op 走 pack()
-            // 证据留空 → 保留 "tdx-dev" 兼容 (M2 全量升级后移除)。
-            selected_provider: if result.provider.is_empty() {
-                "tdx-dev".to_string()
-            } else {
-                result.provider
-            },
-            batch_id: format!("{}-{}", frozen.schema_name, crate::grpc_client::envelope::new_request_id()),
-            complete: true,
-            observed_at: chrono::Local::now().to_rfc3339(),
-            source_at: result.source_at,
-            source: result.source,
-            // 上游合同字段 10: 本地 server 无诊断 handler, 永远不产生诊断阻塞。
-            diagnostic_blocker: String::new(),
-            records: vec![CanonicalPayload {
-                schema: frozen.schema_name.to_string(),
-                schema_version: frozen.schema_version,
-                content_type: "application/json; charset=utf-8".to_string(),
-                data: result.data,
-            }],
-        }))
+            op,
+            frozen.schema_name,
+            frozen.schema_version,
+            result,
+        )
+        .map(Response::new)
     }
+}
+
+fn response_from_fetched(
+    request_id: String,
+    op: Operation,
+    schema: &str,
+    schema_version: u32,
+    result: delegate::Fetched,
+) -> Result<QueryResponse, Status> {
+    if result.provider.trim().is_empty()
+        || result.source.trim().is_empty()
+        || result.batch_id.trim().is_empty()
+    {
+        return Err(Status::internal(
+            "delegate 证据身份缺失: provider/source/batch_id 必须完整",
+        ));
+    }
+    Ok(QueryResponse {
+        request_id,
+        operation: op as i32,
+        admission: AdmissionState::Admitted as i32,
+        selected_provider: result.provider,
+        batch_id: result.batch_id,
+        complete: true,
+        observed_at: chrono::Local::now().to_rfc3339(),
+        source_at: result.source_at,
+        source: result.source,
+        // 上游合同字段 10: 本地 server 无诊断 handler, 永远不产生诊断阻塞。
+        diagnostic_blocker: String::new(),
+        records: vec![CanonicalPayload {
+            schema: schema.to_string(),
+            schema_version,
+            content_type: "application/json; charset=utf-8".to_string(),
+            data: result.data,
+        }],
+    })
 }
 
 // 54 个 RPC 的统一实现 (全部委托 serve_query; 未实现 op 返回 UNIMPLEMENTED)。
@@ -215,3 +233,57 @@ impl_market_data_service!(
     upper_limit_pool_review => UpperLimitPoolReview,
     chain_batch => ChainBatch,
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_preserves_delegate_batch_identity() {
+        let response = response_from_fetched(
+            "TEST_CODE_REQUEST_1".to_string(),
+            Operation::BoardConstituents,
+            "board.constituents",
+            1,
+            delegate::Fetched {
+                data: br#"[{"instrument_code":"TEST_CODE_600519"}]"#.to_vec(),
+                source_at: "2026-08-17T09:20:00+08:00".to_string(),
+                provider: "Tdx".to_string(),
+                source: "tdx".to_string(),
+                batch_id: "TEST_CODE_MEMBERSHIP_BATCH_1".to_string(),
+            },
+        )
+        .expect("source-backed response");
+
+        assert_eq!(response.selected_provider, "Tdx");
+        assert_eq!(response.source, "tdx");
+        assert_eq!(response.batch_id, "TEST_CODE_MEMBERSHIP_BATCH_1");
+    }
+
+    #[test]
+    fn response_rejects_missing_delegate_batch_identity() {
+        for (provider, source, batch_id) in [
+            ("", "tdx", "TEST_CODE_MEMBERSHIP_BATCH_1"),
+            ("Tdx", "", "TEST_CODE_MEMBERSHIP_BATCH_1"),
+            ("Tdx", "tdx", ""),
+        ] {
+            let error = response_from_fetched(
+                "TEST_CODE_REQUEST_2".to_string(),
+                Operation::BoardConstituents,
+                "board.constituents",
+                1,
+                delegate::Fetched {
+                    data: br#"[{"instrument_code":"TEST_CODE_600519"}]"#.to_vec(),
+                    source_at: "2026-08-17T09:20:00+08:00".to_string(),
+                    provider: provider.to_string(),
+                    source: source.to_string(),
+                    batch_id: batch_id.to_string(),
+                },
+            )
+            .expect_err("missing delegate identity must fail closed");
+
+            assert_eq!(error.code(), tonic::Code::Internal);
+            assert!(error.message().contains("证据身份缺失"));
+        }
+    }
+}

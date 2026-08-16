@@ -1,0 +1,1 @@
+../.planning/2026-08-17-opening-data-recovery/findings.md

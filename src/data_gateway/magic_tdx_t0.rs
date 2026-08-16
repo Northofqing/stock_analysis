@@ -6,11 +6,11 @@
 //!
 //! Business rules: BR-092, BR-151, BR-153, BR-171, BR-187.
 
+use crate::magic_compat::InstrumentId;
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
 #[cfg(feature = "magic-gateway")]
 use chrono::TimeZone;
-use crate::magic_compat::InstrumentId;
+use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
 #[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::protocol::constants::{fq_type, KLINE_5MIN, KLINE_DAILY};
 #[cfg(feature = "magic-gateway")]
@@ -20,9 +20,9 @@ use magic_tdx_rs::TdxHqClient;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Mutex, OnceLock};
 #[cfg(feature = "magic-gateway")]
 use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
 
 use super::instrument_identity::{resolve_production_equity, EquitySegment};
 
@@ -43,13 +43,15 @@ pub const T0_HISTORY_MIN_SESSIONS: usize = 3;
 /// 价格不变放行从未激活 = 做T 盘中恒 0 records）。做T需要「价格新鲜」而非
 /// 「时钟新鲜」：滞后窗口内价变 = 新成交 = 数据在动。缓存仅存储通过判定
 /// 路径的 quote（stale 拒绝的数据不污染缓存）。
-static LAST_T0_QUOTES: OnceLock<Mutex<HashMap<String, (f64, DateTime<Utc>)>>> = OnceLock::new();
+type T0QuoteCache = HashMap<String, (f64, DateTime<Utc>)>;
+
+static LAST_T0_QUOTES: OnceLock<Mutex<T0QuoteCache>> = OnceLock::new();
 
 /// 缓存容量上限：超出时重建（保最近语义, 低频事件损失可接受; 候选池
 /// 代码数量级远低于此, 正常路径永不触发）。
 const LAST_T0_QUOTE_CACHE_MAX: usize = 500;
 
-fn last_t0_quotes() -> &'static Mutex<HashMap<String, (f64, DateTime<Utc>)>> {
+fn last_t0_quotes() -> &'static Mutex<T0QuoteCache> {
     LAST_T0_QUOTES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -189,17 +191,11 @@ fn valid_ohlc(open: f64, high: f64, low: f64, close: f64) -> bool {
 /// 判定链（`quote_price` = 当前 batch 归一化价格, `None` 表示无价格可比）:
 /// 1. age ∈ [0, T0_QUOTE_MAX_AGE_SECS] → 新鲜, 更新缓存, Ok（BR-218 5s 红线原样）
 /// 2. age ∈ (5, T0_QUOTE_HARD_STALE_SECS]（TDX 时钟滞后窗口, 移动证据裁决）:
-///    a. 首次见 code（无缓存）→ 播种接受（warn 出声）: 快照价即当前价;
-///       无锚点则缓存永远为空 → 后续分支永不激活（8/12 死锁实证:
-///       全天 0 条过 5s 门, 旧 BR-231 价格不变放行从未生效）
-///    b. 价格已变 + servertime 前进 → 接受（warn 出声）: 价变 = 新成交 =
-///       数据在动 —— 做T 信号路径
-///    c. 价格已变 + servertime 未前进 → clock_inconsistent 拒绝: 健康数据源
-///       价变必然带时间戳前进, 矛盾即异常（fail-closed）
-///    d. 价格未变 + servertime 前进 → 等价新鲜（warn 出声）: BR-231 语义,
-///       带「数据在动」证据
-///    e. 价格未变 + servertime 未前进 → quote_stale 拒绝: 同一快照重放 =
-///       数据源冻结（堵住旧 2 分支的死 feed 洞）
+///    - 首次见 code（无缓存）→ 播种接受（warn 出声）: 快照价即当前价；无锚点则缓存永远为空，后续分支永不激活（8/12 全天 0 条过 5s 门的死锁实证）。
+///    - 价格已变 + servertime 前进 → 接受（warn 出声）: 价变 = 新成交 = 数据在动，即做T信号路径。
+///    - 价格已变 + servertime 未前进 → clock_inconsistent 拒绝: 健康数据源价变必然带时间戳前进，矛盾即异常（fail-closed）。
+///    - 价格未变 + servertime 前进 → 等价新鲜（warn 出声）: BR-231 语义，带“数据在动”证据。
+///    - 价格未变 + servertime 未前进 → quote_stale 拒绝: 同一快照重放 = 数据源冻结（堵住旧两个分支的死 feed 洞）。
 /// 3. age > T0_QUOTE_HARD_STALE_SECS → quote_stale 拒绝（fail-closed 硬上限,
 ///    午休无成交窗口正确老化, 午后自愈）
 ///
@@ -861,7 +857,12 @@ fn evidence_for_quote(
     // BR-231: normalize 先行（纯本地校验, 无网络）→ 价格参与 freshness 判定
     // （价格不变放行）。网络调用（daily/minute）仍在 freshness 门后。
     let normalized_quote = normalize_quote(&code, &quote)?;
-    validate_quote_freshness(&code, source_at, quote_received_at, Some(normalized_quote.price))?;
+    validate_quote_freshness(
+        &code,
+        source_at,
+        quote_received_at,
+        Some(normalized_quote.price),
+    )?;
     // 2026-08-12 实测: TDX 主站 KLINE_RI_K(9) 在 fq_type::NONE 下只返回最新
     // 1 根日K (count=40/800 均如此), 生产 8/11-8/12 全天 settled_daily
     // actual=0 → 做T 证据 0 records。KLINE_DAILY(4) + NONE (不复权) 返回
@@ -958,8 +959,10 @@ fn finalize_t0_batch(
         // 会因同一记录 servertime 未前进而误杀已通过记录——两次门之间
         // servertime 不可能前进）。此处只防 blocking 窗口过长: age > 硬上限
         // 的过时数据 fail-closed 丢弃。
-        let completion_age = observed_at.signed_duration_since(record.source_at).num_seconds();
-        if completion_age < 0 || completion_age > T0_QUOTE_HARD_STALE_SECS {
+        let completion_age = observed_at
+            .signed_duration_since(record.source_at)
+            .num_seconds();
+        if !(0..=T0_QUOTE_HARD_STALE_SECS).contains(&completion_age) {
             rejections.push(rejection(
                 &record.code,
                 "quote_stale",
@@ -1137,8 +1140,10 @@ pub fn fetch_magic_tdx_t0_batch_with_clock(
                 quote_rejections.len()
             )
         })?;
-    let skip_codes: std::collections::HashSet<String> =
-        quote_rejections.iter().map(|rejection| rejection.code.clone()).collect();
+    let skip_codes: std::collections::HashSet<String> = quote_rejections
+        .iter()
+        .map(|rejection| rejection.code.clone())
+        .collect();
     let mut records = Vec::new();
     let mut rejections = Vec::new();
     for (identity, quote) in identities.iter().zip(quotes) {
@@ -1329,12 +1334,8 @@ mod tests {
         // BR-218 fail-closed 硬上限: age > 300s 一律拒绝（优先于播种分支）。
         let observed_at = Utc.with_ymd_and_hms(2026, 7, 23, 2, 6, 0).unwrap();
         let source_at = Utc.with_ymd_and_hms(2026, 7, 23, 2, 0, 55).unwrap(); // age=305s
-        let result = validate_quote_freshness(
-            "TEST_CODE_HARD_STALE_1",
-            source_at,
-            observed_at,
-            Some(10.0),
-        );
+        let result =
+            validate_quote_freshness("TEST_CODE_HARD_STALE_1", source_at, observed_at, Some(10.0));
         let err = result.unwrap_err();
         assert_eq!(err.reason_code, "quote_stale");
         assert!(err.detail.contains("max_secs=300"));
@@ -1636,10 +1637,15 @@ mod tests {
         let validated =
             validate_five_minute_bars("TEST_CODE_600396", live, observed_at).expect("live bars ok");
         assert!(
-            validated.iter().all(|bar| bar.at.time() != NaiveTime::from_hms_opt(13, 0, 0).unwrap()),
+            validated
+                .iter()
+                .all(|bar| bar.at.time() != NaiveTime::from_hms_opt(13, 0, 0).unwrap()),
             "13:00 快照 bar 必须被丢弃"
         );
-        let today_bars: Vec<_> = validated.iter().filter(|bar| bar.at.date() == today).collect();
+        let today_bars: Vec<_> = validated
+            .iter()
+            .filter(|bar| bar.at.date() == today)
+            .collect();
         // 丢弃后今日 bars 与 trading_slots() 槽位逐一对齐 (five_minute_gap 检查)。
         let slots = trading_slots();
         assert_eq!(today_bars.len(), 37); // 24 上午 (9:35-11:30) + 13 午后 (13:05-14:05)

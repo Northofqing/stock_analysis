@@ -278,6 +278,7 @@ pub struct SourceBatchEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum SourceBatchError {
     KindNotAllowed(PushKind),
     FutureBusinessDate(NaiveDate),
@@ -317,6 +318,7 @@ impl std::fmt::Display for SourceBatchError {
 impl std::error::Error for SourceBatchError {}
 
 impl SourceBatchEvidence {
+    #[allow(dead_code)]
     pub fn new(
         kind: PushKind,
         business_date: NaiveDate,
@@ -358,6 +360,7 @@ impl SourceBatchEvidence {
         })
     }
 
+    #[allow(dead_code)]
     pub fn kind(&self) -> PushKind {
         self.kind
     }

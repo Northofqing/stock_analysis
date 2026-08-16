@@ -114,7 +114,7 @@ pub fn latest_persisted_valuation_view() -> Result<Option<ClosingValuationView>,
     latest_persisted_valuation_view_with_conn(&mut c)
 }
 
-/// 指定价格日期的收盘估值 (BR-225 修复: R-07 做T 基准必须用 review_date
+/// 指定价格日期的收盘估值 (BR-233 修复: R-07 做T 基准必须用 review_date
 /// 对应的估值, 不能 fallback 到上一交易日 — 周六补投场景 latest 是 8/6,
 /// 会把周四收盘价冒充周五价)。缺失返回 None, 调用方负责出声。
 pub fn persisted_valuation_view_for_date(
@@ -228,7 +228,7 @@ mod tests {
             save_closing_valuation_with_conn(&mut conn, &latest).expect("insert latest date");
         assert!(inserted_latest.inserted);
 
-        // latest 是 8/7; for_date(8/6) 必须返回 8/6 而不是 latest (BR-225b)
+        // latest 是 8/7; for_date(8/6) 必须返回 8/6 而不是 latest (BR-233)
         let prior_view = persisted_valuation_view_for_date_conn(
             &mut conn,
             NaiveDate::from_ymd_opt(2026, 8, 6).expect("date"),

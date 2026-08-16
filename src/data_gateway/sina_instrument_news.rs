@@ -1,9 +1,9 @@
 //! BR-066/BR-164/BR-172 evidence-preserving Sina instrument-news gateway.
 
-use chrono::{DateTime, Utc};
-use crate::magic_compat::{ProviderId, SourceEvidence};
 #[cfg(feature = "magic-gateway")]
 use crate::magic_compat::{DataBatch, Exchange, IsoDate, PositiveU32};
+use crate::magic_compat::{ProviderId, SourceEvidence};
+use chrono::{DateTime, Utc};
 #[cfg(feature = "magic-gateway")]
 // NewsProvider 是 method-resolution trait (正文无 :: 用法), 提供
 // .instrument_news() 方法解析 — 不得按 unused 删除。
@@ -16,14 +16,14 @@ use magic_market_router::{
 #[cfg(feature = "magic-gateway")]
 use magic_sina_rs::{SinaClient, SinaError};
 
-use super::review::{acquisition_request_hash, audit_gateway_result, GatewayBatch, GatewayError};
-#[cfg(feature = "magic-gateway")]
-use super::review::BatchEvidence;
 #[cfg(feature = "magic-gateway")]
 use super::review::audit_blocking_join_failure;
-use crate::data_provider::news_item::NewsItem;
+#[cfg(feature = "magic-gateway")]
+use super::review::BatchEvidence;
+use super::review::{acquisition_request_hash, audit_gateway_result, GatewayBatch, GatewayError};
 #[cfg(feature = "magic-gateway")]
 use crate::data_provider::news_item::content_hash;
+use crate::data_provider::news_item::NewsItem;
 
 const CAPABILITY: &str = "SinaInstrumentNews";
 const SOURCE: &str = "sina-company-news";
@@ -85,7 +85,7 @@ impl SinaInstrumentNewsGateway {
             Ok(Some(bridge)) => {
                 let from_days = (to - from).num_days().clamp(1, 30) as u32;
                 let result = bridge
-                    .instrument_news_async(&[code.clone()], from_days)
+                    .instrument_news_async(std::slice::from_ref(&code), from_days)
                     .await;
                 let audit_provider = result
                     .as_ref()
@@ -120,8 +120,8 @@ impl SinaInstrumentNewsGateway {
         {
             let worker_hash = request_hash.clone();
             let joined = tokio::task::spawn_blocking(move || {
-                let result = build_request(&code, &from, &to)
-                    .and_then(|(request, storage_code)| {
+                let result =
+                    build_request(&code, &from, &to).and_then(|(request, storage_code)| {
                         fetch_and_admit_sina_batch(&request, &storage_code, from, to)
                     });
                 audit_gateway_result(CAPABILITY, ProviderId::Sina, &worker_hash, result)
@@ -524,9 +524,12 @@ fn gateway_router_error(provider: Option<ProviderId>, error: RouterError) -> Gat
 #[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
+    use crate::magic_compat::{
+        AssetClass, DataBatch, Exchange, InstrumentId, IsoDate, NonEmptyText, Provenance,
+        ProviderId, SourceEvidence,
+    };
     use chrono::{DateTime, Utc};
-    use crate::magic_compat::{AssetClass, DataBatch, Exchange, InstrumentId, IsoDate, NonEmptyText, Provenance, ProviderId, SourceEvidence};
-use magic_market_core::{HttpsUrl, NewsItem as CoreNewsItem};
+    use magic_market_core::{HttpsUrl, NewsItem as CoreNewsItem};
 
     fn instant(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)

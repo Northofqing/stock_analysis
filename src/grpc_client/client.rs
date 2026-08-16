@@ -1,40 +1,150 @@
 //! GrpcMarketClient: 24 个已实现 op 的 gRPC 查询客户端 (合同 §5-§7)。
 //! 启动后应先调 GetCapabilities (合同 §7: RPC 存在 ≠ 能力准入); 未实现 op 在客户端拦截, 不发起调用。
-use crate::grpc_client::auth::attach_bearer;
+use crate::grpc_client::auth::{attach_bearer, attach_bearer_value};
+use crate::grpc_client::bundle::ClientBundleConfig;
 use crate::grpc_client::envelope::{build_query_request, parse_query_response, QueryResult};
 use crate::grpc_client::errors::{ErrorDetail, GrpcError};
 use crate::grpc_client::pb::magic::market::v1::{
-    market_data_service_client::MarketDataServiceClient, market_event_service_client::MarketEventServiceClient,
+    market_data_service_client::MarketDataServiceClient,
+    market_event_service_client::MarketEventServiceClient,
     system_service_client::SystemServiceClient, CapabilitiesRequest, EventCursor, EventFilter,
     HealthRequest, ListenerStatusRequest, Operation, SetWatchlistRequest, SubscribeRequest,
 };
 use crate::grpc_client::retry::{retry_decision, RetryDecision, RetryPolicy};
+use std::path::Path;
 use std::time::Duration;
-use tonic::transport::Channel;
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
+use zeroize::Zeroizing;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContractProfile {
+    LocalBridgeV1,
+    ExternalV1,
+}
+
+enum ClientAuthorization {
+    Environment,
+    InstanceBearer(Zeroizing<String>),
+}
 
 pub struct GrpcMarketClient {
     data: MarketDataServiceClient<Channel>,
     system: SystemServiceClient<Channel>,
     events: MarketEventServiceClient<Channel>,
     retry: RetryPolicy,
+    profile: ContractProfile,
+    authorization: ClientAuthorization,
+    acquisition_authority: Option<String>,
 }
 
 impl GrpcMarketClient {
     pub async fn connect(addr: &str) -> Result<Self, GrpcError> {
         let channel = Channel::from_shared(addr.to_string())
             // D2: 本地构造错误无服务端 status → details 全默认 (桥只看码 + 远端 detail)。
-            .map_err(|_| GrpcError::InvalidArgument { details: ErrorDetail::default() })?
+            .map_err(|_| GrpcError::InvalidArgument {
+                details: ErrorDetail::default(),
+            })?
             // 合同 §12: 为 unary 和 stream 分别设置 deadline/keepalive。
             .timeout(Duration::from_secs(15))
             .connect()
             .await
-            .map_err(|_| GrpcError::Unavailable { details: ErrorDetail::default() })?;
-        Ok(Self {
+            .map_err(|_| GrpcError::Unavailable {
+                details: ErrorDetail::default(),
+            })?;
+        Ok(Self::from_channel(
+            channel,
+            ContractProfile::LocalBridgeV1,
+            ClientAuthorization::Environment,
+            None,
+        ))
+    }
+
+    /// Loads a validated client bundle and opens an ExternalV1 connection using
+    /// its private mTLS identity and instance-owned bearer credential.
+    pub async fn connect_client_bundle(path: &Path) -> Result<Self, GrpcError> {
+        let ClientBundleConfig {
+            endpoint_uri,
+            tls_server_name,
+            ca_pem,
+            certificate_pem,
+            private_key_pem,
+            bearer_token,
+        } = crate::grpc_client::bundle::load(path).map_err(|_| GrpcError::InvalidArgument {
+            details: ErrorDetail::default(),
+        })?;
+
+        let acquisition_authority = format!("grpc-mtls:{tls_server_name}");
+        let tls = ClientTlsConfig::new()
+            .domain_name(tls_server_name)
+            .ca_certificate(Certificate::from_pem(ca_pem))
+            .identity(Identity::from_pem(
+                certificate_pem,
+                private_key_pem.as_slice(),
+            ));
+        let channel = Channel::from_shared(endpoint_uri)
+            .map_err(|_| GrpcError::InvalidArgument {
+                details: ErrorDetail::default(),
+            })?
+            .timeout(Duration::from_secs(15))
+            .tls_config(tls)
+            .map_err(|_| GrpcError::InvalidArgument {
+                details: ErrorDetail::default(),
+            })?
+            .connect()
+            .await
+            .map_err(|_| GrpcError::Unavailable {
+                details: ErrorDetail::default(),
+            })?;
+
+        Ok(Self::from_channel(
+            channel,
+            ContractProfile::ExternalV1,
+            ClientAuthorization::InstanceBearer(bearer_token),
+            Some(acquisition_authority),
+        ))
+    }
+
+    fn from_channel(
+        channel: Channel,
+        profile: ContractProfile,
+        authorization: ClientAuthorization,
+        acquisition_authority: Option<String>,
+    ) -> Self {
+        Self {
             data: MarketDataServiceClient::new(channel.clone()),
             system: SystemServiceClient::new(channel.clone()),
             events: MarketEventServiceClient::new(channel),
             retry: RetryPolicy::default(),
-        })
+            profile,
+            authorization,
+            acquisition_authority,
+        }
+    }
+
+    fn attach_request_auth<T>(&self, request: &mut tonic::Request<T>) -> Result<(), GrpcError> {
+        match &self.authorization {
+            ClientAuthorization::Environment => attach_bearer(request)?,
+            ClientAuthorization::InstanceBearer(token) => {
+                attach_bearer_value(request, token.as_str())?
+            }
+        }
+        Ok(())
+    }
+
+    fn build_profile_query_request(
+        &self,
+        operation: Operation,
+        payload: serde_json::Value,
+    ) -> Result<crate::grpc_client::pb::magic::market::v1::QueryRequest, GrpcError> {
+        match self.profile {
+            ContractProfile::LocalBridgeV1 => {
+                build_query_request(operation, payload).map_err(GrpcError::from)
+            }
+            ContractProfile::ExternalV1 => {
+                crate::grpc_client::external_v1::build_external_query_request(operation, payload)
+                    .map_err(map_external_contract_error)
+            }
+        }
     }
 
     pub async fn get_health(
@@ -46,7 +156,7 @@ impl GrpcMarketClient {
                 request_id: crate::grpc_client::envelope::new_request_id(),
             }),
         });
-        attach_bearer(&mut req)?;
+        self.attach_request_auth(&mut req)?;
         let resp = self.system.get_health(req).await.map_err(GrpcError::from)?;
         Ok(resp.into_inner())
     }
@@ -60,8 +170,12 @@ impl GrpcMarketClient {
                 request_id: crate::grpc_client::envelope::new_request_id(),
             }),
         });
-        attach_bearer(&mut req)?;
-        let resp = self.system.get_capabilities(req).await.map_err(GrpcError::from)?;
+        self.attach_request_auth(&mut req)?;
+        let resp = self
+            .system
+            .get_capabilities(req)
+            .await
+            .map_err(GrpcError::from)?;
         Ok(resp.into_inner().capabilities)
     }
 
@@ -73,9 +187,11 @@ impl GrpcMarketClient {
         payload: serde_json::Value,
     ) -> Result<QueryResult, GrpcError> {
         if !crate::grpc_contract::ops::is_implemented(op) {
-            return Err(GrpcError::Unimplemented { details: ErrorDetail::default() });
+            return Err(GrpcError::Unimplemented {
+                details: ErrorDetail::default(),
+            });
         }
-        let request = build_query_request(op, payload)?;
+        let request = self.build_profile_query_request(op, payload)?;
         let request_id = request
             .context
             .as_ref()
@@ -86,9 +202,14 @@ impl GrpcMarketClient {
         loop {
             let outcome = self.data_call(op, request.clone()).await;
             match outcome {
-                Ok(resp) => {
+                Ok(mut resp) => {
+                    apply_acquisition_authority(
+                        self.profile,
+                        self.acquisition_authority.as_deref(),
+                        &mut resp,
+                    );
                     // 信封错误 (request_id 失配等) 由 From<EnvelopeError> 映射 Unknown + code=envelope。
-                    return parse_query_response(&request_id, resp).map_err(GrpcError::from)
+                    return parse_query_response(&request_id, resp).map_err(GrpcError::from);
                 }
                 Err(err) => match retry_decision(&err) {
                     RetryDecision::RetryBackoff | RetryDecision::RetryBounded
@@ -110,7 +231,7 @@ impl GrpcMarketClient {
         request: crate::grpc_client::pb::magic::market::v1::QueryRequest,
     ) -> Result<crate::grpc_client::pb::magic::market::v1::QueryResponse, GrpcError> {
         let mut req = tonic::Request::new(request);
-        attach_bearer(&mut req)?;
+        self.attach_request_auth(&mut req)?;
         let resp = match op {
             Operation::RealtimeQuotes => self.data.realtime_quotes(req).await,
             Operation::HistoricalBars => self.data.historical_bars(req).await,
@@ -153,7 +274,11 @@ impl GrpcMarketClient {
             Operation::OutcomeDailyBars => self.data.outcome_daily_bars(req).await,
             Operation::UpperLimitPoolReview => self.data.upper_limit_pool_review(req).await,
             Operation::ChainBatch => self.data.chain_batch(req).await,
-            _ => return Err(GrpcError::Unimplemented { details: ErrorDetail::default() }), // 防御: is_implemented 已拦截
+            _ => {
+                return Err(GrpcError::Unimplemented {
+                    details: ErrorDetail::default(),
+                })
+            } // 防御: is_implemented 已拦截
         };
         match resp {
             Ok(r) => Ok(r.into_inner()),
@@ -177,7 +302,7 @@ impl GrpcMarketClient {
             filter: Some(filter),
             after,
         });
-        attach_bearer(&mut req)?;
+        self.attach_request_auth(&mut req)?;
         let resp = self.events.subscribe(req).await.map_err(GrpcError::from)?;
         Ok(resp.into_inner())
     }
@@ -193,7 +318,7 @@ impl GrpcMarketClient {
                 request_id: crate::grpc_client::envelope::new_request_id(),
             }),
         });
-        attach_bearer(&mut req)?;
+        self.attach_request_auth(&mut req)?;
         let resp = self
             .events
             .get_listener_status(req)
@@ -215,13 +340,46 @@ impl GrpcMarketClient {
             }),
             instruments,
         });
-        attach_bearer(&mut req)?;
+        self.attach_request_auth(&mut req)?;
         let resp = self
             .events
             .set_watchlist(req)
             .await
             .map_err(GrpcError::from)?;
         Ok(resp.into_inner())
+    }
+}
+
+fn map_external_contract_error(
+    error: crate::grpc_client::external_v1::ExternalContractError,
+) -> GrpcError {
+    use crate::grpc_client::external_v1::ExternalContractError;
+
+    match error {
+        ExternalContractError::UndeliveredOperation => GrpcError::Unimplemented {
+            details: ErrorDetail::default(),
+        },
+        ExternalContractError::InvalidParameters => GrpcError::InvalidArgument {
+            details: ErrorDetail::default(),
+        },
+        ExternalContractError::Serialize => GrpcError::Unknown {
+            details: ErrorDetail {
+                code: "envelope".to_string(),
+                ..ErrorDetail::default()
+            },
+        },
+    }
+}
+
+fn apply_acquisition_authority(
+    profile: ContractProfile,
+    acquisition_authority: Option<&str>,
+    response: &mut crate::grpc_client::pb::magic::market::v1::QueryResponse,
+) {
+    if profile == ContractProfile::ExternalV1 && response.source.is_empty() {
+        if let Some(authority) = acquisition_authority {
+            response.source = authority.to_owned();
+        }
     }
 }
 
@@ -235,11 +393,15 @@ mod tests {
         QueryResponse,
     };
     use tonic::{Request, Response, Status};
+    use zeroize::Zeroizing;
 
     struct MockSystem;
     #[tonic::async_trait]
     impl SystemService for MockSystem {
-        async fn get_health(&self, _req: Request<HealthRequest>) -> Result<Response<HealthResponse>, Status> {
+        async fn get_health(
+            &self,
+            _req: Request<HealthRequest>,
+        ) -> Result<Response<HealthResponse>, Status> {
             Ok(Response::new(HealthResponse {
                 request_id: "h-1".into(),
                 live: true,
@@ -247,7 +409,10 @@ mod tests {
                 state: "RUNNING".into(),
             }))
         }
-        async fn get_capabilities(&self, _req: Request<CapabilitiesRequest>) -> Result<Response<CapabilitiesResponse>, Status> {
+        async fn get_capabilities(
+            &self,
+            _req: Request<CapabilitiesRequest>,
+        ) -> Result<Response<CapabilitiesResponse>, Status> {
             Ok(Response::new(CapabilitiesResponse {
                 request_id: "c-1".into(),
                 capabilities: vec![],
@@ -299,20 +464,66 @@ mod tests {
     }
 
     impl_mock_market_data!(
-        historical_bars, minute_data, money_flows, order_books, auctions, trades,
-        security_metadata, global_indices, foreign_exchange, economic_calendar,
-        futures_delivery, reference_rates, official_fx_fixings, economic_series,
-        company_filings, global_news, announcements, market_announcements,
-        investor_questions, policy_documents, security_profiles, financial_statements,
-        market_statistics, technical_bars, corporate_actions, board_directory,
-        board_constituents, board_memberships, research_reports, research_documents,
-        consensus, target_prices, semantic_search, fund_flow_series, board_flows,
-        margin_data, block_trades, holder_counts, lockup_events, dividend_plans,
-        post_close_flows, northbound_daily, limit_pools, strong_stock_reasons,
-        dragon_tiger, market_dragon_tiger, dragon_tiger_discovery, market_rankings,
-        market_breadth, popularity, concept_hits, option_data, provider_top_n_rankings,
-        index_quotes, instrument_news, intraday_shape, t0_evidence,
-        outcome_daily_bars, upper_limit_pool_review, chain_batch,
+        historical_bars,
+        minute_data,
+        money_flows,
+        order_books,
+        auctions,
+        trades,
+        security_metadata,
+        global_indices,
+        foreign_exchange,
+        economic_calendar,
+        futures_delivery,
+        reference_rates,
+        official_fx_fixings,
+        economic_series,
+        company_filings,
+        global_news,
+        announcements,
+        market_announcements,
+        investor_questions,
+        policy_documents,
+        security_profiles,
+        financial_statements,
+        market_statistics,
+        technical_bars,
+        corporate_actions,
+        board_directory,
+        board_constituents,
+        board_memberships,
+        research_reports,
+        research_documents,
+        consensus,
+        target_prices,
+        semantic_search,
+        fund_flow_series,
+        board_flows,
+        margin_data,
+        block_trades,
+        holder_counts,
+        lockup_events,
+        dividend_plans,
+        post_close_flows,
+        northbound_daily,
+        limit_pools,
+        strong_stock_reasons,
+        dragon_tiger,
+        market_dragon_tiger,
+        dragon_tiger_discovery,
+        market_rankings,
+        market_breadth,
+        popularity,
+        concept_hits,
+        option_data,
+        provider_top_n_rankings,
+        index_quotes,
+        instrument_news,
+        intraday_shape,
+        t0_evidence,
+        outcome_daily_bars,
+        upper_limit_pool_review,
+        chain_batch,
     );
 
     async fn spawn_mock() -> String {
@@ -335,7 +546,10 @@ mod tests {
         let addr = spawn_mock().await;
         let mut client = GrpcMarketClient::connect(&addr).await.unwrap();
         let result = client
-            .query(Operation::RealtimeQuotes, serde_json::json!({"codes": ["600519"]}))
+            .query(
+                Operation::RealtimeQuotes,
+                serde_json::json!({"codes": ["600519"]}),
+            )
             .await
             .unwrap();
         // 用 PartialEq 断言 (envelope.rs 已验证 AdmissionState 可比较), 不依赖 prost 是否生成 Display。
@@ -353,7 +567,10 @@ mod tests {
         let addr = spawn_mock().await;
         let mut client = GrpcMarketClient::connect(&addr).await.unwrap();
         // OptionData 不在 implemented 集合 → 客户端直接拦截, 不发起调用。
-        let err = client.query(Operation::OptionData, serde_json::json!({})).await.unwrap_err();
+        let err = client
+            .query(Operation::OptionData, serde_json::json!({}))
+            .await
+            .unwrap_err();
         assert!(matches!(err, GrpcError::Unimplemented { .. }));
     }
 
@@ -366,5 +583,149 @@ mod tests {
         assert_eq!(health.state, "RUNNING");
         let caps = client.get_capabilities().await.unwrap();
         assert!(caps.is_empty());
+    }
+
+    fn lazy_test_channel() -> Channel {
+        Channel::from_static("http://127.0.0.1:1").connect_lazy()
+    }
+
+    #[tokio::test]
+    async fn contract_profiles_select_distinct_request_contracts() {
+        let local = GrpcMarketClient::from_channel(
+            lazy_test_channel(),
+            ContractProfile::LocalBridgeV1,
+            ClientAuthorization::Environment,
+            None,
+        );
+        let local_request = local
+            .build_profile_query_request(
+                Operation::RealtimeQuotes,
+                serde_json::json!({"codes": ["600396"]}),
+            )
+            .expect("local bridge request");
+        assert_eq!(
+            local_request.payload.expect("local payload").schema,
+            "market.realtime_quotes"
+        );
+
+        let external = GrpcMarketClient::from_channel(
+            lazy_test_channel(),
+            ContractProfile::ExternalV1,
+            ClientAuthorization::InstanceBearer(Zeroizing::new(
+                "TEST_CODE_bundle_token".to_string(),
+            )),
+            Some("grpc-mtls:magic-market.local".to_string()),
+        );
+        let external_request = external
+            .build_profile_query_request(
+                Operation::SecurityMetadata,
+                serde_json::json!({"codes": ["600396"]}),
+            )
+            .expect("delivered external request");
+        assert_eq!(
+            external_request.payload.expect("external payload").schema,
+            "magic.market.security_metadata.request"
+        );
+
+        let invalid = external
+            .build_profile_query_request(
+                Operation::SecurityMetadata,
+                serde_json::json!({"codes": []}),
+            )
+            .expect_err("invalid external parameters must fail closed");
+        assert!(matches!(invalid, GrpcError::InvalidArgument { .. }));
+
+        let undelivered = external
+            .build_profile_query_request(Operation::RealtimeQuotes, serde_json::json!({}))
+            .expect_err("undelivered external contract must not reach I/O");
+        assert!(matches!(undelivered, GrpcError::Unimplemented { .. }));
+    }
+
+    #[test]
+    fn external_contract_error_mapping_is_non_retryable_and_specific() {
+        use crate::grpc_client::external_v1::ExternalContractError;
+
+        assert!(matches!(
+            map_external_contract_error(ExternalContractError::UndeliveredOperation),
+            GrpcError::Unimplemented { .. }
+        ));
+        assert!(matches!(
+            map_external_contract_error(ExternalContractError::InvalidParameters),
+            GrpcError::InvalidArgument { .. }
+        ));
+        let serialization = map_external_contract_error(ExternalContractError::Serialize);
+        assert!(matches!(serialization, GrpcError::Unknown { .. }));
+        assert_eq!(serialization.details().code, "envelope");
+    }
+
+    #[tokio::test]
+    async fn instance_owned_bearer_is_attached_without_environment_fallback() {
+        let client = GrpcMarketClient::from_channel(
+            lazy_test_channel(),
+            ContractProfile::ExternalV1,
+            ClientAuthorization::InstanceBearer(Zeroizing::new(
+                "TEST_CODE_bundle_token".to_string(),
+            )),
+            Some("grpc-mtls:magic-market.local".to_string()),
+        );
+        let mut request = Request::new(());
+        client
+            .attach_request_auth(&mut request)
+            .expect("instance bearer metadata");
+        assert_eq!(
+            request
+                .metadata()
+                .get("authorization")
+                .expect("authorization metadata")
+                .to_str()
+                .expect("ASCII authorization"),
+            "Bearer TEST_CODE_bundle_token"
+        );
+        assert_eq!(client.profile, ContractProfile::ExternalV1);
+        assert_eq!(
+            client.acquisition_authority.as_deref(),
+            Some("grpc-mtls:magic-market.local")
+        );
+    }
+
+    fn response_with_source(source: &str) -> QueryResponse {
+        QueryResponse {
+            request_id: "TEST_CODE-request".to_string(),
+            operation: Operation::SecurityMetadata as i32,
+            admission: AdmissionState::Admitted as i32,
+            selected_provider: "Tencent".to_string(),
+            batch_id: "TEST_CODE-batch".to_string(),
+            complete: true,
+            observed_at: "2026-08-17T08:00:00+08:00".to_string(),
+            source_at: "2026-08-17T07:59:59+08:00".to_string(),
+            records: vec![],
+            diagnostic_blocker: String::new(),
+            source: source.to_string(),
+        }
+    }
+
+    #[test]
+    fn external_acquisition_authority_only_fills_empty_field_eleven_source() {
+        let authority = "grpc-mtls:magic-market.local";
+        let mut missing = response_with_source("");
+        apply_acquisition_authority(ContractProfile::ExternalV1, Some(authority), &mut missing);
+        assert_eq!(missing.source, authority);
+        assert_eq!(missing.selected_provider, "Tencent");
+        assert_eq!(missing.batch_id, "TEST_CODE-batch");
+        assert_eq!(missing.observed_at, "2026-08-17T08:00:00+08:00");
+        assert_eq!(missing.source_at, "2026-08-17T07:59:59+08:00");
+
+        let mut upstream = response_with_source("upstream-source");
+        apply_acquisition_authority(ContractProfile::ExternalV1, Some(authority), &mut upstream);
+        assert_eq!(upstream.source, "upstream-source");
+
+        let mut local = response_with_source("");
+        apply_acquisition_authority(ContractProfile::LocalBridgeV1, Some(authority), &mut local);
+        assert!(local.source.is_empty());
+    }
+
+    #[test]
+    fn client_bundle_constructor_is_exposed_without_reading_a_real_bundle() {
+        let _constructor = GrpcMarketClient::connect_client_bundle;
     }
 }

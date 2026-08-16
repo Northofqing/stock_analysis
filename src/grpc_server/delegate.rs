@@ -30,8 +30,8 @@ use chrono::{Datelike, Local, NaiveDate};
 use serde_json::{json, Value};
 
 /// 委托取数结果 (M1 起证据链回填 provider/source/batch_id; 合同 §6 缺则不填充)。
-/// 既有 24 op 的 fetch 尚走 pack() (证据留空) → handlers 对空 provider 保留
-/// "tdx-dev" 兼容值, M2 全量升级后移除。
+/// 既有尚未迁移的 fetch 走 pack() 时证据留空，handler 会显式拒绝，禁止
+/// 回填兼容 provider 或生成本地 batch identity。
 pub struct Fetched {
     pub data: Vec<u8>,
     pub source_at: String,
@@ -214,7 +214,7 @@ pub async fn fetch(
         Operation::BlockTrades => fetch_block_trades(params).await.map_err(DelegateError::Fetch),
         Operation::Consensus => fetch_consensus(params).await.map_err(DelegateError::Fetch),
         Operation::BoardDirectory => fetch_board_directory(params).await.map_err(DelegateError::Fetch),
-        Operation::BoardConstituents => fetch_board_constituents(params).await.map_err(DelegateError::Fetch),
+        Operation::BoardConstituents => fetch_board_constituents(params).await,
         Operation::BoardFlows => fetch_board_flows(params).await.map_err(DelegateError::Fetch),
         Operation::LimitPools => fetch_limit_pools(params).await.map_err(DelegateError::Fetch),
         Operation::StrongStockReasons => fetch_strong_stock_reasons(params).await.map_err(DelegateError::Fetch),
@@ -280,7 +280,6 @@ async fn fetch_minute_data(params: &Value) -> Result<Fetched, DelegateError> {
     let codes = crate::grpc_contract::params::resolve_codes(params)?;
     let mut set = tokio::task::JoinSet::new();
     for code in codes {
-        let gateway = gateway;
         set.spawn(async move {
             gateway
                 .minute_data(&code, None)
@@ -651,7 +650,6 @@ async fn fetch_consensus(params: &Value) -> Result<Fetched, FetchFailure> {
         .map_err(|e| format!("params 无效: {e}"))?;
     let mut set = tokio::task::JoinSet::new();
     for code in codes {
-        let gateway = gateway;
         // ConsensusData 记录本身没有 code 字段 (逐代码查询) → 带 code 回传, JSON 里补上。
         // 保真传播 GatewayError 分类 (no_current_reports 等业务态必须过 detail 还原,
         // 不能 format! 折叠成 unknown → no_verified_batch/retryable=true 无界重试)。
@@ -703,7 +701,6 @@ async fn fetch_historical_bars(params: &Value) -> Result<Fetched, DelegateError>
     let days = crate::grpc_contract::params::resolve_u32(params, "days", 120)? as usize;
     let mut set = tokio::task::JoinSet::new();
     for code in codes {
-        let gateway = gateway;
         set.spawn(async move {
             gateway
                 .daily_bars_async(&code, days)
@@ -790,44 +787,44 @@ async fn fetch_board_directory(params: &Value) -> Result<Fetched, FetchFailure> 
 }
 
 /// 板块成分: board 模块无公开「板块→成分」生产入口 (board_constituents_raw
-/// 需内部 BoardConstituentRequest, 未导出) → 用 memberships(code) 对 watchlist
-/// 逐代码查「个股→所属板块」, 输出成分归属视图。
-/// 板块成分归属: 生产调用方传板块 code (push_templates A-11 memberships) —
-/// codes 缺省 watchlist。
-async fn fetch_board_constituents(params: &Value) -> Result<Fetched, FetchFailure> {
+/// 需内部 BoardConstituentRequest, 未导出) → 用 memberships(code) 查
+/// 「个股→所属板块」, 输出成分归属视图。
+///
+/// BR-231: 每次请求只允许一个 canonical code。多个代码会产生多个独立
+/// GatewayBatch，禁止在这里合并后伪造一个跨批次 identity。
+async fn fetch_board_constituents(params: &Value) -> Result<Fetched, DelegateError> {
     let gateway = BoardDataGateway::new();
-    let codes = crate::grpc_contract::params::resolve_codes(params)
-        .map_err(|e| format!("params 无效: {e}"))?;
-    let mut set = tokio::task::JoinSet::new();
-    for code in codes {
-        let gateway = gateway;
-        set.spawn(async move {
-            gateway
-                .memberships(&code)
-                .await
-                .map_err(|e| {
-                    let message = format!("板块归属 Gateway 不可用 ({code}): {e}");
-                    FetchFailure::from_gateway(e).with_message(message)
-                })
-        });
-    }
-    let mut records: Vec<Value> = Vec::new();
-    let mut source_at = String::new();
-    while let Some(joined) = set.join_next().await {
-        let batch = joined.map_err(|e| format!("板块归属 task 失败: {e}"))??;
-        if source_at.is_empty() {
-            source_at = source_at_of(&batch);
-        }
-        records.extend(batch.records().iter().map(|r| {
+    let codes = crate::grpc_contract::params::resolve_codes(params)?;
+    let [code] = codes.as_slice() else {
+        return Err(DelegateError::Params(
+            crate::grpc_contract::params::ParamsError::InvalidArgument(
+                "board_constituents: BR-231 要求每次恰好一个 canonical code".to_string(),
+            ),
+        ));
+    };
+    let batch = gateway.memberships(code).await.map_err(|error| {
+        let message = format!("板块归属 Gateway 不可用 ({code}): {error}");
+        DelegateError::Fetch(FetchFailure::from_gateway(error).with_message(message))
+    })?;
+    pack_board_membership_batch(&batch).map_err(DelegateError::Fetch)
+}
+
+fn pack_board_membership_batch(
+    batch: &crate::data_gateway::GatewayBatch<crate::data_gateway::BoardMembershipRecord>,
+) -> Result<Fetched, FetchFailure> {
+    let records = batch
+        .records()
+        .iter()
+        .map(|record| {
             json!({
-                "instrument_code": r.instrument_code,
-                "board_code": r.board_code,
-                "board_name": r.board_name,
-                "kind": format!("{:?}", r.kind),
+                "instrument_code": record.instrument_code,
+                "board_code": record.board_code,
+                "board_name": record.board_name,
+                "kind": format!("{:?}", record.kind),
             })
-        }));
-    }
-    pack(records, source_at)
+        })
+        .collect();
+    pack_ev(records, batch)
 }
 
 /// 板块资金流: 生产调用方传 kind + limit (statistics.rs / main.rs
@@ -1066,7 +1063,6 @@ async fn fetch_research_reports(params: &Value) -> Result<Fetched, FetchFailure>
     let gateway = ResearchDataGateway::new();
     let mut set = tokio::task::JoinSet::new();
     for code in codes {
-        let gateway = gateway;
         set.spawn(async move {
             let batch = gateway
                 .instrument_reports(&code, page_size)
@@ -1356,7 +1352,6 @@ async fn fetch_fund_flow_series(params: &Value) -> Result<Fetched, DelegateError
     let gateway = CapitalDataGateway::new();
     let mut set = tokio::task::JoinSet::new();
     for code in codes {
-        let gateway = gateway;
         set.spawn(async move {
             gateway
                 .instrument_fund_flow(&code, interval, limit)
@@ -1469,7 +1464,6 @@ async fn fetch_instrument_news(params: &Value) -> Result<Fetched, DelegateError>
     let gateway = SinaInstrumentNewsGateway::new();
     let mut set = tokio::task::JoinSet::new();
     for code in codes {
-        let gateway = gateway;
         set.spawn(async move {
             gateway
                 .instrument_news_in_range(&code, from, now)
@@ -1512,7 +1506,6 @@ async fn fetch_intraday_shape(params: &Value) -> Result<Fetched, DelegateError> 
     let gateway = IntradayShapeGateway::new();
     let mut set = tokio::task::JoinSet::new();
     for code in codes {
-        let gateway = gateway;
         set.spawn(async move {
             gateway
                 .current_shape(&code)
@@ -1701,4 +1694,49 @@ async fn fetch_upper_limit_pool_review(params: &Value) -> Result<Fetched, Delega
         })
         .collect();
     pack_ev(records, &batch).map_err(DelegateError::Fetch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_gateway::{BatchEvidence, BoardMembershipRecord, GatewayBatch};
+
+    #[test]
+    fn single_code_membership_pack_preserves_batch_identity() {
+        let batch = GatewayBatch::Available {
+            records: vec![BoardMembershipRecord {
+                instrument_code: "TEST_CODE_600519".to_string(),
+                board_code: "TEST_CODE_BK0475".to_string(),
+                board_name: "TEST_CODE_BOARD".to_string(),
+                kind: BoardKind::Concept,
+            }],
+            evidence: BatchEvidence {
+                provider: ProviderId::Tdx,
+                source: "tdx".to_string(),
+                source_at: Some("2026-08-17T09:20:00+08:00".to_string()),
+                observed_at: "2026-08-17T09:20:01+08:00".to_string(),
+                batch_id: "TEST_CODE_MEMBERSHIP_BATCH_1".to_string(),
+            },
+        };
+
+        let packed = pack_board_membership_batch(&batch).expect("single-code membership pack");
+
+        assert_eq!(packed.provider, "Tdx");
+        assert_eq!(packed.source, "tdx");
+        assert_eq!(packed.batch_id, "TEST_CODE_MEMBERSHIP_BATCH_1");
+    }
+
+    #[tokio::test]
+    async fn membership_request_rejects_cross_batch_aggregation() {
+        let params = json!({
+            "codes": ["TEST_CODE_600519", "TEST_CODE_000001"],
+        });
+
+        let result = fetch_board_constituents(&params).await;
+
+        let Err(DelegateError::Params(error)) = result else {
+            panic!("multi-code membership request must fail before acquisition");
+        };
+        assert!(error.to_string().contains("BR-231"));
+    }
 }

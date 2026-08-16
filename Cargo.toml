@@ -82,7 +82,7 @@ zeroize = "1"         # 密码 buffer 擦除
 # grpc 数据通道 (docs/superpowers/plans/2026-08-13-grpc-data-channel.md Task 1):
 # 唯一合同源 grpc/market.proto, 由 build.rs + tonic-prost-build 生成代码, 本文件不改 proto
 # tonic 0.14 拆分: tonic-prost (codec 运行时, 生成代码引用 tonic_prost::ProstCodec)
-tonic = "0.14"
+tonic = { version = "0.14", features = ["tls-ring"] }
 tonic-prost = "0.14"
 prost = "0.14"
 tokio-stream = "0.1"

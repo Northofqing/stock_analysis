@@ -4,6 +4,7 @@
 //! 输出:
 //!   1. 实时报价 (servertime 原始值 + 价格) — 验证周六 quote 时间戳行为
 //!   2. 5 分钟 K 线 (KLINE_5MIN, 400 根) — 验证周五 9:30-15:00 的 bar 是否齐全
+//!
 //! 只读探测，无写入、无推送。
 
 #[cfg(feature = "magic-gateway")]

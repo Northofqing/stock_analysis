@@ -7,10 +7,10 @@
 //! and provider evidence preimage. No router or fallback provider participates
 //! in this path.
 
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveTime};
 use crate::magic_compat::{
     Adjustment, AssetClass, Bar, BarInterval, DataBatch, InstrumentId, ProviderId,
 };
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveTime};
 #[cfg(feature = "magic-gateway")]
 use magic_market_core::{BarsRequest, HistoricalBars};
 #[cfg(feature = "magic-gateway")]
@@ -1660,7 +1660,7 @@ fn validated_cardinality_from_parts(
             "Magic TDX cardinality error has zero expected page",
         ));
     }
-    if offset % OUTCOME_TDX_HISTORICAL_PAGE_SIZE != 0 {
+    if !offset.is_multiple_of(OUTCOME_TDX_HISTORICAL_PAGE_SIZE) {
         return Err(invalid_evidence(format!(
             "Magic TDX cardinality offset={offset} is not aligned to the exact \
              {OUTCOME_TDX_HISTORICAL_PAGE_SIZE}-row page geometry"
@@ -3429,8 +3429,8 @@ fn validate_unit_contract() -> Result<(), GatewayError> {
 #[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
-    use chrono::Duration;
     use crate::magic_compat::{Money, Price, Provenance, Quantity};
+    use chrono::Duration;
 
     fn date(value: &str) -> NaiveDate {
         NaiveDate::parse_from_str(value, "%Y-%m-%d").expect("valid TEST_CODE date")

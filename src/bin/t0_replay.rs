@@ -73,12 +73,12 @@ fn main() {
         let client = TdxHqClient::new();
         match client.connect_to_any(Some(5.0)) {
             Ok(_) => {
-                let (market, first) = if codes[0].starts_with('6') || codes[0].starts_with('9') {
-                    (1u8, 1)
+                let market = if codes[0].starts_with('6') || codes[0].starts_with('9') {
+                    1u8
                 } else if codes[0].starts_with('0') || codes[0].starts_with('3') {
-                    (0u8, 1)
+                    0u8
                 } else {
-                    (1u8, 1)
+                    1u8
                 };
                 let daily = client
                     .get_security_bars(KLINE_DAILY, market, &codes[0], 0, 40, fq_type::NONE);

@@ -5,6 +5,7 @@
 //!     OUTCOME_DAILY_BARS/UPPER_LIMIT_POOL_REVIEW (用户决策: 保留本地 server 扩展);
 //!   * QueryResponse.source = 11 (证据链 source 透传, 上游用字段 10 做 diagnostic_blocker);
 //!   * MarketDataService 追加 5 个扩展 RPC。
+//!
 //! 合并 proto 生成到 OUT_DIR (幂等: 已含扩展哨兵则不重复追加),
 //! 上游合同文件本身零修改 — 上游更新 proto 后本地自动跟随。
 use std::path::PathBuf;

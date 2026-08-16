@@ -159,7 +159,12 @@ pub fn catalyst_review_from_chain_batch(
         member_count: names.len(),
         continuous_count,
         leading_members: entries.iter().take(3).map(|e| e.name.clone()).collect(),
-        other_members: entries.iter().skip(3).take(3).map(|e| e.name.clone()).collect(),
+        other_members: entries
+            .iter()
+            .skip(3)
+            .take(3)
+            .map(|e| e.name.clone())
+            .collect(),
         leading_entries: entries.iter().take(3).cloned().collect(),
         other_entries: entries.iter().skip(3).take(3).cloned().collect(),
         // The admitted chain batch has no independent next-day volume/trend
@@ -178,6 +183,7 @@ pub fn catalyst_review_from_chain_batch(
 ///   取完整 VisibleChainBatch — A-10 计算+stage+publish 副作用在服务端进程
 ///   执行 (单写方), 本地只做 catalyst_review_from_chain_batch 纯转换。
 /// - library 模式 (默认): 本地 build_for_date 重算路径不变 (v15.x 出声)。
+///
 /// 桥失败 → Err (fail-closed, 绝不静默回退 library 重算 — 双算会双写 chain_daily)。
 pub async fn load_catalyst_review_snapshot_real(
     date: &str,
@@ -224,9 +230,7 @@ pub async fn load_catalyst_review_snapshot_real(
 /// 与 `load_catalyst_review_snapshot_real` 的差异: 后者每次重新 build, 次日
 /// 重算会得到与推送时不同的名单 (2026-08-12 实测 8/11 前排变 3/6: 秦安/京投/
 /// 第一医药 → 豪尔赛/恒银/百合花); 回放则忠实还原用户当晚看到的名单。
-pub fn load_catalyst_review_snapshot_stored(
-    date: &str,
-) -> Result<CatalystReviewSnapshot, String> {
+pub fn load_catalyst_review_snapshot_stored(date: &str) -> Result<CatalystReviewSnapshot, String> {
     let db = crate::database::DatabaseManager::get();
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
     let batch = replay_visible_batch_with_conn(&mut conn, date)?;
@@ -390,32 +394,34 @@ fn replay_visible_batch_with_conn(
         taxonomy_version: batch_row.taxonomy_version,
         inputs: inputs
             .into_iter()
-            .map(|input| crate::database::chain_intelligence::ChainInputEvidenceInput {
-                input_id: input.input_id,
-                ordinal: input.ordinal,
-                capability: input.capability,
-                provider: input.provider,
-                source: input.source,
-                source_at: input.source_at,
-                observed_at: input.observed_at,
-                source_batch_id: input.source_batch_id,
-                source_batch_hash: input.source_batch_hash,
-                content_hash: input.content_hash,
-            })
+            .map(
+                |input| crate::database::chain_intelligence::ChainInputEvidenceInput {
+                    input_id: input.input_id,
+                    ordinal: input.ordinal,
+                    capability: input.capability,
+                    provider: input.provider,
+                    source: input.source,
+                    source_at: input.source_at,
+                    observed_at: input.observed_at,
+                    source_batch_id: input.source_batch_id,
+                    source_batch_hash: input.source_batch_hash,
+                    content_hash: input.content_hash,
+                },
+            )
             .collect(),
         chains,
         rejections: rejections
             .into_iter()
-            .map(|rejection| {
-                crate::database::chain_intelligence::ChainRejectionInput {
+            .map(
+                |rejection| crate::database::chain_intelligence::ChainRejectionInput {
                     rejection_id: rejection.rejection_id,
                     ordinal: rejection.ordinal,
                     identity_hash: rejection.identity_hash,
                     reason_code: rejection.reason_code,
                     retryable: rejection.retryable != 0,
                     content_hash: rejection.content_hash,
-                }
-            })
+                },
+            )
             .collect(),
     })
 }
@@ -427,9 +433,7 @@ mod tests {
         ChainInputEvidenceInput, VisibleChain, VisibleChainBatch, VisibleChainMember,
     };
 
-    fn visible_chain_batch(
-        names: &[&str],
-    ) -> VisibleChainBatch {
+    fn visible_chain_batch(names: &[&str]) -> VisibleChainBatch {
         VisibleChainBatch {
             batch_id: "TEST_CODE_chain_batch".to_string(),
             content_hash: "a".repeat(64),
@@ -627,16 +631,14 @@ mod tests {
             }
         }
 
-        let replay = replay_visible_batch_with_conn(&mut conn, "2026-08-11")
-            .expect("stored batch replays");
+        let replay =
+            replay_visible_batch_with_conn(&mut conn, "2026-08-11").expect("stored batch replays");
         let snapshot = catalyst_review_from_chain_batch(&replay).expect("maps to A-10");
         // 最早落库版: 用户当晚在推送里看到的名单
         assert_eq!(snapshot.theme, "早盘主线");
         assert_eq!(snapshot.leading_entries[0].name, "TEST_CODE_早盘龙头");
         assert_eq!(snapshot.leading_entries[0].code, "TEST_CODE_600000");
-        assert!(replay
-            .batch_id
-            .starts_with("TEST_CODE_batch_early"));
+        assert!(replay.batch_id.starts_with("TEST_CODE_batch_early"));
 
         let missing = replay_visible_batch_with_conn(&mut conn, "2026-08-10");
         assert!(

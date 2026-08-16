@@ -528,9 +528,9 @@ fn extract_stock_codes(rec_text: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use clap::Parser;
-    use crate::magic_compat::ProviderId;
     use stock_analysis::data_gateway::market_capabilities::MarketSecurityIdentity;
     use stock_analysis::data_gateway::{BatchEvidence, GatewayBatch};
+    use stock_analysis::magic_compat::ProviderId;
 
     fn metadata_evidence() -> BatchEvidence {
         BatchEvidence {

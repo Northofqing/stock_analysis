@@ -22,6 +22,9 @@ const PULLBACK_PCT: f64 = 0.01;
 /// `close/prev_close/open/high/low` 来自当日/昨日日线; 涨停价按
 /// `LimitStatusCalculator::calculate(code, prev_close, name)` 精确计算
 /// (主板 10% / 创业科创 20% / 北交 30% / ST 5%)。
+// Keep the stable pure-function boundary aligned with the complete OHLC evidence tuple;
+// introducing a parameter object would expand this public API and all of its call sites.
+#[allow(clippy::too_many_arguments)]
 pub fn check_entry(
     watch_date: NaiveDate,
     entry: &WatchEntry,
@@ -168,7 +171,10 @@ pub fn conclusion(leading: &[WatchOutcome], all: &[WatchOutcome]) -> String {
     let leading_limit = leading.iter().filter(|o| o.limit_up).count();
     if !leading.is_empty() {
         if leading_limit == leading.len() {
-            format!("前排扩散 {leading_limit}/{} 兑现，题材情绪延续", leading.len())
+            format!(
+                "前排扩散 {leading_limit}/{} 兑现，题材情绪延续",
+                leading.len()
+            )
         } else if leading_limit > 0 {
             format!("前排 {leading_limit}/{} 兑现，题材分歧加剧", leading.len())
         } else {
@@ -184,7 +190,10 @@ pub fn conclusion(leading: &[WatchOutcome], all: &[WatchOutcome]) -> String {
 }
 
 /// 渲染 R-13 推送文本 (纯逻辑)。outcomes 顺序 = 前排 → 其余 (与名单一致)。
-pub fn render_watchlist_tracking(snapshot: &WatchlistSnapshot, outcomes: &[WatchOutcome]) -> String {
+pub fn render_watchlist_tracking(
+    snapshot: &WatchlistSnapshot,
+    outcomes: &[WatchOutcome],
+) -> String {
     let leading_len = snapshot.leading.len();
     let leading = &outcomes[..leading_len.min(outcomes.len())];
     let limit_up_count = outcomes.iter().filter(|o| o.limit_up).count();
@@ -220,7 +229,10 @@ pub fn render_watchlist_tracking(snapshot: &WatchlistSnapshot, outcomes: &[Watch
         } else {
             "未板".to_string()
         };
-        text.push_str(&format!("· {} {} {:+.2}% {}\n", o.code, o.name, o.change_pct, desc));
+        text.push_str(&format!(
+            "· {} {} {:+.2}% {}\n",
+            o.code, o.name, o.change_pct, desc
+        ));
     }
     text.push_str(&format!("结论: {}", conclusion(leading, outcomes)));
     text
@@ -229,8 +241,8 @@ pub fn render_watchlist_tracking(snapshot: &WatchlistSnapshot, outcomes: &[Watch
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::catalyst_watchlist::WatchEntry;
     use crate::data_provider::KlineData;
+    use crate::database::catalyst_watchlist::WatchEntry;
 
     fn entry(code: &str, name: &str, streak: i64) -> WatchEntry {
         WatchEntry {
@@ -321,7 +333,10 @@ mod tests {
         assert_eq!(o.streak_today, 2); // 昨日 1 板 + 今日涨停
         assert!((o.change_pct - 10.01).abs() < 1e-9);
         assert_eq!(o.code, "600721");
-        assert_eq!(o.checked_date, NaiveDate::from_ymd_opt(2026, 8, 12).unwrap());
+        assert_eq!(
+            o.checked_date,
+            NaiveDate::from_ymd_opt(2026, 8, 12).unwrap()
+        );
     }
 
     #[test]
@@ -423,7 +438,10 @@ mod tests {
             outcome("600721", "百花医药", 9.96, true, "封板", 2, Some(14.03)),
             outcome("603758", "秦安股份", 10.02, true, "一字", 2, Some(12.98)),
         ];
-        assert_eq!(conclusion(&leading, &leading), "前排扩散 2/2 兑现，题材情绪延续");
+        assert_eq!(
+            conclusion(&leading, &leading),
+            "前排扩散 2/2 兑现，题材情绪延续"
+        );
     }
 
     #[test]
@@ -432,13 +450,27 @@ mod tests {
             outcome("600721", "百花医药", 9.96, true, "封板", 2, Some(14.03)),
             outcome("600833", "第一医药", 1.40, false, "", 0, Some(10.20)),
         ];
-        assert_eq!(conclusion(&leading, &leading), "前排 1/2 兑现，题材分歧加剧");
+        assert_eq!(
+            conclusion(&leading, &leading),
+            "前排 1/2 兑现，题材分歧加剧"
+        );
     }
 
     #[test]
     fn conclusion_leading_all_dead() {
-        let leading = vec![outcome("600833", "第一医药", -2.0, false, "", 0, Some(10.20))];
-        assert_eq!(conclusion(&leading, &leading), "前排熄火，题材退潮，关注接力风险");
+        let leading = vec![outcome(
+            "600833",
+            "第一医药",
+            -2.0,
+            false,
+            "",
+            0,
+            Some(10.20),
+        )];
+        assert_eq!(
+            conclusion(&leading, &leading),
+            "前排熄火，题材退潮，关注接力风险"
+        );
     }
 
     #[test]

@@ -190,11 +190,11 @@ fn production_process_rejects_dry_run_before_opening_durable_runtime() {
             "production dry-run crossed the pre-runtime rejection boundary {forbidden_startup_marker}: {combined_output}"
         );
     }
-    let readme = include_str!("../README.md");
+    let operator_guide = include_str!("../CLAUDE.md");
     assert!(
-        readme.contains(
-            "普通 `--review` 或常驻生产\nmonitor 携带该变量会在打开 durable delivery 数据库"
-        ) && !readme.contains("需要阻止外发时显式设置 `V10_DRY_RUN_PUSH=1`"),
+        operator_guide.contains(
+            "cargo run --bin monitor -- --review     # manual post-market review (do NOT set V10_DRY_RUN_PUSH=1: BR-192 rejects it)"
+        ) && !operator_guide.contains("需要阻止外发时显式设置 `V10_DRY_RUN_PUSH=1`"),
         "operator documentation must not reintroduce production dry-run"
     );
 

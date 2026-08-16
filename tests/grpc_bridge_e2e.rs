@@ -10,21 +10,21 @@
 //! 桥 → 服务端 → 本地网关 → 桥 的无限递归。这是生产部署的强制约束 (M4 banner 文档化)。
 use chrono::{Duration, NaiveDate, Utc};
 use magic_market_core::{
-    AssetClass, CorporateActionCategory, Exchange, FlowInterval, InstrumentId,
-    MarketRankingKind, NorthboundChannel, ProviderId, StatementKind,
+    AssetClass, CorporateActionCategory, Exchange, FlowInterval, InstrumentId, MarketRankingKind,
+    NorthboundChannel, ProviderId, StatementKind,
 };
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration as StdDuration, Instant};
-use stock_analysis::database::DatabaseManager;
 use stock_analysis::data_gateway::board_ranking::BoardRankingGateway;
 use stock_analysis::data_gateway::{
     grpc_source, BlockTradesGateway, BoardDataGateway, BoardKind, CapitalDataGateway,
     CompanyDataGateway, ConsensusDataGateway, DragonTigerGateway, GeneralWebResearchBatch,
-    GeneralWebResearchGateway, GeneralWebResearchProvider, HistoricalBarsGateway,
-    IndexDataGateway, IntradayShapeGateway, MagicTdxGateway, MarketDataGateway,
-    ResearchDataGateway, ReviewDataGateway, SecurityLifecycleGateway, SinaInstrumentNewsGateway,
+    GeneralWebResearchGateway, GeneralWebResearchProvider, HistoricalBarsGateway, IndexDataGateway,
+    IntradayShapeGateway, MagicTdxGateway, MarketDataGateway, ResearchDataGateway,
+    ReviewDataGateway, SecurityLifecycleGateway, SinaInstrumentNewsGateway,
 };
+use stock_analysis::database::DatabaseManager;
 
 /// 拿空闲端口 (绑定后 drop; 竞态窗口对测试可接受)。
 fn free_port() -> u16 {
@@ -35,15 +35,46 @@ fn free_port() -> u16 {
         .port()
 }
 
+struct FixtureServerGuard {
+    child: Option<Child>,
+}
+
+impl FixtureServerGuard {
+    fn terminate_and_reap(&mut self) -> std::io::Result<ExitStatus> {
+        let child = self.child.as_mut().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "fixture server child already reaped",
+            )
+        })?;
+        // kill may report InvalidInput if the server exited between the last
+        // assertion and cleanup. wait remains mandatory so the child is reaped.
+        let _ = child.kill();
+        let status = child.wait()?;
+        self.child = None;
+        Ok(status)
+    }
+}
+
+impl Drop for FixtureServerGuard {
+    fn drop(&mut self) {
+        if self.child.is_some() {
+            let _ = self.terminate_and_reap();
+        }
+    }
+}
+
 /// spawn fixture 模式 server (cargo 为集成测试提供 CARGO_BIN_EXE_* 路径)。
-fn spawn_fixture_server(port: u16) -> std::process::Child {
+fn spawn_fixture_server(port: u16) -> FixtureServerGuard {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_grpc_market_server"));
     cmd.env("GRPC_GATEWAY_TEST_FIXTURE", "1")
         .env("GRPC_MARKET_PORT", port.to_string())
         .env_remove("DATA_GATEWAY_GRPC") // 递归防护 (见文件头)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    cmd.spawn().expect("spawn grpc_market_server")
+    FixtureServerGuard {
+        child: Some(cmd.spawn().expect("spawn grpc_market_server")),
+    }
 }
 
 /// sync 网关方法 (realtime_quotes/fifteen_min_bars/fetch_top/index/t0) 的调用
@@ -80,7 +111,10 @@ async fn bridge_all_hooked_ops_fixture_roundtrip() {
     // audit_gateway_result (桥路径 audit 留客户端) 写 DataAcquisitionAuditRecord →
     // 需数据库初始化 (与 e2e_dedup.rs 同模式)。
     std::fs::create_dir_all("./test_data").ok();
-    let db_path = PathBuf::from(format!("./test_data/grpc_bridge_e2e_{}.db", std::process::id()));
+    let db_path = PathBuf::from(format!(
+        "./test_data/grpc_bridge_e2e_{}.db",
+        std::process::id()
+    ));
     DatabaseManager::init(Some(db_path)).expect("audit database init");
     grpc_source::reset_bridge();
     let port = free_port();
@@ -132,7 +166,11 @@ async fn bridge_all_hooked_ops_fixture_roundtrip() {
         .memberships("600519")
         .await
         .expect("BoardConstituents 桥");
-    assert_eq!(memberships.records()[0].instrument_code, "600519", "BoardConstituents 保真");
+    assert_eq!(
+        memberships.records()[0].instrument_code,
+        "600519",
+        "BoardConstituents 保真"
+    );
 
     let flows = BoardDataGateway::new()
         .day1_flows(BoardKind::Concept, 20)
@@ -186,7 +224,11 @@ async fn bridge_all_hooked_ops_fixture_roundtrip() {
         .await
         .expect("DragonTiger 桥");
     assert_eq!(dt.records()[0].code, "600519", "DragonTiger 保真");
-    assert_eq!(dt.records()[0].disclosures.len(), 1, "DragonTiger disclosures 解析");
+    assert_eq!(
+        dt.records()[0].disclosures.len(),
+        1,
+        "DragonTiger disclosures 解析"
+    );
 
     let bt = BlockTradesGateway::new()
         .market_review(&["600519".to_string()], date)
@@ -224,10 +266,16 @@ async fn bridge_all_hooked_ops_fixture_roundtrip() {
     .await;
     assert_eq!(t0.records.len(), 1, "T0Evidence records");
     assert_eq!(t0.records[0].code, "600519", "T0Evidence 保真");
-    assert!(t0.rejections.is_empty(), "T0Evidence rejections 空 (fixture)");
+    assert!(
+        t0.rejections.is_empty(),
+        "T0Evidence rejections 空 (fixture)"
+    );
     // 批级 batch_id = 信封 batch_id (fixture-b1); 记录级 batch_id 保留在 records[i]。
     assert_eq!(t0.batch_id, "fixture-b1", "T0Evidence 批级 batch_id");
-    assert_eq!(t0.records[0].batch_id, "fixture-t0", "T0Evidence 记录级 batch_id 保真");
+    assert_eq!(
+        t0.records[0].batch_id, "fixture-t0",
+        "T0Evidence 记录级 batch_id 保真"
+    );
 
     // ---- M3: 个股新闻 (from_days=30 契约) ----
     let news = SinaInstrumentNewsGateway::new()
@@ -245,7 +293,11 @@ async fn bridge_all_hooked_ops_fixture_roundtrip() {
         .instrument_reports("600519", 5)
         .await
         .expect("ResearchReports 桥");
-    assert_eq!(reports.records()[0].report_id, "fixture-r1", "ResearchReports 保真");
+    assert_eq!(
+        reports.records()[0].report_id,
+        "fixture-r1",
+        "ResearchReports 保真"
+    );
     assert_eq!(
         reports.records()[0].source_target_price_upper,
         Some(1600.0),
@@ -256,10 +308,19 @@ async fn bridge_all_hooked_ops_fixture_roundtrip() {
         .northbound_daily(date, NorthboundChannel::Shanghai)
         .await
         .expect("NorthboundDaily 桥");
-    assert_eq!(northbound.records()[0].channel, NorthboundChannel::Shanghai, "NorthboundDaily channel 保真");
-    assert_eq!(northbound.records()[0].total_turnover, 5.2e10, "NorthboundDaily 保真");
     assert_eq!(
-        northbound.records()[0].top_turnover[0].name, "贵州茅台",
+        northbound.records()[0].channel,
+        NorthboundChannel::Shanghai,
+        "NorthboundDaily channel 保真"
+    );
+    assert_eq!(
+        northbound.records()[0].total_turnover,
+        5.2e10,
+        "NorthboundDaily 保真"
+    );
+    assert_eq!(
+        northbound.records()[0].top_turnover[0].name,
+        "贵州茅台",
         "NorthboundDaily top_turnover 解析"
     );
 
@@ -298,14 +359,24 @@ async fn bridge_all_hooked_ops_fixture_roundtrip() {
         "600519",
         "ProviderTopNRankings volume 保真"
     );
-    assert_eq!(pair.volume_ratio.records()[0].metric, MarketRankingKind::VolumeRatio);
-    assert_eq!(pair.main_net_inflow.records()[0].metric, MarketRankingKind::MainNetInflow);
+    assert_eq!(
+        pair.volume_ratio.records()[0].metric,
+        MarketRankingKind::VolumeRatio
+    );
+    assert_eq!(
+        pair.main_net_inflow.records()[0].metric,
+        MarketRankingKind::MainNetInflow
+    );
 
     let shape = IntradayShapeGateway::new()
         .current_shape("600519")
         .await
         .expect("IntradayShape 桥");
-    assert_eq!(shape.records()[0].shape_label, "稳步推高", "IntradayShape 保真");
+    assert_eq!(
+        shape.records()[0].shape_label,
+        "稳步推高",
+        "IntradayShape 保真"
+    );
 
     // ---- M4b 批次 1B: semantic_search + corporate_actions (新桥方法) ----
     let ws = GeneralWebResearchGateway::from_environment(GeneralWebResearchProvider::Bocha)
@@ -321,7 +392,10 @@ async fn bridge_all_hooked_ops_fixture_roundtrip() {
         GeneralWebResearchBatch::Available { records, .. } => records,
         GeneralWebResearchBatch::VerifiedEmpty(_) => panic!("SemanticSearch 不应为空 (fixture)"),
     };
-    assert_eq!(ws_records[0].title, "白酒行业景气度跟踪", "SemanticSearch 保真");
+    assert_eq!(
+        ws_records[0].title, "白酒行业景气度跟踪",
+        "SemanticSearch 保真"
+    );
     assert_eq!(
         ws_records[0].evidence.batch_id, "fixture-b1",
         "SemanticSearch 记录级 evidence.batch_id 保真"
@@ -380,8 +454,13 @@ async fn bridge_all_hooked_ops_fixture_roundtrip() {
         "600519",
         "OutcomeDailyBars instrument 保真"
     );
-    assert!(raw.batch.quality().is_complete(), "OutcomeDailyBars quality 保真");
+    assert!(
+        raw.batch.quality().is_complete(),
+        "OutcomeDailyBars quality 保真"
+    );
 
-    server.kill().expect("kill server");
+    server
+        .terminate_and_reap()
+        .expect("terminate and reap server");
     grpc_source::reset_bridge();
 }

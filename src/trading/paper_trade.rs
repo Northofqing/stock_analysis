@@ -17,9 +17,9 @@
 //!
 //! v16.3 Commit 1: evaluate 改签名接 quote_price, 加 5 态 Invalidated (滑点 > MAX_SLIPPAGE_PCT=2%)
 
+use crate::magic_compat::InstrumentId;
 use chrono::NaiveDate;
 use diesel::prelude::*;
-use crate::magic_compat::InstrumentId;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -674,8 +674,13 @@ pub fn refresh_account_ledger_from_snapshot() -> Result<(), String> {
 
     // 口径分派：快照新鲜（用户当天上传）→ 快照为准；过期 → 持仓 × 实时价自算。
     let (total_assets, cash, market_value, daily_pnl) =
-        if latest_snapshot_effective_date(&mut conn)?.map_or(false, |d| d == today) {
-            (snapshot_total, available_cash, snapshot_market, snapshot_pnl)
+        if latest_snapshot_effective_date(&mut conn)? == Some(today) {
+            (
+                snapshot_total,
+                available_cash,
+                snapshot_market,
+                snapshot_pnl,
+            )
         } else {
             estimate_ledger_from_positions(&mut conn, available_cash, today)?
         };
@@ -716,12 +721,11 @@ fn latest_snapshot_effective_date(
         #[diesel(sql_type = diesel::sql_types::Text)]
         effective_at: String,
     }
-    let row: Option<EffectiveDateRow> = diesel::sql_query(
-        "SELECT effective_at FROM user_account_summary ORDER BY id DESC LIMIT 1",
-    )
-    .get_result(conn)
-    .optional()
-    .map_err(|error| format!("snapshot effective_at unavailable: {error}"))?;
+    let row: Option<EffectiveDateRow> =
+        diesel::sql_query("SELECT effective_at FROM user_account_summary ORDER BY id DESC LIMIT 1")
+            .get_result(conn)
+            .optional()
+            .map_err(|error| format!("snapshot effective_at unavailable: {error}"))?;
     row.map(|r| {
         chrono::DateTime::parse_from_rfc3339(&r.effective_at)
             .map(|dt| dt.date_naive())
@@ -1568,9 +1572,7 @@ mod tests {
     #[test]
     fn portfolio_state_snapshot_upserts_today_ledger_from_confirmed_snapshot() {
         let _ = DatabaseManager::init(None);
-        let mut conn = DatabaseManager::get()
-            .get_conn()
-            .expect("test db conn");
+        let mut conn = DatabaseManager::get().get_conn().expect("test db conn");
 
         // 1. 券商账户汇总（synthetic 值，结构同生产：eastmoney-app-screenshot）。
         //    effective_at=今天 → BR-234b 快照新鲜分支：以快照 4 字段为准。
@@ -1649,9 +1651,7 @@ mod tests {
     fn estimate_ledger_from_snapshot_uses_live_prices_and_prev_ledger() {
         let _ = DatabaseManager::init(None);
         crate::broker::ensure_test_quote_provider(); // 实时价 10.0/只
-        let mut conn = DatabaseManager::get()
-            .get_conn()
-            .expect("test db conn");
+        let mut conn = DatabaseManager::get().get_conn().expect("test db conn");
         let today = chrono::Local::now().date_naive();
         let yesterday = today.pred_opt().expect("yesterday");
 
@@ -1674,13 +1674,13 @@ mod tests {
         let snapshot = UserPositionSnapshot {
             snapshot_row_id: 1,
             snapshot_id: "TEST_CODE_SNAPSHOT_STALE".to_string(),
-            effective_at: chrono::DateTime::parse_from_rfc3339(
-                &format!("{yesterday}T15:46:00+08:00"),
-            )
+            effective_at: chrono::DateTime::parse_from_rfc3339(&format!(
+                "{yesterday}T15:46:00+08:00"
+            ))
             .expect("parse effective"),
-            confirmed_at: chrono::DateTime::parse_from_rfc3339(
-                &format!("{yesterday}T15:47:00+08:00"),
-            )
+            confirmed_at: chrono::DateTime::parse_from_rfc3339(&format!(
+                "{yesterday}T15:47:00+08:00"
+            ))
             .expect("parse confirmed"),
             source: "test-fixture".to_string(),
             confirm_empty: false,
@@ -1695,13 +1695,9 @@ mod tests {
 
         // 自算：market = Σ(明细 × 实时价10) = 10000，total = 10000 + 现金40000 = 50000，
         // daily_pnl = 50000 − 昨日48000 = 2000。
-        let (total, cash, market, pnl) = estimate_ledger_from_snapshot(
-            &snapshot,
-            &mut conn,
-            40_000.0,
-            today,
-        )
-        .expect("estimate ok");
+        let (total, cash, market, pnl) =
+            estimate_ledger_from_snapshot(&snapshot, &mut conn, 40_000.0, today)
+                .expect("estimate ok");
         assert_eq!(market, 10_000.0);
         assert_eq!(total, 50_000.0);
         assert_eq!(cash, 40_000.0);

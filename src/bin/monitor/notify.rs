@@ -2606,6 +2606,7 @@ pub async fn push_presented_source_fact_v3(
 
 /// BR-160 sole delivery entry for an immutable, already committed A-10 source
 /// batch. Kind and governance identity are derived from the binding.
+#[allow(dead_code)]
 pub async fn push_source_batch_v3(
     token: crate::presentation_registry::ProductionPresentationToken,
     text: &str,

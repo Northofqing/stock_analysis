@@ -75,9 +75,9 @@ pub fn resolve_codes(p: &Value) -> Result<Vec<String>, ParamsError> {
         .ok_or_else(|| ParamsError::InvalidArgument("codes 必须是字符串数组".into()))?;
     let mut codes = Vec::with_capacity(arr.len());
     for item in arr {
-        let s = item.as_str().ok_or_else(|| {
-            ParamsError::InvalidArgument("codes 元素必须是字符串".into())
-        })?;
+        let s = item
+            .as_str()
+            .ok_or_else(|| ParamsError::InvalidArgument("codes 元素必须是字符串".into()))?;
         if !s.is_empty() {
             codes.push(s.to_string());
         }
@@ -94,14 +94,14 @@ pub fn resolve_instruments(p: &Value) -> Result<Vec<String>, ParamsError> {
     let Some(value) = p.get("instruments") else {
         return Ok(watchlist_codes());
     };
-    let arr = value.as_array().ok_or_else(|| {
-        ParamsError::InvalidArgument("instruments 必须是对象数组".into())
-    })?;
+    let arr = value
+        .as_array()
+        .ok_or_else(|| ParamsError::InvalidArgument("instruments 必须是对象数组".into()))?;
     let mut codes = Vec::with_capacity(arr.len());
     for item in arr {
-        let obj = item.as_object().ok_or_else(|| {
-            ParamsError::InvalidArgument("instruments 元素必须是对象".into())
-        })?;
+        let obj = item
+            .as_object()
+            .ok_or_else(|| ParamsError::InvalidArgument("instruments 元素必须是对象".into()))?;
         let exchange = obj
             .get("exchange")
             .and_then(Value::as_str)
@@ -164,21 +164,20 @@ pub fn resolve_date(p: &Value) -> Result<NaiveDate, ParamsError> {
             let s = v.as_str().ok_or_else(|| {
                 ParamsError::InvalidArgument("date 必须是字符串 YYYY-MM-DD".into())
             })?;
-            NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|e| {
-                ParamsError::InvalidArgument(format!("date 格式非法 ({e}): {s}"))
-            })
+            NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .map_err(|e| ParamsError::InvalidArgument(format!("date 格式非法 ({e}): {s}")))
         }
     }
 }
 
 /// params[key]: 必填字符串。缺失/非字符串 → Err。
 pub fn resolve_required_string(p: &Value, key: &str) -> Result<String, ParamsError> {
-    let v = p.get(key).ok_or_else(|| {
-        ParamsError::InvalidArgument(format!("{key} 必填"))
-    })?;
-    let s = v.as_str().ok_or_else(|| {
-        ParamsError::InvalidArgument(format!("{key} 必须是字符串"))
-    })?;
+    let v = p
+        .get(key)
+        .ok_or_else(|| ParamsError::InvalidArgument(format!("{key} 必填")))?;
+    let s = v
+        .as_str()
+        .ok_or_else(|| ParamsError::InvalidArgument(format!("{key} 必须是字符串")))?;
     if s.is_empty() {
         return Err(ParamsError::InvalidArgument(format!("{key} 不能为空")));
     }
@@ -197,9 +196,9 @@ pub fn resolve_u32(p: &Value, key: &str, default: u32) -> Result<u32, ParamsErro
     match p.get(key) {
         None => Ok(default),
         Some(v) => {
-            let n = v.as_u64().ok_or_else(|| {
-                ParamsError::InvalidArgument(format!("{key} 必须是无符号整数"))
-            })?;
+            let n = v
+                .as_u64()
+                .ok_or_else(|| ParamsError::InvalidArgument(format!("{key} 必须是无符号整数")))?;
             u32::try_from(n)
                 .map_err(|_| ParamsError::InvalidArgument(format!("{key} 超出 u32 范围")))
         }
@@ -215,11 +214,11 @@ pub fn resolve_enum_str<'a>(
 ) -> Result<&'a str, ParamsError> {
     let value = match p.get(key) {
         None => default,
-        Some(v) => v.as_str().ok_or_else(|| {
-            ParamsError::InvalidArgument(format!("{key} 必须是字符串"))
-        })?,
+        Some(v) => v
+            .as_str()
+            .ok_or_else(|| ParamsError::InvalidArgument(format!("{key} 必须是字符串")))?,
     };
-    if allowed.iter().any(|a| *a == value) {
+    if allowed.contains(&value) {
         Ok(value)
     } else {
         Err(ParamsError::InvalidArgument(format!(
@@ -331,12 +330,22 @@ mod tests {
             "day1"
         );
         assert_eq!(
-            resolve_enum_str(&json!({"interval": "minute1"}), "interval", &["day1", "minute1"], "day1")
-                .unwrap(),
+            resolve_enum_str(
+                &json!({"interval": "minute1"}),
+                "interval",
+                &["day1", "minute1"],
+                "day1"
+            )
+            .unwrap(),
             "minute1"
         );
         assert!(matches!(
-            resolve_enum_str(&json!({"interval": "week1"}), "interval", &["day1", "minute1"], "day1"),
+            resolve_enum_str(
+                &json!({"interval": "week1"}),
+                "interval",
+                &["day1", "minute1"],
+                "day1"
+            ),
             Err(ParamsError::InvalidArgument(_))
         ));
     }

@@ -279,15 +279,41 @@ impl BoardDataGateway {
 
     /// Blocking entry for existing synchronous target-symbol consumers.
     ///
-    /// This is the same fixed Magic TDX production route and the same
-    /// evidence/audit admission as [`Self::memberships`]. It exists so a
-    /// caller already isolated in `spawn_blocking` does not create or drop a
-    /// nested Tokio runtime.
+    /// This uses the same configured transport selection and evidence/audit
+    /// admission as [`Self::memberships`]. It exists so a synchronous caller
+    /// can reuse the gRPC bridge's runtime-safe blocking wrapper.
     pub fn memberships_blocking(
         &self,
         code: &str,
     ) -> Result<GatewayBatch<BoardMembershipRecord>, GatewayError> {
         let code = validate_code(code, MEMBERSHIP_CAPABILITY)?.to_owned();
+        let request_hash = acquisition_request_hash(MEMBERSHIP_CAPABILITY, &code);
+        // BR-231: 同步消费者复用与 async memberships 完全相同的 gRPC
+        // acquisition + audit 分支；桥失败显式返回，绝不降级 library。
+        match super::grpc_source::bridge_for("BoardConstituents") {
+            Ok(Some(bridge)) => {
+                let result = bridge.board_constituents(&code);
+                let audit_provider = result
+                    .as_ref()
+                    .map(|batch| batch.evidence().provider)
+                    .unwrap_or(ProviderId::Tdx);
+                return audit_gateway_result(
+                    MEMBERSHIP_CAPABILITY,
+                    audit_provider,
+                    &request_hash,
+                    result,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_gateway_result(
+                    MEMBERSHIP_CAPABILITY,
+                    ProviderId::Tdx,
+                    &request_hash,
+                    Err(error),
+                );
+            }
+        }
         // no-feature (monitor 零 magic): library transport 不存在。
         // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
         #[cfg(not(feature = "magic-gateway"))]
@@ -1126,5 +1152,42 @@ mod tests {
         assert!(!eastmoney_invalid.retryable());
 
         assert_eq!(FLOW_CAPABILITY, "board-flows");
+    }
+}
+
+#[cfg(all(test, not(feature = "magic-gateway")))]
+mod no_magic_bridge_tests {
+    use super::BoardDataGateway;
+    use crate::database::DatabaseManager;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn blocking_membership_uses_grpc_bridge_when_enabled() {
+        DatabaseManager::init(None).expect("TEST_CODE audit database init");
+        std::env::set_var("DATA_GATEWAY_GRPC", "1");
+        std::env::remove_var("DATA_GATEWAY_GRPC_DISABLED");
+        std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
+        std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:1");
+        super::super::grpc_source::reset_bridge();
+
+        // resolve_test_equity 将该测试命名空间映射为合法上海 A 股 identity；
+        // 此调用只读查询 membership，不经过订单或生产写入路径。
+        let result = BoardDataGateway::new().memberships_blocking("TEST_CODE_600519");
+
+        std::env::remove_var("DATA_GATEWAY_GRPC");
+        std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
+        std::env::remove_var("GRPC_MARKET_ADDR");
+        super::super::grpc_source::reset_bridge();
+
+        let error = result.expect_err("unreachable gRPC bridge must fail closed");
+
+        assert_eq!(error.capability(), "GrpcBridge");
+        assert_eq!(error.reason_code(), "no_verified_batch");
+        assert!(error.retryable());
+        assert!(
+            !error.message().contains("library transport disabled"),
+            "blocking entry must try the configured bridge: {error}"
+        );
     }
 }

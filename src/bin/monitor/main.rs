@@ -1811,6 +1811,39 @@ fn latest_trading_date(today: chrono::NaiveDate) -> chrono::NaiveDate {
     }
 }
 
+#[derive(Default)]
+struct SnapshotReminderGate {
+    last_confirmed: Option<chrono::NaiveDate>,
+    in_flight: Option<chrono::NaiveDate>,
+}
+
+impl SnapshotReminderGate {
+    fn try_begin(&mut self, today: chrono::NaiveDate) -> bool {
+        if self
+            .last_confirmed
+            .is_some_and(|confirmed| confirmed >= today)
+            || self.in_flight.is_some()
+        {
+            return false;
+        }
+        self.in_flight = Some(today);
+        true
+    }
+
+    fn finish(&mut self, today: chrono::NaiveDate, confirmed: bool) {
+        if confirmed
+            && self
+                .last_confirmed
+                .is_none_or(|last_confirmed| today > last_confirmed)
+        {
+            self.last_confirmed = Some(today);
+        }
+        if self.in_flight == Some(today) {
+            self.in_flight = None;
+        }
+    }
+}
+
 /// 任务#3: 持仓快照过期检查 — BR-234b 后快照过期时系统自动估值（持仓×实时价），
 /// 快照的唯一用途是反映真实持仓变动。连续 5 个交易日无新快照 → 推送提醒
 /// （低频率交易者一周一检；1-4 个交易日仅日志）。触发点: 启动时 + 每日 15:10。
@@ -1847,20 +1880,31 @@ async fn check_snapshot_staleness_and_notify() {
         );
         return;
     }
-    // 每日一推去重
-    static LAST: std::sync::Mutex<Option<chrono::NaiveDate>> = std::sync::Mutex::new(None);
-    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-    if *last == Some(today) {
+    // BR-116: 短锁预约本次投递，确认后才提交日期；失败清除预约并保留重试资格。
+    static LAST: std::sync::Mutex<SnapshotReminderGate> =
+        std::sync::Mutex::new(SnapshotReminderGate {
+            last_confirmed: None,
+            in_flight: None,
+        });
+    let should_attempt = {
+        let mut gate = LAST.lock().unwrap_or_else(|error| error.into_inner());
+        gate.try_begin(today)
+    };
+    if !should_attempt {
         return;
     }
-    *last = Some(today);
     let text = format!(
         "[快照提醒] 持仓快照已 {days_behind} 个交易日未更新：最新 {}（总资产 {:.2}）。期间收益为自动估算（持仓×实时行情）；若真实持仓有变动，请上传最新截图。",
         summary.effective_at, summary.total_assets
     );
     log::warn!("[快照提醒] {}", text);
     let outcome = push_governor_v3(&text, PushKind::SnapshotStale, None).await;
-    if !outcome.is_pushed() {
+    let confirmed = periodic_delivery_confirmed(&outcome);
+    {
+        let mut gate = LAST.lock().unwrap_or_else(|error| error.into_inner());
+        gate.finish(today, confirmed);
+    }
+    if !confirmed {
         log::warn!("[快照提醒] 推送未投递: {:?}", outcome);
     }
 }
@@ -1883,6 +1927,7 @@ fn trading_days_since(start: chrono::NaiveDate, end: chrono::NaiveDate) -> i64 {
 /// - 估值日 > 快照日（快照后未上传）→ 自算 = 估值总市值 − 快照确认市值，
 ///   出声标注「按持仓市值差」口径（未计交易/现金变动；上传新快照即恢复确认值）。
 /// - 否则（估值日 ≤ 快照日）→ 用快照确认值 account.daily_pnl（当日精确）。
+///
 /// 纯函数，可单测。
 fn closing_valuation_account_note(
     account: &stock_analysis::database::user_account_summary::UserAccountSummary,
@@ -4268,6 +4313,35 @@ async fn main() {
     // DATA_GATEWAY_GRPC=1 才走 gRPC 桥; 桥接/禁用/保持本地清单一目了然)。
     log::info!("{}", stock_analysis::data_gateway::grpc_source::startup_banner());
 
+    // BR-231 / redlines 2.1, 2.2, 2.4, 2.7: production must prove the
+    // authenticated identity source before any producer loop is started.
+    // The canary is read-only and logs evidence identity, never credentials or
+    // security values. Test mode remains physically isolated from live data.
+    if !test_mode {
+        match stock_analysis::data_gateway::grpc_source::external_opening_readiness().await {
+            Ok(batch) => {
+                let evidence = batch.evidence();
+                log::info!(
+                    "[opening-readiness][BR-231] ExternalV1 verified-ready \
+                     provider={:?} source={} source_at={} observed_at={} batch_id={} records={}",
+                    evidence.provider,
+                    evidence.source,
+                    evidence.source_at.as_deref().unwrap_or("absent"),
+                    evidence.observed_at,
+                    evidence.batch_id,
+                    batch.records().len()
+                );
+            }
+            Err(error) => {
+                log::error!(
+                    "[opening-readiness][BR-231] ExternalV1 gate failed: {}",
+                    error
+                );
+                exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 2).await;
+            }
+        }
+    }
+
     stock_analysis::strategy::v16_4::register_all();
 
     let startup_health = health::health_check().await;
@@ -6269,6 +6343,7 @@ fn load_announcement_audience_codes(
     (audience, None)
 }
 
+#[cfg(test)]
 fn isolate_announcement_position_failure(
     audience: Result<std::collections::HashSet<String>, String>,
     registered_watch_codes: &std::collections::HashSet<String>,
@@ -10364,6 +10439,21 @@ mod tests_v17_4_d {
         assert!(!periodic_delivery_confirmed(
             &notify::PushOutcome::SinkError("TEST_CODE sink".to_string())
         ));
+    }
+
+    #[test]
+    fn br116_snapshot_reminder_gate_serializes_attempts_and_retries_unconfirmed() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
+        let mut gate = SnapshotReminderGate::default();
+
+        assert!(gate.try_begin(today));
+        assert!(!gate.try_begin(today), "same-day concurrent attempt must wait");
+
+        gate.finish(today, false);
+        assert!(gate.try_begin(today), "unconfirmed attempt must remain retryable");
+
+        gate.finish(today, true);
+        assert!(!gate.try_begin(today), "confirmed attempt closes the day");
     }
 }
 

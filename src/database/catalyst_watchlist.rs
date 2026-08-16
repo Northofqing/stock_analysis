@@ -400,11 +400,9 @@ mod tests {
     fn no_watchlist_before_returns_none() {
         let mut conn = connection();
         let checked = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
-        assert!(
-            latest_watchlist_before_with_conn(&mut conn, checked)
-                .unwrap()
-                .is_none()
-        );
+        assert!(latest_watchlist_before_with_conn(&mut conn, checked)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -424,7 +422,7 @@ mod tests {
             high: Some(14.03),
             open: Some(13.38),
         };
-        let first = save_outcomes_with_conn(&mut conn, &[o.clone()]).unwrap();
+        let first = save_outcomes_with_conn(&mut conn, std::slice::from_ref(&o)).unwrap();
         assert_eq!(first.inserted, 1);
         assert_eq!(first.skipped, 0);
         let second = save_outcomes_with_conn(&mut conn, &[o]).unwrap();
@@ -447,10 +445,9 @@ mod tests {
             &[],
         )
         .unwrap();
-        let update_err = diesel::sql_query(
-            "UPDATE catalyst_watchlist_daily SET name='改' WHERE code='600721'",
-        )
-        .execute(&mut conn);
+        let update_err =
+            diesel::sql_query("UPDATE catalyst_watchlist_daily SET name='改' WHERE code='600721'")
+                .execute(&mut conn);
         assert!(update_err.is_err());
         let delete_err =
             diesel::sql_query("DELETE FROM catalyst_watchlist_daily WHERE code='600721'")

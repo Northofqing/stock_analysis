@@ -5,8 +5,6 @@
 //!   --quote: 同上但发实时行情请求 (0x5053E), dump quote 行原始字节 (用于验证时间编码)。
 //! 只读探测，无写入、无推送。
 
-use std::time::Duration;
-
 #[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::net::connection::TcpConnection;
 #[cfg(feature = "magic-gateway")]
