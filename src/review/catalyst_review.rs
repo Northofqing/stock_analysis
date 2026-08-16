@@ -172,9 +172,22 @@ pub fn catalyst_review_from_chain_batch(
 /// BR-160: A-10 only consumes the exact visible batch published by the
 /// unified Gateway. Stale `chain_daily`, local rotation caches, and direct
 /// name lookups are not fallback sources.
+///
+/// M4c 双路 (用户决策「2 op 服务端化 → 全 gRPC → 移除」):
+/// - gRPC 模式 (DATA_GATEWAY_GRPC=1): 经 op 61 (market.chain_batch) 从服务端
+///   取完整 VisibleChainBatch — A-10 计算+stage+publish 副作用在服务端进程
+///   执行 (单写方), 本地只做 catalyst_review_from_chain_batch 纯转换。
+/// - library 模式 (默认): 本地 build_for_date 重算路径不变 (v15.x 出声)。
+/// 桥失败 → Err (fail-closed, 绝不静默回退 library 重算 — 双算会双写 chain_daily)。
 pub async fn load_catalyst_review_snapshot_real(
     date: &str,
 ) -> Result<CatalystReviewSnapshot, String> {
+    if let Some(batch) = crate::data_gateway::grpc_source::fetch_chain_batch_grpc(date)
+        .await
+        .map_err(|error| format!("A-10 gRPC chain_batch 获取失败: {error}"))?
+    {
+        return catalyst_review_from_chain_batch(&batch);
+    }
     let review_date = NaiveDate::parse_from_str(date, "%Y-%m-%d")
         .map_err(|error| format!("A-10 非法复盘日期 {date}: {error}"))?;
     let batch = crate::data_gateway::ChainIntelligenceGateway::new()

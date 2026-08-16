@@ -29,7 +29,7 @@ use crate::grpc_client::pb::magic::market::v1::Operation;
 use chrono::NaiveDate;
 use magic_market_core::{
     FinancialStatement, FlowInterval, InstrumentId, MarketStatistics, NorthboundChannel,
-    StatementKind,
+    ProviderId, StatementKind,
 };
 use magic_tdx_rs::protocol::types::SecurityBar;
 use serde_json::Value;
@@ -201,8 +201,8 @@ pub fn startup_banner() -> String {
     format!(
         "[data_gateway] 数据源模式 = {mode} | server = {server} | 桥接 {} ops | \
          禁用 = {disabled} | 保持本地 {} ops: {} \
-         (limit_pools/strong_stock_reasons 是 A-10 chain 计算+DB 发布, 非数据请求 \
-          — 服务端仅为同一共享表投影, 接桥会搬迁计算副作用, 违背 P4 只迁移 transport)",
+         (M4c: limit_pools/strong_stock_reasons 的 44/45 视图扁平不消费; monitor 复盘 \
+          经 chain_batch op 61 拿完整 VisibleChainBatch, A-10 计算+DB 发布在服务端)",
         HOOKED_OPS.len(),
         KEEP_LOCAL_OPS.len(),
         KEEP_LOCAL_OPS.join(",")
@@ -907,6 +907,87 @@ impl GrpcSource {
             window_start,
         ))
     }
+
+    /// M4c: A-10 完整 batch (op 61, market.chain_batch)。服务端执行
+    /// build_for_date 计算+stage+publish (单写方), 本方法只重建 VisibleChainBatch。
+    pub async fn chain_batch_async(
+        &self,
+        date: &str,
+    ) -> Result<crate::database::chain_intelligence::VisibleChainBatch, GatewayError> {
+        let q = self
+            .query_op(Operation::ChainBatch, serde_json::json!({ "date": date }))
+            .await
+            .map_err(|e| {
+                GatewayError::classified(
+                    "A-10",
+                    Some(ProviderId::Custom),
+                    "unavailable",
+                    "chain_batch_fetch",
+                    true,
+                    format!("A-10 chain_batch op 61 查询失败: {e}"),
+                )
+            })?;
+        let record = q.records.first().ok_or_else(|| {
+            GatewayError::classified(
+                "A-10",
+                Some(ProviderId::Custom),
+                "unavailable",
+                "empty_chain_batch",
+                true,
+                "A-10 chain_batch 响应无记录".to_string(),
+            )
+        })?;
+        let batch: crate::database::chain_intelligence::VisibleChainBatch =
+            serde_json::from_slice(&record.data).map_err(|e| {
+                GatewayError::classified(
+                    "A-10",
+                    Some(ProviderId::Custom),
+                    "unavailable",
+                    "chain_batch_parse",
+                    true,
+                    format!("VisibleChainBatch 反序列化失败: {e}"),
+                )
+            })?;
+        if batch.trading_date.format("%Y-%m-%d").to_string() != date {
+            return Err(GatewayError::classified(
+                "A-10",
+                Some(ProviderId::Custom),
+                "unavailable",
+                "chain_batch_date_mismatch",
+                true,
+                format!(
+                    "A-10 visible batch as_of={} differs from requested {}",
+                    batch.trading_date, date
+                ),
+            ));
+        }
+        Ok(batch)
+    }
+}
+
+/// M4c: A-10 完整 batch 静态入口 (catalyst_review 复盘消费, 无桥实例上下文)。
+/// gRPC 模式 (DATA_GATEWAY_GRPC=1) → 服务端计算+写库, 返回完整 batch;
+/// library 模式 → Ok(None), 调用方走本地 build_for_date (默认出声, v15.x);
+/// gRPC 模式失败 → Err (fail-closed, 绝不静默回退 library 重算)。
+pub async fn fetch_chain_batch_grpc(
+    date: &str,
+) -> Result<Option<crate::database::chain_intelligence::VisibleChainBatch>, GatewayError> {
+    if std::env::var("DATA_GATEWAY_GRPC").as_deref() != Ok("1") {
+        return Ok(None);
+    }
+    let source = bridge_for("ChainBatch")?.ok_or_else(|| {
+        GatewayError::classified(
+            "A-10",
+            Some(ProviderId::Custom),
+            "unavailable",
+            "bridge_disabled",
+            true,
+            "ChainBatch 被 DATA_GATEWAY_GRPC_DISABLED 排除, 复盘需要完整 batch \
+             — 不静默回退 library (fail-closed)"
+                .to_string(),
+        )
+    })?;
+    source.chain_batch_async(date).await.map(Some)
 }
 
 #[cfg(test)]
@@ -1093,8 +1174,8 @@ mod tests {
         assert!(b.contains("禁用 = T0Evidence,InstrumentNews"), "禁用列表: {b}");
         assert!(b.contains("保持本地 2 ops"), "keep-local 计数: {b}");
         assert!(
-            b.contains("A-10 chain 计算+DB 发布"),
-            "keep-local 原因出声: {b}"
+            b.contains("chain_batch op 61"),
+            "M4c keep-local 原因出声 (op 61 消费): {b}"
         );
         std::env::remove_var("DATA_GATEWAY_GRPC");
         std::env::remove_var("DATA_GATEWAY_GRPC_DISABLED");
@@ -1148,5 +1229,31 @@ mod tests {
             "HOOKED_OPS 与真实 bridge_for 调用不一致 (banner 会撒谎)。\
              改钩子时同步 const, 改 const 时同步钩子。"
         );
+    }
+
+    /// M4c wire 契约: canned JSON (与 delegate.rs fetch_chain_batch / fixture.rs
+    /// fixture-cb 视图保持一致) → VisibleChainBatch 反序列化 roundtrip。
+    /// 服务端 build_for_date 输出经 serde_json::to_vec 直出, 客户端 from_slice 重建 —
+    /// 这个测试 pin 住双向 serde 一致 (字段改名会在这里炸)。
+    #[test]
+    fn chain_batch_wire_roundtrip() {
+        use crate::database::chain_intelligence::VisibleChainBatch;
+        let canned = r#"{"batch_id":"fixture-cb","content_hash":"h1","trading_date":"2026-08-15","calculation_version":"v1","taxonomy_version":"t1","inputs":[{"input_id":"i1","ordinal":1,"capability":"limit-up","provider":"tdx","source":"tdx","source_at":"2026-08-15T10:00:00+08:00","observed_at":"2026-08-15T10:00:00+08:00","source_batch_id":"b1","source_batch_hash":"h1","content_hash":"h1"}],"chains":[{"chain_id":"c1","canonical_board_id":"BK0475","board_name":"白酒","upper_limit_count":3,"continuous_count":2,"members":[{"instrument_id":"600519","security_name":"贵州茅台","source_event_id":"e1","streak":2}]}],"rejections":[]}"#;
+        let batch: VisibleChainBatch = serde_json::from_slice(canned.as_bytes())
+            .expect("canned fixture-cb JSON → VisibleChainBatch");
+        assert_eq!(batch.batch_id, "fixture-cb");
+        assert_eq!(batch.trading_date.format("%Y-%m-%d").to_string(), "2026-08-15");
+        assert_eq!(batch.chains.len(), 1);
+        assert_eq!(batch.chains[0].canonical_board_id, "BK0475");
+        assert_eq!(batch.chains[0].members.len(), 1);
+        assert_eq!(batch.chains[0].members[0].instrument_id, "600519");
+        assert_eq!(batch.chains[0].members[0].streak, 2);
+        assert!(batch.rejections.is_empty());
+        // 双向: 序列化回去仍可重建 (服务端 to_vec → 客户端 from_slice 往返)。
+        let reencoded = serde_json::to_vec(&batch).expect("VisibleChainBatch → bytes");
+        let round: VisibleChainBatch =
+            serde_json::from_slice(&reencoded).expect("重新反序列化");
+        assert_eq!(round.batch_id, batch.batch_id);
+        assert_eq!(round.trading_date, batch.trading_date);
     }
 }
