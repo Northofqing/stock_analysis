@@ -1,17 +1,17 @@
 //! BR-066/BR-133/BR-137/BR-166/BR-172 evidence-preserving global financial-news acquisition.
 
-use super::review::{acquisition_request_hash, audit_gateway_result};
 #[cfg(feature = "magic-gateway")]
 use super::review::audit_blocking_join_failure;
-use super::{GatewayBatch, GatewayError};
+use super::review::{acquisition_request_hash, audit_gateway_result};
 #[cfg(feature = "magic-gateway")]
 use super::BatchEvidence;
+use super::{GatewayBatch, GatewayError};
+#[cfg(feature = "magic-gateway")]
+use crate::magic_compat::{DataBatch, PositiveU32};
+use crate::magic_compat::{ProviderId, SourceEvidence};
 use chrono::{DateTime, Utc};
 #[cfg(feature = "magic-gateway")]
 use chrono::{FixedOffset, NaiveDateTime, TimeZone};
-use crate::magic_compat::{ProviderId, SourceEvidence};
-#[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{DataBatch, PositiveU32};
 #[cfg(feature = "magic-gateway")]
 use magic_cls_rs::{ClsClient, ClsError};
 #[cfg(feature = "magic-gateway")]

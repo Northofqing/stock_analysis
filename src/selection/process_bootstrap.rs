@@ -268,15 +268,15 @@ fn classify_parsed_invocation(
     BoundSelectionProcess::Operational {
         generation: 1,
         parsed,
-        selection: match crate::selection::activation_gate::evaluate_production_selection_v2_activation()
-        {
-            crate::selection::activation_gate::SelectionV2ActivationVerdict::Enabled => {
-                SelectionCapabilityState::Enabled
-            }
-            crate::selection::activation_gate::SelectionV2ActivationVerdict::Disabled {
-                reason_code,
-            } => SelectionCapabilityState::Disabled { reason_code },
-        },
+        selection:
+            match crate::selection::activation_gate::evaluate_production_selection_v2_activation() {
+                crate::selection::activation_gate::SelectionV2ActivationVerdict::Enabled => {
+                    SelectionCapabilityState::Enabled
+                }
+                crate::selection::activation_gate::SelectionV2ActivationVerdict::Disabled {
+                    reason_code,
+                } => SelectionCapabilityState::Disabled { reason_code },
+            },
     }
 }
 

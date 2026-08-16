@@ -4,10 +4,9 @@
 //! 数据来源: 轮询快照 diff (纯函数 diff_snapshots) → EventHub 广播 + ring 重放。
 //! fixture 模式不启动轮询, 集成测试直接注入 DetectedEvent。
 use crate::grpc_client::pb::magic::market::v1::{
-    market_event_service_server::MarketEventService, AdmissionState, CanonicalPayload,
-    EventCursor, EventFilter, ListenerStatusRequest, ListenerStatusResponse,
-    MarketEventEnvelope, ReplayRequest, SetWatchlistRequest, SetWatchlistResponse,
-    SubscribeRequest,
+    market_event_service_server::MarketEventService, AdmissionState, CanonicalPayload, EventCursor,
+    EventFilter, ListenerStatusRequest, ListenerStatusResponse, MarketEventEnvelope, ReplayRequest,
+    SetWatchlistRequest, SetWatchlistResponse, SubscribeRequest,
 };
 use crate::grpc_server::ServerState;
 use std::collections::VecDeque;
@@ -137,7 +136,11 @@ pub fn diff_snapshots(
                 change_pct: q.change_pct(),
                 volume: q.volume,
                 amount: q.amount,
-                reason: if now_halted { "停牌".to_string() } else { "复牌".to_string() },
+                reason: if now_halted {
+                    "停牌".to_string()
+                } else {
+                    "复牌".to_string()
+                },
             });
         }
     }
@@ -171,7 +174,10 @@ impl EventHub {
         let envelope = MarketEventEnvelope {
             protocol_version: 1,
             event_id: crate::grpc_client::envelope::new_request_id(),
-            cursor: Some(EventCursor { generation: self.generation.clone(), sequence }),
+            cursor: Some(EventCursor {
+                generation: self.generation.clone(),
+                sequence,
+            }),
             event_kind: event.kind.as_str().to_string(),
             provider: "tdx-dev".to_string(),
             instrument: event.code.clone(),
@@ -209,17 +215,25 @@ impl EventHub {
             .back()
             .and_then(|e| e.cursor.as_ref().map(|c| c.sequence))
             .unwrap_or(0);
-        EventCursor { generation: self.generation.clone(), sequence: seq }
+        EventCursor {
+            generation: self.generation.clone(),
+            sequence: seq,
+        }
     }
 
     /// Replay: 有界、同 generation、best-effort (合同 §8)。
-    pub fn replay_after(&self, cursor: Option<EventCursor>) -> Result<Vec<MarketEventEnvelope>, Status> {
+    pub fn replay_after(
+        &self,
+        cursor: Option<EventCursor>,
+    ) -> Result<Vec<MarketEventEnvelope>, Status> {
         let ring = self.ring.lock().unwrap();
         let Some(cursor) = cursor else {
             return Ok(ring.iter().cloned().collect());
         };
         if cursor.generation != self.generation {
-            return Err(Status::failed_precondition("generation 不匹配, 连续性已重置"));
+            return Err(Status::failed_precondition(
+                "generation 不匹配, 连续性已重置",
+            ));
         }
         if cursor.sequence == 0 {
             // 序列从 1 开始; 0 = 无事件序号, 与 None 同义 → 从起点重放。
@@ -281,8 +295,7 @@ impl MarketEventService for EventService {
     // 即使返回类型相同也不能共用。
     type SubscribeStream =
         tokio_stream::wrappers::ReceiverStream<Result<MarketEventEnvelope, Status>>;
-    type ReplayStream =
-        tokio_stream::wrappers::ReceiverStream<Result<MarketEventEnvelope, Status>>;
+    type ReplayStream = tokio_stream::wrappers::ReceiverStream<Result<MarketEventEnvelope, Status>>;
 
     async fn subscribe(
         &self,
@@ -299,21 +312,19 @@ impl MarketEventService for EventService {
         let replay = hub.replay_after(inner.after)?;
         tokio::spawn(async move {
             for envelope in replay {
-                if envelope_matches(&envelope, &filter)
-                    && tx.send(Ok(envelope)).await.is_err()
-                {
+                if envelope_matches(&envelope, &filter) && tx.send(Ok(envelope)).await.is_err() {
                     return;
                 }
             }
             while let Ok(envelope) = live_rx.recv().await {
-                if envelope_matches(&envelope, &filter)
-                    && tx.send(Ok(envelope)).await.is_err()
-                {
+                if envelope_matches(&envelope, &filter) && tx.send(Ok(envelope)).await.is_err() {
                     return;
                 }
             }
         });
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     async fn replay(
@@ -330,7 +341,9 @@ impl MarketEventService for EventService {
                 }
             }
         });
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     async fn get_listener_status(
@@ -377,7 +390,11 @@ impl MarketEventService for EventService {
         let mut watchlist = self.state.watchlist.lock().unwrap();
         watchlist.clear();
         watchlist.extend(inner.instruments.iter().cloned());
-        let revision = self.state.watchlist_revision.fetch_add(1, Ordering::Relaxed) + 1;
+        let revision = self
+            .state
+            .watchlist_revision
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
         Ok(Response::new(SetWatchlistResponse {
             request_id: "set-watchlist".to_string(),
             desired_revision: revision,
@@ -457,9 +474,13 @@ mod tests {
         let halted = vec![q("600519", 1500.0, 1500.0, 0, 0.0)];
         let resumed = vec![q("600519", 1500.0, 1500.0, 50, 5e7)];
         let e1 = diff_snapshots(&prev, &halted, 0.5, 1.5);
-        assert!(e1.iter().any(|e| e.kind == EventKind::Status && e.reason == "停牌"));
+        assert!(e1
+            .iter()
+            .any(|e| e.kind == EventKind::Status && e.reason == "停牌"));
         let e2 = diff_snapshots(&halted, &resumed, 0.5, 1.5);
-        assert!(e2.iter().any(|e| e.kind == EventKind::Status && e.reason == "复牌"));
+        assert!(e2
+            .iter()
+            .any(|e| e.kind == EventKind::Status && e.reason == "复牌"));
     }
 
     #[test]

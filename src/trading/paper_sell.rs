@@ -25,8 +25,7 @@ use crate::database::DatabaseManager;
 use crate::pipeline::position_tracker::{evaluate_sell_rules, SellEvaluation};
 use crate::strategy::detect_boll_macd_signal;
 use crate::trading::paper_trade::{
-    portfolio_state_snapshot, simulate, Direction, PaperRiskContext, PaperSignal,
-    PaperTradeStatus,
+    portfolio_state_snapshot, simulate, Direction, PaperRiskContext, PaperSignal, PaperTradeStatus,
 };
 use crate::trend_analyzer::StockTrendAnalyzer;
 
@@ -268,7 +267,10 @@ fn evaluate_and_sell(
 ) -> Result<Option<PaperSellResult>, String> {
     // 1. 实时价（BR-218 5s 门；超龄 fail-closed，下 tick 重试）
     let quote = crate::broker::execution_quote(&pos.code).map_err(|error| {
-        warn!("[paper_sell] {} 实时价不可用，本 tick 跳过: {error}", pos.code);
+        warn!(
+            "[paper_sell] {} 实时价不可用，本 tick 跳过: {error}",
+            pos.code
+        );
         error
     })?;
 
@@ -406,8 +408,20 @@ mod tests {
     #[test]
     fn aggregate_computes_net_quantity_weighted_cost_and_first_buy_date() {
         init_test_db();
-        insert_buy("TEST_CODE_600001", "测试甲", 10.0, 200, "2026-08-03 10:00:00");
-        insert_buy("TEST_CODE_600001", "测试甲", 12.0, 100, "2026-08-05 10:00:00");
+        insert_buy(
+            "TEST_CODE_600001",
+            "测试甲",
+            10.0,
+            200,
+            "2026-08-03 10:00:00",
+        );
+        insert_buy(
+            "TEST_CODE_600001",
+            "测试甲",
+            12.0,
+            100,
+            "2026-08-05 10:00:00",
+        );
         insert_sell("TEST_CODE_600001", 11.0, 100, "2026-08-06 10:00:00");
 
         let positions = aggregate_open_positions().unwrap();
@@ -427,7 +441,13 @@ mod tests {
     #[test]
     fn aggregate_drops_fully_sold_positions() {
         init_test_db();
-        insert_buy("TEST_CODE_600002", "测试乙", 10.0, 100, "2026-08-03 10:00:00");
+        insert_buy(
+            "TEST_CODE_600002",
+            "测试乙",
+            10.0,
+            100,
+            "2026-08-03 10:00:00",
+        );
         insert_sell("TEST_CODE_600002", 11.0, 100, "2026-08-06 10:00:00");
         let positions = aggregate_open_positions().unwrap();
         assert!(

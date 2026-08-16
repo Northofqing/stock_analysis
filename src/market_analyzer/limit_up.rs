@@ -1,8 +1,8 @@
 //! Registered business rules: BR-213, BR-220, BR-221.
 //! Evidence-preserving upper-limit market projection.
 
-use anyhow::{bail, Result};
 use crate::magic_compat::{LimitPoolEntry, LimitPoolKind, RatioUnit};
+use anyhow::{bail, Result};
 
 use crate::data_gateway::market_capabilities::{MarketCapabilitiesGateway, MarketSecurityIdentity};
 use crate::data_gateway::{
@@ -309,9 +309,11 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
-    use chrono::{DateTime, Utc};
     use crate::magic_compat::ProviderId;
-    use crate::magic_compat::{AssetClass, Exchange, InstrumentId, IsoDate, Price, Ratio, SourceEvidence};
+    use crate::magic_compat::{
+        AssetClass, Exchange, InstrumentId, IsoDate, Price, Ratio, SourceEvidence,
+    };
+    use chrono::{DateTime, Utc};
 
     const TEST_DATE: &str = "2099-01-02";
     const TEST_DATE_TIME: &str = "2099-01-02T10:00:00+08:00";

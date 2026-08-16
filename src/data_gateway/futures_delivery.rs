@@ -1,21 +1,24 @@
 //! BR-165/BR-199 evidence-preserving CFFEX futures-delivery acquisition.
 
-use super::review::{acquisition_request_hash, audit_gateway_result};
 #[cfg(feature = "magic-gateway")]
 use super::review::audit_blocking_join_failure;
-use super::{GatewayBatch, GatewayError};
+use super::review::{acquisition_request_hash, audit_gateway_result};
 #[cfg(feature = "magic-gateway")]
 use super::BatchEvidence;
-use chrono::NaiveDate;
-#[cfg(feature = "magic-gateway")]
-use chrono::Datelike;
-#[cfg(feature = "magic-gateway")]
-use magic_exchange_rs::{CffexClient, ExchangeError};
+use super::{GatewayBatch, GatewayError};
 use crate::magic_compat::ProviderId;
 #[cfg(feature = "magic-gateway")]
 use crate::magic_compat::{DataBatch, PositiveU32};
 #[cfg(feature = "magic-gateway")]
-use magic_market_core::{FuturesDeliveryCalendar, FuturesDeliveryEvent, FuturesDeliveryMethod, FuturesDeliveryRequest, FuturesProduct};
+use chrono::Datelike;
+use chrono::NaiveDate;
+#[cfg(feature = "magic-gateway")]
+use magic_exchange_rs::{CffexClient, ExchangeError};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{
+    FuturesDeliveryCalendar, FuturesDeliveryEvent, FuturesDeliveryMethod, FuturesDeliveryRequest,
+    FuturesProduct,
+};
 #[cfg(feature = "magic-gateway")]
 use std::collections::HashSet;
 
@@ -76,7 +79,12 @@ impl FuturesDeliveryGateway {
             }
             Ok(None) => {}
             Err(error) => {
-                return audit_gateway_result(CAPABILITY, ProviderId::Cffex, &request_hash, Err(error));
+                return audit_gateway_result(
+                    CAPABILITY,
+                    ProviderId::Cffex,
+                    &request_hash,
+                    Err(error),
+                );
             }
         }
         // no-feature (monitor 零 magic): library transport 不存在。
@@ -365,9 +373,9 @@ fn cffex_gateway_error(error: ExchangeError) -> GatewayError {
 #[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
-    use magic_exchange_rs::TlsBackend;
     use crate::magic_compat::{IsoDate, NonEmptyText, Provenance, SourceEvidence};
-use magic_market_core::{HttpsUrl};
+    use magic_exchange_rs::TlsBackend;
+    use magic_market_core::HttpsUrl;
 
     fn request() -> FuturesDeliveryRequest {
         build_request(2026, 7).expect("TEST_CODE request")

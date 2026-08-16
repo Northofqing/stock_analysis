@@ -7,7 +7,6 @@
 //! the producer-readiness barrier.
 
 use chrono::{DateTime, NaiveDate, Utc};
-use stock_analysis::magic_compat::{AssetClass, Exchange, InstrumentId};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -19,6 +18,7 @@ use stock_analysis::durable_delivery::{
     ScheduleHydrationState, TaskBinding,
 };
 use stock_analysis::event::DurableDeliveryImmutableAppend;
+use stock_analysis::magic_compat::{AssetClass, Exchange, InstrumentId};
 
 use crate::notify::{DailyReportSubKind, PushKind, PushOutcome};
 

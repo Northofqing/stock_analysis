@@ -1660,8 +1660,8 @@ mod tests {
         GlobalNewsRecord,
         crate::data_gateway::BatchEvidence,
     ) {
-        use chrono::{DateTime, Utc};
         use crate::magic_compat::{ProviderId, SourceEvidence};
+        use chrono::{DateTime, Utc};
 
         let provider = GlobalNewsProvider::Jin10;
         let published_at = DateTime::parse_from_rfc3339(published_at_raw)
@@ -1756,8 +1756,8 @@ mod tests {
 
     #[test]
     fn flash_fact_with_mismatched_record_batch_is_rejected() {
-        use chrono::{DateTime, Utc};
         use crate::magic_compat::{ProviderId, SourceEvidence};
+        use chrono::{DateTime, Utc};
 
         let (provider, mut record, batch_evidence) =
             flash_gateway_fixture("2026-07-27T09:30:00+08:00", "TEST_CODE_FLASH_BATCH");

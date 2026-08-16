@@ -465,17 +465,13 @@ pub async fn push_flash_decisions(decisions: Vec<FlashDecision>) -> (usize, usiz
 /// 红线 2.2: 无真实实时报价 (执行报价新鲜度 ≤5s) 的票不入池, 不造价格。
 /// LLM 不可用 / 提取失败 → 出声 warn, 本轮不入池 (v15.x 静默路径可见)。
 /// 返回 (入池数, 因无报价/已入池跳过数)。
-pub async fn candidate_ingest_from_news(
-    titles: &[String],
-) -> (usize, usize) {
+pub async fn candidate_ingest_from_news(titles: &[String]) -> (usize, usize) {
     if titles.is_empty() {
         return (0, 0);
     }
     let registry = stock_analysis::llm::LlmRegistry::from_env();
     let Some(provider) = registry.select("ticker") else {
-        log::warn!(
-            "[候选入池][BR-183] LLM role=ticker 无可用 provider (env 未配置), 本轮不入池"
-        );
+        log::warn!("[候选入池][BR-183] LLM role=ticker 无可用 provider (env 未配置), 本轮不入池");
         return (0, 0);
     };
     // 2026-08-08 实测: 20 条标题 → 输出超 8192 tokens 仍可能截断; 10 条

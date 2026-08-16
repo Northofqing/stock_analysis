@@ -1061,23 +1061,25 @@ pub async fn poll_earnings_and_analyst(
                                 // 暂停分类直到报告期/预测年度/口径合同完成。
                                 // (gate 关闭时跳过分类, events 保持为空, 收尾照常)
                                 if earnings_classification_gate() {
-                                    if let Some(classification) =
-                                        classify_earnings(latest_period, &consensus.data, earnings_cfg)
-                                    {
-                                    match earnings_classification_to_event(
-                                        code_str,
-                                        &classification,
-                                        published_on,
-                                        source_batches,
+                                    if let Some(classification) = classify_earnings(
+                                        latest_period,
+                                        &consensus.data,
+                                        earnings_cfg,
                                     ) {
-                                        Ok(event) => events.push(event),
-                                        Err(error) => {
-                                            source_failures += 1;
-                                            log::warn!(
+                                        match earnings_classification_to_event(
+                                            code_str,
+                                            &classification,
+                                            published_on,
+                                            source_batches,
+                                        ) {
+                                            Ok(event) => events.push(event),
+                                            Err(error) => {
+                                                source_failures += 1;
+                                                log::warn!(
                                                 "[v17_sources][BR-137] earnings source fact rejected: {error}"
                                             );
+                                            }
                                         }
-                                    }
                                     }
                                 }
                             }
@@ -1929,7 +1931,10 @@ mod tests {
             "default must be disabled until 口径合同 bound"
         );
         std::env::set_var("EARNINGS_BEAT_ENABLED", "1");
-        assert!(earnings_classification_gate(), "explicit opt-in must enable");
+        assert!(
+            earnings_classification_gate(),
+            "explicit opt-in must enable"
+        );
         std::env::set_var("EARNINGS_BEAT_ENABLED", "0");
         assert!(
             !earnings_classification_gate(),

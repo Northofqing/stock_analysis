@@ -1,5 +1,6 @@
 //! BR-164 evidence-preserving production financial/news data gateway.
 
+pub mod block_trade;
 pub mod board;
 pub mod board_ranking;
 mod board_runtime;
@@ -26,7 +27,6 @@ pub mod magic_tdx;
 pub mod magic_tdx_selection;
 pub mod magic_tdx_t0;
 pub mod market_capabilities;
-pub mod block_trade;
 pub mod market_data;
 pub mod outcome_daily_bars;
 pub mod position_chain;
@@ -35,6 +35,7 @@ pub mod review;
 pub mod security_lifecycle;
 pub mod sina_instrument_news;
 
+pub use block_trade::{BlockTradeReview, BlockTradesGateway};
 pub use board::{
     load_verified_board_artifact_default, BoardBindingRegistry, BoardDataGateway,
     BoardDirectoryFact, BoardDirectoryRecordEvidence, BoardFlowFact, BoardKind,
@@ -46,12 +47,12 @@ pub use capital::{
     CapitalDataGateway, InstrumentFundFlowFact, NorthboundDailyFact, NorthboundQuotaFact,
     NorthboundTopTurnoverFact, ProviderTopNFact, ProviderTopNPair, ProviderTopNRequestEvidence,
 };
-pub use chain_intelligence::{
-    ChainIntelligencePolicy, ChainSourceEvidence, ChainSourceRejection, UpperLimitFact,
-};
 #[cfg(feature = "magic-gateway")]
 pub use chain_intelligence::{
     build_chain_intelligence_batch, BoardMembershipFact, ChainIntelligenceGateway,
+};
+pub use chain_intelligence::{
+    ChainIntelligencePolicy, ChainSourceEvidence, ChainSourceRejection, UpperLimitFact,
 };
 pub use company::CompanyDataGateway;
 pub use consensus::ConsensusDataGateway;
@@ -89,7 +90,6 @@ pub use market_capabilities::{
     MarketOrderBook, MarketSecurityMetadata, SecurityBoard, METADATA_PROVIDER_ORDER,
     MINUTE_PROVIDER_ORDER, MONEY_FLOW_PROVIDER_ORDER, ORDER_BOOK_PROVIDER_ORDER,
 };
-pub use block_trade::{BlockTradeReview, BlockTradesGateway};
 pub use market_data::{MarketDataGateway, RealtimeMarketQuote};
 pub use outcome_daily_bars::{AdmittedOutcomeDailyBars, OutcomeDailyBarsGateway};
 pub use position_chain::{

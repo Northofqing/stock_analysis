@@ -278,9 +278,9 @@ fn render_section(
 mod tests {
     use super::{apply_with_index_change, project_index_change};
     use crate::data_gateway::{BatchEvidence, GatewayBatch, RealtimeIndexQuote};
+    use crate::magic_compat::ProviderId;
     use crate::pipeline::AnalysisResult;
     use chrono::{TimeZone, Utc};
-    use crate::magic_compat::ProviderId;
 
     fn result(code: &str, advice: &str, change: Option<f64>) -> AnalysisResult {
         let mut result: AnalysisResult = serde_json::from_value(serde_json::json!({

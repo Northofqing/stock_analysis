@@ -9,13 +9,13 @@ use crate::data_gateway::review::{audit_blocking_join_failure, BatchEvidence};
 use crate::data_provider::consensus::ConsensusData;
 #[cfg(feature = "magic-gateway")]
 use crate::data_provider::consensus::RecentReport;
+use crate::magic_compat::ProviderId;
+#[cfg(feature = "magic-gateway")]
+use crate::magic_compat::{InstrumentId, PositiveU32};
 #[cfg(feature = "magic-gateway")]
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime};
 #[cfg(feature = "magic-gateway")]
 use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
-use crate::magic_compat::ProviderId;
-#[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{InstrumentId, PositiveU32};
 #[cfg(feature = "magic-gateway")]
 use magic_market_core::{ReportScope, ResearchReport, ResearchReports, ResearchRequest};
 #[cfg(feature = "magic-gateway")]
@@ -371,8 +371,10 @@ fn map_provider_error(error: EastmoneyError) -> GatewayError {
 #[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
-    use crate::magic_compat::{AssetClass, Exchange, FiniteNumber, NonEmptyText, Price, SourceEvidence};
-use magic_market_core::{EarningsEstimate, HttpsUrl};
+    use crate::magic_compat::{
+        AssetClass, Exchange, FiniteNumber, NonEmptyText, Price, SourceEvidence,
+    };
+    use magic_market_core::{EarningsEstimate, HttpsUrl};
 
     fn instrument() -> InstrumentId {
         InstrumentId::new(Exchange::Shanghai, "TEST_CODE_600396", AssetClass::Equity)

@@ -1,15 +1,15 @@
 //! BR-161 evidence-preserving global-index and foreign-exchange acquisition.
 
-use super::review::{acquisition_request_hash, audit_gateway_result};
 #[cfg(feature = "magic-gateway")]
 use super::review::audit_blocking_join_failure;
-use super::{GatewayBatch, GatewayError};
+use super::review::{acquisition_request_hash, audit_gateway_result};
 #[cfg(feature = "magic-gateway")]
 use super::BatchEvidence;
-use chrono::{DateTime, Utc};
-use crate::magic_compat::{FxPair, GlobalIndexCode, ProviderId};
+use super::{GatewayBatch, GatewayError};
 #[cfg(feature = "magic-gateway")]
 use crate::magic_compat::{DataBatch, RatioUnit};
+use crate::magic_compat::{FxPair, GlobalIndexCode, ProviderId};
+use chrono::{DateTime, Utc};
 #[cfg(feature = "magic-gateway")]
 // GlobalIndexProvider/ForeignExchangeProvider 是 method-resolution trait
 // (正文无 :: 用法), 提供 .global_indices()/.foreign_exchange() 方法解析。
@@ -66,10 +66,8 @@ impl GlobalMarketGateway {
 
     /// Acquires exactly Dow Jones, Nasdaq Composite and S&P 500.
     pub async fn us_indices(&self) -> Result<GatewayBatch<GlobalIndexFact>, GatewayError> {
-        let request_hash = acquisition_request_hash(
-            INDEX_CAPABILITY,
-            "DowJones,NasdaqComposite,Sp500",
-        );
+        let request_hash =
+            acquisition_request_hash(INDEX_CAPABILITY, "DowJones,NasdaqComposite,Sp500");
         // P4 M3 钩子 (2026-08-17 补): DATA_GATEWAY_GRPC=1 → gRPC 通道 (fail-closed,
         // audit 对等)。此前 GlobalIndices 服务端 delegate/桥方法已存在但网关钩子缺失
         // → 零 magic 生产构建 push_templates.rs us_indices 每天 fail-closed 报错。
@@ -80,7 +78,12 @@ impl GlobalMarketGateway {
                     .as_ref()
                     .map(|b| b.evidence().provider)
                     .unwrap_or(ProviderId::Sina);
-                return audit_gateway_result(INDEX_CAPABILITY, audit_provider, &request_hash, result);
+                return audit_gateway_result(
+                    INDEX_CAPABILITY,
+                    audit_provider,
+                    &request_hash,
+                    result,
+                );
             }
             Ok(None) => {}
             Err(error) => {
@@ -162,7 +165,12 @@ impl GlobalMarketGateway {
             }
             Ok(None) => {}
             Err(error) => {
-                return audit_gateway_result(FX_CAPABILITY, ProviderId::Sina, &request_hash, Err(error));
+                return audit_gateway_result(
+                    FX_CAPABILITY,
+                    ProviderId::Sina,
+                    &request_hash,
+                    Err(error),
+                );
             }
         }
         // no-feature (monitor 零 magic): library transport 不存在。
@@ -567,7 +575,9 @@ fn sina_gateway_error(capability: &'static str, error: SinaError) -> GatewayErro
 #[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
-    use crate::magic_compat::{FiniteNumber, NonEmptyText, Price, Provenance, Ratio, SourceEvidence};
+    use crate::magic_compat::{
+        FiniteNumber, NonEmptyText, Price, Provenance, Ratio, SourceEvidence,
+    };
 
     fn at(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)

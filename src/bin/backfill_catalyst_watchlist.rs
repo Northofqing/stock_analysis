@@ -27,9 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| format!("非法日期 {date}: {error}"))?;
 
     let db_path = env::var("STOCK_DB").ok().map(std::path::PathBuf::from);
-    DatabaseManager::init(db_path).map_err(|error| {
-        format!("数据库初始化失败: {error}")
-    })?;
+    DatabaseManager::init(db_path).map_err(|error| format!("数据库初始化失败: {error}"))?;
 
     let snapshot = load_catalyst_review_snapshot_stored(&date)?;
     if snapshot.leading_entries.is_empty() && snapshot.other_entries.is_empty() {
@@ -50,12 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .leading_entries
         .iter()
         .map(|entry| ("leading", entry))
-        .chain(
-            snapshot
-                .other_entries
-                .iter()
-                .map(|entry| ("other", entry)),
-        )
+        .chain(snapshot.other_entries.iter().map(|entry| ("other", entry)))
     {
         println!(
             "[backfill]   {position} {code} {name} (streak={streak})",
@@ -65,7 +58,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let receipt = save_watchlist(watch_date, &snapshot.leading_entries, &snapshot.other_entries)?;
+    let receipt = save_watchlist(
+        watch_date,
+        &snapshot.leading_entries,
+        &snapshot.other_entries,
+    )?;
     println!(
         "[backfill] 完成: run_id={} inserted={} (false=幂等跳过, 名单已存在)",
         receipt.run_id, receipt.inserted

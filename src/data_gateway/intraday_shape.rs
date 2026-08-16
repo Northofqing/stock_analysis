@@ -4,8 +4,8 @@
 //! batch. Prices, previous close, and five-minute bars are never joined from
 //! different providers or batches.
 
-use chrono::{DateTime, Local, NaiveDate, NaiveTime, SecondsFormat, Utc};
 use crate::magic_compat::ProviderId;
+use chrono::{DateTime, Local, NaiveDate, NaiveTime, SecondsFormat, Utc};
 
 use super::instrument_identity::resolve_production_equity;
 #[cfg(test)]
@@ -58,7 +58,12 @@ impl IntradayShapeGateway {
                 let storage_code = match validate_requested_code(&requested_code) {
                     Ok(valid) => valid,
                     Err(error) => {
-                        return audit_gateway_result(CAPABILITY, ProviderId::Tdx, &request_hash, Err(error))
+                        return audit_gateway_result(
+                            CAPABILITY,
+                            ProviderId::Tdx,
+                            &request_hash,
+                            Err(error),
+                        )
                     }
                 };
                 let result = bridge.intraday_shape_async(&storage_code).await;
@@ -70,7 +75,12 @@ impl IntradayShapeGateway {
             }
             Ok(None) => {}
             Err(error) => {
-                return audit_gateway_result(CAPABILITY, ProviderId::Tdx, &request_hash, Err(error));
+                return audit_gateway_result(
+                    CAPABILITY,
+                    ProviderId::Tdx,
+                    &request_hash,
+                    Err(error),
+                );
             }
         }
         let worker_hash = request_hash.clone();

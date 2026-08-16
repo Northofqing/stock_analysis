@@ -1,6 +1,6 @@
 //! canonical payload 校验 (合同 §5: 未知 schema/version 必须停止解析)。
-use crate::grpc_contract::schema::schema_for;
 use crate::grpc_client::pb::magic::market::v1::Operation;
+use crate::grpc_contract::schema::schema_for;
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum SchemaError {
@@ -19,8 +19,8 @@ pub fn validate_payload(
     version: u32,
     data: &[u8],
 ) -> Result<serde_json::Value, SchemaError> {
-    let frozen = schema_for(operation)
-        .ok_or_else(|| SchemaError::UnknownSchema(schema.to_string()))?;
+    let frozen =
+        schema_for(operation).ok_or_else(|| SchemaError::UnknownSchema(schema.to_string()))?;
     if frozen.schema_name != schema {
         return Err(SchemaError::UnknownSchema(schema.to_string()));
     }
@@ -37,28 +37,28 @@ mod tests {
 
     #[test]
     fn rejects_unknown_schema() {
-        let err = validate_payload(Operation::RealtimeQuotes, "not.a.schema", 1, b"[]")
-            .unwrap_err();
+        let err =
+            validate_payload(Operation::RealtimeQuotes, "not.a.schema", 1, b"[]").unwrap_err();
         assert_eq!(err, SchemaError::UnknownSchema("not.a.schema".to_string()));
     }
 
     #[test]
     fn rejects_wrong_schema_for_operation() {
         // Announcements 的 schema 名不能用于 RealtimeQuotes。
-        let err = validate_payload(
-            Operation::RealtimeQuotes,
-            "news.announcements",
-            1,
-            b"[]",
-        )
-        .unwrap_err();
+        let err = validate_payload(Operation::RealtimeQuotes, "news.announcements", 1, b"[]")
+            .unwrap_err();
         assert!(matches!(err, SchemaError::UnknownSchema(_)));
     }
 
     #[test]
     fn rejects_unsupported_version() {
-        let err = validate_payload(Operation::RealtimeQuotes, "market.realtime_quotes", 99, b"[]")
-            .unwrap_err();
+        let err = validate_payload(
+            Operation::RealtimeQuotes,
+            "market.realtime_quotes",
+            99,
+            b"[]",
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             SchemaError::UnsupportedVersion("market.realtime_quotes".to_string(), 99)
@@ -67,8 +67,13 @@ mod tests {
 
     #[test]
     fn rejects_non_json_data() {
-        let err = validate_payload(Operation::RealtimeQuotes, "market.realtime_quotes", 1, b"not json")
-            .unwrap_err();
+        let err = validate_payload(
+            Operation::RealtimeQuotes,
+            "market.realtime_quotes",
+            1,
+            b"not json",
+        )
+        .unwrap_err();
         assert!(matches!(err, SchemaError::NotJson(_)));
     }
 

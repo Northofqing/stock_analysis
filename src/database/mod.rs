@@ -1061,11 +1061,11 @@ pub mod account_mode_log;
 /// BR-103 real-account evidence boundary; nullable fields stay nullable.
 pub mod account_snapshot;
 // v12 PR3-3.2/3.3 (BR-023/024)
+pub mod catalyst_watchlist;
 pub mod closing_valuation;
 pub mod position_shares;
 pub mod selection;
 pub mod selection_v2;
-pub mod catalyst_watchlist;
 pub(crate) mod selection_v2_generation_journal;
 pub mod selection_v2_read_model;
 pub mod selection_v2_repository;

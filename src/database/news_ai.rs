@@ -931,10 +931,10 @@ impl DatabaseManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{FixedOffset, NaiveDate, TimeZone, Utc};
-    use diesel::connection::SimpleConnection;
     use crate::magic_compat::ProviderId;
     use crate::magic_compat::SourceEvidence;
+    use chrono::{FixedOffset, NaiveDate, TimeZone, Utc};
+    use diesel::connection::SimpleConnection;
 
     #[derive(Debug, QueryableByName)]
     struct CountRow {

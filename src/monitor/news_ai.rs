@@ -13,10 +13,10 @@ use crate::data_gateway::{BatchEvidence, GlobalNewsRecord, SinaInstrumentNewsRec
 use crate::llm::{
     LlmError, LlmProvider, ModelCallReceipt as ProviderModelCallReceipt, ReceiptBearingJson,
 };
-use crate::news::aggregator::AdmittedGlobalNewsBatch;
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use crate::magic_compat::ProviderId;
 use crate::magic_compat::SourceEvidence;
+use crate::news::aggregator::AdmittedGlobalNewsBatch;
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
@@ -1517,8 +1517,8 @@ mod tests {
     use crate::data_gateway::historical_bars::AdmittedDailyBars;
     use crate::data_gateway::market_data::RealtimeMarketQuote;
     use crate::data_provider::{AdjustType, KlineData};
-    use async_trait::async_trait;
     use crate::magic_compat::SourceEvidence;
+    use async_trait::async_trait;
     use serde_json::Value;
 
     #[test]

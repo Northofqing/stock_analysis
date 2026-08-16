@@ -172,8 +172,7 @@ mod tests {
         match verdict {
             SelectionV2ActivationVerdict::Disabled { reason_code } => {
                 assert!(
-                    reason_code.is_ascii()
-                        && reason_code.contains('_'),
+                    reason_code.is_ascii() && reason_code.contains('_'),
                     "reason token must be a snake_case static string, got {reason_code}"
                 );
             }

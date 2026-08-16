@@ -4,12 +4,12 @@
 //! line-item keys, units or explicit missing values. Market statistics retain
 //! every optional field as `Option`; absence is never converted to zero.
 
-pub use crate::magic_compat::{FinancialLine, FinancialStatement, MarketStatistics, StatementKind};
 use crate::magic_compat::ProviderId;
 #[cfg(feature = "magic-gateway")]
-use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone, Utc};
-#[cfg(feature = "magic-gateway")]
 use crate::magic_compat::{DataBatch, Exchange, InstrumentId, RatioUnit};
+pub use crate::magic_compat::{FinancialLine, FinancialStatement, MarketStatistics, StatementKind};
+#[cfg(feature = "magic-gateway")]
+use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone, Utc};
 #[cfg(feature = "magic-gateway")]
 use magic_market_router::{
     financial_statement_source, market_statistics_source, AcceptancePolicy, AttemptStatus,
@@ -25,11 +25,11 @@ use std::collections::HashSet;
 #[cfg(feature = "magic-gateway")]
 use std::sync::Arc;
 
-use super::review::{acquisition_request_hash, audit_gateway_result, GatewayBatch, GatewayError};
-#[cfg(feature = "magic-gateway")]
-use super::review::BatchEvidence;
 #[cfg(feature = "magic-gateway")]
 use super::review::audit_blocking_join_failure;
+#[cfg(feature = "magic-gateway")]
+use super::review::BatchEvidence;
+use super::review::{acquisition_request_hash, audit_gateway_result, GatewayBatch, GatewayError};
 
 const FINANCIAL_CAPABILITY: &str = "CompanyFinancialStatements";
 const STATISTICS_CAPABILITY: &str = "CompanyMarketStatistics";
@@ -984,7 +984,10 @@ fn classify_tencent_error(error: TencentError) -> SourceError {
 #[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
-    use crate::magic_compat::{Exchange, FiniteNumber, IsoDate, Money, NonEmptyText, Price, Provenance, Ratio, SourceEvidence};
+    use crate::magic_compat::{
+        Exchange, FiniteNumber, IsoDate, Money, NonEmptyText, Price, Provenance, Ratio,
+        SourceEvidence,
+    };
 
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-07-24T09:30:02+08:00")

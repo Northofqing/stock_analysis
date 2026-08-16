@@ -96,8 +96,12 @@ pub async fn start(
         let data_svc = handlers::DataService::new(state.clone(), config.fixture_mode);
         tonic::transport::Server::builder()
             .add_service(SystemServiceServer::new(health_svc))
-            .add_service(handlers::market_data_service_server::MarketDataServiceServer::new(data_svc))
-            .add_service(events::market_event_service_server::MarketEventServiceServer::new(event_svc))
+            .add_service(
+                handlers::market_data_service_server::MarketDataServiceServer::new(data_svc),
+            )
+            .add_service(
+                events::market_event_service_server::MarketEventServiceServer::new(event_svc),
+            )
             // 注: TdxAgentService 未注册 → tonic 对未注册服务返回 UNIMPLEMENTED (合同 §2 不做项)。
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await
@@ -109,7 +113,10 @@ struct HealthService;
 
 #[tonic::async_trait]
 impl SystemService for HealthService {
-    async fn get_health(&self, _req: Request<HealthRequest>) -> Result<Response<HealthResponse>, Status> {
+    async fn get_health(
+        &self,
+        _req: Request<HealthRequest>,
+    ) -> Result<Response<HealthResponse>, Status> {
         Ok(Response::new(HealthResponse {
             request_id: "health".to_string(),
             live: true,
@@ -118,7 +125,10 @@ impl SystemService for HealthService {
         }))
     }
 
-    async fn get_capabilities(&self, _req: Request<CapabilitiesRequest>) -> Result<Response<CapabilitiesResponse>, Status> {
+    async fn get_capabilities(
+        &self,
+        _req: Request<CapabilitiesRequest>,
+    ) -> Result<Response<CapabilitiesResponse>, Status> {
         let capabilities = implemented_operations()
             .into_iter()
             .map(|op| Capability {

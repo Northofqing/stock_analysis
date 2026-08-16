@@ -23,10 +23,10 @@ use crate::data_gateway::{
     HistoricalBarsGateway, IntradayShapeFact, IntradayShapeGateway,
 };
 use crate::data_provider::KlineData;
+use crate::magic_compat::FlowInterval;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use crate::magic_compat::FlowInterval;
 use once_cell::sync::Lazy;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

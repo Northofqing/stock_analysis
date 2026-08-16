@@ -4,8 +4,8 @@ use crate::data_gateway::{
     BatchEvidence, BoardDataGateway, BoardKind, BoardMembershipRecord, GatewayBatch, GatewayError,
 };
 use crate::database::DatabaseManager;
-use futures::{stream, StreamExt};
 use crate::magic_compat::ProviderId;
+use futures::{stream, StreamExt};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;

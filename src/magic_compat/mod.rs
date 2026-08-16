@@ -25,6 +25,16 @@ pub mod record;
 pub mod tdx;
 pub mod value;
 
+#[cfg(not(feature = "magic-gateway"))]
+pub use bars::{Adjustment, Bar, BarInterval};
+#[cfg(not(feature = "magic-gateway"))]
+pub use evidence::{EvidenceTimestamp, NonEmptyText, SourceEvidence};
+#[cfg(not(feature = "magic-gateway"))]
+pub use instrument::{AssetClass, CoreError, Exchange, InstrumentId};
+#[cfg(not(feature = "magic-gateway"))]
+pub use lifecycle::{
+    CorporateActionCategory, CorporateActionStatus, CorporateActionTerms, UnverifiedSourceUnit,
+};
 #[cfg(feature = "magic-gateway")]
 pub use magic_market_core::{
     Adjustment, AssetClass, Bar, BarInterval, CoreError, CorporateActionCategory,
@@ -37,16 +47,6 @@ pub use magic_market_core::{
 };
 #[cfg(feature = "magic-gateway")]
 pub use magic_tdx_rs::protocol::types::SecurityBar;
-#[cfg(not(feature = "magic-gateway"))]
-pub use bars::{Adjustment, Bar, BarInterval};
-#[cfg(not(feature = "magic-gateway"))]
-pub use evidence::{EvidenceTimestamp, NonEmptyText, SourceEvidence};
-#[cfg(not(feature = "magic-gateway"))]
-pub use instrument::{AssetClass, CoreError, Exchange, InstrumentId};
-#[cfg(not(feature = "magic-gateway"))]
-pub use lifecycle::{
-    CorporateActionCategory, CorporateActionStatus, CorporateActionTerms, UnverifiedSourceUnit,
-};
 #[cfg(not(feature = "magic-gateway"))]
 pub use market::{
     FinancialLine, FinancialStatement, LimitPoolEntry, LimitPoolKind, MarketStatistics,
@@ -137,7 +137,11 @@ mod tests {
             ("Shenzhen", Exchange::Shenzhen),
             ("Beijing", Exchange::Beijing),
         ];
-        assert_eq!(exchange_cases.len(), 3, "Exchange 变体数必须与上游 75ee2a2 一致");
+        assert_eq!(
+            exchange_cases.len(),
+            3,
+            "Exchange 变体数必须与上游 75ee2a2 一致"
+        );
         for (name, exchange) in exchange_cases {
             assert_eq!(&format!("{exchange:?}"), name, "Debug 名 = wire 契约");
             assert_eq!(
@@ -153,7 +157,11 @@ mod tests {
             ("Bond", AssetClass::Bond),
             ("Option", AssetClass::Option),
         ];
-        assert_eq!(asset_cases.len(), 5, "AssetClass 变体数必须与上游 75ee2a2 一致");
+        assert_eq!(
+            asset_cases.len(),
+            5,
+            "AssetClass 变体数必须与上游 75ee2a2 一致"
+        );
         for (name, asset_class) in asset_cases {
             assert_eq!(&format!("{asset_class:?}"), name, "Debug 名 = wire 契约");
             assert_eq!(
@@ -243,7 +251,11 @@ mod tests {
             ("Lower", LimitPoolKind::Lower),
             ("PreviousUpper", LimitPoolKind::PreviousUpper),
         ];
-        assert_eq!(limit_pool_kinds.len(), 4, "LimitPoolKind 变体数 = 上游 75ee2a2");
+        assert_eq!(
+            limit_pool_kinds.len(),
+            4,
+            "LimitPoolKind 变体数 = 上游 75ee2a2"
+        );
         for (name, kind) in limit_pool_kinds {
             assert_eq!(&format!("{kind:?}"), name);
             assert_eq!(
@@ -257,7 +269,11 @@ mod tests {
             ("Income", StatementKind::Income),
             ("CashFlow", StatementKind::CashFlow),
         ];
-        assert_eq!(statement_kinds.len(), 3, "StatementKind 变体数 = 上游 75ee2a2");
+        assert_eq!(
+            statement_kinds.len(),
+            3,
+            "StatementKind 变体数 = 上游 75ee2a2"
+        );
         for (name, kind) in statement_kinds {
             assert_eq!(&format!("{kind:?}"), name);
             assert_eq!(
@@ -308,12 +324,16 @@ mod tests {
     fn custom_variant_wire_representation_matches_upstream() {
         let kind = MarketRankingKind::Custom(NonEmptyText::new("region_heat").unwrap());
         // NonEmptyText 是 derive Debug 的 tuple struct → Debug 名含类型前缀
-        assert_eq!(format!("{kind:?}"), r#"Custom(NonEmptyText("region_heat"))"#);
+        assert_eq!(
+            format!("{kind:?}"),
+            r#"Custom(NonEmptyText("region_heat"))"#
+        );
         assert_eq!(
             serde_json::to_string(&kind).unwrap(),
             r#"{"Custom":"region_heat"}"#
         );
-        let parsed: MarketRankingKind = serde_json::from_str(r#"{"Custom":"region_heat"}"#).unwrap();
+        let parsed: MarketRankingKind =
+            serde_json::from_str(r#"{"Custom":"region_heat"}"#).unwrap();
         assert_eq!(parsed, kind);
 
         let unit = MarketRankingUnit::Custom(NonEmptyText::new("score_100").unwrap());
@@ -334,8 +354,7 @@ mod tests {
     }
 
     fn test_evidence() -> SourceEvidence {
-        SourceEvidence::new(ProviderId::Eastmoney, "2099-01-02T10:00:01+08:00", "phase3")
-            .unwrap()
+        SourceEvidence::new(ProviderId::Eastmoney, "2099-01-02T10:00:01+08:00", "phase3").unwrap()
     }
 
     fn test_instrument() -> InstrumentId {
@@ -533,14 +552,23 @@ mod tests {
 
         let categories: &[(&str, CorporateActionCategory)] = &[
             ("Distribution", CorporateActionCategory::Distribution),
-            ("BonusRightsListing", CorporateActionCategory::BonusRightsListing),
+            (
+                "BonusRightsListing",
+                CorporateActionCategory::BonusRightsListing,
+            ),
             (
                 "NonTradableShareListing",
                 CorporateActionCategory::NonTradableShareListing,
             ),
-            ("UnknownCapitalChange", CorporateActionCategory::UnknownCapitalChange),
+            (
+                "UnknownCapitalChange",
+                CorporateActionCategory::UnknownCapitalChange,
+            ),
             ("CapitalChange", CorporateActionCategory::CapitalChange),
-            ("AdditionalIssuance", CorporateActionCategory::AdditionalIssuance),
+            (
+                "AdditionalIssuance",
+                CorporateActionCategory::AdditionalIssuance,
+            ),
             ("ShareRepurchase", CorporateActionCategory::ShareRepurchase),
             (
                 "AdditionalIssuanceListing",
@@ -554,7 +582,10 @@ mod tests {
                 "ConvertibleBondListing",
                 CorporateActionCategory::ConvertibleBondListing,
             ),
-            ("CapitalRescaling", CorporateActionCategory::CapitalRescaling),
+            (
+                "CapitalRescaling",
+                CorporateActionCategory::CapitalRescaling,
+            ),
             (
                 "NonTradableReverseSplit",
                 CorporateActionCategory::NonTradableReverseSplit,
@@ -565,7 +596,11 @@ mod tests {
             ),
             ("PutWarrantGrant", CorporateActionCategory::PutWarrantGrant),
         ];
-        assert_eq!(categories.len(), 14, "CorporateActionCategory 变体数 = 上游 75ee2a2");
+        assert_eq!(
+            categories.len(),
+            14,
+            "CorporateActionCategory 变体数 = 上游 75ee2a2"
+        );
         for (name, v) in categories {
             assert_eq!(&format!("{v:?}"), name);
             assert_eq!(
@@ -580,7 +615,11 @@ mod tests {
             ("Cancelled", CorporateActionStatus::Cancelled),
             ("Unknown", CorporateActionStatus::Unknown),
         ];
-        assert_eq!(statuses.len(), 4, "CorporateActionStatus 变体数 = 上游 75ee2a2");
+        assert_eq!(
+            statuses.len(),
+            4,
+            "CorporateActionStatus 变体数 = 上游 75ee2a2"
+        );
         for (name, v) in statuses {
             assert_eq!(&format!("{v:?}"), name);
             assert_eq!(
@@ -699,7 +738,8 @@ mod tests {
         });
         let err = serde_json::from_value::<CorporateActionTerms>(invalid).unwrap_err();
         assert!(
-            err.to_string().contains("category does not use provider-native ratio terms"),
+            err.to_string()
+                .contains("category does not use provider-native ratio terms"),
             "got: {err}"
         );
     }

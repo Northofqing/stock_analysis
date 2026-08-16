@@ -6,18 +6,18 @@
 
 #[cfg(feature = "magic-gateway")]
 use super::instrument_identity::resolve_production_equity;
-use super::review::{acquisition_request_hash, audit_gateway_result};
 #[cfg(feature = "magic-gateway")]
 use super::review::audit_blocking_join_failure;
-use super::{GatewayBatch, GatewayError};
+use super::review::{acquisition_request_hash, audit_gateway_result};
 #[cfg(feature = "magic-gateway")]
 use super::BatchEvidence;
-use chrono::NaiveDate;
-#[cfg(feature = "magic-gateway")]
-use magic_eastmoney_rs::EastmoneyClient;
+use super::{GatewayBatch, GatewayError};
 use crate::magic_compat::ProviderId;
 #[cfg(feature = "magic-gateway")]
 use crate::magic_compat::{IsoDate, PositiveU32};
+use chrono::NaiveDate;
+#[cfg(feature = "magic-gateway")]
+use magic_eastmoney_rs::EastmoneyClient;
 #[cfg(feature = "magic-gateway")]
 use magic_market_core::{BlockTrades, InstrumentDateRangeRequest};
 
@@ -96,13 +96,15 @@ impl BlockTradesGateway {
                 .await
                 {
                     Ok(result) => result,
-                    Err(error) => audit_blocking_join_failure(
-                        CAPABILITY,
-                        ProviderId::Eastmoney,
-                        request_hash.clone(),
-                        error.to_string(),
-                    )
-                    .await,
+                    Err(error) => {
+                        audit_blocking_join_failure(
+                            CAPABILITY,
+                            ProviderId::Eastmoney,
+                            request_hash.clone(),
+                            error.to_string(),
+                        )
+                        .await
+                    }
                 };
             audit_gateway_result(CAPABILITY, ProviderId::Eastmoney, &request_hash, result)
         }
@@ -208,15 +210,14 @@ fn fetch_block_trades(
             "no block-trade batch provenance".to_string(),
         )
     })?;
-    let evidence = BatchEvidence::from_provenance(ProviderId::Eastmoney, provenance).map_err(
-        |error| {
+    let evidence =
+        BatchEvidence::from_provenance(ProviderId::Eastmoney, provenance).map_err(|error| {
             GatewayError::invalid_evidence(
                 CAPABILITY,
                 Some(ProviderId::Eastmoney),
                 format!("provenance: {error}"),
             )
-        },
-    )?;
+        })?;
     if reviews.is_empty() {
         return Ok(GatewayBatch::VerifiedEmpty(evidence));
     }

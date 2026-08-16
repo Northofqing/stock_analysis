@@ -1,13 +1,13 @@
 //! Registered business rules: BR-158, BR-159, BR-213.
 //! Unified A-01/R-03 provider admission, evidence retention and acquisition audit.
 
+#[cfg(feature = "magic-gateway")]
+use crate::magic_compat::IsoDate;
+use crate::magic_compat::ProviderId;
+use crate::magic_compat::{LimitPoolEntry, LimitPoolKind, PositiveU32};
 use chrono::NaiveDate;
 #[cfg(feature = "magic-gateway")]
 use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
-use crate::magic_compat::ProviderId;
-use crate::magic_compat::{LimitPoolEntry, LimitPoolKind, PositiveU32};
-#[cfg(feature = "magic-gateway")]
-use crate::magic_compat::IsoDate;
 #[cfg(feature = "magic-gateway")]
 use magic_market_core::{LimitPoolRequest, LimitPools};
 #[cfg(feature = "magic-gateway")]
@@ -965,9 +965,12 @@ mod tests {
     use super::*;
     use crate::data_provider::{AdjustType, KlineData};
     use crate::database::DatabaseManager;
+    use crate::magic_compat::{
+        AssetClass, DataBatch, Exchange, InstrumentId, IsoDate, NonEmptyText, Price, Provenance,
+        Ratio, RatioUnit, SourceEvidence,
+    };
     use diesel::prelude::*;
     use diesel::sql_types::{BigInt, Nullable, Text};
-    use crate::magic_compat::{AssetClass, DataBatch, Exchange, InstrumentId, IsoDate, NonEmptyText, Price, Provenance, Ratio, RatioUnit, SourceEvidence};
     use serial_test::serial;
 
     #[derive(Debug, QueryableByName)]

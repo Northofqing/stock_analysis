@@ -8,9 +8,9 @@
 //! Business rules: BR-092 (strict K-line validation), BR-147 (settled close
 //! evidence).
 
-use super::magic_tdx_t0::MagicTdxT0Batch;
 #[cfg(feature = "magic-gateway")]
 use super::magic_tdx_t0::fetch_magic_tdx_t0_batch;
+use super::magic_tdx_t0::MagicTdxT0Batch;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 

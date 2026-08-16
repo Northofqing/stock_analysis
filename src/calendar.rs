@@ -141,8 +141,9 @@ fn parse_verified_trading_calendar(raw: &str) -> Result<VerifiedTradingCalendar,
             }
             for y in years.split(',') {
                 coverage_years.push(
-                    y.trim().parse::<i32>()
-                        .map_err(|_| "invalid checked-in trading-calendar coverage year".to_owned())?,
+                    y.trim().parse::<i32>().map_err(|_| {
+                        "invalid checked-in trading-calendar coverage year".to_owned()
+                    })?,
                 );
             }
             continue;
@@ -178,7 +179,11 @@ fn parse_verified_trading_calendar(raw: &str) -> Result<VerifiedTradingCalendar,
     if source.is_none() {
         return Err("checked-in trading-calendar authority is missing".to_owned());
     }
-    if closures.is_empty() || closures.iter().any(|date| !coverage_years.contains(&date.year())) {
+    if closures.is_empty()
+        || closures
+            .iter()
+            .any(|date| !coverage_years.contains(&date.year()))
+    {
         return Err("checked-in trading-calendar coverage is inconsistent".to_owned());
     }
     Ok(VerifiedTradingCalendar {

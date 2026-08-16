@@ -444,7 +444,7 @@ impl PushKind {
             PushKind::NewsFlashAggregated => Some(3600), // 1h/窗口 (code=窗口标签)
             // R-12 盘后回测: 1次/日 (60 min 冷却, 防重复调度触发)
             PushKind::ReviewBacktest => Some(3600),
-            _ => Some(1800),                          // 默认 30min
+            _ => Some(1800), // 默认 30min
         }
     }
 
@@ -898,9 +898,7 @@ pub fn dispatch_table_init_audit() {
     // Completion Rule 4d: Spec-only PushKind 无真实生产者必须启动声明。
     // NewsRanked: BR-191 退役 (shadow NewsRanker), 0 生产 dispatcher —
     // 有生产者接入前不得声称活动。若未来接入, 必须先撤此声明。
-    log::info!(
-        "[v17.x][NewsRanked] disabled=no_producer reason=BR-191-shadow-news-ranker-retired"
-    );
+    log::info!("[v17.x][NewsRanked] disabled=no_producer reason=BR-191-shadow-news-ranker-retired");
 }
 
 /// b011 P0-2: L4 dedup 键语义 (与 PushKind::cooldown_secs 配套)

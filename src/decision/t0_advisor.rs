@@ -8,8 +8,8 @@
 //! Business rules: BR-151, BR-153.
 
 use crate::data_gateway::{MagicTdxT0DailyBar, MagicTdxT0Evidence, MagicTdxT0FiveMinuteBar};
-use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use crate::magic_compat::InstrumentId;
+use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;

@@ -247,8 +247,10 @@ impl GeneralWebResearchGateway {
     pub fn is_available(&self) -> bool {
         // P4 M4b 批次 1B: grpc 模式桥存在即视为可用 (API key 服务端持有)。
         // 保持 SearchService 路由语义 — 桥故障在调用时显式报错, 不静默回退。
-        matches!(super::grpc_source::bridge_for("SemanticSearch"), Ok(Some(_)))
-            || !self.api_keys.is_empty()
+        matches!(
+            super::grpc_source::bridge_for("SemanticSearch"),
+            Ok(Some(_))
+        ) || !self.api_keys.is_empty()
     }
 
     pub async fn search(

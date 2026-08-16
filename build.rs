@@ -24,7 +24,10 @@ fn main() {
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos(&[merged_path.to_str().expect("path")], &[out_dir.to_str().expect("path")])
+        .compile_protos(
+            &[merged_path.to_str().expect("path")],
+            &[out_dir.to_str().expect("path")],
+        )
         .expect("compile market_local.proto (上游合同 + 本地扩展)");
     println!("cargo:rerun-if-changed={upstream}");
     println!("cargo:rerun-if-changed=build.rs");
@@ -75,7 +78,10 @@ fn merge_local_extensions(content: &str) -> String {
     }
     // 2. QueryResponse 块末尾追加 source = 11。
     if let Some((_, end)) = find_block(&lines, "message QueryResponse {") {
-        lines.splice(end..end, EXT_QUERY_RESPONSE_FIELD.iter().map(|s| s.to_string()));
+        lines.splice(
+            end..end,
+            EXT_QUERY_RESPONSE_FIELD.iter().map(|s| s.to_string()),
+        );
     } else {
         panic!("market.proto 缺少 message QueryResponse");
     }

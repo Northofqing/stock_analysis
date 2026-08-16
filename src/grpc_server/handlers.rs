@@ -1,7 +1,7 @@
 //! MarketDataService handler: 校验请求 → fixture 或 data_gateway 委托 → QueryResponse。
 use crate::grpc_client::pb::magic::market::v1::{
-    market_data_service_server::MarketDataService, AdmissionState, CanonicalPayload,
-    Operation, QueryRequest, QueryResponse,
+    market_data_service_server::MarketDataService, AdmissionState, CanonicalPayload, Operation,
+    QueryRequest, QueryResponse,
 };
 use crate::grpc_contract::schema::schema_for;
 use crate::grpc_server::{delegate, fixture, ServerState};
@@ -21,7 +21,11 @@ impl DataService {
     }
 
     /// 统一查询入口: 校验 → 取数 → 包装 QueryResponse。
-    async fn serve_query(&self, op: Operation, req: QueryRequest) -> Result<Response<QueryResponse>, Status> {
+    async fn serve_query(
+        &self,
+        op: Operation,
+        req: QueryRequest,
+    ) -> Result<Response<QueryResponse>, Status> {
         let payload = req
             .payload
             .as_ref()
@@ -51,7 +55,8 @@ impl DataService {
 
         // fixture 模式 (离线确定性测试) 优先。
         if self.fixture_mode {
-            if let Some(mut resp) = fixture::fixture_response(op, &request_schema, request_version) {
+            if let Some(mut resp) = fixture::fixture_response(op, &request_schema, request_version)
+            {
                 // fixture 硬编码 request_id ("fixture-xxx"); 客户端 §6 严格匹配 request_id,
                 // 必须回显请求的 request_id (与真实路径行为一致)。
                 resp.request_id = req

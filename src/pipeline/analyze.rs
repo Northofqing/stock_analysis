@@ -1275,12 +1275,12 @@ mod tests {
     use crate::data_provider::consensus::{ConsensusData, RecentReport};
     use crate::data_provider::{AdjustType, KlineData};
     use crate::indicators::DivergenceType;
+    use crate::magic_compat::ProviderId;
     use crate::notification::NotificationService;
     use crate::strategy::{BollMacdAction, BollMacdSignal};
     use crate::trend_analyzer::{BuySignal, StockTrendAnalyzer, TrendAnalysisResult};
     use chrono::{NaiveDate, TimeZone, Utc};
     use diesel::prelude::*;
-    use crate::magic_compat::ProviderId;
     use std::sync::Arc;
 
     use super::AnalysisPipeline;

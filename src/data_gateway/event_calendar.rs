@@ -1,18 +1,18 @@
 //! BR-161 evidence-preserving R-08 event-calendar acquisition.
 
-use super::review::{acquisition_request_hash, audit_gateway_result};
 #[cfg(feature = "magic-gateway")]
 use super::review::audit_blocking_join_failure;
-use super::GatewayBatch;
+use super::review::{acquisition_request_hash, audit_gateway_result};
 #[cfg(feature = "magic-gateway")]
 use super::BatchEvidence;
+use super::GatewayBatch;
 use super::GatewayError;
-use chrono::{DateTime, NaiveDate, Utc};
-#[cfg(feature = "magic-gateway")]
-use magic_cninfo_rs::{CninfoClient, CninfoError};
 use crate::magic_compat::ProviderId;
 #[cfg(feature = "magic-gateway")]
 use crate::magic_compat::{DataBatch, IsoDate, PositiveU32};
+use chrono::{DateTime, NaiveDate, Utc};
+#[cfg(feature = "magic-gateway")]
+use magic_cninfo_rs::{CninfoClient, CninfoError};
 #[cfg(feature = "magic-gateway")]
 use magic_market_core::{Announcement as CoreAnnouncement, MarketAnnouncementRequest};
 #[cfg(feature = "magic-gateway")]
@@ -66,7 +66,12 @@ impl EventCalendarGateway {
             }
             Ok(None) => {}
             Err(error) => {
-                return audit_gateway_result(CAPABILITY, ProviderId::Cninfo, &request_hash, Err(error));
+                return audit_gateway_result(
+                    CAPABILITY,
+                    ProviderId::Cninfo,
+                    &request_hash,
+                    Err(error),
+                );
             }
         }
         // no-feature (monitor 零 magic): library transport 不存在。
@@ -412,9 +417,12 @@ fn parse_observed_at(value: &str) -> Result<DateTime<Utc>, GatewayError> {
 #[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
-    use crate::magic_compat::{AssetClass, DataBatch, Exchange, InstrumentId, NonEmptyText, Provenance, ProviderId, SourceEvidence};
-#[cfg(feature = "magic-gateway")]
-use magic_market_core::{Announcement, HttpsUrl};
+    use crate::magic_compat::{
+        AssetClass, DataBatch, Exchange, InstrumentId, NonEmptyText, Provenance, ProviderId,
+        SourceEvidence,
+    };
+    #[cfg(feature = "magic-gateway")]
+    use magic_market_core::{Announcement, HttpsUrl};
 
     fn announcement(
         id: &str,

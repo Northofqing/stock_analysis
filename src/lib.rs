@@ -7,9 +7,9 @@ extern crate self as stock_analysis;
 // 2026-08-07: app (运行模式) 与 cli (参数解析) 并入库存量 —
 // bin/monitor 时间线需要调用 modes::run_chain_analysis_mode (新闻+AI 链分析推送)。
 // CLI binary (src/main.rs) 保留本地 mod app; mod cli;, 与库路径互不冲突。
-pub mod app;
 pub mod analyzer;
 pub mod announcement;
+pub mod app;
 pub mod auth;
 pub mod breakout;
 pub mod broker;
@@ -224,8 +224,8 @@ pub mod http_client;
 
 // grpc 数据通道 (docs/superpowers/plans/2026-08-13-grpc-data-channel.md Task 1):
 // 合同注册表 (服务端/客户端共享) + 客户端网络层; 唯一合同源 grpc/market.proto
-pub mod grpc_contract;
 pub mod grpc_client;
+pub mod grpc_contract;
 /// M5 (Task #76): grpc_market_server 是 magic-* 数据提供者宿主 — 只在
 /// magic-gateway (默认) 构建存在。monitor (--no-default-features) 不编译
 /// server, 走 grpc_client 桥。仅 src/bin/grpc_market_server.rs 引用。

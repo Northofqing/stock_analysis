@@ -80,15 +80,15 @@ fn main() {
                 } else {
                     1u8
                 };
-                let daily = client
-                    .get_security_bars(KLINE_DAILY, market, &codes[0], 0, 40, fq_type::NONE);
+                let daily =
+                    client.get_security_bars(KLINE_DAILY, market, &codes[0], 0, 40, fq_type::NONE);
                 println!(
                     "DIRECT DAILY (TdxHqClient, market={}): {:?}",
                     market,
                     daily.as_ref().map(|bars| bars.len())
                 );
-                let m5 = client
-                    .get_security_bars(KLINE_5MIN, market, &codes[0], 0, 400, fq_type::NONE);
+                let m5 =
+                    client.get_security_bars(KLINE_5MIN, market, &codes[0], 0, 400, fq_type::NONE);
                 println!(
                     "DIRECT 5MIN (TdxHqClient, market={}): {:?}",
                     market,

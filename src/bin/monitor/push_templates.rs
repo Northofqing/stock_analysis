@@ -5785,18 +5785,21 @@ pub async fn dispatch_candidate_triggered_daily(hhmm: &str, banner: &BannerCtx) 
         use stock_analysis::database::DatabaseManager;
         let db = DatabaseManager::get();
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        db.candidate_promotion_samples(&today).map_err(|e| e.to_string())
+        db.candidate_promotion_samples(&today)
+            .map_err(|e| e.to_string())
     })
     .await
     {
         Ok(Ok((count, hits))) if count >= 30 => {
             let win_rate = hits as f64 / count as f64;
             if win_rate >= 0.30 {
-                Some(stock_analysis::opportunity::candidate_state::PromotionEvidence {
-                    sample_count: count as u32,
-                    win_rate_strong: win_rate,
-                    win_rate_weak: 0.0,
-                })
+                Some(
+                    stock_analysis::opportunity::candidate_state::PromotionEvidence {
+                        sample_count: count as u32,
+                        win_rate_strong: win_rate,
+                        win_rate_weak: 0.0,
+                    },
+                )
             } else {
                 None
             }
@@ -6191,7 +6194,9 @@ fn r09_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn r09_metric_label(metric: &stock_analysis::magic_compat::MarketRankingKind) -> Result<&'static str, String> {
+fn r09_metric_label(
+    metric: &stock_analysis::magic_compat::MarketRankingKind,
+) -> Result<&'static str, String> {
     match metric {
         stock_analysis::magic_compat::MarketRankingKind::VolumeRatio => Ok("volume_ratio"),
         stock_analysis::magic_compat::MarketRankingKind::MainNetInflow => Ok("main_net_inflow"),
@@ -6201,7 +6206,9 @@ fn r09_metric_label(metric: &stock_analysis::magic_compat::MarketRankingKind) ->
     }
 }
 
-fn r09_unit_label(unit: &stock_analysis::magic_compat::MarketRankingUnit) -> Result<&'static str, String> {
+fn r09_unit_label(
+    unit: &stock_analysis::magic_compat::MarketRankingUnit,
+) -> Result<&'static str, String> {
     match unit {
         stock_analysis::magic_compat::MarketRankingUnit::Multiple => Ok("multiple"),
         stock_analysis::magic_compat::MarketRankingUnit::Yuan => Ok("yuan"),
@@ -6306,7 +6313,8 @@ fn r09_projection_rows(
                 || record.source_order_ordinal.get() != expected_ordinal
                 || record.trading_date.as_str() != expected_date
                 || record.filter_identity.as_str() != expected_filter
-                || record.instrument.asset_class() != stock_analysis::magic_compat::AssetClass::Equity
+                || record.instrument.asset_class()
+                    != stock_analysis::magic_compat::AssetClass::Equity
                 || record.instrument.code().trim().is_empty()
                 || record.label.as_str().is_empty()
             {
@@ -6840,12 +6848,15 @@ mod br192_provider_top_n_tests {
         build_r09_delivery_envelope, dispatch_r09_provider_top_n_outcome_with_loader,
         prepare_r09_provider_top_n_report, r09_outcome_from_durable, R09_TEMPLATE_ID,
     };
-    use stock_analysis::magic_compat::{AssetClass, Exchange, FiniteNumber, InstrumentId, IsoDate, MarketRankingKind, MarketRankingUnit, NonEmptyText, PositiveU32, ProviderId};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use stock_analysis::data_gateway::{
         BatchEvidence, GatewayBatch, ProviderTopNFact, ProviderTopNPair,
         ProviderTopNRequestEvidence,
+    };
+    use stock_analysis::magic_compat::{
+        AssetClass, Exchange, FiniteNumber, InstrumentId, IsoDate, MarketRankingKind,
+        MarketRankingUnit, NonEmptyText, PositiveU32, ProviderId,
     };
 
     fn day() -> chrono::NaiveDate {
@@ -7375,7 +7386,10 @@ const INDUSTRY_KEYWORD_GROUPS: [(&str, &[&str]); 14] = [
     ("航天", &["航天", "卫星"]),
     ("卫星", &["卫星", "航天"]),
     ("算力", &["算力", "服务器", "AIGC", "CPO"]),
-    ("人工智能", &["人工智能", "AI", "AIGC", "DeepSeek", "ChatGPT"]),
+    (
+        "人工智能",
+        &["人工智能", "AI", "AIGC", "DeepSeek", "ChatGPT"],
+    ),
     ("军工", &["军工", "国防", "商业航天"]),
     ("医疗", &["医疗", "创新药", "CXO"]),
 ];
@@ -7404,7 +7418,9 @@ fn infer_industry_boards(
 
 /// 公告标题 → IPO 阶段 + 命中关键词。
 /// 阶段推断: 上市公告书=上市, 招股意向书/发行=发行中, 注册=过会, 受理/问询=在审。
-fn ipo_keyword_stage(title: &str) -> Option<(stock_analysis::news::ipo::supply_chain::IpoStage, String)> {
+fn ipo_keyword_stage(
+    title: &str,
+) -> Option<(stock_analysis::news::ipo::supply_chain::IpoStage, String)> {
     use stock_analysis::news::ipo::supply_chain::IpoStage;
     let t = title.to_ascii_lowercase();
     let pick = |k: &str, s: IpoStage| t.contains(k).then(|| (s, k.to_string()));
@@ -7460,14 +7476,15 @@ pub async fn dispatch_ipo_catalyst(date: &str) -> bool {
     };
     // 2026-08-06: 优先复用 R-08 已拉取的当日公告批次 (同日期命中 → 不重复拉
     // cninfo, 避免复盘内两次拉取触发限流 router_batch_rejected)。未命中 → 拉取。
-    let cached: Option<Vec<stock_analysis::data_gateway::EventAnnouncement>> = REVIEW_ANNOUNCEMENTS_CACHE
-        .get_or_init(|| std::sync::Mutex::new(None))
-        .lock()
-        .ok()
-        .and_then(|cache| match cache.as_ref() {
-            Some((cached_date, records)) if cached_date == date => Some(records.clone()),
-            _ => None,
-        });
+    let cached: Option<Vec<stock_analysis::data_gateway::EventAnnouncement>> =
+        REVIEW_ANNOUNCEMENTS_CACHE
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .ok()
+            .and_then(|cache| match cache.as_ref() {
+                Some((cached_date, records)) if cached_date == date => Some(records.clone()),
+                _ => None,
+            });
     let records: Vec<stock_analysis::data_gateway::EventAnnouncement> = match cached {
         Some(records) => {
             log::info!(
@@ -7585,10 +7602,7 @@ pub async fn dispatch_ipo_catalyst(date: &str) -> bool {
                 {
                     Ok(stock_analysis::data_gateway::GatewayBatch::Available {
                         records, ..
-                    }) => records
-                        .iter()
-                        .map(|r| r.instrument_code.clone())
-                        .collect(),
+                    }) => records.iter().map(|r| r.instrument_code.clone()).collect(),
                     Ok(stock_analysis::data_gateway::GatewayBatch::VerifiedEmpty(evidence)) => {
                         log::warn!(
                             "[A-11][BR-223] 板块成分已验证为空: board={} batch_id={}",
@@ -7610,31 +7624,34 @@ pub async fn dispatch_ipo_catalyst(date: &str) -> bool {
                 continue;
             }
             let member_codes = member_codes.into_iter().take(10).collect::<Vec<_>>();
-            let named: Vec<(String, String)> = match stock_analysis::data_gateway::MarketCapabilitiesGateway::new()
-                .security_identities(&member_codes)
-                .await
-            {
-                Ok(stock_analysis::data_gateway::GatewayBatch::Available { records, .. }) => records
-                    .iter()
-                    .map(|identity| (identity.code.clone(), identity.name.clone()))
-                    .collect(),
-                Ok(stock_analysis::data_gateway::GatewayBatch::VerifiedEmpty(evidence)) => {
-                    log::warn!(
-                        "[A-11][BR-223] 证券身份已验证为空，跳过该板块: board={} batch_id={}",
-                        board_code,
-                        evidence.batch_id
-                    );
-                    continue;
-                }
-                Err(error) => {
-                    log::warn!(
-                        "[A-11][BR-223] 证券身份不可用，跳过该板块: board={} error={}",
-                        board_code,
-                        error
-                    );
-                    continue;
-                }
-            };
+            let named: Vec<(String, String)> =
+                match stock_analysis::data_gateway::MarketCapabilitiesGateway::new()
+                    .security_identities(&member_codes)
+                    .await
+                {
+                    Ok(stock_analysis::data_gateway::GatewayBatch::Available {
+                        records, ..
+                    }) => records
+                        .iter()
+                        .map(|identity| (identity.code.clone(), identity.name.clone()))
+                        .collect(),
+                    Ok(stock_analysis::data_gateway::GatewayBatch::VerifiedEmpty(evidence)) => {
+                        log::warn!(
+                            "[A-11][BR-223] 证券身份已验证为空，跳过该板块: board={} batch_id={}",
+                            board_code,
+                            evidence.batch_id
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "[A-11][BR-223] 证券身份不可用，跳过该板块: board={} error={}",
+                            board_code,
+                            error
+                        );
+                        continue;
+                    }
+                };
             industry.push(IndustryBoard {
                 board_name: board_name.clone(),
                 stocks: named,
@@ -7937,7 +7954,10 @@ fn prepare_tomorrow_watch_delivery(
                 record.code
             ));
         }
-        source_binding.push_str(&format!("{}|{}\n", record.code, record.ranking_net_amount_yuan));
+        source_binding.push_str(&format!(
+            "{}|{}\n",
+            record.code, record.ranking_net_amount_yuan
+        ));
     }
     let task_identity = crate::review_batch::review_task_identity(
         business_date,
@@ -8202,11 +8222,7 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
                         .ok()
                         .and_then(|quotes| quotes.get(&chain.leader_code))
                         .map(|quote| quote.name.clone())
-                        .or_else(|| {
-                            closes
-                                .get(&chain.leader_code)
-                                .map(|(name, _)| name.clone())
-                        })
+                        .or_else(|| closes.get(&chain.leader_code).map(|(name, _)| name.clone()))
                         .unwrap_or_else(|| chain.leader_code.clone())
                 };
                 let base = leader_quotes
@@ -8295,7 +8311,8 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
                             lo_price: 0.0,
                             hi_price: 0.0,
                             stop: 0.0,
-                            reason: "整百股持仓满足做T结构条件; 无收盘价, 竞价后按 T-11 复核".to_string(),
+                            reason: "整百股持仓满足做T结构条件; 无收盘价, 竞价后按 T-11 复核"
+                                .to_string(),
                         });
                     }
                 }
@@ -8401,7 +8418,12 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
     )
     .await;
     let dispatcher_error = push_outcome_dispatcher_error(&push_result);
-    log_dispatcher_attempt("R-07", push_result.is_pushed(), items.len(), &dispatcher_error);
+    log_dispatcher_attempt(
+        "R-07",
+        push_result.is_pushed(),
+        items.len(),
+        &dispatcher_error,
+    );
     crate::review_batch::ReviewTaskOutcome::from_push_outcome(push_result, items.len())
 }
 
@@ -8455,7 +8477,10 @@ pub fn render_position_review(p: PositionReviewParams<'_>) -> String {
     if !p.items.is_empty() {
         out.push_str("\n逐个复盘:\n");
         for (index, item) in p.items.iter().enumerate() {
-            let close = item.close.map(|v| format!("{v:.2}")).unwrap_or_else(|| "-".to_string());
+            let close = item
+                .close
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "-".to_string());
             let ret = item
                 .unrealized_return_pct
                 .map(|v| format!("{v:+.2}%"))
@@ -8511,7 +8536,11 @@ async fn build_review_ai_section(items: &[PositionReviewItem]) -> String {
     }
     let has_key = ["DOUBAO_API_KEY", "DEEPSEEK_API_KEY", "GEMINI_API_KEY"]
         .iter()
-        .any(|k| std::env::var(k).map(|v| !v.trim().is_empty()).unwrap_or(false));
+        .any(|k| {
+            std::env::var(k)
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false)
+        });
     if !has_key {
         log::warn!(
             "[复盘AI] 未配置 DOUBAO/DEEPSEEK/GEMINI_API_KEY 任一 key, 跳过 AI 研判段 (fail-open)"
@@ -8581,10 +8610,18 @@ async fn build_review_ai_section(items: &[PositionReviewItem]) -> String {
                 ));
             }
             Ok(Ok(Err(error))) => {
-                log::warn!("[复盘AI] {}({}) 研判失败: {error} (跳过该只)", item.name, code);
+                log::warn!(
+                    "[复盘AI] {}({}) 研判失败: {error} (跳过该只)",
+                    item.name,
+                    code
+                );
             }
             Ok(Err(error)) => {
-                log::warn!("[复盘AI] {}({}) 研判任务失败: {error} (跳过该只)", item.name, code);
+                log::warn!(
+                    "[复盘AI] {}({}) 研判任务失败: {error} (跳过该只)",
+                    item.name,
+                    code
+                );
             }
             Err(_) => {
                 log::warn!("[复盘AI] {}({}) 研判超时 90s (跳过该只)", item.name, code);
@@ -8667,10 +8704,8 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
     };
 
     let valuation: Option<ClosingValuationView> =
-        match tokio::task::spawn_blocking(move || {
-            persisted_valuation_view_for_date(trading_date)
-        })
-        .await
+        match tokio::task::spawn_blocking(move || persisted_valuation_view_for_date(trading_date))
+            .await
         {
             Ok(Ok(valuation)) => valuation,
             Ok(Err(error)) => {
@@ -8858,10 +8893,7 @@ async fn dispatch_r12_backtest_outcome(date: &str) -> crate::review_batch::Revie
     match crate::durable_delivery_runtime::inspect_review_task_occurrence(
         today,
         stock_analysis::durable_delivery::PushKind::ReviewBacktest,
-        crate::review_batch::review_task_identity(
-            today,
-            crate::review_batch::ReviewTask::R12,
-        ),
+        crate::review_batch::review_task_identity(today, crate::review_batch::ReviewTask::R12),
     )
     .await
     {
@@ -9008,23 +9040,21 @@ async fn dispatch_r13_counted_delivery(
         business_date,
         crate::review_batch::ReviewTask::R13,
     );
-    let transition_basis_canonical =
-        match serde_json::to_vec(&ExistingReviewTaskTransitionBasis {
-            task_identity: task_identity.clone(),
-            business_date: date.clone(),
-            task: "R-13".to_string(),
-            snapshot_size: outcomes.len(),
-        }) {
-            Ok(canonical) => canonical,
-            Err(error) => {
-                let reason = format!("R-13 transition basis serialization failed: {error}");
-                log::error!("[R-13][BR-140][BR-192] {reason}");
-                log_dispatcher_attempt("R-13", false, outcomes.len(), &reason);
-                return crate::notify::PushOutcome::Denied(reason);
-            }
-        };
-    let task_binding = match TaskBinding::new(task_identity.clone(), transition_basis_canonical)
-    {
+    let transition_basis_canonical = match serde_json::to_vec(&ExistingReviewTaskTransitionBasis {
+        task_identity: task_identity.clone(),
+        business_date: date.clone(),
+        task: "R-13".to_string(),
+        snapshot_size: outcomes.len(),
+    }) {
+        Ok(canonical) => canonical,
+        Err(error) => {
+            let reason = format!("R-13 transition basis serialization failed: {error}");
+            log::error!("[R-13][BR-140][BR-192] {reason}");
+            log_dispatcher_attempt("R-13", false, outcomes.len(), &reason);
+            return crate::notify::PushOutcome::Denied(reason);
+        }
+    };
+    let task_binding = match TaskBinding::new(task_identity.clone(), transition_basis_canonical) {
         Ok(binding) => binding,
         Err(error) => {
             let reason = format!("R-13 task binding rejected: {error}");
@@ -9102,8 +9132,7 @@ async fn dispatch_r13_counted_delivery(
             return crate::notify::PushOutcome::Denied(reason);
         }
     };
-    crate::notify::push_counted_with_binding(presentation_token, text, None, counted_binding)
-        .await
+    crate::notify::push_counted_with_binding(presentation_token, text, None, counted_binding).await
 }
 
 /// BR-192 counted delivery shared by the review-batch dispatchers that were
@@ -9134,22 +9163,20 @@ async fn dispatch_review_task_counted(
     let task_label = task.label().to_string();
     let date = business_date.format("%Y-%m-%d").to_string();
     let task_identity = crate::review_batch::review_task_identity(business_date, task);
-    let transition_basis_canonical =
-        match serde_json::to_vec(&ExistingReviewTaskTransitionBasis {
-            task_identity: task_identity.clone(),
-            business_date: date.clone(),
-            task: task_label.clone(),
-            snapshot_size,
-        }) {
-            Ok(canonical) => canonical,
-            Err(error) => {
-                let reason =
-                    format!("{task_label} transition basis serialization failed: {error}");
-                log::error!("[{task_label}][BR-140][BR-192] {reason}");
-                log_dispatcher_attempt(&task_label, false, snapshot_size, &reason);
-                return crate::notify::PushOutcome::Denied(reason);
-            }
-        };
+    let transition_basis_canonical = match serde_json::to_vec(&ExistingReviewTaskTransitionBasis {
+        task_identity: task_identity.clone(),
+        business_date: date.clone(),
+        task: task_label.clone(),
+        snapshot_size,
+    }) {
+        Ok(canonical) => canonical,
+        Err(error) => {
+            let reason = format!("{task_label} transition basis serialization failed: {error}");
+            log::error!("[{task_label}][BR-140][BR-192] {reason}");
+            log_dispatcher_attempt(&task_label, false, snapshot_size, &reason);
+            return crate::notify::PushOutcome::Denied(reason);
+        }
+    };
     let task_binding = match TaskBinding::new(task_identity.clone(), transition_basis_canonical) {
         Ok(binding) => binding,
         Err(error) => {
@@ -9159,10 +9186,8 @@ async fn dispatch_review_task_counted(
             return crate::notify::PushOutcome::Denied(reason);
         }
     };
-    let delivery_subject_hash = crate::review_batch::audit_identity_hash(
-        "review-task-delivery-subject",
-        &subject_identity,
-    );
+    let delivery_subject_hash =
+        crate::review_batch::audit_identity_hash("review-task-delivery-subject", &subject_identity);
     let counted_binding = match crate::durable_delivery_runtime::CountedDeliveryBinding::new(
         business_date,
         task_identity,
@@ -9180,24 +9205,19 @@ async fn dispatch_review_task_counted(
             return crate::notify::PushOutcome::Denied(reason);
         }
     };
-    let presentation_token = match crate::presentation_registry::acquire_token(
-        family,
-        kind,
-        producer,
-        renderer,
-    ) {
-        Ok(token) => token,
-        Err(reason) => {
-            log::error!(
-                "[BR-196] production presentation token rejected family={} reason={}",
-                family,
-                reason
-            );
-            return crate::notify::PushOutcome::Denied(reason);
-        }
-    };
-    crate::notify::push_counted_with_binding(presentation_token, text, None, counted_binding)
-        .await
+    let presentation_token =
+        match crate::presentation_registry::acquire_token(family, kind, producer, renderer) {
+            Ok(token) => token,
+            Err(reason) => {
+                log::error!(
+                    "[BR-196] production presentation token rejected family={} reason={}",
+                    family,
+                    reason
+                );
+                return crate::notify::PushOutcome::Denied(reason);
+            }
+        };
+    crate::notify::push_counted_with_binding(presentation_token, text, None, counted_binding).await
 }
 
 /// R-13: T+1 关注票核对 — 读昨日 A-10 名单快照, 核对今日行情, 推送回填。
@@ -9219,10 +9239,7 @@ async fn dispatch_r13_watchlist_tracking_outcome(
     match crate::durable_delivery_runtime::inspect_review_task_occurrence(
         today,
         stock_analysis::durable_delivery::PushKind::WatchlistTracking,
-        crate::review_batch::review_task_identity(
-            today,
-            crate::review_batch::ReviewTask::R13,
-        ),
+        crate::review_batch::review_task_identity(today, crate::review_batch::ReviewTask::R13),
     )
     .await
     {
@@ -9274,10 +9291,8 @@ async fn dispatch_r13_watchlist_tracking_outcome(
             return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
         }
     };
-    let text = stock_analysis::review::watchlist_tracking::render_watchlist_tracking(
-        &snapshot,
-        &outcomes,
-    );
+    let text =
+        stock_analysis::review::watchlist_tracking::render_watchlist_tracking(&snapshot, &outcomes);
     // BR-192 counted 推送: task binding + InternalDurable 证据入 durable ledger。
     // 决策身份对同一核对日稳定 → 重启后 preflight 复用 + immutable conflict 双保险。
     let result = dispatch_r13_counted_delivery(&snapshot, &outcomes, &text, today).await;
@@ -9289,10 +9304,7 @@ async fn dispatch_r13_watchlist_tracking_outcome(
             skipped.join(",")
         );
     }
-    let outcome = crate::review_batch::ReviewTaskOutcome::from_push_outcome(
-        result,
-        outcomes.len(),
-    );
+    let outcome = crate::review_batch::ReviewTaskOutcome::from_push_outcome(result, outcomes.len());
     if matches!(
         outcome,
         crate::review_batch::ReviewTaskOutcome::Delivered { .. }
@@ -9372,10 +9384,7 @@ pub async fn dispatch_post_session_review(
             }
         },
     );
-    let source_only_outcomes = [r04, r08, r09]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+    let source_only_outcomes = [r04, r08, r09].into_iter().flatten().collect::<Vec<_>>();
 
     // BR-222/BR-232/BR-233 keep these registered task semantics intact, but
     // they are downstream of the closed BR-139 SourceOnly phase above.
@@ -9402,10 +9411,7 @@ pub async fn dispatch_post_session_review(
         },
         async {
             if phases.source_only.contains(&ReviewTask::R12) {
-                Some((
-                    ReviewTask::R12,
-                    dispatch_r12_backtest_outcome(&date).await,
-                ))
+                Some((ReviewTask::R12, dispatch_r12_backtest_outcome(&date).await))
             } else {
                 None
             }
@@ -9449,9 +9455,7 @@ pub async fn dispatch_post_session_review(
     // BR-232: SignalTracker 样本回填 (5 日收益验证, 每日复盘时执行)
     let (backfilled_total, backfilled_hits) = backfill_pending_predictions(14).await;
     if backfilled_total > 0 {
-        log::info!(
-            "[BR-232] 预测样本回填 verified={backfilled_total} hits={backfilled_hits}"
-        );
+        log::info!("[BR-232] 预测样本回填 verified={backfilled_total} hits={backfilled_hits}");
     }
 
     // BR-223: 盘后大宗交易推送 (自选+持仓代码集, 非 ReviewTask 侧推)
@@ -10233,8 +10237,8 @@ fn prepare_r08_counted_delivery(
         >,
     >,
 ) -> Result<PreparedR08CountedDelivery, String> {
-    use stock_analysis::magic_compat::ProviderId;
     use stock_analysis::data_gateway::GatewayBatch;
+    use stock_analysis::magic_compat::ProviderId;
 
     if r08_reminder_trading_date(business_date) != reminder_date {
         return Err("R-08 reminder date must be the next trading day".to_string());
@@ -10763,17 +10767,16 @@ pub async fn dispatch_r08_event_calendar_outcome(
                     // 2026-08-06: 缓存公告批次供 A-11 复用 (避免复盘内 44s 两次
                     // cninfo 拉取触发限流 router_batch_rejected)。失败不写缓存。
                     if let Ok(stock_analysis::data_gateway::GatewayBatch::Available {
-                        records, ..
+                        records,
+                        ..
                     }) = &result
                     {
                         if let Ok(mut cache) = REVIEW_ANNOUNCEMENTS_CACHE
                             .get_or_init(|| std::sync::Mutex::new(None))
                             .lock()
                         {
-                            *cache = Some((
-                                review_date.format("%Y-%m-%d").to_string(),
-                                records.clone(),
-                            ));
+                            *cache =
+                                Some((review_date.format("%Y-%m-%d").to_string(), records.clone()));
                         }
                     }
                     result
@@ -11951,10 +11954,7 @@ pub async fn dispatch_r03_industry_chain_outcome(
     match crate::durable_delivery_runtime::inspect_review_task_occurrence(
         today,
         stock_analysis::durable_delivery::PushKind::IndustryChain,
-        crate::review_batch::review_task_identity(
-            today,
-            crate::review_batch::ReviewTask::R03,
-        ),
+        crate::review_batch::review_task_identity(today, crate::review_batch::ReviewTask::R03),
     )
     .await
     {
@@ -12782,11 +12782,11 @@ mod tests_r_dispatchers {
 
     #[test]
     fn br162_r04_renderer_keeps_trade_ids_and_exact_seats_without_fake_sum() {
-        use stock_analysis::magic_compat::{DragonTigerSide, Exchange, ProviderId};
         use stock_analysis::data_gateway::{
             BatchEvidence, DragonTigerSeatReview, DragonTigerSourceDisclosure,
             DragonTigerStockReview,
         };
+        use stock_analysis::magic_compat::{DragonTigerSide, Exchange, ProviderId};
 
         let disclosure = |trade_id: &str, net_amount_yuan: f64| {
             let mut seats = Vec::with_capacity(10);
@@ -12940,11 +12940,11 @@ mod tests_r_dispatchers {
 
     #[test]
     fn br192_r04_counted_binding_fails_closed_without_exact_provider_evidence() {
-        use stock_analysis::magic_compat::{DragonTigerSide, Exchange, ProviderId};
         use stock_analysis::data_gateway::{
             BatchEvidence, DragonTigerSeatReview, DragonTigerSourceDisclosure,
             DragonTigerStockReview,
         };
+        use stock_analysis::magic_compat::{DragonTigerSide, Exchange, ProviderId};
 
         let stocks = vec![DragonTigerStockReview {
             exchange: Exchange::Shanghai,
@@ -13182,8 +13182,8 @@ mod tests_r_dispatchers {
 
     #[tokio::test]
     async fn br162_r04_preserves_wait_empty_and_unavailable_outcomes() {
-        use stock_analysis::magic_compat::ProviderId;
         use stock_analysis::data_gateway::{BatchEvidence, GatewayBatch, GatewayError};
+        use stock_analysis::magic_compat::ProviderId;
 
         let before = dispatch_r04_lhb_outcome_with_loader(
             "2026-07-21",
@@ -13267,10 +13267,7 @@ async fn dispatch_catalyst_review_daily_outcome(
     match crate::durable_delivery_runtime::inspect_review_task_occurrence(
         today,
         stock_analysis::durable_delivery::PushKind::CatalystReview,
-        crate::review_batch::review_task_identity(
-            today,
-            crate::review_batch::ReviewTask::A10,
-        ),
+        crate::review_batch::review_task_identity(today, crate::review_batch::ReviewTask::A10),
     )
     .await
     {
@@ -13802,7 +13799,9 @@ pub async fn push_sector_anomaly(
     let text = render_sector_anomaly(hhmm, moves);
     // 2026-08-07 用户决策: I-09A 升级 counted — 板块级全局事件,
     // occurrence=sector-anomaly:{date}, scope=Global, InternalDurable。
-    push_sector_anomaly_counted(hhmm, moves, &text).await.is_pushed()
+    push_sector_anomaly_counted(hhmm, moves, &text)
+        .await
+        .is_pushed()
 }
 
 /// I-09A counted 投递 (SectorAnomaly 白名单, 2026-08-07)。
@@ -13959,9 +13958,9 @@ pub async fn push_candidate_triggered(
     promotion_evidence: Option<stock_analysis::opportunity::candidate_state::PromotionEvidence>,
     live_override: Option<bool>,
 ) -> Result<bool, String> {
-    use stock_analysis::magic_compat::{AssetClass, Exchange, InstrumentId};
     use sha2::{Digest, Sha256};
     use stock_analysis::database::DatabaseManager;
+    use stock_analysis::magic_compat::{AssetClass, Exchange, InstrumentId};
     use stock_analysis::opportunity::candidate_state::require_live_promotion;
 
     if let Err(error) = require_live_promotion(promotion_evidence, live_override) {
@@ -14019,13 +14018,13 @@ pub async fn push_candidate_triggered(
     let outcome = crate::notify::push_counted_with_binding(token, &text, None, binding).await;
     match outcome {
         crate::notify::PushOutcome::Pushed | crate::notify::PushOutcome::Deduped => {
-            log::info!(
-                "[T-07] candidate triggered delivered code={code} outcome={outcome:?}"
-            );
+            log::info!("[T-07] candidate triggered delivered code={code} outcome={outcome:?}");
             Ok(true)
         }
         other => {
-            log::warn!("[T-07] candidate triggered delivery unconfirmed code={code} outcome={other:?}");
+            log::warn!(
+                "[T-07] candidate triggered delivery unconfirmed code={code} outcome={other:?}"
+            );
             Ok(false)
         }
     }
@@ -14149,18 +14148,21 @@ pub async fn push_data_mode_change(
 
     let health = dm_evaluate(input, prev);
 
-    let (prev_mode, new_mode, dispatch_reason) =
-        match data_mode_notification_plan(input, prev, persistent_reminder_due, pending_stable_since)
-        {
-            DataModeNotificationPlan::EstablishSilently => {
-                return Ok(ModeDispatchResult::EstablishedSilently);
-            }
-            DataModeNotificationPlan::Dispatch {
-                previous,
-                current,
-                reason,
-            } => (previous, current, reason),
-        };
+    let (prev_mode, new_mode, dispatch_reason) = match data_mode_notification_plan(
+        input,
+        prev,
+        persistent_reminder_due,
+        pending_stable_since,
+    ) {
+        DataModeNotificationPlan::EstablishSilently => {
+            return Ok(ModeDispatchResult::EstablishedSilently);
+        }
+        DataModeNotificationPlan::Dispatch {
+            previous,
+            current,
+            reason,
+        } => (previous, current, reason),
+    };
 
     // 1. 拼 T-02 (复用 §14.1 T-02 模板)
     let hhmm = chrono::Local::now().format("%H:%M").to_string();
@@ -15127,13 +15129,13 @@ pub fn build_test_template_catalog(
     date: &str,
     hhmm: &str,
 ) -> Result<Vec<TestTemplatePreview>, String> {
-    use stock_analysis::magic_compat::{DragonTigerSide, Exchange as CoreExchange, ProviderId};
     use stock_analysis::data_gateway::{
         BatchEvidence, DragonTigerSeatReview, DragonTigerSourceDisclosure, DragonTigerStockReview,
     };
     use stock_analysis::decision::t0_advisor::{
         PriceZone, T0Metrics, T0PlanState, T0StructuredPlan, TrendStatus, ZoneSource,
     };
+    use stock_analysis::magic_compat::{DragonTigerSide, Exchange as CoreExchange, ProviderId};
     use stock_analysis::market_analyzer::sector_monitor::{
         AnomalyReason, ConceptBoard, UnexplainedMove,
     };
@@ -16205,10 +16207,7 @@ mod tests_br232_tomorrow_watch_quotes {
             .expect("盘后收盘快照 Gateway 必须对 8 只票返回完整批次 (strict 批不允许部分)");
         for code in codes {
             let quote = &quotes[code];
-            assert_ne!(
-                quote.name, *code,
-                "{code} 名字仍是代码 — BR-233 补名未生效"
-            );
+            assert_ne!(quote.name, *code, "{code} 名字仍是代码 — BR-233 补名未生效");
             assert!(
                 quote.price > 0.0,
                 "{code} 价格缺失 (price={}) — 低吸/止损仍会是 0.00",
@@ -16225,7 +16224,9 @@ mod tests {
 
     #[test]
     fn render_intraday_alert_includes_category_and_extra() {
-        use stock_analysis::monitor::detector::{AlertCategory, AlertDetail, AlertEvent, AlertLevel};
+        use stock_analysis::monitor::detector::{
+            AlertCategory, AlertDetail, AlertEvent, AlertLevel,
+        };
         let event = AlertEvent {
             level: AlertLevel::Important,
             category: AlertCategory::MainInflow,
@@ -16253,12 +16254,17 @@ mod tests {
         assert!(text.contains("平安银行(000001)"), "缺失标的: {text}");
         assert!(text.contains("主力净流入 1.2 亿"), "缺失消息: {text}");
         assert!(text.contains("主力排名 3/50"), "缺失 extra: {text}");
-        assert!(text.contains("辅助建议, 非下单指令"), "缺失免责声明: {text}");
+        assert!(
+            text.contains("辅助建议, 非下单指令"),
+            "缺失免责声明: {text}"
+        );
     }
 
     #[test]
     fn render_intraday_alert_handles_empty_extra() {
-        use stock_analysis::monitor::detector::{AlertCategory, AlertDetail, AlertEvent, AlertLevel};
+        use stock_analysis::monitor::detector::{
+            AlertCategory, AlertDetail, AlertEvent, AlertLevel,
+        };
         let event = AlertEvent {
             level: AlertLevel::Emergency,
             category: AlertCategory::LimitDown,
@@ -16350,8 +16356,8 @@ mod tests {
 
     #[test]
     fn br099_candidate_assembly_removes_only_held_and_keeps_watch_candidate() {
-        use stock_analysis::magic_compat::ProviderId;
         use stock_analysis::data_gateway::BatchEvidence;
+        use stock_analysis::magic_compat::ProviderId;
         use stock_analysis::market_data::TopStock;
         use stock_analysis::opportunity::candidate_panel::{merge_candidates, CandidateSource};
 
@@ -16440,9 +16446,11 @@ mod tests {
 
     #[test]
     fn br159_candidate_statistics_projection_requires_exact_identity_and_preserves_missing() {
-        use stock_analysis::magic_compat::{AssetClass, Exchange, FiniteNumber, InstrumentId, ProviderId, SourceEvidence};
         use stock_analysis::data_gateway::{
             company::MarketStatistics, BatchEvidence, GatewayBatch,
+        };
+        use stock_analysis::magic_compat::{
+            AssetClass, Exchange, FiniteNumber, InstrumentId, ProviderId, SourceEvidence,
         };
 
         let batch_id = "TEST_CODE_statistics_batch";
@@ -20796,7 +20804,12 @@ mod tests {
         use stock_analysis::monitor::data_mode::{DataHealthInput, DataMode as LibDM};
 
         assert!(matches!(
-            data_mode_notification_plan(&DataHealthInput::default(), Some(LibDM::Unsafe), true, None),
+            data_mode_notification_plan(
+                &DataHealthInput::default(),
+                Some(LibDM::Unsafe),
+                true,
+                None
+            ),
             DataModeNotificationPlan::Dispatch {
                 current: LibDM::Unsafe,
                 reason: DataModeDispatchReason::PersistentUnsafeReminder,
@@ -20804,7 +20817,12 @@ mod tests {
             }
         ));
         assert_eq!(
-            data_mode_notification_plan(&DataHealthInput::default(), Some(LibDM::Unsafe), false, None),
+            data_mode_notification_plan(
+                &DataHealthInput::default(),
+                Some(LibDM::Unsafe),
+                false,
+                None
+            ),
             DataModeNotificationPlan::EstablishSilently
         );
     }
@@ -21432,8 +21450,8 @@ mod tests {
 
     #[test]
     fn br138_dispatcher_r08_excludes_local_only_lifecycle_rows() {
-        use stock_analysis::magic_compat::ProviderId;
         use stock_analysis::data_gateway::{BatchEvidence, EventAnnouncement, GatewayBatch};
+        use stock_analysis::magic_compat::ProviderId;
         let batch = GatewayBatch::Available {
             records: vec![EventAnnouncement {
                 announcement_id: "TEST_CODE_DISPATCHER_R08_LOCAL".to_string(),
@@ -21460,8 +21478,8 @@ mod tests {
 
     #[test]
     fn br199_r08_missing_cninfo_category_stays_explicitly_missing() {
-        use stock_analysis::magic_compat::ProviderId;
         use stock_analysis::data_gateway::{BatchEvidence, EventAnnouncement, GatewayBatch};
+        use stock_analysis::magic_compat::ProviderId;
         let batch = GatewayBatch::Available {
             records: vec![EventAnnouncement {
                 announcement_id: "TEST_CODE_R08_MISSING_CATEGORY".to_string(),

@@ -4,9 +4,9 @@
 //! module only projects facts whose semantics are explicit in the admitted
 //! normalized statement batch. Missing ratios and growth fields remain absent.
 
-use anyhow::{anyhow, Result};
 use crate::magic_compat::ProviderId;
 use crate::magic_compat::StatementKind;
+use anyhow::{anyhow, Result};
 use sha2::{Digest, Sha256};
 
 use crate::data_gateway::{company::FinancialStatement, parse_evidence_instant, GatewayBatch};
@@ -363,7 +363,10 @@ pub fn project_income_statements(batch: GatewayBatch<FinancialStatement>) -> Res
 mod tests {
     use super::*;
     use crate::data_gateway::BatchEvidence;
-    use crate::magic_compat::{AssetClass, Exchange, FiniteNumber, InstrumentId, IsoDate, NonEmptyText, ProviderId, SourceEvidence};
+    use crate::magic_compat::{
+        AssetClass, Exchange, FiniteNumber, InstrumentId, IsoDate, NonEmptyText, ProviderId,
+        SourceEvidence,
+    };
 
     #[test]
     fn quality_requires_history() {

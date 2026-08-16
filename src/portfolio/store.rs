@@ -526,8 +526,8 @@ struct LedgerRow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Utc};
     use crate::magic_compat::ProviderId;
+    use chrono::{TimeZone, Utc};
     use std::path::PathBuf;
 
     const TEST_DB: &str = "./test_data/test.db";

@@ -2,6 +2,7 @@
 
 //! BR-156/BR-164 Magic TDX Gateway evidence adapter for event-scoped selection.
 
+use crate::magic_compat::Exchange;
 use crate::selection::model::{
     DirectMentionEvidence, SecurityIdentity, SecurityMarket, SecurityMasterSnapshot,
 };
@@ -11,7 +12,6 @@ use crate::selection::quality::{
 };
 use crate::selection::relation::direct_mentions;
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike};
-use crate::magic_compat::Exchange;
 #[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::protocol::constants::{KLINE_5MIN, KLINE_DAILY};
 #[cfg(feature = "magic-gateway")]

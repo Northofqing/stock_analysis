@@ -92,7 +92,11 @@ pub fn fetch_position_quotes() -> Result<Vec<stock_analysis::market_data::TopSto
                         .num_hours()
                         <= 24 =>
             {
-                snapshot.items.iter().map(|item| item.code.clone()).collect()
+                snapshot
+                    .items
+                    .iter()
+                    .map(|item| item.code.clone())
+                    .collect()
             }
             Ok(Some(_)) | Ok(None) => {
                 // 快照缺失/过期: 回退本地持仓代码 (仅行情展示用途, 行情自带来源时间)
@@ -385,9 +389,9 @@ pub(super) fn log_full_market_rankings_unavailable(owner: &str) {
 #[cfg(test)]
 mod quote_batch_tests {
     use super::*;
-    use stock_analysis::magic_compat::ProviderId;
     use stock_analysis::data_gateway::{BatchEvidence, GatewayBatch, RealtimeMarketQuote};
     use stock_analysis::data_provider::{AdjustType, KlineData};
+    use stock_analysis::magic_compat::ProviderId;
     use stock_analysis::market_data::TopStock;
 
     fn quote(code: &str) -> TopStock {

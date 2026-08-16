@@ -11,15 +11,12 @@ use anyhow::{bail, Result};
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let date_str = args.get(1).map(String::as_str).unwrap_or("2026-08-06");
-    let limit: u32 = args
-        .get(2)
-        .map(|s| s.parse().unwrap_or(100))
-        .unwrap_or(100);
+    let limit: u32 = args.get(2).map(|s| s.parse().unwrap_or(100)).unwrap_or(100);
     let date = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")?;
     // BR-159 审计依赖数据库; 独立 bin 需先初始化 (用主库, 审计表只追加不污染)
-    stock_analysis::database::DatabaseManager::init(Some(
-        std::path::PathBuf::from("data/stock_analysis.db"),
-    ))
+    stock_analysis::database::DatabaseManager::init(Some(std::path::PathBuf::from(
+        "data/stock_analysis.db",
+    )))
     .map_err(|error| anyhow::anyhow!("数据库初始化失败: {error}"))?;
 
     let batch = stock_analysis::data_gateway::EventCalendarGateway::new()
@@ -53,9 +50,7 @@ async fn main() -> Result<()> {
             asc_ok = false;
         }
     }
-    println!(
-        "排序: 倒序(最新优先)={desc_ok} 正序(最早优先)={asc_ok}"
-    );
+    println!("排序: 倒序(最新优先)={desc_ok} 正序(最早优先)={asc_ok}");
     println!(
         "时间范围: {}  →  {}",
         times.first().unwrap_or(&""),

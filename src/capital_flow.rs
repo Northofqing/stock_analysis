@@ -4,8 +4,8 @@
 //! module only projects the gateway's complete, audited facts into the small
 //! domain shape consumed by scoring and prompt rendering.
 
-use anyhow::{bail, Result};
 use crate::magic_compat::FlowInterval;
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::data_gateway::{GatewayBatch, InstrumentFundFlowFact};

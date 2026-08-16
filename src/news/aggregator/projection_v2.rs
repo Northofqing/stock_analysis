@@ -152,11 +152,11 @@ fn require_hash(value: &str, field: &'static str) -> Result<(), NotificationProj
 mod tests {
     use super::*;
     use crate::data_gateway::{BatchEvidence, GlobalNewsProvider, GlobalNewsRecord};
+    use crate::magic_compat::SourceEvidence;
     use crate::news::aggregator::raw_v2::{
         registered_global_news_feeds, RawGlobalNewsFeedAttempt, TestRawGlobalNewsTerminal,
     };
     use chrono::TimeZone;
-    use crate::magic_compat::SourceEvidence;
 
     const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 

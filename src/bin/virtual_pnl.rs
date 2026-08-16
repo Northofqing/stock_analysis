@@ -50,7 +50,10 @@ fn main() {
     // avg_cost < 1.0 元 = 7/14-16 Breakout 价格 feed 异常期的破损成交价 (真实
     // A 股价格不可能低于 1 元), 标注 ⚠️ 使污染持仓可见, 不静默计入汇总口径。
     let avg_cost = |cost: f64, qty: i64| if qty > 0 { cost / qty as f64 } else { 0.0 };
-    println!("{:4} {:8} {:<10} {:>10} {:>10} {:>10} {:>8} {:>4}", "#", "代码", "名称", "持仓", "成本", "市值", "浮盈亏%", "注");
+    println!(
+        "{:4} {:8} {:<10} {:>10} {:>10} {:>10} {:>8} {:>4}",
+        "#", "代码", "名称", "持仓", "成本", "市值", "浮盈亏%", "注"
+    );
     for (i, row) in rows.iter().enumerate() {
         let market = if row.code.starts_with('6') { 1u8 } else { 0u8 };
         let close = client

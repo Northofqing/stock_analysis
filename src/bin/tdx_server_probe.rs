@@ -125,13 +125,21 @@ fn main() {
         (None, None) => left.tcp_ms.cmp(&right.tcp_ms),
     });
 
-    println!("[probe] unreachable={} reachable={}", unreachable, results.len());
+    println!(
+        "[probe] unreachable={} reachable={}",
+        unreachable,
+        results.len()
+    );
     println!("[probe] ── 按 servertime age 升序 (age<5s 可通过新鲜度门) ──");
     let mut pass_count = 0_usize;
     for r in &results {
         match (r.age_secs, &r.servertime) {
             (Some(age), Some(st)) => {
-                let gate = if age < FRESHNESS_GATE_SECS { " <== PASS" } else { "" };
+                let gate = if age < FRESHNESS_GATE_SECS {
+                    " <== PASS"
+                } else {
+                    ""
+                };
                 if age < FRESHNESS_GATE_SECS {
                     pass_count += 1;
                 }
@@ -148,7 +156,8 @@ fn main() {
     }
     println!(
         "[probe] 汇总: age<5s 可过门的主站 = {} 台 / 可达 {} 台",
-        pass_count, results.len()
+        pass_count,
+        results.len()
     );
 }
 

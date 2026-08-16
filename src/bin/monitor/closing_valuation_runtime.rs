@@ -192,9 +192,9 @@ fn run_blocking(
 mod tests {
     use super::*;
     use chrono::Local;
-    use stock_analysis::magic_compat::ProviderId;
     use stock_analysis::data_gateway::BatchEvidence;
     use stock_analysis::data_provider::KlineData;
+    use stock_analysis::magic_compat::ProviderId;
 
     fn evidence() -> BatchEvidence {
         BatchEvidence {

@@ -230,17 +230,12 @@ pub fn evaluate_sell_rules(e: &SellEvaluation<'_>) -> Option<String> {
     // 铁律4 持仓 >14 天仍亏损
     let timeout_loss = hold_days > 14 && return_rate < 0.0;
     // 铁律5 布林上轨减仓：触上轨 + MACD 顶背离/红柱缩短/死叉
-    let bm_top_sell = matches!(
-        e.boll_macd.map(|s| s.action),
-        Some(BollMacdAction::TopSell)
-    ) && return_rate >= 5.0
+    let bm_top_sell = matches!(e.boll_macd.map(|s| s.action), Some(BollMacdAction::TopSell))
+        && return_rate >= 5.0
         && hold_days >= 2;
 
-    let should_sell = stop_loss
-        || !tiered_stops.is_empty()
-        || profit_trend_exit
-        || timeout_loss
-        || bm_top_sell;
+    let should_sell =
+        stop_loss || !tiered_stops.is_empty() || profit_trend_exit || timeout_loss || bm_top_sell;
 
     if !should_sell {
         return None;

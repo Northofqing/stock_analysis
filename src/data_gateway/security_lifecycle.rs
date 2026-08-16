@@ -6,9 +6,6 @@
 //! admitted only with exact request coverage and complete, ordered evidence;
 //! only source-published `Implemented` actions are projected.
 
-use chrono::NaiveDate;
-#[cfg(feature = "magic-gateway")]
-use chrono::{DateTime, FixedOffset, TimeZone, Utc};
 #[cfg(all(test, feature = "magic-gateway"))]
 use crate::magic_compat::Exchange;
 use crate::magic_compat::{
@@ -16,6 +13,9 @@ use crate::magic_compat::{
 };
 #[cfg(feature = "magic-gateway")]
 use crate::magic_compat::{CorporateActionStatus, DataBatch, IsoDate, SourceEvidence};
+use chrono::NaiveDate;
+#[cfg(feature = "magic-gateway")]
+use chrono::{DateTime, FixedOffset, TimeZone, Utc};
 #[cfg(feature = "magic-gateway")]
 use magic_market_core::{
     CorporateAction, CorporateActionRequest, CorporateActionResponse, CorporateActions,
@@ -27,11 +27,11 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::instrument_identity::{resolve_production_equity, EquitySegment};
+#[cfg(feature = "magic-gateway")]
+use super::review::audit_blocking_join_failure;
 use super::review::{
     acquisition_request_hash, audit_gateway_result, BatchEvidence, GatewayBatch, GatewayError,
 };
-#[cfg(feature = "magic-gateway")]
-use super::review::audit_blocking_join_failure;
 use super::MarketSecurityMetadata;
 
 const LIFECYCLE_CAPABILITY: &str = "SecurityLifecycle";
@@ -294,8 +294,12 @@ impl SecurityLifecycleGateway {
                 let actions = bridge
                     .corporate_actions_async(&code, window_start, window_end)
                     .await;
-                let actions =
-                    audit_gateway_result(ACTIONS_CAPABILITY, ProviderId::Tdx, &actions_hash, actions);
+                let actions = audit_gateway_result(
+                    ACTIONS_CAPABILITY,
+                    ProviderId::Tdx,
+                    &actions_hash,
+                    actions,
+                );
                 return Ok(SecurityLifecycleContext {
                     instrument,
                     window_start,

@@ -1,19 +1,19 @@
 //! BR-133/BR-167 evidence-preserving macroeconomic release acquisition.
 
-use super::review::{acquisition_request_hash, audit_gateway_result};
 #[cfg(feature = "magic-gateway")]
 use super::review::audit_blocking_join_failure;
-use super::{GatewayBatch, GatewayError};
+use super::review::{acquisition_request_hash, audit_gateway_result};
 #[cfg(feature = "magic-gateway")]
 use super::BatchEvidence;
+use super::{GatewayBatch, GatewayError};
+#[cfg(feature = "magic-gateway")]
+use crate::magic_compat::{DataBatch, PositiveU32};
+use crate::magic_compat::{ProviderId, SourceEvidence};
 use chrono::{DateTime, Utc};
 #[cfg(feature = "magic-gateway")]
 use chrono::{FixedOffset, NaiveDateTime, TimeZone};
 #[cfg(feature = "magic-gateway")]
 use magic_jin10_rs::{Jin10Client, Jin10Error};
-use crate::magic_compat::{ProviderId, SourceEvidence};
-#[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{DataBatch, PositiveU32};
 #[cfg(feature = "magic-gateway")]
 // EconomicCalendarProvider 是 method-resolution trait (正文无 :: 用法)。
 use magic_market_core::{EconomicCalendarProvider, EconomicCalendarRequest, EconomicEvent};
@@ -78,7 +78,12 @@ impl EconomicCalendarGateway {
             }
             Ok(None) => {}
             Err(error) => {
-                return audit_gateway_result(CAPABILITY, ProviderId::Jin10, &request_hash, Err(error));
+                return audit_gateway_result(
+                    CAPABILITY,
+                    ProviderId::Jin10,
+                    &request_hash,
+                    Err(error),
+                );
             }
         }
         // no-feature (monitor 零 magic): library transport 不存在。
@@ -419,8 +424,10 @@ fn jin10_gateway_error(error: Jin10Error) -> GatewayError {
 #[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
-    use crate::magic_compat::{DataBatch, NonEmptyText, PositiveU32, Provenance, ProviderId, SourceEvidence};
-use magic_market_core::EconomicEvent;
+    use crate::magic_compat::{
+        DataBatch, NonEmptyText, PositiveU32, Provenance, ProviderId, SourceEvidence,
+    };
+    use magic_market_core::EconomicEvent;
 
     fn event(
         batch_id: &str,

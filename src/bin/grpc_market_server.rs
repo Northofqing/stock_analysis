@@ -36,7 +36,9 @@ async fn main() -> anyhow::Result<()> {
         // (chain_policy_unavailable, Task #75 生产探针实证)。load_all 与 monitor
         // 同语义: 读失败 → 合同 None → delegate 查询时 fail-closed 出声, 无静默兜底。
         stock_analysis::config::load_all();
-        log::info!("[grpc_market_server] config::load_all() 完成 (chain.toml 合同, A-10 delegate 依赖)");
+        log::info!(
+            "[grpc_market_server] config::load_all() 完成 (chain.toml 合同, A-10 delegate 依赖)"
+        );
     }
 
     let config = stock_analysis::grpc_server::ServerConfig::default();
@@ -69,8 +71,8 @@ async fn main() -> anyhow::Result<()> {
             if codes.is_empty() {
                 continue;
             }
-            let Ok(batch) = stock_analysis::data_gateway::MarketDataGateway::new()
-                .realtime_quotes(&codes)
+            let Ok(batch) =
+                stock_analysis::data_gateway::MarketDataGateway::new().realtime_quotes(&codes)
             else {
                 continue; // 拉取失败跳过本周期, 保留上一快照
             };
@@ -86,12 +88,8 @@ async fn main() -> anyhow::Result<()> {
                     amount: 0.0,
                 })
                 .collect();
-            let events = stock_analysis::grpc_server::events::diff_snapshots(
-                &prev,
-                &next,
-                price_t,
-                vol_t,
-            );
+            let events =
+                stock_analysis::grpc_server::events::diff_snapshots(&prev, &next, price_t, vol_t);
             for e in events {
                 hub_for_poll.push_event(&e);
             }

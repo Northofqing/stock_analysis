@@ -26,32 +26,33 @@ use super::instrument_identity::resolve_production_equity;
 use super::instrument_identity::resolve_test_equity;
 #[cfg(feature = "magic-gateway")]
 use super::instrument_identity::{CanonicalEquityIdentity, EquityIdentityError};
+#[cfg(feature = "magic-gateway")]
+use crate::magic_compat::{DataBatch, NonEmptyText, PositiveU32, SourceEvidence};
+use crate::magic_compat::{Exchange, ProviderId};
 use crate::selection::schema_v2::{
     canonical_json as schema_canonical_json, sha256_bytes as schema_sha256_bytes,
     sha256_json as schema_sha256_json, ArtifactHashPreimage as SchemaArtifactHashPreimage,
     AttestedDirectoryBatchPreimage, BoardAuditAttestationContentPreimage,
-    BoardAuditAttestationReceiptPreimage, BoardAuditRootBindingPreimage,
-    BoardAuditSubjectPreimage, BoardBindingProposalInputPreimage, BoardConnectionPolicyPreimage,
+    BoardAuditAttestationReceiptPreimage, BoardAuditRootBindingPreimage, BoardAuditSubjectPreimage,
+    BoardBindingProposalInputPreimage, BoardConnectionPolicyPreimage,
     DirectoryBatchContentPreimage, DirectoryBatchEvidencePreimage, DirectoryBoardRecordPreimage,
-    DirectoryRecordSourceEvidencePreimage, ProviderBoardKind, BOARD_AUDIT_COMMAND_VERSION, BOARD_AUDIT_ROOT_POLICY_VERSION,
-    BOARD_BINDING_PROPOSAL_SCHEMA_VERSION, BOARD_BINDINGS_SCHEMA_VERSION as SCHEMA_BOARD_BINDINGS_VERSION,
-    BOARD_BINDING_VALIDITY_POLICY_VERSION, BOARD_CONNECTION_POLICY_VERSION,
-    BOARD_DIRECTORY_PROVIDER, BOARD_DIRECTORY_REQUEST_LIMIT, BOARD_DIRECTORY_SOURCE,
-    DOMAIN_BOARD_ARTIFACT, DOMAIN_BOARD_AUDIT_ATTESTATION, DOMAIN_BOARD_AUDIT_RECEIPT,
-    DOMAIN_BOARD_AUDIT_SUBJECT, DOMAIN_BOARD_BINDING_PROPOSAL, DOMAIN_BOARD_DIRECTORY_BATCH,
-    DOMAIN_BOARD_DIRECTORY_RECORD, UPSTREAM_REVISION,
+    DirectoryRecordSourceEvidencePreimage, ProviderBoardKind, BOARD_AUDIT_COMMAND_VERSION,
+    BOARD_AUDIT_ROOT_POLICY_VERSION,
+    BOARD_BINDINGS_SCHEMA_VERSION as SCHEMA_BOARD_BINDINGS_VERSION,
+    BOARD_BINDING_PROPOSAL_SCHEMA_VERSION, BOARD_BINDING_VALIDITY_POLICY_VERSION,
+    BOARD_CONNECTION_POLICY_VERSION, BOARD_DIRECTORY_PROVIDER, BOARD_DIRECTORY_REQUEST_LIMIT,
+    BOARD_DIRECTORY_SOURCE, DOMAIN_BOARD_ARTIFACT, DOMAIN_BOARD_AUDIT_ATTESTATION,
+    DOMAIN_BOARD_AUDIT_RECEIPT, DOMAIN_BOARD_AUDIT_SUBJECT, DOMAIN_BOARD_BINDING_PROPOSAL,
+    DOMAIN_BOARD_DIRECTORY_BATCH, DOMAIN_BOARD_DIRECTORY_RECORD, UPSTREAM_REVISION,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
-use crate::magic_compat::{Exchange, ProviderId};
-#[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{DataBatch, NonEmptyText, PositiveU32, SourceEvidence};
 #[cfg(feature = "magic-gateway")]
 use magic_market_core::{BoardCategory, BoardConstituentRequest, BoardMembership};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "magic-gateway")]
 use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use thiserror::Error;
@@ -506,9 +507,7 @@ pub fn seal_board_binding_release(
         ));
     }
     for batch in &batches {
-        batch
-            .validate(recorded_at)
-            .map_err(schema_board_error)?;
+        batch.validate(recorded_at).map_err(schema_board_error)?;
     }
 
     let connection_policy = BoardConnectionPolicyPreimage::fixed();
@@ -547,9 +546,7 @@ pub fn seal_board_binding_release(
     };
 
     let sealed = seal_artifact_hashes(preimage)?;
-    let artifact_content_hash = sealed
-        .artifact_content_hash()
-        .map_err(schema_board_error)?;
+    let artifact_content_hash = sealed.artifact_content_hash().map_err(schema_board_error)?;
 
     let wire = VerifiedBoardArtifactFileWire {
         schema_version: sealed.schema_version.clone(),
@@ -575,9 +572,9 @@ pub fn seal_board_binding_release(
         proposal_json: String::from_utf8(proposal_bytes).map_err(|error| {
             BoardSelectionError::invalid_config("board_proposal_seal_non_utf8", error.to_string())
         })?,
-        artifact_json: String::from_utf8(canonical_schema_file_bytes(&wire).map_err(
-            |error| BoardSelectionError::invalid_config("board_artifact_seal_failed", error.to_string()),
-        )?)
+        artifact_json: String::from_utf8(canonical_schema_file_bytes(&wire).map_err(|error| {
+            BoardSelectionError::invalid_config("board_artifact_seal_failed", error.to_string())
+        })?)
         .map_err(|error| {
             BoardSelectionError::invalid_config("board_artifact_seal_non_utf8", error.to_string())
         })?,
@@ -615,9 +612,7 @@ fn directory_batch_from_fact(
             batch_id: fact.evidence.batch_id.clone(),
         },
     };
-    record
-        .directory_record_hash()
-        .map_err(schema_board_error)?;
+    record.directory_record_hash().map_err(schema_board_error)?;
     let content = DirectoryBatchContentPreimage {
         domain: DOMAIN_BOARD_DIRECTORY_BATCH.to_owned(),
         category: kind,
@@ -735,8 +730,7 @@ fn parse_observed_at(value: &str) -> Result<chrono::DateTime<Utc>, BoardSelectio
 }
 
 fn rfc3339_nanos(value: chrono::DateTime<Utc>) -> String {
-    value
-        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+    value.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
 }
 
 fn parse_canonical_schema_file<T>(

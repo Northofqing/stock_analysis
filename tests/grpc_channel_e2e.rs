@@ -19,7 +19,11 @@ async fn health_and_capabilities() {
     let health = client.get_health().await.unwrap();
     assert!(health.live && health.ready);
     let caps = client.get_capabilities().await.unwrap();
-    assert_eq!(caps.len(), 39, "M1: 38 个生产 op + M4c ChainBatch 全部在 capability 表");
+    assert_eq!(
+        caps.len(),
+        39,
+        "M1: 38 个生产 op + M4c ChainBatch 全部在 capability 表"
+    );
     handle.abort();
 }
 
@@ -32,22 +36,48 @@ async fn six_representative_ops_fixture_roundtrip() {
     })
     .await
     .unwrap();
-    let mut client = GrpcMarketClient::connect(&format!("http://{addr}")).await.unwrap();
+    let mut client = GrpcMarketClient::connect(&format!("http://{addr}"))
+        .await
+        .unwrap();
 
     let cases: Vec<(Operation, &str, &str)> = vec![
-        (Operation::RealtimeQuotes, "market.realtime_quotes", "600519"),
-        (Operation::HistoricalBars, "market.historical_bars", "600519"),
+        (
+            Operation::RealtimeQuotes,
+            "market.realtime_quotes",
+            "600519",
+        ),
+        (
+            Operation::HistoricalBars,
+            "market.historical_bars",
+            "600519",
+        ),
         (Operation::MinuteData, "market.minute_data", "600519"),
         (Operation::Announcements, "news.announcements", "600519"),
         (Operation::GlobalNews, "news.global_news", "央行"),
-        (Operation::SecurityMetadata, "market.security_metadata", "600519"),
+        (
+            Operation::SecurityMetadata,
+            "market.security_metadata",
+            "600519",
+        ),
         // M1 扩展 (P4): 6 个新 op fixture roundtrip。
         (Operation::IndexQuotes, "market.index_quotes", "sh000001"),
         (Operation::InstrumentNews, "news.instrument_news", "600519"),
-        (Operation::IntradayShape, "market.intraday_shape", "稳步推高"),
+        (
+            Operation::IntradayShape,
+            "market.intraday_shape",
+            "稳步推高",
+        ),
         (Operation::T0Evidence, "market.t0_evidence", "600519"),
-        (Operation::OutcomeDailyBars, "market.outcome_daily_bars", "2026-08-14"),
-        (Operation::UpperLimitPoolReview, "market.upper_limit_pool_review", "600519"),
+        (
+            Operation::OutcomeDailyBars,
+            "market.outcome_daily_bars",
+            "2026-08-14",
+        ),
+        (
+            Operation::UpperLimitPoolReview,
+            "market.upper_limit_pool_review",
+            "600519",
+        ),
         // M4c 扩展: A-10 完整 batch (fixture, 字段与 converter 重建一致)。
         (Operation::ChainBatch, "market.chain_batch", "fixture-cb"),
     ];
@@ -81,10 +111,15 @@ async fn subscribe_receives_injected_events_with_monotonic_cursor() {
     })
     .await
     .unwrap();
-    let mut client = GrpcMarketClient::connect(&format!("http://{addr}")).await.unwrap();
+    let mut client = GrpcMarketClient::connect(&format!("http://{addr}"))
+        .await
+        .unwrap();
     let mut stream = client
         .subscribe(
-            EventFilter { instruments: vec![], event_kinds: vec![] },
+            EventFilter {
+                instruments: vec![],
+                event_kinds: vec![],
+            },
             None,
         )
         .await
@@ -104,14 +139,11 @@ async fn subscribe_receives_injected_events_with_monotonic_cursor() {
     hub.push_event(&d);
 
     use futures::StreamExt;
-    let envelope = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        stream.next(),
-    )
-    .await
-    .expect("5s 内收到事件")
-    .expect("流未结束")
-    .expect("事件无错误");
+    let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("5s 内收到事件")
+        .expect("流未结束")
+        .expect("事件无错误");
     assert_eq!(envelope.instrument, "600519");
     assert_eq!(envelope.event_kind, "price");
     let cursor = envelope.cursor.unwrap();
@@ -136,7 +168,10 @@ async fn replay_returns_bounded_events_same_generation() {
     };
     hub.push_event(&d);
     let q = hub
-        .replay_after(Some(EventCursor { generation: "g1".into(), sequence: 0 }))
+        .replay_after(Some(EventCursor {
+            generation: "g1".into(),
+            sequence: 0,
+        }))
         .unwrap();
     assert_eq!(q.len(), 1);
 }
@@ -153,7 +188,9 @@ async fn set_watchlist_then_status_match_then_subscribe_filter() {
     })
     .await
     .unwrap();
-    let mut client = GrpcMarketClient::connect(&format!("http://{addr}")).await.unwrap();
+    let mut client = GrpcMarketClient::connect(&format!("http://{addr}"))
+        .await
+        .unwrap();
 
     // 1. SetWatchlist 完全替换。
     let set = client
@@ -162,7 +199,10 @@ async fn set_watchlist_then_status_match_then_subscribe_filter() {
         .unwrap();
     assert_eq!(set.state, "APPLIED");
     assert_eq!(set.instruments.len(), 2);
-    assert_eq!(set.desired_revision, 2, "初始 STOCK_LIST 为空时 revision 1 → 2");
+    assert_eq!(
+        set.desired_revision, 2,
+        "初始 STOCK_LIST 为空时 revision 1 → 2"
+    );
 
     // 2. GetListenerStatus: desired 与 applied 立即匹配 (本地同步应用)。
     let status = client.get_listener_status().await.unwrap();
@@ -170,7 +210,10 @@ async fn set_watchlist_then_status_match_then_subscribe_filter() {
         status.desired_watchlist_revision, status.applied_watchlist_revision,
         "desired == applied (本地 server 无异步应用流程)"
     );
-    assert_eq!(status.desired_instruments, vec!["600519".to_string(), "000001".to_string()]);
+    assert_eq!(
+        status.desired_instruments,
+        vec!["600519".to_string(), "000001".to_string()]
+    );
     assert_eq!(status.applied_instruments, status.desired_instruments);
 
     // 3. Subscribe.filter.instruments 只投递匹配事件 (README 语义)。
@@ -204,7 +247,10 @@ async fn set_watchlist_then_status_match_then_subscribe_filter() {
         .expect("5s 内收到事件")
         .expect("流未结束")
         .expect("事件无错误");
-    assert_eq!(got.instrument, "600519", "filter 只投递 600519, 000001 被过滤");
+    assert_eq!(
+        got.instrument, "600519",
+        "filter 只投递 600519, 000001 被过滤"
+    );
     handle.abort();
 }
 
@@ -217,7 +263,9 @@ async fn unknown_schema_rejected() {
     })
     .await
     .unwrap();
-    let mut client = GrpcMarketClient::connect(&format!("http://{addr}")).await.unwrap();
+    let mut client = GrpcMarketClient::connect(&format!("http://{addr}"))
+        .await
+        .unwrap();
     // OptionData 未实现 → 客户端拦截。
     let err = client
         .query(Operation::OptionData, serde_json::json!({}))

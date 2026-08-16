@@ -33,7 +33,9 @@ fn main() {
             for b in &boards {
                 println!(
                     "  {} {:+.2}% 主力{:+.2}亿",
-                    b.name, b.change_pct, b.main_inflow / 1e8
+                    b.name,
+                    b.change_pct,
+                    b.main_inflow / 1e8
                 );
             }
         }
@@ -118,7 +120,11 @@ fn main() {
             }
         }
     }
-    println!("收盘价获取: {} 只持仓 {} 只有效收盘价", rows.len(), closes.len());
+    println!(
+        "收盘价获取: {} 只持仓 {} 只有效收盘价",
+        rows.len(),
+        closes.len()
+    );
     let mut dump: Vec<(&str, &str, f64, f64)> = Vec::new();
     for r in &rows {
         if let Some(close) = closes.get(&r.code) {
@@ -138,7 +144,13 @@ fn main() {
         };
         println!(
             "  {:2} {} {} {:8.2} {:8.2} {:+6.2}%  {}",
-            i + 1, code, name, cost, close, pnl, verdict
+            i + 1,
+            code,
+            name,
+            cost,
+            close,
+            pnl,
+            verdict
         );
     }
 }

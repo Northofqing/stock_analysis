@@ -18,12 +18,12 @@ use std::path::Path;
 
 fn main() {
     // BR-159: TDX gateway 审计需要 core 数据库 (gateway_result 落库)。
-    let database_path = std::env::var("DATABASE_PATH")
-        .unwrap_or_else(|_| "./data/stock_analysis.db".to_string());
+    let database_path =
+        std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/stock_analysis.db".to_string());
     std::env::set_var("MAGICLAW_DB_PATH", &database_path);
-    if let Err(error) =
-        stock_analysis::database::DatabaseManager::init(Some(std::path::PathBuf::from(&database_path)))
-    {
+    if let Err(error) = stock_analysis::database::DatabaseManager::init(Some(
+        std::path::PathBuf::from(&database_path),
+    )) {
         eprintln!("core 数据库初始化失败 ({database_path}): {error}");
         std::process::exit(1);
     }
@@ -102,9 +102,8 @@ fn cmd_seal_board(args: &[String]) -> i32 {
         &industry,
     ) {
         Ok(files) => {
-            let proposal_path = root.join(
-                stock_analysis::data_gateway::board::BOARD_BINDING_PROPOSAL_PATH,
-            );
+            let proposal_path =
+                root.join(stock_analysis::data_gateway::board::BOARD_BINDING_PROPOSAL_PATH);
             let artifact_path = root.join(stock_analysis::data_gateway::board::BOARD_BINDINGS_PATH);
             if let Err(error) = std::fs::write(&proposal_path, files.proposal_json) {
                 eprintln!("[封存] 写入 {proposal_path:?} 失败: {error}");
@@ -151,9 +150,8 @@ fn cmd_print_activation(args: &[String]) -> i32 {
     }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     // 生成激活文件用 stages 1-3 (config hash) — 文件不能要求自身已存在。
-    match stock_analysis::selection::config_activation_v2::prepare_activation_config_hash(
-        root, now,
-    ) {
+    match stock_analysis::selection::config_activation_v2::prepare_activation_config_hash(root, now)
+    {
         Ok(materials) => {
             let reviewed_at = rfc3339(now);
             let json = format!(
@@ -173,7 +171,10 @@ fn cmd_print_activation(args: &[String]) -> i32 {
             0
         }
         Err(error) => {
-            eprintln!("[激活] 材料校验失败: code={} detail={}", error.code, error.detail);
+            eprintln!(
+                "[激活] 材料校验失败: code={} detail={}",
+                error.code, error.detail
+            );
             1
         }
     }

@@ -1,16 +1,19 @@
 //! BR-164/BR-188 evidence-preserving board discovery and flow Gateway runtime.
 
-use super::review::{acquisition_request_hash, audit_gateway_result};
 #[cfg(feature = "magic-gateway")]
 use super::review::audit_blocking_join_failure;
+use super::review::{acquisition_request_hash, audit_gateway_result};
 use super::{BatchEvidence, GatewayBatch, GatewayError};
 #[cfg(feature = "magic-gateway")]
-use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
+use crate::magic_compat::{DataBatch, FlowInterval, PositiveU32};
 use crate::magic_compat::{InstrumentId, ProviderId};
 #[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{DataBatch, FlowInterval, PositiveU32};
+use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
 #[cfg(feature = "magic-gateway")]
-use magic_market_core::{BoardCategory, BoardConstituentProvider, BoardConstituentRequest, BoardDirectoryProvider, BoardDirectoryRequest, BoardFlows, BoardMembership, BoardMembershipProvider};
+use magic_market_core::{
+    BoardCategory, BoardConstituentProvider, BoardConstituentRequest, BoardDirectoryProvider,
+    BoardDirectoryRequest, BoardFlows, BoardMembership, BoardMembershipProvider,
+};
 #[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::{TdxBoardProvider, TdxError, TdxHqClient};
 
@@ -167,7 +170,12 @@ impl BoardDataGateway {
                     .as_ref()
                     .map(|b| b.evidence().provider)
                     .unwrap_or(ProviderId::Tdx);
-                return audit_gateway_result(DIRECTORY_CAPABILITY, audit_provider, &request_hash, result);
+                return audit_gateway_result(
+                    DIRECTORY_CAPABILITY,
+                    audit_provider,
+                    &request_hash,
+                    result,
+                );
             }
             Ok(None) => {}
             Err(error) => {
@@ -231,7 +239,12 @@ impl BoardDataGateway {
                     .as_ref()
                     .map(|b| b.evidence().provider)
                     .unwrap_or(ProviderId::Tdx);
-                return audit_gateway_result(MEMBERSHIP_CAPABILITY, audit_provider, &request_hash, result);
+                return audit_gateway_result(
+                    MEMBERSHIP_CAPABILITY,
+                    audit_provider,
+                    &request_hash,
+                    result,
+                );
             }
             Ok(None) => {}
             Err(error) => {
@@ -260,8 +273,7 @@ impl BoardDataGateway {
         {
             let gateway = *self;
             let joined =
-                tokio::task::spawn_blocking(move || fetch_memberships_audited(gateway, code))
-                    .await;
+                tokio::task::spawn_blocking(move || fetch_memberships_audited(gateway, code)).await;
             match joined {
                 Ok(result) => result,
                 Err(error) => {
@@ -324,9 +336,7 @@ impl BoardDataGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                &format!(
-                    "library transport disabled: DATA_GATEWAY_GRPC=1 required (code={code})"
-                ),
+                &format!("library transport disabled: DATA_GATEWAY_GRPC=1 required (code={code})"),
             ));
         }
         #[cfg(feature = "magic-gateway")]
@@ -350,7 +360,12 @@ impl BoardDataGateway {
                     .as_ref()
                     .map(|b| b.evidence().provider)
                     .unwrap_or(ProviderId::Eastmoney);
-                return audit_gateway_result(FLOW_CAPABILITY, audit_provider, &request_hash, result);
+                return audit_gateway_result(
+                    FLOW_CAPABILITY,
+                    audit_provider,
+                    &request_hash,
+                    result,
+                );
             }
             Ok(None) => {}
             Err(error) => {
@@ -417,7 +432,12 @@ impl BoardDataGateway {
                     .as_ref()
                     .map(|b| b.evidence().provider)
                     .unwrap_or(ProviderId::Eastmoney);
-                return audit_gateway_result(FLOW_CAPABILITY, audit_provider, &request_hash, result);
+                return audit_gateway_result(
+                    FLOW_CAPABILITY,
+                    audit_provider,
+                    &request_hash,
+                    result,
+                );
             }
             Ok(None) => {}
             Err(error) => {
@@ -906,9 +926,9 @@ mod tests {
         validate_source_evidence, BatchEvidence, BoardDataGateway, BoardKind, GatewayBatch,
         DIRECTORY_CAPABILITY, FLOW_CAPABILITY, MEMBERSHIP_CAPABILITY,
     };
+    use crate::magic_compat::{Exchange, ProviderId, SourceEvidence};
     #[cfg(feature = "magic-gateway")]
     use magic_eastmoney_rs::EastmoneyError;
-    use crate::magic_compat::{Exchange, ProviderId, SourceEvidence};
     #[cfg(feature = "magic-gateway")]
     use magic_market_core::BoardCategory;
     #[cfg(feature = "magic-gateway")]

@@ -1,17 +1,17 @@
 //! BR-162 evidence-preserving R-04 whole-market dragon-tiger Gateway.
 
-use super::review::{acquisition_request_hash, audit_gateway_result};
 #[cfg(feature = "magic-gateway")]
 use super::review::audit_blocking_join_failure;
-use super::{GatewayBatch, GatewayError};
+use super::review::{acquisition_request_hash, audit_gateway_result};
 #[cfg(feature = "magic-gateway")]
 use super::BatchEvidence;
+use super::{GatewayBatch, GatewayError};
+#[cfg(feature = "magic-gateway")]
+use crate::magic_compat::{AssetClass, IsoDate, PositiveU32};
+use crate::magic_compat::{DragonTigerSide, Exchange, ProviderId};
 use chrono::NaiveDate;
 #[cfg(feature = "magic-gateway")]
 use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
-use crate::magic_compat::{DragonTigerSide, Exchange, ProviderId};
-#[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{AssetClass, IsoDate, PositiveU32};
 #[cfg(feature = "magic-gateway")]
 // MarketDragonTigerData 是 method-resolution trait (正文无 :: 用法),
 // feature 模式提供 .market_dragon_tiger() 方法解析 — 不得按 unused 删除。
@@ -566,7 +566,7 @@ fn router_gateway_error(provider: Option<ProviderId>, error: RouterError) -> Gat
 mod tests {
     use super::*;
     use crate::magic_compat::{InstrumentId, Money, NonEmptyText, SourceEvidence};
-use magic_market_core::{DragonTigerEntry, DragonTigerSeat};
+    use magic_market_core::{DragonTigerEntry, DragonTigerSeat};
 
     fn disclosure(
         code: &str,

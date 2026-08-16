@@ -6,9 +6,9 @@
 //! These types are consumed by the v17.7 adapter (Task 5) and downstream
 //! classifier tasks (Task 3 earnings, Task 4 analyst).
 
+use crate::magic_compat::ProviderId;
 use crate::{data_gateway::parse_evidence_instant, signal::market_event::Direction};
 use chrono::{DateTime, Local, NaiveDate};
-use crate::magic_compat::ProviderId;
 use std::collections::BTreeMap;
 use std::fmt;
 

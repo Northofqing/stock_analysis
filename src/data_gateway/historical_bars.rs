@@ -9,16 +9,17 @@
 //! that source and permits the next registered source. No field is filled or
 //! estimated at this boundary.
 
-use chrono::NaiveDate;
-#[cfg(feature = "magic-gateway")]
-use chrono::Local;
-#[cfg(feature = "magic-gateway")]
-use magic_baidu_rs::{BaiduClient, BaiduError};
 #[cfg(all(test, feature = "magic-gateway"))]
 use crate::magic_compat::Exchange;
 use crate::magic_compat::ProviderId;
+use crate::magic_compat::SecurityBar;
 #[cfg(feature = "magic-gateway")]
 use crate::magic_compat::{AssetClass, DataBatch, InstrumentId};
+#[cfg(feature = "magic-gateway")]
+use chrono::Local;
+use chrono::NaiveDate;
+#[cfg(feature = "magic-gateway")]
+use magic_baidu_rs::{BaiduClient, BaiduError};
 #[cfg(feature = "magic-gateway")]
 use magic_market_core::{Adjustment, Bar, BarInterval, BarsRequest, HistoricalBars};
 #[cfg(feature = "magic-gateway")]
@@ -29,7 +30,6 @@ use magic_market_router::{
 use magic_sina_rs::{SinaClient, SinaError};
 #[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::protocol::constants::{fq_type, KLINE_15MIN};
-use crate::magic_compat::SecurityBar;
 #[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::{TdxError, TdxSmartClient};
 #[cfg(feature = "magic-gateway")]
@@ -37,16 +37,18 @@ use magic_tencent_rs::{TencentClient, TencentError};
 #[cfg(feature = "magic-gateway")]
 use std::sync::Arc;
 
-use crate::data_provider::KlineData;
 #[cfg(feature = "magic-gateway")]
 use crate::data_provider::AdjustType;
+use crate::data_provider::KlineData;
 use crate::database::daily_change_confirmation::DailyChangeConfirmationQuery;
 use crate::database::DatabaseManager;
-use crate::monitor::data_quality::{AdjacentDailyChange, MAX_UNCONFIRMED_ADJACENT_DAILY_CHANGE_PCT};
 #[cfg(feature = "magic-gateway")]
 use crate::monitor::data_quality::{
     validate_daily_freshness, validate_daily_kline_quality_with_confirmation,
     validate_daily_kline_structure, DqStats, FreshnessConfig,
+};
+use crate::monitor::data_quality::{
+    AdjacentDailyChange, MAX_UNCONFIRMED_ADJACENT_DAILY_CHANGE_PCT,
 };
 
 #[cfg(feature = "magic-gateway")]
@@ -54,11 +56,10 @@ use super::instrument_identity::{resolve_production_equity, EquitySegment};
 use super::review::{
     acquisition_request_hash, audit_gateway_result, BatchEvidence, GatewayBatch, GatewayError,
 };
-use super::security_lifecycle::{
-    CorporateActionState, LifecycleConfirmationEvidence, ListingDateState,
-    SecurityLifecycleGateway,
-};
 use super::security_lifecycle::SecurityLifecycleContext;
+use super::security_lifecycle::{
+    CorporateActionState, LifecycleConfirmationEvidence, ListingDateState, SecurityLifecycleGateway,
+};
 
 const CAPABILITY: &str = "HistoricalDailyBars";
 
@@ -237,7 +238,12 @@ impl HistoricalBarsGateway {
             }
             Ok(None) => {}
             Err(error) => {
-                return Err(GatewayError::unavailable(CAPABILITY, None, true, error.to_string()));
+                return Err(GatewayError::unavailable(
+                    CAPABILITY,
+                    None,
+                    true,
+                    error.to_string(),
+                ));
             }
         }
         // no-feature (monitor 零 magic): library transport 不存在。
@@ -260,14 +266,7 @@ impl HistoricalBarsGateway {
                 GatewayError::unavailable(CAPABILITY, None, true, error.to_string())
             })?;
             let bars = client
-                .get_security_bars(
-                    KLINE_15MIN,
-                    market,
-                    code,
-                    0,
-                    count as u16,
-                    fq_type::NONE,
-                )
+                .get_security_bars(KLINE_15MIN, market, code, 0, count as u16, fq_type::NONE)
                 .map_err(|error| {
                     GatewayError::unavailable(
                         CAPABILITY,

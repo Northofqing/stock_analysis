@@ -230,8 +230,8 @@ fn finish_bar(pending: PendingBar, shanghai: &FixedOffset) -> MinuteBar {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
     use crate::magic_compat::ProviderId;
+    use chrono::TimeZone;
 
     fn bars(count: usize, step_minutes: i64) -> Vec<MinuteBar> {
         let start = chrono::NaiveDate::from_ymd_opt(2026, 7, 16)

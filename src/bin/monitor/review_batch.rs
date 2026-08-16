@@ -2816,7 +2816,10 @@ mod tests {
         assert!(ReviewTask::ALL.contains(&ReviewTask::R12));
         assert!(ReviewTask::ALL.contains(&ReviewTask::R13));
         assert_eq!(ReviewTask::R12.label(), "R-12");
-        assert_eq!(ReviewTask::R12.source_label(), "paper_trades_15min_backtest");
+        assert_eq!(
+            ReviewTask::R12.source_label(),
+            "paper_trades_15min_backtest"
+        );
         assert_eq!(
             ReviewTask::R12.dependency(),
             ReviewTaskDependency::SourceOnly

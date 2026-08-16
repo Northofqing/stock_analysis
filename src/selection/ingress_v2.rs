@@ -1640,8 +1640,8 @@ fn reject_control(value: &str) -> Result<(), IngressPreparationError> {
 mod tests {
     use super::*;
     use crate::data_gateway::{BatchEvidence, GlobalNewsProvider, GlobalNewsRecord};
-    use crate::news::aggregator::raw_v2::{RawGlobalNewsFeedAttempt, TestRawGlobalNewsTerminal};
     use crate::magic_compat::SourceEvidence;
+    use crate::news::aggregator::raw_v2::{RawGlobalNewsFeedAttempt, TestRawGlobalNewsTerminal};
 
     fn utc(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)

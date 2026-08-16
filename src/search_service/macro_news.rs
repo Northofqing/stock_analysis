@@ -137,8 +137,8 @@ mod tests {
         BatchEvidence, EconomicReleaseFact, GatewayBatch, GatewayError, GlobalNewsProvider,
         GlobalNewsRecord,
     };
-    use chrono::{DateTime, Utc};
     use crate::magic_compat::{ProviderId, SourceEvidence};
+    use chrono::{DateTime, Utc};
 
     fn timestamp(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)

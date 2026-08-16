@@ -183,17 +183,13 @@ impl Bar {
             || bar_start.as_bytes().get(10) != bar_end.as_bytes().get(10)
             || bar_start > bar_end
         {
-            return Err(CoreError::InvalidRequest(
-                "invalid bar time range".into(),
-            ));
+            return Err(CoreError::InvalidRequest("invalid bar time range".into()));
         }
         if low.get() > open.get().min(close.get())
             || high.get() < open.get().max(close.get())
             || low.get() > high.get()
         {
-            return Err(CoreError::InvalidRequest(
-                "inconsistent OHLC range".into(),
-            ));
+            return Err(CoreError::InvalidRequest("inconsistent OHLC range".into()));
         }
         ensure_nonnegative_money("bar_amount", amount)?;
         Ok(Self {

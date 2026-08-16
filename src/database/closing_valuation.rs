@@ -237,12 +237,7 @@ mod tests {
         .expect("prior persisted");
         assert_eq!(prior_view.valuation.price_date, prior.price_date);
         assert_eq!(
-            prior_view
-                .valuation
-                .items
-                .first()
-                .expect("item")
-                .close,
+            prior_view.valuation.items.first().expect("item").close,
             Some(11.0)
         );
 
@@ -254,24 +249,17 @@ mod tests {
         .expect("latest persisted");
         assert_eq!(latest_view.valuation.price_date, latest.price_date);
         assert_eq!(
-            latest_view
-                .valuation
-                .items
-                .first()
-                .expect("item")
-                .close,
+            latest_view.valuation.items.first().expect("item").close,
             Some(22.0)
         );
 
         // 不存在的日期 → None (调用方出声, 不用 latest 冒充)
-        assert!(
-            persisted_valuation_view_for_date_conn(
-                &mut conn,
-                NaiveDate::from_ymd_opt(2026, 8, 8).expect("date")
-            )
-            .expect("for_date read")
-            .is_none()
-        );
+        assert!(persisted_valuation_view_for_date_conn(
+            &mut conn,
+            NaiveDate::from_ymd_opt(2026, 8, 8).expect("date")
+        )
+        .expect("for_date read")
+        .is_none());
     }
 
     #[test]

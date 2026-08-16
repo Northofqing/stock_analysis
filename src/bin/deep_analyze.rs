@@ -23,8 +23,7 @@ fn main() {
         .join("data")
         .join("deep_analyze_probe.db");
     std::env::set_var("DATABASE_PATH", &probe_db);
-    stock_analysis::database::DatabaseManager::init(Some(probe_db))
-        .expect("probe db init");
+    stock_analysis::database::DatabaseManager::init(Some(probe_db)).expect("probe db init");
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()

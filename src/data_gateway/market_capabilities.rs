@@ -5,18 +5,20 @@
 //! identity-consistent batch that carries all evidence and fields required by
 //! that consumer contract. Missing fields never become zeroes.
 
+use crate::magic_compat::ProviderId;
+#[cfg(all(test, feature = "magic-gateway"))]
+use crate::magic_compat::RatioUnit;
+#[cfg(feature = "magic-gateway")]
+use crate::magic_compat::{AssetClass, DataBatch, Exchange, InstrumentId};
 use chrono::{DateTime, NaiveDate, Utc};
 #[cfg(feature = "magic-gateway")]
 use chrono::{FixedOffset, NaiveDateTime, TimeZone, Timelike};
-#[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{AssetClass, DataBatch, Exchange, InstrumentId};
-use crate::magic_compat::ProviderId;
-#[cfg(feature = "magic-gateway")]
-use magic_market_core::{BookLevel, DataStatus, MinuteDataRequest, MinutePoint, OrderBook, SecurityMetadata};
-#[cfg(all(test, feature = "magic-gateway"))]
-use crate::magic_compat::RatioUnit;
 #[cfg(all(test, feature = "magic-gateway"))]
 use magic_market_core::Board;
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{
+    BookLevel, DataStatus, MinuteDataRequest, MinutePoint, OrderBook, SecurityMetadata,
+};
 #[cfg(feature = "magic-gateway")]
 use magic_market_router::{
     minute_source, order_book_source, security_metadata_source, AcceptancePolicy, AttemptStatus,
@@ -190,11 +192,21 @@ impl MarketCapabilitiesGateway {
                     .as_ref()
                     .map(|b| b.evidence().provider)
                     .unwrap_or(ProviderId::Tdx);
-                return audit_gateway_result(MINUTE_CAPABILITY, audit_provider, &request_hash, result);
+                return audit_gateway_result(
+                    MINUTE_CAPABILITY,
+                    audit_provider,
+                    &request_hash,
+                    result,
+                );
             }
             Ok(None) => {}
             Err(error) => {
-                return audit_gateway_result(MINUTE_CAPABILITY, ProviderId::Tdx, &request_hash, Err(error));
+                return audit_gateway_result(
+                    MINUTE_CAPABILITY,
+                    ProviderId::Tdx,
+                    &request_hash,
+                    Err(error),
+                );
             }
         }
         // P4 M5: no-feature 构建不携带 library transport, 无桥时显式失败
@@ -255,7 +267,12 @@ impl MarketCapabilitiesGateway {
                     .as_ref()
                     .map(|b| b.evidence().provider)
                     .unwrap_or(ProviderId::Tdx);
-                return audit_gateway_result(ORDER_BOOK_CAPABILITY, audit_provider, &request_hash, result);
+                return audit_gateway_result(
+                    ORDER_BOOK_CAPABILITY,
+                    audit_provider,
+                    &request_hash,
+                    result,
+                );
             }
             Ok(None) => {}
             Err(error) => {
@@ -327,7 +344,12 @@ impl MarketCapabilitiesGateway {
                     .as_ref()
                     .map(|b| b.evidence().provider)
                     .unwrap_or(ProviderId::Eastmoney);
-                return audit_gateway_result(MONEY_FLOW_CAPABILITY, audit_provider, &request_hash, result);
+                return audit_gateway_result(
+                    MONEY_FLOW_CAPABILITY,
+                    audit_provider,
+                    &request_hash,
+                    result,
+                );
             }
             Ok(None) => {}
             Err(error) => {
@@ -354,8 +376,8 @@ impl MarketCapabilitiesGateway {
         {
             let worker_hash = request_hash.clone();
             let joined = tokio::task::spawn_blocking(move || {
-                let result = build_instruments(&storage_codes, MONEY_FLOW_CAPABILITY).and_then(
-                    |_| {
+                let result =
+                    build_instruments(&storage_codes, MONEY_FLOW_CAPABILITY).and_then(|_| {
                         Err(GatewayError::classified(
                             MONEY_FLOW_CAPABILITY,
                             Some(ProviderId::Eastmoney),
@@ -366,8 +388,7 @@ impl MarketCapabilitiesGateway {
                              magic-emquant-rs; that licensed bridge is not linked into this \
                              binary",
                         ))
-                    },
-                );
+                    });
                 audit_gateway_result(
                     MONEY_FLOW_CAPABILITY,
                     ProviderId::Eastmoney,
@@ -466,10 +487,8 @@ impl MarketCapabilitiesGateway {
         codes: &[String],
     ) -> Result<GatewayBatch<MarketSecurityIdentity>, GatewayError> {
         let storage_codes = codes.to_vec();
-        let request_hash = acquisition_request_hash(
-            SECURITY_IDENTITY_CAPABILITY,
-            &storage_codes.join(","),
-        );
+        let request_hash =
+            acquisition_request_hash(SECURITY_IDENTITY_CAPABILITY, &storage_codes.join(","));
         // BR-231: identity is a narrow projection of the authenticated
         // ExternalV1 SecurityMetadata contract. A configured bridge failure is
         // audited and returned; it never falls back to a different provider.
@@ -1981,8 +2000,8 @@ fn classify_sina_error(error: SinaError) -> SourceError {
 mod tests {
     use super::*;
     use crate::magic_compat::{DataBatch, Money, Price, Provenance, Quantity, Ratio};
-#[cfg(feature = "magic-gateway")]
-use magic_market_core::{BookLevel, MoneyFlow, PriceLimitRule};
+    #[cfg(feature = "magic-gateway")]
+    use magic_market_core::{BookLevel, MoneyFlow, PriceLimitRule};
 
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-07-24T09:30:02+08:00")

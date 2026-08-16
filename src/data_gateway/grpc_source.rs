@@ -11,27 +11,30 @@
 //! Handle::block_on; 纯同步线程 → 静态 BRIDGE_RUNTIME。
 pub mod convert;
 
+use crate::data_gateway::market_capabilities::MarketSecurityIdentity;
+use crate::data_gateway::outcome_daily_bars::{OutcomeTransportFailure, RawOutcomeFetch};
 use crate::data_gateway::{
     board_ranking::BoardRankingFact, BlockTradeReview, BoardDirectoryFact, BoardFlowFact,
     BoardKind, BoardMembershipRecord, DragonTigerStockReview, EconomicReleaseFact,
     EventAnnouncement, ForeignExchangeFact, FuturesDeliveryFact, GatewayBatch, GatewayError,
     GeneralWebResearchBatch, GlobalIndexFact, GlobalNewsRecord, ImplementedCorporateAction,
-    InstrumentFundFlowFact, IntradayShapeFact, MagicTdxT0Batch, MarketMinutePoint,
-    MarketMoneyFlow, MarketOrderBook, MarketSecurityMetadata, NorthboundDailyFact,
-    ProviderTopNFact, RealtimeIndexQuote, RealtimeMarketQuote, ResearchReportFact,
-    SinaInstrumentNewsRecord, UpperLimitRecord,
+    InstrumentFundFlowFact, IntradayShapeFact, MagicTdxT0Batch, MarketMinutePoint, MarketMoneyFlow,
+    MarketOrderBook, MarketSecurityMetadata, NorthboundDailyFact, ProviderTopNFact,
+    RealtimeIndexQuote, RealtimeMarketQuote, ResearchReportFact, SinaInstrumentNewsRecord,
+    UpperLimitRecord,
 };
-use crate::data_gateway::market_capabilities::MarketSecurityIdentity;
-use crate::data_gateway::outcome_daily_bars::{OutcomeTransportFailure, RawOutcomeFetch};
 use crate::data_provider::{consensus::ConsensusData, KlineData};
 use crate::grpc_client::client::GrpcMarketClient;
 use crate::grpc_client::envelope::QueryResult;
 use crate::grpc_client::errors::GrpcError;
 use crate::grpc_client::pb::magic::market::v1::{AdmissionState, Operation};
-use chrono::NaiveDate;
 use crate::magic_compat::ProviderId;
-use crate::magic_compat::{FinancialStatement, FlowInterval, InstrumentId, MarketStatistics, NorthboundChannel, StatementKind};
 use crate::magic_compat::SecurityBar;
+use crate::magic_compat::{
+    FinancialStatement, FlowInterval, InstrumentId, MarketStatistics, NorthboundChannel,
+    StatementKind,
+};
+use chrono::NaiveDate;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -67,7 +70,10 @@ fn map_query_error(op: Operation, e: &GrpcError) -> GatewayError {
         // 从 detail 恢复 provider/reason_code/retryable, 保真重建分类。
         _ => {
             let d = e.details();
-            let provider = d.provider.as_deref().and_then(|s| convert::parse_provider(s).ok());
+            let provider = d
+                .provider
+                .as_deref()
+                .and_then(|s| convert::parse_provider(s).ok());
             let reason_code = d.reason_code.as_deref().unwrap_or("no_verified_batch");
             let retryable = d.retryable.unwrap_or(true);
             GatewayError::classified(
@@ -245,9 +251,11 @@ fn reason_code_static(s: &str) -> &'static str {
         "exact_batch_join_accepted",
         "database_failure",
     ];
-    KNOWN.iter().find(|k| **k == s).copied().unwrap_or_else(|| {
-        Box::leak(s.to_string().into_boxed_str())
-    })
+    KNOWN
+        .iter()
+        .find(|k| **k == s)
+        .copied()
+        .unwrap_or_else(|| Box::leak(s.to_string().into_boxed_str()))
 }
 
 /// 已挂桥的 op 清单 (与各网关文件内 `super::grpc_source::bridge_for("X")` 调用
@@ -348,7 +356,9 @@ pub async fn external_opening_readiness(
             "开盘 readiness 要求 DATA_GATEWAY_GRPC=1 且 SecurityMetadata 未被禁用",
         )
     })?;
-    source.ensure_external_connected(Operation::SecurityMetadata).await?;
+    source
+        .ensure_external_connected(Operation::SecurityMetadata)
+        .await?;
     {
         let mut guard = source.external_client.lock().await;
         let state = guard
@@ -361,7 +371,9 @@ pub async fn external_opening_readiness(
             .map_err(map_external_connection_error)?;
         require_external_opening_capabilities(&capabilities)?;
     }
-    source.security_identities_async(&["600396".to_string()]).await
+    source
+        .security_identities_async(&["600396".to_string()])
+        .await
 }
 
 /// M4 启动 banner (v15.x 出声原则): 数据源模式必须打印, 默认 library。
@@ -380,13 +392,12 @@ pub fn startup_banner() -> String {
     } else {
         disabled
     };
-    let external = if std::env::var_os("GRPC_MARKET_CLIENT_BUNDLE")
-        .is_some_and(|value| !value.is_empty())
-    {
-        "configured"
-    } else {
-        "unconfigured"
-    };
+    let external =
+        if std::env::var_os("GRPC_MARKET_CLIENT_BUNDLE").is_some_and(|value| !value.is_empty()) {
+            "configured"
+        } else {
+            "unconfigured"
+        };
     format!(
         "[data_gateway] 数据源模式 = {mode} | server = {server} | external-v1 = {external} | 桥接 {} ops | \
          禁用 = {disabled} | 保持本地 {} ops: {} \
@@ -487,7 +498,10 @@ impl GrpcSource {
         self.ensure_connected().await?;
         let mut guard = self.client.lock().await;
         let client = guard.as_mut().expect("ensure_connected 后必有 client");
-        client.query(op, params).await.map_err(|e| map_query_error(op, &e))
+        client
+            .query(op, params)
+            .await
+            .map_err(|e| map_query_error(op, &e))
     }
 
     async fn ensure_external_connected(&self, operation: Operation) -> Result<(), GatewayError> {
@@ -593,7 +607,10 @@ impl GrpcSource {
         codes: &[String],
     ) -> Result<GatewayBatch<RealtimeMarketQuote>, GatewayError> {
         let q = self
-            .query_op(Operation::RealtimeQuotes, serde_json::json!({ "codes": codes }))
+            .query_op(
+                Operation::RealtimeQuotes,
+                serde_json::json!({ "codes": codes }),
+            )
             .await?;
         convert::realtime_quotes(&q)
     }
@@ -611,7 +628,10 @@ impl GrpcSource {
         code: &str,
     ) -> Result<GatewayBatch<MarketMinutePoint>, GatewayError> {
         let q = self
-            .query_op(Operation::MinuteData, serde_json::json!({ "codes": [code] }))
+            .query_op(
+                Operation::MinuteData,
+                serde_json::json!({ "codes": [code] }),
+            )
             .await?;
         convert::minute_data(&q)
     }
@@ -660,9 +680,7 @@ impl GrpcSource {
     ) -> Result<GatewayBatch<MarketSecurityMetadata>, GatewayError> {
         // 文档 §8 契约: instruments 对象数组 (exchange 由 code 前缀推导)。
         let params = crate::grpc_contract::params::instruments_for(codes);
-        let q = self
-            .query_op(Operation::SecurityMetadata, params)
-            .await?;
+        let q = self.query_op(Operation::SecurityMetadata, params).await?;
         convert::security_metadata(&q)
     }
 
@@ -740,9 +758,7 @@ impl GrpcSource {
         convert::announcements(&q)
     }
 
-    pub async fn global_news_async(
-        &self,
-    ) -> Result<GatewayBatch<GlobalNewsRecord>, GatewayError> {
+    pub async fn global_news_async(&self) -> Result<GatewayBatch<GlobalNewsRecord>, GatewayError> {
         let q = self
             .query_op(Operation::GlobalNews, serde_json::json!({}))
             .await?;
@@ -849,7 +865,10 @@ impl GrpcSource {
         code: &str,
     ) -> Result<GatewayBatch<BoardMembershipRecord>, GatewayError> {
         let q = self
-            .query_op(Operation::BoardConstituents, serde_json::json!({ "codes": [code] }))
+            .query_op(
+                Operation::BoardConstituents,
+                serde_json::json!({ "codes": [code] }),
+            )
             .await?;
         convert::board_constituents(&q)
     }
@@ -878,7 +897,11 @@ impl GrpcSource {
     }
 
     /// 同步包装 (spawn_blocking / 纯同步线程), 与本地 day1_flows_blocking 对齐。
-    pub fn board_flows(&self, kind: BoardKind, limit: u32) -> Result<GatewayBatch<BoardFlowFact>, GatewayError> {
+    pub fn board_flows(
+        &self,
+        kind: BoardKind,
+        limit: u32,
+    ) -> Result<GatewayBatch<BoardFlowFact>, GatewayError> {
         block_on(self.board_flows_async(kind, limit))
     }
 
@@ -976,7 +999,10 @@ impl GrpcSource {
         codes: &[String],
     ) -> Result<GatewayBatch<MarketStatistics>, GatewayError> {
         let q = self
-            .query_op(Operation::MarketStatistics, serde_json::json!({ "codes": codes }))
+            .query_op(
+                Operation::MarketStatistics,
+                serde_json::json!({ "codes": codes }),
+            )
             .await?;
         convert::market_statistics(&q)
     }
@@ -1057,7 +1083,10 @@ impl GrpcSource {
         codes: &[String],
     ) -> Result<GatewayBatch<RealtimeIndexQuote>, GatewayError> {
         let q = self
-            .query_op(Operation::IndexQuotes, serde_json::json!({ "codes": codes }))
+            .query_op(
+                Operation::IndexQuotes,
+                serde_json::json!({ "codes": codes }),
+            )
             .await?;
         convert::index_quotes(&q)
     }
@@ -1093,7 +1122,10 @@ impl GrpcSource {
         code: &str,
     ) -> Result<GatewayBatch<IntradayShapeFact>, GatewayError> {
         let q = self
-            .query_op(Operation::IntradayShape, serde_json::json!({ "codes": [code] }))
+            .query_op(
+                Operation::IntradayShape,
+                serde_json::json!({ "codes": [code] }),
+            )
             .await?;
         convert::intraday_shape(&q)
     }
@@ -1125,10 +1157,7 @@ impl GrpcSource {
     }
 
     /// 同步包装 (spawn_blocking / 纯同步线程)。
-    pub fn t0_evidence_batch(
-        &self,
-        codes: &[String],
-    ) -> Result<MagicTdxT0Batch, GatewayError> {
+    pub fn t0_evidence_batch(&self, codes: &[String]) -> Result<MagicTdxT0Batch, GatewayError> {
         block_on(self.t0_evidence_batch_async(codes))
     }
 
@@ -1308,8 +1337,8 @@ mod tests {
     use crate::grpc_client::pb::magic::market::v1 as pb;
     use crate::magic_compat::ProviderId;
     use prost::Message; // pb::ErrorDetail::encode_to_vec
-    // env 是进程级: 这些测试并行时会互相看到对方的 env (race)。
-    // 共享锁串行化 env 敏感的测试 (M3 全量并行跑时暴露)。
+                        // env 是进程级: 这些测试并行时会互相看到对方的 env (race)。
+                        // 共享锁串行化 env 敏感的测试 (M3 全量并行跑时暴露)。
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// D2 核心: Fetch 失败 (Internal + ErrorDetail) 按 detail 重建分类 —
@@ -1358,12 +1387,24 @@ mod tests {
     #[test]
     fn map_query_error_request_class_codes_no_retry() {
         for code in [
-            GrpcError::InvalidArgument { details: ErrorDetail::default() },
-            GrpcError::Unimplemented { details: ErrorDetail::default() },
-            GrpcError::PermissionDenied { details: ErrorDetail::default() },
-            GrpcError::Unauthenticated { details: ErrorDetail::default() },
-            GrpcError::ResourceExhausted { details: ErrorDetail::default() },
-            GrpcError::FailedPrecondition { details: ErrorDetail::default() },
+            GrpcError::InvalidArgument {
+                details: ErrorDetail::default(),
+            },
+            GrpcError::Unimplemented {
+                details: ErrorDetail::default(),
+            },
+            GrpcError::PermissionDenied {
+                details: ErrorDetail::default(),
+            },
+            GrpcError::Unauthenticated {
+                details: ErrorDetail::default(),
+            },
+            GrpcError::ResourceExhausted {
+                details: ErrorDetail::default(),
+            },
+            GrpcError::FailedPrecondition {
+                details: ErrorDetail::default(),
+            },
         ] {
             let g = map_query_error(Operation::RealtimeQuotes, &code);
             assert_eq!(g.audit_outcome(), "invalid_request", "{code:?}");
@@ -1375,7 +1416,9 @@ mod tests {
     /// 默认 reason_code=no_verified_batch + retryable=true (原有语义不变)。
     #[test]
     fn map_query_error_unavailable_without_detail_keeps_defaults() {
-        let err = GrpcError::Unavailable { details: ErrorDetail::default() };
+        let err = GrpcError::Unavailable {
+            details: ErrorDetail::default(),
+        };
         let g = map_query_error(Operation::HistoricalBars, &err);
         assert_eq!(g.reason_code(), "no_verified_batch");
         assert!(g.retryable());
@@ -1489,7 +1532,9 @@ mod tests {
         std::env::set_var("DATA_GATEWAY_GRPC", "1");
         std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:1");
         reset_bridge();
-        let bridge = bridge_for("RealtimeQuotes").unwrap().expect("bridge 实例存在");
+        let bridge = bridge_for("RealtimeQuotes")
+            .unwrap()
+            .expect("bridge 实例存在");
         let err = bridge.realtime_quotes(&["600519".to_string()]).unwrap_err();
         assert!(err.retryable(), "服务端不可达必须 retryable");
         std::env::remove_var("DATA_GATEWAY_GRPC");
@@ -1507,9 +1552,14 @@ mod tests {
         std::env::set_var("DATA_GATEWAY_GRPC", "1");
         std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:1");
         reset_bridge();
-        let bridge = bridge_for("RealtimeQuotes").unwrap().expect("bridge 实例存在");
+        let bridge = bridge_for("RealtimeQuotes")
+            .unwrap()
+            .expect("bridge 实例存在");
         let err = bridge.realtime_quotes(&["600519".to_string()]).unwrap_err();
-        assert!(err.retryable(), "async worker 路径也必须 fail-closed retryable");
+        assert!(
+            err.retryable(),
+            "async worker 路径也必须 fail-closed retryable"
+        );
         std::env::remove_var("DATA_GATEWAY_GRPC");
         std::env::remove_var("GRPC_MARKET_ADDR");
         reset_bridge();
@@ -1522,8 +1572,14 @@ mod tests {
         std::env::remove_var("DATA_GATEWAY_GRPC_DISABLED");
         std::env::remove_var("GRPC_MARKET_ADDR");
         let b = startup_banner();
-        assert!(b.contains("数据源模式 = library"), "默认必须 library (v15.x 出声): {b}");
-        assert!(b.contains("server = http://127.0.0.1:18082"), "默认地址: {b}");
+        assert!(
+            b.contains("数据源模式 = library"),
+            "默认必须 library (v15.x 出声): {b}"
+        );
+        assert!(
+            b.contains("server = http://127.0.0.1:18082"),
+            "默认地址: {b}"
+        );
         assert!(b.contains("禁用 = 无"), "无禁用: {b}");
         assert!(b.contains("保持本地 2 ops"), "keep-local 计数: {b}");
     }
@@ -1536,8 +1592,14 @@ mod tests {
         std::env::set_var("DATA_GATEWAY_GRPC_DISABLED", "T0Evidence,InstrumentNews");
         let b = startup_banner();
         assert!(b.contains("数据源模式 = grpc"), "grpc 模式: {b}");
-        assert!(b.contains("server = http://127.0.0.1:19001"), "显式地址: {b}");
-        assert!(b.contains("禁用 = T0Evidence,InstrumentNews"), "禁用列表: {b}");
+        assert!(
+            b.contains("server = http://127.0.0.1:19001"),
+            "显式地址: {b}"
+        );
+        assert!(
+            b.contains("禁用 = T0Evidence,InstrumentNews"),
+            "禁用列表: {b}"
+        );
         assert!(b.contains("保持本地 2 ops"), "keep-local 计数: {b}");
         assert!(
             b.contains("chain_batch op 61"),
@@ -1565,7 +1627,10 @@ mod tests {
         );
         let banner = startup_banner();
         assert!(banner.contains("external-v1 = configured"), "{banner}");
-        assert!(!banner.contains(secret_marker), "bundle path must stay secret-safe: {banner}");
+        assert!(
+            !banner.contains(secret_marker),
+            "bundle path must stay secret-safe: {banner}"
+        );
 
         std::env::remove_var("DATA_GATEWAY_GRPC");
         std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
@@ -1618,10 +1683,9 @@ mod tests {
         let bridge = bridge_for("BoardConstituents")
             .expect("bridge config")
             .expect("bridge enabled");
-        let error = block_on(
-            bridge.query_external_op(Operation::BoardConstituents, serde_json::json!({})),
-        )
-        .expect_err("undelivered contract must be rejected before I/O");
+        let error =
+            block_on(bridge.query_external_op(Operation::BoardConstituents, serde_json::json!({})))
+                .expect_err("undelivered contract must be rejected before I/O");
         assert_eq!(error.reason_code(), "external_contract_rejected");
         assert!(!error.retryable());
 
@@ -1662,7 +1726,9 @@ mod tests {
             let text = std::fs::read_to_string(&path).expect("读网关源文件");
             for (idx, _) in text.match_indices("bridge_for(\"") {
                 let rest = &text[idx + "bridge_for(\"".len()..];
-                let end = rest.find('"').unwrap_or_else(|| panic!("bridge_for 名称未闭合: {path:?}"));
+                let end = rest
+                    .find('"')
+                    .unwrap_or_else(|| panic!("bridge_for 名称未闭合: {path:?}"));
                 found.push(rest[..end].to_string());
             }
         }
@@ -1689,7 +1755,10 @@ mod tests {
         let batch: VisibleChainBatch = serde_json::from_slice(canned.as_bytes())
             .expect("canned fixture-cb JSON → VisibleChainBatch");
         assert_eq!(batch.batch_id, "fixture-cb");
-        assert_eq!(batch.trading_date.format("%Y-%m-%d").to_string(), "2026-08-15");
+        assert_eq!(
+            batch.trading_date.format("%Y-%m-%d").to_string(),
+            "2026-08-15"
+        );
         assert_eq!(batch.chains.len(), 1);
         assert_eq!(batch.chains[0].canonical_board_id, "BK0475");
         assert_eq!(batch.chains[0].members.len(), 1);
@@ -1698,8 +1767,7 @@ mod tests {
         assert!(batch.rejections.is_empty());
         // 双向: 序列化回去仍可重建 (服务端 to_vec → 客户端 from_slice 往返)。
         let reencoded = serde_json::to_vec(&batch).expect("VisibleChainBatch → bytes");
-        let round: VisibleChainBatch =
-            serde_json::from_slice(&reencoded).expect("重新反序列化");
+        let round: VisibleChainBatch = serde_json::from_slice(&reencoded).expect("重新反序列化");
         assert_eq!(round.batch_id, batch.batch_id);
         assert_eq!(round.trading_date, batch.trading_date);
     }

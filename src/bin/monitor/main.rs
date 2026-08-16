@@ -559,9 +559,9 @@ mod tests_monitor_historical_gateway_projection {
     use super::{
         chronological_daily_bars, latest_price_change_from_records, t1_close_from_records,
     };
-    use stock_analysis::magic_compat::ProviderId;
     use stock_analysis::data_gateway::BatchEvidence;
     use stock_analysis::data_provider::{AdjustType, KlineData};
+    use stock_analysis::magic_compat::ProviderId;
 
     fn evidence() -> BatchEvidence {
         BatchEvidence {
@@ -1453,8 +1453,8 @@ fn report_dispatch_outcome(name: &str, delivered: bool, failures: &mut Vec<Strin
 async fn run_daily_pushes() -> Result<(), String> {
     use push_templates::{
         dispatch_catalyst_review_daily, dispatch_industry_chain_intraday_daily,
-        dispatch_intraday_market_daily, dispatch_news_catalyst_daily,
-        dispatch_news_to_idea_daily, dispatch_paper_review_daily, dispatch_preopen_news_hot_daily,
+        dispatch_intraday_market_daily, dispatch_news_catalyst_daily, dispatch_news_to_idea_daily,
+        dispatch_paper_review_daily, dispatch_preopen_news_hot_daily,
     };
 
     use stock_analysis::opportunity::scheduler::{OpportunitySchedule, PushWindow};
@@ -1866,10 +1866,7 @@ async fn check_snapshot_staleness_and_notify() {
         return;
     };
     if snapshot_date >= last_trading {
-        log::debug!(
-            "[快照提醒] 快照新鲜: effective_at={}",
-            summary.effective_at
-        );
+        log::debug!("[快照提醒] 快照新鲜: effective_at={}", summary.effective_at);
         return;
     }
     // 累计过期交易日数 ≥ 5 才提醒（BR-234b：未传时系统已自动估值，无需每日打扰）
@@ -2044,10 +2041,7 @@ mod tests_br236_valuation_note {
             NaiveDate::from_ymd_opt(2026, 8, 10).expect("date"),
             Some(44741.0),
         );
-        assert!(
-            note.contains("昨日盈亏 -426.05"),
-            "unexpected note: {note}"
-        );
+        assert!(note.contains("昨日盈亏 -426.05"), "unexpected note: {note}");
         assert!(
             !note.contains("自算"),
             "same-day snapshot must not self-calc: {note}"
@@ -2071,10 +2065,7 @@ mod tests_br236_valuation_note {
             NaiveDate::from_ymd_opt(2026, 8, 11).expect("date"),
             Some(49399.0),
         );
-        assert!(
-            note.contains("昨日盈亏 +123.45"),
-            "unexpected note: {note}"
-        );
+        assert!(note.contains("昨日盈亏 +123.45"), "unexpected note: {note}");
     }
 
     /// 快照过期 + 估值市值缺失 → 出声「自算不可用」，不静默回落确认值
@@ -2117,10 +2108,7 @@ mod tests_br236_valuation_note {
             NaiveDate::from_ymd_opt(2026, 8, 11).expect("date"),
             Some(49399.0),
         );
-        assert!(
-            note.contains("昨日盈亏 -426.05"),
-            "unexpected note: {note}"
-        );
+        assert!(note.contains("昨日盈亏 -426.05"), "unexpected note: {note}");
     }
 }
 
@@ -2506,9 +2494,8 @@ pub(crate) struct DataModePendingStable {
     since: std::time::Instant,
 }
 
-static DATA_MODE_PENDING_STABLE: Lazy<
-    std::sync::Mutex<Option<DataModePendingStable>>,
-> = Lazy::new(|| std::sync::Mutex::new(None));
+static DATA_MODE_PENDING_STABLE: Lazy<std::sync::Mutex<Option<DataModePendingStable>>> =
+    Lazy::new(|| std::sync::Mutex::new(None));
 
 static DATA_MODE_UNSAFE_REMINDER: Lazy<
     std::sync::Mutex<stock_analysis::monitor::data_mode::PersistentUnsafeReminder>,
@@ -2636,53 +2623,51 @@ async fn evaluate_data_mode_hook() {
             None => None,
         }
     };
-    let result =
-        match pt::push_data_mode_change(
-            &input,
-            prev,
-            persistent_reminder_due,
-            Some(&banner),
-            pending_since,
-        )
-        .await
-        {
-            Ok(result) => {
-                let mut pending = match DATA_MODE_PENDING_STABLE.lock() {
-                    Ok(guard) => guard,
-                    Err(_) => {
-                        log::error!("[DataMode-hook] pending stable lock poisoned");
-                        return;
-                    }
-                };
-                match &result {
-                    pt::ModeDispatchResult::EstablishedSilently => {
-                        // 抖动窗口内跳过 → 出声 (BR-225c, v15 静默路径可见)
-                        if pending_since.is_none() && prev.is_some() && prev != Some(health.mode)
-                        {
-                            log::warn!(
+    let result = match pt::push_data_mode_change(
+        &input,
+        prev,
+        persistent_reminder_due,
+        Some(&banner),
+        pending_since,
+    )
+    .await
+    {
+        Ok(result) => {
+            let mut pending = match DATA_MODE_PENDING_STABLE.lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    log::error!("[DataMode-hook] pending stable lock poisoned");
+                    return;
+                }
+            };
+            match &result {
+                pt::ModeDispatchResult::EstablishedSilently => {
+                    // 抖动窗口内跳过 → 出声 (BR-225c, v15 静默路径可见)
+                    if pending_since.is_none() && prev.is_some() && prev != Some(health.mode) {
+                        log::warn!(
                                 "[DataMode-hook][BR-225c] 状态切换 {:?} → {:?} 在 300s 稳定窗口内, 跳过通知 (模式仍生效, 仅推送节流)",
                                 prev,
                                 health.mode
                             );
-                        }
-                        if pending.is_none() {
-                            *pending = Some(DataModePendingStable {
-                                mode: health.mode,
-                                since: std::time::Instant::now(),
-                            });
-                        }
                     }
-                    pt::ModeDispatchResult::Delivery(_) => {
-                        *pending = None;
+                    if pending.is_none() {
+                        *pending = Some(DataModePendingStable {
+                            mode: health.mode,
+                            since: std::time::Instant::now(),
+                        });
                     }
                 }
-                result
+                pt::ModeDispatchResult::Delivery(_) => {
+                    *pending = None;
+                }
             }
-            Err(error) => {
-                log::error!("[DataMode-hook] change push failed: {error}");
-                return;
-            }
-        };
+            result
+        }
+        Err(error) => {
+            log::error!("[DataMode-hook] change push failed: {error}");
+            return;
+        }
+    };
     if result.is_confirmed() {
         match LATEST_DATA_MODE.lock() {
             Ok(mut state) => *state = Some(health.mode),
@@ -4311,7 +4296,10 @@ async fn main() {
 
     // P4 M4: data_gateway 数据源模式 banner (v15.x 出声 — 默认 library,
     // DATA_GATEWAY_GRPC=1 才走 gRPC 桥; 桥接/禁用/保持本地清单一目了然)。
-    log::info!("{}", stock_analysis::data_gateway::grpc_source::startup_banner());
+    log::info!(
+        "{}",
+        stock_analysis::data_gateway::grpc_source::startup_banner()
+    );
 
     // BR-231 / redlines 2.1, 2.2, 2.4, 2.7: production must prove the
     // authenticated identity source before any producer loop is started.
@@ -5170,7 +5158,8 @@ async fn post_session_review_scheduler(selection_v2_enabled: bool) {
                     .map(|(_, sha)| sha != &snapshot_sha)
                     .unwrap_or(false);
             if due_for_date {
-                match closing_valuation_runtime::run_closing_valuation_once(now.date_naive()).await {
+                match closing_valuation_runtime::run_closing_valuation_once(now.date_naive()).await
+                {
                     Ok(receipt) => {
                         log::info!(
                             "[BR-147] closing valuation persisted: run_id={} inserted={} snapshot_sha={}",
@@ -6311,7 +6300,9 @@ fn load_announcement_audience_codes(
         }
     };
     let snapshot_local = snapshot.effective_at.with_timezone(&chrono::Local);
-    let age_hours = chrono::Local::now().signed_duration_since(snapshot_local).num_hours();
+    let age_hours = chrono::Local::now()
+        .signed_duration_since(snapshot_local)
+        .num_hours();
     if age_hours > 24 {
         return (
             registered_watch_codes.clone(),
@@ -6330,8 +6321,11 @@ fn load_announcement_audience_codes(
             ),
         );
     }
-    let mut audience: std::collections::HashSet<String> =
-        snapshot.items.iter().map(|item| item.code.clone()).collect();
+    let mut audience: std::collections::HashSet<String> = snapshot
+        .items
+        .iter()
+        .map(|item| item.code.clone())
+        .collect();
     audience.extend(registered_watch_codes.iter().cloned());
     log::info!(
         "[NewsMonitor][BR-226] 用户确认持仓快照作为持仓受众: {} 只持仓 + {} 只自选 (snapshot_id={}, effective_at={})",
@@ -6494,15 +6488,15 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
                         session
                     );
                 } else {
-                match stock_analysis::news::aggregator::raw_v2::fetch_raw_global_news_batch(20)
-                    .await
-                {
-                    Ok(batch) => {
-                        // BR-172: NewsAI shadow 默认启用（2026-08-11 取消
-                        // STOCK_ANALYSIS_NEWS_AI_SHADOW_ENABLE 开关）。与 Track A
-                        // 同 tick 消费 admitted batches；模型未配置时 shadow 内部
-                        // warn 出声跳过，不影响候选入池。
-                        let admitted: Vec<
+                    match stock_analysis::news::aggregator::raw_v2::fetch_raw_global_news_batch(20)
+                        .await
+                    {
+                        Ok(batch) => {
+                            // BR-172: NewsAI shadow 默认启用（2026-08-11 取消
+                            // STOCK_ANALYSIS_NEWS_AI_SHADOW_ENABLE 开关）。与 Track A
+                            // 同 tick 消费 admitted batches；模型未配置时 shadow 内部
+                            // warn 出声跳过，不影响候选入池。
+                            let admitted: Vec<
                             stock_analysis::news::aggregator::AdmittedGlobalNewsBatch,
                         > = batch
                             .attempts()
@@ -6519,38 +6513,39 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
                                 )
                             })
                             .collect();
-                        if !admitted.is_empty() {
-                            crate::news_ai_shadow::spawn_from_same_tick(&admitted);
-                        }
-                        let titles: Vec<String> = batch
-                            .attempts()
-                            .iter()
-                            .flat_map(|attempt| {
-                                attempt
-                                    .terminal()
-                                    .records()
-                                    .map(|records| {
-                                        records.iter().map(|record| record.title.clone())
-                                    })
-                                    .into_iter()
-                                    .flatten()
-                            })
-                            .collect();
-                        let (recorded, skipped) =
-                            crate::news_aggregator_init::candidate_ingest_from_news(&titles).await;
-                        log::info!(
+                            if !admitted.is_empty() {
+                                crate::news_ai_shadow::spawn_from_same_tick(&admitted);
+                            }
+                            let titles: Vec<String> = batch
+                                .attempts()
+                                .iter()
+                                .flat_map(|attempt| {
+                                    attempt
+                                        .terminal()
+                                        .records()
+                                        .map(|records| {
+                                            records.iter().map(|record| record.title.clone())
+                                        })
+                                        .into_iter()
+                                        .flatten()
+                                })
+                                .collect();
+                            let (recorded, skipped) =
+                                crate::news_aggregator_init::candidate_ingest_from_news(&titles)
+                                    .await;
+                            log::info!(
                             "[GlobalNews][BR-183] Track A tick records={} recorded={} skipped={}",
                             titles.len(),
                             recorded,
                             skipped
                         );
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "[GlobalNews][BR-183] raw batch 获取失败, 本轮候选不入池: {error}"
+                            );
+                        }
                     }
-                    Err(error) => {
-                        log::warn!(
-                            "[GlobalNews][BR-183] raw batch 获取失败, 本轮候选不入池: {error}"
-                        );
-                    }
-                }
                 }
             }
         }
@@ -7191,9 +7186,9 @@ struct HoldingPlanDailyRow {
 async fn prepare_holding_plan_messages(
     banner: &push_templates::BannerCtx,
 ) -> Result<Vec<PreparedHoldingPlan>, String> {
-    use stock_analysis::magic_compat::{AssetClass, Exchange, InstrumentId};
     use sha2::{Digest, Sha256};
     use stock_analysis::database::user_position_snapshot::latest_user_position_snapshot;
+    use stock_analysis::magic_compat::{AssetClass, Exchange, InstrumentId};
 
     let snapshot = latest_user_position_snapshot()
         .map_err(|error| format!("持仓快照读取失败: {error}"))?
@@ -7211,10 +7206,7 @@ async fn prepare_holding_plan_messages(
     let mut out = Vec::new();
     for item in &snapshot.items {
         let Some(quote) = quote_map.get(&item.code) else {
-            log::warn!(
-                "[T-03] code={} 行情缺失, 跳过该票 (其余照常)",
-                item.code
-            );
+            log::warn!("[T-03] code={} 行情缺失, 跳过该票 (其余照常)", item.code);
             continue;
         };
         if item.cost_price <= 0.0 {
@@ -7311,9 +7303,9 @@ struct PreparedCloseCall {
 async fn prepare_close_call_messages(
     banner: &push_templates::BannerCtx,
 ) -> Result<Vec<PreparedCloseCall>, String> {
-    use stock_analysis::magic_compat::{AssetClass, Exchange, InstrumentId};
     use sha2::{Digest, Sha256};
     use stock_analysis::database::user_position_snapshot::latest_user_position_snapshot;
+    use stock_analysis::magic_compat::{AssetClass, Exchange, InstrumentId};
 
     let snapshot = latest_user_position_snapshot()
         .map_err(|error| format!("持仓快照读取失败: {error}"))?
@@ -7485,7 +7477,8 @@ async fn monitor_loop() {
                     match stock_analysis::trading::paper_sell::scan_and_sell(risk_context) {
                         Ok(sold) if !sold.is_empty() => {
                             for result in &sold {
-                                let text = format!(
+                                let text =
+                                    format!(
                                     "[虚拟盘卖出] {}({}) 卖出{}股 @{:.2} | 收益率{:+.2}% | 原因:{}",
                                     result.name, result.code, result.quantity, result.price,
                                     result.return_rate_pct, result.reason
@@ -7526,34 +7519,34 @@ async fn monitor_loop() {
                         // BR-234: 收盘后卖出评估 — 无交易时段守卫，收盘 K 线完整评估
                         // (v19 review 同盘中: invalid_position_ledger 暂停, 见 paper_sell_paused)
                         if !paper_sell_paused("盘后") {
-                        match stock_analysis::trading::paper_sell::scan_and_sell_post_close(
-                            risk_context,
-                        ) {
-                            Ok(sold) if !sold.is_empty() => {
-                                for result in &sold {
-                                    let text = format!(
+                            match stock_analysis::trading::paper_sell::scan_and_sell_post_close(
+                                risk_context,
+                            ) {
+                                Ok(sold) if !sold.is_empty() => {
+                                    for result in &sold {
+                                        let text = format!(
                                         "[虚拟盘卖出] {}({}) 卖出{}股 @{:.2} | 收益率{:+.2}% | 原因:{}",
                                         result.name, result.code, result.quantity, result.price,
                                         result.return_rate_pct, result.reason
                                     );
-                                    let outcome = push_governor_v3(
-                                        &text,
-                                        PushKind::PaperSell,
-                                        Some(&result.code),
-                                    )
-                                    .await;
-                                    if !outcome.is_pushed() {
-                                        log::warn!(
-                                            "[paper_sell] {} 推送未投递: {:?}",
-                                            result.code,
-                                            outcome
-                                        );
+                                        let outcome = push_governor_v3(
+                                            &text,
+                                            PushKind::PaperSell,
+                                            Some(&result.code),
+                                        )
+                                        .await;
+                                        if !outcome.is_pushed() {
+                                            log::warn!(
+                                                "[paper_sell] {} 推送未投递: {:?}",
+                                                result.code,
+                                                outcome
+                                            );
+                                        }
                                     }
                                 }
+                                Ok(_) => {}
+                                Err(e) => log::warn!("[paper_sell] 收盘后扫描失败: {}", e),
                             }
-                            Ok(_) => {}
-                            Err(e) => log::warn!("[paper_sell] 收盘后扫描失败: {}", e),
-                        }
                         }
                     }
                     None => log::error!(
@@ -7581,9 +7574,8 @@ async fn monitor_loop() {
                                 "[产业链][盘后15:30] 新闻+AI 链分析完成并推送 (date={})",
                                 today
                             );
-                            *CHAIN_POST_LAST
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner()) = Some(today);
+                            *CHAIN_POST_LAST.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(today);
                         }
                         Err(error) => {
                             log::error!(
@@ -7760,9 +7752,8 @@ async fn monitor_loop() {
                                         stock_count,
                                         report.len()
                                     );
-                                    *CHAIN_LAST_RUN
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner()) = Some(today);
+                                    *CHAIN_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner()) =
+                                        Some(today);
                                 }
                                 Err(error) => {
                                     log::error!(
@@ -7794,7 +7785,9 @@ async fn monitor_loop() {
                     .map(|d| d == today)
                     .unwrap_or(false);
                 if !already_run {
-                    log::info!("[BR-021][BR-108] 8:30 盘前重置 (含错过补偿) 触发真实 AccountMode 评估");
+                    log::info!(
+                        "[BR-021][BR-108] 8:30 盘前重置 (含错过补偿) 触发真实 AccountMode 评估"
+                    );
                     if evaluate_account_mode_hook(false).await {
                         *BR021_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some(today);
                     } else {
@@ -7825,9 +7818,8 @@ async fn monitor_loop() {
                                 "[产业链][盘前9:05] 新闻+AI 链分析完成并推送 (date={})",
                                 today
                             );
-                            *CHAIN_PREOPEN_LAST
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner()) = Some(today);
+                            *CHAIN_PREOPEN_LAST.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(today);
                         }
                         Err(error) => {
                             log::error!("[产业链][盘前9:05] 链分析推送失败, 保留重试资格: {error}");
@@ -8059,9 +8051,8 @@ async fn monitor_loop() {
                         if now_time >= chrono::NaiveTime::from_hms_opt(9, 10, 0).unwrap()
                             && now_time < chrono::NaiveTime::from_hms_opt(9, 20, 0).unwrap()
                         {
-                            static PREOPEN_PROBE_LAST: std::sync::Mutex<
-                                Option<chrono::NaiveDate>,
-                            > = std::sync::Mutex::new(None);
+                            static PREOPEN_PROBE_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                                std::sync::Mutex::new(None);
                             let probe_today = chrono::Local::now().date_naive();
                             let probe_done = PREOPEN_PROBE_LAST
                                 .lock()
@@ -8070,19 +8061,16 @@ async fn monitor_loop() {
                                 .unwrap_or(false);
                             if !probe_done {
                                 // 基准代码: 深主板 + 沪主板 + 创业板
-                                let probe_codes: Vec<String> = [
-                                    "000001", "600000", "300750",
-                                ]
-                                .iter()
-                                .map(|s| s.to_string())
-                                .collect();
+                                let probe_codes: Vec<String> = ["000001", "600000", "300750"]
+                                    .iter()
+                                    .map(|s| s.to_string())
+                                    .collect();
                                 let probe_result = tokio::task::spawn_blocking(move || {
                                     market_data::fetch_realtime_quotes(&probe_codes)
                                 })
                                 .await;
-                                *PREOPEN_PROBE_LAST
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner()) = Some(probe_today);
+                                *PREOPEN_PROBE_LAST.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    Some(probe_today);
                                 match probe_result {
                                     Ok(Ok(quotes)) if !quotes.is_empty() => {
                                         log::info!(
@@ -8094,12 +8082,9 @@ async fn monitor_loop() {
                                         let text = "⚠️ 开盘前行情源预检失败: 统一实时行情返回空批次 (9:10)。\n若 9:20 竞价时行情未恢复, A-02 竞价优选/P-05 候选台将在窗口内重试。"
                                             .to_string();
                                         log::warn!("[预检][行情源] {text}");
-                                        let outcome = push_governor_v3(
-                                            &text,
-                                            PushKind::IntradayMarket,
-                                            None,
-                                        )
-                                        .await;
+                                        let outcome =
+                                            push_governor_v3(&text, PushKind::IntradayMarket, None)
+                                                .await;
                                         log::info!(
                                             "[预检][行情源] 预警推送 pushed={}",
                                             outcome.is_pushed()
@@ -8110,21 +8095,16 @@ async fn monitor_loop() {
                                             "⚠️ 开盘前行情源预检失败 (9:10): {error}\n若 9:20 竞价时行情未恢复, A-02/P-05 将在窗口内重试。"
                                         );
                                         log::warn!("[预检][行情源] {text}");
-                                        let outcome = push_governor_v3(
-                                            &text,
-                                            PushKind::IntradayMarket,
-                                            None,
-                                        )
-                                        .await;
+                                        let outcome =
+                                            push_governor_v3(&text, PushKind::IntradayMarket, None)
+                                                .await;
                                         log::info!(
                                             "[预检][行情源] 预警推送 pushed={}",
                                             outcome.is_pushed()
                                         );
                                     }
                                     Err(error) => {
-                                        log::warn!(
-                                            "[预检][行情源] 探测任务失败: {error}"
-                                        );
+                                        log::warn!("[预检][行情源] 探测任务失败: {error}");
                                     }
                                 }
                             }
@@ -9916,8 +9896,8 @@ async fn post_close_news_scheduler() {
 /// 失败不重试: 告警时效性强, 30s 后快照已变化; 同日同类再次触发由 counted
 /// 去重/状态机放行新 occurrence。
 async fn deliver_intraday_alert(event: &AlertEvent) -> bool {
-    use stock_analysis::magic_compat::{AssetClass, Exchange, InstrumentId};
     use sha2::{Digest, Sha256};
+    use stock_analysis::magic_compat::{AssetClass, Exchange, InstrumentId};
 
     let business_date = chrono::Local::now().date_naive();
     let occurrence = format!(
@@ -9948,31 +9928,33 @@ async fn deliver_intraday_alert(event: &AlertEvent) -> bool {
     let instrument = match InstrumentId::new(exchange, event.code.clone(), AssetClass::Equity) {
         Ok(id) => id,
         Err(error) => {
-            log::error!("[盘中告警] instrument 构造失败 code={}: {error}", event.code);
+            log::error!(
+                "[盘中告警] instrument 构造失败 code={}: {error}",
+                event.code
+            );
             return false;
         }
     };
-    let binding =
-        match durable_delivery_runtime::CountedDeliveryBinding::new(
-            business_date,
-            occurrence,
-            canonical_bytes,
-            durable_delivery_runtime::CountedDeliveryScope::Ticket { instrument },
-            subject_hash,
-            durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
-            None,
-            true,
-        ) {
-            Ok(binding) => binding,
-            Err(error) => {
-                log::error!(
-                    "[盘中告警] counted binding 构造失败 code={} category={}: {error}",
-                    event.code,
-                    event.category.key()
-                );
-                return false;
-            }
-        };
+    let binding = match durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        occurrence,
+        canonical_bytes,
+        durable_delivery_runtime::CountedDeliveryScope::Ticket { instrument },
+        subject_hash,
+        durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        true,
+    ) {
+        Ok(binding) => binding,
+        Err(error) => {
+            log::error!(
+                "[盘中告警] counted binding 构造失败 code={} category={}: {error}",
+                event.code,
+                event.category.key()
+            );
+            return false;
+        }
+    };
     let token = match crate::presentation_registry::acquire_token(
         "T-04B-intraday-alert",
         PushKind::HoldingEvent,
@@ -10447,10 +10429,16 @@ mod tests_v17_4_d {
         let mut gate = SnapshotReminderGate::default();
 
         assert!(gate.try_begin(today));
-        assert!(!gate.try_begin(today), "same-day concurrent attempt must wait");
+        assert!(
+            !gate.try_begin(today),
+            "same-day concurrent attempt must wait"
+        );
 
         gate.finish(today, false);
-        assert!(gate.try_begin(today), "unconfirmed attempt must remain retryable");
+        assert!(
+            gate.try_begin(today),
+            "unconfirmed attempt must remain retryable"
+        );
 
         gate.finish(today, true);
         assert!(!gate.try_begin(today), "confirmed attempt closes the day");

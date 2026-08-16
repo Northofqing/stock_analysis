@@ -7,14 +7,14 @@
 //! under the five-second freshness rule and continues to the next Magic
 //! provider. No consumer-owned HTTP or legacy parser is retained.
 
+#[cfg(all(test, feature = "magic-gateway"))]
+use crate::magic_compat::Exchange;
+use crate::magic_compat::ProviderId;
+#[cfg(feature = "magic-gateway")]
+use crate::magic_compat::{AssetClass, InstrumentId, RatioUnit};
 use chrono::{DateTime, NaiveDate, Utc};
 #[cfg(feature = "magic-gateway")]
 use chrono::{FixedOffset, NaiveTime};
-#[cfg(all(test, feature = "magic-gateway"))]
-use crate::magic_compat::Exchange;
-#[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{AssetClass, InstrumentId, RatioUnit};
-use crate::magic_compat::ProviderId;
 #[cfg(feature = "magic-gateway")]
 use magic_market_core::{DataStatus, Quote};
 #[cfg(feature = "magic-gateway")]
@@ -219,7 +219,12 @@ impl MarketDataGateway {
             }
             Ok(None) => {}
             Err(error) => {
-                return audit_gateway_result(CAPABILITY, ProviderId::Tdx, &request_hash, Err(error));
+                return audit_gateway_result(
+                    CAPABILITY,
+                    ProviderId::Tdx,
+                    &request_hash,
+                    Err(error),
+                );
             }
         }
         // P4 M5: no-feature 构建不携带 library transport, 无桥时显式失败
@@ -249,11 +254,8 @@ impl MarketDataGateway {
                 }
             };
 
-            let (terminal_provider, result) = route_quotes(
-                codes,
-                &instruments,
-                QuoteAdmissionMode::RealtimeFiveSecond,
-            );
+            let (terminal_provider, result) =
+                route_quotes(codes, &instruments, QuoteAdmissionMode::RealtimeFiveSecond);
             audit_gateway_result(CAPABILITY, terminal_provider, &request_hash, result)
         }
     }
@@ -698,10 +700,10 @@ fn cached_tencent_client() -> Result<Arc<TencentClient>, String> {
     if let Some(client) = guard.as_ref() {
         return Ok(client.clone());
     }
-    let client = Arc::new(
-        TencentClient::new()
-            .map_err(|error| format!("Magic Tencent quote client initialization failed: {error}"))?,
-    );
+    let client =
+        Arc::new(TencentClient::new().map_err(|error| {
+            format!("Magic Tencent quote client initialization failed: {error}")
+        })?);
     *guard = Some(client.clone());
     Ok(client)
 }
@@ -736,8 +738,7 @@ fn quote_chain_source(
             classify_tdx_error,
         )),
         ProviderId::Tencent => {
-            let client = cached_tencent_client()
-                .map_err(RouterError::InvalidConfiguration)?;
+            let client = cached_tencent_client().map_err(RouterError::InvalidConfiguration)?;
             Ok(quote_source(
                 ProviderId::Tencent,
                 client,
@@ -746,11 +747,7 @@ fn quote_chain_source(
         }
         ProviderId::Sina => {
             let client = cached_sina_client().map_err(RouterError::InvalidConfiguration)?;
-            Ok(quote_source(
-                ProviderId::Sina,
-                client,
-                classify_sina_error,
-            ))
+            Ok(quote_source(ProviderId::Sina, client, classify_sina_error))
         }
         other => Err(RouterError::InvalidConfiguration(format!(
             "provider {other:?} is not a registered realtime quote route"
@@ -1136,7 +1133,9 @@ fn classify_sina_error(error: SinaError) -> SourceError {
 #[cfg(all(test, feature = "magic-gateway"))]
 mod tests {
     use super::*;
-    use crate::magic_compat::{DataBatch, Money, Price, Provenance, Quantity, Ratio, SourceEvidence};
+    use crate::magic_compat::{
+        DataBatch, Money, Price, Provenance, Quantity, Ratio, SourceEvidence,
+    };
 
     fn quote_batch(
         code: &str,
@@ -1245,7 +1244,7 @@ mod tests {
             batch,
             QuoteAdmissionMode::RealtimeFiveSecond,
         )
-            .expect("fresh records must survive a stale sibling");
+        .expect("fresh records must survive a stale sibling");
         let kept = admitted
             .records()
             .iter()
@@ -1279,7 +1278,7 @@ mod tests {
             batch,
             QuoteAdmissionMode::RealtimeFiveSecond,
         )
-            .expect_err("an entirely stale batch must remain an explicit failure");
+        .expect_err("an entirely stale batch must remain an explicit failure");
         assert!(error.retryable(), "staleness must keep failing over");
         assert!(
             error.to_string().contains("quote_stale"),
@@ -1329,7 +1328,10 @@ mod tests {
         // 午休 + 当日 source → 放行
         assert!(off_session_static_quote_eligible(lunch_now, today_source));
         // 午休 + 昨日 source → 拒绝
-        assert!(!off_session_static_quote_eligible(lunch_now, yesterday_source));
+        assert!(!off_session_static_quote_eligible(
+            lunch_now,
+            yesterday_source
+        ));
         // 盘中 → 拒绝 (即使当日 source)
         assert!(!off_session_static_quote_eligible(
             bj(2026, 8, 12, 10, 0, 0),
@@ -1988,10 +1990,13 @@ mod tests {
     fn br233_settled_close_admits_after_hours_quote_for_trading_date() {
         let trading_date = NaiveDate::from_ymd_opt(2026, 8, 10).expect("fixed date");
         // 15:00 +08 = 07:00 UTC; 收市后 21:00 +08 = 13:00 UTC 请求
-        let source_at = chrono::NaiveDateTime::new(trading_date, chrono::NaiveTime::from_hms_opt(15, 0, 0).unwrap())
-            .and_local_timezone(chrono::FixedOffset::east_opt(8 * 3600).unwrap())
-            .unwrap()
-            .with_timezone(&Utc);
+        let source_at = chrono::NaiveDateTime::new(
+            trading_date,
+            chrono::NaiveTime::from_hms_opt(15, 0, 0).unwrap(),
+        )
+        .and_local_timezone(chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+        .unwrap()
+        .with_timezone(&Utc);
         // 与 br218 测试同款真实样式代码 (TEST_CODE_ 前缀会被 build_instrument 解析)
         let codes = vec!["600396".to_owned()];
         let batch = quote_batch(
@@ -2019,10 +2024,13 @@ mod tests {
     fn br233_settled_close_rejects_wrong_source_date() {
         let trading_date = NaiveDate::from_ymd_opt(2026, 8, 10).expect("fixed date");
         let other_day = NaiveDate::from_ymd_opt(2026, 8, 7).expect("fixed date");
-        let source_at = chrono::NaiveDateTime::new(other_day, chrono::NaiveTime::from_hms_opt(15, 0, 0).unwrap())
-            .and_local_timezone(chrono::FixedOffset::east_opt(8 * 3600).unwrap())
-            .unwrap()
-            .with_timezone(&Utc);
+        let source_at = chrono::NaiveDateTime::new(
+            other_day,
+            chrono::NaiveTime::from_hms_opt(15, 0, 0).unwrap(),
+        )
+        .and_local_timezone(chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+        .unwrap()
+        .with_timezone(&Utc);
         let codes = vec!["600396".to_owned()];
         let batch = quote_batch(
             "600396",
@@ -2048,10 +2056,13 @@ mod tests {
     fn br233_settled_close_rejects_intraday_request() {
         let trading_date = NaiveDate::from_ymd_opt(2026, 8, 10).expect("fixed date");
         // 盘中 13:00 +08 = 05:00 UTC → 未过 07:00 UTC 收盘时刻
-        let source_at = chrono::NaiveDateTime::new(trading_date, chrono::NaiveTime::from_hms_opt(13, 0, 0).unwrap())
-            .and_local_timezone(chrono::FixedOffset::east_opt(8 * 3600).unwrap())
-            .unwrap()
-            .with_timezone(&Utc);
+        let source_at = chrono::NaiveDateTime::new(
+            trading_date,
+            chrono::NaiveTime::from_hms_opt(13, 0, 0).unwrap(),
+        )
+        .and_local_timezone(chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+        .unwrap()
+        .with_timezone(&Utc);
         let codes = vec!["600396".to_owned()];
         let batch = quote_batch(
             "600396",

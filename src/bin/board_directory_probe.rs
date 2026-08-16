@@ -5,11 +5,16 @@ use anyhow::{bail, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let kind = match std::env::args().nth(1).as_deref() { Some("industry") => stock_analysis::data_gateway::BoardKind::Industry, Some("region") => stock_analysis::data_gateway::BoardKind::Region, _ => stock_analysis::data_gateway::BoardKind::Concept }; let filter = std::env::args().nth(2);
+    let kind = match std::env::args().nth(1).as_deref() {
+        Some("industry") => stock_analysis::data_gateway::BoardKind::Industry,
+        Some("region") => stock_analysis::data_gateway::BoardKind::Region,
+        _ => stock_analysis::data_gateway::BoardKind::Concept,
+    };
+    let filter = std::env::args().nth(2);
     // BR-159 审计依赖数据库
-    stock_analysis::database::DatabaseManager::init(Some(
-        std::path::PathBuf::from("data/stock_analysis.db"),
-    ))
+    stock_analysis::database::DatabaseManager::init(Some(std::path::PathBuf::from(
+        "data/stock_analysis.db",
+    )))
     .map_err(|error| anyhow::anyhow!("数据库初始化失败: {error}"))?;
     let batch = stock_analysis::data_gateway::BoardDataGateway::production_tdx()
         .directory(kind, 200)

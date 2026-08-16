@@ -20,11 +20,11 @@ use crate::database::data_acquisition_audit::DataAcquisitionAuditRecord;
 #[cfg(feature = "magic-gateway")]
 use crate::database::DatabaseManager;
 #[cfg(feature = "magic-gateway")]
-use chrono::{DateTime, FixedOffset, Local, NaiveDate, SecondsFormat};
-#[cfg(feature = "magic-gateway")]
 use crate::magic_compat::{
     AssetClass, DataBatch, Exchange, InstrumentId, LimitPoolEntry, PositiveU32, ProviderId,
 };
+#[cfg(feature = "magic-gateway")]
+use chrono::{DateTime, FixedOffset, Local, NaiveDate, SecondsFormat};
 #[cfg(feature = "magic-gateway")]
 use magic_market_core::{
     BoardCategory, BoardMembership, BoardMembershipProvider, SecurityMetadata,
@@ -35,9 +35,9 @@ use magic_tdx_rs::{protocol::constants::PRIMARY_SERVERS, BlockService, TdxError,
 use serde::Serialize;
 #[cfg(feature = "magic-gateway")]
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
 #[cfg(feature = "magic-gateway")]
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainIntelligencePolicy {

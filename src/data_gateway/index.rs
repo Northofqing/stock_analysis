@@ -6,8 +6,8 @@
 //! receives one complete, ordered Tencent batch or an explicit failure; it no
 //! longer owns a Tencent URL, HTTP client, retry loop, or wire parser.
 
-use chrono::{DateTime, Utc};
 use crate::magic_compat::{AssetClass, DataBatch, Exchange, InstrumentId, ProviderId, RatioUnit};
+use chrono::{DateTime, Utc};
 #[cfg(feature = "magic-gateway")]
 use magic_market_core::{DataStatus, Quote, RealtimeQuotes};
 #[cfg(feature = "magic-gateway")]

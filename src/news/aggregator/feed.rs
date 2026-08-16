@@ -129,8 +129,8 @@ pub(super) fn record_to_market_event(
 mod tests {
     use super::*;
     use crate::data_gateway::BatchEvidence;
-    use chrono::{DateTime, Utc};
     use crate::magic_compat::{ProviderId, SourceEvidence};
+    use chrono::{DateTime, Utc};
 
     fn test_record(provider: GlobalNewsProvider) -> GlobalNewsRecord {
         let published_at = DateTime::parse_from_rfc3339("2026-07-25T10:00:00+08:00")

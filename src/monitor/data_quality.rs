@@ -922,7 +922,8 @@ mod tests {
             make_kline(d1, 10.0, 10.5, 9.8, 10.0),
             make_kline(d3, 10.2, 10.6, 10.1, 10.4),
         ];
-        validate_daily_kline_quality(&mut bars, "TEST_CODE_000001").expect("suspension gap tolerated");
+        validate_daily_kline_quality(&mut bars, "TEST_CODE_000001")
+            .expect("suspension gap tolerated");
     }
 
     #[test]

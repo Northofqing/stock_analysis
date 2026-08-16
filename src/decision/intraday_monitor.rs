@@ -657,8 +657,10 @@ mod tests {
         let effective = chrono::Local::now();
         let input = UserPositionSnapshotInput {
             snapshot_id: unique_code("SNAPSHOT"),
-            effective_at: effective.with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap()),
-            confirmed_at: effective.with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap()),
+            effective_at: effective
+                .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap()),
+            confirmed_at: effective
+                .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap()),
             source: "test-fixture".to_string(),
             confirm_empty: false,
             evidence_sha256: "TEST_CODE_EVIDENCE".to_string(),
