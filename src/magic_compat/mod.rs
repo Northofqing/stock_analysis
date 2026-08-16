@@ -16,19 +16,40 @@
 
 pub mod evidence;
 pub mod instrument;
+pub mod market;
 pub mod provider_id;
+pub mod ranking;
+pub mod tdx;
 
 #[cfg(feature = "magic-gateway")]
 pub use magic_market_core::{
-    AssetClass, CoreError, EvidenceTimestamp, Exchange, InstrumentId, NonEmptyText, ProviderId,
-    SourceEvidence,
+    AssetClass, CoreError, DataBatch, EvidenceTimestamp, Exchange, FinancialLine,
+    FinancialStatement, FiniteNumber, FlowInterval, FxPair, GlobalIndexCode, InstrumentId,
+    IsoDate, LimitPoolEntry, LimitPoolKind, MarketRankingKind, MarketRankingUnit, MarketStatistics,
+    Money, NonEmptyText, NorthboundChannel, PositiveU32, Price, Provenance, ProviderId,
+    QualityReport, Quantity, Ratio, RatioUnit, SourceEvidence, StatementKind,
 };
+#[cfg(feature = "magic-gateway")]
+pub use magic_tdx_rs::protocol::types::SecurityBar;
 #[cfg(not(feature = "magic-gateway"))]
 pub use evidence::{EvidenceTimestamp, NonEmptyText, SourceEvidence};
 #[cfg(not(feature = "magic-gateway"))]
 pub use instrument::{AssetClass, CoreError, Exchange, InstrumentId};
 #[cfg(not(feature = "magic-gateway"))]
+pub use market::{
+    FinancialLine, FinancialStatement, LimitPoolEntry, LimitPoolKind, MarketStatistics,
+    StatementKind,
+};
+#[cfg(not(feature = "magic-gateway"))]
 pub use provider_id::ProviderId;
+#[cfg(not(feature = "magic-gateway"))]
+pub use ranking::{FxPair, GlobalIndexCode, MarketRankingKind, MarketRankingUnit};
+#[cfg(not(feature = "magic-gateway"))]
+pub use record::{DataBatch, FlowInterval, IsoDate, NorthboundChannel, Provenance, QualityReport};
+#[cfg(not(feature = "magic-gateway"))]
+pub use tdx::SecurityBar;
+#[cfg(not(feature = "magic-gateway"))]
+pub use value::{FiniteNumber, Money, PositiveU32, Price, Quantity, Ratio, RatioUnit};
 
 #[cfg(test)]
 mod tests {
@@ -199,5 +220,252 @@ mod tests {
         assert!(EvidenceTimestamp::parse_instant("2026-08-16T10:00:00+08:00").is_ok());
         assert!(EvidenceTimestamp::parse_instant("2026-08-16").is_err());
         assert!(EvidenceTimestamp::parse_instant("2026-08-16T10:00:00").is_err());
+    }
+
+    /// Phase 3: unit-variant 枚举 Debug 名 + serde 字符串 (wire 契约) 与上游一致。
+    #[test]
+    fn enum_wire_names_match_upstream() {
+        let limit_pool_kinds: &[(&str, LimitPoolKind)] = &[
+            ("Upper", LimitPoolKind::Upper),
+            ("Broken", LimitPoolKind::Broken),
+            ("Lower", LimitPoolKind::Lower),
+            ("PreviousUpper", LimitPoolKind::PreviousUpper),
+        ];
+        assert_eq!(limit_pool_kinds.len(), 4, "LimitPoolKind 变体数 = 上游 75ee2a2");
+        for (name, kind) in limit_pool_kinds {
+            assert_eq!(&format!("{kind:?}"), name);
+            assert_eq!(
+                serde_json::to_string(kind).unwrap(),
+                serde_json::to_string(name).unwrap()
+            );
+        }
+
+        let statement_kinds: &[(&str, StatementKind)] = &[
+            ("Balance", StatementKind::Balance),
+            ("Income", StatementKind::Income),
+            ("CashFlow", StatementKind::CashFlow),
+        ];
+        assert_eq!(statement_kinds.len(), 3, "StatementKind 变体数 = 上游 75ee2a2");
+        for (name, kind) in statement_kinds {
+            assert_eq!(&format!("{kind:?}"), name);
+            assert_eq!(
+                serde_json::to_string(kind).unwrap(),
+                serde_json::to_string(name).unwrap()
+            );
+        }
+
+        let indices: &[(&str, GlobalIndexCode)] = &[
+            ("DowJones", GlobalIndexCode::DowJones),
+            ("NasdaqComposite", GlobalIndexCode::NasdaqComposite),
+            ("Sp500", GlobalIndexCode::Sp500),
+            ("Nikkei225", GlobalIndexCode::Nikkei225),
+            ("HangSeng", GlobalIndexCode::HangSeng),
+            ("Ftse100", GlobalIndexCode::Ftse100),
+        ];
+        assert_eq!(indices.len(), 6, "GlobalIndexCode 变体数 = 上游 75ee2a2");
+        for (name, code) in indices {
+            assert_eq!(&format!("{code:?}"), name);
+            assert_eq!(
+                serde_json::to_string(code).unwrap(),
+                serde_json::to_string(name).unwrap()
+            );
+        }
+
+        let pairs: &[(&str, FxPair)] = &[
+            ("UsdCny", FxPair::UsdCny),
+            ("EurUsd", FxPair::EurUsd),
+            ("UsdJpy", FxPair::UsdJpy),
+            ("GbpUsd", FxPair::GbpUsd),
+            ("AudUsd", FxPair::AudUsd),
+            ("UsdChf", FxPair::UsdChf),
+            ("UsdCad", FxPair::UsdCad),
+            ("NzdUsd", FxPair::NzdUsd),
+        ];
+        assert_eq!(pairs.len(), 8, "FxPair 变体数 = 上游 75ee2a2");
+        for (name, pair) in pairs {
+            assert_eq!(&format!("{pair:?}"), name);
+            assert_eq!(
+                serde_json::to_string(pair).unwrap(),
+                serde_json::to_string(name).unwrap()
+            );
+        }
+    }
+
+    /// Phase 3: Custom(NonEmptyText) 变体的 wire 表示 (newtype 变体) 与上游一致。
+    #[test]
+    fn custom_variant_wire_representation_matches_upstream() {
+        let kind = MarketRankingKind::Custom(NonEmptyText::new("region_heat").unwrap());
+        // NonEmptyText 是 derive Debug 的 tuple struct → Debug 名含类型前缀
+        assert_eq!(format!("{kind:?}"), r#"Custom(NonEmptyText("region_heat"))"#);
+        assert_eq!(
+            serde_json::to_string(&kind).unwrap(),
+            r#"{"Custom":"region_heat"}"#
+        );
+        let parsed: MarketRankingKind = serde_json::from_str(r#"{"Custom":"region_heat"}"#).unwrap();
+        assert_eq!(parsed, kind);
+
+        let unit = MarketRankingUnit::Custom(NonEmptyText::new("score_100").unwrap());
+        assert_eq!(format!("{unit:?}"), r#"Custom(NonEmptyText("score_100"))"#);
+        assert_eq!(
+            serde_json::to_string(&unit).unwrap(),
+            r#"{"Custom":"score_100"}"#
+        );
+        let parsed: MarketRankingUnit = serde_json::from_str(r#"{"Custom":"score_100"}"#).unwrap();
+        assert_eq!(parsed, unit);
+
+        // 内部校验由 NonEmptyText 承担 (evidence.rs 已测), Custom 变体直接构造
+        assert_eq!(
+            serde_json::to_string(&MarketRankingKind::Custom(NonEmptyText::new("x").unwrap()))
+                .unwrap(),
+            r#"{"Custom":"x"}"#
+        );
+    }
+
+    fn test_evidence() -> SourceEvidence {
+        SourceEvidence::new(ProviderId::Eastmoney, "2099-01-02T10:00:01+08:00", "phase3")
+            .unwrap()
+    }
+
+    fn test_instrument() -> InstrumentId {
+        InstrumentId::new(Exchange::Shanghai, "600396", AssetClass::Equity).unwrap()
+    }
+
+    /// Phase 3: LimitPoolEntry serde round-trip + 字段保真 (review.rs:535
+    /// `DataBatch<LimitPoolEntry>` 反序列化依赖)。
+    #[test]
+    fn limit_pool_entry_json_roundtrip() {
+        let entry = LimitPoolEntry {
+            kind: LimitPoolKind::Upper,
+            instrument: test_instrument(),
+            trading_date: IsoDate::new("2099-01-02").unwrap(),
+            price: Price::new(11.0).unwrap(),
+            change: Ratio::decimal(0.1).unwrap(),
+            volume: Some(Quantity::new(1_000_000.0).unwrap()),
+            turnover: None,
+            sealed_amount: Some(Money::new(123_456_789.0).unwrap()),
+            first_seal_at: Some(NonEmptyText::new("09:30:00").unwrap()),
+            last_seal_at: None,
+            break_count: Some(2),
+            streak: Some(PositiveU32::new(3).unwrap()),
+            industry: Some(NonEmptyText::new("半导体").unwrap()),
+            board_name: None,
+            seal_state: Some(NonEmptyText::new("封板").unwrap()),
+            reseal_count: None,
+            reason: None,
+            evidence: test_evidence(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains(r#""kind":"Upper""#));
+        assert!(json.contains(r#""trading_date":"2099-01-02""#));
+        assert!(json.contains(r#""first_seal_at":"09:30:00""#));
+        assert!(json.contains(r#""industry":"半导体""#));
+        assert!(json.contains(r#""provider":"Eastmoney""#));
+        assert!(json.contains(r#""batch_id":"phase3""#));
+        let parsed: LimitPoolEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, entry);
+        assert_eq!(parsed.kind, LimitPoolKind::Upper);
+        assert_eq!(parsed.streak.unwrap().get(), 3);
+        assert_eq!(parsed.change.get(), 0.1);
+    }
+
+    /// Phase 3: FinancialStatement serde round-trip (company_financials.rs
+    /// 消费其 lines/instrument/kind)。
+    #[test]
+    fn financial_statement_json_roundtrip() {
+        let statement = FinancialStatement {
+            instrument: test_instrument(),
+            kind: StatementKind::Income,
+            report_period: IsoDate::new("2026-03-31").unwrap(),
+            announced_on: Some(IsoDate::new("2026-04-28").unwrap()),
+            currency: Some(NonEmptyText::new("CNY").unwrap()),
+            lines: vec![FinancialLine {
+                key: NonEmptyText::new("revenue").unwrap(),
+                source_label: NonEmptyText::new("营业收入").unwrap(),
+                value: Some(FiniteNumber::new(1_234_567_890.0).unwrap()),
+                unit: Some(NonEmptyText::new("元").unwrap()),
+            }],
+            evidence: test_evidence(),
+        };
+        let json = serde_json::to_string(&statement).unwrap();
+        assert!(json.contains(r#""kind":"Income""#));
+        assert!(json.contains(r#""report_period":"2026-03-31""#));
+        assert!(json.contains(r#""key":"revenue""#));
+        let parsed: FinancialStatement = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, statement);
+        assert_eq!(parsed.lines[0].value.unwrap().get(), 1_234_567_890.0);
+    }
+
+    /// Phase 3: MarketStatistics 私有字段 + new 校验 + accessors + round-trip
+    /// (push_templates.rs:3686 `MarketStatistics::new` 测试依赖)。
+    #[test]
+    fn market_statistics_validation_and_roundtrip() {
+        let stats = MarketStatistics::new(
+            test_instrument(),
+            Some(Ratio::decimal(0.05).unwrap()),
+            Some(FiniteNumber::new(15.0).unwrap()),
+            None,
+            Some(FiniteNumber::new(2.0).unwrap()),
+            Some(Money::new(1e11).unwrap()),
+            Some(Money::new(8e10).unwrap()),
+            Some(Price::new(13.0).unwrap()),
+            None,
+            Some(FiniteNumber::new(2.5).unwrap()),
+            test_evidence(),
+        )
+        .unwrap();
+        assert_eq!(stats.turnover_rate().unwrap().get(), 0.05);
+        assert_eq!(stats.total_market_cap().unwrap().get(), 1e11);
+        assert_eq!(stats.instrument().code(), "600396");
+        assert_eq!(stats.volume_ratio().unwrap().get(), 2.5);
+        assert_eq!(stats.evidence().provider(), ProviderId::Eastmoney);
+
+        // 校验: 市值不可为负 (ensure_nonnegative 错误字符串逐字一致)
+        let error = MarketStatistics::new(
+            test_instrument(),
+            None,
+            None,
+            None,
+            None,
+            Some(Money::new(-1.0).unwrap()),
+            None,
+            None,
+            None,
+            None,
+            test_evidence(),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("must be non-negative"),
+            "{error}"
+        );
+
+        let json = serde_json::to_string(&stats).unwrap();
+        assert!(json.contains(r#""turnover_rate":{"value":0.05,"unit":"Decimal"}"#));
+        let parsed: MarketStatistics = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, stats);
+    }
+
+    /// Phase 3: SecurityBar 字段名 (上游仅有 Serialize, wire 字段名=字段名)。
+    #[test]
+    fn security_bar_json_field_names_match_upstream() {
+        let bar = SecurityBar {
+            open: 10.0,
+            close: 10.5,
+            high: 10.6,
+            low: 9.9,
+            vol: 100_000.0,
+            amount: 1_050_000.0,
+            year: 2026,
+            month: 8,
+            day: 16,
+            hour: 14,
+            minute: 30,
+            datetime: "2026-08-16 14:30:00".to_owned(),
+        };
+        let json = serde_json::to_string(&bar).unwrap();
+        assert_eq!(
+            json,
+            r#"{"open":10.0,"close":10.5,"high":10.6,"low":9.9,"vol":100000.0,"amount":1050000.0,"year":2026,"month":8,"day":16,"hour":14,"minute":30,"datetime":"2026-08-16 14:30:00"}"#
+        );
     }
 }

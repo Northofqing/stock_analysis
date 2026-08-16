@@ -1,3 +1,5 @@
+#![cfg(feature = "magic-gateway")]
+
 //! BR-156/BR-164 Magic TDX Gateway evidence adapter for event-scoped selection.
 
 use crate::selection::model::{

@@ -1,0 +1,234 @@
+//! LimitPoolKind / LimitPoolEntry / StatementKind / FinancialLine /
+//! FinancialStatement / MarketStatistics 本地镜像 (M5, Task #76, feature 关时使用)。
+//! 与上游 magic_market_core rev 75ee2a2 (limit_pool.rs + company.rs + enrichment.rs)
+//! 同构: 字段/serde 表示/校验语义一致 (wire 是 JSON, convert.rs 依赖)。
+
+#[cfg(not(feature = "magic-gateway"))]
+use serde::{de, Deserialize, Deserializer, Serialize};
+
+#[cfg(not(feature = "magic-gateway"))]
+use super::evidence::{NonEmptyText, SourceEvidence};
+#[cfg(not(feature = "magic-gateway"))]
+use super::instrument::InstrumentId;
+#[cfg(not(feature = "magic-gateway"))]
+use super::record::IsoDate;
+#[cfg(not(feature = "magic-gateway"))]
+use super::value::{FiniteNumber, Money, PositiveU32, Price, Quantity, Ratio};
+
+/// Kind of price-limit pool (board) membership.
+#[cfg(not(feature = "magic-gateway"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LimitPoolKind {
+    Upper,
+    Broken,
+    Lower,
+    PreviousUpper,
+}
+
+/// A single record from a price-limit pool.
+#[cfg(not(feature = "magic-gateway"))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LimitPoolEntry {
+    pub kind: LimitPoolKind,
+    pub instrument: InstrumentId,
+    pub trading_date: IsoDate,
+    pub price: Price,
+    pub change: Ratio,
+    pub volume: Option<Quantity>,
+    pub turnover: Option<Ratio>,
+    pub sealed_amount: Option<Money>,
+    pub first_seal_at: Option<NonEmptyText>,
+    pub last_seal_at: Option<NonEmptyText>,
+    pub break_count: Option<u32>,
+    pub streak: Option<PositiveU32>,
+    pub industry: Option<NonEmptyText>,
+    pub board_name: Option<NonEmptyText>,
+    pub seal_state: Option<NonEmptyText>,
+    pub reseal_count: Option<u32>,
+    pub reason: Option<NonEmptyText>,
+    pub evidence: SourceEvidence,
+}
+
+/// Financial-statement family.
+#[cfg(not(feature = "magic-gateway"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StatementKind {
+    Balance,
+    Income,
+    CashFlow,
+}
+
+/// A single line of a financial statement.
+#[cfg(not(feature = "magic-gateway"))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FinancialLine {
+    pub key: NonEmptyText,
+    pub source_label: NonEmptyText,
+    pub value: Option<FiniteNumber>,
+    pub unit: Option<NonEmptyText>,
+}
+
+/// One reported financial statement.
+#[cfg(not(feature = "magic-gateway"))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FinancialStatement {
+    pub instrument: InstrumentId,
+    pub kind: StatementKind,
+    pub report_period: IsoDate,
+    pub announced_on: Option<IsoDate>,
+    pub currency: Option<NonEmptyText>,
+    pub lines: Vec<FinancialLine>,
+    pub evidence: SourceEvidence,
+}
+
+/// Valuation, capitalization and trading statistics adjacent to a quote.
+#[cfg(not(feature = "magic-gateway"))]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MarketStatistics {
+    instrument: InstrumentId,
+    turnover_rate: Option<Ratio>,
+    trailing_pe: Option<FiniteNumber>,
+    static_pe: Option<FiniteNumber>,
+    pb: Option<FiniteNumber>,
+    total_market_cap: Option<Money>,
+    floating_market_cap: Option<Money>,
+    upper_limit: Option<Price>,
+    lower_limit: Option<Price>,
+    volume_ratio: Option<FiniteNumber>,
+    evidence: SourceEvidence,
+}
+
+#[cfg(not(feature = "magic-gateway"))]
+impl MarketStatistics {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        instrument: InstrumentId,
+        turnover_rate: Option<Ratio>,
+        trailing_pe: Option<FiniteNumber>,
+        static_pe: Option<FiniteNumber>,
+        pb: Option<FiniteNumber>,
+        total_market_cap: Option<Money>,
+        floating_market_cap: Option<Money>,
+        upper_limit: Option<Price>,
+        lower_limit: Option<Price>,
+        volume_ratio: Option<FiniteNumber>,
+        evidence: SourceEvidence,
+    ) -> Result<Self, super::instrument::CoreError> {
+        ensure_nonnegative("total_market_cap", total_market_cap)?;
+        ensure_nonnegative("floating_market_cap", floating_market_cap)?;
+        Ok(Self {
+            instrument,
+            turnover_rate,
+            trailing_pe,
+            static_pe,
+            pb,
+            total_market_cap,
+            floating_market_cap,
+            upper_limit,
+            lower_limit,
+            volume_ratio,
+            evidence,
+        })
+    }
+
+    pub fn instrument(&self) -> &InstrumentId {
+        &self.instrument
+    }
+
+    pub fn turnover_rate(&self) -> Option<Ratio> {
+        self.turnover_rate
+    }
+
+    pub fn trailing_pe(&self) -> Option<FiniteNumber> {
+        self.trailing_pe
+    }
+
+    pub fn static_pe(&self) -> Option<FiniteNumber> {
+        self.static_pe
+    }
+
+    pub fn pb(&self) -> Option<FiniteNumber> {
+        self.pb
+    }
+
+    pub fn total_market_cap(&self) -> Option<Money> {
+        self.total_market_cap
+    }
+
+    pub fn floating_market_cap(&self) -> Option<Money> {
+        self.floating_market_cap
+    }
+
+    pub fn upper_limit(&self) -> Option<Price> {
+        self.upper_limit
+    }
+
+    pub fn lower_limit(&self) -> Option<Price> {
+        self.lower_limit
+    }
+
+    pub fn volume_ratio(&self) -> Option<FiniteNumber> {
+        self.volume_ratio
+    }
+
+    pub fn evidence(&self) -> &SourceEvidence {
+        &self.evidence
+    }
+}
+
+#[cfg(not(feature = "magic-gateway"))]
+fn ensure_nonnegative(
+    field: &'static str,
+    value: Option<Money>,
+) -> Result<(), super::instrument::CoreError> {
+    if value.is_some_and(|number| number.get() < 0.0) {
+        return Err(super::instrument::CoreError::InvalidValue {
+            field,
+            value: value
+                .map(|number| number.get().to_string())
+                .unwrap_or_default(),
+            reason: "must be non-negative",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "magic-gateway"))]
+#[derive(Deserialize)]
+struct MarketStatisticsWire {
+    instrument: InstrumentId,
+    turnover_rate: Option<Ratio>,
+    trailing_pe: Option<FiniteNumber>,
+    static_pe: Option<FiniteNumber>,
+    pb: Option<FiniteNumber>,
+    total_market_cap: Option<Money>,
+    floating_market_cap: Option<Money>,
+    upper_limit: Option<Price>,
+    lower_limit: Option<Price>,
+    volume_ratio: Option<FiniteNumber>,
+    evidence: SourceEvidence,
+}
+
+#[cfg(not(feature = "magic-gateway"))]
+impl<'de> Deserialize<'de> for MarketStatistics {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = MarketStatisticsWire::deserialize(deserializer)?;
+        Self::new(
+            value.instrument,
+            value.turnover_rate,
+            value.trailing_pe,
+            value.static_pe,
+            value.pb,
+            value.total_market_cap,
+            value.floating_market_cap,
+            value.upper_limit,
+            value.lower_limit,
+            value.volume_ratio,
+            value.evidence,
+        )
+        .map_err(de::Error::custom)
+    }
+}
