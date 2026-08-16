@@ -2,7 +2,9 @@
 //! 用法: cargo run --bin tencent_quote_probe -- [code]
 //! 只读网络请求，无写入、无推送。
 
+#[cfg(feature = "magic-gateway")]
 use magic_market_core::RealtimeQuotes;
+#[cfg(feature = "magic-gateway")]
 use magic_tencent_rs::TencentClient;
 use stock_analysis::data_gateway::instrument_identity::resolve_production_equity;
 

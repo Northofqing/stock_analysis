@@ -9,12 +9,10 @@
 use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone, Utc};
 #[cfg(test)]
 use crate::magic_compat::Exchange;
-use magic_market_core::{
-    AssetClass, CorporateAction, CorporateActionCategory, CorporateActionRequest,
-    CorporateActionResponse, CorporateActionStatus, CorporateActionTerms, CorporateActions,
-    DataBatch, InstrumentId, IsoDate, ProviderId, SecurityMetadata, SecurityMetadataProvider,
-    SourceEvidence,
-};
+use crate::magic_compat::{AssetClass, DataBatch, InstrumentId, IsoDate, ProviderId, SourceEvidence};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{CorporateAction, CorporateActionCategory, CorporateActionRequest, CorporateActionResponse, CorporateActionStatus, CorporateActionTerms, CorporateActions, SecurityMetadata, SecurityMetadataProvider};
+#[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::{TdxError, TdxSmartClient};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -899,7 +897,9 @@ fn tdx_gateway_error(capability: &'static str, error: TdxError) -> GatewayError 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magic_market_core::{DataStatus, FiniteNumber, PriceLimitRule, Provenance, SourceEvidence};
+    use crate::magic_compat::{FiniteNumber, Provenance, SourceEvidence};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{DataStatus, PriceLimitRule};
 
     const OBSERVED_AT: &str = "2026-07-27T01:00:00Z";
     const BATCH_ID: &str = "TEST_CODE_lifecycle_batch";

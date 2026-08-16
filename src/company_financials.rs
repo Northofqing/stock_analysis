@@ -6,7 +6,7 @@
 
 use anyhow::{anyhow, Result};
 use crate::magic_compat::ProviderId;
-use magic_market_core::StatementKind;
+use crate::magic_compat::StatementKind;
 use sha2::{Digest, Sha256};
 
 use crate::data_gateway::{company::FinancialStatement, parse_evidence_instant, GatewayBatch};
@@ -363,10 +363,7 @@ pub fn project_income_statements(batch: GatewayBatch<FinancialStatement>) -> Res
 mod tests {
     use super::*;
     use crate::data_gateway::BatchEvidence;
-    use magic_market_core::{
-        AssetClass, Exchange, FiniteNumber, InstrumentId, IsoDate, NonEmptyText, ProviderId,
-        SourceEvidence,
-    };
+    use crate::magic_compat::{AssetClass, Exchange, FiniteNumber, InstrumentId, IsoDate, NonEmptyText, ProviderId, SourceEvidence};
 
     #[test]
     fn quality_requires_history() {
@@ -385,13 +382,13 @@ mod tests {
             announced_on: Some(IsoDate::new("2026-04-30").expect("announcement date")),
             currency: Some(NonEmptyText::new("CNY").expect("currency")),
             lines: vec![
-                magic_market_core::FinancialLine {
+                crate::magic_compat::FinancialLine {
                     key: NonEmptyText::new("basiceps").expect("key"),
                     source_label: NonEmptyText::new("基本每股收益").expect("label"),
                     value: Some(FiniteNumber::new(1.23).expect("finite EPS")),
                     unit: None,
                 },
-                magic_market_core::FinancialLine {
+                crate::magic_compat::FinancialLine {
                     key: NonEmptyText::new("bizinco").expect("key"),
                     source_label: NonEmptyText::new("营业收入").expect("label"),
                     value: Some(FiniteNumber::new(100.0).expect("finite revenue")),
@@ -450,7 +447,7 @@ mod tests {
             report_period: IsoDate::new("2026-03-31").expect("report date"),
             announced_on: Some(IsoDate::new("2026-04-30").expect("announcement date")),
             currency: Some(NonEmptyText::new("CNY").expect("currency")),
-            lines: vec![magic_market_core::FinancialLine {
+            lines: vec![crate::magic_compat::FinancialLine {
                 key: NonEmptyText::new("basiceps").expect("key"),
                 source_label: NonEmptyText::new("基本每股收益").expect("label"),
                 value: Some(FiniteNumber::new(1.23).expect("finite EPS")),

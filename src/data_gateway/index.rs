@@ -7,10 +7,10 @@
 //! longer owns a Tencent URL, HTTP client, retry loop, or wire parser.
 
 use chrono::{DateTime, Utc};
-use magic_market_core::{
-    AssetClass, DataBatch, DataStatus, Exchange, InstrumentId, ProviderId, Quote, RatioUnit,
-    RealtimeQuotes,
-};
+use crate::magic_compat::{AssetClass, DataBatch, Exchange, InstrumentId, ProviderId, RatioUnit};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{DataStatus, Quote, RealtimeQuotes};
+#[cfg(feature = "magic-gateway")]
 use magic_tencent_rs::{TencentClient, TencentError};
 use std::collections::HashSet;
 
@@ -294,7 +294,7 @@ fn required_text<'a>(
 }
 
 fn required_value(
-    value: Option<magic_market_core::Price>,
+    value: Option<crate::magic_compat::Price>,
     code: &str,
     field: &str,
 ) -> Result<f64, GatewayError> {
@@ -361,7 +361,7 @@ fn tencent_gateway_error(error: TencentError) -> GatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magic_market_core::{Money, Price, Provenance, Quantity, Ratio};
+    use crate::magic_compat::{Money, Price, Provenance, Quantity, Ratio};
 
     struct QuoteFixture {
         exchange: Exchange,

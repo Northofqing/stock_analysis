@@ -2,13 +2,13 @@
 
 use super::review::{acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result};
 use super::{BatchEvidence, GatewayBatch, GatewayError};
+#[cfg(feature = "magic-gateway")]
 use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
 use crate::magic_compat::{InstrumentId, ProviderId};
-use magic_market_core::{
-    BoardCategory, BoardConstituentProvider, BoardConstituentRequest, BoardDirectoryProvider,
-    BoardDirectoryRequest, BoardFlows, BoardMembership, BoardMembershipProvider, DataBatch,
-    FlowInterval, PositiveU32,
-};
+use crate::magic_compat::{DataBatch, FlowInterval, PositiveU32};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{BoardCategory, BoardConstituentProvider, BoardConstituentRequest, BoardDirectoryProvider, BoardDirectoryRequest, BoardFlows, BoardMembership, BoardMembershipProvider};
+#[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::{TdxBoardProvider, TdxError, TdxHqClient};
 
 const DIRECTORY_CAPABILITY: &str = "board-directory";
@@ -779,9 +779,12 @@ mod tests {
         validate_source_evidence, BatchEvidence, BoardDataGateway, BoardKind, GatewayBatch,
         DIRECTORY_CAPABILITY, FLOW_CAPABILITY, MEMBERSHIP_CAPABILITY,
     };
+    #[cfg(feature = "magic-gateway")]
     use magic_eastmoney_rs::EastmoneyError;
     use crate::magic_compat::{Exchange, ProviderId, SourceEvidence};
+    #[cfg(feature = "magic-gateway")]
     use magic_market_core::BoardCategory;
+    #[cfg(feature = "magic-gateway")]
     use magic_tdx_rs::TdxError;
 
     fn evidence(provider: ProviderId) -> BatchEvidence {

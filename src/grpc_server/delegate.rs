@@ -24,7 +24,7 @@ use crate::data_gateway::outcome_daily_bars::{
     fetch_magic_tdx_outcome_adaptive, OutcomeTransportFailure, RawOutcomeFetch,
 };
 use crate::magic_compat::{InstrumentId, ProviderId};
-use magic_market_core::{FlowInterval, NorthboundChannel, StatementKind};
+use crate::magic_compat::{FlowInterval, NorthboundChannel, StatementKind};
 use crate::grpc_client::pb::magic::market::v1::Operation;
 use chrono::{Datelike, Local, NaiveDate};
 use serde_json::{json, Value};

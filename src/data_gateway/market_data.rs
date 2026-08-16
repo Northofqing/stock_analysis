@@ -10,13 +10,18 @@
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveTime, Utc};
 #[cfg(test)]
 use crate::magic_compat::Exchange;
-use magic_market_core::{AssetClass, DataStatus, InstrumentId, ProviderId, Quote, RatioUnit};
+use crate::magic_compat::{AssetClass, InstrumentId, ProviderId, RatioUnit};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{DataStatus, Quote};
 use magic_market_router::{
     quote_source, AcceptancePolicy, AttemptStatus, FailureKind, QuoteRouter, RouterError,
     SourceError,
 };
+#[cfg(feature = "magic-gateway")]
 use magic_sina_rs::{SinaClient, SinaError};
+#[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::{TdxError, TdxSmartClient};
+#[cfg(feature = "magic-gateway")]
 use magic_tencent_rs::{TencentClient, TencentError};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -722,7 +727,7 @@ fn off_session_static_quote_eligible(now: DateTime<Utc>, source_at: DateTime<Utc
 fn admit_quote_batch(
     storage_codes: &[String],
     provider: ProviderId,
-    batch: magic_market_core::DataBatch<Quote>,
+    batch: crate::magic_compat::DataBatch<Quote>,
     mode: QuoteAdmissionMode,
 ) -> Result<GatewayBatch<RealtimeMarketQuote>, GatewayError> {
     admit_quote_batch_at(Utc::now(), storage_codes, provider, batch, mode)
@@ -733,7 +738,7 @@ fn admit_quote_batch_at(
     now: DateTime<Utc>,
     storage_codes: &[String],
     provider: ProviderId,
-    batch: magic_market_core::DataBatch<Quote>,
+    batch: crate::magic_compat::DataBatch<Quote>,
     mode: QuoteAdmissionMode,
 ) -> Result<GatewayBatch<RealtimeMarketQuote>, GatewayError> {
     let evidence = BatchEvidence::from_provenance(provider, batch.provenance())?;
@@ -1058,7 +1063,7 @@ fn classify_sina_error(error: SinaError) -> SourceError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magic_market_core::{DataBatch, Money, Price, Provenance, Quantity, Ratio, SourceEvidence};
+    use crate::magic_compat::{DataBatch, Money, Price, Provenance, Quantity, Ratio, SourceEvidence};
 
     fn quote_batch(
         code: &str,
@@ -1545,6 +1550,7 @@ mod tests {
     /// accepted by the router and must be rejected by `admit_quote_batch`.
     #[test]
     fn br217_router_policy_cannot_express_acquisition_time_freshness() {
+        #[cfg(feature = "magic-gateway")]
         use magic_market_router::quote_source;
 
         struct FixedQuoteProvider {

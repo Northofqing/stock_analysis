@@ -7,11 +7,11 @@ use crate::data_gateway::review::{
 };
 use crate::data_provider::consensus::{ConsensusData, RecentReport};
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime};
+#[cfg(feature = "magic-gateway")]
 use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
-use magic_market_core::{
-    InstrumentId, PositiveU32, ProviderId, ReportScope, ResearchReport, ResearchReports,
-    ResearchRequest,
-};
+use crate::magic_compat::{InstrumentId, PositiveU32, ProviderId};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{ReportScope, ResearchReport, ResearchReports, ResearchRequest};
 use std::collections::{HashMap, HashSet};
 
 const CAPABILITY: &str = "consensus";
@@ -340,10 +340,9 @@ fn map_provider_error(error: EastmoneyError) -> GatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magic_market_core::{
-        AssetClass, EarningsEstimate, Exchange, FiniteNumber, HttpsUrl, NonEmptyText, Price,
-        SourceEvidence,
-    };
+    use crate::magic_compat::{AssetClass, Exchange, FiniteNumber, NonEmptyText, Price, SourceEvidence};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{EarningsEstimate, HttpsUrl};
 
     fn instrument() -> InstrumentId {
         InstrumentId::new(Exchange::Shanghai, "TEST_CODE_600396", AssetClass::Equity)

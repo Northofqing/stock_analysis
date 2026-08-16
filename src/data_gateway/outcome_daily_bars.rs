@@ -8,10 +8,10 @@
 //! in this path.
 
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveTime};
-use magic_market_core::{
-    Adjustment, AssetClass, Bar, BarInterval, BarsRequest, DataBatch, HistoricalBars, InstrumentId,
-    ProviderId,
-};
+use crate::magic_compat::{AssetClass, DataBatch, InstrumentId, ProviderId};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{Adjustment, Bar, BarInterval, BarsRequest, HistoricalBars};
+#[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::{TdxError, TdxSmartClient};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -3372,7 +3372,7 @@ fn validate_unit_contract() -> Result<(), GatewayError> {
 mod tests {
     use super::*;
     use chrono::Duration;
-    use magic_market_core::{Money, Price, Provenance, Quantity};
+    use crate::magic_compat::{Money, Price, Provenance, Quantity};
 
     fn date(value: &str) -> NaiveDate {
         NaiveDate::parse_from_str(value, "%Y-%m-%d").expect("valid TEST_CODE date")

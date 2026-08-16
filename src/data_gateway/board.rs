@@ -39,10 +39,9 @@ use crate::selection::schema_v2::{
     DOMAIN_BOARD_DIRECTORY_RECORD, UPSTREAM_REVISION,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
-use magic_market_core::{
-    BoardCategory, BoardConstituentRequest, BoardMembership, DataBatch, Exchange, NonEmptyText,
-    PositiveU32, ProviderId, SourceEvidence,
-};
+use crate::magic_compat::{DataBatch, Exchange, NonEmptyText, PositiveU32, ProviderId, SourceEvidence};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{BoardCategory, BoardConstituentRequest, BoardMembership};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -1486,7 +1485,7 @@ const fn exchange_token(exchange: Exchange) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magic_market_core::{AssetClass, InstrumentId, NonEmptyText, Provenance, SourceEvidence};
+    use crate::magic_compat::{AssetClass, InstrumentId, NonEmptyText, Provenance, SourceEvidence};
 
     const TEST_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 

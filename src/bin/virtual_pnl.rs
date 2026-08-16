@@ -4,7 +4,9 @@
 //! (非交易时段 = 上一交易日收盘)。年化 = 浮动盈亏 / 成本 / 持有天数 * 365。
 //! 只读, 无写入、无推送。
 
+#[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::protocol::constants::{fq_type, KLINE_5MIN};
+#[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::TdxHqClient;
 
 fn main() {

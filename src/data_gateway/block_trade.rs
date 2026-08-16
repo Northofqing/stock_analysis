@@ -8,10 +8,11 @@ use super::instrument_identity::resolve_production_equity;
 use super::review::{acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result};
 use super::{BatchEvidence, GatewayBatch, GatewayError};
 use chrono::NaiveDate;
+#[cfg(feature = "magic-gateway")]
 use magic_eastmoney_rs::EastmoneyClient;
-use magic_market_core::{
-    BlockTrades, InstrumentDateRangeRequest, IsoDate, PositiveU32, ProviderId,
-};
+use crate::magic_compat::{IsoDate, PositiveU32, ProviderId};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{BlockTrades, InstrumentDateRangeRequest};
 
 const CAPABILITY: &str = "BlockTrades";
 
@@ -114,7 +115,7 @@ fn fetch_block_trades(
 
     let mut reviews: Vec<BlockTradeReview> = Vec::new();
     let mut issues: Vec<String> = Vec::new();
-    let mut first_provenance: Option<magic_market_core::Provenance> = None;
+    let mut first_provenance: Option<crate::magic_compat::Provenance> = None;
 
     for code in codes {
         let identity = resolve_production_equity(code, None).map_err(|error| {

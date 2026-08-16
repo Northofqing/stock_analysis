@@ -2,15 +2,17 @@
 //! Unified A-01/R-03 provider admission, evidence retention and acquisition audit.
 
 use chrono::NaiveDate;
+#[cfg(feature = "magic-gateway")]
 use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
 use crate::magic_compat::ProviderId;
-use magic_market_core::{
-    IsoDate, LimitPoolEntry, LimitPoolKind, LimitPoolRequest, LimitPools, PositiveU32,
-};
+use crate::magic_compat::{IsoDate, LimitPoolEntry, LimitPoolKind, PositiveU32};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{LimitPoolRequest, LimitPools};
 use magic_market_router::{
     AcceptancePolicy, AttemptStatus, FailureKind, LimitPoolRouter, RouterError, SourceError,
     SourceFn,
 };
+#[cfg(feature = "magic-gateway")]
 use magic_ths_rs::{ThsClient, ThsError};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -35,7 +37,7 @@ pub struct BatchEvidence {
 impl BatchEvidence {
     pub fn from_provenance(
         provider: ProviderId,
-        provenance: &magic_market_core::Provenance,
+        provenance: &crate::magic_compat::Provenance,
     ) -> Result<Self, GatewayError> {
         let batch_id = provenance.batch_id().ok_or_else(|| {
             GatewayError::invalid_evidence(
@@ -532,7 +534,7 @@ pub(crate) fn route_exact_date_upper_limit_pool(
 fn validate_routed_limit_pool_batch(
     capability: &'static str,
     provider: ProviderId,
-    batch: &magic_market_core::DataBatch<LimitPoolEntry>,
+    batch: &crate::magic_compat::DataBatch<LimitPoolEntry>,
     expected_date: NaiveDate,
 ) -> Result<(), GatewayError> {
     if !matches!(provider, ProviderId::Eastmoney | ProviderId::Tonghuashun) {
@@ -923,10 +925,7 @@ mod tests {
     use crate::database::DatabaseManager;
     use diesel::prelude::*;
     use diesel::sql_types::{BigInt, Nullable, Text};
-    use magic_market_core::{
-        AssetClass, DataBatch, Exchange, InstrumentId, NonEmptyText, Price, Provenance, Ratio,
-        RatioUnit, SourceEvidence,
-    };
+    use crate::magic_compat::{AssetClass, DataBatch, Exchange, InstrumentId, NonEmptyText, Price, Provenance, Ratio, RatioUnit, SourceEvidence};
     use serial_test::serial;
 
     #[derive(Debug, QueryableByName)]

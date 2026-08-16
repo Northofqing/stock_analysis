@@ -15,11 +15,10 @@ use crate::database::chain_intelligence::{
 use crate::database::data_acquisition_audit::DataAcquisitionAuditRecord;
 use crate::database::DatabaseManager;
 use chrono::{DateTime, FixedOffset, Local, NaiveDate, SecondsFormat};
-use magic_market_core::{
-    AssetClass, BoardCategory, BoardMembership, BoardMembershipProvider, DataBatch, Exchange,
-    InstrumentId, LimitPoolEntry, PositiveU32, ProviderId, SecurityMetadata,
-    SecurityMetadataProvider,
-};
+use crate::magic_compat::{AssetClass, DataBatch, Exchange, InstrumentId, LimitPoolEntry, PositiveU32, ProviderId};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{BoardCategory, BoardMembership, BoardMembershipProvider, SecurityMetadata, SecurityMetadataProvider};
+#[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::{protocol::constants::PRIMARY_SERVERS, BlockService, TdxError, TdxSmartClient};
 use serde::Serialize;
 use sha2::{Digest, Sha256};

@@ -3,10 +3,10 @@
 use super::review::{acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result};
 use super::{BatchEvidence, GatewayBatch, GatewayError};
 use chrono::{DateTime, Utc};
-use magic_market_core::{
-    DataBatch, ForeignExchangeProvider, FxPair, FxQuote, FxRequest, GlobalIndexCode,
-    GlobalIndexProvider, GlobalIndexQuote, GlobalIndexRequest, ProviderId, RatioUnit,
-};
+use crate::magic_compat::{DataBatch, FxPair, GlobalIndexCode, ProviderId, RatioUnit};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{ForeignExchangeProvider, FxQuote, FxRequest, GlobalIndexProvider, GlobalIndexQuote, GlobalIndexRequest};
+#[cfg(feature = "magic-gateway")]
 use magic_sina_rs::{SinaClient, SinaError};
 use std::collections::HashSet;
 
@@ -485,7 +485,7 @@ fn sina_gateway_error(capability: &'static str, error: SinaError) -> GatewayErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magic_market_core::{FiniteNumber, NonEmptyText, Price, Provenance, Ratio, SourceEvidence};
+    use crate::magic_compat::{FiniteNumber, NonEmptyText, Price, Provenance, Ratio, SourceEvidence};
 
     fn at(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)

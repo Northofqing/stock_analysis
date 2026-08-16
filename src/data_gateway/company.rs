@@ -5,14 +5,16 @@
 //! every optional field as `Option`; absence is never converted to zero.
 
 use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone, Utc};
-use magic_market_core::{DataBatch, Exchange, InstrumentId, ProviderId, RatioUnit};
-pub use magic_market_core::{FinancialLine, FinancialStatement, MarketStatistics, StatementKind};
+use crate::magic_compat::{DataBatch, Exchange, InstrumentId, ProviderId, RatioUnit};
+pub use crate::magic_compat::{FinancialLine, FinancialStatement, MarketStatistics, StatementKind};
 use magic_market_router::{
     financial_statement_source, market_statistics_source, AcceptancePolicy, AttemptStatus,
     FailureKind, FinancialStatementRequest, FinancialStatementRouter, MarketStatisticsRouter,
     RouterError, SourceError,
 };
+#[cfg(feature = "magic-gateway")]
 use magic_sina_rs::{SinaClient, SinaError};
+#[cfg(feature = "magic-gateway")]
 use magic_tencent_rs::{TencentClient, TencentError};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -923,10 +925,7 @@ fn classify_tencent_error(error: TencentError) -> SourceError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magic_market_core::{
-        Exchange, FiniteNumber, IsoDate, Money, NonEmptyText, Price, Provenance, Ratio,
-        SourceEvidence,
-    };
+    use crate::magic_compat::{Exchange, FiniteNumber, IsoDate, Money, NonEmptyText, Price, Provenance, Ratio, SourceEvidence};
 
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-07-24T09:30:02+08:00")
@@ -1798,6 +1797,7 @@ mod tests {
 
     #[test]
     fn br164_company_error_classifiers_cover_all_provider_variants_and_actions() {
+        #[cfg(feature = "magic-gateway")]
         use magic_market_router::FailureAction;
 
         assert_eq!(
@@ -1838,6 +1838,7 @@ mod tests {
 
     #[test]
     fn br164_router_failures_keep_auditable_outcome_reason_and_retryability() {
+        #[cfg(feature = "magic-gateway")]
         use magic_market_router::{FailoverChain, FailureAction, SourceFn};
 
         fn routed_error(kind: FailureKind, action: FailureAction) -> RouterError {

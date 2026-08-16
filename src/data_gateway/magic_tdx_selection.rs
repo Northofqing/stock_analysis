@@ -12,7 +12,9 @@ use crate::selection::quality::{
 use crate::selection::relation::direct_mentions;
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike};
 use crate::magic_compat::Exchange;
+#[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::protocol::constants::{KLINE_5MIN, KLINE_DAILY};
+#[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::{SecurityBar, SecurityInfo, SecurityQuote, TdxService};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -1005,6 +1007,7 @@ fn source_error(
 mod tests {
     use super::*;
     use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone};
+    #[cfg(feature = "magic-gateway")]
     use magic_tdx_rs::SecurityBar;
     use std::collections::BTreeMap;
 

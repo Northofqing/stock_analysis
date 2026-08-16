@@ -5,7 +5,7 @@
 //! domain shape consumed by scoring and prompt rendering.
 
 use anyhow::{bail, Result};
-use magic_market_core::FlowInterval;
+use crate::magic_compat::FlowInterval;
 use serde::{Deserialize, Serialize};
 
 use crate::data_gateway::{GatewayBatch, InstrumentFundFlowFact};

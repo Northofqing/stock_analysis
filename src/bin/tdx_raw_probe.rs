@@ -7,9 +7,13 @@
 
 use std::time::Duration;
 
+#[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::net::connection::TcpConnection;
+#[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::net::packet::{ResponseHeader, RSP_HEADER_LEN};
+#[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::net::utils::{build_security_bars_packet, perform_handshake};
+#[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::protocol::parsers::parse_security_bars;
 
 fn hex_dump(prefix: &str, body: &[u8], max: usize) {

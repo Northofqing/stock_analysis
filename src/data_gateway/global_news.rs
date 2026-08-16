@@ -3,12 +3,16 @@
 use super::review::{acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result};
 use super::{BatchEvidence, GatewayBatch, GatewayError};
 use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
+#[cfg(feature = "magic-gateway")]
 use magic_cls_rs::{ClsClient, ClsError};
+#[cfg(feature = "magic-gateway")]
 use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
+#[cfg(feature = "magic-gateway")]
 use magic_jin10_rs::{Jin10Client, Jin10Error};
-use magic_market_core::{
-    DataBatch, NewsItem, NewsProvider, PositiveU32, ProviderId, SourceEvidence,
-};
+use crate::magic_compat::{DataBatch, PositiveU32, ProviderId, SourceEvidence};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{NewsItem, NewsProvider};
+#[cfg(feature = "magic-gateway")]
 use magic_thepaper_rs::{ThePaperClient, ThePaperError};
 use std::collections::HashSet;
 
@@ -479,7 +483,9 @@ fn thepaper_gateway_error(provider: GlobalNewsProvider, error: ThePaperError) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magic_market_core::{HttpsUrl, NonEmptyText, Provenance};
+    use crate::magic_compat::{NonEmptyText, Provenance};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{HttpsUrl};
 
     fn observed_at(after: &str) -> String {
         let timestamp = DateTime::parse_from_rfc3339(after)

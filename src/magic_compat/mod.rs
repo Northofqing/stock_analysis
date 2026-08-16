@@ -19,7 +19,9 @@ pub mod instrument;
 pub mod market;
 pub mod provider_id;
 pub mod ranking;
+pub mod record;
 pub mod tdx;
+pub mod value;
 
 #[cfg(feature = "magic-gateway")]
 pub use magic_market_core::{

@@ -14,18 +14,16 @@
 //! `spawn_blocking`, so they cannot drop a blocking runtime on a Tokio worker.
 
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
+#[cfg(feature = "magic-gateway")]
 use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
+#[cfg(feature = "magic-gateway")]
 use magic_exchange_rs::{ExchangeError, HkexClient};
 use magic_market_composition::{
     EastmoneyProviderTopNRankingRouter, EastmoneyProviderTopNRouterError,
 };
-use magic_market_core::{
-    validate_provider_top_n_ranking_batch, DataBatch, Exchange, FiniteNumber, FlowInterval,
-    FlowScope, FundFlowPoint, FundFlowRequest, InstrumentId, IsoDate, MarketRankingKind,
-    MarketRankingUnit, NonEmptyText, NorthboundChannel, NorthboundDailyRequest,
-    NorthboundDailyStat, NorthboundQuotaBalance, PositiveU32, ProviderId, ProviderTopNRankingEntry,
-    ProviderTopNRankingRequest, RatioUnit, SourceEvidence,
-};
+use crate::magic_compat::{DataBatch, Exchange, FiniteNumber, FlowInterval, InstrumentId, IsoDate, MarketRankingKind, MarketRankingUnit, NonEmptyText, NorthboundChannel, PositiveU32, ProviderId, RatioUnit, SourceEvidence};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{validate_provider_top_n_ranking_batch, FlowScope, FundFlowPoint, FundFlowRequest, NorthboundDailyRequest, NorthboundDailyStat, NorthboundQuotaBalance, ProviderTopNRankingEntry, ProviderTopNRankingRequest};
 use magic_market_router::{
     fund_flow_series_source, northbound_daily_source, AcceptancePolicy, AttemptStatus, FailureKind,
     FundFlowSeriesRouter, NorthboundDailyRouter, RouterError, SourceError,
@@ -1200,7 +1198,7 @@ fn source_date(
 }
 
 fn required_money(
-    value: Option<magic_market_core::Money>,
+    value: Option<crate::magic_compat::Money>,
     field: &str,
     code: &str,
 ) -> Result<f64, GatewayError> {
@@ -1214,7 +1212,7 @@ fn required_money(
 }
 
 fn required_percent(
-    value: Option<magic_market_core::Ratio>,
+    value: Option<crate::magic_compat::Ratio>,
     field: &str,
     code: &str,
 ) -> Result<f64, GatewayError> {
@@ -1587,16 +1585,13 @@ mod tests {
         PROVIDER_TOP_N_VOLUME_RATIO_CAPABILITY,
     };
     use chrono::{DateTime, NaiveDate, Utc};
+    #[cfg(feature = "magic-gateway")]
     use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
+    #[cfg(feature = "magic-gateway")]
     use magic_exchange_rs::{ExchangeError, TlsBackend};
-    use magic_market_core::{
-        AssetClass, DataBatch, Exchange, FiniteNumber, FlowInterval, FlowScope, FundFlowPoint,
-        FundFlowRequest, InstrumentId, IsoDate, MarketRankingKind, MarketRankingUnit, Money,
-        NonEmptyText, NorthboundChannel, NorthboundDailyRequest, NorthboundDailyStat,
-        NorthboundQuotaBalance, NorthboundTopTurnover, PositiveU32, Provenance, ProviderId,
-        ProviderTopNRankingCapabilities, ProviderTopNRankingEntry, Quantity, Ratio, RatioUnit,
-        SourceEvidence, VerifiedEmpty,
-    };
+    use crate::magic_compat::{AssetClass, DataBatch, Exchange, FiniteNumber, FlowInterval, InstrumentId, IsoDate, MarketRankingKind, MarketRankingUnit, Money, NonEmptyText, NorthboundChannel, PositiveU32, Provenance, ProviderId, Quantity, Ratio, RatioUnit, SourceEvidence};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{FlowScope, FundFlowPoint, FundFlowRequest, NorthboundDailyRequest, NorthboundDailyStat, NorthboundQuotaBalance, NorthboundTopTurnover, ProviderTopNRankingCapabilities, ProviderTopNRankingEntry, VerifiedEmpty};
     use magic_market_router::{
         AcceptancePolicy, FailoverChain, FailureAction, FailureKind, RouterError, SourceError,
         SourceFn,

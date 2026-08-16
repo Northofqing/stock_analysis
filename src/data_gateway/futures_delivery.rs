@@ -3,11 +3,11 @@
 use super::review::{acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result};
 use super::{BatchEvidence, GatewayBatch, GatewayError};
 use chrono::{Datelike, NaiveDate};
+#[cfg(feature = "magic-gateway")]
 use magic_exchange_rs::{CffexClient, ExchangeError};
-use magic_market_core::{
-    DataBatch, FuturesDeliveryCalendar, FuturesDeliveryEvent, FuturesDeliveryMethod,
-    FuturesDeliveryRequest, FuturesProduct, PositiveU32, ProviderId,
-};
+use crate::magic_compat::{DataBatch, PositiveU32, ProviderId};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{FuturesDeliveryCalendar, FuturesDeliveryEvent, FuturesDeliveryMethod, FuturesDeliveryRequest, FuturesProduct};
 use std::collections::HashSet;
 
 const CAPABILITY: &str = "R-08-cffex-delivery";
@@ -324,8 +324,11 @@ fn cffex_gateway_error(error: ExchangeError) -> GatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "magic-gateway")]
     use magic_exchange_rs::TlsBackend;
-    use magic_market_core::{HttpsUrl, IsoDate, NonEmptyText, Provenance, SourceEvidence};
+    use crate::magic_compat::{IsoDate, NonEmptyText, Provenance, SourceEvidence};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{HttpsUrl};
 
     fn request() -> FuturesDeliveryRequest {
         build_request(2026, 7).expect("TEST_CODE request")

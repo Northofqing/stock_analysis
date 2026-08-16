@@ -10,20 +10,24 @@
 //! estimated at this boundary.
 
 use chrono::{Local, NaiveDate};
+#[cfg(feature = "magic-gateway")]
 use magic_baidu_rs::{BaiduClient, BaiduError};
 #[cfg(test)]
 use crate::magic_compat::Exchange;
-use magic_market_core::{
-    Adjustment, AssetClass, Bar, BarInterval, BarsRequest, DataBatch, HistoricalBars, InstrumentId,
-    ProviderId,
-};
+use crate::magic_compat::{AssetClass, DataBatch, InstrumentId, ProviderId};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{Adjustment, Bar, BarInterval, BarsRequest, HistoricalBars};
 use magic_market_router::{
     AcceptancePolicy, AttemptStatus, BarsRouter, FailureKind, RouterError, SourceError, SourceFn,
 };
+#[cfg(feature = "magic-gateway")]
 use magic_sina_rs::{SinaClient, SinaError};
+#[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::protocol::constants::{fq_type, KLINE_15MIN};
-use magic_tdx_rs::protocol::types::SecurityBar;
+use crate::magic_compat::SecurityBar;
+#[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::{TdxError, TdxSmartClient};
+#[cfg(feature = "magic-gateway")]
 use magic_tencent_rs::{TencentClient, TencentError};
 use std::sync::Arc;
 
@@ -1480,7 +1484,7 @@ mod tests {
     use crate::data_gateway::security_lifecycle::{
         AdmittedListingDate, CorporateActionState, ListingDateState,
     };
-    use magic_market_core::{Money, Price, Provenance, Quantity};
+    use crate::magic_compat::{Money, Price, Provenance, Quantity};
 
     fn bar(
         date: &str,

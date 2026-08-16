@@ -3,11 +3,11 @@
 use super::review::{acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result};
 use super::{BatchEvidence, GatewayBatch, GatewayError};
 use chrono::NaiveDate;
+#[cfg(feature = "magic-gateway")]
 use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
-use magic_market_core::{
-    AssetClass, DragonTigerDisclosure, DragonTigerSide, Exchange, IsoDate, MarketDragonTigerData,
-    MarketDragonTigerRequest, PositiveU32, ProviderId,
-};
+use crate::magic_compat::{AssetClass, Exchange, IsoDate, PositiveU32, ProviderId};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{DragonTigerDisclosure, DragonTigerSide, MarketDragonTigerData, MarketDragonTigerRequest};
 use magic_market_router::{
     AcceptancePolicy, AttemptStatus, FailureKind, MarketDragonTigerRouter, RouterError, SourceFn,
 };
@@ -526,9 +526,9 @@ fn router_gateway_error(provider: Option<ProviderId>, error: RouterError) -> Gat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magic_market_core::{
-        DragonTigerEntry, DragonTigerSeat, InstrumentId, Money, NonEmptyText, SourceEvidence,
-    };
+    use crate::magic_compat::{InstrumentId, Money, NonEmptyText, SourceEvidence};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{DragonTigerEntry, DragonTigerSeat};
 
     fn disclosure(
         code: &str,

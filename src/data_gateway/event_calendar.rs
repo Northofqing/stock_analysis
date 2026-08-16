@@ -3,11 +3,11 @@
 use super::review::{acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result};
 use super::{BatchEvidence, GatewayBatch, GatewayError};
 use chrono::{DateTime, NaiveDate, Utc};
+#[cfg(feature = "magic-gateway")]
 use magic_cninfo_rs::{CninfoClient, CninfoError};
-use magic_market_core::{
-    Announcement as CoreAnnouncement, DataBatch, IsoDate, MarketAnnouncementRequest, PositiveU32,
-    ProviderId,
-};
+use crate::magic_compat::{DataBatch, IsoDate, PositiveU32, ProviderId};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{Announcement as CoreAnnouncement, MarketAnnouncementRequest};
 use magic_market_router::{
     market_announcement_source, AcceptancePolicy, AttemptStatus, FailureKind,
     MarketAnnouncementRouter, RouterError, SourceError,
@@ -379,10 +379,9 @@ fn parse_observed_at(value: &str) -> Result<DateTime<Utc>, GatewayError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magic_market_core::{
-        Announcement, AssetClass, DataBatch, Exchange, HttpsUrl, InstrumentId, NonEmptyText,
-        Provenance, ProviderId, SourceEvidence,
-    };
+    use crate::magic_compat::{AssetClass, DataBatch, Exchange, InstrumentId, NonEmptyText, Provenance, ProviderId, SourceEvidence};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{Announcement, HttpsUrl};
 
     fn announcement(
         id: &str,

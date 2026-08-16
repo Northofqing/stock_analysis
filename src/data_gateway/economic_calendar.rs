@@ -3,11 +3,11 @@
 use super::review::{acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result};
 use super::{BatchEvidence, GatewayBatch, GatewayError};
 use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
+#[cfg(feature = "magic-gateway")]
 use magic_jin10_rs::{Jin10Client, Jin10Error};
-use magic_market_core::{
-    DataBatch, EconomicCalendarProvider, EconomicCalendarRequest, EconomicEvent, PositiveU32,
-    ProviderId, SourceEvidence,
-};
+use crate::magic_compat::{DataBatch, PositiveU32, ProviderId, SourceEvidence};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{EconomicCalendarProvider, EconomicCalendarRequest, EconomicEvent};
 use std::collections::HashSet;
 
 const CAPABILITY: &str = "EconomicCalendar-Jin10";
@@ -384,9 +384,9 @@ fn jin10_gateway_error(error: Jin10Error) -> GatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magic_market_core::{
-        DataBatch, EconomicEvent, NonEmptyText, PositiveU32, Provenance, ProviderId, SourceEvidence,
-    };
+    use crate::magic_compat::{DataBatch, NonEmptyText, PositiveU32, Provenance, ProviderId, SourceEvidence};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{EconomicEvent};
 
     fn event(
         batch_id: &str,

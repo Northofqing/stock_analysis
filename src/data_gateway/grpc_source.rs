@@ -28,11 +28,8 @@ use crate::grpc_client::errors::GrpcError;
 use crate::grpc_client::pb::magic::market::v1::Operation;
 use chrono::NaiveDate;
 use crate::magic_compat::ProviderId;
-use magic_market_core::{
-    FinancialStatement, FlowInterval, InstrumentId, MarketStatistics, NorthboundChannel,
-    StatementKind,
-};
-use magic_tdx_rs::protocol::types::SecurityBar;
+use crate::magic_compat::{FinancialStatement, FlowInterval, InstrumentId, MarketStatistics, NorthboundChannel, StatementKind};
+use crate::magic_compat::SecurityBar;
 use serde_json::Value;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::Mutex as AsyncMutex;

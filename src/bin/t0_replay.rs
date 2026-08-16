@@ -11,7 +11,9 @@
 //! 只读网络请求, 无写入、无推送。
 
 use chrono::TimeZone;
+#[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::protocol::constants::{fq_type, KLINE_5MIN, KLINE_DAILY};
+#[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::TdxHqClient;
 use stock_analysis::data_gateway::magic_tdx_t0::fetch_magic_tdx_t0_batch_with_clock;
 

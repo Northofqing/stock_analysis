@@ -6,7 +6,9 @@
 //!   2. 5 分钟 K 线 (KLINE_5MIN, 400 根) — 验证周五 9:30-15:00 的 bar 是否齐全
 //! 只读探测，无写入、无推送。
 
+#[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::protocol::constants::{fq_type, KLINE_5MIN};
+#[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::TdxHqClient;
 
 fn main() {
@@ -42,7 +44,7 @@ fn main() {
     if bars.is_empty() {
         return;
     }
-    let bar_ts = |b: &magic_tdx_rs::protocol::types::SecurityBar| -> String {
+    let bar_ts = |b: &crate::magic_compat::SecurityBar| -> String {
         format!(
             "{:04}-{:02}-{:02} {:02}:{:02}",
             b.year, b.month, b.day, b.hour, b.minute
@@ -50,8 +52,8 @@ fn main() {
     };
     // 统计周五 (2026-08-07) 的 bar
     let mut friday_count = 0usize;
-    let mut friday_first: Option<&magic_tdx_rs::protocol::types::SecurityBar> = None;
-    let mut friday_last: Option<&magic_tdx_rs::protocol::types::SecurityBar> = None;
+    let mut friday_first: Option<&crate::magic_compat::SecurityBar> = None;
+    let mut friday_last: Option<&crate::magic_compat::SecurityBar> = None;
     for b in bars.iter() {
         if b.year == 2026 && b.month == 8 && b.day == 7 {
             friday_count += 1;

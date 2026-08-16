@@ -1,14 +1,14 @@
 //! BR-066/BR-164/BR-172 evidence-preserving Sina instrument-news gateway.
 
 use chrono::{DateTime, Utc};
-use magic_market_core::{
-    DataBatch, Exchange, InstrumentDateRangeRequest, IsoDate, NewsItem as CoreNewsItem,
-    NewsProvider, PositiveU32, ProviderId, SourceEvidence,
-};
+use crate::magic_compat::{DataBatch, Exchange, IsoDate, PositiveU32, ProviderId, SourceEvidence};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{InstrumentDateRangeRequest, NewsItem as CoreNewsItem, NewsProvider};
 use magic_market_router::{
     AcceptancePolicy, AttemptStatus, FailureKind, InstrumentNewsRouter, RouterError, SourceError,
     SourceFn,
 };
+#[cfg(feature = "magic-gateway")]
 use magic_sina_rs::{SinaClient, SinaError};
 
 use super::review::{
@@ -490,10 +490,9 @@ fn gateway_router_error(provider: Option<ProviderId>, error: RouterError) -> Gat
 mod tests {
     use super::*;
     use chrono::{DateTime, Utc};
-    use magic_market_core::{
-        AssetClass, DataBatch, Exchange, HttpsUrl, InstrumentId, IsoDate, NewsItem as CoreNewsItem,
-        NonEmptyText, Provenance, ProviderId, SourceEvidence,
-    };
+    use crate::magic_compat::{AssetClass, DataBatch, Exchange, InstrumentId, IsoDate, NonEmptyText, Provenance, ProviderId, SourceEvidence};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{HttpsUrl, NewsItem as CoreNewsItem};
 
     fn instant(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)

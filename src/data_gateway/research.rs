@@ -2,11 +2,11 @@
 
 use super::review::{acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result};
 use super::{BatchEvidence, GatewayBatch, GatewayError};
+#[cfg(feature = "magic-gateway")]
 use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
-use magic_market_core::{
-    DataBatch, PositiveU32, ProviderId, ReportScope, ResearchReport, ResearchReports,
-    ResearchRequest,
-};
+use crate::magic_compat::{DataBatch, PositiveU32, ProviderId};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{ReportScope, ResearchReport, ResearchReports, ResearchRequest};
 
 const CAPABILITY: &str = "research-reports";
 
@@ -249,11 +249,11 @@ fn eastmoney_gateway_error(error: EastmoneyError) -> GatewayError {
 #[cfg(test)]
 mod tests {
     use super::{build_request, eastmoney_gateway_error, normalize_reports_batch};
+    #[cfg(feature = "magic-gateway")]
     use magic_eastmoney_rs::EastmoneyError;
-    use magic_market_core::{
-        AssetClass, DataBatch, Exchange, HttpsUrl, InstrumentId, NonEmptyText, Price, Provenance,
-        ProviderId, ReportScope, ResearchReport, SourceEvidence,
-    };
+    use crate::magic_compat::{AssetClass, DataBatch, Exchange, InstrumentId, NonEmptyText, Price, Provenance, ProviderId, SourceEvidence};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{HttpsUrl, ReportScope, ResearchReport};
 
     const OBSERVED_AT: &str = "1784965800.000000000";
     const BATCH_ID: &str = "TEST_CODE_research_batch";

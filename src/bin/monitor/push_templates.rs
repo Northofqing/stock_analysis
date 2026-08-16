@@ -6178,20 +6178,20 @@ fn r09_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn r09_metric_label(metric: &magic_market_core::MarketRankingKind) -> Result<&'static str, String> {
+fn r09_metric_label(metric: &crate::magic_compat::MarketRankingKind) -> Result<&'static str, String> {
     match metric {
-        magic_market_core::MarketRankingKind::VolumeRatio => Ok("volume_ratio"),
-        magic_market_core::MarketRankingKind::MainNetInflow => Ok("main_net_inflow"),
+        crate::magic_compat::MarketRankingKind::VolumeRatio => Ok("volume_ratio"),
+        crate::magic_compat::MarketRankingKind::MainNetInflow => Ok("main_net_inflow"),
         other => Err(format!(
             "R-09 fixed metric contract rejected unsupported metric {other:?}"
         )),
     }
 }
 
-fn r09_unit_label(unit: &magic_market_core::MarketRankingUnit) -> Result<&'static str, String> {
+fn r09_unit_label(unit: &crate::magic_compat::MarketRankingUnit) -> Result<&'static str, String> {
     match unit {
-        magic_market_core::MarketRankingUnit::Multiple => Ok("multiple"),
-        magic_market_core::MarketRankingUnit::Yuan => Ok("yuan"),
+        crate::magic_compat::MarketRankingUnit::Multiple => Ok("multiple"),
+        crate::magic_compat::MarketRankingUnit::Yuan => Ok("yuan"),
         other => Err(format!(
             "R-09 fixed metric contract rejected unsupported unit {other:?}"
         )),
@@ -6200,7 +6200,7 @@ fn r09_unit_label(unit: &magic_market_core::MarketRankingUnit) -> Result<&'stati
 
 fn r09_request_binding(
     request: &stock_analysis::data_gateway::capital::ProviderTopNRequestEvidence,
-    expected_metric: &magic_market_core::MarketRankingKind,
+    expected_metric: &crate::magic_compat::MarketRankingKind,
     review_date: chrono::NaiveDate,
 ) -> Result<ProviderTopNRequestBinding, String> {
     let expected_date = review_date.format("%Y-%m-%d").to_string();
@@ -6270,8 +6270,8 @@ fn r09_batch_binding<T>(
 
 fn r09_projection_rows(
     records: &[stock_analysis::data_gateway::capital::ProviderTopNFact],
-    expected_metric: &magic_market_core::MarketRankingKind,
-    expected_unit: &magic_market_core::MarketRankingUnit,
+    expected_metric: &crate::magic_compat::MarketRankingKind,
+    expected_unit: &crate::magic_compat::MarketRankingUnit,
     expected_date: chrono::NaiveDate,
     expected_filter: &str,
 ) -> Result<Vec<ProviderTopNProjectionRow>, String> {
@@ -6372,12 +6372,12 @@ fn prepare_r09_provider_top_n_report(
 ) -> Result<PreparedProviderTopNReport, String> {
     let volume_request = r09_request_binding(
         &pair.volume_ratio_request,
-        &magic_market_core::MarketRankingKind::VolumeRatio,
+        &crate::magic_compat::MarketRankingKind::VolumeRatio,
         review_date,
     )?;
     let inflow_request = r09_request_binding(
         &pair.main_net_inflow_request,
-        &magic_market_core::MarketRankingKind::MainNetInflow,
+        &crate::magic_compat::MarketRankingKind::MainNetInflow,
         review_date,
     )?;
     let volume_batch = r09_batch_binding(&pair.volume_ratio)?;
@@ -6387,15 +6387,15 @@ fn prepare_r09_provider_top_n_report(
     }
     let volume_projection = r09_projection_rows(
         pair.volume_ratio.records(),
-        &magic_market_core::MarketRankingKind::VolumeRatio,
-        &magic_market_core::MarketRankingUnit::Multiple,
+        &crate::magic_compat::MarketRankingKind::VolumeRatio,
+        &crate::magic_compat::MarketRankingUnit::Multiple,
         review_date,
         &volume_request.filter_identity,
     )?;
     let inflow_projection = r09_projection_rows(
         pair.main_net_inflow.records(),
-        &magic_market_core::MarketRankingKind::MainNetInflow,
-        &magic_market_core::MarketRankingUnit::Yuan,
+        &crate::magic_compat::MarketRankingKind::MainNetInflow,
+        &crate::magic_compat::MarketRankingUnit::Yuan,
         review_date,
         &inflow_request.filter_identity,
     )?;
@@ -6827,10 +6827,7 @@ mod br192_provider_top_n_tests {
         build_r09_delivery_envelope, dispatch_r09_provider_top_n_outcome_with_loader,
         prepare_r09_provider_top_n_report, r09_outcome_from_durable, R09_TEMPLATE_ID,
     };
-    use magic_market_core::{
-        AssetClass, Exchange, FiniteNumber, InstrumentId, IsoDate, MarketRankingKind,
-        MarketRankingUnit, NonEmptyText, PositiveU32, ProviderId,
-    };
+    use crate::magic_compat::{AssetClass, Exchange, FiniteNumber, InstrumentId, IsoDate, MarketRankingKind, MarketRankingUnit, NonEmptyText, PositiveU32, ProviderId};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use stock_analysis::data_gateway::{
@@ -9710,7 +9707,7 @@ struct R08FuturesFactBinding {
 #[serde(deny_unknown_fields)]
 struct R08IndexFactBinding {
     source_order_ordinal: usize,
-    code: magic_market_core::GlobalIndexCode,
+    code: crate::magic_compat::GlobalIndexCode,
     name: String,
     value: f64,
     change: f64,
@@ -9725,7 +9722,7 @@ struct R08IndexFactBinding {
 #[serde(deny_unknown_fields)]
 struct R08FxFactBinding {
     source_order_ordinal: usize,
-    pair: magic_market_core::FxPair,
+    pair: crate::magic_compat::FxPair,
     name: String,
     rate: f64,
     change: Option<f64>,
@@ -10618,12 +10615,12 @@ fn build_global_indices_summary(
         .iter()
         .map(|record| {
             let name = match record.code {
-                magic_market_core::GlobalIndexCode::DowJones => "道琼斯",
-                magic_market_core::GlobalIndexCode::NasdaqComposite => "纳斯达克",
-                magic_market_core::GlobalIndexCode::Sp500 => "标普500",
-                magic_market_core::GlobalIndexCode::Nikkei225 => "日经225",
-                magic_market_core::GlobalIndexCode::HangSeng => "恒生指数",
-                magic_market_core::GlobalIndexCode::Ftse100 => "富时100",
+                crate::magic_compat::GlobalIndexCode::DowJones => "道琼斯",
+                crate::magic_compat::GlobalIndexCode::NasdaqComposite => "纳斯达克",
+                crate::magic_compat::GlobalIndexCode::Sp500 => "标普500",
+                crate::magic_compat::GlobalIndexCode::Nikkei225 => "日经225",
+                crate::magic_compat::GlobalIndexCode::HangSeng => "恒生指数",
+                crate::magic_compat::GlobalIndexCode::Ftse100 => "富时100",
             };
             format!("{name} {:+.2}%", record.change_percent)
         })
@@ -11191,7 +11188,7 @@ mod tests_br140_r08_partial_components {
     fn indices_batch(
     ) -> stock_analysis::data_gateway::GatewayBatch<stock_analysis::data_gateway::GlobalIndexFact>
     {
-        use magic_market_core::{GlobalIndexCode, ProviderId};
+        use crate::magic_compat::{GlobalIndexCode, ProviderId};
 
         let observed_at = chrono::DateTime::parse_from_rfc3339("2026-07-21T13:00:00Z")
             .unwrap()
@@ -11235,7 +11232,7 @@ mod tests_br140_r08_partial_components {
     fn fx_batch(
     ) -> stock_analysis::data_gateway::GatewayBatch<stock_analysis::data_gateway::ForeignExchangeFact>
     {
-        use magic_market_core::{FxPair, ProviderId};
+        use crate::magic_compat::{FxPair, ProviderId};
 
         let observed_at = chrono::DateTime::parse_from_rfc3339("2026-07-21T13:00:01Z")
             .unwrap()
@@ -12178,7 +12175,9 @@ fn prepare_review_lhb_delivery(
     stocks: &[stock_analysis::data_gateway::DragonTigerStockReview],
     evidence: &stock_analysis::data_gateway::BatchEvidence,
 ) -> Result<PreparedReviewLhbDelivery, String> {
-    use magic_market_core::{DragonTigerSide, ProviderId};
+    use crate::magic_compat::{ProviderId};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{DragonTigerSide};
 
     if evidence.provider != ProviderId::Eastmoney {
         return Err(format!(
@@ -12678,6 +12677,7 @@ mod tests_r_dispatchers {
     #[test]
     fn br162_r04_renderer_keeps_trade_ids_and_exact_seats_without_fake_sum() {
         use crate::magic_compat::{Exchange, ProviderId};
+#[cfg(feature = "magic-gateway")]
 use magic_market_core::DragonTigerSide;
         use stock_analysis::data_gateway::{
             BatchEvidence, DragonTigerSeatReview, DragonTigerSourceDisclosure,
@@ -12837,6 +12837,7 @@ use magic_market_core::DragonTigerSide;
     #[test]
     fn br192_r04_counted_binding_fails_closed_without_exact_provider_evidence() {
         use crate::magic_compat::{Exchange, ProviderId};
+#[cfg(feature = "magic-gateway")]
 use magic_market_core::DragonTigerSide;
         use stock_analysis::data_gateway::{
             BatchEvidence, DragonTigerSeatReview, DragonTigerSourceDisclosure,
@@ -15028,7 +15029,9 @@ pub fn build_test_template_catalog(
     date: &str,
     hhmm: &str,
 ) -> Result<Vec<TestTemplatePreview>, String> {
-    use magic_market_core::{DragonTigerSide, Exchange as CoreExchange, ProviderId};
+    use crate::magic_compat::{Exchange as CoreExchange, ProviderId};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{DragonTigerSide};
     use stock_analysis::data_gateway::{
         BatchEvidence, DragonTigerSeatReview, DragonTigerSourceDisclosure, DragonTigerStockReview,
     };
@@ -16341,9 +16344,7 @@ mod tests {
 
     #[test]
     fn br159_candidate_statistics_projection_requires_exact_identity_and_preserves_missing() {
-        use magic_market_core::{
-            AssetClass, Exchange, FiniteNumber, InstrumentId, ProviderId, SourceEvidence,
-        };
+        use crate::magic_compat::{AssetClass, Exchange, FiniteNumber, InstrumentId, ProviderId, SourceEvidence};
         use stock_analysis::data_gateway::{
             company::MarketStatistics, BatchEvidence, GatewayBatch,
         };

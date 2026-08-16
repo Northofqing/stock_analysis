@@ -6,18 +6,22 @@
 //! that consumer contract. Missing fields never become zeroes.
 
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc};
-use magic_market_core::{
-    AssetClass, BookLevel, DataBatch, DataStatus, Exchange, InstrumentId, MinuteDataRequest,
-    MinutePoint, OrderBook, ProviderId, SecurityMetadata,
-};
+use crate::magic_compat::{AssetClass, DataBatch, Exchange, InstrumentId, ProviderId};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{BookLevel, DataStatus, MinuteDataRequest, MinutePoint, OrderBook, SecurityMetadata};
 #[cfg(test)]
-use magic_market_core::{Board, RatioUnit};
+use crate::magic_compat::{RatioUnit};
+#[cfg(test)]
+use magic_market_core::{Board};
 use magic_market_router::{
     minute_source, order_book_source, security_metadata_source, AcceptancePolicy, AttemptStatus,
     FailureKind, MinuteRouter, OrderBookRouter, RouterError, SecurityMetadataRouter, SourceError,
 };
+#[cfg(feature = "magic-gateway")]
 use magic_sina_rs::{SinaClient, SinaError};
+#[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::{TdxError, TdxSmartClient};
+#[cfg(feature = "magic-gateway")]
 use magic_tencent_rs::{TencentClient, TencentError};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -1692,7 +1696,7 @@ fn validate_book_order(
 
 #[cfg(test)]
 fn required_money(
-    value: Option<magic_market_core::Money>,
+    value: Option<crate::magic_compat::Money>,
     provider: ProviderId,
     code: &str,
     field: &str,
@@ -1831,9 +1835,9 @@ fn classify_sina_error(error: SinaError) -> SourceError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magic_market_core::{
-        BookLevel, DataBatch, Money, MoneyFlow, Price, PriceLimitRule, Provenance, Quantity, Ratio,
-    };
+    use crate::magic_compat::{DataBatch, Money, Price, Provenance, Quantity, Ratio};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{BookLevel, MoneyFlow, PriceLimitRule};
 
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-07-24T09:30:02+08:00")

@@ -9,8 +9,11 @@
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
 use crate::magic_compat::InstrumentId;
+#[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::protocol::constants::{fq_type, KLINE_5MIN, KLINE_DAILY};
+#[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::protocol::types::{MinuteTimePrice, SecurityBar, SecurityQuote};
+#[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::TdxHqClient;
 use serde::Serialize;
 use sha2::{Digest, Sha256};

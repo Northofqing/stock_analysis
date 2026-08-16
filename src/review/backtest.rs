@@ -15,7 +15,7 @@
 //! 纯计算函数与网络/DB 薄壳分离: 单测不依赖网络。
 
 use chrono::{Duration, NaiveDate, NaiveDateTime, Utc};
-use magic_tdx_rs::protocol::types::SecurityBar;
+use crate::magic_compat::SecurityBar;
 
 use crate::data_gateway::historical_bars::HistoricalBarsGateway;
 use crate::data_provider::{AdjustType, KlineData};

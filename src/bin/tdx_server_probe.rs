@@ -18,7 +18,9 @@
 
 use std::time::Instant;
 
+#[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::protocol::constants::{ALL_KNOWN_SERVERS, PRIMARY_SERVERS};
+#[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::TdxHqClient;
 
 /// 探测目标: 贵州茅台（沪市 market=1, 全天活跃）
