@@ -29,9 +29,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use crate::magic_compat::{
     AssetClass, Exchange, InstrumentId, NonEmptyText, ProviderId, SourceEvidence,
 };
-use crate::magic_compat::{DataBatch, FinancialStatement, FiniteNumber, FlowInterval, FxPair, GlobalIndexCode, IsoDate, MarketRankingKind, MarketRankingUnit, MarketStatistics, Money, NorthboundChannel, PositiveU32, Price, Ratio};
-#[cfg(feature = "magic-gateway")]
-use magic_market_core::{Bar, CorporateActionCategory, CorporateActionTerms, DragonTigerSide};
+use crate::magic_compat::{Bar, CorporateActionCategory, CorporateActionTerms, DataBatch, DragonTigerSide, FinancialStatement, FiniteNumber, FlowInterval, FxPair, GlobalIndexCode, IsoDate, MarketRankingKind, MarketRankingUnit, MarketStatistics, Money, NorthboundChannel, PositiveU32, Price, Ratio};
 use crate::magic_compat::SecurityBar;
 use serde_json::Value;
 

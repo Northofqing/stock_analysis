@@ -38,6 +38,14 @@ pub enum MarketRankingUnit {
     Custom(NonEmptyText),
 }
 
+/// Side of a dragon-tiger (LHB) disclosure seat.
+#[cfg(not(feature = "magic-gateway"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DragonTigerSide {
+    Buy,
+    Sell,
+}
+
 /// Global equity-index identity.
 #[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -14,8 +14,10 @@
 //! 依赖全部删除后, 本模块可更名或并入各自归属模块 (见
 //! docs/superpowers/plans/2026-08-15-p4-migration.md M5 节)。
 
+pub mod bars;
 pub mod evidence;
 pub mod instrument;
+pub mod lifecycle;
 pub mod market;
 pub mod provider_id;
 pub mod ranking;
@@ -25,18 +27,26 @@ pub mod value;
 
 #[cfg(feature = "magic-gateway")]
 pub use magic_market_core::{
-    AssetClass, CoreError, DataBatch, EvidenceTimestamp, Exchange, FinancialLine,
-    FinancialStatement, FiniteNumber, FlowInterval, FxPair, GlobalIndexCode, InstrumentId,
-    IsoDate, LimitPoolEntry, LimitPoolKind, MarketRankingKind, MarketRankingUnit, MarketStatistics,
-    Money, NonEmptyText, NorthboundChannel, PositiveU32, Price, Provenance, ProviderId,
-    QualityReport, Quantity, Ratio, RatioUnit, SourceEvidence, StatementKind,
+    Adjustment, AssetClass, Bar, BarInterval, CoreError, CorporateActionCategory,
+    CorporateActionStatus, CorporateActionTerms, DataBatch, DragonTigerSide, EvidenceTimestamp,
+    Exchange, FinancialLine, FinancialStatement, FiniteNumber, FlowInterval, FxPair,
+    GlobalIndexCode, InstrumentId, IsoDate, LimitPoolEntry, LimitPoolKind, MarketRankingKind,
+    MarketRankingUnit, MarketStatistics, Money, NonEmptyText, NorthboundChannel, PositiveU32,
+    Price, Provenance, ProviderId, QualityReport, Quantity, Ratio, RatioUnit, SourceEvidence,
+    StatementKind, UnverifiedSourceUnit,
 };
 #[cfg(feature = "magic-gateway")]
 pub use magic_tdx_rs::protocol::types::SecurityBar;
 #[cfg(not(feature = "magic-gateway"))]
+pub use bars::{Adjustment, Bar, BarInterval};
+#[cfg(not(feature = "magic-gateway"))]
 pub use evidence::{EvidenceTimestamp, NonEmptyText, SourceEvidence};
 #[cfg(not(feature = "magic-gateway"))]
 pub use instrument::{AssetClass, CoreError, Exchange, InstrumentId};
+#[cfg(not(feature = "magic-gateway"))]
+pub use lifecycle::{
+    CorporateActionCategory, CorporateActionStatus, CorporateActionTerms, UnverifiedSourceUnit,
+};
 #[cfg(not(feature = "magic-gateway"))]
 pub use market::{
     FinancialLine, FinancialStatement, LimitPoolEntry, LimitPoolKind, MarketStatistics,
@@ -45,7 +55,7 @@ pub use market::{
 #[cfg(not(feature = "magic-gateway"))]
 pub use provider_id::ProviderId;
 #[cfg(not(feature = "magic-gateway"))]
-pub use ranking::{FxPair, GlobalIndexCode, MarketRankingKind, MarketRankingUnit};
+pub use ranking::{DragonTigerSide, FxPair, GlobalIndexCode, MarketRankingKind, MarketRankingUnit};
 #[cfg(not(feature = "magic-gateway"))]
 pub use record::{DataBatch, FlowInterval, IsoDate, NorthboundChannel, Provenance, QualityReport};
 #[cfg(not(feature = "magic-gateway"))]
@@ -468,6 +478,229 @@ mod tests {
         assert_eq!(
             json,
             r#"{"open":10.0,"close":10.5,"high":10.6,"low":9.9,"vol":100000.0,"amount":1050000.0,"year":2026,"month":8,"day":16,"hour":14,"minute":30,"datetime":"2026-08-16 14:30:00"}"#
+        );
+    }
+
+    /// Phase 3: bars/lifecycle/signals 补充枚举 wire 名 (convert.rs 依赖 serde 表示)。
+    #[test]
+    fn bridge_enum_wire_names_match_upstream() {
+        let bar_intervals: &[(&str, BarInterval)] = &[
+            ("Minute1", BarInterval::Minute1),
+            ("Minute5", BarInterval::Minute5),
+            ("Minute15", BarInterval::Minute15),
+            ("Minute30", BarInterval::Minute30),
+            ("Hour1", BarInterval::Hour1),
+            ("Day", BarInterval::Day),
+            ("Week", BarInterval::Week),
+            ("Month", BarInterval::Month),
+            ("Year", BarInterval::Year),
+        ];
+        assert_eq!(bar_intervals.len(), 9, "BarInterval 变体数 = 上游 75ee2a2");
+        for (name, v) in bar_intervals {
+            assert_eq!(&format!("{v:?}"), name);
+            assert_eq!(
+                serde_json::to_string(v).unwrap(),
+                serde_json::to_string(name).unwrap()
+            );
+        }
+
+        let adjustments: &[(&str, Adjustment)] = &[
+            ("Unadjusted", Adjustment::Unadjusted),
+            ("Forward", Adjustment::Forward),
+            ("Backward", Adjustment::Backward),
+        ];
+        assert_eq!(adjustments.len(), 3, "Adjustment 变体数 = 上游 75ee2a2");
+        for (name, v) in adjustments {
+            assert_eq!(&format!("{v:?}"), name);
+            assert_eq!(
+                serde_json::to_string(v).unwrap(),
+                serde_json::to_string(name).unwrap()
+            );
+        }
+
+        let sides: &[(&str, DragonTigerSide)] = &[
+            ("Buy", DragonTigerSide::Buy),
+            ("Sell", DragonTigerSide::Sell),
+        ];
+        assert_eq!(sides.len(), 2, "DragonTigerSide 变体数 = 上游 75ee2a2");
+        for (name, v) in sides {
+            assert_eq!(&format!("{v:?}"), name);
+            assert_eq!(
+                serde_json::to_string(v).unwrap(),
+                serde_json::to_string(name).unwrap()
+            );
+        }
+
+        let categories: &[(&str, CorporateActionCategory)] = &[
+            ("Distribution", CorporateActionCategory::Distribution),
+            ("BonusRightsListing", CorporateActionCategory::BonusRightsListing),
+            (
+                "NonTradableShareListing",
+                CorporateActionCategory::NonTradableShareListing,
+            ),
+            ("UnknownCapitalChange", CorporateActionCategory::UnknownCapitalChange),
+            ("CapitalChange", CorporateActionCategory::CapitalChange),
+            ("AdditionalIssuance", CorporateActionCategory::AdditionalIssuance),
+            ("ShareRepurchase", CorporateActionCategory::ShareRepurchase),
+            (
+                "AdditionalIssuanceListing",
+                CorporateActionCategory::AdditionalIssuanceListing,
+            ),
+            (
+                "TransferredAllotmentListing",
+                CorporateActionCategory::TransferredAllotmentListing,
+            ),
+            (
+                "ConvertibleBondListing",
+                CorporateActionCategory::ConvertibleBondListing,
+            ),
+            ("CapitalRescaling", CorporateActionCategory::CapitalRescaling),
+            (
+                "NonTradableReverseSplit",
+                CorporateActionCategory::NonTradableReverseSplit,
+            ),
+            (
+                "SubscriptionWarrantGrant",
+                CorporateActionCategory::SubscriptionWarrantGrant,
+            ),
+            ("PutWarrantGrant", CorporateActionCategory::PutWarrantGrant),
+        ];
+        assert_eq!(categories.len(), 14, "CorporateActionCategory 变体数 = 上游 75ee2a2");
+        for (name, v) in categories {
+            assert_eq!(&format!("{v:?}"), name);
+            assert_eq!(
+                serde_json::to_string(v).unwrap(),
+                serde_json::to_string(name).unwrap()
+            );
+        }
+
+        let statuses: &[(&str, CorporateActionStatus)] = &[
+            ("Implemented", CorporateActionStatus::Implemented),
+            ("Proposed", CorporateActionStatus::Proposed),
+            ("Cancelled", CorporateActionStatus::Cancelled),
+            ("Unknown", CorporateActionStatus::Unknown),
+        ];
+        assert_eq!(statuses.len(), 4, "CorporateActionStatus 变体数 = 上游 75ee2a2");
+        for (name, v) in statuses {
+            assert_eq!(&format!("{v:?}"), name);
+            assert_eq!(
+                serde_json::to_string(v).unwrap(),
+                serde_json::to_string(name).unwrap()
+            );
+        }
+    }
+
+    /// Phase 3: Bar serde round-trip + 校验语义 (convert.rs:1886
+    /// `DataBatch<Bar>` 反序列化依赖)。
+    #[test]
+    fn bar_json_roundtrip_and_validation() {
+        let bar = Bar::new(
+            test_instrument(),
+            BarInterval::Minute15,
+            "2099-01-02 09:45:00",
+            "2099-01-02 10:00:00",
+            Price::new(10.0).unwrap(),
+            Price::new(10.8).unwrap(),
+            Price::new(9.9).unwrap(),
+            Price::new(10.5).unwrap(),
+            Quantity::new(1_000_000.0).unwrap(),
+            Some(Money::new(10_500_000.0).unwrap()),
+            Adjustment::Forward,
+            ProviderId::Tdx,
+            "phase3-batch",
+        )
+        .unwrap();
+        let json = serde_json::to_string(&bar).unwrap();
+        assert!(json.contains(r#""interval":"Minute15""#));
+        assert!(json.contains(r#""adjustment":"Forward""#));
+        assert!(json.contains(r#""provider":"Tdx""#));
+        assert!(json.contains(r#""bar_start":"2099-01-02 09:45:00""#));
+        let parsed: Bar = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, bar);
+        assert_eq!(parsed.interval(), BarInterval::Minute15);
+        assert_eq!(parsed.close().get(), 10.5);
+        assert_eq!(parsed.batch_id(), "phase3-batch");
+
+        // 校验: 时间格式与 interval 匹配 + OHLC 一致性 (错误字符串逐字)
+        let bad_time = Bar::new(
+            test_instrument(),
+            BarInterval::Minute15,
+            "2099-01-02",
+            "2099-01-02 10:00:00",
+            Price::new(10.0).unwrap(),
+            Price::new(10.8).unwrap(),
+            Price::new(9.9).unwrap(),
+            Price::new(10.5).unwrap(),
+            Quantity::new(1.0).unwrap(),
+            None,
+            Adjustment::Unadjusted,
+            ProviderId::Tdx,
+            "b",
+        );
+        assert_eq!(
+            bad_time.unwrap_err().to_string(),
+            "invalid request: invalid bar time range"
+        );
+
+        let bad_ohlc = Bar::new(
+            test_instrument(),
+            BarInterval::Day,
+            "2099-01-02",
+            "2099-01-03",
+            Price::new(10.0).unwrap(),
+            Price::new(9.5).unwrap(),
+            Price::new(9.9).unwrap(),
+            Price::new(10.5).unwrap(),
+            Quantity::new(1.0).unwrap(),
+            None,
+            Adjustment::Unadjusted,
+            ProviderId::Tdx,
+            "b",
+        );
+        assert_eq!(
+            bad_ohlc.unwrap_err().to_string(),
+            "invalid request: inconsistent OHLC range"
+        );
+    }
+
+    /// Phase 3: CorporateActionTerms 反序列化 (convert.rs from_value 路径)。
+    #[test]
+    fn corporate_action_terms_json_roundtrip() {
+        let terms = CorporateActionTerms::Distribution {
+            cash_per_share: Some(FiniteNumber::new(0.5).unwrap()),
+            bonus_per_share: None,
+            rights_per_share: None,
+            rights_price: None,
+        };
+        let json = serde_json::to_string(&terms).unwrap();
+        assert_eq!(
+            json,
+            r#"{"Distribution":{"cash_per_share":0.5,"bonus_per_share":null,"rights_per_share":null,"rights_price":null}}"#
+        );
+        let parsed: CorporateActionTerms = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, terms);
+
+        let native = CorporateActionTerms::ProviderNativeRatio {
+            category: CorporateActionCategory::CapitalRescaling,
+            source_ratio: FiniteNumber::new(3.0).unwrap(),
+            source_ratio_unit: UnverifiedSourceUnit::ProviderNative,
+        };
+        let parsed: CorporateActionTerms =
+            serde_json::from_str(&serde_json::to_string(&native).unwrap()).unwrap();
+        assert_eq!(parsed, native);
+
+        // 校验: 类别不匹配时反序列化必须拒绝 (上游错误字符串逐字)
+        let invalid = serde_json::json!({
+            "ProviderNativeRatio": {
+                "category": "CapitalChange",
+                "source_ratio": 3.0,
+                "source_ratio_unit": "ProviderNative",
+            }
+        });
+        let err = serde_json::from_value::<CorporateActionTerms>(invalid).unwrap_err();
+        assert!(
+            err.to_string().contains("category does not use provider-native ratio terms"),
+            "got: {err}"
         );
     }
 }
