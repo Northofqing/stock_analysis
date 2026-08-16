@@ -22,6 +22,7 @@ pub mod index;
 pub mod instrument_identity;
 pub mod intraday_shape;
 pub mod magic_tdx;
+#[cfg(feature = "magic-gateway")]
 pub mod magic_tdx_selection;
 pub mod magic_tdx_t0;
 pub mod market_capabilities;
