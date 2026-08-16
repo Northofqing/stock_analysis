@@ -19,9 +19,12 @@ pub use super::board_runtime::{
 };
 
 #[cfg(not(test))]
+#[cfg(feature = "magic-gateway")]
 use super::instrument_identity::resolve_production_equity;
 #[cfg(test)]
+#[cfg(feature = "magic-gateway")]
 use super::instrument_identity::resolve_test_equity;
+#[cfg(feature = "magic-gateway")]
 use super::instrument_identity::{CanonicalEquityIdentity, EquityIdentityError};
 use crate::selection::schema_v2::{
     canonical_json as schema_canonical_json, sha256_bytes as schema_sha256_bytes,
@@ -39,12 +42,16 @@ use crate::selection::schema_v2::{
     DOMAIN_BOARD_DIRECTORY_RECORD, UPSTREAM_REVISION,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
-use crate::magic_compat::{DataBatch, Exchange, NonEmptyText, PositiveU32, ProviderId, SourceEvidence};
+use crate::magic_compat::{Exchange, ProviderId};
+#[cfg(feature = "magic-gateway")]
+use crate::magic_compat::{DataBatch, NonEmptyText, PositiveU32, SourceEvidence};
 #[cfg(feature = "magic-gateway")]
 use magic_market_core::{BoardCategory, BoardConstituentRequest, BoardMembership};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "magic-gateway")]
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use thiserror::Error;
@@ -77,6 +84,7 @@ impl SelectionBoardKind {
         }
     }
 
+    #[cfg(feature = "magic-gateway")]
     fn from_provider(value: BoardCategory) -> Result<Self, BoardSelectionError> {
         match value {
             BoardCategory::Industry => Ok(Self::Industry),
@@ -98,6 +106,7 @@ impl SelectionBoardKind {
     }
 
     #[cfg(test)]
+    #[cfg(feature = "magic-gateway")]
     fn provider_category(self) -> BoardCategory {
         match self {
             Self::Industry => BoardCategory::Industry,
@@ -840,6 +849,8 @@ impl BoardDataGateway {
     /// The fixed request limit and all validation remain owned by this public
     /// Gateway boundary. Callers never construct a Magic TDX provider or
     /// receive an unvalidated constituent batch.
+    /// transport-only: 生产无调用方 (delegate 走 board_runtime `memberships`)。
+    #[cfg(feature = "magic-gateway")]
     pub async fn board_constituents(
         &self,
         binding: VerifiedBoardBinding,
@@ -857,6 +868,7 @@ impl BoardDataGateway {
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn fetch_board_constituents(
     gateway: BoardDataGateway,
     binding: VerifiedBoardBinding,
@@ -872,6 +884,7 @@ fn fetch_board_constituents(
     validate_board_constituent_batch(&binding, BOARD_CONSTITUENT_REQUEST_LIMIT, &batch)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn build_board_constituent_request(
     binding: &VerifiedBoardBinding,
 ) -> Result<BoardConstituentRequest, BoardSelectionError> {
@@ -901,6 +914,7 @@ fn build_board_constituent_request(
 /// The caller must construct the upstream request with
 /// `BOARD_CONSTITUENT_REQUEST_LIMIT`. Passing any other limit is an invalid
 /// request; returning exactly that limit is treated as potential truncation.
+#[cfg(feature = "magic-gateway")]
 pub(crate) fn validate_board_constituent_batch(
     binding: &VerifiedBoardBinding,
     requested_limit: u32,
@@ -1026,6 +1040,7 @@ pub(crate) fn validate_board_constituent_batch(
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_constituent_record(
     binding: &VerifiedBoardBinding,
     batch_observed_at: &str,
@@ -1091,6 +1106,7 @@ fn validate_constituent_record(
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_record_evidence(
     evidence: &SourceEvidence,
     batch_observed_at: &str,
@@ -1119,6 +1135,7 @@ fn validate_record_evidence(
 }
 
 #[cfg(not(test))]
+#[cfg(feature = "magic-gateway")]
 fn resolve_constituent_identity(
     code: &str,
 ) -> Result<CanonicalEquityIdentity, BoardSelectionError> {
@@ -1126,12 +1143,14 @@ fn resolve_constituent_identity(
 }
 
 #[cfg(test)]
+#[cfg(feature = "magic-gateway")]
 fn resolve_constituent_identity(
     code: &str,
 ) -> Result<CanonicalEquityIdentity, BoardSelectionError> {
     resolve_test_equity(code, None).map_err(identity_error)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn identity_error(error: EquityIdentityError) -> BoardSelectionError {
     BoardSelectionError::invalid_batch("board_constituent_identity_invalid", error.to_string())
 }
@@ -1474,6 +1493,7 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+#[cfg(feature = "magic-gateway")]
 const fn exchange_token(exchange: Exchange) -> &'static str {
     match exchange {
         Exchange::Shanghai => "shanghai",
@@ -1483,6 +1503,7 @@ const fn exchange_token(exchange: Exchange) -> &'static str {
 }
 
 #[cfg(test)]
+#[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
     use crate::magic_compat::{AssetClass, InstrumentId, NonEmptyText, Provenance, SourceEvidence};

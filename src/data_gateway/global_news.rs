@@ -1,19 +1,28 @@
 //! BR-066/BR-133/BR-137/BR-166/BR-172 evidence-preserving global financial-news acquisition.
 
-use super::review::{acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result};
-use super::{BatchEvidence, GatewayBatch, GatewayError};
-use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
+use super::review::{acquisition_request_hash, audit_gateway_result};
+#[cfg(feature = "magic-gateway")]
+use super::review::audit_blocking_join_failure;
+use super::{GatewayBatch, GatewayError};
+#[cfg(feature = "magic-gateway")]
+use super::BatchEvidence;
+use chrono::{DateTime, Utc};
+#[cfg(feature = "magic-gateway")]
+use chrono::{FixedOffset, NaiveDateTime, TimeZone};
+use crate::magic_compat::{ProviderId, SourceEvidence};
+#[cfg(feature = "magic-gateway")]
+use crate::magic_compat::{DataBatch, PositiveU32};
 #[cfg(feature = "magic-gateway")]
 use magic_cls_rs::{ClsClient, ClsError};
 #[cfg(feature = "magic-gateway")]
 use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
 #[cfg(feature = "magic-gateway")]
 use magic_jin10_rs::{Jin10Client, Jin10Error};
-use crate::magic_compat::{DataBatch, PositiveU32, ProviderId, SourceEvidence};
 #[cfg(feature = "magic-gateway")]
 use magic_market_core::{NewsItem, NewsProvider};
 #[cfg(feature = "magic-gateway")]
 use magic_thepaper_rs::{ThePaperClient, ThePaperError};
+#[cfg(feature = "magic-gateway")]
 use std::collections::HashSet;
 
 const MAX_LIMIT: u32 = 20;
@@ -115,29 +124,46 @@ impl GlobalNewsGateway {
                 return audit_gateway_result(capability, provider_id, &request_hash, Err(error));
             }
         }
-        let worker_hash = request_hash.clone();
-        let joined = tokio::task::spawn_blocking(move || {
-            let result =
-                build_limit(provider, limit).and_then(|limit| fetch_and_admit(provider, limit));
-            audit_gateway_result(capability, provider_id, &worker_hash, result)
-        })
-        .await;
+        // no-feature (monitor 零 magic 构建): library transport 编译期不存在。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
+                capability,
+                Some(provider_id),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let worker_hash = request_hash.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let result =
+                    build_limit(provider, limit).and_then(|limit| fetch_and_admit(provider, limit));
+                audit_gateway_result(capability, provider_id, &worker_hash, result)
+            })
+            .await;
 
-        match joined {
-            Ok(result) => result,
-            Err(error) => {
-                audit_blocking_join_failure(
-                    capability,
-                    provider_id,
-                    request_hash,
-                    error.to_string(),
-                )
-                .await
+            match joined {
+                Ok(result) => result,
+                Err(error) => {
+                    audit_blocking_join_failure(
+                        capability,
+                        provider_id,
+                        request_hash,
+                        error.to_string(),
+                    )
+                    .await
+                }
             }
         }
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn build_limit(provider: GlobalNewsProvider, limit: u32) -> Result<PositiveU32, GatewayError> {
     if limit > MAX_LIMIT {
         return Err(GatewayError::invalid_request(
@@ -153,6 +179,7 @@ fn build_limit(provider: GlobalNewsProvider, limit: u32) -> Result<PositiveU32, 
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn fetch_and_admit(
     provider: GlobalNewsProvider,
     limit: PositiveU32,
@@ -178,6 +205,7 @@ fn fetch_and_admit(
     admit_batch(provider, batch)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn admit_batch(
     provider: GlobalNewsProvider,
     batch: DataBatch<NewsItem>,
@@ -307,6 +335,7 @@ fn admit_batch(
     Ok(GatewayBatch::Available { records, evidence })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_record_evidence(
     provider: GlobalNewsProvider,
     item: &NewsItem,
@@ -331,6 +360,7 @@ fn validate_record_evidence(
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn parse_provider_time(
     provider: GlobalNewsProvider,
     value: &str,
@@ -373,6 +403,7 @@ fn parse_provider_time(
         })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn parse_observed_at(
     provider: GlobalNewsProvider,
     value: &str,
@@ -414,6 +445,7 @@ fn parse_observed_at(
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn provider_error(
     provider: GlobalNewsProvider,
     category: &'static str,
@@ -444,10 +476,12 @@ fn provider_error(
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn eastmoney_gateway_error(provider: GlobalNewsProvider, error: EastmoneyError) -> GatewayError {
     provider_error(provider, error.category(), error.to_string())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn cls_gateway_error(provider: GlobalNewsProvider, error: ClsError) -> GatewayError {
     let category = match error {
         ClsError::InvalidRequest(_) => "invalid_request",
@@ -458,6 +492,7 @@ fn cls_gateway_error(provider: GlobalNewsProvider, error: ClsError) -> GatewayEr
     provider_error(provider, category, error.to_string())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn jin10_gateway_error(provider: GlobalNewsProvider, error: Jin10Error) -> GatewayError {
     let category = match error {
         Jin10Error::InvalidRequest(_) => "invalid_request",
@@ -468,6 +503,7 @@ fn jin10_gateway_error(provider: GlobalNewsProvider, error: Jin10Error) -> Gatew
     provider_error(provider, category, error.to_string())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn thepaper_gateway_error(provider: GlobalNewsProvider, error: ThePaperError) -> GatewayError {
     let category = match error {
         ThePaperError::InvalidRequest(_) => "invalid_request",
@@ -481,11 +517,11 @@ fn thepaper_gateway_error(provider: GlobalNewsProvider, error: ThePaperError) ->
 }
 
 #[cfg(test)]
+#[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
     use crate::magic_compat::{NonEmptyText, Provenance};
-#[cfg(feature = "magic-gateway")]
-use magic_market_core::{HttpsUrl};
+    use magic_market_core::HttpsUrl;
 
     fn observed_at(after: &str) -> String {
         let timestamp = DateTime::parse_from_rfc3339(after)

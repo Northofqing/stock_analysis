@@ -13,28 +13,38 @@
 //! zero. Blocking provider clients are created, used and dropped inside
 //! `spawn_blocking`, so they cannot drop a blocking runtime on a Tokio worker.
 
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::NaiveDate;
+#[cfg(feature = "magic-gateway")]
+use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
 #[cfg(feature = "magic-gateway")]
 use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
 #[cfg(feature = "magic-gateway")]
 use magic_exchange_rs::{ExchangeError, HkexClient};
+#[cfg(feature = "magic-gateway")]
 use magic_market_composition::{
     EastmoneyProviderTopNRankingRouter, EastmoneyProviderTopNRouterError,
 };
-use crate::magic_compat::{DataBatch, Exchange, FiniteNumber, FlowInterval, InstrumentId, IsoDate, MarketRankingKind, MarketRankingUnit, NonEmptyText, NorthboundChannel, PositiveU32, ProviderId, RatioUnit, SourceEvidence};
+use crate::magic_compat::{
+    FiniteNumber, FlowInterval, InstrumentId, IsoDate, MarketRankingKind, MarketRankingUnit,
+    NonEmptyText, NorthboundChannel, PositiveU32, ProviderId,
+};
+#[cfg(feature = "magic-gateway")]
+use crate::magic_compat::{DataBatch, Exchange, RatioUnit, SourceEvidence};
 #[cfg(feature = "magic-gateway")]
 use magic_market_core::{validate_provider_top_n_ranking_batch, FlowScope, FundFlowPoint, FundFlowRequest, NorthboundDailyRequest, NorthboundDailyStat, NorthboundQuotaBalance, ProviderTopNRankingEntry, ProviderTopNRankingRequest};
+#[cfg(feature = "magic-gateway")]
 use magic_market_router::{
     fund_flow_series_source, northbound_daily_source, AcceptancePolicy, AttemptStatus, FailureKind,
     FundFlowSeriesRouter, NorthboundDailyRouter, RouterError, SourceError,
 };
+#[cfg(feature = "magic-gateway")]
 use std::collections::HashSet;
+#[cfg(feature = "magic-gateway")]
 use std::sync::Arc;
 
-use super::review::{
-    acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result, BatchEvidence,
-    GatewayBatch, GatewayError,
-};
+use super::review::{acquisition_request_hash, audit_gateway_result, GatewayBatch, GatewayError};
+#[cfg(feature = "magic-gateway")]
+use super::review::{audit_blocking_join_failure, BatchEvidence};
 
 const FUND_FLOW_CAPABILITY: &str = "CapitalInstrumentFundFlow";
 const PROVIDER_TOP_N_VOLUME_RATIO_CAPABILITY: &str = "CapitalProviderTopNVolumeRatio";
@@ -43,6 +53,11 @@ const NORTHBOUND_CAPABILITY: &str = "CapitalNorthboundDaily";
 const EASTMONEY_SOURCE: &str = "eastmoney-web";
 const HKEX_SOURCE: &str = "hkex-official";
 const PROVIDER_TOP_N_LIMIT: u32 = 20;
+// Upstream `EastmoneyClient::provider_top_n_a_share_request` 的固定 A-share
+// filter identity。桥模式本地构造 request evidence 时必须与 library transport
+// 使用同一 filter, 才能保证 canonical request_hash 一致。
+const PROVIDER_TOP_N_A_SHARE_FILTER: &str =
+    "m:0+t:6+f:!2,m:0+t:13+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2,m:0+t:81+s:262144+f:!2";
 const OBSERVATION_MAX_AGE_MILLIS: i64 = 30_000;
 // Minute1 source timestamps have minute precision. Two minutes is the
 // strictest useful gate that does not reject a just-published minute solely
@@ -173,31 +188,47 @@ impl CapitalDataGateway {
                 );
             }
         }
-        let worker_hash = request_hash.clone();
-        let joined = tokio::task::spawn_blocking(move || {
-            let result = build_fund_flow_request(&storage_code, interval, limit).and_then(
-                |(instrument, request)| {
-                    route_fund_flow(&storage_code, &instrument, &request, Utc::now())
-                },
-            );
-            audit_gateway_result(
+        // P4 M5: no-feature 构建不携带 library transport, 无桥时显式失败
+        // (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
                 FUND_FLOW_CAPABILITY,
-                ProviderId::Eastmoney,
-                &worker_hash,
-                result,
-            )
-        })
-        .await;
-        match joined {
-            Ok(result) => result,
-            Err(error) => {
-                audit_blocking_join_failure(
+                Some(ProviderId::Eastmoney),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let worker_hash = request_hash.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let result = build_fund_flow_request(&storage_code, interval, limit).and_then(
+                    |(instrument, request)| {
+                        route_fund_flow(&storage_code, &instrument, &request, Utc::now())
+                    },
+                );
+                audit_gateway_result(
                     FUND_FLOW_CAPABILITY,
                     ProviderId::Eastmoney,
-                    request_hash,
-                    error.to_string(),
+                    &worker_hash,
+                    result,
                 )
-                .await
+            })
+            .await;
+            match joined {
+                Ok(result) => result,
+                Err(error) => {
+                    audit_blocking_join_failure(
+                        FUND_FLOW_CAPABILITY,
+                        ProviderId::Eastmoney,
+                        request_hash,
+                        error.to_string(),
+                    )
+                    .await
+                }
             }
         }
     }
@@ -213,25 +244,24 @@ impl CapitalDataGateway {
         &self,
         trading_date: NaiveDate,
     ) -> Result<ProviderTopNPair, GatewayError> {
-        let volume_request = build_provider_top_n_request(
+        // P4 M5: request evidence 本地构造 (无 transport 类型依赖), 与 library
+        // transport 的 `provider_top_n_request_evidence` 保持同 canonical
+        // request_hash (桥只换 transport 数据)。
+        let volume_request_evidence = provider_top_n_a_share_evidence(
             MarketRankingKind::VolumeRatio,
             trading_date,
             PROVIDER_TOP_N_VOLUME_RATIO_CAPABILITY,
         )?;
-        let inflow_request = build_provider_top_n_request(
+        let inflow_request_evidence = provider_top_n_a_share_evidence(
             MarketRankingKind::MainNetInflow,
             trading_date,
             PROVIDER_TOP_N_MAIN_NET_INFLOW_CAPABILITY,
         )?;
-        let volume_request_evidence = provider_top_n_request_evidence(
-            &volume_request,
-            PROVIDER_TOP_N_VOLUME_RATIO_CAPABILITY,
-        );
-        let inflow_request_evidence = provider_top_n_request_evidence(
-            &inflow_request,
-            PROVIDER_TOP_N_MAIN_NET_INFLOW_CAPABILITY,
-        );
+        // 仅 library transport 路径需要独立的 hash 变量 (桥路径直接读
+        // evidence.request_hash), no-feature 构建不产生未使用变量。
+        #[cfg(feature = "magic-gateway")]
         let volume_request_hash = volume_request_evidence.request_hash.clone();
+        #[cfg(feature = "magic-gateway")]
         let inflow_request_hash = inflow_request_evidence.request_hash.clone();
         // P4 M4b: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; 双路 audit 留
         // 客户端, request evidence 是本地构造的 (桥只换 transport 数据)。
@@ -311,29 +341,63 @@ impl CapitalDataGateway {
                 };
             }
         }
-        let worker_volume_request_hash = volume_request_hash.clone();
-        let worker_inflow_request_hash = inflow_request_hash.clone();
-        let joined = tokio::task::spawn_blocking(move || {
-            route_provider_top_n_pair(
-                volume_request,
-                volume_request_evidence,
-                inflow_request,
-                inflow_request_evidence,
+        // P4 M5: no-feature 构建不携带 library transport, 无桥时显式失败
+        // (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
+                PROVIDER_TOP_N_VOLUME_RATIO_CAPABILITY,
+                Some(ProviderId::Eastmoney),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let volume_request = build_provider_top_n_request(
+                MarketRankingKind::VolumeRatio,
                 trading_date,
-                &worker_volume_request_hash,
-                &worker_inflow_request_hash,
-            )
-        })
-        .await;
-        match joined {
-            Ok(result) => result,
-            Err(error) => {
-                audit_provider_top_n_join_failure(
-                    volume_request_hash,
-                    inflow_request_hash,
-                    error.to_string(),
+                PROVIDER_TOP_N_VOLUME_RATIO_CAPABILITY,
+            )?;
+            let inflow_request = build_provider_top_n_request(
+                MarketRankingKind::MainNetInflow,
+                trading_date,
+                PROVIDER_TOP_N_MAIN_NET_INFLOW_CAPABILITY,
+            )?;
+            let volume_request_evidence = provider_top_n_request_evidence(
+                &volume_request,
+                PROVIDER_TOP_N_VOLUME_RATIO_CAPABILITY,
+            );
+            let inflow_request_evidence = provider_top_n_request_evidence(
+                &inflow_request,
+                PROVIDER_TOP_N_MAIN_NET_INFLOW_CAPABILITY,
+            );
+            let worker_volume_request_hash = volume_request_hash.clone();
+            let worker_inflow_request_hash = inflow_request_hash.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                route_provider_top_n_pair(
+                    volume_request,
+                    volume_request_evidence,
+                    inflow_request,
+                    inflow_request_evidence,
+                    trading_date,
+                    &worker_volume_request_hash,
+                    &worker_inflow_request_hash,
                 )
-                .await
+            })
+            .await;
+            match joined {
+                Ok(result) => result,
+                Err(error) => {
+                    audit_provider_top_n_join_failure(
+                        volume_request_hash,
+                        inflow_request_hash,
+                        error.to_string(),
+                    )
+                    .await
+                }
             }
         }
     }
@@ -366,34 +430,51 @@ impl CapitalDataGateway {
                 );
             }
         }
-        let worker_hash = request_hash.clone();
-        let joined = tokio::task::spawn_blocking(move || {
-            let result = iso_date(trading_date, NORTHBOUND_CAPABILITY)
-                .map(|date| NorthboundDailyRequest::new(date, channel))
-                .and_then(|request| route_northbound(&request, Utc::now()));
-            audit_gateway_result(
+        // P4 M5: no-feature 构建不携带 library transport, 无桥时显式失败
+        // (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
                 NORTHBOUND_CAPABILITY,
-                ProviderId::Hkex,
-                &worker_hash,
-                result,
-            )
-        })
-        .await;
-        match joined {
-            Ok(result) => result,
-            Err(error) => {
-                audit_blocking_join_failure(
+                Some(ProviderId::Hkex),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let worker_hash = request_hash.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let result = iso_date(trading_date, NORTHBOUND_CAPABILITY)
+                    .map(|date| NorthboundDailyRequest::new(date, channel))
+                    .and_then(|request| route_northbound(&request, Utc::now()));
+                audit_gateway_result(
                     NORTHBOUND_CAPABILITY,
                     ProviderId::Hkex,
-                    request_hash,
-                    error.to_string(),
+                    &worker_hash,
+                    result,
                 )
-                .await
+            })
+            .await;
+            match joined {
+                Ok(result) => result,
+                Err(error) => {
+                    audit_blocking_join_failure(
+                        NORTHBOUND_CAPABILITY,
+                        ProviderId::Hkex,
+                        request_hash,
+                        error.to_string(),
+                    )
+                    .await
+                }
             }
         }
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn build_fund_flow_request(
     storage_code: &str,
     interval: FlowInterval,
@@ -412,6 +493,7 @@ fn build_fund_flow_request(
     Ok((instrument, request))
 }
 
+#[cfg(feature = "magic-gateway")]
 fn build_provider_top_n_request(
     metric: MarketRankingKind,
     trading_date: NaiveDate,
@@ -424,6 +506,7 @@ fn build_provider_top_n_request(
         .map_err(|error| eastmoney_gateway_error(capability, error))
 }
 
+#[cfg(feature = "magic-gateway")]
 fn provider_top_n_request_evidence(
     request: &ProviderTopNRankingRequest,
     capability: &'static str,
@@ -444,6 +527,36 @@ fn provider_top_n_request_evidence(
     }
 }
 
+/// P4 M5: 桥模式本地构造 BR-192 A-share Top-N request evidence (无 transport
+/// 类型依赖, magic_compat 即可)。canonical 格式与
+/// `provider_top_n_request_evidence` 完全一致, 保证两模式 request_hash 相同。
+fn provider_top_n_a_share_evidence(
+    metric: MarketRankingKind,
+    trading_date: NaiveDate,
+    capability: &'static str,
+) -> Result<ProviderTopNRequestEvidence, GatewayError> {
+    let date = iso_date(trading_date, capability)?;
+    let limit = PositiveU32::new(PROVIDER_TOP_N_LIMIT)
+        .map_err(|error| GatewayError::invalid_request(capability, error.to_string()))?;
+    let filter_identity = NonEmptyText::new(PROVIDER_TOP_N_A_SHARE_FILTER)
+        .map_err(|error| GatewayError::invalid_request(capability, error.to_string()))?;
+    let canonical = format!(
+        "metric={:?};trading_date={};limit={};filter={}",
+        metric,
+        date.as_str(),
+        limit.get(),
+        filter_identity.as_str()
+    );
+    Ok(ProviderTopNRequestEvidence {
+        metric,
+        trading_date: date,
+        limit,
+        filter_identity,
+        request_hash: acquisition_request_hash(capability, &canonical),
+    })
+}
+
+#[cfg(feature = "magic-gateway")]
 fn route_fund_flow(
     storage_code: &str,
     instrument: &InstrumentId,
@@ -475,6 +588,7 @@ fn route_fund_flow(
     admit_fund_flow_batch(storage_code, instrument, request, outcome.into_batch(), now)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn route_provider_top_n_pair(
     volume_request: ProviderTopNRankingRequest,
     volume_request_evidence: ProviderTopNRequestEvidence,
@@ -561,6 +675,7 @@ fn route_provider_top_n_pair(
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn route_provider_top_n(
     router: &EastmoneyProviderTopNRankingRouter,
     request: &ProviderTopNRankingRequest,
@@ -585,6 +700,7 @@ fn route_provider_top_n(
     )
 }
 
+#[cfg(feature = "magic-gateway")]
 fn route_northbound(
     request: &NorthboundDailyRequest,
     now: DateTime<Utc>,
@@ -612,12 +728,14 @@ fn route_northbound(
     admit_northbound_batch(request, outcome.into_batch(), now)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn strict_policy() -> AcceptancePolicy {
     AcceptancePolicy::new()
         .with_require_complete(true)
         .with_require_source_at(true)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn admit_fund_flow_batch(
     storage_code: &str,
     instrument: &InstrumentId,
@@ -731,6 +849,7 @@ fn admit_fund_flow_batch(
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn admit_provider_top_n_batch(
     request: &ProviderTopNRankingRequest,
     batch: DataBatch<ProviderTopNRankingEntry>,
@@ -790,6 +909,7 @@ fn admit_provider_top_n_batch(
     Ok(GatewayBatch::Available { records, evidence })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_provider_top_n_pair(
     volume_ratio: &GatewayBatch<ProviderTopNFact>,
     main_net_inflow: &GatewayBatch<ProviderTopNFact>,
@@ -812,6 +932,7 @@ fn validate_provider_top_n_pair(
     )
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_provider_top_n_side(
     batch: &GatewayBatch<ProviderTopNFact>,
     expected_metric: &MarketRankingKind,
@@ -860,6 +981,7 @@ fn validate_provider_top_n_side(
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn admit_northbound_batch(
     request: &NorthboundDailyRequest,
     batch: DataBatch<NorthboundDailyStat>,
@@ -962,6 +1084,7 @@ fn admit_northbound_batch(
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_batch<T>(
     capability: &'static str,
     provider: ProviderId,
@@ -1001,6 +1124,7 @@ fn validate_batch<T>(
     Ok(evidence)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_record_evidence(
     capability: &'static str,
     provider: ProviderId,
@@ -1021,6 +1145,7 @@ fn validate_record_evidence(
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_observation_freshness(
     capability: &'static str,
     provider: ProviderId,
@@ -1042,6 +1167,7 @@ fn validate_observation_freshness(
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_fund_flow_freshness(
     interval: FlowInterval,
     period_at: &str,
@@ -1100,6 +1226,7 @@ fn validate_fund_flow_freshness(
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_daily_source_freshness(
     capability: &'static str,
     provider: ProviderId,
@@ -1131,6 +1258,7 @@ fn validate_daily_source_freshness(
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn parse_observed_at(
     value: &str,
     capability: &'static str,
@@ -1166,6 +1294,7 @@ fn parse_observed_at(
         })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn source_date(
     value: Option<&str>,
     capability: &'static str,
@@ -1197,6 +1326,7 @@ fn source_date(
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn required_money(
     value: Option<crate::magic_compat::Money>,
     field: &str,
@@ -1211,6 +1341,7 @@ fn required_money(
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn required_percent(
     value: Option<crate::magic_compat::Ratio>,
     field: &str,
@@ -1233,6 +1364,7 @@ fn required_percent(
     Ok(value.get())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn a_share_instrument(
     storage_code: &str,
     capability: &'static str,
@@ -1255,6 +1387,7 @@ fn a_share_instrument(
     Ok(identity.instrument().clone())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn positive_limit(
     value: u32,
     maximum: u32,
@@ -1275,15 +1408,18 @@ fn iso_date(value: NaiveDate, capability: &'static str) -> Result<IsoDate, Gatew
         .map_err(|error| GatewayError::invalid_request(capability, error.to_string()))
 }
 
+#[cfg(feature = "magic-gateway")]
 fn parse_iso_date(value: &IsoDate, capability: &'static str) -> Result<NaiveDate, GatewayError> {
     NaiveDate::parse_from_str(value.as_str(), "%Y-%m-%d")
         .map_err(|error| GatewayError::invalid_evidence(capability, None, error.to_string()))
 }
 
+#[cfg(feature = "magic-gateway")]
 fn shanghai_offset() -> FixedOffset {
     FixedOffset::east_opt(SHANGHAI_OFFSET_SECONDS).expect("fixed Shanghai offset is valid")
 }
 
+#[cfg(feature = "magic-gateway")]
 fn classify_eastmoney_error(error: EastmoneyError) -> SourceError {
     let message = error.to_string();
     match error {
@@ -1300,6 +1436,7 @@ fn classify_eastmoney_error(error: EastmoneyError) -> SourceError {
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn classify_exchange_error(error: ExchangeError) -> SourceError {
     let message = error.to_string();
     match error {
@@ -1321,6 +1458,7 @@ fn classify_exchange_error(error: ExchangeError) -> SourceError {
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn eastmoney_gateway_error(capability: &'static str, error: EastmoneyError) -> GatewayError {
     let reason_code = error.category();
     let message = error.to_string();
@@ -1365,6 +1503,7 @@ fn eastmoney_gateway_error(capability: &'static str, error: EastmoneyError) -> G
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn provider_top_n_invalid_evidence(
     capability: &'static str,
     provider: Option<ProviderId>,
@@ -1380,6 +1519,7 @@ fn provider_top_n_invalid_evidence(
     )
 }
 
+#[cfg(feature = "magic-gateway")]
 fn provider_top_n_router_error(
     capability: &'static str,
     error: EastmoneyProviderTopNRouterError,
@@ -1453,6 +1593,7 @@ fn provider_top_n_router_error(
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 async fn audit_provider_top_n_join_failure(
     volume_request_hash: String,
     inflow_request_hash: String,
@@ -1485,6 +1626,7 @@ async fn audit_provider_top_n_join_failure(
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn exchange_gateway_error(capability: &'static str, error: ExchangeError) -> GatewayError {
     let message = error.to_string();
     match error {
@@ -1531,6 +1673,7 @@ fn exchange_gateway_error(capability: &'static str, error: ExchangeError) -> Gat
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn router_gateway_error(
     capability: &'static str,
     provider: ProviderId,
@@ -1570,7 +1713,7 @@ fn router_gateway_error(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "magic-gateway"))]
 mod tests {
     use super::{
         a_share_instrument, admit_fund_flow_batch, admit_northbound_batch,

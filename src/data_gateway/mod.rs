@@ -47,8 +47,11 @@ pub use capital::{
     NorthboundTopTurnoverFact, ProviderTopNFact, ProviderTopNPair, ProviderTopNRequestEvidence,
 };
 pub use chain_intelligence::{
-    build_chain_intelligence_batch, BoardMembershipFact, ChainIntelligenceGateway,
     ChainIntelligencePolicy, ChainSourceEvidence, ChainSourceRejection, UpperLimitFact,
+};
+#[cfg(feature = "magic-gateway")]
+pub use chain_intelligence::{
+    build_chain_intelligence_batch, BoardMembershipFact, ChainIntelligenceGateway,
 };
 pub use company::CompanyDataGateway;
 pub use consensus::ConsensusDataGateway;

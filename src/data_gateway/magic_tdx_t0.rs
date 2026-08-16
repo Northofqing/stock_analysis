@@ -7,7 +7,9 @@
 //! Business rules: BR-092, BR-151, BR-153, BR-171, BR-187.
 
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
+#[cfg(feature = "magic-gateway")]
+use chrono::TimeZone;
 use crate::magic_compat::InstrumentId;
 #[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::protocol::constants::{fq_type, KLINE_5MIN, KLINE_DAILY};
@@ -18,7 +20,9 @@ use magic_tdx_rs::TdxHqClient;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
+#[cfg(feature = "magic-gateway")]
+use std::sync::Arc;
 
 use super::instrument_identity::{resolve_production_equity, EquitySegment};
 
@@ -242,7 +246,7 @@ pub fn validate_quote_freshness(
     let cached = last_t0_quotes()
         .lock()
         .ok()
-        .and_then(|mut cache| cache.get(code).copied());
+        .and_then(|cache| cache.get(code).copied());
     let Some((last_price, last_source_at)) = cached else {
         // 首次见 code: 播种接受 —— 无锚点则缓存永远为空（8/12 死锁实证）。
         // 出声（warn）——例外放行必须可见（v15.x 规则 4）。
@@ -343,6 +347,7 @@ fn normalized_identity(code: &str) -> Result<T0RequestIdentity> {
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_quote_identities(
     identities: &[T0RequestIdentity],
     quotes: &[SecurityQuote],
@@ -369,6 +374,7 @@ fn validate_quote_identities(
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn source_time(
     raw: &str,
     observed_at: DateTime<Utc>,
@@ -398,6 +404,7 @@ fn source_time(
         })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn normalize_book(
     code: &str,
     quote: &SecurityQuote,
@@ -488,6 +495,7 @@ fn validate_book_levels(
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn normalize_quote(
     code: &str,
     quote: &SecurityQuote,
@@ -527,6 +535,7 @@ fn normalize_quote(
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn daily_from_raw(
     code: &str,
     bar: SecurityBar,
@@ -631,6 +640,7 @@ pub fn validate_settled_daily(
     Ok(bars)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn five_minute_from_raw(
     code: &str,
     bar: SecurityBar,
@@ -801,6 +811,7 @@ pub fn validate_five_minute_bars(
     Ok(bars)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn normalize_intraday_average(
     code: &str,
     minute: Vec<MinuteTimePrice>,
@@ -833,6 +844,7 @@ fn normalize_intraday_average(
     Ok(average)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn evidence_for_quote(
     client: &TdxHqClient,
     identity: &T0RequestIdentity,
@@ -1035,6 +1047,7 @@ fn finalize_t0_batch(
 }
 
 /// 生产入口: 以当前墙钟作为观测时刻。
+#[cfg(feature = "magic-gateway")]
 pub fn fetch_magic_tdx_t0_batch(
     codes: &[String],
     requested_at: DateTime<Utc>,
@@ -1056,6 +1069,7 @@ pub fn fetch_magic_tdx_t0_batch(
 ///
 /// pub(super): data_gateway 内共享 — R-12 盘后回测 (historical_bars::fifteen_min_bars)
 /// 复用同一连接, 避免盘后 60 只票回测各建一条 TCP。
+#[cfg(feature = "magic-gateway")]
 pub(super) fn cached_tdx_hq_client() -> Result<Arc<TdxHqClient>> {
     static CACHE: OnceLock<Mutex<Option<Arc<TdxHqClient>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(None));
@@ -1074,6 +1088,7 @@ pub(super) fn cached_tdx_hq_client() -> Result<Arc<TdxHqClient>> {
     Ok(client)
 }
 
+#[cfg(feature = "magic-gateway")]
 pub fn fetch_magic_tdx_t0_batch_with_clock(
     codes: &[String],
     requested_at: DateTime<Utc>,
@@ -1148,6 +1163,7 @@ pub fn fetch_magic_tdx_t0_batch_with_clock(
 }
 
 #[cfg(test)]
+#[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
 

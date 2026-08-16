@@ -7,12 +7,17 @@
 //! under the five-second freshness rule and continues to the next Magic
 //! provider. No consumer-owned HTTP or legacy parser is retained.
 
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveTime, Utc};
-#[cfg(test)]
+use chrono::{DateTime, NaiveDate, Utc};
+#[cfg(feature = "magic-gateway")]
+use chrono::{FixedOffset, NaiveTime};
+#[cfg(all(test, feature = "magic-gateway"))]
 use crate::magic_compat::Exchange;
-use crate::magic_compat::{AssetClass, InstrumentId, ProviderId, RatioUnit};
+#[cfg(feature = "magic-gateway")]
+use crate::magic_compat::{AssetClass, InstrumentId, RatioUnit};
+use crate::magic_compat::ProviderId;
 #[cfg(feature = "magic-gateway")]
 use magic_market_core::{DataStatus, Quote};
+#[cfg(feature = "magic-gateway")]
 use magic_market_router::{
     quote_source, AcceptancePolicy, AttemptStatus, FailureKind, QuoteRouter, RouterError,
     SourceError,
@@ -23,9 +28,12 @@ use magic_sina_rs::{SinaClient, SinaError};
 use magic_tdx_rs::{TdxError, TdxSmartClient};
 #[cfg(feature = "magic-gateway")]
 use magic_tencent_rs::{TencentClient, TencentError};
+#[cfg(feature = "magic-gateway")]
 use std::collections::{HashMap, HashSet};
+#[cfg(feature = "magic-gateway")]
 use std::sync::{Arc, Mutex, OnceLock};
 
+#[cfg(feature = "magic-gateway")]
 use super::instrument_identity::{resolve_production_equity, EquitySegment};
 use super::parse_evidence_instant;
 use super::review::{
@@ -100,7 +108,7 @@ impl AdmittedRealtimeQuote {
 
     /// Pure test seam. This symbol is absent from production builds and keeps
     /// test/live identities physically distinct.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "magic-gateway"))]
     pub(crate) fn from_test_fixture(
         record: RealtimeMarketQuote,
         evidence: BatchEvidence,
@@ -214,24 +222,40 @@ impl MarketDataGateway {
                 return audit_gateway_result(CAPABILITY, ProviderId::Tdx, &request_hash, Err(error));
             }
         }
-        let instruments = match build_instruments(codes) {
-            Ok(instruments) => instruments,
-            Err(error) => {
-                return audit_gateway_result(
-                    CAPABILITY,
-                    ProviderId::Tdx,
-                    &request_hash,
-                    Err(error),
-                );
-            }
-        };
+        // P4 M5: no-feature 构建不携带 library transport, 无桥时显式失败
+        // (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
+                CAPABILITY,
+                Some(ProviderId::Tdx),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let instruments = match build_instruments(codes) {
+                Ok(instruments) => instruments,
+                Err(error) => {
+                    return audit_gateway_result(
+                        CAPABILITY,
+                        ProviderId::Tdx,
+                        &request_hash,
+                        Err(error),
+                    );
+                }
+            };
 
-        let (terminal_provider, result) = route_quotes(
-            codes,
-            &instruments,
-            QuoteAdmissionMode::RealtimeFiveSecond,
-        );
-        audit_gateway_result(CAPABILITY, terminal_provider, &request_hash, result)
+            let (terminal_provider, result) = route_quotes(
+                codes,
+                &instruments,
+                QuoteAdmissionMode::RealtimeFiveSecond,
+            );
+            audit_gateway_result(CAPABILITY, terminal_provider, &request_hash, result)
+        }
     }
 
     /// Acquire a non-empty batch whose quote projections cannot be detached
@@ -262,27 +286,46 @@ impl MarketDataGateway {
         codes: &[String],
         trading_date: NaiveDate,
     ) -> Result<GatewayBatch<RealtimeMarketQuote>, GatewayError> {
-        let request_hash = acquisition_request_hash(
-            CAPABILITY,
-            &format!("settled:{trading_date}:{}", codes.join(",")),
-        );
-        let instruments = match build_instruments(codes) {
-            Ok(instruments) => instruments,
-            Err(error) => {
-                return audit_gateway_result(
-                    CAPABILITY,
-                    ProviderId::Tdx,
-                    &request_hash,
-                    Err(error),
-                );
-            }
-        };
-        let (terminal_provider, result) = route_quotes(
-            codes,
-            &instruments,
-            QuoteAdmissionMode::SettledClose { trading_date },
-        );
-        audit_gateway_result(CAPABILITY, terminal_provider, &request_hash, result)
+        // P4 M5: 无 gRPC 桥 op + no-feature 构建不携带 library transport →
+        // 显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            // 参数仅被 library transport (feature 模式) 消费; 显式引用以消除
+            // no-feature 构建的 unused 警告, 行为不变 (fail-closed)。
+            let _ = (codes, trading_date);
+            return Err(GatewayError::classified(
+                CAPABILITY,
+                Some(ProviderId::Tdx),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let request_hash = acquisition_request_hash(
+                CAPABILITY,
+                &format!("settled:{trading_date}:{}", codes.join(",")),
+            );
+            let instruments = match build_instruments(codes) {
+                Ok(instruments) => instruments,
+                Err(error) => {
+                    return audit_gateway_result(
+                        CAPABILITY,
+                        ProviderId::Tdx,
+                        &request_hash,
+                        Err(error),
+                    );
+                }
+            };
+            let (terminal_provider, result) = route_quotes(
+                codes,
+                &instruments,
+                QuoteAdmissionMode::SettledClose { trading_date },
+            );
+            audit_gateway_result(CAPABILITY, terminal_provider, &request_hash, result)
+        }
     }
 }
 
@@ -326,6 +369,7 @@ fn validate_admitted_projection(
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn build_instruments(codes: &[String]) -> Result<Vec<InstrumentId>, GatewayError> {
     if codes.is_empty() {
         return Err(GatewayError::invalid_request(
@@ -348,6 +392,7 @@ fn build_instruments(codes: &[String]) -> Result<Vec<InstrumentId>, GatewayError
         .collect()
 }
 
+#[cfg(feature = "magic-gateway")]
 fn build_instrument(storage_code: &str) -> Result<InstrumentId, GatewayError> {
     #[cfg(test)]
     let identity = if storage_code.starts_with("TEST_CODE_") {
@@ -397,12 +442,14 @@ fn build_instrument(storage_code: &str) -> Result<InstrumentId, GatewayError> {
 /// so it stays in [`admit_quote_batch`]. To keep that gate from terminating
 /// the whole acquisition, each provider is routed on its own and a retryable
 /// admission failure falls over to the next one instead of aborting.
+#[cfg(feature = "magic-gateway")]
 fn realtime_quote_acceptance_policy() -> AcceptancePolicy {
     AcceptancePolicy::new()
         .with_require_complete(true)
         .with_require_source_at(true)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn route_quotes(
     storage_codes: &[String],
     instruments: &[InstrumentId],
@@ -488,23 +535,29 @@ fn route_quotes(
 
 /// BR-217: failover order for realtime quotes. Magic TDX stays the first
 /// A-share route candidate; the HTTP providers behind it are fallbacks only.
+#[cfg(feature = "magic-gateway")]
 const QUOTE_PROVIDER_CHAIN: [ProviderId; 3] =
     [ProviderId::Tdx, ProviderId::Tencent, ProviderId::Sina];
 
 /// BR-219: consecutive failures before a proven-dead provider is skipped.
+#[cfg(feature = "magic-gateway")]
 const QUOTE_BREAKER_FAILURE_THRESHOLD: u32 = 3;
 /// BR-219: how long a tripped provider stays skipped before it is retried
 /// (level 0 的初始冷却)。
+#[cfg(feature = "magic-gateway")]
 const QUOTE_BREAKER_COOLDOWN_SECS: i64 = 300;
 /// BR-219 退避: 冷却 = 300s × 3^level, 封顶 45 分钟。结构性失败 (如 TDX
 /// 免费主站 servertime 滞后 6-63s 恒超 5s 门, 2026-08-11 全天每 5 分钟
 /// 白试 3 次) 下固定 300s 冷却 = 每 5 分钟全量重连一次全失败; 指数退避
 /// 让重试频率随连败增长, 把重试预算留给可能恢复的瞬时故障。
+#[cfg(feature = "magic-gateway")]
 const QUOTE_BREAKER_COOLDOWN_MAX_SECS: i64 = 2700;
 /// BR-219 退避级别上限: 300s → 900s → 2700s 后不再增长。
+#[cfg(feature = "magic-gateway")]
 const QUOTE_BREAKER_BACKOFF_MAX_LEVEL: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Default)]
+#[cfg(feature = "magic-gateway")]
 struct QuoteBreakerState {
     consecutive_failures: u32,
     opened_at: Option<DateTime<Utc>>,
@@ -516,6 +569,7 @@ struct QuoteBreakerState {
 }
 
 /// BR-219: 退避级别对应的冷却时长 (秒)。
+#[cfg(feature = "magic-gateway")]
 fn breaker_cooldown_secs(level: u32) -> i64 {
     let exponent = level.min(QUOTE_BREAKER_BACKOFF_MAX_LEVEL);
     QUOTE_BREAKER_COOLDOWN_SECS
@@ -523,6 +577,7 @@ fn breaker_cooldown_secs(level: u32) -> i64 {
         .min(QUOTE_BREAKER_COOLDOWN_MAX_SECS)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn quote_breakers() -> &'static Mutex<HashMap<ProviderId, QuoteBreakerState>> {
     static BREAKERS: OnceLock<Mutex<HashMap<ProviderId, QuoteBreakerState>>> = OnceLock::new();
     BREAKERS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -534,6 +589,7 @@ fn quote_breakers() -> &'static Mutex<HashMap<ProviderId, QuoteBreakerState>> {
 /// turns an unattempted provider into a successful or empty one. If the whole
 /// chain is tripped the skip set is discarded so that a transient outage can
 /// never escalate into permanently not acquiring anything.
+#[cfg(feature = "magic-gateway")]
 fn quote_breaker_skips(now: DateTime<Utc>) -> HashSet<ProviderId> {
     let mut guard = match quote_breakers().lock() {
         Ok(guard) => guard,
@@ -573,6 +629,7 @@ fn quote_breaker_skips(now: DateTime<Utc>) -> HashSet<ProviderId> {
     skips
 }
 
+#[cfg(feature = "magic-gateway")]
 fn record_quote_provider_success(provider: ProviderId) {
     let mut guard = match quote_breakers().lock() {
         Ok(guard) => guard,
@@ -581,6 +638,7 @@ fn record_quote_provider_success(provider: ProviderId) {
     guard.insert(provider, QuoteBreakerState::default());
 }
 
+#[cfg(feature = "magic-gateway")]
 fn record_quote_provider_failure(provider: ProviderId, now: DateTime<Utc>) {
     let mut guard = match quote_breakers().lock() {
         Ok(guard) => guard,
@@ -615,6 +673,7 @@ fn record_quote_provider_failure(provider: ProviderId, now: DateTime<Utc>) {
 ///   下轮重建重试。
 /// 断线自愈由上游负责 (Tdx 切换服务器 / HTTP client 无状态), 本项目侧不感知
 /// 连接生命周期; 请求失败仍按原 fail-closed + breaker 语义处理。
+#[cfg(feature = "magic-gateway")]
 fn cached_tdx_smart_client() -> Arc<TdxSmartClient> {
     static CACHE: OnceLock<Mutex<Option<Arc<TdxSmartClient>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(None));
@@ -627,6 +686,7 @@ fn cached_tdx_smart_client() -> Arc<TdxSmartClient> {
         .clone()
 }
 
+#[cfg(feature = "magic-gateway")]
 fn cached_tencent_client() -> Result<Arc<TencentClient>, String> {
     static CACHE: OnceLock<Mutex<Option<Arc<TencentClient>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(None));
@@ -645,6 +705,7 @@ fn cached_tencent_client() -> Result<Arc<TencentClient>, String> {
     Ok(client)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn cached_sina_client() -> Result<Arc<SinaClient>, String> {
     static CACHE: OnceLock<Mutex<Option<Arc<SinaClient>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(None));
@@ -663,6 +724,7 @@ fn cached_sina_client() -> Result<Arc<SinaClient>, String> {
     Ok(client)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn quote_chain_source(
     provider: ProviderId,
 ) -> Result<magic_market_router::SourceFn<[InstrumentId], magic_market_core::Quote>, RouterError> {
@@ -695,15 +757,18 @@ fn quote_chain_source(
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 const SHANGHAI_OFFSET_SECONDS: i32 = 8 * 60 * 60;
 
 /// BR-236 (2026-08-12): 午休/盘后静态快照放行的节流状态 — 每个 (北京日期,
 /// 会话) 首次放行 warn 一次, 后续 debug。盘后 9 小时 ≈ 540 批次, 逐批
 /// warn 会刷屏; v15.x 规则要求出声, 会话级一次即满足。
+#[cfg(feature = "magic-gateway")]
 static OFF_SESSION_WARN_STATE: OnceLock<Mutex<Option<(NaiveDate, bool)>>> = OnceLock::new();
 
 /// BR-236: 北京时间午休 [11:30, 13:00) 或盘后 [15:00, 24:00)。
 /// 与 machine 时区解耦 (显式 +08, company.rs:29 同款), 测试确定性强。
+#[cfg(feature = "magic-gateway")]
 fn in_lunch_or_after_hours(now: DateTime<Utc>) -> bool {
     let t = now
         .with_timezone(&FixedOffset::east_opt(SHANGHAI_OFFSET_SECONDS).expect("+08 offset"))
@@ -716,6 +781,7 @@ fn in_lunch_or_after_hours(now: DateTime<Utc>) -> bool {
 /// BR-236: 超龄 quote 在午休/盘后且 source_at 与 now 同为今日北京时间 →
 /// 当日最后成交价 = 合法静态快照 (BR-233 同源语义, 非实时价)。盘中/盘前
 /// (source_at 为上一交易日) 一律 false → 维持 BR-218 5s 红线。
+#[cfg(feature = "magic-gateway")]
 fn off_session_static_quote_eligible(now: DateTime<Utc>, source_at: DateTime<Utc>) -> bool {
     if !in_lunch_or_after_hours(now) {
         return false;
@@ -724,6 +790,7 @@ fn off_session_static_quote_eligible(now: DateTime<Utc>, source_at: DateTime<Utc
     now.with_timezone(&zone).date_naive() == source_at.with_timezone(&zone).date_naive()
 }
 
+#[cfg(feature = "magic-gateway")]
 fn admit_quote_batch(
     storage_codes: &[String],
     provider: ProviderId,
@@ -734,6 +801,7 @@ fn admit_quote_batch(
 }
 
 /// BR-236: `now` 注入版 — 测试可固定时钟; 生产入口是 [`admit_quote_batch`]。
+#[cfg(feature = "magic-gateway")]
 fn admit_quote_batch_at(
     now: DateTime<Utc>,
     storage_codes: &[String],
@@ -961,6 +1029,7 @@ fn admit_quote_batch_at(
     Ok(GatewayBatch::Available { records, evidence })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn router_gateway_error(error: RouterError, provider: ProviderId) -> GatewayError {
     let attempts = error
         .attempts()
@@ -1003,6 +1072,7 @@ fn router_gateway_error(error: RouterError, provider: ProviderId) -> GatewayErro
     )
 }
 
+#[cfg(feature = "magic-gateway")]
 fn classify_tdx_error(error: TdxError) -> SourceError {
     let message = error.to_string();
     match error {
@@ -1034,6 +1104,7 @@ fn classify_tdx_error(error: TdxError) -> SourceError {
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn classify_tencent_error(error: TencentError) -> SourceError {
     let message = error.to_string();
     match error {
@@ -1047,6 +1118,7 @@ fn classify_tencent_error(error: TencentError) -> SourceError {
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn classify_sina_error(error: SinaError) -> SourceError {
     let message = error.to_string();
     match error {
@@ -1060,7 +1132,7 @@ fn classify_sina_error(error: SinaError) -> SourceError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "magic-gateway"))]
 mod tests {
     use super::*;
     use crate::magic_compat::{DataBatch, Money, Price, Provenance, Quantity, Ratio, SourceEvidence};

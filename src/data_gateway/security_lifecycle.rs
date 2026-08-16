@@ -6,12 +6,21 @@
 //! admitted only with exact request coverage and complete, ordered evidence;
 //! only source-published `Implemented` actions are projected.
 
-use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone, Utc};
-#[cfg(test)]
-use crate::magic_compat::Exchange;
-use crate::magic_compat::{AssetClass, DataBatch, InstrumentId, IsoDate, ProviderId, SourceEvidence};
+use chrono::NaiveDate;
 #[cfg(feature = "magic-gateway")]
-use magic_market_core::{CorporateAction, CorporateActionCategory, CorporateActionRequest, CorporateActionResponse, CorporateActionStatus, CorporateActionTerms, CorporateActions, SecurityMetadata, SecurityMetadataProvider};
+use chrono::{DateTime, FixedOffset, TimeZone, Utc};
+#[cfg(all(test, feature = "magic-gateway"))]
+use crate::magic_compat::Exchange;
+use crate::magic_compat::{
+    AssetClass, CorporateActionCategory, CorporateActionTerms, InstrumentId, ProviderId,
+};
+#[cfg(feature = "magic-gateway")]
+use crate::magic_compat::{CorporateActionStatus, DataBatch, IsoDate, SourceEvidence};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{
+    CorporateAction, CorporateActionRequest, CorporateActionResponse, CorporateActions,
+    SecurityMetadata, SecurityMetadataProvider,
+};
 #[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::{TdxError, TdxSmartClient};
 use serde::Serialize;
@@ -19,9 +28,10 @@ use sha2::{Digest, Sha256};
 
 use super::instrument_identity::{resolve_production_equity, EquitySegment};
 use super::review::{
-    acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result, BatchEvidence,
-    GatewayBatch, GatewayError,
+    acquisition_request_hash, audit_gateway_result, BatchEvidence, GatewayBatch, GatewayError,
 };
+#[cfg(feature = "magic-gateway")]
+use super::review::audit_blocking_join_failure;
 use super::MarketSecurityMetadata;
 
 const LIFECYCLE_CAPABILITY: &str = "SecurityLifecycle";
@@ -255,10 +265,8 @@ impl SecurityLifecycleGateway {
     ) -> Result<SecurityLifecycleContext, GatewayError> {
         let code = code.to_owned();
         let canonical = format!("{code}:{window_start}:{window_end}");
-        let lifecycle_hash = acquisition_request_hash(LIFECYCLE_CAPABILITY, &canonical);
         let listing_hash = acquisition_request_hash(LISTING_CAPABILITY, &canonical);
         let actions_hash = acquisition_request_hash(ACTIONS_CAPABILITY, &canonical);
-        let worker_lifecycle_hash = lifecycle_hash.clone();
 
         // P4 M4b 批次 1B: grpc 模式走桥 (服务端 SecurityLifecycleGateway 直连)。
         // 本地验证先行复制 (fail-fast, 与 acquire_blocking 语义一致):
@@ -307,34 +315,53 @@ impl SecurityLifecycleGateway {
             }
         }
 
-        let joined = tokio::task::spawn_blocking(move || {
-            acquire_blocking(code, window_start, window_end, listing_hash, actions_hash)
-        })
-        .await;
+        // no-feature (monitor 零 magic 构建): library transport 编译期不存在。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
+                LIFECYCLE_CAPABILITY,
+                Some(ProviderId::Tdx),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let lifecycle_hash = acquisition_request_hash(LIFECYCLE_CAPABILITY, &canonical);
+            let worker_lifecycle_hash = lifecycle_hash.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                acquire_blocking(code, window_start, window_end, listing_hash, actions_hash)
+            })
+            .await;
 
-        match joined {
-            Ok(result) => result,
-            Err(error) => {
-                match audit_blocking_join_failure::<()>(
-                    LIFECYCLE_CAPABILITY,
-                    ProviderId::Tdx,
-                    worker_lifecycle_hash,
-                    error.to_string(),
-                )
-                .await
-                {
-                    Err(error) => Err(error),
-                    Ok(_) => Err(GatewayError::invalid_evidence(
+            match joined {
+                Ok(result) => result,
+                Err(error) => {
+                    match audit_blocking_join_failure::<()>(
                         LIFECYCLE_CAPABILITY,
-                        Some(ProviderId::Tdx),
-                        "blocking join failure unexpectedly produced an available batch",
-                    )),
+                        ProviderId::Tdx,
+                        worker_lifecycle_hash,
+                        error.to_string(),
+                    )
+                    .await
+                    {
+                        Err(error) => Err(error),
+                        Ok(_) => Err(GatewayError::invalid_evidence(
+                            LIFECYCLE_CAPABILITY,
+                            Some(ProviderId::Tdx),
+                            "blocking join failure unexpectedly produced an available batch",
+                        )),
+                    }
                 }
             }
         }
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn acquire_blocking(
     code: String,
     window_start: NaiveDate,
@@ -385,6 +412,7 @@ struct ListingProjection {
     listed_on: Option<NaiveDate>,
 }
 
+#[cfg(feature = "magic-gateway")]
 fn admit_listing_metadata(
     instrument: &InstrumentId,
     batch: DataBatch<SecurityMetadata>,
@@ -519,6 +547,7 @@ fn listing_state(
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn admit_corporate_actions(
     request: &CorporateActionRequest,
     response: &CorporateActionResponse,
@@ -561,6 +590,7 @@ fn admit_corporate_actions(
     Ok(GatewayBatch::Available { records, evidence })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_action_batch(
     request: &CorporateActionRequest,
     response: &CorporateActionResponse,
@@ -574,6 +604,7 @@ fn validate_action_batch(
     )
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_action_parts(
     request: &CorporateActionRequest,
     response_evidence: &SourceEvidence,
@@ -673,6 +704,7 @@ fn validate_action_parts(
     Ok(evidence)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn project_implemented_action(
     record: &CorporateAction,
 ) -> Result<ImplementedCorporateAction, GatewayError> {
@@ -754,6 +786,7 @@ fn build_instrument(code: &str) -> Result<InstrumentId, GatewayError> {
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn build_action_request(
     instrument: InstrumentId,
     start: NaiveDate,
@@ -768,6 +801,7 @@ fn build_action_request(
         .map_err(|error| GatewayError::invalid_request(ACTIONS_CAPABILITY, error.to_string()))
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_observation_timestamp(
     capability: &'static str,
     observed_at: &str,
@@ -805,6 +839,7 @@ fn validate_observation_timestamp(
         .ok_or_else(invalid)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn parse_request_date(field: &str, value: &IsoDate) -> Result<NaiveDate, GatewayError> {
     parse_iso_date(value.as_str()).map_err(|error| {
         GatewayError::invalid_request(
@@ -814,6 +849,7 @@ fn parse_request_date(field: &str, value: &IsoDate) -> Result<NaiveDate, Gateway
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn parse_record_date(field: &str, value: &IsoDate) -> Result<NaiveDate, GatewayError> {
     parse_iso_date(value.as_str()).map_err(|error| {
         GatewayError::invalid_evidence(
@@ -824,10 +860,12 @@ fn parse_record_date(field: &str, value: &IsoDate) -> Result<NaiveDate, GatewayE
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn parse_iso_date(value: &str) -> Result<NaiveDate, chrono::ParseError> {
     NaiveDate::parse_from_str(value, "%Y-%m-%d")
 }
 
+#[cfg(feature = "magic-gateway")]
 fn current_china_date() -> Result<NaiveDate, GatewayError> {
     let offset = FixedOffset::east_opt(8 * 60 * 60).ok_or_else(|| {
         GatewayError::invalid_request(
@@ -838,6 +876,7 @@ fn current_china_date() -> Result<NaiveDate, GatewayError> {
     Ok(Utc::now().with_timezone(&offset).date_naive())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn tdx_gateway_error(capability: &'static str, error: TdxError) -> GatewayError {
     let message = error.to_string();
     match error {
@@ -895,11 +934,11 @@ fn tdx_gateway_error(capability: &'static str, error: TdxError) -> GatewayError 
 }
 
 #[cfg(test)]
+#[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
     use crate::magic_compat::{FiniteNumber, Provenance, SourceEvidence};
-#[cfg(feature = "magic-gateway")]
-use magic_market_core::{DataStatus, PriceLimitRule};
+    use magic_market_core::{DataStatus, PriceLimitRule};
 
     const OBSERVED_AT: &str = "2026-07-27T01:00:00Z";
     const BATCH_ID: &str = "TEST_CODE_lifecycle_batch";

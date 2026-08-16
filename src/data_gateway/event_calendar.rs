@@ -1,18 +1,28 @@
 //! BR-161 evidence-preserving R-08 event-calendar acquisition.
 
-use super::review::{acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result};
-use super::{BatchEvidence, GatewayBatch, GatewayError};
+use super::review::{acquisition_request_hash, audit_gateway_result};
+#[cfg(feature = "magic-gateway")]
+use super::review::audit_blocking_join_failure;
+use super::GatewayBatch;
+#[cfg(feature = "magic-gateway")]
+use super::BatchEvidence;
+use super::GatewayError;
 use chrono::{DateTime, NaiveDate, Utc};
 #[cfg(feature = "magic-gateway")]
 use magic_cninfo_rs::{CninfoClient, CninfoError};
-use crate::magic_compat::{DataBatch, IsoDate, PositiveU32, ProviderId};
+use crate::magic_compat::ProviderId;
+#[cfg(feature = "magic-gateway")]
+use crate::magic_compat::{DataBatch, IsoDate, PositiveU32};
 #[cfg(feature = "magic-gateway")]
 use magic_market_core::{Announcement as CoreAnnouncement, MarketAnnouncementRequest};
+#[cfg(feature = "magic-gateway")]
 use magic_market_router::{
     market_announcement_source, AcceptancePolicy, AttemptStatus, FailureKind,
     MarketAnnouncementRouter, RouterError, SourceError,
 };
+#[cfg(feature = "magic-gateway")]
 use std::collections::HashSet;
+#[cfg(feature = "magic-gateway")]
 use std::sync::Arc;
 
 const CAPABILITY: &str = "R-08-announcements";
@@ -59,40 +69,57 @@ impl EventCalendarGateway {
                 return audit_gateway_result(CAPABILITY, ProviderId::Cninfo, &request_hash, Err(error));
             }
         }
-        let worker_request_hash = request_hash.clone();
-        let joined = tokio::task::spawn_blocking(move || {
-            let result = build_request(trading_date, limit)
-                .and_then(|request| fetch_and_admit_cninfo_batch(&request, trading_date));
-            audit_gateway_result(CAPABILITY, ProviderId::Cninfo, &worker_request_hash, result)
-        })
-        .await;
+        // no-feature (monitor 零 magic): library transport 不存在。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
+                CAPABILITY,
+                Some(ProviderId::Cninfo),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let worker_request_hash = request_hash.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let result = build_request(trading_date, limit)
+                    .and_then(|request| fetch_and_admit_cninfo_batch(&request, trading_date));
+                audit_gateway_result(CAPABILITY, ProviderId::Cninfo, &worker_request_hash, result)
+            })
+            .await;
 
-        match joined {
-            Ok(result) => {
-                let batch = result?;
-                // BR-216: a completed announcement poll proves the News source
-                // is alive. A legitimately empty batch still counts as success;
-                // only failed acquisitions skip the marker, so freshness is
-                // never fabricated.
-                crate::monitor::data_mode::mark_capability_success(
-                    crate::monitor::data_mode::Capability::News,
-                )
-                .map_err(|error| GatewayError::unavailable(CAPABILITY, None, false, error))?;
-                Ok(batch)
-            }
-            Err(error) => {
-                audit_blocking_join_failure(
-                    CAPABILITY,
-                    ProviderId::Cninfo,
-                    request_hash,
-                    error.to_string(),
-                )
-                .await
+            match joined {
+                Ok(result) => {
+                    let batch = result?;
+                    // BR-216: a completed announcement poll proves the News source
+                    // is alive. A legitimately empty batch still counts as success;
+                    // only failed acquisitions skip the marker, so freshness is
+                    // never fabricated.
+                    crate::monitor::data_mode::mark_capability_success(
+                        crate::monitor::data_mode::Capability::News,
+                    )
+                    .map_err(|error| GatewayError::unavailable(CAPABILITY, None, false, error))?;
+                    Ok(batch)
+                }
+                Err(error) => {
+                    audit_blocking_join_failure(
+                        CAPABILITY,
+                        ProviderId::Cninfo,
+                        request_hash,
+                        error.to_string(),
+                    )
+                    .await
+                }
             }
         }
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn build_request(
     trading_date: NaiveDate,
     limit: u32,
@@ -108,6 +135,7 @@ fn build_request(
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn fetch_and_admit_cninfo_batch(
     request: &MarketAnnouncementRequest,
     trading_date: NaiveDate,
@@ -137,6 +165,7 @@ fn fetch_and_admit_cninfo_batch(
     admit_cninfo_market_batch(outcome.into_batch(), &trading_date.to_string())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn admit_cninfo_market_batch(
     batch: DataBatch<CoreAnnouncement>,
     requested_date: &str,
@@ -239,6 +268,7 @@ fn admit_cninfo_market_batch(
     Ok(GatewayBatch::Available { records, evidence })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn cninfo_gateway_error(error: CninfoError) -> GatewayError {
     let message = error.to_string();
     match error {
@@ -283,6 +313,7 @@ fn cninfo_gateway_error(error: CninfoError) -> GatewayError {
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn classify_cninfo_source_error(error: CninfoError) -> SourceError {
     let message = error.to_string();
     match error {
@@ -301,6 +332,7 @@ fn classify_cninfo_source_error(error: CninfoError) -> SourceError {
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn gateway_router_error(provider: Option<ProviderId>, error: RouterError) -> GatewayError {
     let terminal_kind = error
         .attempts()
@@ -377,6 +409,7 @@ fn parse_observed_at(value: &str) -> Result<DateTime<Utc>, GatewayError> {
 }
 
 #[cfg(test)]
+#[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
     use crate::magic_compat::{AssetClass, DataBatch, Exchange, InstrumentId, NonEmptyText, Provenance, ProviderId, SourceEvidence};

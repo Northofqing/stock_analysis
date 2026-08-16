@@ -9,14 +9,19 @@
 //! that source and permits the next registered source. No field is filled or
 //! estimated at this boundary.
 
-use chrono::{Local, NaiveDate};
+use chrono::NaiveDate;
+#[cfg(feature = "magic-gateway")]
+use chrono::Local;
 #[cfg(feature = "magic-gateway")]
 use magic_baidu_rs::{BaiduClient, BaiduError};
-#[cfg(test)]
+#[cfg(all(test, feature = "magic-gateway"))]
 use crate::magic_compat::Exchange;
-use crate::magic_compat::{AssetClass, DataBatch, InstrumentId, ProviderId};
+use crate::magic_compat::ProviderId;
+#[cfg(feature = "magic-gateway")]
+use crate::magic_compat::{AssetClass, DataBatch, InstrumentId};
 #[cfg(feature = "magic-gateway")]
 use magic_market_core::{Adjustment, Bar, BarInterval, BarsRequest, HistoricalBars};
+#[cfg(feature = "magic-gateway")]
 use magic_market_router::{
     AcceptancePolicy, AttemptStatus, BarsRouter, FailureKind, RouterError, SourceError, SourceFn,
 };
@@ -29,25 +34,31 @@ use crate::magic_compat::SecurityBar;
 use magic_tdx_rs::{TdxError, TdxSmartClient};
 #[cfg(feature = "magic-gateway")]
 use magic_tencent_rs::{TencentClient, TencentError};
+#[cfg(feature = "magic-gateway")]
 use std::sync::Arc;
 
-use crate::data_provider::{AdjustType, KlineData};
+use crate::data_provider::KlineData;
+#[cfg(feature = "magic-gateway")]
+use crate::data_provider::AdjustType;
 use crate::database::daily_change_confirmation::DailyChangeConfirmationQuery;
 use crate::database::DatabaseManager;
+use crate::monitor::data_quality::{AdjacentDailyChange, MAX_UNCONFIRMED_ADJACENT_DAILY_CHANGE_PCT};
+#[cfg(feature = "magic-gateway")]
 use crate::monitor::data_quality::{
     validate_daily_freshness, validate_daily_kline_quality_with_confirmation,
-    validate_daily_kline_structure, AdjacentDailyChange, DqStats, FreshnessConfig,
-    MAX_UNCONFIRMED_ADJACENT_DAILY_CHANGE_PCT,
+    validate_daily_kline_structure, DqStats, FreshnessConfig,
 };
 
+#[cfg(feature = "magic-gateway")]
 use super::instrument_identity::{resolve_production_equity, EquitySegment};
 use super::review::{
     acquisition_request_hash, audit_gateway_result, BatchEvidence, GatewayBatch, GatewayError,
 };
 use super::security_lifecycle::{
     CorporateActionState, LifecycleConfirmationEvidence, ListingDateState,
-    SecurityLifecycleContext, SecurityLifecycleGateway,
+    SecurityLifecycleGateway,
 };
+use super::security_lifecycle::SecurityLifecycleContext;
 
 const CAPABILITY: &str = "HistoricalDailyBars";
 
@@ -229,40 +240,56 @@ impl HistoricalBarsGateway {
                 return Err(GatewayError::unavailable(CAPABILITY, None, true, error.to_string()));
             }
         }
-        let market = if code.starts_with('6') { 1u8 } else { 0u8 };
-        let client = super::magic_tdx_t0::cached_tdx_hq_client().map_err(|error| {
-            GatewayError::unavailable(CAPABILITY, None, true, error.to_string())
-        })?;
-        let bars = client
-            .get_security_bars(
-                KLINE_15MIN,
-                market,
-                code,
-                0,
-                count as u16,
-                fq_type::NONE,
-            )
-            .map_err(|error| {
-                GatewayError::unavailable(
-                    CAPABILITY,
-                    None,
-                    true,
-                    format!("magic-tdx 15min bars failed for {code}: {error}"),
-                )
-            })?;
-        if bars.is_empty() {
-            return Err(GatewayError::unavailable(
+        // no-feature (monitor 零 magic): library transport 不存在。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
                 CAPABILITY,
                 None,
-                false,
-                format!("magic-tdx 15min bars empty for {code}"),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
             ));
         }
-        Ok(bars)
+        #[cfg(feature = "magic-gateway")]
+        {
+            let market = if code.starts_with('6') { 1u8 } else { 0u8 };
+            let client = super::magic_tdx_t0::cached_tdx_hq_client().map_err(|error| {
+                GatewayError::unavailable(CAPABILITY, None, true, error.to_string())
+            })?;
+            let bars = client
+                .get_security_bars(
+                    KLINE_15MIN,
+                    market,
+                    code,
+                    0,
+                    count as u16,
+                    fq_type::NONE,
+                )
+                .map_err(|error| {
+                    GatewayError::unavailable(
+                        CAPABILITY,
+                        None,
+                        true,
+                        format!("magic-tdx 15min bars failed for {code}: {error}"),
+                    )
+                })?;
+            if bars.is_empty() {
+                return Err(GatewayError::unavailable(
+                    CAPABILITY,
+                    None,
+                    false,
+                    format!("magic-tdx 15min bars empty for {code}"),
+                ));
+            }
+            Ok(bars)
+        }
     }
 
     pub fn daily_bars(&self, code: &str, days: usize) -> Result<AdmittedDailyBars, GatewayError> {
-        let (request_hash, terminal_provider, result) = acquire_structural_batch(code, days);
+        let request_hash = acquisition_request_hash(CAPABILITY, &format!("{code}:{days}"));
         // P4 M2 钩子: DATA_GATEWAY_GRPC=1 → gRPC 通道 (fail-closed, audit 对等)。
         match super::grpc_source::bridge_for("HistoricalBars") {
             Ok(Some(bridge)) => {
@@ -282,12 +309,30 @@ impl HistoricalBarsGateway {
                 return AdmittedDailyBars::from_audited_batch(code.to_owned(), audited);
             }
         }
-        let result = result.and_then(|mut batch| {
-            finalize_selected_batch_sync(code, &mut batch)?;
-            Ok(batch)
-        });
-        let audited = audit_gateway_result(CAPABILITY, terminal_provider, &request_hash, result)?;
-        AdmittedDailyBars::from_audited_batch(code.to_owned(), audited)
+        // no-feature (monitor 零 magic): library transport 不存在。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
+                CAPABILITY,
+                Some(ProviderId::Tdx),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let (terminal_provider, result) = acquire_structural_batch(code, days);
+            let result = result.and_then(|mut batch| {
+                finalize_selected_batch_sync(code, &mut batch)?;
+                Ok(batch)
+            });
+            let audited =
+                audit_gateway_result(CAPABILITY, terminal_provider, &request_hash, result)?;
+            AdmittedDailyBars::from_audited_batch(code.to_owned(), audited)
+        }
     }
 
     /// Async entry for consumers that already run inside Tokio.
@@ -301,18 +346,7 @@ impl HistoricalBarsGateway {
         days: usize,
     ) -> Result<AdmittedDailyBars, GatewayError> {
         let code = code.to_owned();
-        let worker_code = code.clone();
-        let (request_hash, terminal_provider, result) =
-            tokio::task::spawn_blocking(move || acquire_structural_batch(&worker_code, days))
-                .await
-                .map_err(|error| {
-                    GatewayError::unavailable(
-                        CAPABILITY,
-                        None,
-                        true,
-                        format!("historical-bars blocking task failed: {error}"),
-                    )
-                })?;
+        let request_hash = acquisition_request_hash(CAPABILITY, &format!("{code}:{days}"));
         // P4 M2 钩子: DATA_GATEWAY_GRPC=1 → gRPC 通道 (async 路径, 不 block_on)。
         match super::grpc_source::bridge_for("HistoricalBars") {
             Ok(Some(bridge)) => {
@@ -332,20 +366,48 @@ impl HistoricalBarsGateway {
                 return AdmittedDailyBars::from_audited_batch(code, audited);
             }
         }
-        let result = finalize_selected_batch_async(code.clone(), result).await;
-        let audited = tokio::task::spawn_blocking(move || {
-            audit_gateway_result(CAPABILITY, terminal_provider, &request_hash, result)
-        })
-        .await
-        .map_err(|error| {
-            GatewayError::unavailable(
+        // no-feature (monitor 零 magic): library transport 不存在。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
                 CAPABILITY,
-                Some(terminal_provider),
+                Some(ProviderId::Tdx),
+                "unavailable",
+                "provider_transport",
                 true,
-                format!("historical-bars audit task failed: {error}"),
-            )
-        })??;
-        AdmittedDailyBars::from_audited_batch(code, audited)
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let worker_code = code.clone();
+            let (terminal_provider, result) =
+                tokio::task::spawn_blocking(move || acquire_structural_batch(&worker_code, days))
+                    .await
+                    .map_err(|error| {
+                        GatewayError::unavailable(
+                            CAPABILITY,
+                            None,
+                            true,
+                            format!("historical-bars blocking task failed: {error}"),
+                        )
+                    })?;
+            let result = finalize_selected_batch_async(code.clone(), result).await;
+            let audited = tokio::task::spawn_blocking(move || {
+                audit_gateway_result(CAPABILITY, terminal_provider, &request_hash, result)
+            })
+            .await
+            .map_err(|error| {
+                GatewayError::unavailable(
+                    CAPABILITY,
+                    Some(terminal_provider),
+                    true,
+                    format!("historical-bars audit task failed: {error}"),
+                )
+            })??;
+            AdmittedDailyBars::from_audited_batch(code, audited)
+        }
     }
 
     /// Fetch a daily-bar batch that is guaranteed to be non-empty and whose
@@ -383,67 +445,81 @@ impl HistoricalBarsGateway {
         days: usize,
     ) -> Result<Vec<DailyChangeConfirmationQuery>, GatewayError> {
         let code = code.to_owned();
-        let worker_code = code.clone();
-        let (request_hash, terminal_provider, result) =
-            tokio::task::spawn_blocking(move || acquire_structural_batch(&worker_code, days))
-                .await
-                .map_err(|error| {
-                    GatewayError::unavailable(
-                        CAPABILITY,
-                        None,
-                        true,
-                        format!("historical-bars review task failed: {error}"),
-                    )
-                })?;
-        let mut batch = tokio::task::spawn_blocking(move || {
-            audit_gateway_result(CAPABILITY, terminal_provider, &request_hash, result)
-        })
-        .await
-        .map_err(|error| {
-            GatewayError::unavailable(
+        // no-feature (monitor 零 magic): library transport 不存在, 显式失败
+        // (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
                 CAPABILITY,
-                Some(terminal_provider),
+                Some(ProviderId::Tdx),
+                "unavailable",
+                "provider_transport",
                 true,
-                format!("historical-bars review audit task failed: {error}"),
-            )
-        })??;
-        if pending_changes(&code, &mut batch)?.is_empty() {
-            return Ok(Vec::new());
+                &format!(
+                    "library transport disabled: DATA_GATEWAY_GRPC=1 required (code={code}, days={days})"
+                ),
+            ));
         }
-        let (window_start, window_end) = batch_window(&batch)?;
-        let lifecycle = SecurityLifecycleGateway::new()
-            .acquire(&code, window_start, window_end)
-            .await?;
-        tokio::task::spawn_blocking(move || {
-            confirmation_queries_for_pending_batch(&code, &mut batch, &lifecycle)
-        })
-        .await
-        .map_err(|error| {
-            GatewayError::unavailable(
-                CAPABILITY,
-                Some(terminal_provider),
-                true,
-                format!("historical-bars review projection task failed: {error}"),
-            )
-        })?
+        #[cfg(feature = "magic-gateway")]
+        {
+            let request_hash = acquisition_request_hash(CAPABILITY, &format!("{code}:{days}"));
+            let worker_code = code.clone();
+            let (terminal_provider, result) =
+                tokio::task::spawn_blocking(move || acquire_structural_batch(&worker_code, days))
+                    .await
+                    .map_err(|error| {
+                        GatewayError::unavailable(
+                            CAPABILITY,
+                            None,
+                            true,
+                            format!("historical-bars review task failed: {error}"),
+                        )
+                    })?;
+            let mut batch = tokio::task::spawn_blocking(move || {
+                audit_gateway_result(CAPABILITY, terminal_provider, &request_hash, result)
+            })
+            .await
+            .map_err(|error| {
+                GatewayError::unavailable(
+                    CAPABILITY,
+                    Some(terminal_provider),
+                    true,
+                    format!("historical-bars review audit task failed: {error}"),
+                )
+            })??;
+            if pending_changes(&code, &mut batch)?.is_empty() {
+                return Ok(Vec::new());
+            }
+            let (window_start, window_end) = batch_window(&batch)?;
+            let lifecycle = SecurityLifecycleGateway::new()
+                .acquire(&code, window_start, window_end)
+                .await?;
+            tokio::task::spawn_blocking(move || {
+                confirmation_queries_for_pending_batch(&code, &mut batch, &lifecycle)
+            })
+            .await
+            .map_err(|error| {
+                GatewayError::unavailable(
+                    CAPABILITY,
+                    Some(terminal_provider),
+                    true,
+                    format!("historical-bars review projection task failed: {error}"),
+                )
+            })?
+        }
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn acquire_structural_batch(
     code: &str,
     days: usize,
-) -> (
-    String,
-    ProviderId,
-    Result<GatewayBatch<KlineData>, GatewayError>,
-) {
-    let request_hash = acquisition_request_hash(CAPABILITY, &format!("{code}:{days}"));
+) -> (ProviderId, Result<GatewayBatch<KlineData>, GatewayError>) {
     let request = match build_request(code, days) {
         Ok(request) => request,
-        Err(error) => return (request_hash, ProviderId::Tdx, Err(error)),
+        Err(error) => return (ProviderId::Tdx, Err(error)),
     };
-    let (provider, result) = route_daily_bars(code, &request);
-    (request_hash, provider, result)
+    route_daily_bars(code, &request)
 }
 
 pub const fn daily_bar_provider_label(provider: ProviderId) -> &'static str {
@@ -456,6 +532,7 @@ pub const fn daily_bar_provider_label(provider: ProviderId) -> &'static str {
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn build_request(code: &str, days: usize) -> Result<BarsRequest, GatewayError> {
     let storage_code = code;
     #[cfg(test)]
@@ -503,6 +580,7 @@ fn build_request(code: &str, days: usize) -> Result<BarsRequest, GatewayError> {
         .map_err(|error| GatewayError::invalid_request(CAPABILITY, error.to_string()))
 }
 
+#[cfg(feature = "magic-gateway")]
 fn route_daily_bars(
     storage_code: &str,
     request: &BarsRequest,
@@ -607,6 +685,7 @@ fn route_daily_bars(
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validated_source<Provider, Classify>(
     provider_id: ProviderId,
     provider: Arc<Provider>,
@@ -627,6 +706,7 @@ where
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_candidate_batch(
     storage_code: &str,
     request: &BarsRequest,
@@ -796,6 +876,7 @@ fn validate_candidate_batch(
     Ok(output)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn project_selected_batch(
     storage_code: &str,
     request: &BarsRequest,
@@ -851,6 +932,7 @@ fn batch_window(batch: &GatewayBatch<KlineData>) -> Result<(NaiveDate, NaiveDate
     Ok((minimum, maximum))
 }
 
+#[cfg(feature = "magic-gateway")]
 fn pending_changes(
     code: &str,
     batch: &mut GatewayBatch<KlineData>,
@@ -905,6 +987,7 @@ fn build_confirmation_query(
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn confirmation_queries_for_pending_batch(
     code: &str,
     batch: &mut GatewayBatch<KlineData>,
@@ -924,6 +1007,7 @@ fn confirmation_queries_for_pending_batch(
         .collect()
 }
 
+#[cfg(feature = "magic-gateway")]
 fn finalize_with_lifecycle(
     code: &str,
     batch: &mut GatewayBatch<KlineData>,
@@ -966,6 +1050,7 @@ fn finalize_with_lifecycle(
 }
 
 /// BR-229: 按代码前缀判定板别涨停幅 (创业板/科创板 20%, 北交所 30%, 主板 10%)。
+#[cfg(feature = "magic-gateway")]
 fn board_limit_up_pct_for_code(code: &str) -> Option<f64> {
     if code.starts_with("300") || code.starts_with("301") || code.starts_with("688") {
         Some(20.0)
@@ -978,6 +1063,7 @@ fn board_limit_up_pct_for_code(code: &str) -> Option<f64> {
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn finalize_without_pending_change(
     code: &str,
     batch: &mut GatewayBatch<KlineData>,
@@ -998,6 +1084,7 @@ fn finalize_without_pending_change(
         .map_err(|error| final_admission_error(provider, error))
 }
 
+#[cfg(feature = "magic-gateway")]
 fn acquire_lifecycle_sync(
     code: &str,
     window_start: NaiveDate,
@@ -1043,6 +1130,7 @@ fn acquire_lifecycle_sync(
         })?
 }
 
+#[cfg(feature = "magic-gateway")]
 fn finalize_selected_batch_sync(
     code: &str,
     batch: &mut GatewayBatch<KlineData>,
@@ -1315,6 +1403,7 @@ pub(super) async fn finalize_outcome_sequence_async(
     })?
 }
 
+#[cfg(feature = "magic-gateway")]
 async fn finalize_selected_batch_async(
     code: String,
     result: Result<GatewayBatch<KlineData>, GatewayError>,
@@ -1343,6 +1432,7 @@ async fn finalize_selected_batch_async(
     })?
 }
 
+#[cfg(feature = "magic-gateway")]
 fn provider_initialization_error(provider: ProviderId, message: String) -> GatewayError {
     GatewayError::classified(
         CAPABILITY,
@@ -1354,6 +1444,7 @@ fn provider_initialization_error(provider: ProviderId, message: String) -> Gatew
     )
 }
 
+#[cfg(feature = "magic-gateway")]
 fn router_gateway_error(error: RouterError, provider: ProviderId) -> GatewayError {
     let attempts = error
         .attempts()
@@ -1408,6 +1499,7 @@ fn router_gateway_error(error: RouterError, provider: ProviderId) -> GatewayErro
     )
 }
 
+#[cfg(feature = "magic-gateway")]
 fn classify_tdx_error(error: TdxError) -> SourceError {
     let message = error.to_string();
     match error {
@@ -1439,6 +1531,7 @@ fn classify_tdx_error(error: TdxError) -> SourceError {
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn classify_tencent_error(error: TencentError) -> SourceError {
     let message = error.to_string();
     match error {
@@ -1452,6 +1545,7 @@ fn classify_tencent_error(error: TencentError) -> SourceError {
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn classify_sina_error(error: SinaError) -> SourceError {
     let message = error.to_string();
     match error {
@@ -1465,6 +1559,7 @@ fn classify_sina_error(error: SinaError) -> SourceError {
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn classify_baidu_error(error: BaiduError) -> SourceError {
     let message = error.to_string();
     match error {
@@ -1479,6 +1574,7 @@ fn classify_baidu_error(error: BaiduError) -> SourceError {
 }
 
 #[cfg(test)]
+#[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
     use crate::data_gateway::security_lifecycle::{

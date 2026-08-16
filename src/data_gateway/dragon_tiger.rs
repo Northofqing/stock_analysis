@@ -1,16 +1,26 @@
 //! BR-162 evidence-preserving R-04 whole-market dragon-tiger Gateway.
 
-use super::review::{acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result};
-use super::{BatchEvidence, GatewayBatch, GatewayError};
+use super::review::{acquisition_request_hash, audit_gateway_result};
+#[cfg(feature = "magic-gateway")]
+use super::review::audit_blocking_join_failure;
+use super::{GatewayBatch, GatewayError};
+#[cfg(feature = "magic-gateway")]
+use super::BatchEvidence;
 use chrono::NaiveDate;
 #[cfg(feature = "magic-gateway")]
 use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
-use crate::magic_compat::{AssetClass, Exchange, IsoDate, PositiveU32, ProviderId};
+use crate::magic_compat::{DragonTigerSide, Exchange, ProviderId};
 #[cfg(feature = "magic-gateway")]
-use magic_market_core::{DragonTigerDisclosure, DragonTigerSide, MarketDragonTigerData, MarketDragonTigerRequest};
+use crate::magic_compat::{AssetClass, IsoDate, PositiveU32};
+#[cfg(feature = "magic-gateway")]
+// MarketDragonTigerData 是 method-resolution trait (正文无 :: 用法),
+// feature 模式提供 .market_dragon_tiger() 方法解析 — 不得按 unused 删除。
+use magic_market_core::{DragonTigerDisclosure, MarketDragonTigerData, MarketDragonTigerRequest};
+#[cfg(feature = "magic-gateway")]
 use magic_market_router::{
     AcceptancePolicy, AttemptStatus, FailureKind, MarketDragonTigerRouter, RouterError, SourceFn,
 };
+#[cfg(feature = "magic-gateway")]
 use std::collections::{HashMap, HashSet};
 
 const CAPABILITY: &str = "R-04";
@@ -90,41 +100,58 @@ impl DragonTigerGateway {
                 );
             }
         }
-        let worker_request_hash = request_hash.clone();
-        let joined = tokio::task::spawn_blocking(move || {
-            let result = build_request(trading_date, disclosure_limit).and_then(|request| {
-                if stock_limit == 0 {
-                    return Err(GatewayError::invalid_request(
-                        CAPABILITY,
-                        "stock limit must be greater than zero",
-                    ));
-                }
-                fetch_market_review(request, trading_date, stock_limit)
-            });
-            audit_gateway_result(
+        // no-feature (monitor 零 magic): library transport 不存在。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
                 CAPABILITY,
-                ProviderId::Eastmoney,
-                &worker_request_hash,
-                result,
-            )
-        })
-        .await;
-
-        match joined {
-            Ok(result) => result,
-            Err(error) => {
-                audit_blocking_join_failure(
+                Some(ProviderId::Eastmoney),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let worker_request_hash = request_hash.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let result = build_request(trading_date, disclosure_limit).and_then(|request| {
+                    if stock_limit == 0 {
+                        return Err(GatewayError::invalid_request(
+                            CAPABILITY,
+                            "stock limit must be greater than zero",
+                        ));
+                    }
+                    fetch_market_review(request, trading_date, stock_limit)
+                });
+                audit_gateway_result(
                     CAPABILITY,
                     ProviderId::Eastmoney,
-                    request_hash,
-                    error.to_string(),
+                    &worker_request_hash,
+                    result,
                 )
-                .await
+            })
+            .await;
+
+            match joined {
+                Ok(result) => result,
+                Err(error) => {
+                    audit_blocking_join_failure(
+                        CAPABILITY,
+                        ProviderId::Eastmoney,
+                        request_hash,
+                        error.to_string(),
+                    )
+                    .await
+                }
             }
         }
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn build_request(
     trading_date: NaiveDate,
     disclosure_limit: u32,
@@ -137,6 +164,7 @@ fn build_request(
         .map_err(|error| GatewayError::invalid_request(CAPABILITY, error.to_string()))
 }
 
+#[cfg(feature = "magic-gateway")]
 fn fetch_market_review(
     request: MarketDragonTigerRequest,
     expected_date: NaiveDate,
@@ -188,6 +216,7 @@ fn fetch_market_review(
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn aggregate_disclosures(
     records: &[DragonTigerDisclosure],
     expected_date: NaiveDate,
@@ -312,6 +341,7 @@ fn aggregate_disclosures(
     Ok(stocks)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_instrument(asset_class: AssetClass, code: &str) -> Result<(), GatewayError> {
     let source_code = code.strip_prefix("TEST_CODE_").unwrap_or(code);
     if asset_class != AssetClass::Equity
@@ -327,6 +357,7 @@ fn validate_instrument(asset_class: AssetClass, code: &str) -> Result<(), Gatewa
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_record_evidence(
     record: &crate::magic_compat::SourceEvidence,
     batch: &BatchEvidence,
@@ -346,6 +377,7 @@ fn validate_record_evidence(
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn source_trade_id(entry_id: &str) -> Result<String, GatewayError> {
     let (_, trade_id) = entry_id.rsplit_once(':').ok_or_else(|| {
         GatewayError::invalid_evidence(
@@ -364,6 +396,7 @@ fn source_trade_id(entry_id: &str) -> Result<String, GatewayError> {
     Ok(trade_id.to_string())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_and_sort_seats(
     seats: &mut [DragonTigerSeatReview],
     entry_id: &str,
@@ -407,6 +440,7 @@ fn validate_and_sort_seats(
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn disclosure_order(
     left: &DragonTigerSourceDisclosure,
     right: &DragonTigerSourceDisclosure,
@@ -420,6 +454,7 @@ fn disclosure_order(
     .then_with(|| left.entry_id.cmp(&right.entry_id))
 }
 
+#[cfg(feature = "magic-gateway")]
 const fn exchange_order(exchange: Exchange) -> u8 {
     match exchange {
         Exchange::Shanghai => 0,
@@ -428,6 +463,7 @@ const fn exchange_order(exchange: Exchange) -> u8 {
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 const fn seat_side_order(side: DragonTigerSide) -> u8 {
     match side {
         DragonTigerSide::Buy => 0,
@@ -435,6 +471,7 @@ const fn seat_side_order(side: DragonTigerSide) -> u8 {
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn eastmoney_gateway_error(error: EastmoneyError) -> GatewayError {
     let reason_code = error.category();
     let message = error.to_string();
@@ -486,6 +523,7 @@ fn eastmoney_gateway_error(error: EastmoneyError) -> GatewayError {
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn router_gateway_error(provider: Option<ProviderId>, error: RouterError) -> GatewayError {
     let terminal_kind = error
         .attempts()
@@ -524,10 +562,10 @@ fn router_gateway_error(provider: Option<ProviderId>, error: RouterError) -> Gat
 }
 
 #[cfg(test)]
+#[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
     use crate::magic_compat::{InstrumentId, Money, NonEmptyText, SourceEvidence};
-#[cfg(feature = "magic-gateway")]
 use magic_market_core::{DragonTigerEntry, DragonTigerSeat};
 
     fn disclosure(

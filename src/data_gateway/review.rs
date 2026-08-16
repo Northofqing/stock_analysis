@@ -5,9 +5,12 @@ use chrono::NaiveDate;
 #[cfg(feature = "magic-gateway")]
 use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
 use crate::magic_compat::ProviderId;
-use crate::magic_compat::{IsoDate, LimitPoolEntry, LimitPoolKind, PositiveU32};
+use crate::magic_compat::{LimitPoolEntry, LimitPoolKind, PositiveU32};
+#[cfg(feature = "magic-gateway")]
+use crate::magic_compat::IsoDate;
 #[cfg(feature = "magic-gateway")]
 use magic_market_core::{LimitPoolRequest, LimitPools};
+#[cfg(feature = "magic-gateway")]
 use magic_market_router::{
     AcceptancePolicy, AttemptStatus, FailureKind, LimitPoolRouter, RouterError, SourceError,
     SourceFn,
@@ -280,23 +283,39 @@ impl ReviewDataGateway {
                 return audit_routed_gateway_result("R-03", &request_hash, Err(error));
             }
         }
-        let worker_request_hash = request_hash.clone();
-        let joined = tokio::task::spawn_blocking(move || {
-            let result = route_exact_date_upper_limit_pool("R-03", trading_date)
-                .and_then(|batch| map_r03_upper_limit_batch(batch, trading_date));
-            audit_routed_gateway_result("R-03", &worker_request_hash, result)
-        })
-        .await;
-        match joined {
-            Ok(result) => result,
-            Err(error) => {
-                audit_blocking_join_failure(
-                    "R-03",
-                    ProviderId::Custom,
-                    request_hash,
-                    error.to_string(),
-                )
-                .await
+        // no-feature (monitor 零 magic): library transport 不存在。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
+                "R-03",
+                Some(ProviderId::Custom),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let worker_request_hash = request_hash.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let result = route_exact_date_upper_limit_pool("R-03", trading_date)
+                    .and_then(|batch| map_r03_upper_limit_batch(batch, trading_date));
+                audit_routed_gateway_result("R-03", &worker_request_hash, result)
+            })
+            .await;
+            match joined {
+                Ok(result) => result,
+                Err(error) => {
+                    audit_blocking_join_failure(
+                        "R-03",
+                        ProviderId::Custom,
+                        request_hash,
+                        error.to_string(),
+                    )
+                    .await
+                }
             }
         }
     }
@@ -309,12 +328,30 @@ impl ReviewDataGateway {
         trading_date: NaiveDate,
     ) -> Result<GatewayBatch<LimitPoolEntry>, GatewayError> {
         const CAPABILITY: &str = "BR-213-UpperLimitPool";
-        let request_hash = acquisition_request_hash(
-            CAPABILITY,
-            &format!("{trading_date}:{WHOLE_LIMIT_POOL_BOUND}"),
-        );
-        let result = route_exact_date_upper_limit_pool(CAPABILITY, trading_date);
-        audit_routed_gateway_result(CAPABILITY, &request_hash, result)
+        // no-feature (monitor 零 magic): library transport 不存在。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
+                CAPABILITY,
+                Some(ProviderId::Custom),
+                "unavailable",
+                "provider_transport",
+                true,
+                &format!(
+                    "library transport disabled: DATA_GATEWAY_GRPC=1 required (trading_date={trading_date})"
+                ),
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let request_hash = acquisition_request_hash(
+                CAPABILITY,
+                &format!("{trading_date}:{WHOLE_LIMIT_POOL_BOUND}"),
+            );
+            let result = route_exact_date_upper_limit_pool(CAPABILITY, trading_date);
+            audit_routed_gateway_result(CAPABILITY, &request_hash, result)
+        }
     }
 }
 
@@ -468,6 +505,7 @@ fn project_a01_daily_closes(
     Ok(GatewayBatch::Available { records, evidence })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn build_limit_pool_request(trading_date: NaiveDate) -> Result<LimitPoolRequest, GatewayError> {
     let iso_date = IsoDate::new(trading_date.format("%Y-%m-%d").to_string())
         .map_err(|error| GatewayError::invalid_request("R-03", error.to_string()))?;
@@ -477,6 +515,7 @@ fn build_limit_pool_request(trading_date: NaiveDate) -> Result<LimitPoolRequest,
         .map_err(|error| GatewayError::invalid_request("R-03", error.to_string()))
 }
 
+#[cfg(feature = "magic-gateway")]
 pub(crate) fn route_exact_date_upper_limit_pool(
     capability: &'static str,
     expected_date: NaiveDate,
@@ -837,6 +876,7 @@ pub(super) async fn audit_blocking_join_failure<T: Send + 'static>(
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn eastmoney_source_error(error: EastmoneyError) -> SourceError {
     let message = error.to_string();
     match error {
@@ -856,6 +896,7 @@ fn eastmoney_source_error(error: EastmoneyError) -> SourceError {
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn ths_source_error(error: ThsError) -> SourceError {
     let message = error.to_string();
     match error {
@@ -877,6 +918,7 @@ fn ths_source_error(error: ThsError) -> SourceError {
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn gateway_router_error(
     capability: &'static str,
     provider: Option<ProviderId>,
@@ -925,7 +967,7 @@ mod tests {
     use crate::database::DatabaseManager;
     use diesel::prelude::*;
     use diesel::sql_types::{BigInt, Nullable, Text};
-    use crate::magic_compat::{AssetClass, DataBatch, Exchange, InstrumentId, NonEmptyText, Price, Provenance, Ratio, RatioUnit, SourceEvidence};
+    use crate::magic_compat::{AssetClass, DataBatch, Exchange, InstrumentId, IsoDate, NonEmptyText, Price, Provenance, Ratio, RatioUnit, SourceEvidence};
     use serial_test::serial;
 
     #[derive(Debug, QueryableByName)]
@@ -1137,6 +1179,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "magic-gateway")]
     fn br159_limit_pool_requests_are_bounded() {
         let date = NaiveDate::from_ymd_opt(2099, 1, 2).unwrap();
         let request = build_limit_pool_request(date).expect("bounded whole-market request");
@@ -1300,6 +1343,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "magic-gateway")]
     fn br159_limit_pool_provider_error_mappers_preserve_retry_policy() {
         let eastmoney_cases = [
             eastmoney_source_error(EastmoneyError::InvalidRequest("TEST_CODE".into())),

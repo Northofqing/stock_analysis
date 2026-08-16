@@ -226,6 +226,10 @@ pub mod http_client;
 // 合同注册表 (服务端/客户端共享) + 客户端网络层; 唯一合同源 grpc/market.proto
 pub mod grpc_contract;
 pub mod grpc_client;
+/// M5 (Task #76): grpc_market_server 是 magic-* 数据提供者宿主 — 只在
+/// magic-gateway (默认) 构建存在。monitor (--no-default-features) 不编译
+/// server, 走 grpc_client 桥。仅 src/bin/grpc_market_server.rs 引用。
+#[cfg(feature = "magic-gateway")]
 pub mod grpc_server;
 
 // M5 (Task #76): magic-* 类型兼容层 — feature 开 = 重导出真实类型,

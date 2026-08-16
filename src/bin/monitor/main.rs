@@ -559,7 +559,7 @@ mod tests_monitor_historical_gateway_projection {
     use super::{
         chronological_daily_bars, latest_price_change_from_records, t1_close_from_records,
     };
-    use crate::magic_compat::ProviderId;
+    use stock_analysis::magic_compat::ProviderId;
     use stock_analysis::data_gateway::BatchEvidence;
     use stock_analysis::data_provider::{AdjustType, KlineData};
 
@@ -7116,7 +7116,7 @@ struct HoldingPlanDailyRow {
 async fn prepare_holding_plan_messages(
     banner: &push_templates::BannerCtx,
 ) -> Result<Vec<PreparedHoldingPlan>, String> {
-    use crate::magic_compat::{AssetClass, Exchange, InstrumentId};
+    use stock_analysis::magic_compat::{AssetClass, Exchange, InstrumentId};
     use sha2::{Digest, Sha256};
     use stock_analysis::database::user_position_snapshot::latest_user_position_snapshot;
 
@@ -7236,7 +7236,7 @@ struct PreparedCloseCall {
 async fn prepare_close_call_messages(
     banner: &push_templates::BannerCtx,
 ) -> Result<Vec<PreparedCloseCall>, String> {
-    use crate::magic_compat::{AssetClass, Exchange, InstrumentId};
+    use stock_analysis::magic_compat::{AssetClass, Exchange, InstrumentId};
     use sha2::{Digest, Sha256};
     use stock_analysis::database::user_position_snapshot::latest_user_position_snapshot;
 
@@ -9841,7 +9841,7 @@ async fn post_close_news_scheduler() {
 /// 失败不重试: 告警时效性强, 30s 后快照已变化; 同日同类再次触发由 counted
 /// 去重/状态机放行新 occurrence。
 async fn deliver_intraday_alert(event: &AlertEvent) -> bool {
-    use crate::magic_compat::{AssetClass, Exchange, InstrumentId};
+    use stock_analysis::magic_compat::{AssetClass, Exchange, InstrumentId};
     use sha2::{Digest, Sha256};
 
     let business_date = chrono::Local::now().date_naive();
@@ -10267,7 +10267,7 @@ mod tests_v17_4_d {
         stock_analysis::data_gateway::GatewayBatch::Available {
             records,
             evidence: stock_analysis::data_gateway::BatchEvidence {
-                provider: crate::magic_compat::ProviderId::Eastmoney,
+                provider: stock_analysis::magic_compat::ProviderId::Eastmoney,
                 source: "TEST_CODE_eastmoney-board-flow".to_owned(),
                 source_at: Some("1785290400.000000000".to_owned()),
                 observed_at: "1785290401.000000000".to_owned(),
@@ -10790,7 +10790,7 @@ mod tests_br140_review_chain_isolation {
             },
         ];
         let evidence = stock_analysis::data_gateway::BatchEvidence {
-            provider: crate::magic_compat::ProviderId::Eastmoney,
+            provider: stock_analysis::magic_compat::ProviderId::Eastmoney,
             source: "TEST_CODE_eastmoney-web".to_string(),
             source_at: Some("2099-01-02".to_string()),
             observed_at: "2099-01-02T16:00:00+08:00".to_string(),

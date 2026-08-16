@@ -1,13 +1,22 @@
 //! BR-165/BR-199 evidence-preserving CFFEX futures-delivery acquisition.
 
-use super::review::{acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result};
-use super::{BatchEvidence, GatewayBatch, GatewayError};
-use chrono::{Datelike, NaiveDate};
+use super::review::{acquisition_request_hash, audit_gateway_result};
+#[cfg(feature = "magic-gateway")]
+use super::review::audit_blocking_join_failure;
+use super::{GatewayBatch, GatewayError};
+#[cfg(feature = "magic-gateway")]
+use super::BatchEvidence;
+use chrono::NaiveDate;
+#[cfg(feature = "magic-gateway")]
+use chrono::Datelike;
 #[cfg(feature = "magic-gateway")]
 use magic_exchange_rs::{CffexClient, ExchangeError};
-use crate::magic_compat::{DataBatch, PositiveU32, ProviderId};
+use crate::magic_compat::ProviderId;
+#[cfg(feature = "magic-gateway")]
+use crate::magic_compat::{DataBatch, PositiveU32};
 #[cfg(feature = "magic-gateway")]
 use magic_market_core::{FuturesDeliveryCalendar, FuturesDeliveryEvent, FuturesDeliveryMethod, FuturesDeliveryRequest, FuturesProduct};
+#[cfg(feature = "magic-gateway")]
 use std::collections::HashSet;
 
 const CAPABILITY: &str = "R-08-cffex-delivery";
@@ -17,8 +26,17 @@ const SOURCE: &str = "cffex-official-notice";
 ///
 /// This is deliberately a contract read, not a network probe: startup may
 /// report availability without creating a provider or fabricating readiness.
+#[cfg(feature = "magic-gateway")]
 pub const fn cffex_futures_delivery_live_supported() -> bool {
     CffexClient::calendar_capabilities().futures_delivery
+}
+
+/// no-feature (monitor 零 magic): 进程内无 CffexClient, 契约无从读取。
+/// 诚实声明 = false → 启动 banner 走 warn 分支 (出声, 与 DATA_GATEWAY_GRPC=1
+/// 下 gRPC 通道独立承载 R-08 交付不冲突)。
+#[cfg(not(feature = "magic-gateway"))]
+pub const fn cffex_futures_delivery_live_supported() -> bool {
+    false
 }
 
 /// One admitted contract fact from an official CFFEX delivery notice.
@@ -61,28 +79,45 @@ impl FuturesDeliveryGateway {
                 return audit_gateway_result(CAPABILITY, ProviderId::Cffex, &request_hash, Err(error));
             }
         }
-        let worker_request_hash = request_hash.clone();
-        let joined = tokio::task::spawn_blocking(move || {
-            let result = build_request(year, month).and_then(fetch_and_admit_cffex_batch);
-            audit_gateway_result(CAPABILITY, ProviderId::Cffex, &worker_request_hash, result)
-        })
-        .await;
+        // no-feature (monitor 零 magic): library transport 不存在。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
+                CAPABILITY,
+                Some(ProviderId::Cffex),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let worker_request_hash = request_hash.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let result = build_request(year, month).and_then(fetch_and_admit_cffex_batch);
+                audit_gateway_result(CAPABILITY, ProviderId::Cffex, &worker_request_hash, result)
+            })
+            .await;
 
-        match joined {
-            Ok(result) => result,
-            Err(error) => {
-                audit_blocking_join_failure(
-                    CAPABILITY,
-                    ProviderId::Cffex,
-                    request_hash,
-                    error.to_string(),
-                )
-                .await
+            match joined {
+                Ok(result) => result,
+                Err(error) => {
+                    audit_blocking_join_failure(
+                        CAPABILITY,
+                        ProviderId::Cffex,
+                        request_hash,
+                        error.to_string(),
+                    )
+                    .await
+                }
             }
         }
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn build_request(year: u32, month: u32) -> Result<FuturesDeliveryRequest, GatewayError> {
     let year = PositiveU32::new(year).map_err(|error| {
         GatewayError::invalid_request(CAPABILITY, format!("invalid CFFEX year: {error}"))
@@ -95,6 +130,7 @@ fn build_request(year: u32, month: u32) -> Result<FuturesDeliveryRequest, Gatewa
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn fetch_and_admit_cffex_batch(
     request: FuturesDeliveryRequest,
 ) -> Result<GatewayBatch<FuturesDeliveryFact>, GatewayError> {
@@ -105,6 +141,7 @@ fn fetch_and_admit_cffex_batch(
     admit_cffex_batch(batch, &request)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn admit_cffex_batch(
     batch: DataBatch<FuturesDeliveryEvent>,
     request: &FuturesDeliveryRequest,
@@ -250,6 +287,7 @@ fn admit_cffex_batch(
     Ok(GatewayBatch::Available { records, evidence })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn product_code(product: FuturesProduct) -> &'static str {
     match product {
         FuturesProduct::If => "IF",
@@ -259,6 +297,7 @@ fn product_code(product: FuturesProduct) -> &'static str {
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn parse_date(value: &str, field: &str) -> Result<NaiveDate, GatewayError> {
     NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|error| {
         GatewayError::invalid_evidence(
@@ -269,6 +308,7 @@ fn parse_date(value: &str, field: &str) -> Result<NaiveDate, GatewayError> {
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn cffex_gateway_error(error: ExchangeError) -> GatewayError {
     let message = error.to_string();
     match error {
@@ -322,12 +362,11 @@ fn cffex_gateway_error(error: ExchangeError) -> GatewayError {
 }
 
 #[cfg(test)]
+#[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
-    #[cfg(feature = "magic-gateway")]
     use magic_exchange_rs::TlsBackend;
     use crate::magic_compat::{IsoDate, NonEmptyText, Provenance, SourceEvidence};
-#[cfg(feature = "magic-gateway")]
 use magic_market_core::{HttpsUrl};
 
     fn request() -> FuturesDeliveryRequest {

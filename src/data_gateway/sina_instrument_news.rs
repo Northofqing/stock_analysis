@@ -1,9 +1,14 @@
 //! BR-066/BR-164/BR-172 evidence-preserving Sina instrument-news gateway.
 
 use chrono::{DateTime, Utc};
-use crate::magic_compat::{DataBatch, Exchange, IsoDate, PositiveU32, ProviderId, SourceEvidence};
+use crate::magic_compat::{ProviderId, SourceEvidence};
 #[cfg(feature = "magic-gateway")]
+use crate::magic_compat::{DataBatch, Exchange, IsoDate, PositiveU32};
+#[cfg(feature = "magic-gateway")]
+// NewsProvider 是 method-resolution trait (正文无 :: 用法), 提供
+// .instrument_news() 方法解析 — 不得按 unused 删除。
 use magic_market_core::{InstrumentDateRangeRequest, NewsItem as CoreNewsItem, NewsProvider};
+#[cfg(feature = "magic-gateway")]
 use magic_market_router::{
     AcceptancePolicy, AttemptStatus, FailureKind, InstrumentNewsRouter, RouterError, SourceError,
     SourceFn,
@@ -11,11 +16,14 @@ use magic_market_router::{
 #[cfg(feature = "magic-gateway")]
 use magic_sina_rs::{SinaClient, SinaError};
 
-use super::review::{
-    acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result, BatchEvidence,
-    GatewayBatch, GatewayError,
-};
-use crate::data_provider::news_item::{content_hash, NewsItem};
+use super::review::{acquisition_request_hash, audit_gateway_result, GatewayBatch, GatewayError};
+#[cfg(feature = "magic-gateway")]
+use super::review::BatchEvidence;
+#[cfg(feature = "magic-gateway")]
+use super::review::audit_blocking_join_failure;
+use crate::data_provider::news_item::NewsItem;
+#[cfg(feature = "magic-gateway")]
+use crate::data_provider::news_item::content_hash;
 
 const CAPABILITY: &str = "SinaInstrumentNews";
 const SOURCE: &str = "sina-company-news";
@@ -95,30 +103,48 @@ impl SinaInstrumentNewsGateway {
                 );
             }
         }
-        let worker_hash = request_hash.clone();
-        let joined = tokio::task::spawn_blocking(move || {
-            let result = build_request(&code, &from, &to).and_then(|(request, storage_code)| {
-                fetch_and_admit_sina_batch(&request, &storage_code, from, to)
-            });
-            audit_gateway_result(CAPABILITY, ProviderId::Sina, &worker_hash, result)
-        })
-        .await;
+        // no-feature (monitor 零 magic): library transport 不存在。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
+                CAPABILITY,
+                Some(ProviderId::Sina),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let worker_hash = request_hash.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let result = build_request(&code, &from, &to)
+                    .and_then(|(request, storage_code)| {
+                        fetch_and_admit_sina_batch(&request, &storage_code, from, to)
+                    });
+                audit_gateway_result(CAPABILITY, ProviderId::Sina, &worker_hash, result)
+            })
+            .await;
 
-        match joined {
-            Ok(result) => result,
-            Err(error) => {
-                audit_blocking_join_failure(
-                    CAPABILITY,
-                    ProviderId::Sina,
-                    request_hash,
-                    error.to_string(),
-                )
-                .await
+            match joined {
+                Ok(result) => result,
+                Err(error) => {
+                    audit_blocking_join_failure(
+                        CAPABILITY,
+                        ProviderId::Sina,
+                        request_hash,
+                        error.to_string(),
+                    )
+                    .await
+                }
             }
         }
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn build_request(
     code: &str,
     from: &DateTime<Utc>,
@@ -166,6 +192,7 @@ fn build_request(
     Ok((request, code.to_owned()))
 }
 
+#[cfg(feature = "magic-gateway")]
 fn fetch_and_admit_sina_batch(
     request: &InstrumentDateRangeRequest,
     storage_code: &str,
@@ -179,6 +206,7 @@ fn fetch_and_admit_sina_batch(
     admit_sina_batch(batch, request, storage_code, from, to)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn admit_sina_batch(
     batch: DataBatch<CoreNewsItem>,
     request: &InstrumentDateRangeRequest,
@@ -267,6 +295,7 @@ fn admit_sina_batch(
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_batch_provenance(batch: &DataBatch<CoreNewsItem>) -> Result<(), GatewayError> {
     if batch.provenance().source() != SOURCE {
         return Err(GatewayError::invalid_evidence(
@@ -300,6 +329,7 @@ fn validate_batch_provenance(batch: &DataBatch<CoreNewsItem>) -> Result<(), Gate
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_record(
     record: &CoreNewsItem,
     request: &InstrumentDateRangeRequest,
@@ -359,6 +389,7 @@ fn validate_record(
     Ok(published_at)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn parse_published_at(value: &str) -> Result<DateTime<Utc>, GatewayError> {
     DateTime::parse_from_rfc3339(value)
         .map(|value| value.with_timezone(&Utc))
@@ -371,6 +402,7 @@ fn parse_published_at(value: &str) -> Result<DateTime<Utc>, GatewayError> {
         })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn parse_observed_at(value: &str) -> Result<DateTime<Utc>, GatewayError> {
     let (seconds, nanos) = value.split_once('.').ok_or_else(|| {
         GatewayError::invalid_evidence(
@@ -409,6 +441,7 @@ fn parse_observed_at(value: &str) -> Result<DateTime<Utc>, GatewayError> {
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn sina_gateway_error(error: SinaError) -> GatewayError {
     let message = error.to_string();
     match error {
@@ -449,6 +482,7 @@ fn sina_gateway_error(error: SinaError) -> GatewayError {
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn gateway_router_error(provider: Option<ProviderId>, error: RouterError) -> GatewayError {
     let terminal_kind = error
         .attempts()
@@ -487,11 +521,11 @@ fn gateway_router_error(provider: Option<ProviderId>, error: RouterError) -> Gat
 }
 
 #[cfg(test)]
+#[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
     use chrono::{DateTime, Utc};
     use crate::magic_compat::{AssetClass, DataBatch, Exchange, InstrumentId, IsoDate, NonEmptyText, Provenance, ProviderId, SourceEvidence};
-#[cfg(feature = "magic-gateway")]
 use magic_market_core::{HttpsUrl, NewsItem as CoreNewsItem};
 
     fn instant(value: &str) -> DateTime<Utc> {

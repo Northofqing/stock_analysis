@@ -4,25 +4,40 @@
 //! admitted batches into these facts, then this module performs only validated
 //! identity joins, filtering, ordering and immutable batch construction.
 
+use crate::data_gateway::review::GatewayError;
+#[cfg(feature = "magic-gateway")]
 use crate::data_gateway::review::{
     acquisition_request_hash, audit_gateway_result, audit_routed_gateway_result,
-    route_exact_date_upper_limit_pool, BatchEvidence, GatewayBatch, GatewayError,
+    route_exact_date_upper_limit_pool, BatchEvidence, GatewayBatch,
 };
+#[cfg(feature = "magic-gateway")]
 use crate::database::chain_intelligence::{
     ChainBatchInput, ChainInput, ChainInputEvidenceInput, ChainMemberInput, ChainRejectionInput,
     ChainVisibilityReceiptInput, VisibleChainBatch,
 };
-use crate::database::data_acquisition_audit::DataAcquisitionAuditRecord;
-use crate::database::DatabaseManager;
-use chrono::{DateTime, FixedOffset, Local, NaiveDate, SecondsFormat};
-use crate::magic_compat::{AssetClass, DataBatch, Exchange, InstrumentId, LimitPoolEntry, PositiveU32, ProviderId};
 #[cfg(feature = "magic-gateway")]
-use magic_market_core::{BoardCategory, BoardMembership, BoardMembershipProvider, SecurityMetadata, SecurityMetadataProvider};
+use crate::database::data_acquisition_audit::DataAcquisitionAuditRecord;
+#[cfg(feature = "magic-gateway")]
+use crate::database::DatabaseManager;
+#[cfg(feature = "magic-gateway")]
+use chrono::{DateTime, FixedOffset, Local, NaiveDate, SecondsFormat};
+#[cfg(feature = "magic-gateway")]
+use crate::magic_compat::{
+    AssetClass, DataBatch, Exchange, InstrumentId, LimitPoolEntry, PositiveU32, ProviderId,
+};
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{
+    BoardCategory, BoardMembership, BoardMembershipProvider, SecurityMetadata,
+    SecurityMetadataProvider,
+};
 #[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::{protocol::constants::PRIMARY_SERVERS, BlockService, TdxError, TdxSmartClient};
 use serde::Serialize;
+#[cfg(feature = "magic-gateway")]
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
+#[cfg(feature = "magic-gateway")]
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainIntelligencePolicy {
@@ -80,6 +95,7 @@ pub struct UpperLimitFact {
     pub source_event_id: String,
 }
 
+#[cfg(feature = "magic-gateway")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BoardMembershipFact {
     pub instrument_id: String,
@@ -97,6 +113,7 @@ pub struct ChainSourceRejection {
     pub retryable: bool,
 }
 
+#[cfg(feature = "magic-gateway")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CanonicalLimitFact {
     security_name: String,
@@ -104,12 +121,14 @@ struct CanonicalLimitFact {
     source_event_id: String,
 }
 
+#[cfg(feature = "magic-gateway")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CanonicalMembership {
     board_name: String,
     category: BoardCategory,
 }
 
+#[cfg(feature = "magic-gateway")]
 #[derive(Serialize)]
 struct MemberHashPayload<'a> {
     board_id: &'a str,
@@ -119,6 +138,7 @@ struct MemberHashPayload<'a> {
     streak: u32,
 }
 
+#[cfg(feature = "magic-gateway")]
 #[derive(Serialize)]
 struct RejectionHashPayload<'a> {
     identity: &'a str,
@@ -126,6 +146,7 @@ struct RejectionHashPayload<'a> {
     retryable: bool,
 }
 
+#[cfg(feature = "magic-gateway")]
 #[derive(Serialize)]
 struct BatchIdentityPayload<'a> {
     trading_date: String,
@@ -134,6 +155,7 @@ struct BatchIdentityPayload<'a> {
     ordered_input_batch_ids: Vec<&'a str>,
 }
 
+#[cfg(feature = "magic-gateway")]
 fn invalid(message: impl Into<String>) -> GatewayError {
     GatewayError::classified(
         "A-10",
@@ -145,12 +167,14 @@ fn invalid(message: impl Into<String>) -> GatewayError {
     )
 }
 
+#[cfg(feature = "magic-gateway")]
 fn sha256_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn canonical_hash<T: Serialize>(label: &str, value: &T) -> Result<String, GatewayError> {
     let payload = serde_json::to_vec(value)
         .map_err(|error| invalid(format!("serialize {label} for canonical hash: {error}")))?;
@@ -161,6 +185,7 @@ fn canonical_hash<T: Serialize>(label: &str, value: &T) -> Result<String, Gatewa
     Ok(sha256_bytes(&bytes))
 }
 
+#[cfg(feature = "magic-gateway")]
 fn require_text(field: &str, value: &str) -> Result<(), GatewayError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(invalid(format!("{field} must be non-empty canonical text")));
@@ -168,6 +193,7 @@ fn require_text(field: &str, value: &str) -> Result<(), GatewayError> {
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn require_hash(field: &str, value: &str) -> Result<(), GatewayError> {
     if value.len() != 64
         || !value
@@ -181,10 +207,12 @@ fn require_hash(field: &str, value: &str) -> Result<(), GatewayError> {
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn valid_instrument_id(value: &str) -> bool {
     value.len() == 6 && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn is_excluded_board(
     policy: &ChainIntelligencePolicy,
     board_name: &str,
@@ -194,6 +222,7 @@ fn is_excluded_board(
         || policy.excluded_board_names.contains(board_name)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_source_evidence(evidence: &[ChainSourceEvidence]) -> Result<(), GatewayError> {
     if evidence.is_empty() {
         return Err(invalid("chain derivation requires source evidence"));
@@ -227,6 +256,7 @@ fn validate_source_evidence(evidence: &[ChainSourceEvidence]) -> Result<(), Gate
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn canonical_inputs(
     evidence: &[ChainSourceEvidence],
     parent_identity_hash: &str,
@@ -263,6 +293,7 @@ fn canonical_inputs(
         .collect()
 }
 
+#[cfg(feature = "magic-gateway")]
 fn canonical_limits(
     facts: &[UpperLimitFact],
 ) -> Result<BTreeMap<String, CanonicalLimitFact>, GatewayError> {
@@ -307,6 +338,7 @@ fn canonical_limits(
     Ok(limits)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn canonical_memberships(
     facts: &[BoardMembershipFact],
 ) -> Result<BTreeMap<(String, String), CanonicalMembership>, GatewayError> {
@@ -348,6 +380,7 @@ fn canonical_memberships(
     Ok(memberships)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn rejection(
     parent_identity_hash: &str,
     ordinal: usize,
@@ -379,6 +412,7 @@ fn rejection(
 /// Builds one immutable, same-date A-10 batch from already admitted provider
 /// facts.  It never guesses a missing name, board membership, streak or source
 /// identity.
+#[cfg(feature = "magic-gateway")]
 pub fn build_chain_intelligence_batch(
     trading_date: NaiveDate,
     created_at: DateTime<FixedOffset>,
@@ -398,6 +432,7 @@ pub fn build_chain_intelligence_batch(
     )
 }
 
+#[cfg(feature = "magic-gateway")]
 fn build_chain_intelligence_batch_with_rejections(
     trading_date: NaiveDate,
     created_at: DateTime<FixedOffset>,
@@ -609,9 +644,11 @@ fn build_chain_intelligence_batch_with_rejections(
     Ok(batch)
 }
 
+#[cfg(feature = "magic-gateway")]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ChainIntelligenceGateway;
 
+#[cfg(feature = "magic-gateway")]
 impl ChainIntelligenceGateway {
     pub const fn new() -> Self {
         Self
@@ -658,6 +695,7 @@ impl ChainIntelligenceGateway {
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn build_visible_batch(
     trading_date: NaiveDate,
     request_hash: &str,
@@ -673,6 +711,7 @@ fn build_visible_batch(
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn acquire_and_build_batch(trading_date: NaiveDate) -> Result<ChainBatchInput, GatewayError> {
     let config = crate::config::get_chain_intelligence_config().ok_or_else(|| {
         GatewayError::classified(
@@ -835,6 +874,7 @@ fn acquire_and_build_batch(trading_date: NaiveDate) -> Result<ChainBatchInput, G
     )
 }
 
+#[cfg(feature = "magic-gateway")]
 fn acquire_limit_pool(
     trading_date: NaiveDate,
 ) -> Result<GatewayBatch<LimitPoolEntry>, GatewayError> {
@@ -843,6 +883,7 @@ fn acquire_limit_pool(
     audit_routed_gateway_result("A-10-limit-pool", &request_hash, result)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn acquire_security_metadata(
     instruments: &[InstrumentId],
 ) -> Result<GatewayBatch<SecurityMetadata>, GatewayError> {
@@ -874,6 +915,7 @@ fn acquire_security_metadata(
     )
 }
 
+#[cfg(feature = "magic-gateway")]
 fn acquire_board_memberships(
     instruments: &[InstrumentId],
 ) -> Result<GatewayBatch<BoardMembership>, GatewayError> {
@@ -915,6 +957,7 @@ fn acquire_board_memberships(
     )
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_metadata_batch(
     batch: &DataBatch<SecurityMetadata>,
     requested: &[InstrumentId],
@@ -962,6 +1005,7 @@ fn validate_metadata_batch(
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_board_batch(
     batch: &DataBatch<BoardMembership>,
     requested: &[InstrumentId],
@@ -1005,6 +1049,7 @@ fn validate_board_batch(
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn source_evidence<T: Serialize>(
     capability: &str,
     batch: &GatewayBatch<T>,
@@ -1021,6 +1066,7 @@ fn source_evidence<T: Serialize>(
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn canonical_records_hash<T: Serialize>(
     label: &str,
     records: &[T],
@@ -1036,6 +1082,7 @@ fn canonical_records_hash<T: Serialize>(
     canonical_hash("BR160_SOURCE_RECORDS_V1", &(label, rows))
 }
 
+#[cfg(feature = "magic-gateway")]
 fn canonical_instrument_request(instruments: &[InstrumentId]) -> String {
     let mut identities = instruments
         .iter()
@@ -1046,6 +1093,7 @@ fn canonical_instrument_request(instruments: &[InstrumentId]) -> String {
     identities.join(",")
 }
 
+#[cfg(feature = "magic-gateway")]
 fn instrument_identity(instrument: &InstrumentId) -> String {
     format!(
         "{:?}:{:?}:{}",
@@ -1055,6 +1103,7 @@ fn instrument_identity(instrument: &InstrumentId) -> String {
     )
 }
 
+#[cfg(feature = "magic-gateway")]
 fn persist_and_publish_batch(
     batch: &ChainBatchInput,
     request_hash: &str,
@@ -1143,6 +1192,7 @@ fn persist_and_publish_batch(
         })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn audit_chain_success(
     database: &DatabaseManager,
     batch: &ChainBatchInput,
@@ -1189,6 +1239,7 @@ fn audit_chain_success(
         })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn audit_chain_failure(request_hash: &str, error: &GatewayError) -> Result<(), GatewayError> {
     let database = DatabaseManager::try_get().ok_or_else(|| {
         GatewayError::audit_failure(
@@ -1229,6 +1280,7 @@ fn audit_chain_failure(request_hash: &str, error: &GatewayError) -> Result<(), G
         })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn tdx_error(capability: &'static str, error: TdxError) -> GatewayError {
     let message = error.to_string();
     match error {
@@ -1286,6 +1338,7 @@ fn tdx_error(capability: &'static str, error: TdxError) -> GatewayError {
 }
 
 #[cfg(test)]
+#[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
 

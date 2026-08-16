@@ -31,3 +31,7 @@ data/push_log/
 
 # gRPC TLS 证书 (运行时生成/本地保管, 绝不入仓 — P4 迁移安全约束)
 /grpc/*.pem
+
+# client-bundle/ 整个目录绝不入仓 (PEM + Bearer token + connection.json,
+# README: "Keep the entire directory private and never commit it")
+/client-bundle/

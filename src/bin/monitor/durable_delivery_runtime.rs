@@ -7,7 +7,7 @@
 //! the producer-readiness barrier.
 
 use chrono::{DateTime, NaiveDate, Utc};
-use crate::magic_compat::{AssetClass, Exchange, InstrumentId};
+use stock_analysis::magic_compat::{AssetClass, Exchange, InstrumentId};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};

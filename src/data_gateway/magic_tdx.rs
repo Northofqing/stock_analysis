@@ -8,7 +8,9 @@
 //! Business rules: BR-092 (strict K-line validation), BR-147 (settled close
 //! evidence).
 
-use super::magic_tdx_t0::{fetch_magic_tdx_t0_batch, MagicTdxT0Batch};
+use super::magic_tdx_t0::MagicTdxT0Batch;
+#[cfg(feature = "magic-gateway")]
+use super::magic_tdx_t0::fetch_magic_tdx_t0_batch;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
@@ -37,6 +39,17 @@ impl MagicTdxGateway {
             Ok(None) => {}
             Err(error) => return Err(anyhow::anyhow!("T0 证据批 gRPC 桥不可用: {error}")),
         }
-        fetch_magic_tdx_t0_batch(codes, observed_at)
+        // no-feature (monitor 零 magic): library transport 不存在。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(anyhow::anyhow!(
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required"
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            fetch_magic_tdx_t0_batch(codes, observed_at)
+        }
     }
 }

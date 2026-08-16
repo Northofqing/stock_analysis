@@ -4,13 +4,20 @@
 //! 按代码查询)。聚合批次证据 = 首个成功真实批次的 provenance (逐代码真实证据
 //! 保留在上游记录内, 不合成 batch_id, 遵守 BR-164)。
 
+#[cfg(feature = "magic-gateway")]
 use super::instrument_identity::resolve_production_equity;
-use super::review::{acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result};
-use super::{BatchEvidence, GatewayBatch, GatewayError};
+use super::review::{acquisition_request_hash, audit_gateway_result};
+#[cfg(feature = "magic-gateway")]
+use super::review::audit_blocking_join_failure;
+use super::{GatewayBatch, GatewayError};
+#[cfg(feature = "magic-gateway")]
+use super::BatchEvidence;
 use chrono::NaiveDate;
 #[cfg(feature = "magic-gateway")]
 use magic_eastmoney_rs::EastmoneyClient;
-use crate::magic_compat::{IsoDate, PositiveU32, ProviderId};
+use crate::magic_compat::ProviderId;
+#[cfg(feature = "magic-gateway")]
+use crate::magic_compat::{IsoDate, PositiveU32};
 #[cfg(feature = "magic-gateway")]
 use magic_market_core::{BlockTrades, InstrumentDateRangeRequest};
 
@@ -66,26 +73,43 @@ impl BlockTradesGateway {
                 );
             }
         }
-        let codes_owned = codes.to_vec();
-        let result: Result<GatewayBatch<BlockTradeReview>, GatewayError> =
-            match tokio::task::spawn_blocking(move || {
-                fetch_block_trades(&codes_owned, trading_date)
-            })
-            .await
-            {
-                Ok(result) => result,
-                Err(error) => audit_blocking_join_failure(
-                    CAPABILITY,
-                    ProviderId::Eastmoney,
-                    request_hash.clone(),
-                    error.to_string(),
-                )
-                .await,
-            };
-        audit_gateway_result(CAPABILITY, ProviderId::Eastmoney, &request_hash, result)
+        // no-feature (monitor 零 magic): library transport 不存在。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
+                CAPABILITY,
+                Some(ProviderId::Eastmoney),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let codes_owned = codes.to_vec();
+            let result: Result<GatewayBatch<BlockTradeReview>, GatewayError> =
+                match tokio::task::spawn_blocking(move || {
+                    fetch_block_trades(&codes_owned, trading_date)
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => audit_blocking_join_failure(
+                        CAPABILITY,
+                        ProviderId::Eastmoney,
+                        request_hash.clone(),
+                        error.to_string(),
+                    )
+                    .await,
+                };
+            audit_gateway_result(CAPABILITY, ProviderId::Eastmoney, &request_hash, result)
+        }
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn fetch_block_trades(
     codes: &[String],
     trading_date: NaiveDate,

@@ -81,17 +81,34 @@ impl IndexDataGateway {
                 );
             }
         }
-        let result = build_index_instruments(storage_codes).and_then(|instruments| {
-            let client = TencentClient::new().map_err(tencent_gateway_error)?;
-            let batch = client
-                .realtime_quotes(&instruments)
-                .map_err(tencent_gateway_error)?;
-            admit_index_batch(storage_codes, batch, Utc::now())
-        });
-        audit_gateway_result(CAPABILITY, ProviderId::Tencent, &request_hash, result)
+        // no-feature (monitor 零 magic): library transport 不存在。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
+                CAPABILITY,
+                Some(ProviderId::Tencent),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let result = build_index_instruments(storage_codes).and_then(|instruments| {
+                let client = TencentClient::new().map_err(tencent_gateway_error)?;
+                let batch = client
+                    .realtime_quotes(&instruments)
+                    .map_err(tencent_gateway_error)?;
+                admit_index_batch(storage_codes, batch, Utc::now())
+            });
+            audit_gateway_result(CAPABILITY, ProviderId::Tencent, &request_hash, result)
+        }
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn build_index_instruments(storage_codes: &[String]) -> Result<Vec<InstrumentId>, GatewayError> {
     if storage_codes.is_empty() {
         return Err(GatewayError::invalid_request(
@@ -143,6 +160,7 @@ fn build_index_instruments(storage_codes: &[String]) -> Result<Vec<InstrumentId>
         .collect()
 }
 
+#[cfg(feature = "magic-gateway")]
 fn admit_index_batch(
     storage_codes: &[String],
     batch: DataBatch<Quote>,
@@ -323,6 +341,7 @@ fn parse_timestamp(value: &str, field: &str) -> Result<DateTime<Utc>, GatewayErr
         })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn tencent_gateway_error(error: TencentError) -> GatewayError {
     match error {
         TencentError::InvalidRequest(message) => GatewayError::invalid_request(CAPABILITY, message),
@@ -359,6 +378,7 @@ fn tencent_gateway_error(error: TencentError) -> GatewayError {
 }
 
 #[cfg(test)]
+#[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
     use crate::magic_compat::{Money, Price, Provenance, Quantity, Ratio};

@@ -1,10 +1,16 @@
 //! BR-119/BR-164 evidence-preserving research-report acquisition Gateway.
 
-use super::review::{acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result};
-use super::{BatchEvidence, GatewayBatch, GatewayError};
+use super::review::{acquisition_request_hash, audit_gateway_result};
+#[cfg(feature = "magic-gateway")]
+use super::review::audit_blocking_join_failure;
+use super::{GatewayBatch, GatewayError};
+#[cfg(feature = "magic-gateway")]
+use super::BatchEvidence;
 #[cfg(feature = "magic-gateway")]
 use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
-use crate::magic_compat::{DataBatch, PositiveU32, ProviderId};
+use crate::magic_compat::ProviderId;
+#[cfg(feature = "magic-gateway")]
+use crate::magic_compat::{DataBatch, PositiveU32};
 #[cfg(feature = "magic-gateway")]
 use magic_market_core::{ReportScope, ResearchReport, ResearchReports, ResearchRequest};
 
@@ -62,33 +68,50 @@ impl ResearchDataGateway {
                 );
             }
         }
-        let worker_request_hash = request_hash.clone();
-        let joined = tokio::task::spawn_blocking(move || {
-            let result = build_request(&code, page_size).and_then(fetch_reports);
-            audit_gateway_result(
+        // no-feature (monitor 零 magic): library transport 不存在。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
                 CAPABILITY,
-                ProviderId::Eastmoney,
-                &worker_request_hash,
-                result,
-            )
-        })
-        .await;
-
-        match joined {
-            Ok(result) => result,
-            Err(error) => {
-                audit_blocking_join_failure(
+                Some(ProviderId::Eastmoney),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let worker_request_hash = request_hash.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let result = build_request(&code, page_size).and_then(fetch_reports);
+                audit_gateway_result(
                     CAPABILITY,
                     ProviderId::Eastmoney,
-                    request_hash,
-                    error.to_string(),
+                    &worker_request_hash,
+                    result,
                 )
-                .await
+            })
+            .await;
+
+            match joined {
+                Ok(result) => result,
+                Err(error) => {
+                    audit_blocking_join_failure(
+                        CAPABILITY,
+                        ProviderId::Eastmoney,
+                        request_hash,
+                        error.to_string(),
+                    )
+                    .await
+                }
             }
         }
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn build_request(code: &str, page_size: u32) -> Result<ResearchRequest, GatewayError> {
     let instrument = a_share_instrument(code)?;
     let page = PositiveU32::new(1)
@@ -99,6 +122,7 @@ fn build_request(code: &str, page_size: u32) -> Result<ResearchRequest, GatewayE
         .map_err(|error| GatewayError::invalid_request(CAPABILITY, error.to_string()))
 }
 
+#[cfg(feature = "magic-gateway")]
 fn fetch_reports(
     request: ResearchRequest,
 ) -> Result<GatewayBatch<ResearchReportFact>, GatewayError> {
@@ -109,6 +133,7 @@ fn fetch_reports(
     normalize_reports_batch(batch)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn normalize_reports_batch(
     batch: DataBatch<ResearchReport>,
 ) -> Result<GatewayBatch<ResearchReportFact>, GatewayError> {
@@ -169,6 +194,7 @@ fn normalize_reports_batch(
     Ok(GatewayBatch::Available { records, evidence })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_record_evidence(
     record: &crate::magic_compat::SourceEvidence,
     batch: &BatchEvidence,
@@ -204,6 +230,7 @@ fn a_share_instrument(code: &str) -> Result<crate::magic_compat::InstrumentId, G
     Ok(identity.instrument().clone())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn eastmoney_gateway_error(error: EastmoneyError) -> GatewayError {
     let message = error.to_string();
     match error {
@@ -247,12 +274,11 @@ fn eastmoney_gateway_error(error: EastmoneyError) -> GatewayError {
 }
 
 #[cfg(test)]
+#[cfg(feature = "magic-gateway")]
 mod tests {
     use super::{build_request, eastmoney_gateway_error, normalize_reports_batch};
-    #[cfg(feature = "magic-gateway")]
     use magic_eastmoney_rs::EastmoneyError;
     use crate::magic_compat::{AssetClass, DataBatch, Exchange, InstrumentId, NonEmptyText, Price, Provenance, ProviderId, SourceEvidence};
-#[cfg(feature = "magic-gateway")]
 use magic_market_core::{HttpsUrl, ReportScope, ResearchReport};
 
     const OBSERVED_AT: &str = "1784965800.000000000";

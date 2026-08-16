@@ -8,9 +8,11 @@
 //! in this path.
 
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveTime};
-use crate::magic_compat::{AssetClass, DataBatch, InstrumentId, ProviderId};
+use crate::magic_compat::{
+    Adjustment, AssetClass, Bar, BarInterval, DataBatch, InstrumentId, ProviderId,
+};
 #[cfg(feature = "magic-gateway")]
-use magic_market_core::{Adjustment, Bar, BarInterval, BarsRequest, HistoricalBars};
+use magic_market_core::{BarsRequest, HistoricalBars};
 #[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::{TdxError, TdxSmartClient};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -22,19 +24,23 @@ use crate::monitor::data_quality::{validate_daily_freshness, DqStats, FreshnessC
 use crate::selection::outcome_session_gate::validate_shanghai_tick_instant;
 use crate::selection::schema_v2::{
     build_request_evidence, canonical_f64, canonical_json, sha256_bytes, sha256_json,
-    AdjustmentKind, DailyIntervalKind, OutcomeHistoricalBarCardinalityPreimage,
-    OutcomeMarketRequestParametersPreimage, OutcomePhase, OutcomeProviderAvailableEvidencePreimage,
-    OutcomeProviderErrorPreimage, OutcomeProviderRequestPreimage, OutcomeTradingDateVectorPreimage,
-    OutcomeTransportAttemptPreimage, OutcomeTransportAttemptsPreimage,
-    OutcomeTransportBarFingerprint, OutcomeTransportBatchContentPreimage,
-    OutcomeTransportEvidencePreimage, OutcomeTransportRequestPreimage,
-    OutcomeTransportResultPreimage, ProviderAvailableEvidencePreimage,
+    AdjustmentKind, DailyIntervalKind, OutcomeMarketRequestParametersPreimage, OutcomePhase,
+    OutcomeProviderAvailableEvidencePreimage, OutcomeProviderRequestPreimage,
+    OutcomeTradingDateVectorPreimage, OutcomeTransportAttemptPreimage,
+    OutcomeTransportAttemptsPreimage, OutcomeTransportBarFingerprint,
+    OutcomeTransportBatchContentPreimage, ProviderAvailableEvidencePreimage,
     ProviderCapabilityHashPreimage, ProviderEvidenceKind, RequestEvidenceColumns, RequestKind,
     RequestParametersPreimage, AMENDMENT_DESIGN_SHA256, DOMAIN_OUTCOME_MARKET_REQUEST,
     DOMAIN_OUTCOME_PROVIDER_AVAILABLE_EVIDENCE, DOMAIN_OUTCOME_PROVIDER_REQUEST,
     DOMAIN_OUTCOME_TRANSPORT_ATTEMPTS, DOMAIN_PROVIDER_AVAILABLE_EVIDENCE,
     DOMAIN_PROVIDER_CAPABILITY, OUTCOME_ADAPTIVE_POLICY_VERSION, OUTCOME_PARENT_DESIGN_SHA256,
     OUTCOME_TDX_HISTORICAL_PAGE_SIZE, UPSTREAM_REVISION,
+};
+#[cfg(feature = "magic-gateway")]
+use crate::selection::schema_v2::{
+    OutcomeHistoricalBarCardinalityPreimage, OutcomeProviderErrorPreimage,
+    OutcomeTransportEvidencePreimage, OutcomeTransportRequestPreimage,
+    OutcomeTransportResultPreimage,
 };
 
 use super::historical_bars::{finalize_outcome_sequence_async, OutcomeLifecycleAdmission};
@@ -194,6 +200,7 @@ impl OutcomeAcquisitionFailure {
     }
 
     #[cfg(test)]
+    #[cfg(feature = "magic-gateway")]
     pub(crate) fn test_only_after_provider(
         request_evidence: RequestEvidenceColumns,
         reason_code: &'static str,
@@ -615,6 +622,7 @@ impl OutcomeDailyBarsGateway {
                     maximum_latest_n,
                     window_start,
                 ),
+                #[cfg(feature = "magic-gateway")]
                 Ok(None) => fetch_magic_tdx_outcome_adaptive(
                     instrument,
                     wire_market,
@@ -623,6 +631,20 @@ impl OutcomeDailyBarsGateway {
                     maximum_latest_n,
                     window_start,
                 ),
+                // no-feature (monitor 零 magic 构建): library transport 编译期
+                // 不存在。无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+                #[cfg(not(feature = "magic-gateway"))]
+                Ok(None) => Err(OutcomeTransportFailure::new(
+                    GatewayError::classified(
+                        CAPABILITY,
+                        Some(ProviderId::Tdx),
+                        "unavailable",
+                        "provider_transport",
+                        true,
+                        "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                    ),
+                    Vec::new(),
+                )),
                 Err(error) => Err(OutcomeTransportFailure::new(
                     GatewayError::unavailable(
                         CAPABILITY,
@@ -1090,6 +1112,7 @@ fn latest_successful_transport_result_hash(
 }
 
 #[cfg(test)]
+#[cfg(feature = "magic-gateway")]
 fn test_only_transport_attempts(
     request_columns: &RequestEvidenceColumns,
     available_evidence: Option<&OutcomeProviderAvailableEvidencePreimage>,
@@ -1245,6 +1268,8 @@ fn outcome_transport_attempts_preimage(
 
 /// 服务端 delegate 直调点 (P4 M3): 客户端 acquire() 走桥时由 grpc_market_server
 /// 在 spawn_blocking 内调用本函数, 序列化视图后由客户端 convert 重建。
+/// (library transport: 仅 feature 构建编译)
+#[cfg(feature = "magic-gateway")]
 pub(crate) fn fetch_magic_tdx_outcome_adaptive(
     instrument: InstrumentId,
     canonical_market: String,
@@ -1274,6 +1299,7 @@ pub(crate) fn fetch_magic_tdx_outcome_adaptive(
     result
 }
 
+#[cfg(feature = "magic-gateway")]
 fn adaptive_fetch_with<Fetch>(
     canonical_stock_code: &str,
     canonical_market: &str,
@@ -1423,6 +1449,7 @@ where
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 #[allow(clippy::too_many_arguments)]
 fn resolve_available_cardinality<Fetch>(
     canonical_stock_code: &str,
@@ -1571,6 +1598,7 @@ where
     ))
 }
 
+#[cfg(feature = "magic-gateway")]
 fn ensure_success_cardinality(
     requested_latest_n: u16,
     batch: &DataBatch<Bar>,
@@ -1585,6 +1613,7 @@ fn ensure_success_cardinality(
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn batch_covers_window_start(
     batch: &DataBatch<Bar>,
     window_start: NaiveDate,
@@ -1608,6 +1637,88 @@ struct ValidatedHistoricalBarCardinality {
     requested_total: u16,
 }
 
+/// 无 feature 构建下 TdxError 类型不存在 (library transport 编译期被移除),
+/// 但同一套 cardinality 验证逻辑被两个入口共用: feature 构建的 typed 错误
+/// 分支 (`validated_cardinality_mismatch`) 与无条件的历史复核
+/// (`validate_transport_attempts`)。验证主体与 TdxError 解耦为单一来源,
+/// 避免两条路径行为漂移。
+fn validated_cardinality_from_parts(
+    offset: u32,
+    actual: usize,
+    expected_page: u16,
+    requested_total: u16,
+    current_request: u16,
+) -> Result<Option<ValidatedHistoricalBarCardinality>, GatewayError> {
+    if requested_total != current_request {
+        return Err(invalid_evidence(format!(
+            "Magic TDX cardinality total {} does not equal current request {current_request}",
+            requested_total
+        )));
+    }
+    if expected_page == 0 {
+        return Err(invalid_evidence(
+            "Magic TDX cardinality error has zero expected page",
+        ));
+    }
+    if offset % OUTCOME_TDX_HISTORICAL_PAGE_SIZE != 0 {
+        return Err(invalid_evidence(format!(
+            "Magic TDX cardinality offset={offset} is not aligned to the exact \
+             {OUTCOME_TDX_HISTORICAL_PAGE_SIZE}-row page geometry"
+        )));
+    }
+    let requested_total_u32 = u32::from(requested_total);
+    if offset >= requested_total_u32 {
+        return Err(invalid_evidence(format!(
+            "Magic TDX cardinality offset={offset} is outside requested_total={requested_total}"
+        )));
+    }
+    let expected_for_offset = (requested_total_u32 - offset).min(OUTCOME_TDX_HISTORICAL_PAGE_SIZE);
+    if u32::from(expected_page) != expected_for_offset {
+        return Err(invalid_evidence(format!(
+            "Magic TDX cardinality offset={offset} expected_page={expected_page} does not equal \
+             exact upstream page size {expected_for_offset} for requested_total={requested_total}"
+        )));
+    }
+    let expected_page_end = offset
+        .checked_add(u32::from(expected_page))
+        .ok_or_else(|| invalid_evidence("Magic TDX expected page end overflows u32"))?;
+    if expected_page_end > u32::from(requested_total) {
+        return Err(invalid_evidence(format!(
+            "Magic TDX cardinality page offset={offset} expected_page={expected_page} exceeds \
+             requested_total={requested_total}"
+        )));
+    }
+    if actual == usize::from(expected_page) {
+        return Err(invalid_evidence(
+            "Magic TDX cardinality error contradicts an exact page response",
+        ));
+    }
+    if actual > usize::from(expected_page) {
+        return Err(invalid_evidence(format!(
+            "Magic TDX cardinality page returned {actual} rows above expected_page={expected_page}"
+        )));
+    }
+    let actual = u32::try_from(actual)
+        .map_err(|_| invalid_evidence("Magic TDX cardinality actual count exceeds u32"))?;
+    let available_count = offset
+        .checked_add(actual)
+        .ok_or_else(|| invalid_evidence("Magic TDX available cardinality overflows u32"))?;
+    let available_count = u16::try_from(available_count)
+        .map_err(|_| invalid_evidence("Magic TDX available cardinality exceeds u16"))?;
+    if available_count > requested_total {
+        return Err(invalid_evidence(format!(
+            "Magic TDX available cardinality {available_count} exceeds requested_total={requested_total}"
+        )));
+    }
+    Ok(Some(ValidatedHistoricalBarCardinality {
+        available_count,
+        requested_total,
+    }))
+}
+
+/// Magic TDX typed 错误变体 → 复用单一来源验证 (仅 feature 构建; TdxError
+/// 在 no-feature 构建下不存在)。
+#[cfg(feature = "magic-gateway")]
 fn validated_cardinality_mismatch(
     error: &TdxError,
     current_request: u16,
@@ -1621,73 +1732,16 @@ fn validated_cardinality_mismatch(
     else {
         return Ok(None);
     };
-    if *requested_total != current_request {
-        return Err(invalid_evidence(format!(
-            "Magic TDX cardinality total {} does not equal current request {current_request}",
-            requested_total
-        )));
-    }
-    if *expected_page == 0 {
-        return Err(invalid_evidence(
-            "Magic TDX cardinality error has zero expected page",
-        ));
-    }
-    if *offset % OUTCOME_TDX_HISTORICAL_PAGE_SIZE != 0 {
-        return Err(invalid_evidence(format!(
-            "Magic TDX cardinality offset={offset} is not aligned to the exact \
-             {OUTCOME_TDX_HISTORICAL_PAGE_SIZE}-row page geometry"
-        )));
-    }
-    let requested_total_u32 = u32::from(*requested_total);
-    if *offset >= requested_total_u32 {
-        return Err(invalid_evidence(format!(
-            "Magic TDX cardinality offset={offset} is outside requested_total={requested_total}"
-        )));
-    }
-    let expected_for_offset = (requested_total_u32 - *offset).min(OUTCOME_TDX_HISTORICAL_PAGE_SIZE);
-    if u32::from(*expected_page) != expected_for_offset {
-        return Err(invalid_evidence(format!(
-            "Magic TDX cardinality offset={offset} expected_page={expected_page} does not equal \
-             exact upstream page size {expected_for_offset} for requested_total={requested_total}"
-        )));
-    }
-    let expected_page_end = offset
-        .checked_add(u32::from(*expected_page))
-        .ok_or_else(|| invalid_evidence("Magic TDX expected page end overflows u32"))?;
-    if expected_page_end > u32::from(*requested_total) {
-        return Err(invalid_evidence(format!(
-            "Magic TDX cardinality page offset={offset} expected_page={expected_page} exceeds \
-             requested_total={requested_total}"
-        )));
-    }
-    if *actual == usize::from(*expected_page) {
-        return Err(invalid_evidence(
-            "Magic TDX cardinality error contradicts an exact page response",
-        ));
-    }
-    if *actual > usize::from(*expected_page) {
-        return Err(invalid_evidence(format!(
-            "Magic TDX cardinality page returned {actual} rows above expected_page={expected_page}"
-        )));
-    }
-    let actual = u32::try_from(*actual)
-        .map_err(|_| invalid_evidence("Magic TDX cardinality actual count exceeds u32"))?;
-    let available_count = offset
-        .checked_add(actual)
-        .ok_or_else(|| invalid_evidence("Magic TDX available cardinality overflows u32"))?;
-    let available_count = u16::try_from(available_count)
-        .map_err(|_| invalid_evidence("Magic TDX available cardinality exceeds u16"))?;
-    if available_count > *requested_total {
-        return Err(invalid_evidence(format!(
-            "Magic TDX available cardinality {available_count} exceeds requested_total={requested_total}"
-        )));
-    }
-    Ok(Some(ValidatedHistoricalBarCardinality {
-        available_count,
-        requested_total: *requested_total,
-    }))
+    validated_cardinality_from_parts(
+        *offset,
+        *actual,
+        *expected_page,
+        *requested_total,
+        current_request,
+    )
 }
 
+#[cfg(feature = "magic-gateway")]
 fn successful_transport_attempt(
     request_ordinal: u32,
     canonical_stock_code: &str,
@@ -1736,6 +1790,7 @@ fn successful_transport_attempt(
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn failed_transport_attempt(
     request_ordinal: u32,
     canonical_stock_code: &str,
@@ -1772,6 +1827,7 @@ fn failed_transport_attempt(
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn provider_error_preimage(error: &TdxError) -> Result<OutcomeProviderErrorPreimage, GatewayError> {
     let (variant, coded_error, io_kind, raw_os_error, detail, historical_bar_cardinality) =
         match error {
@@ -1883,6 +1939,7 @@ fn provider_error_preimage(error: &TdxError) -> Result<OutcomeProviderErrorPreim
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn transport_request_preimage(
     canonical_stock_code: &str,
     canonical_market: &str,
@@ -1987,16 +2044,14 @@ fn validate_transport_attempts(
                 let actual = usize::try_from(cardinality.actual).map_err(|_| {
                     invalid_evidence("stored TDX cardinality actual does not fit usize")
                 })?;
-                let typed = TdxError::HistoricalBarCardinality {
-                    offset: cardinality.offset,
+                let validated = validated_cardinality_from_parts(
+                    cardinality.offset,
                     actual,
-                    expected_page: cardinality.expected_page,
-                    requested_total: cardinality.requested_total,
-                };
-                let validated = validated_cardinality_mismatch(&typed, attempt.request.latest_n)?
-                    .ok_or_else(|| {
-                    invalid_evidence("typed cardinality variant was not read")
-                })?;
+                    cardinality.expected_page,
+                    cardinality.requested_total,
+                    attempt.request.latest_n,
+                )?
+                .ok_or_else(|| invalid_evidence("typed cardinality variant was not read"))?;
                 let structured_hash = sha256_json(cardinality).map_err(schema_gateway_error)?;
                 if provider_error.variant != "historical_bar_cardinality"
                     || provider_error.structured_detail_hash.as_deref()
@@ -2044,6 +2099,7 @@ fn validate_transport_attempt_prefix(
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn unsupported_recovery_window(
     window_start: NaiveDate,
     largest_successful_latest_n: u16,
@@ -3281,6 +3337,7 @@ fn outcome_instrument(code: &str, canonical_market: &str) -> Result<InstrumentId
     .map_err(|error| GatewayError::invalid_request(CAPABILITY, error.to_string()))
 }
 
+#[cfg(feature = "magic-gateway")]
 fn map_tdx_error(error: TdxError) -> GatewayError {
     let (reason_code, retryable) = match &error {
         TdxError::InvalidData(_)
@@ -3369,6 +3426,7 @@ fn validate_unit_contract() -> Result<(), GatewayError> {
 }
 
 #[cfg(test)]
+#[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
     use chrono::Duration;

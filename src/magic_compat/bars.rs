@@ -10,6 +10,7 @@ use serde::{de, Deserialize, Deserializer, Serialize};
 use super::instrument::{CoreError, InstrumentId};
 #[cfg(not(feature = "magic-gateway"))]
 use super::value::{Money, Price, Quantity};
+#[cfg(not(feature = "magic-gateway"))]
 use super::ProviderId;
 
 /// OHLCV bar granularity.

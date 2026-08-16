@@ -2021,6 +2021,7 @@ fn schema_error(error: crate::selection::schema_v2::SchemaV2Error) -> OutcomeV2E
 }
 
 #[cfg(test)]
+#[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
     use crate::selection::schema_v2::{

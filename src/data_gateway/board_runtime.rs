@@ -1,10 +1,13 @@
 //! BR-164/BR-188 evidence-preserving board discovery and flow Gateway runtime.
 
-use super::review::{acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result};
+use super::review::{acquisition_request_hash, audit_gateway_result};
+#[cfg(feature = "magic-gateway")]
+use super::review::audit_blocking_join_failure;
 use super::{BatchEvidence, GatewayBatch, GatewayError};
 #[cfg(feature = "magic-gateway")]
 use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
 use crate::magic_compat::{InstrumentId, ProviderId};
+#[cfg(feature = "magic-gateway")]
 use crate::magic_compat::{DataBatch, FlowInterval, PositiveU32};
 #[cfg(feature = "magic-gateway")]
 use magic_market_core::{BoardCategory, BoardConstituentProvider, BoardConstituentRequest, BoardDirectoryProvider, BoardDirectoryRequest, BoardFlows, BoardMembership, BoardMembershipProvider};
@@ -139,6 +142,7 @@ impl BoardDataGateway {
         self.connection_policy
     }
 
+    #[cfg(feature = "magic-gateway")]
     pub(super) fn board_constituents_raw(
         &self,
         request: &BoardConstituentRequest,
@@ -175,24 +179,40 @@ impl BoardDataGateway {
                 );
             }
         }
-        let worker_hash = request_hash.clone();
-        let gateway = *self;
-        let joined = tokio::task::spawn_blocking(move || {
-            let result = build_directory_request(kind, limit)
-                .and_then(|request| fetch_directory(gateway, request));
-            audit_gateway_result(DIRECTORY_CAPABILITY, ProviderId::Tdx, &worker_hash, result)
-        })
-        .await;
-        match joined {
-            Ok(result) => result,
-            Err(error) => {
-                audit_blocking_join_failure(
-                    DIRECTORY_CAPABILITY,
-                    ProviderId::Tdx,
-                    request_hash,
-                    error.to_string(),
-                )
-                .await
+        // no-feature (monitor 零 magic): library transport 不存在。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
+                DIRECTORY_CAPABILITY,
+                Some(ProviderId::Tdx),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let worker_hash = request_hash.clone();
+            let gateway = *self;
+            let joined = tokio::task::spawn_blocking(move || {
+                let result = build_directory_request(kind, limit)
+                    .and_then(|request| fetch_directory(gateway, request));
+                audit_gateway_result(DIRECTORY_CAPABILITY, ProviderId::Tdx, &worker_hash, result)
+            })
+            .await;
+            match joined {
+                Ok(result) => result,
+                Err(error) => {
+                    audit_blocking_join_failure(
+                        DIRECTORY_CAPABILITY,
+                        ProviderId::Tdx,
+                        request_hash,
+                        error.to_string(),
+                    )
+                    .await
+                }
             }
         }
     }
@@ -223,19 +243,36 @@ impl BoardDataGateway {
                 );
             }
         }
-        let gateway = *self;
-        let joined =
-            tokio::task::spawn_blocking(move || fetch_memberships_audited(gateway, code)).await;
-        match joined {
-            Ok(result) => result,
-            Err(error) => {
-                audit_blocking_join_failure(
-                    MEMBERSHIP_CAPABILITY,
-                    ProviderId::Tdx,
-                    request_hash,
-                    error.to_string(),
-                )
-                .await
+        // no-feature (monitor 零 magic): library transport 不存在。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
+                MEMBERSHIP_CAPABILITY,
+                Some(ProviderId::Tdx),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let gateway = *self;
+            let joined =
+                tokio::task::spawn_blocking(move || fetch_memberships_audited(gateway, code))
+                    .await;
+            match joined {
+                Ok(result) => result,
+                Err(error) => {
+                    audit_blocking_join_failure(
+                        MEMBERSHIP_CAPABILITY,
+                        ProviderId::Tdx,
+                        request_hash,
+                        error.to_string(),
+                    )
+                    .await
+                }
             }
         }
     }
@@ -251,7 +288,25 @@ impl BoardDataGateway {
         code: &str,
     ) -> Result<GatewayBatch<BoardMembershipRecord>, GatewayError> {
         let code = validate_code(code, MEMBERSHIP_CAPABILITY)?.to_owned();
-        fetch_memberships_audited(*self, code)
+        // no-feature (monitor 零 magic): library transport 不存在。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
+                MEMBERSHIP_CAPABILITY,
+                Some(ProviderId::Tdx),
+                "unavailable",
+                "provider_transport",
+                true,
+                &format!(
+                    "library transport disabled: DATA_GATEWAY_GRPC=1 required (code={code})"
+                ),
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            fetch_memberships_audited(*self, code)
+        }
     }
 
     pub async fn day1_flows(
@@ -281,22 +336,38 @@ impl BoardDataGateway {
                 );
             }
         }
-        let worker_hash = request_hash.clone();
-        let joined = tokio::task::spawn_blocking(move || {
-            let result = build_flow_request(kind, limit).and_then(fetch_flows);
-            audit_gateway_result(FLOW_CAPABILITY, ProviderId::Eastmoney, &worker_hash, result)
-        })
-        .await;
-        match joined {
-            Ok(result) => result,
-            Err(error) => {
-                audit_blocking_join_failure(
-                    FLOW_CAPABILITY,
-                    ProviderId::Eastmoney,
-                    request_hash,
-                    error.to_string(),
-                )
-                .await
+        // no-feature (monitor 零 magic): library transport 不存在。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
+                FLOW_CAPABILITY,
+                Some(ProviderId::Eastmoney),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let worker_hash = request_hash.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let result = build_flow_request(kind, limit).and_then(fetch_flows);
+                audit_gateway_result(FLOW_CAPABILITY, ProviderId::Eastmoney, &worker_hash, result)
+            })
+            .await;
+            match joined {
+                Ok(result) => result,
+                Err(error) => {
+                    audit_blocking_join_failure(
+                        FLOW_CAPABILITY,
+                        ProviderId::Eastmoney,
+                        request_hash,
+                        error.to_string(),
+                    )
+                    .await
+                }
             }
         }
     }
@@ -332,16 +403,33 @@ impl BoardDataGateway {
                 );
             }
         }
-        let result = build_flow_request(kind, limit).and_then(fetch_flows);
-        audit_gateway_result(
-            FLOW_CAPABILITY,
-            ProviderId::Eastmoney,
-            &request_hash,
-            result,
-        )
+        // no-feature (monitor 零 magic): library transport 不存在。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
+                FLOW_CAPABILITY,
+                Some(ProviderId::Eastmoney),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let result = build_flow_request(kind, limit).and_then(fetch_flows);
+            audit_gateway_result(
+                FLOW_CAPABILITY,
+                ProviderId::Eastmoney,
+                &request_hash,
+                result,
+            )
+        }
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn fetch_memberships_audited(
     gateway: BoardDataGateway,
     code: String,
@@ -357,6 +445,7 @@ fn fetch_memberships_audited(
     )
 }
 
+#[cfg(feature = "magic-gateway")]
 fn build_directory_request(
     kind: BoardKind,
     limit: u32,
@@ -367,6 +456,7 @@ fn build_directory_request(
         .map_err(|error| GatewayError::invalid_request(DIRECTORY_CAPABILITY, error.to_string()))
 }
 
+#[cfg(feature = "magic-gateway")]
 fn fetch_directory(
     gateway: BoardDataGateway,
     request: BoardDirectoryRequest,
@@ -410,10 +500,12 @@ fn fetch_directory(
     finish_batch(records, evidence)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn build_instrument(code: &str) -> Result<InstrumentId, GatewayError> {
     a_share_instrument(code, MEMBERSHIP_CAPABILITY)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn fetch_memberships(
     gateway: BoardDataGateway,
     instrument: InstrumentId,
@@ -457,6 +549,7 @@ fn fetch_memberships(
     finish_batch(records, evidence)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn build_flow_request(
     kind: BoardKind,
     limit: u32,
@@ -467,6 +560,7 @@ fn build_flow_request(
     Ok((category, limit))
 }
 
+#[cfg(feature = "magic-gateway")]
 fn fetch_flows(
     request: (BoardCategory, PositiveU32),
 ) -> Result<GatewayBatch<BoardFlowFact>, GatewayError> {
@@ -513,6 +607,7 @@ fn fetch_flows(
 }
 
 impl BoardDataGateway {
+    #[cfg(feature = "magic-gateway")]
     fn connected_tdx_board_provider(
         self,
         capability: &'static str,
@@ -527,6 +622,7 @@ impl BoardDataGateway {
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn resolve_production_tdx_board_provider(
     capability: &'static str,
 ) -> Result<TdxBoardProvider, GatewayError> {
@@ -632,6 +728,7 @@ fn validate_batch_evidence(
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn category(kind: BoardKind) -> Result<BoardCategory, GatewayError> {
     Ok(match kind {
         BoardKind::Industry => BoardCategory::Industry,
@@ -640,6 +737,7 @@ fn category(kind: BoardKind) -> Result<BoardCategory, GatewayError> {
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn kind(category: BoardCategory) -> Result<BoardKind, GatewayError> {
     match category {
         BoardCategory::Industry => Ok(BoardKind::Industry),
@@ -671,6 +769,7 @@ fn a_share_instrument(code: &str, capability: &'static str) -> Result<Instrument
     Ok(identity.instrument().clone())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn tdx_gateway_error(capability: &'static str, error: TdxError) -> GatewayError {
     let message = error.to_string();
     match error {
@@ -727,6 +826,7 @@ fn tdx_gateway_error(capability: &'static str, error: TdxError) -> GatewayError 
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn eastmoney_gateway_error(error: EastmoneyError) -> GatewayError {
     let message = error.to_string();
     match error {
@@ -772,6 +872,7 @@ fn eastmoney_gateway_error(error: EastmoneyError) -> GatewayError {
 }
 
 #[cfg(test)]
+#[cfg(feature = "magic-gateway")]
 mod tests {
     use super::{
         build_directory_request, build_flow_request, build_instrument, category,

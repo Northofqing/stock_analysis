@@ -1511,6 +1511,7 @@ fn nonempty_optional(value: &str) -> Option<&str> {
 }
 
 #[cfg(test)]
+#[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
     use crate::data_gateway::historical_bars::AdmittedDailyBars;

@@ -1,13 +1,23 @@
 //! BR-133/BR-167 evidence-preserving macroeconomic release acquisition.
 
-use super::review::{acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result};
-use super::{BatchEvidence, GatewayBatch, GatewayError};
-use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
+use super::review::{acquisition_request_hash, audit_gateway_result};
+#[cfg(feature = "magic-gateway")]
+use super::review::audit_blocking_join_failure;
+use super::{GatewayBatch, GatewayError};
+#[cfg(feature = "magic-gateway")]
+use super::BatchEvidence;
+use chrono::{DateTime, Utc};
+#[cfg(feature = "magic-gateway")]
+use chrono::{FixedOffset, NaiveDateTime, TimeZone};
 #[cfg(feature = "magic-gateway")]
 use magic_jin10_rs::{Jin10Client, Jin10Error};
-use crate::magic_compat::{DataBatch, PositiveU32, ProviderId, SourceEvidence};
+use crate::magic_compat::{ProviderId, SourceEvidence};
 #[cfg(feature = "magic-gateway")]
+use crate::magic_compat::{DataBatch, PositiveU32};
+#[cfg(feature = "magic-gateway")]
+// EconomicCalendarProvider 是 method-resolution trait (正文无 :: 用法)。
 use magic_market_core::{EconomicCalendarProvider, EconomicCalendarRequest, EconomicEvent};
+#[cfg(feature = "magic-gateway")]
 use std::collections::HashSet;
 
 const CAPABILITY: &str = "EconomicCalendar-Jin10";
@@ -71,27 +81,44 @@ impl EconomicCalendarGateway {
                 return audit_gateway_result(CAPABILITY, ProviderId::Jin10, &request_hash, Err(error));
             }
         }
-        let worker_hash = request_hash.clone();
-        let joined = tokio::task::spawn_blocking(move || {
-            let result = build_request(limit, country.as_deref()).and_then(fetch_and_admit);
-            audit_gateway_result(CAPABILITY, ProviderId::Jin10, &worker_hash, result)
-        })
-        .await;
-        match joined {
-            Ok(result) => result,
-            Err(error) => {
-                audit_blocking_join_failure(
-                    CAPABILITY,
-                    ProviderId::Jin10,
-                    request_hash,
-                    error.to_string(),
-                )
-                .await
+        // no-feature (monitor 零 magic): library transport 不存在。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
+                CAPABILITY,
+                Some(ProviderId::Jin10),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let worker_hash = request_hash.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let result = build_request(limit, country.as_deref()).and_then(fetch_and_admit);
+                audit_gateway_result(CAPABILITY, ProviderId::Jin10, &worker_hash, result)
+            })
+            .await;
+            match joined {
+                Ok(result) => result,
+                Err(error) => {
+                    audit_blocking_join_failure(
+                        CAPABILITY,
+                        ProviderId::Jin10,
+                        request_hash,
+                        error.to_string(),
+                    )
+                    .await
+                }
             }
         }
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn build_request(
     limit: u32,
     country: Option<&str>,
@@ -119,6 +146,7 @@ fn build_request(
     Ok(request)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn fetch_and_admit(
     request: EconomicCalendarRequest,
 ) -> Result<GatewayBatch<EconomicReleaseFact>, GatewayError> {
@@ -129,6 +157,7 @@ fn fetch_and_admit(
     admit_jin10_batch(batch, &request)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn admit_jin10_batch(
     batch: DataBatch<EconomicEvent>,
     request: &EconomicCalendarRequest,
@@ -269,6 +298,7 @@ fn admit_jin10_batch(
     Ok(GatewayBatch::Available { records, evidence })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_record_evidence(
     event: &EconomicEvent,
     batch: &BatchEvidence,
@@ -290,6 +320,7 @@ fn validate_record_evidence(
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn parse_china_time(value: &str, field: &str) -> Result<DateTime<Utc>, GatewayError> {
     let naive = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").map_err(|error| {
         GatewayError::invalid_evidence(
@@ -318,6 +349,7 @@ fn parse_china_time(value: &str, field: &str) -> Result<DateTime<Utc>, GatewayEr
         })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn parse_observed_at(value: &str) -> Result<DateTime<Utc>, GatewayError> {
     let (seconds, nanos) = value.split_once('.').ok_or_else(|| {
         GatewayError::invalid_evidence(
@@ -356,10 +388,12 @@ fn parse_observed_at(value: &str) -> Result<DateTime<Utc>, GatewayError> {
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn optional_text(value: Option<crate::magic_compat::NonEmptyText>) -> Option<String> {
     value.map(|value| value.as_str().to_owned())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn jin10_gateway_error(error: Jin10Error) -> GatewayError {
     let message = error.to_string();
     match error {
@@ -382,11 +416,11 @@ fn jin10_gateway_error(error: Jin10Error) -> GatewayError {
 }
 
 #[cfg(test)]
+#[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
     use crate::magic_compat::{DataBatch, NonEmptyText, PositiveU32, Provenance, ProviderId, SourceEvidence};
-#[cfg(feature = "magic-gateway")]
-use magic_market_core::{EconomicEvent};
+use magic_market_core::EconomicEvent;
 
     fn event(
         batch_id: &str,

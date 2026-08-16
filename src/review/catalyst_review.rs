@@ -190,17 +190,32 @@ pub async fn load_catalyst_review_snapshot_real(
     }
     let review_date = NaiveDate::parse_from_str(date, "%Y-%m-%d")
         .map_err(|error| format!("A-10 非法复盘日期 {date}: {error}"))?;
-    let batch = crate::data_gateway::ChainIntelligenceGateway::new()
-        .build_for_date(review_date)
-        .await
-        .map_err(|error| error.to_string())?;
-    if batch.trading_date != review_date {
+    // no-feature (monitor 零 magic): library 重算 transport 不存在。
+    // 无 bridge 时显式失败 (fail-closed), 绝不静默回退/双写旧缓存产物。
+    #[cfg(not(feature = "magic-gateway"))]
+    {
         return Err(format!(
-            "A-10 visible batch as_of={} differs from requested {}",
-            batch.trading_date, review_date
+            "A-10 library transport disabled: DATA_GATEWAY_GRPC=1 required"
         ));
     }
-    catalyst_review_from_chain_batch(&batch)
+    #[cfg(feature = "magic-gateway")]
+    {
+        let batch = crate::data_gateway::ChainIntelligenceGateway::new()
+            .build_for_date(review_date)
+            .await
+            .map_err(|error| error.to_string())?;
+        if batch.trading_date != review_date {
+            return Err(format!(
+                "A-10 visible batch as_of={} differs from requested {}",
+                batch.trading_date, review_date
+            ));
+        }
+        catalyst_review_from_chain_batch(&batch)
+    }
+    #[cfg(not(feature = "magic-gateway"))]
+    {
+        unreachable!("A-10 library transport disabled guard returned above")
+    }
 }
 
 /// BR-160 历史回放 (backfill 专用): 读取指定交易日「最早落库」的 visible batch

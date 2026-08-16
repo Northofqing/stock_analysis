@@ -2,16 +2,23 @@
 //! Typed seller-consensus acquisition and normalization.
 
 use crate::data_gateway::review::{
-    acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result, BatchEvidence,
-    GatewayBatch, GatewayError,
+    acquisition_request_hash, audit_gateway_result, GatewayBatch, GatewayError,
 };
-use crate::data_provider::consensus::{ConsensusData, RecentReport};
+#[cfg(feature = "magic-gateway")]
+use crate::data_gateway::review::{audit_blocking_join_failure, BatchEvidence};
+use crate::data_provider::consensus::ConsensusData;
+#[cfg(feature = "magic-gateway")]
+use crate::data_provider::consensus::RecentReport;
+#[cfg(feature = "magic-gateway")]
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime};
 #[cfg(feature = "magic-gateway")]
 use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
-use crate::magic_compat::{InstrumentId, PositiveU32, ProviderId};
+use crate::magic_compat::ProviderId;
+#[cfg(feature = "magic-gateway")]
+use crate::magic_compat::{InstrumentId, PositiveU32};
 #[cfg(feature = "magic-gateway")]
 use magic_market_core::{ReportScope, ResearchReport, ResearchReports, ResearchRequest};
+#[cfg(feature = "magic-gateway")]
 use std::collections::{HashMap, HashSet};
 
 const CAPABILITY: &str = "consensus";
@@ -57,27 +64,44 @@ impl ConsensusDataGateway {
                 );
             }
         }
-        let worker_hash = request_hash.clone();
-        let joined = tokio::task::spawn_blocking(move || {
-            let result = a_share_instrument(&code).and_then(fetch_consensus_batch);
-            audit_gateway_result(CAPABILITY, ProviderId::Eastmoney, &worker_hash, result)
-        })
-        .await;
-        match joined {
-            Ok(result) => result,
-            Err(error) => {
-                audit_blocking_join_failure(
-                    CAPABILITY,
-                    ProviderId::Eastmoney,
-                    request_hash,
-                    error.to_string(),
-                )
-                .await
+        // no-feature (monitor 零 magic): library transport 不存在。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
+                CAPABILITY,
+                Some(ProviderId::Eastmoney),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let worker_hash = request_hash.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let result = a_share_instrument(&code).and_then(fetch_consensus_batch);
+                audit_gateway_result(CAPABILITY, ProviderId::Eastmoney, &worker_hash, result)
+            })
+            .await;
+            match joined {
+                Ok(result) => result,
+                Err(error) => {
+                    audit_blocking_join_failure(
+                        CAPABILITY,
+                        ProviderId::Eastmoney,
+                        request_hash,
+                        error.to_string(),
+                    )
+                    .await
+                }
             }
         }
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn a_share_instrument(code: &str) -> Result<InstrumentId, GatewayError> {
     #[cfg(test)]
     let resolved = super::instrument_identity::resolve_test_equity(code, None);
@@ -91,6 +115,7 @@ fn a_share_instrument(code: &str) -> Result<InstrumentId, GatewayError> {
     Ok(identity.instrument().clone())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn fetch_consensus_batch(
     instrument: InstrumentId,
 ) -> Result<GatewayBatch<ConsensusData>, GatewayError> {
@@ -129,6 +154,7 @@ fn fetch_consensus_batch(
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn normalize_reports(
     reports: &[ResearchReport],
     expected_instrument: &InstrumentId,
@@ -283,6 +309,7 @@ fn normalize_reports(
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn parse_provider_date(raw: &str) -> Result<NaiveDate, GatewayError> {
     NaiveDate::parse_from_str(raw, "%Y-%m-%d")
         .or_else(|_| {
@@ -300,14 +327,17 @@ fn parse_provider_date(raw: &str) -> Result<NaiveDate, GatewayError> {
         })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn average(values: &[f64]) -> Option<f64> {
     (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn invalid_evidence(message: impl Into<String>) -> GatewayError {
     GatewayError::invalid_evidence(CAPABILITY, Some(ProviderId::Eastmoney), message)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn map_provider_error(error: EastmoneyError) -> GatewayError {
     let message = error.to_string();
     match error {
@@ -338,10 +368,10 @@ fn map_provider_error(error: EastmoneyError) -> GatewayError {
 }
 
 #[cfg(test)]
+#[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
     use crate::magic_compat::{AssetClass, Exchange, FiniteNumber, NonEmptyText, Price, SourceEvidence};
-#[cfg(feature = "magic-gateway")]
 use magic_market_core::{EarningsEstimate, HttpsUrl};
 
     fn instrument() -> InstrumentId {

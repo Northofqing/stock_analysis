@@ -1,13 +1,25 @@
 //! BR-161 evidence-preserving global-index and foreign-exchange acquisition.
 
-use super::review::{acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result};
-use super::{BatchEvidence, GatewayBatch, GatewayError};
-use chrono::{DateTime, Utc};
-use crate::magic_compat::{DataBatch, FxPair, GlobalIndexCode, ProviderId, RatioUnit};
+use super::review::{acquisition_request_hash, audit_gateway_result};
 #[cfg(feature = "magic-gateway")]
-use magic_market_core::{ForeignExchangeProvider, FxQuote, FxRequest, GlobalIndexProvider, GlobalIndexQuote, GlobalIndexRequest};
+use super::review::audit_blocking_join_failure;
+use super::{GatewayBatch, GatewayError};
+#[cfg(feature = "magic-gateway")]
+use super::BatchEvidence;
+use chrono::{DateTime, Utc};
+use crate::magic_compat::{FxPair, GlobalIndexCode, ProviderId};
+#[cfg(feature = "magic-gateway")]
+use crate::magic_compat::{DataBatch, RatioUnit};
+#[cfg(feature = "magic-gateway")]
+// GlobalIndexProvider/ForeignExchangeProvider 是 method-resolution trait
+// (正文无 :: 用法), 提供 .global_indices()/.foreign_exchange() 方法解析。
+use magic_market_core::{
+    ForeignExchangeProvider, FxQuote, FxRequest, GlobalIndexProvider, GlobalIndexQuote,
+    GlobalIndexRequest,
+};
 #[cfg(feature = "magic-gateway")]
 use magic_sina_rs::{SinaClient, SinaError};
+#[cfg(feature = "magic-gateway")]
 use std::collections::HashSet;
 
 const INDEX_CAPABILITY: &str = "R-08-global-indices";
@@ -54,53 +66,63 @@ impl GlobalMarketGateway {
 
     /// Acquires exactly Dow Jones, Nasdaq Composite and S&P 500.
     pub async fn us_indices(&self) -> Result<GatewayBatch<GlobalIndexFact>, GatewayError> {
-        let request = GlobalIndexRequest::new(vec![
-            GlobalIndexCode::DowJones,
-            GlobalIndexCode::NasdaqComposite,
-            GlobalIndexCode::Sp500,
-        ])
-        .map_err(|error| {
-            GatewayError::invalid_request(
+        // no-feature (monitor 零 magic): library transport 不存在。
+        // GlobalIndices 无 gRPC 桥 (HOOKED_OPS 不含), 显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
                 INDEX_CAPABILITY,
-                format!("invalid US index request: {error}"),
-            )
-        })?;
-        let request_hash =
-            acquisition_request_hash(INDEX_CAPABILITY, "DowJones,NasdaqComposite,Sp500");
-        let worker_request_hash = request_hash.clone();
-        let joined = tokio::task::spawn_blocking(move || {
-            let result = fetch_and_admit_indices(request);
-            audit_gateway_result(
-                INDEX_CAPABILITY,
-                ProviderId::Sina,
-                &worker_request_hash,
-                result,
-            )
-        })
-        .await;
-
-        match joined {
-            Ok(result) => result,
-            Err(error) => {
-                audit_blocking_join_failure(
+                Some(ProviderId::Sina),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let request = GlobalIndexRequest::new(vec![
+                GlobalIndexCode::DowJones,
+                GlobalIndexCode::NasdaqComposite,
+                GlobalIndexCode::Sp500,
+            ])
+            .map_err(|error| {
+                GatewayError::invalid_request(
+                    INDEX_CAPABILITY,
+                    format!("invalid US index request: {error}"),
+                )
+            })?;
+            let request_hash =
+                acquisition_request_hash(INDEX_CAPABILITY, "DowJones,NasdaqComposite,Sp500");
+            let worker_request_hash = request_hash.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let result = fetch_and_admit_indices(request);
+                audit_gateway_result(
                     INDEX_CAPABILITY,
                     ProviderId::Sina,
-                    request_hash,
-                    error.to_string(),
+                    &worker_request_hash,
+                    result,
                 )
-                .await
+            })
+            .await;
+
+            match joined {
+                Ok(result) => result,
+                Err(error) => {
+                    audit_blocking_join_failure(
+                        INDEX_CAPABILITY,
+                        ProviderId::Sina,
+                        request_hash,
+                        error.to_string(),
+                    )
+                    .await
+                }
             }
         }
     }
 
     /// Acquires exactly the USD/CNY quote.
     pub async fn usd_cny(&self) -> Result<GatewayBatch<ForeignExchangeFact>, GatewayError> {
-        let request = FxRequest::new(vec![FxPair::UsdCny]).map_err(|error| {
-            GatewayError::invalid_request(
-                FX_CAPABILITY,
-                format!("invalid USD/CNY request: {error}"),
-            )
-        })?;
         let request_hash = acquisition_request_hash(FX_CAPABILITY, "UsdCny");
         // P4 M3 钩子: DATA_GATEWAY_GRPC=1 → gRPC 通道 (fail-closed, audit 对等)。
         match super::grpc_source::bridge_for("ForeignExchange") {
@@ -117,33 +139,56 @@ impl GlobalMarketGateway {
                 return audit_gateway_result(FX_CAPABILITY, ProviderId::Sina, &request_hash, Err(error));
             }
         }
-        let worker_request_hash = request_hash.clone();
-        let joined = tokio::task::spawn_blocking(move || {
-            let result = fetch_and_admit_fx(request);
-            audit_gateway_result(
+        // no-feature (monitor 零 magic): library transport 不存在。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
                 FX_CAPABILITY,
-                ProviderId::Sina,
-                &worker_request_hash,
-                result,
-            )
-        })
-        .await;
-
-        match joined {
-            Ok(result) => result,
-            Err(error) => {
-                audit_blocking_join_failure(
+                Some(ProviderId::Sina),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let request = FxRequest::new(vec![FxPair::UsdCny]).map_err(|error| {
+                GatewayError::invalid_request(
+                    FX_CAPABILITY,
+                    format!("invalid USD/CNY request: {error}"),
+                )
+            })?;
+            let worker_request_hash = request_hash.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let result = fetch_and_admit_fx(request);
+                audit_gateway_result(
                     FX_CAPABILITY,
                     ProviderId::Sina,
-                    request_hash,
-                    error.to_string(),
+                    &worker_request_hash,
+                    result,
                 )
-                .await
+            })
+            .await;
+
+            match joined {
+                Ok(result) => result,
+                Err(error) => {
+                    audit_blocking_join_failure(
+                        FX_CAPABILITY,
+                        ProviderId::Sina,
+                        request_hash,
+                        error.to_string(),
+                    )
+                    .await
+                }
             }
         }
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn fetch_and_admit_indices(
     request: GlobalIndexRequest,
 ) -> Result<GatewayBatch<GlobalIndexFact>, GatewayError> {
@@ -164,6 +209,7 @@ fn fetch_and_admit_indices(
     admit_indices(batch, &request, Utc::now())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn fetch_and_admit_fx(
     request: FxRequest,
 ) -> Result<GatewayBatch<ForeignExchangeFact>, GatewayError> {
@@ -184,6 +230,7 @@ fn fetch_and_admit_fx(
     admit_fx(batch, &request, Utc::now())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn admit_indices(
     batch: DataBatch<GlobalIndexQuote>,
     request: &GlobalIndexRequest,
@@ -247,6 +294,7 @@ fn admit_indices(
     Ok(GatewayBatch::Available { records, evidence })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn admit_fx(
     batch: DataBatch<FxQuote>,
     request: &FxRequest,
@@ -305,6 +353,7 @@ fn admit_fx(
     Ok(GatewayBatch::Available { records, evidence })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_batch<T>(
     capability: &'static str,
     batch: &DataBatch<T>,
@@ -330,6 +379,7 @@ fn validate_batch<T>(
     Ok(evidence)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_record_evidence(
     capability: &'static str,
     batch: &BatchEvidence,
@@ -349,6 +399,7 @@ fn validate_record_evidence(
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn parse_source_at(
     capability: &'static str,
     value: Option<&str>,
@@ -375,6 +426,7 @@ fn parse_source_at(
     Ok(timestamp)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn parse_observed_at(
     capability: &'static str,
     value: &str,
@@ -411,6 +463,7 @@ fn parse_observed_at(
     Ok(timestamp)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_realtime_age(
     capability: &'static str,
     timestamp: DateTime<Utc>,
@@ -431,6 +484,7 @@ fn validate_realtime_age(
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn index_order(code: GlobalIndexCode) -> u8 {
     match code {
         GlobalIndexCode::DowJones => 0,
@@ -442,6 +496,7 @@ fn index_order(code: GlobalIndexCode) -> u8 {
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn sina_gateway_error(capability: &'static str, error: SinaError) -> GatewayError {
     let message = error.to_string();
     match error {
@@ -483,6 +538,7 @@ fn sina_gateway_error(capability: &'static str, error: SinaError) -> GatewayErro
 }
 
 #[cfg(test)]
+#[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
     use crate::magic_compat::{FiniteNumber, NonEmptyText, Price, Provenance, Ratio, SourceEvidence};

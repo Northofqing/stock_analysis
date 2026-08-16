@@ -4,9 +4,13 @@
 //! line-item keys, units or explicit missing values. Market statistics retain
 //! every optional field as `Option`; absence is never converted to zero.
 
-use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone, Utc};
-use crate::magic_compat::{DataBatch, Exchange, InstrumentId, ProviderId, RatioUnit};
 pub use crate::magic_compat::{FinancialLine, FinancialStatement, MarketStatistics, StatementKind};
+use crate::magic_compat::ProviderId;
+#[cfg(feature = "magic-gateway")]
+use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone, Utc};
+#[cfg(feature = "magic-gateway")]
+use crate::magic_compat::{DataBatch, Exchange, InstrumentId, RatioUnit};
+#[cfg(feature = "magic-gateway")]
 use magic_market_router::{
     financial_statement_source, market_statistics_source, AcceptancePolicy, AttemptStatus,
     FailureKind, FinancialStatementRequest, FinancialStatementRouter, MarketStatisticsRouter,
@@ -16,13 +20,16 @@ use magic_market_router::{
 use magic_sina_rs::{SinaClient, SinaError};
 #[cfg(feature = "magic-gateway")]
 use magic_tencent_rs::{TencentClient, TencentError};
+#[cfg(feature = "magic-gateway")]
 use std::collections::HashSet;
+#[cfg(feature = "magic-gateway")]
 use std::sync::Arc;
 
-use super::review::{
-    acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result, BatchEvidence,
-    GatewayBatch, GatewayError,
-};
+use super::review::{acquisition_request_hash, audit_gateway_result, GatewayBatch, GatewayError};
+#[cfg(feature = "magic-gateway")]
+use super::review::BatchEvidence;
+#[cfg(feature = "magic-gateway")]
+use super::review::audit_blocking_join_failure;
 
 const FINANCIAL_CAPABILITY: &str = "CompanyFinancialStatements";
 const STATISTICS_CAPABILITY: &str = "CompanyMarketStatistics";
@@ -83,27 +90,43 @@ impl CompanyDataGateway {
                 );
             }
         }
-        let worker_hash = request_hash.clone();
-        let joined = tokio::task::spawn_blocking(move || {
-            let result = build_instruments(&storage_codes, FINANCIAL_CAPABILITY)
-                .map(|instruments| route_financial_statements(&instruments, kind, Utc::now()));
-            let (provider, result) = match result {
-                Ok(routed) => routed,
-                Err(error) => (ProviderId::Sina, Err(error)),
-            };
-            audit_gateway_result(FINANCIAL_CAPABILITY, provider, &worker_hash, result)
-        })
-        .await;
-        match joined {
-            Ok(result) => result,
-            Err(error) => {
-                audit_blocking_join_failure(
-                    FINANCIAL_CAPABILITY,
-                    ProviderId::Sina,
-                    request_hash,
-                    error.to_string(),
-                )
-                .await
+        // no-feature (monitor 零 magic): library transport 不存在。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
+                FINANCIAL_CAPABILITY,
+                Some(ProviderId::Sina),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let worker_hash = request_hash.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let result = build_instruments(&storage_codes, FINANCIAL_CAPABILITY)
+                    .map(|instruments| route_financial_statements(&instruments, kind, Utc::now()));
+                let (provider, result) = match result {
+                    Ok(routed) => routed,
+                    Err(error) => (ProviderId::Sina, Err(error)),
+                };
+                audit_gateway_result(FINANCIAL_CAPABILITY, provider, &worker_hash, result)
+            })
+            .await;
+            match joined {
+                Ok(result) => result,
+                Err(error) => {
+                    audit_blocking_join_failure(
+                        FINANCIAL_CAPABILITY,
+                        ProviderId::Sina,
+                        request_hash,
+                        error.to_string(),
+                    )
+                    .await
+                }
             }
         }
     }
@@ -169,32 +192,49 @@ impl CompanyDataGateway {
                 );
             }
         }
-        let worker_hash = request_hash.clone();
-        let joined = tokio::task::spawn_blocking(move || {
-            let result = build_instruments(&storage_codes, STATISTICS_CAPABILITY)
-                .map(|instruments| route_market_statistics(&instruments, Utc::now()));
-            let (provider, result) = match result {
-                Ok(routed) => routed,
-                Err(error) => (ProviderId::Tencent, Err(error)),
-            };
-            audit_gateway_result(STATISTICS_CAPABILITY, provider, &worker_hash, result)
-        })
-        .await;
-        match joined {
-            Ok(result) => result,
-            Err(error) => {
-                audit_blocking_join_failure(
-                    STATISTICS_CAPABILITY,
-                    ProviderId::Tencent,
-                    request_hash,
-                    error.to_string(),
-                )
-                .await
+        // no-feature (monitor 零 magic): library transport 不存在。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        #[cfg(not(feature = "magic-gateway"))]
+        {
+            return Err(GatewayError::classified(
+                STATISTICS_CAPABILITY,
+                Some(ProviderId::Tencent),
+                "unavailable",
+                "provider_transport",
+                true,
+                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+            ));
+        }
+        #[cfg(feature = "magic-gateway")]
+        {
+            let worker_hash = request_hash.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let result = build_instruments(&storage_codes, STATISTICS_CAPABILITY)
+                    .map(|instruments| route_market_statistics(&instruments, Utc::now()));
+                let (provider, result) = match result {
+                    Ok(routed) => routed,
+                    Err(error) => (ProviderId::Tencent, Err(error)),
+                };
+                audit_gateway_result(STATISTICS_CAPABILITY, provider, &worker_hash, result)
+            })
+            .await;
+            match joined {
+                Ok(result) => result,
+                Err(error) => {
+                    audit_blocking_join_failure(
+                        STATISTICS_CAPABILITY,
+                        ProviderId::Tencent,
+                        request_hash,
+                        error.to_string(),
+                    )
+                    .await
+                }
             }
         }
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn build_instruments(
     codes: &[String],
     capability: &'static str,
@@ -220,6 +260,7 @@ fn build_instruments(
         .collect()
 }
 
+#[cfg(feature = "magic-gateway")]
 fn build_instrument(
     storage_code: &str,
     capability: &'static str,
@@ -242,6 +283,7 @@ fn build_instrument(
     Ok(identity.instrument().clone())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn route_financial_statements(
     instruments: &[InstrumentId],
     kind: StatementKind,
@@ -295,6 +337,7 @@ fn route_financial_statements(
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn route_market_statistics(
     instruments: &[InstrumentId],
     now: DateTime<Utc>,
@@ -349,6 +392,7 @@ fn route_market_statistics(
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn admit_financial_batch(
     instruments: &[InstrumentId],
     kind: StatementKind,
@@ -507,6 +551,7 @@ fn admit_financial_batch(
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_financial_lines(
     statement: &FinancialStatement,
     provider: ProviderId,
@@ -540,6 +585,7 @@ fn validate_financial_lines(
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn admit_statistics_batch(
     instruments: &[InstrumentId],
     provider: ProviderId,
@@ -641,6 +687,7 @@ fn admit_statistics_batch(
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_statistics_values(
     statistics: &MarketStatistics,
     provider: ProviderId,
@@ -707,6 +754,7 @@ fn validate_statistics_values(
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn require_complete_batch<T>(
     capability: &'static str,
     provider: ProviderId,
@@ -728,6 +776,7 @@ fn require_complete_batch<T>(
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn parse_source_date(
     value: &str,
     field: &'static str,
@@ -742,6 +791,7 @@ fn parse_source_date(
     })
 }
 
+#[cfg(feature = "magic-gateway")]
 fn parse_provider_timestamp(
     capability: &'static str,
     provider: ProviderId,
@@ -780,6 +830,7 @@ fn parse_provider_timestamp(
         .ok_or_else(|| invalid_timestamp(capability, provider, field, value))
 }
 
+#[cfg(feature = "magic-gateway")]
 fn invalid_timestamp(
     capability: &'static str,
     provider: ProviderId,
@@ -793,11 +844,13 @@ fn invalid_timestamp(
     )
 }
 
+#[cfg(feature = "magic-gateway")]
 fn shanghai_offset() -> FixedOffset {
     FixedOffset::east_opt(SHANGHAI_OFFSET_SECONDS)
         .expect("Shanghai UTC offset is a compile-time valid constant")
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_observation_time(
     capability: &'static str,
     provider: ProviderId,
@@ -822,6 +875,7 @@ fn validate_observation_time(
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn validate_realtime_freshness(
     provider: ProviderId,
     source_at: DateTime<Utc>,
@@ -842,6 +896,7 @@ fn validate_realtime_freshness(
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
 fn terminal_provider(error: &RouterError, default: ProviderId) -> ProviderId {
     error
         .attempts()
@@ -850,6 +905,7 @@ fn terminal_provider(error: &RouterError, default: ProviderId) -> ProviderId {
         .unwrap_or(default)
 }
 
+#[cfg(feature = "magic-gateway")]
 fn router_gateway_error(
     capability: &'static str,
     error: RouterError,
@@ -896,6 +952,7 @@ fn router_gateway_error(
     )
 }
 
+#[cfg(feature = "magic-gateway")]
 fn classify_sina_error(error: SinaError) -> SourceError {
     let message = error.to_string();
     match error {
@@ -909,6 +966,7 @@ fn classify_sina_error(error: SinaError) -> SourceError {
     }
 }
 
+#[cfg(feature = "magic-gateway")]
 fn classify_tencent_error(error: TencentError) -> SourceError {
     let message = error.to_string();
     match error {
@@ -923,6 +981,7 @@ fn classify_tencent_error(error: TencentError) -> SourceError {
 }
 
 #[cfg(test)]
+#[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
     use crate::magic_compat::{Exchange, FiniteNumber, IsoDate, Money, NonEmptyText, Price, Provenance, Ratio, SourceEvidence};
@@ -1797,7 +1856,6 @@ mod tests {
 
     #[test]
     fn br164_company_error_classifiers_cover_all_provider_variants_and_actions() {
-        #[cfg(feature = "magic-gateway")]
         use magic_market_router::FailureAction;
 
         assert_eq!(
@@ -1838,7 +1896,6 @@ mod tests {
 
     #[test]
     fn br164_router_failures_keep_auditable_outcome_reason_and_retryability() {
-        #[cfg(feature = "magic-gateway")]
         use magic_market_router::{FailoverChain, FailureAction, SourceFn};
 
         fn routed_error(kind: FailureKind, action: FailureAction) -> RouterError {
