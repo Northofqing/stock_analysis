@@ -3,8 +3,9 @@
 
 use chrono::NaiveDate;
 use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
+use crate::magic_compat::ProviderId;
 use magic_market_core::{
-    IsoDate, LimitPoolEntry, LimitPoolKind, LimitPoolRequest, LimitPools, PositiveU32, ProviderId,
+    IsoDate, LimitPoolEntry, LimitPoolKind, LimitPoolRequest, LimitPools, PositiveU32,
 };
 use magic_market_router::{
     AcceptancePolicy, AttemptStatus, FailureKind, LimitPoolRouter, RouterError, SourceError,
@@ -948,7 +949,7 @@ mod tests {
             .expect("batch id");
 
         let evidence =
-            BatchEvidence::from_provenance(magic_market_core::ProviderId::Tdx, &provenance)
+            BatchEvidence::from_provenance(crate::magic_compat::ProviderId::Tdx, &provenance)
                 .expect("valid evidence");
 
         assert_eq!(evidence.source, "TEST_CODE_tdx-smart");
@@ -960,7 +961,7 @@ mod tests {
     #[test]
     fn br158_verified_empty_is_not_unavailable() {
         let evidence = BatchEvidence {
-            provider: magic_market_core::ProviderId::Tdx,
+            provider: crate::magic_compat::ProviderId::Tdx,
             source: "TEST_CODE_tdx-smart".to_string(),
             source_at: Some("2099-01-02".to_string()),
             observed_at: "2099-01-02T10:00:00+08:00".to_string(),
@@ -973,7 +974,7 @@ mod tests {
 
         let unavailable = GatewayError::unavailable(
             "A-01",
-            Some(magic_market_core::ProviderId::Tdx),
+            Some(crate::magic_compat::ProviderId::Tdx),
             true,
             "TEST_CODE transport unavailable",
         );

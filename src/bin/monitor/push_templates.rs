@@ -6238,7 +6238,7 @@ fn r09_batch_binding<T>(
     let evidence = batch.evidence();
     if batch.is_verified_empty()
         || batch.records().is_empty()
-        || evidence.provider != magic_market_core::ProviderId::Eastmoney
+        || evidence.provider != crate::magic_compat::ProviderId::Eastmoney
         || evidence.source != "eastmoney-web"
         || evidence.source_at.is_some()
         || evidence.observed_at.trim().is_empty()
@@ -7866,7 +7866,7 @@ fn prepare_tomorrow_watch_delivery(
     lhb_records: &[stock_analysis::data_gateway::DragonTigerStockReview],
     rendered: String,
 ) -> Result<PreparedReviewLhbDelivery, String> {
-    use magic_market_core::ProviderId;
+    use crate::magic_compat::ProviderId;
     if evidence.provider != ProviderId::Eastmoney {
         return Err(format!(
             "R-07 provider mismatch: expected Eastmoney, got {:?}",
@@ -9674,7 +9674,7 @@ fn prepare_r08_public_calendar(
 #[serde(deny_unknown_fields)]
 struct R08ProviderEvidenceBinding {
     component: String,
-    provider: magic_market_core::ProviderId,
+    provider: crate::magic_compat::ProviderId,
     source: String,
     source_at: Option<String>,
     observed_at: String,
@@ -9717,7 +9717,7 @@ struct R08IndexFactBinding {
     change_percent: f64,
     source_at: String,
     observed_at: String,
-    provider: magic_market_core::ProviderId,
+    provider: crate::magic_compat::ProviderId,
     batch_id: String,
 }
 
@@ -9732,7 +9732,7 @@ struct R08FxFactBinding {
     change_percent: Option<f64>,
     source_at: String,
     observed_at: String,
-    provider: magic_market_core::ProviderId,
+    provider: crate::magic_compat::ProviderId,
     batch_id: String,
 }
 
@@ -9836,7 +9836,7 @@ fn r08_is_sha256_hex(value: &str) -> bool {
 fn validate_r08_public_binding_fields(
     binding: R08PublicSourceBinding,
 ) -> Result<ValidatedR08PublicBinding, &'static str> {
-    use magic_market_core::ProviderId;
+    use crate::magic_compat::ProviderId;
 
     const INVALID: &str = "counted_r08_source_only_binding_invalid";
     let business_date = chrono::NaiveDate::parse_from_str(&binding.business_date, "%Y-%m-%d")
@@ -10117,7 +10117,7 @@ pub(super) fn validate_r08_public_source_binding_canonical_bytes(
 
 fn r08_provider_evidence_binding<T>(
     component: &str,
-    expected_provider: magic_market_core::ProviderId,
+    expected_provider: crate::magic_compat::ProviderId,
     expected_source: &str,
     batch: &stock_analysis::data_gateway::GatewayBatch<T>,
 ) -> Result<(R08ProviderEvidenceBinding, chrono::DateTime<chrono::Utc>), String> {
@@ -10182,7 +10182,7 @@ fn prepare_r08_counted_delivery(
         >,
     >,
 ) -> Result<PreparedR08CountedDelivery, String> {
-    use magic_market_core::ProviderId;
+    use crate::magic_compat::ProviderId;
     use stock_analysis::data_gateway::GatewayBatch;
 
     if r08_reminder_trading_date(business_date) != reminder_date {
@@ -11062,7 +11062,7 @@ mod tests_br140_r08_partial_components {
                     Ok(announcement_batch(review_date)),
                     Err(stock_analysis::data_gateway::GatewayError::unavailable(
                         "event_calendar",
-                        Some(magic_market_core::ProviderId::Cffex),
+                        Some(crate::magic_compat::ProviderId::Cffex),
                         false,
                         format!(
                             "provider_unsupported: unsupported by {review_date} {reminder_date}"
@@ -11156,7 +11156,7 @@ mod tests_br140_r08_partial_components {
         stock_analysis::data_gateway::GatewayBatch::Available {
             records,
             evidence: stock_analysis::data_gateway::BatchEvidence {
-                provider: magic_market_core::ProviderId::Cffex,
+                provider: crate::magic_compat::ProviderId::Cffex,
                 source: "cffex-official-notice".to_string(),
                 source_at: Some("2026-07-16".to_string()),
                 observed_at: "2026-07-16T08:00:00Z".to_string(),
@@ -11179,7 +11179,7 @@ mod tests_br140_r08_partial_components {
                 canonical_url: "https://example.invalid/TEST_CODE_announcement".to_string(),
             }],
             evidence: stock_analysis::data_gateway::BatchEvidence {
-                provider: magic_market_core::ProviderId::Cninfo,
+                provider: crate::magic_compat::ProviderId::Cninfo,
                 source: "cninfo-market".to_string(),
                 source_at: Some(format!("{business_date}T18:00:00+08:00")),
                 observed_at: format!("{business_date}T18:01:00+08:00"),
@@ -11607,7 +11607,7 @@ mod tests_br140_r08_partial_components {
         let business_date = chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap();
         let cffex = stock_analysis::data_gateway::GatewayBatch::VerifiedEmpty(
             stock_analysis::data_gateway::BatchEvidence {
-                provider: magic_market_core::ProviderId::Cffex,
+                provider: crate::magic_compat::ProviderId::Cffex,
                 source: "cffex-official-notice".to_string(),
                 source_at: None,
                 observed_at: "2026-07-21T13:00:01Z".to_string(),
@@ -12995,7 +12995,7 @@ mod tests_r_dispatchers {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Err(stock_analysis::data_gateway::GatewayError::unavailable(
                     "R-04",
-                    Some(magic_market_core::ProviderId::Eastmoney),
+                    Some(crate::magic_compat::ProviderId::Eastmoney),
                     true,
                     "TEST_CODE provider must not run",
                 ))
@@ -13077,7 +13077,7 @@ mod tests_r_dispatchers {
 
     #[tokio::test]
     async fn br162_r04_preserves_wait_empty_and_unavailable_outcomes() {
-        use magic_market_core::ProviderId;
+        use crate::magic_compat::ProviderId;
         use stock_analysis::data_gateway::{BatchEvidence, GatewayBatch, GatewayError};
 
         let before = dispatch_r04_lhb_outcome_with_loader(
@@ -16249,7 +16249,7 @@ mod tests {
 
     #[test]
     fn br099_candidate_assembly_removes_only_held_and_keeps_watch_candidate() {
-        use magic_market_core::ProviderId;
+        use crate::magic_compat::ProviderId;
         use stock_analysis::data_gateway::BatchEvidence;
         use stock_analysis::market_data::TopStock;
         use stock_analysis::opportunity::candidate_panel::{merge_candidates, CandidateSource};
@@ -21303,7 +21303,7 @@ mod tests {
 
     #[test]
     fn br138_dispatcher_r08_excludes_local_only_lifecycle_rows() {
-        use magic_market_core::ProviderId;
+        use crate::magic_compat::ProviderId;
         use stock_analysis::data_gateway::{BatchEvidence, EventAnnouncement, GatewayBatch};
         let batch = GatewayBatch::Available {
             records: vec![EventAnnouncement {
@@ -21331,7 +21331,7 @@ mod tests {
 
     #[test]
     fn br199_r08_missing_cninfo_category_stays_explicitly_missing() {
-        use magic_market_core::ProviderId;
+        use crate::magic_compat::ProviderId;
         use stock_analysis::data_gateway::{BatchEvidence, EventAnnouncement, GatewayBatch};
         let batch = GatewayBatch::Available {
             records: vec![EventAnnouncement {

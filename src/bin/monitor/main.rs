@@ -559,7 +559,7 @@ mod tests_monitor_historical_gateway_projection {
     use super::{
         chronological_daily_bars, latest_price_change_from_records, t1_close_from_records,
     };
-    use magic_market_core::ProviderId;
+    use crate::magic_compat::ProviderId;
     use stock_analysis::data_gateway::BatchEvidence;
     use stock_analysis::data_provider::{AdjustType, KlineData};
 
@@ -10267,7 +10267,7 @@ mod tests_v17_4_d {
         stock_analysis::data_gateway::GatewayBatch::Available {
             records,
             evidence: stock_analysis::data_gateway::BatchEvidence {
-                provider: magic_market_core::ProviderId::Eastmoney,
+                provider: crate::magic_compat::ProviderId::Eastmoney,
                 source: "TEST_CODE_eastmoney-board-flow".to_owned(),
                 source_at: Some("1785290400.000000000".to_owned()),
                 observed_at: "1785290401.000000000".to_owned(),
@@ -10790,7 +10790,7 @@ mod tests_br140_review_chain_isolation {
             },
         ];
         let evidence = stock_analysis::data_gateway::BatchEvidence {
-            provider: magic_market_core::ProviderId::Eastmoney,
+            provider: crate::magic_compat::ProviderId::Eastmoney,
             source: "TEST_CODE_eastmoney-web".to_string(),
             source_at: Some("2099-01-02".to_string()),
             observed_at: "2099-01-02T16:00:00+08:00".to_string(),

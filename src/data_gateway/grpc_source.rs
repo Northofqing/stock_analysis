@@ -27,9 +27,10 @@ use crate::grpc_client::envelope::QueryResult;
 use crate::grpc_client::errors::GrpcError;
 use crate::grpc_client::pb::magic::market::v1::Operation;
 use chrono::NaiveDate;
+use crate::magic_compat::ProviderId;
 use magic_market_core::{
     FinancialStatement, FlowInterval, InstrumentId, MarketStatistics, NorthboundChannel,
-    ProviderId, StatementKind,
+    StatementKind,
 };
 use magic_tdx_rs::protocol::types::SecurityBar;
 use serde_json::Value;
@@ -995,7 +996,7 @@ mod tests {
     use super::*;
     use crate::grpc_client::errors::{ErrorDetail, GrpcError};
     use crate::grpc_client::pb::magic::market::v1 as pb;
-    use magic_market_core::ProviderId;
+    use crate::magic_compat::ProviderId;
     use prost::Message; // pb::ErrorDetail::encode_to_vec
     // env 是进程级: 这些测试并行时会互相看到对方的 env (race)。
     // 共享锁串行化 env 敏感的测试 (M3 全量并行跑时暴露)。

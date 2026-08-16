@@ -228,6 +228,10 @@ pub mod grpc_contract;
 pub mod grpc_client;
 pub mod grpc_server;
 
+// M5 (Task #76): magic-* 类型兼容层 — feature 开 = 重导出真实类型,
+// feature 关 (monitor --no-default-features) = 本地镜像 (serde/Debug 与上游一致)
+pub mod magic_compat;
+
 #[cfg(test)]
 mod tests {
     use super::*;

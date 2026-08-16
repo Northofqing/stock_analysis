@@ -48,20 +48,23 @@ lettre = { version = "0.11.19", features = ["smtp-transport", "sendmail-transpor
 clap = { version = "4.5.54", features = ["derive"] }
 # BR-164: every public market/news provider is resolved from one immutable
 # upstream release commit. Do not mix path/crates.io/Git revisions.
-magic-tdx-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
-magic-market-core = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
-magic-market-router = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
-magic-market-composition = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
-magic-eastmoney-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
-magic-ths-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
-magic-sina-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
-magic-cninfo-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
-magic-tencent-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
-magic-cls-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
-magic-jin10-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
-magic-thepaper-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
-magic-exchange-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
-magic-baidu-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
+# M5 (Task #76): 全部 optional, 归入 magic-gateway feature (默认开)。
+# monitor 生产构建 --no-default-features = 零 magic-* 运行时 (数据全走 gRPC);
+# grpc_market_server 是数据提供者宿主, 构建 --features magic-gateway (默认即含)。
+magic-tdx-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+magic-market-core = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+magic-market-router = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+magic-market-composition = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+magic-eastmoney-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+magic-ths-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+magic-sina-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+magic-cninfo-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+magic-tencent-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+magic-cls-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+magic-jin10-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+magic-thepaper-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+magic-exchange-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+magic-baidu-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
 plotters = "0.3"
 futures = "0.3"
 fs2 = "0.4.3"
@@ -83,6 +86,30 @@ tonic = "0.14"
 tonic-prost = "0.14"
 prost = "0.14"
 tokio-stream = "0.1"
+
+[features]
+# M5 (Task #76): 默认开 → 既有构建/测试行为不变 (全量 magic-*)。
+# monitor 生产构建: cargo build --release --bin monitor --no-default-features
+#   = 零 magic-* 编译与运行时 (数据全走 gRPC 桥, DATA_GATEWAY_GRPC=1)。
+# grpc_market_server 构建: 默认 (含 magic-gateway) = 数据提供者宿主。
+# 回滚: git revert (编译期依赖, 非运行时开关)。
+default = ["magic-gateway"]
+magic-gateway = [
+    "dep:magic-tdx-rs",
+    "dep:magic-market-core",
+    "dep:magic-market-router",
+    "dep:magic-market-composition",
+    "dep:magic-eastmoney-rs",
+    "dep:magic-ths-rs",
+    "dep:magic-sina-rs",
+    "dep:magic-cninfo-rs",
+    "dep:magic-tencent-rs",
+    "dep:magic-cls-rs",
+    "dep:magic-jin10-rs",
+    "dep:magic-thepaper-rs",
+    "dep:magic-exchange-rs",
+    "dep:magic-baidu-rs",
+]
 
 [build-dependencies]
 # tonic 0.14 重构: configure()/compile() 移入 tonic-prost-build

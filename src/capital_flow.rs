@@ -176,7 +176,7 @@ pub fn format_for_prompt(flow: &MoneyFlowSummary, shape: &IntradayShape) -> Stri
 mod tests {
     use super::*;
     use crate::data_gateway::BatchEvidence;
-    use magic_market_core::ProviderId;
+    use crate::magic_compat::ProviderId;
 
     #[test]
     fn projection_keeps_missing_price_change_explicit() {

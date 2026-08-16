@@ -686,7 +686,7 @@ mod tests {
         crate::data_gateway::GatewayBatch::Available {
             records,
             evidence: crate::data_gateway::BatchEvidence {
-                provider: magic_market_core::ProviderId::Tdx,
+                provider: crate::magic_compat::ProviderId::Tdx,
                 source: "TEST_CODE_tdx-block-files".to_owned(),
                 source_at: None,
                 observed_at: "1785290400.000000000".to_owned(),
@@ -752,7 +752,7 @@ mod tests {
         let empty = build_concept_index_from_memberships(&codes, |_| {
             Ok(crate::data_gateway::GatewayBatch::VerifiedEmpty(
                 crate::data_gateway::BatchEvidence {
-                    provider: magic_market_core::ProviderId::Tdx,
+                    provider: crate::magic_compat::ProviderId::Tdx,
                     source: "TEST_CODE_tdx-block-files".to_owned(),
                     source_at: None,
                     observed_at: "1785290400.000000000".to_owned(),

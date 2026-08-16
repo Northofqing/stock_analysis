@@ -334,7 +334,7 @@ mod tests {
 
     fn financial_evidence(source: &str) -> crate::company_financials::FinancialProjectionEvidence {
         crate::company_financials::FinancialProjectionEvidence {
-            provider: magic_market_core::ProviderId::Sina,
+            provider: crate::magic_compat::ProviderId::Sina,
             source: source.to_string(),
             source_at: Some("2026-06-30".to_string()),
             observed_at: "2026-07-18T10:00:00+08:00".to_string(),

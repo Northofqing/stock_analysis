@@ -1,7 +1,7 @@
 //! 搜索服务共享类型与抽象（原 search_service.rs 头部）
 
 use async_trait::async_trait;
-use magic_market_core::ProviderId;
+use crate::magic_compat::ProviderId;
 use serde::{Deserialize, Serialize};
 
 use crate::data_gateway::{BatchEvidence, GlobalNewsRecord};

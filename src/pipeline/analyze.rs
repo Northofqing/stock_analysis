@@ -1280,7 +1280,7 @@ mod tests {
     use crate::trend_analyzer::{BuySignal, StockTrendAnalyzer, TrendAnalysisResult};
     use chrono::{NaiveDate, TimeZone, Utc};
     use diesel::prelude::*;
-    use magic_market_core::ProviderId;
+    use crate::magic_compat::ProviderId;
     use std::sync::Arc;
 
     use super::AnalysisPipeline;

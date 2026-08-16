@@ -310,8 +310,9 @@ mod tests {
     use std::cell::Cell;
 
     use chrono::{DateTime, Utc};
+    use crate::magic_compat::ProviderId;
     use magic_market_core::{
-        AssetClass, Exchange, InstrumentId, IsoDate, Price, ProviderId, Ratio, SourceEvidence,
+        AssetClass, Exchange, InstrumentId, IsoDate, Price, Ratio, SourceEvidence,
     };
 
     const TEST_DATE: &str = "2099-01-02";

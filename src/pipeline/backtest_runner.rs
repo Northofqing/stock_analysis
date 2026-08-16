@@ -67,7 +67,7 @@ impl AnalysisPipeline {
                     (
                         data,
                         BatchEvidence {
-                            provider: magic_market_core::ProviderId::Tdx,
+                            provider: crate::magic_compat::ProviderId::Tdx,
                             source: "TEST_CODE_isolated_backtest".to_string(),
                             source_at: Some("2026-07-26T01:00:00Z".to_string()),
                             observed_at: "2026-07-26T01:00:01Z".to_string(),

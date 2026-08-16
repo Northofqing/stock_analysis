@@ -2,7 +2,8 @@
 
 use std::{error::Error, fmt};
 
-use magic_market_core::{AssetClass, Exchange, InstrumentId, ProviderId};
+use crate::magic_compat::ProviderId;
+use magic_market_core::{AssetClass, Exchange, InstrumentId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EquityShareClass {

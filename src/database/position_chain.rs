@@ -343,7 +343,7 @@ mod tests {
     use crate::data_gateway::{BatchEvidence, BoardKind, PositionChainAssignment};
     use diesel::connection::SimpleConnection;
     use diesel::prelude::*;
-    use magic_market_core::ProviderId;
+    use crate::magic_compat::ProviderId;
 
     use super::*;
 

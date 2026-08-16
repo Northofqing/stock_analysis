@@ -356,14 +356,14 @@ fn invalid(message: impl Into<String>) -> NewsAiAssessmentAuditError {
 }
 
 fn source_provider_tag(
-    provider: magic_market_core::ProviderId,
+    provider: crate::magic_compat::ProviderId,
 ) -> NewsAiAssessmentAuditResult<&'static str> {
     match provider {
-        magic_market_core::ProviderId::Eastmoney => Ok("eastmoney"),
-        magic_market_core::ProviderId::Cailianpress => Ok("cailianpress"),
-        magic_market_core::ProviderId::Jin10 => Ok("jin10"),
-        magic_market_core::ProviderId::ThePaper => Ok("thepaper"),
-        magic_market_core::ProviderId::Sina => Ok("sina"),
+        crate::magic_compat::ProviderId::Eastmoney => Ok("eastmoney"),
+        crate::magic_compat::ProviderId::Cailianpress => Ok("cailianpress"),
+        crate::magic_compat::ProviderId::Jin10 => Ok("jin10"),
+        crate::magic_compat::ProviderId::ThePaper => Ok("thepaper"),
+        crate::magic_compat::ProviderId::Sina => Ok("sina"),
         _ => Err(invalid(format!(
             "news provider is not admitted by BR-172: {provider:?}"
         ))),
@@ -933,7 +933,8 @@ mod tests {
     use super::*;
     use chrono::{FixedOffset, NaiveDate, TimeZone, Utc};
     use diesel::connection::SimpleConnection;
-    use magic_market_core::{ProviderId, SourceEvidence};
+    use crate::magic_compat::ProviderId;
+    use magic_market_core::SourceEvidence;
 
     #[derive(Debug, QueryableByName)]
     struct CountRow {

@@ -5,7 +5,7 @@ use crate::data_gateway::{
 };
 use crate::database::DatabaseManager;
 use futures::{stream, StreamExt};
-use magic_market_core::ProviderId;
+use crate::magic_compat::ProviderId;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -379,7 +379,7 @@ pub async fn refresh_position_chains(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magic_market_core::ProviderId;
+    use crate::magic_compat::ProviderId;
     use std::collections::BTreeMap;
 
     fn evidence() -> BatchEvidence {

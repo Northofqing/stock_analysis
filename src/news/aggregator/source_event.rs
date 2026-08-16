@@ -8,7 +8,7 @@
 
 use crate::{data_gateway::parse_evidence_instant, signal::market_event::Direction};
 use chrono::{DateTime, Local, NaiveDate};
-use magic_market_core::ProviderId;
+use crate::magic_compat::ProviderId;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -480,7 +480,7 @@ mod tests {
     #[test]
     fn source_batch_evidence_accepts_eastmoney_unix_milliseconds_without_rewriting() {
         let evidence = SourceBatchEvidence::new(
-            magic_market_core::ProviderId::Eastmoney,
+            crate::magic_compat::ProviderId::Eastmoney,
             "TEST_CODE_eastmoney-research".into(),
             None,
             "unix-ms:1785799979851".into(),
@@ -495,7 +495,7 @@ mod tests {
     #[test]
     fn source_batch_evidence_rejects_malformed_observed_at() {
         let error = SourceBatchEvidence::new(
-            magic_market_core::ProviderId::Eastmoney,
+            crate::magic_compat::ProviderId::Eastmoney,
             "TEST_CODE_eastmoney-research".into(),
             None,
             "1785799979.8510450000".into(),
@@ -511,7 +511,7 @@ mod tests {
     fn earnings_event_preserves_each_admitted_batch_evidence() {
         let now = Local::now();
         let financial = SourceBatchEvidence::new(
-            magic_market_core::ProviderId::Sina,
+            crate::magic_compat::ProviderId::Sina,
             "TEST_CODE_sina-financial".into(),
             Some(now.date_naive().to_string()),
             now.to_rfc3339(),
@@ -520,7 +520,7 @@ mod tests {
         )
         .expect("financial evidence");
         let consensus = SourceBatchEvidence::new(
-            magic_market_core::ProviderId::Eastmoney,
+            crate::magic_compat::ProviderId::Eastmoney,
             "TEST_CODE_eastmoney-research".into(),
             None,
             now.to_rfc3339(),
@@ -596,7 +596,7 @@ mod tests {
         );
 
         let wrong_source = SourceBatchEvidence::new(
-            magic_market_core::ProviderId::Sina,
+            crate::magic_compat::ProviderId::Sina,
             "TEST_CODE_other-source".into(),
             Some(now.date_naive().to_string()),
             now.to_rfc3339(),

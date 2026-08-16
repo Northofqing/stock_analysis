@@ -5,7 +5,7 @@
 //! different providers or batches.
 
 use chrono::{DateTime, Local, NaiveDate, NaiveTime, SecondsFormat, Utc};
-use magic_market_core::ProviderId;
+use crate::magic_compat::ProviderId;
 
 use super::instrument_identity::resolve_production_equity;
 #[cfg(test)]

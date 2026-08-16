@@ -1,7 +1,8 @@
 //! BR-210 shared conversion for immutable Magic evidence instants.
 
 use chrono::{DateTime, Utc};
-use magic_market_core::{EvidenceTimestamp, ProviderId};
+use crate::magic_compat::ProviderId;
+use magic_market_core::EvidenceTimestamp;
 
 use super::review::GatewayError;
 

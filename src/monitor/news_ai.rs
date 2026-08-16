@@ -15,7 +15,8 @@ use crate::llm::{
 };
 use crate::news::aggregator::AdmittedGlobalNewsBatch;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
-use magic_market_core::{ProviderId, SourceEvidence};
+use crate::magic_compat::ProviderId;
+use magic_market_core::SourceEvidence;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};

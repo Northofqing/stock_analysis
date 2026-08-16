@@ -1714,7 +1714,7 @@ mod tests {
             CandidateSupplementStatus::Available {
                 board_evidence: Vec::new(),
                 candidate_evidence: BatchEvidence {
-                    provider: magic_market_core::ProviderId::Tdx,
+                    provider: crate::magic_compat::ProviderId::Tdx,
                     source: "TEST_CODE_magic_tdx_candidate_batch".to_string(),
                     source_at: Some("2026-07-19T07:00:00Z".to_string()),
                     observed_at: "2026-07-19T07:00:01Z".to_string(),
@@ -2229,7 +2229,7 @@ mod tests {
     #[test]
     fn laggard_supplement_preserves_available_and_verified_empty_evidence() {
         let evidence = BatchEvidence {
-            provider: magic_market_core::ProviderId::Tdx,
+            provider: crate::magic_compat::ProviderId::Tdx,
             source: "TEST_CODE_magic_tdx_laggard".to_string(),
             source_at: Some("2026-07-19T07:00:00Z".to_string()),
             observed_at: "2026-07-19T07:00:01Z".to_string(),

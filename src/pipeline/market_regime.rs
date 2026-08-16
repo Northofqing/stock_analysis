@@ -280,7 +280,7 @@ mod tests {
     use crate::data_gateway::{BatchEvidence, GatewayBatch, RealtimeIndexQuote};
     use crate::pipeline::AnalysisResult;
     use chrono::{TimeZone, Utc};
-    use magic_market_core::ProviderId;
+    use crate::magic_compat::ProviderId;
 
     fn result(code: &str, advice: &str, change: Option<f64>) -> AnalysisResult {
         let mut result: AnalysisResult = serde_json::from_value(serde_json::json!({

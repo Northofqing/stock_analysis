@@ -5,7 +5,8 @@
 //! normalized statement batch. Missing ratios and growth fields remain absent.
 
 use anyhow::{anyhow, Result};
-use magic_market_core::{ProviderId, StatementKind};
+use crate::magic_compat::ProviderId;
+use magic_market_core::StatementKind;
 use sha2::{Digest, Sha256};
 
 use crate::data_gateway::{company::FinancialStatement, parse_evidence_instant, GatewayBatch};
