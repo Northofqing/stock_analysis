@@ -1515,11 +1515,11 @@ fn format_r04_money(value: f64) -> String {
     }
 }
 
-const fn exchange_label(exchange: magic_market_core::Exchange) -> &'static str {
+const fn exchange_label(exchange: crate::magic_compat::Exchange) -> &'static str {
     match exchange {
-        magic_market_core::Exchange::Shanghai => "SH",
-        magic_market_core::Exchange::Shenzhen => "SZ",
-        magic_market_core::Exchange::Beijing => "BJ",
+        crate::magic_compat::Exchange::Shanghai => "SH",
+        crate::magic_compat::Exchange::Shenzhen => "SZ",
+        crate::magic_compat::Exchange::Beijing => "BJ",
     }
 }
 
@@ -5343,8 +5343,8 @@ fn parse_paper_trade_sqlite_time(
 fn paper_trade_instrument_for_env(
     code: &str,
     env: stock_analysis::risk::env_guard::TradingEnv,
-) -> Result<magic_market_core::InstrumentId, String> {
-    use magic_market_core::{AssetClass, InstrumentId};
+) -> Result<crate::magic_compat::InstrumentId, String> {
+    use crate::magic_compat::{AssetClass, InstrumentId};
 
     let canonical_code = match env {
         stock_analysis::risk::env_guard::TradingEnv::Prod => code,
@@ -6293,7 +6293,7 @@ fn r09_projection_rows(
                 || record.source_order_ordinal.get() != expected_ordinal
                 || record.trading_date.as_str() != expected_date
                 || record.filter_identity.as_str() != expected_filter
-                || record.instrument.asset_class() != magic_market_core::AssetClass::Equity
+                || record.instrument.asset_class() != crate::magic_compat::AssetClass::Equity
                 || record.instrument.code().trim().is_empty()
                 || record.label.as_str().is_empty()
             {
@@ -12677,7 +12677,8 @@ mod tests_r_dispatchers {
 
     #[test]
     fn br162_r04_renderer_keeps_trade_ids_and_exact_seats_without_fake_sum() {
-        use magic_market_core::{DragonTigerSide, Exchange, ProviderId};
+        use crate::magic_compat::{Exchange, ProviderId};
+use magic_market_core::DragonTigerSide;
         use stock_analysis::data_gateway::{
             BatchEvidence, DragonTigerSeatReview, DragonTigerSourceDisclosure,
             DragonTigerStockReview,
@@ -12835,7 +12836,8 @@ mod tests_r_dispatchers {
 
     #[test]
     fn br192_r04_counted_binding_fails_closed_without_exact_provider_evidence() {
-        use magic_market_core::{DragonTigerSide, Exchange, ProviderId};
+        use crate::magic_compat::{Exchange, ProviderId};
+use magic_market_core::DragonTigerSide;
         use stock_analysis::data_gateway::{
             BatchEvidence, DragonTigerSeatReview, DragonTigerSourceDisclosure,
             DragonTigerStockReview,
@@ -13852,7 +13854,7 @@ pub async fn push_candidate_triggered(
     promotion_evidence: Option<stock_analysis::opportunity::candidate_state::PromotionEvidence>,
     live_override: Option<bool>,
 ) -> Result<bool, String> {
-    use magic_market_core::{AssetClass, Exchange, InstrumentId};
+    use crate::magic_compat::{AssetClass, Exchange, InstrumentId};
     use sha2::{Digest, Sha256};
     use stock_analysis::database::DatabaseManager;
     use stock_analysis::opportunity::candidate_state::require_live_promotion;

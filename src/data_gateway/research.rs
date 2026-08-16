@@ -170,7 +170,7 @@ fn normalize_reports_batch(
 }
 
 fn validate_record_evidence(
-    record: &magic_market_core::SourceEvidence,
+    record: &crate::magic_compat::SourceEvidence,
     batch: &BatchEvidence,
 ) -> Result<(), GatewayError> {
     if record.provider() != batch.provider
@@ -191,7 +191,7 @@ fn validate_code(code: &str) -> Result<&str, GatewayError> {
     Ok(code)
 }
 
-fn a_share_instrument(code: &str) -> Result<magic_market_core::InstrumentId, GatewayError> {
+fn a_share_instrument(code: &str) -> Result<crate::magic_compat::InstrumentId, GatewayError> {
     #[cfg(test)]
     let resolved = super::instrument_identity::resolve_test_equity(code, None);
     #[cfg(not(test))]

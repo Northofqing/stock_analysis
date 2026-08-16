@@ -1809,7 +1809,7 @@ mod tests {
             SinaError::Decode("TEST_CODE".to_owned()),
             SinaError::Protocol("TEST_CODE".to_owned()),
             SinaError::Unsupported("TEST_CODE".to_owned()),
-            SinaError::Core(magic_market_core::CoreError::InvalidRequest(
+            SinaError::Core(crate::magic_compat::CoreError::InvalidRequest(
                 "TEST_CODE".to_owned(),
             )),
         ] {
@@ -1825,7 +1825,7 @@ mod tests {
             TencentError::Decode("TEST_CODE".to_owned()),
             TencentError::Protocol("TEST_CODE".to_owned()),
             TencentError::Unsupported("TEST_CODE".to_owned()),
-            TencentError::Core(magic_market_core::CoreError::InvalidRequest(
+            TencentError::Core(crate::magic_compat::CoreError::InvalidRequest(
                 "TEST_CODE".to_owned(),
             )),
         ] {

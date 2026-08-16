@@ -171,7 +171,7 @@ mod tests {
     use super::*;
     use crate::signal::market_event::{Direction, EventType};
     use chrono::{TimeZone, Utc};
-    use magic_market_core::{ProviderId, SourceEvidence};
+    use crate::magic_compat::{ProviderId, SourceEvidence};
 
     #[test]
     fn source_bound_batch_keeps_record_and_batch_evidence_inseparable() {

@@ -356,7 +356,7 @@ fn parse_observed_at(value: &str) -> Result<DateTime<Utc>, GatewayError> {
     })
 }
 
-fn optional_text(value: Option<magic_market_core::NonEmptyText>) -> Option<String> {
+fn optional_text(value: Option<crate::magic_compat::NonEmptyText>) -> Option<String> {
     value.map(|value| value.as_str().to_owned())
 }
 

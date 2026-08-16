@@ -3,7 +3,7 @@
 use std::{error::Error, fmt};
 
 use crate::magic_compat::ProviderId;
-use magic_market_core::{AssetClass, Exchange, InstrumentId};
+use crate::magic_compat::{AssetClass, Exchange, InstrumentId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EquityShareClass {
@@ -438,7 +438,7 @@ fn classify_current_equity(
 
 #[cfg(test)]
 mod tests {
-    use magic_market_core::{Exchange, ProviderId};
+    use crate::magic_compat::{Exchange, ProviderId};
 
     use super::{resolve_production_equity, EquitySegment, EquityShareClass};
 
@@ -625,7 +625,7 @@ mod tests {
         assert_eq!(b_share.exchange(), Exchange::Shanghai);
         assert_eq!(
             b_share.instrument().asset_class(),
-            magic_market_core::AssetClass::Equity
+            crate::magic_compat::AssetClass::Equity
         );
 
         let a_share = resolve_production_equity("921001", None).expect("valid Beijing A share");

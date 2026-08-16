@@ -934,7 +934,7 @@ mod tests {
     use chrono::{FixedOffset, NaiveDate, TimeZone, Utc};
     use diesel::connection::SimpleConnection;
     use crate::magic_compat::ProviderId;
-    use magic_market_core::SourceEvidence;
+    use crate::magic_compat::SourceEvidence;
 
     #[derive(Debug, QueryableByName)]
     struct CountRow {

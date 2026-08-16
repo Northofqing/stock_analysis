@@ -9,7 +9,7 @@ use crate::selection::quality::{
 };
 use crate::selection::relation::direct_mentions;
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike};
-use magic_market_core::Exchange;
+use crate::magic_compat::Exchange;
 use magic_tdx_rs::protocol::constants::{KLINE_5MIN, KLINE_DAILY};
 use magic_tdx_rs::{SecurityBar, SecurityInfo, SecurityQuote, TdxService};
 use serde::Serialize;

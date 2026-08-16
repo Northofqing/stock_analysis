@@ -3261,9 +3261,9 @@ fn outcome_instrument(code: &str, canonical_market: &str) -> Result<InstrumentId
         ));
     }
     let expected_market = match identity.exchange() {
-        magic_market_core::Exchange::Shanghai => "SH",
-        magic_market_core::Exchange::Shenzhen => "SZ",
-        magic_market_core::Exchange::Beijing => unreachable!("Beijing rejected above"),
+        crate::magic_compat::Exchange::Shanghai => "SH",
+        crate::magic_compat::Exchange::Shenzhen => "SZ",
+        crate::magic_compat::Exchange::Beijing => unreachable!("Beijing rejected above"),
     };
     if canonical_market != expected_market {
         return Err(GatewayError::invalid_request(

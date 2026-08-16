@@ -1641,7 +1641,7 @@ mod tests {
     use super::*;
     use crate::data_gateway::{BatchEvidence, GlobalNewsProvider, GlobalNewsRecord};
     use crate::news::aggregator::raw_v2::{RawGlobalNewsFeedAttempt, TestRawGlobalNewsTerminal};
-    use magic_market_core::SourceEvidence;
+    use crate::magic_compat::SourceEvidence;
 
     fn utc(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)

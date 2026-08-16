@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use crate::magic_compat::ProviderId;
-use magic_market_core::EvidenceTimestamp;
+use crate::magic_compat::EvidenceTimestamp;
 
 use super::review::GatewayError;
 

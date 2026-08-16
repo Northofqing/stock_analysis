@@ -16,7 +16,7 @@ use crate::llm::{
 use crate::news::aggregator::AdmittedGlobalNewsBatch;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use crate::magic_compat::ProviderId;
-use magic_market_core::SourceEvidence;
+use crate::magic_compat::SourceEvidence;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
@@ -1517,7 +1517,7 @@ mod tests {
     use crate::data_gateway::market_data::RealtimeMarketQuote;
     use crate::data_provider::{AdjustType, KlineData};
     use async_trait::async_trait;
-    use magic_market_core::SourceEvidence;
+    use crate::magic_compat::SourceEvidence;
     use serde_json::Value;
 
     #[test]

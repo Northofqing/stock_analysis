@@ -2369,7 +2369,7 @@ mod tests {
         );
         assert_eq!(
             classify_tencent_error(TencentError::Core(
-                magic_market_core::CoreError::InvalidRequest("TEST_CODE".to_owned())
+                crate::magic_compat::CoreError::InvalidRequest("TEST_CODE".to_owned())
             ))
             .kind(),
             FailureKind::Evidence

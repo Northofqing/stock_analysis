@@ -8,7 +8,7 @@
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
-use magic_market_core::InstrumentId;
+use crate::magic_compat::InstrumentId;
 use magic_tdx_rs::protocol::constants::{fq_type, KLINE_5MIN, KLINE_DAILY};
 use magic_tdx_rs::protocol::types::{MinuteTimePrice, SecurityBar, SecurityQuote};
 use magic_tdx_rs::TdxHqClient;
@@ -329,9 +329,9 @@ fn normalized_identity(code: &str) -> Result<T0RequestIdentity> {
         ));
     }
     let market = match identity.exchange() {
-        magic_market_core::Exchange::Shanghai => 1,
-        magic_market_core::Exchange::Shenzhen => 0,
-        magic_market_core::Exchange::Beijing => 2,
+        crate::magic_compat::Exchange::Shanghai => 1,
+        crate::magic_compat::Exchange::Shenzhen => 0,
+        crate::magic_compat::Exchange::Beijing => 2,
     };
     Ok(T0RequestIdentity {
         market,

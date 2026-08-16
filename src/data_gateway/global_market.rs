@@ -333,7 +333,7 @@ fn validate_batch<T>(
 fn validate_record_evidence(
     capability: &'static str,
     batch: &BatchEvidence,
-    record: &magic_market_core::SourceEvidence,
+    record: &crate::magic_compat::SourceEvidence,
 ) -> Result<(), GatewayError> {
     if record.provider() != ProviderId::Sina
         || record.batch_id() != batch.batch_id

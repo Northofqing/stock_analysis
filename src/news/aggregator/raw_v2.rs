@@ -504,7 +504,7 @@ fn classify_gateway_error(error: &GatewayError) -> (&'static str, &'static str, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magic_market_core::{ProviderId, SourceEvidence};
+    use crate::magic_compat::{ProviderId, SourceEvidence};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct TypedFixturePort {

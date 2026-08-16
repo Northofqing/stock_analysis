@@ -7116,7 +7116,7 @@ struct HoldingPlanDailyRow {
 async fn prepare_holding_plan_messages(
     banner: &push_templates::BannerCtx,
 ) -> Result<Vec<PreparedHoldingPlan>, String> {
-    use magic_market_core::{AssetClass, Exchange, InstrumentId};
+    use crate::magic_compat::{AssetClass, Exchange, InstrumentId};
     use sha2::{Digest, Sha256};
     use stock_analysis::database::user_position_snapshot::latest_user_position_snapshot;
 
@@ -7236,7 +7236,7 @@ struct PreparedCloseCall {
 async fn prepare_close_call_messages(
     banner: &push_templates::BannerCtx,
 ) -> Result<Vec<PreparedCloseCall>, String> {
-    use magic_market_core::{AssetClass, Exchange, InstrumentId};
+    use crate::magic_compat::{AssetClass, Exchange, InstrumentId};
     use sha2::{Digest, Sha256};
     use stock_analysis::database::user_position_snapshot::latest_user_position_snapshot;
 
@@ -9841,7 +9841,7 @@ async fn post_close_news_scheduler() {
 /// 失败不重试: 告警时效性强, 30s 后快照已变化; 同日同类再次触发由 counted
 /// 去重/状态机放行新 occurrence。
 async fn deliver_intraday_alert(event: &AlertEvent) -> bool {
-    use magic_market_core::{AssetClass, Exchange, InstrumentId};
+    use crate::magic_compat::{AssetClass, Exchange, InstrumentId};
     use sha2::{Digest, Sha256};
 
     let business_date = chrono::Local::now().date_naive();

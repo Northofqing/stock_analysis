@@ -9,7 +9,7 @@
 
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveTime, Utc};
 #[cfg(test)]
-use magic_market_core::Exchange;
+use crate::magic_compat::Exchange;
 use magic_market_core::{AssetClass, DataStatus, InstrumentId, ProviderId, Quote, RatioUnit};
 use magic_market_router::{
     quote_source, AcceptancePolicy, AttemptStatus, FailureKind, QuoteRouter, RouterError,

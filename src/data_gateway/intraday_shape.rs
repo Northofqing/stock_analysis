@@ -453,10 +453,10 @@ mod tests {
             })
             .collect();
         let record = MagicTdxT0Evidence {
-            instrument: magic_market_core::InstrumentId::new(
-                magic_market_core::Exchange::Shanghai,
+            instrument: crate::magic_compat::InstrumentId::new(
+                crate::magic_compat::Exchange::Shanghai,
                 "TEST_CODE_600396",
-                magic_market_core::AssetClass::Equity,
+                crate::magic_compat::AssetClass::Equity,
             )
             .unwrap(),
             code: "TEST_CODE_600396".to_owned(),
@@ -542,10 +542,10 @@ mod tests {
         );
 
         let mut instrument_mismatched = fixture();
-        instrument_mismatched.records[0].instrument = magic_market_core::InstrumentId::new(
-            magic_market_core::Exchange::Shanghai,
+        instrument_mismatched.records[0].instrument = crate::magic_compat::InstrumentId::new(
+            crate::magic_compat::Exchange::Shanghai,
             "TEST_CODE_600397",
-            magic_market_core::AssetClass::Equity,
+            crate::magic_compat::AssetClass::Equity,
         )
         .unwrap();
         assert_eq!(

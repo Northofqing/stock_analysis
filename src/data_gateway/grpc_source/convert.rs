@@ -26,12 +26,14 @@ use crate::data_gateway::outcome_daily_bars::{OutcomeTransportFailure, RawOutcom
 use crate::selection::schema_v2::OutcomeTransportAttemptPreimage;
 use crate::grpc_client::envelope::QueryResult;
 use chrono::{DateTime, NaiveDate, Utc};
-use crate::magic_compat::ProviderId;
+use crate::magic_compat::{
+    AssetClass, Exchange, InstrumentId, NonEmptyText, ProviderId, SourceEvidence,
+};
 use magic_market_core::{
-    AssetClass, Bar, CorporateActionCategory, CorporateActionTerms, DataBatch, DragonTigerSide,
-    Exchange, FinancialStatement, FiniteNumber, FlowInterval, FxPair, GlobalIndexCode,
-    InstrumentId, IsoDate, MarketRankingKind, MarketRankingUnit, MarketStatistics, Money,
-    NorthboundChannel, NonEmptyText, PositiveU32, Price, Ratio, SourceEvidence,
+    Bar, CorporateActionCategory, CorporateActionTerms, DataBatch, DragonTigerSide,
+    FinancialStatement, FiniteNumber, FlowInterval, FxPair, GlobalIndexCode, IsoDate,
+    MarketRankingKind, MarketRankingUnit, MarketStatistics, Money, NorthboundChannel, PositiveU32,
+    Price, Ratio,
 };
 use magic_tdx_rs::protocol::types::SecurityBar;
 use serde_json::Value;

@@ -3,10 +3,11 @@
 use super::review::{acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result};
 use super::{BatchEvidence, GatewayBatch, GatewayError};
 use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
+use crate::magic_compat::{InstrumentId, ProviderId};
 use magic_market_core::{
     BoardCategory, BoardConstituentProvider, BoardConstituentRequest, BoardDirectoryProvider,
     BoardDirectoryRequest, BoardFlows, BoardMembership, BoardMembershipProvider, DataBatch,
-    FlowInterval, InstrumentId, PositiveU32, ProviderId,
+    FlowInterval, PositiveU32,
 };
 use magic_tdx_rs::{TdxBoardProvider, TdxError, TdxHqClient};
 
@@ -588,7 +589,7 @@ fn ensure_complete(
 
 fn validate_source_evidence(
     capability: &'static str,
-    record: &magic_market_core::SourceEvidence,
+    record: &crate::magic_compat::SourceEvidence,
     batch: &BatchEvidence,
     provider: ProviderId,
 ) -> Result<(), GatewayError> {
@@ -779,7 +780,8 @@ mod tests {
         DIRECTORY_CAPABILITY, FLOW_CAPABILITY, MEMBERSHIP_CAPABILITY,
     };
     use magic_eastmoney_rs::EastmoneyError;
-    use magic_market_core::{BoardCategory, Exchange, ProviderId, SourceEvidence};
+    use crate::magic_compat::{Exchange, ProviderId, SourceEvidence};
+    use magic_market_core::BoardCategory;
     use magic_tdx_rs::TdxError;
 
     fn evidence(provider: ProviderId) -> BatchEvidence {

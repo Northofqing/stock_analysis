@@ -2710,7 +2710,7 @@ mod tests {
                 FailureAction::TryNext,
             ),
             (
-                EastmoneyError::Core(magic_market_core::CoreError::InvalidRequest(
+                EastmoneyError::Core(crate::magic_compat::CoreError::InvalidRequest(
                     "TEST_CODE".to_owned(),
                 )),
                 FailureKind::Quality,
@@ -2778,7 +2778,7 @@ mod tests {
                 FailureAction::TryNext,
             ),
             (
-                ExchangeError::Core(magic_market_core::CoreError::InvalidRequest(
+                ExchangeError::Core(crate::magic_compat::CoreError::InvalidRequest(
                     "TEST_CODE".to_owned(),
                 )),
                 FailureKind::Quality,
@@ -2838,7 +2838,7 @@ mod tests {
                 false,
             ),
             (
-                EastmoneyError::Core(magic_market_core::CoreError::InvalidRequest(
+                EastmoneyError::Core(crate::magic_compat::CoreError::InvalidRequest(
                     "TEST_CODE".to_owned(),
                 )),
                 "partial",
@@ -2918,7 +2918,7 @@ mod tests {
                 false,
             ),
             (
-                ExchangeError::Core(magic_market_core::CoreError::InvalidRequest(
+                ExchangeError::Core(crate::magic_compat::CoreError::InvalidRequest(
                     "TEST_CODE".to_owned(),
                 )),
                 "partial",

@@ -156,7 +156,7 @@ mod tests {
         registered_global_news_feeds, RawGlobalNewsFeedAttempt, TestRawGlobalNewsTerminal,
     };
     use chrono::TimeZone;
-    use magic_market_core::SourceEvidence;
+    use crate::magic_compat::SourceEvidence;
 
     const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 

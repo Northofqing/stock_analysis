@@ -9,7 +9,7 @@
 
 use crate::data_gateway::{MagicTdxT0DailyBar, MagicTdxT0Evidence, MagicTdxT0FiveMinuteBar};
 use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
-use magic_market_core::InstrumentId;
+use crate::magic_compat::InstrumentId;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -806,10 +806,10 @@ mod tests {
             volume: 1_100.0,
         });
         MagicTdxT0Evidence {
-            instrument: magic_market_core::InstrumentId::new(
-                magic_market_core::Exchange::Shanghai,
+            instrument: crate::magic_compat::InstrumentId::new(
+                crate::magic_compat::Exchange::Shanghai,
                 "TEST_CODE_600396",
-                magic_market_core::AssetClass::Equity,
+                crate::magic_compat::AssetClass::Equity,
             )
             .unwrap(),
             code: "TEST_CODE_600396".to_string(),

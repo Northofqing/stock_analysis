@@ -19,7 +19,7 @@
 
 use chrono::NaiveDate;
 use diesel::prelude::*;
-use magic_market_core::InstrumentId;
+use crate::magic_compat::InstrumentId;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -1154,10 +1154,10 @@ mod tests {
         PaperTradeTerminalBindingV1::new(
             7,
             "TEST_CODE_PLAN_BR192",
-            magic_market_core::InstrumentId::new(
-                magic_market_core::Exchange::Shanghai,
+            crate::magic_compat::InstrumentId::new(
+                crate::magic_compat::Exchange::Shanghai,
                 "TEST_CODE_600001",
-                magic_market_core::AssetClass::Equity,
+                crate::magic_compat::AssetClass::Equity,
             )
             .unwrap(),
             chrono::NaiveDate::from_ymd_opt(2026, 7, 30).unwrap(),

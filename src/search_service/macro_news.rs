@@ -138,7 +138,7 @@ mod tests {
         GlobalNewsRecord,
     };
     use chrono::{DateTime, Utc};
-    use magic_market_core::{ProviderId, SourceEvidence};
+    use crate::magic_compat::{ProviderId, SourceEvidence};
 
     fn timestamp(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)

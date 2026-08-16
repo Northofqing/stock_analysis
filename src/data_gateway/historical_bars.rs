@@ -12,7 +12,7 @@
 use chrono::{Local, NaiveDate};
 use magic_baidu_rs::{BaiduClient, BaiduError};
 #[cfg(test)]
-use magic_market_core::Exchange;
+use crate::magic_compat::Exchange;
 use magic_market_core::{
     Adjustment, AssetClass, Bar, BarInterval, BarsRequest, DataBatch, HistoricalBars, InstrumentId,
     ProviderId,

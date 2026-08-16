@@ -328,7 +328,7 @@ fn validate_instrument(asset_class: AssetClass, code: &str) -> Result<(), Gatewa
 }
 
 fn validate_record_evidence(
-    record: &magic_market_core::SourceEvidence,
+    record: &crate::magic_compat::SourceEvidence,
     batch: &BatchEvidence,
 ) -> Result<(), GatewayError> {
     if record.provider() != ProviderId::Eastmoney

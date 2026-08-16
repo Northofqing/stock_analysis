@@ -8,7 +8,7 @@
 
 use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone, Utc};
 #[cfg(test)]
-use magic_market_core::Exchange;
+use crate::magic_compat::Exchange;
 use magic_market_core::{
     AssetClass, CorporateAction, CorporateActionCategory, CorporateActionRequest,
     CorporateActionResponse, CorporateActionStatus, CorporateActionTerms, CorporateActions,

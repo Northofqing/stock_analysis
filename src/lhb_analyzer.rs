@@ -112,7 +112,7 @@ pub fn analyze_dragon_tiger_review(review: &DragonTigerStockReview) -> Result<Lh
 mod tests {
     use super::*;
     use crate::data_gateway::DragonTigerSourceDisclosure;
-    use magic_market_core::Exchange;
+    use crate::magic_compat::Exchange;
 
     fn disclosure(trade_id: &str, net_amount_yuan: Option<f64>) -> DragonTigerSourceDisclosure {
         DragonTigerSourceDisclosure {
