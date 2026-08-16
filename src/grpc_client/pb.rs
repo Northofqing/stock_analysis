@@ -37,6 +37,7 @@ mod tests {
             source_at: "2026-08-13T10:00:00+08:00".to_string(),
             records: vec![payload],
             source: "tdx".to_string(),
+            diagnostic_blocker: String::new(),
         };
         let bytes = prost::Message::encode_to_vec(&resp);
         let decoded = QueryResponse::decode(bytes.as_slice()).expect("decode");

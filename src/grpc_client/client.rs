@@ -2,11 +2,11 @@
 //! 启动后应先调 GetCapabilities (合同 §7: RPC 存在 ≠ 能力准入); 未实现 op 在客户端拦截, 不发起调用。
 use crate::grpc_client::auth::attach_bearer;
 use crate::grpc_client::envelope::{build_query_request, parse_query_response, QueryResult};
-use crate::grpc_client::errors::GrpcError;
+use crate::grpc_client::errors::{ErrorDetail, GrpcError};
 use crate::grpc_client::pb::magic::market::v1::{
     market_data_service_client::MarketDataServiceClient, market_event_service_client::MarketEventServiceClient,
     system_service_client::SystemServiceClient, CapabilitiesRequest, EventCursor, EventFilter,
-    HealthRequest, Operation, SubscribeRequest,
+    HealthRequest, ListenerStatusRequest, Operation, SetWatchlistRequest, SubscribeRequest,
 };
 use crate::grpc_client::retry::{retry_decision, RetryDecision, RetryPolicy};
 use std::time::Duration;
@@ -22,12 +22,13 @@ pub struct GrpcMarketClient {
 impl GrpcMarketClient {
     pub async fn connect(addr: &str) -> Result<Self, GrpcError> {
         let channel = Channel::from_shared(addr.to_string())
-            .map_err(|_| GrpcError::InvalidArgument)?
+            // D2: 本地构造错误无服务端 status → details 全默认 (桥只看码 + 远端 detail)。
+            .map_err(|_| GrpcError::InvalidArgument { details: ErrorDetail::default() })?
             // 合同 §12: 为 unary 和 stream 分别设置 deadline/keepalive。
             .timeout(Duration::from_secs(15))
             .connect()
             .await
-            .map_err(|_| GrpcError::Unavailable)?;
+            .map_err(|_| GrpcError::Unavailable { details: ErrorDetail::default() })?;
         Ok(Self {
             data: MarketDataServiceClient::new(channel.clone()),
             system: SystemServiceClient::new(channel.clone()),
@@ -72,7 +73,7 @@ impl GrpcMarketClient {
         payload: serde_json::Value,
     ) -> Result<QueryResult, GrpcError> {
         if !crate::grpc_contract::ops::is_implemented(op) {
-            return Err(GrpcError::Unimplemented);
+            return Err(GrpcError::Unimplemented { details: ErrorDetail::default() });
         }
         let request = build_query_request(op, payload)?;
         let request_id = request
@@ -151,7 +152,8 @@ impl GrpcMarketClient {
             Operation::T0Evidence => self.data.t0_evidence(req).await,
             Operation::OutcomeDailyBars => self.data.outcome_daily_bars(req).await,
             Operation::UpperLimitPoolReview => self.data.upper_limit_pool_review(req).await,
-            _ => return Err(GrpcError::Unimplemented), // 防御: is_implemented 已拦截
+            Operation::ChainBatch => self.data.chain_batch(req).await,
+            _ => return Err(GrpcError::Unimplemented { details: ErrorDetail::default() }), // 防御: is_implemented 已拦截
         };
         match resp {
             Ok(r) => Ok(r.into_inner()),
@@ -177,6 +179,48 @@ impl GrpcMarketClient {
         });
         attach_bearer(&mut req)?;
         let resp = self.events.subscribe(req).await.map_err(GrpcError::from)?;
+        Ok(resp.into_inner())
+    }
+
+    /// 合同 §8 GetListenerStatus: 读取服务端 listener 状态 (generation/cursor/
+    /// watchlist 版本)。上游直连排期后用于核对服务端 watchlist 与本地 STOCK_LIST。
+    pub async fn get_listener_status(
+        &mut self,
+    ) -> Result<crate::grpc_client::pb::magic::market::v1::ListenerStatusResponse, GrpcError> {
+        let mut req = tonic::Request::new(ListenerStatusRequest {
+            context: Some(crate::grpc_client::pb::magic::market::v1::RequestContext {
+                protocol_version: 1,
+                request_id: crate::grpc_client::envelope::new_request_id(),
+            }),
+        });
+        attach_bearer(&mut req)?;
+        let resp = self
+            .events
+            .get_listener_status(req)
+            .await
+            .map_err(GrpcError::from)?;
+        Ok(resp.into_inner())
+    }
+
+    /// 合同 §8 SetWatchlist: 请求覆盖服务端 watchlist (上游: 终端申请 desired,
+    /// 服务端决定应用; 本地 server: 立即应用 desired==applied)。返回服务端确认。
+    pub async fn set_watchlist(
+        &mut self,
+        instruments: Vec<String>,
+    ) -> Result<crate::grpc_client::pb::magic::market::v1::SetWatchlistResponse, GrpcError> {
+        let mut req = tonic::Request::new(SetWatchlistRequest {
+            context: Some(crate::grpc_client::pb::magic::market::v1::RequestContext {
+                protocol_version: 1,
+                request_id: crate::grpc_client::envelope::new_request_id(),
+            }),
+            instruments,
+        });
+        attach_bearer(&mut req)?;
+        let resp = self
+            .events
+            .set_watchlist(req)
+            .await
+            .map_err(GrpcError::from)?;
         Ok(resp.into_inner())
     }
 }
@@ -231,6 +275,7 @@ mod tests {
                 observed_at: "2026-08-13T10:00:00+08:00".into(),
                 source_at: "2026-08-13T10:00:00+08:00".into(),
                 source: "mock".into(),
+                diagnostic_blocker: String::new(),
                 records: vec![CanonicalPayload {
                     schema: "market.realtime_quotes".into(),
                     schema_version: 1,
@@ -241,8 +286,9 @@ mod tests {
             }))
         }
 
-                // tonic 生成的 MarketDataService trait 共 54 个方法, 全部必须实现。
-                // 这里只有 realtime_quotes 是真实桩; 其余 53 个 (proto RPC 名 camelCase) 全部 unimplemented。
+                // tonic 生成的 MarketDataService trait 共 60 个方法 (上游 55 + 本地扩展 5),
+                // 全部必须实现。这里只有 realtime_quotes 是真实桩; 其余 59 个
+                // (proto RPC 名 camelCase) 全部 unimplemented。
                 $(
                     async fn $stub(&self, _req: Request<QueryRequest>) -> Result<Response<QueryResponse>, Status> {
                         Err(Status::unimplemented(stringify!($stub)))
@@ -266,7 +312,7 @@ mod tests {
         dragon_tiger, market_dragon_tiger, dragon_tiger_discovery, market_rankings,
         market_breadth, popularity, concept_hits, option_data, provider_top_n_rankings,
         index_quotes, instrument_news, intraday_shape, t0_evidence,
-        outcome_daily_bars, upper_limit_pool_review,
+        outcome_daily_bars, upper_limit_pool_review, chain_batch,
     );
 
     async fn spawn_mock() -> String {
@@ -308,7 +354,7 @@ mod tests {
         let mut client = GrpcMarketClient::connect(&addr).await.unwrap();
         // OptionData 不在 implemented 集合 → 客户端直接拦截, 不发起调用。
         let err = client.query(Operation::OptionData, serde_json::json!({})).await.unwrap_err();
-        assert!(matches!(err, GrpcError::Unimplemented));
+        assert!(matches!(err, GrpcError::Unimplemented { .. }));
     }
 
     #[tokio::test]

@@ -19,7 +19,7 @@ async fn health_and_capabilities() {
     let health = client.get_health().await.unwrap();
     assert!(health.live && health.ready);
     let caps = client.get_capabilities().await.unwrap();
-    assert_eq!(caps.len(), 38, "M1: 38 个生产 op (24 既有 + 8 已有编号 + 6 新编号) 全部在 capability 表");
+    assert_eq!(caps.len(), 39, "M1: 38 个生产 op + M4c ChainBatch 全部在 capability 表");
     handle.abort();
 }
 
@@ -48,6 +48,8 @@ async fn six_representative_ops_fixture_roundtrip() {
         (Operation::T0Evidence, "market.t0_evidence", "600519"),
         (Operation::OutcomeDailyBars, "market.outcome_daily_bars", "2026-08-14"),
         (Operation::UpperLimitPoolReview, "market.upper_limit_pool_review", "600519"),
+        // M4c 扩展: A-10 完整 batch (fixture, 字段与 converter 重建一致)。
+        (Operation::ChainBatch, "market.chain_batch", "fixture-cb"),
     ];
     for (op, schema, probe) in cases {
         let result = client
@@ -140,6 +142,73 @@ async fn replay_returns_bounded_events_same_generation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn set_watchlist_then_status_match_then_subscribe_filter() {
+    // README (client-bundle) 流程: SetWatchlist 完全替换 → GetListenerStatus
+    // 直到 desired/applied revisions+lists 匹配 → Subscribe.filter.instruments
+    // 只过滤投递事件。本地 server 同步应用 (desired==applied), 一次即匹配。
+    let (addr, handle, hub) = start(ServerConfig {
+        fixture_mode: true,
+        port: 0,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let mut client = GrpcMarketClient::connect(&format!("http://{addr}")).await.unwrap();
+
+    // 1. SetWatchlist 完全替换。
+    let set = client
+        .set_watchlist(vec!["600519".to_string(), "000001".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(set.state, "APPLIED");
+    assert_eq!(set.instruments.len(), 2);
+    assert_eq!(set.desired_revision, 2, "初始 STOCK_LIST 为空时 revision 1 → 2");
+
+    // 2. GetListenerStatus: desired 与 applied 立即匹配 (本地同步应用)。
+    let status = client.get_listener_status().await.unwrap();
+    assert_eq!(
+        status.desired_watchlist_revision, status.applied_watchlist_revision,
+        "desired == applied (本地 server 无异步应用流程)"
+    );
+    assert_eq!(status.desired_instruments, vec!["600519".to_string(), "000001".to_string()]);
+    assert_eq!(status.applied_instruments, status.desired_instruments);
+
+    // 3. Subscribe.filter.instruments 只投递匹配事件 (README 语义)。
+    let mut stream = client
+        .subscribe(
+            EventFilter {
+                instruments: vec!["600519".to_string()],
+                event_kinds: vec![],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let mk = |code: &str| DetectedEvent {
+        kind: EventKind::Price,
+        code: code.into(),
+        name: "测试".into(),
+        price: 1500.0,
+        prev_close: 1490.0,
+        change_pct: 0.67,
+        volume: 100,
+        amount: 1e8,
+        reason: "涨跌幅变化".into(),
+    };
+    hub.push_event(&mk("600519"));
+    hub.push_event(&mk("000001"));
+
+    use futures::StreamExt;
+    let got = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("5s 内收到事件")
+        .expect("流未结束")
+        .expect("事件无错误");
+    assert_eq!(got.instrument, "600519", "filter 只投递 600519, 000001 被过滤");
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn unknown_schema_rejected() {
     let (addr, handle, _hub) = start(ServerConfig {
         fixture_mode: true,
@@ -156,7 +225,7 @@ async fn unknown_schema_rejected() {
         .unwrap_err();
     assert!(matches!(
         err,
-        stock_analysis::grpc_client::errors::GrpcError::Unimplemented
+        stock_analysis::grpc_client::errors::GrpcError::Unimplemented { .. }
     ));
     handle.abort();
 }

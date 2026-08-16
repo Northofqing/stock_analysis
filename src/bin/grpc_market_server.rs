@@ -19,6 +19,19 @@ async fn main() -> anyhow::Result<()> {
         );
         std::process::exit(2);
     }
+    // M4c: A-10 delegate (op 44/45/61) 执行 build_for_date 计算+stage+publish,
+    // 需要与 monitor 同一 SQLite 库 (DATABASE_PATH, 默认 ./data/stock_analysis.db)。
+    // 未 init → DatabaseManager::try_get()=None → A-10 delegate 生产必失败。
+    // fixture 模式 (GRPC_GATEWAY_TEST_FIXTURE=1) 全部 delegate 走 canned 数据,
+    // 不需要 DB — 跳过 init (测试 cwd 无 data/ 目录, init 会失败)。
+    if std::env::var("GRPC_GATEWAY_TEST_FIXTURE").as_deref() != Ok("1") {
+        let db_path = std::env::var("DATABASE_PATH")
+            .unwrap_or_else(|_| "./data/stock_analysis.db".to_string());
+        stock_analysis::database::DatabaseManager::init(Some(std::path::PathBuf::from(&db_path)))
+            .map_err(|e| anyhow::anyhow!("DatabaseManager::init({db_path}) 失败: {e}"))?;
+        log::info!("[grpc_market_server] 数据库已初始化: {db_path} (A-10 链 delegate 依赖)");
+    }
+
     let config = stock_analysis::grpc_server::ServerConfig::default();
     let (addr, handle, hub) = stock_analysis::grpc_server::start(config).await?;
     log::info!("[grpc_market_server] 就绪: {addr} (Ctrl-C 退出)");

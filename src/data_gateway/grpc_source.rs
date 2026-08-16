@@ -24,6 +24,7 @@ use crate::data_gateway::outcome_daily_bars::{OutcomeTransportFailure, RawOutcom
 use crate::data_provider::{consensus::ConsensusData, KlineData};
 use crate::grpc_client::client::GrpcMarketClient;
 use crate::grpc_client::envelope::QueryResult;
+use crate::grpc_client::errors::GrpcError;
 use crate::grpc_client::pb::magic::market::v1::Operation;
 use chrono::NaiveDate;
 use magic_market_core::{
@@ -42,6 +43,65 @@ static SOURCE: OnceLock<Mutex<Option<Arc<GrpcSource>>>> = OnceLock::new();
 static BRIDGE_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 const DEFAULT_ADDR: &str = "http://127.0.0.1:18082";
+
+/// D2: gRPC 错误 → GatewayError 分类保真映射 (query_op 共用)。
+/// 服务端 Fetch 失败 (handlers.rs) 携带 ErrorDetail (provider/reason_code/retryable),
+/// 客户端据此重建分类 — 不再折叠为默认 unavailable+provider=None (BR-170 pre-fix 形态)。
+/// 明确错误码 (invalid_argument/unimplemented/…): 重试不会变好 → invalid_request 不重试。
+fn map_query_error(op: Operation, e: &GrpcError) -> GatewayError {
+    let method = crate::grpc_contract::ops::method_name(op);
+    let message = format!("gRPC {method} 查询失败: {e}");
+    match e {
+        // 请求/权限/能力类错误码: 服务端拒绝语义 (参数错/未实现/未认证/无权限/超限/前提失败)。
+        GrpcError::InvalidArgument { .. }
+        | GrpcError::Unimplemented { .. }
+        | GrpcError::PermissionDenied { .. }
+        | GrpcError::Unauthenticated { .. }
+        | GrpcError::ResourceExhausted { .. }
+        | GrpcError::FailedPrecondition { .. } => {
+            GatewayError::invalid_request("GrpcBridge", message)
+        }
+        // Fetch 失败 (Internal + ErrorDetail) 与传输类 (Unavailable/DeadlineExceeded/Unknown):
+        // 从 detail 恢复 provider/reason_code/retryable, 保真重建分类。
+        _ => {
+            let d = e.details();
+            let provider = d.provider.as_deref().and_then(|s| convert::parse_provider(s).ok());
+            let reason_code = d.reason_code.as_deref().unwrap_or("no_verified_batch");
+            let retryable = d.retryable.unwrap_or(true);
+            GatewayError::classified(
+                "GrpcBridge",
+                provider,
+                "unavailable",
+                reason_code_static(reason_code),
+                retryable,
+                message,
+            )
+        }
+    }
+}
+
+/// reason_code 需要 &'static (GatewayError 字段); wire 值来自服务端。
+/// 静态表覆盖已知集合 (convert.rs 与 review.rs 全部构造点), 未知
+/// (服务端新增 code) → Box::leak — 错误路径一次性, 不累积 (每请求至多 1 个)。
+fn reason_code_static(s: &str) -> &'static str {
+    const KNOWN: &[&str] = &[
+        "no_verified_batch",
+        "invalid_request",
+        "invalid_evidence",
+        "unavailable",
+        "partial",
+        "internal",
+        "tdx_board_membership_unsupported",
+        "upper_limit_streak_missing",
+        "manual_confirmation_contract_unavailable",
+        "five_minute_gap",
+        "exact_batch_join_accepted",
+        "database_failure",
+    ];
+    KNOWN.iter().find(|k| **k == s).copied().unwrap_or_else(|| {
+        Box::leak(s.to_string().into_boxed_str())
+    })
+}
 
 /// 已挂桥的 op 清单 (与各网关文件内 `super::grpc_source::bridge_for("X")` 调用
 /// 一一对应)。变更时必须同步 — hooked_ops_match_bridge_for_call_sites 单测
@@ -229,17 +289,7 @@ impl GrpcSource {
         self.ensure_connected().await?;
         let mut guard = self.client.lock().await;
         let client = guard.as_mut().expect("ensure_connected 后必有 client");
-        client.query(op, params).await.map_err(|e| {
-            GatewayError::unavailable(
-                "GrpcBridge",
-                None,
-                true,
-                format!(
-                    "gRPC {:?} 查询失败: {e}",
-                    crate::grpc_contract::ops::method_name(op)
-                ),
-            )
-        })
+        client.query(op, params).await.map_err(|e| map_query_error(op, &e))
     }
 
     // ---------- 6 个首批 op (M2) ----------
@@ -862,9 +912,104 @@ impl GrpcSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grpc_client::errors::{ErrorDetail, GrpcError};
+    use crate::grpc_client::pb::magic::market::v1 as pb;
+    use magic_market_core::ProviderId;
+    use prost::Message; // pb::ErrorDetail::encode_to_vec
     // env 是进程级: 这些测试并行时会互相看到对方的 env (race)。
     // 共享锁串行化 env 敏感的测试 (M3 全量并行跑时暴露)。
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// D2 核心: Fetch 失败 (Internal + ErrorDetail) 按 detail 重建分类 —
+    /// provider/reason_code/retryable 保真, 不折叠 (BR-170 pre-fix 形态回归)。
+    #[test]
+    fn map_query_error_restores_fetch_classification() {
+        let err = GrpcError::Internal {
+            details: ErrorDetail {
+                code: "internal".to_string(),
+                request_id: Some("req-1".to_string()),
+                operation: Some(8),
+                provider: Some("Tdx".to_string()),
+                reason_code: Some("no_verified_batch".to_string()),
+                retryable: Some(true),
+            },
+        };
+        let g = map_query_error(Operation::BoardConstituents, &err);
+        assert_eq!(g.capability(), "GrpcBridge");
+        assert_eq!(g.provider(), Some(ProviderId::Tdx));
+        assert_eq!(g.reason_code(), "no_verified_batch");
+        assert_eq!(g.audit_outcome(), "unavailable");
+        assert!(g.retryable());
+        assert!(g.message().contains("BoardConstituents"));
+    }
+
+    /// D2: 服务端未知 provider 名 (新增 provider 未同步 parse_provider) →
+    /// provider=None 但 reason_code/retryable 仍保真 (fail-closed, 不猜默认)。
+    #[test]
+    fn map_query_error_unknown_provider_keeps_rest() {
+        let err = GrpcError::Internal {
+            details: ErrorDetail {
+                code: "internal".to_string(),
+                provider: Some("NewProvider".to_string()),
+                reason_code: Some("database_failure".to_string()),
+                retryable: Some(false),
+                ..Default::default()
+            },
+        };
+        let g = map_query_error(Operation::RealtimeQuotes, &err);
+        assert_eq!(g.provider(), None);
+        assert_eq!(g.reason_code(), "database_failure");
+        assert!(!g.retryable());
+    }
+
+    /// D2: 请求/权限类错误码 → invalid_request 不重试 (重试不会变好)。
+    #[test]
+    fn map_query_error_request_class_codes_no_retry() {
+        for code in [
+            GrpcError::InvalidArgument { details: ErrorDetail::default() },
+            GrpcError::Unimplemented { details: ErrorDetail::default() },
+            GrpcError::PermissionDenied { details: ErrorDetail::default() },
+            GrpcError::Unauthenticated { details: ErrorDetail::default() },
+            GrpcError::ResourceExhausted { details: ErrorDetail::default() },
+            GrpcError::FailedPrecondition { details: ErrorDetail::default() },
+        ] {
+            let g = map_query_error(Operation::RealtimeQuotes, &code);
+            assert_eq!(g.audit_outcome(), "invalid_request", "{code:?}");
+            assert!(!g.retryable(), "{code:?}");
+        }
+    }
+
+    /// D2: Unavailable 无 ErrorDetail (服务端不可达, connect 失败) →
+    /// 默认 reason_code=no_verified_batch + retryable=true (原有语义不变)。
+    #[test]
+    fn map_query_error_unavailable_without_detail_keeps_defaults() {
+        let err = GrpcError::Unavailable { details: ErrorDetail::default() };
+        let g = map_query_error(Operation::HistoricalBars, &err);
+        assert_eq!(g.reason_code(), "no_verified_batch");
+        assert!(g.retryable());
+    }
+
+    /// D2 wire round-trip: proto ErrorDetail → GrpcError::details() → map_query_error
+    /// 全链路保真 (与 grpc_server::handlers.rs Fetch 分支编码端对应)。
+    #[test]
+    fn map_query_error_roundtrip_from_status_detail() {
+        let pb_detail = pb::ErrorDetail {
+            request_id: "req-7".to_string(),
+            operation: Operation::OutcomeDailyBars as i32,
+            provider: "Tdx".to_string(),
+            reason_code: "no_verified_batch".to_string(),
+            retryable: true,
+        };
+        let status = tonic::Status::with_details(
+            tonic::Code::Internal,
+            "取数失败",
+            pb_detail.encode_to_vec().into(),
+        );
+        let g = map_query_error(Operation::OutcomeDailyBars, &GrpcError::from(status));
+        assert_eq!(g.provider(), Some(ProviderId::Tdx));
+        assert_eq!(g.reason_code(), "no_verified_batch");
+        assert!(g.retryable());
+    }
 
     #[test]
     fn bridge_disabled_without_env() {

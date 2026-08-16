@@ -1,5 +1,6 @@
 //! Operation ↔ proto 方法名映射 + 已实现集合。
-//! 54 个 op 全部列出 (合同 market.proto 冻结); 生产未用到的 op 不进 implemented。
+//! 全部 op 列出 (client-bundle/market.proto 上游 0-55 + build.rs 本地扩展 56-60,
+//! 合并后共 61 个); 生产未用到的 op 不进 implemented。
 use crate::grpc_client::pb::magic::market::v1::Operation;
 
 /// proto 方法名 (MarketDataService 的 RPC 名, 与 market.proto 一一对应)。
@@ -66,6 +67,7 @@ pub fn method_name(op: Operation) -> &'static str {
         T0Evidence => "T0Evidence",
         OutcomeDailyBars => "OutcomeDailyBars",
         UpperLimitPoolReview => "UpperLimitPoolReview",
+        ChainBatch => "ChainBatch",
         Unspecified => "OPERATION_UNSPECIFIED",
     }
 }
@@ -84,9 +86,14 @@ pub fn implemented_operations() -> Vec<Operation> {
         ForeignExchange, FinancialStatements, MarketStatistics,
         TechnicalBars, CorporateActions, SemanticSearch,
         FundFlowSeries, ProviderTopNRankings,
-        // M1 扩展: 6 个新 op (proto 编号 55-60)。
+        // M1 扩展: InstrumentNews 是上游合同 op (=55), 其余 5 个是本地扩展
+        // (56-60, 用户决策 2026-08-16 「保留本地 server 扩展」; 上游直连后
+        // 这些 op 由本地 server 继续提供, monitor 桥不感知差异)。
         IndexQuotes, InstrumentNews, IntradayShape, T0Evidence,
         OutcomeDailyBars, UpperLimitPoolReview,
+        // M4c 扩展: A-10 完整 batch (=61, 本地扩展)。limit_pools/strong_stock_reasons
+        // (44/45) 视图不可重建 VisibleChainBatch → monitor 复盘经此 op 消费。
+        ChainBatch,
     ]
 }
 
@@ -100,10 +107,10 @@ mod tests {
     use crate::grpc_client::pb::magic::market::v1::Operation;
 
     #[test]
-    fn method_name_covers_all_60_operations() {
-        // 从 proto 的 Operation 枚举全量遍历 (0..=60), 每个都映射到非空方法名。
+    fn method_name_covers_all_61_operations() {
+        // 从 proto 的 Operation 枚举全量遍历 (0..=61), 每个都映射到非空方法名。
         // prost 0.14 标记 from_i32 deprecated → 用 TryFrom<i32> (语义等价)。
-        for value in 0..=60 {
+        for value in 0..=61 {
             if let Ok(op) = Operation::try_from(value) {
                 assert!(!method_name(op).is_empty(), "op {value} 缺少方法名映射");
             }
@@ -111,8 +118,8 @@ mod tests {
     }
 
     #[test]
-    fn implemented_set_is_38_and_within_60() {
-        assert_eq!(implemented_operations().len(), 38);
+    fn implemented_set_is_39_and_within_61() {
+        assert_eq!(implemented_operations().len(), 39);
         assert!(implemented_operations()
             .iter()
             .all(|op| !matches!(op, Operation::Unspecified)));

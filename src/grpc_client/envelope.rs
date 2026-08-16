@@ -43,6 +43,9 @@ pub fn build_query_request(
         }),
         // 合同 §5: 普通调用保持 preferred_provider 为空, 由服务端 Composition 选择。
         preferred_provider: String::new(),
+        // 合同字段 4: allow_unadmitted 只显式许可诊断 handler, 不改变准入;
+        // 用户指令 2026-08-16: 客户端一律显式许可 (诊断 handler 全量可用)。
+        allow_unadmitted: true,
         payload: Some(CanonicalPayload {
             schema: schema.schema_name.to_string(),
             schema_version: schema.schema_version,
@@ -144,6 +147,7 @@ mod tests {
             source_at: "t2".to_string(),
             records: vec![],
             source: "tdx".to_string(),
+            diagnostic_blocker: String::new(),
         };
         let result = parse_query_response("r-1", resp).unwrap();
         assert_eq!(result.admission, AdmissionState::Admitted);
@@ -165,6 +169,7 @@ mod tests {
             source_at: "".to_string(),
             records: vec![],
             source: String::new(),
+            diagnostic_blocker: String::new(),
         };
         let err = parse_query_response("r-1", resp).unwrap_err();
         assert!(matches!(err, EnvelopeError::RequestIdMismatch(_, _)));
@@ -183,6 +188,7 @@ mod tests {
             source_at: "".to_string(),
             records: vec![],
             source: String::new(),
+            diagnostic_blocker: String::new(),
         };
         assert_eq!(parse_query_response("r-1", resp).unwrap_err(), EnvelopeError::MissingRequestId);
     }

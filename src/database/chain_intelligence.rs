@@ -6,7 +6,7 @@ use chrono::{DateTime, FixedOffset, NaiveDate, SecondsFormat};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Integer, Nullable, Text};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::DatabaseManager;
@@ -144,7 +144,7 @@ pub enum ChainStoreError {
 
 pub type ChainStoreResult<T> = Result<T, ChainStoreError>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainInputEvidenceInput {
     pub input_id: String,
     pub ordinal: i32,
@@ -162,7 +162,7 @@ pub struct ChainInputEvidenceInput {
     pub content_hash: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainMemberInput {
     pub member_id: String,
     pub ordinal: i32,
@@ -173,7 +173,7 @@ pub struct ChainMemberInput {
     pub content_hash: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainInput {
     pub chain_row_id: String,
     pub chain_id: String,
@@ -186,7 +186,7 @@ pub struct ChainInput {
     pub members: Vec<ChainMemberInput>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainRejectionInput {
     pub rejection_id: String,
     pub ordinal: i32,
@@ -196,7 +196,7 @@ pub struct ChainRejectionInput {
     pub content_hash: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainBatchInput {
     pub batch_id: String,
     pub content_hash: String,
@@ -225,7 +225,9 @@ pub struct ChainStageReceipt {
     pub members_inserted: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// M4c: 以下三个 visible 类型补 Serialize+Deserialize — 服务端 op 61
+// (market.chain_batch) 直出 to_value, 客户端 converter 重建 VisibleChainBatch。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VisibleChainMember {
     pub instrument_id: String,
     pub security_name: String,
@@ -233,7 +235,7 @@ pub struct VisibleChainMember {
     pub streak: i32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VisibleChain {
     pub chain_id: String,
     pub canonical_board_id: String,
@@ -243,7 +245,7 @@ pub struct VisibleChain {
     pub members: Vec<VisibleChainMember>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VisibleChainBatch {
     pub batch_id: String,
     pub content_hash: String,

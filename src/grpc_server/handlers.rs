@@ -5,6 +5,7 @@ use crate::grpc_client::pb::magic::market::v1::{
 };
 use crate::grpc_contract::schema::schema_for;
 use crate::grpc_server::{delegate, fixture, ServerState};
+use prost::Message; // ErrorDetail::encode_to_vec (tonic 0.14 Status::with_details 取 bytes)
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
@@ -77,18 +78,35 @@ impl DataService {
                 Status::invalid_argument(format!("payload.data 不是合法 JSON: {e}"))
             })?,
         };
-        let result = delegate::fetch(op, &request_schema, &params)
-            .await
-            .map_err(|e| match e {
-                delegate::DelegateError::Params(pe) => Status::invalid_argument(pe.to_string()),
-                delegate::DelegateError::Fetch(msg) => Status::internal(msg),
-            })?;
-
         let request_id = req
             .context
             .as_ref()
             .map(|c| c.request_id.clone())
             .unwrap_or_else(|| "unknown".to_string());
+        let result = delegate::fetch(op, &request_schema, &params)
+            .await
+            .map_err(|e| match e {
+                delegate::DelegateError::Params(pe) => Status::invalid_argument(pe.to_string()),
+                // Fetch → internal + ErrorDetail (provider/reason_code/retryable),
+                // 客户端桥据此重建 GatewayError 保真 (D2 分类不折叠)。
+                delegate::DelegateError::Fetch(failure) => {
+                    let detail = crate::grpc_client::pb::magic::market::v1::ErrorDetail {
+                        request_id: request_id.clone(),
+                        operation: op as i32,
+                        provider: failure
+                            .provider
+                            .map(|p| format!("{:?}", p))
+                            .unwrap_or_default(),
+                        reason_code: failure.reason_code.to_string(),
+                        retryable: failure.retryable,
+                    };
+                    Status::with_details(
+                        tonic::Code::Internal,
+                        format!("取数失败: {}", failure.message),
+                        detail.encode_to_vec().into(), // Bytes (tonic 0.14)
+                    )
+                }
+            })?;
         Ok(Response::new(QueryResponse {
             request_id,
             operation: op as i32,
@@ -105,6 +123,8 @@ impl DataService {
             observed_at: chrono::Local::now().to_rfc3339(),
             source_at: result.source_at,
             source: result.source,
+            // 上游合同字段 10: 本地 server 无诊断 handler, 永远不产生诊断阻塞。
+            diagnostic_blocker: String::new(),
             records: vec![CanonicalPayload {
                 schema: frozen.schema_name.to_string(),
                 schema_version: frozen.schema_version,
@@ -193,4 +213,5 @@ impl_market_data_service!(
     t0_evidence => T0Evidence,
     outcome_daily_bars => OutcomeDailyBars,
     upper_limit_pool_review => UpperLimitPoolReview,
+    chain_batch => ChainBatch,
 );

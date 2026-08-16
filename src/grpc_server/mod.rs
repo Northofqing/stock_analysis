@@ -13,7 +13,8 @@ use crate::grpc_client::pb::magic::market::v1::{
     HealthResponse, ListenerStatusRequest, ListenerStatusResponse,
 };
 use crate::grpc_contract::ops::implemented_operations;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use tonic::{Request, Response, Status};
 
 pub struct ServerState {
@@ -21,6 +22,11 @@ pub struct ServerState {
     pub generation: String,
     pub sequence: AtomicU64,
     pub shadow_events: bool,
+    /// SetWatchlist 状态 (合同 §8): 本地 server 无异步应用流程, desired==applied,
+    /// 初始 = STOCK_LIST (ServerConfig.instruments)。上游直连后该语义仍一致。
+    pub watchlist: Mutex<Vec<String>>,
+    /// 已应用 watchlist 版本 (每次 SetWatchlist 成功 +1)。
+    pub watchlist_revision: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +83,8 @@ pub async fn start(
         generation: format!("dev-{}", std::process::id()),
         sequence: AtomicU64::new(0),
         shadow_events: config.shadow_events,
+        watchlist: Mutex::new(config.instruments.clone()),
+        watchlist_revision: AtomicU64::new(1),
     });
 
     // Task 11: 事件服务注册。fixture 模式 hub 只接受注入, 不启动轮询。
@@ -122,6 +130,8 @@ impl SystemService for HealthService {
                 provider: "tdx-dev".to_string(),
                 exact_scope: "watchlist + explicit instruments".to_string(),
                 blocker: String::new(),
+                // 上游合同字段 7: 本地 server 无诊断 handler, 永远 false。
+                diagnostic_available: false,
             })
             .collect();
         Ok(Response::new(CapabilitiesResponse {

@@ -23,6 +23,8 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
         source_at: "2026-08-13T10:00:00+08:00".to_string(),
         records,
         source: "fixture".to_string(),
+        // 上游合同字段 10: fixture 无诊断阻塞。
+        diagnostic_blocker: String::new(),
     };
     match op {
         Operation::RealtimeQuotes => Some(resp(
@@ -132,6 +134,13 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
                 r#"[{"code":"600519","trading_date":"2026-08-15","theme":"白酒","streak":2}]"#,
             )],
         )),
+        // M4c 扩展: A-10 完整 batch (字段形状与 converter 重建 VisibleChainBatch 一致)。
+        Operation::ChainBatch => Some(resp(
+            "fixture-cb",
+            vec![payload(
+                r#"{"batch_id":"fixture-cb","content_hash":"h1","trading_date":"2026-08-15","calculation_version":"v1","taxonomy_version":"t1","inputs":[{"input_id":"i1","ordinal":1,"capability":"limit-up","provider":"tdx","source":"tdx","source_at":"2026-08-15T10:00:00+08:00","observed_at":"2026-08-15T10:00:00+08:00","source_batch_id":"b1","source_batch_hash":"h1","content_hash":"h1"}],"chains":[{"chain_id":"c1","canonical_board_id":"BK0475","board_name":"白酒","upper_limit_count":3,"continuous_count":2,"members":[{"instrument_id":"600519","security_name":"贵州茅台","source_event_id":"e1","streak":2}]}],"rejections":[]}"#,
+            )],
+        )),
         // M3 扩展 (P4): 剩余网关钩子的 op fixture (字段形状与 convert.rs 解析一致)。
         Operation::DragonTiger => Some(resp(
             "fixture-dt",
@@ -234,6 +243,8 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
                 r#"[{"metric":"VolumeRatio","ordinal":1,"code":"600519","label":"贵州茅台","value":3.2,"unit":"Multiple","trading_date":"2026-08-13","filter_identity":"volume_ratio_top20","provider_declared_total":20,"inspected_row_count":20},{"metric":"MainNetInflow","ordinal":1,"code":"600519","label":"贵州茅台","value":1.5e9,"unit":"Yuan","trading_date":"2026-08-13","filter_identity":"main_net_inflow_top20","provider_declared_total":20,"inspected_row_count":20}]"#,
             )],
             source: "fixture".to_string(),
+            // 上游合同字段 10: fixture 无诊断阻塞。
+            diagnostic_blocker: String::new(),
         }),
         Operation::SemanticSearch => Some(QueryResponse {
             // convert::parse_general_web_provider 只认 GeneralWebResearchProvider
@@ -252,6 +263,8 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
                 r#"[{"title":"白酒行业景气度跟踪","snippet":"2026年中报白酒板块营收同比增长 8.2%","url":"https://example.com/ws1","publisher":"国泰君安证券","published_at_raw":"2026-08-15T09:00:00+08:00","published_at":"2026-08-15T09:00:00+08:00","evidence":{"provider":"bocha","observed_at":"2026-08-15T09:00:00+08:00","batch_id":"fixture-b1","item_id":"ws-1","publication_quality":"exact_provider_time","use_scope":"research_only"}}]"#,
             )],
             source: "bocha-general-web".to_string(),
+            // 上游合同字段 10: fixture 无诊断阻塞。
+            diagnostic_blocker: String::new(),
         }),
         Operation::CorporateActions => Some(resp(
             "fixture-ca",

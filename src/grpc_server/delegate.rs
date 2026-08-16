@@ -39,19 +39,75 @@ pub struct Fetched {
     pub batch_id: String,
 }
 
+/// 取数失败 (携带服务端侧分类, 客户端桥据此重建 GatewayError 保真;
+/// proto ErrorDetail 字段: provider/reason_code/retryable)。
+#[derive(Debug)]
+pub struct FetchFailure {
+    pub message: String,
+    pub provider: Option<ProviderId>,
+    pub reason_code: &'static str,
+    pub retryable: bool,
+}
+
+impl FetchFailure {
+    /// 从 data_gateway 网关错误提取分类 (provider/reason_code/retryable 保真)。
+    pub fn from_gateway(e: crate::data_gateway::GatewayError) -> Self {
+        Self {
+            message: e.to_string(),
+            provider: e.provider(),
+            reason_code: e.reason_code(),
+            retryable: e.retryable(),
+        }
+    }
+
+    /// 非网关错误 (serde/IO 等) → 默认 unavailable 语义 (fail-closed, 可重试)。
+    pub fn unknown(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            provider: None,
+            reason_code: "no_verified_batch",
+            retryable: true,
+        }
+    }
+}
+
+impl From<String> for FetchFailure {
+    fn from(e: String) -> Self {
+        FetchFailure::unknown(e)
+    }
+}
+
+impl From<&str> for FetchFailure {
+    fn from(e: &str) -> Self {
+        FetchFailure::unknown(e)
+    }
+}
+
+impl From<serde_json::Error> for FetchFailure {
+    fn from(e: serde_json::Error) -> Self {
+        FetchFailure::unknown(e.to_string())
+    }
+}
+
+impl From<crate::data_gateway::GatewayError> for FetchFailure {
+    fn from(e: crate::data_gateway::GatewayError) -> Self {
+        FetchFailure::from_gateway(e)
+    }
+}
+
 /// 委托层错误: Params = 请求方参数 (→ Status::invalid_argument);
-/// Fetch = 取数失败 (→ Status::internal, fail-closed 不静默回退)。
+/// Fetch = 取数失败 (→ Status::internal + ErrorDetail 分类, fail-closed 不静默回退)。
 #[derive(Debug)]
 pub enum DelegateError {
     Params(crate::grpc_contract::params::ParamsError),
-    Fetch(String),
+    Fetch(FetchFailure),
 }
 
 impl std::fmt::Display for DelegateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DelegateError::Params(e) => write!(f, "{e}"),
-            DelegateError::Fetch(msg) => write!(f, "取数失败: {msg}"),
+            DelegateError::Fetch(failure) => write!(f, "取数失败: {}", failure.message),
         }
     }
 }
@@ -59,6 +115,12 @@ impl std::fmt::Display for DelegateError {
 impl From<crate::grpc_contract::params::ParamsError> for DelegateError {
     fn from(e: crate::grpc_contract::params::ParamsError) -> Self {
         DelegateError::Params(e)
+    }
+}
+
+impl From<FetchFailure> for DelegateError {
+    fn from(f: FetchFailure) -> Self {
+        DelegateError::Fetch(f)
     }
 }
 
@@ -72,9 +134,9 @@ fn source_at_of(batch: &crate::data_gateway::GatewayBatch<impl Sized>) -> String
 }
 
 /// 无 evidence 的视图打包 (provider/source/batch_id 留空, 合同 §6 缺则不填充)。
-fn pack(records: Vec<Value>, source_at: String) -> Result<Fetched, String> {
+fn pack(records: Vec<Value>, source_at: String) -> Result<Fetched, FetchFailure> {
     Ok(Fetched {
-        data: serde_json::to_vec(&records).map_err(|e| e.to_string())?,
+        data: serde_json::to_vec(&records).map_err(|e| FetchFailure::unknown(e.to_string()))?,
         source_at,
         provider: String::new(),
         source: String::new(),
@@ -86,7 +148,7 @@ fn pack(records: Vec<Value>, source_at: String) -> Result<Fetched, String> {
 fn pack_ev(
     records: Vec<Value>,
     batch: &crate::data_gateway::GatewayBatch<impl Sized>,
-) -> Result<Fetched, String> {
+) -> Result<Fetched, FetchFailure> {
     let ev = batch.evidence();
     pack_ev_from(
         records,
@@ -104,9 +166,9 @@ fn pack_ev_from(
     provider: String,
     source: String,
     batch_id: String,
-) -> Result<Fetched, String> {
+) -> Result<Fetched, FetchFailure> {
     Ok(Fetched {
-        data: serde_json::to_vec(&records).map_err(|e| e.to_string())?,
+        data: serde_json::to_vec(&records).map_err(|e| FetchFailure::unknown(e.to_string()))?,
         source_at,
         provider,
         source,
@@ -114,11 +176,11 @@ fn pack_ev_from(
     })
 }
 
-fn not_yet(op: Operation) -> Result<Fetched, String> {
-    Err(format!(
+fn not_yet(op: Operation) -> Result<Fetched, FetchFailure> {
+    Err(FetchFailure::unknown(format!(
         "{}: delegate 尚未实现 (Task 10 补全)",
         crate::grpc_contract::ops::method_name(op)
-    ))
+    )))
 }
 
 /// 统一取数入口 (M1: 新 14 个 fetch 收 params; 既有 24 个签名不变 → 显式 codes
@@ -147,8 +209,8 @@ pub async fn fetch(
         Operation::BoardDirectory => fetch_board_directory(params).await.map_err(DelegateError::Fetch),
         Operation::BoardConstituents => fetch_board_constituents(params).await.map_err(DelegateError::Fetch),
         Operation::BoardFlows => fetch_board_flows(params).await.map_err(DelegateError::Fetch),
-        Operation::LimitPools => fetch_limit_pools().await.map_err(DelegateError::Fetch),
-        Operation::StrongStockReasons => fetch_strong_stock_reasons().await.map_err(DelegateError::Fetch),
+        Operation::LimitPools => fetch_limit_pools(params).await.map_err(DelegateError::Fetch),
+        Operation::StrongStockReasons => fetch_strong_stock_reasons(params).await.map_err(DelegateError::Fetch),
         Operation::MarketDragonTiger => fetch_market_dragon_tiger(params).await.map_err(DelegateError::Fetch),
         Operation::MarketRankings => fetch_market_rankings(params).await.map_err(DelegateError::Fetch),
         Operation::ConceptHits => fetch_concept_hits(params).await.map_err(DelegateError::Fetch),
@@ -170,6 +232,8 @@ pub async fn fetch(
         Operation::T0Evidence => fetch_t0_evidence(params).await,
         Operation::OutcomeDailyBars => fetch_outcome_daily_bars(params).await,
         Operation::UpperLimitPoolReview => fetch_upper_limit_pool_review(params).await,
+        // M4c 扩展 (P4): A-10 完整 batch (本地扩展 61, monitor 复盘消费)。
+        Operation::ChainBatch => fetch_chain_batch_full(params).await.map_err(DelegateError::Fetch),
         _ => not_yet(op).map_err(DelegateError::Fetch),
     }
 }
@@ -183,7 +247,7 @@ pub fn fetch_realtime_quotes(params: &Value) -> Result<Fetched, DelegateError> {
     let codes = crate::grpc_contract::params::resolve_codes(params)?;
     let batch = crate::data_gateway::MarketDataGateway::new()
         .realtime_quotes(&codes)
-        .map_err(|e| DelegateError::Fetch(format!("统一实时行情 Gateway 不可用: {e}")))?;
+        .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(format!("统一实时行情 Gateway 不可用: {e}"))))?;
     let records: Vec<Value> = batch
         .records()
         .iter()
@@ -214,13 +278,13 @@ async fn fetch_minute_data(params: &Value) -> Result<Fetched, DelegateError> {
             gateway
                 .minute_data(&code, None)
                 .await
-                .map_err(|e| DelegateError::Fetch(format!("分钟线 Gateway 不可用 ({code}): {e}")))
+                .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(format!("分钟线 Gateway 不可用 ({code}): {e}"))))
         });
     }
     let mut records: Vec<Value> = Vec::new();
     let mut evidence_first: Option<crate::data_gateway::BatchEvidence> = None;
     while let Some(joined) = set.join_next().await {
-        let batch = joined.map_err(|e| DelegateError::Fetch(format!("分钟线 task 失败: {e}")))?;
+        let batch = joined.map_err(|e| DelegateError::Fetch(FetchFailure::unknown(format!("分钟线 task 失败: {e}"))))?;
         let batch = batch?;
         if evidence_first.is_none() {
             evidence_first = Some(batch.evidence().clone());
@@ -239,7 +303,7 @@ async fn fetch_minute_data(params: &Value) -> Result<Fetched, DelegateError> {
     // P4 M2: 证据链回填 (取首个 batch 的 evidence; 全部失败时 evidence_first 为 None
     // → 显式错误, 不静默填默认证据)。
     let ev = evidence_first
-        .ok_or_else(|| DelegateError::Fetch("分钟线: 无任何 batch 成功".to_string()))?;
+        .ok_or_else(|| DelegateError::Fetch(FetchFailure::unknown("分钟线: 无任何 batch 成功".to_string())))?;
     pack_ev_from(
         records,
         ev.source_at.clone().unwrap_or_default(),
@@ -257,7 +321,7 @@ async fn fetch_order_books(params: &Value) -> Result<Fetched, DelegateError> {
     let batch = gateway
         .order_books(&codes)
         .await
-        .map_err(|e| DelegateError::Fetch(format!("盘口 Gateway 不可用: {e}")))?;
+        .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(format!("盘口 Gateway 不可用: {e}"))))?;
     let records: Vec<Value> = batch
         .records()
         .iter()
@@ -286,7 +350,7 @@ async fn fetch_money_flows(params: &Value) -> Result<Fetched, DelegateError> {
     let batch = gateway
         .money_flows(&codes)
         .await
-        .map_err(|e| DelegateError::Fetch(format!("资金流 Gateway 不可用: {e}")))?;
+        .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(format!("资金流 Gateway 不可用: {e}"))))?;
     let records: Vec<Value> = batch
         .records()
         .iter()
@@ -313,7 +377,7 @@ async fn fetch_security_metadata(params: &Value) -> Result<Fetched, DelegateErro
     let batch = gateway
         .security_metadata(&codes)
         .await
-        .map_err(|e| DelegateError::Fetch(format!("证券元数据 Gateway 不可用: {e}")))?;
+        .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(format!("证券元数据 Gateway 不可用: {e}"))))?;
     let records: Vec<Value> = batch
         .records()
         .iter()
@@ -333,7 +397,7 @@ async fn fetch_security_metadata(params: &Value) -> Result<Fetched, DelegateErro
     pack_ev(records, &batch).map_err(DelegateError::Fetch)
 }
 
-async fn fetch_global_indices() -> Result<Fetched, String> {
+async fn fetch_global_indices() -> Result<Fetched, FetchFailure> {
     let gateway = GlobalMarketGateway::new();
     let batch = gateway
         .us_indices()
@@ -357,7 +421,7 @@ async fn fetch_global_indices() -> Result<Fetched, String> {
     pack(records, source_at)
 }
 
-async fn fetch_announcements() -> Result<Fetched, String> {
+async fn fetch_announcements() -> Result<Fetched, FetchFailure> {
     let gateway = EventCalendarGateway::new();
     let batch = gateway
         .market_announcements(today(), 100)
@@ -381,7 +445,7 @@ async fn fetch_announcements() -> Result<Fetched, String> {
     pack(records, source_at)
 }
 
-async fn fetch_global_news() -> Result<Fetched, String> {
+async fn fetch_global_news() -> Result<Fetched, FetchFailure> {
     let gateway = GlobalNewsGateway::new();
     let batch = gateway
         .global_news(GlobalNewsProvider::Eastmoney, 20)
@@ -409,7 +473,7 @@ async fn fetch_global_news() -> Result<Fetched, String> {
     pack(records, source_at)
 }
 
-async fn fetch_economic_calendar() -> Result<Fetched, String> {
+async fn fetch_economic_calendar() -> Result<Fetched, FetchFailure> {
     let gateway = EconomicCalendarGateway::new();
     let batch = gateway
         .latest_releases(20, None)
@@ -441,7 +505,7 @@ async fn fetch_economic_calendar() -> Result<Fetched, String> {
     pack(records, source_at)
 }
 
-async fn fetch_futures_delivery() -> Result<Fetched, String> {
+async fn fetch_futures_delivery() -> Result<Fetched, FetchFailure> {
     let gateway = FuturesDeliveryGateway::new();
     let now = Local::now();
     let batch = gateway
@@ -468,7 +532,7 @@ async fn fetch_futures_delivery() -> Result<Fetched, String> {
 /// 龙虎榜: 生产调用方传 trading_date + disclosure_limit + stock_limit
 /// (push_templates r04, main.rs 12411) — 参数默认值保持 M1 行为 (今天/100/20),
 /// 显式字段才改变行为 (v15.x)。
-async fn fetch_dragon_tiger(params: &Value) -> Result<Fetched, String> {
+async fn fetch_dragon_tiger(params: &Value) -> Result<Fetched, FetchFailure> {
     let trading_date = crate::grpc_contract::params::resolve_date(params)
         .map_err(|e| format!("params 无效: {e}"))?;
     let disclosure_limit =
@@ -521,7 +585,7 @@ async fn fetch_dragon_tiger(params: &Value) -> Result<Fetched, String> {
 
 /// 大宗交易: 生产调用方传 codes + trading_date (push_templates r05) —
 /// codes 缺省 watchlist, date 缺省今天。
-async fn fetch_block_trades(params: &Value) -> Result<Fetched, String> {
+async fn fetch_block_trades(params: &Value) -> Result<Fetched, FetchFailure> {
     let codes = crate::grpc_contract::params::resolve_codes(params)
         .map_err(|e| format!("params 无效: {e}"))?;
     let trading_date = crate::grpc_contract::params::resolve_date(params)
@@ -553,7 +617,7 @@ async fn fetch_block_trades(params: &Value) -> Result<Fetched, String> {
 }
 
 /// 一致预期: 生产调用方逐代码 fetch(code) (v17_sources) — codes 缺省 watchlist。
-async fn fetch_consensus(params: &Value) -> Result<Fetched, String> {
+async fn fetch_consensus(params: &Value) -> Result<Fetched, FetchFailure> {
     let gateway = ConsensusDataGateway::new();
     let codes = crate::grpc_contract::params::resolve_codes(params)
         .map_err(|e| format!("params 无效: {e}"))?;
@@ -607,13 +671,13 @@ async fn fetch_historical_bars(params: &Value) -> Result<Fetched, DelegateError>
             gateway
                 .daily_bars_async(&code, days)
                 .await
-                .map_err(|e| DelegateError::Fetch(format!("日线 Gateway 不可用 ({code}): {e}")))
+                .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(format!("日线 Gateway 不可用 ({code}): {e}"))))
         });
     }
     let mut records: Vec<Value> = Vec::new();
     let mut evidence_first: Option<crate::data_gateway::BatchEvidence> = None;
     while let Some(joined) = set.join_next().await {
-        let batch = joined.map_err(|e| DelegateError::Fetch(format!("日线 task 失败: {e}")))?;
+        let batch = joined.map_err(|e| DelegateError::Fetch(FetchFailure::unknown(format!("日线 task 失败: {e}"))))?;
         let batch = batch?;
         if evidence_first.is_none() {
             evidence_first = Some(batch.evidence().clone());
@@ -636,7 +700,7 @@ async fn fetch_historical_bars(params: &Value) -> Result<Fetched, DelegateError>
     }
     // P4 M2: 证据链回填 (AdmittedDailyBars 载体, 手动 pack_ev_from)。
     let ev = evidence_first
-        .ok_or_else(|| DelegateError::Fetch("日线: 无任何 batch 成功".to_string()))?;
+        .ok_or_else(|| DelegateError::Fetch(FetchFailure::unknown("日线: 无任何 batch 成功".to_string())))?;
     pack_ev_from(
         records,
         ev.source_at.clone().unwrap_or_default(),
@@ -649,7 +713,7 @@ async fn fetch_historical_bars(params: &Value) -> Result<Fetched, DelegateError>
 
 /// 板块目录: 生产调用方传 kind + limit (push_templates A-11, 200 只) —
 /// kind 缺省 Concept, limit 缺省 50 (M1 行为)。
-async fn fetch_board_directory(params: &Value) -> Result<Fetched, String> {
+async fn fetch_board_directory(params: &Value) -> Result<Fetched, FetchFailure> {
     let kind_str = crate::grpc_contract::params::resolve_enum_str(
         params,
         "kind",
@@ -690,7 +754,7 @@ async fn fetch_board_directory(params: &Value) -> Result<Fetched, String> {
 /// 逐代码查「个股→所属板块」, 输出成分归属视图。
 /// 板块成分归属: 生产调用方传板块 code (push_templates A-11 memberships) —
 /// codes 缺省 watchlist。
-async fn fetch_board_constituents(params: &Value) -> Result<Fetched, String> {
+async fn fetch_board_constituents(params: &Value) -> Result<Fetched, FetchFailure> {
     let gateway = BoardDataGateway::new();
     let codes = crate::grpc_contract::params::resolve_codes(params)
         .map_err(|e| format!("params 无效: {e}"))?;
@@ -725,7 +789,7 @@ async fn fetch_board_constituents(params: &Value) -> Result<Fetched, String> {
 
 /// 板块资金流: 生产调用方传 kind + limit (statistics.rs / main.rs
 /// day1_flows_blocking, Industry/20) — kind 缺省 Concept, limit 缺省 20。
-async fn fetch_board_flows(params: &Value) -> Result<Fetched, String> {
+async fn fetch_board_flows(params: &Value) -> Result<Fetched, FetchFailure> {
     let kind_str = crate::grpc_contract::params::resolve_enum_str(
         params,
         "kind",
@@ -765,18 +829,39 @@ async fn fetch_board_flows(params: &Value) -> Result<Fetched, String> {
     pack(records, source_at)
 }
 
-/// LimitPools/StrongStockReasons 共用 A-10 题材链 batch (唯一生产入口)。
+/// LimitPools/StrongStockReasons/ChainBatch 共用 A-10 题材链 batch (唯一生产入口)。
+/// M4c: 加 date 参数 (resolve_date, 默认 today) — monitor 复盘按指定交易日重算。
 async fn fetch_chain_batch(
+    params: &Value,
 ) -> Result<crate::database::chain_intelligence::VisibleChainBatch, String> {
+    let trading_date = crate::grpc_contract::params::resolve_date(params)
+        .map_err(|e| format!("params 无效: {e}"))?;
     ChainIntelligenceGateway::new()
-        .build_for_date(today())
+        .build_for_date(trading_date)
         .await
         .map_err(|e| format!("题材链 Gateway 不可用: {e}"))
 }
 
+/// M4c: A-10 完整 batch (本地扩展 op 61, schema market.chain_batch v1)。
+/// 44/45 视图扁平化后 inputs/版本/rejections 不可重建 — monitor 复盘经此 op
+/// 拿完整 VisibleChainBatch (计算+stage+publish 副作用在服务端进程执行,
+/// 与 build_for_date 语义一致; 切桥后 A-10 单写方 = 服务端)。
+async fn fetch_chain_batch_full(params: &Value) -> Result<Fetched, FetchFailure> {
+    let batch = fetch_chain_batch(params).await?;
+    let data = serde_json::to_vec(&batch)
+        .map_err(|e| FetchFailure::unknown(format!("VisibleChainBatch 序列化失败: {e}")))?;
+    Ok(Fetched {
+        data,
+        source_at: batch.trading_date.to_string(),
+        provider: String::new(),
+        source: String::new(),
+        batch_id: String::new(),
+    })
+}
+
 /// 涨停池: 全部涨停链成员扁平视图 (含连板 streak)。
-async fn fetch_limit_pools() -> Result<Fetched, String> {
-    let batch = fetch_chain_batch().await?;
+async fn fetch_limit_pools(params: &Value) -> Result<Fetched, FetchFailure> {
+    let batch = fetch_chain_batch(params).await?;
     let mut records: Vec<Value> = Vec::new();
     for chain in &batch.chains {
         for m in &chain.members {
@@ -793,8 +878,8 @@ async fn fetch_limit_pools() -> Result<Fetched, String> {
 }
 
 /// 强势股原因: 涨停链维度 (板块催化 + 涨停数 + 连续板成员)。
-async fn fetch_strong_stock_reasons() -> Result<Fetched, String> {
-    let batch = fetch_chain_batch().await?;
+async fn fetch_strong_stock_reasons(params: &Value) -> Result<Fetched, FetchFailure> {
+    let batch = fetch_chain_batch(params).await?;
     let records: Vec<Value> = batch
         .chains
         .iter()
@@ -824,7 +909,7 @@ async fn fetch_strong_stock_reasons() -> Result<Fetched, String> {
 /// 全市场龙虎榜: 与 DragonTiger op 共用 market_review (唯一生产入口),
 /// 区别仅在 schema 视图。
 /// 全市场龙虎榜 (R-04 视图别名): 参数语义与 fetch_dragon_tiger 一致。
-async fn fetch_market_dragon_tiger(params: &Value) -> Result<Fetched, String> {
+async fn fetch_market_dragon_tiger(params: &Value) -> Result<Fetched, FetchFailure> {
     let trading_date = crate::grpc_contract::params::resolve_date(params)
         .map_err(|e| format!("params 无效: {e}"))?;
     let disclosure_limit =
@@ -877,7 +962,7 @@ async fn fetch_market_dragon_tiger(params: &Value) -> Result<Fetched, String> {
 
 /// 板块排行: fetch_top 是同步 reqwest 阻塞调用 → spawn_blocking 隔离,
 /// 不卡 tokio worker。
-async fn fetch_board_ranking(fid: &str, top_n: usize) -> Result<Fetched, String> {
+async fn fetch_board_ranking(fid: &str, top_n: usize) -> Result<Fetched, FetchFailure> {
     let fid = fid.to_string();
     let joined = tokio::task::spawn_blocking(move || BoardRankingGateway::new().fetch_top(&fid, top_n))
         .await
@@ -904,7 +989,7 @@ async fn fetch_board_ranking(fid: &str, top_n: usize) -> Result<Fetched, String>
 
 /// 主力净流入排行 (fid=f62): 生产调用方传 top_n (sector_monitor rank_top) —
 /// 缺省 20 (M1 行为)。
-async fn fetch_market_rankings(params: &Value) -> Result<Fetched, String> {
+async fn fetch_market_rankings(params: &Value) -> Result<Fetched, FetchFailure> {
     let top_n = crate::grpc_contract::params::resolve_u32(params, "top_n", 20)
         .map_err(|e| format!("params 无效: {e}"))?;
     fetch_board_ranking("f62", top_n as usize).await
@@ -912,7 +997,7 @@ async fn fetch_market_rankings(params: &Value) -> Result<Fetched, String> {
 
 /// 概念涨幅榜 (东财概念板块排行 fid=f3): 生产调用方传 top_n
 /// (sector_monitor rank_top, push_templates 5/10/30) — 缺省 30 (M1 行为)。
-async fn fetch_concept_hits(params: &Value) -> Result<Fetched, String> {
+async fn fetch_concept_hits(params: &Value) -> Result<Fetched, FetchFailure> {
     let top_n = crate::grpc_contract::params::resolve_u32(params, "top_n", 30)
         .map_err(|e| format!("params 无效: {e}"))?;
     fetch_board_ranking("f3", top_n as usize).await
@@ -920,7 +1005,7 @@ async fn fetch_concept_hits(params: &Value) -> Result<Fetched, String> {
 
 /// 研报: 逐代码 instrument_reports (记录无 code 字段 → 带 code 回传)。
 /// 研报: codes 缺省 watchlist, page_size 缺省 5 (M1 行为; agent 工具传 20)。
-async fn fetch_research_reports(params: &Value) -> Result<Fetched, String> {
+async fn fetch_research_reports(params: &Value) -> Result<Fetched, FetchFailure> {
     let codes = crate::grpc_contract::params::resolve_codes(params)
         .map_err(|e| format!("params 无效: {e}"))?;
     let page_size = crate::grpc_contract::params::resolve_u32(params, "page_size", 5)
@@ -965,7 +1050,7 @@ async fn fetch_research_reports(params: &Value) -> Result<Fetched, String> {
 /// 北向日数据: P4 M4b 升级 — 收 date + channel params (默认今天/Shanghai),
 /// 与客户端桥 CapitalDataGateway::northbound_daily(trading_date, channel) 对齐
 /// (此前固定 today()+双 channel 合流, 无法满足指定日期/单通道请求)。
-async fn fetch_northbound_daily(params: &Value) -> Result<Fetched, String> {
+async fn fetch_northbound_daily(params: &Value) -> Result<Fetched, FetchFailure> {
     let date = crate::grpc_contract::params::resolve_date(params)
         .map_err(|e| format!("params 无效: {e}"))?;
     let channel = match crate::grpc_contract::params::resolve_enum_str(
@@ -1025,7 +1110,7 @@ async fn fetch_foreign_exchange(params: &Value) -> Result<Fetched, DelegateError
     let batch = GlobalMarketGateway::new()
         .usd_cny()
         .await
-        .map_err(|e| DelegateError::Fetch(format!("外汇 Gateway 不可用: {e}")))?;
+        .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(format!("外汇 Gateway 不可用: {e}"))))?;
     let records: Vec<Value> = batch
         .records()
         .iter()
@@ -1062,11 +1147,11 @@ async fn fetch_financial_statements(params: &Value) -> Result<Fetched, DelegateE
     let batch = CompanyDataGateway::new()
         .financial_statements(&codes, kind)
         .await
-        .map_err(|e| DelegateError::Fetch(format!("财务报告 Gateway 不可用: {e}")))?;
+        .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(format!("财务报告 Gateway 不可用: {e}"))))?;
     let records: Vec<Value> = batch
         .records()
         .iter()
-        .map(|r| serde_json::to_value(r).map_err(|e| DelegateError::Fetch(e.to_string())))
+        .map(|r| serde_json::to_value(r).map_err(|e| DelegateError::Fetch(FetchFailure::unknown(e.to_string()))))
         .collect::<Result<_, _>>()?;
     pack_ev(records, &batch).map_err(DelegateError::Fetch)
 }
@@ -1078,7 +1163,7 @@ async fn fetch_market_statistics(params: &Value) -> Result<Fetched, DelegateErro
     let batch = CompanyDataGateway::new()
         .market_statistics(&codes)
         .await
-        .map_err(|e| DelegateError::Fetch(format!("市场统计 Gateway 不可用: {e}")))?;
+        .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(format!("市场统计 Gateway 不可用: {e}"))))?;
     let records: Vec<Value> = batch
         .records()
         .iter()
@@ -1112,7 +1197,7 @@ async fn fetch_technical_bars(params: &Value) -> Result<Fetched, DelegateError> 
     for code in codes {
         let bars = gateway
             .fifteen_min_bars(&code, count)
-            .map_err(|e| DelegateError::Fetch(format!("15 分钟线 Gateway 不可用 ({code}): {e}")))?;
+            .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(format!("15 分钟线 Gateway 不可用 ({code}): {e}"))))?;
         records.extend(bars.iter().map(|b| {
             json!({
                 "code": code,
@@ -1139,12 +1224,12 @@ async fn fetch_corporate_actions(params: &Value) -> Result<Fetched, DelegateErro
     let ctx = crate::data_gateway::security_lifecycle::SecurityLifecycleGateway::new()
         .acquire(&code, window_start, window_end)
         .await
-        .map_err(|e| DelegateError::Fetch(format!("公司行动 Gateway 不可用: {e}")))?;
+        .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(format!("公司行动 Gateway 不可用: {e}"))))?;
     let state = ctx.corporate_actions;
     let mut records: Vec<Value> = Vec::new();
     for r in state.records() {
         let terms = serde_json::to_value(&r.terms)
-            .map_err(|e| DelegateError::Fetch(format!("terms 序列化失败: {e}")))?;
+            .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(format!("terms 序列化失败: {e}"))))?;
         records.push(json!({
             "code": r.code,
             "category": format!("{:?}", r.category),
@@ -1158,7 +1243,7 @@ async fn fetch_corporate_actions(params: &Value) -> Result<Fetched, DelegateErro
     // SecurityLifecycleContext 非 GatewayBatch → evidence 从 CorporateActionState 取。
     let evidence = state.evidence();
     Ok(Fetched {
-        data: serde_json::to_vec(&records).map_err(|e| DelegateError::Fetch(e.to_string()))?,
+        data: serde_json::to_vec(&records).map_err(|e| DelegateError::Fetch(FetchFailure::unknown(e.to_string())))?,
         source_at: evidence
             .map(|e| e.source_at.clone().unwrap_or_default())
             .unwrap_or_default(),
@@ -1176,18 +1261,18 @@ async fn fetch_semantic_search(params: &Value) -> Result<Fetched, DelegateError>
     let batch = GeneralWebResearchGateway::from_environment(GeneralWebResearchProvider::Bocha)
         .search(&query, limit)
         .await
-        .map_err(|e| DelegateError::Fetch(format!("联网检索不可用: {e}")))?;
+        .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(format!("联网检索不可用: {e}"))))?;
     // GeneralWebResearchBatch 只有 evidence() 访问器; records 在 enum 变体字段。
     let records: Vec<Value> = match &batch {
         crate::data_gateway::GeneralWebResearchBatch::Available { records, .. } => records
             .iter()
-            .map(|r| serde_json::to_value(r).map_err(|e| DelegateError::Fetch(e.to_string())))
+            .map(|r| serde_json::to_value(r).map_err(|e| DelegateError::Fetch(FetchFailure::unknown(e.to_string()))))
             .collect::<Result<_, _>>()?,
         crate::data_gateway::GeneralWebResearchBatch::VerifiedEmpty(_) => Vec::new(),
     };
     let ev = batch.evidence();
     Ok(Fetched {
-        data: serde_json::to_vec(&records).map_err(|e| DelegateError::Fetch(e.to_string()))?,
+        data: serde_json::to_vec(&records).map_err(|e| DelegateError::Fetch(FetchFailure::unknown(e.to_string())))?,
         source_at: String::new(),
         provider: format!("{:?}", ev.provider),
         source: ev.source.clone(),
@@ -1217,14 +1302,14 @@ async fn fetch_fund_flow_series(params: &Value) -> Result<Fetched, DelegateError
             gateway
                 .instrument_fund_flow(&code, interval, limit)
                 .await
-                .map_err(|e| format!("资金流 Gateway 不可用 ({code}): {e}"))
+                .map_err(|e| FetchFailure::unknown(format!("资金流 Gateway 不可用 ({code}): {e}")))
         });
     }
     let mut records: Vec<Value> = Vec::new();
     let mut source_at = String::new();
     while let Some(joined) = set.join_next().await {
         let batch = joined
-            .map_err(|e| DelegateError::Fetch(format!("资金流 task 失败: {e}")))?
+            .map_err(|e| FetchFailure::unknown(format!("资金流 task 失败: {e}")))?
             .map_err(DelegateError::Fetch)?;
         if source_at.is_empty() {
             source_at = source_at_of(&batch);
@@ -1253,7 +1338,7 @@ async fn fetch_provider_top_n_rankings(params: &Value) -> Result<Fetched, Delega
     let pair = CapitalDataGateway::new()
         .provider_top_n_pair(date)
         .await
-        .map_err(|e| DelegateError::Fetch(format!("头部排行 Gateway 不可用: {e}")))?;
+        .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(format!("头部排行 Gateway 不可用: {e}"))))?;
     let mut records: Vec<Value> = Vec::new();
     for batch in [&pair.volume_ratio, &pair.main_net_inflow] {
         for r in batch.records() {
@@ -1291,7 +1376,7 @@ async fn fetch_index_quotes(params: &Value) -> Result<Fetched, DelegateError> {
     };
     let batch = IndexDataGateway::new()
         .realtime_quotes(&codes)
-        .map_err(|e| DelegateError::Fetch(format!("指数行情 Gateway 不可用: {e}")))?;
+        .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(format!("指数行情 Gateway 不可用: {e}"))))?;
     let records: Vec<Value> = batch
         .records()
         .iter()
@@ -1330,14 +1415,14 @@ async fn fetch_instrument_news(params: &Value) -> Result<Fetched, DelegateError>
             gateway
                 .instrument_news_in_range(&code, from, now)
                 .await
-                .map_err(|e| format!("个股新闻 Gateway 不可用 ({code}): {e}"))
+                .map_err(|e| FetchFailure::unknown(format!("个股新闻 Gateway 不可用 ({code}): {e}")))
         });
     }
     let mut records: Vec<Value> = Vec::new();
     let mut source_at = String::new();
     while let Some(joined) = set.join_next().await {
         let batch = joined
-            .map_err(|e| DelegateError::Fetch(format!("个股新闻 task 失败: {e}")))?
+            .map_err(|e| FetchFailure::unknown(format!("个股新闻 task 失败: {e}")))?
             .map_err(DelegateError::Fetch)?;
         if source_at.is_empty() {
             source_at = source_at_of(&batch);
@@ -1373,14 +1458,14 @@ async fn fetch_intraday_shape(params: &Value) -> Result<Fetched, DelegateError> 
             gateway
                 .current_shape(&code)
                 .await
-                .map_err(|e| format!("日内形态 Gateway 不可用 ({code}): {e}"))
+                .map_err(|e| FetchFailure::unknown(format!("日内形态 Gateway 不可用 ({code}): {e}")))
         });
     }
     let mut records: Vec<Value> = Vec::new();
     let mut source_at = String::new();
     while let Some(joined) = set.join_next().await {
         let batch = joined
-            .map_err(|e| DelegateError::Fetch(format!("日内形态 task 失败: {e}")))?
+            .map_err(|e| FetchFailure::unknown(format!("日内形态 task 失败: {e}")))?
             .map_err(DelegateError::Fetch)?;
         if source_at.is_empty() {
             source_at = source_at_of(&batch);
@@ -1408,20 +1493,20 @@ async fn fetch_t0_evidence(params: &Value) -> Result<Fetched, DelegateError> {
     let codes = crate::grpc_contract::params::resolve_codes(params)?;
     let batch = MagicTdxGateway::new()
         .get_t0_evidence_batch(&codes, chrono::Utc::now())
-        .map_err(|e| DelegateError::Fetch(format!("T0 证据不可用: {e}")))?;
+        .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(format!("T0 证据不可用: {e}"))))?;
     let records: Vec<Value> = batch
         .records
         .iter()
-        .map(|r| serde_json::to_value(r).map_err(|e| DelegateError::Fetch(e.to_string())))
+        .map(|r| serde_json::to_value(r).map_err(|e| DelegateError::Fetch(FetchFailure::unknown(e.to_string()))))
         .collect::<Result<_, _>>()?;
     let rejections: Vec<Value> = batch
         .rejections
         .iter()
-        .map(|r| serde_json::to_value(r).map_err(|e| DelegateError::Fetch(e.to_string())))
+        .map(|r| serde_json::to_value(r).map_err(|e| DelegateError::Fetch(FetchFailure::unknown(e.to_string()))))
         .collect::<Result<_, _>>()?;
     let view = json!({ "records": records, "rejections": rejections });
     Ok(Fetched {
-        data: serde_json::to_vec(&view).map_err(|e| DelegateError::Fetch(e.to_string()))?,
+        data: serde_json::to_vec(&view).map_err(|e| DelegateError::Fetch(FetchFailure::unknown(e.to_string())))?,
         source_at: batch.source_at.to_rfc3339(),
         provider: String::new(),
         source: String::new(),
@@ -1487,14 +1572,14 @@ async fn fetch_outcome_daily_bars(params: &Value) -> Result<Fetched, DelegateErr
         )
     })
     .await
-    .map_err(|e| DelegateError::Fetch(format!("outcome_daily_bars worker join 失败: {e}")))?;
+    .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(format!("outcome_daily_bars worker join 失败: {e}"))))?;
 
     match result {
         Ok(RawOutcomeFetch { batch, attempts }) => {
             let batch_json = serde_json::to_value(&batch)
-                .map_err(|e| DelegateError::Fetch(format!("outcome batch 序列化失败: {e}")))?;
+                .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(format!("outcome batch 序列化失败: {e}"))))?;
             let attempts_json = serde_json::to_value(&attempts).map_err(|e| {
-                DelegateError::Fetch(format!("outcome attempts 序列化失败: {e}"))
+                DelegateError::Fetch(FetchFailure::unknown(format!("outcome attempts 序列化失败: {e}")))
             })?;
             let provenance = batch.provenance();
             Ok(Fetched {
@@ -1503,7 +1588,7 @@ async fn fetch_outcome_daily_bars(params: &Value) -> Result<Fetched, DelegateErr
                     "attempts": attempts_json,
                     "error": Value::Null,
                 }))
-                .map_err(|e| DelegateError::Fetch(e.to_string()))?,
+                .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(e.to_string())))?,
                 source_at: provenance.source_at().unwrap_or_default().to_string(),
                 provider: format!("{:?}", ProviderId::Tdx),
                 source: provenance.source().to_string(),
@@ -1512,7 +1597,7 @@ async fn fetch_outcome_daily_bars(params: &Value) -> Result<Fetched, DelegateErr
         }
         Err(OutcomeTransportFailure { error, attempts }) => {
             let attempts_json = serde_json::to_value(&attempts).map_err(|e| {
-                DelegateError::Fetch(format!("outcome attempts 序列化失败: {e}"))
+                DelegateError::Fetch(FetchFailure::unknown(format!("outcome attempts 序列化失败: {e}")))
             })?;
             Ok(Fetched {
                 data: serde_json::to_vec(&json!({
@@ -1527,7 +1612,7 @@ async fn fetch_outcome_daily_bars(params: &Value) -> Result<Fetched, DelegateErr
                         "message": error.message(),
                     },
                 }))
-                .map_err(|e| DelegateError::Fetch(e.to_string()))?,
+                .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(e.to_string())))?,
                 source_at: String::new(),
                 provider: format!("{:?}", ProviderId::Tdx),
                 source: String::new(),
@@ -1543,7 +1628,7 @@ async fn fetch_upper_limit_pool_review(params: &Value) -> Result<Fetched, Delega
     let batch = ReviewDataGateway::new()
         .r03_upper_limit_pool(date)
         .await
-        .map_err(|e| DelegateError::Fetch(format!("涨停池复盘 Gateway 不可用: {e}")))?;
+        .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(format!("涨停池复盘 Gateway 不可用: {e}"))))?;
     let records: Vec<Value> = batch
         .records()
         .iter()

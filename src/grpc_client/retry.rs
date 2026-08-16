@@ -12,8 +12,10 @@ pub enum RetryDecision {
 /// §10 表: 每个错误码的重试决策。
 pub fn retry_decision(err: &GrpcError) -> RetryDecision {
     match err {
-        GrpcError::Unavailable => RetryDecision::RetryBackoff,
-        GrpcError::DeadlineExceeded => RetryDecision::RetryBounded,
+        // D2: 变体带 details, 用 { .. } 忽略; 重试决策仍只看错误码 (§10),
+        // 服务端 reason_code/retryable 由桥在 GatewayError 层消费 (grpc_source.rs)。
+        GrpcError::Unavailable { .. } => RetryDecision::RetryBackoff,
+        GrpcError::DeadlineExceeded { .. } => RetryDecision::RetryBounded,
         _ => RetryDecision::NoRetry,
     }
 }
@@ -50,18 +52,47 @@ impl RetryPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grpc_client::errors::ErrorDetail;
+
+    fn unavail() -> GrpcError {
+        GrpcError::Unavailable { details: ErrorDetail::default() }
+    }
 
     #[test]
     fn decision_follows_contract_table() {
-        assert_eq!(retry_decision(&GrpcError::Unavailable), RetryDecision::RetryBackoff);
-        assert_eq!(retry_decision(&GrpcError::DeadlineExceeded), RetryDecision::RetryBounded);
-        assert_eq!(retry_decision(&GrpcError::InvalidArgument), RetryDecision::NoRetry);
-        assert_eq!(retry_decision(&GrpcError::Unauthenticated), RetryDecision::NoRetry);
-        assert_eq!(retry_decision(&GrpcError::PermissionDenied), RetryDecision::NoRetry);
-        assert_eq!(retry_decision(&GrpcError::Unimplemented), RetryDecision::NoRetry);
-        assert_eq!(retry_decision(&GrpcError::ResourceExhausted), RetryDecision::NoRetry);
-        assert_eq!(retry_decision(&GrpcError::FailedPrecondition), RetryDecision::NoRetry);
-        assert_eq!(retry_decision(&GrpcError::Internal), RetryDecision::NoRetry);
+        assert_eq!(retry_decision(&unavail()), RetryDecision::RetryBackoff);
+        assert_eq!(
+            retry_decision(&GrpcError::DeadlineExceeded { details: ErrorDetail::default() }),
+            RetryDecision::RetryBounded
+        );
+        assert_eq!(
+            retry_decision(&GrpcError::InvalidArgument { details: ErrorDetail::default() }),
+            RetryDecision::NoRetry
+        );
+        assert_eq!(
+            retry_decision(&GrpcError::Unauthenticated { details: ErrorDetail::default() }),
+            RetryDecision::NoRetry
+        );
+        assert_eq!(
+            retry_decision(&GrpcError::PermissionDenied { details: ErrorDetail::default() }),
+            RetryDecision::NoRetry
+        );
+        assert_eq!(
+            retry_decision(&GrpcError::Unimplemented { details: ErrorDetail::default() }),
+            RetryDecision::NoRetry
+        );
+        assert_eq!(
+            retry_decision(&GrpcError::ResourceExhausted { details: ErrorDetail::default() }),
+            RetryDecision::NoRetry
+        );
+        assert_eq!(
+            retry_decision(&GrpcError::FailedPrecondition { details: ErrorDetail::default() }),
+            RetryDecision::NoRetry
+        );
+        assert_eq!(
+            retry_decision(&GrpcError::Internal { details: ErrorDetail::default() }),
+            RetryDecision::NoRetry
+        );
     }
 
     #[test]

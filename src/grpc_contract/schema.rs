@@ -1,7 +1,8 @@
 //! canonical JSON schema 注册表 (合同 §5: 每方法 schema 名/版本冻结;
 //! 调用方遇到未知 schema/version 必须停止解析, 不能忽略或猜字段)。
 //!
-//! 初始以 data_gateway 返回类型的 JSON 为准, 冻结 24 个生产 op;
+//! 初始以 data_gateway 返回类型的 JSON 为准, 冻结 24 个生产 op,
+//! M1 起扩展至 38 个 (含本地扩展 op, 见 ops.rs implemented_operations);
 //! schema 名约定: "<域>.<数据族>", 版本从 1 起。
 use crate::grpc_client::pb::magic::market::v1::Operation;
 
@@ -53,6 +54,8 @@ const SCHEMAS: &[OpSchema] = &[
     OpSchema { operation: Operation::T0Evidence, schema_name: "market.t0_evidence", schema_version: 1 },
     OpSchema { operation: Operation::OutcomeDailyBars, schema_name: "market.outcome_daily_bars", schema_version: 1 },
     OpSchema { operation: Operation::UpperLimitPoolReview, schema_name: "market.upper_limit_pool_review", schema_version: 1 },
+    // M4c 扩展: A-10 完整 batch (本地扩展 61, monitor 复盘消费)。
+    OpSchema { operation: Operation::ChainBatch, schema_name: "market.chain_batch", schema_version: 1 },
 ];
 
 pub fn schema_for(op: Operation) -> Option<&'static OpSchema> {
@@ -65,8 +68,8 @@ mod tests {
 
     #[test]
     fn every_implemented_op_has_frozen_schema() {
-        // 38 个已实现 op 全部有 schema (M1 扩展后)。
-        assert_eq!(SCHEMAS.len(), 38);
+        // 39 个已实现 op 全部有 schema (M1 扩展 + M4c ChainBatch)。
+        assert_eq!(SCHEMAS.len(), 39);
         for op in crate::grpc_contract::ops::implemented_operations() {
             assert!(schema_for(op).is_some(), "op {op:?} 缺 schema");
         }

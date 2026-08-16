@@ -6,7 +6,8 @@
 use crate::grpc_client::pb::magic::market::v1::{
     market_event_service_server::MarketEventService, AdmissionState, CanonicalPayload,
     EventCursor, EventFilter, ListenerStatusRequest, ListenerStatusResponse,
-    MarketEventEnvelope, ReplayRequest, SubscribeRequest,
+    MarketEventEnvelope, ReplayRequest, SetWatchlistRequest, SetWatchlistResponse,
+    SubscribeRequest,
 };
 use crate::grpc_server::ServerState;
 use std::collections::VecDeque;
@@ -254,6 +255,8 @@ impl EventHub {
 
 pub struct EventService {
     pub hub: Arc<EventHub>,
+    /// SetWatchlist / ListenerStatus 的 watchlist 状态源 (ServerState.watchlist)。
+    pub state: Arc<ServerState>,
 }
 
 impl EventService {
@@ -261,6 +264,7 @@ impl EventService {
     pub fn new(state: Arc<ServerState>, _fixture_mode: bool) -> Self {
         Self {
             hub: Arc::new(EventHub::new(state.generation.clone(), state.shadow_events)),
+            state,
         }
     }
 }
@@ -334,12 +338,51 @@ impl MarketEventService for EventService {
         _req: Request<ListenerStatusRequest>,
     ) -> Result<Response<ListenerStatusResponse>, Status> {
         let cursor = self.hub.latest_cursor();
+        let watchlist = self.state.watchlist.lock().unwrap().clone();
+        let revision = self.state.watchlist_revision.load(Ordering::Relaxed);
+        // 合同 §8 watchlist 状态: 本地 server 无异步应用流程, desired==applied;
+        // maximum=0 = 未声明上限 (本地 server 不限制); admitted_event_families =
+        // 本地 EventKind 全集 (与 diff_snapshots 产出一致)。
+        let families: Vec<String> = [
+            EventKind::Price,
+            EventKind::Volume,
+            EventKind::Amount,
+            EventKind::Status,
+            EventKind::Reset,
+        ]
+        .into_iter()
+        .map(|k| k.as_str().to_string())
+        .collect();
         Ok(Response::new(ListenerStatusResponse {
             request_id: "status".to_string(),
             state: "RUNNING".to_string(),
             terminal_generation: cursor.generation.clone(),
             latest: Some(cursor),
             capabilities: vec![],
+            desired_watchlist_revision: revision,
+            desired_instruments: watchlist.clone(),
+            applied_watchlist_revision: revision,
+            applied_instruments: watchlist,
+            maximum_watchlist_instruments: 0,
+            admitted_event_families: families,
+        }))
+    }
+
+    async fn set_watchlist(
+        &self,
+        req: Request<SetWatchlistRequest>,
+    ) -> Result<Response<SetWatchlistResponse>, Status> {
+        let inner = req.into_inner();
+        // 本地 server 无异步应用流程: 请求立即应用 (desired==applied), 版本 +1。
+        let mut watchlist = self.state.watchlist.lock().unwrap();
+        watchlist.clear();
+        watchlist.extend(inner.instruments.iter().cloned());
+        let revision = self.state.watchlist_revision.fetch_add(1, Ordering::Relaxed) + 1;
+        Ok(Response::new(SetWatchlistResponse {
+            request_id: "set-watchlist".to_string(),
+            desired_revision: revision,
+            state: "APPLIED".to_string(),
+            instruments: inner.instruments,
         }))
     }
 }
