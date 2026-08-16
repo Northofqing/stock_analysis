@@ -45,6 +45,8 @@ fn err(capability: &'static str, msg: impl Into<String>) -> GatewayError {
 pub fn parse_provider(s: &str) -> Result<ProviderId, GatewayError> {
     Ok(match s {
         "Tdx" => ProviderId::Tdx,
+        // 服务端兼容值 (handlers.rs M1 fallback): Magic TDX 开发实例, 语义即 Tdx。
+        "tdx-dev" => ProviderId::Tdx,
         "Tencent" => ProviderId::Tencent,
         "Eastmoney" => ProviderId::Eastmoney,
         "Sina" => ProviderId::Sina,
@@ -1921,6 +1923,8 @@ mod tests {
     #[test]
     fn provider_debug_names_roundtrip() {
         assert_eq!(parse_provider("Tdx").unwrap(), ProviderId::Tdx);
+        // 服务端 M1 兼容 fallback (handlers.rs), 语义 = Tdx。
+        assert_eq!(parse_provider("tdx-dev").unwrap(), ProviderId::Tdx);
         assert_eq!(parse_provider("Eastmoney").unwrap(), ProviderId::Eastmoney);
         assert!(parse_provider("").is_err());
         assert!(parse_provider("Mystery").is_err());

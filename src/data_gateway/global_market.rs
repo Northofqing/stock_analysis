@@ -66,8 +66,34 @@ impl GlobalMarketGateway {
 
     /// Acquires exactly Dow Jones, Nasdaq Composite and S&P 500.
     pub async fn us_indices(&self) -> Result<GatewayBatch<GlobalIndexFact>, GatewayError> {
+        let request_hash = acquisition_request_hash(
+            INDEX_CAPABILITY,
+            "DowJones,NasdaqComposite,Sp500",
+        );
+        // P4 M3 钩子 (2026-08-17 补): DATA_GATEWAY_GRPC=1 → gRPC 通道 (fail-closed,
+        // audit 对等)。此前 GlobalIndices 服务端 delegate/桥方法已存在但网关钩子缺失
+        // → 零 magic 生产构建 push_templates.rs us_indices 每天 fail-closed 报错。
+        match super::grpc_source::bridge_for("GlobalIndices") {
+            Ok(Some(bridge)) => {
+                let result = bridge.global_indices_async().await;
+                let audit_provider = result
+                    .as_ref()
+                    .map(|b| b.evidence().provider)
+                    .unwrap_or(ProviderId::Sina);
+                return audit_gateway_result(INDEX_CAPABILITY, audit_provider, &request_hash, result);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_gateway_result(
+                    INDEX_CAPABILITY,
+                    ProviderId::Sina,
+                    &request_hash,
+                    Err(error),
+                );
+            }
+        }
         // no-feature (monitor 零 magic): library transport 不存在。
-        // GlobalIndices 无 gRPC 桥 (HOOKED_OPS 不含), 显式失败 (fail-closed), 绝不静默回退。
+        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
         #[cfg(not(feature = "magic-gateway"))]
         {
             return Err(GatewayError::classified(

@@ -119,6 +119,7 @@ pub const HOOKED_OPS: &[&str] = &[
     "ForeignExchange",
     "FundFlowSeries",
     "FuturesDelivery",
+    "GlobalIndices",
     "GlobalNews",
     "HistoricalBars",
     "IndexQuotes",

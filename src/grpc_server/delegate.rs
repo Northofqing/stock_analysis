@@ -70,6 +70,12 @@ impl FetchFailure {
             retryable: true,
         }
     }
+
+    /// 覆盖 message 保留调用方上下文 (分类字段不动 — from_gateway 后调用)。
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = message.into();
+        self
+    }
 }
 
 impl From<String> for FetchFailure {
@@ -403,7 +409,10 @@ async fn fetch_global_indices() -> Result<Fetched, FetchFailure> {
     let batch = gateway
         .us_indices()
         .await
-        .map_err(|e| format!("全球指数 Gateway 不可用: {e}"))?;
+        .map_err(|e| {
+            let message = format!("全球指数 Gateway 不可用: {e}");
+            FetchFailure::from_gateway(e).with_message(message)
+        })?;
     let source_at = source_at_of(&batch);
     let records: Vec<Value> = batch
         .records()
@@ -427,7 +436,10 @@ async fn fetch_announcements() -> Result<Fetched, FetchFailure> {
     let batch = gateway
         .market_announcements(today(), 100)
         .await
-        .map_err(|e| format!("公告 Gateway 不可用: {e}"))?;
+        .map_err(|e| {
+            let message = format!("公告 Gateway 不可用: {e}");
+            FetchFailure::from_gateway(e).with_message(message)
+        })?;
     let source_at = source_at_of(&batch);
     let records: Vec<Value> = batch
         .records()
@@ -451,7 +463,10 @@ async fn fetch_global_news() -> Result<Fetched, FetchFailure> {
     let batch = gateway
         .global_news(GlobalNewsProvider::Eastmoney, 20)
         .await
-        .map_err(|e| format!("全球新闻 Gateway 不可用: {e}"))?;
+        .map_err(|e| {
+            let message = format!("全球新闻 Gateway 不可用: {e}");
+            FetchFailure::from_gateway(e).with_message(message)
+        })?;
     let source_at = source_at_of(&batch);
     let records: Vec<Value> = batch
         .records()
@@ -479,7 +494,10 @@ async fn fetch_economic_calendar() -> Result<Fetched, FetchFailure> {
     let batch = gateway
         .latest_releases(20, None)
         .await
-        .map_err(|e| format!("财经日历 Gateway 不可用: {e}"))?;
+        .map_err(|e| {
+            let message = format!("财经日历 Gateway 不可用: {e}");
+            FetchFailure::from_gateway(e).with_message(message)
+        })?;
     let source_at = source_at_of(&batch);
     let records: Vec<Value> = batch
         .records()
@@ -512,7 +530,10 @@ async fn fetch_futures_delivery() -> Result<Fetched, FetchFailure> {
     let batch = gateway
         .cffex_contract_month(now.year() as u32, now.month())
         .await
-        .map_err(|e| format!("交割日历 Gateway 不可用: {e}"))?;
+        .map_err(|e| {
+            let message = format!("交割日历 Gateway 不可用: {e}");
+            FetchFailure::from_gateway(e).with_message(message)
+        })?;
     let source_at = source_at_of(&batch);
     let records: Vec<Value> = batch
         .records()
@@ -546,7 +567,10 @@ async fn fetch_dragon_tiger(params: &Value) -> Result<Fetched, FetchFailure> {
     let batch = gateway
         .market_review(trading_date, disclosure_limit, stock_limit as usize)
         .await
-        .map_err(|e| format!("龙虎榜 Gateway 不可用: {e}"))?;
+        .map_err(|e| {
+            let message = format!("龙虎榜 Gateway 不可用: {e}");
+            FetchFailure::from_gateway(e).with_message(message)
+        })?;
     let source_at = source_at_of(&batch);
     let records: Vec<Value> = batch
         .records()
@@ -595,7 +619,10 @@ async fn fetch_block_trades(params: &Value) -> Result<Fetched, FetchFailure> {
     let batch = gateway
         .market_review(&codes, trading_date)
         .await
-        .map_err(|e| format!("大宗交易 Gateway 不可用: {e}"))?;
+        .map_err(|e| {
+            let message = format!("大宗交易 Gateway 不可用: {e}");
+            FetchFailure::from_gateway(e).with_message(message)
+        })?;
     let source_at = source_at_of(&batch);
     let records: Vec<Value> = batch
         .records()
@@ -626,18 +653,27 @@ async fn fetch_consensus(params: &Value) -> Result<Fetched, FetchFailure> {
     for code in codes {
         let gateway = gateway;
         // ConsensusData 记录本身没有 code 字段 (逐代码查询) → 带 code 回传, JSON 里补上。
+        // 保真传播 GatewayError 分类 (no_current_reports 等业务态必须过 detail 还原,
+        // 不能 format! 折叠成 unknown → no_verified_batch/retryable=true 无界重试)。
         set.spawn(async move {
             let batch = gateway
                 .fetch(&code)
                 .await
-                .map_err(|e| format!("一致预期 Gateway 不可用 ({code}): {e}"))?;
-            Ok::<_, String>((code, batch))
+                .map_err(|e| (code.clone(), e))?;
+            Ok::<_, (String, crate::data_gateway::GatewayError)>((code, batch))
         });
     }
     let mut records: Vec<Value> = Vec::new();
     let mut source_at = String::new();
     while let Some(joined) = set.join_next().await {
-        let (code, batch) = joined.map_err(|e| format!("一致预期 task 失败: {e}"))??;
+        let (code, batch) = joined
+            .map_err(|e| FetchFailure::unknown(format!("一致预期 task 失败: {e}")))?
+            .map_err(|(code, e)| FetchFailure {
+                message: format!("一致预期 Gateway 不可用 ({code}): {e}"),
+                provider: e.provider(),
+                reason_code: e.reason_code(),
+                retryable: e.retryable(),
+            })?;
         if source_at.is_empty() {
             source_at = source_at_of(&batch);
         }
@@ -733,7 +769,10 @@ async fn fetch_board_directory(params: &Value) -> Result<Fetched, FetchFailure> 
     let batch = gateway
         .directory(kind, limit)
         .await
-        .map_err(|e| format!("板块目录 Gateway 不可用: {e}"))?;
+        .map_err(|e| {
+            let message = format!("板块目录 Gateway 不可用: {e}");
+            FetchFailure::from_gateway(e).with_message(message)
+        })?;
     let source_at = source_at_of(&batch);
     let records: Vec<Value> = batch
         .records()
@@ -766,7 +805,10 @@ async fn fetch_board_constituents(params: &Value) -> Result<Fetched, FetchFailur
             gateway
                 .memberships(&code)
                 .await
-                .map_err(|e| format!("板块归属 Gateway 不可用 ({code}): {e}"))
+                .map_err(|e| {
+                    let message = format!("板块归属 Gateway 不可用 ({code}): {e}");
+                    FetchFailure::from_gateway(e).with_message(message)
+                })
         });
     }
     let mut records: Vec<Value> = Vec::new();
@@ -809,7 +851,10 @@ async fn fetch_board_flows(params: &Value) -> Result<Fetched, FetchFailure> {
     let batch = gateway
         .day1_flows(kind, limit)
         .await
-        .map_err(|e| format!("板块资金流 Gateway 不可用: {e}"))?;
+        .map_err(|e| {
+            let message = format!("板块资金流 Gateway 不可用: {e}");
+            FetchFailure::from_gateway(e).with_message(message)
+        })?;
     let source_at = source_at_of(&batch);
     let records: Vec<Value> = batch
         .records()
@@ -923,7 +968,10 @@ async fn fetch_market_dragon_tiger(params: &Value) -> Result<Fetched, FetchFailu
     let batch = gateway
         .market_review(trading_date, disclosure_limit, stock_limit as usize)
         .await
-        .map_err(|e| format!("龙虎榜 Gateway 不可用: {e}"))?;
+        .map_err(|e| {
+            let message = format!("龙虎榜 Gateway 不可用: {e}");
+            FetchFailure::from_gateway(e).with_message(message)
+        })?;
     let source_at = source_at_of(&batch);
     let records: Vec<Value> = batch
         .records()
@@ -968,7 +1016,11 @@ async fn fetch_board_ranking(fid: &str, top_n: usize) -> Result<Fetched, FetchFa
     let joined = tokio::task::spawn_blocking(move || BoardRankingGateway::new().fetch_top(&fid, top_n))
         .await
         .map_err(|e| format!("板块排行 task 失败: {e}"))?;
-    let facts = joined.map_err(|e| format!("板块排行 Gateway 不可用: {e}"))?;
+    let facts = joined.map_err(|e| {
+        // fetch_top 的 error 类型非 GatewayError (无 provider/reason_code 可保真)
+        // → unknown (unavailable, 可重试, fail-closed)。
+        FetchFailure::unknown(format!("板块排行 Gateway 不可用: {e}"))
+    })?;
     let records: Vec<Value> = facts
         .iter()
         .map(|r| {
@@ -1019,8 +1071,11 @@ async fn fetch_research_reports(params: &Value) -> Result<Fetched, FetchFailure>
             let batch = gateway
                 .instrument_reports(&code, page_size)
                 .await
-                .map_err(|e| format!("研报 Gateway 不可用 ({code}): {e}"))?;
-            Ok::<_, String>((code, batch))
+                .map_err(|e| {
+                    let message = format!("研报 Gateway 不可用 ({code}): {e}");
+                    FetchFailure::from_gateway(e).with_message(message)
+                })?;
+            Ok::<_, FetchFailure>((code, batch))
         });
     }
     let mut records: Vec<Value> = Vec::new();
@@ -1069,7 +1124,10 @@ async fn fetch_northbound_daily(params: &Value) -> Result<Fetched, FetchFailure>
     let batch = gateway
         .northbound_daily(date, channel)
         .await
-        .map_err(|e| format!("北向资金 Gateway 不可用: {e}"))?;
+        .map_err(|e| {
+            let message = format!("北向资金 Gateway 不可用: {e}");
+            FetchFailure::from_gateway(e).with_message(message)
+        })?;
     let records: Vec<Value> = batch
         .records()
         .iter()
