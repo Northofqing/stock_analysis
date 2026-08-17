@@ -6,7 +6,7 @@ Status: Gate A design selected under the user's standing project authorization
 Rules: AGENTS 2.1, 2.2, 2.3, 2.4, 2.7, 2.8, 2.10; BR-091, BR-103,
 BR-112, BR-113, BR-114, BR-116, BR-159, BR-164, BR-168, BR-188, BR-213,
 BR-216, BR-217, BR-218, BR-220, BR-221, BR-223, BR-225, BR-226, BR-227,
-BR-231.
+BR-231, BR-236, BR-238.
 
 ## 1. Outcome
 
@@ -18,8 +18,9 @@ fallback until the remote canaries pass.
 Success means:
 
 1. the bundle is loaded without logging or committing its private key or token;
-2. startup verifies remote TLS identity, health, and the required admitted
-   runtime capabilities before the data path is declared ready;
+2. startup verifies remote TLS identity, health, and the required static
+   admitted runtime capabilities before static producers start, while live
+   capabilities remain a separate background gate;
 3. external request schemas and canonical record schemas are translated at one
    boundary, not in individual push renderers;
 4. provider, acquisition authority, source time, observation time and batch ID
@@ -116,6 +117,61 @@ record.data={instrument,name,board,is_st,listed_on:null,price_limit:{...},
 ```
 
 No credential value is part of this document or the recorded command evidence.
+
+### 2.4 Gate-redesign evidence
+
+The first readiness implementation exposed three independent correctness
+failures. These are Gate A findings, not release evidence.
+
+Reproducible command:
+
+```bash
+rg -n 'external_opening_readiness|OPENING_REQUIRED_EXTERNAL_CAPABILITIES|with_capacity\(8\)|off_session_static_quote_eligible|off_session_quote_keepalive_loop|global_news_async\(\)|fetch_global_news\(\)' \
+  src/bin/monitor/main.rs src/data_gateway/market_data.rs \
+  src/data_gateway/global_news.rs src/data_gateway/grpc_source.rs \
+  src/grpc_server/delegate.rs
+```
+
+Relevant result:
+
+```text
+src/bin/monitor/main.rs:4384:external_opening_readiness().await
+src/bin/monitor/main.rs:4819:off_session_quote_keepalive_loop()
+src/data_gateway/grpc_source.rs:226:const OPENING_REQUIRED_EXTERNAL_CAPABILITIES: &[Operation] = &[
+src/data_gateway/grpc_source.rs:231:Operation::Announcements,
+src/data_gateway/grpc_source.rs:232:Operation::MarketAnnouncements,
+src/data_gateway/grpc_source.rs:233:Operation::BoardConstituents,
+src/data_gateway/grpc_source.rs:234:Operation::BoardMemberships,
+src/data_gateway/grpc_source.rs:235:Operation::LimitPools,
+src/data_gateway/grpc_source.rs:237:Operation::UpperLimitPoolReview,
+src/data_gateway/grpc_source.rs:519:let mut routes = Vec::with_capacity(8);
+src/data_gateway/market_data.rs:783:fn off_session_static_quote_eligible(...)
+src/data_gateway/market_data.rs:908:if off_session_static_quote_eligible(...)
+src/data_gateway/global_news.rs:115:bridge.global_news_async().await
+src/data_gateway/grpc_source.rs:559:.global_news_async()
+src/grpc_server/delegate.rs:240:Operation::GlobalNews => fetch_global_news().await
+src/grpc_server/delegate.rs:522:.global_news(GlobalNewsProvider::Eastmoney, 20)
+```
+
+The synchronous readiness loop occurs before strategy registration and all
+producer loops, so a quote that cannot be fresh before its live publication
+window can suppress the 09:00--09:15 P-01 public/static window. Separately,
+BR-236 currently admits a same-day off-session static quote through the
+`RealtimeFiveSecond` path and the keepalive caller marks `Capability::Quote`;
+this converts a non-realtime fact into realtime authority. Finally, the gRPC
+GlobalNews branch discards the caller's provider and limit, while the server
+always requests Eastmoney/20. Four registered feed attempts can therefore
+consume the same Eastmoney batch under four logical names unless response
+evidence is checked against each registration. The capability list also treats
+both members of three alias pairs as mandatory and the eight-route matrix omits
+`T0Evidence`, so capability discovery can both false-red on a valid alias and
+false-green without a core live route.
+
+The selected correction is a deeper two-phase readiness module: one small
+interface returns typed static-startup and live-session reports, while contract
+selection, provider binding, current-time freshness and mode behavior remain
+inside the module. Callers do not receive a general-purpose Boolean that can
+substitute for their own evidence checks.
 
 ## 3. Opening dependency map
 
@@ -254,22 +310,170 @@ The response handler stops inventing `tdx-dev` and a new batch ID. Empty
 provider/source/batch values are an internal error. This fixes the local
 fallback while preserving the stricter external path.
 
-### 5.7 Startup readiness
+### 5.7 Two-phase opening readiness
 
-Before the monitor declares the bundle path ready, a read-only preflight checks:
+Readiness is split at the real dependency seam. Static/auth/contract readiness
+is a startup prerequisite. Live-session readiness is a background observation
+and never delays a public/static producer window. The reports share evidence
+validation but have different scheduling and failure effects.
 
-1. bundle parse and TLS/auth connection;
-2. health `live && ready`;
-3. every opening-required capability has at least one
-   `repository_admission=ADMITTED && runtime_available=true` provider;
-4. real canaries are required only where the bundle supplies a frozen request
-   and response contract. Capability-only evidence for quote,
-   news/announcement or board membership is reported separately and cannot
-   authorize direct parsing until the upstream supplies the missing fixtures and
-   schema labels.
+#### 5.7.1 Capability discovery uses semantic OR families
 
-A failed preflight is visible and fail-closed. The current release remains
-running until the new binary and data path have passed these checks.
+Bundle health must be `live && ready`. Capability rows remain discovery
+evidence only and require
+`repository_admission=ADMITTED && runtime_available=true`. Aliases for the same
+semantic dependency form an OR family, not multiple mandatory operations:
+
+| Semantic dependency | Phase | Admitted runtime operation family |
+| --- | --- | --- |
+| announcements | static | `Announcements` OR `MarketAnnouncements` |
+| board membership | static | `BoardConstituents` OR `BoardMemberships` |
+| upper-limit review | static | `UpperLimitPoolReview` OR `LimitPools` |
+| realtime quotes | live | `RealtimeQuotes` |
+| order books | live | `OrderBooks` |
+| T0 evidence | live | `T0Evidence` |
+| security identity | static | `SecurityMetadata` |
+| instrument news | static | `InstrumentNews` |
+| global news | static | `GlobalNews` |
+
+At least one row in every required semantic family must pass. Requiring both
+aliases would reject a valid deployment; accepting a diagnostic-only or
+unadmitted row would fabricate authority. Discovery never replaces the exact
+route canary selected below.
+
+#### 5.7.2 Static startup phase
+
+Before any producer is started, the monitor must acquire its production process
+lease, parse the bundle, verify TLS/auth and health, evaluate the static
+semantic capability families, and execute these exact static routes. The three
+live semantic families are evaluated by the background phase and cannot turn a
+static startup check red:
+
+| Stable route name | Profile | Empty policy |
+| --- | --- | --- |
+| `SecurityMetadata` | ExternalV1 | exact canary identity required |
+| `InstrumentNews` | ExternalV1 | bounded verified-empty allowed |
+| `GlobalNews-Eastmoney` | LocalBridgeV1 | bounded verified-empty allowed |
+| `GlobalNews-CLS` | LocalBridgeV1 | bounded verified-empty allowed |
+| `GlobalNews-Jin10` | LocalBridgeV1 | bounded verified-empty allowed |
+| `GlobalNews-ThePaper` | LocalBridgeV1 | bounded verified-empty allowed |
+| `Announcements` | LocalBridgeV1 | bounded verified-empty allowed |
+| `BoardConstituents` | LocalBridgeV1 | exact canary membership required |
+| `UpperLimitPoolReview` | LocalBridgeV1 | bounded verified-empty allowed |
+
+Each GlobalNews canary sends the exact registered provider plus a positive
+bounded limit. The server must consume both parameters. The returned
+`BatchEvidence.provider` and `source` must equal that provider registration and
+the record count must not exceed the requested limit. A batch from one provider
+must not satisfy another provider's route; a mismatch is non-retryable invalid
+evidence for that attempt and is retained in the audit disposition.
+
+The four news canaries form one redundant source family, not four serial startup
+locks. Startup attempts all four and requires at least two independently
+identified, fully validated providers. A failed provider remains an explicit
+typed route failure and is excluded; its records are never accepted, relabelled
+or replaced. Fewer than two verified providers blocks startup. This preserves
+cross-source corroboration while preventing one provider protocol change from
+suppressing every public-news producer.
+
+All successful routes preserve provider, acquisition source, optional source
+time, observation time and immutable batch ID. The five non-news routes remain
+mandatory, so static readiness requires at least seven of nine attempts: all
+five mandatory routes plus at least two of four GlobalNews routes. Success emits
+`opening_static_ready=true routes=<passed>/9 global_news=<passed>/4` and starts
+producer schedulers, including the 09:00--09:15 P-01 path. A mandatory failure
+or an insufficient news quorum emits `opening_static_ready=false
+reason_code=... retryable=...`, starts zero producers and retries only when the
+classified failure is retryable. A deterministic bundle, auth, contract,
+identity or evidence mismatch in a mandatory route exits before producer
+startup.
+
+#### 5.7.3 Live-session background phase
+
+After static readiness succeeds, a background task canaries exactly three live
+routes through LocalBridgeV1: `RealtimeQuotes`, `OrderBooks` and `T0Evidence`.
+Before the current trading session supplies live data it reports
+`opening_data_ready=false reason_code=pending_live_window retryable=true`; this
+does not block P-01 or another producer whose declared inputs are all static.
+It does keep every live-dependent computation fail-closed.
+
+`opening_data_ready=true routes=3 route_names=RealtimeQuotes,OrderBooks,T0Evidence`
+may be emitted only when all three canaries pass in the current live acquisition
+window. It is an operational observation, not transferable evidence. Every
+live consumer must still validate its own exact batch at its own consumption
+clock before computation and before marking DataMode capability success:
+
+- parse both RFC3339 and fractional-Unix evidence through the shared strict
+  parser without rewriting the original strings;
+- reject any future source timestamp, including positive sub-millisecond skew;
+- accept age exactly five seconds and reject any age greater than five seconds
+  without integer-millisecond truncation;
+- require `source_at <= observed_at <= consumer_now` for live evidence;
+- require positive finite quote prices and exact requested instrument identity;
+- require record/envelope provider, source, batch and time fields to agree;
+- repeat the same current-time check after RPC/network and downstream assembly
+  delay, including each quote inside `T0Evidence`.
+
+The live loop recomputes failure/success and emits state transitions; a prior
+success is never a sticky permit. Route identity mismatch is deterministic and
+non-retryable for that response. Transport/staleness remains retryable. A live
+failure does not terminate the public/static producers, but no affected
+consumer, DataMode update, T0 decision or order-book calculation may proceed.
+
+Off-session, lunch and after-hours static prices are never valid
+`RealtimeFiveSecond` evidence and never mark `Capability::Quote`. A caller that
+needs an official completed-session close must use the distinct typed
+`SettledClose` path with its trading-date/session proof. The old off-session
+Quote keepalive is removed rather than renamed.
+
+#### 5.7.4 Runtime modes
+
+| Mode | Static phase | Live phase | Delivery meaning |
+| --- | --- | --- | --- |
+| bare production monitor | blocking before producers | background/current live window | normal governed delivery |
+| production `--push` | blocking before selected dispatcher | no waiting; live-dependent dispatch fails closed at its consumer | terminal governed delivery |
+| `--review` | not an opening dependency | not run | use the strict post-session dependency gate; never print opening-ready |
+| `--test` | TEST_CODE deterministic adapter only | TEST_CODE deterministic adapter only | physically isolated test data/sink |
+| `--test --push-dry-run` | same TEST_CODE isolation | same TEST_CODE isolation | render/audit only, zero external delivery |
+| `--test --review` | not run | not run | verify strict review failure in test isolation |
+
+Test and review skips are explicit banners such as
+`opening_readiness=not_applicable mode=test`; they must not be represented as
+`opening_data_ready=true`. A naked production `--push-dry-run` remains invalid;
+the supported dry-run form is the documented isolated `--test --push-dry-run`.
+
+#### 5.7.5 Single-monitor lease and cutover
+
+Every production invocation capable of scheduling or delivering a push must
+hold one non-blocking, cross-process exclusive monitor lease before network
+preflight or producer initialization and retain its file descriptor for process
+lifetime. Production and TEST_CODE use physically separate lease paths. A live
+foreign owner yields a typed `monitor_instance_already_running` exit before any
+provider, durable-delivery or sink call; a PID string is diagnostic and is not
+the lock authority. Read-only `grpc_bundle_probe`, help and history inspection
+do not take the delivery lease.
+
+Cutover remains stop-then-start: build and probe the candidate without starting
+a second monitor, gracefully stop the old process, verify its PID and listening
+ownership are gone, then start the candidate and prove it owns the lease. The
+current release remains running until static/auth/contract probes and Gate C are
+ready for that controlled handoff.
+
+### 5.8 Upstream revision and immutable historical artifacts
+
+The server-side fourteen-crate Magic runtime is pinned to revision
+`75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e`, including the TDX provider-time
+decode required by the five-second quote gate. Every newly admitted runtime
+batch and provider registration must report that revision; older literals must
+not label data acquired by this binary.
+
+The checked-in board-binding registry is different: it is immutable audit
+evidence captured at revision `5f1ce93656a55854c844065390520cd4aecd9a14`.
+The file stays byte-identical. Its revision mismatch against the current
+runtime is an explicit selection-activation blocker until the registry is
+reacquired and audited; changing only its revision field would fabricate
+evidence. Opening news and market-data readiness do not treat that historical
+artifact as current provider authority.
 
 ## 6. Failure modes
 
@@ -277,13 +481,18 @@ running until the new binary and data path have passed these checks.
 | --- | --- |
 | bundle missing/escapes directory/bad protocol | fail before network; no secret text |
 | TLS/auth/health failure | typed unavailable/unauthenticated; bounded retry only where contract permits |
-| capability unavailable or unadmitted | startup blocker for its dependent push; never enable diagnostics silently |
+| capability alias family has no admitted runtime member | static startup blocker or live background failure according to §5.7; never require every alias and never enable diagnostics silently |
 | schema/version unknown or absent from delivered contract | block direct operation before I/O/interpretation; never infer it from local types |
 | admission not ADMITTED | reject for production |
 | response complete=false | accept only explicitly modeled field-level projections such as identity; otherwise reject |
 | provider/source/batch missing or conflicting | invalid evidence; no compatibility fill |
 | source time missing | keep absent; consumers requiring freshness reject |
-| authenticated remote clock leads the consumer | preserve the original timestamp and admit at most 2 seconds of positive clock skew; reject larger future evidence and retain the ordinary 30-second observation / one-trading-day source freshness budgets |
+| authenticated identity/news clock leads the consumer | preserve the original timestamp and admit at most 2 seconds of positive clock skew only for the explicitly bounded identity/news contract; reject larger future evidence and retain its 30-second observation / one-trading-day source budgets |
+| quote/order-book/T0 source time leads the consumer | reject any positive future duration; no clock-skew exception and no millisecond truncation |
+| live route is stale, absent or fails after static startup | keep `opening_data_ready=false`, retain retry eligibility, and fail only its live-dependent consumers; do not suppress P-01 |
+| off-session source returns same-day last trade | reject from Realtime/DataMode; only a separately requested typed SettledClose may consume it |
+| one GlobalNews response identifies a different provider/source or exceeds limit | invalid evidence, non-retryable for that attempt; exclude it and do not classify it under the requested feed |
+| fewer than two of four GlobalNews providers return verified evidence | static startup blocker with all four typed outcomes retained; never fabricate, relabel or consume a failed provider |
 | one board membership request contains multiple stocks | invalid request; caller performs independent per-stock calls |
 | remote outage after startup | current attempt fails and timer retains retry eligibility under BR-116 |
 | local fallback evidence missing | internal error; do not weaken client validation |
@@ -297,6 +506,10 @@ running until the new binary and data path have passed these checks.
 | `src/grpc_client/envelope.rs` | adopt and split profile-specific request building | retains request ID and response validation |
 | `src/data_gateway/grpc_source.rs` | adopt | single gateway normalization boundary and existing retry bridge |
 | `src/data_gateway/grpc_source/convert.rs` | adopt | normalize external records and enforce evidence conflicts |
+| current all-routes `external_opening_readiness` | replace/deepen | split into typed static-startup and live-session reports; remove transferable all-purpose Boolean authority |
+| `src/data_gateway/global_news.rs` and server delegate | adopt/fix | carry exact provider/limit and validate returned provider/source before feed classification |
+| realtime `admit_quote_batch` | adopt/fix | exact-duration consumer gate remains the sole realtime admission path |
+| `off_session_static_quote_eligible` and `off_session_quote_keepalive_loop` | reject/remove | they convert a static price into Realtime/Quote authority and violate §2.4 |
 | `src/grpc_server/delegate.rs` | adopt/fix | local fallback must preserve original gateway evidence |
 | `src/grpc_server/handlers.rs` | adopt/fix | remove invented compatibility evidence |
 | `src/data_gateway/board_runtime.rs` | adopt/fix | bridge the blocking membership consumer |
@@ -307,9 +520,13 @@ running until the new binary and data path have passed these checks.
 ## 8. Validation and release evidence
 
 Targeted red/green tests cover bundle path containment, TLS config construction,
-auth secrecy, external request schemas, unadmitted rejection, remote record
-shape, identity partial projection, board single-code evidence and blocking
-bridge use.
+auth secrecy, external request schemas, semantic capability OR families,
+unadmitted rejection, remote record shape, identity partial projection, board
+single-code evidence, all four provider-bound GlobalNews attempts, the two-of-four
+news quorum, provider and limit round trips, T0 readiness, static-before-producer ordering,
+live-background/P-01 independence, exact five-second/sub-millisecond consumer
+checks, off-session realtime rejection, mode-specific skips and cross-process
+monitor lease exclusion.
 
 Mandatory commands:
 
@@ -324,19 +541,25 @@ python3 tools/coverage/check_thresholds.py target/coverage/coverage.json
 cargo build --release --bin monitor
 ```
 
-Live read-only evidence must additionally show the bundle preflight passes,
-opening canaries have admissible records, one monitor process is running, the
-source/batch-empty errors are absent, and the push/audit chain records real
-delivery outcomes. A weekend/off-session stale quote is not opening evidence;
-the 5-second quote check must be repeated in the 2026-08-18 live window.
+Live read-only evidence must additionally show the static bundle preflight
+passes, at least two of four news providers retain distinct verified evidence
+while every failed provider is explicit, the three
+live canaries pass in the current live window, exactly one monitor owns the
+lease, source/batch-empty errors are absent, and the push/audit chain records
+real delivery outcomes. A weekend, lunch or after-hours static quote is not
+opening evidence; the exact five-second quote/order-book/T0 consumer checks must
+be repeated in the 2026-08-18 live window.
 
 ## 9. Deployment and rollback
 
 1. Preserve the current release binaries and process metadata.
-2. Build and preflight the new binaries without starting a second monitor.
-3. Stop the old monitor gracefully only after Gate C and bundle canaries pass.
-4. Start one monitor with the explicit bundle path and verify startup/read-only
-   acquisition before the push windows.
+2. Build and run the read-only bundle/static probes without starting a second
+   monitor; the probe does not acquire the delivery lease.
+3. Stop the old monitor gracefully only after Gate C and static probes pass;
+   verify its process/listener ownership is gone.
+4. Start one monitor with the explicit bundle path, verify exclusive lease
+   ownership and `opening_static_ready=true`, and let the live phase canary in
+   the current session without delaying P-01.
 5. If the external profile fails, stop the new process and restore the previous
    release plus local gRPC service. Do not delete audit, push or market evidence.
 6. Code rollback is `git revert <scoped-commit>`; configuration rollback removes

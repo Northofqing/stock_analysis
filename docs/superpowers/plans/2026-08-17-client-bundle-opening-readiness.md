@@ -4,7 +4,7 @@
 
 **Goal:** Make the 2026-08-18 pre-open/open monitor consume authenticated real `client-bundle` data with complete evidence and verified push readiness.
 
-**Architecture:** Keep gateway and push consumers stable. Add an external-v1 transport/contract profile inside `grpc_client`, normalize canonical records once in `grpc_source`, and retain the local plaintext service as a reversible fallback until live canaries pass. Missing, stale, partial, conflicting, unsupported and unadmitted facts remain fail-closed.
+**Architecture:** Keep gateway and push renderers stable. Add an external-v1 transport/contract profile inside `grpc_client`, normalize canonical records once in `grpc_source`, and retain the local plaintext service for contracts the bundle does not freeze. A blocking static/auth/contract phase starts public/static producers; a separate background live phase observes RealtimeQuotes, OrderBooks and T0Evidence without delaying P-01. Every live consumer still revalidates exact five-second evidence at its own clock. Missing, stale, partial, conflicting, unsupported and unadmitted facts remain fail-closed.
 
 **Tech Stack:** Rust, Tokio, tonic 0.14 TLS, Prost, Serde JSON, zeroize, existing SQLite/Diesel audit and monitor delivery stack.
 
@@ -17,9 +17,12 @@
 - Create `src/bin/grpc_bundle_probe.rs`: secret-safe live health/capability/schema canary.
 - Modify `Cargo.toml`, `src/grpc_client/{mod,auth,client,envelope}.rs`: TLS, per-client auth and contract profiles.
 - Modify `src/data_gateway/grpc_source{.rs,/convert.rs}`: profile selection and canonical normalization.
+- Modify `src/data_gateway/{global_news,market_data}.rs`: provider-bound news requests and strict live quote admission.
 - Modify `src/data_gateway/{market_capabilities,board_runtime}.rs`: opening-critical no-feature bridges.
 - Modify `src/grpc_server/{delegate,handlers}.rs`: preserve local fallback evidence.
-- Modify `docs/business_rules.md`: BR-231 citations/status and pre-existing duplicate-ID repair.
+- Create `src/bin/monitor/process_lease.rs` (TO BE BUILT at Gate B): process-lifetime cross-process production monitor exclusion.
+- Modify `src/bin/monitor/{main,market_data}.rs`: two-phase readiness, mode banners and consumer/DataMode gates.
+- Modify `docs/business_rules.md`: BR-238 citations/status and pre-existing duplicate-ID repair.
 
 ### Task 1: Freeze and repair local evidence propagation
 
@@ -145,15 +148,51 @@ cargo test --no-default-features --lib data_gateway::board_runtime -- --test-thr
 cargo test --no-default-features --lib data_gateway::market_capabilities -- --test-threads=1
 ```
 
-### Task 6: Add a secret-safe live readiness probe
+### Task 6: Close the four-provider GlobalNews bridge contract and quorum
+
+**Files:** `src/data_gateway/global_news.rs`, `src/data_gateway/grpc_source.rs`, `src/grpc_server/delegate.rs`, `src/news/aggregator/raw_v2.rs`
+
+- [ ] Add a failing test in which the LocalBridgeV1 server always returns an
+  Eastmoney batch while the caller independently requests Eastmoney, CLS, Jin10
+  and ThePaper. Only Eastmoney may be Available; the other three must be typed
+  non-retryable `invalid_evidence`, not duplicate AI input.
+- [ ] Add failing round-trip tests proving the caller's stable provider wire
+  name and positive bounded `limit` reach the server, and that a response count
+  greater than the limit is rejected.
+- [ ] Give `GlobalNewsProvider` one public closed wire-name parser/formatter.
+  Pass `{provider,limit}` through `GlobalNewsGateway` → `GrpcSource` → delegate;
+  reject missing/unknown providers instead of defaulting to Eastmoney/20.
+- [ ] Validate every returned batch against the requested registration's exact
+  provider ID and source string before classifying Available or VerifiedEmpty.
+  Preserve mismatching evidence in the typed audit disposition.
+- [ ] Attempt all four providers but require at least two distinct verified
+  batches for static readiness. Preserve every failed provider as an explicit
+  typed outcome; never relabel, fill or consume it.
+- [ ] Verify:
+
+```bash
+cargo test --lib data_gateway::global_news::tests -- --test-threads=1
+cargo test --lib news::aggregator::raw_v2::tests -- --test-threads=1
+cargo test --lib grpc_server::delegate::tests -- --test-threads=1
+```
+
+### Task 7: Add a secret-safe static readiness probe
 
 **Files:** `src/bin/grpc_bundle_probe.rs`
 
-- [ ] Test capability evaluation: an operation is capability-ready only if at
-  least one row is admitted and runtime available; diagnostic MoneyFlows cannot
-  satisfy production readiness. Keep capability-ready separate from
+- [ ] Test capability evaluation: a semantic capability family is ready when at
+  least one alias row is admitted and runtime available. Explicitly prove
+  `Announcements|MarketAnnouncements`,
+  `BoardConstituents|BoardMemberships` and
+  `UpperLimitPoolReview|LimitPools` are OR families. Diagnostic MoneyFlows
+  cannot satisfy production readiness. Keep capability-ready separate from
   contract-ready so missing schemas cannot be treated as usable data.
 - [ ] Implement `--bundle <dir> --opening`. Output only health, capability readiness, admission/completeness/count, canonical schema name/version and sorted JSON field names—never values or auth metadata.
+- [ ] Reuse the production static-readiness module to exercise all nine static
+  attempts, including four independently provider-bound GlobalNews routes and
+  their two-of-four quorum. The
+  probe may report stable route names and evidence presence/counts but must not
+  print record values, URLs, titles, token material or private paths.
 - [ ] Exit nonzero for bad health, missing capability, missing delivered
   contract/fixture, unknown schema or bad evidence.
 - [ ] Verify unit/help tests, then run:
@@ -163,28 +202,62 @@ cargo run --release --bin grpc_bundle_probe -- \
   --bundle /Users/zhangzhen/Desktop/Quant/stock_analysis/client-bundle --opening
 ```
 
-Off-session quote staleness is an explicit blocker and must be rechecked in the live opening window.
+This read-only probe proves static auth/contract inputs. It must not turn an
+off-session quote into live evidence or acquire the production monitor lease.
 
-### Task 7: Integrate monitor readiness without changing push semantics
+### Task 8: Integrate two-phase readiness and consumer-side live gates
 
-**Files:** `src/bin/monitor/main.rs`, existing integration/process tests
+**Files:** `src/data_gateway/grpc_source.rs`, `src/data_gateway/grpc_source/convert.rs`, `src/data_gateway/market_data.rs`, `src/bin/monitor/main.rs`, `src/bin/monitor/market_data.rs`, `src/bin/monitor/process_lease.rs`, existing integration/process tests
 
-- [ ] Add a failing startup test: failed external readiness prints one `opening_data_ready=false reason_code=...` banner and does not start opening producers.
-- [ ] Run health/capability readiness before producer warmup. Post-start failures retain BR-116 retry eligibility. Renderer/governance/sink modules never receive credentials.
+- [ ] Add failing ordering tests proving static failure starts zero producers,
+  static success starts the 09:00--09:15 P-01 scheduler, and a missing/stale
+  RealtimeQuotes, OrderBooks or T0Evidence canary leaves
+  `opening_data_ready=false` without delaying P-01.
+- [ ] Implement the nine stable static attempts from design §5.7.2, including
+  separate `GlobalNews-Eastmoney`, `GlobalNews-CLS`, `GlobalNews-Jin10` and
+  `GlobalNews-ThePaper` results. Require all five non-news routes plus at least
+  two verified news providers. Emit `opening_static_ready` independently from
+  `opening_data_ready` and list degraded providers without their record values.
+- [ ] Run the three live routes (`RealtimeQuotes`, `OrderBooks`, `T0Evidence`)
+  in a BR-116 background loop after static success. Outside a current live
+  acquisition window report `pending_live_window`; never accept an off-session
+  stale record to make the state green.
+- [ ] Add injected-clock RED tests for exactly 5s accepted, 5s+1ns rejected,
+  future+1ns rejected, network/consumer delay rejected, positive finite price,
+  exact identity and record/envelope evidence conflicts. Apply the same
+  consumer-time validation to realtime quote, order book and every T0 quote.
+- [ ] Delete the BR-236 `RealtimeFiveSecond` off-session exception and the
+  off-session Quote keepalive caller. Preserve official completed-session data
+  only through the distinct typed `SettledClose` mode. Mark DataMode Quote
+  success only after consumer-side live validation.
+- [ ] Make identity/news positive clock skew remain the bounded contract in the
+  design, but give live quote/order-book/T0 no positive future-time exception.
+- [ ] Add mode tests: `--review` and `--test --review` do not run opening gates;
+  `--test` and `--test --push-dry-run` use only TEST_CODE isolation and print
+  not-applicable rather than opening-ready; production `--push` passes static
+  readiness but does not wait indefinitely for live data.
+- [ ] Acquire a mode-separated non-blocking cross-process monitor lease before
+  any production provider/producer/sink call and hold it for process lifetime.
+  A second delivery-capable production process must exit with
+  `monitor_instance_already_running` and zero external calls. Probe/help/history
+  remain read-only and lease-free.
+- [ ] Renderer/governance/sink modules never receive credentials or a reusable
+  readiness Boolean. Their live facts arrive only after the typed consumer gate.
 - [ ] Verify call paths with multiline-aware search:
 
 ```bash
-rg -nA4 'GRPC_MARKET_CLIENT_BUNDLE|opening_data_ready|security_identities_async|board_constituents\(' \
+rg -nA4 'GRPC_MARKET_CLIENT_BUNDLE|opening_static_ready|opening_data_ready|T0Evidence|security_identities_async|board_constituents\(' \
   src/bin/monitor src/data_gateway src/grpc_client
 ```
 
-- [ ] Run `grpc_bridge_e2e`, `monitor_help_isolation` and a release no-default-features monitor build.
+- [ ] Run `grpc_bridge_e2e`, `monitor_help_isolation`, the cross-process lease
+  test and a release no-default-features monitor build.
 
-### Task 8: Gate C/D and single-instance cutover
+### Task 9: Gate C/D and single-instance cutover
 
 **Files:** changed sources/docs; private `.env` at cutover only
 
-- [ ] Add BR-231 citations to changed active paths. Reassign the pre-existing duplicate rows without changing semantics: SignalTracker BR-224 → BR-232; review BR-225 → BR-233; update their exact code citations.
+- [ ] Add BR-238 citations to changed active paths. Reassign the pre-existing duplicate rows without changing semantics: SignalTracker BR-224 → BR-232; review BR-225 → BR-233; update their exact code citations.
 - [ ] Run Gate C:
 
 ```bash
@@ -203,13 +276,23 @@ python3 tools/coverage/check_thresholds.py target/coverage/coverage.json
 cargo build --release --bin monitor
 ```
 
-- [ ] Preserve current binary hashes/PIDs, set only the private bundle path, stop the old monitor gracefully and start exactly one new monitor after canaries pass.
-- [ ] Verify opening producers, governed delivery and JSONL audit outcomes; confirm no credentials, mock data, empty evidence, duplicate monitor or selection-v2 recovery flood.
+- [ ] Preserve current binary hashes/PIDs/listeners, set only the private bundle
+  path, run the lease-free static probe, stop the old monitor gracefully, verify
+  its PID/listener has gone, then start exactly one candidate monitor and prove
+  exclusive lease ownership plus `opening_static_ready=true`.
+- [ ] In the current live window verify all three live routes and exact
+  consumer-side freshness before accepting `opening_data_ready=true`. Verify
+  P-01 remains scheduled while live readiness is pending, at least two news
+  provider batches retain their requested evidence, every degraded provider is
+  explicit, and governed delivery/JSONL audit
+  outcomes contain no credentials, mock data, empty evidence, duplicate monitor
+  or selection-v2 recovery flood.
 - [ ] On any blocker, stop the new monitor and restore the preserved release plus explicit local address. Never delete audit/data evidence. Code rollback is `git revert <scoped-commit>`.
 
 ## Self-review
 
-- Every selected design requirement maps to Tasks 1-8.
+- Every selected design requirement maps to Tasks 1-9.
 - No placeholder or unspecified error-handling step remains.
 - Names are consistent: `ClientBundleConfig`, `ContractProfile`, `build_external_query_request`, `security_identities`, `GRPC_MARKET_CLIENT_BUNDLE`.
 - Public-market readiness remains separate from unavailable BR-103 broker account/trade watermark evidence.
+- Gate C/D remain pending until Task 9 independently verifies their complete command and live-evidence sets.
