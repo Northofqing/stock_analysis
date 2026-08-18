@@ -10,6 +10,7 @@
 | --- | --- |
 | [`ENGINEERING_RULES_V2.md`](ENGINEERING_RULES_V2.md) | Gate A→D、证据、失败和回滚合同 |
 | [`business_rules.md`](business_rules.md) | 业务规则注册表 |
+| [`operations/2026-08-18-data-grpc-known-issues.md`](operations/2026-08-18-data-grpc-known-issues.md) | 数据源与 gRPC 故障活清单（证据、影响、状态、验收） |
 | [`superpowers/specs/2026-07-25-unified-data-final-cutover-design.md`](superpowers/specs/2026-07-25-unified-data-final-cutover-design.md) | 统一金融/新闻 Gateway 最终切换设计 |
 | [`superpowers/specs/2026-07-29-config-readme-cleanup-design.md`](superpowers/specs/2026-07-29-config-readme-cleanup-design.md) | BR-181 runtime 配置所有权与 README 真实性设计 |
 | [`integrations/magic-tdx-stock-analysis.md`](integrations/magic-tdx-stock-analysis.md) | Magic TDX 主源和统一 Gateway 接入边界 |
