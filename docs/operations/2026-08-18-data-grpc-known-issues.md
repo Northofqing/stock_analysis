@@ -136,6 +136,79 @@ new dated evidence note and then change the status.
 - Acceptance: exact requested dates and record continuity pass with original
   batch evidence, or the route remains explicitly unavailable.
 
+### MONITOR-20260818-001 — P-01 scheduler is unreachable before open
+
+- Status: `OPEN`; Gate A correction is BR-241.
+- Affected path: resident P-01 09:00--09:15 owner.
+- Confirmed: 2026-08-18 read-only call-chain inspection.
+- Evidence: `market_loop` first blocks in `while !is_market_active()` at
+  `src/bin/monitor/main.rs:8155`; the P-01 state and due branch are initialized
+  only afterward at lines 8298--8343. The branch requires a closed session and
+  `09:00 <= now < 09:15`, so its requirements cannot coexist. Its volatile
+  `preopen_pushed` state is also assigned from `preopen_ok && candidate_ok`,
+  coupling an accepted P-01 to independent P-03 failure.
+- Safety behavior: do not start a second monitor and do not use grouped
+  `--push` as compensation; outside the pre-open window it can dispatch A-01
+  and A-10 instead of P-01.
+- Required correction: install a P-01-only resident owner before the
+  market-active wait, use durable Global `BusinessDateOnce`, separate P-03,
+  and add an exclusive production compensation command that acquires the same
+  monitor lease.
+- Acceptance: boundary/restart tests pass; a controlled single-owner release
+  produces one real P-01 Accepted receipt; repeated compensation and resident
+  restart produce zero additional Feishu messages.
+
+### DATA-20260818-004 — P-01 persisted inputs are stale and one dependency has no producer
+
+- Status: `OPEN`; Gate A source correction is BR-241.
+- Affected path: P-01 completed-day source composition and rendering.
+- Confirmed: 2026-08-18 production DB and caller inspection.
+- Evidence: `chain_daily` latest date was 2026-08-14 and
+  `board_rotation_daily` latest date was 2026-07-16. Both loaders independently
+  select `MAX(date)`. Repository search found `save_board_rotations` callers
+  only in DAO tests, so the rotation table has no production writer. Current
+  P-01 also does not consume the exact LocalBridge `LimitPools` batch.
+- Safety behavior: do not mix latest dates, relabel
+  `OpeningStatic-UpperLimitPoolReview`, invent a rotation producer, synthesize
+  names/news, or treat verified-empty news as a headline.
+- Required correction: for P-01 business date D, resolve
+  `evidence_date=prev_trading_day(D)`; acquire exact
+  `LimitPools {Upper,evidence_date,200}`; derive/persist the exact chain solely
+  from that batch; resolve the exact top-head set through SecurityIdentity; and
+  query each head through `SinaInstrumentNewsGateway::instrument_news_in_range`
+  over `[evidence_date,D]`. All evidence and exclusions enter one canonical
+  binding. `board_rotation_daily` is retired only from P-01; other callers stay
+  unchanged.
+- Acceptance: Tuesday-to-Monday and Monday-to-Friday tests pass; exact request,
+  chain receipt, identity exact-set, every per-head news batch, rendered hash,
+  and delivery decision join to the same P-01 occurrence.
+
+### DELIVERY-20260818-001 — P-01 has no durable typed receipt or exact join
+
+- Status: `OPEN`; Gate A durable correction is BR-241.
+- Affected path: `PreopenNewsHot` governance, sink authority, deduplication,
+  compensation, and audit.
+- Confirmed: 2026-08-18 code and production-audit inspection.
+- Evidence: monitor `PushKind::PreopenNewsHot` is absent from durable
+  `PushKind` and `durable_kind_and_sub_kind_with_override`; the current
+  dispatcher reaches generic boolean `deliver_and_record`. The day's only
+  confirmed Feishu delivery was `data_mode_v1`; there was no P-01 dispatcher
+  attempt, `preopen_news_hot_v1` Accepted receipt, durable decision/attempt, or
+  exact audit join.
+- Safety behavior: DataMode, BR-196 test delivery, another PushKind, a local
+  log, transport handshake, or boolean success cannot prove P-01. An uncertain
+  remote result must not be blindly resent.
+- Required correction: add durable `PreopenNewsHot/preopen_news_hot_v1` as
+  Global BusinessDateOnce and daily-budget-exempt; perform generic
+  `inspect_business_date_once_claim` before providers; create the complete
+  P-01 `CountedDeliveryBinding`; and deliver only through existing
+  `notify::push_counted_with_binding`. Late compensation must say
+  `盘前热点补发` and `依据前一交易日`, not impersonate the 09:00 card.
+- Acceptance: typed Feishu Accepted includes non-empty local/platform IDs;
+  receipt hash, sink-result hash, decision, attempt, immutable audit, source
+  binding, render hash, and committed artifact pass exact join; crash recovery
+  and same-day repeat cause no second sink call.
+
 ## Runtime facts that are not open defects
 
 - The notification outlet is functional: event-audit record
