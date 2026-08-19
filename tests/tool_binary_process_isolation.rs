@@ -76,7 +76,7 @@ fn winrate_simulator_runs_against_an_isolated_real_sqlite_fixture() {
     let output = Command::new(env!("CARGO_BIN_EXE_winrate_simulator"))
         .args([
             "--days",
-            "30",
+            "90",
             "--min-samples",
             "1",
             "--blacklist",

@@ -17,8 +17,9 @@ P-01 has exactly one production owner and one delivery identity per A-share
 trading day:
 
 - `business_date` is the local trading day on which the P-01 message is due;
-- `evidence_date = calendar::prev_trading_day(business_date)` is the most recent
-  completed trading day;
+- `evidence_date = calendar::verified_prev_a_share_trading_day(business_date)`
+  is the most recent completed trading day under the immutable checked-in
+  exchange-calendar authority; unavailable coverage is an explicit failure;
 - exact `LimitPools` and the `chain_daily` projection derived only from that
   batch are bound to `evidence_date`;
 - the exact top-head code set is resolved through one complete
@@ -238,8 +239,13 @@ or the durable decision/attempt/result/audit exact join.
 1. One production monitor lease protects resident and compensation modes.
 2. `business_date` is a valid local trading day and equals the local date for a
    production compensation.
-3. `evidence_date` comes only from the exchange calendar function
-   `calendar::prev_trading_day(business_date)`.
+3. The sink-side binding validator first requires
+   `calendar::verified_a_share_trading_day(business_date) == Ok(true)` and only
+   then resolves `evidence_date` through the immutable, fail-closed
+   `calendar::verified_prev_a_share_trading_day(business_date)`. A weekend,
+   exchange holiday, runtime holiday override, or unavailable coverage cannot
+   authorize P-01 and returns the stable
+   `counted_p01_calendar_authority_unavailable` reason before sink I/O.
 4. LimitPools record dates and the derived chain date equal `evidence_date`.
 5. The exact LimitPools request is
    `{kind:"Upper",trading_date:evidence_date,limit:200}`.
@@ -563,6 +569,9 @@ Required cases include:
 - Tuesday 2026-08-18 -> Monday 2026-08-17;
 - Monday -> previous Friday across a weekend;
 - holiday predecessor resolution through the admitted calendar;
+- sink-side binding rejection for a weekend, exchange holiday, and
+  out-of-coverage 2027-01-01 business date, all with the stable
+  `counted_p01_calendar_authority_unavailable` reason;
 - exact completed date across LimitPools and chain;
 - exact SecurityIdentity head-code set and one bounded InstrumentNews result
   per head over `[evidence_date,business_date]`;

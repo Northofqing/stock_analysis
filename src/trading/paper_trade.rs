@@ -815,6 +815,16 @@ fn valuation_price(code: &str) -> Result<f64, String> {
 ///
 /// BR-234b：口径统一为 refresh 后当日 ledger（快照为准或持仓×实时价自算），
 /// 不再直接读快照汇总——自算路径下快照总资产已过期，会算错仓位占比。
+fn require_confirmed_position_snapshot(
+    snapshot: Option<crate::database::user_position_snapshot::UserPositionSnapshot>,
+) -> Result<crate::database::user_position_snapshot::UserPositionSnapshot, String> {
+    let snapshot = snapshot.ok_or_else(|| "无用户确认持仓快照 (BR-226)".to_string())?;
+    if snapshot.confirm_empty || snapshot.items.is_empty() {
+        return Err("account snapshot has no confirmed positions (BR-226)".to_string());
+    }
+    Ok(snapshot)
+}
+
 pub fn portfolio_state_snapshot(code: &str, quote_price: f64) -> Result<(f64, f64, f64), String> {
     if !quote_price.is_finite() || quote_price <= 0.0 {
         return Err(format!(
@@ -838,12 +848,10 @@ pub fn portfolio_state_snapshot(code: &str, quote_price: f64) -> Result<(f64, f6
     let (total_assets, available_cash) = (ledger.total_value, ledger.cash);
 
     // 4. 用户确认持仓快照（账户持仓明细；缺失/空 = 无授权证据 → 出声拒绝）
-    let snapshot = crate::database::user_position_snapshot::latest_user_position_snapshot()
-        .map_err(|error| format!("持仓快照读取失败: {error}"))?
-        .ok_or_else(|| "无用户确认持仓快照 (BR-226)".to_string())?;
-    if snapshot.confirm_empty || snapshot.items.is_empty() {
-        return Err("account snapshot has no confirmed positions (BR-226)".to_string());
-    }
+    let snapshot = require_confirmed_position_snapshot(
+        crate::database::user_position_snapshot::latest_user_position_snapshot()
+            .map_err(|error| format!("持仓快照读取失败: {error}"))?,
+    )?;
 
     // 5. 单票仓位（买入前状态：候选已有持仓则计占比，新仓 = 0）
     let pos_pct = snapshot
@@ -1383,6 +1391,10 @@ mod tests {
         };
         let pct = position_pct(&[second, unrelated], "TEST_CODE_600519", 20.0, 100_000.0);
         assert!((pct - 10.0).abs() < f64::EPSILON);
+
+        let missing = require_confirmed_position_snapshot(None)
+            .expect_err("missing snapshot must fail loudly without shared database state");
+        assert!(missing.contains("持仓快照"), "missing={missing}");
     }
 
     // ---- 涨停买必 NotFilled (PR3-3.5 硬性要求) ----
@@ -1576,7 +1588,8 @@ mod tests {
 
         // 1. 券商账户汇总（synthetic 值，结构同生产：eastmoney-app-screenshot）。
         //    effective_at=今天 → BR-234b 快照新鲜分支：以快照 4 字段为准。
-        let today = chrono::Local::now().date_naive();
+        let effective = chrono::Local::now()
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("UTC+8 offset"));
         diesel::sql_query(
             "INSERT INTO user_account_summary \
                 (effective_at, total_assets, securities_market_value, available_cash, \
@@ -1584,23 +1597,21 @@ mod tests {
              VALUES (?, 100000.0, 60000.0, 40000.0, \
                      60.0, 123.45, 'eastmoney-app-screenshot')",
         )
-        .bind::<diesel::sql_types::Text, _>(&format!("{today}T15:46:00+08:00"))
+        .bind::<diesel::sql_types::Text, _>(&effective.to_rfc3339())
         .execute(&mut conn)
         .expect("insert account summary");
 
-        // 2a. 快照缺失 = 无授权证据 → 出声拒绝（不静默）
-        let missing = portfolio_state_snapshot("TEST_CODE_600519", 50.0)
-            .expect_err("missing snapshot must fail loudly");
-        assert!(missing.contains("持仓快照"), "missing={missing}");
-
-        // 2b. 用户确认持仓快照 + 明细（synthetic TEST_CODE 持仓）
+        // 2. 用户确认持仓快照 + 明细（synthetic TEST_CODE 持仓）
         use crate::portfolio::user_position_snapshot::{
             UserPositionItemInput, UserPositionSnapshotInput,
         };
-        let effective = chrono::DateTime::parse_from_rfc3339(&format!("{today}T15:46:00+08:00"))
-            .expect("parse effective_at");
         let input = UserPositionSnapshotInput {
-            snapshot_id: "TEST_CODE_SNAPSHOT_001".to_string(),
+            snapshot_id: format!(
+                "TEST_CODE_SNAPSHOT_PORTFOLIO_{}",
+                effective
+                    .timestamp_nanos_opt()
+                    .expect("test time fits timestamp nanos")
+            ),
             effective_at: effective,
             confirmed_at: effective,
             source: "test-fixture".to_string(),

@@ -14,7 +14,13 @@ pub const ENVELOPE_VERSION: i64 = 1;
 // 做T T0Advice 上线后盘中烧满 30 槽, 19:00 复盘被 DailyBudgetFull 饿死
 // (8/13 实证 7 路全 failed, delivered=0)。version bump 触发 policy catalog
 // 重播 (schema v7 DELETE + 重建) + 新 envelope decision_identity 刷新。
-pub const POLICY_VERSION: i64 = 3;
+// BR-241 (2026-08-18): v4 — P-01 becomes one Global BusinessDateOnce
+// counted delivery per business date and is exempt from the intraday budget.
+// BR-245 (2026-08-18): v5 — R-07 TomorrowWatch is one Global
+// BusinessDateOnce review delivery per business date and is budget-exempt;
+// the preceding business day's Accepted wall time cannot create a rolling
+// 86,400-second denial on the next business date.
+pub const POLICY_VERSION: i64 = 5;
 pub const DAILY_BUDGET_LIMIT: i64 = 30;
 pub(crate) const MANUAL_ACCEPTED_DELIVERY_AUDIT_DOMAIN: &str = "manual-delivery-accepted-audit-v1";
 
@@ -189,10 +195,11 @@ pub enum PushKind {
     ReviewBacktest,
     WatchlistTracking,
     CatalystReview,
+    PreopenNewsHot,
 }
 
 impl PushKind {
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::HoldingPlan,
         Self::HoldingEvent,
         Self::T0Advice,
@@ -215,6 +222,7 @@ impl PushKind {
         Self::ReviewBacktest,
         Self::WatchlistTracking,
         Self::CatalystReview,
+        Self::PreopenNewsHot,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -241,6 +249,7 @@ impl PushKind {
             Self::ReviewBacktest => "ReviewBacktest",
             Self::WatchlistTracking => "WatchlistTracking",
             Self::CatalystReview => "CatalystReview",
+            Self::PreopenNewsHot => "PreopenNewsHot",
         }
     }
 
@@ -268,6 +277,7 @@ impl PushKind {
             Self::ReviewBacktest => "review_backtest_v1",
             Self::WatchlistTracking => "watchlist_tracking_v1",
             Self::CatalystReview => "catalyst_review_v1",
+            Self::PreopenNewsHot => "preopen_news_hot_v1",
         }
     }
 
@@ -426,7 +436,9 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         (ReviewLhb, Global, Some(86_400), BusinessDateOnce),
         (ReviewSignal, Global, Some(86_400), BusinessDateOnce),
         (ReviewFailure, Global, Some(86_400), BusinessDateOnce),
-        (TomorrowWatch, Global, Some(86_400), Rolling),
+        // BR-245: R-07 is a business-date review occurrence. The nominal
+        // duration is never interpreted as a rolling expiry.
+        (TomorrowWatch, Global, Some(86_400), BusinessDateOnce),
         (EventCalendar, Global, Some(86_400), Rolling),
         // 2026-08-07: I-09/I-09A 板块参考类升级 counted — 当日一次。
         (SectorTop, Global, Some(86_400), BusinessDateOnce),
@@ -439,6 +451,9 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         (ReviewBacktest, Global, Some(86_400), BusinessDateOnce),
         (WatchlistTracking, Global, Some(86_400), BusinessDateOnce),
         (CatalystReview, Global, Some(86_400), BusinessDateOnce),
+        // BR-241: required opening delivery owns one global claim per business
+        // date and must not be starved by unrelated intraday budget use.
+        (PreopenNewsHot, Global, Some(86_400), BusinessDateOnce),
     ]
     .into_iter()
     .map(
@@ -458,11 +473,13 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
                     | PushKind::ReviewLhb
                     | PushKind::ReviewSignal
                     | PushKind::ReviewFailure
+                    | PushKind::TomorrowWatch
                     | PushKind::IndustryChain
                     | PushKind::PositionReview
                     | PushKind::ReviewBacktest
                     | PushKind::WatchlistTracking
                     | PushKind::CatalystReview
+                    | PushKind::PreopenNewsHot
             ),
             policy_version: POLICY_VERSION,
         },
@@ -1219,6 +1236,32 @@ pub struct ScheduleHydration {
 pub struct ReviewTaskOccurrenceEvidence {
     pub decision_identity: String,
     pub state: DecisionState,
+    pub schedule_hydration: Option<ScheduleHydration>,
+}
+
+/// Read-only evidence for one authoritative BusinessDateOnce claim.
+///
+/// Unlike `ReviewTaskOccurrenceEvidence`, this type does not require or imply
+/// a review-task binding. It is therefore safe for non-review daily producers
+/// such as BR-241 P-01 to inspect before provider acquisition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BusinessDateOnceClaimEvidence {
+    pub decision_identity: String,
+    pub state: DecisionState,
+    /// Authoritative sink calls made by this exact inspect/resume operation.
+    /// Plain inspection is always zero; a stored Reserved-envelope resume may
+    /// report one. This is runtime evidence, not persisted policy state.
+    pub sink_calls: usize,
+    /// Exact current attempt persisted on the claimed decision, if an attempt
+    /// has been allocated. Never substituted with the decision identity.
+    pub current_attempt_identity: Option<String>,
+    /// Domain-separated hash of the exact typed Accepted receipt. Present
+    /// only when the Delivered authority join validates end-to-end.
+    pub authoritative_receipt_sha256: Option<String>,
+    /// Domain-owned mode extracted from the immutable source binding. P-01
+    /// uses this to prevent a late compensation command from sending a stored
+    /// Scheduled envelope as though it were a compensation message.
+    pub source_binding_mode: Option<String>,
     pub schedule_hydration: Option<ScheduleHydration>,
 }
 

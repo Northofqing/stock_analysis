@@ -1,4 +1,4 @@
-//! Closed ExternalV1 request-contract adapter (BR-231).
+//! Closed ExternalV1 request-contract adapter (BR-238).
 //!
 //! The client bundle delivered on 2026-08-17 is not a complete wire contract.
 //! This module therefore admits only operations whose request schema and JSON
@@ -8,6 +8,7 @@
 use crate::grpc_client::pb::magic::market::v1::{
     CanonicalPayload, Operation, QueryRequest, RequestContext,
 };
+use crate::magic_compat::{AssetClass, InstrumentId};
 use chrono::NaiveDate;
 use serde_json::{Map, Value};
 
@@ -27,19 +28,16 @@ pub fn build_external_query_request(
 ) -> Result<QueryRequest, ExternalContractError> {
     let (schema, data) = match operation {
         Operation::SecurityMetadata => {
-            ensure_only_keys(&params, &["codes"])?;
-            let codes = required_codes(&params)?;
+            ensure_only_keys(&params, &["instruments"])?;
+            let instruments = required_instruments(&params)?;
             (
                 "magic.market.security_metadata.request",
-                serde_json::json!({"instruments": instruments(&codes)?}),
+                serde_json::json!({"instruments": instruments}),
             )
         }
         Operation::InstrumentNews => {
-            ensure_only_keys(&params, &["codes", "start", "end", "limit"])?;
-            let codes = required_codes(&params)?;
-            let [code] = codes.as_slice() else {
-                return Err(ExternalContractError::InvalidParameters);
-            };
+            ensure_only_keys(&params, &["instrument", "start", "end", "limit"])?;
+            let instrument = required_instrument(&params)?;
             let limit = params.get("limit").map_or(Ok(100_u64), |value| {
                 value
                     .as_u64()
@@ -47,7 +45,7 @@ pub fn build_external_query_request(
                     .ok_or(ExternalContractError::InvalidParameters)
             })?;
             let mut request = Map::new();
-            request.insert("instrument".to_string(), instrument(code)?);
+            request.insert("instrument".to_string(), instrument);
             request.insert("limit".to_string(), Value::from(limit));
             match (params.get("start"), params.get("end")) {
                 (None, None) => {}
@@ -98,46 +96,44 @@ fn ensure_only_keys(params: &Value, allowed: &[&str]) -> Result<(), ExternalCont
     }
 }
 
-fn required_codes(params: &Value) -> Result<Vec<String>, ExternalContractError> {
-    let codes = params
-        .get("codes")
+fn required_instruments(params: &Value) -> Result<Vec<Value>, ExternalContractError> {
+    let instruments = params
+        .get("instruments")
         .and_then(Value::as_array)
         .ok_or(ExternalContractError::InvalidParameters)?;
-    if codes.is_empty() {
+    if instruments.is_empty() {
         return Err(ExternalContractError::InvalidParameters);
     }
-    let mut seen = std::collections::HashSet::with_capacity(codes.len());
-    codes
+    let mut seen = std::collections::HashSet::with_capacity(instruments.len());
+    instruments
         .iter()
         .map(|value| {
-            let code = value
-                .as_str()
-                .filter(|code| code.len() == 6 && code.bytes().all(|byte| byte.is_ascii_digit()))
-                .ok_or(ExternalContractError::InvalidParameters)?;
-            if !seen.insert(code) {
+            let instrument = canonical_instrument(value)?;
+            let identity =
+                serde_json::to_string(&instrument).map_err(|_| ExternalContractError::Serialize)?;
+            if !seen.insert(identity) {
                 return Err(ExternalContractError::InvalidParameters);
             }
-            Ok(code.to_string())
+            Ok(instrument)
         })
         .collect()
 }
 
-fn instruments(codes: &[String]) -> Result<Vec<Value>, ExternalContractError> {
-    codes.iter().map(|code| instrument(code)).collect()
+fn required_instrument(params: &Value) -> Result<Value, ExternalContractError> {
+    params
+        .get("instrument")
+        .ok_or(ExternalContractError::InvalidParameters)
+        .and_then(canonical_instrument)
 }
 
-fn instrument(code: &str) -> Result<Value, ExternalContractError> {
-    let exchange = match code.as_bytes().first() {
-        Some(b'6') => "Shanghai",
-        Some(b'0' | b'3') => "Shenzhen",
-        Some(b'4' | b'8' | b'9') => "Beijing",
-        _ => return Err(ExternalContractError::InvalidParameters),
-    };
-    Ok(serde_json::json!({
-        "exchange": exchange,
-        "code": code,
-        "asset_class": "Equity",
-    }))
+fn canonical_instrument(value: &Value) -> Result<Value, ExternalContractError> {
+    ensure_only_keys(value, &["exchange", "code", "asset_class"])?;
+    let instrument: InstrumentId = serde_json::from_value(value.clone())
+        .map_err(|_| ExternalContractError::InvalidParameters)?;
+    if instrument.asset_class() != AssetClass::Equity {
+        return Err(ExternalContractError::InvalidParameters);
+    }
+    serde_json::to_value(instrument).map_err(|_| ExternalContractError::Serialize)
 }
 
 fn parse_iso_date(value: &Value) -> Result<NaiveDate, ExternalContractError> {
@@ -161,9 +157,17 @@ mod tests {
 
     #[test]
     fn security_metadata_uses_delivered_schema_and_canonical_instruments() {
-        let request =
-            build_external_query_request(Operation::SecurityMetadata, json!({"codes": ["600396"]}))
-                .expect("delivered SecurityMetadata contract");
+        let request = build_external_query_request(
+            Operation::SecurityMetadata,
+            json!({
+                "instruments": [{
+                    "exchange": "Shanghai",
+                    "code": "600396",
+                    "asset_class": "Equity"
+                }]
+            }),
+        )
+        .expect("delivered SecurityMetadata contract");
 
         let (schema, data, allow_unadmitted) = payload_json(request);
         assert_eq!(schema, "magic.market.security_metadata.request");
@@ -184,7 +188,14 @@ mod tests {
     fn instrument_news_uses_delivered_single_instrument_contract() {
         let request = build_external_query_request(
             Operation::InstrumentNews,
-            json!({"codes": ["000001"], "limit": 100}),
+            json!({
+                "instrument": {
+                    "exchange": "Shenzhen",
+                    "code": "000001",
+                    "asset_class": "Equity"
+                },
+                "limit": 100
+            }),
         )
         .expect("delivered InstrumentNews contract");
 
@@ -224,7 +235,20 @@ mod tests {
         assert_eq!(
             build_external_query_request(
                 Operation::SecurityMetadata,
-                json!({"codes": ["600396", "600396"]}),
+                json!({
+                    "instruments": [
+                        {
+                            "exchange": "Shanghai",
+                            "code": "600396",
+                            "asset_class": "Equity"
+                        },
+                        {
+                            "exchange": "Shanghai",
+                            "code": "600396",
+                            "asset_class": "Equity"
+                        }
+                    ]
+                }),
             )
             .unwrap_err(),
             ExternalContractError::InvalidParameters
@@ -232,10 +256,27 @@ mod tests {
         assert_eq!(
             build_external_query_request(
                 Operation::InstrumentNews,
-                json!({"codes": ["000001"], "from_days": 30}),
+                json!({
+                    "instrument": {
+                        "exchange": "Shenzhen",
+                        "code": "000001",
+                        "asset_class": "Equity"
+                    },
+                    "from_days": 30
+                }),
             )
             .unwrap_err(),
             ExternalContractError::InvalidParameters
         );
+    }
+
+    #[test]
+    fn rejects_bare_codes_instead_of_inferring_exchange() {
+        for operation in [Operation::SecurityMetadata, Operation::InstrumentNews] {
+            assert_eq!(
+                build_external_query_request(operation, json!({"codes": ["600396"]})).unwrap_err(),
+                ExternalContractError::InvalidParameters
+            );
+        }
     }
 }

@@ -29,8 +29,8 @@
 - Remote `QueryResponse` has no `source` field; the local build adds field 11. A direct remote client therefore receives an empty local-extension field and current converters reject it.
 - The three `.superpowers/{task_plan,findings,progress}.md` files were genuine but stale historical planning copies. `task_plan.md` and `findings.md` matched the deleted HEAD root blobs exactly; `progress.md` mixed the same old plan with a new 2026-08-17 append. Their old Gate-A prohibition could block Claude from following the current opening-recovery task.
 - The stale `.superpowers` files are preserved under `.superpowers/archive/2026-08-17-stale-production-closure/`; the live paths now point to this plan's files.
-- Gate-A design and BR-231 exist. Self-review confirmed the referenced production symbols exist and BR-231 is unique.
-- The business-rule checker is red on two pre-existing duplicate IDs, BR-224 and BR-225. BR-231 itself produces only expected pre-implementation citation warnings; the duplicate IDs must be repaired before Gate C.
+- Gate-A design and BR-238 exist. Self-review confirmed the referenced production symbols exist and BR-238 is unique.
+- The business-rule checker is red on two pre-existing duplicate IDs, BR-224 and BR-225. BR-238 itself produces only expected pre-implementation citation warnings; the duplicate IDs must be repaired before Gate C.
 - The delivered bundle is contract-incomplete: `grpc-external-api.md` claims 60 RPCs, while `market.proto` ends at operation 55 and the referenced `grpc-derived-products.md` is absent.
 - Only `SecurityMetadata` and `InstrumentNews` have sufficiently frozen external request contracts in the delivered material. The other opening-critical RPC methods are admitted at runtime, but their external payload schema labels are not delivered and must not be guessed.
 - Remote `SecurityMetadata` may truthfully return `complete=false`; missing listing date/price-limit evidence must remain missing. It is safe only for a narrow identity projection, never as complete security metadata.

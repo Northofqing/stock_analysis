@@ -490,6 +490,8 @@ mod tests {
             intraday_average_price: 10.2,
         };
         MagicTdxT0Batch {
+            provider: ProviderId::Tdx,
+            source: "TEST_CODE_magic_tdx_t0".to_owned(),
             requested_at: source_at - chrono::Duration::seconds(1),
             source_at,
             observed_at,

@@ -1,4 +1,4 @@
-//! BR-066/BR-133/BR-137/BR-166/BR-172 evidence-preserving global financial-news acquisition.
+//! BR-066/BR-133/BR-137/BR-166/BR-172/BR-238 evidence-preserving global financial-news acquisition.
 
 #[cfg(feature = "magic-gateway")]
 use super::review::audit_blocking_join_failure;
@@ -25,7 +25,8 @@ use magic_thepaper_rs::{ThePaperClient, ThePaperError};
 #[cfg(feature = "magic-gateway")]
 use std::collections::HashSet;
 
-const MAX_LIMIT: u32 = 20;
+/// Maximum per-request record count supported by every registered provider.
+pub const MAX_GLOBAL_NEWS_LIMIT: u32 = 20;
 
 /// One released global-news provider and its immutable source contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +38,27 @@ pub enum GlobalNewsProvider {
 }
 
 impl GlobalNewsProvider {
+    /// Stable LocalBridgeV1 request value. This is intentionally independent
+    /// from `Debug` so transport identity cannot change with diagnostics.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Eastmoney => "Eastmoney",
+            Self::Cailianpress => "Cailianpress",
+            Self::Jin10 => "Jin10",
+            Self::ThePaper => "ThePaper",
+        }
+    }
+
+    pub fn from_wire_name(value: &str) -> Option<Self> {
+        match value {
+            "Eastmoney" => Some(Self::Eastmoney),
+            "Cailianpress" => Some(Self::Cailianpress),
+            "Jin10" => Some(Self::Jin10),
+            "ThePaper" => Some(Self::ThePaper),
+            _ => None,
+        }
+    }
+
     pub const fn provider_id(self) -> ProviderId {
         match self {
             Self::Eastmoney => ProviderId::Eastmoney,
@@ -108,11 +130,11 @@ impl GlobalNewsGateway {
         let capability = provider.capability();
         let provider_id = provider.provider_id();
         let request_hash =
-            acquisition_request_hash(capability, &format!("{}:{limit}", provider.source()));
+            acquisition_request_hash(capability, format!("{}:{limit}", provider.source()));
         // P4 M3 钩子: DATA_GATEWAY_GRPC=1 → gRPC 通道 (fail-closed, audit 对等)。
         match super::grpc_source::bridge_for("GlobalNews") {
             Ok(Some(bridge)) => {
-                let result = bridge.global_news_async().await;
+                let result = bridge.global_news_async(provider, limit).await;
                 let audit_provider = result
                     .as_ref()
                     .map(|b| b.evidence().provider)
@@ -165,10 +187,10 @@ impl GlobalNewsGateway {
 
 #[cfg(feature = "magic-gateway")]
 fn build_limit(provider: GlobalNewsProvider, limit: u32) -> Result<PositiveU32, GatewayError> {
-    if limit > MAX_LIMIT {
+    if limit > MAX_GLOBAL_NEWS_LIMIT {
         return Err(GatewayError::invalid_request(
             provider.capability(),
-            format!("global-news limit {limit} exceeds {MAX_LIMIT}"),
+            format!("global-news limit {limit} exceeds {MAX_GLOBAL_NEWS_LIMIT}"),
         ));
     }
     PositiveU32::new(limit).map_err(|error| {
@@ -408,41 +430,12 @@ fn parse_observed_at(
     provider: GlobalNewsProvider,
     value: &str,
 ) -> Result<DateTime<Utc>, GatewayError> {
-    let (seconds, nanos) = value.split_once('.').ok_or_else(|| {
-        GatewayError::invalid_evidence(
-            provider.capability(),
-            Some(provider.provider_id()),
-            format!("invalid global-news observation time {value:?}"),
-        )
-    })?;
-    if nanos.len() != 9 || !nanos.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(GatewayError::invalid_evidence(
-            provider.capability(),
-            Some(provider.provider_id()),
-            format!("invalid global-news observation nanoseconds {value:?}"),
-        ));
-    }
-    let seconds = seconds.parse::<i64>().map_err(|error| {
-        GatewayError::invalid_evidence(
-            provider.capability(),
-            Some(provider.provider_id()),
-            format!("invalid global-news observation seconds {value:?}: {error}"),
-        )
-    })?;
-    let nanos = nanos.parse::<u32>().map_err(|error| {
-        GatewayError::invalid_evidence(
-            provider.capability(),
-            Some(provider.provider_id()),
-            format!("invalid global-news observation nanoseconds {value:?}: {error}"),
-        )
-    })?;
-    DateTime::from_timestamp(seconds, nanos).ok_or_else(|| {
-        GatewayError::invalid_evidence(
-            provider.capability(),
-            Some(provider.provider_id()),
-            format!("global-news observation time is out of range {value:?}"),
-        )
-    })
+    super::evidence_time::parse_evidence_instant(
+        provider.capability(),
+        provider.provider_id(),
+        "observed_at",
+        value,
+    )
 }
 
 #[cfg(feature = "magic-gateway")]
@@ -669,7 +662,13 @@ mod tests {
             assert!(!provider.source().is_empty());
             assert!(!provider.feed_name().is_empty());
             assert!(!provider.capability().is_empty());
+            assert_eq!(
+                GlobalNewsProvider::from_wire_name(provider.wire_name()),
+                Some(provider)
+            );
         }
+        assert_eq!(GlobalNewsProvider::from_wire_name("eastmoney"), None);
+        assert_eq!(GlobalNewsProvider::from_wire_name(""), None);
 
         assert_eq!(
             parse_provider_time(GlobalNewsProvider::Eastmoney, "2026-07-25 11:00")
@@ -680,6 +679,12 @@ mod tests {
         assert!(parse_provider_time(GlobalNewsProvider::Eastmoney, "bad").is_err());
         assert!(parse_provider_time(GlobalNewsProvider::Jin10, "bad").is_err());
         assert!(parse_observed_at(GlobalNewsProvider::Jin10, "bad").is_err());
+        assert_eq!(
+            parse_observed_at(GlobalNewsProvider::Eastmoney, "unix-ms:1786967511935")
+                .expect("Eastmoney emits an unambiguous Magic unix-ms instant")
+                .to_rfc3339(),
+            "2026-08-17T11:51:51.935+00:00"
+        );
         assert!(parse_observed_at(GlobalNewsProvider::Jin10, "1.bad").is_err());
         assert!(parse_observed_at(GlobalNewsProvider::Jin10, "bad.000000000").is_err());
         assert!(

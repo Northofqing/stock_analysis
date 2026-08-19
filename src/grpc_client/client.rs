@@ -207,9 +207,9 @@ impl GrpcMarketClient {
                         self.profile,
                         self.acquisition_authority.as_deref(),
                         &mut resp,
-                    );
+                    )?;
                     // 信封错误 (request_id 失配等) 由 From<EnvelopeError> 映射 Unknown + code=envelope。
-                    return parse_query_response(&request_id, resp).map_err(GrpcError::from);
+                    return parse_query_response(&request_id, op, resp).map_err(GrpcError::from);
                 }
                 Err(err) => match retry_decision(&err) {
                     RetryDecision::RetryBackoff | RetryDecision::RetryBounded
@@ -375,12 +375,31 @@ fn apply_acquisition_authority(
     profile: ContractProfile,
     acquisition_authority: Option<&str>,
     response: &mut crate::grpc_client::pb::magic::market::v1::QueryResponse,
-) {
-    if profile == ContractProfile::ExternalV1 && response.source.is_empty() {
-        if let Some(authority) = acquisition_authority {
-            response.source = authority.to_owned();
-        }
+) -> Result<(), GrpcError> {
+    if profile != ContractProfile::ExternalV1 {
+        return Ok(());
     }
+
+    if !response.source.is_empty() {
+        return Err(GrpcError::FailedPrecondition {
+            details: ErrorDetail {
+                code: "external_source_field_conflict".to_string(),
+                reason_code: Some("external_source_field_conflict".to_string()),
+                retryable: Some(false),
+                ..ErrorDetail::default()
+            },
+        });
+    }
+    let authority = acquisition_authority.ok_or_else(|| GrpcError::FailedPrecondition {
+        details: ErrorDetail {
+            code: "external_acquisition_authority_missing".to_string(),
+            reason_code: Some("external_acquisition_authority_missing".to_string()),
+            retryable: Some(false),
+            ..ErrorDetail::default()
+        },
+    })?;
+    response.source = authority.to_owned();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -619,7 +638,13 @@ mod tests {
         let external_request = external
             .build_profile_query_request(
                 Operation::SecurityMetadata,
-                serde_json::json!({"codes": ["600396"]}),
+                serde_json::json!({
+                    "instruments": [{
+                        "exchange": "Shanghai",
+                        "code": "600396",
+                        "asset_class": "Equity"
+                    }]
+                }),
             )
             .expect("delivered external request");
         assert_eq!(
@@ -630,7 +655,7 @@ mod tests {
         let invalid = external
             .build_profile_query_request(
                 Operation::SecurityMetadata,
-                serde_json::json!({"codes": []}),
+                serde_json::json!({"instruments": []}),
             )
             .expect_err("invalid external parameters must fail closed");
         assert!(matches!(invalid, GrpcError::InvalidArgument { .. }));
@@ -705,10 +730,11 @@ mod tests {
     }
 
     #[test]
-    fn external_acquisition_authority_only_fills_empty_field_eleven_source() {
+    fn external_acquisition_authority_rejects_remote_field_eleven_and_uses_local_mtls() {
         let authority = "grpc-mtls:magic-market.local";
         let mut missing = response_with_source("");
-        apply_acquisition_authority(ContractProfile::ExternalV1, Some(authority), &mut missing);
+        apply_acquisition_authority(ContractProfile::ExternalV1, Some(authority), &mut missing)
+            .expect("local mTLS authority");
         assert_eq!(missing.source, authority);
         assert_eq!(missing.selected_provider, "Tencent");
         assert_eq!(missing.batch_id, "TEST_CODE-batch");
@@ -716,11 +742,17 @@ mod tests {
         assert_eq!(missing.source_at, "2026-08-17T07:59:59+08:00");
 
         let mut upstream = response_with_source("upstream-source");
-        apply_acquisition_authority(ContractProfile::ExternalV1, Some(authority), &mut upstream);
-        assert_eq!(upstream.source, "upstream-source");
+        let error = apply_acquisition_authority(
+            ContractProfile::ExternalV1,
+            Some(authority),
+            &mut upstream,
+        )
+        .expect_err("ExternalV1 field 11 is not an upstream contract field");
+        assert!(matches!(error, GrpcError::FailedPrecondition { .. }));
 
         let mut local = response_with_source("");
-        apply_acquisition_authority(ContractProfile::LocalBridgeV1, Some(authority), &mut local);
+        apply_acquisition_authority(ContractProfile::LocalBridgeV1, Some(authority), &mut local)
+            .expect("local bridge keeps its own source");
         assert!(local.source.is_empty());
     }
 

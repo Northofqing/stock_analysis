@@ -1,8 +1,9 @@
 use std::fs;
 use std::path::Path;
 
-const RELEASE_REVISION: &str = "5f1ce93656a55854c844065390520cd4aecd9a14";
-const OLD_RELEASE_REVISION: &str = "660902ff93a07f18367dc16879cf67732accd25a";
+const RELEASE_REVISION: &str = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e";
+const OLD_RELEASE_REVISION: &str = "7b870ee25e59f250ba847922ffa3d34cdd07e674";
+const HISTORICAL_BOARD_REGISTRY_REVISION: &str = "5f1ce93656a55854c844065390520cd4aecd9a14";
 const MAGIC_REPOSITORY: &str = "https://github.com/Northofqing/magic-market-data-rs.git";
 const DIRECT_MAGIC_CRATES: [&str; 14] = [
     "magic-baidu-rs",
@@ -47,6 +48,14 @@ fn production_source(source: &str) -> &str {
     source.split("#[cfg(test)]").next().unwrap_or(source)
 }
 
+fn manifest_table<'a>(manifest: &'a str, header: &str) -> &'a str {
+    manifest
+        .split_once(header)
+        .map(|(_, tail)| tail)
+        .and_then(|tail| tail.split_once("\n[").map(|(table, _)| table))
+        .expect("Cargo manifest must contain the requested TOML table")
+}
+
 fn lock_field<'a>(block: &'a str, field: &str) -> Option<&'a str> {
     let prefix = format!("{field} = \"");
     block.lines().find_map(|line| {
@@ -68,7 +77,7 @@ fn br192_magic_market_release_revision_is_one_atomic_identity() {
 
     let expected_manifest_fragment =
         format!("git = \"{MAGIC_REPOSITORY}\", rev = \"{RELEASE_REVISION}\"");
-    let mut dependency_rows = manifest
+    let mut dependency_rows = manifest_table(&manifest, "[dependencies]")
         .lines()
         .filter(|line| line.trim_start().starts_with("magic-"))
         .map(str::trim)
@@ -159,9 +168,18 @@ fn br192_magic_market_release_revision_is_one_atomic_identity() {
         "global-news evidence must bind the released upstream identity"
     );
 
-    let expected_registry_field = format!("\"upstream_revision\":\"{RELEASE_REVISION}\"");
+    // The checked-in board registry is immutable capture evidence from the
+    // previous audited revision. It must not be relabelled as the runtime
+    // revision; the current schema rejects that mismatch until a new board
+    // audit artifact is generated.
+    let expected_registry_field =
+        format!("\"upstream_revision\":\"{HISTORICAL_BOARD_REGISTRY_REVISION}\"");
     assert!(
         registry.contains(&expected_registry_field),
-        "checked-in board registry must bind the released upstream identity"
+        "checked-in board registry must retain its captured upstream identity"
+    );
+    assert!(
+        !registry.contains(&format!("\"upstream_revision\":\"{RELEASE_REVISION}\"")),
+        "historical board evidence must not be relabelled as the runtime revision"
     );
 }

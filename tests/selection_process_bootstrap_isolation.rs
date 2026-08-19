@@ -132,6 +132,10 @@ fn exact_help_is_a_storage_free_terminal_process() {
 
     assert!(output.status.success(), "help failed: {combined}");
     assert!(combined.contains("monitor --help"), "{combined}");
+    assert!(
+        combined.contains("monitor --compensate=P-01 --business-date=YYYY-MM-DD"),
+        "P-01 compensation command is missing from help: {combined}"
+    );
     assert_storage_free(&root, &production_before);
     std::fs::remove_dir_all(root).expect("remove help root");
 }
@@ -153,6 +157,18 @@ fn exact_version_is_a_storage_free_terminal_process() {
 }
 
 #[test]
+fn p01_compensation_cli_publishes_only_an_opaque_typed_request() {
+    let source = include_str!("../src/selection/process_bootstrap.rs");
+
+    assert!(source.contains("pub struct P01CompensationRequest"));
+    assert!(source.contains("_private: ()"));
+    assert!(source.contains("pub fn p01_compensation_request(&self)"));
+    assert!(!source.contains("pub fn p01_compensation_business_date(&self)"));
+    assert!(source.contains("explicit_args.len() != 2"));
+    assert!(source.contains("argument == \"--compensate=P-01\""));
+}
+
+#[test]
 fn invalid_argv_is_a_storage_free_rejected_process() {
     let root = isolated_root("invalid");
     let production_before = production_fingerprints();
@@ -169,7 +185,7 @@ fn invalid_argv_is_a_storage_free_rejected_process() {
 }
 
 #[test]
-fn operational_argv_runs_core_with_unreleased_selection_disabled() {
+fn operational_argv_runs_core_with_unverified_selection_disabled() {
     let root = isolated_root("operational-core");
     let production_before = production_fingerprints();
     let output = monitor(&root)
@@ -188,7 +204,7 @@ fn operational_argv_runs_core_with_unreleased_selection_disabled() {
     );
     assert!(
         combined.contains(
-            "[selection-v2][BR-183] capability=disabled reason_code=selection_v2_activation_not_released providers=0 database_operations=0 sinks=0 schedulers=0"
+            "[selection-v2][BR-183] capability=disabled reason_code=board_artifact_unverified providers=0 database_operations=0 sinks=0 schedulers=0"
         ),
         "{combined}"
     );

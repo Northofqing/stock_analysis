@@ -12,29 +12,29 @@ use crate::data_gateway::outcome_daily_bars::{
     fetch_magic_tdx_outcome_adaptive, OutcomeTransportFailure, RawOutcomeFetch,
 };
 use crate::data_gateway::{
-    board_ranking::BoardRankingGateway, BlockTradesGateway, BoardDataGateway, BoardKind,
-    CapitalDataGateway, ChainIntelligenceGateway, ConsensusDataGateway, DragonTigerGateway,
-    EconomicCalendarGateway, EventCalendarGateway, FuturesDeliveryGateway, GlobalMarketGateway,
-    GlobalNewsGateway, GlobalNewsProvider, HistoricalBarsGateway, IndexDataGateway,
-    IntradayShapeGateway, MagicTdxGateway, MarketCapabilitiesGateway, NorthboundQuotaFact,
-    ResearchDataGateway, ReviewDataGateway, SinaInstrumentNewsGateway,
-};
-use crate::data_gateway::{
     company::CompanyDataGateway,
     general_web_research::{GeneralWebResearchGateway, GeneralWebResearchProvider},
 };
+use crate::data_gateway::{
+    BlockTradesGateway, BoardDataGateway, BoardKind, CapitalDataGateway, ChainIntelligenceGateway,
+    ConsensusDataGateway, DragonTigerGateway, EconomicCalendarGateway, EventCalendarGateway,
+    FuturesDeliveryGateway, GlobalMarketGateway, GlobalNewsGateway, GlobalNewsProvider,
+    HistoricalBarsGateway, IndexDataGateway, IntradayShapeGateway, MagicTdxGateway,
+    MarketCapabilitiesGateway, NorthboundQuotaFact, ResearchDataGateway, ReviewDataGateway,
+    SinaInstrumentNewsGateway,
+};
 use crate::grpc_client::pb::magic::market::v1::Operation;
 use crate::magic_compat::{FlowInterval, NorthboundChannel, StatementKind};
-use crate::magic_compat::{InstrumentId, ProviderId};
+use crate::magic_compat::{InstrumentId, LimitPoolEntry, LimitPoolKind, ProviderId};
 use chrono::{Datelike, Local, NaiveDate};
 use serde_json::{json, Value};
 
-/// 委托取数结果 (M1 起证据链回填 provider/source/batch_id; 合同 §6 缺则不填充)。
-/// 既有尚未迁移的 fetch 走 pack() 时证据留空，handler 会显式拒绝，禁止
-/// 回填兼容 provider 或生成本地 batch identity。
+/// 委托取数结果。所有字段均来自实际 Gateway 批次；handler 只校验并透传，
+/// 不得生成 provider/source/batch/time 来掩盖缺失证据。
 pub struct Fetched {
     pub data: Vec<u8>,
     pub source_at: String,
+    pub observed_at: String,
     pub provider: String,
     pub source: String,
     pub batch_id: String,
@@ -135,22 +135,6 @@ fn today() -> NaiveDate {
     Local::now().date_naive()
 }
 
-/// batch 的 evidence 可信源时间 (合同 §6: 缺则不填充)。
-fn source_at_of(batch: &crate::data_gateway::GatewayBatch<impl Sized>) -> String {
-    batch.evidence().source_at.clone().unwrap_or_default()
-}
-
-/// 无 evidence 的视图打包 (provider/source/batch_id 留空, 合同 §6 缺则不填充)。
-fn pack(records: Vec<Value>, source_at: String) -> Result<Fetched, FetchFailure> {
-    Ok(Fetched {
-        data: serde_json::to_vec(&records).map_err(|e| FetchFailure::unknown(e.to_string()))?,
-        source_at,
-        provider: String::new(),
-        source: String::new(),
-        batch_id: String::new(),
-    })
-}
-
 /// GatewayBatch 打包: evidence 证据链 5 字段全回填 (M1 新 fetch 用)。
 fn pack_ev(
     records: Vec<Value>,
@@ -160,6 +144,7 @@ fn pack_ev(
     pack_ev_from(
         records,
         ev.source_at.clone().unwrap_or_default(),
+        ev.observed_at.clone(),
         format!("{:?}", ev.provider),
         ev.source.clone(),
         ev.batch_id.clone(),
@@ -170,6 +155,7 @@ fn pack_ev(
 fn pack_ev_from(
     records: Vec<Value>,
     source_at: String,
+    observed_at: String,
     provider: String,
     source: String,
     batch_id: String,
@@ -177,10 +163,58 @@ fn pack_ev_from(
     Ok(Fetched {
         data: serde_json::to_vec(&records).map_err(|e| FetchFailure::unknown(e.to_string()))?,
         source_at,
+        observed_at,
         provider,
         source,
         batch_id,
     })
+}
+
+fn retain_single_batch_evidence(
+    retained: &mut Option<crate::data_gateway::BatchEvidence>,
+    batch: &crate::data_gateway::GatewayBatch<impl Sized>,
+) -> Result<(), FetchFailure> {
+    retain_batch_evidence(retained, batch.evidence())
+}
+
+fn retain_batch_evidence(
+    retained: &mut Option<crate::data_gateway::BatchEvidence>,
+    evidence: &crate::data_gateway::BatchEvidence,
+) -> Result<(), FetchFailure> {
+    if let Some(existing) = retained.as_ref() {
+        if existing != evidence {
+            return Err(FetchFailure {
+                message: "one QueryResponse cannot merge distinct provider batch identities"
+                    .to_string(),
+                provider: None,
+                reason_code: "invalid_evidence",
+                retryable: false,
+            });
+        }
+    } else {
+        *retained = Some(evidence.clone());
+    }
+    Ok(())
+}
+
+fn pack_retained_evidence(
+    records: Vec<Value>,
+    evidence: Option<crate::data_gateway::BatchEvidence>,
+) -> Result<Fetched, FetchFailure> {
+    let evidence = evidence.ok_or_else(|| FetchFailure {
+        message: "delegate returned no source-backed batch evidence".to_string(),
+        provider: None,
+        reason_code: "no_verified_batch",
+        retryable: true,
+    })?;
+    pack_ev_from(
+        records,
+        evidence.source_at.unwrap_or_default(),
+        evidence.observed_at,
+        format!("{:?}", evidence.provider),
+        evidence.source,
+        evidence.batch_id,
+    )
 }
 
 fn not_yet(op: Operation) -> Result<Fetched, FetchFailure> {
@@ -202,8 +236,10 @@ pub async fn fetch(op: Operation, _schema: &str, params: &Value) -> Result<Fetch
         Operation::MoneyFlows => fetch_money_flows(params).await,
         Operation::SecurityMetadata => fetch_security_metadata(params).await,
         Operation::GlobalIndices => fetch_global_indices().await.map_err(DelegateError::Fetch),
-        Operation::Announcements => fetch_announcements().await.map_err(DelegateError::Fetch),
-        Operation::GlobalNews => fetch_global_news().await.map_err(DelegateError::Fetch),
+        Operation::Announcements => fetch_market_announcements()
+            .await
+            .map_err(DelegateError::Fetch),
+        Operation::GlobalNews => fetch_global_news(params).await,
         Operation::EconomicCalendar => fetch_economic_calendar()
             .await
             .map_err(DelegateError::Fetch),
@@ -222,9 +258,7 @@ pub async fn fetch(op: Operation, _schema: &str, params: &Value) -> Result<Fetch
         Operation::BoardFlows => fetch_board_flows(params)
             .await
             .map_err(DelegateError::Fetch),
-        Operation::LimitPools => fetch_limit_pools(params)
-            .await
-            .map_err(DelegateError::Fetch),
+        Operation::LimitPools => fetch_limit_pools(params).await,
         Operation::StrongStockReasons => fetch_strong_stock_reasons(params)
             .await
             .map_err(DelegateError::Fetch),
@@ -277,9 +311,8 @@ pub fn fetch_realtime_quotes(params: &Value) -> Result<Fetched, DelegateError> {
     let batch = crate::data_gateway::MarketDataGateway::new()
         .realtime_quotes(&codes)
         .map_err(|e| {
-            DelegateError::Fetch(FetchFailure::unknown(format!(
-                "统一实时行情 Gateway 不可用: {e}"
-            )))
+            let message = format!("统一实时行情 Gateway 不可用: {e}");
+            DelegateError::Fetch(FetchFailure::from_gateway(e).with_message(message))
         })?;
     let records: Vec<Value> = batch
         .records()
@@ -321,9 +354,8 @@ async fn fetch_minute_data(params: &Value) -> Result<Fetched, DelegateError> {
             DelegateError::Fetch(FetchFailure::unknown(format!("分钟线 task 失败: {e}")))
         })?;
         let batch = batch?;
-        if evidence_first.is_none() {
-            evidence_first = Some(batch.evidence().clone());
-        }
+        retain_batch_evidence(&mut evidence_first, batch.evidence())
+            .map_err(DelegateError::Fetch)?;
         records.extend(batch.records().iter().map(|r| {
             json!({
                 "code": r.code,
@@ -335,8 +367,7 @@ async fn fetch_minute_data(params: &Value) -> Result<Fetched, DelegateError> {
             })
         }));
     }
-    // P4 M2: 证据链回填 (取首个 batch 的 evidence; 全部失败时 evidence_first 为 None
-    // → 显式错误, 不静默填默认证据)。
+    // P4 M2: 一个 QueryResponse 只能绑定一个真实批次身份；跨批聚合显式拒绝。
     let ev = evidence_first.ok_or_else(|| {
         DelegateError::Fetch(FetchFailure::unknown(
             "分钟线: 无任何 batch 成功".to_string(),
@@ -345,6 +376,7 @@ async fn fetch_minute_data(params: &Value) -> Result<Fetched, DelegateError> {
     pack_ev_from(
         records,
         ev.source_at.clone().unwrap_or_default(),
+        ev.observed_at.clone(),
         format!("{:?}", ev.provider),
         ev.source.clone(),
         ev.batch_id.clone(),
@@ -357,7 +389,8 @@ async fn fetch_order_books(params: &Value) -> Result<Fetched, DelegateError> {
     let gateway = MarketCapabilitiesGateway::new();
     let codes = crate::grpc_contract::params::resolve_codes(params)?;
     let batch = gateway.order_books(&codes).await.map_err(|e| {
-        DelegateError::Fetch(FetchFailure::unknown(format!("盘口 Gateway 不可用: {e}")))
+        let message = format!("盘口 Gateway 不可用: {e}");
+        DelegateError::Fetch(FetchFailure::from_gateway(e).with_message(message))
     })?;
     let records: Vec<Value> = batch
         .records()
@@ -440,7 +473,6 @@ async fn fetch_global_indices() -> Result<Fetched, FetchFailure> {
         let message = format!("全球指数 Gateway 不可用: {e}");
         FetchFailure::from_gateway(e).with_message(message)
     })?;
-    let source_at = source_at_of(&batch);
     let records: Vec<Value> = batch
         .records()
         .iter()
@@ -455,10 +487,10 @@ async fn fetch_global_indices() -> Result<Fetched, FetchFailure> {
             })
         })
         .collect();
-    pack(records, source_at)
+    pack_ev(records, &batch)
 }
 
-async fn fetch_announcements() -> Result<Fetched, FetchFailure> {
+async fn fetch_market_announcements() -> Result<Fetched, FetchFailure> {
     let gateway = EventCalendarGateway::new();
     let batch = gateway
         .market_announcements(today(), 100)
@@ -467,7 +499,6 @@ async fn fetch_announcements() -> Result<Fetched, FetchFailure> {
             let message = format!("公告 Gateway 不可用: {e}");
             FetchFailure::from_gateway(e).with_message(message)
         })?;
-    let source_at = source_at_of(&batch);
     let records: Vec<Value> = batch
         .records()
         .iter()
@@ -482,19 +513,55 @@ async fn fetch_announcements() -> Result<Fetched, FetchFailure> {
             })
         })
         .collect();
-    pack(records, source_at)
+    pack_ev(records, &batch)
 }
 
-async fn fetch_global_news() -> Result<Fetched, FetchFailure> {
+fn resolve_global_news_request(
+    params: &Value,
+) -> Result<(GlobalNewsProvider, u32), crate::grpc_contract::params::ParamsError> {
+    use crate::data_gateway::global_news::MAX_GLOBAL_NEWS_LIMIT;
+    use crate::grpc_contract::params::{resolve_required_string, resolve_u32, ParamsError};
+
+    let provider_name = resolve_required_string(params, "provider")?;
+    let provider = GlobalNewsProvider::from_wire_name(&provider_name).ok_or_else(|| {
+        ParamsError::InvalidArgument(format!(
+            "provider 非法值 {provider_name:?} (允许: Eastmoney/Cailianpress/Jin10/ThePaper)"
+        ))
+    })?;
+    if params.get("limit").is_none() {
+        return Err(ParamsError::InvalidArgument("limit 必填".to_string()));
+    }
+    let limit = resolve_u32(params, "limit", 0)?;
+    if !(1..=MAX_GLOBAL_NEWS_LIMIT).contains(&limit) {
+        return Err(ParamsError::InvalidArgument(format!(
+            "limit 必须在 1..={MAX_GLOBAL_NEWS_LIMIT}，收到 {limit}"
+        )));
+    }
+    Ok((provider, limit))
+}
+
+async fn fetch_global_news(params: &Value) -> Result<Fetched, DelegateError> {
+    let (provider, limit) = resolve_global_news_request(params)?;
     let gateway = GlobalNewsGateway::new();
-    let batch = gateway
-        .global_news(GlobalNewsProvider::Eastmoney, 20)
-        .await
-        .map_err(|e| {
-            let message = format!("全球新闻 Gateway 不可用: {e}");
-            FetchFailure::from_gateway(e).with_message(message)
-        })?;
-    let source_at = source_at_of(&batch);
+    let batch = gateway.global_news(provider, limit).await.map_err(|e| {
+        let message = format!("全球新闻 Gateway 不可用: {e}");
+        DelegateError::Fetch(FetchFailure::from_gateway(e).with_message(message))
+    })?;
+    if batch.evidence().provider != provider.provider_id()
+        || batch.evidence().source != provider.source()
+        || batch.records().len() > limit as usize
+    {
+        return Err(DelegateError::Fetch(FetchFailure {
+            message: format!(
+                "global-news response violates request provider={} source={} limit={limit}",
+                provider.wire_name(),
+                provider.source()
+            ),
+            provider: Some(provider.provider_id()),
+            reason_code: "invalid_evidence",
+            retryable: false,
+        }));
+    }
     let records: Vec<Value> = batch
         .records()
         .iter()
@@ -513,7 +580,7 @@ async fn fetch_global_news() -> Result<Fetched, FetchFailure> {
             })
         })
         .collect();
-    pack(records, source_at)
+    pack_ev(records, &batch).map_err(DelegateError::Fetch)
 }
 
 async fn fetch_economic_calendar() -> Result<Fetched, FetchFailure> {
@@ -522,7 +589,6 @@ async fn fetch_economic_calendar() -> Result<Fetched, FetchFailure> {
         let message = format!("财经日历 Gateway 不可用: {e}");
         FetchFailure::from_gateway(e).with_message(message)
     })?;
-    let source_at = source_at_of(&batch);
     let records: Vec<Value> = batch
         .records()
         .iter()
@@ -545,7 +611,7 @@ async fn fetch_economic_calendar() -> Result<Fetched, FetchFailure> {
             })
         })
         .collect();
-    pack(records, source_at)
+    pack_ev(records, &batch)
 }
 
 async fn fetch_futures_delivery() -> Result<Fetched, FetchFailure> {
@@ -558,7 +624,6 @@ async fn fetch_futures_delivery() -> Result<Fetched, FetchFailure> {
             let message = format!("交割日历 Gateway 不可用: {e}");
             FetchFailure::from_gateway(e).with_message(message)
         })?;
-    let source_at = source_at_of(&batch);
     let records: Vec<Value> = batch
         .records()
         .iter()
@@ -572,7 +637,7 @@ async fn fetch_futures_delivery() -> Result<Fetched, FetchFailure> {
             })
         })
         .collect();
-    pack(records, source_at)
+    pack_ev(records, &batch)
 }
 
 /// 龙虎榜: 生产调用方传 trading_date + disclosure_limit + stock_limit
@@ -594,7 +659,6 @@ async fn fetch_dragon_tiger(params: &Value) -> Result<Fetched, FetchFailure> {
             let message = format!("龙虎榜 Gateway 不可用: {e}");
             FetchFailure::from_gateway(e).with_message(message)
         })?;
-    let source_at = source_at_of(&batch);
     let records: Vec<Value> = batch
         .records()
         .iter()
@@ -628,7 +692,7 @@ async fn fetch_dragon_tiger(params: &Value) -> Result<Fetched, FetchFailure> {
             })
         })
         .collect();
-    pack(records, source_at)
+    pack_ev(records, &batch)
 }
 
 /// 大宗交易: 生产调用方传 codes + trading_date (push_templates r05) —
@@ -646,7 +710,6 @@ async fn fetch_block_trades(params: &Value) -> Result<Fetched, FetchFailure> {
             let message = format!("大宗交易 Gateway 不可用: {e}");
             FetchFailure::from_gateway(e).with_message(message)
         })?;
-    let source_at = source_at_of(&batch);
     let records: Vec<Value> = batch
         .records()
         .iter()
@@ -664,7 +727,7 @@ async fn fetch_block_trades(params: &Value) -> Result<Fetched, FetchFailure> {
             })
         })
         .collect();
-    pack(records, source_at)
+    pack_ev(records, &batch)
 }
 
 /// 一致预期: 生产调用方逐代码 fetch(code) (v17_sources) — codes 缺省 watchlist。
@@ -683,7 +746,7 @@ async fn fetch_consensus(params: &Value) -> Result<Fetched, FetchFailure> {
         });
     }
     let mut records: Vec<Value> = Vec::new();
-    let mut source_at = String::new();
+    let mut evidence_first: Option<crate::data_gateway::BatchEvidence> = None;
     while let Some(joined) = set.join_next().await {
         let (code, batch) = joined
             .map_err(|e| FetchFailure::unknown(format!("一致预期 task 失败: {e}")))?
@@ -693,9 +756,7 @@ async fn fetch_consensus(params: &Value) -> Result<Fetched, FetchFailure> {
                 reason_code: e.reason_code(),
                 retryable: e.retryable(),
             })?;
-        if source_at.is_empty() {
-            source_at = source_at_of(&batch);
-        }
+        retain_single_batch_evidence(&mut evidence_first, &batch)?;
         records.extend(batch.records().iter().map(|r| {
             json!({
                 "code": code,
@@ -708,7 +769,7 @@ async fn fetch_consensus(params: &Value) -> Result<Fetched, FetchFailure> {
             })
         }));
     }
-    pack(records, source_at)
+    pack_retained_evidence(records, evidence_first)
 }
 
 // ---------- Task 10 补全的 11 op (delegate 24 个生产 op 全量覆盖) ----------
@@ -737,9 +798,8 @@ async fn fetch_historical_bars(params: &Value) -> Result<Fetched, DelegateError>
             DelegateError::Fetch(FetchFailure::unknown(format!("日线 task 失败: {e}")))
         })?;
         let batch = batch?;
-        if evidence_first.is_none() {
-            evidence_first = Some(batch.evidence().clone());
-        }
+        retain_batch_evidence(&mut evidence_first, batch.evidence())
+            .map_err(DelegateError::Fetch)?;
         let code = batch.target_code().to_string();
         records.extend(batch.records().iter().map(|k| {
             json!({
@@ -763,6 +823,7 @@ async fn fetch_historical_bars(params: &Value) -> Result<Fetched, DelegateError>
     pack_ev_from(
         records,
         ev.source_at.clone().unwrap_or_default(),
+        ev.observed_at.clone(),
         format!("{:?}", ev.provider),
         ev.source.clone(),
         ev.batch_id.clone(),
@@ -792,7 +853,6 @@ async fn fetch_board_directory(params: &Value) -> Result<Fetched, FetchFailure> 
         let message = format!("板块目录 Gateway 不可用: {e}");
         FetchFailure::from_gateway(e).with_message(message)
     })?;
-    let source_at = source_at_of(&batch);
     let records: Vec<Value> = batch
         .records()
         .iter()
@@ -805,14 +865,14 @@ async fn fetch_board_directory(params: &Value) -> Result<Fetched, FetchFailure> 
             })
         })
         .collect();
-    pack(records, source_at)
+    pack_ev(records, &batch)
 }
 
 /// 板块成分: board 模块无公开「板块→成分」生产入口 (board_constituents_raw
 /// 需内部 BoardConstituentRequest, 未导出) → 用 memberships(code) 查
 /// 「个股→所属板块」, 输出成分归属视图。
 ///
-/// BR-231: 每次请求只允许一个 canonical code。多个代码会产生多个独立
+/// BR-238: 每次请求只允许一个 canonical code。多个代码会产生多个独立
 /// GatewayBatch，禁止在这里合并后伪造一个跨批次 identity。
 async fn fetch_board_constituents(params: &Value) -> Result<Fetched, DelegateError> {
     let gateway = BoardDataGateway::new();
@@ -820,7 +880,7 @@ async fn fetch_board_constituents(params: &Value) -> Result<Fetched, DelegateErr
     let [code] = codes.as_slice() else {
         return Err(DelegateError::Params(
             crate::grpc_contract::params::ParamsError::InvalidArgument(
-                "board_constituents: BR-231 要求每次恰好一个 canonical code".to_string(),
+                "board_constituents: BR-238 要求每次恰好一个 canonical code".to_string(),
             ),
         ));
     };
@@ -871,7 +931,6 @@ async fn fetch_board_flows(params: &Value) -> Result<Fetched, FetchFailure> {
         let message = format!("板块资金流 Gateway 不可用: {e}");
         FetchFailure::from_gateway(e).with_message(message)
     })?;
-    let source_at = source_at_of(&batch);
     let records: Vec<Value> = batch
         .records()
         .iter()
@@ -888,10 +947,46 @@ async fn fetch_board_flows(params: &Value) -> Result<Fetched, FetchFailure> {
             })
         })
         .collect();
-    pack(records, source_at)
+    pack_ev(records, &batch)
 }
 
-/// LimitPools/StrongStockReasons/ChainBatch 共用 A-10 题材链 batch (唯一生产入口)。
+fn resolve_limit_pools_request(
+    params: &Value,
+) -> Result<NaiveDate, crate::grpc_contract::params::ParamsError> {
+    use crate::grpc_contract::params::{
+        resolve_required_date, resolve_required_string, resolve_u32, ParamsError,
+    };
+
+    const REQUIRED_KEYS: [&str; 3] = ["kind", "trading_date", "limit"];
+    let object = params
+        .as_object()
+        .ok_or_else(|| ParamsError::InvalidArgument("LimitPools params 必须是对象".to_string()))?;
+    if object.len() != REQUIRED_KEYS.len()
+        || object
+            .keys()
+            .any(|key| !REQUIRED_KEYS.contains(&key.as_str()))
+    {
+        return Err(ParamsError::InvalidArgument(
+            "LimitPools params 必须且只能包含 kind/trading_date/limit".to_string(),
+        ));
+    }
+    let kind = resolve_required_string(params, "kind")?;
+    if kind != "Upper" {
+        return Err(ParamsError::InvalidArgument(format!(
+            "kind 非法值 {kind:?} (仅允许 Upper)"
+        )));
+    }
+    let trading_date = resolve_required_date(params, "trading_date")?;
+    let limit = resolve_u32(params, "limit", 0)?;
+    if limit != 200 {
+        return Err(ParamsError::InvalidArgument(format!(
+            "limit 必须为 200，收到 {limit}"
+        )));
+    }
+    Ok(trading_date)
+}
+
+/// StrongStockReasons/ChainBatch 共用 A-10 题材链 batch (唯一生产入口)。
 /// M4c: 加 date 参数 (resolve_date, 默认 today) — monitor 复盘按指定交易日重算。
 async fn fetch_chain_batch(
     params: &Value,
@@ -915,28 +1010,114 @@ async fn fetch_chain_batch_full(params: &Value) -> Result<Fetched, FetchFailure>
     Ok(Fetched {
         data,
         source_at: batch.trading_date.to_string(),
-        provider: String::new(),
-        source: String::new(),
-        batch_id: String::new(),
+        observed_at: Local::now().to_rfc3339(),
+        provider: format!("{:?}", ProviderId::Custom),
+        source: format!("chain-intelligence: {}", batch.calculation_version),
+        batch_id: batch.batch_id,
     })
 }
 
-/// 涨停池: 全部涨停链成员扁平视图 (含连板 streak)。
-async fn fetch_limit_pools(params: &Value) -> Result<Fetched, FetchFailure> {
-    let batch = fetch_chain_batch(params).await?;
-    let mut records: Vec<Value> = Vec::new();
-    for chain in &batch.chains {
-        for m in &chain.members {
-            records.push(json!({
-                "chain_id": chain.chain_id,
-                "board_name": chain.board_name,
-                "code": m.instrument_id,
-                "name": m.security_name,
-                "streak": m.streak,
-            }));
+fn invalid_limit_pool_evidence(provider: ProviderId, message: impl Into<String>) -> FetchFailure {
+    FetchFailure {
+        message: message.into(),
+        provider: Some(provider),
+        reason_code: "invalid_evidence",
+        retryable: false,
+    }
+}
+
+fn pack_limit_pool_batch(
+    batch: &crate::data_gateway::GatewayBatch<LimitPoolEntry>,
+    trading_date: NaiveDate,
+    requested_limit: u32,
+) -> Result<Fetched, FetchFailure> {
+    let evidence = batch.evidence();
+    let provider = evidence.provider;
+    if !matches!(provider, ProviderId::Eastmoney | ProviderId::Tonghuashun) {
+        return Err(invalid_limit_pool_evidence(
+            provider,
+            "LimitPools batch provider is not registered for exact-date upper-limit data",
+        ));
+    }
+    let expected_date = trading_date.format("%Y-%m-%d").to_string();
+    if evidence.source_at.as_deref() != Some(expected_date.as_str()) {
+        return Err(invalid_limit_pool_evidence(
+            provider,
+            format!(
+                "LimitPools batch source_at {:?} differs from requested {expected_date}",
+                evidence.source_at
+            ),
+        ));
+    }
+    let maximum_count = usize::try_from(requested_limit).map_err(|_| {
+        invalid_limit_pool_evidence(provider, "LimitPools requested limit exceeds usize")
+    })?;
+    if batch.records().len() > maximum_count {
+        return Err(invalid_limit_pool_evidence(
+            provider,
+            format!(
+                "LimitPools batch count {} exceeds requested limit {requested_limit}",
+                batch.records().len()
+            ),
+        ));
+    }
+    for record in batch.records() {
+        if record.kind != LimitPoolKind::Upper {
+            return Err(invalid_limit_pool_evidence(
+                provider,
+                "LimitPools record kind differs from requested Upper",
+            ));
+        }
+        if record.trading_date.as_str() != expected_date.as_str() {
+            return Err(invalid_limit_pool_evidence(
+                provider,
+                format!(
+                    "LimitPools record trading_date {} differs from requested {expected_date}",
+                    record.trading_date.as_str()
+                ),
+            ));
+        }
+        if record.evidence.provider() != provider
+            || record.evidence.source_at() != evidence.source_at.as_deref()
+            || record.evidence.observed_at() != evidence.observed_at.as_str()
+            || record.evidence.batch_id() != evidence.batch_id.as_str()
+        {
+            return Err(invalid_limit_pool_evidence(
+                provider,
+                format!(
+                    "LimitPools record {} evidence differs from its batch envelope",
+                    record.instrument.code()
+                ),
+            ));
         }
     }
-    pack(records, batch.trading_date.to_string())
+    let records = batch
+        .records()
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| FetchFailure::unknown(format!("LimitPoolEntry 序列化失败: {error}")))?;
+    pack_ev(records, batch)
+}
+
+/// Exact-date full upper-limit membership batch for the LocalBridge LimitPools contract.
+async fn fetch_limit_pools(params: &Value) -> Result<Fetched, DelegateError> {
+    const FULL_LIMIT: u32 = 200;
+    let trading_date = resolve_limit_pools_request(params)?;
+    let batch = tokio::task::spawn_blocking(move || {
+        ReviewDataGateway::new().current_upper_limit_pool_library(trading_date)
+    })
+    .await
+    .map_err(|error| {
+        DelegateError::Fetch(FetchFailure::unknown(format!(
+            "LimitPools worker join 失败: {error}"
+        )))
+    })?
+    .map_err(|error| {
+        let message = format!("LimitPools Gateway 不可用: {error}");
+        DelegateError::Fetch(FetchFailure::from_gateway(error).with_message(message))
+    })?;
+    pack_limit_pool_batch(&batch, trading_date, FULL_LIMIT).map_err(DelegateError::Fetch)
 }
 
 /// 强势股原因: 涨停链维度 (板块催化 + 涨停数 + 连续板成员)。
@@ -965,7 +1146,14 @@ async fn fetch_strong_stock_reasons(params: &Value) -> Result<Fetched, FetchFail
             })
         })
         .collect();
-    pack(records, batch.trading_date.to_string())
+    pack_ev_from(
+        records,
+        batch.trading_date.to_string(),
+        Local::now().to_rfc3339(),
+        format!("{:?}", ProviderId::Custom),
+        format!("chain-intelligence: {}", batch.calculation_version),
+        batch.batch_id,
+    )
 }
 
 /// 全市场龙虎榜: 与 DragonTiger op 共用 market_review (唯一生产入口),
@@ -987,7 +1175,6 @@ async fn fetch_market_dragon_tiger(params: &Value) -> Result<Fetched, FetchFailu
             let message = format!("龙虎榜 Gateway 不可用: {e}");
             FetchFailure::from_gateway(e).with_message(message)
         })?;
-    let source_at = source_at_of(&batch);
     let records: Vec<Value> = batch
         .records()
         .iter()
@@ -1021,39 +1208,19 @@ async fn fetch_market_dragon_tiger(params: &Value) -> Result<Fetched, FetchFailu
             })
         })
         .collect();
-    pack(records, source_at)
+    pack_ev(records, &batch)
 }
 
 /// 板块排行: fetch_top 是同步 reqwest 阻塞调用 → spawn_blocking 隔离,
 /// 不卡 tokio worker。
 async fn fetch_board_ranking(fid: &str, top_n: usize) -> Result<Fetched, FetchFailure> {
-    let fid = fid.to_string();
-    let joined =
-        tokio::task::spawn_blocking(move || BoardRankingGateway::new().fetch_top(&fid, top_n))
-            .await
-            .map_err(|e| format!("板块排行 task 失败: {e}"))?;
-    let facts = joined.map_err(|e| {
-        // fetch_top 的 error 类型非 GatewayError (无 provider/reason_code 可保真)
-        // → unknown (unavailable, 可重试, fail-closed)。
-        FetchFailure::unknown(format!("板块排行 Gateway 不可用: {e}"))
-    })?;
-    let records: Vec<Value> = facts
-        .iter()
-        .map(|r| {
-            json!({
-                "code": r.code,
-                "name": r.name,
-                "change_pct": r.change_pct,
-                "main_inflow": r.main_inflow,
-                "leader_name": r.leader_name,
-                "vol_ratio": r.vol_ratio,
-                "turnover": r.turnover,
-                "day1_ratio": r.day1_ratio,
-                "day5_ratio": r.day5_ratio,
-            })
-        })
-        .collect();
-    pack(records, String::new())
+    let _ = (fid, top_n);
+    Err(FetchFailure {
+        message: "板块排行 provider 未返回可保真的 batch evidence".to_string(),
+        provider: None,
+        reason_code: "no_verified_batch",
+        retryable: false,
+    })
 }
 
 /// 主力净流入排行 (fid=f62): 生产调用方传 top_n (sector_monitor rank_top) —
@@ -1094,12 +1261,10 @@ async fn fetch_research_reports(params: &Value) -> Result<Fetched, FetchFailure>
         });
     }
     let mut records: Vec<Value> = Vec::new();
-    let mut source_at = String::new();
+    let mut evidence_first: Option<crate::data_gateway::BatchEvidence> = None;
     while let Some(joined) = set.join_next().await {
         let (code, batch) = joined.map_err(|e| format!("研报 task 失败: {e}"))??;
-        if source_at.is_empty() {
-            source_at = source_at_of(&batch);
-        }
+        retain_single_batch_evidence(&mut evidence_first, &batch)?;
         records.extend(batch.records().iter().map(|r| {
             json!({
                 "code": code,
@@ -1114,7 +1279,7 @@ async fn fetch_research_reports(params: &Value) -> Result<Fetched, FetchFailure>
             })
         }));
     }
-    pack(records, source_at)
+    pack_retained_evidence(records, evidence_first)
 }
 
 /// 北向资金: 沪股通 + 深股通 两 channel 并发 (逐 channel 查询)。
@@ -1169,7 +1334,7 @@ async fn fetch_northbound_daily(params: &Value) -> Result<Fetched, FetchFailure>
             })
         })
         .collect();
-    pack(records, source_at_of(&batch))
+    pack_ev(records, &batch)
 }
 
 // ---------- M1 扩展 (P4): 8 个 proto 已有 op ----------
@@ -1273,30 +1438,13 @@ async fn fetch_market_statistics(params: &Value) -> Result<Fetched, DelegateErro
 /// count 默认 48 (3 个交易日)。fifteen_min_bars 返回 Vec 非 GatewayBatch →
 /// source_at/证据留空 (合同 §6 缺则不填充)。
 async fn fetch_technical_bars(params: &Value) -> Result<Fetched, DelegateError> {
-    let codes = crate::grpc_contract::params::resolve_codes(params)?;
-    let count = crate::grpc_contract::params::resolve_u32(params, "count", 48)? as usize;
-    let gateway = HistoricalBarsGateway::new();
-    let mut records: Vec<Value> = Vec::new();
-    for code in codes {
-        let bars = gateway.fifteen_min_bars(&code, count).map_err(|e| {
-            DelegateError::Fetch(FetchFailure::unknown(format!(
-                "15 分钟线 Gateway 不可用 ({code}): {e}"
-            )))
-        })?;
-        records.extend(bars.iter().map(|b| {
-            json!({
-                "code": code,
-                "open": b.open,
-                "close": b.close,
-                "high": b.high,
-                "low": b.low,
-                "vol": b.vol,
-                "amount": b.amount,
-                "at": b.datetime,
-            })
-        }));
-    }
-    pack(records, String::new()).map_err(DelegateError::Fetch)
+    let _ = params;
+    Err(DelegateError::Fetch(FetchFailure {
+        message: "15 分钟线 provider 未返回可保真的 batch evidence".to_string(),
+        provider: None,
+        reason_code: "no_verified_batch",
+        retryable: false,
+    }))
 }
 
 /// 公司行动: SecurityLifecycleGateway::acquire 返回生命周期上下文, 取
@@ -1338,6 +1486,7 @@ async fn fetch_corporate_actions(params: &Value) -> Result<Fetched, DelegateErro
         source_at: evidence
             .map(|e| e.source_at.clone().unwrap_or_default())
             .unwrap_or_default(),
+        observed_at: evidence.map(|e| e.observed_at.clone()).unwrap_or_default(),
         provider: evidence
             .map(|e| format!("{:?}", e.provider))
             .unwrap_or_default(),
@@ -1346,34 +1495,105 @@ async fn fetch_corporate_actions(params: &Value) -> Result<Fetched, DelegateErro
     })
 }
 
-/// 语义检索: data_gateway 无向量检索 (P4 探索) → 联网检索 GeneralWebResearchGateway
+/// BR-242 语义检索: data_gateway 无向量检索 (P4 探索) → 联网检索 GeneralWebResearchGateway
 /// (Bocha/Tavily/SerpApi, 需 API key; 无 key 显式失败, 不静默回退)。
+fn resolve_semantic_search_request(
+    params: &Value,
+) -> Result<(GeneralWebResearchProvider, String, usize), crate::grpc_contract::params::ParamsError>
+{
+    use crate::grpc_contract::params::{resolve_required_string, resolve_u32, ParamsError};
+
+    const REQUIRED_KEYS: [&str; 3] = ["provider", "query", "limit"];
+    let object = params.as_object().ok_or_else(|| {
+        ParamsError::InvalidArgument("SemanticSearch params 必须是对象".to_string())
+    })?;
+    if object.len() != REQUIRED_KEYS.len()
+        || object
+            .keys()
+            .any(|key| !REQUIRED_KEYS.contains(&key.as_str()))
+    {
+        return Err(ParamsError::InvalidArgument(
+            "SemanticSearch params 必须且只能包含 provider/query/limit".to_string(),
+        ));
+    }
+    let provider_name = resolve_required_string(params, "provider")?;
+    let provider = GeneralWebResearchProvider::from_wire_name(&provider_name).ok_or_else(|| {
+        ParamsError::InvalidArgument(format!(
+            "provider 非法值 {provider_name:?} (允许: Bocha/Tavily/SerpApi)"
+        ))
+    })?;
+    let query = resolve_required_string(params, "query")?;
+    if query.trim() != query {
+        return Err(ParamsError::InvalidArgument(
+            "query 不得包含首尾空白".to_string(),
+        ));
+    }
+    let limit = resolve_u32(params, "limit", 0)?;
+    if !(1..=50).contains(&limit) {
+        return Err(ParamsError::InvalidArgument(format!(
+            "limit 必须在 1..=50，收到 {limit}"
+        )));
+    }
+    Ok((provider, query, limit as usize))
+}
+
 async fn fetch_semantic_search(params: &Value) -> Result<Fetched, DelegateError> {
-    let query = crate::grpc_contract::params::resolve_required_string(params, "query")?;
-    let limit = crate::grpc_contract::params::resolve_u32(params, "limit", 10)? as usize;
-    let batch = GeneralWebResearchGateway::from_environment(GeneralWebResearchProvider::Bocha)
+    let (provider, query, limit) = resolve_semantic_search_request(params)?;
+    let batch = GeneralWebResearchGateway::from_environment(provider)
         .search(&query, limit)
         .await
-        .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(format!("联网检索不可用: {e}"))))?;
-    // GeneralWebResearchBatch 只有 evidence() 访问器; records 在 enum 变体字段。
-    let records: Vec<Value> = match &batch {
-        crate::data_gateway::GeneralWebResearchBatch::Available { records, .. } => records
-            .iter()
-            .map(|r| {
-                serde_json::to_value(r)
-                    .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(e.to_string())))
+        .map_err(|error| {
+            DelegateError::Fetch(FetchFailure {
+                message: format!("{} 联网检索不可用: {error}", provider.label()),
+                provider: None,
+                reason_code: error.reason_code(),
+                retryable: error.retryable(),
             })
-            .collect::<Result<_, _>>()?,
-        crate::data_gateway::GeneralWebResearchBatch::VerifiedEmpty(_) => Vec::new(),
+        })?;
+    let evidence = batch.evidence();
+    let batch_records = match &batch {
+        crate::data_gateway::GeneralWebResearchBatch::Available { records, .. } => {
+            records.as_slice()
+        }
+        crate::data_gateway::GeneralWebResearchBatch::VerifiedEmpty(_) => &[],
     };
-    let ev = batch.evidence();
+    if evidence.provider != provider
+        || evidence.source != provider.source()
+        || evidence.query != query
+        || batch_records.len() > limit
+        || batch_records.iter().any(|record| {
+            record.evidence.provider != provider
+                || record.evidence.batch_id != evidence.batch_id
+                || record.evidence.observed_at != evidence.observed_at
+        })
+    {
+        return Err(DelegateError::Fetch(FetchFailure {
+            message: format!(
+                "SemanticSearch response violates request provider={} source={} limit={limit}",
+                provider.wire_name(),
+                provider.source()
+            ),
+            provider: None,
+            reason_code: "invalid_evidence",
+            retryable: false,
+        }));
+    }
+    // GeneralWebResearchBatch 只有 evidence() 访问器; records 在 enum 变体字段。
+    let records: Vec<Value> = batch_records
+        .iter()
+        .map(|record| {
+            serde_json::to_value(record)
+                .map_err(|error| DelegateError::Fetch(FetchFailure::unknown(error.to_string())))
+        })
+        .collect::<Result<_, _>>()?;
     Ok(Fetched {
         data: serde_json::to_vec(&records)
             .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(e.to_string())))?,
         source_at: String::new(),
-        provider: format!("{:?}", ev.provider),
-        source: ev.source.clone(),
-        batch_id: ev.batch_id.clone(),
+        observed_at: evidence.observed_at.to_rfc3339(),
+        provider: format!("{:?}", evidence.provider),
+        source: evidence.source.clone(),
+        batch_id: evidence.batch_id.clone(),
     })
 }
 
@@ -1402,14 +1622,12 @@ async fn fetch_fund_flow_series(params: &Value) -> Result<Fetched, DelegateError
         });
     }
     let mut records: Vec<Value> = Vec::new();
-    let mut source_at = String::new();
+    let mut evidence_first: Option<crate::data_gateway::BatchEvidence> = None;
     while let Some(joined) = set.join_next().await {
         let batch = joined
             .map_err(|e| FetchFailure::unknown(format!("资金流 task 失败: {e}")))?
             .map_err(DelegateError::Fetch)?;
-        if source_at.is_empty() {
-            source_at = source_at_of(&batch);
-        }
+        retain_single_batch_evidence(&mut evidence_first, &batch).map_err(DelegateError::Fetch)?;
         records.extend(batch.records().iter().map(|r| {
             json!({
                 "code": r.code,
@@ -1424,7 +1642,7 @@ async fn fetch_fund_flow_series(params: &Value) -> Result<Fetched, DelegateError
             })
         }));
     }
-    pack(records, source_at).map_err(DelegateError::Fetch)
+    pack_retained_evidence(records, evidence_first).map_err(DelegateError::Fetch)
 }
 
 /// 头部排行: CapitalDataGateway::provider_top_n_pair (VolumeRatio + MainNetInflow
@@ -1434,13 +1652,44 @@ async fn fetch_provider_top_n_rankings(params: &Value) -> Result<Fetched, Delega
     let pair = CapitalDataGateway::new()
         .provider_top_n_pair(date)
         .await
-        .map_err(|e| {
-            DelegateError::Fetch(FetchFailure::unknown(format!(
-                "头部排行 Gateway 不可用: {e}"
-            )))
-        })?;
+        .map_err(provider_top_n_gateway_failure)?;
+    pack_provider_top_n_pair(&pair).map_err(DelegateError::Fetch)
+}
+
+pub(crate) fn provider_top_n_gateway_failure(
+    error: crate::data_gateway::GatewayError,
+) -> DelegateError {
+    let message = format!("头部排行 Gateway 不可用: {error}");
+    DelegateError::Fetch(FetchFailure::from_gateway(error).with_message(message))
+}
+
+fn pack_provider_top_n_pair(
+    pair: &crate::data_gateway::capital::ProviderTopNPair,
+) -> Result<Fetched, FetchFailure> {
+    let volume_evidence = pair.volume_ratio.evidence();
+    let inflow_evidence = pair.main_net_inflow.evidence();
+    if pair.volume_ratio.records().is_empty()
+        || pair.main_net_inflow.records().is_empty()
+        || volume_evidence.source.trim().is_empty()
+        || volume_evidence.observed_at.trim().is_empty()
+        || volume_evidence.batch_id.trim().is_empty()
+        || inflow_evidence.source.trim().is_empty()
+        || inflow_evidence.observed_at.trim().is_empty()
+        || inflow_evidence.batch_id.trim().is_empty()
+        || volume_evidence.batch_id == inflow_evidence.batch_id
+    {
+        return Err(FetchFailure {
+            message: "BR-240 provider Top-N requires two non-empty, distinct real batch evidences"
+                .to_string(),
+            provider: Some(volume_evidence.provider),
+            reason_code: "invalid_evidence",
+            retryable: false,
+        });
+    }
+
     let mut records: Vec<Value> = Vec::new();
     for batch in [&pair.volume_ratio, &pair.main_net_inflow] {
+        let evidence = batch.evidence();
         for r in batch.records() {
             records.push(json!({
                 "metric": format!("{:?}", r.metric),
@@ -1453,11 +1702,19 @@ async fn fetch_provider_top_n_rankings(params: &Value) -> Result<Fetched, Delega
                 "filter_identity": r.filter_identity.as_str(),
                 "provider_declared_total": r.provider_declared_total.get(),
                 "inspected_row_count": r.inspected_row_count.get(),
+                "evidence": {
+                    "provider": format!("{:?}", evidence.provider),
+                    "source": evidence.source,
+                    "source_at": evidence.source_at,
+                    "observed_at": evidence.observed_at,
+                    "batch_id": evidence.batch_id,
+                },
             }));
         }
     }
-    // ProviderTopNPair 非 GatewayBatch → evidence 取第一路 (volume_ratio)。
-    pack_ev(records, &pair.volume_ratio).map_err(DelegateError::Fetch)
+    // QueryResponse 的公共 evidence 只能承载一个真实批次；保留 volume 批次作为
+    // 传输兼容证据，双路权威 evidence 逐行保存在上面的 evidence 对象中。
+    pack_ev(records, &pair.volume_ratio)
 }
 
 // ---------- M1 扩展 (P4): 6 个新 op (proto 编号 55-60) ----------
@@ -1524,14 +1781,12 @@ async fn fetch_instrument_news(params: &Value) -> Result<Fetched, DelegateError>
         });
     }
     let mut records: Vec<Value> = Vec::new();
-    let mut source_at = String::new();
+    let mut evidence_first: Option<crate::data_gateway::BatchEvidence> = None;
     while let Some(joined) = set.join_next().await {
         let batch = joined
             .map_err(|e| FetchFailure::unknown(format!("个股新闻 task 失败: {e}")))?
             .map_err(DelegateError::Fetch)?;
-        if source_at.is_empty() {
-            source_at = source_at_of(&batch);
-        }
+        retain_single_batch_evidence(&mut evidence_first, &batch).map_err(DelegateError::Fetch)?;
         records.extend(batch.records().iter().map(|r| {
             let item = r.persistence_item();
             json!({
@@ -1549,7 +1804,7 @@ async fn fetch_instrument_news(params: &Value) -> Result<Fetched, DelegateError>
             })
         }));
     }
-    pack(records, source_at).map_err(DelegateError::Fetch)
+    pack_retained_evidence(records, evidence_first).map_err(DelegateError::Fetch)
 }
 
 /// 日内形态: IntradayShapeGateway::current_shape (逐代码, async)。
@@ -1565,14 +1820,12 @@ async fn fetch_intraday_shape(params: &Value) -> Result<Fetched, DelegateError> 
         });
     }
     let mut records: Vec<Value> = Vec::new();
-    let mut source_at = String::new();
+    let mut evidence_first: Option<crate::data_gateway::BatchEvidence> = None;
     while let Some(joined) = set.join_next().await {
         let batch = joined
             .map_err(|e| FetchFailure::unknown(format!("日内形态 task 失败: {e}")))?
             .map_err(DelegateError::Fetch)?;
-        if source_at.is_empty() {
-            source_at = source_at_of(&batch);
-        }
+        retain_single_batch_evidence(&mut evidence_first, &batch).map_err(DelegateError::Fetch)?;
         records.extend(batch.records().iter().map(|r| {
             json!({
                 "date": r.date,
@@ -1587,7 +1840,7 @@ async fn fetch_intraday_shape(params: &Value) -> Result<Fetched, DelegateError> 
             })
         }));
     }
-    pack(records, source_at).map_err(DelegateError::Fetch)
+    pack_retained_evidence(records, evidence_first).map_err(DelegateError::Fetch)
 }
 
 /// T0 证据: MagicTdxGateway::get_t0_evidence_batch (同步阻塞, 直接调用)。
@@ -1618,17 +1871,17 @@ async fn fetch_t0_evidence(params: &Value) -> Result<Fetched, DelegateError> {
         data: serde_json::to_vec(&view)
             .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(e.to_string())))?,
         source_at: batch.source_at.to_rfc3339(),
-        provider: String::new(),
-        source: String::new(),
+        observed_at: batch.observed_at.to_rfc3339(),
+        provider: format!("{:?}", ProviderId::Tdx),
+        source: "magic_tdx_t0".to_string(),
         batch_id: batch.batch_id,
     })
 }
 
 /// 复盘 outcome 日线 (P4 M3 transport seam): 服务端在 spawn_blocking 内执行
 /// 自适应抓取 (fetch_magic_tdx_outcome_adaptive — claim 台账/audit 始终留客户端,
-/// 这里只迁移 provider transport)。视图 = {"batch": to_value(DataBatch<Bar>),
-/// "attempts": to_value(Preimage), "error": {...}|null}; error 分支保留完整
-/// attempts, 客户端 convert::outcome_daily_bars 重建 OutcomeTransportFailure。
+/// 这里只迁移 provider transport)。成功视图保留 batch 与 attempts；失败时没有
+/// 可验证批次身份，直接返回 typed FetchFailure，不伪造响应 evidence。
 /// 参数: code/market/expected_bar_count/maximum_latest_n/window_start/instrument
 /// (InstrumentId 对象 round-trip)。
 async fn fetch_outcome_daily_bars(params: &Value) -> Result<Fetched, DelegateError> {
@@ -1703,37 +1956,18 @@ async fn fetch_outcome_daily_bars(params: &Value) -> Result<Fetched, DelegateErr
                 }))
                 .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(e.to_string())))?,
                 source_at: provenance.source_at().unwrap_or_default().to_string(),
+                observed_at: provenance.fetched_at().to_string(),
                 provider: format!("{:?}", ProviderId::Tdx),
                 source: provenance.source().to_string(),
                 batch_id: provenance.batch_id().unwrap_or_default().to_string(),
             })
         }
-        Err(OutcomeTransportFailure { error, attempts }) => {
-            let attempts_json = serde_json::to_value(&attempts).map_err(|e| {
-                DelegateError::Fetch(FetchFailure::unknown(format!(
-                    "outcome attempts 序列化失败: {e}"
-                )))
-            })?;
-            Ok(Fetched {
-                data: serde_json::to_vec(&json!({
-                    "batch": Value::Null,
-                    "attempts": attempts_json,
-                    "error": {
-                        "capability": error.capability(),
-                        "provider": error.provider().map(|p| format!("{:?}", p)),
-                        "audit_outcome": error.audit_outcome(),
-                        "reason_code": error.reason_code(),
-                        "retryable": error.retryable(),
-                        "message": error.message(),
-                    },
-                }))
-                .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(e.to_string())))?,
-                source_at: String::new(),
-                provider: format!("{:?}", ProviderId::Tdx),
-                source: String::new(),
-                batch_id: String::new(),
-            })
-        }
+        Err(OutcomeTransportFailure { error, attempts }) => Err(DelegateError::Fetch(
+            FetchFailure::from_gateway(error).with_message(format!(
+                "outcome transport failed after {} attempts",
+                attempts.len()
+            )),
+        )),
     }
 }
 
@@ -1744,9 +1978,8 @@ async fn fetch_upper_limit_pool_review(params: &Value) -> Result<Fetched, Delega
         .r03_upper_limit_pool(date)
         .await
         .map_err(|e| {
-            DelegateError::Fetch(FetchFailure::unknown(format!(
-                "涨停池复盘 Gateway 不可用: {e}"
-            )))
+            let message = format!("涨停池复盘 Gateway 不可用: {e}");
+            DelegateError::Fetch(FetchFailure::from_gateway(e).with_message(message))
         })?;
     let records: Vec<Value> = batch
         .records()
@@ -1766,7 +1999,396 @@ async fn fetch_upper_limit_pool_review(params: &Value) -> Result<Fetched, Delega
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_gateway::{BatchEvidence, BoardMembershipRecord, GatewayBatch};
+
+    #[test]
+    fn p01_limit_pools_request_requires_exact_upper_date_and_full_limit() {
+        let trading_date = NaiveDate::from_ymd_opt(2026, 8, 18).expect("TEST_CODE date");
+        assert_eq!(
+            resolve_limit_pools_request(&json!({
+                "kind": "Upper",
+                "trading_date": "2026-08-18",
+                "limit": 200,
+            }))
+            .expect("exact P-01 LimitPools request"),
+            trading_date
+        );
+
+        for invalid in [
+            json!({}),
+            json!({"kind": "Upper", "trading_date": "2026-08-18"}),
+            json!({"kind": "upper", "trading_date": "2026-08-18", "limit": 200}),
+            json!({"kind": "Upper", "trading_date": "2026-08-18", "limit": 199}),
+            json!({"kind": "Upper", "trading_date": "2026-08-18", "limit": 1000}),
+            json!({"kind": "Upper", "trading_date": "2026-02-30", "limit": 200}),
+            json!({"kind": "Upper", "date": "2026-08-18", "limit": 200}),
+            json!({
+                "kind": "Upper",
+                "trading_date": "2026-08-18",
+                "limit": 200,
+                "unexpected": true,
+            }),
+        ] {
+            assert!(
+                resolve_limit_pools_request(&invalid).is_err(),
+                "invalid LimitPools request must fail closed: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn br238_global_news_request_requires_exact_provider_and_limit() {
+        let cases = [
+            ("Eastmoney", GlobalNewsProvider::Eastmoney),
+            ("Cailianpress", GlobalNewsProvider::Cailianpress),
+            ("Jin10", GlobalNewsProvider::Jin10),
+            ("ThePaper", GlobalNewsProvider::ThePaper),
+        ];
+        for (wire_name, expected) in cases {
+            assert_eq!(
+                resolve_global_news_request(&json!({"provider": wire_name, "limit": 7}))
+                    .expect("registered global-news request"),
+                (expected, 7)
+            );
+        }
+
+        for invalid in [
+            json!({}),
+            json!({"provider": "Eastmoney"}),
+            json!({"limit": 7}),
+            json!({"provider": "eastmoney", "limit": 7}),
+            json!({"provider": "Eastmoney", "limit": 0}),
+            json!({"provider": "Eastmoney", "limit": 21}),
+        ] {
+            assert!(
+                resolve_global_news_request(&invalid).is_err(),
+                "invalid request must fail closed: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn br242_semantic_search_request_binds_exact_provider_query_and_limit() {
+        for (wire_name, expected) in [
+            ("Bocha", GeneralWebResearchProvider::Bocha),
+            ("Tavily", GeneralWebResearchProvider::Tavily),
+            ("SerpApi", GeneralWebResearchProvider::SerpApi),
+        ] {
+            assert_eq!(
+                resolve_semantic_search_request(&json!({
+                    "provider": wire_name,
+                    "query": "TEST_CODE 语义检索",
+                    "limit": 50,
+                }))
+                .expect("exact SemanticSearch request"),
+                (expected, "TEST_CODE 语义检索".to_string(), 50)
+            );
+        }
+
+        for invalid in [
+            json!({}),
+            json!({"query": "TEST_CODE", "limit": 1}),
+            json!({"provider": "Bocha", "limit": 1}),
+            json!({"provider": "Bocha", "query": "TEST_CODE"}),
+            json!({"provider": "bocha", "query": "TEST_CODE", "limit": 1}),
+            json!({"provider": "Bocha", "query": "", "limit": 1}),
+            json!({"provider": "Bocha", "query": "TEST_CODE", "limit": 0}),
+            json!({"provider": "Bocha", "query": "TEST_CODE", "limit": 51}),
+            json!({
+                "provider": "Bocha",
+                "query": "TEST_CODE",
+                "limit": 1,
+                "unexpected": true,
+            }),
+        ] {
+            assert!(
+                resolve_semantic_search_request(&invalid).is_err(),
+                "invalid SemanticSearch request must fail closed: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn br238_gateway_failure_classification_survives_delegate_context() {
+        let failure = FetchFailure::from_gateway(crate::data_gateway::GatewayError::unavailable(
+            "TEST_CODE_capability",
+            Some(ProviderId::Sina),
+            false,
+            "TEST_CODE_original",
+        ))
+        .with_message("TEST_CODE_context");
+        assert_eq!(failure.provider, Some(ProviderId::Sina));
+        assert_eq!(failure.reason_code, "no_verified_batch");
+        assert!(!failure.retryable);
+        assert_eq!(failure.message, "TEST_CODE_context");
+    }
+    use crate::data_gateway::{
+        capital::{ProviderTopNFact, ProviderTopNPair, ProviderTopNRequestEvidence},
+        BatchEvidence, BoardMembershipRecord, GatewayBatch,
+    };
+    use crate::magic_compat::{
+        AssetClass, Exchange, FiniteNumber, IsoDate, MarketRankingKind, MarketRankingUnit, Money,
+        NonEmptyText, PositiveU32, Price, Quantity, Ratio, RatioUnit, SourceEvidence,
+    };
+
+    fn p01_limit_pool_entry(
+        kind: LimitPoolKind,
+        trading_date: &str,
+        provider: ProviderId,
+        batch_id: &str,
+    ) -> LimitPoolEntry {
+        LimitPoolEntry {
+            kind,
+            instrument: InstrumentId::new(
+                Exchange::Shanghai,
+                "TEST_CODE_600001",
+                AssetClass::Equity,
+            )
+            .expect("TEST_CODE instrument"),
+            trading_date: IsoDate::new(trading_date).expect("TEST_CODE trading date"),
+            price: Price::new(10.25).expect("positive price"),
+            change: Ratio::new(10.0, RatioUnit::Percent).expect("finite change"),
+            volume: Some(Quantity::new(12_300.0).expect("non-negative volume")),
+            turnover: Some(Ratio::new(3.5, RatioUnit::Percent).expect("finite turnover")),
+            sealed_amount: Some(Money::new(8_800_000.0).expect("finite amount")),
+            first_seal_at: Some(
+                NonEmptyText::new("2026-08-18T09:31:00+08:00").expect("first seal"),
+            ),
+            last_seal_at: Some(NonEmptyText::new("2026-08-18T10:02:00+08:00").expect("last seal")),
+            break_count: Some(1),
+            streak: Some(PositiveU32::new(2).expect("positive streak")),
+            industry: Some(NonEmptyText::new("TEST_CODE industry").expect("industry")),
+            board_name: Some(NonEmptyText::new("TEST_CODE board").expect("board")),
+            seal_state: Some(NonEmptyText::new("TEST_CODE sealed").expect("seal state")),
+            reseal_count: Some(1),
+            reason: Some(NonEmptyText::new("TEST_CODE reason").expect("reason")),
+            evidence: SourceEvidence::new(provider, "2026-08-18T10:03:00+08:00", batch_id)
+                .expect("record evidence")
+                .with_source_at(trading_date)
+                .expect("record source date"),
+        }
+    }
+
+    #[test]
+    fn p01_limit_pools_pack_retains_full_entry_and_original_batch_envelope() {
+        let trading_date = NaiveDate::from_ymd_opt(2026, 8, 18).expect("TEST_CODE date");
+        let batch_id = "TEST_CODE_LIMIT_POOL_BATCH";
+        let entry = p01_limit_pool_entry(
+            LimitPoolKind::Upper,
+            "2026-08-18",
+            ProviderId::Eastmoney,
+            batch_id,
+        );
+        let batch = GatewayBatch::Available {
+            records: vec![entry.clone()],
+            evidence: BatchEvidence {
+                provider: ProviderId::Eastmoney,
+                source: "TEST_CODE_eastmoney_limit_pool".to_string(),
+                source_at: Some("2026-08-18".to_string()),
+                observed_at: "2026-08-18T10:03:00+08:00".to_string(),
+                batch_id: batch_id.to_string(),
+            },
+        };
+
+        let packed = pack_limit_pool_batch(&batch, trading_date, 200)
+            .expect("valid full LimitPoolEntry batch");
+        let decoded: Vec<LimitPoolEntry> =
+            serde_json::from_slice(&packed.data).expect("full LimitPoolEntry wire batch");
+
+        assert_eq!(decoded, vec![entry]);
+        assert_eq!(packed.provider, "Eastmoney");
+        assert_eq!(packed.source, "TEST_CODE_eastmoney_limit_pool");
+        assert_eq!(packed.source_at, "2026-08-18");
+        assert_eq!(packed.observed_at, "2026-08-18T10:03:00+08:00");
+        assert_eq!(packed.batch_id, batch_id);
+    }
+
+    #[test]
+    fn p01_limit_pools_pack_rejects_count_date_kind_and_evidence_conflicts() {
+        let trading_date = NaiveDate::from_ymd_opt(2026, 8, 18).expect("TEST_CODE date");
+        let batch_id = "TEST_CODE_LIMIT_POOL_BATCH";
+        let evidence = BatchEvidence {
+            provider: ProviderId::Eastmoney,
+            source: "TEST_CODE_eastmoney_limit_pool".to_string(),
+            source_at: Some("2026-08-18".to_string()),
+            observed_at: "2026-08-18T10:03:00+08:00".to_string(),
+            batch_id: batch_id.to_string(),
+        };
+        let valid = p01_limit_pool_entry(
+            LimitPoolKind::Upper,
+            "2026-08-18",
+            ProviderId::Eastmoney,
+            batch_id,
+        );
+
+        let mut wrong_date = valid.clone();
+        wrong_date.trading_date = IsoDate::new("2026-08-17").expect("TEST_CODE prior date");
+        let mut wrong_kind = valid.clone();
+        wrong_kind.kind = LimitPoolKind::Broken;
+        let mut wrong_evidence = valid.clone();
+        wrong_evidence.evidence = SourceEvidence::new(
+            ProviderId::Eastmoney,
+            "2026-08-18T10:03:00+08:00",
+            "TEST_CODE_OTHER_BATCH",
+        )
+        .expect("conflicting evidence")
+        .with_source_at("2026-08-18")
+        .expect("conflicting source date");
+        let mut wrong_envelope_date = evidence.clone();
+        wrong_envelope_date.source_at = Some("2026-08-17".to_string());
+
+        let conflicts = [
+            (
+                "count",
+                GatewayBatch::Available {
+                    records: vec![valid.clone(); 201],
+                    evidence: evidence.clone(),
+                },
+            ),
+            (
+                "envelope-date",
+                GatewayBatch::Available {
+                    records: vec![valid.clone()],
+                    evidence: wrong_envelope_date,
+                },
+            ),
+            (
+                "date",
+                GatewayBatch::Available {
+                    records: vec![wrong_date],
+                    evidence: evidence.clone(),
+                },
+            ),
+            (
+                "kind",
+                GatewayBatch::Available {
+                    records: vec![wrong_kind],
+                    evidence: evidence.clone(),
+                },
+            ),
+            (
+                "evidence",
+                GatewayBatch::Available {
+                    records: vec![wrong_evidence],
+                    evidence,
+                },
+            ),
+        ];
+
+        for (conflict, batch) in conflicts {
+            let Err(failure) = pack_limit_pool_batch(&batch, trading_date, 200) else {
+                panic!("request-bound LimitPools {conflict} conflict must fail closed");
+            };
+            assert_eq!(failure.reason_code, "invalid_evidence", "{conflict}");
+            assert!(!failure.retryable, "{conflict}");
+        }
+    }
+
+    fn provider_top_n_side(
+        metric: MarketRankingKind,
+        unit: MarketRankingUnit,
+        code: &str,
+        batch_id: &str,
+    ) -> GatewayBatch<ProviderTopNFact> {
+        GatewayBatch::Available {
+            records: vec![ProviderTopNFact {
+                metric,
+                source_order_ordinal: PositiveU32::new(1).expect("positive ordinal"),
+                instrument: InstrumentId::new(Exchange::Shanghai, code, AssetClass::Equity)
+                    .expect("test instrument"),
+                label: NonEmptyText::new(format!("TEST_CODE_{code}")).expect("non-empty label"),
+                value: FiniteNumber::new(1.0).expect("finite value"),
+                unit,
+                trading_date: IsoDate::new("2026-08-17").expect("ISO date"),
+                filter_identity: NonEmptyText::new("TEST_CODE_A_SHARE_FILTER")
+                    .expect("non-empty filter"),
+                provider_declared_total: PositiveU32::new(2).expect("positive total"),
+                inspected_row_count: PositiveU32::new(1).expect("positive row count"),
+            }],
+            evidence: BatchEvidence {
+                provider: ProviderId::Eastmoney,
+                source: "eastmoney-web".to_string(),
+                source_at: None,
+                observed_at: "2026-08-17T15:36:00+08:00".to_string(),
+                batch_id: batch_id.to_string(),
+            },
+        }
+    }
+
+    fn provider_top_n_request(metric: MarketRankingKind) -> ProviderTopNRequestEvidence {
+        ProviderTopNRequestEvidence {
+            metric,
+            trading_date: IsoDate::new("2026-08-17").expect("ISO date"),
+            limit: PositiveU32::new(20).expect("positive limit"),
+            filter_identity: NonEmptyText::new("TEST_CODE_A_SHARE_FILTER")
+                .expect("non-empty filter"),
+            request_hash: "TEST_CODE_REQUEST_HASH".to_string(),
+        }
+    }
+
+    #[test]
+    fn br240_provider_top_n_pack_retains_both_real_batch_evidences() {
+        let volume_batch_id = "TEST_CODE_REAL_VOLUME_BATCH";
+        let inflow_batch_id = "TEST_CODE_REAL_INFLOW_BATCH";
+        let pair = ProviderTopNPair {
+            volume_ratio_request: provider_top_n_request(MarketRankingKind::VolumeRatio),
+            volume_ratio: provider_top_n_side(
+                MarketRankingKind::VolumeRatio,
+                MarketRankingUnit::Multiple,
+                "TEST_CODE_600001",
+                volume_batch_id,
+            ),
+            main_net_inflow_request: provider_top_n_request(MarketRankingKind::MainNetInflow),
+            main_net_inflow: provider_top_n_side(
+                MarketRankingKind::MainNetInflow,
+                MarketRankingUnit::Yuan,
+                "TEST_CODE_600002",
+                inflow_batch_id,
+            ),
+        };
+
+        let packed = pack_provider_top_n_pair(&pair).expect("two real evidence batches");
+        let rows: Vec<Value> = serde_json::from_slice(&packed.data).expect("canonical rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["evidence"]["batch_id"], volume_batch_id);
+        assert_eq!(rows[1]["evidence"]["batch_id"], inflow_batch_id);
+        assert_ne!(
+            rows[0]["evidence"]["batch_id"],
+            rows[1]["evidence"]["batch_id"]
+        );
+        for row in rows {
+            assert_eq!(row["evidence"]["provider"], "Eastmoney");
+            assert_eq!(row["evidence"]["source"], "eastmoney-web");
+            assert_eq!(row["evidence"]["source_at"], Value::Null);
+            assert_eq!(row["evidence"]["observed_at"], "2026-08-17T15:36:00+08:00");
+        }
+    }
+
+    #[test]
+    fn br240_provider_top_n_pack_rejects_identical_batch_ids() {
+        let duplicate_batch_id = "TEST_CODE_DUPLICATE_REAL_BATCH";
+        let pair = ProviderTopNPair {
+            volume_ratio_request: provider_top_n_request(MarketRankingKind::VolumeRatio),
+            volume_ratio: provider_top_n_side(
+                MarketRankingKind::VolumeRatio,
+                MarketRankingUnit::Multiple,
+                "TEST_CODE_600001",
+                duplicate_batch_id,
+            ),
+            main_net_inflow_request: provider_top_n_request(MarketRankingKind::MainNetInflow),
+            main_net_inflow: provider_top_n_side(
+                MarketRankingKind::MainNetInflow,
+                MarketRankingUnit::Yuan,
+                "TEST_CODE_600002",
+                duplicate_batch_id,
+            ),
+        };
+
+        let Err(failure) = pack_provider_top_n_pair(&pair) else {
+            panic!("duplicate IDs must fail closed");
+        };
+        assert_eq!(failure.reason_code, "invalid_evidence");
+        assert!(!failure.retryable);
+    }
 
     #[test]
     fn single_code_membership_pack_preserves_batch_identity() {
@@ -1791,6 +2413,16 @@ mod tests {
         assert_eq!(packed.provider, "Tdx");
         assert_eq!(packed.source, "tdx");
         assert_eq!(packed.batch_id, "TEST_CODE_MEMBERSHIP_BATCH_1");
+        assert_eq!(packed.observed_at, "2026-08-17T09:20:01+08:00");
+    }
+
+    #[test]
+    fn production_delegates_do_not_use_identity_erasing_pack() {
+        let source = include_str!("delegate.rs");
+        let forbidden_definition = ["fn pack", "(records"].concat();
+        let forbidden_call = ["pack", "(records,"].concat();
+        assert!(!source.contains(&forbidden_definition));
+        assert!(!source.contains(&forbidden_call));
     }
 
     #[tokio::test]
@@ -1804,6 +2436,6 @@ mod tests {
         let Err(DelegateError::Params(error)) = result else {
             panic!("multi-code membership request must fail before acquisition");
         };
-        assert!(error.to_string().contains("BR-231"));
+        assert!(error.to_string().contains("BR-238"));
     }
 }

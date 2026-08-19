@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt;
 
-pub const UPSTREAM_REVISION: &str = "5f1ce93656a55854c844065390520cd4aecd9a14";
+pub const UPSTREAM_REVISION: &str = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e";
 pub const AMENDMENT_DESIGN_SHA256: &str =
     "5c36c4a9d8b871de524186e9939717b8d888c15b06ac9543b9bec215796bc906";
 pub const OUTCOME_PARENT_DESIGN_SHA256: &str =
@@ -8875,7 +8875,7 @@ mod tests {
         artifact.validate().unwrap();
         assert_eq!(
             artifact.artifact_content_hash().unwrap(),
-            "789b7d87085e5181e34cab279c3aaed6f0db5043375d7a620efa4d3cb35057d3"
+            "f48cd7c51daeb0b15632e3dd977727203d7ef83ff6854b445d0229939edb608d"
         );
         let json = canonical_json(&artifact).unwrap();
         assert!(json.contains("\"provider_endpoint_evidence\":null"));

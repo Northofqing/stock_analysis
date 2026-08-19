@@ -161,7 +161,7 @@ impl BoardDataGateway {
         limit: u32,
     ) -> Result<GatewayBatch<BoardDirectoryFact>, GatewayError> {
         let request_hash =
-            acquisition_request_hash(DIRECTORY_CAPABILITY, &format!("{kind:?}:{limit}"));
+            acquisition_request_hash(DIRECTORY_CAPABILITY, format!("{kind:?}:{limit}"));
         // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
         match super::grpc_source::bridge_for("BoardDirectory") {
             Ok(Some(bridge)) => {
@@ -300,7 +300,7 @@ impl BoardDataGateway {
     ) -> Result<GatewayBatch<BoardMembershipRecord>, GatewayError> {
         let code = validate_code(code, MEMBERSHIP_CAPABILITY)?.to_owned();
         let request_hash = acquisition_request_hash(MEMBERSHIP_CAPABILITY, &code);
-        // BR-231: 同步消费者复用与 async memberships 完全相同的 gRPC
+        // BR-238: 同步消费者复用与 async memberships 完全相同的 gRPC
         // acquisition + audit 分支；桥失败显式返回，绝不降级 library。
         match super::grpc_source::bridge_for("BoardConstituents") {
             Ok(Some(bridge)) => {
@@ -351,7 +351,7 @@ impl BoardDataGateway {
         limit: u32,
     ) -> Result<GatewayBatch<BoardFlowFact>, GatewayError> {
         let request_hash =
-            acquisition_request_hash(FLOW_CAPABILITY, &format!("{kind:?}:Day1:{limit}"));
+            acquisition_request_hash(FLOW_CAPABILITY, format!("{kind:?}:Day1:{limit}"));
         // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
         match super::grpc_source::bridge_for("BoardFlows") {
             Ok(Some(bridge)) => {
@@ -423,7 +423,7 @@ impl BoardDataGateway {
         limit: u32,
     ) -> Result<GatewayBatch<BoardFlowFact>, GatewayError> {
         let request_hash =
-            acquisition_request_hash(FLOW_CAPABILITY, &format!("{kind:?}:Day1:{limit}"));
+            acquisition_request_hash(FLOW_CAPABILITY, format!("{kind:?}:Day1:{limit}"));
         // P4 M3: gRPC 桥 (同步路径, spawn_blocking 内调用 → block_on)。
         match super::grpc_source::bridge_for("BoardFlows") {
             Ok(Some(bridge)) => {

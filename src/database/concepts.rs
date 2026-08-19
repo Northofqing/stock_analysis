@@ -21,7 +21,7 @@ struct ConceptRow {
 }
 
 /// chain_daily 行：某日某主线簇。
-#[derive(QueryableByName)]
+#[derive(Debug, Clone, PartialEq, Eq, QueryableByName)]
 pub struct ChainDailyRow {
     #[diesel(sql_type = Text)]
     pub date: String,
@@ -198,6 +198,59 @@ impl DatabaseManager {
         .map_err(|error| format!("主线批量落库失败: {error}"))
     }
 
+    /// BR-241: 原子替换指定证据日的完整 P-01 主线投影。
+    ///
+    /// 删除和插入位于同一事务；任一行失败时不会留下部分投影。同日旧概念不会
+    /// 混入本次由 exact LimitPools 批次派生的结果。
+    pub fn replace_chain_clusters_for_date_strict(
+        &self,
+        date: chrono::NaiveDate,
+        clusters: &[(String, Vec<String>, i32)],
+    ) -> Result<(), String> {
+        let date = date.format("%Y-%m-%d").to_string();
+        let mut concepts = std::collections::HashSet::with_capacity(clusters.len());
+        let mut encoded = Vec::with_capacity(clusters.len());
+        for (concept, codes, continuation_count) in clusters {
+            if concept.trim().is_empty()
+                || codes.is_empty()
+                || codes.iter().any(|code| code.trim().is_empty())
+                || *continuation_count < 0
+            {
+                return Err(format!(
+                    "P-01 exact-date 主线行非法: concept={concept:?} continuation_count={continuation_count}"
+                ));
+            }
+            if !concepts.insert(concept.as_str()) {
+                return Err(format!("P-01 exact-date 主线概念重复: {concept}"));
+            }
+            let stocks = serde_json::to_string(codes)
+                .map_err(|error| format!("序列化 P-01 主线 {concept} 失败: {error}"))?;
+            encoded.push((concept, stocks, *continuation_count));
+        }
+
+        let mut conn = self
+            .get_conn()
+            .map_err(|error| format!("P-01 exact-date 主线替换获取连接失败: {error}"))?;
+        conn.transaction::<_, diesel::result::Error, _>(|tx| {
+            diesel::sql_query("DELETE FROM chain_daily WHERE date = ?")
+                .bind::<Text, _>(&date)
+                .execute(tx)?;
+            for (concept, stocks, continuation_count) in &encoded {
+                diesel::sql_query(
+                    "INSERT INTO chain_daily (date, concept, stocks, continuation_count) \
+                     VALUES (?, ?, ?, ?)",
+                )
+                .bind::<Text, _>(&date)
+                .bind::<Text, _>(*concept)
+                .bind::<Text, _>(stocks)
+                .bind::<Integer, _>(*continuation_count)
+                .execute(tx)?;
+            }
+            Ok(())
+        })
+        .map_err(|error| format!("P-01 exact-date 主线原子替换失败: {error}"))
+    }
+
     /// 读取最近一个有记录日期的主线簇（含当天）。
     pub fn get_latest_chain_clusters(&self) -> Vec<ChainDailyRow> {
         match self.get_latest_chain_clusters_strict() {
@@ -223,6 +276,27 @@ impl DatabaseManager {
         )
         .load(&mut conn)
         .map_err(|error| format!("查询 chain_daily 失败: {error}"))
+    }
+
+    /// BR-241: 严格读取指定证据日的 P-01 主线投影。
+    ///
+    /// 空集表示该日期没有已持久化投影；连接或查询失败保持显式错误。调用方不得
+    /// 把空集或其他日期的最新行改标为指定日期证据。
+    pub fn get_chain_clusters_for_date_strict(
+        &self,
+        date: chrono::NaiveDate,
+    ) -> Result<Vec<ChainDailyRow>, String> {
+        let date = date.format("%Y-%m-%d").to_string();
+        let mut conn = self
+            .get_conn()
+            .map_err(|error| format!("获取 exact-date chain_daily 数据库连接失败: {error}"))?;
+        diesel::sql_query(
+            "SELECT date, concept, stocks, continuation_count FROM chain_daily \
+             WHERE date = ? ORDER BY continuation_count DESC, concept ASC",
+        )
+        .bind::<Text, _>(&date)
+        .load(&mut conn)
+        .map_err(|error| format!("查询 exact-date chain_daily {date} 失败: {error}"))
     }
 
     /// BR-195: 严格查询某概念主线在截至 `as_of` 的最近 N 个自然日内出现的天数。
@@ -599,6 +673,62 @@ mod tests {
             !got.iter().any(|r| r.board_code == "B002_OLD"),
             "get_latest 应只返回最新 date 的 row, 不返 2020 的 stale 数据"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn p01_chain_read_uses_requested_date_not_max_date() {
+        DatabaseManager::init(None).expect("test database init");
+        let requested = "2198-12-30".to_string();
+        let later = "2198-12-31".to_string();
+        let _requested_guard = ConceptsGuard {
+            code: "TEST_CODE_P01_REQUESTED".to_string(),
+            chain_date: requested.clone(),
+            simhashes: Vec::new(),
+        };
+        let _later_guard = ConceptsGuard {
+            code: "TEST_CODE_P01_LATER".to_string(),
+            chain_date: later.clone(),
+            simhashes: Vec::new(),
+        };
+        let db = DatabaseManager::get();
+        db.save_chain_clusters(
+            &requested,
+            &[
+                (
+                    "TEST_CODE_P01_SECOND".to_string(),
+                    vec!["TEST_CODE_000002".to_string()],
+                    1,
+                ),
+                (
+                    "TEST_CODE_P01_FIRST".to_string(),
+                    vec!["TEST_CODE_000001".to_string()],
+                    3,
+                ),
+            ],
+        )
+        .expect("save requested-date P-01 chain rows");
+        db.save_chain_clusters(
+            &later,
+            &[(
+                "TEST_CODE_P01_STALE_MAX".to_string(),
+                vec!["TEST_CODE_000003".to_string()],
+                9,
+            )],
+        )
+        .expect("save later chain row");
+
+        let rows = db
+            .get_chain_clusters_for_date_strict(
+                chrono::NaiveDate::parse_from_str(&requested, "%Y-%m-%d")
+                    .expect("valid requested date"),
+            )
+            .expect("exact-date P-01 chain read");
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.date == requested));
+        assert_eq!(rows[0].concept, "TEST_CODE_P01_FIRST");
+        assert_eq!(rows[1].concept, "TEST_CODE_P01_SECOND");
     }
 
     #[test]

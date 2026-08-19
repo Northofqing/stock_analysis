@@ -189,6 +189,13 @@ pub struct AuditDispatcher {
     chain_state: Mutex<AuditChainState>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExactAuthorityAppendError {
+    Duplicate { envelope_id: String },
+    Persistence(String),
+    Verification(String),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AuditObjectIdentity {
     device: u64,
@@ -438,25 +445,31 @@ impl AuditDispatcher {
             // have extended the chain since this dispatcher last wrote.
             let json_name = format!("{year}.jsonl");
             let path = self.base_dir.join(&json_name);
-            let (mut file, json_identity) =
-                open_or_create_audit_file(capability, OsStr::new(&json_name), true)?;
-            let previous_hash = validate_existing_chain_file(&file, &path)?
+            let (read_file, read_identity) =
+                open_or_create_read_only_audit_file(capability, OsStr::new(&json_name))?;
+            let previous_hash = validate_existing_chain_file(&read_file, &path)?
                 .unwrap_or_else(|| "GENESIS".to_string());
-            let mut record = serde_json::json!({
-                "envelope": envelope,
-                "hash_domain": DELIVERY_AUDIT_RECORD_HASH_DOMAIN,
-                "previous_hash": previous_hash,
-            });
-            let record_hash = calculate_record_hash(&record)?;
-            record.as_object_mut().expect("json object literal").insert(
-                "record_hash".to_string(),
-                serde_json::Value::String(record_hash.clone()),
-            );
-            let mut line = serde_json::to_vec(&record)
-                .map_err(|error| format!("serialize audit line: {error}"))?;
-            line.push(b'\n');
+            let prepared = prepare_canonical_audit_line(envelope, &previous_hash)?;
+            drop(read_file);
 
-            file.write_all(&line)
+            let (mut file, json_identity) =
+                open_existing_audit_file(capability, OsStr::new(&json_name), true)?;
+            if read_identity != json_identity {
+                return Err(format!(
+                    "audit identity changed before append: {}",
+                    path.display()
+                ));
+            }
+            let observed_previous_hash =
+                validate_existing_chain_file(&file, &path)?.unwrap_or_else(|| "GENESIS".to_owned());
+            if observed_previous_hash != prepared.previous_hash {
+                return Err(format!(
+                    "audit chain changed before append: {}",
+                    path.display()
+                ));
+            }
+
+            file.write_all(&prepared.bytes)
                 .map_err(|error| format!("append {}: {error}", path.display()))?;
             file.flush()
                 .map_err(|error| format!("flush {}: {error}", path.display()))?;
@@ -480,6 +493,204 @@ impl AuditDispatcher {
                 Err(error)
             }
         }
+    }
+
+    /// Atomically append one schema-v5 transactional or schema-v6 NewsFlash
+    /// authority and prove its exact persisted cardinality before returning.
+    /// The pre-append same-ID check and post-sync reread share the writer's
+    /// retained root, process mutex and kernel lock, so a competing process
+    /// cannot mint a second receipt for the same authority identity.
+    pub(crate) fn append_exact_news_flash_authority(
+        &self,
+        envelope: &EventEnvelope,
+    ) -> Result<super::push_record::PushRecord, ExactAuthorityAppendError> {
+        use fs2::FileExt;
+
+        let expected_record = super::push_record::PushRecord::try_from_authoritative(envelope)
+            .map_err(|error| ExactAuthorityAppendError::Verification(error.to_string()))?;
+        let valid_news_flash_authority = match expected_record.audit_schema_version {
+            Some(super::envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION) => {
+                expected_record.news_flash_transaction_stage.is_some()
+            }
+            Some(super::envelope::NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION) => true,
+            _ => false,
+        };
+        if !valid_news_flash_authority {
+            return Err(ExactAuthorityAppendError::Verification(
+                "exact NewsFlash append requires transactional schema-v5 or schema-v6".into(),
+            ));
+        }
+        let expected_value = serde_json::to_value(envelope).map_err(|error| {
+            ExactAuthorityAppendError::Verification(format!(
+                "serialize expected NewsFlash envelope: {error}"
+            ))
+        })?;
+        let expected_bytes = serde_json::to_vec(&expected_value).map_err(|error| {
+            ExactAuthorityAppendError::Verification(format!(
+                "canonicalize expected NewsFlash envelope: {error}"
+            ))
+        })?;
+        let year = envelope.ts.format("%Y").to_string();
+        let mut state = self.chain_state.lock().map_err(|_| {
+            ExactAuthorityAppendError::Persistence("audit chain state lock poisoned".into())
+        })?;
+        if let Some(reason) = state.poisoned.as_deref() {
+            return Err(ExactAuthorityAppendError::Persistence(format!(
+                "audit chain is poisoned after an earlier persistence failure: {reason}"
+            )));
+        }
+
+        let result = (|| {
+            let capability = self
+                .capability
+                .as_ref()
+                .map_err(|error| ExactAuthorityAppendError::Persistence(error.clone()))?;
+            let _process_guard = audit_process_mutex().lock().map_err(|_| {
+                ExactAuthorityAppendError::Persistence("audit process mutex poisoned".into())
+            })?;
+            capability
+                .validate_complete_chain()
+                .map_err(ExactAuthorityAppendError::Persistence)?;
+            let lock_name = format!("{year}.lock");
+            let (lock_file, lock_identity) =
+                open_or_create_audit_file(capability, OsStr::new(&lock_name), false)
+                    .map_err(ExactAuthorityAppendError::Persistence)?;
+            FileExt::lock_exclusive(&lock_file).map_err(|error| {
+                ExactAuthorityAppendError::Persistence(format!(
+                    "lock exact NewsFlash audit {lock_name}: {error}"
+                ))
+            })?;
+            capability
+                .validate_complete_chain()
+                .map_err(ExactAuthorityAppendError::Persistence)?;
+            revalidate_audit_leaf(capability, OsStr::new(&lock_name), &lock_identity)
+                .map_err(ExactAuthorityAppendError::Persistence)?;
+
+            let json_name = format!("{year}.jsonl");
+            let path = self.base_dir.join(&json_name);
+            let (read_file, read_identity) =
+                open_or_create_read_only_audit_file(capability, OsStr::new(&json_name))
+                    .map_err(ExactAuthorityAppendError::Persistence)?;
+            let previous_hash = validate_existing_chain_file(&read_file, &path)
+                .map_err(ExactAuthorityAppendError::Persistence)?
+                .unwrap_or_else(|| "GENESIS".to_owned());
+            let before = count_exact_envelope(&read_file, &path, &envelope.id, &expected_bytes)
+                .map_err(ExactAuthorityAppendError::Persistence)?;
+            if before.exact != 0 || before.same_id_mismatch != 0 {
+                revalidate_audit_leaf(capability, OsStr::new(&json_name), &read_identity)
+                    .map_err(ExactAuthorityAppendError::Persistence)?;
+                FileExt::unlock(&lock_file).map_err(|error| {
+                    ExactAuthorityAppendError::Persistence(format!(
+                        "unlock duplicate NewsFlash audit {lock_name}: {error}"
+                    ))
+                })?;
+                return Err(ExactAuthorityAppendError::Duplicate {
+                    envelope_id: envelope.id.clone(),
+                });
+            }
+
+            // ENGINEERING_RULES_V2 §4.3: build, hash, serialize and validate
+            // the complete canonical record before opening an append-capable
+            // handle to the yearly authority.
+            let prepared = prepare_canonical_audit_line(envelope, &previous_hash)
+                .map_err(ExactAuthorityAppendError::Persistence)?;
+            drop(read_file);
+            let (mut file, json_identity) =
+                open_existing_audit_file(capability, OsStr::new(&json_name), true)
+                    .map_err(ExactAuthorityAppendError::Persistence)?;
+            if read_identity != json_identity {
+                return Err(ExactAuthorityAppendError::Persistence(format!(
+                    "exact NewsFlash audit identity changed before append: {}",
+                    path.display()
+                )));
+            }
+            let observed_previous_hash = validate_existing_chain_file(&file, &path)
+                .map_err(ExactAuthorityAppendError::Persistence)?
+                .unwrap_or_else(|| "GENESIS".to_owned());
+            if observed_previous_hash != prepared.previous_hash {
+                return Err(ExactAuthorityAppendError::Persistence(format!(
+                    "exact NewsFlash audit chain changed before append: {}",
+                    path.display()
+                )));
+            }
+            let observed_before = count_exact_envelope(&file, &path, &envelope.id, &expected_bytes)
+                .map_err(ExactAuthorityAppendError::Persistence)?;
+            if observed_before.exact != 0 || observed_before.same_id_mismatch != 0 {
+                revalidate_audit_leaf(capability, OsStr::new(&json_name), &json_identity)
+                    .map_err(ExactAuthorityAppendError::Persistence)?;
+                FileExt::unlock(&lock_file).map_err(|error| {
+                    ExactAuthorityAppendError::Persistence(format!(
+                        "unlock duplicate NewsFlash audit {lock_name}: {error}"
+                    ))
+                })?;
+                return Err(ExactAuthorityAppendError::Duplicate {
+                    envelope_id: envelope.id.clone(),
+                });
+            }
+            file.write_all(&prepared.bytes).map_err(|error| {
+                ExactAuthorityAppendError::Persistence(format!(
+                    "append exact NewsFlash audit {}: {error}",
+                    path.display()
+                ))
+            })?;
+            file.flush().map_err(|error| {
+                ExactAuthorityAppendError::Persistence(format!(
+                    "flush exact NewsFlash audit {}: {error}",
+                    path.display()
+                ))
+            })?;
+            file.sync_all().map_err(|error| {
+                ExactAuthorityAppendError::Persistence(format!(
+                    "sync exact NewsFlash audit {}: {error}",
+                    path.display()
+                ))
+            })?;
+            capability.root().sync_all().map_err(|error| {
+                ExactAuthorityAppendError::Persistence(format!(
+                    "sync exact NewsFlash audit root {}: {error}",
+                    self.base_dir.display()
+                ))
+            })?;
+            validate_existing_chain_file(&file, &path)
+                .map_err(ExactAuthorityAppendError::Verification)?;
+            let after = count_exact_envelope(&file, &path, &envelope.id, &expected_bytes)
+                .map_err(ExactAuthorityAppendError::Verification)?;
+            if after.exact != 1 || after.same_id_mismatch != 0 {
+                return Err(ExactAuthorityAppendError::Verification(format!(
+                    "NewsFlash authority cardinality mismatch: id={} exact={} mismatched={}",
+                    envelope.id, after.exact, after.same_id_mismatch
+                )));
+            }
+            capability
+                .validate_complete_chain()
+                .map_err(ExactAuthorityAppendError::Verification)?;
+            revalidate_audit_leaf(capability, OsStr::new(&lock_name), &lock_identity)
+                .map_err(ExactAuthorityAppendError::Verification)?;
+            revalidate_audit_leaf(capability, OsStr::new(&json_name), &json_identity)
+                .map_err(ExactAuthorityAppendError::Verification)?;
+            FileExt::unlock(&lock_file).map_err(|error| {
+                ExactAuthorityAppendError::Verification(format!(
+                    "unlock exact NewsFlash audit {lock_name}: {error}"
+                ))
+            })?;
+            Ok(expected_record)
+        })();
+        if let Err(error) = &result {
+            if !matches!(error, ExactAuthorityAppendError::Duplicate { .. }) {
+                let reason = match error {
+                    ExactAuthorityAppendError::Persistence(reason)
+                    | ExactAuthorityAppendError::Verification(reason) => reason.clone(),
+                    ExactAuthorityAppendError::Duplicate { .. } => unreachable!(),
+                };
+                state.poisoned = Some(reason.clone());
+                state.health = AuditHealth::Degraded {
+                    reason_code: reason,
+                };
+            }
+        } else {
+            self.handled_count.fetch_add(1, Ordering::SeqCst);
+        }
+        result
     }
 
     /// Re-open the retained BR-192 authority and prove that exactly one
@@ -570,6 +781,160 @@ impl AuditDispatcher {
             ));
         }
         Ok(expected_record)
+    }
+
+    /// Read one year's authoritative envelopes under the same retained-root,
+    /// full-chain and cross-process lock used by append. This never creates or
+    /// writes the JSONL authority; the lock file is the existing coordination
+    /// seam shared with writers.
+    pub(crate) fn read_authoritative_year(&self, year: i32) -> Result<Vec<EventEnvelope>, String> {
+        use fs2::FileExt;
+
+        let capability = self.capability.as_ref().map_err(Clone::clone)?;
+        let _process_guard = audit_process_mutex()
+            .lock()
+            .map_err(|_| "audit process mutex poisoned".to_owned())?;
+        capability.validate_complete_chain()?;
+        let lock_name = format!("{year}.lock");
+        let (lock, lock_identity) =
+            open_or_create_audit_file(capability, OsStr::new(&lock_name), false)?;
+        FileExt::lock_exclusive(&lock)
+            .map_err(|error| format!("lock NewsFlash reconcile {lock_name}: {error}"))?;
+        capability.validate_complete_chain()?;
+        revalidate_audit_leaf(capability, OsStr::new(&lock_name), &lock_identity)?;
+
+        let json_name = format!("{year}.jsonl");
+        let path = self.base_dir.join(&json_name);
+        let (jsonl, json_identity) =
+            open_existing_audit_file(capability, OsStr::new(&json_name), false)?;
+        validate_existing_chain_file(&jsonl, &path)?;
+        let mut reader = jsonl
+            .try_clone()
+            .map_err(|error| format!("clone NewsFlash reconcile {}: {error}", path.display()))?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| format!("seek NewsFlash reconcile {}: {error}", path.display()))?;
+        let mut content = String::new();
+        reader
+            .read_to_string(&mut content)
+            .map_err(|error| format!("read NewsFlash reconcile {}: {error}", path.display()))?;
+        let mut envelopes = Vec::new();
+        for (index, line) in content.lines().enumerate() {
+            let record: serde_json::Value = serde_json::from_str(line).map_err(|error| {
+                format!("parse NewsFlash reconcile line {}: {error}", index + 1)
+            })?;
+            let envelope: EventEnvelope =
+                serde_json::from_value(record.get("envelope").cloned().ok_or_else(|| {
+                    format!("NewsFlash reconcile line {} missing envelope", index + 1)
+                })?)
+                .map_err(|error| {
+                    format!(
+                        "decode NewsFlash reconcile line {} envelope: {error}",
+                        index + 1
+                    )
+                })?;
+            let audit_schema_version = envelope
+                .payload
+                .get("audit_schema_version")
+                .and_then(serde_json::Value::as_u64);
+            if audit_schema_version
+                == Some(u64::from(
+                    super::envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION,
+                ))
+            {
+                super::push_record::PushRecord::try_from_authoritative(&envelope).map_err(
+                    |error| format!("validate NewsFlash reconcile line {}: {error}", index + 1),
+                )?;
+            }
+            envelopes.push(envelope);
+        }
+        capability.validate_complete_chain()?;
+        revalidate_audit_leaf(capability, OsStr::new(&lock_name), &lock_identity)?;
+        revalidate_audit_leaf(capability, OsStr::new(&json_name), &json_identity)?;
+        FileExt::unlock(&lock)
+            .map_err(|error| format!("unlock NewsFlash reconcile {lock_name}: {error}"))?;
+        Ok(envelopes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persist_legacy_envelope_for_test(
+        &self,
+        envelope: &EventEnvelope,
+    ) -> Result<(), String> {
+        use fs2::FileExt;
+
+        super::push_record::PushRecord::try_from(envelope)
+            .map_err(|error| format!("invalid legacy delivery audit: {error}"))?;
+        let year = envelope.ts.format("%Y").to_string();
+        let mut state = self
+            .chain_state
+            .lock()
+            .map_err(|_| "audit chain state lock poisoned".to_owned())?;
+        if let Some(reason) = state.poisoned.as_deref() {
+            return Err(format!(
+                "audit chain is poisoned after an earlier persistence failure: {reason}"
+            ));
+        }
+        let result = (|| {
+            let capability = self.capability.as_ref().map_err(Clone::clone)?;
+            let _process_guard = audit_process_mutex()
+                .lock()
+                .map_err(|_| "audit process mutex poisoned".to_owned())?;
+            capability.validate_complete_chain()?;
+            let lock_name = format!("{year}.lock");
+            let (lock_file, lock_identity) =
+                open_or_create_audit_file(capability, OsStr::new(&lock_name), false)?;
+            FileExt::lock_exclusive(&lock_file)
+                .map_err(|error| format!("lock legacy audit {lock_name}: {error}"))?;
+            capability.validate_complete_chain()?;
+            revalidate_audit_leaf(capability, OsStr::new(&lock_name), &lock_identity)?;
+
+            let json_name = format!("{year}.jsonl");
+            let path = self.base_dir.join(&json_name);
+            let (mut file, json_identity) =
+                open_or_create_audit_file(capability, OsStr::new(&json_name), true)?;
+            if validate_existing_chain_file(&file, &path)?.is_some() {
+                return Err("legacy audit fixture must be the chain prefix".to_owned());
+            }
+            let mut record = serde_json::json!({
+                "envelope": envelope,
+                "previous_hash": "GENESIS",
+            });
+            let record_hash = calculate_record_hash(&record)?;
+            record.as_object_mut().expect("json object literal").insert(
+                "record_hash".to_owned(),
+                serde_json::Value::String(record_hash),
+            );
+            let mut line = serde_json::to_vec(&record)
+                .map_err(|error| format!("serialize legacy audit line: {error}"))?;
+            line.push(b'\n');
+            file.write_all(&line)
+                .map_err(|error| format!("append legacy audit {}: {error}", path.display()))?;
+            file.flush()
+                .map_err(|error| format!("flush legacy audit {}: {error}", path.display()))?;
+            file.sync_all()
+                .map_err(|error| format!("sync legacy audit {}: {error}", path.display()))?;
+            capability.root().sync_all().map_err(|error| {
+                format!(
+                    "sync legacy audit root {}: {error}",
+                    self.base_dir.display()
+                )
+            })?;
+            validate_existing_chain_file(&file, &path)?;
+            capability.validate_complete_chain()?;
+            revalidate_audit_leaf(capability, OsStr::new(&lock_name), &lock_identity)?;
+            revalidate_audit_leaf(capability, OsStr::new(&json_name), &json_identity)?;
+            FileExt::unlock(&lock_file)
+                .map_err(|error| format!("unlock legacy audit {lock_name}: {error}"))?;
+            Ok(())
+        })();
+        if let Err(error) = &result {
+            state.poisoned = Some(error.clone());
+            state.health = AuditHealth::Degraded {
+                reason_code: error.clone(),
+            };
+        }
+        result
     }
 }
 
@@ -860,6 +1225,13 @@ fn open_or_create_audit_file(
     open_or_create_audit_file_with_hook(capability, name, append, || Ok(()))
 }
 
+fn open_or_create_read_only_audit_file(
+    capability: &PinnedAuditRoot,
+    name: &OsStr,
+) -> Result<(File, AuditObjectIdentity), String> {
+    open_or_create_audit_file_with_flags(capability, name, AUDIT_O_RDONLY, || Ok(()))
+}
+
 fn open_or_create_audit_file_with_hook<F>(
     capability: &PinnedAuditRoot,
     name: &OsStr,
@@ -873,6 +1245,18 @@ where
     if append {
         flags |= AUDIT_O_APPEND;
     }
+    open_or_create_audit_file_with_flags(capability, name, flags, before_create)
+}
+
+fn open_or_create_audit_file_with_flags<F>(
+    capability: &PinnedAuditRoot,
+    name: &OsStr,
+    flags: i32,
+    before_create: F,
+) -> Result<(File, AuditObjectIdentity), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
     let path = capability.root_path.join(name);
     let file = match audit_openat(capability.root(), name, flags, 0) {
         Ok(file) => file,
@@ -1152,6 +1536,97 @@ fn calculate_record_hash(record: &serde_json::Value) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedCanonicalAuditLine {
+    previous_hash: String,
+    bytes: Vec<u8>,
+}
+
+fn prepare_canonical_audit_line(
+    envelope: &EventEnvelope,
+    previous_hash: &str,
+) -> Result<PreparedCanonicalAuditLine, String> {
+    if previous_hash.is_empty() {
+        return Err("audit previous hash is empty".to_owned());
+    }
+    let mut record = serde_json::json!({
+        "envelope": envelope,
+        "hash_domain": DELIVERY_AUDIT_RECORD_HASH_DOMAIN,
+        "previous_hash": previous_hash,
+    });
+    let record_hash = calculate_record_hash(&record)?;
+    record.as_object_mut().expect("json object literal").insert(
+        "record_hash".to_owned(),
+        serde_json::Value::String(record_hash),
+    );
+    let mut bytes =
+        serde_json::to_vec(&record).map_err(|error| format!("serialize audit line: {error}"))?;
+    bytes.push(b'\n');
+    Ok(PreparedCanonicalAuditLine {
+        previous_hash: previous_hash.to_owned(),
+        bytes,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExactEnvelopeCount {
+    exact: u32,
+    same_id_mismatch: u32,
+}
+
+fn count_exact_envelope(
+    file: &File,
+    path: &Path,
+    expected_id: &str,
+    expected_bytes: &[u8],
+) -> Result<ExactEnvelopeCount, String> {
+    let mut reader = file
+        .try_clone()
+        .map_err(|error| format!("clone exact envelope reader {}: {error}", path.display()))?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("seek exact envelope reader {}: {error}", path.display()))?;
+    let mut content = String::new();
+    reader
+        .read_to_string(&mut content)
+        .map_err(|error| format!("read exact envelope authority {}: {error}", path.display()))?;
+    let mut count = ExactEnvelopeCount {
+        exact: 0,
+        same_id_mismatch: 0,
+    };
+    for (index, line) in content.lines().enumerate() {
+        let record: serde_json::Value = serde_json::from_str(line).map_err(|error| {
+            format!("parse exact envelope authority line {}: {error}", index + 1)
+        })?;
+        let envelope = record.get("envelope").ok_or_else(|| {
+            format!(
+                "exact envelope authority line {} missing envelope",
+                index + 1
+            )
+        })?;
+        if envelope.get("id").and_then(serde_json::Value::as_str) == Some(expected_id) {
+            let observed_bytes = serde_json::to_vec(envelope).map_err(|error| {
+                format!(
+                    "serialize exact envelope authority line {}: {error}",
+                    index + 1
+                )
+            })?;
+            if observed_bytes == expected_bytes {
+                count.exact = count
+                    .exact
+                    .checked_add(1)
+                    .ok_or_else(|| "exact envelope count overflow".to_owned())?;
+            } else {
+                count.same_id_mismatch = count
+                    .same_id_mismatch
+                    .checked_add(1)
+                    .ok_or_else(|| "same-id envelope mismatch count overflow".to_owned())?;
+            }
+        }
+    }
+    Ok(count)
+}
+
 impl Dispatcher for AuditDispatcher {
     fn name(&self) -> &'static str {
         "AuditDispatcher"
@@ -1165,6 +1640,22 @@ impl Dispatcher for AuditDispatcher {
         // Reject non-matching event types (supports direct dispatch testing).
         if !self.accepts(&envelope) {
             return DispatchResult::Skipped("no_dispatcher".into());
+        }
+
+        if matches!(
+            envelope
+                .payload
+                .get("audit_schema_version")
+                .and_then(serde_json::Value::as_u64),
+            Some(version)
+                if version
+                    == u64::from(super::envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION)
+                    || version
+                        == u64::from(super::envelope::NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION)
+        ) {
+            return DispatchResult::Failed(
+                "BR-244 schema-v5/v6 NewsFlash authority requires the exact append API".into(),
+            );
         }
 
         let record = match super::push_record::PushRecord::try_from_authoritative(&envelope) {
@@ -1346,6 +1837,35 @@ mod tests {
     }
 
     #[test]
+    fn br244_exact_news_flash_prepares_canonical_line_before_append_open() {
+        let envelope = test_envelope_type("push.delivery.audit");
+        let prepared = prepare_canonical_audit_line(&envelope, "TEST_CODE_PARENT_HASH")
+            .expect("prepare canonical BR-244 audit line");
+
+        assert!(prepared.bytes.ends_with(b"\n"));
+        let record: serde_json::Value =
+            serde_json::from_slice(&prepared.bytes[..prepared.bytes.len() - 1])
+                .expect("decode prepared canonical BR-244 audit line");
+        assert_eq!(record["envelope"]["id"], envelope.id);
+        assert_eq!(record["previous_hash"], "TEST_CODE_PARENT_HASH");
+        assert_eq!(
+            record["hash_domain"],
+            "stock_analysis.delivery_audit_record.v2"
+        );
+        let mut unhashed = record.clone();
+        let stored_hash = unhashed
+            .as_object_mut()
+            .expect("prepared audit record is an object")
+            .remove("record_hash")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .expect("prepared audit record has a hash");
+        assert_eq!(
+            calculate_record_hash(&unhashed).expect("recalculate prepared audit hash"),
+            stored_hash
+        );
+    }
+
+    #[test]
     fn registry_routes_only_exact_event_type() {
         let mut registry = DispatcherRegistry::new();
         registry.register(Arc::new(RecordingDispatcher::for_type(
@@ -1518,6 +2038,27 @@ mod tests {
             matches!(result, DispatchResult::Failed(error) if error.contains("parse audit line 1"))
         );
         assert_eq!(dispatcher.handled_count(), 0);
+        assert_eq!(fs::read_to_string(path).unwrap(), "{not-json}\n");
+    }
+
+    #[test]
+    fn br244_generic_dispatch_validates_chain_before_requesting_append_authority() {
+        let fixture = TestAuditNamespace::new("GENERIC_READ_BEFORE_APPEND");
+        let dispatcher = fixture.dispatcher();
+        let path = fixture
+            .audit_path()
+            .join(format!("{}.jsonl", chrono::Local::now().format("%Y")));
+        fs::write(&path, "{not-json}\n").unwrap();
+        let writable_permissions = fs::metadata(&path).unwrap().permissions();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let result = dispatcher.dispatch(test_envelope_type("push.delivery.audit"));
+
+        fs::set_permissions(&path, writable_permissions).unwrap();
+        assert!(
+            matches!(result, DispatchResult::Failed(error) if error.contains("parse audit line 1")),
+            "the generic writer must validate through a read-only handle before requesting append authority"
+        );
         assert_eq!(fs::read_to_string(path).unwrap(), "{not-json}\n");
     }
 

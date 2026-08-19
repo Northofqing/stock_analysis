@@ -1,4 +1,6 @@
 //! P4 M2: gRPC 响应 → 客户端类型化 GatewayBatch 转换。
+//! BR-238 要求转换保留已认证 client-bundle 的原始批次证据。
+//! BR-236 要求实时行情在 RPC 返回后的 consumer seam 重新执行精确五秒门。
 //! 与服务端 delegate.rs fetch_xxx 的 JSON 视图逐字段镜像 (每条转换注明对应
 //! fetch 行号, 视图字段名以 delegate 的 json! 键名为准 — 例如 change_pct 对应
 //! 结构体字段 change_percent)。
@@ -31,8 +33,8 @@ use crate::magic_compat::{
 use crate::magic_compat::{
     Bar, CorporateActionCategory, CorporateActionTerms, DataBatch, DragonTigerSide,
     FinancialStatement, FiniteNumber, FlowInterval, FxPair, GlobalIndexCode, IsoDate,
-    MarketRankingKind, MarketRankingUnit, MarketStatistics, Money, NorthboundChannel, PositiveU32,
-    Price, Ratio,
+    LimitPoolEntry, LimitPoolKind, MarketRankingKind, MarketRankingUnit, MarketStatistics, Money,
+    NorthboundChannel, PositiveU32, Price, Ratio,
 };
 use crate::selection::schema_v2::OutcomeTransportAttemptPreimage;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -41,9 +43,25 @@ use serde_json::Value;
 /// bridge 缺证据时的 capability 标记 (audit_outcome=invalid_evidence)。
 const BRIDGE_CAPABILITY: &str = "GrpcBridge";
 const MAX_CLOCK_SKEW: chrono::TimeDelta = chrono::TimeDelta::seconds(2);
+const LIVE_BATCH_MAX_AGE: chrono::TimeDelta = chrono::TimeDelta::seconds(5);
 
 fn err(capability: &'static str, msg: impl Into<String>) -> GatewayError {
     GatewayError::invalid_evidence(capability, None, msg)
+}
+
+fn live_time_error(
+    capability: &'static str,
+    provider: ProviderId,
+    message: impl Into<String>,
+) -> GatewayError {
+    GatewayError::classified(
+        capability,
+        Some(provider),
+        "unavailable",
+        "quote_stale",
+        true,
+        message,
+    )
 }
 
 /// Debug 名 → ProviderId (服务端 pack_ev 用 format!("{:?}", provider) 写 JSON)。
@@ -154,6 +172,15 @@ fn parse_records(q: &QueryResult, capability: &'static str) -> Result<Vec<Value>
             "响应 complete=false, 完整数据转换不得接纳 partial batch",
         ));
     }
+    if q.records.len() != 1 {
+        return Err(err(
+            capability,
+            format!(
+                "local canonical array contract requires exactly one payload, got {}",
+                q.records.len()
+            ),
+        ));
+    }
     let Some(payload) = q.records.first() else {
         return Err(err(capability, "records 空 (服务端无 canonical payload)"));
     };
@@ -172,6 +199,36 @@ fn as_f64(v: &Value, key: &str, capability: &'static str) -> Result<f64, Gateway
     v.get(key)
         .and_then(Value::as_f64)
         .ok_or_else(|| err(capability, format!("record 缺数值字段 {key}")))
+}
+
+fn as_positive_finite_f64(
+    v: &Value,
+    key: &str,
+    capability: &'static str,
+) -> Result<f64, GatewayError> {
+    let value = as_f64(v, key, capability)?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(err(
+            capability,
+            format!("record 字段 {key} 必须为正有限数，实际为 {value}"),
+        ));
+    }
+    Ok(value)
+}
+
+fn as_non_negative_finite_f64(
+    v: &Value,
+    key: &str,
+    capability: &'static str,
+) -> Result<f64, GatewayError> {
+    let value = as_f64(v, key, capability)?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(err(
+            capability,
+            format!("record 字段 {key} 必须为非负有限数，实际为 {value}"),
+        ));
+    }
+    Ok(value)
 }
 
 fn as_bool(v: &Value, key: &str, capability: &'static str) -> Result<bool, GatewayError> {
@@ -243,14 +300,90 @@ fn record_observed_at(
     q: &QueryResult,
     capability: &'static str,
 ) -> Result<DateTime<Utc>, GatewayError> {
-    DateTime::parse_from_rfc3339(&q.observed_at)
-        .map(|dt| dt.with_timezone(&Utc))
-        .map_err(|e| {
-            err(
-                capability,
-                format!("observed_at 非 RFC3339: {} ({e})", q.observed_at),
-            )
-        })
+    crate::data_gateway::parse_evidence_instant(
+        capability,
+        parse_provider(&q.selected_provider)?,
+        "observed_at",
+        &q.observed_at,
+    )
+}
+
+fn live_evidence_times(
+    q: &QueryResult,
+    capability: &'static str,
+    now: DateTime<Utc>,
+) -> Result<(BatchEvidence, DateTime<Utc>, DateTime<Utc>), GatewayError> {
+    let evidence = evidence_of(q, capability)?;
+    let source_at_raw = evidence
+        .source_at
+        .as_deref()
+        .ok_or_else(|| err(capability, "source_at 空，实时批次不得进入 consumer"))?;
+    let source_at = crate::data_gateway::parse_evidence_instant(
+        capability,
+        evidence.provider,
+        "source_at",
+        source_at_raw,
+    )?;
+    let observed_at = crate::data_gateway::parse_evidence_instant(
+        capability,
+        evidence.provider,
+        "observed_at",
+        &evidence.observed_at,
+    )?;
+    validate_live_times(
+        capability,
+        evidence.provider,
+        source_at,
+        observed_at,
+        now,
+        "batch",
+    )?;
+    Ok((evidence, source_at, observed_at))
+}
+
+fn validate_live_times(
+    capability: &'static str,
+    provider: ProviderId,
+    source_at: DateTime<Utc>,
+    observed_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    scope: &str,
+) -> Result<(), GatewayError> {
+    if source_at > now {
+        return Err(live_time_error(
+            capability,
+            provider,
+            format!("{scope}.source_at 晚于 consumer now: source_at={source_at} now={now}"),
+        ));
+    }
+    if observed_at > now {
+        return Err(live_time_error(
+            capability,
+            provider,
+            format!("{scope}.observed_at 晚于 consumer now: observed_at={observed_at} now={now}"),
+        ));
+    }
+    if source_at > observed_at {
+        return Err(err(
+            capability,
+            format!(
+                "{scope}.source_at 晚于 observed_at: source_at={source_at} observed_at={observed_at}"
+            ),
+        ));
+    }
+    let age = now.signed_duration_since(source_at);
+    if age > LIVE_BATCH_MAX_AGE {
+        return Err(live_time_error(
+            capability,
+            provider,
+            format!(
+                "consumer 收到过期实时 {scope}: age_ns={} max_ns={}",
+                age.num_nanoseconds().unwrap_or(i64::MAX),
+                LIVE_BATCH_MAX_AGE.num_nanoseconds().unwrap_or(i64::MAX)
+            ),
+        ));
+    }
+    Ok(())
 }
 
 // ---------- 6 个首批 op (M2) ----------
@@ -284,6 +417,39 @@ pub fn realtime_quotes(q: &QueryResult) -> Result<GatewayBatch<RealtimeMarketQuo
         records,
         evidence: ev,
     })
+}
+
+/// RPC 完成后的 consumer-side 实时行情门。
+///
+/// `now` 是 consumer 实际收到并转换响应的时刻；provider `source_at` 到该时刻
+/// 必须精确处于 `0..=5s`，且 `source_at <= observed_at <= now`。
+pub fn realtime_quotes_at(
+    q: &QueryResult,
+    now: DateTime<Utc>,
+) -> Result<GatewayBatch<RealtimeMarketQuote>, GatewayError> {
+    let capability = "RealtimeMarketQuotes";
+    let (evidence, source_at, observed_at) = live_evidence_times(q, capability, now)?;
+    let parsed = parse_records(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(evidence));
+    }
+    let records = parsed
+        .iter()
+        .map(|value| {
+            Ok(RealtimeMarketQuote {
+                code: as_str(value, "code", capability)?,
+                name: as_str(value, "name", capability)?,
+                price: as_positive_finite_f64(value, "price", capability)?,
+                change_percent: as_f64(value, "change_pct", capability)?,
+                previous_close: as_positive_finite_f64(value, "previous_close", capability)?,
+                source_at,
+                observed_at,
+                provider: evidence.provider,
+                batch_id: evidence.batch_id.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, GatewayError>>()?;
+    Ok(GatewayBatch::Available { records, evidence })
 }
 
 /// 分钟线。视图: delegate.rs fetch_minute_data (:211-219)
@@ -349,6 +515,42 @@ fn book_levels(
     Ok(levels)
 }
 
+fn live_book_levels(
+    v: &Value,
+    key: &str,
+    capability: &'static str,
+) -> Result<[MarketBookLevel; 5], GatewayError> {
+    let arr = v
+        .get(key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| err(capability, format!("record 缺数组字段 {key}")))?;
+    if arr.len() != 5 {
+        return Err(err(
+            capability,
+            format!(
+                "live {key} 档位数必须精确为 5，实际为 {}；禁止以零值补缺档",
+                arr.len()
+            ),
+        ));
+    }
+    let levels = book_levels(v, key, capability)?;
+    for (index, item) in arr.iter().enumerate() {
+        as_positive_finite_f64(item, "price", capability).map_err(|error| {
+            err(
+                capability,
+                format!("{key}[{index}] price 非正有限数: {error}"),
+            )
+        })?;
+        as_non_negative_finite_f64(item, "quantity", capability).map_err(|error| {
+            err(
+                capability,
+                format!("{key}[{index}] quantity 非非负有限数: {error}"),
+            )
+        })?;
+    }
+    Ok(levels)
+}
+
 pub fn order_books(q: &QueryResult) -> Result<GatewayBatch<MarketOrderBook>, GatewayError> {
     let capability = "MarketOrderBooks";
     let ev = evidence_of(q, capability)?;
@@ -376,6 +578,59 @@ pub fn order_books(q: &QueryResult) -> Result<GatewayBatch<MarketOrderBook>, Gat
         records,
         evidence: ev,
     })
+}
+
+/// RPC 完成后的 consumer-side 五档盘口门。
+pub fn order_books_at(
+    q: &QueryResult,
+    now: DateTime<Utc>,
+) -> Result<GatewayBatch<MarketOrderBook>, GatewayError> {
+    let capability = "MarketOrderBooks";
+    let (evidence, source_at, observed_at) = live_evidence_times(q, capability, now)?;
+    let parsed = parse_records(q, capability)?;
+    if parsed.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(evidence));
+    }
+    let records = parsed
+        .iter()
+        .map(|value| {
+            let record_source_at_raw = as_str(value, "source_at", capability)?;
+            let record_source_at = crate::data_gateway::parse_evidence_instant(
+                capability,
+                evidence.provider,
+                "record.source_at",
+                &record_source_at_raw,
+            )?;
+            if record_source_at != source_at {
+                return Err(err(
+                    capability,
+                    format!(
+                        "record.source_at 与批次不一致: record={record_source_at} batch={source_at}"
+                    ),
+                ));
+            }
+            Ok(MarketOrderBook {
+                code: as_str(value, "code", capability)?,
+                bids: live_book_levels(value, "bids", capability)?,
+                asks: live_book_levels(value, "asks", capability)?,
+                total_bid_quantity: as_non_negative_finite_f64(
+                    value,
+                    "total_bid_quantity",
+                    capability,
+                )?,
+                total_ask_quantity: as_non_negative_finite_f64(
+                    value,
+                    "total_ask_quantity",
+                    capability,
+                )?,
+                source_at,
+                observed_at,
+                provider: evidence.provider,
+                batch_id: evidence.batch_id.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, GatewayError>>()?;
+    Ok(GatewayBatch::Available { records, evidence })
 }
 
 /// 资金流。视图: delegate.rs fetch_money_flows (:262-270)
@@ -585,8 +840,14 @@ fn parse_security_identities(
                 }
                 let record_source_at =
                     required_evidence_time(&record, "source_at", capability, ev.provider)?;
-                if record_source_at != source_at {
-                    return Err(err(capability, "record source_at 与 envelope 冲突"));
+                if record_source_at < source_at {
+                    return Err(err(
+                        capability,
+                        "record source_at 早于 envelope oldest source_at",
+                    ));
+                }
+                if record_source_at > record_observed_at {
+                    return Err(err(capability, "record source_at 晚于 record observed_at"));
                 }
                 match as_str(&record, "status", capability)?.as_str() {
                     "Available" | "Unavailable" => {}
@@ -617,6 +878,19 @@ fn parse_security_identities(
 
     if records.is_empty() {
         return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    if first.schema == EXTERNAL_SECURITY_METADATA_SCHEMA {
+        let oldest_record_source = records
+            .iter()
+            .map(|record| record.source_at)
+            .min()
+            .ok_or_else(|| err(capability, "external identity records 空"))?;
+        if oldest_record_source != source_at {
+            return Err(err(
+                capability,
+                "envelope source_at 不是 record source_at 最小值",
+            ));
+        }
     }
     Ok(GatewayBatch::Available {
         records,
@@ -1865,6 +2139,133 @@ pub fn provider_top_n_rankings(
     })
 }
 
+fn parse_provider_top_n_row_evidence(
+    value: &Value,
+    capability: &'static str,
+) -> Result<BatchEvidence, GatewayError> {
+    let evidence = value
+        .get("evidence")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| err(capability, "头部排行 record 缺 evidence 对象"))?;
+    let provider_name = as_str(evidence, "provider", capability)?;
+    let provider = parse_provider(&provider_name).map_err(|error| {
+        err(
+            capability,
+            format!("record evidence.provider 无法解析: {error}"),
+        )
+    })?;
+    let source = as_str(evidence, "source", capability)?;
+    let observed_at = as_str(evidence, "observed_at", capability)?;
+    let batch_id = as_str(evidence, "batch_id", capability)?;
+    if source.trim().is_empty() || observed_at.trim().is_empty() || batch_id.trim().is_empty() {
+        return Err(err(
+            capability,
+            "头部排行 record evidence 的 source/observed_at/batch_id 不得为空",
+        ));
+    }
+    let observed_instant = crate::data_gateway::parse_evidence_instant(
+        capability,
+        provider,
+        "record.evidence.observed_at",
+        &observed_at,
+    )?;
+    let source_at = match evidence.get("source_at") {
+        Some(Value::Null) => None,
+        Some(Value::String(value)) if !value.trim().is_empty() => {
+            let source_instant = crate::data_gateway::parse_evidence_instant(
+                capability,
+                provider,
+                "record.evidence.source_at",
+                value,
+            )?;
+            if source_instant > observed_instant {
+                return Err(err(
+                    capability,
+                    "头部排行 record evidence.source_at 晚于 observed_at",
+                ));
+            }
+            Some(value.clone())
+        }
+        _ => {
+            return Err(err(
+                capability,
+                "头部排行 record evidence.source_at 必须显式为时间或 null",
+            ))
+        }
+    };
+    Ok(BatchEvidence {
+        provider,
+        source,
+        source_at,
+        observed_at,
+        batch_id,
+    })
+}
+
+fn retain_provider_top_n_metric_evidence(
+    retained: &mut Option<BatchEvidence>,
+    evidence: BatchEvidence,
+    capability: &'static str,
+) -> Result<(), GatewayError> {
+    if retained
+        .as_ref()
+        .is_some_and(|existing| existing != &evidence)
+    {
+        return Err(err(
+            capability,
+            "同一头部排行 metric 混入不同 record evidence",
+        ));
+    }
+    if retained.is_none() {
+        *retained = Some(evidence);
+    }
+    Ok(())
+}
+
+fn validate_provider_top_n_source_date(
+    record: &ProviderTopNFact,
+    evidence: &BatchEvidence,
+    capability: &'static str,
+) -> Result<NaiveDate, GatewayError> {
+    let trading_date = NaiveDate::parse_from_str(record.trading_date.as_str(), "%Y-%m-%d")
+        .map_err(|error| {
+            err(
+                capability,
+                format!("头部排行 trading_date 无法解析: {error}"),
+            )
+        })?;
+    let observed_at = crate::data_gateway::parse_evidence_instant(
+        capability,
+        evidence.provider,
+        "record.evidence.observed_at",
+        &evidence.observed_at,
+    )?;
+    let shanghai = chrono::FixedOffset::east_opt(8 * 60 * 60).expect("valid Shanghai fixed offset");
+    if trading_date > observed_at.with_timezone(&shanghai).date_naive() {
+        return Err(err(
+            capability,
+            "头部排行 trading_date 晚于 evidence 上海观察日",
+        ));
+    }
+    if let Some(source_at) = evidence.source_at.as_deref() {
+        let source_date = crate::data_gateway::parse_evidence_instant(
+            capability,
+            evidence.provider,
+            "record.evidence.source_at",
+            source_at,
+        )?
+        .with_timezone(&shanghai)
+        .date_naive();
+        if source_date != trading_date {
+            return Err(err(
+                capability,
+                "头部排行 trading_date 与 evidence.source_at 上海日期冲突",
+            ));
+        }
+    }
+    Ok(trading_date)
+}
+
 /// 头部排行双路 (ProviderTopNPair 视角): 服务端视图合流输出 (无分路顺序
 /// 保证), 客户端按 metric 分组重建 volume_ratio / main_net_inflow 两个
 /// GatewayBatch — 与本地 CapitalDataGateway::provider_top_n_pair 的
@@ -1879,34 +2280,86 @@ pub fn provider_top_n_pair(
     GatewayError,
 > {
     let capability = "ProviderTopNRankings";
-    let (parsed, ev) = parse_records_parts(q, capability)?;
+    let (parsed, envelope_evidence) = parse_records_parts(q, capability)?;
     if parsed.is_empty() {
-        return Ok((
-            GatewayBatch::VerifiedEmpty(ev.clone()),
-            GatewayBatch::VerifiedEmpty(ev),
+        return Err(err(
+            capability,
+            "BR-240 头部排行原子双路不得缺少任一 metric evidence",
         ));
     }
     let mut volume: Vec<ProviderTopNFact> = Vec::new();
     let mut inflow: Vec<ProviderTopNFact> = Vec::new();
+    let mut volume_evidence: Option<BatchEvidence> = None;
+    let mut inflow_evidence: Option<BatchEvidence> = None;
+    let mut pair_trading_date: Option<NaiveDate> = None;
     for v in &parsed {
+        let row_evidence = parse_provider_top_n_row_evidence(v, capability)?;
         let record = parse_provider_top_n_record(v, capability)?;
+        let record_trading_date =
+            validate_provider_top_n_source_date(&record, &row_evidence, capability)?;
+        if pair_trading_date
+            .as_ref()
+            .is_some_and(|expected| expected != &record_trading_date)
+        {
+            return Err(err(capability, "BR-240 双路头部排行 trading_date 不一致"));
+        }
+        if pair_trading_date.is_none() {
+            pair_trading_date = Some(record_trading_date);
+        }
         match record.metric {
-            MarketRankingKind::VolumeRatio => volume.push(record),
-            MarketRankingKind::MainNetInflow => inflow.push(record),
+            MarketRankingKind::VolumeRatio => {
+                retain_provider_top_n_metric_evidence(
+                    &mut volume_evidence,
+                    row_evidence,
+                    capability,
+                )?;
+                volume.push(record);
+            }
+            MarketRankingKind::MainNetInflow => {
+                retain_provider_top_n_metric_evidence(
+                    &mut inflow_evidence,
+                    row_evidence,
+                    capability,
+                )?;
+                inflow.push(record);
+            }
             other => return Err(err(capability, format!("头部排行未知 metric: {other:?}"))),
         }
     }
-    let partition = |records: Vec<ProviderTopNFact>| {
-        if records.is_empty() {
-            GatewayBatch::VerifiedEmpty(ev.clone())
-        } else {
-            GatewayBatch::Available {
-                records,
-                evidence: ev.clone(),
-            }
-        }
-    };
-    Ok((partition(volume), partition(inflow)))
+    let volume_evidence = volume_evidence
+        .ok_or_else(|| err(capability, "BR-240 volume-ratio metric/evidence 缺失"))?;
+    let inflow_evidence = inflow_evidence
+        .ok_or_else(|| err(capability, "BR-240 main-net-inflow metric/evidence 缺失"))?;
+    if volume_evidence != envelope_evidence {
+        return Err(err(
+            capability,
+            "BR-240 volume-ratio record evidence 与公共 envelope 冲突",
+        ));
+    }
+    if volume_evidence.provider != inflow_evidence.provider
+        || volume_evidence.source != inflow_evidence.source
+    {
+        return Err(err(
+            capability,
+            "BR-240 双路头部排行 provider/source 不一致",
+        ));
+    }
+    if volume_evidence.batch_id == inflow_evidence.batch_id {
+        return Err(err(
+            capability,
+            "BR-240 两路头部排行不得共享同一上游 batch_id",
+        ));
+    }
+    Ok((
+        GatewayBatch::Available {
+            records: volume,
+            evidence: volume_evidence,
+        },
+        GatewayBatch::Available {
+            records: inflow,
+            evidence: inflow_evidence,
+        },
+    ))
 }
 
 pub fn index_quotes(q: &QueryResult) -> Result<GatewayBatch<RealtimeIndexQuote>, GatewayError> {
@@ -1979,6 +2432,420 @@ pub fn instrument_news(
     })
 }
 
+const EXTERNAL_INSTRUMENT_NEWS_SCHEMA: &str = "magic.market.news_item";
+const EXTERNAL_INSTRUMENT_NEWS_FIELDS: &[&str] = &[
+    "item_id",
+    "title",
+    "summary",
+    "content",
+    "publisher",
+    "canonical_url",
+    "published_at",
+    "instruments",
+    "topics",
+    "language",
+    "evidence",
+];
+
+#[derive(serde::Deserialize)]
+struct ExternalInstrumentNewsWire {
+    item_id: String,
+    title: String,
+    summary: Option<String>,
+    content: Option<String>,
+    publisher: String,
+    canonical_url: String,
+    published_at: String,
+    instruments: Vec<InstrumentId>,
+    topics: Vec<String>,
+    language: String,
+    evidence: SourceEvidence,
+}
+
+/// Normalize the delivered ExternalV1 `magic.market.news_item@1` contract.
+///
+/// The wire record stays bound to the exact canonical instrument and immutable
+/// batch evidence that authorized the read. Missing provider source time is
+/// never replaced by the acquisition time; the legacy persistence projection
+/// uses the envelope observation only for `fetched_at`.
+pub fn external_instrument_news(
+    storage_code: &str,
+    requested_instrument: &InstrumentId,
+    request_limit: usize,
+    q: &QueryResult,
+) -> Result<GatewayBatch<SinaInstrumentNewsRecord>, GatewayError> {
+    external_instrument_news_with_range(
+        storage_code,
+        requested_instrument,
+        None,
+        request_limit,
+        q,
+        None,
+    )
+}
+
+pub fn external_instrument_news_at(
+    storage_code: &str,
+    requested_instrument: &InstrumentId,
+    request_limit: usize,
+    q: &QueryResult,
+    consumer_now: DateTime<Utc>,
+) -> Result<GatewayBatch<SinaInstrumentNewsRecord>, GatewayError> {
+    external_instrument_news_with_range(
+        storage_code,
+        requested_instrument,
+        None,
+        request_limit,
+        q,
+        Some(consumer_now),
+    )
+}
+
+pub fn external_instrument_news_in_range(
+    storage_code: &str,
+    requested_instrument: &InstrumentId,
+    request_start: NaiveDate,
+    request_end: NaiveDate,
+    request_limit: usize,
+    q: &QueryResult,
+) -> Result<GatewayBatch<SinaInstrumentNewsRecord>, GatewayError> {
+    if request_start > request_end {
+        return Err(GatewayError::invalid_request(
+            "InstrumentNews",
+            "ExternalV1 InstrumentNews request start must not follow end",
+        ));
+    }
+    external_instrument_news_with_range(
+        storage_code,
+        requested_instrument,
+        Some((request_start, request_end)),
+        request_limit,
+        q,
+        None,
+    )
+}
+
+pub fn external_instrument_news_in_range_at(
+    storage_code: &str,
+    requested_instrument: &InstrumentId,
+    request_start: NaiveDate,
+    request_end: NaiveDate,
+    request_limit: usize,
+    q: &QueryResult,
+    consumer_now: DateTime<Utc>,
+) -> Result<GatewayBatch<SinaInstrumentNewsRecord>, GatewayError> {
+    if request_start > request_end {
+        return Err(GatewayError::invalid_request(
+            "InstrumentNews",
+            "ExternalV1 InstrumentNews request start must not follow end",
+        ));
+    }
+    external_instrument_news_with_range(
+        storage_code,
+        requested_instrument,
+        Some((request_start, request_end)),
+        request_limit,
+        q,
+        Some(consumer_now),
+    )
+}
+
+fn external_instrument_news_with_range(
+    storage_code: &str,
+    requested_instrument: &InstrumentId,
+    requested_range: Option<(NaiveDate, NaiveDate)>,
+    request_limit: usize,
+    q: &QueryResult,
+    consumer_now: Option<DateTime<Utc>>,
+) -> Result<GatewayBatch<SinaInstrumentNewsRecord>, GatewayError> {
+    let capability = "InstrumentNews";
+    let evidence = evidence_of(q, capability)?;
+    if !q.complete {
+        return Err(err(capability, "ExternalV1 InstrumentNews complete=false"));
+    }
+    if requested_instrument.asset_class() != AssetClass::Equity
+        || requested_instrument.code() != storage_code
+    {
+        return Err(err(
+            capability,
+            "requested canonical instrument 与 storage code 冲突",
+        ));
+    }
+    if !(1..=10_000).contains(&request_limit) || q.records.len() > request_limit {
+        return Err(err(
+            capability,
+            "external news record count 超过 exact request limit",
+        ));
+    }
+    let fetched_at = crate::data_gateway::parse_evidence_instant(
+        capability,
+        evidence.provider,
+        "observed_at",
+        &q.observed_at,
+    )?;
+    if let Some(now) = consumer_now {
+        let max_age = chrono::TimeDelta::seconds(30);
+        let age = now.signed_duration_since(fetched_at);
+        if age < -MAX_CLOCK_SKEW || age > max_age {
+            return Err(GatewayError::classified(
+                capability,
+                Some(evidence.provider),
+                "stale",
+                "observation_stale",
+                true,
+                format!(
+                    "instrument news observation failed freshness gate age_ms={} max_age_ms={} max_clock_skew_ms={}",
+                    age.num_milliseconds(),
+                    max_age.num_milliseconds(),
+                    MAX_CLOCK_SKEW.num_milliseconds()
+                ),
+            ));
+        }
+    }
+    let envelope_source_at = evidence
+        .source_at
+        .as_deref()
+        .map(|value| {
+            crate::data_gateway::parse_evidence_instant(
+                capability,
+                evidence.provider,
+                "source_at",
+                value,
+            )
+        })
+        .transpose()?;
+    if envelope_source_at.is_some_and(|source_at| source_at > fetched_at) {
+        return Err(err(capability, "source_at 晚于 observed_at"));
+    }
+    if let (Some(now), Some(source_at)) = (consumer_now, envelope_source_at) {
+        if source_at > now + MAX_CLOCK_SKEW {
+            return Err(GatewayError::invalid_evidence(
+                capability,
+                Some(evidence.provider),
+                "instrument news source timestamp exceeds maximum clock skew",
+            ));
+        }
+        let shanghai =
+            chrono::FixedOffset::east_opt(8 * 60 * 60).expect("Shanghai fixed UTC offset is valid");
+        let source_date = source_at.with_timezone(&shanghai).date_naive();
+        let today = now.with_timezone(&shanghai).date_naive();
+        let oldest_allowed = crate::calendar::prev_trading_day(today);
+        if source_date < oldest_allowed {
+            return Err(GatewayError::classified(
+                capability,
+                Some(evidence.provider),
+                "stale",
+                "daily_source_stale",
+                true,
+                format!(
+                    "instrument news source date {source_date} is older than one trading day; oldest_allowed={oldest_allowed}"
+                ),
+            ));
+        }
+    }
+    if q.records.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(evidence));
+    }
+
+    let mut records = Vec::with_capacity(q.records.len());
+    for payload in &q.records {
+        validate_external_news_payload(payload, capability)?;
+        let value: Value = serde_json::from_slice(&payload.data)
+            .map_err(|error| err(capability, format!("external news 非 JSON object: {error}")))?;
+        validate_external_news_fields(&value, capability)?;
+        let wire: ExternalInstrumentNewsWire = serde_json::from_value(value)
+            .map_err(|error| err(capability, format!("external news 字段无效: {error}")))?;
+
+        validate_external_news_text(&wire.item_id, "item_id", capability)?;
+        validate_external_news_text(&wire.title, "title", capability)?;
+        validate_external_news_text(&wire.publisher, "publisher", capability)?;
+        validate_external_news_text(&wire.canonical_url, "canonical_url", capability)?;
+        validate_external_news_text(&wire.published_at, "published_at", capability)?;
+        validate_external_news_text(&wire.language, "language", capability)?;
+        if let Some(summary) = wire.summary.as_deref() {
+            validate_external_news_text(summary, "summary", capability)?;
+        }
+        if let Some(content) = wire.content.as_deref() {
+            validate_external_news_text(content, "content", capability)?;
+        }
+        for topic in &wire.topics {
+            validate_external_news_text(topic, "topics[]", capability)?;
+        }
+        if !wire
+            .instruments
+            .iter()
+            .any(|instrument| instrument == requested_instrument)
+        {
+            return Err(err(
+                capability,
+                "external news instruments 不含 exact request instrument",
+            ));
+        }
+        let parsed_url = url::Url::parse(&wire.canonical_url)
+            .map_err(|error| err(capability, format!("canonical_url 无效: {error}")))?;
+        if parsed_url.scheme() != "https" || parsed_url.host_str().is_none() {
+            return Err(err(capability, "canonical_url 必须是绝对 HTTPS URL"));
+        }
+        if wire.evidence.provider() != evidence.provider
+            || wire.evidence.batch_id() != evidence.batch_id
+        {
+            return Err(err(
+                capability,
+                "external news record provider/batch 与 envelope 冲突",
+            ));
+        }
+        let record_observed_at = crate::data_gateway::parse_evidence_instant(
+            capability,
+            evidence.provider,
+            "record.evidence.observed_at",
+            wire.evidence.observed_at(),
+        )?;
+        if record_observed_at > fetched_at {
+            return Err(err(
+                capability,
+                "external news record observed_at 晚于 envelope final observed_at",
+            ));
+        }
+        let published_at = DateTime::parse_from_rfc3339(&wire.published_at)
+            .map(|value| value.with_timezone(&Utc))
+            .map_err(|error| {
+                err(
+                    capability,
+                    format!("external news published_at 非 RFC3339: {error}"),
+                )
+            })?;
+        if let Some((request_start, request_end)) = requested_range {
+            let shanghai = chrono::FixedOffset::east_opt(8 * 60 * 60)
+                .expect("Shanghai fixed UTC offset is valid");
+            let published_date = published_at.with_timezone(&shanghai).date_naive();
+            if published_date < request_start || published_date > request_end {
+                return Err(err(
+                    capability,
+                    format!(
+                        "external news published_at outside exact request range: date={published_date} start={request_start} end={request_end}"
+                    ),
+                ));
+            }
+        }
+        let record_source_at = wire
+            .evidence
+            .source_at()
+            .map(|value| {
+                crate::data_gateway::parse_evidence_instant(
+                    capability,
+                    evidence.provider,
+                    "record.evidence.source_at",
+                    value,
+                )
+            })
+            .transpose()?;
+        match (record_source_at, envelope_source_at) {
+            (Some(record_source_at), Some(envelope_source_at)) => {
+                if record_source_at > envelope_source_at {
+                    return Err(err(
+                        capability,
+                        "external news record source_at 晚于 envelope newest source_at",
+                    ));
+                }
+                if record_source_at != published_at {
+                    return Err(err(
+                        capability,
+                        "external news record source_at 与 published_at 冲突",
+                    ));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(err(
+                    capability,
+                    "external news record/envelope source_at presence 冲突",
+                ));
+            }
+        }
+        if record_source_at.is_some_and(|source_at| source_at > record_observed_at) {
+            return Err(err(
+                capability,
+                "external news record source_at 晚于 observed_at",
+            ));
+        }
+        if published_at > record_observed_at {
+            return Err(err(
+                capability,
+                "external news observed_at 早于 published_at",
+            ));
+        }
+
+        // The canonical contract represents a missing summary as JSON null.
+        // `NewsItem` is a legacy non-optional projection, so blank preserves
+        // that explicit missing value without inventing provider content.
+        let summary = wire.summary.unwrap_or_default();
+        let persistence_item = NewsItem {
+            source: q.selected_provider.clone(),
+            external_id: wire.item_id,
+            category: "个股新闻".to_string(),
+            code: Some(storage_code.to_string()),
+            title: wire.title.clone(),
+            summary: summary.clone(),
+            url: wire.canonical_url,
+            source_name: wire.publisher,
+            published_at,
+            fetched_at,
+            content_hash: crate::data_provider::news_item::content_hash(&wire.title, &summary),
+        };
+        records.push(SinaInstrumentNewsRecord::new(
+            persistence_item,
+            wire.evidence,
+        ));
+    }
+    Ok(GatewayBatch::Available { records, evidence })
+}
+
+fn validate_external_news_payload(
+    payload: &crate::grpc_client::pb::magic::market::v1::CanonicalPayload,
+    capability: &'static str,
+) -> Result<(), GatewayError> {
+    if payload.schema != EXTERNAL_INSTRUMENT_NEWS_SCHEMA
+        || payload.schema_version != 1
+        || payload.content_type != CANONICAL_JSON_CONTENT_TYPE
+    {
+        return Err(err(
+            capability,
+            "InstrumentNews schema/version/content-type 冲突",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_external_news_fields(
+    value: &Value,
+    capability: &'static str,
+) -> Result<(), GatewayError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| err(capability, "external news payload 必须是 JSON object"))?;
+    if object.len() != EXTERNAL_INSTRUMENT_NEWS_FIELDS.len()
+        || EXTERNAL_INSTRUMENT_NEWS_FIELDS
+            .iter()
+            .any(|field| !object.contains_key(*field))
+    {
+        return Err(err(
+            capability,
+            "external news payload fields 与 schema@1 冲突",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_external_news_text(
+    value: &str,
+    field: &'static str,
+    capability: &'static str,
+) -> Result<(), GatewayError> {
+    NonEmptyText::new(value)
+        .map(|_| ())
+        .map_err(|error| err(capability, format!("external news {field} 无效: {error}")))
+}
+
 pub fn intraday_shape(q: &QueryResult) -> Result<GatewayBatch<IntradayShapeFact>, GatewayError> {
     let capability = "IntradayShape";
     let (parsed, ev) = parse_records_parts(q, capability)?;
@@ -2036,25 +2903,169 @@ pub fn upper_limit_pool_review(
     })
 }
 
+const LIMIT_POOL_SCHEMA: &str = "market.limit_pools";
+const LIMIT_POOL_MAX_RECORDS: usize = 200;
+const LIMIT_POOL_FIELDS: &[&str] = &[
+    "kind",
+    "instrument",
+    "trading_date",
+    "price",
+    "change",
+    "volume",
+    "turnover",
+    "sealed_amount",
+    "first_seal_at",
+    "last_seal_at",
+    "break_count",
+    "streak",
+    "industry",
+    "board_name",
+    "seal_state",
+    "reseal_count",
+    "reason",
+    "evidence",
+];
+
+/// Complete LocalBridge LimitPools contract. Optional provider fields must be
+/// present as explicit nulls; serde performs the typed positive-price and
+/// finite-ratio validation after the closed field-set check.
+pub fn limit_pools(
+    q: &QueryResult,
+    trading_date: NaiveDate,
+) -> Result<GatewayBatch<LimitPoolEntry>, GatewayError> {
+    let capability = "LimitPools";
+    let evidence = evidence_of(q, capability)?;
+    if !q.complete {
+        return Err(err(capability, "响应 complete=false，不接纳截断涨停池"));
+    }
+    if !matches!(
+        evidence.provider,
+        ProviderId::Eastmoney | ProviderId::Tonghuashun
+    ) {
+        return Err(err(
+            capability,
+            "batch provider 不是已登记 exact-date 涨停池来源",
+        ));
+    }
+    let expected_date = trading_date.format("%Y-%m-%d").to_string();
+    if evidence.source_at.as_deref() != Some(expected_date.as_str()) {
+        return Err(err(capability, "batch source_at 与请求交易日冲突"));
+    }
+    crate::data_gateway::parse_evidence_instant(
+        capability,
+        evidence.provider,
+        "observed_at",
+        &evidence.observed_at,
+    )?;
+    if q.records.len() != 1 {
+        return Err(err(
+            capability,
+            format!(
+                "canonical LimitPools contract requires exactly one payload, got {}",
+                q.records.len()
+            ),
+        ));
+    }
+    let payload = &q.records[0];
+    if payload.schema != LIMIT_POOL_SCHEMA
+        || payload.schema_version != 1
+        || payload.content_type != CANONICAL_JSON_CONTENT_TYPE
+    {
+        return Err(err(
+            capability,
+            "LimitPools schema/version/content-type 冲突",
+        ));
+    }
+    let values: Vec<Value> = serde_json::from_slice(&payload.data).map_err(|error| {
+        err(
+            capability,
+            format!("LimitPools payload 非 JSON 数组: {error}"),
+        )
+    })?;
+    if values.len() > LIMIT_POOL_MAX_RECORDS {
+        return Err(err(
+            capability,
+            "LimitPools records 超过 P-01 whole-pool 上限 200",
+        ));
+    }
+
+    let mut seen_codes = std::collections::HashSet::with_capacity(values.len());
+    let mut records = Vec::with_capacity(values.len());
+    for value in values {
+        let object = value
+            .as_object()
+            .ok_or_else(|| err(capability, "LimitPoolEntry 必须是 JSON object"))?;
+        if object.len() != LIMIT_POOL_FIELDS.len()
+            || LIMIT_POOL_FIELDS
+                .iter()
+                .any(|field| !object.contains_key(*field))
+        {
+            return Err(err(capability, "LimitPoolEntry fields 与 schema@1 冲突"));
+        }
+        let record: LimitPoolEntry = serde_json::from_value(value)
+            .map_err(|error| err(capability, format!("LimitPoolEntry 类型校验失败: {error}")))?;
+        if record.kind != LimitPoolKind::Upper
+            || record.trading_date.as_str() != expected_date.as_str()
+        {
+            return Err(err(
+                capability,
+                "LimitPoolEntry kind/trading_date 与请求冲突",
+            ));
+        }
+        if record.evidence.provider() != evidence.provider
+            || record.evidence.source_at() != evidence.source_at.as_deref()
+            || record.evidence.observed_at() != evidence.observed_at.as_str()
+            || record.evidence.batch_id() != evidence.batch_id.as_str()
+        {
+            return Err(err(
+                capability,
+                "LimitPoolEntry record evidence 与 envelope 冲突",
+            ));
+        }
+        if !seen_codes.insert(record.instrument.code().to_owned()) {
+            return Err(err(capability, "LimitPools 包含重复 instrument code"));
+        }
+        records.push(record);
+    }
+
+    if records.is_empty() {
+        Ok(GatewayBatch::VerifiedEmpty(evidence))
+    } else {
+        Ok(GatewayBatch::Available { records, evidence })
+    }
+}
+
 /// T0 证据批: 视图是 {"records": [...], "rejections": [...]} 对象 (delegate
 /// fetch_t0_evidence 契约; record 字段 serde 直出)。
 /// 返回 MagicTdxT0Batch (records + rejections 全量) — 与本地
 /// MagicTdxGateway::get_t0_evidence_batch 对齐, rejections 绝不丢弃。
-/// 空 records → 空批 (本地语义: get_t0_evidence_batch 返回空批而非错误)。
+/// 空 records 无法从当前 wire 视图恢复 batch.requested_at，显式拒绝，绝不以
+/// observed_at 或 consumer now 代填。
 pub fn t0_evidence_batch(q: &QueryResult) -> Result<MagicTdxT0Batch, GatewayError> {
     let capability = "T0Evidence";
     let ev = evidence_of(q, capability)?;
-    let Some(payload) = q.records.first() else {
-        return Err(err(capability, "records 空 (服务端无 canonical payload)"));
-    };
-    // 合同 (M1): 视图是对象 {"records","rejections"} (非数组);
-    // 防御性兼容数组包对象 (parse_records 的数组路径)。
+    if !q.complete {
+        return Err(err(
+            capability,
+            "响应 complete=false，T0 consumer 不接纳 partial batch",
+        ));
+    }
+    if q.records.len() != 1 {
+        return Err(err(
+            capability,
+            format!(
+                "T0 canonical contract requires exactly one payload, got {}",
+                q.records.len()
+            ),
+        ));
+    }
+    let payload = &q.records[0];
+    // 合同 (M1): 视图必须是对象 {"records","rejections"}，不接纳数组兼容形状。
     let value: Value = serde_json::from_slice(&payload.data)
         .map_err(|e| err(capability, format!("T0Evidence 视图非 JSON: {e}")))?;
     let view = value
-        .as_array()
-        .and_then(|arr| arr.first())
-        .unwrap_or(&value);
+        .as_object()
+        .ok_or_else(|| err(capability, "T0Evidence 视图必须是 JSON 对象"))?;
     let records = view
         .get("records")
         .and_then(Value::as_array)
@@ -2123,12 +3134,30 @@ pub fn t0_evidence_batch(q: &QueryResult) -> Result<MagicTdxT0Batch, GatewayErro
             })
             .collect::<Result<Vec<_>, _>>()?;
         let code = as_str(v, "code", capability)?;
+        let requested_at_raw = as_str(v, "requested_at", capability)?;
+        let source_at_raw = as_str(v, "source_at", capability)?;
+        let observed_at_raw = as_str(v, "observed_at", capability)?;
         out.push(MagicTdxT0Evidence {
             instrument: instrument_for(&code, capability)?,
             code,
-            requested_at: as_rfc3339(v, "requested_at", capability)?,
-            source_at: as_rfc3339(v, "source_at", capability)?,
-            observed_at: as_rfc3339(v, "observed_at", capability)?,
+            requested_at: crate::data_gateway::parse_evidence_instant(
+                capability,
+                ev.provider,
+                "record.requested_at",
+                &requested_at_raw,
+            )?,
+            source_at: crate::data_gateway::parse_evidence_instant(
+                capability,
+                ev.provider,
+                "record.source_at",
+                &source_at_raw,
+            )?,
+            observed_at: crate::data_gateway::parse_evidence_instant(
+                capability,
+                ev.provider,
+                "record.observed_at",
+                &observed_at_raw,
+            )?,
             batch_id: as_str(v, "batch_id", capability)?,
             quote: MagicTdxT0Quote {
                 price: quote_obj
@@ -2182,28 +3211,189 @@ pub fn t0_evidence_batch(q: &QueryResult) -> Result<MagicTdxT0Batch, GatewayErro
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    // 批级时间戳: source_at/observed_at 从批级证据取 (服务端 pack_ev 来源);
-    // requested_at 记录级有 (同批一致), 空批时以 observed_at 兜底 (同机取数时刻)。
-    let requested_at = out
-        .first()
-        .map(|r| r.requested_at)
-        .unwrap_or_else(|| ev.observed_at.parse().unwrap_or_else(|_| Utc::now()));
+    // 批级时间戳从服务端 envelope 原样解析；requested_at 仅记录级存在，
+    // 空记录无法无损重建，必须显式失败，不能用 observed_at/consumer now 代填。
+    let requested_at = out.first().map(|r| r.requested_at).ok_or_else(|| {
+        err(
+            capability,
+            "T0Evidence 空 records 缺 requested_at，无法保真重建",
+        )
+    })?;
+    let source_at_raw = ev
+        .source_at
+        .as_deref()
+        .ok_or_else(|| err(capability, "T0Evidence source_at 缺失"))?;
     Ok(MagicTdxT0Batch {
+        provider: ev.provider,
+        source: ev.source.clone(),
         requested_at,
-        source_at: ev
-            .source_at
-            .as_deref()
-            .ok_or_else(|| err(capability, "T0Evidence source_at 缺失"))?
-            .parse()
-            .map_err(|e| err(capability, format!("T0Evidence source_at 非法 ({e})")))?,
-        observed_at: ev
-            .observed_at
-            .parse()
-            .map_err(|e| err(capability, format!("T0Evidence observed_at 非法 ({e})")))?,
+        source_at: crate::data_gateway::parse_evidence_instant(
+            capability,
+            ev.provider,
+            "source_at",
+            source_at_raw,
+        )?,
+        observed_at: crate::data_gateway::parse_evidence_instant(
+            capability,
+            ev.provider,
+            "observed_at",
+            &ev.observed_at,
+        )?,
         batch_id: ev.batch_id.clone(),
         records: out,
         rejections,
     })
+}
+
+fn require_positive_live_value(
+    capability: &'static str,
+    field: &str,
+    value: f64,
+) -> Result<(), GatewayError> {
+    if value.is_finite() && value > 0.0 {
+        Ok(())
+    } else {
+        Err(err(
+            capability,
+            format!("{field} 必须为正有限数，实际为 {value}"),
+        ))
+    }
+}
+
+fn require_non_negative_live_value(
+    capability: &'static str,
+    field: &str,
+    value: f64,
+) -> Result<(), GatewayError> {
+    if value.is_finite() && value >= 0.0 {
+        Ok(())
+    } else {
+        Err(err(
+            capability,
+            format!("{field} 必须为非负有限数，实际为 {value}"),
+        ))
+    }
+}
+
+fn validate_t0_live_quote(
+    quote: &MagicTdxT0Quote,
+    capability: &'static str,
+) -> Result<(), GatewayError> {
+    for (field, value) in [
+        ("quote.price", quote.price),
+        ("quote.last_close", quote.last_close),
+        ("quote.open", quote.open),
+        ("quote.high", quote.high),
+        ("quote.low", quote.low),
+    ] {
+        require_positive_live_value(capability, field, value)?;
+    }
+    for (field, value) in [
+        ("quote.volume", quote.volume),
+        ("quote.amount", quote.amount),
+    ] {
+        require_non_negative_live_value(capability, field, value)?;
+    }
+    for (side, levels) in [("bids", &quote.bids), ("asks", &quote.asks)] {
+        for (index, level) in levels.iter().enumerate() {
+            require_positive_live_value(
+                capability,
+                &format!("quote.{side}[{index}].price"),
+                level.price,
+            )?;
+            require_non_negative_live_value(
+                capability,
+                &format!("quote.{side}[{index}].volume"),
+                level.volume,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// RPC 完成后的 consumer-side T0 完整批次门。
+pub fn t0_evidence_batch_at(
+    q: &QueryResult,
+    now: DateTime<Utc>,
+) -> Result<MagicTdxT0Batch, GatewayError> {
+    let capability = "T0Evidence";
+    let (envelope, source_at, observed_at) = live_evidence_times(q, capability, now)?;
+    let batch = t0_evidence_batch(q)?;
+    if batch.provider != envelope.provider
+        || batch.source != envelope.source
+        || batch.batch_id != envelope.batch_id
+        || batch.source_at != source_at
+        || batch.observed_at != observed_at
+    {
+        return Err(err(
+            capability,
+            "T0 reconstructed batch evidence differs from gRPC envelope",
+        ));
+    }
+    if batch.requested_at > batch.observed_at {
+        return Err(err(
+            capability,
+            format!(
+                "batch.requested_at 晚于 observed_at: requested_at={} observed_at={}",
+                batch.requested_at, batch.observed_at
+            ),
+        ));
+    }
+
+    let mut minimum_record_source_at: Option<DateTime<Utc>> = None;
+    for record in &batch.records {
+        if record.code != record.instrument.code() {
+            return Err(err(
+                capability,
+                format!(
+                    "T0 record identity mismatch: code={} instrument={}",
+                    record.code,
+                    record.instrument.code()
+                ),
+            ));
+        }
+        if record.batch_id != batch.batch_id
+            || record.requested_at != batch.requested_at
+            || record.observed_at != batch.observed_at
+        {
+            return Err(err(
+                capability,
+                format!(
+                    "T0 record evidence differs from batch: code={}",
+                    record.code
+                ),
+            ));
+        }
+        validate_live_times(
+            capability,
+            batch.provider,
+            record.source_at,
+            record.observed_at,
+            now,
+            "record",
+        )?;
+        validate_t0_live_quote(&record.quote, capability)?;
+        require_positive_live_value(
+            capability,
+            "intraday_average_price",
+            record.intraday_average_price,
+        )?;
+        minimum_record_source_at = Some(
+            minimum_record_source_at
+                .map(|current| current.min(record.source_at))
+                .unwrap_or(record.source_at),
+        );
+    }
+    if minimum_record_source_at != Some(batch.source_at) {
+        return Err(err(
+            capability,
+            format!(
+                "batch.source_at 必须等于最早 record.source_at: batch={} minimum={:?}",
+                batch.source_at, minimum_record_source_at
+            ),
+        ));
+    }
+    Ok(batch)
 }
 
 /// as_optional_u32: JSON null → None; 缺失 → Err fail-closed。
@@ -2226,30 +3416,63 @@ fn as_optional_u32(
 /// 写 JSON ("Bocha"/"Tavily"/"SerpApi" — 不在 ProviderId 解析表内, 不能复用 parse_provider)。
 /// 未知/空 → Err (fail-closed)。
 fn parse_general_web_provider(s: &str) -> Result<GeneralWebResearchProvider, GatewayError> {
-    Ok(match s {
-        "Bocha" => GeneralWebResearchProvider::Bocha,
-        "Tavily" => GeneralWebResearchProvider::Tavily,
-        "SerpApi" => GeneralWebResearchProvider::SerpApi,
-        _ => {
-            return Err(err(
-                "SemanticSearch",
-                format!("selected_provider 无法解析为 GeneralWebResearchProvider: {s}"),
-            ))
-        }
+    GeneralWebResearchProvider::from_wire_name(s).ok_or_else(|| {
+        err(
+            "SemanticSearch",
+            format!("selected_provider 无法解析为 GeneralWebResearchProvider: {s}"),
+        )
     })
 }
 
-/// 语义检索桥。视图: delegate.rs fetch_semantic_search (:1170) — 服务端
+/// BR-242 语义检索桥。视图: delegate.rs fetch_semantic_search — 服务端
 /// records = serde_json::to_value(GeneralWebResearchRecord) 直出 (snake_case serde,
 /// 含 record 级 evidence 子对象), selected_provider = Debug 名。批级 evidence
 /// 客户端重建 (query 客户端已知; use_scope 恒 ResearchOnly — 本地 admit_records 语义)。
-/// record 级 wire 完整性: serde round-trip + evidence 归属 (batch_id/provider) 与批级一致。
+/// record 级 wire 完整性: serde round-trip + evidence 归属
+/// (batch_id/provider/observed_at) 与批级一致。
 pub fn semantic_search(
     q: &QueryResult,
     query: &str,
+    requested_provider: GeneralWebResearchProvider,
+    requested_limit: usize,
 ) -> Result<GeneralWebResearchBatch, GatewayError> {
     let capability = "SemanticSearch";
+    if !(1..=50).contains(&requested_limit) {
+        return Err(GatewayError::invalid_request(
+            capability,
+            format!("requested limit must be within 1..=50, got {requested_limit}"),
+        ));
+    }
+    if q.admission != crate::grpc_client::pb::magic::market::v1::AdmissionState::Admitted {
+        return Err(err(capability, "响应未获 repository admission"));
+    }
+    if !q.diagnostic_blocker.is_empty() {
+        return Err(err(
+            capability,
+            "响应携带 diagnostic_blocker, 不得进入生产证据转换",
+        ));
+    }
     let provider = parse_general_web_provider(&q.selected_provider)?;
+    if provider != requested_provider {
+        return Err(err(
+            capability,
+            format!(
+                "response provider {} differs from requested provider {}",
+                provider.label(),
+                requested_provider.label()
+            ),
+        ));
+    }
+    if q.source != requested_provider.source() {
+        return Err(err(
+            capability,
+            format!(
+                "response source {:?} differs from requested provider source {:?}",
+                q.source,
+                requested_provider.source()
+            ),
+        ));
+    }
     if q.source.is_empty() {
         return Err(err(capability, "source 空 (服务端未回填证据链)"));
     }
@@ -2260,11 +3483,31 @@ pub fn semantic_search(
         provider,
         source: q.source.clone(),
         query: query.to_string(),
-        observed_at: record_observed_at(q, capability)?,
+        // SemanticSearch is not a financial ProviderId route. Its delegate
+        // serializes GeneralWebResearchEvidence.observed_at with to_rfc3339(),
+        // so parse that frozen wire field directly instead of routing Bocha
+        // through the unrelated ProviderId parser.
+        observed_at: DateTime::parse_from_rfc3339(&q.observed_at)
+            .map(|value| value.with_timezone(&Utc))
+            .map_err(|error| {
+                err(
+                    capability,
+                    format!("observed_at 非 RFC3339: {} ({error})", q.observed_at),
+                )
+            })?,
         batch_id: q.batch_id.clone(),
         use_scope: ResearchUseScope::ResearchOnly,
     };
     let parsed = parse_records(q, capability)?;
+    if parsed.len() > requested_limit {
+        return Err(err(
+            capability,
+            format!(
+                "response record count {} exceeds requested limit {requested_limit}",
+                parsed.len()
+            ),
+        ));
+    }
     if parsed.is_empty() {
         return Ok(GeneralWebResearchBatch::VerifiedEmpty(evidence));
     }
@@ -2278,6 +3521,9 @@ pub fn semantic_search(
             }
             if record.evidence.provider != evidence.provider {
                 return Err(err(capability, "记录 evidence.provider 与批级不一致"));
+            }
+            if record.evidence.observed_at != evidence.observed_at {
+                return Err(err(capability, "记录 evidence.observed_at 与批级不一致"));
             }
             Ok(record)
         })
@@ -2436,6 +3682,7 @@ pub fn outcome_daily_bars(q: &QueryResult) -> Result<RawOutcomeFetch, OutcomeTra
 mod tests {
     use super::*;
     use crate::grpc_client::pb::magic::market::v1::{AdmissionState, CanonicalPayload};
+    use chrono::TimeZone;
 
     fn mk_q(data: &str, provider: &str, source: &str) -> QueryResult {
         QueryResult {
@@ -2454,6 +3701,376 @@ mod tests {
             source: source.to_string(),
             diagnostic_blocker: String::new(),
         }
+    }
+
+    fn p01_limit_pools_q() -> QueryResult {
+        let mut query = mk_q("[]", "Eastmoney", "TEST_CODE_eastmoney_limit_pool");
+        query.batch_id = "TEST_CODE_LIMIT_POOL_BATCH".to_string();
+        query.source_at = "2026-08-18".to_string();
+        query.observed_at = "2026-08-18T10:03:00+08:00".to_string();
+        query.records[0].schema = "market.limit_pools".to_string();
+        query.records[0].data = serde_json::to_vec(&serde_json::json!([{
+            "kind": "Upper",
+            "instrument": {
+                "exchange": "Shanghai",
+                "code": "TEST_CODE_600001",
+                "asset_class": "Equity"
+            },
+            "trading_date": "2026-08-18",
+            "price": 10.25,
+            "change": {"value": 10.0, "unit": "Percent"},
+            "volume": 12300.0,
+            "turnover": {"value": 3.5, "unit": "Percent"},
+            "sealed_amount": 8800000.0,
+            "first_seal_at": "2026-08-18T09:31:00+08:00",
+            "last_seal_at": "2026-08-18T10:02:00+08:00",
+            "break_count": 1,
+            "streak": 2,
+            "industry": "TEST_CODE industry",
+            "board_name": "TEST_CODE board",
+            "seal_state": "TEST_CODE sealed",
+            "reseal_count": 1,
+            "reason": "TEST_CODE reason",
+            "evidence": {
+                "provider": "Eastmoney",
+                "source_at": "2026-08-18",
+                "observed_at": "2026-08-18T10:03:00+08:00",
+                "batch_id": "TEST_CODE_LIMIT_POOL_BATCH"
+            }
+        }]))
+        .expect("TEST_CODE canonical LimitPools JSON");
+        query
+    }
+
+    #[test]
+    fn p01_limit_pools_roundtrips_complete_entry_and_original_evidence() {
+        let query = p01_limit_pools_q();
+        let date = NaiveDate::from_ymd_opt(2026, 8, 18).expect("TEST_CODE date");
+        let batch = limit_pools(&query, date).expect("complete exact-date LimitPools batch");
+        let record = &batch.records()[0];
+
+        assert_eq!(record.kind, LimitPoolKind::Upper);
+        assert_eq!(record.instrument.code(), "TEST_CODE_600001");
+        assert_eq!(record.trading_date.as_str(), "2026-08-18");
+        assert_eq!(record.price.get(), 10.25);
+        assert_eq!(record.change.get(), 10.0);
+        assert_eq!(record.volume.map(|value| value.get()), Some(12_300.0));
+        assert_eq!(record.break_count, Some(1));
+        assert_eq!(record.streak.map(|value| value.get()), Some(2));
+        assert_eq!(record.evidence.provider(), ProviderId::Eastmoney);
+        assert_eq!(record.evidence.source_at(), Some("2026-08-18"));
+        assert_eq!(record.evidence.observed_at(), "2026-08-18T10:03:00+08:00");
+        assert_eq!(record.evidence.batch_id(), "TEST_CODE_LIMIT_POOL_BATCH");
+        assert_eq!(batch.evidence().source, "TEST_CODE_eastmoney_limit_pool");
+    }
+
+    #[test]
+    fn p01_limit_pools_rejects_contract_value_and_evidence_conflicts() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 18).expect("TEST_CODE date");
+        let mut cases = Vec::new();
+
+        let mut partial = p01_limit_pools_q();
+        partial.complete = false;
+        cases.push(("partial", partial));
+
+        let mut wrong_schema = p01_limit_pools_q();
+        wrong_schema.records[0].schema = "market.limit_pools.v2".to_string();
+        cases.push(("schema", wrong_schema));
+
+        let mut wrong_version = p01_limit_pools_q();
+        wrong_version.records[0].schema_version = 2;
+        cases.push(("version", wrong_version));
+
+        let mut wrong_content_type = p01_limit_pools_q();
+        wrong_content_type.records[0].content_type = "application/json".to_string();
+        cases.push(("content_type", wrong_content_type));
+
+        let mut missing_field = p01_limit_pools_q();
+        let mut missing_value: Value =
+            serde_json::from_slice(&missing_field.records[0].data).expect("TEST_CODE JSON");
+        missing_value[0]
+            .as_object_mut()
+            .expect("TEST_CODE entry")
+            .remove("reason");
+        missing_field.records[0].data = serde_json::to_vec(&missing_value).expect("TEST_CODE JSON");
+        cases.push(("missing_field", missing_field));
+
+        let mut extra_field = p01_limit_pools_q();
+        let mut extra_value: Value =
+            serde_json::from_slice(&extra_field.records[0].data).expect("TEST_CODE JSON");
+        extra_value[0]["unexpected"] = serde_json::json!(true);
+        extra_field.records[0].data = serde_json::to_vec(&extra_value).expect("TEST_CODE JSON");
+        cases.push(("extra_field", extra_field));
+
+        for (label, field, value) in [
+            ("kind", "kind", serde_json::json!("Broken")),
+            (
+                "trading_date",
+                "trading_date",
+                serde_json::json!("2026-08-17"),
+            ),
+            ("price", "price", serde_json::json!(0.0)),
+            ("change", "change", serde_json::json!("not-a-ratio")),
+        ] {
+            let mut query = p01_limit_pools_q();
+            let mut payload: Value =
+                serde_json::from_slice(&query.records[0].data).expect("TEST_CODE JSON");
+            payload[0][field] = value;
+            query.records[0].data = serde_json::to_vec(&payload).expect("TEST_CODE JSON");
+            cases.push((label, query));
+        }
+
+        for (label, field, value) in [
+            (
+                "record_provider",
+                "provider",
+                serde_json::json!("Tonghuashun"),
+            ),
+            (
+                "record_source_at",
+                "source_at",
+                serde_json::json!("2026-08-17"),
+            ),
+            (
+                "record_observed_at",
+                "observed_at",
+                serde_json::json!("2026-08-18T10:04:00+08:00"),
+            ),
+            (
+                "record_batch_id",
+                "batch_id",
+                serde_json::json!("TEST_CODE_OTHER_BATCH"),
+            ),
+        ] {
+            let mut query = p01_limit_pools_q();
+            let mut payload: Value =
+                serde_json::from_slice(&query.records[0].data).expect("TEST_CODE JSON");
+            payload[0]["evidence"][field] = value;
+            query.records[0].data = serde_json::to_vec(&payload).expect("TEST_CODE JSON");
+            cases.push((label, query));
+        }
+
+        let mut duplicate = p01_limit_pools_q();
+        let mut duplicate_value: Value =
+            serde_json::from_slice(&duplicate.records[0].data).expect("TEST_CODE JSON");
+        let duplicate_record = duplicate_value[0].clone();
+        duplicate_value
+            .as_array_mut()
+            .expect("TEST_CODE array")
+            .push(duplicate_record);
+        duplicate.records[0].data = serde_json::to_vec(&duplicate_value).expect("TEST_CODE JSON");
+        cases.push(("duplicate", duplicate));
+
+        let mut over_limit = p01_limit_pools_q();
+        let record: Value = serde_json::from_slice::<Value>(&over_limit.records[0].data)
+            .expect("TEST_CODE JSON")[0]
+            .clone();
+        over_limit.records[0].data =
+            serde_json::to_vec(&vec![record; 201]).expect("TEST_CODE JSON");
+        cases.push(("count", over_limit));
+
+        let mut wrong_envelope_source_at = p01_limit_pools_q();
+        wrong_envelope_source_at.source_at = "2026-08-17".to_string();
+        cases.push(("envelope_source_at", wrong_envelope_source_at));
+
+        let mut invalid_envelope_observed_at = p01_limit_pools_q();
+        invalid_envelope_observed_at.observed_at = "not-an-instant".to_string();
+        cases.push(("envelope_observed_at", invalid_envelope_observed_at));
+
+        let mut unregistered_provider = p01_limit_pools_q();
+        unregistered_provider.selected_provider = "Tdx".to_string();
+        cases.push(("envelope_provider", unregistered_provider));
+
+        let mut multiple_payloads = p01_limit_pools_q();
+        multiple_payloads
+            .records
+            .push(multiple_payloads.records[0].clone());
+        cases.push(("payload_count", multiple_payloads));
+
+        for (label, query) in cases {
+            let error = limit_pools(&query, date)
+                .expect_err("invalid LimitPools contract must fail closed");
+            assert_eq!(error.reason_code(), "invalid_evidence", "case={label}");
+        }
+    }
+
+    #[test]
+    fn p01_limit_pools_accepts_only_proven_complete_empty() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 18).expect("TEST_CODE date");
+        let mut empty = p01_limit_pools_q();
+        empty.records[0].data = b"[]".to_vec();
+        assert!(matches!(
+            limit_pools(&empty, date).expect("complete empty is provider-verified"),
+            GatewayBatch::VerifiedEmpty(_)
+        ));
+
+        empty.complete = false;
+        assert!(limit_pools(&empty, date).is_err());
+    }
+
+    fn provider_top_n_row(
+        metric: &str,
+        ordinal: u64,
+        code: &str,
+        unit: &str,
+        batch_id: &str,
+        observed_at: &str,
+    ) -> Value {
+        serde_json::json!({
+            "metric": metric,
+            "ordinal": ordinal,
+            "code": code,
+            "label": format!("TEST_CODE_{metric}_{ordinal}"),
+            "value": 1.0,
+            "unit": unit,
+            "trading_date": "2026-08-17",
+            "filter_identity": "TEST_CODE_A_SHARE_FILTER",
+            "provider_declared_total": 2,
+            "inspected_row_count": 2,
+            "evidence": {
+                "provider": "Eastmoney",
+                "source": "eastmoney-web",
+                "source_at": null,
+                "observed_at": observed_at,
+                "batch_id": batch_id,
+            },
+        })
+    }
+
+    fn provider_top_n_pair_q() -> QueryResult {
+        let volume_observed_at = "2026-08-17T15:36:00+08:00";
+        let rows = serde_json::json!([
+            provider_top_n_row(
+                "VolumeRatio",
+                1,
+                "600001",
+                "Multiple",
+                "TEST_CODE_REAL_VOLUME_BATCH",
+                volume_observed_at,
+            ),
+            provider_top_n_row(
+                "MainNetInflow",
+                1,
+                "600002",
+                "Yuan",
+                "TEST_CODE_REAL_INFLOW_BATCH",
+                "2026-08-17T15:36:01+08:00",
+            ),
+        ]);
+        let mut query = mk_q(&rows.to_string(), "Eastmoney", "eastmoney-web");
+        query.batch_id = "TEST_CODE_REAL_VOLUME_BATCH".to_string();
+        query.source_at.clear();
+        query.observed_at = volume_observed_at.to_string();
+        query
+    }
+
+    #[test]
+    fn br240_provider_top_n_pair_preserves_two_real_batch_evidences() {
+        let (volume, inflow) =
+            provider_top_n_pair(&provider_top_n_pair_q()).expect("two real metric batches");
+
+        assert_eq!(volume.evidence().batch_id, "TEST_CODE_REAL_VOLUME_BATCH");
+        assert_eq!(inflow.evidence().batch_id, "TEST_CODE_REAL_INFLOW_BATCH");
+        assert_eq!(volume.evidence().source, "eastmoney-web");
+        assert_eq!(inflow.evidence().source, "eastmoney-web");
+        assert_eq!(volume.evidence().source_at, None);
+        assert_eq!(inflow.evidence().source_at, None);
+        assert_eq!(volume.evidence().observed_at, "2026-08-17T15:36:00+08:00");
+        assert_eq!(inflow.evidence().observed_at, "2026-08-17T15:36:01+08:00");
+        assert_ne!(volume.evidence().batch_id, inflow.evidence().batch_id);
+    }
+
+    #[test]
+    fn br240_provider_top_n_pair_rejects_invalid_evidence_matrix() {
+        let mut missing = provider_top_n_pair_q();
+        let mut missing_rows: Value = serde_json::from_slice(&missing.records[0].data).unwrap();
+        missing_rows[0]
+            .as_object_mut()
+            .expect("record object")
+            .remove("evidence");
+        missing.records[0].data = serde_json::to_vec(&missing_rows).unwrap();
+
+        let mut mixed = provider_top_n_pair_q();
+        let mut mixed_rows: Value = serde_json::from_slice(&mixed.records[0].data).unwrap();
+        mixed_rows
+            .as_array_mut()
+            .expect("rows array")
+            .push(provider_top_n_row(
+                "VolumeRatio",
+                2,
+                "600003",
+                "Multiple",
+                "TEST_CODE_MIXED_VOLUME_BATCH",
+                "2026-08-17T15:36:00+08:00",
+            ));
+        mixed.records[0].data = serde_json::to_vec(&mixed_rows).unwrap();
+
+        let mut same = provider_top_n_pair_q();
+        let mut same_rows: Value = serde_json::from_slice(&same.records[0].data).unwrap();
+        same_rows[1]["evidence"]["batch_id"] =
+            Value::String("TEST_CODE_REAL_VOLUME_BATCH".to_string());
+        same.records[0].data = serde_json::to_vec(&same_rows).unwrap();
+
+        let mut envelope_conflict = provider_top_n_pair_q();
+        envelope_conflict.batch_id = "TEST_CODE_CONFLICTING_ENVELOPE_BATCH".to_string();
+
+        let mut provider_conflict = provider_top_n_pair_q();
+        let mut provider_rows: Value =
+            serde_json::from_slice(&provider_conflict.records[0].data).unwrap();
+        provider_rows[1]["evidence"]["provider"] = Value::String("Sina".to_string());
+        provider_conflict.records[0].data = serde_json::to_vec(&provider_rows).unwrap();
+
+        let mut source_conflict = provider_top_n_pair_q();
+        let mut source_rows: Value =
+            serde_json::from_slice(&source_conflict.records[0].data).unwrap();
+        source_rows[1]["evidence"]["source"] = Value::String("TEST_CODE_OTHER_SOURCE".to_string());
+        source_conflict.records[0].data = serde_json::to_vec(&source_rows).unwrap();
+
+        let mut trading_date_conflict = provider_top_n_pair_q();
+        let mut trading_date_rows: Value =
+            serde_json::from_slice(&trading_date_conflict.records[0].data).unwrap();
+        trading_date_rows[1]["trading_date"] = Value::String("2026-08-14".to_string());
+        trading_date_conflict.records[0].data = serde_json::to_vec(&trading_date_rows).unwrap();
+
+        let mut future_source_date = provider_top_n_pair_q();
+        let mut future_rows: Value =
+            serde_json::from_slice(&future_source_date.records[0].data).unwrap();
+        future_rows[0]["trading_date"] = Value::String("2026-08-18".to_string());
+        future_rows[1]["trading_date"] = Value::String("2026-08-18".to_string());
+        future_source_date.records[0].data = serde_json::to_vec(&future_rows).unwrap();
+
+        let mut source_at_date_conflict = provider_top_n_pair_q();
+        let mut source_at_rows: Value =
+            serde_json::from_slice(&source_at_date_conflict.records[0].data).unwrap();
+        source_at_rows[1]["evidence"]["source_at"] =
+            Value::String("2026-08-16T15:36:00+08:00".to_string());
+        source_at_date_conflict.records[0].data = serde_json::to_vec(&source_at_rows).unwrap();
+
+        for (case, query) in [
+            ("missing", missing),
+            ("mixed", mixed),
+            ("same", same),
+            ("envelope_conflict", envelope_conflict),
+            ("provider_conflict", provider_conflict),
+            ("source_conflict", source_conflict),
+            ("trading_date_conflict", trading_date_conflict),
+            ("future_source_date", future_source_date),
+            ("source_at_date_conflict", source_at_date_conflict),
+        ] {
+            let error = provider_top_n_pair(&query)
+                .expect_err("invalid per-metric evidence must fail closed");
+            assert_eq!(error.reason_code(), "invalid_evidence", "case={case}");
+            assert!(!error.retryable(), "case={case}");
+        }
+    }
+
+    #[test]
+    fn br238_local_array_contract_rejects_multiple_payloads() {
+        let mut query = mk_q("[]", "Tdx", "TEST_CODE_source");
+        query.records.push(query.records[0].clone());
+        let error = parse_records(&query, "TEST_CODE_capability")
+            .expect_err("additional local payloads must not be silently ignored");
+        assert_eq!(error.reason_code(), "invalid_evidence");
     }
 
     fn external_identity_record(code: &str, listed_and_limit_fields: bool) -> CanonicalPayload {
@@ -2518,6 +4135,293 @@ mod tests {
         ]
     }
 
+    fn external_news_q() -> QueryResult {
+        QueryResult {
+            admission: AdmissionState::Admitted,
+            selected_provider: "Sina".to_string(),
+            batch_id: "TEST_CODE_external_news_batch".to_string(),
+            complete: true,
+            observed_at: "2026-08-17T10:00:01+08:00".to_string(),
+            source_at: "2026-08-17T09:59:00+08:00".to_string(),
+            records: vec![CanonicalPayload {
+                schema: "magic.market.news_item".to_string(),
+                schema_version: 1,
+                content_type: "application/json; charset=utf-8".to_string(),
+                data: serde_json::to_vec(&serde_json::json!({
+                    "item_id": "https://example.com/TEST_CODE_news_1",
+                    "title": "TEST_CODE 产业链新闻",
+                    "summary": null,
+                    "content": null,
+                    "publisher": "TEST_CODE publisher",
+                    "canonical_url": "https://example.com/TEST_CODE_news_1",
+                    "published_at": "2026-08-17T09:59:00+08:00",
+                    "instruments": [{
+                        "exchange": "Shanghai",
+                        "code": "TEST_CODE_600396",
+                        "asset_class": "Equity"
+                    }],
+                    "topics": [],
+                    "language": "zh-CN",
+                    "evidence": {
+                        "provider": "Sina",
+                        "source_at": "2026-08-17T09:59:00+08:00",
+                        "observed_at": "2026-08-17T10:00:01+08:00",
+                        "batch_id": "TEST_CODE_external_news_batch"
+                    }
+                }))
+                .expect("external news fixture JSON"),
+            }],
+            source: "grpc-mtls:TEST_CODE_market.local".to_string(),
+            diagnostic_blocker: String::new(),
+        }
+    }
+
+    fn replace_external_news_evidence_field(
+        q: &mut QueryResult,
+        index: usize,
+        key: &str,
+        value: Value,
+    ) {
+        let mut data: Value =
+            serde_json::from_slice(&q.records[index].data).expect("external news fixture JSON");
+        data["evidence"][key] = value;
+        q.records[index].data = serde_json::to_vec(&data).expect("external news fixture JSON");
+    }
+
+    #[test]
+    fn external_instrument_news_preserves_request_identity_and_observation_time() {
+        let requested =
+            InstrumentId::new(Exchange::Shanghai, "TEST_CODE_600396", AssetClass::Equity)
+                .expect("canonical test instrument");
+        let batch =
+            external_instrument_news("TEST_CODE_600396", &requested, 100, &external_news_q())
+                .expect("complete admitted external news");
+        let record = &batch.records()[0];
+        let item = record.persistence_item();
+
+        assert_eq!(item.code.as_deref(), Some("TEST_CODE_600396"));
+        assert_eq!(item.title, "TEST_CODE 产业链新闻");
+        assert_eq!(item.summary, "");
+        assert_eq!(item.url, "https://example.com/TEST_CODE_news_1");
+        assert_eq!(item.source_name, "TEST_CODE publisher");
+        assert_eq!(
+            item.published_at,
+            DateTime::parse_from_rfc3339("2026-08-17T09:59:00+08:00")
+                .unwrap()
+                .with_timezone(&Utc)
+        );
+        assert_eq!(
+            item.fetched_at,
+            DateTime::parse_from_rfc3339("2026-08-17T10:00:01+08:00")
+                .unwrap()
+                .with_timezone(&Utc),
+            "fetched_at must preserve envelope observed_at"
+        );
+        assert_eq!(
+            record.evidence().source_at(),
+            Some("2026-08-17T09:59:00+08:00")
+        );
+    }
+
+    #[test]
+    fn external_instrument_news_accepts_per_record_times_within_batch_aggregates() {
+        let requested =
+            InstrumentId::new(Exchange::Shanghai, "TEST_CODE_600396", AssetClass::Equity)
+                .expect("canonical test instrument");
+        let mut response = external_news_q();
+        let mut older = response.records[0].clone();
+        let mut value: Value = serde_json::from_slice(&older.data).unwrap();
+        value["item_id"] = Value::String("https://example.com/TEST_CODE_news_2".to_string());
+        value["canonical_url"] = Value::String("https://example.com/TEST_CODE_news_2".to_string());
+        value["title"] = Value::String("TEST_CODE 较早产业链新闻".to_string());
+        value["published_at"] = Value::String("2026-08-17T09:58:00+08:00".to_string());
+        value["evidence"]["source_at"] = Value::String("2026-08-17T01:58:00Z".to_string());
+        value["evidence"]["observed_at"] = Value::String("2026-08-17T09:59:59+08:00".to_string());
+        older.data = serde_json::to_vec(&value).unwrap();
+        response.records.push(older);
+
+        let batch = external_instrument_news("TEST_CODE_600396", &requested, 100, &response)
+            .expect("record times may precede batch newest/final aggregate times");
+
+        assert_eq!(batch.records().len(), 2);
+        assert_eq!(
+            batch.records()[1].evidence().source_at(),
+            Some("2026-08-17T01:58:00Z"),
+            "semantic comparison must not rewrite raw record evidence"
+        );
+        assert_eq!(
+            batch.records()[1].evidence().observed_at(),
+            "2026-08-17T09:59:59+08:00"
+        );
+        assert_eq!(
+            batch.evidence().source_at.as_deref(),
+            Some("2026-08-17T09:59:00+08:00")
+        );
+        assert_eq!(batch.evidence().observed_at, "2026-08-17T10:00:01+08:00");
+    }
+
+    #[test]
+    fn external_instrument_news_rejects_records_without_requested_instrument() {
+        let requested =
+            InstrumentId::new(Exchange::Shenzhen, "TEST_CODE_000001", AssetClass::Equity)
+                .expect("canonical test instrument");
+
+        assert!(
+            external_instrument_news("TEST_CODE_000001", &requested, 100, &external_news_q(),)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn external_instrument_news_rejects_record_envelope_evidence_conflict() {
+        let requested =
+            InstrumentId::new(Exchange::Shanghai, "TEST_CODE_600396", AssetClass::Equity)
+                .expect("canonical test instrument");
+        for (field, value) in [
+            ("provider", Value::String("Tencent".to_string())),
+            (
+                "batch_id",
+                Value::String("TEST_CODE_other_batch".to_string()),
+            ),
+        ] {
+            let mut response = external_news_q();
+            replace_external_news_evidence_field(&mut response, 0, field, value);
+
+            assert!(
+                external_instrument_news("TEST_CODE_600396", &requested, 100, &response).is_err(),
+                "record {field} conflict must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn external_instrument_news_rejects_times_outside_batch_aggregate_contract() {
+        let requested =
+            InstrumentId::new(Exchange::Shanghai, "TEST_CODE_600396", AssetClass::Equity)
+                .expect("canonical test instrument");
+
+        let mut source_after_envelope = external_news_q();
+        let mut value: Value =
+            serde_json::from_slice(&source_after_envelope.records[0].data).unwrap();
+        value["published_at"] = Value::String("2026-08-17T10:00:00+08:00".to_string());
+        value["evidence"]["source_at"] = Value::String("2026-08-17T10:00:00+08:00".to_string());
+        source_after_envelope.records[0].data = serde_json::to_vec(&value).unwrap();
+        assert!(external_instrument_news(
+            "TEST_CODE_600396",
+            &requested,
+            100,
+            &source_after_envelope,
+        )
+        .is_err());
+
+        let mut source_not_publication = external_news_q();
+        replace_external_news_evidence_field(
+            &mut source_not_publication,
+            0,
+            "source_at",
+            Value::String("2026-08-17T09:58:00+08:00".to_string()),
+        );
+        assert!(external_instrument_news(
+            "TEST_CODE_600396",
+            &requested,
+            100,
+            &source_not_publication,
+        )
+        .is_err());
+
+        let mut observation_after_envelope = external_news_q();
+        replace_external_news_evidence_field(
+            &mut observation_after_envelope,
+            0,
+            "observed_at",
+            Value::String("2026-08-17T10:00:02+08:00".to_string()),
+        );
+        assert!(external_instrument_news(
+            "TEST_CODE_600396",
+            &requested,
+            100,
+            &observation_after_envelope,
+        )
+        .is_err());
+
+        let mut missing_envelope_source = external_news_q();
+        missing_envelope_source.source_at.clear();
+        assert!(external_instrument_news(
+            "TEST_CODE_600396",
+            &requested,
+            100,
+            &missing_envelope_source,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn external_instrument_news_rejects_mixed_payload_schemas() {
+        let requested =
+            InstrumentId::new(Exchange::Shanghai, "TEST_CODE_600396", AssetClass::Equity)
+                .expect("canonical test instrument");
+        let mut response = external_news_q();
+        let mut unexpected = response.records[0].clone();
+        unexpected.schema = "magic.market.unfrozen_news".to_string();
+        response.records.push(unexpected);
+
+        assert!(external_instrument_news("TEST_CODE_600396", &requested, 100, &response).is_err());
+    }
+
+    #[test]
+    fn external_instrument_news_preserves_missing_source_time() {
+        let requested =
+            InstrumentId::new(Exchange::Shanghai, "TEST_CODE_600396", AssetClass::Equity)
+                .expect("canonical test instrument");
+        let mut response = external_news_q();
+        response.source_at.clear();
+        let mut value: Value = serde_json::from_slice(&response.records[0].data).unwrap();
+        value["evidence"]["source_at"] = Value::Null;
+        response.records[0].data = serde_json::to_vec(&value).unwrap();
+
+        let batch = external_instrument_news("TEST_CODE_600396", &requested, 100, &response)
+            .expect("missing source_at remains an admitted absence");
+        assert!(batch.evidence().source_at.is_none());
+        assert!(batch.records()[0].evidence().source_at().is_none());
+    }
+
+    #[test]
+    fn external_instrument_news_rejects_items_outside_exact_requested_date_range() {
+        let requested =
+            InstrumentId::new(Exchange::Shanghai, "TEST_CODE_600396", AssetClass::Equity)
+                .expect("canonical test instrument");
+        let error = external_instrument_news_in_range(
+            "TEST_CODE_600396",
+            &requested,
+            NaiveDate::from_ymd_opt(2026, 8, 18).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 18).unwrap(),
+            100,
+            &external_news_q(),
+        )
+        .expect_err("a response outside the exact request date range must fail closed");
+        assert_eq!(error.reason_code(), "invalid_evidence");
+    }
+
+    #[test]
+    fn external_instrument_news_rejects_stale_observation_at_consumer_clock() {
+        let requested =
+            InstrumentId::new(Exchange::Shanghai, "TEST_CODE_600396", AssetClass::Equity)
+                .expect("canonical test instrument");
+        let now = DateTime::parse_from_rfc3339("2026-08-17T10:00:31.000000001+08:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        let error = external_instrument_news_at(
+            "TEST_CODE_600396",
+            &requested,
+            100,
+            &external_news_q(),
+            now,
+        )
+        .expect_err("news observation older than thirty seconds must fail closed");
+        assert_eq!(error.reason_code(), "observation_stale");
+        assert!(error.retryable());
+    }
+
     fn local_identity_now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-08-15T10:00:20+08:00")
             .expect("fixed local identity clock")
@@ -2564,6 +4468,32 @@ mod tests {
     }
 
     #[test]
+    fn br238_global_news_accepts_magic_evidence_timestamp_encodings() {
+        let record = r#"[{"item_id":"TEST_CODE_GLOBAL_NEWS_001","title":"TEST_CODE industry-chain news","summary":null,"content":null,"publisher":"TEST_CODE publisher","url":"https://example.com/TEST_CODE_GLOBAL_NEWS_001","published_at":"2026-08-17T11:50:00+08:00","instruments":[],"topics":["TEST_CODE_topic"],"language":"zh-CN"}]"#;
+
+        for (encoded, expected) in [
+            ("unix-ms:1786967511935", "2026-08-17T11:51:51.935+00:00"),
+            ("1786967511.935000000", "2026-08-17T11:51:51.935+00:00"),
+        ] {
+            let mut response = mk_q(record, "Eastmoney", "eastmoney-web");
+            response.observed_at = encoded.to_string();
+
+            let batch = global_news(&response)
+                .expect("admitted global news must accept every validated Magic timestamp form");
+            assert_eq!(
+                batch.records()[0].observed_at.to_rfc3339(),
+                expected,
+                "encoding={encoded}"
+            );
+            assert_eq!(
+                batch.evidence().observed_at,
+                encoded,
+                "raw evidence must remain traceable"
+            );
+        }
+    }
+
+    #[test]
     fn realtime_quotes_rejects_missing_change_pct() {
         let q = mk_q(
             r#"[{"code":"600519","name":"贵州茅台","price":1500.0,"previous_close":1465.7}]"#,
@@ -2571,6 +4501,78 @@ mod tests {
             "tdx",
         );
         assert!(realtime_quotes(&q).is_err());
+    }
+
+    #[test]
+    fn br238_realtime_consumer_rejects_five_seconds_and_one_nanosecond_old() {
+        let now =
+            Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap() + chrono::Duration::nanoseconds(1);
+        let mut q = mk_q(
+            r#"[{"code":"TEST_CODE_QUOTE_001","name":"TEST_CODE_name","price":10.0,"change_pct":0.0,"previous_close":9.9}]"#,
+            "Tdx",
+            "TEST_CODE_tdx",
+        );
+        q.source_at = "2026-08-17T01:30:00Z".to_string();
+        q.observed_at = "2026-08-17T01:30:00Z".to_string();
+
+        let error = realtime_quotes_at(&q, now)
+            .expect_err("consumer age 5s+1ns must fail the realtime freshness red line");
+        assert_eq!(error.reason_code(), "quote_stale");
+        assert!(error.retryable());
+    }
+
+    #[test]
+    fn br238_realtime_consumer_accepts_exact_five_second_fractional_unix_evidence() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
+        let mut q = mk_q(
+            r#"[{"code":"TEST_CODE_QUOTE_003","name":"TEST_CODE_name","price":10.0,"change_pct":0.0,"previous_close":9.9}]"#,
+            "Tdx",
+            "TEST_CODE_tdx",
+        );
+        q.source_at = "1786930200.000000000".to_string();
+        q.observed_at = "1786930200.250000000".to_string();
+
+        let batch = realtime_quotes_at(&q, now)
+            .expect("exactly five-second-old source evidence remains live");
+        assert_eq!(batch.records().len(), 1);
+        assert_eq!(
+            batch.records()[0].observed_at.timestamp_subsec_millis(),
+            250
+        );
+    }
+
+    #[test]
+    fn br238_realtime_consumer_rejects_one_nanosecond_future_source_time() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 0).unwrap();
+        let mut q = mk_q(
+            r#"[{"code":"TEST_CODE_QUOTE_004","name":"TEST_CODE_name","price":10.0,"change_pct":0.0,"previous_close":9.9}]"#,
+            "Tdx",
+            "TEST_CODE_tdx",
+        );
+        q.source_at = "1786930200.000000001".to_string();
+        q.observed_at = "1786930200.000000001".to_string();
+
+        let error = realtime_quotes_at(&q, now)
+            .expect_err("even 1ns future provider evidence must fail closed");
+        assert_eq!(error.reason_code(), "quote_stale");
+        assert!(error.retryable());
+    }
+
+    #[test]
+    fn br238_realtime_consumer_rejects_non_positive_quote_prices() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 0).unwrap();
+        let mut q = mk_q(
+            r#"[{"code":"TEST_CODE_QUOTE_002","name":"TEST_CODE_name","price":0.0,"change_pct":0.0,"previous_close":9.9}]"#,
+            "Tdx",
+            "TEST_CODE_tdx",
+        );
+        q.source_at = "1786930200.000000000".to_string();
+        q.observed_at = "1786930200.000000000".to_string();
+
+        let error = realtime_quotes_at(&q, now)
+            .expect_err("zero quote price must fail before reaching a consumer");
+        assert_eq!(error.reason_code(), "invalid_evidence");
+        assert!(!error.retryable());
     }
 
     #[test]
@@ -2633,6 +4635,123 @@ mod tests {
     }
 
     #[test]
+    fn br238_order_book_consumer_accepts_exact_five_second_fractional_unix_evidence() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
+        let mut q = mk_q(
+            r#"[{"code":"TEST_CODE_BOOK_001","bids":[{"price":9.90,"quantity":100.0},{"price":9.89,"quantity":100.0},{"price":9.88,"quantity":100.0},{"price":9.87,"quantity":100.0},{"price":9.86,"quantity":100.0}],"asks":[{"price":10.10,"quantity":200.0},{"price":10.11,"quantity":200.0},{"price":10.12,"quantity":200.0},{"price":10.13,"quantity":200.0},{"price":10.14,"quantity":200.0}],"total_bid_quantity":500.0,"total_ask_quantity":1000.0,"source_at":"1786930200.000000000"}]"#,
+            "Tdx",
+            "TEST_CODE_tdx",
+        );
+        q.source_at = "1786930200.000000000".to_string();
+        q.observed_at = "1786930200.250000000".to_string();
+
+        let batch =
+            order_books_at(&q, now).expect("exactly five-second-old book evidence remains live");
+        assert_eq!(batch.records().len(), 1);
+        assert_eq!(batch.records()[0].source_at.timestamp(), 1_786_930_200);
+    }
+
+    #[test]
+    fn br238_order_book_consumer_rejects_record_envelope_time_conflict() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
+        let mut q = mk_q(
+            r#"[{"code":"TEST_CODE_BOOK_002","bids":[{"price":9.9,"quantity":100.0}],"asks":[{"price":10.1,"quantity":200.0}],"total_bid_quantity":100.0,"total_ask_quantity":200.0,"source_at":"1786930200.000000001"}]"#,
+            "Tdx",
+            "TEST_CODE_tdx",
+        );
+        q.source_at = "1786930200.000000000".to_string();
+        q.observed_at = "1786930200.250000000".to_string();
+
+        let error = order_books_at(&q, now)
+            .expect_err("record time must bind exactly to the gRPC envelope instant");
+        assert_eq!(error.reason_code(), "invalid_evidence");
+        assert!(!error.retryable());
+    }
+
+    #[test]
+    fn br238_order_book_consumer_rejects_missing_levels_instead_of_zero_filling() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
+        let mut q = mk_q(
+            r#"[{"code":"TEST_CODE_BOOK_003","bids":[{"price":9.9,"quantity":100.0}],"asks":[{"price":10.1,"quantity":200.0}],"total_bid_quantity":100.0,"total_ask_quantity":200.0,"source_at":"1786930200.000000000"}]"#,
+            "Tdx",
+            "TEST_CODE_tdx",
+        );
+        q.source_at = "1786930200.000000000".to_string();
+        q.observed_at = "1786930200.250000000".to_string();
+
+        let error = order_books_at(&q, now)
+            .expect_err("a live five-level book cannot synthesize absent levels as zero");
+        assert_eq!(error.reason_code(), "invalid_evidence");
+        assert!(!error.retryable());
+    }
+
+    fn live_t0_q() -> QueryResult {
+        let mut q = mk_q(
+            r#"{"records":[{"instrument":{"exchange":"Shanghai","code":"600519","asset_class":"Equity"},"code":"600519","requested_at":"2026-08-17T01:29:59Z","source_at":"2026-08-17T01:30:00Z","observed_at":"2026-08-17T01:30:00.250Z","batch_id":"TEST_CODE_T0_BATCH_001","quote":{"price":10.0,"last_close":9.9,"open":9.95,"high":10.1,"low":9.8,"volume":1000.0,"amount":10000.0,"bids":[{"price":9.99,"volume":100.0},{"price":9.98,"volume":100.0},{"price":9.97,"volume":100.0},{"price":9.96,"volume":100.0},{"price":9.95,"volume":100.0}],"asks":[{"price":10.01,"volume":100.0},{"price":10.02,"volume":100.0},{"price":10.03,"volume":100.0},{"price":10.04,"volume":100.0},{"price":10.05,"volume":100.0}]},"settled_daily":[],"completed_five_minute":[],"intraday_average_price":9.98}],"rejections":[]}"#,
+            "Tdx",
+            "TEST_CODE_magic_tdx_t0",
+        );
+        q.batch_id = "TEST_CODE_T0_BATCH_001".to_string();
+        q.source_at = "1786930200.000000000".to_string();
+        q.observed_at = "1786930200.250000000".to_string();
+        q
+    }
+
+    #[test]
+    fn br238_t0_consumer_preserves_live_envelope_provenance() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
+        let q = live_t0_q();
+
+        let batch = t0_evidence_batch_at(&q, now)
+            .expect("complete exact-boundary T0 evidence must remain available");
+        assert_eq!(batch.provider, ProviderId::Tdx);
+        assert_eq!(batch.source, "TEST_CODE_magic_tdx_t0");
+        assert_eq!(batch.batch_id, "TEST_CODE_T0_BATCH_001");
+        assert_eq!(batch.records.len(), 1);
+    }
+
+    #[test]
+    fn br238_t0_consumer_rejects_record_source_older_than_five_seconds() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
+        let mut q = live_t0_q();
+        q.source_at = "1786930199.999999999".to_string();
+        let mut view: Value = serde_json::from_slice(&q.records[0].data).unwrap();
+        view["records"][0]["source_at"] = Value::String("1786930199.999999999".to_string());
+        q.records[0].data = serde_json::to_vec(&view).unwrap();
+
+        let error = t0_evidence_batch_at(&q, now)
+            .expect_err("T0 source age 5s+1ns must fail after RPC delivery");
+        assert_eq!(error.reason_code(), "quote_stale");
+        assert!(error.retryable());
+    }
+
+    #[test]
+    fn br238_t0_consumer_rejects_multiple_payloads() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
+        let mut q = live_t0_q();
+        q.records.push(q.records[0].clone());
+
+        let error = t0_evidence_batch_at(&q, now)
+            .expect_err("T0 canonical contract is exactly one payload");
+        assert_eq!(error.reason_code(), "invalid_evidence");
+        assert!(!error.retryable());
+    }
+
+    #[test]
+    fn br238_t0_consumer_rejects_non_positive_quote_price() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
+        let mut q = live_t0_q();
+        let mut view: Value = serde_json::from_slice(&q.records[0].data).unwrap();
+        view["records"][0]["quote"]["price"] = serde_json::json!(0.0);
+        q.records[0].data = serde_json::to_vec(&view).unwrap();
+
+        let error = t0_evidence_batch_at(&q, now)
+            .expect_err("non-positive T0 quote price cannot reach live consumers");
+        assert_eq!(error.reason_code(), "invalid_evidence");
+        assert!(!error.retryable());
+    }
+
+    #[test]
     fn security_metadata_board_and_date_parsed() {
         let q = mk_q(
             r#"[{"code":"600519","name":"贵州茅台","board":"Main","is_st":false,"listed_on":"2001-08-27","price_limit_percent":10.0,"source_at":"2026-08-15T09:35:00+08:00"}]"#,
@@ -2679,6 +4798,63 @@ mod tests {
             batch.evidence().source_at.as_deref(),
             Some("1786931999.125000000")
         );
+    }
+
+    #[test]
+    fn external_identity_accepts_oldest_record_source_as_batch_provenance() {
+        let mut q = external_identity_q();
+        replace_external_record_field(
+            &mut q,
+            1,
+            "source_at",
+            Value::String("1786931999.500000000".to_string()),
+        );
+
+        let batch =
+            security_identities(&external_identity_requested(), &q, external_identity_now())
+                .expect("batch source is the oldest record source, not every record source");
+
+        assert_eq!(
+            batch.records()[0].source_at.timestamp_subsec_nanos(),
+            125_000_000
+        );
+        assert_eq!(
+            batch.records()[1].source_at.timestamp_subsec_nanos(),
+            500_000_000
+        );
+        assert_eq!(
+            batch.evidence().source_at.as_deref(),
+            Some("1786931999.125000000")
+        );
+    }
+
+    #[test]
+    fn external_identity_rejects_envelope_source_that_is_not_the_record_minimum() {
+        let mut q = external_identity_q();
+        q.source_at = "1786931999.000000000".to_string();
+
+        let error =
+            security_identities(&external_identity_requested(), &q, external_identity_now())
+                .expect_err("batch source must equal the oldest record source");
+
+        assert_eq!(error.reason_code(), "invalid_evidence");
+    }
+
+    #[test]
+    fn external_identity_rejects_record_source_after_record_observation() {
+        let mut q = external_identity_q();
+        replace_external_record_field(
+            &mut q,
+            1,
+            "source_at",
+            Value::String("1786932001.000000000".to_string()),
+        );
+
+        let error =
+            security_identities(&external_identity_requested(), &q, external_identity_now())
+                .expect_err("record source cannot be later than its observation");
+
+        assert_eq!(error.reason_code(), "invalid_evidence");
     }
 
     #[test]
@@ -3033,11 +5209,12 @@ mod tests {
         // 视图: delegate.rs fetch_semantic_search — to_value(GeneralWebResearchRecord)
         // 直出 (snake_case serde, 含 record 级 evidence 子对象)。
         let q = mk_q(
-            r#"[{"title":"白酒行业景气度跟踪","snippet":"2026年中报白酒板块营收同比增长 8.2%","url":"https://example.com/ws1","publisher":"国泰君安证券","published_at_raw":"2026-08-15T09:00:00+08:00","published_at":"2026-08-15T09:00:00+08:00","evidence":{"provider":"bocha","observed_at":"2026-08-15T09:00:00+08:00","batch_id":"b-1","item_id":"ws-1","publication_quality":"exact_provider_time","use_scope":"research_only"}}]"#,
+            r#"[{"title":"白酒行业景气度跟踪","snippet":"2026年中报白酒板块营收同比增长 8.2%","url":"https://example.com/ws1","publisher":"国泰君安证券","published_at_raw":"2026-08-15T09:00:00+08:00","published_at":"2026-08-15T09:00:00+08:00","evidence":{"provider":"bocha","observed_at":"2026-08-15T10:00:00+08:00","batch_id":"b-1","item_id":"ws-1","publication_quality":"exact_provider_time","use_scope":"research_only"}}]"#,
             "Bocha",
             "bocha-general-web",
         );
-        let batch = semantic_search(&q, "白酒 景气").unwrap();
+        let batch =
+            semantic_search(&q, "白酒 景气", GeneralWebResearchProvider::Bocha, 10).unwrap();
         let (records, evidence) = match batch {
             GeneralWebResearchBatch::Available { records, evidence } => (records, evidence),
             GeneralWebResearchBatch::VerifiedEmpty(_) => panic!("fixture 不应为空"),
@@ -3047,6 +5224,87 @@ mod tests {
         assert_eq!(evidence.use_scope, ResearchUseScope::ResearchOnly);
         assert_eq!(records[0].title, "白酒行业景气度跟踪");
         assert_eq!(records[0].evidence.batch_id, "b-1");
+    }
+
+    #[test]
+    fn br242_semantic_search_rejects_unadmitted_local_bridge_envelope() {
+        let mut q = mk_q("[]", "Bocha", "bocha-general-web");
+        q.admission = AdmissionState::Unadmitted;
+
+        let error = semantic_search(&q, "TEST_CODE query", GeneralWebResearchProvider::Bocha, 10)
+            .expect_err("SemanticSearch must reject a repository-unadmitted response");
+
+        assert_eq!(error.reason_code(), "invalid_evidence");
+        assert!(!error.retryable());
+    }
+
+    #[test]
+    fn br242_semantic_search_rejects_diagnostic_local_bridge_envelope() {
+        let mut q = mk_q("[]", "Bocha", "bocha-general-web");
+        q.diagnostic_blocker = "TEST_CODE_operator_diagnostic".to_string();
+
+        let error = semantic_search(&q, "TEST_CODE query", GeneralWebResearchProvider::Bocha, 10)
+            .expect_err("SemanticSearch must reject diagnostic evidence in production");
+
+        assert_eq!(error.reason_code(), "invalid_evidence");
+        assert!(!error.retryable());
+    }
+
+    #[test]
+    fn br242_semantic_search_rejects_a_different_requested_provider() {
+        let q = mk_q(
+            r#"[{"title":"TEST_CODE result","snippet":"TEST_CODE context","url":"https://example.com/ws1","publisher":"TEST_CODE publisher","published_at_raw":null,"published_at":null,"evidence":{"provider":"bocha","observed_at":"2026-08-15T09:00:00+08:00","batch_id":"b-1","item_id":"ws-1","publication_quality":"missing","use_scope":"research_only"}}]"#,
+            "Bocha",
+            "bocha-general-web",
+        );
+        let error = semantic_search(
+            &q,
+            "TEST_CODE query",
+            GeneralWebResearchProvider::Tavily,
+            10,
+        )
+        .expect_err("response provider must equal the requested provider");
+        assert_eq!(error.reason_code(), "invalid_evidence");
+        assert!(!error.retryable());
+    }
+
+    #[test]
+    fn br242_semantic_search_rejects_a_different_requested_source() {
+        let q = mk_q(
+            r#"[{"title":"TEST_CODE result","snippet":"TEST_CODE context","url":"https://example.com/ws1","publisher":"TEST_CODE publisher","published_at_raw":null,"published_at":null,"evidence":{"provider":"bocha","observed_at":"2026-08-15T09:00:00+08:00","batch_id":"b-1","item_id":"ws-1","publication_quality":"missing","use_scope":"research_only"}}]"#,
+            "Bocha",
+            "TEST_CODE_wrong-source",
+        );
+        let error = semantic_search(&q, "TEST_CODE query", GeneralWebResearchProvider::Bocha, 10)
+            .expect_err("response source must equal the requested provider source");
+        assert_eq!(error.reason_code(), "invalid_evidence");
+        assert!(!error.retryable());
+    }
+
+    #[test]
+    fn br242_semantic_search_rejects_records_over_requested_limit() {
+        let q = mk_q(
+            r#"[{"title":"TEST_CODE one","snippet":"TEST_CODE context","url":"https://example.com/ws1","publisher":"TEST_CODE publisher","published_at_raw":null,"published_at":null,"evidence":{"provider":"bocha","observed_at":"2026-08-15T09:00:00+08:00","batch_id":"b-1","item_id":"ws-1","publication_quality":"missing","use_scope":"research_only"}},{"title":"TEST_CODE two","snippet":"TEST_CODE context","url":"https://example.com/ws2","publisher":"TEST_CODE publisher","published_at_raw":null,"published_at":null,"evidence":{"provider":"bocha","observed_at":"2026-08-15T09:00:00+08:00","batch_id":"b-1","item_id":"ws-2","publication_quality":"missing","use_scope":"research_only"}}]"#,
+            "Bocha",
+            "bocha-general-web",
+        );
+        let error = semantic_search(&q, "TEST_CODE query", GeneralWebResearchProvider::Bocha, 1)
+            .expect_err("response records must not exceed the requested limit");
+        assert_eq!(error.reason_code(), "invalid_evidence");
+        assert!(!error.retryable());
+    }
+
+    #[test]
+    fn br242_semantic_search_rejects_record_observed_at_different_from_batch() {
+        let q = mk_q(
+            r#"[{"title":"TEST_CODE result","snippet":"TEST_CODE context","url":"https://example.com/ws1","publisher":"TEST_CODE publisher","published_at_raw":null,"published_at":null,"evidence":{"provider":"bocha","observed_at":"2026-08-15T09:59:59+08:00","batch_id":"b-1","item_id":"ws-1","publication_quality":"missing","use_scope":"research_only"}}]"#,
+            "Bocha",
+            "bocha-general-web",
+        );
+        let error = semantic_search(&q, "TEST_CODE query", GeneralWebResearchProvider::Bocha, 10)
+            .expect_err("record observed_at must equal the admitted batch evidence");
+        assert_eq!(error.reason_code(), "invalid_evidence");
+        assert!(!error.retryable());
     }
 
     #[test]

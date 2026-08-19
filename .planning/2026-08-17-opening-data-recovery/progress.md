@@ -16,8 +16,8 @@
 - Completed mandatory instruction pre-flight and the systematic-debugging root-cause phase.
 - Selected the authenticated-upstream/local-normalization design under the user's standing authorization; no further business confirmation is required.
 - Verified and removed the stale `.superpowers` planning conflict by reversible archive plus links to the active opening-recovery plan.
-- Wrote and self-reviewed `docs/superpowers/specs/2026-08-17-client-bundle-opening-readiness-design.md` and registered BR-231.
-- Ran the business-rule checker: BR-231 is registered; the duplicate BR-224/BR-225 meanings were reassigned to BR-232/BR-233 and the checker passes.
+- Wrote and self-reviewed `docs/superpowers/specs/2026-08-17-client-bundle-opening-readiness-design.md` and registered BR-238.
+- Ran the business-rule checker: BR-238 is registered; the duplicate BR-224/BR-225 meanings were reassigned to BR-232/BR-233 and the checker passes.
 - Wrote `docs/superpowers/plans/2026-08-17-client-bundle-opening-readiness.md` for inline test-first execution.
 - Started three isolated parallel workstreams after the user's explicit parallel-execution request: local evidence propagation, secure bundle loading, and read-only external contract freeze.
 - Froze the ExternalV1 evidence boundary: the bundle proto stops at operation 55, a referenced derived-products document is missing, and only SecurityMetadata/InstrumentNews have sufficiently proven request contracts.
@@ -57,7 +57,7 @@
 | Remote mTLS and health | Verified, live, ready | TLS verified; live=true; ready=true | PASS |
 | Remote opening capabilities | 11 opening-critical operations admitted/runtime available | all 11 ready; unrelated diagnostic-only capabilities remain excluded | PASS |
 | Bundle/server proto parity | Same operation set | bundle ends at 55; server exposes 60 | FAIL |
-| Production admission request | `allow_unadmitted=false` | focused BR-231 regression group passed | PASS |
+| Production admission request | `allow_unadmitted=false` | focused BR-238 regression group passed | PASS |
 | Instance-owned Bearer injection | request header set; process env unchanged | 1/1 focused test passed | PASS |
 | Business-rule unique IDs | no duplicate numeric BR ID | checker passed; 229 rules | PASS |
 | ExternalV1 request contracts | only delivered schemas admitted | positive/negative/duplicate tests GREEN | PASS |

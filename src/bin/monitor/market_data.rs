@@ -1,4 +1,5 @@
-//! 行情数据抓取 — 从 main.rs 提取（BR-210 evidence timestamp contract）
+//! 行情数据抓取 — 从 main.rs 提取（BR-210 evidence timestamp contract）。
+//! BR-236 禁止过期或未来行情刷新实时 Quote/DataMode 能力。
 
 use crate::freshness::validate_daily_snapshot_freshness;
 

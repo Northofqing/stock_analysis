@@ -76,7 +76,7 @@ impl DragonTigerGateway {
     ) -> Result<GatewayBatch<DragonTigerStockReview>, GatewayError> {
         let request_hash = acquisition_request_hash(
             CAPABILITY,
-            &format!("{trading_date}:{disclosure_limit}:{stock_limit}"),
+            format!("{trading_date}:{disclosure_limit}:{stock_limit}"),
         );
         // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
         match super::grpc_source::bridge_for("DragonTiger") {

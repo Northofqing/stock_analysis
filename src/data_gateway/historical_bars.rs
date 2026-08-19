@@ -288,7 +288,7 @@ impl HistoricalBarsGateway {
     }
 
     pub fn daily_bars(&self, code: &str, days: usize) -> Result<AdmittedDailyBars, GatewayError> {
-        let request_hash = acquisition_request_hash(CAPABILITY, &format!("{code}:{days}"));
+        let request_hash = acquisition_request_hash(CAPABILITY, format!("{code}:{days}"));
         // P4 M2 钩子: DATA_GATEWAY_GRPC=1 → gRPC 通道 (fail-closed, audit 对等)。
         match super::grpc_source::bridge_for("HistoricalBars") {
             Ok(Some(bridge)) => {
@@ -345,7 +345,7 @@ impl HistoricalBarsGateway {
         days: usize,
     ) -> Result<AdmittedDailyBars, GatewayError> {
         let code = code.to_owned();
-        let request_hash = acquisition_request_hash(CAPABILITY, &format!("{code}:{days}"));
+        let request_hash = acquisition_request_hash(CAPABILITY, format!("{code}:{days}"));
         // P4 M2 钩子: DATA_GATEWAY_GRPC=1 → gRPC 通道 (async 路径, 不 block_on)。
         match super::grpc_source::bridge_for("HistoricalBars") {
             Ok(Some(bridge)) => {
@@ -461,7 +461,7 @@ impl HistoricalBarsGateway {
         }
         #[cfg(feature = "magic-gateway")]
         {
-            let request_hash = acquisition_request_hash(CAPABILITY, &format!("{code}:{days}"));
+            let request_hash = acquisition_request_hash(CAPABILITY, format!("{code}:{days}"));
             let worker_code = code.clone();
             let (terminal_provider, result) =
                 tokio::task::spawn_blocking(move || acquire_structural_batch(&worker_code, days))
@@ -514,11 +514,45 @@ fn acquire_structural_batch(
     code: &str,
     days: usize,
 ) -> (ProviderId, Result<GatewayBatch<KlineData>, GatewayError>) {
-    let request = match build_request(code, days) {
+    let observed_at = Local::now();
+    let provider_days = match provider_request_count(days, observed_at) {
+        Ok(provider_days) => provider_days,
+        Err(error) => return (ProviderId::Tdx, Err(error)),
+    };
+    let request = match build_request(code, provider_days) {
         Ok(request) => request,
         Err(error) => return (ProviderId::Tdx, Err(error)),
     };
-    route_daily_bars(code, &request)
+    route_daily_bars(code, &request, days, observed_at)
+}
+
+#[cfg(feature = "magic-gateway")]
+fn provider_request_count(
+    requested_records: usize,
+    observed_at: chrono::DateTime<Local>,
+) -> Result<usize, GatewayError> {
+    if requested_records == 0 {
+        return Ok(0);
+    }
+    if unsettled_current_session_date(&observed_at).is_some() {
+        requested_records.checked_add(1).ok_or_else(|| {
+            GatewayError::invalid_request(
+                CAPABILITY,
+                "daily-bar settled-window over-fetch count overflow",
+            )
+        })
+    } else {
+        Ok(requested_records)
+    }
+}
+
+#[cfg(feature = "magic-gateway")]
+fn unsettled_current_session_date(observed_at: &chrono::DateTime<Local>) -> Option<NaiveDate> {
+    let observed_date = observed_at.date_naive();
+    let latest_completed =
+        crate::calendar::latest_completed_trading_day_at(observed_at.naive_local());
+    (crate::calendar::is_trading_day(observed_date) && latest_completed < observed_date)
+        .then_some(observed_date)
 }
 
 pub const fn daily_bar_provider_label(provider: ProviderId) -> &'static str {
@@ -583,6 +617,8 @@ fn build_request(code: &str, days: usize) -> Result<BarsRequest, GatewayError> {
 fn route_daily_bars(
     storage_code: &str,
     request: &BarsRequest,
+    requested_records: usize,
+    observed_at: chrono::DateTime<Local>,
 ) -> (ProviderId, Result<GatewayBatch<KlineData>, GatewayError>) {
     let tencent = match TencentClient::new() {
         Ok(client) => Arc::new(client),
@@ -632,6 +668,8 @@ fn route_daily_bars(
             Arc::new(TdxSmartClient::new()),
             classify_tdx_error,
             storage_code,
+            requested_records,
+            observed_at,
         ))
         .and_then(|router| {
             router.register(validated_source(
@@ -639,6 +677,8 @@ fn route_daily_bars(
                 tencent,
                 classify_tencent_error,
                 storage_code,
+                requested_records,
+                observed_at,
             ))
         })
         .and_then(|router| {
@@ -647,6 +687,8 @@ fn route_daily_bars(
                 sina,
                 classify_sina_error,
                 storage_code,
+                requested_records,
+                observed_at,
             ))
         })
         .and_then(|router| {
@@ -655,6 +697,8 @@ fn route_daily_bars(
                 baidu,
                 classify_baidu_error,
                 storage_code,
+                requested_records,
+                observed_at,
             ))
         });
     if let Err(error) = registration {
@@ -670,7 +714,14 @@ fn route_daily_bars(
             let batch = outcome.into_batch();
             (
                 provider,
-                project_selected_batch(storage_code, request, provider, batch),
+                project_selected_batch_at(
+                    storage_code,
+                    request,
+                    requested_records,
+                    provider,
+                    batch,
+                    observed_at,
+                ),
             )
         }
         Err(error) => {
@@ -690,6 +741,8 @@ fn validated_source<Provider, Classify>(
     provider: Arc<Provider>,
     classify: Classify,
     storage_code: &str,
+    requested_records: usize,
+    observed_at: chrono::DateTime<Local>,
 ) -> SourceFn<BarsRequest, Bar>
 where
     Provider: HistoricalBars<Bar = Bar> + Send + Sync + 'static,
@@ -700,17 +753,43 @@ where
         let batch = provider
             .historical_bars(request)
             .map_err(classify.clone())?;
-        validate_candidate_batch(&storage_code, request, provider_id, &batch)?;
+        validate_candidate_batch_at(
+            &storage_code,
+            request,
+            requested_records,
+            provider_id,
+            &batch,
+            observed_at,
+        )?;
         Ok(batch)
     })
 }
 
-#[cfg(feature = "magic-gateway")]
+#[cfg(all(test, feature = "magic-gateway"))]
 fn validate_candidate_batch(
     storage_code: &str,
     request: &BarsRequest,
     provider: ProviderId,
     batch: &DataBatch<Bar>,
+) -> Result<Vec<KlineData>, SourceError> {
+    validate_candidate_batch_at(
+        storage_code,
+        request,
+        usize::from(request.limit()),
+        provider,
+        batch,
+        Local::now(),
+    )
+}
+
+#[cfg(feature = "magic-gateway")]
+fn validate_candidate_batch_at(
+    storage_code: &str,
+    request: &BarsRequest,
+    requested_records: usize,
+    provider: ProviderId,
+    batch: &DataBatch<Bar>,
+    observed_at: chrono::DateTime<Local>,
 ) -> Result<Vec<KlineData>, SourceError> {
     if !batch.quality().is_complete() {
         return Err(SourceError::try_next(
@@ -843,6 +922,36 @@ fn validate_candidate_batch(
             ),
         ));
     }
+    let latest_completed =
+        crate::calendar::latest_completed_trading_day_at(observed_at.naive_local());
+    let unsettled_date = unsettled_current_session_date(&observed_at);
+    if let Some(unexpected) = output
+        .iter()
+        .find(|bar| bar.date > latest_completed && Some(bar.date) != unsettled_date)
+    {
+        return Err(SourceError::try_next(
+            FailureKind::Quality,
+            format!(
+                "{provider:?} daily bar {} is beyond completed window ending {latest_completed}",
+                unexpected.date
+            ),
+        ));
+    }
+    output.retain(|bar| Some(bar.date) != unsettled_date);
+    if output.len() < requested_records {
+        return Err(SourceError::try_next(
+            FailureKind::Quality,
+            format!(
+                "{provider:?} settled daily cardinality mismatch requested={requested_records} actual={} latest_completed={latest_completed}",
+                output.len()
+            ),
+        ));
+    }
+    output.sort_by_key(|bar| bar.date);
+    let excess = output.len() - requested_records;
+    if excess > 0 {
+        output.drain(..excess);
+    }
     let _pending_confirmations = validate_daily_kline_structure(&mut output, storage_code)
         .map_err(|error| {
             SourceError::try_next(
@@ -858,7 +967,7 @@ fn validate_candidate_batch(
     })?;
     validate_daily_freshness(
         latest.date,
-        Local::now(),
+        observed_at,
         &FreshnessConfig::default(),
         &DqStats::new(),
     )
@@ -875,22 +984,48 @@ fn validate_candidate_batch(
     Ok(output)
 }
 
-#[cfg(feature = "magic-gateway")]
+#[cfg(all(test, feature = "magic-gateway"))]
 fn project_selected_batch(
     storage_code: &str,
     request: &BarsRequest,
     provider: ProviderId,
     batch: DataBatch<Bar>,
 ) -> Result<GatewayBatch<KlineData>, GatewayError> {
+    project_selected_batch_at(
+        storage_code,
+        request,
+        usize::from(request.limit()),
+        provider,
+        batch,
+        Local::now(),
+    )
+}
+
+#[cfg(feature = "magic-gateway")]
+fn project_selected_batch_at(
+    storage_code: &str,
+    request: &BarsRequest,
+    requested_records: usize,
+    provider: ProviderId,
+    batch: DataBatch<Bar>,
+    observed_at: chrono::DateTime<Local>,
+) -> Result<GatewayBatch<KlineData>, GatewayError> {
     let evidence = BatchEvidence::from_provenance(provider, batch.provenance())?;
-    let records =
-        validate_candidate_batch(storage_code, request, provider, &batch).map_err(|error| {
-            GatewayError::invalid_evidence(
-                CAPABILITY,
-                Some(provider),
-                format!("selected daily batch failed final admission: {error}"),
-            )
-        })?;
+    let records = validate_candidate_batch_at(
+        storage_code,
+        request,
+        requested_records,
+        provider,
+        &batch,
+        observed_at,
+    )
+    .map_err(|error| {
+        GatewayError::invalid_evidence(
+            CAPABILITY,
+            Some(provider),
+            format!("selected daily batch failed final admission: {error}"),
+        )
+    })?;
     Ok(GatewayBatch::Available { records, evidence })
 }
 
@@ -1608,6 +1743,34 @@ mod tests {
         .unwrap()
     }
 
+    fn bar_with_volume(
+        date: &str,
+        close: f64,
+        volume: f64,
+        provider: ProviderId,
+        batch_id: &str,
+        amount: f64,
+    ) -> Bar {
+        Bar::new(
+            InstrumentId::new(Exchange::Shanghai, "600396", AssetClass::Equity).unwrap(),
+            BarInterval::Day,
+            date,
+            date,
+            Price::new(close).unwrap(),
+            Price::new(close).unwrap(),
+            Price::new(close).unwrap(),
+            Price::new(close).unwrap(),
+            Quantity::new(volume).unwrap(),
+            Some(Money::new(amount).unwrap()),
+            Adjustment::Unadjusted,
+            provider,
+            batch_id,
+        )
+        .unwrap()
+        .with_source_at(date)
+        .unwrap()
+    }
+
     fn batch(provider: ProviderId, amount: Option<f64>) -> DataBatch<Bar> {
         batch_with_closes(provider, amount, 10.0, 10.1)
     }
@@ -1682,6 +1845,110 @@ mod tests {
             crate::calendar::latest_completed_trading_day_at(Local::now().naive_local())
         );
         assert_eq!(output[0].amount, 1_000.0);
+    }
+
+    #[test]
+    fn br158_excludes_unsettled_current_session_bar_without_losing_requested_history() {
+        let observed_at = NaiveDate::from_ymd_opt(2026, 8, 18)
+            .unwrap()
+            .and_hms_opt(9, 0, 0)
+            .unwrap()
+            .and_local_timezone(Local)
+            .single()
+            .unwrap();
+        let request = build_request("TEST_CODE_600396", 3).unwrap();
+        assert_eq!(provider_request_count(0, observed_at).unwrap(), 0);
+        assert_eq!(provider_request_count(2, observed_at).unwrap(), 3);
+        let batch_id = "TEST_CODE_unsettled_daily_batch";
+        let batch = DataBatch::strict(
+            vec![
+                bar_with_volume(
+                    "2026-08-14",
+                    10.0,
+                    100.0,
+                    ProviderId::Tdx,
+                    batch_id,
+                    1_000.0,
+                ),
+                bar_with_volume(
+                    "2026-08-17",
+                    10.1,
+                    100.0,
+                    ProviderId::Tdx,
+                    batch_id,
+                    1_010.0,
+                ),
+                bar_with_volume("2026-08-18", 10.1, 0.0, ProviderId::Tdx, batch_id, 0.0),
+            ],
+            Provenance::new("TEST_CODE_tdx", observed_at.to_rfc3339())
+                .unwrap()
+                .with_source_at("2026-08-18")
+                .unwrap()
+                .with_batch_id(batch_id)
+                .unwrap(),
+        );
+
+        let output = validate_candidate_batch_at(
+            "TEST_CODE_600396",
+            &request,
+            2,
+            ProviderId::Tdx,
+            &batch,
+            observed_at,
+        )
+        .expect("the forming current-session bar is not settled history");
+
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0].date.to_string(), "2026-08-17");
+        assert_eq!(output[1].date.to_string(), "2026-08-14");
+        assert!(output.iter().all(|bar| bar.settled));
+
+        let future_batch_id = "TEST_CODE_future_daily_batch";
+        let future_batch = DataBatch::strict(
+            vec![
+                bar_with_volume(
+                    "2026-08-14",
+                    10.0,
+                    100.0,
+                    ProviderId::Tdx,
+                    future_batch_id,
+                    1_000.0,
+                ),
+                bar_with_volume(
+                    "2026-08-17",
+                    10.1,
+                    100.0,
+                    ProviderId::Tdx,
+                    future_batch_id,
+                    1_010.0,
+                ),
+                bar_with_volume(
+                    "2026-08-19",
+                    10.2,
+                    100.0,
+                    ProviderId::Tdx,
+                    future_batch_id,
+                    1_020.0,
+                ),
+            ],
+            Provenance::new("TEST_CODE_tdx", observed_at.to_rfc3339())
+                .unwrap()
+                .with_source_at("2026-08-19")
+                .unwrap()
+                .with_batch_id(future_batch_id)
+                .unwrap(),
+        );
+        let future = validate_candidate_batch_at(
+            "TEST_CODE_600396",
+            &request,
+            2,
+            ProviderId::Tdx,
+            &future_batch,
+            observed_at,
+        )
+        .unwrap_err();
+        assert_eq!(future.kind(), FailureKind::Quality);
+        assert!(future.message().contains("beyond completed window"));
     }
 
     #[test]

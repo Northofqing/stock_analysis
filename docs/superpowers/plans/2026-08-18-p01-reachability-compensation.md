@@ -80,6 +80,22 @@ fn p01_monday_uses_previous_friday() {
 }
 
 #[test]
+fn p01_calendar_authority_fails_closed() {
+    assert_eq!(
+        P01BusinessContext::new(date(2026, 10, 1))
+            .unwrap_err()
+            .reason_code(),
+        "p01_business_date_not_trading",
+    );
+    assert_eq!(
+        P01BusinessContext::new(date(2027, 1, 1))
+            .unwrap_err()
+            .reason_code(),
+        "p01_trading_calendar_unavailable",
+    );
+}
+
+#[test]
 fn p01_window_is_start_inclusive_end_exclusive() {
     let due = date(2026, 8, 18);
     assert!(matches!(classify_scheduled_due(due.and_hms_opt(9, 0, 0).unwrap()), P01Due::Due(_)));
@@ -89,7 +105,7 @@ fn p01_window_is_start_inclusive_end_exclusive() {
 
 - [ ] **Step 2: Run RED**
 
-Run: `cargo test --bin monitor p01_tuesday_ p01_monday_ p01_window_ -- --nocapture`
+Run: `cargo test --bin monitor p01_tuesday_ p01_monday_ p01_calendar_ p01_window_ -- --nocapture`
 
 Expected: FAIL because the P-01 types/functions are absent.
 
@@ -104,12 +120,29 @@ pub struct P01BusinessContext {
 
 impl P01BusinessContext {
     pub fn new(business_date: chrono::NaiveDate) -> Result<Self, P01Failure> {
-        if !stock_analysis::calendar::is_trading_day(business_date) {
-            return Err(P01Failure::terminal("p01_business_date_not_trading", "calendar"));
+        match stock_analysis::calendar::verified_a_share_trading_day(business_date) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(P01Failure::terminal(
+                    "p01_business_date_not_trading",
+                    "calendar",
+                ));
+            }
+            Err(_) => {
+                return Err(P01Failure::terminal(
+                    "p01_trading_calendar_unavailable",
+                    "calendar",
+                ));
+            }
         }
+        let evidence_date =
+            stock_analysis::calendar::verified_prev_a_share_trading_day(business_date)
+                .map_err(|_| {
+                    P01Failure::terminal("p01_trading_calendar_unavailable", "calendar")
+                })?;
         Ok(Self {
             business_date,
-            evidence_date: stock_analysis::calendar::prev_trading_day(business_date),
+            evidence_date,
         })
     }
 }
@@ -118,6 +151,7 @@ pub enum P01ExecutionMode { Scheduled, Compensation }
 pub enum P01Due { Due(P01BusinessContext), NotDue(P01NotDueReason) }
 pub enum P01NotDueReason {
     NonTradingDay,
+    CalendarUnavailable,
     BeforeWindow,
     ScheduledWindowClosed,
     CompensationBeforeWindowClosed,
@@ -319,7 +353,12 @@ reconciliation; query before providers without constructing a `ReviewTask`.
 Refactor the review-specific wrapper to validate its review identity then
 delegate. Add `CountedDeliveryBinding::validate_p01_text`, exact-key checking
 the occurrence, LimitPools/chain date, identity exact set, one news batch per
-head/range, exclusions, ordered hashes, and rendered bytes hash.
+head/range, exclusions, ordered hashes, and rendered bytes hash. Immediately
+before sink authorization, the validator first requires
+`verified_a_share_trading_day(business_date) == Ok(true)` and only then resolves
+`verified_prev_a_share_trading_day(business_date)`. A known non-trading date or
+unavailable immutable-calendar coverage returns the stable
+`counted_p01_calendar_authority_unavailable` reason and performs zero sink I/O.
 
 - [ ] **Step 5: Run GREEN and commit**
 

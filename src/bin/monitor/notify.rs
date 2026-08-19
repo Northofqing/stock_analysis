@@ -2107,6 +2107,52 @@ pub enum PushOutcome {
     SinkError(String), // v14.2 sink 失败
 }
 
+/// BR-172 distinguishes a definitive pre-accept failure from a failure to
+/// persist post-sink evidence. The latter must never authorize a resend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NewsAiNotifyOutcome {
+    Pushed {
+        audit: stock_analysis::event::PersistedDeliveryAuditReceipt,
+    },
+    PreSinkError(String),
+    SinkError(String),
+    PostSinkAuditFailed {
+        audit: Option<stock_analysis::event::PersistedDeliveryAuditReceipt>,
+        reason: String,
+    },
+}
+
+/// BR-244 physical delivery boundary. Only a validated CLI receipt can be
+/// promoted to `Accepted`; transport paths that cannot return one fail before
+/// making a request, while any failure after the CLI process starts remains
+/// `Uncertain`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NewsFlashPhysicalSinkOutcome {
+    PreAttemptRejected {
+        reason_code: String,
+        evidence_sha256: String,
+    },
+    DefinitivelyRejected {
+        reason_code: String,
+        transport_evidence_sha256: String,
+    },
+    Accepted {
+        remote_receipt: stock_analysis::event::envelope::NewsFlashRemoteReceipt,
+    },
+    Uncertain {
+        reason_code: String,
+    },
+}
+
+/// BR-244 settlement observed by `NewsFlashGate`. `Accepted` is impossible
+/// without the exact source-bound immutable audit receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NewsFlashNotifyOutcome {
+    Terminal(Box<stock_analysis::event::NewsFlashTerminalReceipt>),
+    RejectedBeforeSink(String),
+    TerminalAuditFailed { reason: String },
+}
+
 impl PushOutcome {
     pub fn is_pushed(&self) -> bool {
         matches!(self, Self::Pushed)
@@ -2395,6 +2441,381 @@ pub(super) async fn push_governor_v3(
     push_governor_inner(text, kind, code).await
 }
 
+/// BR-172 shared process-level gates. The exact assessment gate remains in
+/// `preflight_news_ai_analysis_v3`, because it requires a concrete delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum NewsAiCommonGateStatus {
+    Ready,
+    LaunchStageDenied,
+    AuditUnavailable { reason_code: String },
+    PhysicalSinkUnavailable { reason_code: String },
+}
+
+/// An opaque, exact-delivery capability. It is constructed only after Launch,
+/// exact NewsAI L5 governance, binding validation and audit-health checks have
+/// all passed. Owning this value is the sole authority to enter the physical
+/// NewsAI sink; callers cannot manufacture it from a boolean.
+pub(super) struct NewsAiPreparedPhysicalSink {
+    event: stock_analysis::push_l1::SignalEvent,
+    kind: PushKind,
+    text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum NewsAiPreflightRejection {
+    Denied(String),
+    Error(String),
+}
+
+pub(super) fn news_ai_common_gate_status() -> NewsAiCommonGateStatus {
+    let kind = PushKind::NewsToIdea;
+    if !launch_gate_check(kind) {
+        return NewsAiCommonGateStatus::LaunchStageDenied;
+    }
+    match stock_analysis::event::runtime_delivery_audit_health() {
+        stock_analysis::event::AuditHealth::Healthy => {}
+        stock_analysis::event::AuditHealth::Unverified => {
+            return NewsAiCommonGateStatus::AuditUnavailable {
+                reason_code: "audit_health_unverified".to_owned(),
+            };
+        }
+        stock_analysis::event::AuditHealth::Degraded { reason_code } => {
+            return NewsAiCommonGateStatus::AuditUnavailable { reason_code };
+        }
+    }
+    if dry_run_push_active() {
+        return NewsAiCommonGateStatus::PhysicalSinkUnavailable {
+            reason_code: "physical_sink_disabled_by_dry_run".to_owned(),
+        };
+    }
+    if std::env::var("STOCK_ANALYSIS_PUSH_V6_ENABLE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        return NewsAiCommonGateStatus::PhysicalSinkUnavailable {
+            reason_code: "exact_sink_attempt_boundary_unavailable_for_l6".to_owned(),
+        };
+    }
+    NewsAiCommonGateStatus::Ready
+}
+
+/// Complete every pre-sink governance decision while the durable ledger is
+/// still `Reserved`. A rejection from this function is definitive and the
+/// outer state machine may safely roll the reservation back.
+pub(super) fn preflight_news_ai_analysis_v3(
+    text: String,
+    delivery: &stock_analysis::monitor::news_ai::GovernedNewsAiDelivery,
+) -> Result<NewsAiPreparedPhysicalSink, NewsAiPreflightRejection> {
+    use crate::v14_adapter::{self, V14Gate};
+
+    let kind = PushKind::NewsToIdea;
+    match news_ai_common_gate_status() {
+        NewsAiCommonGateStatus::Ready => {}
+        NewsAiCommonGateStatus::LaunchStageDenied => {
+            return Err(NewsAiPreflightRejection::Denied(
+                "launch_gate_stage".to_owned(),
+            ));
+        }
+        NewsAiCommonGateStatus::AuditUnavailable { reason_code } => {
+            return Err(NewsAiPreflightRejection::Error(format!(
+                "delivery audit unavailable: {reason_code}"
+            )));
+        }
+        NewsAiCommonGateStatus::PhysicalSinkUnavailable { reason_code } => {
+            return Err(NewsAiPreflightRejection::Error(format!(
+                "news_ai physical sink unavailable: {reason_code}"
+            )));
+        }
+    }
+    let event = match v14_adapter::v14_gate_news_ai(delivery) {
+        V14Gate::Approved(event) => *event,
+        V14Gate::Deduped => {
+            return Err(NewsAiPreflightRejection::Denied(
+                "news_ai_legacy_dedup_forbidden".to_owned(),
+            ));
+        }
+        V14Gate::Denied(reason) => return Err(NewsAiPreflightRejection::Denied(reason)),
+    };
+    if event.event_id != delivery.identity().sha256()
+        || event.code.as_deref() != Some(delivery.fact().target_code())
+    {
+        return Err(NewsAiPreflightRejection::Denied(
+            "news_ai_governance_binding_mismatch".to_owned(),
+        ));
+    }
+    if text.trim().is_empty() {
+        return Err(NewsAiPreflightRejection::Error(
+            "news_ai_rendered_card_empty".to_owned(),
+        ));
+    }
+    Ok(NewsAiPreparedPhysicalSink { event, kind, text })
+}
+
+/// BR-172 sole physical NewsAI sink entry. The opaque marker performs the
+/// durable `Reserved -> SinkStarted` transition only after transport setup and
+/// immediately before the real CLI/HTTP request. No Launch/L5/audit-health
+/// decisions occur after that transition.
+pub(super) async fn send_preflighted_news_ai_analysis_v3(
+    prepared: NewsAiPreparedPhysicalSink,
+    marker: &mut dyn PhysicalSinkAttemptMarker,
+) -> NewsAiNotifyOutcome {
+    use crate::v14_adapter;
+
+    let NewsAiPreparedPhysicalSink { event, kind, text } = prepared;
+
+    let started = std::time::Instant::now();
+    if std::env::var("STOCK_ANALYSIS_PUSH_V6_ENABLE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        return NewsAiNotifyOutcome::PreSinkError(
+            "news_ai_exact_sink_attempt_boundary_unavailable_for_l6".to_owned(),
+        );
+    }
+    let delivered = match push_wechat_with_attempt_marker(&text, Some(marker)).await {
+        PushWechatAttemptOutcome::RejectedBeforeAttempt(reason) => {
+            return NewsAiNotifyOutcome::PreSinkError(reason);
+        }
+        PushWechatAttemptOutcome::SimulatedWithoutPhysicalAttempt => {
+            return NewsAiNotifyOutcome::PreSinkError(
+                "news_ai_physical_sink_disabled_by_dry_run".to_owned(),
+            );
+        }
+        PushWechatAttemptOutcome::Attempted(delivered) => delivered,
+    };
+    let channel = current_send_channel();
+    let l7_result = v14_adapter::v14_record_delivery(&event, kind, &text, delivered, channel);
+    let outcome = if delivered { "Pushed" } else { "SinkError" };
+    let audit_result = stock_analysis::event::publish_delivery_with_receipt(
+        &kind.stable_template_id(),
+        event.code.as_deref(),
+        outcome,
+        channel,
+        text.len(),
+        started.elapsed().as_millis() as u64,
+    );
+    let mut audit_errors = Vec::new();
+    if let Err(error) = l7_result {
+        audit_errors.push(format!("L7 analytics: {error}"));
+    }
+    let authoritative_audit = match audit_result {
+        Ok(receipt) => Some(receipt),
+        Err(error) => {
+            audit_errors.push(format!("delivery hash-chain: {error}"));
+            None
+        }
+    };
+    if !delivered {
+        return NewsAiNotifyOutcome::SinkError(if audit_errors.is_empty() {
+            "push_wechat returned false".to_owned()
+        } else {
+            format!("push_wechat returned false; {}", audit_errors.join("; "))
+        });
+    }
+    if audit_errors.is_empty() {
+        match authoritative_audit {
+            Some(audit) => NewsAiNotifyOutcome::Pushed { audit },
+            None => NewsAiNotifyOutcome::PostSinkAuditFailed {
+                audit: None,
+                reason: "authoritative delivery audit receipt missing after success".to_owned(),
+            },
+        }
+    } else {
+        NewsAiNotifyOutcome::PostSinkAuditFailed {
+            audit: authoritative_audit,
+            reason: audit_errors.join("; "),
+        }
+    }
+}
+
+/// BR-244 dedicated NewsFlash transaction. It reuses Launch/L4/L5, the real
+/// sink and L7, but never enters generic `deliver_and_record`, whose BR-145
+/// settlement cannot prove the ordered NewsFlash source binding.
+pub(super) async fn push_news_flash_v3(
+    token: crate::presentation_registry::ProductionPresentationToken,
+    reservation: &crate::news_aggregator_init::FlashReservation,
+) -> NewsFlashNotifyOutcome {
+    use crate::v14_adapter::{self, V14Gate};
+
+    let (kind, text) = match reservation.decision() {
+        crate::news_aggregator_init::FlashDecision::Critical { text, .. } => {
+            (PushKind::NewsFlashCritical, text.as_str())
+        }
+        crate::news_aggregator_init::FlashDecision::Aggregated { text, .. } => {
+            (PushKind::NewsFlashAggregated, text.as_str())
+        }
+    };
+    if token.descriptor().push_kind != kind {
+        return NewsFlashNotifyOutcome::RejectedBeforeSink(
+            "presentation_token_kind_mismatch".to_owned(),
+        );
+    }
+    if !launch_gate_check(kind) {
+        return NewsFlashNotifyOutcome::RejectedBeforeSink("launch_gate_stage".to_owned());
+    }
+    if let stock_analysis::event::AuditHealth::Degraded { reason_code } =
+        stock_analysis::event::runtime_delivery_audit_health()
+    {
+        return NewsFlashNotifyOutcome::RejectedBeforeSink(format!(
+            "delivery audit unavailable: {reason_code}"
+        ));
+    }
+    let event = match v14_adapter::v14_gate_news_flash(reservation) {
+        V14Gate::Approved(event) => *event,
+        V14Gate::Deduped => {
+            return NewsFlashNotifyOutcome::RejectedBeforeSink("news_flash_deduped".to_owned());
+        }
+        V14Gate::Denied(reason) => return NewsFlashNotifyOutcome::RejectedBeforeSink(reason),
+    };
+    if event.event_id != reservation.reservation_identity_sha256() {
+        if let Err(error) = v14_adapter::rollback_dedup_for_event(&event, kind, None, None) {
+            log::error!(
+                "[NewsFlash][BR-244] rollback after governance binding mismatch failed: {error}"
+            );
+        }
+        return NewsFlashNotifyOutcome::RejectedBeforeSink(
+            "news_flash_governance_binding_mismatch".to_owned(),
+        );
+    }
+
+    let send_type = resolve_send_type();
+    let send_transport = resolve_send_transport(send_type);
+    let push_v6_enabled = std::env::var("STOCK_ANALYSIS_PUSH_V6_ENABLE")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let boolean_only_sink_enabled = dry_run_push_active();
+    if let Err(NewsFlashPhysicalSinkOutcome::PreAttemptRejected { reason_code, .. }) =
+        news_flash_physical_preflight(
+            send_type,
+            send_transport,
+            push_v6_enabled,
+            boolean_only_sink_enabled,
+        )
+    {
+        if let Err(error) = v14_adapter::rollback_dedup_for_event(&event, kind, None, None) {
+            log::error!(
+                "[NewsFlash][BR-244] rollback after physical preflight rejection failed: {error}"
+            );
+        }
+        return NewsFlashNotifyOutcome::RejectedBeforeSink(reason_code);
+    }
+    let attempt_observed_at = chrono::Utc::now().fixed_offset();
+    let attempt = match stock_analysis::event::publish_news_flash_attempt(
+        stock_analysis::event::NewsFlashAttemptAuditInput {
+            push_kind: reservation.push_kind().to_owned(),
+            business_date: reservation.business_date(),
+            decision_key: reservation.decision_key().to_owned(),
+            channel: send_type.as_str().to_owned(),
+            rendered_len: reservation.rendered_len(),
+            reservation_sha256: reservation.reservation_identity_sha256().to_owned(),
+            sources: reservation.audit_sources(),
+            evidence_sha256: reservation.evidence_sha256().to_owned(),
+            render_sha256: reservation.render_sha256().to_owned(),
+            attempt_ordinal: reservation.attempt_ordinal(),
+            observed_at: attempt_observed_at,
+        },
+    ) {
+        Ok(attempt) => attempt,
+        Err(stock_analysis::event::NewsFlashDeliveryAuditError::DuplicateAuthority {
+            envelope_id,
+        }) => {
+            let mut reason = format!("news_flash_sink_attempt_duplicate_authority:{envelope_id}");
+            match stock_analysis::event::reconcile_news_flash_business_date(
+                reservation.business_date(),
+            ) {
+                Ok(_) => reason.push_str("; authority_reconciled"),
+                Err(error) => reason.push_str(&format!("; authority_reconcile_failed:{error}")),
+            }
+            // Another process has already created this canonical attempt. Keep
+            // the weaker process-local identity suppressed and let the next
+            // fresh authority snapshot recover its open/terminal state.
+            if let Err(commit_error) = v14_adapter::commit_dedup_for_event(&event, kind, None, None)
+            {
+                reason.push_str(&format!("; legacy_l4_commit_failed:{commit_error}"));
+            }
+            return NewsFlashNotifyOutcome::TerminalAuditFailed { reason };
+        }
+        Err(error) => {
+            let mut reason = format!("news_flash_sink_attempt_audit_failed:{error}");
+            if let Err(rollback_error) =
+                v14_adapter::rollback_dedup_for_event(&event, kind, None, None)
+            {
+                reason.push_str(&format!("; legacy_l4_rollback_failed:{rollback_error}"));
+            }
+            return NewsFlashNotifyOutcome::RejectedBeforeSink(reason);
+        }
+    };
+
+    let started = std::time::Instant::now();
+    let owned_text = text.to_owned();
+    let physical = match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            deliver_news_flash_physical_with(
+                send_type,
+                send_transport,
+                push_v6_enabled,
+                boolean_only_sink_enabled,
+                &owned_text,
+                push_via_magiclaw_cli_receipt_blocking,
+            )
+        }),
+    )
+    .await
+    {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(error)) => NewsFlashPhysicalSinkOutcome::Uncertain {
+            reason_code: format!("news_flash_sink_worker_join_failed:{error}"),
+        },
+        Err(_) => NewsFlashPhysicalSinkOutcome::Uncertain {
+            reason_code: "news_flash_sink_request_timeout".to_owned(),
+        },
+    };
+
+    let disposition = news_flash_terminal_disposition_after_l7_with(physical, |delivered| {
+        v14_adapter::v14_record_delivery(&event, kind, text, delivered, send_type.as_str())
+    });
+    let terminal = match stock_analysis::event::publish_news_flash_terminal(
+        &attempt,
+        stock_analysis::event::NewsFlashTerminalAuditInput {
+            disposition,
+            observed_at: chrono::Utc::now().fixed_offset(),
+            latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        },
+    ) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            if let Err(commit_error) = v14_adapter::commit_dedup_for_event(&event, kind, None, None)
+            {
+                log::error!(
+                    "[NewsFlash][BR-244] terminal audit failed and legacy L4 suppression failed: {commit_error}"
+                );
+            }
+            return NewsFlashNotifyOutcome::TerminalAuditFailed {
+                reason: format!("news_flash_terminal_audit_failed:{error}"),
+            };
+        }
+    };
+    let legacy_settle_result = match &terminal {
+        stock_analysis::event::NewsFlashTerminalReceipt::DefinitivelyRejected(_) => {
+            v14_adapter::rollback_dedup_for_event(&event, kind, None, None)
+        }
+        stock_analysis::event::NewsFlashTerminalReceipt::Accepted(_)
+        | stock_analysis::event::NewsFlashTerminalReceipt::Uncertain(_) => {
+            v14_adapter::commit_dedup_for_event(&event, kind, None, None)
+        }
+    };
+    if let Err(error) = legacy_settle_result {
+        log::error!(
+            "[NewsFlash][BR-244] legacy L4 settlement failed after immutable terminal authority: {error}"
+        );
+    }
+    NewsFlashNotifyOutcome::Terminal(Box::new(terminal))
+}
+
 /// Dedicated BR-196 exact-six governance smoke entry.
 ///
 /// The dispatch is minted only by the invocation-scoped BR-196 context; the
@@ -2646,12 +3067,46 @@ fn requires_ticket_code(kind: PushKind) -> bool {
     )
 }
 
+#[async_trait::async_trait]
+pub(super) trait PhysicalSinkAttemptMarker: Send {
+    async fn mark_sink_started(&mut self) -> Result<(), String>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PushWechatAttemptOutcome {
+    RejectedBeforeAttempt(String),
+    SimulatedWithoutPhysicalAttempt,
+    Attempted(bool),
+}
+
+async fn mark_physical_sink_attempt(
+    marker: &mut Option<&mut dyn PhysicalSinkAttemptMarker>,
+) -> Result<(), String> {
+    match marker {
+        Some(marker) => marker.mark_sink_started().await,
+        None => Ok(()),
+    }
+}
+
 pub async fn push_wechat(text: &str) -> bool {
+    match push_wechat_with_attempt_marker(text, None).await {
+        PushWechatAttemptOutcome::Attempted(delivered) => delivered,
+        PushWechatAttemptOutcome::SimulatedWithoutPhysicalAttempt => true,
+        PushWechatAttemptOutcome::RejectedBeforeAttempt(_) => false,
+    }
+}
+
+async fn push_wechat_with_attempt_marker(
+    text: &str,
+    mut marker: Option<&mut dyn PhysicalSinkAttemptMarker>,
+) -> PushWechatAttemptOutcome {
     let bound_namespace = match crate::durable_delivery_runtime::current_runtime_namespace() {
         Ok(namespace) => namespace,
         Err(error) => {
             log::error!("[BR-192] push-log namespace binding rejected: {error}");
-            return false;
+            return PushWechatAttemptOutcome::RejectedBeforeAttempt(
+                "push_log_namespace_binding_rejected".to_owned(),
+            );
         }
     };
     // v10 P6 5 要素接入: V10_DRY_RUN_PUSH=1 时跳过实际推送, 仅 log
@@ -2665,9 +3120,11 @@ pub async fn push_wechat(text: &str) -> bool {
                 error.reason_code(),
                 error.retry_authorized()
             );
-            return false;
+            return PushWechatAttemptOutcome::RejectedBeforeAttempt(
+                "dry_run_push_audit_failed".to_owned(),
+            );
         }
-        return true;
+        return PushWechatAttemptOutcome::SimulatedWithoutPhysicalAttempt;
     }
 
     // v69: 不管走哪条推送路径 (magiclaw cli / feishu http / 后续), 都先保存 push_log
@@ -2677,20 +3134,22 @@ pub async fn push_wechat(text: &str) -> bool {
             error.reason_code(),
             error.retry_authorized()
         );
-        return false;
+        return PushWechatAttemptOutcome::RejectedBeforeAttempt(
+            "push_log_persistence_failed".to_owned(),
+        );
     }
 
     let send_type = resolve_send_type();
     let send_transport = resolve_send_transport(send_type);
 
     if matches!(send_transport, MessageSendTransport::Cli) {
-        return push_via_magiclaw_cli(send_type, text).await;
+        return push_via_magiclaw_cli_with_attempt_marker(send_type, text, marker).await;
     }
 
     if matches!(send_type, MessageSendType::Feishu)
         && matches!(send_transport, MessageSendTransport::Http)
     {
-        return push_feishu_via_http(text).await;
+        return push_feishu_via_http_with_attempt_marker(text, marker).await;
     }
 
     log::info!(
@@ -2714,7 +3173,9 @@ pub async fn push_wechat(text: &str) -> bool {
         Ok(c) => c,
         Err(e) => {
             log::error!("[{}] 创建 HTTP 客户端失败: {}", send_type.label(), e);
-            return false;
+            return PushWechatAttemptOutcome::RejectedBeforeAttempt(
+                "delivery_http_client_build_failed".to_owned(),
+            );
         }
     };
 
@@ -2735,7 +3196,9 @@ pub async fn push_wechat(text: &str) -> bool {
         }
         Err(e) => {
             log::error!("[{}] daemon 不可用: {}", send_type.label(), e);
-            return false;
+            return PushWechatAttemptOutcome::RejectedBeforeAttempt(
+                "delivery_daemon_unavailable".to_owned(),
+            );
         }
     }
 
@@ -2748,7 +3211,9 @@ pub async fn push_wechat(text: &str) -> bool {
                     send_type.label(),
                     e
                 );
-                return false;
+                return PushWechatAttemptOutcome::RejectedBeforeAttempt(
+                    "delivery_auth_token_unavailable".to_owned(),
+                );
             }
         };
 
@@ -2786,12 +3251,16 @@ pub async fn push_wechat(text: &str) -> bool {
                         first_err,
                         issue_err
                     );
-                    return false;
+                    return PushWechatAttemptOutcome::RejectedBeforeAttempt(
+                        "delivery_auth_refresh_failed".to_owned(),
+                    );
                 }
             }
         } else {
             log::error!("[{}] daemon 鉴权预检失败: {}", send_type.label(), first_err);
-            return false;
+            return PushWechatAttemptOutcome::RejectedBeforeAttempt(
+                "delivery_auth_preflight_failed".to_owned(),
+            );
         }
     }
 
@@ -2799,12 +3268,19 @@ pub async fn push_wechat(text: &str) -> bool {
         Ok(v) => v,
         Err(e) => {
             log::error!("[{}] 解析收件人失败: {}", send_type.label(), e);
-            return false;
+            return PushWechatAttemptOutcome::RejectedBeforeAttempt(
+                "delivery_target_resolution_failed".to_owned(),
+            );
         }
     };
     let to_log = to.as_deref().unwrap_or("<magiclaw-default>");
 
-    match send_via_magiclaw_daemon(
+    if let Err(error) = mark_physical_sink_attempt(&mut marker).await {
+        log::error!("[NewsAI][BR-172] durable sink-start marker failed: {error}");
+        return PushWechatAttemptOutcome::RejectedBeforeAttempt(error);
+    }
+
+    let delivered = match send_via_magiclaw_daemon(
         &client,
         &api_base,
         &active_token,
@@ -2865,7 +3341,8 @@ pub async fn push_wechat(text: &str) -> bool {
                 false
             }
         }
-    }
+    };
+    PushWechatAttemptOutcome::Attempted(delivered)
 }
 
 /// BR-192 single authoritative counted-delivery adapter.
@@ -3596,6 +4073,133 @@ enum BlockingCliDeliveryFailure {
     },
 }
 
+fn deliver_news_flash_physical_with<Deliver>(
+    send_type: MessageSendType,
+    send_transport: MessageSendTransport,
+    push_v6_enabled: bool,
+    boolean_only_sink_enabled: bool,
+    text: &str,
+    deliver_cli: Deliver,
+) -> NewsFlashPhysicalSinkOutcome
+where
+    Deliver:
+        FnOnce(MessageSendType, &str) -> Result<CliDeliveryReceipt, BlockingCliDeliveryFailure>,
+{
+    if let Err(rejection) = news_flash_physical_preflight(
+        send_type,
+        send_transport,
+        push_v6_enabled,
+        boolean_only_sink_enabled,
+    ) {
+        return rejection;
+    }
+
+    let started = std::time::Instant::now();
+    match deliver_cli(send_type, text) {
+        Ok(receipt) => NewsFlashPhysicalSinkOutcome::Accepted {
+            remote_receipt: stock_analysis::event::envelope::NewsFlashRemoteReceipt {
+                channel: send_type.as_str().to_owned(),
+                provider: "magiclaw-cli".to_owned(),
+                message_id: receipt.message_id,
+                platform_message_id: receipt.platform_msg_id,
+                accepted_at: chrono::Utc::now().fixed_offset(),
+                latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            },
+        },
+        Err(BlockingCliDeliveryFailure::Rejected {
+            reason_code,
+            evidence,
+        }) => NewsFlashPhysicalSinkOutcome::DefinitivelyRejected {
+            reason_code,
+            transport_evidence_sha256: sha256_domain(
+                "br244-news-flash-definitive-rejection-v1",
+                &evidence,
+            ),
+        },
+        Err(BlockingCliDeliveryFailure::Uncertain { reason_code, .. }) => {
+            NewsFlashPhysicalSinkOutcome::Uncertain { reason_code }
+        }
+    }
+}
+
+/// BR-244 orders the irreversible boundary as physical sink -> L7 -> terminal
+/// audit. A physical acceptance is therefore only eligible for an authoritative
+/// `Accepted` terminal after L7 has durably recorded that exact sink result.
+fn news_flash_terminal_disposition_after_l7_with<RecordDelivery>(
+    physical: NewsFlashPhysicalSinkOutcome,
+    record_delivery: RecordDelivery,
+) -> stock_analysis::event::NewsFlashTerminalDisposition
+where
+    RecordDelivery: FnOnce(bool) -> Result<(), String>,
+{
+    let physically_accepted = matches!(&physical, NewsFlashPhysicalSinkOutcome::Accepted { .. });
+    if let Err(error) = record_delivery(physically_accepted) {
+        return stock_analysis::event::NewsFlashTerminalDisposition::Uncertain {
+            reason_code: format!("news_flash_l7_analytics_failed:{error}"),
+        };
+    }
+
+    match physical {
+        NewsFlashPhysicalSinkOutcome::PreAttemptRejected {
+            reason_code,
+            evidence_sha256,
+        } => stock_analysis::event::NewsFlashTerminalDisposition::DefinitivelyRejected {
+            reason_code,
+            transport_evidence_sha256: evidence_sha256,
+        },
+        NewsFlashPhysicalSinkOutcome::DefinitivelyRejected {
+            reason_code,
+            transport_evidence_sha256,
+        } => stock_analysis::event::NewsFlashTerminalDisposition::DefinitivelyRejected {
+            reason_code,
+            transport_evidence_sha256,
+        },
+        NewsFlashPhysicalSinkOutcome::Accepted { remote_receipt } => {
+            stock_analysis::event::NewsFlashTerminalDisposition::Accepted { remote_receipt }
+        }
+        NewsFlashPhysicalSinkOutcome::Uncertain { reason_code } => {
+            stock_analysis::event::NewsFlashTerminalDisposition::Uncertain { reason_code }
+        }
+    }
+}
+
+fn news_flash_physical_preflight(
+    send_type: MessageSendType,
+    send_transport: MessageSendTransport,
+    push_v6_enabled: bool,
+    boolean_only_sink_enabled: bool,
+) -> Result<(), NewsFlashPhysicalSinkOutcome> {
+    let reject = |reason_code: &str, evidence: &[u8]| {
+        Err(NewsFlashPhysicalSinkOutcome::PreAttemptRejected {
+            reason_code: reason_code.to_owned(),
+            evidence_sha256: sha256_domain("br244-news-flash-pre-attempt-v1", evidence),
+        })
+    };
+    if push_v6_enabled {
+        return reject(
+            "news_flash_v6_typed_receipt_unavailable",
+            b"STOCK_ANALYSIS_PUSH_V6_ENABLE selects a boolean-only sink",
+        );
+    }
+    if boolean_only_sink_enabled {
+        return reject(
+            "news_flash_boolean_only_sink_unavailable",
+            b"dry-run and boolean-only sinks cannot return a typed remote receipt",
+        );
+    }
+    if !matches!(send_transport, MessageSendTransport::Cli) {
+        return reject(
+            "news_flash_typed_receipt_transport_unavailable",
+            format!(
+                "channel={} transport=http does not return a typed remote receipt",
+                send_type.as_str()
+            )
+            .as_bytes(),
+        );
+    }
+    Ok(())
+}
+
 fn push_via_magiclaw_cli_receipt_blocking(
     send_type: MessageSendType,
     text: &str,
@@ -3680,14 +4284,19 @@ fn dry_run_push_active() -> bool {
     cfg!(test) || std::env::var("V10_DRY_RUN_PUSH").ok().as_deref() == Some("1")
 }
 
-pub async fn push_feishu_via_http(text: &str) -> bool {
+async fn push_feishu_via_http_with_attempt_marker(
+    text: &str,
+    marker: Option<&mut dyn PhysicalSinkAttemptMarker>,
+) -> PushWechatAttemptOutcome {
     let url = match resolve_feishu_webhook_url() {
         Some(v) => v,
         None => {
             log::error!(
                 "[飞书] 推送失败: 未配置 FEISHU_WEBHOOK_URL（或 MAGICLAW_FEISHU_WEBHOOK_URL）"
             );
-            return false;
+            return PushWechatAttemptOutcome::RejectedBeforeAttempt(
+                "feishu_webhook_url_unavailable".to_owned(),
+            );
         }
     };
 
@@ -3701,14 +4310,30 @@ pub async fn push_feishu_via_http(text: &str) -> bool {
         Ok(v) => v,
         Err(e) => {
             log::error!("[飞书] 创建 HTTP 客户端失败: {}", e);
-            return false;
+            return PushWechatAttemptOutcome::RejectedBeforeAttempt(
+                "feishu_http_client_build_failed".to_owned(),
+            );
         }
     };
 
-    push_feishu_http_with_client(&client, &url, text).await
+    push_feishu_http_with_client_and_attempt_marker(&client, &url, text, marker).await
 }
 
+#[cfg(test)]
 async fn push_feishu_http_with_client(client: &reqwest::Client, url: &str, text: &str) -> bool {
+    match push_feishu_http_with_client_and_attempt_marker(client, url, text, None).await {
+        PushWechatAttemptOutcome::Attempted(delivered) => delivered,
+        PushWechatAttemptOutcome::SimulatedWithoutPhysicalAttempt => true,
+        PushWechatAttemptOutcome::RejectedBeforeAttempt(_) => false,
+    }
+}
+
+async fn push_feishu_http_with_client_and_attempt_marker(
+    client: &reqwest::Client,
+    url: &str,
+    text: &str,
+    mut marker: Option<&mut dyn PhysicalSinkAttemptMarker>,
+) -> PushWechatAttemptOutcome {
     let payload = serde_json::json!({
         "msg_type": "text",
         "content": {
@@ -3716,11 +4341,15 @@ async fn push_feishu_http_with_client(client: &reqwest::Client, url: &str, text:
         }
     });
 
+    if let Err(error) = mark_physical_sink_attempt(&mut marker).await {
+        log::error!("[NewsAI][BR-172] durable sink-start marker failed: {error}");
+        return PushWechatAttemptOutcome::RejectedBeforeAttempt(error);
+    }
     let resp = match client.post(url).json(&payload).send().await {
         Ok(v) => v,
         Err(e) => {
             log::error!("[飞书] 推送失败: 调用 webhook 失败: {}", e);
-            return false;
+            return PushWechatAttemptOutcome::Attempted(false);
         }
     };
 
@@ -3729,12 +4358,12 @@ async fn push_feishu_http_with_client(client: &reqwest::Client, url: &str, text:
         Ok(body) => body,
         Err(error) => {
             log::error!("[飞书] 推送失败: 读取 webhook 响应失败: {}", error);
-            return false;
+            return PushWechatAttemptOutcome::Attempted(false);
         }
     };
     if !status.is_success() {
         log::error!("[飞书] 推送失败: webhook HTTP {}: {}", status, body_text);
-        return false;
+        return PushWechatAttemptOutcome::Attempted(false);
     }
 
     let parsed = serde_json::from_str::<serde_json::Value>(&body_text).ok();
@@ -3751,14 +4380,18 @@ async fn push_feishu_http_with_client(client: &reqwest::Client, url: &str, text:
 
     if ok_by_status_code || ok_by_code {
         log::info!("[飞书] 推送成功 | via=http");
-        return true;
+        return PushWechatAttemptOutcome::Attempted(true);
     }
 
     log::error!("[飞书] 推送失败: webhook 返回非成功体: {}", body_text);
-    false
+    PushWechatAttemptOutcome::Attempted(false)
 }
 
-pub async fn push_via_magiclaw_cli(send_type: MessageSendType, text: &str) -> bool {
+async fn push_via_magiclaw_cli_with_attempt_marker(
+    send_type: MessageSendType,
+    text: &str,
+    mut marker: Option<&mut dyn PhysicalSinkAttemptMarker>,
+) -> PushWechatAttemptOutcome {
     let to = match send_type {
         MessageSendType::Wechat => None,
         MessageSendType::Feishu => match resolve_feishu_target() {
@@ -3767,7 +4400,9 @@ pub async fn push_via_magiclaw_cli(send_type: MessageSendType, text: &str) -> bo
                 log::error!(
                     "[飞书] 解析收件人失败: 飞书发送缺少收件人，请设置 FEISHU_TO（或 MAGICLAW_FEISHU_TO / FEISHU_CHAT_ID / FEISHU_OPEN_ID / FEISHU_USER_ID / FEISHU_EMAIL）"
                 );
-                return false;
+                return PushWechatAttemptOutcome::RejectedBeforeAttempt(
+                    "feishu_target_unavailable".to_owned(),
+                );
             }
         },
     };
@@ -3833,6 +4468,10 @@ pub async fn push_via_magiclaw_cli(send_type: MessageSendType, text: &str) -> bo
         }
     }
 
+    if let Err(error) = mark_physical_sink_attempt(&mut marker).await {
+        log::error!("[NewsAI][BR-172] durable sink-start marker failed: {error}");
+        return PushWechatAttemptOutcome::RejectedBeforeAttempt(error);
+    }
     let output = match cmd.output().await {
         Ok(v) => v,
         Err(e) => {
@@ -3841,7 +4480,7 @@ pub async fn push_via_magiclaw_cli(send_type: MessageSendType, text: &str) -> bo
                 magiclaw_bin,
                 e
             );
-            return false;
+            return PushWechatAttemptOutcome::Attempted(false);
         }
     };
 
@@ -3856,7 +4495,7 @@ pub async fn push_via_magiclaw_cli(send_type: MessageSendType, text: &str) -> bo
                     receipt.message_id.len(),
                     receipt.platform_msg_id.len()
                 );
-                return true;
+                return PushWechatAttemptOutcome::Attempted(true);
             }
             Err(error) => {
                 log::error!(
@@ -3864,7 +4503,7 @@ pub async fn push_via_magiclaw_cli(send_type: MessageSendType, text: &str) -> bo
                     send_type.label(),
                     error
                 );
-                return false;
+                return PushWechatAttemptOutcome::Attempted(false);
             }
         }
     }
@@ -3886,7 +4525,7 @@ pub async fn push_via_magiclaw_cli(send_type: MessageSendType, text: &str) -> bo
             "".to_string()
         }
     );
-    false
+    PushWechatAttemptOutcome::Attempted(false)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -6643,6 +7282,251 @@ mod tests {
                 "exit-zero stdout without a real Feishu receipt must fail: {stdout}"
             );
         }
+    }
+
+    #[test]
+    fn br244_news_flash_v6_is_rejected_before_any_physical_request() {
+        let mut cli_calls = 0usize;
+        let outcome = deliver_news_flash_physical_with(
+            MessageSendType::Feishu,
+            MessageSendTransport::Cli,
+            true,
+            false,
+            "TEST_CODE_BR244_V6_PRE_ATTEMPT",
+            |_send_type, _text| {
+                cli_calls += 1;
+                panic!("V6 prerequisite rejection must not invoke the CLI sink")
+            },
+        );
+
+        assert_eq!(cli_calls, 0);
+        assert!(matches!(
+            outcome,
+            NewsFlashPhysicalSinkOutcome::PreAttemptRejected {
+                reason_code,
+                ..
+            } if reason_code == "news_flash_v6_typed_receipt_unavailable"
+        ));
+    }
+
+    #[test]
+    fn br244_news_flash_http_and_boolean_sinks_never_invoke_cli() {
+        for (transport, boolean_only, expected_reason) in [
+            (
+                MessageSendTransport::Http,
+                false,
+                "news_flash_typed_receipt_transport_unavailable",
+            ),
+            (
+                MessageSendTransport::Cli,
+                true,
+                "news_flash_boolean_only_sink_unavailable",
+            ),
+        ] {
+            let mut cli_calls = 0usize;
+            let outcome = deliver_news_flash_physical_with(
+                MessageSendType::Feishu,
+                transport,
+                false,
+                boolean_only,
+                "TEST_CODE_BR244_UNSUPPORTED_TRANSPORT",
+                |_send_type, _text| {
+                    cli_calls += 1;
+                    panic!("unsupported NewsFlash transport must not invoke the CLI")
+                },
+            );
+            assert_eq!(cli_calls, 0);
+            assert!(matches!(
+                outcome,
+                NewsFlashPhysicalSinkOutcome::PreAttemptRejected {
+                    reason_code,
+                    ..
+                } if reason_code == expected_reason
+            ));
+        }
+    }
+
+    #[test]
+    fn br244_news_flash_cli_acceptance_requires_and_preserves_typed_remote_receipt() {
+        let outcome = deliver_news_flash_physical_with(
+            MessageSendType::Feishu,
+            MessageSendTransport::Cli,
+            false,
+            false,
+            "TEST_CODE_BR244_TYPED_RECEIPT",
+            |send_type, text| {
+                assert!(matches!(send_type, MessageSendType::Feishu));
+                assert_eq!(text, "TEST_CODE_BR244_TYPED_RECEIPT");
+                Ok(CliDeliveryReceipt {
+                    message_id: "TEST_CODE_LOCAL_MESSAGE_ID".to_owned(),
+                    platform_msg_id: "TEST_CODE_REMOTE_PLATFORM_ID".to_owned(),
+                })
+            },
+        );
+
+        let receipt = match outcome {
+            NewsFlashPhysicalSinkOutcome::Accepted { remote_receipt } => remote_receipt,
+            other => panic!("typed CLI receipt must be accepted, got {other:?}"),
+        };
+        assert_eq!(receipt.channel, "feishu");
+        assert_eq!(receipt.provider, "magiclaw-cli");
+        assert_eq!(receipt.message_id, "TEST_CODE_LOCAL_MESSAGE_ID");
+        assert_eq!(receipt.platform_message_id, "TEST_CODE_REMOTE_PLATFORM_ID");
+    }
+
+    #[test]
+    fn br244_news_flash_l7_failure_after_acceptance_is_uncertain_without_resend() {
+        let sink_calls = std::cell::Cell::new(0usize);
+        let physical = deliver_news_flash_physical_with(
+            MessageSendType::Feishu,
+            MessageSendTransport::Cli,
+            false,
+            false,
+            "TEST_CODE_BR244_L7_FAILURE",
+            |_send_type, _text| {
+                sink_calls.set(sink_calls.get() + 1);
+                Ok(CliDeliveryReceipt {
+                    message_id: "TEST_CODE_LOCAL_MESSAGE_ID".to_owned(),
+                    platform_msg_id: "TEST_CODE_REMOTE_PLATFORM_ID".to_owned(),
+                })
+            },
+        );
+        assert_eq!(sink_calls.get(), 1);
+
+        let l7_calls = std::cell::Cell::new(0usize);
+        let disposition =
+            news_flash_terminal_disposition_after_l7_with(physical, |physically_accepted| {
+                l7_calls.set(l7_calls.get() + 1);
+                assert!(physically_accepted);
+                Err("TEST_CODE_L7_APPEND_FAILED".to_owned())
+            });
+
+        assert_eq!(sink_calls.get(), 1, "L7 failure must not resend");
+        assert_eq!(l7_calls.get(), 1);
+        assert!(matches!(
+            disposition,
+            stock_analysis::event::NewsFlashTerminalDisposition::Uncertain { reason_code }
+                if reason_code
+                    == "news_flash_l7_analytics_failed:TEST_CODE_L7_APPEND_FAILED"
+        ));
+    }
+
+    #[test]
+    fn br244_news_flash_request_issued_failures_remain_uncertain() {
+        for reason_code in [
+            "magiclaw_cli_nonzero_after_send_attempt",
+            "magiclaw_cli_receipt_invalid",
+        ] {
+            let outcome = deliver_news_flash_physical_with(
+                MessageSendType::Feishu,
+                MessageSendTransport::Cli,
+                false,
+                false,
+                "TEST_CODE_BR244_REQUEST_ISSUED",
+                |_send_type, _text| {
+                    Err(BlockingCliDeliveryFailure::Uncertain {
+                        reason_code: reason_code.to_owned(),
+                        evidence: b"TEST_CODE_TRANSPORT_EVIDENCE".to_vec(),
+                    })
+                },
+            );
+            assert_eq!(
+                outcome,
+                NewsFlashPhysicalSinkOutcome::Uncertain {
+                    reason_code: reason_code.to_owned(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn br244_news_flash_cli_request_prevented_is_definitively_rejected() {
+        let outcome = deliver_news_flash_physical_with(
+            MessageSendType::Feishu,
+            MessageSendTransport::Cli,
+            false,
+            false,
+            "TEST_CODE_BR244_REQUEST_PREVENTED",
+            |_send_type, _text| {
+                Err(BlockingCliDeliveryFailure::Rejected {
+                    reason_code: "magiclaw_cli_spawn_failed".to_owned(),
+                    evidence: b"TEST_CODE_PROCESS_NOT_STARTED".to_vec(),
+                })
+            },
+        );
+
+        assert!(matches!(
+            outcome,
+            NewsFlashPhysicalSinkOutcome::DefinitivelyRejected {
+                reason_code,
+                transport_evidence_sha256,
+            } if reason_code == "magiclaw_cli_spawn_failed"
+                && transport_evidence_sha256.len() == 64
+        ));
+    }
+
+    #[test]
+    fn br244_news_flash_attempt_precedes_cli_and_terminal_authority() {
+        let source = include_str!("notify.rs");
+        let start = source
+            .find("pub(super) async fn push_news_flash_v3")
+            .expect("NewsFlash production transaction");
+        let end = source[start..]
+            .find("/// Dedicated BR-196")
+            .expect("NewsFlash production transaction boundary");
+        let transaction = &source[start..start + end];
+
+        let preflight = transaction
+            .find("news_flash_physical_preflight(")
+            .expect("typed transport preflight");
+        let attempt = transaction
+            .find("publish_news_flash_attempt(")
+            .expect("durable sink attempt append");
+        let physical = transaction
+            .find("deliver_news_flash_physical_with(")
+            .expect("single typed physical request seam");
+        let duplicate = transaction
+            .find("NewsFlashDeliveryAuditError::DuplicateAuthority")
+            .expect("typed duplicate attempt branch");
+        let duplicate_branch = &transaction[duplicate..physical];
+        assert!(duplicate_branch.contains("reconcile_news_flash_business_date("));
+        assert!(duplicate_branch.contains("return NewsFlashNotifyOutcome::TerminalAuditFailed"));
+        let l7 = transaction
+            .find("v14_adapter::v14_record_delivery(")
+            .expect("single L7 delivery audit");
+        let terminal = transaction
+            .find("publish_news_flash_terminal(")
+            .expect("durable terminal append");
+        assert!(
+            preflight < attempt
+                && attempt < duplicate
+                && duplicate < physical
+                && physical < l7
+                && l7 < terminal
+        );
+        assert_eq!(
+            transaction.matches("publish_news_flash_attempt(").count(),
+            1
+        );
+        assert_eq!(
+            transaction
+                .matches("deliver_news_flash_physical_with(")
+                .count(),
+            1
+        );
+        assert_eq!(
+            transaction.matches("publish_news_flash_terminal(").count(),
+            1
+        );
+        assert_eq!(
+            transaction
+                .matches("v14_adapter::v14_record_delivery(")
+                .count(),
+            1
+        );
+        assert!(!transaction.contains("push_wechat(text)"));
+        assert!(!transaction.contains("sink_router().route"));
+        assert!(!transaction.contains("publish_news_flash_delivery("));
     }
 
     #[tokio::test]

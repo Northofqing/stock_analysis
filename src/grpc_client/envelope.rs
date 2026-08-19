@@ -23,6 +23,8 @@ pub enum EnvelopeError {
     RequestIdMismatch(String, String),
     #[error("响应缺 request_id")]
     MissingRequestId,
+    #[error("响应 operation 不匹配: 期望 {0} 实际 {1}")]
+    OperationMismatch(i32, i32),
     #[error("schema 未冻结, 无法构造请求")]
     SchemaNotFrozen,
     #[error("payload 序列化失败: {0}")]
@@ -42,7 +44,7 @@ pub fn build_query_request(
         }),
         // 合同 §5: 普通调用保持 preferred_provider 为空, 由服务端 Composition 选择。
         preferred_provider: String::new(),
-        // BR-231: production gateway requests never opt into diagnostic data.
+        // BR-238: production gateway requests never opt into diagnostic data.
         // A separately named operator probe may build an explicit diagnostic
         // request, but the shared production constructor stays fail-closed.
         allow_unadmitted: false,
@@ -72,6 +74,7 @@ pub struct QueryResult {
 
 pub fn parse_query_response(
     expected_request_id: &str,
+    expected_operation: Operation,
     resp: QueryResponse,
 ) -> Result<QueryResult, EnvelopeError> {
     if resp.request_id.is_empty() {
@@ -81,6 +84,12 @@ pub fn parse_query_response(
         return Err(EnvelopeError::RequestIdMismatch(
             expected_request_id.to_string(),
             resp.request_id,
+        ));
+    }
+    if resp.operation != expected_operation as i32 {
+        return Err(EnvelopeError::OperationMismatch(
+            expected_operation as i32,
+            resp.operation,
         ));
     }
     Ok(QueryResult {
@@ -122,7 +131,7 @@ mod tests {
         assert_eq!(req.preferred_provider, "");
         assert!(
             !req.allow_unadmitted,
-            "BR-231 production requests must not opt into diagnostic data"
+            "BR-238 production requests must not opt into diagnostic data"
         );
         let payload = req.payload.unwrap();
         assert_eq!(payload.schema, "market.realtime_quotes");
@@ -144,7 +153,7 @@ mod tests {
     fn parses_query_response_with_matching_request_id() {
         let resp = QueryResponse {
             request_id: "r-1".to_string(),
-            operation: 3,
+            operation: Operation::RealtimeQuotes as i32,
             admission: AdmissionState::Admitted as i32,
             selected_provider: "tdx-dev".to_string(),
             batch_id: "b-1".to_string(),
@@ -155,7 +164,7 @@ mod tests {
             source: "tdx".to_string(),
             diagnostic_blocker: "TEST_CODE_diagnostic_blocker".to_string(),
         };
-        let result = parse_query_response("r-1", resp).unwrap();
+        let result = parse_query_response("r-1", Operation::RealtimeQuotes, resp).unwrap();
         assert_eq!(result.admission, AdmissionState::Admitted);
         assert!(result.complete);
         assert_eq!(result.selected_provider, "tdx-dev");
@@ -167,7 +176,7 @@ mod tests {
     fn rejects_mismatched_request_id() {
         let resp = QueryResponse {
             request_id: "other".to_string(),
-            operation: 3,
+            operation: Operation::RealtimeQuotes as i32,
             admission: 1,
             selected_provider: "".to_string(),
             batch_id: "".to_string(),
@@ -178,15 +187,41 @@ mod tests {
             source: String::new(),
             diagnostic_blocker: String::new(),
         };
-        let err = parse_query_response("r-1", resp).unwrap_err();
+        let err = parse_query_response("r-1", Operation::RealtimeQuotes, resp).unwrap_err();
         assert!(matches!(err, EnvelopeError::RequestIdMismatch(_, _)));
+    }
+
+    #[test]
+    fn br238_rejects_response_for_a_different_operation() {
+        let resp = QueryResponse {
+            request_id: "r-1".to_string(),
+            operation: Operation::OrderBooks as i32,
+            admission: AdmissionState::Admitted as i32,
+            selected_provider: "TEST_CODE_provider".to_string(),
+            batch_id: "TEST_CODE_batch".to_string(),
+            complete: true,
+            observed_at: "2026-08-17T09:20:01+08:00".to_string(),
+            source_at: "2026-08-17T09:20:00+08:00".to_string(),
+            records: vec![],
+            source: "TEST_CODE_source".to_string(),
+            diagnostic_blocker: String::new(),
+        };
+        let error = parse_query_response("r-1", Operation::RealtimeQuotes, resp)
+            .expect_err("a response for a different operation must fail closed");
+        assert_eq!(
+            error,
+            EnvelopeError::OperationMismatch(
+                Operation::RealtimeQuotes as i32,
+                Operation::OrderBooks as i32,
+            )
+        );
     }
 
     #[test]
     fn rejects_missing_request_id() {
         let resp = QueryResponse {
             request_id: String::new(),
-            operation: 3,
+            operation: Operation::RealtimeQuotes as i32,
             admission: 1,
             selected_provider: "".to_string(),
             batch_id: "".to_string(),
@@ -198,7 +233,7 @@ mod tests {
             diagnostic_blocker: String::new(),
         };
         assert_eq!(
-            parse_query_response("r-1", resp).unwrap_err(),
+            parse_query_response("r-1", Operation::RealtimeQuotes, resp).unwrap_err(),
             EnvelopeError::MissingRequestId
         );
     }

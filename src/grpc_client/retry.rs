@@ -11,9 +11,23 @@ pub enum RetryDecision {
 
 /// §10 表: 每个错误码的重试决策。
 pub fn retry_decision(err: &GrpcError) -> RetryDecision {
+    if err.details().retryable == Some(false) {
+        return RetryDecision::NoRetry;
+    }
+    if err.details().retryable == Some(true) {
+        return match err {
+            // Request/auth/permission/contract errors remain non-retryable even if a
+            // remote endpoint sends contradictory metadata.
+            GrpcError::InvalidArgument { .. }
+            | GrpcError::Unauthenticated { .. }
+            | GrpcError::PermissionDenied { .. }
+            | GrpcError::Unimplemented { .. } => RetryDecision::NoRetry,
+            GrpcError::DeadlineExceeded { .. } => RetryDecision::RetryBounded,
+            _ => RetryDecision::RetryBackoff,
+        };
+    }
     match err {
-        // D2: 变体带 details, 用 { .. } 忽略; 重试决策仍只看错误码 (§10),
-        // 服务端 reason_code/retryable 由桥在 GatewayError 层消费 (grpc_source.rs)。
+        // No explicit detail: fall back to the frozen transport-code table.
         GrpcError::Unavailable { .. } => RetryDecision::RetryBackoff,
         GrpcError::DeadlineExceeded { .. } => RetryDecision::RetryBounded,
         _ => RetryDecision::NoRetry,
@@ -110,6 +124,40 @@ mod tests {
                 details: ErrorDetail::default()
             }),
             RetryDecision::NoRetry
+        );
+    }
+
+    #[test]
+    fn explicit_retryable_detail_overrides_transport_default_safely() {
+        let non_retryable = ErrorDetail {
+            retryable: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            retry_decision(&GrpcError::Unavailable {
+                details: non_retryable
+            }),
+            RetryDecision::NoRetry
+        );
+
+        let retryable = ErrorDetail {
+            retryable: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            retry_decision(&GrpcError::Internal { details: retryable }),
+            RetryDecision::RetryBackoff,
+            "delegate failures arrive as Internal with authoritative retryability"
+        );
+
+        let invalid = ErrorDetail {
+            retryable: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            retry_decision(&GrpcError::InvalidArgument { details: invalid }),
+            RetryDecision::NoRetry,
+            "an invalid request is never made retryable by remote metadata"
         );
     }
 

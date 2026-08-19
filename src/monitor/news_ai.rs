@@ -16,6 +16,7 @@ use crate::llm::{
 use crate::magic_compat::ProviderId;
 use crate::magic_compat::SourceEvidence;
 use crate::news::aggregator::AdmittedGlobalNewsBatch;
+use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -60,6 +61,14 @@ pub enum NewsAiError {
     ModelReceiptMissing,
     #[error("invalid model schema: {0}")]
     InvalidModelSchema(String),
+    #[error("analysis audit failed: {0}")]
+    AnalysisAuditFailed(String),
+    #[error("prediction commit failed: {0}")]
+    PredictionCommitFailed(String),
+    #[error("delivery denied: {0}")]
+    DeliveryDenied(String),
+    #[error("delivery sink failed: {0}")]
+    DeliverySinkFailed(String),
 }
 
 impl NewsAiError {
@@ -75,6 +84,10 @@ impl NewsAiError {
             Self::ModelUnavailable(_) => "model_unavailable",
             Self::ModelReceiptMissing => "model_receipt_missing",
             Self::InvalidModelSchema(_) => "invalid_model_schema",
+            Self::AnalysisAuditFailed(_) => "analysis_audit_failed",
+            Self::PredictionCommitFailed(_) => "prediction_commit_failed",
+            Self::DeliveryDenied(_) => "delivery_denied",
+            Self::DeliverySinkFailed(_) => "delivery_sink_failed",
         }
     }
 }
@@ -769,6 +782,55 @@ impl ModelCallReceipt {
     pub fn completed_at(&self) -> DateTime<Utc> {
         self.completed_at
     }
+
+    fn try_from_persisted(input: PersistedModelCallReceipt) -> Result<Self, NewsAiError> {
+        validate_nonempty_id("persisted model provider", &input.provider)?;
+        validate_nonempty_id("persisted model", &input.model)?;
+        let upstream_request_id = validate_optional_model_id(
+            "persisted upstream request",
+            input.upstream_request_id.as_deref(),
+        )?;
+        let upstream_response_id = validate_required_model_id(
+            "persisted upstream response",
+            Some(&input.upstream_response_id),
+        )?;
+        for (label, value) in [
+            ("persisted model system", input.system_sha256.as_str()),
+            ("persisted model user", input.user_sha256.as_str()),
+            ("persisted model response", input.response_sha256.as_str()),
+        ] {
+            validate_sha256(label, value)?;
+        }
+        if input.completed_at < input.started_at {
+            return Err(NewsAiError::AnalysisAuditFailed(
+                "persisted model completion precedes start".to_owned(),
+            ));
+        }
+        Ok(Self {
+            provider: input.provider,
+            model: input.model,
+            upstream_request_id,
+            upstream_response_id,
+            system_sha256: input.system_sha256,
+            user_sha256: input.user_sha256,
+            response_sha256: input.response_sha256,
+            started_at: input.started_at,
+            completed_at: input.completed_at,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PersistedModelCallReceipt {
+    pub provider: String,
+    pub model: String,
+    pub upstream_request_id: Option<String>,
+    pub upstream_response_id: String,
+    pub system_sha256: String,
+    pub user_sha256: String,
+    pub response_sha256: String,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -851,6 +913,685 @@ impl NewsAiAssessment {
     pub fn receipt(&self) -> &ModelCallReceipt {
         &self.receipt
     }
+
+    pub(crate) fn try_from_persisted(
+        input: PersistedNewsAiAssessment,
+    ) -> Result<Self, NewsAiError> {
+        validate_sha256("persisted assessment identity", &input.assessment_id)?;
+        validate_sha256(
+            "persisted assessment input evidence",
+            &input.input_evidence_sha256,
+        )?;
+        validate_sha256(
+            "persisted assessment prompt",
+            &input.normalized_prompt_sha256,
+        )?;
+        if input.confidence > 100 {
+            return Err(NewsAiError::AnalysisAuditFailed(
+                "persisted assessment confidence exceeds 100".to_owned(),
+            ));
+        }
+        if input.uncertainty.trim().is_empty() || input.core_logic.trim().is_empty() {
+            return Err(NewsAiError::AnalysisAuditFailed(
+                "persisted assessment reasoning is empty".to_owned(),
+            ));
+        }
+        let receipt = ModelCallReceipt::try_from_persisted(input.receipt)?;
+        if receipt.system_sha256() != sha256_hex(NEWS_AI_SYSTEM_PROMPT_V1.as_bytes())
+            || receipt.user_sha256() != input.normalized_prompt_sha256
+        {
+            return Err(NewsAiError::AnalysisAuditFailed(
+                "persisted model receipt differs from NewsAI prompt evidence".to_owned(),
+            ));
+        }
+        Ok(Self {
+            assessment_id: input.assessment_id,
+            impact: input.impact,
+            confidence: input.confidence,
+            uncertainty: input.uncertainty,
+            core_logic: input.core_logic,
+            input_evidence_sha256: input.input_evidence_sha256,
+            normalized_prompt_sha256: input.normalized_prompt_sha256,
+            receipt,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PersistedNewsAiAssessment {
+    pub assessment_id: String,
+    pub impact: NewsImpact,
+    pub confidence: u8,
+    pub uncertainty: String,
+    pub core_logic: String,
+    pub input_evidence_sha256: String,
+    pub normalized_prompt_sha256: String,
+    pub receipt: PersistedModelCallReceipt,
+}
+
+/// Exact BR-172 delivery identity. Its hash is stable across retries and is
+/// bound only to admitted source identity plus the analysis version; display
+/// text, process time and model output never alter the identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewsAiDeliveryIdentity {
+    provider: ProviderId,
+    source_batch_id: String,
+    source_item_id: String,
+    target_code: String,
+    analysis_version: String,
+    sha256: String,
+}
+
+impl NewsAiDeliveryIdentity {
+    fn from_fact(fact: &AdmittedNewsFact, analysis_version: &str) -> Self {
+        let mut hasher = Sha256::new();
+        for value in [
+            provider_tag(fact.provider()),
+            fact.source_batch_id(),
+            fact.item_id(),
+            fact.target_code(),
+            analysis_version,
+        ] {
+            hash_field(&mut hasher, value);
+        }
+        Self {
+            provider: fact.provider(),
+            source_batch_id: fact.source_batch_id().to_owned(),
+            source_item_id: fact.item_id().to_owned(),
+            target_code: fact.target_code().to_owned(),
+            analysis_version: analysis_version.to_owned(),
+            sha256: format!("{:x}", hasher.finalize()),
+        }
+    }
+
+    pub fn provider(&self) -> ProviderId {
+        self.provider
+    }
+
+    pub fn source_batch_id(&self) -> &str {
+        &self.source_batch_id
+    }
+
+    pub fn source_item_id(&self) -> &str {
+        &self.source_item_id
+    }
+
+    pub fn target_code(&self) -> &str {
+        &self.target_code
+    }
+
+    pub fn analysis_version(&self) -> &str {
+        &self.analysis_version
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
+/// Delivery-ready projection whose constructor is crate-private. The database
+/// audit owner must mint it from an append/verified-existing receipt; callers
+/// cannot promote a bare model response into production delivery.
+#[derive(Debug, Clone)]
+pub struct AuditedNewsAiAssessment {
+    delivery: GovernedNewsAiDelivery,
+}
+
+impl AuditedNewsAiAssessment {
+    pub(crate) fn try_from_assessment_audit(
+        request: NewsAiRequest,
+        assessment: NewsAiAssessment,
+        assessment_audit_record_sha256: &str,
+    ) -> Result<Self, NewsAiError> {
+        validate_sha256("assessment audit record", assessment_audit_record_sha256)?;
+        let expected_assessment_id = assessment_identity(&request);
+        if assessment.assessment_id() != expected_assessment_id {
+            return Err(NewsAiError::AnalysisAuditFailed(
+                "assessment identity differs from exact source identity".to_owned(),
+            ));
+        }
+        let fact = request.fact().clone();
+        let analysis_version = request.analysis_version().to_owned();
+        let identity = NewsAiDeliveryIdentity::from_fact(&fact, &analysis_version);
+        Ok(Self {
+            delivery: GovernedNewsAiDelivery {
+                fact,
+                analysis_version,
+                assessment,
+                assessment_audit_record_sha256: assessment_audit_record_sha256.to_owned(),
+                identity,
+            },
+        })
+    }
+
+    pub(crate) fn try_from_persisted_assessment_audit(
+        fact: AdmittedNewsFact,
+        analysis_version: &str,
+        assessment: PersistedNewsAiAssessment,
+        assessment_audit_record_sha256: &str,
+    ) -> Result<Self, NewsAiError> {
+        if analysis_version.trim().is_empty() {
+            return Err(NewsAiError::AnalysisAuditFailed(
+                "persisted assessment analysis version is empty".to_owned(),
+            ));
+        }
+        validate_sha256("assessment audit record", assessment_audit_record_sha256)?;
+        let assessment = NewsAiAssessment::try_from_persisted(assessment)?;
+        let expected_assessment_id = assessment_identity_for_fact(&fact, analysis_version);
+        if assessment.assessment_id() != expected_assessment_id {
+            return Err(NewsAiError::AnalysisAuditFailed(
+                "persisted assessment identity differs from admitted source fact".to_owned(),
+            ));
+        }
+        let identity = NewsAiDeliveryIdentity::from_fact(&fact, analysis_version);
+        Ok(Self {
+            delivery: GovernedNewsAiDelivery {
+                fact,
+                analysis_version: analysis_version.to_owned(),
+                assessment,
+                assessment_audit_record_sha256: assessment_audit_record_sha256.to_owned(),
+                identity,
+            },
+        })
+    }
+
+    pub fn delivery(&self) -> &GovernedNewsAiDelivery {
+        &self.delivery
+    }
+}
+
+/// Complete immutable input presented at the governed-delivery seam.
+#[derive(Debug, Clone)]
+pub struct GovernedNewsAiDelivery {
+    fact: AdmittedNewsFact,
+    analysis_version: String,
+    assessment: NewsAiAssessment,
+    assessment_audit_record_sha256: String,
+    identity: NewsAiDeliveryIdentity,
+}
+
+impl GovernedNewsAiDelivery {
+    pub fn fact(&self) -> &AdmittedNewsFact {
+        &self.fact
+    }
+
+    pub fn analysis_version(&self) -> &str {
+        &self.analysis_version
+    }
+
+    pub fn assessment(&self) -> &NewsAiAssessment {
+        &self.assessment
+    }
+
+    pub fn assessment_audit_record_sha256(&self) -> &str {
+        &self.assessment_audit_record_sha256
+    }
+
+    pub fn identity(&self) -> &NewsAiDeliveryIdentity {
+        &self.identity
+    }
+
+    /// Render only immutable source/model/audit evidence. This card does not
+    /// infer holdings, prices or trading actions and has no default values.
+    pub fn render_card(&self) -> String {
+        let impact = match self.assessment.impact() {
+            NewsImpact::MajorNegative => "重大负面",
+            NewsImpact::Negative => "负面",
+            NewsImpact::Neutral => "中性",
+            NewsImpact::Positive => "正面",
+            NewsImpact::MajorPositive => "重大正面",
+        };
+        format!(
+            "🧠 AI 新闻证据分析\n\
+             标的：{}\n\
+             标题：{}\n\
+             来源：{} / {:?}\n\
+             发布时间：{}\n\
+             影响：{}（置信度 {}%）\n\
+             核心逻辑：{}\n\
+             不确定性：{}\n\
+             模型：{} / {}\n\
+             模型响应：{}\n\
+             证据哈希：{}\n\
+             评估审计：{}\n\
+             投递身份：{}\n\
+             ⚠️ 仅为来源绑定的模型分析，不构成交易建议。",
+            self.fact.target_code(),
+            self.fact.title(),
+            self.fact.source(),
+            self.fact.provider(),
+            self.fact.published_at().to_rfc3339(),
+            impact,
+            self.assessment.confidence(),
+            self.assessment.core_logic(),
+            self.assessment.uncertainty(),
+            self.assessment.receipt().provider(),
+            self.assessment.receipt().model(),
+            self.assessment.receipt().upstream_response_id(),
+            self.assessment.input_evidence_sha256(),
+            self.assessment_audit_record_sha256,
+            self.identity.sha256(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewsAiDeliveryReservation {
+    delivery_identity_sha256: String,
+    reservation_id: String,
+}
+
+impl NewsAiDeliveryReservation {
+    pub(crate) fn try_new(
+        delivery_identity_sha256: &str,
+        reservation_id: &str,
+    ) -> Result<Self, NewsAiError> {
+        validate_sha256("delivery reservation identity", delivery_identity_sha256)?;
+        validate_nonempty_id("delivery reservation", reservation_id)?;
+        Ok(Self {
+            delivery_identity_sha256: delivery_identity_sha256.to_owned(),
+            reservation_id: reservation_id.to_owned(),
+        })
+    }
+
+    pub fn delivery_identity_sha256(&self) -> &str {
+        &self.delivery_identity_sha256
+    }
+
+    pub fn reservation_id(&self) -> &str {
+        &self.reservation_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NewsAiReserveOutcome {
+    Reserved(NewsAiDeliveryReservation),
+    LinkPending(NewsAiDeliveryLinkRecovery),
+    Deduped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewsAiDeliveryAuditReceipt {
+    delivery_identity_sha256: String,
+    audit_event_id: String,
+}
+
+impl NewsAiDeliveryAuditReceipt {
+    pub(crate) fn try_new(
+        delivery_identity_sha256: &str,
+        audit_event_id: &str,
+    ) -> Result<Self, NewsAiError> {
+        validate_sha256("delivery audit identity", delivery_identity_sha256)?;
+        validate_nonempty_id("delivery audit event", audit_event_id)?;
+        Ok(Self {
+            delivery_identity_sha256: delivery_identity_sha256.to_owned(),
+            audit_event_id: audit_event_id.to_owned(),
+        })
+    }
+
+    pub fn delivery_identity_sha256(&self) -> &str {
+        &self.delivery_identity_sha256
+    }
+
+    pub fn audit_event_id(&self) -> &str {
+        &self.audit_event_id
+    }
+}
+
+/// Capability reconstructed only from a durable `delivered` ledger state.
+/// It authorizes prediction linkage but carries no permission to call a sink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewsAiDeliveryLinkRecovery {
+    reservation: NewsAiDeliveryReservation,
+    delivery_audit: NewsAiDeliveryAuditReceipt,
+}
+
+impl NewsAiDeliveryLinkRecovery {
+    pub(crate) fn try_new(
+        reservation: NewsAiDeliveryReservation,
+        delivery_audit: NewsAiDeliveryAuditReceipt,
+    ) -> Result<Self, NewsAiError> {
+        if reservation.delivery_identity_sha256() != delivery_audit.delivery_identity_sha256() {
+            return Err(NewsAiError::AnalysisAuditFailed(
+                "link recovery reservation differs from delivery audit".to_owned(),
+            ));
+        }
+        Ok(Self {
+            reservation,
+            delivery_audit,
+        })
+    }
+
+    pub fn reservation(&self) -> &NewsAiDeliveryReservation {
+        &self.reservation
+    }
+
+    pub fn delivery_audit(&self) -> &NewsAiDeliveryAuditReceipt {
+        &self.delivery_audit
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NewsAiPhysicalPushOutcome {
+    Pushed(NewsAiDeliveryAuditReceipt),
+    Deduped,
+    Denied(String),
+    /// Definitive failure before the physical sink was attempted.
+    SinkError(String),
+    /// Sink was attempted or accepted, so retry is forbidden even when the
+    /// post-sink audit could not be completed.
+    PostSinkFailure {
+        delivery_audit_event_id: Option<String>,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewsAiPredictionLinkReceipt {
+    delivery_identity_sha256: String,
+    assessment_id: String,
+    delivery_audit_event_id: String,
+    prediction_link_id: String,
+}
+
+impl NewsAiPredictionLinkReceipt {
+    pub fn try_new(
+        delivery_identity_sha256: &str,
+        assessment_id: &str,
+        delivery_audit_event_id: &str,
+        prediction_link_id: &str,
+    ) -> Result<Self, NewsAiError> {
+        validate_sha256(
+            "prediction link delivery identity",
+            delivery_identity_sha256,
+        )?;
+        validate_sha256("prediction link assessment identity", assessment_id)?;
+        validate_nonempty_id(
+            "prediction link delivery audit event",
+            delivery_audit_event_id,
+        )?;
+        validate_sha256("prediction link", prediction_link_id)?;
+        Ok(Self {
+            delivery_identity_sha256: delivery_identity_sha256.to_owned(),
+            assessment_id: assessment_id.to_owned(),
+            delivery_audit_event_id: delivery_audit_event_id.to_owned(),
+            prediction_link_id: prediction_link_id.to_owned(),
+        })
+    }
+
+    pub fn prediction_link_id(&self) -> &str {
+        &self.prediction_link_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NewsAiGovernedDeliveryOutcome {
+    RetainedNoDelivery {
+        assessment_id: String,
+    },
+    Pushed {
+        delivery_identity_sha256: String,
+        delivery_audit_event_id: String,
+        prediction_link_id: String,
+    },
+    PredictionLinkRecovered {
+        delivery_identity_sha256: String,
+        delivery_audit_event_id: String,
+        prediction_link_id: String,
+    },
+    Deduped {
+        delivery_identity_sha256: String,
+    },
+    Denied {
+        delivery_identity_sha256: String,
+        reason: String,
+    },
+    SinkError {
+        delivery_identity_sha256: String,
+        reason: String,
+    },
+    ReserveFailed {
+        delivery_identity_sha256: String,
+        reason: String,
+    },
+    RollbackFailed {
+        delivery_identity_sha256: String,
+        original_outcome: String,
+        reason: String,
+    },
+    PostSinkCommitFailed {
+        delivery_identity_sha256: String,
+        delivery_audit_event_id: String,
+        reason: String,
+    },
+    PostSinkRecovery {
+        delivery_identity_sha256: String,
+        delivery_audit_event_id: Option<String>,
+        reason: String,
+    },
+}
+
+/// The adapter seam is intentionally narrow: production supplies the durable
+/// reservation/prediction store and the normal governed sink; tests supply an
+/// in-memory adapter. `Pushed` is impossible without a durable delivery-audit
+/// receipt, so a transport-only success cannot advance settlement.
+#[async_trait]
+pub trait NewsAiGovernedDeliveryPort: Send + Sync {
+    async fn reserve(
+        &self,
+        delivery: &GovernedNewsAiDelivery,
+    ) -> Result<NewsAiReserveOutcome, String>;
+
+    async fn push(
+        &self,
+        delivery: &GovernedNewsAiDelivery,
+        reservation: &NewsAiDeliveryReservation,
+    ) -> NewsAiPhysicalPushOutcome;
+
+    async fn commit(
+        &self,
+        delivery: &GovernedNewsAiDelivery,
+        reservation: &NewsAiDeliveryReservation,
+        delivery_audit: &NewsAiDeliveryAuditReceipt,
+    ) -> Result<NewsAiPredictionLinkReceipt, String>;
+
+    async fn rollback(
+        &self,
+        delivery: &GovernedNewsAiDelivery,
+        reservation: &NewsAiDeliveryReservation,
+    ) -> Result<(), String>;
+}
+
+/// Deep BR-172 state machine. It owns ordering and settlement semantics; the
+/// adapter cannot cause commit before a receipt-bearing physical delivery.
+pub async fn deliver_governed_news_ai<P>(
+    audited: &AuditedNewsAiAssessment,
+    port: &P,
+) -> NewsAiGovernedDeliveryOutcome
+where
+    P: NewsAiGovernedDeliveryPort + ?Sized,
+{
+    let delivery = audited.delivery();
+    let identity = delivery.identity().sha256().to_owned();
+    if delivery.assessment().impact() == NewsImpact::Neutral {
+        return NewsAiGovernedDeliveryOutcome::RetainedNoDelivery {
+            assessment_id: delivery.assessment().assessment_id().to_owned(),
+        };
+    }
+
+    let reservation = match port.reserve(delivery).await {
+        Ok(NewsAiReserveOutcome::Deduped) => {
+            return NewsAiGovernedDeliveryOutcome::Deduped {
+                delivery_identity_sha256: identity,
+            };
+        }
+        Ok(NewsAiReserveOutcome::LinkPending(recovery)) => {
+            if recovery.reservation().delivery_identity_sha256() != identity
+                || recovery.delivery_audit().delivery_identity_sha256() != identity
+            {
+                return NewsAiGovernedDeliveryOutcome::ReserveFailed {
+                    delivery_identity_sha256: identity,
+                    reason: "link recovery identity differs from delivery".to_owned(),
+                };
+            }
+            let reservation = recovery.reservation();
+            let delivery_audit = recovery.delivery_audit();
+            return match port.commit(delivery, reservation, delivery_audit).await {
+                Ok(link)
+                    if link.delivery_identity_sha256 == identity
+                        && link.assessment_id == delivery.assessment().assessment_id()
+                        && link.delivery_audit_event_id == delivery_audit.audit_event_id() =>
+                {
+                    NewsAiGovernedDeliveryOutcome::PredictionLinkRecovered {
+                        delivery_identity_sha256: identity,
+                        delivery_audit_event_id: delivery_audit.audit_event_id().to_owned(),
+                        prediction_link_id: link.prediction_link_id().to_owned(),
+                    }
+                }
+                Ok(_) => NewsAiGovernedDeliveryOutcome::PostSinkCommitFailed {
+                    delivery_identity_sha256: identity,
+                    delivery_audit_event_id: delivery_audit.audit_event_id().to_owned(),
+                    reason: "recovered prediction link receipt differs from delivery".to_owned(),
+                },
+                Err(reason) => NewsAiGovernedDeliveryOutcome::PostSinkCommitFailed {
+                    delivery_identity_sha256: identity,
+                    delivery_audit_event_id: delivery_audit.audit_event_id().to_owned(),
+                    reason,
+                },
+            };
+        }
+        Ok(NewsAiReserveOutcome::Reserved(reservation))
+            if reservation.delivery_identity_sha256() == identity =>
+        {
+            reservation
+        }
+        Ok(NewsAiReserveOutcome::Reserved(_)) => {
+            return NewsAiGovernedDeliveryOutcome::ReserveFailed {
+                delivery_identity_sha256: identity,
+                reason: "reservation identity differs from delivery".to_owned(),
+            };
+        }
+        Err(reason) => {
+            return NewsAiGovernedDeliveryOutcome::ReserveFailed {
+                delivery_identity_sha256: identity,
+                reason,
+            };
+        }
+    };
+
+    match port.push(delivery, &reservation).await {
+        NewsAiPhysicalPushOutcome::Pushed(delivery_audit) => {
+            if delivery_audit.delivery_identity_sha256() != identity {
+                return NewsAiGovernedDeliveryOutcome::PostSinkCommitFailed {
+                    delivery_identity_sha256: identity,
+                    delivery_audit_event_id: delivery_audit.audit_event_id().to_owned(),
+                    reason: "delivery audit identity differs from reservation".to_owned(),
+                };
+            }
+            match port.commit(delivery, &reservation, &delivery_audit).await {
+                Ok(link)
+                    if link.delivery_identity_sha256 == identity
+                        && link.assessment_id == delivery.assessment().assessment_id()
+                        && link.delivery_audit_event_id == delivery_audit.audit_event_id() =>
+                {
+                    NewsAiGovernedDeliveryOutcome::Pushed {
+                        delivery_identity_sha256: identity,
+                        delivery_audit_event_id: delivery_audit.audit_event_id().to_owned(),
+                        prediction_link_id: link.prediction_link_id().to_owned(),
+                    }
+                }
+                Ok(_) => NewsAiGovernedDeliveryOutcome::PostSinkCommitFailed {
+                    delivery_identity_sha256: identity,
+                    delivery_audit_event_id: delivery_audit.audit_event_id().to_owned(),
+                    reason: "prediction link receipt differs from delivery".to_owned(),
+                },
+                Err(reason) => NewsAiGovernedDeliveryOutcome::PostSinkCommitFailed {
+                    delivery_identity_sha256: identity,
+                    delivery_audit_event_id: delivery_audit.audit_event_id().to_owned(),
+                    reason,
+                },
+            }
+        }
+        NewsAiPhysicalPushOutcome::Deduped => {
+            rollback_or_failure(port, delivery, &reservation, identity, "deduped").await
+        }
+        NewsAiPhysicalPushOutcome::Denied(reason) => {
+            let original = format!("denied:{reason}");
+            match port.rollback(delivery, &reservation).await {
+                Ok(()) => NewsAiGovernedDeliveryOutcome::Denied {
+                    delivery_identity_sha256: identity,
+                    reason,
+                },
+                Err(rollback_reason) => NewsAiGovernedDeliveryOutcome::RollbackFailed {
+                    delivery_identity_sha256: identity,
+                    original_outcome: original,
+                    reason: rollback_reason,
+                },
+            }
+        }
+        NewsAiPhysicalPushOutcome::SinkError(reason) => {
+            let original = format!("sink_error:{reason}");
+            match port.rollback(delivery, &reservation).await {
+                Ok(()) => NewsAiGovernedDeliveryOutcome::SinkError {
+                    delivery_identity_sha256: identity,
+                    reason,
+                },
+                Err(rollback_reason) => NewsAiGovernedDeliveryOutcome::RollbackFailed {
+                    delivery_identity_sha256: identity,
+                    original_outcome: original,
+                    reason: rollback_reason,
+                },
+            }
+        }
+        NewsAiPhysicalPushOutcome::PostSinkFailure {
+            delivery_audit_event_id,
+            reason,
+        } => NewsAiGovernedDeliveryOutcome::PostSinkRecovery {
+            delivery_identity_sha256: identity,
+            delivery_audit_event_id,
+            reason,
+        },
+    }
+}
+
+async fn rollback_or_failure<P>(
+    port: &P,
+    delivery: &GovernedNewsAiDelivery,
+    reservation: &NewsAiDeliveryReservation,
+    identity: String,
+    original_outcome: &str,
+) -> NewsAiGovernedDeliveryOutcome
+where
+    P: NewsAiGovernedDeliveryPort + ?Sized,
+{
+    match port.rollback(delivery, reservation).await {
+        Ok(()) => NewsAiGovernedDeliveryOutcome::Deduped {
+            delivery_identity_sha256: identity,
+        },
+        Err(reason) => NewsAiGovernedDeliveryOutcome::RollbackFailed {
+            delivery_identity_sha256: identity,
+            original_outcome: original_outcome.to_owned(),
+            reason,
+        },
+    }
+}
+
+fn validate_sha256(label: &str, value: &str) -> Result<(), NewsAiError> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(NewsAiError::AnalysisAuditFailed(format!(
+            "{label} must be a SHA-256 hex digest"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_nonempty_id(label: &str, value: &str) -> Result<(), NewsAiError> {
+    if value.trim().is_empty() {
+        return Err(NewsAiError::AnalysisAuditFailed(format!(
+            "{label} ID is empty"
+        )));
+    }
+    Ok(())
 }
 
 /// Side-effect-free BR-172 model adapter. Provider selection occurs once
@@ -1418,13 +2159,17 @@ fn hash_request_evidence(
 }
 
 fn assessment_identity(request: &NewsAiRequest) -> String {
+    assessment_identity_for_fact(request.fact(), request.analysis_version())
+}
+
+fn assessment_identity_for_fact(fact: &AdmittedNewsFact, analysis_version: &str) -> String {
     let mut hasher = Sha256::new();
     for value in [
-        provider_tag(request.fact.provider()),
-        request.fact.source_batch_id(),
-        request.fact.item_id(),
-        request.fact.target_code(),
-        request.analysis_version(),
+        provider_tag(fact.provider()),
+        fact.source_batch_id(),
+        fact.item_id(),
+        fact.target_code(),
+        analysis_version,
     ] {
         hash_field(&mut hasher, value);
     }
@@ -2179,6 +2924,271 @@ mod tests {
             assessment.receipt().upstream_response_id(),
             "TEST_CODE_upstream_response"
         );
+    }
+
+    #[derive(Default)]
+    struct RecordingGovernedDeliveryPort {
+        actions: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    #[async_trait]
+    impl NewsAiGovernedDeliveryPort for RecordingGovernedDeliveryPort {
+        async fn reserve(
+            &self,
+            delivery: &GovernedNewsAiDelivery,
+        ) -> Result<NewsAiReserveOutcome, String> {
+            self.actions.lock().unwrap().push("reserve");
+            Ok(NewsAiReserveOutcome::Reserved(
+                NewsAiDeliveryReservation::try_new(
+                    delivery.identity().sha256(),
+                    "TEST_CODE_RESERVATION_001",
+                )
+                .unwrap(),
+            ))
+        }
+
+        async fn push(
+            &self,
+            delivery: &GovernedNewsAiDelivery,
+            _reservation: &NewsAiDeliveryReservation,
+        ) -> NewsAiPhysicalPushOutcome {
+            self.actions.lock().unwrap().push("push");
+            NewsAiPhysicalPushOutcome::Pushed(
+                NewsAiDeliveryAuditReceipt::try_new(delivery.identity().sha256(), &"b".repeat(64))
+                    .unwrap(),
+            )
+        }
+
+        async fn commit(
+            &self,
+            delivery: &GovernedNewsAiDelivery,
+            _reservation: &NewsAiDeliveryReservation,
+            delivery_audit: &NewsAiDeliveryAuditReceipt,
+        ) -> Result<NewsAiPredictionLinkReceipt, String> {
+            self.actions.lock().unwrap().push("commit");
+            NewsAiPredictionLinkReceipt::try_new(
+                delivery.identity().sha256(),
+                delivery.assessment().assessment_id(),
+                delivery_audit.audit_event_id(),
+                &"c".repeat(64),
+            )
+            .map_err(|error| error.to_string())
+        }
+
+        async fn rollback(
+            &self,
+            _delivery: &GovernedNewsAiDelivery,
+            _reservation: &NewsAiDeliveryReservation,
+        ) -> Result<(), String> {
+            self.actions.lock().unwrap().push("rollback");
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn br172_governed_delivery_commits_only_after_audited_push() {
+        let request = request();
+        let response = r#"{
+            "impact":"positive",
+            "confidence":70,
+            "uncertainty":"TEST_CODE 尚需核对",
+            "core_logic":"TEST_CODE 合同可能提升收入"
+        }"#;
+        let receipt = ModelCallReceipt::try_new(
+            "TEST_CODE_model_provider",
+            "TEST_CODE_model",
+            Some("TEST_CODE_request_id"),
+            request.normalized_prompt(),
+            response,
+            instant("2026-07-27T01:00:04Z"),
+            instant("2026-07-27T01:00:05Z"),
+        )
+        .unwrap();
+        let assessment =
+            NewsAiAssessment::from_model_response(&request, response, Some(receipt)).unwrap();
+        let audited = AuditedNewsAiAssessment::try_from_assessment_audit(
+            request,
+            assessment,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        let port = RecordingGovernedDeliveryPort::default();
+
+        let outcome = deliver_governed_news_ai(&audited, &port).await;
+
+        assert_eq!(
+            outcome,
+            NewsAiGovernedDeliveryOutcome::Pushed {
+                delivery_identity_sha256: audited.delivery().identity().sha256().to_owned(),
+                delivery_audit_event_id: "b".repeat(64),
+                prediction_link_id: "c".repeat(64),
+            }
+        );
+        assert_eq!(
+            *port.actions.lock().unwrap(),
+            vec!["reserve", "push", "commit"]
+        );
+    }
+
+    #[derive(Default)]
+    struct LinkRecoveryPort {
+        reserve_calls: std::sync::atomic::AtomicUsize,
+        push_calls: std::sync::atomic::AtomicUsize,
+        commit_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl NewsAiGovernedDeliveryPort for LinkRecoveryPort {
+        async fn reserve(
+            &self,
+            delivery: &GovernedNewsAiDelivery,
+        ) -> Result<NewsAiReserveOutcome, String> {
+            let call = self
+                .reserve_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let reservation = NewsAiDeliveryReservation::try_new(
+                delivery.identity().sha256(),
+                "TEST_CODE_LINK_RECOVERY_RESERVATION",
+            )
+            .unwrap();
+            if call == 0 {
+                Ok(NewsAiReserveOutcome::Reserved(reservation))
+            } else {
+                let audit = NewsAiDeliveryAuditReceipt::try_new(
+                    delivery.identity().sha256(),
+                    "TEST_CODE_PERSISTED_ENVELOPE_ID",
+                )
+                .unwrap();
+                Ok(NewsAiReserveOutcome::LinkPending(
+                    NewsAiDeliveryLinkRecovery::try_new(reservation, audit).unwrap(),
+                ))
+            }
+        }
+
+        async fn push(
+            &self,
+            delivery: &GovernedNewsAiDelivery,
+            _reservation: &NewsAiDeliveryReservation,
+        ) -> NewsAiPhysicalPushOutcome {
+            self.push_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            NewsAiPhysicalPushOutcome::Pushed(
+                NewsAiDeliveryAuditReceipt::try_new(
+                    delivery.identity().sha256(),
+                    "TEST_CODE_PERSISTED_ENVELOPE_ID",
+                )
+                .unwrap(),
+            )
+        }
+
+        async fn commit(
+            &self,
+            delivery: &GovernedNewsAiDelivery,
+            _reservation: &NewsAiDeliveryReservation,
+            delivery_audit: &NewsAiDeliveryAuditReceipt,
+        ) -> Result<NewsAiPredictionLinkReceipt, String> {
+            let call = self
+                .commit_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                return Err("TEST_CODE_LINK_STORE_UNAVAILABLE".to_owned());
+            }
+            NewsAiPredictionLinkReceipt::try_new(
+                delivery.identity().sha256(),
+                delivery.assessment().assessment_id(),
+                delivery_audit.audit_event_id(),
+                &"c".repeat(64),
+            )
+            .map_err(|error| error.to_string())
+        }
+
+        async fn rollback(
+            &self,
+            _delivery: &GovernedNewsAiDelivery,
+            _reservation: &NewsAiDeliveryReservation,
+        ) -> Result<(), String> {
+            Err("TEST_CODE_LINK_RECOVERY_MUST_NOT_ROLLBACK".to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn br172_delivered_retry_links_prediction_without_calling_sink_again() {
+        let request = request();
+        let response = r#"{
+            "impact":"positive",
+            "confidence":70,
+            "uncertainty":"TEST_CODE 尚需核对",
+            "core_logic":"TEST_CODE 合同可能提升收入"
+        }"#;
+        let receipt = ModelCallReceipt::try_new(
+            "TEST_CODE_model_provider",
+            "TEST_CODE_model",
+            Some("TEST_CODE_request_id"),
+            request.normalized_prompt(),
+            response,
+            instant("2026-07-27T01:00:04Z"),
+            instant("2026-07-27T01:00:05Z"),
+        )
+        .unwrap();
+        let assessment =
+            NewsAiAssessment::from_model_response(&request, response, Some(receipt)).unwrap();
+        let audited = AuditedNewsAiAssessment::try_from_assessment_audit(
+            request,
+            assessment,
+            &"a".repeat(64),
+        )
+        .unwrap();
+        let port = LinkRecoveryPort::default();
+
+        assert!(matches!(
+            deliver_governed_news_ai(&audited, &port).await,
+            NewsAiGovernedDeliveryOutcome::PostSinkCommitFailed { .. }
+        ));
+        assert!(matches!(
+            deliver_governed_news_ai(&audited, &port).await,
+            NewsAiGovernedDeliveryOutcome::PredictionLinkRecovered { .. }
+        ));
+        assert_eq!(port.push_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            port.commit_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    #[test]
+    fn br172_delivery_card_contains_only_bound_model_and_audit_evidence() {
+        let request = request();
+        let response = r#"{
+            "impact":"positive",
+            "confidence":70,
+            "uncertainty":"TEST_CODE 尚需核对",
+            "core_logic":"TEST_CODE 合同可能提升收入"
+        }"#;
+        let receipt = ModelCallReceipt::try_new(
+            "TEST_CODE_model_provider",
+            "TEST_CODE_model",
+            Some("TEST_CODE_request_id"),
+            request.normalized_prompt(),
+            response,
+            instant("2026-07-27T01:00:04Z"),
+            instant("2026-07-27T01:00:05Z"),
+        )
+        .unwrap();
+        let assessment =
+            NewsAiAssessment::from_model_response(&request, response, Some(receipt)).unwrap();
+        let audited = AuditedNewsAiAssessment::try_from_assessment_audit(
+            request,
+            assessment,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+
+        let card = audited.delivery().render_card();
+        assert!(card.contains("TEST_CODE 合同可能提升收入"));
+        assert!(card.contains("TEST_CODE_model_provider / TEST_CODE_model"));
+        assert!(card.contains(audited.delivery().identity().sha256()));
+        assert!(card.contains("不构成交易建议"));
+        assert!(!card.contains("建议买入"));
     }
 
     #[test]

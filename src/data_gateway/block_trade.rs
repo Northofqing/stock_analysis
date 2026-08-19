@@ -52,7 +52,7 @@ impl BlockTradesGateway {
         codes: &[String],
         trading_date: NaiveDate,
     ) -> Result<GatewayBatch<BlockTradeReview>, GatewayError> {
-        let request_hash = acquisition_request_hash(CAPABILITY, &codes.join(","));
+        let request_hash = acquisition_request_hash(CAPABILITY, codes.join(","));
         // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
         match super::grpc_source::bridge_for("BlockTrades") {
             Ok(Some(bridge)) => {

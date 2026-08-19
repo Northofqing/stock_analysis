@@ -407,6 +407,7 @@ impl HistoryQuery {
             total_latency_ms += record.latency_ms;
 
             match record.outcome {
+                super::push_record::PushOutcomeLabel::Attempted => {}
                 super::push_record::PushOutcomeLabel::Pushed => pushed += 1,
                 super::push_record::PushOutcomeLabel::Deduped => deduped += 1,
                 super::push_record::PushOutcomeLabel::Denied => denied += 1,

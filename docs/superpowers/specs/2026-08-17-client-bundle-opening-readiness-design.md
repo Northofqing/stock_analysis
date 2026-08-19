@@ -310,6 +310,55 @@ The response handler stops inventing `tdx-dev` and a new batch ID. Empty
 provider/source/batch values are an internal error. This fixes the local
 fallback while preserving the stricter external path.
 
+### 5.6.1 P-01 LocalBridge LimitPools full-record contract
+
+The synchronous BR-213 P-01 consumer remains the owner of the exact-date
+upper-limit-pool interface. When `DATA_GATEWAY_GRPC=1`, it calls LocalBridgeV1
+`LimitPools` through the bridge's runtime-safe blocking seam and audits that
+routed result. A configured bridge error is returned unchanged; it never falls
+back to a library provider, cache, empty batch, `UpperLimitPoolReview`, or A-10
+chain projection.
+
+The LocalBridgeV1 request has exactly three keys and is:
+
+```json
+{"kind":"Upper","trading_date":"YYYY-MM-DD","limit":200}
+```
+
+The date is caller-owned and the whole-pool bound remains 200. A `date` alias,
+missing or extra key, non-`Upper` kind, malformed date, or any other limit is an
+invalid request. The server calls a separate library-only `ReviewDataGateway`
+seam so it cannot re-enter the consumer transport selector. That seam performs
+the existing Eastmoney/Tonghuashun router acquisition and BR-159 audit. The
+server must not derive this operation from `VisibleChainBatch`: its current
+flattened records omit price, change, optional provider fields and record
+evidence and therefore cannot authorize P-01.
+
+Every response record is one canonical JSON object with this closed field set:
+
+```text
+kind, instrument, trading_date, price, change, volume, turnover,
+sealed_amount, first_seal_at, last_seal_at, break_count, streak,
+industry, board_name, seal_state, reseal_count, reason, evidence
+```
+
+`instrument`, `price`, `change`, and `evidence` retain their complete typed
+Magic representation; every listed key is present, optional fields serialize as
+explicit `null`, and values are never synthesized. The envelope carries the
+selected real provider plus its source, source time, observation time and batch
+ID. Each record evidence must bind exactly to that provider, batch ID, source
+time and observation time.
+
+Client admission requires `complete=true`, no more than 200 records, unique
+canonical instrument codes, `kind=Upper`, every record trading date and the
+envelope source date equal to the requested date, and exact record/envelope
+evidence binding. A complete provider-backed zero-record result is
+`VerifiedEmpty`. Missing/truncated/extra record fields, partial quality, count
+overflow, duplicate instruments, wrong kind/date, or evidence conflict is
+typed non-retryable `invalid_evidence`; a malformed request date is typed
+non-retryable `invalid_request`; transport/provider failures retain their
+source classification and retryability.
+
 ### 5.7 Two-phase opening readiness
 
 Readiness is split at the real dependency seam. Static/auth/contract readiness
@@ -359,7 +408,7 @@ static startup check red:
 | `GlobalNews-ThePaper` | LocalBridgeV1 | bounded verified-empty allowed |
 | `Announcements` | LocalBridgeV1 | bounded verified-empty allowed |
 | `BoardConstituents` | LocalBridgeV1 | exact canary membership required |
-| `UpperLimitPoolReview` | LocalBridgeV1 | bounded verified-empty allowed |
+| `LimitPools` | LocalBridgeV1 | bounded verified-empty allowed; full `LimitPoolEntry` contract required |
 
 Each GlobalNews canary sends the exact registered provider plus a positive
 bounded limit. The server must consume both parameters. The returned
@@ -413,6 +462,19 @@ clock before computation and before marking DataMode capability success:
 - require record/envelope provider, source, batch and time fields to agree;
 - repeat the same current-time check after RPC/network and downstream assembly
   delay, including each quote inside `T0Evidence`.
+
+GRPC-20260818-002 corrects the realtime provider failover seam. Every provider
+attempt must return exactly the requested canonical instrument set before it
+can be classified successful. A stale, missing, duplicate, out-of-request,
+out-of-order, or record/envelope evidence-mismatched quote fails the entire
+provider attempt; the remaining subset must not be represented as a complete
+batch. Stale and missing responses are typed retryable so routing continues to
+the next registered provider. Structural, order and evidence conflicts are
+typed non-retryable `invalid_evidence` for that response. If no provider returns
+one complete admitted set, the request fails explicitly with
+`no_verified_batch`. The freshness interval remains exactly `0..=5s`, with
+future evidence and age `>5s` rejected without integer-millisecond truncation,
+cache substitution, subset completion, or partial-as-complete promotion.
 
 The live loop recomputes failure/success and emits state transitions; a prior
 success is never a sticky permit. Route identity mismatch is deterministic and
@@ -489,12 +551,15 @@ artifact as current provider authority.
 | source time missing | keep absent; consumers requiring freshness reject |
 | authenticated identity/news clock leads the consumer | preserve the original timestamp and admit at most 2 seconds of positive clock skew only for the explicitly bounded identity/news contract; reject larger future evidence and retain its 30-second observation / one-trading-day source budgets |
 | quote/order-book/T0 source time leads the consumer | reject any positive future duration; no clock-skew exception and no millisecond truncation |
+| one gRPC quote provider returns stale/missing/duplicate/out-of-order/mismatched records | fail that whole provider attempt; stale/missing remain retryable for failover, structural/evidence conflicts are non-retryable; never promote a subset to complete |
+| every gRPC quote provider lacks one complete exact requested set | explicit `no_verified_batch`; zero realtime computation or Quote/DataMode success mark |
 | live route is stale, absent or fails after static startup | keep `opening_data_ready=false`, retain retry eligibility, and fail only its live-dependent consumers; do not suppress P-01 |
 | off-session source returns same-day last trade | reject from Realtime/DataMode; only a separately requested typed SettledClose may consume it |
 | one GlobalNews response identifies a different provider/source or exceeds limit | invalid evidence, non-retryable for that attempt; exclude it and do not classify it under the requested feed |
 | fewer than two of four GlobalNews providers return verified evidence | static startup blocker with all four typed outcomes retained; never fabricate, relabel or consume a failed provider |
 | one board membership request contains multiple stocks | invalid request; caller performs independent per-stock calls |
 | remote outage after startup | current attempt fails and timer retains retry eligibility under BR-116 |
+| LocalBridge `LimitPools` field/evidence/count/date conflict | non-retryable invalid evidence; do not fall back to library, `UpperLimitPoolReview` or A-10 chain projection |
 | local fallback evidence missing | internal error; do not weaken client validation |
 | real account evidence stale | account-dependent advice remains conservative; do not fabricate from public data |
 
@@ -508,6 +573,8 @@ artifact as current provider authority.
 | `src/data_gateway/grpc_source/convert.rs` | adopt | normalize external records and enforce evidence conflicts |
 | current all-routes `external_opening_readiness` | replace/deepen | split into typed static-startup and live-session reports; remove transferable all-purpose Boolean authority |
 | `src/data_gateway/global_news.rs` and server delegate | adopt/fix | carry exact provider/limit and validate returned provider/source before feed classification |
+| `ReviewDataGateway::current_upper_limit_pool` | adopt/deepen | keep one synchronous P-01 interface; select the LocalBridge transport internally and expose a separate server-only library seam to prevent recursion |
+| current flattened `LimitPools` chain view | reject/replace | omits full provider `LimitPoolEntry` facts and record evidence, so it cannot authorize P-01 |
 | realtime `admit_quote_batch` | adopt/fix | exact-duration consumer gate remains the sole realtime admission path |
 | `off_session_static_quote_eligible` and `off_session_quote_keepalive_loop` | reject/remove | they convert a static price into Realtime/Quote authority and violate §2.4 |
 | `src/grpc_server/delegate.rs` | adopt/fix | local fallback must preserve original gateway evidence |

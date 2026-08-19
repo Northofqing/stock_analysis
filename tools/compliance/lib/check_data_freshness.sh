@@ -47,11 +47,22 @@ holidays = set()
 for raw in Path(calendar_raw).read_text(encoding="utf-8").splitlines():
     line = raw.strip()
     if line.startswith("# year="):
+        if years:
+            print("ERROR:交易日历包含重复 calendar year 声明")
+            raise SystemExit(0)
+        tokens = [token.strip() for token in line.split("=", 1)[1].split(",")]
+        if not tokens or any(not token for token in tokens):
+            print(f"ERROR:非法 calendar year 标记: {line}")
+            raise SystemExit(0)
         try:
-            years.add(int(line.split("=", 1)[1]))
+            parsed_years = [int(token) for token in tokens]
         except ValueError:
             print(f"ERROR:非法 calendar year 标记: {line}")
             raise SystemExit(0)
+        if len(set(parsed_years)) != len(parsed_years):
+            print(f"ERROR:calendar year 标记包含重复年份: {line}")
+            raise SystemExit(0)
+        years.update(parsed_years)
     elif line and not line.startswith("#"):
         try:
             holidays.add(date.fromisoformat(line))

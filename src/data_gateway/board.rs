@@ -62,7 +62,7 @@ pub const BOARD_BINDINGS_PATH: &str = "config/selection/provider_board_bindings.
 pub const BOARD_BINDING_PROPOSAL_PATH: &str =
     "config/selection/provider_board_binding_proposal.v1.json";
 pub const CHAIN_RULES_PATH: &str = "config/chain.toml";
-pub const PINNED_MAGIC_MARKET_REVISION: &str = "5f1ce93656a55854c844065390520cd4aecd9a14";
+pub const PINNED_MAGIC_MARKET_REVISION: &str = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e";
 pub const BOARD_CONSTITUENT_REQUEST_LIMIT: u32 = 10_000;
 
 const DIRECTORY_PROVIDER: &str = "tdx";

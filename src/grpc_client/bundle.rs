@@ -1,4 +1,4 @@
-//! Authenticated external gRPC client-bundle loading (BR-231).
+//! Authenticated external gRPC client-bundle loading (BR-238).
 
 use serde::Deserialize;
 use std::fmt;

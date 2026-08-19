@@ -73,7 +73,7 @@ impl SinaInstrumentNewsGateway {
         let code = code.to_owned();
         let request_hash = acquisition_request_hash(
             CAPABILITY,
-            &format!(
+            format!(
                 "{code}:{}:{}:{REQUEST_LIMIT}",
                 from.to_rfc3339(),
                 to.to_rfc3339()

@@ -61,7 +61,7 @@ impl CompanyDataGateway {
         let storage_codes = codes.to_vec();
         let request_hash = acquisition_request_hash(
             FINANCIAL_CAPABILITY,
-            &format!("{kind:?}:{}", storage_codes.join(",")),
+            format!("{kind:?}:{}", storage_codes.join(",")),
         );
         // P4 M4b: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
         match super::grpc_source::bridge_for("FinancialStatements") {
@@ -165,8 +165,7 @@ impl CompanyDataGateway {
         codes: &[String],
     ) -> Result<GatewayBatch<MarketStatistics>, GatewayError> {
         let storage_codes = codes.to_vec();
-        let request_hash =
-            acquisition_request_hash(STATISTICS_CAPABILITY, &storage_codes.join(","));
+        let request_hash = acquisition_request_hash(STATISTICS_CAPABILITY, storage_codes.join(","));
         // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
         match super::grpc_source::bridge_for("MarketStatistics") {
             Ok(Some(bridge)) => {

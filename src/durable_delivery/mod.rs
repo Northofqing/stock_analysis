@@ -12,10 +12,11 @@ mod schema;
 pub use coordinator::DurableDeliveryCoordinator;
 pub use model::{
     compiled_policy_catalog, AuthoritativeDeliveryRequest, AuthoritativeSink,
-    AuthoritativeSinkPort, AuthoritativeSinkResult, AuthorityWatermark, CooldownScope,
-    CoordinatorConfig, DecisionState, DeliveryEnvelope, DeliverySubKind, DurableDeliveryError,
-    ImmutableAppendPort, ManualDisposition, ManualResolutionCommand, PolicyRow, PrepareOutcome,
-    PushKind, ReconcileSummary, Result, ResumeOutcome, ReviewTaskOccurrenceEvidence,
+    AuthoritativeSinkPort, AuthoritativeSinkResult, AuthorityWatermark,
+    BusinessDateOnceClaimEvidence, CooldownScope, CoordinatorConfig, DecisionState,
+    DeliveryEnvelope, DeliverySubKind, DurableDeliveryError, ImmutableAppendPort,
+    ManualDisposition, ManualResolutionCommand, PolicyRow, PrepareOutcome, PushKind,
+    ReconcileSummary, Result, ResumeOutcome, ReviewTaskOccurrenceEvidence,
     ReviewTerminalReplayAttempt, ReviewTerminalReplayCompletion,
     ReviewTerminalReplayCompletionCanonical, ReviewTerminalReplayCompletionState,
     ReviewTerminalReplayInput, ReviewTerminalReplayStartCanonical, ScheduleHydration,

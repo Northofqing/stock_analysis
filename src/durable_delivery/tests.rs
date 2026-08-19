@@ -277,6 +277,71 @@ impl Fixture {
     }
 }
 
+fn authority_table_rows(connection: &Connection, table: &str) -> Vec<Vec<String>> {
+    assert!(
+        table
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+        "TEST_CODE authority table name must be a plain identifier"
+    );
+    let mut metadata = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .expect("prepare authority table metadata");
+    let columns = metadata
+        .query_map([], |row| row.get::<_, String>(1))
+        .expect("query authority table metadata")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("collect authority table columns");
+    assert!(!columns.is_empty(), "authority table {table} must exist");
+    let quoted_columns = columns
+        .iter()
+        .map(|column| format!("\"{}\"", column.replace('"', "\"\"")))
+        .collect::<Vec<_>>();
+    let column_list = quoted_columns.join(",");
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT {column_list} FROM {table} ORDER BY {column_list}"
+        ))
+        .expect("prepare authority table snapshot");
+    let column_count = statement.column_count();
+    statement
+        .query_map([], |row| {
+            (0..column_count)
+                .map(|index| {
+                    let value = row.get_ref(index)?;
+                    Ok(match value {
+                        rusqlite::types::ValueRef::Null => "null".to_owned(),
+                        rusqlite::types::ValueRef::Integer(value) => {
+                            format!("integer:{value}")
+                        }
+                        rusqlite::types::ValueRef::Real(value) => {
+                            format!("real:{:016x}", value.to_bits())
+                        }
+                        rusqlite::types::ValueRef::Text(value) => {
+                            format!("text:{}", hex::encode(value))
+                        }
+                        rusqlite::types::ValueRef::Blob(value) => {
+                            format!("blob:{}", hex::encode(value))
+                        }
+                    })
+                })
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .expect("query authority table snapshot")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("collect authority table snapshot")
+}
+
+fn authority_snapshot(
+    connection: &Connection,
+    tables: &[&str],
+) -> BTreeMap<String, Vec<Vec<String>>> {
+    tables
+        .iter()
+        .map(|table| ((*table).to_owned(), authority_table_rows(connection, table)))
+        .collect()
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         let can_clean = match self.coordinator.take() {
@@ -3722,6 +3787,15 @@ fn envelope(
         )
         .expect("valid task binding")
     });
+    let source_binding = if push_kind == PushKind::PreopenNewsHot {
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": "P01_SOURCE_BINDING_V1",
+            "render_mode": "Scheduled"
+        }))
+        .expect("serialize TEST_CODE P-01 binding")
+    } else {
+        format!("TEST_CODE_SOURCE_BINDING_{label}").into_bytes()
+    };
     DeliveryEnvelope::new(
         business_date,
         push_kind,
@@ -3729,7 +3803,7 @@ fn envelope(
         scope_key,
         format!("TEST_CODE_OCCURRENCE_{label}"),
         format!("TEST_CODE_EVIDENCE_{label}"),
-        format!("TEST_CODE_SOURCE_BINDING_{label}").into_bytes(),
+        source_binding,
         format!("TEST_CODE_SUBJECT_HASH_{label}"),
         format!("TEST_CODE_RENDERED_BODY_{label}").into_bytes(),
         true,
@@ -4011,6 +4085,7 @@ fn br214_daily_review_kinds_are_business_date_once() {
         PushKind::ReviewLhb,
         PushKind::ReviewSignal,
         PushKind::ReviewFailure,
+        PushKind::TomorrowWatch,
         PushKind::ReviewProviderTopN,
     ] {
         let row = catalog
@@ -4024,11 +4099,400 @@ fn br214_daily_review_kinds_are_business_date_once() {
         );
     }
     assert_eq!(
-        POLICY_VERSION, 3,
-        "BR-237: review-kind daily-budget exemption (counts_against_daily_budget=false) changed \
+        POLICY_VERSION, 5,
+        "BR-245: TomorrowWatch Global BusinessDateOnce budget-exempt policy changed \
          policy semantics, POLICY_VERSION must be bumped because it is decision_identity hash \
-         material (bumped 2 -> 3 on 2026-08-13)"
+         material (bumped 4 -> 5 on 2026-08-18)"
     );
+}
+
+#[test]
+fn br245_prior_late_acceptance_does_not_block_next_business_date() {
+    let fixture = Fixture::new("BR245_NEXT_BUSINESS_DATE");
+    let append = MemoryAppendPort::default();
+    let prior_accepted_at = Utc
+        .with_ymd_and_hms(2026, 8, 17, 15, 20, 35)
+        .single()
+        .expect("valid prior acceptance timestamp")
+        + chrono::Duration::milliseconds(788);
+    let next_admission_at = Utc
+        .with_ymd_and_hms(2026, 8, 18, 13, 0, 45)
+        .single()
+        .expect("valid next business-date timestamp");
+
+    let prior = envelope(
+        "BR245_PRIOR_ACCEPTED",
+        PushKind::TomorrowWatch,
+        DeliverySubKind::None,
+        "2026-08-17",
+        true,
+    );
+    let prior_prepare = fixture
+        .coordinator
+        .prepare(&prior, 1, prior_accepted_at)
+        .expect("prepare prior R-07");
+    assert_eq!(prior_prepare.state, DecisionState::Reserved);
+    fixture
+        .coordinator
+        .reconcile_all_pending(&append, prior_accepted_at)
+        .expect("append prior reservation audits");
+    let prior_sink = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(
+        prior_accepted_at,
+    )));
+    let prior_sinks: Vec<AuthoritativeSink> = vec![prior_sink.clone()];
+    fixture
+        .coordinator
+        .resume_deliverable(&prior.decision_identity, &prior_sinks, prior_accepted_at)
+        .expect("accept prior R-07");
+    fixture
+        .coordinator
+        .reconcile_all_pending(&append, prior_accepted_at)
+        .expect("finalize prior R-07");
+    assert_eq!(
+        fixture
+            .coordinator
+            .decision_state(&prior.decision_identity)
+            .expect("prior state"),
+        DecisionState::Delivered
+    );
+
+    let next = envelope(
+        "BR245_NEXT_ACCEPTED",
+        PushKind::TomorrowWatch,
+        DeliverySubKind::None,
+        "2026-08-18",
+        true,
+    );
+    let next_prepare = fixture
+        .coordinator
+        .prepare(&next, 1, next_admission_at)
+        .expect("prepare next business-date R-07");
+    assert_eq!(
+        next_prepare.state,
+        DecisionState::Reserved,
+        "a prior business-date acceptance must not become a rolling cooldown conflict"
+    );
+    fixture
+        .coordinator
+        .reconcile_all_pending(&append, next_admission_at)
+        .expect("append next reservation audits");
+    let next_sink = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(
+        next_admission_at,
+    )));
+    let next_sinks: Vec<AuthoritativeSink> = vec![next_sink.clone()];
+    fixture
+        .coordinator
+        .resume_deliverable(&next.decision_identity, &next_sinks, next_admission_at)
+        .expect("deliver next business-date R-07");
+    fixture
+        .coordinator
+        .reconcile_all_pending(&append, next_admission_at)
+        .expect("finalize next business-date R-07");
+
+    assert_eq!(prior_sink.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(next_sink.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture
+            .coordinator
+            .decision_state(&next.decision_identity)
+            .expect("next state"),
+        DecisionState::Delivered
+    );
+}
+
+#[test]
+fn br245_same_business_date_reuses_or_rejects_without_new_sink() {
+    let fixture = Fixture::new("BR245_SAME_BUSINESS_DATE");
+    let append = MemoryAppendPort::default();
+    let admission_at = Utc
+        .with_ymd_and_hms(2026, 8, 18, 13, 0, 45)
+        .single()
+        .expect("valid R-07 admission timestamp");
+    let original = envelope(
+        "BR245_ORIGINAL",
+        PushKind::TomorrowWatch,
+        DeliverySubKind::None,
+        "2026-08-18",
+        true,
+    );
+    let prepared = fixture
+        .coordinator
+        .prepare(&original, 1, admission_at)
+        .expect("prepare original R-07");
+    assert_eq!(prepared.state, DecisionState::Reserved);
+    fixture
+        .coordinator
+        .reconcile_all_pending(&append, admission_at)
+        .expect("append original reservation audits");
+    let original_sink = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(admission_at)));
+    let original_sinks: Vec<AuthoritativeSink> = vec![original_sink.clone()];
+    fixture
+        .coordinator
+        .resume_deliverable(&original.decision_identity, &original_sinks, admission_at)
+        .expect("deliver original R-07");
+    fixture
+        .coordinator
+        .reconcile_all_pending(&append, admission_at)
+        .expect("finalize original R-07");
+
+    let forbidden_replay_sink =
+        StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(admission_at)));
+    let forbidden_replay_sinks: Vec<AuthoritativeSink> = vec![forbidden_replay_sink.clone()];
+    let replay = fixture
+        .coordinator
+        .prepare(&original, 1, admission_at + chrono::Duration::seconds(1))
+        .expect("reuse original R-07 decision");
+    assert_eq!(replay.state, DecisionState::Delivered);
+    assert_eq!(replay.sink_calls, 0);
+    let replay_resume = fixture
+        .coordinator
+        .resume_deliverable(
+            &original.decision_identity,
+            &forbidden_replay_sinks,
+            admission_at + chrono::Duration::seconds(1),
+        )
+        .expect("inspect terminal replay");
+    assert_eq!(replay_resume.state, DecisionState::Delivered);
+    assert_eq!(replay_resume.sink_calls, 0);
+
+    let conflicting = envelope(
+        "BR245_CONFLICTING",
+        PushKind::TomorrowWatch,
+        DeliverySubKind::None,
+        "2026-08-18",
+        true,
+    );
+    let conflict = fixture
+        .coordinator
+        .prepare(&conflicting, 1, admission_at + chrono::Duration::seconds(2))
+        .expect("persist same-date R-07 conflict");
+    assert_eq!(conflict.state, DecisionState::RejectedAuditPending);
+    assert_eq!(conflict.sink_calls, 0);
+    fixture
+        .coordinator
+        .reconcile_all_pending(&append, admission_at + chrono::Duration::seconds(2))
+        .expect("finalize same-date R-07 conflict");
+    let forbidden_conflict_sink =
+        StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(admission_at)));
+    let forbidden_conflict_sinks: Vec<AuthoritativeSink> = vec![forbidden_conflict_sink.clone()];
+    let conflict_resume = fixture
+        .coordinator
+        .resume_deliverable(
+            &conflicting.decision_identity,
+            &forbidden_conflict_sinks,
+            admission_at + chrono::Duration::seconds(3),
+        )
+        .expect("inspect rejected same-date conflict");
+    assert_eq!(conflict_resume.state, DecisionState::RejectedDurable);
+    assert_eq!(conflict_resume.sink_calls, 0);
+
+    assert_eq!(original_sink.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(forbidden_replay_sink.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(forbidden_conflict_sink.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM business_date_once_claims"),
+        1
+    );
+}
+
+#[test]
+fn p01_policy_is_global_business_date_once_and_budget_exempt() {
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::PreopenNewsHot)
+        .expect("P-01 durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::Global);
+    assert_eq!(row.window_mode, WindowMode::BusinessDateOnce);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, Some(86_400));
+    assert!(!row.counts_against_daily_budget);
+    assert_eq!(row.push_kind.stable_template_id(), "preopen_news_hot_v1");
+}
+
+#[test]
+fn p01_business_date_once_claim_inspection_is_read_only_without_task_binding() {
+    let fixture = Fixture::new("P01_GENERIC_CLAIM_INSPECT");
+    let append = MemoryAppendPort::default();
+    let candidate = envelope(
+        "P01_GENERIC_CLAIM_INSPECT",
+        PushKind::PreopenNewsHot,
+        DeliverySubKind::None,
+        "2026-08-18",
+        false,
+    );
+    prepare_reserved(&fixture, &candidate, &append);
+    let decision_count = fixture.query_i64("SELECT COUNT(*) FROM delivery_decisions");
+
+    let evidence = fixture
+        .coordinator
+        .inspect_business_date_once_claim(
+            "2026-08-18",
+            PushKind::PreopenNewsHot,
+            DeliverySubKind::None,
+            "GLOBAL",
+            "TEST_CODE_OCCURRENCE_P01_GENERIC_CLAIM_INSPECT",
+        )
+        .expect("inspect generic P-01 claim")
+        .expect("P-01 claim exists");
+
+    assert_eq!(evidence.decision_identity, candidate.decision_identity);
+    assert_eq!(evidence.state, DecisionState::Reserved);
+    assert_eq!(evidence.sink_calls, 0);
+    assert!(evidence.current_attempt_identity.is_none());
+    assert!(evidence.authoritative_receipt_sha256.is_none());
+    assert_eq!(evidence.source_binding_mode.as_deref(), Some("Scheduled"));
+    assert!(evidence.schedule_hydration.is_none());
+
+    let accepted_receipt = receipt(now());
+    let receipt_canonical = serde_json::to_vec(&accepted_receipt).expect("serialize receipt");
+    let mut receipt_preimage = b"stock_analysis.counted_receipt.v1\0".to_vec();
+    receipt_preimage.extend_from_slice(&receipt_canonical);
+    let expected_receipt_sha256 = sha256_hex(&receipt_preimage);
+    let sink = StaticSink::new(AuthoritativeSinkResult::Accepted(accepted_receipt));
+    let sinks: Vec<AuthoritativeSink> = vec![sink.clone()];
+    fixture
+        .coordinator
+        .resume_deliverable(&candidate.decision_identity, &sinks, now())
+        .expect("deliver generic P-01 claim");
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::Delivered,
+        &candidate.decision_identity,
+    );
+    let delivered = fixture
+        .coordinator
+        .inspect_business_date_once_claim(
+            "2026-08-18",
+            PushKind::PreopenNewsHot,
+            DeliverySubKind::None,
+            "GLOBAL",
+            "TEST_CODE_OCCURRENCE_P01_GENERIC_CLAIM_INSPECT",
+        )
+        .expect("inspect Delivered generic P-01 claim")
+        .expect("Delivered P-01 claim exists");
+    assert_eq!(delivered.state, DecisionState::Delivered);
+    assert_eq!(delivered.sink_calls, 0);
+    assert_eq!(delivered.source_binding_mode.as_deref(), Some("Scheduled"));
+    assert!(delivered.current_attempt_identity.is_some());
+    assert_eq!(
+        delivered.authoritative_receipt_sha256.as_deref(),
+        Some(expected_receipt_sha256.as_str())
+    );
+    assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_decisions"),
+        decision_count,
+        "generic claim inspection must not prepare another decision"
+    );
+}
+
+#[test]
+fn p01_business_date_once_resume_uses_stored_envelope_and_never_resends_terminal_claims() {
+    let fixture = Fixture::new("P01_GENERIC_CLAIM_RESUME");
+    let append = MemoryAppendPort::default();
+    let candidate = envelope(
+        "P01_GENERIC_CLAIM_RESUME",
+        PushKind::PreopenNewsHot,
+        DeliverySubKind::None,
+        "2026-08-18",
+        false,
+    );
+    prepare_reserved(&fixture, &candidate, &append);
+    let accepted = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(now())));
+    let accepted_sinks: Vec<AuthoritativeSink> = vec![accepted.clone()];
+
+    let delivered = fixture
+        .coordinator
+        .resume_business_date_once_claim(
+            "2026-08-18",
+            PushKind::PreopenNewsHot,
+            DeliverySubKind::None,
+            "GLOBAL",
+            "TEST_CODE_OCCURRENCE_P01_GENERIC_CLAIM_RESUME",
+            &accepted_sinks,
+            &append,
+            now(),
+        )
+        .expect("resume exact stored P-01 claim")
+        .expect("P-01 claim exists");
+    assert_eq!(delivered.state, DecisionState::Delivered);
+    assert_eq!(delivered.sink_calls, 1);
+    assert!(delivered.current_attempt_identity.is_some());
+    assert!(delivered.authoritative_receipt_sha256.is_some());
+    assert_eq!(accepted.calls.load(Ordering::SeqCst), 1);
+
+    let forbidden_resend = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(now())));
+    let forbidden_sinks: Vec<AuthoritativeSink> = vec![forbidden_resend.clone()];
+    let repeated = fixture
+        .coordinator
+        .resume_business_date_once_claim(
+            "2026-08-18",
+            PushKind::PreopenNewsHot,
+            DeliverySubKind::None,
+            "GLOBAL",
+            "TEST_CODE_OCCURRENCE_P01_GENERIC_CLAIM_RESUME",
+            &forbidden_sinks,
+            &append,
+            now(),
+        )
+        .expect("inspect already Delivered P-01 claim")
+        .expect("Delivered P-01 claim exists");
+    assert_eq!(repeated.state, DecisionState::Delivered);
+    assert_eq!(repeated.sink_calls, 0);
+    assert_eq!(
+        repeated.authoritative_receipt_sha256,
+        delivered.authoritative_receipt_sha256
+    );
+    assert_eq!(forbidden_resend.calls.load(Ordering::SeqCst), 0);
+
+    let uncertain_fixture = Fixture::new("P01_GENERIC_CLAIM_UNCERTAIN");
+    let uncertain_append = MemoryAppendPort::default();
+    let uncertain_candidate = envelope(
+        "P01_GENERIC_CLAIM_UNCERTAIN",
+        PushKind::PreopenNewsHot,
+        DeliverySubKind::None,
+        "2026-08-18",
+        false,
+    );
+    prepare_reserved(&uncertain_fixture, &uncertain_candidate, &uncertain_append);
+    let uncertain = StaticSink::new(AuthoritativeSinkResult::Uncertain(uncertainty(now())));
+    let uncertain_sinks: Vec<AuthoritativeSink> = vec![uncertain];
+    uncertain_fixture
+        .coordinator
+        .resume_deliverable(
+            &uncertain_candidate.decision_identity,
+            &uncertain_sinks,
+            now(),
+        )
+        .expect("persist uncertain P-01 result");
+    let forbidden_uncertain_resend =
+        StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(now())));
+    let forbidden_uncertain_sinks: Vec<AuthoritativeSink> =
+        vec![forbidden_uncertain_resend.clone()];
+    let uncertain_evidence = uncertain_fixture
+        .coordinator
+        .resume_business_date_once_claim(
+            "2026-08-18",
+            PushKind::PreopenNewsHot,
+            DeliverySubKind::None,
+            "GLOBAL",
+            "TEST_CODE_OCCURRENCE_P01_GENERIC_CLAIM_UNCERTAIN",
+            &forbidden_uncertain_sinks,
+            &uncertain_append,
+            now(),
+        )
+        .expect("reconcile uncertain P-01 claim")
+        .expect("uncertain P-01 claim exists");
+    assert_eq!(
+        uncertain_evidence.state,
+        DecisionState::UncertainManualReview
+    );
+    assert_eq!(uncertain_evidence.sink_calls, 0);
+    assert!(uncertain_evidence.current_attempt_identity.is_some());
+    assert!(uncertain_evidence.authoritative_receipt_sha256.is_none());
+    assert_eq!(forbidden_uncertain_resend.calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -4981,21 +5445,233 @@ fn reconcile_terminal(
 }
 
 #[test]
-fn policy_catalog_has_twenty_two_kinds_and_twenty_five_rows() {
+fn policy_catalog_has_twenty_three_kinds_and_twenty_six_rows() {
     // 2026-08-07: I-09 SectorTop / I-09A SectorAnomaly 升级 counted,
     // policy catalog 15 kind/18 row → 17 kind/20 row。
     // 2026-08-12: R-03/R-11/R-12/R-13/A-10 复盘 dispatcher 升级 counted
     // (重启错过补偿重复推送修复) → 17 kind/20 row → 22 kind/25 row。
+    // 2026-08-18: BR-241 P-01 durable owner → 23 kind/26 row。
     let fixture = Fixture::new("CATALOG");
     assert_eq!(
         fixture.query_i64("SELECT COUNT(*) FROM delivery_policy_catalog"),
-        25
+        26
     );
     assert_eq!(
         fixture.query_i64("SELECT COUNT(DISTINCT push_kind) FROM delivery_policy_catalog"),
-        22
+        23
     );
-    assert_eq!(compiled_policy_catalog().len(), 25);
+    assert_eq!(compiled_policy_catalog().len(), 26);
+}
+
+#[test]
+fn p01_schema_v7_to_v9_replays_only_policy_catalog_and_preserves_delivery_authority() {
+    let mut fixture = Fixture::new("P01_SCHEMA_V7_TO_V9_POLICY_ONLY");
+    let append = MemoryAppendPort::default();
+    let candidate = envelope(
+        "P01_SCHEMA_V7_TO_V9_POLICY_ONLY",
+        PushKind::PreopenNewsHot,
+        DeliverySubKind::None,
+        "2026-08-18",
+        false,
+    );
+    prepare_reserved(&fixture, &candidate, &append);
+    let sink = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(now())));
+    let sinks: Vec<AuthoritativeSink> = vec![sink];
+    fixture
+        .coordinator
+        .resume_deliverable(&candidate.decision_identity, &sinks, now())
+        .expect("deliver TEST_CODE P-01 before migration");
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::Delivered,
+        &candidate.decision_identity,
+    );
+    drop(fixture.coordinator.take());
+
+    let mut connection =
+        Connection::open(&fixture.database_path).expect("open TEST_CODE P-01 migration database");
+    let authority_tables = [
+        "delivery_decisions",
+        "delivery_attempts",
+        "business_date_once_claims",
+        "sink_results",
+        "cooldown_heads",
+        "immutable_audit_outbox",
+    ];
+    let count = |connection: &Connection, table: &str| {
+        connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap_or_else(|error| panic!("count {table}: {error}"))
+    };
+    let before = authority_tables
+        .iter()
+        .map(|table| ((*table).to_owned(), count(&connection, table)))
+        .collect::<BTreeMap<_, _>>();
+
+    connection
+        .execute(
+            "DELETE FROM delivery_policy_catalog WHERE push_kind='PreopenNewsHot'",
+            [],
+        )
+        .expect("restore schema-v7 policy set");
+    connection
+        .execute("UPDATE delivery_policy_catalog SET policy_version=3", [])
+        .expect("restore schema-v7 policy version");
+    connection
+        .pragma_update(None, "user_version", 7_i64)
+        .expect("restore schema-v7 marker");
+
+    initialize_test_schema(&mut connection).expect("migrate schema v7 to v9");
+
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .expect("read migrated schema version"),
+        9
+    );
+    assert_eq!(
+        count(
+            &connection,
+            "delivery_policy_catalog WHERE push_kind='PreopenNewsHot'"
+        ),
+        1
+    );
+    let after = authority_tables
+        .iter()
+        .map(|table| ((*table).to_owned(), count(&connection, table)))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        after, before,
+        "policy migration must preserve durable authority"
+    );
+}
+
+#[test]
+fn br245_schema_v9_replays_only_policy_catalog_and_preserves_all_authority_rows() {
+    let mut fixture = Fixture::new("BR245_SCHEMA_V9_POLICY_ONLY");
+    let append = MemoryAppendPort::default();
+    let accepted_at = Utc
+        .with_ymd_and_hms(2026, 8, 17, 15, 20, 35)
+        .single()
+        .expect("valid R-07 accepted timestamp")
+        + chrono::Duration::milliseconds(788);
+    let candidate = envelope(
+        "BR245_SCHEMA_V9_POLICY_ONLY",
+        PushKind::TomorrowWatch,
+        DeliverySubKind::None,
+        "2026-08-17",
+        true,
+    );
+    let prepared = fixture
+        .coordinator
+        .prepare(&candidate, 1, accepted_at)
+        .expect("prepare TEST_CODE R-07 before migration");
+    assert_eq!(prepared.state, DecisionState::Reserved);
+    fixture
+        .coordinator
+        .reconcile_all_pending(&append, accepted_at)
+        .expect("append TEST_CODE R-07 reservation audits");
+    let sink = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(accepted_at)));
+    let sinks: Vec<AuthoritativeSink> = vec![sink];
+    fixture
+        .coordinator
+        .resume_deliverable(&candidate.decision_identity, &sinks, accepted_at)
+        .expect("deliver TEST_CODE R-07 before migration");
+    fixture
+        .coordinator
+        .reconcile_all_pending(&append, accepted_at)
+        .expect("finalize TEST_CODE R-07 before migration");
+    assert_eq!(
+        fixture
+            .coordinator
+            .decision_state(&candidate.decision_identity)
+            .expect("R-07 state before migration"),
+        DecisionState::Delivered
+    );
+    drop(fixture.coordinator.take());
+
+    let mut connection =
+        Connection::open(&fixture.database_path).expect("open TEST_CODE BR-245 migration database");
+    let authority_tables = [
+        "delivery_decisions",
+        "immutable_audit_outbox",
+        "cooldown_reservations",
+        "cooldown_heads",
+        "business_date_once_claims",
+        "daily_budget_reservations",
+        "delivery_attempts",
+        "sink_results",
+        "review_terminal_replay_attempts",
+        "review_terminal_replay_completions",
+        "manual_resolutions",
+        "delivery_disposition_payloads",
+        "task_transition_payloads",
+        "delivery_state_events",
+        "delivery_attempt_events",
+        "cooldown_reservation_events",
+        "daily_budget_reservation_events",
+    ];
+    let before = authority_snapshot(&connection, &authority_tables);
+
+    connection
+        .execute("UPDATE delivery_policy_catalog SET policy_version=4", [])
+        .expect("restore schema-v8 policy version");
+    connection
+        .execute(
+            "UPDATE delivery_policy_catalog
+             SET window_mode='Rolling', counts_against_daily_budget=1
+             WHERE push_kind='TomorrowWatch' AND sub_kind='NONE'",
+            [],
+        )
+        .expect("restore schema-v8 TomorrowWatch policy");
+    connection
+        .pragma_update(None, "user_version", 8_i64)
+        .expect("restore schema-v8 marker");
+
+    initialize_test_schema(&mut connection).expect("migrate schema v8 to v9");
+
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .expect("read migrated schema version"),
+        9
+    );
+    let migrated_policy = connection
+        .query_row(
+            "SELECT cooldown_scope,window_mode,base_cooldown_secs,
+                    counts_against_daily_budget,policy_version
+             FROM delivery_policy_catalog
+             WHERE push_kind='TomorrowWatch' AND sub_kind='NONE'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .expect("read migrated TomorrowWatch policy");
+    assert_eq!(
+        migrated_policy,
+        (
+            "Global".to_owned(),
+            "BusinessDateOnce".to_owned(),
+            86_400,
+            0,
+            5
+        )
+    );
+    assert_eq!(
+        authority_snapshot(&connection, &authority_tables),
+        before,
+        "schema-v9 policy replay must preserve every authority-table value"
+    );
 }
 
 #[test]
@@ -5124,7 +5800,7 @@ fn prepare_binding_cooldown_and_budget_are_one_transaction() {
 
 #[test]
 fn br237_review_kinds_exempt_from_daily_budget_signal_kinds_compete() {
-    // catalog 语义: 10 个复盘类 (BusinessDateOnce 每日必达) 豁免日预算,
+    // catalog 语义: 11 个复盘类 (BusinessDateOnce 每日必达) 豁免日预算,
     // 盘中信号类继续竞争 30 槽 (8/13 复盘被做T T0Advice 烧满预算饿死事故)。
     let catalog = compiled_policy_catalog();
     for kind in [
@@ -5132,6 +5808,7 @@ fn br237_review_kinds_exempt_from_daily_budget_signal_kinds_compete() {
         PushKind::ReviewLhb,
         PushKind::ReviewSignal,
         PushKind::ReviewFailure,
+        PushKind::TomorrowWatch,
         PushKind::ReviewProviderTopN,
         PushKind::IndustryChain,
         PushKind::PositionReview,
@@ -5154,7 +5831,6 @@ fn br237_review_kinds_exempt_from_daily_budget_signal_kinds_compete() {
         PushKind::SectorTop,
         PushKind::SectorAnomaly,
         PushKind::CloseCall,
-        PushKind::TomorrowWatch,
     ] {
         let row = catalog
             .iter()
@@ -5215,10 +5891,10 @@ fn br237_review_kinds_exempt_from_daily_budget_signal_kinds_compete() {
         .reconcile_all_pending(&append, now())
         .expect("reconcile overflow");
 
-    // 复盘类 (豁免) 预算满时仍成功 Reserved → Delivered, 且不占新槽
+    // BR-245 R-07 复盘类 (豁免) 预算满时仍成功 Reserved → Delivered, 且不占新槽
     let review = envelope(
-        "BR237_REVIEW",
-        PushKind::ReviewBacktest,
+        "BR245_R07_BUDGET_EXEMPT",
+        PushKind::TomorrowWatch,
         DeliverySubKind::None,
         "2026-07-30",
         true,

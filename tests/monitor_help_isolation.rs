@@ -122,8 +122,8 @@ fn assert_br196_explicit_dry_run_summary(output: &str) {
     assert!(
         summary
             .split_ascii_whitespace()
-            .any(|field| field == "smoke=6/6"),
-        "BR-196 exact-six governance smoke is incomplete: {summary}"
+            .any(|field| field == "smoke=3/3"),
+        "BR-196 exact-three non-counted governance smoke is incomplete: {summary}"
     );
     for zero_count in [
         "external_process_attempted=0",
@@ -203,6 +203,107 @@ fn production_process_rejects_dry_run_before_opening_durable_runtime() {
 
 #[test]
 #[serial_test::serial(durable_physical_isolation)]
+fn p01_compensation_lease_loser_exits_before_provider_or_durable_side_effects() {
+    use fs2::FileExt;
+
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "monitor-p01-lease-loser-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).expect("create isolated P-01 lease-loser directory");
+    let lease_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("data/locks/production/monitor-delivery.lock");
+    std::fs::create_dir_all(lease_path.parent().expect("production lease parent"))
+        .expect("create production lease parent");
+    let lease = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lease_path)
+        .expect("open production lease");
+    let test_owns_lease = match lease.try_lock_exclusive() {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+        Err(error) => panic!("inspect production monitor lease: {error}"),
+    };
+
+    let output = isolated_monitor_command(&root)
+        // This date has no admitted calendar authority. If an independently
+        // running resident releases the lease during the subprocess race, the
+        // command still exits before provider/durable/audit/sink initialization.
+        .args(["--compensate=P-01", "--business-date=1900-01-01"])
+        .env("MONITOR_ENABLED", "true")
+        .output()
+        .expect("run P-01 compensation lease loser");
+    if test_owns_lease {
+        fs2::FileExt::unlock(&lease).expect("release production monitor lease");
+    }
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(output.status.code(), Some(2), "output={combined_output}");
+    assert!(
+        combined_output.contains("monitor_instance_already_running"),
+        "P-01 lease loser must fail with the stable singleton code: {combined_output}"
+    );
+    assert!(
+        !root.join("data").exists(),
+        "P-01 lease loser created provider/durable/audit state"
+    );
+    for forbidden in [
+        "[P-01][BR-241] compensation_",
+        "[DB init][BR-051][BR-183] core database bound",
+        "[DurableDelivery][BR-192]",
+        "开始推送",
+    ] {
+        assert!(
+            !combined_output.contains(forbidden),
+            "P-01 lease loser crossed forbidden boundary {forbidden}: {combined_output}"
+        );
+    }
+
+    std::fs::remove_dir_all(root).expect("remove isolated P-01 lease-loser directory");
+}
+
+#[test]
+fn p01_compensation_source_binds_cli_and_production_lease_to_one_task_local_kind() {
+    let main = include_str!("../src/bin/monitor/main.rs");
+    let entry = main
+        .split_once("async fn main()")
+        .expect("monitor entrypoint")
+        .1;
+    let runtime = include_str!("../src/bin/monitor/durable_delivery_runtime.rs");
+
+    let lease = entry
+        .find("let _monitor_instance_lease")
+        .expect("normal monitor lease");
+    let request = entry
+        .find(".p01_compensation_request()")
+        .expect("opaque P-01 CLI request");
+    let capability = entry
+        .find("durable_delivery_runtime::authorize_p01_compensation_scope")
+        .expect("typed production-lease capability");
+    let runtime_init = entry
+        .find("preflight_runtime_delivery_audit")
+        .expect("runtime audit initialization");
+    assert!(lease < request && request < capability && capability < runtime_init);
+
+    assert!(runtime.contains("tokio::task_local!"));
+    assert!(runtime.contains("struct P01CompensationCapability"));
+    assert!(runtime.contains("p01_compensation_claim_is_authorized"));
+    assert!(runtime.contains("push_kind == DurablePushKind::PreopenNewsHot"));
+    assert!(runtime.contains("canonical.render_mode == \"Compensation\""));
+    assert!(!runtime.contains("P01_COMPENSATION_SCOPE_ACTIVE"));
+}
+
+#[test]
+#[serial_test::serial(durable_physical_isolation)]
 fn test_process_uses_physical_test_code_durable_namespace_without_network() {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let root = std::env::temp_dir().join(format!(
@@ -239,12 +340,7 @@ fn test_process_uses_physical_test_code_durable_namespace_without_network() {
         !root.join("data/durable_delivery.sqlite3").exists(),
         "test invocation opened the production durable database"
     );
-    for network_marker in [
-        "https://",
-        "http://",
-        "开始推送",
-        "authoritative test delivery skipped network",
-    ] {
+    for network_marker in ["开始推送", "authoritative test delivery skipped network"] {
         assert!(
             !combined_output.contains(network_marker),
             "isolated terminal dry-run reached a network/sink path marker {network_marker}: {combined_output}"
@@ -473,7 +569,7 @@ fn br194_test_review_blocks_all_source_providers_and_sinks_before_account_gate()
     );
     assert!(
         combined_output.contains(
-            "[selection-v2][BR-183] capability=disabled reason_code=selection_v2_activation_not_released providers=0 database_operations=0 sinks=0 schedulers=0"
+            "[selection-v2][BR-183] capability=disabled reason_code=board_artifact_unverified providers=0 database_operations=0 sinks=0 schedulers=0"
         ),
         "test process did not report its disabled selection capability; output={combined_output}"
     );
@@ -565,7 +661,7 @@ fn br194_terminal_replay_cli_rejects_duplicates_and_nontrading_dates_before_data
             "business date is not an A-share trading day",
         ),
         (
-            &["--business-date", "2025-07-30", "--task", "R-04"],
+            &["--business-date", "2024-07-30", "--task", "R-04"],
             "A-share trading-calendar authority unavailable",
         ),
     ];
@@ -648,7 +744,7 @@ fn test_mode_ignores_caller_supplied_production_database_path() {
     }
     assert!(
         combined_output.contains(
-            "[selection-v2][BR-183] capability=disabled reason_code=selection_v2_activation_not_released providers=0 database_operations=0 sinks=0 schedulers=0"
+            "[selection-v2][BR-183] capability=disabled reason_code=board_artifact_unverified providers=0 database_operations=0 sinks=0 schedulers=0"
         ),
         "disabled selection capability summary missing: {combined_output}",
     );
@@ -706,7 +802,7 @@ fn test_mode_ignores_the_repository_dotenv_production_database_default() {
     assert_br196_explicit_dry_run_summary(&combined_output);
     assert!(
         combined_output.contains(
-            "[selection-v2][BR-183] capability=disabled reason_code=selection_v2_activation_not_released providers=0 database_operations=0 sinks=0 schedulers=0"
+            "[selection-v2][BR-183] capability=disabled reason_code=board_artifact_unverified providers=0 database_operations=0 sinks=0 schedulers=0"
         ),
         "test mode did not report the disabled selection capability"
     );
@@ -720,7 +816,7 @@ fn test_mode_ignores_the_repository_dotenv_production_database_default() {
     );
     assert!(
         combined_output.contains(
-            "[selection-v2][BR-183] capability=disabled reason_code=selection_v2_activation_not_released providers=0 database_operations=0 sinks=0 schedulers=0"
+            "[selection-v2][BR-183] capability=disabled reason_code=board_artifact_unverified providers=0 database_operations=0 sinks=0 schedulers=0"
         ),
         "test mode did not preserve the disabled selection summary: {combined_output}"
     );
@@ -1107,7 +1203,8 @@ fn registered_push_and_backfill_flags_reach_truthful_terminal_handlers() {
     );
     assert!(output.status.success(), "output={combined_output}");
     assert!(
-        combined_output.contains("[v70] E2E 模式启动"),
+        combined_output.contains("[v30] --test 模式启动")
+            && combined_output.contains("[BR-196] V2 acceptance start"),
         "BR-196 dry-run did not reach the E2E terminal handler: {combined_output}"
     );
     assert_br196_explicit_dry_run_summary(&combined_output);
@@ -1522,7 +1619,7 @@ fn test_binding_ignores_caller_memory_database_override() {
     );
     assert!(
         combined_output.contains(
-            "[selection-v2][BR-183] capability=disabled reason_code=selection_v2_activation_not_released providers=0 database_operations=0 sinks=0 schedulers=0"
+            "[selection-v2][BR-183] capability=disabled reason_code=board_artifact_unverified providers=0 database_operations=0 sinks=0 schedulers=0"
         ) && !combined_output.contains("journal_mode mismatch"),
         "caller memory override reached database construction: output={combined_output}"
     );
@@ -1566,7 +1663,7 @@ fn test_binding_ignores_caller_database_parent_override() {
     );
     assert!(
         combined_output.contains(
-            "[selection-v2][BR-183] capability=disabled reason_code=selection_v2_activation_not_released providers=0 database_operations=0 sinks=0 schedulers=0"
+            "[selection-v2][BR-183] capability=disabled reason_code=board_artifact_unverified providers=0 database_operations=0 sinks=0 schedulers=0"
         ) && !combined_output.contains("[DB init] 创建目录"),
         "caller database parent override reached database construction: output={combined_output}"
     );

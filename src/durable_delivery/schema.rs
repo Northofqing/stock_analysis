@@ -6,7 +6,7 @@ use rusqlite::{functions::FunctionFlags, params, Connection, OptionalExtension, 
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
-pub(crate) const SCHEMA_VERSION: i64 = 7;
+pub(crate) const SCHEMA_VERSION: i64 = 9;
 
 #[cfg(test)]
 thread_local! {
@@ -105,6 +105,8 @@ pub(crate) fn initialize_schema(transaction: &Transaction<'_>) -> Result<()> {
             migrate_schema_v4_to_v5(transaction)?;
             migrate_schema_v5_to_v6(transaction)?;
             migrate_schema_v6_to_v7(transaction)?;
+            migrate_schema_v7_to_v8(transaction)?;
+            migrate_schema_v8_to_v9(transaction)?;
         }
         2 => {
             migrate_schema_v2_to_v3(transaction)?;
@@ -112,23 +114,40 @@ pub(crate) fn initialize_schema(transaction: &Transaction<'_>) -> Result<()> {
             migrate_schema_v4_to_v5(transaction)?;
             migrate_schema_v5_to_v6(transaction)?;
             migrate_schema_v6_to_v7(transaction)?;
+            migrate_schema_v7_to_v8(transaction)?;
+            migrate_schema_v8_to_v9(transaction)?;
         }
         3 => {
             migrate_schema_v3_to_v4(transaction)?;
             migrate_schema_v4_to_v5(transaction)?;
             migrate_schema_v5_to_v6(transaction)?;
             migrate_schema_v6_to_v7(transaction)?;
+            migrate_schema_v7_to_v8(transaction)?;
+            migrate_schema_v8_to_v9(transaction)?;
         }
         4 => {
             migrate_schema_v4_to_v5(transaction)?;
             migrate_schema_v5_to_v6(transaction)?;
             migrate_schema_v6_to_v7(transaction)?;
+            migrate_schema_v7_to_v8(transaction)?;
+            migrate_schema_v8_to_v9(transaction)?;
         }
         5 => {
             migrate_schema_v5_to_v6(transaction)?;
             migrate_schema_v6_to_v7(transaction)?;
+            migrate_schema_v7_to_v8(transaction)?;
+            migrate_schema_v8_to_v9(transaction)?;
         }
-        6 => migrate_schema_v6_to_v7(transaction)?,
+        6 => {
+            migrate_schema_v6_to_v7(transaction)?;
+            migrate_schema_v7_to_v8(transaction)?;
+            migrate_schema_v8_to_v9(transaction)?;
+        }
+        7 => {
+            migrate_schema_v7_to_v8(transaction)?;
+            migrate_schema_v8_to_v9(transaction)?;
+        }
+        8 => migrate_schema_v8_to_v9(transaction)?,
         _ => {}
     }
     transaction.execute_batch(
@@ -1153,6 +1172,45 @@ fn migrate_schema_v6_to_v7(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+/// BR-241: replay only the compiled delivery policy catalog so the new P-01
+/// Global BusinessDateOnce row and policy version become authoritative.
+///
+/// Delivery decisions, attempts, business-date claims, sink results, cooldown
+/// heads and immutable audits are intentionally outside this migration and
+/// remain untouched (AGENTS §2.7).
+fn migrate_schema_v7_to_v8(transaction: &Transaction<'_>) -> Result<()> {
+    let table_exists: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type='table' AND name='delivery_policy_catalog'",
+        [],
+        |row| row.get(0),
+    )?;
+    if table_exists != 0 {
+        transaction.execute("DELETE FROM delivery_policy_catalog", [])?;
+    }
+    Ok(())
+}
+
+/// BR-245: replay only the compiled policy catalog so TomorrowWatch changes
+/// from a rolling, budget-counted signal row to the Global BusinessDateOnce,
+/// budget-exempt R-07 review policy.
+///
+/// Historical delivery authority is immutable: decisions, attempts,
+/// business-date claims, sink results, cooldown projections and immutable
+/// audit outbox rows are deliberately outside this migration (AGENTS §2.7).
+fn migrate_schema_v8_to_v9(transaction: &Transaction<'_>) -> Result<()> {
+    let table_exists: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type='table' AND name='delivery_policy_catalog'",
+        [],
+        |row| row.get(0),
+    )?;
+    if table_exists != 0 {
+        transaction.execute("DELETE FROM delivery_policy_catalog", [])?;
+    }
+    Ok(())
+}
+
 fn migrate_schema_v5_to_v6(transaction: &Transaction<'_>) -> Result<()> {
     let table_exists: i64 = transaction.query_row(
         "SELECT COUNT(*) FROM sqlite_master
@@ -1366,9 +1424,9 @@ fn seed_and_verify_policy_catalog(transaction: &Transaction<'_>) -> Result<()> {
         let mapped = statement.query_map([], policy_from_row)?;
         mapped.collect::<std::result::Result<Vec<_>, _>>()?
     };
-    if rows.len() != 25 {
+    if rows.len() != 26 {
         return Err(DurableDeliveryError::PolicyMismatch(format!(
-            "seeded policy catalog must have 25 rows, got {}",
+            "seeded policy catalog must have 26 rows, got {}",
             rows.len()
         )));
     }
@@ -1376,9 +1434,9 @@ fn seed_and_verify_policy_catalog(transaction: &Transaction<'_>) -> Result<()> {
         .iter()
         .map(|row| row.push_kind)
         .collect::<BTreeSet<_>>();
-    if distinct.len() != 22 {
+    if distinct.len() != 23 {
         return Err(DurableDeliveryError::PolicyMismatch(format!(
-            "seeded policy catalog must have 22 kinds, got {}",
+            "seeded policy catalog must have 23 kinds, got {}",
             distinct.len()
         )));
     }

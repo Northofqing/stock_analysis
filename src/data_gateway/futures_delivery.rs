@@ -66,7 +66,7 @@ impl FuturesDeliveryGateway {
         year: u32,
         month: u32,
     ) -> Result<GatewayBatch<FuturesDeliveryFact>, GatewayError> {
-        let request_hash = acquisition_request_hash(CAPABILITY, &format!("{year:04}-{month:02}"));
+        let request_hash = acquisition_request_hash(CAPABILITY, format!("{year:04}-{month:02}"));
         // P4 M3 钩子: DATA_GATEWAY_GRPC=1 → gRPC 通道 (fail-closed, audit 对等)。
         match super::grpc_source::bridge_for("FuturesDelivery") {
             Ok(Some(bridge)) => {

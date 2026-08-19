@@ -1871,8 +1871,8 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         // BR-171: exact operator confirmations for >±20% adjacent daily-close
         // moves are immutable, hash-chained and validated at startup.
         daily_change_confirmation::create_schema(&mut *conn)?;
-        // BR-172 rollout step 3: NewsAI assessments are appended before any
-        // delivery reservation and validated as an immutable SHA-256 chain.
+        // BR-172: NewsAI assessments plus exact reservation/sink/delivery/
+        // prediction-link events are independently immutable SHA-256 chains.
         news_ai::create_schema(&mut *conn)?;
 
         // ledger 表（v3 每日净值快照）

@@ -22,6 +22,56 @@ use stock_analysis::magic_compat::{AssetClass, Exchange, InstrumentId};
 
 use crate::notify::{DailyReportSubKind, PushKind, PushOutcome};
 
+tokio::task_local! {
+    static P01_COMPENSATION_BUSINESS_DATE: NaiveDate;
+}
+
+/// Unforgeable, date-bound authority for the one controlled compensation
+/// command. Construction requires both the opaque parsed-CLI proof and the
+/// normal production monitor lease.
+#[derive(Debug)]
+pub(super) struct P01CompensationCapability {
+    business_date: NaiveDate,
+    _private: (),
+}
+
+pub(super) fn authorize_p01_compensation_scope(
+    lease: &super::MonitorInstanceLease,
+    cli: &stock_analysis::selection::VerifiedParsedSelectionCli,
+) -> Result<P01CompensationCapability, &'static str> {
+    if !lease.production {
+        return Err("p01_compensation_requires_production_lease");
+    }
+    let request = cli
+        .p01_compensation_request()
+        .ok_or("p01_compensation_requires_typed_cli_request")?;
+    Ok(P01CompensationCapability {
+        business_date: request.business_date(),
+        _private: (),
+    })
+}
+
+impl P01CompensationCapability {
+    pub(super) fn business_date(&self) -> NaiveDate {
+        self.business_date
+    }
+}
+
+pub(super) async fn with_p01_compensation_scope<T>(
+    capability: &P01CompensationCapability,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    P01_COMPENSATION_BUSINESS_DATE
+        .scope(capability.business_date, future)
+        .await
+}
+
+fn active_p01_compensation_business_date() -> Option<NaiveDate> {
+    P01_COMPENSATION_BUSINESS_DATE
+        .try_with(|business_date| *business_date)
+        .ok()
+}
+
 pub const BR194_REPLAY_AUTHORITY_MANIFEST_V1: &str = concat!(
     "database=data/durable_delivery.sqlite3\n",
     "durable_audit_dir=data/durable_delivery_audit/\n",
@@ -69,6 +119,7 @@ struct RuntimeState {
     coordinator: Arc<DurableDeliveryCoordinator>,
     append: Arc<DurableDeliveryImmutableAppend>,
     sink: AuthoritativeSink,
+    counted_delivery_critical_section: Mutex<()>,
     producer_ready: AtomicBool,
     schedule_hydrations: Mutex<Vec<ScheduleHydration>>,
     queued_schedule_hydration_ids: Mutex<std::collections::BTreeSet<String>>,
@@ -92,6 +143,17 @@ pub struct StartupReconcileEvidence {
 pub struct DurableDispatchEvidence {
     pub decision_identity: String,
     pub state: DecisionState,
+    pub schedule_hydration: Option<ScheduleHydration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusinessDateOnceDispatchEvidence {
+    pub decision_identity: String,
+    pub state: DecisionState,
+    pub sink_calls: usize,
+    pub current_attempt_identity: Option<String>,
+    pub authoritative_receipt_sha256: Option<String>,
+    pub source_binding_mode: Option<String>,
     pub schedule_hydration: Option<ScheduleHydration>,
 }
 
@@ -133,6 +195,100 @@ pub struct CountedDeliveryBinding {
     origin: CountedDeliveryOrigin,
     task_binding: Option<TaskBinding>,
     retry_authorized: bool,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct P01CanonicalSourceBinding {
+    schema_version: String,
+    business_date: String,
+    evidence_date: String,
+    template_id: String,
+    schedule_occurrence_identity: String,
+    render_mode: String,
+    captured_observed_at: String,
+    limit_pools: P01LimitPoolsBinding,
+    chain_daily: P01ChainDailyBinding,
+    ordered_head_codes: Vec<String>,
+    security_identity: P01SecurityIdentityBinding,
+    instrument_news: Vec<P01InstrumentNewsBinding>,
+    excluded_limit_pool_records: Vec<P01ExcludedLimitPoolRecord>,
+    rendered_content_sha256: String,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct P01LimitPoolsBinding {
+    request_kind: String,
+    request_trading_date: String,
+    request_limit: u32,
+    request_hash: String,
+    provider: String,
+    source: String,
+    source_at: String,
+    observed_at: String,
+    batch_id: String,
+    ordered_record_hashes: Vec<String>,
+    record_count: usize,
+    verified_empty: bool,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct P01ChainDailyBinding {
+    source_at: String,
+    limit_pool_batch_id: String,
+    ordered_limit_pool_record_hashes: Vec<String>,
+    ordered_row_hashes: Vec<String>,
+    record_count: usize,
+    persistence_receipt: String,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct P01SecurityIdentityBinding {
+    requested_codes: Vec<String>,
+    resolved_codes: Vec<String>,
+    provider: String,
+    source: String,
+    source_at: Option<String>,
+    observed_at: String,
+    batch_id: String,
+    ordered_record_hashes: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct P01InstrumentNewsBinding {
+    code: String,
+    range_start: String,
+    range_end: String,
+    provider: String,
+    source: String,
+    source_at: Option<String>,
+    observed_at: String,
+    batch_id: String,
+    ordered_record_hashes: Vec<String>,
+    record_count: usize,
+    verified_empty: bool,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct P01ExcludedLimitPoolRecord {
+    record_hash: String,
+    reason_code: String,
+}
+
+fn p01_verified_evidence_date(business_date: NaiveDate) -> Result<String, &'static str> {
+    const CALENDAR_UNAVAILABLE: &str = "counted_p01_calendar_authority_unavailable";
+    match stock_analysis::calendar::verified_a_share_trading_day(business_date) {
+        Ok(true) => {}
+        Ok(false) | Err(_) => return Err(CALENDAR_UNAVAILABLE),
+    }
+    stock_analysis::calendar::verified_prev_a_share_trading_day(business_date)
+        .map(|date| date.format("%Y-%m-%d").to_string())
+        .map_err(|_| CALENDAR_UNAVAILABLE)
 }
 
 impl CountedDeliveryBinding {
@@ -228,6 +384,65 @@ impl CountedDeliveryBinding {
 
     pub fn retry_authorized(&self) -> bool {
         self.retry_authorized
+    }
+
+    /// Fail-closed BR-241 validation of the exact composite P-01 source binding.
+    pub fn validate_p01_text(&self, text: &str) -> Result<(), &'static str> {
+        const INVALID: &str = "counted_p01_binding_invalid";
+        let canonical: P01CanonicalSourceBinding =
+            serde_json::from_slice(&self.source_binding_canonical).map_err(|_| INVALID)?;
+        if serde_json::to_vec(&canonical).map_err(|_| INVALID)? != self.source_binding_canonical
+            || sha256_hex(&self.source_binding_canonical) != self.source_evidence_fingerprint
+            || !matches!(self.scope, CountedDeliveryScope::Global)
+            || !matches!(self.origin, CountedDeliveryOrigin::InternalDurable)
+            || self.task_binding.is_some()
+            || self.retry_authorized
+        {
+            return Err(INVALID);
+        }
+
+        let business_date = self.business_date.format("%Y-%m-%d").to_string();
+        let evidence_date = p01_verified_evidence_date(self.business_date)?;
+        let occurrence_identity = format!("p01:{business_date}");
+        let captured_observed_at =
+            DateTime::parse_from_rfc3339(&canonical.captured_observed_at).map_err(|_| INVALID)?;
+        if canonical.schema_version != "P01_SOURCE_BINDING_V1"
+            || canonical.business_date != business_date
+            || canonical.evidence_date != evidence_date
+            || canonical.template_id != DurablePushKind::PreopenNewsHot.stable_template_id()
+            || canonical.schedule_occurrence_identity != occurrence_identity
+            || self.schedule_occurrence_identity != occurrence_identity
+            || !matches!(canonical.render_mode.as_str(), "Scheduled" | "Compensation")
+            || captured_observed_at.date_naive() != self.business_date
+            || !is_sha256_hex(&canonical.rendered_content_sha256)
+            || sha256_hex(text.as_bytes()) != canonical.rendered_content_sha256
+            || p01_domain_sha256(b"P01_DELIVERY_SUBJECT_V1\0", &self.source_binding_canonical)
+                != self.delivery_subject_hash
+        {
+            return Err(INVALID);
+        }
+
+        if !p01_limit_pools_are_exact(&canonical.limit_pools, &evidence_date)
+            || !p01_chain_is_exact(
+                &canonical.chain_daily,
+                &canonical.limit_pools,
+                &evidence_date,
+            )
+            || !p01_heads_are_exact(
+                &canonical.ordered_head_codes,
+                &canonical.security_identity,
+                &canonical.instrument_news,
+                &evidence_date,
+                &business_date,
+            )
+            || !p01_exclusions_are_exact(
+                &canonical.excluded_limit_pool_records,
+                &canonical.limit_pools.ordered_record_hashes,
+            )
+        {
+            return Err(INVALID);
+        }
+        Ok(())
     }
 
     pub fn validate_r04_source_only(&self) -> Result<(), &'static str> {
@@ -482,6 +697,158 @@ impl CountedDeliveryBinding {
         }
         Ok(())
     }
+}
+
+fn p01_limit_pools_are_exact(binding: &P01LimitPoolsBinding, evidence_date: &str) -> bool {
+    #[derive(serde::Serialize)]
+    struct ExactRequest<'a> {
+        kind: &'static str,
+        trading_date: &'a str,
+        limit: u32,
+    }
+    let Ok(request_bytes) = serde_json::to_vec(&ExactRequest {
+        kind: "Upper",
+        trading_date: evidence_date,
+        limit: 200,
+    }) else {
+        return false;
+    };
+    let mut request_preimage = b"P01_LIMIT_POOLS_REQUEST_V1\0".to_vec();
+    request_preimage.extend_from_slice(&request_bytes);
+    let expected_request_hash = sha256_hex(&request_preimage);
+
+    binding.request_kind == "Upper"
+        && binding.request_trading_date == evidence_date
+        && binding.request_limit == 200
+        && binding.request_hash == expected_request_hash
+        && p01_nonempty_source(
+            &binding.provider,
+            &binding.source,
+            &binding.observed_at,
+            &binding.batch_id,
+        )
+        && binding.source_at == evidence_date
+        && !binding.verified_empty
+        && binding.record_count > 0
+        && binding.record_count == binding.ordered_record_hashes.len()
+        && binding
+            .ordered_record_hashes
+            .iter()
+            .all(|hash| is_sha256_hex(hash))
+}
+
+fn p01_chain_is_exact(
+    chain: &P01ChainDailyBinding,
+    limit_pools: &P01LimitPoolsBinding,
+    evidence_date: &str,
+) -> bool {
+    chain.source_at == evidence_date
+        && chain.limit_pool_batch_id == limit_pools.batch_id
+        && chain.ordered_limit_pool_record_hashes == limit_pools.ordered_record_hashes
+        && chain.record_count > 0
+        && chain.record_count == chain.ordered_row_hashes.len()
+        && chain
+            .ordered_row_hashes
+            .iter()
+            .all(|hash| is_sha256_hex(hash))
+        && is_sha256_hex(&chain.persistence_receipt)
+}
+
+fn p01_heads_are_exact(
+    head_codes: &[String],
+    identities: &P01SecurityIdentityBinding,
+    news: &[P01InstrumentNewsBinding],
+    evidence_date: &str,
+    business_date: &str,
+) -> bool {
+    let unique_heads = head_codes.iter().collect::<std::collections::HashSet<_>>();
+    if head_codes.is_empty()
+        || head_codes.len() > 3
+        || unique_heads.len() != head_codes.len()
+        || head_codes.iter().any(|code| !p01_code_is_valid(code))
+        || identities.requested_codes != head_codes
+        || identities.resolved_codes != head_codes
+        || !p01_nonempty_source(
+            &identities.provider,
+            &identities.source,
+            &identities.observed_at,
+            &identities.batch_id,
+        )
+        || identities
+            .source_at
+            .as_ref()
+            .is_some_and(|source_at| source_at.trim().is_empty())
+        || identities.ordered_record_hashes.len() != head_codes.len()
+        || identities
+            .ordered_record_hashes
+            .iter()
+            .any(|hash| !is_sha256_hex(hash))
+        || news.len() != head_codes.len()
+    {
+        return false;
+    }
+
+    let mut total_news_records = 0usize;
+    for (expected_code, batch) in head_codes.iter().zip(news) {
+        if batch.code != *expected_code
+            || batch.range_start != evidence_date
+            || batch.range_end != business_date
+            || !p01_nonempty_source(
+                &batch.provider,
+                &batch.source,
+                &batch.observed_at,
+                &batch.batch_id,
+            )
+            || batch
+                .source_at
+                .as_ref()
+                .is_some_and(|source_at| source_at.trim().is_empty())
+            || batch.record_count != batch.ordered_record_hashes.len()
+            || batch
+                .ordered_record_hashes
+                .iter()
+                .any(|hash| !is_sha256_hex(hash))
+            || batch.verified_empty != batch.ordered_record_hashes.is_empty()
+        {
+            return false;
+        }
+        total_news_records = total_news_records.saturating_add(batch.record_count);
+    }
+    total_news_records > 0
+}
+
+fn p01_exclusions_are_exact(
+    exclusions: &[P01ExcludedLimitPoolRecord],
+    limit_pool_record_hashes: &[String],
+) -> bool {
+    let mut seen = std::collections::HashSet::with_capacity(exclusions.len());
+    exclusions.iter().all(|row| {
+        is_sha256_hex(&row.record_hash)
+            && row.reason_code == "p01_chain_classification_missing"
+            && limit_pool_record_hashes.contains(&row.record_hash)
+            && seen.insert(row.record_hash.as_str())
+    })
+}
+
+fn p01_nonempty_source(provider: &str, source: &str, observed_at: &str, batch_id: &str) -> bool {
+    [provider, source, observed_at, batch_id]
+        .iter()
+        .all(|value| !value.trim().is_empty())
+}
+
+fn p01_code_is_valid(code: &str) -> bool {
+    #[cfg(test)]
+    if let Some(code) = code.strip_prefix("TEST_CODE_") {
+        return code.len() == 6 && code.bytes().all(|byte| byte.is_ascii_digit());
+    }
+    code.len() == 6 && code.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn p01_domain_sha256(domain: &[u8], bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(bytes);
+    hex::encode(digest.finalize())
 }
 
 fn r04_object_has_exact_keys(
@@ -824,6 +1191,86 @@ pub fn eager_bind_runtime_artifacts() -> Result<(), String> {
     runtime_state().map(|_| ())
 }
 
+#[derive(serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct P01FailureAuditV1<'a> {
+    schema_version: &'static str,
+    rule_ids: [&'static str; 2],
+    template_id: &'static str,
+    execution_mode: &'a str,
+    business_date: Option<String>,
+    evidence_date: Option<String>,
+    observed_at: String,
+    reason_code: &'static str,
+    retryable: bool,
+    stage: &'static str,
+    source_evidence_sha256: Option<&'a str>,
+}
+
+/// Append one pre-delivery P-01 failure to the existing fsync'd immutable
+/// durable audit chain. Provider-specific failures remain additionally owned
+/// by their acquisition audits; absence of a composed source hash stays null.
+pub async fn append_p01_failure_audit(
+    execution_mode: &str,
+    observed_at: DateTime<chrono::Local>,
+    failure: &crate::p01::P01Failure,
+    source_evidence_sha256: Option<&str>,
+) -> Result<String, String> {
+    let canonical =
+        p01_failure_audit_canonical(execution_mode, observed_at, failure, source_evidence_sha256)?;
+    let canonical_sha256 = sha256_hex(&canonical);
+    let identity = format!("p01-failure:{canonical_sha256}");
+    let state = runtime_state()?;
+    let append = Arc::clone(&state.append);
+    tokio::task::spawn_blocking(move || {
+        append_p01_failure_audit_exact(append.as_ref(), &identity, &canonical, &canonical_sha256)
+    })
+    .await
+    .map_err(|error| format!("join BR-241 P-01 failure audit append: {error}"))?
+}
+
+fn append_p01_failure_audit_exact(
+    append: &dyn ImmutableAppendPort,
+    identity: &str,
+    canonical: &[u8],
+    canonical_sha256: &str,
+) -> Result<String, String> {
+    append
+        .append_exact("P01FailureV1", identity, canonical, canonical_sha256)
+        .map_err(|error| format!("append BR-241 P-01 failure audit: {error}"))
+}
+
+fn p01_failure_audit_canonical(
+    execution_mode: &str,
+    observed_at: DateTime<chrono::Local>,
+    failure: &crate::p01::P01Failure,
+    source_evidence_sha256: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    if !matches!(execution_mode, "Scheduled" | "Compensation")
+        || source_evidence_sha256.is_some_and(|hash| !is_sha256_hex(hash))
+    {
+        return Err("BR-241 P-01 failure audit identity invalid".to_owned());
+    }
+    serde_json::to_vec(&P01FailureAuditV1 {
+        schema_version: "stock_analysis.p01_failure.v1",
+        rule_ids: ["BR-241", "2.7"],
+        template_id: "preopen_news_hot_v1",
+        execution_mode,
+        business_date: failure
+            .business_date()
+            .map(|date| date.format("%Y-%m-%d").to_string()),
+        evidence_date: failure
+            .evidence_date()
+            .map(|date| date.format("%Y-%m-%d").to_string()),
+        observed_at: observed_at.to_rfc3339(),
+        reason_code: failure.reason_code(),
+        retryable: failure.retryable(),
+        stage: failure.stage(),
+        source_evidence_sha256,
+    })
+    .map_err(|error| format!("serialize BR-241 P-01 failure audit: {error}"))
+}
+
 pub fn pending_schedule_hydrations() -> Result<Vec<ScheduleHydration>, String> {
     let state = runtime_state()?;
     pending_hydrations(state.as_ref())
@@ -839,14 +1286,58 @@ pub fn acknowledge_local_schedule_hydrations(
     acknowledge_schedule_hydrations_blocking(state.as_ref(), transition_identities, Utc::now())
 }
 
+fn p01_compensation_binding_is_authorized(
+    binding: &CountedDeliveryBinding,
+    kind: PushKind,
+    text: &str,
+) -> bool {
+    let Some(active_business_date) = active_p01_compensation_business_date() else {
+        return false;
+    };
+    if kind != PushKind::PreopenNewsHot
+        || binding.business_date() != active_business_date
+        || binding.validate_p01_text(text).is_err()
+    {
+        return false;
+    }
+    serde_json::from_slice::<P01CanonicalSourceBinding>(binding.source_binding_canonical())
+        .is_ok_and(|canonical| canonical.render_mode == "Compensation")
+}
+
+fn p01_compensation_envelope_is_authorized(envelope: &DeliveryEnvelope) -> bool {
+    let Some(active_business_date) = active_p01_compensation_business_date() else {
+        return false;
+    };
+    envelope.push_kind == DurablePushKind::PreopenNewsHot
+        && envelope.business_date == active_business_date.format("%Y-%m-%d").to_string()
+        && serde_json::from_slice::<P01CanonicalSourceBinding>(&envelope.source_binding_canonical)
+            .is_ok_and(|canonical| canonical.render_mode == "Compensation")
+}
+
+fn p01_compensation_claim_is_authorized(
+    business_date: NaiveDate,
+    push_kind: DurablePushKind,
+    sub_kind: DeliverySubKind,
+    scope_key: &str,
+    occurrence_identity: &str,
+) -> bool {
+    active_p01_compensation_business_date() == Some(business_date)
+        && push_kind == DurablePushKind::PreopenNewsHot
+        && sub_kind == DeliverySubKind::None
+        && scope_key == "GLOBAL"
+        && occurrence_identity == format!("p01:{business_date}")
+}
+
 pub async fn deliver_counted_binding(
     binding: CountedDeliveryBinding,
     kind: PushKind,
     text: String,
     sub_kind: Option<DailyReportSubKind>,
 ) -> PushOutcome {
-    if let Err(error) = ensure_startup_reconciled().await {
-        return PushOutcome::Denied(format!("durable delivery admission frozen: {error}"));
+    if !p01_compensation_binding_is_authorized(&binding, kind, &text) {
+        if let Err(error) = ensure_startup_reconciled().await {
+            return PushOutcome::Denied(format!("durable delivery admission frozen: {error}"));
+        }
     }
     let envelope = match envelope_from_binding(binding, kind, &text, sub_kind) {
         Ok(envelope) => envelope,
@@ -879,11 +1370,164 @@ pub async fn deliver_presented_envelope(
 }
 
 async fn deliver_envelope(envelope: DeliveryEnvelope) -> Result<DurableDispatchEvidence, String> {
-    ensure_startup_reconciled().await?;
+    // BR-241 compensation is intentionally single-kind: its own exact claim
+    // preflight/resume is authoritative and must not first resume unrelated
+    // pending PushKinds through the global startup barrier.
+    if !p01_compensation_envelope_is_authorized(&envelope) {
+        ensure_startup_reconciled().await?;
+    }
     let state = runtime_state()?;
     tokio::task::spawn_blocking(move || deliver_envelope_blocking(state.as_ref(), envelope))
         .await
         .map_err(|error| format!("BR-192 counted delivery join failed: {error}"))?
+}
+
+/// Read the durable owner of an exact BusinessDateOnce occurrence.
+///
+/// BR-241 deliberately does not run startup reconciliation here because that
+/// phase may resume an unrelated sink. Ordinary callers still require the
+/// normal startup barrier; the exclusive P-01 compensation command may inspect
+/// its own exact claim immediately after taking the production process lease.
+pub async fn inspect_business_date_once_claim(
+    business_date: NaiveDate,
+    push_kind: stock_analysis::durable_delivery::PushKind,
+    sub_kind: DeliverySubKind,
+    scope_key: &str,
+    occurrence_identity: &str,
+) -> Result<Option<BusinessDateOnceDispatchEvidence>, String> {
+    let state = runtime_state()?;
+    if !state.producer_ready.load(Ordering::Acquire)
+        && !p01_compensation_claim_is_authorized(
+            business_date,
+            push_kind,
+            sub_kind,
+            scope_key,
+            occurrence_identity,
+        )
+    {
+        return Err(
+            "BR-241 BusinessDateOnce preflight requires completed startup reconciliation"
+                .to_owned(),
+        );
+    }
+    let query_state = Arc::clone(&state);
+    let date = business_date.format("%Y-%m-%d").to_string();
+    let scope_key = scope_key.to_owned();
+    let occurrence_identity = occurrence_identity.to_owned();
+    let evidence = tokio::task::spawn_blocking(move || {
+        query_state
+            .coordinator
+            .inspect_business_date_once_claim(
+                &date,
+                push_kind,
+                sub_kind,
+                &scope_key,
+                &occurrence_identity,
+            )
+            .map_err(|error| format!("inspect BR-241 BusinessDateOnce claim: {error}"))
+    })
+    .await
+    .map_err(|error| format!("BR-241 BusinessDateOnce preflight join failed: {error}"))??;
+
+    let Some(evidence) = evidence else {
+        return Ok(None);
+    };
+    if let Some(hydration) = evidence.schedule_hydration.as_ref() {
+        queue_hydrations(state.as_ref(), std::slice::from_ref(hydration))?;
+    }
+    Ok(Some(BusinessDateOnceDispatchEvidence {
+        decision_identity: evidence.decision_identity,
+        state: evidence.state,
+        sink_calls: evidence.sink_calls,
+        current_attempt_identity: evidence.current_attempt_identity,
+        authoritative_receipt_sha256: evidence.authoritative_receipt_sha256,
+        source_binding_mode: evidence.source_binding_mode,
+        schedule_hydration: evidence.schedule_hydration,
+    }))
+}
+
+/// Reconcile an existing exact BusinessDateOnce owner and resume only a
+/// still-Reserved stored envelope. Provider acquisition is intentionally not
+/// part of this seam.
+pub async fn resume_business_date_once_claim(
+    business_date: NaiveDate,
+    push_kind: DurablePushKind,
+    sub_kind: DeliverySubKind,
+    scope_key: &str,
+    occurrence_identity: &str,
+) -> Result<Option<BusinessDateOnceDispatchEvidence>, String> {
+    let state = runtime_state()?;
+    if !state.producer_ready.load(Ordering::Acquire)
+        && !p01_compensation_claim_is_authorized(
+            business_date,
+            push_kind,
+            sub_kind,
+            scope_key,
+            occurrence_identity,
+        )
+    {
+        return Err(
+            "BR-241 BusinessDateOnce resume requires completed startup reconciliation".to_owned(),
+        );
+    }
+    let resume_state = Arc::clone(&state);
+    let scope_key = scope_key.to_owned();
+    let occurrence_identity = occurrence_identity.to_owned();
+    let evidence = tokio::task::spawn_blocking(move || {
+        resume_business_date_once_claim_blocking(
+            resume_state.as_ref(),
+            business_date,
+            push_kind,
+            sub_kind,
+            &scope_key,
+            &occurrence_identity,
+        )
+    })
+    .await
+    .map_err(|error| format!("BR-241 BusinessDateOnce resume join failed: {error}"))??;
+    if let Some(hydration) = evidence
+        .as_ref()
+        .and_then(|evidence| evidence.schedule_hydration.as_ref())
+    {
+        queue_hydrations(state.as_ref(), std::slice::from_ref(hydration))?;
+    }
+    Ok(evidence)
+}
+
+fn resume_business_date_once_claim_blocking(
+    state: &RuntimeState,
+    business_date: NaiveDate,
+    push_kind: DurablePushKind,
+    sub_kind: DeliverySubKind,
+    scope_key: &str,
+    occurrence_identity: &str,
+) -> Result<Option<BusinessDateOnceDispatchEvidence>, String> {
+    let _critical_section = state
+        .counted_delivery_critical_section
+        .lock()
+        .map_err(|_| "BR-241 counted delivery critical-section mutex poisoned".to_owned())?;
+    let evidence = state
+        .coordinator
+        .resume_business_date_once_claim(
+            &business_date.format("%Y-%m-%d").to_string(),
+            push_kind,
+            sub_kind,
+            scope_key,
+            occurrence_identity,
+            std::slice::from_ref(&state.sink),
+            state.append.as_ref(),
+            Utc::now(),
+        )
+        .map_err(|error| format!("resume BR-241 BusinessDateOnce claim: {error}"))?;
+    Ok(evidence.map(|evidence| BusinessDateOnceDispatchEvidence {
+        decision_identity: evidence.decision_identity,
+        state: evidence.state,
+        sink_calls: evidence.sink_calls,
+        current_attempt_identity: evidence.current_attempt_identity,
+        authoritative_receipt_sha256: evidence.authoritative_receipt_sha256,
+        source_binding_mode: evidence.source_binding_mode,
+        schedule_hydration: evidence.schedule_hydration,
+    }))
 }
 
 /// Read the durable owner of an exact counted review occurrence.
@@ -897,22 +1541,50 @@ pub async fn inspect_review_task_occurrence(
     push_kind: stock_analysis::durable_delivery::PushKind,
     task_identity: String,
 ) -> Result<Option<DurableDispatchEvidence>, String> {
-    if !matches!(
-        push_kind,
-        stock_analysis::durable_delivery::PushKind::ReviewLhb
-            | stock_analysis::durable_delivery::PushKind::EventCalendar
-            | stock_analysis::durable_delivery::PushKind::ReviewProviderTopN
-            // 2026-08-12: R-03/R-11/R-12/R-13/A-10 复盘 dispatcher 升级 counted,
-            // preflight 允许集与 durable_kind_and_sub_kind 的 review 映射同步。
-            | stock_analysis::durable_delivery::PushKind::IndustryChain
-            | stock_analysis::durable_delivery::PushKind::PositionReview
-            | stock_analysis::durable_delivery::PushKind::ReviewBacktest
-            | stock_analysis::durable_delivery::PushKind::WatchlistTracking
-            | stock_analysis::durable_delivery::PushKind::CatalystReview
-    ) {
+    let review_task = match push_kind {
+        DurablePushKind::ReviewLhb => crate::review_batch::ReviewTask::R04,
+        DurablePushKind::EventCalendar => crate::review_batch::ReviewTask::R08,
+        DurablePushKind::ReviewProviderTopN => crate::review_batch::ReviewTask::R09,
+        DurablePushKind::TomorrowWatch => crate::review_batch::ReviewTask::R07,
+        DurablePushKind::IndustryChain => crate::review_batch::ReviewTask::R03,
+        DurablePushKind::PositionReview => crate::review_batch::ReviewTask::R11,
+        DurablePushKind::ReviewBacktest => crate::review_batch::ReviewTask::R12,
+        DurablePushKind::WatchlistTracking => crate::review_batch::ReviewTask::R13,
+        DurablePushKind::CatalystReview => crate::review_batch::ReviewTask::A10,
+        _ => {
+            return Err(format!(
+                "BR-200 unsupported review terminal preflight kind {push_kind}"
+            ))
+        }
+    };
+    let expected_task_identity =
+        crate::review_batch::review_task_identity(business_date, review_task);
+    if task_identity != expected_task_identity {
         return Err(format!(
-            "BR-200 unsupported review terminal preflight kind {push_kind}"
+            "BR-200 review terminal preflight identity mismatch for {}",
+            review_task.label()
         ));
+    }
+    let policy = stock_analysis::durable_delivery::compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == push_kind && row.sub_kind == DeliverySubKind::None)
+        .ok_or_else(|| format!("BR-200 missing compiled review policy for {push_kind}"))?;
+    if policy.window_mode == stock_analysis::durable_delivery::WindowMode::BusinessDateOnce {
+        return inspect_business_date_once_claim(
+            business_date,
+            push_kind,
+            DeliverySubKind::None,
+            "GLOBAL",
+            &task_identity,
+        )
+        .await
+        .map(|evidence| {
+            evidence.map(|evidence| DurableDispatchEvidence {
+                decision_identity: evidence.decision_identity,
+                state: evidence.state,
+                schedule_hydration: evidence.schedule_hydration,
+            })
+        });
     }
     let state = runtime_state()?;
     if !state.producer_ready.load(Ordering::Acquire) {
@@ -947,6 +1619,116 @@ pub async fn inspect_review_task_occurrence(
         decision_identity: evidence.decision_identity,
         state: evidence.state,
         schedule_hydration: evidence.schedule_hydration,
+    }))
+}
+
+/// BR-239 resumes an already-owned review occurrence exclusively from its
+/// stored immutable envelope. It never prepares a replacement envelope, so a
+/// producer can call it before any source/provider acquisition.
+pub async fn resume_review_task_occurrence(
+    business_date: NaiveDate,
+    push_kind: stock_analysis::durable_delivery::PushKind,
+    task_identity: String,
+) -> Result<Option<DurableDispatchEvidence>, String> {
+    let state = runtime_state()?;
+    if !state.producer_ready.load(Ordering::Acquire) {
+        return Err(
+            "BR-239 review occurrence resume requires completed startup reconciliation".to_owned(),
+        );
+    }
+    let resume_state = Arc::clone(&state);
+    let evidence = tokio::task::spawn_blocking(move || {
+        resume_review_task_occurrence_blocking(
+            resume_state.as_ref(),
+            business_date,
+            push_kind,
+            task_identity,
+        )
+    })
+    .await
+    .map_err(|error| format!("BR-239 review occurrence resume join failed: {error}"))??;
+    if let Some(hydration) = evidence
+        .as_ref()
+        .and_then(|evidence| evidence.schedule_hydration.as_ref())
+    {
+        queue_hydrations(state.as_ref(), std::slice::from_ref(hydration))?;
+    }
+    Ok(evidence)
+}
+
+fn resume_review_task_occurrence_blocking(
+    state: &RuntimeState,
+    business_date: NaiveDate,
+    push_kind: DurablePushKind,
+    task_identity: String,
+) -> Result<Option<DurableDispatchEvidence>, String> {
+    let _critical_section = state
+        .counted_delivery_critical_section
+        .lock()
+        .map_err(|_| "BR-239 counted delivery critical-section mutex poisoned".to_owned())?;
+    let date = business_date.format("%Y-%m-%d").to_string();
+    let inspect = || {
+        state
+            .coordinator
+            .inspect_review_task_occurrence(
+                &date,
+                push_kind,
+                DeliverySubKind::None,
+                "GLOBAL",
+                &task_identity,
+            )
+            .map_err(|error| format!("inspect BR-239 review occurrence: {error}"))
+    };
+    let Some(existing) = inspect()? else {
+        return Ok(None);
+    };
+
+    let mut reconciled_hydrations = reconcile_current_decision(state, &existing.decision_identity)?;
+    if state
+        .coordinator
+        .decision_state(&existing.decision_identity)
+        .map_err(|error| {
+            format!(
+                "read BR-239 review occurrence {}: {error}",
+                existing.decision_identity
+            )
+        })?
+        == DecisionState::Reserved
+    {
+        state
+            .coordinator
+            .resume_deliverable(
+                &existing.decision_identity,
+                std::slice::from_ref(&state.sink),
+                Utc::now(),
+            )
+            .map_err(|error| {
+                format!(
+                    "resume stored BR-239 review occurrence {}: {error}",
+                    existing.decision_identity
+                )
+            })?;
+        reconciled_hydrations.extend(reconcile_current_decision(
+            state,
+            &existing.decision_identity,
+        )?);
+    }
+
+    let Some(mut final_evidence) = inspect()? else {
+        return Err(format!(
+            "BR-239 review occurrence {} disappeared during reconciliation",
+            existing.decision_identity
+        ));
+    };
+    if final_evidence.schedule_hydration.is_none() {
+        final_evidence.schedule_hydration = unique_hydrations(reconciled_hydrations)
+            .into_iter()
+            .find(|hydration| hydration.decision_identity == existing.decision_identity);
+    }
+    Ok(Some(DurableDispatchEvidence {
+        decision_identity: final_evidence.decision_identity,
+        state: final_evidence.state,
+        schedule_hydration: final_evidence.schedule_hydration,
     }))
 }
 
@@ -1224,6 +2006,7 @@ fn build_runtime_state(namespace: &RuntimeNamespace) -> Result<Arc<RuntimeState>
         coordinator: Arc::new(coordinator),
         append: Arc::new(append),
         sink: Arc::new(sink),
+        counted_delivery_critical_section: Mutex::new(()),
         producer_ready: AtomicBool::new(false),
         schedule_hydrations: Mutex::new(Vec::new()),
         queued_schedule_hydration_ids: Mutex::new(std::collections::BTreeSet::new()),
@@ -1310,6 +2093,13 @@ fn deliver_envelope_blocking(
     state: &RuntimeState,
     envelope: DeliveryEnvelope,
 ) -> Result<DurableDispatchEvidence, String> {
+    // BR-239: coordinator reconciliation consumes one process-global immutable
+    // audit outbox. Keep the complete durable transition atomic within this
+    // monitor while leaving provider/source acquisition outside this function.
+    let _critical_section = state
+        .counted_delivery_critical_section
+        .lock()
+        .map_err(|_| "BR-239 counted delivery critical-section mutex poisoned".to_owned())?;
     let decision_identity = envelope.decision_identity.clone();
     state
         .coordinator
@@ -1385,6 +2175,7 @@ fn envelope_from_binding(
         PushKind::EventCalendar => binding
             .validate_r08_public_source_only_text(text)
             .map_err(str::to_owned)?,
+        PushKind::PreopenNewsHot => binding.validate_p01_text(text).map_err(str::to_owned)?,
         _ => {}
     }
     let (push_kind, sub_kind) =
@@ -1457,6 +2248,7 @@ fn durable_kind_and_sub_kind_with_override(
         K::HoldingEvent => (D::HoldingEvent, DeliverySubKind::None),
         K::T0Advice => (D::T0Advice, DeliverySubKind::None),
         K::CandidateTriggered => (D::CandidateTriggered, DeliverySubKind::None),
+        K::PreopenNewsHot => (D::PreopenNewsHot, DeliverySubKind::None),
         K::CloseCall => (D::CloseCall, DeliverySubKind::None),
         K::ForbiddenOps => (D::ForbiddenOps, DeliverySubKind::None),
         K::PaperTrade => (D::PaperTrade, DeliverySubKind::None),
@@ -1737,6 +2529,70 @@ mod tests {
 
     struct AcceptingHydrationTestSink;
 
+    struct FirstCallBlockingSink {
+        calls: std::sync::atomic::AtomicUsize,
+        first_entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        second_entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        release_first: (Mutex<bool>, std::sync::Condvar),
+    }
+
+    impl FirstCallBlockingSink {
+        fn new() -> (
+            Arc<Self>,
+            std::sync::mpsc::Receiver<()>,
+            std::sync::mpsc::Receiver<()>,
+        ) {
+            let (first_sender, first_receiver) = std::sync::mpsc::channel();
+            let (second_sender, second_receiver) = std::sync::mpsc::channel();
+            (
+                Arc::new(Self {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                    first_entered: Mutex::new(Some(first_sender)),
+                    second_entered: Mutex::new(Some(second_sender)),
+                    release_first: (Mutex::new(false), std::sync::Condvar::new()),
+                }),
+                first_receiver,
+                second_receiver,
+            )
+        }
+
+        fn release_first(&self) {
+            let (released, signal) = &self.release_first;
+            *released.lock().expect("release mutex") = true;
+            signal.notify_all();
+        }
+    }
+
+    impl AuthoritativeSinkPort for FirstCallBlockingSink {
+        fn sink_identity(&self) -> &str {
+            "TEST_CODE_BR239_SERIAL_SINK"
+        }
+
+        fn deliver(&self, _request: &AuthoritativeDeliveryRequest) -> AuthoritativeSinkResult {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                if let Some(sender) = self.first_entered.lock().expect("first sender").take() {
+                    sender.send(()).expect("signal first sink entry");
+                }
+                let (released, signal) = &self.release_first;
+                let mut released = released.lock().expect("release mutex");
+                while !*released {
+                    released = signal.wait(released).expect("release wait");
+                }
+            } else if let Some(sender) = self.second_entered.lock().expect("second sender").take() {
+                sender.send(()).expect("signal second sink entry");
+            }
+            AuthoritativeSinkResult::Accepted(stock_analysis::durable_delivery::TypedReceipt {
+                channel: "TEST_CODE_CHANNEL".to_owned(),
+                provider: "TEST_CODE_PROVIDER".to_owned(),
+                message_id: format!("TEST_CODE_MESSAGE_{call}"),
+                platform_message_id: Some(format!("TEST_CODE_PLATFORM_MESSAGE_{call}")),
+                accepted_at: Utc::now(),
+                latency_ms: Some(1),
+            })
+        }
+    }
+
     struct RejectingReplayAppend;
 
     impl ImmutableAppendPort for RejectingReplayAppend {
@@ -1877,11 +2733,163 @@ mod tests {
             coordinator: Arc::new(coordinator),
             append: Arc::new(append),
             sink: Arc::new(AcceptingHydrationTestSink),
+            counted_delivery_critical_section: Mutex::new(()),
             producer_ready: AtomicBool::new(false),
             schedule_hydrations: Mutex::new(Vec::new()),
             queued_schedule_hydration_ids: Mutex::new(std::collections::BTreeSet::new()),
         });
         (namespace_dir, state)
+    }
+
+    #[test]
+    fn br239_counted_deliveries_do_not_overlap_the_durable_critical_section() {
+        let test_code = format!(
+            "TEST_CODE_BR239_SERIAL_{}_{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        );
+        let namespace_dir = TestNamespaceDir::new(&test_code);
+        let coordinator = DurableDeliveryCoordinator::open(CoordinatorConfig::test(
+            namespace_dir.path().join("durable_delivery.sqlite3"),
+            &test_code,
+            format!("owner-{test_code}-0123456789abcdef"),
+        ))
+        .expect("open BR-239 coordinator");
+        let append = DurableDeliveryImmutableAppend::for_test_code(&test_code)
+            .expect("bind BR-239 immutable append");
+        let (sink, first_entered, second_entered) = FirstCallBlockingSink::new();
+        let state = Arc::new(RuntimeState {
+            namespace: RuntimeNamespace::Test {
+                test_code: test_code.clone(),
+            },
+            coordinator: Arc::new(coordinator),
+            append: Arc::new(append),
+            sink: sink.clone(),
+            counted_delivery_critical_section: Mutex::new(()),
+            producer_ready: AtomicBool::new(true),
+            schedule_hydrations: Mutex::new(Vec::new()),
+            queued_schedule_hydration_ids: Mutex::new(std::collections::BTreeSet::new()),
+        });
+        let first_state = Arc::clone(&state);
+        let first = std::thread::spawn(move || {
+            deliver_envelope_blocking(
+                first_state.as_ref(),
+                hydration_envelope("BR239_FIRST", "2026-08-16"),
+            )
+        });
+        first_entered
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("first delivery reaches the authoritative sink");
+
+        let second_state = Arc::clone(&state);
+        let second = std::thread::spawn(move || {
+            deliver_envelope_blocking(
+                second_state.as_ref(),
+                hydration_envelope("BR239_SECOND", "2026-08-17"),
+            )
+        });
+        let overlapped = second_entered
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .is_ok();
+        sink.release_first();
+
+        let first = first.join().expect("join first delivery");
+        let second = second.join().expect("join second delivery");
+        assert!(
+            !overlapped,
+            "second sink entered before the first durable delivery completed"
+        );
+        assert_eq!(
+            first.expect("first delivery succeeds").state,
+            DecisionState::Delivered
+        );
+        assert_eq!(
+            second.expect("second delivery succeeds").state,
+            DecisionState::Delivered
+        );
+    }
+
+    #[test]
+    fn br239_existing_reserved_review_occurrence_resumes_from_stored_envelope() {
+        let test_code = format!(
+            "TEST_CODE_BR239_RESUME_{}_{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        );
+        let namespace_dir = TestNamespaceDir::new(&test_code);
+        let coordinator = DurableDeliveryCoordinator::open(CoordinatorConfig::test(
+            namespace_dir.path().join("durable_delivery.sqlite3"),
+            &test_code,
+            format!("owner-{test_code}-0123456789abcdef"),
+        ))
+        .expect("open BR-239 resume coordinator");
+        let append = DurableDeliveryImmutableAppend::for_test_code(&test_code)
+            .expect("bind BR-239 resume immutable append");
+        let state = RuntimeState {
+            namespace: RuntimeNamespace::Test {
+                test_code: test_code.clone(),
+            },
+            coordinator: Arc::new(coordinator),
+            append: Arc::new(append),
+            sink: Arc::new(AcceptingHydrationTestSink),
+            counted_delivery_critical_section: Mutex::new(()),
+            producer_ready: AtomicBool::new(true),
+            schedule_hydrations: Mutex::new(Vec::new()),
+            queued_schedule_hydration_ids: Mutex::new(std::collections::BTreeSet::new()),
+        };
+        let business_date = NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
+        let task_identity = crate::review_batch::review_task_identity(
+            business_date,
+            crate::review_batch::ReviewTask::R07,
+        );
+        let envelope = DeliveryEnvelope::new(
+            "2026-08-17",
+            DurablePushKind::TomorrowWatch,
+            DeliverySubKind::None,
+            "GLOBAL",
+            "TEST_CODE_BR239_R07_OCCURRENCE",
+            "TEST_CODE_BR239_R07_EVIDENCE",
+            b"TEST_CODE_BR239_R07_SOURCE".to_vec(),
+            subject_hash(),
+            b"TEST_CODE_BR239_R07_RENDERED".to_vec(),
+            true,
+            Some(
+                TaskBinding::new(
+                    task_identity.clone(),
+                    serde_json::to_vec(&serde_json::json!({
+                        "task_identity": task_identity,
+                        "business_date": "2026-08-17",
+                        "task": "R-07",
+                        "snapshot_size": 1,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        state
+            .coordinator
+            .prepare(&envelope, 1, Utc::now())
+            .expect("reserve exact R-07 occurrence");
+        reconcile_current_decision(&state, &envelope.decision_identity)
+            .expect("persist reservation audit");
+
+        let evidence = resume_review_task_occurrence_blocking(
+            &state,
+            business_date,
+            DurablePushKind::TomorrowWatch,
+            crate::review_batch::review_task_identity(
+                business_date,
+                crate::review_batch::ReviewTask::R07,
+            ),
+        )
+        .expect("resume stored R-07 occurrence")
+        .expect("reserved occurrence exists");
+
+        assert_eq!(evidence.decision_identity, envelope.decision_identity);
+        assert_eq!(evidence.state, DecisionState::Delivered);
+        assert!(evidence.schedule_hydration.is_some());
     }
 
     fn replay_input(
@@ -2042,6 +3050,87 @@ mod tests {
         r04_binding_from_canonical(business_date, canonical)
     }
 
+    fn exact_p01_binding(text: &str) -> CountedDeliveryBinding {
+        let input = crate::p01::P01InputBinding::complete_test_input();
+        let mode = crate::p01::P01RenderMode::Scheduled;
+        let canonical = input
+            .canonical_source_bytes(mode, text)
+            .expect("valid TEST_CODE P-01 canonical binding");
+        p01_binding_from_bytes(input.context.business_date, canonical)
+    }
+
+    fn p01_binding_from_bytes(
+        business_date: NaiveDate,
+        canonical: Vec<u8>,
+    ) -> CountedDeliveryBinding {
+        CountedDeliveryBinding::new(
+            business_date,
+            format!("p01:{business_date}"),
+            canonical.clone(),
+            CountedDeliveryScope::Global,
+            p01_domain_sha256(b"P01_DELIVERY_SUBJECT_V1\0", &canonical),
+            CountedDeliveryOrigin::InternalDurable,
+            None,
+            false,
+        )
+        .expect("valid TEST_CODE counted P-01 binding")
+    }
+
+    fn exact_p01_binding_for_business_date(
+        text: &str,
+        business_date: NaiveDate,
+        evidence_date: NaiveDate,
+    ) -> CountedDeliveryBinding {
+        #[derive(serde::Serialize)]
+        struct ExactRequest<'a> {
+            kind: &'static str,
+            trading_date: &'a str,
+            limit: u32,
+        }
+
+        let exact = exact_p01_binding(text);
+        let mut canonical: P01CanonicalSourceBinding =
+            serde_json::from_slice(exact.source_binding_canonical())
+                .expect("parse exact TEST_CODE P-01 binding");
+        let business_date_text = business_date.format("%Y-%m-%d").to_string();
+        let evidence_date_text = evidence_date.format("%Y-%m-%d").to_string();
+        canonical.business_date.clone_from(&business_date_text);
+        canonical.evidence_date.clone_from(&evidence_date_text);
+        canonical.schedule_occurrence_identity = format!("p01:{business_date_text}");
+        canonical.captured_observed_at = format!("{business_date_text}T15:30:00+08:00");
+        canonical
+            .limit_pools
+            .request_trading_date
+            .clone_from(&evidence_date_text);
+        canonical
+            .limit_pools
+            .source_at
+            .clone_from(&evidence_date_text);
+        let request = serde_json::to_vec(&ExactRequest {
+            kind: "Upper",
+            trading_date: &evidence_date_text,
+            limit: 200,
+        })
+        .expect("serialize exact TEST_CODE P-01 request");
+        canonical.limit_pools.request_hash =
+            p01_domain_sha256(b"P01_LIMIT_POOLS_REQUEST_V1\0", &request);
+        canonical
+            .chain_daily
+            .source_at
+            .clone_from(&evidence_date_text);
+        canonical.security_identity.source_at = Some(format!("{business_date_text}T01:00:00Z"));
+        for batch in &mut canonical.instrument_news {
+            batch.range_start.clone_from(&evidence_date_text);
+            batch.range_end.clone_from(&business_date_text);
+            batch.source_at = Some(format!("{business_date_text}T01:00:00Z"));
+        }
+
+        p01_binding_from_bytes(
+            business_date,
+            serde_json::to_vec(&canonical).expect("serialize exact TEST_CODE P-01 binding"),
+        )
+    }
+
     #[test]
     fn br192_review_batch_dispatchers_are_counted_kinds() {
         // 2026-08-12: R-03/R-11/R-12/R-13/A-10 复盘 dispatcher 升级 counted —
@@ -2064,6 +3153,265 @@ mod tests {
                 "{monitor_kind:?} must be counted"
             );
         }
+    }
+
+    #[test]
+    fn p01_notification_kind_maps_to_durable_preopen_news_hot() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::PreopenNewsHot),
+            Some((DurablePushKind::PreopenNewsHot, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::PreopenNewsHot));
+    }
+
+    #[tokio::test]
+    async fn p01_compensation_scope_authorizes_only_its_exact_claim_and_kind() {
+        let business_date = NaiveDate::from_ymd_opt(2026, 8, 18).expect("valid TEST_CODE date");
+        P01_COMPENSATION_BUSINESS_DATE
+            .scope(business_date, async move {
+                assert!(p01_compensation_claim_is_authorized(
+                    business_date,
+                    DurablePushKind::PreopenNewsHot,
+                    DeliverySubKind::None,
+                    "GLOBAL",
+                    "p01:2026-08-18",
+                ));
+                assert!(!p01_compensation_claim_is_authorized(
+                    business_date,
+                    DurablePushKind::IndustryChain,
+                    DeliverySubKind::None,
+                    "GLOBAL",
+                    "p01:2026-08-18",
+                ));
+                assert!(!p01_compensation_claim_is_authorized(
+                    NaiveDate::from_ymd_opt(2026, 8, 19).unwrap(),
+                    DurablePushKind::PreopenNewsHot,
+                    DeliverySubKind::None,
+                    "GLOBAL",
+                    "p01:2026-08-19",
+                ));
+                assert!(!p01_compensation_claim_is_authorized(
+                    business_date,
+                    DurablePushKind::PreopenNewsHot,
+                    DeliverySubKind::None,
+                    "TEST_CODE_NOT_GLOBAL",
+                    "p01:2026-08-18",
+                ));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn p01_compensation_scope_never_authorizes_a_scheduled_binding() {
+        let text = "TEST_CODE_P01_EXACT_RENDERED_TEXT";
+        let scheduled = exact_p01_binding(text);
+        let input = crate::p01::P01InputBinding::complete_test_input();
+        let compensation_bytes = input
+            .canonical_source_bytes(crate::p01::P01RenderMode::Compensation, text)
+            .expect("valid TEST_CODE compensation binding");
+        let compensation = p01_binding_from_bytes(input.context.business_date, compensation_bytes);
+
+        P01_COMPENSATION_BUSINESS_DATE
+            .scope(input.context.business_date, async move {
+                assert!(!p01_compensation_binding_is_authorized(
+                    &scheduled,
+                    PushKind::PreopenNewsHot,
+                    text,
+                ));
+                assert!(p01_compensation_binding_is_authorized(
+                    &compensation,
+                    PushKind::PreopenNewsHot,
+                    text,
+                ));
+                assert!(!p01_compensation_binding_is_authorized(
+                    &compensation,
+                    PushKind::IndustryChain,
+                    text,
+                ));
+            })
+            .await;
+    }
+
+    #[test]
+    fn p01_failure_audit_canonical_binds_time_reason_and_optional_source_hash() {
+        let context = crate::p01::P01BusinessContext::new(
+            NaiveDate::from_ymd_opt(2026, 8, 18).expect("valid TEST_CODE date"),
+        )
+        .expect("valid TEST_CODE P-01 context");
+        let failure = crate::p01::P01Failure::for_context(
+            "TEST_CODE_P01_PROVIDER_FAILURE",
+            true,
+            "TEST_CODE_PROVIDER_STAGE",
+            context,
+        );
+        let observed_at = DateTime::parse_from_rfc3339("2026-08-18T15:30:00+08:00")
+            .expect("valid TEST_CODE observed_at")
+            .with_timezone(&chrono::Local);
+        let source_hash = "a".repeat(64);
+        let canonical =
+            p01_failure_audit_canonical("Compensation", observed_at, &failure, Some(&source_hash))
+                .expect("canonical TEST_CODE P-01 failure audit");
+        let value: serde_json::Value =
+            serde_json::from_slice(&canonical).expect("parse TEST_CODE P-01 failure audit");
+
+        assert_eq!(value["schema_version"], "stock_analysis.p01_failure.v1");
+        assert_eq!(value["execution_mode"], "Compensation");
+        assert_eq!(value["business_date"], "2026-08-18");
+        assert_eq!(value["evidence_date"], "2026-08-17");
+        assert_eq!(value["observed_at"], "2026-08-18T15:30:00+08:00");
+        assert_eq!(value["reason_code"], "TEST_CODE_P01_PROVIDER_FAILURE");
+        assert_eq!(value["retryable"], true);
+        assert_eq!(value["stage"], "TEST_CODE_PROVIDER_STAGE");
+        assert_eq!(value["source_evidence_sha256"], source_hash);
+        assert_eq!(value.as_object().expect("audit object").len(), 11);
+
+        assert!(p01_failure_audit_canonical("Unknown", observed_at, &failure, None).is_err());
+        assert!(p01_failure_audit_canonical(
+            "Scheduled",
+            observed_at,
+            &failure,
+            Some("TEST_CODE_NOT_A_HASH"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn p01_failure_audit_uses_the_immutable_exact_append_contract() {
+        type AppendedRecord = (String, String, Vec<u8>, String);
+
+        #[derive(Default)]
+        struct RecordingAppend {
+            record: Mutex<Option<AppendedRecord>>,
+        }
+
+        impl ImmutableAppendPort for RecordingAppend {
+            fn append_exact(
+                &self,
+                record_kind: &str,
+                identity: &str,
+                canonical_bytes: &[u8],
+                sha256: &str,
+            ) -> stock_analysis::durable_delivery::Result<String> {
+                *self.record.lock().expect("TEST_CODE append record") = Some((
+                    record_kind.to_owned(),
+                    identity.to_owned(),
+                    canonical_bytes.to_vec(),
+                    sha256.to_owned(),
+                ));
+                Ok(sha256.to_owned())
+            }
+        }
+
+        let canonical = br#"{"reason_code":"TEST_CODE_P01_FAILURE"}"#;
+        let digest = sha256_hex(canonical);
+        let identity = format!("p01-failure:{digest}");
+        let append = RecordingAppend::default();
+        let receipt = append_p01_failure_audit_exact(&append, &identity, canonical, &digest)
+            .expect("append TEST_CODE P-01 failure audit");
+        let record = append
+            .record
+            .lock()
+            .expect("TEST_CODE append record")
+            .clone()
+            .expect("one immutable append");
+
+        assert_eq!(receipt, digest);
+        assert_eq!(record.0, "P01FailureV1");
+        assert_eq!(record.1, identity);
+        assert_eq!(record.2, canonical);
+        assert_eq!(record.3, digest);
+    }
+
+    #[test]
+    fn p01_runtime_accepts_exact_canonical_binding_and_rendered_text() {
+        let text = "TEST_CODE_P01_EXACT_RENDERED_TEXT";
+        let binding = exact_p01_binding(text);
+        assert_eq!(binding.validate_p01_text(text), Ok(()));
+    }
+
+    #[test]
+    fn br241_p01_runtime_uses_fail_closed_verified_calendar_authority() {
+        assert_eq!(
+            p01_verified_evidence_date(
+                NaiveDate::from_ymd_opt(2026, 8, 18).expect("valid TEST_CODE date")
+            ),
+            Ok("2026-08-17".to_owned())
+        );
+        assert_eq!(
+            p01_verified_evidence_date(
+                NaiveDate::from_ymd_opt(1900, 1, 2).expect("valid TEST_CODE date")
+            ),
+            Err("counted_p01_calendar_authority_unavailable")
+        );
+    }
+
+    #[test]
+    fn br241_p01_runtime_validator_rejects_non_trading_and_uncovered_business_dates() {
+        let text = "TEST_CODE_P01_EXACT_RENDERED_TEXT";
+        for (business_date, evidence_date) in [
+            (
+                NaiveDate::from_ymd_opt(2026, 8, 22).expect("valid TEST_CODE weekend"),
+                NaiveDate::from_ymd_opt(2026, 8, 21).expect("valid TEST_CODE evidence date"),
+            ),
+            (
+                NaiveDate::from_ymd_opt(2026, 10, 1).expect("valid TEST_CODE holiday"),
+                NaiveDate::from_ymd_opt(2026, 9, 30).expect("valid TEST_CODE evidence date"),
+            ),
+            (
+                NaiveDate::from_ymd_opt(2027, 1, 1).expect("valid TEST_CODE out-of-coverage date"),
+                NaiveDate::from_ymd_opt(2026, 12, 31).expect("valid TEST_CODE evidence date"),
+            ),
+        ] {
+            let binding = exact_p01_binding_for_business_date(text, business_date, evidence_date);
+            assert_eq!(
+                binding.validate_p01_text(text),
+                Err("counted_p01_calendar_authority_unavailable"),
+                "business_date={business_date} must fail closed before sink"
+            );
+        }
+    }
+
+    #[test]
+    fn p01_runtime_rejects_unknown_identity_range_and_render_mutations() {
+        let text = "TEST_CODE_P01_EXACT_RENDERED_TEXT";
+        let business_date = NaiveDate::from_ymd_opt(2026, 8, 18).expect("valid TEST_CODE date");
+        let exact = exact_p01_binding(text);
+        let exact_json = String::from_utf8(exact.source_binding_canonical().to_vec())
+            .expect("P-01 binding is UTF-8 JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&exact_json).expect("parse exact P-01 binding");
+        let exact_request_hash = parsed["limit_pools"]["request_hash"]
+            .as_str()
+            .expect("exact P-01 request hash");
+        let mutations = [
+            exact_json.replacen(
+                "{\"schema_version\"",
+                "{\"unknown\":true,\"schema_version\"",
+                1,
+            ),
+            exact_json.replacen(
+                "\"resolved_codes\":[\"TEST_CODE_000001\"]",
+                "\"resolved_codes\":[\"TEST_CODE_000002\"]",
+                1,
+            ),
+            exact_json.replacen(
+                "\"range_end\":\"2026-08-18\"",
+                "\"range_end\":\"2026-08-17\"",
+                1,
+            ),
+            exact_json.replacen(exact_request_hash, &"0".repeat(64), 1),
+        ];
+        for canonical in mutations {
+            assert_eq!(
+                p01_binding_from_bytes(business_date, canonical.into_bytes())
+                    .validate_p01_text(text),
+                Err("counted_p01_binding_invalid")
+            );
+        }
+        assert_eq!(
+            exact.validate_p01_text("TEST_CODE_P01_DIFFERENT_RENDERED_TEXT"),
+            Err("counted_p01_binding_invalid")
+        );
     }
 
     #[test]
@@ -4043,6 +5391,7 @@ mod tests {
                 })
                 .expect("bind TEST_CODE push-log writer"),
             ),
+            counted_delivery_critical_section: Mutex::new(()),
             producer_ready: AtomicBool::new(false),
             schedule_hydrations: Mutex::new(Vec::new()),
             queued_schedule_hydration_ids: Mutex::new(std::collections::BTreeSet::new()),
@@ -4107,6 +5456,7 @@ mod tests {
                     .expect("bind first exact TEST_CODE immutable append"),
             ),
             sink: Arc::new(AcceptingHydrationTestSink),
+            counted_delivery_critical_section: Mutex::new(()),
             producer_ready: AtomicBool::new(false),
             schedule_hydrations: Mutex::new(Vec::new()),
             queued_schedule_hydration_ids: Mutex::new(std::collections::BTreeSet::new()),
@@ -4145,6 +5495,7 @@ mod tests {
                     .expect("bind restarted exact TEST_CODE immutable append"),
             ),
             sink: Arc::new(AcceptingHydrationTestSink),
+            counted_delivery_critical_section: Mutex::new(()),
             producer_ready: AtomicBool::new(false),
             schedule_hydrations: Mutex::new(Vec::new()),
             queued_schedule_hydration_ids: Mutex::new(std::collections::BTreeSet::new()),

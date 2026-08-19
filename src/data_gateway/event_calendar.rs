@@ -53,7 +53,7 @@ impl EventCalendarGateway {
         trading_date: NaiveDate,
         limit: u32,
     ) -> Result<GatewayBatch<EventAnnouncement>, GatewayError> {
-        let request_hash = acquisition_request_hash(CAPABILITY, &format!("{trading_date}:{limit}"));
+        let request_hash = acquisition_request_hash(CAPABILITY, format!("{trading_date}:{limit}"));
         // P4 M3 钩子: DATA_GATEWAY_GRPC=1 → gRPC 通道 (fail-closed, audit 对等)。
         match super::grpc_source::bridge_for("Announcements") {
             Ok(Some(bridge)) => {

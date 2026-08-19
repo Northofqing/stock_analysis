@@ -5,6 +5,7 @@
 //! 桥据此重建 GatewayError 分类 (grpc_source.rs query_op), 不再折叠为
 //! 默认 unavailable+provider=None (BR-170 生产日志 pre-fix 形态)。
 use prost::Message; // ErrorDetail::decode (tonic 0.14 details() 返回 &[u8])
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq)]
 pub enum GrpcError {
@@ -57,10 +58,206 @@ pub struct ErrorDetail {
     pub provider: Option<String>,
     pub reason_code: Option<String>,
     pub retryable: Option<bool>,
+    /// Bounded, secret-screened server diagnostic for operator evidence only.
+    /// Program flow must continue to branch exclusively on typed fields above.
+    pub diagnostic_message: Option<Box<DiagnosticMessage>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiagnosticMessage(String);
+
+impl DiagnosticMessage {
+    fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+const MAX_DIAGNOSTIC_CHARS: usize = 512;
+const REQUEST_ID_HASH_DOMAIN: &[u8] = b"stock_analysis.grpc_error.request_id.v1";
+
+fn request_id_correlation(value: &str) -> Option<String> {
+    if value.is_empty() {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update((REQUEST_ID_HASH_DOMAIN.len() as u64).to_be_bytes());
+    digest.update(REQUEST_ID_HASH_DOMAIN);
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value.as_bytes());
+    Some(format!("sha256:{}", hex::encode(digest.finalize())))
+}
+
+fn known_provider(value: &str) -> Option<crate::magic_compat::ProviderId> {
+    use crate::magic_compat::ProviderId;
+
+    Some(match value {
+        "Tdx" => ProviderId::Tdx,
+        "Tencent" => ProviderId::Tencent,
+        "Eastmoney" => ProviderId::Eastmoney,
+        "Sina" => ProviderId::Sina,
+        "Baostock" => ProviderId::Baostock,
+        "Baidu" => ProviderId::Baidu,
+        "Tonghuashun" => ProviderId::Tonghuashun,
+        "Iwencai" => ProviderId::Iwencai,
+        "Cninfo" => ProviderId::Cninfo,
+        "Cailianpress" => ProviderId::Cailianpress,
+        "Jin10" => ProviderId::Jin10,
+        "ThePaper" => ProviderId::ThePaper,
+        "Yonhap" => ProviderId::Yonhap,
+        "WallstreetCn" => ProviderId::WallstreetCn,
+        "Sse" => ProviderId::Sse,
+        "Szse" => ProviderId::Szse,
+        "Hkex" => ProviderId::Hkex,
+        "Cffex" => ProviderId::Cffex,
+        "StateCouncil" => ProviderId::StateCouncil,
+        "Nbs" => ProviderId::Nbs,
+        "Pbc" => ProviderId::Pbc,
+        "Cfets" => ProviderId::Cfets,
+        "Fred" => ProviderId::Fred,
+        "Imf" => ProviderId::Imf,
+        "WorldBank" => ProviderId::WorldBank,
+        "SecEdgar" => ProviderId::SecEdgar,
+        "XinhuaFinance" => ProviderId::XinhuaFinance,
+        "Yicai" => ProviderId::Yicai,
+        "SecuritiesTimes" => ProviderId::SecuritiesTimes,
+        "LocalAnalysis" => ProviderId::LocalAnalysis,
+        "LocalTerminal" => ProviderId::LocalTerminal,
+        "Custom" => ProviderId::Custom,
+        _ => return None,
+    })
+}
+
+fn safe_wire_provider(value: &str) -> Option<String> {
+    known_provider(value).map(|provider| format!("{provider:?}"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KnownReasonCode {
+    NoVerifiedBatch,
+    InvalidRequest,
+    InvalidEvidence,
+    Unavailable,
+    Partial,
+    Internal,
+    TdxBoardMembershipUnsupported,
+    UpperLimitStreakMissing,
+    ManualConfirmationContractUnavailable,
+    FiveMinuteGap,
+    ExactBatchJoinAccepted,
+    DatabaseFailure,
+    ExternalSourceFieldConflict,
+    ExternalAcquisitionAuthorityMissing,
+    ProviderUnavailable,
+}
+
+impl KnownReasonCode {
+    fn from_wire(value: &str) -> Option<Self> {
+        Some(match value {
+            "no_verified_batch" => Self::NoVerifiedBatch,
+            "invalid_request" => Self::InvalidRequest,
+            "invalid_evidence" => Self::InvalidEvidence,
+            "unavailable" => Self::Unavailable,
+            "partial" => Self::Partial,
+            "internal" => Self::Internal,
+            "tdx_board_membership_unsupported" => Self::TdxBoardMembershipUnsupported,
+            "upper_limit_streak_missing" => Self::UpperLimitStreakMissing,
+            "manual_confirmation_contract_unavailable" => {
+                Self::ManualConfirmationContractUnavailable
+            }
+            "five_minute_gap" => Self::FiveMinuteGap,
+            "exact_batch_join_accepted" => Self::ExactBatchJoinAccepted,
+            "database_failure" => Self::DatabaseFailure,
+            "external_source_field_conflict" => Self::ExternalSourceFieldConflict,
+            "external_acquisition_authority_missing" => Self::ExternalAcquisitionAuthorityMissing,
+            "provider_unavailable" => Self::ProviderUnavailable,
+            _ => return None,
+        })
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoVerifiedBatch => "no_verified_batch",
+            Self::InvalidRequest => "invalid_request",
+            Self::InvalidEvidence => "invalid_evidence",
+            Self::Unavailable => "unavailable",
+            Self::Partial => "partial",
+            Self::Internal => "internal",
+            Self::TdxBoardMembershipUnsupported => "tdx_board_membership_unsupported",
+            Self::UpperLimitStreakMissing => "upper_limit_streak_missing",
+            Self::ManualConfirmationContractUnavailable => {
+                "manual_confirmation_contract_unavailable"
+            }
+            Self::FiveMinuteGap => "five_minute_gap",
+            Self::ExactBatchJoinAccepted => "exact_batch_join_accepted",
+            Self::DatabaseFailure => "database_failure",
+            Self::ExternalSourceFieldConflict => "external_source_field_conflict",
+            Self::ExternalAcquisitionAuthorityMissing => "external_acquisition_authority_missing",
+            Self::ProviderUnavailable => "provider_unavailable",
+        }
+    }
+}
+
+fn safe_wire_reason_code(value: &str) -> Option<String> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(
+            KnownReasonCode::from_wire(value)
+                .unwrap_or(KnownReasonCode::Internal)
+                .as_str()
+                .to_owned(),
+        )
+    }
+}
+
+fn safe_wire_operation(value: i32) -> Option<i32> {
+    use crate::grpc_client::pb::magic::market::v1::Operation;
+
+    Operation::try_from(value)
+        .ok()
+        .filter(|operation| *operation != Operation::Unspecified)
+        .map(|operation| operation as i32)
+}
+
+fn safe_status_message(message: &str) -> Option<Box<DiagnosticMessage>> {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = trimmed
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .take(MAX_DIAGNOSTIC_CHARS)
+        .collect::<String>();
+    let lower = normalized.to_ascii_lowercase();
+    let safe = if lower.contains("instrumentnews record has conflicting evidence") {
+        "InstrumentNews record has conflicting evidence"
+    } else if lower.contains("instrument-news html entity is not closed") {
+        "instrument-news HTML entity is not closed"
+    } else if lower.contains("instrument-news page is not newest-first") {
+        "instrument-news page is not newest-first"
+    } else if lower.contains("native the paper row unexpectedly has an external link") {
+        "native The Paper row unexpectedly has an external link"
+    } else if lower.contains("news article host")
+        && lower.contains("is not an admitted global-news host")
+    {
+        "news article host is not an admitted global-news host"
+    } else {
+        // Upstream status text is an untrusted free-form payload. A blacklist
+        // cannot prove that credentials, cookies or request data are absent,
+        // so only the closed canonical vocabulary above may reach logs.
+        "[redacted-unclassified-status]"
+    };
+    Some(Box::new(DiagnosticMessage::new(safe)))
 }
 
 impl From<tonic::Status> for GrpcError {
     fn from(status: tonic::Status) -> Self {
+        let diagnostic_message = safe_status_message(status.message());
         // 尝试解码 ErrorDetail (合同 §10: request ID/operation/provider/reason code/retryable)。
         // tonic 0.14 重构: details() 返回原始 &[u8] (不再是 Box<dyn Any>),
         // 用 prost::Message::decode 直接解码; 解码失败则忽略, 用 code 分支即可。
@@ -68,6 +265,7 @@ impl From<tonic::Status> for GrpcError {
         let detail = if status.details().is_empty() {
             ErrorDetail {
                 code: status.code().to_string(),
+                diagnostic_message: diagnostic_message.clone(),
                 ..Default::default()
             }
         } else {
@@ -75,26 +273,16 @@ impl From<tonic::Status> for GrpcError {
                 .ok()
                 .map(|d| ErrorDetail {
                     code: status.code().to_string(),
-                    request_id: if d.request_id.is_empty() {
-                        None
-                    } else {
-                        Some(d.request_id.clone())
-                    },
-                    operation: Some(d.operation),
-                    provider: if d.provider.is_empty() {
-                        None
-                    } else {
-                        Some(d.provider.clone())
-                    },
-                    reason_code: if d.reason_code.is_empty() {
-                        None
-                    } else {
-                        Some(d.reason_code.clone())
-                    },
+                    request_id: request_id_correlation(&d.request_id),
+                    operation: safe_wire_operation(d.operation),
+                    provider: safe_wire_provider(&d.provider),
+                    reason_code: safe_wire_reason_code(&d.reason_code),
                     retryable: Some(d.retryable),
+                    diagnostic_message: diagnostic_message.clone(),
                 })
                 .unwrap_or_else(|| ErrorDetail {
                     code: status.code().to_string(),
+                    diagnostic_message: diagnostic_message.clone(),
                     ..Default::default()
                 })
         };
@@ -148,6 +336,9 @@ mod tests {
     fn detail_for(code: Code) -> ErrorDetail {
         ErrorDetail {
             code: code.to_string(),
+            diagnostic_message: Some(Box::new(DiagnosticMessage::new(
+                "[redacted-unclassified-status]",
+            ))),
             ..Default::default()
         }
     }
@@ -215,6 +406,9 @@ mod tests {
                 GrpcError::Unknown {
                     details: ErrorDetail {
                         code: "Unknown error".into(),
+                        diagnostic_message: Some(Box::new(DiagnosticMessage::new(
+                            "[redacted-unclassified-status]",
+                        ))),
                         ..Default::default()
                     },
                 },
@@ -227,7 +421,8 @@ mod tests {
     }
 
     /// D2 核心: Fetch 失败 status 携带的 ErrorDetail (provider/reason_code/retryable)
-    /// 必须保真解码到 GrpcError.details(), 桥据此重建 GatewayError 分类。
+    /// 必须保真解码到 GrpcError.details(), 桥据此重建 GatewayError 分类；
+    /// request_id 仅保留不可逆关联 token, 不保留不受信任的 wire 原文。
     #[test]
     fn decodes_fetch_error_detail_into_all_variants() {
         let mut detail = crate::grpc_client::pb::magic::market::v1::ErrorDetail {
@@ -248,7 +443,15 @@ mod tests {
             Some("no_verified_batch")
         );
         assert_eq!(err.details().retryable, Some(true));
-        assert_eq!(err.details().request_id.as_deref(), Some("req-42"));
+        let request_42 = err
+            .details()
+            .request_id
+            .as_deref()
+            .expect("request correlation token")
+            .to_owned();
+        assert!(request_42.starts_with("sha256:"));
+        assert_eq!(request_42.len(), "sha256:".len() + 64);
+        assert_ne!(request_42, "req-42");
 
         // Unavailable 也带 detail (非 Fetch 路径同样保留 request_id 供审计)。
         detail.request_id = "req-43".to_string();
@@ -259,7 +462,134 @@ mod tests {
         );
         let err = GrpcError::from(status);
         assert!(matches!(err, GrpcError::Unavailable { .. }));
-        assert_eq!(err.details().request_id.as_deref(), Some("req-43"));
+        let request_43 = err
+            .details()
+            .request_id
+            .as_deref()
+            .expect("request correlation token");
+        assert!(request_43.starts_with("sha256:"));
+        assert_eq!(request_43.len(), "sha256:".len() + 64);
+        assert_ne!(request_43, "req-43");
+        assert_ne!(request_43, request_42);
+    }
+
+    #[test]
+    fn preserves_bounded_safe_status_detail_without_exposing_credentials() {
+        let status = tonic::Status::new(
+            Code::FailedPrecondition,
+            "InstrumentNews record has conflicting evidence",
+        );
+        let err = GrpcError::from(status);
+        assert_eq!(
+            err.details()
+                .diagnostic_message
+                .as_ref()
+                .map(|message| message.as_str()),
+            Some("InstrumentNews record has conflicting evidence")
+        );
+
+        let status = tonic::Status::new(
+            Code::Unauthenticated,
+            "authorization: Bearer TEST_SECRET_TOKEN",
+        );
+        let err = GrpcError::from(status);
+        assert_eq!(
+            err.details()
+                .diagnostic_message
+                .as_ref()
+                .map(|message| message.as_str()),
+            Some("[redacted-unclassified-status]")
+        );
+        assert!(!format!("{err:?}").contains("TEST_SECRET_TOKEN"));
+
+        let long = "x".repeat(600);
+        let err = GrpcError::from(tonic::Status::new(Code::Internal, long));
+        assert_eq!(
+            err.details()
+                .diagnostic_message
+                .as_deref()
+                .expect("bounded diagnostic")
+                .as_str(),
+            "[redacted-unclassified-status]"
+        );
+    }
+
+    #[test]
+    fn rejects_unclassified_upstream_status_text_instead_of_blacklisting_secrets() {
+        for diagnostic in [
+            "api_key=TEST_ONLY_VALUE",
+            "cookie: session=TEST_ONLY_COOKIE",
+            r#"request payload={\"query\":\"TEST_ONLY_PRIVATE_INPUT\"}"#,
+            "unlabelled TEST_ONLY_SENSITIVE_VALUE",
+        ] {
+            let error = GrpcError::from(tonic::Status::new(Code::Internal, diagnostic));
+            assert_eq!(
+                error
+                    .details()
+                    .diagnostic_message
+                    .as_deref()
+                    .map(DiagnosticMessage::as_str),
+                Some("[redacted-unclassified-status]")
+            );
+            assert!(
+                !format!("{error:?}").contains("TEST_ONLY"),
+                "arbitrary upstream status text must never survive in Debug"
+            );
+        }
+    }
+
+    #[test]
+    fn wire_error_detail_is_closed_and_keeps_authoritative_classification() {
+        let untrusted = crate::grpc_client::pb::magic::market::v1::ErrorDetail {
+            request_id: "TEST_ONLY_SECRET_REQUEST_ID".to_string(),
+            operation: i32::MAX,
+            provider: "TEST_ONLY_SECRET_PROVIDER".to_string(),
+            reason_code: "TEST_ONLY_SECRET_REASON".to_string(),
+            retryable: true,
+        };
+        let error = GrpcError::from(tonic::Status::with_details(
+            Code::Internal,
+            "",
+            untrusted.encode_to_vec().into(),
+        ));
+        let detail = error.details();
+        let request_id = detail
+            .request_id
+            .as_deref()
+            .expect("hashed request identity");
+        assert!(request_id.starts_with("sha256:"));
+        assert_eq!(request_id.len(), "sha256:".len() + 64);
+        assert_eq!(detail.operation, None);
+        assert_eq!(detail.provider, None);
+        assert_eq!(detail.reason_code.as_deref(), Some("internal"));
+        assert_eq!(detail.retryable, Some(true));
+        assert!(!format!("{error:?}").contains("TEST_ONLY_SECRET"));
+
+        let classified = crate::grpc_client::pb::magic::market::v1::ErrorDetail {
+            request_id: "TEST_CODE_CLASSIFIED_REQUEST".to_string(),
+            operation: crate::grpc_client::pb::magic::market::v1::Operation::ProviderTopNRankings
+                as i32,
+            provider: "Tdx".to_string(),
+            reason_code: "invalid_evidence".to_string(),
+            retryable: false,
+        };
+        let error = GrpcError::from(tonic::Status::with_details(
+            Code::Internal,
+            "",
+            classified.encode_to_vec().into(),
+        ));
+        let detail = error.details();
+        assert_ne!(
+            detail.request_id.as_deref(),
+            Some("TEST_CODE_CLASSIFIED_REQUEST")
+        );
+        assert_eq!(
+            detail.operation,
+            Some(crate::grpc_client::pb::magic::market::v1::Operation::ProviderTopNRankings as i32)
+        );
+        assert_eq!(detail.provider.as_deref(), Some("Tdx"));
+        assert_eq!(detail.reason_code.as_deref(), Some("invalid_evidence"));
+        assert_eq!(detail.retryable, Some(false));
     }
 
     #[test]

@@ -16,7 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 DATABASE = ROOT / "data/durable_delivery.sqlite3"
-EXPECTED_SCHEMA_VERSION = 6
+EXPECTED_SCHEMA_VERSION = 9
 EXPECTED_PASSED_REPLAY_REASON = "existing_terminal_hydrated"
 EXPECTED_FAILED_REPLAY_REASONS = frozenset(
     {

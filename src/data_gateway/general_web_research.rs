@@ -43,6 +43,25 @@ impl GeneralWebResearchProvider {
         }
     }
 
+    /// Stable LocalBridge request spelling. This is deliberately separate
+    /// from the display label (`SerpAPI`) and serde spelling (`serp_api`).
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Bocha => "Bocha",
+            Self::Tavily => "Tavily",
+            Self::SerpApi => "SerpApi",
+        }
+    }
+
+    pub fn from_wire_name(value: &str) -> Option<Self> {
+        match value {
+            "Bocha" => Some(Self::Bocha),
+            "Tavily" => Some(Self::Tavily),
+            "SerpApi" => Some(Self::SerpApi),
+            _ => None,
+        }
+    }
+
     const fn credential_env_name(self) -> &'static str {
         match self {
             Self::Bocha => "BOCHA_API_KEYS",
@@ -268,10 +287,13 @@ impl GeneralWebResearchGateway {
                 format!("query must be non-empty and limit must be within 1..={MAX_RESULTS}"),
             ));
         }
-        // P4 M4b 批次 1B: grpc 模式走桥 (服务端 Bocha 直连, API key 服务端持有)。
+        // BR-242: grpc 模式保留调用方选择的 exact provider，API key 仍由服务端持有。
         match super::grpc_source::bridge_for("SemanticSearch") {
             Ok(Some(bridge)) => {
-                return match bridge.semantic_search_async(query, limit).await {
+                return match bridge
+                    .semantic_search_async(self.provider, query, limit)
+                    .await
+                {
                     Ok(batch) => Ok(batch),
                     Err(e) => Err(GeneralWebResearchError::new(
                         self.provider,

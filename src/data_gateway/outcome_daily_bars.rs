@@ -66,8 +66,8 @@ const DOMAIN_LIFECYCLE_EVIDENCE: &str = "stock_analysis.br174.outcome_daily_bars
 // and expose shares to outcome math so D1/T0 ratios use one unit.
 const SHARES_PER_BOARD_LOT: f64 = 100.0;
 const VOLUME_CONVERSION_CONTRACT: &str =
-    "magic-market-data-rs@5f1ce93656a55854c844065390520cd4aecd9a14:BR-022+BR-036";
-const VOLUME_CONTRACT_UPSTREAM_REVISION: &str = "5f1ce93656a55854c844065390520cd4aecd9a14";
+    "magic-market-data-rs@75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e:BR-022+BR-036";
+const VOLUME_CONTRACT_UPSTREAM_REVISION: &str = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e";
 const VOLUME_CONVERSION_VERSION: &str = "outcome-volume-shares-v1";
 const CORE_VOLUME_UNIT: &str = "board_lot";
 const ADMITTED_VOLUME_UNIT: &str = "share";
@@ -4279,7 +4279,7 @@ mod tests {
     fn core_lot_volume_is_converted_to_t0_share_unit() {
         assert_eq!(
             VOLUME_CONVERSION_CONTRACT,
-            "magic-market-data-rs@5f1ce93656a55854c844065390520cd4aecd9a14:BR-022+BR-036"
+            "magic-market-data-rs@75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e:BR-022+BR-036"
         );
         assert_eq!(UPSTREAM_REVISION, VOLUME_CONTRACT_UPSTREAM_REVISION);
         validate_unit_contract().expect("pinned TEST_CODE unit contract");

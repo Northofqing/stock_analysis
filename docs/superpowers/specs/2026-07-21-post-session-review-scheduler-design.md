@@ -80,3 +80,23 @@ freshness 比较、任务 identity 和审计文件日期必须统一为最近已
 采用 `dispatch_post_session_review`、BR-108 banner 评估、BR-110 逐项结果与现有通知治理；拒绝调用遗留 `run_review_only_inner(false)`，因为其生产可达性已由既有设计禁止。
 
 整体回退 BR-139 文档、调度器、注册调用和测试即可。回滚不删除数据库、日志、投递审计或持仓数据。
+
+## 7. BR-245：R-07 按业务日投递
+
+`TomorrowWatch` 是每个已验证复盘业务日的独立消息。它不得使用“上次实际
+Accepted 时刻 + 86,400 秒”的 `Rolling` 冷却：前一业务日的延迟回执不得锁死次一
+业务日。因此其唯一策略是 `Global`/`GLOBAL`、`NONE`、`BusinessDateOnce`、名义
+86,400 秒，且 `counts_against_daily_budget=false`。
+
+同一业务日的不可变 claim 只允许一个 decision：同 decision 复用已有状态，不同 decision
+显式冲突，两者都是零新增 sink。下一个已验证业务日建立新 claim，只按业务日隔离，
+不读取前一日 Accepted wall-clock 冷却头。
+
+策略参与 decision identity 哈希，所以该修正必须递增 `POLICY_VERSION`。SQLite schema 升级
+只能重放 `delivery_policy_catalog`；升级前后必须逐表逐列保留 decisions、attempts、
+business-date claims、sink results、cooldown heads/reservations 与 immutable audit outbox。任何
+删除、改写或重新解释既有 authority row 都是迁移失败。
+
+回滚只能回退新的策略目录/代码并重建二进制；不删除或改写已有决策、claim、receipt
+和审计记录。上线验收必须使用下一真实业务日的 typed Accepted receipt 及 exact audit join；
+局部单测不能替代这一 Gate-D 证据。

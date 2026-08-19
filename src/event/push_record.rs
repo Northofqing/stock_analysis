@@ -14,6 +14,7 @@ use thiserror::Error;
 /// Classification label for a push delivery outcome.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PushOutcomeLabel {
+    Attempted,
     Pushed,
     Deduped,
     Denied,
@@ -27,6 +28,7 @@ impl PushOutcomeLabel {
     /// strings remain invalid instead of being silently reclassified.
     pub fn from_audit_str(s: &str) -> Option<Self> {
         Some(match s {
+            "Attempted" => PushOutcomeLabel::Attempted,
             "Pushed" => PushOutcomeLabel::Pushed,
             "SinkError" | "Failed" | "Uncertain" => PushOutcomeLabel::Failed,
             "Deduped" => PushOutcomeLabel::Deduped,
@@ -74,6 +76,36 @@ pub struct PushRecord {
     pub source_business_date: Option<chrono::NaiveDate>,
     pub source_batch_id: Option<String>,
     pub source_content_sha256: Option<String>,
+    pub news_flash_sources: Option<Vec<super::envelope::NewsFlashAuditSource>>,
+    pub news_flash_reservation_sha256: Option<String>,
+    pub news_flash_evidence_sha256: Option<String>,
+    pub news_flash_render_sha256: Option<String>,
+    pub news_flash_join_sha256: Option<String>,
+    pub news_flash_business_date: Option<chrono::NaiveDate>,
+    pub news_flash_decision_key: Option<String>,
+    pub news_flash_transaction_stage: Option<String>,
+    pub news_flash_attempt_ordinal: Option<u32>,
+    pub news_flash_attempt_observed_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+    pub news_flash_sink_attempt_identity: Option<String>,
+    pub news_flash_sink_attempt_sha256: Option<String>,
+    pub news_flash_attempt_envelope_id: Option<String>,
+    pub news_flash_remote_receipt: Option<super::envelope::NewsFlashRemoteReceipt>,
+    pub news_flash_remote_receipt_identity: Option<String>,
+    pub news_flash_remote_receipt_sha256: Option<String>,
+    pub news_flash_terminal_observed_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+    pub news_flash_terminal_reason_code: Option<String>,
+    pub news_flash_transport_evidence_sha256: Option<String>,
+    pub news_flash_failure_provider: Option<String>,
+    pub news_flash_failure_available_provider: Option<String>,
+    pub news_flash_failure_stage: Option<String>,
+    pub news_flash_failure_reason: Option<String>,
+    pub news_flash_failure_diagnostic_code: Option<String>,
+    pub news_flash_failure_diagnostic: Option<String>,
+    pub news_flash_failure_observed_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+    pub news_flash_failure_source_record_count: Option<u32>,
+    pub news_flash_failure_batch_id: Option<String>,
+    pub news_flash_failure_record_id: Option<String>,
+    pub news_flash_failure_identity_sha256: Option<String>,
 }
 
 /// Errors when extracting a `PushRecord` from an `EventEnvelope`.
@@ -91,6 +123,151 @@ pub enum PushRecordError {
     #[error("invalid field value: {0}")]
     InvalidFieldValue(String),
 }
+
+const NEWS_FLASH_LEGACY_DELIVERY_FIELDS: &[&str] = &[
+    "kind",
+    "outcome",
+    "decision_status",
+    "retryable",
+    "rule_ids",
+    "reason_code",
+    "subject_hash",
+    "identity_hash",
+    "source_as_of",
+    "audit_schema_version",
+    "channel",
+    "rendered_len",
+    "latency_ms",
+    "news_flash_sources",
+    "news_flash_reservation_sha256",
+    "news_flash_evidence_sha256",
+    "news_flash_render_sha256",
+    "news_flash_join_sha256",
+];
+
+const NEWS_FLASH_ATTEMPT_FIELDS: &[&str] = &[
+    "kind",
+    "outcome",
+    "decision_status",
+    "retryable",
+    "rule_ids",
+    "reason_code",
+    "subject_hash",
+    "identity_hash",
+    "source_as_of",
+    "audit_schema_version",
+    "channel",
+    "rendered_len",
+    "latency_ms",
+    "news_flash_sources",
+    "news_flash_reservation_sha256",
+    "news_flash_evidence_sha256",
+    "news_flash_render_sha256",
+    "news_flash_join_sha256",
+    "news_flash_business_date",
+    "news_flash_decision_key",
+    "news_flash_transaction_stage",
+    "news_flash_attempt_ordinal",
+    "news_flash_attempt_observed_at",
+    "news_flash_sink_attempt_identity",
+    "news_flash_sink_attempt_sha256",
+];
+
+const NEWS_FLASH_TERMINAL_FIELDS: &[&str] = &[
+    "kind",
+    "outcome",
+    "decision_status",
+    "retryable",
+    "rule_ids",
+    "reason_code",
+    "subject_hash",
+    "identity_hash",
+    "source_as_of",
+    "audit_schema_version",
+    "channel",
+    "rendered_len",
+    "latency_ms",
+    "news_flash_sources",
+    "news_flash_reservation_sha256",
+    "news_flash_evidence_sha256",
+    "news_flash_render_sha256",
+    "news_flash_join_sha256",
+    "news_flash_business_date",
+    "news_flash_decision_key",
+    "news_flash_transaction_stage",
+    "news_flash_attempt_ordinal",
+    "news_flash_attempt_observed_at",
+    "news_flash_sink_attempt_identity",
+    "news_flash_sink_attempt_sha256",
+    "news_flash_attempt_envelope_id",
+    "news_flash_terminal_observed_at",
+    "news_flash_terminal_reason_code",
+];
+
+const NEWS_FLASH_DEFINITIVE_FIELDS: &[&str] = &[
+    "kind",
+    "outcome",
+    "decision_status",
+    "retryable",
+    "rule_ids",
+    "reason_code",
+    "subject_hash",
+    "identity_hash",
+    "source_as_of",
+    "audit_schema_version",
+    "channel",
+    "rendered_len",
+    "latency_ms",
+    "news_flash_sources",
+    "news_flash_reservation_sha256",
+    "news_flash_evidence_sha256",
+    "news_flash_render_sha256",
+    "news_flash_join_sha256",
+    "news_flash_business_date",
+    "news_flash_decision_key",
+    "news_flash_transaction_stage",
+    "news_flash_attempt_ordinal",
+    "news_flash_attempt_observed_at",
+    "news_flash_sink_attempt_identity",
+    "news_flash_sink_attempt_sha256",
+    "news_flash_attempt_envelope_id",
+    "news_flash_terminal_observed_at",
+    "news_flash_terminal_reason_code",
+    "news_flash_transport_evidence_sha256",
+];
+
+const NEWS_FLASH_ACCEPTED_FIELDS: &[&str] = &[
+    "kind",
+    "outcome",
+    "decision_status",
+    "retryable",
+    "rule_ids",
+    "reason_code",
+    "subject_hash",
+    "identity_hash",
+    "source_as_of",
+    "audit_schema_version",
+    "channel",
+    "rendered_len",
+    "latency_ms",
+    "news_flash_sources",
+    "news_flash_reservation_sha256",
+    "news_flash_evidence_sha256",
+    "news_flash_render_sha256",
+    "news_flash_join_sha256",
+    "news_flash_business_date",
+    "news_flash_decision_key",
+    "news_flash_transaction_stage",
+    "news_flash_attempt_ordinal",
+    "news_flash_attempt_observed_at",
+    "news_flash_sink_attempt_identity",
+    "news_flash_sink_attempt_sha256",
+    "news_flash_attempt_envelope_id",
+    "news_flash_terminal_observed_at",
+    "news_flash_remote_receipt",
+    "news_flash_remote_receipt_identity",
+    "news_flash_remote_receipt_sha256",
+];
 
 impl PushRecord {
     /// Extract a `PushRecord` from an `EventEnvelope`.
@@ -171,6 +348,40 @@ impl PushRecord {
                 "source_batch_id",
                 "source_content_sha256",
             ],
+            Some(super::envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION) => match env
+                .payload
+                .get("news_flash_transaction_stage")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("SinkAttempt") => NEWS_FLASH_ATTEMPT_FIELDS,
+                Some("Accepted") => NEWS_FLASH_ACCEPTED_FIELDS,
+                Some("DefinitivelyRejected") => NEWS_FLASH_DEFINITIVE_FIELDS,
+                Some("Uncertain") => NEWS_FLASH_TERMINAL_FIELDS,
+                Some(_) => NEWS_FLASH_ATTEMPT_FIELDS,
+                None => NEWS_FLASH_LEGACY_DELIVERY_FIELDS,
+            },
+            Some(super::envelope::NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION) => &[
+                "kind",
+                "outcome",
+                "decision_status",
+                "retryable",
+                "rule_ids",
+                "reason_code",
+                "subject_hash",
+                "identity_hash",
+                "source_as_of",
+                "audit_schema_version",
+                "channel",
+                "rendered_len",
+                "latency_ms",
+                "news_flash_failure_stage",
+                "news_flash_failure_reason",
+                "news_flash_failure_diagnostic_code",
+                "news_flash_failure_diagnostic",
+                "news_flash_failure_observed_at",
+                "news_flash_failure_source_record_count",
+                "news_flash_failure_identity_sha256",
+            ],
             Some(_) => &[
                 "kind",
                 "outcome",
@@ -195,7 +406,20 @@ impl PushRecord {
                 "latency_ms",
             ],
         };
-        validate_closed_payload(&env.payload, expected_fields)?;
+        let mut expected_fields = expected_fields.to_vec();
+        if audit_schema_version == Some(super::envelope::NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION) {
+            for optional in [
+                "news_flash_failure_provider",
+                "news_flash_failure_available_provider",
+                "news_flash_failure_batch_id",
+                "news_flash_failure_record_id",
+            ] {
+                if env.payload.get(optional).is_some() {
+                    expected_fields.push(optional);
+                }
+            }
+        }
+        validate_closed_payload(&env.payload, &expected_fields)?;
 
         let id = env.id.clone();
         let trace_id = env.trace_id.clone();
@@ -274,6 +498,8 @@ impl PushRecord {
                 super::envelope::DELIVERY_AUDIT_SCHEMA_VERSION
                     | super::envelope::COUNTED_DELIVERY_AUDIT_SCHEMA_VERSION
                     | super::envelope::SOURCE_BATCH_DELIVERY_AUDIT_SCHEMA_VERSION
+                    | super::envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION
+                    | super::envelope::NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION
             ) {
                 return Err(PushRecordError::InvalidFieldValue(format!(
                     "audit_schema_version={version}"
@@ -323,21 +549,27 @@ impl PushRecord {
                 .and_then(serde_json::Value::as_bool)
                 .ok_or_else(|| PushRecordError::InvalidFieldType("retryable".into()))?;
             let reason_code = required_text("reason_code")?;
-            let Some((expected_reason, expected_retryable)) =
-                super::envelope::delivery_outcome_metadata(&outcome_str)
-            else {
-                return Err(PushRecordError::InvalidFieldValue(format!(
-                    "outcome={outcome_str}"
-                )));
-            };
-            if retryable != expected_retryable {
+            if version != super::envelope::NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION {
+                let Some((expected_reason, expected_retryable)) =
+                    super::envelope::delivery_outcome_metadata(&outcome_str)
+                else {
+                    return Err(PushRecordError::InvalidFieldValue(format!(
+                        "outcome={outcome_str}"
+                    )));
+                };
+                if retryable != expected_retryable {
+                    return Err(PushRecordError::InvalidFieldValue(
+                        "retryable does not match outcome".into(),
+                    ));
+                }
+                if reason_code != expected_reason {
+                    return Err(PushRecordError::InvalidFieldValue(
+                        "reason_code does not match outcome".into(),
+                    ));
+                }
+            } else if outcome_str != "Failed" {
                 return Err(PushRecordError::InvalidFieldValue(
-                    "retryable does not match outcome".into(),
-                ));
-            }
-            if reason_code != expected_reason {
-                return Err(PushRecordError::InvalidFieldValue(
-                    "reason_code does not match outcome".into(),
+                    "NewsFlash failure outcome must be Failed".into(),
                 ));
             }
 
@@ -360,6 +592,12 @@ impl PushRecord {
                 }
                 super::envelope::SOURCE_BATCH_DELIVERY_AUDIT_SCHEMA_VERSION => {
                     super::envelope::SOURCE_BATCH_DELIVERY_AUDIT_RULE_IDS.as_slice()
+                }
+                super::envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION => {
+                    super::envelope::NEWS_FLASH_DELIVERY_AUDIT_RULE_IDS.as_slice()
+                }
+                super::envelope::NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION => {
+                    super::envelope::NEWS_FLASH_FAILURE_AUDIT_RULE_IDS.as_slice()
                 }
                 super::envelope::DELIVERY_AUDIT_SCHEMA_VERSION => {
                     super::envelope::DELIVERY_AUDIT_RULE_IDS.as_slice()
@@ -525,6 +763,361 @@ impl PushRecord {
             (None, None, None)
         };
 
+        let (
+            news_flash_sources,
+            news_flash_reservation_sha256,
+            news_flash_evidence_sha256,
+            news_flash_render_sha256,
+            news_flash_join_sha256,
+            news_flash_business_date,
+            news_flash_decision_key,
+            news_flash_transaction_stage,
+            news_flash_attempt_ordinal,
+            news_flash_attempt_observed_at,
+            news_flash_sink_attempt_identity,
+            news_flash_sink_attempt_sha256,
+            news_flash_attempt_envelope_id,
+            news_flash_remote_receipt,
+            news_flash_remote_receipt_identity,
+            news_flash_remote_receipt_sha256,
+            news_flash_terminal_observed_at,
+            news_flash_terminal_reason_code,
+            news_flash_transport_evidence_sha256,
+        ) = if audit_schema_version
+            == Some(super::envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION)
+        {
+            let sources_value = env
+                .payload
+                .get("news_flash_sources")
+                .cloned()
+                .ok_or_else(|| PushRecordError::MissingField("news_flash_sources".into()))?;
+            let sources: Vec<super::envelope::NewsFlashAuditSource> =
+                serde_json::from_value(sources_value)
+                    .map_err(|_| PushRecordError::InvalidFieldType("news_flash_sources".into()))?;
+            if sources.is_empty() || sources.len() > 3 {
+                return Err(PushRecordError::InvalidFieldValue(
+                    "news_flash_sources".into(),
+                ));
+            }
+            let reservation = required_text("news_flash_reservation_sha256")?;
+            let evidence = required_text("news_flash_evidence_sha256")?;
+            let render = required_text("news_flash_render_sha256")?;
+            let join = required_text("news_flash_join_sha256")?;
+            for (field, value) in [
+                ("news_flash_reservation_sha256", &reservation),
+                ("news_flash_evidence_sha256", &evidence),
+                ("news_flash_render_sha256", &render),
+                ("news_flash_join_sha256", &join),
+            ] {
+                if !super::envelope::is_lower_hex_sha256(value) {
+                    return Err(PushRecordError::InvalidFieldValue(field.into()));
+                }
+            }
+            if super::envelope::news_flash_evidence_sha256(&sources) != evidence {
+                return Err(PushRecordError::InvalidFieldValue(
+                    "news_flash_evidence_sha256".into(),
+                ));
+            }
+            let transaction_stage = env
+                .payload
+                .get("news_flash_transaction_stage")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            let (
+                business_date,
+                attempt_ordinal,
+                attempt_observed_at,
+                sink_attempt_identity,
+                sink_attempt_sha256,
+                attempt_envelope_id,
+                remote_receipt,
+                remote_receipt_identity,
+                remote_receipt_sha256,
+                decision_key,
+                terminal_observed_at,
+                terminal_reason_code,
+                transport_evidence_sha256,
+                expected_join,
+            ) = if transaction_stage.is_some() {
+                let business_date = chrono::NaiveDate::parse_from_str(
+                    &required_text("news_flash_business_date")?,
+                    "%Y-%m-%d",
+                )
+                .map_err(|_| {
+                    PushRecordError::InvalidFieldValue("news_flash_business_date".into())
+                })?;
+                let attempt_ordinal = env
+                    .payload
+                    .get("news_flash_attempt_ordinal")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| {
+                        PushRecordError::InvalidFieldValue("news_flash_attempt_ordinal".into())
+                    })?;
+                let decision_key = required_text("news_flash_decision_key")?;
+                let attempt_observed_at = chrono::DateTime::parse_from_rfc3339(&required_text(
+                    "news_flash_attempt_observed_at",
+                )?)
+                .map_err(|_| {
+                    PushRecordError::InvalidFieldValue("news_flash_attempt_observed_at".into())
+                })?;
+                let sink_attempt_identity = required_text("news_flash_sink_attempt_identity")?;
+                let sink_attempt_sha256 = required_text("news_flash_sink_attempt_sha256")?;
+                if !super::envelope::is_lower_hex_sha256(&sink_attempt_identity)
+                    || !super::envelope::is_lower_hex_sha256(&sink_attempt_sha256)
+                    || super::envelope::news_flash_sink_attempt_identity(
+                        &reservation,
+                        attempt_ordinal,
+                        &channel,
+                        &attempt_observed_at,
+                    ) != sink_attempt_identity
+                    || super::envelope::news_flash_sink_attempt_sha256(
+                        &kind,
+                        &decision_key,
+                        business_date,
+                        &reservation,
+                        &evidence,
+                        &render,
+                        &sources,
+                        attempt_ordinal,
+                        &channel,
+                        &attempt_observed_at,
+                        &sink_attempt_identity,
+                    ) != sink_attempt_sha256
+                {
+                    return Err(PushRecordError::InvalidFieldValue(
+                        "news_flash sink attempt binding".into(),
+                    ));
+                }
+                let attempt_envelope_id = env
+                    .payload
+                    .get("news_flash_attempt_envelope_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                let remote_receipt = env
+                    .payload
+                    .get("news_flash_remote_receipt")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|_| {
+                        PushRecordError::InvalidFieldType("news_flash_remote_receipt".into())
+                    })?;
+                let remote_receipt_identity = env
+                    .payload
+                    .get("news_flash_remote_receipt_identity")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                let remote_receipt_sha256 = env
+                    .payload
+                    .get("news_flash_remote_receipt_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                let terminal_observed_at = env
+                    .payload
+                    .get("news_flash_terminal_observed_at")
+                    .and_then(serde_json::Value::as_str)
+                    .map(chrono::DateTime::parse_from_rfc3339)
+                    .transpose()
+                    .map_err(|_| {
+                        PushRecordError::InvalidFieldValue("news_flash_terminal_observed_at".into())
+                    })?;
+                let terminal_reason_code = env
+                    .payload
+                    .get("news_flash_terminal_reason_code")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                let transport_evidence_sha256 = env
+                    .payload
+                    .get("news_flash_transport_evidence_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                let event: super::envelope::PushDeliveryEvent =
+                    serde_json::from_value(env.payload.clone()).map_err(|_| {
+                        PushRecordError::InvalidFieldType("NewsFlash schema-v5 payload".into())
+                    })?;
+                super::envelope::DomainEvent::validate(&event).map_err(|_| {
+                    PushRecordError::InvalidFieldValue("NewsFlash schema-v5 payload".into())
+                })?;
+                let expected_join = super::envelope::news_flash_transaction_join_hash(&event);
+                (
+                    Some(business_date),
+                    Some(attempt_ordinal),
+                    Some(attempt_observed_at),
+                    Some(sink_attempt_identity),
+                    Some(sink_attempt_sha256),
+                    attempt_envelope_id,
+                    remote_receipt,
+                    remote_receipt_identity,
+                    remote_receipt_sha256,
+                    Some(decision_key),
+                    terminal_observed_at,
+                    terminal_reason_code,
+                    transport_evidence_sha256,
+                    expected_join,
+                )
+            } else {
+                (
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    super::envelope::news_flash_delivery_join_hash(
+                        &kind,
+                        &outcome_str,
+                        &channel,
+                        &reservation,
+                        &evidence,
+                        &render,
+                    ),
+                )
+            };
+            if join != expected_join
+                || env.id != join
+                || subject_hash.as_deref() != Some(reservation.as_str())
+            {
+                return Err(PushRecordError::InvalidFieldValue(
+                    "news_flash delivery exact join".into(),
+                ));
+            }
+            (
+                Some(sources),
+                Some(reservation),
+                Some(evidence),
+                Some(render),
+                Some(join),
+                business_date,
+                decision_key,
+                transaction_stage,
+                attempt_ordinal,
+                attempt_observed_at,
+                sink_attempt_identity,
+                sink_attempt_sha256,
+                attempt_envelope_id,
+                remote_receipt,
+                remote_receipt_identity,
+                remote_receipt_sha256,
+                terminal_observed_at,
+                terminal_reason_code,
+                transport_evidence_sha256,
+            )
+        } else {
+            (
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None,
+            )
+        };
+
+        let (
+            news_flash_failure_provider,
+            news_flash_failure_available_provider,
+            news_flash_failure_stage,
+            news_flash_failure_reason,
+            news_flash_failure_diagnostic_code,
+            news_flash_failure_diagnostic,
+            news_flash_failure_observed_at,
+            news_flash_failure_source_record_count,
+            news_flash_failure_batch_id,
+            news_flash_failure_record_id,
+            news_flash_failure_identity_sha256,
+        ) = if audit_schema_version
+            == Some(super::envelope::NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION)
+        {
+            let optional_text = |field: &str| -> Result<Option<String>, PushRecordError> {
+                env.payload
+                    .get(field)
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .filter(|text| !text.trim().is_empty())
+                            .map(str::to_owned)
+                            .ok_or_else(|| PushRecordError::InvalidFieldValue(field.into()))
+                    })
+                    .transpose()
+            };
+            let provider = optional_text("news_flash_failure_provider")?;
+            let available_provider = optional_text("news_flash_failure_available_provider")?;
+            let stage = required_text("news_flash_failure_stage")?;
+            let reason = required_text("news_flash_failure_reason")?;
+            let diagnostic_code = required_text("news_flash_failure_diagnostic_code")?;
+            let diagnostic = required_text("news_flash_failure_diagnostic")?;
+            if diagnostic.len() > 512 || diagnostic.contains('\0') {
+                return Err(PushRecordError::InvalidFieldValue(
+                    "news_flash_failure_diagnostic".into(),
+                ));
+            }
+            let observed_at = chrono::DateTime::parse_from_rfc3339(&required_text(
+                "news_flash_failure_observed_at",
+            )?)
+            .map_err(|_| {
+                PushRecordError::InvalidFieldValue("news_flash_failure_observed_at".into())
+            })?;
+            let source_record_count = env
+                .payload
+                .get("news_flash_failure_source_record_count")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| {
+                    PushRecordError::InvalidFieldType(
+                        "news_flash_failure_source_record_count".into(),
+                    )
+                })?;
+            let batch_id = optional_text("news_flash_failure_batch_id")?;
+            let record_id = optional_text("news_flash_failure_record_id")?;
+            let identity = required_text("news_flash_failure_identity_sha256")?;
+            let expected_identity = super::envelope::news_flash_failure_identity_hash(
+                super::envelope::NewsFlashFailureIdentityFields {
+                    provider: provider.as_deref(),
+                    available_provider: available_provider.as_deref(),
+                    stage: &stage,
+                    reason_code: &reason,
+                    diagnostic_code: &diagnostic_code,
+                    diagnostic: &diagnostic,
+                    retryable: retryable
+                        .ok_or_else(|| PushRecordError::MissingField("retryable".into()))?,
+                    observed_at: &observed_at,
+                    source_record_count,
+                    batch_id: batch_id.as_deref(),
+                    record_id: record_id.as_deref(),
+                },
+            );
+            if identity != expected_identity
+                || subject_hash.as_deref() != Some(identity.as_str())
+                || reason_code.as_deref() != Some(reason.as_str())
+            {
+                return Err(PushRecordError::InvalidFieldValue(
+                    "news_flash failure exact identity".into(),
+                ));
+            }
+            (
+                provider,
+                available_provider,
+                Some(stage),
+                Some(reason),
+                Some(diagnostic_code),
+                Some(diagnostic),
+                Some(observed_at),
+                Some(source_record_count),
+                batch_id,
+                record_id,
+                Some(identity),
+            )
+        } else {
+            (
+                None, None, None, None, None, None, None, None, None, None, None,
+            )
+        };
+
         Ok(PushRecord {
             id,
             kind,
@@ -554,6 +1147,36 @@ impl PushRecord {
             source_business_date,
             source_batch_id,
             source_content_sha256,
+            news_flash_sources,
+            news_flash_reservation_sha256,
+            news_flash_evidence_sha256,
+            news_flash_render_sha256,
+            news_flash_join_sha256,
+            news_flash_business_date,
+            news_flash_decision_key,
+            news_flash_transaction_stage,
+            news_flash_attempt_ordinal,
+            news_flash_attempt_observed_at,
+            news_flash_sink_attempt_identity,
+            news_flash_sink_attempt_sha256,
+            news_flash_attempt_envelope_id,
+            news_flash_remote_receipt,
+            news_flash_remote_receipt_identity,
+            news_flash_remote_receipt_sha256,
+            news_flash_terminal_observed_at,
+            news_flash_terminal_reason_code,
+            news_flash_transport_evidence_sha256,
+            news_flash_failure_provider,
+            news_flash_failure_available_provider,
+            news_flash_failure_stage,
+            news_flash_failure_reason,
+            news_flash_failure_diagnostic_code,
+            news_flash_failure_diagnostic,
+            news_flash_failure_observed_at,
+            news_flash_failure_source_record_count,
+            news_flash_failure_batch_id,
+            news_flash_failure_record_id,
+            news_flash_failure_identity_sha256,
         })
     }
 
@@ -569,10 +1192,12 @@ impl PushRecord {
                 super::envelope::DELIVERY_AUDIT_SCHEMA_VERSION
                     | super::envelope::COUNTED_DELIVERY_AUDIT_SCHEMA_VERSION
                     | super::envelope::SOURCE_BATCH_DELIVERY_AUDIT_SCHEMA_VERSION
+                    | super::envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION
+                    | super::envelope::NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION
             )
         ) {
             return Err(PushRecordError::InvalidFieldValue(
-                "authoritative delivery audit requires schema v2, v3 or v4".into(),
+                "authoritative delivery audit requires schema v2, v3, v4, v5 or v6".into(),
             ));
         }
         Ok(record)
@@ -1090,5 +1715,185 @@ mod tests {
         assert_eq!(env.event_type, "push.source");
         assert_eq!(env.payload["kind"], "Announcement");
         assert_eq!(env.payload["code"], "TEST_CODE_600519");
+    }
+
+    #[test]
+    fn br244_news_flash_audit_revalidates_ordered_sources_and_exact_join() {
+        let published_at =
+            chrono::DateTime::parse_from_rfc3339("2026-08-18T09:30:00+08:00").unwrap();
+        let observed_at =
+            chrono::DateTime::parse_from_rfc3339("2026-08-18T09:30:01+08:00").unwrap();
+        let sources = vec![
+            crate::event::NewsFlashAuditSource {
+                event_id: "TEST_CODE_EVENT_A".to_owned(),
+                provider: "Eastmoney".to_owned(),
+                source: "eastmoney-web".to_owned(),
+                published_at,
+                observed_at,
+                batch_id: "TEST_CODE_BATCH_A".to_owned(),
+            },
+            crate::event::NewsFlashAuditSource {
+                event_id: "TEST_CODE_EVENT_B".to_owned(),
+                provider: "Jin10".to_owned(),
+                source: "jin10-flash-v1".to_owned(),
+                published_at,
+                observed_at,
+                batch_id: "TEST_CODE_BATCH_B".to_owned(),
+            },
+        ];
+        let evidence = crate::event::envelope::news_flash_evidence_sha256(&sources);
+        let event = crate::event::PushDeliveryEvent::new_news_flash(
+            "news_flash_aggregated_v1".to_owned(),
+            "Pushed".to_owned(),
+            "dry_run".to_owned(),
+            88,
+            3,
+            "a".repeat(64),
+            sources,
+            evidence,
+            "b".repeat(64),
+        );
+        let event_id = event.news_flash_join_sha256.clone().unwrap();
+        let mut envelope = EventEnvelope::from_event(
+            &event,
+            event_id,
+            "TEST_CODE_NEWS_FLASH_TRACE".to_owned(),
+            chrono::Local::now(),
+        )
+        .unwrap();
+        let record = PushRecord::try_from_authoritative(&envelope).unwrap();
+        assert_eq!(record.audit_schema_version, Some(5));
+        assert_eq!(record.news_flash_sources.as_ref().unwrap().len(), 2);
+
+        envelope.payload["news_flash_sources"]
+            .as_array_mut()
+            .unwrap()
+            .swap(0, 1);
+        assert!(matches!(
+            PushRecord::try_from_authoritative(&envelope),
+            Err(PushRecordError::InvalidFieldValue(field))
+                if field == "news_flash_evidence_sha256"
+        ));
+    }
+
+    #[test]
+    fn br244_news_flash_sink_attempt_round_trips_closed_authority() {
+        let published_at =
+            chrono::DateTime::parse_from_rfc3339("2026-08-18T09:30:00+08:00").unwrap();
+        let observed_at =
+            chrono::DateTime::parse_from_rfc3339("2026-08-18T09:30:01+08:00").unwrap();
+        let sources = vec![crate::event::NewsFlashAuditSource {
+            event_id: "TEST_CODE_EVENT_ATTEMPT".to_owned(),
+            provider: "Eastmoney".to_owned(),
+            source: "eastmoney-web".to_owned(),
+            published_at,
+            observed_at,
+            batch_id: "TEST_CODE_BATCH_ATTEMPT".to_owned(),
+        }];
+        let evidence = crate::event::envelope::news_flash_evidence_sha256(&sources);
+        let event = crate::event::PushDeliveryEvent::new_news_flash_attempt(
+            "news_flash_aggregated_v1".to_owned(),
+            "TEST_CODE_WINDOW_20260818T093000".to_owned(),
+            "TEST_CODE_DRY_RUN".to_owned(),
+            91,
+            chrono::NaiveDate::from_ymd_opt(2026, 8, 18).unwrap(),
+            "a".repeat(64),
+            sources,
+            evidence,
+            "b".repeat(64),
+            1,
+            observed_at,
+        );
+        let event_id = event.news_flash_join_sha256.clone().unwrap();
+        let envelope = EventEnvelope::from_event(
+            &event,
+            event_id.clone(),
+            "TEST_CODE_NEWS_FLASH_ATTEMPT_TRACE".to_owned(),
+            chrono::Local::now(),
+        )
+        .unwrap();
+        let record = PushRecord::try_from_authoritative(&envelope).unwrap();
+
+        assert_eq!(record.id, event_id);
+        assert_eq!(record.outcome, PushOutcomeLabel::Attempted);
+        assert_eq!(
+            record.news_flash_business_date,
+            chrono::NaiveDate::from_ymd_opt(2026, 8, 18)
+        );
+        assert_eq!(
+            record.news_flash_transaction_stage.as_deref(),
+            Some("SinkAttempt")
+        );
+        assert_eq!(record.news_flash_attempt_ordinal, Some(1));
+        assert_eq!(
+            record.news_flash_decision_key.as_deref(),
+            Some("TEST_CODE_WINDOW_20260818T093000")
+        );
+        assert_eq!(record.news_flash_attempt_observed_at, Some(observed_at));
+        assert!(record
+            .news_flash_sink_attempt_identity
+            .as_deref()
+            .is_some_and(crate::event::envelope::is_lower_hex_sha256));
+        assert!(record
+            .news_flash_sink_attempt_sha256
+            .as_deref()
+            .is_some_and(crate::event::envelope::is_lower_hex_sha256));
+        assert!(record.news_flash_attempt_envelope_id.is_none());
+        assert!(record.news_flash_remote_receipt.is_none());
+    }
+
+    #[test]
+    fn br244_news_flash_failure_audit_binds_required_fields() {
+        let observed_at =
+            chrono::DateTime::parse_from_rfc3339("2026-08-18T09:30:01+08:00").unwrap();
+        let event = crate::event::PushDeliveryEvent::new_news_flash_failure(
+            Some("Jin10".to_owned()),
+            Some("Eastmoney".to_owned()),
+            "global_news_gateway".to_owned(),
+            "no_verified_batch".to_owned(),
+            "TEST_CODE_NO_BATCH".to_owned(),
+            "TEST_CODE provider returned no verified batch".to_owned(),
+            true,
+            observed_at,
+            0,
+            None,
+            None,
+        );
+        let mut envelope = EventEnvelope::from_event(
+            &event,
+            "TEST_CODE_NEWS_FLASH_FAILURE".to_owned(),
+            "TEST_CODE_NEWS_FLASH_TRACE".to_owned(),
+            chrono::Local::now(),
+        )
+        .unwrap();
+        let record = PushRecord::try_from_authoritative(&envelope).unwrap();
+        assert_eq!(record.audit_schema_version, Some(6));
+        assert_eq!(record.news_flash_failure_provider.as_deref(), Some("Jin10"));
+        assert_eq!(
+            record.news_flash_failure_available_provider.as_deref(),
+            Some("Eastmoney")
+        );
+        assert_eq!(
+            record.news_flash_failure_diagnostic_code.as_deref(),
+            Some("TEST_CODE_NO_BATCH")
+        );
+        assert_eq!(record.news_flash_failure_source_record_count, Some(0));
+        assert_eq!(record.retryable, Some(true));
+
+        let mut available_provider_tamper = envelope.clone();
+        available_provider_tamper.payload["news_flash_failure_available_provider"] =
+            serde_json::json!("Tencent");
+        assert!(matches!(
+            PushRecord::try_from_authoritative(&available_provider_tamper),
+            Err(PushRecordError::InvalidFieldValue(field))
+                if field == "news_flash failure exact identity"
+        ));
+
+        envelope.payload["retryable"] = serde_json::json!(false);
+        assert!(matches!(
+            PushRecord::try_from_authoritative(&envelope),
+            Err(PushRecordError::InvalidFieldValue(field))
+                if field == "news_flash failure exact identity"
+        ));
     }
 }

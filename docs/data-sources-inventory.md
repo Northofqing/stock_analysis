@@ -11,13 +11,13 @@
 
 | 数据类别 | 具体内容 | 数据源/端点 | 提供方 | 关键代码位置 | 频率/触发 | 用途 |
 |---|---|---|---|---|---|---|
-| 实时报价 | 最新价/昨收/涨跌幅等 | Magic TDX (TCP) → Magic Tencent (HTTP) → Magic Sina (HTTP) 三级路由 | magic-tdx-rs / magic-tencent-rs / magic-sina-rs | `src/data_gateway/market_data.rs` (CAPABILITY: RealtimeMarketQuotes) | 消费者调用即拉取; 5 秒新鲜度门 (BR-218) | 盘中实时价格、执行报价 |
+| 实时报价 | 最新价/昨收/涨跌幅等 | Magic TDX (TCP) → Magic Tencent (HTTP) → Magic Sina (HTTP) 三级路由 | magic-tdx-rs / magic-tencent-rs / magic-sina-rs | `src/data_gateway/market_data.rs` (CAPABILITY: RealtimeMarketQuotes) | 消费者调用即拉取；逐条严格 `0..=5s` 新鲜度门 (BR-218)，未来/超龄即使在午休或盘后也显式拒绝；盘后收盘价仅走独立 `SettledClose` 合同 | 盘中实时价格、执行报价 |
 | 五档盘口 | 买卖各五档价量 | TDX → Tencent → Sina 三级路由 | 同上 | `src/data_gateway/market_capabilities.rs:47` (ORDER_BOOK_PROVIDER_ORDER); `magic_tdx_t0.rs:44` (T0BookLevel 做T专用) | 消费者按需 | 盘口深度分析、做T |
 | 分时/分钟均价 | 每分钟 price/cumulative_quantity/avg | TDX → Tencent → Sina 三级路由 | 同上 | `src/data_gateway/market_capabilities.rs:41` (MINUTE_PROVIDER_ORDER) | 消费者按需 | 分时走势 |
 | 5 分钟 K 线 | at/open/high/low/close/volume/amount | Magic TDX (TdxHqClient, TCP; `cached_tdx_hq_client` 进程级复用) | magic-tdx-rs (KLINE_5MIN) | `src/data_gateway/magic_tdx_t0.rs:13,985` | 做T 扫描每 30s tick | T0 做T 证据链、日内形态 |
 | 日 K 线 | 20+ 根日线 | Magic TDX → Tencent → Sina → Baidu 四级路由 (BR-092 跨股票一致性准入) | 四家 magic crates | `src/data_gateway/historical_bars.rs:5,48` (HistoricalDailyBars) | 消费者按需; 批量请求 | 趋势分析、指标、盘后选股 |
 | Outcome 日 K 线 (选股专用) | 已验证 due binding 的证据前像 | **Magic TDX ONLY, 无路由无回退** | magic-tdx-rs (tdx-smart) | `src/data_gateway/outcome_daily_bars.rs:44` (OutcomeDailyBarsV2) | BR-174 盘后选股流程 | Schema-v2 正式选股 |
-| 做T 证据链 | quote+五档+日K(20)+5分钟K+source_time+内容哈希+BR-231 价格缓存 | Magic TDX (TdxHqClient TCP; ALL_KNOWN_SERVERS/PRIMARY_SERVERS, connect_to_any 5s 超时) | magic-tdx-rs | `src/data_gateway/magic_tdx_t0.rs:991` (fetch_magic_tdx_t0_batch_with_clock), `:967-989` (cached client) | 盘中 30s tick 批量 | 反向 T 观察计划 (BR-153) |
+| 做T 证据链 | quote+五档+日K(20)+5分钟K+source_time+内容哈希+BR-231 已准入证据诊断缓存 | Magic TDX (TdxHqClient TCP; ALL_KNOWN_SERVERS/PRIMARY_SERVERS, connect_to_any 5s 超时) | magic-tdx-rs | `src/data_gateway/magic_tdx_t0.rs::fetch_magic_tdx_t0_batch_with_clock`, `src/data_gateway/magic_tdx_t0.rs::validate_quote_freshness` | 盘中 30s tick 批量；quote 逐票与批次完成均严格 `0..=5s`，未来/过期显式拒绝 | 反向 T 观察计划 (BR-153)；缓存仅诊断/重放检测，不放宽新鲜度 |
 
 ## 二、新闻类
 

@@ -12,16 +12,36 @@ use thiserror::Error;
 pub const DELIVERY_AUDIT_SCHEMA_VERSION: u32 = 2;
 pub const COUNTED_DELIVERY_AUDIT_SCHEMA_VERSION: u32 = 3;
 pub const SOURCE_BATCH_DELIVERY_AUDIT_SCHEMA_VERSION: u32 = 4;
+pub const NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION: u32 = 5;
+pub const NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION: u32 = 6;
 pub const DELIVERY_SUBJECT_HASH_DOMAIN: &str = "stock_analysis.delivery_subject.v2";
 pub const DELIVERY_IDENTITY_HASH_DOMAIN: &str = "stock_analysis.delivery_identity.v2";
 pub const COUNTED_DELIVERY_JOIN_HASH_DOMAIN: &str = "stock_analysis.counted_delivery_join.v1";
 pub const SOURCE_BATCH_DELIVERY_SUBJECT_HASH_DOMAIN: &str =
     "stock_analysis.source_batch_delivery_subject.v1";
+pub const NEWS_FLASH_EVIDENCE_HASH_DOMAIN: &str =
+    "stock_analysis.news_flash_ordered_source_evidence.v1";
+pub const NEWS_FLASH_DELIVERY_JOIN_HASH_DOMAIN: &str = "stock_analysis.news_flash_delivery_join.v1";
+pub const NEWS_FLASH_TRANSACTION_JOIN_HASH_DOMAIN: &str =
+    "stock_analysis.news_flash_transaction_join.v2";
+pub const NEWS_FLASH_SINK_ATTEMPT_IDENTITY_HASH_DOMAIN: &str =
+    "stock_analysis.news_flash_sink_attempt_identity.v1";
+pub const NEWS_FLASH_SINK_ATTEMPT_HASH_DOMAIN: &str = "stock_analysis.news_flash_sink_attempt.v1";
+pub const NEWS_FLASH_REMOTE_RECEIPT_IDENTITY_HASH_DOMAIN: &str =
+    "stock_analysis.news_flash_remote_receipt_identity.v1";
+pub const NEWS_FLASH_REMOTE_RECEIPT_HASH_DOMAIN: &str =
+    "stock_analysis.news_flash_remote_receipt.v1";
+pub const NEWS_FLASH_FAILURE_IDENTITY_HASH_DOMAIN: &str = "stock_analysis.news_flash_failure.v3";
 pub const DELIVERY_AUDIT_RULE_IDS: [&str; 5] = ["2.7", "BR-091", "BR-111", "BR-130", "BR-142"];
 pub const COUNTED_DELIVERY_AUDIT_RULE_IDS: [&str; 6] =
     ["2.7", "BR-091", "BR-111", "BR-130", "BR-142", "BR-192"];
 pub const SOURCE_BATCH_DELIVERY_AUDIT_RULE_IDS: [&str; 6] =
     ["2.7", "BR-091", "BR-111", "BR-130", "BR-142", "BR-160"];
+pub const NEWS_FLASH_DELIVERY_AUDIT_RULE_IDS: [&str; 7] = [
+    "2.7", "BR-082", "BR-091", "BR-111", "BR-130", "BR-142", "BR-244",
+];
+pub const NEWS_FLASH_FAILURE_AUDIT_RULE_IDS: [&str; 5] =
+    ["2.2", "2.7", "BR-091", "BR-142", "BR-244"];
 
 // ========================================================================
 // DomainEvent trait
@@ -151,6 +171,60 @@ impl EventEnvelope {
 // PushDeliveryEvent
 // ========================================================================
 
+/// One canonical provider record in the exact NewsFlash display order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NewsFlashAuditSource {
+    pub event_id: String,
+    pub provider: String,
+    pub source: String,
+    pub published_at: chrono::DateTime<chrono::FixedOffset>,
+    pub observed_at: chrono::DateTime<chrono::FixedOffset>,
+    pub batch_id: String,
+}
+
+/// Receipt fields returned by the physical transport. A NewsFlash Accepted
+/// audit stores the typed values so its identity/hash can be revalidated
+/// independently instead of trusting a boolean or an opaque log line.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NewsFlashRemoteReceipt {
+    pub channel: String,
+    pub provider: String,
+    pub message_id: String,
+    pub platform_message_id: String,
+    pub accepted_at: chrono::DateTime<chrono::FixedOffset>,
+    pub latency_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewsFlashTransactionStage {
+    SinkAttempt,
+    Accepted,
+    DefinitivelyRejected,
+    Uncertain,
+}
+
+impl NewsFlashTransactionStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SinkAttempt => "SinkAttempt",
+            Self::Accepted => "Accepted",
+            Self::DefinitivelyRejected => "DefinitivelyRejected",
+            Self::Uncertain => "Uncertain",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "SinkAttempt" => Self::SinkAttempt,
+            "Accepted" => Self::Accepted,
+            "DefinitivelyRejected" => Self::DefinitivelyRejected,
+            "Uncertain" => Self::Uncertain,
+            _ => return None,
+        })
+    }
+}
+
 /// A domain event representing a push delivery attempt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PushDeliveryEvent {
@@ -189,6 +263,66 @@ pub struct PushDeliveryEvent {
     pub source_batch_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_content_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_sources: Option<Vec<NewsFlashAuditSource>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_reservation_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_evidence_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_render_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_join_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_business_date: Option<chrono::NaiveDate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_decision_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_transaction_stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_attempt_ordinal: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_attempt_observed_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_sink_attempt_identity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_sink_attempt_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_attempt_envelope_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_remote_receipt: Option<NewsFlashRemoteReceipt>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_remote_receipt_identity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_remote_receipt_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_terminal_observed_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_terminal_reason_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_transport_evidence_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_failure_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_failure_available_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_failure_stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_failure_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_failure_diagnostic_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_failure_diagnostic: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_failure_observed_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_failure_source_record_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_failure_batch_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_failure_record_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_flash_failure_identity_sha256: Option<String>,
 }
 
 impl PushDeliveryEvent {
@@ -232,6 +366,36 @@ impl PushDeliveryEvent {
             source_business_date: None,
             source_batch_id: None,
             source_content_sha256: None,
+            news_flash_sources: None,
+            news_flash_reservation_sha256: None,
+            news_flash_evidence_sha256: None,
+            news_flash_render_sha256: None,
+            news_flash_join_sha256: None,
+            news_flash_business_date: None,
+            news_flash_decision_key: None,
+            news_flash_transaction_stage: None,
+            news_flash_attempt_ordinal: None,
+            news_flash_attempt_observed_at: None,
+            news_flash_sink_attempt_identity: None,
+            news_flash_sink_attempt_sha256: None,
+            news_flash_attempt_envelope_id: None,
+            news_flash_remote_receipt: None,
+            news_flash_remote_receipt_identity: None,
+            news_flash_remote_receipt_sha256: None,
+            news_flash_terminal_observed_at: None,
+            news_flash_terminal_reason_code: None,
+            news_flash_transport_evidence_sha256: None,
+            news_flash_failure_provider: None,
+            news_flash_failure_available_provider: None,
+            news_flash_failure_stage: None,
+            news_flash_failure_reason: None,
+            news_flash_failure_diagnostic_code: None,
+            news_flash_failure_diagnostic: None,
+            news_flash_failure_observed_at: None,
+            news_flash_failure_source_record_count: None,
+            news_flash_failure_batch_id: None,
+            news_flash_failure_record_id: None,
+            news_flash_failure_identity_sha256: None,
         }
     }
 
@@ -323,6 +487,219 @@ impl PushDeliveryEvent {
             delivery_identity_hash_from_subject(&event.kind, &event.subject_hash, &event.channel);
         event
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_news_flash(
+        kind: String,
+        outcome: String,
+        channel: String,
+        rendered_len: usize,
+        latency_ms: u64,
+        reservation_sha256: String,
+        sources: Vec<NewsFlashAuditSource>,
+        evidence_sha256: String,
+        render_sha256: String,
+    ) -> Self {
+        let mut event = Self::new(kind, None, outcome, channel, rendered_len, latency_ms);
+        event.audit_schema_version = NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION;
+        event.rule_ids = NEWS_FLASH_DELIVERY_AUDIT_RULE_IDS
+            .iter()
+            .map(|rule| (*rule).to_owned())
+            .collect();
+        event.subject_hash = reservation_sha256.clone();
+        event.identity_hash =
+            delivery_identity_hash_from_subject(&event.kind, &event.subject_hash, &event.channel);
+        event.news_flash_join_sha256 = Some(news_flash_delivery_join_hash(
+            &event.kind,
+            &event.outcome,
+            &event.channel,
+            &reservation_sha256,
+            &evidence_sha256,
+            &render_sha256,
+        ));
+        event.news_flash_reservation_sha256 = Some(reservation_sha256);
+        event.news_flash_sources = Some(sources);
+        event.news_flash_evidence_sha256 = Some(evidence_sha256);
+        event.news_flash_render_sha256 = Some(render_sha256);
+        event
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_news_flash_attempt(
+        kind: String,
+        decision_key: String,
+        channel: String,
+        rendered_len: usize,
+        business_date: chrono::NaiveDate,
+        reservation_sha256: String,
+        sources: Vec<NewsFlashAuditSource>,
+        evidence_sha256: String,
+        render_sha256: String,
+        attempt_ordinal: u32,
+        attempt_observed_at: chrono::DateTime<chrono::FixedOffset>,
+    ) -> Self {
+        let attempt_identity = news_flash_sink_attempt_identity(
+            &reservation_sha256,
+            attempt_ordinal,
+            &channel,
+            &attempt_observed_at,
+        );
+        let attempt_sha256 = news_flash_sink_attempt_sha256(
+            &kind,
+            &decision_key,
+            business_date,
+            &reservation_sha256,
+            &evidence_sha256,
+            &render_sha256,
+            &sources,
+            attempt_ordinal,
+            &channel,
+            &attempt_observed_at,
+            &attempt_identity,
+        );
+        let mut event = Self::new_news_flash(
+            kind,
+            "Attempted".to_owned(),
+            channel,
+            rendered_len,
+            0,
+            reservation_sha256,
+            sources,
+            evidence_sha256,
+            render_sha256,
+        );
+        event.news_flash_business_date = Some(business_date);
+        event.news_flash_decision_key = Some(decision_key);
+        event.news_flash_transaction_stage =
+            Some(NewsFlashTransactionStage::SinkAttempt.as_str().to_owned());
+        event.news_flash_attempt_ordinal = Some(attempt_ordinal);
+        event.news_flash_attempt_observed_at = Some(attempt_observed_at);
+        event.news_flash_sink_attempt_identity = Some(attempt_identity);
+        event.news_flash_sink_attempt_sha256 = Some(attempt_sha256);
+        event.news_flash_join_sha256 = Some(news_flash_transaction_join_hash(&event));
+        event
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_news_flash_terminal(
+        stage: NewsFlashTransactionStage,
+        kind: String,
+        decision_key: String,
+        channel: String,
+        rendered_len: usize,
+        latency_ms: u64,
+        business_date: chrono::NaiveDate,
+        reservation_sha256: String,
+        sources: Vec<NewsFlashAuditSource>,
+        evidence_sha256: String,
+        render_sha256: String,
+        attempt_ordinal: u32,
+        attempt_observed_at: chrono::DateTime<chrono::FixedOffset>,
+        sink_attempt_identity: String,
+        sink_attempt_sha256: String,
+        attempt_envelope_id: String,
+        remote_receipt: Option<NewsFlashRemoteReceipt>,
+        terminal_observed_at: chrono::DateTime<chrono::FixedOffset>,
+        terminal_reason_code: Option<String>,
+        transport_evidence_sha256: Option<String>,
+    ) -> Self {
+        let outcome = match stage {
+            NewsFlashTransactionStage::Accepted => "Pushed",
+            NewsFlashTransactionStage::DefinitivelyRejected => "SinkError",
+            NewsFlashTransactionStage::Uncertain => "Uncertain",
+            NewsFlashTransactionStage::SinkAttempt => "Attempted",
+        };
+        let mut event = Self::new_news_flash(
+            kind,
+            outcome.to_owned(),
+            channel,
+            rendered_len,
+            latency_ms,
+            reservation_sha256,
+            sources,
+            evidence_sha256,
+            render_sha256,
+        );
+        event.news_flash_business_date = Some(business_date);
+        event.news_flash_decision_key = Some(decision_key);
+        event.news_flash_transaction_stage = Some(stage.as_str().to_owned());
+        event.news_flash_attempt_ordinal = Some(attempt_ordinal);
+        event.news_flash_attempt_observed_at = Some(attempt_observed_at);
+        event.news_flash_sink_attempt_identity = Some(sink_attempt_identity);
+        event.news_flash_sink_attempt_sha256 = Some(sink_attempt_sha256);
+        event.news_flash_attempt_envelope_id = Some(attempt_envelope_id);
+        event.news_flash_terminal_observed_at = Some(terminal_observed_at);
+        event.news_flash_terminal_reason_code = terminal_reason_code;
+        event.news_flash_transport_evidence_sha256 = transport_evidence_sha256;
+        if let Some(receipt) = remote_receipt {
+            event.news_flash_remote_receipt_identity =
+                Some(news_flash_remote_receipt_identity(&receipt));
+            event.news_flash_remote_receipt_sha256 =
+                Some(news_flash_remote_receipt_sha256(&receipt));
+            event.news_flash_remote_receipt = Some(receipt);
+        }
+        event.news_flash_join_sha256 = Some(news_flash_transaction_join_hash(&event));
+        event
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_news_flash_failure(
+        provider: Option<String>,
+        available_provider: Option<String>,
+        stage: String,
+        reason_code: String,
+        diagnostic_code: String,
+        diagnostic: String,
+        retryable: bool,
+        observed_at: chrono::DateTime<chrono::FixedOffset>,
+        source_record_count: u32,
+        batch_id: Option<String>,
+        record_id: Option<String>,
+    ) -> Self {
+        let mut event = Self::new(
+            "news_flash_source_failure_v1".to_owned(),
+            None,
+            "Failed".to_owned(),
+            "none".to_owned(),
+            0,
+            0,
+        );
+        event.audit_schema_version = NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION;
+        event.rule_ids = NEWS_FLASH_FAILURE_AUDIT_RULE_IDS
+            .iter()
+            .map(|rule| (*rule).to_owned())
+            .collect();
+        event.retryable = retryable;
+        let identity_sha256 = news_flash_failure_identity_hash(NewsFlashFailureIdentityFields {
+            provider: provider.as_deref(),
+            available_provider: available_provider.as_deref(),
+            stage: &stage,
+            reason_code: &reason_code,
+            diagnostic_code: &diagnostic_code,
+            diagnostic: &diagnostic,
+            retryable,
+            observed_at: &observed_at,
+            source_record_count,
+            batch_id: batch_id.as_deref(),
+            record_id: record_id.as_deref(),
+        });
+        event.reason_code = reason_code.clone();
+        event.subject_hash = identity_sha256.clone();
+        event.identity_hash =
+            delivery_identity_hash_from_subject(&event.kind, &event.subject_hash, &event.channel);
+        event.news_flash_failure_provider = provider;
+        event.news_flash_failure_available_provider = available_provider;
+        event.news_flash_failure_stage = Some(stage);
+        event.news_flash_failure_reason = Some(reason_code);
+        event.news_flash_failure_diagnostic_code = Some(diagnostic_code);
+        event.news_flash_failure_diagnostic = Some(diagnostic);
+        event.news_flash_failure_observed_at = Some(observed_at);
+        event.news_flash_failure_source_record_count = Some(source_record_count);
+        event.news_flash_failure_batch_id = batch_id;
+        event.news_flash_failure_record_id = record_id;
+        event.news_flash_failure_identity_sha256 = Some(identity_sha256);
+        event
+    }
 }
 
 impl DomainEvent for PushDeliveryEvent {
@@ -349,9 +726,17 @@ impl DomainEvent for PushDeliveryEvent {
         if self.outcome.trim().is_empty() {
             return Err(EnvelopeError::BlankDeliveryOutcome);
         }
-        let Some((expected_reason, expected_retryable)) = delivery_outcome_metadata(&self.outcome)
-        else {
-            return Err(EnvelopeError::InvalidDeliveryOutcome(self.outcome.clone()));
+        let failure_schema = self.audit_schema_version == NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION;
+        let expected_outcome = if failure_schema {
+            if self.outcome != "Failed" {
+                return Err(EnvelopeError::InvalidDeliveryOutcome(self.outcome.clone()));
+            }
+            None
+        } else {
+            Some(
+                delivery_outcome_metadata(&self.outcome)
+                    .ok_or_else(|| EnvelopeError::InvalidDeliveryOutcome(self.outcome.clone()))?,
+            )
         };
         if self.channel.trim().is_empty() {
             return Err(EnvelopeError::BlankDeliveryChannel);
@@ -366,6 +751,8 @@ impl DomainEvent for PushDeliveryEvent {
             DELIVERY_AUDIT_SCHEMA_VERSION
                 | COUNTED_DELIVERY_AUDIT_SCHEMA_VERSION
                 | SOURCE_BATCH_DELIVERY_AUDIT_SCHEMA_VERSION
+                | NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION
+                | NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION
         ) {
             return Err(EnvelopeError::InvalidDeliveryAuditField(
                 "audit_schema_version".into(),
@@ -376,19 +763,25 @@ impl DomainEvent for PushDeliveryEvent {
                 "decision_status".into(),
             ));
         }
-        if self.retryable != expected_retryable {
-            return Err(EnvelopeError::InvalidDeliveryAuditField("retryable".into()));
-        }
-        if self.reason_code != expected_reason {
-            return Err(EnvelopeError::InvalidDeliveryAuditField(
-                "reason_code".into(),
-            ));
+        if let Some((expected_reason, expected_retryable)) = expected_outcome {
+            if self.retryable != expected_retryable {
+                return Err(EnvelopeError::InvalidDeliveryAuditField("retryable".into()));
+            }
+            if self.reason_code != expected_reason {
+                return Err(EnvelopeError::InvalidDeliveryAuditField(
+                    "reason_code".into(),
+                ));
+            }
         }
         let expected_rules = match self.audit_schema_version {
             COUNTED_DELIVERY_AUDIT_SCHEMA_VERSION => COUNTED_DELIVERY_AUDIT_RULE_IDS.as_slice(),
             SOURCE_BATCH_DELIVERY_AUDIT_SCHEMA_VERSION => {
                 SOURCE_BATCH_DELIVERY_AUDIT_RULE_IDS.as_slice()
             }
+            NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION => {
+                NEWS_FLASH_DELIVERY_AUDIT_RULE_IDS.as_slice()
+            }
+            NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION => NEWS_FLASH_FAILURE_AUDIT_RULE_IDS.as_slice(),
             DELIVERY_AUDIT_SCHEMA_VERSION => DELIVERY_AUDIT_RULE_IDS.as_slice(),
             _ => unreachable!("schema version checked above"),
         }
@@ -426,6 +819,23 @@ impl DomainEvent for PushDeliveryEvent {
         let source_batch_fields = [
             self.source_batch_id.as_deref(),
             self.source_content_sha256.as_deref(),
+        ];
+        let news_flash_delivery_fields = [
+            self.news_flash_reservation_sha256.as_deref(),
+            self.news_flash_evidence_sha256.as_deref(),
+            self.news_flash_render_sha256.as_deref(),
+            self.news_flash_join_sha256.as_deref(),
+        ];
+        let news_flash_failure_fields = [
+            self.news_flash_failure_provider.as_deref(),
+            self.news_flash_failure_available_provider.as_deref(),
+            self.news_flash_failure_stage.as_deref(),
+            self.news_flash_failure_reason.as_deref(),
+            self.news_flash_failure_diagnostic_code.as_deref(),
+            self.news_flash_failure_diagnostic.as_deref(),
+            self.news_flash_failure_batch_id.as_deref(),
+            self.news_flash_failure_record_id.as_deref(),
+            self.news_flash_failure_identity_sha256.as_deref(),
         ];
         if self.audit_schema_version == COUNTED_DELIVERY_AUDIT_SCHEMA_VERSION {
             let durable_push_kind = self
@@ -543,12 +953,185 @@ impl DomainEvent for PushDeliveryEvent {
                 "non-source-batch audit must not contain source batch lineage".into(),
             ));
         }
+        if self.audit_schema_version == NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION {
+            let sources = self
+                .news_flash_sources
+                .as_deref()
+                .filter(|sources| !sources.is_empty() && sources.len() <= 3)
+                .ok_or_else(|| {
+                    EnvelopeError::InvalidDeliveryAuditField("news_flash_sources".into())
+                })?;
+            validate_news_flash_sources(sources)?;
+            if news_flash_delivery_fields
+                .iter()
+                .any(|value| value.is_none_or(|value| !is_lower_hex_sha256(value)))
+            {
+                return Err(EnvelopeError::InvalidDeliveryAuditField(
+                    "news_flash delivery hashes".into(),
+                ));
+            }
+            let reservation = self
+                .news_flash_reservation_sha256
+                .as_deref()
+                .expect("NewsFlash hashes checked");
+            let evidence = self
+                .news_flash_evidence_sha256
+                .as_deref()
+                .expect("NewsFlash hashes checked");
+            let render = self
+                .news_flash_render_sha256
+                .as_deref()
+                .expect("NewsFlash hashes checked");
+            if news_flash_evidence_sha256(sources) != evidence {
+                return Err(EnvelopeError::InvalidDeliveryAuditField(
+                    "news_flash_evidence_sha256".into(),
+                ));
+            }
+            let expected_join = if self.news_flash_transaction_stage.is_some() {
+                validate_news_flash_transaction(self, sources)?;
+                news_flash_transaction_join_hash(self)
+            } else {
+                news_flash_delivery_join_hash(
+                    &self.kind,
+                    &self.outcome,
+                    &self.channel,
+                    reservation,
+                    evidence,
+                    render,
+                )
+            };
+            if self.news_flash_join_sha256.as_deref() != Some(expected_join.as_str())
+                || self.subject_hash != reservation
+            {
+                return Err(EnvelopeError::InvalidDeliveryAuditField(
+                    "news_flash delivery join".into(),
+                ));
+            }
+        } else if self.news_flash_sources.is_some()
+            || news_flash_delivery_fields
+                .iter()
+                .any(|value| value.is_some())
+            || self.news_flash_business_date.is_some()
+            || self.news_flash_decision_key.is_some()
+            || self.news_flash_transaction_stage.is_some()
+            || self.news_flash_attempt_ordinal.is_some()
+            || self.news_flash_attempt_observed_at.is_some()
+            || self.news_flash_sink_attempt_identity.is_some()
+            || self.news_flash_sink_attempt_sha256.is_some()
+            || self.news_flash_attempt_envelope_id.is_some()
+            || self.news_flash_remote_receipt.is_some()
+            || self.news_flash_remote_receipt_identity.is_some()
+            || self.news_flash_remote_receipt_sha256.is_some()
+            || self.news_flash_terminal_observed_at.is_some()
+            || self.news_flash_terminal_reason_code.is_some()
+            || self.news_flash_transport_evidence_sha256.is_some()
+        {
+            return Err(EnvelopeError::InvalidDeliveryAuditField(
+                "non-NewsFlash audit contains NewsFlash delivery binding".into(),
+            ));
+        }
+        if self.audit_schema_version == NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION {
+            let required_failure_fields = [
+                self.news_flash_failure_stage.as_deref(),
+                self.news_flash_failure_reason.as_deref(),
+                self.news_flash_failure_diagnostic_code.as_deref(),
+                self.news_flash_failure_diagnostic.as_deref(),
+                self.news_flash_failure_identity_sha256.as_deref(),
+            ];
+            if required_failure_fields
+                .iter()
+                .any(|value| value.is_none_or(|value| value.trim().is_empty()))
+                || self.news_flash_failure_observed_at.is_none()
+                || self.news_flash_failure_source_record_count.is_none()
+            {
+                return Err(EnvelopeError::InvalidDeliveryAuditField(
+                    "news_flash failure fields".into(),
+                ));
+            }
+            for (field, value) in [
+                ("provider", self.news_flash_failure_provider.as_deref()),
+                (
+                    "available_provider",
+                    self.news_flash_failure_available_provider.as_deref(),
+                ),
+                ("batch_id", self.news_flash_failure_batch_id.as_deref()),
+                ("record_id", self.news_flash_failure_record_id.as_deref()),
+            ] {
+                if value.is_some_and(|value| {
+                    value.trim().is_empty() || value.trim() != value || value.contains('\0')
+                }) {
+                    return Err(EnvelopeError::InvalidDeliveryAuditField(format!(
+                        "news_flash_failure_{field}"
+                    )));
+                }
+            }
+            let diagnostic = self
+                .news_flash_failure_diagnostic
+                .as_deref()
+                .expect("failure fields checked");
+            if diagnostic.len() > 512 || diagnostic.contains('\0') {
+                return Err(EnvelopeError::InvalidDeliveryAuditField(
+                    "news_flash_failure_diagnostic".into(),
+                ));
+            }
+            let expected_identity =
+                news_flash_failure_identity_hash(NewsFlashFailureIdentityFields {
+                    provider: self.news_flash_failure_provider.as_deref(),
+                    available_provider: self.news_flash_failure_available_provider.as_deref(),
+                    stage: self
+                        .news_flash_failure_stage
+                        .as_deref()
+                        .expect("failure fields checked"),
+                    reason_code: self
+                        .news_flash_failure_reason
+                        .as_deref()
+                        .expect("failure fields checked"),
+                    diagnostic_code: self
+                        .news_flash_failure_diagnostic_code
+                        .as_deref()
+                        .expect("failure fields checked"),
+                    diagnostic,
+                    retryable: self.retryable,
+                    observed_at: self
+                        .news_flash_failure_observed_at
+                        .as_ref()
+                        .expect("failure fields checked"),
+                    source_record_count: self
+                        .news_flash_failure_source_record_count
+                        .expect("failure fields checked"),
+                    batch_id: self.news_flash_failure_batch_id.as_deref(),
+                    record_id: self.news_flash_failure_record_id.as_deref(),
+                });
+            if self.news_flash_failure_identity_sha256.as_deref()
+                != Some(expected_identity.as_str())
+                || self.subject_hash != expected_identity
+                || self.reason_code
+                    != self
+                        .news_flash_failure_reason
+                        .as_deref()
+                        .expect("failure fields checked")
+            {
+                return Err(EnvelopeError::InvalidDeliveryAuditField(
+                    "news_flash failure identity".into(),
+                ));
+            }
+        } else if self.news_flash_failure_observed_at.is_some()
+            || self.news_flash_failure_source_record_count.is_some()
+            || news_flash_failure_fields
+                .iter()
+                .any(|value| value.is_some())
+        {
+            return Err(EnvelopeError::InvalidDeliveryAuditField(
+                "non-NewsFlash-failure audit contains failure binding".into(),
+            ));
+        }
         Ok(())
     }
 }
 
 pub(crate) fn delivery_outcome_metadata(outcome: &str) -> Option<(&'static str, bool)> {
     Some(match outcome {
+        "Attempted" => ("delivery.attempted", false),
         "Pushed" => ("delivery.confirmed", false),
         "SinkError" => ("delivery.sink_error", true),
         "Failed" => ("delivery.failed", true),
@@ -559,7 +1142,7 @@ pub(crate) fn delivery_outcome_metadata(outcome: &str) -> Option<(&'static str, 
     })
 }
 
-pub(crate) fn is_lower_hex_sha256(value: &str) -> bool {
+pub fn is_lower_hex_sha256(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -639,6 +1222,437 @@ pub(crate) fn source_batch_delivery_subject_hash(
         content_sha256.to_owned(),
     ] {
         hasher.update([0]);
+        hasher.update(value.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn validate_news_flash_sources(sources: &[NewsFlashAuditSource]) -> Result<(), EnvelopeError> {
+    for source in sources {
+        if [
+            source.event_id.as_str(),
+            source.provider.as_str(),
+            source.source.as_str(),
+            source.batch_id.as_str(),
+        ]
+        .iter()
+        .any(|value| value.trim().is_empty() || value.contains('\0'))
+            || source.observed_at < source.published_at
+        {
+            return Err(EnvelopeError::InvalidDeliveryAuditField(
+                "news_flash_sources".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_news_flash_transaction(
+    event: &PushDeliveryEvent,
+    sources: &[NewsFlashAuditSource],
+) -> Result<(), EnvelopeError> {
+    let stage = event
+        .news_flash_transaction_stage
+        .as_deref()
+        .and_then(NewsFlashTransactionStage::parse)
+        .ok_or_else(|| {
+            EnvelopeError::InvalidDeliveryAuditField("news_flash_transaction_stage".into())
+        })?;
+    let business_date = event.news_flash_business_date.ok_or_else(|| {
+        EnvelopeError::InvalidDeliveryAuditField("news_flash_business_date".into())
+    })?;
+    let decision_key = event
+        .news_flash_decision_key
+        .as_deref()
+        .filter(|value| !value.trim().is_empty() && value.trim() == *value && !value.contains('\0'))
+        .ok_or_else(|| {
+            EnvelopeError::InvalidDeliveryAuditField("news_flash_decision_key".into())
+        })?;
+    let ordinal = event
+        .news_flash_attempt_ordinal
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            EnvelopeError::InvalidDeliveryAuditField("news_flash_attempt_ordinal".into())
+        })?;
+    let observed_at = event
+        .news_flash_attempt_observed_at
+        .as_ref()
+        .ok_or_else(|| {
+            EnvelopeError::InvalidDeliveryAuditField("news_flash_attempt_observed_at".into())
+        })?;
+    let attempt_identity = event
+        .news_flash_sink_attempt_identity
+        .as_deref()
+        .filter(|value| is_lower_hex_sha256(value))
+        .ok_or_else(|| {
+            EnvelopeError::InvalidDeliveryAuditField("news_flash_sink_attempt_identity".into())
+        })?;
+    let attempt_sha256 = event
+        .news_flash_sink_attempt_sha256
+        .as_deref()
+        .filter(|value| is_lower_hex_sha256(value))
+        .ok_or_else(|| {
+            EnvelopeError::InvalidDeliveryAuditField("news_flash_sink_attempt_sha256".into())
+        })?;
+    let reservation = event
+        .news_flash_reservation_sha256
+        .as_deref()
+        .expect("NewsFlash reservation validated before transaction");
+    let evidence = event
+        .news_flash_evidence_sha256
+        .as_deref()
+        .expect("NewsFlash evidence validated before transaction");
+    let render = event
+        .news_flash_render_sha256
+        .as_deref()
+        .expect("NewsFlash render validated before transaction");
+    if news_flash_sink_attempt_identity(reservation, ordinal, &event.channel, observed_at)
+        != attempt_identity
+        || news_flash_sink_attempt_sha256(
+            &event.kind,
+            decision_key,
+            business_date,
+            reservation,
+            evidence,
+            render,
+            sources,
+            ordinal,
+            &event.channel,
+            observed_at,
+            attempt_identity,
+        ) != attempt_sha256
+    {
+        return Err(EnvelopeError::InvalidDeliveryAuditField(
+            "news_flash sink attempt binding".into(),
+        ));
+    }
+
+    match stage {
+        NewsFlashTransactionStage::SinkAttempt => {
+            if event.outcome != "Attempted"
+                || event.news_flash_attempt_envelope_id.is_some()
+                || event.news_flash_remote_receipt.is_some()
+                || event.news_flash_remote_receipt_identity.is_some()
+                || event.news_flash_remote_receipt_sha256.is_some()
+                || event.news_flash_terminal_observed_at.is_some()
+                || event.news_flash_terminal_reason_code.is_some()
+                || event.news_flash_transport_evidence_sha256.is_some()
+            {
+                return Err(EnvelopeError::InvalidDeliveryAuditField(
+                    "SinkAttempt terminal fields".into(),
+                ));
+            }
+        }
+        NewsFlashTransactionStage::Accepted => {
+            if event.outcome != "Pushed" {
+                return Err(EnvelopeError::InvalidDeliveryAuditField(
+                    "Accepted outcome".into(),
+                ));
+            }
+            let receipt = event.news_flash_remote_receipt.as_ref().ok_or_else(|| {
+                EnvelopeError::InvalidDeliveryAuditField("news_flash_remote_receipt".into())
+            })?;
+            if [
+                receipt.channel.as_str(),
+                receipt.provider.as_str(),
+                receipt.message_id.as_str(),
+                receipt.platform_message_id.as_str(),
+            ]
+            .iter()
+            .any(|value| value.trim().is_empty() || value.contains('\0'))
+                || receipt.channel != event.channel
+                || receipt.accepted_at < *observed_at
+                || event.news_flash_remote_receipt_identity.as_deref()
+                    != Some(news_flash_remote_receipt_identity(receipt).as_str())
+                || event.news_flash_remote_receipt_sha256.as_deref()
+                    != Some(news_flash_remote_receipt_sha256(receipt).as_str())
+                || event.news_flash_terminal_reason_code.is_some()
+                || event.news_flash_transport_evidence_sha256.is_some()
+            {
+                return Err(EnvelopeError::InvalidDeliveryAuditField(
+                    "news_flash typed remote receipt".into(),
+                ));
+            }
+        }
+        NewsFlashTransactionStage::DefinitivelyRejected => {
+            if event.outcome != "SinkError"
+                || event.news_flash_remote_receipt.is_some()
+                || event.news_flash_remote_receipt_identity.is_some()
+                || event.news_flash_remote_receipt_sha256.is_some()
+                || event
+                    .news_flash_terminal_reason_code
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty() || value.contains('\0'))
+                || event
+                    .news_flash_transport_evidence_sha256
+                    .as_deref()
+                    .is_none_or(|value| !is_lower_hex_sha256(value))
+            {
+                return Err(EnvelopeError::InvalidDeliveryAuditField(
+                    "DefinitivelyRejected terminal fields".into(),
+                ));
+            }
+        }
+        NewsFlashTransactionStage::Uncertain => {
+            if event.outcome != "Uncertain"
+                || event.news_flash_remote_receipt.is_some()
+                || event.news_flash_remote_receipt_identity.is_some()
+                || event.news_flash_remote_receipt_sha256.is_some()
+                || event
+                    .news_flash_terminal_reason_code
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty() || value.contains('\0'))
+                || event.news_flash_transport_evidence_sha256.is_some()
+            {
+                return Err(EnvelopeError::InvalidDeliveryAuditField(
+                    "Uncertain terminal fields".into(),
+                ));
+            }
+        }
+    }
+    if stage != NewsFlashTransactionStage::SinkAttempt
+        && event
+            .news_flash_attempt_envelope_id
+            .as_deref()
+            .is_none_or(|value| !is_lower_hex_sha256(value))
+    {
+        return Err(EnvelopeError::InvalidDeliveryAuditField(
+            "news_flash_attempt_envelope_id".into(),
+        ));
+    }
+    if stage != NewsFlashTransactionStage::SinkAttempt
+        && event
+            .news_flash_terminal_observed_at
+            .is_none_or(|terminal_at| {
+                terminal_at < *observed_at || terminal_at.date_naive() < business_date
+            })
+    {
+        return Err(EnvelopeError::InvalidDeliveryAuditField(
+            "news_flash_terminal_observed_at".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn news_flash_evidence_sha256(sources: &[NewsFlashAuditSource]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(NEWS_FLASH_EVIDENCE_HASH_DOMAIN.as_bytes());
+    hasher.update((sources.len() as u64).to_be_bytes());
+    for source in sources {
+        let published_at = source.published_at.to_rfc3339();
+        let observed_at = source.observed_at.to_rfc3339();
+        for value in [
+            source.event_id.as_str(),
+            source.provider.as_str(),
+            source.source.as_str(),
+            published_at.as_str(),
+            observed_at.as_str(),
+            source.batch_id.as_str(),
+        ] {
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value.as_bytes());
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn news_flash_delivery_join_hash(
+    kind: &str,
+    outcome: &str,
+    channel: &str,
+    reservation_sha256: &str,
+    evidence_sha256: &str,
+    render_sha256: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(NEWS_FLASH_DELIVERY_JOIN_HASH_DOMAIN.as_bytes());
+    for value in [
+        kind,
+        outcome,
+        channel,
+        reservation_sha256,
+        evidence_sha256,
+        render_sha256,
+    ] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn news_flash_sink_attempt_identity(
+    reservation_sha256: &str,
+    attempt_ordinal: u32,
+    channel: &str,
+    observed_at: &chrono::DateTime<chrono::FixedOffset>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(NEWS_FLASH_SINK_ATTEMPT_IDENTITY_HASH_DOMAIN.as_bytes());
+    for value in [
+        reservation_sha256.to_owned(),
+        attempt_ordinal.to_string(),
+        channel.to_owned(),
+        observed_at.to_rfc3339(),
+    ] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn news_flash_sink_attempt_sha256(
+    kind: &str,
+    decision_key: &str,
+    business_date: chrono::NaiveDate,
+    reservation_sha256: &str,
+    evidence_sha256: &str,
+    render_sha256: &str,
+    sources: &[NewsFlashAuditSource],
+    attempt_ordinal: u32,
+    channel: &str,
+    observed_at: &chrono::DateTime<chrono::FixedOffset>,
+    attempt_identity: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(NEWS_FLASH_SINK_ATTEMPT_HASH_DOMAIN.as_bytes());
+    for value in [
+        kind.to_owned(),
+        decision_key.to_owned(),
+        business_date.format("%Y-%m-%d").to_string(),
+        reservation_sha256.to_owned(),
+        evidence_sha256.to_owned(),
+        render_sha256.to_owned(),
+        news_flash_evidence_sha256(sources),
+        attempt_ordinal.to_string(),
+        channel.to_owned(),
+        observed_at.to_rfc3339(),
+        attempt_identity.to_owned(),
+    ] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn news_flash_remote_receipt_identity(receipt: &NewsFlashRemoteReceipt) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(NEWS_FLASH_REMOTE_RECEIPT_IDENTITY_HASH_DOMAIN.as_bytes());
+    for value in [
+        receipt.channel.as_str(),
+        receipt.provider.as_str(),
+        receipt.message_id.as_str(),
+        receipt.platform_message_id.as_str(),
+    ] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn news_flash_remote_receipt_sha256(receipt: &NewsFlashRemoteReceipt) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(NEWS_FLASH_REMOTE_RECEIPT_HASH_DOMAIN.as_bytes());
+    for value in [
+        receipt.channel.clone(),
+        receipt.provider.clone(),
+        receipt.message_id.clone(),
+        receipt.platform_message_id.clone(),
+        receipt.accepted_at.to_rfc3339(),
+        receipt.latency_ms.to_string(),
+    ] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn news_flash_transaction_join_hash(event: &PushDeliveryEvent) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(NEWS_FLASH_TRANSACTION_JOIN_HASH_DOMAIN.as_bytes());
+    let values = [
+        event.kind.clone(),
+        event.outcome.clone(),
+        event.channel.clone(),
+        event.rendered_len.to_string(),
+        event.latency_ms.to_string(),
+        optional_owned(event.news_flash_transaction_stage.as_ref()),
+        event
+            .news_flash_business_date
+            .map(|value| value.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "<absent>".to_owned()),
+        optional_owned(event.news_flash_decision_key.as_ref()),
+        optional_owned(event.news_flash_reservation_sha256.as_ref()),
+        optional_owned(event.news_flash_evidence_sha256.as_ref()),
+        optional_owned(event.news_flash_render_sha256.as_ref()),
+        event
+            .news_flash_attempt_ordinal
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "<absent>".to_owned()),
+        event
+            .news_flash_attempt_observed_at
+            .as_ref()
+            .map(chrono::DateTime::to_rfc3339)
+            .unwrap_or_else(|| "<absent>".to_owned()),
+        optional_owned(event.news_flash_sink_attempt_identity.as_ref()),
+        optional_owned(event.news_flash_sink_attempt_sha256.as_ref()),
+        optional_owned(event.news_flash_attempt_envelope_id.as_ref()),
+        event
+            .news_flash_terminal_observed_at
+            .as_ref()
+            .map(chrono::DateTime::to_rfc3339)
+            .unwrap_or_else(|| "<absent>".to_owned()),
+        optional_owned(event.news_flash_terminal_reason_code.as_ref()),
+        optional_owned(event.news_flash_transport_evidence_sha256.as_ref()),
+        optional_owned(event.news_flash_remote_receipt_identity.as_ref()),
+        optional_owned(event.news_flash_remote_receipt_sha256.as_ref()),
+    ];
+    for value in values {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn optional_owned(value: Option<&String>) -> String {
+    value.cloned().unwrap_or_else(|| "<absent>".to_owned())
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NewsFlashFailureIdentityFields<'a> {
+    pub provider: Option<&'a str>,
+    pub available_provider: Option<&'a str>,
+    pub stage: &'a str,
+    pub reason_code: &'a str,
+    pub diagnostic_code: &'a str,
+    pub diagnostic: &'a str,
+    pub retryable: bool,
+    pub observed_at: &'a chrono::DateTime<chrono::FixedOffset>,
+    pub source_record_count: u32,
+    pub batch_id: Option<&'a str>,
+    pub record_id: Option<&'a str>,
+}
+
+pub fn news_flash_failure_identity_hash(fields: NewsFlashFailureIdentityFields<'_>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(NEWS_FLASH_FAILURE_IDENTITY_HASH_DOMAIN.as_bytes());
+    let retryable = if fields.retryable { "true" } else { "false" };
+    let observed_at = fields.observed_at.to_rfc3339();
+    let source_record_count = fields.source_record_count.to_string();
+    for value in [
+        fields.provider.unwrap_or("<absent>"),
+        fields.available_provider.unwrap_or("<absent>"),
+        fields.stage,
+        fields.reason_code,
+        fields.diagnostic_code,
+        fields.diagnostic,
+        retryable,
+        observed_at.as_str(),
+        source_record_count.as_str(),
+        fields.batch_id.unwrap_or("<absent>"),
+        fields.record_id.unwrap_or("<absent>"),
+    ] {
+        hasher.update((value.len() as u64).to_be_bytes());
         hasher.update(value.as_bytes());
     }
     format!("{:x}", hasher.finalize())

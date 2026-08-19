@@ -212,6 +212,22 @@ pub fn verified_a_share_trading_day(date: NaiveDate) -> Result<bool, String> {
     )
 }
 
+/// Resolve the preceding A-share trading day using only the immutable,
+/// fail-closed exchange-calendar authority.
+pub fn verified_prev_a_share_trading_day(from: NaiveDate) -> Result<NaiveDate, String> {
+    let mut candidate = from
+        .checked_sub_signed(chrono::Duration::days(1))
+        .ok_or_else(|| "A-share trading-calendar previous-date underflow".to_owned())?;
+    loop {
+        if verified_a_share_trading_day(candidate)? {
+            return Ok(candidate);
+        }
+        candidate = candidate
+            .checked_sub_signed(chrono::Duration::days(1))
+            .ok_or_else(|| "A-share trading-calendar previous-date underflow".to_owned())?;
+    }
+}
+
 /// 添加节假日（运行时注入，用于测试或动态更新）
 /// review #14: poison 时 log error 而非静默丢弃, 让调用方知道 add 失败.
 pub fn add_holidays(dates: &[NaiveDate]) {
@@ -409,6 +425,14 @@ mod tests {
         assert_eq!(verified_a_share_trading_day(weekend), Ok(false));
         assert!(
             verified_a_share_trading_day(NaiveDate::from_ymd_opt(2027, 1, 4).unwrap()).is_err()
+        );
+        assert_eq!(
+            verified_prev_a_share_trading_day(NaiveDate::from_ymd_opt(2026, 8, 18).unwrap()),
+            Ok(NaiveDate::from_ymd_opt(2026, 8, 17).unwrap())
+        );
+        assert!(
+            verified_prev_a_share_trading_day(NaiveDate::from_ymd_opt(2027, 1, 4).unwrap())
+                .is_err()
         );
 
         add_holidays(&[trading_day]);

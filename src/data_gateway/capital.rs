@@ -291,12 +291,15 @@ impl CapitalDataGateway {
                             Ok(inflow),
                         );
                         match (volume_audited, inflow_audited) {
-                            (Ok(volume), Ok(inflow)) => Ok(ProviderTopNPair {
-                                volume_ratio_request: volume_request_evidence,
-                                volume_ratio: volume,
-                                main_net_inflow_request: inflow_request_evidence,
-                                main_net_inflow: inflow,
-                            }),
+                            (Ok(volume), Ok(inflow)) => {
+                                validate_provider_top_n_pair(&volume, &inflow, trading_date)?;
+                                Ok(ProviderTopNPair {
+                                    volume_ratio_request: volume_request_evidence,
+                                    volume_ratio: volume,
+                                    main_net_inflow_request: inflow_request_evidence,
+                                    main_net_inflow: inflow,
+                                })
+                            }
                             (Err(error), _) | (_, Err(error)) => Err(error),
                         }
                     }
@@ -923,7 +926,6 @@ fn admit_provider_top_n_batch(
     Ok(GatewayBatch::Available { records, evidence })
 }
 
-#[cfg(feature = "magic-gateway")]
 fn validate_provider_top_n_pair(
     volume_ratio: &GatewayBatch<ProviderTopNFact>,
     main_net_inflow: &GatewayBatch<ProviderTopNFact>,
@@ -943,10 +945,17 @@ fn validate_provider_top_n_pair(
         &MarketRankingUnit::Yuan,
         &expected_date,
         PROVIDER_TOP_N_MAIN_NET_INFLOW_CAPABILITY,
-    )
+    )?;
+    if volume_ratio.evidence().batch_id == main_net_inflow.evidence().batch_id {
+        return Err(GatewayError::invalid_evidence(
+            PROVIDER_TOP_N_MAIN_NET_INFLOW_CAPABILITY,
+            Some(main_net_inflow.evidence().provider),
+            "atomic provider Top-N sides must retain distinct upstream batch identities",
+        ));
+    }
+    Ok(())
 }
 
-#[cfg(feature = "magic-gateway")]
 fn validate_provider_top_n_side(
     batch: &GatewayBatch<ProviderTopNFact>,
     expected_metric: &MarketRankingKind,
@@ -955,7 +964,7 @@ fn validate_provider_top_n_side(
     capability: &'static str,
 ) -> Result<(), GatewayError> {
     if batch.is_verified_empty() || batch.records().is_empty() {
-        return Err(provider_top_n_invalid_evidence(
+        return Err(GatewayError::invalid_evidence(
             capability,
             Some(ProviderId::Eastmoney),
             "atomic provider Top-N side is empty",
@@ -966,7 +975,7 @@ fn validate_provider_top_n_side(
         || evidence.source != EASTMONEY_SOURCE
         || evidence.source_at.is_some()
     {
-        return Err(provider_top_n_invalid_evidence(
+        return Err(GatewayError::invalid_evidence(
             capability,
             Some(evidence.provider),
             "atomic provider Top-N side has inconsistent provider/source evidence",
@@ -974,7 +983,7 @@ fn validate_provider_top_n_side(
     }
     for (index, record) in batch.records().iter().enumerate() {
         let expected_ordinal = u32::try_from(index + 1).map_err(|_| {
-            provider_top_n_invalid_evidence(
+            GatewayError::invalid_evidence(
                 capability,
                 Some(ProviderId::Eastmoney),
                 "provider Top-N ordinal overflow",
@@ -985,7 +994,7 @@ fn validate_provider_top_n_side(
             || &record.trading_date != expected_date
             || record.source_order_ordinal.get() != expected_ordinal
         {
-            return Err(provider_top_n_invalid_evidence(
+            return Err(GatewayError::invalid_evidence(
                 capability,
                 Some(ProviderId::Eastmoney),
                 "atomic provider Top-N metric/unit/date/order mismatch",
@@ -993,6 +1002,166 @@ fn validate_provider_top_n_side(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod br240_transport_neutral_tests {
+    use super::*;
+    use crate::data_gateway::BatchEvidence;
+    use crate::magic_compat::{AssetClass, Exchange};
+
+    fn evidence(batch_id: &str) -> BatchEvidence {
+        BatchEvidence {
+            provider: ProviderId::Eastmoney,
+            source: EASTMONEY_SOURCE.to_owned(),
+            source_at: None,
+            observed_at: "2026-07-24T15:36:00+08:00".to_owned(),
+            batch_id: batch_id.to_owned(),
+        }
+    }
+
+    fn record(
+        metric: MarketRankingKind,
+        unit: MarketRankingUnit,
+        ordinal: u32,
+    ) -> ProviderTopNFact {
+        ProviderTopNFact {
+            metric,
+            source_order_ordinal: PositiveU32::new(ordinal).unwrap(),
+            instrument: InstrumentId::new(
+                Exchange::Shanghai,
+                format!("TEST_CODE_600{ordinal:03}"),
+                AssetClass::Equity,
+            )
+            .unwrap(),
+            label: NonEmptyText::new(format!("TEST_CODE_TOP_N_{ordinal}")).unwrap(),
+            value: FiniteNumber::new(f64::from(3 - ordinal)).unwrap(),
+            unit,
+            trading_date: IsoDate::new("2026-07-24").unwrap(),
+            filter_identity: NonEmptyText::new(PROVIDER_TOP_N_A_SHARE_FILTER).unwrap(),
+            provider_declared_total: PositiveU32::new(100).unwrap(),
+            inspected_row_count: PositiveU32::new(2).unwrap(),
+        }
+    }
+
+    fn side(
+        metric: MarketRankingKind,
+        unit: MarketRankingUnit,
+        batch_id: &str,
+    ) -> GatewayBatch<ProviderTopNFact> {
+        GatewayBatch::Available {
+            records: vec![
+                record(metric.clone(), unit.clone(), 1),
+                record(metric, unit, 2),
+            ],
+            evidence: evidence(batch_id),
+        }
+    }
+
+    #[test]
+    fn br240_transport_neutral_pair_rejects_wrong_source_metric_unit_date_or_order() {
+        let volume = side(
+            MarketRankingKind::VolumeRatio,
+            MarketRankingUnit::Multiple,
+            "TEST_CODE_BR240_VOLUME",
+        );
+        let inflow = side(
+            MarketRankingKind::MainNetInflow,
+            MarketRankingUnit::Yuan,
+            "TEST_CODE_BR240_INFLOW",
+        );
+        let date = NaiveDate::from_ymd_opt(2026, 7, 24).unwrap();
+        validate_provider_top_n_pair(&volume, &inflow, date).unwrap();
+
+        let mutate_volume = |mutate: fn(&mut Vec<ProviderTopNFact>, &mut BatchEvidence)| {
+            let mut records = volume.records().to_vec();
+            let mut evidence = volume.evidence().clone();
+            mutate(&mut records, &mut evidence);
+            GatewayBatch::Available { records, evidence }
+        };
+        let cases = [
+            (
+                "wrong_source",
+                mutate_volume(|_, evidence| evidence.source = "TEST_CODE_wrong-source".to_owned()),
+            ),
+            (
+                "wrong_metric",
+                mutate_volume(|records, _| records[0].metric = MarketRankingKind::MainNetInflow),
+            ),
+            (
+                "wrong_unit",
+                mutate_volume(|records, _| records[0].unit = MarketRankingUnit::Yuan),
+            ),
+            (
+                "wrong_date",
+                mutate_volume(|records, _| {
+                    records[0].trading_date = IsoDate::new("2026-07-23").unwrap()
+                }),
+            ),
+            (
+                "wrong_order",
+                mutate_volume(|records, _| {
+                    records[0].source_order_ordinal = PositiveU32::new(2).unwrap()
+                }),
+            ),
+        ];
+
+        for (case, invalid_volume) in cases {
+            let error = validate_provider_top_n_pair(&invalid_volume, &inflow, date)
+                .expect_err("BR-240 invalid pair evidence must fail closed");
+            assert_eq!(error.reason_code(), "invalid_evidence", "case={case}");
+            assert!(!error.retryable(), "case={case}");
+        }
+    }
+
+    #[test]
+    fn br240_transport_neutral_pair_rejects_shared_upstream_batch_identity() {
+        let shared_batch_id = "TEST_CODE_BR240_SHARED_BATCH";
+        let volume = side(
+            MarketRankingKind::VolumeRatio,
+            MarketRankingUnit::Multiple,
+            shared_batch_id,
+        );
+        let inflow = side(
+            MarketRankingKind::MainNetInflow,
+            MarketRankingUnit::Yuan,
+            shared_batch_id,
+        );
+
+        let error = validate_provider_top_n_pair(
+            &volume,
+            &inflow,
+            NaiveDate::from_ymd_opt(2026, 7, 24).unwrap(),
+        )
+        .expect_err("BR-240 requires two independently attributable upstream batches");
+
+        assert_eq!(
+            error.capability(),
+            PROVIDER_TOP_N_MAIN_NET_INFLOW_CAPABILITY
+        );
+        assert_eq!(error.provider(), Some(ProviderId::Eastmoney));
+        assert_eq!(error.reason_code(), "invalid_evidence");
+        assert!(!error.retryable());
+    }
+
+    #[cfg(feature = "magic-gateway")]
+    #[test]
+    fn br240_invalid_provider_evidence_is_non_retryable_through_delegate() {
+        let error = provider_top_n_invalid_evidence(
+            PROVIDER_TOP_N_VOLUME_RATIO_CAPABILITY,
+            Some(ProviderId::Eastmoney),
+            "TEST_CODE deterministic invalid evidence",
+        );
+        let crate::grpc_server::delegate::DelegateError::Fetch(failure) =
+            crate::grpc_server::delegate::provider_top_n_gateway_failure(error)
+        else {
+            panic!("provider Top-N gateway failures must cross the fetch boundary");
+        };
+
+        assert_eq!(failure.provider, Some(ProviderId::Eastmoney));
+        assert_eq!(failure.reason_code, "invalid_evidence");
+        assert!(!failure.retryable);
+    }
 }
 
 #[cfg(feature = "magic-gateway")]
@@ -1523,14 +1692,7 @@ fn provider_top_n_invalid_evidence(
     provider: Option<ProviderId>,
     message: impl Into<String>,
 ) -> GatewayError {
-    GatewayError::classified(
-        capability,
-        provider,
-        "partial",
-        "provider_top_n_invalid_evidence",
-        true,
-        message,
-    )
+    GatewayError::invalid_evidence(capability, provider, message)
 }
 
 #[cfg(feature = "magic-gateway")]
@@ -2627,8 +2789,8 @@ mod tests {
                 PROVIDER_TOP_N_VOLUME_RATIO_CAPABILITY,
             )
             .unwrap_err();
-            assert_eq!(error.reason_code(), "provider_top_n_invalid_evidence");
-            assert!(error.retryable());
+            assert_eq!(error.reason_code(), "invalid_evidence");
+            assert!(!error.retryable());
         }
     }
 
@@ -2683,7 +2845,8 @@ mod tests {
         let error =
             validate_provider_top_n_pair(&volume, &super::GatewayBatch::VerifiedEmpty(empty), date)
                 .unwrap_err();
-        assert!(error.retryable());
+        assert_eq!(error.reason_code(), "invalid_evidence");
+        assert!(!error.retryable());
 
         let metric_drift = ProviderTopNPair {
             volume_ratio_request: provider_top_n_request_evidence(

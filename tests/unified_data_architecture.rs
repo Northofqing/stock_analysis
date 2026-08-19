@@ -56,11 +56,31 @@ const REQWEST_TRANSPORT_OWNER_PATHS: &[&str] = &[
     "bin/monitor/notify.rs",
     "bin/monitor/webhook_alert.rs",
     "broker.rs",
+    "data_gateway/board_ranking.rs",
     "data_gateway/general_web_research.rs",
     "http_client.rs",
     "notification/service.rs",
     "push_l6/external_sinks.rs",
 ];
+
+// These exact binaries are operator diagnostics/replay tools, not production
+// business consumers. `magic_compat` is the reviewed upstream type boundary.
+// A new direct Magic provider owner must be reviewed and named individually.
+const MAGIC_PROVIDER_OWNER_PATHS: &[&str] = &[
+    "bin/t0_replay.rs",
+    "bin/tdx_5min_probe.rs",
+    "bin/tdx_raw_probe.rs",
+    "bin/tdx_server_probe.rs",
+    "bin/tencent_quote_probe.rs",
+    "bin/virtual_pnl.rs",
+    "magic_compat/mod.rs",
+];
+
+fn is_allowed_magic_provider_owner(relative_path: &Path) -> bool {
+    MAGIC_PROVIDER_OWNER_PATHS
+        .iter()
+        .any(|allowed| relative_path == Path::new(allowed))
+}
 
 fn line_owns_reqwest_transport(line: &str) -> bool {
     let code = line.trim_start();
@@ -127,6 +147,9 @@ fn br164_financial_and_news_acquisition_is_gateway_owned() {
         if path.starts_with(&gateway) {
             continue;
         }
+        let relative_path = path.strip_prefix(&root).unwrap_or_else(|error| {
+            panic!("strip {} from {}: {error}", root.display(), path.display())
+        });
         let body = fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
         for host in FINANCIAL_HOSTS {
@@ -140,7 +163,7 @@ fn br164_financial_and_news_acquisition_is_gateway_owned() {
                 || trimmed.starts_with("pub use magic_"))
                 && !trimmed.starts_with("use magic_market_core")
                 && !trimmed.starts_with("pub use magic_market_core");
-            if imports_magic_provider {
+            if imports_magic_provider && !is_allowed_magic_provider_owner(relative_path) {
                 violations.push(format!(
                     "{} imports a Magic provider outside data_gateway: {}",
                     path.display(),

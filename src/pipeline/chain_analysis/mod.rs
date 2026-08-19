@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 // 修复 Top10#3+#4 (2026-06-29 audit): chain_analysis.rs (1839 行) 拆子模块
 mod fetchers;
+pub mod p01_projection;
 // 兄弟模块 fetchers.rs 内 fetch_* 用 pub(super) 暴露, 这里 use 让 mod.rs 直接调用
 use fetchers::{
     fetch_after_market_catalysts, fetch_board_code_map, fetch_cluster_news, fetch_concepts_cached,

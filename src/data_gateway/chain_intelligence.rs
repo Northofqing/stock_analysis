@@ -661,7 +661,7 @@ impl ChainIntelligenceGateway {
         trading_date: NaiveDate,
     ) -> Result<VisibleChainBatch, GatewayError> {
         let request_hash =
-            acquisition_request_hash("A-10-chain-intelligence", &trading_date.to_string());
+            acquisition_request_hash("A-10-chain-intelligence", trading_date.to_string());
         let worker_hash = request_hash.clone();
         let joined =
             tokio::task::spawn_blocking(move || build_visible_batch(trading_date, &worker_hash))
@@ -878,7 +878,7 @@ fn acquire_and_build_batch(trading_date: NaiveDate) -> Result<ChainBatchInput, G
 fn acquire_limit_pool(
     trading_date: NaiveDate,
 ) -> Result<GatewayBatch<LimitPoolEntry>, GatewayError> {
-    let request_hash = acquisition_request_hash("A-10-limit-pool", &trading_date.to_string());
+    let request_hash = acquisition_request_hash("A-10-limit-pool", trading_date.to_string());
     let result = route_exact_date_upper_limit_pool("A-10-limit-pool", trading_date);
     audit_routed_gateway_result("A-10-limit-pool", &request_hash, result)
 }
@@ -889,7 +889,7 @@ fn acquire_security_metadata(
 ) -> Result<GatewayBatch<SecurityMetadata>, GatewayError> {
     let request_hash = acquisition_request_hash(
         "A-10-security-metadata",
-        &canonical_instrument_request(instruments),
+        canonical_instrument_request(instruments),
     );
     let result = (|| {
         let provider = TdxSmartClient::new();
@@ -921,7 +921,7 @@ fn acquire_board_memberships(
 ) -> Result<GatewayBatch<BoardMembership>, GatewayError> {
     let request_hash = acquisition_request_hash(
         "A-10-board-memberships",
-        &canonical_instrument_request(instruments),
+        canonical_instrument_request(instruments),
     );
     let result = (|| {
         let (_, ip, port) = PRIMARY_SERVERS.first().copied().ok_or_else(|| {

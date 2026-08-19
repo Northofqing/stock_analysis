@@ -27,7 +27,7 @@
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use chrono::{Local, NaiveDate, TimeZone, Timelike};
+use chrono::{FixedOffset, Local, NaiveDate, TimeZone, Timelike};
 use stock_analysis::push_l1::{
     NewsCatalystPayload, PostSessionReviewPayload, Severity, SignalEvent, SignalPayload,
     SignalSource,
@@ -489,6 +489,14 @@ pub fn v14_gate_counted_binding(
     event.event_id =
         stock_analysis::push_l1::make_source_fact_event_id(kind_str, schedule_occurrence_identity);
     let profile = default_profile_for_kind(kind);
+    let context_source = if kind.requires_banner() {
+        GovernanceContextSource::CountedCombinedAccount
+    } else {
+        // BR-241: public-source counted cards such as P-01 retain real
+        // process-local DataMode analytics but must not fabricate or require a
+        // combined account banner that is not part of their source binding.
+        GovernanceContextSource::CountedSourceOnly
+    };
     v14_gate_prepared(V14PreparedGate {
         kind,
         has_governance_identity: code.is_some(),
@@ -496,7 +504,7 @@ pub fn v14_gate_counted_binding(
         cooldown_override_secs: None,
         event,
         profile,
-        context_source: GovernanceContextSource::CountedCombinedAccount,
+        context_source,
         context_override: None,
     })
 }
@@ -601,6 +609,94 @@ pub fn v14_gate_source_fact(evidence: &SourceFactEvidence) -> V14Gate {
     })
 }
 
+/// BR-172 L5 gate for one immutable, already-audited NewsAI assessment.
+/// Exact dedup is owned by `database::news_ai`; this gate therefore performs
+/// fail-closed combined-account governance and deliberately never enters the
+/// legacy `(kind, code, cooldown)` reservation path.
+pub fn v14_gate_news_ai(
+    delivery: &stock_analysis::monitor::news_ai::GovernedNewsAiDelivery,
+) -> V14Gate {
+    let event = signal_event_for_news_ai(delivery);
+    v14_gate_prepared(V14PreparedGate {
+        kind: PushKind::NewsToIdea,
+        has_governance_identity: true,
+        sub_kind: None,
+        cooldown_override_secs: None,
+        event,
+        profile: news_ai_profile(),
+        context_source: GovernanceContextSource::NewsAiCombinedAccount,
+        context_override: None,
+    })
+}
+
+/// BR-244 L5/L4 reservation for one source-bound NewsFlash transaction.
+/// The gate does not settle the reservation; `notify` commits or rolls back
+/// only after the physical sink and the exact immutable audit are known.
+pub fn v14_gate_news_flash(reservation: &crate::news_aggregator_init::FlashReservation) -> V14Gate {
+    let (kind, headline, published_on) = match reservation.decision() {
+        crate::news_aggregator_init::FlashDecision::Critical {
+            headline,
+            source_published_on,
+            ..
+        } => (
+            PushKind::NewsFlashCritical,
+            headline.clone(),
+            *source_published_on,
+        ),
+        crate::news_aggregator_init::FlashDecision::Aggregated { text, .. } => {
+            let Some(published_on) = reservation
+                .sources()
+                .iter()
+                .map(|source| source.published_at().with_timezone(&Local).date_naive())
+                .max()
+            else {
+                return V14Gate::Denied("news_flash_source_evidence_missing".to_owned());
+            };
+            (PushKind::NewsFlashAggregated, text.clone(), published_on)
+        }
+    };
+    let Some(observed_at) = reservation
+        .sources()
+        .iter()
+        .map(|source| source.observed_at().with_timezone(&Local))
+        .max()
+    else {
+        return V14Gate::Denied("news_flash_source_evidence_missing".to_owned());
+    };
+    if !stock_analysis::event::envelope::is_lower_hex_sha256(
+        reservation.reservation_identity_sha256(),
+    ) || !stock_analysis::event::envelope::is_lower_hex_sha256(reservation.evidence_sha256())
+        || !stock_analysis::event::envelope::is_lower_hex_sha256(reservation.render_sha256())
+    {
+        return V14Gate::Denied("news_flash_binding_invalid".to_owned());
+    }
+    let (signal_source, kind_str, severity) = map_push_kind(kind);
+    let mut event = SignalEvent::new(
+        signal_source,
+        kind_str,
+        None,
+        observed_at,
+        SignalPayload::NewsCatalyst(NewsCatalystPayload {
+            code: None,
+            headline: Some(headline),
+            source: Some("source-bound-global-news".to_owned()),
+            published_on: Some(published_on),
+        }),
+        severity,
+    );
+    event.event_id = reservation.reservation_identity_sha256().to_owned();
+    v14_gate_prepared(V14PreparedGate {
+        kind,
+        has_governance_identity: true,
+        sub_kind: None,
+        cooldown_override_secs: None,
+        event,
+        profile: source_fact_profile(kind),
+        context_source: GovernanceContextSource::SourceFact,
+        context_override: None,
+    })
+}
+
 /// BR-160 sole uncounted source-batch gate. Account mode is not applicable to
 /// the already committed A-10 batch; global data health remains observable but
 /// does not replace the batch's own admission contract.
@@ -645,6 +741,7 @@ pub fn v14_gate_source_batch(evidence: &SourceBatchEvidence) -> V14Gate {
 #[derive(Clone, Copy)]
 enum GovernanceContextSource {
     CombinedAccount,
+    NewsAiCombinedAccount,
     CountedCombinedAccount,
     SourceFact,
     SourceBatch,
@@ -704,6 +801,7 @@ fn v14_gate_prepared(request: V14PreparedGate<'_>) -> V14Gate {
         .map(Ok)
         .unwrap_or_else(|| match context_source {
             GovernanceContextSource::CombinedAccount
+            | GovernanceContextSource::NewsAiCombinedAccount
             | GovernanceContextSource::CountedCombinedAccount => current_governance_ctx(),
             GovernanceContextSource::SourceFact | GovernanceContextSource::SourceBatch => {
                 current_source_fact_governance_ctx()
@@ -781,6 +879,16 @@ fn v14_gate_prepared(request: V14PreparedGate<'_>) -> V14Gate {
             return V14Gate::Denied("analytics_audit_unavailable".to_string());
         }
         return V14Gate::Denied(reason);
+    }
+
+    // BR-172 exact identity reservation/commit is append-only in the NewsAI
+    // audit ledger. Re-entering legacy L4 would add a weaker second dedup
+    // owner and could suppress distinct provider facts for the same code.
+    if matches!(
+        context_source,
+        GovernanceContextSource::NewsAiCombinedAccount
+    ) {
+        return V14Gate::Approved(Box::new(event));
     }
 
     // BR-192: counted delivery retains L5 governance but has exactly one
@@ -1183,6 +1291,46 @@ fn signal_event_for_source_fact(evidence: &SourceFactEvidence) -> SignalEvent {
     event
 }
 
+fn signal_event_for_news_ai(
+    delivery: &stock_analysis::monitor::news_ai::GovernedNewsAiDelivery,
+) -> SignalEvent {
+    let fact = delivery.fact();
+    let (source, kind_str, severity) = map_push_kind(PushKind::NewsToIdea);
+    let published_at = fact.published_at().with_timezone(&Local);
+    let shanghai_offset =
+        FixedOffset::east_opt(8 * 3600).expect("UTC+08:00 is a valid Shanghai market offset");
+    let published_on = fact
+        .published_at()
+        .with_timezone(&shanghai_offset)
+        .date_naive();
+    let mut event = SignalEvent::new(
+        source,
+        kind_str,
+        Some(fact.target_code().to_owned()),
+        published_at,
+        SignalPayload::NewsCatalyst(NewsCatalystPayload {
+            code: Some(fact.target_code().to_owned()),
+            headline: Some(fact.title().to_owned()),
+            source: Some(fact.source().to_owned()),
+            published_on: Some(published_on),
+        }),
+        severity,
+    );
+    event.event_id = delivery.identity().sha256().to_owned();
+    event
+}
+
+fn news_ai_profile() -> TemplateMetadata {
+    let mut profile = default_profile_for_kind(PushKind::NewsToIdea);
+    profile.category = stock_analysis::push_l2::TemplateCategory::News;
+    // BR-172 explicitly forbids the generic public-source DataMode::Down
+    // exemption: AI delivery requires the real combined-account context at
+    // full data health.
+    profile.data_mode_min = DataMode::Full;
+    profile.always_send_on_data_source_down = false;
+    profile
+}
+
 fn source_fact_profile(kind: PushKind) -> TemplateMetadata {
     let mut profile = default_profile_for_kind(kind);
     profile.category = stock_analysis::push_l2::TemplateCategory::News;
@@ -1218,6 +1366,7 @@ fn is_source_fact_signal(kind: PushKind, event: &SignalEvent) -> bool {
             | PushKind::EarningsMiss
             | PushKind::AnalystUpgrade
             | PushKind::NewsFlashCritical
+            | PushKind::NewsFlashAggregated
     ) && matches!(event.payload, SignalPayload::NewsCatalyst(_))
 }
 
@@ -1384,6 +1533,14 @@ mod tests {
                 .replace(crate::push_templates::BannerCtx::test_default());
             Self(previous)
         }
+
+        fn missing() -> Self {
+            let previous = crate::LATEST_BANNER
+                .lock()
+                .expect("test banner lock")
+                .take();
+            Self(previous)
+        }
     }
 
     impl Drop for TestBannerGuard {
@@ -1451,7 +1608,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial(cooldown_memo)]
-    fn br196_scoped_smoke_clock_does_not_relax_ordinary_quiet_hour() {
+    fn br196_scoped_smoke_clock_does_not_relax_ordinary_or_counted_gate() {
         let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         std::env::set_var("STOCK_ANALYSIS_QUIET_HOUR_OVERRIDE", "1");
         let _banner_guard = TestBannerGuard::full();
@@ -1459,6 +1616,10 @@ mod tests {
 
         assert!(matches!(
             v14_gate(PushKind::PreopenNewsHot, None),
+            V14Gate::Denied(reason) if reason == "counted_binding_required"
+        ));
+        assert!(matches!(
+            v14_gate(PushKind::IntradayMarket, None),
             V14Gate::Denied(reason) if reason == "quiet_hour"
         ));
 
@@ -1467,14 +1628,18 @@ mod tests {
         )
         .expect("construct scoped BR-196 governance context");
         let dispatch = context
-            .dispatch("P-01-preopen-news-hot", PushKind::PreopenNewsHot, None)
-            .expect("mint exact-six dispatch");
+            .dispatch("T-11-auction-volume", PushKind::AuctionVolume, None)
+            .expect("mint exact governance dispatch");
         assert!(matches!(
             v14_gate_br196_smoke(&dispatch),
             V14Gate::Approved(_)
         ));
         assert!(matches!(
             v14_gate(PushKind::PreopenNewsHot, None),
+            V14Gate::Denied(reason) if reason == "counted_binding_required"
+        ));
+        assert!(matches!(
+            v14_gate(PushKind::IntradayMarket, None),
             V14Gate::Denied(reason) if reason == "quiet_hour"
         ));
     }
@@ -1517,6 +1682,13 @@ mod tests {
             default_profile_for_kind(PushKind::CatalystReview).data_mode_min,
             DataMode::Down
         );
+    }
+
+    #[test]
+    fn br172_news_ai_gate_requires_full_data_without_down_exemption() {
+        let profile = news_ai_profile();
+        assert_eq!(profile.data_mode_min, DataMode::Full);
+        assert!(!profile.always_send_on_data_source_down);
     }
 
     #[test]
@@ -1675,6 +1847,27 @@ mod tests {
         assert_eq!(first.ts, second.ts);
         assert_eq!(first.code.as_deref(), Some("TEST_CODE_600519"));
         assert_eq!(first.ts.date_naive(), business_date);
+    }
+
+    #[test]
+    #[serial_test::serial(cooldown_memo)]
+    fn br241_p01_counted_gate_does_not_require_combined_account_banner() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        let _banner_guard = TestBannerGuard::missing();
+        let business_date = NaiveDate::from_ymd_opt(2026, 8, 18).unwrap();
+
+        let gate = v14_gate_counted_binding(
+            PushKind::PreopenNewsHot,
+            None,
+            None,
+            "p01:2026-08-18",
+            business_date,
+        );
+
+        assert!(
+            matches!(gate, V14Gate::Approved(_)),
+            "P-01 public-source counted gate must not depend on an account banner: {gate:?}"
+        );
     }
 
     #[test]

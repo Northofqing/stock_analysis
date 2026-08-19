@@ -4,13 +4,21 @@ use crate::grpc_client::pb::magic::market::v1::{
 };
 
 pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<QueryResponse> {
+    // BR-238 / BR-236: live fixture evidence is minted only inside the isolated
+    // fixture server and must still satisfy the production consumer-side 5s gate.
+    // Historical/news fixtures remain pinned below so their deterministic
+    // business dates are not silently rewritten as live evidence.
+    let live_at = chrono::Utc::now().to_rfc3339();
     let payload = |data: &str| CanonicalPayload {
         schema: schema.to_string(),
         schema_version: version,
         content_type: "application/json; charset=utf-8".to_string(),
         data: data.as_bytes().to_vec(),
     };
-    let resp = |request_id: &str, records: Vec<CanonicalPayload>| QueryResponse {
+    let response = |request_id: &str,
+                    records: Vec<CanonicalPayload>,
+                    observed_at: &str,
+                    source_at: &str| QueryResponse {
         request_id: request_id.to_string(),
         operation: op as i32,
         admission: AdmissionState::Admitted as i32,
@@ -19,15 +27,26 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
         selected_provider: "Tdx".to_string(),
         batch_id: "fixture-b1".to_string(),
         complete: true,
-        observed_at: "2026-08-13T10:00:00+08:00".to_string(),
-        source_at: "2026-08-13T10:00:00+08:00".to_string(),
+        observed_at: observed_at.to_string(),
+        source_at: source_at.to_string(),
         records,
         source: "fixture".to_string(),
         // 上游合同字段 10: fixture 无诊断阻塞。
         diagnostic_blocker: String::new(),
     };
+    let resp = |request_id: &str, records: Vec<CanonicalPayload>| {
+        response(
+            request_id,
+            records,
+            "2026-08-13T10:00:00+08:00",
+            "2026-08-13T10:00:00+08:00",
+        )
+    };
+    let live_resp = |request_id: &str, records: Vec<CanonicalPayload>| {
+        response(request_id, records, &live_at, &live_at)
+    };
     match op {
-        Operation::RealtimeQuotes => Some(resp(
+        Operation::RealtimeQuotes => Some(live_resp(
             "fixture-rq",
             vec![payload(
                 r#"[{"code":"600519","name":"贵州茅台","price":1500.0,"change_pct":2.34,"previous_close":1490.0}]"#,
@@ -63,12 +82,30 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
                 r#"[{"event_id":"fixture-e1","indicator_id":123,"country":"CN","name":"中国 CPI 同比","period":"2026-07","scheduled_at":"2026-08-09T09:30:00+08:00","released_at":"2026-08-09T09:30:00+08:00","previous":0.6,"consensus":0.7,"actual":0.8,"revised":null,"unit":"%","importance":3,"impact":"利好"}]"#,
             )],
         )),
-        Operation::OrderBooks => Some(resp(
-            "fixture-ob",
-            vec![payload(
-                r#"[{"code":"600519","bids":[{"price":1499.0,"quantity":100.0},{"price":1498.0,"quantity":200.0}],"asks":[{"price":1501.0,"quantity":150.0},{"price":1502.0,"quantity":300.0}],"total_bid_quantity":300.0,"total_ask_quantity":450.0,"source_at":"2026-08-13T10:00:00+08:00"}]"#,
-            )],
-        )),
+        Operation::OrderBooks => {
+            let data = serde_json::json!([{
+                "code": "600519",
+                "bids": [
+                    {"price": 1499.0, "quantity": 100.0},
+                    {"price": 1498.0, "quantity": 200.0},
+                    {"price": 1497.0, "quantity": 300.0},
+                    {"price": 1496.0, "quantity": 400.0},
+                    {"price": 1495.0, "quantity": 500.0}
+                ],
+                "asks": [
+                    {"price": 1501.0, "quantity": 150.0},
+                    {"price": 1502.0, "quantity": 300.0},
+                    {"price": 1503.0, "quantity": 450.0},
+                    {"price": 1504.0, "quantity": 600.0},
+                    {"price": 1505.0, "quantity": 750.0}
+                ],
+                "total_bid_quantity": 1500.0,
+                "total_ask_quantity": 2250.0,
+                "source_at": live_at
+            }])
+            .to_string();
+            Some(live_resp("fixture-ob", vec![payload(&data)]))
+        }
         Operation::MoneyFlows => Some(resp(
             "fixture-mf",
             vec![payload(
@@ -113,12 +150,47 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
                 r#"[{"date":"2026-08-15","pre_close":1500.0,"open_pct":0.2,"high_pct":2.1,"low_pct":-0.8,"close_pct":1.3,"amplitude":2.9,"tail_30m_pct":0.5,"shape_label":"稳步推高"}]"#,
             )],
         )),
-        Operation::T0Evidence => Some(resp(
-            "fixture-t0",
-            vec![payload(
-                r#"{"records":[{"instrument":"SH600519","code":"600519","requested_at":"2026-08-15T09:35:00+08:00","source_at":"2026-08-15T09:35:00+08:00","observed_at":"2026-08-15T09:35:00+08:00","batch_id":"fixture-t0","quote":{"price":1500.0,"last_close":1490.0,"open":1495.0,"high":1505.0,"low":1490.0,"volume":1e6,"amount":1.5e9,"bids":[{"price":1499.0,"volume":100.0},{"price":1498.0,"volume":200.0},{"price":1497.0,"volume":300.0},{"price":1496.0,"volume":400.0},{"price":1495.0,"volume":500.0}],"asks":[{"price":1501.0,"volume":100.0},{"price":1502.0,"volume":200.0},{"price":1503.0,"volume":300.0},{"price":1504.0,"volume":400.0},{"price":1505.0,"volume":500.0}]},"settled_daily":[],"completed_five_minute":[],"intraday_average_price":1498.0}],"rejections":[]}"#,
-            )],
-        )),
+        Operation::T0Evidence => {
+            let data = serde_json::json!({
+                "records": [{
+                    "instrument": "SH600519",
+                    "code": "600519",
+                    "requested_at": live_at,
+                    "source_at": live_at,
+                    "observed_at": live_at,
+                    "batch_id": "fixture-b1",
+                    "quote": {
+                        "price": 1500.0,
+                        "last_close": 1490.0,
+                        "open": 1495.0,
+                        "high": 1505.0,
+                        "low": 1490.0,
+                        "volume": 1e6,
+                        "amount": 1.5e9,
+                        "bids": [
+                            {"price": 1499.0, "volume": 100.0},
+                            {"price": 1498.0, "volume": 200.0},
+                            {"price": 1497.0, "volume": 300.0},
+                            {"price": 1496.0, "volume": 400.0},
+                            {"price": 1495.0, "volume": 500.0}
+                        ],
+                        "asks": [
+                            {"price": 1501.0, "volume": 100.0},
+                            {"price": 1502.0, "volume": 200.0},
+                            {"price": 1503.0, "volume": 300.0},
+                            {"price": 1504.0, "volume": 400.0},
+                            {"price": 1505.0, "volume": 500.0}
+                        ]
+                    },
+                    "settled_daily": [],
+                    "completed_five_minute": [],
+                    "intraday_average_price": 1498.0
+                }],
+                "rejections": []
+            })
+            .to_string();
+            Some(live_resp("fixture-t0", vec![payload(&data)]))
+        }
         Operation::OutcomeDailyBars => Some(resp(
             "fixture-ob",
             vec![payload(
@@ -237,12 +309,12 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
             selected_provider: "Eastmoney".to_string(),
             batch_id: "fixture-b1".to_string(),
             complete: true,
-            observed_at: "2026-08-13T10:00:00+08:00".to_string(),
-            source_at: "2026-08-13T10:00:00+08:00".to_string(),
+            observed_at: "2026-08-15T10:00:00+08:00".to_string(),
+            source_at: String::new(),
             records: vec![payload(
-                r#"[{"metric":"VolumeRatio","ordinal":1,"code":"600519","label":"贵州茅台","value":3.2,"unit":"Multiple","trading_date":"2026-08-13","filter_identity":"volume_ratio_top20","provider_declared_total":20,"inspected_row_count":20},{"metric":"MainNetInflow","ordinal":1,"code":"600519","label":"贵州茅台","value":1.5e9,"unit":"Yuan","trading_date":"2026-08-13","filter_identity":"main_net_inflow_top20","provider_declared_total":20,"inspected_row_count":20}]"#,
+                r#"[{"metric":"VolumeRatio","ordinal":1,"code":"600519","label":"贵州茅台","value":3.2,"unit":"Multiple","trading_date":"2026-08-15","filter_identity":"volume_ratio_top20","provider_declared_total":20,"inspected_row_count":20,"evidence":{"provider":"Eastmoney","source":"eastmoney-web","source_at":null,"observed_at":"2026-08-15T10:00:00+08:00","batch_id":"fixture-b1"}},{"metric":"MainNetInflow","ordinal":1,"code":"600519","label":"贵州茅台","value":1.5e9,"unit":"Yuan","trading_date":"2026-08-15","filter_identity":"main_net_inflow_top20","provider_declared_total":20,"inspected_row_count":20,"evidence":{"provider":"Eastmoney","source":"eastmoney-web","source_at":null,"observed_at":"2026-08-15T10:00:01+08:00","batch_id":"fixture-b2"}}]"#,
             )],
-            source: "fixture".to_string(),
+            source: "eastmoney-web".to_string(),
             // 上游合同字段 10: fixture 无诊断阻塞。
             diagnostic_blocker: String::new(),
         }),

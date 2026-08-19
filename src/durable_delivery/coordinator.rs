@@ -2839,6 +2839,192 @@ impl DurableDeliveryCoordinator {
         })
     }
 
+    /// Return the durable owner of one exact BusinessDateOnce occurrence
+    /// without mutating admission state or contacting a sink.
+    ///
+    /// BR-241 uses this before any P-01 provider call. The occurrence identity
+    /// is read from the frozen envelope; no review-task binding is required or
+    /// fabricated.
+    pub fn inspect_business_date_once_claim(
+        &self,
+        business_date: &str,
+        push_kind: super::model::PushKind,
+        sub_kind: super::model::DeliverySubKind,
+        scope_key: &str,
+        occurrence_identity: &str,
+    ) -> Result<Option<super::model::BusinessDateOnceClaimEvidence>> {
+        super::model::validate_business_date(business_date)?;
+        if scope_key.trim().is_empty() || occurrence_identity.trim().is_empty() {
+            return Err(DurableDeliveryError::PolicyMismatch(
+                "business_date_once_claim_identity_invalid".to_owned(),
+            ));
+        }
+        let policy = compiled_policy_catalog()
+            .into_iter()
+            .find(|row| row.push_kind == push_kind && row.sub_kind == sub_kind)
+            .ok_or_else(|| {
+                DurableDeliveryError::PolicyMismatch(format!(
+                    "BusinessDateOnce claim has no compiled policy for {push_kind}/{sub_kind}"
+                ))
+            })?;
+        if policy.window_mode != super::model::WindowMode::BusinessDateOnce {
+            return Err(DurableDeliveryError::PolicyMismatch(format!(
+                "BusinessDateOnce claim requires BusinessDateOnce policy for {push_kind}/{sub_kind}"
+            )));
+        }
+        let expected_scope = match policy.cooldown_scope {
+            super::model::CooldownScope::Global => "GLOBAL",
+            super::model::CooldownScope::PerTicket => scope_key,
+        };
+        if scope_key != expected_scope {
+            return Err(DurableDeliveryError::PolicyMismatch(format!(
+                "BusinessDateOnce claim scope mismatch for {push_kind}/{sub_kind}: {scope_key}"
+            )));
+        }
+
+        self.with_connection(|connection| {
+            let claimed = connection
+                .query_row(
+                    "SELECT decision_identity,policy_version
+                     FROM business_date_once_claims
+                     WHERE business_date=?1 AND push_kind=?2
+                       AND sub_kind=?3 AND scope_key=?4",
+                    params![business_date, push_kind.as_str(), sub_kind.as_str(), scope_key],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()?;
+            let Some((decision_identity, claim_policy_version)) = claimed else {
+                return Ok(None);
+            };
+            let stored = load_decision(connection, &decision_identity)?.ok_or_else(|| {
+                DurableDeliveryError::DecisionNotFound(decision_identity.clone())
+            })?;
+            if sha256_hex(&stored.envelope_canonical) != stored.envelope_sha256 {
+                return Err(DurableDeliveryError::PolicyMismatch(format!(
+                    "BusinessDateOnce claim envelope hash mismatch for {decision_identity}"
+                )));
+            }
+            let envelope = parse_envelope(&stored.envelope_canonical)?;
+            if envelope.decision_identity != decision_identity
+                || envelope.business_date != business_date
+                || envelope.push_kind != push_kind
+                || envelope.sub_kind != sub_kind
+                || envelope.scope_key != scope_key
+                || envelope.schedule_occurrence_identity != occurrence_identity
+                || envelope.policy_version != claim_policy_version
+            {
+                return Err(DurableDeliveryError::PolicyMismatch(format!(
+                    "BusinessDateOnce claim identity mismatch for {decision_identity}"
+                )));
+            }
+            let authoritative_receipt_sha256 = if stored.state == DecisionState::Delivered {
+                let disposition = load_current_disposition_evidence(connection, &stored)?;
+                if disposition.disposition != "Accepted" {
+                    return Err(DurableDeliveryError::PolicyMismatch(format!(
+                        "BusinessDateOnce Delivered claim has no authoritative Accepted receipt for {decision_identity}"
+                    )));
+                }
+                let (_, receipt) = validate_authoritative_accepted_delivery_evidence(
+                    connection,
+                    &stored,
+                    &envelope,
+                    &disposition,
+                )?;
+                let receipt_canonical = serde_json::to_vec(&receipt)?;
+                Some(domain_sha256_hex(
+                    "stock_analysis.counted_receipt.v1",
+                    &receipt_canonical,
+                ))
+            } else {
+                None
+            };
+            let source_binding_mode = p01_source_binding_mode(
+                push_kind,
+                &envelope.source_binding_canonical,
+            )?;
+            Ok(Some(super::model::BusinessDateOnceClaimEvidence {
+                schedule_hydration: load_schedule_hydration(connection, &decision_identity)?,
+                decision_identity,
+                state: stored.state,
+                sink_calls: 0,
+                current_attempt_identity: stored.current_attempt_identity,
+                authoritative_receipt_sha256,
+                source_binding_mode,
+            }))
+        })
+    }
+
+    /// Reconcile and, only when still Reserved, resume one exact
+    /// BusinessDateOnce claim from its persisted immutable envelope.
+    ///
+    /// No caller envelope is accepted. Uncertain and terminal states are
+    /// inspection-only, so this seam cannot blindly resend them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume_business_date_once_claim(
+        &self,
+        business_date: &str,
+        push_kind: super::model::PushKind,
+        sub_kind: super::model::DeliverySubKind,
+        scope_key: &str,
+        occurrence_identity: &str,
+        sinks: &[AuthoritativeSink],
+        append_port: &dyn ImmutableAppendPort,
+        now: DateTime<Utc>,
+    ) -> Result<Option<super::model::BusinessDateOnceClaimEvidence>> {
+        let Some(initial) = self.inspect_business_date_once_claim(
+            business_date,
+            push_kind,
+            sub_kind,
+            scope_key,
+            occurrence_identity,
+        )?
+        else {
+            return Ok(None);
+        };
+        let reconcile_until_idle = || -> Result<()> {
+            for _ in 0..20 {
+                if self.reconcile_all_pending(append_port, now)?.progress_count == 0 {
+                    return Ok(());
+                }
+            }
+            Err(DurableDeliveryError::PolicyMismatch(format!(
+                "BusinessDateOnce claim {} exceeded 20 reconciliation iterations",
+                initial.decision_identity
+            )))
+        };
+
+        reconcile_until_idle()?;
+        let reconciled = self
+            .inspect_business_date_once_claim(
+                business_date,
+                push_kind,
+                sub_kind,
+                scope_key,
+                occurrence_identity,
+            )?
+            .ok_or_else(|| {
+                DurableDeliveryError::DecisionNotFound(initial.decision_identity.clone())
+            })?;
+        let mut sink_calls = 0usize;
+        if reconciled.state == DecisionState::Reserved {
+            sink_calls += self
+                .resume_deliverable(&reconciled.decision_identity, sinks, now)?
+                .sink_calls;
+            reconcile_until_idle()?;
+        }
+        let mut evidence = self.inspect_business_date_once_claim(
+            business_date,
+            push_kind,
+            sub_kind,
+            scope_key,
+            occurrence_identity,
+        )?;
+        if let Some(evidence) = evidence.as_mut() {
+            evidence.sink_calls = sink_calls;
+        }
+        Ok(evidence)
+    }
+
     /// Return the durable owner of an exact review-task occurrence without
     /// mutating admission state or contacting a sink.
     ///
@@ -5791,52 +5977,18 @@ fn validate_delivered_transition_evidence(
             "Delivered transition current envelope binding mismatch".to_owned(),
         ));
     }
-    let current_disposition_identity =
-        stored
-            .current_disposition_identity
-            .as_deref()
-            .ok_or_else(|| {
-                DurableDeliveryError::PolicyMismatch(
-                    "Delivered transition requires a current disposition".to_owned(),
-                )
-            })?;
-    let disposition = transaction
-        .query_row(
-            "SELECT disposition_identity,attempt_identity,resolution_identity,
-                    denial_identity,disposition,disposition_canonical,
-                    disposition_sha256,append_state,immutable_audit_ref,created_at
-             FROM delivery_disposition_payloads
-             WHERE disposition_identity=?1 AND decision_identity=?2",
-            params![current_disposition_identity, stored.decision_identity],
-            |row| {
-                Ok(StoredDispositionEvidence {
-                    disposition_identity: row.get(0)?,
-                    attempt_identity: row.get(1)?,
-                    resolution_identity: row.get(2)?,
-                    denial_identity: row.get(3)?,
-                    disposition: row.get(4)?,
-                    canonical: row.get(5)?,
-                    sha256: row.get(6)?,
-                    append_state: row.get(7)?,
-                    immutable_audit_ref: row.get(8)?,
-                    created_at: row.get(9)?,
-                })
-            },
-        )
-        .optional()?
-        .ok_or_else(|| {
-            DurableDeliveryError::PolicyMismatch(
-                "Delivered transition current disposition is missing or rebound".to_owned(),
-            )
-        })?;
+    let disposition = load_current_disposition_evidence(transaction, stored)?;
 
     let disposition_payload = match disposition.disposition.as_str() {
-        "Accepted" => validate_authoritative_accepted_delivery_evidence(
-            transaction,
-            stored,
-            &envelope,
-            &disposition,
-        )?,
+        "Accepted" => {
+            validate_authoritative_accepted_delivery_evidence(
+                transaction,
+                stored,
+                &envelope,
+                &disposition,
+            )?
+            .0
+        }
         "ManualAccepted" => {
             let manual = load_and_validate_manual_accepted_delivery_evidence(
                 transaction,
@@ -5876,6 +6028,50 @@ fn validate_delivered_transition_evidence(
         )?;
     }
     Ok(())
+}
+
+fn load_current_disposition_evidence(
+    connection: &Connection,
+    stored: &StoredDecision,
+) -> Result<StoredDispositionEvidence> {
+    let current_disposition_identity =
+        stored
+            .current_disposition_identity
+            .as_deref()
+            .ok_or_else(|| {
+                DurableDeliveryError::PolicyMismatch(
+                    "Delivered transition requires a current disposition".to_owned(),
+                )
+            })?;
+    connection
+        .query_row(
+            "SELECT disposition_identity,attempt_identity,resolution_identity,
+                    denial_identity,disposition,disposition_canonical,
+                    disposition_sha256,append_state,immutable_audit_ref,created_at
+             FROM delivery_disposition_payloads
+             WHERE disposition_identity=?1 AND decision_identity=?2",
+            params![current_disposition_identity, stored.decision_identity],
+            |row| {
+                Ok(StoredDispositionEvidence {
+                    disposition_identity: row.get(0)?,
+                    attempt_identity: row.get(1)?,
+                    resolution_identity: row.get(2)?,
+                    denial_identity: row.get(3)?,
+                    disposition: row.get(4)?,
+                    canonical: row.get(5)?,
+                    sha256: row.get(6)?,
+                    append_state: row.get(7)?,
+                    immutable_audit_ref: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            DurableDeliveryError::PolicyMismatch(
+                "Delivered transition current disposition is missing or rebound".to_owned(),
+            )
+        })
 }
 
 fn validate_current_disposition_canonical(
@@ -6063,7 +6259,7 @@ fn validate_authoritative_accepted_delivery_evidence(
     stored: &StoredDecision,
     envelope: &DeliveryEnvelope,
     disposition: &StoredDispositionEvidence,
-) -> Result<DeliveryDispositionCanonical> {
+) -> Result<(DeliveryDispositionCanonical, super::model::TypedReceipt)> {
     let accepted_count: i64 = connection.query_row(
         "SELECT COUNT(*)
          FROM delivery_disposition_payloads p
@@ -6271,7 +6467,7 @@ fn validate_authoritative_accepted_delivery_evidence(
             "authoritative accepted result identity mismatch".to_owned(),
         ));
     }
-    Ok(disposition_payload)
+    Ok((disposition_payload, receipt.clone()))
 }
 
 fn insert_new_decision(
@@ -6488,6 +6684,28 @@ fn parse_envelope(canonical: &[u8]) -> Result<DeliveryEnvelope> {
     let envelope: DeliveryEnvelope = serde_json::from_slice(canonical)?;
     envelope.validate()?;
     Ok(envelope)
+}
+
+fn p01_source_binding_mode(
+    push_kind: super::model::PushKind,
+    canonical: &[u8],
+) -> Result<Option<String>> {
+    if push_kind != super::model::PushKind::PreopenNewsHot {
+        return Ok(None);
+    }
+    let value: serde_json::Value = serde_json::from_slice(canonical)?;
+    let schema = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str);
+    let mode = value.get("render_mode").and_then(serde_json::Value::as_str);
+    if schema != Some("P01_SOURCE_BINDING_V1")
+        || !matches!(mode, Some("Scheduled" | "Compensation"))
+    {
+        return Err(DurableDeliveryError::PolicyMismatch(
+            "P-01 stored source binding render mode invalid".to_owned(),
+        ));
+    }
+    Ok(mode.map(str::to_owned))
 }
 
 fn replay_push_kind(review_task: &str) -> Result<super::model::PushKind> {
@@ -7670,6 +7888,14 @@ fn require_nonempty_immutable_ref(
 
 fn canonical_json(value: &impl Serialize) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(value)?)
+}
+
+fn domain_sha256_hex(domain: &str, payload: &[u8]) -> String {
+    let mut preimage = Vec::with_capacity(domain.len() + 1 + payload.len());
+    preimage.extend_from_slice(domain.as_bytes());
+    preimage.push(0);
+    preimage.extend_from_slice(payload);
+    sha256_hex(&preimage)
 }
 
 fn timestamp(value: DateTime<Utc>) -> String {

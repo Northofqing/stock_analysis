@@ -12,9 +12,9 @@ use crate::magic_compat::Exchange;
 use crate::magic_compat::ProviderId;
 #[cfg(feature = "magic-gateway")]
 use crate::magic_compat::{AssetClass, InstrumentId, RatioUnit};
+#[cfg(all(test, feature = "magic-gateway"))]
+use chrono::FixedOffset;
 use chrono::{DateTime, NaiveDate, Utc};
-#[cfg(feature = "magic-gateway")]
-use chrono::{FixedOffset, NaiveTime};
 #[cfg(feature = "magic-gateway")]
 use magic_market_core::{DataStatus, Quote};
 #[cfg(feature = "magic-gateway")]
@@ -206,7 +206,7 @@ impl MarketDataGateway {
         &self,
         codes: &[String],
     ) -> Result<GatewayBatch<RealtimeMarketQuote>, GatewayError> {
-        let request_hash = acquisition_request_hash(CAPABILITY, &codes.join(","));
+        let request_hash = acquisition_request_hash(CAPABILITY, codes.join(","));
         // P4 M2 钩子: DATA_GATEWAY_GRPC=1 → gRPC 通道 (fail-closed, audit 对等)。
         match super::grpc_source::bridge_for("RealtimeQuotes") {
             Ok(Some(bridge)) => {
@@ -308,7 +308,7 @@ impl MarketDataGateway {
         {
             let request_hash = acquisition_request_hash(
                 CAPABILITY,
-                &format!("settled:{trading_date}:{}", codes.join(",")),
+                format!("settled:{trading_date}:{}", codes.join(",")),
             );
             let instruments = match build_instruments(codes) {
                 Ok(instruments) => instruments,
@@ -522,7 +522,19 @@ fn route_quotes(
     }
 
     match last_failure {
-        Some((provider, error)) => (provider, Err(error)),
+        Some((provider, error)) => (
+            provider,
+            Err(GatewayError::unavailable(
+                CAPABILITY,
+                Some(provider),
+                error.retryable(),
+                format!(
+                    "no realtime quote provider returned one complete admitted set; \
+                     last_provider={provider:?} last_reason={}: {error}",
+                    error.reason_code()
+                ),
+            )),
+        ),
         None => (
             ProviderId::Tdx,
             Err(GatewayError::unavailable(
@@ -755,38 +767,8 @@ fn quote_chain_source(
     }
 }
 
-#[cfg(feature = "magic-gateway")]
+#[cfg(all(test, feature = "magic-gateway"))]
 const SHANGHAI_OFFSET_SECONDS: i32 = 8 * 60 * 60;
-
-/// BR-236 (2026-08-12): 午休/盘后静态快照放行的节流状态 — 每个 (北京日期,
-/// 会话) 首次放行 warn 一次, 后续 debug。盘后 9 小时 ≈ 540 批次, 逐批
-/// warn 会刷屏; v15.x 规则要求出声, 会话级一次即满足。
-#[cfg(feature = "magic-gateway")]
-static OFF_SESSION_WARN_STATE: OnceLock<Mutex<Option<(NaiveDate, bool)>>> = OnceLock::new();
-
-/// BR-236: 北京时间午休 [11:30, 13:00) 或盘后 [15:00, 24:00)。
-/// 与 machine 时区解耦 (显式 +08, company.rs:29 同款), 测试确定性强。
-#[cfg(feature = "magic-gateway")]
-fn in_lunch_or_after_hours(now: DateTime<Utc>) -> bool {
-    let t = now
-        .with_timezone(&FixedOffset::east_opt(SHANGHAI_OFFSET_SECONDS).expect("+08 offset"))
-        .time();
-    (t >= NaiveTime::from_hms_opt(11, 30, 0).expect("11:30")
-        && t < NaiveTime::from_hms_opt(13, 0, 0).expect("13:00"))
-        || t >= NaiveTime::from_hms_opt(15, 0, 0).expect("15:00")
-}
-
-/// BR-236: 超龄 quote 在午休/盘后且 source_at 与 now 同为今日北京时间 →
-/// 当日最后成交价 = 合法静态快照 (BR-233 同源语义, 非实时价)。盘中/盘前
-/// (source_at 为上一交易日) 一律 false → 维持 BR-218 5s 红线。
-#[cfg(feature = "magic-gateway")]
-fn off_session_static_quote_eligible(now: DateTime<Utc>, source_at: DateTime<Utc>) -> bool {
-    if !in_lunch_or_after_hours(now) {
-        return false;
-    }
-    let zone = FixedOffset::east_opt(SHANGHAI_OFFSET_SECONDS).expect("+08 offset");
-    now.with_timezone(&zone).date_naive() == source_at.with_timezone(&zone).date_naive()
-}
 
 #[cfg(feature = "magic-gateway")]
 fn admit_quote_batch(
@@ -819,9 +801,12 @@ fn admit_quote_batch_at(
         ));
     }
     if batch.records().len() != storage_codes.len() {
-        return Err(GatewayError::invalid_evidence(
+        return Err(GatewayError::classified(
             CAPABILITY,
             Some(provider),
+            "partial",
+            "quote_batch_incomplete",
+            true,
             format!(
                 "quote cardinality mismatch requested={} actual={}",
                 storage_codes.len(),
@@ -838,7 +823,6 @@ fn admit_quote_batch_at(
     )?;
     let mut records = Vec::with_capacity(batch.records().len());
     let mut stale_exclusions: Vec<String> = Vec::new();
-    let mut off_session_admissions: Vec<String> = Vec::new();
     for (storage_code, quote) in storage_codes.iter().zip(batch.records()) {
         let expected = build_instrument(storage_code)?;
         if quote.instrument() != &expected
@@ -899,22 +883,25 @@ fn admit_quote_batch_at(
         )?;
         match mode {
             QuoteAdmissionMode::RealtimeFiveSecond => {
-                let age_ms = now.signed_duration_since(source_at).num_milliseconds();
-                if !(0..=5_000).contains(&age_ms) {
-                    // BR-218: the five-second red line is judged per record. A stale
-                    // record is excluded outright — never repaired, back-filled or
-                    // served from a previous round — but it must not discard the
-                    // records that did meet the gate.
-                    if off_session_static_quote_eligible(now, source_at) {
-                        // BR-236: 午休/盘后 — source_at 与 now 同为今日北京日期,
-                        // 价格 = 当日最后成交价, 是合法静态快照 (BR-233 同源
-                        // 语义), 只是非实时。放行而非排除; 盘中真断流走
-                        // router/provider 层错误, 不会到达此处。
-                        off_session_admissions.push(format!("{storage_code}@{age_ms}ms"));
-                    } else {
-                        stale_exclusions.push(format!("{storage_code}@{age_ms}ms"));
-                        continue;
-                    }
+                let age = now.signed_duration_since(source_at);
+                if source_at > now || age > chrono::Duration::seconds(5) {
+                    // GRPC-20260818-002 / BR-218: this provider did not
+                    // produce one exact fresh set. Returning the remaining
+                    // records as `Available` would let the server advertise a
+                    // partial response as complete. Keep the error retryable
+                    // so `route_quotes` can try the next registered provider.
+                    return Err(GatewayError::classified(
+                        CAPABILITY,
+                        Some(provider),
+                        "stale",
+                        "quote_stale",
+                        true,
+                        format!(
+                            "provider attempt is incomplete because requested quote \
+                             {storage_code} failed the five-second freshness gate: \
+                             source_at={source_at}, admission_at={now}"
+                        ),
+                    ));
                 }
             }
             QuoteAdmissionMode::SettledClose { trading_date } => {
@@ -993,37 +980,6 @@ fn admit_quote_batch_at(
             stale_exclusions.join(",")
         );
     }
-    if !off_session_admissions.is_empty() {
-        // BR-236: 每 (北京日期, 会话) 首次 warn, 后续 debug — 盘后 9 小时
-        // ≈540 批次不刷屏, 同时满足 v15.x 出声原则 (会话级一次)。
-        let zone = FixedOffset::east_opt(SHANGHAI_OFFSET_SECONDS).expect("+08 offset");
-        let today = now.with_timezone(&zone).date_naive();
-        let t = now.with_timezone(&zone).time();
-        let is_lunch = t >= NaiveTime::from_hms_opt(11, 30, 0).expect("11:30")
-            && t < NaiveTime::from_hms_opt(13, 0, 0).expect("13:00");
-        let mut state = OFF_SESSION_WARN_STATE
-            .get_or_init(|| Mutex::new(None))
-            .lock()
-            .expect("off-session warn state");
-        if *state != Some((today, is_lunch)) {
-            *state = Some((today, is_lunch));
-            log::warn!(
-                "[DataGateway][RealtimeMarketQuotes][BR-236] 午休/盘后静态快照放行 \
-                 provider={provider:?} batch_id={} admitted={} off_session=[{}]",
-                evidence.batch_id,
-                records.len(),
-                off_session_admissions.join(",")
-            );
-        } else {
-            log::debug!(
-                "[DataGateway][RealtimeMarketQuotes][BR-236] 午休/盘后静态快照放行 \
-                 admitted={} off_session=[{}]",
-                records.len(),
-                off_session_admissions.join(",")
-            );
-        }
-    }
-
     Ok(GatewayBatch::Available { records, evidence })
 }
 
@@ -1215,13 +1171,11 @@ mod tests {
         DataBatch::strict(quotes, provenance)
     }
 
-    /// BR-218 / AGENTS §2.4 + §2.2: one instrument whose feed lagged past five
-    /// seconds must be excluded, not allowed to discard the fresh records
-    /// alongside it. This is the defect that produced zero live quotes: free
-    /// feeds lag 0.5–5s per instrument independently, so an all-or-nothing
-    /// batch verdict almost never passes for a realistic watchlist.
+    /// BR-218 / GRPC-20260818-002: one stale member makes the provider attempt
+    /// incomplete. The fresh subset must not be promoted to a complete batch;
+    /// the retryable verdict lets the provider route try its next source.
     #[test]
-    fn br218_stale_record_is_excluded_without_discarding_fresh_records() {
+    fn br218_stale_member_rejects_provider_attempt_retryably() {
         let now = Utc::now();
         let codes = vec![
             "600396".to_owned(),
@@ -1238,27 +1192,23 @@ mod tests {
             "TEST_CODE_partition_batch",
         );
 
-        let admitted = admit_quote_batch(
+        let error = admit_quote_batch(
             &codes,
             ProviderId::Tencent,
             batch,
             QuoteAdmissionMode::RealtimeFiveSecond,
         )
-        .expect("fresh records must survive a stale sibling");
-        let kept = admitted
-            .records()
-            .iter()
-            .map(|record| record.code.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            kept,
-            vec!["600396", "600036"],
-            "the stale instrument stays absent; it is never repaired or back-filled"
+        .expect_err("a stale member must reject the whole provider attempt");
+
+        assert_eq!(error.reason_code(), "quote_stale");
+        assert!(
+            error.retryable(),
+            "staleness must continue provider failover"
         );
     }
 
-    /// BR-218: excluding stale records must not weaken the red line. When every
-    /// record is stale the batch still fails retryably so BR-217 fails over.
+    /// BR-218: an all-stale provider batch also fails retryably so BR-217 can
+    /// continue to the next provider.
     #[test]
     fn br218_all_stale_records_still_fail_the_batch_retryably() {
         let now = Utc::now();
@@ -1286,6 +1236,115 @@ mod tests {
         );
     }
 
+    /// GRPC-20260818-002: a provider that omits one requested instrument is
+    /// retryable so the route can try the next registered provider. Missing
+    /// data is never represented as a successful subset.
+    #[test]
+    fn br218_missing_member_rejects_provider_attempt_retryably() {
+        let now = bj(2026, 8, 12, 10, 30, 0);
+        let codes = vec!["600396".to_owned(), "600519".to_owned()];
+        let batch = quote_batch(
+            "600396",
+            ProviderId::Tencent,
+            "TEST_CODE_br218_missing_member",
+            now - chrono::Duration::seconds(1),
+        );
+
+        let error = admit_quote_batch_at(
+            now,
+            &codes,
+            ProviderId::Tencent,
+            batch,
+            QuoteAdmissionMode::RealtimeFiveSecond,
+        )
+        .expect_err("a missing member must reject the whole provider attempt");
+
+        assert_eq!(error.reason_code(), "quote_batch_incomplete");
+        assert!(
+            error.retryable(),
+            "a missing member must continue provider failover"
+        );
+    }
+
+    /// BR-218 / AGENTS §2.4: the five-second boundary is exact. A quote
+    /// older than it by one nanosecond must not enter the admitted records.
+    #[test]
+    fn br218_rejects_quote_older_than_five_seconds_by_one_nanosecond() {
+        let now = bj(2026, 8, 12, 10, 30, 0);
+        let codes = vec!["600396".to_owned()];
+        let source_at = now - chrono::Duration::seconds(5) - chrono::Duration::nanoseconds(1);
+        let batch = quote_batch(
+            "600396",
+            ProviderId::Tencent,
+            "TEST_CODE_br218_five_seconds_plus_one_ns",
+            source_at,
+        );
+
+        let error = admit_quote_batch_at(
+            now,
+            &codes,
+            ProviderId::Tencent,
+            batch,
+            QuoteAdmissionMode::RealtimeFiveSecond,
+        )
+        .expect_err("5s + 1ns evidence must be excluded, leaving an explicit stale batch");
+
+        assert_eq!(error.reason_code(), "quote_stale");
+        assert!(error.retryable());
+    }
+
+    /// BR-218 / AGENTS §2.4: future evidence is invalid even when it is
+    /// ahead of the admission clock by less than one millisecond.
+    #[test]
+    fn br218_rejects_quote_from_one_nanosecond_in_the_future() {
+        let now = bj(2026, 8, 12, 10, 30, 0);
+        let codes = vec!["600396".to_owned()];
+        let batch = quote_batch(
+            "600396",
+            ProviderId::Tencent,
+            "TEST_CODE_br218_future_one_ns",
+            now + chrono::Duration::nanoseconds(1),
+        );
+
+        let error = admit_quote_batch_at(
+            now,
+            &codes,
+            ProviderId::Tencent,
+            batch,
+            QuoteAdmissionMode::RealtimeFiveSecond,
+        )
+        .expect_err("future evidence must be excluded, leaving an explicit stale batch");
+
+        assert_eq!(error.reason_code(), "quote_stale");
+        assert!(error.retryable());
+    }
+
+    /// BR-218 / AGENTS §2.4: exactly five seconds old remains admissible.
+    #[test]
+    fn br218_accepts_quote_at_exactly_five_seconds() {
+        let now = bj(2026, 8, 12, 10, 30, 0);
+        let codes = vec!["600396".to_owned()];
+        let source_at = now - chrono::Duration::seconds(5);
+        let batch = quote_batch(
+            "600396",
+            ProviderId::Tencent,
+            "TEST_CODE_br218_exact_five_seconds",
+            source_at,
+        );
+
+        let admitted = admit_quote_batch_at(
+            now,
+            &codes,
+            ProviderId::Tencent,
+            batch,
+            QuoteAdmissionMode::RealtimeFiveSecond,
+        )
+        .expect("exactly five-second-old evidence must remain admissible");
+
+        assert_eq!(admitted.records().len(), 1);
+        assert_eq!(admitted.records()[0].source_at, source_at);
+    }
+
     /// 北京时间固定时钟构造器（BR-236 测试共用）。
     fn bj(y: i32, m: u32, d: u32, hh: u32, mm: u32, ss: u32) -> DateTime<Utc> {
         let zone = FixedOffset::east_opt(SHANGHAI_OFFSET_SECONDS).expect("+08 offset");
@@ -1299,60 +1358,10 @@ mod tests {
             .with_timezone(&Utc)
     }
 
-    /// BR-236: 午休/盘后时段边界 — [11:30,13:00) ∪ [15:00,24:00) (北京时间)。
+    /// BR-218: lunch does not weaken the realtime contract. Same-day stale
+    /// records remain excluded and an all-stale batch fails explicitly.
     #[test]
-    fn br236_session_boundaries() {
-        // 午休前 1 秒 → 否
-        assert!(!in_lunch_or_after_hours(bj(2026, 8, 12, 11, 29, 59)));
-        // 午休起点/终点
-        assert!(in_lunch_or_after_hours(bj(2026, 8, 12, 11, 30, 0)));
-        assert!(in_lunch_or_after_hours(bj(2026, 8, 12, 12, 59, 59)));
-        assert!(!in_lunch_or_after_hours(bj(2026, 8, 12, 13, 0, 0)));
-        // 下午盘中 → 否
-        assert!(!in_lunch_or_after_hours(bj(2026, 8, 12, 14, 59, 59)));
-        // 盘后起点/深夜
-        assert!(in_lunch_or_after_hours(bj(2026, 8, 12, 15, 0, 0)));
-        assert!(in_lunch_or_after_hours(bj(2026, 8, 12, 23, 59, 59)));
-        // 盘前 → 否
-        assert!(!in_lunch_or_after_hours(bj(2026, 8, 12, 9, 15, 0)));
-        assert!(!in_lunch_or_after_hours(bj(2026, 8, 12, 9, 30, 0)));
-    }
-
-    /// BR-236: eligibility — 仅当 now 处于午休/盘后且 source_at 与 now 同为
-    /// 今日北京日期才放行。
-    #[test]
-    fn br236_off_session_eligibility() {
-        let lunch_now = bj(2026, 8, 12, 11, 45, 0);
-        let today_source = bj(2026, 8, 12, 11, 30, 0);
-        let yesterday_source = bj(2026, 8, 11, 15, 0, 0);
-        // 午休 + 当日 source → 放行
-        assert!(off_session_static_quote_eligible(lunch_now, today_source));
-        // 午休 + 昨日 source → 拒绝
-        assert!(!off_session_static_quote_eligible(
-            lunch_now,
-            yesterday_source
-        ));
-        // 盘中 → 拒绝 (即使当日 source)
-        assert!(!off_session_static_quote_eligible(
-            bj(2026, 8, 12, 10, 0, 0),
-            today_source
-        ));
-        // 盘前 → 拒绝
-        assert!(!off_session_static_quote_eligible(
-            bj(2026, 8, 12, 9, 15, 0),
-            today_source
-        ));
-        // 盘后 + 当日 source → 放行
-        assert!(off_session_static_quote_eligible(
-            bj(2026, 8, 12, 15, 30, 0),
-            bj(2026, 8, 12, 15, 0, 0)
-        ));
-    }
-
-    /// BR-236: 午休 30s/40s 超龄的当日静态快照 → 放行且记录保真
-    /// (落在 records, 不是 stale 排除)。
-    #[test]
-    fn br236_lunch_admits_same_day_stale_quote() {
+    fn br218_lunch_rejects_same_day_stale_quotes() {
         let now = bj(2026, 8, 12, 11, 45, 0);
         let codes = vec!["600396".to_owned(), "600519".to_owned()];
         let batch = quote_batch_multi(
@@ -1363,30 +1372,22 @@ mod tests {
             ProviderId::Tencent,
             "TEST_CODE_br236_lunch",
         );
-        let admitted = admit_quote_batch_at(
+        let error = admit_quote_batch_at(
             now,
             &codes,
             ProviderId::Tencent,
             batch,
             QuoteAdmissionMode::RealtimeFiveSecond,
         )
-        .expect("lunch same-day static snapshot must be admitted");
-        let kept = admitted
-            .records()
-            .iter()
-            .map(|record| record.code.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            kept,
-            vec!["600396", "600519"],
-            "off-session admission keeps the same-day quotes"
-        );
+        .expect_err("lunch must not promote stale quotes into realtime records");
+        assert_eq!(error.reason_code(), "quote_stale");
+        assert!(error.retryable());
     }
 
-    /// BR-236: 盘后整批超龄当日快照 → 放行 (BR-218 的整批 quote_stale 仅在
-    /// 排除为空时兜底, 此处应走 off-session 放行而非失败)。
+    /// BR-218: after hours does not weaken the realtime contract. Settled
+    /// closes are available only through the distinct `SettledClose` mode.
     #[test]
-    fn br236_after_hours_admits_same_day_stale_quote() {
+    fn br218_after_hours_rejects_same_day_stale_quote() {
         let now = bj(2026, 8, 12, 15, 30, 0);
         let codes = vec!["600396".to_owned()];
         let batch = quote_batch_multi(
@@ -1394,15 +1395,16 @@ mod tests {
             ProviderId::Tencent,
             "TEST_CODE_br236_after_hours",
         );
-        let admitted = admit_quote_batch_at(
+        let error = admit_quote_batch_at(
             now,
             &codes,
             ProviderId::Tencent,
             batch,
             QuoteAdmissionMode::RealtimeFiveSecond,
         )
-        .expect("after-hours same-day static snapshot must be admitted");
-        assert_eq!(admitted.records().len(), 1);
+        .expect_err("after-hours must not promote stale quotes into realtime records");
+        assert_eq!(error.reason_code(), "quote_stale");
+        assert!(error.retryable());
     }
 
     /// BR-236: 盘前超龄 → 不适用 off-session 放行, 维持 BR-218 整批 quote_stale
@@ -1431,7 +1433,8 @@ mod tests {
         );
     }
 
-    /// BR-236: 盘中维持 BR-218 语义 — 超龄排除、新鲜保留 (注入固定 now)。
+    /// BR-236 / GRPC-20260818-002: intraday keeps the exact-set BR-218
+    /// contract. One stale member rejects the complete provider attempt.
     #[test]
     fn br236_intraday_keeps_br218_semantics() {
         let now = bj(2026, 8, 12, 10, 30, 0);
@@ -1444,23 +1447,18 @@ mod tests {
             ProviderId::Tencent,
             "TEST_CODE_br236_intraday",
         );
-        let admitted = admit_quote_batch_at(
+        let error = admit_quote_batch_at(
             now,
             &codes,
             ProviderId::Tencent,
             batch,
             QuoteAdmissionMode::RealtimeFiveSecond,
         )
-        .expect("fresh record must survive a stale sibling intraday");
-        let kept = admitted
-            .records()
-            .iter()
-            .map(|record| record.code.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            kept,
-            vec!["600396"],
-            "intraday keeps BR-218 per-record exclusion semantics"
+        .expect_err("a stale intraday member must reject the provider attempt");
+        assert_eq!(error.reason_code(), "quote_stale");
+        assert!(
+            error.retryable(),
+            "intraday staleness must continue provider failover"
         );
     }
 
@@ -1956,7 +1954,11 @@ mod tests {
             QuoteAdmissionMode::RealtimeFiveSecond,
         )
         .unwrap_err();
-        assert_eq!(cardinality.reason_code(), "invalid_evidence");
+        assert_eq!(cardinality.reason_code(), "quote_batch_incomplete");
+        assert!(
+            cardinality.retryable(),
+            "missing provider records must continue failover"
+        );
 
         let identity = admit_quote_batch(
             &["TEST_CODE_600396".to_owned()],

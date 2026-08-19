@@ -135,6 +135,8 @@ mod br196_transport;
 
 mod presentation_registry;
 
+mod p01;
+
 mod push_templates;
 
 mod review_batch;
@@ -1454,7 +1456,7 @@ async fn run_daily_pushes() -> Result<(), String> {
     use push_templates::{
         dispatch_catalyst_review_daily, dispatch_industry_chain_intraday_daily,
         dispatch_intraday_market_daily, dispatch_news_catalyst_daily, dispatch_news_to_idea_daily,
-        dispatch_paper_review_daily, dispatch_preopen_news_hot_daily,
+        dispatch_paper_review_daily,
     };
 
     use stock_analysis::opportunity::scheduler::{OpportunitySchedule, PushWindow};
@@ -1487,10 +1489,9 @@ async fn run_daily_pushes() -> Result<(), String> {
 
     match window {
         PushWindow::Preopen => {
-            report_dispatch_outcome(
-                "P-01",
-                dispatch_preopen_news_hot_daily().await,
-                &mut failures,
+            failures.push(
+                "P-01 is owned by the BR-241 resident scheduler or the exclusive --compensate=P-01 command"
+                    .to_owned(),
             );
         }
 
@@ -2112,23 +2113,6 @@ mod tests_br236_valuation_note {
     }
 }
 
-#[cfg(test)]
-mod tests_br236_keepalive_gate {
-    use super::off_session_keepalive_due;
-    use stock_analysis::calendar::MarketSession;
-
-    /// BR-236: 六枚举门控全表 — 仅午休/盘后需要 keepalive 保活。
-    #[test]
-    fn gate_table_all_six_sessions() {
-        assert!(off_session_keepalive_due(MarketSession::LunchBreak));
-        assert!(off_session_keepalive_due(MarketSession::AfterHours));
-        assert!(!off_session_keepalive_due(MarketSession::Closed));
-        assert!(!off_session_keepalive_due(MarketSession::Auction));
-        assert!(!off_session_keepalive_due(MarketSession::Morning));
-        assert!(!off_session_keepalive_due(MarketSession::Afternoon));
-    }
-}
-
 /// v41 + v51: 周期刷新 banner (从 AccountMode + DataMode 评估结果合并)
 
 ///   - v51: DataMode 也走真值 (调 dm_evaluate, 不是写死 Full)
@@ -2730,98 +2714,6 @@ async fn data_mode_monitor_loop() {
     .await;
 }
 
-/// BR-236 (2026-08-12): 午休/盘后保持 Quote capability 新鲜 (DataMode Full)。
-/// tick 循环在午休 sleep / 盘后 break (main.rs:9187-9197), 无调用者执行
-/// fetch_position_quotes → 无 Quote mark → 120s 门过期 → Unsafe。keepalive
-/// 在这两个时段每 60s 拉一次持仓行情 (网关层 BR-236 二级判定放行当日
-/// 最后成交价), 成功即 mark。失败 warn 出声且不 mark → DataMode 诚实降级。
-/// 周末/节假日 current_session()==Closed → 不运行 (零调用)。
-fn off_session_keepalive_due(session: MarketSession) -> bool {
-    matches!(
-        session,
-        MarketSession::LunchBreak | MarketSession::AfterHours
-    )
-}
-
-const OFF_SESSION_KEEPALIVE_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// 会话边界 info 节流 — 每 (北京日期, 会话) 进入时打一次, 避免 60s 周期
-/// 重复刷信息。
-static OFF_SESSION_KEEPALIVE_ANNOUNCED: std::sync::Mutex<Option<(chrono::NaiveDate, bool)>> =
-    std::sync::Mutex::new(None);
-
-async fn off_session_quote_keepalive_loop() {
-    log::info!(
-        "[BR-236] off-session quote keepalive scheduler started period={}s",
-        OFF_SESSION_KEEPALIVE_PERIOD.as_secs()
-    );
-    run_data_mode_scheduler(
-        data_mode_evaluation_interval(OFF_SESSION_KEEPALIVE_PERIOD),
-        || async {
-            let session = stock_analysis::calendar::current_session();
-            if !off_session_keepalive_due(session) {
-                return;
-            }
-            let today = chrono::Local::now().date_naive();
-            let is_lunch = matches!(session, MarketSession::LunchBreak);
-            if let Ok(mut announced) = OFF_SESSION_KEEPALIVE_ANNOUNCED.lock() {
-                if *announced != Some((today, is_lunch)) {
-                    *announced = Some((today, is_lunch));
-                    log::info!(
-                        "[BR-236] off-session quote keepalive active session={:?} date={today}",
-                        session
-                    );
-                }
-            }
-            match tokio::task::spawn_blocking(crate::market_data::fetch_position_quotes).await {
-                Ok(Ok(quotes)) if !quotes.is_empty() => {
-                    // mark 在 fetch_position_quotes 内部完成 (bin/monitor/market_data.rs:118)
-                    log::debug!(
-                        "[BR-236] off-session keepalive refreshed positions={}",
-                        quotes.len()
-                    );
-                }
-                Ok(Ok(_)) => {
-                    // 快照缺失/过期且本地无持仓: 兜底探测基准代码 (与盘前
-                    // 探测 main.rs:7641 同款, mark 在 fetch_realtime_quote_batch :136)。
-                    let probe = ["000001", "600000", "300750"]
-                        .iter()
-                        .map(|code| code.to_string())
-                        .collect::<Vec<_>>();
-                    match tokio::task::spawn_blocking(move || {
-                        crate::market_data::fetch_realtime_quotes(&probe)
-                    })
-                    .await
-                    {
-                        Ok(Ok(rows)) if !rows.is_empty() => {
-                            log::debug!(
-                                "[BR-236] off-session keepalive probe fallback rows={}",
-                                rows.len()
-                            );
-                        }
-                        Ok(Ok(_)) => {
-                            log::warn!("[BR-236] off-session keepalive probe returned no rows");
-                        }
-                        Ok(Err(error)) => {
-                            log::warn!("[BR-236] off-session keepalive probe failed: {error}");
-                        }
-                        Err(error) => {
-                            log::warn!("[BR-236] off-session keepalive probe join failed: {error}");
-                        }
-                    }
-                }
-                Ok(Err(error)) => {
-                    log::warn!("[BR-236] off-session quote keepalive failed: {error}");
-                }
-                Err(error) => {
-                    log::warn!("[BR-236] off-session keepalive join failed: {error}");
-                }
-            }
-        },
-    )
-    .await;
-}
-
 #[cfg(test)]
 mod br135_data_mode_reminder_tests {
     use super::*;
@@ -3367,6 +3259,7 @@ fn print_event_help() {
     eprintln!("       monitor --test --push-dry-run");
     eprintln!("       monitor --review");
     eprintln!("       monitor --test --review");
+    eprintln!("       monitor --compensate=P-01 --business-date=YYYY-MM-DD");
     eprintln!("       monitor --replay=YYYY-MM-DD [--replay-force] [--replay-rate-ms=N]");
     eprintln!("       monitor --history [--date=YYYY-MM-DD] [--code=CODE] [--kind=KIND]");
     eprintln!("                         [--limit=N] [--success-rate] [--sink=SINK]");
@@ -3382,6 +3275,7 @@ fn print_event_help() {
         "--test --push-dry-run validates the same catalog and audit logs without external delivery."
     );
     eprintln!("--review is production-strict and requires fresh, complete real account evidence.");
+    eprintln!("--compensate=P-01 is an exclusive production-only late recovery after 09:15.");
     eprintln!(
         "--test --review verifies that the strict review fails closed without live evidence."
     );
@@ -3402,6 +3296,153 @@ fn service_enablement_required(arguments: &[String]) -> bool {
 fn runtime_data_path(test_mode: bool, leaf: &str) -> std::path::PathBuf {
     let root = if test_mode { "data/test" } else { "data" };
     std::path::PathBuf::from(root).join(leaf)
+}
+
+#[derive(Debug)]
+enum MonitorInstanceLeaseError {
+    AlreadyRunning {
+        path: std::path::PathBuf,
+    },
+    Io {
+        action: &'static str,
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl MonitorInstanceLeaseError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::AlreadyRunning { .. } => "monitor_instance_already_running",
+            Self::Io { .. } => "monitor_instance_lease_io_error",
+        }
+    }
+}
+
+impl std::fmt::Display for MonitorInstanceLeaseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyRunning { path } => {
+                write!(
+                    formatter,
+                    "monitor lease is already held: {}",
+                    path.display()
+                )
+            }
+            Self::Io {
+                action,
+                path,
+                source,
+            } => write!(
+                formatter,
+                "{action} monitor lease {}: {source}",
+                path.display()
+            ),
+        }
+    }
+}
+
+struct MonitorInstanceLease {
+    _file: std::fs::File,
+    production: bool,
+}
+
+fn monitor_instance_lease_path(test_mode: bool) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("data")
+        .join("locks")
+        .join(if test_mode { "test" } else { "production" })
+        .join("monitor-delivery.lock")
+}
+
+fn acquire_monitor_instance_lease(
+    test_mode: bool,
+) -> Result<MonitorInstanceLease, MonitorInstanceLeaseError> {
+    let mut lease = acquire_monitor_instance_lease_at(&monitor_instance_lease_path(test_mode))?;
+    lease.production = !test_mode;
+    Ok(lease)
+}
+
+fn acquire_monitor_instance_lease_at(
+    path: &std::path::Path,
+) -> Result<MonitorInstanceLease, MonitorInstanceLeaseError> {
+    let parent = path.parent().ok_or_else(|| MonitorInstanceLeaseError::Io {
+        action: "resolve parent for",
+        path: path.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "monitor lease path has no parent",
+        ),
+    })?;
+    std::fs::create_dir_all(parent).map_err(|source| MonitorInstanceLeaseError::Io {
+        action: "create parent for",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|source| MonitorInstanceLeaseError::Io {
+            action: "open",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    fs2::FileExt::try_lock_exclusive(&file).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::WouldBlock {
+            MonitorInstanceLeaseError::AlreadyRunning {
+                path: path.to_path_buf(),
+            }
+        } else {
+            MonitorInstanceLeaseError::Io {
+                action: "acquire",
+                path: path.to_path_buf(),
+                source,
+            }
+        }
+    })?;
+    Ok(MonitorInstanceLease {
+        _file: file,
+        production: false,
+    })
+}
+
+#[cfg(test)]
+mod tests_br238_monitor_instance_lease {
+    #[test]
+    fn br238_monitor_instance_lease_is_exclusive_and_released_with_owner() {
+        let lease_root = std::env::temp_dir().join(format!(
+            "TEST_CODE_BR238_MONITOR_LEASE_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let lease_path = lease_root.join("monitor-delivery.lock");
+
+        let production_path = super::monitor_instance_lease_path(false);
+        let test_path = super::monitor_instance_lease_path(true);
+        assert_ne!(production_path, test_path);
+        assert!(production_path.ends_with("data/locks/production/monitor-delivery.lock"));
+        assert!(test_path.ends_with("data/locks/test/monitor-delivery.lock"));
+
+        let first = super::acquire_monitor_instance_lease_at(&lease_path)
+            .expect("first monitor owns the exclusive lease");
+        let second = super::acquire_monitor_instance_lease_at(&lease_path);
+        let error = match second {
+            Ok(_) => panic!("second monitor unexpectedly acquired the same lease"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), "monitor_instance_already_running");
+
+        drop(first);
+        let replacement = super::acquire_monitor_instance_lease_at(&lease_path)
+            .expect("OS releases the monitor lease with its owner handle");
+        drop(replacement);
+
+        std::fs::remove_file(&lease_path).expect("remove isolated lease file");
+        std::fs::remove_dir(&lease_root).expect("remove isolated lease directory");
+    }
 }
 
 fn allocate_durable_test_code() -> Result<String, String> {
@@ -3507,6 +3548,235 @@ fn allocate_test_core_database_path() -> Result<std::path::PathBuf, String> {
 type JsonlWriterTask = tokio::task::JoinHandle<Result<(), stock_analysis::event::JsonlError>>;
 const JSONL_WRITER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const BACKGROUND_TASK_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const OPENING_READINESS_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn opening_failure_banner(
+    readiness_key: &'static str,
+    reason_code: &str,
+    retryable: bool,
+    capability: &str,
+) -> String {
+    format!(
+        "{readiness_key}=false reason_code={reason_code} retryable={retryable} capability={capability}"
+    )
+}
+
+fn opening_success_banner(
+    readiness_key: &'static str,
+    report: &stock_analysis::data_gateway::grpc_source::OpeningReadinessReport,
+) -> String {
+    format!(
+        "{readiness_key}=true routes={} route_names={}",
+        report.routes.len(),
+        report.route_names()
+    )
+}
+
+fn opening_static_failure_banner(reason_code: &str, retryable: bool, capability: &str) -> String {
+    opening_failure_banner("opening_static_ready", reason_code, retryable, capability)
+}
+
+fn opening_static_success_banner(
+    report: &stock_analysis::data_gateway::grpc_source::OpeningReadinessReport,
+) -> String {
+    format!(
+        "opening_static_ready=true routes={}/9 global_news={}/4 route_names={} degraded_routes={}",
+        report.routes.len(),
+        report.global_news_routes(),
+        report.route_names(),
+        report.degraded_route_names()
+    )
+}
+
+fn opening_live_failure_banner(reason_code: &str, retryable: bool, capability: &str) -> String {
+    opening_failure_banner("opening_data_ready", reason_code, retryable, capability)
+}
+
+fn opening_live_success_banner(
+    report: &stock_analysis::data_gateway::grpc_source::OpeningReadinessReport,
+) -> String {
+    opening_success_banner("opening_data_ready", report)
+}
+
+fn live_opening_window(session: MarketSession) -> bool {
+    matches!(
+        session,
+        MarketSession::Auction | MarketSession::Morning | MarketSession::Afternoon
+    )
+}
+
+/// BR-238 live readiness is operational observation only. It starts after the
+/// static gate and never delays P-01; every consumer still repeats its own
+/// exact five-second gate at the actual consumption clock.
+async fn opening_live_readiness_loop() {
+    let mut last_banner: Option<String> = None;
+    loop {
+        let session = current_session();
+        let (banner, report, failure) = if live_opening_window(session) {
+            match stock_analysis::data_gateway::grpc_source::external_live_opening_readiness().await
+            {
+                Ok(report) => {
+                    match stock_analysis::data_gateway::grpc_source::audit_opening_readiness_report(
+                        "OpeningLive",
+                        &report,
+                    ) {
+                        Ok(()) => (opening_live_success_banner(&report), Some(report), None),
+                        Err(error) => (
+                            opening_live_failure_banner(
+                                error.reason_code(),
+                                error.retryable(),
+                                error.capability(),
+                            ),
+                            None,
+                            Some(error),
+                        ),
+                    }
+                }
+                Err(error) => {
+                    let error = match stock_analysis::data_gateway::grpc_source::audit_opening_readiness_failure(
+                        "OpeningLive",
+                        &error,
+                    ) {
+                        Ok(()) => error,
+                        Err(audit_error) => audit_error,
+                    };
+                    (
+                        opening_live_failure_banner(
+                            error.reason_code(),
+                            error.retryable(),
+                            error.capability(),
+                        ),
+                        None,
+                        Some(error),
+                    )
+                }
+            }
+        } else {
+            (
+                opening_live_failure_banner(
+                    "pending_live_window",
+                    true,
+                    "RealtimeQuotes|OrderBooks|T0Evidence",
+                ),
+                None,
+                None,
+            )
+        };
+
+        if last_banner.as_deref() != Some(&banner) {
+            if let Some(report) = report {
+                for route in &report.routes {
+                    log::info!(
+                        "[opening-live][BR-238] route={} profile={} provider={:?} source={} \
+                         source_at={} observed_at={} batch_id={} records={}",
+                        route.route,
+                        route.profile,
+                        route.provider,
+                        route.source,
+                        route.source_at.as_deref().unwrap_or("absent"),
+                        route.observed_at,
+                        route.batch_id,
+                        route.records
+                    );
+                }
+                log::info!("{banner}");
+            } else if let Some(error) = failure {
+                if error.retryable() {
+                    log::warn!("{banner} detail={error}");
+                } else {
+                    log::error!("{banner} detail={error}");
+                }
+            } else {
+                log::info!("{banner} session={session:?}");
+            }
+            last_banner = Some(banner);
+        }
+
+        tokio::time::sleep(OPENING_READINESS_RETRY_INTERVAL).await;
+    }
+}
+
+#[cfg(test)]
+mod tests_br238_opening_readiness {
+    use super::{
+        live_opening_window, opening_live_failure_banner, opening_live_success_banner,
+        opening_static_failure_banner, opening_static_success_banner,
+    };
+    use stock_analysis::calendar::MarketSession;
+    use stock_analysis::data_gateway::grpc_source::{
+        OpeningReadinessReport, OpeningRouteReadiness,
+    };
+    use stock_analysis::magic_compat::ProviderId;
+
+    #[test]
+    fn br238_readiness_banners_are_stable_and_secret_free() {
+        let static_failure = opening_static_failure_banner(
+            "TEST_CODE_transport_unavailable",
+            true,
+            "TEST_CODE_SecurityMetadata",
+        );
+        assert_eq!(
+            static_failure,
+            "opening_static_ready=false reason_code=TEST_CODE_transport_unavailable retryable=true capability=TEST_CODE_SecurityMetadata"
+        );
+
+        let report = OpeningReadinessReport {
+            routes: vec![OpeningRouteReadiness {
+                route: "TEST_CODE_SecurityMetadata",
+                profile: "TEST_CODE_ExternalV1",
+                provider: ProviderId::Sina,
+                source: "TEST_CODE_source".to_string(),
+                source_at: Some("2026-08-17T09:20:00+08:00".to_string()),
+                observed_at: "2026-08-17T09:20:01+08:00".to_string(),
+                batch_id: "TEST_CODE_batch".to_string(),
+                records: 1,
+            }],
+            degraded_routes: Vec::new(),
+        };
+        assert_eq!(
+            opening_static_success_banner(&report),
+            "opening_static_ready=true routes=1/9 global_news=0/4 route_names=TEST_CODE_SecurityMetadata degraded_routes=none"
+        );
+
+        let live_failure = opening_live_failure_banner("quote_stale", true, "RealtimeQuotes");
+        assert_eq!(
+            live_failure,
+            "opening_data_ready=false reason_code=quote_stale retryable=true capability=RealtimeQuotes"
+        );
+        assert_eq!(
+            opening_live_success_banner(&report),
+            "opening_data_ready=true routes=1 route_names=TEST_CODE_SecurityMetadata"
+        );
+    }
+
+    #[test]
+    fn br238_live_opening_window_excludes_static_and_off_session_prices() {
+        assert!(live_opening_window(MarketSession::Auction));
+        assert!(live_opening_window(MarketSession::Morning));
+        assert!(live_opening_window(MarketSession::Afternoon));
+        assert!(!live_opening_window(MarketSession::Closed));
+        assert!(!live_opening_window(MarketSession::LunchBreak));
+        assert!(!live_opening_window(MarketSession::AfterHours));
+    }
+
+    #[test]
+    fn br238_static_gate_precedes_producers_while_live_gate_is_background_only() {
+        let source = include_str!("main.rs");
+        let gate = ["external_static_opening_", "readiness()"].concat();
+        let producer = ["strategy::v16_4::", "register_all()"].concat();
+        let gate_at = source.find(&gate).expect("opening gate exists");
+        let producer_at = source
+            .find(&producer)
+            .expect("producer registration exists");
+        assert!(gate_at < producer_at);
+        assert!(source.contains("if !test_mode && !review_mode"));
+        assert!(source.contains("tokio::spawn(opening_live_readiness_loop())"));
+        assert!(source.contains("opening_readiness=not_applicable mode=test"));
+        let forbidden_keepalive = ["off_session_quote_", "keepalive_loop"].concat();
+        assert!(!source.contains(&forbidden_keepalive));
+        assert!(source.contains("OPENING_READINESS_RETRY_INTERVAL"));
+    }
+}
 
 async fn quiesce_background_tasks(
     tasks: Vec<(&'static str, tokio::task::JoinHandle<()>)>,
@@ -3879,6 +4149,61 @@ async fn main() {
         log::info!("[monitor] disabled: MONITOR_ENABLED is not true");
         return;
     }
+    let test_mode = selection_cli.is_test();
+    // BR-192/Rule 2.5: reject a production dry-run configuration before the
+    // singleton lease or any durable runtime can be opened. This check is
+    // intentionally process-local and side-effect free so a running production
+    // monitor cannot mask the unsafe configuration with an AlreadyRunning error.
+    if !test_mode && std::env::var("V10_DRY_RUN_PUSH").as_deref() == Ok("1") {
+        eprintln!(
+            "[DurableDelivery][BR-192] production configuration rejected: V10_DRY_RUN_PUSH=1"
+        );
+        std::process::exit(2);
+    }
+    let read_only_history = matches!(
+        selection_cli.event_command(),
+        Some(stock_analysis::event::cli::EventCommand::History { .. })
+    );
+    let _monitor_instance_lease = if read_only_history {
+        None
+    } else {
+        match acquire_monitor_instance_lease(test_mode) {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                eprintln!("[BR-238] code={} {error}", error.code());
+                std::process::exit(2);
+            }
+        }
+    };
+    // BR-241: reject an invalid P-01 compensation command after acquiring the
+    // production singleton lease, but before audit/sink initialization or the
+    // global durable startup barrier can resume an unrelated PushKind.
+    let p01_compensation = selection_cli.p01_compensation_request().map(|request| {
+        let requested_business_date = request.business_date();
+        let captured_at = chrono::Local::now();
+        match p01::classify_compensation_due(requested_business_date, captured_at) {
+            p01::P01Due::Due(context) => {
+                let capability = durable_delivery_runtime::authorize_p01_compensation_scope(
+                    _monitor_instance_lease
+                        .as_ref()
+                        .expect("P-01 compensation requires the production monitor lease"),
+                    &selection_cli,
+                )
+                .unwrap_or_else(|reason_code| {
+                    eprintln!("[P-01][BR-241] compensation_rejected reason={reason_code}");
+                    std::process::exit(2);
+                });
+                (context, captured_at, capability)
+            }
+            p01::P01Due::NotDue(reason) => {
+                eprintln!(
+                    "[P-01][BR-241] compensation_rejected business_date={} reason={:?}",
+                    requested_business_date, reason
+                );
+                std::process::exit(2);
+            }
+        }
+    });
     let selection_v2_enabled = match selection_cli.selection_v2_disabled_reason_code() {
         Some(reason_code) => {
             log::warn!(
@@ -3889,7 +4214,6 @@ async fn main() {
         }
         None => true,
     };
-    let test_mode = selection_cli.is_test();
     let review_mode = selection_cli.is_review();
     let e2e_mode = selection_cli.is_e2e();
     if stock_analysis::data_gateway::cffex_futures_delivery_live_supported() {
@@ -4230,35 +4554,90 @@ async fn main() {
     );
 
     // BR-192: counted producers remain frozen until every unresolved business
-    // date has reached the durable local fixed point.  This barrier performs
-    // zero provider calls and never resends an uncertain receipt.
-    match durable_delivery_runtime::ensure_startup_reconciled().await {
-        Ok(evidence) => {
-            log::info!(
-                "[DurableDelivery][BR-192] startup fixed point reached progress={} resumed_sink_calls={} foreign_lease_boundaries={} manual_review_boundaries={} schedule_hydrations={}",
-                evidence.progress_count,
-                evidence.resumed_sink_calls,
-                evidence.non_progressable_foreign_attempts.len(),
-                evidence.non_progressable_manual_reviews.len(),
-                evidence.schedule_hydrations.len()
-            );
-            if !evidence.non_progressable_foreign_attempts.is_empty() {
-                log::warn!(
-                    "[DurableDelivery][BR-192] non-expired foreign attempts retained without resend: {:?}",
-                    evidence.non_progressable_foreign_attempts
+    // date has reached the durable local fixed point. P-01 compensation is an
+    // exclusive single-kind command, so it deliberately skips this global
+    // barrier and uses the P-01 stored-envelope reconcile seam instead.
+    if p01_compensation.is_none() {
+        match durable_delivery_runtime::ensure_startup_reconciled().await {
+            Ok(evidence) => {
+                log::info!(
+                    "[DurableDelivery][BR-192] startup fixed point reached progress={} resumed_sink_calls={} foreign_lease_boundaries={} manual_review_boundaries={} schedule_hydrations={}",
+                    evidence.progress_count,
+                    evidence.resumed_sink_calls,
+                    evidence.non_progressable_foreign_attempts.len(),
+                    evidence.non_progressable_manual_reviews.len(),
+                    evidence.schedule_hydrations.len()
                 );
+                if !evidence.non_progressable_foreign_attempts.is_empty() {
+                    log::warn!(
+                        "[DurableDelivery][BR-192] non-expired foreign attempts retained without resend: {:?}",
+                        evidence.non_progressable_foreign_attempts
+                    );
+                }
+                if !evidence.non_progressable_manual_reviews.is_empty() {
+                    log::warn!(
+                        "[DurableDelivery][BR-192] uncertain decisions retained for manual review without resend: {:?}",
+                        evidence.non_progressable_manual_reviews
+                    );
+                }
             }
-            if !evidence.non_progressable_manual_reviews.is_empty() {
-                log::warn!(
-                    "[DurableDelivery][BR-192] uncertain decisions retained for manual review without resend: {:?}",
-                    evidence.non_progressable_manual_reviews
-                );
+            Err(error) => {
+                log::error!("[DurableDelivery][BR-192] producer activation blocked: {error}");
+                exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 2).await;
             }
         }
-        Err(error) => {
-            log::error!("[DurableDelivery][BR-192] producer activation blocked: {error}");
-            exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 2).await;
-        }
+    } else {
+        log::info!(
+            "[P-01][BR-241] global durable startup reconciliation skipped; compensation owns only the P-01 BusinessDateOnce claim"
+        );
+    }
+
+    if let Some((context, captured_at, capability)) = p01_compensation {
+        let exit_code = match p01::run_p01_compensation_once(&capability, context, captured_at)
+            .await
+        {
+            p01::P01RunOutcome::Delivered {
+                decision_identity,
+                receipt_sha256,
+            } => {
+                log::info!(
+                            "[P-01][BR-241] compensation_delivered business_date={} decision={} receipt_sha256={}",
+                            context.business_date,
+                            decision_identity,
+                            receipt_sha256
+                        );
+                0
+            }
+            p01::P01RunOutcome::AlreadyDelivered { decision_identity } => {
+                log::info!(
+                    "[P-01][BR-241] compensation_already_delivered business_date={} decision={}",
+                    context.business_date,
+                    decision_identity
+                );
+                0
+            }
+            p01::P01RunOutcome::AwaitingReconciliation { attempt_identity } => {
+                log::error!(
+                            "[P-01][BR-241] compensation_awaiting_reconciliation business_date={} attempt={}",
+                            context.business_date,
+                            attempt_identity
+                        );
+                2
+            }
+            p01::P01RunOutcome::RetryableFailure(failure)
+            | p01::P01RunOutcome::TerminalFailure(failure) => {
+                log::error!(
+                            "[P-01][BR-241] compensation_failed business_date={:?} evidence_date={:?} reason_code={} retryable={} stage={}",
+                            failure.business_date(),
+                            failure.evidence_date(),
+                            failure.reason_code(),
+                            failure.retryable(),
+                            failure.stage()
+                        );
+                2
+            }
+        };
+        exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, exit_code).await;
     }
 
     log::info!(
@@ -4301,31 +4680,85 @@ async fn main() {
         stock_analysis::data_gateway::grpc_source::startup_banner()
     );
 
-    // BR-231 / redlines 2.1, 2.2, 2.4, 2.7: production must prove the
-    // authenticated identity source before any producer loop is started.
-    // The canary is read-only and logs evidence identity, never credentials or
-    // security values. Test mode remains physically isolated from live data.
-    if !test_mode {
-        match stock_analysis::data_gateway::grpc_source::external_opening_readiness().await {
-            Ok(batch) => {
-                let evidence = batch.evidence();
-                log::info!(
-                    "[opening-readiness][BR-231] ExternalV1 verified-ready \
-                     provider={:?} source={} source_at={} observed_at={} batch_id={} records={}",
-                    evidence.provider,
-                    evidence.source,
-                    evidence.source_at.as_deref().unwrap_or("absent"),
-                    evidence.observed_at,
-                    evidence.batch_id,
-                    batch.records().len()
-                );
-            }
-            Err(error) => {
-                log::error!(
-                    "[opening-readiness][BR-231] ExternalV1 gate failed: {}",
-                    error
-                );
-                exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 2).await;
+    if test_mode {
+        log::info!("opening_readiness=not_applicable mode=test");
+    } else if review_mode {
+        log::info!("opening_readiness=not_applicable mode=review");
+    }
+
+    // BR-238 / redlines 2.1, 2.2, 2.4, 2.7: normal production proves only the
+    // nine static/auth/contract routes before producer startup. Live quote,
+    // order-book and T0 evidence are observed by a later background task and
+    // cannot suppress the 09:00--09:15 P-01 scheduler.
+    if !test_mode && !review_mode {
+        loop {
+            match stock_analysis::data_gateway::grpc_source::external_static_opening_readiness()
+                .await
+            {
+                Ok(report) => {
+                    if let Err(error) =
+                        stock_analysis::data_gateway::grpc_source::audit_opening_readiness_report(
+                            "OpeningStatic",
+                            &report,
+                        )
+                    {
+                        let banner = opening_static_failure_banner(
+                            error.reason_code(),
+                            error.retryable(),
+                            error.capability(),
+                        );
+                        log::warn!(
+                            "{} retry_after_secs={} detail={}",
+                            banner,
+                            OPENING_READINESS_RETRY_INTERVAL.as_secs(),
+                            error
+                        );
+                        tokio::time::sleep(OPENING_READINESS_RETRY_INTERVAL).await;
+                        continue;
+                    }
+                    for route in &report.routes {
+                        log::info!(
+                            "[opening-readiness][BR-238] route={} profile={} provider={:?} \
+                             source={} source_at={} observed_at={} batch_id={} records={}",
+                            route.route,
+                            route.profile,
+                            route.provider,
+                            route.source,
+                            route.source_at.as_deref().unwrap_or("absent"),
+                            route.observed_at,
+                            route.batch_id,
+                            route.records
+                        );
+                    }
+                    log::info!("{}", opening_static_success_banner(&report));
+                    break;
+                }
+                Err(error) => {
+                    let error = match stock_analysis::data_gateway::grpc_source::audit_opening_readiness_failure(
+                        "OpeningStatic",
+                        &error,
+                    ) {
+                        Ok(()) => error,
+                        Err(audit_error) => audit_error,
+                    };
+                    let banner = opening_static_failure_banner(
+                        error.reason_code(),
+                        error.retryable(),
+                        error.capability(),
+                    );
+                    if error.retryable() {
+                        log::warn!(
+                            "{} retry_after_secs={} detail={}",
+                            banner,
+                            OPENING_READINESS_RETRY_INTERVAL.as_secs(),
+                            error
+                        );
+                        tokio::time::sleep(OPENING_READINESS_RETRY_INTERVAL).await;
+                    } else {
+                        log::error!("{} detail={}", banner, error);
+                        exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 2).await;
+                    }
+                }
             }
         }
     }
@@ -4476,16 +4909,10 @@ async fn main() {
                 );
             }
         }
-        // BR-108/BR-116: --review 与常驻监控一样需要真实治理上下文。该分支在主循环
-        // 启动前返回，若不在此评估 AccountMode/DataMode，LATEST_BANNER 恒为 None，
-        // 依赖 banner 的复盘推送会以 "governance banner unavailable" 被跳过。
-        // 复用与 startup 完全相同的评估路径，不构造任何默认 banner。
-        if !evaluate_account_mode_hook(true).await {
-            log::error!(
-                "[复盘][BR-108/BR-116] AccountMode notification unconfirmed; context remains conservative"
-            );
-        }
-        evaluate_data_mode_hook().await;
+        // BR-194: strict review dispatchers own their declared dependencies.
+        // Do not run the normal AccountMode/DataMode notification hooks here:
+        // those hooks are independent sink calls and would make `--review`
+        // report delivery before any review task has acquired its evidence.
         let result = match ReviewExecutionPath::StrictDispatchers {
             ReviewExecutionPath::StrictDispatchers => run_review_only().await,
         };
@@ -4720,10 +5147,10 @@ async fn main() {
             // Phase 3: 移除 news_pipeline_loop_v15_3 (#2)；统一新闻 Gateway
             // 已由 news_monitor_loop 消费，旧 loop 会重复取数。
             tokio::join!(
+                p01::p01_scheduler_loop(),
                 monitor_loop(),
                 news_monitor_loop(selection_v2_enabled),
-                data_mode_monitor_loop(),
-                off_session_quote_keepalive_loop()
+                data_mode_monitor_loop()
             );
         };
 
@@ -4735,11 +5162,13 @@ async fn main() {
 
         let post_close_news = tokio::spawn(post_close_news_scheduler());
         let post_session_review = spawn_post_session_review_scheduler(selection_v2_enabled);
+        let opening_live_readiness = tokio::spawn(opening_live_readiness_loop());
         let background_tasks = vec![
             ("dryrun_reporter", dryrun_reporter),
             ("monitor_event_consumer", event_consumer),
             ("post_close_news", post_close_news),
             ("post_session_review", post_session_review),
+            ("opening_live_readiness", opening_live_readiness),
         ];
 
         let shutdown_signal = async {
@@ -4928,36 +5357,15 @@ async fn run_review_only() -> Result<(), String> {
                     Ok(())
                 }
                 review_batch::ReviewCompletion::NoDelivery if !deferred.is_empty() => {
-                    if should_treat_no_delivery_as_non_fatal(&batch) {
-                        log::warn!(
-                            "[复盘][BR-209] ======== 盘后分析无确认投递 (原因: {} 为延后) ({}s) statuses={:?} ========",
-                            deferred.join(", "),
-                            review_start.elapsed().as_secs(),
-                            task_statuses
-                        );
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "[BR-140][BR-209][BR-212] 严格盘后复盘没有确认投递；A-10 已在数据请求前延后，请在以下时间后重新运行 --review: {}",
-                            deferred.join(", ")
-                        ))
-                    }
+                    Err(format!(
+                        "[BR-140][BR-209][BR-212] 严格盘后复盘没有确认投递；A-10 已在数据请求前延后，请在以下时间后重新运行 --review: {}",
+                        deferred.join(", ")
+                    ))
                 }
-                review_batch::ReviewCompletion::NoDelivery => {
-                    if should_treat_no_delivery_as_non_fatal(&batch) {
-                        log::warn!(
-                            "[复盘][BR-212] ======== 盘后分析无确认投递，但部分任务出现可重试失败/等待/降级 ======== ({}s) statuses={:?}",
-                            review_start.elapsed().as_secs(),
-                            task_statuses
-                        );
-                        Ok(())
-                    } else {
-                        Err(
-                            "[BR-140][BR-212] 严格盘后复盘没有任何确认投递；逐任务状态已写审计"
-                                .to_string(),
-                        )
-                    }
-                }
+                review_batch::ReviewCompletion::NoDelivery => Err(
+                    "[BR-140][BR-212] 严格盘后复盘没有任何确认投递；逐任务状态已写审计"
+                        .to_string(),
+                ),
             }
         }
 
@@ -4968,17 +5376,6 @@ async fn run_review_only() -> Result<(), String> {
             review_timeout_secs
         )),
     }
-}
-
-fn should_treat_no_delivery_as_non_fatal(batch: &review_batch::ReviewBatchOutcome) -> bool {
-    !batch.tasks.is_empty()
-        && !batch.tasks.iter().all(|(_, outcome)| {
-            matches!(
-                outcome,
-                review_batch::ReviewTaskOutcome::Disabled { .. }
-                    | review_batch::ReviewTaskOutcome::NoData { .. }
-            )
-        })
 }
 
 #[cfg(test)]
@@ -5004,38 +5401,8 @@ mod tests_br212_review_cli_completion {
             assert!(run_review_only.contains(required), "missing {required}");
         }
         assert!(!run_review_only.contains("batch.has_confirmed_delivery()"));
-    }
-
-    #[test]
-    fn br212_review_no_delivery_with_source_failure_is_treated_as_non_fatal() {
-        let batch = crate::review_batch::ReviewBatchOutcome::new(vec![
-            (
-                crate::review_batch::ReviewTask::R08,
-                crate::review_batch::ReviewTaskOutcome::failed(
-                    true,
-                    "r08_cffex_component_unavailable",
-                ),
-            ),
-            (
-                crate::review_batch::ReviewTask::R04,
-                crate::review_batch::ReviewTaskOutcome::disabled(
-                    "R-04 capability",
-                    "mock unavailable",
-                ),
-            ),
-        ]);
-
-        assert!(super::should_treat_no_delivery_as_non_fatal(&batch));
-    }
-
-    #[test]
-    fn br212_review_no_delivery_with_all_disabled_is_fatal() {
-        let batch = crate::review_batch::ReviewBatchOutcome::new(vec![(
-            crate::review_batch::ReviewTask::R04,
-            crate::review_batch::ReviewTaskOutcome::disabled("R-04 capability", "mock unavailable"),
-        )]);
-
-        assert!(!super::should_treat_no_delivery_as_non_fatal(&batch));
+        assert!(run_review_only.contains("严格盘后复盘没有任何确认投递"));
+        assert!(!run_review_only.contains("should_treat_no_delivery_as_non_fatal"));
     }
 }
 
@@ -5055,19 +5422,77 @@ fn post_session_review_window_open(now: chrono::NaiveDateTime, is_trading_day: b
     is_trading_day && now.time() >= threshold
 }
 
+struct ReviewAttemptLease {
+    active: &'static std::sync::atomic::AtomicBool,
+}
+
+impl ReviewAttemptLease {
+    fn try_acquire(active: &'static std::sync::atomic::AtomicBool) -> Result<Self, String> {
+        active
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .map_err(|_| {
+                "BR-239 previous strict review attempt is already in flight; retry suppressed"
+                    .to_owned()
+            })?;
+        Ok(Self { active })
+    }
+}
+
+impl Drop for ReviewAttemptLease {
+    fn drop(&mut self) {
+        self.active
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+async fn run_tracked_review_attempt_with_timeout<Future, Output>(
+    active: &'static std::sync::atomic::AtomicBool,
+    timeout: std::time::Duration,
+    future: Future,
+) -> Result<Output, String>
+where
+    Future: std::future::Future<Output = Result<Output, String>> + Send + 'static,
+    Output: Send + 'static,
+{
+    let lease = ReviewAttemptLease::try_acquire(active)?;
+    // A timed-out JoinHandle is deliberately detached. The lease lives inside
+    // the task and therefore remains held until every awaited blocking worker
+    // has returned; subsequent scheduler ticks fail closed without overlap.
+    let worker = tokio::spawn(async move {
+        let _lease = lease;
+        future.await
+    });
+    match tokio::time::timeout(timeout, worker).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(format!("strict review worker join failed: {error}")),
+        Err(_) => Err(format!(
+            "strict review timed out after {}s; detached worker remains in flight",
+            timeout.as_secs()
+        )),
+    }
+}
+
 async fn attempt_post_session_review(
     due: &std::collections::BTreeSet<review_batch::ReviewTask>,
 ) -> Result<review_batch::ReviewBatchOutcome, String> {
+    static REVIEW_ATTEMPT_ACTIVE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
     let timeout_secs = review_timeout_secs();
     // 2026-08-06: 手动 --review 用 at_manual — 跳过 21:00 龙虎榜发布门,
     // R-04/R-07 立即尝试 (未发布数据 dispatcher 内部降级)。
     let context = review_batch::ReviewRunContext::at_manual(chrono::Local::now().naive_local());
-    tokio::time::timeout(
+    let due = due.clone();
+    run_tracked_review_attempt_with_timeout(
+        &REVIEW_ATTEMPT_ACTIVE,
         std::time::Duration::from_secs(timeout_secs),
-        run_strict_review_only_inner(due, context),
+        async move { run_strict_review_only_inner(&due, context).await },
     )
     .await
-    .map_err(|_| format!("strict review timed out after {timeout_secs}s"))?
 }
 
 async fn post_session_review_scheduler(selection_v2_enabled: bool) {
@@ -5419,9 +5844,10 @@ impl TemplateTestSummary {
                 self.push_kind_retired_total,
                 self.push_kind_total,
             ) == expected_kind;
+        let governance_smoke_count = br196_test_delivery::governance_smoke_identity_count();
         let render_and_smoke_complete = self.rendered_family_total == self.family_active_total
-            && self.governance_smoke_attempted == 4
-            && self.governance_smoke_passed == 4;
+            && self.governance_smoke_attempted == governance_smoke_count
+            && self.governance_smoke_passed == governance_smoke_count;
         let explicit_dry_run = self.explicit_dry_run_family_total > 0;
         let disposition_complete = if explicit_dry_run {
             !self.live_acceptance_opted_in
@@ -5684,8 +6110,8 @@ mod tests_br196_monitor_test_acceptance {
             push_kind_retired_total: 0,
             push_kind_total: 61,
             rendered_family_total: 55,
-            governance_smoke_attempted: 4,
-            governance_smoke_passed: 4,
+            governance_smoke_attempted: br196_test_delivery::governance_smoke_identity_count(),
+            governance_smoke_passed: br196_test_delivery::governance_smoke_identity_count(),
             live_acceptance_opted_in: false,
             target_authority_status: "not_constructed_explicit_dry_run",
             target_identity_sha256: None,
@@ -5947,17 +6373,20 @@ async fn push_e2e_14x_templates(
         ],
     });
 
-    log::info!("[v70] P-01 推 ({} 字)", p01.chars().count());
+    log::info!("[v70] P-01 渲染 smoke ({} 字)", p01.chars().count());
 
-    let p01_outcome = notify::push_br196_governance_smoke_v3(
-        &p01,
-        smoke_context.dispatch(
-            "P-01-preopen-news-hot",
-            notify::PushKind::PreopenNewsHot,
-            None,
-        )?,
-    )
-    .await;
+    // BR-241: P-01 is counted durable delivery. A TEST_CODE fixture cannot
+    // replace its immutable binding or authoritative typed receipt.
+    log::warn!(
+        "[v70][BR-196][BR-241] capability_unavailable=preopen_news_hot_counted_binding_unavailable; \
+         skipped before governance smoke dispatch"
+    );
+    push_templates::log_dispatcher_attempt(
+        "P-01",
+        false,
+        0,
+        "preopen_news_hot_counted_binding_unavailable",
+    );
 
     // P-02 竞价热点量能 (isolated fixture)
 
@@ -6086,18 +6515,11 @@ async fn push_e2e_14x_templates(
     );
 
     log::info!("[v70] e2e 14x 模板跑完");
-    Ok(vec![
-        br196_test_delivery::GovernanceSmokeDisposition {
-            family_key: "P-01-preopen-news-hot",
-            push_kind: notify::PushKind::PreopenNewsHot,
-            outcome: p01_outcome,
-        },
-        br196_test_delivery::GovernanceSmokeDisposition {
-            family_key: "T-11-auction-volume",
-            push_kind: notify::PushKind::AuctionVolume,
-            outcome: p02_outcome,
-        },
-    ])
+    Ok(vec![br196_test_delivery::GovernanceSmokeDisposition {
+        family_key: "T-11-auction-volume",
+        push_kind: notify::PushKind::AuctionVolume,
+        outcome: p02_outcome,
+    }])
 }
 
 /// 窗口：盘前08:00-09:30、盘中09:30-15:00、盘后15:00-22:00。
@@ -6423,9 +6845,8 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
 
     nm.restore_dedup();
 
-    log::info!(
-        "[NewsAI-shadow][BR-112][BR-172] governed delivery remains disabled; immutable assessment shadow enabled by default (env 开关已取消, 2026-08-11)"
-    );
+    let news_ai_producer = news_ai_shadow::NewsAiProducer::from_runtime();
+    news_ai_producer.log_startup_banner();
 
     let mut sm = SignalStateMachine::default();
 
@@ -6449,6 +6870,36 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
 
     let mut announcement_watch_load: Option<AnnouncementWatchLoadTask> = None;
 
+    // BR-244: one process-local owner preserves event/window dedup across all
+    // news ticks. It carries no selection-ingress capability.
+    let mut news_flash_gate =
+        crate::news_aggregator_init::NewsFlashGate::new(chrono::Local::now().date_naive());
+    log::warn!(
+        "{}",
+        crate::news_aggregator_init::NEWS_FLASH_CRITICAL_DISABLED_BANNER
+    );
+    push_templates::log_dispatcher_attempt(
+        "N-01",
+        false,
+        0,
+        "disabled=no_authoritative_strength_provider",
+    );
+    let news_flash_startup_date = chrono::Local::now().date_naive();
+    match stock_analysis::event::reconcile_news_flash_business_date(news_flash_startup_date) {
+        Ok(snapshot) => {
+            if let Err(error) = news_flash_gate.recover(&snapshot) {
+                log::error!(
+                    "[GlobalNews][BR-244] startup NewsFlash authority recovery failed: {error:?}"
+                );
+            }
+        }
+        Err(error) => {
+            log::error!(
+                "[GlobalNews][BR-244] startup NewsFlash authority unavailable; sink disabled until recovery: {error}"
+            );
+        }
+    }
+
     loop {
         if !NewsMonitor::should_run() {
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
@@ -6463,89 +6914,191 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
             ));
         }
 
-        // BR-174/BR-183: raw global-news acquisition and notification
-        // projection require a durable selection-v2 ingress receipt. While
-        // that capability is unreleased, do not call a provider or advance
-        // notification simhash; independent policy/announcement business
-        // below continues.
+        // BR-244: public SourceOnly NewsFlash may consume the same-tick opaque
+        // raw batch without minting a BR-174 selection receipt. Candidate and
+        // selection consumers remain independently gated below.
         if outer_tick.enter(NewsOuterTickPhase::CriticalFlash) {
-            if !selection_v2_enabled {
-                log::debug!(
-                    "[GlobalNews][BR-174][BR-183] disabled \
-                     provider_calls=0 notification_projection=0 news_ai=0"
-                );
-            } else {
-                // BR-183 Track A (2026-08-07): 新闻 → 候选入池。
-                // 不依赖 BR-180 receipt: 直接取 raw 标题 → LLM 提取受益个股 →
-                // pushed_stocks 候选池 (DB 级当日去重), intraday_monitor 消费。
-                // critical 闪送仍待 receipt 链路 (Phase 4)。
-                // 2026-08-08 实测: 红线 2.2 报价门 (5s 新鲜度) 在非交易时段
-                // 永远失败 (收盘后报价 = 9 小时前) → 只在 9:15-15:00 入池。
-                let session = stock_analysis::calendar::current_session();
-                if !session.is_trading() && !session.is_auction() {
-                    log::debug!(
-                        "[GlobalNews][BR-183] Track A 跳过: 非交易时段 session={:?}, 无实时报价",
-                        session
+            let authority_date = chrono::Local::now().date_naive();
+            let authority_preflight =
+                match stock_analysis::event::reconcile_news_flash_business_date(authority_date) {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(error) => {
+                        log::error!(
+                        "[GlobalNews][BR-244] tick NewsFlash authority unavailable; provider and sink skipped: {error}"
                     );
-                } else {
-                    match stock_analysis::news::aggregator::raw_v2::fetch_raw_global_news_batch(20)
-                        .await
-                    {
-                        Ok(batch) => {
-                            // BR-172: NewsAI shadow 默认启用（2026-08-11 取消
-                            // STOCK_ANALYSIS_NEWS_AI_SHADOW_ENABLE 开关）。与 Track A
-                            // 同 tick 消费 admitted batches；模型未配置时 shadow 内部
-                            // warn 出声跳过，不影响候选入池。
-                            let admitted: Vec<
-                            stock_analysis::news::aggregator::AdmittedGlobalNewsBatch,
-                        > = batch
-                            .attempts()
-                            .iter()
-                            .filter_map(|attempt| {
-                                let terminal = attempt.terminal();
-                                let records = terminal.records()?;
-                                let evidence = terminal.evidence()?;
-                                Some(
-                                    stock_analysis::news::aggregator::AdmittedGlobalNewsBatch::from_parts(
-                                        records.to_vec(),
-                                        evidence.clone(),
-                                    ),
-                                )
-                            })
-                            .collect();
-                            if !admitted.is_empty() {
-                                crate::news_ai_shadow::spawn_from_same_tick(&admitted);
-                            }
-                            let titles: Vec<String> = batch
-                                .attempts()
-                                .iter()
-                                .flat_map(|attempt| {
-                                    attempt
-                                        .terminal()
-                                        .records()
-                                        .map(|records| {
-                                            records.iter().map(|record| record.title.clone())
-                                        })
-                                        .into_iter()
-                                        .flatten()
-                                })
-                                .collect();
-                            let (recorded, skipped) =
-                                crate::news_aggregator_init::candidate_ingest_from_news(&titles)
-                                    .await;
-                            log::info!(
-                            "[GlobalNews][BR-183] Track A tick records={} recorded={} skipped={}",
-                            titles.len(),
-                            recorded,
-                            skipped
-                        );
-                        }
-                        Err(error) => {
+                        None
+                    }
+                };
+            let mut flash_events = Vec::new();
+            let mut raw_batch = None;
+            let mut failure_audit_ready = authority_preflight.is_some();
+            if authority_preflight.is_some() {
+                match stock_analysis::news::aggregator::raw_v2::fetch_raw_global_news_batch(20)
+                    .await
+                {
+                    Ok(batch) => {
+                        let projection =
+                            stock_analysis::news::aggregator::raw_v2::project_news_flash_events(
+                                &batch,
+                            );
+                        for failure in projection.failures() {
+                            let error = failure.audit_message();
                             log::warn!(
-                                "[GlobalNews][BR-183] raw batch 获取失败, 本轮候选不入池: {error}"
+                                "[GlobalNews][BR-244] NewsFlash source unavailable: {error}"
+                            );
+                            if let Err(audit_error) =
+                                crate::news_aggregator_init::audit_news_flash_source_failure(
+                                    failure,
+                                )
+                            {
+                                failure_audit_ready = false;
+                                log::error!(
+                                    "[GlobalNews][BR-244] immutable failure audit unavailable; public sink fails closed: {audit_error}"
+                                );
+                            }
+                        }
+                        let (events, _) = projection.into_parts();
+                        flash_events = events;
+                        raw_batch = Some(batch);
+                    }
+                    Err(error) => {
+                        let error = format!("BR-244 raw_batch_acquisition_failed:{error}");
+                        log::warn!("[GlobalNews][BR-244] {error}");
+                        if let Err(audit_error) =
+                            crate::news_aggregator_init::audit_news_flash_batch_failure(
+                                &error,
+                                chrono::Utc::now(),
+                            )
+                        {
+                            failure_audit_ready = false;
+                            log::error!(
+                                "[GlobalNews][BR-244] immutable batch-failure audit unavailable: {audit_error}"
                             );
                         }
                     }
+                }
+            }
+
+            let monitor_config = stock_analysis::config::get_monitor_config();
+            // BR-244: projection and every immutable failure audit complete
+            // before the snapshot that may authorize reservation. The earlier
+            // read is provider preflight only and is never reused for reserve.
+            let reserve_now = chrono::Local::now();
+            let fresh_authority = match stock_analysis::event::reconcile_news_flash_business_date(
+                reserve_now.date_naive(),
+            ) {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    failure_audit_ready = false;
+                    log::error!(
+                            "[GlobalNews][BR-244] fresh pre-reserve authority unavailable; sink skipped: {error}"
+                        );
+                    None
+                }
+            };
+            let reservations = if failure_audit_ready {
+                match fresh_authority.as_ref() {
+                    Some(snapshot) => match news_flash_gate.reserve_from_authority(
+                        snapshot,
+                        &flash_events,
+                        reserve_now,
+                        monitor_config.news_critical_score_threshold,
+                        monitor_config.news_max_critical_per_day,
+                    ) {
+                        Ok(reservations) => reservations,
+                        Err(error) => {
+                            log::error!(
+                                "[GlobalNews][BR-244] authority-bound reservation failed closed: {error:?}"
+                            );
+                            Vec::new()
+                        }
+                    },
+                    None => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            let (critical_pushed, aggregate_pushed) = if failure_audit_ready {
+                crate::news_aggregator_init::push_flash_reservations(
+                    &mut news_flash_gate,
+                    reservations,
+                )
+                .await
+            } else {
+                for reservation in reservations {
+                    if let Err(error) = news_flash_gate.settle(
+                        reservation,
+                        crate::news_aggregator_init::FlashSettlement::RolledBack {
+                            reason: "required immutable source-failure audit unavailable"
+                                .to_owned(),
+                        },
+                    ) {
+                        log::error!(
+                            "[GlobalNews][BR-244] fail-closed reservation rollback failed: {error:?}"
+                        );
+                    }
+                }
+                (0, 0)
+            };
+            if critical_pushed > 0 || aggregate_pushed > 0 {
+                log::info!(
+                    "[GlobalNews][BR-244] accepted critical={} aggregate={}",
+                    critical_pushed,
+                    aggregate_pushed
+                );
+            }
+
+            // BR-244: public SourceOnly reserve/dispatch/settle is complete
+            // before BR-172 selection ingress, NewsAI and candidate/LLM work.
+            if let Some(batch) = raw_batch {
+                let session = stock_analysis::calendar::current_session();
+                if selection_v2_enabled && (session.is_trading() || session.is_auction()) {
+                    let admitted: Vec<
+                        stock_analysis::news::aggregator::AdmittedGlobalNewsBatch,
+                    > = batch
+                        .attempts()
+                        .iter()
+                        .filter_map(|attempt| {
+                            let terminal = attempt.terminal();
+                            let records = terminal.records()?;
+                            let evidence = terminal.evidence()?;
+                            Some(
+                                stock_analysis::news::aggregator::AdmittedGlobalNewsBatch::from_parts(
+                                    records.to_vec(),
+                                    evidence.clone(),
+                                ),
+                            )
+                        })
+                        .collect();
+                    if !admitted.is_empty() {
+                        news_ai_producer.schedule_from_same_tick(&admitted);
+                    }
+                    let titles: Vec<String> = batch
+                        .attempts()
+                        .iter()
+                        .flat_map(|attempt| {
+                            attempt
+                                .terminal()
+                                .records()
+                                .map(|records| records.iter().map(|record| record.title.clone()))
+                                .into_iter()
+                                .flatten()
+                        })
+                        .collect();
+                    let (recorded, skipped) =
+                        crate::news_aggregator_init::candidate_ingest_from_news(&titles).await;
+                    log::info!(
+                        "[GlobalNews][BR-183] Track A tick records={} recorded={} skipped={}",
+                        titles.len(),
+                        recorded,
+                        skipped
+                    );
+                } else {
+                    log::debug!(
+                        "[GlobalNews][BR-174][BR-183] selection consumers skipped: enabled={} session={:?}",
+                        selection_v2_enabled,
+                        session
+                    );
                 }
             }
         }
@@ -7917,8 +8470,8 @@ async fn monitor_loop() {
 
             let mut last_t0_scan = std::time::Instant::now(); // 持仓做 T 扫描（30秒）
 
-            // 2026-08-07 BR-192 收尾: 持仓健康度 summary 由 T-03 counted 投递
-            // (prepare_holding_plan_messages) 承担, 原 unavailable 占位已移除。
+            // BR-192: legacy HoldingEvent summary disabled before rendering;
+            // T-03 holding-plan has its own independent durable evidence path.
 
             let mut last_industry_chain_intraday = std::time::Instant::now(); // v34: I-03 涨停扩散 (15 min)
 
@@ -7974,9 +8527,10 @@ async fn monitor_loop() {
 
             let mut virtual_snapshot_persisted = false;
 
-            // v32: P-01 盘前新闻热点 — 每个交易日首次进入 9:00-9:15 窗口时推一次
-
-            let mut preopen_pushed = false;
+            // P-03 and the 09:10 quote probe retain their legacy session-local
+            // completion flag. BR-241 P-01 is owned by its independent durable
+            // scheduler and never reads or writes this flag.
+            let mut preopen_aux_pushed = false;
 
             let entry_mode = air_refuel_entry_mode();
 
@@ -7989,23 +8543,10 @@ async fn monitor_loop() {
             loop {
                 let session = current_session();
 
-                // ═══════════════════════════════════════════════════════════════
-
-                // v32: P-01 盘前新闻热点 (9:00-9:15 窗口, 每日首次)
-
-                //   - 触发: 首次进入 9:00 ≤ now < 9:15, 每个 monitor_loop session 推一次
-
-                //   - 数据源: news_monitor 拉今日 + 昨日要闻 + 板块聚类
-
-                //   - 模板: render_preopen_news_hot (无 banner, ℹ️参考级)
-
-                //   - 静默: 公告空时短路
-
-                //   - 注意: P-02 竞价量能 / P-03 候选触发 已有独立路径, 不在此重复
-
-                // ═══════════════════════════════════════════════════════════════
-
-                if !preopen_pushed && session == MarketSession::Closed {
+                // Legacy P-03 / quote-probe owner. P-01 was removed from this
+                // post-market-activation block because that placement made its
+                // 09:00--09:15 condition structurally unreachable.
+                if !preopen_aux_pushed && session == MarketSession::Closed {
                     let now_time = chrono::Local::now().time();
 
                     let preopen_start = chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap();
@@ -8013,17 +8554,6 @@ async fn monitor_loop() {
                     let preopen_end = chrono::NaiveTime::from_hms_opt(9, 15, 0).unwrap();
 
                     if now_time >= preopen_start && now_time < preopen_end {
-                        log::info!(
-                            "[P-01] 盘前窗口 ({}-{}), 推盘前新闻热点",
-                            preopen_start.format("%H:%M"),
-                            preopen_end.format("%H:%M")
-                        );
-
-                        let preopen_ok = push_templates::dispatch_preopen_news_hot_daily().await;
-                        if !preopen_ok {
-                            log::error!("[P-01][BR-091] dispatcher did not confirm delivery");
-                        }
-
                         // v39: P-03 候选触发 (同盘前窗口, 影子开关控制)
 
                         let hhmm = chrono::Local::now().format("%H:%M").to_string();
@@ -8035,7 +8565,7 @@ async fn monitor_loop() {
                             if !candidate_ok {
                                 log::error!("[P-03][BR-091] dispatcher did not confirm delivery");
                             }
-                            preopen_pushed = preopen_ok && candidate_ok;
+                            preopen_aux_pushed = candidate_ok;
                         }
 
                         // 2026-08-06 实证: 9:15-9:25 DNS 全挂 + TDX 不可达 →
@@ -8439,9 +8969,7 @@ async fn monitor_loop() {
                                 if let Some(event) = state_machine.process(e) {
                                     alert_count += 1;
 
-                                    // BR-192 收尾: 指标告警走 counted binding 投递
-                                    // (失败不重试 — 竞价窗口内数据快速变化)。
-                                    deliver_intraday_alert(&event).await;
+                                    reject_unbound_alert_delivery(&event);
                                 }
                             }
                         }
@@ -8979,16 +9507,15 @@ async fn monitor_loop() {
                                     emergency_note = "⚠️ 炸板！".to_string();
                                 }
 
-                                // BR-192 收尾 (2026-08-07): 指标告警走 counted 投递。
-                                // LimitUp/LimitDown 除外 — 下方显式构造的涨停/跌停
-                                // 突变事件负责投递 (避免同一触达双推)。
+                                // BR-192: in-memory alerts have no durable lifecycle
+                                // owner, so every alert category stays fail-closed.
                                 if !matches!(
                                     e.category,
                                     AlertCategory::LimitUp | AlertCategory::LimitDown
                                 ) {
                                     if let Some(ev) = state_machine.process(e) {
                                         alert_count += 1;
-                                        deliver_intraday_alert(&ev).await;
+                                        reject_unbound_alert_delivery(&ev);
                                     }
                                 }
                             }
@@ -9065,15 +9592,12 @@ async fn monitor_loop() {
                                 if let Some(ev) = state_machine.process(event) {
                                     alert_count += 1;
 
-                                    // BR-192 收尾: 涨停/跌停突变走 counted 投递。
-                                    deliver_intraday_alert(&ev).await;
+                                    reject_unbound_alert_delivery(&ev);
                                 }
                             }
 
-                            // 2026-08-07 BR-192 收尾: BoardBreak 指标告警已由上方
-                            // scan_stock 循环走 counted binding 投递 (origin=
-                            // InternalDurable)。emergency_note 仅保留给信号融合
-                            // 共振文本使用, 不再承担投递职责。
+                            // BR-192: the in-memory board-break transition has no
+                            // durable occurrence owner and cannot authorize delivery.
                             if !emergency_note.is_empty() {
                                 log::warn!(
                                     "[炸板][BR-192] capability_unavailable=holding_event_counted_binding_unavailable; \
@@ -9888,119 +10412,17 @@ async fn post_close_news_scheduler() {
     }
 }
 
-/// BR-192 收尾 (2026-08-07): 盘中指标告警 → counted binding 投递。
-/// 事件型推送无定时调度身份, 以 {date}:{code}:{category} 作为 occurrence
-/// identity (同一标的同类型告警当日只投递一次, counted 层去重; 状态机另做
-/// 5 分钟去重)。source 证据 = 事件核心事实序列化 (message 含实际数值,
-/// detail 含快照字段), origin=InternalDurable (内部派生证据接缝)。
-/// 失败不重试: 告警时效性强, 30s 后快照已变化; 同日同类再次触发由 counted
-/// 去重/状态机放行新 occurrence。
-async fn deliver_intraday_alert(event: &AlertEvent) -> bool {
-    use sha2::{Digest, Sha256};
-    use stock_analysis::magic_compat::{AssetClass, Exchange, InstrumentId};
-
-    let business_date = chrono::Local::now().date_naive();
-    let occurrence = format!(
-        "intraday-alert:{}:{}:{}",
-        business_date,
+/// BR-192: an in-memory AlertEvent is not a durable lifecycle transition and
+/// cannot mint counted delivery evidence. Keep the failure explicit and make
+/// provider/sink call counts observably zero until a real owner is introduced.
+fn reject_unbound_alert_delivery(event: &AlertEvent) -> bool {
+    log::warn!(
+        "[盘中告警][BR-192] capability_unavailable=alert_daily_report_counted_binding_unavailable; \
+         provider_calls=0 sink_calls=0 code={} category={}",
         event.code,
         event.category.key()
     );
-    let canonical = serde_json::json!({
-        "code": event.code,
-        "category": event.category.key(),
-        "level": event.level.label(),
-        "message": event.message,
-        "triggered_at": event.triggered_at.to_rfc3339(),
-        "price": event.detail.price,
-        "change_pct": event.detail.change_pct,
-        "volume_ratio": event.detail.volume_ratio,
-        "main_flow_yi": event.detail.main_flow_yi,
-        "t1_locked": event.detail.t1_locked,
-    });
-    let canonical_bytes = canonical.to_string().into_bytes();
-    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
-    let exchange = if event.code.starts_with('6') {
-        Exchange::Shanghai
-    } else {
-        Exchange::Shenzhen
-    };
-    let instrument = match InstrumentId::new(exchange, event.code.clone(), AssetClass::Equity) {
-        Ok(id) => id,
-        Err(error) => {
-            log::error!(
-                "[盘中告警] instrument 构造失败 code={}: {error}",
-                event.code
-            );
-            return false;
-        }
-    };
-    let binding = match durable_delivery_runtime::CountedDeliveryBinding::new(
-        business_date,
-        occurrence,
-        canonical_bytes,
-        durable_delivery_runtime::CountedDeliveryScope::Ticket { instrument },
-        subject_hash,
-        durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
-        None,
-        true,
-    ) {
-        Ok(binding) => binding,
-        Err(error) => {
-            log::error!(
-                "[盘中告警] counted binding 构造失败 code={} category={}: {error}",
-                event.code,
-                event.category.key()
-            );
-            return false;
-        }
-    };
-    let token = match crate::presentation_registry::acquire_token(
-        "T-04B-intraday-alert",
-        PushKind::HoldingEvent,
-        "intraday_alert_dispatcher",
-        "render_intraday_alert",
-    ) {
-        Ok(token) => token,
-        Err(reason) => {
-            log::error!(
-                "[盘中告警][BR-196] presentation token rejected code={} category={} reason={}",
-                event.code,
-                event.category.key(),
-                reason
-            );
-            return false;
-        }
-    };
-    let text = push_templates::render_intraday_alert(event);
-    let outcome = notify::push_counted_with_binding(token, &text, None, binding).await;
-    match outcome {
-        notify::PushOutcome::Pushed => {
-            log::info!(
-                "[盘中告警] delivered code={} category={}",
-                event.code,
-                event.category.key()
-            );
-            true
-        }
-        notify::PushOutcome::Deduped => {
-            log::info!(
-                "[盘中告警] deduped (当日同类已投递) code={} category={}",
-                event.code,
-                event.category.key()
-            );
-            true
-        }
-        other => {
-            log::warn!(
-                "[盘中告警] 投递未确认 code={} category={} outcome={:?}",
-                event.code,
-                event.category.key(),
-                other
-            );
-            false
-        }
-    }
+    false
 }
 
 #[cfg(test)]
@@ -10472,6 +10894,49 @@ mod tests_post_session_review_scheduler {
     use chrono::{NaiveDate, NaiveDateTime};
     use sha2::{Digest, Sha256};
 
+    #[tokio::test]
+    async fn br239_timeout_keeps_retry_blocked_until_detached_worker_finishes() {
+        static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let worker_release = std::sync::Arc::clone(&release);
+
+        let first = run_tracked_review_attempt_with_timeout(
+            &ACTIVE,
+            std::time::Duration::from_millis(10),
+            async move {
+                worker_release.notified().await;
+                Ok::<_, String>(())
+            },
+        )
+        .await;
+        assert!(first.unwrap_err().contains("timed out"));
+
+        let overlapping = run_tracked_review_attempt_with_timeout(
+            &ACTIVE,
+            std::time::Duration::from_millis(10),
+            async { Ok::<_, String>(()) },
+        )
+        .await;
+        assert!(overlapping.unwrap_err().contains("already in flight"));
+
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while ACTIVE.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached worker releases the process-wide attempt lease");
+
+        run_tracked_review_attempt_with_timeout(
+            &ACTIVE,
+            std::time::Duration::from_secs(1),
+            async { Ok::<_, String>(()) },
+        )
+        .await
+        .expect("retry becomes eligible only after the worker exits");
+    }
+
     fn at(hour: u32, minute: u32) -> NaiveDateTime {
         NaiveDate::from_ymd_opt(2026, 7, 21)
             .expect("valid test date")
@@ -10679,6 +11144,135 @@ mod tests_post_session_review_scheduler {
             !production.contains(&stale_owner),
             "the stale monitor-loop review owner must not return"
         );
+    }
+
+    #[test]
+    fn br244_news_loop_owns_one_gate_and_one_governed_dispatch_caller() {
+        let source = include_str!("main.rs");
+        let production = source
+            .split("mod tests_post_session_review_scheduler")
+            .next()
+            .expect("production source precedes scheduler tests");
+
+        assert_eq!(
+            production.matches("NewsFlashGate::new(").count(),
+            1,
+            "the resident news loop must own exactly one process-local NewsFlashGate"
+        );
+        assert_eq!(
+            production
+                .matches("reconcile_news_flash_business_date(")
+                .count(),
+            3,
+            "startup, tick preflight, and fresh pre-reserve reads must use immutable authority"
+        );
+        assert!(production.contains("NEWS_FLASH_CRITICAL_DISABLED_BANNER"));
+        assert!(production.contains("disabled=no_authoritative_strength_provider"));
+        assert_eq!(
+            production.matches("project_news_flash_events(").count(),
+            1,
+            "opaque admitted GlobalNews must cross one evidence-preserving projection seam"
+        );
+        assert_eq!(
+            production.matches("push_flash_reservations(").count(),
+            1,
+            "NewsFlash decisions must have one governed production delivery caller"
+        );
+        let projection = production
+            .find("project_news_flash_events(")
+            .expect("BR-244 source projection caller");
+        let acquisition = production[..projection]
+            .rfind("fetch_raw_global_news_batch(20)")
+            .expect("BR-244 raw acquisition caller");
+        let tick_authority = production[..acquisition]
+            .rfind("reconcile_news_flash_business_date(")
+            .expect("BR-244 tick authority caller");
+        let gate = production
+            .find("news_flash_gate.reserve_from_authority(")
+            .expect("BR-244 authority-bound gate caller");
+        let dispatch = production
+            .find("push_flash_reservations(")
+            .expect("BR-244 governed dispatcher caller");
+        let selection_gate = production[dispatch..]
+            .find("if selection_v2_enabled &&")
+            .map(|offset| dispatch + offset)
+            .expect("selection-only consumers retain their own gate after public dispatch");
+        let failure_audit = production
+            .find("audit_news_flash_source_failure(")
+            .expect("BR-244 immutable failure audit caller");
+        let batch_failure_audit = production
+            .find("audit_news_flash_batch_failure(")
+            .expect("BR-244 immutable batch-failure audit caller");
+        let failure_audit_call = &production[failure_audit..];
+        let failure_audit_call_end = failure_audit_call
+            .find(')')
+            .expect("BR-244 immutable failure audit call closes");
+        let fresh_authority = production[failure_audit..gate]
+            .rfind("reconcile_news_flash_business_date(")
+            .map(|offset| failure_audit + offset)
+            .expect("BR-244 fresh pre-reserve authority caller");
+        assert!(
+            failure_audit_call[..failure_audit_call_end].contains("failure"),
+            "the typed failure-audit wrapper must consume the projected failure"
+        );
+        assert!(tick_authority < acquisition && acquisition < projection);
+        assert!(projection < failure_audit);
+        assert!(failure_audit < fresh_authority);
+        assert!(batch_failure_audit < fresh_authority);
+        assert!(fresh_authority < gate && gate < dispatch && dispatch < selection_gate);
+    }
+
+    #[test]
+    fn br241_p01_has_one_reachable_owner_and_no_generic_delivery_bypass() {
+        let main_source = include_str!("main.rs");
+        let production = main_source
+            .split("mod tests_post_session_review_scheduler")
+            .next()
+            .expect("production source precedes scheduler tests");
+        let templates = include_str!("push_templates.rs");
+
+        assert_eq!(
+            production.matches("p01::p01_scheduler_loop()").count(),
+            1,
+            "resident P-01 must be a top-level sibling loop"
+        );
+        let scheduler = production
+            .find("p01::p01_scheduler_loop()")
+            .expect("P-01 resident owner");
+        let market_loop = production
+            .find("monitor_loop(),")
+            .expect("market resident owner");
+        assert!(
+            scheduler < market_loop,
+            "P-01 must start independently before the market-active wait"
+        );
+        assert!(production.contains(".p01_compensation_request()"));
+        assert!(production.contains("p01::run_p01_compensation_once("));
+        let compensation_classification = production
+            .find("p01::classify_compensation_due")
+            .expect("P-01 compensation must be classified");
+        let audit_preflight = production
+            .find("preflight_runtime_delivery_audit")
+            .expect("delivery audit preflight");
+        assert!(
+            compensation_classification < audit_preflight,
+            "invalid P-01 compensation must fail before any audit or sink initialization"
+        );
+        let scoped_activation = production
+            .find("durable_delivery_runtime::authorize_p01_compensation_scope")
+            .expect("P-01 compensation must bind its typed singleton-lease capability");
+        assert!(compensation_classification < scoped_activation);
+        assert!(scoped_activation < audit_preflight);
+        let scoped_reconcile_guard = production
+            .find("if p01_compensation.is_none()")
+            .expect("P-01 compensation must skip global durable reconciliation");
+        let global_reconcile = production
+            .find("durable_delivery_runtime::ensure_startup_reconciled().await")
+            .expect("ordinary startup durable barrier");
+        assert!(scoped_reconcile_guard < global_reconcile);
+        assert!(!production.contains("dispatch_preopen_news_hot_daily"));
+        assert!(!templates.contains("pub async fn push_preopen_news_hot("));
+        assert!(!templates.contains("pub async fn dispatch_preopen_news_hot_daily("));
     }
 
     #[test]

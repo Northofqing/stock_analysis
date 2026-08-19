@@ -1,6 +1,7 @@
 //! Bearer token 认证 (合同 §9: 不加密的 metadata 认证)。
 //! token 只进 metadata, 不进请求体/URL/日志。
 use tonic::metadata::MetadataValue;
+use zeroize::Zeroizing;
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum AuthError {
@@ -25,9 +26,10 @@ pub fn attach_bearer_value<T>(
     request: &mut tonic::Request<T>,
     token: &str,
 ) -> Result<(), AuthError> {
-    let value = format!("Bearer {token}");
-    let metadata =
+    let value = Zeroizing::new(format!("Bearer {token}"));
+    let mut metadata =
         MetadataValue::try_from(value.as_str()).map_err(|_| AuthError::InvalidTokenValue)?;
+    metadata.set_sensitive(true);
     request.metadata_mut().insert("authorization", metadata);
     Ok(())
 }
@@ -67,6 +69,13 @@ mod tests {
                 .to_str()
                 .unwrap();
             assert_eq!(auth, "Bearer secret-token");
+            assert!(
+                req.metadata()
+                    .get("authorization")
+                    .expect("authorization metadata")
+                    .is_sensitive(),
+                "authorization metadata must be hidden from debug/tracing output"
+            );
         });
     }
 
@@ -91,6 +100,11 @@ mod tests {
                 .to_str()
                 .unwrap();
             assert_eq!(auth, "Bearer TEST_CODE_bundle_token");
+            assert!(req
+                .metadata()
+                .get("authorization")
+                .expect("authorization metadata")
+                .is_sensitive());
             assert!(std::env::var("GRPC_MARKET_TOKEN").is_err());
         });
     }

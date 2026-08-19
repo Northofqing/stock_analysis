@@ -257,8 +257,7 @@ impl MarketCapabilitiesGateway {
         codes: &[String],
     ) -> Result<GatewayBatch<MarketOrderBook>, GatewayError> {
         let storage_codes = codes.to_vec();
-        let request_hash =
-            acquisition_request_hash(ORDER_BOOK_CAPABILITY, &storage_codes.join(","));
+        let request_hash = acquisition_request_hash(ORDER_BOOK_CAPABILITY, storage_codes.join(","));
         // P4 M2 钩子: gRPC 通道 (fail-closed, audit 对等)。
         match super::grpc_source::bridge_for("OrderBooks") {
             Ok(Some(bridge)) => {
@@ -334,8 +333,7 @@ impl MarketCapabilitiesGateway {
         codes: &[String],
     ) -> Result<GatewayBatch<MarketMoneyFlow>, GatewayError> {
         let storage_codes = codes.to_vec();
-        let request_hash =
-            acquisition_request_hash(MONEY_FLOW_CAPABILITY, &storage_codes.join(","));
+        let request_hash = acquisition_request_hash(MONEY_FLOW_CAPABILITY, storage_codes.join(","));
         // P4 M2 钩子: gRPC 通道 (fail-closed, audit 对等)。
         match super::grpc_source::bridge_for("MoneyFlows") {
             Ok(Some(bridge)) => {
@@ -419,7 +417,7 @@ impl MarketCapabilitiesGateway {
         codes: &[String],
     ) -> Result<GatewayBatch<MarketSecurityMetadata>, GatewayError> {
         let storage_codes = codes.to_vec();
-        let request_hash = acquisition_request_hash(METADATA_CAPABILITY, &storage_codes.join(","));
+        let request_hash = acquisition_request_hash(METADATA_CAPABILITY, storage_codes.join(","));
         // P4 M2 钩子: gRPC 通道 (fail-closed, audit 对等; library 路径仍是
         // unsupported_security_metadata 显式错误)。
         match super::grpc_source::bridge_for("SecurityMetadata") {
@@ -488,8 +486,8 @@ impl MarketCapabilitiesGateway {
     ) -> Result<GatewayBatch<MarketSecurityIdentity>, GatewayError> {
         let storage_codes = codes.to_vec();
         let request_hash =
-            acquisition_request_hash(SECURITY_IDENTITY_CAPABILITY, &storage_codes.join(","));
-        // BR-231: identity is a narrow projection of the authenticated
+            acquisition_request_hash(SECURITY_IDENTITY_CAPABILITY, storage_codes.join(","));
+        // BR-238: identity is a narrow projection of the authenticated
         // ExternalV1 SecurityMetadata contract. A configured bridge failure is
         // audited and returned; it never falls back to a different provider.
         match super::grpc_source::bridge_for("SecurityMetadata") {

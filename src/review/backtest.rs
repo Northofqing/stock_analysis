@@ -310,8 +310,45 @@ pub fn read_paper_signal_entries(days: usize) -> Result<(Vec<SignalEntry>, usize
 }
 
 /// 虚拟仓信号回测: 每笔信号 → 15min bars 对齐 → forward return 分组。
+type TechnicalBarsCache = std::collections::HashMap<String, Result<Vec<SecurityBar>, String>>;
+
+fn load_technical_bars_cached<'a, Loader>(
+    cache: &'a mut TechnicalBarsCache,
+    code: &str,
+    loader: Loader,
+) -> Result<&'a [SecurityBar], &'a str>
+where
+    Loader: FnOnce(&str) -> Result<Vec<SecurityBar>, String>,
+{
+    cache
+        .entry(code.to_owned())
+        .or_insert_with(|| loader(code))
+        .as_ref()
+        .map(Vec::as_slice)
+        .map_err(String::as_str)
+}
+
 pub fn backtest_virtual_signals(days: usize) -> Result<R12BacktestResult, String> {
     let (entries, broken) = read_paper_signal_entries(days)?;
+    let gateway = HistoricalBarsGateway::new();
+    let mut cache = TechnicalBarsCache::new();
+    let mut loader = |code: &str| {
+        gateway
+            .fifteen_min_bars(code, 800)
+            .map_err(|error| error.to_string())
+    };
+    backtest_virtual_signals_with_entries_and_cache(&entries, broken, &mut cache, &mut loader)
+}
+
+fn backtest_virtual_signals_with_entries_and_cache<Loader>(
+    entries: &[SignalEntry],
+    broken: usize,
+    bars_by_code: &mut TechnicalBarsCache,
+    loader: &mut Loader,
+) -> Result<R12BacktestResult, String>
+where
+    Loader: FnMut(&str) -> Result<Vec<SecurityBar>, String>,
+{
     if entries.is_empty() {
         return Ok(R12BacktestResult {
             broken_excluded: broken,
@@ -319,10 +356,7 @@ pub fn backtest_virtual_signals(days: usize) -> Result<R12BacktestResult, String
         });
     }
 
-    let gateway = HistoricalBarsGateway::new();
-    let mut bars_by_code: std::collections::HashMap<String, Vec<SecurityBar>> =
-        std::collections::HashMap::new();
-    let mut skipped_codes = Vec::new();
+    let mut skipped_codes = std::collections::BTreeSet::new();
     let mut unaligned = 0_usize;
 
     // buy 分组累积: reason → window → rets
@@ -330,26 +364,21 @@ pub fn backtest_virtual_signals(days: usize) -> Result<R12BacktestResult, String
         std::collections::BTreeMap::new();
     let mut sell_rets: Vec<Vec<f64>> = vec![Vec::new(), Vec::new()];
 
-    for entry in &entries {
-        // 每只票只拉一次 (缓存)
-        if !bars_by_code.contains_key(&entry.code) {
-            match gateway.fifteen_min_bars(&entry.code, 800) {
-                Ok(bars) => {
-                    bars_by_code.insert(entry.code.clone(), bars);
-                }
-                Err(error) => {
-                    log::warn!(
-                        "[r12-backtest] 15min bars failed {} ({}): {error}",
-                        entry.code,
-                        entry.name
-                    );
-                    skipped_codes.push(entry.code.clone());
-                    continue;
-                }
+    for entry in entries {
+        // BR-239: success and failure are both cached for the whole run. A
+        // failed code must not be reacquired once per duplicate signal row.
+        let bars = match load_technical_bars_cached(bars_by_code, &entry.code, |code| loader(code))
+        {
+            Ok(bars) => bars,
+            Err(error) => {
+                log::warn!(
+                    "[r12-backtest] 15min bars failed {} ({}): {error}",
+                    entry.code,
+                    entry.name
+                );
+                skipped_codes.insert(entry.code.clone());
+                continue;
             }
-        }
-        let Some(bars) = bars_by_code.get(&entry.code) else {
-            continue;
         };
         let Some(idx) = locate_signal_bar(bars, entry.ts_utc) else {
             unaligned += 1;
@@ -373,7 +402,7 @@ pub fn backtest_virtual_signals(days: usize) -> Result<R12BacktestResult, String
 
     let mut result = R12BacktestResult {
         broken_excluded: broken,
-        skipped_codes,
+        skipped_codes: skipped_codes.into_iter().collect(),
         unaligned_signals: unaligned,
         ..Default::default()
     };
@@ -403,11 +432,28 @@ pub fn backtest_virtual_signals(days: usize) -> Result<R12BacktestResult, String
 /// boll_macd 15min 回测: 每只票 800 根 → 滑动窗口信号 → forward return。
 pub fn backtest_boll_macd_15min(codes: &[String]) -> Result<Vec<SignalGroup>, String> {
     let gateway = HistoricalBarsGateway::new();
+    let mut cache = TechnicalBarsCache::new();
+    let mut loader = |code: &str| {
+        gateway
+            .fifteen_min_bars(code, 800)
+            .map_err(|error| error.to_string())
+    };
+    backtest_boll_macd_15min_with_cache(codes, &mut cache, &mut loader)
+}
+
+fn backtest_boll_macd_15min_with_cache<Loader>(
+    codes: &[String],
+    bars_by_code: &mut TechnicalBarsCache,
+    loader: &mut Loader,
+) -> Result<Vec<SignalGroup>, String>
+where
+    Loader: FnMut(&str) -> Result<Vec<SecurityBar>, String>,
+{
     let mut rets_by_action: std::collections::BTreeMap<String, Vec<Vec<f64>>> =
         std::collections::BTreeMap::new();
     let mut skipped = Vec::new();
     for code in codes {
-        let bars = match gateway.fifteen_min_bars(code, 800) {
+        let bars = match load_technical_bars_cached(bars_by_code, code, |code| loader(code)) {
             Ok(bars) => bars,
             Err(error) => {
                 log::warn!("[r12-backtest] boll_macd 15min bars failed {code}: {error}");
@@ -415,7 +461,7 @@ pub fn backtest_boll_macd_15min(codes: &[String]) -> Result<Vec<SignalGroup>, St
                 continue;
             }
         };
-        let desc = bars_to_desc_kline(&bars);
+        let desc = bars_to_desc_kline(bars);
         let signals = scan_boll_macd_buys(&desc);
         for (j, action) in signals {
             let label = format!("{action:?}");
@@ -556,17 +602,35 @@ fn pct(rate: Option<f64>) -> String {
 
 /// 供 dispatcher 用的组合入口: 虚拟仓回测 + boll_macd 回测。
 pub fn run_full_backtest(days: usize) -> Result<R12BacktestResult, String> {
-    let mut result = backtest_virtual_signals(days)?;
-    let (entries, _) = read_paper_signal_entries(days)?;
+    let (entries, broken) = read_paper_signal_entries(days)?;
+    let gateway = HistoricalBarsGateway::new();
+    run_full_backtest_with_entries_and_loader(&entries, broken, |code| {
+        gateway
+            .fifteen_min_bars(code, 800)
+            .map_err(|error| error.to_string())
+    })
+}
+
+fn run_full_backtest_with_entries_and_loader<Loader>(
+    entries: &[SignalEntry],
+    broken: usize,
+    mut loader: Loader,
+) -> Result<R12BacktestResult, String>
+where
+    Loader: FnMut(&str) -> Result<Vec<SecurityBar>, String>,
+{
+    let mut cache = TechnicalBarsCache::new();
+    let mut result =
+        backtest_virtual_signals_with_entries_and_cache(entries, broken, &mut cache, &mut loader)?;
     let mut seen = std::collections::BTreeSet::new();
-    for e in &entries {
+    for e in entries {
         seen.insert(e.code.clone());
     }
     let codes: Vec<String> = seen.into_iter().collect();
     if codes.is_empty() {
         return Ok(result);
     }
-    result.boll_macd = backtest_boll_macd_15min(&codes)?;
+    result.boll_macd = backtest_boll_macd_15min_with_cache(&codes, &mut cache, &mut loader)?;
     Ok(result)
 }
 
@@ -577,6 +641,52 @@ pub fn run_full_backtest(days: usize) -> Result<R12BacktestResult, String> {
 mod tests {
     use super::*;
     use chrono::NaiveDate;
+
+    #[test]
+    fn br239_failed_technical_bars_code_is_negative_cached() {
+        let mut cache = std::collections::HashMap::new();
+        let calls = std::cell::Cell::new(0_usize);
+        for _ in 0..3 {
+            let result = load_technical_bars_cached(&mut cache, "TEST_CODE_000001", |_| {
+                calls.set(calls.get() + 1);
+                Err("TEST_CODE no_verified_batch".to_owned())
+            });
+            assert_eq!(result.unwrap_err(), "TEST_CODE no_verified_batch");
+        }
+        assert_eq!(
+            calls.get(),
+            1,
+            "failed codes must not be reacquired in one run"
+        );
+    }
+
+    #[test]
+    fn br239_full_backtest_loads_each_code_once_across_all_analyses() {
+        let entries = vec![SignalEntry {
+            code: "TEST_CODE_000001".to_owned(),
+            name: "TEST_CODE sample".to_owned(),
+            direction: "buy".to_owned(),
+            price: 10.0,
+            virtual_reason: "TEST_CODE reason".to_owned(),
+            ts_utc: NaiveDate::from_ymd_opt(2026, 8, 10)
+                .unwrap()
+                .and_hms_opt(1, 30, 0)
+                .unwrap(),
+        }];
+        let calls = std::cell::Cell::new(0_usize);
+
+        run_full_backtest_with_entries_and_loader(&entries, 0, |_| {
+            calls.set(calls.get() + 1);
+            Ok(sample_bars())
+        })
+        .expect("TEST_CODE full backtest succeeds");
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "virtual-signal and boll/macd analysis must share one run cache"
+        );
+    }
 
     fn bar(date: (i32, u32, u32), hhmm: (u32, u32), close: f64) -> SecurityBar {
         SecurityBar {

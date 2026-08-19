@@ -61,7 +61,7 @@ impl EconomicCalendarGateway {
         let country = country.map(str::to_owned);
         let request_hash = acquisition_request_hash(
             CAPABILITY,
-            &format!(
+            format!(
                 "limit={limit}:country={}",
                 country.as_deref().unwrap_or("*")
             ),

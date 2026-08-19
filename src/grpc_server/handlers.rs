@@ -1,4 +1,5 @@
 //! MarketDataService handler: 校验请求 → fixture 或 data_gateway 委托 → QueryResponse。
+//! BR-238 preserves authenticated external batch evidence end-to-end.
 use crate::grpc_client::pb::magic::market::v1::{
     market_data_service_server::MarketDataService, AdmissionState, CanonicalPayload, Operation,
     QueryRequest, QueryResponse,
@@ -137,6 +138,39 @@ fn response_from_fetched(
             "delegate 证据身份缺失: provider/source/batch_id 必须完整",
         ));
     }
+    match op {
+        Operation::SemanticSearch => {
+            crate::data_gateway::GeneralWebResearchProvider::from_wire_name(&result.provider)
+                .ok_or_else(|| {
+                    Status::internal(
+                        "delegate 证据身份非法: SemanticSearch provider 未在冻结枚举中",
+                    )
+                })?;
+            chrono::DateTime::parse_from_rfc3339(&result.observed_at).map_err(|_| {
+                Status::internal(
+                    "delegate 证据时间缺失或非法: SemanticSearch observed_at 必须是 RFC3339 instant",
+                )
+            })?;
+        }
+        _ => {
+            let provider =
+                crate::data_gateway::grpc_source::convert::parse_provider(&result.provider)
+                    .map_err(|_| {
+                        Status::internal("delegate 证据身份非法: provider 未在冻结枚举中")
+                    })?;
+            crate::data_gateway::parse_evidence_instant(
+                "GrpcBridge",
+                provider,
+                "observed_at",
+                &result.observed_at,
+            )
+            .map_err(|_| {
+                Status::internal(
+                    "delegate 证据时间缺失或非法: observed_at 必须是已冻结 Magic instant",
+                )
+            })?;
+        }
+    }
     Ok(QueryResponse {
         request_id,
         operation: op as i32,
@@ -144,7 +178,7 @@ fn response_from_fetched(
         selected_provider: result.provider,
         batch_id: result.batch_id,
         complete: true,
-        observed_at: chrono::Local::now().to_rfc3339(),
+        observed_at: result.observed_at,
         source_at: result.source_at,
         source: result.source,
         // 上游合同字段 10: 本地 server 无诊断 handler, 永远不产生诊断阻塞。
@@ -244,6 +278,93 @@ mod tests {
     use super::*;
 
     #[test]
+    fn br242_semantic_search_handler_local_bridge_roundtrips_every_general_web_provider() {
+        use crate::data_gateway::{
+            GeneralWebResearchBatch, GeneralWebResearchProvider, ResearchUseScope,
+        };
+
+        for (wire_name, serde_name, source, expected_provider) in [
+            (
+                "Bocha",
+                "bocha",
+                "bocha-general-web",
+                GeneralWebResearchProvider::Bocha,
+            ),
+            (
+                "Tavily",
+                "tavily",
+                "tavily-general-web",
+                GeneralWebResearchProvider::Tavily,
+            ),
+            (
+                "SerpApi",
+                "serp_api",
+                "serpapi-general-web",
+                GeneralWebResearchProvider::SerpApi,
+            ),
+        ] {
+            let request_id = format!("TEST_CODE_BR242_{wire_name}");
+            let batch_id = format!("TEST_CODE_BR242_BATCH_{wire_name}");
+            let record = serde_json::json!({
+                "title": "TEST_CODE semantic result",
+                "snippet": "TEST_CODE source-backed context",
+                "url": "https://example.com/TEST_CODE_BR242",
+                "publisher": "TEST_CODE publisher",
+                "published_at_raw": null,
+                "published_at": null,
+                "evidence": {
+                    "provider": serde_name,
+                    "observed_at": "2026-08-18T10:00:00+08:00",
+                    "batch_id": batch_id,
+                    "item_id": format!("TEST_CODE_BR242_ITEM_{wire_name}"),
+                    "publication_quality": "missing",
+                    "use_scope": "research_only"
+                }
+            });
+            let response = response_from_fetched(
+                request_id.clone(),
+                Operation::SemanticSearch,
+                "market.semantic_search",
+                1,
+                delegate::Fetched {
+                    data: serde_json::to_vec(&vec![record]).expect("TEST_CODE record serializes"),
+                    source_at: String::new(),
+                    observed_at: "2026-08-18T10:00:00+08:00".to_string(),
+                    provider: wire_name.to_string(),
+                    source: source.to_string(),
+                    batch_id: batch_id.clone(),
+                },
+            )
+            .expect("BR-242 handler must admit every frozen general-web provider");
+            let result = crate::grpc_client::envelope::parse_query_response(
+                &request_id,
+                Operation::SemanticSearch,
+                response,
+            )
+            .expect("LocalBridge envelope must preserve the handler response");
+            let batch = crate::data_gateway::grpc_source::convert::semantic_search(
+                &result,
+                "TEST_CODE semantic query",
+                expected_provider,
+                1,
+            )
+            .expect("LocalBridge converter must admit the exact requested provider");
+
+            let (records, evidence) = match batch {
+                GeneralWebResearchBatch::Available { records, evidence } => (records, evidence),
+                GeneralWebResearchBatch::VerifiedEmpty(_) => {
+                    panic!("TEST_CODE fixture contains one source-backed record")
+                }
+            };
+            assert_eq!(records.len(), 1);
+            assert_eq!(evidence.provider, expected_provider);
+            assert_eq!(evidence.source, source);
+            assert_eq!(evidence.batch_id, batch_id);
+            assert_eq!(evidence.use_scope, ResearchUseScope::ResearchOnly);
+        }
+    }
+
+    #[test]
     fn response_preserves_delegate_batch_identity() {
         let response = response_from_fetched(
             "TEST_CODE_REQUEST_1".to_string(),
@@ -253,6 +374,7 @@ mod tests {
             delegate::Fetched {
                 data: br#"[{"instrument_code":"TEST_CODE_600519"}]"#.to_vec(),
                 source_at: "2026-08-17T09:20:00+08:00".to_string(),
+                observed_at: "2026-08-17T09:20:01+08:00".to_string(),
                 provider: "Tdx".to_string(),
                 source: "tdx".to_string(),
                 batch_id: "TEST_CODE_MEMBERSHIP_BATCH_1".to_string(),
@@ -263,6 +385,29 @@ mod tests {
         assert_eq!(response.selected_provider, "Tdx");
         assert_eq!(response.source, "tdx");
         assert_eq!(response.batch_id, "TEST_CODE_MEMBERSHIP_BATCH_1");
+        assert_eq!(response.observed_at, "2026-08-17T09:20:01+08:00");
+    }
+
+    #[test]
+    fn br238_response_accepts_validated_magic_observation_encodings() {
+        for observed_at in ["1786970635.386291000", "unix-ms:1786970635026"] {
+            let response = response_from_fetched(
+                "TEST_CODE_REQUEST_MAGIC_TIME".to_string(),
+                Operation::GlobalNews,
+                "market.global_news",
+                1,
+                delegate::Fetched {
+                    data: br#"[{"item_id":"TEST_CODE_GLOBAL_NEWS_001"}]"#.to_vec(),
+                    source_at: "2026-08-17T20:43:49+08:00".to_string(),
+                    observed_at: observed_at.to_string(),
+                    provider: "Cailianpress".to_string(),
+                    source: "cls-v1".to_string(),
+                    batch_id: "TEST_CODE_GLOBAL_NEWS_BATCH_1".to_string(),
+                },
+            )
+            .expect("validated Magic evidence time must survive the gRPC response boundary");
+            assert_eq!(response.observed_at, observed_at);
+        }
     }
 
     #[test]
@@ -280,6 +425,7 @@ mod tests {
                 delegate::Fetched {
                     data: br#"[{"instrument_code":"TEST_CODE_600519"}]"#.to_vec(),
                     source_at: "2026-08-17T09:20:00+08:00".to_string(),
+                    observed_at: "2026-08-17T09:20:01+08:00".to_string(),
                     provider: provider.to_string(),
                     source: source.to_string(),
                     batch_id: batch_id.to_string(),
@@ -289,6 +435,29 @@ mod tests {
 
             assert_eq!(error.code(), tonic::Code::Internal);
             assert!(error.message().contains("证据身份缺失"));
+        }
+    }
+
+    #[test]
+    fn response_rejects_missing_or_invalid_delegate_observation_time() {
+        for observed_at in ["", "not-a-time"] {
+            let error = response_from_fetched(
+                "TEST_CODE_REQUEST_TIME".to_string(),
+                Operation::BoardConstituents,
+                "board.constituents",
+                1,
+                delegate::Fetched {
+                    data: br#"[{"instrument_code":"TEST_CODE_600519"}]"#.to_vec(),
+                    source_at: "2026-08-17T09:20:00+08:00".to_string(),
+                    observed_at: observed_at.to_string(),
+                    provider: "Tdx".to_string(),
+                    source: "tdx".to_string(),
+                    batch_id: "TEST_CODE_MEMBERSHIP_BATCH_1".to_string(),
+                },
+            )
+            .expect_err("missing/invalid observed_at must fail closed");
+            assert_eq!(error.code(), tonic::Code::Internal);
+            assert!(error.message().contains("observed_at"));
         }
     }
 }

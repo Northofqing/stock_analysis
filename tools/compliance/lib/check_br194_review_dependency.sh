@@ -138,8 +138,25 @@ for body in callers + [dispatcher]:
     for forbidden in ("BannerCtx", "current_banner()", "evaluate_account_mode_hook(true)"):
         assert forbidden not in body, f"review pre-gate restored: {forbidden}"
 
-assert "Self::R04 | Self::R08 | Self::R09 | Self::A10 | Self::A01 =>" in r08_dependency
-assert "ReviewTaskDependency::SourceOnly" in r08_dependency
+source_only_arm = r08_dependency.split("=> ReviewTaskDependency::SourceOnly", 1)[0]
+for source_only_task in (
+    "Self::R04",
+    "Self::R07",
+    "Self::R08",
+    "Self::R09",
+    "Self::R11",
+    "Self::R12",
+    "Self::R13",
+    "Self::A10",
+    "Self::A01",
+):
+    assert source_only_task in source_only_arm, (
+        f"BR-139 SourceOnly mapping missing: {source_only_task}"
+    )
+for account_task in ("Self::R02", "Self::R03", "Self::R05", "Self::R06"):
+    assert account_task not in source_only_arm, (
+        f"account/conservative task entered SourceOnly arm: {account_task}"
+    )
 
 assert dispatcher.find("let preflight = review_preflight") < dispatcher.find(
     "let phases = partition_review_tasks"
@@ -150,9 +167,9 @@ assert dispatcher.find("let phases = partition_review_tasks") < dispatcher.find(
     dispatcher[-160:],
 )
 assert dispatcher.find("tokio::join!") < dispatcher.find(
-    "let account_required = account_dependency_outcomes"
+    "let mut account_required_outcomes"
 )
-assert dispatcher.find("let account_required = account_dependency_outcomes") < dispatcher.rfind(
+assert dispatcher.find("let mut account_required_outcomes") < dispatcher.rfind(
     "merge_review_task_outcomes"
 )
 for source_only_task in (
@@ -168,8 +185,13 @@ for required in (
     "dispatch_paper_review_daily_outcome",
 ):
     assert required in dispatcher, f"source-only provider missing: {required}"
-for forbidden in ("dispatch_r03_industry_chain_outcome",):
-    assert forbidden not in dispatcher, f"conservative provider restored: {forbidden}"
+account_phase = dispatcher.find("let mut account_required_outcomes")
+r03_dispatch = dispatcher.find("dispatch_r03_industry_chain_outcome")
+assert account_phase >= 0
+assert r03_dispatch == -1, (
+    "R-03 must not dispatch while BR-194 account metrics are incomplete"
+)
+assert "ReviewTaskOutcome::account_metrics_incomplete" in dispatcher[account_phase:]
 
 for static_task in ("Self::R02", "Self::R05", "Self::R06"):
     assert static_task in review
@@ -298,8 +320,11 @@ for required in (
 ):
     assert required in schema, f"missing replay schema authority {required}"
 for required in (
-    "SCHEMA_VERSION: i64 = 6",
+    "SCHEMA_VERSION: i64 = 9",
     "migrate_schema_v5_to_v6",
+    "migrate_schema_v6_to_v7",
+    "migrate_schema_v7_to_v8",
+    "migrate_schema_v8_to_v9",
     "register_sha256_function",
     "FunctionFlags::SQLITE_INNOCUOUS",
     "FROM pragma_function_list",
@@ -392,7 +417,7 @@ for required in (
     "PRAGMA table_info",
     "if actual != expected",
     "replay table CHECK/UNIQUE contract mismatch",
-    "EXPECTED_SCHEMA_VERSION = 6",
+    "EXPECTED_SCHEMA_VERSION = 9",
     "PRAGMA user_version",
     "sha256_hex(NEW.start_canonical)=NEW.start_sha256",
     "sha256_hex(NEW.completion_canonical)=NEW.completion_sha256",
@@ -482,7 +507,7 @@ def validate_dispatcher(body: str) -> None:
         "let preflight = review_preflight",
         "let phases = partition_review_tasks",
         "tokio::join!",
-        "let account_required = account_dependency_outcomes",
+        "let mut account_required_outcomes",
         "merge_review_task_outcomes",
         "dispatch_r08_event_calendar_outcome",
         "dispatch_catalyst_review_daily_outcome",
@@ -494,17 +519,24 @@ def validate_dispatcher(body: str) -> None:
     )
     assert body.find("let phases = partition_review_tasks") < body.find("tokio::join!")
     assert body.find("tokio::join!") < body.find(
-        "let account_required = account_dependency_outcomes"
+        "let mut account_required_outcomes"
     )
-    assert body.find("let account_required = account_dependency_outcomes") < body.rfind(
+    assert body.find("let mut account_required_outcomes") < body.rfind(
         "merge_review_task_outcomes"
     )
-    for forbidden in ("dispatch_r03_industry_chain_outcome",):
-        assert forbidden not in body
+    assert "dispatch_r03_industry_chain_outcome" not in body
+    account_phase = body.find("let mut account_required_outcomes")
+    assert "ReviewTaskOutcome::account_metrics_incomplete" in body[account_phase:]
 
 def validate_r08_dependency(body: str) -> None:
-    assert "Self::R04 | Self::R08 | Self::R09 | Self::A10 | Self::A01 =>" in body
-    assert "ReviewTaskDependency::SourceOnly" in body
+    source_arm = body.split("=> ReviewTaskDependency::SourceOnly", 1)[0]
+    for task in (
+        "Self::R04", "Self::R07", "Self::R08", "Self::R09", "Self::R11",
+        "Self::R12", "Self::R13", "Self::A10", "Self::A01",
+    ):
+        assert task in source_arm
+    for task in ("Self::R02", "Self::R03", "Self::R05", "Self::R06"):
+        assert task not in source_arm
 
 def validate_r08_dispatcher(body: str) -> None:
     for forbidden in (
@@ -731,8 +763,11 @@ def validate_schema(body: str) -> None:
     assert body.count("validate_review_terminal_replay_attempt_audit_insert") >= 2
     assert body.count("validate_review_terminal_replay_completion_audit_insert") >= 2
     for required in (
-        "SCHEMA_VERSION: i64 = 6",
+        "SCHEMA_VERSION: i64 = 9",
         "migrate_schema_v5_to_v6",
+        "migrate_schema_v6_to_v7",
+        "migrate_schema_v7_to_v8",
+        "migrate_schema_v8_to_v9",
         "register_sha256_function",
         "FunctionFlags::SQLITE_INNOCUOUS",
         "FROM pragma_function_list",
@@ -793,7 +828,7 @@ def validate_verifier(body: str) -> None:
         "PRAGMA table_info",
         "if actual != expected",
         "replay table CHECK/UNIQUE contract mismatch",
-        "EXPECTED_SCHEMA_VERSION = 6",
+        "EXPECTED_SCHEMA_VERSION = 9",
         "PRAGMA user_version",
         "sha256_hex(NEW.start_canonical)=NEW.start_sha256",
         "sha256_hex(NEW.completion_canonical)=NEW.completion_sha256",
@@ -831,12 +866,12 @@ mutations = [
     (callers[0], "async fn run_review_only()", "async fn run_review_only() /* current_banner() */", validate_review_boundary),
     (callers[1], "async fn attempt_post_session_review(", "async fn attempt_post_session_review(/* evaluate_account_mode_hook(true) */", validate_review_boundary),
     (dispatcher, "let preflight = review_preflight", "let preflight = preflight_removed", validate_dispatcher),
-    (dispatcher, "merge_review_task_outcomes(preflight.outcomes", "merge_removed(preflight.outcomes", validate_dispatcher),
-    (dispatcher, "let account_required = account_dependency_outcomes", "dispatch_r03_industry_chain_outcome(); let account_required = account_dependency_outcomes", validate_dispatcher),
+    (dispatcher, "merge_review_task_outcomes(", "merge_removed(", validate_dispatcher),
+    (dispatcher, "let mut account_required_outcomes", "dispatch_r03_industry_chain_outcome(); let mut account_required_outcomes", validate_dispatcher),
     (dispatcher, "dispatch_r08_event_calendar_outcome", "r08_dispatch_removed", validate_dispatcher),
     (dispatcher, "dispatch_catalyst_review_daily_outcome", "a10_dispatch_removed", validate_dispatcher),
     (dispatcher, "dispatch_paper_review_daily_outcome", "a01_dispatch_removed", validate_dispatcher),
-    (r08_dependency, "Self::R04 | Self::R08 | Self::R09 | Self::A10 | Self::A01 =>", "Self::R04 | Self::R08 | Self::R09 =>", validate_r08_dependency),
+    (r08_dependency, "Self::R07", "SOURCE_ONLY_TASK_REMOVED", validate_r08_dependency),
     (r08_loader, "push_r08_presented_source_only_with_binding", "push_counted_with_binding", validate_r08_dispatcher),
     (r08_presented_entry, "token.descriptor().push_kind", "PushKind::EventCalendar", validate_r08_presented_entry),
     (r08_presented_entry, "push_r08_source_only_with_binding", "push_counted_with_binding", validate_r08_presented_entry),
@@ -882,7 +917,7 @@ mutations = [
     (schema, "FOREIGN KEY(attempt_identity,decision_identity)", "FOREIGN KEY(attempt_identity)", validate_schema),
     (schema, "immutable_review_terminal_replay_attempt_update", "immutable_replay_update_REMOVED", validate_schema),
     (schema, "validate_review_terminal_replay_completion_audit_insert", "validate_replay_completion_REMOVED", validate_schema),
-    (schema, "SCHEMA_VERSION: i64 = 6", "SCHEMA_VERSION: i64 = 5", validate_schema),
+    (schema, "SCHEMA_VERSION: i64 = 9", "SCHEMA_VERSION: i64 = 8", validate_schema),
     (schema, "FunctionFlags::SQLITE_INNOCUOUS", "FunctionFlags::SQLITE_DIRECTONLY", validate_schema),
     (schema, "FROM pragma_function_list", "FROM missing_function_catalog", validate_schema),
     (schema, "sha256_hex(NEW.start_canonical)=NEW.start_sha256", "NEW.start_sha256=NEW.start_sha256", validate_schema),
@@ -898,6 +933,7 @@ mutations = [
     (coordinator, "SELECT COALESCE(MAX(replay_ordinal),0)+1", "SELECT 1", validate_coordinator),
     (verifier, "EXPECTED_REPLAY_COLUMNS", "REPLAY_COLUMNS_REMOVED", validate_verifier),
     (verifier, "EXPECTED_REPLAY_TRIGGER_SQL", "REPLAY_TRIGGER_SQL_REMOVED", validate_verifier),
+    (verifier, "EXPECTED_SCHEMA_VERSION = 9", "EXPECTED_SCHEMA_VERSION = 8", validate_verifier),
     (verifier, "if actual != expected", "if False", validate_verifier),
     (verifier, "PRAGMA table_info", "PRAGMA table_xinfo_REMOVED", validate_verifier),
     (verifier, "verify_replay_completion_reason_vocabulary(connection)", "replay_reason_scan_REMOVED(connection)", validate_verifier),

@@ -2094,21 +2094,6 @@ fn prev_mode_to_tmpl(m: stock_analysis::risk::action_gate::AccountMode) -> Accou
 // v14.2: v13 核心 6 模板 push_* wrapper (render + dispatch)
 // ============================================================================
 
-/// v13 §14.1 P-01 盘前新闻热点 (ℹ️参考, 盘前无 banner)
-pub async fn push_preopen_news_hot(code: &str, params: PreopenNewsHotParams<'_>) -> bool {
-    let text = render_preopen_news_hot(params);
-    dispatch_registered_outcome!(
-        "P-01-preopen-news-hot",
-        crate::notify::PushKind::PreopenNewsHot,
-        "preopen_news_dispatcher",
-        "render_preopen_news_hot",
-        code,
-        None,
-        text
-    )
-    .is_pushed()
-}
-
 /// BR-225: 取前三条主线簇的头股代码。`chain_daily.stocks` 只存代码，名称必须
 /// 由外部权威来源解析，因此调用方需要先拿到这份代码集合。
 pub fn preopen_head_codes(
@@ -2286,65 +2271,6 @@ pub fn build_preopen_news_hot_from_db<'a>(
         news_pairs,
         watch_stocks,
     })
-}
-
-/// v15.1: 业务层入口 — 09:00 盘前自动调用
-pub async fn dispatch_preopen_news_hot_daily() -> bool {
-    use stock_analysis::database::DatabaseManager;
-    let db = DatabaseManager::get();
-    let clusters = match db.get_latest_chain_clusters_strict() {
-        Ok(clusters) => clusters,
-        Err(error) => {
-            log::error!("[P-01] {error}");
-            log_dispatcher_attempt("P-01", false, 0, &error);
-            return false;
-        }
-    };
-    let rotations = match db.get_latest_board_rotations_strict() {
-        Ok(rotations) => rotations,
-        Err(error) => {
-            log::error!("[P-01] {error}");
-            log_dispatcher_attempt("P-01", false, 0, &error);
-            return false;
-        }
-    };
-    if clusters.is_empty() || rotations.is_empty() {
-        log_dispatcher_attempt("P-01", false, 0, "no clusters");
-        log::info!("[P-01] 无主线簇或板块新闻, 跳过推送");
-        return false;
-    }
-    let now = chrono::Local::now();
-    let hhmm = now.format("%H:%M").to_string();
-    // BR-225: 头股名称先由统一 Gateway 的 security identity 批次解析，作为板块
-    // 异动股名称之外的独立回落证据。解析失败不合成名称，只记录后交由构造函数
-    // 按缺失代码显式失败。
-    let resolved_names = match preopen_head_codes(&clusters) {
-        Ok(codes) => match resolve_preopen_head_names(&codes).await {
-            Ok(names) => names,
-            Err(error) => {
-                log::warn!("[P-01][BR-225] 头股名称回落解析失败: {error}");
-                std::collections::HashMap::new()
-            }
-        },
-        Err(error) => {
-            log::error!("[P-01] 快照批次拒绝: {error}");
-            log_dispatcher_attempt("P-01", false, 0, &error);
-            return false;
-        }
-    };
-    let params = match build_preopen_news_hot_from_db(&hhmm, &clusters, &rotations, &resolved_names)
-    {
-        Ok(params) => params,
-        Err(error) => {
-            log::error!("[P-01] 快照批次拒绝: {error}");
-            log_dispatcher_attempt("P-01", false, 0, &error);
-            return false;
-        }
-    };
-    let snapshot_size = clusters.len();
-    let result = push_preopen_news_hot("", params).await;
-    log_dispatcher_attempt("P-01", result, snapshot_size, "");
-    result
 }
 
 // ============================================================================
@@ -2896,16 +2822,37 @@ fn fetch_settled_close_batch_strict(
     if batch.is_verified_empty() {
         return Err("盘后收盘快照 Gateway 返回不允许的 verified-empty".to_string());
     }
-    let quotes: std::collections::HashMap<_, _> = batch
-        .records()
-        .iter()
-        .cloned()
-        .map(|quote| (quote.code.clone(), quote))
-        .collect();
-    if quotes.len() != requested.len() {
+    project_settled_close_records(&requested, batch.records())
+}
+
+/// BR-164/BR-233: preserve the exact requested identity set when projecting an
+/// admitted settled-close batch. Unit tests exercise this pure seam with
+/// TEST_CODE fixtures; live-provider validation belongs to the release canary.
+fn project_settled_close_records(
+    requested: &[String],
+    records: &[stock_analysis::data_gateway::RealtimeMarketQuote],
+) -> Result<
+    std::collections::HashMap<String, stock_analysis::data_gateway::RealtimeMarketQuote>,
+    String,
+> {
+    let requested_set: std::collections::HashSet<&str> =
+        requested.iter().map(String::as_str).collect();
+    let mut quotes = std::collections::HashMap::with_capacity(records.len());
+    for quote in records {
+        if !requested_set.contains(quote.code.as_str()) {
+            return Err(format!(
+                "盘后收盘快照 Gateway 返回请求外代码: {}",
+                quote.code
+            ));
+        }
+        if quotes.insert(quote.code.clone(), quote.clone()).is_some() {
+            return Err(format!("盘后收盘快照 Gateway 返回重复代码: {}", quote.code));
+        }
+    }
+    if quotes.len() != requested_set.len() {
         return Err(format!(
             "盘后收盘快照 Gateway 批次不完整: requested={} actual={}",
-            requested.len(),
+            requested_set.len(),
             quotes.len()
         ));
     }
@@ -7252,9 +7199,18 @@ pub fn render_auction_repush(
 ) -> String {
     let mut text = format!("🔔 竞价优选 Top{}（{}）\n", top5.len(), hhmm);
     for (index, entry) in top5.iter().enumerate() {
-        let price = entry.current_price.unwrap_or(0.0);
+        let price = entry
+            .current_price
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .map(|value| format!("{value:.2}"))
+            .unwrap_or_else(|| "-".to_string());
+        let heat = entry
+            .heat_score
+            .filter(|value| value.is_finite())
+            .map(|value| format!("{value:+.0}"))
+            .unwrap_or_else(|| "-".to_string());
         text.push_str(&format!(
-            "{}. {}({}) {} | 现价 {:.2} | 热度 {:+.0}\n",
+            "{}. {}({}) {} | 现价 {} | 热度 {}\n",
             index + 1,
             entry.name,
             entry.code,
@@ -7264,7 +7220,7 @@ pub fn render_auction_repush(
                 .map(|source| source.label())
                 .unwrap_or("候选"),
             price,
-            entry.heat_score.unwrap_or(0.0)
+            heat,
         ));
     }
     text.push_str("竞价阶段, 以开盘实际成交为准 | 辅助建议, 非下单指令");
@@ -7285,19 +7241,31 @@ pub async fn dispatch_auction_repush(hhmm: &str) -> bool {
         log_dispatcher_attempt("A-02", false, 0, "no candidates at auction");
         return false;
     }
+    let candidate_count = entries.len();
     let mut ranked: Vec<_> = entries
         .into_iter()
-        .filter(|entry| entry.current_price.is_some())
+        .filter(|entry| {
+            entry
+                .current_price
+                .is_some_and(|value| value.is_finite() && value > 0.0)
+                && entry.heat_score.is_some_and(|value| value.is_finite())
+        })
         .collect();
+    let excluded_count = candidate_count.saturating_sub(ranked.len());
+    if excluded_count > 0 {
+        log::warn!(
+            "[A-02][BR-223] excluded {excluded_count} candidate(s) with missing/invalid price or heat"
+        );
+    }
     ranked.sort_by(|a, b| {
         let tier_a = a.tier == stock_analysis::opportunity::candidate_panel::EvidenceTier::Strong;
         let tier_b = b.tier == stock_analysis::opportunity::candidate_panel::EvidenceTier::Strong;
-        tier_b.cmp(&tier_a).then_with(|| {
-            b.heat_score
-                .unwrap_or(0.0)
-                .partial_cmp(&a.heat_score.unwrap_or(0.0))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        tier_b
+            .cmp(&tier_a)
+            .then_with(|| match (b.heat_score, a.heat_score) {
+                (Some(heat_b), Some(heat_a)) => heat_b.total_cmp(&heat_a),
+                _ => std::cmp::Ordering::Equal,
+            })
     });
     let top5: Vec<_> = ranked.into_iter().take(5).collect();
     if top5.is_empty() {
@@ -8011,9 +7979,81 @@ fn prepare_tomorrow_watch_delivery(
 /// BR-222: R-07 明日观察池 (v12 MVP-4 §7.6) — 4 类来源装配 + 按 code 去重 (首胜)。
 ///
 /// 来源: A档未触发(Strong 候选) / 龙虎榜强票(净买入 Top5) / 涨停链龙头(前 3 链) /
-/// 可做T持仓(整百股结构过滤)。龙虎榜/涨停链条目无价格字段, 按 BR-222 规则置 0.0
-/// 并在理由中注明 "以明日竞价为准, 按 T-11 复核" (红线 2.2: 不虚构价格)。
+/// 可做T持仓(整百股结构过滤)。龙虎榜/涨停链/做T 条目缺同一交易日收盘价时逐条
+/// 告警并排除，禁止补 0 或用上一交易日价格参与区间计算 (BR-222, 红线 2.2)。
+async fn inspect_r07_review_occurrence(
+    review_date: chrono::NaiveDate,
+) -> Result<Option<crate::durable_delivery_runtime::DurableDispatchEvidence>, String> {
+    crate::durable_delivery_runtime::resume_review_task_occurrence(
+        review_date,
+        stock_analysis::durable_delivery::PushKind::TomorrowWatch,
+        crate::review_batch::review_task_identity(
+            review_date,
+            crate::review_batch::ReviewTask::R07,
+        ),
+    )
+    .await
+}
+
+async fn dispatch_tomorrow_watch_outcome_with_runner<
+    Preflight,
+    PreflightFuture,
+    Runner,
+    RunnerFuture,
+>(
+    date: &str,
+    preflight: Preflight,
+    runner: Runner,
+) -> crate::review_batch::ReviewTaskOutcome
+where
+    Preflight: FnOnce(chrono::NaiveDate) -> PreflightFuture,
+    PreflightFuture: std::future::Future<
+        Output = Result<Option<crate::durable_delivery_runtime::DurableDispatchEvidence>, String>,
+    >,
+    Runner: FnOnce(String) -> RunnerFuture,
+    RunnerFuture: std::future::Future<Output = crate::review_batch::ReviewTaskOutcome>,
+{
+    let review_date = match chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            let reason = format!("invalid review date {date}: {error}");
+            log_dispatcher_attempt("R-07", false, 0, &reason);
+            return crate::review_batch::ReviewTaskOutcome::failed(false, reason);
+        }
+    };
+
+    match preflight(review_date).await {
+        Ok(Some(evidence)) => {
+            return review_outcome_from_existing_durable(
+                evidence,
+                review_date,
+                crate::review_batch::ReviewTask::R07,
+            )
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return crate::review_batch::ReviewTaskOutcome::failed(
+                true,
+                format!("R-07 durable occurrence preflight failed: {error}"),
+            )
+        }
+    }
+
+    runner(date.to_owned()).await
+}
+
 async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::ReviewTaskOutcome {
+    dispatch_tomorrow_watch_outcome_with_runner(
+        date,
+        inspect_r07_review_occurrence,
+        |owned_date| async move { dispatch_tomorrow_watch_after_preflight(&owned_date).await },
+    )
+    .await
+}
+
+async fn dispatch_tomorrow_watch_after_preflight(
+    date: &str,
+) -> crate::review_batch::ReviewTaskOutcome {
     use stock_analysis::opportunity::candidate_panel::EvidenceTier;
     use stock_analysis::review::tomorrow_watchlist::{
         dedup, WatchItem as OwnedWatchItem, WatchSource,
@@ -8037,7 +8077,14 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
                 if entry.tier != EvidenceTier::Strong {
                     continue;
                 }
-                let Some(price) = entry.current_price else {
+                let Some(price) = entry
+                    .current_price
+                    .filter(|price| price.is_finite() && *price > 0.0)
+                else {
+                    log::warn!(
+                        "[R-07][BR-222] A档候选 {} 缺少有限正价格, 排除该条目",
+                        entry.code
+                    );
                     continue;
                 };
                 items.push(OwnedWatchItem {
@@ -8068,7 +8115,7 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
     // 2. 龙虎榜强票 (净买入 > 0 Top5)
     //    BR-233 修复 (2026-08-10): 上游 record 无 name/价格契约 —
     //    name 与收盘价从 closing_valuation 视图补齐 (同做T候选基准);
-    //    视图缺失的 code → name 退化 code + 0.0 价格 + T-11 复核注记 (fail-closed)。
+    //    视图缺失的 code → 逐条告警并排除，禁止补 0 (fail-closed)。
     //    龙虎榜批次同时是 R-07 counted ceremony 的 counted source (BR-140/BR-192)。
     let closes: std::collections::HashMap<String, (String, f64)> = tokio::task::spawn_blocking(
         move || {
@@ -8117,7 +8164,7 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
             });
             // BR-233: 盘后收盘快照补名补价 (21:00 晚间最后成交时间
             // 必然超龄, 5s 红线走 settled-close 准入: 收盘价+中文名)。
-            // 失败/缺失 → closes 视图兜底 → 0.0 退化 (fail-closed, 红线 2.2 不虚构价格)。
+            // 失败/缺失 → closes 视图兜底；仍缺失则排除 (fail-closed, 红线 2.2)。
             let strong_codes: Vec<String> = strong
                 .iter()
                 .take(5)
@@ -8130,7 +8177,7 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
             .await
             .unwrap_or_else(|error| Err(format!("R-07 龙虎榜收盘快照 join 失败: {error}")));
             for record in strong.iter().take(5) {
-                let (name, base) = strong_quotes
+                let resolved = strong_quotes
                     .as_ref()
                     .ok()
                     .and_then(|quotes| quotes.get(&record.code))
@@ -8140,21 +8187,14 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
                             .get(&record.code)
                             .map(|(name, close)| (name.clone(), *close))
                     })
-                    .unwrap_or_else(|| (record.code.clone(), 0.0));
-                let (lo, hi, stop, reason) = if base > 0.0 {
-                    (
-                        base * 0.98,
-                        base * 1.02,
-                        base * 0.95,
-                        format!("龙虎榜净买入为正; 以收盘价 {base:.2} 为基准, 竞价后按 T-11 复核"),
-                    )
-                } else {
-                    (
-                        0.0,
-                        0.0,
-                        0.0,
-                        "龙虎榜净买入为正; 价格以明日竞价为准, 按 T-11 复核".to_string(),
-                    )
+                    .filter(|(_, price)| price.is_finite() && *price > 0.0);
+                let Some((name, base)) = resolved else {
+                    log::warn!(
+                        "[R-07][BR-222] 龙虎榜 {} 缺少 {} 同日有限正收盘价, 排除该条目",
+                        record.code,
+                        trading_date
+                    );
+                    continue;
                 };
                 items.push(OwnedWatchItem {
                     code: record.code.clone(),
@@ -8162,10 +8202,12 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
                     topic: "龙虎榜强票".to_string(),
                     source: WatchSource::LhbStrong,
                     trigger: format!("净买入 {:.0} 万", record.ranking_net_amount_yuan / 10000.0),
-                    lo_price: lo,
-                    hi_price: hi,
-                    stop,
-                    reason,
+                    lo_price: base * 0.98,
+                    hi_price: base * 1.02,
+                    stop: base * 0.95,
+                    reason: format!(
+                        "龙虎榜净买入为正; 以收盘价 {base:.2} 为基准, 竞价后按 T-11 复核"
+                    ),
                 });
             }
         }
@@ -8231,27 +8273,14 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
                     .and_then(|quotes| quotes.get(&chain.leader_code))
                     .map(|quote| quote.price)
                     .or_else(|| closes.get(&chain.leader_code).map(|(_, close)| *close))
-                    .unwrap_or(0.0);
-                let (lo, hi, stop, reason) = if base > 0.0 {
-                    (
-                        base * 0.98,
-                        base * 1.02,
-                        base * 0.95,
-                        format!(
-                            "涨停链龙头({}家涨停); 以收盘价 {base:.2} 为基准, 竞价后按 T-11 复核",
-                            chain.limit_up_n
-                        ),
-                    )
-                } else {
-                    (
-                        0.0,
-                        0.0,
-                        0.0,
-                        format!(
-                            "涨停链龙头({}家涨停); 价格以明日竞价为准, 按 T-11 复核",
-                            chain.limit_up_n
-                        ),
-                    )
+                    .filter(|price| price.is_finite() && *price > 0.0);
+                let Some(base) = base else {
+                    log::warn!(
+                        "[R-07][BR-222] 涨停链龙头 {} 缺少 {} 同日有限正收盘价, 排除该条目",
+                        chain.leader_code,
+                        trading_date
+                    );
+                    continue;
                 };
                 items.push(OwnedWatchItem {
                     code: chain.leader_code.clone(),
@@ -8259,10 +8288,13 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
                     topic: chain.chain.clone(),
                     source: WatchSource::LimitChainLeader,
                     trigger: format!("{}-板", chain.leader_boards),
-                    lo_price: lo,
-                    hi_price: hi,
-                    stop,
-                    reason,
+                    lo_price: base * 0.98,
+                    hi_price: base * 1.02,
+                    stop: base * 0.95,
+                    reason: format!(
+                        "涨停链龙头({}家涨停); 以收盘价 {base:.2} 为基准, 竞价后按 T-11 复核",
+                        chain.limit_up_n
+                    ),
                 });
             }
         }
@@ -8301,20 +8333,11 @@ async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::Rev
                             reason: format!("整百股持仓满足做T结构条件; 以收盘价 {base:.2} 为基准"),
                         });
                     }
-                    _ => {
-                        items.push(OwnedWatchItem {
-                            code: position.code,
-                            name: position.name,
-                            topic: "做T候选".to_string(),
-                            source: WatchSource::T0Candidate,
-                            trigger: "持仓做T".to_string(),
-                            lo_price: 0.0,
-                            hi_price: 0.0,
-                            stop: 0.0,
-                            reason: "整百股持仓满足做T结构条件; 无收盘价, 竞价后按 T-11 复核"
-                                .to_string(),
-                        });
-                    }
+                    _ => log::warn!(
+                        "[R-07][BR-222] 做T持仓 {} 缺少 {} 同日有限正收盘价, 排除该条目",
+                        position.code,
+                        trading_date
+                    ),
                 }
             }
         }
@@ -8459,6 +8482,78 @@ pub struct PositionReviewItem {
     pub daily_price_pnl: Option<f64>,
 }
 
+/// BR-233 / AGENTS 2.2: convert only a complete, finite closing-valuation batch.
+/// Missing values remain unavailable and must never enter review arithmetic as zero.
+fn validated_position_review_items(
+    valuation: &stock_analysis::portfolio::closing_valuation::ClosingValuationView,
+) -> Result<(Vec<PositionReviewItem>, f64, f64), String> {
+    if valuation.covered != valuation.total {
+        return Err(format!(
+            "closing valuation coverage incomplete: covered={} total={}",
+            valuation.covered, valuation.total
+        ));
+    }
+    let total_market_value = valuation
+        .total_market_value
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .ok_or_else(|| "closing valuation total_market_value missing or invalid".to_string())?;
+    let total_unrealized_pnl = valuation
+        .total_unrealized_pnl
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| "closing valuation total_unrealized_pnl missing or invalid".to_string())?;
+
+    let mut items = Vec::with_capacity(valuation.items.len());
+    for item in &valuation.items {
+        let close = item
+            .close
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .ok_or_else(|| format!("closing valuation {} close missing or invalid", item.code))?;
+        let market_value = item
+            .market_value
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .ok_or_else(|| {
+                format!(
+                    "closing valuation {} market_value missing or invalid",
+                    item.code
+                )
+            })?;
+        let unrealized_pnl = item
+            .unrealized_pnl
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| {
+                format!(
+                    "closing valuation {} unrealized_pnl missing or invalid",
+                    item.code
+                )
+            })?;
+        if item
+            .unrealized_return_pct
+            .is_some_and(|value| !value.is_finite())
+            || item.daily_price_pnl.is_some_and(|value| !value.is_finite())
+        {
+            return Err(format!(
+                "closing valuation {} optional metric is invalid",
+                item.code
+            ));
+        }
+        let quantity = i64::try_from(item.quantity)
+            .map_err(|_| format!("closing valuation {} quantity exceeds i64", item.code))?;
+        items.push(PositionReviewItem {
+            code: item.code.clone(),
+            name: item.name.clone(),
+            quantity,
+            cost_price: item.cost_price,
+            close: Some(close),
+            market_value,
+            unrealized_pnl,
+            unrealized_return_pct: item.unrealized_return_pct,
+            daily_price_pnl: item.daily_price_pnl,
+        });
+    }
+    items.sort_by(|a, b| b.market_value.total_cmp(&a.market_value));
+    Ok((items, total_market_value, total_unrealized_pnl))
+}
+
 /// BR-222: R-11 持仓复盘模板渲染 (用户确认持仓摘要, 盘后 1次/日)。
 pub fn render_position_review(p: PositionReviewParams<'_>) -> String {
     let mut out = format!("🏦 持仓复盘（{}）\n", p.date);
@@ -8529,6 +8624,37 @@ pub fn render_position_review(p: PositionReviewParams<'_>) -> String {
 /// - 未配置 DOUBAO/DEEPSEEK/GEMINI 任一 key → warn 出声跳过（fail-open，不阻塞复盘）。
 /// - 单只失败/超时（90s）→ warn 出声跳过该只。
 /// - 报告写 `reports/details/{date}_{code}.md`，推送文本只带摘要路径（全文过长）。
+#[derive(Debug, PartialEq, Eq)]
+enum ReviewAiWorkerOutcome<T> {
+    Completed(T),
+    TimedOut,
+}
+
+async fn run_review_ai_future_with_timeout<T, F, Fut>(
+    timeout: std::time::Duration,
+    make_future: F,
+) -> Result<ReviewAiWorkerOutcome<T>, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        Ok(
+            match runtime.block_on(tokio::time::timeout(timeout, make_future())) {
+                Ok(output) => ReviewAiWorkerOutcome::Completed(output),
+                Err(_) => ReviewAiWorkerOutcome::TimedOut,
+            },
+        )
+    })
+    .await
+    .map_err(|error| format!("blocking review worker failed: {error}"))?
+}
+
 async fn build_review_ai_section(items: &[PositionReviewItem]) -> String {
     if stock_analysis::risk::env_guard::runtime_is_test_process() {
         log::info!("[复盘AI] --test 进程隔离, 跳过 AI 研判段");
@@ -8572,18 +8698,15 @@ async fn build_review_ai_section(items: &[PositionReviewItem]) -> String {
         async move {
             let started = std::time::Instant::now();
             // GeminiAnalyzer 含 RefCell (non-Sync)，其 async future 不满足外层
-            // tokio::spawn 的 Send 约束 → 在 spawn_blocking 内建独立 current_thread
-            // runtime 跑研判，外层只等 Result (Send)。
-            let outcome = tokio::time::timeout(
+            // tokio::spawn 的 Send 约束。BR-242 把 timeout 放进 worker 自己的
+            // current-thread runtime；超时会先 drop future，再结束 runtime/worker。
+            let outcome = run_review_ai_future_with_timeout(
                 std::time::Duration::from_secs(90),
-                tokio::task::spawn_blocking(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|error| error.to_string())?;
-                    rt.block_on(stock_analysis::deep_analyzer::run_and_save(&code))
+                move || async move {
+                    stock_analysis::deep_analyzer::run_and_save(&code)
+                        .await
                         .map_err(|error| error.to_string())
-                }),
+                },
             )
             .await;
             (display_code, started.elapsed().as_secs(), outcome)
@@ -8594,7 +8717,7 @@ async fn build_review_ai_section(items: &[PositionReviewItem]) -> String {
     let mut lines: Vec<String> = Vec::new();
     for (item, (code, secs, outcome)) in targets.iter().zip(results) {
         match outcome {
-            Ok(Ok(Ok(path))) => {
+            Ok(ReviewAiWorkerOutcome::Completed(Ok(path))) => {
                 log::info!(
                     "[复盘AI] {}({}) 研判完成 {}s → {}",
                     item.name,
@@ -8609,21 +8732,21 @@ async fn build_review_ai_section(items: &[PositionReviewItem]) -> String {
                     path.display()
                 ));
             }
-            Ok(Ok(Err(error))) => {
+            Ok(ReviewAiWorkerOutcome::Completed(Err(error))) => {
                 log::warn!(
                     "[复盘AI] {}({}) 研判失败: {error} (跳过该只)",
                     item.name,
                     code
                 );
             }
-            Ok(Err(error)) => {
+            Err(error) => {
                 log::warn!(
                     "[复盘AI] {}({}) 研判任务失败: {error} (跳过该只)",
                     item.name,
                     code
                 );
             }
-            Err(_) => {
+            Ok(ReviewAiWorkerOutcome::TimedOut) => {
                 log::warn!("[复盘AI] {}({}) 研判超时 90s (跳过该只)", item.name, code);
             }
         }
@@ -8722,6 +8845,15 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
         log_dispatcher_attempt("R-11", false, 0, "closing valuation not persisted");
         return crate::review_batch::ReviewTaskOutcome::no_data("closing valuation not persisted");
     };
+    let (items, total_market_value, total_unrealized_pnl) =
+        match validated_position_review_items(&valuation.valuation) {
+            Ok(validated) => validated,
+            Err(reason) => {
+                log::warn!("[R-11][BR-233] {reason}");
+                log_dispatcher_attempt("R-11", false, 0, &reason);
+                return crate::review_batch::ReviewTaskOutcome::no_data(reason);
+            }
+        };
 
     let positions =
         match tokio::task::spawn_blocking(stock_analysis::portfolio::get_positions).await {
@@ -8750,8 +8882,8 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
             .items
             .iter()
             .find(|item| item.code == position.code)
-            .map(|item| item.market_value.unwrap_or(0.0))
-            .unwrap_or_else(|| position.shares as f64 * position.cost_price);
+            .and_then(|item| item.market_value)
+            .unwrap_or(position.shares as f64 * position.cost_price);
         total_position_value += market_value;
         *sector_value.entry(position.sector.clone()).or_insert(0.0) += market_value;
     }
@@ -8781,49 +8913,23 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
     }
 
     let unrealized_return_pct = if summary.securities_market_value > 0.0 {
-        valuation.valuation.total_unrealized_pnl.unwrap_or(0.0) / summary.securities_market_value
-            * 100.0
+        total_unrealized_pnl / summary.securities_market_value * 100.0
     } else {
         0.0
     };
-    // BR-233: 个股明细 (逐个复盘, 按市值降序)
-    let mut items: Vec<PositionReviewItem> = valuation
-        .valuation
-        .items
-        .iter()
-        .map(|item| PositionReviewItem {
-            code: item.code.clone(),
-            name: item.name.clone(),
-            quantity: i64::try_from(item.quantity).unwrap_or(0),
-            cost_price: item.cost_price,
-            close: item.close,
-            market_value: item.market_value.unwrap_or(0.0),
-            unrealized_pnl: item.unrealized_pnl.unwrap_or(0.0),
-            unrealized_return_pct: item.unrealized_return_pct,
-            daily_price_pnl: item.daily_price_pnl,
-        })
-        .collect();
-    items.sort_by(|a, b| {
-        b.market_value
-            .partial_cmp(&a.market_value)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
     let params = PositionReviewParams {
         date,
         total_assets: summary.total_assets,
         position_ratio_pct: summary.position_ratio_pct,
         available_cash: summary.available_cash,
         daily_pnl: summary.daily_pnl,
-        unrealized_pnl: valuation.valuation.total_unrealized_pnl.unwrap_or(0.0),
+        unrealized_pnl: total_unrealized_pnl,
         unrealized_return_pct,
         position_count: positions
             .iter()
             .filter(|p| p.status == stock_analysis::portfolio::PositionStatus::Holding)
             .count(),
-        market_value: valuation
-            .valuation
-            .total_market_value
-            .unwrap_or(total_position_value),
+        market_value: total_market_value,
         sectors: &top_sectors,
         items: &items,
     };
@@ -8880,7 +8986,36 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
 /// 由 render_r12 文本标注"不可回测" (用户已确认)。
 /// 回测窗口 = 近 30 自然日 (覆盖虚拟仓 7/14 起全部信号); 网络拉取 + SQLite 读表在
 /// spawn_blocking 内, 失败出声 (failed), 单只拉取失败在模块内 warn 跳过。
+const R12_TECHNICAL_BARS_PUBLISHED: bool = false;
+
+async fn dispatch_r12_backtest_outcome_with_runner<Runner, RunnerFuture>(
+    date: &str,
+    runner: Runner,
+) -> crate::review_batch::ReviewTaskOutcome
+where
+    Runner: FnOnce(String) -> RunnerFuture,
+    RunnerFuture: std::future::Future<Output = crate::review_batch::ReviewTaskOutcome>,
+{
+    if !R12_TECHNICAL_BARS_PUBLISHED {
+        let reason =
+            "TechnicalBars production capability unpublished; provider_calls=0 loader_calls=0";
+        log::warn!("[R-12][BR-239] disabled capability=TechnicalBars reason={reason}");
+        log_dispatcher_attempt("R-12", false, 0, reason);
+        return crate::review_batch::ReviewTaskOutcome::disabled("TechnicalBars", reason);
+    }
+    runner(date.to_owned()).await
+}
+
 async fn dispatch_r12_backtest_outcome(date: &str) -> crate::review_batch::ReviewTaskOutcome {
+    dispatch_r12_backtest_outcome_with_runner(date, |owned_date| async move {
+        dispatch_r12_backtest_after_capability(&owned_date).await
+    })
+    .await
+}
+
+async fn dispatch_r12_backtest_after_capability(
+    date: &str,
+) -> crate::review_batch::ReviewTaskOutcome {
     let today = match chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") {
         Ok(date) => date,
         Err(error) => {
@@ -9484,26 +9619,18 @@ pub async fn dispatch_post_session_review(
     let ipo_pushed = dispatch_ipo_catalyst(&date).await;
     log::info!("[BR-223] IPO 产业链催化 pushed={ipo_pushed}");
     let observed_at = chrono::Local::now().fixed_offset();
-    // 2026-08-06 用户决策 (未接券商): R-03 (涨停产业链复盘) 解除账户 gate。
-    // 其 dispatcher 数据源为 portfolio 持仓 + 涨停链 (不依赖 real_account_snapshot),
-    // 直接走真实数据路径; 其余 account_required 任务保持 account_metrics_incomplete。
+    // BR-139/BR-194: account_required 任务在真实账户指标缺失时统一停在
+    // typed AccountMetricsIncomplete 边界；不得调用 provider、renderer 或 sink。
     let mut account_required_outcomes = Vec::new();
     for task in &phases.account_required {
-        if *task == ReviewTask::R03 {
-            account_required_outcomes.push((
-                ReviewTask::R03,
-                dispatch_r03_industry_chain_outcome(&date).await,
-            ));
-        } else {
-            account_required_outcomes.push((
-                *task,
-                ReviewTaskOutcome::account_metrics_incomplete(observed_at),
-            ));
-        }
+        account_required_outcomes.push((
+            *task,
+            ReviewTaskOutcome::account_metrics_incomplete(observed_at),
+        ));
     }
     if !account_required_outcomes.is_empty() {
         log::warn!(
-            "[复盘依赖][BR-194] dependency=legacy_account_gate status=unavailable affected_count={} stage=acquire_batch reason_code=account_metrics_incomplete retryable=true source_provider=none source_time=none (R-03 已解除, 走持仓+涨停链)",
+            "[复盘依赖][BR-194] dependency=legacy_account_gate status=unavailable affected_count={} stage=acquire_batch reason_code=account_metrics_incomplete retryable=true source_provider=none source_time=none",
             account_required_outcomes.len()
         );
     }
@@ -11654,6 +11781,9 @@ mod tests_br140_r08_partial_components {
             .expect("account phase");
         assert!(initial_phase_end < followup_phase_start);
         assert!(followup_phase_start < account_phase_start);
+        let account_phase = &dispatcher[account_phase_start..];
+        assert!(account_phase.contains("ReviewTaskOutcome::account_metrics_incomplete"));
+        assert!(!account_phase.contains("dispatch_r03_industry_chain_outcome"));
     }
 
     #[test]
@@ -11681,16 +11811,11 @@ mod tests_br140_r08_partial_components {
         assert!(r08 < account);
         assert!(a10 < account);
         assert!(a01 < account);
-        // BR-194: R-03 is a LegacyAccountGate task, so `partition_review_tasks`
-        // can never place it in `source_only`. 2026-08-06 R-03 解除 (a9f006a):
-        // R-03 在 account phase 之后的 account_required 循环内走真实数据
-        // (dispatch_r03_industry_chain_outcome), 仍属 account-gated 路径 —
-        // 约束: 调用位置必须位于 account phase 之后 (绝不能在 source-only join)。
-        let r03 = dispatcher.find("dispatch_r03_industry_chain_outcome");
-        assert!(
-            r03.map(|pos| pos > account).unwrap_or(false),
-            "R-03 must stay on the account-gated path, not the source-only join"
-        );
+        // BR-139/BR-194: R-03 is a LegacyAccountGate task. When account
+        // metrics are incomplete the dispatcher must produce only the typed
+        // outcome; invoking R-03 would create provider/render/sink effects.
+        assert!(!dispatcher.contains("dispatch_r03_industry_chain_outcome"));
+        assert!(dispatcher[account..].contains("ReviewTaskOutcome::account_metrics_incomplete"));
     }
 
     #[test]
@@ -12732,6 +12857,71 @@ pub async fn dispatch_r06_failure_real(_date: &str, _banner: &BannerCtx) -> bool
 #[cfg(test)]
 mod tests_r_dispatchers {
     use super::*;
+
+    #[tokio::test]
+    async fn br239_r12_unpublished_technical_bars_is_disabled_before_loader() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let loader_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&loader_calls);
+        let outcome =
+            dispatch_r12_backtest_outcome_with_runner("2026-08-17", move |_| async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                crate::review_batch::ReviewTaskOutcome::no_data(
+                    "TEST_CODE loader unexpectedly called",
+                )
+            })
+            .await;
+
+        assert_eq!(loader_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            outcome,
+            crate::review_batch::ReviewTaskOutcome::Disabled { capability, reason }
+                if capability == "TechnicalBars"
+                    && reason.contains("unpublished")
+                    && reason.contains("provider_calls=0")
+        ));
+    }
+
+    #[tokio::test]
+    async fn br239_r07_existing_reserved_skips_all_source_acquisition() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let source_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&source_calls);
+        let outcome = dispatch_tomorrow_watch_outcome_with_runner(
+            "2026-08-17",
+            |_| async {
+                Ok(Some(
+                    crate::durable_delivery_runtime::DurableDispatchEvidence {
+                        decision_identity: "TEST_CODE_BR239_R07_RESERVED".to_owned(),
+                        state: stock_analysis::durable_delivery::DecisionState::Reserved,
+                        schedule_hydration: None,
+                    },
+                ))
+            },
+            move |_| async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                crate::review_batch::ReviewTaskOutcome::no_data(
+                    "TEST_CODE source runner unexpectedly called",
+                )
+            },
+        )
+        .await;
+
+        assert_eq!(source_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            outcome,
+            crate::review_batch::ReviewTaskOutcome::Failed {
+                failure: crate::review_batch::ReviewTaskFailure::ExistingSourceFailure {
+                    retryable: true,
+                    reason,
+                },
+            } if reason.contains("state=Reserved")
+        ));
+    }
 
     #[test]
     fn br140_dispatcher_error_is_never_empty_on_non_push() {
@@ -13958,9 +14148,6 @@ pub async fn push_candidate_triggered(
     promotion_evidence: Option<stock_analysis::opportunity::candidate_state::PromotionEvidence>,
     live_override: Option<bool>,
 ) -> Result<bool, String> {
-    use sha2::{Digest, Sha256};
-    use stock_analysis::database::DatabaseManager;
-    use stock_analysis::magic_compat::{AssetClass, Exchange, InstrumentId};
     use stock_analysis::opportunity::candidate_state::require_live_promotion;
 
     if let Err(error) = require_live_promotion(promotion_evidence, live_override) {
@@ -13968,66 +14155,8 @@ pub async fn push_candidate_triggered(
         return Ok(false);
     }
 
-    // BR-192 收尾 (2026-08-07): 原恒 CANDIDATE_COUNTED_BINDING_UNAVAILABLE —
-    // 候选选择无 durable 生命周期所有者, 无法构造不可变审计。现先持久化
-    // 选中决策 (candidate_trigger_selection: 谁/何时/依据), binding 以此为
-    // 真实证据 (origin=InternalDurable), 不再伪造批次身份。
-    let trigger_date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let basis = params.trigger_desc.to_string();
-    let db = DatabaseManager::get();
-    db.record_candidate_trigger(&trigger_date, code, params.name, &basis)?;
-
-    let canonical = serde_json::json!({
-        "code": code,
-        "name": params.name,
-        "grade": params.grade.label(),
-        "topic": params.topic,
-        "price": params.price,
-        "trigger_desc": basis,
-        "triggered_at": chrono::Local::now().to_rfc3339(),
-    });
-    let canonical_bytes = canonical.to_string().into_bytes();
-    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
-    let exchange = if code.starts_with('6') {
-        Exchange::Shanghai
-    } else {
-        Exchange::Shenzhen
-    };
-    let instrument = InstrumentId::new(exchange, code.to_string(), AssetClass::Equity)
-        .map_err(|error| format!("instrument 构造失败 code={code}: {error}"))?;
-    let binding = crate::durable_delivery_runtime::CountedDeliveryBinding::new(
-        chrono::Local::now().date_naive(),
-        format!("candidate-trigger:{trigger_date}:{code}"),
-        canonical_bytes,
-        crate::durable_delivery_runtime::CountedDeliveryScope::Ticket { instrument },
-        subject_hash,
-        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
-        None,
-        true,
-    )
-    .map_err(|error| format!("counted binding 构造失败 code={code}: {error}"))?;
-
-    let token = crate::presentation_registry::acquire_token(
-        "T-07-candidate-triggered",
-        crate::notify::PushKind::CandidateTriggered,
-        "candidate_dispatcher",
-        "render_candidate_triggered",
-    )
-    .map_err(|reason| format!("[BR-196] presentation token rejected code={code}: {reason}"))?;
-    let text = render_candidate_triggered(banner, params);
-    let outcome = crate::notify::push_counted_with_binding(token, &text, None, binding).await;
-    match outcome {
-        crate::notify::PushOutcome::Pushed | crate::notify::PushOutcome::Deduped => {
-            log::info!("[T-07] candidate triggered delivered code={code} outcome={outcome:?}");
-            Ok(true)
-        }
-        other => {
-            log::warn!(
-                "[T-07] candidate triggered delivery unconfirmed code={code} outcome={other:?}"
-            );
-            Ok(false)
-        }
-    }
+    let _ = (code, banner, params);
+    Err(CANDIDATE_COUNTED_BINDING_UNAVAILABLE.to_string())
 }
 
 /// MVP3-3.2 T-08 候选失效 (ℹ️参考, 复用 CandidateBoard).
@@ -14529,6 +14658,73 @@ pub fn render_preopen_news_hot(p: PreopenNewsHotParams<'_>) -> String {
     }
     s.push_str("辅助建议, 非下单指令");
     s
+}
+
+/// BR-241 source-bound P-01 renderer. Scheduled and compensation executions
+/// consume the same admitted binding; only the explicit timing label differs.
+pub fn render_bound_preopen_news_hot(
+    mode: crate::p01::P01RenderMode,
+    input: &crate::p01::P01InputBinding,
+) -> Result<String, crate::p01::P01Failure> {
+    if input.heads.is_empty() || input.heads.iter().all(|head| head.news.is_empty()) {
+        return Err(crate::p01::P01Failure::for_context(
+            "p01_render_input_empty",
+            false,
+            "render",
+            input.context,
+        ));
+    }
+
+    let hhmm = input.captured_observed_at.format("%H:%M");
+    let mut text = match mode {
+        crate::p01::P01RenderMode::Scheduled => {
+            format!("📰 盘前热点（{hhmm}）\n")
+        }
+        crate::p01::P01RenderMode::Compensation => "📰 盘前热点补发\n".to_string(),
+    };
+    text.push_str(&format!("业务日 {}\n", input.context.business_date));
+    text.push_str(&format!("依据前一交易日 {}\n", input.context.evidence_date));
+    if matches!(mode, crate::p01::P01RenderMode::Compensation) {
+        text.push_str(&format!("补发时间 {hhmm}\n"));
+    }
+
+    text.push_str("主线: ");
+    text.push_str(
+        &input
+            .heads
+            .iter()
+            .map(|head| head.concept.as_str())
+            .collect::<Vec<_>>()
+            .join(" / "),
+    );
+    text.push('\n');
+    text.push_str("催化:\n");
+    for head in &input.heads {
+        // BR-241: each head contributes its newest admitted row. All remaining
+        // rows and hashes stay in the canonical source binding for audit.
+        if let Some(news) = head.news.first() {
+            let published = news
+                .published_at
+                .with_timezone(
+                    &chrono::FixedOffset::east_opt(8 * 60 * 60)
+                        .expect("Shanghai fixed offset is always valid"),
+                )
+                .format("%m-%d %H:%M");
+            text.push_str(&format!(
+                "· {} → {}（{} {}）\n",
+                news.title, head.concept, news.source_name, published
+            ));
+        }
+    }
+    text.push_str("关注票:\n");
+    for head in &input.heads {
+        text.push_str(&format!(
+            "· {}({}) 逻辑: {}\n",
+            head.name, head.code, head.concept
+        ));
+    }
+    text.push_str("辅助建议, 非下单指令");
+    Ok(text)
 }
 
 /// v13 §14.2 I-01 盘中轮动总览（盘中交易建议类带 banner）
@@ -16184,43 +16380,135 @@ pub async fn dispatch_sector_anomaly_daily(hhmm: &str, news_text: &str) -> bool 
     result
 }
 
-/// BR-233 (2026-08-10): R-07 明日观察池补名补价 — 生产 8/10 21:00 推送
-/// 中龙虎榜/涨停链 8 只票名字=代码、低吸/止损 0.00 (用户投诉)。
-/// 修复 = 统一实时行情 gateway 补齐 name+price; strict 批次任一票失败
-/// 会整批退化 → name=code + 0.00。此测试用生产推送的真实 code 清单
-/// 验证盘后 (21:5x) 实时行情仍返回完整中文名+收盘价。
+/// BR-233: R-07 settled-close projection is deterministic and test/live
+/// isolated. Provider reachability and current-session evidence are verified by
+/// the release canary instead of a wall-clock-dependent unit test.
 #[cfg(test)]
 mod tests_br232_tomorrow_watch_quotes {
     use super::*;
 
-    #[tokio::test]
-    async fn br233_tomorrow_watch_codes_have_settled_close_names_and_prices() {
-        // gateway 审计需要 DB (audit_gateway_result 写库; 测试模式 init 幂等)
-        let _ = stock_analysis::database::DatabaseManager::init(None);
-        let codes = [
-            "000636", "002842", "001258", "301583", "601700", // 龙虎榜 Top5 (净买入>0)
-            "002474", "600327", "002541", // 涨停链龙头 (前 3 链)
-        ];
-        // 生产推送的 trading_date = 2026-08-10 (8/10 21:00 晚间装配)
-        let trading_date = chrono::NaiveDate::from_ymd_opt(2026, 8, 10).expect("fixed date");
-        let quotes = fetch_settled_close_batch_strict(&codes, trading_date)
-            .expect("盘后收盘快照 Gateway 必须对 8 只票返回完整批次 (strict 批不允许部分)");
-        for code in codes {
-            let quote = &quotes[code];
-            assert_ne!(quote.name, *code, "{code} 名字仍是代码 — BR-233 补名未生效");
-            assert!(
-                quote.price > 0.0,
-                "{code} 价格缺失 (price={}) — 低吸/止损仍会是 0.00",
-                quote.price
-            );
-            println!("{code} {} close={}", quote.name, quote.price);
+    fn settled_quote(
+        code: &str,
+        name: &str,
+        price: f64,
+    ) -> stock_analysis::data_gateway::RealtimeMarketQuote {
+        let observed_at = chrono::DateTime::parse_from_rfc3339("2026-08-10T21:00:00+08:00")
+            .expect("fixed observation")
+            .with_timezone(&chrono::Utc);
+        stock_analysis::data_gateway::RealtimeMarketQuote {
+            code: code.to_owned(),
+            name: name.to_owned(),
+            price,
+            previous_close: price - 0.1,
+            change_percent: 1.0,
+            source_at: observed_at - chrono::Duration::hours(6),
+            observed_at,
+            provider: stock_analysis::magic_compat::ProviderId::Tencent,
+            batch_id: "TEST_CODE_br233_settled_batch".to_owned(),
         }
+    }
+
+    #[test]
+    fn br233_tomorrow_watch_projection_keeps_test_names_and_prices() {
+        let requested = vec!["TEST_CODE_600396".to_owned(), "TEST_CODE_600519".to_owned()];
+        let records = vec![
+            settled_quote("TEST_CODE_600396", "协议测试股票一", 12.34),
+            settled_quote("TEST_CODE_600519", "协议测试股票二", 56.78),
+        ];
+
+        let quotes = project_settled_close_records(&requested, &records)
+            .expect("complete TEST_CODE batch must project exactly");
+        assert_eq!(quotes["TEST_CODE_600396"].name, "协议测试股票一");
+        assert_eq!(quotes["TEST_CODE_600396"].price, 12.34);
+        assert_eq!(quotes["TEST_CODE_600519"].name, "协议测试股票二");
+        assert_eq!(quotes["TEST_CODE_600519"].price, 56.78);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn br242_review_ai_timeout_drops_future_before_worker_returns() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct DropProbe(Arc<AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_in_future = Arc::clone(&dropped);
+        let outcome = run_review_ai_future_with_timeout(
+            std::time::Duration::from_millis(10),
+            move || async move {
+                let _probe = DropProbe(dropped_in_future);
+                std::future::pending::<()>().await;
+                Ok::<(), String>(())
+            },
+        )
+        .await
+        .expect("blocking review worker must join after its inner timeout");
+
+        assert!(matches!(outcome, ReviewAiWorkerOutcome::TimedOut));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the analysis future must be dropped before the worker returns"
+        );
+    }
+
+    #[test]
+    fn br223_auction_renderer_keeps_missing_price_and_heat_blank() {
+        let text = render_auction_repush(
+            "09:20",
+            &[
+                stock_analysis::opportunity::candidate_panel::CandidateEntry {
+                    code: "TEST_CODE_MISSING_AUCTION".to_string(),
+                    name: "TEST_CODE 缺值候选".to_string(),
+                    sources: Vec::new(),
+                    tier: stock_analysis::opportunity::candidate_panel::EvidenceTier::Strong,
+                    evidence: Vec::new(),
+                    current_price: None,
+                    change_pct: None,
+                    heat_score: None,
+                },
+            ],
+        );
+        assert!(text.contains("现价 - | 热度 -"), "text={text}");
+        assert!(!text.contains("现价 0.00"), "text={text}");
+    }
+
+    #[test]
+    fn br233_position_review_rejects_partial_valuation_instead_of_filling_zero() {
+        let valuation = stock_analysis::portfolio::closing_valuation::ClosingValuationView {
+            price_date: chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap(),
+            provider: "TEST_CODE_PROVIDER".to_string(),
+            covered: 0,
+            total: 1,
+            items: vec![
+                stock_analysis::portfolio::closing_valuation::ClosingValuationItem {
+                    code: "TEST_CODE_PARTIAL".to_string(),
+                    name: "TEST_CODE 缺估值".to_string(),
+                    quantity: 100,
+                    cost_price: 10.0,
+                    close: None,
+                    market_value: None,
+                    unrealized_pnl: None,
+                    unrealized_return_pct: None,
+                    daily_price_pnl: None,
+                },
+            ],
+            total_market_value: None,
+            total_unrealized_pnl: None,
+        };
+        let error = validated_position_review_items(&valuation)
+            .expect_err("partial valuation must remain unavailable");
+        assert!(error.contains("coverage incomplete"), "error={error}");
+    }
 
     #[test]
     fn render_intraday_alert_includes_category_and_extra() {
@@ -17647,6 +17935,32 @@ mod tests {
         assert!(out.ends_with("辅助建议, 非下单指令"));
     }
 
+    #[test]
+    fn p01_compensation_render_is_explicitly_late() {
+        let input = crate::p01::P01InputBinding::complete_test_input();
+        let text =
+            render_bound_preopen_news_hot(crate::p01::P01RenderMode::Compensation, &input).unwrap();
+
+        assert!(text.starts_with("📰 盘前热点补发"));
+        assert!(text.contains("业务日 2026-08-18"));
+        assert!(text.contains("依据前一交易日 2026-08-17"));
+        assert!(text.contains("补发时间 15:30"));
+    }
+
+    #[test]
+    fn p01_scheduled_render_keeps_normal_title_and_bound_facts() {
+        let input = crate::p01::P01InputBinding::complete_test_input();
+        let text =
+            render_bound_preopen_news_hot(crate::p01::P01RenderMode::Scheduled, &input).unwrap();
+
+        assert!(text.starts_with("📰 盘前热点（15:30）"));
+        assert!(!text.contains("补发"));
+        assert!(text.contains("主线: TEST_CODE_AI_CHAIN"));
+        assert!(text.contains("TEST_CODE_PROVIDER_HEADLINE"));
+        assert!(text.contains("TEST_CODE_IDENTITY_NAME(TEST_CODE_000001)"));
+        assert!(text.ends_with("辅助建议, 非下单指令"));
+    }
+
     // ====== v13 I-01 盘中轮动总览 (3 用例) ======
     #[test]
     fn intraday_market_full_state() {
@@ -18518,9 +18832,9 @@ mod tests {
     }
 
     #[test]
-    fn v15_dispatch_preopen_news_hot_daily_no_data() {
-        // 空 DB 时不推送 (graceful no-op)
-        // 实际需要 DB, 此处仅验证 build_* 函数路径, dispatch 行为在 e2e
+    fn v15_legacy_preopen_builder_rejects_empty_data() {
+        // BR-241 retains this builder only for isolated catalog rendering.
+        // Production P-01 no longer has a generic dispatcher path.
         use stock_analysis::database::concepts::ChainDailyRow;
         let clusters: Vec<ChainDailyRow> = vec![];
         assert!(build_preopen_news_hot_from_db(

@@ -22,7 +22,7 @@ use stock_analysis::data_gateway::{
     CompanyDataGateway, ConsensusDataGateway, DragonTigerGateway, GeneralWebResearchBatch,
     GeneralWebResearchGateway, GeneralWebResearchProvider, HistoricalBarsGateway, IndexDataGateway,
     IntradayShapeGateway, MagicTdxGateway, MarketDataGateway, ResearchDataGateway,
-    ReviewDataGateway, SecurityLifecycleGateway, SinaInstrumentNewsGateway,
+    ReviewDataGateway, SecurityLifecycleGateway,
 };
 use stock_analysis::database::DatabaseManager;
 
@@ -270,23 +270,18 @@ async fn bridge_all_hooked_ops_fixture_roundtrip() {
         t0.rejections.is_empty(),
         "T0Evidence rejections 空 (fixture)"
     );
-    // 批级 batch_id = 信封 batch_id (fixture-b1); 记录级 batch_id 保留在 records[i]。
+    // BR-238: live record and envelope evidence are one authenticated batch.
     assert_eq!(t0.batch_id, "fixture-b1", "T0Evidence 批级 batch_id");
     assert_eq!(
-        t0.records[0].batch_id, "fixture-t0",
+        t0.records[0].batch_id, "fixture-b1",
         "T0Evidence 记录级 batch_id 保真"
     );
 
-    // ---- M3: 个股新闻 (from_days=30 契约) ----
-    let news = SinaInstrumentNewsGateway::new()
-        .instrument_news_in_range("600519", now - Duration::days(30), now)
-        .await
-        .expect("InstrumentNews 桥");
-    assert_eq!(
-        news.records()[0].persistence_item().code.as_deref(),
-        Some("600519"),
-        "InstrumentNews 保真"
-    );
+    // InstrumentNews is intentionally absent here: production routes it through
+    // authenticated ExternalV1, while this process only hosts the LocalBridgeV1
+    // fixture server. Its strict ExternalV1 contract is covered in convert tests
+    // and by the release bundle probe; silently falling back here would mask a
+    // missing client-bundle in production.
 
     // ---- M4b 批次 1A: 6 个新桥 op (fixture 视图与 delegate fetch_* 对齐) ----
     let reports = ResearchDataGateway::new()

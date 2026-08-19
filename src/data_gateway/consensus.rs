@@ -42,7 +42,7 @@ impl ConsensusDataGateway {
         let code = code.to_owned();
         let request_hash = acquisition_request_hash(
             CAPABILITY,
-            &format!("{code}:{REPORT_WINDOW_DAYS}:{REPORT_LIMIT}"),
+            format!("{code}:{REPORT_WINDOW_DAYS}:{REPORT_LIMIT}"),
         );
         // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
         match super::grpc_source::bridge_for("Consensus") {

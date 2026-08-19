@@ -54,7 +54,7 @@ impl IndexDataGateway {
         &self,
         storage_codes: &[String],
     ) -> Result<GatewayBatch<RealtimeIndexQuote>, GatewayError> {
-        let request_hash = acquisition_request_hash(CAPABILITY, &storage_codes.join(","));
+        let request_hash = acquisition_request_hash(CAPABILITY, storage_codes.join(","));
         // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
         match super::grpc_source::bridge_for("IndexQuotes") {
             Ok(Some(bridge)) => {

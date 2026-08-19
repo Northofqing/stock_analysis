@@ -39,6 +39,23 @@ pub struct VerifiedParsedSelectionCli {
     _private: (),
 }
 
+/// Opaque proof that the one accepted P-01 compensation grammar was selected.
+///
+/// Only [`VerifiedParsedSelectionCli::p01_compensation_request`] can construct
+/// this value, so monitor runtime code cannot turn an arbitrary date into the
+/// authority to bypass unrelated startup reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct P01CompensationRequest {
+    business_date: chrono::NaiveDate,
+    _private: (),
+}
+
+impl P01CompensationRequest {
+    pub fn business_date(self) -> chrono::NaiveDate {
+        self.business_date
+    }
+}
+
 impl fmt::Debug for VerifiedParsedSelectionCli {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -86,6 +103,12 @@ impl VerifiedParsedSelectionCli {
 
     pub fn is_backfill_chain_name(&self) -> bool {
         self.parsed().backfill_chain_name
+    }
+
+    /// Return an opaque proof of the exact, isolated production compensation
+    /// command selected by this invocation.
+    pub fn p01_compensation_request(&self) -> Option<P01CompensationRequest> {
+        parsed_p01_compensation_request(self.parsed())
     }
 
     pub fn event_command(&self) -> Option<EventCommand> {
@@ -334,6 +357,11 @@ enum TerminalState {
     Version,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompensationCommand {
+    P01 { business_date: chrono::NaiveDate },
+}
+
 #[derive(Debug)]
 struct ParsedSelectionCli {
     terminal: Option<TerminalState>,
@@ -345,6 +373,7 @@ struct ParsedSelectionCli {
     push_dry_run: bool,
     backfill_st_type: bool,
     backfill_chain_name: bool,
+    compensation: Option<CompensationCommand>,
     event_command: Option<EventCommand>,
     explicit_argument_count: usize,
 }
@@ -425,10 +454,11 @@ fn parse_process_args(
         }
         _ => None,
     };
-    let event_command = match terminal {
-        Some(TerminalState::Help) => Some(EventCommand::Help),
-        Some(TerminalState::Version) => None,
-        _ => {
+    let compensation = parse_compensation_command(explicit_args)?;
+    let event_command = match (terminal, compensation) {
+        (Some(TerminalState::Help), _) => Some(EventCommand::Help),
+        (Some(TerminalState::Version), _) | (None, Some(_)) => None,
+        (None, None) => {
             let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
             crate::event::cli::parse_args(&refs).map_err(|error| {
                 SelectionProcessBootstrapError::new("selection_cli_invalid", error.to_string())
@@ -443,6 +473,7 @@ fn parse_process_args(
     };
     let e2e = has_exact_flag(&args, "--e2e");
     let v13_diag = has_exact_flag(&args, "--v13-diag");
+    let push_dry_run = has_exact_flag(&args, "--push-dry-run");
     if has_exact_flag(&args, "--e2e") && !test {
         return Err(SelectionProcessBootstrapError::new(
             "selection_e2e_requires_test",
@@ -455,6 +486,12 @@ fn parse_process_args(
             "--v13-diag requires the explicit --test process binding",
         ));
     }
+    if push_dry_run && !test {
+        return Err(SelectionProcessBootstrapError::new(
+            "selection_push_dry_run_requires_test",
+            "--push-dry-run requires the explicit --test process binding",
+        ));
+    }
 
     Ok(ParsedSelectionCli {
         terminal,
@@ -463,12 +500,95 @@ fn parse_process_args(
         e2e,
         v13_diag,
         push: has_exact_flag(&args, "--push"),
-        push_dry_run: has_exact_flag(&args, "--push-dry-run"),
+        push_dry_run,
         backfill_st_type: has_exact_flag(&args, "--backfill-st-type"),
         backfill_chain_name: has_exact_flag(&args, "--backfill-chain-name"),
+        compensation,
         event_command,
         explicit_argument_count: args.len().saturating_sub(1),
     })
+}
+
+fn parse_compensation_command(
+    explicit_args: &[String],
+) -> Result<Option<CompensationCommand>, SelectionProcessBootstrapError> {
+    let contains_compensation_argument = explicit_args.iter().any(|argument| {
+        argument.starts_with("--compensate") || argument.starts_with("--business-date")
+    });
+    if !contains_compensation_argument {
+        return Ok(None);
+    }
+    if explicit_args.len() != 2 {
+        return Err(SelectionProcessBootstrapError::new(
+            "selection_p01_compensation_invalid",
+            "P-01 compensation requires exactly --compensate=P-01 and --business-date=YYYY-MM-DD",
+        ));
+    }
+
+    let mut selected_task = false;
+    let mut business_date = None;
+    for argument in explicit_args {
+        if argument == "--compensate=P-01" {
+            if selected_task {
+                return Err(SelectionProcessBootstrapError::new(
+                    "selection_p01_compensation_invalid",
+                    "P-01 compensation task argument must occur exactly once",
+                ));
+            }
+            selected_task = true;
+        } else if let Some(value) = argument.strip_prefix("--business-date=") {
+            if business_date.is_some() {
+                return Err(SelectionProcessBootstrapError::new(
+                    "selection_p01_compensation_invalid",
+                    "P-01 compensation business date must occur exactly once",
+                ));
+            }
+            let bytes = value.as_bytes();
+            let canonical_yyyy_mm_dd = bytes.len() == 10
+                && bytes[4] == b'-'
+                && bytes[7] == b'-'
+                && bytes
+                    .iter()
+                    .enumerate()
+                    .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit());
+            if !canonical_yyyy_mm_dd {
+                return Err(SelectionProcessBootstrapError::new(
+                    "selection_p01_compensation_date_invalid",
+                    "P-01 compensation business date must use YYYY-MM-DD",
+                ));
+            }
+            business_date = Some(
+                chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| {
+                    SelectionProcessBootstrapError::new(
+                        "selection_p01_compensation_date_invalid",
+                        "P-01 compensation business date must use YYYY-MM-DD",
+                    )
+                })?,
+            );
+        } else {
+            return Err(SelectionProcessBootstrapError::new(
+                "selection_p01_compensation_invalid",
+                "P-01 compensation cannot be combined with another task or operational argument",
+            ));
+        }
+    }
+
+    match (selected_task, business_date) {
+        (true, Some(business_date)) => Ok(Some(CompensationCommand::P01 { business_date })),
+        _ => Err(SelectionProcessBootstrapError::new(
+            "selection_p01_compensation_invalid",
+            "P-01 compensation requires exactly --compensate=P-01 and --business-date=YYYY-MM-DD",
+        )),
+    }
+}
+
+fn parsed_p01_compensation_request(parsed: &ParsedSelectionCli) -> Option<P01CompensationRequest> {
+    parsed.compensation.map(
+        |CompensationCommand::P01 { business_date }| P01CompensationRequest {
+            business_date,
+            _private: (),
+        },
+    )
 }
 
 fn has_exact_flag(args: &[String], flag: &str) -> bool {
@@ -510,6 +630,94 @@ mod tests {
             .expect("isolated review dry-run");
         assert!(!review.e2e);
         assert!(review.review);
+    }
+
+    #[test]
+    fn production_push_dry_run_requires_explicit_test_binding() {
+        let error = parse(&["monitor", "--push-dry-run"])
+            .expect_err("production dry-run must not bypass TEST_CODE isolation");
+        assert_eq!(error.code(), "selection_push_dry_run_requires_test");
+    }
+
+    #[test]
+    fn p01_compensation_accepts_only_the_exact_task_and_business_date_pair() {
+        let parsed = parse(&["monitor", "--compensate=P-01", "--business-date=2026-08-18"])
+            .expect("exact production P-01 compensation command");
+
+        assert_eq!(
+            parsed.compensation,
+            Some(CompensationCommand::P01 {
+                business_date: chrono::NaiveDate::from_ymd_opt(2026, 8, 18).unwrap(),
+            })
+        );
+        assert_eq!(parsed.mode, SelectionProcessMode::Production);
+        assert_eq!(parsed.explicit_argument_count, 2);
+        assert!(parsed.event_command.is_none());
+    }
+
+    #[test]
+    fn p01_compensation_request_is_an_opaque_typed_cli_proof() {
+        let parsed = parse(&["monitor", "--compensate=P-01", "--business-date=2026-08-18"])
+            .expect("exact production P-01 compensation command");
+
+        assert_eq!(
+            parsed_p01_compensation_request(&parsed)
+                .expect("typed P-01 request")
+                .business_date(),
+            chrono::NaiveDate::from_ymd_opt(2026, 8, 18).unwrap()
+        );
+        let ordinary = parse(&["monitor", "--review"]).expect("ordinary production command");
+        assert!(parsed_p01_compensation_request(&ordinary).is_none());
+    }
+
+    #[test]
+    fn p01_compensation_rejects_noncanonical_business_date_spelling() {
+        for argument in [
+            "--business-date=2026-8-18",
+            "--business-date=2026-08-8",
+            "--business-date=+2026-08-18",
+        ] {
+            let error = parse(&["monitor", "--compensate=P-01", argument])
+                .expect_err("P-01 date identity must be exact YYYY-MM-DD");
+            assert_eq!(error.code(), "selection_p01_compensation_date_invalid");
+        }
+    }
+
+    #[test]
+    fn p01_compensation_rejects_duplicates_and_mixed_operational_modes() {
+        for args in [
+            vec![
+                "monitor",
+                "--compensate=P-01",
+                "--business-date=2026-08-18",
+                "--test",
+            ],
+            vec![
+                "monitor",
+                "--compensate=P-01",
+                "--business-date=2026-08-18",
+                "--push",
+            ],
+            vec![
+                "monitor",
+                "--compensate=P-01",
+                "--business-date=2026-08-18",
+                "--review",
+            ],
+            vec![
+                "monitor",
+                "--compensate=P-01",
+                "--business-date=2026-08-18",
+                "--business-date=2026-08-18",
+            ],
+            vec!["monitor", "--compensate=P-01", "--compensate=P-01"],
+            vec!["monitor", "--compensate=P-02", "--business-date=2026-08-18"],
+            vec!["monitor", "--compensate=P-01"],
+            vec!["monitor", "--business-date=2026-08-18"],
+        ] {
+            let error = parse(&args).expect_err("P-01 compensation must be an exclusive command");
+            assert_eq!(error.code(), "selection_p01_compensation_invalid");
+        }
     }
 
     #[test]

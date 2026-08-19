@@ -1,4 +1,4 @@
-//! Registered business rules: BR-158, BR-159, BR-213.
+//! Registered business rules: BR-158, BR-159, BR-213, BR-238.
 //! Unified A-01/R-03 provider admission, evidence retention and acquisition audit.
 
 #[cfg(feature = "magic-gateway")]
@@ -26,6 +26,62 @@ use thiserror::Error;
 use super::historical_bars::{AdmittedDailyBars, HistoricalBarsGateway};
 
 const WHOLE_LIMIT_POOL_BOUND: u32 = 200;
+
+#[derive(Debug, Clone, Copy, Serialize)]
+enum LimitPoolAcquisitionProfile {
+    #[serde(rename = "LocalBridgeV1")]
+    LocalBridgeV1,
+    #[serde(rename = "InProcessRouterV1")]
+    InProcessRouterV1,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+enum LimitPoolAcquisitionOperation {
+    #[serde(rename = "LimitPools")]
+    LimitPools,
+}
+
+#[derive(Debug, Serialize)]
+struct CanonicalLimitPoolAcquisitionRequest {
+    schema: &'static str,
+    profile: LimitPoolAcquisitionProfile,
+    operation: LimitPoolAcquisitionOperation,
+    request: CanonicalLimitPoolRequest,
+}
+
+#[derive(Debug, Serialize)]
+struct CanonicalLimitPoolRequest {
+    kind: LimitPoolKind,
+    trading_date: String,
+    limit: u32,
+}
+
+/// BR-159 request identity for every BR-213 whole-pool acquisition. A typed
+/// document keeps the route/profile and the exact request fields in one stable
+/// canonical preimage; callers cannot fall back to delimiter-based summaries.
+fn limit_pool_acquisition_request_hash(
+    capability: &'static str,
+    profile: LimitPoolAcquisitionProfile,
+    trading_date: NaiveDate,
+) -> Result<String, GatewayError> {
+    let canonical = serde_json::to_vec(&CanonicalLimitPoolAcquisitionRequest {
+        schema: "BR159_LIMIT_POOLS_ACQUISITION_V1",
+        profile,
+        operation: LimitPoolAcquisitionOperation::LimitPools,
+        request: CanonicalLimitPoolRequest {
+            kind: LimitPoolKind::Upper,
+            trading_date: trading_date.format("%Y-%m-%d").to_string(),
+            limit: WHOLE_LIMIT_POOL_BOUND,
+        },
+    })
+    .map_err(|error| {
+        GatewayError::invalid_request(
+            capability,
+            format!("canonical LimitPools request encoding failed: {error}"),
+        )
+    })?;
+    Ok(acquisition_request_hash(capability, canonical))
+}
 
 /// Provider and acquisition facts retained for every accepted or verified-empty batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,7 +326,7 @@ impl ReviewDataGateway {
         trading_date: NaiveDate,
     ) -> Result<GatewayBatch<UpperLimitRecord>, GatewayError> {
         let request_hash =
-            acquisition_request_hash("R-03", &format!("{trading_date}:{WHOLE_LIMIT_POOL_BOUND}"));
+            acquisition_request_hash("R-03", format!("{trading_date}:{WHOLE_LIMIT_POOL_BOUND}"));
         // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端,
         // audit_routed 不校验 provider 一致性 — 与本地 Custom provider 对等)。
         match super::grpc_source::bridge_for("UpperLimitPoolReview") {
@@ -322,8 +378,42 @@ impl ReviewDataGateway {
 
     /// Exact-date upper-limit membership batch for the BR-213 market display
     /// projection. The acquisition is durably audited before any consumer may
-    /// join display names from realtime quotes.
+    /// join display names from the separately admitted identity batches.
     pub(crate) fn current_upper_limit_pool(
+        &self,
+        trading_date: NaiveDate,
+    ) -> Result<GatewayBatch<LimitPoolEntry>, GatewayError> {
+        const CAPABILITY: &str = "BR-213-UpperLimitPool";
+        let request_hash = limit_pool_acquisition_request_hash(
+            CAPABILITY,
+            LimitPoolAcquisitionProfile::LocalBridgeV1,
+            trading_date,
+        )?;
+        // BR-238: the synchronous P-01 consumer keeps one interface while the
+        // bridge owns its runtime-safe blocking implementation. A configured
+        // bridge failure is terminal for this attempt; never fall back to a
+        // library provider after transport/schema/evidence failure.
+        match super::grpc_source::bridge_for("LimitPools") {
+            Ok(Some(bridge)) => {
+                let result = bridge
+                    .limit_pools(trading_date)
+                    .and_then(|batch| admit_current_upper_limit_pool(batch, trading_date));
+                return audit_routed_gateway_result(CAPABILITY, &request_hash, result);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return audit_routed_gateway_result(CAPABILITY, &request_hash, Err(error));
+            }
+        }
+        self.current_upper_limit_pool_library(trading_date)
+    }
+
+    /// Library-only server seam for LocalBridge `LimitPools`.
+    ///
+    /// This deliberately bypasses [`super::grpc_source::bridge_for`] so the
+    /// server delegate cannot recursively call itself when its environment also
+    /// enables the consumer bridge.
+    pub(crate) fn current_upper_limit_pool_library(
         &self,
         trading_date: NaiveDate,
     ) -> Result<GatewayBatch<LimitPoolEntry>, GatewayError> {
@@ -345,14 +435,102 @@ impl ReviewDataGateway {
         }
         #[cfg(feature = "magic-gateway")]
         {
-            let request_hash = acquisition_request_hash(
+            let request_hash = limit_pool_acquisition_request_hash(
                 CAPABILITY,
-                &format!("{trading_date}:{WHOLE_LIMIT_POOL_BOUND}"),
-            );
+                LimitPoolAcquisitionProfile::InProcessRouterV1,
+                trading_date,
+            )?;
             let result = route_exact_date_upper_limit_pool(CAPABILITY, trading_date);
             audit_routed_gateway_result(CAPABILITY, &request_hash, result)
         }
     }
+}
+
+/// Re-admit the LocalBridge projection at the synchronous consumer seam. The
+/// converter validates wire shape; this layer additionally binds the complete
+/// records to the exact BR-213 date, bound and immutable batch evidence before
+/// the batch can escape into P-01.
+fn admit_current_upper_limit_pool(
+    batch: GatewayBatch<LimitPoolEntry>,
+    expected_date: NaiveDate,
+) -> Result<GatewayBatch<LimitPoolEntry>, GatewayError> {
+    const CAPABILITY: &str = "BR-213-UpperLimitPool";
+    let evidence = batch.evidence();
+    let provider = evidence.provider;
+    if !matches!(provider, ProviderId::Eastmoney | ProviderId::Tonghuashun) {
+        return Err(GatewayError::invalid_evidence(
+            CAPABILITY,
+            Some(provider),
+            "LimitPools selected an unregistered provider",
+        ));
+    }
+    if evidence.source.trim().is_empty()
+        || evidence.observed_at.trim().is_empty()
+        || evidence.batch_id.trim().is_empty()
+    {
+        return Err(GatewayError::invalid_evidence(
+            CAPABILITY,
+            Some(provider),
+            "LimitPools batch evidence is incomplete",
+        ));
+    }
+    let expected_text = expected_date.format("%Y-%m-%d").to_string();
+    if evidence.source_at.as_deref() != Some(expected_text.as_str()) {
+        return Err(GatewayError::invalid_evidence(
+            CAPABILITY,
+            Some(provider),
+            format!(
+                "LimitPools batch source_at {:?} differs from requested {expected_date}",
+                evidence.source_at
+            ),
+        ));
+    }
+    if batch.records().len() > WHOLE_LIMIT_POOL_BOUND as usize {
+        return Err(GatewayError::invalid_evidence(
+            CAPABILITY,
+            Some(provider),
+            format!(
+                "LimitPools returned {} records, exceeding bound {WHOLE_LIMIT_POOL_BOUND}",
+                batch.records().len()
+            ),
+        ));
+    }
+
+    let mut identities = HashSet::with_capacity(batch.records().len());
+    for record in batch.records() {
+        let record_date = NaiveDate::parse_from_str(record.trading_date.as_str(), "%Y-%m-%d")
+            .map_err(|error| {
+                GatewayError::invalid_evidence(
+                    CAPABILITY,
+                    Some(provider),
+                    format!("invalid LimitPools trading date: {error}"),
+                )
+            })?;
+        if record.kind != LimitPoolKind::Upper
+            || record_date != expected_date
+            || record.evidence.provider() != provider
+            || record.evidence.batch_id() != evidence.batch_id
+            || record.evidence.source_at() != evidence.source_at.as_deref()
+            || record.evidence.observed_at() != evidence.observed_at
+        {
+            return Err(GatewayError::invalid_evidence(
+                CAPABILITY,
+                Some(provider),
+                "LimitPools record differs from requested date or batch evidence",
+            ));
+        }
+        if !identities.insert(record.instrument.code().to_owned()) {
+            return Err(GatewayError::invalid_evidence(
+                CAPABILITY,
+                Some(provider),
+                format!(
+                    "LimitPools contains duplicate security {}",
+                    record.instrument.code()
+                ),
+            ));
+        }
+    }
+    Ok(batch)
 }
 
 /// Persist the exact BR-213 two-batch join before the plain display projection
@@ -703,12 +881,15 @@ fn map_r03_upper_limit_batch(
     Ok(GatewayBatch::Available { records, evidence })
 }
 
-pub(super) fn acquisition_request_hash(capability: &str, canonical_request: &str) -> String {
+pub(super) fn acquisition_request_hash(
+    capability: &str,
+    canonical_request: impl AsRef<[u8]>,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"BR159_DATA_GATEWAY_REQUEST_V1\0");
     hasher.update(capability.as_bytes());
     hasher.update(b"\0");
-    hasher.update(canonical_request.as_bytes());
+    hasher.update(canonical_request.as_ref());
     hex::encode(hasher.finalize())
 }
 
@@ -966,8 +1147,8 @@ mod tests {
     use crate::data_provider::{AdjustType, KlineData};
     use crate::database::DatabaseManager;
     use crate::magic_compat::{
-        AssetClass, DataBatch, Exchange, InstrumentId, IsoDate, NonEmptyText, Price, Provenance,
-        Ratio, RatioUnit, SourceEvidence,
+        AssetClass, DataBatch, Exchange, InstrumentId, IsoDate, Money, NonEmptyText, Price,
+        Provenance, Quantity, Ratio, RatioUnit, SourceEvidence,
     };
     use diesel::prelude::*;
     use diesel::sql_types::{BigInt, Nullable, Text};
@@ -981,6 +1162,13 @@ mod tests {
         request_hash: String,
         #[diesel(sql_type = Nullable<Text>)]
         batch_id: Option<String>,
+    }
+
+    #[cfg(not(feature = "magic-gateway"))]
+    #[derive(Debug, QueryableByName)]
+    struct AcquisitionRequestAuditRow {
+        #[diesel(sql_type = Text)]
+        request_hash: String,
     }
 
     #[test]
@@ -1270,6 +1458,35 @@ mod tests {
     }
 
     #[test]
+    fn br213_localbridge_admission_preserves_the_complete_limit_pool_record() {
+        let date = NaiveDate::from_ymd_opt(2099, 1, 2).unwrap();
+        let mut record =
+            limit_pool_entry(ProviderId::Eastmoney, LimitPoolKind::Upper, "2099-01-02");
+        record.volume = Some(Quantity::new(12_300.0).unwrap());
+        record.turnover = Some(Ratio::new(7.5, RatioUnit::Percent).unwrap());
+        record.sealed_amount = Some(Money::new(8_900_000.0).unwrap());
+        record.first_seal_at = Some(NonEmptyText::new("09:31:02").unwrap());
+        record.last_seal_at = Some(NonEmptyText::new("14:52:03").unwrap());
+        record.break_count = Some(3);
+        record.board_name = Some(NonEmptyText::new("TEST_CODE board").unwrap());
+        record.seal_state = Some(NonEmptyText::new("TEST_CODE sealed").unwrap());
+        record.reseal_count = Some(2);
+        record.reason = Some(NonEmptyText::new("TEST_CODE reason").unwrap());
+        let expected = record.clone();
+
+        let admitted = admit_current_upper_limit_pool(
+            GatewayBatch::Available {
+                records: vec![record],
+                evidence: evidence(ProviderId::Eastmoney, "TEST_CODE_limit_pool"),
+            },
+            date,
+        )
+        .expect("complete LocalBridge limit-pool record must be preserved");
+
+        assert_eq!(admitted.records(), &[expected]);
+    }
+
+    #[test]
     fn br213_projection_evidence_is_versioned_canonical_and_delimiter_safe() {
         let date = NaiveDate::from_ymd_opt(2099, 1, 2).unwrap();
         let mut limit_pool = evidence(ProviderId::Eastmoney, "TEST_CODE_batch|quote_source=x");
@@ -1343,6 +1560,76 @@ mod tests {
         assert_eq!(row.request_hash, expected_hash);
         let expected_batch_id = format!("BR-213:{expected_hash}");
         assert_eq!(row.batch_id.as_deref(), Some(expected_batch_id.as_str()));
+    }
+
+    #[cfg(not(feature = "magic-gateway"))]
+    #[test]
+    #[serial]
+    fn br213_no_feature_current_pool_uses_enabled_local_bridge() {
+        DatabaseManager::init(None).expect("TEST_CODE audit database init");
+        std::env::set_var("DATA_GATEWAY_GRPC", "1");
+        std::env::remove_var("DATA_GATEWAY_GRPC_DISABLED");
+        std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
+        std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:1");
+        super::super::grpc_source::reset_bridge();
+
+        let result = ReviewDataGateway::new()
+            .current_upper_limit_pool(NaiveDate::from_ymd_opt(2099, 1, 2).unwrap());
+
+        std::env::remove_var("DATA_GATEWAY_GRPC");
+        std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
+        std::env::remove_var("GRPC_MARKET_ADDR");
+        super::super::grpc_source::reset_bridge();
+
+        let error = result.expect_err("unreachable LocalBridge must fail closed");
+        assert_eq!(error.capability(), "GrpcBridge");
+        assert_eq!(error.reason_code(), "no_verified_batch");
+        assert!(error.retryable());
+        assert!(
+            !error.message().contains("library transport disabled"),
+            "configured bridge must be attempted: {error}"
+        );
+
+        // Independently precomputed from the BR-159 domain prefix, capability,
+        // and this exact canonical request (field order is schema/profile/
+        // operation/request(kind,trading_date,limit)).
+        const EXPECTED_REQUEST_HASH: &str =
+            "f9f0a9b2ccddff6edcc14cf0773b58f9a7fbb2db73442acb31e1b24229a4b6d7";
+        let mut connection = DatabaseManager::get().get_conn().unwrap();
+        let row = diesel::sql_query(
+            "SELECT request_hash FROM data_acquisition_audit \
+             WHERE capability = 'BR-213-UpperLimitPool' ORDER BY id DESC LIMIT 1",
+        )
+        .get_result::<AcquisitionRequestAuditRow>(&mut *connection)
+        .expect("LocalBridge failure must retain its exact request identity in BR-159 audit");
+        assert_eq!(row.request_hash, EXPECTED_REQUEST_HASH);
+        assert_ne!(
+            row.request_hash,
+            acquisition_request_hash("BR-213-UpperLimitPool", "2099-01-02:200"),
+            "legacy date:limit text does not prove route, profile, kind, or exact request fields"
+        );
+    }
+
+    #[cfg(not(feature = "magic-gateway"))]
+    #[test]
+    #[serial]
+    fn br213_no_feature_disabled_bridge_fails_without_fallback_data() {
+        std::env::set_var("DATA_GATEWAY_GRPC", "1");
+        std::env::set_var("DATA_GATEWAY_GRPC_DISABLED", "LimitPools");
+        std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
+        super::super::grpc_source::reset_bridge();
+
+        let result = ReviewDataGateway::new()
+            .current_upper_limit_pool(NaiveDate::from_ymd_opt(2099, 1, 2).unwrap());
+
+        std::env::remove_var("DATA_GATEWAY_GRPC");
+        std::env::remove_var("DATA_GATEWAY_GRPC_DISABLED");
+        super::super::grpc_source::reset_bridge();
+
+        let error = result.expect_err("disabled bridge has no no-feature provider fallback");
+        assert_eq!(error.capability(), "BR-213-UpperLimitPool");
+        assert_eq!(error.reason_code(), "provider_transport");
+        assert!(error.retryable());
     }
 
     #[test]
