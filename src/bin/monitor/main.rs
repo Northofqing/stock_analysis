@@ -8365,6 +8365,55 @@ async fn monitor_loop() {
                     }
                 }
             }
+            // Attribution Research Loop (2026-08-20 spec §4.6): 15:05 归因闭环。
+            // 与 PerformanceEngine 同点运行, 当日一次, 失败出声 (30s 重试窗口沿用 PERF 模式)。
+            if now.hour() == 15 && now.minute() == 5 {
+                use std::collections::HashMap;
+                use stock_analysis::performance::attribution::{
+                    compute_daily, compute_window, persist_daily,
+                };
+                use stock_analysis::performance::report::{render_full_markdown, render_summary};
+                static ATTRIBUTION_LAST_RUN: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                    std::sync::Mutex::new(None);
+                let today = now.date_naive();
+                let already_run = ATTRIBUTION_LAST_RUN
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .map(|d| d == today)
+                    .unwrap_or(false);
+                if !already_run {
+                    match (|| -> Result<String, String> {
+                        let quotes = market_data::fetch_position_quotes()?;
+                        // 生产价格映射 (build_price_map 是 cfg(test) 辅助, 生产内联同构构造)
+                        let prices: HashMap<String, f64> = quotes
+                            .iter()
+                            .map(|q| (q.code.clone(), q.price))
+                            .collect();
+                        let daily = compute_daily(today, &prices)?;
+                        persist_daily(&daily)?;
+                        let window = compute_window(today, 30, &prices)?;
+                        let md = render_full_markdown(&daily, &window);
+                        std::fs::create_dir_all("data/attribution")
+                            .map_err(|e| format!("create data/attribution: {e}"))?;
+                        std::fs::write(format!("data/attribution/{}.md", today.format("%Y-%m-%d")), md)
+                            .map_err(|e| format!("write attribution md: {e}"))?;
+                        Ok(render_summary(&daily, &window))
+                    })() {
+                        Ok(text) => {
+                            let outcome = push_governor_v3(&text, PushKind::AttributionDaily, None).await;
+                            log::info!(
+                                "[attribution] 15:05 归因推送完成: {:?}",
+                                outcome
+                            );
+                            *ATTRIBUTION_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(today);
+                        }
+                        Err(e) => {
+                            log::warn!("[attribution] 15:05 归因计算失败 (允许 30s 后重试): {e}");
+                        }
+                    }
+                }
+            }
             // BR-226: 持仓快照 24h 新鲜度 — 收盘后主动预警。
             // 快照 effective_at 超过 6h (即非今日导入) → 次日 9:20 竞价时必过期
             // (age > 24h), 公告受众将静默降级。2026-08-06 实证: 08-05 15:02 快照
