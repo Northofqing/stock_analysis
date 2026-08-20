@@ -29,7 +29,7 @@ spec §6 全量 AC 于 2026-08-20 (Task 9) 执行, 结果见下表。AC-A8/A9/A1
 | AC-A4 | `cargo build --lib` | exit 0 | — |
 | AC-A5 | `cargo build --release --bin monitor` | exit 0 | — |
 | AC-A6 | `V10_DRY_RUN_PUSH=1 ./target/release/monitor --test 2>&1 \| grep -E 'attribution'` | 见下方输出 | — |
-| AC-A7 | `cargo test --lib performance::attribution consistency` | 通过 | — |
+| AC-A7 | `cargo test --lib performance::attribution` (窗口直测: `window_realized_is_cumulative_across_days` / `window_includes_exactly_days` / `daily_emission_unchanged_with_emit_from_none` / `fifo_rejects_*` 负路径) | 通过 (2026-08-20 修复轮) | — |
 | AC-A8 | 生产: `ls data/attribution/$(date +%Y-%m-%d).md` | **待补验** | 文件存在 + 日志行 `[attribution] 15:05 归因推送完成` |
 | AC-A9 | 生产: `grep -lE '^\[AttributionDaily\]' data/push_log/$(date +%Y-%m-%d)/ \| wc -l` | **待补验** | ≥ 1 (PushKind AttributionDaily) |
 | AC-A10 | 生产: `grep -c '"event_type":"push.delivery.audit"' data/event_bus/$(date +%Y-%m-%d).jsonl` 且含 attribution_daily_v1 | **待补验** | > 0 且含 attribution_daily_v1 |
@@ -51,6 +51,37 @@ NewsAggregator。补验时间: 部署后下一个交易日 15:05 (归因日推) 
   spec 决策。
 - **推送失败不重试**: 仅计算失败重试 (30s tick); 推送失败经 outcome 日志 +
   `push.delivery.audit` 出声, 不静默。
+
+## 2026-08-20 修复轮 (Task 10, final review NEEDS-FIXES 落地)
+
+- **CRIT-1 已修 (诚实记录)**: 初版 `compute_window` 已实现为**单日** — fifo 发射谓词
+  为 `== target_date`, 当日推送与 md 的「30天已实现」实际只读当日卖出 (E7 卖出集中
+  8/11-8/12, 8/13 起窗口 headline 静默读作 ~0)。当晚修复为 30 自然日累计
+  (`end−(days−1) ..= end` 含首尾): `fifo_match_from(rows, end, Some(start))` 发射
+  `timestamp.date() >= start`, 顺带修正旧 31 天 off-by-one; 窗口前买入照常被窗口
+  卖出消耗。日级 `fifo_match` 2-arg API 与 compute_daily 语义逐字节不变 (由
+  `daily_emission_unchanged_with_emit_from_none` 锁定)。
+- **spec §4.4 item 5 已实现 (deferred gap 关闭)**: final review SPEC-GAP-4.4.5 指出
+  Top 亏损/盈利交易明细缺失 (且本 ops doc 当时未记录该缺口 — 现已如实补记并关闭):
+  全文 md 新增「## Top 亏损/盈利交易明细」(当日, 盈利/亏损各 ≤5 笔, 每行含
+  code/plan_id/盈亏/入场族; 空明细打印「无」不静默)。「五节」doc 注释恢复属实。
+- **spec §4.4 item 2 已实现**: 数据质量审计与摘要质量行现含可疑影响金额
+  (`⚠ 数据存疑 27笔 (+582,000)` 形状; FamilyAggregate.suspicious_pnl, 已实现口径,
+  正数带 "+")。
+- **fifo 负路径断言**: 补 identity / timestamp / late-than-settlement / unordered /
+  direction / quantity / sell-no-buy 7 分支直测 (brooks-test 🟡 T5 警告关闭;
+  non-finite PnL 分支在 price/quantity 前置校验下不可达, 不测试)。
+
+### 修复轮验证 (2026-08-20 实跑)
+
+```bash
+$ cargo test --lib performance:: 2>&1 | tail -3
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 2703 filtered out; finished in 0.00s
+# 22 (Task 9) + 10 新增 (窗口累计/窗口边界/日级不变 3 + fifo 负路径 3 + top_trades 1 + 报告节 3)
+
+$ cargo build --lib            # Finished dev profile, exit 0, 0 warnings
+$ cargo build --release --bin monitor   # Finished release profile, exit 0, 0 warnings
+```
 
 ## 2026-08-20 Task 9 验证输出
 
