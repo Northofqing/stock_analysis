@@ -9186,8 +9186,23 @@ async fn monitor_loop() {
                                 t1_locked: false,
                             };
 
-                            for e in detector.scan_stock(&snap) {
+                            for mut e in detector.scan_stock(&snap) {
                                 signal_count += 1;
+
+                                // G5a (2026-08-20 spec §5): 同步归因, 2s 预算,
+                                // 失败出声不折叠; ai_decision 随审计落库
+                                // ({failure:?} 用 Debug 格式 — AttributionFailure 是否实现
+                                // Display 未承诺, Debug 恒可用)
+                                if let Err(failure) =
+                                    stock_analysis::monitor::attribution::apply_attribution(&mut e)
+                                {
+                                    log::warn!("[G5a] attribution failed: {failure:?}");
+                                }
+                                if let Err(error) =
+                                    stock_analysis::monitor::alert_log::append_jsonl(&e)
+                                {
+                                    log::warn!("[G5a] alert audit append failed: {error:?}");
+                                }
 
                                 if let Some(event) = state_machine.process(e) {
                                     alert_count += 1;
@@ -9692,8 +9707,23 @@ async fn monitor_loop() {
 
                             let mut emergency_note = String::new();
 
-                            for e in detector.scan_stock(&snap) {
+                            for mut e in detector.scan_stock(&snap) {
                                 signal_count += 1;
+
+                                // G5a (2026-08-20 spec §5): 同步归因, 2s 预算,
+                                // 失败出声不折叠; ai_decision 随审计落库
+                                // ({failure:?} 用 Debug 格式 — AttributionFailure 是否实现
+                                // Display 未承诺, Debug 恒可用)
+                                if let Err(failure) =
+                                    stock_analysis::monitor::attribution::apply_attribution(&mut e)
+                                {
+                                    log::warn!("[G5a] attribution failed: {failure:?}");
+                                }
+                                if let Err(error) =
+                                    stock_analysis::monitor::alert_log::append_jsonl(&e)
+                                {
+                                    log::warn!("[G5a] alert audit append failed: {error:?}");
+                                }
 
                                 let (dir, strength) = match e.category {
                                     AlertCategory::LimitUp | AlertCategory::MainInflow => {
