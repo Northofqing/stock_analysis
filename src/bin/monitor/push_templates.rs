@@ -15342,7 +15342,7 @@ pub fn build_test_template_catalog(
     };
     use stock_analysis::monitor::detector::{AlertCategory, AlertDetail, AlertEvent, AlertLevel};
 
-    const EXPECTED_CATALOG_TOTAL: usize = 55;
+    const EXPECTED_CATALOG_TOTAL: usize = 56;
     let banner = BannerCtx {
         account_mode: AccountMode::Normal,
         total_pos: Some(0),
@@ -16229,6 +16229,11 @@ pub fn build_test_template_catalog(
                 },
             ],
         ),
+    );
+    // 交付物 A (2026-08-20): 虚拟盘归因摘要透传模板 (A-12-attribution-daily)
+    push(
+        "A-12-attribution-daily",
+        render_attribution_daily("TEST_CODE 归因摘要…"),
     );
 
     if catalog.len() != EXPECTED_CATALOG_TOTAL {
