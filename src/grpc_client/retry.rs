@@ -70,7 +70,7 @@ mod tests {
 
     fn unavail() -> GrpcError {
         GrpcError::Unavailable {
-            details: ErrorDetail::default(),
+            details: Box::default(),
         }
     }
 
@@ -79,49 +79,49 @@ mod tests {
         assert_eq!(retry_decision(&unavail()), RetryDecision::RetryBackoff);
         assert_eq!(
             retry_decision(&GrpcError::DeadlineExceeded {
-                details: ErrorDetail::default()
+                details: Box::default()
             }),
             RetryDecision::RetryBounded
         );
         assert_eq!(
             retry_decision(&GrpcError::InvalidArgument {
-                details: ErrorDetail::default()
+                details: Box::default()
             }),
             RetryDecision::NoRetry
         );
         assert_eq!(
             retry_decision(&GrpcError::Unauthenticated {
-                details: ErrorDetail::default()
+                details: Box::default()
             }),
             RetryDecision::NoRetry
         );
         assert_eq!(
             retry_decision(&GrpcError::PermissionDenied {
-                details: ErrorDetail::default()
+                details: Box::default()
             }),
             RetryDecision::NoRetry
         );
         assert_eq!(
             retry_decision(&GrpcError::Unimplemented {
-                details: ErrorDetail::default()
+                details: Box::default()
             }),
             RetryDecision::NoRetry
         );
         assert_eq!(
             retry_decision(&GrpcError::ResourceExhausted {
-                details: ErrorDetail::default()
+                details: Box::default()
             }),
             RetryDecision::NoRetry
         );
         assert_eq!(
             retry_decision(&GrpcError::FailedPrecondition {
-                details: ErrorDetail::default()
+                details: Box::default()
             }),
             RetryDecision::NoRetry
         );
         assert_eq!(
             retry_decision(&GrpcError::Internal {
-                details: ErrorDetail::default()
+                details: Box::default()
             }),
             RetryDecision::NoRetry
         );
@@ -135,7 +135,7 @@ mod tests {
         };
         assert_eq!(
             retry_decision(&GrpcError::Unavailable {
-                details: non_retryable
+                details: Box::new(non_retryable)
             }),
             RetryDecision::NoRetry
         );
@@ -145,7 +145,9 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            retry_decision(&GrpcError::Internal { details: retryable }),
+            retry_decision(&GrpcError::Internal {
+                details: Box::new(retryable),
+            }),
             RetryDecision::RetryBackoff,
             "delegate failures arrive as Internal with authoritative retryability"
         );
@@ -155,7 +157,9 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            retry_decision(&GrpcError::InvalidArgument { details: invalid }),
+            retry_decision(&GrpcError::InvalidArgument {
+                details: Box::new(invalid),
+            }),
             RetryDecision::NoRetry,
             "an invalid request is never made retryable by remote metadata"
         );

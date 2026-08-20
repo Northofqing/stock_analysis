@@ -42,14 +42,14 @@ impl GrpcMarketClient {
         let channel = Channel::from_shared(addr.to_string())
             // D2: 本地构造错误无服务端 status → details 全默认 (桥只看码 + 远端 detail)。
             .map_err(|_| GrpcError::InvalidArgument {
-                details: ErrorDetail::default(),
+                details: Box::default(),
             })?
             // 合同 §12: 为 unary 和 stream 分别设置 deadline/keepalive。
             .timeout(Duration::from_secs(15))
             .connect()
             .await
             .map_err(|_| GrpcError::Unavailable {
-                details: ErrorDetail::default(),
+                details: Box::default(),
             })?;
         Ok(Self::from_channel(
             channel,
@@ -70,7 +70,7 @@ impl GrpcMarketClient {
             private_key_pem,
             bearer_token,
         } = crate::grpc_client::bundle::load(path).map_err(|_| GrpcError::InvalidArgument {
-            details: ErrorDetail::default(),
+            details: Box::default(),
         })?;
 
         let acquisition_authority = format!("grpc-mtls:{tls_server_name}");
@@ -83,17 +83,17 @@ impl GrpcMarketClient {
             ));
         let channel = Channel::from_shared(endpoint_uri)
             .map_err(|_| GrpcError::InvalidArgument {
-                details: ErrorDetail::default(),
+                details: Box::default(),
             })?
             .timeout(Duration::from_secs(15))
             .tls_config(tls)
             .map_err(|_| GrpcError::InvalidArgument {
-                details: ErrorDetail::default(),
+                details: Box::default(),
             })?
             .connect()
             .await
             .map_err(|_| GrpcError::Unavailable {
-                details: ErrorDetail::default(),
+                details: Box::default(),
             })?;
 
         Ok(Self::from_channel(
@@ -188,7 +188,7 @@ impl GrpcMarketClient {
     ) -> Result<QueryResult, GrpcError> {
         if !crate::grpc_contract::ops::is_implemented(op) {
             return Err(GrpcError::Unimplemented {
-                details: ErrorDetail::default(),
+                details: Box::default(),
             });
         }
         let request = self.build_profile_query_request(op, payload)?;
@@ -276,7 +276,7 @@ impl GrpcMarketClient {
             Operation::ChainBatch => self.data.chain_batch(req).await,
             _ => {
                 return Err(GrpcError::Unimplemented {
-                    details: ErrorDetail::default(),
+                    details: Box::default(),
                 })
             } // 防御: is_implemented 已拦截
         };
@@ -357,16 +357,16 @@ fn map_external_contract_error(
 
     match error {
         ExternalContractError::UndeliveredOperation => GrpcError::Unimplemented {
-            details: ErrorDetail::default(),
+            details: Box::default(),
         },
         ExternalContractError::InvalidParameters => GrpcError::InvalidArgument {
-            details: ErrorDetail::default(),
+            details: Box::default(),
         },
         ExternalContractError::Serialize => GrpcError::Unknown {
-            details: ErrorDetail {
+            details: Box::new(ErrorDetail {
                 code: "envelope".to_string(),
                 ..ErrorDetail::default()
-            },
+            }),
         },
     }
 }
@@ -382,21 +382,21 @@ fn apply_acquisition_authority(
 
     if !response.source.is_empty() {
         return Err(GrpcError::FailedPrecondition {
-            details: ErrorDetail {
+            details: Box::new(ErrorDetail {
                 code: "external_source_field_conflict".to_string(),
                 reason_code: Some("external_source_field_conflict".to_string()),
                 retryable: Some(false),
                 ..ErrorDetail::default()
-            },
+            }),
         });
     }
     let authority = acquisition_authority.ok_or_else(|| GrpcError::FailedPrecondition {
-        details: ErrorDetail {
+        details: Box::new(ErrorDetail {
             code: "external_acquisition_authority_missing".to_string(),
             reason_code: Some("external_acquisition_authority_missing".to_string()),
             retryable: Some(false),
             ..ErrorDetail::default()
-        },
+        }),
     })?;
     response.source = authority.to_owned();
     Ok(())

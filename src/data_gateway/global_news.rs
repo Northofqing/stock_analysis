@@ -3,15 +3,11 @@
 #[cfg(feature = "magic-gateway")]
 use super::review::audit_blocking_join_failure;
 use super::review::{acquisition_request_hash, audit_gateway_result};
-#[cfg(feature = "magic-gateway")]
-use super::BatchEvidence;
-use super::{GatewayBatch, GatewayError};
+use super::{BatchEvidence, GatewayBatch, GatewayError};
 #[cfg(feature = "magic-gateway")]
 use crate::magic_compat::{DataBatch, PositiveU32};
 use crate::magic_compat::{ProviderId, SourceEvidence};
-use chrono::{DateTime, Utc};
-#[cfg(feature = "magic-gateway")]
-use chrono::{FixedOffset, NaiveDateTime, TimeZone};
+use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
 #[cfg(feature = "magic-gateway")]
 use magic_cls_rs::{ClsClient, ClsError};
 #[cfg(feature = "magic-gateway")]
@@ -111,6 +107,64 @@ pub struct GlobalNewsRecord {
     pub topics: Vec<String>,
     pub language: String,
     pub evidence: SourceEvidence,
+}
+
+pub(crate) fn parse_global_news_provider_time(
+    provider: GlobalNewsProvider,
+    value: &str,
+) -> Result<DateTime<Utc>, GatewayError> {
+    parse_provider_time(provider, value)
+}
+
+pub(crate) fn parse_global_news_observed_at(
+    provider: GlobalNewsProvider,
+    value: &str,
+) -> Result<DateTime<Utc>, GatewayError> {
+    parse_observed_at(provider, value)
+}
+
+pub(crate) fn validate_global_news_batch_evidence(
+    provider: GlobalNewsProvider,
+    evidence: &BatchEvidence,
+) -> Result<(DateTime<Utc>, DateTime<Utc>), GatewayError> {
+    let capability = provider.capability();
+    let provider_id = provider.provider_id();
+    if evidence.provider != provider_id || evidence.source != provider.source() {
+        return Err(GatewayError::invalid_evidence(
+            capability,
+            Some(provider_id),
+            "global-news batch provider/source contract mismatch",
+        ));
+    }
+    if evidence.batch_id.trim().is_empty() || evidence.observed_at.trim().is_empty() {
+        return Err(GatewayError::invalid_evidence(
+            capability,
+            Some(provider_id),
+            "global-news batch identity is incomplete",
+        ));
+    }
+    let source_at = evidence
+        .source_at
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            GatewayError::invalid_evidence(
+                capability,
+                Some(provider_id),
+                "global-news batch source time is missing",
+            )
+        })?;
+    let parsed_source_at = parse_global_news_provider_time(provider, source_at)?;
+    let parsed_observed_at =
+        parse_global_news_observed_at(provider, evidence.observed_at.as_str())?;
+    if parsed_source_at > parsed_observed_at {
+        return Err(GatewayError::invalid_evidence(
+            capability,
+            Some(provider_id),
+            "global-news batch source time is after observation time",
+        ));
+    }
+    Ok((parsed_source_at, parsed_observed_at))
 }
 
 /// Production seam for all released typed global financial-news clients.
@@ -255,22 +309,8 @@ fn admit_batch(
         ));
     }
     let evidence = BatchEvidence::from_provenance(provider_id, batch.provenance())?;
-    let observed_at = parse_observed_at(provider, &evidence.observed_at)?;
-    let batch_source_at = evidence.source_at.as_deref().ok_or_else(|| {
-        GatewayError::invalid_evidence(
-            capability,
-            Some(provider_id),
-            "global-news batch source time is missing",
-        )
-    })?;
-    let parsed_batch_source_at = parse_provider_time(provider, batch_source_at)?;
-    if parsed_batch_source_at > observed_at {
-        return Err(GatewayError::invalid_evidence(
-            capability,
-            Some(provider_id),
-            "global-news batch source time is after observation time",
-        ));
-    }
+    let (parsed_batch_source_at, observed_at) =
+        validate_global_news_batch_evidence(provider, &evidence)?;
     if batch.records().is_empty() {
         return Ok(GatewayBatch::VerifiedEmpty(evidence));
     }
@@ -382,17 +422,16 @@ fn validate_record_evidence(
     Ok(())
 }
 
-#[cfg(feature = "magic-gateway")]
 fn parse_provider_time(
     provider: GlobalNewsProvider,
     value: &str,
 ) -> Result<DateTime<Utc>, GatewayError> {
-    let parsed = if provider == GlobalNewsProvider::Eastmoney {
-        let naive = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M").map_err(|error| {
+    let parse_shanghai = |format: &str| {
+        let naive = NaiveDateTime::parse_from_str(value, format).map_err(|error| {
             GatewayError::invalid_evidence(
                 provider.capability(),
                 Some(provider.provider_id()),
-                format!("invalid Eastmoney provider time {value:?}: {error}"),
+                format!("invalid provider time {value:?}: {error}"),
             )
         })?;
         let china = FixedOffset::east_opt(8 * 60 * 60).ok_or_else(|| {
@@ -402,9 +441,16 @@ fn parse_provider_time(
                 "UTC+08:00 offset is unavailable",
             )
         })?;
-        china.from_local_datetime(&naive).single()
-    } else {
-        return DateTime::parse_from_rfc3339(value)
+        china.from_local_datetime(&naive).single().ok_or_else(|| {
+            GatewayError::invalid_evidence(
+                provider.capability(),
+                Some(provider.provider_id()),
+                format!("ambiguous provider time {value:?}"),
+            )
+        })
+    };
+    let parse_rfc3339 = || {
+        DateTime::parse_from_rfc3339(value)
             .map(|timestamp| timestamp.with_timezone(&Utc))
             .map_err(|error| {
                 GatewayError::invalid_evidence(
@@ -412,20 +458,44 @@ fn parse_provider_time(
                     Some(provider.provider_id()),
                     format!("invalid provider time {value:?}: {error}"),
                 )
-            });
+            })
     };
-    parsed
-        .map(|timestamp| timestamp.with_timezone(&Utc))
-        .ok_or_else(|| {
-            GatewayError::invalid_evidence(
-                provider.capability(),
-                Some(provider.provider_id()),
-                format!("ambiguous provider time {value:?}"),
-            )
-        })
+    match provider {
+        GlobalNewsProvider::Eastmoney => {
+            parse_shanghai("%Y-%m-%d %H:%M").map(|timestamp| timestamp.with_timezone(&Utc))
+        }
+        GlobalNewsProvider::Jin10 => parse_shanghai("%Y-%m-%d %H:%M:%S")
+            .map(|timestamp| timestamp.with_timezone(&Utc))
+            .or_else(|_| parse_rfc3339()),
+        GlobalNewsProvider::Cailianpress => super::evidence_time::parse_evidence_instant(
+            provider.capability(),
+            provider.provider_id(),
+            "source_at",
+            value,
+        ),
+        GlobalNewsProvider::ThePaper if value.starts_with("unix-ms:") => {
+            let milliseconds = value
+                .strip_prefix("unix-ms:")
+                .and_then(|raw| raw.parse::<i64>().ok())
+                .ok_or_else(|| {
+                    GatewayError::invalid_evidence(
+                        provider.capability(),
+                        Some(provider.provider_id()),
+                        format!("invalid ThePaper provider time {value:?}"),
+                    )
+                })?;
+            DateTime::from_timestamp_millis(milliseconds).ok_or_else(|| {
+                GatewayError::invalid_evidence(
+                    provider.capability(),
+                    Some(provider.provider_id()),
+                    format!("out-of-range ThePaper provider time {value:?}"),
+                )
+            })
+        }
+        GlobalNewsProvider::ThePaper => parse_rfc3339(),
+    }
 }
 
-#[cfg(feature = "magic-gateway")]
 fn parse_observed_at(
     provider: GlobalNewsProvider,
     value: &str,
@@ -676,6 +746,18 @@ mod tests {
                 .to_rfc3339(),
             "2026-07-25T03:00:00+00:00"
         );
+        for (provider, source_at) in [
+            (GlobalNewsProvider::Cailianpress, "1787127337"),
+            (GlobalNewsProvider::Jin10, "2026-08-19 16:15:37"),
+            (GlobalNewsProvider::ThePaper, "unix-ms:1787127337000"),
+        ] {
+            assert_eq!(
+                parse_provider_time(provider, source_at)
+                    .expect("delivered provider source time")
+                    .to_rfc3339(),
+                "2026-08-19T08:15:37+00:00"
+            );
+        }
         assert!(parse_provider_time(GlobalNewsProvider::Eastmoney, "bad").is_err());
         assert!(parse_provider_time(GlobalNewsProvider::Jin10, "bad").is_err());
         assert!(parse_observed_at(GlobalNewsProvider::Jin10, "bad").is_err());

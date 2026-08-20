@@ -34,7 +34,7 @@ use crate::magic_compat::{
     StatementKind,
 };
 use crate::magic_compat::{LimitPoolEntry, LimitPoolKind, ProviderId};
-use chrono::NaiveDate;
+use chrono::{DateTime, FixedOffset, NaiveDate};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -68,6 +68,22 @@ fn limit_pools_request(trading_date: NaiveDate) -> Value {
         "kind": "Upper",
         "trading_date": trading_date.format("%Y-%m-%d").to_string(),
         "limit": 200,
+    })
+}
+
+fn instrument_news_request_params(
+    instrument: &InstrumentId,
+    start: NaiveDate,
+    end: NaiveDate,
+    limit: u32,
+    captured_at: DateTime<FixedOffset>,
+) -> Value {
+    serde_json::json!({
+        "instrument": instrument,
+        "start": start.format("%Y-%m-%d").to_string(),
+        "end": end.format("%Y-%m-%d").to_string(),
+        "limit": limit,
+        "captured_through": captured_at.to_rfc3339(),
     })
 }
 
@@ -356,7 +372,11 @@ fn reason_code_static(s: &str) -> &'static str {
         "database_failure",
         "external_source_field_conflict",
         "external_acquisition_authority_missing",
+        "provider_authentication_rejected",
+        "provider_rate_limited",
         "provider_unavailable",
+        "external_query_rejected",
+        "provider_response_invalid",
     ];
     KNOWN
         .iter()
@@ -477,6 +497,100 @@ pub struct OpeningReadinessReport {
     pub degraded_routes: Vec<OpeningRouteFailure>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpeningDiagnosticFailure {
+    pub route: &'static str,
+    pub capability: &'static str,
+    pub provider: Option<ProviderId>,
+    pub audit_outcome: &'static str,
+    pub reason_code: &'static str,
+    pub retryable: bool,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct OpeningDiagnosticReport {
+    attempts: Vec<&'static str>,
+    ready_routes: Vec<OpeningRouteReadiness>,
+    failures: Vec<OpeningDiagnosticFailure>,
+}
+
+impl OpeningDiagnosticReport {
+    fn record_result(
+        &mut self,
+        route: &'static str,
+        result: Result<OpeningRouteReadiness, GatewayError>,
+    ) {
+        match result {
+            Ok(readiness) => self.record_ready(readiness),
+            Err(error) => self.record_failure(route, error),
+        }
+    }
+
+    fn record_ready(&mut self, route: OpeningRouteReadiness) {
+        self.attempts.push(route.route);
+        self.ready_routes.push(route);
+    }
+
+    fn record_failure(&mut self, route: &'static str, error: GatewayError) {
+        self.attempts.push(route);
+        self.failures.push(OpeningDiagnosticFailure {
+            route,
+            capability: error.capability(),
+            provider: error.provider(),
+            audit_outcome: error.audit_outcome(),
+            reason_code: error.reason_code(),
+            retryable: error.retryable(),
+        });
+    }
+
+    pub fn attempted_route_names(&self) -> String {
+        self.attempts.join(",")
+    }
+
+    pub fn failed_route_names(&self) -> String {
+        if self.failures.is_empty() {
+            return "none".to_owned();
+        }
+        self.failures
+            .iter()
+            .map(|failure| failure.route)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    pub fn ready_routes(&self) -> &[OpeningRouteReadiness] {
+        &self.ready_routes
+    }
+
+    pub fn failures(&self) -> &[OpeningDiagnosticFailure] {
+        &self.failures
+    }
+
+    pub fn production_ready(&self) -> bool {
+        let mut degraded_routes = Vec::with_capacity(self.failures.len());
+        for failure in &self.failures {
+            let Some(expected_provider) = expected_global_news_provider(failure.route) else {
+                return false;
+            };
+            degraded_routes.push(OpeningRouteFailure {
+                route: failure.route,
+                provider: expected_provider,
+                reason_code: failure.reason_code,
+                retryable: failure.retryable,
+                message: format!(
+                    "diagnostic route failed with reason_code={}",
+                    failure.reason_code
+                ),
+            });
+        }
+        require_external_static_readiness(&OpeningReadinessReport {
+            routes: self.ready_routes.clone(),
+            degraded_routes,
+        })
+        .is_ok()
+    }
+}
+
 impl OpeningReadinessReport {
     pub fn route_names(&self) -> String {
         self.routes
@@ -578,7 +692,9 @@ fn require_external_static_readiness(report: &OpeningReadinessReport) -> Result<
                 route.route
             )));
         }
-        let expected_profile = if matches!(route.route, "SecurityMetadata" | "InstrumentNews") {
+        let expected_profile = if matches!(route.route, "SecurityMetadata" | "InstrumentNews")
+            || route.route.starts_with("GlobalNews-")
+        {
             "ExternalV1"
         } else {
             "LocalBridgeV1"
@@ -627,11 +743,15 @@ fn require_external_static_readiness(report: &OpeningReadinessReport) -> Result<
 }
 
 fn expected_global_news_provider(route: &str) -> Option<ProviderId> {
+    expected_global_news_route_provider(route).map(GlobalNewsProvider::provider_id)
+}
+
+fn expected_global_news_route_provider(route: &str) -> Option<GlobalNewsProvider> {
     match route {
-        "GlobalNews-Eastmoney" => Some(ProviderId::Eastmoney),
-        "GlobalNews-CLS" => Some(ProviderId::Cailianpress),
-        "GlobalNews-Jin10" => Some(ProviderId::Jin10),
-        "GlobalNews-ThePaper" => Some(ProviderId::ThePaper),
+        "GlobalNews-Eastmoney" => Some(GlobalNewsProvider::Eastmoney),
+        "GlobalNews-CLS" => Some(GlobalNewsProvider::Cailianpress),
+        "GlobalNews-Jin10" => Some(GlobalNewsProvider::Jin10),
+        "GlobalNews-ThePaper" => Some(GlobalNewsProvider::ThePaper),
         _ => None,
     }
 }
@@ -700,6 +820,181 @@ pub fn audit_opening_readiness_report(
         log::info!(
             "[OpeningReadiness][BR-159][BR-238] phase={phase} route={} audit_id={} record_hash={}",
             route.route,
+            receipt.audit_id,
+            receipt.record_hash
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct OpeningDiagnosticAuditRow {
+    route: &'static str,
+    provider_id: ProviderId,
+    capability: String,
+    provider: String,
+    source: String,
+    request_hash: String,
+    source_at: Option<String>,
+    observed_at: String,
+    batch_id: Option<String>,
+    outcome: &'static str,
+    accepted_count: i64,
+    rejected_count: i64,
+    reason_code: &'static str,
+    retryable: bool,
+}
+
+fn invalid_opening_diagnostic_report(message: impl Into<String>) -> GatewayError {
+    GatewayError::invalid_evidence("OpeningReadiness", Some(ProviderId::Custom), message.into())
+}
+
+fn opening_diagnostic_audit_rows(
+    phase: &'static str,
+    report: &OpeningDiagnosticReport,
+) -> Result<Vec<OpeningDiagnosticAuditRow>, GatewayError> {
+    let failure_observed_at =
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let mut seen_routes = std::collections::HashSet::with_capacity(report.attempts.len());
+    let mut rows = Vec::with_capacity(report.attempts.len());
+
+    for route_name in &report.attempts {
+        if !seen_routes.insert(*route_name) {
+            return Err(invalid_opening_diagnostic_report(format!(
+                "opening diagnostic report repeats route {route_name}"
+            )));
+        }
+        let ready = report
+            .ready_routes
+            .iter()
+            .filter(|route| route.route == *route_name)
+            .collect::<Vec<_>>();
+        let failed = report
+            .failures
+            .iter()
+            .filter(|failure| failure.route == *route_name)
+            .collect::<Vec<_>>();
+        match (ready.as_slice(), failed.as_slice()) {
+            ([route], []) => {
+                let accepted_count = i64::try_from(route.records).map_err(|_| {
+                    GatewayError::audit_failure(
+                        "OpeningReadiness",
+                        route.provider,
+                        "accepted_count_overflow",
+                        "opening readiness record count exceeds SQLite INTEGER",
+                    )
+                })?;
+                let capability = format!("{phase}-{}", route.route);
+                let request_hash = crate::data_gateway::review::acquisition_request_hash(
+                    &capability,
+                    format!("{}:{}", route.profile, route.route),
+                );
+                let (outcome, reason_code) = if route.records == 0 {
+                    ("verified_empty", "verified_empty")
+                } else {
+                    ("available", "accepted")
+                };
+                rows.push(OpeningDiagnosticAuditRow {
+                    route: route.route,
+                    provider_id: route.provider,
+                    capability,
+                    provider: format!("{:?}", route.provider),
+                    source: route.source.clone(),
+                    request_hash,
+                    source_at: route.source_at.clone(),
+                    observed_at: route.observed_at.clone(),
+                    batch_id: Some(route.batch_id.clone()),
+                    outcome,
+                    accepted_count,
+                    rejected_count: 0,
+                    reason_code,
+                    retryable: false,
+                });
+            }
+            ([], [failure]) => {
+                let provider_id = failure.provider.unwrap_or(ProviderId::Custom);
+                let capability = format!("{phase}-{}", failure.route);
+                let request_hash = crate::data_gateway::review::acquisition_request_hash(
+                    &capability,
+                    format!(
+                        "{}:{}:{}",
+                        failure.capability, failure.audit_outcome, failure.reason_code
+                    ),
+                );
+                rows.push(OpeningDiagnosticAuditRow {
+                    route: failure.route,
+                    provider_id,
+                    capability,
+                    provider: format!("{provider_id:?}"),
+                    source: "opening-readiness".to_owned(),
+                    request_hash,
+                    source_at: None,
+                    observed_at: failure_observed_at.clone(),
+                    batch_id: None,
+                    outcome: failure.audit_outcome,
+                    accepted_count: 0,
+                    rejected_count: 1,
+                    reason_code: failure.reason_code,
+                    retryable: failure.retryable,
+                });
+            }
+            _ => {
+                return Err(invalid_opening_diagnostic_report(format!(
+                    "opening diagnostic route {route_name} must have exactly one terminal outcome"
+                )));
+            }
+        }
+    }
+
+    if rows.len() != report.ready_routes.len() + report.failures.len() {
+        return Err(invalid_opening_diagnostic_report(
+            "opening diagnostic report contains a terminal outcome without an attempt",
+        ));
+    }
+    Ok(rows)
+}
+
+/// Persist one BR-159 hash-chained row for every static diagnostic attempt.
+/// Unlike the strict release probe, this records partial readiness so the
+/// resident monitor can remain alive without disguising a failed route.
+pub fn audit_opening_diagnostic_report(
+    phase: &'static str,
+    report: &OpeningDiagnosticReport,
+) -> Result<(), GatewayError> {
+    use crate::database::data_acquisition_audit::DataAcquisitionAuditRecord;
+    use crate::database::DatabaseManager;
+
+    let rows = opening_diagnostic_audit_rows(phase, report)?;
+    let database = DatabaseManager::try_get().ok_or_else(|| {
+        GatewayError::audit_failure(
+            "OpeningReadiness",
+            ProviderId::Custom,
+            "database_unavailable",
+            "opening diagnostic audit database is not initialized",
+        )
+    })?;
+    for row in rows {
+        let record = DataAcquisitionAuditRecord {
+            capability: &row.capability,
+            provider: &row.provider,
+            source: &row.source,
+            request_hash: &row.request_hash,
+            source_at: row.source_at.as_deref(),
+            observed_at: &row.observed_at,
+            batch_id: row.batch_id.as_deref(),
+            outcome: row.outcome,
+            request_count: 1,
+            accepted_count: row.accepted_count,
+            rejected_count: row.rejected_count,
+            reason_code: row.reason_code,
+            retryable: row.retryable,
+        };
+        let receipt = database.record_data_acquisition(&record).map_err(|error| {
+            GatewayError::audit_failure("OpeningReadiness", row.provider_id, row.reason_code, error)
+        })?;
+        log::info!(
+            "[OpeningReadiness][BR-159][BR-238][BR-246] phase={phase} route={} audit_id={} record_hash={}",
+            row.route,
             receipt.audit_id,
             receipt.record_hash
         );
@@ -833,19 +1128,38 @@ fn opening_route<T>(
             format!("{route} canary evidence is incomplete"),
         ));
     }
-    let observed_at = crate::data_gateway::parse_evidence_instant(
-        "OpeningReadiness",
-        evidence.provider,
-        "observed_at",
-        &evidence.observed_at,
-    )?;
-    if let Some(source_at) = evidence.source_at.as_deref() {
-        let source_at = crate::data_gateway::parse_evidence_instant(
+    let global_news_provider = expected_global_news_route_provider(route);
+    if global_news_provider.is_some_and(|provider| provider.provider_id() != evidence.provider) {
+        return Err(GatewayError::invalid_evidence(
+            "OpeningReadiness",
+            Some(evidence.provider),
+            format!("{route} canary provider differs from its exact route"),
+        ));
+    }
+    let observed_at = if let Some(provider) = global_news_provider {
+        crate::data_gateway::global_news::parse_global_news_observed_at(
+            provider,
+            &evidence.observed_at,
+        )?
+    } else {
+        crate::data_gateway::parse_evidence_instant(
             "OpeningReadiness",
             evidence.provider,
-            "source_at",
-            source_at,
-        )?;
+            "observed_at",
+            &evidence.observed_at,
+        )?
+    };
+    if let Some(source_at) = evidence.source_at.as_deref() {
+        let source_at = if let Some(provider) = global_news_provider {
+            crate::data_gateway::global_news::parse_global_news_provider_time(provider, source_at)?
+        } else {
+            crate::data_gateway::parse_evidence_instant(
+                "OpeningReadiness",
+                evidence.provider,
+                "source_at",
+                source_at,
+            )?
+        };
         if source_at > observed_at {
             return Err(GatewayError::invalid_evidence(
                 "OpeningReadiness",
@@ -1055,6 +1369,84 @@ fn opening_t0_route(batch: &MagicTdxT0Batch) -> Result<OpeningRouteReadiness, Ga
 /// nine static/auth/contract routes are exercised before producer loops start.
 /// Live quote/book/T0 evidence is deliberately excluded and observed later by
 /// the background live gate so it cannot suppress the 09:00--09:15 P-01 window.
+pub async fn external_static_opening_diagnostics() -> Result<OpeningDiagnosticReport, GatewayError>
+{
+    const CANARY_CODE: &str = "600396";
+    let source = required_opening_bridge("SecurityMetadata")?;
+    source
+        .ensure_external_connected(Operation::SecurityMetadata)
+        .await?;
+    let capabilities = current_external_opening_capabilities(&source).await?;
+    require_external_static_capabilities(&capabilities)?;
+
+    let code = CANARY_CODE.to_owned();
+    let mut report = OpeningDiagnosticReport::default();
+
+    let identities = source
+        .security_identities_async(std::slice::from_ref(&code))
+        .await
+        .and_then(|batch| opening_route("SecurityMetadata", "ExternalV1", &batch, true));
+    report.record_result("SecurityMetadata", identities);
+
+    let instrument_news = match required_opening_bridge("InstrumentNews") {
+        Ok(bridge) => bridge
+            .instrument_news_canary_async(CANARY_CODE)
+            .await
+            .and_then(|batch| opening_route("InstrumentNews", "ExternalV1", &batch, false)),
+        Err(error) => Err(error),
+    };
+    report.record_result("InstrumentNews", instrument_news);
+
+    for (route, provider) in [
+        ("GlobalNews-Eastmoney", GlobalNewsProvider::Eastmoney),
+        ("GlobalNews-CLS", GlobalNewsProvider::Cailianpress),
+        ("GlobalNews-Jin10", GlobalNewsProvider::Jin10),
+        ("GlobalNews-ThePaper", GlobalNewsProvider::ThePaper),
+    ] {
+        let result = match required_opening_bridge("GlobalNews") {
+            Ok(bridge) => bridge
+                .global_news_async(provider, 1)
+                .await
+                .and_then(|batch| opening_route(route, "ExternalV1", &batch, false)),
+            Err(error) => Err(error),
+        };
+        report.record_result(route, result);
+    }
+
+    let announcements = match required_opening_bridge("Announcements") {
+        Ok(bridge) => bridge
+            .announcements_async()
+            .await
+            .and_then(|batch| opening_route("Announcements", "LocalBridgeV1", &batch, false)),
+        Err(error) => Err(error),
+    };
+    report.record_result("Announcements", announcements);
+
+    let memberships = match required_opening_bridge("BoardConstituents") {
+        Ok(bridge) => match bridge.board_constituents_async(CANARY_CODE).await {
+            Ok(batch) => exact_membership_canary(CANARY_CODE, &batch)
+                .and_then(|()| opening_route("BoardConstituents", "LocalBridgeV1", &batch, true)),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    };
+    report.record_result("BoardConstituents", memberships);
+
+    let review_date = crate::calendar::prev_trading_day(chrono::Local::now().date_naive());
+    let limit_pools = match required_opening_bridge("LimitPools") {
+        Ok(bridge) => bridge
+            .limit_pools_async(review_date)
+            .await
+            .and_then(|batch| opening_limit_pools_route(&batch, review_date)),
+        Err(error) => Err(error),
+    };
+    report.record_result("LimitPools", limit_pools);
+
+    Ok(report)
+}
+
+/// BR-238 production static opening gate. Unlike the read-only diagnostics
+/// collector above, this remains fail-closed at each mandatory route.
 pub async fn external_static_opening_readiness() -> Result<OpeningReadinessReport, GatewayError> {
     const CANARY_CODE: &str = "600396";
     let source = required_opening_bridge("SecurityMetadata")?;
@@ -1098,7 +1490,7 @@ pub async fn external_static_opening_readiness() -> Result<OpeningReadinessRepor
         let result = global_news_bridge
             .global_news_async(provider, 1)
             .await
-            .and_then(|batch| opening_route(route, "LocalBridgeV1", &batch, false));
+            .and_then(|batch| opening_route(route, "ExternalV1", &batch, false));
         match result {
             Ok(readiness) => routes.push(readiness),
             Err(error) => {
@@ -1658,16 +2050,22 @@ impl GrpcSource {
         provider: GlobalNewsProvider,
         limit: u32,
     ) -> Result<GatewayBatch<GlobalNewsRecord>, GatewayError> {
-        let q = self
-            .query_op(
-                Operation::GlobalNews,
-                serde_json::json!({
-                    "provider": provider.wire_name(),
-                    "limit": limit,
-                }),
-            )
-            .await?;
-        let batch = convert::global_news(&q)?;
+        let params = serde_json::json!({
+            "provider": provider.wire_name(),
+            "limit": limit,
+        });
+        let external = self.external_bundle.is_some();
+        let q = if external {
+            self.query_external_op(Operation::GlobalNews, params)
+                .await?
+        } else {
+            self.query_op(Operation::GlobalNews, params).await?
+        };
+        let batch = if external {
+            convert::external_global_news(provider, &q)?
+        } else {
+            convert::global_news(&q)?
+        };
         if batch.evidence().provider != provider.provider_id()
             || batch.evidence().source != provider.source()
         {
@@ -2048,7 +2446,9 @@ impl GrpcSource {
             ));
         }
         let instrument = production_equity_instrument(code)?;
-        let end = chrono::Local::now().date_naive();
+        let captured_at = chrono::Local::now().fixed_offset();
+        let captured_through = captured_at.with_timezone(&chrono::Utc);
+        let end = captured_at.date_naive();
         let start = end
             .checked_sub_signed(chrono::Duration::days(i64::from(from_days)))
             .ok_or_else(|| {
@@ -2060,22 +2460,20 @@ impl GrpcSource {
         let q = self
             .query_external_op(
                 Operation::InstrumentNews,
-                serde_json::json!({
-                    "instrument": instrument,
-                    "start": start.format("%Y-%m-%d").to_string(),
-                    "end": end.format("%Y-%m-%d").to_string(),
-                    "limit": 100,
-                }),
+                instrument_news_request_params(&instrument, start, end, 100, captured_at),
             )
             .await?;
         convert::external_instrument_news_in_range_at(
             code,
             &instrument,
-            start,
-            end,
-            100,
             &q,
-            chrono::Utc::now(),
+            convert::ExternalInstrumentNewsRequestContext::new(
+                start,
+                end,
+                100,
+                captured_through,
+                chrono::Utc::now(),
+            ),
         )
     }
 
@@ -2087,27 +2485,27 @@ impl GrpcSource {
         code: &str,
     ) -> Result<GatewayBatch<SinaInstrumentNewsRecord>, GatewayError> {
         let instrument = production_equity_instrument(code)?;
-        let end = chrono::Local::now().date_naive();
+        let captured_at = chrono::Local::now().fixed_offset();
+        let captured_through = captured_at.with_timezone(&chrono::Utc);
+        let end = captured_at.date_naive();
         let start = crate::calendar::prev_trading_day(end);
         let q = self
             .query_external_op(
                 Operation::InstrumentNews,
-                serde_json::json!({
-                    "instrument": instrument,
-                    "start": start.format("%Y-%m-%d").to_string(),
-                    "end": end.format("%Y-%m-%d").to_string(),
-                    "limit": 1,
-                }),
+                instrument_news_request_params(&instrument, start, end, 1, captured_at),
             )
             .await?;
         convert::external_instrument_news_in_range_at(
             code,
             &instrument,
-            start,
-            end,
-            1,
             &q,
-            chrono::Utc::now(),
+            convert::ExternalInstrumentNewsRequestContext::new(
+                start,
+                end,
+                1,
+                captured_through,
+                chrono::Utc::now(),
+            ),
         )
     }
 
@@ -2520,7 +2918,7 @@ mod tests {
     #[test]
     fn map_query_error_restores_fetch_classification() {
         let err = GrpcError::Internal {
-            details: ErrorDetail {
+            details: Box::new(ErrorDetail {
                 code: "internal".to_string(),
                 request_id: Some("req-1".to_string()),
                 operation: Some(8),
@@ -2528,7 +2926,8 @@ mod tests {
                 reason_code: Some("no_verified_batch".to_string()),
                 retryable: Some(true),
                 diagnostic_message: None,
-            },
+                ..Default::default()
+            }),
         };
         let g = map_query_error(Operation::BoardConstituents, &err);
         assert_eq!(g.capability(), "GrpcBridge");
@@ -2544,13 +2943,13 @@ mod tests {
     #[test]
     fn map_query_error_unknown_provider_keeps_rest() {
         let err = GrpcError::Internal {
-            details: ErrorDetail {
+            details: Box::new(ErrorDetail {
                 code: "internal".to_string(),
                 provider: Some("NewProvider".to_string()),
                 reason_code: Some("database_failure".to_string()),
                 retryable: Some(false),
                 ..Default::default()
-            },
+            }),
         };
         let g = map_query_error(Operation::RealtimeQuotes, &err);
         assert_eq!(g.provider(), None);
@@ -2563,22 +2962,22 @@ mod tests {
     fn map_query_error_request_class_codes_no_retry() {
         for code in [
             GrpcError::InvalidArgument {
-                details: ErrorDetail::default(),
+                details: Box::default(),
             },
             GrpcError::Unimplemented {
-                details: ErrorDetail::default(),
+                details: Box::default(),
             },
             GrpcError::PermissionDenied {
-                details: ErrorDetail::default(),
+                details: Box::default(),
             },
             GrpcError::Unauthenticated {
-                details: ErrorDetail::default(),
+                details: Box::default(),
             },
             GrpcError::ResourceExhausted {
-                details: ErrorDetail::default(),
+                details: Box::default(),
             },
             GrpcError::FailedPrecondition {
-                details: ErrorDetail::default(),
+                details: Box::default(),
             },
         ] {
             let g = map_query_error(Operation::RealtimeQuotes, &code);
@@ -2592,7 +2991,7 @@ mod tests {
     #[test]
     fn map_query_error_unavailable_without_detail_keeps_defaults() {
         let err = GrpcError::Unavailable {
-            details: ErrorDetail::default(),
+            details: Box::default(),
         };
         let g = map_query_error(Operation::HistoricalBars, &err);
         assert_eq!(g.reason_code(), "no_verified_batch");
@@ -2610,7 +3009,7 @@ mod tests {
         let query = map_external_query_error(
             Operation::SecurityMetadata,
             &GrpcError::Internal {
-                details: detail.clone(),
+                details: Box::new(detail.clone()),
             },
         );
         assert_eq!(query.provider(), Some(ProviderId::Sina));
@@ -2618,11 +3017,39 @@ mod tests {
         assert!(query.retryable());
         assert!(!query.message().contains("TEST_CODE_upstream_retry"));
 
-        let connection = map_external_connection_error(GrpcError::Internal { details: detail });
+        let connection = map_external_connection_error(GrpcError::Internal {
+            details: Box::new(detail),
+        });
         assert_eq!(connection.provider(), Some(ProviderId::Sina));
         assert_eq!(connection.reason_code(), "internal");
         assert!(connection.retryable());
         assert!(!connection.message().contains("TEST_CODE_upstream_retry"));
+    }
+
+    #[test]
+    fn br238_documented_provider_failure_reasons_survive_gateway_mapping() {
+        for reason_code in [
+            "provider_authentication_rejected",
+            "provider_rate_limited",
+            "provider_unavailable",
+            "external_query_rejected",
+            "provider_response_invalid",
+        ] {
+            let error = map_external_query_error(
+                Operation::GlobalNews,
+                &GrpcError::Internal {
+                    details: Box::new(ErrorDetail {
+                        provider: Some("Cailianpress".to_owned()),
+                        reason_code: Some(reason_code.to_owned()),
+                        retryable: Some(false),
+                        ..Default::default()
+                    }),
+                },
+            );
+            assert_eq!(error.provider(), Some(ProviderId::Cailianpress));
+            assert_eq!(error.reason_code(), reason_code);
+            assert!(!error.retryable());
+        }
     }
 
     #[test]
@@ -2761,6 +3188,207 @@ mod tests {
     }
 
     #[test]
+    fn br238_diagnostic_report_retains_a_failure_and_later_success() {
+        let mut report = OpeningDiagnosticReport::default();
+        report.record_failure(
+            "InstrumentNews",
+            GatewayError::invalid_evidence(
+                "InstrumentNews",
+                Some(ProviderId::Sina),
+                "TEST_CODE cutoff-empty failure",
+            ),
+        );
+        report.record_ready(OpeningRouteReadiness {
+            route: "Announcements",
+            profile: "LocalBridgeV1",
+            provider: ProviderId::Cninfo,
+            source: "TEST_CODE_source".to_owned(),
+            source_at: None,
+            observed_at: "2026-08-20T09:00:00+08:00".to_owned(),
+            batch_id: "TEST_CODE_batch".to_owned(),
+            records: 0,
+        });
+
+        assert_eq!(
+            report.attempted_route_names(),
+            "InstrumentNews,Announcements"
+        );
+        assert_eq!(report.failed_route_names(), "InstrumentNews");
+        assert_eq!(report.ready_routes().len(), 1);
+        assert_eq!(report.failures().len(), 1);
+        assert_eq!(report.failures()[0].capability, "InstrumentNews");
+        assert!(!report.production_ready());
+    }
+
+    #[test]
+    fn br246_diagnostic_audit_persists_every_attempt_without_fabricating_failure_evidence() {
+        use diesel::prelude::*;
+        use diesel::sql_types::{BigInt, Integer, Nullable, Text};
+
+        #[derive(QueryableByName)]
+        struct PersistedAttempt {
+            #[diesel(sql_type = Text)]
+            capability: String,
+            #[diesel(sql_type = Text)]
+            provider: String,
+            #[diesel(sql_type = Nullable<Text>)]
+            source_at: Option<String>,
+            #[diesel(sql_type = Nullable<Text>)]
+            batch_id: Option<String>,
+            #[diesel(sql_type = BigInt)]
+            accepted_count: i64,
+            #[diesel(sql_type = BigInt)]
+            rejected_count: i64,
+            #[diesel(sql_type = Text)]
+            reason_code: String,
+            #[diesel(sql_type = Integer)]
+            retryable: i32,
+        }
+
+        crate::database::DatabaseManager::init(None).expect("TEST_CODE audit database");
+        let mut report = OpeningDiagnosticReport::default();
+        for (route, provider) in [
+            ("SecurityMetadata", ProviderId::Sina),
+            ("GlobalNews-Eastmoney", ProviderId::Eastmoney),
+            ("GlobalNews-CLS", ProviderId::Cailianpress),
+            ("GlobalNews-Jin10", ProviderId::Jin10),
+            ("GlobalNews-ThePaper", ProviderId::ThePaper),
+            ("Announcements", ProviderId::Cninfo),
+            ("BoardConstituents", ProviderId::Eastmoney),
+            ("LimitPools", ProviderId::Eastmoney),
+        ] {
+            report.record_ready(br238_ready_route(route, provider));
+        }
+        report.record_failure(
+            "InstrumentNews",
+            GatewayError::classified(
+                "InstrumentNews",
+                Some(ProviderId::Sina),
+                "unavailable",
+                "instrument_cutoff_empty",
+                true,
+                "TEST_CODE upstream detail must not become audit evidence",
+            ),
+        );
+
+        audit_opening_diagnostic_report("TEST_CODE_OpeningStaticResident", &report)
+            .expect("every diagnostic attempt must be immutably audited");
+
+        let mut connection = crate::database::DatabaseManager::get()
+            .get_conn()
+            .expect("TEST_CODE audit connection");
+        let rows = diesel::sql_query(
+            "SELECT capability, provider, source_at, batch_id, accepted_count, \
+                    rejected_count, reason_code, retryable \
+             FROM data_acquisition_audit \
+             WHERE capability LIKE 'TEST_CODE_OpeningStaticResident-%' \
+             ORDER BY id ASC",
+        )
+        .load::<PersistedAttempt>(&mut connection)
+        .expect("TEST_CODE diagnostic audit rows");
+
+        assert_eq!(rows.len(), 9);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.capability.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "TEST_CODE_OpeningStaticResident-SecurityMetadata",
+                "TEST_CODE_OpeningStaticResident-GlobalNews-Eastmoney",
+                "TEST_CODE_OpeningStaticResident-GlobalNews-CLS",
+                "TEST_CODE_OpeningStaticResident-GlobalNews-Jin10",
+                "TEST_CODE_OpeningStaticResident-GlobalNews-ThePaper",
+                "TEST_CODE_OpeningStaticResident-Announcements",
+                "TEST_CODE_OpeningStaticResident-BoardConstituents",
+                "TEST_CODE_OpeningStaticResident-LimitPools",
+                "TEST_CODE_OpeningStaticResident-InstrumentNews",
+            ]
+        );
+        assert_eq!(rows.iter().filter(|row| row.accepted_count == 1).count(), 8);
+        let failed = rows.last().expect("InstrumentNews failure row");
+        assert_eq!(failed.provider, "Sina");
+        assert_eq!(failed.source_at, None);
+        assert_eq!(failed.batch_id, None);
+        assert_eq!(failed.accepted_count, 0);
+        assert_eq!(failed.rejected_count, 1);
+        assert_eq!(failed.reason_code, "instrument_cutoff_empty");
+        assert_eq!(failed.retryable, 1);
+    }
+
+    #[test]
+    fn br246_diagnostic_audit_rejects_record_count_overflow() {
+        let mut report = OpeningDiagnosticReport::default();
+        let mut route = br238_ready_route("SecurityMetadata", ProviderId::Sina);
+        route.records = usize::MAX;
+        report.record_ready(route);
+
+        let error = opening_diagnostic_audit_rows("TEST_CODE_OpeningStaticResident", &report)
+            .expect_err("SQLite INTEGER overflow must fail instead of truncating");
+
+        assert_eq!(error.audit_outcome(), "unavailable");
+        assert_eq!(error.reason_code(), "acquisition_audit_unavailable");
+        assert!(error.retryable());
+        assert!(error.message().contains("accepted_count_overflow"));
+    }
+
+    #[test]
+    fn br238_diagnostic_report_applies_the_existing_global_news_quorum() {
+        let mut report = OpeningDiagnosticReport::default();
+        for (route, provider) in [
+            ("SecurityMetadata", ProviderId::Sina),
+            ("InstrumentNews", ProviderId::Sina),
+            ("GlobalNews-Eastmoney", ProviderId::Eastmoney),
+            ("GlobalNews-CLS", ProviderId::Cailianpress),
+            ("Announcements", ProviderId::Cninfo),
+            ("BoardConstituents", ProviderId::Eastmoney),
+            ("LimitPools", ProviderId::Eastmoney),
+        ] {
+            report.record_ready(br238_ready_route(route, provider));
+        }
+        for (route, provider) in [
+            ("GlobalNews-Jin10", None),
+            ("GlobalNews-ThePaper", Some(ProviderId::ThePaper)),
+        ] {
+            report.record_failure(
+                route,
+                GatewayError::classified(
+                    "GlobalNews",
+                    provider,
+                    "unavailable",
+                    "provider_unavailable",
+                    true,
+                    "TEST_CODE provider unavailable",
+                ),
+            );
+        }
+
+        assert_eq!(report.ready_routes().len(), 7);
+        assert_eq!(report.failures().len(), 2);
+        assert!(report.production_ready());
+    }
+
+    #[test]
+    fn br238_instrument_news_request_reuses_one_captured_upper_bound() {
+        let instrument = InstrumentId::new(
+            crate::magic_compat::Exchange::Shanghai,
+            "TEST_CODE_600396",
+            crate::magic_compat::AssetClass::Equity,
+        )
+        .expect("TEST_CODE canonical instrument");
+        let start = NaiveDate::from_ymd_opt(2026, 8, 18).expect("TEST_CODE start");
+        let end = NaiveDate::from_ymd_opt(2026, 8, 19).expect("TEST_CODE end");
+        let captured = DateTime::parse_from_rfc3339("2026-08-19T16:15:37.125+08:00")
+            .expect("TEST_CODE captured clock");
+
+        let params = instrument_news_request_params(&instrument, start, end, 20, captured);
+
+        assert_eq!(params["captured_through"], "2026-08-19T16:15:37.125+08:00");
+        assert_eq!(params["start"], "2026-08-18");
+        assert_eq!(params["end"], "2026-08-19");
+        assert_eq!(params["limit"], 20);
+    }
+
+    #[test]
     fn br238_opening_route_accepts_valid_fractional_unix_evidence_time() {
         let batch = GatewayBatch::<u8>::VerifiedEmpty(crate::data_gateway::BatchEvidence {
             provider: ProviderId::Sina,
@@ -2771,6 +3399,20 @@ mod tests {
         });
         opening_route("InstrumentNews", "ExternalV1", &batch, false)
             .expect("fractional Unix evidence accepted by the production converter stays valid");
+    }
+
+    #[test]
+    fn br238_opening_route_accepts_validated_jin10_provider_source_time() {
+        let batch = GatewayBatch::<u8>::VerifiedEmpty(crate::data_gateway::BatchEvidence {
+            provider: ProviderId::Jin10,
+            source: GlobalNewsProvider::Jin10.source().to_owned(),
+            source_at: Some("2026-08-19 22:41:08".to_owned()),
+            observed_at: "1787150469.000000000".to_owned(),
+            batch_id: "TEST_CODE_jin10_opening_batch".to_owned(),
+        });
+
+        opening_route("GlobalNews-Jin10", "ExternalV1", &batch, false)
+            .expect("provider-specific source time was already admitted by the converter");
     }
 
     #[test]
@@ -2847,6 +3489,7 @@ mod tests {
             provider: "Tdx".to_string(),
             reason_code: "no_verified_batch".to_string(),
             retryable: true,
+            ..Default::default()
         };
         let status = tonic::Status::with_details(
             tonic::Code::Internal,
@@ -3016,6 +3659,32 @@ mod tests {
     }
 
     #[test]
+    fn br238_configured_global_news_never_falls_back_to_local_bridge() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("DATA_GATEWAY_GRPC", "1");
+        std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:1");
+        std::env::set_var(
+            "GRPC_MARKET_CLIENT_BUNDLE",
+            "/TEST_CODE_missing_global_news_bundle",
+        );
+        reset_bridge();
+
+        let bridge = bridge_for("GlobalNews")
+            .expect("bridge config")
+            .expect("bridge enabled");
+        let error = block_on(bridge.global_news_async(GlobalNewsProvider::Jin10, 1))
+            .expect_err("configured ExternalV1 failure must not fall back to LocalBridgeV1");
+        assert_eq!(error.capability(), "GrpcExternalV1");
+        assert_eq!(error.reason_code(), "external_bundle_invalid");
+        assert!(!error.retryable());
+
+        std::env::remove_var("DATA_GATEWAY_GRPC");
+        std::env::remove_var("GRPC_MARKET_ADDR");
+        std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
+        reset_bridge();
+    }
+
+    #[test]
     fn br238_opening_readiness_requires_external_bundle() {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("DATA_GATEWAY_GRPC", "1");
@@ -3070,7 +3739,9 @@ mod tests {
     fn br238_ready_route(route: &'static str, provider: ProviderId) -> OpeningRouteReadiness {
         OpeningRouteReadiness {
             route,
-            profile: if matches!(route, "SecurityMetadata" | "InstrumentNews") {
+            profile: if matches!(route, "SecurityMetadata" | "InstrumentNews")
+                || route.starts_with("GlobalNews-")
+            {
                 "ExternalV1"
             } else {
                 "LocalBridgeV1"

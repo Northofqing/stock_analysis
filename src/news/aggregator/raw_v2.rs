@@ -5,6 +5,10 @@
 //! BR-244 exposes one narrower SourceOnly NewsFlash projection that consumes
 //! the same opaque tick, never mints a receipt and never changes impact facts.
 
+use crate::data_gateway::global_news::{
+    parse_global_news_observed_at, parse_global_news_provider_time,
+    validate_global_news_batch_evidence,
+};
 use crate::data_gateway::{
     BatchEvidence, GatewayBatch, GatewayError, GlobalNewsGateway, GlobalNewsProvider,
     GlobalNewsRecord,
@@ -583,6 +587,7 @@ const fn provider_id_wire_name(provider: ProviderId) -> &'static str {
 }
 
 fn validate_news_flash_record(
+    provider: GlobalNewsProvider,
     record: &GlobalNewsRecord,
     evidence: &BatchEvidence,
     env: crate::risk::env_guard::TradingEnv,
@@ -590,10 +595,11 @@ fn validate_news_flash_record(
     let source_time_matches = record
         .evidence
         .source_at()
-        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-        .is_some_and(|value| value.with_timezone(&Utc) == record.published_at);
-    let observation_time_matches = DateTime::parse_from_rfc3339(record.evidence.observed_at())
-        .is_ok_and(|value| value.with_timezone(&Utc) == record.observed_at);
+        .and_then(|value| parse_global_news_provider_time(provider, value).ok())
+        .is_some_and(|value| value == record.published_at);
+    let observation_time_matches =
+        parse_global_news_observed_at(provider, record.evidence.observed_at())
+            .is_ok_and(|value| value == record.observed_at);
     if record.item_id.trim().is_empty() {
         Err("missing_record_id")
     } else if record.title.trim().is_empty() {
@@ -680,22 +686,8 @@ pub fn project_news_flash_events(batch: &RawNewsAggregationBatch) -> NewsFlashSo
                 let Some(evidence) = terminal.evidence() else {
                     unreachable!("Available raw terminal always owns batch evidence")
                 };
-                let batch_times_valid = evidence
-                    .source_at
-                    .as_deref()
-                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-                    .zip(DateTime::parse_from_rfc3339(&evidence.observed_at).ok())
-                    .is_some_and(|(source_at, observed_at)| source_at <= observed_at);
                 if registration.source_contract != registration.provider.source()
-                    || evidence.provider != registration.provider.provider_id()
-                    || evidence.source != registration.source_contract
-                    || evidence
-                        .source_at
-                        .as_deref()
-                        .is_none_or(|value| value.trim().is_empty())
-                    || evidence.observed_at.trim().is_empty()
-                    || evidence.batch_id.trim().is_empty()
-                    || !batch_times_valid
+                    || validate_global_news_batch_evidence(registration.provider, evidence).is_err()
                     || !news_flash_identity_allowed_for_env(
                         crate::risk::env_guard::current_env(),
                         &[
@@ -725,6 +717,7 @@ pub fn project_news_flash_events(batch: &RawNewsAggregationBatch) -> NewsFlashSo
                 }
                 if let Some((record, diagnostic)) = records.iter().find_map(|record| {
                     validate_news_flash_record(
+                        registration.provider,
                         record,
                         evidence,
                         crate::risk::env_guard::current_env(),
@@ -1216,9 +1209,18 @@ mod tests {
         BatchEvidence {
             provider: provider.provider_id(),
             source: provider.source().to_owned(),
-            source_at: Some("2026-07-28T01:00:00.000000000Z".to_owned()),
+            source_at: Some(provider_source_at_wire(provider).to_owned()),
             observed_at: "2026-07-28T01:00:01.000000000Z".to_owned(),
             batch_id: format!("TEST_CODE_{batch_id}"),
+        }
+    }
+
+    fn provider_source_at_wire(provider: GlobalNewsProvider) -> &'static str {
+        match provider {
+            GlobalNewsProvider::Eastmoney => "2026-07-28 09:00",
+            GlobalNewsProvider::Cailianpress
+            | GlobalNewsProvider::Jin10
+            | GlobalNewsProvider::ThePaper => "2026-07-28T01:00:00.000000000Z",
         }
     }
 
@@ -1247,9 +1249,33 @@ mod tests {
                 format!("TEST_CODE_{}", provider.feed_name()),
             )
             .expect("TEST_CODE source evidence")
-            .with_source_at("2026-07-28T01:00:00.000000000Z")
+            .with_source_at(provider_source_at_wire(provider))
             .expect("TEST_CODE source publication evidence"),
         }
+    }
+
+    fn provider_wire_available(
+        provider: GlobalNewsProvider,
+    ) -> (Vec<GlobalNewsRecord>, BatchEvidence) {
+        let mut record = record(provider);
+        let observed_at_wire = format!("{}.000000000", record.observed_at.timestamp());
+        let batch_id = format!("TEST_CODE_{}_provider_wire", provider.feed_name());
+        record.evidence = SourceEvidence::new(
+            provider.provider_id(),
+            observed_at_wire.clone(),
+            batch_id.clone(),
+        )
+        .expect("TEST_CODE provider-wire observation evidence")
+        .with_source_at(record.published_at.to_rfc3339())
+        .expect("TEST_CODE provider-wire publication evidence");
+        let evidence = BatchEvidence {
+            provider: provider.provider_id(),
+            source: provider.source().to_owned(),
+            source_at: Some(record.published_at.to_rfc3339()),
+            observed_at: observed_at_wire,
+            batch_id,
+        };
+        (vec![record], evidence)
     }
 
     #[tokio::test]
@@ -1526,6 +1552,59 @@ mod tests {
         assert_eq!(failure.batch_id(), Some("TEST_CODE_cls_global_news"));
         assert_eq!(failure.record_id(), Some("TEST_CODE_item"));
         assert_eq!(failure.diagnostic(), "record_observation_time_mismatch");
+    }
+
+    #[test]
+    fn br244_projector_accepts_admitted_cls_and_jin10_observed_at_wire_format() {
+        let attempted_at = DateTime::parse_from_rfc3339("2026-07-28T09:00:02+08:00")
+            .expect("TEST_CODE attempted time")
+            .with_timezone(&Utc);
+        let (cls_records, cls_evidence) = provider_wire_available(GlobalNewsProvider::Cailianpress);
+        let (jin10_records, jin10_evidence) = provider_wire_available(GlobalNewsProvider::Jin10);
+        let attempts = vec![
+            RawGlobalNewsFeedAttempt::test_fixture(
+                "TEST_CODE raw attempt",
+                RegisteredGlobalNewsFeed::for_provider(GlobalNewsProvider::Eastmoney),
+                attempted_at,
+                TestRawGlobalNewsTerminal::VerifiedEmpty {
+                    evidence: evidence(GlobalNewsProvider::Eastmoney, "eastmoney_provider_wire"),
+                },
+            ),
+            RawGlobalNewsFeedAttempt::test_fixture(
+                "TEST_CODE raw attempt",
+                RegisteredGlobalNewsFeed::for_provider(GlobalNewsProvider::Cailianpress),
+                attempted_at,
+                TestRawGlobalNewsTerminal::Available {
+                    records: cls_records,
+                    evidence: cls_evidence,
+                },
+            ),
+            RawGlobalNewsFeedAttempt::test_fixture(
+                "TEST_CODE raw attempt",
+                RegisteredGlobalNewsFeed::for_provider(GlobalNewsProvider::Jin10),
+                attempted_at,
+                TestRawGlobalNewsTerminal::Available {
+                    records: jin10_records,
+                    evidence: jin10_evidence,
+                },
+            ),
+            RawGlobalNewsFeedAttempt::test_fixture(
+                "TEST_CODE raw attempt",
+                RegisteredGlobalNewsFeed::for_provider(GlobalNewsProvider::ThePaper),
+                attempted_at,
+                TestRawGlobalNewsTerminal::VerifiedEmpty {
+                    evidence: evidence(GlobalNewsProvider::ThePaper, "thepaper_provider_wire"),
+                },
+            ),
+        ];
+        let batch =
+            RawNewsAggregationBatch::test_fixture("TEST_CODE raw batch", attempts, attempted_at);
+
+        let projection = project_news_flash_events(&batch);
+
+        assert_eq!(projection.events().len(), 2);
+        assert_eq!(projection.available_feed_count(), 2);
+        assert!(projection.failures().is_empty());
     }
 
     #[tokio::test]

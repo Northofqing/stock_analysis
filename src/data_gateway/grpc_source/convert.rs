@@ -8,6 +8,10 @@
 //! 缺字段/缺证据 → GatewayError::invalid_evidence (fail-closed, 绝不静默填充)。
 //! 空 records → GatewayBatch::VerifiedEmpty (服务端 proven empty, 不 collapse
 //! 成 unavailable)。
+use crate::data_gateway::global_news::{
+    parse_global_news_observed_at, parse_global_news_provider_time,
+    validate_global_news_batch_evidence,
+};
 use crate::data_gateway::market_capabilities::MarketSecurityIdentity;
 use crate::data_gateway::outcome_daily_bars::{OutcomeTransportFailure, RawOutcomeFetch};
 use crate::data_gateway::{
@@ -16,13 +20,14 @@ use crate::data_gateway::{
     DragonTigerSeatReview, DragonTigerSourceDisclosure, DragonTigerStockReview,
     EconomicReleaseFact, EventAnnouncement, ForeignExchangeFact, FuturesDeliveryFact, GatewayBatch,
     GatewayError, GeneralWebResearchBatch, GeneralWebResearchBatchEvidence,
-    GeneralWebResearchProvider, GeneralWebResearchRecord, GlobalIndexFact, GlobalNewsRecord,
-    ImplementedCorporateAction, InstrumentFundFlowFact, IntradayShapeFact, MagicTdxT0Batch,
-    MagicTdxT0DailyBar, MagicTdxT0Evidence, MagicTdxT0FiveMinuteBar, MagicTdxT0Quote,
-    MagicTdxT0Rejection, MarketBookLevel, MarketMinutePoint, MarketMoneyFlow, MarketOrderBook,
-    MarketSecurityMetadata, NorthboundDailyFact, NorthboundQuotaFact, NorthboundTopTurnoverFact,
-    ProviderTopNFact, RealtimeIndexQuote, RealtimeMarketQuote, ResearchReportFact,
-    ResearchUseScope, SecurityBoard, SinaInstrumentNewsRecord, T0BookLevel, UpperLimitRecord,
+    GeneralWebResearchProvider, GeneralWebResearchRecord, GlobalIndexFact, GlobalNewsProvider,
+    GlobalNewsRecord, ImplementedCorporateAction, InstrumentFundFlowFact, IntradayShapeFact,
+    MagicTdxT0Batch, MagicTdxT0DailyBar, MagicTdxT0Evidence, MagicTdxT0FiveMinuteBar,
+    MagicTdxT0Quote, MagicTdxT0Rejection, MarketBookLevel, MarketMinutePoint, MarketMoneyFlow,
+    MarketOrderBook, MarketSecurityMetadata, NorthboundDailyFact, NorthboundQuotaFact,
+    NorthboundTopTurnoverFact, ProviderTopNFact, RealtimeIndexQuote, RealtimeMarketQuote,
+    ResearchReportFact, ResearchUseScope, SecurityBoard, SinaInstrumentNewsRecord, T0BookLevel,
+    UpperLimitRecord,
 };
 use crate::data_provider::{consensus::ConsensusData, news_item::NewsItem, AdjustType, KlineData};
 use crate::grpc_client::envelope::QueryResult;
@@ -1271,6 +1276,174 @@ pub fn global_news(q: &QueryResult) -> Result<GatewayBatch<GlobalNewsRecord>, Ga
     })
 }
 
+/// ExternalV1 GlobalNews v2 uses one canonical payload per record. This is a
+/// separate contract from LocalBridgeV1's single JSON-array payload above.
+pub fn external_global_news(
+    provider: GlobalNewsProvider,
+    q: &QueryResult,
+) -> Result<GatewayBatch<GlobalNewsRecord>, GatewayError> {
+    let capability = "GlobalNews";
+    let transport_evidence = evidence_of(q, capability)?;
+    if !q.complete {
+        return Err(err(capability, "ExternalV1 GlobalNews complete=false"));
+    }
+    if transport_evidence.provider != provider.provider_id() {
+        return Err(GatewayError::invalid_evidence(
+            capability,
+            Some(provider.provider_id()),
+            "ExternalV1 GlobalNews selected provider differs from exact request",
+        ));
+    }
+    if !transport_evidence.source.starts_with("grpc-mtls:") {
+        return Err(GatewayError::invalid_evidence(
+            capability,
+            Some(provider.provider_id()),
+            "ExternalV1 GlobalNews acquisition authority is missing",
+        ));
+    }
+
+    let evidence = BatchEvidence {
+        provider: provider.provider_id(),
+        source: provider.source().to_owned(),
+        source_at: transport_evidence.source_at,
+        observed_at: transport_evidence.observed_at,
+        batch_id: transport_evidence.batch_id,
+    };
+    if q.records.is_empty() {
+        parse_global_news_observed_at(provider, &evidence.observed_at)?;
+        if let Some(source_at) = evidence.source_at.as_deref() {
+            parse_global_news_provider_time(provider, source_at)?;
+        }
+        return Ok(GatewayBatch::VerifiedEmpty(evidence));
+    }
+
+    let (batch_source_at, batch_observed_at) =
+        validate_global_news_batch_evidence(provider, &evidence)?;
+    let mut item_ids = std::collections::HashSet::with_capacity(q.records.len());
+    let mut urls = std::collections::HashSet::with_capacity(q.records.len());
+    let mut previous_published_at: Option<DateTime<Utc>> = None;
+    let mut records = Vec::with_capacity(q.records.len());
+    for payload in &q.records {
+        validate_external_news_payload(payload, capability)?;
+        let value: Value = serde_json::from_slice(&payload.data).map_err(|error| {
+            err(
+                capability,
+                format!("GlobalNews v2 record is not JSON: {error}"),
+            )
+        })?;
+        validate_external_news_fields(&value, capability)?;
+        let wire: ExternalNewsItemWire = serde_json::from_value(value).map_err(|error| {
+            err(
+                capability,
+                format!("GlobalNews v2 fields are invalid: {error}"),
+            )
+        })?;
+
+        validate_external_news_text(&wire.item_id, "item_id", capability)?;
+        validate_external_news_text(&wire.title, "title", capability)?;
+        validate_external_news_text(&wire.publisher, "publisher", capability)?;
+        validate_external_news_text(&wire.url, "url", capability)?;
+        validate_external_news_text(&wire.published_at, "published_at", capability)?;
+        validate_external_news_text(&wire.language, "language", capability)?;
+        if wire.evidence.provider() != evidence.provider
+            || wire.evidence.batch_id() != evidence.batch_id
+            || wire.evidence.observed_at() != evidence.observed_at
+        {
+            return Err(GatewayError::invalid_evidence(
+                capability,
+                Some(provider.provider_id()),
+                "GlobalNews v2 record evidence differs from its envelope",
+            ));
+        }
+        let record_source_at = wire.evidence.source_at().ok_or_else(|| {
+            GatewayError::invalid_evidence(
+                capability,
+                Some(provider.provider_id()),
+                "GlobalNews v2 record source_at is missing",
+            )
+        })?;
+        let parsed_source_at = parse_global_news_provider_time(provider, record_source_at)?;
+        let published_at = DateTime::parse_from_rfc3339(&wire.published_at)
+            .map(|value| value.with_timezone(&Utc))
+            .map_err(|_| {
+                GatewayError::invalid_evidence(
+                    capability,
+                    Some(provider.provider_id()),
+                    "GlobalNews v2 published_at is not RFC3339",
+                )
+            })?;
+        let observed_at = parse_global_news_observed_at(provider, wire.evidence.observed_at())?;
+        if parsed_source_at != published_at
+            || published_at > observed_at
+            || observed_at > batch_observed_at
+        {
+            return Err(GatewayError::invalid_evidence(
+                capability,
+                Some(provider.provider_id()),
+                "GlobalNews v2 record time evidence conflicts",
+            ));
+        }
+        if previous_published_at.is_some_and(|previous| previous < published_at) {
+            return Err(GatewayError::invalid_evidence(
+                capability,
+                Some(provider.provider_id()),
+                "GlobalNews v2 records are not ordered newest first",
+            ));
+        }
+        previous_published_at = Some(published_at);
+        if !item_ids.insert(wire.item_id.clone()) || !urls.insert(wire.url.clone()) {
+            return Err(GatewayError::invalid_evidence(
+                capability,
+                Some(provider.provider_id()),
+                "GlobalNews v2 contains duplicate record identity",
+            ));
+        }
+        let parsed_url = url::Url::parse(&wire.url).map_err(|_| {
+            GatewayError::invalid_evidence(
+                capability,
+                Some(provider.provider_id()),
+                "GlobalNews v2 url is invalid",
+            )
+        })?;
+        if parsed_url.scheme() != "https" || parsed_url.host_str().is_none() {
+            return Err(GatewayError::invalid_evidence(
+                capability,
+                Some(provider.provider_id()),
+                "GlobalNews v2 url must be absolute HTTPS",
+            ));
+        }
+        records.push(GlobalNewsRecord {
+            item_id: wire.item_id,
+            title: wire.title,
+            summary: wire.summary,
+            content: wire.content,
+            publisher: wire.publisher,
+            canonical_url: wire.url,
+            published_at,
+            observed_at,
+            instruments: wire
+                .instruments
+                .into_iter()
+                .map(|instrument| instrument.code().to_owned())
+                .collect(),
+            topics: wire.topics,
+            language: wire.language,
+            evidence: wire.evidence,
+        });
+    }
+    if records
+        .first()
+        .is_none_or(|record| record.published_at != batch_source_at)
+    {
+        return Err(GatewayError::invalid_evidence(
+            capability,
+            Some(provider.provider_id()),
+            "GlobalNews v2 batch source_at differs from newest record",
+        ));
+    }
+    Ok(GatewayBatch::Available { records, evidence })
+}
+
 /// 财经日历。视图: delegate.rs fetch_economic_calendar (:413-439)
 /// {"event_id","country","name","period","scheduled_at","previous","consensus",
 ///  "actual","unit","importance","released_at","revised","impact","indicator_id"}。
@@ -2439,7 +2612,7 @@ const EXTERNAL_INSTRUMENT_NEWS_FIELDS: &[&str] = &[
     "summary",
     "content",
     "publisher",
-    "canonical_url",
+    "url",
     "published_at",
     "instruments",
     "topics",
@@ -2448,13 +2621,13 @@ const EXTERNAL_INSTRUMENT_NEWS_FIELDS: &[&str] = &[
 ];
 
 #[derive(serde::Deserialize)]
-struct ExternalInstrumentNewsWire {
+struct ExternalNewsItemWire {
     item_id: String,
     title: String,
     summary: Option<String>,
     content: Option<String>,
     publisher: String,
-    canonical_url: String,
+    url: String,
     published_at: String,
     instruments: Vec<InstrumentId>,
     topics: Vec<String>,
@@ -2462,7 +2635,7 @@ struct ExternalInstrumentNewsWire {
     evidence: SourceEvidence,
 }
 
-/// Normalize the delivered ExternalV1 `magic.market.news_item@1` contract.
+/// Normalize the delivered ExternalV1 `magic.market.news_item@2` contract.
 ///
 /// The wire record stays bound to the exact canonical instrument and immutable
 /// batch evidence that authorized the read. Missing provider source time is
@@ -2481,6 +2654,7 @@ pub fn external_instrument_news(
         request_limit,
         q,
         None,
+        None,
     )
 }
 
@@ -2497,6 +2671,7 @@ pub fn external_instrument_news_at(
         None,
         request_limit,
         q,
+        None,
         Some(consumer_now),
     )
 }
@@ -2522,19 +2697,47 @@ pub fn external_instrument_news_in_range(
         request_limit,
         q,
         None,
+        None,
     )
+}
+
+/// Immutable request and observation bounds for one ExternalV1 InstrumentNews
+/// projection. Keeping these values together prevents callers from mixing the
+/// RPC's captured upper bound with a later consumer clock.
+#[derive(Debug, Clone, Copy)]
+pub struct ExternalInstrumentNewsRequestContext {
+    request_start: NaiveDate,
+    request_end: NaiveDate,
+    request_limit: usize,
+    captured_through: DateTime<Utc>,
+    consumer_now: DateTime<Utc>,
+}
+
+impl ExternalInstrumentNewsRequestContext {
+    pub const fn new(
+        request_start: NaiveDate,
+        request_end: NaiveDate,
+        request_limit: usize,
+        captured_through: DateTime<Utc>,
+        consumer_now: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            request_start,
+            request_end,
+            request_limit,
+            captured_through,
+            consumer_now,
+        }
+    }
 }
 
 pub fn external_instrument_news_in_range_at(
     storage_code: &str,
     requested_instrument: &InstrumentId,
-    request_start: NaiveDate,
-    request_end: NaiveDate,
-    request_limit: usize,
     q: &QueryResult,
-    consumer_now: DateTime<Utc>,
+    context: ExternalInstrumentNewsRequestContext,
 ) -> Result<GatewayBatch<SinaInstrumentNewsRecord>, GatewayError> {
-    if request_start > request_end {
+    if context.request_start > context.request_end {
         return Err(GatewayError::invalid_request(
             "InstrumentNews",
             "ExternalV1 InstrumentNews request start must not follow end",
@@ -2543,10 +2746,11 @@ pub fn external_instrument_news_in_range_at(
     external_instrument_news_with_range(
         storage_code,
         requested_instrument,
-        Some((request_start, request_end)),
-        request_limit,
+        Some((context.request_start, context.request_end)),
+        context.request_limit,
         q,
-        Some(consumer_now),
+        Some(context.captured_through),
+        Some(context.consumer_now),
     )
 }
 
@@ -2556,6 +2760,7 @@ fn external_instrument_news_with_range(
     requested_range: Option<(NaiveDate, NaiveDate)>,
     request_limit: usize,
     q: &QueryResult,
+    captured_through: Option<DateTime<Utc>>,
     consumer_now: Option<DateTime<Utc>>,
 ) -> Result<GatewayBatch<SinaInstrumentNewsRecord>, GatewayError> {
     let capability = "InstrumentNews";
@@ -2653,13 +2858,13 @@ fn external_instrument_news_with_range(
         let value: Value = serde_json::from_slice(&payload.data)
             .map_err(|error| err(capability, format!("external news 非 JSON object: {error}")))?;
         validate_external_news_fields(&value, capability)?;
-        let wire: ExternalInstrumentNewsWire = serde_json::from_value(value)
+        let wire: ExternalNewsItemWire = serde_json::from_value(value)
             .map_err(|error| err(capability, format!("external news 字段无效: {error}")))?;
 
         validate_external_news_text(&wire.item_id, "item_id", capability)?;
         validate_external_news_text(&wire.title, "title", capability)?;
         validate_external_news_text(&wire.publisher, "publisher", capability)?;
-        validate_external_news_text(&wire.canonical_url, "canonical_url", capability)?;
+        validate_external_news_text(&wire.url, "url", capability)?;
         validate_external_news_text(&wire.published_at, "published_at", capability)?;
         validate_external_news_text(&wire.language, "language", capability)?;
         if let Some(summary) = wire.summary.as_deref() {
@@ -2681,10 +2886,10 @@ fn external_instrument_news_with_range(
                 "external news instruments 不含 exact request instrument",
             ));
         }
-        let parsed_url = url::Url::parse(&wire.canonical_url)
-            .map_err(|error| err(capability, format!("canonical_url 无效: {error}")))?;
+        let parsed_url = url::Url::parse(&wire.url)
+            .map_err(|error| err(capability, format!("url 无效: {error}")))?;
         if parsed_url.scheme() != "https" || parsed_url.host_str().is_none() {
-            return Err(err(capability, "canonical_url 必须是绝对 HTTPS URL"));
+            return Err(err(capability, "url 必须是绝对 HTTPS URL"));
         }
         if wire.evidence.provider() != evidence.provider
             || wire.evidence.batch_id() != evidence.batch_id
@@ -2714,6 +2919,12 @@ fn external_instrument_news_with_range(
                     format!("external news published_at 非 RFC3339: {error}"),
                 )
             })?;
+        if captured_through.is_some_and(|captured| published_at > captured) {
+            return Err(err(
+                capability,
+                "external news published_at exceeds caller-captured upper bound",
+            ));
+        }
         if let Some((request_start, request_end)) = requested_range {
             let shanghai = chrono::FixedOffset::east_opt(8 * 60 * 60)
                 .expect("Shanghai fixed UTC offset is valid");
@@ -2786,7 +2997,7 @@ fn external_instrument_news_with_range(
             code: Some(storage_code.to_string()),
             title: wire.title.clone(),
             summary: summary.clone(),
-            url: wire.canonical_url,
+            url: wire.url,
             source_name: wire.publisher,
             published_at,
             fetched_at,
@@ -2805,7 +3016,7 @@ fn validate_external_news_payload(
     capability: &'static str,
 ) -> Result<(), GatewayError> {
     if payload.schema != EXTERNAL_INSTRUMENT_NEWS_SCHEMA
-        || payload.schema_version != 1
+        || payload.schema_version != 2
         || payload.content_type != CANONICAL_JSON_CONTENT_TYPE
     {
         return Err(err(
@@ -2830,7 +3041,7 @@ fn validate_external_news_fields(
     {
         return Err(err(
             capability,
-            "external news payload fields 与 schema@1 冲突",
+            "external news payload fields 与 schema@2 冲突",
         ));
     }
     Ok(())
@@ -4145,7 +4356,7 @@ mod tests {
             source_at: "2026-08-17T09:59:00+08:00".to_string(),
             records: vec![CanonicalPayload {
                 schema: "magic.market.news_item".to_string(),
-                schema_version: 1,
+                schema_version: 2,
                 content_type: "application/json; charset=utf-8".to_string(),
                 data: serde_json::to_vec(&serde_json::json!({
                     "item_id": "https://example.com/TEST_CODE_news_1",
@@ -4153,7 +4364,7 @@ mod tests {
                     "summary": null,
                     "content": null,
                     "publisher": "TEST_CODE publisher",
-                    "canonical_url": "https://example.com/TEST_CODE_news_1",
+                    "url": "https://example.com/TEST_CODE_news_1",
                     "published_at": "2026-08-17T09:59:00+08:00",
                     "instruments": [{
                         "exchange": "Shanghai",
@@ -4174,6 +4385,107 @@ mod tests {
             source: "grpc-mtls:TEST_CODE_market.local".to_string(),
             diagnostic_blocker: String::new(),
         }
+    }
+
+    fn external_global_news_v2_q() -> QueryResult {
+        QueryResult {
+            admission: AdmissionState::Admitted,
+            selected_provider: "Jin10".to_string(),
+            batch_id: "TEST_CODE_external_global_news_batch".to_string(),
+            complete: true,
+            observed_at: "1787127606.533354000".to_string(),
+            source_at: "2026-08-19 16:15:37".to_string(),
+            records: vec![CanonicalPayload {
+                schema: "magic.market.news_item".to_string(),
+                schema_version: 2,
+                content_type: "application/json; charset=utf-8".to_string(),
+                data: serde_json::to_vec(&serde_json::json!({
+                    "item_id": "TEST_CODE_GLOBAL_NEWS_001",
+                    "title": "TEST_CODE global news",
+                    "summary": null,
+                    "content": null,
+                    "publisher": "Jin10",
+                    "url": "https://example.com/TEST_CODE_GLOBAL_NEWS_001",
+                    "published_at": "2026-08-19T16:15:37+08:00",
+                    "instruments": [],
+                    "topics": ["TEST_CODE_topic"],
+                    "language": "zh-CN",
+                    "evidence": {
+                        "provider": "Jin10",
+                        "source_at": "2026-08-19 16:15:37",
+                        "observed_at": "1787127606.533354000",
+                        "batch_id": "TEST_CODE_external_global_news_batch"
+                    }
+                }))
+                .expect("TEST_CODE external GlobalNews v2 JSON"),
+            }],
+            source: "grpc-mtls:TEST_CODE_market.local".to_string(),
+            diagnostic_blocker: String::new(),
+        }
+    }
+
+    #[test]
+    fn br238_external_global_news_v2_preserves_provider_times_and_record_evidence() {
+        let batch = external_global_news(GlobalNewsProvider::Jin10, &external_global_news_v2_q())
+            .expect("complete admitted ExternalV1 GlobalNews v2 batch");
+
+        assert_eq!(batch.evidence().provider, ProviderId::Jin10);
+        assert_eq!(batch.evidence().source, GlobalNewsProvider::Jin10.source());
+        assert_eq!(
+            batch.evidence().source_at.as_deref(),
+            Some("2026-08-19 16:15:37")
+        );
+        let record = &batch.records()[0];
+        assert_eq!(record.item_id, "TEST_CODE_GLOBAL_NEWS_001");
+        assert_eq!(record.evidence.source_at(), Some("2026-08-19 16:15:37"));
+        assert_eq!(
+            record.published_at,
+            DateTime::parse_from_rfc3339("2026-08-19T16:15:37+08:00")
+                .expect("TEST_CODE publication")
+                .with_timezone(&Utc)
+        );
+    }
+
+    #[test]
+    fn br238_external_global_news_v2_rejects_provider_and_record_evidence_conflicts() {
+        let mut response = external_global_news_v2_q();
+        response.selected_provider = "Eastmoney".to_string();
+        let error = external_global_news(GlobalNewsProvider::Jin10, &response)
+            .expect_err("transport provider must match the exact requested route");
+        assert_eq!(error.reason_code(), "invalid_evidence");
+        assert!(!error.retryable());
+
+        let mut response = external_global_news_v2_q();
+        replace_external_news_evidence_field(
+            &mut response,
+            0,
+            "provider",
+            Value::String("Eastmoney".to_string()),
+        );
+        let error = external_global_news(GlobalNewsProvider::Jin10, &response)
+            .expect_err("record provider must match its batch envelope");
+        assert_eq!(error.reason_code(), "invalid_evidence");
+        assert!(!error.retryable());
+    }
+
+    #[test]
+    fn br238_external_global_news_v2_rejects_records_out_of_provider_order() {
+        let mut response = external_global_news_v2_q();
+        let mut newer: Value = serde_json::from_slice(&response.records[0].data)
+            .expect("TEST_CODE external GlobalNews v2 JSON");
+        newer["item_id"] = Value::String("TEST_CODE_GLOBAL_NEWS_002".to_string());
+        newer["url"] = Value::String("https://example.com/TEST_CODE_GLOBAL_NEWS_002".to_string());
+        newer["published_at"] = Value::String("2026-08-19T16:15:38+08:00".to_string());
+        newer["evidence"]["source_at"] = Value::String("2026-08-19 16:15:38".to_string());
+        response.records.push(CanonicalPayload {
+            data: serde_json::to_vec(&newer).expect("TEST_CODE external GlobalNews v2 JSON"),
+            ..response.records[0].clone()
+        });
+
+        let error = external_global_news(GlobalNewsProvider::Jin10, &response)
+            .expect_err("provider records must remain newest-first");
+        assert_eq!(error.reason_code(), "invalid_evidence");
+        assert!(!error.retryable());
     }
 
     fn replace_external_news_evidence_field(
@@ -4224,6 +4536,36 @@ mod tests {
     }
 
     #[test]
+    fn external_instrument_news_rejects_publication_after_captured_upper_bound() {
+        let requested =
+            InstrumentId::new(Exchange::Shanghai, "TEST_CODE_600396", AssetClass::Equity)
+                .expect("canonical test instrument");
+        let date = NaiveDate::from_ymd_opt(2026, 8, 17).expect("TEST_CODE date");
+        let captured_through = DateTime::parse_from_rfc3339("2026-08-17T09:58:59+08:00")
+            .expect("TEST_CODE captured upper bound")
+            .with_timezone(&Utc);
+        let consumer_now = DateTime::parse_from_rfc3339("2026-08-17T10:00:01+08:00")
+            .expect("TEST_CODE consumer clock")
+            .with_timezone(&Utc);
+
+        let error = external_instrument_news_in_range_at(
+            "TEST_CODE_600396",
+            &requested,
+            &external_news_q(),
+            ExternalInstrumentNewsRequestContext::new(
+                date,
+                date,
+                100,
+                captured_through,
+                consumer_now,
+            ),
+        )
+        .expect_err("records after the exact request upper bound must fail closed");
+        assert_eq!(error.reason_code(), "invalid_evidence");
+        assert!(!error.retryable());
+    }
+
+    #[test]
     fn external_instrument_news_accepts_per_record_times_within_batch_aggregates() {
         let requested =
             InstrumentId::new(Exchange::Shanghai, "TEST_CODE_600396", AssetClass::Equity)
@@ -4232,7 +4574,7 @@ mod tests {
         let mut older = response.records[0].clone();
         let mut value: Value = serde_json::from_slice(&older.data).unwrap();
         value["item_id"] = Value::String("https://example.com/TEST_CODE_news_2".to_string());
-        value["canonical_url"] = Value::String("https://example.com/TEST_CODE_news_2".to_string());
+        value["url"] = Value::String("https://example.com/TEST_CODE_news_2".to_string());
         value["title"] = Value::String("TEST_CODE 较早产业链新闻".to_string());
         value["published_at"] = Value::String("2026-08-17T09:58:00+08:00".to_string());
         value["evidence"]["source_at"] = Value::String("2026-08-17T01:58:00Z".to_string());

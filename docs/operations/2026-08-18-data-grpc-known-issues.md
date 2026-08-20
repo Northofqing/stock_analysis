@@ -103,8 +103,8 @@ new dated evidence note and then change the status.
 
 ### DATA-20260818-002 — GlobalNews provider routes are degraded
 
-- Status: `DEGRADED`; the admitted two-provider quorum is currently CLS and
-  ThePaper. Eastmoney and Jin10 remain intermittent.
+- Status: `DEGRADED`; the latest authenticated ExternalV1 probe admitted only
+  Jin10, so the required independent-provider quorum remains unavailable.
 - Affected path: provider diversity and news/AI industry-chain inputs.
 - Evidence:
   - ThePaper repeatedly returned
@@ -121,11 +121,42 @@ new dated evidence note and then change the status.
     relabelled or filled from another batch. A later review invalidated the
     overall opening result because a separate mandatory route was not exact, so
     this observation supports only the independent news batches.
+  - The 2026-08-19 authenticated probe against client bundle `2026-08-19.1`
+    admitted Jin10 after the client consumed its registered provider-local
+    source-time wire. Eastmoney remained typed unavailable because a returned
+    article host was outside its admitted source contract; CLS returned a
+    redacted typed upstream rejection; ThePaper remained typed unavailable
+    because a native row contained an external link. Protected article content,
+    URLs and item identities are intentionally omitted.
 - Safety behavior: a failing provider stays typed and excluded. One provider's
   batch must not be relabelled as another provider, and no URL/field allowlist
   is widened without a source-contract change and regression fixture.
 - Acceptance: each restored provider independently produces an admitted batch
   with provider/source/count/evidence identity preserved.
+
+### NEWSFLASH-20260819-001 — admitted provider time wire rejected by SourceOnly projection
+
+- Status: `IN_PROGRESS`; deterministic RED captured and the shared parser fix is
+  awaiting focused/full verification.
+- Confirmed: 2026-08-19 after the corrective production cutover.
+- Affected path: BR-244 SourceOnly NewsFlash projection for CLS and Jin10.
+- Evidence: the gateway admitted independent CLS and Jin10 batches with their
+  registered provider/source contracts, but every NewsFlash projection rejected
+  them as `batch_evidence_incomplete`. The retained diagnostic states that the
+  registered provider/source contract did not match; protected news contents
+  and item identities are intentionally omitted.
+- Root cause: `BatchEvidence` correctly retained the provider's numeric
+  `observed_at` wire, which the gateway had already validated through the shared
+  evidence-time parser. The NewsFlash projector independently assumed RFC3339,
+  so valid source/observation times failed its second parse.
+- Required correction: move the exact provider/source and provider-specific time
+  validation behind the `global_news` module seam and consume that seam from
+  NewsFlash. Do not normalize the raw wire, change its audit identity, relax
+  future-time checks, or duplicate provider parsers in the consumer.
+- Acceptance: CLS/Jin10 numeric observation-wire regression passes; malformed,
+  future, wrong-provider, wrong-source and record/batch mismatches remain
+  rejected; fresh Gate C, release build and a live projection show admitted
+  events or a different truthful typed terminal.
 
 ### GRPC-20260818-003 — client error mapping may expose unsafe server detail
 
@@ -159,8 +190,8 @@ new dated evidence note and then change the status.
 
 ### GRPC-20260818-004 — InstrumentNews range loses the caller's instant upper bound
 
-- Status: `OPEN`; P-01 adds a consumer-side fail-closed guard, while the RPC
-  contract remains to be corrected.
+- Status: `FIXED` in client bundle `2026-08-19.1` and the matching client
+  adapter; full Gate C/D remains pending.
 - Affected path: P-01 per-head InstrumentNews acquisition and any caller that
   requires an instant upper bound within the current local date.
 - Confirmed: 2026-08-18 code-path inspection of
@@ -174,17 +205,20 @@ new dated evidence note and then change the status.
   rejects the entire binding when any `published_at > captured observed_at`;
   it does not silently filter the row, rewrite the timestamp, or substitute a
   cached headline.
-- Required correction: make the RPC request carry the caller's explicit start
-  and end instants (or a separately frozen exact end-date/end-time contract),
-  and validate the same bounds on both server and client without using server
-  wall time as request identity.
+- Corrective evidence: ExternalV1 schema v2 now carries the caller's single
+  captured RFC3339 `captured_through` value together with its exact date range.
+  The client converter rejects every record later than that same captured
+  instant and does not reuse its post-response freshness clock as request
+  identity. The authenticated probe admitted one schema-v2 record and the
+  exact-bound projection passed.
 - Acceptance: fixed-clock round-trip tests prove an exact upper-bound record is
   accepted, a record one nanosecond later is rejected, supported timestamp
   encodings compare by instant, and the original evidence is unchanged.
 
 ### GRPC-20260818-005 — latest client bundle documentation and proto are inconsistent
 
-- Status: `OPEN`; non-blocking for the current P-01 route.
+- Status: `FIXED` by client bundle `2026-08-19.1`; integrity-file portability is
+  tracked separately below.
 - Confirmed: 2026-08-18 local read-only inspection of the user-supplied latest
   `client-bundle`.
 - Evidence: `grpc-external-api.md` says 60 read-only RPC families are in the v1
@@ -198,12 +232,29 @@ new dated evidence note and then change the status.
 - Safety behavior: clients must not infer or code-generate the missing five RPC
   contracts from prose, and must not treat a document version timestamp as a
   wire contract.
-- Required correction: publish one self-consistent bundle whose proto contains
-  every advertised method/enum value and whose referenced derived-product
-  contract is included; bind all artifacts to one release manifest/hash set.
+- Corrective evidence: the delivered proto now publishes all 60 documented RPC
+  families and the generated client exposes the newly published operations.
+  Compatibility generation adds only contracts absent from older bundles.
 - Acceptance: clean-directory code generation exposes exactly 60 methods,
   derived request/record schemas are present, and document/proto counts and
   hashes agree.
+
+### GRPC-20260819-001 — bundle checksum manifest uses CRLF paths
+
+- Status: `OPEN`; packaging defect only, with no permission to skip integrity
+  verification.
+- Affected path: direct POSIX `shasum -a 256 -c manifest.sha256` verification of
+  client bundle `2026-08-19.1`.
+- Evidence: the unmodified command treats the carriage return as part of every
+  path and cannot open the named files. Removing only carriage returns from the
+  manifest stream allows every published artifact hash to verify successfully;
+  no bundle artifact is rewritten and no checksum is bypassed.
+- Safety behavior: release automation must not ignore checksum failures or
+  recompute a replacement manifest locally.
+- Required correction: publish `manifest.sha256` with LF line endings, or
+  explicitly document and test a cross-platform verification command.
+- Acceptance: the documented unmodified verification command succeeds in a
+  clean POSIX checkout and verifies every manifest entry.
 
 ### DATA-20260818-003 — HistoricalBars had no verified batch for an issue-scoped instrument
 
@@ -463,6 +514,128 @@ new dated evidence note and then change the status.
   must not be copied into documentation or PR evidence.
 - R-08 remains unavailable until an admitted official CFFEX evidence route is
   published; it must not be represented as verified empty.
+
+### GRPC-20260820-001 — InstrumentNews rejects a valid cutoff-empty result
+
+- Status: `OPEN` upstream; blocks the production opening probe.
+- Confirmed: 2026-08-20 10:15 +08:00 against client bundle
+  `2026-08-19.2` / source commit `3935a372aa014bb155bd920de60e8944af0e4162`.
+- Affected path: the mandatory ExternalV1 `InstrumentNews` startup canary and
+  every consumer that requests an exact caller-captured upper bound.
+- Reproduction: health is live/ready; the capability is admitted and runtime
+  available; `SecurityMetadata` succeeds; a valid InstrumentNews v2 request
+  whose cutoff leaves no matching records returns `FAILED_PRECONDITION` with
+  provider `Sina`, `reason_code=invalid_evidence`, `retryable=false`,
+  `admission=UNADMITTED`, `evidence_code=instrument_cutoff_empty`, and
+  `evidence_field=captured_through`.
+- Contract conflict: the client converter and opening probe accept a complete,
+  admitted empty response as `VerifiedEmpty`. Removing records published after
+  the caller's exact cutoff is required filtering; zero retained records do
+  not by themselves prove invalid evidence. The client must not synthesize a
+  record or reinterpret an unadmitted failure as verified empty.
+- Required upstream behavior: return `ADMITTED`, `complete=true`,
+  `records=[]`, and the original truthful batch evidence when the exact cutoff
+  produces a source-verified empty result. Reserve `invalid_evidence` for
+  malformed, conflicting, partial, or unprovable evidence.
+- Acceptance: the same production-equivalent opening probe reaches the next
+  canary; its InstrumentNews line reports `ADMITTED complete=true records=0`
+  and the production projection returns `VerifiedEmpty`. A non-empty control
+  response still enforces the exact instrument, date range, limit, cutoff,
+  record order, provider, batch, and per-record evidence.
+- Recheck: 2026-08-20 11:51 +08:00, after a fresh release build and manifest
+  verification of the same latest bundle, the production-equivalent opening
+  probe still returned the identical typed failure and stopped before the nine
+  route canaries. The upstream fix is therefore not present in the deployed
+  service reached by this bundle; documentation/schema availability alone is
+  not acceptance evidence.
+- Recheck: 2026-08-20 12:53 +08:00, the manifest-verified bundle still returned
+  the identical `instrument_cutoff_empty` rejection. The enhanced read-only
+  probe continued through all nine independent routes, confirming this remains
+  a mandatory ExternalV1 blocker rather than a local `GrpcBridge` failure.
+
+### GRPC-20260820-002 — Eastmoney GlobalNews transiently returned an opaque internal failure
+
+- Status: `OBSERVED_TRANSIENT`; immediate production-equivalent recheck
+  recovered. The opaque failure remains a diagnostics defect if it recurs.
+- Confirmed: 2026-08-20 12:53 +08:00 against manifest-verified client bundle
+  `2026-08-19.2` / source commit
+  `3935a372aa014bb155bd920de60e8944af0e4162`.
+- Affected path: ExternalV1 `GlobalNews` with the exact closed provider
+  `Eastmoney` and `limit=1`.
+- Evidence: the direct query and the production projection route both return
+  an unadmitted `internal`, `retryable=false` failure with no Provider,
+  evidence code, evidence field or record index. The same run admitted and
+  fully projected Cailianpress, Jin10 and ThePaper as
+  `magic.market.news_item@2`, so bundle transport, authentication and the
+  GlobalNews request schema were functioning.
+- Contract conflict: the delivered error contract requires provider failures
+  to retain a closed safe Provider identity and one of the registered reason
+  codes. An opaque `internal` response cannot identify authentication, rate
+  limiting, provider availability, external rejection or invalid response.
+- Safety behavior: Eastmoney is excluded; its records are not relabelled or
+  replaced. The three independently admitted providers satisfy the existing
+  GlobalNews quorum, so this failure alone does not block opening.
+- Required upstream behavior: return an admitted, fully evidenced batch (empty
+  is allowed when source-verified), or a secret-safe typed failure containing
+  provider `Eastmoney`, a closed reason code, retryability and any applicable
+  evidence locator.
+- Acceptance: the exact direct canary either projects an admitted batch or
+  returns the complete typed failure above; the other three providers remain
+  independently validated and no provider result satisfies another route.
+- Recheck: 2026-08-20 13:13 +08:00, with the current release local service
+  temporarily owning the bridge port, both the direct ExternalV1 canary and the
+  production projection admitted one fully evidenced Eastmoney record. All four
+  GlobalNews providers passed in that run. This closes the immediate data-path
+  blocker but does not make the earlier opaque error contract-compliant.
+
+### RUNTIME-20260820-001 — mandatory LocalBridge owner was absent
+
+- Status: `DEPLOYMENT_PENDING`; the current release service passes all three
+  routes when running, but it was stopped again after the bounded probe.
+- Confirmed: 2026-08-20 12:53 +08:00.
+- Affected paths: `Announcements`, `BoardConstituents` and exact `LimitPools`
+  startup routes.
+- Evidence: no process was listening on the configured local bridge port and
+  no production monitor process was running. The complete nine-route probe
+  classified all three failures as capability `GrpcBridge`,
+  `reason_code=no_verified_batch`, `retryable=true`; the authenticated bundle
+  health and its delivered direct ExternalV1 routes remained reachable.
+- Safety behavior: the production monitor stays stopped. These unavailable
+  mandatory routes are not converted to empty batches and cannot receive an
+  ExternalV1 profile unless that exact request/response contract is delivered.
+- Required local action: build and start the compatible local data service as
+  the sole listener, or complete a separately designed ExternalV1 migration
+  for each route. Then rerun the release opening probe before starting monitor.
+- Acceptance: one compatible listener owns the configured port and the same
+  probe admits Announcements, exact BoardConstituents and exact LimitPools with
+  their original evidence; `opening_static_ready=true` is still required.
+- Recheck: 2026-08-20 13:13 +08:00, a freshly built release service was started
+  temporarily without `DATA_GATEWAY_GRPC`. Announcements admitted 100 Cninfo
+  records, exact BoardConstituents admitted 13 TDX records, and exact prior-day
+  LimitPools admitted 36 Tonghuashun records after the Eastmoney date-mismatch
+  attempt was explicitly rejected. The service was then stopped with Ctrl-C;
+  no monitor or notification sink was started. The resulting probe had eight
+  ready routes and only InstrumentNews failed.
+
+## 2026-08-20 no-push runtime explanation
+
+- The immutable delivery audit contains ten confirmed `data_mode_v1` pushes,
+  with the last at 08:37:56 +08:00. It contains 296 explicit
+  `news_flash_source_failure_v1` results and zero successful NewsFlash
+  deliveries, with the last source failure at 08:56:47 +08:00.
+- The durable-delivery database contains zero decisions for business date
+  2026-08-20. At the 12:53 check there was no monitor process and no local
+  bridge listener, so no producer existed to create later messages.
+- The last resident NewsFlash attempts also rejected source evidence rather
+  than silently sending: provider-evidence failures and record publication-time
+  mismatches were retained as non-retryable invalid evidence. The latest direct
+  bundle probe now validates Cailianpress, Jin10 and ThePaper, but this does not
+  prove the stopped monitor's full NewsFlash path until a current release passes
+  opening readiness and is started under the production lease.
+- A 13:13 bounded local-service run further validated Eastmoney and all three
+  LocalBridge mandatory routes. It still did not start monitor because the
+  persistent InstrumentNews mandatory failure kept
+  `opening_static_ready=false` (eight of nine routes ready).
 
 ## Update procedure
 

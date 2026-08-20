@@ -236,14 +236,13 @@ non-empty token. Paths may not escape the bundle directory. Errors identify only
 the field/file role, never secret content.
 
 `GRPC_MARKET_ADDR` continues to identify the normalized local plaintext bridge.
-Because the delivered ExternalV1 contract is incomplete, the configured bundle
-is an additional authenticated client, not a wholesale replacement for that
-bridge. Dispatch is closed and operation-specific: only fixture-proven external
-operations may use the bundle; every other operation remains on the local
-normalized service. A configured external operation never silently falls back
-after TLS/auth/schema/evidence failure. If the bundle is absent, all existing
-local operations keep their current path and the externally owned identity/news
-readiness checks report unavailable explicitly.
+The configured bundle is an additional authenticated client, not a wholesale
+replacement for that bridge. Dispatch is closed and operation-specific: only
+fixture-proven external operations may use the bundle; every other operation
+remains on the local normalized service. A configured external operation never
+silently falls back after TLS/auth/schema/evidence failure. If the bundle is
+absent, all existing local operations keep their current path and the externally
+owned identity/news readiness checks report unavailable explicitly.
 
 ### 5.2 Transport and auth
 
@@ -256,14 +255,26 @@ environment variable, URL, request payload, log or debug output.
 
 `ContractProfile::LocalBridgeV1` retains local short schemas and JSON-array
 records. `ContractProfile::ExternalV1` is a closed allow-list built only from
-contracts actually delivered by the upstream. The 2026-08-17 bundle proves the
-`SecurityMetadata` and `InstrumentNews` request contracts; it does not deliver
-request/record schema labels for the other opening operations, its Proto ends at
-operation 55 while the companion document claims 60, and the referenced
-`grpc-derived-products.md` is missing. Those operations therefore remain
-explicitly unsupported in the direct external profile. Unknown or undelivered
+contracts actually delivered by the upstream. The 2026-08-19.1 bundle proves
+60 RPC declarations, supplies `grpc-derived-products.md`, and freezes the
+`SecurityMetadata` v1 plus `GlobalNews` v2 and `InstrumentNews` v2 request and
+record contracts. Those three operations may use the direct external profile;
+all other operations remain explicitly unsupported there and continue through
+their previously admitted LocalBridgeV1 routes. Unknown or undelivered
 operation/schema/version fails before I/O or interpretation; local Rust types
 must not be used to guess an ExternalV1 payload contract.
+
+GlobalNews v2 accepts one closed routing `provider` plus a positive bounded
+`limit`. The adapter maps the provider to `QueryRequest.preferred_provider` and
+emits the delivered business payload exactly as `{"limit":N}`; it must never
+invent a `provider` JSON field. The routing value is one of the four closed
+`GlobalNewsProvider::wire_name()` values.
+InstrumentNews v2 accepts exactly one canonical instrument, `start`, `end`,
+positive bounded `limit`, and caller-captured RFC3339 `captured_through`; when
+the date range is present, `end` must equal that instant's Asia/Shanghai date.
+`captured_through` is captured once by the caller and is used unchanged for the
+request and consumer-side upper-bound check. It is never reconstructed from a
+response, database time, or a second wall-clock read.
 
 `allow_unadmitted` defaults to `false`. Only a separately named diagnostic
 probe may set it to true; production gateway calls cannot.
@@ -402,10 +413,10 @@ static startup check red:
 | --- | --- | --- |
 | `SecurityMetadata` | ExternalV1 | exact canary identity required |
 | `InstrumentNews` | ExternalV1 | bounded verified-empty allowed |
-| `GlobalNews-Eastmoney` | LocalBridgeV1 | bounded verified-empty allowed |
-| `GlobalNews-CLS` | LocalBridgeV1 | bounded verified-empty allowed |
-| `GlobalNews-Jin10` | LocalBridgeV1 | bounded verified-empty allowed |
-| `GlobalNews-ThePaper` | LocalBridgeV1 | bounded verified-empty allowed |
+| `GlobalNews-Eastmoney` | ExternalV1 | bounded verified-empty allowed |
+| `GlobalNews-CLS` | ExternalV1 | bounded verified-empty allowed |
+| `GlobalNews-Jin10` | ExternalV1 | bounded verified-empty allowed |
+| `GlobalNews-ThePaper` | ExternalV1 | bounded verified-empty allowed |
 | `Announcements` | LocalBridgeV1 | bounded verified-empty allowed |
 | `BoardConstituents` | LocalBridgeV1 | exact canary membership required |
 | `LimitPools` | LocalBridgeV1 | bounded verified-empty allowed; full `LimitPoolEntry` contract required |
@@ -416,6 +427,14 @@ bounded limit. The server must consume both parameters. The returned
 the record count must not exceed the requested limit. A batch from one provider
 must not satisfy another provider's route; a mismatch is non-retryable invalid
 evidence for that attempt and is retained in the audit disposition.
+
+When `GRPC_MARKET_CLIENT_BUNDLE` is configured, all four GlobalNews routes use
+the authenticated ExternalV1 v2 profile. TLS, authentication, capability,
+schema, provider, record or evidence failure on that configured profile is
+terminal for that provider attempt and never falls back to the local server,
+library transport, cache or another provider. With no bundle configured, the
+pre-existing LocalBridgeV1 GlobalNews route remains available under its own
+explicit evidence and readiness contract; it cannot impersonate ExternalV1.
 
 The four news canaries form one redundant source family, not four serial startup
 locks. Startup attempts all four and requires at least two independently
@@ -520,6 +539,24 @@ a second monitor, gracefully stop the old process, verify its PID and listening
 ownership are gone, then start the candidate and prove it owns the lease. The
 current release remains running until static/auth/contract probes and Gate C are
 ready for that controlled handoff.
+
+The read-only bundle probe has a different failure-reporting duty from the
+production startup gate. Transport, health, capability discovery and canonical
+instrument construction remain hard prerequisites. After those prerequisites
+pass, the probe must execute every independent static canary it can reach,
+retain each secret-safe typed success or failure in stable route order, print a
+single deterministic summary, and exit nonzero if any mandatory canary failed.
+One provider or route failure must not hide later independent diagnostics. This
+diagnostic aggregation grants no startup permit: production
+`external_static_opening_readiness` remains fail-closed and returns no ready
+report unless its existing BR-238 quorum and mandatory-route rules pass.
+The probe may additionally issue the four closed ExternalV1 GlobalNews requests
+directly to expose their structured gRPC detail. Those requests validate the
+delivered request schema `magic.market.global_news.request@2` and response-record
+schema `magic.market.news_item@2`, then run the same production projection. A
+single direct GlobalNews failure is diagnostic only; readiness still uses the
+existing two-of-four family quorum rather than promoting all four providers to
+mandatory routes.
 
 ### 5.8 Upstream revision and immutable historical artifacts
 

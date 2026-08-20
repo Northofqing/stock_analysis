@@ -104,6 +104,7 @@ impl DataService {
                             .unwrap_or_default(),
                         reason_code: failure.reason_code.to_string(),
                         retryable: failure.retryable,
+                        ..Default::default()
                     };
                     Status::with_details(
                         tonic::Code::Internal,

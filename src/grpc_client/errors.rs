@@ -10,25 +10,25 @@ use sha2::{Digest, Sha256};
 #[derive(Debug, thiserror::Error, Clone, PartialEq)]
 pub enum GrpcError {
     #[error("请求参数错误 (不重试)")]
-    InvalidArgument { details: ErrorDetail },
+    InvalidArgument { details: Box<ErrorDetail> },
     #[error("认证失败 (刷新凭据)")]
-    Unauthenticated { details: ErrorDetail },
+    Unauthenticated { details: Box<ErrorDetail> },
     #[error("无权限调用该能力 (停止调用)")]
-    PermissionDenied { details: ErrorDetail },
+    PermissionDenied { details: Box<ErrorDetail> },
     #[error("能力未准入或不支持 (不重试)")]
-    Unimplemented { details: ErrorDetail },
+    Unimplemented { details: Box<ErrorDetail> },
     #[error("资源受限 (退避; 流消费者记录 gap)")]
-    ResourceExhausted { details: ErrorDetail },
+    ResourceExhausted { details: Box<ErrorDetail> },
     #[error("超时 (有界重试, 保留原 request_id)")]
-    DeadlineExceeded { details: ErrorDetail },
+    DeadlineExceeded { details: Box<ErrorDetail> },
     #[error("服务不可用 (指数退避, 重新检查 health/capabilities)")]
-    Unavailable { details: ErrorDetail },
+    Unavailable { details: Box<ErrorDetail> },
     #[error("数据完整性/连续性失败 (不能当空成功)")]
-    FailedPrecondition { details: ErrorDetail },
+    FailedPrecondition { details: Box<ErrorDetail> },
     #[error("服务端内部错误 (记录 request_id, 停止无界重试)")]
-    Internal { details: ErrorDetail },
+    Internal { details: Box<ErrorDetail> },
     #[error("未知错误 (code={code})", code = details.code)]
-    Unknown { details: ErrorDetail },
+    Unknown { details: Box<ErrorDetail> },
 }
 
 impl GrpcError {
@@ -58,9 +58,28 @@ pub struct ErrorDetail {
     pub provider: Option<String>,
     pub reason_code: Option<String>,
     pub retryable: Option<bool>,
+    pub admission: Option<crate::grpc_client::pb::magic::market::v1::AdmissionState>,
+    pub evidence_code: Option<SafeEvidenceIdentifier>,
+    pub evidence_field: Option<SafeEvidenceIdentifier>,
+    pub record_index: Option<u32>,
     /// Bounded, secret-screened server diagnostic for operator evidence only.
     /// Program flow must continue to branch exclusively on typed fields above.
     pub diagnostic_message: Option<Box<DiagnosticMessage>>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SafeEvidenceIdentifier(String);
+
+impl SafeEvidenceIdentifier {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SafeEvidenceIdentifier {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SafeEvidenceIdentifier([redacted])")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -78,6 +97,7 @@ impl DiagnosticMessage {
 
 const MAX_DIAGNOSTIC_CHARS: usize = 512;
 const REQUEST_ID_HASH_DOMAIN: &[u8] = b"stock_analysis.grpc_error.request_id.v1";
+const ERROR_DETAIL_TRAILER: &str = "magic-error-detail-bin";
 
 fn request_id_correlation(value: &str) -> Option<String> {
     if value.is_empty() {
@@ -151,7 +171,11 @@ enum KnownReasonCode {
     DatabaseFailure,
     ExternalSourceFieldConflict,
     ExternalAcquisitionAuthorityMissing,
+    ProviderAuthenticationRejected,
+    ProviderRateLimited,
     ProviderUnavailable,
+    ExternalQueryRejected,
+    ProviderResponseInvalid,
 }
 
 impl KnownReasonCode {
@@ -173,7 +197,11 @@ impl KnownReasonCode {
             "database_failure" => Self::DatabaseFailure,
             "external_source_field_conflict" => Self::ExternalSourceFieldConflict,
             "external_acquisition_authority_missing" => Self::ExternalAcquisitionAuthorityMissing,
+            "provider_authentication_rejected" => Self::ProviderAuthenticationRejected,
+            "provider_rate_limited" => Self::ProviderRateLimited,
             "provider_unavailable" => Self::ProviderUnavailable,
+            "external_query_rejected" => Self::ExternalQueryRejected,
+            "provider_response_invalid" => Self::ProviderResponseInvalid,
             _ => return None,
         })
     }
@@ -196,9 +224,37 @@ impl KnownReasonCode {
             Self::DatabaseFailure => "database_failure",
             Self::ExternalSourceFieldConflict => "external_source_field_conflict",
             Self::ExternalAcquisitionAuthorityMissing => "external_acquisition_authority_missing",
+            Self::ProviderAuthenticationRejected => "provider_authentication_rejected",
+            Self::ProviderRateLimited => "provider_rate_limited",
             Self::ProviderUnavailable => "provider_unavailable",
+            Self::ExternalQueryRejected => "external_query_rejected",
+            Self::ProviderResponseInvalid => "provider_response_invalid",
         }
     }
+}
+
+const MAX_EVIDENCE_IDENTIFIER_CHARS: usize = 160;
+
+fn safe_evidence_identifier(value: &str) -> Option<SafeEvidenceIdentifier> {
+    if value.is_empty()
+        || value.chars().count() > MAX_EVIDENCE_IDENTIFIER_CHARS
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | '[' | ']')
+        })
+    {
+        return None;
+    }
+    Some(SafeEvidenceIdentifier(value.to_owned()))
+}
+
+fn safe_wire_admission(
+    value: i32,
+) -> Option<crate::grpc_client::pb::magic::market::v1::AdmissionState> {
+    use crate::grpc_client::pb::magic::market::v1::AdmissionState;
+
+    AdmissionState::try_from(value)
+        .ok()
+        .filter(|admission| *admission != AdmissionState::Unspecified)
 }
 
 fn safe_wire_reason_code(value: &str) -> Option<String> {
@@ -255,6 +311,34 @@ fn safe_status_message(message: &str) -> Option<Box<DiagnosticMessage>> {
     Some(Box::new(DiagnosticMessage::new(safe)))
 }
 
+fn decode_wire_error_detail(
+    status: &tonic::Status,
+) -> Option<crate::grpc_client::pb::magic::market::v1::ErrorDetail> {
+    type WireErrorDetail = crate::grpc_client::pb::magic::market::v1::ErrorDetail;
+
+    let standard = if status.details().is_empty() {
+        Ok(None)
+    } else {
+        WireErrorDetail::decode(status.details())
+            .map(Some)
+            .map_err(|_| ())
+    };
+    let trailer = match status.metadata().get_bin(ERROR_DETAIL_TRAILER) {
+        None => Ok(None),
+        Some(value) => value
+            .to_bytes()
+            .map_err(|_| ())
+            .and_then(|bytes| WireErrorDetail::decode(bytes).map(Some).map_err(|_| ())),
+    };
+
+    match (standard.ok()?, trailer.ok()?) {
+        (Some(standard), Some(trailer)) if standard == trailer => Some(standard),
+        (Some(_), Some(_)) => None,
+        (Some(detail), None) | (None, Some(detail)) => Some(detail),
+        (None, None) => None,
+    }
+}
+
 impl From<tonic::Status> for GrpcError {
     fn from(status: tonic::Status) -> Self {
         let diagnostic_message = safe_status_message(status.message());
@@ -262,43 +346,60 @@ impl From<tonic::Status> for GrpcError {
         // tonic 0.14 重构: details() 返回原始 &[u8] (不再是 Box<dyn Any>),
         // 用 prost::Message::decode 直接解码; 解码失败则忽略, 用 code 分支即可。
         // 空 details → 纯默认 (prost 会把空 bytes 解码为全默认值, 语义上等于没有 ErrorDetail)。
-        let detail = if status.details().is_empty() {
+        let detail = if let Some(d) = decode_wire_error_detail(&status) {
+            ErrorDetail {
+                code: status.code().to_string(),
+                request_id: request_id_correlation(&d.request_id),
+                operation: safe_wire_operation(d.operation),
+                provider: safe_wire_provider(&d.provider),
+                reason_code: safe_wire_reason_code(&d.reason_code),
+                retryable: Some(d.retryable),
+                admission: safe_wire_admission(d.admission),
+                evidence_code: safe_evidence_identifier(&d.evidence_code),
+                evidence_field: safe_evidence_identifier(&d.evidence_field),
+                record_index: d.has_record_index.then_some(d.record_index),
+                diagnostic_message: diagnostic_message.clone(),
+            }
+        } else {
             ErrorDetail {
                 code: status.code().to_string(),
                 diagnostic_message: diagnostic_message.clone(),
                 ..Default::default()
             }
-        } else {
-            crate::grpc_client::pb::magic::market::v1::ErrorDetail::decode(status.details())
-                .ok()
-                .map(|d| ErrorDetail {
-                    code: status.code().to_string(),
-                    request_id: request_id_correlation(&d.request_id),
-                    operation: safe_wire_operation(d.operation),
-                    provider: safe_wire_provider(&d.provider),
-                    reason_code: safe_wire_reason_code(&d.reason_code),
-                    retryable: Some(d.retryable),
-                    diagnostic_message: diagnostic_message.clone(),
-                })
-                .unwrap_or_else(|| ErrorDetail {
-                    code: status.code().to_string(),
-                    diagnostic_message: diagnostic_message.clone(),
-                    ..Default::default()
-                })
         };
 
         // D2: 每个变体都携带 detail — 即便非 Fetch 错误码也保留 request_id 供日志/审计。
         match status.code() {
-            tonic::Code::InvalidArgument => GrpcError::InvalidArgument { details: detail },
-            tonic::Code::Unauthenticated => GrpcError::Unauthenticated { details: detail },
-            tonic::Code::PermissionDenied => GrpcError::PermissionDenied { details: detail },
-            tonic::Code::Unimplemented => GrpcError::Unimplemented { details: detail },
-            tonic::Code::ResourceExhausted => GrpcError::ResourceExhausted { details: detail },
-            tonic::Code::DeadlineExceeded => GrpcError::DeadlineExceeded { details: detail },
-            tonic::Code::Unavailable => GrpcError::Unavailable { details: detail },
-            tonic::Code::FailedPrecondition => GrpcError::FailedPrecondition { details: detail },
-            tonic::Code::Internal => GrpcError::Internal { details: detail },
-            _ => GrpcError::Unknown { details: detail },
+            tonic::Code::InvalidArgument => GrpcError::InvalidArgument {
+                details: Box::new(detail),
+            },
+            tonic::Code::Unauthenticated => GrpcError::Unauthenticated {
+                details: Box::new(detail),
+            },
+            tonic::Code::PermissionDenied => GrpcError::PermissionDenied {
+                details: Box::new(detail),
+            },
+            tonic::Code::Unimplemented => GrpcError::Unimplemented {
+                details: Box::new(detail),
+            },
+            tonic::Code::ResourceExhausted => GrpcError::ResourceExhausted {
+                details: Box::new(detail),
+            },
+            tonic::Code::DeadlineExceeded => GrpcError::DeadlineExceeded {
+                details: Box::new(detail),
+            },
+            tonic::Code::Unavailable => GrpcError::Unavailable {
+                details: Box::new(detail),
+            },
+            tonic::Code::FailedPrecondition => GrpcError::FailedPrecondition {
+                details: Box::new(detail),
+            },
+            tonic::Code::Internal => GrpcError::Internal {
+                details: Box::new(detail),
+            },
+            _ => GrpcError::Unknown {
+                details: Box::new(detail),
+            },
         }
     }
 }
@@ -307,10 +408,10 @@ impl From<crate::grpc_client::auth::AuthError> for GrpcError {
     fn from(_: crate::grpc_client::auth::AuthError) -> Self {
         // token 含非法字符无法注入 metadata → 请求根本到不了服务端, 语义上等同认证失败。
         GrpcError::Unauthenticated {
-            details: ErrorDetail {
+            details: Box::new(ErrorDetail {
                 code: "unauthenticated".to_string(),
                 ..Default::default()
-            },
+            }),
         }
     }
 }
@@ -320,10 +421,10 @@ impl From<crate::grpc_client::envelope::EnvelopeError> for GrpcError {
         // 信封构造失败是客户端本地错误 (序列化失败/未冻结 schema), 非服务端状态。
         // 映射 Unknown + code=envelope, 与响应侧信封校验失败同码 (见 client.rs query)。
         GrpcError::Unknown {
-            details: ErrorDetail {
+            details: Box::new(ErrorDetail {
                 code: "envelope".to_string(),
                 ..Default::default()
-            },
+            }),
         }
     }
 }
@@ -349,68 +450,68 @@ mod tests {
             (
                 Code::InvalidArgument,
                 GrpcError::InvalidArgument {
-                    details: detail_for(Code::InvalidArgument),
+                    details: Box::new(detail_for(Code::InvalidArgument)),
                 },
             ),
             (
                 Code::Unauthenticated,
                 GrpcError::Unauthenticated {
-                    details: detail_for(Code::Unauthenticated),
+                    details: Box::new(detail_for(Code::Unauthenticated)),
                 },
             ),
             (
                 Code::PermissionDenied,
                 GrpcError::PermissionDenied {
-                    details: detail_for(Code::PermissionDenied),
+                    details: Box::new(detail_for(Code::PermissionDenied)),
                 },
             ),
             (
                 Code::Unimplemented,
                 GrpcError::Unimplemented {
-                    details: detail_for(Code::Unimplemented),
+                    details: Box::new(detail_for(Code::Unimplemented)),
                 },
             ),
             (
                 Code::ResourceExhausted,
                 GrpcError::ResourceExhausted {
-                    details: detail_for(Code::ResourceExhausted),
+                    details: Box::new(detail_for(Code::ResourceExhausted)),
                 },
             ),
             (
                 Code::DeadlineExceeded,
                 GrpcError::DeadlineExceeded {
-                    details: detail_for(Code::DeadlineExceeded),
+                    details: Box::new(detail_for(Code::DeadlineExceeded)),
                 },
             ),
             (
                 Code::Unavailable,
                 GrpcError::Unavailable {
-                    details: detail_for(Code::Unavailable),
+                    details: Box::new(detail_for(Code::Unavailable)),
                 },
             ),
             (
                 Code::FailedPrecondition,
                 GrpcError::FailedPrecondition {
-                    details: detail_for(Code::FailedPrecondition),
+                    details: Box::new(detail_for(Code::FailedPrecondition)),
                 },
             ),
             (
                 Code::Internal,
                 GrpcError::Internal {
-                    details: detail_for(Code::Internal),
+                    details: Box::new(detail_for(Code::Internal)),
                 },
             ),
             // tonic 0.14: Code::Unknown.to_string() = "Unknown error" (grpc 规范英文描述)。
             (
                 Code::Unknown,
                 GrpcError::Unknown {
-                    details: ErrorDetail {
+                    details: Box::new(ErrorDetail {
                         code: "Unknown error".into(),
                         diagnostic_message: Some(Box::new(DiagnosticMessage::new(
                             "[redacted-unclassified-status]",
                         ))),
                         ..Default::default()
-                    },
+                    }),
                 },
             ),
         ];
@@ -431,6 +532,7 @@ mod tests {
             provider: "Tdx".to_string(),
             reason_code: "no_verified_batch".to_string(),
             retryable: true,
+            ..Default::default()
         };
         // Internal (Fetch 分支) + Unavailable (服务端不可达时无 detail) 两条路径。
         let encoded = detail.encode_to_vec();
@@ -546,6 +648,11 @@ mod tests {
             provider: "TEST_ONLY_SECRET_PROVIDER".to_string(),
             reason_code: "TEST_ONLY_SECRET_REASON".to_string(),
             retryable: true,
+            admission: i32::MAX,
+            evidence_code: "TEST_ONLY_SECRET=value".to_owned(),
+            evidence_field: "private/request/payload".to_owned(),
+            record_index: 42,
+            has_record_index: false,
         };
         let error = GrpcError::from(tonic::Status::with_details(
             Code::Internal,
@@ -563,6 +670,10 @@ mod tests {
         assert_eq!(detail.provider, None);
         assert_eq!(detail.reason_code.as_deref(), Some("internal"));
         assert_eq!(detail.retryable, Some(true));
+        assert_eq!(detail.admission, None);
+        assert_eq!(detail.evidence_code, None);
+        assert_eq!(detail.evidence_field, None);
+        assert_eq!(detail.record_index, None);
         assert!(!format!("{error:?}").contains("TEST_ONLY_SECRET"));
 
         let classified = crate::grpc_client::pb::magic::market::v1::ErrorDetail {
@@ -572,6 +683,7 @@ mod tests {
             provider: "Tdx".to_string(),
             reason_code: "invalid_evidence".to_string(),
             retryable: false,
+            ..Default::default()
         };
         let error = GrpcError::from(tonic::Status::with_details(
             Code::Internal,
@@ -590,6 +702,91 @@ mod tests {
         assert_eq!(detail.provider.as_deref(), Some("Tdx"));
         assert_eq!(detail.reason_code.as_deref(), Some("invalid_evidence"));
         assert_eq!(detail.retryable, Some(false));
+    }
+
+    #[test]
+    fn br238_external_v2_error_detail_preserves_structured_authority() {
+        use crate::grpc_client::pb::magic::market::v1::AdmissionState;
+
+        let wire = crate::grpc_client::pb::magic::market::v1::ErrorDetail {
+            request_id: "TEST_CODE_V2_ERROR_DETAIL".to_owned(),
+            operation: crate::grpc_client::pb::magic::market::v1::Operation::GlobalNews as i32,
+            provider: "Cailianpress".to_owned(),
+            reason_code: "external_query_rejected".to_owned(),
+            retryable: false,
+            admission: AdmissionState::Unadmitted as i32,
+            evidence_code: "record_evidence_conflict".to_owned(),
+            evidence_field: "records[2].identity".to_owned(),
+            record_index: 2,
+            has_record_index: true,
+        };
+        let error = GrpcError::from(tonic::Status::with_details(
+            Code::Internal,
+            "",
+            wire.encode_to_vec().into(),
+        ));
+        let detail = error.details();
+
+        assert_eq!(
+            detail.reason_code.as_deref(),
+            Some("external_query_rejected")
+        );
+        assert_eq!(detail.retryable, Some(false));
+        assert_eq!(detail.admission, Some(AdmissionState::Unadmitted));
+        assert_eq!(
+            detail
+                .evidence_code
+                .as_ref()
+                .map(SafeEvidenceIdentifier::as_str),
+            Some("record_evidence_conflict")
+        );
+        assert_eq!(
+            detail
+                .evidence_field
+                .as_ref()
+                .map(SafeEvidenceIdentifier::as_str),
+            Some("records[2].identity")
+        );
+        assert_eq!(detail.record_index, Some(2));
+        assert!(!format!("{error:?}").contains("records[2].identity"));
+    }
+
+    #[test]
+    fn br238_external_v2_error_detail_decodes_custom_binary_trailer() {
+        use crate::grpc_client::pb::magic::market::v1::AdmissionState;
+        use tonic::metadata::MetadataValue;
+
+        let wire = crate::grpc_client::pb::magic::market::v1::ErrorDetail {
+            request_id: "TEST_CODE_TRAILER_ERROR_DETAIL".to_owned(),
+            operation: crate::grpc_client::pb::magic::market::v1::Operation::InstrumentNews as i32,
+            provider: "Sina".to_owned(),
+            reason_code: "invalid_evidence".to_owned(),
+            retryable: false,
+            admission: AdmissionState::Unadmitted as i32,
+            evidence_code: "record_time_conflict".to_owned(),
+            evidence_field: "records[0].published_at".to_owned(),
+            record_index: 0,
+            has_record_index: true,
+        };
+        let mut status = tonic::Status::new(Code::FailedPrecondition, "rejected");
+        status.metadata_mut().insert_bin(
+            "magic-error-detail-bin",
+            MetadataValue::from_bytes(&wire.encode_to_vec()),
+        );
+
+        let error = GrpcError::from(status);
+        let detail = error.details();
+        assert_eq!(detail.provider.as_deref(), Some("Sina"));
+        assert_eq!(detail.reason_code.as_deref(), Some("invalid_evidence"));
+        assert_eq!(detail.admission, Some(AdmissionState::Unadmitted));
+        assert_eq!(
+            detail
+                .evidence_field
+                .as_ref()
+                .map(SafeEvidenceIdentifier::as_str),
+            Some("records[0].published_at")
+        );
+        assert_eq!(detail.record_index, Some(0));
     }
 
     #[test]

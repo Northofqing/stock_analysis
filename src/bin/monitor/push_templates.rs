@@ -21350,6 +21350,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn br246_unsafe_banner_names_missing_capabilities_without_unsafe_advice() {
+        let text = render_data_mode_reminder(
+            "10:23",
+            DataMode::Unsafe,
+            "Quote/MoneyFlow/News/OrderBook",
+            &[
+                "不做盘口承接判断".to_string(),
+                "禁出价格型建议".to_string(),
+                "仅保留风险类推送".to_string(),
+            ],
+            Some("关键能力恢复并通过 freshness 校验后"),
+        );
+
+        for required in [
+            "当前模式: Unsafe",
+            "受影响: Quote/MoneyFlow/News/OrderBook",
+            "· 不做盘口承接判断",
+            "· 禁出价格型建议",
+            "· 仅保留风险类推送",
+            "恢复预计: 关键能力恢复并通过 freshness 校验后",
+        ] {
+            assert!(text.contains(required), "BR-246 banner missing: {required}");
+        }
+        assert!(!text.contains("建议买入价"));
+        assert!(!text.contains("盘口承接良好"));
+        assert!(!text.contains("自动下单"));
+    }
+
     /// T-01 模板精确内容验证: 与 §14.1 T-01 一致
     #[test]
     fn t01_template_text_exact_format() {

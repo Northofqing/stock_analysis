@@ -5,12 +5,19 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
 use stock_analysis::data_gateway::instrument_identity::resolve_production_equity;
+use stock_analysis::data_gateway::GlobalNewsProvider;
 use stock_analysis::grpc_client::client::GrpcMarketClient;
 use stock_analysis::grpc_client::envelope::QueryResult;
+use stock_analysis::grpc_client::errors::GrpcError;
 use stock_analysis::grpc_client::pb::magic::market::v1::{AdmissionState, Capability, Operation};
 
-const DIRECT_EXTERNAL_OPERATIONS: &[Operation] =
-    &[Operation::SecurityMetadata, Operation::InstrumentNews];
+const DIRECT_EXTERNAL_OPERATIONS: &[Operation] = &[
+    Operation::SecurityMetadata,
+    Operation::GlobalNews,
+    Operation::InstrumentNews,
+];
+
+const DIRECT_GLOBAL_NEWS_PROVIDERS: [&str; 4] = ["Eastmoney", "Cailianpress", "Jin10", "ThePaper"];
 
 const STATIC_OPENING_CAPABILITY_FAMILIES: &[(&str, &[Operation])] = &[
     ("SecurityMetadata", &[Operation::SecurityMetadata]),
@@ -65,6 +72,38 @@ fn canonical_bundle_path(path: &Path) -> anyhow::Result<PathBuf> {
         .map_err(|_| anyhow::anyhow!("client-bundle directory is unavailable"))
 }
 
+fn structured_probe_error(context: &str, error: GrpcError) -> anyhow::Error {
+    let detail = error.details();
+    let provider = detail.provider.as_deref().unwrap_or("<absent>");
+    let reason_code = detail.reason_code.as_deref().unwrap_or("<absent>");
+    let retryable = detail
+        .retryable
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "<absent>".to_owned());
+    let admission = detail
+        .admission
+        .map(|value| format!("{value:?}"))
+        .unwrap_or_else(|| "<absent>".to_owned());
+    let evidence_code = detail
+        .evidence_code
+        .as_ref()
+        .map(|value| value.as_str())
+        .unwrap_or("<absent>");
+    let evidence_field = detail
+        .evidence_field
+        .as_ref()
+        .map(|value| value.as_str())
+        .unwrap_or("<absent>");
+    let record_index = detail
+        .record_index
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "<absent>".to_owned());
+    anyhow::anyhow!(
+        "{context}: grpc_code={} provider={provider} reason_code={reason_code} retryable={retryable} admission={admission} evidence_code={evidence_code} evidence_field={evidence_field} record_index={record_index}",
+        detail.code
+    )
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
@@ -117,34 +156,59 @@ async fn main() -> anyhow::Result<()> {
         .instrument()
         .clone();
 
-    let security = client
+    let mut direct_failures = Vec::new();
+    match client
         .query(
             Operation::SecurityMetadata,
             serde_json::json!({"instruments": [instrument.clone()]}),
         )
         .await
-        .map_err(|error| anyhow::anyhow!("SecurityMetadata canary failed: {error}"))?;
-    let security_summary =
-        validate_canary(&security, "magic.market.security_metadata", true, true)?;
-    println!(
-        "canary operation=SecurityMetadata admission=ADMITTED complete={} records={} schemas={} fields={} evidence=ok",
-        security.complete,
-        security.records.len(),
-        security_summary.schemas,
-        security_summary.fields,
-    );
-    let identities = stock_analysis::data_gateway::grpc_source::convert::security_identities(
-        std::slice::from_ref(&args.code),
-        &security,
-        chrono::Utc::now(),
-    )
-    .map_err(|error| anyhow::anyhow!("SecurityMetadata identity projection failed: {error}"))?;
-    println!(
-        "projection operation=SecurityIdentity records={} evidence=ok",
-        identities.records().len()
-    );
+    {
+        Ok(security) => {
+            match validate_canary(&security, "magic.market.security_metadata", 1, true, true) {
+                Ok(security_summary) => {
+                    println!(
+                        "canary operation=SecurityMetadata admission=ADMITTED complete={} records={} schemas={} fields={} evidence=ok",
+                        security.complete,
+                        security.records.len(),
+                        security_summary.schemas,
+                        security_summary.fields,
+                    );
+                    match stock_analysis::data_gateway::grpc_source::convert::security_identities(
+                        std::slice::from_ref(&args.code),
+                        &security,
+                        chrono::Utc::now(),
+                    ) {
+                        Ok(identities) => println!(
+                            "projection operation=SecurityIdentity records={} evidence=ok",
+                            identities.records().len()
+                        ),
+                        Err(_) => {
+                            eprintln!(
+                                "probe_failure stage=SecurityIdentity reason_code=projection_invalid"
+                            );
+                            direct_failures.push("SecurityIdentity");
+                        }
+                    }
+                }
+                Err(_) => {
+                    eprintln!("probe_failure stage=SecurityMetadata reason_code=contract_invalid");
+                    direct_failures.push("SecurityMetadataContract");
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!(
+                "{}",
+                structured_probe_error("SecurityMetadata canary failed", error)
+            );
+            direct_failures.push("SecurityMetadataRpc");
+        }
+    }
 
-    let news_end = chrono::Local::now().date_naive();
+    let news_captured_at = chrono::Local::now().fixed_offset();
+    let news_captured_through = news_captured_at.with_timezone(&chrono::Utc);
+    let news_end = news_captured_at.date_naive();
     let news_start = stock_analysis::calendar::prev_trading_day(news_end);
     let news = client
         .query(
@@ -153,44 +217,131 @@ async fn main() -> anyhow::Result<()> {
                 "instrument": instrument.clone(),
                 "start": news_start.format("%Y-%m-%d").to_string(),
                 "end": news_end.format("%Y-%m-%d").to_string(),
-                "limit": 1
+                "limit": 1,
+                "captured_through": news_captured_at.to_rfc3339()
             }),
         )
-        .await
-        .map_err(|error| anyhow::anyhow!("InstrumentNews canary failed: {error}"))?;
-    let news_summary = validate_canary(&news, "magic.market.news_item", false, false)?;
-    println!(
-        "canary operation=InstrumentNews admission=ADMITTED complete={} records={} schemas={} fields={} evidence=ok",
-        news.complete,
-        news.records.len(),
-        news_summary.schemas,
-        news_summary.fields,
-    );
-    let news_projection =
-        stock_analysis::data_gateway::grpc_source::convert::external_instrument_news_in_range_at(
-            &args.code,
-            &instrument,
-            news_start,
-            news_end,
-            1,
-            &news,
-            chrono::Utc::now(),
-        )
-        .map_err(|error| anyhow::anyhow!("InstrumentNews production projection failed: {error}"))?;
-    println!(
-        "projection operation=InstrumentNews records={} evidence=ok",
-        news_projection.records().len()
-    );
+        .await;
+    match news {
+        Ok(news) => match validate_canary(&news, "magic.market.news_item", 2, false, false) {
+            Ok(news_summary) => {
+                println!(
+                    "canary operation=InstrumentNews admission=ADMITTED complete={} records={} schemas={} fields={} evidence=ok",
+                    news.complete,
+                    news.records.len(),
+                    news_summary.schemas,
+                    news_summary.fields,
+                );
+                match stock_analysis::data_gateway::grpc_source::convert::external_instrument_news_in_range_at(
+                    &args.code,
+                    &instrument,
+                    &news,
+                    stock_analysis::data_gateway::grpc_source::convert::ExternalInstrumentNewsRequestContext::new(
+                        news_start,
+                        news_end,
+                        1,
+                        news_captured_through,
+                        chrono::Utc::now(),
+                    ),
+                ) {
+                    Ok(news_projection) => println!(
+                        "projection operation=InstrumentNews records={} evidence=ok",
+                        news_projection.records().len()
+                    ),
+                    Err(_) => {
+                        eprintln!(
+                            "probe_failure stage=InstrumentNewsProjection reason_code=projection_invalid"
+                        );
+                        direct_failures.push("InstrumentNewsProjection");
+                    }
+                }
+            }
+            Err(_) => {
+                eprintln!("probe_failure stage=InstrumentNews reason_code=contract_invalid");
+                direct_failures.push("InstrumentNewsContract");
+            }
+        },
+        Err(error) => {
+            eprintln!(
+                "{}",
+                structured_probe_error("InstrumentNews canary failed", error)
+            );
+            direct_failures.push("InstrumentNewsRpc");
+        }
+    }
+
+    let mut direct_global_news_failures = Vec::new();
+    for provider in DIRECT_GLOBAL_NEWS_PROVIDERS {
+        let Some(provider_kind) = GlobalNewsProvider::from_wire_name(provider) else {
+            anyhow::bail!("direct GlobalNews provider registry is invalid");
+        };
+        match client
+            .query(
+                Operation::GlobalNews,
+                serde_json::json!({"provider": provider, "limit": 1}),
+            )
+            .await
+        {
+            Ok(news) => {
+                match validate_canary(&news, "magic.market.news_item", 2, false, false) {
+                    Ok(summary) => match stock_analysis::data_gateway::grpc_source::convert::external_global_news(provider_kind, &news) {
+                        Ok(projection) => println!(
+                            "canary operation=GlobalNews provider={} admission=ADMITTED complete={} records={} schemas={} fields={} projected_records={} evidence=ok",
+                            provider,
+                            news.complete,
+                            news.records.len(),
+                            summary.schemas,
+                            summary.fields,
+                            projection.records().len(),
+                        ),
+                        Err(_) => {
+                            eprintln!(
+                                "probe_failure stage=GlobalNews-{}Projection reason_code=projection_invalid",
+                                provider
+                            );
+                            direct_global_news_failures.push(provider);
+                        }
+                    },
+                    Err(_) => {
+                        eprintln!(
+                            "probe_failure stage=GlobalNews-{} reason_code=contract_invalid",
+                            provider
+                        );
+                        direct_global_news_failures.push(provider);
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    structured_probe_error(
+                        &format!("GlobalNews-{provider} canary failed"),
+                        error,
+                    )
+                );
+                direct_global_news_failures.push(provider);
+            }
+        }
+    }
 
     // Exercise the same nine route canaries used by the production monitor.
     // The bundle path stays process-local and is never printed.
     std::env::set_var("GRPC_MARKET_CLIENT_BUNDLE", &bundle);
     std::env::set_var("DATA_GATEWAY_GRPC", "1");
     stock_analysis::data_gateway::grpc_source::reset_bridge();
-    let report = stock_analysis::data_gateway::grpc_source::external_static_opening_readiness()
-        .await
-        .map_err(|error| anyhow::anyhow!("production static readiness failed: {error}"))?;
-    for route in &report.routes {
+    let report =
+        stock_analysis::data_gateway::grpc_source::external_static_opening_diagnostics()
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "static diagnostics prerequisite failed: capability={} provider={:?} reason_code={} retryable={}",
+                    error.capability(),
+                    error.provider(),
+                    error.reason_code(),
+                    error.retryable()
+                )
+            })?;
+    for route in report.ready_routes() {
         println!(
             "static_route route={} profile={} provider={:?} source_present={} source_at_present={} observed_at_present={} batch_id_present={} records={}",
             route.route,
@@ -203,13 +354,47 @@ async fn main() -> anyhow::Result<()> {
             route.records,
         );
     }
+    for failure in report.failures() {
+        println!(
+            "static_route_failure route={} capability={} provider={:?} reason_code={} retryable={}",
+            failure.route,
+            failure.capability,
+            failure.provider,
+            failure.reason_code,
+            failure.retryable
+        );
+    }
+    let global_news_routes = report
+        .ready_routes()
+        .iter()
+        .filter(|route| route.route.starts_with("GlobalNews-"))
+        .count();
+    let opening_ready = direct_failures.is_empty() && report.production_ready();
     println!(
-        "opening_static_ready=true routes={}/9 global_news={}/4 route_names={} degraded_routes={}",
-        report.routes.len(),
-        report.global_news_routes(),
-        report.route_names(),
-        report.degraded_route_names()
+        "opening_static_ready={} attempts={}/9 ready_routes={} failed_routes={} global_news={}/4 direct_global_news_failures={} attempt_order={}",
+        opening_ready,
+        report.ready_routes().len() + report.failures().len(),
+        report.ready_routes().len(),
+        report.failed_route_names(),
+        global_news_routes,
+        if direct_global_news_failures.is_empty() {
+            "none".to_owned()
+        } else {
+            direct_global_news_failures.join(",")
+        },
+        report.attempted_route_names(),
     );
+    if !opening_ready {
+        anyhow::bail!(
+            "opening probe failed direct_stages={} static_failed_routes={}",
+            if direct_failures.is_empty() {
+                "none".to_owned()
+            } else {
+                direct_failures.join(",")
+            },
+            report.failed_route_names()
+        );
+    }
     Ok(())
 }
 
@@ -221,6 +406,7 @@ struct CanarySummary {
 fn validate_canary(
     result: &QueryResult,
     expected_schema: &str,
+    expected_version: u32,
     allow_partial: bool,
     require_source_at: bool,
 ) -> anyhow::Result<CanarySummary> {
@@ -255,7 +441,7 @@ fn validate_canary(
     let mut fields = BTreeSet::new();
     for record in &result.records {
         if record.schema != expected_schema
-            || record.schema_version != 1
+            || record.schema_version != expected_version
             || record.content_type != "application/json; charset=utf-8"
         {
             anyhow::bail!("canary record contract is unknown");
@@ -275,6 +461,7 @@ fn validate_canary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
     fn capability(
         operation: Operation,
         admission: AdmissionState,
@@ -349,10 +536,50 @@ mod tests {
     #[test]
     fn direct_external_contract_allow_list_is_closed() {
         assert!(external_contract_ready(Operation::SecurityMetadata));
+        assert!(external_contract_ready(Operation::GlobalNews));
         assert!(external_contract_ready(Operation::InstrumentNews));
         assert!(!external_contract_ready(Operation::RealtimeQuotes));
         assert!(!external_contract_ready(Operation::BoardConstituents));
         assert!(!external_contract_ready(Operation::UpperLimitPoolReview));
+    }
+
+    #[test]
+    fn direct_global_news_canary_set_is_closed_and_complete() {
+        assert_eq!(
+            DIRECT_GLOBAL_NEWS_PROVIDERS,
+            ["Eastmoney", "Cailianpress", "Jin10", "ThePaper"]
+        );
+    }
+
+    #[test]
+    fn br238_probe_error_exposes_only_safe_structured_authority() {
+        let wire = stock_analysis::grpc_client::pb::magic::market::v1::ErrorDetail {
+            request_id: "TEST_ONLY_PRIVATE_REQUEST".to_owned(),
+            operation: Operation::InstrumentNews as i32,
+            provider: "Sina".to_owned(),
+            reason_code: "invalid_evidence".to_owned(),
+            retryable: false,
+            admission: AdmissionState::Unadmitted as i32,
+            evidence_code: "record_time_conflict".to_owned(),
+            evidence_field: "records[0].published_at".to_owned(),
+            record_index: 0,
+            has_record_index: true,
+        };
+        let error =
+            stock_analysis::grpc_client::errors::GrpcError::from(tonic::Status::with_details(
+                tonic::Code::FailedPrecondition,
+                "TEST_ONLY_PRIVATE_STATUS",
+                wire.encode_to_vec().into(),
+            ));
+
+        let rendered = structured_probe_error("InstrumentNews canary failed", error).to_string();
+        assert!(rendered.contains("reason_code=invalid_evidence"));
+        assert!(rendered.contains("provider=Sina"));
+        assert!(rendered.contains("admission=Unadmitted"));
+        assert!(rendered.contains("evidence_code=record_time_conflict"));
+        assert!(rendered.contains("evidence_field=records[0].published_at"));
+        assert!(rendered.contains("record_index=0"));
+        assert!(!rendered.contains("TEST_ONLY_PRIVATE"));
     }
 
     #[test]
@@ -368,7 +595,7 @@ mod tests {
             source: "TEST_CODE_mtls_authority".to_string(),
             diagnostic_blocker: String::new(),
         };
-        let summary = validate_canary(&result, "magic.market.news_item", false, false)
+        let summary = validate_canary(&result, "magic.market.news_item", 2, false, false)
             .expect("InstrumentNews may truthfully omit provider source_at");
         assert_eq!(summary.schemas, "verified-empty");
     }

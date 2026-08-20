@@ -927,34 +927,68 @@ mod virtual_observation_tests {
     }
 
     #[test]
-    fn br170_position_chain_refresh_precedes_long_running_consumers() {
+    fn br246_position_chain_refresh_is_background_and_cannot_block_main_loops() {
         let source = include_str!("main.rs");
-        let service_branch = source
-            .rsplit_once("} else if !selection_cli.requires_service_enablement()")
-            .map(|(_, service_branch)| service_branch)
-            .expect("long-running service branch");
-        let refresh = service_branch
-            .find("refresh_startup_position_chains().await")
-            .expect("startup position-chain refresh");
-        let first_consumer = [
-            service_branch
-                .find("spawn_dryrun_reporter")
-                .expect("dry-run reporter"),
-            service_branch
-                .find("EventBus::global().subscribe")
-                .expect("event consumer"),
-            service_branch
-                .find("let main_loops = async")
-                .expect("main consumer loops"),
+        let production_test_boundary = ["mod tests_post_", "session_review_scheduler"].concat();
+        let production = source
+            .split(&production_test_boundary)
+            .next()
+            .expect("production source precedes post-session tests");
+        let blocking_refresh = [
+            "let position_chain_report = match refresh_startup_",
+            "position_chains().await",
         ]
-        .into_iter()
-        .min()
-        .expect("at least one long-running consumer");
+        .concat();
+        let background_spawn = ["tokio::spawn(position_chain_", "refresh_loop())"].concat();
 
-        assert!(
-            refresh < first_consumer,
-            "BR-170 startup refresh must finish before any long-running consumer starts"
+        assert!(!production.contains(&blocking_refresh));
+        assert_eq!(production.matches(&background_spawn).count(), 1);
+        assert!(production.contains("let main_loops = async"));
+    }
+
+    #[tokio::test]
+    async fn br246_position_chain_refresh_retries_after_explicit_failure() {
+        let (observed_tx, mut observed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let interval = position_chain_refresh_interval(std::time::Duration::from_millis(25));
+        let scheduler_calls = std::sync::Arc::clone(&calls);
+        let scheduler = tokio::spawn(run_position_chain_refresh_scheduler(interval, move || {
+            let observed_tx = observed_tx.clone();
+            let call = scheduler_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                observed_tx
+                    .send(call)
+                    .expect("TEST_CODE scheduler observer remains open");
+                if call == 0 {
+                    Err("TEST_CODE position-chain unavailable".to_owned())
+                } else {
+                    Ok(stock_analysis::data_gateway::PositionChainRefreshReport {
+                        outcomes: Vec::new(),
+                    })
+                }
+            }
+        }));
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), observed_rx.recv())
+                .await
+                .expect("TEST_CODE immediate refresh")
+                .expect("TEST_CODE immediate refresh value"),
+            0
         );
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), observed_rx.recv())
+                .await
+                .expect("TEST_CODE retry refresh")
+                .expect("TEST_CODE retry refresh value"),
+            1
+        );
+        assert!(!scheduler.is_finished());
+        scheduler.abort();
+        let error = scheduler
+            .await
+            .expect_err("intentionally infinite scheduler is aborted by the test");
+        assert!(error.is_cancelled());
     }
 
     #[tokio::test]
@@ -3549,6 +3583,11 @@ type JsonlWriterTask = tokio::task::JoinHandle<Result<(), stock_analysis::event:
 const JSONL_WRITER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const BACKGROUND_TASK_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const OPENING_READINESS_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const OPENING_STATIC_READINESS_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+const POSITION_CHAIN_REFRESH_PERIOD: std::time::Duration = std::time::Duration::from_secs(300);
+
+static OPENING_STATIC_LAST_BANNER: Lazy<std::sync::Mutex<Option<String>>> =
+    Lazy::new(|| std::sync::Mutex::new(None));
 
 fn opening_failure_banner(
     readiness_key: &'static str,
@@ -3576,6 +3615,7 @@ fn opening_static_failure_banner(reason_code: &str, retryable: bool, capability:
     opening_failure_banner("opening_static_ready", reason_code, retryable, capability)
 }
 
+#[cfg(test)]
 fn opening_static_success_banner(
     report: &stock_analysis::data_gateway::grpc_source::OpeningReadinessReport,
 ) -> String {
@@ -3586,6 +3626,123 @@ fn opening_static_success_banner(
         report.route_names(),
         report.degraded_route_names()
     )
+}
+
+fn opening_static_diagnostic_banner(
+    report: &stock_analysis::data_gateway::grpc_source::OpeningDiagnosticReport,
+) -> String {
+    let ready_routes = report.ready_routes().len();
+    let global_news = report
+        .ready_routes()
+        .iter()
+        .filter(|route| route.route.starts_with("GlobalNews-"))
+        .count();
+    if report.production_ready() {
+        format!(
+            "opening_static_ready=true routes={ready_routes}/9 global_news={global_news}/4 failed_routes={}",
+            report.failed_route_names()
+        )
+    } else {
+        format!(
+            "opening_static_ready=false reason_code=diagnostic_routes_unavailable retryable={} capability=OpeningReadiness routes={ready_routes}/9 global_news={global_news}/4 failed_routes={}",
+            report.failures().iter().any(|failure| failure.retryable),
+            report.failed_route_names()
+        )
+    }
+}
+
+fn log_opening_static_state_if_changed(banner: String, error: Option<&str>) {
+    let changed = match OPENING_STATIC_LAST_BANNER.lock() {
+        Ok(mut last_banner) => {
+            if last_banner.as_deref() == Some(banner.as_str()) {
+                false
+            } else {
+                *last_banner = Some(banner.clone());
+                true
+            }
+        }
+        Err(_) => {
+            log::error!(
+                "opening_static_ready=false reason_code=readiness_state_lock_poisoned retryable=true capability=OpeningReadiness"
+            );
+            return;
+        }
+    };
+    if !changed {
+        return;
+    }
+    match error {
+        Some(error) => log::warn!("{banner} detail={error}"),
+        None if banner.starts_with("opening_static_ready=true") => log::info!("{banner}"),
+        None => log::warn!("{banner}"),
+    }
+}
+
+fn opening_static_readiness_interval(period: std::time::Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
+}
+
+async fn run_opening_static_readiness_scheduler<F, Fut>(
+    mut interval: tokio::time::Interval,
+    mut evaluate: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    loop {
+        interval.tick().await;
+        evaluate().await;
+    }
+}
+
+async fn evaluate_opening_static_readiness_once() {
+    match stock_analysis::data_gateway::grpc_source::external_static_opening_diagnostics().await {
+        Ok(report) => {
+            match stock_analysis::data_gateway::grpc_source::audit_opening_diagnostic_report(
+                "OpeningStaticResident",
+                &report,
+            ) {
+                Ok(()) => log_opening_static_state_if_changed(
+                    opening_static_diagnostic_banner(&report),
+                    None,
+                ),
+                Err(error) => {
+                    let banner = opening_static_failure_banner(
+                        error.reason_code(),
+                        error.retryable(),
+                        error.capability(),
+                    );
+                    log_opening_static_state_if_changed(banner, Some(&error.to_string()));
+                }
+            }
+        }
+        Err(error) => {
+            let error =
+                match stock_analysis::data_gateway::grpc_source::audit_opening_readiness_failure(
+                    "OpeningStaticResident",
+                    &error,
+                ) {
+                    Ok(()) => error,
+                    Err(audit_error) => audit_error,
+                };
+            let banner = opening_static_failure_banner(
+                error.reason_code(),
+                error.retryable(),
+                error.capability(),
+            );
+            log_opening_static_state_if_changed(banner, Some(&error.to_string()));
+        }
+    }
+}
+
+async fn opening_static_readiness_loop() {
+    run_opening_static_readiness_scheduler(
+        opening_static_readiness_interval(OPENING_STATIC_READINESS_PERIOD),
+        evaluate_opening_static_readiness_once,
+    )
+    .await;
 }
 
 fn opening_live_failure_banner(reason_code: &str, retryable: bool, capability: &str) -> String {
@@ -3605,9 +3762,9 @@ fn live_opening_window(session: MarketSession) -> bool {
     )
 }
 
-/// BR-238 live readiness is operational observation only. It starts after the
-/// static gate and never delays P-01; every consumer still repeats its own
-/// exact five-second gate at the actual consumption clock.
+/// BR-238 live readiness is operational observation only. It runs beside the
+/// BR-246 static supervisor and never delays P-01; every consumer still repeats
+/// its own exact five-second gate at the actual consumption clock.
 async fn opening_live_readiness_loop() {
     let mut last_banner: Option<String> = None;
     loop {
@@ -3700,7 +3857,8 @@ async fn opening_live_readiness_loop() {
 mod tests_br238_opening_readiness {
     use super::{
         live_opening_window, opening_live_failure_banner, opening_live_success_banner,
-        opening_static_failure_banner, opening_static_success_banner,
+        opening_static_failure_banner, opening_static_readiness_interval,
+        opening_static_success_banner, run_opening_static_readiness_scheduler,
     };
     use stock_analysis::calendar::MarketSession;
     use stock_analysis::data_gateway::grpc_source::{
@@ -3760,21 +3918,84 @@ mod tests_br238_opening_readiness {
     }
 
     #[test]
-    fn br238_static_gate_precedes_producers_while_live_gate_is_background_only() {
+    fn br246_resident_producers_do_not_wait_for_static_data_readiness() {
         let source = include_str!("main.rs");
-        let gate = ["external_static_opening_", "readiness()"].concat();
-        let producer = ["strategy::v16_4::", "register_all()"].concat();
-        let gate_at = source.find(&gate).expect("opening gate exists");
-        let producer_at = source
-            .find(&producer)
-            .expect("producer registration exists");
-        assert!(gate_at < producer_at);
-        assert!(source.contains("if !test_mode && !review_mode"));
-        assert!(source.contains("tokio::spawn(opening_live_readiness_loop())"));
-        assert!(source.contains("opening_readiness=not_applicable mode=test"));
+        let production_test_boundary = ["mod tests_post_", "session_review_scheduler"].concat();
+        let production = source
+            .split(&production_test_boundary)
+            .next()
+            .expect("production source precedes post-session tests");
+        let blocking_call = ["external_static_opening_", "readiness().await"].concat();
+        let resident_spawn = ["tokio::spawn(opening_static_", "readiness_loop())"].concat();
+        assert!(!production.contains(&blocking_call));
+        assert_eq!(production.matches(&resident_spawn).count(), 1);
+        assert!(production.contains("p01::p01_scheduler_loop()"));
+        assert!(production.contains("monitor_loop()"));
+        assert!(production.contains("news_monitor_loop(selection_v2_enabled)"));
+        assert!(production.contains("data_mode_monitor_loop()"));
+        assert!(production.contains("opening_readiness=not_applicable mode=test"));
         let forbidden_keepalive = ["off_session_quote_", "keepalive_loop"].concat();
-        assert!(!source.contains(&forbidden_keepalive));
-        assert!(source.contains("OPENING_READINESS_RETRY_INTERVAL"));
+        assert!(!production.contains(&forbidden_keepalive));
+    }
+
+    #[tokio::test]
+    async fn br246_static_failures_do_not_complete_the_resident_scheduler() {
+        let (observed_tx, mut observed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let interval = opening_static_readiness_interval(std::time::Duration::from_millis(25));
+        let scheduler = tokio::spawn(run_opening_static_readiness_scheduler(
+            interval,
+            move || {
+                let observed_tx = observed_tx.clone();
+                async move {
+                    observed_tx
+                        .send(())
+                        .expect("TEST_CODE scheduler observer remains open");
+                }
+            },
+        ));
+
+        for expected_call in 1..=2 {
+            tokio::time::timeout(std::time::Duration::from_millis(250), observed_rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("TEST_CODE scheduler call {expected_call} timed out"))
+                .expect("TEST_CODE scheduler observer receives call");
+        }
+        assert!(
+            !scheduler.is_finished(),
+            "a modeled unavailable result must not complete the resident scheduler"
+        );
+        scheduler.abort();
+        let error = scheduler
+            .await
+            .expect_err("intentionally infinite scheduler is aborted by the test");
+        assert!(error.is_cancelled());
+    }
+
+    #[test]
+    fn br246_readiness_supervisor_has_no_delivery_sink_bypass() {
+        let source = include_str!("main.rs");
+        let evaluator = source
+            .split("async fn evaluate_opening_static_readiness_once()")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("async fn opening_static_readiness_loop()")
+                    .next()
+            })
+            .expect("BR-246 static evaluator source");
+
+        assert!(evaluator.contains("external_static_opening_diagnostics().await"));
+        assert!(evaluator.contains("audit_opening_diagnostic_report("));
+        for forbidden in [
+            "notify::",
+            "push_templates::",
+            "push_counted_with_binding",
+            "push_wechat",
+        ] {
+            assert!(
+                !evaluator.contains(forbidden),
+                "readiness observation must not bypass governed delivery via {forbidden}"
+            );
+        }
     }
 }
 
@@ -3935,7 +4156,7 @@ async fn refresh_startup_position_chains(
     let database = DatabaseManager::get();
     let positions = database
         .get_all_open_positions()
-        .map_err(|error| format!("BR-170 load open positions before consumers: {error}"))?;
+        .map_err(|error| format!("BR-170 load open positions for resident refresh: {error}"))?;
     let codes = positions
         .into_iter()
         .map(|position| position.code)
@@ -3945,11 +4166,11 @@ async fn refresh_startup_position_chains(
     for outcome in &report.outcomes {
         match &outcome.status {
             PositionChainRefreshStatus::Assigned { inserted } => log::info!(
-                "[startup][BR-170] code={} status=assigned inserted={inserted}",
+                "[position-chain][BR-170][BR-246] code={} status=assigned inserted={inserted}",
                 outcome.code
             ),
             PositionChainRefreshStatus::VerifiedEmpty { cleared_positions } => log::info!(
-                "[startup][BR-170] code={} status=verified_empty cleared_positions={cleared_positions}",
+                "[position-chain][BR-170][BR-246] code={} status=verified_empty cleared_positions={cleared_positions}",
                 outcome.code
             ),
             PositionChainRefreshStatus::Failed {
@@ -3957,7 +4178,7 @@ async fn refresh_startup_position_chains(
                 retryable,
                 message,
             } => log::error!(
-                "[startup][BR-170] code={} status=failed reason_code={} retryable={} error={}",
+                "[position-chain][BR-170][BR-246] code={} status=failed reason_code={} retryable={} error={}",
                 outcome.code,
                 reason_code,
                 retryable,
@@ -3966,7 +4187,7 @@ async fn refresh_startup_position_chains(
         }
     }
     log::info!(
-        "[startup][BR-170] 持仓产业链刷新完成 | requested={} assigned={} verified_empty={} failed={}",
+        "[position-chain][BR-170][BR-246] 持仓产业链刷新完成 | requested={} assigned={} verified_empty={} failed={}",
         codes.len(),
         report.assigned(),
         report.verified_empty(),
@@ -3974,6 +4195,46 @@ async fn refresh_startup_position_chains(
     );
 
     Ok(report)
+}
+
+fn position_chain_refresh_interval(period: std::time::Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
+}
+
+async fn run_position_chain_refresh_scheduler<F, Fut>(
+    mut interval: tokio::time::Interval,
+    mut refresh: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<
+        Output = Result<stock_analysis::data_gateway::PositionChainRefreshReport, String>,
+    >,
+{
+    loop {
+        interval.tick().await;
+        match refresh().await {
+            Ok(report) if report.has_failures() => log::warn!(
+                "[position-chain][BR-170][BR-246] refresh_degraded failed={} retry_after_secs={}",
+                report.failed(),
+                POSITION_CHAIN_REFRESH_PERIOD.as_secs()
+            ),
+            Ok(_) => {}
+            Err(error) => log::error!(
+                "[position-chain][BR-170][BR-246] refresh_unavailable retry_after_secs={} error={error}",
+                POSITION_CHAIN_REFRESH_PERIOD.as_secs()
+            ),
+        }
+    }
+}
+
+async fn position_chain_refresh_loop() {
+    run_position_chain_refresh_scheduler(
+        position_chain_refresh_interval(POSITION_CHAIN_REFRESH_PERIOD),
+        refresh_startup_position_chains,
+    )
+    .await;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4686,83 +4947,6 @@ async fn main() {
         log::info!("opening_readiness=not_applicable mode=review");
     }
 
-    // BR-238 / redlines 2.1, 2.2, 2.4, 2.7: normal production proves only the
-    // nine static/auth/contract routes before producer startup. Live quote,
-    // order-book and T0 evidence are observed by a later background task and
-    // cannot suppress the 09:00--09:15 P-01 scheduler.
-    if !test_mode && !review_mode {
-        loop {
-            match stock_analysis::data_gateway::grpc_source::external_static_opening_readiness()
-                .await
-            {
-                Ok(report) => {
-                    if let Err(error) =
-                        stock_analysis::data_gateway::grpc_source::audit_opening_readiness_report(
-                            "OpeningStatic",
-                            &report,
-                        )
-                    {
-                        let banner = opening_static_failure_banner(
-                            error.reason_code(),
-                            error.retryable(),
-                            error.capability(),
-                        );
-                        log::warn!(
-                            "{} retry_after_secs={} detail={}",
-                            banner,
-                            OPENING_READINESS_RETRY_INTERVAL.as_secs(),
-                            error
-                        );
-                        tokio::time::sleep(OPENING_READINESS_RETRY_INTERVAL).await;
-                        continue;
-                    }
-                    for route in &report.routes {
-                        log::info!(
-                            "[opening-readiness][BR-238] route={} profile={} provider={:?} \
-                             source={} source_at={} observed_at={} batch_id={} records={}",
-                            route.route,
-                            route.profile,
-                            route.provider,
-                            route.source,
-                            route.source_at.as_deref().unwrap_or("absent"),
-                            route.observed_at,
-                            route.batch_id,
-                            route.records
-                        );
-                    }
-                    log::info!("{}", opening_static_success_banner(&report));
-                    break;
-                }
-                Err(error) => {
-                    let error = match stock_analysis::data_gateway::grpc_source::audit_opening_readiness_failure(
-                        "OpeningStatic",
-                        &error,
-                    ) {
-                        Ok(()) => error,
-                        Err(audit_error) => audit_error,
-                    };
-                    let banner = opening_static_failure_banner(
-                        error.reason_code(),
-                        error.retryable(),
-                        error.capability(),
-                    );
-                    if error.retryable() {
-                        log::warn!(
-                            "{} retry_after_secs={} detail={}",
-                            banner,
-                            OPENING_READINESS_RETRY_INTERVAL.as_secs(),
-                            error
-                        );
-                        tokio::time::sleep(OPENING_READINESS_RETRY_INTERVAL).await;
-                    } else {
-                        log::error!("{} detail={}", banner, error);
-                        exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 2).await;
-                    }
-                }
-            }
-        }
-    }
-
     stock_analysis::strategy::v16_4::register_all();
 
     let startup_health = health::health_check().await;
@@ -5017,20 +5201,6 @@ async fn main() {
         );
         exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 0).await;
     } else {
-        let position_chain_report = match refresh_startup_position_chains().await {
-            Ok(report) => report,
-            Err(error) => {
-                log::error!("[startup][BR-170] 持仓产业链预刷新失败: {error}");
-                exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 2).await;
-            }
-        };
-        if position_chain_report.has_failures() {
-            log::warn!(
-                "[startup][BR-170] {} 个持仓产业链刷新失败；成功项已提交，失败项保持空值或既有可验证链接，候选建仓仍按代码 fail-closed",
-                position_chain_report.failed()
-            );
-        }
-
         let dryrun_reporter = dryrun_report::spawn_dryrun_reporter(1_800);
 
         // 订阅者示例：独立任务消费告警/扫描事件并写入审计日志，
@@ -5162,12 +5332,16 @@ async fn main() {
 
         let post_close_news = tokio::spawn(post_close_news_scheduler());
         let post_session_review = spawn_post_session_review_scheduler(selection_v2_enabled);
+        let position_chain_refresh = tokio::spawn(position_chain_refresh_loop());
+        let opening_static_readiness = tokio::spawn(opening_static_readiness_loop());
         let opening_live_readiness = tokio::spawn(opening_live_readiness_loop());
         let background_tasks = vec![
             ("dryrun_reporter", dryrun_reporter),
             ("monitor_event_consumer", event_consumer),
             ("post_close_news", post_close_news),
             ("post_session_review", post_session_review),
+            ("position_chain_refresh", position_chain_refresh),
+            ("opening_static_readiness", opening_static_readiness),
             ("opening_live_readiness", opening_live_readiness),
         ];
 
