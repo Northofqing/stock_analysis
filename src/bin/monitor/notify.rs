@@ -108,6 +108,8 @@ pub enum PushKind {
     PaperSell,
     /// 持仓快照过期提醒 (任务#3, ℹ️ 每日1次, 默认降级) [MVP-1]
     SnapshotStale,
+    /// 虚拟盘绩效归因日推 (交付物 A, 每日 1 次, 默认出声) [2026-08-20]
+    AttributionDaily,
     /// 尾盘决策 (T-12, ⚡ 1次/日) [MVP-4]
     CloseCall,
     // ============= v12 §14.2 盘后 PushKind =============
@@ -335,6 +337,8 @@ impl PushKind {
             PushKind::ReviewBacktest => PushLevel::Info,
             // R-13 昨日关注回填: 参考级 (非交易建议, 仅行情核对)
             PushKind::WatchlistTracking => PushLevel::Info,
+            // 交付物 A (2026-08-20): 虚拟盘绩效归因日推 — 参考级 (默认出声)
+            PushKind::AttributionDaily => PushLevel::Info,
             // ℹ️参考 (降级 + ForbiddenOps/PaperTrade)
             _ => PushLevel::Info,
         }
@@ -444,6 +448,8 @@ impl PushKind {
             PushKind::NewsFlashAggregated => Some(3600), // 1h/窗口 (code=窗口标签)
             // R-12 盘后回测: 1次/日 (60 min 冷却, 防重复调度触发)
             PushKind::ReviewBacktest => Some(3600),
+            // 交付物 A (2026-08-20): 虚拟盘归因日推 — 无冷却 (调用方按日去重, 15:05 单点)
+            PushKind::AttributionDaily => None,
             _ => Some(1800), // 默认 30min
         }
     }
@@ -468,6 +474,8 @@ impl PushKind {
             | StPriceLimitChanged
             | BlockTradeIntradayConfirm
             | BlockTradePriceRange => CooldownScope::PerTicket,
+            // 交付物 A (2026-08-20): 虚拟盘归因日推 — 全局冷却域 (每日 1 次, 无 code 维度)
+            AttributionDaily => CooldownScope::Global,
             _ => CooldownScope::Global,
         }
     }
@@ -515,6 +523,8 @@ impl PushKind {
             PushKind::PositionReview => "持仓复盘",
             PushKind::ReviewBacktest => "15min回测",
             PushKind::WatchlistTracking => "昨日关注回填",
+            // 交付物 A (2026-08-20): 虚拟盘绩效归因日推
+            PushKind::AttributionDaily => "虚拟盘归因",
             // v13 新增
             PushKind::PreopenNewsHot => "盘前热点",
             PushKind::IntradayMarket => "盘中轮动",
@@ -868,6 +878,17 @@ pub const DISPATCH_TABLE: &[(PushKind, DispatchRow)] = &[
             cooldown_scope: CooldownScope::Global,
             label: "昨日关注回填",
             stable_template_id: "t1_watchlist_tracking_v1",
+        },
+    ),
+    // ============== 交付物 A: 虚拟盘绩效归因日推 (2026-08-20) ==============
+    (
+        PushKind::AttributionDaily,
+        DispatchRow {
+            level: PushLevel::Info,
+            cooldown_secs: None,
+            cooldown_scope: CooldownScope::Global,
+            label: "虚拟盘归因",
+            stable_template_id: "attribution_daily_v1",
         },
     ),
 ];
@@ -6710,11 +6731,11 @@ mod tests {
     // ============== v17.x: DISPATCH_TABLE 19 rows 完整性 (BR-234 + 任务#3 + R-12 + R-13) ==============
 
     #[test]
-    fn dispatch_table_size_is_nineteen() {
+    fn dispatch_table_size_is_twenty() {
         assert_eq!(
             DISPATCH_TABLE.len(),
-            19,
-            "v17.x DISPATCH_TABLE 应 19 rows (3 v17.6 + 6 v17.7 + 6 v17.8 + 1 BR-234 + 1 #3 + 1 R-12 + 1 R-13)"
+            20,
+            "v17.x DISPATCH_TABLE 应 20 rows (3 v17.6 + 6 v17.7 + 6 v17.8 + 1 BR-234 + 1 #3 + 1 R-12 + 1 R-13 + 1 交付物A)"
         );
     }
 

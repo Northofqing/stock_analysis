@@ -1173,6 +1173,8 @@ fn map_push_kind(kind: PushKind) -> (SignalSource, &'static str, Severity) {
         PushKind::SectorTier => (SectorRotation, "sector_tier", Severity::Normal),
         PushKind::CapitalVerify => (HoldingHealth, "capital_verify", Severity::High),
         PushKind::WeeklySOP => (HoldingHealth, "weekly_sop", Severity::Normal),
+        // 交付物 A (2026-08-20): 虚拟盘绩效归因日推 — 非交易建议, 与 R-12/R-13 同档
+        PushKind::AttributionDaily => (HoldingHealth, "attribution_daily", Severity::Normal),
         PushKind::StockPick => (HoldingHealth, "stock_pick", Severity::Normal),
         PushKind::IndustryChain => (SectorRotation, "industry_chain", Severity::Normal),
         PushKind::TurnoverTop => (SectorRotation, "turnover_top", Severity::Normal),

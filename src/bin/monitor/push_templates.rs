@@ -1203,6 +1203,11 @@ pub fn render_daily_report(date: &str, items: &[HoldingDailyPlan<'_>]) -> String
     out
 }
 
+/// 虚拟盘归因摘要 (交付物 A; 文本由 performance::report::render_summary 生成)
+pub fn render_attribution_daily(summary: &str) -> String {
+    summary.to_string()
+}
+
 /// R-02 盘面走向
 #[derive(Debug)]
 pub struct MarketReview<'a> {

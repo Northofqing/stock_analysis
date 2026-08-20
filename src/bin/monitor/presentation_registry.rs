@@ -39,7 +39,7 @@ const fn descriptor(
     }
 }
 
-const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 57] = [
+const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 58] = [
     descriptor(
         "T-01-account-mode",
         PushKind::AccountMode,
@@ -79,6 +79,14 @@ const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 57
         PushKind::HoldingEvent,
         "intraday_alert_dispatcher",
         "render_intraday_alert",
+    ),
+    descriptor(
+        // 交付物 A (2026-08-20): 虚拟盘绩效归因日推 — 15:05 归因闭环推送,
+        // 文本由 performance::report::render_summary 生成并经透传模板进入投递链
+        "A-12-attribution-daily",
+        PushKind::AttributionDaily,
+        "attribution_daily_dispatcher",
+        "render_attribution_daily",
     ),
     descriptor(
         "T-05-t0-advice",
@@ -388,7 +396,7 @@ const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 57
     ),
 ];
 
-pub(super) fn descriptors() -> &'static [ProductionPresentationDescriptor; 57] {
+pub(super) fn descriptors() -> &'static [ProductionPresentationDescriptor; 58] {
     &PRODUCTION_PRESENTATION_DESCRIPTORS
 }
 
