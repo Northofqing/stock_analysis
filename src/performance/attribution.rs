@@ -409,6 +409,69 @@ pub fn compute_window(
     Ok(WindowAttribution { days, end, families })
 }
 
+/// 建表 DDL (spec §4.3). const 供单测文本断言 (Step 1 测试依赖此 const).
+const DDL_SQL: &str = "CREATE TABLE IF NOT EXISTS paper_attribution_daily (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            date            TEXT NOT NULL,
+            signal_family   TEXT NOT NULL,
+            realized_trades INTEGER NOT NULL DEFAULT 0,
+            realized_pnl    REAL NOT NULL DEFAULT 0.0,
+            open_lots       INTEGER NOT NULL DEFAULT 0,
+            unrealized_pnl  REAL NOT NULL DEFAULT 0.0,
+            total_pnl       REAL NOT NULL DEFAULT 0.0,
+            wins            INTEGER NOT NULL DEFAULT 0,
+            losses          INTEGER NOT NULL DEFAULT 0,
+            win_rate        REAL,
+            unvalued_lots   INTEGER NOT NULL DEFAULT 0,
+            suspicious_lots INTEGER NOT NULL DEFAULT 0,
+            created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(date, signal_family)
+        )";
+
+/// 插入 SQL. const 供单测文本断言 (Step 1 测试依赖此 const).
+const PERSIST_SQL: &str = "INSERT OR REPLACE INTO paper_attribution_daily \
+             (date, signal_family, realized_trades, realized_pnl, open_lots, unrealized_pnl, \
+              total_pnl, wins, losses, win_rate, unvalued_lots, suspicious_lots) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+/// 建表 (spec §4.3 DDL). 幂等, 与 paper_performance_snapshot 并行, 不 UPDATE 历史行.
+pub fn ensure_attribution_table() -> Result<(), String> {
+    let mut conn = crate::database::DatabaseManager::get()
+        .get_conn()
+        .map_err(|e| format!("DB: {e}"))?;
+    diesel::sql_query(DDL_SQL)
+        .execute(&mut conn)
+        .map_err(|e| format!("create paper_attribution_daily: {e}"))?;
+    Ok(())
+}
+
+/// 写入当日归因 (INSERT OR REPLACE, 当日重算幂等).
+pub fn persist_daily(daily: &DailyAttribution) -> Result<(), String> {
+    ensure_attribution_table()?;
+    let mut conn = crate::database::DatabaseManager::get()
+        .get_conn()
+        .map_err(|e| format!("DB: {e}"))?;
+    let date_str = daily.date.format("%Y-%m-%d").to_string();
+    for row in &daily.families {
+        diesel::sql_query(PERSIST_SQL)
+            .bind::<diesel::sql_types::Text, _>(&date_str)
+            .bind::<diesel::sql_types::Text, _>(row.family.as_str())
+            .bind::<diesel::sql_types::BigInt, _>(row.realized_trades)
+            .bind::<diesel::sql_types::Double, _>(row.realized_pnl)
+            .bind::<diesel::sql_types::BigInt, _>(row.open_lots)
+            .bind::<diesel::sql_types::Double, _>(row.unrealized_pnl)
+            .bind::<diesel::sql_types::Double, _>(row.total_pnl)
+            .bind::<diesel::sql_types::BigInt, _>(row.wins)
+            .bind::<diesel::sql_types::BigInt, _>(row.losses)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(row.win_rate)
+            .bind::<diesel::sql_types::BigInt, _>(row.unvalued_lots)
+            .bind::<diesel::sql_types::BigInt, _>(row.suspicious_lots)
+            .execute(&mut conn)
+            .map_err(|e| format!("insert paper_attribution_daily: {e}"))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,5 +649,23 @@ mod tests {
         let families = aggregate_families(&attributions, &open, &HashMap::new());
         let fund = families.iter().find(|f| f.family == SignalFamily::PostCloseFundInflow).expect("fund family");
         assert_eq!(fund.suspicious_lots, 1);
+    }
+
+    #[test]
+    fn ddl_const_declares_unique_per_date_and_family() {
+        // 当日重算幂等锚点 (spec §4.3): UNIQUE(date, signal_family) + INSERT OR REPLACE
+        assert!(DDL_SQL.contains("CREATE TABLE IF NOT EXISTS paper_attribution_daily"));
+        assert!(DDL_SQL.contains("UNIQUE(date, signal_family)"));
+        assert!(DDL_SQL.contains("unvalued_lots"));
+        assert!(DDL_SQL.contains("suspicious_lots"));
+    }
+
+    #[test]
+    fn persist_const_has_12_bind_slots_matching_12_columns() {
+        // INSERT OR REPLACE (当日幂等, 与 snapshot 同模式) + 12 列 ↔ 12 个绑定占位
+        assert!(PERSIST_SQL.contains("INSERT OR REPLACE INTO paper_attribution_daily"));
+        let cols = PERSIST_SQL.split('(').nth(2).expect("column list").split(',').count();
+        let binds = PERSIST_SQL.matches('?').count();
+        assert_eq!(cols, binds, "columns ({cols}) must equal bind slots ({binds})");
     }
 }
