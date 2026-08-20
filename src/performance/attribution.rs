@@ -5,7 +5,9 @@
 //! 归因口径: 已实现 (FIFO 带 lot 归属) + 未实现浮盈 (未平仓 lot × 收盘价).
 
 use chrono::NaiveDate;
+use diesel::RunQueryDsl;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// 入场信号族 (归因维度). spec §4.1.
 /// Ord 派生供 Task 3 的 BTreeMap 聚合排序使用.
@@ -267,6 +269,146 @@ pub fn fifo_match(
     Ok((realized, open))
 }
 
+/// 单族聚合 (spec §4.2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FamilyAggregate {
+    pub family: SignalFamily,
+    pub realized_trades: i64,
+    pub realized_pnl: f64,
+    pub open_lots: i64,
+    pub unrealized_pnl: f64,
+    pub total_pnl: f64,
+    pub wins: i64,
+    pub losses: i64,
+    pub win_rate: Option<f64>,
+    pub unvalued_lots: i64,
+    pub suspicious_lots: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DailyAttribution {
+    pub date: NaiveDate,
+    pub families: Vec<FamilyAggregate>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowAttribution {
+    pub days: u32,
+    pub end: NaiveDate,
+    pub families: Vec<FamilyAggregate>,
+}
+
+/// 聚合: 已实现 (卖出归因) + 未实现浮盈 (未平仓 lot × close).
+/// 缺失 close → unvalued_lots 计数, 浮盈记 0 (不静默: 计数与报告明示).
+pub fn aggregate_families(
+    attributions: &[TradeAttribution],
+    open: &[OpenLot],
+    prices: &HashMap<String, f64>,
+) -> Vec<FamilyAggregate> {
+    use std::collections::BTreeMap;
+    // 注意: rustc 1.95 拒绝「闭包返回指向捕获变量的引用」(captured variable cannot
+    // escape FnMut closure body), 故用嵌套 fn 而非闭包实现 entry 复用.
+    fn ensure<'a>(
+        map: &'a mut BTreeMap<SignalFamily, FamilyAggregate>,
+        family: SignalFamily,
+    ) -> &'a mut FamilyAggregate {
+        map.entry(family).or_insert_with(|| FamilyAggregate {
+            family,
+            realized_trades: 0,
+            realized_pnl: 0.0,
+            open_lots: 0,
+            unrealized_pnl: 0.0,
+            total_pnl: 0.0,
+            wins: 0,
+            losses: 0,
+            win_rate: None,
+            unvalued_lots: 0,
+            suspicious_lots: 0,
+        })
+    }
+    let mut map: BTreeMap<SignalFamily, FamilyAggregate> = BTreeMap::new();
+    for a in attributions {
+        let row = ensure(&mut map, a.entry_family);
+        row.realized_trades += 1;
+        row.realized_pnl += a.pnl;
+        if a.pnl > 0.0 {
+            row.wins += 1;
+        } else {
+            row.losses += 1;
+        }
+        if a.suspicious {
+            row.suspicious_lots += 1;
+        }
+    }
+    for lot in open {
+        let row = ensure(&mut map, lot.family);
+        row.open_lots += 1;
+        if lot.suspicious {
+            row.suspicious_lots += 1;
+        }
+        match prices.get(&lot.code).copied().filter(|p| p.is_finite() && *p > 0.0) {
+            Some(close) => row.unrealized_pnl += (close - lot.cost_price) * lot.remaining_qty as f64,
+            None => row.unvalued_lots += 1,
+        }
+    }
+    let mut families: Vec<FamilyAggregate> = map.into_values().collect();
+    for row in &mut families {
+        row.total_pnl = row.realized_pnl + row.unrealized_pnl;
+        row.win_rate = (row.realized_trades > 0)
+            .then_some(row.wins as f64 / row.realized_trades as f64);
+    }
+    families.sort_by_key(|f| f.family);
+    families
+}
+
+const FILLS_UNTIL_SQL: &str = "SELECT id, code, direction, fill_price, quantity, \
+     datetime(ts, 'localtime') AS local_ts, plan_id, virtual_reason \
+     FROM paper_trades \
+     WHERE datetime(ts, 'localtime') < datetime(?, '+1 day') AND status = 'Filled' \
+     ORDER BY datetime(ts, 'localtime') ASC, id ASC";
+
+/// 查询截至日期 (含) 的全部 Filled 成交 (与 snapshot.rs 查询同构, 多带 plan_id/virtual_reason).
+pub fn query_fills_until(date: NaiveDate) -> Result<Vec<AttributionFillRow>, String> {
+    let mut conn = crate::database::DatabaseManager::get()
+        .get_conn()
+        .map_err(|e| format!("DB: {e}"))?;
+    let date_str = date.format("%Y-%m-%d").to_string();
+    diesel::sql_query(FILLS_UNTIL_SQL)
+        .bind::<diesel::sql_types::Text, _>(&date_str)
+        .load::<AttributionFillRow>(&mut conn)
+        .map_err(|e| format!("query paper_trades attribution: {e}"))
+}
+
+/// 当日归因: 已实现 (当日卖出 FIFO 全局匹配) + 浮盈 (截至当日未平仓 × close).
+pub fn compute_daily(
+    date: NaiveDate,
+    prices: &HashMap<String, f64>,
+) -> Result<DailyAttribution, String> {
+    let rows = query_fills_until(date)?;
+    let (attributions, open) = fifo_match(&rows, date)?;
+    let families = aggregate_families(&attributions, &open, prices);
+    Ok(DailyAttribution { date, families })
+}
+
+/// 30 天滚动窗口 (spec §4.5): 已实现 = 窗口内卖出 (FIFO 对历史全量 lot), 浮盈 = 期末未平仓 × close.
+pub fn compute_window(
+    end: NaiveDate,
+    days: u32,
+    prices: &HashMap<String, f64>,
+) -> Result<WindowAttribution, String> {
+    let rows = query_fills_until(end)?;
+    let (all_attributions, open) = fifo_match(&rows, end)?;
+    let start = end
+        .checked_sub_signed(chrono::Duration::days(i64::from(days)))
+        .unwrap_or(NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch"));
+    let windowed: Vec<TradeAttribution> = all_attributions
+        .into_iter()
+        .filter(|a| a.sell_date >= start) // sell_date 字段由 Task 2 的 fifo_match 填充
+        .collect();
+    let families = aggregate_families(&windowed, &open, prices);
+    Ok(WindowAttribution { days, end, families })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,5 +524,67 @@ mod tests {
         assert_eq!(attributions.len(), 1); // 只归当日卖出
         assert_eq!(attributions[0].pnl, 200.0);
         assert_eq!(open.len(), 0);
+    }
+
+    #[test]
+    fn aggregate_families_sums_realized_and_unrealized() {
+        let target = NaiveDate::from_ymd_opt(2026, 7, 18).expect("valid date");
+        let rows = vec![
+            fill(1, "TEST_CODE_600000", "buy", 10.0, 100, "2026-07-17 10:00:00", "news-1", "NewsCatalyst"),
+            fill(2, "TEST_CODE_600000", "buy", 12.0, 200, "2026-07-18 09:31:00", "fund-2", "MainNetInflow"),
+            fill(3, "TEST_CODE_600000", "sell", 15.0, 200, "2026-07-18 14:00:00", "sell-3", "BR-234四大铁律卖出:结构止损"),
+        ];
+        let (attributions, open) = fifo_match(&rows, target).expect("valid FIFO fills");
+        // T2 review Minor-2 (carried): 锁 open lot 契约 — plan_id/family 贯通 fifo_match → 聚合
+        assert_eq!(open[0].plan_id, "fund-2");
+        assert_eq!(open[0].family, SignalFamily::MainNetInflow);
+        let mut prices = HashMap::new();
+        prices.insert("TEST_CODE_600000".to_string(), 16.0);
+        let families = aggregate_families(&attributions, &open, &prices);
+
+        let news = families.iter().find(|f| f.family == SignalFamily::NewsCatalyst).expect("news family");
+        assert_eq!(news.realized_pnl, 500.0);
+        assert_eq!(news.realized_trades, 1);
+        assert_eq!(news.wins, 1);
+        assert_eq!(news.losses, 0);
+        assert_eq!(news.win_rate, Some(1.0));
+        assert_eq!(news.unrealized_pnl, 0.0);
+        assert_eq!(news.open_lots, 0);
+
+        let fund = families.iter().find(|f| f.family == SignalFamily::MainNetInflow).expect("fund family");
+        assert_eq!(fund.realized_pnl, 300.0);
+        // 剩余 100 股 × (16.0 - 12.0) = +400 浮盈
+        assert_eq!(fund.unrealized_pnl, 400.0);
+        assert_eq!(fund.open_lots, 1);
+        assert_eq!(fund.total_pnl, 700.0);
+    }
+
+    #[test]
+    fn missing_close_price_counts_unvalued_not_silent() {
+        let target = NaiveDate::from_ymd_opt(2026, 7, 18).expect("valid date");
+        let rows = vec![
+            fill(1, "TEST_CODE_600000", "buy", 10.0, 100, "2026-07-17 10:00:00", "news-1", "NewsCatalyst"),
+            fill(2, "TEST_CODE_600000", "buy", 12.0, 100, "2026-07-18 09:31:00", "news-2", "NewsCatalyst"),
+        ];
+        let (attributions, open) = fifo_match(&rows, target).expect("valid FIFO fills");
+        let prices = HashMap::new(); // 无任何收盘价
+        let families = aggregate_families(&attributions, &open, &prices);
+        let news = families.iter().find(|f| f.family == SignalFamily::NewsCatalyst).expect("news family");
+        assert_eq!(news.open_lots, 2);
+        assert_eq!(news.unvalued_lots, 2);
+        assert_eq!(news.unrealized_pnl, 0.0); // 未估值不填零假装, 但计数出声
+        assert_eq!(news.suspicious_lots, 0);
+    }
+
+    #[test]
+    fn suspicious_lots_are_counted_per_family() {
+        let target = NaiveDate::from_ymd_opt(2026, 7, 18).expect("valid date");
+        let rows = vec![
+            fill(1, "TEST_CODE_600000", "buy", 10.0, 100, "2026-07-17 10:00:00", "p1", "盘后资金净流入Top10 收盘价买入: 主力+25.32亿 量比0.0 涨幅+858.9%"),
+        ];
+        let (attributions, open) = fifo_match(&rows, target).expect("valid FIFO fills");
+        let families = aggregate_families(&attributions, &open, &HashMap::new());
+        let fund = families.iter().find(|f| f.family == SignalFamily::PostCloseFundInflow).expect("fund family");
+        assert_eq!(fund.suspicious_lots, 1);
     }
 }
