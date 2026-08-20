@@ -123,7 +123,7 @@ pub struct TradeAttribution {
     pub entry_family: SignalFamily,
     pub exit_reason: String,
     pub suspicious: bool,
-    /// 卖出发生日期 (Task 3 compute_window 按此过滤窗口).
+    /// 卖出发生日期 (窗口归因以 emit_from 谓词按此判断是否入窗).
     pub sell_date: NaiveDate,
 }
 
@@ -138,14 +138,30 @@ pub struct OpenLot {
     pub cost_price: f64,
 }
 
-/// FIFO 匹配: 语义与 performance/snapshot.rs::realized_pnls_for_date 逐条对齐
+/// FIFO 匹配 (当日语义): 语义与 performance/snapshot.rs::realized_pnls_for_date 逐条对齐
 /// (id>0, code 非空, price>0 finite, qty>0 且 %100==0, 时间序校验, oversell 拒绝,
 /// 非 finite PnL 拒绝), 区别: 匹配时携带入场 lot 的 plan_id/family/suspicious 归属.
 /// 跨 lot 匹配时 PnL 按数量比例拆分 (每段生成一条 TradeAttribution).
+/// 发射谓词 = 仅当日卖出 (fifo_match_from 的 emit_from=None 特例, compute_daily 语义).
 /// 返回 (当日已实现归因列表, 未平仓 lot 列表).
 pub fn fifo_match(
     rows: &[AttributionFillRow],
     target_date: NaiveDate,
+) -> Result<(Vec<TradeAttribution>, Vec<OpenLot>), String> {
+    fifo_match_from(rows, target_date, None)
+}
+
+/// FIFO 匹配核心 (发射谓词参数化, CRIT-1 修复):
+/// - `emit_from = None`    → 仅发射 `timestamp.date() == target_date` 的卖出
+///   (与旧 fifo_match 行为逐字节一致; fifo_match 2-arg wrapper 保持公开 API 稳定,
+///   compute_daily 与既有日级测试不受影响).
+/// - `emit_from = Some(d)` → 发射 `timestamp.date() >= d` 的全部卖出 (compute_window
+///   30 天窗口语义; FIFO 匹配仍对全部 rows 执行 — 窗口前买入照常被窗口卖出消耗).
+/// 校验 (身份/时间戳/越界/无序/oversell 等) 与 emit_from 无关, 全部 rows 一视同仁.
+pub fn fifo_match_from(
+    rows: &[AttributionFillRow],
+    target_date: NaiveDate,
+    emit_from: Option<NaiveDate>,
 ) -> Result<(Vec<TradeAttribution>, Vec<OpenLot>), String> {
     use std::collections::{HashMap, VecDeque};
 
@@ -220,7 +236,12 @@ pub fn fifo_match(
                     })?;
                     let matched = remaining.min(lot.remaining);
                     let portion_pnl = (price - lot.price) * f64::from(matched);
-                    if timestamp.date() == target_date {
+                    let date = timestamp.date();
+                    let emit = match emit_from {
+                        None => date == target_date,
+                        Some(from) => date >= from,
+                    };
+                    if emit {
                         realized.push(TradeAttribution {
                             sell_id: row.id,
                             code: row.code.clone(),
@@ -229,7 +250,7 @@ pub fn fifo_match(
                             entry_family: lot.family,
                             exit_reason: row.virtual_reason.clone(),
                             suspicious: lot.suspicious,
-                            sell_date: timestamp.date(),
+                            sell_date: date,
                         });
                     }
                     remaining -= matched;
@@ -283,12 +304,17 @@ pub struct FamilyAggregate {
     pub win_rate: Option<f64>,
     pub unvalued_lots: i64,
     pub suspicious_lots: i64,
+    /// 可疑 lot 已实现影响金额 (spec §4.4.2; realized-only — 未平仓可疑 lot 只计入
+    /// suspicious_lots, 金额待其卖出实现后归入).
+    pub suspicious_pnl: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DailyAttribution {
     pub date: NaiveDate,
     pub families: Vec<FamilyAggregate>,
+    /// Top 盈亏交易明细 (当日, spec §4.4 item 5): 盈利 (pnl>0) ≤5 在前, 亏损 (pnl<0) ≤5 在后.
+    pub top_trades: Vec<TradeAttribution>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -300,6 +326,8 @@ pub struct WindowAttribution {
 
 /// 聚合: 已实现 (卖出归因) + 未实现浮盈 (未平仓 lot × close).
 /// 缺失 close → unvalued_lots 计数, 浮盈记 0 (不静默: 计数与报告明示).
+/// suspicious_pnl 仅计已实现 (可疑卖出归因的 pnl 合计; 未平仓可疑 lot 只计
+/// suspicious_lots 计数, 金额待卖出后归入).
 pub fn aggregate_families(
     attributions: &[TradeAttribution],
     open: &[OpenLot],
@@ -324,6 +352,7 @@ pub fn aggregate_families(
             win_rate: None,
             unvalued_lots: 0,
             suspicious_lots: 0,
+            suspicious_pnl: 0.0,
         })
     }
     let mut map: BTreeMap<SignalFamily, FamilyAggregate> = BTreeMap::new();
@@ -338,6 +367,7 @@ pub fn aggregate_families(
         }
         if a.suspicious {
             row.suspicious_lots += 1;
+            row.suspicious_pnl += a.pnl; // realized-only 影响金额 (spec §4.4.2)
         }
     }
     for lot in open {
@@ -379,6 +409,18 @@ pub fn query_fills_until(date: NaiveDate) -> Result<Vec<AttributionFillRow>, Str
         .map_err(|e| format!("query paper_trades attribution: {e}"))
 }
 
+/// Top 盈亏交易明细 (spec §4.4 item 5, 当日): 盈利 (pnl>0) 按 pnl 降序 ≤5 在前,
+/// 亏损 (pnl<0) 按 pnl 升序 (最负在前) ≤5 在后; pnl==0 不入列.
+fn top_trades(attributions: &[TradeAttribution]) -> Vec<TradeAttribution> {
+    let mut winners: Vec<&TradeAttribution> = attributions.iter().filter(|a| a.pnl > 0.0).collect();
+    winners.sort_by(|a, b| b.pnl.partial_cmp(&a.pnl).unwrap_or(std::cmp::Ordering::Equal));
+    let mut losers: Vec<&TradeAttribution> = attributions.iter().filter(|a| a.pnl < 0.0).collect();
+    losers.sort_by(|a, b| a.pnl.partial_cmp(&b.pnl).unwrap_or(std::cmp::Ordering::Equal));
+    winners.truncate(5);
+    losers.truncate(5);
+    winners.into_iter().chain(losers).cloned().collect()
+}
+
 /// 当日归因: 已实现 (当日卖出 FIFO 全局匹配) + 浮盈 (截至当日未平仓 × close).
 pub fn compute_daily(
     date: NaiveDate,
@@ -386,26 +428,36 @@ pub fn compute_daily(
 ) -> Result<DailyAttribution, String> {
     let rows = query_fills_until(date)?;
     let (attributions, open) = fifo_match(&rows, date)?;
+    let top_trades = top_trades(&attributions);
     let families = aggregate_families(&attributions, &open, prices);
-    Ok(DailyAttribution { date, families })
+    Ok(DailyAttribution { date, families, top_trades })
 }
 
-/// 30 天滚动窗口 (spec §4.5): 已实现 = 窗口内卖出 (FIFO 对历史全量 lot), 浮盈 = 期末未平仓 × close.
+/// 30 天滚动窗口 (spec §4.5): 已实现 = 窗口内每日卖出 FIFO 全局匹配 (对历史全部 lot),
+/// 浮盈 = 期末未平仓 × close. 窗口 = end−(days−1) ..= end 共 days 个自然日.
 pub fn compute_window(
     end: NaiveDate,
     days: u32,
     prices: &HashMap<String, f64>,
 ) -> Result<WindowAttribution, String> {
     let rows = query_fills_until(end)?;
-    let (all_attributions, open) = fifo_match(&rows, end)?;
+    aggregate_window(end, days, &rows, prices)
+}
+
+/// 窗口聚合纯函数 (不触 DB, 供单测直测): start = end − (days−1) 天 (含首尾共 days 个
+/// 自然日); FIFO 匹配跑全部 rows (窗口前买入照常被窗口卖出消耗), 发射谓词 =
+/// `timestamp.date() >= start` (CRIT-1: 已实现必须为窗口累计, 非单日).
+pub fn aggregate_window(
+    end: NaiveDate,
+    days: u32,
+    rows: &[AttributionFillRow],
+    prices: &HashMap<String, f64>,
+) -> Result<WindowAttribution, String> {
     let start = end
-        .checked_sub_signed(chrono::Duration::days(i64::from(days)))
+        .checked_sub_signed(chrono::Duration::days(i64::from(days) - 1))
         .unwrap_or(NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch"));
-    let windowed: Vec<TradeAttribution> = all_attributions
-        .into_iter()
-        .filter(|a| a.sell_date >= start) // sell_date 字段由 Task 2 的 fifo_match 填充
-        .collect();
-    let families = aggregate_families(&windowed, &open, prices);
+    let (attributions, open) = fifo_match_from(rows, end, Some(start))?;
+    let families = aggregate_families(&attributions, &open, prices);
     Ok(WindowAttribution { days, end, families })
 }
 
@@ -587,6 +639,138 @@ mod tests {
         assert_eq!(attributions.len(), 1); // 只归当日卖出
         assert_eq!(attributions[0].pnl, 200.0);
         assert_eq!(open.len(), 0);
+    }
+
+    #[test]
+    fn window_realized_is_cumulative_across_days() {
+        // CRIT-1 回归锚点: 窗口已实现 = 窗口内每日卖出累计, 非仅末日单日.
+        let end = NaiveDate::from_ymd_opt(2026, 7, 20).expect("valid date");
+        let rows = vec![
+            fill(1, "TEST_CODE_600000", "buy", 10.0, 200, "2026-07-16 10:00:00", "p1", "NewsCatalyst"),
+            fill(2, "TEST_CODE_600000", "sell", 11.0, 100, "2026-07-17 14:00:00", "s1", "BR-234四大铁律卖出"),
+            fill(3, "TEST_CODE_600000", "sell", 12.0, 100, "2026-07-20 14:00:00", "s2", "BR-234四大铁律卖出"),
+        ];
+        let window = aggregate_window(end, 30, &rows, &HashMap::new()).expect("valid window");
+        let window_realized: f64 = window.families.iter().map(|f| f.realized_pnl).sum();
+        // 7/17 卖出 (11.0-10.0)*100 = +100; 7/20 卖出 (12.0-10.0)*100 = +200 → 累计 +300
+        assert_eq!(window_realized, 300.0);
+        assert_eq!(window.families.iter().map(|f| f.realized_trades).sum::<i64>(), 2);
+        // 对照: 当日口径只含 7/20 卖出
+        let (daily_attributions, _) = fifo_match(&rows, end).expect("valid FIFO fills");
+        assert_eq!(daily_attributions.len(), 1);
+        assert_eq!(daily_attributions[0].pnl, 200.0);
+    }
+
+    #[test]
+    fn window_includes_exactly_days() {
+        // 30 自然日含首尾: start = end − 29; end−29 卖出入窗, end−30 卖出出窗 (off-by-one 锚点).
+        let end = NaiveDate::from_ymd_opt(2026, 7, 20).expect("valid date");
+        let rows = vec![
+            fill(1, "TEST_CODE_600000", "buy", 10.0, 300, "2026-06-01 10:00:00", "p1", "NewsCatalyst"),
+            fill(2, "TEST_CODE_600000", "sell", 11.0, 100, "2026-06-20 14:00:00", "s1", "BR-234四大铁律卖出"), // end−30 → 出窗
+            fill(3, "TEST_CODE_600000", "sell", 12.0, 100, "2026-06-21 14:00:00", "s2", "BR-234四大铁律卖出"), // end−29 → 入窗
+        ];
+        let window = aggregate_window(end, 30, &rows, &HashMap::new()).expect("valid window");
+        let window_realized: f64 = window.families.iter().map(|f| f.realized_pnl).sum();
+        // 只有 6/21 卖出 (12.0-10.0)*100 = +200; 若 6/20 误入窗则 +300 (与旧 31 天 off-by-one 同形)
+        assert_eq!(window_realized, 200.0);
+        assert_eq!(window.families.iter().map(|f| f.realized_trades).sum::<i64>(), 1);
+    }
+
+    #[test]
+    fn daily_emission_unchanged_with_emit_from_none() {
+        // CRIT-1 守卫: fifo_match 2-arg wrapper 与显式 None 均只发射当日卖出 (日级契约不变).
+        let target = NaiveDate::from_ymd_opt(2026, 7, 18).expect("valid date");
+        let rows = vec![
+            fill(1, "TEST_CODE_600000", "buy", 10.0, 200, "2026-07-16 10:00:00", "p1", "NewsCatalyst"),
+            fill(2, "TEST_CODE_600000", "sell", 11.0, 100, "2026-07-17 14:00:00", "s1", "BR-234四大铁律卖出"),
+            fill(3, "TEST_CODE_600000", "sell", 12.0, 100, "2026-07-18 14:00:00", "s2", "BR-234四大铁律卖出"),
+        ];
+        let (attributions, _) = fifo_match(&rows, target).expect("valid FIFO fills");
+        assert_eq!(attributions.len(), 1);
+        assert_eq!(attributions[0].pnl, 200.0);
+        assert_eq!(attributions[0].sell_date, target);
+        let (from_none, _) = fifo_match_from(&rows, target, None).expect("valid FIFO fills");
+        assert_eq!(from_none, attributions); // 显式 None 与 wrapper 逐字节一致
+    }
+
+    #[test]
+    fn fifo_rejects_invalid_identity_timestamp_and_late_fills() {
+        let target = NaiveDate::from_ymd_opt(2026, 7, 18).expect("valid date");
+        let err = fifo_match(&[fill(0, "TEST_CODE_600000", "buy", 10.0, 100, "2026-07-18 10:00:00", "p1", "NewsCatalyst")], target)
+            .expect_err("id<=0 must fail");
+        assert!(err.contains("identity invalid"));
+        let empty_code = fill(1, "", "buy", 10.0, 100, "2026-07-18 10:00:00", "p1", "NewsCatalyst");
+        let err = fifo_match(&[empty_code], target).expect_err("empty code must fail");
+        assert!(err.contains("identity invalid"));
+        let bad_ts = fill(1, "TEST_CODE_600000", "buy", 10.0, 100, "not-a-timestamp", "p1", "NewsCatalyst");
+        let err = fifo_match(&[bad_ts], target).expect_err("bad timestamp must fail");
+        assert!(err.contains("timestamp invalid"));
+        let late = fill(1, "TEST_CODE_600000", "buy", 10.0, 100, "2026-07-19 10:00:00", "p1", "NewsCatalyst");
+        let err = fifo_match(&[late], target).expect_err("later than settlement must fail");
+        assert!(err.contains("later than settlement date"));
+    }
+
+    #[test]
+    fn fifo_rejects_unordered_fills_invalid_direction_and_quantity() {
+        let target = NaiveDate::from_ymd_opt(2026, 7, 18).expect("valid date");
+        let unordered = vec![
+            fill(2, "TEST_CODE_600000", "buy", 10.0, 100, "2026-07-18 10:00:00", "p1", "NewsCatalyst"),
+            fill(1, "TEST_CODE_600000", "buy", 10.0, 100, "2026-07-18 09:00:00", "p2", "NewsCatalyst"),
+        ];
+        let err = fifo_match(&unordered, target).expect_err("unordered fills must fail");
+        assert!(err.contains("not ordered"));
+        let bad_dir = fill(1, "TEST_CODE_600000", "hold", 10.0, 100, "2026-07-18 10:00:00", "p1", "NewsCatalyst");
+        let err = fifo_match(&[bad_dir], target).expect_err("invalid direction must fail");
+        assert!(err.contains("direction invalid"));
+        let bad_qty = fill(1, "TEST_CODE_600000", "buy", 10.0, 150, "2026-07-18 10:00:00", "p1", "NewsCatalyst");
+        let err = fifo_match(&[bad_qty], target).expect_err("invalid quantity must fail");
+        assert!(err.contains("quantity invalid"));
+    }
+
+    #[test]
+    fn fifo_rejects_sell_without_matched_buys() {
+        let target = NaiveDate::from_ymd_opt(2026, 7, 18).expect("valid date");
+        let sell_only = vec![fill(1, "TEST_CODE_600000", "sell", 11.0, 100, "2026-07-18 14:00:00", "s1", "BR-234四大铁律卖出")];
+        let err = fifo_match(&sell_only, target).expect_err("sell without buys must fail");
+        assert!(err.contains("no matched buy lots"));
+        // 注: non-finite PnL 分支 (fifo_match 末尾) 在 price/quantity 前置校验下不可达,
+        // 不做直测 — 与 snapshot.rs 移植副本同理由.
+    }
+
+    #[test]
+    fn top_trades_keeps_five_per_side_ordered() {
+        let target = NaiveDate::from_ymd_opt(2026, 7, 18).expect("valid date");
+        // 6 盈利 (+10..+60) + 6 亏损 (-10..-60), 各截断到 ≤5
+        let mut attributions = Vec::new();
+        for i in 1..=6 {
+            attributions.push(TradeAttribution {
+                sell_id: i,
+                code: format!("TEST_CODE_60000{i}"),
+                pnl: (i * 10) as f64,
+                entry_plan_id: format!("w{i}"),
+                entry_family: SignalFamily::NewsCatalyst,
+                exit_reason: "BR-234四大铁律卖出".to_string(),
+                suspicious: false,
+                sell_date: target,
+            });
+            attributions.push(TradeAttribution {
+                sell_id: 10 + i,
+                code: format!("TEST_CODE_6000{i}0"),
+                pnl: -(i * 10) as f64,
+                entry_plan_id: format!("l{i}"),
+                entry_family: SignalFamily::ExitByRule,
+                exit_reason: "BR-234四大铁律卖出".to_string(),
+                suspicious: false,
+                sell_date: target,
+            });
+        }
+        let top = top_trades(&attributions);
+        assert_eq!(top.len(), 10); // 盈利 5 + 亏损 5
+        assert_eq!(top[0].pnl, 60.0); // 盈利降序在前
+        assert_eq!(top[4].pnl, 20.0);
+        assert_eq!(top[5].pnl, -60.0); // 亏损升序 (最负在前) 在后
+        assert_eq!(top[9].pnl, -20.0);
     }
 
     #[test]
