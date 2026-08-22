@@ -375,28 +375,6 @@ pub fn render_data_mode(
     out
 }
 
-/// BR-135: periodic reminder for one continuously confirmed Unsafe state.
-pub fn render_data_mode_reminder(
-    hhmm: &str,
-    current: DataMode,
-    missing_items: &str,
-    restrictions: &[String],
-    eta: Option<&str>,
-) -> String {
-    let mut out = format!(
-        "📡 数据状态持续异常（{}）\n当前模式: {}\n受影响: {}\n输出限制:",
-        hhmm,
-        current.label(),
-        missing_items,
-    );
-    append_data_mode_restrictions(&mut out, restrictions);
-    let reminder_minutes =
-        stock_analysis::monitor::data_mode::PERSISTENT_UNSAFE_REMINDER_INTERVAL.as_secs() / 60;
-    out.push_str(&format!("\n提醒频率: 每{}分钟", reminder_minutes));
-    append_data_mode_eta_footer(&mut out, eta);
-    out
-}
-
 /// 持仓建议动作倾向
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Intent {
@@ -14201,7 +14179,6 @@ pub async fn push_candidate_invalidated(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DataModeDispatchReason {
     Transition,
-    PersistentUnsafeReminder,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14222,7 +14199,7 @@ const DATA_MODE_STABLE_WINDOW: std::time::Duration = std::time::Duration::from_s
 fn data_mode_notification_plan(
     input: &stock_analysis::monitor::data_mode::DataHealthInput,
     prev: Option<stock_analysis::monitor::data_mode::DataMode>,
-    persistent_reminder_due: bool,
+    unsafe_fact_changed: bool,
     pending_stable_since: Option<std::time::Instant>,
 ) -> DataModeNotificationPlan {
     use stock_analysis::monitor::data_mode::{evaluate as dm_evaluate, DataMode as LibDM};
@@ -14250,11 +14227,13 @@ fn data_mode_notification_plan(
                 DataModeNotificationPlan::EstablishSilently
             }
         }
-        (Some(LibDM::Unsafe), LibDM::Unsafe) if persistent_reminder_due => {
+        // BR-135: a changed stable missing-capability fingerprint is a new
+        // status fact, not a periodic reminder. Reuse the governed T-02 path.
+        (Some(LibDM::Unsafe), LibDM::Unsafe) if unsafe_fact_changed => {
             DataModeNotificationPlan::Dispatch {
                 previous: Some(LibDM::Unsafe),
                 current: LibDM::Unsafe,
-                reason: DataModeDispatchReason::PersistentUnsafeReminder,
+                reason: DataModeDispatchReason::Transition,
             }
         }
         _ => DataModeNotificationPlan::EstablishSilently,
@@ -14279,7 +14258,7 @@ impl ModeDispatchResult {
 pub async fn push_data_mode_change(
     input: &stock_analysis::monitor::data_mode::DataHealthInput,
     prev: Option<stock_analysis::monitor::data_mode::DataMode>,
-    persistent_reminder_due: bool,
+    unsafe_fact_changed: bool,
     banner: Option<&BannerCtx>,
     pending_stable_since: Option<std::time::Instant>,
 ) -> Result<ModeDispatchResult, String> {
@@ -14287,21 +14266,17 @@ pub async fn push_data_mode_change(
 
     let health = dm_evaluate(input, prev);
 
-    let (prev_mode, new_mode, dispatch_reason) = match data_mode_notification_plan(
-        input,
-        prev,
-        persistent_reminder_due,
-        pending_stable_since,
-    ) {
-        DataModeNotificationPlan::EstablishSilently => {
-            return Ok(ModeDispatchResult::EstablishedSilently);
-        }
-        DataModeNotificationPlan::Dispatch {
-            previous,
-            current,
-            reason,
-        } => (previous, current, reason),
-    };
+    let (prev_mode, new_mode, dispatch_reason) =
+        match data_mode_notification_plan(input, prev, unsafe_fact_changed, pending_stable_since) {
+            DataModeNotificationPlan::EstablishSilently => {
+                return Ok(ModeDispatchResult::EstablishedSilently);
+            }
+            DataModeNotificationPlan::Dispatch {
+                previous,
+                current,
+                reason,
+            } => (previous, current, reason),
+        };
 
     // 1. 拼 T-02 (复用 §14.1 T-02 模板)
     let hhmm = chrono::Local::now().format("%H:%M").to_string();
@@ -14355,18 +14330,6 @@ pub async fn push_data_mode_change(
             &restrictions,
             health.eta.as_deref(),
         ),
-        DataModeDispatchReason::PersistentUnsafeReminder => {
-            log::warn!(
-                "[DataMode][BR-135] persistent Unsafe reminder due; governed delivery starting"
-            );
-            render_data_mode_reminder(
-                &hhmm,
-                new_tmpl,
-                &missing_str,
-                &restrictions,
-                health.eta.as_deref(),
-            )
-        }
     };
     text.push_str(&mode_text);
 
@@ -14381,15 +14344,6 @@ pub async fn push_data_mode_change(
             banner,
             text
         ),
-        DataModeDispatchReason::PersistentUnsafeReminder => dispatch_registered_outcome!(
-            "T-02-data-mode-reminder",
-            crate::notify::PushKind::DataMode,
-            "data_mode_scheduler",
-            "render_data_mode_reminder",
-            "",
-            banner,
-            text
-        ),
     };
 
     if !matches!(outcome, crate::notify::PushOutcome::Pushed) {
@@ -14399,9 +14353,6 @@ pub async fn push_data_mode_change(
                 prev_mode,
                 new_mode
             ),
-            DataModeDispatchReason::PersistentUnsafeReminder => {
-                log::warn!("[DataMode][BR-135] persistent Unsafe reminder unconfirmed; remains due")
-            }
         }
     }
 
@@ -15347,7 +15298,7 @@ pub fn build_test_template_catalog(
     };
     use stock_analysis::monitor::detector::{AlertCategory, AlertDetail, AlertEvent, AlertLevel};
 
-    const EXPECTED_CATALOG_TOTAL: usize = 57;
+    const EXPECTED_CATALOG_TOTAL: usize = 56;
     let banner = BannerCtx {
         account_mode: AccountMode::Normal,
         total_pos: Some(0),
@@ -15385,16 +15336,6 @@ pub fn build_test_template_catalog(
             "TEST_CODE OrderBook",
             &restrictions,
             Some("下一完整批次"),
-        ),
-    );
-    push(
-        "T-02-data-mode-reminder",
-        render_data_mode_reminder(
-            hhmm,
-            DataMode::Unsafe,
-            "TEST_CODE Quote",
-            &restrictions,
-            None,
         ),
     );
     push(
@@ -21134,7 +21075,7 @@ mod tests {
     }
 
     #[test]
-    fn br135_same_unsafe_dispatches_only_when_reminder_is_due() {
+    fn br135_same_unsafe_dispatches_only_when_stable_facts_change() {
         use stock_analysis::monitor::data_mode::{DataHealthInput, DataMode as LibDM};
 
         assert!(matches!(
@@ -21146,7 +21087,7 @@ mod tests {
             ),
             DataModeNotificationPlan::Dispatch {
                 current: LibDM::Unsafe,
-                reason: DataModeDispatchReason::PersistentUnsafeReminder,
+                reason: DataModeDispatchReason::Transition,
                 ..
             }
         ));
@@ -21163,7 +21104,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(cooldown_memo)]
-    async fn br135_due_unsafe_reminder_uses_governed_delivery() {
+    async fn br135_changed_unsafe_facts_use_governed_status_delivery() {
         let _e2e_guard = E2E_MUTEX.lock().await;
         let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         init_test_db();
@@ -21185,9 +21126,21 @@ mod tests {
         assert_eq!(
             push_data_mode_change(&input, Some(LibDM::Unsafe), true, Some(&banner), None)
                 .await
-                .expect("due persistent Unsafe reminder must use the governed path"),
+                .expect("changed Unsafe facts must use the governed status path"),
             ModeDispatchResult::Delivery(crate::notify::PushOutcome::Pushed)
         );
+    }
+
+    #[test]
+    fn br135_catalog_retires_external_persistent_unsafe_reminder() {
+        let catalog = build_test_template_catalog("2026-08-22", "10:23")
+            .expect("complete TEST_CODE renderer catalog");
+        assert!(catalog
+            .iter()
+            .any(|preview| preview.template_id == "T-02-data-mode"));
+        assert!(!catalog
+            .iter()
+            .any(|preview| preview.template_id == "T-02-data-mode-reminder"));
     }
 
     #[tokio::test]
@@ -21346,34 +21299,26 @@ mod tests {
     }
 
     #[test]
-    fn br135_persistent_unsafe_reminder_text_is_explicit() {
-        let text = render_data_mode_reminder(
+    fn br135_status_text_does_not_claim_a_periodic_external_reminder() {
+        let text = render_data_mode(
             "10:23",
+            Some(DataMode::Unsafe),
             DataMode::Unsafe,
             "Quote/News",
             &["禁出价格型建议".to_string(), "仅保留风险类推送".to_string()],
             Some("Quote 恢复后"),
         );
-        for required in [
-            "📡 数据状态持续异常（10:23）",
-            "当前模式: Unsafe",
-            "受影响: Quote/News",
-            "· 禁出价格型建议",
-            "· 仅保留风险类推送",
-            "恢复预计: Quote 恢复后",
-            "提醒频率: 每30分钟",
-        ] {
-            assert!(
-                text.contains(required),
-                "BR-135 reminder missing: {required}"
-            );
-        }
+        assert!(text.contains("📡 数据状态变更（10:23）"));
+        assert!(text.contains("Unsafe → Unsafe"));
+        assert!(!text.contains("数据状态持续异常"));
+        assert!(!text.contains("提醒频率"));
     }
 
     #[test]
     fn br246_unsafe_banner_names_missing_capabilities_without_unsafe_advice() {
-        let text = render_data_mode_reminder(
+        let text = render_data_mode(
             "10:23",
+            None,
             DataMode::Unsafe,
             "Quote/MoneyFlow/News/OrderBook",
             &[
@@ -21385,7 +21330,7 @@ mod tests {
         );
 
         for required in [
-            "当前模式: Unsafe",
+            "未建立 → Unsafe",
             "受影响: Quote/MoneyFlow/News/OrderBook",
             "· 不做盘口承接判断",
             "· 禁出价格型建议",

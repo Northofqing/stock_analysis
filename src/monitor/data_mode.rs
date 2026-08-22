@@ -359,50 +359,116 @@ impl DataMode {
     }
 }
 
-/// BR-135: a confirmed persistent-Unsafe reminder remains quiet for 30 minutes.
+/// BR-135: an unchanged, confirmed Unsafe event is audited every 30 minutes.
 pub const PERSISTENT_UNSAFE_REMINDER_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
-/// Tracks only authoritative DataMode delivery confirmation.
+pub const UNSAFE_EVENT_FINGERPRINT_VERSION: &str = "data_mode_unsafe_v1";
+pub const UNSAFE_HEARTBEAT_AUDIT_KIND: &str = "data_mode_unsafe_heartbeat_v1";
+pub const UNSAFE_HEARTBEAT_AUDIT_OUTCOME: &str = "Deduped";
+pub const UNSAFE_HEARTBEAT_AUDIT_CHANNEL: &str = "internal_audit";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PersistentUnsafeAction {
+    ExternalStatus { fingerprint: String },
+    InternalHeartbeat { fingerprint: String },
+    Silent,
+}
+
+#[derive(Clone, Debug)]
+struct ConfirmedUnsafeEvent {
+    fingerprint: String,
+    confirmed_at: Instant,
+}
+
+/// Returns a stable identity for the source-backed Unsafe facts.
 ///
-/// The caller supplies the monotonic clock and records a result only after the
-/// real sink and every mandatory audit have succeeded.
-#[derive(Debug, Default)]
+/// Dynamic age, wall time and ETA are intentionally excluded. The fixed
+/// `Capability::ALL` order also makes caller ordering and duplicates inert.
+pub fn unsafe_event_fingerprint(missing: &[Capability]) -> String {
+    let ordered_missing = Capability::ALL
+        .iter()
+        .filter(|capability| missing.contains(capability))
+        .map(|capability| capability.label())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{UNSAFE_EVENT_FINGERPRINT_VERSION}|{}|{ordered_missing}",
+        DataMode::Unsafe.label()
+    )
+}
+
+/// Tracks only authoritative external delivery or immutable heartbeat confirmation.
+///
+/// The caller supplies the monotonic clock and records a result only after its
+/// matching side effect and every mandatory audit have succeeded.
+#[derive(Clone, Debug, Default)]
 pub struct PersistentUnsafeReminder {
-    last_confirmed_at: Option<Instant>,
+    confirmed: Option<ConfirmedUnsafeEvent>,
 }
 
 impl PersistentUnsafeReminder {
-    /// Clears the prior outage interval as soon as real health has recovered.
-    /// This observation is independent of whether the recovery notification is delivered.
-    pub fn observe_mode(&mut self, mode: DataMode) -> bool {
-        let cleared = mode != DataMode::Unsafe && self.last_confirmed_at.is_some();
+    pub fn action(
+        &self,
+        mode: DataMode,
+        missing: &[Capability],
+        now: Instant,
+    ) -> Result<PersistentUnsafeAction, String> {
         if mode != DataMode::Unsafe {
-            self.last_confirmed_at = None;
+            return Ok(PersistentUnsafeAction::Silent);
         }
-        cleared
-    }
-
-    pub fn should_dispatch(&self, mode: DataMode, now: Instant) -> Result<bool, String> {
-        if mode != DataMode::Unsafe {
-            return Ok(false);
-        }
-        let Some(last_confirmed_at) = self.last_confirmed_at else {
-            return Ok(true);
+        let fingerprint = unsafe_event_fingerprint(missing);
+        let Some(confirmed) = &self.confirmed else {
+            return Ok(PersistentUnsafeAction::ExternalStatus { fingerprint });
         };
+        if confirmed.fingerprint != fingerprint {
+            return Ok(PersistentUnsafeAction::ExternalStatus { fingerprint });
+        }
         let elapsed = now
-            .checked_duration_since(last_confirmed_at)
+            .checked_duration_since(confirmed.confirmed_at)
             .ok_or_else(|| {
-                "BR-135 monotonic reminder clock moved backwards; reminder state unchanged"
-                    .to_string()
+                "BR-135 monotonic heartbeat clock moved backwards; state unchanged".to_string()
             })?;
-        Ok(elapsed >= PERSISTENT_UNSAFE_REMINDER_INTERVAL)
+        if elapsed >= PERSISTENT_UNSAFE_REMINDER_INTERVAL {
+            Ok(PersistentUnsafeAction::InternalHeartbeat { fingerprint })
+        } else {
+            Ok(PersistentUnsafeAction::Silent)
+        }
     }
 
-    pub fn record_confirmed(&mut self, mode: DataMode, now: Instant) {
-        self.observe_mode(mode);
+    pub fn record_external_confirmed(
+        &mut self,
+        mode: DataMode,
+        missing: &[Capability],
+        now: Instant,
+    ) {
         if mode == DataMode::Unsafe {
-            self.last_confirmed_at = Some(now);
+            self.confirmed = Some(ConfirmedUnsafeEvent {
+                fingerprint: unsafe_event_fingerprint(missing),
+                confirmed_at: now,
+            });
+        } else {
+            self.confirmed = None;
         }
+    }
+
+    pub fn record_heartbeat_confirmed(
+        &mut self,
+        fingerprint: &str,
+        now: Instant,
+    ) -> Result<(), String> {
+        let confirmed = self
+            .confirmed
+            .as_mut()
+            .ok_or_else(|| "BR-135 heartbeat has no confirmed Unsafe event".to_string())?;
+        if confirmed.fingerprint != fingerprint {
+            return Err("BR-135 heartbeat fingerprint does not match confirmed event".to_string());
+        }
+        now.checked_duration_since(confirmed.confirmed_at)
+            .ok_or_else(|| {
+                "BR-135 monotonic heartbeat clock moved backwards; state unchanged".to_string()
+            })?;
+        confirmed.confirmed_at = now;
+        Ok(())
     }
 }
 
@@ -936,40 +1002,173 @@ mod tests {
     }
 
     #[test]
-    fn br135_persistent_unsafe_reminder_is_due_only_after_confirmed_interval() {
+    fn br135_unchanged_unsafe_switches_from_external_status_to_internal_heartbeat() {
         let start = Instant::now();
         let mut state = PersistentUnsafeReminder::default();
+        let missing = [Capability::Quote, Capability::News];
+        assert_eq!(UNSAFE_HEARTBEAT_AUDIT_KIND, "data_mode_unsafe_heartbeat_v1");
+        assert_eq!(UNSAFE_HEARTBEAT_AUDIT_OUTCOME, "Deduped");
+        assert_eq!(UNSAFE_HEARTBEAT_AUDIT_CHANNEL, "internal_audit");
 
-        assert!(state.should_dispatch(DataMode::Unsafe, start).unwrap());
-        state.record_confirmed(DataMode::Unsafe, start);
+        let first = state.action(DataMode::Unsafe, &missing, start).unwrap();
+        assert!(matches!(
+            first,
+            PersistentUnsafeAction::ExternalStatus { .. }
+        ));
+        state.record_external_confirmed(DataMode::Unsafe, &missing, start);
 
-        assert!(!state
-            .should_dispatch(
+        assert_eq!(
+            state
+                .action(
+                    DataMode::Unsafe,
+                    &missing,
+                    start + Duration::from_secs(1_799),
+                )
+                .unwrap(),
+            PersistentUnsafeAction::Silent
+        );
+        let due = state
+            .action(
                 DataMode::Unsafe,
-                start + std::time::Duration::from_secs(1_799),
+                &missing,
+                start + Duration::from_secs(1_800),
             )
-            .unwrap());
+            .unwrap();
+        let fingerprint = match due {
+            PersistentUnsafeAction::InternalHeartbeat { fingerprint } => fingerprint,
+            other => panic!("expected internal heartbeat, got {other:?}"),
+        };
+
+        state
+            .record_heartbeat_confirmed(&fingerprint, start + Duration::from_secs(1_800))
+            .unwrap();
+        assert_eq!(
+            state
+                .action(
+                    DataMode::Unsafe,
+                    &missing,
+                    start + Duration::from_secs(1_801),
+                )
+                .unwrap(),
+            PersistentUnsafeAction::Silent
+        );
+    }
+
+    #[test]
+    fn br135_fingerprint_is_canonical_and_missing_change_is_external_fact() {
+        let start = Instant::now();
+        let mut state = PersistentUnsafeReminder::default();
+        let unordered = [Capability::News, Capability::Quote, Capability::News];
+        let canonical = [Capability::Quote, Capability::News];
+
+        let first = state.action(DataMode::Unsafe, &unordered, start).unwrap();
+        let first_fingerprint = match first {
+            PersistentUnsafeAction::ExternalStatus { fingerprint } => fingerprint,
+            other => panic!("expected external status, got {other:?}"),
+        };
+        assert_eq!(
+            first_fingerprint,
+            unsafe_event_fingerprint(&canonical),
+            "input order and duplicates must not affect event identity"
+        );
+        state.record_external_confirmed(DataMode::Unsafe, &canonical, start);
+
+        assert_eq!(
+            state
+                .action(DataMode::Unsafe, &unordered, start + Duration::from_secs(1),)
+                .unwrap(),
+            PersistentUnsafeAction::Silent
+        );
+        assert!(matches!(
+            state
+                .action(
+                    DataMode::Unsafe,
+                    &[Capability::Quote, Capability::Kline, Capability::News],
+                    start + Duration::from_secs(2),
+                )
+                .unwrap(),
+            PersistentUnsafeAction::ExternalStatus { .. }
+        ));
+    }
+
+    #[test]
+    fn br135_failures_and_unconfirmed_recovery_do_not_advance_state() {
+        let start = Instant::now();
+        let mut state = PersistentUnsafeReminder::default();
+        let missing = [Capability::Quote];
+        state.record_external_confirmed(DataMode::Unsafe, &missing, start);
+
+        let due_at = start + Duration::from_secs(1_800);
+        let due = state.action(DataMode::Unsafe, &missing, due_at).unwrap();
+        assert!(matches!(
+            due,
+            PersistentUnsafeAction::InternalHeartbeat { .. }
+        ));
+        assert_eq!(
+            state.action(DataMode::Unsafe, &missing, due_at).unwrap(),
+            due,
+            "an unconfirmed audit must remain due"
+        );
+
+        assert_eq!(
+            state.action(DataMode::Full, &[], due_at).unwrap(),
+            PersistentUnsafeAction::Silent
+        );
+        assert!(matches!(
+            state.action(DataMode::Unsafe, &missing, due_at).unwrap(),
+            PersistentUnsafeAction::InternalHeartbeat { .. }
+        ));
+        state.record_external_confirmed(DataMode::Full, &[], due_at);
+        assert!(matches!(
+            state
+                .action(DataMode::Unsafe, &missing, due_at + Duration::from_secs(1),)
+                .unwrap(),
+            PersistentUnsafeAction::ExternalStatus { .. }
+        ));
+    }
+
+    #[test]
+    fn br135_clock_rollback_and_wrong_fingerprint_are_explicit_errors() {
+        let start = Instant::now();
+        let mut state = PersistentUnsafeReminder::default();
+        let missing = [Capability::Quote];
+        state.record_external_confirmed(
+            DataMode::Unsafe,
+            &missing,
+            start + Duration::from_secs(10),
+        );
+
         assert!(state
-            .should_dispatch(
-                DataMode::Unsafe,
-                start + std::time::Duration::from_secs(1_800),
-            )
-            .unwrap());
-
-        assert!(state.observe_mode(DataMode::Full));
-        assert!(!state.observe_mode(DataMode::Degraded));
-        assert!(!state
-            .should_dispatch(
-                DataMode::Full,
-                start + std::time::Duration::from_secs(3_600),
-            )
-            .unwrap());
+            .action(DataMode::Unsafe, &missing, start)
+            .unwrap_err()
+            .contains("moved backwards"));
         assert!(state
-            .should_dispatch(
-                DataMode::Unsafe,
-                start + std::time::Duration::from_secs(3_600),
+            .record_heartbeat_confirmed(
+                "data_mode_unsafe_v1|Unsafe|News",
+                start + Duration::from_secs(1_800),
             )
-            .unwrap());
+            .unwrap_err()
+            .contains("fingerprint"));
+        assert_eq!(
+            state
+                .action(
+                    DataMode::Unsafe,
+                    &missing,
+                    start + Duration::from_secs(1_809),
+                )
+                .unwrap(),
+            PersistentUnsafeAction::Silent
+        );
+        assert!(matches!(
+            state
+                .action(
+                    DataMode::Unsafe,
+                    &missing,
+                    start + Duration::from_secs(1_810),
+                )
+                .unwrap(),
+            PersistentUnsafeAction::InternalHeartbeat { .. }
+        ));
     }
 
     // ---- 输入辅助 ----
