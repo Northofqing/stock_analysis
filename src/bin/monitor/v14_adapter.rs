@@ -1175,6 +1175,8 @@ fn map_push_kind(kind: PushKind) -> (SignalSource, &'static str, Severity) {
         PushKind::WeeklySOP => (HoldingHealth, "weekly_sop", Severity::Normal),
         // 交付物 A (2026-08-20): 虚拟盘绩效归因日推 — 非交易建议, 与 R-12/R-13 同档
         PushKind::AttributionDaily => (HoldingHealth, "attribution_daily", Severity::Normal),
+        // G5b 深链归因 (2026-08-22): LLM 深链研究 — 同档非交易建议
+        PushKind::G5bAttribution => (HoldingHealth, "g5b_attribution", Severity::Normal),
         PushKind::StockPick => (HoldingHealth, "stock_pick", Severity::Normal),
         PushKind::IndustryChain => (SectorRotation, "industry_chain", Severity::Normal),
         PushKind::TurnoverTop => (SectorRotation, "turnover_top", Severity::Normal),

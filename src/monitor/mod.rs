@@ -17,6 +17,7 @@ pub mod adaptive;
 pub mod alert;
 pub mod alert_log;
 pub mod attribution; // v10 P1 G5a 异动即时归因 (规则快归因, P95 ≤ 2s)
+pub mod attribution_deep; // G5b 深链归因 (盘后 LLM 深链, 2026-08-22 落地)
 pub mod auction;
 pub mod checklist;
 pub mod data_mode; // v12 PR2-2.1

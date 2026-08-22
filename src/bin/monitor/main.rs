@@ -8437,6 +8437,109 @@ async fn monitor_loop() {
                     }
                 }
             }
+            // G5b 深链归因 (2026-08-22): 当日告警 LLM 深链 — 独立于结算成败。
+            // 窗口同 15:05-15:20; 当日一次 (G5B_LAST_RUN 成功路径才记, 失败下 tick 重试);
+            // 无告警 / 无模型 → 出声跳过。上限 DEEP_ATTRIBUTION_MAX_EVENTS 条 (成本护栏)。
+            if now.hour() == 15 && (5..=20).contains(&now.minute()) {
+                use stock_analysis::monitor::alert_log::read_today_records;
+                use stock_analysis::monitor::attribution_deep::{
+                    append_deep_attribution_row, render_deep_attribution_summary,
+                    top_events_for_deep, DeepAttributionAnalyzer, DeepAttributionRequest,
+                    DeepAttributionRow, DEEP_ATTRIBUTION_MAX_EVENTS,
+                };
+                use stock_analysis::llm::registry::LlmRegistry;
+                static G5B_LAST_RUN: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                    std::sync::Mutex::new(None);
+                let today = now.date_naive();
+                let g5b_done = G5B_LAST_RUN
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .map(|d| d == today)
+                    .unwrap_or(false);
+                if !g5b_done {
+                    let records = read_today_records();
+                    if records.is_empty() {
+                        log::info!(
+                            "[g5b] 深链归因: 今日无告警记录, 跳过 (当日仅此一次)"
+                        );
+                        *G5B_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some(today);
+                    } else {
+                        let events = top_events_for_deep(records, DEEP_ATTRIBUTION_MAX_EVENTS);
+                        let Some(provider) = LlmRegistry::from_env().select("g5b") else {
+                            // v15.x 规则4: 每次跳过都出声 — 窗口内每 tick 提示, 不记 LAST_RUN
+                            // 以便用户补配 DEEPSEEK_API_KEY 后窗口内自愈。
+                            log::warn!(
+                                "[g5b] 深链归因: 无可用 LLM provider (DEEPSEEK_API_KEY 未配置?), 本次跳过"
+                            );
+                            continue;
+                        };
+                        let analyzer = DeepAttributionAnalyzer::new(provider);
+                        let mut done = 0usize;
+                        let mut failed = 0usize;
+                        for record in events {
+                            let request = DeepAttributionRequest {
+                                record,
+                                as_of: chrono::Utc::now(),
+                            };
+                            match analyzer.assess(&request).await {
+                                Ok(outcome) => {
+                                    let row = DeepAttributionRow {
+                                        record: request.record,
+                                        result: outcome.result,
+                                        analyzed_at: chrono::Utc::now().to_rfc3339(),
+                                        provider: outcome.receipt.provider().to_string(),
+                                        model: outcome.receipt.model().to_string(),
+                                        upstream_request_id: outcome
+                                            .receipt
+                                            .upstream_request_id()
+                                            .map(str::to_owned),
+                                        upstream_response_id: outcome
+                                            .receipt
+                                            .upstream_response_id()
+                                            .map(str::to_owned),
+                                        elapsed_ms: outcome.elapsed_ms,
+                                    };
+                                    if let Err(e) = append_deep_attribution_row(&row) {
+                                        log::warn!("[g5b] 深链归因落库失败: {e}");
+                                        failed += 1;
+                                        continue;
+                                    }
+                                    log::info!(
+                                        "[g5b] 深链归因完成 {}/{}: {} {} ({}ms)",
+                                        done + 1,
+                                        DEEP_ATTRIBUTION_MAX_EVENTS,
+                                        row.record.code,
+                                        row.record.name,
+                                        row.elapsed_ms
+                                    );
+                                    let summary = render_deep_attribution_summary(&row);
+                                    let outcome = push_governor_v3(
+                                        &summary,
+                                        PushKind::G5bAttribution,
+                                        None,
+                                    )
+                                    .await;
+                                    log::info!(
+                                        "[g5b] 深链归因推送完成: {:?}",
+                                        outcome
+                                    );
+                                    done += 1;
+                                }
+                                Err(e) => {
+                                    log::warn!("[g5b] 深链归因分析失败 ({}): {e}", request.record.code);
+                                    failed += 1;
+                                }
+                            }
+                        }
+                        log::info!(
+                            "[g5b] 深链归因当日批次结束: 成功 {done}, 失败 {failed} (上限 {})",
+                            DEEP_ATTRIBUTION_MAX_EVENTS
+                        );
+                        // 全部事件已尝试 (成功/失败均已出声) → 记 LAST_RUN, 避免窗口内重计费
+                        *G5B_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some(today);
+                    }
+                }
+            }
             // BR-226: 持仓快照 24h 新鲜度 — 收盘后主动预警。
             // 快照 effective_at 超过 6h (即非今日导入) → 次日 9:20 竞价时必过期
             // (age > 24h), 公告受众将静默降级。2026-08-06 实证: 08-05 15:02 快照

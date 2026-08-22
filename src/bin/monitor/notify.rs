@@ -110,6 +110,8 @@ pub enum PushKind {
     SnapshotStale,
     /// 虚拟盘绩效归因日推 (交付物 A, 每日 1 次, 默认出声) [2026-08-20]
     AttributionDaily,
+    /// G5b 深链归因 (盘后 LLM 深链, 每日 ≤3 条, 默认出声) [2026-08-22]
+    G5bAttribution,
     /// 尾盘决策 (T-12, ⚡ 1次/日) [MVP-4]
     CloseCall,
     // ============= v12 §14.2 盘后 PushKind =============
@@ -339,6 +341,8 @@ impl PushKind {
             PushKind::WatchlistTracking => PushLevel::Info,
             // 交付物 A (2026-08-20): 虚拟盘绩效归因日推 — 参考级 (默认出声)
             PushKind::AttributionDaily => PushLevel::Info,
+            // G5b 深链归因 (2026-08-22): LLM 深链研究 — 参考级 (默认出声)
+            PushKind::G5bAttribution => PushLevel::Info,
             // ℹ️参考 (降级 + ForbiddenOps/PaperTrade)
             _ => PushLevel::Info,
         }
@@ -450,6 +454,8 @@ impl PushKind {
             PushKind::ReviewBacktest => Some(3600),
             // 交付物 A (2026-08-20): 虚拟盘归因日推 — 无冷却 (调用方按日去重, 15:05 单点)
             PushKind::AttributionDaily => None,
+            // G5b 深链归因 (2026-08-22): 同 AttributionDaily — 调用方按日去重
+            PushKind::G5bAttribution => None,
             _ => Some(1800), // 默认 30min
         }
     }
@@ -476,6 +482,8 @@ impl PushKind {
             | BlockTradePriceRange => CooldownScope::PerTicket,
             // 交付物 A (2026-08-20): 虚拟盘归因日推 — 全局冷却域 (每日 1 次, 无 code 维度)
             AttributionDaily => CooldownScope::Global,
+            // G5b 深链归因 (2026-08-22): 全局冷却域 (每日 ≤3 条, 同 15:05 单点)
+            G5bAttribution => CooldownScope::Global,
             _ => CooldownScope::Global,
         }
     }
@@ -525,6 +533,8 @@ impl PushKind {
             PushKind::WatchlistTracking => "昨日关注回填",
             // 交付物 A (2026-08-20): 虚拟盘绩效归因日推
             PushKind::AttributionDaily => "虚拟盘归因",
+            // G5b 深链归因 (2026-08-22)
+            PushKind::G5bAttribution => "深链归因",
             // v13 新增
             PushKind::PreopenNewsHot => "盘前热点",
             PushKind::IntradayMarket => "盘中轮动",
@@ -889,6 +899,17 @@ pub const DISPATCH_TABLE: &[(PushKind, DispatchRow)] = &[
             cooldown_scope: CooldownScope::Global,
             label: "虚拟盘归因",
             stable_template_id: "attribution_daily_v1",
+        },
+    ),
+    // ============== G5b 深链归因 (2026-08-22) ==============
+    (
+        PushKind::G5bAttribution,
+        DispatchRow {
+            level: PushLevel::Info,
+            cooldown_secs: None,
+            cooldown_scope: CooldownScope::Global,
+            label: "深链归因",
+            stable_template_id: "g5b_attribution_v1",
         },
     ),
 ];
@@ -6734,8 +6755,8 @@ mod tests {
     fn dispatch_table_size_is_twenty() {
         assert_eq!(
             DISPATCH_TABLE.len(),
-            20,
-            "v17.x DISPATCH_TABLE 应 20 rows (3 v17.6 + 6 v17.7 + 6 v17.8 + 1 BR-234 + 1 #3 + 1 R-12 + 1 R-13 + 1 交付物A)"
+            21,
+            "v17.x DISPATCH_TABLE 应 21 rows (3 v17.6 + 6 v17.7 + 6 v17.8 + 1 BR-234 + 1 #3 + 1 R-12 + 1 R-13 + 1 交付物A + 1 G5b)"
         );
     }
 
@@ -6771,8 +6792,9 @@ mod tests {
             PushKind::SnapshotStale,
             PushKind::ReviewBacktest,
             PushKind::WatchlistTracking,
+            PushKind::G5bAttribution,
         ];
-        assert_eq!(expected.len(), 19);
+        assert_eq!(expected.len(), 20);
         for k in expected {
             assert!(k.dispatch_row().is_some(), "{:?} 应在 DISPATCH_TABLE 内", k);
         }

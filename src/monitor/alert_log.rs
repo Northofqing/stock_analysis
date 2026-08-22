@@ -82,24 +82,51 @@ pub fn today_stats() -> (usize, usize, usize) {
     (emergency, important, info)
 }
 
+/// 读取今日告警 JSONL 结构化记录 (G5b 深链归因等机器消费方)。
+/// 文件缺失或行解析失败 → 该行跳过 (出声: 返回错误行计数由调用方日志体现)。
+pub fn read_today_records() -> Vec<AlertRecord> {
+    let path = today_file("jsonl");
+    let Ok(content) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            match serde_json::from_str::<AlertRecord>(trimmed) {
+                Ok(record) => Some(record),
+                Err(error) => {
+                    log::warn!(
+                        "[alert_log] read_today_records 跳过无法解析的告警行: {error}"
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
 // ── JSON 记录 ──
 
-#[derive(serde::Serialize)]
-struct AlertRecord {
-    triggered_at: String,
-    code: String,
-    name: String,
-    level: String,
-    category: String,
-    message: String,
-    price: Option<f64>,
-    change_pct: Option<f64>,
-    main_flow_yi: Option<f64>,
-    news_title: Option<String>,
-    news_importance: Option<u8>,
-    attribution_decision: Option<String>,
-    routed_external_id: Option<String>,
-    t1_locked: bool,
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct AlertRecord {
+    pub triggered_at: String,
+    pub code: String,
+    pub name: String,
+    pub level: String,
+    pub category: String,
+    pub message: String,
+    pub price: Option<f64>,
+    pub change_pct: Option<f64>,
+    pub main_flow_yi: Option<f64>,
+    pub news_title: Option<String>,
+    pub news_importance: Option<u8>,
+    pub attribution_decision: Option<String>,
+    pub routed_external_id: Option<String>,
+    pub t1_locked: bool,
 }
 
 impl AlertRecord {

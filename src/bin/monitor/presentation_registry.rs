@@ -39,7 +39,7 @@ const fn descriptor(
     }
 }
 
-const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 58] = [
+const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 59] = [
     descriptor(
         "T-01-account-mode",
         PushKind::AccountMode,
@@ -87,6 +87,14 @@ const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 58
         PushKind::AttributionDaily,
         "attribution_daily_dispatcher",
         "render_attribution_daily",
+    ),
+    descriptor(
+        // G5b 深链归因 (2026-08-22): 盘后 LLM 深链 — 15:05 闭环追加深链段,
+        // 文本由 attribution_deep::render_deep_attribution_summary 生成
+        "G5b-attribution-deep",
+        PushKind::G5bAttribution,
+        "g5b_attribution_dispatcher",
+        "render_deep_attribution",
     ),
     descriptor(
         "T-05-t0-advice",
@@ -396,7 +404,7 @@ const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 58
     ),
 ];
 
-pub(super) fn descriptors() -> &'static [ProductionPresentationDescriptor; 58] {
+pub(super) fn descriptors() -> &'static [ProductionPresentationDescriptor; 59] {
     &PRODUCTION_PRESENTATION_DESCRIPTORS
 }
 
