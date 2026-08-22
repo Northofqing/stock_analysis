@@ -48,7 +48,11 @@ static SOURCE: OnceLock<Mutex<Option<Arc<GrpcSource>>>> = OnceLock::new();
 static BRIDGE_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 const DEFAULT_ADDR: &str = "http://127.0.0.1:18082";
-const GRPC_BRIDGE_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// BR-243: 桥同步查询总期限。原 20s — BoardConstituents 每次下载 TDX 板块文件
+/// (13-15s) 加排队/重试后逼近 20s 导致边缘超时 (CANCELLED)。放宽到 35s 与
+/// 客户端 tonic deadline (client.rs .timeout(35s)) 对齐; 慢查询失败语义不变
+/// (fail-closed, retryable)。
+const GRPC_BRIDGE_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
 
 fn production_equity_instrument(code: &str) -> Result<InstrumentId, GatewayError> {
     crate::data_gateway::instrument_identity::resolve_production_equity(code, None)
@@ -1756,8 +1760,16 @@ impl GrpcSource {
 
     async fn query_op(&self, op: Operation, params: Value) -> Result<QueryResult, GatewayError> {
         self.ensure_connected().await?;
-        let mut guard = self.client.lock().await;
-        let client = guard.as_mut().expect("ensure_connected 后必有 client");
+        // BR-243: 锁只保护惰性连接初始化, 查询必须并发。全局锁覆盖整个
+        // query await 会让一个慢 op (如 tdx-smart failover 20s+) 阻塞所有
+        // 排队请求, 排队者超过 GRPC_BRIDGE_SYNC_TIMEOUT 后全部超时取消。
+        let mut client = {
+            let guard = self.client.lock().await;
+            guard
+                .as_ref()
+                .expect("ensure_connected 后必有 client")
+                .clone()
+        };
         client
             .query(op, params)
             .await
@@ -2860,8 +2872,9 @@ mod tests {
     fn br243_normal_result_is_preserved_and_production_deadline_is_literal() {
         assert_eq!(
             GRPC_BRIDGE_SYNC_TIMEOUT,
-            std::time::Duration::from_secs(20),
-            "BR-243 pins one literal 20-second complete-future deadline"
+            std::time::Duration::from_secs(35),
+            "BR-243 pins one literal 35-second complete-future deadline \
+             (20s caused BoardConstituents TDX block-file download edge timeouts)"
         );
 
         let expected = "TEST_CODE bridge payload".to_string();

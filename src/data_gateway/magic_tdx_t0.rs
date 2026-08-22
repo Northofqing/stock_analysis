@@ -119,6 +119,12 @@ pub struct MagicTdxT0Batch {
     pub batch_id: String,
     pub records: Vec<MagicTdxT0Evidence>,
     pub rejections: Vec<MagicTdxT0Rejection>,
+    /// 2026-08-21 用户指令「拿不到时间先跳过, 标注时间不可信」:
+    /// 桥往返 + server 侧整批组装 (7 codes × 4 TDX 调用) 耗时 11-55s,
+    /// 且 TDX servertime 实测滞后墙钟 14-27s (2026-08-21 全天) — 服务端
+    /// age 门放宽时置 true; consumer 侧按 record age 复查亦置 true。
+    /// 推送方必须标注「时间不可信」。未来时间 (损坏) 仍硬拒, 不置此位。
+    pub time_untrustworthy: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -568,7 +574,7 @@ pub fn validate_settled_daily(
 }
 
 #[cfg(feature = "magic-gateway")]
-fn five_minute_from_raw(
+pub fn five_minute_from_raw(
     code: &str,
     bar: SecurityBar,
 ) -> std::result::Result<MagicTdxT0FiveMinuteBar, MagicTdxT0Rejection> {
@@ -709,14 +715,34 @@ pub fn validate_five_minute_bars(
             true,
         ));
     }
+    // 2026-08-21 实盘探针确认: TDX 盘中午后 KLINE_5MIN 响应缺 11:30 上午收盘 bar
+    // (09:35..11:25 后直接跳 13:05), 收盘后数据补齐为全 48 槽位; 当日 7 只持仓
+    // 全同形。属已知数据形态而非断档: 识别条件 = 观测已过午后开盘 && 今日 bar 数
+    // 恰为已完成槽位-1 && 槽位 23 (11:30) 实为 13:05。命中则从对齐槽位剔除 11:30
+    // 再逐一对齐; 其余场景仍严格对齐 —— 剔除后任意真实断档(缺 10:00/11:25 等)
+    // 都会在错位索引处报 five_minute_gap, 不会被形态容错掩盖。
+    let local_time = observed_at.with_timezone(&Local).time();
+    let afternoon_started = local_time >= NaiveTime::from_hms_opt(13, 5, 0).expect("static slot");
+    let completed_slot_count = allowed_slots.iter().filter(|t| **t <= cutoff).count();
+    let mut alignment_slots = allowed_slots.clone();
+    if afternoon_started
+        && today_bars.len() + 1 == completed_slot_count
+        && today_bars.get(23).map(|bar| bar.at.time())
+            == Some(NaiveTime::from_hms_opt(13, 5, 0).expect("static slot"))
+    {
+        log::warn!(
+            "[T0Evidence][数据形态] code={code} TDX 盘中午后缺 11:30 bar, 剔除该槽位对齐 (已知形态, 非断档)"
+        );
+        alignment_slots.remove(23);
+    }
     for (index, bar) in today_bars.iter().enumerate() {
-        if allowed_slots.get(index).copied() != Some(bar.at.time()) {
+        if alignment_slots.get(index).copied() != Some(bar.at.time()) {
             return Err(rejection(
                 code,
                 "five_minute_gap",
                 format!(
                     "date={today} index={index} expected={:?} actual={}",
-                    allowed_slots.get(index),
+                    alignment_slots.get(index),
                     bar.at.time()
                 ),
                 false,
@@ -778,6 +804,7 @@ fn evidence_for_quote(
     quote: SecurityQuote,
     requested_at: DateTime<Utc>,
     clock: Option<DateTime<Utc>>,
+    time_untrustworthy: &mut bool,
 ) -> std::result::Result<ValidatedT0Evidence, MagicTdxT0Rejection> {
     let code = identity.instrument.code().to_owned();
     let quote_received_at = clock.unwrap_or_else(Utc::now);
@@ -789,12 +816,26 @@ fn evidence_for_quote(
     // provider source_at 执行五秒 freshness 门。价格仅在通过后记入
     // 诊断 cache，不放宽时效；网络调用（daily/minute）仍在该门后。
     let normalized_quote = normalize_quote(&code, &quote)?;
-    validate_quote_freshness(
+    // 2026-08-21 用户指令「拿不到时间先跳过, 标注时间不可信」: TDX servertime
+    // 生产实测滞后墙钟 14-27s (2026-08-21 全天), 5s 门全量硬拒致做T 0 records。
+    // 放宽**仅 age 门**: stale → 置 time_untrustworthy + WARN 继续; future_time
+    // (损坏) 仍是硬错误, 绝不放行。
+    match validate_quote_freshness(
         &code,
         source_at,
         quote_received_at,
         Some(normalized_quote.price),
-    )?;
+    ) {
+        Ok(()) => {}
+        Err(rejection) if rejection.detail.starts_with("future_time") => return Err(rejection),
+        Err(rejection) => {
+            *time_untrustworthy = true;
+            log::warn!(
+                "[T0Evidence][时间不可信] code={code} 跳过 entry age 门: {} — 推送须标注",
+                rejection.detail
+            );
+        }
+    }
     // 2026-08-12 实测: TDX 主站 KLINE_RI_K(9) 在 fq_type::NONE 下只返回最新
     // 1 根日K (count=40/800 均如此), 生产 8/11-8/12 全天 settled_daily
     // actual=0 → 做T 证据 0 records。KLINE_DAILY(4) + NONE (不复权) 返回
@@ -851,6 +892,7 @@ fn finalize_t0_batch(
     identities: &[T0RequestIdentity],
     records: Vec<ValidatedT0Evidence>,
     mut rejections: Vec<MagicTdxT0Rejection>,
+    time_untrustworthy: bool,
 ) -> Result<MagicTdxT0Batch> {
     if observed_at < requested_at {
         return Err(anyhow!(
@@ -888,26 +930,42 @@ fn finalize_t0_batch(
         }
         // BR-231 批次完成二次门：quote 在进入后续日线/分钟线采集
         // 前即使曾通过，完成时也必须仍处于 `0..=5s`。缓存和价格
-        // 变化不参与本门；过期/未来记录 fail-closed 且不更新缓存。
+        // 变化不参与本门；未来记录 fail-closed 且不更新缓存。
+        // 2026-08-21 用户指令「拿不到时间先跳过, 标注时间不可信」:
+        // time_untrustworthy=true 时 stale 记录放行 (WARN 出声), future_time
+        // (损坏) 永远硬拒; false (测试/严格路径) 保持原 fail-closed 语义。
         let completion_age = observed_at.signed_duration_since(record.source_at);
-        if record.source_at > observed_at
-            || completion_age > chrono::Duration::seconds(T0_QUOTE_MAX_AGE_SECS)
-        {
-            let timing = if record.source_at > observed_at {
-                "future_time"
-            } else {
-                "stale"
-            };
+        if record.source_at > observed_at {
             rejections.push(rejection(
                 &record.code,
                 "quote_stale",
                 format!(
-                    "completion_{timing} age_ms={} max_secs={T0_QUOTE_MAX_AGE_SECS}",
+                    "completion_future_time age_ms={} max_secs={T0_QUOTE_MAX_AGE_SECS}",
                     completion_age.num_milliseconds()
                 ),
                 true,
             ));
             continue;
+        }
+        if completion_age > chrono::Duration::seconds(T0_QUOTE_MAX_AGE_SECS) {
+            if !time_untrustworthy {
+                rejections.push(rejection(
+                    &record.code,
+                    "quote_stale",
+                    format!(
+                        "completion_stale age_ms={} max_secs={T0_QUOTE_MAX_AGE_SECS}",
+                        completion_age.num_milliseconds()
+                    ),
+                    true,
+                ));
+                continue;
+            }
+            log::warn!(
+                "[T0Evidence][时间不可信] code={} 跳过 completion age 门: stale \
+                 age_ms={} max_secs={T0_QUOTE_MAX_AGE_SECS} — 推送须标注",
+                record.code,
+                completion_age.num_milliseconds()
+            );
         }
         fresh_records.push(record);
     }
@@ -984,6 +1042,7 @@ fn finalize_t0_batch(
         batch_id,
         records,
         rejections,
+        time_untrustworthy,
     })
 }
 
@@ -1084,25 +1143,46 @@ pub fn fetch_magic_tdx_t0_batch_with_clock(
         .collect();
     let mut records = Vec::new();
     let mut rejections = Vec::new();
+    // 2026-08-21 用户指令「拿不到时间先跳过, 标注时间不可信」: TDX servertime
+    // 滞后墙钟 14-27s → entry 门放宽; 标志贯穿 finalize (completion 门同步放宽)。
+    let mut time_untrustworthy = false;
     for (identity, quote) in identities.iter().zip(quotes) {
         if skip_codes.contains(identity.instrument.code()) {
             continue;
         }
-        match evidence_for_quote(&client, identity, quote, requested_at, clock) {
+        match evidence_for_quote(
+            &client,
+            identity,
+            quote,
+            requested_at,
+            clock,
+            &mut time_untrustworthy,
+        ) {
             Ok(record) => records.push(record),
             Err(error) => rejections.push(error),
         }
     }
     rejections.extend(quote_rejections);
     let observed_at = clock.unwrap_or_else(Utc::now);
-    finalize_t0_batch(
+    let batch = finalize_t0_batch(
         requested_at,
         source_at,
         observed_at,
         &identities,
         records,
         rejections,
-    )
+        time_untrustworthy,
+    )?;
+    if batch.time_untrustworthy {
+        log::warn!(
+            "[T0Evidence][时间不可信] 服务端整批放宽 age 门: source_at={} \
+             observed_at={} records={} — 推送必须带标注",
+            batch.source_at,
+            batch.observed_at,
+            batch.records.len()
+        );
+    }
+    Ok(batch)
 }
 
 #[cfg(test)]
@@ -1338,6 +1418,7 @@ mod tests {
             std::slice::from_ref(&identity),
             vec![record.clone()],
             Vec::new(),
+            false,
         )
         .unwrap();
         let second = finalize_t0_batch(
@@ -1347,6 +1428,7 @@ mod tests {
             std::slice::from_ref(&identity),
             vec![record.clone()],
             Vec::new(),
+            false,
         )
         .unwrap();
         assert_eq!(first.batch_id, second.batch_id);
@@ -1364,6 +1446,7 @@ mod tests {
             &[identity],
             vec![changed],
             Vec::new(),
+            false,
         )
         .unwrap();
         assert_ne!(changed.batch_id, first.batch_id);
@@ -1395,6 +1478,7 @@ mod tests {
             std::slice::from_ref(&identity),
             Vec::new(),
             vec![first_rejection],
+            false,
         )
         .unwrap();
         let second = finalize_t0_batch(
@@ -1404,6 +1488,7 @@ mod tests {
             &[identity],
             Vec::new(),
             vec![second_rejection],
+            false,
         )
         .unwrap();
 
@@ -1429,6 +1514,7 @@ mod tests {
             &[identity],
             vec![record],
             Vec::new(),
+            false,
         )
         .unwrap();
 
@@ -1438,6 +1524,62 @@ mod tests {
         assert!(batch.rejections[0].detail.contains("completion_stale"));
         assert_eq!(batch.observed_at, completion_at);
         assert_eq!(batch.batch_id.len(), 64);
+    }
+
+    #[test]
+    fn br243_completion_stale_is_admitted_with_time_untrustworthy_flag() {
+        // 2026-08-21 用户指令「拿不到时间先跳过, 标注时间不可信」: 完成时
+        // stale 记录在 time_untrustworthy=true 下放行 (WARN), 不置 rejection。
+        let requested_at = Utc.with_ymd_and_hms(2026, 7, 23, 2, 0, 0).unwrap();
+        let source_at = requested_at + chrono::Duration::seconds(1);
+        let completion_at = source_at + chrono::Duration::milliseconds(5_001);
+        let identity = normalized_identity("TEST_CODE_600396").unwrap();
+        let record = validated_record(&identity, source_at, requested_at);
+
+        let batch = finalize_t0_batch(
+            requested_at,
+            source_at,
+            completion_at,
+            &[identity],
+            vec![record.clone()],
+            Vec::new(),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(batch.records.len(), 1);
+        assert!(batch.rejections.is_empty());
+        assert!(batch.time_untrustworthy);
+        assert_eq!(batch.records[0].code, "TEST_CODE_600396");
+        assert_eq!(batch.observed_at, completion_at);
+    }
+
+    #[test]
+    fn br243_future_time_is_never_admitted_even_with_flag() {
+        // 未来时间 = 损坏 ≠ 延迟: time_untrustworthy=true 也不能放行 future。
+        let requested_at = Utc.with_ymd_and_hms(2026, 7, 23, 2, 0, 0).unwrap();
+        let observed_at = requested_at + chrono::Duration::seconds(2);
+        let record_source_at = observed_at + chrono::Duration::milliseconds(1);
+        let identity = normalized_identity("TEST_CODE_600396").unwrap();
+        let record = validated_record(&identity, record_source_at, observed_at);
+
+        let batch = finalize_t0_batch(
+            requested_at,
+            requested_at + chrono::Duration::seconds(1),
+            observed_at,
+            &[identity],
+            vec![record],
+            Vec::new(),
+            true,
+        )
+        .unwrap();
+
+        assert!(batch.records.is_empty());
+        assert_eq!(batch.rejections.len(), 1);
+        assert_eq!(batch.rejections[0].reason_code, "quote_stale");
+        assert!(batch.rejections[0]
+            .detail
+            .contains("completion_future_time"));
     }
 
     #[test]
@@ -1455,6 +1597,7 @@ mod tests {
             &[identity],
             vec![record],
             Vec::new(),
+            false,
         )
         .unwrap();
 
@@ -1648,6 +1791,111 @@ mod tests {
         for (index, bar) in today_bars.iter().enumerate() {
             assert_eq!(slots.get(index).copied(), Some(bar.at.time()));
         }
+    }
+
+    #[test]
+    fn missing_1130_intraday_shape_is_admitted_after_afternoon_open() {
+        // 2026-08-21 实盘: TDX 盘中午后 KLINE_5MIN 响应缺 11:30 bar
+        // (09:35..11:25 直接跳 13:05), 收盘后补齐为全 48 槽位; 当日持仓全同形。
+        // 构造观测 14:48 (cutoff 14:45) 的盘中形态: 今日 44 根 (23 上午 + 21 午后),
+        // 历史 3 个完整交易日 → 剔除 11:30 槽位后逐一对齐通过。
+        let observed_at = Local
+            .with_ymd_and_hms(2026, 8, 21, 14, 48, 0)
+            .single()
+            .expect("fixture time")
+            .with_timezone(&Utc);
+        let today = observed_at.with_timezone(&Local).date_naive();
+        let bar = |date: NaiveDate, time: NaiveTime| MagicTdxT0FiveMinuteBar {
+            at: date.and_time(time),
+            open: 10.0,
+            high: 10.2,
+            low: 9.8,
+            close: 10.0,
+            volume: 1_000.0,
+            amount: 10_000.0,
+        };
+        let mut live = Vec::new();
+        let mut date = crate::calendar::prev_trading_day(today);
+        for _ in 0..T0_HISTORY_MIN_SESSIONS {
+            for time in trading_slots() {
+                live.push(bar(date, time));
+            }
+            date = crate::calendar::prev_trading_day(date);
+        }
+        let cutoff = completed_slot_cutoff(observed_at); // 14:45
+        let missing_1130 = NaiveTime::from_hms_opt(11, 30, 0).expect("static slot");
+        let today_bars_count = trading_slots()
+            .iter()
+            .filter(|time| **time <= cutoff && **time != missing_1130)
+            .count();
+        assert_eq!(today_bars_count, 44, "fixture sanity: 45 已完成槽位 - 11:30");
+        for time in trading_slots()
+            .into_iter()
+            .filter(|time| *time <= cutoff && *time != missing_1130)
+        {
+            live.push(bar(today, time));
+        }
+
+        let validated = validate_five_minute_bars("TEST_CODE_600396", live, observed_at)
+            .expect("缺 11:30 的盘中形态必须被接收");
+        let today_validated: Vec<_> = validated
+            .iter()
+            .filter(|b| b.at.date() == today)
+            .collect();
+        assert_eq!(today_validated.len(), 44);
+        assert!(
+            today_validated
+                .iter()
+                .all(|b| b.at.time() != missing_1130),
+            "11:30 不在 TDX 盘中响应里, 不得凭空出现在输出中"
+        );
+    }
+
+    #[test]
+    fn real_morning_gap_is_still_rejected_despite_1130_tolerance() {
+        // 形态容错只覆盖"仅缺 11:30"。缺 10:00 时今日 bar 数同样少 1、槽位 23
+        // 同样为 13:05 (误判形态命中), 但剔除 11:30 后错位索引处必须仍报
+        // five_minute_gap —— 真实断档不得被形态容错掩盖。
+        let observed_at = Local
+            .with_ymd_and_hms(2026, 8, 21, 14, 48, 0)
+            .single()
+            .expect("fixture time")
+            .with_timezone(&Utc);
+        let today = observed_at.with_timezone(&Local).date_naive();
+        let bar = |date: NaiveDate, time: NaiveTime| MagicTdxT0FiveMinuteBar {
+            at: date.and_time(time),
+            open: 10.0,
+            high: 10.2,
+            low: 9.8,
+            close: 10.0,
+            volume: 1_000.0,
+            amount: 10_000.0,
+        };
+        let mut live = Vec::new();
+        let mut date = crate::calendar::prev_trading_day(today);
+        for _ in 0..T0_HISTORY_MIN_SESSIONS {
+            for time in trading_slots() {
+                live.push(bar(date, time));
+            }
+            date = crate::calendar::prev_trading_day(date);
+        }
+        let cutoff = completed_slot_cutoff(observed_at);
+        let missing_1000 = NaiveTime::from_hms_opt(10, 0, 0).expect("static slot");
+        for time in trading_slots()
+            .into_iter()
+            .filter(|time| *time <= cutoff && *time != missing_1000)
+        {
+            live.push(bar(today, time));
+        }
+
+        let error = validate_five_minute_bars("TEST_CODE_600396", live, observed_at)
+            .expect_err("缺 10:00 是真实断档, 必须拒绝");
+        assert_eq!(error.reason_code, "five_minute_gap");
+        assert!(
+            error.detail.contains("index=5"),
+            "错位应指向 10:05 槽: {}",
+            error.detail
+        );
     }
 
     #[test]

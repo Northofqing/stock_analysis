@@ -437,7 +437,6 @@ async fn assess_candidate(
         "receipt-bearing news_ai model provider unavailable; assessment not written".to_owned()
     })?;
 
-    let as_of = chrono::Utc::now();
     let context = news_market_context(calendar::current_session());
     let daily = HistoricalBarsGateway::new()
         .required_daily_bars_async(&candidate.target_code, DAILY_HISTORY_DAYS)
@@ -456,6 +455,9 @@ async fn assess_candidate(
     } else {
         None
     };
+    // as_of 必须在市场证据就绪之后取:日K/quote 批次的 observed_at 是获取
+    // 完成时刻,若 as_of 早于它们会被 NewsMarketSnapshot 误判 "in the future"。
+    let as_of = chrono::Utc::now();
     let market =
         NewsMarketSnapshot::try_from_admitted(&candidate.target_code, context, as_of, daily, quote)
             .map_err(|error| error.to_string())?;

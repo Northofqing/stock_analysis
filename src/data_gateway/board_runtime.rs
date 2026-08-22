@@ -21,6 +21,10 @@ const DIRECTORY_CAPABILITY: &str = "board-directory";
 const MEMBERSHIP_CAPABILITY: &str = "board-memberships";
 const FLOW_CAPABILITY: &str = "board-flows";
 const PRODUCTION_TDX_CONNECT_TIMEOUT_SECONDS: f64 = 5.0;
+/// BR-243: connect_to_any 遍历 10 台 PRIMARY + 101 台 ALL_KNOWN (每台 5s 超时)
+/// 实测 9-15s — 超过 gRPC 桥客户端 15s deadline 导致 CANCELLED。缓存已验证
+/// 可达的 (server, port), 缓存命中直接复用, 不再逐调用遍历。
+const TDX_BOARD_SERVER_CACHE_TTL_SECS: u64 = 60;
 const BOARD_CONNECTION_POLICY_VERSION: &str = "selection-board-tdx-production-v1";
 const BOARD_DIRECTORY_PROVIDER: &str = "tdx";
 const BOARD_DIRECTORY_SOURCE: &str = "tdx-block-files";
@@ -668,15 +672,36 @@ impl BoardDataGateway {
     }
 }
 
+/// 已验证可达的 TDX (server, port) 缓存。connect_to_any 每次遍历 111 台
+/// 服务器 (每台 5s 超时, 实测 9-15s) — 缓存命中后直接复用已验证端点,
+/// TdxBlockClient 惰性连接该服务器 (毫秒级)。缓存仅作端点记忆:
+/// 端点失联时 TdxBlockClient 查询失败 → fail-closed 返回 + 缓存过期后重连。
+static TDX_BOARD_SERVER_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<Option<(String, u16, std::time::Instant)>>,
+> = std::sync::OnceLock::new();
+
 #[cfg(feature = "magic-gateway")]
 fn resolve_production_tdx_board_provider(
     capability: &'static str,
 ) -> Result<TdxBoardProvider, GatewayError> {
+    let cache = TDX_BOARD_SERVER_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    // 1) 缓存命中且未过期 → 直接复用已验证端点 (不重新遍历服务器列表)。
+    if let Some((server, port, connected_at)) = cache.lock().unwrap().as_ref() {
+        if connected_at.elapsed().as_secs() < TDX_BOARD_SERVER_CACHE_TTL_SECS {
+            return Ok(TdxBoardProvider::new(
+                server,
+                *port,
+                PRODUCTION_TDX_CONNECT_TIMEOUT_SECONDS,
+            ));
+        }
+    }
+    // 2) 未命中/过期 → 完整 connect_to_any 探测 (慢一次, 成功后记忆端点)。
     let client = TdxHqClient::new();
     let connected = client
         .connect_to_any(Some(PRODUCTION_TDX_CONNECT_TIMEOUT_SECONDS))
         .map_err(|error| tdx_gateway_error(capability, error))?;
     if !connected {
+        *cache.lock().unwrap() = None;
         return Err(GatewayError::unavailable(
             capability,
             Some(ProviderId::Tdx),
@@ -692,6 +717,10 @@ fn resolve_production_tdx_board_provider(
             "Magic TDX connected without exposing a server identity",
         )
     })?;
+    *cache.lock().unwrap() = Some((server.clone(), port, std::time::Instant::now()));
+    log::info!(
+        "[BoardDataGateway] TDX board 端点记忆: {server}:{port} (cache_ttl={TDX_BOARD_SERVER_CACHE_TTL_SECS}s)"
+    );
     Ok(TdxBoardProvider::new(
         &server,
         port,

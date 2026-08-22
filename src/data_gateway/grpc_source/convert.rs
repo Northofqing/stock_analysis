@@ -318,6 +318,33 @@ fn live_evidence_times(
     capability: &'static str,
     now: DateTime<Utc>,
 ) -> Result<(BatchEvidence, DateTime<Utc>, DateTime<Utc>), GatewayError> {
+    let (evidence, source_at, observed_at, _) = live_evidence_times_lenient(q, capability, now)?;
+    // 非 T0 能力保持严格 age 门: lenient 变体仅对 age 放宽, 未来/倒挂仍硬错,
+    // 因此这里 _ 恒 false → 直接沿用严格语义。
+    validate_live_times(
+        capability,
+        evidence.provider,
+        source_at,
+        observed_at,
+        now,
+        "batch",
+    )?;
+    Ok((evidence, source_at, observed_at))
+}
+
+/// 2026-08-21 用户指令「拿不到时间先跳过, 标注时间不可信」: T0Evidence 专用
+/// 宽松时间门。生产根因 (BR-243 follow-up): 桥往返 + server 侧整批组装
+/// (7 codes × quote+daily+5min+minute-time 顺序 TDX 调用) 实测 11-55s,
+/// 消费者按自己 now 复查 age 必然超 5s → 做T 自 P4 桥迁移 (08-16) 起全拒。
+///
+/// 放宽范围**仅 age 门** (source_at 比 now 老): 置 time_untrustworthy=true 由
+/// 推送方标注「时间不可信」。未来时间 / source_at 晚于 observed_at / source_at
+/// 缺失仍是硬错误 (损坏 ≠ 延迟, 绝不静默放行)。
+fn live_evidence_times_lenient(
+    q: &QueryResult,
+    capability: &'static str,
+    now: DateTime<Utc>,
+) -> Result<(BatchEvidence, DateTime<Utc>, DateTime<Utc>, bool), GatewayError> {
     let evidence = evidence_of(q, capability)?;
     let source_at_raw = evidence
         .source_at
@@ -335,15 +362,43 @@ fn live_evidence_times(
         "observed_at",
         &evidence.observed_at,
     )?;
-    validate_live_times(
-        capability,
-        evidence.provider,
-        source_at,
-        observed_at,
-        now,
-        "batch",
-    )?;
-    Ok((evidence, source_at, observed_at))
+    let mut time_untrustworthy = false;
+    if source_at > now {
+        return Err(live_time_error(
+            capability,
+            evidence.provider,
+            format!("{capability}.source_at 晚于 consumer now: source_at={source_at} now={now}"),
+        ));
+    }
+    if observed_at > now {
+        return Err(live_time_error(
+            capability,
+            evidence.provider,
+            format!(
+                "{capability}.observed_at 晚于 consumer now: observed_at={observed_at} now={now}"
+            ),
+        ));
+    }
+    if source_at > observed_at {
+        return Err(err(
+            capability,
+            format!(
+                "{capability}.source_at 晚于 observed_at: source_at={source_at} observed_at={observed_at}"
+            ),
+        ));
+    }
+    let age = now.signed_duration_since(source_at);
+    if age > LIVE_BATCH_MAX_AGE {
+        // 2026-08-21 用户指令: 拿不到可信时间 → 先跳过 age 门, 标注时间不可信。
+        time_untrustworthy = true;
+        log::warn!(
+            "[{capability}][时间不可信] batch age_ns={} max_ns={} source_at={source_at} \
+             observed_at={observed_at} now={now} (桥组装延迟, 放宽 age 门, 推送须标注)",
+            age.num_nanoseconds().unwrap_or(i64::MAX),
+            LIVE_BATCH_MAX_AGE.num_nanoseconds().unwrap_or(i64::MAX),
+        );
+    }
+    Ok((evidence, source_at, observed_at, time_untrustworthy))
 }
 
 fn validate_live_times(
@@ -3453,6 +3508,7 @@ pub fn t0_evidence_batch(q: &QueryResult) -> Result<MagicTdxT0Batch, GatewayErro
         batch_id: ev.batch_id.clone(),
         records: out,
         rejections,
+        time_untrustworthy: false, // t0_evidence_batch_at 按 lenient 门回填
     })
 }
 
@@ -3528,8 +3584,9 @@ pub fn t0_evidence_batch_at(
     now: DateTime<Utc>,
 ) -> Result<MagicTdxT0Batch, GatewayError> {
     let capability = "T0Evidence";
-    let (envelope, source_at, observed_at) = live_evidence_times(q, capability, now)?;
-    let batch = t0_evidence_batch(q)?;
+    let (envelope, source_at, observed_at, batch_time_untrustworthy) =
+        live_evidence_times_lenient(q, capability, now)?;
+    let mut batch = t0_evidence_batch(q)?;
     if batch.provider != envelope.provider
         || batch.source != envelope.source
         || batch.batch_id != envelope.batch_id
@@ -3552,6 +3609,7 @@ pub fn t0_evidence_batch_at(
     }
 
     let mut minimum_record_source_at: Option<DateTime<Utc>> = None;
+    let mut record_time_untrustworthy = false;
     for record in &batch.records {
         if record.code != record.instrument.code() {
             return Err(err(
@@ -3575,14 +3633,41 @@ pub fn t0_evidence_batch_at(
                 ),
             ));
         }
-        validate_live_times(
-            capability,
-            batch.provider,
-            record.source_at,
-            record.observed_at,
-            now,
-            "record",
-        )?;
+        // 2026-08-21 用户指令「拿不到时间先跳过, 标注时间不可信」: 记录级 age 门
+        // 同样放宽 (server 整批组装 11-55s 的延迟会落在这个记录上), 未来/倒挂仍硬错。
+        let record_age = now.signed_duration_since(record.source_at);
+        if record.source_at > now || record.observed_at > now {
+            return Err(live_time_error(
+                capability,
+                batch.provider,
+                format!(
+                    "record 时间晚于 consumer now: source_at={} observed_at={} now={}",
+                    record.source_at, record.observed_at, now
+                ),
+            ));
+        }
+        if record.source_at > record.observed_at {
+            return Err(err(
+                capability,
+                format!(
+                    "T0 record.source_at 晚于 observed_at: source_at={} observed_at={}",
+                    record.source_at, record.observed_at
+                ),
+            ));
+        }
+        if record_age > LIVE_BATCH_MAX_AGE {
+            record_time_untrustworthy = true;
+            log::warn!(
+                "[{capability}][时间不可信] record code={} age_ns={} max_ns={} \
+                 source_at={} observed_at={} now={} (桥组装延迟, 放宽 age 门, 推送须标注)",
+                record.code,
+                record_age.num_nanoseconds().unwrap_or(i64::MAX),
+                LIVE_BATCH_MAX_AGE.num_nanoseconds().unwrap_or(i64::MAX),
+                record.source_at,
+                record.observed_at,
+                now,
+            );
+        }
         validate_t0_live_quote(&record.quote, capability)?;
         require_positive_live_value(
             capability,
@@ -3603,6 +3688,16 @@ pub fn t0_evidence_batch_at(
                 batch.source_at, minimum_record_source_at
             ),
         ));
+    }
+    // 2026-08-21 用户指令: 拿不到可信时间 → 跳过 age 门但必须标注, 推送方据
+    // time_untrustworthy 打印「时间不可信」, 禁止静默放行。
+    batch.time_untrustworthy = batch_time_untrustworthy || record_time_untrustworthy;
+    if batch.time_untrustworthy {
+        log::warn!(
+            "[{capability}][时间不可信] 整批已放宽 age 门: source_at={source_at} \
+             observed_at={observed_at} now={now} records={} — 推送必须带标注",
+            batch.records.len(),
+        );
     }
     Ok(batch)
 }
@@ -5053,7 +5148,9 @@ mod tests {
     }
 
     #[test]
-    fn br238_t0_consumer_rejects_record_source_older_than_five_seconds() {
+    fn br243_t0_consumer_flags_record_source_older_than_five_seconds_instead_of_rejecting() {
+        // 2026-08-21 用户指令「拿不到时间先跳过, 标注时间不可信」:
+        // T0 age 门从硬拒改为 time_untrustworthy 标注 (桥组装延迟 11-55s 生产实测)。
         let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
         let mut q = live_t0_q();
         q.source_at = "1786930199.999999999".to_string();
@@ -5061,10 +5158,38 @@ mod tests {
         view["records"][0]["source_at"] = Value::String("1786930199.999999999".to_string());
         q.records[0].data = serde_json::to_vec(&view).unwrap();
 
-        let error = t0_evidence_batch_at(&q, now)
-            .expect_err("T0 source age 5s+1ns must fail after RPC delivery");
+        let batch = t0_evidence_batch_at(&q, now)
+            .expect("T0 source age 5s+1ns must be flagged, not rejected (2026-08-21 指令)");
+        assert!(
+            batch.time_untrustworthy,
+            "age 超门批次必须标注 时间不可信"
+        );
+        assert_eq!(batch.records.len(), 1);
+    }
+
+    #[test]
+    fn br243_t0_consumer_keeps_strict_time_corruption_rejections() {
+        // 未来时间 / source_at 晚于 observed_at = 损坏而非延迟, age 放宽不覆盖。
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
+
+        let mut future = live_t0_q();
+        future.source_at = "1786930205.000000001".to_string();
+        let mut view: Value = serde_json::from_slice(&future.records[0].data).unwrap();
+        view["records"][0]["source_at"] = Value::String("1786930205.000000001".to_string());
+        future.records[0].data = serde_json::to_vec(&view).unwrap();
+        let error = t0_evidence_batch_at(&future, now)
+            .expect_err("future record source time must remain a hard rejection");
         assert_eq!(error.reason_code(), "quote_stale");
-        assert!(error.retryable());
+
+        let mut inverted = live_t0_q();
+        inverted.source_at = "1786930200.500000000".to_string();
+        let mut view: Value = serde_json::from_slice(&inverted.records[0].data).unwrap();
+        view["records"][0]["source_at"] = Value::String("1786930200.500000000".to_string());
+        inverted.records[0].data = serde_json::to_vec(&view).unwrap();
+        let error = t0_evidence_batch_at(&inverted, now)
+            .expect_err("record.source_at later than observed_at must stay a hard rejection");
+        assert_eq!(error.reason_code(), "invalid_evidence");
+        assert!(!error.retryable());
     }
 
     #[test]

@@ -22,11 +22,13 @@ pub enum ContractProfile {
     ExternalV1,
 }
 
+#[derive(Clone)]
 enum ClientAuthorization {
     Environment,
     InstanceBearer(Zeroizing<String>),
 }
 
+#[derive(Clone)]
 pub struct GrpcMarketClient {
     data: MarketDataServiceClient<Channel>,
     system: SystemServiceClient<Channel>,
@@ -45,7 +47,11 @@ impl GrpcMarketClient {
                 details: Box::default(),
             })?
             // 合同 §12: 为 unary 和 stream 分别设置 deadline/keepalive。
-            .timeout(Duration::from_secs(15))
+            // BR-243 follow-up: BoardConstituents 每次从 TDX 服务器下载完整板块
+            // 文件 (实测 13-15s, 无本地缓存) — 15s deadline 边缘超时导致
+            // position-chain/做T 证据批 CANCELLED。放宽到 35s 容纳下载耗时;
+            // 慢查询仍受桥侧 GRPC_BRIDGE_SYNC_TIMEOUT (35s) 兜底, fail-closed 语义不变。
+            .timeout(Duration::from_secs(35))
             .connect()
             .await
             .map_err(|_| GrpcError::Unavailable {
@@ -85,7 +91,8 @@ impl GrpcMarketClient {
             .map_err(|_| GrpcError::InvalidArgument {
                 details: Box::default(),
             })?
-            .timeout(Duration::from_secs(15))
+            // BR-243 follow-up: 与本地桥同 deadline (BoardConstituents 板块文件下载 13-15s)。
+            .timeout(Duration::from_secs(35))
             .tls_config(tls)
             .map_err(|_| GrpcError::InvalidArgument {
                 details: Box::default(),

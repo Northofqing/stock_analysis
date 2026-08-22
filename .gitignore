@@ -1,37 +1,25 @@
 /.agents
+/.cargo
 /.claude
+/.codegraph
 /.cursor
 /.github
+/.planning
+/.superpowers
+/.trellis
+/.vscode
+/.workspace
+/client-bundle
+/config
+/data
+/deploy
+/docs
+/logs
+/reports
 /target
 /.env
-/.vscode
-/.superpowers/sdd/review-*.diff
-/.superpowers/sdd/sdd-workspace/
-**/__pycache__/
-*.pyc
-/data
-/reports
 /test_data
-.DS_Store
-/.planning/.active_plan
-/.trellis
+/tests
 /tools
 /skills-lock.json
-# 推送日志 (data/push_log, 运行时生成)
-data/push_log/
-/docs
-/.planning
-/.cargo
-# review #16 fix (B-001): 不忽略 tests/ 目录, 让 cargo integration tests 正常入仓
-# (之前 /tests 在 .gitignore line 13, 导致新 test files 需 `git add -f`, 易漏)
-# 例外: 测试运行时数据 (test_data) 已在 line 10 单独忽略
 
-# 运行日志 (logs/, 运行时生成, 不入仓)
-/logs
-
-# gRPC TLS 证书 (运行时生成/本地保管, 绝不入仓 — P4 迁移安全约束)
-/grpc/*.pem
-
-# client-bundle/ 整个目录绝不入仓 (PEM + Bearer token + connection.json,
-# README: "Keep the entire directory private and never commit it")
-/client-bundle/

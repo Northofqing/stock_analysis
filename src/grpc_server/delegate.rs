@@ -229,7 +229,7 @@ fn not_yet(op: Operation) -> Result<Fetched, FetchFailure> {
 pub async fn fetch(op: Operation, _schema: &str, params: &Value) -> Result<Fetched, DelegateError> {
     match op {
         // P4 M2: 首批 6 op 升级收 params (客户端桥按 codes/days 精确请求)。
-        Operation::RealtimeQuotes => fetch_realtime_quotes(params),
+        Operation::RealtimeQuotes => fetch_realtime_quotes(params).await,
         Operation::HistoricalBars => fetch_historical_bars(params).await,
         Operation::MinuteData => fetch_minute_data(params).await,
         Operation::OrderBooks => fetch_order_books(params).await,
@@ -301,19 +301,30 @@ pub async fn fetch(op: Operation, _schema: &str, params: &Value) -> Result<Fetch
     }
 }
 
-// ---------- 统一实时行情 (Task 8 已落地, 同步路径) ----------
+// ---------- 统一实时行情 (Task 8 已落地, spawn_blocking 路径) ----------
 
 /// 字段映射以实际 struct 为准: RealtimeMarketQuote 有
 /// code/name/price/previous_close/change_percent (无 volume/amount)。
 /// P4 M2: 升级收 params (codes 缺省 watchlist)。
-pub fn fetch_realtime_quotes(params: &Value) -> Result<Fetched, DelegateError> {
+///
+/// 同步 Gateway 调用必须跑在 spawn_blocking 上: TDX 连接卡顿时整条
+/// provider chain 可耗时 20s+, 若直接执行会阻塞 tokio worker, 导致
+/// monitor 桥请求排队超时 (BR-243 盘中卡窗根因)。
+pub async fn fetch_realtime_quotes(params: &Value) -> Result<Fetched, DelegateError> {
     let codes = crate::grpc_contract::params::resolve_codes(params)?;
-    let batch = crate::data_gateway::MarketDataGateway::new()
-        .realtime_quotes(&codes)
-        .map_err(|e| {
-            let message = format!("统一实时行情 Gateway 不可用: {e}");
-            DelegateError::Fetch(FetchFailure::from_gateway(e).with_message(message))
-        })?;
+    let batch = tokio::task::spawn_blocking(move || {
+        crate::data_gateway::MarketDataGateway::new().realtime_quotes(&codes)
+    })
+    .await
+    .map_err(|error| {
+        DelegateError::Fetch(FetchFailure::unknown(format!(
+            "统一实时行情 task 失败: {error}"
+        )))
+    })?
+    .map_err(|e| {
+        let message = format!("统一实时行情 Gateway 不可用: {e}");
+        DelegateError::Fetch(FetchFailure::from_gateway(e).with_message(message))
+    })?;
     let records: Vec<Value> = batch
         .records()
         .iter()

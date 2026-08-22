@@ -7754,6 +7754,19 @@ async fn prepare_magic_tdx_t0_messages() -> Result<Vec<PreparedT0Advice>, String
         );
     }
 
+    // 2026-08-21 用户指令「拿不到时间先跳过, 标注时间不可信」: 桥组装延迟致
+    // source_at 超 5s 门时批次带 time_untrustworthy=true, 必须出声标注, 禁止静默放行。
+    if batch.time_untrustworthy {
+        log::warn!(
+            "[做T-持仓][BR-153][时间不可信] batch={} source_at={} observed_at={} \
+             records={} — 推送内容带「时间不可信」标注, 仅供参考",
+            batch.batch_id.get(..12).unwrap_or(batch.batch_id.as_str()),
+            batch.source_at,
+            batch.observed_at,
+            batch.records.len(),
+        );
+    }
+
     let by_code = positions
         .iter()
         .map(|position| (position.code.as_str(), position))
@@ -7775,6 +7788,13 @@ async fn prepare_magic_tdx_t0_messages() -> Result<Vec<PreparedT0Advice>, String
                     &banner,
                     push_templates::T0AdviceParams::from(&plan),
                 );
+                // 2026-08-21 用户指令「拿不到时间先跳过, 标注时间不可信」:
+                // 批次 age 门被放宽 (time_untrustworthy=true) 时, 推送正文必须带标注, 出声不可静默。
+                let text = if batch.time_untrustworthy {
+                    format!("[⚠️时间不可信] 上游数据超 5s 新鲜度门(桥组装延迟), 仅供参考\n{text}")
+                } else {
+                    text
+                };
                 let decision_id = decision_binding.decision_id()?;
                 let source_binding_canonical = decision_binding.canonical_bytes()?;
                 let delivery_subject_hash = decision_binding.delivery_subject_hash()?;

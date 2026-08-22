@@ -25,6 +25,11 @@ use std::sync::Arc;
 use thiserror::Error;
 
 const REALTIME_MAX_AGE_SECONDS: i64 = 5;
+/// 数据证据时间戳 vs 分析时刻的容差(秒)。TDX servertime 与本地时钟存在
+/// 结构性偏差(6-63s, 见 tdx_server_probe.rs), 且 server 端批次的
+/// observed_at 是请求时刻而 source_at 是 provider 响应时刻 —— 证据时间戳
+/// 晚于 as_of 是正常现象, 不能按 0 容差判定 "in the future"。
+const DATA_EVIDENCE_FUTURE_TOLERANCE_SECONDS: i64 = 90;
 const REQUIRED_DAILY_HISTORY: usize = 20;
 const MODEL_CALL_TIMEOUT_SECONDS: u64 = 45;
 pub const NEWS_AI_ANALYSIS_VERSION: &str = "news_ai_v1";
@@ -471,7 +476,7 @@ impl NewsMarketSnapshot {
             .map_err(|error| market_error(error.to_string()))?;
         let daily_observed_at = parse_observed_at(&daily_evidence.observed_at)
             .map_err(|error| market_error(error.to_string()))?;
-        if daily_observed_at > as_of {
+        if daily_observed_at > as_of + chrono::Duration::seconds(DATA_EVIDENCE_FUTURE_TOLERANCE_SECONDS) {
             return Err(market_error("daily batch observation is in the future"));
         }
         let metrics = validate_daily_bars(&daily_bars, latest_completed_trading_day)?;
@@ -1780,13 +1785,27 @@ fn parse_observed_at(value: &str) -> Result<DateTime<Utc>, NewsAiError> {
             });
         }
     }
-    DateTime::parse_from_rfc3339(value)
-        .map(|timestamp| timestamp.with_timezone(&Utc))
-        .map_err(|error| {
-            NewsAiError::NewsEvidenceMismatch(format!(
-                "invalid observation timestamp {value:?}: {error}"
-            ))
-        })
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
+        return Ok(parsed.with_timezone(&Utc));
+    }
+    if let Some(parsed) = parse_unix_epoch_seconds_or_millis(value) {
+        return Ok(parsed);
+    }
+    Err(NewsAiError::NewsEvidenceMismatch(format!(
+        "invalid observation timestamp {value:?}: neither RFC3339 nor unix epoch"
+    )))
+}
+
+/// 解析 unix epoch 秒(10 位)或毫秒(13 位)格式的时间戳。
+fn parse_unix_epoch_seconds_or_millis(value: &str) -> Option<DateTime<Utc>> {
+    let digits = value.parse::<i64>().ok()?;
+    if value.len() == 13 {
+        // 毫秒
+        DateTime::from_timestamp(digits / 1000, (digits % 1000) as u32 * 1_000_000)
+    } else {
+        // 秒
+        DateTime::from_timestamp(digits, 0)
+    }
 }
 
 fn parse_source_at(provider: ProviderId, value: &str) -> Result<DateTime<Utc>, NewsAiError> {
@@ -1809,13 +1828,15 @@ fn parse_source_at(provider: ProviderId, value: &str) -> Result<DateTime<Utc>, N
                 ))
             });
     }
-    DateTime::parse_from_rfc3339(value)
-        .map(|value| value.with_timezone(&Utc))
-        .map_err(|error| {
-            NewsAiError::NewsEvidenceMismatch(format!(
-                "invalid publication time {value:?}: {error}"
-            ))
-        })
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
+        return Ok(parsed.with_timezone(&Utc));
+    }
+    if let Some(parsed) = parse_unix_epoch_seconds_or_millis(value) {
+        return Ok(parsed);
+    }
+    Err(NewsAiError::NewsEvidenceMismatch(format!(
+        "invalid publication time {value:?}: neither RFC3339 nor unix epoch"
+    )))
 }
 
 fn validate_daily_bars(
@@ -1921,7 +1942,10 @@ fn validate_quote(
             "quote source time differs from batch source time",
         ));
     }
-    if quote.source_at > quote.observed_at || quote.observed_at > as_of {
+    if quote.source_at > quote.observed_at + chrono::Duration::seconds(DATA_EVIDENCE_FUTURE_TOLERANCE_SECONDS)
+        || quote.observed_at
+            > as_of + chrono::Duration::seconds(DATA_EVIDENCE_FUTURE_TOLERANCE_SECONDS)
+    {
         return Err(market_error("quote timestamps are out of order"));
     }
     if as_of.signed_duration_since(quote.source_at)
@@ -1953,7 +1977,10 @@ fn validate_optional_metrics(
                         "optional metric {name} is not finite"
                     )));
                 }
-                if evidence.batch_id.trim().is_empty() || evidence.observed_at > as_of {
+                if evidence.batch_id.trim().is_empty()
+                    || evidence.observed_at
+                        > as_of + chrono::Duration::seconds(DATA_EVIDENCE_FUTURE_TOLERANCE_SECONDS)
+                {
                     return Err(market_error(format!(
                         "optional metric {name} has invalid evidence"
                     )));
@@ -2840,6 +2867,48 @@ mod tests {
             "core_logic":"TEST_CODE 合同可能提升收入"
         }"#;
         assert!(parse_strict_model_output(duplicate).is_err());
+    }
+
+    #[test]
+    fn parse_source_at_accepts_unix_epoch_seconds_and_millis() {
+        // 财联社(Cailianpress)publication_time 为 unix 秒时间戳(10 位)。
+        let seconds = DateTime::from_timestamp(1787276172, 0).expect("seconds in range");
+        assert_eq!(
+            parse_source_at(ProviderId::Cailianpress, "1787276172").expect("unix seconds"),
+            seconds
+        );
+        let millis = DateTime::from_timestamp(1787276172, 123_000_000).expect("millis in range");
+        assert_eq!(
+            parse_source_at(ProviderId::Cailianpress, "1787276172123").expect("unix millis"),
+            millis
+        );
+    }
+
+    #[test]
+    fn parse_source_at_keeps_rfc3339_and_eastmoney() {
+        assert_eq!(
+            parse_source_at(ProviderId::Jin10, "2026-08-21T09:36:12+08:00").expect("rfc3339"),
+            DateTime::parse_from_rfc3339("2026-08-21T09:36:12+08:00")
+                .expect("rfc3339 valid")
+                .with_timezone(&Utc)
+        );
+        assert_eq!(
+            parse_source_at(ProviderId::Eastmoney, "2026-08-21 09:36").expect("eastmoney"),
+            Utc.from_utc_datetime(
+                &NaiveDateTime::parse_from_str("2026-08-21 09:36", "%Y-%m-%d %H:%M")
+                    .expect("naive valid")
+            ) - chrono::Duration::hours(8)
+        );
+    }
+
+    #[test]
+    fn parse_observed_at_accepts_unix_epoch_seconds() {
+        let seconds = DateTime::from_timestamp(1787276172, 0).expect("seconds in range");
+        assert_eq!(
+            parse_observed_at("1787276172").expect("unix seconds"),
+            seconds
+        );
+        assert!(parse_observed_at("not-a-timestamp").is_err());
     }
 
     #[test]

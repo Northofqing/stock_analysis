@@ -498,6 +498,7 @@ mod tests {
             batch_id: "TEST_CODE_INTRADAY_BATCH".to_owned(),
             records: vec![record],
             rejections: Vec::new(),
+            time_untrustworthy: false,
         }
     }
 
