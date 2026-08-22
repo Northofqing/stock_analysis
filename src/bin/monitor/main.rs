@@ -5991,16 +5991,19 @@ impl TemplateTestSummary {
         // BR-236 同步: R-13 补录 manifest family (br196_test_delivery) 后
         // active 54→55 (未激活 news) / 56→57 (激活), total 70→71;
         // WatchlistTracking PushKind 入 ALL_PUSH_KINDS 后 kind total 60→61。
-        let activated_news = self.family_active_total == 57;
+        // G5b (2026-08-22) +1 家族 +1 kind: 未激活 (57,13,3,73)/(52,11,0,63),
+        // 激活 news 后 2 个 newsflash 家族 由 Disabled→Active: (59,11,3,73)/(54,9,0,63)
+        // (2026-08-22 实测运行时 manifest 与 br196 单元 default 快照一致)。
+        let activated_news = self.family_disabled_total == 11;
         let expected_family = if activated_news {
-            (57, 11, 3, 71)
+            (59, 11, 3, 73)
         } else {
-            (55, 13, 3, 71)
+            (57, 13, 3, 73)
         };
         let expected_kind = if activated_news {
-            (52, 9, 0, 61)
+            (54, 9, 0, 63)
         } else {
-            (50, 11, 0, 61)
+            (52, 11, 0, 63)
         };
         let lifecycle_complete = self.manifest_version == br196_test_delivery::MANIFEST_VERSION
             && self.manifest_sha256.len() == 64
@@ -6275,15 +6278,16 @@ mod tests_br196_monitor_test_acceptance {
             manifest_sha256: "a".repeat(64),
             news_capability_generation: 1,
             news_capability_sha256: "b".repeat(64),
-            family_active_total: 55,
+            // G5b (2026-08-22) +1 家族 +1 kind: 55→57, 71→73, kind 61→63
+            family_active_total: 57,
             family_disabled_total: 13,
             family_retired_total: 3,
-            family_total: 71,
-            push_kind_active_total: 50,
+            family_total: 73,
+            push_kind_active_total: 52,
             push_kind_disabled_total: 11,
             push_kind_retired_total: 0,
-            push_kind_total: 61,
-            rendered_family_total: 55,
+            push_kind_total: 63,
+            rendered_family_total: 57,
             governance_smoke_attempted: br196_test_delivery::governance_smoke_identity_count(),
             governance_smoke_passed: br196_test_delivery::governance_smoke_identity_count(),
             live_acceptance_opted_in: false,
@@ -6295,7 +6299,7 @@ mod tests_br196_monitor_test_acceptance {
             batches_pushed: 0,
             families_pushed: 0,
             receipt_audit_appended: 0,
-            explicit_dry_run_family_total: 55,
+            explicit_dry_run_family_total: 57,
             failed: 0,
         }
     }
@@ -6340,7 +6344,7 @@ mod tests_br196_monitor_test_acceptance {
     fn br196_renderer_catalog_is_closed_unique_and_nonempty() {
         let catalog = push_templates::build_test_template_catalog("2026-07-31", "10:30")
             .expect("complete TEST_CODE renderer catalog");
-        assert_eq!(catalog.len(), 55);
+        assert_eq!(catalog.len(), 57);
         let ids = catalog
             .iter()
             .map(|preview| preview.template_id)

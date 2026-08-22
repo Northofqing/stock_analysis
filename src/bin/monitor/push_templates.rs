@@ -1208,6 +1208,11 @@ pub fn render_attribution_daily(summary: &str) -> String {
     summary.to_string()
 }
 
+/// G5b 深链归因摘要 (2026-08-22; 文本由 attribution_deep::render_deep_attribution_summary 生成)
+pub fn render_g5b_attribution(summary: &str) -> String {
+    summary.to_string()
+}
+
 /// R-02 盘面走向
 #[derive(Debug)]
 pub struct MarketReview<'a> {
@@ -15342,7 +15347,7 @@ pub fn build_test_template_catalog(
     };
     use stock_analysis::monitor::detector::{AlertCategory, AlertDetail, AlertEvent, AlertLevel};
 
-    const EXPECTED_CATALOG_TOTAL: usize = 56;
+    const EXPECTED_CATALOG_TOTAL: usize = 57;
     let banner = BannerCtx {
         account_mode: AccountMode::Normal,
         total_pos: Some(0),
@@ -16234,6 +16239,11 @@ pub fn build_test_template_catalog(
     push(
         "A-12-attribution-daily",
         render_attribution_daily("TEST_CODE 归因摘要…"),
+    );
+    // G5b 深链归因 (2026-08-22): 深链摘要透传模板 (G5b-attribution-deep)
+    push(
+        "G5b-attribution-deep",
+        render_g5b_attribution("TEST_CODE 深链归因摘要…"),
     );
 
     if catalog.len() != EXPECTED_CATALOG_TOTAL {
