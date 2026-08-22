@@ -10,6 +10,8 @@
 
 Normative amendments (newer clauses supersede conflicting text in the rows below):
 
+- **BR-134（2026-08-22 T+1/FIFO 可卖库存修订）：** 纸面卖出在任何行情、订单或推送副作用前，必须按 `(ts, id)` 升序加载并校验全部 `Filled` 成交，再以数量感知 FIFO 消耗卖出；每个剩余买入批次必须保留原始买入日、成交价和剩余数量。以评估日为界，仅 `buy_date < as_of_date` 的批次可卖；隔夜批次与当日批次混合时，只能一次卖出全部隔夜可卖数量，当日批次继续锁定；只有当日批次时不得生成卖单。卖出规则使用的成本、最早持有日和收益率必须只从可卖批次推导，禁止用全部历史买入的聚合均价或最早日期替代。重复/乱序身份、非法方向、非正或非有限价格、非正或非 100 股整数手、算术溢出、超卖等结构错误必须使整批扫描在外部副作用前显式失败。现有 `paper_sell_paused` 默认暂停以及 BR-201/BR-211 Disabled 状态不变；算法正确不构成启用生产卖出的授权。完整中文设计见 `docs/superpowers/plans/2026-08-22-买卖策略验证.md` 的“T+1/FIFO 批次库存修复设计”。
+
 - **BR-192 / BR-165 (2026-08-17 upstream identity repair):** the compiled
   fourteen-crate Magic runtime and all newly admitted provider evidence bind
   revision `75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e`, which supersedes the
