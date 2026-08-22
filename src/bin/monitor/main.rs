@@ -8386,8 +8386,11 @@ async fn monitor_loop() {
                 }
             }
             // Attribution Research Loop (2026-08-20 spec §4.6): 15:05 归因闭环。
-            // 与 PerformanceEngine 同点运行, 当日一次, 失败出声 (30s 重试窗口沿用 PERF 模式)。
-            if now.hour() == 15 && now.minute() == 5 {
+            // 与 PerformanceEngine 同点运行, 当日一次, 失败出声。
+            // 重试窗口 15:05-15:20: 失败后每个 tick 重试直到成功 (2026-08-22 实测
+            // 15:05 失败后 minute==5 条件永不再真 → 当天归因永久缺失的 bug)。
+            // 成功才记 ATTRIBUTION_LAST_RUN → 窗口内失败持续重试, 跨日不重复成功推送。
+            if now.hour() == 15 && (5..=20).contains(&now.minute()) {
                 use std::collections::HashMap;
                 use stock_analysis::performance::attribution::{
                     compute_daily, compute_window, persist_daily,
