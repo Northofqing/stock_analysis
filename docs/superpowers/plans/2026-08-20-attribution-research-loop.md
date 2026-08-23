@@ -1464,15 +1464,21 @@ cargo test --lib trading::paper_ -- --test-threads=1
 **规格：** 对应设计 §10 与 BR-247。目标是消除策略来源/退出原因混淆和误导性胜率，不解除 BR-239 的 TechnicalBars 生产禁用。
 
 - [x] 完成中文 Gate A：数据流、失败模式、旧模块关系、验收和回滚已登记。
-- [ ] RED：锁定早于首根 K 线不得映射到索引 0。
-- [ ] RED：锁定卖出行不进入买入事件统计，未知入场族整批失败。
-- [ ] RED：锁定逐事件路径 MFE/MAE，不再使用跨样本终点极值。
-- [ ] RED：锁定非法时间、真实 `fill_price` 缺失、坏/乱序 K 线整批失败。
-- [ ] GREEN：补全九个入场策略族并由 R-12 复用同一映射。
-- [ ] GREEN：把 R-12 收窄为买入事件研究，删除固定日期/`price < 1` 静默排除。
-- [ ] GREEN：报告改用“上涨比例/终点收益/路径 MFE/MAE”，固定输出非策略胜率声明和 200 样本门。
-- [ ] 回归：`cargo test --lib review::backtest -- --test-threads=1`。
-- [ ] 回归：`cargo test --lib performance::attribution -- --test-threads=1`。
+- [x] RED：锁定早于首根 K 线不得映射到索引 0。
+- [x] RED：锁定卖出行不进入买入事件统计，未知入场族整批失败。
+- [x] RED：锁定逐事件路径 MFE/MAE，不再使用跨样本终点极值。
+- [x] RED：锁定非法时间、真实 `fill_price` 缺失、坏/乱序 K 线整批失败。
+- [x] GREEN：补全九个入场策略族并由 R-12 复用同一映射。
+- [x] GREEN：把 R-12 收窄为买入事件研究，删除固定日期/`price < 1` 静默排除。
+- [x] GREEN：报告改用“上涨比例/终点收益/路径 MFE/MAE”，固定输出非策略胜率声明和 200 样本门。
+- [x] 回归：`cargo test --lib review::backtest::tests -- --test-threads=1`（12/12 PASS）。
+- [x] 回归：`cargo test --lib performance::attribution -- --test-threads=1`（19/19 PASS）。
+- [x] 回归：`cargo test --lib trading::paper_ -- --test-threads=1`（67/67 PASS）。
+- [x] 编译/静态检查：`cargo check --bin monitor` 与 `cargo clippy --lib -- -D warnings`（PASS）。
 - [ ] Gate B/C/D 与真实数据限制统一在最终证据节报告。
+
+实现提交：`6f6a892`（入场策略族）、`73174c1`（R-12 买入事件研究）。
+当前只证明 Gate B 和定向回归；BR-239 仍保持 Disabled，未发布 TechnicalBars
+生产能力，也没有形成完整买入→卖出扣成本胜率结论。
 
 回滚：文档、策略族映射和 R-12 实现分别 `git revert <sha>`；不得恢复硬编码日期删除、卖出胜率或边界 K 线补配。
