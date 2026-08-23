@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Enforce AGENTS.md global/core line-coverage thresholds from llvm-cov JSON."""
+"""Enforce AGENTS.md global/core line-coverage thresholds from llvm-cov JSON.
+
+Business rule: BR-250.
+"""
 
 from __future__ import annotations
 

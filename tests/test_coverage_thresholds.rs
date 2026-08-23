@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// BR-250: worktree 中的绝对源码路径必须按当前 checkout 计入核心覆盖率。
 static NEXT_REPORT_ID: AtomicU64 = AtomicU64::new(0);
 
 struct TestReport(PathBuf);

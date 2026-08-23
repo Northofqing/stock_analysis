@@ -1581,17 +1581,19 @@ cargo run --bin economic_position_probe -- \
   仍可审计，只有分组与计数全部为零才返回 NoData。
 - [x] `cargo check --bin monitor` 与 `cargo clippy --lib -- -D warnings` PASS；四个改动
   源文件的 `rustfmt --check` 与 `git diff --check` PASS。
-- [ ] Gate B 全仓：`cargo test -- --test-threads=1` 的 lib 为 2793/0/7，monitor 为
-  681/2/4；仅失败 `main.rs` 既有 BR-139、BR-241 源码计数断言，且该文件相对基线零差异。
+- [ ] Gate B 全仓：同步 2026-08-24 最新 `master` 后，`cargo test -- --test-threads=1`
+  的 lib 为 2796/0/7，monitor 为 683/2/4；仅失败 `main.rs` 既有 BR-139、BR-241
+  源码计数断言，且该文件相对最新基线零差异。
   `cargo fmt --check` 仍命中多个既有文件；全目标 Clippy 仍命中 `t0_replay.rs` 两条
   `doc_lazy_continuation` 与 `hbars_probe.rs` 一条 `let_unit_value`。
 - [ ] Gate C：`check_fake_impl.sh` 与设计矛盾检查 PASS；总合规因 worktree 无生产数据库
-  导致 freshness FAIL，并因 60 条既有 BR 引用仓库中缺失的旧文档而 FAIL（另有 157 条
-  既有引用警告）。BR-247/248 没有新增登记错误；未执行会写生产数据的回填脚本。
-- [ ] Gate D：插桩测试仍只被相同两条 monitor 基线断言阻断。已生成报告的全局行覆盖为
-  174954/236621（73.94%，要求 80%）；按 worktree 路径纠正后核心覆盖为
-  140403/189144（74.23%，要求 95%）。官方阈值检查器把
-  `.worktrees/buy-sell-t1-fifo/src/...` 错归一化为非核心路径并以 exit 2 退出。
+  导致 freshness FAIL，并因 60 条既有 BR 引用仓库中缺失的旧文档而 FAIL。补齐 BR-250
+  两个 active path 的规则号后，最新业务规则复验为 60 errors/157 warnings；BR-247/248/250
+  没有新增登记错误。未执行会写生产数据的回填脚本。
+- [ ] Gate D：插桩测试仍只被相同两条 monitor 基线断言阻断。新鲜报告的全局行覆盖为
+  175112/236807（73.95%，要求 80%）；核心覆盖为 140311/189071（74.21%，要求 95%，
+  215 个文件）。BR-250 修复后官方检查器正确识别 worktree 核心文件并以真实低覆盖
+  exit 1 退出，不再错误返回“没有核心模块”的 exit 2。
 
 改动文件覆盖证据：`backtest.rs` 84.14%、`boll_macd.rs` 93.58%、
 `economic_position.rs` 90.89%、`push_templates.rs` 65.93%。这些数字不满足 Gate D，不能
@@ -1605,8 +1607,13 @@ cargo run --bin economic_position_probe -- \
 
 - [x] 复现：真实报告在 worktree 中返回 exit 2，错误声称没有核心模块。
 - [x] 根因：固定 `/stock_analysis/` 截断早于 cwd-relative 解析，产生 `.worktrees/.../src`。
-- [ ] RED：worktree 绝对路径必须计入核心覆盖并以真实低覆盖 exit 1。
-- [ ] GREEN：优先相对当前 checkout，保留外部 CI 重复仓库路径回退。
-- [ ] 回归：覆盖率工具测试、真实报告和全仓 Gate 重新验证。
+- [x] RED：隔离 worktree 绝对路径 fixture 在旧检查器上返回 exit 2，未进入阈值判断。
+- [x] GREEN：优先相对当前 checkout，保留外部 CI 重复仓库路径回退；4/4 工具测试通过。
+- [x] 回归：真实报告正确返回 exit 1；全局 175112/236807（73.95%），核心
+  140311/189071（74.21%，215 个文件），证明 Gate D 仍真实未达标。
+
+实现提交：`f7419dd`。同步最新 `master` 的合并提交为 `38ba06e`；相对最新基线
+`src/bin/monitor/main.rs` 仍为零差异。BR-250 只修验证工具，不改变任何策略、订单、阈值、
+覆盖率报告或覆盖率门槛。
 
 回滚：设计与实现分别 `git revert <sha>`；禁止修改 coverage JSON 或降低阈值。
