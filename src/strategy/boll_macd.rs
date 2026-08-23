@@ -92,17 +92,50 @@ impl BollMacdSignal {
     }
 }
 
+/// 布林+MACD 真正消费的最小观察值，按时间正序（最旧 → 最新）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BollMacdObservation {
+    pub close: f64,
+    pub volume: f64,
+}
+
+/// 从真实 close/volume 窄观察值检测信号。坏值显式失败，不补零。
+pub fn detect_boll_macd_observations(
+    data: &[BollMacdObservation],
+) -> Result<BollMacdSignal, String> {
+    for (index, observation) in data.iter().enumerate() {
+        if !observation.close.is_finite() || observation.close <= 0.0 {
+            return Err(format!(
+                "boll_macd observation index={index} close is non-positive/non-finite"
+            ));
+        }
+        if !observation.volume.is_finite() || observation.volume < 0.0 {
+            return Err(format!(
+                "boll_macd observation index={index} volume is negative/non-finite"
+            ));
+        }
+    }
+    let (closes, volumes): (Vec<f64>, Vec<f64>) = data
+        .iter()
+        .map(|observation| (observation.close, observation.volume))
+        .unzip();
+    Ok(detect_boll_macd_series(&closes, &volumes))
+}
+
 /// 检测布林+MACD 共振信号
 ///
 /// `data` 倒序：`data[0]` 最新。
 pub fn detect_boll_macd_signal(data: &[KlineData]) -> BollMacdSignal {
-    if data.len() < 35 {
-        return BollMacdSignal::empty();
-    }
-
     // 转为时间正序（最旧 → 最新）
     let (closes, volumes): (Vec<f64>, Vec<f64>) =
         data.iter().rev().map(|k| (k.close, k.volume)).unzip();
+    detect_boll_macd_series(&closes, &volumes)
+}
+
+fn detect_boll_macd_series(closes: &[f64], volumes: &[f64]) -> BollMacdSignal {
+    if closes.len() < 35 || closes.len() != volumes.len() {
+        return BollMacdSignal::empty();
+    }
     let n = closes.len();
 
     // ============ 布林带 (20, 2σ) ============
@@ -138,7 +171,7 @@ pub fn detect_boll_macd_signal(data: &[KlineData]) -> BollMacdSignal {
     };
 
     // ============ MACD (6, 13, 5) ============
-    let macd = calc_macd(&closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL);
+    let macd = calc_macd(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL);
     if macd.len() < 3 {
         return BollMacdSignal::empty();
     }
@@ -148,7 +181,7 @@ pub fn detect_boll_macd_signal(data: &[KlineData]) -> BollMacdSignal {
 
     // MACD 背离（30 日窗口，DIF 为指标）
     let dif_series: Vec<f64> = macd.iter().map(|p| p.dif).collect();
-    let div = detect_divergence(&closes, &dif_series, 30, "MACD").divergence;
+    let div = detect_divergence(closes, &dif_series, 30, "MACD").divergence;
 
     let close = closes[n - 1];
 
@@ -310,5 +343,118 @@ pub fn detect_boll_macd_signal(data: &[KlineData]) -> BollMacdSignal {
         macd_hist: m.histogram,
         macd_div: div,
         vol_ratio,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_provider::AdjustType;
+
+    fn kline(close: f64, volume: f64) -> KlineData {
+        KlineData {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 8, 24).unwrap(),
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume,
+            amount: close * volume,
+            pct_chg: 0.0,
+            intraday_price: None,
+            settled: true,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            eps: None,
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
+            is_limit_up: false,
+            is_limit_down: false,
+            is_suspended: false,
+            adjust: AdjustType::None,
+        }
+    }
+
+    #[test]
+    fn br247_chronological_observation_interface_uses_only_close_and_volume() {
+        let observations = vec![
+            BollMacdObservation {
+                close: 10.0,
+                volume: 1_000.0,
+            };
+            35
+        ];
+        let signal = detect_boll_macd_observations(&observations).expect("valid observations");
+        assert_eq!(signal.close, 10.0);
+        assert_eq!(signal.upper, 10.0);
+        assert_eq!(signal.lower, 10.0);
+        assert_eq!(signal.vol_ratio, 1.0);
+    }
+
+    #[test]
+    fn br247_observation_interface_rejects_bad_source_values() {
+        let invalid_close = [BollMacdObservation {
+            close: f64::NAN,
+            volume: 1_000.0,
+        }];
+        let error = detect_boll_macd_observations(&invalid_close).unwrap_err();
+        assert!(
+            error.contains("close is non-positive/non-finite"),
+            "{error}"
+        );
+
+        let invalid_volume = [BollMacdObservation {
+            close: 10.0,
+            volume: -1.0,
+        }];
+        let error = detect_boll_macd_observations(&invalid_volume).unwrap_err();
+        assert!(error.contains("volume is negative/non-finite"), "{error}");
+    }
+
+    #[test]
+    fn br247_narrow_interface_preserves_legacy_signal_semantics() {
+        let observations = (0..80)
+            .map(|index| BollMacdObservation {
+                close: if index < 50 {
+                    10.0 + f64::from(index) * 0.04
+                } else {
+                    12.0 - (f64::from(index) - 50.0) * 0.10
+                },
+                volume: 1_000.0 + f64::from(index),
+            })
+            .collect::<Vec<_>>();
+        let descending_legacy = observations
+            .iter()
+            .rev()
+            .map(|observation| kline(observation.close, observation.volume))
+            .collect::<Vec<_>>();
+
+        let narrow = detect_boll_macd_observations(&observations).expect("valid observations");
+        let legacy = detect_boll_macd_signal(&descending_legacy);
+
+        assert_eq!(narrow.action, legacy.action);
+        assert_eq!(narrow.reason, legacy.reason);
+        assert_eq!(narrow.close, legacy.close);
+        assert_eq!(narrow.upper, legacy.upper);
+        assert_eq!(narrow.middle, legacy.middle);
+        assert_eq!(narrow.lower, legacy.lower);
+        assert_eq!(narrow.band_width_pct, legacy.band_width_pct);
+        assert_eq!(narrow.band_change_pct, legacy.band_change_pct);
+        assert_eq!(narrow.macd_dif, legacy.macd_dif);
+        assert_eq!(narrow.macd_dea, legacy.macd_dea);
+        assert_eq!(narrow.macd_hist, legacy.macd_hist);
+        assert_eq!(narrow.macd_div, legacy.macd_div);
+        assert_eq!(narrow.vol_ratio, legacy.vol_ratio);
     }
 }

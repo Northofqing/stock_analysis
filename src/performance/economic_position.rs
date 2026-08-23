@@ -491,6 +491,12 @@ fn validate_cost_ledger(
     if ledger.basis_id.trim().is_empty() {
         return Err("economic cost basis_id is empty".to_owned());
     }
+    if ledger.kind == CostBasisKind::Observed {
+        return Err(
+            "economic observed cost source-backed capability is unavailable; use Scenario or no ledger"
+                .to_owned(),
+        );
+    }
     let fill_ids = fills.iter().map(|fill| fill.id).collect::<HashSet<_>>();
     let mut costs = HashMap::with_capacity(ledger.costs.len());
     for cost in &ledger.costs {
@@ -1275,7 +1281,7 @@ mod tests {
     }
 
     #[test]
-    fn br248_complete_cost_evidence_produces_observed_net_result() {
+    fn br248_unverified_observed_cost_ledger_fails_closed() {
         let rows = vec![
             fill(
                 1,
@@ -1296,43 +1302,13 @@ mod tests {
                 "BR-234四大铁律卖出",
             ),
         ];
-        let mut ledger = complete_costs(CostBasisKind::Observed, &rows, 5.0);
-        ledger.costs[1].adverse_cost = 6.0;
-
-        let report = rebuild_economic_positions(&rows, date("2026-01-06"), Some(&ledger)).unwrap();
-
-        assert!(matches!(
-            &report.closed_positions[0].net,
-            NetMetrics::Available {
-                kind: CostBasisKind::Observed,
-                net_pnl,
-                total_adverse_cost,
-                outcome: NetOutcomeClass::Profit,
-                ..
-            } if *net_pnl == 189.0 && *total_adverse_cost == 11.0
-        ));
-        assert_eq!(
-            report.cost_basis,
-            Some(CostBasisAudit {
-                basis_id: "TEST_CODE_Observed_COST_V1".to_owned(),
-                kind: CostBasisKind::Observed,
-                evidence_ids: vec![
-                    "TEST_CODE_COST_EVIDENCE_1".to_owned(),
-                    "TEST_CODE_COST_EVIDENCE_2".to_owned(),
-                ],
-            })
+        let ledger = complete_costs(CostBasisKind::Observed, &rows, 5.0);
+        let error =
+            rebuild_economic_positions(&rows, date("2026-01-06"), Some(&ledger)).unwrap_err();
+        assert!(
+            error.contains("source-backed capability is unavailable"),
+            "{error}"
         );
-        assert!(matches!(
-            report.net_summary,
-            NetSummary::Available {
-                kind: CostBasisKind::Observed,
-                wins: 1,
-                losses: 0,
-                breakeven: 0,
-                win_rate: Some(rate),
-                ..
-            } if rate == 1.0
-        ));
     }
 
     #[test]

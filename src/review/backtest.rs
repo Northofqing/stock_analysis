@@ -8,19 +8,19 @@
 //!      需要 MagicTdxT0Evidence 实时数据), 历史回放不可得 → 标注不可回测。
 //!
 //! 数据: TDX 15 分钟 K线 (get_security_bars KLINE_15MIN=1, 升序 旧→新,
-//! 单次 ≤800 根 ≈ 50 交易日)。KlineData 只有
-//! NaiveDate 无时分 → 本模块直接操作原始 SecurityBar 做时间对齐, 转
-//! KlineData 仅用于喂 detect_boll_macd_signal (该函数只用数组顺序)。
+//! 单次 ≤800 根 ≈ 50 交易日)。本模块只操作原始 SecurityBar；boll_macd
+//! 通过仅含真实 close/volume 的窄观察接口消费，不构造证据外字段。
 //!
 //! 纯计算函数与网络/DB 薄壳分离: 单测不依赖网络。
 
 use crate::magic_compat::SecurityBar;
-use chrono::{Duration, NaiveDate, NaiveDateTime};
+use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 
 use crate::data_gateway::historical_bars::HistoricalBarsGateway;
-use crate::data_provider::{AdjustType, KlineData};
 use crate::performance::attribution::{signal_family_of, SignalFamily};
-use crate::strategy::boll_macd::{detect_boll_macd_signal, BollMacdAction, BollMacdSignal};
+use crate::strategy::boll_macd::{
+    detect_boll_macd_observations, BollMacdAction, BollMacdObservation,
+};
 use crate::trading::paper_lot_ledger::parse_paper_fill_timestamp;
 
 /// 一组买入事件的统计结果（单窗口）。`up_rate` 只是终点上涨比例，
@@ -98,6 +98,72 @@ fn security_bar_time(bar: &SecurityBar, index: usize) -> Result<NaiveDateTime, S
         })
 }
 
+fn start_stamped_slot(time: NaiveTime) -> Option<u8> {
+    let minute = time.hour().checked_mul(60)?.checked_add(time.minute())?;
+    let (start, base_slot) = if (570..=675).contains(&minute) {
+        (570, 0_u32)
+    } else if (780..=885).contains(&minute) {
+        (780, 8_u32)
+    } else {
+        return None;
+    };
+    let offset = minute.checked_sub(start)?;
+    if offset % 15 != 0 {
+        return None;
+    }
+    u8::try_from(base_slot.checked_add(offset / 15)?).ok()
+}
+
+fn end_stamped_slot(time: NaiveTime) -> Option<u8> {
+    let minute = time.hour().checked_mul(60)?.checked_add(time.minute())?;
+    let (start, base_slot) = if (585..=690).contains(&minute) {
+        (585, 0_u32)
+    } else if (795..=900).contains(&minute) {
+        (795, 8_u32)
+    } else {
+        return None;
+    };
+    let offset = minute.checked_sub(start)?;
+    if offset % 15 != 0 {
+        return None;
+    }
+    u8::try_from(base_slot.checked_add(offset / 15)?).ok()
+}
+
+fn sequence_is_continuous_for(
+    times: &[NaiveDateTime],
+    slot_of: fn(NaiveTime) -> Option<u8>,
+) -> Result<bool, String> {
+    let slots = times
+        .iter()
+        .map(|time| slot_of(time.time()))
+        .collect::<Option<Vec<_>>>();
+    let Some(slots) = slots else {
+        return Ok(false);
+    };
+    for (time_pair, slot_pair) in times.windows(2).zip(slots.windows(2)) {
+        let previous_time = time_pair[0];
+        let next_time = time_pair[1];
+        let previous_slot = slot_pair[0];
+        let next_slot = slot_pair[1];
+        if previous_time.date() == next_time.date() {
+            if previous_slot.checked_add(1) != Some(next_slot) {
+                return Ok(false);
+            }
+            continue;
+        }
+        if previous_slot != 15 || next_slot != 0 {
+            return Ok(false);
+        }
+        let expected_previous =
+            crate::calendar::verified_prev_a_share_trading_day(next_time.date())?;
+        if expected_previous != previous_time.date() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// BR-247：生产入口消费前的结构门。来源/新鲜度由未来发布的 TechnicalBars
 /// 能力负责；这里仍拒绝空批次、坏 OHLC、负量额、重复或逆序时间。
 pub fn validate_technical_bars(bars: &[SecurityBar]) -> Result<(), String> {
@@ -105,6 +171,7 @@ pub fn validate_technical_bars(bars: &[SecurityBar]) -> Result<(), String> {
         return Err("technical bars are empty".to_owned());
     }
     let mut previous = None;
+    let mut times = Vec::with_capacity(bars.len());
     for (index, bar) in bars.iter().enumerate() {
         let time = security_bar_time(bar, index)?;
         if previous.is_some_and(|old| old >= time) {
@@ -113,6 +180,15 @@ pub fn validate_technical_bars(bars: &[SecurityBar]) -> Result<(), String> {
             ));
         }
         previous = Some(time);
+        if !crate::calendar::verified_a_share_trading_day(time.date()).map_err(|error| {
+            format!("technical bar index={index} trading calendar unavailable: {error}")
+        })? {
+            return Err(format!(
+                "technical bar index={index} falls on a non-trading date: {}",
+                time.date()
+            ));
+        }
+        times.push(time);
         let prices = [bar.open, bar.high, bar.low, bar.close];
         if prices
             .iter()
@@ -133,12 +209,17 @@ pub fn validate_technical_bars(bars: &[SecurityBar]) -> Result<(), String> {
             ));
         }
     }
+    let start_stamped = sequence_is_continuous_for(&times, start_stamped_slot)?;
+    let end_stamped = sequence_is_continuous_for(&times, end_stamped_slot)?;
+    if !start_stamped && !end_stamped {
+        return Err("technical bars are not continuous on a stable 15-minute grid".to_owned());
+    }
     Ok(())
 }
 
-/// 在升序 15min bars 里定位最后一个可见 bar。坏 K 线必须显式失败；早于
-/// 第一根或不早于最新一根（无法证明被下一根边界包住）保持 `Ok(None)`，
-/// 禁止补配边界索引。
+/// 在升序 15min bars 里定位与信号北京时间完全相等的来源 bar 边界。
+/// raw TechnicalBars 尚未发布区间起止语义，因此任意非边界分钟、午休、
+/// 盘前或盘后时间保持 `Ok(None)`，禁止映射到此前 bar。
 pub fn locate_signal_bar(
     bars: &[SecurityBar],
     signal_utc: NaiveDateTime,
@@ -147,14 +228,16 @@ pub fn locate_signal_bar(
     let bj = signal_utc
         .checked_add_signed(Duration::hours(8))
         .ok_or_else(|| format!("signal timestamp overflow after UTC+8 conversion: {signal_utc}"))?;
-    let mut next_index = None;
     for (index, bar) in bars.iter().enumerate() {
-        if security_bar_time(bar, index)? > bj {
-            next_index = Some(index);
+        let bar_time = security_bar_time(bar, index)?;
+        if bar_time == bj {
+            return Ok(Some(index));
+        }
+        if bar_time > bj {
             break;
         }
     }
-    Ok(next_index.and_then(|index| index.checked_sub(1)))
+    Ok(None)
 }
 
 /// 计算 forward return: (bars[idx+n].close - base_price) / base_price。
@@ -163,8 +246,8 @@ pub fn forward_return(bars: &[SecurityBar], idx: usize, n: usize, base_price: f6
     forward_observation(bars, idx, n, base_price).map(|observation| observation.terminal_ret)
 }
 
-/// 从信号后的完整路径计算终点收益及逐事件 MFE/MAE。MFE 以 0 为下界，
-/// MAE 以 0 为上界，分别表示最好和最坏的路径内变动。
+/// 从信号后的完整路径计算终点收益及逐事件 MFE/MAE。终点使用最后一根
+/// `close`，MFE/MAE 分别消费每根真实 `high/low`；二者以 0 为初始界。
 pub fn forward_observation(
     bars: &[SecurityBar],
     idx: usize,
@@ -179,12 +262,16 @@ pub fn forward_observation(
     let mut mfe = 0.0_f64;
     let mut mae = 0.0_f64;
     for bar in path {
-        if !bar.close.is_finite() || bar.close <= 0.0 {
+        if [bar.close, bar.high, bar.low]
+            .iter()
+            .any(|price| !price.is_finite() || *price <= 0.0)
+        {
             return None;
         }
-        let ret = (bar.close - base_price) / base_price;
-        mfe = mfe.max(ret);
-        mae = mae.min(ret);
+        let favorable_ret = (bar.high - base_price) / base_price;
+        let adverse_ret = (bar.low - base_price) / base_price;
+        mfe = mfe.max(favorable_ret);
+        mae = mae.min(adverse_ret);
     }
     let terminal_ret = (path.last()?.close - base_price) / base_price;
     Some(EventObservation {
@@ -229,97 +316,28 @@ pub fn aggregate_group(
     }
 }
 
-fn forward_observation_desc(
-    desc: &[KlineData],
-    index: usize,
-    n: usize,
-) -> Option<EventObservation> {
-    let base = desc.get(index)?.close;
-    if !base.is_finite() || base <= 0.0 || n == 0 {
-        return None;
-    }
-    let end = index.checked_sub(n)?;
-    let mut mfe = 0.0_f64;
-    let mut mae = 0.0_f64;
-    for bar in &desc[end..index] {
-        if !bar.close.is_finite() || bar.close <= 0.0 {
-            return None;
-        }
-        let ret = (bar.close - base) / base;
-        mfe = mfe.max(ret);
-        mae = mae.min(ret);
-    }
-    let terminal_ret = (desc.get(end)?.close - base) / base;
-    Some(EventObservation {
-        terminal_ret,
-        mfe,
-        mae,
-    })
-}
-
-/// 已验证升序 SecurityBar → 降序 KlineData（data[0]=最新）。
-pub fn bars_to_desc_kline(bars: &[SecurityBar]) -> Result<Vec<KlineData>, String> {
+/// 在已验证的升序 SecurityBar 上逐个历史边界运行 boll_macd。
+/// 返回的 index 与原始 bars 一致，未来路径统一复用 `forward_observation`。
+pub fn scan_boll_macd_buys(bars: &[SecurityBar]) -> Result<Vec<(usize, BollMacdAction)>, String> {
     validate_technical_bars(bars)?;
-    bars.iter()
-        .enumerate()
-        .rev()
-        .map(|(index, bar)| {
-            let date = security_bar_time(bar, index)?.date();
-            Ok(KlineData {
-                date,
-                open: bar.open,
-                high: bar.high,
-                low: bar.low,
-                close: bar.close,
-                volume: bar.vol,
-                amount: bar.amount,
-                pct_chg: 0.0,
-                intraday_price: None,
-                settled: true,
-                pe_ratio: None,
-                pb_ratio: None,
-                turnover_rate: None,
-                market_cap: None,
-                circulating_cap: None,
-                eps: None,
-                roe: None,
-                revenue_yoy: None,
-                net_profit_yoy: None,
-                gross_margin: None,
-                net_margin: None,
-                sharpe_ratio: None,
-                financials_history: None,
-                valuation_history: None,
-                consensus: None,
-                industry: None,
-                is_limit_up: false,
-                is_limit_down: false,
-                is_suspended: false,
-                adjust: AdjustType::None,
-            })
+    let observations = bars
+        .iter()
+        .map(|bar| BollMacdObservation {
+            close: bar.close,
+            volume: bar.vol,
         })
-        .collect()
-}
-
-/// 在降序 KlineData 上滑动窗口跑 detect_boll_macd_signal:
-/// 对每个位置 j (0..=len-35, data[j] 作为该时刻最新 bar, 窗口 data[j..]
-/// 含 ≥35 根), 若 action ∈ 买入信号则返回 (j, action)。
-/// 调用方用 j-n 取未来第 n 根 (j 越小越新, j-n 是 j 之后第 n 根)。
-pub fn scan_boll_macd_buys(desc: &[KlineData]) -> Vec<(usize, BollMacdAction)> {
+        .collect::<Vec<_>>();
     let mut signals = Vec::new();
-    let max_j = desc.len().saturating_sub(35);
-    for j in 0..=max_j {
-        let sig: BollMacdSignal = detect_boll_macd_signal(&desc[j..]);
-        if BUY_ACTIONS.contains(&sig.action) {
-            signals.push((j, sig.action));
+    if observations.len() < 35 {
+        return Ok(signals);
+    }
+    for index in (34..observations.len()).rev() {
+        let signal = detect_boll_macd_observations(&observations[..=index])?;
+        if BUY_ACTIONS.contains(&signal.action) {
+            signals.push((index, signal.action));
         }
     }
-    signals
-}
-
-/// 降序数组上, 信号在位置 j, 未来第 n 根 = j - n。计算 forward return。
-pub fn forward_return_desc(desc: &[KlineData], j: usize, n: usize) -> Option<f64> {
-    forward_observation_desc(desc, j, n).map(|observation| observation.terminal_ret)
+    Ok(signals)
 }
 
 // ============================================================
@@ -594,16 +612,17 @@ where
     for code in codes {
         let bars = load_technical_bars_cached(bars_by_code, code, |code| loader(code))
             .map_err(|error| format!("R-12 boll_macd bars unavailable for {code}: {error}"))?;
-        let desc = bars_to_desc_kline(bars)
+        let signals = scan_boll_macd_buys(bars)
             .map_err(|error| format!("R-12 boll_macd bars invalid for {code}: {error}"))?;
-        let signals = scan_boll_macd_buys(&desc);
-        for (j, action) in signals {
+        for (index, action) in signals {
             let label = format!("{action:?}");
             let group = observations_by_action
                 .entry(label)
                 .or_insert_with(|| vec![Vec::new(), Vec::new()]);
             for (wi, window) in WINDOWS_BARS.iter().enumerate() {
-                if let Some(observation) = forward_observation_desc(&desc, j, *window) {
+                if let Some(observation) =
+                    forward_observation(bars, index, *window, bars[index].close)
+                {
                     group[wi].push(observation);
                 } else {
                     censored_windows += 1;
@@ -835,7 +854,7 @@ mod tests {
     }
 
     fn sample_bars() -> Vec<SecurityBar> {
-        // 2026-08-10 全天 16 根 15min (9:30-11:30, 13:00-15:00)
+        // 起点标记制：2026-08-10 全天 16 根 15min。
         let mut bars = Vec::new();
         let d = (2026, 8, 10);
         for (h, m) in [
@@ -847,7 +866,6 @@ mod tests {
             (10, 45),
             (11, 0),
             (11, 15),
-            (11, 30),
             (13, 0),
             (13, 15),
             (13, 30),
@@ -855,14 +873,45 @@ mod tests {
             (14, 0),
             (14, 15),
             (14, 30),
+            (14, 45),
         ] {
             bars.push(bar(d, (h, m), 10.0));
         }
         bars
     }
 
+    fn end_stamped_bars() -> Vec<SecurityBar> {
+        let d = (2026, 8, 10);
+        [
+            (9, 45),
+            (10, 0),
+            (10, 15),
+            (10, 30),
+            (10, 45),
+            (11, 0),
+            (11, 15),
+            (11, 30),
+            (13, 15),
+            (13, 30),
+            (13, 45),
+            (14, 0),
+            (14, 15),
+            (14, 30),
+            (14, 45),
+            (15, 0),
+        ]
+        .into_iter()
+        .map(|hhmm| bar(d, hhmm, 10.0))
+        .collect()
+    }
+
     #[test]
-    fn locate_signal_bar_finds_bracketing_bar() {
+    fn br247_complete_end_stamped_grid_is_admitted() {
+        validate_technical_bars(&end_stamped_bars()).expect("complete end-stamped grid");
+    }
+
+    #[test]
+    fn locate_signal_bar_finds_exact_source_boundary() {
         let bars = sample_bars();
         // 北京时间 9:25 早于第一根已完成 K 线，不能偷配到 idx 0。
         let utc = NaiveDate::from_ymd_opt(2026, 8, 10)
@@ -870,24 +919,24 @@ mod tests {
             .and_hms_opt(1, 25, 0)
             .unwrap();
         assert_eq!(locate_signal_bar(&bars, utc).unwrap(), None);
-        // 北京时间 10:23 → 最后 bar <= 10:23 是 10:15 (idx 3)
+        // 北京时间 10:15 → 与来源 bar 边界精确相等 (idx 3)
         let utc = NaiveDate::from_ymd_opt(2026, 8, 10)
             .unwrap()
-            .and_hms_opt(2, 23, 0)
+            .and_hms_opt(2, 15, 0)
             .unwrap();
         assert_eq!(locate_signal_bar(&bars, utc).unwrap(), Some(3));
-        // 北京时间 9:31 → 9:30 (idx 0)
+        // 北京时间 9:30 → idx 0
         let utc = NaiveDate::from_ymd_opt(2026, 8, 10)
             .unwrap()
-            .and_hms_opt(1, 31, 0)
+            .and_hms_opt(1, 30, 0)
             .unwrap();
         assert_eq!(locate_signal_bar(&bars, utc).unwrap(), Some(0));
-        // 北京时间 14:25 → 14:15 (idx 14)
+        // 北京时间 14:15 → idx 13
         let utc = NaiveDate::from_ymd_opt(2026, 8, 10)
             .unwrap()
-            .and_hms_opt(6, 25, 0)
+            .and_hms_opt(6, 15, 0)
             .unwrap();
-        assert_eq!(locate_signal_bar(&bars, utc).unwrap(), Some(14));
+        assert_eq!(locate_signal_bar(&bars, utc).unwrap(), Some(13));
         // 北京时间 15:05 (盘后, 无 bar 承载) → None — 收盘后信号对齐失败
         let utc = NaiveDate::from_ymd_opt(2026, 8, 10)
             .unwrap()
@@ -903,11 +952,37 @@ mod tests {
     }
 
     #[test]
+    fn br247_only_exact_source_bar_boundaries_are_aligned() {
+        let bars = sample_bars();
+        let exact_boundary = NaiveDate::from_ymd_opt(2026, 8, 10)
+            .unwrap()
+            .and_hms_opt(2, 15, 0)
+            .unwrap();
+        assert_eq!(locate_signal_bar(&bars, exact_boundary).unwrap(), Some(3));
+
+        let inside_unpublished_interval = NaiveDate::from_ymd_opt(2026, 8, 10)
+            .unwrap()
+            .and_hms_opt(2, 23, 0)
+            .unwrap();
+        assert_eq!(
+            locate_signal_bar(&bars, inside_unpublished_interval).unwrap(),
+            None,
+            "raw TechnicalBars has no source-backed interval semantics"
+        );
+
+        let lunch_break = NaiveDate::from_ymd_opt(2026, 8, 10)
+            .unwrap()
+            .and_hms_opt(3, 45, 0)
+            .unwrap();
+        assert_eq!(locate_signal_bar(&bars, lunch_break).unwrap(), None);
+    }
+
+    #[test]
     fn forward_return_uses_close_after_n_bars() {
         let mut bars = sample_bars();
-        bars[5].close = 11.0; // 10:45 bar
-        bars[9].close = 12.5; // 13:00 bar
-                              // idx 5, n=4 → bars[9].close = 12.5, base 11.0 → +13.64%
+        bars[5] = bar((2026, 8, 10), (10, 45), 11.0);
+        bars[9] = bar((2026, 8, 10), (13, 15), 12.5);
+        // idx 5, n=4 → bars[9].close = 12.5, base 11.0 → +13.64%
         let ret = forward_return(&bars, 5, 4, 11.0).expect("ret");
         assert!((ret - 0.13636).abs() < 0.001);
         let observation = forward_observation(&bars, 5, 4, 11.0).expect("path observation");
@@ -917,6 +992,18 @@ mod tests {
         assert_eq!(forward_return(&bars, 15, 4, 10.0), None);
         // base <= 0
         assert_eq!(forward_return(&bars, 5, 1, 0.0), None);
+    }
+
+    #[test]
+    fn br247_path_mfe_uses_high_and_mae_uses_low() {
+        let mut bars = sample_bars();
+        bars[6].close = 10.0;
+        bars[6].high = 12.0;
+        bars[6].low = 8.0;
+        let observation = forward_observation(&bars, 5, 1, 10.0).expect("complete path");
+        assert_eq!(observation.terminal_ret, 0.0);
+        assert!((observation.mfe - 0.2).abs() < 1e-9);
+        assert!((observation.mae + 0.2).abs() < 1e-9);
     }
 
     #[test]
@@ -971,77 +1058,50 @@ mod tests {
     }
 
     #[test]
-    fn bars_to_desc_kline_reverses_order() {
-        let mut bars = sample_bars();
-        bars[15] = bar((2026, 8, 10), (14, 30), 9.0);
-        let desc = bars_to_desc_kline(&bars).expect("valid bars");
-        assert_eq!(desc.len(), 16);
-        // data[0] = 最新 (14:30)
-        assert_eq!(desc[0].close, 9.0);
-        assert_eq!(desc[15].close, 10.0);
-        // date 单调降序
-        assert!(desc[0].date >= desc[15].date);
-    }
-
-    #[test]
-    fn scan_boll_macd_buys_detects_signal_and_forward_return_desc() {
+    fn scan_boll_macd_buys_uses_raw_bars_and_shared_forward_path() {
         // 合成 80 根序列: 缓涨 50 根 (MACD 转正) 后急跌 30 根 (触下轨 +
         // MACD 绿柱缩短) → BottomBuy (实测 variant=1 触发 7 个信号)。
-        // 注意 desc[0]=最新 (急跌末端), desc[79]=最旧 (缓涨起点) —
-        // 构造 raw 时 i=0 最旧, i 越大越新。
-        let mut raw: Vec<KlineData> = Vec::new();
-        for i in 0..80 {
-            // 0..50 缓涨 10→12; 50..80 急跌 12→9
-            let close = if i < 50 {
-                10.0 + (i as f64) * 0.04
-            } else {
-                12.0 - (i as f64 - 50.0) * 0.10
-            };
-            let volume = 1_000.0;
-            raw.push(KlineData {
-                date: NaiveDate::from_ymd_opt(2026, 8, 1)
-                    .unwrap()
-                    .checked_sub_days(chrono::Days::new(i as u64))
-                    .expect("date"),
-                open: close,
-                high: close,
-                low: close,
-                close,
-                volume,
-                amount: close * volume,
-                pct_chg: 0.0,
-                intraday_price: None,
-                settled: true,
-                pe_ratio: None,
-                pb_ratio: None,
-                turnover_rate: None,
-                market_cap: None,
-                circulating_cap: None,
-                eps: None,
-                roe: None,
-                revenue_yoy: None,
-                net_profit_yoy: None,
-                gross_margin: None,
-                net_margin: None,
-                sharpe_ratio: None,
-                financials_history: None,
-                valuation_history: None,
-                consensus: None,
-                industry: None,
-                is_limit_up: false,
-                is_limit_down: false,
-                is_suspended: false,
-                adjust: AdjustType::None,
-            });
+        let slots = [
+            (9, 30),
+            (9, 45),
+            (10, 0),
+            (10, 15),
+            (10, 30),
+            (10, 45),
+            (11, 0),
+            (11, 15),
+            (13, 0),
+            (13, 15),
+            (13, 30),
+            (13, 45),
+            (14, 0),
+            (14, 15),
+            (14, 30),
+            (14, 45),
+        ];
+        let mut bars = Vec::new();
+        for date in [
+            (2026, 8, 3),
+            (2026, 8, 4),
+            (2026, 8, 5),
+            (2026, 8, 6),
+            (2026, 8, 7),
+        ] {
+            for slot in slots {
+                let index = bars.len();
+                let close = if index < 50 {
+                    10.0 + (index as f64) * 0.04
+                } else {
+                    12.0 - (index as f64 - 50.0) * 0.10
+                };
+                bars.push(bar(date, slot, close));
+            }
         }
-        // raw[0]=最旧 → 反转使 desc[0]=最新
-        let desc: Vec<KlineData> = raw.into_iter().rev().collect();
-        let signals = scan_boll_macd_buys(&desc);
+        let signals = scan_boll_macd_buys(&bars).expect("valid raw technical bars");
         assert!(!signals.is_empty(), "expected at least one buy signal");
-        // forward return 在信号后可用
-        let (j, _) = signals[0];
-        let r4 = forward_return_desc(&desc, j, 4);
-        let r16 = forward_return_desc(&desc, j, 16);
+        let (index, _) = signals[0];
+        let r4 = forward_return(&bars, index, 4, bars[index].close);
+        let r16 = forward_return(&bars, index, 16, bars[index].close);
         assert!(r4.is_some() || r16.is_some());
     }
 
@@ -1158,6 +1218,33 @@ mod tests {
         assert!(validate_technical_bars(&unordered)
             .unwrap_err()
             .contains("not strictly ordered"));
+    }
+
+    #[test]
+    fn br247_internal_technical_bar_gap_fails_closed() {
+        let mut bars = sample_bars();
+        bars.remove(4);
+        let error = validate_technical_bars(&bars).unwrap_err();
+        assert!(error.contains("not continuous"), "{error}");
+    }
+
+    #[test]
+    fn br247_cross_trading_day_gap_fails_closed() {
+        let bars = vec![
+            bar((2026, 8, 3), (14, 45), 10.0),
+            bar((2026, 8, 5), (9, 30), 10.0),
+        ];
+        let error = validate_technical_bars(&bars).unwrap_err();
+        assert!(error.contains("not continuous"), "{error}");
+    }
+
+    #[test]
+    fn br247_mixed_timestamp_conventions_fail_closed() {
+        let mut bars = sample_bars();
+        bars.remove(8);
+        bars.push(bar((2026, 8, 10), (15, 0), 10.0));
+        let error = validate_technical_bars(&bars).unwrap_err();
+        assert!(error.contains("not continuous"), "{error}");
     }
 
     #[test]

@@ -8999,6 +8999,70 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
 /// spawn_blocking 内；任一来源或结构失败均显式失败，不发布部分结果。
 const R12_TECHNICAL_BARS_PUBLISHED: bool = false;
 
+fn r12_has_auditable_result(result: &stock_analysis::review::backtest::R12BacktestResult) -> bool {
+    !result.virtual_buy.is_empty()
+        || !result.boll_macd.is_empty()
+        || result.exit_rows_excluded > 0
+        || result.unaligned_signals > 0
+        || result.censored_windows > 0
+}
+
+fn r12_group_event_count(
+    groups: &[stock_analysis::review::backtest::SignalGroup],
+    label: &str,
+) -> Result<usize, String> {
+    groups.iter().try_fold(0_usize, |total, group| {
+        total
+            .checked_add(group.count)
+            .ok_or_else(|| format!("R-12 {label} event count overflow"))
+    })
+}
+
+fn r12_source_binding_canonical(
+    date: chrono::NaiveDate,
+    result: &stock_analysis::review::backtest::R12BacktestResult,
+) -> Result<Vec<u8>, String> {
+    let binding = serde_json::json!({
+        "date": date.format("%Y-%m-%d").to_string(),
+        "virtual_group_count": result.virtual_buy.len(),
+        "virtual_event_count": r12_group_event_count(&result.virtual_buy, "virtual")?,
+        "exit_rows_excluded": result.exit_rows_excluded,
+        "boll_macd_group_count": result.boll_macd.len(),
+        "boll_macd_event_count": r12_group_event_count(&result.boll_macd, "boll_macd")?,
+        "unaligned_signals": result.unaligned_signals,
+        "censored_windows": result.censored_windows,
+    });
+    serde_json::to_vec(&binding)
+        .map_err(|error| format!("R-12 source binding serialization failed: {error}"))
+}
+
+#[cfg(test)]
+mod tests_r12_review_audit {
+    use super::{r12_has_auditable_result, r12_source_binding_canonical};
+
+    #[test]
+    fn br247_censoring_counts_remain_auditable_without_statistical_groups() {
+        assert!(!r12_has_auditable_result(
+            &stock_analysis::review::backtest::R12BacktestResult::default()
+        ));
+
+        let result = stock_analysis::review::backtest::R12BacktestResult {
+            exit_rows_excluded: 1,
+            unaligned_signals: 2,
+            censored_windows: 3,
+            ..Default::default()
+        };
+        assert!(r12_has_auditable_result(&result));
+
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 24).unwrap();
+        let canonical = r12_source_binding_canonical(date, &result).expect("canonical binding");
+        let value: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
+        assert_eq!(value["exit_rows_excluded"], 1);
+        assert_eq!(value["unaligned_signals"], 2);
+        assert_eq!(value["censored_windows"], 3);
+    }
+}
+
 async fn dispatch_r12_backtest_outcome_with_runner<Runner, RunnerFuture>(
     date: &str,
     runner: Runner,
@@ -9072,23 +9136,16 @@ async fn dispatch_r12_backtest_after_capability(
             return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
         }
     };
-    let has_signals = !result.virtual_buy.is_empty() || !result.boll_macd.is_empty();
-    if !has_signals {
+    if !r12_has_auditable_result(&result) {
         log_dispatcher_attempt("R-12", false, 0, "no backtest signals in window");
         return crate::review_batch::ReviewTaskOutcome::no_data("no backtest signals in window");
     }
     let text = stock_analysis::review::backtest::render_r12(&result);
     // BR-192 counted delivery: 信号计数来自同一回测窗口 (确定性), 决策身份稳定 →
     // 重启错过补偿批重跑时 preflight 复用, 不再重复推送。
-    let source_binding_canonical = match serde_json::to_vec(&(
-        date,
-        result.virtual_buy.len(),
-        result.exit_rows_excluded,
-        result.boll_macd.len(),
-    )) {
+    let source_binding_canonical = match r12_source_binding_canonical(today, &result) {
         Ok(canonical) => canonical,
-        Err(error) => {
-            let reason = format!("R-12 source binding serialization failed: {error}");
+        Err(reason) => {
             log_dispatcher_attempt("R-12", false, 1, &reason);
             return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
         }
