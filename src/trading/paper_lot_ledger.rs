@@ -2,6 +2,31 @@
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 
+/// 解析持久化纸面成交的规范时间。禁止 SQLite/调用方把 `now`、仅日期或仅时间
+/// 补造成事实；执行账本与策略研究共用同一严格边界。
+pub(crate) fn parse_paper_fill_timestamp(
+    fill_id: i64,
+    raw: &str,
+) -> Result<chrono::NaiveDateTime, String> {
+    let parsed = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")
+        .map_err(|error| format!("paper fill id={fill_id} timestamp invalid: {error}"))?;
+    let whole_seconds = parsed.format("%Y-%m-%d %H:%M:%S").to_string();
+    let canonical = raw == whole_seconds
+        || raw
+            .strip_prefix(&format!("{whole_seconds}."))
+            .is_some_and(|fraction| {
+                !fraction.is_empty()
+                    && fraction.len() <= 9
+                    && fraction.bytes().all(|byte| byte.is_ascii_digit())
+            });
+    if !canonical {
+        return Err(format!(
+            "paper fill id={fill_id} timestamp invalid: expected YYYY-MM-DD HH:MM:SS[.fraction], got {raw:?}"
+        ));
+    }
+    Ok(parsed)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PaperFill {
     pub id: i64,

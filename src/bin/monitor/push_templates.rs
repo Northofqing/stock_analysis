@@ -8991,11 +8991,12 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
     crate::review_batch::ReviewTaskOutcome::from_push_outcome(result, 1)
 }
 
-/// R-12: 盘后 15min 回测段 — 用 15 分钟 K线回测虚拟仓买卖信号 + boll_macd 信号。
+/// R-12: 盘后 15min 买入事件研究 — 只衡量虚拟仓入场与 boll_macd 入场后的
+/// 短期价格路径，不把卖出原因或事件上涨比例冒充完整策略胜率。
 /// T0 做T 信号依赖实时五档盘口 (MagicTdxT0Evidence bid/ask + 分时均价), 历史不可得 →
 /// 由 render_r12 文本标注"不可回测" (用户已确认)。
-/// 回测窗口 = 近 30 自然日 (覆盖虚拟仓 7/14 起全部信号); 网络拉取 + SQLite 读表在
-/// spawn_blocking 内, 失败出声 (failed), 单只拉取失败在模块内 warn 跳过。
+/// 研究窗口 = 近 30 自然日；网络拉取 + SQLite 读表在
+/// spawn_blocking 内；任一来源或结构失败均显式失败，不发布部分结果。
 const R12_TECHNICAL_BARS_PUBLISHED: bool = false;
 
 async fn dispatch_r12_backtest_outcome_with_runner<Runner, RunnerFuture>(
@@ -9056,8 +9057,8 @@ async fn dispatch_r12_backtest_after_capability(
             return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
         }
     }
-    let result = match tokio::task::spawn_blocking(|| {
-        stock_analysis::review::backtest::run_full_backtest(30)
+    let result = match tokio::task::spawn_blocking(move || {
+        stock_analysis::review::backtest::run_full_backtest(today, 30)
     })
     .await
     {
@@ -9071,9 +9072,7 @@ async fn dispatch_r12_backtest_after_capability(
             return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
         }
     };
-    let has_signals = !result.virtual_buy.is_empty()
-        || !result.virtual_sell.is_empty()
-        || !result.boll_macd.is_empty();
+    let has_signals = !result.virtual_buy.is_empty() || !result.boll_macd.is_empty();
     if !has_signals {
         log_dispatcher_attempt("R-12", false, 0, "no backtest signals in window");
         return crate::review_batch::ReviewTaskOutcome::no_data("no backtest signals in window");
@@ -9084,7 +9083,7 @@ async fn dispatch_r12_backtest_after_capability(
     let source_binding_canonical = match serde_json::to_vec(&(
         date,
         result.virtual_buy.len(),
-        result.virtual_sell.len(),
+        result.exit_rows_excluded,
         result.boll_macd.len(),
     )) {
         Ok(canonical) => canonical,
@@ -15847,24 +15846,23 @@ pub fn build_test_template_catalog(
                     reason: "TEST_CODE NewsCatalyst".to_string(),
                     window_bars: 4,
                     count: 50,
-                    win_rate: Some(0.36),
-                    avg_ret: Some(0.0031),
-                    mfe: Some(0.089),
-                    mae: Some(-0.026),
+                    up_rate: Some(0.36),
+                    avg_terminal_ret: Some(0.0031),
+                    avg_mfe: Some(0.089),
+                    avg_mae: Some(-0.026),
                 }],
-                virtual_sell: Vec::new(),
-                broken_excluded: 190,
+                exit_rows_excluded: 100,
                 boll_macd: vec![stock_analysis::review::backtest::SignalGroup {
                     reason: "TEST_CODE BottomBuy".to_string(),
                     window_bars: 4,
                     count: 10224,
-                    win_rate: Some(0.44),
-                    avg_ret: Some(-0.0003),
-                    mfe: Some(0.2),
-                    mae: Some(-0.103),
+                    up_rate: Some(0.44),
+                    avg_terminal_ret: Some(-0.0003),
+                    avg_mfe: Some(0.2),
+                    avg_mae: Some(-0.103),
                 }],
-                skipped_codes: Vec::new(),
                 unaligned_signals: 0,
+                censored_windows: 0,
             },
         ),
     );

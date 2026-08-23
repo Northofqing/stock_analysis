@@ -1,14 +1,14 @@
-//! R-12 盘后回测 — 用 15 分钟 K线数据回测策略信号。
+//! R-12 买入事件研究 — 用 15 分钟 K 线衡量入场后的短期价格路径。
+//! Registered business rules: BR-239, BR-247.
 //!
-//! 背景: 盘后复盘 (R-01~R-11) 全为当日回顾 + 明日计划, 无策略回测。
-//! 用户要求补上, 明确「用 15 分钟 K线数据进行回测」, 三个信号全回测:
-//!   1. 虚拟仓买卖信号 (paper_trades 历史成交, 8 类 virtual_reason)
+//! 本模块不是完整策略回测，不计算买入到卖出的净胜率。它只报告：
+//!   1. 虚拟仓已成交买入事件 (paper_trades Filled buy, 9 类入场来源)
 //!   2. boll_macd 信号 (15min 滑动窗口 detect_boll_macd_signal)
 //!   3. T0 做T 信号 — 依赖实时五档盘口 + 分时均价 (t0_advisor::evaluate_structured
 //!      需要 MagicTdxT0Evidence 实时数据), 历史回放不可得 → 标注不可回测。
 //!
 //! 数据: TDX 15 分钟 K线 (get_security_bars KLINE_15MIN=1, 升序 旧→新,
-//! 单次 ≤800 根 ≈ 50 交易日, 覆盖虚拟仓 7/14 起全部信号)。KlineData 只有
+//! 单次 ≤800 根 ≈ 50 交易日)。KlineData 只有
 //! NaiveDate 无时分 → 本模块直接操作原始 SecurityBar 做时间对齐, 转
 //! KlineData 仅用于喂 detect_boll_macd_signal (该函数只用数组顺序)。
 //!
@@ -19,160 +19,253 @@ use chrono::{Duration, NaiveDate, NaiveDateTime};
 
 use crate::data_gateway::historical_bars::HistoricalBarsGateway;
 use crate::data_provider::{AdjustType, KlineData};
+use crate::performance::attribution::{signal_family_of, SignalFamily};
 use crate::strategy::boll_macd::{detect_boll_macd_signal, BollMacdAction, BollMacdSignal};
+use crate::trading::paper_lot_ledger::parse_paper_fill_timestamp;
 
-/// 一组信号的统计结果 (单窗口)。reason 为信号来源, window_bars 为
-/// forward return 窗口 (4 根 = 1h, 16 根 = 1 交易日)。
+/// 一组买入事件的统计结果（单窗口）。`up_rate` 只是终点上涨比例，
+/// 不是完整经济持仓胜率。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SignalGroup {
     pub reason: String,
     pub window_bars: usize,
     pub count: usize,
-    pub win_rate: Option<f64>,
-    pub avg_ret: Option<f64>,
-    pub mfe: Option<f64>,
-    pub mae: Option<f64>,
+    pub up_rate: Option<f64>,
+    pub avg_terminal_ret: Option<f64>,
+    pub avg_mfe: Option<f64>,
+    pub avg_mae: Option<f64>,
 }
 
 impl SignalGroup {
     fn is_under_sampled(&self) -> bool {
-        self.count < 10
+        self.count < 200
     }
 }
 
-/// R-12 回测汇总结果。
+/// R-12 买入事件研究汇总结果。
 #[derive(Debug, Clone, Default)]
 pub struct R12BacktestResult {
-    /// 虚拟仓买入信号按 virtual_reason 分组 (每 reason × 窗口一个组)
+    /// 虚拟仓买入事件按明确入场族分组（每族 × 窗口一个组）。
     pub virtual_buy: Vec<SignalGroup>,
-    /// 虚拟仓卖出信号 (BR-234 四大铁律卖出) 分组
-    pub virtual_sell: Vec<SignalGroup>,
-    /// 破损成交 (price < 1.0, 7/14-16 Breakout 价格 feed 异常期) 排除数
-    pub broken_excluded: usize,
+    /// 同窗口内真实卖出事实数量；只披露，不进入入场上涨率。
+    pub exit_rows_excluded: usize,
     /// boll_macd 15min 信号统计
     pub boll_macd: Vec<SignalGroup>,
-    /// 取数失败跳过的 code (出声)
-    pub skipped_codes: Vec<String>,
-    /// 无 15min bar 可对齐的信号数 (集合竞价/收盘后信号, 出声)
+    /// 无 15min bar 可对齐的买入事件数（集合竞价、收盘后或覆盖外）。
     pub unaligned_signals: usize,
+    /// 已对齐但未来 4/16 根窗口尚不完整的事件窗口数（右删失）。
+    pub censored_windows: usize,
 }
 
-/// 虚拟仓信号条目 (paper_trades Filled)。
+/// 已校验的虚拟仓买入事件（paper_trades Filled buy）。
 #[derive(Debug, Clone)]
 pub struct SignalEntry {
+    pub id: i64,
+    pub plan_id: String,
     pub code: String,
     pub name: String,
-    pub direction: String, // "buy" | "sell"
-    pub price: f64,
-    pub virtual_reason: String,
+    pub fill_price: f64,
+    pub family: SignalFamily,
     pub ts_utc: NaiveDateTime,
 }
 
-/// 虚拟仓买入信号分组前缀: BR-234 卖出归 sell 组。
-const SELL_REASON_PREFIX: &str = "BR-234四大铁律卖出";
-/// 破损成交价阈值: 真实 A 股价格不可能低于 1 元 (virtual_pnl 同款判定)
-const BROKEN_PRICE_THRESHOLD: f64 = 1.0;
-/// 价格 feed 异常日窗口 (7/14-16): 该窗口 190 笔买入全为破损成交 —
-/// 002463 沪电股份真实价 121 元当日记 0.07-10 元, Momentum 反向放大到 1680 元。
-/// 按日期整体排除 (virtual_pnl 同款先例), 卖出自 8/10 BR-234 起不受影响。
-pub const BROKEN_FILL_DAYS: [&str; 3] = ["2026-07-14", "2026-07-15", "2026-07-16"];
-
-/// 破损成交判定: 坏日期窗口内 或 价格低于阈值 (兜底未来异常)。
-pub fn is_broken_fill(ts_utc: &NaiveDateTime, price: f64) -> bool {
-    if price < BROKEN_PRICE_THRESHOLD {
-        return true;
-    }
-    BROKEN_FILL_DAYS
-        .iter()
-        .any(|day| ts_utc.format("%Y-%m-%d").to_string().as_str() == *day)
-}
 /// forward return 窗口 (根 15min bar)
 pub const WINDOWS_BARS: [usize; 2] = [4, 16];
 /// boll_macd 买入动作
 const BUY_ACTIONS: [BollMacdAction; 2] = [BollMacdAction::BottomBuy, BollMacdAction::UptrendStart];
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EventObservation {
+    pub terminal_ret: f64,
+    pub mfe: f64,
+    pub mae: f64,
+}
+
 // ============================================================
 // 纯计算 (可测, 不依赖网络/DB)
 // ============================================================
 
-/// 在升序 15min bars 里定位信号时刻所在的 bar: 返回最后一个
-/// (date, hour, minute) <= 信号北京时间的 bar index。无匹配返回 None
-/// (集合竞价 9:25 / 收盘后 15:00 之后信号, 无 bar 承载 → 对齐失败)。
-pub fn locate_signal_bar(bars: &[SecurityBar], signal_utc: NaiveDateTime) -> Option<usize> {
-    let bj = signal_utc + Duration::hours(8);
-    bars.iter()
-        .position(|bar| {
-            let date = NaiveDate::from_ymd_opt(bar.year as i32, bar.month, bar.day);
-            let Some(date) = date else {
-                return false;
-            };
-            let bar_time = date
-                .and_hms_opt(bar.hour, bar.minute, 0)
-                .unwrap_or_else(|| {
-                    NaiveDate::from_ymd_opt(2020, 1, 1)
-                        .expect("valid fallback date")
-                        .and_hms_opt(0, 0, 0)
-                        .expect("valid fallback time")
-                });
-            bar_time > bj
+fn security_bar_time(bar: &SecurityBar, index: usize) -> Result<NaiveDateTime, String> {
+    let year = i32::try_from(bar.year)
+        .map_err(|_| format!("technical bar index={index} year invalid: {}", bar.year))?;
+    NaiveDate::from_ymd_opt(year, bar.month, bar.day)
+        .and_then(|date| date.and_hms_opt(bar.hour, bar.minute, 0))
+        .ok_or_else(|| {
+            format!(
+                "technical bar index={index} timestamp invalid: {:04}-{:02}-{:02} {:02}:{:02}",
+                bar.year, bar.month, bar.day, bar.hour, bar.minute
+            )
         })
-        .map(|idx| idx.saturating_sub(1))
+}
+
+/// BR-247：生产入口消费前的结构门。来源/新鲜度由未来发布的 TechnicalBars
+/// 能力负责；这里仍拒绝空批次、坏 OHLC、负量额、重复或逆序时间。
+pub fn validate_technical_bars(bars: &[SecurityBar]) -> Result<(), String> {
+    if bars.is_empty() {
+        return Err("technical bars are empty".to_owned());
+    }
+    let mut previous = None;
+    for (index, bar) in bars.iter().enumerate() {
+        let time = security_bar_time(bar, index)?;
+        if previous.is_some_and(|old| old >= time) {
+            return Err(format!(
+                "technical bars not strictly ordered at index={index}: {time}"
+            ));
+        }
+        previous = Some(time);
+        let prices = [bar.open, bar.high, bar.low, bar.close];
+        if prices
+            .iter()
+            .any(|price| !price.is_finite() || *price <= 0.0)
+        {
+            return Err(format!(
+                "technical bar index={index} contains non-positive/non-finite OHLC"
+            ));
+        }
+        if bar.high < bar.open.max(bar.close).max(bar.low)
+            || bar.low > bar.open.min(bar.close).min(bar.high)
+        {
+            return Err(format!("technical bar index={index} OHLC is inconsistent"));
+        }
+        if !bar.vol.is_finite() || bar.vol < 0.0 || !bar.amount.is_finite() || bar.amount < 0.0 {
+            return Err(format!(
+                "technical bar index={index} volume/amount is invalid"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 在升序 15min bars 里定位最后一个可见 bar。坏 K 线必须显式失败；早于
+/// 第一根或不早于最新一根（无法证明被下一根边界包住）保持 `Ok(None)`，
+/// 禁止补配边界索引。
+pub fn locate_signal_bar(
+    bars: &[SecurityBar],
+    signal_utc: NaiveDateTime,
+) -> Result<Option<usize>, String> {
+    validate_technical_bars(bars)?;
+    let bj = signal_utc
+        .checked_add_signed(Duration::hours(8))
+        .ok_or_else(|| format!("signal timestamp overflow after UTC+8 conversion: {signal_utc}"))?;
+    let mut next_index = None;
+    for (index, bar) in bars.iter().enumerate() {
+        if security_bar_time(bar, index)? > bj {
+            next_index = Some(index);
+            break;
+        }
+    }
+    Ok(next_index.and_then(|index| index.checked_sub(1)))
 }
 
 /// 计算 forward return: (bars[idx+n].close - base_price) / base_price。
 /// idx+n 越界或 base_price <= 0 返回 None。
 pub fn forward_return(bars: &[SecurityBar], idx: usize, n: usize, base_price: f64) -> Option<f64> {
-    if base_price <= 0.0 {
-        return None;
-    }
-    let target = bars.get(idx + n)?;
-    Some((target.close - base_price) / base_price)
+    forward_observation(bars, idx, n, base_price).map(|observation| observation.terminal_ret)
 }
 
-/// 从收益序列聚合 SignalGroup (胜率 = ret > 0 占比, MFE/MAE = 极值)。
-pub fn aggregate_group(reason: &str, window_bars: usize, rets: &[f64]) -> SignalGroup {
-    let count = rets.len();
-    let win_rate = if count > 0 {
-        Some(rets.iter().filter(|r| **r > 0.0).count() as f64 / count as f64)
+/// 从信号后的完整路径计算终点收益及逐事件 MFE/MAE。MFE 以 0 为下界，
+/// MAE 以 0 为上界，分别表示最好和最坏的路径内变动。
+pub fn forward_observation(
+    bars: &[SecurityBar],
+    idx: usize,
+    n: usize,
+    base_price: f64,
+) -> Option<EventObservation> {
+    if !base_price.is_finite() || base_price <= 0.0 || n == 0 {
+        return None;
+    }
+    let end = idx.checked_add(n)?;
+    let path = bars.get(idx.checked_add(1)?..=end)?;
+    let mut mfe = 0.0_f64;
+    let mut mae = 0.0_f64;
+    for bar in path {
+        if !bar.close.is_finite() || bar.close <= 0.0 {
+            return None;
+        }
+        let ret = (bar.close - base_price) / base_price;
+        mfe = mfe.max(ret);
+        mae = mae.min(ret);
+    }
+    let terminal_ret = (path.last()?.close - base_price) / base_price;
+    Some(EventObservation {
+        terminal_ret,
+        mfe,
+        mae,
+    })
+}
+
+/// 聚合逐事件路径；上涨比例不是策略胜率，MFE/MAE 是逐事件路径值的均值。
+pub fn aggregate_group(
+    reason: &str,
+    window_bars: usize,
+    observations: &[EventObservation],
+) -> SignalGroup {
+    let count = observations.len();
+    let up_rate = if count > 0 {
+        Some(
+            observations
+                .iter()
+                .filter(|observation| observation.terminal_ret > 0.0)
+                .count() as f64
+                / count as f64,
+        )
     } else {
         None
     };
-    let avg_ret = if count > 0 {
-        Some(rets.iter().sum::<f64>() / count as f64)
-    } else {
-        None
+    let average = |project: fn(&EventObservation) -> f64| {
+        (count > 0).then(|| observations.iter().map(project).sum::<f64>() / count as f64)
     };
-    let mfe = if count > 0 {
-        rets.iter().cloned().fold(f64::MIN, f64::max)
-    } else {
-        f64::MIN
-    };
-    let mae = if count > 0 {
-        rets.iter().cloned().fold(f64::MAX, f64::min)
-    } else {
-        f64::MAX
-    };
+    let avg_terminal_ret = average(|observation| observation.terminal_ret);
+    let avg_mfe = average(|observation| observation.mfe);
+    let avg_mae = average(|observation| observation.mae);
     SignalGroup {
         reason: reason.to_string(),
         window_bars,
         count,
-        win_rate,
-        avg_ret,
-        mfe: if count > 0 { Some(mfe) } else { None },
-        mae: if count > 0 { Some(mae) } else { None },
+        up_rate,
+        avg_terminal_ret,
+        avg_mfe,
+        avg_mae,
     }
 }
 
-/// 升序 SecurityBar → 降序 KlineData (data[0]=最新, 喂 detect_boll_macd_signal)。
-/// date 填 bar 日期 (时分丢失不影响 detect — 只用数组顺序)。
-pub fn bars_to_desc_kline(bars: &[SecurityBar]) -> Vec<KlineData> {
-    let mut out: Vec<KlineData> = bars
-        .iter()
+fn forward_observation_desc(
+    desc: &[KlineData],
+    index: usize,
+    n: usize,
+) -> Option<EventObservation> {
+    let base = desc.get(index)?.close;
+    if !base.is_finite() || base <= 0.0 || n == 0 {
+        return None;
+    }
+    let end = index.checked_sub(n)?;
+    let mut mfe = 0.0_f64;
+    let mut mae = 0.0_f64;
+    for bar in &desc[end..index] {
+        if !bar.close.is_finite() || bar.close <= 0.0 {
+            return None;
+        }
+        let ret = (bar.close - base) / base;
+        mfe = mfe.max(ret);
+        mae = mae.min(ret);
+    }
+    let terminal_ret = (desc.get(end)?.close - base) / base;
+    Some(EventObservation {
+        terminal_ret,
+        mfe,
+        mae,
+    })
+}
+
+/// 已验证升序 SecurityBar → 降序 KlineData（data[0]=最新）。
+pub fn bars_to_desc_kline(bars: &[SecurityBar]) -> Result<Vec<KlineData>, String> {
+    validate_technical_bars(bars)?;
+    bars.iter()
+        .enumerate()
         .rev()
-        .map(|bar| {
-            let date = NaiveDate::from_ymd_opt(bar.year as i32, bar.month, bar.day)
-                .unwrap_or_else(|| NaiveDate::from_ymd_opt(2020, 1, 1).expect("valid fallback"));
-            KlineData {
+        .map(|(index, bar)| {
+            let date = security_bar_time(bar, index)?.date();
+            Ok(KlineData {
                 date,
                 open: bar.open,
                 high: bar.high,
@@ -203,11 +296,9 @@ pub fn bars_to_desc_kline(bars: &[SecurityBar]) -> Vec<KlineData> {
                 is_limit_down: false,
                 is_suspended: false,
                 adjust: AdjustType::None,
-            }
+            })
         })
-        .collect();
-    out.sort_by_key(|bar| std::cmp::Reverse(bar.date));
-    out
+        .collect()
 }
 
 /// 在降序 KlineData 上滑动窗口跑 detect_boll_macd_signal:
@@ -228,85 +319,143 @@ pub fn scan_boll_macd_buys(desc: &[KlineData]) -> Vec<(usize, BollMacdAction)> {
 
 /// 降序数组上, 信号在位置 j, 未来第 n 根 = j - n。计算 forward return。
 pub fn forward_return_desc(desc: &[KlineData], j: usize, n: usize) -> Option<f64> {
-    let base = desc.get(j)?.close;
-    let target = desc.get(j.checked_sub(n)?)?.close;
-    if base <= 0.0 {
-        return None;
-    }
-    Some((target - base) / base)
+    forward_observation_desc(desc, j, n).map(|observation| observation.terminal_ret)
 }
 
 // ============================================================
 // 网络/DB 薄壳 (spawn_blocking 内调用)
 // ============================================================
 
-/// 读 paper_trades 近 days 天 Filled 信号 (buy + sell), 破损价排除计数。
-pub fn read_paper_signal_entries(days: usize) -> Result<(Vec<SignalEntry>, usize), String> {
-    use crate::database::DatabaseManager;
-    use diesel::query_dsl::RunQueryDsl;
+#[derive(diesel::QueryableByName, Debug, Clone)]
+struct PaperFilledReviewRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    id: i64,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    plan_id: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    code: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    name: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    direction: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+    fill_price: Option<f64>,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    quantity: i64,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    occurred_at: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    virtual_reason: String,
+}
 
-    #[derive(diesel::QueryableByName)]
-    struct Row {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        code: String,
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        name: String,
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        direction: String,
-        #[diesel(sql_type = diesel::sql_types::Double)]
-        price: f64,
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        virtual_reason: String,
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        ts: String,
+fn parse_paper_signal_rows(
+    rows: Vec<PaperFilledReviewRow>,
+    as_of_date: NaiveDate,
+    days: usize,
+) -> Result<(Vec<SignalEntry>, usize), String> {
+    if days == 0 {
+        return Err("R-12 review window days must be positive".to_owned());
     }
+    let lookback =
+        i64::try_from(days - 1).map_err(|_| format!("R-12 review window too large: {days}"))?;
+    let start_date = as_of_date
+        .checked_sub_signed(Duration::days(lookback))
+        .ok_or_else(|| format!("R-12 review window underflow: as_of={as_of_date} days={days}"))?;
+    let mut previous_order = None;
+    let mut identities = std::collections::HashSet::new();
+    let mut entries = Vec::new();
+    let mut exit_rows_excluded = 0_usize;
 
-    let db = DatabaseManager::get();
-    let mut conn = db.get_conn().map_err(|e| format!("db conn: {e}"))?;
-    let sql = format!(
-        "SELECT code, name, direction, price, virtual_reason, ts \
-         FROM paper_trades \
-         WHERE status='Filled' AND ts >= datetime('now', '-{days} days')"
-    );
-    let rows: Vec<Row> = diesel::sql_query(sql)
-        .load::<Row>(&mut conn)
-        .map_err(|e| format!("paper_trades read: {e}"))?;
-
-    let mut entries = Vec::with_capacity(rows.len());
-    let mut broken = 0_usize;
     for row in rows {
-        let ts_utc = match NaiveDateTime::parse_from_str(&row.ts, "%Y-%m-%d %H:%M:%S") {
-            Ok(ts) => ts,
-            Err(_) => {
-                log::warn!("[r12-backtest] unparseable ts {} code={}", row.ts, row.code);
-                continue;
-            }
-        };
-        // 破损成交排除: 7/14-16 价格 feed 异常期 (virtual_pnl 同款先例) — 该窗口
-        // 全部 190 笔买入价格偏低/放大 (沪电股份真实 121 元, 当日记 0.07-10 元;
-        // Momentum 反向放大到 1680 元), price<1.0 阈值只能覆盖部分 → 按日期整体排除。
-        // sell 不受影响 (卖出自 BR-234 8/10 起, 价格正常)。
-        if is_broken_fill(&ts_utc, row.price) {
-            broken += 1;
+        if row.id <= 0 || !identities.insert(row.id) {
+            return Err(format!(
+                "R-12 paper fill identity invalid/duplicate: id={}",
+                row.id
+            ));
+        }
+        if row.plan_id.trim().is_empty() || row.code.trim().is_empty() || row.name.trim().is_empty()
+        {
+            return Err(format!(
+                "R-12 paper fill id={} plan/code/name is blank",
+                row.id
+            ));
+        }
+        let ts_utc = parse_paper_fill_timestamp(row.id, &row.occurred_at)?;
+        if previous_order.is_some_and(|previous| previous > (ts_utc, row.id)) {
+            return Err(format!("R-12 paper fills are not ordered at id={}", row.id));
+        }
+        previous_order = Some((ts_utc, row.id));
+        let fill_price = row
+            .fill_price
+            .filter(|price| price.is_finite() && *price > 0.0)
+            .ok_or_else(|| format!("R-12 paper fill id={} fill_price missing/invalid", row.id))?;
+        u32::try_from(row.quantity)
+            .ok()
+            .filter(|quantity| *quantity > 0 && quantity.is_multiple_of(100))
+            .ok_or_else(|| {
+                format!(
+                    "R-12 paper fill id={} quantity invalid: {}",
+                    row.id, row.quantity
+                )
+            })?;
+        let local_date = ts_utc
+            .checked_add_signed(Duration::hours(8))
+            .ok_or_else(|| format!("R-12 paper fill id={} local time overflow", row.id))?
+            .date();
+        let direction = row.direction.trim();
+        if direction != "buy" && direction != "sell" {
+            return Err(format!(
+                "R-12 paper fill id={} direction invalid: {:?}",
+                row.id, row.direction
+            ));
+        }
+        if local_date < start_date || local_date > as_of_date {
             continue;
         }
-        let ts_utc = match NaiveDateTime::parse_from_str(&row.ts, "%Y-%m-%d %H:%M:%S") {
-            Ok(ts) => ts,
-            Err(_) => {
-                log::warn!("[r12-backtest] unparseable ts {} code={}", row.ts, row.code);
-                continue;
-            }
-        };
+        if direction == "sell" {
+            exit_rows_excluded += 1;
+            continue;
+        }
+        let family = signal_family_of(&row.virtual_reason);
+        if family == SignalFamily::Unknown || family == SignalFamily::ExitByRule {
+            return Err(format!(
+                "R-12 paper buy id={} entry strategy family unavailable: {:?}",
+                row.id, row.virtual_reason
+            ));
+        }
         entries.push(SignalEntry {
+            id: row.id,
+            plan_id: row.plan_id,
             code: row.code,
             name: row.name,
-            direction: row.direction,
-            price: row.price,
-            virtual_reason: row.virtual_reason,
+            fill_price,
+            family,
             ts_utc,
         });
     }
-    Ok((entries, broken))
+    Ok((entries, exit_rows_excluded))
+}
+
+/// 读取并严格校验纸面成交，再按显式评估日投影买入事件。卖出只计数，不评分。
+pub fn read_paper_signal_entries(
+    as_of_date: NaiveDate,
+    days: usize,
+) -> Result<(Vec<SignalEntry>, usize), String> {
+    use crate::database::DatabaseManager;
+    use diesel::query_dsl::RunQueryDsl;
+
+    let db = DatabaseManager::get();
+    let mut conn = db.get_conn().map_err(|e| format!("db conn: {e}"))?;
+    let rows = diesel::sql_query(
+        "SELECT id, plan_id, code, name, direction, fill_price, quantity, \
+                CAST(ts AS TEXT) AS occurred_at, virtual_reason \
+         FROM paper_trades \
+         WHERE status = 'Filled' \
+         ORDER BY ts ASC, id ASC",
+    )
+    .load::<PaperFilledReviewRow>(&mut conn)
+    .map_err(|e| format!("paper_trades read: {e}"))?;
+    parse_paper_signal_rows(rows, as_of_date, days)
 }
 
 /// 虚拟仓信号回测: 每笔信号 → 15min bars 对齐 → forward return 分组。
@@ -328,8 +477,11 @@ where
         .map_err(String::as_str)
 }
 
-pub fn backtest_virtual_signals(days: usize) -> Result<R12BacktestResult, String> {
-    let (entries, broken) = read_paper_signal_entries(days)?;
+pub fn backtest_virtual_signals(
+    as_of_date: NaiveDate,
+    days: usize,
+) -> Result<R12BacktestResult, String> {
+    let (entries, exit_rows_excluded) = read_paper_signal_entries(as_of_date, days)?;
     let gateway = HistoricalBarsGateway::new();
     let mut cache = TechnicalBarsCache::new();
     let mut loader = |code: &str| {
@@ -337,12 +489,17 @@ pub fn backtest_virtual_signals(days: usize) -> Result<R12BacktestResult, String
             .fifteen_min_bars(code, 800)
             .map_err(|error| error.to_string())
     };
-    backtest_virtual_signals_with_entries_and_cache(&entries, broken, &mut cache, &mut loader)
+    backtest_virtual_signals_with_entries_and_cache(
+        &entries,
+        exit_rows_excluded,
+        &mut cache,
+        &mut loader,
+    )
 }
 
 fn backtest_virtual_signals_with_entries_and_cache<Loader>(
     entries: &[SignalEntry],
-    broken: usize,
+    exit_rows_excluded: usize,
     bars_by_code: &mut TechnicalBarsCache,
     loader: &mut Loader,
 ) -> Result<R12BacktestResult, String>
@@ -351,62 +508,53 @@ where
 {
     if entries.is_empty() {
         return Ok(R12BacktestResult {
-            broken_excluded: broken,
+            exit_rows_excluded,
             ..Default::default()
         });
     }
 
-    let mut skipped_codes = std::collections::BTreeSet::new();
     let mut unaligned = 0_usize;
+    let mut censored_windows = 0_usize;
 
-    // buy 分组累积: reason → window → rets
-    let mut buy_rets: std::collections::BTreeMap<String, Vec<Vec<f64>>> =
+    // 入场族 → 窗口 → 逐事件路径观察。
+    let mut observations_by_family: std::collections::BTreeMap<String, Vec<Vec<EventObservation>>> =
         std::collections::BTreeMap::new();
-    let mut sell_rets: Vec<Vec<f64>> = vec![Vec::new(), Vec::new()];
 
     for entry in entries {
         // BR-239: success and failure are both cached for the whole run. A
         // failed code must not be reacquired once per duplicate signal row.
-        let bars = match load_technical_bars_cached(bars_by_code, &entry.code, |code| loader(code))
-        {
-            Ok(bars) => bars,
-            Err(error) => {
-                log::warn!(
-                    "[r12-backtest] 15min bars failed {} ({}): {error}",
-                    entry.code,
-                    entry.name
-                );
-                skipped_codes.insert(entry.code.clone());
-                continue;
-            }
-        };
-        let Some(idx) = locate_signal_bar(bars, entry.ts_utc) else {
+        let bars = load_technical_bars_cached(bars_by_code, &entry.code, |code| loader(code))
+            .map_err(|error| {
+                format!(
+                    "R-12 15min bars unavailable for {} ({}): {error}",
+                    entry.code, entry.name
+                )
+            })?;
+        let Some(idx) = locate_signal_bar(bars, entry.ts_utc)
+            .map_err(|error| format!("R-12 15min bars invalid for {}: {error}", entry.code))?
+        else {
             unaligned += 1;
             continue;
         };
-        let is_sell =
-            entry.virtual_reason.starts_with(SELL_REASON_PREFIX) || entry.direction == "sell";
+        let group = observations_by_family
+            .entry(entry.family.as_str().to_owned())
+            .or_insert_with(|| vec![Vec::new(), Vec::new()]);
         for (wi, window) in WINDOWS_BARS.iter().enumerate() {
-            if let Some(ret) = forward_return(bars, idx, *window, entry.price) {
-                if is_sell {
-                    sell_rets[wi].push(ret);
-                } else {
-                    let group = buy_rets
-                        .entry(entry.virtual_reason.clone())
-                        .or_insert_with(|| vec![Vec::new(), Vec::new()]);
-                    group[wi].push(ret);
-                }
+            if let Some(observation) = forward_observation(bars, idx, *window, entry.fill_price) {
+                group[wi].push(observation);
+            } else {
+                censored_windows += 1;
             }
         }
     }
 
     let mut result = R12BacktestResult {
-        broken_excluded: broken,
-        skipped_codes: skipped_codes.into_iter().collect(),
+        exit_rows_excluded,
         unaligned_signals: unaligned,
+        censored_windows,
         ..Default::default()
     };
-    for (reason, windows) in &buy_rets {
+    for (reason, windows) in &observations_by_family {
         for (wi, window) in WINDOWS_BARS.iter().enumerate() {
             if windows[wi].is_empty() {
                 continue;
@@ -415,16 +563,6 @@ where
                 .virtual_buy
                 .push(aggregate_group(reason, *window, &windows[wi]));
         }
-    }
-    for (wi, window) in WINDOWS_BARS.iter().enumerate() {
-        if sell_rets[wi].is_empty() {
-            continue;
-        }
-        result.virtual_sell.push(aggregate_group(
-            "虚拟仓卖出(四大铁律)",
-            *window,
-            &sell_rets[wi],
-        ));
     }
     Ok(result)
 }
@@ -439,44 +577,42 @@ pub fn backtest_boll_macd_15min(codes: &[String]) -> Result<Vec<SignalGroup>, St
             .map_err(|error| error.to_string())
     };
     backtest_boll_macd_15min_with_cache(codes, &mut cache, &mut loader)
+        .map(|(groups, _censored_windows)| groups)
 }
 
 fn backtest_boll_macd_15min_with_cache<Loader>(
     codes: &[String],
     bars_by_code: &mut TechnicalBarsCache,
     loader: &mut Loader,
-) -> Result<Vec<SignalGroup>, String>
+) -> Result<(Vec<SignalGroup>, usize), String>
 where
     Loader: FnMut(&str) -> Result<Vec<SecurityBar>, String>,
 {
-    let mut rets_by_action: std::collections::BTreeMap<String, Vec<Vec<f64>>> =
+    let mut observations_by_action: std::collections::BTreeMap<String, Vec<Vec<EventObservation>>> =
         std::collections::BTreeMap::new();
-    let mut skipped = Vec::new();
+    let mut censored_windows = 0_usize;
     for code in codes {
-        let bars = match load_technical_bars_cached(bars_by_code, code, |code| loader(code)) {
-            Ok(bars) => bars,
-            Err(error) => {
-                log::warn!("[r12-backtest] boll_macd 15min bars failed {code}: {error}");
-                skipped.push(code.clone());
-                continue;
-            }
-        };
-        let desc = bars_to_desc_kline(bars);
+        let bars = load_technical_bars_cached(bars_by_code, code, |code| loader(code))
+            .map_err(|error| format!("R-12 boll_macd bars unavailable for {code}: {error}"))?;
+        let desc = bars_to_desc_kline(bars)
+            .map_err(|error| format!("R-12 boll_macd bars invalid for {code}: {error}"))?;
         let signals = scan_boll_macd_buys(&desc);
         for (j, action) in signals {
             let label = format!("{action:?}");
-            let group = rets_by_action
+            let group = observations_by_action
                 .entry(label)
                 .or_insert_with(|| vec![Vec::new(), Vec::new()]);
             for (wi, window) in WINDOWS_BARS.iter().enumerate() {
-                if let Some(ret) = forward_return_desc(&desc, j, *window) {
-                    group[wi].push(ret);
+                if let Some(observation) = forward_observation_desc(&desc, j, *window) {
+                    group[wi].push(observation);
+                } else {
+                    censored_windows += 1;
                 }
             }
         }
     }
     let mut out = Vec::new();
-    for (label, windows) in &rets_by_action {
+    for (label, windows) in &observations_by_action {
         for (wi, window) in WINDOWS_BARS.iter().enumerate() {
             if windows[wi].is_empty() {
                 continue;
@@ -484,101 +620,76 @@ where
             out.push(aggregate_group(label, *window, &windows[wi]));
         }
     }
-    if !skipped.is_empty() {
-        log::warn!(
-            "[r12-backtest] boll_macd skipped {} codes: {}",
-            skipped.len(),
-            skipped.join(",")
-        );
-    }
-    Ok(out)
+    Ok((out, censored_windows))
 }
 
-/// 渲染 R-12 段文本 (三段式: 虚拟仓信号 / boll_macd / T0 标注)。
+/// 渲染 R-12 事件研究；固定声明该结果不是完整策略胜率。
 pub fn render_r12(result: &R12BacktestResult) -> String {
     let mut lines = vec![
-        "📈 R-12 盘后回测 (15min K线)".to_string(),
+        "📈 R-12 买入事件研究（15 分钟 K 线）".to_string(),
         "━━━━━━━━━━━━━━━━━━━━".to_string(),
+        "ℹ️ 上涨比例仅描述入场后短期价格路径，不是买入→卖出扣成本策略胜率。".to_string(),
     ];
 
-    lines.push("【虚拟仓信号回测】".to_string());
-    if result.virtual_buy.is_empty() && result.virtual_sell.is_empty() {
-        lines.push("· 近 30 天无 Filled 信号或全部对齐失败".to_string());
+    lines.push("【虚拟仓买入事件】".to_string());
+    if result.virtual_buy.is_empty() {
+        lines.push("· 窗口内无可采信的 Filled 买入事件或全部未对齐".to_string());
     } else {
-        lines.push("买入信号 (按来源):".to_string());
+        lines.push("买入事件（按入场来源）:".to_string());
         for group in &result.virtual_buy {
             lines.push(format!(
-                "· {} ({}根) 样本{} 胜率{} 均收益{:+.2}% MFE {:+.1}% MAE {:+.1}%{}",
+                "· {}（{}根）样本{} 上涨比例{} 平均终点{} 平均MFE {} 平均MAE {}{}",
                 group.reason,
                 group.window_bars,
                 group.count,
-                pct(group.win_rate),
-                group.avg_ret.unwrap_or(0.0) * 100.0,
-                group.mfe.unwrap_or(0.0) * 100.0,
-                group.mae.unwrap_or(0.0) * 100.0,
+                pct(group.up_rate),
+                signed_pct(group.avg_terminal_ret),
+                signed_pct(group.avg_mfe),
+                signed_pct(group.avg_mae),
                 if group.is_under_sampled() {
-                    " (样本不足)"
-                } else {
-                    ""
-                }
-            ));
-        }
-        lines.push("卖出信号 (四大铁律, 跌=卖对):".to_string());
-        for group in &result.virtual_sell {
-            lines.push(format!(
-                "· {} ({}根) 样本{} 胜率{} 均收益{:+.2}% MFE {:+.1}% MAE {:+.1}%{}",
-                group.reason,
-                group.window_bars,
-                group.count,
-                pct(group.win_rate),
-                group.avg_ret.unwrap_or(0.0) * 100.0,
-                group.mfe.unwrap_or(0.0) * 100.0,
-                group.mae.unwrap_or(0.0) * 100.0,
-                if group.is_under_sampled() {
-                    " (样本不足)"
+                    "（样本不足 200，不形成策略结论）"
                 } else {
                     ""
                 }
             ));
         }
     }
-    if result.broken_excluded > 0 {
+    if result.exit_rows_excluded > 0 {
         lines.push(format!(
-            "⚠️ 排除破损成交 {} 笔 (7/14-16 价格 feed 异常期, 按日期整体排除)",
-            result.broken_excluded
+            "ℹ️ 同窗口卖出事实 {} 笔，仅作为退出记录披露，未进入入场上涨比例",
+            result.exit_rows_excluded
         ));
     }
     if result.unaligned_signals > 0 {
         lines.push(format!(
-            "⚠️ 无 15min bar 对齐信号 {} 笔 (集合竞价/收盘后)",
+            "⚠️ 无 15 分钟 K 线对齐的买入事件 {} 笔（覆盖外/集合竞价/收盘后）",
             result.unaligned_signals
         ));
     }
-    if !result.skipped_codes.is_empty() {
+    if result.censored_windows > 0 {
         lines.push(format!(
-            "⚠️ 取数失败跳过 {} 只: {}",
-            result.skipped_codes.len(),
-            result.skipped_codes.join(",")
+            "ℹ️ 未来窗口不完整 {} 个，按右删失保留且不进入分母",
+            result.censored_windows
         ));
     }
 
     lines.push(String::new());
-    lines.push("【boll_macd 15min 回测】".to_string());
+    lines.push("【boll_macd 15 分钟买入事件】".to_string());
     if result.boll_macd.is_empty() {
         lines.push("· 无买入信号 (BottomBuy/UptrendStart)".to_string());
     } else {
         for group in &result.boll_macd {
             lines.push(format!(
-                "· {} ({}根) 信号{} 胜率{} 均收益{:+.2}% MFE {:+.1}% MAE {:+.1}%{}",
+                "· {}（{}根）信号{} 上涨比例{} 平均终点{} 平均MFE {} 平均MAE {}{}",
                 group.reason,
                 group.window_bars,
                 group.count,
-                pct(group.win_rate),
-                group.avg_ret.unwrap_or(0.0) * 100.0,
-                group.mfe.unwrap_or(0.0) * 100.0,
-                group.mae.unwrap_or(0.0) * 100.0,
+                pct(group.up_rate),
+                signed_pct(group.avg_terminal_ret),
+                signed_pct(group.avg_mfe),
+                signed_pct(group.avg_mae),
                 if group.is_under_sampled() {
-                    " (样本不足)"
+                    "（样本不足 200，不形成策略结论）"
                 } else {
                     ""
                 }
@@ -600,11 +711,18 @@ fn pct(rate: Option<f64>) -> String {
     }
 }
 
-/// 供 dispatcher 用的组合入口: 虚拟仓回测 + boll_macd 回测。
-pub fn run_full_backtest(days: usize) -> Result<R12BacktestResult, String> {
-    let (entries, broken) = read_paper_signal_entries(days)?;
+fn signed_pct(rate: Option<f64>) -> String {
+    match rate {
+        Some(value) => format!("{:+.2}%", value * 100.0),
+        None => "-".to_owned(),
+    }
+}
+
+/// 供 dispatcher 用的组合入口：调用方必须传入同一复盘业务日。
+pub fn run_full_backtest(as_of_date: NaiveDate, days: usize) -> Result<R12BacktestResult, String> {
+    let (entries, exit_rows_excluded) = read_paper_signal_entries(as_of_date, days)?;
     let gateway = HistoricalBarsGateway::new();
-    run_full_backtest_with_entries_and_loader(&entries, broken, |code| {
+    run_full_backtest_with_entries_and_loader(&entries, exit_rows_excluded, |code| {
         gateway
             .fifteen_min_bars(code, 800)
             .map_err(|error| error.to_string())
@@ -613,15 +731,19 @@ pub fn run_full_backtest(days: usize) -> Result<R12BacktestResult, String> {
 
 fn run_full_backtest_with_entries_and_loader<Loader>(
     entries: &[SignalEntry],
-    broken: usize,
+    exit_rows_excluded: usize,
     mut loader: Loader,
 ) -> Result<R12BacktestResult, String>
 where
     Loader: FnMut(&str) -> Result<Vec<SecurityBar>, String>,
 {
     let mut cache = TechnicalBarsCache::new();
-    let mut result =
-        backtest_virtual_signals_with_entries_and_cache(entries, broken, &mut cache, &mut loader)?;
+    let mut result = backtest_virtual_signals_with_entries_and_cache(
+        entries,
+        exit_rows_excluded,
+        &mut cache,
+        &mut loader,
+    )?;
     let mut seen = std::collections::BTreeSet::new();
     for e in entries {
         seen.insert(e.code.clone());
@@ -630,7 +752,13 @@ where
     if codes.is_empty() {
         return Ok(result);
     }
-    result.boll_macd = backtest_boll_macd_15min_with_cache(&codes, &mut cache, &mut loader)?;
+    let (boll_macd, boll_censored_windows) =
+        backtest_boll_macd_15min_with_cache(&codes, &mut cache, &mut loader)?;
+    result.boll_macd = boll_macd;
+    result.censored_windows = result
+        .censored_windows
+        .checked_add(boll_censored_windows)
+        .ok_or_else(|| "R-12 censored window count overflow".to_owned())?;
     Ok(result)
 }
 
@@ -663,11 +791,12 @@ mod tests {
     #[test]
     fn br239_full_backtest_loads_each_code_once_across_all_analyses() {
         let entries = vec![SignalEntry {
+            id: 1,
+            plan_id: "TEST_CODE_PLAN_1".to_owned(),
             code: "TEST_CODE_000001".to_owned(),
             name: "TEST_CODE sample".to_owned(),
-            direction: "buy".to_owned(),
-            price: 10.0,
-            virtual_reason: "TEST_CODE reason".to_owned(),
+            fill_price: 10.0,
+            family: SignalFamily::NewsCatalyst,
             ts_utc: NaiveDate::from_ymd_opt(2026, 8, 10)
                 .unwrap()
                 .and_hms_opt(1, 30, 0)
@@ -735,36 +864,42 @@ mod tests {
     #[test]
     fn locate_signal_bar_finds_bracketing_bar() {
         let bars = sample_bars();
+        // 北京时间 9:25 早于第一根已完成 K 线，不能偷配到 idx 0。
+        let utc = NaiveDate::from_ymd_opt(2026, 8, 10)
+            .unwrap()
+            .and_hms_opt(1, 25, 0)
+            .unwrap();
+        assert_eq!(locate_signal_bar(&bars, utc).unwrap(), None);
         // 北京时间 10:23 → 最后 bar <= 10:23 是 10:15 (idx 3)
         let utc = NaiveDate::from_ymd_opt(2026, 8, 10)
             .unwrap()
             .and_hms_opt(2, 23, 0)
             .unwrap();
-        assert_eq!(locate_signal_bar(&bars, utc), Some(3));
+        assert_eq!(locate_signal_bar(&bars, utc).unwrap(), Some(3));
         // 北京时间 9:31 → 9:30 (idx 0)
         let utc = NaiveDate::from_ymd_opt(2026, 8, 10)
             .unwrap()
             .and_hms_opt(1, 31, 0)
             .unwrap();
-        assert_eq!(locate_signal_bar(&bars, utc), Some(0));
+        assert_eq!(locate_signal_bar(&bars, utc).unwrap(), Some(0));
         // 北京时间 14:25 → 14:15 (idx 14)
         let utc = NaiveDate::from_ymd_opt(2026, 8, 10)
             .unwrap()
             .and_hms_opt(6, 25, 0)
             .unwrap();
-        assert_eq!(locate_signal_bar(&bars, utc), Some(14));
+        assert_eq!(locate_signal_bar(&bars, utc).unwrap(), Some(14));
         // 北京时间 15:05 (盘后, 无 bar 承载) → None — 收盘后信号对齐失败
         let utc = NaiveDate::from_ymd_opt(2026, 8, 10)
             .unwrap()
             .and_hms_opt(7, 5, 0)
             .unwrap();
-        assert_eq!(locate_signal_bar(&bars, utc), None);
+        assert_eq!(locate_signal_bar(&bars, utc).unwrap(), None);
         // 数据早于信号 → None
         let utc = NaiveDate::from_ymd_opt(2026, 8, 11)
             .unwrap()
             .and_hms_opt(1, 30, 0)
             .unwrap();
-        assert_eq!(locate_signal_bar(&bars, utc), None);
+        assert_eq!(locate_signal_bar(&bars, utc).unwrap(), None);
     }
 
     #[test]
@@ -775,6 +910,9 @@ mod tests {
                               // idx 5, n=4 → bars[9].close = 12.5, base 11.0 → +13.64%
         let ret = forward_return(&bars, 5, 4, 11.0).expect("ret");
         assert!((ret - 0.13636).abs() < 0.001);
+        let observation = forward_observation(&bars, 5, 4, 11.0).expect("path observation");
+        assert!((observation.mfe - 0.13636).abs() < 0.001);
+        assert!((observation.mae + 0.09090).abs() < 0.001);
         // 越界
         assert_eq!(forward_return(&bars, 15, 4, 10.0), None);
         // base <= 0
@@ -783,27 +921,60 @@ mod tests {
 
     #[test]
     fn aggregate_group_computes_stats() {
-        let rets = vec![0.05, -0.02, 0.03, 0.01, -0.01];
-        let g = aggregate_group("NewsCatalyst", 4, &rets);
+        let observations = vec![
+            EventObservation {
+                terminal_ret: 0.05,
+                mfe: 0.08,
+                mae: -0.01,
+            },
+            EventObservation {
+                terminal_ret: -0.02,
+                mfe: 0.01,
+                mae: -0.03,
+            },
+            EventObservation {
+                terminal_ret: 0.03,
+                mfe: 0.04,
+                mae: 0.0,
+            },
+            EventObservation {
+                terminal_ret: 0.01,
+                mfe: 0.02,
+                mae: 0.0,
+            },
+            EventObservation {
+                terminal_ret: -0.01,
+                mfe: 0.0,
+                mae: -0.02,
+            },
+        ];
+        let g = aggregate_group("NewsCatalyst", 4, &observations);
         assert_eq!(g.count, 5);
-        assert_eq!(g.win_rate, Some(0.6));
-        assert!((g.avg_ret.unwrap() - 0.012).abs() < 1e-9);
-        assert_eq!(g.mfe, Some(0.05));
-        assert_eq!(g.mae, Some(-0.02));
+        assert_eq!(g.up_rate, Some(0.6));
+        assert!((g.avg_terminal_ret.unwrap() - 0.012).abs() < 1e-9);
+        assert!((g.avg_mfe.unwrap() - 0.03).abs() < 1e-9);
+        assert!((g.avg_mae.unwrap() + 0.012).abs() < 1e-9);
         assert!(g.is_under_sampled());
-        let g2 = aggregate_group("Breakout", 16, &[0.1; 10]);
+        let positive = EventObservation {
+            terminal_ret: 0.1,
+            mfe: 0.1,
+            mae: 0.0,
+        };
+        let g199 = aggregate_group("Breakout", 16, &[positive; 199]);
+        assert!(g199.is_under_sampled());
+        let g2 = aggregate_group("Breakout", 16, &[positive; 200]);
         assert!(!g2.is_under_sampled());
         let empty = aggregate_group("x", 4, &[]);
         assert_eq!(empty.count, 0);
-        assert_eq!(empty.win_rate, None);
+        assert_eq!(empty.up_rate, None);
+        assert_eq!(empty.avg_mfe, None);
     }
 
     #[test]
     fn bars_to_desc_kline_reverses_order() {
         let mut bars = sample_bars();
-        bars[0].close = 10.0;
-        bars[15].close = 9.0;
-        let desc = bars_to_desc_kline(&bars);
+        bars[15] = bar((2026, 8, 10), (14, 30), 9.0);
+        let desc = bars_to_desc_kline(&bars).expect("valid bars");
         assert_eq!(desc.len(), 16);
         // data[0] = 最新 (14:30)
         assert_eq!(desc[0].close, 9.0);
@@ -874,46 +1045,142 @@ mod tests {
         assert!(r4.is_some() || r16.is_some());
     }
 
-    #[test]
-    fn sell_reason_prefix_matches_br234() {
-        assert!("BR-234四大铁律卖出:ATR动态止损".starts_with(SELL_REASON_PREFIX));
-        assert!(!("NewsCatalyst".starts_with(SELL_REASON_PREFIX)));
+    fn raw_fill(
+        id: i64,
+        direction: &str,
+        fill_price: Option<f64>,
+        occurred_at: &str,
+        virtual_reason: &str,
+    ) -> PaperFilledReviewRow {
+        PaperFilledReviewRow {
+            id,
+            plan_id: format!("TEST_CODE_PLAN_{id}"),
+            code: "TEST_CODE_000001".to_owned(),
+            name: "TEST_CODE sample".to_owned(),
+            direction: direction.to_owned(),
+            fill_price,
+            quantity: 100,
+            occurred_at: occurred_at.to_owned(),
+            virtual_reason: virtual_reason.to_owned(),
+        }
     }
 
     #[test]
-    fn broken_fill_excludes_bad_window_and_low_price() {
-        // 7/14-16 窗口内: 低价 + 正常价 + 放大价全部排除 (190 笔全破损)
-        let d15 = NaiveDate::from_ymd_opt(2026, 7, 15)
-            .unwrap()
-            .and_hms_opt(10, 0, 0)
-            .unwrap();
-        assert!(is_broken_fill(&d15, 0.07), "窗口内低价必须排除");
-        assert!(
-            is_broken_fill(&d15, 10.0),
-            "窗口内正常价也须排除 (沪电真实 121 元)"
+    fn br247_sell_rows_are_not_scored_as_entry_events() {
+        let as_of = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
+        let (entries, exits) = parse_paper_signal_rows(
+            vec![raw_fill(
+                1,
+                "sell",
+                Some(10.0),
+                "2026-08-10 01:30:00",
+                "BR-234四大铁律卖出:ATR动态止损",
+            )],
+            as_of,
+            1,
+        )
+        .expect("sell row is a valid exit fact");
+        assert!(entries.is_empty());
+        assert_eq!(exits, 1);
+        let calls = std::cell::Cell::new(0_usize);
+
+        let result = run_full_backtest_with_entries_and_loader(&entries, exits, |_| {
+            calls.set(calls.get() + 1);
+            Ok(sample_bars())
+        })
+        .expect("sell row is a valid exit fact but not an entry event");
+
+        assert!(result.virtual_buy.is_empty());
+        assert_eq!(result.exit_rows_excluded, 1);
+        assert_eq!(
+            calls.get(),
+            0,
+            "exit-only input must make zero provider calls"
         );
-        assert!(
-            is_broken_fill(&d15, 1680.0),
-            "窗口内放大价也须排除 (Momentum)"
-        );
-        // 窗口外: 仅 <1.0 排除, 低价股 (如 3 元) 保留
-        let d20 = NaiveDate::from_ymd_opt(2026, 7, 20)
+    }
+
+    #[test]
+    fn br247_does_not_delete_positive_fill_by_fixed_date_or_one_yuan_threshold() {
+        let as_of = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        let (entries, exits) = parse_paper_signal_rows(
+            vec![raw_fill(
+                1,
+                "buy",
+                Some(0.5),
+                "2026-07-15 02:00:00",
+                "Momentum",
+            )],
+            as_of,
+            1,
+        )
+        .expect("positive source fill must not be rejected by a fixed price/date rule");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].fill_price, 0.5);
+        assert_eq!(exits, 0);
+    }
+
+    #[test]
+    fn br247_invalid_fill_or_unknown_entry_family_fails_the_batch() {
+        let as_of = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
+        let missing = raw_fill(1, "buy", None, "2026-08-10 01:30:00", "Momentum");
+        assert!(parse_paper_signal_rows(vec![missing], as_of, 1)
+            .unwrap_err()
+            .contains("fill_price missing/invalid"));
+
+        let bad_time = raw_fill(2, "buy", Some(10.0), "now", "Momentum");
+        assert!(parse_paper_signal_rows(vec![bad_time], as_of, 1)
+            .unwrap_err()
+            .contains("timestamp invalid"));
+
+        let unknown = raw_fill(3, "buy", Some(10.0), "2026-08-10 01:30:00", "mystery");
+        assert!(parse_paper_signal_rows(vec![unknown], as_of, 1)
+            .unwrap_err()
+            .contains("entry strategy family unavailable"));
+    }
+
+    #[test]
+    fn br247_invalid_or_unordered_technical_bars_fail_closed() {
+        let signal_utc = NaiveDate::from_ymd_opt(2026, 8, 10)
             .unwrap()
-            .and_hms_opt(10, 0, 0)
+            .and_hms_opt(2, 23, 0)
             .unwrap();
-        assert!(is_broken_fill(&d20, 0.5), "窗口外 <1.0 兜底排除");
-        assert!(!is_broken_fill(&d20, 3.5), "窗口外正常低价股保留");
-        // sell 不受影响 (8/10 起)
-        let d10 = NaiveDate::from_ymd_opt(2026, 8, 10)
-            .unwrap()
-            .and_hms_opt(15, 0, 0)
-            .unwrap();
-        assert!(!is_broken_fill(&d10, 45.0));
-        // 8/11 今日成交 (38-121 元) 保留
-        let d11 = NaiveDate::from_ymd_opt(2026, 8, 11)
-            .unwrap()
-            .and_hms_opt(10, 0, 0)
-            .unwrap();
-        assert!(!is_broken_fill(&d11, 121.35));
+        let mut invalid = sample_bars();
+        invalid[0].close = 0.0;
+        assert!(validate_technical_bars(&invalid)
+            .unwrap_err()
+            .contains("OHLC"));
+        assert!(locate_signal_bar(&invalid, signal_utc)
+            .unwrap_err()
+            .contains("OHLC"));
+
+        let mut unordered = sample_bars();
+        unordered.swap(0, 1);
+        assert!(validate_technical_bars(&unordered)
+            .unwrap_err()
+            .contains("not strictly ordered"));
+    }
+
+    #[test]
+    fn br247_render_discloses_event_semantics_and_censoring() {
+        let result = R12BacktestResult {
+            virtual_buy: vec![aggregate_group(
+                "Momentum",
+                4,
+                &[EventObservation {
+                    terminal_ret: 0.01,
+                    mfe: 0.02,
+                    mae: -0.01,
+                }],
+            )],
+            exit_rows_excluded: 2,
+            censored_windows: 1,
+            ..Default::default()
+        };
+        let rendered = render_r12(&result);
+        assert!(rendered.contains("上涨比例"));
+        assert!(rendered.contains("不是买入→卖出扣成本策略胜率"));
+        assert!(rendered.contains("样本不足 200"));
+        assert!(rendered.contains("右删失"));
+        assert!(!rendered.contains("卖出信号"));
     }
 }

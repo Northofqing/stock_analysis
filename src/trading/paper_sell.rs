@@ -24,7 +24,9 @@ use crate::data_provider::KlineData;
 use crate::database::DatabaseManager;
 use crate::pipeline::position_tracker::{evaluate_sell_rules, SellEvaluation};
 use crate::strategy::detect_boll_macd_signal;
-use crate::trading::paper_lot_ledger::{rebuild_paper_positions, PaperFill};
+use crate::trading::paper_lot_ledger::{
+    parse_paper_fill_timestamp, rebuild_paper_positions, PaperFill,
+};
 use crate::trading::paper_trade::{
     portfolio_state_snapshot, simulate_with_audit_evidence, Direction, PaperAuditEvidence,
     PaperRiskContext, PaperSignal, PaperTradeStatus,
@@ -202,26 +204,6 @@ fn aggregate_open_positions_at(
         });
     }
     Ok(positions)
-}
-
-fn parse_paper_fill_timestamp(fill_id: i64, raw: &str) -> Result<chrono::NaiveDateTime, String> {
-    let parsed = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")
-        .map_err(|error| format!("paper fill id={fill_id} timestamp invalid: {error}"))?;
-    let whole_seconds = parsed.format("%Y-%m-%d %H:%M:%S").to_string();
-    let canonical = raw == whole_seconds
-        || raw
-            .strip_prefix(&format!("{whole_seconds}."))
-            .is_some_and(|fraction| {
-                !fraction.is_empty()
-                    && fraction.len() <= 9
-                    && fraction.bytes().all(|byte| byte.is_ascii_digit())
-            });
-    if !canonical {
-        return Err(format!(
-            "paper fill id={fill_id} timestamp invalid: expected YYYY-MM-DD HH:MM:SS[.fraction], got {raw:?}"
-        ));
-    }
-    Ok(parsed)
 }
 
 #[derive(QueryableByName)]
