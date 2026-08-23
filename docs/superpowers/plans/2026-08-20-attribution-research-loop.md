@@ -1523,3 +1523,20 @@ cargo run --bin economic_position_probe -- \
 
 回滚：设计、实现与证据分别 `git revert <sha>`；不得修改历史 `paper_trades`、补零费用
 或恢复 lot 片段胜率。
+
+## 任务 13：2026-08-23 纸面库存重建失败审计
+
+**规格：** 对应设计 §12 与 BR-249。只补订单前失败审计，不修改 `main.rs`、推送、
+卖出阈值、历史成交或生产暂停闸。
+
+- [x] Gate A：冻结独立审计语义、来源快照、哈希链、五年留存、精确去重和回滚。
+- [ ] RED：解析失败与 FIFO/T+1 重建失败必须形成持久回执。
+- [ ] RED：完全相同失败重放不新增；来源或诊断变化必须新增。
+- [ ] RED：审计/链不可更新删除；篡改阻止追加；链写失败整笔回滚。
+- [ ] GREEN：新增独立 `paper_inventory_failure_audit` 深模块和启动校验。
+- [ ] GREEN：`paper_sell` 在原始行读取后的三个结构失败阶段调用审计。
+- [ ] 回归：paper FIFO/交易、审计模块、Clippy 和 monitor 编译通过。
+- [ ] Gate C/D：合规、全量测试、覆盖率和 PR 证据统一在最终证据节完成。
+
+回滚：设计、实现与证据分别 `git revert <sha>`；数据库审计记录至少保留五年，不执行
+破坏性 down migration，不改写或删除 `paper_trades`。
