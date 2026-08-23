@@ -1,4 +1,5 @@
 //! 2026-08-20 Attribution Research Loop — 交付物 A 核心模块.
+//! Registered business rules: BR-247.
 //!
 //! 设计: docs/superpowers/specs/2026-08-20-attribution-research-loop-design.md §4.
 //! 数据来源: paper_trades (plan_id + virtual_reason), 证据 E3-E7.
@@ -17,7 +18,12 @@ pub enum SignalFamily {
     VolumeSurge,
     MainNetInflow,
     Breakout,
+    SectorLeader,
+    AuctionAnomaly,
+    LLMSelect,
+    Momentum,
     PostCloseFundInflow,
+    /// 仅为历史持久化/序列化兼容保留；BR-247 禁止把退出原因映射成入场族。
     ExitByRule,
     Unknown,
 }
@@ -29,6 +35,10 @@ impl SignalFamily {
             SignalFamily::VolumeSurge => "VolumeSurge",
             SignalFamily::MainNetInflow => "MainNetInflow",
             SignalFamily::Breakout => "Breakout",
+            SignalFamily::SectorLeader => "SectorLeader",
+            SignalFamily::AuctionAnomaly => "AuctionAnomaly",
+            SignalFamily::LLMSelect => "LLMSelect",
+            SignalFamily::Momentum => "Momentum",
             SignalFamily::PostCloseFundInflow => "PostCloseFundInflow",
             SignalFamily::ExitByRule => "ExitByRule",
             SignalFamily::Unknown => "Unknown",
@@ -51,11 +61,20 @@ pub fn signal_family_of(reason: &str) -> SignalFamily {
     if r.starts_with("Breakout") {
         return SignalFamily::Breakout;
     }
+    if r.starts_with("SectorLeader") {
+        return SignalFamily::SectorLeader;
+    }
+    if r.starts_with("AuctionAnomaly") {
+        return SignalFamily::AuctionAnomaly;
+    }
+    if r.starts_with("LLMSelect") {
+        return SignalFamily::LLMSelect;
+    }
+    if r.starts_with("Momentum") {
+        return SignalFamily::Momentum;
+    }
     if r.starts_with("盘后资金净流入") || r.contains("收盘价买入") {
         return SignalFamily::PostCloseFundInflow;
-    }
-    if r.starts_with("BR-") {
-        return SignalFamily::ExitByRule;
     }
     SignalFamily::Unknown
 }
@@ -534,7 +553,15 @@ mod tests {
         assert_eq!(signal_family_of("VolumeSurge"), SignalFamily::VolumeSurge);
         assert_eq!(signal_family_of("MainNetInflow"), SignalFamily::MainNetInflow);
         assert_eq!(signal_family_of("Breakout"), SignalFamily::Breakout);
-        assert_eq!(signal_family_of("BR-234四大铁律卖出:结构止损（破中期趋势）"), SignalFamily::ExitByRule);
+        assert_eq!(signal_family_of("SectorLeader"), SignalFamily::SectorLeader);
+        assert_eq!(signal_family_of("AuctionAnomaly"), SignalFamily::AuctionAnomaly);
+        assert_eq!(signal_family_of("LLMSelect"), SignalFamily::LLMSelect);
+        assert_eq!(signal_family_of("Momentum"), SignalFamily::Momentum);
+        assert_eq!(
+            signal_family_of("BR-234四大铁律卖出:结构止损（破中期趋势）"),
+            SignalFamily::Unknown,
+            "exit reason is not an entry strategy family"
+        );
         assert_eq!(signal_family_of("盘后资金净流入Top10 收盘价买入: 主力+9.96亿 量比1.5 涨幅-2.9%"), SignalFamily::PostCloseFundInflow);
         assert_eq!(signal_family_of("均线策略 收盘价买入 量比1.2 涨幅+3%"), SignalFamily::PostCloseFundInflow);
         assert_eq!(signal_family_of("未知原因"), SignalFamily::Unknown);
