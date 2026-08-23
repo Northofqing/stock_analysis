@@ -1617,3 +1617,16 @@ cargo run --bin economic_position_probe -- \
 覆盖率报告或覆盖率门槛。
 
 回滚：设计与实现分别 `git revert <sha>`；禁止修改 coverage JSON 或降低阈值。
+
+## 任务 17：2026-08-24 公开未来路径 OHLC 失败关闭
+
+**规格：** 对应设计 §10.2/§10.5 与 BR-247。`forward_observation/forward_return` 是
+公开计算缝，不能依赖调用方必然先执行整批 K 线门禁；本任务只补路径 OHLC 自校验，
+不改变时间对齐、窗口、指标公式、阈值、provider 或生产能力状态。
+
+- [x] 缺口审计：当前路径只检查 `close/high/low` 正有限，不检查 `open` 或 OHLC 关系。
+- [ ] RED：未来路径存在非有限 open 或 `high < close` 时必须返回 `None`。
+- [ ] GREEN：逐根复用与整批门禁同义的正有限与 OHLC 关系校验。
+- [ ] 回归：BR-247 定向测试、lib Clippy、monitor check、特定文件 rustfmt。
+
+回滚：设计与实现分别 `git revert <sha>`；不得用坏 OHLC 继续计算 MFE/MAE。
