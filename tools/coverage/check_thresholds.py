@@ -35,12 +35,17 @@ def percentage(covered: int, count: int) -> float:
 def repository_relative_path(filename: str) -> str:
     """Normalize llvm-cov paths from local and repeated GitHub workspaces."""
     normalized = filename.replace("\\", "/")
-    marker = "/stock_analysis/"
-    if marker in normalized:
-        return normalized.rsplit(marker, 1)[-1]
     try:
-        return pathlib.Path(normalized).resolve().relative_to(pathlib.Path.cwd()).as_posix()
+        return (
+            pathlib.Path(normalized)
+            .resolve()
+            .relative_to(pathlib.Path.cwd().resolve())
+            .as_posix()
+        )
     except (OSError, ValueError):
+        marker = "/stock_analysis/"
+        if marker in normalized:
+            return normalized.rsplit(marker, 1)[-1]
         return normalized.lstrip("./")
 
 

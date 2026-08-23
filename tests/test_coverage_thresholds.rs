@@ -13,6 +13,37 @@ impl TestReport {
     }
 }
 
+struct TestCheckout {
+    root: PathBuf,
+    checkout: PathBuf,
+}
+
+impl TestCheckout {
+    fn new() -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "stock-analysis-coverage-worktree-{}-{}",
+            std::process::id(),
+            NEXT_REPORT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let checkout = root
+            .join("stock_analysis")
+            .join(".worktrees")
+            .join("TEST_CODE_branch");
+        std::fs::create_dir_all(&checkout).expect("create isolated worktree checkout");
+        Self { root, checkout }
+    }
+
+    fn path(&self) -> &Path {
+        &self.checkout
+    }
+}
+
+impl Drop for TestCheckout {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
 impl Drop for TestReport {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
@@ -90,16 +121,46 @@ fn write_expanded_core_report() -> TestReport {
     TestReport(report)
 }
 
+fn write_current_checkout_report(checkout: &Path) -> TestReport {
+    let report = std::env::temp_dir().join(format!(
+        "stock-analysis-worktree-coverage-{}-{}.json",
+        std::process::id(),
+        NEXT_REPORT_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let source = checkout.join("src/risk/limits.rs");
+    let file = std::fs::File::create(&report).expect("create worktree coverage report");
+    serde_json::to_writer(
+        file,
+        &json!({
+            "data": [{
+                "totals": {"lines": {"covered": 100, "count": 100}},
+                "files": [{
+                    "filename": source,
+                    "summary": {"lines": {"covered": 0, "count": 100}}
+                }]
+            }]
+        }),
+    )
+    .expect("write worktree coverage fixture");
+    TestReport(report)
+}
+
 fn run_gate(report: &TestReport) -> std::process::Output {
+    run_gate_from(report, Path::new(env!("CARGO_MANIFEST_DIR")))
+}
+
+fn run_gate_from(report: &TestReport, current_dir: &Path) -> std::process::Output {
+    let checker = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/coverage/check_thresholds.py");
     Command::new("python3")
+        .arg(checker)
         .args([
-            "tools/coverage/check_thresholds.py",
             report.path().to_str().expect("UTF-8 report path"),
             "--global-min",
             "80",
             "--core-min",
             "75",
         ])
+        .current_dir(current_dir)
         .output()
         .expect("run coverage threshold checker")
 }
@@ -124,4 +185,14 @@ fn every_registered_production_control_path_counts_as_core() {
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("core coverage gate failed"));
     assert!(String::from_utf8_lossy(&output.stdout).contains("8 files"));
+}
+
+#[test]
+fn current_worktree_paths_are_counted_as_core_instead_of_disappearing() {
+    let checkout = TestCheckout::new();
+    let report = write_current_checkout_report(checkout.path());
+    let output = run_gate_from(&report, checkout.path());
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("core coverage gate failed"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 files"));
 }
