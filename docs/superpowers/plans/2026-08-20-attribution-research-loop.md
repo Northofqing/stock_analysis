@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - **提交纪律**: 只 `git add` 本分支文件 (src/performance/*, src/bin/monitor/notify.rs, push_templates.rs, v14_adapter.rs, main.rs, docs/operations/*)。**绝不 `git add` grpc WIP 文件**: `.claude/settings.json, build.rs, docs/business_rules.md, docs/operations/2026-08-18-data-grpc-known-issues.md, docs/superpowers/specs/2026-08-17-client-bundle-opening-readiness-design.md, docs/superpowers/specs/2026-08-18-newsflash-two-phase-source-audit-design.md, src/bin/grpc_bundle_probe.rs, src/data_gateway/global_news.rs, src/data_gateway/grpc_source.rs, src/data_gateway/grpc_source/convert.rs, src/grpc_client/client.rs, src/grpc_client/errors.rs, src/grpc_client/external_v1.rs, src/grpc_client/retry.rs, src/grpc_server/handlers.rs, src/news/aggregator/raw_v2.rs, findings.md, progress.md, task_plan.md`。提交前 `git status --short` 检查无 WIP 文件混入。
-- **docs/ 被 .gitignore 忽略**: 新 docs 文件用 `git add -f <path>` 提交 (仓库惯例, 历史 spec 均 force-add)。
+- **docs/ 被 .gitignore 忽略**: 遵守用户指令，不再用 `git add -f` 强制跟踪新文件；后续修订合并进已经被 Git 跟踪的设计、计划或业务规则文件。
 - **v15 规则**: 默认值出声 — 归因空数据日仍生成报告并推送 (不静默跳过); 静默路径必须有注释说明。
 - **测试字符串不进生产**: 单测里出现的 `first/mock/stub/test kept` 等字符串绝不出现在生产推送文本; 生产文本只由归因数据生成。
 - **数据必须真实**: 不 mock, 不静默填零; 缺价格 → `unvalued` 计数, 缺数据 → 报告明示。
@@ -1404,7 +1404,7 @@ Expected: 单测全绿; build exit 0; 集成 grep ≥3; 生产 AC (A8/A9/A10/B2)
 - [ ] **Step 3: 提交文档**
 
 ```bash
-git add -f docs/operations/2026-08-20-attribution-research-loop.md
+git add docs/operations/2026-08-20-attribution-research-loop.md
 git commit -m "docs: attribution loop BR registration and orphan backlog
 
 交付物 A/B 收尾: spec §8 的 BR 注册 + 孤儿待办 (factor_ic / failure_attribution)
@@ -1426,3 +1426,35 @@ Expected: 仅剩 grpc WIP 文件 (18 个) 未提交 — **确认本分支 9 个�
 - **占位符扫描**: 无 TBD/TODO; T6 内注释明确 `--test 不覆盖 15:05 块时记录事实` 属诚实边界, 非占位。
 - **类型一致性**: `compute_daily/compute_window/persist_daily/render_full_markdown/render_summary/fifo_match/aggregate_families/query_fills_until` 签名在 T3-T6 间一致; `TradeAttribution.sell_date` 字段在 T3 明确要求回填 T2 结构体; `AttributionFillRow` 字段与 SQL 列一一对应 (id/code/direction/fill_price/quantity/local_ts/plan_id/virtual_reason)。
 - **已知实施时需确认项**: (1) notify.rs 5 个 match 块的确切行号 (Step 2 已给 grep 命令); (2) `market_data` 命名空间可见性 (T6 Step 1 注); (3) --test 是否覆盖 15:05/盘中循环 (T6/T8 已注明记录事实)。
+
+---
+
+## 任务 10：2026-08-22 纸面卖出 T+1/FIFO 修订
+
+**规格：** 本计划对应设计 §9，业务规则为 BR-134。实施在隔离分支 `codex/buy-sell-t1-fifo` 完成，不修改生产暂停闸、阈值、真实下单路径和 `monitor/main.rs`。
+
+- [x] 新增纯 FIFO 批次账本，并按代码稳定排序。
+- [x] 使用真实 `Filled.fill_price`，拒绝缺失、非正和非有限成交价。
+- [x] 部分卖出按 FIFO 消耗原始批次，保留剩余价格、日期和数量。
+- [x] 仅暴露隔夜可卖数量；当日批次锁定，同日卖出或超量消耗锁定批次整批失败。
+- [x] 每一行在状态变更前校验不晚于评估日，未来卖出和未来买入后卖空均不能绕过。
+- [x] 读取原始 `paper_trades.ts` 并严格解析，拒绝 SQLite `now`、仅时间及其他补造输入。
+- [x] 多代码交错买卖保持 FIFO 隔离，输出按代码稳定排序。
+- [x] 将评估日、成交 ID、剩余 lot、数量和精确价格绑定到防篡改订单审计，同时保持 `virtual_reason` 不变。
+- [x] 数据库测试使用运行时唯一 `TEST_CODE` 并只清理自身代码。
+- [x] 独立审查完成；Critical 时间补造和 Important 未来/同日绕过已修复。
+- [ ] 结构性重建失败的独立持久审计事件：需要新的 Gate A，不能伪装成订单审计；在完成前生产暂停不解除。
+- [ ] Gate B 全仓格式/Clippy：存在与本切片无关的既存失败，需按归因分批处理。
+- [ ] Gate C 数据新鲜度：`stock_daily` 仍需受控真实回填后复验。
+- [ ] Gate D：全仓覆盖率仍需达到 80%，核心交易/数据链路达到 95%。
+
+已验证证据：
+
+```text
+da1c907  拒绝非法纸面成交时间线
+041fe59  绑定纸面卖出 FIFO 审计证据
+cargo test --lib trading::paper_ -- --test-threads=1
+结果：67 passed, 0 failed
+```
+
+回滚：按新到旧顺序执行 `git revert 041fe59`、`git revert da1c907`，并继续回滚本分支更早的 FIFO 实施提交；禁止直接删除历史成交。
