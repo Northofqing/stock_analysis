@@ -1645,6 +1645,42 @@ Gate A 提交：`e7645d6`。实现提交：`72d76bd`；该修复不增加 provid
 - [x] GREEN：增加独立计划身份集合，重复时整批返回明确错误。
 - [x] 回归：BR-247 19/19 PASS；lib Clippy、monitor check、特定文件 rustfmt 均 PASS。
 
-Gate A 提交：`9238a8c`。实现提交在本任务完成时记录；本任务不修改任何历史成交或生产副作用。
+Gate A 提交：`9238a8c`。实现提交：`19a7b4f`；本任务不修改任何历史成交或生产副作用。
 
 回滚：设计与实现分别 `git revert <sha>`；不得通过删行、改写 `plan_id` 或静默去重历史事实。
+
+## 任务 19：2026-08-24 策略边界全量复验
+
+**规格：** 复验任务 15、17、18 的最终分支状态，只记录可重复执行的结果及归因，不修改
+`src/bin/monitor/main.rs`、Unsafe 重复推送、生产数据库、生产回填、订单路径或发布状态。
+
+- [x] BR-247 定向回归：`cargo test --lib review::backtest::tests -- --test-threads=1`
+  为 19/19 PASS；`cargo clippy --lib -- -D warnings`、`cargo check --bin monitor` 与
+  `rustfmt --edition 2021 --check src/review/backtest.rs` PASS。
+- [ ] Gate B 格式：`cargo fmt --check` 仍被本分支未修改的仓库既有格式差异阻塞；本次
+  修改的策略文件局部格式门已通过。
+- [ ] Gate B 测试：`cargo test -- --test-threads=1` 的 lib 为 2798 PASS / 0 FAIL /
+  7 ignored；monitor 为 683 PASS / 2 FAIL / 4 ignored。两个失败仍是受保护
+  `main.rs:11641` 的 BR-139 与 `main.rs:11750` 的 BR-241 基线结构计数断言；该文件
+  相对 `master` 零差异。
+- [ ] Gate B Clippy：全目标仍仅复现本分支未修改的 `hbars_probe.rs` 一条
+  `let_unit_value` 与 `t0_replay.rs` 两条 `doc_lazy_continuation`；lib Clippy PASS。
+- [ ] Gate C：fake implementation、设计矛盾及其余专项检查 PASS；隔离 worktree 没有
+  生产数据库，freshness FAIL；业务规则检查仍为既有 60 errors / 157 warnings。未执行
+  `backfill_daily.sh`，也未修改任何生产数据。
+- [ ] Gate D：先执行 `cargo llvm-cov clean --workspace`，再用官方 workspace / all-features
+  范围加 `--ignore-run-fail` 生成诊断 JSON。阈值检查得到全局 181971/236839 = 76.83%
+  （要求 80%），核心 145117/189071 = 76.75%（要求 95%，215 个文件），exit 1；
+  `src/review/backtest.rs` 为 871/1028 = 84.73%。由于插桩测试存在失败且 raw JSON 不是
+  BR-202 发布权威，本结果只能证明 Gate D 未通过。
+- [x] 全特性失败归因：除上述 monitor 两项外，失败目标为
+  `magic_market_release_revision`、`monitor_help_isolation`、
+  `selection_process_bootstrap_isolation`、`unified_data_architecture`；对应测试、
+  `src/bin/t0_minute_probe.rs` 与 `src/bin/monitor/main.rs` 均相对 `master` 零差异，不在
+  本次买卖策略修改范围内。
+- [x] 数据结论保持不变：真实历史仍受 T+1 违规、逐成交费用、基准/市场状态和干净验证
+  纪元缺失阻塞；R-12 TechnicalBars 保持 Disabled，完整策略保持 ResearchOnly，
+  `paper_sell_paused` 不解除。
+
+本任务不形成“Done”或发布结论。待全仓 Gate B/C/D 基线恢复且获得不可变真实证据后，
+按任务 14 另立 Gate A；禁止用默认费用、选择性删除旧成交、降低覆盖阈值或伪造基准跨门。
