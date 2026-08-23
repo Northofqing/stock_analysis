@@ -1476,6 +1476,7 @@ cargo test --lib trading::paper_ -- --test-threads=1
 - [x] 回归：`cargo test --lib trading::paper_ -- --test-threads=1`（67/67 PASS）。
 - [x] 编译/静态检查：`cargo check --bin monitor` 与 `cargo clippy --lib -- -D warnings`（PASS）。
 - [ ] Gate B/C/D 与真实数据限制统一在最终证据节报告。
+- [ ] 双轴审查修正：精确边界对齐、连续时间栅格、high/low MFE/MAE、窄 close/volume 接口和全删失审计计数。
 
 实现提交：`6f6a892`（入场策略族）、`73174c1`（R-12 买入事件研究）。
 当前只证明 Gate B 和定向回归；BR-239 仍保持 Disabled，未发布 TechnicalBars
@@ -1494,7 +1495,7 @@ cargo test --lib trading::paper_ -- --test-threads=1
 - [x] RED：混合入场族保留组成，未知买入族整批失败。
 - [x] RED：T+1、超卖、重复/乱序、非法身份/方向/价格/数量和未来行整批失败。
 - [x] RED：费用缺失时净指标不可用；完整费用逐成交绑定，缺失/重复/未知引用失败。
-- [x] RED：Observed/Scenario 标签隔离，盈利/亏损/平衡正确分母。
+- [ ] 双轴审查 RED：无真实费用适配器时任意字符串 Observed 必须失败；Scenario 仍可显式计算。
 - [x] RED：少于 200 个闭环或覆盖少于 84 天固定样本不足。
 - [x] GREEN：新增 `performance::economic_position` 深模块及只读原始时间薄壳。
 - [x] 回归：经济仓位 8/8、现有 attribution 19/19、paper FIFO/交易 67/67；
