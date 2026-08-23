@@ -1476,10 +1476,10 @@ cargo test --lib trading::paper_ -- --test-threads=1
 - [x] 回归：`cargo test --lib trading::paper_ -- --test-threads=1`（67/67 PASS）。
 - [x] 编译/静态检查：`cargo check --bin monitor` 与 `cargo clippy --lib -- -D warnings`（PASS）。
 - [ ] Gate B/C/D 与真实数据限制统一在最终证据节报告。
-- [ ] 双轴审查修正：精确边界对齐、连续时间栅格、high/low MFE/MAE、窄 close/volume 接口和全删失审计计数。
+- [x] 双轴审查修正：精确边界对齐、连续时间栅格、high/low MFE/MAE、窄 close/volume 接口和全删失审计计数。
 
 实现提交：`6f6a892`（入场策略族）、`73174c1`（R-12 买入事件研究）。
-当前只证明 Gate B 和定向回归；BR-239 仍保持 Disabled，未发布 TechnicalBars
+当前只证明实现和定向回归；全仓 Gate B/C/D 仍受任务 15 所列基线阻塞。BR-239 仍保持 Disabled，未发布 TechnicalBars
 生产能力，也没有形成完整买入→卖出扣成本胜率结论。
 
 回滚：文档、策略族映射和 R-12 实现分别 `git revert <sha>`；不得恢复硬编码日期删除、卖出胜率或边界 K 线补配。
@@ -1495,7 +1495,7 @@ cargo test --lib trading::paper_ -- --test-threads=1
 - [x] RED：混合入场族保留组成，未知买入族整批失败。
 - [x] RED：T+1、超卖、重复/乱序、非法身份/方向/价格/数量和未来行整批失败。
 - [x] RED：费用缺失时净指标不可用；完整费用逐成交绑定，缺失/重复/未知引用失败。
-- [ ] 双轴审查 RED：无真实费用适配器时任意字符串 Observed 必须失败；Scenario 仍可显式计算。
+- [x] 双轴审查 RED/GREEN：无真实费用适配器时任意字符串 Observed 失败关闭；Scenario 仍可显式计算。
 - [x] RED：少于 200 个闭环或覆盖少于 84 天固定样本不足。
 - [x] GREEN：新增 `performance::economic_position` 深模块及只读原始时间薄壳。
 - [x] 回归：经济仓位 8/8、现有 attribution 19/19、paper FIFO/交易 67/67；
@@ -1564,3 +1564,36 @@ cargo run --bin economic_position_probe -- \
 
 当前结论：代码层不再有合理的“补一个计算函数即可得到成功案例”工作；剩余是数据采集
 与用户/账户事实授权。禁止用旧 898 行选择性截断、新增默认常量或全 0 快照跨过该门。
+
+## 任务 15：2026-08-24 双轴审查修正与全仓验证证据
+
+**规格：** 对应设计 §10/§11 与 BR-247/BR-248。只修买卖策略验证边界，不修改
+`src/bin/monitor/main.rs`、Unsafe 重复推送、交易阈值、生产订单路径或历史成交。
+
+- [x] Gate A 文档提交：`da8fed5`。
+- [x] 实现提交：`f94b680`。
+- [x] R-12 定向测试：17/17 PASS；覆盖起点/终点栅格、内部与跨日缺口、栅格切换、
+  精确时间边界、午休/非边界不对齐、high/low MFE/MAE 和原始 bars 共享未来路径。
+- [x] Boll/MACD 窄接口测试：3/3 PASS；坏 close/volume 失败关闭，且与旧入口逐字段
+  对比动作、原因、布林带、MACD 和量比，确认算法语义未改变。
+- [x] 经济仓位测试：8/8 PASS；Observed 无真实来源能力时失败，Scenario 未回归。
+- [x] R-12 dispatcher 审计测试：1/1 PASS；无统计分组但有退出排除、未对齐或截尾计数时
+  仍可审计，只有分组与计数全部为零才返回 NoData。
+- [x] `cargo check --bin monitor` 与 `cargo clippy --lib -- -D warnings` PASS；四个改动
+  源文件的 `rustfmt --check` 与 `git diff --check` PASS。
+- [ ] Gate B 全仓：`cargo test -- --test-threads=1` 的 lib 为 2793/0/7，monitor 为
+  681/2/4；仅失败 `main.rs` 既有 BR-139、BR-241 源码计数断言，且该文件相对基线零差异。
+  `cargo fmt --check` 仍命中多个既有文件；全目标 Clippy 仍命中 `t0_replay.rs` 两条
+  `doc_lazy_continuation` 与 `hbars_probe.rs` 一条 `let_unit_value`。
+- [ ] Gate C：`check_fake_impl.sh` 与设计矛盾检查 PASS；总合规因 worktree 无生产数据库
+  导致 freshness FAIL，并因 60 条既有 BR 引用仓库中缺失的旧文档而 FAIL（另有 157 条
+  既有引用警告）。BR-247/248 没有新增登记错误；未执行会写生产数据的回填脚本。
+- [ ] Gate D：插桩测试仍只被相同两条 monitor 基线断言阻断。已生成报告的全局行覆盖为
+  174954/236621（73.94%，要求 80%）；按 worktree 路径纠正后核心覆盖为
+  140403/189144（74.23%，要求 95%）。官方阈值检查器把
+  `.worktrees/buy-sell-t1-fifo/src/...` 错归一化为非核心路径并以 exit 2 退出。
+
+改动文件覆盖证据：`backtest.rs` 84.14%、`boll_macd.rs` 93.58%、
+`economic_position.rs` 90.89%、`push_templates.rs` 65.93%。这些数字不满足 Gate D，不能
+据此发布“策略已验证成功”或解除 ResearchOnly/TechnicalBars Disabled。回滚按新到旧执行
+`git revert f94b680`、`git revert da8fed5`；不得删除历史成交或伪造生产数据。
