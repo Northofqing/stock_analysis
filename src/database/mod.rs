@@ -1051,6 +1051,7 @@ mod kline;
 mod lhb;
 pub mod news_ai;
 pub mod order_audit;
+pub(crate) mod paper_inventory_failure_audit;
 pub mod position_chain;
 mod positions;
 // BR-215: projection reconciliation is a tool-facing entry point.
@@ -2118,6 +2119,10 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
              BEGIN SELECT RAISE(ABORT, 'BR-084 invalid paper trade order'); END",
         )
         .execute(&mut *conn)?;
+        // BR-249: paper-inventory reconstruction failures occur before an
+        // order attempt, so they use an independent immutable hash chain.
+        // Startup refuses a missing, partial or tampered chain.
+        paper_inventory_failure_audit::create_schema(&mut *conn)?;
 
         // execution_tracking (PR3-3.5)
         diesel::sql_query(

@@ -21,11 +21,15 @@ use log::{info, warn};
 
 use crate::data_gateway::historical_bars::HistoricalBarsGateway;
 use crate::data_provider::KlineData;
+use crate::database::paper_inventory_failure_audit::{
+    append_failure_on_conn, PaperInventoryFailureRecord, PaperInventoryFailureStage,
+    PaperInventorySourceFact,
+};
 use crate::database::DatabaseManager;
 use crate::pipeline::position_tracker::{evaluate_sell_rules, SellEvaluation};
 use crate::strategy::detect_boll_macd_signal;
 use crate::trading::paper_lot_ledger::{
-    parse_paper_fill_timestamp, rebuild_paper_positions, PaperFill,
+    parse_paper_fill_timestamp, rebuild_paper_positions, PaperFill, PaperPositionInventory,
 };
 use crate::trading::paper_trade::{
     portfolio_state_snapshot, simulate_with_audit_evidence, Direction, PaperAuditEvidence,
@@ -144,10 +148,11 @@ pub fn aggregate_open_positions() -> Result<Vec<PaperPosition>, String> {
 fn aggregate_open_positions_at(
     as_of_date: chrono::NaiveDate,
 ) -> Result<Vec<PaperPosition>, String> {
-    let db = DatabaseManager::try_get().ok_or_else(|| "DB 未初始化".to_string())?;
+    let db = DatabaseManager::try_get()
+        .ok_or_else(|| "DB 未初始化；BR-249 来源不可用，失败审计未形成".to_string())?;
     let mut conn = db
         .get_conn()
-        .map_err(|error| format!("DB 连接失败: {error}"))?;
+        .map_err(|error| format!("DB 连接失败: {error}；BR-249 来源不可用，失败审计未形成"))?;
     let rows = diesel::sql_query(
         "SELECT id, code, name, direction, fill_price, quantity, \
                 CAST(ts AS TEXT) AS occurred_at \
@@ -156,26 +161,75 @@ fn aggregate_open_positions_at(
          ORDER BY ts ASC, id ASC",
     )
     .load::<FilledTradeRow>(&mut conn)
-    .map_err(|error| format!("paper_trades Filled 读取失败: {error}"))?;
-
-    let fills = rows
-        .into_iter()
+    .map_err(|error| {
+        format!("paper_trades Filled 读取失败: {error}；BR-249 来源事实不可用，失败审计未形成")
+    })?;
+    let source_facts = rows
+        .iter()
         .map(|row| {
-            let occurred_at = parse_paper_fill_timestamp(row.id, &row.occurred_at)?;
-            Ok(PaperFill {
-                id: row.id,
-                code: row.code,
-                name: row.name,
-                direction: row.direction,
-                fill_price: row.fill_price,
-                quantity: row.quantity,
-                occurred_at,
-            })
+            PaperInventorySourceFact::new(
+                row.id,
+                row.code.clone(),
+                row.name.clone(),
+                row.direction.clone(),
+                row.fill_price,
+                row.quantity,
+                row.occurred_at.clone(),
+            )
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Vec<_>>();
 
-    let inventories = rebuild_paper_positions(&fills, as_of_date)?;
+    let mut fills = Vec::with_capacity(rows.len());
+    for row in rows {
+        let occurred_at = match parse_paper_fill_timestamp(row.id, &row.occurred_at) {
+            Ok(occurred_at) => occurred_at,
+            Err(error) => {
+                return Err(audit_inventory_failure(
+                    &mut conn,
+                    as_of_date,
+                    PaperInventoryFailureStage::ParseRawFill,
+                    &error,
+                    &source_facts,
+                ));
+            }
+        };
+        fills.push(PaperFill {
+            id: row.id,
+            code: row.code,
+            name: row.name,
+            direction: row.direction,
+            fill_price: row.fill_price,
+            quantity: row.quantity,
+            occurred_at,
+        });
+    }
 
+    let inventories = match rebuild_paper_positions(&fills, as_of_date) {
+        Ok(inventories) => inventories,
+        Err(error) => {
+            return Err(audit_inventory_failure(
+                &mut conn,
+                as_of_date,
+                PaperInventoryFailureStage::RebuildFifo,
+                &error,
+                &source_facts,
+            ));
+        }
+    };
+    project_sellable_positions(inventories).map_err(|error| {
+        audit_inventory_failure(
+            &mut conn,
+            as_of_date,
+            PaperInventoryFailureStage::ProjectSellablePosition,
+            &error,
+            &source_facts,
+        )
+    })
+}
+
+fn project_sellable_positions(
+    inventories: Vec<PaperPositionInventory>,
+) -> Result<Vec<PaperPosition>, String> {
     let mut positions = Vec::new();
     for inventory in inventories {
         if inventory.sellable_quantity == 0 {
@@ -204,6 +258,32 @@ fn aggregate_open_positions_at(
         });
     }
     Ok(positions)
+}
+
+fn audit_inventory_failure(
+    conn: &mut SqliteConnection,
+    as_of_date: chrono::NaiveDate,
+    stage: PaperInventoryFailureStage,
+    diagnostic: &str,
+    source_facts: &[PaperInventorySourceFact],
+) -> String {
+    let record = PaperInventoryFailureRecord {
+        as_of_date,
+        stage,
+        diagnostic,
+        source_facts,
+    };
+    match append_failure_on_conn(conn, &record) {
+        Ok(receipt) => format!(
+            "{diagnostic}; BR-249 audit_id={} record_hash={} disposition={}",
+            receipt.audit_id,
+            receipt.record_hash,
+            receipt.disposition.as_str()
+        ),
+        Err(error) => {
+            format!("{diagnostic}; BR-249 持久失败审计不可用: {error}")
+        }
+    }
 }
 
 #[derive(QueryableByName)]
@@ -528,6 +608,27 @@ mod tests {
         .unwrap();
     }
 
+    fn inventory_failure_audit_count(code: &str) -> i64 {
+        let mut conn = DatabaseManager::get().get_conn().unwrap();
+        diesel::sql_query(
+            "SELECT COUNT(*) AS n FROM paper_inventory_failure_audit
+             WHERE instr(source_facts_json, ?) > 0",
+        )
+        .bind::<diesel::sql_types::Text, _>(code)
+        .get_result::<CountRow>(&mut conn)
+        .expect("count BR-249 audit rows")
+        .n
+    }
+
+    fn order_audit_count(code: &str) -> i64 {
+        let mut conn = DatabaseManager::get().get_conn().unwrap();
+        diesel::sql_query("SELECT COUNT(*) AS n FROM order_audit WHERE code = ?")
+            .bind::<diesel::sql_types::Text, _>(code)
+            .get_result::<CountRow>(&mut conn)
+            .expect("count order audit rows")
+            .n
+    }
+
     #[test]
     #[serial_test::serial]
     fn aggregate_uses_fill_price_instead_of_signal_price() {
@@ -662,10 +763,56 @@ mod tests {
             "2026-08-03 10:00:00",
         );
 
-        let error =
+        let first_error =
             aggregate_open_positions_at(date(2026, 8, 5)).expect_err("Filled 缺成交价必须整批失败");
+        let replay_error =
+            aggregate_open_positions_at(date(2026, 8, 5)).expect_err("同一坏事实重放仍必须失败");
 
-        assert!(error.contains("fill_price"), "{error}");
+        assert!(first_error.contains("fill_price"), "{first_error}");
+        assert!(
+            first_error.contains("BR-249 audit_id=")
+                && first_error.contains("disposition=appended"),
+            "{first_error}"
+        );
+        assert!(
+            replay_error.contains("disposition=existing"),
+            "{replay_error}"
+        );
+        assert_eq!(inventory_failure_audit_count(&code), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn aggregate_persists_t1_failure_before_any_order_attempt() {
+        let code = unique_code("T1_AUDIT");
+        let _guard = PaperSellGuard::new(vec![code.clone()]);
+        insert_fill(
+            &code,
+            "T+1审计",
+            "buy",
+            10.0,
+            Some(10.0),
+            100,
+            "2026-08-11 09:31:00",
+        );
+        insert_fill(
+            &code,
+            "T+1审计",
+            "sell",
+            10.2,
+            Some(10.2),
+            100,
+            "2026-08-11 14:31:00",
+        );
+        let order_attempts_before = order_audit_count(&code);
+
+        let error = aggregate_open_positions_at(date(2026, 8, 12))
+            .expect_err("同日卖出必须在订单前失败并审计");
+
+        assert!(error.contains("T+1"), "{error}");
+        assert!(error.contains("BR-249 audit_id="), "{error}");
+        assert_eq!(inventory_failure_audit_count(&code), 1);
+        assert_eq!(order_audit_count(&code), order_attempts_before);
     }
 
     #[test]
@@ -688,7 +835,7 @@ mod tests {
                 .expect_err("raw paper fill timestamp must be complete and immutable");
 
             assert!(
-                error.contains("timestamp invalid"),
+                error.contains("timestamp invalid") && error.contains("BR-249 audit_id="),
                 "{raw_timestamp}: {error}"
             );
         }
