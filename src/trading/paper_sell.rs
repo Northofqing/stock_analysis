@@ -26,7 +26,8 @@ use crate::pipeline::position_tracker::{evaluate_sell_rules, SellEvaluation};
 use crate::strategy::detect_boll_macd_signal;
 use crate::trading::paper_lot_ledger::{rebuild_paper_positions, PaperFill};
 use crate::trading::paper_trade::{
-    portfolio_state_snapshot, simulate, Direction, PaperRiskContext, PaperSignal, PaperTradeStatus,
+    portfolio_state_snapshot, simulate_with_audit_evidence, Direction, PaperAuditEvidence,
+    PaperRiskContext, PaperSignal, PaperTradeStatus,
 };
 use crate::trend_analyzer::StockTrendAnalyzer;
 
@@ -41,6 +42,8 @@ pub struct PaperPosition {
     pub avg_buy_price: f64,
     /// 最早可卖批次的买入日期
     pub first_buy_date: chrono::NaiveDate,
+    /// 绑定评估日、成交身份与剩余批次的规范化审计证据。
+    pub inventory_audit_evidence: String,
 }
 
 /// 一次卖出动作的结果（供 monitor 推送）。
@@ -188,12 +191,14 @@ fn aggregate_open_positions_at(
                 inventory.code
             )
         })?;
+        let inventory_audit_evidence = inventory.audit_evidence();
         positions.push(PaperPosition {
             code: inventory.code,
             name: inventory.name,
             quantity: i64::from(inventory.sellable_quantity),
             avg_buy_price,
             first_buy_date,
+            inventory_audit_evidence,
         });
     }
     Ok(positions)
@@ -390,7 +395,9 @@ fn evaluate_and_sell(
         quote_observed_at: quote.observed_at,
         risk_context,
     };
-    let outcome = simulate(&signal, quote.price, cash, total, pos_pct)?;
+    let audit_evidence = PaperAuditEvidence::new(pos.inventory_audit_evidence.clone())?;
+    let outcome =
+        simulate_with_audit_evidence(&signal, quote.price, cash, total, pos_pct, &audit_evidence)?;
     if outcome.result.status != PaperTradeStatus::Filled {
         warn!(
             "[paper_sell] {} 卖出未成交: {:?}",

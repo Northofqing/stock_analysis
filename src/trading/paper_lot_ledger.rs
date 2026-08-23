@@ -22,10 +22,57 @@ pub(crate) struct PaperPositionInventory {
     pub locked_quantity: u32,
     pub sellable_avg_price: Option<f64>,
     pub earliest_sellable_date: Option<chrono::NaiveDate>,
+    as_of_date: chrono::NaiveDate,
+    source_fill_ids: Vec<i64>,
+    open_lots: Vec<PaperLotAuditEvidence>,
+}
+
+impl PaperPositionInventory {
+    pub(crate) fn audit_evidence(&self) -> String {
+        let source_fill_ids = self
+            .source_fill_ids
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let open_lots = self
+            .open_lots
+            .iter()
+            .map(|lot| {
+                format!(
+                    "{}@{}@{}@{:016x}@{}",
+                    lot.buy_fill_id,
+                    lot.bought_at.format("%Y-%m-%dT%H:%M:%S%.9f"),
+                    lot.remaining_quantity,
+                    lot.price.to_bits(),
+                    if lot.sellable { "sellable" } else { "locked" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        let sellable_avg_price_bits = self.sellable_avg_price.map_or_else(
+            || "none".to_string(),
+            |price| format!("{:016x}", price.to_bits()),
+        );
+        format!(
+            "BR134_FIFO_V1;as_of={};source_fill_ids={source_fill_ids};open_lots={open_lots};sellable_quantity={};locked_quantity={};sellable_avg_price_bits={sellable_avg_price_bits}",
+            self.as_of_date, self.sellable_quantity, self.locked_quantity
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PaperLotAuditEvidence {
+    buy_fill_id: i64,
+    bought_at: chrono::NaiveDateTime,
+    remaining_quantity: u32,
+    price: f64,
+    sellable: bool,
 }
 
 #[derive(Debug)]
 struct OpenPaperLot {
+    buy_fill_id: i64,
     bought_at: chrono::NaiveDateTime,
     remaining_quantity: u32,
     price: f64,
@@ -35,6 +82,7 @@ struct OpenPaperLot {
 struct PositionState {
     name: String,
     lots: VecDeque<OpenPaperLot>,
+    source_fill_ids: Vec<i64>,
 }
 
 pub(crate) fn rebuild_paper_positions(
@@ -88,10 +136,13 @@ pub(crate) fn rebuild_paper_positions(
             .or_insert_with(|| PositionState {
                 name: fill.name.clone(),
                 lots: VecDeque::new(),
+                source_fill_ids: Vec::new(),
             });
         state.name.clone_from(&fill.name);
+        state.source_fill_ids.push(fill.id);
         match fill.direction.as_str() {
             "buy" => state.lots.push_back(OpenPaperLot {
+                buy_fill_id: fill.id,
                 bought_at: fill.occurred_at,
                 remaining_quantity: quantity,
                 price,
@@ -146,13 +197,19 @@ fn inventory_from_state(
     state: PositionState,
     as_of_date: chrono::NaiveDate,
 ) -> Result<PaperPositionInventory, String> {
+    let PositionState {
+        name,
+        lots,
+        source_fill_ids,
+    } = state;
     let mut total_quantity = 0_u32;
     let mut sellable_quantity = 0_u32;
     let mut locked_quantity = 0_u32;
     let mut sellable_cost = 0.0_f64;
     let mut earliest_sellable_date = None;
+    let mut open_lots = Vec::with_capacity(lots.len());
 
-    for lot in state.lots {
+    for lot in lots {
         total_quantity = total_quantity
             .checked_add(lot.remaining_quantity)
             .ok_or_else(|| format!("paper position {code} quantity overflow"))?;
@@ -170,10 +227,24 @@ fn inventory_from_state(
                     current.min(bought_date)
                 }),
             );
+            open_lots.push(PaperLotAuditEvidence {
+                buy_fill_id: lot.buy_fill_id,
+                bought_at: lot.bought_at,
+                remaining_quantity: lot.remaining_quantity,
+                price: lot.price,
+                sellable: true,
+            });
         } else if bought_date == as_of_date {
             locked_quantity = locked_quantity
                 .checked_add(lot.remaining_quantity)
                 .ok_or_else(|| format!("paper position {code} locked quantity overflow"))?;
+            open_lots.push(PaperLotAuditEvidence {
+                buy_fill_id: lot.buy_fill_id,
+                bought_at: lot.bought_at,
+                remaining_quantity: lot.remaining_quantity,
+                price: lot.price,
+                sellable: false,
+            });
         } else {
             return Err(format!(
                 "paper position {code} contains future fill date {bought_date} after {as_of_date}"
@@ -195,12 +266,15 @@ fn inventory_from_state(
 
     Ok(PaperPositionInventory {
         code,
-        name: state.name,
+        name,
         total_quantity,
         sellable_quantity,
         locked_quantity,
         sellable_avg_price,
         earliest_sellable_date,
+        as_of_date,
+        source_fill_ids,
+        open_lots,
     })
 }
 
@@ -240,6 +314,21 @@ mod tests {
         assert_eq!(positions[0].locked_quantity, 100);
         assert_eq!(positions[0].sellable_avg_price, Some(10.0));
         assert_eq!(positions[0].earliest_sellable_date, Some(date(2026, 8, 3)));
+    }
+
+    #[test]
+    fn inventory_audit_evidence_binds_source_fills_and_open_lots() {
+        let fills = vec![
+            fill(1, "buy", 10.0, 200, "2026-08-03 10:00:00"),
+            fill(2, "buy", 12.0, 100, "2026-08-05 10:00:00"),
+        ];
+
+        let positions = rebuild_paper_positions(&fills, date(2026, 8, 5)).unwrap();
+
+        assert_eq!(
+            positions[0].audit_evidence(),
+            "BR134_FIFO_V1;as_of=2026-08-05;source_fill_ids=1,2;open_lots=1@2026-08-03T10:00:00.000000000@200@4024000000000000@sellable|2@2026-08-05T10:00:00.000000000@100@4028000000000000@locked;sellable_quantity=200;locked_quantity=100;sellable_avg_price_bits=4024000000000000"
+        );
     }
 
     #[test]

@@ -478,6 +478,24 @@ impl Direction {
     }
 }
 
+/// 额外写入订单审计、但不改变策略分类文本的结构化证据。
+#[derive(Clone, Debug)]
+pub struct PaperAuditEvidence(String);
+
+impl PaperAuditEvidence {
+    pub fn new(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err("paper audit evidence must not be blank".to_string());
+        }
+        Ok(Self(value))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// 输入: 模拟成交信号
 #[derive(Clone, Debug)]
 pub struct PaperSignal {
@@ -499,6 +517,16 @@ pub struct PaperSignal {
     pub secondary_confirmed: bool,
     pub quote_observed_at: chrono::DateTime<chrono::Utc>,
     pub risk_context: PaperRiskContext,
+}
+
+fn audit_decision_basis(
+    signal: &PaperSignal,
+    audit_evidence: Option<&PaperAuditEvidence>,
+) -> String {
+    audit_evidence.map_or_else(
+        || signal.virtual_reason.clone(),
+        |evidence| format!("{} | {}", signal.virtual_reason, evidence.as_str()),
+    )
 }
 
 /// 输出: 模拟结果
@@ -891,6 +919,7 @@ fn persist_paper_trade_with_audit(
     signal: &PaperSignal,
     result: &PaperResult,
     observed_at: &str,
+    audit_evidence: Option<&PaperAuditEvidence>,
 ) -> diesel::QueryResult<(usize, Option<PaperTradePersistenceReceipt>)> {
     conn.transaction::<_, diesel::result::Error, _>(|conn| {
         let rows = diesel::sql_query(sql).execute(conn)?;
@@ -905,10 +934,11 @@ fn persist_paper_trade_with_audit(
         } else {
             result.not_fill_reason.as_deref()
         };
+        let decision_basis = audit_decision_basis(signal, audit_evidence);
         let audit = crate::database::order_audit::OrderAuditRecord {
             business_order_id: &signal.plan_id,
             source: "PaperTrade",
-            decision_basis: &signal.virtual_reason,
+            decision_basis: &decision_basis,
             side: signal.direction.as_str(),
             code: &signal.code,
             requested_price: signal.price,
@@ -945,6 +975,7 @@ fn simulate_with_scope(
     total_value: f64,
     current_position_pct: f64,
     snapshot_scope: bool,
+    audit_evidence: Option<&PaperAuditEvidence>,
 ) -> Result<PaperOutcome, String> {
     if snapshot_scope {
         return Err(
@@ -962,10 +993,11 @@ fn simulate_with_scope(
     {
         let reason = "duplicate business order id within 60 seconds".to_string();
         let observed_at = signal.quote_observed_at.to_rfc3339();
+        let decision_basis = audit_decision_basis(signal, audit_evidence);
         let audit = crate::database::order_audit::OrderAuditRecord {
             business_order_id: &signal.plan_id,
             source: "PaperTrade",
-            decision_basis: &signal.virtual_reason,
+            decision_basis: &decision_basis,
             side: signal.direction.as_str(),
             code: &signal.code,
             requested_price: signal.price,
@@ -989,10 +1021,11 @@ fn simulate_with_scope(
         current_position_pct,
     ) {
         let observed_at = signal.quote_observed_at.to_rfc3339();
+        let decision_basis = audit_decision_basis(signal, audit_evidence);
         let audit = crate::database::order_audit::OrderAuditRecord {
             business_order_id: &signal.plan_id,
             source: "PaperTrade",
-            decision_basis: &signal.virtual_reason,
+            decision_basis: &decision_basis,
             side: signal.direction.as_str(),
             code: &signal.code,
             requested_price: signal.price,
@@ -1042,9 +1075,15 @@ fn simulate_with_scope(
         signal.risk_context.data_mode.label(),
     );
     let observed_at = signal.quote_observed_at.to_rfc3339();
-    let (rows, terminal_receipt) =
-        persist_paper_trade_with_audit(&mut conn, &sql, signal, &result, &observed_at)
-            .map_err(|e| format!("BR-086 audited paper trade transaction: {e}"))?;
+    let (rows, terminal_receipt) = persist_paper_trade_with_audit(
+        &mut conn,
+        &sql,
+        signal,
+        &result,
+        &observed_at,
+        audit_evidence,
+    )
+    .map_err(|e| format!("BR-086 audited paper trade transaction: {e}"))?;
 
     Ok(PaperOutcome {
         result,
@@ -1067,6 +1106,26 @@ pub fn simulate(
         total_value,
         current_position_pct,
         false,
+        None,
+    )
+}
+
+pub(crate) fn simulate_with_audit_evidence(
+    signal: &PaperSignal,
+    quote_price: f64,
+    current_cash: f64,
+    total_value: f64,
+    current_position_pct: f64,
+    audit_evidence: &PaperAuditEvidence,
+) -> Result<PaperOutcome, String> {
+    simulate_with_scope(
+        signal,
+        quote_price,
+        current_cash,
+        total_value,
+        current_position_pct,
+        false,
+        Some(audit_evidence),
     )
 }
 
@@ -1121,6 +1180,14 @@ mod tests {
         count: i64,
     }
 
+    #[derive(QueryableByName)]
+    struct PaperAuditBasisRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        virtual_reason: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        decision_basis: String,
+    }
+
     #[test]
     fn br086_chain_insert_failure_rolls_back_paper_trade() {
         let mut conn =
@@ -1148,6 +1215,7 @@ mod tests {
             &signal,
             &result,
             "2026-07-18T09:30:00+08:00",
+            None,
         )
         .expect_err("chain failure must roll back paper row and audit row");
         for table in ["paper_trades", "order_audit", "order_audit_chain"] {
@@ -1215,6 +1283,64 @@ mod tests {
     }
 
     #[test]
+    fn br134_inventory_evidence_extends_audit_basis_without_changing_virtual_reason() {
+        let signal = signal_default(false, false, false);
+        let evidence = PaperAuditEvidence::new(
+            "BR134_FIFO_V1;as_of=2026-08-23;source_fill_ids=1;open_lots=1@lot",
+        )
+        .unwrap();
+
+        assert_eq!(
+            audit_decision_basis(&signal, Some(&evidence)),
+            "NewsCatalyst | BR134_FIFO_V1;as_of=2026-08-23;source_fill_ids=1;open_lots=1@lot"
+        );
+        assert_eq!(signal.virtual_reason, "NewsCatalyst");
+    }
+
+    #[test]
+    fn br134_inventory_evidence_persists_only_in_order_audit_basis() {
+        let mut conn =
+            diesel::sqlite::SqliteConnection::establish(":memory:").expect("in-memory SQLite");
+        DatabaseManager::run_migrations_for_test(&mut conn).expect("test migrations");
+        let mut signal = signal_default(false, false, false);
+        signal.plan_id = "TEST_CODE_BR134_AUDIT_EVIDENCE".to_string();
+        let evidence = PaperAuditEvidence::new(
+            "BR134_FIFO_V1;as_of=2026-08-23;source_fill_ids=1;open_lots=1@lot",
+        )
+        .unwrap();
+        let result = evaluate(&signal, signal.price);
+        let sql = "INSERT INTO paper_trades
+                   (plan_id, code, name, direction, price, quantity, status,
+                    fill_price, not_fill_reason, virtual_reason, account_mode, data_mode)
+                   VALUES ('TEST_CODE_BR134_AUDIT_EVIDENCE', 'TEST_CODE_688001', '测试', 'buy',
+                           50.0, 100, 'Filled', 50.0, NULL, 'NewsCatalyst', 'Normal', 'Full')";
+
+        persist_paper_trade_with_audit(
+            &mut conn,
+            sql,
+            &signal,
+            &result,
+            "2026-08-23T09:31:00+08:00",
+            Some(&evidence),
+        )
+        .expect("audited paper persistence");
+        let row = diesel::sql_query(
+            "SELECT p.virtual_reason, a.decision_basis
+             FROM paper_trades p
+             JOIN order_audit a ON a.business_order_id = p.plan_id
+             WHERE p.plan_id = 'TEST_CODE_BR134_AUDIT_EVIDENCE'",
+        )
+        .get_result::<PaperAuditBasisRow>(&mut conn)
+        .expect("paper/audit evidence join");
+
+        assert_eq!(row.virtual_reason, "NewsCatalyst");
+        assert_eq!(
+            row.decision_basis,
+            "NewsCatalyst | BR134_FIFO_V1;as_of=2026-08-23;source_fill_ids=1;open_lots=1@lot"
+        );
+    }
+
+    #[test]
     fn br192_realtime_quote_freshness_accepts_five_seconds_and_rejects_bad_time() {
         let evaluated_at = chrono::DateTime::parse_from_rfc3339("2026-07-30T09:31:05+08:00")
             .unwrap()
@@ -1266,6 +1392,7 @@ mod tests {
             &signal,
             &result,
             "2026-07-30T09:31:00+08:00",
+            None,
         )
         .expect("atomic paper terminal persistence");
         let receipt = receipt.expect("new terminal transition carries receipt");
