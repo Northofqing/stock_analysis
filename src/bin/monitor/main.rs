@@ -2519,9 +2519,10 @@ static DATA_MODE_UNSAFE_REMINDER: Lazy<
     std::sync::Mutex<stock_analysis::monitor::data_mode::PersistentUnsafeReminder>,
 > = Lazy::new(|| std::sync::Mutex::new(Default::default()));
 
-fn commit_data_mode_reminder_result(
+fn commit_data_mode_status_result(
     state: &mut stock_analysis::monitor::data_mode::PersistentUnsafeReminder,
     mode: stock_analysis::monitor::data_mode::DataMode,
+    missing: &[stock_analysis::monitor::data_mode::Capability],
     result: &push_templates::ModeDispatchResult,
     confirmed_now: impl FnOnce() -> std::time::Instant,
 ) -> bool {
@@ -2531,8 +2532,32 @@ fn commit_data_mode_reminder_result(
     ) {
         return false;
     }
-    state.record_confirmed(mode, confirmed_now());
+    state.record_external_confirmed(mode, missing, confirmed_now());
     true
+}
+
+fn commit_due_unsafe_heartbeat<Now, Publish>(
+    state: &mut stock_analysis::monitor::data_mode::PersistentUnsafeReminder,
+    action: &stock_analysis::monitor::data_mode::PersistentUnsafeAction,
+    confirmed_now: Now,
+    publish: Publish,
+) -> Result<bool, String>
+where
+    Now: FnOnce() -> std::time::Instant,
+    Publish: FnOnce(&str) -> Result<(), String>,
+{
+    let stock_analysis::monitor::data_mode::PersistentUnsafeAction::InternalHeartbeat {
+        fingerprint,
+    } = action
+    else {
+        return Ok(false);
+    };
+
+    let mut confirmed_state = state.clone();
+    confirmed_state.record_heartbeat_confirmed(fingerprint, confirmed_now())?;
+    publish(fingerprint)?;
+    *state = confirmed_state;
+    Ok(true)
 }
 
 async fn evaluate_data_mode_hook() {
@@ -2540,6 +2565,7 @@ async fn evaluate_data_mode_hook() {
 
     use stock_analysis::monitor::data_mode::{
         current_data_health_input, evaluate as dm_evaluate, DataMode as LibDM,
+        PersistentUnsafeAction,
     };
 
     let input = match current_data_health_input(120, 600) {
@@ -2558,27 +2584,23 @@ async fn evaluate_data_mode_hook() {
     };
 
     let health = dm_evaluate(&input, prev);
-    let reminder_evaluated_at = std::time::Instant::now();
-    let persistent_reminder_due = match DATA_MODE_UNSAFE_REMINDER.lock() {
-        Ok(mut state) => {
-            if state.observe_mode(health.mode) {
-                log::info!(
-                    "[DataMode-hook][BR-135] recovery observed; persistent Unsafe reminder state cleared"
-                );
+    let unsafe_action = match DATA_MODE_UNSAFE_REMINDER.lock() {
+        Ok(state) => match state.action(health.mode, &health.missing, std::time::Instant::now()) {
+            Ok(action) => action,
+            Err(error) => {
+                log::error!("[DataMode-hook][BR-135] heartbeat state unavailable: {error}");
+                return;
             }
-            match state.should_dispatch(health.mode, reminder_evaluated_at) {
-                Ok(due) => due,
-                Err(error) => {
-                    log::error!("[DataMode-hook][BR-135] reminder clock unavailable: {error}");
-                    return;
-                }
-            }
-        }
+        },
         Err(_) => {
-            log::error!("[DataMode-hook][BR-135] reminder state lock poisoned");
+            log::error!("[DataMode-hook][BR-135] heartbeat state lock poisoned");
             return;
         }
     };
+    let unsafe_fact_changed = matches!(
+        &unsafe_action,
+        PersistentUnsafeAction::ExternalStatus { .. }
+    );
 
     log::info!(
         "[DataMode-hook] 模式 {:?} → {:?}, missing={:?}",
@@ -2618,6 +2640,51 @@ async fn evaluate_data_mode_hook() {
         return;
     }
 
+    if matches!(
+        &unsafe_action,
+        PersistentUnsafeAction::InternalHeartbeat { .. }
+    ) {
+        let mut state = match DATA_MODE_UNSAFE_REMINDER.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                log::error!("[DataMode-hook][BR-135] heartbeat state lock poisoned");
+                return;
+            }
+        };
+        match commit_due_unsafe_heartbeat(
+            &mut state,
+            &unsafe_action,
+            std::time::Instant::now,
+            |fingerprint| {
+                stock_analysis::event::publish_delivery(
+                    stock_analysis::monitor::data_mode::UNSAFE_HEARTBEAT_AUDIT_KIND,
+                    Some(fingerprint),
+                    stock_analysis::monitor::data_mode::UNSAFE_HEARTBEAT_AUDIT_OUTCOME,
+                    stock_analysis::monitor::data_mode::UNSAFE_HEARTBEAT_AUDIT_CHANNEL,
+                    0,
+                    0,
+                )
+            },
+        ) {
+            Ok(true) => log::warn!(
+                "[DataMode-hook][BR-135] mode=Unsafe missing={} external_delivery=suppressed_unchanged internal_heartbeat=confirmed",
+                health
+                    .missing
+                    .iter()
+                    .map(|capability| capability.label())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            ),
+            Ok(false) => {}
+            Err(error) => {
+                log::error!(
+                    "[DataMode-hook][BR-135] internal heartbeat unconfirmed; remains due: {error}"
+                );
+            }
+        }
+        return;
+    }
+
     // BR-225c: 抖动抑制 — 非恶化切换需稳定 300s 才推。pending 记录首个
     // 不同模式的观测时刻; 窗口内静默 (warn 一次, v15 出声规则); 投递后清空。
     let pending_since = {
@@ -2644,7 +2711,7 @@ async fn evaluate_data_mode_hook() {
     let result = match pt::push_data_mode_change(
         &input,
         prev,
-        persistent_reminder_due,
+        unsafe_fact_changed,
         Some(&banner),
         pending_since,
     )
@@ -2699,19 +2766,20 @@ async fn evaluate_data_mode_hook() {
     }
     match DATA_MODE_UNSAFE_REMINDER.lock() {
         Ok(mut state) => {
-            if commit_data_mode_reminder_result(
+            if commit_data_mode_status_result(
                 &mut state,
                 health.mode,
+                &health.missing,
                 &result,
                 std::time::Instant::now,
             ) {
                 log::info!(
-                    "[DataMode-hook][BR-135] confirmed DataMode delivery committed for reminder state"
+                    "[DataMode-hook][BR-135] confirmed DataMode delivery committed for event state"
                 );
             }
         }
         Err(_) => log::error!(
-            "[DataMode-hook][BR-135] confirmed delivery not committed: reminder state lock poisoned"
+            "[DataMode-hook][BR-135] confirmed delivery not committed: heartbeat state lock poisoned"
         ),
     }
 }
@@ -2753,46 +2821,111 @@ mod br135_data_mode_reminder_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use stock_analysis::monitor::data_mode::{DataMode as LibDM, PersistentUnsafeReminder};
+    use stock_analysis::monitor::data_mode::{
+        Capability, DataMode as LibDM, PersistentUnsafeAction, PersistentUnsafeReminder,
+    };
 
     #[test]
-    fn br135_reminder_confirmation_requires_pushed() {
+    fn br135_external_event_confirmation_requires_pushed() {
         let now = std::time::Instant::now();
+        let missing = [Capability::Quote];
         for outcome in [
             notify::PushOutcome::Denied("TEST_CODE denied".to_string()),
             notify::PushOutcome::Deduped,
             notify::PushOutcome::SinkError("TEST_CODE sink".to_string()),
         ] {
             let mut state = PersistentUnsafeReminder::default();
-            assert!(!commit_data_mode_reminder_result(
+            assert!(!commit_data_mode_status_result(
                 &mut state,
                 LibDM::Unsafe,
+                &missing,
                 &push_templates::ModeDispatchResult::Delivery(outcome),
                 || panic!("unconfirmed delivery must not sample confirmation time"),
             ));
-            assert!(state.should_dispatch(LibDM::Unsafe, now).unwrap());
+            assert!(matches!(
+                state.action(LibDM::Unsafe, &missing, now).unwrap(),
+                PersistentUnsafeAction::ExternalStatus { .. }
+            ));
         }
 
         let mut state = PersistentUnsafeReminder::default();
         let confirmed_at = now + std::time::Duration::from_secs(7);
-        assert!(commit_data_mode_reminder_result(
+        assert!(commit_data_mode_status_result(
             &mut state,
             LibDM::Unsafe,
+            &missing,
             &push_templates::ModeDispatchResult::Delivery(notify::PushOutcome::Pushed),
             || confirmed_at,
         ));
-        assert!(!state
-            .should_dispatch(
-                LibDM::Unsafe,
-                confirmed_at + std::time::Duration::from_secs(1_799),
-            )
-            .unwrap());
-        assert!(state
-            .should_dispatch(
-                LibDM::Unsafe,
-                confirmed_at + std::time::Duration::from_secs(1_800),
-            )
-            .unwrap());
+        assert_eq!(
+            state
+                .action(
+                    LibDM::Unsafe,
+                    &missing,
+                    confirmed_at + std::time::Duration::from_secs(1_799),
+                )
+                .unwrap(),
+            PersistentUnsafeAction::Silent
+        );
+        assert!(matches!(
+            state
+                .action(
+                    LibDM::Unsafe,
+                    &missing,
+                    confirmed_at + std::time::Duration::from_secs(1_800),
+                )
+                .unwrap(),
+            PersistentUnsafeAction::InternalHeartbeat { .. }
+        ));
+    }
+
+    #[test]
+    fn br135_internal_heartbeat_commits_only_after_authoritative_audit() {
+        let start = std::time::Instant::now();
+        let due_at = start + std::time::Duration::from_secs(1_800);
+        let missing = [Capability::Quote, Capability::News];
+        let mut state = PersistentUnsafeReminder::default();
+        state.record_external_confirmed(LibDM::Unsafe, &missing, start);
+        let action = state.action(LibDM::Unsafe, &missing, due_at).unwrap();
+
+        let error = commit_due_unsafe_heartbeat(
+            &mut state,
+            &action,
+            || due_at,
+            |_fingerprint| Err("TEST_CODE_AUDIT_APPEND_FAILURE".to_string()),
+        )
+        .unwrap_err();
+        assert_eq!(error, "TEST_CODE_AUDIT_APPEND_FAILURE");
+        assert_eq!(
+            state.action(LibDM::Unsafe, &missing, due_at).unwrap(),
+            action,
+            "failed audit must leave the heartbeat due"
+        );
+
+        let published = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&published);
+        assert!(commit_due_unsafe_heartbeat(
+            &mut state,
+            &action,
+            || due_at,
+            move |fingerprint| {
+                assert!(fingerprint.contains("Quote,News"));
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap());
+        assert_eq!(published.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .action(
+                    LibDM::Unsafe,
+                    &missing,
+                    due_at + std::time::Duration::from_secs(1),
+                )
+                .unwrap(),
+            PersistentUnsafeAction::Silent
+        );
     }
 
     #[tokio::test]
@@ -5991,14 +6124,14 @@ impl TemplateTestSummary {
         // BR-236 同步: R-13 补录 manifest family (br196_test_delivery) 后
         // active 54→55 (未激活 news) / 56→57 (激活), total 70→71;
         // WatchlistTracking PushKind 入 ALL_PUSH_KINDS 后 kind total 60→61。
-        // G5b (2026-08-22) +1 家族 +1 kind: 未激活 (57,13,3,73)/(52,11,0,63),
-        // 激活 news 后 2 个 newsflash 家族 由 Disabled→Active: (59,11,3,73)/(54,9,0,63)
+        // BR-135 (2026-08-22) 退休外部 reminder 家族: 未激活
+        // (56,13,3,72)/(52,11,0,63), 激活 news 后 (58,11,3,72)/(54,9,0,63)
         // (2026-08-22 实测运行时 manifest 与 br196 单元 default 快照一致)。
         let activated_news = self.family_disabled_total == 11;
         let expected_family = if activated_news {
-            (59, 11, 3, 73)
+            (58, 11, 3, 72)
         } else {
-            (57, 13, 3, 73)
+            (56, 13, 3, 72)
         };
         let expected_kind = if activated_news {
             (54, 9, 0, 63)
@@ -6278,16 +6411,16 @@ mod tests_br196_monitor_test_acceptance {
             manifest_sha256: "a".repeat(64),
             news_capability_generation: 1,
             news_capability_sha256: "b".repeat(64),
-            // G5b (2026-08-22) +1 家族 +1 kind: 55→57, 71→73, kind 61→63
-            family_active_total: 57,
+            // BR-135 (2026-08-22) 退休外部 reminder 家族，PushKind 闭集不变。
+            family_active_total: 56,
             family_disabled_total: 13,
             family_retired_total: 3,
-            family_total: 73,
+            family_total: 72,
             push_kind_active_total: 52,
             push_kind_disabled_total: 11,
             push_kind_retired_total: 0,
             push_kind_total: 63,
-            rendered_family_total: 57,
+            rendered_family_total: 56,
             governance_smoke_attempted: br196_test_delivery::governance_smoke_identity_count(),
             governance_smoke_passed: br196_test_delivery::governance_smoke_identity_count(),
             live_acceptance_opted_in: false,
@@ -6299,7 +6432,7 @@ mod tests_br196_monitor_test_acceptance {
             batches_pushed: 0,
             families_pushed: 0,
             receipt_audit_appended: 0,
-            explicit_dry_run_family_total: 57,
+            explicit_dry_run_family_total: 56,
             failed: 0,
         }
     }
@@ -6344,7 +6477,7 @@ mod tests_br196_monitor_test_acceptance {
     fn br196_renderer_catalog_is_closed_unique_and_nonempty() {
         let catalog = push_templates::build_test_template_catalog("2026-07-31", "10:30")
             .expect("complete TEST_CODE renderer catalog");
-        assert_eq!(catalog.len(), 57);
+        assert_eq!(catalog.len(), 56);
         let ids = catalog
             .iter()
             .map(|preview| preview.template_id)

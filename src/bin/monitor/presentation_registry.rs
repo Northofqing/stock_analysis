@@ -39,7 +39,7 @@ const fn descriptor(
     }
 }
 
-const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 59] = [
+const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 58] = [
     descriptor(
         "T-01-account-mode",
         PushKind::AccountMode,
@@ -51,12 +51,6 @@ const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 59
         PushKind::DataMode,
         "data_mode_hook",
         "render_data_mode",
-    ),
-    descriptor(
-        "T-02-data-mode-reminder",
-        PushKind::DataMode,
-        "data_mode_scheduler",
-        "render_data_mode_reminder",
     ),
     descriptor(
         "T-03-holding-plan",
@@ -404,7 +398,7 @@ const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 59
     ),
 ];
 
-pub(super) fn descriptors() -> &'static [ProductionPresentationDescriptor; 59] {
+pub(super) fn descriptors() -> &'static [ProductionPresentationDescriptor; 58] {
     &PRODUCTION_PRESENTATION_DESCRIPTORS
 }
 
