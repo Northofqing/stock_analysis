@@ -1597,3 +1597,16 @@ cargo run --bin economic_position_probe -- \
 `economic_position.rs` 90.89%、`push_templates.rs` 65.93%。这些数字不满足 Gate D，不能
 据此发布“策略已验证成功”或解除 ResearchOnly/TechnicalBars Disabled。回滚按新到旧执行
 `git revert f94b680`、`git revert da8fed5`；不得删除历史成交或伪造生产数据。
+
+## 任务 16：2026-08-24 修复 worktree 覆盖率路径识别
+
+**规格：** 对应设计 §14 与 BR-250。只修验证工具的 checkout 路径归一化，不修改覆盖
+报告、80%/95% 阈值、核心目录集合或任何生产路径。
+
+- [x] 复现：真实报告在 worktree 中返回 exit 2，错误声称没有核心模块。
+- [x] 根因：固定 `/stock_analysis/` 截断早于 cwd-relative 解析，产生 `.worktrees/.../src`。
+- [ ] RED：worktree 绝对路径必须计入核心覆盖并以真实低覆盖 exit 1。
+- [ ] GREEN：优先相对当前 checkout，保留外部 CI 重复仓库路径回退。
+- [ ] 回归：覆盖率工具测试、真实报告和全仓 Gate 重新验证。
+
+回滚：设计与实现分别 `git revert <sha>`；禁止修改 coverage JSON 或降低阈值。

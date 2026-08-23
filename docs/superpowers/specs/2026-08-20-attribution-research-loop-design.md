@@ -668,3 +668,34 @@ TDD 必须覆盖：解析失败持久化、T+1/超卖重建失败持久化、精
 取得以上事实后，先回到 Gate A 登记对齐、聚类和结论规则，再实现逐周期超额收益、按
 `(code, entry_date)` 聚类的不确定性和多状态报告。样本仍须达到 200 个闭环、84 天覆盖；
 任何条件不足都只能输出 `Unavailable/InsufficientSample/ResearchOnly`。
+
+## 14. 2026-08-24 worktree 覆盖率路径归一化
+
+### 14.1 目的与边界
+
+Gate D 的 llvm-cov 报告使用绝对文件名。隔离 worktree 中的路径形如
+`<repo>/.worktrees/<branch>/src/...`；现有检查器先按固定 `/stock_analysis/` 截断，得到
+`.worktrees/<branch>/src/...`，因此核心前缀一个也匹配不到并错误返回“无核心模块”。本修订
+只修复检查器对当前 checkout 的路径识别，不修改报告、覆盖计数、80%/95% 阈值或核心
+目录集合，也不把未达标转换成成功。业务规则登记为 BR-250，Threshold-Proof 为 N/A。
+
+### 14.2 归一化合同
+
+检查器必须先把输入路径和当前工作目录都规范为绝对路径，并尝试取得相对当前 checkout
+的路径。只要文件确实位于当前 checkout，`<cwd>/src/risk/limits.rs` 和
+`<cwd>/src/bin/monitor/main.rs` 就必须分别归一化为 `src/risk/limits.rs` 与
+`src/bin/monitor/main.rs`，无论 cwd 本身是否位于 `.worktrees/<name>` 下。
+
+只有输入文件不属于当前 checkout 时，才允许使用既有重复仓库目录兼容逻辑，支持 CI 的
+`.../stock_analysis/stock_analysis/src/...`。路径无法相对化且没有受支持仓库标记时保留
+显式非核心结果；禁止猜测任意含 `src` 的外部路径属于本仓库。零匹配或零核心行仍必须
+返回 exit 2，实际覆盖低于阈值仍必须返回 exit 1。
+
+### 14.3 失败模式、验收与回滚
+
+回归测试必须从当前 `CARGO_MANIFEST_DIR` 构造 worktree 形状的绝对核心文件名，并证明
+检查器输出核心文件数量且因低覆盖返回 exit 1，而不是因零匹配返回 exit 2。既有普通
+workspace、扩展核心目录和成功阈值测试必须继续通过；真实 coverage JSON 必须输出实际
+全局/核心分子分母。实现失败只回滚检查器与测试，不得修改 coverage JSON 或降低阈值。
+
+回滚使用 `git revert <sha>`。本修订不改变策略结果、生产数据、推送、交易或历史成交。
