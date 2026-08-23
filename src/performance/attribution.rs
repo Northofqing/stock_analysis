@@ -176,6 +176,7 @@ pub fn fifo_match(
 ///   compute_daily 与既有日级测试不受影响).
 /// - `emit_from = Some(d)` → 发射 `timestamp.date() >= d` 的全部卖出 (compute_window
 ///   30 天窗口语义; FIFO 匹配仍对全部 rows 执行 — 窗口前买入照常被窗口卖出消耗).
+///
 /// 校验 (身份/时间戳/越界/无序/oversell 等) 与 emit_from 无关, 全部 rows 一视同仁.
 pub fn fifo_match_from(
     rows: &[AttributionFillRow],
@@ -355,10 +356,10 @@ pub fn aggregate_families(
     use std::collections::BTreeMap;
     // 注意: rustc 1.95 拒绝「闭包返回指向捕获变量的引用」(captured variable cannot
     // escape FnMut closure body), 故用嵌套 fn 而非闭包实现 entry 复用.
-    fn ensure<'a>(
-        map: &'a mut BTreeMap<SignalFamily, FamilyAggregate>,
+    fn ensure(
+        map: &mut BTreeMap<SignalFamily, FamilyAggregate>,
         family: SignalFamily,
-    ) -> &'a mut FamilyAggregate {
+    ) -> &mut FamilyAggregate {
         map.entry(family).or_insert_with(|| FamilyAggregate {
             family,
             realized_trades: 0,
