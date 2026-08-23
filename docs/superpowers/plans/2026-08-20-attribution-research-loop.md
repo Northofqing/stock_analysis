@@ -1489,17 +1489,37 @@ cargo test --lib trading::paper_ -- --test-threads=1
 归因生产接线、推送或交易闸。
 
 - [x] Gate A：冻结空仓→再次空仓的主样本、开放仓位右删失、费用证据和失败边界。
-- [ ] RED：跨多个买入 lot 和多个部分卖单只形成一个闭合样本。
-- [ ] RED：归零后再次买入形成新的生命周期，代码间状态隔离。
-- [ ] RED：混合入场族保留组成，未知买入族整批失败。
-- [ ] RED：T+1、超卖、重复/乱序、非法身份/方向/价格/数量和未来行整批失败。
-- [ ] RED：费用缺失时净指标不可用；完整费用逐成交绑定，缺失/重复/未知引用失败。
-- [ ] RED：Observed/Scenario 标签隔离，盈利/亏损/平衡正确分母。
-- [ ] RED：少于 200 个闭环或覆盖少于 84 天固定样本不足。
-- [ ] GREEN：新增 `performance::economic_position` 深模块及只读原始时间薄壳。
-- [ ] 回归：新增模块、现有 attribution、paper FIFO、monitor 编译和 Clippy。
+- [x] RED：跨多个买入 lot 和多个部分卖单只形成一个闭合样本。
+- [x] RED：归零后再次买入形成新的生命周期，代码间状态隔离。
+- [x] RED：混合入场族保留组成，未知买入族整批失败。
+- [x] RED：T+1、超卖、重复/乱序、非法身份/方向/价格/数量和未来行整批失败。
+- [x] RED：费用缺失时净指标不可用；完整费用逐成交绑定，缺失/重复/未知引用失败。
+- [x] RED：Observed/Scenario 标签隔离，盈利/亏损/平衡正确分母。
+- [x] RED：少于 200 个闭环或覆盖少于 84 天固定样本不足。
+- [x] GREEN：新增 `performance::economic_position` 深模块及只读原始时间薄壳。
+- [x] 回归：经济仓位 8/8、现有 attribution 19/19、paper FIFO/交易 67/67；
+  `cargo check --bin monitor`、`cargo check --bin economic_position_probe` 与
+  `cargo clippy --lib --bin economic_position_probe -- -D warnings` 均 PASS。
 - [ ] 下一验证层：逐周期基准 Alpha、聚类不确定性和市场状态证据；完成前保持 ResearchOnly。
-- [ ] Gate C/D 与真实历史只读探针证据在最终证据节报告。
+- [x] 真实历史只读探针已执行并按规则失败：`002594` 在 `id=520` 前只有 3,100 股
+  隔夜批次，2026-08-11 当日买入 100 股后卖出 3,200 股，确定消费当日锁定批次。
+- [ ] Gate C/D：历史批次当前不可采信，且费用、Alpha、聚类与市场状态证据仍缺失。
+
+实现提交：`f120b6e`（经济仓位生命周期）、`dd4d0c4`（SQLite READ_ONLY 探针）。
+
+真实只读命令与结果：
+
+```text
+cargo run --bin economic_position_probe -- \
+  --db data/stock_analysis.db \
+  --as-of 2026-08-23
+结果：FAIL — economic sell id=520 violates A-share T+1 for 002594:
+      buy_date=2026-08-11 sell_date=2026-08-11
+只读复核：隔夜买入 3100 股 + 当日买入 100 股；id=520 卖出 3200 股。
+```
+
+该失败是当前策略验证结论的一部分：禁止删除/缩量 `id=520`、跳过该周期、假设部分
+成交或用后续买入补平。历史事实继续保留，完整胜率不得发布。
 
 回滚：设计、实现与证据分别 `git revert <sha>`；不得修改历史 `paper_trades`、补零费用
 或恢复 lot 片段胜率。
