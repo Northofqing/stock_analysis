@@ -1530,13 +1530,18 @@ cargo run --bin economic_position_probe -- \
 卖出阈值、历史成交或生产暂停闸。
 
 - [x] Gate A：冻结独立审计语义、来源快照、哈希链、五年留存、精确去重和回滚。
-- [ ] RED：解析失败与 FIFO/T+1 重建失败必须形成持久回执。
-- [ ] RED：完全相同失败重放不新增；来源或诊断变化必须新增。
-- [ ] RED：审计/链不可更新删除；篡改阻止追加；链写失败整笔回滚。
-- [ ] GREEN：新增独立 `paper_inventory_failure_audit` 深模块和启动校验。
-- [ ] GREEN：`paper_sell` 在原始行读取后的三个结构失败阶段调用审计。
-- [ ] 回归：paper FIFO/交易、审计模块、Clippy 和 monitor 编译通过。
+- [x] RED：解析失败与 FIFO/T+1 重建失败必须形成持久回执。
+- [x] RED：完全相同失败重放不新增；来源或诊断变化必须新增。
+- [x] RED：审计/链不可更新删除；篡改阻止追加；链写失败整笔回滚。
+- [x] GREEN：新增独立 `paper_inventory_failure_audit` 深模块和启动校验。
+- [x] GREEN：`paper_sell` 在原始行读取后的三个结构失败阶段调用审计。
+- [x] 回归：审计模块 6/6、paper FIFO/交易 68/68、`cargo clippy --lib -- -D warnings`
+  与 `cargo check --bin monitor` 均 PASS。
 - [ ] Gate C/D：合规、全量测试、覆盖率和 PR 证据统一在最终证据节完成。
 
 回滚：设计、实现与证据分别 `git revert <sha>`；数据库审计记录至少保留五年，不执行
 破坏性 down migration，不改写或删除 `paper_trades`。
+
+实现提交：`37dcf07`。集成测试已证明 T+1 失败在 `order_audit` 数量不变时取得 BR-249
+回执；同一来源快照、评估日、阶段和诊断的第二次扫描返回 `disposition=existing`，审计
+主表与链表仍各只有一行。`paper_sell_paused` 和 `src/bin/monitor/main.rs` 未修改。
