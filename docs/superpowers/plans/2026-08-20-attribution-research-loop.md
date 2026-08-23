@@ -1625,8 +1625,11 @@ cargo run --bin economic_position_probe -- \
 不改变时间对齐、窗口、指标公式、阈值、provider 或生产能力状态。
 
 - [x] 缺口审计：当前路径只检查 `close/high/low` 正有限，不检查 `open` 或 OHLC 关系。
-- [ ] RED：未来路径存在非有限 open 或 `high < close` 时必须返回 `None`。
-- [ ] GREEN：逐根复用与整批门禁同义的正有限与 OHLC 关系校验。
-- [ ] 回归：BR-247 定向测试、lib Clippy、monitor check、特定文件 rustfmt。
+- [x] RED：旧实现对非有限 open 与 `high < close` 错误返回可计算结果。
+- [x] GREEN：逐根执行与整批门禁同义的正有限与 OHLC 关系校验。
+- [x] 回归：BR-247 18/18 PASS；lib Clippy、monitor check、特定文件 rustfmt 均 PASS。
+
+Gate A 提交：`e7645d6`。实现提交在本任务完成时记录；该修复不增加 provider、数据库、
+订单或推送副作用。
 
 回滚：设计与实现分别 `git revert <sha>`；不得用坏 OHLC 继续计算 MFE/MAE。

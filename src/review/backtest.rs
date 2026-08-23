@@ -262,9 +262,11 @@ pub fn forward_observation(
     let mut mfe = 0.0_f64;
     let mut mae = 0.0_f64;
     for bar in path {
-        if [bar.close, bar.high, bar.low]
+        if [bar.open, bar.high, bar.low, bar.close]
             .iter()
             .any(|price| !price.is_finite() || *price <= 0.0)
+            || bar.high < bar.open.max(bar.close).max(bar.low)
+            || bar.low > bar.open.min(bar.close).min(bar.high)
         {
             return None;
         }
@@ -1004,6 +1006,26 @@ mod tests {
         assert_eq!(observation.terminal_ret, 0.0);
         assert!((observation.mfe - 0.2).abs() < 1e-9);
         assert!((observation.mae + 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn br247_forward_path_rejects_inconsistent_ohlc_without_batch_prevalidation() {
+        let mut non_finite_open = sample_bars();
+        non_finite_open[6].open = f64::NAN;
+        assert!(
+            forward_observation(&non_finite_open, 5, 1, 10.0).is_none(),
+            "public forward path must reject a non-finite open"
+        );
+
+        let mut high_below_close = sample_bars();
+        high_below_close[6].open = 9.0;
+        high_below_close[6].high = 9.5;
+        high_below_close[6].low = 8.0;
+        high_below_close[6].close = 10.0;
+        assert!(
+            forward_return(&high_below_close, 5, 1, 10.0).is_none(),
+            "public forward return must reject high below close"
+        );
     }
 
     #[test]
