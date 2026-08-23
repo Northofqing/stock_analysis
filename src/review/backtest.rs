@@ -382,12 +382,13 @@ fn parse_paper_signal_rows(
         .checked_sub_signed(Duration::days(lookback))
         .ok_or_else(|| format!("R-12 review window underflow: as_of={as_of_date} days={days}"))?;
     let mut previous_order = None;
-    let mut identities = std::collections::HashSet::new();
+    let mut fill_identities = std::collections::HashSet::new();
+    let mut plan_identities = std::collections::HashSet::new();
     let mut entries = Vec::new();
     let mut exit_rows_excluded = 0_usize;
 
     for row in rows {
-        if row.id <= 0 || !identities.insert(row.id) {
+        if row.id <= 0 || !fill_identities.insert(row.id) {
             return Err(format!(
                 "R-12 paper fill identity invalid/duplicate: id={}",
                 row.id
@@ -398,6 +399,12 @@ fn parse_paper_signal_rows(
             return Err(format!(
                 "R-12 paper fill id={} plan/code/name is blank",
                 row.id
+            ));
+        }
+        if !plan_identities.insert(row.plan_id.clone()) {
+            return Err(format!(
+                "R-12 paper fill plan identity invalid/duplicate: plan_id={:?}",
+                row.plan_id
             ));
         }
         let ts_utc = parse_paper_fill_timestamp(row.id, &row.occurred_at)?;
@@ -1218,6 +1225,20 @@ mod tests {
         assert!(parse_paper_signal_rows(vec![unknown], as_of, 1)
             .unwrap_err()
             .contains("entry strategy family unavailable"));
+    }
+
+    #[test]
+    fn br247_duplicate_plan_identity_fails_the_batch() {
+        let as_of = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
+        let first = raw_fill(1, "buy", Some(10.0), "2026-08-10 01:30:00", "Momentum");
+        let mut duplicate_plan = raw_fill(2, "buy", Some(10.1), "2026-08-10 01:31:00", "Momentum");
+        duplicate_plan.plan_id = first.plan_id.clone();
+
+        assert!(
+            parse_paper_signal_rows(vec![first, duplicate_plan], as_of, 1)
+                .unwrap_err()
+                .contains("plan identity invalid/duplicate")
+        );
     }
 
     #[test]

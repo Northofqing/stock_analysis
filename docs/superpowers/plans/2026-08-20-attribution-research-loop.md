@@ -1629,7 +1629,7 @@ cargo run --bin economic_position_probe -- \
 - [x] GREEN：逐根执行与整批门禁同义的正有限与 OHLC 关系校验。
 - [x] 回归：BR-247 18/18 PASS；lib Clippy、monitor check、特定文件 rustfmt 均 PASS。
 
-Gate A 提交：`e7645d6`。实现提交在本任务完成时记录；该修复不增加 provider、数据库、
+Gate A 提交：`e7645d6`。实现提交：`72d76bd`；该修复不增加 provider、数据库、
 订单或推送副作用。
 
 回滚：设计与实现分别 `git revert <sha>`；不得用坏 OHLC 继续计算 MFE/MAE。
@@ -1641,8 +1641,10 @@ Gate A 提交：`e7645d6`。实现提交在本任务完成时记录；该修复�
 把同一买入计划重复计入事件样本。不改变历史成交、查询窗口、策略公式、provider 或生产状态。
 
 - [x] Gate A：成交行 `id` 与业务 `plan_id` 两个身份轴分别批内唯一。
-- [ ] RED：两个不同成交行 `id` 复用同一 `plan_id` 时，旧实现错误接收两条事件。
-- [ ] GREEN：增加独立计划身份集合，重复时整批返回明确错误。
-- [ ] 回归：BR-247 模块测试、lib Clippy、monitor check、特定文件 rustfmt。
+- [x] RED：两个不同成交行 `id` 复用同一 `plan_id` 时，旧实现错误接收两条事件。
+- [x] GREEN：增加独立计划身份集合，重复时整批返回明确错误。
+- [x] 回归：BR-247 19/19 PASS；lib Clippy、monitor check、特定文件 rustfmt 均 PASS。
+
+Gate A 提交：`9238a8c`。实现提交在本任务完成时记录；本任务不修改任何历史成交或生产副作用。
 
 回滚：设计与实现分别 `git revert <sha>`；不得通过删行、改写 `plan_id` 或静默去重历史事实。
