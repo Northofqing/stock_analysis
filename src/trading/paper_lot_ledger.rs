@@ -1,6 +1,6 @@
 //! BR-134 纸面交易批次库存重建。
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone)]
 pub(crate) struct PaperFill {
@@ -42,13 +42,26 @@ pub(crate) fn rebuild_paper_positions(
     as_of_date: chrono::NaiveDate,
 ) -> Result<Vec<PaperPositionInventory>, String> {
     let mut states = BTreeMap::<String, PositionState>::new();
+    let mut seen_ids = HashSet::new();
+    let mut previous_order = None;
     for fill in fills {
-        if fill.direction != "buy" {
+        if fill.id <= 0 || fill.code.trim().is_empty() || fill.name.trim().is_empty() {
             return Err(format!(
-                "paper fill id={} direction invalid: {:?}",
-                fill.id, fill.direction
+                "paper fill identity invalid: id={} code={:?} name={:?}",
+                fill.id, fill.code, fill.name
             ));
         }
+        if !seen_ids.insert(fill.id) {
+            return Err(format!("paper fill duplicate identity: id={}", fill.id));
+        }
+        let current_order = (fill.occurred_at, fill.id);
+        if previous_order.is_some_and(|previous| previous >= current_order) {
+            return Err(format!(
+                "paper fills out of order at id={} occurred_at={}",
+                fill.id, fill.occurred_at
+            ));
+        }
+        previous_order = Some(current_order);
         let price = fill
             .fill_price
             .filter(|value| value.is_finite() && *value > 0.0)
@@ -69,17 +82,46 @@ pub(crate) fn rebuild_paper_positions(
                 lots: VecDeque::new(),
             });
         state.name.clone_from(&fill.name);
-        state.lots.push_back(OpenPaperLot {
-            bought_at: fill.occurred_at,
-            remaining_quantity: quantity,
-            price,
-        });
+        match fill.direction.as_str() {
+            "buy" => state.lots.push_back(OpenPaperLot {
+                bought_at: fill.occurred_at,
+                remaining_quantity: quantity,
+                price,
+            }),
+            "sell" => {
+                let mut remaining = quantity;
+                while remaining > 0 {
+                    let lot = state.lots.front_mut().ok_or_else(|| {
+                        format!(
+                            "paper sell id={} oversells {} by {} shares",
+                            fill.id, fill.code, remaining
+                        )
+                    })?;
+                    let consumed = remaining.min(lot.remaining_quantity);
+                    lot.remaining_quantity -= consumed;
+                    remaining -= consumed;
+                    if lot.remaining_quantity == 0 {
+                        state.lots.pop_front();
+                    }
+                }
+            }
+            other => {
+                return Err(format!(
+                    "paper fill id={} direction invalid: {other:?}",
+                    fill.id
+                ));
+            }
+        }
     }
 
-    states
-        .into_iter()
-        .map(|(code, state)| inventory_from_state(code, state, as_of_date))
-        .collect()
+    let mut positions = Vec::new();
+    for (code, state) in states {
+        let inventory = inventory_from_state(code, state, as_of_date)?;
+        if inventory.total_quantity > 0 {
+            positions.push(inventory);
+        }
+    }
+    Ok(positions)
 }
 
 fn inventory_from_state(
@@ -181,5 +223,143 @@ mod tests {
         assert_eq!(positions[0].locked_quantity, 100);
         assert_eq!(positions[0].sellable_avg_price, Some(10.0));
         assert_eq!(positions[0].earliest_sellable_date, Some(date(2026, 8, 3)));
+    }
+
+    #[test]
+    fn prior_partial_sell_consumes_the_oldest_lot() {
+        let fills = vec![
+            fill(1, "buy", 10.0, 200, "2026-08-03 10:00:00"),
+            fill(2, "buy", 12.0, 100, "2026-08-04 10:00:00"),
+            fill(3, "sell", 11.0, 100, "2026-08-05 10:00:00"),
+        ];
+
+        let positions = rebuild_paper_positions(&fills, date(2026, 8, 6)).unwrap();
+
+        assert_eq!(positions[0].total_quantity, 200);
+        assert_eq!(positions[0].sellable_quantity, 200);
+        assert_eq!(positions[0].locked_quantity, 0);
+        assert_eq!(positions[0].sellable_avg_price, Some(11.0));
+        assert_eq!(positions[0].earliest_sellable_date, Some(date(2026, 8, 3)));
+    }
+
+    #[test]
+    fn rejects_invalid_identity_and_order_before_returning_positions() {
+        let mut non_positive_id = fill(0, "buy", 10.0, 100, "2026-08-03 10:00:00");
+        let mut blank_code = fill(1, "buy", 10.0, 100, "2026-08-03 10:00:00");
+        blank_code.code = "  ".to_string();
+        let mut blank_name = fill(1, "buy", 10.0, 100, "2026-08-03 10:00:00");
+        blank_name.name = String::new();
+        let duplicate_ids = vec![
+            fill(1, "buy", 10.0, 100, "2026-08-03 10:00:00"),
+            fill(1, "buy", 11.0, 100, "2026-08-03 10:01:00"),
+        ];
+        let out_of_order = vec![
+            fill(2, "buy", 10.0, 100, "2026-08-03 10:01:00"),
+            fill(1, "buy", 11.0, 100, "2026-08-03 10:00:00"),
+        ];
+
+        let cases = vec![
+            (
+                "non-positive id",
+                vec![non_positive_id.clone()],
+                "identity invalid",
+            ),
+            ("blank code", vec![blank_code], "identity invalid"),
+            ("blank name", vec![blank_name], "identity invalid"),
+            ("duplicate id", duplicate_ids, "duplicate identity"),
+            ("out of order", out_of_order, "out of order"),
+        ];
+
+        for (label, fills, expected) in cases {
+            let error = rebuild_paper_positions(&fills, date(2026, 8, 6)).expect_err(label);
+            assert!(error.contains(expected), "{label}: {error}");
+        }
+
+        non_positive_id.id = -1;
+        let error =
+            rebuild_paper_positions(&[non_positive_id], date(2026, 8, 6)).expect_err("negative id");
+        assert!(error.contains("identity invalid"), "{error}");
+    }
+
+    #[test]
+    fn fully_sold_symbol_is_not_an_open_position() {
+        let fills = vec![
+            fill(1, "buy", 10.0, 100, "2026-08-03 10:00:00"),
+            fill(2, "sell", 11.0, 100, "2026-08-04 10:00:00"),
+        ];
+
+        let positions = rebuild_paper_positions(&fills, date(2026, 8, 5)).unwrap();
+
+        assert!(positions.is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_trade_facts_for_the_whole_batch() {
+        let mut missing_price = fill(1, "buy", 10.0, 100, "2026-08-03 10:00:00");
+        missing_price.fill_price = None;
+        let mut non_finite_price = fill(1, "buy", 10.0, 100, "2026-08-03 10:00:00");
+        non_finite_price.fill_price = Some(f64::NAN);
+        let invalid_quantity = fill(1, "buy", 10.0, 99, "2026-08-03 10:00:00");
+        let invalid_direction = fill(1, "hold", 10.0, 100, "2026-08-03 10:00:00");
+        let oversell = fill(1, "sell", 10.0, 100, "2026-08-03 10:00:00");
+        let future_fill = fill(1, "buy", 10.0, 100, "2026-08-07 10:00:00");
+        let overflow = vec![
+            fill(1, "buy", 10.0, 4_294_967_200, "2026-08-03 10:00:00"),
+            fill(2, "buy", 10.0, 4_294_967_200, "2026-08-03 10:01:00"),
+        ];
+
+        let cases = vec![
+            ("missing price", vec![missing_price], "fill_price"),
+            ("non-finite price", vec![non_finite_price], "fill_price"),
+            (
+                "invalid quantity",
+                vec![invalid_quantity],
+                "quantity invalid",
+            ),
+            (
+                "invalid direction",
+                vec![invalid_direction],
+                "direction invalid",
+            ),
+            ("oversell", vec![oversell], "oversells"),
+            ("future fill", vec![future_fill], "future fill"),
+            ("quantity overflow", overflow, "quantity overflow"),
+        ];
+
+        for (label, fills, expected) in cases {
+            let error = rebuild_paper_positions(&fills, date(2026, 8, 6)).expect_err(label);
+            assert!(error.contains(expected), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn same_day_only_inventory_has_no_sellable_cost_or_date() {
+        let fills = vec![fill(1, "buy", 12.0, 100, "2026-08-05 10:00:00")];
+
+        let positions = rebuild_paper_positions(&fills, date(2026, 8, 5)).unwrap();
+
+        assert_eq!(positions[0].total_quantity, 100);
+        assert_eq!(positions[0].sellable_quantity, 0);
+        assert_eq!(positions[0].locked_quantity, 100);
+        assert_eq!(positions[0].sellable_avg_price, None);
+        assert_eq!(positions[0].earliest_sellable_date, None);
+    }
+
+    #[test]
+    fn interleaved_symbols_are_sorted_by_code() {
+        let mut code_b = fill(1, "buy", 20.0, 100, "2026-08-03 10:00:00");
+        code_b.code = "TEST_CODE_600002".to_string();
+        code_b.name = "测试乙".to_string();
+        let mut code_a = fill(2, "buy", 10.0, 100, "2026-08-03 10:01:00");
+        code_a.code = "TEST_CODE_600001".to_string();
+        code_a.name = "测试甲".to_string();
+
+        let positions = rebuild_paper_positions(&[code_b, code_a], date(2026, 8, 4)).unwrap();
+
+        assert_eq!(positions.len(), 2);
+        assert_eq!(positions[0].code, "TEST_CODE_600001");
+        assert_eq!(positions[0].name, "测试甲");
+        assert_eq!(positions[1].code, "TEST_CODE_600002");
+        assert_eq!(positions[1].name, "测试乙");
     }
 }
