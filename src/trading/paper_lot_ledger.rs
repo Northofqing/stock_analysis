@@ -62,6 +62,14 @@ pub(crate) fn rebuild_paper_positions(
             ));
         }
         previous_order = Some(current_order);
+        if fill.occurred_at.date() > as_of_date {
+            return Err(format!(
+                "paper fill id={} has future fill date {} after {}",
+                fill.id,
+                fill.occurred_at.date(),
+                as_of_date
+            ));
+        }
         let price = fill
             .fill_price
             .filter(|value| value.is_finite() && *value > 0.0)
@@ -97,6 +105,15 @@ pub(crate) fn rebuild_paper_positions(
                             fill.id, fill.code, remaining
                         )
                     })?;
+                    if lot.bought_at.date() >= fill.occurred_at.date() {
+                        return Err(format!(
+                            "paper sell id={} violates A-share T+1 for {}: buy_date={} sell_date={}",
+                            fill.id,
+                            fill.code,
+                            lot.bought_at.date(),
+                            fill.occurred_at.date()
+                        ));
+                    }
                     let consumed = remaining.min(lot.remaining_quantity);
                     lot.remaining_quantity -= consumed;
                     remaining -= consumed;
@@ -243,6 +260,55 @@ mod tests {
     }
 
     #[test]
+    fn rejects_sell_that_would_consume_a_same_day_buy_lot() {
+        let fills = vec![
+            fill(1, "buy", 10.0, 100, "2026-08-03 10:00:00"),
+            fill(2, "sell", 11.0, 100, "2026-08-03 14:00:00"),
+        ];
+
+        let error = rebuild_paper_positions(&fills, date(2026, 8, 4))
+            .expect_err("A-share T+1 must reject a historical same-day sell");
+
+        assert!(error.contains("T+1"), "{error}");
+        assert!(error.contains("id=2"), "{error}");
+    }
+
+    #[test]
+    fn rejects_future_sell_and_future_buy_even_if_the_position_would_be_cleared() {
+        let future_sell = vec![
+            fill(1, "buy", 10.0, 100, "2026-08-03 10:00:00"),
+            fill(2, "sell", 11.0, 100, "2026-08-07 10:00:00"),
+        ];
+        let future_round_trip = vec![
+            fill(1, "buy", 10.0, 100, "2026-08-07 10:00:00"),
+            fill(2, "sell", 11.0, 100, "2026-08-08 10:00:00"),
+        ];
+
+        for (label, fills) in [
+            ("future sell", future_sell),
+            ("future round trip", future_round_trip),
+        ] {
+            let error = rebuild_paper_positions(&fills, date(2026, 8, 6)).expect_err(label);
+            assert!(error.contains("future fill"), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn rejects_sell_quantity_that_exceeds_overnight_inventory() {
+        let fills = vec![
+            fill(1, "buy", 10.0, 100, "2026-08-03 10:00:00"),
+            fill(2, "buy", 12.0, 100, "2026-08-05 10:00:00"),
+            fill(3, "sell", 11.0, 200, "2026-08-05 14:00:00"),
+        ];
+
+        let error = rebuild_paper_positions(&fills, date(2026, 8, 6))
+            .expect_err("sell cannot consume the same-day remainder");
+
+        assert!(error.contains("T+1"), "{error}");
+        assert!(error.contains("id=3"), "{error}");
+    }
+
+    #[test]
     fn rejects_invalid_identity_and_order_before_returning_positions() {
         let mut non_positive_id = fill(0, "buy", 10.0, 100, "2026-08-03 10:00:00");
         let mut blank_code = fill(1, "buy", 10.0, 100, "2026-08-03 10:00:00");
@@ -346,20 +412,42 @@ mod tests {
     }
 
     #[test]
-    fn interleaved_symbols_are_sorted_by_code() {
+    fn interleaved_symbols_keep_fifo_state_isolated_and_sorted_by_code() {
         let mut code_b = fill(1, "buy", 20.0, 100, "2026-08-03 10:00:00");
         code_b.code = "TEST_CODE_600002".to_string();
         code_b.name = "测试乙".to_string();
-        let mut code_a = fill(2, "buy", 10.0, 100, "2026-08-03 10:01:00");
-        code_a.code = "TEST_CODE_600001".to_string();
-        code_a.name = "测试甲".to_string();
+        let mut code_a_old = fill(2, "buy", 10.0, 200, "2026-08-03 10:01:00");
+        code_a_old.code = "TEST_CODE_600001".to_string();
+        code_a_old.name = "测试甲".to_string();
+        let mut code_b_new = fill(3, "buy", 30.0, 100, "2026-08-04 10:00:00");
+        code_b_new.code = "TEST_CODE_600002".to_string();
+        code_b_new.name = "测试乙".to_string();
+        let mut code_a_new = fill(4, "buy", 12.0, 100, "2026-08-04 10:01:00");
+        code_a_new.code = "TEST_CODE_600001".to_string();
+        code_a_new.name = "测试甲".to_string();
+        let mut sell_b = fill(5, "sell", 25.0, 100, "2026-08-05 10:00:00");
+        sell_b.code = "TEST_CODE_600002".to_string();
+        sell_b.name = "测试乙".to_string();
+        let mut sell_a = fill(6, "sell", 11.0, 100, "2026-08-05 10:01:00");
+        sell_a.code = "TEST_CODE_600001".to_string();
+        sell_a.name = "测试甲".to_string();
 
-        let positions = rebuild_paper_positions(&[code_b, code_a], date(2026, 8, 4)).unwrap();
+        let positions = rebuild_paper_positions(
+            &[code_b, code_a_old, code_b_new, code_a_new, sell_b, sell_a],
+            date(2026, 8, 6),
+        )
+        .unwrap();
 
         assert_eq!(positions.len(), 2);
         assert_eq!(positions[0].code, "TEST_CODE_600001");
         assert_eq!(positions[0].name, "测试甲");
+        assert_eq!(positions[0].total_quantity, 200);
+        assert_eq!(positions[0].sellable_avg_price, Some(11.0));
+        assert_eq!(positions[0].earliest_sellable_date, Some(date(2026, 8, 3)));
         assert_eq!(positions[1].code, "TEST_CODE_600002");
         assert_eq!(positions[1].name, "测试乙");
+        assert_eq!(positions[1].total_quantity, 100);
+        assert_eq!(positions[1].sellable_avg_price, Some(30.0));
+        assert_eq!(positions[1].earliest_sellable_date, Some(date(2026, 8, 4)));
     }
 }

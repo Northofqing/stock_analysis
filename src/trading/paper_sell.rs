@@ -145,7 +145,7 @@ fn aggregate_open_positions_at(
         .map_err(|error| format!("DB 连接失败: {error}"))?;
     let rows = diesel::sql_query(
         "SELECT id, code, name, direction, fill_price, quantity, \
-                strftime('%Y-%m-%d %H:%M:%f', ts) AS occurred_at \
+                CAST(ts AS TEXT) AS occurred_at \
          FROM paper_trades \
          WHERE status = 'Filled' \
          ORDER BY ts ASC, id ASC",
@@ -156,11 +156,7 @@ fn aggregate_open_positions_at(
     let fills = rows
         .into_iter()
         .map(|row| {
-            let occurred_at =
-                chrono::NaiveDateTime::parse_from_str(&row.occurred_at, "%Y-%m-%d %H:%M:%S%.f")
-                    .map_err(|error| {
-                        format!("paper fill id={} timestamp invalid: {error}", row.id)
-                    })?;
+            let occurred_at = parse_paper_fill_timestamp(row.id, &row.occurred_at)?;
             Ok(PaperFill {
                 id: row.id,
                 code: row.code,
@@ -201,6 +197,26 @@ fn aggregate_open_positions_at(
         });
     }
     Ok(positions)
+}
+
+fn parse_paper_fill_timestamp(fill_id: i64, raw: &str) -> Result<chrono::NaiveDateTime, String> {
+    let parsed = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")
+        .map_err(|error| format!("paper fill id={fill_id} timestamp invalid: {error}"))?;
+    let whole_seconds = parsed.format("%Y-%m-%d %H:%M:%S").to_string();
+    let canonical = raw == whole_seconds
+        || raw
+            .strip_prefix(&format!("{whole_seconds}."))
+            .is_some_and(|fraction| {
+                !fraction.is_empty()
+                    && fraction.len() <= 9
+                    && fraction.bytes().all(|byte| byte.is_ascii_digit())
+            });
+    if !canonical {
+        return Err(format!(
+            "paper fill id={fill_id} timestamp invalid: expected YYYY-MM-DD HH:MM:SS[.fraction], got {raw:?}"
+        ));
+    }
+    Ok(parsed)
 }
 
 #[derive(QueryableByName)]
@@ -547,11 +563,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn aggregate_computes_fifo_remaining_cost_and_first_sellable_date() {
-        let code = "TEST_CODE_600001";
-        let _guard = PaperSellGuard::new(vec![code.to_string()]);
-        insert_buy(code, "测试甲", 10.0, 200, "2026-08-03 10:00:00");
-        insert_buy(code, "测试甲", 12.0, 100, "2026-08-05 10:00:00");
-        insert_sell(code, 11.0, 100, "2026-08-06 10:00:00");
+        let code = unique_code("FIFO_REMAINING");
+        let _guard = PaperSellGuard::new(vec![code.clone()]);
+        insert_buy(&code, "测试甲", 10.0, 200, "2026-08-03 10:00:00");
+        insert_buy(&code, "测试甲", 12.0, 100, "2026-08-05 10:00:00");
+        insert_sell(&code, 11.0, 100, "2026-08-06 10:00:00");
 
         let positions = aggregate_open_positions_at(date(2026, 8, 7)).unwrap();
         let pos = positions
@@ -570,28 +586,24 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn aggregate_drops_fully_sold_positions() {
-        let code = "TEST_CODE_600002";
-        let _guard = PaperSellGuard::new(vec![code.to_string()]);
-        insert_buy(code, "测试乙", 10.0, 100, "2026-08-03 10:00:00");
-        insert_sell(code, 11.0, 100, "2026-08-06 10:00:00");
+        let code = unique_code("FULLY_SOLD");
+        let _guard = PaperSellGuard::new(vec![code.clone()]);
+        insert_buy(&code, "测试乙", 10.0, 100, "2026-08-03 10:00:00");
+        insert_sell(&code, 11.0, 100, "2026-08-06 10:00:00");
         let positions = aggregate_open_positions_at(date(2026, 8, 7)).unwrap();
-        assert!(
-            !positions.iter().any(|p| p.code == code),
-            "净持仓为 0 的票不应出现在聚合结果"
-        );
+        assert!(!positions.iter().any(|p| p.code == code));
     }
 
     #[test]
     #[serial_test::serial]
     fn already_sold_today_returns_true_after_sell() {
-        let _guard = PaperSellGuard::new(vec![
-            "TEST_CODE_600003".to_string(),
-            "TEST_CODE_600004".to_string(),
-        ]);
-        insert_sell("TEST_CODE_600003", 11.0, 100, "2026-08-06 10:00:00");
-        assert!(already_sold_today("TEST_CODE_600003", "2026-08-06").unwrap());
-        assert!(!already_sold_today("TEST_CODE_600003", "2026-08-07").unwrap());
-        assert!(!already_sold_today("TEST_CODE_600004", "2026-08-06").unwrap());
+        let sold_code = unique_code("SOLD_TODAY");
+        let untouched_code = unique_code("NOT_SOLD_TODAY");
+        let _guard = PaperSellGuard::new(vec![sold_code.clone(), untouched_code.clone()]);
+        insert_sell(&sold_code, 11.0, 100, "2026-08-06 10:00:00");
+        assert!(already_sold_today(&sold_code, "2026-08-06").unwrap());
+        assert!(!already_sold_today(&sold_code, "2026-08-07").unwrap());
+        assert!(!already_sold_today(&untouched_code, "2026-08-06").unwrap());
     }
 
     #[test]
@@ -665,6 +677,32 @@ mod tests {
             aggregate_open_positions_at(date(2026, 8, 5)).expect_err("Filled 缺成交价必须整批失败");
 
         assert!(error.contains("fill_price"), "{error}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn aggregate_rejects_sqlite_time_modifiers_and_partial_times() {
+        for (label, raw_timestamp) in [("SQLITE_NOW", "now"), ("TIME_ONLY", "12:34")] {
+            let code = unique_code(label);
+            let _guard = PaperSellGuard::new(vec![code.clone()]);
+            insert_fill(
+                &code,
+                "非法成交时间",
+                "buy",
+                10.0,
+                Some(10.0),
+                100,
+                raw_timestamp,
+            );
+
+            let error = aggregate_open_positions_at(date(2099, 1, 1))
+                .expect_err("raw paper fill timestamp must be complete and immutable");
+
+            assert!(
+                error.contains("timestamp invalid"),
+                "{raw_timestamp}: {error}"
+            );
+        }
     }
 
     #[test]
