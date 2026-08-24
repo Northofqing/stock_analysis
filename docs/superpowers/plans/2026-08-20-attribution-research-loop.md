@@ -1556,6 +1556,8 @@ cargo run --bin economic_position_probe -- \
 - [x] 复核 `trades`：35 行费用全为 0，与纸面成交精确匹配和身份匹配均为 0。
 - [x] 复核 `stock_daily`：5,006 行、57 个个股代码，没有沪深 300 历史序列。
 - [x] 复核 `paper_performance_snapshot`：当前为零值空汇总，不作为成功证据。
+- [x] 2026-08-24 READ_ONLY 复核：日线增至 5,070 行、最新 2026-08-21，但成交、费用、
+  基准、空仓确认和绩效事实均未解除阻塞；数据库读取前后哈希与 mtime 一致。
 - [x] 决定暂不实现默认费用、事后收盘基准或无来源市场状态适配器。
 - [ ] 外部事实：建立不可变空仓确认后的干净验证纪元。
 - [ ] 外部事实：提供逐成交 Observed 费用或明确批准的版本化 Scenario 费用。
@@ -1665,9 +1667,10 @@ Gate A 提交：`9238a8c`。实现提交：`19a7b4f`；本任务不修改任何�
   相对 `master` 零差异。
 - [ ] Gate B Clippy：全目标仍仅复现本分支未修改的 `hbars_probe.rs` 一条
   `let_unit_value` 与 `t0_replay.rs` 两条 `doc_lazy_continuation`；lib Clippy PASS。
-- [ ] Gate C：fake implementation、设计矛盾及其余专项检查 PASS；隔离 worktree 没有
-  生产数据库，freshness FAIL；业务规则检查仍为既有 60 errors / 157 warnings。未执行
-  `backfill_daily.sh`，也未修改任何生产数据。
+- [ ] Gate C：显式以 `STOCK_DB` 只读绑定主仓库真实库后，fake implementation、
+  freshness、设计矛盾及其余专项检查 PASS；freshness 为 latest=2026-08-21、滞后 1 个
+  交易日。完整合规仍仅由既有业务规则检查 60 errors / 157 warnings 阻塞。未执行
+  `backfill_daily.sh`，数据库读取前后 SHA-256、mtime 与大小一致。
 - [ ] Gate D：先执行 `cargo llvm-cov clean --workspace`，再用官方 workspace / all-features
   范围加 `--ignore-run-fail` 生成诊断 JSON。阈值检查得到全局 181971/236839 = 76.83%
   （要求 80%），核心 145117/189071 = 76.75%（要求 95%，215 个文件），exit 1；
@@ -1684,3 +1687,25 @@ Gate A 提交：`9238a8c`。实现提交：`19a7b4f`；本任务不修改任何�
 
 本任务不形成“Done”或发布结论。待全仓 Gate B/C/D 基线恢复且获得不可变真实证据后，
 按任务 14 另立 Gate A；禁止用默认费用、选择性删除旧成交、降低覆盖阈值或伪造基准跨门。
+
+## 任务 20：2026-08-24 当前真实证据只读复核
+
+**规格：** 对应设计 §13.1 与 BR-248。只读确认外部事实是否变化，并纠正 Gate C 的
+freshness 归因；不复制、链接、回填或修改生产数据库，不新增费用/基准假设。
+
+- [x] 数据库 `quick_check=ok`；读取前后大小、mtime 与 SHA-256 完全一致。
+- [x] 898 条 Filled 仍止于 2026-08-14；898 个 `plan_id` 非空且唯一，没有新成交。
+- [x] `trades` 仍为 35 行；commission、stamp tax、slippage 的非零行均为 0，
+  35/35 缺 `signal_id`，不能绑定为纸面成交 Observed 费用。
+- [x] 日线为 5,070 行、57 个代码、最新 2026-08-21；沪深 300 历史仍为 0 行。
+- [x] 18 份持仓快照中空仓确认仍为 0；最新快照非空且含 7 项，不能自选日期切新纪元。
+- [x] `economic_position_probe --as-of 2026-08-24` 仍由 sell `id=520` 的
+  2026-08-11 同日买卖 T+1 违规失败关闭。
+- [x] `STOCK_DB=<真实库> bash tools/compliance/lib/check_data_freshness.sh` PASS：最新日线
+  滞后 1 个交易日；无需且未运行生产回填。
+- [ ] 完整 Gate C：同一只读绑定下其余专项检查 PASS，仍由业务规则 60 errors /
+  157 warnings 阻塞。
+- [ ] 策略量化结论：逐成交费用、基准/市场状态和干净验证纪元仍缺失，保持 ResearchOnly。
+
+本任务只更新证据，不产生新的实现提交。回滚文档使用 `git revert <sha>`；数据库无回滚
+动作，因为没有发生写入。
