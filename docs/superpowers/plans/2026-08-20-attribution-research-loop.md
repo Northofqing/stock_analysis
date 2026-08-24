@@ -1752,10 +1752,458 @@ freshness 归因；不复制、链接、回填或修改生产数据库，不新�
 - [x] 真实库只读时间证据：898 Filled 中 573 笔具有候选严格订单审计时间与哈希链；候选不
   等于可用，旧 `id=520` T+1 违规仍阻断严格历史指标。
 - [x] Gate A 文档：设计 §15、BR-251、数据流、失败、旧模块、回滚和 AC 已写入。
-- [ ] 用户复核书面设计 §15。
-- [ ] 使用 `writing-plans` 把实现拆成可独立回滚的小提交；复核前不写实现代码。
+- [x] 用户复核书面设计 §15。
+- [x] 使用 `writing-plans` 把实现拆成可独立回滚的小提交；实现计划见下文任务 23–33。
 - [ ] Gate B/C/D、真实只读 TDX/gRPC 验收、生产采集授权、生产回填授权和 scheduler/monitor
   集成证据均待后续；当前状态 `In Progress / ResearchOnly`。
 
 本任务的设计回滚使用 `git revert <Gate-A-doc-sha>`。没有生产数据写入，因此不存在数据
 回滚；未来已追加审计或季度事实不得作为代码回滚的一部分删除。
+
+# 买卖策略历史归因复盘实施计划
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use `executing-plans` to implement this plan task-by-task with review checkpoints.
+
+**目标：** 在不改买卖阈值、不改订单/推送链、不改历史成交的前提下，交付沪深 300
+日线/1 分钟线的可审计季度证据链，以及可重放、可归因、默认只读且结论固定为
+`ResearchOnly` 的买卖策略历史复盘。
+
+**架构：** `ReviewDataGateway::benchmark_bars` 负责真实 provider 准入和 BR-159 receipt；
+`BenchmarkCapture` 是季度 segment/manifest 的唯一 writer；`BenchmarkReader` 是回测与归因的
+唯一 reader；`AttributionReplayRunner` 只编排已验证成交、费用、个股收盘、基准、日历和市场
+状态，纯计算继续复用 `economic_position::rebuild_economic_positions`。新 segment、manifest、
+run、report、failure 全部 append-only/hash-chain；旧 `paper_trades` 和
+`paper_attribution_daily` 只读保留。
+
+**技术栈：** Rust 2021、Tokio、Diesel/SQLite、rusqlite read-only、Serde JSON、SHA-256、
+zstd 0.13、Tonic/Prost、Magic TDX 锁定 revision `75ee2a2…`、Clap 4。
+
+**规格：** `docs/superpowers/specs/2026-08-20-attribution-research-loop-design.md` §15；
+`docs/business_rules.md` BR-251。
+
+**全局约束：** 每个任务先跑失败测试再写最小实现；每个任务独立提交。禁止修改
+`src/bin/monitor/main.rs`、Unsafe 推送、订单路径、买卖阈值、`paper_sell_paused`、
+TechnicalBars 状态、旧成交和旧归因表。测试 identity 必须以 `TEST_CODE` 开头；生产路径无
+mock/default/fake fallback。任何真实 TDX 探针、生产 capture、历史 report 写入或定时集成，
+都只能在对应授权检查点后执行。
+
+## 任务 23：冻结基准领域类型与整批准入规则
+
+**文件：**
+
+- 新建：`src/data_gateway/benchmark.rs`
+- 修改：`src/data_gateway/mod.rs`
+- 测试：`src/data_gateway/benchmark.rs` 内 `#[cfg(test)]`
+
+**窄接口：**
+
+```rust
+pub const HS300_CANONICAL: &str = "sh000300";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BenchmarkGranularity { Daily, Minute1 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BenchmarkRange {
+    Daily { from: NaiveDate, to: NaiveDate },
+    Minute1 { from: DateTime<FixedOffset>, to: DateTime<FixedOffset> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BenchmarkRequest {
+    pub instrument: String,
+    pub range: BenchmarkRange,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum BenchmarkBarTime {
+    Daily(NaiveDate),
+    MinuteEnd(DateTime<FixedOffset>),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BenchmarkBar {
+    pub at: BenchmarkBarTime,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: Option<f64>,
+    pub amount: Option<f64>,
+}
+```
+
+- [ ] 先写测试：仅 `sh000300` 通过 registry；`sh000905`、equity code、`TEST_CODE` 生产请求
+  返回 `UnsupportedInstrument`/`TestIdentityRejected`，不能按前缀推断资产。
+- [ ] 先写测试：Daily/Minute1 的反向范围、非 +08:00 分钟范围、非正/非有限 OHLC、
+  `low/open/close/high` 矛盾、重复/乱序全部整批失败。
+- [ ] 先写测试：Daily 精确覆盖权威交易日；Minute1 只接受连续竞价网格，午休不算缺口，
+  会话内缺一分钟、跨日和多余记录失败；±20% 以上真实涨跌不得被固定幅度规则拒绝。
+- [ ] 实现 `BenchmarkError` 的 `Unsupported`、`Unavailable { code, retryable }` 与
+  `FailedIntegrity { code }` 分类，不把 empty 解释为 verified empty。
+- [ ] 在 `data_gateway/mod.rs` 只导出请求、bar、错误和后续 Reader/Capture 所需类型；原始
+  TDX 类型与 adapter 保持私有。
+- [ ] 运行：`cargo test data_gateway::benchmark --all-features -- --test-threads=1`。预期先因
+  模块/类型缺失失败，最小实现后全绿。
+- [ ] 提交：`git commit -m "feat: 冻结历史基准准入合同"`。
+
+## 任务 24：实现私有 Magic TDX 指数 adapter 与 BR-159 receipt seam
+
+**文件：**
+
+- 修改：`src/data_gateway/benchmark.rs`
+- 修改：`src/data_gateway/review.rs`
+- 测试：上述两文件内单测
+
+```rust
+#[derive(Debug, Clone)]
+pub struct AuditedBenchmarkBatch {
+    pub batch: GatewayBatch<BenchmarkBar>,
+    pub receipt: DataAcquisitionAuditReceipt,
+}
+
+impl ReviewDataGateway {
+    pub(crate) async fn benchmark_bars(
+        &self,
+        request: BenchmarkRequest,
+    ) -> Result<AuditedBenchmarkBatch, GatewayError>;
+
+    pub(crate) async fn benchmark_bars_library(
+        &self,
+        request: BenchmarkRequest,
+    ) -> Result<AuditedBenchmarkBatch, GatewayError>;
+}
+```
+
+- [ ] 先把 `audit_gateway_result_with_receipt` 写成失败测试：成功批次只有在 BR-159 row/hash
+  写入成功后才能返回；审计失败丢弃批次并返回 `acquisition_audit_unavailable`。原有 helper
+  通过该函数投影，避免两套审计逻辑。
+- [ ] 以私有 `IndexBarsSource` trait 注入 TEST_CODE page，测试 offset 0/800/1600、页错误、
+  提前空页、重复页、单页少记录且范围未覆盖均整批失败。
+- [ ] `#[cfg(feature="magic-gateway")]` concrete adapter 固定 `market=1`、`code=000300`、
+  `KLINE_DAILY=4`/`KLINE_1MIN=8`、`fq_type::NONE`，使用 `spawn_blocking`；每页最老时间必须
+  严格向历史推进，直到覆盖请求起点，不设置会截断真实范围的任意页数上限。
+- [ ] 把 TDX 不含 instrument 的 `IndexBar` 与 canonical 请求、category、锁定 revision 一起
+  写入 request hash/batch identity；volume/amount 若源缺失保留 `None`，不得补零。
+- [ ] 加 `BenchmarkProviderAttestation`：真实 identity 未验收时 concrete adapter 返回
+  `benchmark_identity_unverified`；Minute1 结束标签未验收时返回
+  `benchmark_time_semantics_unavailable`。测试 adapter 不改变生产 attestation。
+- [ ] 运行：`cargo test data_gateway::benchmark data_gateway::review --all-features -- --test-threads=1`
+  与 `cargo check --no-default-features`。
+- [ ] 提交：`git commit -m "feat: 接入可审计的TDX指数适配器"`。
+
+## 任务 25：增加 no-default-features 的 BenchmarkBars gRPC 合同
+
+**文件：**
+
+- 修改：`build.rs`
+- 修改：`src/grpc_contract/ops.rs`
+- 修改：`src/grpc_contract/schema.rs`
+- 修改：`src/grpc_server/delegate.rs`
+- 修改：`src/grpc_server/handlers.rs`
+- 修改：`src/grpc_server/fixture.rs`
+- 修改：`src/data_gateway/grpc_source.rs`
+- 修改：`src/data_gateway/grpc_source/convert.rs`
+- 修改：`src/data_gateway/benchmark.rs`
+
+- [ ] 先写合同失败测试：枚举上界 62、implemented 数量 40、schema 全覆盖、handler 方法存在、
+  `HOOKED_OPS` 与 `bridge_for("BenchmarkBars")` 调用点一致。
+- [ ] 只在 `build.rs` 本地扩展块增加 `OPERATION_BENCHMARK_BARS = 62` 与
+  `rpc BenchmarkBars(...)`；不修改/强制跟踪被 `.gitignore` 排除的 `client-bundle`。
+- [ ] 注册 `method_name=BenchmarkBars`、`schema=market.benchmark_bars v1`，fixture 明确返回
+  `None`，防止生产合同以 canned 数据伪装成功。
+- [ ] server delegate 解析完整 `BenchmarkRequest`，调用 `benchmark_bars_library` 防递归；
+  wire 保存 instrument、granularity、每条年月日时分、OHLC、nullable volume/amount 与完整
+  batch evidence，不走 TechnicalBars。
+- [ ] client converter 重建强类型批次并再次运行整批准入；任何缺字段、unknown provider、
+  identity/range 不一致返回 typed error，不自行解释/补值。
+- [ ] `ReviewDataGateway::benchmark_bars` 在桥已配置时只走 gRPC，桥失败 terminal；未配置时
+  才走 library。两条路径最终都只追加一次客户端 BR-159 receipt。
+- [ ] 运行：`cargo test grpc_contract grpc_server data_gateway::grpc_source --all-features -- --test-threads=1`、
+  `cargo build --no-default-features --bin monitor`、`cargo build --bin grpc_market_server`。
+- [ ] 提交：`git commit -m "feat: 增加历史基准gRPC合同"`。
+
+## 任务 26：实现自然季度不可变 segment 与 manifest store
+
+**文件：**
+
+- 修改：`Cargo.toml`
+- 修改：`Cargo.lock`
+- 新建：`src/database/benchmark_segments.rs`
+- 修改：`src/database/mod.rs`
+
+**持久化接口：**
+
+```rust
+pub enum SegmentState { Provisional, Sealed }
+
+pub struct BenchmarkSegmentAppend {
+    pub request: BenchmarkRequest,
+    pub quarter_start: NaiveDate,
+    pub state: SegmentState,
+    pub bars: Vec<BenchmarkBar>,
+    pub evidence: BatchEvidence,
+    pub acquisition_receipt: DataAcquisitionAuditReceipt,
+}
+
+pub struct BenchmarkManifestRef {
+    pub manifest_hash: String,
+    pub instrument: String,
+    pub granularity: BenchmarkGranularity,
+    pub from_key: String,
+    pub to_key: String,
+    pub segment_hashes: Vec<String>,
+}
+```
+
+- [ ] 先写 migration 测试：`benchmark_segment_revision`、`benchmark_segment_chain`、
+  `benchmark_manifest`、`benchmark_manifest_chain` 均存在 UPDATE/DELETE 拒绝 trigger；启动时
+  缺链、断链、篡改立即失败。
+- [ ] 在 `Cargo.toml` 显式增加 `zstd = "0.13"`；canonical payload V1 用固定字段顺序，浮点
+  保存 `to_bits()` 的 u64，先算域分离 SHA-256，再 zstd 压缩并另算 compressed hash。
+- [ ] 每行保存 instrument/granularity/quarter、state、首末 key、count、两种 hash、codec/
+  version、BLOB、provider/source/source_at/observed_at/batch_id、BR-159 audit ID/hash、
+  predecessor、retention deadline（created_at + 至少五年）与链 hash。
+- [ ] 先验证 acquisition receipt 的行存在且 record hash 一致；segment、chain、manifest、
+  manifest chain 在一个 IMMEDIATE transaction 内提交，任一 insert 失败全部回滚。
+- [ ] 实现四个自然季度边界；Daily/Minute1 不能共段。相同 state+payload 返回原 receipt；
+  payload/state 改变只能追加 successor。Sealed 后修订仍追加，不覆盖旧 Sealed。
+- [ ] Reader 解压后同时校验 compressed hash、canonical hash、记录数/边界和链；不提供 latest
+  查询 API，只允许精确 manifest hash。
+- [ ] 运行：`cargo test database::benchmark_segments --all-features -- --test-threads=1`。
+- [ ] 提交：`git commit -m "feat: 保存不可变季度基准段"`。
+
+## 任务 27：实现唯一 BenchmarkCapture 与 BenchmarkReader
+
+**文件：**
+
+- 修改：`src/data_gateway/benchmark.rs`
+- 修改：`src/database/benchmark_segments.rs`
+- 测试：两个模块内单测
+
+```rust
+pub struct BenchmarkSnapshotRef {
+    pub manifest: BenchmarkManifestRef,
+    pub bars: Vec<BenchmarkBar>,
+}
+
+impl BenchmarkCapture {
+    pub async fn preview(&self, request: BenchmarkRequest) -> Result<CapturePreview, BenchmarkError>;
+    pub fn commit(&self, preview: CapturePreview) -> Result<BenchmarkManifestRef, BenchmarkError>;
+}
+
+impl BenchmarkReader {
+    pub fn read_exact(
+        &self,
+        manifest_hash: &str,
+        expected: &BenchmarkRequest,
+    ) -> Result<BenchmarkSnapshotRef, BenchmarkError>;
+    pub fn to_daily_series(
+        &self,
+        snapshot: &BenchmarkSnapshotRef,
+        name: &str,
+    ) -> Result<BenchmarkSeries, BenchmarkError>;
+}
+```
+
+- [ ] 先写测试：preview 不写任何表；commit 才调用 store；跨季度按
+  `(quarter_start, granularity, segment_hash)` 排序生成 manifest。
+- [ ] 先写测试：缺段、重叠、冲突、错误 instrument/granularity、范围未覆盖、manifest 顺序
+  被改、segment 解压/hash/链异常全部 fail-closed。
+- [ ] 当前季度只生成 Provisional；只有权威日历证明季度内全部交易日/分钟覆盖时才能追加
+  Sealed。不能用“已过季度末”单独推断完整。
+- [ ] `read_exact` 只接收调用方给出的 manifest hash 和 expected request；删除任何按 created_at
+  找最新的实现诱因。
+- [ ] `to_daily_series` 在完整 snapshot 验证后才投影现有 `BenchmarkSeries`；任何 requested
+  trading day 缺 close 整体失败，不跳日。
+- [ ] 运行：`cargo test data_gateway::benchmark database::benchmark_segments --all-features -- --test-threads=1`。
+- [ ] 提交：`git commit -m "feat: 完成基准采集与读取深模块"`。
+
+## 任务 28：实现 append-only 归因 run/report/failure store
+
+**文件：**
+
+- 新建：`src/database/attribution_reports.rs`
+- 修改：`src/database/mod.rs`
+
+- [ ] 先写 migration/immutability 测试：`attribution_run_audit`、`attribution_run_chain`、
+  `attribution_report_revision`、`attribution_report_chain`、`attribution_failure_audit`、
+  `attribution_failure_chain` 全部 append-only，启动全链校验。
+- [ ] report canonical identity 固定绑定：模式、目标范围、规则版本、成交 hash、费用 hash/
+  Unavailable、个股收盘 hash、benchmark manifest、日历 authority hash、regime hash/
+  Unavailable 与结果 payload hash。
+- [ ] 相同 report identity 返回既有 report receipt；来源合法修订追加 predecessor revision。
+  无论 report 是否幂等命中，每次正式 invocation 都追加独立 run audit。
+- [ ] `FailedIntegrity` 事务只追加 run+failure，不允许插入任何指标/report；failure 保存 stage、
+  code、retryable、来源摘要 hash 和脱敏消息。
+- [ ] 模拟 chain insert 失败，断言 run/report/failure 同事务回滚；模拟 UPDATE/DELETE 均失败。
+- [ ] 运行：`cargo test database::attribution_reports --all-features -- --test-threads=1`。
+- [ ] 提交：`git commit -m "feat: 保存不可变归因报告审计"`。
+
+## 任务 29：提取生产只读历史证据装载器
+
+**文件：**
+
+- 修改：`src/database/order_audit.rs`
+- 新建：`src/performance/attribution_replay.rs`
+- 修改：`src/performance/mod.rs`
+- 修改：`src/bin/economic_position_probe.rs`
+
+- [ ] 先把 BR-086 canonical row/hash 校验提取成共享纯函数；Diesel 启动校验和 rusqlite
+  read-only loader 必须消费同一函数，避免复制哈希算法。
+- [ ] 用 `SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_NO_MUTEX` + `PRAGMA query_only=ON` 打开显式
+  `--db`，复用 `economic_position_probe` 范式；读取操作前后校验 main DB 文件身份不变，不能
+  调 `DatabaseManager::init` 或 migration。
+- [ ] 查询全部 Filled 和完整 order audit/chain 后先全链校验，再按 `plan_id/business_order_id`
+  选择唯一 outcome=Filled 且 code/side/price/quantity 一致的终态；0 条或多条都返回
+  `TradeTimeUnavailable/FailedIntegrity`，Rejected 重试不能冒充终态。
+- [ ] RFC3339 `quote_observed_at` 转固定 +08:00；`paper_trades.ts` 只参与 FIFO 排序和一一
+  对账，不作为分钟时间。完整来源先验证再按 range 截止，不能用日期过滤隐藏 id=520。
+- [ ] 同一只读连接加载范围开始前全部 FIFO 前史、范围内个股 `stock_daily` 精确收盘并计算
+  canonical hash；缺字段保持 typed Unavailable，非法价格/重复/时间断档为 FailedIntegrity。
+- [ ] 费用 loader 首版只接受显式、逐 fill、有 source/evidence ID/hash 的 ledger；没有真实
+  ledger 时返回 `FeeEvidenceUnavailable`，不创建默认零费用。
+- [ ] 运行：`cargo test database::order_audit performance::attribution_replay --all-features -- --test-threads=1`，
+  再对 TEST_CODE 临时库运行 `economic_position_probe` 回归。
+- [ ] 提交：`git commit -m "feat: 装载只读历史归因证据"`。
+
+## 任务 30：实现零未来函数的分钟对齐与纯归因
+
+**文件：**
+
+- 修改：`src/performance/attribution_replay.rs`
+- 修改：`src/performance/economic_position.rs`（仅在缺少必要只读字段/纯函数时最小扩展）
+
+```rust
+pub enum MetricAvailability<T> {
+    Available(T),
+    Unavailable { code: AttributionUnavailable, detail: String },
+}
+
+pub enum MinuteLabelSemantics {
+    Unverified,
+    EndLabelVerified { evidence_hash: String },
+}
+
+pub fn align_completed_minute(
+    fill_at: DateTime<FixedOffset>,
+    bars: &[BenchmarkBar],
+    semantics: &MinuteLabelSemantics,
+) -> Result<&BenchmarkBar, AttributionError>;
+```
+
+- [ ] 先写对齐测试：未验收标签、09:31、整分钟边界、午休、13:01、15:00、跨日、重复候选；
+  唯一合法条件是 `bar_end < fill_at` 且 `0 < delta <= 60s`，不允许 nearest/fill/close。
+- [ ] 复用 `rebuild_economic_positions` 的 FIFO/T+1/超卖/混合入场族规则；禁止复制另一套仓位
+  状态机。结构错误整次 FailedIntegrity，id=520 不得跳过。
+- [ ] 每个闭合周期计算 gross return、benchmark return、gross excess；只有费用完整时计算 net
+  return/net excess/net win rate。基准缺失只关闭相关维度，周期仍计入总分母与原因计数。
+- [ ] 开放周期保留为右删失；按入场族聚合时同时输出总周期、可用周期、不可用原因与覆盖率，
+  禁止只展示有效子样本。
+- [ ] 样本 <200 闭环或 <84 自然日输出 InsufficientSample；即使满足仍因费用/基准/regime/
+  聚类/Gate D/生产集成任一缺失固定 ResearchOnly，不新增成功阈值。
+- [ ] 证明同一天的 daily 计算与 range 计算 canonical bytes 完全一致。
+- [ ] 运行：`cargo test performance::economic_position performance::attribution_replay --all-features -- --test-threads=1`。
+- [ ] 提交：`git commit -m "feat: 计算历史经济仓位归因"`。
+
+## 任务 31：实现权威业务日期解析与 Replay Runner
+
+**文件：**
+
+- 修改：`src/performance/attribution_replay.rs`
+- 修改：`src/calendar.rs`（只增加 verified resolver，不改变旧 API 语义）
+- 修改：`src/database/attribution_reports.rs`
+
+```rust
+pub enum ReplayMode {
+    Scheduled { invoked_at: DateTime<FixedOffset> },
+    Range { from: NaiveDate, to: NaiveDate },
+    Quarter { year: i32, quarter: u8 },
+}
+
+pub struct ReplayRequest {
+    pub mode: ReplayMode,
+    pub benchmark_manifest_hash: String,
+}
+
+impl AttributionReplayRunner {
+    pub fn preview(&self, request: ReplayRequest) -> Result<AttributionReport, ReplayError>;
+    pub fn commit(&self, request: ReplayRequest) -> Result<AttributionReportReceipt, ReplayError>;
+}
+```
+
+- [ ] 先写日期测试：交易日 14:59:59 => CurrentSessionIncomplete；15:00 后候选为实际当日；
+  周六/周日 => 最近交易日（正常周五）；周五休市、法定休市、跨年、日历年份缺失均按 §15.7。
+- [ ] resolver 只调用 `verified_a_share_trading_day`/
+  `verified_prev_a_share_trading_day`，显式 +08:00；不得复用可变 holiday 的旧
+  `latest_completed_trading_day_at`。
+- [ ] scheduled 在交易日收盘后若成交、个股收盘、benchmark 或必需 manifest 未覆盖当日，
+  返回 retryable CurrentSessionIncomplete，不改跑昨天；周末/节假日缺证据返回对应 typed
+  Unavailable，不猜其他日期。
+- [ ] Range 按权威交易日逐日复盘但只加载一次完整前史和 exact benchmark manifest；Quarter
+  固定自然季度边界。两者调用同一纯引擎。
+- [ ] `preview` 使用只读 loader 且不写 store；它不是正式 invocation。`commit` 才在单个
+  append-only transaction 记录 invocation/report 或 invocation/failure。
+- [ ] 相同周五在周五/周六/周日正式运行：report receipt 相同，三条 run audit 不同；来源
+  修订则新 report revision 指向旧版。
+- [ ] 运行：`cargo test calendar performance::attribution_replay database::attribution_reports --all-features -- --test-threads=1`。
+- [ ] 提交：`git commit -m "feat: 编排买卖策略历史复盘"`。
+
+## 任务 32：交付默认只读的中文 strategy_attribution CLI
+
+**文件：**
+
+- 新建：`src/bin/strategy_attribution.rs`
+- 修改：`Cargo.toml`（仅在需要显式 bin 项时）
+- 测试：CLI 文件内 parser/unit tests
+
+- [ ] 用 Clap derive 实现 `resolve`、`probe`、`capture`、`scheduled`、`replay`、`quarter`；
+  `--db`、日期范围、manifest 均显式，不接受硬编码生产路径。
+- [ ] `resolve` 与 `probe` 只读：probe 可调用 raw diagnostic adapter 验证真实 identity/分页/
+  时间标签，但输出不得转交业务 Reader，也不得更新生产 attestation 或数据库。
+- [ ] `capture` 没有 `--commit` 时只输出 canonical 请求和预期季度，不连接 writer；带
+  `--commit` 才初始化可写 DB、经 Gateway/BR-159 采集并追加 segment。
+- [ ] `scheduled/replay/quarter` 默认 `preview`，以 SQLite READ_ONLY 打开；带 `--commit` 才
+  追加 run/report/failure。任何命令均无订单、推送、配置和旧表写入路径。
+- [ ] 中文 Markdown/JSON 报告列齐 §15.8 的总分母、可用性、manifest hashes、失败原因、
+  样本门和 ResearchOnly；退出码区分成功、Unavailable、FailedIntegrity、参数错误。
+- [ ] parser 测试覆盖缺 `--db`、缺 manifest、非法季度、commit 组合；TEST_CODE E2E 校验
+  preview 前后 DB hash/mtime 不变，commit 只新增允许的新表行。
+- [ ] 运行：`cargo test --bin strategy_attribution --all-features -- --test-threads=1`、
+  `cargo build --release --bin strategy_attribution`、`cargo build --release --bin strategy_attribution --no-default-features`。
+- [ ] 提交：`git commit -m "feat: 增加中文策略归因命令行"`。
+
+## 任务 33：收口旧回测消费者、合规证据与授权检查点
+
+**文件：**
+
+- 修改：`src/pipeline/backtest_runner.rs`
+- 修改：`docs/superpowers/specs/2026-08-20-attribution-research-loop-design.md`
+- 修改：`docs/superpowers/plans/2026-08-20-attribution-research-loop.md`
+- 修改：`docs/business_rules.md`
+- 修改：Draft PR #15 描述
+
+- [ ] 先写回测测试：只有显式 `BenchmarkManifestRef` 能调用 Reader 投影；缺 manifest 明确
+  `BenchmarkSegmentUnavailable`/报告“基准缺失”，不调用旧指数 equity path；完整 manifest
+  不跳交易日。
+- [ ] 删除 `fetch_benchmark_series_with_code` 的无 offset 假分页/逐页吞错；保留现有策略纯
+ 计算 `BenchmarkSeries` 接口，由 Reader 完整投影后传入，避免扩散存储细节。
+- [ ] 跑定向回归，确认 `paper_trades`、`paper_attribution_daily` 行为未改，
+  `src/bin/monitor/main.rs`、Unsafe 推送、TechnicalBars、`paper_sell_paused` diff 为零。
+- [ ] Gate B/C：`cargo fmt --all -- --check`；
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings`；
+  `cargo test --workspace --all-targets --all-features -- --test-threads=1`；
+  `bash tools/compliance/check.sh`。
+- [ ] Gate D：`cargo llvm-cov --workspace --all-features --json --output-path target/coverage/coverage.json -- --test-threads=1`；
+  `python3 tools/coverage/check_thresholds.py target/coverage/coverage.json`；
+  `cargo build --release --bin monitor`；`cargo build --release --bin strategy_attribution`。
+- [ ] 更新 PR 必填字段：`Refs: spec §15`、Data-Redlines 2.1/2.2/2.3/2.4/2.7/2.8/2.10、
+  OldModules、Business-Rules BR-251、Threshold-Proof N/A、验证证据和 `git revert` rollback。
+- [ ] 只有用户另行授权后才运行真实 TDX/gRPC probe；probe 通过后单独提交 attestation evidence。
+  分钟结束标签未证实时 Minute1 继续 Disabled。
+- [ ] 只有用户另行授权后才运行 `capture --commit` 或历史 `--commit`。不得删除失败审计和已
+  追加 segment/report；代码回滚只 `git revert <sha>` 并停止新 writer。
+- [ ] 因 `monitor/main.rs` 受保护且 scheduler 未集成，即使以上代码/测试全绿，PR 仍保持
+  Draft、状态 `In Progress / ResearchOnly`；不得称 Done 或 merge-ready。
+- [ ] 最终代码提交：`git commit -m "refactor: 统一回测基准读取入口"`；证据文档另提交
+  `git commit -m "docs: 记录策略归因验证证据"`。
