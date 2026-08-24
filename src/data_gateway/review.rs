@@ -165,6 +165,12 @@ impl<T> fmt::Display for GatewayBatch<T> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct AuditedBenchmarkBatch {
+    pub batch: GatewayBatch<crate::data_gateway::BenchmarkBar>,
+    pub receipt: crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DailyClose {
     pub date: NaiveDate,
@@ -308,6 +314,29 @@ pub struct ReviewDataGateway;
 impl ReviewDataGateway {
     pub const fn new() -> Self {
         Self
+    }
+
+    #[allow(dead_code)] // Task 25 wires the private gRPC/client consumer.
+    pub(crate) async fn benchmark_bars(
+        &self,
+        request: crate::data_gateway::BenchmarkRequest,
+    ) -> Result<AuditedBenchmarkBatch, GatewayError> {
+        self.benchmark_bars_library(request).await
+    }
+
+    #[allow(dead_code)] // Task 25 wires the private gRPC server delegate.
+    pub(crate) async fn benchmark_bars_library(
+        &self,
+        request: crate::data_gateway::BenchmarkRequest,
+    ) -> Result<AuditedBenchmarkBatch, GatewayError> {
+        let outcome = super::benchmark::acquire_production_benchmark_bars(request).await;
+        audit_gateway_result_with_receipt(
+            "BenchmarkBars",
+            ProviderId::Tdx,
+            &outcome.request_hash,
+            outcome.result,
+        )
+        .map(|(batch, receipt)| AuditedBenchmarkBatch { batch, receipt })
     }
 
     pub async fn a01_daily_bars(
@@ -893,12 +922,18 @@ pub(super) fn acquisition_request_hash(
     hex::encode(hasher.finalize())
 }
 
-pub(super) fn audit_gateway_result<T>(
+pub(super) fn audit_gateway_result_with_receipt<T>(
     capability: &'static str,
     provider: ProviderId,
     request_hash: &str,
     result: Result<GatewayBatch<T>, GatewayError>,
-) -> Result<GatewayBatch<T>, GatewayError> {
+) -> Result<
+    (
+        GatewayBatch<T>,
+        crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt,
+    ),
+    GatewayError,
+> {
     use crate::database::data_acquisition_audit::DataAcquisitionAuditRecord;
     use crate::database::DatabaseManager;
 
@@ -1014,7 +1049,20 @@ pub(super) fn audit_gateway_result<T>(
             receipt.current_outcome
         );
     }
-    result
+    match result {
+        Ok(batch) => Ok((batch, receipt)),
+        Err(error) => Err(error),
+    }
+}
+
+pub(super) fn audit_gateway_result<T>(
+    capability: &'static str,
+    provider: ProviderId,
+    request_hash: &str,
+    result: Result<GatewayBatch<T>, GatewayError>,
+) -> Result<GatewayBatch<T>, GatewayError> {
+    audit_gateway_result_with_receipt(capability, provider, request_hash, result)
+        .map(|(batch, _receipt)| batch)
 }
 
 pub(super) fn audit_routed_gateway_result<T>(
@@ -1164,6 +1212,22 @@ mod tests {
         batch_id: Option<String>,
     }
 
+    #[derive(Debug, QueryableByName)]
+    struct AcquisitionReceiptRow {
+        #[diesel(sql_type = Text)]
+        outcome: String,
+        #[diesel(sql_type = Text)]
+        reason_code: String,
+        #[diesel(sql_type = Text)]
+        record_hash: String,
+    }
+
+    #[derive(Debug, QueryableByName)]
+    struct AcquisitionCountRow {
+        #[diesel(sql_type = BigInt)]
+        count: i64,
+    }
+
     #[cfg(not(feature = "magic-gateway"))]
     #[derive(Debug, QueryableByName)]
     struct AcquisitionRequestAuditRow {
@@ -1212,6 +1276,145 @@ mod tests {
         );
         assert!(unavailable.retryable());
         assert_ne!(batch.to_string(), unavailable.to_string());
+    }
+
+    #[test]
+    #[serial]
+    fn br159_success_returns_receipt_only_after_the_row_and_hash_are_persisted() {
+        DatabaseManager::init(None).expect("TEST_CODE audit database init");
+        let batch = GatewayBatch::Available {
+            records: vec![DailyClose {
+                date: NaiveDate::from_ymd_opt(2099, 1, 2).unwrap(),
+                close: 10.0,
+            }],
+            evidence: evidence(ProviderId::Tdx, "TEST_CODE_receipt_batch"),
+        };
+
+        let request_hash =
+            acquisition_request_hash("TEST_CODE-BenchmarkBars", "TEST_CODE_request_hash_preimage");
+        let (returned, receipt) = audit_gateway_result_with_receipt(
+            "TEST_CODE-BenchmarkBars",
+            ProviderId::Tdx,
+            &request_hash,
+            Ok(batch),
+        )
+        .expect("accepted batch must carry its durable BR-159 receipt");
+
+        let mut connection = DatabaseManager::get().get_conn().unwrap();
+        let row = diesel::sql_query(
+            "SELECT a.outcome, a.reason_code, c.record_hash \
+             FROM data_acquisition_audit a \
+             JOIN data_acquisition_audit_chain c ON c.acquisition_audit_id = a.id \
+             WHERE a.id = ?",
+        )
+        .bind::<BigInt, _>(receipt.audit_id)
+        .get_result::<AcquisitionReceiptRow>(&mut *connection)
+        .expect("receipt must identify a real audit row and chain hash");
+
+        assert_eq!(returned.records().len(), 1);
+        assert_eq!(row.outcome, "available");
+        assert_eq!(row.reason_code, "accepted");
+        assert_eq!(row.record_hash, receipt.record_hash);
+    }
+
+    #[test]
+    #[serial]
+    fn br159_audit_failure_discards_an_accepted_batch() {
+        DatabaseManager::init(None).expect("TEST_CODE audit database init");
+        let batch = GatewayBatch::Available {
+            records: vec![DailyClose {
+                date: NaiveDate::from_ymd_opt(2099, 1, 2).unwrap(),
+                close: 10.0,
+            }],
+            evidence: evidence(ProviderId::Tdx, "TEST_CODE_discarded_batch"),
+        };
+
+        let error = audit_gateway_result_with_receipt(
+            "TEST_CODE-BenchmarkAuditFailure",
+            ProviderId::Tdx,
+            "TEST_CODE_invalid_hash_for_forced_audit_failure",
+            Ok(batch),
+        )
+        .expect_err("a batch must not escape when its BR-159 append fails");
+
+        assert_eq!(error.reason_code(), "acquisition_audit_unavailable");
+    }
+
+    #[test]
+    #[serial]
+    fn br159_error_outcome_is_persisted_before_the_original_typed_error_returns() {
+        DatabaseManager::init(None).expect("TEST_CODE audit database init");
+        let request_hash = acquisition_request_hash(
+            "TEST_CODE-BenchmarkError",
+            "TEST_CODE_provider_failure_preimage",
+        );
+        let original = GatewayError::classified(
+            "TEST_CODE-BenchmarkError",
+            Some(ProviderId::Tdx),
+            "unavailable",
+            "TEST_CODE_provider_failure",
+            true,
+            "TEST_CODE provider failed",
+        );
+
+        let returned = audit_gateway_result_with_receipt::<DailyClose>(
+            "TEST_CODE-BenchmarkError",
+            ProviderId::Tdx,
+            &request_hash,
+            Err(original),
+        )
+        .expect_err("provider failure remains a typed error after audit");
+        assert_eq!(returned.reason_code(), "TEST_CODE_provider_failure");
+
+        let mut connection = DatabaseManager::get().get_conn().unwrap();
+        let row = diesel::sql_query(
+            "SELECT a.outcome, a.reason_code, c.record_hash \
+             FROM data_acquisition_audit a \
+             JOIN data_acquisition_audit_chain c ON c.acquisition_audit_id = a.id \
+             WHERE a.capability = ? AND a.request_hash = ? ORDER BY a.id DESC LIMIT 1",
+        )
+        .bind::<Text, _>("TEST_CODE-BenchmarkError")
+        .bind::<Text, _>(&request_hash)
+        .get_result::<AcquisitionReceiptRow>(&mut *connection)
+        .expect("typed provider error must be durably audited");
+        assert_eq!(row.outcome, "unavailable");
+        assert_eq!(row.reason_code, "TEST_CODE_provider_failure");
+        assert_eq!(row.record_hash.len(), 64);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn benchmark_entrypoint_delegates_to_library_and_appends_exactly_one_audit_row() {
+        DatabaseManager::init(None).expect("TEST_CODE audit database init");
+        let mut connection = DatabaseManager::get().get_conn().unwrap();
+        let before = diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM data_acquisition_audit \
+             WHERE capability = 'BenchmarkBars'",
+        )
+        .get_result::<AcquisitionCountRow>(&mut *connection)
+        .unwrap()
+        .count;
+        drop(connection);
+
+        let day = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
+        let error = ReviewDataGateway::new()
+            .benchmark_bars(crate::data_gateway::BenchmarkRequest {
+                instrument: crate::data_gateway::HS300_CANONICAL.to_owned(),
+                range: crate::data_gateway::BenchmarkRange::Daily { from: day, to: day },
+            })
+            .await
+            .expect_err("production identity attestation is intentionally unavailable");
+        assert_eq!(error.reason_code(), "benchmark_identity_unverified");
+
+        let mut connection = DatabaseManager::get().get_conn().unwrap();
+        let after = diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM data_acquisition_audit \
+             WHERE capability = 'BenchmarkBars'",
+        )
+        .get_result::<AcquisitionCountRow>(&mut *connection)
+        .unwrap()
+        .count;
+        assert_eq!(after - before, 1, "delegation must not audit twice");
     }
 
     fn evidence(provider: ProviderId, batch_id: &str) -> BatchEvidence {
