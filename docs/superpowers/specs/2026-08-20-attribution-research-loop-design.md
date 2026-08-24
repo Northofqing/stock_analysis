@@ -736,3 +736,295 @@ workspace、扩展核心目录和成功阈值测试必须继续通过；真实 c
 全局/核心分子分母。实现失败只回滚检查器与测试，不得修改 coverage JSON 或降低阈值。
 
 回滚使用 `git revert <sha>`。本修订不改变策略结果、生产数据、推送、交易或历史成交。
+
+## 15. 2026-08-24 沪深 300 历史基准与买卖策略归因复盘
+
+### 15.1 状态、目标与不可越界范围
+
+**状态：Gate A 设计经用户确认，书面设计待复核；实现 TO BE BUILT。** 本节落实 §13.3/
+§13.4 已登记的历史基准缺口，并增加用户明确要求的历史归因复盘及业务日期规则：交易日
+运行实际当日数据，周六、周日运行最近完成交易日（通常为周五）。本节不改变 §11 的
+经济仓位定义、样本门槛和结论边界。
+
+范围只包含：沪深 300 日线/1 分钟线正式采集 seam、不可变季度段、v18 `BenchmarkReader`
+活动实现、买卖策略历史归因 Runner、append-only 报告与独立一次性 CLI。以下行为明确不在
+范围内：
+
+1. 不修改 `src/bin/monitor/main.rs`、Unsafe 重复推送和任何订单/外部通知路径。
+2. 不重写、删除、补齐旧 `paper_trades`，不把默认零费用升级为 Observed。
+3. 不释放 `paper_sell_paused`，不启用 R-12 `TechnicalBars`，不改变买卖阈值。
+4. 不在本轮执行生产历史回填，不安装系统级定时任务；两者均需单独授权。
+5. 不把模块测试或 CLI 存在写成生产集成完成。受 `CLAUDE.md` Completion Rule 约束，
+   在禁止修改 monitor 的当前范围内，整体状态必须保持 `In Progress / ResearchOnly`。
+
+触发数据红线为 2.1、2.2、2.3、2.4、2.7、2.8、2.10；没有 config/阈值修改，2.9 的
+Threshold-Proof 为 N/A。业务规则统一登记为 BR-251。
+
+### 15.2 HEAD 证据与旧模块关系
+
+以下命令在分支 `codex/buy-sell-t1-fifo` 的当前 HEAD 执行，避免从旧 spec 推导活动代码：
+
+```text
+$ rg -n 'BenchmarkRef|BenchmarkReader' src
+# exit 1，0 个活动 Rust 实现
+
+$ rg -n 'pub struct BenchmarkSeries|fn fetch_benchmark_series|pub struct ReviewDataGateway|verified_a_share_trading_day|verified_prev_a_share_trading_day' \
+    src/strategy/core.rs src/pipeline/backtest_runner.rs src/data_gateway/review.rs src/calendar.rs
+src/data_gateway/review.rs:306:pub struct ReviewDataGateway;
+src/calendar.rs:199:pub fn verified_a_share_trading_day(...)
+src/calendar.rs:217:pub fn verified_prev_a_share_trading_day(...)
+src/pipeline/backtest_runner.rs:322:    async fn fetch_benchmark_series(...)
+src/pipeline/backtest_runner.rs:333:    async fn fetch_benchmark_series_with_code(...)
+src/strategy/core.rs:879:pub struct BenchmarkSeries {
+
+$ rg -n 'INSERT OR REPLACE INTO paper_attribution_daily|pub fn compute_daily|pub fn compute_window' \
+    src/performance/attribution.rs
+445:pub fn compute_daily(
+458:pub fn compute_window(
+504:const PERSIST_SQL: &str = "INSERT OR REPLACE INTO paper_attribution_daily ..."
+```
+
+对生产库的 READ_ONLY 联结复核得到 `Filled=898`、同时存在严格候选订单审计时间及哈希链的
+独立成交 `=573`。573 只是时间证据候选，仍须通过一一关联、完整链、FIFO/T+1、费用和基准
+验证；不得直接包装成可用胜率。锁定的 `magic-market-data-rs` revision
+`75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e` 的指数专用原语证据沿用 §13.4；活动项目尚未
+接入该协议。
+
+| 旧模块/设计 | 处理 | 理由 |
+|---|---|---|
+| v18 `BenchmarkRef` / `BenchmarkReader` | 采用并活动实现 | 已定义唯一业务读取 seam、版本/hash 和缺失即 Unavailable；避免第二套基准架构 |
+| `ReviewDataGateway` | 深化 | 新增内部 `benchmark_bars` acquisition seam，复用现有 provider/gRPC/BR-159 边界 |
+| Magic TDX `get_index_bars/get_index_bars_all` | 私有 Adapter 采用 | 唯一已核验的指数专用协议；记录不自带代码，必须绑定请求身份并经真实验收 |
+| `HistoricalBarsGateway` / Tencent HistoricalBars | 拒绝用于指数 | 当前生产合同为 Equity，不得用代码形状绕过资产身份 |
+| `strategy::core::BenchmarkSeries` | 保留为计算投影 | 只可由完整 `BenchmarkSnapshot` 构造；旧“缺日跳过”语义不再拥有数据准入权 |
+| `pipeline::backtest_runner` | 修订消费者 | 取消无 offset 假分页和逐页吞错，只消费 `BenchmarkReader` 的日级投影 |
+| `performance::attribution` | 采用信号族/FIFO纯函数，拒绝旧编排 | 直接查库并接收当前价格 Map 不能证明历史 as-of；`INSERT OR REPLACE` 不能作审计权威 |
+| `PaperTradeTerminalBindingV1` / BR-086 链 | 采用证据模式 | 分钟锚点复用精确纸面成交与订单审计联结，不以 `paper_trades.ts` 猜时区 |
+| `paper_attribution_daily` | 保留遗留投影 | 不迁移、不覆盖、不删除；新权威结果进入独立 append-only store |
+| `src/bin/monitor/main.rs` | 拒绝修改 | 用户明确保护；新能力由独立一次性 CLI 暴露，故不宣称 monitor 集成完成 |
+
+### 15.3 深模块、接口与数据流
+
+新增能力形成一个深的 `Benchmark` 模块：复杂的 provider 身份、分页、时间语义、季度段、
+hash 和审计都隐藏在窄接口之后。TO BE BUILT 路径为 `src/data_gateway/benchmark.rs`；数据库
+实现分别位于 `src/database/benchmark_segments.rs` 与 `src/database/attribution_reports.rs`。
+
+核心职责固定如下：
+
+- `ReviewDataGateway::benchmark_bars(request)`：内部采集 seam，返回带 BR-159 receipt 的
+  完整批次或结构化错误。它不负责持久化季度段。
+- 私有 `TdxIndexBarsAdapter`：把 canonical index 请求映射到 TDX 指数协议和分页；不能被
+  归因/回测直接构造。首个注册项只支持 `sh000300`；其他现有常量返回 `Unsupported`。
+- `BenchmarkCapture`：季度段的唯一 writer。只有它能把已接纳批次、BR-159 receipt 和
+  canonical payload 原子绑定成 segment revision。
+- `BenchmarkReader`：唯一业务 read seam。按明确范围返回 `BenchmarkSnapshotRef`，包含有序
+  segment hashes、manifest hash、provider/version 和覆盖边界；任何缺失、重叠、冲突或链
+  异常都返回 Unavailable/错误，绝不返回裸 `Vec`。
+- `AttributionReplayRunner`：应用编排器。它读取成交、费用、个股历史收盘、基准、日历和
+  市场状态证据，再调用纯归因引擎；纯引擎不访问数据库、当前行情或 provider。
+- `AttributionReportStore`：归因运行、失败与报告 revision 的唯一 append-only writer。
+- `src/bin/strategy_attribution.rs`：一次性 CLI（TO BE BUILT），只调用 Runner，不复制规则。
+
+```text
+Magic TDX 指数协议 / gRPC
+            │
+            ▼
+私有 TdxIndexBarsAdapter
+            │
+            ▼
+ReviewDataGateway::benchmark_bars ──► BR-159 acquisition receipt
+            │
+            ▼
+BenchmarkCapture ──► 不可变自然季度 segment revisions
+            │
+            ▼
+BenchmarkReader ──► BenchmarkSnapshotRef / 已验证 BenchmarkSeries 投影
+            │
+            ├────────► 日级 backtest
+            └────────► AttributionReplayRunner
+                         │
+成交/费用/历史收盘/日历 ─┘
+                         ▼
+                   纯经济仓位归因
+                         ▼
+           append-only report + run/failure audit
+```
+
+no-default-features 生产客户端必须使用显式 gRPC operation 和保真 wire model；不能复用会
+丢失年月日时分数值语义的 TechnicalBars 桥。库内 magic Adapter 与 gRPC server 共享同一
+规范化函数，客户端只重建强类型批次，不自行解释 provider 数据。
+
+### 15.4 指数批次准入合同
+
+请求至少绑定：canonical instrument、`Daily|Minute1`、闭区间、Asia/Shanghai 业务时区、
+provider 与锁定 revision。返回批次必须保留 provider/source、source time（上游提供时）、
+local observed time、batch identity、完整性和 BR-159 receipt。
+
+准入在任何计算/持久化前完成：
+
+1. OHLC 均为正且有限，`low <= open/close <= high`；volume/amount 只按来源字段保存，缺失
+   保持缺失，不补零。
+2. 记录按规范时间稳定升序；重复、乱序、同一时间不同内容整批失败。
+3. Daily 必须精确覆盖请求范围内权威交易日；Minute1 必须只落在上午/下午连续竞价段，
+   段内连续，午休不是缺口。禁止跨日补齐。
+4. 实际涨跌无固定百分比拒绝上限；异常只保存来源事实并走连续性/公司行动或人工证据，
+   不得因为幅度“不像真的”删除。
+5. TDX `IndexBar` 不自带证券代码，Adapter 必须把 market/code/category 写入请求绑定；在
+   独立实盘身份锚点与时间语义验收完成前，能力保持 Disabled。
+6. 任一页失败、空页提前结束、或上游提供 total 时 total 与实际计数冲突，整批失败；不得
+   保留已取页形成“部分成功”。
+
+### 15.5 三个月自然季度分片与五年留存
+
+三个月是存储和读取周期，不是删除周期。分片边界固定为 1–3、4–6、7–9、10–12 月；
+Daily 与 Minute1 分开建段。同一规范 payload 按 instrument、粒度、时间排序，浮点字段使用
+确定性的 IEEE-754 位表示；先对未压缩 canonical bytes 做域分离 SHA-256，再压缩。存储必须
+记录 codec/version 和压缩体 hash，解压后重新验证 canonical payload hash，因此未来更换
+codec 不改变业务内容身份。初始 codec 的依赖选型在实施计划中固定，不得使用未登记的
+隐式系统工具。
+
+每个 segment revision 至少保存：季度身份、状态、记录数/首末时刻、canonical payload hash、
+压缩 payload、provider/batch evidence、BR-159 audit ID/hash、前一 revision、链前 hash、链
+record hash、created_at 与不少于五年的 retention deadline。表和链必须以触发器禁止 UPDATE/
+DELETE，启动时全链校验，追加时至少校验可信全链状态和当前尾部。
+
+- 当前季度可以追加 `Provisional` revision；同身份同 payload 返回既有回执，不新增行。
+- 同身份不同 payload 只能追加 successor，不覆盖旧 revision。
+- 季度结束且完整覆盖/链/内容均通过后，追加 `Sealed` revision；后续来源修订仍只能追加
+  新 successor，既有 Sealed 和引用它的报告保持可复现。
+- Reader 对请求范围选择显式指定的 revision/manifest，不按“最新时间”猜权威；跨季度按
+  `(quarter_start, granularity, segment_hash)` 确定顺序组合 manifest hash。
+- 缺段、重叠、冲突、删除、hash 不匹配或请求范围未覆盖都返回 `BenchmarkSegmentUnavailable`
+  或 `FailedIntegrity`，禁止近似读取。
+
+### 15.6 成交时间与分钟基准对齐
+
+纸面成交没有交易所撮合时间，策略按当时报价模拟成交。因此经济时间只认能够与
+`paper_trades` 一一精确绑定、且订单审计链完整的 RFC3339
+`order_audit.quote_observed_at`。`paper_trades.ts` 继续供严格 FIFO 排序，但因列本身无时区
+身份，不可用于分钟基准锚点。所有业务日期/时间显式转换为 Asia/Shanghai，禁止依赖机器
+`Local`。
+
+TDX 分钟标签必须先由只读实盘探针证明为“分钟结束标签”；确认前所有分钟 Alpha 返回
+`BenchmarkTimeSemanticsUnavailable`，日线能力不受此结论冒充。确认后，对成交时刻 `t`
+只选择唯一满足：
+
+```text
+bar_end < t  且  0 < t - bar_end <= 60 秒
+```
+
+的已完成 1 分钟线。严格 `<` 防止整分钟边界使用可能包含未来成交的 bar。09:31:00、
+13:01:00 等没有足够新且已完成 bar 的时刻为 Unavailable；不得跨午休、跨日、取最近值、
+前向填充或用前收/当日收盘替代。
+
+每个闭合经济仓位分别对齐开仓和再次归零时点：
+
+```text
+基准收益   = 卖出锚点指数价 / 买入锚点指数价 - 1
+毛超额收益 = 策略毛收益 - 基准收益
+净超额收益 = 策略净收益 - 基准收益
+```
+
+费用缺失时允许报告已验证的毛事实和毛超额，但净收益/净胜率/净 Alpha 必须保持
+`FeeEvidenceUnavailable`。Daily backtest 只接受同一交易日的精确指数收盘；缺日整段不可用，
+不进行 nearest/forward-fill。
+
+### 15.7 历史复盘与业务日期解析
+
+`AttributionReplayRunner` 提供同一引擎上的三种模式：
+
+- `scheduled`：根据运行时刻解析一个目标业务日。
+- `replay --from <date> --to <date>`：按权威交易日逐日历史复盘。
+- `quarter --year <year> --quarter <1..4>`：按自然季度复盘并固定所用 segment manifest。
+
+目标日解析只使用 `verified_a_share_trading_day` 和
+`verified_prev_a_share_trading_day`：
+
+1. 交易日收盘后且成交、个股日线、基准及所需证据覆盖目标日时，运行实际当日。
+2. 交易日收盘前或当日证据未完成时返回 `CurrentSessionIncomplete`，retryable=true；禁止
+   改跑昨天。
+3. 周六、周日选择最近完成交易日，正常为周五；若周五休市则继续按权威日历向前。
+4. 法定休市日同样选择最近完成交易日；日历年份超出覆盖返回
+   `TradingCalendarUnavailable`，不使用工作日猜测。
+
+周五、周六和周日可能三次运行同一目标日：report identity 由目标范围、规则版本、成交/
+费用/个股收盘/基准/日历 manifests 决定，相同内容返回已有报告回执；每次 invocation 另追加
+run audit。来源发生合法修订时产生新 report revision，并引用前版，不覆盖。Daily 与历史
+range 对同一天必须得到 byte-identical 的核心结果。
+
+历史复盘必须读取范围开始前的必要 FIFO 前史，不能把季度首日伪装成空仓。旧 898 条数据
+全部保留：时间/费用/基准缺失进入可用性清单；T+1、超卖、重复或链错误仍按 BR-134/
+BR-248 整次 `FailedIntegrity`。当前 `id=520` 会使受影响严格运行失败并留下失败审计，不能
+通过跳行得到“更好看”的历史胜率。只有真实不可变空仓确认之后才能建立发布级干净纪元。
+
+### 15.8 输出、错误语义与结论门
+
+运行失败和指标缺失分开建模：
+
+- `FailedIntegrity`：T+1、超卖、身份重复、乱序、非法数值、时间/K 线缺口、链或 hash
+  异常。不得持久化绩效指标或推送；只追加包含来源摘要、规则、阶段、retryability 和脱敏
+  hash 的失败审计。
+- typed `Unavailable`：独立周期或指标缺 `TradeTime`、`FeeEvidence`、`BenchmarkSegment`、
+  `BenchmarkTimeSemantics`、`BenchmarkAlignment`、`MarketRegime`。周期必须保留在总数和原因
+  计数中，其他证据独立完整的维度可报告，但标题必须标范围与覆盖率。
+- `InsufficientSample`：闭合经济仓位少于 200 或首末覆盖少于 84 个自然日。
+- `ResearchOnly`：可以计算部分或完整研究指标，但任一真实费用、完整逐周期基准、多个来源
+  绑定市场状态、聚类不确定性、Gate C/D 或生产集成证据缺失。
+
+本切片不新增“策略成功”阈值，也不把正均值等同成功。未来若要输出正式通过/失败结论，
+必须另行登记统计判定、置信区间、聚类方式、市场状态覆盖和 config 双向引用。
+
+每份中文报告至少列出：运行模式/时刻、目标日期或范围、规则与 manifest hashes、总周期、
+闭合/开放周期、各可用/不可用原因数量、覆盖率、毛/净指标可用性、基准收益/Alpha 可用性、
+按入场族聚合、右删失、数据质量、样本门与结论状态。禁止只展示有效子样本而隐藏分母。
+
+### 15.9 测试矩阵与发布门
+
+TDD 至少覆盖：
+
+1. 日期：交易日盘中/收盘后、周五、周六、周日、法定休市、周五休市、跨年与日历缺失。
+2. 协议：指数/股票身份隔离、分页超过单页、空页提前、页错误、上游提供 total 时的计数
+   冲突、Daily/Minute1 完整性、OHLC 与真实幅度保留。
+3. 分片：四个季度边界、跨季度 manifest、Daily/Minute1 隔离、相同重放幂等、不同内容
+   successor、Provisional/Sealed、篡改/删除/重叠/缺失拒绝、压缩前后 hash 验证。
+4. 对齐：Asia/Shanghai、整分钟严格前一已完成 bar、09:31、午休、13:01、15:00、跨日和
+   未确认标签语义 Disabled，证明零未来函数。
+5. 归因：Daily 与 range 同日一致、FIFO 前史、T+1/超卖/重复整批失败、费用缺失只关闭净
+   维度、基准缺失只关闭 Alpha、开放周期右删失、混合族、相同 report 幂等和修订追加。
+6. 审计：BR-159 receipt 绑定、segment/report/failure 链禁止 UPDATE/DELETE、启动全链校验、
+   写入失败原子回滚、测试/生产物理隔离与不少于五年留存。
+7. 真实只读验收：`sh000300` canonical identity、Daily 日期/价格、Minute1 标签/连续竞价段和
+   gRPC no-feature round-trip。未通过前能力保持 Disabled；不得把 TEST_CODE fixture 当 live。
+
+Gate B/C/D 命令固定为仓库标准：
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets --all-features -- --test-threads=1
+bash tools/compliance/check.sh
+cargo llvm-cov --workspace --all-features --json --output-path target/coverage/coverage.json -- --test-threads=1
+python3 tools/coverage/check_thresholds.py target/coverage/coverage.json
+cargo build --release --bin monitor
+```
+
+另外必须有定向测试、独立 CLI release build、只读 live probe 记录和独立 reviewer。由于用户
+保护 `monitor/main.rs` 且仓库暂无系统级 scheduler 资产，当前 slice 即使模块/CLI 全绿也不
+满足 CLAUDE 生产 integration/production evidence；PR 必须保持 Draft/In Progress，不能合并
+或称 Done。
+
+### 15.10 分阶段启用与回滚
+
+1. Gate A：本节、BR-251 和实施计划经用户复核。
+2. Gate B：实现纯类型、Reader/Capture/Store/Runner/CLI 和 TEST_CODE 测试；CLI 默认 preview，
+   不写生产库。
+3. 协议验收：运行真实 TDX/gRPC 只读探针，确认 identity、分页和分钟标签；不采集入库。
+4. 经单独授权后，允许 `capture --commit` 只向新 append-only 表写季度段；先影子验证，不改
+   旧表和消费者。
+5. 经单独授权后运行历史 replay；报告固定 `ResearchOnly`，不触发推送、订单或状态切换。
+6. 系统级定时、monitor 集成及任何正式结论另立批准与生产证据门。
+
+代码回滚使用 `git revert <sha>`；旧程序忽略新表。已追加的 acquisition/segment/report/
+failure 审计和历史市场事实不得删除，回滚只停止新 writer/reader。架构/数据流错误回 Gate A，
+实现错误回 Gate B，红线违规在 Gate B 修复后重做失败模式审查。生产回填未获授权或任一
+Gate 失败时，安全下一步仅为保留 Draft、修复对应根因或继续只读验证。

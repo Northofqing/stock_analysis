@@ -1733,3 +1733,29 @@ freshness 归因；不复制、链接、回填或修改生产数据库，不新�
 
 本任务没有数据或代码写入，只固化完成性边界。回滚文档使用 `git revert <sha>`；未来任何
 实现仍须重新输出 pre-flight 并从 Gate A 开始，禁止把本次只读审计当作实现批准。
+
+## 任务 22：2026-08-24 历史基准与买卖策略归因复盘 Gate A
+
+**规格：** 对应设计 §15 与 BR-251。深化既有 v18 `BenchmarkReader`，通过
+`ReviewDataGateway` 的私有 TDX 指数协议 Adapter、唯一 `BenchmarkCapture`、三个月自然
+季度不可变分片和独立 `AttributionReplayRunner`，支持历史复盘以及交易日当日、周末通常
+周五的业务日期规则。不修改生产数据库、历史成交、`monitor/main.rs`、Unsafe 推送、订单闸、
+`paper_sell_paused` 或 TechnicalBars 状态。
+
+- [x] 用户确认：复用既有 Benchmark/Attribution 架构，不创建第二套顶层历史指数模块。
+- [x] 用户确认：Daily/Minute1 按固定自然季度分片，旧段压缩只读保留不少于五年，不以
+  三个月作为删除期限。
+- [x] 用户确认：成交分钟锚点、费用/基准 typed Unavailable、历史复盘、交易日/周末目标日、
+  错误分层、测试矩阵和分阶段发布。
+- [x] HEAD 审计：活动代码没有 `BenchmarkReader`；旧 runner 无 offset 假分页并吞页错误；
+  `BenchmarkSeries` 跳缺日；旧 attribution 编排直查库且结果 `INSERT OR REPLACE`。
+- [x] 真实库只读时间证据：898 Filled 中 573 笔具有候选严格订单审计时间与哈希链；候选不
+  等于可用，旧 `id=520` T+1 违规仍阻断严格历史指标。
+- [x] Gate A 文档：设计 §15、BR-251、数据流、失败、旧模块、回滚和 AC 已写入。
+- [ ] 用户复核书面设计 §15。
+- [ ] 使用 `writing-plans` 把实现拆成可独立回滚的小提交；复核前不写实现代码。
+- [ ] Gate B/C/D、真实只读 TDX/gRPC 验收、生产采集授权、生产回填授权和 scheduler/monitor
+  集成证据均待后续；当前状态 `In Progress / ResearchOnly`。
+
+本任务的设计回滚使用 `git revert <Gate-A-doc-sha>`。没有生产数据写入，因此不存在数据
+回滚；未来已追加审计或季度事实不得作为代码回滚的一部分删除。
