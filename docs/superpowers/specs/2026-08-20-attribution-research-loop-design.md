@@ -678,6 +678,34 @@ TDD 必须覆盖：解析失败持久化、T+1/超卖重建失败持久化、精
 `(code, entry_date)` 聚类的不确定性和多状态报告。样本仍须达到 200 个闭环、84 天覆盖；
 任何条件不足都只能输出 `Unavailable/InsufficientSample/ResearchOnly`。
 
+### 13.4 2026-08-24 现有采集能力完成性审计
+
+对仓库与锁定的 `magic-market-data-rs` revision
+`75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e` 做只读调用链审计后，三个阻塞项必须进一步
+区分为“正式能力缺口”和“真实事实尚未到达”：
+
+1. **逐成交费用仍是正式能力缺口。** 仓库没有成交/费用导入器；`trades` 的佣金、印花税、
+   滑点列来自 `DEFAULT 0` 迁移，唯一真实 INSERT 不写这些列，也不写可与 `paper_trades`
+   绑定的成交身份。现有 `TradeEventSource` 事件同样不含费用或结算凭据，运行时代码明确
+   报告 broker trade-sync watermark 尚未连接。策略模块中的费率常量只能作为 Scenario，
+   不能升级为 Observed。
+2. **历史沪深300仍是正式 Gateway 缺口。** 当前 `IndexDataGateway` 只提供 5 秒实时指数
+   quote，生产 `get_backtest_daily_data` 明确拒绝指数历史身份，所以
+   `fetch_benchmark_series(sh000300)` 不能形成生产序列。锁定上游的 Tencent
+   `HistoricalBars` 走只接受 Equity 的校验；TDX normalized `HistoricalBars` 虽未拒绝
+   Index，却仍无条件调用股票 `security_bars`，未接入其独立 `get_index_bars/IndexBar`
+   协议。底层原语可供未来设计，但当前没有经过身份、协议和真实源验证的指数历史能力。
+3. **不可变空仓确认入口已经存在，缺的是事实。** `import_user_position_snapshot` 要求完整
+   用户 JSON，只有空 `items` 与显式 `confirm_empty=true` 同时成立才接受；规范化证据哈希后，
+   SQLite 以原子事务、唯一身份及禁止 UPDATE/DELETE 的触发器只追加保存。它明确是
+   `user_confirmed_full_snapshot`，不是 30 秒券商账户证据，也不得从投影或交易增量推断。
+   当前真实库没有任何空仓确认，因此代理不得自行生成或代用户导入。
+
+本审计不新增实现：费用需要真实券商成交/结算来源；指数历史适配需要另立 Gate A，冻结
+canonical instrument、指数专用协议、分页、时间对齐、持久证据及真实 provider 验收；空仓
+入口只等待真实用户/账户事实。三者未齐前，BR-248 继续 `ResearchOnly`，不释放
+`paper_sell_paused`，不启用 R-12 `TechnicalBars`，也不改写旧 898 条成交。
+
 ## 14. 2026-08-24 worktree 覆盖率路径归一化
 
 ### 14.1 目的与边界

@@ -1709,3 +1709,27 @@ freshness 归因；不复制、链接、回填或修改生产数据库，不新�
 
 本任务只更新证据，不产生新的实现提交。回滚文档使用 `git revert <sha>`；数据库无回滚
 动作，因为没有发生写入。
+
+## 任务 21：2026-08-24 费用、基准与空仓采集能力审计
+
+**规格：** 对应设计 §13.4 与 BR-248。只读追踪仓库和锁定上游 revision 的精确调用链，
+区分“已有入口但缺真实事实”与“尚无生产能力”；不修改生产数据库、`main.rs`、推送或交易闸。
+
+- [x] 费用写入链：确认仓库没有成交/费用 importer，唯一 `trades` INSERT 不写费用字段、
+  成交身份、`signal_id` 或可用策略标签；三类默认 0 不能作为 Observed。
+- [x] 费用来源链：确认运行时 broker trade-sync watermark 未连接，`TradeEventSource` 事件也
+  没有费用/结算凭据；现有费率只保留 Scenario 语义。
+- [x] 项目基准链：确认正式指数 Gateway 仅支持 5 秒实时 quote，生产历史 bars 门明确拒绝
+  指数身份，当前 `fetch_benchmark_series(sh000300)` 无可用生产序列。
+- [x] 锁定上游链：Tencent HistoricalBars 为 Equity-only；TDX normalized HistoricalBars
+  仍走股票协议，独立指数协议尚未接入。底层原语不冒充已经发布的生产 Gateway。
+- [x] 空仓入口链：确认完整用户快照 importer 强制空集合与 `confirm_empty=true` 一致，证据
+  规范化后 append-only 保存；没有真实确认时不自动生成空仓。
+- [x] 结论：空仓项只缺真实事实；费用项缺真实 broker 来源；指数项可以另立 Gate A 设计，
+  但未完成真实身份/协议验收前不能进入策略结论。
+- [ ] 外部事实：导入真实空仓确认，建立干净验证纪元。
+- [ ] 外部能力：接入逐成交真实费用/结算身份。
+- [ ] 新 Gate A：经明确批准后设计并实现 TDX 指数历史 Gateway 与不可变基准批次。
+
+本任务没有数据或代码写入，只固化完成性边界。回滚文档使用 `git revert <sha>`；未来任何
+实现仍须重新输出 pre-flight 并从 Gate A 开始，禁止把本次只读审计当作实现批准。
