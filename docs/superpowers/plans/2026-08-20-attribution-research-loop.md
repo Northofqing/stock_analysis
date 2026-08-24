@@ -1762,7 +1762,7 @@ freshness 归因；不复制、链接、回填或修改生产数据库，不新�
 
 # 买卖策略历史归因复盘实施计划
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use `executing-plans` to implement this plan task-by-task with review checkpoints.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use `subagent-driven-development`（推荐）或 `executing-plans` 逐任务实现，并保留复核检查点。
 
 **目标：** 在不改买卖阈值、不改订单/推送链、不改历史成交的前提下，交付沪深 300
 日线/1 分钟线的可审计季度证据链，以及可重放、可归因、默认只读且结论固定为
@@ -1787,7 +1787,7 @@ TechnicalBars 状态、旧成交和旧归因表。测试 identity 必须以 `TES
 mock/default/fake fallback。任何真实 TDX 探针、生产 capture、历史 report 写入或定时集成，
 都只能在对应授权检查点后执行。
 
-## 任务 23：冻结基准领域类型与整批准入规则
+## Task 23（任务 23）：冻结基准领域类型与整批准入规则
 
 **文件：**
 
@@ -1847,7 +1847,7 @@ pub struct BenchmarkBar {
   模块/类型缺失失败，最小实现后全绿。
 - [ ] 提交：`git commit -m "feat: 冻结历史基准准入合同"`。
 
-## 任务 24：实现私有 Magic TDX 指数 adapter 与 BR-159 receipt seam
+## Task 24（任务 24）：实现私有 Magic TDX 指数 adapter 与 BR-159 receipt seam
 
 **文件：**
 
@@ -1892,7 +1892,7 @@ impl ReviewDataGateway {
   与 `cargo check --no-default-features`。
 - [ ] 提交：`git commit -m "feat: 接入可审计的TDX指数适配器"`。
 
-## 任务 25：增加 no-default-features 的 BenchmarkBars gRPC 合同
+## Task 25（任务 25）：增加 no-default-features 的 BenchmarkBars gRPC 合同
 
 **文件：**
 
@@ -1923,7 +1923,7 @@ impl ReviewDataGateway {
   `cargo build --no-default-features --bin monitor`、`cargo build --bin grpc_market_server`。
 - [ ] 提交：`git commit -m "feat: 增加历史基准gRPC合同"`。
 
-## 任务 26：实现自然季度不可变 segment 与 manifest store
+## Task 26（任务 26）：实现自然季度不可变 segment 与 manifest store
 
 **文件：**
 
@@ -1973,7 +1973,7 @@ pub struct BenchmarkManifestRef {
 - [ ] 运行：`cargo test database::benchmark_segments --all-features -- --test-threads=1`。
 - [ ] 提交：`git commit -m "feat: 保存不可变季度基准段"`。
 
-## 任务 27：实现唯一 BenchmarkCapture 与 BenchmarkReader
+## Task 27（任务 27）：实现唯一 BenchmarkCapture 与 BenchmarkReader
 
 **文件：**
 
@@ -2019,7 +2019,7 @@ impl BenchmarkReader {
 - [ ] 运行：`cargo test data_gateway::benchmark database::benchmark_segments --all-features -- --test-threads=1`。
 - [ ] 提交：`git commit -m "feat: 完成基准采集与读取深模块"`。
 
-## 任务 28：实现 append-only 归因 run/report/failure store
+## Task 28（任务 28）：实现 append-only 归因 run/report/failure store
 
 **文件：**
 
@@ -2040,7 +2040,7 @@ impl BenchmarkReader {
 - [ ] 运行：`cargo test database::attribution_reports --all-features -- --test-threads=1`。
 - [ ] 提交：`git commit -m "feat: 保存不可变归因报告审计"`。
 
-## 任务 29：提取生产只读历史证据装载器
+## Task 29（任务 29）：提取生产只读历史证据装载器
 
 **文件：**
 
@@ -2067,7 +2067,7 @@ impl BenchmarkReader {
   再对 TEST_CODE 临时库运行 `economic_position_probe` 回归。
 - [ ] 提交：`git commit -m "feat: 装载只读历史归因证据"`。
 
-## 任务 30：实现零未来函数的分钟对齐与纯归因
+## Task 30（任务 30）：实现零未来函数的分钟对齐与纯归因
 
 **文件：**
 
@@ -2106,7 +2106,7 @@ pub fn align_completed_minute(
 - [ ] 运行：`cargo test performance::economic_position performance::attribution_replay --all-features -- --test-threads=1`。
 - [ ] 提交：`git commit -m "feat: 计算历史经济仓位归因"`。
 
-## 任务 31：实现权威业务日期解析与 Replay Runner
+## Task 31（任务 31）：实现权威业务日期解析与 Replay Runner
 
 **文件：**
 
@@ -2149,7 +2149,7 @@ impl AttributionReplayRunner {
 - [ ] 运行：`cargo test calendar performance::attribution_replay database::attribution_reports --all-features -- --test-threads=1`。
 - [ ] 提交：`git commit -m "feat: 编排买卖策略历史复盘"`。
 
-## 任务 32：交付默认只读的中文 strategy_attribution CLI
+## Task 32（任务 32）：交付默认只读的中文 strategy_attribution CLI
 
 **文件：**
 
@@ -2173,7 +2173,7 @@ impl AttributionReplayRunner {
   `cargo build --release --bin strategy_attribution`、`cargo build --release --bin strategy_attribution --no-default-features`。
 - [ ] 提交：`git commit -m "feat: 增加中文策略归因命令行"`。
 
-## 任务 33：收口旧回测消费者、合规证据与授权检查点
+## Task 33（任务 33）：收口旧回测消费者、合规证据与授权检查点
 
 **文件：**
 
