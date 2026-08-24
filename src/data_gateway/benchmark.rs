@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, TimeZone, Timelike};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, TimeZone, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -59,6 +59,89 @@ pub struct BenchmarkBar {
     pub amount: Option<f64>,
 }
 
+/// BR-251 gRPC uses an explicit numeric wall-clock model instead of relying on
+/// chrono's textual serde representation. Every field is required; nullable
+/// provider values remain explicit JSON `null` rather than disappearing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum BenchmarkWireTime {
+    Daily {
+        year: i32,
+        month: u32,
+        day: u32,
+    },
+    Minute1 {
+        year: i32,
+        month: u32,
+        day: u32,
+        hour: u32,
+        minute: u32,
+        utc_offset_seconds: i32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BenchmarkRequestWire {
+    pub(crate) instrument: String,
+    pub(crate) granularity: BenchmarkGranularity,
+    pub(crate) from: BenchmarkWireTime,
+    pub(crate) to: BenchmarkWireTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BenchmarkBarWire {
+    pub(crate) at: BenchmarkWireTime,
+    pub(crate) open: f64,
+    pub(crate) high: f64,
+    pub(crate) low: f64,
+    pub(crate) close: f64,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub(crate) volume: Option<f64>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub(crate) amount: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BenchmarkEvidenceWire {
+    pub(crate) provider: String,
+    pub(crate) source: String,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub(crate) source_at: Option<String>,
+    pub(crate) observed_at: String,
+    pub(crate) batch_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BenchmarkAuditReceiptWire {
+    pub(crate) audit_id: i64,
+    pub(crate) record_hash: String,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub(crate) previous_outcome: Option<String>,
+    pub(crate) current_outcome: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BenchmarkGrpcResponseWire {
+    pub(crate) request: BenchmarkRequestWire,
+    pub(crate) request_hash: String,
+    pub(crate) bars: Vec<BenchmarkBarWire>,
+    pub(crate) evidence: BenchmarkEvidenceWire,
+    pub(crate) receipt: BenchmarkAuditReceiptWire,
+}
+
+fn deserialize_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BenchmarkUnsupported {
     UnsupportedInstrument,
@@ -94,6 +177,473 @@ impl BenchmarkRegistry {
             accepts_test_identities: true,
         }
     }
+}
+
+impl BenchmarkRequestWire {
+    pub(crate) fn try_from_request(request: &BenchmarkRequest) -> Result<Self, GatewayError> {
+        validate_range(&request.range).map_err(benchmark_admission_error)?;
+        Ok(match &request.range {
+            BenchmarkRange::Daily { from, to } => Self {
+                instrument: request.instrument.clone(),
+                granularity: BenchmarkGranularity::Daily,
+                from: BenchmarkWireTime::from_date(*from),
+                to: BenchmarkWireTime::from_date(*to),
+            },
+            BenchmarkRange::Minute1 { from, to } => Self {
+                instrument: request.instrument.clone(),
+                granularity: BenchmarkGranularity::Minute1,
+                from: BenchmarkWireTime::from_minute(*from),
+                to: BenchmarkWireTime::from_minute(*to),
+            },
+        })
+    }
+
+    pub(crate) fn to_request(&self) -> Result<BenchmarkRequest, GatewayError> {
+        let range = match self.granularity {
+            BenchmarkGranularity::Daily => BenchmarkRange::Daily {
+                from: self.from.to_date()?,
+                to: self.to.to_date()?,
+            },
+            BenchmarkGranularity::Minute1 => BenchmarkRange::Minute1 {
+                from: self.from.to_minute()?,
+                to: self.to.to_minute()?,
+            },
+        };
+        let request = BenchmarkRequest {
+            instrument: self.instrument.clone(),
+            range,
+        };
+        validate_range(&request.range).map_err(benchmark_admission_error)?;
+        Ok(request)
+    }
+}
+
+impl BenchmarkWireTime {
+    fn from_date(date: NaiveDate) -> Self {
+        Self::Daily {
+            year: date.year(),
+            month: date.month(),
+            day: date.day(),
+        }
+    }
+
+    fn from_minute(at: DateTime<FixedOffset>) -> Self {
+        Self::Minute1 {
+            year: at.year(),
+            month: at.month(),
+            day: at.day(),
+            hour: at.hour(),
+            minute: at.minute(),
+            utc_offset_seconds: at.offset().local_minus_utc(),
+        }
+    }
+
+    fn to_date(&self) -> Result<NaiveDate, GatewayError> {
+        let Self::Daily { year, month, day } = self else {
+            return Err(benchmark_wire_error(
+                "Daily granularity requires a daily wire timestamp",
+            ));
+        };
+        NaiveDate::from_ymd_opt(*year, *month, *day)
+            .ok_or_else(|| benchmark_wire_error("daily wire timestamp is invalid"))
+    }
+
+    fn to_minute(&self) -> Result<DateTime<FixedOffset>, GatewayError> {
+        let Self::Minute1 {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            utc_offset_seconds,
+        } = self
+        else {
+            return Err(benchmark_wire_error(
+                "Minute1 granularity requires a minute wire timestamp",
+            ));
+        };
+        if *utc_offset_seconds != 8 * 60 * 60 {
+            return Err(benchmark_wire_error(
+                "Minute1 wire timestamp must use Asia/Shanghai +08:00",
+            ));
+        }
+        let date = NaiveDate::from_ymd_opt(*year, *month, *day)
+            .ok_or_else(|| benchmark_wire_error("minute wire date is invalid"))?;
+        let local = date
+            .and_hms_opt(*hour, *minute, 0)
+            .ok_or_else(|| benchmark_wire_error("minute wire time is invalid"))?;
+        let offset = FixedOffset::east_opt(*utc_offset_seconds)
+            .ok_or_else(|| benchmark_wire_error("minute wire UTC offset is invalid"))?;
+        offset
+            .from_local_datetime(&local)
+            .single()
+            .ok_or_else(|| benchmark_wire_error("minute wire timestamp is ambiguous"))
+    }
+}
+
+impl BenchmarkBarWire {
+    #[cfg(any(feature = "magic-gateway", test))]
+    fn from_bar(bar: &BenchmarkBar) -> Self {
+        let at = match bar.at {
+            BenchmarkBarTime::Daily(date) => BenchmarkWireTime::from_date(date),
+            BenchmarkBarTime::MinuteEnd(at) => BenchmarkWireTime::from_minute(at),
+        };
+        Self {
+            at,
+            open: bar.open,
+            high: bar.high,
+            low: bar.low,
+            close: bar.close,
+            volume: bar.volume,
+            amount: bar.amount,
+        }
+    }
+
+    fn to_bar(&self, granularity: BenchmarkGranularity) -> Result<BenchmarkBar, GatewayError> {
+        let at = match granularity {
+            BenchmarkGranularity::Daily => BenchmarkBarTime::Daily(self.at.to_date()?),
+            BenchmarkGranularity::Minute1 => BenchmarkBarTime::MinuteEnd(self.at.to_minute()?),
+        };
+        Ok(BenchmarkBar {
+            at,
+            open: self.open,
+            high: self.high,
+            low: self.low,
+            close: self.close,
+            volume: self.volume,
+            amount: self.amount,
+        })
+    }
+}
+
+impl BenchmarkEvidenceWire {
+    #[cfg(any(feature = "magic-gateway", test))]
+    fn from_evidence(evidence: &super::review::BatchEvidence) -> Self {
+        Self {
+            provider: format!("{:?}", evidence.provider),
+            source: evidence.source.clone(),
+            source_at: evidence.source_at.clone(),
+            observed_at: evidence.observed_at.clone(),
+            batch_id: evidence.batch_id.clone(),
+        }
+    }
+
+    fn to_evidence_at(
+        &self,
+        consumer_now: DateTime<Utc>,
+    ) -> Result<super::review::BatchEvidence, GatewayError> {
+        if self.provider != "Tdx" {
+            return Err(benchmark_wire_error(
+                "benchmark wire provider must be the registered Tdx provider",
+            ));
+        }
+        if self.source.trim().is_empty() || self.batch_id.trim().is_empty() {
+            return Err(benchmark_wire_error(
+                "benchmark wire source and batch_id must be nonblank",
+            ));
+        }
+        let observed_at = super::parse_evidence_instant(
+            BENCHMARK_CAPABILITY,
+            ProviderId::Tdx,
+            "observed_at",
+            &self.observed_at,
+        )?;
+        if observed_at > consumer_now + Duration::seconds(2) {
+            return Err(benchmark_wire_error(
+                "benchmark observed_at is beyond the allowed consumer clock skew",
+            ));
+        }
+        validate_benchmark_evidence_freshness(observed_at, consumer_now)?;
+        if let Some(source_at) = &self.source_at {
+            let source_at = super::parse_evidence_instant(
+                BENCHMARK_CAPABILITY,
+                ProviderId::Tdx,
+                "source_at",
+                source_at,
+            )?;
+            if source_at > observed_at {
+                return Err(benchmark_wire_error(
+                    "benchmark source_at must not be later than observed_at",
+                ));
+            }
+        }
+        Ok(super::review::BatchEvidence {
+            provider: ProviderId::Tdx,
+            source: self.source.clone(),
+            source_at: self.source_at.clone(),
+            observed_at: self.observed_at.clone(),
+            batch_id: self.batch_id.clone(),
+        })
+    }
+}
+
+fn validate_benchmark_evidence_freshness(
+    observed_at: DateTime<Utc>,
+    consumer_now: DateTime<Utc>,
+) -> Result<(), GatewayError> {
+    let shanghai =
+        FixedOffset::east_opt(8 * 60 * 60).expect("the fixed Asia/Shanghai UTC offset is valid");
+    let observed_date = observed_at.with_timezone(&shanghai).date_naive();
+    let consumer_date = consumer_now.with_timezone(&shanghai).date_naive();
+    crate::calendar::verified_a_share_trading_day(observed_date)
+        .map_err(benchmark_trading_calendar_error)?;
+    crate::calendar::verified_a_share_trading_day(consumer_date)
+        .map_err(benchmark_trading_calendar_error)?;
+
+    let mut cursor = observed_date;
+    let mut elapsed_trading_days = 0_u8;
+    while cursor < consumer_date {
+        cursor = cursor.succ_opt().ok_or_else(|| {
+            benchmark_trading_calendar_error(
+                "A-share trading-calendar date overflow while checking benchmark freshness",
+            )
+        })?;
+        if crate::calendar::verified_a_share_trading_day(cursor)
+            .map_err(benchmark_trading_calendar_error)?
+        {
+            elapsed_trading_days += 1;
+            if elapsed_trading_days > 1 {
+                return Err(GatewayError::classified(
+                    BENCHMARK_CAPABILITY,
+                    Some(ProviderId::Tdx),
+                    "stale",
+                    "benchmark_evidence_stale",
+                    true,
+                    "benchmark acquisition evidence is more than one verified A-share trading day old",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn benchmark_trading_calendar_error(message: impl Into<String>) -> GatewayError {
+    GatewayError::classified(
+        BENCHMARK_CAPABILITY,
+        Some(ProviderId::Tdx),
+        "unavailable",
+        "benchmark_trading_calendar_unavailable",
+        true,
+        message,
+    )
+}
+
+impl BenchmarkAuditReceiptWire {
+    #[cfg(any(feature = "magic-gateway", test))]
+    fn from_receipt(
+        receipt: &crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt,
+    ) -> Self {
+        Self {
+            audit_id: receipt.audit_id,
+            record_hash: receipt.record_hash.clone(),
+            previous_outcome: receipt.previous_outcome.clone(),
+            current_outcome: receipt.current_outcome.clone(),
+        }
+    }
+
+    fn to_receipt(
+        &self,
+    ) -> Result<crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt, GatewayError>
+    {
+        if self.audit_id <= 0 || !is_lower_hex_sha256(&self.record_hash) {
+            return Err(benchmark_wire_error(
+                "benchmark audit receipt id/hash is malformed",
+            ));
+        }
+        if self.current_outcome != "available" {
+            return Err(benchmark_wire_error(
+                "benchmark audit receipt current_outcome must be available",
+            ));
+        }
+        if self
+            .previous_outcome
+            .as_deref()
+            .is_some_and(|outcome| !is_registered_audit_outcome(outcome))
+        {
+            return Err(benchmark_wire_error(
+                "benchmark audit receipt previous_outcome is unknown",
+            ));
+        }
+        Ok(
+            crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt {
+                audit_id: self.audit_id,
+                record_hash: self.record_hash.clone(),
+                previous_outcome: self.previous_outcome.clone(),
+                current_outcome: self.current_outcome.clone(),
+            },
+        )
+    }
+}
+
+impl BenchmarkGrpcResponseWire {
+    #[cfg(any(feature = "magic-gateway", test))]
+    pub(crate) fn from_audited(
+        request: &BenchmarkRequest,
+        audited: &super::review::AuditedBenchmarkBatch,
+    ) -> Result<Self, GatewayError> {
+        let super::review::GatewayBatch::Available { records, evidence } = &audited.batch else {
+            return Err(benchmark_wire_error(
+                "an empty benchmark batch cannot be serialized as admitted evidence",
+            ));
+        };
+        BenchmarkAuditReceiptWire::from_receipt(&audited.receipt).to_receipt()?;
+        Ok(Self {
+            request: BenchmarkRequestWire::try_from_request(request)?,
+            request_hash: audited.request_hash.clone(),
+            bars: records.iter().map(BenchmarkBarWire::from_bar).collect(),
+            evidence: BenchmarkEvidenceWire::from_evidence(evidence),
+            receipt: BenchmarkAuditReceiptWire::from_receipt(&audited.receipt),
+        })
+    }
+
+    fn into_audited(
+        self,
+        expected_request: &BenchmarkRequest,
+        registry: &BenchmarkRegistry,
+        coverage: BenchmarkAdmissionCoverage<'_>,
+        consumer_now: DateTime<Utc>,
+    ) -> Result<super::review::AuditedBenchmarkBatch, GatewayError> {
+        let echoed_request = self.request.to_request()?;
+        let expected_wire = BenchmarkRequestWire::try_from_request(expected_request)?;
+        if &echoed_request != expected_request || self.request != expected_wire {
+            return Err(benchmark_wire_error(
+                "benchmark response request identity or range differs from the caller request",
+            ));
+        }
+        let bars = self
+            .bars
+            .iter()
+            .map(|bar| bar.to_bar(self.request.granularity))
+            .collect::<Result<Vec<_>, _>>()?;
+        let admitted = admit_benchmark_batch(registry, echoed_request, bars, coverage)
+            .map_err(benchmark_admission_error)?;
+        let evidence = self.evidence.to_evidence_at(consumer_now)?;
+        let receipt = self.receipt.to_receipt()?;
+        Ok(super::review::AuditedBenchmarkBatch {
+            batch: super::review::GatewayBatch::Available {
+                records: admitted.into_bars(),
+                evidence,
+            },
+            receipt,
+            request_hash: self.request_hash,
+        })
+    }
+}
+
+pub(super) fn admit_benchmark_grpc_wire(
+    expected_request: &BenchmarkRequest,
+    wire: BenchmarkGrpcResponseWire,
+) -> Result<super::review::AuditedBenchmarkBatch, GatewayError> {
+    validate_benchmark_response_request(expected_request, &wire)?;
+    let consumer_now = Utc::now();
+    let coverage = verified_benchmark_coverage(expected_request)?;
+    match &coverage {
+        OwnedBenchmarkCoverage::Daily(authoritative_trading_days) => wire.into_audited(
+            expected_request,
+            &BenchmarkRegistry::production_default(),
+            BenchmarkAdmissionCoverage::Daily {
+                authoritative_trading_days,
+            },
+            consumer_now,
+        ),
+        OwnedBenchmarkCoverage::Minute1 => wire.into_audited(
+            expected_request,
+            &BenchmarkRegistry::production_default(),
+            BenchmarkAdmissionCoverage::Minute1,
+            consumer_now,
+        ),
+    }
+}
+
+pub(super) fn verify_benchmark_grpc_server_receipt(
+    expected_request: &BenchmarkRequest,
+    wire: &BenchmarkGrpcResponseWire,
+) -> Result<crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt, GatewayError> {
+    validate_benchmark_response_request(expected_request, wire)?;
+    let expected_request_hash = canonical_base_request_hash(expected_request);
+    if wire.request_hash != expected_request_hash {
+        return Err(benchmark_wire_error(
+            "benchmark audit request hash differs from the caller request identity",
+        ));
+    }
+    let receipt = wire.receipt.to_receipt()?;
+    let expected = crate::database::data_acquisition_audit::DataAcquisitionAuditRecord {
+        capability: BENCHMARK_CAPABILITY,
+        provider: "Tdx",
+        source: &wire.evidence.source,
+        request_hash: &expected_request_hash,
+        source_at: wire.evidence.source_at.as_deref(),
+        observed_at: &wire.evidence.observed_at,
+        batch_id: Some(&wire.evidence.batch_id),
+        outcome: "available",
+        request_count: 1,
+        accepted_count: i64::try_from(wire.bars.len()).map_err(|_| {
+            benchmark_wire_error("benchmark response bar count exceeds the audit counter range")
+        })?,
+        rejected_count: 0,
+        reason_code: "accepted",
+        retryable: false,
+    };
+    crate::database::DatabaseManager::try_get()
+        .ok_or_else(|| benchmark_wire_error("benchmark receipt database is not initialized"))?
+        .verify_data_acquisition_receipt(&receipt, &expected)
+        .map_err(|error| {
+            benchmark_wire_error(format!(
+                "benchmark audit receipt is not verified by the local BR-159 chain: {error}"
+            ))
+        })?;
+    Ok(receipt)
+}
+
+#[cfg(test)]
+pub(super) fn admit_benchmark_grpc_wire_for_test(
+    expected_request: &BenchmarkRequest,
+    wire: BenchmarkGrpcResponseWire,
+    coverage: BenchmarkAdmissionCoverage<'_>,
+    consumer_now: DateTime<Utc>,
+) -> Result<super::review::AuditedBenchmarkBatch, GatewayError> {
+    validate_benchmark_response_request(expected_request, &wire)?;
+    let registry = BenchmarkRegistry::test_only(["TEST_CODE_000300"]);
+    wire.into_audited(expected_request, &registry, coverage, consumer_now)
+}
+
+fn validate_benchmark_response_request(
+    expected_request: &BenchmarkRequest,
+    wire: &BenchmarkGrpcResponseWire,
+) -> Result<(), GatewayError> {
+    let echoed_request = wire.request.to_request()?;
+    let expected_wire = BenchmarkRequestWire::try_from_request(expected_request)?;
+    if &echoed_request != expected_request || wire.request != expected_wire {
+        return Err(benchmark_wire_error(
+            "benchmark response request identity or range differs from the caller request",
+        ));
+    }
+    Ok(())
+}
+
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_registered_audit_outcome(outcome: &str) -> bool {
+    matches!(
+        outcome,
+        "available"
+            | "verified_empty"
+            | "invalid_request"
+            | "unavailable"
+            | "stale"
+            | "partial"
+            | "conflict"
+            | "unsupported"
+    )
+}
+
+fn benchmark_wire_error(message: impl Into<String>) -> GatewayError {
+    GatewayError::invalid_evidence(BENCHMARK_CAPABILITY, Some(ProviderId::Tdx), message)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -175,6 +725,13 @@ fn validate_benchmark_request(
 ) -> Result<(), BenchmarkError> {
     validate_instrument(registry, &request.instrument)?;
     validate_range(&request.range)
+}
+
+pub(super) fn validate_production_benchmark_request(
+    request: &BenchmarkRequest,
+) -> Result<(), GatewayError> {
+    validate_benchmark_request(&BenchmarkRegistry::production_default(), request)
+        .map_err(benchmark_admission_error)
 }
 
 fn validate_instrument(
@@ -619,7 +1176,7 @@ fn verified_benchmark_coverage(
     }
 }
 
-fn canonical_base_request_hash(request: &BenchmarkRequest) -> String {
+pub(super) fn canonical_base_request_hash(request: &BenchmarkRequest) -> String {
     let category = match request.range {
         BenchmarkRange::Daily { .. } => TDX_DAILY_CATEGORY,
         BenchmarkRange::Minute1 { .. } => TDX_MINUTE1_CATEGORY,
@@ -852,8 +1409,8 @@ fn fetch_and_admit_benchmark_batch(
             })?;
     }
 
+    let request_hash = canonical_base_request_hash(&request);
     let canonical_bytes = canonical_acquisition_bytes(&request, category, &pages)?;
-    let request_hash = domain_hash(b"BR251_TDX_INDEX_REQUEST_V1\0", &canonical_bytes);
     let batch_id = domain_hash(b"BR251_TDX_INDEX_BATCH_V1\0", &canonical_bytes);
 
     let mut selected = Vec::new();
@@ -1169,18 +1726,22 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    use chrono::{DateTime, Datelike, FixedOffset, NaiveDate};
+    use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, Utc};
     use diesel::prelude::*;
     use diesel::sql_types::{Integer, Text};
     use serial_test::serial;
 
     use super::{
-        acquire_benchmark_batch_from_source, admit_benchmark_batch, BenchmarkAdmissionCoverage,
-        BenchmarkBar, BenchmarkBarTime, BenchmarkError, BenchmarkProviderAttestation,
-        BenchmarkRange, BenchmarkRegistry, BenchmarkRequest, BenchmarkUnsupported, IndexBarsSource,
-        IndexPageRequest, RawIndexBar, HS300_CANONICAL,
+        acquire_benchmark_batch_from_source, admit_benchmark_batch,
+        admit_benchmark_grpc_wire_for_test, canonical_base_request_hash,
+        BenchmarkAdmissionCoverage, BenchmarkBar, BenchmarkBarTime, BenchmarkError,
+        BenchmarkEvidenceWire, BenchmarkGrpcResponseWire, BenchmarkProviderAttestation,
+        BenchmarkRange, BenchmarkRegistry, BenchmarkRequest, BenchmarkUnsupported,
+        BenchmarkWireTime, IndexBarsSource, IndexPageRequest, RawIndexBar, HS300_CANONICAL,
     };
-    use crate::data_gateway::GatewayError;
+    use crate::data_gateway::review::AuditedBenchmarkBatch;
+    use crate::data_gateway::{BatchEvidence, GatewayBatch, GatewayError};
+    use crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt;
     use crate::database::DatabaseManager;
 
     #[derive(Debug, QueryableByName)]
@@ -1229,6 +1790,186 @@ mod tests {
 
     fn test_registry() -> BenchmarkRegistry {
         BenchmarkRegistry::test_only(["TEST_CODE_000300"])
+    }
+
+    #[test]
+    fn benchmark_grpc_wire_roundtrips_request_evidence_receipt_and_absent_source_time() {
+        let trading_day = date(21);
+        let request = daily_request(trading_day, trading_day, "TEST_CODE_000300");
+        let expected_bar = BenchmarkBar {
+            amount: Some(8_000.0),
+            ..bar(BenchmarkBarTime::Daily(trading_day))
+        };
+        let audited = AuditedBenchmarkBatch {
+            batch: GatewayBatch::Available {
+                records: vec![expected_bar.clone()],
+                evidence: BatchEvidence {
+                    provider: crate::magic_compat::ProviderId::Tdx,
+                    source: "TEST_CODE_magic-tdx-index-bars".to_owned(),
+                    source_at: None,
+                    observed_at: "2026-08-21T15:01:00+08:00".to_owned(),
+                    batch_id: "TEST_CODE_benchmark_batch".to_owned(),
+                },
+            },
+            receipt: DataAcquisitionAuditReceipt {
+                audit_id: 17,
+                record_hash: "a".repeat(64),
+                previous_outcome: None,
+                current_outcome: "available".to_owned(),
+            },
+            request_hash: canonical_base_request_hash(&request),
+        };
+
+        let wire = BenchmarkGrpcResponseWire::from_audited(&request, &audited)
+            .expect("source-backed TEST_CODE batch has a complete wire view");
+        assert_eq!(wire.request.granularity, super::BenchmarkGranularity::Daily);
+        assert_eq!(
+            wire.bars[0].at,
+            BenchmarkWireTime::Daily {
+                year: 2026,
+                month: 8,
+                day: 21,
+            }
+        );
+        assert_eq!(wire.bars[0].volume, None);
+        assert_eq!(wire.bars[0].amount, Some(8_000.0));
+        assert_eq!(wire.evidence.source_at, None);
+
+        let roundtrip = admit_benchmark_grpc_wire_for_test(
+            &request,
+            wire,
+            BenchmarkAdmissionCoverage::Daily {
+                authoritative_trading_days: &[trading_day],
+            },
+            minute("2026-08-21T15:01:01+08:00").with_timezone(&Utc),
+        )
+        .expect("client re-admission preserves the server batch and receipt");
+        assert_eq!(roundtrip.batch.records(), &[expected_bar]);
+        assert_eq!(roundtrip.batch.evidence().source_at, None);
+        assert_eq!(roundtrip.receipt, audited.receipt);
+    }
+
+    #[test]
+    fn benchmark_evidence_freshness_uses_verified_a_share_trading_days() {
+        let evidence_at = |observed_at: &str| BenchmarkEvidenceWire {
+            provider: "Tdx".to_owned(),
+            source: "TEST_CODE verified historical acquisition".to_owned(),
+            source_at: None,
+            observed_at: observed_at.to_owned(),
+            batch_id: "TEST_CODE benchmark freshness".to_owned(),
+        };
+        let consumer_at = |value: &str| {
+            DateTime::parse_from_rfc3339(value)
+                .expect("TEST_CODE consumer time")
+                .with_timezone(&Utc)
+        };
+
+        for (label, observed_at, consumer_now) in [
+            (
+                "one trading-day boundary",
+                "2026-08-24T15:01:00+08:00",
+                "2026-08-25T15:01:00+08:00",
+            ),
+            (
+                "weekend boundary",
+                "2026-08-21T15:01:00+08:00",
+                "2026-08-23T15:01:00+08:00",
+            ),
+            (
+                "National Day exchange-holiday boundary",
+                "2026-09-30T15:01:00+08:00",
+                "2026-10-08T15:01:00+08:00",
+            ),
+        ] {
+            let admitted = evidence_at(observed_at)
+                .to_evidence_at(consumer_at(consumer_now))
+                .unwrap_or_else(|error| panic!("{label} must remain fresh: {error}"));
+            assert_eq!(admitted.source_at, None, "{label}");
+        }
+
+        for (label, observed_at, consumer_now) in [
+            (
+                "two ordinary trading days",
+                "2026-08-21T15:01:00+08:00",
+                "2026-08-25T15:01:00+08:00",
+            ),
+            (
+                "two trading days across National Day",
+                "2026-09-30T15:01:00+08:00",
+                "2026-10-09T15:01:00+08:00",
+            ),
+        ] {
+            let error = evidence_at(observed_at)
+                .to_evidence_at(consumer_at(consumer_now))
+                .expect_err("more than one verified trading day must be stale");
+            assert_eq!(error.audit_outcome(), "stale", "{label}");
+            assert_eq!(error.reason_code(), "benchmark_evidence_stale", "{label}");
+            assert!(error.retryable(), "{label}");
+        }
+    }
+
+    #[test]
+    fn benchmark_grpc_wire_preserves_minute_components_granularity_and_nullable_amount() {
+        let at = minute("2026-08-21T09:31:00+08:00");
+        let request = minute_request(at, at);
+        let expected_bar = BenchmarkBar {
+            at: BenchmarkBarTime::MinuteEnd(at),
+            open: 3_500.0,
+            high: 3_510.0,
+            low: 3_490.0,
+            close: 3_505.0,
+            volume: Some(123.0),
+            amount: None,
+        };
+        let audited = AuditedBenchmarkBatch {
+            batch: GatewayBatch::Available {
+                records: vec![expected_bar.clone()],
+                evidence: BatchEvidence {
+                    provider: crate::magic_compat::ProviderId::Tdx,
+                    source: "TEST_CODE_magic-tdx-index-bars".to_owned(),
+                    source_at: None,
+                    observed_at: "2026-08-21T09:31:01+08:00".to_owned(),
+                    batch_id: "TEST_CODE_benchmark_minute_batch".to_owned(),
+                },
+            },
+            receipt: DataAcquisitionAuditReceipt {
+                audit_id: 18,
+                record_hash: "b".repeat(64),
+                previous_outcome: Some("available".to_owned()),
+                current_outcome: "available".to_owned(),
+            },
+            request_hash: canonical_base_request_hash(&request),
+        };
+
+        let wire = BenchmarkGrpcResponseWire::from_audited(&request, &audited)
+            .expect("complete TEST_CODE minute wire");
+        assert_eq!(
+            wire.request.granularity,
+            super::BenchmarkGranularity::Minute1
+        );
+        assert_eq!(
+            wire.bars[0].at,
+            BenchmarkWireTime::Minute1 {
+                year: 2026,
+                month: 8,
+                day: 21,
+                hour: 9,
+                minute: 31,
+                utc_offset_seconds: 8 * 60 * 60,
+            }
+        );
+        assert_eq!(wire.bars[0].volume, Some(123.0));
+        assert_eq!(wire.bars[0].amount, None);
+
+        let roundtrip = admit_benchmark_grpc_wire_for_test(
+            &request,
+            wire,
+            BenchmarkAdmissionCoverage::Minute1,
+            minute("2026-08-21T15:01:01+08:00").with_timezone(&Utc),
+        )
+        .expect("client re-admits the complete minute wire");
+        assert_eq!(roundtrip.batch.records(), &[expected_bar]);
+        assert_eq!(roundtrip.receipt, audited.receipt);
     }
 
     fn assert_failed_integrity(result: Result<super::AdmittedBenchmarkBatch, BenchmarkError>) {
@@ -1732,6 +2473,7 @@ mod tests {
     #[test]
     #[serial]
     fn audit_persists_benchmark_outcome_independently_from_retryability() {
+        let _env = super::super::grpc_source::test_grpc_env_guard();
         DatabaseManager::init(None).expect("TEST_CODE audit database init");
         let day = date(21);
         let empty_source = TestIndexBarsSource::new(vec![]);
@@ -1895,7 +2637,7 @@ mod tests {
         let changed_row = acquire("TEST_CODE_000300", amount_changed);
         let changed_instrument = acquire("TEST_CODE_ALT", base.clone());
 
-        assert_ne!(first.request_hash, changed_row.request_hash);
+        assert_eq!(first.request_hash, changed_row.request_hash);
         assert_ne!(
             first.batch.evidence().batch_id,
             changed_row.batch.evidence().batch_id
@@ -1914,7 +2656,7 @@ mod tests {
             )
             .expect("TEST_CODE canonical identity");
             (
-                super::domain_hash(b"BR251_TDX_INDEX_REQUEST_V1\0", &canonical),
+                super::canonical_base_request_hash(&request),
                 super::domain_hash(b"BR251_TDX_INDEX_BATCH_V1\0", &canonical),
             )
         };
@@ -1934,9 +2676,26 @@ mod tests {
             },
         ] {
             let changed_identity = canonical_identity(changed);
-            assert_ne!(base_identity.0, changed_identity.0);
+            assert_eq!(base_identity.0, changed_identity.0);
             assert_ne!(base_identity.1, changed_identity.1);
         }
+        let next_day = day.succ_opt().expect("TEST_CODE next day");
+        let base_request = daily_request(day, day, "TEST_CODE_000300");
+        let changed_range_request = daily_request(day, next_day, "TEST_CODE_000300");
+        let changed_range_canonical = super::canonical_acquisition_bytes(
+            &changed_range_request,
+            super::TDX_DAILY_CATEGORY,
+            &[(0, vec![base.clone()])],
+        )
+        .expect("TEST_CODE changed-range canonical identity");
+        assert_ne!(
+            super::canonical_base_request_hash(&base_request),
+            super::canonical_base_request_hash(&changed_range_request)
+        );
+        assert_ne!(
+            base_identity.1,
+            super::domain_hash(b"BR251_TDX_INDEX_BATCH_V1\0", &changed_range_canonical)
+        );
         assert!(first
             .batch
             .evidence()
@@ -2063,6 +2822,77 @@ mod tests {
             "benchmark_time_semantics_unavailable"
         );
         assert!(source.offsets().is_empty());
+    }
+
+    #[test]
+    fn invalid_ranges_fail_before_provider_source_access() {
+        let day = NaiveDate::from_ymd_opt(2026, 8, 21).expect("TEST_CODE date");
+        let source = TestIndexBarsSource::new(vec![]);
+        let reversed = daily_request(
+            day,
+            day.pred_opt().expect("TEST_CODE previous day"),
+            "TEST_CODE_000300",
+        );
+        let off_grid = minute_request(
+            minute("2026-08-21T09:31:30+08:00"),
+            minute("2026-08-21T09:32:00+08:00"),
+        );
+
+        for (request, coverage, expected_reason) in [
+            (
+                reversed,
+                BenchmarkAdmissionCoverage::Daily {
+                    authoritative_trading_days: &[],
+                },
+                "benchmark_range_reversed",
+            ),
+            (
+                off_grid,
+                BenchmarkAdmissionCoverage::Minute1,
+                "benchmark_minute_range_off_grid",
+            ),
+        ] {
+            let error = acquire_benchmark_batch_from_source(
+                &source,
+                request,
+                &test_registry(),
+                BenchmarkProviderAttestation::test_only(true, true),
+                coverage,
+                "2026-08-21T15:01:00+08:00",
+            )
+            .expect_err("invalid request must fail before provider access");
+            assert_eq!(error.audit_outcome(), "invalid_request");
+            assert_eq!(error.reason_code(), expected_reason);
+            assert!(!error.retryable());
+        }
+        assert!(
+            source.offsets().is_empty(),
+            "invalid request must not call the provider source"
+        );
+    }
+
+    #[test]
+    fn pure_nanosecond_minute_request_fails_before_provider_access() {
+        let source = TestIndexBarsSource::new(vec![]);
+        let request = minute_request(
+            minute("2026-08-21T09:31:00.000000001+08:00"),
+            minute("2026-08-21T09:32:00+08:00"),
+        );
+
+        let error = acquire_benchmark_batch_from_source(
+            &source,
+            request,
+            &test_registry(),
+            BenchmarkProviderAttestation::test_only(true, true),
+            BenchmarkAdmissionCoverage::Minute1,
+            "2026-08-21T15:01:00+08:00",
+        )
+        .expect_err("pure nanosecond off-grid request must fail before provider access");
+
+        assert_eq!(error.audit_outcome(), "invalid_request");
+        assert_eq!(error.reason_code(), "benchmark_minute_range_off_grid");
+        assert!(!error.retryable());
+        assert_eq!(source.offsets(), Vec::<u32>::new());
     }
 
     #[test]

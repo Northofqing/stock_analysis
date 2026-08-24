@@ -1905,6 +1905,10 @@ impl ReviewDataGateway {
 - 修改：`src/data_gateway/grpc_source.rs`
 - 修改：`src/data_gateway/grpc_source/convert.rs`
 - 修改：`src/data_gateway/benchmark.rs`
+- 修改：`src/data_gateway/review.rs`（仅修改既有 `benchmark_bars` 的桥选择；receipt helper 不动）
+- 修改：`src/grpc_client/client.rs`（仅同步生成 trait 的 TEST_CODE mock 方法；不改生产路由）
+- 修改：`src/data_gateway/board_runtime.rs`（仅让 no-default 测试复用唯一 gRPC env/cache RAII guard；不改 board 业务逻辑）
+- 修改：`src/database/data_acquisition_audit.rs`（仅增加 BR-159 单笔回执与整链/事实绑定的只读核验；不迁移、不改写审计表）
 
 - [ ] 先写合同失败测试：枚举上界 62、implemented 数量 40、schema 全覆盖、handler 方法存在、
   `HOOKED_OPS` 与 `bridge_for("BenchmarkBars")` 调用点一致。
@@ -1918,7 +1922,38 @@ impl ReviewDataGateway {
 - [ ] client converter 重建强类型批次并再次运行整批准入；任何缺字段、unknown provider、
   identity/range 不一致返回 typed error，不自行解释/补值。
 - [ ] `ReviewDataGateway::benchmark_bars` 在桥已配置时只走 gRPC，桥失败 terminal；未配置时
-  才走 library。两条路径最终都只追加一次客户端 BR-159 receipt。
+  才走 library。所有终止结果必须有审计所有者，禁止因为避免双写而留下零审计。
+- [ ] 审计分层裁定：library 路径沿用 `benchmark_bars_library` 的唯一 provider acquisition
+  BR-159 append；gRPC 成功由 server 同一 seam 追加并回传真实 receipt，client 完整准入后复用，
+  禁止再造第二条 provider acquisition。server 未接收请求的本地禁用/连接失败由 client 追加唯一
+  transport audit；只有通过专用 typed failure marker 或完整验证的 server receipt 才能标记
+  `ServerHandled`，未验证 envelope、缺失/畸形 receipt、无法确认 server 是否处理的响应一律记录
+  `transport_outcome_unknown`，不能冒充 provider 成败。server receipt 已验证但 client evidence/批次
+  准入又拒绝时，保留 provider 原事实，并以独立 `BenchmarkBarsGrpcConsumerAdmission` capability
+  追加 consumer rejection；provider、transport、consumer 三层事实使用不同 capability 和稳定请求身份，
+  任一终止路径不得零审计。
+- [ ] benchmark failure wire 的 reason/outcome/retryable 必须覆盖 server 所有可达闭集，包括
+  `provider_transport`、`blocking_task_failed` 与 `acquisition_audit_unavailable`；owner 只由专用 marker/
+  receipt 验证决定，禁止从 reason 文本推断。Minute1 负向测试须分别覆盖纯秒与纯纳秒 off-grid，
+  并断言 provider/transport 调用数均为 0。
+- [ ] fix round 3 不再接受“ID 为正、hash 为 64 位十六进制”的形式核验。成功回执必须在同一
+  数据库快照内先验证完整 BR-159 链，再按 `audit_id` 精确核对 chain hash、BenchmarkBars/Tdx、
+  canonical request hash、source/source_at/observed_at/batch_id、请求/接受/拒绝计数、outcome/
+  reason/retryable 与 wire evidence；任一不符归 `OutcomeUnknown` 并由 client 追加唯一 transport
+  失败事实。server 自身审计 append 失败必须由独立 typed audit state 表达，并由 client 持久化
+  唯一失败事实，禁止从 reason 字符串推断、禁止零审计。server failure 只允许 server 可达的
+  精确 `(outcome, reason, retryable, audit_state)` 闭集；client-only reason 或非法组合一律 unknown。
+- [ ] fix round 4 将 caller 可独立重算的 canonical request identity 与 provider 原始分页/content
+  identity 分开：BR-159 `request_hash` 必须只由当前 `BenchmarkRequest`、TDX 协议参数与固定依赖
+  revision 决定，client 从 `expected_request` 独立重算并与 wire/真实审计行核对；原始 pages/rows
+  （含未投影字段）继续由独立 `batch_id` hash 绑定，禁止丢失 Task 24 原始证据。请求 A 的真实
+  receipt/evidence/hash 重放到请求 B 时，无论 B bars 合法或 OHLC 非法，都必须先归
+  `OutcomeUnknown` 并仅追加 1 条 transport 失败事实。所有读取/计数同一全局审计 DB 的测试必须
+  共用同一个 poison-safe RAII guard，并在默认并行测试中稳定通过。
+- [ ] evidence 除 `source_at <= observed_at <= consumer clock + 2s` 外，还须按不可变 A 股交易日历
+  执行 daily/historical 最多落后 1 个交易日的新鲜度门；覆盖周末/节假日边界，`source_at=None`
+  仍保持缺失。所有会改写 `DATA_GATEWAY_GRPC*`、`GRPC_MARKET_ADDR`、bundle 路径或 bridge cache
+  的测试（含 no-default board runtime）必须复用唯一、poison-safe 的 RAII guard，并覆盖 panic 后恢复。
 - [ ] 运行：`cargo test grpc_contract grpc_server data_gateway::grpc_source --all-features -- --test-threads=1`、
   `cargo build --no-default-features --bin monitor`、`cargo build --bin grpc_market_server`。
 - [ ] 提交：`git commit -m "feat: 增加历史基准gRPC合同"`。

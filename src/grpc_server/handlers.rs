@@ -112,6 +112,48 @@ impl DataService {
                         detail.encode_to_vec().into(), // Bytes (tonic 0.14)
                     )
                 }
+                delegate::DelegateError::BenchmarkFetch {
+                    failure,
+                    audit_outcome,
+                    audit_state,
+                } => {
+                    let exact_server_failure = failure.provider
+                        == Some(crate::magic_compat::ProviderId::Tdx)
+                        && crate::data_gateway::grpc_source::benchmark_server_failure_is_exact(
+                            audit_outcome,
+                            failure.reason_code,
+                            failure.retryable,
+                            audit_state,
+                        );
+                    let detail = crate::grpc_client::pb::magic::market::v1::BenchmarkErrorDetail {
+                        error: Some(crate::grpc_client::pb::magic::market::v1::ErrorDetail {
+                            request_id: request_id.clone(),
+                            operation: op as i32,
+                            // ErrorDetail.provider has no presence bit: empty means absent only.
+                            // The benchmark client accepts ServerHandled solely for exact `Tdx`;
+                            // empty therefore becomes an unknown transport audit and never invents Tdx.
+                            provider: failure
+                                .provider
+                                .map(|p| format!("{:?}", p))
+                                .unwrap_or_default(),
+                            reason_code: failure.reason_code.to_string(),
+                            retryable: failure.retryable,
+                            ..Default::default()
+                        }),
+                        audit_outcome: audit_outcome.to_string(),
+                        audit_state: if exact_server_failure {
+                            audit_state.as_proto()
+                        } else {
+                            crate::grpc_client::pb::magic::market::v1::BenchmarkAuditState::Unspecified
+                                as i32
+                        },
+                    };
+                    Status::with_details(
+                        tonic::Code::Internal,
+                        format!("历史基准取数失败: {}", failure.message),
+                        detail.encode_to_vec().into(),
+                    )
+                }
             })?;
         response_from_fetched(
             request_id,
@@ -272,6 +314,7 @@ impl_market_data_service!(
     outcome_daily_bars => OutcomeDailyBars,
     upper_limit_pool_review => UpperLimitPoolReview,
     chain_batch => ChainBatch,
+    benchmark_bars => BenchmarkBars,
 );
 
 #[cfg(test)]

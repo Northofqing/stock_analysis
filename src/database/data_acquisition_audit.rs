@@ -212,15 +212,10 @@ fn calculate_record_hash(
     Ok(hex::encode(hasher.finalize()))
 }
 
-pub(super) fn validate_data_acquisition_audit_chain(
-    conn: &mut SqliteConnection,
+fn validate_data_acquisition_audit_chain_rows(
+    audits: &[PersistedAcquisitionAudit],
+    chain: &[AuditChainRow],
 ) -> diesel::QueryResult<String> {
-    // 2026-08-12: 两次 SELECT 包进同一 DEFERRED 事务, 保证同一快照 —
-    // 并发写者 (如回填工具 vs 运行中 monitor) 在两次读取之间提交时,
-    // 裸 SELECT 会看到 audit/chain 各一瞬, 误报 length mismatch。
-    let (audits, chain) = conn.transaction::<_, diesel::result::Error, _>(|conn| {
-        Ok((load_audit_rows(conn)?, load_chain_rows(conn)?))
-    })?;
     if audits.len() != chain.len() {
         return Err(audit_error(format!(
             "BR-159 acquisition audit hash chain length mismatch: audit_rows={}, chain_rows={}",
@@ -250,6 +245,73 @@ pub(super) fn validate_data_acquisition_audit_chain(
         previous = evidence.record_hash.clone();
     }
     Ok(previous)
+}
+
+pub(super) fn validate_data_acquisition_audit_chain(
+    conn: &mut SqliteConnection,
+) -> diesel::QueryResult<String> {
+    // 2026-08-12: 两次 SELECT 包进同一 DEFERRED 事务, 保证同一快照 —
+    // 并发写者 (如回填工具 vs 运行中 monitor) 在两次读取之间提交时,
+    // 裸 SELECT 会看到 audit/chain 各一瞬, 误报 length mismatch。
+    let (audits, chain) = conn.transaction::<_, diesel::result::Error, _>(|conn| {
+        Ok((load_audit_rows(conn)?, load_chain_rows(conn)?))
+    })?;
+    validate_data_acquisition_audit_chain_rows(&audits, &chain)
+}
+
+fn verify_data_acquisition_receipt_snapshot(
+    audits: &[PersistedAcquisitionAudit],
+    chain: &[AuditChainRow],
+    receipt: &DataAcquisitionAuditReceipt,
+    expected: &DataAcquisitionAuditRecord<'_>,
+) -> diesel::QueryResult<()> {
+    validate_record(expected).map_err(audit_error)?;
+    validate_data_acquisition_audit_chain_rows(audits, chain)?;
+    let Some((position, audit)) = audits
+        .iter()
+        .enumerate()
+        .find(|(_, audit)| audit.id == receipt.audit_id)
+    else {
+        return Err(audit_error(format!(
+            "BR-159 acquisition receipt references missing audit id {}",
+            receipt.audit_id
+        )));
+    };
+    let evidence = chain
+        .get(position)
+        .ok_or_else(|| audit_error("BR-159 acquisition receipt has no chain row"))?;
+    let previous_outcome = audits[..position]
+        .iter()
+        .rev()
+        .find(|candidate| {
+            candidate.capability == audit.capability && candidate.provider == audit.provider
+        })
+        .map(|candidate| candidate.outcome.as_str());
+    let expected_retryable = i32::from(expected.retryable);
+    let facts_match = audit.capability == expected.capability
+        && audit.provider == expected.provider
+        && audit.source == expected.source
+        && audit.request_hash == expected.request_hash
+        && audit.source_at.as_deref() == expected.source_at
+        && audit.observed_at == expected.observed_at
+        && audit.batch_id.as_deref() == expected.batch_id
+        && audit.outcome == expected.outcome
+        && audit.request_count == expected.request_count
+        && audit.accepted_count == expected.accepted_count
+        && audit.rejected_count == expected.rejected_count
+        && audit.reason_code == expected.reason_code
+        && audit.retryable == expected_retryable;
+    let receipt_matches = evidence.acquisition_audit_id == receipt.audit_id
+        && evidence.record_hash == receipt.record_hash
+        && previous_outcome == receipt.previous_outcome.as_deref()
+        && audit.outcome == receipt.current_outcome;
+    if !facts_match || !receipt_matches {
+        return Err(audit_error(format!(
+            "BR-159 acquisition receipt does not bind the expected audit facts at id {}",
+            receipt.audit_id
+        )));
+    }
+    Ok(())
 }
 
 fn validate_data_acquisition_audit_tail(
@@ -446,6 +508,24 @@ impl DatabaseManager {
             insert_acquisition_audit_query(conn, record)
         })
         .map_err(|error| format!("BR-159 acquisition audit append: {error}"))
+    }
+
+    /// Verify a remotely supplied receipt against the immutable local BR-159
+    /// audit and hash-chain rows without creating or changing audit state.
+    pub(crate) fn verify_data_acquisition_receipt(
+        &self,
+        receipt: &DataAcquisitionAuditReceipt,
+        expected: &DataAcquisitionAuditRecord<'_>,
+    ) -> Result<(), String> {
+        let mut conn = self
+            .get_conn()
+            .map_err(|error| format!("BR-159 acquisition receipt DB connection: {error}"))?;
+        conn.transaction::<_, diesel::result::Error, _>(|conn| {
+            let audits = load_audit_rows(conn)?;
+            let chain = load_chain_rows(conn)?;
+            verify_data_acquisition_receipt_snapshot(&audits, &chain, receipt, expected)
+        })
+        .map_err(|error| format!("BR-159 acquisition receipt verification: {error}"))
     }
 }
 

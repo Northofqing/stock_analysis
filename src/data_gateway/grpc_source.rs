@@ -11,6 +11,12 @@
 //! Handle::block_on; 纯同步线程 → 静态 BRIDGE_RUNTIME。
 pub mod convert;
 
+// BR-251 server/client share this exact wire model without exposing the private
+// benchmark acquisition module as a general construction API.
+#[cfg(any(feature = "magic-gateway", test))]
+pub(crate) use super::benchmark::BenchmarkGrpcResponseWire;
+pub(crate) use super::benchmark::BenchmarkRequestWire;
+
 use crate::data_gateway::market_capabilities::MarketSecurityIdentity;
 use crate::data_gateway::outcome_daily_bars::{OutcomeTransportFailure, RawOutcomeFetch};
 use crate::data_gateway::{
@@ -35,6 +41,7 @@ use crate::magic_compat::{
 };
 use crate::magic_compat::{LimitPoolEntry, LimitPoolKind, ProviderId};
 use chrono::{DateTime, FixedOffset, NaiveDate};
+use prost::Message;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -53,6 +60,551 @@ const DEFAULT_ADDR: &str = "http://127.0.0.1:18082";
 /// 客户端 tonic deadline (client.rs .timeout(35s)) 对齐; 慢查询失败语义不变
 /// (fail-closed, retryable)。
 const GRPC_BRIDGE_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BenchmarkGrpcOwnership {
+    ServerHandled,
+    ServerAuditAppendFailed,
+    ClientBeforeSend,
+    OutcomeUnknown,
+    ConsumerAdmissionRejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchmarkServerAuditState {
+    Persisted,
+    AppendFailed,
+}
+
+impl BenchmarkServerAuditState {
+    pub(crate) const fn as_proto(self) -> i32 {
+        match self {
+            Self::Persisted => {
+                crate::grpc_client::pb::magic::market::v1::BenchmarkAuditState::Persisted as i32
+            }
+            Self::AppendFailed => {
+                crate::grpc_client::pb::magic::market::v1::BenchmarkAuditState::AppendFailed as i32
+            }
+        }
+    }
+
+    fn from_proto(value: i32) -> Option<Self> {
+        match crate::grpc_client::pb::magic::market::v1::BenchmarkAuditState::try_from(value)
+            .ok()?
+        {
+            crate::grpc_client::pb::magic::market::v1::BenchmarkAuditState::Persisted => {
+                Some(Self::Persisted)
+            }
+            crate::grpc_client::pb::magic::market::v1::BenchmarkAuditState::AppendFailed => {
+                Some(Self::AppendFailed)
+            }
+            crate::grpc_client::pb::magic::market::v1::BenchmarkAuditState::Unspecified => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BenchmarkServerFailureSpec {
+    audit_outcome: &'static str,
+    reason_code: &'static str,
+    retryable: bool,
+    audit_state: BenchmarkServerAuditState,
+}
+
+const fn benchmark_server_failure_spec(
+    audit_outcome: &'static str,
+    reason_code: &'static str,
+    retryable: bool,
+    audit_state: BenchmarkServerAuditState,
+) -> BenchmarkServerFailureSpec {
+    BenchmarkServerFailureSpec {
+        audit_outcome,
+        reason_code,
+        retryable,
+        audit_state,
+    }
+}
+
+const BENCHMARK_SERVER_FAILURES: &[BenchmarkServerFailureSpec] = &[
+    benchmark_server_failure_spec(
+        "unsupported",
+        "benchmark_instrument_unsupported",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "unsupported",
+        "benchmark_test_identity_rejected",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "invalid_request",
+        "benchmark_range_reversed",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "invalid_request",
+        "benchmark_time_zone_invalid",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "invalid_request",
+        "benchmark_minute_range_crosses_day",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "invalid_request",
+        "benchmark_minute_range_off_grid",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "unavailable",
+        "benchmark_batch_empty",
+        true,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "unavailable",
+        "benchmark_identity_unverified",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "unavailable",
+        "benchmark_time_semantics_unavailable",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "unavailable",
+        "benchmark_trading_calendar_unavailable",
+        true,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "unavailable",
+        "benchmark_trading_calendar_unavailable",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "unavailable",
+        "provider_transport",
+        true,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "unavailable",
+        "blocking_task_failed",
+        true,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "partial",
+        "provider_transport",
+        true,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "partial",
+        "benchmark_ohlc_not_positive_finite",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "partial",
+        "benchmark_ohlc_inconsistent",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "partial",
+        "benchmark_turnover_not_finite_nonnegative",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "partial",
+        "benchmark_bar_granularity_mismatch",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "partial",
+        "benchmark_bar_outside_range",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "partial",
+        "benchmark_bar_order_or_duplicate",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "partial",
+        "benchmark_coverage_kind_mismatch",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "partial",
+        "benchmark_authoritative_days_invalid",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "partial",
+        "benchmark_daily_coverage_incomplete",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "partial",
+        "benchmark_minute_bar_invalid",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "partial",
+        "benchmark_minute_coverage_incomplete",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "partial",
+        "benchmark_page_empty_before_range",
+        true,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "partial",
+        "benchmark_page_size_invalid",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "partial",
+        "benchmark_page_order_or_duplicate",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "partial",
+        "benchmark_page_did_not_advance",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "partial",
+        "benchmark_page_boundary_did_not_advance",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "partial",
+        "benchmark_short_page_before_range",
+        true,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "partial",
+        "benchmark_page_offset_overflow",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "partial",
+        "benchmark_raw_time_invalid",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "partial",
+        "benchmark_datetime_conflict",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "partial",
+        "benchmark_canonical_identity_unavailable",
+        false,
+        BenchmarkServerAuditState::Persisted,
+    ),
+    benchmark_server_failure_spec(
+        "unavailable",
+        "acquisition_audit_unavailable",
+        true,
+        BenchmarkServerAuditState::AppendFailed,
+    ),
+];
+
+fn exact_benchmark_server_failure(
+    audit_outcome: &str,
+    reason_code: &str,
+    retryable: bool,
+    audit_state: BenchmarkServerAuditState,
+) -> Option<BenchmarkServerFailureSpec> {
+    BENCHMARK_SERVER_FAILURES.iter().copied().find(|spec| {
+        spec.audit_outcome == audit_outcome
+            && spec.reason_code == reason_code
+            && spec.retryable == retryable
+            && spec.audit_state == audit_state
+    })
+}
+
+pub(crate) fn benchmark_server_failure_is_exact(
+    audit_outcome: &str,
+    reason_code: &str,
+    retryable: bool,
+    audit_state: BenchmarkServerAuditState,
+) -> bool {
+    exact_benchmark_server_failure(audit_outcome, reason_code, retryable, audit_state).is_some()
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BenchmarkGrpcFailure {
+    error: GatewayError,
+    ownership: BenchmarkGrpcOwnership,
+    verified_receipt:
+        Option<Box<crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt>>,
+}
+
+impl BenchmarkGrpcFailure {
+    pub(crate) const fn client_before_send(error: GatewayError) -> Self {
+        Self {
+            error,
+            ownership: BenchmarkGrpcOwnership::ClientBeforeSend,
+            verified_receipt: None,
+        }
+    }
+
+    fn server_handled(error: GatewayError) -> Self {
+        Self {
+            error,
+            ownership: BenchmarkGrpcOwnership::ServerHandled,
+            verified_receipt: None,
+        }
+    }
+
+    fn server_audit_append_failed(error: GatewayError) -> Self {
+        Self {
+            error,
+            ownership: BenchmarkGrpcOwnership::ServerAuditAppendFailed,
+            verified_receipt: None,
+        }
+    }
+
+    fn outcome_unknown(error: GatewayError) -> Self {
+        Self {
+            error,
+            ownership: BenchmarkGrpcOwnership::OutcomeUnknown,
+            verified_receipt: None,
+        }
+    }
+
+    fn consumer_admission(
+        error: GatewayError,
+        receipt: crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt,
+    ) -> Self {
+        Self {
+            error,
+            ownership: BenchmarkGrpcOwnership::ConsumerAdmissionRejected,
+            verified_receipt: Some(Box::new(receipt)),
+        }
+    }
+
+    pub(crate) const fn ownership(&self) -> BenchmarkGrpcOwnership {
+        self.ownership
+    }
+
+    pub(crate) fn into_error(self) -> GatewayError {
+        self.error
+    }
+
+    pub(crate) const fn has_verified_receipt(&self) -> bool {
+        self.verified_receipt.is_some()
+    }
+}
+
+impl std::ops::Deref for BenchmarkGrpcFailure {
+    type Target = GatewayError;
+
+    fn deref(&self) -> &Self::Target {
+        &self.error
+    }
+}
+
+fn benchmark_transport_error(
+    audit_outcome: &'static str,
+    reason_code: &'static str,
+    retryable: bool,
+    message: impl Into<String>,
+) -> GatewayError {
+    GatewayError::classified(
+        "GrpcBridge",
+        None,
+        audit_outcome,
+        reason_code,
+        retryable,
+        message,
+    )
+}
+
+fn local_benchmark_failure(error: GatewayError) -> BenchmarkGrpcFailure {
+    BenchmarkGrpcFailure::client_before_send(error)
+}
+
+fn unknown_benchmark_transport_failure() -> BenchmarkGrpcFailure {
+    BenchmarkGrpcFailure::outcome_unknown(benchmark_transport_error(
+        "unavailable",
+        "transport_outcome_unknown",
+        true,
+        "BenchmarkBars RPC outcome cannot be attributed to a verified server audit",
+    ))
+}
+
+fn classify_benchmark_status(request_id: &str, status: tonic::Status) -> BenchmarkGrpcFailure {
+    let Ok(detail) =
+        crate::grpc_client::pb::magic::market::v1::BenchmarkErrorDetail::decode(status.details())
+    else {
+        return unknown_benchmark_transport_failure();
+    };
+    let Some(error_detail) = detail.error else {
+        return unknown_benchmark_transport_failure();
+    };
+    let Some(audit_state) = BenchmarkServerAuditState::from_proto(detail.audit_state) else {
+        return unknown_benchmark_transport_failure();
+    };
+    let Some(spec) = exact_benchmark_server_failure(
+        &detail.audit_outcome,
+        &error_detail.reason_code,
+        error_detail.retryable,
+        audit_state,
+    ) else {
+        return unknown_benchmark_transport_failure();
+    };
+    if status.code() != tonic::Code::Internal
+        || error_detail.request_id != request_id
+        || error_detail.operation != Operation::BenchmarkBars as i32
+        || error_detail.provider != "Tdx"
+    {
+        return unknown_benchmark_transport_failure();
+    }
+    let error = GatewayError::classified(
+        "GrpcBridge",
+        Some(ProviderId::Tdx),
+        spec.audit_outcome,
+        spec.reason_code,
+        spec.retryable,
+        "BenchmarkBars server returned a verified typed provider failure",
+    );
+    match audit_state {
+        BenchmarkServerAuditState::Persisted => BenchmarkGrpcFailure::server_handled(error),
+        BenchmarkServerAuditState::AppendFailed => {
+            BenchmarkGrpcFailure::server_audit_append_failed(error)
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn benchmark_typed_failure_for_test(error: GatewayError) -> BenchmarkGrpcFailure {
+    benchmark_typed_failure_with_state_for_test(error, BenchmarkServerAuditState::Persisted)
+}
+
+#[cfg(test)]
+pub(crate) fn benchmark_typed_failure_with_state_for_test(
+    error: GatewayError,
+    audit_state: BenchmarkServerAuditState,
+) -> BenchmarkGrpcFailure {
+    let request_id = "TEST_CODE_benchmark_typed_failure";
+    let provider = error
+        .provider()
+        .map(|provider| format!("{provider:?}"))
+        // Proto3 scalar strings have no presence bit: empty means absent. This
+        // TEST_CODE helper preserves None so the client fails closed to an
+        // unknown transport audit; it must never fabricate provider Tdx.
+        .unwrap_or_default();
+    let detail = crate::grpc_client::pb::magic::market::v1::BenchmarkErrorDetail {
+        error: Some(crate::grpc_client::pb::magic::market::v1::ErrorDetail {
+            request_id: request_id.to_owned(),
+            operation: Operation::BenchmarkBars as i32,
+            provider,
+            reason_code: error.reason_code().to_owned(),
+            retryable: error.retryable(),
+            ..Default::default()
+        }),
+        audit_outcome: error.audit_outcome().to_owned(),
+        audit_state: audit_state.as_proto(),
+    };
+    classify_benchmark_status(
+        request_id,
+        tonic::Status::with_details(
+            tonic::Code::Internal,
+            "TEST_CODE typed benchmark failure",
+            detail.encode_to_vec().into(),
+        ),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn benchmark_unknown_failure_for_test() -> BenchmarkGrpcFailure {
+    unknown_benchmark_transport_failure()
+}
+
+fn parse_benchmark_query_response(
+    request_id: &str,
+    response: crate::grpc_client::pb::magic::market::v1::QueryResponse,
+) -> Result<QueryResult, BenchmarkGrpcFailure> {
+    crate::grpc_client::envelope::parse_query_response(
+        request_id,
+        Operation::BenchmarkBars,
+        response,
+    )
+    .map_err(|_| unknown_benchmark_transport_failure())
+}
+
+async fn benchmark_bars_with_query<F, Fut>(
+    request: &crate::data_gateway::BenchmarkRequest,
+    query: F,
+) -> Result<crate::data_gateway::review::AuditedBenchmarkBatch, BenchmarkGrpcFailure>
+where
+    F: FnOnce(Value) -> Fut,
+    Fut: std::future::Future<Output = Result<QueryResult, BenchmarkGrpcFailure>>,
+{
+    super::benchmark::validate_production_benchmark_request(request)
+        .map_err(local_benchmark_failure)?;
+    let wire = BenchmarkRequestWire::try_from_request(request).map_err(local_benchmark_failure)?;
+    let params = serde_json::to_value(wire).map_err(|error| {
+        local_benchmark_failure(benchmark_transport_error(
+            "invalid_request",
+            "benchmark_request_serialize_failed",
+            false,
+            format!("BenchmarkBars request serialize failed: {error}"),
+        ))
+    })?;
+    let response = query(params).await?;
+    convert::benchmark_bars(request, &response).map_err(|failure| {
+        let (error, receipt) = failure.into_parts();
+        match receipt {
+            Some(receipt) => BenchmarkGrpcFailure::consumer_admission(error, receipt),
+            None => unknown_benchmark_transport_failure(),
+        }
+    })
+}
+
+#[cfg(test)]
+pub(crate) async fn benchmark_bars_with_test_query(
+    request: &crate::data_gateway::BenchmarkRequest,
+    response: QueryResult,
+) -> Result<crate::data_gateway::review::AuditedBenchmarkBatch, BenchmarkGrpcFailure> {
+    benchmark_bars_with_query(request, |_| std::future::ready(Ok(response))).await
+}
 
 fn production_equity_instrument(code: &str) -> Result<InstrumentId, GatewayError> {
     crate::data_gateway::instrument_identity::resolve_production_equity(code, None)
@@ -381,6 +933,48 @@ fn reason_code_static(s: &str) -> &'static str {
         "provider_unavailable",
         "external_query_rejected",
         "provider_response_invalid",
+        "provider_transport",
+        "blocking_task_failed",
+        "acquisition_audit_unavailable",
+        "benchmark_authoritative_days_invalid",
+        "benchmark_bar_granularity_mismatch",
+        "benchmark_bar_order_or_duplicate",
+        "benchmark_bar_outside_range",
+        "benchmark_batch_empty",
+        "benchmark_canonical_identity_unavailable",
+        "benchmark_coverage_kind_mismatch",
+        "benchmark_daily_coverage_incomplete",
+        "benchmark_datetime_conflict",
+        "benchmark_identity_unverified",
+        "benchmark_instrument_unsupported",
+        "benchmark_minute_bar_invalid",
+        "benchmark_minute_coverage_incomplete",
+        "benchmark_minute_range_crosses_day",
+        "benchmark_minute_range_off_grid",
+        "benchmark_ohlc_inconsistent",
+        "benchmark_ohlc_not_positive_finite",
+        "benchmark_page_boundary_did_not_advance",
+        "benchmark_page_did_not_advance",
+        "benchmark_page_empty_before_range",
+        "benchmark_page_offset_overflow",
+        "benchmark_page_order_or_duplicate",
+        "benchmark_page_size_invalid",
+        "benchmark_range_reversed",
+        "benchmark_raw_time_invalid",
+        "benchmark_short_page_before_range",
+        "benchmark_test_identity_rejected",
+        "benchmark_time_semantics_unavailable",
+        "benchmark_time_zone_invalid",
+        "benchmark_trading_calendar_unavailable",
+        "benchmark_turnover_not_finite_nonnegative",
+        "benchmark_request_envelope_invalid",
+        "benchmark_request_identity_missing",
+        "benchmark_request_serialize_failed",
+        "grpc_address_invalid",
+        "grpc_connect_failed",
+        "grpc_auth_metadata_invalid",
+        "transport_outcome_unknown",
+        "bridge_disabled",
     ];
     KNOWN
         .iter()
@@ -399,6 +993,7 @@ pub const HOOKED_OPS: &[&str] = &[
     "BoardDirectory",
     "BoardFlows",
     "BoardRanking",
+    "BenchmarkBars",
     "Consensus",
     "CorporateActions",
     "DragonTiger",
@@ -450,7 +1045,11 @@ pub fn bridge_for(op: &str) -> Result<Option<Arc<GrpcSource>>, GatewayError> {
         return Ok(None);
     }
     let cell = SOURCE.get_or_init(|| Mutex::new(None));
-    if let Some(source) = cell.lock().unwrap().as_ref() {
+    if let Some(source) = cell
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+    {
         return Ok(Some(source.clone()));
     }
     // 连接是惰性的: 此处只注册桥实例 (连接在首个方法调用 ensure_connected 做,
@@ -463,14 +1062,63 @@ pub fn bridge_for(op: &str) -> Result<Option<Arc<GrpcSource>>, GatewayError> {
             .map(PathBuf::from),
         external_client: AsyncMutex::new(None),
     });
-    *cell.lock().unwrap() = Some(arc.clone());
+    *cell
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(arc.clone());
     Ok(Some(arc))
 }
 
 /// 测试/重置用: 清空桥缓存 (重连)。
 pub fn reset_bridge() {
     if let Some(cell) = SOURCE.get() {
-        *cell.lock().unwrap() = None;
+        *cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+#[cfg(test)]
+static TEST_GRPC_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) struct TestGrpcEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    snapshot: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+#[cfg(test)]
+pub(crate) fn test_grpc_env_guard() -> TestGrpcEnvGuard {
+    const KEYS: &[&str] = &[
+        "DATA_GATEWAY_GRPC",
+        "DATA_GATEWAY_GRPC_DISABLED",
+        "GRPC_MARKET_ADDR",
+        "GRPC_MARKET_CLIENT_BUNDLE",
+    ];
+    let lock = TEST_GRPC_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let snapshot = KEYS
+        .iter()
+        .map(|key| (*key, std::env::var_os(key)))
+        .collect();
+    reset_bridge();
+    TestGrpcEnvGuard {
+        _lock: lock,
+        snapshot,
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestGrpcEnvGuard {
+    fn drop(&mut self) {
+        reset_bridge();
+        for (key, value) in &self.snapshot {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        reset_bridge();
     }
 }
 
@@ -1776,6 +2424,72 @@ impl GrpcSource {
             .map_err(|e| map_query_error(op, &e))
     }
 
+    /// BR-251 has a local-only generated RPC that is intentionally absent from
+    /// `GrpcMarketClient::data_call`: R-13 keeps that production router frozen.
+    /// This narrow client still uses the shared envelope/auth contract and
+    /// returns the server's real BR-159 receipt for client-side re-admission.
+    async fn query_benchmark_op(&self, params: Value) -> Result<QueryResult, BenchmarkGrpcFailure> {
+        let request =
+            crate::grpc_client::envelope::build_query_request(Operation::BenchmarkBars, params)
+                .map_err(|error| {
+                    local_benchmark_failure(benchmark_transport_error(
+                        "invalid_request",
+                        "benchmark_request_envelope_invalid",
+                        false,
+                        format!("BenchmarkBars request envelope rejected: {error}"),
+                    ))
+                })?;
+        let request_id = request
+            .context
+            .as_ref()
+            .map(|context| context.request_id.clone())
+            .ok_or_else(|| {
+                local_benchmark_failure(benchmark_transport_error(
+                    "invalid_request",
+                    "benchmark_request_identity_missing",
+                    false,
+                    "BenchmarkBars request envelope has no request_id",
+                ))
+            })?;
+        let endpoint = tonic::transport::Endpoint::from_shared(self.addr.clone())
+            .map_err(|error| {
+                local_benchmark_failure(benchmark_transport_error(
+                    "invalid_request",
+                    "grpc_address_invalid",
+                    false,
+                    format!("BenchmarkBars gRPC address rejected: {error}"),
+                ))
+            })?
+            .timeout(GRPC_BRIDGE_SYNC_TIMEOUT);
+        let channel = endpoint.connect().await.map_err(|error| {
+            local_benchmark_failure(benchmark_transport_error(
+                "unavailable",
+                "grpc_connect_failed",
+                true,
+                format!(
+                    "BenchmarkBars gRPC server {} unavailable: {error}",
+                    self.addr
+                ),
+            ))
+        })?;
+        let mut client = crate::grpc_client::pb::magic::market::v1::market_data_service_client::MarketDataServiceClient::new(channel);
+        let mut request = tonic::Request::new(request);
+        crate::grpc_client::auth::attach_bearer(&mut request).map_err(|error| {
+            local_benchmark_failure(benchmark_transport_error(
+                "invalid_request",
+                "grpc_auth_metadata_invalid",
+                false,
+                format!("BenchmarkBars bearer metadata rejected: {error}"),
+            ))
+        })?;
+        let response = client
+            .benchmark_bars(request)
+            .await
+            .map_err(|status| classify_benchmark_status(&request_id, status))?
+            .into_inner();
+        parse_benchmark_query_response(&request_id, response)
+    }
+
     async fn ensure_external_connected(&self, operation: Operation) -> Result<(), GatewayError> {
         let mut guard = self.external_client.lock().await;
         if let Some(state) = guard.as_mut() {
@@ -2017,6 +2731,13 @@ impl GrpcSource {
             )
             .await?;
         convert::historical_bars(code, &q)
+    }
+
+    pub(crate) async fn benchmark_bars_async(
+        &self,
+        request: &crate::data_gateway::BenchmarkRequest,
+    ) -> Result<crate::data_gateway::review::AuditedBenchmarkBatch, BenchmarkGrpcFailure> {
+        benchmark_bars_with_query(request, |params| self.query_benchmark_op(params)).await
     }
 
     /// 同步包装。
@@ -2792,10 +3513,10 @@ mod tests {
     use crate::grpc_client::errors::{ErrorDetail, GrpcError};
     use crate::grpc_client::pb::magic::market::v1 as pb;
     use crate::magic_compat::ProviderId;
+    use chrono::TimeZone;
     use prost::Message; // pb::ErrorDetail::encode_to_vec
                         // env 是进程级: 这些测试并行时会互相看到对方的 env (race)。
                         // 共享锁串行化 env 敏感的测试 (M3 全量并行跑时暴露)。
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn br243_sync_context_returns_typed_retryable_timeout() {
@@ -3009,6 +3730,324 @@ mod tests {
         let g = map_query_error(Operation::HistoricalBars, &err);
         assert_eq!(g.reason_code(), "no_verified_batch");
         assert!(g.retryable());
+    }
+
+    #[test]
+    fn benchmark_reason_codes_are_closed_without_internal_folding() {
+        for reason in [
+            "benchmark_instrument_unsupported",
+            "benchmark_test_identity_rejected",
+            "benchmark_range_reversed",
+            "benchmark_identity_unverified",
+            "benchmark_time_semantics_unavailable",
+            "benchmark_trading_calendar_unavailable",
+            "benchmark_page_empty_before_range",
+            "benchmark_ohlc_inconsistent",
+        ] {
+            assert_eq!(reason_code_static(reason), reason, "reason={reason}");
+        }
+    }
+
+    #[test]
+    fn benchmark_transport_ownership_is_explicit_not_reason_derived() {
+        let same_error = GatewayError::classified(
+            "GrpcBridge",
+            None,
+            "unavailable",
+            "provider_transport",
+            true,
+            "TEST_CODE identical taxonomy",
+        );
+        let local = BenchmarkGrpcFailure::client_before_send(same_error.clone());
+        assert_eq!(local.ownership(), BenchmarkGrpcOwnership::ClientBeforeSend);
+        assert_eq!(local.reason_code(), "provider_transport");
+
+        let server = benchmark_typed_failure_for_test(GatewayError::classified(
+            "GrpcBridge",
+            Some(ProviderId::Tdx),
+            "unavailable",
+            "provider_transport",
+            true,
+            "TEST_CODE identical taxonomy with typed provider marker",
+        ));
+        assert_eq!(server.ownership(), BenchmarkGrpcOwnership::ServerHandled);
+        assert_eq!(server.reason_code(), "provider_transport");
+
+        let unknown = classify_benchmark_status(
+            "TEST_CODE_wrong_request",
+            tonic::Status::with_details(
+                tonic::Code::Internal,
+                "TEST_CODE same reason without valid marker",
+                pb::BenchmarkErrorDetail {
+                    error: Some(pb::ErrorDetail {
+                        request_id: "TEST_CODE_different_request".to_owned(),
+                        operation: Operation::BenchmarkBars as i32,
+                        provider: "Tdx".to_owned(),
+                        reason_code: "provider_transport".to_owned(),
+                        retryable: true,
+                        ..Default::default()
+                    }),
+                    audit_outcome: "unavailable".to_owned(),
+                    audit_state: BenchmarkServerAuditState::Persisted.as_proto(),
+                }
+                .encode_to_vec()
+                .into(),
+            ),
+        );
+        assert_eq!(unknown.ownership(), BenchmarkGrpcOwnership::OutcomeUnknown);
+        assert_eq!(unknown.reason_code(), "transport_outcome_unknown");
+    }
+
+    #[test]
+    fn benchmark_typed_server_failures_preserve_outcome_reason_and_retryability() {
+        let request_id = "TEST_CODE_benchmark_request";
+        for spec in BENCHMARK_SERVER_FAILURES {
+            let outcome = spec.audit_outcome;
+            let reason = spec.reason_code;
+            let retryable = spec.retryable;
+            let audit_state = spec.audit_state;
+            let detail = pb::BenchmarkErrorDetail {
+                error: Some(pb::ErrorDetail {
+                    request_id: request_id.to_owned(),
+                    operation: Operation::BenchmarkBars as i32,
+                    provider: "Tdx".to_owned(),
+                    reason_code: reason.to_owned(),
+                    retryable,
+                    ..Default::default()
+                }),
+                audit_outcome: outcome.to_owned(),
+                audit_state: audit_state.as_proto(),
+            };
+            let failure = classify_benchmark_status(
+                request_id,
+                tonic::Status::with_details(
+                    tonic::Code::Internal,
+                    "TEST_CODE typed server failure",
+                    detail.encode_to_vec().into(),
+                ),
+            );
+            let ownership = match audit_state {
+                BenchmarkServerAuditState::Persisted => BenchmarkGrpcOwnership::ServerHandled,
+                BenchmarkServerAuditState::AppendFailed => {
+                    BenchmarkGrpcOwnership::ServerAuditAppendFailed
+                }
+            };
+            assert_eq!(failure.ownership(), ownership);
+            assert_eq!(failure.audit_outcome(), outcome);
+            assert_eq!(failure.reason_code(), reason);
+            assert_eq!(failure.retryable(), retryable);
+        }
+    }
+
+    #[test]
+    fn benchmark_server_failure_marker_rejects_client_reasons_and_illegal_tuples() {
+        let request_id = "TEST_CODE_benchmark_request";
+        for (outcome, reason, retryable, audit_state) in [
+            (
+                "unavailable",
+                "bridge_disabled",
+                false,
+                BenchmarkServerAuditState::Persisted,
+            ),
+            (
+                "partial",
+                "provider_transport",
+                false,
+                BenchmarkServerAuditState::Persisted,
+            ),
+            (
+                "unavailable",
+                "acquisition_audit_unavailable",
+                true,
+                BenchmarkServerAuditState::Persisted,
+            ),
+            (
+                "unavailable",
+                "provider_transport",
+                true,
+                BenchmarkServerAuditState::AppendFailed,
+            ),
+        ] {
+            let detail = pb::BenchmarkErrorDetail {
+                error: Some(pb::ErrorDetail {
+                    request_id: request_id.to_owned(),
+                    operation: Operation::BenchmarkBars as i32,
+                    provider: "Tdx".to_owned(),
+                    reason_code: reason.to_owned(),
+                    retryable,
+                    ..Default::default()
+                }),
+                audit_outcome: outcome.to_owned(),
+                audit_state: audit_state.as_proto(),
+            };
+            let failure = classify_benchmark_status(
+                request_id,
+                tonic::Status::with_details(
+                    tonic::Code::Internal,
+                    "TEST_CODE invalid typed server tuple",
+                    detail.encode_to_vec().into(),
+                ),
+            );
+            assert_eq!(failure.ownership(), BenchmarkGrpcOwnership::OutcomeUnknown);
+            assert_eq!(failure.reason_code(), "transport_outcome_unknown");
+        }
+    }
+
+    #[test]
+    fn benchmark_unverified_status_has_ambiguous_transport_ownership() {
+        let failure = classify_benchmark_status(
+            "TEST_CODE_benchmark_request",
+            tonic::Status::unavailable("TEST_CODE response lost"),
+        );
+        assert_eq!(failure.ownership(), BenchmarkGrpcOwnership::OutcomeUnknown);
+        assert_eq!(failure.audit_outcome(), "unavailable");
+        assert_eq!(failure.reason_code(), "transport_outcome_unknown");
+        assert!(failure.retryable());
+    }
+
+    #[test]
+    fn benchmark_typed_failure_without_provider_marker_is_outcome_unknown() {
+        let request_id = "TEST_CODE_benchmark_request";
+        let detail = pb::BenchmarkErrorDetail {
+            error: Some(pb::ErrorDetail {
+                request_id: request_id.to_owned(),
+                operation: Operation::BenchmarkBars as i32,
+                provider: String::new(),
+                reason_code: "provider_transport".to_owned(),
+                retryable: true,
+                ..Default::default()
+            }),
+            audit_outcome: "unavailable".to_owned(),
+            audit_state: BenchmarkServerAuditState::Persisted.as_proto(),
+        };
+
+        let failure = classify_benchmark_status(
+            request_id,
+            tonic::Status::with_details(
+                tonic::Code::Internal,
+                "TEST_CODE missing provider marker",
+                detail.encode_to_vec().into(),
+            ),
+        );
+
+        assert_eq!(failure.ownership(), BenchmarkGrpcOwnership::OutcomeUnknown);
+        assert_eq!(failure.audit_outcome(), "unavailable");
+        assert_eq!(failure.reason_code(), "transport_outcome_unknown");
+        assert!(failure.retryable());
+    }
+
+    #[test]
+    fn benchmark_test_helper_roundtrips_absent_provider_without_inventing_tdx() {
+        let failure = benchmark_typed_failure_for_test(GatewayError::classified(
+            "GrpcBridge",
+            None,
+            "unavailable",
+            "provider_transport",
+            true,
+            "TEST_CODE absent provider",
+        ));
+        assert_eq!(failure.ownership(), BenchmarkGrpcOwnership::OutcomeUnknown);
+        assert_eq!(failure.reason_code(), "transport_outcome_unknown");
+        assert!(failure.retryable());
+    }
+
+    #[test]
+    fn benchmark_unverified_response_envelope_has_ambiguous_ownership() {
+        let response = pb::QueryResponse {
+            request_id: "TEST_CODE_wrong_request".to_owned(),
+            operation: Operation::BenchmarkBars as i32,
+            admission: AdmissionState::Admitted as i32,
+            selected_provider: "Tdx".to_owned(),
+            batch_id: "TEST_CODE_unverified_envelope".to_owned(),
+            complete: true,
+            observed_at: "2026-08-21T15:01:00+08:00".to_owned(),
+            source_at: String::new(),
+            records: Vec::new(),
+            source: "TEST_CODE benchmark response".to_owned(),
+            diagnostic_blocker: String::new(),
+        };
+        let failure = parse_benchmark_query_response("TEST_CODE_expected_request", response)
+            .expect_err("unverified request echo cannot prove server audit ownership");
+        assert_eq!(failure.ownership(), BenchmarkGrpcOwnership::OutcomeUnknown);
+        assert_eq!(failure.audit_outcome(), "unavailable");
+        assert_eq!(failure.reason_code(), "transport_outcome_unknown");
+        assert!(failure.retryable());
+    }
+
+    #[tokio::test]
+    async fn benchmark_request_validation_precedes_wire_and_transport() {
+        let transport_calls = std::sync::atomic::AtomicUsize::new(0);
+        let shanghai = chrono::FixedOffset::east_opt(8 * 60 * 60).expect("Shanghai offset");
+        let day = NaiveDate::from_ymd_opt(2026, 8, 21).expect("TEST_CODE date");
+        let off_grid = crate::data_gateway::BenchmarkRequest {
+            instrument: crate::data_gateway::HS300_CANONICAL.to_owned(),
+            range: crate::data_gateway::BenchmarkRange::Minute1 {
+                from: shanghai
+                    .with_ymd_and_hms(2026, 8, 21, 9, 31, 30)
+                    .single()
+                    .expect("TEST_CODE second"),
+                to: shanghai
+                    .with_ymd_and_hms(2026, 8, 21, 9, 32, 0)
+                    .single()
+                    .expect("TEST_CODE minute"),
+            },
+        };
+        let reversed = crate::data_gateway::BenchmarkRequest {
+            instrument: crate::data_gateway::HS300_CANONICAL.to_owned(),
+            range: crate::data_gateway::BenchmarkRange::Daily {
+                from: day,
+                to: day.pred_opt().expect("TEST_CODE previous day"),
+            },
+        };
+
+        for (request, expected_reason) in [
+            (off_grid, "benchmark_minute_range_off_grid"),
+            (reversed, "benchmark_range_reversed"),
+        ] {
+            let error = benchmark_bars_with_query(&request, |_| {
+                transport_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(Err(unknown_benchmark_transport_failure()))
+            })
+            .await
+            .expect_err("invalid request must stop before transport construction");
+            assert_eq!(error.ownership(), BenchmarkGrpcOwnership::ClientBeforeSend);
+            assert_eq!(error.capability(), "BenchmarkBars");
+            assert_eq!(error.audit_outcome(), "invalid_request");
+            assert_eq!(error.reason_code(), expected_reason);
+            assert!(!error.retryable());
+        }
+        assert_eq!(
+            transport_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "invalid requests must not invoke the transport closure"
+        );
+    }
+
+    #[tokio::test]
+    async fn pure_nanosecond_minute_request_fails_before_transport() {
+        let transport_calls = std::sync::atomic::AtomicUsize::new(0);
+        let request = crate::data_gateway::BenchmarkRequest {
+            instrument: crate::data_gateway::HS300_CANONICAL.to_owned(),
+            range: crate::data_gateway::BenchmarkRange::Minute1 {
+                from: DateTime::parse_from_rfc3339("2026-08-21T09:31:00.000000001+08:00")
+                    .expect("TEST_CODE nanosecond minute"),
+                to: DateTime::parse_from_rfc3339("2026-08-21T09:32:00+08:00")
+                    .expect("TEST_CODE minute"),
+            },
+        };
+
+        let error = benchmark_bars_with_query(&request, |_| {
+            transport_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Err(unknown_benchmark_transport_failure()))
+        })
+        .await
+        .expect_err("pure nanosecond off-grid request must stop before transport");
+
+        assert_eq!(error.ownership(), BenchmarkGrpcOwnership::ClientBeforeSend);
+        assert_eq!(error.audit_outcome(), "invalid_request");
+        assert_eq!(error.reason_code(), "benchmark_minute_range_off_grid");
+        assert!(!error.retryable());
+        assert_eq!(transport_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -3235,6 +4274,7 @@ mod tests {
 
     #[test]
     fn br246_diagnostic_audit_persists_every_attempt_without_fabricating_failure_evidence() {
+        let _env = test_grpc_env_guard();
         use diesel::prelude::*;
         use diesel::sql_types::{BigInt, Integer, Nullable, Text};
 
@@ -3517,7 +4557,7 @@ mod tests {
 
     #[test]
     fn bridge_disabled_without_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = test_grpc_env_guard();
         std::env::remove_var("DATA_GATEWAY_GRPC");
         std::env::remove_var("DATA_GATEWAY_GRPC_DISABLED");
         std::env::remove_var("GRPC_MARKET_ADDR");
@@ -3525,8 +4565,79 @@ mod tests {
     }
 
     #[test]
+    fn grpc_env_guard_reset_bridge_recovers_from_poisoned_cache() {
+        let guard = test_grpc_env_guard();
+        let cell = SOURCE.get_or_init(|| Mutex::new(None));
+        let poisoned = std::panic::catch_unwind(|| {
+            let _cache = cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            panic!("TEST_CODE poison bridge cache");
+        });
+        assert!(poisoned.is_err());
+
+        reset_bridge();
+        assert!(cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none());
+        drop(guard);
+
+        let reacquired = test_grpc_env_guard();
+        assert!(SOURCE
+            .get()
+            .expect("TEST_CODE bridge cache initialized")
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none());
+        drop(reacquired);
+    }
+
+    #[test]
+    fn grpc_env_guard_restores_env_and_cache_after_panic_and_reacquires() {
+        const KEYS: &[&str] = &[
+            "DATA_GATEWAY_GRPC",
+            "DATA_GATEWAY_GRPC_DISABLED",
+            "GRPC_MARKET_ADDR",
+            "GRPC_MARKET_CLIENT_BUNDLE",
+        ];
+        let baseline_guard = test_grpc_env_guard();
+        let before: Vec<_> = KEYS
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+        drop(baseline_guard);
+        let unwound = std::panic::catch_unwind(|| {
+            let _env = test_grpc_env_guard();
+            std::env::set_var("DATA_GATEWAY_GRPC", "1");
+            std::env::set_var("DATA_GATEWAY_GRPC_DISABLED", "TEST_CODE_disabled");
+            std::env::set_var("GRPC_MARKET_ADDR", "http://TEST_CODE_changed:1");
+            std::env::set_var("GRPC_MARKET_CLIENT_BUNDLE", "/TEST_CODE_changed_bundle");
+            let _ = bridge_for("RealtimeQuotes").expect("TEST_CODE configured bridge");
+            let cell = SOURCE.get().expect("TEST_CODE bridge cache initialized");
+            let _cache = cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            panic!("TEST_CODE unwind through env/cache guard");
+        });
+        assert!(unwound.is_err());
+
+        let reacquired = test_grpc_env_guard();
+        for (key, expected) in &before {
+            assert_eq!(std::env::var_os(key), expected.clone(), "env key {key}");
+        }
+        assert!(SOURCE
+            .get()
+            .expect("TEST_CODE bridge cache initialized")
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none());
+        drop(reacquired);
+    }
+
+    #[test]
     fn bridge_disabled_by_op_name() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = test_grpc_env_guard();
         std::env::set_var("DATA_GATEWAY_GRPC", "1");
         std::env::set_var("DATA_GATEWAY_GRPC_DISABLED", "RealtimeQuotes");
         std::env::remove_var("GRPC_MARKET_ADDR");
@@ -3542,7 +4653,7 @@ mod tests {
     fn bridge_enabled_but_unreachable_is_fail_closed() {
         // 连接是惰性的: bridge_for 只注册实例, fail-closed 在方法层
         // (首个查询 ensure_connected 失败 → unavailable retryable)。
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = test_grpc_env_guard();
         std::env::set_var("DATA_GATEWAY_GRPC", "1");
         std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:1");
         reset_bridge();
@@ -3562,7 +4673,7 @@ mod tests {
         // 网关调用直接在 async worker 上发生, 旧判别器 Handle::block_on 触发
         // tokio "Cannot start a runtime from within a runtime"。修复后 async
         // worker 走独立 std 线程路径 → 服务端不可达返回 Err 而非 panic。
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = test_grpc_env_guard();
         std::env::set_var("DATA_GATEWAY_GRPC", "1");
         std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:1");
         reset_bridge();
@@ -3581,7 +4692,7 @@ mod tests {
 
     #[test]
     fn startup_banner_defaults_to_library() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = test_grpc_env_guard();
         std::env::remove_var("DATA_GATEWAY_GRPC");
         std::env::remove_var("DATA_GATEWAY_GRPC_DISABLED");
         std::env::remove_var("GRPC_MARKET_ADDR");
@@ -3600,7 +4711,7 @@ mod tests {
 
     #[test]
     fn startup_banner_grpc_mode_and_disabled() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = test_grpc_env_guard();
         std::env::set_var("DATA_GATEWAY_GRPC", "1");
         std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:19001");
         std::env::set_var("DATA_GATEWAY_GRPC_DISABLED", "T0Evidence,InstrumentNews");
@@ -3626,7 +4737,7 @@ mod tests {
 
     #[test]
     fn br231_external_bundle_is_captured_but_never_printed() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = test_grpc_env_guard();
         let secret_marker = "/TEST_CODE_private_bundle_marker";
         std::env::set_var("DATA_GATEWAY_GRPC", "1");
         std::env::set_var("GRPC_MARKET_CLIENT_BUNDLE", secret_marker);
@@ -3653,7 +4764,7 @@ mod tests {
 
     #[test]
     fn br231_security_identity_requires_external_bundle() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = test_grpc_env_guard();
         std::env::set_var("DATA_GATEWAY_GRPC", "1");
         std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
         reset_bridge();
@@ -3673,7 +4784,7 @@ mod tests {
 
     #[test]
     fn br238_configured_global_news_never_falls_back_to_local_bridge() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = test_grpc_env_guard();
         std::env::set_var("DATA_GATEWAY_GRPC", "1");
         std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:1");
         std::env::set_var(
@@ -3699,7 +4810,7 @@ mod tests {
 
     #[test]
     fn br238_opening_readiness_requires_external_bundle() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = test_grpc_env_guard();
         std::env::set_var("DATA_GATEWAY_GRPC", "1");
         std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
         reset_bridge();
@@ -3815,7 +4926,7 @@ mod tests {
 
     #[test]
     fn br231_undelivered_external_contract_is_rejected_before_connection() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = test_grpc_env_guard();
         std::env::set_var("DATA_GATEWAY_GRPC", "1");
         std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
         reset_bridge();

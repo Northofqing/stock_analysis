@@ -1208,11 +1208,10 @@ mod tests {
 mod no_magic_bridge_tests {
     use super::BoardDataGateway;
     use crate::database::DatabaseManager;
-    use serial_test::serial;
 
     #[test]
-    #[serial]
-    fn blocking_membership_uses_grpc_bridge_when_enabled() {
+    fn grpc_env_guard_blocking_membership_uses_bridge_when_enabled() {
+        let _env = super::super::grpc_source::test_grpc_env_guard();
         DatabaseManager::init(None).expect("TEST_CODE audit database init");
         std::env::set_var("DATA_GATEWAY_GRPC", "1");
         std::env::remove_var("DATA_GATEWAY_GRPC_DISABLED");
@@ -1223,11 +1222,6 @@ mod no_magic_bridge_tests {
         // resolve_test_equity 将该测试命名空间映射为合法上海 A 股 identity；
         // 此调用只读查询 membership，不经过订单或生产写入路径。
         let result = BoardDataGateway::new().memberships_blocking("TEST_CODE_600519");
-
-        std::env::remove_var("DATA_GATEWAY_GRPC");
-        std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
-        std::env::remove_var("GRPC_MARKET_ADDR");
-        super::super::grpc_source::reset_bridge();
 
         let error = result.expect_err("unreachable gRPC bridge must fail closed");
 
