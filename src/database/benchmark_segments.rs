@@ -15,6 +15,7 @@ use crate::data_gateway::{
     BatchEvidence, BenchmarkBar, BenchmarkBarTime, BenchmarkError, BenchmarkGranularity,
     BenchmarkRange, BenchmarkRequest,
 };
+use crate::magic_compat::ProviderId;
 
 const SEGMENT_CHAIN_GENESIS: &str = "BR251_BENCHMARK_SEGMENT_CHAIN_GENESIS_V1";
 const MANIFEST_CHAIN_GENESIS: &str = "BR251_BENCHMARK_MANIFEST_CHAIN_GENESIS_V1";
@@ -1514,7 +1515,9 @@ fn validate_manifest_acquisition_membership(
     Ok(())
 }
 
-fn request_from_manifest(manifest: &BenchmarkManifestRef) -> Result<BenchmarkRequest, String> {
+pub(crate) fn request_from_manifest(
+    manifest: &BenchmarkManifestRef,
+) -> Result<BenchmarkRequest, String> {
     let range = match manifest.granularity {
         BenchmarkGranularity::Daily => BenchmarkRange::Daily {
             from: NaiveDate::parse_from_str(&manifest.from_key, "%Y-%m-%d")
@@ -1786,7 +1789,7 @@ fn insert_manifest(
 fn read_exact_on_connection(
     conn: &mut SqliteConnection,
     manifest_hash: &str,
-) -> diesel::QueryResult<(BenchmarkManifestRef, Vec<BenchmarkBar>)> {
+) -> diesel::QueryResult<(BenchmarkManifestRef, Vec<BenchmarkBar>, Vec<BatchEvidence>)> {
     if !is_lower_hex_hash(manifest_hash) {
         return Err(integrity_store_error(
             "benchmark_manifest_hash_invalid",
@@ -1848,6 +1851,7 @@ fn read_exact_on_connection(
         .map_err(|error| store_error(format!("BR-251 benchmark payload validation: {error:?}")))?;
     validate_manifest_acquisition_membership(&manifest, &retained_segments, &acquisition_bindings)
         .map_err(typed_store_error)?;
+    let mut evidence = Vec::with_capacity(acquisition_bindings.len());
     for binding in &acquisition_bindings {
         if binding.request_hash != request_hash {
             return Err(store_error(
@@ -1871,8 +1875,27 @@ fn read_exact_on_connection(
                 failure_reason_code: "benchmark_manifest_acquisition_audit_invalid",
             },
         )?;
+        let provider = serde_json::from_value::<ProviderId>(serde_json::Value::String(
+            binding.provider.clone(),
+        ))
+        .map_err(|error| {
+            integrity_store_error(
+                "benchmark_manifest_acquisition_provider_invalid",
+                format!(
+                    "BR-251 persisted manifest acquisition provider is invalid at audit id {}: {error}",
+                    binding.audit_id
+                ),
+            )
+        })?;
+        evidence.push(BatchEvidence {
+            provider,
+            source: binding.source.clone(),
+            source_at: binding.source_at.clone(),
+            observed_at: binding.observed_at.clone(),
+            batch_id: binding.batch_id.clone(),
+        });
     }
-    Ok((manifest, bars))
+    Ok((manifest, bars, evidence))
 }
 
 impl<'a> BenchmarkSegmentStore<'a> {
@@ -1880,7 +1903,7 @@ impl<'a> BenchmarkSegmentStore<'a> {
         Self { database }
     }
 
-    pub fn append(
+    pub(crate) fn append(
         &self,
         segments: Vec<BenchmarkSegmentAppend>,
     ) -> Result<BenchmarkManifestRef, BenchmarkSegmentStoreError> {
@@ -2028,7 +2051,7 @@ impl<'a> BenchmarkSegmentStore<'a> {
                     &acquisition_bindings,
                     &manifest_chain_tail,
                 )?;
-                let (retained_manifest, retained_payload) =
+                let (retained_manifest, retained_payload, _) =
                     read_exact_on_connection(conn, &manifest.manifest_hash)?;
                 if retained_manifest != manifest || retained_payload != payload {
                     return Err(store_error(
@@ -2050,10 +2073,13 @@ impl<'a> BenchmarkSegmentStore<'a> {
         })
     }
 
-    pub fn read_exact(
+    pub(crate) fn read_exact(
         &self,
         manifest_hash: &str,
-    ) -> Result<(BenchmarkManifestRef, Vec<BenchmarkBar>), BenchmarkSegmentStoreError> {
+    ) -> Result<
+        (BenchmarkManifestRef, Vec<BenchmarkBar>, Vec<BatchEvidence>),
+        BenchmarkSegmentStoreError,
+    > {
         let mut conn = self.database.get_conn().map_err(|error| {
             unavailable(
                 "benchmark_segment_storage_unavailable",
@@ -2235,7 +2261,11 @@ mod tests {
     use diesel::sql_types::{BigInt, Binary, Nullable, Text};
 
     use super::*;
-    use crate::data_gateway::{BenchmarkBarTime, BenchmarkRange};
+    use crate::data_gateway::review::AuditedBenchmarkBatch;
+    use crate::data_gateway::{
+        BenchmarkBarTime, BenchmarkCapture, BenchmarkRange, BenchmarkReader, GatewayBatch,
+        HS300_CANONICAL,
+    };
     use crate::database::data_acquisition_audit::DataAcquisitionAuditRecord;
     use crate::magic_compat::ProviderId;
 
@@ -2382,10 +2412,15 @@ mod tests {
             retryable: bool,
         ) -> DataAcquisitionAuditReceipt {
             let request_hash = request.canonical_request_hash();
+            let provider = serde_json::to_value(evidence.provider)
+                .expect("TEST_CODE serialize provider")
+                .as_str()
+                .expect("TEST_CODE provider is a unit-variant string")
+                .to_owned();
             self.manager
                 .record_data_acquisition(&DataAcquisitionAuditRecord {
                     capability: "BenchmarkBars",
-                    provider: "Tdx",
+                    provider: &provider,
                     source: &evidence.source,
                     request_hash: &request_hash,
                     source_at: evidence.source_at.as_deref(),
@@ -2553,7 +2588,7 @@ mod tests {
             .store()
             .append(segments)
             .unwrap_or_else(|error| panic!("{context}: append failed: {error}"));
-        let (retained, _) = database
+        let (retained, _, _) = database
             .store()
             .read_exact(&manifest.manifest_hash)
             .unwrap_or_else(|error| panic!("{context}: immediate exact read failed: {error}"));
@@ -3124,7 +3159,7 @@ mod tests {
 
         assert_eq!(corrected.segment_hashes[0], original.segment_hashes[0]);
         assert_ne!(corrected.segment_hashes[1], original.segment_hashes[1]);
-        let (retained_original, original_bars) = database
+        let (retained_original, original_bars, _) = database
             .store()
             .read_exact(&original.manifest_hash)
             .expect("TEST_CODE old manifest remains exactly readable");
@@ -3216,7 +3251,7 @@ mod tests {
 
         assert_eq!(corrected.segment_hashes[0], original.segment_hashes[0]);
         assert_ne!(corrected.segment_hashes[1], original.segment_hashes[1]);
-        let (retained_original, original_bars) = database
+        let (retained_original, original_bars, _) = database
             .store()
             .read_exact(&original.manifest_hash)
             .expect("TEST_CODE original shared manifest remains readable");
@@ -3536,7 +3571,7 @@ mod tests {
         .collect();
         let manifest = append_readable(&database, appends, "TEST_CODE natural quarters");
         assert_eq!(manifest.segment_hashes.len(), 2);
-        let (_, bars) = database
+        let (_, bars, _) = database
             .store()
             .read_exact(&manifest.manifest_hash)
             .expect("TEST_CODE exact manifest");
@@ -4294,7 +4329,7 @@ mod tests {
             .store()
             .append(vec![append])
             .expect("TEST_CODE append");
-        let (loaded_manifest, loaded_bars) = database
+        let (loaded_manifest, loaded_bars, _) = database
             .store()
             .read_exact(&manifest.manifest_hash)
             .expect("TEST_CODE read exact");
@@ -4499,5 +4534,393 @@ mod tests {
         .parse::<f64>()
         .expect("TEST_CODE retention number");
         assert!(retained >= 1825.0, "retained days={retained}");
+    }
+
+    #[test]
+    fn capture_and_reader_are_the_only_public_business_seams() {
+        let database = TestDatabase::new();
+        let _capture = BenchmarkCapture::new(&database.manager);
+        let _reader = BenchmarkReader::new(&database.manager);
+    }
+
+    #[test]
+    fn capture_preview_is_side_effect_free_and_commit_is_canonical_and_idempotent() {
+        let database = TestDatabase::new();
+        let request = BenchmarkRequest {
+            instrument: "TEST_CODE_sh000300".into(),
+            range: BenchmarkRange::Daily {
+                from: date(2026, 3, 31),
+                to: date(2026, 4, 1),
+            },
+        };
+        let evidence = evidence("TEST_CODE_capture_cross_quarter");
+        let bars = vec![
+            daily_bar(date(2026, 3, 31), 101.0),
+            daily_bar(date(2026, 4, 1), 102.0),
+        ];
+        let receipt = database.receipt(&request, &evidence, 2);
+        let audited = AuditedBenchmarkBatch {
+            batch: GatewayBatch::Available {
+                records: bars,
+                evidence,
+            },
+            receipt,
+            request_hash: request.canonical_request_hash(),
+        };
+        let tables = [
+            "benchmark_segment_revision",
+            "benchmark_segment_chain",
+            "benchmark_manifest",
+            "benchmark_manifest_acquisition",
+            "benchmark_manifest_chain",
+        ];
+        let mut conn = database.conn();
+        let before = tables.map(|table| count(&mut conn, table));
+        drop(conn);
+
+        let capture = BenchmarkCapture::new(&database.manager);
+        let preview = capture
+            .preview_audited_for_test(request.clone(), audited.clone())
+            .expect("TEST_CODE admitted preview");
+        let mut conn = database.conn();
+        assert_eq!(tables.map(|table| count(&mut conn, table)), before);
+        drop(conn);
+
+        let manifest = capture.commit(preview).expect("TEST_CODE commit");
+        assert_eq!(manifest.segment_hashes.len(), 2);
+        let replay = capture
+            .preview_audited_for_test(request, audited)
+            .and_then(|preview| capture.commit(preview))
+            .expect("TEST_CODE idempotent replay");
+        assert_eq!(replay, manifest);
+
+        let mut conn = database.conn();
+        assert_eq!(count(&mut conn, "benchmark_segment_revision"), 2);
+        assert_eq!(count(&mut conn, "benchmark_segment_chain"), 2);
+        assert_eq!(count(&mut conn, "benchmark_manifest"), 1);
+        assert_eq!(count(&mut conn, "benchmark_manifest_chain"), 1);
+    }
+
+    #[test]
+    fn capture_preview_rejects_relabelled_request_hash_and_real_test_identity() {
+        let database = TestDatabase::new();
+        let request = daily_request();
+        let evidence = evidence("TEST_CODE_capture_identity_rejection");
+        let bars = vec![daily_bar(date(2026, 1, 5), 101.0)];
+        let mut audited = AuditedBenchmarkBatch {
+            batch: GatewayBatch::Available {
+                records: bars,
+                evidence: evidence.clone(),
+            },
+            receipt: database.receipt(&request, &evidence, 1),
+            request_hash: request.canonical_request_hash(),
+        };
+        audited.request_hash = "f".repeat(64);
+        let capture = BenchmarkCapture::new(&database.manager);
+        assert!(matches!(
+            capture.preview_audited_for_test(request.clone(), audited.clone()),
+            Err(BenchmarkError::FailedIntegrity {
+                code: "benchmark_capture_request_hash_mismatch"
+            })
+        ));
+
+        let production_identity = BenchmarkRequest {
+            instrument: HS300_CANONICAL.into(),
+            range: request.range,
+        };
+        assert!(matches!(
+            capture.preview_audited_for_test(production_identity, audited),
+            Err(BenchmarkError::FailedIntegrity {
+                code: "benchmark_test_preview_requires_test_identity"
+            })
+        ));
+    }
+
+    #[test]
+    fn reader_requires_exact_request_and_projects_every_daily_close() {
+        let database = TestDatabase::new();
+        let request = BenchmarkRequest {
+            instrument: "TEST_CODE_sh000300".into(),
+            range: BenchmarkRange::Daily {
+                from: date(2026, 3, 31),
+                to: date(2026, 4, 1),
+            },
+        };
+        let evidence = evidence("TEST_CODE_reader_exact_daily");
+        let bars = vec![
+            daily_bar(date(2026, 3, 31), 101.0),
+            daily_bar(date(2026, 4, 1), 102.0),
+        ];
+        let audited = AuditedBenchmarkBatch {
+            batch: GatewayBatch::Available {
+                records: bars.clone(),
+                evidence: evidence.clone(),
+            },
+            receipt: database.receipt(&request, &evidence, 2),
+            request_hash: request.canonical_request_hash(),
+        };
+        let capture = BenchmarkCapture::new(&database.manager);
+        let manifest = capture
+            .preview_audited_for_test(request.clone(), audited)
+            .and_then(|preview| capture.commit(preview))
+            .expect("TEST_CODE captured daily manifest");
+        let reader = BenchmarkReader::new(&database.manager);
+        let snapshot = reader
+            .read_exact(&manifest.manifest_hash, &request)
+            .expect("TEST_CODE exact reader");
+        assert_eq!(snapshot.manifest, manifest);
+        assert_eq!(snapshot.bars, bars);
+
+        let series = reader
+            .to_daily_series(&snapshot, "TEST_CODE HS300")
+            .expect("TEST_CODE complete daily projection");
+        assert_eq!(series.name, "TEST_CODE HS300");
+        assert_eq!(series.closes.len(), 2);
+        assert_eq!(series.closes[&date(2026, 3, 31)], 101.0);
+        assert_eq!(series.closes[&date(2026, 4, 1)], 102.0);
+
+        let wrong = BenchmarkRequest {
+            instrument: "TEST_CODE_other".into(),
+            range: request.range.clone(),
+        };
+        assert_eq!(
+            reader.read_exact(&manifest.manifest_hash, &wrong),
+            Err(BenchmarkError::FailedIntegrity {
+                code: "benchmark_expected_request_mismatch"
+            })
+        );
+        let wrong_range = BenchmarkRequest {
+            instrument: request.instrument.clone(),
+            range: BenchmarkRange::Daily {
+                from: date(2026, 3, 31),
+                to: date(2026, 3, 31),
+            },
+        };
+        assert_eq!(
+            reader.read_exact(&manifest.manifest_hash, &wrong_range),
+            Err(BenchmarkError::FailedIntegrity {
+                code: "benchmark_expected_request_mismatch"
+            })
+        );
+        let minute = DateTime::parse_from_rfc3339("2026-03-31T09:31:00+08:00")
+            .expect("TEST_CODE wrong expected minute");
+        let wrong_granularity = BenchmarkRequest {
+            instrument: request.instrument.clone(),
+            range: BenchmarkRange::Minute1 {
+                from: minute,
+                to: minute,
+            },
+        };
+        assert_eq!(
+            reader.read_exact(&manifest.manifest_hash, &wrong_granularity),
+            Err(BenchmarkError::FailedIntegrity {
+                code: "benchmark_expected_request_mismatch"
+            })
+        );
+
+        let mut tampered = snapshot;
+        tampered.bars.pop();
+        assert!(matches!(
+            reader.to_daily_series(&tampered, "TEST_CODE HS300"),
+            Err(BenchmarkError::FailedIntegrity {
+                code: "benchmark_snapshot_tampered"
+            })
+        ));
+    }
+
+    #[test]
+    fn reader_returns_ordered_persisted_multi_receipt_evidence_and_detects_caller_tamper() {
+        let database = TestDatabase::new();
+        let request = BenchmarkRequest {
+            instrument: "TEST_CODE_sh000300".into(),
+            range: BenchmarkRange::Daily {
+                from: date(2026, 3, 31),
+                to: date(2026, 4, 1),
+            },
+        };
+        let q1_evidence = BatchEvidence {
+            source: "TEST_CODE_magic_tdx_index@revision-q1".into(),
+            source_at: Some("2026-03-31T15:00:00+08:00".into()),
+            observed_at: "2026-03-31T15:00:01+08:00".into(),
+            ..evidence("TEST_CODE_reader_evidence_q1")
+        };
+        let q2_evidence = BatchEvidence {
+            provider: ProviderId::Tencent,
+            source: "TEST_CODE_tencent_index@revision-q2".into(),
+            source_at: Some("2026-04-01T15:00:00+08:00".into()),
+            observed_at: "2026-04-01T15:00:01+08:00".into(),
+            ..evidence("TEST_CODE_reader_evidence_q2")
+        };
+        let manifest = database
+            .store()
+            .append(vec![
+                append_with_evidence(
+                    &database,
+                    request.clone(),
+                    date(2026, 1, 1),
+                    SegmentState::Provisional,
+                    vec![daily_bar(date(2026, 3, 31), 101.0)],
+                    q1_evidence.clone(),
+                ),
+                append_with_evidence(
+                    &database,
+                    request.clone(),
+                    date(2026, 4, 1),
+                    SegmentState::Provisional,
+                    vec![daily_bar(date(2026, 4, 1), 102.0)],
+                    q2_evidence.clone(),
+                ),
+            ])
+            .expect("TEST_CODE multi-receipt manifest");
+
+        let reader = BenchmarkReader::new(&database.manager);
+        let snapshot = reader
+            .read_exact(&manifest.manifest_hash, &request)
+            .expect("TEST_CODE exact snapshot with persisted evidence");
+        assert_eq!(snapshot.evidence, vec![q1_evidence, q2_evidence]);
+
+        let mut tampered = snapshot;
+        tampered.evidence[0].source = "TEST_CODE_caller_relabelled_revision".into();
+        assert!(matches!(
+            reader.to_daily_series(&tampered, "TEST_CODE HS300"),
+            Err(BenchmarkError::FailedIntegrity {
+                code: "benchmark_snapshot_tampered"
+            })
+        ));
+    }
+
+    #[test]
+    fn reader_rejects_persisted_manifest_provider_and_source_tamper() {
+        let request = BenchmarkRequest {
+            instrument: "TEST_CODE_sh000300".into(),
+            range: BenchmarkRange::Daily {
+                from: date(2026, 3, 31),
+                to: date(2026, 4, 1),
+            },
+        };
+
+        let provider_database = TestDatabase::new();
+        let provider_manifest =
+            shared_cross_quarter_manifest(&provider_database, "TEST_CODE_reader_provider_tamper");
+        rewrite_only_manifest_binding(&provider_database, &provider_manifest, |binding| {
+            binding.provider = "TEST_CODE_unknown_provider".into();
+        });
+        assert!(matches!(
+            BenchmarkReader::new(&provider_database.manager)
+                .read_exact(&provider_manifest.manifest_hash, &request),
+            Err(BenchmarkError::FailedIntegrity {
+                code: "benchmark_manifest_acquisition_audit_invalid"
+            })
+        ));
+
+        let source_database = TestDatabase::new();
+        let source_manifest =
+            shared_cross_quarter_manifest(&source_database, "TEST_CODE_reader_source_tamper");
+        rewrite_only_manifest_binding(&source_database, &source_manifest, |binding| {
+            binding.source = "TEST_CODE_relabelled_source@revision".into();
+        });
+        assert!(matches!(
+            BenchmarkReader::new(&source_database.manager)
+                .read_exact(&source_manifest.manifest_hash, &request),
+            Err(BenchmarkError::FailedIntegrity {
+                code: "benchmark_manifest_acquisition_audit_invalid"
+            })
+        ));
+    }
+
+    #[test]
+    fn capture_seals_only_complete_ended_daily_quarters_and_never_one_day_minute() {
+        let daily_database = TestDatabase::new();
+        let daily_request = q1_2026_request();
+        let daily_bars = q1_2026_bars(108.0);
+        let daily_evidence =
+            evidence_observed_at("TEST_CODE_capture_sealed_q1", "2026-04-01T00:00:01+08:00");
+        let daily_audited = AuditedBenchmarkBatch {
+            batch: GatewayBatch::Available {
+                records: daily_bars.clone(),
+                evidence: daily_evidence.clone(),
+            },
+            receipt: daily_database.receipt(
+                &daily_request,
+                &daily_evidence,
+                daily_bars.len() as i64,
+            ),
+            request_hash: daily_request.canonical_request_hash(),
+        };
+        let daily_capture = BenchmarkCapture::new(&daily_database.manager);
+        daily_capture
+            .preview_audited_for_test(daily_request, daily_audited)
+            .and_then(|preview| daily_capture.commit(preview))
+            .expect("TEST_CODE complete ended quarter seals");
+        let daily_state =
+            diesel::sql_query("SELECT state AS value FROM benchmark_segment_revision LIMIT 1")
+                .get_result::<TextRow>(&mut daily_database.conn())
+                .expect("TEST_CODE daily state")
+                .value;
+        assert_eq!(daily_state, "Sealed");
+
+        let minute_database = TestDatabase::new();
+        let from = DateTime::parse_from_rfc3339("2026-01-05T09:31:00+08:00")
+            .expect("TEST_CODE minute from");
+        let to =
+            DateTime::parse_from_rfc3339("2026-01-05T09:32:00+08:00").expect("TEST_CODE minute to");
+        let minute_request = BenchmarkRequest {
+            instrument: "TEST_CODE_sh000300".into(),
+            range: BenchmarkRange::Minute1 { from, to },
+        };
+        let minute_bars = vec![minute_bar(from, 101.0), minute_bar(to, 102.0)];
+        let minute_evidence = evidence_observed_at(
+            "TEST_CODE_capture_minute_provisional",
+            "2026-04-01T00:00:01+08:00",
+        );
+        let minute_audited = AuditedBenchmarkBatch {
+            batch: GatewayBatch::Available {
+                records: minute_bars,
+                evidence: minute_evidence.clone(),
+            },
+            receipt: minute_database.receipt(&minute_request, &minute_evidence, 2),
+            request_hash: minute_request.canonical_request_hash(),
+        };
+        let minute_capture = BenchmarkCapture::new(&minute_database.manager);
+        let minute_manifest = minute_capture
+            .preview_audited_for_test(minute_request.clone(), minute_audited)
+            .and_then(|preview| minute_capture.commit(preview))
+            .expect("TEST_CODE one-day minute remains provisional");
+        let minute_state =
+            diesel::sql_query("SELECT state AS value FROM benchmark_segment_revision LIMIT 1")
+                .get_result::<TextRow>(&mut minute_database.conn())
+                .expect("TEST_CODE minute state")
+                .value;
+        assert_eq!(minute_state, "Provisional");
+        let minute_snapshot = BenchmarkReader::new(&minute_database.manager)
+            .read_exact(&minute_manifest.manifest_hash, &minute_request)
+            .expect("TEST_CODE minute exact read");
+        assert!(matches!(
+            BenchmarkReader::new(&minute_database.manager)
+                .to_daily_series(&minute_snapshot, "TEST_CODE minute"),
+            Err(BenchmarkError::FailedIntegrity {
+                code: "benchmark_daily_projection_granularity_mismatch"
+            })
+        ));
+    }
+
+    #[test]
+    fn reader_preserves_typed_missing_and_integrity_store_failures() {
+        let database = TestDatabase::new();
+        let reader = BenchmarkReader::new(&database.manager);
+        let request = daily_request();
+        assert_eq!(
+            reader.read_exact("TEST_CODE_not_a_hash", &request),
+            Err(BenchmarkError::FailedIntegrity {
+                code: "benchmark_manifest_hash_invalid"
+            })
+        );
+        assert_eq!(
+            reader.read_exact(&"f".repeat(64), &request),
+            Err(BenchmarkError::Unavailable {
+                code: "benchmark_manifest_unavailable",
+                retryable: false
+            })
+        );
     }
 }

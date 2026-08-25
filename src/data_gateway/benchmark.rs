@@ -1,11 +1,19 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, TimeZone, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::review::{BatchEvidence, GatewayBatch, GatewayError};
+use super::review::{
+    AuditedBenchmarkBatch, BatchEvidence, GatewayBatch, GatewayError, ReviewDataGateway,
+};
+use crate::database::benchmark_segments::{
+    request_from_manifest, BenchmarkManifestRef, BenchmarkSegmentAppend, BenchmarkSegmentStore,
+    BenchmarkSegmentStoreError, SegmentState,
+};
+use crate::database::DatabaseManager;
 use crate::magic_compat::ProviderId;
+use crate::strategy::core::BenchmarkSeries;
 
 pub const HS300_CANONICAL: &str = "sh000300";
 
@@ -57,6 +65,259 @@ pub struct BenchmarkBar {
     pub close: f64,
     pub volume: Option<f64>,
     pub amount: Option<f64>,
+}
+
+/// An admitted acquisition prepared for one atomic benchmark-store commit.
+///
+/// Fields intentionally remain private and the value is consumed by `commit`,
+/// so callers cannot relabel retained evidence or segment state.
+pub struct CapturePreview {
+    segments: Vec<BenchmarkSegmentAppend>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BenchmarkSnapshotRef {
+    pub manifest: BenchmarkManifestRef,
+    pub bars: Vec<BenchmarkBar>,
+    pub evidence: Vec<BatchEvidence>,
+}
+
+pub struct BenchmarkCapture<'a> {
+    gateway: ReviewDataGateway,
+    database: &'a DatabaseManager,
+}
+
+impl<'a> BenchmarkCapture<'a> {
+    #[must_use]
+    pub fn new(database: &'a DatabaseManager) -> Self {
+        Self {
+            gateway: ReviewDataGateway::new(),
+            database,
+        }
+    }
+
+    pub async fn preview(
+        &self,
+        request: BenchmarkRequest,
+    ) -> Result<CapturePreview, BenchmarkError> {
+        let audited = self
+            .gateway
+            .benchmark_bars(request.clone())
+            .await
+            .map_err(map_gateway_error)?;
+        prepare_capture_preview(request, audited)
+    }
+
+    pub fn commit(&self, preview: CapturePreview) -> Result<BenchmarkManifestRef, BenchmarkError> {
+        BenchmarkSegmentStore::new(self.database)
+            .append(preview.segments)
+            .map_err(map_store_error)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preview_audited_for_test(
+        &self,
+        request: BenchmarkRequest,
+        audited: AuditedBenchmarkBatch,
+    ) -> Result<CapturePreview, BenchmarkError> {
+        if !request.instrument.starts_with("TEST_CODE") {
+            return Err(failed_integrity(
+                "benchmark_test_preview_requires_test_identity",
+            ));
+        }
+        prepare_capture_preview(request, audited)
+    }
+}
+
+pub struct BenchmarkReader<'a> {
+    database: &'a DatabaseManager,
+}
+
+impl<'a> BenchmarkReader<'a> {
+    #[must_use]
+    pub fn new(database: &'a DatabaseManager) -> Self {
+        Self { database }
+    }
+
+    pub fn read_exact(
+        &self,
+        manifest_hash: &str,
+        expected: &BenchmarkRequest,
+    ) -> Result<BenchmarkSnapshotRef, BenchmarkError> {
+        let (manifest, bars, evidence) = BenchmarkSegmentStore::new(self.database)
+            .read_exact(manifest_hash)
+            .map_err(map_store_error)?;
+        let retained_request = request_from_manifest(&manifest)
+            .map_err(|_| failed_integrity("benchmark_manifest_request_invalid"))?;
+        if &retained_request != expected {
+            return Err(failed_integrity("benchmark_expected_request_mismatch"));
+        }
+        expected.validate_persisted_payload(&bars)?;
+        Ok(BenchmarkSnapshotRef {
+            manifest,
+            bars,
+            evidence,
+        })
+    }
+
+    pub fn to_daily_series(
+        &self,
+        snapshot: &BenchmarkSnapshotRef,
+        name: &str,
+    ) -> Result<BenchmarkSeries, BenchmarkError> {
+        if snapshot.manifest.granularity != BenchmarkGranularity::Daily {
+            return Err(failed_integrity(
+                "benchmark_daily_projection_granularity_mismatch",
+            ));
+        }
+        let expected = request_from_manifest(&snapshot.manifest)
+            .map_err(|_| failed_integrity("benchmark_manifest_request_invalid"))?;
+        let retained = self.read_exact(&snapshot.manifest.manifest_hash, &expected)?;
+        if &retained != snapshot {
+            return Err(failed_integrity("benchmark_snapshot_tampered"));
+        }
+
+        let mut closes = HashMap::with_capacity(retained.bars.len());
+        for bar in retained.bars {
+            let BenchmarkBarTime::Daily(day) = bar.at else {
+                return Err(failed_integrity(
+                    "benchmark_daily_projection_granularity_mismatch",
+                ));
+            };
+            if closes.insert(day, bar.close).is_some() {
+                return Err(failed_integrity("benchmark_daily_projection_duplicate_day"));
+            }
+        }
+        Ok(BenchmarkSeries::new(name, closes))
+    }
+}
+
+fn prepare_capture_preview(
+    request: BenchmarkRequest,
+    audited: AuditedBenchmarkBatch,
+) -> Result<CapturePreview, BenchmarkError> {
+    let (bars, evidence) = match audited.batch {
+        GatewayBatch::Available { records, evidence } => (records, evidence),
+        GatewayBatch::VerifiedEmpty(_) => {
+            return Err(BenchmarkError::Unavailable {
+                code: "benchmark_batch_empty",
+                retryable: true,
+            });
+        }
+    };
+    let request_hash = request.validate_persisted_payload(&bars)?;
+    if audited.request_hash != request_hash {
+        return Err(failed_integrity("benchmark_capture_request_hash_mismatch"));
+    }
+
+    let mut quarter_bars = BTreeMap::<NaiveDate, Vec<BenchmarkBar>>::new();
+    for bar in bars {
+        let day = match &bar.at {
+            BenchmarkBarTime::Daily(day) => *day,
+            BenchmarkBarTime::MinuteEnd(at) => at.date_naive(),
+        };
+        let quarter_start = natural_quarter_start(day)?;
+        quarter_bars.entry(quarter_start).or_default().push(bar);
+    }
+
+    let mut segments = Vec::with_capacity(quarter_bars.len());
+    for (quarter_start, bars) in quarter_bars {
+        let state = capture_segment_state(&request, quarter_start, &bars, &evidence)?;
+        segments.push(BenchmarkSegmentAppend {
+            request: request.clone(),
+            quarter_start,
+            state,
+            bars,
+            evidence: evidence.clone(),
+            acquisition_receipt: audited.receipt.clone(),
+        });
+    }
+    Ok(CapturePreview { segments })
+}
+
+fn natural_quarter_start(day: NaiveDate) -> Result<NaiveDate, BenchmarkError> {
+    let month = ((day.month() - 1) / 3) * 3 + 1;
+    NaiveDate::from_ymd_opt(day.year(), month, 1)
+        .ok_or_else(|| failed_integrity("benchmark_quarter_boundary_invalid"))
+}
+
+fn natural_quarter_end(quarter_start: NaiveDate) -> Result<NaiveDate, BenchmarkError> {
+    let next = if quarter_start.month() == 10 {
+        NaiveDate::from_ymd_opt(quarter_start.year() + 1, 1, 1)
+    } else {
+        NaiveDate::from_ymd_opt(quarter_start.year(), quarter_start.month() + 3, 1)
+    }
+    .ok_or_else(|| failed_integrity("benchmark_quarter_boundary_invalid"))?;
+    next.checked_sub_signed(Duration::days(1))
+        .ok_or_else(|| failed_integrity("benchmark_quarter_boundary_invalid"))
+}
+
+fn capture_segment_state(
+    request: &BenchmarkRequest,
+    quarter_start: NaiveDate,
+    bars: &[BenchmarkBar],
+    evidence: &BatchEvidence,
+) -> Result<SegmentState, BenchmarkError> {
+    let BenchmarkRange::Daily { from, to } = request.range else {
+        return Ok(SegmentState::Provisional);
+    };
+    let quarter_end = natural_quarter_end(quarter_start)?;
+    if from > quarter_start || to < quarter_end {
+        return Ok(SegmentState::Provisional);
+    }
+    let quarter_request = BenchmarkRequest {
+        instrument: request.instrument.clone(),
+        range: BenchmarkRange::Daily {
+            from: quarter_start,
+            to: quarter_end,
+        },
+    };
+    if quarter_request.validate_persisted_payload(bars).is_err() {
+        return Ok(SegmentState::Provisional);
+    }
+    let observed_at = DateTime::<FixedOffset>::parse_from_rfc3339(&evidence.observed_at)
+        .map_err(|_| failed_integrity("benchmark_capture_observed_at_invalid"))?;
+    let shanghai = FixedOffset::east_opt(8 * 60 * 60)
+        .ok_or_else(|| failed_integrity("benchmark_shanghai_offset_unavailable"))?;
+    if observed_at.with_timezone(&shanghai).date_naive() > quarter_end {
+        Ok(SegmentState::Sealed)
+    } else {
+        Ok(SegmentState::Provisional)
+    }
+}
+
+fn map_gateway_error(error: GatewayError) -> BenchmarkError {
+    match error.audit_outcome() {
+        "unsupported" if error.reason_code() == "benchmark_test_identity_rejected" => {
+            BenchmarkError::Unsupported(BenchmarkUnsupported::TestIdentityRejected)
+        }
+        "unsupported" => BenchmarkError::Unsupported(BenchmarkUnsupported::UnsupportedInstrument),
+        "unavailable" | "stale" => BenchmarkError::Unavailable {
+            code: error.reason_code(),
+            retryable: error.retryable(),
+        },
+        "partial" if error.retryable() => BenchmarkError::Unavailable {
+            code: error.reason_code(),
+            retryable: true,
+        },
+        _ => failed_integrity(error.reason_code()),
+    }
+}
+
+fn map_store_error(error: BenchmarkSegmentStoreError) -> BenchmarkError {
+    match error {
+        BenchmarkSegmentStoreError::BenchmarkSegmentUnavailable {
+            reason_code,
+            retryable,
+            ..
+        } => BenchmarkError::Unavailable {
+            code: reason_code,
+            retryable,
+        },
+        BenchmarkSegmentStoreError::FailedIntegrity { reason_code, .. } => {
+            failed_integrity(reason_code)
+        }
+    }
 }
 
 /// BR-251 gRPC uses an explicit numeric wall-clock model instead of relying on
@@ -1799,7 +2060,7 @@ mod tests {
 
     use super::{
         acquire_benchmark_batch_from_source, admit_benchmark_batch,
-        admit_benchmark_grpc_wire_for_test, canonical_base_request_hash,
+        admit_benchmark_grpc_wire_for_test, canonical_base_request_hash, map_gateway_error,
         BenchmarkAdmissionCoverage, BenchmarkBar, BenchmarkBarTime, BenchmarkError,
         BenchmarkEvidenceWire, BenchmarkGrpcResponseWire, BenchmarkProviderAttestation,
         BenchmarkRange, BenchmarkRegistry, BenchmarkRequest, BenchmarkUnsupported,
@@ -1856,6 +2117,46 @@ mod tests {
 
     fn test_registry() -> BenchmarkRegistry {
         BenchmarkRegistry::test_only(["TEST_CODE_000300"])
+    }
+
+    #[test]
+    fn production_preview_mapping_preserves_retryable_partial_taxonomy() {
+        for reason_code in [
+            "provider_transport",
+            "benchmark_page_empty_before_range",
+            "benchmark_short_page_before_range",
+        ] {
+            let mapped = map_gateway_error(GatewayError::classified(
+                "BenchmarkBars",
+                Some(crate::magic_compat::ProviderId::Tdx),
+                "partial",
+                reason_code,
+                true,
+                "TEST_CODE typed retryable partial",
+            ));
+            assert_eq!(
+                mapped,
+                BenchmarkError::Unavailable {
+                    code: reason_code,
+                    retryable: true,
+                }
+            );
+        }
+
+        let bad_data = map_gateway_error(GatewayError::classified(
+            "BenchmarkBars",
+            Some(crate::magic_compat::ProviderId::Tdx),
+            "partial",
+            "benchmark_page_order_or_duplicate",
+            false,
+            "TEST_CODE typed non-retryable bad data",
+        ));
+        assert_eq!(
+            bad_data,
+            BenchmarkError::FailedIntegrity {
+                code: "benchmark_page_order_or_duplicate",
+            }
+        );
     }
 
     #[test]
