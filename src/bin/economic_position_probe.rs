@@ -3,14 +3,14 @@
 //! 必须显式指定数据库与评估日；SQLite 以 READ_ONLY 打开。探针不接受费用假设，
 //! 因而只验证成交事实和闭环数量，净指标保持 Unavailable。
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use chrono::NaiveDate;
-use rusqlite::{Connection, OpenFlags};
-use stock_analysis::performance::economic_position::{
-    rebuild_economic_positions, select_economic_rows_through, EconomicFillRow, NetSummary,
+use stock_analysis::performance::attribution_replay::{
+    AttributionReplayLoader, AttributionReplayRequest, FeeEvidenceAvailability,
 };
+use stock_analysis::performance::economic_position::{rebuild_economic_positions, NetSummary};
 
 struct Args {
     database: PathBuf,
@@ -47,49 +47,25 @@ fn parse_args() -> Result<Args, String> {
     })
 }
 
-fn read_fills(database: &Path) -> Result<Vec<EconomicFillRow>, String> {
-    if !database.is_file() {
-        return Err(format!(
-            "database path is not an existing file: {}",
-            database.display()
-        ));
-    }
-    let connection = Connection::open_with_flags(
-        database,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|error| format!("open database read-only: {error}"))?;
-    let mut statement = connection
-        .prepare(
-            "SELECT id, plan_id, code, name, direction, fill_price, quantity, \
-             CAST(ts AS TEXT), virtual_reason \
-             FROM paper_trades WHERE status = 'Filled' ORDER BY ts ASC, id ASC",
-        )
-        .map_err(|error| format!("prepare read-only paper_trades query: {error}"))?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok(EconomicFillRow {
-                id: row.get(0)?,
-                plan_id: row.get(1)?,
-                code: row.get(2)?,
-                name: row.get(3)?,
-                direction: row.get(4)?,
-                fill_price: row.get(5)?,
-                quantity: row.get(6)?,
-                occurred_at: row.get(7)?,
-                virtual_reason: row.get(8)?,
-            })
-        })
-        .map_err(|error| format!("read paper_trades: {error}"))?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("decode paper_trades: {error}"))
-}
-
 fn run() -> Result<(), String> {
     let args = parse_args()?;
-    let all_rows = read_fills(&args.database)?;
-    let through = select_economic_rows_through(all_rows, args.as_of_date)?;
-    let report = rebuild_economic_positions(&through, args.as_of_date, None)?;
+    let evidence = AttributionReplayLoader::new(&args.database)
+        .load(&AttributionReplayRequest {
+            from: args.as_of_date,
+            to: args.as_of_date,
+            required_trading_dates: vec![args.as_of_date],
+            fee_ledger: None,
+        })
+        .map_err(|error| format!("BR-251 replay evidence: {error}"))?;
+    if !matches!(evidence.fees, FeeEvidenceAvailability::Unavailable { .. }) {
+        return Err("read-only probe unexpectedly received fee authority".to_owned());
+    }
+    let fills = evidence
+        .fills
+        .into_iter()
+        .map(|evidence| evidence.fill)
+        .collect::<Vec<_>>();
+    let report = rebuild_economic_positions(&fills, args.as_of_date, None)?;
     println!("BR-248 经济仓位只读探针");
     println!("评估日: {}", report.as_of_date);
     println!("来源成交: {}", report.source_fill_ids.len());
