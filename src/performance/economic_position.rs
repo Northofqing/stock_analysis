@@ -10,6 +10,7 @@ use chrono::{NaiveDate, NaiveDateTime};
 use diesel::RunQueryDsl;
 
 use super::attribution::{signal_family_of, SignalFamily};
+use super::attribution_replay::ValidatedReplayFeeLedger;
 use crate::trading::paper_lot_ledger::parse_paper_fill_timestamp;
 
 const MIN_CLOSED_POSITIONS: usize = 200;
@@ -37,7 +38,7 @@ pub struct EconomicFillRow {
     pub virtual_reason: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum CostBasisKind {
     Observed,
     Scenario,
@@ -88,7 +89,7 @@ pub enum NetMetrics {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct EntryFamilyComposition {
     pub family: SignalFamily,
     pub quantity: u64,
@@ -497,48 +498,83 @@ fn validate_cost_ledger(
                 .to_owned(),
         );
     }
+    let costs = validate_exact_cost_entries(
+        fills,
+        ledger
+            .costs
+            .iter()
+            .map(|cost| (cost.fill_id, cost.adverse_cost, cost.evidence_id.as_str())),
+        "economic cost ledger",
+        "economic cost",
+    )?;
+    Ok(ValidatedCostLedger::Available {
+        basis_id: ledger.basis_id.clone(),
+        kind: ledger.kind,
+        costs,
+    })
+}
+
+fn validate_exact_cost_entries<'a>(
+    fills: &[ValidatedFill],
+    entries: impl IntoIterator<Item = (i64, f64, &'a str)>,
+    source: &str,
+    evidence_source: &str,
+) -> Result<HashMap<i64, ValidatedFillCost>, String> {
     let fill_ids = fills.iter().map(|fill| fill.id).collect::<HashSet<_>>();
-    let mut costs = HashMap::with_capacity(ledger.costs.len());
-    for cost in &ledger.costs {
-        if !fill_ids.contains(&cost.fill_id) {
-            return Err(format!(
-                "economic cost ledger references unknown fill id={}",
-                cost.fill_id
-            ));
+    let mut costs = HashMap::new();
+    for (fill_id, adverse_cost, evidence_id) in entries {
+        if !fill_ids.contains(&fill_id) {
+            return Err(format!("{source} references unknown fill id={fill_id}"));
         }
-        if cost.evidence_id.trim().is_empty()
-            || !cost.adverse_cost.is_finite()
-            || cost.adverse_cost < 0.0
-        {
+        if evidence_id.trim().is_empty() || !adverse_cost.is_finite() || adverse_cost < 0.0 {
             return Err(format!(
-                "economic cost evidence invalid for fill id={}",
-                cost.fill_id
+                "{evidence_source} evidence invalid for fill id={fill_id}"
             ));
         }
         if costs
             .insert(
-                cost.fill_id,
+                fill_id,
                 ValidatedFillCost {
-                    adverse_cost: cost.adverse_cost,
-                    evidence_id: cost.evidence_id.clone(),
+                    adverse_cost,
+                    evidence_id: evidence_id.to_owned(),
                 },
             )
             .is_some()
         {
-            return Err(format!(
-                "economic cost ledger duplicate fill id={}",
-                cost.fill_id
-            ));
+            return Err(format!("{source} duplicate fill id={fill_id}"));
         }
     }
     for fill in fills {
         if !costs.contains_key(&fill.id) {
-            return Err(format!("economic cost ledger missing fill id={}", fill.id));
+            return Err(format!("{source} missing fill id={}", fill.id));
         }
     }
+    Ok(costs)
+}
+
+fn validate_replay_fee_ledger(
+    fills: &[ValidatedFill],
+    ledger: &ValidatedReplayFeeLedger,
+) -> Result<ValidatedCostLedger, String> {
+    // `ValidatedReplayFeeLedger` has private fields and can only be constructed after
+    // BR-251 source/authority/hash and exact fill-set validation. The public
+    // `FillCostLedger { kind: Observed }` path above deliberately remains rejected.
+    let ledger = ledger.economic_ledger();
+    if ledger.basis_id.trim().is_empty() || ledger.kind != CostBasisKind::Observed {
+        return Err("validated replay fee ledger basis is inconsistent".to_owned());
+    }
+    let costs = validate_exact_cost_entries(
+        fills,
+        ledger
+            .costs
+            .iter()
+            .map(|cost| (cost.fill_id, cost.adverse_cost, cost.evidence_id.as_str())),
+        "validated replay fee ledger",
+        "validated replay fee ledger",
+    )?;
     Ok(ValidatedCostLedger::Available {
         basis_id: ledger.basis_id.clone(),
-        kind: ledger.kind,
+        kind: CostBasisKind::Observed,
         costs,
     })
 }
@@ -801,6 +837,29 @@ pub fn rebuild_economic_positions(
 ) -> Result<EconomicPositionReport, String> {
     let fills = validate_fills(rows, as_of_date)?;
     let ledger = validate_cost_ledger(&fills, cost_ledger)?;
+    rebuild_validated_economic_positions(fills, as_of_date, ledger)
+}
+
+/// BR-251 crate-private seam：只接受 replay 模块完成来源/hash/一一绑定校验后构造的
+/// opaque ledger；普通调用者仍不能把字符串或布尔值包装成 Observed。
+pub(super) fn rebuild_economic_positions_with_replay_fees(
+    rows: &[EconomicFillRow],
+    as_of_date: NaiveDate,
+    cost_ledger: Option<&ValidatedReplayFeeLedger>,
+) -> Result<EconomicPositionReport, String> {
+    let fills = validate_fills(rows, as_of_date)?;
+    let ledger = match cost_ledger {
+        Some(ledger) => validate_replay_fee_ledger(&fills, ledger)?,
+        None => ValidatedCostLedger::Unavailable,
+    };
+    rebuild_validated_economic_positions(fills, as_of_date, ledger)
+}
+
+fn rebuild_validated_economic_positions(
+    fills: Vec<ValidatedFill>,
+    as_of_date: NaiveDate,
+    ledger: ValidatedCostLedger,
+) -> Result<EconomicPositionReport, String> {
     let source_fill_ids = fills.iter().map(|fill| fill.id).collect::<Vec<_>>();
     let cost_basis = cost_basis_audit(&fills, &ledger)?;
     let mut states = BTreeMap::<String, PositionCycle>::new();
