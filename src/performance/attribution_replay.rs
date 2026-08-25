@@ -6,7 +6,7 @@ use std::ops::Deref;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, FixedOffset, NaiveDate, Timelike};
+use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone, Timelike};
 use rusqlite::{
     params_from_iter, types::Value, Connection, ErrorCode, OpenFlags, Transaction,
     TransactionBehavior,
@@ -20,10 +20,25 @@ use super::economic_position::{
     select_economic_rows_through, CostBasisKind, EconomicFillRow, EntryFamilyComposition,
     FillCostEvidence as EconomicFillCostEvidence, FillCostLedger, NetMetrics,
 };
-use crate::data_gateway::{BenchmarkBar, BenchmarkBarTime};
+use crate::calendar::{
+    resolve_verified_replay_quarter, resolve_verified_replay_range,
+    resolve_verified_scheduled_replay, verified_a_share_trading_day,
+    verified_replay_quarter_bounds, VerifiedCalendarError, VerifiedCalendarErrorKind,
+    VerifiedReplayCalendar,
+};
+use crate::data_gateway::{
+    BenchmarkBar, BenchmarkBarTime, BenchmarkError, BenchmarkRange, BenchmarkReader,
+    BenchmarkRequest, BenchmarkUnsupported, HS300_CANONICAL,
+};
+use crate::database::attribution_reports::{
+    AttributionEvidenceHash, AttributionFailureAppend, AttributionFailureReceipt,
+    AttributionInvocation, AttributionReportAppend, AttributionReportReceipt,
+    AttributionReportStore, AttributionReportStoreError, AttributionRunMode,
+};
 use crate::database::order_audit::{
     validate_canonical_order_audit_chain, CanonicalOrderAuditChainRow, CanonicalOrderAuditRow,
 };
+use crate::database::DatabaseManager;
 use crate::trading::paper_lot_ledger::parse_paper_fill_timestamp;
 
 const STOCK_CLOSE_HASH_DOMAIN: &[u8] = b"BR251_STOCK_CLOSE_MANIFEST_V1\0";
@@ -33,6 +48,7 @@ const ATTRIBUTION_REPORT_HASH_DOMAIN: &[u8] = b"BR251_ATTRIBUTION_REPORT_V1\0";
 const ATTRIBUTION_REPORT_SEAL_DOMAIN: &[u8] = b"BR251_ATTRIBUTION_REPORT_SEAL_V1\0";
 const REPLAY_FEE_BASIS_HASH_DOMAIN: &[u8] = b"BR251_REPLAY_FEE_BASIS_V1\0";
 const REPLAY_CAPABILITY_SEAL_DOMAIN: &[u8] = b"BR251_REPLAY_CAPABILITY_SEAL_V1\0";
+const REPLAY_TRADE_MANIFEST_HASH_DOMAIN: &[u8] = b"BR251_REPLAY_TRADE_MANIFEST_V1\0";
 const MIN_CLOSED_CYCLES: usize = 200;
 const MIN_COVERAGE_DAYS: i64 = 84;
 
@@ -694,6 +710,7 @@ pub struct AttributionReplayEvidence {
     pub fills: Vec<ReplayFillEvidence>,
     pub stock_closes: StockCloseManifest,
     pub fees: FeeEvidenceAvailability,
+    trade_manifest_hash: String,
     capability_seal: AttributionReplayCapabilitySeal,
 }
 
@@ -705,13 +722,16 @@ impl AttributionReplayEvidence {
         stock_closes: StockCloseManifest,
         fees: FeeEvidenceAvailability,
     ) -> Self {
-        let capability_seal = replay_capability_seal(from, to, &fills, &stock_closes, &fees);
+        let trade_manifest_hash = replay_trade_manifest_hash(&fills);
+        let capability_seal =
+            replay_capability_seal(from, to, &fills, &stock_closes, &fees, &trade_manifest_hash);
         Self {
             from,
             to,
             fills,
             stock_closes,
             fees,
+            trade_manifest_hash,
             capability_seal,
         }
     }
@@ -736,6 +756,10 @@ impl AttributionReplayEvidence {
         &self.fees
     }
 
+    pub fn trade_manifest_hash(&self) -> &str {
+        &self.trade_manifest_hash
+    }
+
     pub fn into_fills(self) -> Vec<ReplayFillEvidence> {
         self.fills
     }
@@ -751,38 +775,44 @@ fn update_optional_text(hasher: &mut Sha256, value: Option<&str>) {
     }
 }
 
+fn update_canonical_replay_fill(hasher: &mut Sha256, evidence: &ReplayFillEvidence) {
+    let fill = &evidence.fill;
+    hasher.update(fill.id.to_be_bytes());
+    update_len_prefixed(hasher, fill.plan_id.as_bytes());
+    update_len_prefixed(hasher, fill.code.as_bytes());
+    update_len_prefixed(hasher, fill.name.as_bytes());
+    update_len_prefixed(hasher, fill.direction.as_bytes());
+    match fill.fill_price {
+        Some(price) => {
+            hasher.update([1]);
+            hasher.update(price.to_bits().to_be_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    hasher.update(fill.quantity.to_be_bytes());
+    update_len_prefixed(hasher, fill.occurred_at.as_bytes());
+    update_len_prefixed(hasher, fill.virtual_reason.as_bytes());
+    hasher.update(evidence.terminal_audit_id.to_be_bytes());
+    update_len_prefixed(hasher, evidence.terminal_audit_hash.as_bytes());
+    update_len_prefixed(hasher, evidence.terminal_time.to_rfc3339().as_bytes());
+}
+
 fn replay_capability_seal(
     from: NaiveDate,
     to: NaiveDate,
     fills: &[ReplayFillEvidence],
     stock_closes: &StockCloseManifest,
     fees: &FeeEvidenceAvailability,
+    trade_manifest_hash: &str,
 ) -> AttributionReplayCapabilitySeal {
     let mut hasher = Sha256::new();
     hasher.update(REPLAY_CAPABILITY_SEAL_DOMAIN);
+    update_len_prefixed(&mut hasher, trade_manifest_hash.as_bytes());
     update_len_prefixed(&mut hasher, from.to_string().as_bytes());
     update_len_prefixed(&mut hasher, to.to_string().as_bytes());
     hasher.update((fills.len() as u64).to_be_bytes());
     for evidence in fills {
-        let fill = &evidence.fill;
-        hasher.update(fill.id.to_be_bytes());
-        update_len_prefixed(&mut hasher, fill.plan_id.as_bytes());
-        update_len_prefixed(&mut hasher, fill.code.as_bytes());
-        update_len_prefixed(&mut hasher, fill.name.as_bytes());
-        update_len_prefixed(&mut hasher, fill.direction.as_bytes());
-        match fill.fill_price {
-            Some(price) => {
-                hasher.update([1]);
-                hasher.update(price.to_bits().to_be_bytes());
-            }
-            None => hasher.update([0]),
-        }
-        hasher.update(fill.quantity.to_be_bytes());
-        update_len_prefixed(&mut hasher, fill.occurred_at.as_bytes());
-        update_len_prefixed(&mut hasher, fill.virtual_reason.as_bytes());
-        hasher.update(evidence.terminal_audit_id.to_be_bytes());
-        update_len_prefixed(&mut hasher, evidence.terminal_audit_hash.as_bytes());
-        update_len_prefixed(&mut hasher, evidence.terminal_time.to_rfc3339().as_bytes());
+        update_canonical_replay_fill(&mut hasher, evidence);
     }
     update_len_prefixed(&mut hasher, stock_closes.manifest_hash.as_bytes());
     hasher.update((stock_closes.entries.len() as u64).to_be_bytes());
@@ -821,6 +851,16 @@ fn replay_capability_seal(
     AttributionReplayCapabilitySeal(hasher.finalize().into())
 }
 
+fn replay_trade_manifest_hash(fills: &[ReplayFillEvidence]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(REPLAY_TRADE_MANIFEST_HASH_DOMAIN);
+    hasher.update((fills.len() as u64).to_be_bytes());
+    for evidence in fills {
+        update_canonical_replay_fill(&mut hasher, evidence);
+    }
+    hex::encode(hasher.finalize())
+}
+
 fn validate_replay_capability(
     evidence: &AttributionReplayEvidence,
 ) -> Result<(), AttributionReplayError> {
@@ -830,8 +870,11 @@ fn validate_replay_capability(
         &evidence.fills,
         &evidence.stock_closes,
         &evidence.fees,
+        &evidence.trade_manifest_hash,
     );
-    if expected != evidence.capability_seal {
+    if replay_trade_manifest_hash(&evidence.fills) != evidence.trade_manifest_hash
+        || expected != evidence.capability_seal
+    {
         return Err(AttributionReplayError::integrity(
             AttributionIntegrityFailure::ReplayEvidence,
             "replay capability projection no longer matches the loader-issued seal",
@@ -877,6 +920,45 @@ struct RawStockCloseRow {
     updated_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttributionReplayLoadStage {
+    Trade,
+    StockClose,
+    Fee,
+    Finalize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AttributionReplayLoadProgress {
+    trade_manifest_hash: Option<String>,
+    stock_close_manifest_hash: Option<String>,
+    fee: Option<FeeEvidenceAvailability>,
+}
+
+#[derive(Debug, Clone)]
+struct AttributionReplayLoadFailure {
+    error: AttributionReplayError,
+    progress: AttributionReplayLoadProgress,
+    stage: AttributionReplayLoadStage,
+    failure_date: Option<NaiveDate>,
+}
+
+impl AttributionReplayLoadProgress {
+    fn failure(
+        &self,
+        error: AttributionReplayError,
+        stage: AttributionReplayLoadStage,
+        failure_date: Option<NaiveDate>,
+    ) -> AttributionReplayLoadFailure {
+        AttributionReplayLoadFailure {
+            error,
+            progress: self.clone(),
+            stage,
+            failure_date,
+        }
+    }
+}
+
 impl AttributionReplayLoader {
     pub fn new(database: impl AsRef<Path>) -> Self {
         Self {
@@ -888,52 +970,88 @@ impl AttributionReplayLoader {
         &self,
         request: &AttributionReplayRequest,
     ) -> Result<AttributionReplayEvidence, AttributionReplayError> {
-        validate_request(request)?;
+        self.load_with_progress(request)
+            .map_err(|failure| failure.error)
+    }
+
+    fn load_with_progress(
+        &self,
+        request: &AttributionReplayRequest,
+    ) -> Result<AttributionReplayEvidence, AttributionReplayLoadFailure> {
+        let mut progress = AttributionReplayLoadProgress::default();
+        validate_request(request)
+            .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Trade, None))?;
         let canonical_database = self.database.canonicalize().map_err(|error| {
-            AttributionReplayError::integrity(
-                AttributionIntegrityFailure::DatabaseIdentity,
-                format!("explicit database path cannot be resolved: {error}"),
+            progress.failure(
+                AttributionReplayError::integrity(
+                    AttributionIntegrityFailure::DatabaseIdentity,
+                    format!("explicit database path cannot be resolved: {error}"),
+                ),
+                AttributionReplayLoadStage::Trade,
+                None,
             )
         })?;
         let before_metadata = canonical_database.metadata().map_err(|error| {
-            AttributionReplayError::integrity(
-                AttributionIntegrityFailure::DatabaseIdentity,
-                format!("explicit database metadata unavailable: {error}"),
+            progress.failure(
+                AttributionReplayError::integrity(
+                    AttributionIntegrityFailure::DatabaseIdentity,
+                    format!("explicit database metadata unavailable: {error}"),
+                ),
+                AttributionReplayLoadStage::Trade,
+                None,
             )
         })?;
         if !before_metadata.is_file() {
-            return Err(AttributionReplayError::integrity(
-                AttributionIntegrityFailure::DatabaseIdentity,
-                "explicit database path is not a regular file",
+            return Err(progress.failure(
+                AttributionReplayError::integrity(
+                    AttributionIntegrityFailure::DatabaseIdentity,
+                    "explicit database path is not a regular file",
+                ),
+                AttributionReplayLoadStage::Trade,
+                None,
             ));
         }
         let expected_identity = FileIdentity::of(&before_metadata);
-        let mut connection = open_query_only_connection(&canonical_database)?;
-        verify_main_database(&connection, &canonical_database, expected_identity)?;
+        let mut connection = open_query_only_connection(&canonical_database)
+            .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Trade, None))?;
+        verify_main_database(&connection, &canonical_database, expected_identity)
+            .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Trade, None))?;
 
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Deferred)
-            .map_err(|error| source_read_error("begin one read transaction", error))?;
-        let all_paper_rows = load_paper_rows(&transaction)?;
-        let audit_rows = load_order_audits(&transaction)?;
-        let chain_rows = load_order_audit_chain(&transaction)?;
-        validate_canonical_order_audit_chain(&audit_rows, &chain_rows).map_err(|detail| {
-            AttributionReplayError::integrity(AttributionIntegrityFailure::OrderAuditChain, detail)
-        })?;
+            .map_err(|error| source_read_error("begin one read transaction", error))
+            .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Trade, None))?;
+        let all_paper_rows = load_paper_rows(&transaction)
+            .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Trade, None))?;
+        let audit_rows = load_order_audits(&transaction)
+            .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Trade, None))?;
+        let chain_rows = load_order_audit_chain(&transaction)
+            .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Trade, None))?;
+        validate_canonical_order_audit_chain(&audit_rows, &chain_rows)
+            .map_err(|detail| {
+                AttributionReplayError::integrity(
+                    AttributionIntegrityFailure::OrderAuditChain,
+                    detail,
+                )
+            })
+            .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Trade, None))?;
 
         let all_economic_rows = all_paper_rows
             .iter()
             .map(|row| row.fill.clone())
             .collect::<Vec<_>>();
-        validate_complete_paper_source(&all_economic_rows, request.to)?;
-        let all_terminals = bind_all_terminals(&all_paper_rows, &audit_rows, &chain_rows)?;
-        let projected_rows =
-            select_economic_rows_through(all_economic_rows, request.to).map_err(|detail| {
+        validate_complete_paper_source(&all_economic_rows, request.to)
+            .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Trade, None))?;
+        let all_terminals = bind_all_terminals(&all_paper_rows, &audit_rows, &chain_rows)
+            .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Trade, None))?;
+        let projected_rows = select_economic_rows_through(all_economic_rows, request.to)
+            .map_err(|detail| {
                 AttributionReplayError::integrity(
                     AttributionIntegrityFailure::PaperTradeSource,
                     detail,
                 )
-            })?;
+            })
+            .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Trade, None))?;
         let terminal_by_fill = all_terminals
             .into_iter()
             .map(|terminal| (terminal.fill.id, terminal))
@@ -948,13 +1066,31 @@ impl AttributionReplayLoader {
                     )
                 })
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Trade, None))?;
+        progress.trade_manifest_hash = Some(replay_trade_manifest_hash(&fills));
         let required_close_keys =
-            derive_required_close_keys(&fills, &request.required_trading_dates)?;
-        let raw_closes = load_stock_closes(&transaction, &required_close_keys)?;
-        let stock_closes = build_stock_close_manifest(raw_closes, &required_close_keys)?;
-        verify_transaction_main_database(&transaction, &canonical_database, expected_identity)?;
-        let fees = validate_fee_ledger(request.fee_ledger.as_ref(), &fills)?;
+            derive_required_close_keys(&fills, &request.required_trading_dates).map_err(
+                |error| progress.failure(error, AttributionReplayLoadStage::Trade, None),
+            )?;
+        let raw_closes =
+            load_stock_closes(&transaction, &required_close_keys).map_err(|error| {
+                progress.failure(error, AttributionReplayLoadStage::StockClose, None)
+            })?;
+        let stock_closes =
+            build_stock_close_manifest(raw_closes, &required_close_keys).map_err(|failure| {
+                progress.failure(
+                    failure.error,
+                    AttributionReplayLoadStage::StockClose,
+                    failure.failure_date,
+                )
+            })?;
+        progress.stock_close_manifest_hash = Some(stock_closes.manifest_hash().to_owned());
+        verify_transaction_main_database(&transaction, &canonical_database, expected_identity)
+            .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Finalize, None))?;
+        let fees = validate_fee_ledger(request.fee_ledger.as_ref(), &fills)
+            .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Fee, None))?;
+        progress.fee = Some(fees.clone());
 
         #[cfg(test)]
         run_after_read_test_hook();
@@ -962,34 +1098,52 @@ impl AttributionReplayLoader {
             .metadata()
             .map(|metadata| FileIdentity::of(&metadata))
             .map_err(|error| {
-                AttributionReplayError::integrity(
-                    AttributionIntegrityFailure::DatabaseIdentity,
-                    format!("database identity re-check during read failed: {error}"),
+                progress.failure(
+                    AttributionReplayError::integrity(
+                        AttributionIntegrityFailure::DatabaseIdentity,
+                        format!("database identity re-check during read failed: {error}"),
+                    ),
+                    AttributionReplayLoadStage::Finalize,
+                    None,
                 )
             })?;
         if during_identity != expected_identity {
-            return Err(AttributionReplayError::integrity(
-                AttributionIntegrityFailure::DatabaseIdentity,
-                "database file identity changed during read",
+            return Err(progress.failure(
+                AttributionReplayError::integrity(
+                    AttributionIntegrityFailure::DatabaseIdentity,
+                    "database file identity changed during read",
+                ),
+                AttributionReplayLoadStage::Finalize,
+                None,
             ));
         }
         transaction
             .commit()
-            .map_err(|error| source_read_error("finish read transaction", error))?;
-        verify_main_database(&connection, &canonical_database, expected_identity)?;
+            .map_err(|error| source_read_error("finish read transaction", error))
+            .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Finalize, None))?;
+        verify_main_database(&connection, &canonical_database, expected_identity)
+            .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Finalize, None))?;
         let after_identity = canonical_database
             .metadata()
             .map(|metadata| FileIdentity::of(&metadata))
             .map_err(|error| {
-                AttributionReplayError::integrity(
-                    AttributionIntegrityFailure::DatabaseIdentity,
-                    format!("database identity re-check after read failed: {error}"),
+                progress.failure(
+                    AttributionReplayError::integrity(
+                        AttributionIntegrityFailure::DatabaseIdentity,
+                        format!("database identity re-check after read failed: {error}"),
+                    ),
+                    AttributionReplayLoadStage::Finalize,
+                    None,
                 )
             })?;
         if after_identity != expected_identity {
-            return Err(AttributionReplayError::integrity(
-                AttributionIntegrityFailure::DatabaseIdentity,
-                "database file identity changed after read",
+            return Err(progress.failure(
+                AttributionReplayError::integrity(
+                    AttributionIntegrityFailure::DatabaseIdentity,
+                    "database file identity changed after read",
+                ),
+                AttributionReplayLoadStage::Finalize,
+                None,
             ));
         }
 
@@ -1539,70 +1693,106 @@ fn derive_required_close_keys(
     Ok(keys)
 }
 
+#[derive(Debug)]
+struct StockCloseManifestFailure {
+    error: AttributionReplayError,
+    failure_date: Option<NaiveDate>,
+}
+
+impl StockCloseManifestFailure {
+    fn new(error: AttributionReplayError, failure_date: Option<NaiveDate>) -> Self {
+        Self {
+            error,
+            failure_date,
+        }
+    }
+}
+
 fn build_stock_close_manifest(
     rows: Vec<RawStockCloseRow>,
     required_keys: &BTreeSet<(String, NaiveDate)>,
-) -> Result<StockCloseManifest, AttributionReplayError> {
+) -> Result<StockCloseManifest, StockCloseManifestFailure> {
     let mut selected = BTreeMap::<(String, NaiveDate), StockCloseEvidence>::new();
     for row in rows {
         let parsed_date = NaiveDate::parse_from_str(&row.date, "%Y-%m-%d").map_err(|error| {
-            AttributionReplayError::integrity(
-                AttributionIntegrityFailure::StockCloseSource,
-                format!(
-                    "stock_daily id={} date is not exact YYYY-MM-DD: {error}",
-                    row.id
+            StockCloseManifestFailure::new(
+                AttributionReplayError::integrity(
+                    AttributionIntegrityFailure::StockCloseSource,
+                    format!(
+                        "stock_daily id={} date is not exact YYYY-MM-DD: {error}",
+                        row.id
+                    ),
                 ),
+                None,
             )
         })?;
         if parsed_date.format("%Y-%m-%d").to_string() != row.date {
-            return Err(AttributionReplayError::integrity(
-                AttributionIntegrityFailure::StockCloseSource,
-                format!("stock_daily id={} date is not canonical YYYY-MM-DD", row.id),
+            return Err(StockCloseManifestFailure::new(
+                AttributionReplayError::integrity(
+                    AttributionIntegrityFailure::StockCloseSource,
+                    format!("stock_daily id={} date is not canonical YYYY-MM-DD", row.id),
+                ),
+                Some(parsed_date),
             ));
         }
         let key = (row.code.clone(), parsed_date);
         if !required_keys.contains(&key) {
-            return Err(AttributionReplayError::integrity(
-                AttributionIntegrityFailure::StockCloseSource,
-                format!(
-                    "stock close query returned unexpected key {} {}",
-                    row.code, parsed_date
+            return Err(StockCloseManifestFailure::new(
+                AttributionReplayError::integrity(
+                    AttributionIntegrityFailure::StockCloseSource,
+                    format!(
+                        "stock close query returned unexpected key {} {}",
+                        row.code, parsed_date
+                    ),
                 ),
+                Some(parsed_date),
             ));
         }
         if selected.contains_key(&key) {
-            return Err(AttributionReplayError::integrity(
-                AttributionIntegrityFailure::StockCloseSource,
-                format!(
-                    "duplicate stock close fact for {} {}",
-                    row.code, parsed_date
+            return Err(StockCloseManifestFailure::new(
+                AttributionReplayError::integrity(
+                    AttributionIntegrityFailure::StockCloseSource,
+                    format!(
+                        "duplicate stock close fact for {} {}",
+                        row.code, parsed_date
+                    ),
                 ),
+                Some(parsed_date),
             ));
         }
         let close = row.close.ok_or_else(|| {
-            AttributionReplayError::unavailable(
-                AttributionUnavailable::StockCloseUnavailable,
-                true,
-                format!("stock close is absent for {} {}", row.code, parsed_date),
+            StockCloseManifestFailure::new(
+                AttributionReplayError::unavailable(
+                    AttributionUnavailable::StockCloseUnavailable,
+                    true,
+                    format!("stock close is absent for {} {}", row.code, parsed_date),
+                ),
+                Some(parsed_date),
             )
         })?;
         if !close.is_finite() || close <= 0.0 {
-            return Err(AttributionReplayError::integrity(
-                AttributionIntegrityFailure::StockCloseSource,
-                format!("stock close is invalid for {} {}", row.code, parsed_date),
+            return Err(StockCloseManifestFailure::new(
+                AttributionReplayError::integrity(
+                    AttributionIntegrityFailure::StockCloseSource,
+                    format!("stock close is invalid for {} {}", row.code, parsed_date),
+                ),
+                Some(parsed_date),
             ));
         }
         row.data_source
             .as_deref()
             .filter(|source| !source.trim().is_empty())
             .ok_or_else(|| {
-                AttributionReplayError::unavailable(
-                    AttributionUnavailable::StockCloseUnavailable,
-                    true,
-                    format!(
-                        "stock close source is absent for {} {}",
-                        row.code, parsed_date
+                StockCloseManifestFailure::new(
+                    AttributionReplayError::unavailable(
+                        AttributionUnavailable::StockCloseUnavailable,
+                        true,
+                        format!(
+                            "stock close source is absent for {} {}",
+                            row.code, parsed_date
+                        ),
                     ),
+                    Some(parsed_date),
                 )
             })?;
         selected.insert(
@@ -1619,10 +1809,13 @@ fn build_stock_close_manifest(
     }
     for (code, date) in required_keys {
         if !selected.contains_key(&(code.clone(), *date)) {
-            return Err(AttributionReplayError::unavailable(
-                AttributionUnavailable::StockCloseUnavailable,
-                true,
-                format!("stock close is unavailable for {code} {date}"),
+            return Err(StockCloseManifestFailure::new(
+                AttributionReplayError::unavailable(
+                    AttributionUnavailable::StockCloseUnavailable,
+                    true,
+                    format!("stock close is unavailable for {code} {date}"),
+                ),
+                Some(*date),
             ));
         }
     }
@@ -2583,6 +2776,1242 @@ pub fn canonical_attribution_report_hash(
     Ok(hex::encode(hasher.finalize()))
 }
 
+const ATTRIBUTION_REPLAY_RULE_VERSION: &str = "BR-251-v1";
+const RUNNER_SOURCE_SUMMARY_DOMAIN: &[u8] = b"BR251_RUNNER_SOURCE_SUMMARY_V2\0";
+const RUNNER_FAILURE_LEAF_DOMAIN: &[u8] = b"BR251_RUNNER_FAILURE_LEAF_V1\0";
+#[cfg(test)]
+const RUNNER_TEST_SEMANTICS_DOMAIN: &[u8] = b"BR251_RUNNER_TEST_SEMANTICS_V1\0";
+const RUNNER_BENCHMARK_MANIFEST_DOMAIN: &[u8] = b"BR251_RUNNER_DAY_MANIFESTS_V1\0";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayMode {
+    Scheduled {
+        invoked_at: DateTime<FixedOffset>,
+    },
+    Range {
+        from: NaiveDate,
+        to: NaiveDate,
+        invoked_at: DateTime<FixedOffset>,
+    },
+    Quarter {
+        year: i32,
+        quarter: u8,
+        invoked_at: DateTime<FixedOffset>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayRequest {
+    pub mode: ReplayMode,
+    pub benchmark_day_manifests: Vec<BenchmarkDayManifest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BenchmarkDayManifest {
+    pub trading_date: NaiveDate,
+    pub manifest_hash: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayErrorClass {
+    Unavailable,
+    FailedIntegrity,
+    Storage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayStage {
+    Request,
+    Calendar,
+    TradeEvidence,
+    Benchmark,
+    Compute,
+    Store,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayEvidenceFailureKind {
+    StockCloseAbsent,
+    BenchmarkExactAbsent,
+}
+
+impl ReplayStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Calendar => "calendar",
+            Self::TradeEvidence => "trade_evidence",
+            Self::Benchmark => "benchmark",
+            Self::Compute => "compute",
+            Self::Store => "store",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayError {
+    class: ReplayErrorClass,
+    stage: ReplayStage,
+    code: &'static str,
+    retryable: bool,
+    redacted_message: String,
+    failure_receipt: Option<Box<AttributionFailureReceipt>>,
+    failure_date: Option<NaiveDate>,
+    failure_fingerprint: [u8; 32],
+    evidence_failure_kind: Option<ReplayEvidenceFailureKind>,
+}
+
+impl ReplayError {
+    fn new(
+        class: ReplayErrorClass,
+        stage: ReplayStage,
+        code: &'static str,
+        retryable: bool,
+    ) -> Self {
+        let failure_fingerprint = runner_failure_leaf_fingerprint(
+            class,
+            stage,
+            code,
+            retryable,
+            code.as_bytes(),
+            None,
+            None,
+        );
+        Self {
+            class,
+            stage,
+            code,
+            retryable,
+            redacted_message: format!("BR-251 replay failed at {} with {code}", stage.as_str()),
+            failure_receipt: None,
+            failure_date: None,
+            failure_fingerprint,
+            evidence_failure_kind: None,
+        }
+    }
+
+    fn with_failure_date(mut self, failure_date: NaiveDate) -> Self {
+        self.failure_date = Some(failure_date);
+        self.failure_fingerprint = runner_failure_leaf_fingerprint(
+            self.class,
+            self.stage,
+            self.code,
+            self.retryable,
+            self.code.as_bytes(),
+            Some(failure_date),
+            None,
+        );
+        self
+    }
+
+    fn with_typed_failure(
+        mut self,
+        kind: &'static str,
+        detail: &[u8],
+        failure_date: Option<NaiveDate>,
+        manifest_hash: Option<&str>,
+    ) -> Self {
+        self.failure_date = failure_date;
+        self.failure_fingerprint = runner_failure_leaf_fingerprint(
+            self.class,
+            self.stage,
+            kind,
+            self.retryable,
+            detail,
+            failure_date,
+            manifest_hash,
+        );
+        self
+    }
+
+    fn with_benchmark_failure_context(
+        mut self,
+        failure_date: NaiveDate,
+        manifest_hash: &str,
+    ) -> Self {
+        self.failure_date = Some(failure_date);
+        self.failure_fingerprint = runner_failure_leaf_fingerprint(
+            self.class,
+            self.stage,
+            self.code,
+            self.retryable,
+            self.code.as_bytes(),
+            Some(failure_date),
+            Some(manifest_hash),
+        );
+        self
+    }
+
+    fn with_evidence_failure_kind(mut self, kind: ReplayEvidenceFailureKind) -> Self {
+        self.evidence_failure_kind = Some(kind);
+        self
+    }
+
+    fn into_current_session_incomplete(mut self) -> Self {
+        self.code = "current_session_incomplete";
+        self.retryable = true;
+        self.redacted_message = format!(
+            "BR-251 replay failed at {} with current_session_incomplete",
+            self.stage.as_str()
+        );
+        self
+    }
+
+    fn with_failure_receipt(mut self, receipt: AttributionFailureReceipt) -> Self {
+        self.failure_receipt = Some(Box::new(receipt));
+        self
+    }
+
+    pub const fn class(&self) -> ReplayErrorClass {
+        self.class
+    }
+
+    pub const fn stage(&self) -> ReplayStage {
+        self.stage
+    }
+
+    pub const fn code(&self) -> &'static str {
+        self.code
+    }
+
+    pub const fn retryable(&self) -> bool {
+        self.retryable
+    }
+
+    pub fn redacted_message(&self) -> &str {
+        &self.redacted_message
+    }
+
+    pub fn failure_receipt(&self) -> Option<&AttributionFailureReceipt> {
+        self.failure_receipt.as_deref()
+    }
+}
+
+fn runner_failure_leaf_fingerprint(
+    class: ReplayErrorClass,
+    stage: ReplayStage,
+    kind: &str,
+    retryable: bool,
+    detail: &[u8],
+    failure_date: Option<NaiveDate>,
+    manifest_hash: Option<&str>,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(RUNNER_FAILURE_LEAF_DOMAIN);
+    hasher.update([match class {
+        ReplayErrorClass::Unavailable => 0,
+        ReplayErrorClass::FailedIntegrity => 1,
+        ReplayErrorClass::Storage => 2,
+    }]);
+    update_len_prefixed(&mut hasher, stage.as_str().as_bytes());
+    update_len_prefixed(&mut hasher, kind.as_bytes());
+    hasher.update([u8::from(retryable)]);
+    update_len_prefixed(&mut hasher, detail);
+    match failure_date {
+        Some(date) => {
+            hasher.update([1]);
+            update_len_prefixed(&mut hasher, date.to_string().as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    match manifest_hash {
+        Some(hash) => {
+            hasher.update([1]);
+            update_len_prefixed(&mut hasher, hash.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    hasher.finalize().into()
+}
+
+impl std::fmt::Display for ReplayError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} ({:?}, retryable={})",
+            self.redacted_message, self.class, self.retryable
+        )
+    }
+}
+
+impl std::error::Error for ReplayError {}
+
+/// Opaque output of the runner's one read-only prepare pipeline.
+#[derive(Debug, Clone)]
+pub struct PreparedAttributionReport {
+    invocation: AttributionInvocation,
+    report: AttributionComputationReport,
+    canonical_result_bytes: Vec<u8>,
+    result_payload: serde_json::Value,
+    trade_manifest_hash: String,
+    fee: AttributionEvidenceHash,
+    stock_close_manifest_hash: String,
+    benchmark_manifest_hash: String,
+    benchmark_day_manifests: Vec<BenchmarkDayManifest>,
+    calendar_authority_hash: String,
+}
+
+impl PreparedAttributionReport {
+    pub fn invocation(&self) -> &AttributionInvocation {
+        &self.invocation
+    }
+
+    pub fn report(&self) -> &AttributionComputationReport {
+        &self.report
+    }
+
+    pub fn canonical_result_bytes(&self) -> &[u8] {
+        &self.canonical_result_bytes
+    }
+
+    pub fn trade_manifest_hash(&self) -> &str {
+        &self.trade_manifest_hash
+    }
+
+    pub fn stock_close_manifest_hash(&self) -> &str {
+        &self.stock_close_manifest_hash
+    }
+
+    pub fn benchmark_manifest_hash(&self) -> &str {
+        &self.benchmark_manifest_hash
+    }
+
+    pub fn benchmark_day_manifests(&self) -> &[BenchmarkDayManifest] {
+        &self.benchmark_day_manifests
+    }
+
+    pub fn calendar_authority_hash(&self) -> &str {
+        &self.calendar_authority_hash
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AdmittedReplayRequest {
+    mode: ReplayMode,
+    provisional_invocation: AttributionInvocation,
+    benchmark_day_manifests: Vec<BenchmarkDayManifest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FailureEvidenceState {
+    Unknown,
+    Unavailable([u8; 32]),
+    Available(String),
+}
+
+#[derive(Debug, Clone)]
+struct FailureEvidenceSummary {
+    mode: &'static str,
+    invoked_at: DateTime<FixedOffset>,
+    target_from: NaiveDate,
+    target_to: NaiveDate,
+    rule_version: String,
+    requested_benchmark_days: Vec<BenchmarkDayManifest>,
+    calendar: FailureEvidenceState,
+    trade: FailureEvidenceState,
+    stock_close: FailureEvidenceState,
+    fee: FailureEvidenceState,
+    benchmark_days: BTreeMap<NaiveDate, FailureEvidenceState>,
+}
+
+impl FailureEvidenceSummary {
+    fn new(admitted: &AdmittedReplayRequest) -> Self {
+        let mode = match admitted.provisional_invocation.mode {
+            AttributionRunMode::Scheduled => "scheduled",
+            AttributionRunMode::Range => "range",
+            AttributionRunMode::Quarter => "quarter",
+        };
+        let benchmark_days = admitted
+            .benchmark_day_manifests
+            .iter()
+            .map(|binding| (binding.trading_date, FailureEvidenceState::Unknown))
+            .collect();
+        Self {
+            mode,
+            invoked_at: admitted.provisional_invocation.invoked_at,
+            target_from: admitted.provisional_invocation.target_from,
+            target_to: admitted.provisional_invocation.target_to,
+            rule_version: admitted.provisional_invocation.rule_version.clone(),
+            requested_benchmark_days: admitted.benchmark_day_manifests.clone(),
+            calendar: FailureEvidenceState::Unknown,
+            trade: FailureEvidenceState::Unknown,
+            stock_close: FailureEvidenceState::Unknown,
+            fee: FailureEvidenceState::Unknown,
+            benchmark_days,
+        }
+    }
+
+    fn record_calendar(&mut self, calendar: &VerifiedReplayCalendar) {
+        self.target_from = calendar.target_from();
+        self.target_to = calendar.target_to();
+        self.calendar = FailureEvidenceState::Available(calendar.authority_hash().to_owned());
+    }
+
+    fn record_replay_evidence(&mut self, evidence: &AttributionReplayEvidence) {
+        self.trade = FailureEvidenceState::Available(evidence.trade_manifest_hash().to_owned());
+        self.stock_close =
+            FailureEvidenceState::Available(evidence.stock_closes().manifest_hash().to_owned());
+        self.fee = failure_fee_state(evidence.fees());
+    }
+
+    fn record_load_failure(
+        &mut self,
+        failure: &AttributionReplayLoadFailure,
+        leaf_fingerprint: [u8; 32],
+    ) {
+        if let Some(identity) = &failure.progress.trade_manifest_hash {
+            self.trade = FailureEvidenceState::Available(identity.clone());
+        }
+        if let Some(identity) = &failure.progress.stock_close_manifest_hash {
+            self.stock_close = FailureEvidenceState::Available(identity.clone());
+        }
+        if let Some(fee) = &failure.progress.fee {
+            self.fee = failure_fee_state(fee);
+        }
+        match failure.stage {
+            AttributionReplayLoadStage::Trade
+                if matches!(self.trade, FailureEvidenceState::Unknown) =>
+            {
+                self.trade = FailureEvidenceState::Unavailable(leaf_fingerprint);
+            }
+            AttributionReplayLoadStage::StockClose
+                if matches!(self.stock_close, FailureEvidenceState::Unknown) =>
+            {
+                self.stock_close = FailureEvidenceState::Unavailable(leaf_fingerprint);
+            }
+            AttributionReplayLoadStage::Fee
+                if matches!(self.fee, FailureEvidenceState::Unknown) =>
+            {
+                self.fee = FailureEvidenceState::Unavailable(leaf_fingerprint);
+            }
+            AttributionReplayLoadStage::Finalize
+            | AttributionReplayLoadStage::Trade
+            | AttributionReplayLoadStage::StockClose
+            | AttributionReplayLoadStage::Fee => {}
+        }
+    }
+
+    fn record_benchmark_available(&mut self, date: NaiveDate, manifest_hash: &str) {
+        self.benchmark_days.insert(
+            date,
+            FailureEvidenceState::Available(manifest_hash.to_owned()),
+        );
+    }
+
+    fn record_benchmark_unavailable(&mut self, date: NaiveDate, fingerprint: [u8; 32]) {
+        self.benchmark_days
+            .insert(date, FailureEvidenceState::Unavailable(fingerprint));
+    }
+
+    fn source_summary_hash(&self, error: &ReplayError) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(RUNNER_SOURCE_SUMMARY_DOMAIN);
+        update_len_prefixed(&mut hasher, self.mode.as_bytes());
+        update_len_prefixed(&mut hasher, self.invoked_at.to_rfc3339().as_bytes());
+        update_len_prefixed(&mut hasher, self.target_from.to_string().as_bytes());
+        update_len_prefixed(&mut hasher, self.target_to.to_string().as_bytes());
+        update_len_prefixed(&mut hasher, self.rule_version.as_bytes());
+        hasher.update((self.requested_benchmark_days.len() as u64).to_be_bytes());
+        for binding in &self.requested_benchmark_days {
+            update_len_prefixed(&mut hasher, binding.trading_date.to_string().as_bytes());
+            update_len_prefixed(&mut hasher, binding.manifest_hash.as_bytes());
+        }
+        update_failure_evidence_state(&mut hasher, &self.calendar);
+        update_failure_evidence_state(&mut hasher, &self.trade);
+        update_failure_evidence_state(&mut hasher, &self.stock_close);
+        update_failure_evidence_state(&mut hasher, &self.fee);
+        hasher.update((self.benchmark_days.len() as u64).to_be_bytes());
+        for (date, state) in &self.benchmark_days {
+            update_len_prefixed(&mut hasher, date.to_string().as_bytes());
+            update_failure_evidence_state(&mut hasher, state);
+        }
+        update_len_prefixed(&mut hasher, error.stage.as_str().as_bytes());
+        update_len_prefixed(&mut hasher, error.code.as_bytes());
+        hasher.update([u8::from(error.retryable)]);
+        hasher.update(error.failure_fingerprint);
+        hex::encode(hasher.finalize())
+    }
+}
+
+fn update_failure_evidence_state(hasher: &mut Sha256, state: &FailureEvidenceState) {
+    match state {
+        FailureEvidenceState::Unknown => hasher.update([0]),
+        FailureEvidenceState::Unavailable(fingerprint) => {
+            hasher.update([1]);
+            hasher.update(fingerprint);
+        }
+        FailureEvidenceState::Available(identity) => {
+            hasher.update([2]);
+            update_len_prefixed(hasher, identity.as_bytes());
+        }
+    }
+}
+
+fn failure_fee_state(fee: &FeeEvidenceAvailability) -> FailureEvidenceState {
+    match fee {
+        FeeEvidenceAvailability::Available(ledger) => {
+            let mut bindings = ledger
+                .entries()
+                .iter()
+                .map(|entry| FeeEvidenceBinding {
+                    fill_id: entry.fill_id(),
+                    evidence_hash: entry.evidence_hash().to_owned(),
+                })
+                .collect::<Vec<_>>();
+            bindings.sort_by_key(|binding| binding.fill_id);
+            FailureEvidenceState::Available(canonical_replay_fee_basis_id(&bindings))
+        }
+        FeeEvidenceAvailability::Unavailable {
+            code,
+            retryable,
+            detail,
+        } => FailureEvidenceState::Unavailable(runner_failure_leaf_fingerprint(
+            ReplayErrorClass::Unavailable,
+            ReplayStage::TradeEvidence,
+            code.code(),
+            *retryable,
+            detail.as_bytes(),
+            None,
+            None,
+        )),
+    }
+}
+
+struct PrepareFailure {
+    error: ReplayError,
+    invocation: AttributionInvocation,
+    evidence: FailureEvidenceSummary,
+}
+
+/// Production construction always keeps minute-label semantics unverified.
+/// The TEST_CODE-only constructor is not callable by an external/production caller:
+///
+/// ```compile_fail
+/// use stock_analysis::performance::attribution_replay::{
+///     AttributionReplayLoader, AttributionReplayRunner,
+/// };
+/// use stock_analysis::database::DatabaseManager;
+///
+/// fn unlock<'a>(database: &'a DatabaseManager, loader: AttributionReplayLoader) {
+///     let _ = AttributionReplayRunner::new_for_test(
+///         database,
+///         loader,
+///         "sh000300",
+///         "caller_hash",
+///     );
+/// }
+/// ```
+///
+/// A prepared preview is opaque and cannot be forged or passed to `commit`:
+///
+/// ```compile_fail
+/// use stock_analysis::performance::attribution_replay::PreparedAttributionReport;
+///
+/// fn forge() -> PreparedAttributionReport {
+///     PreparedAttributionReport { todo!() }
+/// }
+/// ```
+pub struct AttributionReplayRunner<'a> {
+    database: &'a DatabaseManager,
+    loader: AttributionReplayLoader,
+    benchmark_instrument: String,
+    minute_semantics: MinuteLabelSemantics,
+    fee_ledger: Option<AuthoritativeFillFeeLedger>,
+}
+
+impl<'a> AttributionReplayRunner<'a> {
+    #[must_use]
+    pub fn new(database: &'a DatabaseManager, loader: AttributionReplayLoader) -> Self {
+        Self {
+            database,
+            loader,
+            benchmark_instrument: HS300_CANONICAL.to_owned(),
+            minute_semantics: MinuteLabelSemantics::Unverified,
+            fee_ledger: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_test(
+        database: &'a DatabaseManager,
+        loader: AttributionReplayLoader,
+        benchmark_instrument: &str,
+        semantics_evidence: &str,
+    ) -> Self {
+        assert!(benchmark_instrument.starts_with("TEST_CODE"));
+        assert!(semantics_evidence.starts_with("TEST_CODE"));
+        let mut hasher = Sha256::new();
+        hasher.update(RUNNER_TEST_SEMANTICS_DOMAIN);
+        update_len_prefixed(&mut hasher, semantics_evidence.as_bytes());
+        Self {
+            database,
+            loader,
+            benchmark_instrument: benchmark_instrument.to_owned(),
+            minute_semantics: MinuteLabelSemantics::EndLabelVerified {
+                evidence_hash: hex::encode(hasher.finalize()),
+            },
+            fee_ledger: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_test_with_fee_ledger(
+        database: &'a DatabaseManager,
+        loader: AttributionReplayLoader,
+        benchmark_instrument: &str,
+        semantics_evidence: &str,
+        fee_ledger: AuthoritativeFillFeeLedger,
+    ) -> Self {
+        let mut runner =
+            Self::new_for_test(database, loader, benchmark_instrument, semantics_evidence);
+        runner.fee_ledger = Some(fee_ledger);
+        runner
+    }
+
+    pub fn preview(
+        &self,
+        request: ReplayRequest,
+    ) -> Result<PreparedAttributionReport, ReplayError> {
+        let admitted = admit_replay_request(request)?;
+        self.prepare(&admitted).map_err(|failure| failure.error)
+    }
+
+    pub fn commit(&self, request: ReplayRequest) -> Result<AttributionReportReceipt, ReplayError> {
+        let admitted = admit_replay_request(request)?;
+        let prepared = match self.prepare(&admitted) {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                let error = failure.error;
+                let source_summary_hash = failure.evidence.source_summary_hash(&error);
+                let receipt = AttributionReportStore::new(self.database)
+                    .commit_failure(AttributionFailureAppend {
+                        invocation: failure.invocation,
+                        stage: error.stage.as_str().to_owned(),
+                        code: error.code.to_owned(),
+                        retryable: error.retryable,
+                        source_summary_hash,
+                        redacted_message: error.redacted_message.clone(),
+                    })
+                    .map_err(map_store_error)?;
+                return Err(error.with_failure_receipt(receipt));
+            }
+        };
+        AttributionReportStore::new(self.database)
+            .commit_report(AttributionReportAppend {
+                invocation: prepared.invocation,
+                trade_hash: prepared.trade_manifest_hash,
+                fee: prepared.fee,
+                stock_close_hash: prepared.stock_close_manifest_hash,
+                benchmark_manifest_hash: prepared.benchmark_manifest_hash,
+                calendar_authority_hash: prepared.calendar_authority_hash,
+                regime: AttributionEvidenceHash::Unavailable(
+                    "market_regime_unavailable".to_owned(),
+                ),
+                result_payload: prepared.result_payload,
+            })
+            .map_err(map_store_error)
+    }
+
+    fn prepare(
+        &self,
+        admitted: &AdmittedReplayRequest,
+    ) -> Result<PreparedAttributionReport, Box<PrepareFailure>> {
+        let mut summary = FailureEvidenceSummary::new(admitted);
+        let calendar = match resolve_admitted_calendar(admitted) {
+            Ok(calendar) => calendar,
+            Err(error) => {
+                let error = map_calendar_error(error);
+                summary.calendar = FailureEvidenceState::Unavailable(error.failure_fingerprint);
+                return Err(Box::new(PrepareFailure {
+                    error,
+                    invocation: admitted.provisional_invocation.clone(),
+                    evidence: summary,
+                }));
+            }
+        };
+        summary.record_calendar(&calendar);
+        let invocation = AttributionInvocation {
+            target_from: calendar.target_from(),
+            target_to: calendar.target_to(),
+            ..admitted.provisional_invocation.clone()
+        };
+        let replay_request = AttributionReplayRequest {
+            from: calendar.target_from(),
+            to: calendar.target_to(),
+            required_trading_dates: calendar.required_trading_dates().to_vec(),
+            fee_ledger: self.fee_ledger.clone(),
+        };
+        let evidence = match self.loader.load_with_progress(&replay_request) {
+            Ok(evidence) => evidence,
+            Err(failure) => {
+                let error = map_current_session_evidence_error(
+                    admitted,
+                    &calendar,
+                    map_attribution_load_failure(&failure),
+                );
+                summary.record_load_failure(&failure, error.failure_fingerprint);
+                return Err(Box::new(PrepareFailure {
+                    error,
+                    invocation,
+                    evidence: summary,
+                }));
+            }
+        };
+        summary.record_replay_evidence(&evidence);
+        if let Err(error) = validate_fill_calendar_authority(&evidence) {
+            let error = map_current_session_evidence_error(admitted, &calendar, error);
+            return Err(Box::new(PrepareFailure {
+                error,
+                invocation,
+                evidence: summary,
+            }));
+        }
+        let (benchmark_bars, benchmark_manifest_hash, benchmark_day_manifests) =
+            match load_runner_benchmarks(
+                self.database,
+                &self.benchmark_instrument,
+                &evidence,
+                &calendar,
+                &admitted.benchmark_day_manifests,
+                &mut summary,
+            ) {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    let error = map_current_session_evidence_error(admitted, &calendar, error);
+                    return Err(Box::new(PrepareFailure {
+                        error,
+                        invocation,
+                        evidence: summary,
+                    }));
+                }
+            };
+        let report =
+            match compute_attribution_range(&evidence, &benchmark_bars, &self.minute_semantics) {
+                Ok(report) => report,
+                Err(error) => {
+                    return Err(Box::new(PrepareFailure {
+                        error: map_attribution_error(ReplayStage::Compute, error),
+                        invocation,
+                        evidence: summary,
+                    }));
+                }
+            };
+        let canonical_result_bytes = match canonical_attribution_report_bytes(&report) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return Err(Box::new(PrepareFailure {
+                    error: map_attribution_error(ReplayStage::Compute, error),
+                    invocation,
+                    evidence: summary,
+                }));
+            }
+        };
+        let core_result_payload: serde_json::Value =
+            match serde_json::from_slice(&canonical_result_bytes) {
+                Ok(payload) => payload,
+                Err(_) => {
+                    return Err(Box::new(PrepareFailure {
+                        error: ReplayError::new(
+                            ReplayErrorClass::FailedIntegrity,
+                            ReplayStage::Compute,
+                            "canonical_attribution_report_failed",
+                            false,
+                        ),
+                        invocation,
+                        evidence: summary,
+                    }));
+                }
+            };
+        let result_payload = serde_json::json!({
+            "benchmark_day_manifests": &benchmark_day_manifests,
+            "core_report": core_result_payload,
+        });
+        let fee = match runner_fee_evidence_hash(report.fee_basis()) {
+            Ok(fee) => fee,
+            Err(error) => {
+                return Err(Box::new(PrepareFailure {
+                    error,
+                    invocation,
+                    evidence: summary,
+                }));
+            }
+        };
+        Ok(PreparedAttributionReport {
+            invocation,
+            report,
+            canonical_result_bytes,
+            result_payload,
+            trade_manifest_hash: evidence.trade_manifest_hash().to_owned(),
+            fee,
+            stock_close_manifest_hash: evidence.stock_closes().manifest_hash().to_owned(),
+            benchmark_manifest_hash,
+            benchmark_day_manifests,
+            calendar_authority_hash: calendar.authority_hash().to_owned(),
+        })
+    }
+}
+
+fn replay_invoked_at(mode: &ReplayMode) -> DateTime<FixedOffset> {
+    match mode {
+        ReplayMode::Scheduled { invoked_at }
+        | ReplayMode::Range { invoked_at, .. }
+        | ReplayMode::Quarter { invoked_at, .. } => *invoked_at,
+    }
+}
+
+fn admit_replay_request(request: ReplayRequest) -> Result<AdmittedReplayRequest, ReplayError> {
+    let invoked_at = replay_invoked_at(&request.mode);
+    if invoked_at.offset().local_minus_utc() != 8 * 60 * 60 {
+        return Err(ReplayError::new(
+            ReplayErrorClass::FailedIntegrity,
+            ReplayStage::Request,
+            "invalid_invocation_timezone",
+            false,
+        ));
+    }
+    if request
+        .benchmark_day_manifests
+        .iter()
+        .any(|binding| !is_lowercase_sha256(&binding.manifest_hash))
+    {
+        return Err(ReplayError::new(
+            ReplayErrorClass::FailedIntegrity,
+            ReplayStage::Request,
+            "invalid_benchmark_manifest_hash",
+            false,
+        ));
+    }
+    let (mode, target_from, target_to) = match &request.mode {
+        ReplayMode::Scheduled { invoked_at } => (
+            AttributionRunMode::Scheduled,
+            invoked_at.date_naive(),
+            invoked_at.date_naive(),
+        ),
+        ReplayMode::Range { from, to, .. } if from <= to => (AttributionRunMode::Range, *from, *to),
+        ReplayMode::Range { .. } => {
+            return Err(ReplayError::new(
+                ReplayErrorClass::FailedIntegrity,
+                ReplayStage::Request,
+                "invalid_replay_range",
+                false,
+            ));
+        }
+        ReplayMode::Quarter { year, quarter, .. } => {
+            let (from, to) =
+                verified_replay_quarter_bounds(*year, *quarter).map_err(map_calendar_error)?;
+            (AttributionRunMode::Quarter, from, to)
+        }
+    };
+    Ok(AdmittedReplayRequest {
+        mode: request.mode,
+        provisional_invocation: AttributionInvocation {
+            mode,
+            target_from,
+            target_to,
+            rule_version: ATTRIBUTION_REPLAY_RULE_VERSION.to_owned(),
+            invoked_at,
+        },
+        benchmark_day_manifests: request.benchmark_day_manifests,
+    })
+}
+
+fn resolve_admitted_calendar(
+    admitted: &AdmittedReplayRequest,
+) -> Result<VerifiedReplayCalendar, VerifiedCalendarError> {
+    match &admitted.mode {
+        ReplayMode::Scheduled { invoked_at } => resolve_verified_scheduled_replay(*invoked_at),
+        ReplayMode::Range { from, to, .. } => resolve_verified_replay_range(*from, *to),
+        ReplayMode::Quarter { year, quarter, .. } => {
+            resolve_verified_replay_quarter(*year, *quarter)
+        }
+    }
+}
+
+fn validate_fill_calendar_authority(
+    evidence: &AttributionReplayEvidence,
+) -> Result<(), ReplayError> {
+    for fill in evidence.fills() {
+        let paper_date = parse_paper_fill_timestamp(fill.fill().id, &fill.fill().occurred_at)
+            .map_err(|detail| {
+                ReplayError::new(
+                    ReplayErrorClass::FailedIntegrity,
+                    ReplayStage::Calendar,
+                    "fill_timestamp_invalid",
+                    false,
+                )
+                .with_typed_failure(
+                    "paper_fill_timestamp",
+                    detail.as_bytes(),
+                    None,
+                    None,
+                )
+            })?
+            .date();
+        let terminal_date = fill.terminal_time().date_naive();
+        for date in [paper_date, terminal_date] {
+            match verified_a_share_trading_day(date) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(ReplayError::new(
+                        ReplayErrorClass::FailedIntegrity,
+                        ReplayStage::Calendar,
+                        "fill_non_trading_day",
+                        false,
+                    )
+                    .with_failure_date(date));
+                }
+                Err(detail) => {
+                    return Err(ReplayError::new(
+                        ReplayErrorClass::FailedIntegrity,
+                        ReplayStage::Calendar,
+                        "fill_calendar_authority_failed",
+                        false,
+                    )
+                    .with_typed_failure(
+                        "fill_calendar_authority",
+                        detail.as_bytes(),
+                        Some(date),
+                        None,
+                    ));
+                }
+            }
+        }
+        if paper_date != terminal_date {
+            let detail = format!("{paper_date}|{terminal_date}");
+            return Err(ReplayError::new(
+                ReplayErrorClass::FailedIntegrity,
+                ReplayStage::Calendar,
+                "fill_terminal_date_mismatch",
+                false,
+            )
+            .with_typed_failure(
+                "fill_terminal_date_mismatch",
+                detail.as_bytes(),
+                Some(paper_date),
+                None,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn runner_benchmark_request(
+    instrument: &str,
+    trading_date: NaiveDate,
+) -> Result<BenchmarkRequest, ReplayError> {
+    let offset = FixedOffset::east_opt(8 * 60 * 60).ok_or_else(|| {
+        ReplayError::new(
+            ReplayErrorClass::FailedIntegrity,
+            ReplayStage::Benchmark,
+            "benchmark_timezone_unavailable",
+            false,
+        )
+    })?;
+    let from = offset
+        .from_local_datetime(&trading_date.and_hms_opt(9, 31, 0).ok_or_else(|| {
+            ReplayError::new(
+                ReplayErrorClass::FailedIntegrity,
+                ReplayStage::Benchmark,
+                "benchmark_range_invalid",
+                false,
+            )
+        })?)
+        .single()
+        .ok_or_else(|| {
+            ReplayError::new(
+                ReplayErrorClass::FailedIntegrity,
+                ReplayStage::Benchmark,
+                "benchmark_range_invalid",
+                false,
+            )
+        })?;
+    let to = offset
+        .from_local_datetime(&trading_date.and_hms_opt(15, 0, 0).ok_or_else(|| {
+            ReplayError::new(
+                ReplayErrorClass::FailedIntegrity,
+                ReplayStage::Benchmark,
+                "benchmark_range_invalid",
+                false,
+            )
+        })?)
+        .single()
+        .ok_or_else(|| {
+            ReplayError::new(
+                ReplayErrorClass::FailedIntegrity,
+                ReplayStage::Benchmark,
+                "benchmark_range_invalid",
+                false,
+            )
+        })?;
+    Ok(BenchmarkRequest {
+        instrument: instrument.to_owned(),
+        range: BenchmarkRange::Minute1 { from, to },
+    })
+}
+
+fn load_runner_benchmarks(
+    database: &DatabaseManager,
+    instrument: &str,
+    evidence: &AttributionReplayEvidence,
+    calendar: &VerifiedReplayCalendar,
+    supplied: &[BenchmarkDayManifest],
+    summary: &mut FailureEvidenceSummary,
+) -> Result<(Vec<BenchmarkBar>, String, Vec<BenchmarkDayManifest>), ReplayError> {
+    if supplied
+        .windows(2)
+        .any(|pair| pair[0].trading_date >= pair[1].trading_date)
+    {
+        return Err(ReplayError::new(
+            ReplayErrorClass::FailedIntegrity,
+            ReplayStage::Benchmark,
+            "benchmark_day_manifests_not_strictly_ordered",
+            false,
+        ));
+    }
+    let mut required = calendar
+        .required_trading_dates()
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    required.extend(
+        evidence
+            .fills()
+            .iter()
+            .map(|fill| fill.terminal_time().date_naive()),
+    );
+    let supplied_dates = supplied
+        .iter()
+        .map(|binding| binding.trading_date)
+        .collect::<BTreeSet<_>>();
+    if supplied_dates.iter().any(|date| !required.contains(date)) {
+        return Err(ReplayError::new(
+            ReplayErrorClass::FailedIntegrity,
+            ReplayStage::Benchmark,
+            "benchmark_day_manifest_extra",
+            false,
+        ));
+    }
+    if let Some(missing_date) = required.iter().find(|date| !supplied_dates.contains(date)) {
+        let error = ReplayError::new(
+            ReplayErrorClass::Unavailable,
+            ReplayStage::Benchmark,
+            "benchmark_day_manifest_unavailable",
+            true,
+        )
+        .with_failure_date(*missing_date)
+        .with_evidence_failure_kind(ReplayEvidenceFailureKind::BenchmarkExactAbsent);
+        summary.record_benchmark_unavailable(*missing_date, error.failure_fingerprint);
+        return Err(error);
+    }
+    let reader = BenchmarkReader::new(database);
+    let mut bars = Vec::new();
+    for binding in supplied {
+        let expected = runner_benchmark_request(instrument, binding.trading_date)?;
+        let snapshot = match reader.read_exact(&binding.manifest_hash, &expected) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let error = map_benchmark_error(error)
+                    .with_benchmark_failure_context(binding.trading_date, &binding.manifest_hash);
+                summary
+                    .record_benchmark_unavailable(binding.trading_date, error.failure_fingerprint);
+                return Err(error);
+            }
+        };
+        summary.record_benchmark_available(binding.trading_date, &binding.manifest_hash);
+        bars.extend(snapshot.bars);
+    }
+    Ok((
+        bars,
+        requested_benchmark_binding_hash(supplied),
+        supplied.to_vec(),
+    ))
+}
+
+fn requested_benchmark_binding_hash(bindings: &[BenchmarkDayManifest]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(RUNNER_BENCHMARK_MANIFEST_DOMAIN);
+    hasher.update((bindings.len() as u64).to_be_bytes());
+    for binding in bindings {
+        update_len_prefixed(&mut hasher, binding.trading_date.to_string().as_bytes());
+        update_len_prefixed(&mut hasher, binding.manifest_hash.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn runner_fee_evidence_hash(
+    fee: &MetricAvailability<AttributionFeeBasis>,
+) -> Result<AttributionEvidenceHash, ReplayError> {
+    match fee {
+        MetricAvailability::Unavailable { code, .. } => {
+            Ok(AttributionEvidenceHash::Unavailable(code.code().to_owned()))
+        }
+        MetricAvailability::Available(basis) => {
+            if !is_lowercase_sha256(&basis.basis_id) {
+                return Err(ReplayError::new(
+                    ReplayErrorClass::FailedIntegrity,
+                    ReplayStage::Compute,
+                    "fee_basis_identity_failed",
+                    false,
+                ));
+            }
+            Ok(AttributionEvidenceHash::Available(basis.basis_id.clone()))
+        }
+    }
+}
+
+fn map_calendar_error(error: VerifiedCalendarError) -> ReplayError {
+    let kind = error.kind();
+    let class = match kind {
+        VerifiedCalendarErrorKind::CurrentSessionIncomplete
+        | VerifiedCalendarErrorKind::TradingCalendarUnavailable => ReplayErrorClass::Unavailable,
+        VerifiedCalendarErrorKind::InvalidRequest => ReplayErrorClass::FailedIntegrity,
+    };
+    ReplayError::new(
+        class,
+        ReplayStage::Calendar,
+        error.code(),
+        error.retryable(),
+    )
+    .with_typed_failure(
+        match kind {
+            VerifiedCalendarErrorKind::InvalidRequest => "calendar_invalid_request",
+            VerifiedCalendarErrorKind::CurrentSessionIncomplete => {
+                "calendar_current_session_incomplete"
+            }
+            VerifiedCalendarErrorKind::TradingCalendarUnavailable => {
+                "calendar_authority_unavailable"
+            }
+        },
+        error.code().as_bytes(),
+        None,
+        None,
+    )
+}
+
+fn map_attribution_error(stage: ReplayStage, error: AttributionReplayError) -> ReplayError {
+    match error {
+        AttributionReplayError::Unavailable {
+            code,
+            retryable,
+            detail,
+        } => ReplayError::new(ReplayErrorClass::Unavailable, stage, code.code(), retryable)
+            .with_typed_failure(code.code(), detail.as_bytes(), None, None),
+        AttributionReplayError::FailedIntegrity { code, detail } => {
+            ReplayError::new(ReplayErrorClass::FailedIntegrity, stage, code.code(), false)
+                .with_typed_failure(code.code(), detail.as_bytes(), None, None)
+        }
+    }
+}
+
+fn map_attribution_load_failure(failure: &AttributionReplayLoadFailure) -> ReplayError {
+    let mut mapped = match &failure.error {
+        AttributionReplayError::Unavailable {
+            code,
+            retryable,
+            detail,
+        } => ReplayError::new(
+            ReplayErrorClass::Unavailable,
+            ReplayStage::TradeEvidence,
+            code.code(),
+            *retryable,
+        )
+        .with_typed_failure(code.code(), detail.as_bytes(), failure.failure_date, None),
+        AttributionReplayError::FailedIntegrity { code, detail } => ReplayError::new(
+            ReplayErrorClass::FailedIntegrity,
+            ReplayStage::TradeEvidence,
+            code.code(),
+            false,
+        )
+        .with_typed_failure(code.code(), detail.as_bytes(), failure.failure_date, None),
+    };
+    if failure.stage == AttributionReplayLoadStage::StockClose
+        && matches!(
+            failure.error,
+            AttributionReplayError::Unavailable {
+                code: AttributionUnavailable::StockCloseUnavailable,
+                ..
+            }
+        )
+    {
+        mapped = mapped.with_evidence_failure_kind(ReplayEvidenceFailureKind::StockCloseAbsent);
+    }
+    mapped
+}
+
+fn map_benchmark_error(error: BenchmarkError) -> ReplayError {
+    match error {
+        BenchmarkError::Unavailable { code, retryable } => {
+            let mapped = ReplayError::new(
+                ReplayErrorClass::Unavailable,
+                ReplayStage::Benchmark,
+                code,
+                retryable,
+            );
+            if code == "benchmark_manifest_unavailable" {
+                mapped.with_evidence_failure_kind(ReplayEvidenceFailureKind::BenchmarkExactAbsent)
+            } else {
+                mapped
+            }
+        }
+        BenchmarkError::FailedIntegrity { code } => ReplayError::new(
+            ReplayErrorClass::FailedIntegrity,
+            ReplayStage::Benchmark,
+            code,
+            false,
+        ),
+        BenchmarkError::Unsupported(BenchmarkUnsupported::UnsupportedInstrument) => {
+            ReplayError::new(
+                ReplayErrorClass::FailedIntegrity,
+                ReplayStage::Benchmark,
+                "benchmark_instrument_unsupported",
+                false,
+            )
+        }
+        BenchmarkError::Unsupported(BenchmarkUnsupported::TestIdentityRejected) => {
+            ReplayError::new(
+                ReplayErrorClass::FailedIntegrity,
+                ReplayStage::Benchmark,
+                "benchmark_test_identity_rejected",
+                false,
+            )
+        }
+    }
+}
+
+fn map_store_error(error: AttributionReportStoreError) -> ReplayError {
+    ReplayError::new(
+        ReplayErrorClass::Storage,
+        ReplayStage::Store,
+        error.reason_code(),
+        error.retryable(),
+    )
+}
+
+fn map_current_session_evidence_error(
+    admitted: &AdmittedReplayRequest,
+    calendar: &VerifiedReplayCalendar,
+    error: ReplayError,
+) -> ReplayError {
+    let is_actual_current_session = matches!(admitted.mode, ReplayMode::Scheduled { .. })
+        && calendar.target_to() == replay_invoked_at(&admitted.mode).date_naive();
+    let is_current_session_evidence = error.failure_date == Some(calendar.target_to())
+        && matches!(
+            error.evidence_failure_kind,
+            Some(
+                ReplayEvidenceFailureKind::StockCloseAbsent
+                    | ReplayEvidenceFailureKind::BenchmarkExactAbsent
+            )
+        );
+    if is_actual_current_session
+        && error.class == ReplayErrorClass::Unavailable
+        && is_current_session_evidence
+    {
+        error.into_current_session_incomplete()
+    } else {
+        error
+    }
+}
+
 fn canonical_report_error(detail: impl Into<String>) -> AttributionReplayError {
     AttributionReplayError::integrity(AttributionIntegrityFailure::CanonicalReport, detail)
 }
@@ -3138,14 +4567,20 @@ fn run_after_read_test_hook() {
 mod tests {
     use std::path::PathBuf;
 
-    use chrono::{DateTime, NaiveDate};
+    use chrono::{DateTime, Duration, FixedOffset, NaiveDate, TimeZone, Timelike};
     use rusqlite::{params, Connection};
 
     use super::*;
-    use crate::data_gateway::{BenchmarkBar, BenchmarkBarTime};
+    use crate::data_gateway::review::AuditedBenchmarkBatch;
+    use crate::data_gateway::{
+        BatchEvidence, BenchmarkBar, BenchmarkBarTime, BenchmarkCapture, BenchmarkRange,
+        BenchmarkRequest, GatewayBatch,
+    };
+    use crate::database::data_acquisition_audit::DataAcquisitionAuditRecord;
     use crate::database::order_audit::{
         canonical_order_audit_record_hash, CanonicalOrderAuditRow, AUDIT_CHAIN_GENESIS,
     };
+    use crate::magic_compat::ProviderId;
 
     fn date(raw: &str) -> NaiveDate {
         NaiveDate::parse_from_str(raw, "%Y-%m-%d").unwrap()
@@ -3310,6 +4745,1240 @@ mod tests {
         }
     }
 
+    fn shanghai_at(day: &str, hour: u32, minute: u32, second: u32) -> DateTime<FixedOffset> {
+        let date = NaiveDate::parse_from_str(day, "%Y-%m-%d").unwrap();
+        FixedOffset::east_opt(8 * 60 * 60)
+            .unwrap()
+            .from_local_datetime(&date.and_hms_opt(hour, minute, second).unwrap())
+            .single()
+            .unwrap()
+    }
+
+    fn runner_benchmark_request(instrument: &str, trading_date: NaiveDate) -> BenchmarkRequest {
+        BenchmarkRequest {
+            instrument: instrument.to_owned(),
+            range: BenchmarkRange::Minute1 {
+                from: FixedOffset::east_opt(8 * 60 * 60)
+                    .unwrap()
+                    .from_local_datetime(&trading_date.and_hms_opt(9, 31, 0).unwrap())
+                    .single()
+                    .unwrap(),
+                to: FixedOffset::east_opt(8 * 60 * 60)
+                    .unwrap()
+                    .from_local_datetime(&trading_date.and_hms_opt(15, 0, 0).unwrap())
+                    .single()
+                    .unwrap(),
+            },
+        }
+    }
+
+    fn complete_minute_bars(request: &BenchmarkRequest, price_shift: f64) -> Vec<BenchmarkBar> {
+        let BenchmarkRange::Minute1 { from, to } = request.range else {
+            panic!("TEST_CODE minute request expected");
+        };
+        let mut bars = Vec::new();
+        let mut cursor = from;
+        while cursor <= to {
+            let minute = cursor.hour() * 60 + cursor.minute();
+            if (9 * 60 + 31..=11 * 60 + 30).contains(&minute)
+                || (13 * 60 + 1..=15 * 60).contains(&minute)
+            {
+                let close = 3_500.0 + price_shift + bars.len() as f64 / 100.0;
+                bars.push(BenchmarkBar {
+                    at: BenchmarkBarTime::MinuteEnd(cursor),
+                    open: close,
+                    high: close + 1.0,
+                    low: close - 1.0,
+                    close,
+                    volume: None,
+                    amount: None,
+                });
+            }
+            cursor += Duration::minutes(1);
+        }
+        bars
+    }
+
+    fn append_test_benchmark_manifest(
+        manager: &crate::database::DatabaseManager,
+        trading_date: NaiveDate,
+        price_shift: f64,
+    ) -> BenchmarkDayManifest {
+        let request = runner_benchmark_request("TEST_CODE_000300", trading_date);
+        let bars = complete_minute_bars(&request, price_shift);
+        let request_hash = request.canonical_request_hash();
+        let evidence = BatchEvidence {
+            provider: ProviderId::Tdx,
+            source: "TEST_CODE_magic-tdx-index-bars@task31".to_owned(),
+            source_at: Some("2026-08-21T15:00:01+08:00".to_owned()),
+            observed_at: "2026-08-21T15:00:02+08:00".to_owned(),
+            batch_id: format!("TEST_CODE_task31_batch_{price_shift}"),
+        };
+        let receipt = manager
+            .record_data_acquisition(&DataAcquisitionAuditRecord {
+                capability: "BenchmarkBars",
+                provider: "Tdx",
+                source: &evidence.source,
+                request_hash: &request_hash,
+                source_at: evidence.source_at.as_deref(),
+                observed_at: &evidence.observed_at,
+                batch_id: Some(&evidence.batch_id),
+                outcome: "available",
+                request_count: 1,
+                accepted_count: i64::try_from(bars.len()).unwrap(),
+                rejected_count: 0,
+                reason_code: "accepted",
+                retryable: false,
+            })
+            .expect("TEST_CODE acquisition audit");
+        let preview = BenchmarkCapture::new(manager)
+            .preview_audited_for_test(
+                request,
+                AuditedBenchmarkBatch {
+                    batch: GatewayBatch::Available {
+                        records: bars,
+                        evidence,
+                    },
+                    receipt,
+                    request_hash,
+                },
+            )
+            .expect("TEST_CODE benchmark capture preview");
+        let manifest_hash = BenchmarkCapture::new(manager)
+            .commit(preview)
+            .expect("TEST_CODE benchmark capture commit")
+            .manifest_hash;
+        BenchmarkDayManifest {
+            trading_date,
+            manifest_hash,
+        }
+    }
+
+    fn attribution_table_counts(path: &Path) -> Vec<i64> {
+        let connection = Connection::open(path).unwrap();
+        [
+            "attribution_run_audit",
+            "attribution_run_chain",
+            "attribution_report_revision",
+            "attribution_report_chain",
+            "attribution_failure_audit",
+            "attribution_failure_chain",
+        ]
+        .into_iter()
+        .map(|table| {
+            connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        })
+        .collect()
+    }
+
+    fn runner_readonly_counts(path: &Path) -> Vec<i64> {
+        let connection = Connection::open(path).unwrap();
+        [
+            "paper_trades",
+            "order_audit",
+            "order_audit_chain",
+            "stock_daily",
+            "data_acquisition_audit",
+            "data_acquisition_audit_chain",
+            "benchmark_segment_revision",
+            "benchmark_segment_chain",
+            "benchmark_manifest",
+            "benchmark_manifest_acquisition",
+            "benchmark_manifest_chain",
+            "attribution_run_audit",
+            "attribution_run_chain",
+            "attribution_report_revision",
+            "attribution_report_chain",
+            "attribution_failure_audit",
+            "attribution_failure_chain",
+        ]
+        .into_iter()
+        .map(|table| {
+            connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        })
+        .collect()
+    }
+
+    fn sqlite_object_stats(path: &Path) -> Vec<Option<(u64, u64, u64, std::time::SystemTime)>> {
+        [
+            path.to_path_buf(),
+            PathBuf::from(format!("{}-wal", path.display())),
+            PathBuf::from(format!("{}-shm", path.display())),
+        ]
+        .into_iter()
+        .map(|candidate| {
+            candidate.metadata().ok().map(|metadata| {
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.len(),
+                    metadata.modified().unwrap(),
+                )
+            })
+        })
+        .collect()
+    }
+
+    fn scheduled_request(
+        invoked_at: DateTime<FixedOffset>,
+        benchmark_day_manifests: Vec<BenchmarkDayManifest>,
+    ) -> ReplayRequest {
+        ReplayRequest {
+            mode: ReplayMode::Scheduled { invoked_at },
+            benchmark_day_manifests,
+        }
+    }
+
+    #[test]
+    fn runner_preview_uses_one_pipeline_and_is_byte_identical_for_scheduled_and_same_day_range() {
+        let path = complete_database("runner_preview");
+        let manager = crate::database::attribution_reports::test_runner_database_manager(&path);
+        let benchmark_day_manifests = vec![
+            append_test_benchmark_manifest(&manager, date("2026-08-20"), 0.0),
+            append_test_benchmark_manifest(&manager, date("2026-08-21"), 10.0),
+        ];
+        let runner = AttributionReplayRunner::new_for_test(
+            &manager,
+            AttributionReplayLoader::new(&path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+        );
+        let before_counts = runner_readonly_counts(&path);
+        let before_objects = sqlite_object_stats(&path);
+        let scheduled = runner
+            .preview(ReplayRequest {
+                mode: ReplayMode::Scheduled {
+                    invoked_at: shanghai_at("2026-08-21", 15, 30, 0),
+                },
+                benchmark_day_manifests: benchmark_day_manifests.clone(),
+            })
+            .expect("TEST_CODE scheduled preview");
+        let range = runner
+            .preview(ReplayRequest {
+                mode: ReplayMode::Range {
+                    from: date("2026-08-21"),
+                    to: date("2026-08-21"),
+                    invoked_at: shanghai_at("2026-08-22", 15, 30, 0),
+                },
+                benchmark_day_manifests,
+            })
+            .expect("TEST_CODE same-day range preview");
+        assert_eq!(
+            scheduled.canonical_result_bytes(),
+            range.canonical_result_bytes()
+        );
+        assert_eq!(scheduled.report().total_closed_cycles(), 1);
+        assert_eq!(scheduled.trade_manifest_hash().len(), 64);
+        assert_eq!(scheduled.calendar_authority_hash().len(), 64);
+        assert_eq!(runner_readonly_counts(&path), before_counts);
+        assert_eq!(sqlite_object_stats(&path), before_objects);
+        drop(runner);
+        drop(manager);
+        remove_database(path);
+    }
+
+    #[test]
+    fn runner_failures_are_typed_audited_and_preview_never_writes_or_falls_back() {
+        let path = complete_database("runner_failures");
+        let manager = crate::database::attribution_reports::test_runner_database_manager(&path);
+        let bindings = vec![
+            append_test_benchmark_manifest(&manager, date("2026-08-20"), 0.0),
+            append_test_benchmark_manifest(&manager, date("2026-08-21"), 10.0),
+        ];
+        let runner = AttributionReplayRunner::new_for_test(
+            &manager,
+            AttributionReplayLoader::new(&path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+        );
+
+        let before_counts = runner_readonly_counts(&path);
+        let before_objects = sqlite_object_stats(&path);
+        let current_missing = runner
+            .preview(scheduled_request(
+                shanghai_at("2026-08-21", 15, 30, 0),
+                vec![bindings[0].clone()],
+            ))
+            .expect_err("TEST_CODE current-day missing evidence");
+        assert_eq!(current_missing.class(), ReplayErrorClass::Unavailable);
+        assert_eq!(current_missing.stage(), ReplayStage::Benchmark);
+        assert_eq!(current_missing.code(), "current_session_incomplete");
+        assert!(current_missing.retryable());
+        assert!(current_missing.failure_receipt().is_none());
+        assert_eq!(runner_readonly_counts(&path), before_counts);
+        assert_eq!(sqlite_object_stats(&path), before_objects);
+
+        let current_committed = runner
+            .commit(scheduled_request(
+                shanghai_at("2026-08-21", 15, 30, 0),
+                vec![bindings[0].clone()],
+            ))
+            .expect_err("TEST_CODE formal current-day failure");
+        assert_eq!(current_committed.code(), "current_session_incomplete");
+        assert!(current_committed.failure_receipt().is_some());
+        assert_eq!(attribution_table_counts(&path), vec![1, 1, 0, 0, 1, 1]);
+
+        let weekend_committed = runner
+            .commit(scheduled_request(
+                shanghai_at("2026-08-22", 15, 30, 0),
+                vec![bindings[0].clone()],
+            ))
+            .expect_err("TEST_CODE weekend must retain exact unavailable");
+        assert_eq!(weekend_committed.class(), ReplayErrorClass::Unavailable);
+        assert_eq!(
+            weekend_committed.code(),
+            "benchmark_day_manifest_unavailable"
+        );
+        assert!(weekend_committed.failure_receipt().is_some());
+        assert_eq!(attribution_table_counts(&path), vec![2, 2, 0, 0, 2, 2]);
+
+        let before_preview_failures = runner_readonly_counts(&path);
+        let before_preview_objects = sqlite_object_stats(&path);
+        let duplicate = runner
+            .preview(scheduled_request(
+                shanghai_at("2026-08-22", 15, 30, 0),
+                vec![
+                    bindings[0].clone(),
+                    bindings[0].clone(),
+                    bindings[1].clone(),
+                ],
+            ))
+            .expect_err("TEST_CODE duplicate day binding");
+        assert_eq!(duplicate.class(), ReplayErrorClass::FailedIntegrity);
+        assert_eq!(
+            duplicate.code(),
+            "benchmark_day_manifests_not_strictly_ordered"
+        );
+
+        let mut extra = bindings.clone();
+        extra.insert(
+            0,
+            BenchmarkDayManifest {
+                trading_date: date("2026-08-19"),
+                manifest_hash: bindings[0].manifest_hash.clone(),
+            },
+        );
+        let extra_error = runner
+            .preview(scheduled_request(
+                shanghai_at("2026-08-22", 15, 30, 0),
+                extra,
+            ))
+            .expect_err("TEST_CODE extra day binding");
+        assert_eq!(extra_error.class(), ReplayErrorClass::FailedIntegrity);
+        assert_eq!(extra_error.code(), "benchmark_day_manifest_extra");
+
+        let mismatch = runner
+            .preview(scheduled_request(
+                shanghai_at("2026-08-22", 15, 30, 0),
+                vec![
+                    BenchmarkDayManifest {
+                        trading_date: bindings[0].trading_date,
+                        manifest_hash: bindings[1].manifest_hash.clone(),
+                    },
+                    BenchmarkDayManifest {
+                        trading_date: bindings[1].trading_date,
+                        manifest_hash: bindings[0].manifest_hash.clone(),
+                    },
+                ],
+            ))
+            .expect_err("TEST_CODE manifest request/date mismatch");
+        assert_eq!(mismatch.class(), ReplayErrorClass::FailedIntegrity);
+        assert_eq!(mismatch.stage(), ReplayStage::Benchmark);
+        assert_eq!(mismatch.code(), "benchmark_expected_request_mismatch");
+        assert_eq!(runner_readonly_counts(&path), before_preview_failures);
+        assert_eq!(sqlite_object_stats(&path), before_preview_objects);
+
+        let before_invalid = attribution_table_counts(&path);
+        let zero_offset = FixedOffset::east_opt(0)
+            .unwrap()
+            .from_local_datetime(&date("2026-08-21").and_hms_opt(15, 30, 0).unwrap())
+            .single()
+            .unwrap();
+        let invalid_time = runner
+            .commit(scheduled_request(zero_offset, bindings.clone()))
+            .expect_err("TEST_CODE invalid formal invocation cannot be audited");
+        assert_eq!(invalid_time.stage(), ReplayStage::Request);
+        assert_eq!(invalid_time.code(), "invalid_invocation_timezone");
+        assert!(invalid_time.failure_receipt().is_none());
+        assert_eq!(attribution_table_counts(&path), before_invalid);
+
+        let incomplete = runner
+            .commit(scheduled_request(
+                shanghai_at("2026-08-21", 14, 59, 59),
+                bindings,
+            ))
+            .expect_err("TEST_CODE pre-close formal invocation is incomplete");
+        assert_eq!(incomplete.code(), "current_session_incomplete");
+        assert!(incomplete.failure_receipt().is_some());
+        assert_eq!(attribution_table_counts(&path), vec![3, 3, 0, 0, 3, 3]);
+        drop(runner);
+        drop(manager);
+        remove_database(path);
+    }
+
+    #[test]
+    fn runner_current_session_mapping_preserves_historical_and_database_unavailability() {
+        let trade_path = complete_database("runner_historical_trade_time");
+        {
+            let connection = Connection::open(&trade_path).unwrap();
+            connection
+                .execute(
+                    "UPDATE order_audit SET quote_observed_at=NULL WHERE id=1",
+                    [],
+                )
+                .unwrap();
+            rehash_audits(&connection);
+        }
+        let trade_manager =
+            crate::database::attribution_reports::test_runner_database_manager(&trade_path);
+        let trade_runner = AttributionReplayRunner::new_for_test(
+            &trade_manager,
+            AttributionReplayLoader::new(&trade_path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+        );
+        let trade_error = trade_runner
+            .preview(scheduled_request(
+                shanghai_at("2026-08-21", 15, 30, 0),
+                Vec::new(),
+            ))
+            .expect_err("TEST_CODE historical missing trade time must remain exact");
+        assert_eq!(trade_error.stage(), ReplayStage::TradeEvidence);
+        assert_eq!(trade_error.code(), "trade_time_unavailable");
+        assert!(!trade_error.retryable());
+        drop(trade_runner);
+        drop(trade_manager);
+        remove_database(trade_path);
+
+        let calendar_path = complete_database("runner_historical_calendar");
+        {
+            let connection = Connection::open(&calendar_path).unwrap();
+            connection
+                .execute(
+                    "UPDATE paper_trades SET ts='2024-08-20 09:31:05' WHERE id=1",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE paper_trades SET ts='2024-08-21 14:20:00' WHERE id=2",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE order_audit SET quote_observed_at='2024-08-20T09:31:05+08:00' WHERE id=1",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE order_audit SET quote_observed_at='2024-08-21T14:20:00+08:00' WHERE id=2",
+                    [],
+                )
+                .unwrap();
+            rehash_audits(&connection);
+        }
+        let calendar_manager =
+            crate::database::attribution_reports::test_runner_database_manager(&calendar_path);
+        let calendar_runner = AttributionReplayRunner::new_for_test(
+            &calendar_manager,
+            AttributionReplayLoader::new(&calendar_path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+        );
+        let calendar_error = calendar_runner
+            .preview(scheduled_request(
+                shanghai_at("2026-08-21", 15, 30, 0),
+                Vec::new(),
+            ))
+            .expect_err("TEST_CODE historical calendar coverage must remain exact");
+        assert_eq!(calendar_error.stage(), ReplayStage::Calendar);
+        assert_eq!(calendar_error.code(), "fill_calendar_authority_failed");
+        assert!(!calendar_error.retryable());
+        drop(calendar_runner);
+        drop(calendar_manager);
+        remove_database(calendar_path);
+
+        let busy_path = complete_database("runner_busy_source");
+        let busy_store_path = complete_database("runner_busy_store");
+        let busy_manager =
+            crate::database::attribution_reports::test_runner_database_manager(&busy_store_path);
+        let writer = Connection::open(&busy_path).unwrap();
+        writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let busy_runner = AttributionReplayRunner::new_for_test(
+            &busy_manager,
+            AttributionReplayLoader::new(&busy_path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+        );
+        let busy_error = busy_runner
+            .preview(scheduled_request(
+                shanghai_at("2026-08-21", 15, 30, 0),
+                Vec::new(),
+            ))
+            .expect_err("TEST_CODE database busy must remain source unavailable");
+        assert_eq!(busy_error.stage(), ReplayStage::TradeEvidence);
+        assert_eq!(busy_error.code(), "replay_source_unavailable");
+        assert!(busy_error.retryable());
+        writer.execute_batch("ROLLBACK").unwrap();
+        drop(writer);
+        drop(busy_runner);
+        drop(busy_manager);
+        remove_database(busy_path);
+        remove_database(busy_store_path);
+
+        let admitted = admit_replay_request(scheduled_request(
+            shanghai_at("2026-08-21", 15, 30, 0),
+            Vec::new(),
+        ))
+        .unwrap();
+        let calendar = resolve_admitted_calendar(&admitted).unwrap();
+        let historical_close_error = map_current_session_evidence_error(
+            &admitted,
+            &calendar,
+            ReplayError::new(
+                ReplayErrorClass::Unavailable,
+                ReplayStage::TradeEvidence,
+                "stock_close_unavailable",
+                true,
+            )
+            .with_failure_date(date("2026-08-20"))
+            .with_evidence_failure_kind(ReplayEvidenceFailureKind::StockCloseAbsent),
+        );
+        assert_eq!(historical_close_error.code(), "stock_close_unavailable");
+        assert!(historical_close_error.retryable());
+    }
+
+    #[test]
+    fn runner_maps_only_target_day_benchmark_unavailability_to_current_session() {
+        let path = complete_database("runner_benchmark_failure_day");
+        let manager = crate::database::attribution_reports::test_runner_database_manager(&path);
+        let bindings = vec![
+            append_test_benchmark_manifest(&manager, date("2026-08-20"), 0.0),
+            append_test_benchmark_manifest(&manager, date("2026-08-21"), 10.0),
+        ];
+        let runner = AttributionReplayRunner::new_for_test(
+            &manager,
+            AttributionReplayLoader::new(&path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+        );
+
+        let historical_missing = runner
+            .preview(scheduled_request(
+                shanghai_at("2026-08-21", 15, 30, 0),
+                vec![bindings[1].clone()],
+            ))
+            .expect_err("TEST_CODE historical benchmark gap must remain exact unavailable");
+        assert_eq!(historical_missing.stage(), ReplayStage::Benchmark);
+        assert_eq!(
+            historical_missing.code(),
+            "benchmark_day_manifest_unavailable"
+        );
+        assert!(historical_missing.retryable());
+
+        let target_missing = runner
+            .preview(scheduled_request(
+                shanghai_at("2026-08-21", 15, 30, 0),
+                vec![bindings[0].clone()],
+            ))
+            .expect_err("TEST_CODE target benchmark gap is current-session incomplete");
+        assert_eq!(target_missing.stage(), ReplayStage::Benchmark);
+        assert_eq!(target_missing.code(), "current_session_incomplete");
+        assert!(target_missing.retryable());
+
+        drop(runner);
+        drop(manager);
+        remove_database(path);
+
+        let storage_path = complete_database("runner_target_benchmark_storage_unavailable");
+        {
+            let connection = Connection::open(&storage_path).unwrap();
+            connection
+                .execute("DELETE FROM paper_trades WHERE id=2", [])
+                .unwrap();
+            connection
+                .execute("DELETE FROM order_audit WHERE id=2", [])
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE paper_trades SET ts='2026-08-21 09:31:05' WHERE id=1",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE order_audit SET quote_observed_at='2026-08-21T09:31:05+08:00' WHERE id=1",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute("DELETE FROM stock_daily WHERE id=1", [])
+                .unwrap();
+            rehash_audits(&connection);
+        }
+        let storage_manager =
+            crate::database::attribution_reports::test_runner_database_manager(&storage_path);
+        let target_binding =
+            append_test_benchmark_manifest(&storage_manager, date("2026-08-21"), 0.0);
+        let storage_runner = AttributionReplayRunner::new_for_test(
+            &storage_manager,
+            AttributionReplayLoader::new(&storage_path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+        );
+        let held_pool_connection = storage_manager
+            .get_conn()
+            .expect("TEST_CODE exhaust the one-connection benchmark pool");
+        let storage_unavailable = storage_runner
+            .preview(scheduled_request(
+                shanghai_at("2026-08-21", 15, 30, 0),
+                vec![target_binding],
+            ))
+            .expect_err("TEST_CODE target benchmark storage unavailable keeps exact taxonomy");
+        assert_eq!(storage_unavailable.stage(), ReplayStage::Benchmark);
+        assert_eq!(
+            storage_unavailable.code(),
+            "benchmark_segment_storage_unavailable"
+        );
+        assert!(storage_unavailable.retryable());
+        drop(held_pool_connection);
+        drop(storage_runner);
+        drop(storage_manager);
+        remove_database(storage_path);
+    }
+
+    #[test]
+    fn benchmark_failure_context_preserves_typed_code_in_leaf_fingerprint() {
+        let manifest_hash = "a".repeat(64);
+        let trading_date = date("2026-08-21");
+        let exact_absence = map_benchmark_error(BenchmarkError::Unavailable {
+            code: "benchmark_manifest_unavailable",
+            retryable: true,
+        })
+        .with_benchmark_failure_context(trading_date, &manifest_hash);
+        let storage_unavailable = map_benchmark_error(BenchmarkError::Unavailable {
+            code: "benchmark_segment_storage_unavailable",
+            retryable: true,
+        })
+        .with_benchmark_failure_context(trading_date, &manifest_hash);
+
+        assert_eq!(exact_absence.code(), "benchmark_manifest_unavailable");
+        assert_eq!(
+            storage_unavailable.code(),
+            "benchmark_segment_storage_unavailable"
+        );
+        assert_ne!(
+            exact_absence.failure_fingerprint,
+            storage_unavailable.failure_fingerprint
+        );
+    }
+
+    #[test]
+    fn runner_validates_paper_and_terminal_dates_with_one_immutable_authority() {
+        fn assert_rejected(label: &str, paper_time: &str, expected_code: &str) {
+            let path = complete_database(label);
+            {
+                let connection = Connection::open(&path).unwrap();
+                connection
+                    .execute("UPDATE paper_trades SET ts=?1 WHERE id=1", [paper_time])
+                    .unwrap();
+            }
+            let manager = crate::database::attribution_reports::test_runner_database_manager(&path);
+            let bindings = vec![
+                append_test_benchmark_manifest(&manager, date("2026-08-20"), 0.0),
+                append_test_benchmark_manifest(&manager, date("2026-08-21"), 10.0),
+            ];
+            let runner = AttributionReplayRunner::new_for_test(
+                &manager,
+                AttributionReplayLoader::new(&path),
+                "TEST_CODE_000300",
+                "TEST_CODE_MINUTE_END_LABEL",
+            );
+            let error = runner
+                .preview(scheduled_request(
+                    shanghai_at("2026-08-21", 15, 30, 0),
+                    bindings,
+                ))
+                .expect_err("TEST_CODE bad paper date must fail the whole replay");
+            assert_eq!(error.class(), ReplayErrorClass::FailedIntegrity);
+            assert_eq!(error.stage(), ReplayStage::Calendar);
+            assert_eq!(error.code(), expected_code);
+            drop(runner);
+            drop(manager);
+            remove_database(path);
+        }
+
+        assert_rejected(
+            "runner_paper_weekend",
+            "2026-08-15 09:31:05",
+            "fill_non_trading_day",
+        );
+        assert_rejected(
+            "runner_paper_holiday",
+            "2026-06-19 09:31:05",
+            "fill_non_trading_day",
+        );
+        assert_rejected(
+            "runner_paper_coverage",
+            "2024-08-20 09:31:05",
+            "fill_calendar_authority_failed",
+        );
+        assert_rejected(
+            "runner_paper_terminal_mismatch",
+            "2026-08-19 09:31:05",
+            "fill_terminal_date_mismatch",
+        );
+    }
+
+    #[test]
+    fn runner_stores_the_exact_task30_validated_fee_basis_identity() {
+        let path = complete_database("runner_fee_identity");
+        let manager = crate::database::attribution_reports::test_runner_database_manager(&path);
+        let bindings = vec![
+            append_test_benchmark_manifest(&manager, date("2026-08-20"), 0.0),
+            append_test_benchmark_manifest(&manager, date("2026-08-21"), 10.0),
+        ];
+        let runner = AttributionReplayRunner::new_for_test_with_fee_ledger(
+            &manager,
+            AttributionReplayLoader::new(&path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+            AuthoritativeFillFeeLedger {
+                entries: vec![fee(1, 1.25), fee(2, 1.50)],
+            },
+        );
+        let request = scheduled_request(shanghai_at("2026-08-21", 15, 30, 0), bindings.clone());
+        let preview = runner
+            .preview(request)
+            .expect("TEST_CODE fee-backed preview");
+        let MetricAvailability::Available(basis) = preview.report().fee_basis() else {
+            panic!("TEST_CODE fee basis must be available");
+        };
+        let expected_basis_id = basis.basis_id.clone();
+        let receipt = runner
+            .commit(scheduled_request(
+                shanghai_at("2026-08-21", 15, 30, 0),
+                bindings,
+            ))
+            .expect("TEST_CODE fee-backed formal replay");
+        let retained_fee: String = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT fee_value FROM attribution_report_revision WHERE id=?1",
+                [receipt.report_revision_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_fee, expected_basis_id);
+        drop(runner);
+        drop(manager);
+        remove_database(path);
+    }
+
+    #[test]
+    fn runner_loader_failure_progress_is_monotonic_and_never_fabricates_evidence() {
+        let stock_path = complete_database("runner_stock_progress");
+        Connection::open(&stock_path)
+            .unwrap()
+            .execute("DELETE FROM stock_daily WHERE date='2026-08-21'", [])
+            .unwrap();
+        let stock_manager =
+            crate::database::attribution_reports::test_runner_database_manager(&stock_path);
+        let stock_runner = AttributionReplayRunner::new_for_test(
+            &stock_manager,
+            AttributionReplayLoader::new(&stock_path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+        );
+        let stock_admitted = admit_replay_request(scheduled_request(
+            shanghai_at("2026-08-22", 15, 30, 0),
+            Vec::new(),
+        ))
+        .unwrap();
+        let stock_failure = match stock_runner.prepare(&stock_admitted) {
+            Ok(_) => panic!("TEST_CODE stock-close failure expected"),
+            Err(failure) => failure,
+        };
+        assert!(matches!(
+            stock_failure.evidence.trade,
+            FailureEvidenceState::Available(_)
+        ));
+        assert!(matches!(
+            stock_failure.evidence.stock_close,
+            FailureEvidenceState::Unavailable(_)
+        ));
+        assert_eq!(stock_failure.evidence.fee, FailureEvidenceState::Unknown);
+        drop(stock_runner);
+        drop(stock_manager);
+        remove_database(stock_path);
+
+        let fee_path = complete_database("runner_fee_progress");
+        let fee_manager =
+            crate::database::attribution_reports::test_runner_database_manager(&fee_path);
+        let fee_runner = AttributionReplayRunner::new_for_test_with_fee_ledger(
+            &fee_manager,
+            AttributionReplayLoader::new(&fee_path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+            AuthoritativeFillFeeLedger {
+                entries: vec![fee(1, 1.25)],
+            },
+        );
+        let fee_admitted = admit_replay_request(scheduled_request(
+            shanghai_at("2026-08-22", 15, 30, 0),
+            Vec::new(),
+        ))
+        .unwrap();
+        let fee_failure = match fee_runner.prepare(&fee_admitted) {
+            Ok(_) => panic!("TEST_CODE fee validation failure expected"),
+            Err(failure) => failure,
+        };
+        assert_eq!(fee_failure.error.code(), "fee_evidence_failed");
+        assert!(matches!(
+            fee_failure.evidence.trade,
+            FailureEvidenceState::Available(_)
+        ));
+        assert!(matches!(
+            fee_failure.evidence.stock_close,
+            FailureEvidenceState::Available(_)
+        ));
+        assert!(matches!(
+            fee_failure.evidence.fee,
+            FailureEvidenceState::Unavailable(_)
+        ));
+        drop(fee_runner);
+        drop(fee_manager);
+        remove_database(fee_path);
+
+        let missing = test_database_path("runner_early_source_progress");
+        let early = AttributionReplayLoader::new(&missing)
+            .load_with_progress(&request_with_no_fees())
+            .expect_err("TEST_CODE early source identity failure expected");
+        assert_eq!(early.stage, AttributionReplayLoadStage::Trade);
+        assert!(early.progress.trade_manifest_hash.is_none());
+        assert!(early.progress.stock_close_manifest_hash.is_none());
+        assert!(early.progress.fee.is_none());
+    }
+
+    #[test]
+    fn runner_failure_summary_binds_bad_leaf_and_every_known_stage_identity() {
+        fn failure_summaries(path: &Path) -> Vec<String> {
+            let connection = Connection::open(path).unwrap();
+            let mut statement = connection
+                .prepare(
+                    "SELECT source_summary_hash FROM attribution_failure_audit ORDER BY id ASC",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<Vec<String>, _>>()
+                .unwrap()
+        }
+
+        let leaf_path = complete_database("runner_failure_leaf_identity");
+        {
+            let connection = Connection::open(&leaf_path).unwrap();
+            connection
+                .execute(
+                    "UPDATE order_audit SET quote_observed_at=NULL WHERE id=1",
+                    [],
+                )
+                .unwrap();
+            rehash_audits(&connection);
+        }
+        let leaf_manager =
+            crate::database::attribution_reports::test_runner_database_manager(&leaf_path);
+        let leaf_runner = AttributionReplayRunner::new_for_test(
+            &leaf_manager,
+            AttributionReplayLoader::new(&leaf_path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+        );
+        leaf_runner
+            .commit(scheduled_request(
+                shanghai_at("2026-08-21", 15, 30, 0),
+                Vec::new(),
+            ))
+            .expect_err("TEST_CODE first missing terminal must be audited");
+        {
+            let connection = Connection::open(&leaf_path).unwrap();
+            connection
+                .execute(
+                    "UPDATE order_audit SET quote_observed_at='2026-08-20T09:31:05+08:00' WHERE id=1",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE order_audit SET quote_observed_at=NULL WHERE id=2",
+                    [],
+                )
+                .unwrap();
+            rehash_audits(&connection);
+        }
+        leaf_runner
+            .commit(scheduled_request(
+                shanghai_at("2026-08-21", 15, 30, 0),
+                Vec::new(),
+            ))
+            .expect_err("TEST_CODE second missing terminal must be audited");
+        let leaf_summaries = failure_summaries(&leaf_path);
+        assert_eq!(leaf_summaries.len(), 2);
+        assert_ne!(leaf_summaries[0], leaf_summaries[1]);
+        drop(leaf_runner);
+        drop(leaf_manager);
+        remove_database(leaf_path);
+
+        let stock_path = complete_database("runner_failure_stock_stage_identity");
+        Connection::open(&stock_path)
+            .unwrap()
+            .execute("DELETE FROM stock_daily WHERE date='2026-08-21'", [])
+            .unwrap();
+        let stock_manager =
+            crate::database::attribution_reports::test_runner_database_manager(&stock_path);
+        let stock_runner = AttributionReplayRunner::new_for_test(
+            &stock_manager,
+            AttributionReplayLoader::new(&stock_path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+        );
+        stock_runner
+            .commit(scheduled_request(
+                shanghai_at("2026-08-22", 15, 30, 0),
+                Vec::new(),
+            ))
+            .expect_err("TEST_CODE first stock-close failure must be audited");
+        Connection::open(&stock_path)
+            .unwrap()
+            .execute(
+                "UPDATE paper_trades SET name='TEST_CODE_CHANGED_SOURCE_NAME' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        stock_runner
+            .commit(scheduled_request(
+                shanghai_at("2026-08-22", 15, 30, 0),
+                Vec::new(),
+            ))
+            .expect_err("TEST_CODE same stock-close leaf after trade revision must be audited");
+        let stock_summaries = failure_summaries(&stock_path);
+        assert_eq!(stock_summaries.len(), 2);
+        assert_ne!(stock_summaries[0], stock_summaries[1]);
+        drop(stock_runner);
+        drop(stock_manager);
+        remove_database(stock_path);
+
+        let stage_path = complete_database("runner_failure_stage_identity");
+        let stage_manager =
+            crate::database::attribution_reports::test_runner_database_manager(&stage_path);
+        let historical = append_test_benchmark_manifest(&stage_manager, date("2026-08-20"), 0.0);
+        let stage_runner = AttributionReplayRunner::new_for_test(
+            &stage_manager,
+            AttributionReplayLoader::new(&stage_path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+        );
+        stage_runner
+            .commit(scheduled_request(
+                shanghai_at("2026-08-21", 15, 30, 0),
+                vec![historical.clone()],
+            ))
+            .expect_err("TEST_CODE target benchmark gap must be audited");
+        Connection::open(&stage_path)
+            .unwrap()
+            .execute(
+                "UPDATE paper_trades SET name='TEST_CODE_CHANGED_SOURCE_NAME' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        stage_runner
+            .commit(scheduled_request(
+                shanghai_at("2026-08-21", 15, 30, 0),
+                vec![historical.clone()],
+            ))
+            .expect_err("TEST_CODE same benchmark gap after trade revision must be audited");
+        {
+            let connection = Connection::open(&stage_path).unwrap();
+            connection
+                .execute(
+                    "UPDATE paper_trades SET name='TEST_CODE公司' WHERE id=1",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE stock_daily SET created_at='2026-08-23' WHERE date='2026-08-21'",
+                    [],
+                )
+                .unwrap();
+        }
+        stage_runner
+            .commit(scheduled_request(
+                shanghai_at("2026-08-21", 15, 30, 0),
+                vec![historical.clone()],
+            ))
+            .expect_err("TEST_CODE same benchmark gap after stock-close revision must be audited");
+        Connection::open(&stage_path)
+            .unwrap()
+            .execute(
+                "UPDATE stock_daily SET created_at='2026-08-22' WHERE date='2026-08-21'",
+                [],
+            )
+            .unwrap();
+        let fee_runner = AttributionReplayRunner::new_for_test_with_fee_ledger(
+            &stage_manager,
+            AttributionReplayLoader::new(&stage_path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+            AuthoritativeFillFeeLedger {
+                entries: vec![fee(1, 1.25), fee(2, 1.50)],
+            },
+        );
+        fee_runner
+            .commit(scheduled_request(
+                shanghai_at("2026-08-21", 15, 30, 0),
+                vec![historical],
+            ))
+            .expect_err("TEST_CODE same benchmark gap after fee revision must be audited");
+        let stage_summaries = failure_summaries(&stage_path);
+        assert_eq!(stage_summaries.len(), 4);
+        assert_ne!(stage_summaries[0], stage_summaries[1]);
+        assert_ne!(stage_summaries[0], stage_summaries[2]);
+        assert_ne!(stage_summaries[0], stage_summaries[3]);
+        drop(fee_runner);
+        drop(stage_runner);
+        drop(stage_manager);
+        remove_database(stage_path);
+    }
+
+    #[test]
+    fn runner_rejects_non_trading_fill_and_maps_source_and_store_failures_without_leaks() {
+        let weekend_path = complete_database("runner_weekend_fill");
+        {
+            let connection = Connection::open(&weekend_path).unwrap();
+            connection
+                .execute(
+                    "UPDATE paper_trades SET ts='2026-08-22 09:31:05' WHERE id=1",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE paper_trades SET ts='2026-08-24 14:20:00' WHERE id=2",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE order_audit SET quote_observed_at='2026-08-22T09:31:05+08:00' WHERE id=1",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE order_audit SET quote_observed_at='2026-08-24T14:20:00+08:00' WHERE id=2",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute("UPDATE stock_daily SET date='2026-08-24' WHERE id=2", [])
+                .unwrap();
+            rehash_audits(&connection);
+        }
+        let weekend_manager =
+            crate::database::attribution_reports::test_runner_database_manager(&weekend_path);
+        let weekend_runner = AttributionReplayRunner::new_for_test(
+            &weekend_manager,
+            AttributionReplayLoader::new(&weekend_path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+        );
+        let weekend_error = weekend_runner
+            .preview(ReplayRequest {
+                mode: ReplayMode::Range {
+                    from: date("2026-08-24"),
+                    to: date("2026-08-24"),
+                    invoked_at: shanghai_at("2026-08-24", 15, 30, 0),
+                },
+                benchmark_day_manifests: Vec::new(),
+            })
+            .expect_err("TEST_CODE weekend fill must fail before benchmark lookup");
+        assert_eq!(weekend_error.class(), ReplayErrorClass::FailedIntegrity);
+        assert_eq!(weekend_error.stage(), ReplayStage::Calendar);
+        assert_eq!(weekend_error.code(), "fill_non_trading_day");
+        assert!(!weekend_error
+            .redacted_message()
+            .contains(&weekend_path.to_string_lossy().to_string()));
+        assert_eq!(attribution_table_counts(&weekend_path), vec![0; 6]);
+        drop(weekend_runner);
+        drop(weekend_manager);
+        remove_database(weekend_path);
+
+        let source_path = complete_database("runner_source_mapping");
+        Connection::open(&source_path)
+            .unwrap()
+            .execute("DELETE FROM stock_daily WHERE date='2026-08-21'", [])
+            .unwrap();
+        let source_manager =
+            crate::database::attribution_reports::test_runner_database_manager(&source_path);
+        let source_runner = AttributionReplayRunner::new_for_test(
+            &source_manager,
+            AttributionReplayLoader::new(&source_path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+        );
+        let current = source_runner
+            .preview(scheduled_request(
+                shanghai_at("2026-08-21", 15, 30, 0),
+                Vec::new(),
+            ))
+            .expect_err("TEST_CODE current close source incomplete");
+        assert_eq!(current.code(), "current_session_incomplete");
+        let weekend = source_runner
+            .preview(scheduled_request(
+                shanghai_at("2026-08-22", 15, 30, 0),
+                Vec::new(),
+            ))
+            .expect_err("TEST_CODE weekend source unavailable remains exact");
+        assert_eq!(weekend.code(), "stock_close_unavailable");
+        assert_eq!(weekend.stage(), ReplayStage::TradeEvidence);
+        drop(source_runner);
+        drop(source_manager);
+        remove_database(source_path);
+
+        let store_path = complete_database("runner_store_failure");
+        let store_manager =
+            crate::database::attribution_reports::test_runner_database_manager(&store_path);
+        let store_bindings = vec![
+            append_test_benchmark_manifest(&store_manager, date("2026-08-20"), 0.0),
+            append_test_benchmark_manifest(&store_manager, date("2026-08-21"), 10.0),
+        ];
+        Connection::open(&store_path)
+            .unwrap()
+            .execute("DROP TRIGGER trg_attribution_run_audit_no_update", [])
+            .unwrap();
+        let store_runner = AttributionReplayRunner::new_for_test(
+            &store_manager,
+            AttributionReplayLoader::new(&store_path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+        );
+        let storage = store_runner
+            .commit(scheduled_request(
+                shanghai_at("2026-08-21", 15, 30, 0),
+                store_bindings,
+            ))
+            .expect_err("TEST_CODE store integrity failure cannot return success");
+        assert_eq!(storage.class(), ReplayErrorClass::Storage);
+        assert_eq!(storage.stage(), ReplayStage::Store);
+        assert!(storage.failure_receipt().is_none());
+        assert_eq!(attribution_table_counts(&store_path), vec![0; 6]);
+        drop(store_runner);
+        drop(store_manager);
+        remove_database(store_path);
+    }
+
+    #[test]
+    fn production_runner_keeps_minute_semantics_unverified() {
+        let path = complete_database("runner_production_semantics");
+        let manager = crate::database::attribution_reports::test_runner_database_manager(&path);
+        let runner = AttributionReplayRunner::new(&manager, AttributionReplayLoader::new(&path));
+        assert_eq!(runner.benchmark_instrument, HS300_CANONICAL);
+        assert_eq!(runner.minute_semantics, MinuteLabelSemantics::Unverified);
+        drop(runner);
+        drop(manager);
+        remove_database(path);
+    }
+
+    #[test]
+    fn runner_commit_reuses_friday_report_for_weekend_runs_and_appends_manifest_successor() {
+        let path = complete_database("runner_commit");
+        let manager = crate::database::attribution_reports::test_runner_database_manager(&path);
+        let initial = vec![
+            append_test_benchmark_manifest(&manager, date("2026-08-20"), 0.0),
+            append_test_benchmark_manifest(&manager, date("2026-08-21"), 10.0),
+        ];
+        let runner = AttributionReplayRunner::new_for_test(
+            &manager,
+            AttributionReplayLoader::new(&path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+        );
+        let friday = runner
+            .commit(scheduled_request(
+                shanghai_at("2026-08-21", 15, 30, 0),
+                initial.clone(),
+            ))
+            .expect("TEST_CODE Friday formal replay");
+        let saturday = runner
+            .commit(scheduled_request(
+                shanghai_at("2026-08-22", 15, 30, 0),
+                initial.clone(),
+            ))
+            .expect("TEST_CODE Saturday formal replay of Friday");
+        let sunday = runner
+            .commit(scheduled_request(
+                shanghai_at("2026-08-23", 15, 30, 0),
+                initial.clone(),
+            ))
+            .expect("TEST_CODE Sunday formal replay of Friday");
+        assert_eq!(friday.report_revision_id, saturday.report_revision_id);
+        assert_eq!(friday.report_revision_id, sunday.report_revision_id);
+        assert_eq!(friday.report_identity, saturday.report_identity);
+        assert_eq!(friday.report_identity, sunday.report_identity);
+        assert_ne!(friday.run.run_audit_id, saturday.run.run_audit_id);
+        assert_ne!(saturday.run.run_audit_id, sunday.run.run_audit_id);
+        assert_eq!(attribution_table_counts(&path), vec![3, 3, 1, 1, 0, 0]);
+
+        let retained_payload: String = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT result_payload_json FROM attribution_report_revision WHERE id=?1",
+                [friday.report_revision_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let retained: serde_json::Value = serde_json::from_str(&retained_payload).unwrap();
+        assert_eq!(
+            retained["benchmark_day_manifests"][0]["trading_date"],
+            "2026-08-20"
+        );
+        assert_eq!(
+            retained["benchmark_day_manifests"][1]["trading_date"],
+            "2026-08-21"
+        );
+        assert!(retained["core_report"].is_object());
+
+        let revised_day = append_test_benchmark_manifest(&manager, date("2026-08-21"), 20.0);
+        let revised = runner
+            .commit(scheduled_request(
+                shanghai_at("2026-08-23", 16, 0, 0),
+                vec![initial[0].clone(), revised_day],
+            ))
+            .expect("TEST_CODE revised benchmark report");
+        assert_eq!(revised.report_revision, 2);
+        assert_eq!(
+            revised.predecessor_report_id,
+            Some(friday.report_revision_id)
+        );
+        assert_ne!(revised.report_identity, friday.report_identity);
+        assert_eq!(attribution_table_counts(&path), vec![4, 4, 2, 2, 0, 0]);
+        drop(runner);
+        drop(manager);
+        remove_database(path);
+    }
+
     fn audit_rows(connection: &Connection) -> Vec<CanonicalOrderAuditRow> {
         let mut statement = connection
             .prepare(
@@ -3387,6 +6056,11 @@ mod tests {
         );
         assert_eq!(evidence.stock_closes.entries.len(), 2);
         assert_eq!(evidence.stock_closes.manifest_hash.len(), 64);
+        assert_eq!(evidence.trade_manifest_hash().len(), 64);
+        assert!(evidence
+            .trade_manifest_hash()
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
         assert!(matches!(
             evidence.fees,
             FeeEvidenceAvailability::Unavailable {

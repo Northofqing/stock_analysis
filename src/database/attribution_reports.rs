@@ -174,6 +174,34 @@ pub struct AttributionReportStore<'a> {
     database: &'a DatabaseManager,
 }
 
+#[cfg(test)]
+pub(crate) fn test_runner_database_manager(path: &std::path::Path) -> DatabaseManager {
+    let database_url = path.to_string_lossy().into_owned();
+    let mut bootstrap = SqliteConnection::establish(&database_url)
+        .expect("TEST_CODE establish replay runner database");
+    diesel::sql_query("PRAGMA journal_mode = WAL")
+        .execute(&mut bootstrap)
+        .expect("TEST_CODE replay runner WAL");
+    drop(bootstrap);
+    let pool =
+        super::build_sqlite_pool_with_size(database_url, 1).expect("TEST_CODE replay runner pool");
+    {
+        let mut connection = pool
+            .get()
+            .expect("TEST_CODE replay runner schema connection");
+        super::data_acquisition_audit::create_schema(&mut connection)
+            .expect("TEST_CODE acquisition schema");
+        super::benchmark_segments::create_schema(&mut connection)
+            .expect("TEST_CODE benchmark schema");
+        create_schema(&mut connection).expect("TEST_CODE attribution report schema");
+    }
+    DatabaseManager {
+        pool,
+        selection_connection_source: None,
+        selection_schema_authority: None,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PreparedInvocation {
     mode: String,
