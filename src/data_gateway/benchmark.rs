@@ -1176,6 +1176,72 @@ fn verified_benchmark_coverage(
     }
 }
 
+impl BenchmarkRequest {
+    pub(crate) fn canonical_request_hash(&self) -> String {
+        canonical_base_request_hash(self)
+    }
+
+    pub(crate) fn validate_persisted_payload(
+        &self,
+        bars: &[BenchmarkBar],
+    ) -> Result<String, BenchmarkError> {
+        validate_range(&self.range)?;
+        if bars.is_empty() {
+            return Err(BenchmarkError::Unavailable {
+                code: "benchmark_batch_empty",
+                retryable: true,
+            });
+        }
+        for bar in bars {
+            validate_bar_values(bar)?;
+            validate_bar_time(&self.range, &bar.at)?;
+        }
+        validate_strict_order(bars)?;
+
+        match self.range {
+            BenchmarkRange::Daily { from, to } => {
+                let mut authoritative_trading_days = Vec::new();
+                let mut cursor = from;
+                loop {
+                    let is_trading_day = crate::calendar::verified_a_share_trading_day(cursor)
+                        .map_err(|_| BenchmarkError::Unavailable {
+                            code: "benchmark_trading_calendar_unavailable",
+                            retryable: true,
+                        })?;
+                    if is_trading_day {
+                        authoritative_trading_days.push(cursor);
+                    }
+                    if cursor == to {
+                        break;
+                    }
+                    cursor = cursor.checked_add_signed(Duration::days(1)).ok_or(
+                        BenchmarkError::Unavailable {
+                            code: "benchmark_trading_calendar_unavailable",
+                            retryable: false,
+                        },
+                    )?;
+                }
+                validate_daily_coverage(from, to, bars, &authoritative_trading_days)?;
+            }
+            BenchmarkRange::Minute1 { from, to } => {
+                let is_trading_day = crate::calendar::verified_a_share_trading_day(
+                    from.date_naive(),
+                )
+                .map_err(|_| BenchmarkError::Unavailable {
+                    code: "benchmark_trading_calendar_unavailable",
+                    retryable: true,
+                })?;
+                if !is_trading_day {
+                    return Err(failed_integrity("benchmark_minute_non_trading_day"));
+                }
+                validate_minute_coverage(from, to, bars)?;
+            }
+        }
+
+        Ok(self.canonical_request_hash())
+    }
+}
+
 pub(super) fn canonical_base_request_hash(request: &BenchmarkRequest) -> String {
     let category = match request.range {
         BenchmarkRange::Daily { .. } => TDX_DAILY_CATEGORY,
@@ -2258,6 +2324,87 @@ mod tests {
             complete,
             BenchmarkAdmissionCoverage::Minute1,
         ));
+    }
+
+    #[test]
+    fn persisted_payload_seam_requires_authoritative_daily_and_minute_coverage() {
+        let d1 = NaiveDate::from_ymd_opt(2026, 1, 5).expect("TEST_CODE d1");
+        let d2 = NaiveDate::from_ymd_opt(2026, 1, 6).expect("TEST_CODE d2");
+        let d3 = NaiveDate::from_ymd_opt(2026, 1, 7).expect("TEST_CODE d3");
+        let complete_daily_request = daily_request(d1, d3, "TEST_CODE_000300");
+        let complete_daily = vec![
+            bar(BenchmarkBarTime::Daily(d1)),
+            bar(BenchmarkBarTime::Daily(d2)),
+            bar(BenchmarkBarTime::Daily(d3)),
+        ];
+        assert_eq!(
+            complete_daily_request.validate_persisted_payload(&complete_daily),
+            Ok(canonical_base_request_hash(&complete_daily_request))
+        );
+        assert_eq!(
+            complete_daily_request.validate_persisted_payload(&[
+                bar(BenchmarkBarTime::Daily(d1)),
+                bar(BenchmarkBarTime::Daily(d3)),
+            ]),
+            Err(BenchmarkError::FailedIntegrity {
+                code: "benchmark_daily_coverage_incomplete"
+            })
+        );
+        assert_eq!(
+            daily_request(
+                NaiveDate::from_ymd_opt(2026, 1, 1).expect("TEST_CODE year start"),
+                NaiveDate::from_ymd_opt(2026, 12, 31).expect("TEST_CODE year end"),
+                "TEST_CODE_000300",
+            )
+            .validate_persisted_payload(&[bar(BenchmarkBarTime::Daily(d1))]),
+            Err(BenchmarkError::FailedIntegrity {
+                code: "benchmark_daily_coverage_incomplete"
+            })
+        );
+
+        let m0931 = minute("2026-08-21T09:31:00+08:00");
+        let m0932 = minute("2026-08-21T09:32:00+08:00");
+        let m0933 = minute("2026-08-21T09:33:00+08:00");
+        assert_eq!(
+            minute_request(m0931, m0933).validate_persisted_payload(&[
+                bar(BenchmarkBarTime::MinuteEnd(m0931)),
+                bar(BenchmarkBarTime::MinuteEnd(m0933)),
+            ]),
+            Err(BenchmarkError::FailedIntegrity {
+                code: "benchmark_minute_coverage_incomplete"
+            })
+        );
+        let m1130 = minute("2026-08-21T11:30:00+08:00");
+        let m1131 = minute("2026-08-21T11:31:00+08:00");
+        let m1301 = minute("2026-08-21T13:01:00+08:00");
+        assert_eq!(
+            minute_request(m1130, m1301).validate_persisted_payload(&[
+                bar(BenchmarkBarTime::MinuteEnd(m1130)),
+                bar(BenchmarkBarTime::MinuteEnd(m1131)),
+                bar(BenchmarkBarTime::MinuteEnd(m1301)),
+            ]),
+            Err(BenchmarkError::FailedIntegrity {
+                code: "benchmark_minute_bar_invalid"
+            })
+        );
+        assert_eq!(
+            minute_request(m0931, m0933).validate_persisted_payload(&[
+                bar(BenchmarkBarTime::MinuteEnd(m0931)),
+                bar(BenchmarkBarTime::MinuteEnd(m0932)),
+                bar(BenchmarkBarTime::MinuteEnd(m0933)),
+            ]),
+            Ok(canonical_base_request_hash(&minute_request(m0931, m0933)))
+        );
+
+        let unavailable = minute("2099-01-05T09:31:00+08:00");
+        assert_eq!(
+            minute_request(unavailable, unavailable)
+                .validate_persisted_payload(&[bar(BenchmarkBarTime::MinuteEnd(unavailable))]),
+            Err(BenchmarkError::Unavailable {
+                code: "benchmark_trading_calendar_unavailable",
+                retryable: true,
+            })
+        );
     }
 
     #[test]

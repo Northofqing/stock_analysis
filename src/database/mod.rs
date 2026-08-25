@@ -1040,6 +1040,7 @@ pub mod factor_snapshot;
 pub mod repository;
 // v12 MVP-5 §8.1
 pub(crate) mod agent_logs;
+pub mod benchmark_segments;
 pub mod chain_intelligence;
 pub mod concepts; // v15.1: 公开供 push_templates 集成使用
 pub mod daily_change_confirmation;
@@ -1869,6 +1870,7 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         // hash-chained, and retains provider/batch evidence plus aggregate
         // acceptance counters. Initialization fails on any chain mismatch.
         data_acquisition_audit::create_schema(&mut *conn)?;
+        benchmark_segments::create_schema(&mut *conn)?;
         // BR-171: exact operator confirmations for >±20% adjacent daily-close
         // moves are immutable, hash-chained and validated at startup.
         daily_change_confirmation::create_schema(&mut *conn)?;
