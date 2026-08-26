@@ -290,6 +290,25 @@ pub(crate) fn benchmark_bars(
         .map_err(|error| BenchmarkGrpcConversionFailure::consumer_admission(error, receipt))
 }
 
+/// Decode and re-admit a gRPC response for a caller-owned audit database.
+///
+/// The remote receipt is checked only as wire evidence. The review gateway
+/// replaces it with a new BR-159 receipt from the caller's explicit database
+/// before exposing a successful batch to `BenchmarkCapture`.
+pub(crate) fn benchmark_bars_for_local_readmission(
+    request: &crate::data_gateway::BenchmarkRequest,
+    q: &QueryResult,
+) -> Result<crate::data_gateway::review::AuditedBenchmarkBatch, BenchmarkGrpcConversionFailure> {
+    let wire = parse_benchmark_wire(q).map_err(BenchmarkGrpcConversionFailure::unverified)?;
+    let receipt =
+        crate::data_gateway::benchmark::decode_benchmark_grpc_server_receipt_for_local_readmission(
+            request, &wire,
+        )
+        .map_err(BenchmarkGrpcConversionFailure::unverified)?;
+    crate::data_gateway::benchmark::admit_benchmark_grpc_wire(request, wire)
+        .map_err(|error| BenchmarkGrpcConversionFailure::consumer_admission(error, receipt))
+}
+
 #[cfg(test)]
 pub(crate) fn benchmark_bars_for_test(
     request: &crate::data_gateway::BenchmarkRequest,

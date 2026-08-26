@@ -3085,6 +3085,26 @@ impl PreparedAttributionReport {
     }
 }
 
+/// Opaque result of committing exactly one prepared attribution report.
+///
+/// The report and receipt are returned together so presentation never reruns
+/// the evidence pipeline or renders a payload different from the committed one.
+#[derive(Debug, Clone)]
+pub struct CommittedAttributionReport {
+    prepared: PreparedAttributionReport,
+    receipt: AttributionReportReceipt,
+}
+
+impl CommittedAttributionReport {
+    pub fn prepared(&self) -> &PreparedAttributionReport {
+        &self.prepared
+    }
+
+    pub fn receipt(&self) -> &AttributionReportReceipt {
+        &self.receipt
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AdmittedReplayRequest {
     mode: ReplayMode,
@@ -3377,6 +3397,14 @@ impl<'a> AttributionReplayRunner<'a> {
     }
 
     pub fn commit(&self, request: ReplayRequest) -> Result<AttributionReportReceipt, ReplayError> {
+        self.commit_with_report(request)
+            .map(|committed| committed.receipt)
+    }
+
+    pub fn commit_with_report(
+        &self,
+        request: ReplayRequest,
+    ) -> Result<CommittedAttributionReport, ReplayError> {
         let admitted = admit_replay_request(request)?;
         let prepared = match self.prepare(&admitted) {
             Ok(prepared) => prepared,
@@ -3396,20 +3424,21 @@ impl<'a> AttributionReplayRunner<'a> {
                 return Err(error.with_failure_receipt(receipt));
             }
         };
-        AttributionReportStore::new(self.database)
+        let receipt = AttributionReportStore::new(self.database)
             .commit_report(AttributionReportAppend {
-                invocation: prepared.invocation,
-                trade_hash: prepared.trade_manifest_hash,
-                fee: prepared.fee,
-                stock_close_hash: prepared.stock_close_manifest_hash,
-                benchmark_manifest_hash: prepared.benchmark_manifest_hash,
-                calendar_authority_hash: prepared.calendar_authority_hash,
+                invocation: prepared.invocation.clone(),
+                trade_hash: prepared.trade_manifest_hash.clone(),
+                fee: prepared.fee.clone(),
+                stock_close_hash: prepared.stock_close_manifest_hash.clone(),
+                benchmark_manifest_hash: prepared.benchmark_manifest_hash.clone(),
+                calendar_authority_hash: prepared.calendar_authority_hash.clone(),
                 regime: AttributionEvidenceHash::Unavailable(
                     "market_regime_unavailable".to_owned(),
                 ),
-                result_payload: prepared.result_payload,
+                result_payload: prepared.result_payload.clone(),
             })
-            .map_err(map_store_error)
+            .map_err(map_store_error)?;
+        Ok(CommittedAttributionReport { prepared, receipt })
     }
 
     fn prepare(
@@ -5915,12 +5944,25 @@ mod tests {
             "TEST_CODE_000300",
             "TEST_CODE_MINUTE_END_LABEL",
         );
-        let friday = runner
-            .commit(scheduled_request(
+        let friday_committed = runner
+            .commit_with_report(scheduled_request(
                 shanghai_at("2026-08-21", 15, 30, 0),
                 initial.clone(),
             ))
             .expect("TEST_CODE Friday formal replay");
+        assert_eq!(
+            friday_committed.prepared().invocation().target_from,
+            date("2026-08-21")
+        );
+        assert_eq!(
+            friday_committed.prepared().invocation().target_to,
+            date("2026-08-21")
+        );
+        assert_eq!(
+            friday_committed.prepared().benchmark_day_manifests(),
+            initial.as_slice()
+        );
+        let friday = friday_committed.receipt().clone();
         let saturday = runner
             .commit(scheduled_request(
                 shanghai_at("2026-08-22", 15, 30, 0),

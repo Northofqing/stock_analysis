@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
 
-use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 use stock_analysis::calendar::{
@@ -21,8 +21,8 @@ use stock_analysis::database::attribution_reports::{
 };
 use stock_analysis::performance::attribution_replay::{
     AttributionConclusion, AttributionReplayLoader, AttributionReplayRunner, BenchmarkDayManifest,
-    MetricAggregate, PreparedAttributionReport, ReplayError, ReplayErrorClass, ReplayMode,
-    ReplayRequest, ReplayStage,
+    CommittedAttributionReport, MetricAggregate, PreparedAttributionReport, ReplayError,
+    ReplayErrorClass, ReplayMode, ReplayRequest, ReplayStage,
 };
 
 const SHANGHAI_OFFSET_SECONDS: i32 = 8 * 60 * 60;
@@ -198,6 +198,16 @@ impl AppError {
         }
     }
 
+    fn output_integrity(code: impl Into<String>) -> Self {
+        Self {
+            class: AppErrorClass::FailedIntegrity,
+            stage: "output",
+            code: code.into(),
+            retryable: false,
+            failure_audit_id: None,
+        }
+    }
+
     fn exit_code(&self) -> ExitCode {
         ExitCode::from(match self.class {
             AppErrorClass::Usage => USAGE_EXIT,
@@ -303,31 +313,6 @@ fn parse_benchmark_request(args: &BenchmarkRequestArgs) -> Result<BenchmarkReque
     })
 }
 
-fn natural_quarters(request: &BenchmarkRequest) -> Vec<String> {
-    let (from, to) = match &request.range {
-        BenchmarkRange::Daily { from, to } => (*from, *to),
-        BenchmarkRange::Minute1 { from, to } => (from.date_naive(), to.date_naive()),
-    };
-    let mut year = from.year();
-    let mut quarter = ((from.month() - 1) / 3) + 1;
-    let end_year = to.year();
-    let end_quarter = ((to.month() - 1) / 3) + 1;
-    let mut labels = Vec::new();
-    loop {
-        labels.push(format!("{year}-Q{quarter}"));
-        if year == end_year && quarter == end_quarter {
-            break;
-        }
-        if quarter == 4 {
-            year += 1;
-            quarter = 1;
-        } else {
-            quarter += 1;
-        }
-    }
-    labels
-}
-
 fn benchmark_request_value(request: &BenchmarkRequest) -> Value {
     match &request.range {
         BenchmarkRange::Daily { from, to } => json!({
@@ -417,9 +402,14 @@ fn render_probe(report: &BenchmarkProbeReport, format: OutputFormat) -> String {
     }
 }
 
-fn render_capture_preview(request: &BenchmarkRequest, format: OutputFormat) -> String {
-    let quarters = natural_quarters(request);
-    match format {
+fn render_capture_preview(
+    request: &BenchmarkRequest,
+    format: OutputFormat,
+) -> Result<String, AppError> {
+    let quarters = request
+        .natural_quarter_labels()
+        .map_err(map_benchmark_error)?;
+    Ok(match format {
         OutputFormat::Json => json!({
             "状态": "成功",
             "模式": "基准采集预览",
@@ -436,7 +426,7 @@ fn render_capture_preview(request: &BenchmarkRequest, format: OutputFormat) -> S
             benchmark_request_value(request),
             quarters.join("、")
         ),
-    }
+    })
 }
 
 fn render_capture_receipt(
@@ -550,14 +540,21 @@ fn prepared_report_value(prepared: &PreparedAttributionReport) -> Value {
     })
 }
 
-fn render_prepared_report(prepared: &PreparedAttributionReport, format: OutputFormat) -> String {
+fn render_prepared_report(
+    prepared: &PreparedAttributionReport,
+    format: OutputFormat,
+) -> Result<String, AppError> {
     let value = prepared_report_value(prepared);
     if matches!(format, OutputFormat::Json) {
-        return value.to_string();
+        return Ok(value.to_string());
     }
     let report = prepared.report();
     let invocation = prepared.invocation();
-    format!(
+    let net_win_rate = serde_json::to_string(report.net_win_rate())
+        .map_err(|_| AppError::output_integrity("report_net_win_rate_serialization_failed"))?;
+    let family_attribution = serde_json::to_string(report.family_attribution())
+        .map_err(|_| AppError::output_integrity("report_family_serialization_failed"))?;
+    Ok(format!(
         "# 买卖策略历史归因（ResearchOnly）\n\n- 运行模式：{:?}\n- 运行时刻：{}\n- 目标范围：{} 至 {}\n- 规则版本：{}\n- 总周期：{}（闭合 {}，开放/右删失 {}）\n- 覆盖自然日：{}\n- 成交 Manifest：{}\n- 个股收盘 Manifest：{}\n- 基准组合 Manifest：{}\n- 日历权威 Manifest：{}\n\n## 指标与完整分母\n\n- 毛收益：{}\n- 基准收益：{}\n- 毛超额收益：{}\n- 净收益：{}\n- 净超额收益：{}\n- 毛胜率：{}\n- 净胜率可用性：{}\n- 按入场族归因：{}\n\n## 样本门与结论\n\n{}\n\n> 本报告只用于研究，不构成策略成功、交易或下单结论。不可用原因保留在总分母中，缺失字段未补零。",
         invocation.mode,
         invocation.invoked_at.to_rfc3339(),
@@ -582,30 +579,32 @@ fn render_prepared_report(prepared: &PreparedAttributionReport, format: OutputFo
         report
             .gross_win_rate()
             .map_or_else(|| "不可用".to_owned(), |rate| rate.to_string()),
-        serde_json::to_string(report.net_win_rate()).unwrap_or_else(|_| "不可用".to_owned()),
-        serde_json::to_string(report.family_attribution())
-            .unwrap_or_else(|_| "不可用".to_owned()),
+        net_win_rate,
+        family_attribution,
         conclusion_value(report.conclusion())
-    )
+    ))
+}
+
+fn report_receipt_value(receipt: &AttributionReportReceipt) -> Value {
+    json!({
+        "状态": "成功",
+        "模式": "归因提交",
+        "运行审计ID": receipt.run.run_audit_id,
+        "报告修订ID": receipt.report_revision_id,
+        "报告身份": receipt.report_identity,
+        "证据身份": receipt.evidence_identity,
+        "序列身份": receipt.series_identity,
+        "结果哈希": receipt.result_payload_hash,
+        "报告修订": receipt.report_revision,
+        "前版报告ID": receipt.predecessor_report_id,
+        "报告记录哈希": receipt.report_record_hash,
+        "结论边界": "ResearchOnly"
+    })
 }
 
 fn render_report_receipt(receipt: &AttributionReportReceipt, format: OutputFormat) -> String {
     match format {
-        OutputFormat::Json => json!({
-            "状态": "成功",
-            "模式": "归因提交",
-            "运行审计ID": receipt.run.run_audit_id,
-            "报告修订ID": receipt.report_revision_id,
-            "报告身份": receipt.report_identity,
-            "证据身份": receipt.evidence_identity,
-            "序列身份": receipt.series_identity,
-            "结果哈希": receipt.result_payload_hash,
-            "报告修订": receipt.report_revision,
-            "前版报告ID": receipt.predecessor_report_id,
-            "报告记录哈希": receipt.report_record_hash,
-            "结论边界": "ResearchOnly"
-        })
-        .to_string(),
+        OutputFormat::Json => report_receipt_value(receipt).to_string(),
         OutputFormat::Markdown => format!(
             "# 归因提交回执\n\n- 状态：成功\n- 运行审计 ID：{}\n- 报告修订 ID：{}\n- 报告身份：{}\n- 证据身份：{}\n- 序列身份：{}\n- 结果哈希：{}\n- 报告修订：{}\n- 前版报告 ID：{}\n- 报告记录哈希：{}\n- 结论边界：ResearchOnly",
             receipt.run.run_audit_id,
@@ -620,6 +619,24 @@ fn render_report_receipt(receipt: &AttributionReportReceipt, format: OutputForma
                 .map_or_else(|| "无".to_owned(), |id| id.to_string()),
             receipt.report_record_hash
         ),
+    }
+}
+
+fn render_committed_report(
+    committed: &CommittedAttributionReport,
+    format: OutputFormat,
+) -> Result<String, AppError> {
+    match format {
+        OutputFormat::Json => Ok(json!({
+            "报告": prepared_report_value(committed.prepared()),
+            "提交回执": report_receipt_value(committed.receipt())
+        })
+        .to_string()),
+        OutputFormat::Markdown => Ok(format!(
+            "{}\n\n{}",
+            render_prepared_report(committed.prepared(), format)?,
+            render_report_receipt(committed.receipt(), format)
+        )),
     }
 }
 
@@ -751,15 +768,13 @@ fn execute_replay(
         benchmark_day_manifests: manifest_bindings(manifests),
     };
     if commit {
-        runner
-            .commit(request)
-            .map(|receipt| render_report_receipt(&receipt, format))
-            .map_err(map_replay_error)
+        let committed = runner
+            .commit_with_report(request)
+            .map_err(map_replay_error)?;
+        render_committed_report(&committed, format)
     } else {
-        runner
-            .preview(request)
-            .map(|prepared| render_prepared_report(&prepared, format))
-            .map_err(map_replay_error)
+        let prepared = runner.preview(request).map_err(map_replay_error)?;
+        render_prepared_report(&prepared, format)
     }
 }
 
@@ -787,7 +802,7 @@ async fn execute(cli: &Cli) -> Result<String, AppError> {
         } => {
             let request = parse_benchmark_request(request)?;
             if !commit {
-                return Ok(render_capture_preview(&request, *format));
+                return render_capture_preview(&request, *format);
             }
             let database_path = db
                 .as_deref()

@@ -897,14 +897,9 @@ pub(super) fn verify_benchmark_grpc_server_receipt(
     expected_request: &BenchmarkRequest,
     wire: &BenchmarkGrpcResponseWire,
 ) -> Result<crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt, GatewayError> {
-    validate_benchmark_response_request(expected_request, wire)?;
+    let receipt =
+        decode_benchmark_grpc_server_receipt_for_local_readmission(expected_request, wire)?;
     let expected_request_hash = canonical_base_request_hash(expected_request);
-    if wire.request_hash != expected_request_hash {
-        return Err(benchmark_wire_error(
-            "benchmark audit request hash differs from the caller request identity",
-        ));
-    }
-    let receipt = wire.receipt.to_receipt()?;
     let expected = crate::database::data_acquisition_audit::DataAcquisitionAuditRecord {
         capability: BENCHMARK_CAPABILITY,
         provider: "Tdx",
@@ -931,6 +926,23 @@ pub(super) fn verify_benchmark_grpc_server_receipt(
             ))
         })?;
     Ok(receipt)
+}
+
+/// Decode the remote receipt only as wire evidence before caller-local
+/// re-admission. The returned value is not trusted as a receipt in the caller's
+/// database and must never be passed to `BenchmarkSegmentStore`.
+pub(super) fn decode_benchmark_grpc_server_receipt_for_local_readmission(
+    expected_request: &BenchmarkRequest,
+    wire: &BenchmarkGrpcResponseWire,
+) -> Result<crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt, GatewayError> {
+    validate_benchmark_response_request(expected_request, wire)?;
+    let expected_request_hash = canonical_base_request_hash(expected_request);
+    if wire.request_hash != expected_request_hash {
+        return Err(benchmark_wire_error(
+            "benchmark audit request hash differs from the caller request identity",
+        ));
+    }
+    wire.receipt.to_receipt()
 }
 
 #[cfg(test)]
@@ -1515,6 +1527,34 @@ fn verified_benchmark_coverage(
 }
 
 impl BenchmarkRequest {
+    /// Natural-quarter labels touched by this request, in stable order.
+    ///
+    /// This is the single BR-251 projection used by capture and CLI preview;
+    /// callers do not reproduce quarter-boundary arithmetic.
+    pub fn natural_quarter_labels(&self) -> Result<Vec<String>, BenchmarkError> {
+        validate_range(&self.range)?;
+        let (from, to) = match &self.range {
+            BenchmarkRange::Daily { from, to } => (*from, *to),
+            BenchmarkRange::Minute1 { from, to } => (from.date_naive(), to.date_naive()),
+        };
+        let mut quarter_start = natural_quarter_start(from)?;
+        let final_quarter_start = natural_quarter_start(to)?;
+        let mut labels = Vec::new();
+        loop {
+            labels.push(format!(
+                "{}-Q{}",
+                quarter_start.year(),
+                ((quarter_start.month() - 1) / 3) + 1
+            ));
+            if quarter_start == final_quarter_start {
+                return Ok(labels);
+            }
+            quarter_start = natural_quarter_end(quarter_start)?
+                .checked_add_signed(Duration::days(1))
+                .ok_or_else(|| failed_integrity("benchmark_quarter_boundary_invalid"))?;
+        }
+    }
+
     pub(crate) fn canonical_request_hash(&self) -> String {
         canonical_base_request_hash(self)
     }

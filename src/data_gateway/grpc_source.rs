@@ -577,6 +577,40 @@ where
     F: FnOnce(Value) -> Fut,
     Fut: std::future::Future<Output = Result<QueryResult, BenchmarkGrpcFailure>>,
 {
+    benchmark_bars_with_query_and_converter(request, query, convert::benchmark_bars).await
+}
+
+async fn benchmark_bars_with_query_for_local_readmission<F, Fut>(
+    request: &crate::data_gateway::BenchmarkRequest,
+    query: F,
+) -> Result<crate::data_gateway::review::AuditedBenchmarkBatch, BenchmarkGrpcFailure>
+where
+    F: FnOnce(Value) -> Fut,
+    Fut: std::future::Future<Output = Result<QueryResult, BenchmarkGrpcFailure>>,
+{
+    benchmark_bars_with_query_and_converter(
+        request,
+        query,
+        convert::benchmark_bars_for_local_readmission,
+    )
+    .await
+}
+
+async fn benchmark_bars_with_query_and_converter<F, Fut>(
+    request: &crate::data_gateway::BenchmarkRequest,
+    query: F,
+    converter: fn(
+        &crate::data_gateway::BenchmarkRequest,
+        &QueryResult,
+    ) -> Result<
+        crate::data_gateway::review::AuditedBenchmarkBatch,
+        convert::BenchmarkGrpcConversionFailure,
+    >,
+) -> Result<crate::data_gateway::review::AuditedBenchmarkBatch, BenchmarkGrpcFailure>
+where
+    F: FnOnce(Value) -> Fut,
+    Fut: std::future::Future<Output = Result<QueryResult, BenchmarkGrpcFailure>>,
+{
     super::benchmark::validate_production_benchmark_request(request)
         .map_err(local_benchmark_failure)?;
     let wire = BenchmarkRequestWire::try_from_request(request).map_err(local_benchmark_failure)?;
@@ -589,7 +623,7 @@ where
         ))
     })?;
     let response = query(params).await?;
-    convert::benchmark_bars(request, &response).map_err(|failure| {
+    converter(request, &response).map_err(|failure| {
         let (error, receipt) = failure.into_parts();
         match receipt {
             Some(receipt) => BenchmarkGrpcFailure::consumer_admission(error, receipt),
@@ -2738,6 +2772,16 @@ impl GrpcSource {
         request: &crate::data_gateway::BenchmarkRequest,
     ) -> Result<crate::data_gateway::review::AuditedBenchmarkBatch, BenchmarkGrpcFailure> {
         benchmark_bars_with_query(request, |params| self.query_benchmark_op(params)).await
+    }
+
+    pub(crate) async fn benchmark_bars_async_for_local_readmission(
+        &self,
+        request: &crate::data_gateway::BenchmarkRequest,
+    ) -> Result<crate::data_gateway::review::AuditedBenchmarkBatch, BenchmarkGrpcFailure> {
+        benchmark_bars_with_query_for_local_readmission(request, |params| {
+            self.query_benchmark_op(params)
+        })
+        .await
     }
 
     /// 同步包装。
