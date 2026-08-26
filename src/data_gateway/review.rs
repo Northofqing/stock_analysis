@@ -366,6 +366,46 @@ fn finish_benchmark_bridge_attempt(
     }
 }
 
+fn finish_benchmark_bridge_attempt_in(
+    database: &crate::database::DatabaseManager,
+    request: &crate::data_gateway::BenchmarkRequest,
+    result: Result<AuditedBenchmarkBatch, super::grpc_source::BenchmarkGrpcFailure>,
+) -> Result<AuditedBenchmarkBatch, GatewayError> {
+    let failure = match result {
+        Ok(audited) => return Ok(audited),
+        Err(failure) => failure,
+    };
+    match failure.ownership() {
+        super::grpc_source::BenchmarkGrpcOwnership::ServerHandled => Err(failure.into_error()),
+        super::grpc_source::BenchmarkGrpcOwnership::ServerAuditAppendFailed
+        | super::grpc_source::BenchmarkGrpcOwnership::ClientBeforeSend => {
+            audit_benchmark_transport_failure_in(database, request, failure.into_error())
+        }
+        super::grpc_source::BenchmarkGrpcOwnership::OutcomeUnknown => {
+            audit_benchmark_transport_failure_in(
+                database,
+                request,
+                GatewayError::classified(
+                    "GrpcBridge",
+                    None,
+                    "unavailable",
+                    "transport_outcome_unknown",
+                    true,
+                    "BenchmarkBars request may have reached the server; provider outcome is unknown",
+                ),
+            )
+        }
+        super::grpc_source::BenchmarkGrpcOwnership::ConsumerAdmissionRejected => {
+            debug_assert!(failure.has_verified_receipt());
+            audit_benchmark_consumer_admission_failure_in(
+                database,
+                request,
+                failure.into_error(),
+            )
+        }
+    }
+}
+
 fn audit_benchmark_transport_failure(
     request: &crate::data_gateway::BenchmarkRequest,
     error: GatewayError,
@@ -378,6 +418,24 @@ fn audit_benchmark_transport_failure(
         Err(error),
     ) {
         Err(error) => Err(error),
+        Ok(_) => unreachable!("an audited transport failure cannot become a successful batch"),
+    }
+}
+
+fn audit_benchmark_transport_failure_in(
+    database: &crate::database::DatabaseManager,
+    request: &crate::data_gateway::BenchmarkRequest,
+    error: GatewayError,
+) -> Result<AuditedBenchmarkBatch, GatewayError> {
+    let transport_request_hash = benchmark_transport_request_hash(request);
+    match audit_gateway_result_with_receipt_state_in::<crate::data_gateway::BenchmarkBar>(
+        database,
+        BENCHMARK_GRPC_TRANSPORT_CAPABILITY,
+        ProviderId::Custom,
+        &transport_request_hash,
+        Err(error),
+    ) {
+        Err(error) => Err(error.into_error()),
         Ok(_) => unreachable!("an audited transport failure cannot become a successful batch"),
     }
 }
@@ -402,6 +460,24 @@ fn audit_benchmark_consumer_admission_failure(
         Err(error),
     ) {
         Err(error) => Err(error),
+        Ok(_) => unreachable!("an audited consumer rejection cannot become a successful batch"),
+    }
+}
+
+fn audit_benchmark_consumer_admission_failure_in(
+    database: &crate::database::DatabaseManager,
+    request: &crate::data_gateway::BenchmarkRequest,
+    error: GatewayError,
+) -> Result<AuditedBenchmarkBatch, GatewayError> {
+    let request_hash = benchmark_consumer_admission_request_hash(request);
+    match audit_gateway_result_with_receipt_state_in::<crate::data_gateway::BenchmarkBar>(
+        database,
+        BENCHMARK_GRPC_CONSUMER_ADMISSION_CAPABILITY,
+        ProviderId::Custom,
+        &request_hash,
+        Err(error),
+    ) {
+        Err(error) => Err(error.into_error()),
         Ok(_) => unreachable!("an audited consumer rejection cannot become a successful batch"),
     }
 }
@@ -454,6 +530,46 @@ impl ReviewDataGateway {
         }
     }
 
+    /// Same benchmark acquisition contract as `benchmark_bars`, but every
+    /// client-owned BR-159 audit is bound to the caller's explicit database.
+    pub(crate) async fn benchmark_bars_into(
+        &self,
+        database: &crate::database::DatabaseManager,
+        request: crate::data_gateway::BenchmarkRequest,
+    ) -> Result<AuditedBenchmarkBatch, GatewayError> {
+        match super::grpc_source::bridge_for("BenchmarkBars") {
+            Ok(Some(source)) => finish_benchmark_bridge_attempt_in(
+                database,
+                &request,
+                source.benchmark_bars_async(&request).await,
+            ),
+            Ok(None) if std::env::var("DATA_GATEWAY_GRPC").as_deref() != Ok("1") => {
+                self.benchmark_bars_library_audited_into(database, request)
+                    .await
+                    .map_err(GatewayAuditFailure::into_error)
+            }
+            Ok(None) => finish_benchmark_bridge_attempt_in(
+                database,
+                &request,
+                Err(super::grpc_source::BenchmarkGrpcFailure::client_before_send(
+                    GatewayError::classified(
+                        "GrpcBridge",
+                        None,
+                        "unavailable",
+                        "bridge_disabled",
+                        false,
+                        "BenchmarkBars gRPC bridge is configured but disabled; library fallback is forbidden",
+                    ),
+                )),
+            ),
+            Err(error) => finish_benchmark_bridge_attempt_in(
+                database,
+                &request,
+                Err(super::grpc_source::BenchmarkGrpcFailure::client_before_send(error)),
+            ),
+        }
+    }
+
     #[allow(dead_code)] // Task 25 wires the private gRPC server delegate.
     pub(crate) async fn benchmark_bars_library(
         &self,
@@ -485,6 +601,26 @@ impl ReviewDataGateway {
     ) -> Result<AuditedBenchmarkBatch, GatewayAuditFailure> {
         let outcome = super::benchmark::acquire_production_benchmark_bars(request).await;
         audit_gateway_result_with_receipt_state(
+            "BenchmarkBars",
+            ProviderId::Tdx,
+            &outcome.request_hash,
+            outcome.result,
+        )
+        .map(|(batch, receipt)| AuditedBenchmarkBatch {
+            batch,
+            receipt,
+            request_hash: outcome.request_hash,
+        })
+    }
+
+    async fn benchmark_bars_library_audited_into(
+        &self,
+        database: &crate::database::DatabaseManager,
+        request: crate::data_gateway::BenchmarkRequest,
+    ) -> Result<AuditedBenchmarkBatch, GatewayAuditFailure> {
+        let outcome = super::benchmark::acquire_production_benchmark_bars(request).await;
+        audit_gateway_result_with_receipt_state_in(
+            database,
             "BenchmarkBars",
             ProviderId::Tdx,
             &outcome.request_hash,
@@ -1101,7 +1237,8 @@ impl GatewayAuditFailure {
     }
 }
 
-fn audit_gateway_result_with_receipt_state<T>(
+fn audit_gateway_result_with_receipt_state_in<T>(
+    database: &crate::database::DatabaseManager,
     capability: &'static str,
     provider: ProviderId,
     request_hash: &str,
@@ -1114,7 +1251,6 @@ fn audit_gateway_result_with_receipt_state<T>(
     GatewayAuditFailure,
 > {
     use crate::database::data_acquisition_audit::DataAcquisitionAuditRecord;
-    use crate::database::DatabaseManager;
 
     let result = result.and_then(|batch| {
         if batch.evidence().provider != provider {
@@ -1198,14 +1334,6 @@ fn audit_gateway_result_with_receipt_state<T>(
         retryable,
     };
     let original_reason_code = reason_code;
-    let database = DatabaseManager::try_get().ok_or_else(|| {
-        GatewayAuditFailure::AppendFailed(GatewayError::audit_failure(
-            capability,
-            provider,
-            original_reason_code,
-            "database is not initialized",
-        ))
-    })?;
     let receipt = database.record_data_acquisition(&record).map_err(|error| {
         GatewayAuditFailure::AppendFailed(GatewayError::audit_failure(
             capability,
@@ -1237,6 +1365,32 @@ fn audit_gateway_result_with_receipt_state<T>(
         Ok(batch) => Ok((batch, receipt)),
         Err(error) => Err(GatewayAuditFailure::Persisted(error)),
     }
+}
+
+fn audit_gateway_result_with_receipt_state<T>(
+    capability: &'static str,
+    provider: ProviderId,
+    request_hash: &str,
+    result: Result<GatewayBatch<T>, GatewayError>,
+) -> Result<
+    (
+        GatewayBatch<T>,
+        crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt,
+    ),
+    GatewayAuditFailure,
+> {
+    let original_reason_code = result
+        .as_ref()
+        .map_or_else(|error| error.reason_code(), |_| "accepted");
+    let database = crate::database::DatabaseManager::try_get().ok_or_else(|| {
+        GatewayAuditFailure::AppendFailed(GatewayError::audit_failure(
+            capability,
+            provider,
+            original_reason_code,
+            "database is not initialized",
+        ))
+    })?;
+    audit_gateway_result_with_receipt_state_in(database, capability, provider, request_hash, result)
 }
 
 pub(super) fn audit_gateway_result_with_receipt<T>(
@@ -1393,6 +1547,9 @@ fn gateway_router_error(
 mod tests {
     use super::*;
     use crate::data_provider::{AdjustType, KlineData};
+    use crate::database::attribution_reports::{
+        AttributionDatabaseAccess, AttributionDatabaseSession,
+    };
     use crate::database::DatabaseManager;
     use crate::magic_compat::{
         AssetClass, DataBatch, Exchange, InstrumentId, IsoDate, Money, NonEmptyText, Price,
@@ -1449,6 +1606,57 @@ mod tests {
     struct AcquisitionRequestAuditRow {
         #[diesel(sql_type = Text)]
         request_hash: String,
+    }
+
+    #[test]
+    fn br251_explicit_benchmark_audit_uses_the_supplied_database() {
+        let path = std::env::temp_dir().join(format!(
+            "TEST_CODE_explicit_benchmark_audit_{}_{}.sqlite3",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("TEST_CODE clock")
+                .as_nanos()
+        ));
+        drop(rusqlite::Connection::open(&path).expect("TEST_CODE create explicit database"));
+        let session =
+            AttributionDatabaseSession::open(&path, AttributionDatabaseAccess::AppendOnly)
+                .expect("TEST_CODE narrow append-only schema");
+        let request_hash = "a".repeat(64);
+        let provider_error = GatewayError::classified(
+            "TEST_CODE_BenchmarkBars",
+            Some(ProviderId::Tdx),
+            "unavailable",
+            "TEST_CODE_provider_unavailable",
+            true,
+            "TEST_CODE explicit audit binding",
+        );
+
+        let result = audit_gateway_result_with_receipt_state_in::<crate::data_gateway::BenchmarkBar>(
+            session.database(),
+            "TEST_CODE_BenchmarkBars",
+            ProviderId::Tdx,
+            &request_hash,
+            Err(provider_error),
+        );
+        assert!(matches!(result, Err(GatewayAuditFailure::Persisted(_))));
+
+        let mut connection = session
+            .database()
+            .get_conn()
+            .expect("TEST_CODE explicit audit connection");
+        let count = diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM data_acquisition_audit
+             WHERE capability='TEST_CODE_BenchmarkBars' AND request_hash=?",
+        )
+        .bind::<Text, _>(&request_hash)
+        .get_result::<AcquisitionCountRow>(&mut connection)
+        .expect("TEST_CODE explicit audit row")
+        .count;
+        assert_eq!(count, 1);
+        drop(connection);
+        drop(session);
+        std::fs::remove_file(&path).expect("TEST_CODE remove exact temporary database");
     }
 
     #[test]

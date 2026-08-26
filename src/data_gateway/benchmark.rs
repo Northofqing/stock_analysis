@@ -82,6 +82,83 @@ pub struct BenchmarkSnapshotRef {
     pub evidence: Vec<BatchEvidence>,
 }
 
+/// Read-only production adapter diagnostics. This report is evidence for an
+/// operator; it is not a capture preview or a reader capability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BenchmarkProbeReport {
+    pub request_hash: String,
+    pub instrument: String,
+    pub granularity: BenchmarkGranularity,
+    pub provider: String,
+    pub source: String,
+    pub source_at: Option<String>,
+    pub observed_at: String,
+    pub batch_id: String,
+    pub accepted_records: usize,
+    pub provider_page_size: u16,
+    pub first_label: String,
+    pub last_label: String,
+    pub minute_label_semantics: &'static str,
+    pub protocol_revision: &'static str,
+}
+
+/// Exercise the real benchmark adapter without writing BR-159 audit rows,
+/// segment manifests, or attestation state.
+pub async fn probe_benchmark_request(
+    request: BenchmarkRequest,
+) -> Result<BenchmarkProbeReport, BenchmarkError> {
+    let outcome = acquire_production_benchmark_bars(request.clone()).await;
+    let batch = outcome.result.map_err(map_gateway_error)?;
+    benchmark_probe_report(&request, &outcome.request_hash, &batch)
+}
+
+fn benchmark_bar_label(bar: &BenchmarkBar) -> String {
+    match &bar.at {
+        BenchmarkBarTime::Daily(date) => date.to_string(),
+        BenchmarkBarTime::MinuteEnd(timestamp) => timestamp.to_rfc3339(),
+    }
+}
+
+fn benchmark_probe_report(
+    request: &BenchmarkRequest,
+    request_hash: &str,
+    batch: &GatewayBatch<BenchmarkBar>,
+) -> Result<BenchmarkProbeReport, BenchmarkError> {
+    if request_hash != canonical_base_request_hash(request) {
+        return Err(failed_integrity("benchmark_probe_request_hash_mismatch"));
+    }
+    request.validate_persisted_payload(batch.records())?;
+    let first = batch.records().first().ok_or(BenchmarkError::Unavailable {
+        code: "benchmark_batch_empty",
+        retryable: true,
+    })?;
+    let last = batch.records().last().ok_or(BenchmarkError::Unavailable {
+        code: "benchmark_batch_empty",
+        retryable: true,
+    })?;
+    let evidence = batch.evidence();
+    let (granularity, minute_label_semantics) = match &request.range {
+        BenchmarkRange::Daily { .. } => (BenchmarkGranularity::Daily, "not_applicable"),
+        BenchmarkRange::Minute1 { .. } => (BenchmarkGranularity::Minute1, "unverified"),
+    };
+    Ok(BenchmarkProbeReport {
+        request_hash: request_hash.to_owned(),
+        instrument: request.instrument.clone(),
+        granularity,
+        provider: format!("{:?}", evidence.provider),
+        source: evidence.source.clone(),
+        source_at: evidence.source_at.clone(),
+        observed_at: evidence.observed_at.clone(),
+        batch_id: evidence.batch_id.clone(),
+        accepted_records: batch.records().len(),
+        provider_page_size: TDX_PAGE_SIZE,
+        first_label: benchmark_bar_label(first),
+        last_label: benchmark_bar_label(last),
+        minute_label_semantics,
+        protocol_revision: TDX_DEPENDENCY_REVISION,
+    })
+}
+
 pub struct BenchmarkCapture<'a> {
     gateway: ReviewDataGateway,
     database: &'a DatabaseManager,
@@ -102,7 +179,7 @@ impl<'a> BenchmarkCapture<'a> {
     ) -> Result<CapturePreview, BenchmarkError> {
         let audited = self
             .gateway
-            .benchmark_bars(request.clone())
+            .benchmark_bars_into(self.database, request.clone())
             .await
             .map_err(map_gateway_error)?;
         prepare_capture_preview(request, audited)
@@ -2060,11 +2137,12 @@ mod tests {
 
     use super::{
         acquire_benchmark_batch_from_source, admit_benchmark_batch,
-        admit_benchmark_grpc_wire_for_test, canonical_base_request_hash, map_gateway_error,
-        BenchmarkAdmissionCoverage, BenchmarkBar, BenchmarkBarTime, BenchmarkError,
-        BenchmarkEvidenceWire, BenchmarkGrpcResponseWire, BenchmarkProviderAttestation,
-        BenchmarkRange, BenchmarkRegistry, BenchmarkRequest, BenchmarkUnsupported,
-        BenchmarkWireTime, IndexBarsSource, IndexPageRequest, RawIndexBar, HS300_CANONICAL,
+        admit_benchmark_grpc_wire_for_test, benchmark_probe_report, canonical_base_request_hash,
+        map_gateway_error, BenchmarkAdmissionCoverage, BenchmarkBar, BenchmarkBarTime,
+        BenchmarkError, BenchmarkEvidenceWire, BenchmarkGrpcResponseWire,
+        BenchmarkProviderAttestation, BenchmarkRange, BenchmarkRegistry, BenchmarkRequest,
+        BenchmarkUnsupported, BenchmarkWireTime, IndexBarsSource, IndexPageRequest, RawIndexBar,
+        HS300_CANONICAL, TDX_DEPENDENCY_REVISION,
     };
     use crate::data_gateway::review::AuditedBenchmarkBatch;
     use crate::data_gateway::{BatchEvidence, GatewayBatch, GatewayError};
@@ -2117,6 +2195,44 @@ mod tests {
 
     fn test_registry() -> BenchmarkRegistry {
         BenchmarkRegistry::test_only(["TEST_CODE_000300"])
+    }
+
+    #[test]
+    fn diagnostic_probe_projection_keeps_identity_boundaries_and_minute_labels_unverified() {
+        let request = minute_request(
+            minute("2026-08-21T09:31:00+08:00"),
+            minute("2026-08-21T09:32:00+08:00"),
+        );
+        let batch = GatewayBatch::Available {
+            records: vec![
+                bar(BenchmarkBarTime::MinuteEnd(minute(
+                    "2026-08-21T09:31:00+08:00",
+                ))),
+                bar(BenchmarkBarTime::MinuteEnd(minute(
+                    "2026-08-21T09:32:00+08:00",
+                ))),
+            ],
+            evidence: BatchEvidence {
+                provider: crate::magic_compat::ProviderId::Tdx,
+                source: "TEST_CODE_magic-tdx-index-bars".to_owned(),
+                source_at: None,
+                observed_at: "2026-08-21T15:01:00+08:00".to_owned(),
+                batch_id: "TEST_CODE_probe_batch".to_owned(),
+            },
+        };
+
+        let request_hash = canonical_base_request_hash(&request);
+        let report = benchmark_probe_report(&request, &request_hash, &batch)
+            .expect("TEST_CODE project diagnostic report");
+        assert_eq!(report.instrument, "TEST_CODE_000300");
+        assert_eq!(report.request_hash, request_hash);
+        assert_eq!(report.provider, "Tdx");
+        assert_eq!(report.accepted_records, 2);
+        assert_eq!(report.provider_page_size, 800);
+        assert_eq!(report.first_label, "2026-08-21T09:31:00+08:00");
+        assert_eq!(report.last_label, "2026-08-21T09:32:00+08:00");
+        assert_eq!(report.minute_label_semantics, "unverified");
+        assert_eq!(report.protocol_revision, TDX_DEPENDENCY_REVISION);
     }
 
     #[test]

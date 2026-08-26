@@ -1,8 +1,10 @@
 //! BR-251 immutable attribution invocation, report, and failure store.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate};
+use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Integer, Nullable, Text};
 use serde::Serialize;
@@ -172,6 +174,170 @@ impl std::error::Error for AttributionReportStoreError {}
 
 pub struct AttributionReportStore<'a> {
     database: &'a DatabaseManager,
+}
+
+/// Explicit BR-251 database access selected by the standalone attribution CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttributionDatabaseAccess {
+    ReadOnly,
+    AppendOnly,
+}
+
+/// Opaque, path-bound database session for the standalone attribution CLI.
+///
+/// Read-only sessions never migrate. Append-only sessions install only the
+/// BR-159 acquisition, benchmark-segment, and attribution-report schemas.
+pub struct AttributionDatabaseSession {
+    database: DatabaseManager,
+    database_path: PathBuf,
+}
+
+#[derive(QueryableByName)]
+struct AttributionQueryOnlyRow {
+    #[diesel(sql_type = Integer)]
+    query_only: i32,
+}
+
+impl AttributionDatabaseSession {
+    pub fn open(
+        path: impl AsRef<Path>,
+        access: AttributionDatabaseAccess,
+    ) -> Result<Self, AttributionReportStoreError> {
+        let path = path.as_ref();
+        let supplied_metadata = std::fs::symlink_metadata(path).map_err(|_| {
+            unavailable(
+                "attribution_database_unavailable",
+                false,
+                "BR-251 explicit attribution database is unavailable",
+            )
+        })?;
+        if supplied_metadata.file_type().is_symlink() || !supplied_metadata.is_file() {
+            return Err(failed_integrity(
+                "attribution_database_identity_invalid",
+                "BR-251 explicit attribution database must be an existing regular file",
+            ));
+        }
+        let database_path = std::fs::canonicalize(path).map_err(|_| {
+            unavailable(
+                "attribution_database_unavailable",
+                false,
+                "BR-251 explicit attribution database cannot be resolved",
+            )
+        })?;
+        if !std::fs::metadata(&database_path)
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false)
+        {
+            return Err(failed_integrity(
+                "attribution_database_identity_invalid",
+                "BR-251 resolved attribution database is not a regular file",
+            ));
+        }
+
+        let database_url = match access {
+            AttributionDatabaseAccess::ReadOnly => {
+                let mut url = url::Url::from_file_path(&database_path).map_err(|_| {
+                    failed_integrity(
+                        "attribution_database_identity_invalid",
+                        "BR-251 attribution database path cannot form a SQLite URI",
+                    )
+                })?;
+                url.query_pairs_mut().append_pair("mode", "ro");
+                url.to_string()
+            }
+            AttributionDatabaseAccess::AppendOnly => database_path
+                .to_str()
+                .ok_or_else(|| {
+                    failed_integrity(
+                        "attribution_database_identity_invalid",
+                        "BR-251 attribution database path must be valid UTF-8",
+                    )
+                })?
+                .to_owned(),
+        };
+        let pool = super::build_sqlite_pool_with_size(database_url, 1).map_err(|_| {
+            unavailable(
+                "attribution_database_unavailable",
+                true,
+                "BR-251 attribution database pool is unavailable",
+            )
+        })?;
+        let database = DatabaseManager {
+            pool,
+            selection_connection_source: None,
+            selection_schema_authority: None,
+        };
+        let mut connection = database.get_conn().map_err(|_| {
+            unavailable(
+                "attribution_database_unavailable",
+                true,
+                "BR-251 attribution database connection is unavailable",
+            )
+        })?;
+        match access {
+            AttributionDatabaseAccess::ReadOnly => {
+                connection
+                    .batch_execute("PRAGMA query_only = ON;")
+                    .map_err(|_| {
+                        failed_integrity(
+                            "attribution_read_only_boundary_failed",
+                            "BR-251 attribution preview cannot enforce query_only",
+                        )
+                    })?;
+                let query_only = diesel::sql_query("PRAGMA query_only")
+                    .get_result::<AttributionQueryOnlyRow>(&mut connection)
+                    .map_err(|_| {
+                        failed_integrity(
+                            "attribution_read_only_boundary_failed",
+                            "BR-251 attribution preview cannot verify query_only",
+                        )
+                    })?
+                    .query_only;
+                if query_only != 1 {
+                    return Err(failed_integrity(
+                        "attribution_read_only_boundary_failed",
+                        "BR-251 attribution preview query_only verification failed",
+                    ));
+                }
+            }
+            AttributionDatabaseAccess::AppendOnly => {
+                super::data_acquisition_audit::create_schema(&mut connection).map_err(|_| {
+                    unavailable(
+                        "attribution_schema_unavailable",
+                        true,
+                        "BR-251 acquisition audit schema initialization failed",
+                    )
+                })?;
+                super::benchmark_segments::create_schema(&mut connection).map_err(|_| {
+                    unavailable(
+                        "attribution_schema_unavailable",
+                        true,
+                        "BR-251 benchmark schema initialization failed",
+                    )
+                })?;
+                create_schema(&mut connection).map_err(|_| {
+                    unavailable(
+                        "attribution_schema_unavailable",
+                        true,
+                        "BR-251 attribution schema initialization failed",
+                    )
+                })?;
+            }
+        }
+        drop(connection);
+        Ok(Self {
+            database,
+            database_path,
+        })
+    }
+
+    pub fn database(&self) -> &DatabaseManager {
+        &self.database
+    }
+
+    pub fn database_path(&self) -> &Path {
+        &self.database_path
+    }
 }
 
 #[cfg(test)]
@@ -2174,6 +2340,131 @@ mod tests {
             .expect("TEST_CODE establish attribution schema database");
         super::create_schema(&mut conn).expect("TEST_CODE create attribution schema");
         conn
+    }
+
+    #[test]
+    fn explicit_attribution_database_session_is_read_only_or_narrow_append_only() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("TEST_CODE clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "TEST_CODE_attribution_session_{}_{}.sqlite",
+            std::process::id(),
+            nonce
+        ));
+        let missing = path.with_extension("missing.sqlite");
+        let mut bootstrap = SqliteConnection::establish(&path.to_string_lossy())
+            .expect("TEST_CODE explicit session bootstrap");
+        bootstrap
+            .batch_execute(
+                "CREATE TABLE legacy_guard(value TEXT NOT NULL);\
+                 INSERT INTO legacy_guard(value) VALUES ('unchanged');",
+            )
+            .expect("TEST_CODE legacy sentinel");
+        drop(bootstrap);
+
+        let before_bytes = std::fs::read(&path).expect("TEST_CODE read database before preview");
+        let before_modified = std::fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .expect("TEST_CODE database mtime before preview");
+        let read_only =
+            AttributionDatabaseSession::open(&path, AttributionDatabaseAccess::ReadOnly)
+                .expect("TEST_CODE open read-only attribution session");
+        assert_eq!(
+            read_only.database_path(),
+            std::fs::canonicalize(&path).unwrap()
+        );
+        let mut connection = read_only
+            .database()
+            .get_conn()
+            .expect("TEST_CODE read-only connection");
+        let sentinel = diesel::sql_query("SELECT value AS name FROM legacy_guard LIMIT 1")
+            .get_result::<NameRow>(&mut connection)
+            .expect("TEST_CODE read legacy sentinel")
+            .name;
+        assert_eq!(sentinel, "unchanged");
+        assert!(
+            diesel::sql_query("CREATE TABLE forbidden_write(id INTEGER)")
+                .execute(&mut connection)
+                .is_err()
+        );
+        drop(connection);
+        drop(read_only);
+        assert_eq!(
+            std::fs::read(&path).expect("TEST_CODE read database after preview"),
+            before_bytes
+        );
+        assert_eq!(
+            std::fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .expect("TEST_CODE database mtime after preview"),
+            before_modified
+        );
+        assert!(!PathBuf::from(format!("{}-wal", path.display())).exists());
+        assert!(!PathBuf::from(format!("{}-shm", path.display())).exists());
+
+        let missing_error =
+            match AttributionDatabaseSession::open(&missing, AttributionDatabaseAccess::ReadOnly) {
+                Ok(_) => panic!("TEST_CODE read-only session must not create a missing database"),
+                Err(error) => error,
+            };
+        assert_eq!(
+            missing_error.reason_code(),
+            "attribution_database_unavailable"
+        );
+        assert!(!missing.exists());
+
+        let append_only =
+            AttributionDatabaseSession::open(&path, AttributionDatabaseAccess::AppendOnly)
+                .expect("TEST_CODE open narrow append-only attribution session");
+        let mut connection = append_only
+            .database()
+            .get_conn()
+            .expect("TEST_CODE append-only connection");
+        let sentinel = diesel::sql_query("SELECT value AS name FROM legacy_guard LIMIT 1")
+            .get_result::<NameRow>(&mut connection)
+            .expect("TEST_CODE legacy sentinel after narrow migrations")
+            .name;
+        assert_eq!(sentinel, "unchanged");
+        for forbidden in ["paper_trades", "stock_daily", "stock_position", "trades"] {
+            let count = diesel::sql_query(
+                "SELECT COUNT(*) AS value FROM sqlite_master WHERE type='table' AND name=?",
+            )
+            .bind::<Text, _>(forbidden)
+            .get_result::<IntegerRow>(&mut connection)
+            .expect("TEST_CODE forbidden legacy table count")
+            .value;
+            assert_eq!(
+                count, 0,
+                "TEST_CODE must not create legacy table {forbidden}"
+            );
+        }
+        for required in [
+            "data_acquisition_audit",
+            "benchmark_segment_revision",
+            "benchmark_manifest",
+            "attribution_run_audit",
+            "attribution_report_revision",
+            "attribution_failure_audit",
+        ] {
+            let count = diesel::sql_query(
+                "SELECT COUNT(*) AS value FROM sqlite_master WHERE type='table' AND name=?",
+            )
+            .bind::<Text, _>(required)
+            .get_result::<IntegerRow>(&mut connection)
+            .expect("TEST_CODE required attribution table count")
+            .value;
+            assert_eq!(count, 1, "TEST_CODE missing narrow table {required}");
+        }
+        drop(connection);
+        drop(append_only);
+        for suffix in ["", "-wal", "-shm"] {
+            let candidate = PathBuf::from(format!("{}{}", path.display(), suffix));
+            if let Err(error) = std::fs::remove_file(&candidate) {
+                assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+            }
+        }
     }
 
     struct TestDatabase {
