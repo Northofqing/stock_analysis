@@ -39,8 +39,10 @@ pub mod sina_instrument_news;
 pub use benchmark::{
     admit_benchmark_batch, probe_benchmark_request, AdmittedBenchmarkBatch,
     BenchmarkAdmissionCoverage, BenchmarkBar, BenchmarkBarTime, BenchmarkCapture, BenchmarkError,
-    BenchmarkGranularity, BenchmarkProbeReport, BenchmarkRange, BenchmarkReader, BenchmarkRegistry,
-    BenchmarkRequest, BenchmarkSnapshotRef, BenchmarkUnsupported, CapturePreview, HS300_CANONICAL,
+    BenchmarkGranularity, BenchmarkProbeReport, BenchmarkRange, BenchmarkRawIdentityAnchor,
+    BenchmarkRawIdentityVerification, BenchmarkRawMinuteLabelSemantics, BenchmarkRawPageTrace,
+    BenchmarkRawTimeSample, BenchmarkReader, BenchmarkRegistry, BenchmarkRequest,
+    BenchmarkSnapshotRef, BenchmarkUnsupported, CapturePreview, HS300_CANONICAL,
 };
 pub use block_trade::{BlockTradeReview, BlockTradesGateway};
 pub use board::{

@@ -82,81 +82,135 @@ pub struct BenchmarkSnapshotRef {
     pub evidence: Vec<BatchEvidence>,
 }
 
-/// Read-only production adapter diagnostics. This report is evidence for an
-/// operator; it is not a capture preview or a reader capability.
+/// Provider request identity carried by a raw diagnostic.
+///
+/// TDX index-bar rows do not echo an instrument identifier, so the requested
+/// protocol mapping is retained while verification remains explicitly absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkRawIdentityVerification {
+    Unverified,
+}
+
+impl BenchmarkRawIdentityVerification {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unverified => "unverified",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkRawMinuteLabelSemantics {
+    NotApplicable,
+    Unverified,
+}
+
+impl BenchmarkRawMinuteLabelSemantics {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not_applicable",
+            Self::Unverified => "unverified",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BenchmarkRawIdentityAnchor {
+    pub canonical_instrument: String,
+    pub provider_market: u8,
+    pub provider_code: &'static str,
+    pub provider_category: u8,
+    pub adjustment_mode: u8,
+    pub provider_identity_echo: Option<String>,
+    pub identity_verification: BenchmarkRawIdentityVerification,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BenchmarkRawPageTrace {
+    pub offset: u32,
+    pub requested: u16,
+    pub received: usize,
+    pub first_raw_label: String,
+    pub last_raw_label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BenchmarkRawTimeSample {
+    pub raw_label: String,
+    pub year: u32,
+    pub month: u32,
+    pub day: u32,
+    pub hour: u32,
+    pub minute: u32,
+}
+
+/// Read-only raw provider diagnostics. This type deliberately contains no
+/// `GatewayBatch`, receipt, capture preview, reader handle, or database state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BenchmarkProbeReport {
     pub request_hash: String,
-    pub instrument: String,
+    pub identity_anchor: BenchmarkRawIdentityAnchor,
     pub granularity: BenchmarkGranularity,
     pub provider: String,
     pub source: String,
     pub source_at: Option<String>,
     pub observed_at: String,
-    pub batch_id: String,
-    pub accepted_records: usize,
-    pub provider_page_size: u16,
-    pub first_label: String,
-    pub last_label: String,
-    pub minute_label_semantics: &'static str,
+    pub provider_reported_total: Option<usize>,
+    pub pages: Vec<BenchmarkRawPageTrace>,
+    pub raw_total_count: usize,
+    pub raw_in_range_count: usize,
+    pub first_raw_label: String,
+    pub last_raw_label: String,
+    pub raw_ohlc_digest: String,
+    pub minute_label_semantics: BenchmarkRawMinuteLabelSemantics,
+    pub minute_raw_time_samples: Vec<BenchmarkRawTimeSample>,
     pub protocol_revision: &'static str,
 }
 
-/// Exercise the real benchmark adapter without writing BR-159 audit rows,
-/// segment manifests, or attestation state.
+/// Exercise the provider's raw index-bar protocol without entering admitted
+/// acquisition. It cannot write BR-159 rows, segment manifests, or attestation.
 pub async fn probe_benchmark_request(
     request: BenchmarkRequest,
 ) -> Result<BenchmarkProbeReport, BenchmarkError> {
-    let outcome = acquire_production_benchmark_bars(request.clone()).await;
-    let batch = outcome.result.map_err(map_gateway_error)?;
-    benchmark_probe_report(&request, &outcome.request_hash, &batch)
-}
+    let registry = BenchmarkRegistry::production_default();
+    validate_benchmark_request(&registry, &request)
+        .map_err(benchmark_admission_error)
+        .map_err(map_gateway_error)?;
 
-fn benchmark_bar_label(bar: &BenchmarkBar) -> String {
-    match &bar.at {
-        BenchmarkBarTime::Daily(date) => date.to_string(),
-        BenchmarkBarTime::MinuteEnd(timestamp) => timestamp.to_rfc3339(),
+    #[cfg(not(feature = "magic-gateway"))]
+    {
+        let _ = request;
+        Err(map_gateway_error(benchmark_gateway_error(
+            BenchmarkAuditOutcome::Unavailable,
+            "provider_transport",
+            true,
+            "Magic TDX library transport is disabled",
+        )))
     }
-}
 
-fn benchmark_probe_report(
-    request: &BenchmarkRequest,
-    request_hash: &str,
-    batch: &GatewayBatch<BenchmarkBar>,
-) -> Result<BenchmarkProbeReport, BenchmarkError> {
-    if request_hash != canonical_base_request_hash(request) {
-        return Err(failed_integrity("benchmark_probe_request_hash_mismatch"));
+    #[cfg(feature = "magic-gateway")]
+    {
+        let joined = tokio::task::spawn_blocking(move || {
+            let source = TdxIndexBarsSource::connect()?;
+            let observed_at =
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            probe_raw_benchmark_from_source(&source, request, &registry, observed_at.as_str())
+        })
+        .await;
+        match joined {
+            Ok(result) => result.map_err(map_gateway_error),
+            Err(error) => Err(map_gateway_error(benchmark_gateway_error(
+                BenchmarkAuditOutcome::Unavailable,
+                "blocking_task_failed",
+                true,
+                format!("TDX raw benchmark diagnostic worker failed: {error}"),
+            ))),
+        }
     }
-    request.validate_persisted_payload(batch.records())?;
-    let first = batch.records().first().ok_or(BenchmarkError::Unavailable {
-        code: "benchmark_batch_empty",
-        retryable: true,
-    })?;
-    let last = batch.records().last().ok_or(BenchmarkError::Unavailable {
-        code: "benchmark_batch_empty",
-        retryable: true,
-    })?;
-    let evidence = batch.evidence();
-    let (granularity, minute_label_semantics) = match &request.range {
-        BenchmarkRange::Daily { .. } => (BenchmarkGranularity::Daily, "not_applicable"),
-        BenchmarkRange::Minute1 { .. } => (BenchmarkGranularity::Minute1, "unverified"),
-    };
-    Ok(BenchmarkProbeReport {
-        request_hash: request_hash.to_owned(),
-        instrument: request.instrument.clone(),
-        granularity,
-        provider: format!("{:?}", evidence.provider),
-        source: evidence.source.clone(),
-        source_at: evidence.source_at.clone(),
-        observed_at: evidence.observed_at.clone(),
-        batch_id: evidence.batch_id.clone(),
-        accepted_records: batch.records().len(),
-        provider_page_size: TDX_PAGE_SIZE,
-        first_label: benchmark_bar_label(first),
-        last_label: benchmark_bar_label(last),
-        minute_label_semantics,
-        protocol_revision: TDX_DEPENDENCY_REVISION,
-    })
 }
 
 pub struct BenchmarkCapture<'a> {
@@ -1749,8 +1803,48 @@ fn fetch_and_admit_benchmark_batch(
         BenchmarkRange::Daily { .. } => TDX_DAILY_CATEGORY,
         BenchmarkRange::Minute1 { .. } => TDX_MINUTE1_CATEGORY,
     };
+    let pages = fetch_raw_benchmark_pages(source, &request, category)?;
+
+    let request_hash = canonical_base_request_hash(&request);
+    let canonical_bytes = canonical_acquisition_bytes(&request, category, &pages)?;
+    let batch_id = domain_hash(b"BR251_TDX_INDEX_BATCH_V1\0", &canonical_bytes);
+
+    let mut selected = Vec::new();
+    for (_, rows) in pages {
+        for raw in rows {
+            let (key, bar) = raw_to_benchmark_bar(raw, &request.range)?;
+            if range_contains_key(&request.range, key)? {
+                selected.push((key, bar));
+            }
+        }
+    }
+    selected.sort_by_key(|(key, _bar)| *key);
+    let bars: Vec<_> = selected.into_iter().map(|(_key, bar)| bar).collect();
+    let admitted = admit_benchmark_batch(registry, request, bars, coverage)
+        .map_err(benchmark_admission_error)?;
+    let evidence = BatchEvidence {
+        provider: ProviderId::Tdx,
+        source: format!("magic-tdx-index-bars@{TDX_DEPENDENCY_REVISION}"),
+        source_at: None,
+        observed_at: observed_at.to_owned(),
+        batch_id,
+    };
+    Ok(PreparedBenchmarkBatch {
+        batch: GatewayBatch::Available {
+            records: admitted.into_bars(),
+            evidence,
+        },
+        request_hash,
+    })
+}
+
+fn fetch_raw_benchmark_pages(
+    source: &impl IndexBarsSource,
+    request: &BenchmarkRequest,
+    category: u8,
+) -> Result<Vec<(u32, Vec<RawIndexBar>)>, GatewayError> {
     let requested_start = range_start_key(&request.range)?;
-    let mut pages = Vec::<(u32, Vec<RawIndexBar>)>::new();
+    let mut pages = Vec::new();
     let mut offset = 0u32;
     let mut previous_oldest = None;
 
@@ -1831,7 +1925,7 @@ fn fetch_and_admit_benchmark_batch(
         let short = rows.len() < usize::from(TDX_PAGE_SIZE);
         pages.push((offset, rows));
         if covered {
-            break;
+            return Ok(pages);
         }
         if short {
             return Err(benchmark_gateway_error(
@@ -1852,38 +1946,198 @@ fn fetch_and_admit_benchmark_batch(
                 )
             })?;
     }
+}
 
-    let request_hash = canonical_base_request_hash(&request);
-    let canonical_bytes = canonical_acquisition_bytes(&request, category, &pages)?;
-    let batch_id = domain_hash(b"BR251_TDX_INDEX_BATCH_V1\0", &canonical_bytes);
+fn probe_raw_benchmark_from_source(
+    source: &impl IndexBarsSource,
+    request: BenchmarkRequest,
+    registry: &BenchmarkRegistry,
+    observed_at: &str,
+) -> Result<BenchmarkProbeReport, GatewayError> {
+    validate_benchmark_request(registry, &request).map_err(benchmark_admission_error)?;
+    DateTime::<FixedOffset>::parse_from_rfc3339(observed_at).map_err(|_| {
+        benchmark_gateway_error(
+            BenchmarkAuditOutcome::Partial,
+            "benchmark_probe_observed_at_invalid",
+            false,
+            "raw benchmark diagnostic observed_at is not RFC3339",
+        )
+    })?;
+    let category = match request.range {
+        BenchmarkRange::Daily { .. } => TDX_DAILY_CATEGORY,
+        BenchmarkRange::Minute1 { .. } => TDX_MINUTE1_CATEGORY,
+    };
+    let pages = fetch_raw_benchmark_pages(source, &request, category)?;
 
-    let mut selected = Vec::new();
-    for (_, rows) in pages {
-        for raw in rows {
-            let (key, bar) = raw_to_benchmark_bar(raw, &request.range)?;
-            if range_contains_key(&request.range, key)? {
-                selected.push((key, bar));
-            }
+    let mut keyed_rows = Vec::new();
+    let mut page_traces = Vec::with_capacity(pages.len());
+    let mut raw_total_count = 0usize;
+    for (offset, rows) in &pages {
+        raw_total_count = raw_total_count.checked_add(rows.len()).ok_or_else(|| {
+            benchmark_gateway_error(
+                BenchmarkAuditOutcome::Partial,
+                "benchmark_raw_count_overflow",
+                false,
+                "TDX raw diagnostic record count overflowed",
+            )
+        })?;
+        let first = rows.first().ok_or_else(|| {
+            benchmark_gateway_error(
+                BenchmarkAuditOutcome::Partial,
+                "benchmark_page_empty_before_range",
+                true,
+                "TDX raw diagnostic page lost its first row",
+            )
+        })?;
+        let last = rows.last().ok_or_else(|| {
+            benchmark_gateway_error(
+                BenchmarkAuditOutcome::Partial,
+                "benchmark_page_empty_before_range",
+                true,
+                "TDX raw diagnostic page lost its last row",
+            )
+        })?;
+        page_traces.push(BenchmarkRawPageTrace {
+            offset: *offset,
+            requested: TDX_PAGE_SIZE,
+            received: rows.len(),
+            first_raw_label: first.datetime.clone(),
+            last_raw_label: last.datetime.clone(),
+        });
+        for row in rows {
+            validate_raw_diagnostic_values(row)?;
+            keyed_rows.push((raw_time_key(row, &request.range)?, row));
         }
     }
-    selected.sort_by_key(|(key, _bar)| *key);
-    let bars: Vec<_> = selected.into_iter().map(|(_key, bar)| bar).collect();
-    let admitted = admit_benchmark_batch(registry, request, bars, coverage)
-        .map_err(benchmark_admission_error)?;
-    let evidence = BatchEvidence {
-        provider: ProviderId::Tdx,
+    keyed_rows.sort_by_key(|(key, _row)| *key);
+    let first = keyed_rows.first().map(|(_key, row)| *row).ok_or_else(|| {
+        benchmark_gateway_error(
+            BenchmarkAuditOutcome::Partial,
+            "benchmark_batch_empty",
+            true,
+            "TDX raw diagnostic contained no rows",
+        )
+    })?;
+    let last = keyed_rows.last().map(|(_key, row)| *row).ok_or_else(|| {
+        benchmark_gateway_error(
+            BenchmarkAuditOutcome::Partial,
+            "benchmark_batch_empty",
+            true,
+            "TDX raw diagnostic contained no rows",
+        )
+    })?;
+    let mut raw_in_range_count = 0usize;
+    for (key, _row) in &keyed_rows {
+        if range_contains_key(&request.range, *key)? {
+            raw_in_range_count += 1;
+        }
+    }
+    if raw_in_range_count == 0 {
+        return Err(benchmark_gateway_error(
+            BenchmarkAuditOutcome::Partial,
+            "benchmark_raw_range_empty",
+            true,
+            "TDX raw diagnostic has no record inside the requested range",
+        ));
+    }
+    let minute_raw_time_samples = if matches!(request.range, BenchmarkRange::Minute1 { .. }) {
+        keyed_rows
+            .iter()
+            .map(|(_key, row)| BenchmarkRawTimeSample {
+                raw_label: row.datetime.clone(),
+                year: row.year,
+                month: row.month,
+                day: row.day,
+                hour: row.hour,
+                minute: row.minute,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let granularity = match request.range {
+        BenchmarkRange::Daily { .. } => BenchmarkGranularity::Daily,
+        BenchmarkRange::Minute1 { .. } => BenchmarkGranularity::Minute1,
+    };
+    let raw_ohlc_bytes = canonical_raw_ohlc_bytes(&request, &pages)?;
+
+    Ok(BenchmarkProbeReport {
+        request_hash: canonical_base_request_hash(&request),
+        identity_anchor: BenchmarkRawIdentityAnchor {
+            canonical_instrument: request.instrument,
+            provider_market: TDX_MARKET,
+            provider_code: TDX_CODE,
+            provider_category: category,
+            adjustment_mode: TDX_FQ_NONE,
+            provider_identity_echo: None,
+            identity_verification: BenchmarkRawIdentityVerification::Unverified,
+        },
+        granularity,
+        provider: "Tdx".to_owned(),
         source: format!("magic-tdx-index-bars@{TDX_DEPENDENCY_REVISION}"),
         source_at: None,
         observed_at: observed_at.to_owned(),
-        batch_id,
-    };
-    Ok(PreparedBenchmarkBatch {
-        batch: GatewayBatch::Available {
-            records: admitted.into_bars(),
-            evidence,
+        provider_reported_total: None,
+        pages: page_traces,
+        raw_total_count,
+        raw_in_range_count,
+        first_raw_label: first.datetime.clone(),
+        last_raw_label: last.datetime.clone(),
+        raw_ohlc_digest: domain_hash(b"BR251_TDX_RAW_OHLC_V1\0", &raw_ohlc_bytes),
+        minute_label_semantics: if matches!(granularity, BenchmarkGranularity::Minute1) {
+            BenchmarkRawMinuteLabelSemantics::Unverified
+        } else {
+            BenchmarkRawMinuteLabelSemantics::NotApplicable
         },
-        request_hash,
+        minute_raw_time_samples,
+        protocol_revision: TDX_DEPENDENCY_REVISION,
     })
+}
+
+fn validate_raw_diagnostic_values(row: &RawIndexBar) -> Result<(), GatewayError> {
+    let prices = [row.open, row.high, row.low, row.close];
+    if prices
+        .iter()
+        .any(|price| !price.is_finite() || *price <= 0.0)
+    {
+        return Err(benchmark_admission_error(failed_integrity(
+            "benchmark_ohlc_not_positive_finite",
+        )));
+    }
+    if row.low > row.open || row.low > row.close || row.open > row.high || row.close > row.high {
+        return Err(benchmark_admission_error(failed_integrity(
+            "benchmark_ohlc_inconsistent",
+        )));
+    }
+    for value in [row.volume, row.amount].into_iter().flatten() {
+        if !value.is_finite() || value < 0.0 {
+            return Err(benchmark_admission_error(failed_integrity(
+                "benchmark_turnover_not_finite_nonnegative",
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn canonical_raw_ohlc_bytes(
+    request: &BenchmarkRequest,
+    pages: &[(u32, Vec<RawIndexBar>)],
+) -> Result<Vec<u8>, GatewayError> {
+    let mut canonical = Vec::new();
+    let request_hash = canonical_base_request_hash(request);
+    append_length_prefixed(&mut canonical, request_hash.as_bytes())?;
+    append_collection_len(&mut canonical, pages.len())?;
+    for (offset, rows) in pages {
+        canonical.extend_from_slice(&offset.to_be_bytes());
+        append_collection_len(&mut canonical, rows.len())?;
+        for row in rows {
+            append_length_prefixed(&mut canonical, row.datetime.as_bytes())?;
+            for value in [row.open, row.high, row.low, row.close] {
+                canonical.extend_from_slice(&value.to_bits().to_be_bytes());
+            }
+        }
+    }
+    Ok(canonical)
 }
 
 fn raw_time_key(row: &RawIndexBar, range: &BenchmarkRange) -> Result<i64, GatewayError> {
@@ -2177,12 +2431,12 @@ mod tests {
 
     use super::{
         acquire_benchmark_batch_from_source, admit_benchmark_batch,
-        admit_benchmark_grpc_wire_for_test, benchmark_probe_report, canonical_base_request_hash,
-        map_gateway_error, BenchmarkAdmissionCoverage, BenchmarkBar, BenchmarkBarTime,
-        BenchmarkError, BenchmarkEvidenceWire, BenchmarkGrpcResponseWire,
+        admit_benchmark_grpc_wire_for_test, canonical_base_request_hash, map_gateway_error,
+        probe_raw_benchmark_from_source, BenchmarkAdmissionCoverage, BenchmarkBar,
+        BenchmarkBarTime, BenchmarkError, BenchmarkEvidenceWire, BenchmarkGrpcResponseWire,
         BenchmarkProviderAttestation, BenchmarkRange, BenchmarkRegistry, BenchmarkRequest,
         BenchmarkUnsupported, BenchmarkWireTime, IndexBarsSource, IndexPageRequest, RawIndexBar,
-        HS300_CANONICAL, TDX_DEPENDENCY_REVISION,
+        HS300_CANONICAL,
     };
     use crate::data_gateway::review::AuditedBenchmarkBatch;
     use crate::data_gateway::{BatchEvidence, GatewayBatch, GatewayError};
@@ -2197,6 +2451,12 @@ mod tests {
         reason_code: String,
         #[diesel(sql_type = Integer)]
         retryable: i32,
+    }
+
+    #[derive(Debug, QueryableByName)]
+    struct BenchmarkAuditCountRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        count: i64,
     }
 
     fn date(day: u32) -> NaiveDate {
@@ -2238,41 +2498,182 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_probe_projection_keeps_identity_boundaries_and_minute_labels_unverified() {
-        let request = minute_request(
-            minute("2026-08-21T09:31:00+08:00"),
-            minute("2026-08-21T09:32:00+08:00"),
+    #[serial]
+    fn raw_diagnostic_accesses_source_without_minting_admitted_evidence() {
+        let _env = super::super::grpc_source::test_grpc_env_guard();
+        DatabaseManager::init(None).expect("TEST_CODE audit database init");
+        let admitted_day = date(21);
+        let oldest = NaiveDate::from_ymd_opt(2024, 1, 1).expect("TEST_CODE oldest raw date");
+        let newest_page = daily_rows(
+            oldest.succ_opt().expect("TEST_CODE first newest-page date"),
+            800,
         );
-        let batch = GatewayBatch::Available {
-            records: vec![
-                bar(BenchmarkBarTime::MinuteEnd(minute(
-                    "2026-08-21T09:31:00+08:00",
-                ))),
-                bar(BenchmarkBarTime::MinuteEnd(minute(
-                    "2026-08-21T09:32:00+08:00",
-                ))),
-            ],
-            evidence: BatchEvidence {
-                provider: crate::magic_compat::ProviderId::Tdx,
-                source: "TEST_CODE_magic-tdx-index-bars".to_owned(),
-                source_at: None,
-                observed_at: "2026-08-21T15:01:00+08:00".to_owned(),
-                batch_id: "TEST_CODE_probe_batch".to_owned(),
-            },
-        };
-
+        let newest_raw_label = newest_page
+            .last()
+            .expect("TEST_CODE full newest page")
+            .datetime
+            .clone();
+        let source = TestIndexBarsSource::new(vec![Ok(newest_page), Ok(vec![raw_daily(oldest)])]);
+        let request = daily_request(oldest, admitted_day, "TEST_CODE_000300");
         let request_hash = canonical_base_request_hash(&request);
-        let report = benchmark_probe_report(&request, &request_hash, &batch)
-            .expect("TEST_CODE project diagnostic report");
-        assert_eq!(report.instrument, "TEST_CODE_000300");
-        assert_eq!(report.request_hash, request_hash);
-        assert_eq!(report.provider, "Tdx");
-        assert_eq!(report.accepted_records, 2);
-        assert_eq!(report.provider_page_size, 800);
-        assert_eq!(report.first_label, "2026-08-21T09:31:00+08:00");
-        assert_eq!(report.last_label, "2026-08-21T09:32:00+08:00");
-        assert_eq!(report.minute_label_semantics, "unverified");
-        assert_eq!(report.protocol_revision, TDX_DEPENDENCY_REVISION);
+        let audit_count = || {
+            let mut connection = DatabaseManager::get()
+                .get_conn()
+                .expect("TEST_CODE audit connection");
+            diesel::sql_query(
+                "SELECT COUNT(*) AS count FROM data_acquisition_audit \
+                 WHERE capability = ? AND request_hash = ?",
+            )
+            .bind::<Text, _>("BenchmarkBars")
+            .bind::<Text, _>(&request_hash)
+            .get_result::<BenchmarkAuditCountRow>(&mut *connection)
+            .expect("TEST_CODE raw diagnostic audit count")
+            .count
+        };
+        let audit_count_before = audit_count();
+
+        let report = probe_raw_benchmark_from_source(
+            &source,
+            request.clone(),
+            &test_registry(),
+            "2099-01-02T10:00:00+08:00",
+        )
+        .expect("TEST_CODE raw diagnostic must reach the provider seam");
+
+        assert_eq!(source.offsets(), vec![0, 800]);
+        assert_eq!(
+            report.identity_anchor.canonical_instrument,
+            request.instrument
+        );
+        assert_eq!(report.identity_anchor.provider_market, 1);
+        assert_eq!(report.identity_anchor.provider_code, "000300");
+        assert_eq!(
+            report.identity_anchor.identity_verification,
+            super::BenchmarkRawIdentityVerification::Unverified
+        );
+        assert_eq!(report.pages.len(), 2);
+        assert_eq!(report.pages[0].offset, 0);
+        assert_eq!(report.pages[0].requested, 800);
+        assert_eq!(report.pages[0].received, 800);
+        assert_eq!(report.pages[1].offset, 800);
+        assert_eq!(report.pages[1].requested, 800);
+        assert_eq!(report.pages[1].received, 1);
+        assert_eq!(report.raw_total_count, 801);
+        assert_eq!(report.raw_in_range_count, 801);
+        assert_eq!(report.first_raw_label, "2024-01-01");
+        assert_eq!(report.last_raw_label, newest_raw_label);
+        assert_eq!(report.raw_ohlc_digest.len(), 64);
+        assert_eq!(
+            report.minute_label_semantics,
+            super::BenchmarkRawMinuteLabelSemantics::NotApplicable
+        );
+        assert!(report.minute_raw_time_samples.is_empty());
+        assert_eq!(audit_count(), audit_count_before);
+
+        let admitted_source = TestIndexBarsSource::new(vec![]);
+        let error = acquire_benchmark_batch_from_source(
+            &admitted_source,
+            daily_request(admitted_day, admitted_day, HS300_CANONICAL),
+            &BenchmarkRegistry::production_default(),
+            BenchmarkProviderAttestation::production_default(),
+            BenchmarkAdmissionCoverage::Daily {
+                authoritative_trading_days: &[admitted_day],
+            },
+            "2099-01-02T10:00:00+08:00",
+        )
+        .expect_err("production admitted acquisition must remain unattested");
+        assert_eq!(error.reason_code(), "benchmark_identity_unverified");
+        assert!(admitted_source.offsets().is_empty());
+    }
+
+    #[test]
+    fn raw_minute_diagnostic_preserves_labels_without_claiming_verified_semantics() {
+        let at = minute("2026-08-21T09:31:00+08:00");
+        let raw = RawIndexBar {
+            year: 2026,
+            month: 8,
+            day: 21,
+            hour: 9,
+            minute: 31,
+            datetime: "2026-08-21 09:31".to_owned(),
+            open: 3_500.0,
+            high: 3_510.0,
+            low: 3_490.0,
+            close: 3_505.0,
+            volume: Some(123.0),
+            amount: None,
+            up_count: 1_501,
+            down_count: 1_199,
+        };
+        let source = TestIndexBarsSource::new(vec![Ok(vec![raw])]);
+
+        let report = probe_raw_benchmark_from_source(
+            &source,
+            minute_request(at, at),
+            &test_registry(),
+            "2099-01-02T10:00:00+08:00",
+        )
+        .expect("TEST_CODE raw minute diagnostic");
+
+        assert_eq!(
+            report.minute_label_semantics,
+            super::BenchmarkRawMinuteLabelSemantics::Unverified
+        );
+        assert_eq!(
+            report.identity_anchor.identity_verification,
+            super::BenchmarkRawIdentityVerification::Unverified
+        );
+        assert_eq!(report.minute_raw_time_samples.len(), 1);
+        assert_eq!(
+            report.minute_raw_time_samples[0],
+            super::BenchmarkRawTimeSample {
+                raw_label: "2026-08-21 09:31".to_owned(),
+                year: 2026,
+                month: 8,
+                day: 21,
+                hour: 9,
+                minute: 31,
+            }
+        );
+    }
+
+    #[test]
+    fn raw_diagnostic_rejects_conflicting_labels_and_invalid_ohlc_explicitly() {
+        let day = date(21);
+        let invalid_observed_source = TestIndexBarsSource::new(vec![]);
+        let error = probe_raw_benchmark_from_source(
+            &invalid_observed_source,
+            daily_request(day, day, "TEST_CODE_000300"),
+            &test_registry(),
+            "TEST_CODE_not_rfc3339",
+        )
+        .expect_err("TEST_CODE missing observation identity must fail before source access");
+        assert_eq!(error.reason_code(), "benchmark_probe_observed_at_invalid");
+        assert!(invalid_observed_source.offsets().is_empty());
+
+        let mut conflicting = raw_daily(day);
+        conflicting.datetime = "2026-08-20".to_owned();
+        let conflicting_source = TestIndexBarsSource::new(vec![Ok(vec![conflicting])]);
+        let error = probe_raw_benchmark_from_source(
+            &conflicting_source,
+            daily_request(day, day, "TEST_CODE_000300"),
+            &test_registry(),
+            "2099-01-02T10:00:00+08:00",
+        )
+        .expect_err("TEST_CODE conflicting raw label must fail");
+        assert_eq!(error.reason_code(), "benchmark_datetime_conflict");
+
+        let mut invalid_ohlc = raw_daily(day);
+        invalid_ohlc.high = invalid_ohlc.open - 1.0;
+        let invalid_source = TestIndexBarsSource::new(vec![Ok(vec![invalid_ohlc])]);
+        let error = probe_raw_benchmark_from_source(
+            &invalid_source,
+            daily_request(day, day, "TEST_CODE_000300"),
+            &test_registry(),
+            "2099-01-02T10:00:00+08:00",
+        )
+        .expect_err("TEST_CODE inconsistent raw OHLC must fail");
+        assert_eq!(error.reason_code(), "benchmark_ohlc_inconsistent");
     }
 
     #[test]

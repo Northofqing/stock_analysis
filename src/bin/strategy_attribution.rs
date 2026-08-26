@@ -53,7 +53,7 @@ enum Command {
         #[arg(long, value_enum, default_value_t)]
         format: OutputFormat,
     },
-    /// 只读调用真实指数 adapter；不签发 Reader 能力，不写审计或数据库。
+    /// 只读调用真实指数 raw adapter；不进入正式准入，不写审计或数据库。
     Probe {
         #[command(flatten)]
         request: BenchmarkRequestArgs,
@@ -365,41 +365,108 @@ fn render_probe(report: &BenchmarkProbeReport, format: OutputFormat) -> String {
     match format {
         OutputFormat::Json => json!({
             "状态": "成功",
-            "模式": "只读真实适配器探针",
+            "模式": "只读原始协议诊断探针",
             "请求哈希": report.request_hash,
-            "基准": report.instrument,
+            "身份锚点": {
+                "规范基准": report.identity_anchor.canonical_instrument,
+                "provider_market": report.identity_anchor.provider_market,
+                "provider_code": report.identity_anchor.provider_code,
+                "provider_category": report.identity_anchor.provider_category,
+                "adjustment_mode": report.identity_anchor.adjustment_mode,
+                "provider身份回显": report.identity_anchor.provider_identity_echo,
+                "身份核验状态": report.identity_anchor.identity_verification
+            },
             "粒度": format!("{:?}", report.granularity),
             "来源提供方": report.provider,
             "来源": report.source,
             "来源时刻": report.source_at,
             "观察时刻": report.observed_at,
-            "批次ID": report.batch_id,
-            "接纳记录数": report.accepted_records,
-            "提供方页大小": report.provider_page_size,
-            "首标签": report.first_label,
-            "末标签": report.last_label,
+            "provider报告总数": report.provider_reported_total,
+            "分页轨迹": report.pages,
+            "原始记录总数": report.raw_total_count,
+            "请求范围内原始记录数": report.raw_in_range_count,
+            "首原始标签": report.first_raw_label,
+            "末原始标签": report.last_raw_label,
+            "原始OHLC摘要": report.raw_ohlc_digest,
             "分钟标签语义": report.minute_label_semantics,
+            "分钟原始时间样本": report.minute_raw_time_samples,
             "协议版本": report.protocol_revision,
+            "正式准入批次已构造": false,
             "Reader能力已签发": false,
+            "BR-159审计已写入": false,
+            "attestation已更新": false,
             "数据库已写入": false
         })
         .to_string(),
-        OutputFormat::Markdown => format!(
-            "# 基准只读探针\n\n- 状态：成功\n- 基准：{}\n- 粒度：{:?}\n- 请求哈希：{}\n- 来源：{} / {}\n- 来源时刻：{}\n- 观察时刻：{}\n- 批次 ID：{}\n- 接纳记录数：{}\n- 首末标签：{} / {}\n- 分钟标签语义：{}\n- 协议版本：{}\n- Reader 能力已签发：否\n- 数据库已写入：否",
-            report.instrument,
+        OutputFormat::Markdown => {
+            let pages = report
+                .pages
+                .iter()
+                .map(|page| {
+                    format!(
+                        "  - offset={} requested={} received={} raw_labels={} / {}",
+                        page.offset,
+                        page.requested,
+                        page.received,
+                        page.first_raw_label,
+                        page.last_raw_label
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let minute_samples = if report.minute_raw_time_samples.is_empty() {
+                "不适用".to_owned()
+            } else {
+                report
+                    .minute_raw_time_samples
+                    .iter()
+                    .map(|sample| {
+                        format!(
+                            "{} [{:04}-{:02}-{:02} {:02}:{:02}]",
+                            sample.raw_label,
+                            sample.year,
+                            sample.month,
+                            sample.day,
+                            sample.hour,
+                            sample.minute
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("、")
+            };
+            format!(
+            "# 基准原始协议只读诊断\n\n- 状态：成功\n- 规范基准：{}\n- Provider 参数：market={} code={} category={} adjustment={}\n- Provider 身份回显：{}\n- 身份核验状态：{}\n- 粒度：{:?}\n- 请求哈希：{}\n- 来源：{} / {}\n- 来源时刻：{}\n- 观察时刻：{}\n- Provider 报告总数：{}\n- 原始记录总数：{}（请求范围内 {}）\n- 首末原始标签：{} / {}\n- 原始 OHLC 摘要：{}\n- 分钟标签语义：{}\n- 分钟原始时间样本：{}\n- 协议版本：{}\n\n## 分页轨迹\n\n{}\n\n- 正式准入批次已构造：否\n- Reader 能力已签发：否\n- BR-159 审计已写入：否\n- attestation 已更新：否\n- 数据库已写入：否",
+            report.identity_anchor.canonical_instrument,
+            report.identity_anchor.provider_market,
+            report.identity_anchor.provider_code,
+            report.identity_anchor.provider_category,
+            report.identity_anchor.adjustment_mode,
+            report
+                .identity_anchor
+                .provider_identity_echo
+                .as_deref()
+                .unwrap_or("缺失"),
+            report.identity_anchor.identity_verification.as_str(),
             report.granularity,
             report.request_hash,
             report.provider,
             report.source,
             report.source_at.as_deref().unwrap_or("缺失"),
             report.observed_at,
-            report.batch_id,
-            report.accepted_records,
-            report.first_label,
-            report.last_label,
-            report.minute_label_semantics,
-            report.protocol_revision
-        ),
+            report
+                .provider_reported_total
+                .map_or_else(|| "缺失".to_owned(), |total| total.to_string()),
+            report.raw_total_count,
+            report.raw_in_range_count,
+            report.first_raw_label,
+            report.last_raw_label,
+            report.raw_ohlc_digest,
+            report.minute_label_semantics.as_str(),
+            minute_samples,
+            report.protocol_revision,
+            pages
+        )
+        }
     }
 }
 
@@ -1212,6 +1279,75 @@ mod tests {
         assert_eq!(error.stage, "output");
         assert_eq!(error.code, "report_test_serialization_failed");
         assert!(!error.retryable);
+    }
+
+    #[test]
+    fn raw_probe_render_exposes_protocol_evidence_without_claiming_admission() {
+        use stock_analysis::data_gateway::{
+            BenchmarkGranularity, BenchmarkRawIdentityAnchor, BenchmarkRawIdentityVerification,
+            BenchmarkRawMinuteLabelSemantics, BenchmarkRawPageTrace, BenchmarkRawTimeSample,
+        };
+
+        let report = BenchmarkProbeReport {
+            request_hash: "1".repeat(64),
+            identity_anchor: BenchmarkRawIdentityAnchor {
+                canonical_instrument: "TEST_CODE_000300".to_owned(),
+                provider_market: 1,
+                provider_code: "000300",
+                provider_category: 8,
+                adjustment_mode: 0,
+                provider_identity_echo: None,
+                identity_verification: BenchmarkRawIdentityVerification::Unverified,
+            },
+            granularity: BenchmarkGranularity::Minute1,
+            provider: "Tdx".to_owned(),
+            source: "TEST_CODE_magic-tdx-index-bars".to_owned(),
+            source_at: None,
+            observed_at: "2026-08-21T15:01:00+08:00".to_owned(),
+            provider_reported_total: None,
+            pages: vec![BenchmarkRawPageTrace {
+                offset: 0,
+                requested: 800,
+                received: 1,
+                first_raw_label: "2026-08-21 09:31".to_owned(),
+                last_raw_label: "2026-08-21 09:31".to_owned(),
+            }],
+            raw_total_count: 1,
+            raw_in_range_count: 1,
+            first_raw_label: "2026-08-21 09:31".to_owned(),
+            last_raw_label: "2026-08-21 09:31".to_owned(),
+            raw_ohlc_digest: "2".repeat(64),
+            minute_label_semantics: BenchmarkRawMinuteLabelSemantics::Unverified,
+            minute_raw_time_samples: vec![BenchmarkRawTimeSample {
+                raw_label: "2026-08-21 09:31".to_owned(),
+                year: 2026,
+                month: 8,
+                day: 21,
+                hour: 9,
+                minute: 31,
+            }],
+            protocol_revision: "TEST_CODE_revision",
+        };
+
+        let value: Value = serde_json::from_str(&render_probe(&report, OutputFormat::Json))
+            .expect("TEST_CODE raw probe JSON");
+        assert_eq!(value["身份锚点"]["规范基准"], "TEST_CODE_000300");
+        assert_eq!(value["身份锚点"]["身份核验状态"], "unverified");
+        assert_eq!(value["分页轨迹"][0]["offset"], 0);
+        assert_eq!(value["分页轨迹"][0]["requested"], 800);
+        assert_eq!(value["分页轨迹"][0]["received"], 1);
+        assert_eq!(value["原始记录总数"], 1);
+        assert_eq!(value["请求范围内原始记录数"], 1);
+        assert_eq!(value["原始OHLC摘要"], "2".repeat(64));
+        assert_eq!(value["分钟标签语义"], "unverified");
+        assert_eq!(
+            value["分钟原始时间样本"][0]["raw_label"],
+            "2026-08-21 09:31"
+        );
+        assert_eq!(value["正式准入批次已构造"], false);
+        assert_eq!(value["BR-159审计已写入"], false);
+        assert_eq!(value["attestation已更新"], false);
+        assert_eq!(value["数据库已写入"], false);
     }
 
     #[test]
