@@ -18,31 +18,31 @@
 `CLAUDE.md`、`docs/superpowers/specs/2026-08-02-gate-d-coverage-closure-design.md`、
 `docs/business_rules.md`、`config/design_contracts.toml`
 
-- [ ] 将 Gate C 明确定义为 PR 合并门禁，Gate D 定义为发布/部署门禁；任何数据红线仍然阻断。
-- [ ] 登记 BR-252 与 `[coverage]`：global `201279/258810`、core `157652/202935`、218 个核心
+- [x] 将 Gate C 明确定义为 PR 合并门禁，Gate D 定义为发布/部署门禁；任何数据红线仍然阻断。
+- [x] 登记 BR-252 与 `[coverage]`：global `201279/258810`、core `157652/202935`、218 个核心
   文件、Rust 1.95.0/LLVM 22.1.2/cargo-llvm-cov 0.8.7，以及 PR 90%/85%、Release 80%/95%。
-- [ ] 记录阈值证明：当前分支核心改动 `13707/14923=91.85%`、其他生产改动
+- [x] 记录阈值证明：当前分支核心改动 `13707/14923=91.85%`、其他生产改动
   `8368/9824=85.18%`；不得把统一 95% 继续作为当前 PR 的历史债代理。
-- [ ] 运行 `git diff --check` 与 `bash tools/compliance/lib/check_design_contradiction.sh`；预期 PASS。
-- [ ] 独立提交规则与计划，提交信息引用 BR-252、spec §10 与 `[coverage]`；回滚只 revert 该提交，
+- [x] 运行 `git diff --check` 与 `bash tools/compliance/lib/check_design_contradiction.sh`；结果 PASS。
+- [x] 独立提交规则与计划（`ee8c8d1`），提交信息引用 BR-252、spec §10 与 `[coverage]`；回滚只 revert 该提交，
   不删除报告、审计或真实持仓数据。
 
 ### Task 41：测试先行实现覆盖率双策略
 
 **文件：** `tests/test_coverage_thresholds.rs`、`tools/coverage/check_thresholds.py`
 
-- [ ] 先扩展真实 CLI 进程测试，建立临时 Git checkout、JSON/LCOV 报告和 `[coverage]` 配置；
+- [x] 先扩展真实 CLI 进程测试，建立临时 Git checkout、JSON/LCOV 报告和 `[coverage]` 配置；
   验证 release/default 仍按 80%/95%，缺核心行与坏报告 exit 2。
-- [ ] 新增失败测试：核心恰好 90% 通过、低一行失败；非核心恰好 85% 通过、低一行失败；某桶无
+- [x] 新增失败测试：核心恰好 90% 通过、低一行失败；非核心恰好 85% 通过、低一行失败；某桶无
   可执行改动输出 N/A；删除-only 不伪报 100%；缺 base/LCOV/配置、路径逃逸与坏 diff exit 2。
-- [ ] 新增棘轮测试：当前比例等于/高于 `[coverage]` 通过；global 或 core 任一低于 baseline
+- [x] 新增棘轮测试：当前比例等于/高于 `[coverage]` 通过；global 或 core 任一低于 baseline
   失败；base 已有 baseline 时 candidate 比例下降失败；base 无 baseline 且未传
   `--bootstrap-baseline` 失败。
-- [ ] 实现接口：旧位置参数保持 release 兼容；新接口为
+- [x] 实现接口：旧位置参数保持 release 兼容；新接口为
   `--policy pr|release --report <json> [--lcov <lcov> --base-ref <ref> --bootstrap-baseline]`。
   JSON 负责全仓/核心统计，LCOV `DA` 负责差分可执行行，Git `--unified=0` 负责新增/修改行；
   两个 patch 桶独立按整数交叉相乘判定。退出码固定 0=通过、1=政策未达标、2=不可验证。
-- [ ] 运行 `cargo test --test test_coverage_thresholds -- --test-threads=1`；预期全部 PASS，随后
+- [x] 运行 `cargo test --test test_coverage_thresholds -- --test-threads=1`（14/14 PASS），随后
   `python3 tools/coverage/check_thresholds.py target/coverage/coverage.json` 仍应以 release 语义
   报告当前 77.77%/77.69% 并 exit 1。
 - [ ] 独立提交 coverage policy 与测试；回滚不触碰 `[coverage]` 历史证据。
