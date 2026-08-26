@@ -47,6 +47,49 @@ fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LIB_DIR="$REPO_ROOT/tools/compliance/lib"
 
+release_preflight() {
+    if [ "${STOCK_DB+x}" != "x" ] || [ -z "$STOCK_DB" ]; then
+        echo "[compliance] ERROR: STOCK_DB must explicitly identify the production database" >&2
+        exit 2
+    fi
+    case "$STOCK_DB" in
+        /*) ;;
+        *)
+            echo "[compliance] ERROR: release STOCK_DB must be an absolute path" >&2
+            exit 2
+            ;;
+    esac
+    if [ "${FRESHNESS_TODAY+x}" = "x" ] || [ "${TRADING_CALENDAR+x}" = "x" ]; then
+        echo "[compliance] ERROR: release rejects FRESHNESS_TODAY/TRADING_CALENDAR overrides" >&2
+        exit 2
+    fi
+    if [ ! -f "$STOCK_DB" ]; then
+        echo "[compliance] ERROR: release STOCK_DB does not exist: $STOCK_DB" >&2
+        exit 2
+    fi
+    if [ "$STOCK_DB" != "$REPO_ROOT/data/stock_analysis.db" ]; then
+        echo "[compliance] ERROR: release STOCK_DB is not the fixed production database" >&2
+        exit 2
+    fi
+    command -v python3 >/dev/null 2>&1 || {
+        echo "[compliance] ERROR: python3 is required to verify STOCK_DB identity" >&2
+        exit 2
+    }
+    local actual expected
+    actual="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$STOCK_DB")"
+    expected="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$REPO_ROOT/data/stock_analysis.db")"
+    if [ "$actual" != "$expected" ]; then
+        echo "[compliance] ERROR: release STOCK_DB is not the fixed production database" >&2
+        exit 2
+    fi
+    STOCK_DB="$actual"
+    export STOCK_DB
+}
+
+if [ "$POLICY" = "release" ]; then
+    release_preflight
+fi
+
 OVERALL_EXIT=0
 
 run_check() {

@@ -2895,3 +2895,35 @@ PR 除 AGENTS §3.1 字段外必须增加：
 
 本修订登记为 BR-252；BR-250 的路径归一化合同继续有效。BR-202 保留为历史候选记录，但其
 未实现的固定 PR 阈值与重型权威平台不再是本轮实施依据。
+
+### 10.12 独立审查后的证据闭合（2026-08-27）
+
+独立审查发现原实现仍可能把不可验证输入签成 PASS，因此本节补充并覆盖 §10.4–§10.11 中
+较宽松的表述：
+
+1. **源码完整性。** JSON 与 LCOV 的生产源码集合必须完全一致。每个相对 base 新增、修改或
+   rename 后仍存在的 `src/**/*.rs` 必须出现在该集合；唯一例外是
+   `config/design_contracts.toml [coverage.reviewed_no_region]` 中已审计且当前文件 SHA-256
+   精确匹配的路径。首次 bootstrap 可登记现存集合；后续 candidate 不得新增豁免路径。
+   缺文件、路径逃逸、rename 丢失、坏 diff 或 hash 漂移均 exit 2，不能输出 N/A。
+2. **报告来源。** `[coverage].source_sha` 必须是 HEAD 祖先，且该提交至 HEAD 的 `src/`、
+   `Cargo.toml`、`Cargo.lock`、`build.rs` 不得变化；报告必须带匹配的 llvm coverage schema、
+   cargo-llvm-cov 版本及当前仓库 `Cargo.toml` 路径。工具身份、JSON/LCOV 集合和 core 文件数
+   必须与合同一致。Release 只有完整 provenance 可验证时才可能 PASS；未达固定阈值可直接
+   exit 1，但不得用缺 provenance 的高覆盖报告签发 PASS。
+3. **Bootstrap。** 初始合同除 CLI `--bootstrap-baseline` 外，必须同时登记
+   `bootstrap_approved = true` 与 `bootstrap_rule = "BR-252"`；90%/85% 和 80%/95% 是硬下限，
+   任一更低均 exit 2。baseline covered/count 必须不高于同源码新鲜报告。CI 可自动识别“base
+   尚无合同”，但不能替代仓库内的显式批准记录。
+4. **Release 数据库。** `check.sh --policy release` 必须在运行任何检查前要求显式绝对
+   `STOCK_DB`，解析后的真实路径必须等于当前部署 checkout 固定的
+   `data/stock_analysis.db`；缺失、别名、测试库或其他路径均 exit 2。Release 同时拒绝
+   `FRESHNESS_TODAY` 与 `TRADING_CALENDAR` 覆盖，防止 fixture 或回拨时钟签发生产 freshness。
+   直接执行 `check_data_freshness.sh` 的覆盖变量只用于隔离测试，不能穿过 release seam。
+5. **PR 证据。** `check_pr_evidence.sh` 除 AGENTS §3.1 字段外，必须校验 §10.11 的精确
+   Gate-Policy、Bootstrap-Baseline、baseline source/count/tool identity、`Gate-C: PASS` 与独立
+   `Gate-D: PASS|Release Blocked`。Hosted CI checkout 必须 `fetch-depth: 0`，否则提交范围证据
+   不可验证。
+
+以上任一输入不可验证都回到 Gate B；Release DB 身份或生产 freshness 不具备时保持
+`Release Blocked`，不得以关闭门禁解决。

@@ -45,7 +45,7 @@
 - [x] 运行 `cargo test --test test_coverage_thresholds -- --test-threads=1`（14/14 PASS），随后
   `python3 tools/coverage/check_thresholds.py target/coverage/coverage.json` 仍应以 release 语义
   报告当前 77.77%/77.69% 并 exit 1。
-- [ ] 独立提交 coverage policy 与测试；回滚不触碰 `[coverage]` 历史证据。
+- [x] 独立提交 coverage policy 与测试（`577366b`）；回滚不触碰 `[coverage]` 历史证据。
 
 ### Task 42：测试先行实现合规双策略
 
@@ -58,7 +58,7 @@
   跳过 `check_data_freshness.sh`，其他检查列表完全一致。
 - [x] 运行 `cargo test --test test_data_freshness_check -- --test-threads=1`（7/7 PASS）与
   `bash tools/compliance/check.sh --policy pr`；预期 PASS。不得运行回填或把 PR skip 写成 freshness PASS。
-- [ ] 独立提交 compliance policy 与测试。
+- [x] 独立提交 compliance policy 与测试（`929324f`）。
 
 ### Task 43：让 CI 只签发其拥有的 Gate C 证据
 
@@ -72,10 +72,15 @@
   `--bootstrap-baseline`。CI 不读取生产库、不自动回填、不输出 Gate D PASS。
 - [x] 运行两个测试 binary（15/15、8/8 PASS）与 YAML 解析；`git diff --check` 和完整 PR compliance
   纳入 Task 44 最终验证。
-- [ ] 独立提交 workflow 与静态测试。
+- [x] 独立提交 workflow 与静态测试（`671e441`）。
 
 ### Task 44：完成 Gate C 验证、PR 证据与合并
 
+- [x] 闭合独立审查发现的证据旁路：改动源码遗漏/rename/路径逃逸/坏 diff/未知 schema 必须
+  exit 2；bootstrap 固定阈值下限、BR-252 批准和 source SHA；release 高覆盖 PASS 必须具备
+  完整工具、源码和 LCOV provenance。
+- [x] Release compliance 必须显式绑定固定生产 `STOCK_DB` 并拒绝测试日期/日历覆盖；PR 证据
+  强制 baseline 与 Gate C/Gate D 分列；compliance workflow 使用 `fetch-depth: 0`。
 - [ ] 运行 `cargo fmt --all -- --check`。
 - [ ] 运行 `cargo clippy --workspace --all-targets --all-features -- -D warnings`。
 - [ ] 运行 `cargo test --workspace --all-targets --all-features -- --test-threads=1`。

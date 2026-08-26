@@ -7,13 +7,14 @@ The default remains the fixed Gate D release policy for backward compatibility.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import pathlib
 import re
 import subprocess
 import sys
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 
@@ -56,6 +57,8 @@ class CoverageTotals:
 class CoverageContract:
     schema: int
     source_sha: str
+    bootstrap_approved: bool
+    bootstrap_rule: str
     global_covered: int
     global_count: int
     core_covered: int
@@ -69,6 +72,7 @@ class CoverageContract:
     rustc_commit: str
     llvm_version: str
     cargo_llvm_cov_version: str
+    reviewed_no_region: tuple[tuple[str, str], ...]
 
 
 def percentage(covered: int, count: int) -> float:
@@ -195,6 +199,30 @@ def print_totals(totals: CoverageTotals, global_min: float, core_min: float) -> 
     )
 
 
+def verify_report_provenance(
+    report: pathlib.Path,
+    repository: pathlib.Path,
+    contract: CoverageContract,
+) -> None:
+    try:
+        payload = json.loads(report.read_text(encoding="utf-8"))
+        report_type = payload["type"]
+        report_version = payload["version"]
+        cargo_metadata = payload["cargo_llvm_cov"]
+        cargo_version = cargo_metadata["version"]
+        manifest = pathlib.Path(cargo_metadata["manifest_path"]).resolve()
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise InputError(f"coverage report provenance is missing or invalid: {exc}") from exc
+    if report_type != "llvm.coverage.json.export" or report_version != "3.1.0":
+        raise InputError(
+            "coverage report provenance has unsupported llvm coverage schema"
+        )
+    if cargo_version != contract.cargo_llvm_cov_version:
+        raise InputError("coverage report provenance cargo-llvm-cov version mismatch")
+    if manifest != (repository / "Cargo.toml").resolve():
+        raise InputError("coverage report provenance manifest path mismatch")
+
+
 def run_git(repository: pathlib.Path, args: list[str], *, allow_failure: bool = False) -> bytes:
     try:
         result = subprocess.run(
@@ -210,6 +238,23 @@ def run_git(repository: pathlib.Path, args: list[str], *, allow_failure: bool = 
         diagnostic = result.stderr.decode("utf-8", errors="replace").strip()
         raise InputError(f"git {' '.join(args)} failed: {diagnostic}")
     return result.stdout if result.returncode == 0 else b""
+
+
+def git_succeeds(repository: pathlib.Path, args: list[str]) -> bool:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=repository,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        raise InputError(f"cannot execute git: {exc}") from exc
+    if result.returncode not in (0, 1):
+        diagnostic = result.stderr.decode("utf-8", errors="replace").strip()
+        raise InputError(f"git {' '.join(args)} failed: {diagnostic}")
+    return result.returncode == 0
 
 
 def discover_repository() -> pathlib.Path:
@@ -243,9 +288,17 @@ def parse_contract(document: bytes, source: str) -> CoverageContract | None:
             raise InputError(f"{source} coverage.{name} must be a non-empty string")
         return value
 
+    def boolean(name: str) -> bool:
+        value = raw.get(name)
+        if not isinstance(value, bool):
+            raise InputError(f"{source} coverage.{name} must be a boolean")
+        return value
+
     contract = CoverageContract(
         schema=integer("schema", positive=True),
         source_sha=string("source_sha"),
+        bootstrap_approved=boolean("bootstrap_approved"),
+        bootstrap_rule=string("bootstrap_rule"),
         global_covered=integer("global_covered"),
         global_count=integer("global_count", positive=True),
         core_covered=integer("core_covered"),
@@ -259,6 +312,7 @@ def parse_contract(document: bytes, source: str) -> CoverageContract | None:
         rustc_commit=string("rustc_commit"),
         llvm_version=string("llvm_version"),
         cargo_llvm_cov_version=string("cargo_llvm_cov_version"),
+        reviewed_no_region=(),
     )
     if contract.schema != 1:
         raise InputError(f"unknown coverage contract schema in {source}: {contract.schema}")
@@ -276,9 +330,50 @@ def parse_contract(document: bytes, source: str) -> CoverageContract | None:
     ):
         if threshold > 100:
             raise InputError(f"{source} coverage.{name} exceeds 100")
+    for name, threshold, floor in (
+        ("pr_core_patch_min", contract.pr_core_patch_min, 90),
+        ("pr_other_patch_min", contract.pr_other_patch_min, 85),
+        ("release_global_min", contract.release_global_min, 80),
+        ("release_core_min", contract.release_core_min, 95),
+    ):
+        if threshold < floor:
+            raise InputError(
+                f"{source} coverage.{name} is below hard policy floor {floor}"
+            )
     if re.fullmatch(r"[0-9a-f]{40}", contract.source_sha) is None:
         raise InputError(f"{source} coverage.source_sha is not a canonical Git SHA")
-    return contract
+    reviewed_raw = raw.get("reviewed_no_region", {})
+    if not isinstance(reviewed_raw, dict):
+        raise InputError(f"{source} coverage.reviewed_no_region must be a table")
+    reviewed: list[tuple[str, str]] = []
+    for path, digest in sorted(reviewed_raw.items()):
+        if (
+            not isinstance(path, str)
+            or not path.startswith("src/")
+            or not path.endswith(".rs")
+            or ".." in pathlib.PurePosixPath(path).parts
+        ):
+            raise InputError(f"{source} has invalid reviewed no-region path: {path!r}")
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise InputError(f"{source} has invalid reviewed no-region SHA-256 for {path}")
+        reviewed.append((path, digest))
+    return replace(contract, reviewed_no_region=tuple(reviewed))
+
+
+def verify_reviewed_no_region(
+    contract: CoverageContract, repository: pathlib.Path
+) -> frozenset[str]:
+    verified: set[str] = set()
+    for relative, expected in contract.reviewed_no_region:
+        path = repository / relative
+        try:
+            actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise InputError(f"cannot verify reviewed no-region source {relative}: {exc}") from exc
+        if actual != expected:
+            raise InputError(f"reviewed no-region SHA-256 mismatch: {relative}")
+        verified.add(relative)
+    return frozenset(verified)
 
 
 def load_candidate_contract(repository: pathlib.Path) -> CoverageContract:
@@ -342,6 +437,25 @@ def verify_tool_identity(contract: CoverageContract) -> None:
         )
 
 
+def verify_source_binding(contract: CoverageContract, repository: pathlib.Path) -> None:
+    inputs = ["src", "Cargo.toml", "Cargo.lock", "build.rs"]
+    if not git_succeeds(
+        repository, ["merge-base", "--is-ancestor", contract.source_sha, "HEAD"]
+    ):
+        raise InputError("coverage.source_sha is not an ancestor of HEAD")
+    if not git_succeeds(
+        repository,
+        ["diff", "--quiet", f"{contract.source_sha}..HEAD", "--", *inputs],
+    ):
+        raise InputError("coverage inputs changed after coverage.source_sha")
+    dirty = run_git(
+        repository,
+        ["status", "--porcelain", "--untracked-files=no", "--", *inputs],
+    )
+    if dirty:
+        raise InputError("coverage inputs have uncommitted changes after coverage.source_sha")
+
+
 def parse_lcov(path: pathlib.Path, repository: pathlib.Path) -> dict[str, dict[int, int]]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -381,14 +495,21 @@ def changed_lines(repository: pathlib.Path, base_ref: str) -> tuple[dict[str, se
     except UnicodeDecodeError as exc:
         raise InputError(f"Git diff is not UTF-8: {exc}") from exc
     changed: dict[str, set[int]] = {}
+    observed_files: set[str] = set()
     current: str | None = None
     for raw in patch.splitlines():
-        if raw.startswith("+++ "):
+        if raw.startswith("diff --git a/"):
+            match = re.match(r"^diff --git a/(.+) b/(.+)$", raw)
+            if match is None or match.group(1).startswith('"') or match.group(2).startswith('"'):
+                raise InputError(f"unsupported Git diff header: {raw}")
+            observed_files.add(match.group(2))
+        elif raw.startswith("+++ "):
             token = raw[4:]
             if token == "/dev/null":
                 current = None
             elif token.startswith("b/") and not token.startswith('b/"'):
                 current = token[2:]
+                observed_files.add(current)
                 changed.setdefault(current, set())
             else:
                 raise InputError(f"unsupported Git patch path: {token}")
@@ -423,6 +544,11 @@ def changed_lines(repository: pathlib.Path, base_ref: str) -> tuple[dict[str, se
         }
     except UnicodeDecodeError as exc:
         raise InputError(f"Git changed path is not UTF-8: {exc}") from exc
+    missing_patch_files = sorted(changed_files - observed_files)
+    if missing_patch_files:
+        raise InputError(
+            "Git diff omitted changed source paths: " + ", ".join(missing_patch_files)
+        )
     return changed, changed_files
 
 
@@ -473,6 +599,77 @@ def print_patch_bucket(name: str, covered: int, count: int, minimum: int) -> boo
     return percent_at_least(covered, count, minimum)
 
 
+def tracked_production_sources(repository: pathlib.Path) -> frozenset[str]:
+    output = run_git(repository, ["ls-files", "-z", "--", "src"])
+    try:
+        return frozenset(
+            item.decode("utf-8")
+            for item in output.split(b"\0")
+            if item and item.decode("utf-8").endswith(".rs")
+        )
+    except UnicodeDecodeError as exc:
+        raise InputError(f"Git source path is not UTF-8: {exc}") from exc
+
+
+def run_release_policy(
+    totals: CoverageTotals,
+    report_path: pathlib.Path,
+    lcov_path: pathlib.Path | None,
+    global_min: float,
+    core_min: float,
+) -> int:
+    print_totals(totals, global_min, core_min)
+    threshold_failed = (
+        percentage(totals.global_covered, totals.global_count) + 1e-9 < global_min
+        or percentage(totals.core_covered, totals.core_count) + 1e-9 < core_min
+    )
+    if threshold_failed:
+        if percentage(totals.global_covered, totals.global_count) + 1e-9 < global_min:
+            print("global coverage gate failed", file=sys.stderr)
+        if percentage(totals.core_covered, totals.core_count) + 1e-9 < core_min:
+            print("core coverage gate failed", file=sys.stderr)
+        return 1
+    if lcov_path is None:
+        raise InputError("release PASS requires --lcov and complete provenance evidence")
+
+    repository = discover_repository()
+    strict_totals = load_report(report_path, repository)
+    contract = load_candidate_contract(repository)
+    verify_source_binding(contract, repository)
+    verify_tool_identity(contract)
+    verify_report_provenance(report_path, repository, contract)
+    if strict_totals.core_file_count != contract.core_file_count:
+        raise InputError(
+            "coverage report core file count mismatch: "
+            f"{strict_totals.core_file_count} != {contract.core_file_count}"
+        )
+    records = parse_lcov(lcov_path, repository)
+    lcov_sources = frozenset(
+        path for path in records if path.startswith("src/") and path.endswith(".rs")
+    )
+    if lcov_sources != strict_totals.source_files:
+        raise InputError("JSON and LCOV production source file sets differ")
+    reviewed = verify_reviewed_no_region(contract, repository)
+    expected_sources = tracked_production_sources(repository)
+    if strict_totals.source_files | reviewed != expected_sources:
+        missing = sorted(expected_sources - strict_totals.source_files - reviewed)
+        extra = sorted((strict_totals.source_files | reviewed) - expected_sources)
+        raise InputError(
+            "release coverage source inventory mismatch: "
+            f"missing={missing!r} extra={extra!r}"
+        )
+    effective_global_min = max(global_min, float(contract.release_global_min))
+    effective_core_min = max(core_min, float(contract.release_core_min))
+    if not percent_at_least(
+        strict_totals.global_covered, strict_totals.global_count, int(effective_global_min)
+    ) or not percent_at_least(
+        strict_totals.core_covered, strict_totals.core_count, int(effective_core_min)
+    ):
+        print("release coverage gate failed against contract", file=sys.stderr)
+        return 1
+    return 0
+
+
 def run_pr_policy(
     totals: CoverageTotals,
     report_path: pathlib.Path,
@@ -480,12 +677,19 @@ def run_pr_policy(
     base_ref: str | None,
     bootstrap: bool,
 ) -> int:
-    del report_path  # Kept in the interface so JSON/LCOV evidence remains explicit at the call site.
     if lcov_path is None or not base_ref:
         raise InputError("PR policy requires --lcov and --base-ref")
     repository = discover_repository()
     contract = load_candidate_contract(repository)
+    verify_source_binding(contract, repository)
     verify_tool_identity(contract)
+    verify_report_provenance(report_path, repository, contract)
+    if totals.core_file_count != contract.core_file_count:
+        raise InputError(
+            "coverage report core file count mismatch: "
+            f"{totals.core_file_count} != {contract.core_file_count}"
+        )
+    reviewed_no_region = verify_reviewed_no_region(contract, repository)
     print_totals(
         totals,
         percentage(contract.global_covered, contract.global_count),
@@ -494,6 +698,31 @@ def run_pr_policy(
     base_contract = load_base_contract(repository, base_ref)
     if base_contract is None and not bootstrap:
         raise InputError("initial coverage contract requires --bootstrap-baseline")
+    if base_contract is None and (
+        not contract.bootstrap_approved or contract.bootstrap_rule != "BR-252"
+    ):
+        raise InputError("initial baseline requires tracked BR-252 bootstrap approval")
+    if base_contract is not None:
+        candidate_reviewed_map = dict(contract.reviewed_no_region)
+        base_reviewed_map = dict(base_contract.reviewed_no_region)
+        candidate_reviewed = set(candidate_reviewed_map)
+        base_reviewed = set(base_reviewed_map)
+        added_reviewed = sorted(candidate_reviewed - base_reviewed)
+        if added_reviewed:
+            raise InputError(
+                "non-bootstrap PR cannot add reviewed no-region paths: "
+                + ", ".join(added_reviewed)
+            )
+        changed_reviewed = sorted(
+            path
+            for path in candidate_reviewed & base_reviewed
+            if candidate_reviewed_map[path] != base_reviewed_map[path]
+        )
+        if changed_reviewed:
+            raise InputError(
+                "non-bootstrap PR cannot change reviewed no-region hashes: "
+                + ", ".join(changed_reviewed)
+            )
 
     failed = False
     if base_contract is not None and contract_regressed(contract, base_contract):
@@ -525,7 +754,15 @@ def run_pr_policy(
     )
     if lcov_sources != totals.source_files:
         raise InputError("JSON and LCOV production source file sets differ")
-    changed, _changed_files = changed_lines(repository, base_ref)
+    changed, changed_files = changed_lines(repository, base_ref)
+    missing_changed_files = sorted(
+        changed_files - totals.source_files - reviewed_no_region
+    )
+    if missing_changed_files:
+        raise InputError(
+            "changed source is absent from JSON/LCOV coverage evidence: "
+            + ", ".join(missing_changed_files)
+        )
 
     buckets = {"core": [0, 0], "other production": [0, 0]}
     for path, lines in changed.items():
@@ -575,15 +812,9 @@ def main() -> int:
         repository = discover_repository() if args.policy == "pr" else None
         totals = load_report(report, repository)
         if args.policy == "release":
-            print_totals(totals, args.global_min, args.core_min)
-            failed = False
-            if percentage(totals.global_covered, totals.global_count) + 1e-9 < args.global_min:
-                print("global coverage gate failed", file=sys.stderr)
-                failed = True
-            if percentage(totals.core_covered, totals.core_count) + 1e-9 < args.core_min:
-                print("core coverage gate failed", file=sys.stderr)
-                failed = True
-            return 1 if failed else 0
+            return run_release_policy(
+                totals, report, args.lcov, args.global_min, args.core_min
+            )
 
         return run_pr_policy(totals, report, args.lcov, args.base_ref, args.bootstrap_baseline)
     except InputError as exc:
