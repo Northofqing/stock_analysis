@@ -760,28 +760,26 @@ workspace、扩展核心目录和成功阈值测试必须继续通过；真实 c
 触发数据红线为 2.1、2.2、2.3、2.4、2.7、2.8、2.10；没有 config/阈值修改，2.9 的
 Threshold-Proof 为 N/A。业务规则统一登记为 BR-251。
 
-### 15.2 HEAD 证据与旧模块关系
+### 15.2 Task 33 前 BASE 证据与旧模块关系
 
-以下命令在分支 `codex/buy-sell-t1-fifo` 的当前 HEAD 执行，避免从旧 spec 推导活动代码：
+以下代码事实固定读取 Task 33 前 BASE
+`bb26b45a7a2f9b3debe8bb1bd70864443f15d16f` 的 Git object，不代表 Task 33 后当前 HEAD：
 
 ```text
-$ rg -n 'BenchmarkRef|BenchmarkReader' src
-# exit 1，0 个活动 Rust 实现
+$ TASK33_BASE=bb26b45a7a2f9b3debe8bb1bd70864443f15d16f
+$ git grep -n -E 'pub struct BenchmarkReader|pub struct BenchmarkSeries|fn fetch_benchmark_series|pub struct ReviewDataGateway|pub fn verified_a_share_trading_day|pub fn verified_prev_a_share_trading_day' "$TASK33_BASE" -- src/data_gateway/benchmark.rs src/strategy/core.rs src/pipeline/backtest_runner.rs src/data_gateway/review.rs src/calendar.rs
+bb26b45a7a2f9b3debe8bb1bd70864443f15d16f:src/calendar.rs:419:pub fn verified_a_share_trading_day(date: NaiveDate) -> Result<bool, String> {
+bb26b45a7a2f9b3debe8bb1bd70864443f15d16f:src/calendar.rs:437:pub fn verified_prev_a_share_trading_day(from: NaiveDate) -> Result<NaiveDate, String> {
+bb26b45a7a2f9b3debe8bb1bd70864443f15d16f:src/data_gateway/benchmark.rs:209:pub struct BenchmarkReader<'a> {
+bb26b45a7a2f9b3debe8bb1bd70864443f15d16f:src/data_gateway/review.rs:329:pub struct ReviewDataGateway;
+bb26b45a7a2f9b3debe8bb1bd70864443f15d16f:src/pipeline/backtest_runner.rs:322:    async fn fetch_benchmark_series(&self, days: usize) -> Option<BenchmarkSeries> {
+bb26b45a7a2f9b3debe8bb1bd70864443f15d16f:src/pipeline/backtest_runner.rs:333:    async fn fetch_benchmark_series_with_code(
+bb26b45a7a2f9b3debe8bb1bd70864443f15d16f:src/strategy/core.rs:879:pub struct BenchmarkSeries {
 
-$ rg -n 'pub struct BenchmarkSeries|fn fetch_benchmark_series|pub struct ReviewDataGateway|verified_a_share_trading_day|verified_prev_a_share_trading_day' \
-    src/strategy/core.rs src/pipeline/backtest_runner.rs src/data_gateway/review.rs src/calendar.rs
-src/data_gateway/review.rs:306:pub struct ReviewDataGateway;
-src/calendar.rs:199:pub fn verified_a_share_trading_day(...)
-src/calendar.rs:217:pub fn verified_prev_a_share_trading_day(...)
-src/pipeline/backtest_runner.rs:322:    async fn fetch_benchmark_series(...)
-src/pipeline/backtest_runner.rs:333:    async fn fetch_benchmark_series_with_code(...)
-src/strategy/core.rs:879:pub struct BenchmarkSeries {
-
-$ rg -n 'INSERT OR REPLACE INTO paper_attribution_daily|pub fn compute_daily|pub fn compute_window' \
-    src/performance/attribution.rs
-445:pub fn compute_daily(
-458:pub fn compute_window(
-504:const PERSIST_SQL: &str = "INSERT OR REPLACE INTO paper_attribution_daily ..."
+$ git grep -n -E 'INSERT OR REPLACE INTO paper_attribution_daily|pub fn compute_daily|pub fn compute_window' "$TASK33_BASE" -- src/performance/attribution.rs
+bb26b45a7a2f9b3debe8bb1bd70864443f15d16f:src/performance/attribution.rs:445:pub fn compute_daily(
+bb26b45a7a2f9b3debe8bb1bd70864443f15d16f:src/performance/attribution.rs:458:pub fn compute_window(
+bb26b45a7a2f9b3debe8bb1bd70864443f15d16f:src/performance/attribution.rs:504:const PERSIST_SQL: &str = "INSERT OR REPLACE INTO paper_attribution_daily \
 ```
 
 对生产库的 READ_ONLY 联结复核得到 `Filled=898`、同时存在严格候选订单审计时间及哈希链的
@@ -1049,11 +1047,25 @@ TDD 与定向证据：RED 在 seam/helper 尚不存在时以 E0425/E0599 失败�
 `paper_trades`、`paper_attribution_daily`、Unsafe、TechnicalBars、`paper_sell_paused` 的
 生产代码 diff 均为零。
 
+以下 reviewer 更正固定在当前 HEAD
+`ece0bd7a22e912d927e9695f68259de2ba420174`，并取代本节早先只列两个 fmt 路径及只列一项
+Clippy 诊断的摘要。复现工具链为 `rustc 1.95.0 (59807616e 2026-04-14)`、
+`cargo 1.95.0 (f2d3ce0bd 2026-03-21)`、`rustfmt 1.9.0-stable
+(59807616e1 2026-04-14)`。
+
 全仓门禁未通过，且失败均在本任务未修改路径：
 
-- `cargo fmt --all -- --check`：`src/bin/hbars_probe.rs` 与受保护
-  `src/bin/monitor/main.rs` 存在继承格式差异。
-- workspace strict Clippy：`src/bin/hbars_probe.rs:17` 的 `clippy::let_unit_value`。
+- `cargo fmt --all -- --check`：当前工具链输出共 11 个相对 Task 33 BASE 零差异路径：
+  `src/bin/hbars_probe.rs`、`src/bin/monitor/main.rs`、`src/bin/rq_probe.rs`、
+  `src/bin/t0_minute_probe.rs`、`src/bin/t0_replay.rs`、
+  `src/data_gateway/magic_tdx_t0.rs`、`src/monitor/alert_log.rs`、
+  `src/monitor/attribution_deep.rs`、`src/monitor/news_ai.rs`、
+  `src/performance/attribution.rs`、`src/performance/report.rs`。旧“两路径”摘要不完整。
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`：reviewer 在当前 HEAD
+  记录的首个 blocker 为 `src/bin/t0_replay.rs:10-11` 的
+  `clippy::doc_lazy_continuation`。使用上述同一工具链重跑时，Cargo 并发 target 输出还同时
+  报出 `src/bin/hbars_probe.rs:17` 的 `clippy::let_unit_value`；并发诊断显示顺序不是稳定身份，
+  且编译在这些错误后停止，后续 warning 仍可能被首批错误遮蔽。
 - workspace tests：lib 为 2982 passed / 7 ignored；monitor 为 683 passed / 2 failed /
   4 ignored，失败为 BR-139 与 BR-241 两个源码计数断言（实际 2、期望 1）。
 - `tools/compliance/check.sh` 因会无条件访问生产 `stock_daily` 的 freshness 子检查而未获授权；

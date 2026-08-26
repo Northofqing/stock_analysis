@@ -2229,8 +2229,14 @@ impl AttributionReplayRunner {
   `cargo clippy --workspace --all-targets --all-features -- -D warnings`；
   `cargo test --workspace --all-targets --all-features -- --test-threads=1`；
   `bash tools/compliance/check.sh`。2026-08-26 证据：runner 15/15 与 strict lib Clippy 通过；
-  全仓 fmt 继承 `hbars_probe.rs`/受保护 `monitor/main.rs` 差异，workspace Clippy 继承
-  `hbars_probe.rs:17`，workspace tests 继承 monitor BR-139/BR-241 两个失败；aggregate
+  在 HEAD `ece0bd7`、rustc/cargo 1.95.0、rustfmt 1.9.0 下，全仓 fmt 完整输出为 11 个相对
+  Task 33 BASE 零差异路径（`hbars_probe.rs`、`monitor/main.rs`、`rq_probe.rs`、
+  `t0_minute_probe.rs`、`t0_replay.rs`、`magic_tdx_t0.rs`、`alert_log.rs`、
+  `attribution_deep.rs`、`news_ai.rs`、`performance/attribution.rs`、
+  `performance/report.rs`）。reviewer 记录的 workspace Clippy 首个 blocker 是
+  `t0_replay.rs:10-11` 的 `doc_lazy_continuation`；同工具链重跑还并发报出
+  `hbars_probe.rs:17` 的 `let_unit_value`，后续诊断可能被首批错误遮蔽。workspace tests 继承
+  monitor BR-139/BR-241 两个失败；aggregate
   compliance 因未授权 freshness/生产 DB 未运行，安全子检查仅 business-rules gate 因 60 个
   继承缺失路径失败（157 warnings）。
 - [ ] Gate D：`cargo llvm-cov --workspace --all-features --json --output-path target/coverage/coverage.json -- --test-threads=1`；
