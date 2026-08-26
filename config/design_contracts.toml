@@ -10,3 +10,23 @@ rust_score_max_constant = "EVENT_RISK_SCORE_MAX"
 score_min = 0
 score_max = 100
 insufficient_cap_relation = "threshold_minus_one"
+
+# BR-252 / docs/superpowers/specs/2026-08-02-gate-d-coverage-closure-design.md §10.4
+# 首次 PR 覆盖率棘轮基线来自 f05f506 上的新鲜 workspace/all-features 报告。
+# 比例判定必须使用整数交叉相乘；普通修改不得降低任一 baseline。
+[coverage]
+schema = 1
+source_sha = "f05f506e744898319b6ba059580ab17bf65004cf"
+global_covered = 201279
+global_count = 258810
+core_covered = 157652
+core_count = 202935
+core_file_count = 218
+pr_core_patch_min = 90
+pr_other_patch_min = 85
+release_global_min = 80
+release_core_min = 95
+rustc_release = "1.95.0"
+rustc_commit = "59807616e1fa2540724bfbac14d7976d7e4a3860"
+llvm_version = "22.1.2"
+cargo_llvm_cov_version = "0.8.7"

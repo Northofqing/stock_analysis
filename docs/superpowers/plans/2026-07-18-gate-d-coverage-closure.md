@@ -1,4 +1,92 @@
-# Gate D Coverage Closure Implementation Plan
+# Gate C 分层门禁与覆盖率棘轮实施计划
+
+> **2026-08-27 当前实施权威：** 本节取代下方历史任务清单。用户已经确认
+> `docs/superpowers/specs/2026-08-02-gate-d-coverage-closure-design.md` §10 的修订方案：
+> 核心改动覆盖率至少 90%，其他生产代码改动覆盖率至少 85%，全仓 global/core 只升不降；
+> Gate D 仍保留 global 80%、core 95%、真实 freshness 与 live/audit 证据。
+
+**目标：** 让普通 PR 用当前改动能够提供的证据完成 Gate C 合并，同时保持数据、资金安全红线
+和 Gate D 发布标准不降级。
+
+**实现边界：** 只深化现有 `check_thresholds.py`、`check.sh` 与两个 workflow；测试继续写入
+已有且受跟踪的 `tests/test_coverage_thresholds.rs` 和 `tests/test_data_freshness_check.rs`。覆盖率
+基线写入已有 `config/design_contracts.toml [coverage]`；不创建或强制跟踪 `.gitignore` 排除文件。
+
+### Task 40：固化 Gate A 规则、阈值证据与回滚边界
+
+**文件：** `AGENTS.md`、`docs/ENGINEERING_RULES_V2.md`、`.github/copilot-instructions.md`、
+`CLAUDE.md`、`docs/superpowers/specs/2026-08-02-gate-d-coverage-closure-design.md`、
+`docs/business_rules.md`、`config/design_contracts.toml`
+
+- [ ] 将 Gate C 明确定义为 PR 合并门禁，Gate D 定义为发布/部署门禁；任何数据红线仍然阻断。
+- [ ] 登记 BR-252 与 `[coverage]`：global `201279/258810`、core `157652/202935`、218 个核心
+  文件、Rust 1.95.0/LLVM 22.1.2/cargo-llvm-cov 0.8.7，以及 PR 90%/85%、Release 80%/95%。
+- [ ] 记录阈值证明：当前分支核心改动 `13707/14923=91.85%`、其他生产改动
+  `8368/9824=85.18%`；不得把统一 95% 继续作为当前 PR 的历史债代理。
+- [ ] 运行 `git diff --check` 与 `bash tools/compliance/lib/check_design_contradiction.sh`；预期 PASS。
+- [ ] 独立提交规则与计划，提交信息引用 BR-252、spec §10 与 `[coverage]`；回滚只 revert 该提交，
+  不删除报告、审计或真实持仓数据。
+
+### Task 41：测试先行实现覆盖率双策略
+
+**文件：** `tests/test_coverage_thresholds.rs`、`tools/coverage/check_thresholds.py`
+
+- [ ] 先扩展真实 CLI 进程测试，建立临时 Git checkout、JSON/LCOV 报告和 `[coverage]` 配置；
+  验证 release/default 仍按 80%/95%，缺核心行与坏报告 exit 2。
+- [ ] 新增失败测试：核心恰好 90% 通过、低一行失败；非核心恰好 85% 通过、低一行失败；某桶无
+  可执行改动输出 N/A；删除-only 不伪报 100%；缺 base/LCOV/配置、路径逃逸与坏 diff exit 2。
+- [ ] 新增棘轮测试：当前比例等于/高于 `[coverage]` 通过；global 或 core 任一低于 baseline
+  失败；base 已有 baseline 时 candidate 比例下降失败；base 无 baseline 且未传
+  `--bootstrap-baseline` 失败。
+- [ ] 实现接口：旧位置参数保持 release 兼容；新接口为
+  `--policy pr|release --report <json> [--lcov <lcov> --base-ref <ref> --bootstrap-baseline]`。
+  JSON 负责全仓/核心统计，LCOV `DA` 负责差分可执行行，Git `--unified=0` 负责新增/修改行；
+  两个 patch 桶独立按整数交叉相乘判定。退出码固定 0=通过、1=政策未达标、2=不可验证。
+- [ ] 运行 `cargo test --test test_coverage_thresholds -- --test-threads=1`；预期全部 PASS，随后
+  `python3 tools/coverage/check_thresholds.py target/coverage/coverage.json` 仍应以 release 语义
+  报告当前 77.77%/77.69% 并 exit 1。
+- [ ] 独立提交 coverage policy 与测试；回滚不触碰 `[coverage]` 历史证据。
+
+### Task 42：测试先行实现合规双策略
+
+**文件：** `tests/test_data_freshness_check.rs`、`tools/compliance/check.sh`
+
+- [ ] 先新增进程测试，以临时 `LIB_DIR` 下的可执行探针记录调用：`--policy pr` 必须运行所有
+  离线检查且不调用 freshness；`--policy release` 与无参数默认都必须调用 freshness；未知参数
+  必须非零且不运行任何子脚本；任一子检查失败必须向上传播。
+- [ ] 给 `check.sh` 增加严格参数解析与可测试的 `COMPLIANCE_LIB_DIR` 私有注入；生产默认仍指向
+  仓库 `tools/compliance/lib`。仅 PR policy 跳过 `check_data_freshness.sh`，其他检查列表完全一致。
+- [ ] 运行 `cargo test --test test_data_freshness_check -- --test-threads=1` 与
+  `bash tools/compliance/check.sh --policy pr`；预期 PASS。不得运行回填或把 PR skip 写成 freshness PASS。
+- [ ] 独立提交 compliance policy 与测试。
+
+### Task 43：让 CI 只签发其拥有的 Gate C 证据
+
+**文件：** `.github/workflows/coverage.yml`、`.github/workflows/compliance.yml`、
+`tests/test_coverage_thresholds.rs`、`tests/test_data_freshness_check.rs`
+
+- [ ] 先加 workflow 静态测试：coverage 必须 `fetch-depth: 0`、固定 Rust `1.95.0`、安装
+  `llvm-tools-preview` 与 cargo-llvm-cov `0.8.7`、生成 JSON+LCOV、调用 `--policy pr` 与 base SHA；
+  compliance 必须调用 `--policy pr`，不得出现 `backfill_daily`。
+- [ ] 修改 workflow：PR 使用 base SHA，push 使用 before SHA；首次 base 无 `[coverage]` 时显式传
+  `--bootstrap-baseline`。CI 不读取生产库、不自动回填、不输出 Gate D PASS。
+- [ ] 运行两个测试 binary、`git diff --check` 与 `bash tools/compliance/check.sh --policy pr`；预期 PASS。
+- [ ] 独立提交 workflow 与静态测试。
+
+### Task 44：完成 Gate C 验证、PR 证据与合并
+
+- [ ] 运行 `cargo fmt --all -- --check`。
+- [ ] 运行 `cargo clippy --workspace --all-targets --all-features -- -D warnings`。
+- [ ] 运行 `cargo test --workspace --all-targets --all-features -- --test-threads=1`。
+- [ ] 运行 `bash tools/compliance/check.sh --policy pr`。
+- [ ] 重新生成 workspace/all-features JSON+LCOV，并运行
+  `python3 tools/coverage/check_thresholds.py --policy pr --report target/coverage/coverage.json --lcov target/coverage/lcov.info --base-ref c6024e5 --bootstrap-baseline`；预期核心 patch ≥90%、其他 patch ≥85%、global/core 不低于 baseline。
+- [ ] 更新 BR-252 为 Gate C PASS，并在 PR 描述完整填写 Refs、Data-Redlines、OldModules、
+  Threshold-Proof、Business-Rules、Rollback、Gate-Policy 与 Bootstrap-Baseline。
+- [ ] 只在上述 Gate C 证据和独立审查均无 Critical/Important 后提交、推送并合并。Gate D 若仍未
+  达到 global80/core95 或未获真实 freshness/live 授权，明确标记 `Release Blocked`，不得部署。
+
+---
 
 > **Historical evidence only (superseded 2026-08-02):** Do not execute the
 > remaining checklist against the current tree. It references retired
