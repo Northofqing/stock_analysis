@@ -19,7 +19,8 @@
 `docs/business_rules.md`、`config/design_contracts.toml`
 
 - [x] 将 Gate C 明确定义为 PR 合并门禁，Gate D 定义为发布/部署门禁；任何数据红线仍然阻断。
-- [x] 登记 BR-252 与 `[coverage]`：global `201279/258810`、core `157652/202935`、218 个核心
+- [x] 登记 BR-252 与 `[coverage]`：经两次新鲜完整报告复现，global `201256/258810`、
+  core `157635/202935`、218 个核心
   文件、Rust 1.95.0/LLVM 22.1.2/cargo-llvm-cov 0.8.7，以及 PR 90%/85%、Release 80%/95%。
 - [x] 记录阈值证明：当前分支核心改动 `13707/14923=91.85%`、其他生产改动
   `8368/9824=85.18%`；不得把统一 95% 继续作为当前 PR 的历史债代理。
@@ -81,6 +82,8 @@
   完整工具、源码和 LCOV provenance。
 - [x] Release compliance 必须显式绑定固定生产 `STOCK_DB` 并拒绝测试日期/日历覆盖；PR 证据
   强制 baseline 与 Gate C/Gate D 分列；compliance workflow 使用 `fetch-depth: 0`。
+- [x] 复现并纠正首次 bootstrap 的不可复现计数：两次同源码、同工具、同测试集完整运行均为
+  global `201256/258810`、core `157635/202935`；只纠正基线事实，不改变任何门禁阈值。
 - [ ] 运行 `cargo fmt --all -- --check`。
 - [ ] 运行 `cargo clippy --workspace --all-targets --all-features -- -D warnings`。
 - [ ] 运行 `cargo test --workspace --all-targets --all-features -- --test-threads=1`。

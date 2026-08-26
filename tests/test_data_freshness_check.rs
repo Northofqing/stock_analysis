@@ -296,8 +296,8 @@ Rollback: git revert TEST_CODE
 Gate-Policy: PR=core-patch90+other-patch85+ratchet; Release=global80+core95+freshness+live
 Bootstrap-Baseline: true
 Baseline-Source-SHA: f05f506e744898319b6ba059580ab17bf65004cf
-Baseline-Global: 201279/258810
-Baseline-Core: 157652/202935
+Baseline-Global: 201256/258810
+Baseline-Core: 157635/202935
 Coverage-Tools: rustc=1.95.0; LLVM=22.1.2; cargo-llvm-cov=0.8.7
 Gate-C: PASS
 Gate-D: Release Blocked"#;
@@ -318,7 +318,7 @@ Gate-Policy: PR=core-patch90+other-patch85+ratchet; Release=global80+core95+fres
 Bootstrap-Baseline: true
 Baseline-Source-SHA: f05f506e744898319b6ba059580ab17bf65004cf
 Baseline-Global: 1/1
-Baseline-Core: 157652/202935
+Baseline-Core: 157635/202935
 Coverage-Tools: rustc=1.95.0; LLVM=22.1.2; cargo-llvm-cov=0.8.7
 Gate-C: PASS
 Gate-D: Release Blocked"#;
@@ -338,8 +338,8 @@ Rollback: git revert TEST_CODE
 Gate-Policy: PR=core-patch90+other-patch85+ratchet; Release=global80+core95+freshness+live
 Bootstrap-Baseline: false
 Baseline-Source-SHA: f05f506e744898319b6ba059580ab17bf65004cf
-Baseline-Global: 201279/258810
-Baseline-Core: 157652/202935
+Baseline-Global: 201256/258810
+Baseline-Core: 157635/202935
 Coverage-Tools: rustc=1.95.0; LLVM=22.1.2; cargo-llvm-cov=0.8.7
 Gate-C: PASS
 Gate-D: Release Blocked"#;

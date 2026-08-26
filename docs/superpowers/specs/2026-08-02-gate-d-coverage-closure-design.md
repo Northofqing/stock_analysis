@@ -2682,11 +2682,11 @@ python3 tools/coverage/check_thresholds.py target/coverage/coverage.json
 结果：第一条命令 exit 0，所有测试通过；第二条命令 exit 1：
 
 ```text
-global line coverage: 201279/258810 = 77.77% (required 80.00%)
-core line coverage: 157652/202935 = 77.69% (required 95.00%, 218 files)
+global line coverage: 201256/258810 = 77.76% (required 80.00%)
+core line coverage: 157635/202935 = 77.68% (required 95.00%, 218 files)
 ```
 
-若继续把固定阈值用于每个 PR，当前分支需替全仓补约 5,769 条 global 和 35,137 条
+若继续把固定阈值用于每个 PR，当前分支需替全仓补约 5,792 条 global 和 35,154 条
 core 已覆盖行。这个缺口是历史仓库状态，不是本轮测试失败，不能通过改小分母、排除目录、
 降低 80%/95% 或伪造报告消除。
 
@@ -2927,3 +2927,25 @@ PR 除 AGENTS §3.1 字段外必须增加：
 
 以上任一输入不可验证都回到 Gate B；Release DB 身份或生产 freshness 不具备时保持
 `Release Blocked`，不得以关闭门禁解决。
+
+### 10.13 Bootstrap 基线复现纠正
+
+2026-08-27 最终验证时，合同初值 `201279/258810`（global）与
+`157652/202935`（core）无法由已提交的同源码、同工具和同测试集复现。连续两次完整执行
+`cargo llvm-cov --workspace --all-features --json -- --test-threads=1` 均得到完全相同的
+`201256/258810`（global）与 `157635/202935`（core，218 文件）；两次测试均为零失败，源码
+总行数、core 总行数、源码集合、工具身份和 patch 结果也完全一致。差异不是生产源码回归，
+而是首次 bootstrap 把不可复现的旧报告计数写入了合同。
+
+因此首次 bootstrap 在本 PR 内纠正为上述两次可复现计数，并保持以下边界不变：
+
+- source SHA 仍为 `f05f506e744898319b6ba059580ab17bf65004cf`，其后无 `src/`、
+  `Cargo.toml`、`Cargo.lock` 或 `build.rs` 改动；
+- PR 核心/其他生产改动阈值仍为 90%/85%，Release 固定阈值仍为 global 80%/core 95%；
+- 本次 patch 证据仍为 core `13707/14923=91.85%`、其他生产代码
+  `8368/9824=85.18%`；
+- 后续非 bootstrap PR 不得降低任一 baseline，且仍须同时通过 candidate 对 base 的棘轮。
+
+该纠正只修复初始证据事实，不缩小分母、不删测试、不改变生产代码，也不把 Gate D 标记为
+通过。未来若需再次修改 baseline，必须重新进入 Gate A、更新 BR-252 并提供至少两次独立的
+同源码完整报告证据。
