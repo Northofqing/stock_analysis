@@ -741,8 +741,9 @@ workspace、扩展核心目录和成功阈值测试必须继续通过；真实 c
 
 ### 15.1 状态、目标与不可越界范围
 
-**状态：Gate A 设计及书面设计已由用户复核确认；实现 TO BE BUILT。** 本节落实 §13.3/
-§13.4 已登记的历史基准缺口，并增加用户明确要求的历史归因复盘及业务日期规则：交易日
+**状态：Gate A 设计已确认；Tasks 23–33 与全分支终审修复已在本地实现，等待最终 scoped
+re-review，整体仍为 Draft / In Progress / ResearchOnly。** 本节落实 §13.3/§13.4 已登记的
+历史基准缺口，并增加用户明确要求的历史归因复盘及业务日期规则：交易日
 运行实际当日数据，周六、周日运行最近完成交易日（通常为周五）。本节不改变 §11 的
 经济仓位定义、样本门槛和结论边界。
 
@@ -804,7 +805,7 @@ bb26b45a7a2f9b3debe8bb1bd70864443f15d16f:src/performance/attribution.rs:504:cons
 ### 15.3 深模块、接口与数据流
 
 新增能力形成一个深的 `Benchmark` 模块：复杂的 provider 身份、分页、时间语义、季度段、
-hash 和审计都隐藏在窄接口之后。TO BE BUILT 路径为 `src/data_gateway/benchmark.rs`；数据库
+hash 和审计都隐藏在窄接口之后。活动实现路径为 `src/data_gateway/benchmark.rs`；数据库
 实现分别位于 `src/database/benchmark_segments.rs` 与 `src/database/attribution_reports.rs`。
 
 核心职责固定如下：
@@ -821,7 +822,7 @@ hash 和审计都隐藏在窄接口之后。TO BE BUILT 路径为 `src/data_gate
 - `AttributionReplayRunner`：应用编排器。它读取成交、费用、个股历史收盘、基准、日历和
   市场状态证据，再调用纯归因引擎；纯引擎不访问数据库、当前行情或 provider。
 - `AttributionReportStore`：归因运行、失败与报告 revision 的唯一 append-only writer。
-- `src/bin/strategy_attribution.rs`：一次性 CLI（TO BE BUILT），只调用 Runner，不复制规则。
+- `src/bin/strategy_attribution.rs`：已活动实现的一次性 CLI，只调用 Runner，不复制规则。
 
 ```text
 Magic TDX 指数协议 / gRPC
@@ -1047,9 +1048,10 @@ TDD 与定向证据：RED 在 seam/helper 尚不存在时以 E0425/E0599 失败�
 `paper_trades`、`paper_attribution_daily`、Unsafe、TechnicalBars、`paper_sell_paused` 的
 生产代码 diff 均为零。
 
-以下 reviewer 更正固定在当前 HEAD
-`ece0bd7a22e912d927e9695f68259de2ba420174`，并取代本节早先只列两个 fmt 路径及只列一项
-Clippy 诊断的摘要。复现工具链为 `rustc 1.95.0 (59807616e 2026-04-14)`、
+以下 reviewer 更正固定为 Task 33 文档提交后的历史证据快照
+`ece0bd7a22e912d927e9695f68259de2ba420174`，不代表后续终审修复 HEAD；它取代本节早先只列
+两个 fmt 路径及只列一项 Clippy 诊断的摘要。复现工具链为
+`rustc 1.95.0 (59807616e 2026-04-14)`、
 `cargo 1.95.0 (f2d3ce0bd 2026-03-21)`、`rustfmt 1.9.0-stable
 (59807616e1 2026-04-14)`。
 
@@ -1061,7 +1063,7 @@ Clippy 诊断的摘要。复现工具链为 `rustc 1.95.0 (59807616e 2026-04-14)
   `src/data_gateway/magic_tdx_t0.rs`、`src/monitor/alert_log.rs`、
   `src/monitor/attribution_deep.rs`、`src/monitor/news_ai.rs`、
   `src/performance/attribution.rs`、`src/performance/report.rs`。旧“两路径”摘要不完整。
-- `cargo clippy --workspace --all-targets --all-features -- -D warnings`：reviewer 在当前 HEAD
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`：reviewer 在该历史证据快照
   记录的首个 blocker 为 `src/bin/t0_replay.rs:10-11` 的
   `clippy::doc_lazy_continuation`。使用上述同一工具链重跑时，Cargo 并发 target 输出还同时
   报出 `src/bin/hbars_probe.rs:17` 的 `clippy::let_unit_value`；并发诊断显示顺序不是稳定身份，
@@ -1081,3 +1083,45 @@ Clippy 诊断的摘要。复现工具链为 `rustc 1.95.0 (59807616e 2026-04-14)
 TDX/gRPC probe、freshness/backfill、capture/replay `--commit`、订单、推送和生产数据库访问均
 未执行；Minute1 继续 Disabled。独立 reviewer、Gate D 阈值、生产授权验收和 Draft PR #15
 描述更新仍是外部待办，因此不得合并或宣称完成。
+
+### 15.12 全分支终审修复证据（2026-08-26）
+
+merge-base `c6024e5fca1680bd7f8a234f980c6de511557e2e` 到产品 HEAD `b04857b` 的独立终审先
+复跑 lib 2982/0/7、CLI all/no-default 各 5/5 与 strict lib Clippy，随后冻结
+`C0/I4/M1`：raw probe 被正式 attestation 自锁、独立季度段不能显式组成跨季度 exact
+manifest、benchmark store 缺 trigger/high-water 尾部回退防护、五年留存未覆盖全部 row/chain，
+以及本节活动状态漂移。修复没有触碰 monitor、订单、推送、Unsafe、config/threshold 或旧表。
+
+提交 `7208a133ed400cf0c2605d0ce1c7e2c4ec4896bf` 在既有
+`BenchmarkSegmentStore` 上增加 `compose_exact(request, selections)`。caller 必须逐项给出
+`BenchmarkRetainedSegmentRef { source_manifest_hash, segment_hash }`；store 逐段重验持久化
+payload、source manifest association、原 BR-159 receipt/request、instrument/granularity/provider/
+version 和连续覆盖，只创建新 manifest/association/chain，不搜索 latest、不重绑 acquisition、
+不返回部分结果。普通 append 的 R-21 fail-closed 语义保持不变。
+
+同一提交在任何 `CREATE TRIGGER IF NOT EXISTS` 修复前校验五张 append-only 表的十个 canonical
+trigger 定义，并以 AUTOINCREMENT high-water/连续身份拒绝协调尾部删除；startup、read、preappend
+复用同一 canonical state gate。五张表的 row/association/chain 全部使用小数秒 UTC 和至少 60
+个日历月 retention 校验，覆盖闰日、缺失、不可解析、无小数、过短与倒序。chain 时间进入哈希后
+domain 升级为 V2；既有 V1 benchmark chain 会显式 fail-closed，生产 inventory/migration 未获
+授权，不能把本地实现写成原库已迁移。
+
+提交 `91d29f9c9e714cd13b3e2fa9a6e056843439677d` 把 CLI `probe` 改为独立 raw provider
+diagnostic seam。`BenchmarkProbeReport` 只输出 canonical/provider identity anchor、逐页
+offset/requested/received、raw count、首末标签、OHLC digest 和 Minute1 raw 时间样本；身份及分钟
+语义类型不存在 `Verified` variant。该 DTO 不包含 `GatewayBatch`、Capture、Reader、receipt 或
+数据库状态，测试证明 source 被访问而 BR-159 计数和 attestation 不变；正式 acquisition 仍在
+source access 前执行 production attestation。
+
+可复核 TDD/回归证据：raw seam 首次因缺函数 E0432 RED，随后 raw 3/3、admitted attestation
+1/1、benchmark all/no-default 各 25/25、CLI all/no-default 各 6/6 通过；exact composition 首次因
+缺 `BenchmarkRetainedSegmentRef`/`compose_exact` E0422/E0599 RED，随后 store all/no-default 各
+54/54、Capture 4/4、Reader 4/4 与 strict lib Clippy 通过。I3/I4 的对抗测试先于实现编写，但
+共享构建协调期间没有保留独立 failing transcript，故只把其当前 GREEN 作为证据，不伪称存在
+可复核 RED 命令输出。
+
+当前仅完成唯一 final fix wave，仍须 scoped final re-review。aggregate compliance、freshness、
+coverage、真实 TDX/gRPC probe、生产数据库 inventory/migration、capture/replay commit、订单和推送
+均未执行；既有全仓 Gate B/C/D 阻塞仍按 §15.11 处理。回滚顺序为先
+`git revert 91d29f9c9e714cd13b3e2fa9a6e056843439677d`，再
+`git revert 7208a133ed400cf0c2605d0ce1c7e2c4ec4896bf`；已追加的审计事实不得删除。

@@ -2229,7 +2229,8 @@ impl AttributionReplayRunner {
   `cargo clippy --workspace --all-targets --all-features -- -D warnings`；
   `cargo test --workspace --all-targets --all-features -- --test-threads=1`；
   `bash tools/compliance/check.sh`。2026-08-26 证据：runner 15/15 与 strict lib Clippy 通过；
-  在 HEAD `ece0bd7`、rustc/cargo 1.95.0、rustfmt 1.9.0 下，全仓 fmt 完整输出为 11 个相对
+  在 Task 33 历史证据快照 `ece0bd7`、rustc/cargo 1.95.0、rustfmt 1.9.0 下，全仓 fmt
+  完整输出为 11 个相对
   Task 33 BASE 零差异路径（`hbars_probe.rs`、`monitor/main.rs`、`rq_probe.rs`、
   `t0_minute_probe.rs`、`t0_replay.rs`、`magic_tdx_t0.rs`、`alert_log.rs`、
   `attribution_deep.rs`、`news_ai.rs`、`performance/attribution.rs`、
@@ -2256,3 +2257,20 @@ impl AttributionReplayRunner {
   Draft、状态 `In Progress / ResearchOnly`；不得称 Done 或 merge-ready。
 - [x] 最终代码提交：`git commit -m "refactor: 统一回测基准读取入口"`；证据文档另提交
   `git commit -m "docs: 记录策略归因验证证据"`。
+
+## 全分支最终审查修复波次（Tasks 23–33 之后）
+
+- [x] 固定 merge-base `c6024e5` → `b04857b` 审查包并独立复跑 lib、CLI、strict lib Clippy；
+  冻结 verdict `C0/I4/M1`，不得以逐任务接受替代端到端审查。
+- [x] 隔离 raw diagnostic 与 admitted acquisition：CLI `probe` 只输出不可准入、不可审计、
+  不可持久化的 identity/page/OHLC/minute raw 证据；正式采集继续受 attestation gate 保护。
+- [x] 增加 caller-explicit `compose_exact`：只组合明确 source manifest + segment revision，保留
+  原 receipt/request binding，禁止 latest/default/env、旧 acquisition 换绑和部分结果。
+- [x] benchmark store 在 startup/read/preappend 统一校验 canonical triggers、sequence high-water、
+  连续身份和所有 row/association/chain 的小数秒 +60 日历月 retention；chain hash domain 升 V2。
+- [x] 本地验证：store all/no-default 各 54/54、Capture/Reader 各 4/4、benchmark all/no-default
+  各 25/25、CLI all/no-default 各 6/6、strict lib/CLI Clippy、scoped fmt 与安全 fake/design 检查。
+- [ ] 生成 `b04857b` → final-fix HEAD 的冻结包并执行一次 scoped final re-review；未接受前整体
+  继续 `Draft / In Progress / ResearchOnly`。
+- [ ] 生产 V1 benchmark chain inventory/migration、真实协议 probe/attestation、freshness、当前
+  coverage、全仓 Gate B/C/D 与 Draft PR 远端同步均需单独授权/闭环，不能由本修复波次代替。
