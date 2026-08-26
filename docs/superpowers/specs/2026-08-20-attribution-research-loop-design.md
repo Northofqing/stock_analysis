@@ -1156,3 +1156,13 @@ BR-139/BR-241 两项结构计数断言阻断（683 passed / 2 failed / 4 ignored
 fake-impl、design-contradiction 通过，business-rules 保持既有 60 errors / 157 warnings。
 aggregate compliance/freshness、覆盖率、真实 provider/生产数据库、capture/replay commit、订单和
 推送均未运行。代码回滚为 `git revert 0eb489e`，不得删除任何已追加审计事实。
+
+冻结范围 `aafc3de66952d259b1ddc7f140fba706dc0ac23a` →
+`5fbc16a5f4eb6e403eefdfb9b77a028555a3e03c` 已由新的独立只读 reviewer 复核并以
+`C0/I0/M0 — ACCEPTED` 接受本 bounded task。reviewer 独立复跑两项 exact 测试各 1/1、
+store all/no-default 各 55/55、benchmark all/no-default 各 25/25、strict lib Clippy、changed-file
+rustfmt、diff-check、fake-impl 和 design-contradiction；全库 lib 为 2995/0/7。它同时确认 source
+identity 的权威形式为 `magic-tdx-index-bars@<TDX_DEPENDENCY_REVISION>`：同 revision 的其他字符串
+表示会保守 fail-closed，而同字符串掩盖不同真实 revision 属于上游 evidence contract 违规，不在
+本 exact-string 组合合同内。business-rules 仍精确保持既有 60 errors / 157 warnings，因此该接受
+只关闭本 bounded task，不改变整体 Gate 状态。

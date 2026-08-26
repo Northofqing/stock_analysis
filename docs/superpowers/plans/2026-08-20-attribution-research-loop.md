@@ -2277,7 +2277,8 @@ impl AttributionReplayRunner {
   provider + exact source + codec/payload versions；不同 revision typed fail 且三张组合表零写，
   相同 revision 经活动 `BenchmarkReader::read_exact` 成功。store all/no-default 各 55/55、
   benchmark all/no-default 各 25/25、lib 2995/0/7 与 strict lib Clippy 通过。
-- [ ] 生成 `aafc3de` → 本任务文档 HEAD 的冻结包并执行新的独立 scoped final re-review；未接受前
-  整体继续 `Draft / In Progress / ResearchOnly`。
+- [x] 生成 `aafc3de` → `5fbc16a` 的冻结包并执行新的独立 scoped final re-review；reviewer
+  独立复跑 exact/store/benchmark/lib/Clippy/rustfmt/安全合规检查，以 `C0/I0/M0 — ACCEPTED`
+  接受本 bounded task。整体仍继续 `Draft / In Progress / ResearchOnly`。
 - [ ] 生产 V1 benchmark chain inventory/migration、真实协议 probe/attestation、freshness、当前
   coverage、全仓 Gate B/C/D 与 Draft PR 远端同步均需单独授权/闭环，不能由本修复波次代替。
