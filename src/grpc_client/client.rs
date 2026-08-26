@@ -550,6 +550,7 @@ mod tests {
         outcome_daily_bars,
         upper_limit_pool_review,
         chain_batch,
+        benchmark_bars,
     );
 
     async fn spawn_mock() -> String {

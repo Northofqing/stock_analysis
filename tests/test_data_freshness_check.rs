@@ -13,6 +13,38 @@ fn script_path() -> PathBuf {
     p
 }
 
+fn compliance_script_path() -> PathBuf {
+    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.push("tools/compliance/check.sh");
+    p
+}
+
+fn pr_evidence_script_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/compliance/lib/check_pr_evidence.sh")
+}
+
+fn run_pr_evidence(body: &str) -> std::process::Output {
+    Command::new("bash")
+        .arg(pr_evidence_script_path())
+        .env("PR_BODY", body)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("应能运行 PR 证据检查")
+}
+
+fn run_compliance(args: &[&str], db: Option<&str>) -> std::process::Output {
+    let mut cmd = Command::new("bash");
+    cmd.arg(compliance_script_path())
+        .args(args)
+        .current_dir(env!("CARGO_MANIFEST_DIR"));
+    if let Some(path) = db {
+        cmd.env("STOCK_DB", path);
+    } else {
+        cmd.env_remove("STOCK_DB");
+    }
+    cmd.output().expect("应能运行 compliance 入口")
+}
+
 fn run_with_db(db: Option<&str>) -> std::process::Output {
     let mut cmd = Command::new("bash");
     cmd.arg(script_path());
@@ -145,4 +177,180 @@ fn test_data_freshness_check_exits_zero_on_fresh_fixture() {
         "fresh fixture db 应 PASS (exit 0), stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+// BR-252: PR 只签发离线 Gate C 证据，Release/default 保持真实 freshness fail-closed。
+#[test]
+fn compliance_pr_policy_runs_offline_checks_without_claiming_freshness() {
+    let output = run_compliance(&["--policy", "pr"], Some("/nonexistent/TEST_CODE.db"));
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("policy=pr"));
+    assert!(stdout.contains("check_fake_impl.sh"));
+    assert!(stdout.contains("freshness: NOT RUN (Gate C offline policy)"));
+    assert!(!stdout.contains("===== check_data_freshness.sh ====="));
+}
+
+#[test]
+fn compliance_release_and_default_reject_an_unapproved_database_before_checks() {
+    for args in [&["--policy", "release"][..], &[][..]] {
+        let output = run_compliance(args, Some("/nonexistent/TEST_CODE.db"));
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("====="));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("release STOCK_DB does not exist"));
+    }
+}
+
+#[test]
+fn compliance_release_requires_an_explicit_production_database_identity() {
+    for args in [&["--policy", "release"][..], &[][..]] {
+        let output = run_compliance(args, None);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("====="));
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains("STOCK_DB must explicitly identify the production database"));
+    }
+}
+
+#[test]
+fn compliance_release_rejects_test_clock_and_calendar_overrides() {
+    for (name, value) in [
+        ("FRESHNESS_TODAY", "2026-08-26"),
+        ("TRADING_CALENDAR", "/tmp/TEST_CODE_calendar.csv"),
+    ] {
+        let output = Command::new("bash")
+            .arg(compliance_script_path())
+            .args(["--policy", "release"])
+            .env("STOCK_DB", "/tmp/TEST_CODE_stock.db")
+            .env(name, value)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .expect("应能运行 release compliance 前置检查");
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("====="));
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains("rejects FRESHNESS_TODAY/TRADING_CALENDAR overrides"));
+    }
+}
+
+#[test]
+fn compliance_release_rejects_an_existing_non_production_database() {
+    let fixture = std::env::temp_dir().join(format!(
+        "TEST_CODE_non_production_stock_{}.db",
+        std::process::id()
+    ));
+    std::fs::write(&fixture, []).expect("create non-production database fixture");
+    let output = run_compliance(&["--policy", "release"], fixture.to_str());
+    let _ = std::fs::remove_file(&fixture);
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("====="));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not the fixed production database"));
+}
+
+#[test]
+fn compliance_rejects_unknown_arguments_before_running_checks() {
+    let output = run_compliance(&["--policy", "TEST_CODE_unknown"], None);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("====="));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Usage:"));
+}
+
+#[test]
+fn compliance_workflow_never_backfills_or_claims_release_freshness() {
+    let workflow = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/compliance.yml"),
+    )
+    .expect("read compliance workflow");
+    assert!(workflow.contains("fetch-depth: 0"));
+    assert!(workflow.contains("PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}"));
+    assert!(workflow.contains("bash tools/compliance/check.sh --policy pr"));
+    assert!(!workflow.contains("backfill_daily"));
+    assert!(!workflow.contains("STOCK_DB="));
+}
+
+#[test]
+fn pr_evidence_rejects_legacy_fields_without_gate_c_and_gate_d_provenance() {
+    let body = r#"Refs: spec §10.12
+Data-Redlines: [2.4, 2.7, 2.10]
+OldModules: checker | adopt | deepen
+Threshold-Proof: 90/85 and 80/95
+Business-Rules: BR-252
+Rollback: git revert TEST_CODE"#;
+    let output = run_pr_evidence(body);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Gate-Policy"), "{stderr}");
+    assert!(stderr.contains("Gate-C"), "{stderr}");
+    assert!(stderr.contains("Gate-D"), "{stderr}");
+}
+
+#[test]
+fn pr_evidence_accepts_complete_separate_gate_c_and_gate_d_results() {
+    let body = r#"Refs: spec §10.12
+Data-Redlines: [2.4, 2.7, 2.10]
+OldModules: checker | adopt | deepen
+Threshold-Proof: spec §10.4 and config/design_contracts.toml [coverage]
+Business-Rules: BR-252
+Rollback: git revert TEST_CODE
+Gate-Policy: PR=core-patch90+other-patch85+ratchet; Release=global80+core95+freshness+live
+Bootstrap-Baseline: true
+Baseline-Source-SHA: f05f506e744898319b6ba059580ab17bf65004cf
+Baseline-Global: 201256/258810
+Baseline-Core: 157635/202935
+Coverage-Tools: rustc=1.95.0; LLVM=22.1.2; cargo-llvm-cov=0.8.7
+Gate-C: PASS
+Gate-D: Release Blocked"#;
+    let output = run_pr_evidence(body);
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("PASS"));
+}
+
+#[test]
+fn pr_evidence_rejects_baseline_values_that_do_not_match_the_contract() {
+    let body = r#"Refs: spec §10.12
+Data-Redlines: [2.4, 2.7, 2.10]
+OldModules: checker | adopt | deepen
+Threshold-Proof: spec §10.4 and config/design_contracts.toml [coverage]
+Business-Rules: BR-252
+Rollback: git revert TEST_CODE
+Gate-Policy: PR=core-patch90+other-patch85+ratchet; Release=global80+core95+freshness+live
+Bootstrap-Baseline: true
+Baseline-Source-SHA: f05f506e744898319b6ba059580ab17bf65004cf
+Baseline-Global: 1/1
+Baseline-Core: 157635/202935
+Coverage-Tools: rustc=1.95.0; LLVM=22.1.2; cargo-llvm-cov=0.8.7
+Gate-C: PASS
+Gate-D: Release Blocked"#;
+    let output = run_pr_evidence(body);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not match contract"));
+}
+
+#[test]
+fn pr_evidence_bootstrap_flag_must_match_the_base_contract_state() {
+    let body = r#"Refs: spec §10.12
+Data-Redlines: [2.4, 2.7, 2.10]
+OldModules: checker | adopt | deepen
+Threshold-Proof: spec §10.4 and config/design_contracts.toml [coverage]
+Business-Rules: BR-252
+Rollback: git revert TEST_CODE
+Gate-Policy: PR=core-patch90+other-patch85+ratchet; Release=global80+core95+freshness+live
+Bootstrap-Baseline: false
+Baseline-Source-SHA: f05f506e744898319b6ba059580ab17bf65004cf
+Baseline-Global: 201256/258810
+Baseline-Core: 157635/202935
+Coverage-Tools: rustc=1.95.0; LLVM=22.1.2; cargo-llvm-cov=0.8.7
+Gate-C: PASS
+Gate-D: Release Blocked"#;
+    let output = Command::new("bash")
+        .arg(pr_evidence_script_path())
+        .env("PR_BODY", body)
+        .env("PR_BASE_SHA", "c6024e5")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("应能核对 base coverage contract");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("Bootstrap-Baseline 与 base contract 状态不一致"));
 }

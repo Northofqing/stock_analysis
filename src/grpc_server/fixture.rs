@@ -213,6 +213,9 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
                 r#"{"batch_id":"fixture-cb","content_hash":"h1","trading_date":"2026-08-15","calculation_version":"v1","taxonomy_version":"t1","inputs":[{"input_id":"i1","ordinal":1,"capability":"limit-up","provider":"tdx","source":"tdx","source_at":"2026-08-15T10:00:00+08:00","observed_at":"2026-08-15T10:00:00+08:00","source_batch_id":"b1","source_batch_hash":"h1","content_hash":"h1"}],"chains":[{"chain_id":"c1","canonical_board_id":"BK0475","board_name":"白酒","upper_limit_count":3,"continuous_count":2,"members":[{"instrument_id":"600519","security_name":"贵州茅台","source_event_id":"e1","streak":2}]}],"rejections":[]}"#,
             )],
         )),
+        // BR-251 carries a real BR-159 receipt; canned evidence must never
+        // masquerade as an audited benchmark acquisition.
+        Operation::BenchmarkBars => None,
         // M3 扩展 (P4): 剩余网关钩子的 op fixture (字段形状与 convert.rs 解析一致)。
         Operation::DragonTiger => Some(resp(
             "fixture-dt",
@@ -345,5 +348,15 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
             )],
         )),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn benchmark_bars_has_no_canned_fixture_receipt() {
+        assert!(fixture_response(Operation::BenchmarkBars, "market.benchmark_bars", 1).is_none());
     }
 }

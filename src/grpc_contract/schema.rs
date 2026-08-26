@@ -2,7 +2,7 @@
 //! 调用方遇到未知 schema/version 必须停止解析, 不能忽略或猜字段)。
 //!
 //! 初始以 data_gateway 返回类型的 JSON 为准, 冻结 24 个生产 op,
-//! M1 起扩展至 38 个 (含本地扩展 op, 见 ops.rs implemented_operations);
+//! 后续扩展至 40 个（含本地扩展 op，见 ops.rs implemented_operations）；
 //! schema 名约定: "<域>.<数据族>", 版本从 1 起。
 use crate::grpc_client::pb::magic::market::v1::Operation;
 
@@ -212,6 +212,12 @@ const SCHEMAS: &[OpSchema] = &[
         schema_name: "market.chain_batch",
         schema_version: 1,
     },
+    // BR-251: 指数专用历史基准批次；wire 绑定请求、批次证据与真实 BR-159 receipt。
+    OpSchema {
+        operation: Operation::BenchmarkBars,
+        schema_name: "market.benchmark_bars",
+        schema_version: 1,
+    },
 ];
 
 pub fn schema_for(op: Operation) -> Option<&'static OpSchema> {
@@ -224,11 +230,18 @@ mod tests {
 
     #[test]
     fn every_implemented_op_has_frozen_schema() {
-        // 39 个已实现 op 全部有 schema (M1 扩展 + M4c ChainBatch)。
-        assert_eq!(SCHEMAS.len(), 39);
+        // 40 个已实现 op 全部有 schema (M1 扩展 + M4c ChainBatch + BR-251 BenchmarkBars)。
+        assert_eq!(SCHEMAS.len(), 40);
         for op in crate::grpc_contract::ops::implemented_operations() {
             assert!(schema_for(op).is_some(), "op {op:?} 缺 schema");
         }
+    }
+
+    #[test]
+    fn benchmark_bars_uses_frozen_v1_schema() {
+        let schema = schema_for(Operation::BenchmarkBars).expect("BenchmarkBars schema");
+        assert_eq!(schema.schema_name, "market.benchmark_bars");
+        assert_eq!(schema.schema_version, 1);
     }
 
     #[test]

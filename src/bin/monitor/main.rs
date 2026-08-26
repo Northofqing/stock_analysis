@@ -4060,11 +4060,13 @@ mod tests_br238_opening_readiness {
             .expect("production source precedes post-session tests");
         let blocking_call = ["external_static_opening_", "readiness().await"].concat();
         let resident_spawn = ["tokio::spawn(opening_static_", "readiness_loop())"].concat();
+        let p01_resident = ["p01::p01_", "scheduler_loop()"].concat();
+        let news_resident = ["news_monitor_loop(selection_", "v2_enabled)"].concat();
         assert!(!production.contains(&blocking_call));
         assert_eq!(production.matches(&resident_spawn).count(), 1);
-        assert!(production.contains("p01::p01_scheduler_loop()"));
+        assert!(production.contains(&p01_resident));
         assert!(production.contains("monitor_loop()"));
-        assert!(production.contains("news_monitor_loop(selection_v2_enabled)"));
+        assert!(production.contains(&news_resident));
         assert!(production.contains("data_mode_monitor_loop()"));
         assert!(production.contains("opening_readiness=not_applicable mode=test"));
         let forbidden_keepalive = ["off_session_quote_", "keepalive_loop"].concat();
@@ -8545,28 +8547,28 @@ async fn monitor_loop() {
                     match (|| -> Result<String, String> {
                         let quotes = market_data::fetch_position_quotes()?;
                         // 生产价格映射 (build_price_map 是 cfg(test) 辅助, 生产内联同构构造)
-                        let prices: HashMap<String, f64> = quotes
-                            .iter()
-                            .map(|q| (q.code.clone(), q.price))
-                            .collect();
+                        let prices: HashMap<String, f64> =
+                            quotes.iter().map(|q| (q.code.clone(), q.price)).collect();
                         let daily = compute_daily(today, &prices)?;
                         persist_daily(&daily)?;
                         let window = compute_window(today, 30, &prices)?;
                         let md = render_full_markdown(&daily, &window);
                         std::fs::create_dir_all("data/attribution")
                             .map_err(|e| format!("create data/attribution: {e}"))?;
-                        std::fs::write(format!("data/attribution/{}.md", today.format("%Y-%m-%d")), md)
-                            .map_err(|e| format!("write attribution md: {e}"))?;
+                        std::fs::write(
+                            format!("data/attribution/{}.md", today.format("%Y-%m-%d")),
+                            md,
+                        )
+                        .map_err(|e| format!("write attribution md: {e}"))?;
                         Ok(render_summary(&daily, &window))
                     })() {
                         Ok(text) => {
-                            let outcome = push_governor_v3(&text, PushKind::AttributionDaily, None).await;
-                            log::info!(
-                                "[attribution] 15:05 归因推送完成: {:?}",
-                                outcome
-                            );
-                            *ATTRIBUTION_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner()) =
-                                Some(today);
+                            let outcome =
+                                push_governor_v3(&text, PushKind::AttributionDaily, None).await;
+                            log::info!("[attribution] 15:05 归因推送完成: {:?}", outcome);
+                            *ATTRIBUTION_LAST_RUN
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = Some(today);
                         }
                         Err(e) => {
                             log::warn!("[attribution] 15:05 归因计算失败 (允许 30s 后重试): {e}");
@@ -8578,13 +8580,13 @@ async fn monitor_loop() {
             // 窗口同 15:05-15:20; 当日一次 (G5B_LAST_RUN 成功路径才记, 失败下 tick 重试);
             // 无告警 / 无模型 → 出声跳过。上限 DEEP_ATTRIBUTION_MAX_EVENTS 条 (成本护栏)。
             if now.hour() == 15 && (5..=20).contains(&now.minute()) {
+                use stock_analysis::llm::registry::LlmRegistry;
                 use stock_analysis::monitor::alert_log::read_today_records;
                 use stock_analysis::monitor::attribution_deep::{
                     append_deep_attribution_row, render_deep_attribution_summary,
                     top_events_for_deep, DeepAttributionAnalyzer, DeepAttributionRequest,
                     DeepAttributionRow, DEEP_ATTRIBUTION_MAX_EVENTS,
                 };
-                use stock_analysis::llm::registry::LlmRegistry;
                 static G5B_LAST_RUN: std::sync::Mutex<Option<chrono::NaiveDate>> =
                     std::sync::Mutex::new(None);
                 let today = now.date_naive();
@@ -8596,9 +8598,7 @@ async fn monitor_loop() {
                 if !g5b_done {
                     let records = read_today_records();
                     if records.is_empty() {
-                        log::info!(
-                            "[g5b] 深链归因: 今日无告警记录, 跳过 (当日仅此一次)"
-                        );
+                        log::info!("[g5b] 深链归因: 今日无告警记录, 跳过 (当日仅此一次)");
                         *G5B_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some(today);
                     } else {
                         let events = top_events_for_deep(records, DEEP_ATTRIBUTION_MAX_EVENTS);
@@ -8650,20 +8650,17 @@ async fn monitor_loop() {
                                         row.elapsed_ms
                                     );
                                     let summary = render_deep_attribution_summary(&row);
-                                    let outcome = push_governor_v3(
-                                        &summary,
-                                        PushKind::G5bAttribution,
-                                        None,
-                                    )
-                                    .await;
-                                    log::info!(
-                                        "[g5b] 深链归因推送完成: {:?}",
-                                        outcome
-                                    );
+                                    let outcome =
+                                        push_governor_v3(&summary, PushKind::G5bAttribution, None)
+                                            .await;
+                                    log::info!("[g5b] 深链归因推送完成: {:?}", outcome);
                                     done += 1;
                                 }
                                 Err(e) => {
-                                    log::warn!("[g5b] 深链归因分析失败 ({}): {e}", request.record.code);
+                                    log::warn!(
+                                        "[g5b] 深链归因分析失败 ({}): {e}",
+                                        request.record.code
+                                    );
                                     failed += 1;
                                 }
                             }

@@ -9,19 +9,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Install sqlite3 + python3
         run: |
           sudo apt-get update
           sudo apt-get install -y sqlite3 python3
-      - name: Build live daily-data freshness evidence
-        run: |
-          mkdir -p data
-          STOCK_DB="$PWD/data/stock_analysis.db" \
-            cargo run --quiet --bin backfill_daily -- 000001
-      - name: AGENTS.md 合规门禁
-        run: bash tools/compliance/check.sh
+      # BR-252: hosted PR CI owns offline Gate C evidence, not production freshness.
+      - name: AGENTS.md Gate C 离线合规门禁
+        run: bash tools/compliance/check.sh --policy pr
       - name: 单元测试 + e2e
         # 修复 C-2 (2026-06-29 codex review): e2e_prediction_verify 是 R-1 critical 修复的回归门禁,
         # 必须进 CI. 注意: 测试用 TEST_CODE_001/002 + WAL + busy_timeout, 与其他 e2e 可并行.
@@ -43,6 +41,7 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           bash tools/compliance/lib/check_pr_evidence.sh
           BASE="${{ github.event.pull_request.base.sha }}"

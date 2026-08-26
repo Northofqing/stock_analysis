@@ -15,5 +15,5 @@ Mandatory constraints:
 - Missing fields remain absent and failures remain explicit.
 - Test and live symbols, accounts, databases, logs, and notifications stay isolated.
 - Register deduplication, mutex, filter, sort, and limit logic in `docs/business_rules.md` before implementation.
-- Run format, strict Clippy, all tests, compliance, coverage, and required live-data validation before declaring merge readiness.
-- Keep the PR Draft and do not merge while any Gate D requirement is missing.
+- Run format, strict Clippy, all tests, offline compliance, patch coverage, and the coverage ratchet before declaring Gate C merge readiness.
+- Keep the PR Draft and do not merge while any Gate C requirement is missing. Missing Gate D production freshness/live evidence blocks release and deployment, not a Gate C-complete merge.

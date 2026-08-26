@@ -177,6 +177,11 @@ Do not design infrastructure layers (buses, registries, replay, ACK protocols) i
 
 ## Configuration
 
+Gate C is the merge boundary: it requires offline compliance, core patch coverage at least 90%,
+other production patch coverage at least 85%, and a non-decreasing global/core baseline. Gate D is
+the release boundary and retains global 80%, core 95%, production freshness, live evidence, and
+independent review. See BR-252 and `docs/superpowers/specs/2026-08-02-gate-d-coverage-closure-design.md` §10.
+
 - `.env`: `STOCK_LIST` (watchlist codes), `WECHAT_SEND_SCRIPT`, `DATABASE_PATH`
 - Runtime TOML inputs are exactly `config/strategy.toml` and `config/chain.toml`, read once by `config::load_all()` during monitor startup; signal hot reload is not implemented.
 - A missing or invalid projection follows its registered typed failure/retention semantics; production consumers must not invent a `const`, disk, embedded, or empty-result fallback.

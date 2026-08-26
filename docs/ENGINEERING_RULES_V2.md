@@ -64,8 +64,10 @@ Every change follows Gate A through Gate D:
 - Gate A: pre-flight plus a reviewable design in `docs/`, including data flow, failures,
   rollback, and old-module disposition.
 - Gate B: implementation with explicit failure paths and tests.
-- Gate C: formatting, Clippy with warnings denied, full tests, and
-  `bash tools/compliance/check.sh`.
+- Gate C: formatting, Clippy with warnings denied, full tests,
+  `bash tools/compliance/check.sh --policy pr`, core changed executable-line coverage at least 90%,
+  other changed production executable-line coverage at least 85%, and no global/core coverage
+  regression below the audited baseline. Gate C is the PR merge gate.
 - Gate D: global line coverage at least 80%, core trading/data paths at least 95%, live-data or
   isolated protocol evidence as appropriate, independent review, and complete PR evidence.
 
@@ -75,14 +77,16 @@ The required baseline commands are:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features -- --test-threads=1
-bash tools/compliance/check.sh
+bash tools/compliance/check.sh --policy pr
 cargo llvm-cov --workspace --all-features --json --output-path target/coverage/coverage.json -- --test-threads=1
-python3 tools/coverage/check_thresholds.py target/coverage/coverage.json
+cargo llvm-cov report --lcov --output-path target/coverage/lcov.info
+python3 tools/coverage/check_thresholds.py --policy pr --report target/coverage/coverage.json --lcov target/coverage/lcov.info --base-ref <merge-base>
 cargo build --release --bin monitor
 ```
 
-Do not mark a task complete or merge its PR while any mandatory gate, independent Critical or
-Important review finding, data-freshness check, or required PR field remains open.
+Do not merge a PR while any Gate C requirement, independent Critical or Important review finding,
+or required PR field remains open. Do not release or deploy while any Gate D requirement, production
+data-freshness check, live evidence, or auditor sign-off remains open.
 
 ## 6. Business-rule changes
 

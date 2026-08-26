@@ -2,7 +2,7 @@
 //! - 上游合同: client-bundle/market.proto (用户维护, 原样引用);
 //! - 本地扩展 / 旧 bundle 兼容声明:
 //!   * 当前上游已发布 Operation/RPC 56-60；旧 bundle 缺失时仍按精确声明补入;
-//!   * Operation 61 CHAIN_BATCH 仍仅供本地 grpc_market_server / monitor 桥使用;
+//!   * Operation 61 CHAIN_BATCH 与 62 BENCHMARK_BARS 仍仅供本地 grpc_market_server 使用;
 //!   * QueryResponse.source = 11 (证据链 source 透传, 上游用字段 10 做 diagnostic_blocker);
 //!   * 当前上游已发布前 5 个派生 RPC；ChainBatch RPC 仍为本地扩展。
 //!
@@ -43,6 +43,8 @@ const EXT_OPERATIONS: &[&str] = &[
     "  OPERATION_UPPER_LIMIT_POOL_REVIEW = 60;",
     // M4c: A-10 题材链完整 batch (monitor 复盘消费, 44/45 视图不可重建 VisibleChainBatch)。
     "  OPERATION_CHAIN_BATCH = 61;",
+    // BR-251: 指数专用历史基准批次；不得复用 equity HistoricalBars/TechnicalBars。
+    "  OPERATION_BENCHMARK_BARS = 62;",
 ];
 
 const EXT_QUERY_RESPONSE_FIELD: &[&str] = &[
@@ -58,6 +60,22 @@ const EXT_RPCS: &[&str] = &[
     "  rpc OutcomeDailyBars(QueryRequest) returns (QueryResponse);",
     "  rpc UpperLimitPoolReview(QueryRequest) returns (QueryResponse);",
     "  rpc ChainBatch(QueryRequest) returns (QueryResponse);",
+    "  rpc BenchmarkBars(QueryRequest) returns (QueryResponse);",
+];
+
+const EXT_BENCHMARK_ERROR_DETAIL: &[&str] = &[
+    "",
+    "// 本地扩展: BR-251 服务端审计结果分类；客户端不得从 reason_code 反推。",
+    "enum BenchmarkAuditState {",
+    "  BENCHMARK_AUDIT_STATE_UNSPECIFIED = 0;",
+    "  BENCHMARK_AUDIT_STATE_PERSISTED = 1;",
+    "  BENCHMARK_AUDIT_STATE_APPEND_FAILED = 2;",
+    "}",
+    "message BenchmarkErrorDetail {",
+    "  ErrorDetail error = 1;",
+    "  string audit_outcome = 2;",
+    "  BenchmarkAuditState audit_state = 3;",
+    "}",
 ];
 
 fn merge_local_extensions(content: &str) -> String {
@@ -86,6 +104,12 @@ fn merge_local_extensions(content: &str) -> String {
         lines.splice(end..end, missing_rpcs);
     } else {
         panic!("market.proto 缺少 service MarketDataService");
+    }
+    if !lines
+        .iter()
+        .any(|line| line.trim() == "message BenchmarkErrorDetail {")
+    {
+        lines.extend(EXT_BENCHMARK_ERROR_DETAIL.iter().map(ToString::to_string));
     }
     lines.join("\n") + "\n"
 }

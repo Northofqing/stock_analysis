@@ -3,7 +3,7 @@ use std::path::Path;
 
 const RELEASE_REVISION: &str = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e";
 const OLD_RELEASE_REVISION: &str = "7b870ee25e59f250ba847922ffa3d34cdd07e674";
-const HISTORICAL_BOARD_REGISTRY_REVISION: &str = "5f1ce93656a55854c844065390520cd4aecd9a14";
+const OLD_BOARD_REGISTRY_REVISION: &str = "5f1ce93656a55854c844065390520cd4aecd9a14";
 const MAGIC_REPOSITORY: &str = "https://github.com/Northofqing/magic-market-data-rs.git";
 const DIRECT_MAGIC_CRATES: [&str; 14] = [
     "magic-baidu-rs",
@@ -168,18 +168,18 @@ fn br192_magic_market_release_revision_is_one_atomic_identity() {
         "global-news evidence must bind the released upstream identity"
     );
 
-    // The checked-in board registry is immutable capture evidence from the
-    // previous audited revision. It must not be relabelled as the runtime
-    // revision; the current schema rejects that mismatch until a new board
-    // audit artifact is generated.
-    let expected_registry_field =
-        format!("\"upstream_revision\":\"{HISTORICAL_BOARD_REGISTRY_REVISION}\"");
+    // The checked-in board registry was regenerated as a complete audited
+    // artifact for this release. Runtime admission rejects any artifact whose
+    // upstream revision differs from the frozen release identity.
+    let expected_registry_field = format!("\"upstream_revision\":\"{RELEASE_REVISION}\"");
     assert!(
         registry.contains(&expected_registry_field),
-        "checked-in board registry must retain its captured upstream identity"
+        "checked-in board registry must bind the released upstream identity"
     );
     assert!(
-        !registry.contains(&format!("\"upstream_revision\":\"{RELEASE_REVISION}\"")),
-        "historical board evidence must not be relabelled as the runtime revision"
+        !registry.contains(&format!(
+            "\"upstream_revision\":\"{OLD_BOARD_REGISTRY_REVISION}\""
+        )),
+        "superseded board registry revision must not remain in release evidence"
     );
 }

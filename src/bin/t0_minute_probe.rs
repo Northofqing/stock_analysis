@@ -1,4 +1,5 @@
-//! Raw TDX 5-min bars probe for today — reveals whether morning session bars
+//! BR-164 reviewed operator diagnostic for raw TDX 5-min bars. It reveals whether
+//! morning session bars
 //! (09:35-11:30) are present in the KLINE_5MIN response during trading.
 //! Usage: cargo run --release --bin t0_minute_probe -- <code>
 #[cfg(feature = "magic-gateway")]
@@ -7,7 +8,9 @@ fn main() {
     use magic_tdx_rs::TdxHqClient;
     use std::time::Instant;
 
-    let code = std::env::args().nth(1).unwrap_or_else(|| "600396".to_string());
+    let code = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "600396".to_string());
     let market = if code.starts_with('6') || code.starts_with('9') {
         1u8
     } else {
@@ -35,9 +38,9 @@ fn main() {
     // 用生产解码器 (five_minute_from_raw) 还原真实 at, 只打印今天 + 最近历史
     let decoded = bars
         .iter()
-        .map(|bar| stock_analysis::data_gateway::magic_tdx_t0::five_minute_from_raw(
-            &code, bar.clone()
-        ))
+        .map(|bar| {
+            stock_analysis::data_gateway::magic_tdx_t0::five_minute_from_raw(&code, bar.clone())
+        })
         .collect::<Result<Vec<_>, _>>();
     match decoded {
         Ok(rows) => {

@@ -13,9 +13,14 @@
 # 后续 PR 会扩展:
 #   - check_*.sh (PR-5+)
 #
+# BR-252 分层策略:
+#   pr      = Gate C 离线检查；不签发生产 freshness 结论
+#   release = Gate D 完整检查；包含生产 freshness（默认，保持兼容）
+#
 # 用法:
-#   bash tools/compliance/check.sh             # 跑全部检查, 失败立即返回
-#   bash tools/compliance/check.sh || exit 1   # CI 集成
+#   bash tools/compliance/check.sh
+#   bash tools/compliance/check.sh --policy pr
+#   bash tools/compliance/check.sh --policy release
 #
 # 退出码:
 #   0 = 全部通过
@@ -23,8 +28,67 @@
 
 set -uo pipefail
 
+POLICY="release"
+if [ "$#" -eq 0 ]; then
+    :
+elif [ "$#" -eq 2 ] && [ "$1" = "--policy" ]; then
+    case "$2" in
+        pr|release) POLICY="$2" ;;
+        *)
+            echo "Usage: bash tools/compliance/check.sh [--policy pr|release]" >&2
+            exit 2
+            ;;
+    esac
+else
+    echo "Usage: bash tools/compliance/check.sh [--policy pr|release]" >&2
+    exit 2
+fi
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LIB_DIR="$REPO_ROOT/tools/compliance/lib"
+
+release_preflight() {
+    if [ "${STOCK_DB+x}" != "x" ] || [ -z "$STOCK_DB" ]; then
+        echo "[compliance] ERROR: STOCK_DB must explicitly identify the production database" >&2
+        exit 2
+    fi
+    case "$STOCK_DB" in
+        /*) ;;
+        *)
+            echo "[compliance] ERROR: release STOCK_DB must be an absolute path" >&2
+            exit 2
+            ;;
+    esac
+    if [ "${FRESHNESS_TODAY+x}" = "x" ] || [ "${TRADING_CALENDAR+x}" = "x" ]; then
+        echo "[compliance] ERROR: release rejects FRESHNESS_TODAY/TRADING_CALENDAR overrides" >&2
+        exit 2
+    fi
+    if [ ! -f "$STOCK_DB" ]; then
+        echo "[compliance] ERROR: release STOCK_DB does not exist: $STOCK_DB" >&2
+        exit 2
+    fi
+    if [ "$STOCK_DB" != "$REPO_ROOT/data/stock_analysis.db" ]; then
+        echo "[compliance] ERROR: release STOCK_DB is not the fixed production database" >&2
+        exit 2
+    fi
+    command -v python3 >/dev/null 2>&1 || {
+        echo "[compliance] ERROR: python3 is required to verify STOCK_DB identity" >&2
+        exit 2
+    }
+    local actual expected
+    actual="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$STOCK_DB")"
+    expected="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$REPO_ROOT/data/stock_analysis.db")"
+    if [ "$actual" != "$expected" ]; then
+        echo "[compliance] ERROR: release STOCK_DB is not the fixed production database" >&2
+        exit 2
+    fi
+    STOCK_DB="$actual"
+    export STOCK_DB
+}
+
+if [ "$POLICY" = "release" ]; then
+    release_preflight
+fi
 
 OVERALL_EXIT=0
 
@@ -43,8 +107,15 @@ run_check() {
     echo
 }
 
+echo "[compliance] policy=$POLICY"
+
 run_check "check_fake_impl.sh"
-run_check "check_data_freshness.sh"
+if [ "$POLICY" = "release" ]; then
+    run_check "check_data_freshness.sh"
+else
+    echo "[compliance] freshness: NOT RUN (Gate C offline policy)"
+    echo
+fi
 run_check "check_design_contradiction.sh"
 run_check "check_business_rules.sh"
 run_check "check_backfill_failure_propagation.sh"

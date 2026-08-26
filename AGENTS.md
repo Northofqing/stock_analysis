@@ -9,7 +9,7 @@
 ## 0. General Principles
 
 - **MUST** Every data red line in Part 2 must be a Definition of Done (DoD) checkpoint for every stage of the development flow (Part 1); the two are inseparable.
-- **MUST** All process outputs must be tracked in Git via PR; the PR checklist must be fully ticked before merge.
+- **MUST** All process outputs must be tracked in Git via PR. Gate C fields must be fully ticked before merge; Gate D fields must be fully ticked before release/deployment.
 - **MUST** In any rule conflict, the priority is: data safety > fund safety > process compliance > development efficiency.
 - **MAY** Emergency situations may use the "Controlled Exception Path" (see Part 3), but must leave audit trails and conduct post-mortems.
 
@@ -17,23 +17,23 @@
 
 ## Part 1: Development Flow
 
-Execute in order. If the previous step has not reached its DoD, do not proceed. Each step's DoD serves as its merge gate.
+Execute in order. If the previous step has not reached its DoD, do not proceed. Gate C is the merge gate; Gate D is the release/deployment gate.
 
 ### 1.1 Flow Steps and Completion Criteria
 
-| Step | Description | DoD (must satisfy before merge) |
+| Step | Description | DoD |
 |---|---|---|
 | 0. Pre-flight | Read `AGENTS.md` + `docs/ENGINEERING_RULES_V2.md` + `.github/copilot-instructions.md` + `CLAUDE.md`. Resolve conflicts by precedence. | Pre-flight plan output (impacted paths, triggered rule IDs, validation, rollback) |
 | 1. Architecture | Document design (data flow, failure modes, rollback, old module relations) in `docs/`. | Design doc exists and reviewable; blocking objections = 0 |
 | 2. Implementation | Code + explicit failure handling. No mock data in production paths. | `cargo fmt --check` + `cargo clippy -D warnings` + `cargo test` all pass; failure paths exercisable |
-| 3. Compliance | All compliance checks pass. | `bash tools/compliance/check.sh` passes (data freshness, fake impl, design contradiction, BR registration) |
-| 4. Release | Unit coverage ≥ 80%, core trading/data links ≥ 95%, regression + live data validation pass, audit fields traceable. | Coverage report + auditor sign-off |
+| 3. Compliance / Merge | Gate C checks pass: offline compliance, core patch coverage ≥ 90%, other production patch coverage ≥ 85%, and global/core coverage do not regress below the audited baseline. | `bash tools/compliance/check.sh --policy pr` and `python3 tools/coverage/check_thresholds.py --policy pr ...` pass; PR evidence complete before merge |
+| 4. Release | Unit coverage ≥ 80%, core trading/data links ≥ 95%, full compliance including production freshness, regression + live data validation pass, audit fields traceable. | Release coverage/compliance reports + live evidence + auditor sign-off before deployment |
 
 ### 1.2 Gate Progression (Gate A → B → C → D)
 
 - **Gate A (Design Ready)**: Design intent is explicit and traceable.
 - **Gate B (Implementation Ready)**: Implementation + explicit failure handling.
-- **Gate C (Compliance Ready)**: All compliance checks pass (blocking).
+- **Gate C (Merge Ready)**: Format, strict Clippy, full tests, offline compliance, patch coverage and the coverage ratchet pass (blocking for merge).
 - **Gate D (Release Ready)**: Tests/coverage/evidence complete.
 
 If a gate fails, fix and retry from the failed gate. Do not skip.
@@ -92,7 +92,7 @@ Bad data is treated as a failure: explicit error, not silent computation with ba
 - Tables like `stock_daily` **MUST** have `MAX(date)` no more than 1 trading day behind (excluding holidays).
 - **MUST** be checked by `tools/compliance/lib/check_data_freshness.sh`.
 - **MUST** fix on FAIL: run `bash tools/one_shot/backfill_daily.sh`.
-- A freshness FAIL is a strict merge blocker.
+- A freshness FAIL is a strict release/deployment blocker. A PR runner without the production database must run the offline Gate C policy and must not claim freshness PASS.
 
 ### 2.5 Test vs Live Isolation
 

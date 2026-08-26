@@ -11,9 +11,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Install stable Rust with coverage tools
-        uses: dtolnay/rust-toolchain@stable
+      # BR-252: coverage identity is pinned to config/design_contracts.toml.
+      - name: Install pinned Rust with coverage tools
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: llvm-tools-preview
 
@@ -21,20 +24,53 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.8.7
+
+      - name: Resolve coverage diff base
+        id: coverage-base
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            DIFF_BASE_SHA="$PR_BASE_SHA"
+          else
+            DIFF_BASE_SHA="$PUSH_BEFORE_SHA"
+          fi
+          git cat-file -e "${DIFF_BASE_SHA}^{commit}"
+          echo "sha=$DIFF_BASE_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Collect complete workspace coverage
         run: |
           mkdir -p target/coverage
           cargo llvm-cov --workspace --all-features --json \
             --output-path target/coverage/coverage.json -- --test-threads=1
+          cargo llvm-cov report --lcov --output-path target/coverage/lcov.info
 
-      - name: Enforce AGENTS coverage (global 80%, core 95%)
-        run: python3 tools/coverage/check_thresholds.py target/coverage/coverage.json
+      - name: Enforce BR-252 Gate C coverage
+        env:
+          DIFF_BASE_SHA: ${{ steps.coverage-base.outputs.sha }}
+        run: |
+          set -euo pipefail
+          BOOTSTRAP_ARGS=()
+          if ! git show "${DIFF_BASE_SHA}:config/design_contracts.toml" | grep -qx '\[coverage\]'; then
+            BOOTSTRAP_ARGS+=(--bootstrap-baseline)
+          fi
+          python3 tools/coverage/check_thresholds.py \
+            --policy pr \
+            --report target/coverage/coverage.json \
+            --lcov target/coverage/lcov.info \
+            --base-ref "$DIFF_BASE_SHA" \
+            "${BOOTSTRAP_ARGS[@]}"
 
       - name: Upload coverage artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report
-          path: target/coverage/coverage.json
+          path: |
+            target/coverage/coverage.json
+            target/coverage/lcov.info

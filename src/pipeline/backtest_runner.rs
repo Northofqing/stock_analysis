@@ -9,7 +9,10 @@ use anyhow::{Context, Result};
 use log::{info, warn};
 
 use super::{AnalysisPipeline, AnalysisResult};
-use crate::data_gateway::{BatchEvidence, HistoricalBarsGateway};
+use crate::data_gateway::{
+    BatchEvidence, BenchmarkError, BenchmarkReader, BenchmarkRequest, HistoricalBarsGateway,
+};
+use crate::database::benchmark_segments::BenchmarkManifestRef;
 use crate::strategy::bollinger_zscore::{
     BollingerZScoreBacktest, BollingerZScoreConfig, BollingerZScoreResult,
 };
@@ -22,6 +25,7 @@ use crate::strategy::rsi::{RsiBacktest, RsiConfig, RsiResult};
 
 type StockHistory = (String, String, Vec<crate::data_provider::KlineData>);
 type HistorySplit = (String, Vec<StockHistory>, Vec<StockHistory>);
+const BACKTEST_BENCHMARK_UNAVAILABLE_REASON: &str = "BenchmarkSegmentUnavailable";
 
 impl AnalysisPipeline {
     fn save_backtest_report(&self, content: &str, filename: &str) -> Result<PathBuf> {
@@ -317,71 +321,34 @@ impl AnalysisPipeline {
         Self::run_multi_factor_on_history(history, factor_cfg).map(|(s, _)| s)
     }
 
-    /// 抓取沪深300基准日线，构建 BenchmarkSeries（date->close）。
-    /// 失败一律返回 None，绝不编造基准数据。
-    async fn fetch_benchmark_series(&self, days: usize) -> Option<BenchmarkSeries> {
-        self.fetch_benchmark_series_with_code(
-            crate::strategy::core::benchmark_codes::HS300,
-            "沪深300",
-            days,
-        )
-        .await
+    /// Project a benchmark only from the caller's exact, persisted BR-251 manifest.
+    #[allow(
+        dead_code,
+        reason = "R-43 requires the manifest projection seam before scheduler injection is authorized"
+    )]
+    fn project_benchmark_manifest(
+        reader: &BenchmarkReader<'_>,
+        manifest: &BenchmarkManifestRef,
+        request: &BenchmarkRequest,
+        name: &str,
+    ) -> Result<BenchmarkSeries, BenchmarkError> {
+        let snapshot = reader.read_exact(&manifest.manifest_hash, request)?;
+        if &snapshot.manifest != manifest {
+            return Err(BenchmarkError::FailedIntegrity {
+                code: "benchmark_manifest_ref_mismatch",
+            });
+        }
+        reader.to_daily_series(&snapshot, name)
     }
 
-    /// 修复 P2.9: 支持多个基准 (按 strategy_kind 推荐)
-    /// 量化分析师建议: 不同策略用不同基准, 不要所有都用沪深300
-    async fn fetch_benchmark_series_with_code(
-        &self,
-        code: &str,
-        name: &str,
-        days: usize,
-    ) -> Option<BenchmarkSeries> {
-        // 修复 B-003: benchmark 7000天拉取可能超时 → 分页拉取
-        // 之前: 单次请求 7000 天, 可能超时被 fail-through
-        // 现在: 365 天/页, 最多 20 页
-        let chunk_size = 365usize;
-        let max_pages = days.div_ceil(chunk_size).min(20);
-        let mut all_closes = std::collections::HashMap::new();
-
-        for page in 0..max_pages {
-            let chunk_days = (days - page * chunk_size).min(chunk_size);
-            if chunk_days == 0 {
-                break;
-            }
-            match self.get_backtest_daily_data(code, chunk_days).await {
-                Ok((data, _)) if !data.is_empty() => {
-                    for k in &data {
-                        all_closes.insert(k.date, k.close);
-                    }
-                }
-                _ => {
-                    warn!(
-                        "基准 {}({}) 第 {} 页数据获取失败, 继续下一页",
-                        name,
-                        code,
-                        page + 1
-                    );
-                    // 不中断, 继续下一页
-                }
-            }
-        }
-
-        if all_closes.is_empty() {
-            warn!(
-                "基准 {}({}) 全部 {} 页数据获取均失败, 回测报告将标注'基准数据缺失'",
-                name, code, max_pages
-            );
-            None
-        } else {
-            info!(
-                "✓ 基准 {} ({}) 已加载 {} 个交易日 ({} 页)",
-                name,
-                code,
-                all_closes.len(),
-                max_pages
-            );
-            Some(BenchmarkSeries::new(name, all_closes))
-        }
+    /// Current wrappers have no explicit manifest/request input. Fail visibly
+    /// instead of guessing a provider, database, date range, or partial series.
+    fn benchmark_segment_unavailable() -> Option<BenchmarkSeries> {
+        warn!(
+            "[BR-251][{}] 基准缺失",
+            BACKTEST_BENCHMARK_UNAVAILABLE_REASON
+        );
+        None
     }
 
     /// 将组合的每日净值与交易明细落盘到 reports/details/ 作为审计留痕。
@@ -650,7 +617,7 @@ impl AnalysisPipeline {
             anyhow::bail!("多因子回测需要至少3只股票，实际仅 {} 只", stocks_data.len());
         }
 
-        let benchmark = self.fetch_benchmark_series(60).await;
+        let benchmark = Self::benchmark_segment_unavailable();
         let (summary, base_state, report) =
             Self::run_multi_factor_resolved(&stocks_data, benchmark)?;
         let date_str = chrono::Local::now().format("%Y%m%d").to_string();
@@ -784,7 +751,7 @@ impl AnalysisPipeline {
         history: &[(String, String, Vec<crate::data_provider::KlineData>)],
     ) -> Result<BacktestSummary> {
         // 生产入口只负责取得真实基准；确定性计算由 resolved seam 完成。
-        let benchmark = self.fetch_benchmark_series(7000).await;
+        let benchmark = Self::benchmark_segment_unavailable();
         let (result, report) = Self::run_bollinger_zscore_resolved(history, benchmark)?;
 
         // 保存报告
@@ -904,7 +871,7 @@ impl AnalysisPipeline {
         &self,
         history: &[(String, String, Vec<crate::data_provider::KlineData>)],
     ) -> Result<BacktestSummary> {
-        let benchmark = self.fetch_benchmark_series(7000).await;
+        let benchmark = Self::benchmark_segment_unavailable();
         let (result, report) = Self::run_rsi_resolved(history, benchmark)?;
 
         // 保存报告
@@ -1018,7 +985,15 @@ impl AnalysisPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data_gateway::review::AuditedBenchmarkBatch;
+    use crate::data_gateway::{
+        BenchmarkBar, BenchmarkBarTime, BenchmarkCapture, BenchmarkError, BenchmarkRange,
+        BenchmarkReader, BenchmarkRequest, GatewayBatch,
+    };
     use crate::data_provider::KlineData;
+    use crate::database::data_acquisition_audit::DataAcquisitionAuditRecord;
+    use crate::database::DatabaseManager;
+    use crate::magic_compat::ProviderId;
     use crate::strategy::core::{BacktestState, BacktestSummary};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1137,8 +1112,118 @@ mod tests {
         .expect("valid analysis result")
     }
 
+    #[test]
+    fn benchmark_projection_requires_exact_manifest_and_preserves_every_requested_day() {
+        DatabaseManager::init(None).expect("TEST_CODE benchmark database initialization");
+        let database = DatabaseManager::get();
+        let from = chrono::NaiveDate::from_ymd_opt(2026, 3, 30).expect("TEST_CODE from date");
+        let middle = chrono::NaiveDate::from_ymd_opt(2026, 3, 31).expect("TEST_CODE middle date");
+        let to = chrono::NaiveDate::from_ymd_opt(2026, 4, 1).expect("TEST_CODE to date");
+        let request = BenchmarkRequest {
+            instrument: "TEST_CODE_sh000300".into(),
+            range: BenchmarkRange::Daily { from, to },
+        };
+        let bars = [(from, 101.0), (middle, 102.0), (to, 103.0)]
+            .into_iter()
+            .map(|(at, close)| BenchmarkBar {
+                at: BenchmarkBarTime::Daily(at),
+                open: close - 1.0,
+                high: close + 1.0,
+                low: close - 2.0,
+                close,
+                volume: Some(1_000.0),
+                amount: None,
+            })
+            .collect::<Vec<_>>();
+        let evidence = BatchEvidence {
+            provider: ProviderId::Tdx,
+            source: "TEST_CODE_backtest_manifest".into(),
+            source_at: Some("2026-04-01T15:00:00+08:00".into()),
+            observed_at: "2026-04-02T15:00:01+08:00".into(),
+            batch_id: format!(
+                "TEST_CODE_backtest_manifest_{}",
+                TEMP_ID.fetch_add(1, Ordering::Relaxed)
+            ),
+        };
+        let request_hash = request.canonical_request_hash();
+        let provider = serde_json::to_value(evidence.provider)
+            .expect("TEST_CODE provider serialization")
+            .as_str()
+            .expect("TEST_CODE provider string")
+            .to_owned();
+        let receipt = database
+            .record_data_acquisition(&DataAcquisitionAuditRecord {
+                capability: "BenchmarkBars",
+                provider: &provider,
+                source: &evidence.source,
+                request_hash: &request_hash,
+                source_at: evidence.source_at.as_deref(),
+                observed_at: &evidence.observed_at,
+                batch_id: Some(&evidence.batch_id),
+                outcome: "available",
+                request_count: 1,
+                accepted_count: bars.len() as i64,
+                rejected_count: 0,
+                reason_code: "accepted",
+                retryable: false,
+            })
+            .expect("TEST_CODE BR-159 acquisition receipt");
+        let capture = BenchmarkCapture::new(database);
+        let manifest = capture
+            .preview_audited_for_test(
+                request.clone(),
+                AuditedBenchmarkBatch {
+                    batch: GatewayBatch::Available {
+                        records: bars,
+                        evidence,
+                    },
+                    receipt,
+                    request_hash,
+                },
+            )
+            .and_then(|preview| capture.commit(preview))
+            .expect("TEST_CODE exact benchmark manifest");
+        let reader = BenchmarkReader::new(database);
+
+        let series = AnalysisPipeline::project_benchmark_manifest(
+            &reader,
+            &manifest,
+            &request,
+            "TEST_CODE_沪深300",
+        )
+        .expect("TEST_CODE complete manifest projection");
+        assert_eq!(series.closes.len(), 3);
+        assert_eq!(series.closes[&from], 101.0);
+        assert_eq!(series.closes[&middle], 102.0);
+        assert_eq!(series.closes[&to], 103.0);
+
+        let mut mismatched_manifest = manifest.clone();
+        mismatched_manifest.instrument = "TEST_CODE_other".into();
+        assert!(matches!(
+            AnalysisPipeline::project_benchmark_manifest(
+                &reader,
+                &mismatched_manifest,
+                &request,
+                "TEST_CODE_沪深300",
+            ),
+            Err(BenchmarkError::FailedIntegrity {
+                code: "benchmark_manifest_ref_mismatch"
+            })
+        ));
+
+        assert_eq!(
+            BACKTEST_BENCHMARK_UNAVAILABLE_REASON,
+            "BenchmarkSegmentUnavailable"
+        );
+        assert!(AnalysisPipeline::benchmark_segment_unavailable().is_none());
+        let (_, _, report) =
+            AnalysisPipeline::run_multi_factor_resolved(&factor_history(120), None)
+                .expect("TEST_CODE missing benchmark remains an explicit report dimension");
+        assert!(report.contains("基准数据缺失"));
+    }
+
     #[tokio::test]
-    async fn isolated_backtest_acquisition_covers_paging_ranking_and_explicit_failures() {
+    async fn isolated_backtest_acquisition_covers_ranking_and_explicit_failures() {
         let mut pipeline = AnalysisPipeline::new(super::super::PipelineConfig {
             max_workers: 1,
             dry_run: true,
@@ -1164,14 +1249,6 @@ mod tests {
         assert_eq!(evidence.source, "TEST_CODE_isolated_backtest");
         assert!(evidence.batch_id.starts_with("TEST_CODE_backtest_"));
 
-        let benchmark = pipeline
-            .fetch_benchmark_series_with_code("TEST_CODE_000300", "TEST_CODE_基准", 366)
-            .await
-            .expect("two-page isolated benchmark");
-        assert_eq!(benchmark.name, "TEST_CODE_基准");
-        assert_eq!(benchmark.closes.len(), 30);
-        assert!(pipeline.fetch_benchmark_series(0).await.is_none());
-
         let ranked = vec![
             analysis_result("TEST_CODE_000001", 10),
             analysis_result("TEST_CODE_000002", 90),
@@ -1194,14 +1271,12 @@ mod tests {
         assert!(pipeline.run_rsi_backtest(&history(19)).await.is_err());
 
         pipeline.test_fetched_data = Some(Ok(Vec::new()));
-        assert!(pipeline.fetch_benchmark_series(30).await.is_none());
         assert!(pipeline
             .fetch_top_backtest_history(&ranked, 2, 30)
             .await
             .is_empty());
 
         pipeline.test_fetched_data = Some(Err("TEST_CODE_历史源失败".to_string()));
-        assert!(pipeline.fetch_benchmark_series(30).await.is_none());
         assert!(pipeline
             .fetch_top_backtest_history(&ranked, 2, 30)
             .await

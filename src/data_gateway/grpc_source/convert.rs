@@ -193,6 +193,138 @@ fn parse_records(q: &QueryResult, capability: &'static str) -> Result<Vec<Value>
         .map_err(|e| err(capability, format!("records 非 JSON 数组: {e}")))
 }
 
+fn parse_benchmark_wire(
+    q: &QueryResult,
+) -> Result<crate::data_gateway::benchmark::BenchmarkGrpcResponseWire, GatewayError> {
+    const CAPABILITY: &str = "BenchmarkBars";
+    let outer_evidence = evidence_of(q, CAPABILITY)?;
+    if !q.complete {
+        return Err(err(
+            CAPABILITY,
+            "BenchmarkBars response complete=false; partial batches are terminal",
+        ));
+    }
+    let [payload] = q.records.as_slice() else {
+        return Err(err(
+            CAPABILITY,
+            format!(
+                "BenchmarkBars requires exactly one canonical payload, got {}",
+                q.records.len()
+            ),
+        ));
+    };
+    if payload.schema != "market.benchmark_bars"
+        || payload.schema_version != 1
+        || payload.content_type != "application/json; charset=utf-8"
+    {
+        return Err(err(
+            CAPABILITY,
+            "BenchmarkBars payload schema/version/content_type is not the frozen v1 contract",
+        ));
+    }
+    let wire: crate::data_gateway::benchmark::BenchmarkGrpcResponseWire =
+        serde_json::from_slice(&payload.data).map_err(|error| {
+            err(
+                CAPABILITY,
+                format!("BenchmarkBars wire is malformed: {error}"),
+            )
+        })?;
+    if wire.evidence.provider != q.selected_provider
+        || wire.evidence.source != outer_evidence.source
+        || wire.evidence.source_at != outer_evidence.source_at
+        || wire.evidence.observed_at != outer_evidence.observed_at
+        || wire.evidence.batch_id != outer_evidence.batch_id
+    {
+        return Err(err(
+            CAPABILITY,
+            "BenchmarkBars inner evidence conflicts with the authenticated response envelope",
+        ));
+    }
+    Ok(wire)
+}
+
+#[derive(Debug)]
+pub(crate) struct BenchmarkGrpcConversionFailure {
+    error: GatewayError,
+    verified_receipt:
+        Option<Box<crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt>>,
+}
+
+impl BenchmarkGrpcConversionFailure {
+    fn unverified(error: GatewayError) -> Self {
+        Self {
+            error,
+            verified_receipt: None,
+        }
+    }
+
+    fn consumer_admission(
+        error: GatewayError,
+        receipt: crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt,
+    ) -> Self {
+        Self {
+            error,
+            verified_receipt: Some(Box::new(receipt)),
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        GatewayError,
+        Option<crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt>,
+    ) {
+        (self.error, self.verified_receipt.map(|receipt| *receipt))
+    }
+}
+
+pub(crate) fn benchmark_bars(
+    request: &crate::data_gateway::BenchmarkRequest,
+    q: &QueryResult,
+) -> Result<crate::data_gateway::review::AuditedBenchmarkBatch, BenchmarkGrpcConversionFailure> {
+    let wire = parse_benchmark_wire(q).map_err(BenchmarkGrpcConversionFailure::unverified)?;
+    let receipt =
+        crate::data_gateway::benchmark::verify_benchmark_grpc_server_receipt(request, &wire)
+            .map_err(BenchmarkGrpcConversionFailure::unverified)?;
+    crate::data_gateway::benchmark::admit_benchmark_grpc_wire(request, wire)
+        .map_err(|error| BenchmarkGrpcConversionFailure::consumer_admission(error, receipt))
+}
+
+/// Decode and re-admit a gRPC response for a caller-owned audit database.
+///
+/// The remote receipt is checked only as wire evidence. The review gateway
+/// replaces it with a new BR-159 receipt from the caller's explicit database
+/// before exposing a successful batch to `BenchmarkCapture`.
+pub(crate) fn benchmark_bars_for_local_readmission(
+    request: &crate::data_gateway::BenchmarkRequest,
+    q: &QueryResult,
+) -> Result<crate::data_gateway::review::AuditedBenchmarkBatch, BenchmarkGrpcConversionFailure> {
+    let wire = parse_benchmark_wire(q).map_err(BenchmarkGrpcConversionFailure::unverified)?;
+    let receipt =
+        crate::data_gateway::benchmark::decode_benchmark_grpc_server_receipt_for_local_readmission(
+            request, &wire,
+        )
+        .map_err(BenchmarkGrpcConversionFailure::unverified)?;
+    crate::data_gateway::benchmark::admit_benchmark_grpc_wire(request, wire)
+        .map_err(|error| BenchmarkGrpcConversionFailure::consumer_admission(error, receipt))
+}
+
+#[cfg(test)]
+pub(crate) fn benchmark_bars_for_test(
+    request: &crate::data_gateway::BenchmarkRequest,
+    q: &QueryResult,
+    coverage: crate::data_gateway::BenchmarkAdmissionCoverage<'_>,
+    consumer_now: DateTime<Utc>,
+) -> Result<crate::data_gateway::review::AuditedBenchmarkBatch, GatewayError> {
+    let wire = parse_benchmark_wire(q)?;
+    crate::data_gateway::benchmark::admit_benchmark_grpc_wire_for_test(
+        request,
+        wire,
+        coverage,
+        consumer_now,
+    )
+}
+
 fn as_str(v: &Value, key: &str, capability: &'static str) -> Result<String, GatewayError> {
     v.get(key)
         .and_then(Value::as_str)
@@ -4009,6 +4141,247 @@ mod tests {
         }
     }
 
+    fn benchmark_request() -> crate::data_gateway::BenchmarkRequest {
+        let day = NaiveDate::from_ymd_opt(2026, 8, 21).expect("TEST_CODE date");
+        crate::data_gateway::BenchmarkRequest {
+            instrument: "TEST_CODE_000300".to_owned(),
+            range: crate::data_gateway::BenchmarkRange::Daily { from: day, to: day },
+        }
+    }
+
+    fn benchmark_query() -> QueryResult {
+        let request = benchmark_request();
+        let day = NaiveDate::from_ymd_opt(2026, 8, 21).expect("TEST_CODE date");
+        let audited = crate::data_gateway::review::AuditedBenchmarkBatch {
+            batch: crate::data_gateway::GatewayBatch::Available {
+                records: vec![crate::data_gateway::BenchmarkBar {
+                    at: crate::data_gateway::BenchmarkBarTime::Daily(day),
+                    open: 3_500.0,
+                    high: 3_510.0,
+                    low: 3_490.0,
+                    close: 3_505.0,
+                    volume: None,
+                    amount: Some(8_000.0),
+                }],
+                evidence: crate::data_gateway::BatchEvidence {
+                    provider: ProviderId::Tdx,
+                    source: "TEST_CODE_magic-tdx-index-bars".to_owned(),
+                    source_at: None,
+                    observed_at: "2026-08-21T15:01:00+08:00".to_owned(),
+                    batch_id: "TEST_CODE_benchmark_batch".to_owned(),
+                },
+            },
+            receipt: crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt {
+                audit_id: 17,
+                record_hash: "a".repeat(64),
+                previous_outcome: None,
+                current_outcome: "available".to_owned(),
+            },
+            request_hash: crate::data_gateway::benchmark::canonical_base_request_hash(&request),
+        };
+        let wire = crate::data_gateway::grpc_source::BenchmarkGrpcResponseWire::from_audited(
+            &request, &audited,
+        )
+        .expect("TEST_CODE benchmark wire");
+        QueryResult {
+            admission: AdmissionState::Admitted,
+            selected_provider: "Tdx".to_owned(),
+            batch_id: "TEST_CODE_benchmark_batch".to_owned(),
+            complete: true,
+            observed_at: "2026-08-21T15:01:00+08:00".to_owned(),
+            source_at: String::new(),
+            records: vec![CanonicalPayload {
+                schema: "market.benchmark_bars".to_owned(),
+                schema_version: 1,
+                content_type: "application/json; charset=utf-8".to_owned(),
+                data: serde_json::to_vec(&wire).expect("TEST_CODE benchmark JSON"),
+            }],
+            source: "TEST_CODE_magic-tdx-index-bars".to_owned(),
+            diagnostic_blocker: String::new(),
+        }
+    }
+
+    fn mutate_benchmark_query(
+        query: &mut QueryResult,
+        mutate: impl FnOnce(&mut serde_json::Value),
+    ) {
+        let mut wire: serde_json::Value =
+            serde_json::from_slice(&query.records[0].data).expect("TEST_CODE benchmark JSON");
+        mutate(&mut wire);
+        query.records[0].data =
+            serde_json::to_vec(&wire).expect("mutated TEST_CODE benchmark JSON");
+    }
+
+    fn admit_test_benchmark(
+        query: &QueryResult,
+    ) -> Result<crate::data_gateway::review::AuditedBenchmarkBatch, GatewayError> {
+        let day = NaiveDate::from_ymd_opt(2026, 8, 21).expect("TEST_CODE date");
+        benchmark_bars_for_test(
+            &benchmark_request(),
+            query,
+            crate::data_gateway::BenchmarkAdmissionCoverage::Daily {
+                authoritative_trading_days: &[day],
+            },
+            DateTime::parse_from_rfc3339("2026-08-21T15:01:01+08:00")
+                .expect("TEST_CODE consumer time")
+                .with_timezone(&Utc),
+        )
+    }
+
+    #[test]
+    fn benchmark_wire_rejects_missing_nullable_fields() {
+        for (section, field) in [
+            ("bar", "volume"),
+            ("bar", "amount"),
+            ("evidence", "source_at"),
+            ("receipt", "previous_outcome"),
+        ] {
+            let mut query = benchmark_query();
+            mutate_benchmark_query(&mut query, |wire| {
+                let object = match section {
+                    "bar" => wire["bars"][0].as_object_mut().expect("bar object"),
+                    "evidence" => wire["evidence"].as_object_mut().expect("evidence object"),
+                    "receipt" => wire["receipt"].as_object_mut().expect("receipt object"),
+                    _ => unreachable!(),
+                };
+                object.remove(field);
+            });
+            let error = admit_test_benchmark(&query)
+                .expect_err("missing nullable wire field must fail closed");
+            assert_eq!(error.reason_code(), "invalid_evidence", "{section}.{field}");
+        }
+    }
+
+    #[test]
+    fn benchmark_wire_rejects_unknown_provider_and_inner_evidence_conflict() {
+        let mut unknown = benchmark_query();
+        unknown.selected_provider = "TEST_CODE_unknown_provider".to_owned();
+        mutate_benchmark_query(&mut unknown, |wire| {
+            wire["evidence"]["provider"] =
+                serde_json::Value::String("TEST_CODE_unknown_provider".to_owned());
+        });
+        assert_eq!(
+            admit_test_benchmark(&unknown)
+                .expect_err("unknown provider must fail closed")
+                .reason_code(),
+            "invalid_evidence"
+        );
+
+        let mut conflict = benchmark_query();
+        mutate_benchmark_query(&mut conflict, |wire| {
+            wire["evidence"]["batch_id"] =
+                serde_json::Value::String("TEST_CODE_conflicting_batch".to_owned());
+        });
+        assert_eq!(
+            admit_test_benchmark(&conflict)
+                .expect_err("inner evidence conflict must fail closed")
+                .reason_code(),
+            "invalid_evidence"
+        );
+    }
+
+    #[test]
+    fn benchmark_wire_rejects_impossible_or_future_evidence_times() {
+        let mut inverted = benchmark_query();
+        inverted.source_at = "2026-08-21T15:02:00+08:00".to_owned();
+        mutate_benchmark_query(&mut inverted, |wire| {
+            wire["evidence"]["source_at"] = serde_json::json!("2026-08-21T15:02:00+08:00");
+        });
+        assert_eq!(
+            admit_test_benchmark(&inverted)
+                .expect_err("source_at after observed_at must fail closed")
+                .reason_code(),
+            "invalid_evidence"
+        );
+
+        let mut future = benchmark_query();
+        future.observed_at = "2099-08-21T15:01:00+08:00".to_owned();
+        mutate_benchmark_query(&mut future, |wire| {
+            wire["evidence"]["observed_at"] = serde_json::json!("2099-08-21T15:01:00+08:00");
+        });
+        assert_eq!(
+            admit_test_benchmark(&future)
+                .expect_err("future observed_at beyond clock skew must fail closed")
+                .reason_code(),
+            "invalid_evidence"
+        );
+    }
+
+    #[test]
+    fn benchmark_wire_rejects_malformed_receipt_and_request_echo() {
+        for (field, value) in [
+            ("audit_id", serde_json::json!(0)),
+            ("record_hash", serde_json::json!("TEST_CODE_short_hash")),
+            ("current_outcome", serde_json::json!("unavailable")),
+            (
+                "previous_outcome",
+                serde_json::json!("TEST_CODE_unknown_outcome"),
+            ),
+        ] {
+            let mut query = benchmark_query();
+            mutate_benchmark_query(&mut query, |wire| wire["receipt"][field] = value);
+            assert_eq!(
+                admit_test_benchmark(&query)
+                    .expect_err("malformed receipt must fail closed")
+                    .reason_code(),
+                "invalid_evidence",
+                "receipt.{field}"
+            );
+        }
+
+        for (field, value) in [
+            ("instrument", serde_json::json!("TEST_CODE_OTHER_INDEX")),
+            (
+                "from",
+                serde_json::json!({"kind":"daily","year":2026,"month":8,"day":20}),
+            ),
+        ] {
+            let mut query = benchmark_query();
+            mutate_benchmark_query(&mut query, |wire| wire["request"][field] = value);
+            assert_eq!(
+                admit_test_benchmark(&query)
+                    .expect_err("request echo mismatch must fail closed")
+                    .reason_code(),
+                "invalid_evidence",
+                "request.{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn benchmark_wire_reexecutes_whole_batch_admission() {
+        let mut invalid_ohlc = benchmark_query();
+        mutate_benchmark_query(&mut invalid_ohlc, |wire| {
+            wire["bars"][0]["close"] = serde_json::json!(0.0);
+        });
+        assert_eq!(
+            admit_test_benchmark(&invalid_ohlc)
+                .expect_err("client admission must reject invalid OHLC")
+                .reason_code(),
+            "benchmark_ohlc_not_positive_finite"
+        );
+
+        let mut empty = benchmark_query();
+        mutate_benchmark_query(&mut empty, |wire| wire["bars"] = serde_json::json!([]));
+        assert_eq!(
+            admit_test_benchmark(&empty)
+                .expect_err("client admission must reject an empty benchmark payload")
+                .reason_code(),
+            "benchmark_batch_empty"
+        );
+
+        let mut granularity_conflict = benchmark_query();
+        mutate_benchmark_query(&mut granularity_conflict, |wire| {
+            wire["request"]["granularity"] = serde_json::json!("Minute1");
+        });
+        assert_eq!(
+            admit_test_benchmark(&granularity_conflict)
+                .expect_err("request granularity and time shape must agree")
+                .reason_code(),
+            "invalid_evidence"
+        );
+    }
+
     fn p01_limit_pools_q() -> QueryResult {
         let mut query = mk_q("[]", "Eastmoney", "TEST_CODE_eastmoney_limit_pool");
         query.batch_id = "TEST_CODE_LIMIT_POOL_BATCH".to_string();
@@ -5160,10 +5533,7 @@ mod tests {
 
         let batch = t0_evidence_batch_at(&q, now)
             .expect("T0 source age 5s+1ns must be flagged, not rejected (2026-08-21 指令)");
-        assert!(
-            batch.time_untrustworthy,
-            "age 超门批次必须标注 时间不可信"
-        );
+        assert!(batch.time_untrustworthy, "age 超门批次必须标注 时间不可信");
         assert_eq!(batch.records.len(), 1);
     }
 

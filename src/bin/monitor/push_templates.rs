@@ -8969,12 +8969,77 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
     crate::review_batch::ReviewTaskOutcome::from_push_outcome(result, 1)
 }
 
-/// R-12: 盘后 15min 回测段 — 用 15 分钟 K线回测虚拟仓买卖信号 + boll_macd 信号。
+/// R-12: 盘后 15min 买入事件研究 — 只衡量虚拟仓入场与 boll_macd 入场后的
+/// 短期价格路径，不把卖出原因或事件上涨比例冒充完整策略胜率。
 /// T0 做T 信号依赖实时五档盘口 (MagicTdxT0Evidence bid/ask + 分时均价), 历史不可得 →
 /// 由 render_r12 文本标注"不可回测" (用户已确认)。
-/// 回测窗口 = 近 30 自然日 (覆盖虚拟仓 7/14 起全部信号); 网络拉取 + SQLite 读表在
-/// spawn_blocking 内, 失败出声 (failed), 单只拉取失败在模块内 warn 跳过。
+/// 研究窗口 = 近 30 自然日；网络拉取 + SQLite 读表在
+/// spawn_blocking 内；任一来源或结构失败均显式失败，不发布部分结果。
 const R12_TECHNICAL_BARS_PUBLISHED: bool = false;
+
+fn r12_has_auditable_result(result: &stock_analysis::review::backtest::R12BacktestResult) -> bool {
+    !result.virtual_buy.is_empty()
+        || !result.boll_macd.is_empty()
+        || result.exit_rows_excluded > 0
+        || result.unaligned_signals > 0
+        || result.censored_windows > 0
+}
+
+fn r12_group_event_count(
+    groups: &[stock_analysis::review::backtest::SignalGroup],
+    label: &str,
+) -> Result<usize, String> {
+    groups.iter().try_fold(0_usize, |total, group| {
+        total
+            .checked_add(group.count)
+            .ok_or_else(|| format!("R-12 {label} event count overflow"))
+    })
+}
+
+fn r12_source_binding_canonical(
+    date: chrono::NaiveDate,
+    result: &stock_analysis::review::backtest::R12BacktestResult,
+) -> Result<Vec<u8>, String> {
+    let binding = serde_json::json!({
+        "date": date.format("%Y-%m-%d").to_string(),
+        "virtual_group_count": result.virtual_buy.len(),
+        "virtual_event_count": r12_group_event_count(&result.virtual_buy, "virtual")?,
+        "exit_rows_excluded": result.exit_rows_excluded,
+        "boll_macd_group_count": result.boll_macd.len(),
+        "boll_macd_event_count": r12_group_event_count(&result.boll_macd, "boll_macd")?,
+        "unaligned_signals": result.unaligned_signals,
+        "censored_windows": result.censored_windows,
+    });
+    serde_json::to_vec(&binding)
+        .map_err(|error| format!("R-12 source binding serialization failed: {error}"))
+}
+
+#[cfg(test)]
+mod tests_r12_review_audit {
+    use super::{r12_has_auditable_result, r12_source_binding_canonical};
+
+    #[test]
+    fn br247_censoring_counts_remain_auditable_without_statistical_groups() {
+        assert!(!r12_has_auditable_result(
+            &stock_analysis::review::backtest::R12BacktestResult::default()
+        ));
+
+        let result = stock_analysis::review::backtest::R12BacktestResult {
+            exit_rows_excluded: 1,
+            unaligned_signals: 2,
+            censored_windows: 3,
+            ..Default::default()
+        };
+        assert!(r12_has_auditable_result(&result));
+
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 24).unwrap();
+        let canonical = r12_source_binding_canonical(date, &result).expect("canonical binding");
+        let value: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
+        assert_eq!(value["exit_rows_excluded"], 1);
+        assert_eq!(value["unaligned_signals"], 2);
+        assert_eq!(value["censored_windows"], 3);
+    }
+}
 
 async fn dispatch_r12_backtest_outcome_with_runner<Runner, RunnerFuture>(
     date: &str,
@@ -9034,8 +9099,8 @@ async fn dispatch_r12_backtest_after_capability(
             return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
         }
     }
-    let result = match tokio::task::spawn_blocking(|| {
-        stock_analysis::review::backtest::run_full_backtest(30)
+    let result = match tokio::task::spawn_blocking(move || {
+        stock_analysis::review::backtest::run_full_backtest(today, 30)
     })
     .await
     {
@@ -9049,25 +9114,16 @@ async fn dispatch_r12_backtest_after_capability(
             return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
         }
     };
-    let has_signals = !result.virtual_buy.is_empty()
-        || !result.virtual_sell.is_empty()
-        || !result.boll_macd.is_empty();
-    if !has_signals {
+    if !r12_has_auditable_result(&result) {
         log_dispatcher_attempt("R-12", false, 0, "no backtest signals in window");
         return crate::review_batch::ReviewTaskOutcome::no_data("no backtest signals in window");
     }
     let text = stock_analysis::review::backtest::render_r12(&result);
     // BR-192 counted delivery: 信号计数来自同一回测窗口 (确定性), 决策身份稳定 →
     // 重启错过补偿批重跑时 preflight 复用, 不再重复推送。
-    let source_binding_canonical = match serde_json::to_vec(&(
-        date,
-        result.virtual_buy.len(),
-        result.virtual_sell.len(),
-        result.boll_macd.len(),
-    )) {
+    let source_binding_canonical = match r12_source_binding_canonical(today, &result) {
         Ok(canonical) => canonical,
-        Err(error) => {
-            let reason = format!("R-12 source binding serialization failed: {error}");
+        Err(reason) => {
             log_dispatcher_attempt("R-12", false, 1, &reason);
             return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
         }
@@ -9575,37 +9631,46 @@ pub async fn dispatch_post_session_review(
         .flatten()
         .collect::<Vec<_>>();
 
-    // BR-232: SignalTracker 样本回填 (5 日收益验证, 每日复盘时执行)
-    let (backfilled_total, backfilled_hits) = backfill_pending_predictions(14).await;
-    if backfilled_total > 0 {
-        log::info!("[BR-232] 预测样本回填 verified={backfilled_total} hits={backfilled_hits}");
-    }
+    if is_test {
+        // BR-194/223/232: ReviewTask preflight is not sufficient for these
+        // post-session side routes. Test mode must stop before every loader,
+        // provider, renderer, persistence, durable-delivery, or sink call.
+        log::info!(
+            "[BR-194][BR-223][BR-232] test_environment_post_session_side_routes=disabled prediction_backfill_calls=0 block_trade_provider_calls=0 ipo_dispatch_calls=0 renderer_calls=0 persistence_calls=0 durable_calls=0 sink_calls=0"
+        );
+    } else {
+        // BR-232: SignalTracker 样本回填 (5 日收益验证, 每日复盘时执行)
+        let (backfilled_total, backfilled_hits) = backfill_pending_predictions(14).await;
+        if backfilled_total > 0 {
+            log::info!("[BR-232] 预测样本回填 verified={backfilled_total} hits={backfilled_hits}");
+        }
 
-    // BR-223: 盘后大宗交易推送 (自选+持仓代码集, 非 ReviewTask 侧推)
-    let mut block_trade_codes: Vec<String> = stock_analysis::portfolio::get_positions()
-        .map(|positions| {
-            positions
-                .into_iter()
-                .map(|position| position.code)
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Ok(list) = std::env::var("STOCK_LIST") {
-        for code in list.split(',') {
-            let code = code.trim().to_string();
-            if !code.is_empty() && !block_trade_codes.contains(&code) {
-                block_trade_codes.push(code);
+        // BR-223: 盘后大宗交易推送 (自选+持仓代码集, 非 ReviewTask 侧推)
+        let mut block_trade_codes: Vec<String> = stock_analysis::portfolio::get_positions()
+            .map(|positions| {
+                positions
+                    .into_iter()
+                    .map(|position| position.code)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Ok(list) = std::env::var("STOCK_LIST") {
+            for code in list.split(',') {
+                let code = code.trim().to_string();
+                if !code.is_empty() && !block_trade_codes.contains(&code) {
+                    block_trade_codes.push(code);
+                }
             }
         }
+        if !block_trade_codes.is_empty() {
+            let block_trade_pushed =
+                dispatch_block_trade_review(&block_trade_codes, business_date).await;
+            log::info!("[BR-223] 盘后大宗交易推送 pushed={block_trade_pushed}");
+        }
+        // BR-223: A-11 IPO 阶段催化 (每日一次, 盘后侧推)
+        let ipo_pushed = dispatch_ipo_catalyst(&date).await;
+        log::info!("[BR-223] IPO 产业链催化 pushed={ipo_pushed}");
     }
-    if !block_trade_codes.is_empty() {
-        let block_trade_pushed =
-            dispatch_block_trade_review(&block_trade_codes, business_date).await;
-        log::info!("[BR-223] 盘后大宗交易推送 pushed={block_trade_pushed}");
-    }
-    // BR-223: A-11 IPO 阶段催化 (每日一次, 盘后侧推)
-    let ipo_pushed = dispatch_ipo_catalyst(&date).await;
-    log::info!("[BR-223] IPO 产业链催化 pushed={ipo_pushed}");
     let observed_at = chrono::Local::now().fixed_offset();
     // BR-139/BR-194: account_required 任务在真实账户指标缺失时统一停在
     // typed AccountMetricsIncomplete 边界；不得调用 provider、renderer 或 sink。
@@ -15788,24 +15853,23 @@ pub fn build_test_template_catalog(
                     reason: "TEST_CODE NewsCatalyst".to_string(),
                     window_bars: 4,
                     count: 50,
-                    win_rate: Some(0.36),
-                    avg_ret: Some(0.0031),
-                    mfe: Some(0.089),
-                    mae: Some(-0.026),
+                    up_rate: Some(0.36),
+                    avg_terminal_ret: Some(0.0031),
+                    avg_mfe: Some(0.089),
+                    avg_mae: Some(-0.026),
                 }],
-                virtual_sell: Vec::new(),
-                broken_excluded: 190,
+                exit_rows_excluded: 100,
                 boll_macd: vec![stock_analysis::review::backtest::SignalGroup {
                     reason: "TEST_CODE BottomBuy".to_string(),
                     window_bars: 4,
                     count: 10224,
-                    win_rate: Some(0.44),
-                    avg_ret: Some(-0.0003),
-                    mfe: Some(0.2),
-                    mae: Some(-0.103),
+                    up_rate: Some(0.44),
+                    avg_terminal_ret: Some(-0.0003),
+                    avg_mfe: Some(0.2),
+                    avg_mae: Some(-0.103),
                 }],
-                skipped_codes: Vec::new(),
                 unaligned_signals: 0,
+                censored_windows: 0,
             },
         ),
     );

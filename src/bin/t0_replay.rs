@@ -7,6 +7,7 @@
 //!     命中 2026-08-21 生产场景 (TDX servertime 滞后墙钟 14-27s),
 //!     age 门放宽 → time_untrustworthy=true
 //!   * 注入 servertime 之前 (如 15:29:30): future_time → 仍硬拒
+//!
 //! 另附盘中形态模拟: 真实最近交易日 48 根剔除 11:30 bar 后按 14:48
 //! 观测校验 (复现 2026-08-21 盘中 five_minute_gap 场景)。
 //!
@@ -16,11 +17,11 @@
 //! 只读网络请求, 无写入、无推送。
 
 use chrono::TimeZone;
+use chrono::{Datelike, NaiveTime};
 #[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::protocol::constants::{fq_type, KLINE_5MIN, KLINE_DAILY};
 #[cfg(feature = "magic-gateway")]
 use magic_tdx_rs::TdxHqClient;
-use chrono::{Datelike, NaiveTime};
 use stock_analysis::data_gateway::magic_tdx_t0::{
     fetch_magic_tdx_t0_batch_with_clock, five_minute_from_raw, validate_five_minute_bars,
 };
@@ -59,10 +60,7 @@ fn main() {
             let mut d = chrono::Local::now().date_naive();
             loop {
                 d -= chrono::Duration::days(1);
-                if !matches!(
-                    d.weekday(),
-                    chrono::Weekday::Sat | chrono::Weekday::Sun
-                ) {
+                if !matches!(d.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun) {
                     break d;
                 }
             }
@@ -78,14 +76,28 @@ fn main() {
             let s: u32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(20);
             chrono::FixedOffset::east_opt(8 * 3600)
                 .unwrap()
-                .with_ymd_and_hms(replay_date.year(), replay_date.month(), replay_date.day(), h, m, s)
+                .with_ymd_and_hms(
+                    replay_date.year(),
+                    replay_date.month(),
+                    replay_date.day(),
+                    h,
+                    m,
+                    s,
+                )
                 .single()
                 .expect("replay time")
                 .with_timezone(&chrono::Utc)
         }
         None => chrono::FixedOffset::east_opt(8 * 3600)
             .unwrap()
-            .with_ymd_and_hms(replay_date.year(), replay_date.month(), replay_date.day(), 15, 30, 20)
+            .with_ymd_and_hms(
+                replay_date.year(),
+                replay_date.month(),
+                replay_date.day(),
+                15,
+                30,
+                20,
+            )
             .single()
             .expect("default replay time")
             .with_timezone(&chrono::Utc),
@@ -156,10 +168,8 @@ fn main() {
                         .collect::<Result<Vec<_>, _>>();
                     if let Ok(rows) = decoded {
                         // 全量历史 (含最近交易日) 参与校验, 与生产 fetch 一致
-                        let session_count = rows
-                            .iter()
-                            .filter(|r| r.at.date() == replay_date)
-                            .count();
+                        let session_count =
+                            rows.iter().filter(|r| r.at.date() == replay_date).count();
                         let mut stripped = rows.clone();
                         stripped.retain(|r| {
                             !(r.at.date() == replay_date
@@ -168,8 +178,12 @@ fn main() {
                         let intraday_at = chrono::FixedOffset::east_opt(8 * 3600)
                             .unwrap()
                             .with_ymd_and_hms(
-                                replay_date.year(), replay_date.month(), replay_date.day(),
-                                14, 48, 0,
+                                replay_date.year(),
+                                replay_date.month(),
+                                replay_date.day(),
+                                14,
+                                48,
+                                0,
                             )
                             .single()
                             .expect("intraday sim time")

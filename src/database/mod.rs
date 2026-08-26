@@ -1040,6 +1040,8 @@ pub mod factor_snapshot;
 pub mod repository;
 // v12 MVP-5 §8.1
 pub(crate) mod agent_logs;
+pub mod attribution_reports;
+pub mod benchmark_segments;
 pub mod chain_intelligence;
 pub mod concepts; // v15.1: 公开供 push_templates 集成使用
 pub mod daily_change_confirmation;
@@ -1051,6 +1053,7 @@ mod kline;
 mod lhb;
 pub mod news_ai;
 pub mod order_audit;
+pub(crate) mod paper_inventory_failure_audit;
 pub mod position_chain;
 mod positions;
 // BR-215: projection reconciliation is a tool-facing entry point.
@@ -1868,6 +1871,8 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         // hash-chained, and retains provider/batch evidence plus aggregate
         // acceptance counters. Initialization fails on any chain mismatch.
         data_acquisition_audit::create_schema(&mut *conn)?;
+        benchmark_segments::create_schema(&mut *conn)?;
+        attribution_reports::create_schema(&mut *conn)?;
         // BR-171: exact operator confirmations for >±20% adjacent daily-close
         // moves are immutable, hash-chained and validated at startup.
         daily_change_confirmation::create_schema(&mut *conn)?;
@@ -2118,6 +2123,10 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
              BEGIN SELECT RAISE(ABORT, 'BR-084 invalid paper trade order'); END",
         )
         .execute(&mut *conn)?;
+        // BR-249: paper-inventory reconstruction failures occur before an
+        // order attempt, so they use an independent immutable hash chain.
+        // Startup refuses a missing, partial or tampered chain.
+        paper_inventory_failure_audit::create_schema(&mut *conn)?;
 
         // execution_tracking (PR3-3.5)
         diesel::sql_query(

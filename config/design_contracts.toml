@@ -10,3 +10,74 @@ rust_score_max_constant = "EVENT_RISK_SCORE_MAX"
 score_min = 0
 score_max = 100
 insufficient_cap_relation = "threshold_minus_one"
+
+# BR-252 / docs/superpowers/specs/2026-08-02-gate-d-coverage-closure-design.md §10.4
+# 首次 PR 覆盖率棘轮基线来自 f05f506 上两次连续、计数一致的
+# workspace/all-features 新鲜报告；见设计 §10.13。
+# 比例判定必须使用整数交叉相乘；普通修改不得降低任一 baseline。
+[coverage]
+schema = 1
+source_sha = "f05f506e744898319b6ba059580ab17bf65004cf"
+bootstrap_approved = true
+bootstrap_rule = "BR-252"
+global_covered = 201256
+global_count = 258810
+core_covered = 157635
+core_count = 202935
+core_file_count = 218
+pr_core_patch_min = 90
+pr_other_patch_min = 85
+release_global_min = 80
+release_core_min = 95
+rustc_release = "1.95.0"
+rustc_commit = "59807616e1fa2540724bfbac14d7976d7e4a3860"
+llvm_version = "22.1.2"
+cargo_llvm_cov_version = "0.8.7"
+
+# BR-252 §10.12: 这些源码在 f05f506 的完整 workspace/all-features 报告中没有 LLVM 行区域。
+# 路径必须保持既有集合且内容 SHA-256 精确匹配；后续 PR 不得新增豁免路径。
+[coverage.reviewed_no_region]
+"src/agent/mod.rs" = "31cd14101280bd562bf03390c3d019fd825081876e2e8678d8283d66d987277c"
+"src/agent/state.rs" = "4479fb43fa56fe9315f5c2e86068715b8ebcf15f78fb4023539138d8076ed619"
+"src/agent/tool.rs" = "b8bd07141cf61c5b728e50c8da1e73ed7f6fc07e53bb356f404d26cfdcb530c5"
+"src/auth/mod.rs" = "3bbc49ba567a4c196cecae8eea6396a33dff98d380241e14343b26605a0a1b01"
+"src/bin/monitor/metrics.rs" = "3520c6630ac62c859fb16c9548e8d011abeb8be22b72aeaa1b6fed55f017e697"
+"src/bin/monitor/recovery.rs" = "fce271b968e53e7091d08a9f3f0135d42cf66279baf37402e177396195fba4f2"
+"src/breakout/mod.rs" = "01cdddf36378c2f7a26943edcbcfee3b6a352373372a014d51501baa3f1db8ff"
+"src/cli.rs" = "b86f6ea8abd70b666850c8576966c32c8f0653f4d34775d4fab75bb4d4072947"
+"src/company_metrics.rs" = "811f5828fa882dc12bdb43fa11a6df71777266169fc56bf9c6d6ed60cabd4674"
+"src/data_gateway/mod.rs" = "a3f62878c0c1f1dd5cfc1ca22c507e4d02841d12261b1cd2202ae0a9a52baf67"
+"src/decision/mod.rs" = "3deb434e51f0a27310e4d01c2038fafb706c0f3ac32094a3d88766cb8b2fee95"
+"src/durable_delivery/mod.rs" = "c098247a5074fe4ebf06356aead1690a8fa50b33319a748b276939f30cd33f92"
+"src/durable_delivery/tests.rs" = "423116bae969ab05efa694daaaaf3c2dc545b9b7da74fb6744f6996e5a1ea6cb"
+"src/grpc_client/mod.rs" = "3fc84ba46b853864b962f1deaa88bdf1628f4c5a25ab0cdd668e35904dc4c501"
+"src/grpc_contract/mod.rs" = "2274079d29da677c860c3531d6249eeeccd0239440a86e556026b58faeee597f"
+"src/magic_compat/bars.rs" = "26f7e2f7a051275f1bf16ac448d27e5dd1e19ebce95925840f4ea6a0f2956edf"
+"src/magic_compat/evidence.rs" = "91cc2b2459665986fd031b7a86b4bbc60c0a76ed173d5970945db11edff252a0"
+"src/magic_compat/instrument.rs" = "22d787a8ebb3dea5801b954f229c301cc120d04e422700fdedd6b92ecb8c3a7b"
+"src/magic_compat/lifecycle.rs" = "f74637e0e0dae194c753561579e58a1d8aeb98a9520fc4f82627e032a033d0cd"
+"src/magic_compat/market.rs" = "0f2797c993313db4fe0e518dd3c5e8519fe75a8028476a4dd018715a36d958f0"
+"src/magic_compat/provider_id.rs" = "f852aed6b42882f0f8f921297a20546e0377446c02478fb63f77887b06b759e5"
+"src/magic_compat/ranking.rs" = "658430b1e493012140b6c4dba844bb5dd61934479b47e8577e30c276c71f85fc"
+"src/magic_compat/record.rs" = "165185ca1999917da2d5493744a928633308fda3e317ae22d3e55b1d9bfaaa4a"
+"src/magic_compat/tdx.rs" = "fe81ba1bdf2efeece4c877cc95b8218e94967a97f06cd14bb96be4f2bd42d45c"
+"src/magic_compat/value.rs" = "9730fb5a70e9b08996c95b85a3b993a4d579fd741fe2297f2653eb3432d53cc6"
+"src/monitor/mod.rs" = "a57109e4486ef37f23827a651c993e9b113591f037e9e29e86dd68090f8b6424"
+"src/news/ipo/mod.rs" = "ad263fad7910c24415efc83d299031091bf206a62b46a8627b53ab3ecd48f8ee"
+"src/news/mod.rs" = "9d72dd2fbc079d497c755ce10ef4cafb1fec9c9bd7bee23a592ddfaf7a066442"
+"src/notification/mod.rs" = "286aae94b688dc8fc1d125621bd3279bbab79c5e9fbef83110b86688f8c4df4a"
+"src/opportunity/mod.rs" = "aa9bf638cfdca1f12b187e7fb17e6f7d2f98f1de425736d726e7b37df511d230"
+"src/performance/mod.rs" = "d87ba6c2ea8d1fc45938b03f086d4eb31def6b99bfa1f484bfd30cc5434b2a9f"
+"src/push_l1/mod.rs" = "ec606a100411bc42685b99b68c19ca95a9f6737f63ef6594134b547a3684e8b6"
+"src/push_l2/mod.rs" = "f8cf2ce3bb3e45a951d574e0f4f70e33b0c27c219a4240fb6089f08c20c26105"
+"src/push_l4/mod.rs" = "6166702adc896d9b4a349a07f50f7db6d5ee179e7229131b3cb3f1d7a0818c8e"
+"src/push_l5/mod.rs" = "32ddffd475de048771010d06b98730010e618087cc9a296d7df6fea76af70cd8"
+"src/push_l6/mod.rs" = "71d00434a456648384ff9ce66a057bb6f7f09c029e29090d4f56f17227f23f30"
+"src/push_l7/mod.rs" = "7e34dd77789187ab5489d3cd413f7f4b92339309f2599cf391baf7723660997b"
+"src/review/mod.rs" = "ede125d356fce9ba37e259dd7772851004f2890d147652c2c0aedd5b410e3703"
+"src/risk/mod.rs" = "b5190ab72bbb0762a999293e651beaeb7aef28298e1248af755f0ccb384ace7e"
+"src/search_service/mod.rs" = "4921583f4cd5de01311a8010686c532a0b6e6da435a14e6486c2bcb875233970"
+"src/search_service/providers/mod.rs" = "dd69ab5f8b0a9fefbaa2d679dc2749bd3caab43ed684e104c70583aaa04915ec"
+"src/selection/mod.rs" = "89200c51fc0e33af07ddb5dad4687a2c6d23534baec8fecaf5086d09bcea58d8"
+"src/signal/mod.rs" = "78f650bd614974da1f2aaa3ac3eb5df6b87a2eb4c98b9182a7d39c7f44d47585"
+"src/strategy/rsi/mod.rs" = "f75951ed4c1d51bfea1647bc065449fbfd33a6c6f4ba5cb799891a34aca9087a"

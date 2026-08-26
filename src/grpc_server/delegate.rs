@@ -108,6 +108,11 @@ impl From<crate::data_gateway::GatewayError> for FetchFailure {
 pub enum DelegateError {
     Params(crate::grpc_contract::params::ParamsError),
     Fetch(FetchFailure),
+    BenchmarkFetch {
+        failure: FetchFailure,
+        audit_outcome: &'static str,
+        audit_state: crate::data_gateway::grpc_source::BenchmarkServerAuditState,
+    },
 }
 
 impl std::fmt::Display for DelegateError {
@@ -115,6 +120,9 @@ impl std::fmt::Display for DelegateError {
         match self {
             DelegateError::Params(e) => write!(f, "{e}"),
             DelegateError::Fetch(failure) => write!(f, "取数失败: {}", failure.message),
+            DelegateError::BenchmarkFetch { failure, .. } => {
+                write!(f, "历史基准取数失败: {}", failure.message)
+            }
         }
     }
 }
@@ -217,6 +225,65 @@ fn pack_retained_evidence(
     )
 }
 
+fn pack_benchmark_audited(
+    request: &crate::data_gateway::BenchmarkRequest,
+    audited: &crate::data_gateway::review::AuditedBenchmarkBatch,
+) -> Result<Fetched, FetchFailure> {
+    let wire =
+        crate::data_gateway::grpc_source::BenchmarkGrpcResponseWire::from_audited(request, audited)
+            .map_err(FetchFailure::from_gateway)?;
+    let evidence = audited.batch.evidence();
+    Ok(Fetched {
+        data: serde_json::to_vec(&wire).map_err(|error| {
+            FetchFailure::unknown(format!("BenchmarkBars wire serialize: {error}"))
+        })?,
+        // Proto outer evidence has no presence bit: empty is the sole absence encoding.
+        // The canonical JSON wire retains explicit null and the client cross-check maps
+        // this empty scalar back to None; it is never substituted with a bar/observed time.
+        source_at: evidence.source_at.clone().unwrap_or_default(),
+        observed_at: evidence.observed_at.clone(),
+        provider: format!("{:?}", evidence.provider),
+        source: evidence.source.clone(),
+        batch_id: evidence.batch_id.clone(),
+    })
+}
+
+fn resolve_benchmark_request(
+    params: &Value,
+) -> Result<crate::data_gateway::BenchmarkRequest, DelegateError> {
+    let wire: crate::data_gateway::grpc_source::BenchmarkRequestWire =
+        serde_json::from_value(params.clone()).map_err(|error| {
+            crate::grpc_contract::params::ParamsError::InvalidArgument(format!(
+                "BenchmarkBars request wire 非法: {error}"
+            ))
+        })?;
+    wire.to_request().map_err(|error| {
+        crate::grpc_contract::params::ParamsError::InvalidArgument(format!(
+            "BenchmarkBars request identity/range 非法: {}",
+            error.message()
+        ))
+        .into()
+    })
+}
+
+async fn fetch_benchmark_bars(params: &Value) -> Result<Fetched, DelegateError> {
+    let request = resolve_benchmark_request(params)?;
+    let audited = ReviewDataGateway::new()
+        .benchmark_bars_library_for_grpc(request.clone())
+        .await
+        .map_err(|library_failure| {
+            let (error, audit_state) = library_failure.into_parts();
+            let message = format!("历史基准 Gateway 不可用: {error}");
+            let audit_outcome = error.audit_outcome();
+            DelegateError::BenchmarkFetch {
+                failure: FetchFailure::from_gateway(error).with_message(message),
+                audit_outcome,
+                audit_state,
+            }
+        })?;
+    pack_benchmark_audited(&request, &audited).map_err(DelegateError::Fetch)
+}
+
 fn not_yet(op: Operation) -> Result<Fetched, FetchFailure> {
     Err(FetchFailure::unknown(format!(
         "{}: delegate 尚未实现 (Task 10 补全)",
@@ -293,6 +360,8 @@ pub async fn fetch(op: Operation, _schema: &str, params: &Value) -> Result<Fetch
         Operation::T0Evidence => fetch_t0_evidence(params).await,
         Operation::OutcomeDailyBars => fetch_outcome_daily_bars(params).await,
         Operation::UpperLimitPoolReview => fetch_upper_limit_pool_review(params).await,
+        // BR-251: server 必须调用 library seam，避免回到自身 gRPC 桥递归。
+        Operation::BenchmarkBars => fetch_benchmark_bars(params).await,
         // M4c 扩展 (P4): A-10 完整 batch (本地扩展 61, monitor 复盘消费)。
         Operation::ChainBatch => fetch_chain_batch_full(params)
             .await
@@ -2010,6 +2079,171 @@ async fn fetch_upper_limit_pool_review(params: &Value) -> Result<Fetched, Delega
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn benchmark_delegate_and_client_converter_roundtrip_one_audited_batch() {
+        let day = NaiveDate::from_ymd_opt(2026, 8, 21).expect("TEST_CODE date");
+        let request = crate::data_gateway::BenchmarkRequest {
+            instrument: "TEST_CODE_000300".to_owned(),
+            range: crate::data_gateway::BenchmarkRange::Daily { from: day, to: day },
+        };
+        let audited = crate::data_gateway::review::AuditedBenchmarkBatch {
+            batch: crate::data_gateway::GatewayBatch::Available {
+                records: vec![crate::data_gateway::BenchmarkBar {
+                    at: crate::data_gateway::BenchmarkBarTime::Daily(day),
+                    open: 3_500.0,
+                    high: 3_510.0,
+                    low: 3_490.0,
+                    close: 3_505.0,
+                    volume: None,
+                    amount: Some(8_000.0),
+                }],
+                evidence: crate::data_gateway::BatchEvidence {
+                    provider: ProviderId::Tdx,
+                    source: "TEST_CODE_magic-tdx-index-bars".to_owned(),
+                    source_at: None,
+                    observed_at: "2026-08-21T15:01:00+08:00".to_owned(),
+                    batch_id: "TEST_CODE_benchmark_batch".to_owned(),
+                },
+            },
+            receipt: crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt {
+                audit_id: 17,
+                record_hash: "a".repeat(64),
+                previous_outcome: None,
+                current_outcome: "available".to_owned(),
+            },
+            request_hash: "c".repeat(64),
+        };
+
+        let fetched = pack_benchmark_audited(&request, &audited)
+            .expect("server serializes the exact audited TEST_CODE batch");
+        assert!(
+            fetched.source_at.is_empty(),
+            "missing provider source time uses only the proto absence encoding"
+        );
+        let query = crate::grpc_client::envelope::QueryResult {
+            admission: crate::grpc_client::pb::magic::market::v1::AdmissionState::Admitted,
+            selected_provider: fetched.provider,
+            batch_id: fetched.batch_id,
+            complete: true,
+            observed_at: fetched.observed_at,
+            source_at: fetched.source_at,
+            records: vec![
+                crate::grpc_client::pb::magic::market::v1::CanonicalPayload {
+                    schema: "market.benchmark_bars".to_owned(),
+                    schema_version: 1,
+                    content_type: "application/json; charset=utf-8".to_owned(),
+                    data: fetched.data,
+                },
+            ],
+            source: fetched.source,
+            diagnostic_blocker: String::new(),
+        };
+        let admitted = crate::data_gateway::grpc_source::convert::benchmark_bars_for_test(
+            &request,
+            &query,
+            crate::data_gateway::BenchmarkAdmissionCoverage::Daily {
+                authoritative_trading_days: &[day],
+            },
+            chrono::DateTime::parse_from_rfc3339("2026-08-21T15:01:01+08:00")
+                .expect("TEST_CODE consumer time")
+                .with_timezone(&chrono::Utc),
+        )
+        .expect("client re-admits the server wire without another audit append");
+
+        assert_eq!(admitted.batch.records(), audited.batch.records());
+        assert_eq!(admitted.batch.evidence(), audited.batch.evidence());
+        assert_eq!(admitted.receipt, audited.receipt);
+        assert_eq!(admitted.batch.evidence().source_at, None);
+    }
+
+    #[test]
+    fn benchmark_delegate_requires_an_exact_numeric_request_wire() {
+        let day = NaiveDate::from_ymd_opt(2026, 8, 21).expect("TEST_CODE date");
+        let request = crate::data_gateway::BenchmarkRequest {
+            instrument: "TEST_CODE_000300".to_owned(),
+            range: crate::data_gateway::BenchmarkRange::Daily { from: day, to: day },
+        };
+        let params = serde_json::to_value(
+            crate::data_gateway::grpc_source::BenchmarkRequestWire::try_from_request(&request)
+                .expect("TEST_CODE valid request"),
+        )
+        .expect("TEST_CODE request JSON");
+        assert_eq!(
+            resolve_benchmark_request(&params).expect("exact request wire"),
+            request
+        );
+
+        for invalid in [
+            serde_json::json!({
+                "granularity": "Daily",
+                "from": {"kind":"daily","year":2026,"month":8,"day":21},
+                "to": {"kind":"daily","year":2026,"month":8,"day":21}
+            }),
+            serde_json::json!({
+                "instrument": "TEST_CODE_000300",
+                "granularity": "Minute1",
+                "from": {"kind":"daily","year":2026,"month":8,"day":21},
+                "to": {"kind":"daily","year":2026,"month":8,"day":21}
+            }),
+            serde_json::json!({
+                "instrument": "TEST_CODE_000300",
+                "granularity": "Daily",
+                "from": {"kind":"daily","year":2026,"month":8,"day":21},
+                "to": {"kind":"daily","year":2026,"month":8,"day":21},
+                "unexpected": true
+            }),
+        ] {
+            assert!(
+                resolve_benchmark_request(&invalid).is_err(),
+                "invalid BenchmarkBars params must fail closed: {invalid}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_env_guard_benchmark_delegate_uses_library_without_recursion() {
+        let _env = crate::data_gateway::grpc_source::test_grpc_env_guard();
+        crate::database::DatabaseManager::init(None).expect("TEST_CODE audit database init");
+        std::env::set_var("DATA_GATEWAY_GRPC", "1");
+        std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:1");
+        crate::data_gateway::grpc_source::reset_bridge();
+
+        let day = NaiveDate::from_ymd_opt(2026, 8, 21).expect("TEST_CODE date");
+        let request = crate::data_gateway::BenchmarkRequest {
+            instrument: "TEST_CODE_000300".to_owned(),
+            range: crate::data_gateway::BenchmarkRange::Daily { from: day, to: day },
+        };
+        let params = serde_json::to_value(
+            crate::data_gateway::grpc_source::BenchmarkRequestWire::try_from_request(&request)
+                .expect("TEST_CODE valid request"),
+        )
+        .expect("TEST_CODE request JSON");
+        let result = fetch_benchmark_bars(&params).await;
+
+        std::env::remove_var("DATA_GATEWAY_GRPC");
+        std::env::remove_var("GRPC_MARKET_ADDR");
+        crate::data_gateway::grpc_source::reset_bridge();
+
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("TEST_CODE identity must be rejected by the library registry"),
+        };
+        match error {
+            DelegateError::BenchmarkFetch { failure, .. } => {
+                assert_eq!(failure.reason_code, "benchmark_test_identity_rejected");
+                assert!(!failure.retryable);
+                assert!(
+                    !failure.message.contains("gRPC server"),
+                    "server delegate must not recurse through its configured bridge"
+                );
+            }
+            DelegateError::Params(error) => panic!("valid TEST_CODE wire was misparsed: {error}"),
+            DelegateError::Fetch(failure) => {
+                panic!("benchmark provider failure lost explicit audit ownership: {failure:?}")
+            }
+        }
+    }
 
     #[test]
     fn p01_limit_pools_request_requires_exact_upper_date_and_full_limit() {

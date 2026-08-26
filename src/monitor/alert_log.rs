@@ -99,9 +99,7 @@ pub fn read_today_records() -> Vec<AlertRecord> {
             match serde_json::from_str::<AlertRecord>(trimmed) {
                 Ok(record) => Some(record),
                 Err(error) => {
-                    log::warn!(
-                        "[alert_log] read_today_records 跳过无法解析的告警行: {error}"
-                    );
+                    log::warn!("[alert_log] read_today_records 跳过无法解析的告警行: {error}");
                     None
                 }
             }

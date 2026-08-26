@@ -67,6 +67,7 @@ const REQWEST_TRANSPORT_OWNER_PATHS: &[&str] = &[
 // business consumers. `magic_compat` is the reviewed upstream type boundary.
 // A new direct Magic provider owner must be reviewed and named individually.
 const MAGIC_PROVIDER_OWNER_PATHS: &[&str] = &[
+    "bin/t0_minute_probe.rs",
     "bin/t0_replay.rs",
     "bin/tdx_5min_probe.rs",
     "bin/tdx_raw_probe.rs",

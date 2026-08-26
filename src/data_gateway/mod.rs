@@ -1,5 +1,6 @@
 //! BR-164 evidence-preserving production financial/news data gateway.
 
+mod benchmark;
 pub mod block_trade;
 pub mod board;
 pub mod board_ranking;
@@ -35,6 +36,14 @@ pub mod review;
 pub mod security_lifecycle;
 pub mod sina_instrument_news;
 
+pub use benchmark::{
+    admit_benchmark_batch, probe_benchmark_request, AdmittedBenchmarkBatch,
+    BenchmarkAdmissionCoverage, BenchmarkBar, BenchmarkBarTime, BenchmarkCapture, BenchmarkError,
+    BenchmarkGranularity, BenchmarkProbeReport, BenchmarkRange, BenchmarkRawIdentityAnchor,
+    BenchmarkRawIdentityVerification, BenchmarkRawMinuteLabelSemantics, BenchmarkRawPageTrace,
+    BenchmarkRawTimeSample, BenchmarkReader, BenchmarkRegistry, BenchmarkRequest,
+    BenchmarkSnapshotRef, BenchmarkUnsupported, CapturePreview, HS300_CANONICAL,
+};
 pub use block_trade::{BlockTradeReview, BlockTradesGateway};
 pub use board::{
     load_verified_board_artifact_default, BoardBindingRegistry, BoardDataGateway,
