@@ -1125,3 +1125,34 @@ coverage、真实 TDX/gRPC probe、生产数据库 inventory/migration、capture
 均未执行；既有全仓 Gate B/C/D 阻塞仍按 §15.11 处理。回滚顺序为先
 `git revert 91d29f9c9e714cd13b3e2fa9a6e056843439677d`，再
 `git revert 7208a133ed400cf0c2605d0ce1c7e2c4ec4896bf`；已追加的审计事实不得删除。
+
+### 15.13 锁定来源版本组合修复证据（2026-08-26）
+
+`b04857b` → `aafc3de` 的 scoped final re-review 关闭 §15.12 原四项 Important 与文档漂移，
+但发现 `compose_exact` 的跨段一致性键遗漏 acquisition `source`：真实锁定的 TDX revision
+编码在 `magic-tdx-index-bars@<revision>`，只比较 `ProviderId::Tdx`、codec 与 payload version
+会允许两个不同 revision 组成同一 exact manifest。用户授权后将该发现作为独立 bounded task
+回到 Gate A/B，不继续沿用已耗尽的旧修复循环。
+
+提交 `0eb489e` 只修改 `src/database/benchmark_segments.rs`。组合一致性键从
+`(provider, codec, codec_version, payload_version)` 收紧为
+`(provider, acquisition source, codec, codec_version, payload_version)`；比较发生在唯一原始
+source binding 解析之后、payload 合并和新 manifest 发布之前。不同 locked revision 返回稳定
+`benchmark_composition_provider_version_mismatch`，测试以 `benchmark_manifest`、
+`benchmark_manifest_acquisition`、`benchmark_manifest_chain` 三表前后计数证明零组合写入；相同
+revision 的独立季度段继续成功，并由活动 `BenchmarkReader::read_exact` 按 exact request 读回
+完整 bars 和两份原 acquisition evidence。Reader、schema、migration、hash domain 与公开 API
+均未扩大。
+
+本任务保留可复核 RED：新增对抗测试第一次运行时 `compose_exact` 实际返回混合 revision
+manifest，1 failed / 3001 filtered；最小修复后该测试 1/1 通过，Reader 成功回归 1/1 通过。
+store all/no-default 各 55/55、benchmark all/no-default 各 25/25、strict lib Clippy、changed-file
+rustfmt 和 diff-check 均通过。全库单测在允许 loopback 测试夹具绑定后为 2995 passed / 0 failed /
+7 ignored。
+
+整体仍为 **Draft / In Progress / ResearchOnly**：workspace 全目标测试继续由未修改的 monitor
+BR-139/BR-241 两项结构计数断言阻断（683 passed / 2 failed / 4 ignored）；workspace Clippy
+继续命中既有 `hbars_probe`/`t0_replay`，全仓 fmt 仍是 §15.11 的 11 个未修改路径；安全合规中
+fake-impl、design-contradiction 通过，business-rules 保持既有 60 errors / 157 warnings。
+aggregate compliance/freshness、覆盖率、真实 provider/生产数据库、capture/replay commit、订单和
+推送均未运行。代码回滚为 `git revert 0eb489e`，不得删除任何已追加审计事实。

@@ -2270,7 +2270,14 @@ impl AttributionReplayRunner {
   连续身份和所有 row/association/chain 的小数秒 +60 日历月 retention；chain hash domain 升 V2。
 - [x] 本地验证：store all/no-default 各 54/54、Capture/Reader 各 4/4、benchmark all/no-default
   各 25/25、CLI all/no-default 各 6/6、strict lib/CLI Clippy、scoped fmt 与安全 fake/design 检查。
-- [ ] 生成 `b04857b` → final-fix HEAD 的冻结包并执行一次 scoped final re-review；未接受前整体
-  继续 `Draft / In Progress / ResearchOnly`。
+- [x] 生成 `b04857b` → `aafc3de` 的冻结包并执行 scoped final re-review；原四项 Important 与
+  文档漂移均关闭，但因 `compose_exact` 遗漏 acquisition source revision，以 `C0/I1/M0`
+  拒绝接受。
+- [x] 把剩余 I1 作为新的 bounded task 回到 Gate A/B：`0eb489e` 将 exact 一致性键收紧为
+  provider + exact source + codec/payload versions；不同 revision typed fail 且三张组合表零写，
+  相同 revision 经活动 `BenchmarkReader::read_exact` 成功。store all/no-default 各 55/55、
+  benchmark all/no-default 各 25/25、lib 2995/0/7 与 strict lib Clippy 通过。
+- [ ] 生成 `aafc3de` → 本任务文档 HEAD 的冻结包并执行新的独立 scoped final re-review；未接受前
+  整体继续 `Draft / In Progress / ResearchOnly`。
 - [ ] 生产 V1 benchmark chain inventory/migration、真实协议 probe/attestation、freshness、当前
   coverage、全仓 Gate B/C/D 与 Draft PR 远端同步均需单独授权/闭环，不能由本修复波次代替。
