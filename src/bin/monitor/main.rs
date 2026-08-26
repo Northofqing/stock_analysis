@@ -4060,11 +4060,13 @@ mod tests_br238_opening_readiness {
             .expect("production source precedes post-session tests");
         let blocking_call = ["external_static_opening_", "readiness().await"].concat();
         let resident_spawn = ["tokio::spawn(opening_static_", "readiness_loop())"].concat();
+        let p01_resident = ["p01::p01_", "scheduler_loop()"].concat();
+        let news_resident = ["news_monitor_loop(selection_", "v2_enabled)"].concat();
         assert!(!production.contains(&blocking_call));
         assert_eq!(production.matches(&resident_spawn).count(), 1);
-        assert!(production.contains("p01::p01_scheduler_loop()"));
+        assert!(production.contains(&p01_resident));
         assert!(production.contains("monitor_loop()"));
-        assert!(production.contains("news_monitor_loop(selection_v2_enabled)"));
+        assert!(production.contains(&news_resident));
         assert!(production.contains("data_mode_monitor_loop()"));
         assert!(production.contains("opening_readiness=not_applicable mode=test"));
         let forbidden_keepalive = ["off_session_quote_", "keepalive_loop"].concat();
