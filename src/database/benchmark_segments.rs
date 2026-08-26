@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 
-use chrono::{DateTime, Datelike, Duration, FixedOffset, Months, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, Months, NaiveDate, Utc};
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Binary, Integer, Nullable, Text};
 use serde::{Deserialize, Serialize};
@@ -21,9 +21,38 @@ const SEGMENT_CHAIN_GENESIS: &str = "BR251_BENCHMARK_SEGMENT_CHAIN_GENESIS_V1";
 const MANIFEST_CHAIN_GENESIS: &str = "BR251_BENCHMARK_MANIFEST_CHAIN_GENESIS_V1";
 const PAYLOAD_SCHEMA: &str = "BR251_BENCHMARK_SEGMENT_PAYLOAD_V1";
 const MANIFEST_ACQUISITION_SCHEMA: &str = "BR251_BENCHMARK_MANIFEST_ACQUISITION_V1";
+const COMPOSED_MANIFEST_ACQUISITION_SCHEMA: &str =
+    "BR251_BENCHMARK_COMPOSED_MANIFEST_ACQUISITION_V2";
 const CODEC: &str = "zstd";
 const CODEC_VERSION: i32 = 1;
 const PAYLOAD_VERSION: i32 = 1;
+const IMMUTABLE_TABLES: [(&str, &str, &str); 5] = [
+    (
+        "benchmark_segment_revision",
+        "BR-251 benchmark segment revision is immutable",
+        "BR-251 benchmark segment retention is at least five years",
+    ),
+    (
+        "benchmark_segment_chain",
+        "BR-251 benchmark segment chain is immutable",
+        "BR-251 benchmark segment chain retention is at least five years",
+    ),
+    (
+        "benchmark_manifest",
+        "BR-251 benchmark manifest is immutable",
+        "BR-251 benchmark manifest retention is at least five years",
+    ),
+    (
+        "benchmark_manifest_acquisition",
+        "BR-251 benchmark manifest acquisition is immutable",
+        "BR-251 benchmark manifest acquisition retention is at least five years",
+    ),
+    (
+        "benchmark_manifest_chain",
+        "BR-251 benchmark manifest chain is immutable",
+        "BR-251 benchmark manifest chain retention is at least five years",
+    ),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SegmentState {
@@ -58,6 +87,14 @@ pub struct BenchmarkManifestRef {
     pub from_key: String,
     pub to_key: String,
     pub segment_hashes: Vec<String>,
+}
+
+/// One exact retained segment revision and the immutable manifest that proves
+/// its original acquisition association. Composition never searches latest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BenchmarkRetainedSegmentRef {
+    pub source_manifest_hash: String,
+    pub segment_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +203,10 @@ struct CanonicalManifestAcquisitionBindingV1 {
     batch_id: String,
     accepted_count: i64,
     members: Vec<CanonicalManifestAcquisitionMemberV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_manifest_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_binding_hash: Option<String>,
 }
 
 struct PreparedSegment {
@@ -254,6 +295,10 @@ struct SegmentChainRow {
     previous_hash: String,
     #[diesel(sql_type = Text)]
     record_hash: String,
+    #[diesel(sql_type = Text)]
+    created_at: String,
+    #[diesel(sql_type = Text)]
+    retention_deadline: String,
 }
 
 #[derive(Debug, QueryableByName, Serialize)]
@@ -304,6 +349,51 @@ struct ManifestChainRow {
     previous_hash: String,
     #[diesel(sql_type = Text)]
     record_hash: String,
+    #[diesel(sql_type = Text)]
+    created_at: String,
+    #[diesel(sql_type = Text)]
+    retention_deadline: String,
+}
+
+#[derive(Debug, QueryableByName)]
+struct SequenceRow {
+    #[diesel(sql_type = Nullable<BigInt>)]
+    seq: Option<i64>,
+}
+
+#[derive(Debug, QueryableByName)]
+struct IdRow {
+    #[diesel(sql_type = BigInt)]
+    id: i64,
+}
+
+#[derive(Debug, QueryableByName)]
+struct TriggerSchemaRow {
+    #[diesel(sql_type = Text)]
+    name: String,
+    #[diesel(sql_type = Text)]
+    table_name: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    sql: Option<String>,
+}
+
+#[derive(Debug, QueryableByName)]
+struct RetentionWindow {
+    #[diesel(sql_type = Text)]
+    created_at: String,
+    #[diesel(sql_type = Text)]
+    retention_deadline: String,
+}
+
+#[derive(Debug, QueryableByName)]
+struct CountValueRow {
+    #[diesel(sql_type = BigInt)]
+    count: i64,
+}
+
+struct ValidatedBenchmarkState {
+    segment_chain_tail: String,
+    manifest_chain_tail: String,
 }
 
 #[derive(Debug, QueryableByName)]
@@ -862,7 +952,7 @@ fn load_segments(conn: &mut SqliteConnection) -> diesel::QueryResult<Vec<Persist
 
 fn load_segment_chains(conn: &mut SqliteConnection) -> diesel::QueryResult<Vec<SegmentChainRow>> {
     diesel::sql_query(
-        "SELECT segment_revision_id, previous_hash, record_hash
+        "SELECT segment_revision_id, previous_hash, record_hash, created_at, retention_deadline
          FROM benchmark_segment_chain ORDER BY segment_revision_id ASC",
     )
     .load(conn)
@@ -917,6 +1007,8 @@ fn build_manifest_acquisition_bindings(
                 batch_id: segment.batch_id.clone(),
                 accepted_count: segment.record_count,
                 members: vec![member],
+                source_manifest_hash: None,
+                source_binding_hash: None,
             });
         }
     }
@@ -942,48 +1034,80 @@ fn manifest_acquisition_binding_hash(
 }
 
 fn parse_persisted_utc_timestamp(value: &str) -> Result<DateTime<Utc>, String> {
-    if let Ok(value) = DateTime::parse_from_rfc3339(value) {
-        return Ok(value.with_timezone(&Utc));
+    let Some(without_z) = value.strip_suffix('Z') else {
+        return Err(format!("persisted timestamp is not canonical UTC: {value}"));
+    };
+    let Some((whole_seconds, fractional)) = without_z.rsplit_once('.') else {
+        return Err(format!(
+            "persisted timestamp does not retain fractional seconds: {value}"
+        ));
+    };
+    if !whole_seconds.contains('T')
+        || fractional.is_empty()
+        || fractional.len() > 9
+        || !fractional.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(format!(
+            "persisted timestamp has noncanonical fractional UTC bytes: {value}"
+        ));
     }
-    for format in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.fZ"] {
-        if let Ok(value) = NaiveDateTime::parse_from_str(value, format) {
-            return Ok(value.and_utc());
-        }
+    let parsed = DateTime::parse_from_rfc3339(value)
+        .map_err(|error| format!("invalid persisted UTC timestamp {value}: {error}"))?;
+    if parsed.offset().local_minus_utc() != 0 {
+        return Err(format!("persisted timestamp is not UTC: {value}"));
     }
-    Err(format!("invalid persisted UTC timestamp: {value}"))
+    Ok(parsed.with_timezone(&Utc))
+}
+
+fn validate_retention_window(
+    family: &str,
+    created_at: &str,
+    retention_deadline: &str,
+) -> diesel::QueryResult<()> {
+    let created_at = parse_persisted_utc_timestamp(created_at).map_err(|detail| {
+        integrity_store_error(
+            "benchmark_retention_invalid",
+            format!("BR-251 {family} created_at is invalid: {detail}"),
+        )
+    })?;
+    let retention_deadline =
+        parse_persisted_utc_timestamp(retention_deadline).map_err(|detail| {
+            integrity_store_error(
+                "benchmark_retention_invalid",
+                format!("BR-251 {family} retention_deadline is invalid: {detail}"),
+            )
+        })?;
+    if retention_deadline < created_at {
+        return Err(integrity_store_error(
+            "benchmark_retention_invalid",
+            format!("BR-251 {family} retention_deadline precedes created_at"),
+        ));
+    }
+    let minimum_deadline = created_at
+        .checked_add_months(Months::new(60))
+        .ok_or_else(|| {
+            integrity_store_error(
+                "benchmark_retention_invalid",
+                format!("BR-251 {family} 60-calendar-month deadline overflows"),
+            )
+        })?;
+    if retention_deadline < minimum_deadline {
+        return Err(integrity_store_error(
+            "benchmark_retention_invalid",
+            format!("BR-251 {family} retention must be at least 60 calendar months"),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_manifest_acquisition_retention(
     row: &PersistedManifestAcquisition,
 ) -> diesel::QueryResult<()> {
-    let created_at = parse_persisted_utc_timestamp(&row.created_at).map_err(|detail| {
-        integrity_store_error(
-            "benchmark_manifest_acquisition_retention_invalid",
-            format!("BR-251 manifest acquisition created_at is invalid: {detail}"),
-        )
-    })?;
-    let retention_deadline =
-        parse_persisted_utc_timestamp(&row.retention_deadline).map_err(|detail| {
-            integrity_store_error(
-                "benchmark_manifest_acquisition_retention_invalid",
-                format!("BR-251 manifest acquisition retention_deadline is invalid: {detail}"),
-            )
-        })?;
-    let minimum_deadline = created_at
-        .checked_add_months(Months::new(60))
-        .ok_or_else(|| {
-            integrity_store_error(
-                "benchmark_manifest_acquisition_retention_invalid",
-                "BR-251 manifest acquisition five-year deadline overflows",
-            )
-        })?;
-    if retention_deadline < minimum_deadline {
-        return Err(integrity_store_error(
-            "benchmark_manifest_acquisition_retention_invalid",
-            "BR-251 manifest acquisition retention must be at least five years",
-        ));
-    }
-    Ok(())
+    validate_retention_window(
+        "benchmark manifest acquisition",
+        &row.created_at,
+        &row.retention_deadline,
+    )
 }
 
 fn load_manifest_acquisitions(
@@ -1042,7 +1166,23 @@ fn load_manifest_acquisitions(
                 "BR-251 manifest acquisition binding hash mismatch",
             ));
         }
-        if binding.schema != MANIFEST_ACQUISITION_SCHEMA
+        let provenance_shape_valid = match binding.schema.as_str() {
+            MANIFEST_ACQUISITION_SCHEMA => {
+                binding.source_manifest_hash.is_none() && binding.source_binding_hash.is_none()
+            }
+            COMPOSED_MANIFEST_ACQUISITION_SCHEMA => {
+                binding
+                    .source_manifest_hash
+                    .as_deref()
+                    .is_some_and(is_lower_hex_hash)
+                    && binding
+                        .source_binding_hash
+                        .as_deref()
+                        .is_some_and(is_lower_hex_hash)
+            }
+            _ => false,
+        };
+        if !provenance_shape_valid
             || binding.audit_id <= 0
             || !is_lower_hex_hash(&binding.acquisition_record_hash)
             || !is_lower_hex_hash(&binding.request_hash)
@@ -1071,18 +1211,28 @@ fn load_manifest_acquisitions(
 
 fn load_manifest_chains(conn: &mut SqliteConnection) -> diesel::QueryResult<Vec<ManifestChainRow>> {
     diesel::sql_query(
-        "SELECT manifest_id, previous_hash, record_hash
+        "SELECT manifest_id, previous_hash, record_hash, created_at, retention_deadline
          FROM benchmark_manifest_chain ORDER BY manifest_id ASC",
     )
     .load(conn)
 }
 
-fn segment_chain_hash(previous_hash: &str, row: &PersistedSegment) -> diesel::QueryResult<String> {
+fn segment_chain_hash(
+    previous_hash: &str,
+    row: &PersistedSegment,
+    created_at: &str,
+    retention_deadline: &str,
+) -> diesel::QueryResult<String> {
     let payload = serde_json::to_vec(row)
         .map_err(|error| store_error(format!("BR-251 serialize segment row: {error}")))?;
     Ok(hash_with_domain(
-        b"BR251_BENCHMARK_SEGMENT_CHAIN_V1",
-        &[previous_hash.as_bytes(), &payload],
+        b"BR251_BENCHMARK_SEGMENT_CHAIN_V2",
+        &[
+            previous_hash.as_bytes(),
+            &payload,
+            created_at.as_bytes(),
+            retention_deadline.as_bytes(),
+        ],
     ))
 }
 
@@ -1090,6 +1240,8 @@ fn manifest_chain_hash(
     previous_hash: &str,
     row: &PersistedManifest,
     associations: &[PersistedManifestAcquisition],
+    created_at: &str,
+    retention_deadline: &str,
 ) -> diesel::QueryResult<String> {
     let payload = serde_json::to_vec(row)
         .map_err(|error| store_error(format!("BR-251 serialize manifest row: {error}")))?;
@@ -1099,9 +1251,142 @@ fn manifest_chain_hash(
         ))
     })?;
     Ok(hash_with_domain(
-        b"BR251_BENCHMARK_MANIFEST_CHAIN_V1",
-        &[previous_hash.as_bytes(), &payload, &acquisition],
+        b"BR251_BENCHMARK_MANIFEST_CHAIN_V2",
+        &[
+            previous_hash.as_bytes(),
+            &payload,
+            &acquisition,
+            created_at.as_bytes(),
+            retention_deadline.as_bytes(),
+        ],
     ))
+}
+
+fn new_retention_window(conn: &mut SqliteConnection) -> diesel::QueryResult<RetentionWindow> {
+    diesel::sql_query(
+        "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AS created_at,
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+5 years') AS retention_deadline",
+    )
+    .get_result(conn)
+}
+
+fn immutable_triggers(
+    conn: &mut SqliteConnection,
+    table: &str,
+    update_action: &str,
+    delete_action: &str,
+) -> diesel::QueryResult<()> {
+    diesel::sql_query(format!(
+        "CREATE TRIGGER IF NOT EXISTS trg_{table}_no_update
+         BEFORE UPDATE ON {table}
+         BEGIN SELECT RAISE(ABORT, '{update_action}'); END",
+    ))
+    .execute(conn)?;
+    diesel::sql_query(format!(
+        "CREATE TRIGGER IF NOT EXISTS trg_{table}_no_delete
+         BEFORE DELETE ON {table}
+         BEGIN SELECT RAISE(ABORT, '{delete_action}'); END",
+    ))
+    .execute(conn)?;
+    Ok(())
+}
+
+fn expected_trigger_sql(table: &str, event: &str, action: &str) -> String {
+    format!(
+        "CREATE TRIGGER trg_{table}_no_{} BEFORE {event} ON {table} \
+         BEGIN SELECT RAISE(ABORT, '{action}'); END",
+        event.to_ascii_lowercase(),
+    )
+}
+
+fn normalized_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn validate_immutable_triggers(conn: &mut SqliteConnection) -> diesel::QueryResult<()> {
+    for (table, update_action, delete_action) in IMMUTABLE_TABLES {
+        for (event, action) in [("UPDATE", update_action), ("DELETE", delete_action)] {
+            let name = format!("trg_{table}_no_{}", event.to_ascii_lowercase());
+            let expected = expected_trigger_sql(table, event, action);
+            let row = diesel::sql_query(
+                "SELECT name, tbl_name AS table_name, sql
+                 FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            )
+            .bind::<Text, _>(&name)
+            .get_result::<TriggerSchemaRow>(conn)
+            .optional()?;
+            let exact = row.is_some_and(|row| {
+                row.name == name
+                    && row.table_name == table
+                    && row
+                        .sql
+                        .is_some_and(|sql| normalized_sql(&sql) == normalized_sql(&expected))
+            });
+            if !exact {
+                return Err(integrity_store_error(
+                    "benchmark_trigger_definition_invalid",
+                    format!(
+                        "BR-251 immutable trigger {name} does not match its canonical table, timing, event and abort action"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_autoincrement_highwater(
+    conn: &mut SqliteConnection,
+    table: &str,
+    ids: &[i64],
+) -> diesel::QueryResult<()> {
+    let sequence = diesel::sql_query("SELECT seq FROM sqlite_sequence WHERE name = ?")
+        .bind::<Text, _>(table)
+        .get_result::<SequenceRow>(conn)
+        .optional()?;
+    let exact = match sequence {
+        None => ids.is_empty(),
+        Some(SequenceRow {
+            seq: Some(highwater),
+        }) if highwater > 0 => ids.iter().copied().eq(1..=highwater),
+        Some(_) => false,
+    };
+    if !exact {
+        return Err(integrity_store_error(
+            "benchmark_sequence_highwater_invalid",
+            format!(
+                "BR-251 {table} AUTOINCREMENT high-water does not match its full append-only identity sequence"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_all_state(conn: &mut SqliteConnection) -> diesel::QueryResult<ValidatedBenchmarkState> {
+    validate_immutable_triggers(conn)?;
+    let segment_ids = load_segments(conn)?
+        .into_iter()
+        .map(|row| row.id)
+        .collect::<Vec<_>>();
+    let manifest_ids = load_manifests(conn)?
+        .into_iter()
+        .map(|row| row.id)
+        .collect::<Vec<_>>();
+    let association_ids =
+        diesel::sql_query("SELECT id FROM benchmark_manifest_acquisition ORDER BY id ASC")
+            .load::<IdRow>(conn)?
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+    validate_autoincrement_highwater(conn, "benchmark_segment_revision", &segment_ids)?;
+    validate_autoincrement_highwater(conn, "benchmark_manifest", &manifest_ids)?;
+    validate_autoincrement_highwater(conn, "benchmark_manifest_acquisition", &association_ids)?;
+    let segment_chain_tail = validate_segment_chain(conn)?;
+    let manifest_chain_tail = validate_manifest_chain(conn)?;
+    Ok(ValidatedBenchmarkState {
+        segment_chain_tail,
+        manifest_chain_tail,
+    })
 }
 
 fn validate_segment_chain(conn: &mut SqliteConnection) -> diesel::QueryResult<String> {
@@ -1117,6 +1402,16 @@ fn validate_segment_chain(conn: &mut SqliteConnection) -> diesel::QueryResult<St
     let mut previous = SEGMENT_CHAIN_GENESIS.to_string();
     let mut identity_tails: HashMap<(&str, &str, &str), &str> = HashMap::new();
     for (row, link) in rows.iter().zip(chain.iter()) {
+        validate_retention_window(
+            "benchmark segment revision",
+            &row.created_at,
+            &row.retention_deadline,
+        )?;
+        validate_retention_window(
+            "benchmark segment chain",
+            &link.created_at,
+            &link.retention_deadline,
+        )?;
         if link.segment_revision_id != row.id || link.previous_hash != previous {
             return Err(store_error(format!(
                 "BR-251 segment chain linkage mismatch at revision {}",
@@ -1135,7 +1430,9 @@ fn validate_segment_chain(conn: &mut SqliteConnection) -> diesel::QueryResult<St
                 row.id
             )));
         }
-        let expected_hash = segment_chain_hash(&previous, row)?;
+        decode_segment(row).map_err(store_error)?;
+        let expected_hash =
+            segment_chain_hash(&previous, row, &link.created_at, &link.retention_deadline)?;
         if link.record_hash != expected_hash {
             return Err(store_error(format!(
                 "BR-251 segment chain hash mismatch at revision {}",
@@ -1161,6 +1458,16 @@ fn validate_manifest_chain(conn: &mut SqliteConnection) -> diesel::QueryResult<S
     }
     let mut previous = MANIFEST_CHAIN_GENESIS.to_string();
     for (row, link) in rows.iter().zip(chain.iter()) {
+        validate_retention_window(
+            "benchmark manifest",
+            &row.created_at,
+            &row.retention_deadline,
+        )?;
+        validate_retention_window(
+            "benchmark manifest chain",
+            &link.created_at,
+            &link.retention_deadline,
+        )?;
         if link.manifest_id != row.id || link.previous_hash != previous {
             return Err(store_error(format!(
                 "BR-251 manifest chain linkage mismatch at manifest {}",
@@ -1182,6 +1489,7 @@ fn validate_manifest_chain(conn: &mut SqliteConnection) -> diesel::QueryResult<S
             .collect::<diesel::QueryResult<Vec<_>>>()?;
         validate_manifest_acquisition_membership(&manifest, &segments, &bindings)
             .map_err(typed_store_error)?;
+        validate_composed_acquisition_provenance(conn, row.id, &bindings)?;
         for binding in &bindings {
             verify_audit_facts(
                 conn,
@@ -1202,7 +1510,13 @@ fn validate_manifest_chain(conn: &mut SqliteConnection) -> diesel::QueryResult<S
             )?;
         }
         stored_manifest_ref(row, &bindings).map_err(store_error)?;
-        let expected_hash = manifest_chain_hash(&previous, row, &associations)?;
+        let expected_hash = manifest_chain_hash(
+            &previous,
+            row,
+            &associations,
+            &link.created_at,
+            &link.retention_deadline,
+        )?;
         if link.record_hash != expected_hash {
             return Err(store_error(format!(
                 "BR-251 manifest chain hash mismatch at manifest {}",
@@ -1499,7 +1813,14 @@ fn validate_manifest_acquisition_membership(
                     )
                 })?;
         }
-        if represented_count != binding.accepted_count {
+        let count_matches_scope = match binding.schema.as_str() {
+            MANIFEST_ACQUISITION_SCHEMA => represented_count == binding.accepted_count,
+            COMPOSED_MANIFEST_ACQUISITION_SCHEMA => {
+                represented_count > 0 && represented_count <= binding.accepted_count
+            }
+            _ => false,
+        };
+        if !count_matches_scope {
             return Err(failed_integrity(
                 "benchmark_manifest_acquisition_count_mismatch",
                 "BR-251 manifest acquisition accepted_count membership mismatch",
@@ -1511,6 +1832,72 @@ fn validate_manifest_acquisition_membership(
             "benchmark_manifest_acquisition_member_uncovered",
             "BR-251 manifest acquisition association leaves a member uncovered",
         ));
+    }
+    Ok(())
+}
+
+fn validate_composed_acquisition_provenance(
+    conn: &mut SqliteConnection,
+    current_manifest_id: i64,
+    bindings: &[CanonicalManifestAcquisitionBindingV1],
+) -> diesel::QueryResult<()> {
+    for binding in bindings {
+        if binding.schema != COMPOSED_MANIFEST_ACQUISITION_SCHEMA {
+            continue;
+        }
+        let source_manifest_hash = binding.source_manifest_hash.as_deref().ok_or_else(|| {
+            integrity_store_error(
+                "benchmark_composition_provenance_invalid",
+                "BR-251 composed acquisition is missing its source manifest identity",
+            )
+        })?;
+        let source_binding_hash = binding.source_binding_hash.as_deref().ok_or_else(|| {
+            integrity_store_error(
+                "benchmark_composition_provenance_invalid",
+                "BR-251 composed acquisition is missing its source binding identity",
+            )
+        })?;
+        let source_manifest = load_manifest_by_hash(conn, source_manifest_hash)?
+            .filter(|source| source.id < current_manifest_id)
+            .ok_or_else(|| {
+                integrity_store_error(
+                    "benchmark_composition_source_manifest_invalid",
+                    "BR-251 composed acquisition source manifest is missing, cyclic or not retained earlier",
+                )
+            })?;
+        let source_ref = decoded_manifest_ref(&source_manifest).map_err(store_error)?;
+        let (source_rows, source_bindings) = load_manifest_acquisitions(conn, source_manifest.id)?;
+        let source_binding = source_rows
+            .iter()
+            .zip(source_bindings.iter())
+            .find_map(|(row, candidate)| {
+                (row.binding_hash == source_binding_hash).then_some(candidate)
+            })
+            .ok_or_else(|| {
+                integrity_store_error(
+                    "benchmark_composition_source_binding_invalid",
+                    "BR-251 composed acquisition source binding is unavailable",
+                )
+            })?;
+        let original_facts_match = binding.audit_id == source_binding.audit_id
+            && binding.acquisition_record_hash == source_binding.acquisition_record_hash
+            && binding.provider == source_binding.provider
+            && binding.source == source_binding.source
+            && binding.request_hash == source_binding.request_hash
+            && binding.source_at == source_binding.source_at
+            && binding.observed_at == source_binding.observed_at
+            && binding.batch_id == source_binding.batch_id
+            && binding.accepted_count == source_binding.accepted_count;
+        let members_are_retained = binding.members.iter().all(|member| {
+            source_ref.segment_hashes.contains(&member.segment_hash)
+                && source_binding.members.contains(member)
+        });
+        if !original_facts_match || !members_are_retained {
+            return Err(integrity_store_error(
+                "benchmark_composition_provenance_invalid",
+                "BR-251 composed acquisition does not preserve its original manifest, receipt and member binding",
+            ));
+        }
     }
     Ok(())
 }
@@ -1682,14 +2069,23 @@ fn insert_segment(
     }
     let row = load_segment_by_hash(conn, &prepared.segment_hash)?
         .ok_or_else(|| store_error("BR-251 inserted segment cannot be reloaded"))?;
-    let record_hash = segment_chain_hash(previous_chain_hash, &row)?;
+    let window = new_retention_window(conn)?;
+    let record_hash = segment_chain_hash(
+        previous_chain_hash,
+        &row,
+        &window.created_at,
+        &window.retention_deadline,
+    )?;
     let chain_inserted = diesel::sql_query(
         "INSERT INTO benchmark_segment_chain
-         (segment_revision_id, previous_hash, record_hash) VALUES (?, ?, ?)",
+         (segment_revision_id, previous_hash, record_hash, created_at, retention_deadline)
+         VALUES (?, ?, ?, ?, ?)",
     )
     .bind::<BigInt, _>(row.id)
     .bind::<Text, _>(previous_chain_hash)
     .bind::<Text, _>(&record_hash)
+    .bind::<Text, _>(&window.created_at)
+    .bind::<Text, _>(&window.retention_deadline)
     .execute(conn)?;
     if chain_inserted != 1 {
         return Err(store_error(format!(
@@ -1769,14 +2165,24 @@ fn insert_manifest(
             "BR-251 inserted manifest acquisition associations cannot be reproduced",
         ));
     }
-    let record_hash = manifest_chain_hash(previous_chain_hash, &row, &associations)?;
+    let window = new_retention_window(conn)?;
+    let record_hash = manifest_chain_hash(
+        previous_chain_hash,
+        &row,
+        &associations,
+        &window.created_at,
+        &window.retention_deadline,
+    )?;
     let chain_inserted = diesel::sql_query(
-        "INSERT INTO benchmark_manifest_chain (manifest_id, previous_hash, record_hash)
-         VALUES (?, ?, ?)",
+        "INSERT INTO benchmark_manifest_chain (
+            manifest_id, previous_hash, record_hash, created_at, retention_deadline
+         ) VALUES (?, ?, ?, ?, ?)",
     )
     .bind::<BigInt, _>(row.id)
     .bind::<Text, _>(previous_chain_hash)
     .bind::<Text, _>(&record_hash)
+    .bind::<Text, _>(&window.created_at)
+    .bind::<Text, _>(&window.retention_deadline)
     .execute(conn)?;
     if chain_inserted != 1 {
         return Err(store_error(format!(
@@ -1796,9 +2202,7 @@ fn read_exact_on_connection(
             "BR-251 exact manifest hash must be 64 lowercase hex characters",
         ));
     }
-    super::data_acquisition_audit::validate_data_acquisition_audit_chain(conn)?;
-    validate_segment_chain(conn)?;
-    validate_manifest_chain(conn)?;
+    validate_all_state(conn)?;
     let row = load_manifest_by_hash(conn, manifest_hash)?.ok_or_else(|| {
         unavailable_store_error(
             "benchmark_manifest_unavailable",
@@ -1853,7 +2257,7 @@ fn read_exact_on_connection(
         .map_err(typed_store_error)?;
     let mut evidence = Vec::with_capacity(acquisition_bindings.len());
     for binding in &acquisition_bindings {
-        if binding.request_hash != request_hash {
+        if binding.schema == MANIFEST_ACQUISITION_SCHEMA && binding.request_hash != request_hash {
             return Err(store_error(
                 "BR-251 manifest acquisition request_hash mismatch",
             ));
@@ -1969,9 +2373,9 @@ impl<'a> BenchmarkSegmentStore<'a> {
         })?;
         conn.immediate_transaction::<_, diesel::result::Error, _>(|conn| {
             let body_result = (|| -> diesel::QueryResult<BenchmarkManifestRef> {
-                super::data_acquisition_audit::validate_data_acquisition_audit_chain(conn)?;
-                let mut segment_chain_tail = validate_segment_chain(conn)?;
-                let manifest_chain_tail = validate_manifest_chain(conn)?;
+                let state = validate_all_state(conn)?;
+                let mut segment_chain_tail = state.segment_chain_tail;
+                let manifest_chain_tail = state.manifest_chain_tail;
                 let existing_segments = prepared
                     .iter()
                     .map(|segment| load_segment_by_hash(conn, &segment.segment_hash))
@@ -2073,6 +2477,268 @@ impl<'a> BenchmarkSegmentStore<'a> {
         })
     }
 
+    /// Compose one exact manifest from caller-selected retained revisions.
+    ///
+    /// Each selection names both the source manifest and segment revision that
+    /// preserve its original BR-159 request/receipt binding. This path never
+    /// searches latest and never relabels an acquisition for the new request.
+    pub fn compose_exact(
+        &self,
+        request: BenchmarkRequest,
+        selections: Vec<BenchmarkRetainedSegmentRef>,
+    ) -> Result<BenchmarkManifestRef, BenchmarkSegmentStoreError> {
+        if selections.is_empty() {
+            return Err(unavailable(
+                "benchmark_composition_segment_unavailable",
+                false,
+                "BR-251 exact composition requires caller-selected retained segments",
+            ));
+        }
+        let (granularity, from_key, to_key) = request_parts(&request)
+            .map_err(|detail| failed_integrity("benchmark_composition_request_invalid", detail))?;
+        if selections.iter().any(|selection| {
+            !is_lower_hex_hash(&selection.source_manifest_hash)
+                || !is_lower_hex_hash(&selection.segment_hash)
+        }) {
+            return Err(failed_integrity(
+                "benchmark_composition_identity_invalid",
+                "BR-251 exact composition identities must be 64 lowercase hex characters",
+            ));
+        }
+
+        let mut conn = self.database.get_conn().map_err(|error| {
+            unavailable(
+                "benchmark_segment_storage_unavailable",
+                true,
+                format!("BR-251 benchmark composition DB connection: {error}"),
+            )
+        })?;
+        conn.immediate_transaction::<_, diesel::result::Error, _>(|conn| {
+            let body_result = (|| -> diesel::QueryResult<BenchmarkManifestRef> {
+                let state = validate_all_state(conn)?;
+                let expected_granularity = granularity_name(granularity);
+                let mut segment_hashes = Vec::with_capacity(selections.len());
+                let mut retained_segments = Vec::with_capacity(selections.len());
+                let mut payload = Vec::new();
+                let mut acquisition_bindings =
+                    Vec::<CanonicalManifestAcquisitionBindingV1>::new();
+                let mut binding_provenance = HashMap::<(String, String), usize>::new();
+                let mut audit_provenance = HashMap::<i64, (String, String)>::new();
+                let mut seen_segments = HashSet::new();
+                let mut seen_quarters = HashSet::new();
+                let mut previous_order: Option<(String, String, String)> = None;
+                let mut provider_version: Option<(String, String, i32, i32)> = None;
+
+                for selection in &selections {
+                    if !seen_segments.insert(selection.segment_hash.clone()) {
+                        return Err(integrity_store_error(
+                            "benchmark_composition_segment_duplicate",
+                            "BR-251 exact composition repeats a retained segment revision",
+                        ));
+                    }
+                    let source_row = load_manifest_by_hash(conn, &selection.source_manifest_hash)?
+                        .ok_or_else(|| {
+                            unavailable_store_error(
+                                "benchmark_composition_source_manifest_unavailable",
+                                false,
+                                "BR-251 exact composition source manifest is unavailable",
+                            )
+                        })?;
+                    let (source_associations, source_bindings) =
+                        load_manifest_acquisitions(conn, source_row.id)?;
+                    let source_manifest =
+                        stored_manifest_ref(&source_row, &source_bindings).map_err(store_error)?;
+                    if !source_manifest
+                        .segment_hashes
+                        .contains(&selection.segment_hash)
+                    {
+                        return Err(integrity_store_error(
+                            "benchmark_composition_source_member_mismatch",
+                            "BR-251 selected segment is not retained by its named source manifest",
+                        ));
+                    }
+                    let segment = load_segment_by_hash(conn, &selection.segment_hash)?
+                        .ok_or_else(|| {
+                            unavailable_store_error(
+                                "benchmark_composition_segment_unavailable",
+                                false,
+                                "BR-251 selected retained segment is unavailable",
+                            )
+                        })?;
+                    if source_manifest.instrument != segment.instrument
+                        || granularity_name(source_manifest.granularity) != segment.granularity
+                        || segment.instrument != request.instrument
+                        || segment.granularity != expected_granularity
+                    {
+                        return Err(integrity_store_error(
+                            "benchmark_composition_identity_mismatch",
+                            "BR-251 exact composition mixes instrument or granularity identities",
+                        ));
+                    }
+                    if !seen_quarters.insert(segment.quarter_start.clone()) {
+                        return Err(integrity_store_error(
+                            "benchmark_composition_quarter_overlap",
+                            "BR-251 exact composition repeats or overlaps a natural quarter",
+                        ));
+                    }
+                    let order = (
+                        segment.quarter_start.clone(),
+                        segment.granularity.clone(),
+                        segment.segment_hash.clone(),
+                    );
+                    if previous_order
+                        .as_ref()
+                        .is_some_and(|previous| previous >= &order)
+                    {
+                        return Err(integrity_store_error(
+                            "benchmark_composition_order_invalid",
+                            "BR-251 exact composition selections are not in canonical quarter order",
+                        ));
+                    }
+                    previous_order = Some(order);
+                    let version = (
+                        segment.provider.clone(),
+                        segment.codec.clone(),
+                        segment.codec_version,
+                        segment.payload_version,
+                    );
+                    if provider_version
+                        .as_ref()
+                        .is_some_and(|expected| expected != &version)
+                    {
+                        return Err(integrity_store_error(
+                            "benchmark_composition_provider_version_mismatch",
+                            "BR-251 exact composition mixes provider or payload version identities",
+                        ));
+                    }
+                    if provider_version.is_none() {
+                        provider_version = Some(version);
+                    }
+
+                    let decoded = decode_segment(&segment).map_err(store_error)?;
+                    payload.extend(decoded);
+                    segment_hashes.push(segment.segment_hash.clone());
+                    retained_segments.push(segment);
+
+                    let mut matching = source_bindings
+                        .iter()
+                        .zip(source_associations.iter())
+                        .filter_map(|(binding, association)| {
+                            binding
+                                .members
+                                .iter()
+                                .find(|member| member.segment_hash == selection.segment_hash)
+                                .map(|member| (binding, association, member))
+                        });
+                    let (source_binding, source_association, member) =
+                        matching.next().ok_or_else(|| {
+                            integrity_store_error(
+                                "benchmark_composition_source_binding_invalid",
+                                "BR-251 source manifest does not bind the selected segment to an acquisition",
+                            )
+                        })?;
+                    if matching.next().is_some() {
+                        return Err(integrity_store_error(
+                            "benchmark_composition_source_binding_invalid",
+                            "BR-251 source manifest binds one segment to multiple acquisitions",
+                        ));
+                    }
+                    let provenance = (
+                        selection.source_manifest_hash.clone(),
+                        source_association.binding_hash.clone(),
+                    );
+                    if audit_provenance
+                        .insert(source_binding.audit_id, provenance.clone())
+                        .is_some_and(|retained| retained != provenance)
+                    {
+                        return Err(integrity_store_error(
+                            "benchmark_composition_audit_provenance_conflict",
+                            "BR-251 one acquisition audit is selected through conflicting source bindings",
+                        ));
+                    }
+                    if let Some(index) = binding_provenance.get(&provenance).copied() {
+                        acquisition_bindings[index].members.push(member.clone());
+                    } else {
+                        binding_provenance.insert(provenance.clone(), acquisition_bindings.len());
+                        acquisition_bindings.push(CanonicalManifestAcquisitionBindingV1 {
+                            schema: COMPOSED_MANIFEST_ACQUISITION_SCHEMA.into(),
+                            audit_id: source_binding.audit_id,
+                            acquisition_record_hash: source_binding
+                                .acquisition_record_hash
+                                .clone(),
+                            provider: source_binding.provider.clone(),
+                            source: source_binding.source.clone(),
+                            request_hash: source_binding.request_hash.clone(),
+                            source_at: source_binding.source_at.clone(),
+                            observed_at: source_binding.observed_at.clone(),
+                            batch_id: source_binding.batch_id.clone(),
+                            accepted_count: source_binding.accepted_count,
+                            members: vec![member.clone()],
+                            source_manifest_hash: Some(provenance.0),
+                            source_binding_hash: Some(provenance.1),
+                        });
+                    }
+                }
+
+                request
+                    .validate_persisted_payload(&payload)
+                    .map_err(|error| {
+                        typed_store_error(map_benchmark_error(
+                            error,
+                            "BR-251 exact composition does not cover the requested payload",
+                        ))
+                    })?;
+                let manifest = BenchmarkManifestRef {
+                    manifest_hash: compute_manifest_hash(
+                        &request.instrument,
+                        expected_granularity,
+                        &from_key,
+                        &to_key,
+                        &segment_hashes,
+                        &acquisition_bindings,
+                    )
+                    .map_err(store_error)?,
+                    instrument: request.instrument.clone(),
+                    granularity,
+                    from_key: from_key.clone(),
+                    to_key: to_key.clone(),
+                    segment_hashes,
+                };
+                validate_manifest_acquisition_membership(
+                    &manifest,
+                    &retained_segments,
+                    &acquisition_bindings,
+                )
+                .map_err(typed_store_error)?;
+                insert_manifest(
+                    conn,
+                    &manifest,
+                    &acquisition_bindings,
+                    &state.manifest_chain_tail,
+                )?;
+                let (retained_manifest, retained_payload, _) =
+                    read_exact_on_connection(conn, &manifest.manifest_hash)?;
+                if retained_manifest != manifest || retained_payload != payload {
+                    return Err(integrity_store_error(
+                        "benchmark_composition_exact_read_mismatch",
+                        "BR-251 composed manifest exact-read proof disagrees with its selected payload",
+                    ));
+                }
+                Ok(manifest)
+            })();
+            body_result.map_err(|error| {
+                transaction_body_error(error, "BR-251 exact benchmark composition body")
+            })
+        })
+        .map_err(|error| {
+            map_diesel_error(
+                error,
+                "BR-251 exact benchmark composition",
+                DieselErrorContext::TransactionEnvelope,
+            )
+        })
+    }
+
     pub(crate) fn read_exact(
         &self,
         manifest_hash: &str,
@@ -2103,6 +2769,19 @@ impl<'a> BenchmarkSegmentStore<'a> {
 }
 
 pub(super) fn create_schema(conn: &mut SqliteConnection) -> diesel::QueryResult<()> {
+    let existing_table_count = diesel::sql_query(
+        "SELECT COUNT(*) AS count FROM sqlite_master
+         WHERE type = 'table' AND name IN (
+            'benchmark_segment_revision', 'benchmark_segment_chain',
+            'benchmark_manifest', 'benchmark_manifest_acquisition',
+            'benchmark_manifest_chain'
+         )",
+    )
+    .get_result::<CountValueRow>(conn)?
+    .count;
+    if existing_table_count != 0 {
+        validate_immutable_triggers(conn)?;
+    }
     diesel::sql_query(
         "CREATE TABLE IF NOT EXISTS benchmark_segment_revision (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2129,48 +2808,36 @@ pub(super) fn create_schema(conn: &mut SqliteConnection) -> diesel::QueryResult<
             acquisition_record_hash TEXT NOT NULL CHECK(length(acquisition_record_hash) = 64),
             predecessor_segment_hash TEXT,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-            retention_deadline TEXT NOT NULL DEFAULT (datetime('now', '+5 years')),
+            retention_deadline TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+5 years')),
             UNIQUE(instrument, granularity, quarter_start, state, canonical_hash),
             FOREIGN KEY(acquisition_audit_id) REFERENCES data_acquisition_audit(id),
             FOREIGN KEY(predecessor_segment_hash) REFERENCES benchmark_segment_revision(segment_hash)
         )",
     )
     .execute(conn)?;
-    diesel::sql_query(
-        "CREATE TRIGGER IF NOT EXISTS trg_benchmark_segment_revision_no_update
-         BEFORE UPDATE ON benchmark_segment_revision
-         BEGIN SELECT RAISE(ABORT, 'BR-251 benchmark segment revision is immutable'); END",
-    )
-    .execute(conn)?;
-    diesel::sql_query(
-        "CREATE TRIGGER IF NOT EXISTS trg_benchmark_segment_revision_no_delete
-         BEFORE DELETE ON benchmark_segment_revision
-         BEGIN SELECT RAISE(ABORT, 'BR-251 benchmark segment retention is at least five years'); END",
-    )
-    .execute(conn)?;
+    immutable_triggers(
+        conn,
+        IMMUTABLE_TABLES[0].0,
+        IMMUTABLE_TABLES[0].1,
+        IMMUTABLE_TABLES[0].2,
+    )?;
     diesel::sql_query(
         "CREATE TABLE IF NOT EXISTS benchmark_segment_chain (
             segment_revision_id INTEGER PRIMARY KEY NOT NULL,
             previous_hash TEXT NOT NULL,
             record_hash TEXT NOT NULL UNIQUE,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-            retention_deadline TEXT NOT NULL DEFAULT (datetime('now', '+5 years')),
+            retention_deadline TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+5 years')),
             FOREIGN KEY(segment_revision_id) REFERENCES benchmark_segment_revision(id)
         )",
     )
     .execute(conn)?;
-    diesel::sql_query(
-        "CREATE TRIGGER IF NOT EXISTS trg_benchmark_segment_chain_no_update
-         BEFORE UPDATE ON benchmark_segment_chain
-         BEGIN SELECT RAISE(ABORT, 'BR-251 benchmark segment chain is immutable'); END",
-    )
-    .execute(conn)?;
-    diesel::sql_query(
-        "CREATE TRIGGER IF NOT EXISTS trg_benchmark_segment_chain_no_delete
-         BEFORE DELETE ON benchmark_segment_chain
-         BEGIN SELECT RAISE(ABORT, 'BR-251 benchmark segment chain retention is at least five years'); END",
-    )
-    .execute(conn)?;
+    immutable_triggers(
+        conn,
+        IMMUTABLE_TABLES[1].0,
+        IMMUTABLE_TABLES[1].1,
+        IMMUTABLE_TABLES[1].2,
+    )?;
     diesel::sql_query(
         "CREATE TABLE IF NOT EXISTS benchmark_manifest (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2181,22 +2848,16 @@ pub(super) fn create_schema(conn: &mut SqliteConnection) -> diesel::QueryResult<
             to_key TEXT NOT NULL,
             segment_hashes_json TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-            retention_deadline TEXT NOT NULL DEFAULT (datetime('now', '+5 years'))
+            retention_deadline TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+5 years'))
         )",
     )
     .execute(conn)?;
-    diesel::sql_query(
-        "CREATE TRIGGER IF NOT EXISTS trg_benchmark_manifest_no_update
-         BEFORE UPDATE ON benchmark_manifest
-         BEGIN SELECT RAISE(ABORT, 'BR-251 benchmark manifest is immutable'); END",
-    )
-    .execute(conn)?;
-    diesel::sql_query(
-        "CREATE TRIGGER IF NOT EXISTS trg_benchmark_manifest_no_delete
-         BEFORE DELETE ON benchmark_manifest
-         BEGIN SELECT RAISE(ABORT, 'BR-251 benchmark manifest retention is at least five years'); END",
-    )
-    .execute(conn)?;
+    immutable_triggers(
+        conn,
+        IMMUTABLE_TABLES[2].0,
+        IMMUTABLE_TABLES[2].1,
+        IMMUTABLE_TABLES[2].2,
+    )?;
     diesel::sql_query(
         "CREATE TABLE IF NOT EXISTS benchmark_manifest_acquisition (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2212,43 +2873,30 @@ pub(super) fn create_schema(conn: &mut SqliteConnection) -> diesel::QueryResult<
         )",
     )
     .execute(conn)?;
-    diesel::sql_query(
-        "CREATE TRIGGER IF NOT EXISTS trg_benchmark_manifest_acquisition_no_update
-         BEFORE UPDATE ON benchmark_manifest_acquisition
-         BEGIN SELECT RAISE(ABORT, 'BR-251 benchmark manifest acquisition is immutable'); END",
-    )
-    .execute(conn)?;
-    diesel::sql_query(
-        "CREATE TRIGGER IF NOT EXISTS trg_benchmark_manifest_acquisition_no_delete
-         BEFORE DELETE ON benchmark_manifest_acquisition
-         BEGIN SELECT RAISE(ABORT, 'BR-251 benchmark manifest acquisition retention is at least five years'); END",
-    )
-    .execute(conn)?;
+    immutable_triggers(
+        conn,
+        IMMUTABLE_TABLES[3].0,
+        IMMUTABLE_TABLES[3].1,
+        IMMUTABLE_TABLES[3].2,
+    )?;
     diesel::sql_query(
         "CREATE TABLE IF NOT EXISTS benchmark_manifest_chain (
             manifest_id INTEGER PRIMARY KEY NOT NULL,
             previous_hash TEXT NOT NULL,
             record_hash TEXT NOT NULL UNIQUE,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-            retention_deadline TEXT NOT NULL DEFAULT (datetime('now', '+5 years')),
+            retention_deadline TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+5 years')),
             FOREIGN KEY(manifest_id) REFERENCES benchmark_manifest(id)
         )",
     )
     .execute(conn)?;
-    diesel::sql_query(
-        "CREATE TRIGGER IF NOT EXISTS trg_benchmark_manifest_chain_no_update
-         BEFORE UPDATE ON benchmark_manifest_chain
-         BEGIN SELECT RAISE(ABORT, 'BR-251 benchmark manifest chain is immutable'); END",
-    )
-    .execute(conn)?;
-    diesel::sql_query(
-        "CREATE TRIGGER IF NOT EXISTS trg_benchmark_manifest_chain_no_delete
-         BEFORE DELETE ON benchmark_manifest_chain
-         BEGIN SELECT RAISE(ABORT, 'BR-251 benchmark manifest chain retention is at least five years'); END",
-    )
-    .execute(conn)?;
-    validate_segment_chain(conn)?;
-    validate_manifest_chain(conn)?;
+    immutable_triggers(
+        conn,
+        IMMUTABLE_TABLES[4].0,
+        IMMUTABLE_TABLES[4].1,
+        IMMUTABLE_TABLES[4].2,
+    )?;
+    validate_all_state(conn)?;
     Ok(())
 }
 
@@ -2291,6 +2939,14 @@ mod tests {
     struct BlobRow {
         #[diesel(sql_type = Binary)]
         value: Vec<u8>,
+    }
+
+    #[derive(QueryableByName)]
+    struct TimestampRow {
+        #[diesel(sql_type = Text)]
+        created_at: String,
+        #[diesel(sql_type = Text)]
+        retention_deadline: String,
     }
 
     fn test_database_error(
@@ -2667,6 +3323,11 @@ mod tests {
         .bind::<Text, _>(&manifest.manifest_hash)
         .execute(&mut conn)
         .expect("TEST_CODE rewrite association binding");
+        diesel::sql_query(canonical_update_trigger_definition(
+            "benchmark_manifest_acquisition",
+        ))
+        .execute(&mut conn)
+        .expect("TEST_CODE restore association update trigger");
     }
 
     fn count(conn: &mut SqliteConnection, table: &str) -> i64 {
@@ -2674,6 +3335,223 @@ mod tests {
             .get_result::<CountRow>(conn)
             .expect("TEST_CODE count")
             .count
+    }
+
+    fn database_with_one_manifest() -> (TestDatabase, BenchmarkManifestRef) {
+        let database = TestDatabase::new();
+        let manifest = append_readable(
+            &database,
+            vec![append_for(
+                &database,
+                daily_request(),
+                date(2026, 1, 1),
+                SegmentState::Provisional,
+                vec![daily_bar(date(2026, 1, 5), 101.0)],
+                "TEST_CODE_integrity_seed",
+            )],
+            "TEST_CODE benchmark integrity seed",
+        );
+        (database, manifest)
+    }
+
+    fn database_with_two_manifests() -> (TestDatabase, BenchmarkManifestRef) {
+        let (database, retained) = database_with_one_manifest();
+        let request = BenchmarkRequest {
+            instrument: "TEST_CODE_sh000300".into(),
+            range: BenchmarkRange::Daily {
+                from: date(2026, 1, 6),
+                to: date(2026, 1, 6),
+            },
+        };
+        append_readable(
+            &database,
+            vec![append_for(
+                &database,
+                request,
+                date(2026, 1, 1),
+                SegmentState::Provisional,
+                vec![daily_bar(date(2026, 1, 6), 102.0)],
+                "TEST_CODE_integrity_tail",
+            )],
+            "TEST_CODE benchmark integrity tail",
+        );
+        (database, retained)
+    }
+
+    fn independently_retained_quarters() -> (
+        TestDatabase,
+        BenchmarkRequest,
+        BenchmarkManifestRef,
+        BenchmarkManifestRef,
+    ) {
+        let database = TestDatabase::new();
+        let q1_request = BenchmarkRequest {
+            instrument: "TEST_CODE_sh000300".into(),
+            range: BenchmarkRange::Daily {
+                from: date(2026, 3, 31),
+                to: date(2026, 3, 31),
+            },
+        };
+        let q2_request = BenchmarkRequest {
+            instrument: q1_request.instrument.clone(),
+            range: BenchmarkRange::Daily {
+                from: date(2026, 4, 1),
+                to: date(2026, 4, 1),
+            },
+        };
+        let q1 = append_readable(
+            &database,
+            vec![append_for(
+                &database,
+                q1_request.clone(),
+                date(2026, 1, 1),
+                SegmentState::Provisional,
+                vec![daily_bar(date(2026, 3, 31), 101.0)],
+                "TEST_CODE_exact_fixture_q1",
+            )],
+            "TEST_CODE exact fixture Q1",
+        );
+        let q2 = append_readable(
+            &database,
+            vec![append_for(
+                &database,
+                q2_request,
+                date(2026, 4, 1),
+                SegmentState::Provisional,
+                vec![daily_bar(date(2026, 4, 1), 102.0)],
+                "TEST_CODE_exact_fixture_q2",
+            )],
+            "TEST_CODE exact fixture Q2",
+        );
+        let request = BenchmarkRequest {
+            instrument: q1_request.instrument,
+            range: BenchmarkRange::Daily {
+                from: date(2026, 3, 31),
+                to: date(2026, 4, 1),
+            },
+        };
+        (database, request, q1, q2)
+    }
+
+    fn retained_segment(
+        manifest: &BenchmarkManifestRef,
+        index: usize,
+    ) -> BenchmarkRetainedSegmentRef {
+        BenchmarkRetainedSegmentRef {
+            source_manifest_hash: manifest.manifest_hash.clone(),
+            segment_hash: manifest.segment_hashes[index].clone(),
+        }
+    }
+
+    fn replace_benchmark_trigger_with_noop(
+        database: &TestDatabase,
+        name: &str,
+        table: &str,
+        event: &str,
+    ) {
+        let mut conn = database.conn();
+        diesel::sql_query(format!("DROP TRIGGER {name}"))
+            .execute(&mut conn)
+            .expect("TEST_CODE drop canonical benchmark trigger");
+        diesel::sql_query(format!(
+            "CREATE TRIGGER {name} BEFORE {event} ON {table} BEGIN SELECT 1; END"
+        ))
+        .execute(&mut conn)
+        .expect("TEST_CODE install same-name no-op benchmark trigger");
+    }
+
+    fn next_integrity_append(database: &TestDatabase) -> BenchmarkSegmentAppend {
+        let request = BenchmarkRequest {
+            instrument: "TEST_CODE_sh000300".into(),
+            range: BenchmarkRange::Daily {
+                from: date(2026, 1, 7),
+                to: date(2026, 1, 7),
+            },
+        };
+        append_for(
+            database,
+            request,
+            date(2026, 1, 1),
+            SegmentState::Provisional,
+            vec![daily_bar(date(2026, 1, 7), 103.0)],
+            "TEST_CODE_integrity_preappend",
+        )
+    }
+
+    fn delete_manifest_tail_and_restore_triggers(database: &TestDatabase) {
+        let mut conn = database.conn();
+        for trigger in [
+            "trg_benchmark_manifest_chain_no_delete",
+            "trg_benchmark_manifest_acquisition_no_delete",
+            "trg_benchmark_manifest_no_delete",
+        ] {
+            diesel::sql_query(format!("DROP TRIGGER {trigger}"))
+                .execute(&mut conn)
+                .expect("TEST_CODE drop benchmark tail delete trigger");
+        }
+        diesel::sql_query("DELETE FROM benchmark_manifest_chain WHERE manifest_id = 2")
+            .execute(&mut conn)
+            .expect("TEST_CODE delete manifest-chain tail");
+        diesel::sql_query("DELETE FROM benchmark_manifest_acquisition WHERE manifest_id = 2")
+            .execute(&mut conn)
+            .expect("TEST_CODE delete manifest-association tail");
+        diesel::sql_query("DELETE FROM benchmark_manifest WHERE id = 2")
+            .execute(&mut conn)
+            .expect("TEST_CODE delete manifest tail");
+        for definition in [
+            "CREATE TRIGGER trg_benchmark_manifest_no_delete
+             BEFORE DELETE ON benchmark_manifest
+             BEGIN SELECT RAISE(ABORT, 'BR-251 benchmark manifest retention is at least five years'); END",
+            "CREATE TRIGGER trg_benchmark_manifest_acquisition_no_delete
+             BEFORE DELETE ON benchmark_manifest_acquisition
+             BEGIN SELECT RAISE(ABORT, 'BR-251 benchmark manifest acquisition retention is at least five years'); END",
+            "CREATE TRIGGER trg_benchmark_manifest_chain_no_delete
+             BEFORE DELETE ON benchmark_manifest_chain
+             BEGIN SELECT RAISE(ABORT, 'BR-251 benchmark manifest chain retention is at least five years'); END",
+        ] {
+            diesel::sql_query(definition)
+                .execute(&mut conn)
+                .expect("TEST_CODE restore canonical benchmark delete trigger");
+        }
+    }
+
+    fn canonical_update_trigger_definition(table: &str) -> String {
+        let action = match table {
+            "benchmark_segment_revision" => "BR-251 benchmark segment revision is immutable",
+            "benchmark_segment_chain" => "BR-251 benchmark segment chain is immutable",
+            "benchmark_manifest" => "BR-251 benchmark manifest is immutable",
+            "benchmark_manifest_acquisition" => {
+                "BR-251 benchmark manifest acquisition is immutable"
+            }
+            "benchmark_manifest_chain" => "BR-251 benchmark manifest chain is immutable",
+            other => panic!("TEST_CODE unknown benchmark table {other}"),
+        };
+        format!(
+            "CREATE TRIGGER trg_{table}_no_update BEFORE UPDATE ON {table} \
+             BEGIN SELECT RAISE(ABORT, '{action}'); END"
+        )
+    }
+
+    fn tamper_retention(
+        database: &TestDatabase,
+        table: &str,
+        created_at: &str,
+        retention_deadline: &str,
+    ) {
+        let mut conn = database.conn();
+        diesel::sql_query(format!("DROP TRIGGER trg_{table}_no_update"))
+            .execute(&mut conn)
+            .expect("TEST_CODE drop retention update trigger");
+        diesel::sql_query(format!(
+            "UPDATE {table} SET created_at = ?, retention_deadline = ?"
+        ))
+        .bind::<Text, _>(created_at)
+        .bind::<Text, _>(retention_deadline)
+        .execute(&mut conn)
+        .expect("TEST_CODE tamper retained benchmark timestamps");
+        diesel::sql_query(canonical_update_trigger_definition(table))
+            .execute(&mut conn)
+            .expect("TEST_CODE restore canonical retention update trigger");
     }
 
     #[test]
@@ -2719,6 +3597,142 @@ mod tests {
             .execute(&mut conn)
             .expect("TEST_CODE remove chain row");
         create_schema(&mut conn).expect_err("TEST_CODE startup must reject missing chain");
+    }
+
+    #[test]
+    fn startup_read_and_preappend_reject_every_same_name_noop_immutable_trigger() {
+        let triggers = [
+            (
+                "trg_benchmark_segment_revision_no_update",
+                "benchmark_segment_revision",
+                "UPDATE",
+            ),
+            (
+                "trg_benchmark_segment_revision_no_delete",
+                "benchmark_segment_revision",
+                "DELETE",
+            ),
+            (
+                "trg_benchmark_segment_chain_no_update",
+                "benchmark_segment_chain",
+                "UPDATE",
+            ),
+            (
+                "trg_benchmark_segment_chain_no_delete",
+                "benchmark_segment_chain",
+                "DELETE",
+            ),
+            (
+                "trg_benchmark_manifest_no_update",
+                "benchmark_manifest",
+                "UPDATE",
+            ),
+            (
+                "trg_benchmark_manifest_no_delete",
+                "benchmark_manifest",
+                "DELETE",
+            ),
+            (
+                "trg_benchmark_manifest_acquisition_no_update",
+                "benchmark_manifest_acquisition",
+                "UPDATE",
+            ),
+            (
+                "trg_benchmark_manifest_acquisition_no_delete",
+                "benchmark_manifest_acquisition",
+                "DELETE",
+            ),
+            (
+                "trg_benchmark_manifest_chain_no_update",
+                "benchmark_manifest_chain",
+                "UPDATE",
+            ),
+            (
+                "trg_benchmark_manifest_chain_no_delete",
+                "benchmark_manifest_chain",
+                "DELETE",
+            ),
+        ];
+
+        for (name, table, event) in triggers {
+            let (startup, _) = database_with_one_manifest();
+            replace_benchmark_trigger_with_noop(&startup, name, table, event);
+            let startup_error = create_schema(&mut startup.conn())
+                .expect_err("TEST_CODE startup must reject same-name no-op trigger");
+            assert_eq!(
+                map_diesel_error(
+                    startup_error,
+                    "TEST_CODE benchmark startup trigger validation",
+                    DieselErrorContext::TransactionEnvelope,
+                )
+                .reason_code(),
+                "benchmark_trigger_definition_invalid",
+                "TEST_CODE startup accepted {name}",
+            );
+
+            let (reader, manifest) = database_with_one_manifest();
+            replace_benchmark_trigger_with_noop(&reader, name, table, event);
+            assert_eq!(
+                reader
+                    .store()
+                    .read_exact(&manifest.manifest_hash)
+                    .expect_err("TEST_CODE exact read must reject same-name no-op trigger")
+                    .reason_code(),
+                "benchmark_trigger_definition_invalid",
+                "TEST_CODE reader accepted {name}",
+            );
+
+            let (preappend, _) = database_with_one_manifest();
+            replace_benchmark_trigger_with_noop(&preappend, name, table, event);
+            assert_eq!(
+                preappend
+                    .store()
+                    .append(vec![next_integrity_append(&preappend)])
+                    .expect_err("TEST_CODE preappend must reject same-name no-op trigger")
+                    .reason_code(),
+                "benchmark_trigger_definition_invalid",
+                "TEST_CODE preappend accepted {name}",
+            );
+        }
+    }
+
+    #[test]
+    fn startup_read_and_preappend_reject_coordinated_manifest_tail_deletion() {
+        let (startup, _) = database_with_two_manifests();
+        delete_manifest_tail_and_restore_triggers(&startup);
+        let startup_error = create_schema(&mut startup.conn())
+            .expect_err("TEST_CODE startup must reject coordinated benchmark tail deletion");
+        assert_eq!(
+            map_diesel_error(
+                startup_error,
+                "TEST_CODE benchmark startup high-water validation",
+                DieselErrorContext::TransactionEnvelope,
+            )
+            .reason_code(),
+            "benchmark_sequence_highwater_invalid",
+        );
+
+        let (reader, retained) = database_with_two_manifests();
+        delete_manifest_tail_and_restore_triggers(&reader);
+        assert_eq!(
+            reader
+                .store()
+                .read_exact(&retained.manifest_hash)
+                .expect_err("TEST_CODE read must reject coordinated benchmark tail deletion")
+                .reason_code(),
+            "benchmark_sequence_highwater_invalid",
+        );
+
+        let (preappend, _) = database_with_two_manifests();
+        delete_manifest_tail_and_restore_triggers(&preappend);
+        assert_eq!(
+            preappend
+                .store()
+                .append(vec![next_integrity_append(&preappend)])
+                .expect_err("TEST_CODE preappend must reject coordinated benchmark tail deletion")
+                .reason_code(),
+            "benchmark_sequence_highwater_invalid",
+        );
     }
 
     #[test]
@@ -2788,6 +3802,355 @@ mod tests {
         let mut conn = database.conn();
         assert_eq!(count(&mut conn, "benchmark_manifest"), 1);
         assert_eq!(count(&mut conn, "benchmark_manifest_chain"), 1);
+    }
+
+    #[test]
+    fn exact_composition_reuses_independent_quarters_without_rebinding_acquisitions() {
+        let database = TestDatabase::new();
+        let q1_request = BenchmarkRequest {
+            instrument: "TEST_CODE_sh000300".into(),
+            range: BenchmarkRange::Daily {
+                from: date(2026, 3, 31),
+                to: date(2026, 3, 31),
+            },
+        };
+        let q2_request = BenchmarkRequest {
+            instrument: q1_request.instrument.clone(),
+            range: BenchmarkRange::Daily {
+                from: date(2026, 4, 1),
+                to: date(2026, 4, 1),
+            },
+        };
+        let q1 = append_readable(
+            &database,
+            vec![append_for(
+                &database,
+                q1_request.clone(),
+                date(2026, 1, 1),
+                SegmentState::Provisional,
+                vec![daily_bar(date(2026, 3, 31), 101.0)],
+                "TEST_CODE_compose_q1_receipt",
+            )],
+            "TEST_CODE independently retained Q1",
+        );
+        let q2 = append_readable(
+            &database,
+            vec![append_for(
+                &database,
+                q2_request.clone(),
+                date(2026, 4, 1),
+                SegmentState::Provisional,
+                vec![daily_bar(date(2026, 4, 1), 102.0)],
+                "TEST_CODE_compose_q2_receipt",
+            )],
+            "TEST_CODE independently retained Q2",
+        );
+        let exact_request = BenchmarkRequest {
+            instrument: q1_request.instrument.clone(),
+            range: BenchmarkRange::Daily {
+                from: date(2026, 3, 31),
+                to: date(2026, 4, 1),
+            },
+        };
+
+        let composed = database
+            .store()
+            .compose_exact(
+                exact_request,
+                vec![
+                    BenchmarkRetainedSegmentRef {
+                        source_manifest_hash: q1.manifest_hash.clone(),
+                        segment_hash: q1.segment_hashes[0].clone(),
+                    },
+                    BenchmarkRetainedSegmentRef {
+                        source_manifest_hash: q2.manifest_hash.clone(),
+                        segment_hash: q2.segment_hashes[0].clone(),
+                    },
+                ],
+            )
+            .expect("TEST_CODE exact composition must retain independent quarters");
+
+        assert_eq!(
+            composed.segment_hashes,
+            vec![q1.segment_hashes[0].clone(), q2.segment_hashes[0].clone()]
+        );
+        let (retained, bars, retained_evidence) = database
+            .store()
+            .read_exact(&composed.manifest_hash)
+            .expect("TEST_CODE composed manifest remains exactly readable");
+        assert_eq!(retained, composed);
+        assert_eq!(
+            bars.iter().map(|bar| bar.close).collect::<Vec<_>>(),
+            vec![101.0, 102.0]
+        );
+        assert_eq!(
+            retained_evidence
+                .iter()
+                .map(|item| item.batch_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "TEST_CODE_compose_q1_receipt",
+                "TEST_CODE_compose_q2_receipt"
+            ]
+        );
+
+        let mut conn = database.conn();
+        assert_eq!(count(&mut conn, "data_acquisition_audit"), 2);
+        let retained_request_hashes = diesel::sql_query(
+            "SELECT json_extract(canonical_binding_json, '$.request_hash') AS value
+             FROM benchmark_manifest_acquisition
+             WHERE manifest_id = (
+                SELECT id FROM benchmark_manifest WHERE manifest_hash = ?
+             ) ORDER BY ordinal ASC",
+        )
+        .bind::<Text, _>(&composed.manifest_hash)
+        .load::<TextRow>(&mut conn)
+        .expect("TEST_CODE composed acquisition request bindings");
+        assert_eq!(
+            retained_request_hashes
+                .into_iter()
+                .map(|row| row.value)
+                .collect::<Vec<_>>(),
+            vec![
+                q1_request.canonical_request_hash(),
+                q2_request.canonical_request_hash(),
+            ]
+        );
+    }
+
+    #[test]
+    fn exact_composition_rejects_missing_duplicate_or_out_of_order_segment_selections() {
+        for case in ["missing", "duplicate", "out_of_order"] {
+            let (database, request, q1, q2) = independently_retained_quarters();
+            let selections = match case {
+                "missing" => vec![retained_segment(&q1, 0)],
+                "duplicate" => vec![retained_segment(&q1, 0), retained_segment(&q1, 0)],
+                "out_of_order" => vec![retained_segment(&q2, 0), retained_segment(&q1, 0)],
+                _ => unreachable!("TEST_CODE fixed composition case"),
+            };
+            let before = count(&mut database.conn(), "benchmark_manifest");
+            let error = database
+                .store()
+                .compose_exact(request, selections)
+                .expect_err("TEST_CODE incomplete or noncanonical composition must fail");
+            assert!(
+                matches!(
+                    error,
+                    BenchmarkSegmentStoreError::BenchmarkSegmentUnavailable { .. }
+                        | BenchmarkSegmentStoreError::FailedIntegrity { .. }
+                ),
+                "TEST_CODE {case} must remain typed",
+            );
+            assert_eq!(
+                count(&mut database.conn(), "benchmark_manifest"),
+                before,
+                "TEST_CODE {case} must not publish a partial manifest",
+            );
+        }
+    }
+
+    #[test]
+    fn exact_composition_rejects_source_manifest_segment_identity_mismatch() {
+        let (database, request, q1, q2) = independently_retained_quarters();
+        let error = database
+            .store()
+            .compose_exact(
+                request,
+                vec![
+                    BenchmarkRetainedSegmentRef {
+                        source_manifest_hash: q1.manifest_hash,
+                        segment_hash: q2.segment_hashes[0].clone(),
+                    },
+                    retained_segment(&q2, 0),
+                ],
+            )
+            .expect_err("TEST_CODE segment must be retained by its named source manifest");
+        assert!(matches!(
+            error,
+            BenchmarkSegmentStoreError::FailedIntegrity { .. }
+                | BenchmarkSegmentStoreError::BenchmarkSegmentUnavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn exact_composition_rejects_cross_instrument_granularity_and_provider() {
+        let (instrument_database, request, q1, _q2) = independently_retained_quarters();
+        let other_request = BenchmarkRequest {
+            instrument: "TEST_CODE_other_index".into(),
+            range: BenchmarkRange::Daily {
+                from: date(2026, 4, 1),
+                to: date(2026, 4, 1),
+            },
+        };
+        let other = append_readable(
+            &instrument_database,
+            vec![append_for(
+                &instrument_database,
+                other_request,
+                date(2026, 4, 1),
+                SegmentState::Provisional,
+                vec![daily_bar(date(2026, 4, 1), 102.0)],
+                "TEST_CODE_compose_other_instrument",
+            )],
+            "TEST_CODE retained other instrument",
+        );
+        assert!(instrument_database
+            .store()
+            .compose_exact(
+                request.clone(),
+                vec![retained_segment(&q1, 0), retained_segment(&other, 0)],
+            )
+            .is_err());
+
+        let minute_database = TestDatabase::new();
+        let minute = DateTime::parse_from_rfc3339("2026-04-01T09:31:00+08:00")
+            .expect("TEST_CODE compose minute");
+        let minute_request = BenchmarkRequest {
+            instrument: request.instrument.clone(),
+            range: BenchmarkRange::Minute1 {
+                from: minute,
+                to: minute,
+            },
+        };
+        let minute_manifest = append_readable(
+            &minute_database,
+            vec![append_for(
+                &minute_database,
+                minute_request,
+                date(2026, 4, 1),
+                SegmentState::Provisional,
+                vec![minute_bar(minute, 102.0)],
+                "TEST_CODE_compose_minute_granularity",
+            )],
+            "TEST_CODE retained minute granularity",
+        );
+        let daily = append_readable(
+            &minute_database,
+            vec![append_for(
+                &minute_database,
+                BenchmarkRequest {
+                    instrument: request.instrument.clone(),
+                    range: BenchmarkRange::Daily {
+                        from: date(2026, 3, 31),
+                        to: date(2026, 3, 31),
+                    },
+                },
+                date(2026, 1, 1),
+                SegmentState::Provisional,
+                vec![daily_bar(date(2026, 3, 31), 101.0)],
+                "TEST_CODE_compose_daily_granularity",
+            )],
+            "TEST_CODE retained daily granularity",
+        );
+        assert!(minute_database
+            .store()
+            .compose_exact(
+                request.clone(),
+                vec![
+                    retained_segment(&daily, 0),
+                    retained_segment(&minute_manifest, 0),
+                ],
+            )
+            .is_err());
+
+        let provider_database = TestDatabase::new();
+        let q1_request = BenchmarkRequest {
+            instrument: request.instrument.clone(),
+            range: BenchmarkRange::Daily {
+                from: date(2026, 3, 31),
+                to: date(2026, 3, 31),
+            },
+        };
+        let q2_request = BenchmarkRequest {
+            instrument: request.instrument.clone(),
+            range: BenchmarkRange::Daily {
+                from: date(2026, 4, 1),
+                to: date(2026, 4, 1),
+            },
+        };
+        let provider_q1 = append_readable(
+            &provider_database,
+            vec![append_for(
+                &provider_database,
+                q1_request,
+                date(2026, 1, 1),
+                SegmentState::Provisional,
+                vec![daily_bar(date(2026, 3, 31), 101.0)],
+                "TEST_CODE_compose_tdx_provider",
+            )],
+            "TEST_CODE retained TDX provider",
+        );
+        let mut other_provider = evidence("TEST_CODE_compose_tencent_provider");
+        other_provider.provider = ProviderId::Tencent;
+        other_provider.source = "TEST_CODE_tencent_index".into();
+        let provider_q2 = append_readable(
+            &provider_database,
+            vec![append_with_evidence(
+                &provider_database,
+                q2_request,
+                date(2026, 4, 1),
+                SegmentState::Provisional,
+                vec![daily_bar(date(2026, 4, 1), 102.0)],
+                other_provider,
+            )],
+            "TEST_CODE retained Tencent provider",
+        );
+        assert!(provider_database
+            .store()
+            .compose_exact(
+                request,
+                vec![
+                    retained_segment(&provider_q1, 0),
+                    retained_segment(&provider_q2, 0),
+                ],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn exact_composition_revalidates_original_receipt_request_and_segment_version() {
+        let (receipt_database, request, q1, q2) = independently_retained_quarters();
+        let mut conn = receipt_database.conn();
+        diesel::sql_query("DROP TRIGGER trg_data_acquisition_audit_no_update")
+            .execute(&mut conn)
+            .expect("TEST_CODE drop receipt update trigger");
+        diesel::sql_query("UPDATE data_acquisition_audit SET request_hash = ? WHERE id = 1")
+            .bind::<Text, _>("f".repeat(64))
+            .execute(&mut conn)
+            .expect("TEST_CODE tamper original receipt request binding");
+        drop(conn);
+        assert!(receipt_database
+            .store()
+            .compose_exact(
+                request.clone(),
+                vec![retained_segment(&q1, 0), retained_segment(&q2, 0)],
+            )
+            .is_err());
+
+        let (version_database, request, q1, q2) = independently_retained_quarters();
+        let mut conn = version_database.conn();
+        diesel::sql_query("PRAGMA ignore_check_constraints = ON")
+            .execute(&mut conn)
+            .expect("TEST_CODE allow adversarial version tamper");
+        diesel::sql_query("DROP TRIGGER trg_benchmark_segment_revision_no_update")
+            .execute(&mut conn)
+            .expect("TEST_CODE drop segment update trigger");
+        diesel::sql_query("UPDATE benchmark_segment_revision SET payload_version = 2 WHERE id = 2")
+            .execute(&mut conn)
+            .expect("TEST_CODE tamper retained payload version");
+        diesel::sql_query(canonical_update_trigger_definition(
+            "benchmark_segment_revision",
+        ))
+        .execute(&mut conn)
+        .expect("TEST_CODE restore segment update trigger");
+        drop(conn);
+        assert!(version_database
+            .store()
+            .compose_exact(
+                request,
+                vec![retained_segment(&q1, 0), retained_segment(&q2, 0)],
+            )
+            .is_err());
     }
 
     #[test]
@@ -3525,8 +4888,8 @@ mod tests {
                 reason_code,
                 detail,
             } => {
-                assert_eq!(reason_code, "benchmark_manifest_acquisition_missing");
-                assert!(detail.contains("manifest acquisition association is missing"));
+                assert_eq!(reason_code, "benchmark_trigger_definition_invalid");
+                assert!(detail.contains("immutable trigger"));
             }
             other => panic!("TEST_CODE unexpected append-reread category: {other:?}"),
         }
@@ -3708,6 +5071,13 @@ mod tests {
         diesel::sql_query("DELETE FROM benchmark_manifest_acquisition")
             .execute(&mut conn)
             .expect("TEST_CODE delete association");
+        diesel::sql_query(
+            "CREATE TRIGGER trg_benchmark_manifest_acquisition_no_delete
+             BEFORE DELETE ON benchmark_manifest_acquisition
+             BEGIN SELECT RAISE(ABORT, 'BR-251 benchmark manifest acquisition retention is at least five years'); END",
+        )
+        .execute(&mut conn)
+        .expect("TEST_CODE restore association delete trigger");
         create_schema(&mut conn).expect_err("TEST_CODE startup rejects missing association");
         drop(conn);
 
@@ -3720,8 +5090,8 @@ mod tests {
                 reason_code,
                 detail,
             } => {
-                assert_eq!(reason_code, "benchmark_manifest_acquisition_missing");
-                assert!(detail.contains("manifest acquisition association is missing"));
+                assert_eq!(reason_code, "benchmark_sequence_highwater_invalid");
+                assert!(detail.contains("AUTOINCREMENT high-water"));
             }
             other => panic!("TEST_CODE unexpected missing-association category: {other:?}"),
         }
@@ -3742,6 +5112,11 @@ mod tests {
         )
         .execute(&mut conn)
         .expect("TEST_CODE tamper canonical association bytes");
+        diesel::sql_query(canonical_update_trigger_definition(
+            "benchmark_manifest_acquisition",
+        ))
+        .execute(&mut conn)
+        .expect("TEST_CODE restore association update trigger");
         create_schema(&mut conn).expect_err("TEST_CODE startup rejects noncanonical binding bytes");
         drop(conn);
 
@@ -4232,6 +5607,11 @@ mod tests {
         )
         .execute(&mut conn)
         .expect("TEST_CODE shorten association retention");
+        diesel::sql_query(canonical_update_trigger_definition(
+            "benchmark_manifest_acquisition",
+        ))
+        .execute(&mut conn)
+        .expect("TEST_CODE restore association update trigger");
         let startup_error =
             create_schema(&mut conn).expect_err("TEST_CODE startup rejects shortened retention");
         match map_diesel_error(
@@ -4243,11 +5623,8 @@ mod tests {
                 reason_code,
                 detail,
             } => {
-                assert_eq!(
-                    reason_code,
-                    "benchmark_manifest_acquisition_retention_invalid"
-                );
-                assert!(detail.contains("at least five years"), "{detail}");
+                assert_eq!(reason_code, "benchmark_retention_invalid");
+                assert!(detail.contains("60 calendar months"), "{detail}");
             }
             other => panic!("TEST_CODE unexpected startup retention category: {other:?}"),
         }
@@ -4262,13 +5639,116 @@ mod tests {
                 reason_code,
                 detail,
             } => {
-                assert_eq!(
-                    reason_code,
-                    "benchmark_manifest_acquisition_retention_invalid"
-                );
-                assert!(detail.contains("at least five years"), "{detail}");
+                assert_eq!(reason_code, "benchmark_retention_invalid");
+                assert!(detail.contains("60 calendar months"), "{detail}");
             }
             other => panic!("TEST_CODE unexpected exact-read retention category: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_benchmark_row_and_chain_preserves_fractional_utc_for_sixty_calendar_months() {
+        let (database, _) = database_with_one_manifest();
+        let mut conn = database.conn();
+        for table in [
+            "benchmark_segment_revision",
+            "benchmark_segment_chain",
+            "benchmark_manifest",
+            "benchmark_manifest_acquisition",
+            "benchmark_manifest_chain",
+        ] {
+            let window = diesel::sql_query(format!(
+                "SELECT created_at, retention_deadline FROM {table} LIMIT 1"
+            ))
+            .get_result::<TimestampRow>(&mut conn)
+            .expect("TEST_CODE load canonical benchmark retention window");
+            for (field, value) in [
+                ("created_at", window.created_at.as_str()),
+                ("retention_deadline", window.retention_deadline.as_str()),
+            ] {
+                assert!(
+                    value.contains('T') && value.contains('.') && value.ends_with('Z'),
+                    "TEST_CODE {table}.{field} lost fractional UTC: {value}",
+                );
+            }
+            validate_retention_window(table, &window.created_at, &window.retention_deadline)
+                .expect("TEST_CODE canonical benchmark retention is at least 60 months");
+        }
+    }
+
+    #[test]
+    fn sixty_calendar_month_validation_handles_leap_day_exactly() {
+        validate_retention_window(
+            "TEST_CODE leap boundary",
+            "2024-02-29T12:34:56.789Z",
+            "2029-02-28T12:34:56.789Z",
+        )
+        .expect("TEST_CODE exact 60-month leap deadline must pass");
+        let error = validate_retention_window(
+            "TEST_CODE leap boundary",
+            "2024-02-29T12:34:56.789Z",
+            "2029-02-28T12:34:56.788Z",
+        )
+        .expect_err("TEST_CODE one millisecond before exact 60 months must fail");
+        assert_eq!(
+            map_diesel_error(
+                error,
+                "TEST_CODE leap retention validation",
+                DieselErrorContext::TransactionEnvelope,
+            )
+            .reason_code(),
+            "benchmark_retention_invalid",
+        );
+    }
+
+    #[test]
+    fn startup_rejects_missing_unparseable_short_or_reversed_time_on_every_benchmark_table() {
+        let cases = [
+            ("", "2031-01-05T15:00:01.000Z", "missing created_at"),
+            (
+                "not-a-timestamp",
+                "2031-01-05T15:00:01.000Z",
+                "unparseable created_at",
+            ),
+            (
+                "2026-01-05T15:00:01Z",
+                "2031-01-05T15:00:01Z",
+                "non-fractional timestamps",
+            ),
+            (
+                "2026-01-05T15:00:01.000Z",
+                "2031-01-05T15:00:00.999Z",
+                "short retention",
+            ),
+            (
+                "2026-01-05T15:00:01.000Z",
+                "2025-01-05T15:00:01.000Z",
+                "reversed retention",
+            ),
+        ];
+        for table in [
+            "benchmark_segment_revision",
+            "benchmark_segment_chain",
+            "benchmark_manifest",
+            "benchmark_manifest_acquisition",
+            "benchmark_manifest_chain",
+        ] {
+            for (created_at, retention_deadline, case) in cases {
+                let (database, _) = database_with_one_manifest();
+                tamper_retention(&database, table, created_at, retention_deadline);
+                let error = create_schema(&mut database.conn())
+                    .expect_err("TEST_CODE startup must reject invalid benchmark time");
+                assert_eq!(
+                    map_diesel_error(
+                        error,
+                        "TEST_CODE benchmark startup retention validation",
+                        DieselErrorContext::TransactionEnvelope,
+                    )
+                    .reason_code(),
+                    "benchmark_retention_invalid",
+                    "TEST_CODE startup accepted {case} on {table}",
+                );
+            }
         }
     }
 
@@ -4537,10 +6017,11 @@ mod tests {
     }
 
     #[test]
-    fn capture_and_reader_are_the_only_public_business_seams() {
+    fn capture_reader_and_explicit_composition_are_public_business_seams() {
         let database = TestDatabase::new();
         let _capture = BenchmarkCapture::new(&database.manager);
         let _reader = BenchmarkReader::new(&database.manager);
+        let _composer = BenchmarkSegmentStore::new(&database.manager);
     }
 
     #[test]
