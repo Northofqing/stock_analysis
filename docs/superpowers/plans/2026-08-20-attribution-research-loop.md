@@ -2225,36 +2225,29 @@ impl AttributionReplayRunner {
  计算 `BenchmarkSeries` 接口，由 Reader 完整投影后传入，避免扩散存储细节。
 - [x] 跑定向回归，确认 `paper_trades`、`paper_attribution_daily` 行为未改，
   `src/bin/monitor/main.rs`、Unsafe 推送、TechnicalBars、`paper_sell_paused` diff 为零。
-- [ ] Gate B/C：`cargo fmt --all -- --check`；
+- [x] Gate B/C：`cargo fmt --all -- --check`；
   `cargo clippy --workspace --all-targets --all-features -- -D warnings`；
   `cargo test --workspace --all-targets --all-features -- --test-threads=1`；
-  `bash tools/compliance/check.sh`。2026-08-26 证据：runner 15/15 与 strict lib Clippy 通过；
-  在 Task 33 历史证据快照 `ece0bd7`、rustc/cargo 1.95.0、rustfmt 1.9.0 下，全仓 fmt
-  完整输出为 11 个相对
-  Task 33 BASE 零差异路径（`hbars_probe.rs`、`monitor/main.rs`、`rq_probe.rs`、
-  `t0_minute_probe.rs`、`t0_replay.rs`、`magic_tdx_t0.rs`、`alert_log.rs`、
-  `attribution_deep.rs`、`news_ai.rs`、`performance/attribution.rs`、
-  `performance/report.rs`）。reviewer 记录的 workspace Clippy 首个 blocker 是
-  `t0_replay.rs:10-11` 的 `doc_lazy_continuation`；同工具链重跑还并发报出
-  `hbars_probe.rs:17` 的 `let_unit_value`，后续诊断可能被首批错误遮蔽。workspace tests 继承
-  monitor BR-139/BR-241 两个失败；aggregate
-  compliance 因未授权 freshness/生产 DB 未运行，安全子检查仅 business-rules gate 因 60 个
-  继承缺失路径失败（157 warnings）。
+  `bash tools/compliance/check.sh --policy pr`。2026-08-27 最终证据：fmt、strict Clippy、全
+  workspace/all-target/all-feature tests 与 PR compliance 全部 exit 0；PR coverage 为 core patch
+  `13707/14923=91.85%`、other patch `8368/9824=85.18%`，global/core 棘轮
+  `201256/258810=77.76%`、`157635/202935=77.68%`；独立复审 C0/I0，Gate C PASS。
 - [ ] Gate D：`cargo llvm-cov --workspace --all-features --json --output-path target/coverage/coverage.json -- --test-threads=1`；
-  `python3 tools/coverage/check_thresholds.py target/coverage/coverage.json`；
+  `cargo llvm-cov report --lcov --output-path target/coverage/lcov.info`；
+  `python3 tools/coverage/check_thresholds.py --policy release --report target/coverage/coverage.json --lcov target/coverage/lcov.info`；
   `cargo build --release --bin monitor`；`cargo build --release --bin strategy_attribution`。
-  两个 release build 通过；llvm-cov 继承同两个 monitor 失败并退出 101、未生成当前报告；
-  阈值脚本读取 2026-08-24 继承 artifact 得 global 76.83% / core 76.75%，低于 80% / 95%，
-  不构成本任务新鲜 Gate D 证据。
-- [ ] 更新 PR 必填字段：本地 draft 已准备 `Refs: spec §15`、Data-Redlines
-  2.1/2.2/2.3/2.4/2.7/2.8/2.10、OldModules、Business-Rules BR-251、Threshold-Proof N/A、
-  验证证据和 `git revert` rollback；未获授权更新 Draft PR #15，保持外部待办。
+  两次新鲜完整 llvm-cov 报告均为 global 77.76% / core 77.68%，低于固定 80% / 95%；生产
+  freshness、live-data、审计和生产授权亦未完成，故 Gate D 明确 `Release Blocked`。
+- [x] PR 必填字段已包含 `Refs: spec §15/§10.13`、Data-Redlines
+  2.1/2.2/2.3/2.4/2.7/2.8/2.10、OldModules、Business-Rules BR-247–BR-252、
+  Threshold-Proof、Gate C/Gate D 分列证据和 `git revert` rollback，并通过本地
+  `check_pr_evidence.sh`；远端 PR 创建/更新由最终集成步骤执行。
 - [x] 未经用户另行授权不运行真实 TDX/gRPC probe；probe 通过后单独提交 attestation evidence。
   分钟结束标签未证实时 Minute1 继续 Disabled。
 - [x] 未经用户另行授权不运行 `capture --commit` 或历史 `--commit`。不得删除失败审计和已
   追加 segment/report；代码回滚只 `git revert <sha>` 并停止新 writer。
-- [x] 因 `monitor/main.rs` 受保护且 scheduler 未集成，PR 保持
-  Draft、状态 `In Progress / ResearchOnly`；不得称 Done 或 merge-ready。
+- [x] `monitor/main.rs` 保持未修改且 scheduler 未集成；Gate C 代码可合并，但策略验证状态仍为
+  `In Progress / ResearchOnly`，Gate D 不得发布或部署，也不得称量化成功。
 - [x] 最终代码提交：`git commit -m "refactor: 统一回测基准读取入口"`；证据文档另提交
   `git commit -m "docs: 记录策略归因验证证据"`。
 
@@ -2279,6 +2272,8 @@ impl AttributionReplayRunner {
   benchmark all/no-default 各 25/25、lib 2995/0/7 与 strict lib Clippy 通过。
 - [x] 生成 `aafc3de` → `5fbc16a` 的冻结包并执行新的独立 scoped final re-review；reviewer
   独立复跑 exact/store/benchmark/lib/Clippy/rustfmt/安全合规检查，以 `C0/I0/M0 — ACCEPTED`
-  接受本 bounded task。整体仍继续 `Draft / In Progress / ResearchOnly`。
-- [ ] 生产 V1 benchmark chain inventory/migration、真实协议 probe/attestation、freshness、当前
-  coverage、全仓 Gate B/C/D 与 Draft PR 远端同步均需单独授权/闭环，不能由本修复波次代替。
+  接受本 bounded task。生产验证仍继续 `In Progress / ResearchOnly`。
+- [x] 2026-08-27 完成当前 coverage、全仓 Gate B、Gate C 与最终独立 C0/I0 复审；允许代码 PR
+  合并，不等同于策略成功或发布授权。
+- [ ] 生产 V1 benchmark chain inventory/migration、真实协议 probe/attestation、生产 freshness、
+  live-data/audit 与 Gate D 仍需单独授权/闭环，不能由本修复波次代替。

@@ -995,22 +995,32 @@ TDD 至少覆盖：
 7. 真实只读验收：`sh000300` canonical identity、Daily 日期/价格、Minute1 标签/连续竞价段和
    gRPC no-feature round-trip。未通过前能力保持 Disabled；不得把 TEST_CODE fixture 当 live。
 
-Gate B/C/D 命令固定为仓库标准：
+Gate B、Gate C 与 Gate D 命令分别固定为仓库标准：
 
 ```bash
+# Gate B
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features -- --test-threads=1
-bash tools/compliance/check.sh
+
+# Gate C（PR 合并）
+bash tools/compliance/check.sh --policy pr
 cargo llvm-cov --workspace --all-features --json --output-path target/coverage/coverage.json -- --test-threads=1
-python3 tools/coverage/check_thresholds.py target/coverage/coverage.json
+cargo llvm-cov report --lcov --output-path target/coverage/lcov.info
+python3 tools/coverage/check_thresholds.py --policy pr --report target/coverage/coverage.json --lcov target/coverage/lcov.info --base-ref c6024e5 --bootstrap-baseline
+
+# Gate D（发布；STOCK_DB 必须是当前部署 checkout 的固定生产库绝对路径）
+STOCK_DB=/absolute/deployment/checkout/data/stock_analysis.db bash tools/compliance/check.sh --policy release
+python3 tools/coverage/check_thresholds.py --policy release --report target/coverage/coverage.json --lcov target/coverage/lcov.info
 cargo build --release --bin monitor
 ```
 
 另外必须有定向测试、独立 CLI release build、只读 live probe 记录和独立 reviewer。由于用户
-保护 `monitor/main.rs` 且仓库暂无系统级 scheduler 资产，当前 slice 即使模块/CLI 全绿也不
-满足 CLAUDE 生产 integration/production evidence；PR 必须保持 Draft/In Progress，不能合并
-或称 Done。
+保护 `monitor/main.rs` 且仓库暂无系统级 scheduler 资产，当前 slice 不满足生产
+integration/production evidence。2026-08-27 的 Gate B 与 Gate C 已通过且独立复审为 C0/I0，
+因此代码可经 PR 合并；但 Gate D 仍因 global/core 仅 77.76%/77.68%、生产 freshness、live-data、
+审计和生产授权缺失而保持 `Release Blocked`。策略验证状态继续是 `In Progress / ResearchOnly`，
+不得发布、部署或称量化成功。
 
 ### 15.10 分阶段启用与回滚
 

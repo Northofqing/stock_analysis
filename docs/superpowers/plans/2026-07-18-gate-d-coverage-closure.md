@@ -84,13 +84,13 @@
   强制 baseline 与 Gate C/Gate D 分列；compliance workflow 使用 `fetch-depth: 0`。
 - [x] 复现并纠正首次 bootstrap 的不可复现计数：两次同源码、同工具、同测试集完整运行均为
   global `201256/258810`、core `157635/202935`；只纠正基线事实，不改变任何门禁阈值。
-- [ ] 运行 `cargo fmt --all -- --check`。
-- [ ] 运行 `cargo clippy --workspace --all-targets --all-features -- -D warnings`。
-- [ ] 运行 `cargo test --workspace --all-targets --all-features -- --test-threads=1`。
-- [ ] 运行 `bash tools/compliance/check.sh --policy pr`。
-- [ ] 重新生成 workspace/all-features JSON+LCOV，并运行
+- [x] 运行 `cargo fmt --all -- --check`。
+- [x] 运行 `cargo clippy --workspace --all-targets --all-features -- -D warnings`。
+- [x] 运行 `cargo test --workspace --all-targets --all-features -- --test-threads=1`。
+- [x] 运行 `bash tools/compliance/check.sh --policy pr`。
+- [x] 重新生成 workspace/all-features JSON+LCOV，并运行
   `python3 tools/coverage/check_thresholds.py --policy pr --report target/coverage/coverage.json --lcov target/coverage/lcov.info --base-ref c6024e5 --bootstrap-baseline`；预期核心 patch ≥90%、其他 patch ≥85%、global/core 不低于 baseline。
-- [ ] 更新 BR-252 为 Gate C PASS，并在 PR 描述完整填写 Refs、Data-Redlines、OldModules、
+- [x] 更新 BR-252 为 Gate C PASS，并在 PR 描述完整填写 Refs、Data-Redlines、OldModules、
   Threshold-Proof、Business-Rules、Rollback、Gate-Policy 与 Bootstrap-Baseline。
 - [ ] 只在上述 Gate C 证据和独立审查均无 Critical/Important 后提交、推送并合并。Gate D 若仍未
   达到 global80/core95 或未获真实 freshness/live 授权，明确标记 `Release Blocked`，不得部署。
