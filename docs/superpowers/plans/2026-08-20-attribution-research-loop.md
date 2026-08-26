@@ -2218,27 +2218,35 @@ impl AttributionReplayRunner {
 - 修改：`docs/business_rules.md`
 - 修改：Draft PR #15 描述
 
-- [ ] 先写回测测试：只有显式 `BenchmarkManifestRef` 能调用 Reader 投影；缺 manifest 明确
+- [x] 先写回测测试：只有显式 `BenchmarkManifestRef` 能调用 Reader 投影；缺 manifest 明确
   `BenchmarkSegmentUnavailable`/报告“基准缺失”，不调用旧指数 equity path；完整 manifest
   不跳交易日。
-- [ ] 删除 `fetch_benchmark_series_with_code` 的无 offset 假分页/逐页吞错；保留现有策略纯
+- [x] 删除 `fetch_benchmark_series_with_code` 的无 offset 假分页/逐页吞错；保留现有策略纯
  计算 `BenchmarkSeries` 接口，由 Reader 完整投影后传入，避免扩散存储细节。
-- [ ] 跑定向回归，确认 `paper_trades`、`paper_attribution_daily` 行为未改，
+- [x] 跑定向回归，确认 `paper_trades`、`paper_attribution_daily` 行为未改，
   `src/bin/monitor/main.rs`、Unsafe 推送、TechnicalBars、`paper_sell_paused` diff 为零。
 - [ ] Gate B/C：`cargo fmt --all -- --check`；
   `cargo clippy --workspace --all-targets --all-features -- -D warnings`；
   `cargo test --workspace --all-targets --all-features -- --test-threads=1`；
-  `bash tools/compliance/check.sh`。
+  `bash tools/compliance/check.sh`。2026-08-26 证据：runner 15/15 与 strict lib Clippy 通过；
+  全仓 fmt 继承 `hbars_probe.rs`/受保护 `monitor/main.rs` 差异，workspace Clippy 继承
+  `hbars_probe.rs:17`，workspace tests 继承 monitor BR-139/BR-241 两个失败；aggregate
+  compliance 因未授权 freshness/生产 DB 未运行，安全子检查仅 business-rules gate 因 60 个
+  继承缺失路径失败（157 warnings）。
 - [ ] Gate D：`cargo llvm-cov --workspace --all-features --json --output-path target/coverage/coverage.json -- --test-threads=1`；
   `python3 tools/coverage/check_thresholds.py target/coverage/coverage.json`；
   `cargo build --release --bin monitor`；`cargo build --release --bin strategy_attribution`。
-- [ ] 更新 PR 必填字段：`Refs: spec §15`、Data-Redlines 2.1/2.2/2.3/2.4/2.7/2.8/2.10、
-  OldModules、Business-Rules BR-251、Threshold-Proof N/A、验证证据和 `git revert` rollback。
-- [ ] 只有用户另行授权后才运行真实 TDX/gRPC probe；probe 通过后单独提交 attestation evidence。
+  两个 release build 通过；llvm-cov 继承同两个 monitor 失败并退出 101、未生成当前报告；
+  阈值脚本读取 2026-08-24 继承 artifact 得 global 76.83% / core 76.75%，低于 80% / 95%，
+  不构成本任务新鲜 Gate D 证据。
+- [ ] 更新 PR 必填字段：本地 draft 已准备 `Refs: spec §15`、Data-Redlines
+  2.1/2.2/2.3/2.4/2.7/2.8/2.10、OldModules、Business-Rules BR-251、Threshold-Proof N/A、
+  验证证据和 `git revert` rollback；未获授权更新 Draft PR #15，保持外部待办。
+- [x] 未经用户另行授权不运行真实 TDX/gRPC probe；probe 通过后单独提交 attestation evidence。
   分钟结束标签未证实时 Minute1 继续 Disabled。
-- [ ] 只有用户另行授权后才运行 `capture --commit` 或历史 `--commit`。不得删除失败审计和已
+- [x] 未经用户另行授权不运行 `capture --commit` 或历史 `--commit`。不得删除失败审计和已
   追加 segment/report；代码回滚只 `git revert <sha>` 并停止新 writer。
-- [ ] 因 `monitor/main.rs` 受保护且 scheduler 未集成，即使以上代码/测试全绿，PR 仍保持
+- [x] 因 `monitor/main.rs` 受保护且 scheduler 未集成，PR 保持
   Draft、状态 `In Progress / ResearchOnly`；不得称 Done 或 merge-ready。
-- [ ] 最终代码提交：`git commit -m "refactor: 统一回测基准读取入口"`；证据文档另提交
+- [x] 最终代码提交：`git commit -m "refactor: 统一回测基准读取入口"`；证据文档另提交
   `git commit -m "docs: 记录策略归因验证证据"`。

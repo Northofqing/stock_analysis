@@ -1028,3 +1028,44 @@ cargo build --release --bin monitor
 failure 审计和历史市场事实不得删除，回滚只停止新 writer/reader。架构/数据流错误回 Gate A，
 实现错误回 Gate B，红线违规在 Gate B 修复后重做失败模式审查。生产回填未获授权或任一
 Gate 失败时，安全下一步仅为保留 Draft、修复对应根因或继续只读验证。
+
+### 15.11 Task 33 本地收口证据（2026-08-26）
+
+状态保持 **Draft / In Progress / ResearchOnly**。代码提交
+`761af2d4828d6668cc0cdf00a258b7f9961cab29` 删除旧
+`fetch_benchmark_series` / `fetch_benchmark_series_with_code`，三种无 manifest wrapper
+统一传 `None` 并记录 `[BR-251][BenchmarkSegmentUnavailable] 基准缺失`；没有从 provider、
+环境变量或默认数据库猜测输入。新增的私有投影 seam 只接受 `&BenchmarkReader`、显式
+`&BenchmarkManifestRef`、exact `&BenchmarkRequest` 和名称，依次执行 `read_exact`、持久化
+manifest 与 caller ref 全等校验、`to_daily_series`。策略计算层仍只消费
+`Option<BenchmarkSeries>`，公共领域类型及 `pipeline/mod.rs` 均未改变。
+
+TDD 与定向证据：RED 在 seam/helper 尚不存在时以 E0425/E0599 失败；GREEN 定向测试 1/1
+通过，完整 `pipeline::backtest_runner::tests` 15/15 通过，跨季度的 2026-03-30、03-31、
+04-01 三个请求交易日全部进入 `BenchmarkSeries`，caller manifest 篡改被
+`benchmark_manifest_ref_mismatch` 拒绝，缺 manifest 报告包含“基准数据缺失”。
+`cargo clippy --lib --all-features -- -D warnings` 通过。`rg` 对两个旧 helper 名称返回零；
+相对 `bb26b45`，`src/pipeline/mod.rs`、`src/bin/monitor/main.rs`、`config/` 及涉及
+`paper_trades`、`paper_attribution_daily`、Unsafe、TechnicalBars、`paper_sell_paused` 的
+生产代码 diff 均为零。
+
+全仓门禁未通过，且失败均在本任务未修改路径：
+
+- `cargo fmt --all -- --check`：`src/bin/hbars_probe.rs` 与受保护
+  `src/bin/monitor/main.rs` 存在继承格式差异。
+- workspace strict Clippy：`src/bin/hbars_probe.rs:17` 的 `clippy::let_unit_value`。
+- workspace tests：lib 为 2982 passed / 7 ignored；monitor 为 683 passed / 2 failed /
+  4 ignored，失败为 BR-139 与 BR-241 两个源码计数断言（实际 2、期望 1）。
+- `tools/compliance/check.sh` 因会无条件访问生产 `stock_daily` 的 freshness 子检查而未获授权；
+  八个安全子检查中七个通过，`check_business_rules.sh` 因 60 个继承的缺失文档路径失败并有
+  157 个 warning。
+- llvm-cov 重现同两个 monitor 失败并退出 101，未生成当前报告；随后阈值命令读取到 mtime
+  为 2026-08-24 的继承 artifact，其 global line coverage 为 181971/236839 = 76.83%（要求
+  80%），core 为 145117/189071 = 76.75%（要求 95%），不能作为本任务新鲜 Gate D 证据。
+- `cargo build --release --bin monitor` 与
+  `cargo build --release --bin strategy_attribution` 均通过。
+
+本任务没有 PushKind、事件或 producer，production push/audit evidence 为 **N/A**。真实
+TDX/gRPC probe、freshness/backfill、capture/replay `--commit`、订单、推送和生产数据库访问均
+未执行；Minute1 继续 Disabled。独立 reviewer、Gate D 阈值、生产授权验收和 Draft PR #15
+描述更新仍是外部待办，因此不得合并或宣称完成。
