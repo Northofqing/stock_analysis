@@ -51,12 +51,12 @@
 
 **文件：** `tests/test_data_freshness_check.rs`、`tools/compliance/check.sh`
 
-- [ ] 先新增进程测试，以临时 `LIB_DIR` 下的可执行探针记录调用：`--policy pr` 必须运行所有
-  离线检查且不调用 freshness；`--policy release` 与无参数默认都必须调用 freshness；未知参数
-  必须非零且不运行任何子脚本；任一子检查失败必须向上传播。
-- [ ] 给 `check.sh` 增加严格参数解析与可测试的 `COMPLIANCE_LIB_DIR` 私有注入；生产默认仍指向
-  仓库 `tools/compliance/lib`。仅 PR policy 跳过 `check_data_freshness.sh`，其他检查列表完全一致。
-- [ ] 运行 `cargo test --test test_data_freshness_check -- --test-threads=1` 与
+- [x] 先新增真实进程测试：`--policy pr` 必须运行仓库全部离线检查且不调用 freshness；
+  `--policy release` 与无参数默认都必须调用 freshness；未知参数必须非零且不运行任何子脚本；
+  缺失数据库造成的 freshness 失败必须向上传播。禁止测试目录注入，避免形成可替换检查脚本的旁路。
+- [x] 给 `check.sh` 增加严格参数解析；检查目录始终固定为仓库 `tools/compliance/lib`。仅 PR policy
+  跳过 `check_data_freshness.sh`，其他检查列表完全一致。
+- [x] 运行 `cargo test --test test_data_freshness_check -- --test-threads=1`（7/7 PASS）与
   `bash tools/compliance/check.sh --policy pr`；预期 PASS。不得运行回填或把 PR skip 写成 freshness PASS。
 - [ ] 独立提交 compliance policy 与测试。
 

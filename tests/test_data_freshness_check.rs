@@ -13,6 +13,25 @@ fn script_path() -> PathBuf {
     p
 }
 
+fn compliance_script_path() -> PathBuf {
+    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.push("tools/compliance/check.sh");
+    p
+}
+
+fn run_compliance(args: &[&str], db: Option<&str>) -> std::process::Output {
+    let mut cmd = Command::new("bash");
+    cmd.arg(compliance_script_path())
+        .args(args)
+        .current_dir(env!("CARGO_MANIFEST_DIR"));
+    if let Some(path) = db {
+        cmd.env("STOCK_DB", path);
+    } else {
+        cmd.env_remove("STOCK_DB");
+    }
+    cmd.output().expect("应能运行 compliance 入口")
+}
+
 fn run_with_db(db: Option<&str>) -> std::process::Output {
     let mut cmd = Command::new("bash");
     cmd.arg(script_path());
@@ -145,4 +164,36 @@ fn test_data_freshness_check_exits_zero_on_fresh_fixture() {
         "fresh fixture db 应 PASS (exit 0), stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+// BR-252: PR 只签发离线 Gate C 证据，Release/default 保持真实 freshness fail-closed。
+#[test]
+fn compliance_pr_policy_runs_offline_checks_without_claiming_freshness() {
+    let output = run_compliance(&["--policy", "pr"], Some("/nonexistent/TEST_CODE.db"));
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("policy=pr"));
+    assert!(stdout.contains("check_fake_impl.sh"));
+    assert!(stdout.contains("freshness: NOT RUN (Gate C offline policy)"));
+    assert!(!stdout.contains("===== check_data_freshness.sh ====="));
+}
+
+#[test]
+fn compliance_release_and_default_run_freshness_and_propagate_failure() {
+    for args in [&["--policy", "release"][..], &[][..]] {
+        let output = run_compliance(args, Some("/nonexistent/TEST_CODE.db"));
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("policy=release"));
+        assert!(stdout.contains("===== check_data_freshness.sh ====="));
+        assert!(stdout.contains("ONE OR MORE CHECKS FAILED"));
+    }
+}
+
+#[test]
+fn compliance_rejects_unknown_arguments_before_running_checks() {
+    let output = run_compliance(&["--policy", "TEST_CODE_unknown"], None);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("====="));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Usage:"));
 }
