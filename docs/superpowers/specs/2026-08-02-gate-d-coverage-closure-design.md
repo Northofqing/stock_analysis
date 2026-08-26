@@ -1,15 +1,8 @@
-# Gate D Coverage Closure Design
+# Gate D 覆盖率收口设计
 
-**Status:** Gate A sixth-remediation worktree candidate after the independent
-RED C1/I4/M1 review. The current worktree bytes are not accepted Gate-A or
-index/HEAD authority. Section 0.1 defines the exact two-blob staging and PR
-evidence required before the next review; no text in this candidate claims that
-condition already holds. The BR-202 row is synchronized byte-for-byte with
-`docs/business_rules.md`; this edit does not close Gate A. A fresh independent
-C0/I0 review and a separate implementation plan remain blocking before Gate B.
-Every numeric coverage result in this document is provisional until the new
-ownership/behavior inventories are executable and a fresh report is generated
-from one fixed reviewed source SHA.
+**状态：** 2026-08-26 分层门禁修订已写入 §10，等待用户书面复核。§0–§9
+保留为历史设计审计；凡与 §10 冲突之处，均由 §10 取代，不得继续作为实施依据。
+本次只完成 Gate A 文档与 BR-252 登记，不声称 Gate B/C/D 完成。
 
 **Date:** 2026-08-02
 
@@ -2667,3 +2660,221 @@ terminal/signature evidence. Append signed archive/key supersession where
 applicable. Never promote an incomplete/quarantined candidate, re-sign old bytes
 or reuse its terminal; repeat the full protocol. Preserve the 80%/95% floors.
 ```
+
+## 10. 2026-08-26 分层门禁与覆盖率棘轮修订（实施权威）
+
+### 10.1 目标与事实基线
+
+本修订解决的问题不是降低交易系统的安全标准，而是把检查放到能够提供相应证据的阶段：
+
+- 普通 PR 证明“本次改动安全、相关测试充分、没有扩大历史覆盖债”；
+- 发布候选证明“整个仓库达到发布目标，并且部署环境中的真实数据足够新鲜”；
+- 真实数据、测试/实盘隔离、订单安全、审计和禁止假实现继续是硬红线，任何阶段都不得豁免。
+
+2026-08-26 在 `f05f506` 工作树生成的新鲜报告：
+
+```bash
+cargo llvm-cov --workspace --all-features --json \
+  --output-path target/coverage/coverage.json -- --test-threads=1
+python3 tools/coverage/check_thresholds.py target/coverage/coverage.json
+```
+
+结果：第一条命令 exit 0，所有测试通过；第二条命令 exit 1：
+
+```text
+global line coverage: 201279/258810 = 77.77% (required 80.00%)
+core line coverage: 157652/202935 = 77.69% (required 95.00%, 218 files)
+```
+
+若继续把固定阈值用于每个 PR，当前分支需替全仓补约 5,769 条 global 和 35,137 条
+core 已覆盖行。这个缺口是历史仓库状态，不是本轮测试失败，不能通过改小分母、排除目录、
+降低 80%/95% 或伪造报告消除。
+
+现有 CI 把回填和聚合合规绑定在同一普通 workflow；仓库 workflow 没有自动部署入口。可复验
+事实如下（第二条 exit 1 且零输出表示没有命中）：
+
+```bash
+rg -n 'backfill_daily|tools/compliance/check\.sh' .github/workflows/compliance.yml
+rg -n 'deploy|self-hosted|environment:' .github/workflows
+```
+
+```text
+22:            cargo run --quiet --bin backfill_daily -- 000001
+24:        run: bash tools/compliance/check.sh
+```
+
+### 10.2 方案比较与选择
+
+| 方案 | 结果 | 决策 |
+| --- | --- | --- |
+| 删除覆盖率、freshness 和 compliance 门禁 | 合并快，但真实数据、订单与审计回归失去阻断 | 拒绝 |
+| 所有 PR 继续执行全仓 80%/核心 95% 和真实库 freshness | 安全目标清楚，但每个聚焦改动都承担历史覆盖债，并依赖普通 CI 不拥有的生产数据库 | 拒绝 |
+| PR 增量覆盖 + 全仓棘轮；发布保留固定阈值 + 真实 freshness/live evidence | 本次改动仍被严格验证，历史债不能恶化，生产发布不降级 | 采用 |
+
+采用方案的核心是深化既有两个模块，而不是新增平行平台：
+
+1. `tools/coverage/check_thresholds.py` 继续是唯一覆盖率 policy seam，共享报告解析、路径归一化、
+   core 范围和错误语义，只增加 `pr` 与 `release` 两种策略。
+2. `tools/compliance/check.sh` 继续是唯一合规入口，只增加 `--policy pr|release`；默认保持
+   `release`，避免旧调用者无意绕开 freshness。
+
+旧 §2.4–§4 尚未实现的隔离构建、签名归档、行为分母平台不进入本轮实现。它们若未来确有
+独立消费者，必须重新 Gate A；不得把本次小型门禁修订扩张成基础设施项目。
+
+### 10.3 Gate A–D 新职责
+
+| Gate | 可证明内容 | 阻断结果 |
+| --- | --- | --- |
+| A 设计 | 数据流、失败方式、旧模块关系、阈值证据和回滚 | 未审阅不得实施 |
+| B 实现 | 代码、显式错误、相关单测/进程测试、测试实盘隔离 | 未通过不得进入 PR 合规 |
+| C PR 合并 | fmt、strict Clippy、全工作区测试、离线 compliance、改动行覆盖率、全仓覆盖率棘轮、PR 证据 | 未通过不得合并 |
+| D 发布 | Gate C 全部证据、global ≥80%、core ≥95%、完整 compliance（含真实 freshness）、live-data/审计证据、独立复核 | 未通过不得发布或部署 |
+
+“合并完成”和“发布就绪”必须分别表述。Gate C 通过只能声明 merge-ready；没有 Gate D
+证据时必须明确 `Release Blocked`，不能说“全部完成”或“生产可用”。仓库当前没有自动部署
+workflow，因此 Gate C 合并不会自动绕过 Gate D。
+
+### 10.4 PR 覆盖率策略
+
+`check_thresholds.py --policy pr` 的接口必须一次完成两项判定：
+
+1. **改动可执行行覆盖率 ≥95%。** 范围仅为相对 base ref 新增或修改的 `src/**/*.rs`
+   可执行行；删除行、注释、空行和 llvm-cov 不计入分母的行不计。改动中没有可执行生产行时，
+   输出 `patch coverage: N/A (0 executable changed lines)` 并通过此子项，不得伪报 100%。
+2. **全仓覆盖率棘轮。** 当前报告的 global/core 比例都不得低于已审计 baseline；比较使用
+   整数交叉相乘，不用浮点舍入决定成败。candidate baseline 不得低于 base 分支 baseline。
+
+初始 baseline 固定为 `tools/coverage/baseline.v1.json`，至少包含：schema、global/core 的
+covered/count、core 文件数、source SHA、rustc commit/LLVM version、cargo-llvm-cov version。
+本次是该文件首次引入，必须在 PR 中明确 `Bootstrap-Baseline: true`，并由同一 source SHA 的
+新鲜报告证明 baseline 不高于实际结果。后续 PR 修改 baseline 时，检查器必须同时读取 base
+分支版本并拒绝任何比例下降；提高 baseline 是允许的，降低必须 exit 1，不能走普通配置修改。
+
+差分行由 `git diff --find-renames --unified=0 <base>...HEAD -- src` 取得；base ref 缺失、不是
+当前仓库对象、diff 解析失败、coverage 文件缺失、路径逃逸、工具身份不一致、baseline schema
+未知或 core 分母为空均 exit 2。任何失败都不能降级为 N/A。
+
+为避免浮动工具制造假回退，coverage workflow 固定 Rust 1.95.0（含
+`llvm-tools-preview`）和 cargo-llvm-cov 0.8.7；baseline 同时记录 `rustc -Vv` 与
+`cargo llvm-cov --version` 的身份。以后升级工具链必须在独立 PR 中，对同一 source SHA 用旧、
+新工具各生成一次报告，解释分母变化并建立不低于新报告的 successor baseline。
+
+CLI 退出语义固定为：0=策略通过，1=覆盖政策未达标，2=输入/工具/报告不可验证。现有不带
+`--policy` 的调用保持 `release` 语义，以免旧脚本从固定 80%/95% 静默降级到 PR 策略。
+
+### 10.5 Release 覆盖率策略
+
+`check_thresholds.py --policy release` 保留现有完整报告判定：
+
+- global line coverage ≥80%；
+- core trading/data paths line coverage ≥95%；
+- core 范围、worktree 路径归一化和“零 core 行失败”继续由 BR-250 约束；
+- 不允许用 patch report、focused test、`--ignore-run-fail`、旧报告或 candidate baseline
+  代替新鲜 workspace/all-features 报告。
+
+80%/95% 因此没有被删除或降低，只是不再把尚未达到的发布目标冒充为每个 PR 的改动质量。
+
+### 10.6 Compliance 分层
+
+`tools/compliance/check.sh --policy pr` 运行所有无需生产环境的检查：fake implementation、
+design contradiction、business rules、backfill failure propagation、silent fallback、legacy caller、
+BR-194 dependency 等。它不运行 `check_data_freshness.sh`，但全工作区测试仍必须运行
+`tests/test_data_freshness_check.rs`，证明 fresh/stale/missing 数据的失败语义没有被削弱。
+
+`tools/compliance/check.sh --policy release` 是默认值，运行上述全部检查并追加真实
+`check_data_freshness.sh`。Release 调用必须显式绑定部署环境真实 `STOCK_DB`；缺库、过期、
+连接失败均阻断。检查器不得自动回填后立刻给自己签发 PASS：若 freshness 失败，由获授权操作者
+单独执行 `bash tools/one_shot/backfill_daily.sh`，保留来源/时间/结果审计，再从头重跑 release。
+
+现有 `.github/workflows/compliance.yml` 中“先对 000001 回填一个 CI 临时库，再把它当作
+freshness 证据”的步骤删除。GitHub-hosted PR runner 没有生产数据库，它只能给出 Gate C 离线
+证据，不能签发 Gate D freshness PASS。
+
+### 10.7 CI 数据流
+
+```text
+PR / main push
+  ├─ fmt + strict clippy + workspace tests
+  ├─ compliance --policy pr
+  └─ llvm-cov(head)
+       ├─ patch coverage >=95%
+       └─ global/core >= tracked ratchet baseline
+             └─ Gate C merge-ready
+
+受控发布主机（显式人工触发）
+  ├─ 重放 Gate C 证据
+  ├─ coverage --policy release (80% / 95%)
+  ├─ compliance --policy release (含真实 STOCK_DB freshness)
+  ├─ live-data / audit / release binary 证据
+  └─ 独立复核通过 → Gate D release-ready
+```
+
+### 10.8 失败方式
+
+- PR patch <95%：只补本次改动的行为/失败路径测试，不修改 baseline 或排除行。
+- global/core 低于 baseline：定位回退文件；补测试或恢复造成回退的改动。禁止降低 baseline。
+- 工具身份漂移：exit 2；按 §10.4 的双报告升级流程处理。
+- PR freshness 未运行：这是预期的 Gate C 状态，不得展示为 freshness PASS。
+- Release freshness 失败：Gate D 阻断；没有回填授权时只报告 blocker，不碰生产库。
+- Release 固定覆盖率失败：Gate D 阻断，但不反向宣称已通过 Gate C 的代码存在测试失败。
+- baseline 或 diff 被篡改/缺失：exit 2，不能按零改动通过。
+
+### 10.9 旧模块处置
+
+| 模块 | 采用/拒绝 | 原因 |
+| --- | --- | --- |
+| `tools/coverage/check_thresholds.py` | 采用并深化 | 保留唯一报告解析、核心范围与路径规范化 seam |
+| `tests/test_coverage_thresholds.rs` | 采用并扩展 | 继续通过真实 CLI 进程接口验证成功与失败，不测试内部实现 |
+| `tools/compliance/check.sh` | 采用并深化 | 单一入口、显式 policy；默认 release 保持 fail-closed |
+| `check_data_freshness.sh` | 原样采用 | freshness 语义和阈值不变，只调整执行阶段 |
+| `.github/workflows/coverage.yml` | 修改调用 | PR 使用 patch + ratchet；不再要求固定发布目标 |
+| `.github/workflows/compliance.yml` | 修改调用 | 删除自动回填，改跑离线 PR policy |
+| §0–§9 未实现的覆盖率权威平台 | 拒绝进入本轮 | 接口和基础设施远超当前痛点，没有已存在消费者 |
+
+### 10.10 测试与验收
+
+Gate B 至少新增以下进程级测试：
+
+- patch 95% 边界通过，低一条可执行行失败；
+- 注释/空行/删除-only 输出 N/A，不伪报 100%；
+- rename 与 worktree 路径正确归一化；
+- 当前报告等于 baseline 通过，任一 global/core 比例下降失败；
+- candidate baseline 低于 base baseline 失败；首次 bootstrap 缺显式标记失败；
+- 缺 base ref、坏 diff、未知 schema、工具身份漂移均 exit 2；
+- `--policy release` 仍以 80%/95% 判定，默认无 policy 仍等价于 release；
+- compliance PR policy 不执行真实 freshness，但继续执行其余全部脚本；
+- compliance release/default 必须执行 freshness，freshness 失败向上传播；
+- workflow 静态测试证明 PR 不回填真实代码、不读取生产库、不宣称 Gate D PASS。
+
+实现完成后的验证命令：
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets --all-features -- --test-threads=1
+bash tools/compliance/check.sh --policy pr
+cargo llvm-cov --workspace --all-features --json \
+  --output-path target/coverage/coverage.json -- --test-threads=1
+python3 tools/coverage/check_thresholds.py --policy pr \
+  --report target/coverage/coverage.json --base-ref <merge-base>
+git diff --check
+```
+
+完整 `bash tools/compliance/check.sh --policy release`、固定 80%/95%、真实 provider/数据库、
+推送和订单验证仍需单独生产授权；未授权或未通过时状态必须写为 `Release Blocked`。
+
+### 10.11 回滚与 PR 证据
+
+实现按“规则文档 → coverage policy → compliance policy → workflow”拆成可独立 revert 的提交。
+代码故障回滚最小实现提交；职责划分错误返回 Gate A。回滚不得删除 coverage 报告、审计、持仓、
+成交或行情证据，不得恢复 CI 自动回填并冒充生产 freshness。
+
+PR 除 AGENTS §3.1 字段外必须增加：
+
+- `Gate-Policy: PR=patch95+ratchet; Release=global80+core95+freshness+live`
+- `Bootstrap-Baseline: true|false`
+- baseline 的 source SHA、global/core covered/count、工具身份；
+- PR Gate C 与 Release Gate D 分开列结果，禁止合并成一个“全部 PASS”。
+
+本修订登记为 BR-252；BR-250 的路径归一化合同继续有效。BR-202 保留为历史候选记录，但其
+未实现的固定 PR 阈值与重型权威平台不再是本轮实施依据。
