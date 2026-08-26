@@ -197,3 +197,14 @@ fn compliance_rejects_unknown_arguments_before_running_checks() {
     assert!(!String::from_utf8_lossy(&output.stdout).contains("====="));
     assert!(String::from_utf8_lossy(&output.stderr).contains("Usage:"));
 }
+
+#[test]
+fn compliance_workflow_never_backfills_or_claims_release_freshness() {
+    let workflow = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/compliance.yml"),
+    )
+    .expect("read compliance workflow");
+    assert!(workflow.contains("bash tools/compliance/check.sh --policy pr"));
+    assert!(!workflow.contains("backfill_daily"));
+    assert!(!workflow.contains("STOCK_DB="));
+}

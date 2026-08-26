@@ -582,3 +582,27 @@ fn pr_policy_rejects_report_source_mismatch_and_tool_drift() {
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stderr).contains("tool identity mismatch"));
 }
+
+#[test]
+fn coverage_workflow_mints_only_pinned_gate_c_evidence() {
+    let workflow = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/coverage.yml"),
+    )
+    .expect("read coverage workflow");
+    for required in [
+        "fetch-depth: 0",
+        "dtolnay/rust-toolchain@1.95.0",
+        "components: llvm-tools-preview",
+        "tool: cargo-llvm-cov@0.8.7",
+        "cargo llvm-cov report --lcov",
+        "--policy pr",
+        "--base-ref",
+        "--bootstrap-baseline",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "coverage workflow 缺少 {required}"
+        );
+    }
+    assert!(!workflow.contains("check_thresholds.py target/coverage/coverage.json"));
+}

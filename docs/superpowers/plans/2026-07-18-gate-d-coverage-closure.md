@@ -65,12 +65,13 @@
 **文件：** `.github/workflows/coverage.yml`、`.github/workflows/compliance.yml`、
 `tests/test_coverage_thresholds.rs`、`tests/test_data_freshness_check.rs`
 
-- [ ] 先加 workflow 静态测试：coverage 必须 `fetch-depth: 0`、固定 Rust `1.95.0`、安装
+- [x] 先加 workflow 静态测试：coverage 必须 `fetch-depth: 0`、固定 Rust `1.95.0`、安装
   `llvm-tools-preview` 与 cargo-llvm-cov `0.8.7`、生成 JSON+LCOV、调用 `--policy pr` 与 base SHA；
   compliance 必须调用 `--policy pr`，不得出现 `backfill_daily`。
-- [ ] 修改 workflow：PR 使用 base SHA，push 使用 before SHA；首次 base 无 `[coverage]` 时显式传
+- [x] 修改 workflow：PR 使用 base SHA，push 使用 before SHA；首次 base 无 `[coverage]` 时显式传
   `--bootstrap-baseline`。CI 不读取生产库、不自动回填、不输出 Gate D PASS。
-- [ ] 运行两个测试 binary、`git diff --check` 与 `bash tools/compliance/check.sh --policy pr`；预期 PASS。
+- [x] 运行两个测试 binary（15/15、8/8 PASS）与 YAML 解析；`git diff --check` 和完整 PR compliance
+  纳入 Task 44 最终验证。
 - [ ] 独立提交 workflow 与静态测试。
 
 ### Task 44：完成 Gate C 验证、PR 证据与合并
