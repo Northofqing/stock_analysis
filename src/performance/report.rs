@@ -37,11 +37,20 @@ pub fn render_summary(daily: &DailyAttribution, window: &WindowAttribution) -> S
         format!("📊 虚拟盘归因 {date}"),
         "━━━━━━━━━━━━━━━━━━━━".to_string(),
         format!("【今日】合计 {:<12}", fmt_money(today_total)),
-        format!("【30天】已实现 {:<8} 期末浮盈 {}", fmt_money(win_realized), fmt_money(win_unreal)),
+        format!(
+            "【30天】已实现 {:<8} 期末浮盈 {}",
+            fmt_money(win_realized),
+            fmt_money(win_unreal)
+        ),
         "━━━━━━━━━━━━━━━━━━━━".to_string(),
     ];
     let mut families: Vec<&FamilyAggregate> = daily.families.iter().collect();
-    families.sort_by(|a, b| b.total_pnl.abs().partial_cmp(&a.total_pnl.abs()).unwrap_or(std::cmp::Ordering::Equal));
+    families.sort_by(|a, b| {
+        b.total_pnl
+            .abs()
+            .partial_cmp(&a.total_pnl.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let ranks = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩"];
     for (i, f) in families.iter().enumerate() {
         let rank = ranks.get(i).copied().unwrap_or("•");
@@ -50,10 +59,17 @@ pub fn render_summary(daily: &DailyAttribution, window: &WindowAttribution) -> S
             SignalFamily::ExitByRule => "ExitByRule(卖)",
             other => other.as_str(),
         };
-        let win = f.win_rate.map(|w| format!("胜率{:.0}%", w * 100.0)).unwrap_or_else(|| "胜率-".to_string());
+        let win = f
+            .win_rate
+            .map(|w| format!("胜率{:.0}%", w * 100.0))
+            .unwrap_or_else(|| "胜率-".to_string());
         lines.push(format!(
             "{} {:<8} {:>6}笔 {:<10} {}",
-            rank, label, f.realized_trades, fmt_money(f.realized_pnl), win
+            rank,
+            label,
+            f.realized_trades,
+            fmt_money(f.realized_pnl),
+            win
         ));
     }
     lines.push("━━━━━━━━━━━━━━━━━━━━".to_string());
@@ -69,7 +85,10 @@ pub fn render_summary(daily: &DailyAttribution, window: &WindowAttribution) -> S
     let mut quality = Vec::new();
     if suspicious > 0 {
         // spec §4.4.2 影响金额: 已实现口径 (suspicious_pnl), 正数带 "+"
-        quality.push(format!("⚠ 数据存疑 {suspicious}笔 ({})", fmt_signed_money(suspicious_pnl)));
+        quality.push(format!(
+            "⚠ 数据存疑 {suspicious}笔 ({})",
+            fmt_signed_money(suspicious_pnl)
+        ));
     }
     if unvalued > 0 {
         quality.push(format!("⚠ 未估值 {unvalued} lot"));
@@ -95,7 +114,10 @@ pub fn render_full_markdown(daily: &DailyAttribution, window: &WindowAttribution
             // spec §4.4.2: 可疑 lot 计数/族/影响金额 (已实现口径, 正数带 "+")
             out.push(format!(
                 "- {}: 存疑 {} lot ({}) / 未估值 {} lot",
-                f.family.as_str(), f.suspicious_lots, fmt_signed_money(f.suspicious_pnl), f.unvalued_lots
+                f.family.as_str(),
+                f.suspicious_lots,
+                fmt_signed_money(f.suspicious_pnl),
+                f.unvalued_lots
             ));
         }
         suspicious_count += f.suspicious_lots;
@@ -107,7 +129,11 @@ pub fn render_full_markdown(daily: &DailyAttribution, window: &WindowAttribution
             fmt_signed_money(suspicious_total)
         ));
     }
-    if !daily.families.iter().any(|f| f.suspicious_lots > 0 || f.unvalued_lots > 0) {
+    if !daily
+        .families
+        .iter()
+        .any(|f| f.suspicious_lots > 0 || f.unvalued_lots > 0)
+    {
         out.push("- 无数据质量问题".to_string());
     }
     out.push(String::new());
@@ -117,9 +143,14 @@ pub fn render_full_markdown(daily: &DailyAttribution, window: &WindowAttribution
     for f in &daily.families {
         out.push(format!(
             "| {} | {} | {} | {} | {} | {} |",
-            f.family.as_str(), fmt_money(f.realized_pnl), fmt_money(f.unrealized_pnl),
-            fmt_money(f.total_pnl), f.realized_trades,
-            f.win_rate.map(|w| format!("{:.0}%", w * 100.0)).unwrap_or_else(|| "-".to_string())
+            f.family.as_str(),
+            fmt_money(f.realized_pnl),
+            fmt_money(f.unrealized_pnl),
+            fmt_money(f.total_pnl),
+            f.realized_trades,
+            f.win_rate
+                .map(|w| format!("{:.0}%", w * 100.0))
+                .unwrap_or_else(|| "-".to_string())
         ));
     }
     out.push(String::new());
@@ -129,9 +160,13 @@ pub fn render_full_markdown(daily: &DailyAttribution, window: &WindowAttribution
     for f in &window.families {
         out.push(format!(
             "| {} | {} | {} | {} | {} |",
-            f.family.as_str(), fmt_money(f.realized_pnl), fmt_money(f.unrealized_pnl),
+            f.family.as_str(),
+            fmt_money(f.realized_pnl),
+            fmt_money(f.unrealized_pnl),
             fmt_money(f.total_pnl),
-            f.win_rate.map(|w| format!("{:.0}%", w * 100.0)).unwrap_or_else(|| "-".to_string())
+            f.win_rate
+                .map(|w| format!("{:.0}%", w * 100.0))
+                .unwrap_or_else(|| "-".to_string())
         ));
     }
     out.push(String::new());
@@ -146,7 +181,11 @@ pub fn render_full_markdown(daily: &DailyAttribution, window: &WindowAttribution
             let side = if t.pnl >= 0.0 { "盈利" } else { "亏损" };
             out.push(format!(
                 "| {} | {} | {} | {} | {} |",
-                side, t.code, t.entry_plan_id, fmt_money(t.pnl), t.entry_family.as_str()
+                side,
+                t.code,
+                t.entry_plan_id,
+                fmt_money(t.pnl),
+                t.entry_family.as_str()
             ));
         }
     }
@@ -160,7 +199,19 @@ mod tests {
     use crate::performance::attribution::TradeAttribution;
     use chrono::NaiveDate;
 
-    fn family(f: SignalFamily, realized: f64, unreal: f64, trades: i64, wins: i64, lots: i64, unvalued: i64, suspicious: i64, suspicious_pnl: f64) -> FamilyAggregate {
+    // TEST_CODE fixture exposes every aggregate dimension used by rendering assertions.
+    #[allow(clippy::too_many_arguments)]
+    fn family(
+        f: SignalFamily,
+        realized: f64,
+        unreal: f64,
+        trades: i64,
+        wins: i64,
+        lots: i64,
+        unvalued: i64,
+        suspicious: i64,
+        suspicious_pnl: f64,
+    ) -> FamilyAggregate {
         FamilyAggregate {
             family: f,
             realized_trades: trades,
@@ -181,8 +232,28 @@ mod tests {
         DailyAttribution {
             date: NaiveDate::from_ymd_opt(2026, 8, 20).expect("date"),
             families: vec![
-                family(SignalFamily::NewsCatalyst, -8120.0, -56000.0, 506, 192, 473, 0, 0, 0.0),
-                family(SignalFamily::PostCloseFundInflow, -3900.0, 1200.0, 270, 84, 135, 12, 27, 582000.0),
+                family(
+                    SignalFamily::NewsCatalyst,
+                    -8120.0,
+                    -56000.0,
+                    506,
+                    192,
+                    473,
+                    0,
+                    0,
+                    0.0,
+                ),
+                family(
+                    SignalFamily::PostCloseFundInflow,
+                    -3900.0,
+                    1200.0,
+                    270,
+                    84,
+                    135,
+                    12,
+                    27,
+                    582000.0,
+                ),
             ],
             top_trades: vec![],
         }
@@ -269,8 +340,20 @@ mod tests {
     fn no_test_strings_leak_into_output() {
         // v15 规则: 测试文本不进生产路径 (spec Global Constraints)
         let text = render_summary(&daily(), &window());
-        for forbidden in ["first", "second", "mock", "stub", "test kept", "placeholder", "fake", "sample"] {
-            assert!(!text.contains(forbidden), "forbidden test string leaked: {forbidden}");
+        for forbidden in [
+            "first",
+            "second",
+            "mock",
+            "stub",
+            "test kept",
+            "placeholder",
+            "fake",
+            "sample",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "forbidden test string leaked: {forbidden}"
+            );
         }
     }
 }

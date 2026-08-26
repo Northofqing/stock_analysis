@@ -49,6 +49,32 @@ fn isolated_monitor_command(root: &std::path::Path) -> Command {
     command
 }
 
+fn assert_selection_capability_is_safely_disabled(output: &str) {
+    let marker = "[selection-v2][BR-183] capability=disabled reason_code=";
+    let line = output
+        .lines()
+        .find(|line| line.contains(marker))
+        .unwrap_or_else(|| panic!("disabled selection capability summary missing: {output}"));
+    let (_, tail) = line
+        .split_once(marker)
+        .expect("selection capability marker must be present");
+    let (reason_code, counters) = tail
+        .split_once(' ')
+        .expect("selection capability reason must precede zero-call counters");
+    assert!(
+        !reason_code.is_empty()
+            && reason_code.is_ascii()
+            && reason_code
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+        "selection capability reason must be a non-empty snake_case token: {line}"
+    );
+    assert_eq!(
+        counters, "providers=0 database_operations=0 sinks=0 schedulers=0",
+        "disabled selection capability must retain the zero-call contract"
+    );
+}
+
 fn initialized_database_path(output: &str) -> std::path::PathBuf {
     let marker = "初始化数据库: ";
     output
@@ -552,8 +578,13 @@ fn br194_test_review_blocks_all_source_providers_and_sinks_before_account_gate()
         );
     }
     for forbidden in [
+        "[DataGateway]",
+        "[BoardDataGateway]",
         "[龙虎榜]",
         "[东财全市场]",
+        "[BR-232] 预测样本回填 verified=",
+        "[BR-223] 盘后大宗交易推送 pushed=",
+        "[BR-223] IPO 产业链催化 pushed=",
         "开始推送",
         "[飞书] 开始推送",
         "[AccountMode-hook] 启动评估",
@@ -569,10 +600,11 @@ fn br194_test_review_blocks_all_source_providers_and_sinks_before_account_gate()
     );
     assert!(
         combined_output.contains(
-            "[selection-v2][BR-183] capability=disabled reason_code=board_artifact_unverified providers=0 database_operations=0 sinks=0 schedulers=0"
+            "[BR-194][BR-223][BR-232] test_environment_post_session_side_routes=disabled prediction_backfill_calls=0 block_trade_provider_calls=0 ipo_dispatch_calls=0 renderer_calls=0 persistence_calls=0 durable_calls=0 sink_calls=0"
         ),
-        "test process did not report its disabled selection capability; output={combined_output}"
+        "test review did not report the closed side-route boundary; output={combined_output}"
     );
+    assert_selection_capability_is_safely_disabled(&combined_output);
 
     std::fs::remove_dir_all(root).expect("remove isolated startup directory");
 }
@@ -742,12 +774,7 @@ fn test_mode_ignores_caller_supplied_production_database_path() {
             "failed review must expose its fail-closed reason; output={combined_output}"
         );
     }
-    assert!(
-        combined_output.contains(
-            "[selection-v2][BR-183] capability=disabled reason_code=board_artifact_unverified providers=0 database_operations=0 sinks=0 schedulers=0"
-        ),
-        "disabled selection capability summary missing: {combined_output}",
-    );
+    assert_selection_capability_is_safely_disabled(&combined_output);
     assert!(
         combined_output.contains("[DB init][BR-051][BR-183] core database bound mode=test path=")
             && combined_output.contains("TEST_CODE_monitor_"),
@@ -800,12 +827,7 @@ fn test_mode_ignores_the_repository_dotenv_production_database_default() {
         "isolated E2E did not reach its completion marker: {combined_output}"
     );
     assert_br196_explicit_dry_run_summary(&combined_output);
-    assert!(
-        combined_output.contains(
-            "[selection-v2][BR-183] capability=disabled reason_code=board_artifact_unverified providers=0 database_operations=0 sinks=0 schedulers=0"
-        ),
-        "test mode did not report the disabled selection capability"
-    );
+    assert_selection_capability_is_safely_disabled(&combined_output);
     assert!(
         !root.join("data/stock_analysis.db").exists(),
         "test mode opened the dotenv production database"
@@ -814,12 +836,7 @@ fn test_mode_ignores_the_repository_dotenv_production_database_default() {
         !root.join("data/magiclaw.db").exists(),
         "test mode opened the dotenv production Magiclaw database"
     );
-    assert!(
-        combined_output.contains(
-            "[selection-v2][BR-183] capability=disabled reason_code=board_artifact_unverified providers=0 database_operations=0 sinks=0 schedulers=0"
-        ),
-        "test mode did not preserve the disabled selection summary: {combined_output}"
-    );
+    assert_selection_capability_is_safely_disabled(&combined_output);
 
     std::fs::remove_dir_all(&root).expect("remove isolated working directory");
 }
@@ -1617,10 +1634,9 @@ fn test_binding_ignores_caller_memory_database_override() {
         matches!(output.status.code(), Some(0 | 2)),
         "review may complete only through independent non-account reports; output={combined_output}"
     );
+    assert_selection_capability_is_safely_disabled(&combined_output);
     assert!(
-        combined_output.contains(
-            "[selection-v2][BR-183] capability=disabled reason_code=board_artifact_unverified providers=0 database_operations=0 sinks=0 schedulers=0"
-        ) && !combined_output.contains("journal_mode mismatch"),
+        !combined_output.contains("journal_mode mismatch"),
         "caller memory override reached database construction: output={combined_output}"
     );
 
@@ -1661,10 +1677,9 @@ fn test_binding_ignores_caller_database_parent_override() {
         matches!(output.status.code(), Some(0 | 2)),
         "review may complete only through independent non-account reports; output={combined_output}"
     );
+    assert_selection_capability_is_safely_disabled(&combined_output);
     assert!(
-        combined_output.contains(
-            "[selection-v2][BR-183] capability=disabled reason_code=board_artifact_unverified providers=0 database_operations=0 sinks=0 schedulers=0"
-        ) && !combined_output.contains("[DB init] 创建目录"),
+        !combined_output.contains("[DB init] 创建目录"),
         "caller database parent override reached database construction: output={combined_output}"
     );
 

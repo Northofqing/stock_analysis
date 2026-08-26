@@ -476,7 +476,9 @@ impl NewsMarketSnapshot {
             .map_err(|error| market_error(error.to_string()))?;
         let daily_observed_at = parse_observed_at(&daily_evidence.observed_at)
             .map_err(|error| market_error(error.to_string()))?;
-        if daily_observed_at > as_of + chrono::Duration::seconds(DATA_EVIDENCE_FUTURE_TOLERANCE_SECONDS) {
+        if daily_observed_at
+            > as_of + chrono::Duration::seconds(DATA_EVIDENCE_FUTURE_TOLERANCE_SECONDS)
+        {
             return Err(market_error("daily batch observation is in the future"));
         }
         let metrics = validate_daily_bars(&daily_bars, latest_completed_trading_day)?;
@@ -1942,7 +1944,8 @@ fn validate_quote(
             "quote source time differs from batch source time",
         ));
     }
-    if quote.source_at > quote.observed_at + chrono::Duration::seconds(DATA_EVIDENCE_FUTURE_TOLERANCE_SECONDS)
+    if quote.source_at
+        > quote.observed_at + chrono::Duration::seconds(DATA_EVIDENCE_FUTURE_TOLERANCE_SECONDS)
         || quote.observed_at
             > as_of + chrono::Duration::seconds(DATA_EVIDENCE_FUTURE_TOLERANCE_SECONDS)
     {

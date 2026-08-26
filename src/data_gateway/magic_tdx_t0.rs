@@ -1828,7 +1828,10 @@ mod tests {
             .iter()
             .filter(|time| **time <= cutoff && **time != missing_1130)
             .count();
-        assert_eq!(today_bars_count, 44, "fixture sanity: 45 已完成槽位 - 11:30");
+        assert_eq!(
+            today_bars_count, 44,
+            "fixture sanity: 45 已完成槽位 - 11:30"
+        );
         for time in trading_slots()
             .into_iter()
             .filter(|time| *time <= cutoff && *time != missing_1130)
@@ -1838,15 +1841,10 @@ mod tests {
 
         let validated = validate_five_minute_bars("TEST_CODE_600396", live, observed_at)
             .expect("缺 11:30 的盘中形态必须被接收");
-        let today_validated: Vec<_> = validated
-            .iter()
-            .filter(|b| b.at.date() == today)
-            .collect();
+        let today_validated: Vec<_> = validated.iter().filter(|b| b.at.date() == today).collect();
         assert_eq!(today_validated.len(), 44);
         assert!(
-            today_validated
-                .iter()
-                .all(|b| b.at.time() != missing_1130),
+            today_validated.iter().all(|b| b.at.time() != missing_1130),
             "11:30 不在 TDX 盘中响应里, 不得凭空出现在输出中"
         );
     }

@@ -7,7 +7,9 @@ use std::path::PathBuf;
 use stock_analysis::data_gateway::MarketDataGateway;
 
 fn main() {
-    let arg = std::env::args().nth(1).unwrap_or_else(|| "600396".to_string());
+    let arg = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "600396".to_string());
     let codes: Vec<String> = arg
         .split(|c: char| c == ',' || c.is_whitespace())
         .filter(|s| !s.is_empty())
@@ -20,11 +22,10 @@ fn main() {
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     let n = codes.len();
     rt.block_on(async {
-        let result = tokio::task::spawn_blocking(move || {
-            MarketDataGateway::new().realtime_quotes(&codes)
-        })
-        .await
-        .expect("blocking task");
+        let result =
+            tokio::task::spawn_blocking(move || MarketDataGateway::new().realtime_quotes(&codes))
+                .await
+                .expect("blocking task");
         match result {
             Ok(batch) => println!(
                 "OK codes={} records={} verified_empty={} evidence={:?}",

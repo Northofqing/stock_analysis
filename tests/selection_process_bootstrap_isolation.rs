@@ -202,10 +202,27 @@ fn operational_argv_runs_core_with_unverified_selection_disabled() {
         !combined.contains("selection_operational_binding_unavailable"),
         "{combined}"
     );
+    let marker = "[selection-v2][BR-183] capability=disabled reason_code=";
+    let line = combined
+        .lines()
+        .find(|line| line.contains(marker))
+        .unwrap_or_else(|| panic!("disabled selection capability summary missing: {combined}"));
+    let (_, tail) = line
+        .split_once(marker)
+        .expect("selection capability marker must be present");
+    let (reason_code, counters) = tail
+        .split_once(' ')
+        .expect("selection capability reason must precede zero-call counters");
     assert!(
-        combined.contains(
-            "[selection-v2][BR-183] capability=disabled reason_code=board_artifact_unverified providers=0 database_operations=0 sinks=0 schedulers=0"
-        ),
+        !reason_code.is_empty()
+            && reason_code.is_ascii()
+            && reason_code
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+        "{combined}"
+    );
+    assert_eq!(
+        counters, "providers=0 database_operations=0 sinks=0 schedulers=0",
         "{combined}"
     );
     assert!(

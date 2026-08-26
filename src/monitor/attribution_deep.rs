@@ -197,8 +197,12 @@ pub fn parse_deep_attribution_output(response: &str) -> Result<DeepAttributionRe
         .or_else(|| trimmed.strip_prefix("```"))
         .map(|s| s.strip_suffix("```").unwrap_or(s))
         .unwrap_or(trimmed);
-    let value: serde_json::Value = serde_json::from_str(json_body)
-        .map_err(|e| format!("JSON 解析失败: {e} (原文: {})", truncated_for_error(trimmed)))?;
+    let value: serde_json::Value = serde_json::from_str(json_body).map_err(|e| {
+        format!(
+            "JSON 解析失败: {e} (原文: {})",
+            truncated_for_error(trimmed)
+        )
+    })?;
     let obj = value.as_object().ok_or("顶层必须是 JSON 对象")?;
     let main_reason = required_string(obj, "main_reason")?;
     let catalyst_chain = match obj.get("catalyst_chain") {
@@ -206,9 +210,9 @@ pub fn parse_deep_attribution_output(response: &str) -> Result<DeepAttributionRe
             let chains: Result<Vec<String>, String> = items
                 .iter()
                 .map(|item| {
-                    item.as_str().map(str::to_owned).ok_or_else(|| {
-                        "catalyst_chain 元素必须是字符串".to_string()
-                    })
+                    item.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| "catalyst_chain 元素必须是字符串".to_string())
                 })
                 .collect();
             chains?
@@ -219,7 +223,9 @@ pub fn parse_deep_attribution_output(response: &str) -> Result<DeepAttributionRe
     let capital_logic = required_string(obj, "capital_logic")?;
     let confidence = required_string(obj, "confidence")?;
     if !matches!(confidence.as_str(), "high" | "medium" | "low") {
-        return Err(format!("confidence 必须是 high/medium/low, 收到: {confidence}"));
+        return Err(format!(
+            "confidence 必须是 high/medium/low, 收到: {confidence}"
+        ));
     }
     let risk_note = required_string(obj, "risk_note")?;
     Ok(DeepAttributionResult {
@@ -273,11 +279,9 @@ pub fn top_events_for_deep(records: Vec<AlertRecord>, max: usize) -> Vec<AlertRe
 pub fn append_deep_attribution_row(row: &DeepAttributionRow) -> Result<(), DeepAttributionError> {
     let dir = PathBuf::from("data/g5b");
     fs::create_dir_all(&dir).map_err(|e| DeepAttributionError::Io(e.to_string()))?;
-    let path = dir.join(format!(
-        "{}.jsonl",
-        chrono::Local::now().format("%Y-%m-%d")
-    ));
-    let mut line = serde_json::to_string(row).map_err(|e| DeepAttributionError::Io(e.to_string()))?;
+    let path = dir.join(format!("{}.jsonl", chrono::Local::now().format("%Y-%m-%d")));
+    let mut line =
+        serde_json::to_string(row).map_err(|e| DeepAttributionError::Io(e.to_string()))?;
     line.push('\n');
     fs::OpenOptions::new()
         .create(true)
@@ -380,10 +384,22 @@ mod tests {
     fn prompt_contains_all_record_fields() {
         let prompt = deep_attribution_prompt(&sample_request());
         for needle in [
-            "600396", "金山股份", "重要", "主力突袭", "14.28", "5.2", "0.8",
-            "公司中标新能源项目", "5", "NewsCatalyst", "false",
+            "600396",
+            "金山股份",
+            "重要",
+            "主力突袭",
+            "14.28",
+            "5.2",
+            "0.8",
+            "公司中标新能源项目",
+            "5",
+            "NewsCatalyst",
+            "false",
         ] {
-            assert!(prompt.contains(needle), "prompt 缺少字段: {needle}\n{prompt}");
+            assert!(
+                prompt.contains(needle),
+                "prompt 缺少字段: {needle}\n{prompt}"
+            );
         }
     }
 
@@ -398,7 +414,10 @@ mod tests {
             as_of: Utc::now(),
         };
         let prompt = deep_attribution_prompt(&request);
-        assert!(prompt.contains("absent"), "缺失字段必须明示 absent:\n{prompt}");
+        assert!(
+            prompt.contains("absent"),
+            "缺失字段必须明示 absent:\n{prompt}"
+        );
     }
 
     #[test]
@@ -423,8 +442,8 @@ mod tests {
 
     #[test]
     fn parse_rejects_missing_fields() {
-        let err = parse_deep_attribution_output(r#"{"main_reason":"a"}"#)
-            .expect_err("缺字段必须报错");
+        let err =
+            parse_deep_attribution_output(r#"{"main_reason":"a"}"#).expect_err("缺字段必须报错");
         assert!(err.contains("catalyst_chain"), "错误应点名缺字段: {err}");
     }
 
@@ -482,7 +501,14 @@ mod tests {
         };
         let md = render_deep_attribution(&row);
         for needle in [
-            "600396", "金山股份", "中标催化", "公告", "吸筹", "medium", "回落", "deepseek",
+            "600396",
+            "金山股份",
+            "中标催化",
+            "公告",
+            "吸筹",
+            "medium",
+            "回落",
+            "deepseek",
         ] {
             assert!(md.contains(needle), "渲染缺少: {needle}\n{md}");
         }
@@ -539,11 +565,17 @@ mod tests {
             fail_with_api: false,
         });
         let analyzer = DeepAttributionAnalyzer::new(provider);
-        let outcome = analyzer.assess(&sample_request()).await.expect("mock 应成功");
+        let outcome = analyzer
+            .assess(&sample_request())
+            .await
+            .expect("mock 应成功");
         assert_eq!(outcome.result.main_reason, "中标催化");
         assert_eq!(outcome.result.confidence, "high");
         assert_eq!(outcome.receipt.provider(), "mock-deep");
-        assert_eq!(outcome.receipt.upstream_response_id(), Some("mock-response-id"));
+        assert_eq!(
+            outcome.receipt.upstream_response_id(),
+            Some("mock-response-id")
+        );
     }
 
     #[tokio::test]
@@ -553,7 +585,10 @@ mod tests {
             fail_with_api: false,
         });
         let analyzer = DeepAttributionAnalyzer::new(provider);
-        let err = analyzer.assess(&sample_request()).await.expect_err("schema 缺失必须失败");
+        let err = analyzer
+            .assess(&sample_request())
+            .await
+            .expect_err("schema 缺失必须失败");
         assert!(
             matches!(err, DeepAttributionError::InvalidModelSchema(_)),
             "非法输出必须是 InvalidModelSchema: {err:?}"
@@ -567,7 +602,10 @@ mod tests {
             fail_with_api: true,
         });
         let analyzer = DeepAttributionAnalyzer::new(provider);
-        let err = analyzer.assess(&sample_request()).await.expect_err("API 错误必须失败");
+        let err = analyzer
+            .assess(&sample_request())
+            .await
+            .expect_err("API 错误必须失败");
         assert!(
             matches!(err, DeepAttributionError::ModelUnavailable(_)),
             "调用失败必须是 ModelUnavailable: {err:?}"

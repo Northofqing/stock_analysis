@@ -21,9 +21,12 @@ async fn health_and_capabilities() {
     let caps = client.get_capabilities().await.unwrap();
     assert_eq!(
         caps.len(),
-        39,
-        "M1: 38 个生产 op + M4c ChainBatch 全部在 capability 表"
+        40,
+        "M1: 38 个生产 op + M4c ChainBatch + BR-251 BenchmarkBars 全部在 capability 表"
     );
+    assert!(caps
+        .iter()
+        .any(|capability| capability.operation == Operation::BenchmarkBars as i32));
     handle.abort();
 }
 

@@ -7,19 +7,18 @@ use std::path::PathBuf;
 use stock_analysis::data_gateway::HistoricalBarsGateway;
 
 fn main() {
-    let code = std::env::args().nth(1).unwrap_or_else(|| "600396".to_string());
+    let code = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "600396".to_string());
     // 生产 monitor 在启动时初始化数据库 (审计写入需要)。
     stock_analysis::database::DatabaseManager::init(
         std::env::var("DATABASE_PATH").ok().map(PathBuf::from),
     )
     .expect("database init");
     let rt = tokio::runtime::Runtime::new().expect("runtime");
-    let result = rt.block_on(async {
+    rt.block_on(async {
         let gateway = HistoricalBarsGateway::new();
-        match gateway
-            .required_daily_bars_async(&code, 120)
-            .await
-        {
+        match gateway.required_daily_bars_async(&code, 120).await {
             Ok(batch) => {
                 println!(
                     "OK code={} records={} evidence={:?}",
@@ -31,5 +30,4 @@ fn main() {
             Err(e) => println!("FAIL: {e:#}"),
         }
     });
-    result
 }

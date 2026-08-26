@@ -9631,37 +9631,46 @@ pub async fn dispatch_post_session_review(
         .flatten()
         .collect::<Vec<_>>();
 
-    // BR-232: SignalTracker 样本回填 (5 日收益验证, 每日复盘时执行)
-    let (backfilled_total, backfilled_hits) = backfill_pending_predictions(14).await;
-    if backfilled_total > 0 {
-        log::info!("[BR-232] 预测样本回填 verified={backfilled_total} hits={backfilled_hits}");
-    }
+    if is_test {
+        // BR-194/223/232: ReviewTask preflight is not sufficient for these
+        // post-session side routes. Test mode must stop before every loader,
+        // provider, renderer, persistence, durable-delivery, or sink call.
+        log::info!(
+            "[BR-194][BR-223][BR-232] test_environment_post_session_side_routes=disabled prediction_backfill_calls=0 block_trade_provider_calls=0 ipo_dispatch_calls=0 renderer_calls=0 persistence_calls=0 durable_calls=0 sink_calls=0"
+        );
+    } else {
+        // BR-232: SignalTracker 样本回填 (5 日收益验证, 每日复盘时执行)
+        let (backfilled_total, backfilled_hits) = backfill_pending_predictions(14).await;
+        if backfilled_total > 0 {
+            log::info!("[BR-232] 预测样本回填 verified={backfilled_total} hits={backfilled_hits}");
+        }
 
-    // BR-223: 盘后大宗交易推送 (自选+持仓代码集, 非 ReviewTask 侧推)
-    let mut block_trade_codes: Vec<String> = stock_analysis::portfolio::get_positions()
-        .map(|positions| {
-            positions
-                .into_iter()
-                .map(|position| position.code)
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Ok(list) = std::env::var("STOCK_LIST") {
-        for code in list.split(',') {
-            let code = code.trim().to_string();
-            if !code.is_empty() && !block_trade_codes.contains(&code) {
-                block_trade_codes.push(code);
+        // BR-223: 盘后大宗交易推送 (自选+持仓代码集, 非 ReviewTask 侧推)
+        let mut block_trade_codes: Vec<String> = stock_analysis::portfolio::get_positions()
+            .map(|positions| {
+                positions
+                    .into_iter()
+                    .map(|position| position.code)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Ok(list) = std::env::var("STOCK_LIST") {
+            for code in list.split(',') {
+                let code = code.trim().to_string();
+                if !code.is_empty() && !block_trade_codes.contains(&code) {
+                    block_trade_codes.push(code);
+                }
             }
         }
+        if !block_trade_codes.is_empty() {
+            let block_trade_pushed =
+                dispatch_block_trade_review(&block_trade_codes, business_date).await;
+            log::info!("[BR-223] 盘后大宗交易推送 pushed={block_trade_pushed}");
+        }
+        // BR-223: A-11 IPO 阶段催化 (每日一次, 盘后侧推)
+        let ipo_pushed = dispatch_ipo_catalyst(&date).await;
+        log::info!("[BR-223] IPO 产业链催化 pushed={ipo_pushed}");
     }
-    if !block_trade_codes.is_empty() {
-        let block_trade_pushed =
-            dispatch_block_trade_review(&block_trade_codes, business_date).await;
-        log::info!("[BR-223] 盘后大宗交易推送 pushed={block_trade_pushed}");
-    }
-    // BR-223: A-11 IPO 阶段催化 (每日一次, 盘后侧推)
-    let ipo_pushed = dispatch_ipo_catalyst(&date).await;
-    log::info!("[BR-223] IPO 产业链催化 pushed={ipo_pushed}");
     let observed_at = chrono::Local::now().fixed_offset();
     // BR-139/BR-194: account_required 任务在真实账户指标缺失时统一停在
     // typed AccountMetricsIncomplete 边界；不得调用 provider、renderer 或 sink。

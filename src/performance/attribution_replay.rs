@@ -4655,6 +4655,8 @@ mod tests {
             .unwrap();
     }
 
+    // TEST_CODE fixture mirrors the immutable paper-trade and audit-chain columns.
+    #[allow(clippy::too_many_arguments)]
     fn append_filled_pair(
         connection: &Connection,
         id: i64,
@@ -5291,7 +5293,7 @@ mod tests {
     fn runner_maps_only_target_day_benchmark_unavailability_to_current_session() {
         let path = complete_database("runner_benchmark_failure_day");
         let manager = crate::database::attribution_reports::test_runner_database_manager(&path);
-        let bindings = vec![
+        let bindings = [
             append_test_benchmark_manifest(&manager, date("2026-08-20"), 0.0),
             append_test_benchmark_manifest(&manager, date("2026-08-21"), 10.0),
         ];
@@ -7036,6 +7038,8 @@ mod tests {
         ));
     }
 
+    // TEST_CODE fixture keeps every replay-evidence field visible at call sites.
+    #[allow(clippy::too_many_arguments)]
     fn replay_fill(
         id: i64,
         code: &str,

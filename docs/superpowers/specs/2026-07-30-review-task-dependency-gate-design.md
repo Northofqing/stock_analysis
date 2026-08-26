@@ -1541,3 +1541,55 @@ provider request、任务 identity、报告日期必须使用此值，禁止重�
 - 回滚仅恢复本节涉及的 dependency mapping、dispatcher 分支和测试；不得删除或
   重写 durable、复盘、持仓、行情或投递审计数据，也不得触碰 R-04 runtime 或交割日
   Gateway。
+
+## 12. 2026-08-26 测试环境旁路闭合修订
+
+### 12.1 问题与归因
+
+BR-194 的 `review_preflight(..., is_test=true)` 已在 provider 前禁用全部
+`SourceOnly` ReviewTask；但后续新增的 BR-232 预测样本回填、BR-223 大宗交易扫描和
+BR-223 A-11 IPO 催化不属于 `ReviewTask`，仍在合并任务 outcome 之前无条件运行。
+因此 `monitor --test --review` 虽打印 `provider_calls=0`，仍可能实际访问真实公告、
+板块或大宗交易来源并尝试非 counted 推送。该行为违反 AGENTS 2.1/2.5，也使原进程
+测试的“全部来源已阻断”结论不完整。
+
+同一批进程测试还把 selection-v2 禁用原因固定为
+`board_artifact_unverified`。审计 artifact 重新生成或 activation 材料变化时，合法的
+BR-193 reason token 会改变；数据库与测试隔离不应绑定某一个可变的诊断原因。
+
+### 12.2 数据流与接口
+
+`dispatch_post_session_review` 继续只计算一次既有 `is_test` 权威，并把它同时传给
+`review_preflight` 与 ReviewTask 外旁路门：
+
+```text
+runtime test authority
+  -> review_preflight (ReviewTask provider/sink 全禁用)
+  -> post-session side-route gate
+       test       -> zero-call audit summary -> merge outcomes
+       production -> BR-232 backfill -> BR-223 block trade -> BR-223 IPO -> merge outcomes
+```
+
+测试分支必须在调用 `backfill_pending_predictions`、读取持仓/自选代码、构造
+BlockTradesGateway、调用 `dispatch_ipo_catalyst` 或任何 renderer/durable/sink 之前
+返回。它不得伪造 backfill 数量、`pushed=false` 结果或成功 receipt。唯一允许输出是
+包含 prediction/provider/renderer/persistence/durable/sink 全部为零的结构化隔离摘要。
+生产分支保留现有调用顺序、输入、数据验证、审计和投递语义。
+
+selection-v2 的进程断言只验证禁用日志的稳定结构、非空 reason token 及
+`providers=0 database_operations=0 sinks=0 schedulers=0`；具体 reason 枚举与顺序仍由
+BR-193 activation 专用测试负责，禁止在无关的数据库隔离测试中冻结墙钟相关原因。
+
+### 12.3 失败模式、验证与回滚
+
+- test authority 无法确认：沿用既有 fail-closed 环境门，不进入生产旁路；不得根据
+  `STOCK_LIST`、数据库路径或网络可达性推断测试模式。
+- 测试进程出现 `[DataGateway]`、`[BoardDataGateway]`、BR-232 verified 或 BR-223
+  pushed 标记：进程隔离测试失败，Gate B 阻塞。
+- 生产来源失败：保持原 typed failure、重试与审计语义，本修订不新增 fallback。
+- 回滚仅撤销本节、同一 dispatcher 的 test 分支和断言 helper；不修改配置、数据库
+  schema、历史行、真实持仓、订单或生产 provider 注册。
+
+验证至少包含精确 `monitor_help_isolation`、`selection_process_bootstrap_isolation`、
+monitor 单元测试、全工作区 Clippy 和全量测试。Gate C/D、覆盖率与真实生产证据仍按
+仓库总门执行，本修订本身不宣称 Release Ready。
