@@ -6,6 +6,7 @@ use std::str::FromStr;
 
 use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde::Serialize;
 use serde_json::{json, Value};
 use stock_analysis::calendar::{
     resolve_verified_scheduled_replay, VerifiedCalendarError, VerifiedCalendarErrorKind,
@@ -458,102 +459,260 @@ fn render_capture_receipt(
     }
 }
 
-fn metric_value(metric: &MetricAggregate) -> Value {
-    json!({
-        "总周期": metric.total_cycles,
-        "可用周期": metric.available_cycles,
-        "不可用周期": metric.unavailable_cycles,
-        "覆盖率": metric.coverage_ratio,
-        "不可用原因": metric.unavailable_reasons,
-        "收益和": metric.sum_return,
-        "平均收益": metric.mean_return,
-        "中位收益": metric.median_return
-    })
+fn output_value<T: Serialize + ?Sized>(value: &T, code: &'static str) -> Result<Value, AppError> {
+    serde_json::to_value(value).map_err(|_| AppError::output_integrity(code))
 }
 
-fn conclusion_value(conclusion: &AttributionConclusion) -> Value {
+fn output_object<const N: usize>(fields: [(&'static str, Value); N]) -> Value {
+    Value::Object(
+        fields
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value))
+            .collect(),
+    )
+}
+
+fn metric_value(metric: &MetricAggregate) -> Result<Value, AppError> {
+    Ok(output_object([
+        (
+            "总周期",
+            output_value(&metric.total_cycles, "report_metric_serialization_failed")?,
+        ),
+        (
+            "可用周期",
+            output_value(
+                &metric.available_cycles,
+                "report_metric_serialization_failed",
+            )?,
+        ),
+        (
+            "不可用周期",
+            output_value(
+                &metric.unavailable_cycles,
+                "report_metric_serialization_failed",
+            )?,
+        ),
+        (
+            "覆盖率",
+            output_value(&metric.coverage_ratio, "report_metric_serialization_failed")?,
+        ),
+        (
+            "不可用原因",
+            output_value(
+                &metric.unavailable_reasons,
+                "report_metric_serialization_failed",
+            )?,
+        ),
+        (
+            "收益和",
+            output_value(&metric.sum_return, "report_metric_serialization_failed")?,
+        ),
+        (
+            "平均收益",
+            output_value(&metric.mean_return, "report_metric_serialization_failed")?,
+        ),
+        (
+            "中位收益",
+            output_value(&metric.median_return, "report_metric_serialization_failed")?,
+        ),
+    ]))
+}
+
+fn conclusion_value(conclusion: &AttributionConclusion) -> Result<Value, AppError> {
     match conclusion {
         AttributionConclusion::InsufficientSample {
             reasons,
             research_limitations,
-        } => json!({
-            "样本门状态": "InsufficientSample",
-            "原因": reasons,
-            "研究限制": research_limitations
-        }),
+        } => Ok(output_object([
+            ("样本门状态", Value::String("InsufficientSample".to_owned())),
+            (
+                "原因",
+                output_value(reasons, "report_conclusion_serialization_failed")?,
+            ),
+            (
+                "研究限制",
+                output_value(
+                    research_limitations,
+                    "report_conclusion_serialization_failed",
+                )?,
+            ),
+        ])),
         AttributionConclusion::ResearchOnly {
             research_limitations,
-        } => json!({
-            "样本门状态": "ResearchOnly",
-            "原因": [],
-            "研究限制": research_limitations
-        }),
+        } => Ok(output_object([
+            ("样本门状态", Value::String("ResearchOnly".to_owned())),
+            ("原因", Value::Array(Vec::new())),
+            (
+                "研究限制",
+                output_value(
+                    research_limitations,
+                    "report_conclusion_serialization_failed",
+                )?,
+            ),
+        ])),
     }
 }
 
-fn prepared_report_value(prepared: &PreparedAttributionReport) -> Value {
+fn prepared_report_value(prepared: &PreparedAttributionReport) -> Result<Value, AppError> {
     let invocation = prepared.invocation();
     let report = prepared.report();
-    json!({
-        "状态": "ResearchOnly",
-        "警告": "本报告只用于研究，不构成策略成功、交易或下单结论",
-        "运行": {
-            "模式": format!("{:?}", invocation.mode),
-            "运行时刻": invocation.invoked_at.to_rfc3339(),
-            "目标起始": invocation.target_from,
-            "目标结束": invocation.target_to,
-            "规则版本": invocation.rule_version
-        },
-        "证据清单": {
-            "成交manifest哈希": prepared.trade_manifest_hash(),
-            "个股收盘manifest哈希": prepared.stock_close_manifest_hash(),
-            "基准组合manifest哈希": prepared.benchmark_manifest_hash(),
-            "基准逐日manifest": prepared.benchmark_day_manifests(),
-            "日历权威哈希": prepared.calendar_authority_hash()
-        },
-        "样本": {
-            "来源成交数": report.source_fill_ids().len(),
-            "总周期": report.total_closed_cycles() + report.total_open_cycles(),
-            "闭合周期": report.total_closed_cycles(),
-            "开放周期_右删失": report.total_open_cycles(),
-            "覆盖自然日": report.coverage_days()
-        },
-        "指标": {
-            "毛收益": metric_value(report.gross()),
-            "基准收益": metric_value(report.benchmark()),
-            "毛超额收益": metric_value(report.gross_excess()),
-            "净收益": metric_value(report.net()),
-            "净超额收益": metric_value(report.net_excess()),
-            "毛胜率": report.gross_win_rate(),
-            "净胜率可用性": report.net_win_rate(),
-            "毛胜负分母": report.gross_outcome(),
-            "净胜负分母": report.net_outcome(),
-            "费用证据可用性": report.fee_basis()
-        },
-        "按入场族归因": report.family_attribution(),
-        "数据质量": {
-            "不可用原因已计入总分母": true,
-            "开放周期按右删失展示": true,
-            "缺失字段未补零": true
-        },
-        "样本门与结论": conclusion_value(report.conclusion())
-    })
+    let run = output_object([
+        ("模式", Value::String(format!("{:?}", invocation.mode))),
+        (
+            "运行时刻",
+            Value::String(invocation.invoked_at.to_rfc3339()),
+        ),
+        (
+            "目标起始",
+            Value::String(invocation.target_from.to_string()),
+        ),
+        ("目标结束", Value::String(invocation.target_to.to_string())),
+        ("规则版本", Value::String(invocation.rule_version.clone())),
+    ]);
+    let manifests = output_object([
+        (
+            "成交manifest哈希",
+            Value::String(prepared.trade_manifest_hash().to_owned()),
+        ),
+        (
+            "个股收盘manifest哈希",
+            Value::String(prepared.stock_close_manifest_hash().to_owned()),
+        ),
+        (
+            "基准组合manifest哈希",
+            Value::String(prepared.benchmark_manifest_hash().to_owned()),
+        ),
+        (
+            "基准逐日manifest",
+            output_value(
+                prepared.benchmark_day_manifests(),
+                "report_manifest_serialization_failed",
+            )?,
+        ),
+        (
+            "日历权威哈希",
+            Value::String(prepared.calendar_authority_hash().to_owned()),
+        ),
+    ]);
+    let samples = output_object([
+        (
+            "来源成交数",
+            output_value(
+                &report.source_fill_ids().len(),
+                "report_sample_serialization_failed",
+            )?,
+        ),
+        (
+            "总周期",
+            output_value(
+                &(report.total_closed_cycles() + report.total_open_cycles()),
+                "report_sample_serialization_failed",
+            )?,
+        ),
+        (
+            "闭合周期",
+            output_value(
+                &report.total_closed_cycles(),
+                "report_sample_serialization_failed",
+            )?,
+        ),
+        (
+            "开放周期_右删失",
+            output_value(
+                &report.total_open_cycles(),
+                "report_sample_serialization_failed",
+            )?,
+        ),
+        (
+            "覆盖自然日",
+            output_value(
+                &report.coverage_days(),
+                "report_sample_serialization_failed",
+            )?,
+        ),
+    ]);
+    let metrics = output_object([
+        ("毛收益", metric_value(report.gross())?),
+        ("基准收益", metric_value(report.benchmark())?),
+        ("毛超额收益", metric_value(report.gross_excess())?),
+        ("净收益", metric_value(report.net())?),
+        ("净超额收益", metric_value(report.net_excess())?),
+        (
+            "毛胜率",
+            output_value(
+                &report.gross_win_rate(),
+                "report_outcome_serialization_failed",
+            )?,
+        ),
+        (
+            "净胜率可用性",
+            output_value(report.net_win_rate(), "report_outcome_serialization_failed")?,
+        ),
+        (
+            "毛胜负分母",
+            output_value(
+                report.gross_outcome(),
+                "report_outcome_serialization_failed",
+            )?,
+        ),
+        (
+            "净胜负分母",
+            output_value(report.net_outcome(), "report_outcome_serialization_failed")?,
+        ),
+        (
+            "费用证据可用性",
+            output_value(report.fee_basis(), "report_outcome_serialization_failed")?,
+        ),
+    ]);
+    Ok(output_object([
+        ("状态", Value::String("ResearchOnly".to_owned())),
+        (
+            "警告",
+            Value::String("本报告只用于研究，不构成策略成功、交易或下单结论".to_owned()),
+        ),
+        ("运行", run),
+        ("证据清单", manifests),
+        ("样本", samples),
+        ("指标", metrics),
+        (
+            "按入场族归因",
+            output_value(
+                report.family_attribution(),
+                "report_family_serialization_failed",
+            )?,
+        ),
+        (
+            "数据质量",
+            output_object([
+                ("不可用原因已计入总分母", Value::Bool(true)),
+                ("开放周期按右删失展示", Value::Bool(true)),
+                ("缺失字段未补零", Value::Bool(true)),
+            ]),
+        ),
+        ("样本门与结论", conclusion_value(report.conclusion())?),
+    ]))
 }
 
 fn render_prepared_report(
     prepared: &PreparedAttributionReport,
     format: OutputFormat,
 ) -> Result<String, AppError> {
-    let value = prepared_report_value(prepared);
+    let value = prepared_report_value(prepared)?;
     if matches!(format, OutputFormat::Json) {
         return Ok(value.to_string());
     }
     let report = prepared.report();
     let invocation = prepared.invocation();
-    let net_win_rate = serde_json::to_string(report.net_win_rate())
-        .map_err(|_| AppError::output_integrity("report_net_win_rate_serialization_failed"))?;
-    let family_attribution = serde_json::to_string(report.family_attribution())
-        .map_err(|_| AppError::output_integrity("report_family_serialization_failed"))?;
+    let net_win_rate = output_value(
+        report.net_win_rate(),
+        "report_net_win_rate_serialization_failed",
+    )?
+    .to_string();
+    let family_attribution = output_value(
+        report.family_attribution(),
+        "report_family_serialization_failed",
+    )?
+    .to_string();
     Ok(format!(
         "# 买卖策略历史归因（ResearchOnly）\n\n- 运行模式：{:?}\n- 运行时刻：{}\n- 目标范围：{} 至 {}\n- 规则版本：{}\n- 总周期：{}（闭合 {}，开放/右删失 {}）\n- 覆盖自然日：{}\n- 成交 Manifest：{}\n- 个股收盘 Manifest：{}\n- 基准组合 Manifest：{}\n- 日历权威 Manifest：{}\n\n## 指标与完整分母\n\n- 毛收益：{}\n- 基准收益：{}\n- 毛超额收益：{}\n- 净收益：{}\n- 净超额收益：{}\n- 毛胜率：{}\n- 净胜率可用性：{}\n- 按入场族归因：{}\n\n## 样本门与结论\n\n{}\n\n> 本报告只用于研究，不构成策略成功、交易或下单结论。不可用原因保留在总分母中，缺失字段未补零。",
         invocation.mode,
@@ -571,40 +730,73 @@ fn render_prepared_report(
         prepared.stock_close_manifest_hash(),
         prepared.benchmark_manifest_hash(),
         prepared.calendar_authority_hash(),
-        metric_value(report.gross()),
-        metric_value(report.benchmark()),
-        metric_value(report.gross_excess()),
-        metric_value(report.net()),
-        metric_value(report.net_excess()),
+        metric_value(report.gross())?,
+        metric_value(report.benchmark())?,
+        metric_value(report.gross_excess())?,
+        metric_value(report.net())?,
+        metric_value(report.net_excess())?,
         report
             .gross_win_rate()
             .map_or_else(|| "不可用".to_owned(), |rate| rate.to_string()),
         net_win_rate,
         family_attribution,
-        conclusion_value(report.conclusion())
+        conclusion_value(report.conclusion())?
     ))
 }
 
-fn report_receipt_value(receipt: &AttributionReportReceipt) -> Value {
-    json!({
-        "状态": "成功",
-        "模式": "归因提交",
-        "运行审计ID": receipt.run.run_audit_id,
-        "报告修订ID": receipt.report_revision_id,
-        "报告身份": receipt.report_identity,
-        "证据身份": receipt.evidence_identity,
-        "序列身份": receipt.series_identity,
-        "结果哈希": receipt.result_payload_hash,
-        "报告修订": receipt.report_revision,
-        "前版报告ID": receipt.predecessor_report_id,
-        "报告记录哈希": receipt.report_record_hash,
-        "结论边界": "ResearchOnly"
-    })
+fn report_receipt_value(receipt: &AttributionReportReceipt) -> Result<Value, AppError> {
+    Ok(output_object([
+        ("状态", Value::String("成功".to_owned())),
+        ("模式", Value::String("归因提交".to_owned())),
+        (
+            "运行审计ID",
+            output_value(
+                &receipt.run.run_audit_id,
+                "report_receipt_serialization_failed",
+            )?,
+        ),
+        (
+            "报告修订ID",
+            output_value(
+                &receipt.report_revision_id,
+                "report_receipt_serialization_failed",
+            )?,
+        ),
+        ("报告身份", Value::String(receipt.report_identity.clone())),
+        ("证据身份", Value::String(receipt.evidence_identity.clone())),
+        ("序列身份", Value::String(receipt.series_identity.clone())),
+        (
+            "结果哈希",
+            Value::String(receipt.result_payload_hash.clone()),
+        ),
+        (
+            "报告修订",
+            output_value(
+                &receipt.report_revision,
+                "report_receipt_serialization_failed",
+            )?,
+        ),
+        (
+            "前版报告ID",
+            output_value(
+                &receipt.predecessor_report_id,
+                "report_receipt_serialization_failed",
+            )?,
+        ),
+        (
+            "报告记录哈希",
+            Value::String(receipt.report_record_hash.clone()),
+        ),
+        ("结论边界", Value::String("ResearchOnly".to_owned())),
+    ]))
 }
 
-fn render_report_receipt(receipt: &AttributionReportReceipt, format: OutputFormat) -> String {
-    match format {
-        OutputFormat::Json => report_receipt_value(receipt).to_string(),
+fn render_report_receipt(
+    receipt: &AttributionReportReceipt,
+    format: OutputFormat,
+) -> Result<String, AppError> {
+    Ok(match format {
+        OutputFormat::Json => report_receipt_value(receipt)?.to_string(),
         OutputFormat::Markdown => format!(
             "# 归因提交回执\n\n- 状态：成功\n- 运行审计 ID：{}\n- 报告修订 ID：{}\n- 报告身份：{}\n- 证据身份：{}\n- 序列身份：{}\n- 结果哈希：{}\n- 报告修订：{}\n- 前版报告 ID：{}\n- 报告记录哈希：{}\n- 结论边界：ResearchOnly",
             receipt.run.run_audit_id,
@@ -619,7 +811,7 @@ fn render_report_receipt(receipt: &AttributionReportReceipt, format: OutputForma
                 .map_or_else(|| "无".to_owned(), |id| id.to_string()),
             receipt.report_record_hash
         ),
-    }
+    })
 }
 
 fn render_committed_report(
@@ -627,15 +819,15 @@ fn render_committed_report(
     format: OutputFormat,
 ) -> Result<String, AppError> {
     match format {
-        OutputFormat::Json => Ok(json!({
-            "报告": prepared_report_value(committed.prepared()),
-            "提交回执": report_receipt_value(committed.receipt())
-        })
+        OutputFormat::Json => Ok(output_object([
+            ("报告", prepared_report_value(committed.prepared())?),
+            ("提交回执", report_receipt_value(committed.receipt())?),
+        ])
         .to_string()),
         OutputFormat::Markdown => Ok(format!(
             "{}\n\n{}",
             render_prepared_report(committed.prepared(), format)?,
-            render_report_receipt(committed.receipt(), format)
+            render_report_receipt(committed.receipt(), format)?
         )),
     }
 }
@@ -996,6 +1188,30 @@ mod tests {
         connection
             .query_row(sql, [], |row| row.get(0))
             .expect("TEST_CODE scalar")
+    }
+
+    struct FailingSerialize;
+
+    impl Serialize for FailingSerialize {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom(
+                "TEST_CODE intentional serialization failure",
+            ))
+        }
+    }
+
+    #[test]
+    fn report_serialization_failure_is_a_stable_output_error_instead_of_a_panic() {
+        let error = output_value(&FailingSerialize, "report_test_serialization_failed")
+            .expect_err("TEST_CODE serialization failure must remain explicit");
+
+        assert_eq!(error.class, AppErrorClass::FailedIntegrity);
+        assert_eq!(error.stage, "output");
+        assert_eq!(error.code, "report_test_serialization_failed");
+        assert!(!error.retryable);
     }
 
     #[test]
