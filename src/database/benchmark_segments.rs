@@ -2527,7 +2527,7 @@ impl<'a> BenchmarkSegmentStore<'a> {
                 let mut seen_segments = HashSet::new();
                 let mut seen_quarters = HashSet::new();
                 let mut previous_order: Option<(String, String, String)> = None;
-                let mut provider_version: Option<(String, String, i32, i32)> = None;
+                let mut provider_version: Option<(String, String, String, i32, i32)> = None;
 
                 for selection in &selections {
                     if !seen_segments.insert(selection.segment_hash.clone()) {
@@ -2596,30 +2596,6 @@ impl<'a> BenchmarkSegmentStore<'a> {
                         ));
                     }
                     previous_order = Some(order);
-                    let version = (
-                        segment.provider.clone(),
-                        segment.codec.clone(),
-                        segment.codec_version,
-                        segment.payload_version,
-                    );
-                    if provider_version
-                        .as_ref()
-                        .is_some_and(|expected| expected != &version)
-                    {
-                        return Err(integrity_store_error(
-                            "benchmark_composition_provider_version_mismatch",
-                            "BR-251 exact composition mixes provider or payload version identities",
-                        ));
-                    }
-                    if provider_version.is_none() {
-                        provider_version = Some(version);
-                    }
-
-                    let decoded = decode_segment(&segment).map_err(store_error)?;
-                    payload.extend(decoded);
-                    segment_hashes.push(segment.segment_hash.clone());
-                    retained_segments.push(segment);
-
                     let mut matching = source_bindings
                         .iter()
                         .zip(source_associations.iter())
@@ -2643,6 +2619,31 @@ impl<'a> BenchmarkSegmentStore<'a> {
                             "BR-251 source manifest binds one segment to multiple acquisitions",
                         ));
                     }
+                    let version = (
+                        source_binding.provider.clone(),
+                        source_binding.source.clone(),
+                        segment.codec.clone(),
+                        segment.codec_version,
+                        segment.payload_version,
+                    );
+                    if provider_version
+                        .as_ref()
+                        .is_some_and(|expected| expected != &version)
+                    {
+                        return Err(integrity_store_error(
+                            "benchmark_composition_provider_version_mismatch",
+                            "BR-251 exact composition mixes provider source revision or payload version identities",
+                        ));
+                    }
+                    if provider_version.is_none() {
+                        provider_version = Some(version);
+                    }
+
+                    let decoded = decode_segment(&segment).map_err(store_error)?;
+                    payload.extend(decoded);
+                    segment_hashes.push(segment.segment_hash.clone());
+                    retained_segments.push(segment);
+
                     let provenance = (
                         selection.source_manifest_hash.clone(),
                         source_association.binding_hash.clone(),
@@ -3856,7 +3857,7 @@ mod tests {
         let composed = database
             .store()
             .compose_exact(
-                exact_request,
+                exact_request.clone(),
                 vec![
                     BenchmarkRetainedSegmentRef {
                         source_manifest_hash: q1.manifest_hash.clone(),
@@ -3874,17 +3875,21 @@ mod tests {
             composed.segment_hashes,
             vec![q1.segment_hashes[0].clone(), q2.segment_hashes[0].clone()]
         );
-        let (retained, bars, retained_evidence) = database
-            .store()
-            .read_exact(&composed.manifest_hash)
-            .expect("TEST_CODE composed manifest remains exactly readable");
-        assert_eq!(retained, composed);
+        let snapshot = BenchmarkReader::new(&database.manager)
+            .read_exact(&composed.manifest_hash, &exact_request)
+            .expect("TEST_CODE active Reader accepts exact same-revision composition");
+        assert_eq!(snapshot.manifest, composed);
         assert_eq!(
-            bars.iter().map(|bar| bar.close).collect::<Vec<_>>(),
+            snapshot
+                .bars
+                .iter()
+                .map(|bar| bar.close)
+                .collect::<Vec<_>>(),
             vec![101.0, 102.0]
         );
         assert_eq!(
-            retained_evidence
+            snapshot
+                .evidence
                 .iter()
                 .map(|item| item.batch_id.as_str())
                 .collect::<Vec<_>>(),
@@ -4105,6 +4110,88 @@ mod tests {
                 ],
             )
             .is_err());
+    }
+
+    #[test]
+    fn exact_composition_rejects_different_locked_provider_sources_without_writes() {
+        let database = TestDatabase::new();
+        let q1_request = BenchmarkRequest {
+            instrument: "TEST_CODE_sh000300".into(),
+            range: BenchmarkRange::Daily {
+                from: date(2026, 3, 31),
+                to: date(2026, 3, 31),
+            },
+        };
+        let q2_request = BenchmarkRequest {
+            instrument: q1_request.instrument.clone(),
+            range: BenchmarkRange::Daily {
+                from: date(2026, 4, 1),
+                to: date(2026, 4, 1),
+            },
+        };
+        let mut q1_evidence = evidence("TEST_CODE_compose_source_revision_q1");
+        q1_evidence.source = "TEST_CODE_magic-tdx-index-bars@revision-a".into();
+        let q1 = append_readable(
+            &database,
+            vec![append_with_evidence(
+                &database,
+                q1_request.clone(),
+                date(2026, 1, 1),
+                SegmentState::Provisional,
+                vec![daily_bar(date(2026, 3, 31), 101.0)],
+                q1_evidence,
+            )],
+            "TEST_CODE retained provider revision A",
+        );
+        let mut q2_evidence = evidence("TEST_CODE_compose_source_revision_q2");
+        q2_evidence.source = "TEST_CODE_magic-tdx-index-bars@revision-b".into();
+        let q2 = append_readable(
+            &database,
+            vec![append_with_evidence(
+                &database,
+                q2_request,
+                date(2026, 4, 1),
+                SegmentState::Provisional,
+                vec![daily_bar(date(2026, 4, 1), 102.0)],
+                q2_evidence,
+            )],
+            "TEST_CODE retained provider revision B",
+        );
+        let request = BenchmarkRequest {
+            instrument: q1_request.instrument,
+            range: BenchmarkRange::Daily {
+                from: date(2026, 3, 31),
+                to: date(2026, 4, 1),
+            },
+        };
+        let before = {
+            let mut conn = database.conn();
+            (
+                count(&mut conn, "benchmark_manifest"),
+                count(&mut conn, "benchmark_manifest_acquisition"),
+                count(&mut conn, "benchmark_manifest_chain"),
+            )
+        };
+
+        let error = database
+            .store()
+            .compose_exact(
+                request,
+                vec![retained_segment(&q1, 0), retained_segment(&q2, 0)],
+            )
+            .expect_err("TEST_CODE mixed locked provider revisions must fail closed");
+        assert_failed_integrity(error, "benchmark_composition_provider_version_mismatch");
+
+        let mut conn = database.conn();
+        assert_eq!(
+            (
+                count(&mut conn, "benchmark_manifest"),
+                count(&mut conn, "benchmark_manifest_acquisition"),
+                count(&mut conn, "benchmark_manifest_chain"),
+            ),
+            before,
+            "TEST_CODE rejected provider revision mix must publish no manifest evidence",
+        );
     }
 
     #[test]
