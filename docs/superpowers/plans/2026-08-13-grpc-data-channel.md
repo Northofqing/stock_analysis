@@ -3846,12 +3846,11 @@ let test_code = "TEST_CODE_600519".to_owned();
 
 不得新建第二个 env-sensitive integration test；现有测试负责最终 `reset_bridge()` 和子进程回收。
 
-- [ ] **Step 2: 覆盖无证券 resolver 的 available wrappers**
+- [ ] **Step 2: 覆盖无证券 resolver 且 fixture 已实现的 available wrappers**
 
 在同一测试内加入以下调用和精确计数断言：
 
 ```rust
-assert_eq!(bridge.global_indices_async().await.unwrap().records().len(), 1);
 assert_eq!(bridge.announcements_async().await.unwrap().records().len(), 1);
 assert_eq!(bridge.futures_delivery_async().await.unwrap().records().len(), 1);
 assert_eq!(
@@ -3905,6 +3904,15 @@ assert!(!news_error.retryable());
 
 ForeignExchange fixture 的 `TEST_CODE_USDCNY` 和 EconomicCalendar fixture 的 numeric optional
 字段故意不冒充合法 typed contract；测试必须保留显式错误，不修生产代码迎合 fixture。
+
+`GlobalIndices` 当前没有 fixture operation，必须覆盖现有 unsupported fail-closed，而不是新增
+fixture 或伪造 Available：
+
+```rust
+let global_indices_error = bridge.global_indices_async().await.unwrap_err();
+assert_eq!(global_indices_error.reason_code(), "invalid_request");
+assert!(!global_indices_error.retryable());
+```
 
 - [ ] **Step 4: 跑 bridge 与 resolver 隔离回归**
 
