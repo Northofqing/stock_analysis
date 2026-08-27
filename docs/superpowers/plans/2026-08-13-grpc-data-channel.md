@@ -3806,7 +3806,7 @@ case 新增生产 fixture fallback。
 Run:
 
 ```bash
-cargo test --bin grpc_local_readiness_probe isolated_fixture_probe_reaches_t0_and_fails_closed_on_test_identity -- --exact --test-threads=1
+cargo test --bin grpc_local_readiness_probe tests::isolated_fixture_probe_reaches_t0_and_fails_closed_on_test_identity -- --exact --test-threads=1
 cargo test --bin grpc_local_readiness_probe -- --test-threads=1
 cargo test --test grpc_channel_e2e -- --test-threads=1
 ```
