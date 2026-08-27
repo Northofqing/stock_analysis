@@ -3051,6 +3051,7 @@ git commit -m "fix(grpc): serialize T0 batches with explicit China time"
 
 **Files:**
 - Modify: `src/data_gateway/grpc_source/convert.rs`
+- Modify: `docs/superpowers/plans/2026-08-13-grpc-data-channel.md`
 
 **Interfaces:**
 - Consumes: `T0EvidenceBatchWireV2` canonical JSON、`QueryResult` envelope 和 consumer `now`。
@@ -3209,6 +3210,37 @@ Expected: 全部 PASS；旧的未来/倒置/价格非法门继续 PASS。
 ```bash
 git add src/data_gateway/grpc_source/convert.rs
 git commit -m "fix(grpc): strictly reconstruct T0 wire v2 batches"
+```
+
+- [ ] **Step 8: 修复 converter 单测的 TEST_CODE 身份隔离**
+
+审查确认 `live_t0_q()` 仍用 `600519`/`SH600519`，违反 AGENTS 2.5。把 Task 4 T0 fixture 的
+record/code/instrument 和冲突用例统一改为 `TEST_CODE_600519` / `TEST_CODE_600520`。
+
+production `instrument_for` 继续拒绝 TEST_CODE；只在 `#[cfg(test)]` 单元测试构建中加入一个
+明确的 TEST_CODE identity seam：从 `TEST_CODE_` 后缀推断测试 exchange，但构造出的
+`InstrumentId.code` 必须保留完整 TEST_CODE，不得剥前缀冒充真实标的。无前缀 production
+路径完全不变；integration/release 构建不得包含该 seam。增加 malformed TEST_CODE 后缀拒绝测试。
+
+- [ ] **Step 9: 验证单元测试隔离且生产构建不放宽**
+
+Run: `cargo test --lib data_gateway::grpc_source::convert::tests::br253_t0_v2 -- --nocapture`
+
+Run: `cargo test --lib data_gateway::grpc_source::convert::tests:: -- --nocapture`
+
+Run: `cargo build --release --bin grpc_local_readiness_probe`
+
+Run: `cargo clippy --lib --all-features -- -D warnings`
+
+Expected: converter 全部 PASS；测试输出身份保持 TEST_CODE；release/normal library 仍使用原生产
+resolver，未开启 fixture 时 TEST_CODE 不能形成完整 typed readiness。
+
+- [ ] **Step 10: 提交隔离修复**
+
+```bash
+git add src/data_gateway/grpc_source/convert.rs \
+  docs/superpowers/plans/2026-08-13-grpc-data-channel.md
+git commit -m "test(grpc): isolate T0 converter identities"
 ```
 
 ---
@@ -3536,8 +3568,9 @@ server/client round-trip 必须由 Task 8 未开启 fixture 的候选端口 prob
 
 在设计 §11.6 记录该分层验证边界，避免后续把 raw fixture 合同测试误写成 live/typed 证据。
 
-增加静态隔离回归，至少证明上述四个 Task 6 文件不存在精确 JSON 真实身份 `"600519"`、
-`SH600519`，且 fixture/E2E 的证券代码都以 `TEST_CODE_` 开头；禁止靠注释豁免。
+增加静态隔离回归：逐个扫描上述四个 Task 6 源文件的字符串字面量/fixture JSON，凡值形似
+A 股六位证券身份（含 SH/SZ 前缀）都必须以 `TEST_CODE_` 开头。不得只排除两个已知字面量，
+也不得仅证明“文件里至少有一个 TEST_CODE”后放行；禁止靠注释豁免。
 
 - [ ] **Step 8: 为 probe 失败与脱敏路径补自动测试**
 

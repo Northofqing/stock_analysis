@@ -1939,7 +1939,18 @@ fn parse_market_ranking_unit(
 }
 
 fn instrument_for(code: &str, capability: &'static str) -> Result<InstrumentId, GatewayError> {
-    let exchange = match crate::grpc_contract::params::exchange_of(code) {
+    #[cfg(test)]
+    let exchange_code = match code.strip_prefix("TEST_CODE_") {
+        Some(suffix) if suffix.len() == 6 && suffix.as_bytes().iter().all(u8::is_ascii_digit) => {
+            suffix
+        }
+        Some(_) => return Err(err(capability, "TEST_CODE suffix 必须是六位 ASCII 数字")),
+        None => code,
+    };
+    #[cfg(not(test))]
+    let exchange_code = code;
+
+    let exchange = match crate::grpc_contract::params::exchange_of(exchange_code) {
         "Shanghai" => Exchange::Shanghai,
         "Shenzhen" => Exchange::Shenzhen,
         "Beijing" => Exchange::Beijing,
@@ -5563,7 +5574,7 @@ mod tests {
 
     fn live_t0_q() -> QueryResult {
         let mut q = mk_q(
-            r#"{"requested_at":"2026-08-17T01:29:59Z","source_at":"2026-08-17T01:30:00Z","observed_at":"2026-08-17T01:30:00.250Z","batch_id":"TEST_CODE_T0_BATCH_001","time_untrustworthy":false,"records":[{"instrument":{"exchange":"Shanghai","code":"600519","asset_class":"Equity"},"code":"600519","requested_at":"2026-08-17T01:29:59Z","source_at":"2026-08-17T01:30:00Z","observed_at":"2026-08-17T01:30:00.250Z","batch_id":"TEST_CODE_T0_BATCH_001","quote":{"price":10.0,"last_close":9.9,"open":9.95,"high":10.1,"low":9.8,"volume":1000.0,"amount":10000.0,"bids":[{"price":9.99,"volume":100.0},{"price":9.98,"volume":100.0},{"price":9.97,"volume":100.0},{"price":9.96,"volume":100.0},{"price":9.95,"volume":100.0}],"asks":[{"price":10.01,"volume":100.0},{"price":10.02,"volume":100.0},{"price":10.03,"volume":100.0},{"price":10.04,"volume":100.0},{"price":10.05,"volume":100.0}]},"settled_daily":[],"completed_five_minute":[{"at":"2026-08-17T09:35:00+08:00","open":10.0,"high":10.1,"low":9.9,"close":10.0,"volume":1000.0,"amount":10000.0}],"intraday_average_price":9.98}],"rejections":[]}"#,
+            r#"{"requested_at":"2026-08-17T01:29:59Z","source_at":"2026-08-17T01:30:00Z","observed_at":"2026-08-17T01:30:00.250Z","batch_id":"TEST_CODE_T0_BATCH_001","time_untrustworthy":false,"records":[{"instrument":{"exchange":"Shanghai","code":"TEST_CODE_600519","asset_class":"Equity"},"code":"TEST_CODE_600519","requested_at":"2026-08-17T01:29:59Z","source_at":"2026-08-17T01:30:00Z","observed_at":"2026-08-17T01:30:00.250Z","batch_id":"TEST_CODE_T0_BATCH_001","quote":{"price":10.0,"last_close":9.9,"open":9.95,"high":10.1,"low":9.8,"volume":1000.0,"amount":10000.0,"bids":[{"price":9.99,"volume":100.0},{"price":9.98,"volume":100.0},{"price":9.97,"volume":100.0},{"price":9.96,"volume":100.0},{"price":9.95,"volume":100.0}],"asks":[{"price":10.01,"volume":100.0},{"price":10.02,"volume":100.0},{"price":10.03,"volume":100.0},{"price":10.04,"volume":100.0},{"price":10.05,"volume":100.0}]},"settled_daily":[],"completed_five_minute":[{"at":"2026-08-17T09:35:00+08:00","open":10.0,"high":10.1,"low":9.9,"close":10.0,"volume":1000.0,"amount":10000.0}],"intraday_average_price":9.98}],"rejections":[]}"#,
             "Tdx",
             "TEST_CODE_magic_tdx_t0",
         );
@@ -5579,6 +5590,8 @@ mod tests {
     fn br253_t0_v2_preserves_china_session_civil_label() {
         let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
         let batch = t0_evidence_batch_at(&live_t0_q(), now).unwrap();
+        assert_eq!(batch.records[0].code, "TEST_CODE_600519");
+        assert_eq!(batch.records[0].instrument.code(), "TEST_CODE_600519");
         assert_eq!(
             batch.records[0].completed_five_minute[0].at,
             NaiveDate::from_ymd_opt(2026, 8, 17)
@@ -5586,6 +5599,41 @@ mod tests {
                 .and_hms_opt(9, 35, 0)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn br253_t0_v2_preserves_alternate_test_code_identity() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
+        let mut q = live_t0_q();
+        let mut view: Value = serde_json::from_slice(&q.records[0].data).unwrap();
+        view["records"][0]["instrument"]["code"] = serde_json::json!("TEST_CODE_600520");
+        view["records"][0]["code"] = serde_json::json!("TEST_CODE_600520");
+        q.records[0].data = serde_json::to_vec(&view).unwrap();
+
+        let batch = t0_evidence_batch_at(&q, now).unwrap();
+        assert_eq!(batch.records[0].code, "TEST_CODE_600520");
+        assert_eq!(batch.records[0].instrument.code(), "TEST_CODE_600520");
+    }
+
+    #[test]
+    fn br253_t0_v2_rejects_malformed_test_code_suffix() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
+        for malformed in [
+            "TEST_CODE_",
+            "TEST_CODE_60051",
+            "TEST_CODE_600519X",
+            "TEST_CODE_NOT_CODE",
+        ] {
+            let mut q = live_t0_q();
+            let mut view: Value = serde_json::from_slice(&q.records[0].data).unwrap();
+            view["records"][0]["instrument"]["code"] = serde_json::json!(malformed);
+            view["records"][0]["code"] = serde_json::json!(malformed);
+            q.records[0].data = serde_json::to_vec(&view).unwrap();
+
+            let error = t0_evidence_batch_at(&q, now)
+                .expect_err("malformed TEST_CODE suffix must fail closed");
+            assert_eq!(error.reason_code(), "invalid_evidence", "code={malformed}");
+        }
     }
 
     #[test]
