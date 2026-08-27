@@ -3988,7 +3988,8 @@ Run before adding the test:
 cargo test --lib --all-features data_gateway::grpc_source::convert::tests::offline_fixture_converters_cover_dormant_available_empty_and_invalid_contracts -- --exact --test-threads=1
 ```
 
-Expected RED: exit 101，测试名称不存在。
+Expected RED: 输出 `running 0 tests`（Cargo 通常 exit 0），证明测试名称尚不存在；该结果只算
+RED/缺口证据，不得计为通过验证。GREEN 必须明确显示新测试 1/1。
 
 Run after adding the test:
 
