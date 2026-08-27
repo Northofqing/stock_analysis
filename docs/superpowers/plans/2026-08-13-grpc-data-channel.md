@@ -3382,10 +3382,12 @@ git commit -m "fix(monitor): make admitted OrderBook critical"
 - Modify: `tests/grpc_bridge_e2e.rs`
 - Modify: `tests/grpc_channel_e2e.rs`
 - Create: `src/bin/grpc_local_readiness_probe.rs`
+- Modify: `docs/superpowers/specs/2026-08-13-grpc-data-channel-design.md`
+- Modify: `docs/superpowers/plans/2026-08-13-grpc-data-channel.md`
 
 **Interfaces:**
 - Consumes: 同一候选 server 的 `GrpcMarketClient` 和四个已冻结 operation。
-- Produces: 只输出 operation/provider/records/time_untrustworthy/result 的 operator probe；不输出证券代码、价格、原始 payload、token 或证书路径。
+- Produces: 只输出 operation/provider/records/time_untrustworthy/status 的 operator probe；不输出证券代码、价格、原始 payload、token 或证书路径。
 
 - [ ] **Step 1: 把 T0 fixture 更新为 v2**
 
@@ -3514,6 +3516,68 @@ Expected: 全部 PASS；fixture 隔离且测试代码符合 `TEST_CODE` 约束�
 ```bash
 git add src/grpc_server/fixture.rs tests/grpc_bridge_e2e.rs tests/grpc_channel_e2e.rs src/bin/grpc_local_readiness_probe.rs
 git commit -m "test(grpc): cover T0 v2 roundtrip and local readiness"
+```
+
+- [ ] **Step 7: 修复 fixture 的 test/live identity 隔离**
+
+审查确认现有 fixture 与两个 E2E 仍用 `600519`/`SH600519` 真实标的身份，违反 AGENTS 2.5。
+把 `src/grpc_server/fixture.rs` 内全部证券 fixture identity，以及两份 E2E 能安全经过现有
+测试 seam 的 query、事件、断言统一改为 `TEST_CODE_600519`（其他测试标的同样必须使用
+`TEST_CODE_` 前缀）。T0 `instrument` 与 `code` 必须保持同一测试身份；fixture 仍只允许在
+`GRPC_GATEWAY_TEST_FIXTURE=1` 隔离路径启用。operator probe 的生产默认 `600396` 保持不变，
+但 fixture 动态测试必须显式传 `--code TEST_CODE_600519`。
+
+部分 high-level bridge adapter 会在发出 RPC 前通过 production identity resolver，按设计拒绝
+`TEST_CODE_`；禁止为了 E2E 修改/放宽 production converter 或 resolver。对这些 operation，
+E2E 改用同一 fixture server 的 `GrpcMarketClient::query`，断言 admission、schema/version、
+批次身份与 TEST_CODE raw payload；不得声称这是 typed domain round-trip。T0 producer DTO 与
+consumer converter 的 TEST_CODE typed 语义分别由 Tasks 3/4 单测证明；真实完整 typed
+server/client round-trip 必须由 Task 8 未开启 fixture 的候选端口 probe 证明。
+
+在设计 §11.6 记录该分层验证边界，避免后续把 raw fixture 合同测试误写成 live/typed 证据。
+
+增加静态隔离回归，至少证明上述四个 Task 6 文件不存在精确 JSON 真实身份 `"600519"`、
+`SH600519`，且 fixture/E2E 的证券代码都以 `TEST_CODE_` 开头；禁止靠注释豁免。
+
+- [ ] **Step 8: 为 probe 失败与脱敏路径补自动测试**
+
+把 inline 判断提取为不接收/不格式化证券代码的私有纯函数，并覆盖：
+
+- health 任一 `live=false` 或 `ready=false` 返回 `not_ready`；
+- 四个 capability 任一不是 `ADMITTED && runtime_available` 返回
+  `required_capability_unavailable`；
+- Quote/OrderBooks 单记录 identity/count 不匹配返回 `record_identity_mismatch`；
+- T0 identity/count 不匹配或任一 rejection 返回
+  `record_identity_or_rejection_mismatch`；
+- HistoricalBars 空记录返回 `records_unavailable`；
+- gRPC/gateway error 的输出只含 operation/reason_code/retryable，不含原始 message、测试
+  sentinel、证券代码、价格、token 或路径。
+
+将主体提取为 `async fn run(args: Args) -> anyhow::Result<()>`，`main` 只解析参数并返回
+`run(args).await`；自动测试使用无监听 loopback 地址证明连接失败返回 `Err`，且脱敏错误不含
+传入的 `TEST_CODE` sentinel。Rust `main -> Result` 的非零退出语义不得被 catch 后改成成功。
+
+- [ ] **Step 9: 验证隔离、失败路径和全部 E2E**
+
+Run: `cargo test --test grpc_channel_e2e -- --test-threads=1`
+
+Run: `cargo test --test grpc_bridge_e2e -- --test-threads=1`
+
+Run: `cargo test --bin grpc_local_readiness_probe -- --test-threads=1`
+
+Run: `rg -n '"600519"|SH600519' src/grpc_server/fixture.rs tests/grpc_bridge_e2e.rs tests/grpc_channel_e2e.rs src/bin/grpc_local_readiness_probe.rs`
+
+Expected: 三组测试全部 PASS；`rg` 无输出、exit 1；fixture 只能用 TEST_CODE，失败测试不泄露
+sentinel 或原始错误。
+
+- [ ] **Step 10: 提交审查修复**
+
+```bash
+git add src/grpc_server/fixture.rs tests/grpc_bridge_e2e.rs tests/grpc_channel_e2e.rs \
+  src/bin/grpc_local_readiness_probe.rs \
+  docs/superpowers/specs/2026-08-13-grpc-data-channel-design.md \
+  docs/superpowers/plans/2026-08-13-grpc-data-channel.md
+git commit -m "test(grpc): isolate fixture identities and probe failures"
 ```
 
 ---

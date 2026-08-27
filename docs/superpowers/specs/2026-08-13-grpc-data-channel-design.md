@@ -391,6 +391,15 @@ schema 或默认时间。MoneyFlow 的 `unsupported_contract` 是真实能力状
 - 只有 exact 全请求成功才刷新 OrderBook，部分成功、重复、缺失、额外代码均不刷新；
 - 既有 quote 5 秒门和 T0 `time_untrustworthy` 规则不被放宽。
 
+测试身份与完整 round-trip 证据必须分层解释。Task 3 的 server producer DTO 单测和 Task 4
+的 consumer converter 单测分别用 `TEST_CODE_` 证明两端的测试身份语义；Task 6 的隔离 fixture
+只通过 raw `GrpcMarketClient::query` 证明 `ADMITTED`、schema/version、批次身份、
+`TEST_CODE_` payload 与中国 civil-time wire 标签。部分 high-level bridge adapter 会在 RPC 前
+按设计通过 production identity resolver 拒绝 `TEST_CODE_`，因此禁止为离线 E2E 放宽
+converter/resolver，也不得把 Task 6 raw fixture 合同测试称为 typed domain round-trip 或 live
+evidence。只有 Task 8 在未开启 fixture 的候选端口上完成真实 provider typed probe，才证明
+完整 server/client typed round-trip。
+
 离线 Gate B/C 全部通过后，在独立临时 target 构建候选 server/monitor，并在备用端口启动
 真实 server。候选探针必须覆盖 `T0Evidence`、`RealtimeQuotes`、`OrderBooks`、
 `HistoricalBars`，输出只保留脱敏计数、provider、admission、freshness 和结构化错误。

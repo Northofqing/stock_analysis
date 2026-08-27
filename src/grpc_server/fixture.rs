@@ -49,25 +49,25 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
         Operation::RealtimeQuotes => Some(live_resp(
             "fixture-rq",
             vec![payload(
-                r#"[{"code":"600519","name":"贵州茅台","price":1500.0,"change_pct":2.34,"previous_close":1490.0}]"#,
+                r#"[{"code":"TEST_CODE_600519","name":"TEST_CODE_测试证券","price":1500.0,"change_pct":2.34,"previous_close":1490.0}]"#,
             )],
         )),
         Operation::HistoricalBars => Some(resp(
             "fixture-hb",
             vec![payload(
-                r#"[{"code":"600519","date":"2026-08-13","open":1480.0,"high":1510.0,"low":1475.0,"close":1500.0,"volume":12345.0,"amount":1.85e9,"pct_chg":2.34,"settled":true}]"#,
+                r#"[{"code":"TEST_CODE_600519","date":"2026-08-13","open":1480.0,"high":1510.0,"low":1475.0,"close":1500.0,"volume":12345.0,"amount":1.85e9,"pct_chg":2.34,"settled":true}]"#,
             )],
         )),
         Operation::MinuteData => Some(resp(
             "fixture-md",
             vec![payload(
-                r#"[{"code":"600519","minute_at":"2026-08-13T09:35:00+08:00","price":1500.0,"cumulative_quantity":12345.0,"cumulative_amount":1.85e9,"source_at":"2026-08-13T09:35:00+08:00"}]"#,
+                r#"[{"code":"TEST_CODE_600519","minute_at":"2026-08-13T09:35:00+08:00","price":1500.0,"cumulative_quantity":12345.0,"cumulative_amount":1.85e9,"source_at":"2026-08-13T09:35:00+08:00"}]"#,
             )],
         )),
         Operation::Announcements => Some(resp(
             "fixture-ann",
             vec![payload(
-                r#"[{"announcement_id":"fixture-a1","code":"600519","category":"分红派息","title":"贵州茅台:关于2026年中期分红的公告","published_at":"2026-08-13T09:00:00+08:00","url":"https://example.com/a1"}]"#,
+                r#"[{"announcement_id":"fixture-a1","code":"TEST_CODE_600519","category":"分红派息","title":"TEST_CODE_测试证券:关于2026年中期分红的公告","published_at":"2026-08-13T09:00:00+08:00","url":"https://example.com/a1"}]"#,
             )],
         )),
         Operation::GlobalNews => Some(resp(
@@ -84,7 +84,7 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
         )),
         Operation::OrderBooks => {
             let data = serde_json::json!([{
-                "code": "600519",
+                "code": "TEST_CODE_600519",
                 "bids": [
                     {"price": 1499.0, "quantity": 100.0},
                     {"price": 1498.0, "quantity": 200.0},
@@ -109,25 +109,25 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
         Operation::MoneyFlows => Some(resp(
             "fixture-mf",
             vec![payload(
-                r#"[{"code":"600519","main_net":5e7,"super_large_net":4e7,"large_net":1e7,"medium_net":-2e6,"small_net":-3e6,"source_at":"2026-08-13T10:00:00+08:00"}]"#,
+                r#"[{"code":"TEST_CODE_600519","main_net":5e7,"super_large_net":4e7,"large_net":1e7,"medium_net":-2e6,"small_net":-3e6,"source_at":"2026-08-13T10:00:00+08:00"}]"#,
             )],
         )),
         Operation::ForeignExchange => Some(resp(
             "fixture-fx",
             vec![payload(
-                r#"[{"pair":"USDCNY","name":"美元/人民币","rate":7.15,"change":-0.01,"change_percent":-0.14,"source_at":"2026-08-13T10:00:00+08:00"}]"#,
+                r#"[{"pair":"TEST_CODE_USDCNY","name":"美元/人民币","rate":7.15,"change":-0.01,"change_percent":-0.14,"source_at":"2026-08-13T10:00:00+08:00"}]"#,
             )],
         )),
         Operation::FuturesDelivery => Some(resp(
             "fixture-fd",
             vec![payload(
-                r#"[{"contract_code":"IF2608","product_code":"IF","last_trading_date":"2026-08-21","delivery_date":"2026-08-21","notice_url":"https://example.com/fd1"}]"#,
+                r#"[{"contract_code":"TEST_CODE_IF2608","product_code":"TEST_CODE_IF","last_trading_date":"2026-08-21","delivery_date":"2026-08-21","notice_url":"https://example.com/fd1"}]"#,
             )],
         )),
         Operation::SecurityMetadata => Some(resp(
             "fixture-sec",
             vec![payload(
-                r#"[{"code":"600519","name":"贵州茅台","board":"Main","is_st":false,"listed_on":"2001-08-27","price_limit_percent":10.0,"source_at":"2026-08-13T10:00:00+08:00"}]"#,
+                r#"[{"code":"TEST_CODE_600519","name":"TEST_CODE_测试证券","board":"Main","is_st":false,"listed_on":"2001-08-27","price_limit_percent":10.0,"source_at":"2026-08-13T10:00:00+08:00"}]"#,
             )],
         )),
         // M1 扩展 (P4): 6 个新 op fixture (字段形状与 delegate 视图一致;
@@ -135,13 +135,13 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
         Operation::IndexQuotes => Some(resp(
             "fixture-idx",
             vec![payload(
-                r#"[{"code":"sh000001","name":"上证指数","current":3500.5,"change":12.3,"change_percent":0.35,"open":3490.0,"high":3510.0,"low":3485.0,"previous_close":3488.2,"volume":3.2e9,"amount":4.5e11,"source_at":"2026-08-15T10:00:00+08:00"}]"#,
+                r#"[{"code":"TEST_CODE_INDEX_000001","name":"TEST_CODE_测试指数","current":3500.5,"change":12.3,"change_percent":0.35,"open":3490.0,"high":3510.0,"low":3485.0,"previous_close":3488.2,"volume":3.2e9,"amount":4.5e11,"source_at":"2026-08-15T10:00:00+08:00"}]"#,
             )],
         )),
         Operation::InstrumentNews => Some(resp(
             "fixture-in",
             vec![payload(
-                r#"[{"code":"600519","title":"贵州茅台:关于2026年半年度报告的公告","summary":"公司发布2026年半年度报告","url":"https://example.com/in1","source":"Sina","source_name":"新浪财经","category":"个股新闻","external_id":"in1","published_at":"2026-08-15T09:00:00+08:00","fetched_at":"2026-08-15T09:00:01+08:00","content_hash":"fixture-hash-in1"}]"#,
+                r#"[{"code":"TEST_CODE_600519","title":"TEST_CODE_测试证券:关于2026年半年度报告的公告","summary":"公司发布2026年半年度报告","url":"https://example.com/in1","source":"Sina","source_name":"新浪财经","category":"个股新闻","external_id":"in1","published_at":"2026-08-15T09:00:00+08:00","fetched_at":"2026-08-15T09:00:01+08:00","content_hash":"fixture-hash-in1"}]"#,
             )],
         )),
         Operation::IntradayShape => Some(resp(
@@ -158,8 +158,8 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
                 "batch_id": "fixture-b1",
                 "time_untrustworthy": false,
                 "records": [{
-                    "instrument": "SH600519",
-                    "code": "600519",
+                    "instrument": "TEST_CODE_600519",
+                    "code": "TEST_CODE_600519",
                     "requested_at": live_at,
                     "source_at": live_at,
                     "observed_at": live_at,
@@ -210,20 +210,20 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
                 // P4 M3 视图: delegate.rs fetch_outcome_daily_bars —
                 // batch = to_value(DataBatch<Bar>) (Bar serde 字段 = provider.rs Repr),
                 // attempts = to_value(Preimage), error = null。
-                r#"{"batch":{"records":[{"instrument":{"exchange":"Shanghai","code":"600519","asset_class":"Equity"},"interval":"Day","bar_start":"2026-08-14","bar_end":"2026-08-14","open":1480.0,"high":1510.0,"low":1475.0,"close":1500.0,"volume":123456.0,"amount":1.85e9,"adjustment":"Unadjusted","source_at":null,"provider":"Tdx","batch_id":"fixture-ob"}],"provenance":{"source":"tdx","source_at":null,"fetched_at":"2026-08-15T10:00:00+08:00","batch_id":"fixture-ob"},"quality":{"complete":true,"issues":[]}},"attempts":[],"error":null}"#,
+                r#"{"batch":{"records":[{"instrument":{"exchange":"Shanghai","code":"TEST_CODE_600519","asset_class":"Equity"},"interval":"Day","bar_start":"2026-08-14","bar_end":"2026-08-14","open":1480.0,"high":1510.0,"low":1475.0,"close":1500.0,"volume":123456.0,"amount":1.85e9,"adjustment":"Unadjusted","source_at":null,"provider":"Tdx","batch_id":"fixture-ob"}],"provenance":{"source":"tdx","source_at":null,"fetched_at":"2026-08-15T10:00:00+08:00","batch_id":"fixture-ob"},"quality":{"complete":true,"issues":[]}},"attempts":[],"error":null}"#,
             )],
         )),
         Operation::UpperLimitPoolReview => Some(resp(
             "fixture-ulp",
             vec![payload(
-                r#"[{"code":"600519","trading_date":"2026-08-15","theme":"白酒","streak":2}]"#,
+                r#"[{"code":"TEST_CODE_600519","trading_date":"2026-08-15","theme":"白酒","streak":2}]"#,
             )],
         )),
         // M4c 扩展: A-10 完整 batch (字段形状与 converter 重建 VisibleChainBatch 一致)。
         Operation::ChainBatch => Some(resp(
             "fixture-cb",
             vec![payload(
-                r#"{"batch_id":"fixture-cb","content_hash":"h1","trading_date":"2026-08-15","calculation_version":"v1","taxonomy_version":"t1","inputs":[{"input_id":"i1","ordinal":1,"capability":"limit-up","provider":"tdx","source":"tdx","source_at":"2026-08-15T10:00:00+08:00","observed_at":"2026-08-15T10:00:00+08:00","source_batch_id":"b1","source_batch_hash":"h1","content_hash":"h1"}],"chains":[{"chain_id":"c1","canonical_board_id":"BK0475","board_name":"白酒","upper_limit_count":3,"continuous_count":2,"members":[{"instrument_id":"600519","security_name":"贵州茅台","source_event_id":"e1","streak":2}]}],"rejections":[]}"#,
+                r#"{"batch_id":"fixture-cb","content_hash":"h1","trading_date":"2026-08-15","calculation_version":"v1","taxonomy_version":"t1","inputs":[{"input_id":"i1","ordinal":1,"capability":"limit-up","provider":"tdx","source":"tdx","source_at":"2026-08-15T10:00:00+08:00","observed_at":"2026-08-15T10:00:00+08:00","source_batch_id":"b1","source_batch_hash":"h1","content_hash":"h1"}],"chains":[{"chain_id":"c1","canonical_board_id":"TEST_CODE_BK0475","board_name":"白酒","upper_limit_count":3,"continuous_count":2,"members":[{"instrument_id":"TEST_CODE_600519","security_name":"TEST_CODE_测试证券","source_event_id":"e1","streak":2}]}],"rejections":[]}"#,
             )],
         )),
         // BR-251 carries a real BR-159 receipt; canned evidence must never
@@ -233,13 +233,13 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
         Operation::DragonTiger => Some(resp(
             "fixture-dt",
             vec![payload(
-                r#"[{"exchange":"Shanghai","code":"600519","ranking_net_amount_yuan":1.5e8,"disclosures":[{"entry_id":"e1","trade_id":"t1","reason":"日涨幅偏离值达7%","buy_amount_yuan":8e7,"sell_amount_yuan":3e7,"net_amount_yuan":5e7,"turnover_rate_pct":1.2,"seats":[{"side":"Buy","rank":1,"seat_name":"机构专用","amount_yuan":4e7,"buy_amount_yuan":4e7,"sell_amount_yuan":0.0,"net_amount_yuan":4e7}]}]}]"#,
+                r#"[{"exchange":"Shanghai","code":"TEST_CODE_600519","ranking_net_amount_yuan":1.5e8,"disclosures":[{"entry_id":"e1","trade_id":"t1","reason":"日涨幅偏离值达7%","buy_amount_yuan":8e7,"sell_amount_yuan":3e7,"net_amount_yuan":5e7,"turnover_rate_pct":1.2,"seats":[{"side":"Buy","rank":1,"seat_name":"机构专用","amount_yuan":4e7,"buy_amount_yuan":4e7,"sell_amount_yuan":0.0,"net_amount_yuan":4e7}]}]}]"#,
             )],
         )),
         Operation::BlockTrades => Some(resp(
             "fixture-bt",
             vec![payload(
-                r#"[{"code":"600519","traded_at":"2026-08-15T15:05:00+08:00","price":1490.0,"close_price":1500.0,"premium_ratio":-0.67,"volume":1e5,"amount":1.49e8,"buyer":"机构专用","seller":"中信证券"}]"#,
+                r#"[{"code":"TEST_CODE_600519","traded_at":"2026-08-15T15:05:00+08:00","price":1490.0,"close_price":1500.0,"premium_ratio":-0.67,"volume":1e5,"amount":1.49e8,"buyer":"机构专用","seller":"中信证券"}]"#,
             )],
         )),
         Operation::Consensus => Some(resp(
@@ -251,37 +251,37 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
         Operation::BoardDirectory => Some(resp(
             "fixture-bdir",
             vec![payload(
-                r#"[{"code":"BK0475","name":"白酒","kind":"Concept","member_count":32}]"#,
+                r#"[{"code":"TEST_CODE_BK0475","name":"白酒","kind":"Concept","member_count":32}]"#,
             )],
         )),
         Operation::BoardConstituents => Some(resp(
             "fixture-bcons",
             vec![payload(
-                r#"[{"instrument_code":"600519","board_code":"BK0475","board_name":"白酒","kind":"Concept"}]"#,
+                r#"[{"instrument_code":"TEST_CODE_600519","board_code":"TEST_CODE_BK0475","board_name":"白酒","kind":"Concept"}]"#,
             )],
         )),
         Operation::BoardFlows => Some(resp(
             "fixture-bf",
             vec![payload(
-                r#"[{"code":"BK0475","name":"白酒","kind":"Concept","rank":1,"return_pct":2.1,"main_net_yuan":3.2e8,"leader_code":"600519","leader_name":"贵州茅台"}]"#,
+                r#"[{"code":"TEST_CODE_BK0475","name":"白酒","kind":"Concept","rank":1,"return_pct":2.1,"main_net_yuan":3.2e8,"leader_code":"TEST_CODE_600519","leader_name":"TEST_CODE_测试证券"}]"#,
             )],
         )),
         Operation::MarketRankings => Some(resp(
             "fixture-mr",
             vec![payload(
-                r#"[{"code":"BK0475","name":"白酒","change_pct":2.1,"main_inflow":3.2e8,"leader_name":"贵州茅台","vol_ratio":1.5,"turnover":3.2,"day1_ratio":1.1,"day5_ratio":2.3}]"#,
+                r#"[{"code":"TEST_CODE_BK0475","name":"白酒","change_pct":2.1,"main_inflow":3.2e8,"leader_name":"TEST_CODE_测试证券","vol_ratio":1.5,"turnover":3.2,"day1_ratio":1.1,"day5_ratio":2.3}]"#,
             )],
         )),
         Operation::ConceptHits => Some(resp(
             "fixture-ch",
             vec![payload(
-                r#"[{"code":"BK0475","name":"白酒","change_pct":2.1,"main_inflow":3.2e8,"leader_name":"贵州茅台","vol_ratio":1.5,"turnover":3.2,"day1_ratio":1.1,"day5_ratio":2.3}]"#,
+                r#"[{"code":"TEST_CODE_BK0475","name":"白酒","change_pct":2.1,"main_inflow":3.2e8,"leader_name":"TEST_CODE_测试证券","vol_ratio":1.5,"turnover":3.2,"day1_ratio":1.1,"day5_ratio":2.3}]"#,
             )],
         )),
         Operation::MarketStatistics => Some(resp(
             "fixture-ms",
             vec![payload(
-                r#"[{"code":"600519","turnover_rate":0.42,"trailing_pe":28.5,"static_pe":26.0,"pb":9.2,"total_market_cap":1.88e12,"floating_market_cap":1.88e12,"upper_limit":1650.0,"lower_limit":1350.0,"volume_ratio":1.1}]"#,
+                r#"[{"code":"TEST_CODE_600519","turnover_rate":0.42,"trailing_pe":28.5,"static_pe":26.0,"pb":9.2,"total_market_cap":1.88e12,"floating_market_cap":1.88e12,"upper_limit":1650.0,"lower_limit":1350.0,"volume_ratio":1.1}]"#,
             )],
         )),
         Operation::TechnicalBars => Some(resp(
@@ -294,25 +294,25 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
         Operation::ResearchReports => Some(resp(
             "fixture-rr",
             vec![payload(
-                r#"[{"code":"600519","report_id":"fixture-r1","title":"贵州茅台:2026年中报点评","organization":"国泰君安","rating":"增持","published_at":"2026-08-13T09:00:00+08:00","canonical_url":"https://example.com/r1","target_price_upper":1600.0,"target_price_lower":1500.0}]"#,
+                r#"[{"code":"TEST_CODE_600519","report_id":"fixture-r1","title":"TEST_CODE_测试证券:2026年中报点评","organization":"国泰君安","rating":"增持","published_at":"2026-08-13T09:00:00+08:00","canonical_url":"https://example.com/r1","target_price_upper":1600.0,"target_price_lower":1500.0}]"#,
             )],
         )),
         Operation::NorthboundDaily => Some(resp(
             "fixture-nbd",
             vec![payload(
-                r#"[{"trading_date":"2026-08-13","channel":"Shanghai","total_turnover":5.2e10,"total_trade_count":4200.0,"quota_balance":8e9,"etf_turnover":1.2e9,"top_turnover":[{"rank":1,"code":"600519","name":"贵州茅台","total_turnover":1.8e9}]}]"#,
+                r#"[{"trading_date":"2026-08-13","channel":"Shanghai","total_turnover":5.2e10,"total_trade_count":4200.0,"quota_balance":8e9,"etf_turnover":1.2e9,"top_turnover":[{"rank":1,"code":"TEST_CODE_600519","name":"TEST_CODE_测试证券","total_turnover":1.8e9}]}]"#,
             )],
         )),
         Operation::FinancialStatements => Some(resp(
             "fixture-fs",
             vec![payload(
-                r#"[{"instrument":{"exchange":"Shanghai","code":"600519","asset_class":"Equity"},"kind":"Balance","report_period":"2026-06-30","announced_on":"2026-08-15","currency":"CNY","lines":[{"key":"total_assets","source_label":"总资产","value":3.2e11,"unit":"元"}],"evidence":{"provider":"Tdx","source_at":"2026-08-13T10:00:00+08:00","observed_at":"2026-08-13T10:00:00+08:00","batch_id":"fixture-b1"}}]"#,
+                r#"[{"instrument":{"exchange":"Shanghai","code":"TEST_CODE_600519","asset_class":"Equity"},"kind":"Balance","report_period":"2026-06-30","announced_on":"2026-08-15","currency":"CNY","lines":[{"key":"total_assets","source_label":"总资产","value":3.2e11,"unit":"元"}],"evidence":{"provider":"Tdx","source_at":"2026-08-13T10:00:00+08:00","observed_at":"2026-08-13T10:00:00+08:00","batch_id":"fixture-b1"}}]"#,
             )],
         )),
         Operation::FundFlowSeries => Some(resp(
             "fixture-ffs",
             vec![payload(
-                r#"[{"code":"600519","interval":"Day1","period_at":"2026-08-13","main_net":5e7,"main_ratio_percent":12.3,"super_large_net":4e7,"large_net":1e7,"medium_net":-2e6,"small_net":-3e6}]"#,
+                r#"[{"code":"TEST_CODE_600519","interval":"Day1","period_at":"2026-08-13","main_net":5e7,"main_ratio_percent":12.3,"super_large_net":4e7,"large_net":1e7,"medium_net":-2e6,"small_net":-3e6}]"#,
             )],
         )),
         Operation::ProviderTopNRankings => Some(QueryResponse {
@@ -328,7 +328,7 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
             observed_at: "2026-08-15T10:00:00+08:00".to_string(),
             source_at: String::new(),
             records: vec![payload(
-                r#"[{"metric":"VolumeRatio","ordinal":1,"code":"600519","label":"贵州茅台","value":3.2,"unit":"Multiple","trading_date":"2026-08-15","filter_identity":"volume_ratio_top20","provider_declared_total":20,"inspected_row_count":20,"evidence":{"provider":"Eastmoney","source":"eastmoney-web","source_at":null,"observed_at":"2026-08-15T10:00:00+08:00","batch_id":"fixture-b1"}},{"metric":"MainNetInflow","ordinal":1,"code":"600519","label":"贵州茅台","value":1.5e9,"unit":"Yuan","trading_date":"2026-08-15","filter_identity":"main_net_inflow_top20","provider_declared_total":20,"inspected_row_count":20,"evidence":{"provider":"Eastmoney","source":"eastmoney-web","source_at":null,"observed_at":"2026-08-15T10:00:01+08:00","batch_id":"fixture-b2"}}]"#,
+                r#"[{"metric":"VolumeRatio","ordinal":1,"code":"TEST_CODE_600519","label":"TEST_CODE_测试证券","value":3.2,"unit":"Multiple","trading_date":"2026-08-15","filter_identity":"volume_ratio_top20","provider_declared_total":20,"inspected_row_count":20,"evidence":{"provider":"Eastmoney","source":"eastmoney-web","source_at":null,"observed_at":"2026-08-15T10:00:00+08:00","batch_id":"fixture-b1"}},{"metric":"MainNetInflow","ordinal":1,"code":"TEST_CODE_600519","label":"TEST_CODE_测试证券","value":1.5e9,"unit":"Yuan","trading_date":"2026-08-15","filter_identity":"main_net_inflow_top20","provider_declared_total":20,"inspected_row_count":20,"evidence":{"provider":"Eastmoney","source":"eastmoney-web","source_at":null,"observed_at":"2026-08-15T10:00:01+08:00","batch_id":"fixture-b2"}}]"#,
             )],
             source: "eastmoney-web".to_string(),
             // 上游合同字段 10: fixture 无诊断阻塞。
@@ -357,7 +357,7 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
         Operation::CorporateActions => Some(resp(
             "fixture-ca",
             vec![payload(
-                r#"[{"code":"600519","category":"Distribution","effective_on":"2026-08-20","record_on":"2026-08-13","ex_on":"2026-08-19","payable_on":"2026-08-21","terms":{"Distribution":{"cash_per_share":0.15,"bonus_per_share":null,"rights_per_share":null,"rights_price":null}}}]"#,
+                r#"[{"code":"TEST_CODE_600519","category":"Distribution","effective_on":"2026-08-20","record_on":"2026-08-13","ex_on":"2026-08-19","payable_on":"2026-08-21","terms":{"Distribution":{"cash_per_share":0.15,"bonus_per_share":null,"rights_per_share":null,"rights_price":null}}}]"#,
             )],
         )),
         _ => None,

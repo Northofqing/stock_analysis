@@ -6,7 +6,14 @@ use stock_analysis::data_gateway::grpc_source::convert;
 use stock_analysis::data_gateway::GatewayError;
 use stock_analysis::grpc_client::client::GrpcMarketClient;
 use stock_analysis::grpc_client::errors::GrpcError;
-use stock_analysis::grpc_client::pb::magic::market::v1::{AdmissionState, Operation};
+use stock_analysis::grpc_client::pb::magic::market::v1::{AdmissionState, Capability, Operation};
+
+const REQUIRED_OPERATIONS: [Operation; 4] = [
+    Operation::RealtimeQuotes,
+    Operation::OrderBooks,
+    Operation::T0Evidence,
+    Operation::HistoricalBars,
+];
 
 #[derive(Parser)]
 struct Args {
@@ -68,10 +75,7 @@ fn probe_failure(
     anyhow::anyhow!("operation={operation} reason_code={reason_code} retryable={retryable}")
 }
 
-fn capability_ready(
-    capabilities: &[stock_analysis::grpc_client::pb::magic::market::v1::Capability],
-    operation: Operation,
-) -> bool {
+fn capability_ready(capabilities: &[Capability], operation: Operation) -> bool {
     capabilities.iter().any(|capability| {
         capability.operation == operation as i32
             && capability.repository_admission == AdmissionState::Admitted as i32
@@ -79,9 +83,37 @@ fn capability_ready(
     })
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+fn health_failure(live: bool, ready: bool) -> Option<anyhow::Error> {
+    (!live || !ready).then(|| probe_failure("Health", "not_ready", true))
+}
+
+fn capabilities_failure(capabilities: &[Capability]) -> Option<anyhow::Error> {
+    REQUIRED_OPERATIONS
+        .iter()
+        .copied()
+        .any(|operation| !capability_ready(capabilities, operation))
+        .then(|| probe_failure("Capabilities", "required_capability_unavailable", false))
+}
+
+fn record_identity_failure(
+    operation: &'static str,
+    records: usize,
+    identity_matches: bool,
+) -> Option<anyhow::Error> {
+    (records != 1 || !identity_matches)
+        .then(|| probe_failure(operation, "record_identity_mismatch", false))
+}
+
+fn t0_failure(records: usize, identity_matches: bool, rejections: usize) -> Option<anyhow::Error> {
+    (records != 1 || !identity_matches || rejections != 0)
+        .then(|| probe_failure("T0Evidence", "record_identity_or_rejection_mismatch", false))
+}
+
+fn daily_failure(records: usize) -> Option<anyhow::Error> {
+    (records == 0).then(|| probe_failure("HistoricalBars", "records_unavailable", false))
+}
+
+async fn run(args: Args) -> anyhow::Result<()> {
     let code = args.code.clone();
     let mut client = GrpcMarketClient::connect(&args.addr)
         .await
@@ -91,8 +123,8 @@ async fn main() -> anyhow::Result<()> {
         .get_health()
         .await
         .map_err(|error| safe_grpc("Health", error))?;
-    if !health.live || !health.ready {
-        return Err(probe_failure("Health", "not_ready", true));
+    if let Some(error) = health_failure(health.live, health.ready) {
+        return Err(error);
     }
     print_result("Health", "not_applicable", 1, "not_applicable", "ready");
 
@@ -100,27 +132,13 @@ async fn main() -> anyhow::Result<()> {
         .get_capabilities()
         .await
         .map_err(|error| safe_grpc("Capabilities", error))?;
-    let required_operations = [
-        Operation::RealtimeQuotes,
-        Operation::OrderBooks,
-        Operation::T0Evidence,
-        Operation::HistoricalBars,
-    ];
-    if required_operations
-        .iter()
-        .copied()
-        .any(|operation| !capability_ready(&capabilities, operation))
-    {
-        return Err(probe_failure(
-            "Capabilities",
-            "required_capability_unavailable",
-            false,
-        ));
+    if let Some(error) = capabilities_failure(&capabilities) {
+        return Err(error);
     }
     print_result(
         "Capabilities",
         "not_applicable",
-        required_operations.len(),
+        REQUIRED_OPERATIONS.len(),
         "not_applicable",
         "available",
     );
@@ -134,12 +152,16 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|error| safe_grpc("RealtimeQuotes", error))?;
     let quotes = convert::realtime_quotes_at(&quote_q, Utc::now())
         .map_err(|error| safe_gateway("RealtimeQuotes", error))?;
-    if quotes.records().len() != 1 || quotes.records()[0].code != code {
-        return Err(probe_failure(
-            "RealtimeQuotes",
-            "record_identity_mismatch",
-            false,
-        ));
+    let quote_identity_matches = quotes
+        .records()
+        .first()
+        .is_some_and(|record| record.code == code);
+    if let Some(error) = record_identity_failure(
+        "RealtimeQuotes",
+        quotes.records().len(),
+        quote_identity_matches,
+    ) {
+        return Err(error);
     }
     let quote_provider = format!("{:?}", quotes.evidence().provider);
     print_result(
@@ -156,12 +178,14 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|error| safe_grpc("OrderBooks", error))?;
     let books = convert::order_books_at(&book_q, Utc::now())
         .map_err(|error| safe_gateway("OrderBooks", error))?;
-    if books.records().len() != 1 || books.records()[0].code != code {
-        return Err(probe_failure(
-            "OrderBooks",
-            "record_identity_mismatch",
-            false,
-        ));
+    let book_identity_matches = books
+        .records()
+        .first()
+        .is_some_and(|record| record.code == code);
+    if let Some(error) =
+        record_identity_failure("OrderBooks", books.records().len(), book_identity_matches)
+    {
+        return Err(error);
     }
     let book_provider = format!("{:?}", books.evidence().provider);
     print_result(
@@ -178,12 +202,9 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|error| safe_grpc("T0Evidence", error))?;
     let t0 = convert::t0_evidence_batch_at(&t0_q, Utc::now())
         .map_err(|error| safe_gateway("T0Evidence", error))?;
-    if t0.records.len() != 1 || t0.records[0].code != code || !t0.rejections.is_empty() {
-        return Err(probe_failure(
-            "T0Evidence",
-            "record_identity_or_rejection_mismatch",
-            false,
-        ));
+    let t0_identity_matches = t0.records.first().is_some_and(|record| record.code == code);
+    if let Some(error) = t0_failure(t0.records.len(), t0_identity_matches, t0.rejections.len()) {
+        return Err(error);
     }
     let t0_provider = format!("{:?}", t0.provider);
     let time_untrustworthy = t0.time_untrustworthy.to_string();
@@ -204,12 +225,8 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|error| safe_grpc("HistoricalBars", error))?;
     let daily = convert::historical_bars(&code, &daily_q)
         .map_err(|error| safe_gateway("HistoricalBars", error))?;
-    if daily.records().is_empty() {
-        return Err(probe_failure(
-            "HistoricalBars",
-            "records_unavailable",
-            false,
-        ));
+    if let Some(error) = daily_failure(daily.records().len()) {
+        return Err(error);
     }
     let daily_provider = format!("{:?}", daily.evidence().provider);
     print_result(
@@ -223,9 +240,36 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    run(Args::parse()).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stock_analysis::grpc_client::errors::ErrorDetail;
+
+    fn admitted_capability(operation: Operation) -> Capability {
+        Capability {
+            operation: operation as i32,
+            repository_admission: AdmissionState::Admitted as i32,
+            runtime_available: true,
+            ..Default::default()
+        }
+    }
+
+    fn required_capabilities() -> Vec<Capability> {
+        [
+            Operation::RealtimeQuotes,
+            Operation::OrderBooks,
+            Operation::T0Evidence,
+            Operation::HistoricalBars,
+        ]
+        .into_iter()
+        .map(admitted_capability)
+        .collect()
+    }
 
     #[test]
     fn result_line_has_only_the_five_safe_fields() {
@@ -238,5 +282,137 @@ mod tests {
         for forbidden in ["600396", "price", "token", "/"] {
             assert!(!result.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn health_requires_both_live_and_ready() {
+        assert!(health_failure(true, true).is_none());
+        for (live, ready) in [(false, true), (true, false), (false, false)] {
+            assert_eq!(
+                health_failure(live, ready).unwrap().to_string(),
+                "operation=Health reason_code=not_ready retryable=true"
+            );
+        }
+    }
+
+    #[test]
+    fn every_required_capability_must_be_admitted_and_runtime_available() {
+        let admitted = required_capabilities();
+        assert!(capabilities_failure(&admitted).is_none());
+
+        for index in 0..admitted.len() {
+            let mut not_admitted = admitted.clone();
+            not_admitted[index].repository_admission = AdmissionState::Unadmitted as i32;
+            assert_eq!(
+                capabilities_failure(&not_admitted).unwrap().to_string(),
+                "operation=Capabilities reason_code=required_capability_unavailable retryable=false"
+            );
+
+            let mut unavailable = admitted.clone();
+            unavailable[index].runtime_available = false;
+            assert_eq!(
+                capabilities_failure(&unavailable).unwrap().to_string(),
+                "operation=Capabilities reason_code=required_capability_unavailable retryable=false"
+            );
+        }
+    }
+
+    #[test]
+    fn record_identity_requires_exactly_one_matching_record() {
+        assert!(record_identity_failure("RealtimeQuotes", 1, true).is_none());
+        for (records, identity_matches) in [(0, true), (2, true), (1, false)] {
+            assert_eq!(
+                record_identity_failure("RealtimeQuotes", records, identity_matches)
+                    .unwrap()
+                    .to_string(),
+                "operation=RealtimeQuotes reason_code=record_identity_mismatch retryable=false"
+            );
+        }
+    }
+
+    #[test]
+    fn t0_requires_one_matching_record_and_no_rejections() {
+        assert!(t0_failure(1, true, 0).is_none());
+        for (records, identity_matches, rejections) in
+            [(0, true, 0), (2, true, 0), (1, false, 0), (1, true, 1)]
+        {
+            assert_eq!(
+                t0_failure(records, identity_matches, rejections)
+                    .unwrap()
+                    .to_string(),
+                "operation=T0Evidence reason_code=record_identity_or_rejection_mismatch retryable=false"
+            );
+        }
+    }
+
+    #[test]
+    fn historical_bars_require_non_empty_records() {
+        assert!(daily_failure(1).is_none());
+        assert_eq!(
+            daily_failure(0).unwrap().to_string(),
+            "operation=HistoricalBars reason_code=records_unavailable retryable=false"
+        );
+    }
+
+    #[test]
+    fn typed_errors_do_not_expose_untrusted_details() {
+        let sentinel = "TEST_CODE_LEAK_SENTINEL price token /tmp/private";
+        let grpc = safe_grpc(
+            "RealtimeQuotes",
+            GrpcError::from(tonic::Status::unavailable(sentinel)),
+        )
+        .to_string();
+        let gateway = safe_gateway(
+            "HistoricalBars",
+            GatewayError::unavailable("HistoricalDailyBars", None, true, sentinel),
+        )
+        .to_string();
+        let typed_grpc = safe_grpc(
+            "OrderBooks",
+            GrpcError::Unavailable {
+                details: Box::new(ErrorDetail {
+                    reason_code: Some("provider_unavailable".to_string()),
+                    retryable: Some(true),
+                    request_id: Some(sentinel.to_string()),
+                    ..Default::default()
+                }),
+            },
+        )
+        .to_string();
+
+        assert_eq!(
+            grpc,
+            "operation=RealtimeQuotes reason_code=absent retryable=absent"
+        );
+        assert_eq!(
+            gateway,
+            "operation=HistoricalBars reason_code=no_verified_batch retryable=true"
+        );
+        assert_eq!(
+            typed_grpc,
+            "operation=OrderBooks reason_code=provider_unavailable retryable=true"
+        );
+        for safe in [&grpc, &gateway, &typed_grpc] {
+            for forbidden in ["TEST_CODE_LEAK_SENTINEL", "price", "token", "/"] {
+                assert!(!safe.contains(forbidden));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_connect_failure_is_nonzero_and_does_not_expose_code() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let error = run(Args {
+            addr,
+            code: "TEST_CODE_LEAK_SENTINEL_9F3A".to_string(),
+        })
+        .await
+        .expect_err("no loopback server must fail the probe");
+        let safe = error.to_string();
+
+        assert!(safe.contains("operation=Connect"));
+        assert!(!safe.contains("TEST_CODE_LEAK_SENTINEL_9F3A"));
     }
 }

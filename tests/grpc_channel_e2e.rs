@@ -5,6 +5,26 @@ use stock_analysis::grpc_client::pb::magic::market::v1::{EventCursor, EventFilte
 use stock_analysis::grpc_server::events::{DetectedEvent, EventHub, EventKind};
 use stock_analysis::grpc_server::{start, ServerConfig};
 
+#[test]
+fn task6_fixture_sources_use_only_test_security_identities() {
+    let sources = [
+        include_str!("../src/grpc_server/fixture.rs"),
+        include_str!("grpc_bridge_e2e.rs"),
+        include_str!("grpc_channel_e2e.rs"),
+        include_str!("../src/bin/grpc_local_readiness_probe.rs"),
+    ];
+    let exact_json_real_identity = ["\"", "600", "519", "\""].concat();
+    let prefixed_real_identity = ["SH", "600", "519"].concat();
+
+    for source in sources {
+        assert!(!source.contains(&exact_json_real_identity));
+        assert!(!source.contains(&prefixed_real_identity));
+    }
+    for fixture_or_e2e in &sources[..3] {
+        assert!(fixture_or_e2e.contains("TEST_CODE_"));
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn health_and_capabilities() {
     let (addr, handle, _hub) = start(ServerConfig {
@@ -47,30 +67,50 @@ async fn six_representative_ops_fixture_roundtrip() {
         (
             Operation::RealtimeQuotes,
             "market.realtime_quotes",
-            "600519",
+            "TEST_CODE_600519",
         ),
         (
             Operation::HistoricalBars,
             "market.historical_bars",
-            "600519",
+            "TEST_CODE_600519",
         ),
-        (Operation::MinuteData, "market.minute_data", "600519"),
-        (Operation::Announcements, "news.announcements", "600519"),
+        (
+            Operation::MinuteData,
+            "market.minute_data",
+            "TEST_CODE_600519",
+        ),
+        (
+            Operation::Announcements,
+            "news.announcements",
+            "TEST_CODE_600519",
+        ),
         (Operation::GlobalNews, "news.global_news", "央行"),
         (
             Operation::SecurityMetadata,
             "market.security_metadata",
-            "600519",
+            "TEST_CODE_600519",
         ),
         // M1 扩展 (P4): 6 个新 op fixture roundtrip。
-        (Operation::IndexQuotes, "market.index_quotes", "sh000001"),
-        (Operation::InstrumentNews, "news.instrument_news", "600519"),
+        (
+            Operation::IndexQuotes,
+            "market.index_quotes",
+            "TEST_CODE_INDEX_000001",
+        ),
+        (
+            Operation::InstrumentNews,
+            "news.instrument_news",
+            "TEST_CODE_600519",
+        ),
         (
             Operation::IntradayShape,
             "market.intraday_shape",
             "稳步推高",
         ),
-        (Operation::T0Evidence, "market.t0_evidence", "600519"),
+        (
+            Operation::T0Evidence,
+            "market.t0_evidence",
+            "TEST_CODE_600519",
+        ),
         (
             Operation::OutcomeDailyBars,
             "market.outcome_daily_bars",
@@ -79,7 +119,7 @@ async fn six_representative_ops_fixture_roundtrip() {
         (
             Operation::UpperLimitPoolReview,
             "market.upper_limit_pool_review",
-            "600519",
+            "TEST_CODE_600519",
         ),
         // M4c 扩展: A-10 完整 batch (fixture, 字段与 converter 重建一致)。
         (Operation::ChainBatch, "market.chain_batch", "fixture-cb"),
@@ -133,8 +173,8 @@ async fn subscribe_receives_injected_events_with_monotonic_cursor() {
 
     let d = DetectedEvent {
         kind: EventKind::Price,
-        code: "600519".into(),
-        name: "贵州茅台".into(),
+        code: "TEST_CODE_600519".into(),
+        name: "TEST_CODE_测试证券".into(),
         price: 1520.0,
         prev_close: 1500.0,
         change_pct: 1.33,
@@ -150,7 +190,7 @@ async fn subscribe_receives_injected_events_with_monotonic_cursor() {
         .expect("5s 内收到事件")
         .expect("流未结束")
         .expect("事件无错误");
-    assert_eq!(envelope.instrument, "600519");
+    assert_eq!(envelope.instrument, "TEST_CODE_600519");
     assert_eq!(envelope.event_kind, "price");
     let cursor = envelope.cursor.unwrap();
     assert_eq!(cursor.sequence, 1);
@@ -163,8 +203,8 @@ async fn replay_returns_bounded_events_same_generation() {
     let hub = EventHub::new("g1".to_string(), false);
     let d = DetectedEvent {
         kind: EventKind::Price,
-        code: "600519".into(),
-        name: "贵州茅台".into(),
+        code: "TEST_CODE_600519".into(),
+        name: "TEST_CODE_测试证券".into(),
         price: 1520.0,
         prev_close: 1500.0,
         change_pct: 1.33,
@@ -200,7 +240,10 @@ async fn set_watchlist_then_status_match_then_subscribe_filter() {
 
     // 1. SetWatchlist 完全替换。
     let set = client
-        .set_watchlist(vec!["600519".to_string(), "000001".to_string()])
+        .set_watchlist(vec![
+            "TEST_CODE_600519".to_string(),
+            "TEST_CODE_000001".to_string(),
+        ])
         .await
         .unwrap();
     assert_eq!(set.state, "APPLIED");
@@ -218,7 +261,10 @@ async fn set_watchlist_then_status_match_then_subscribe_filter() {
     );
     assert_eq!(
         status.desired_instruments,
-        vec!["600519".to_string(), "000001".to_string()]
+        vec![
+            "TEST_CODE_600519".to_string(),
+            "TEST_CODE_000001".to_string()
+        ]
     );
     assert_eq!(status.applied_instruments, status.desired_instruments);
 
@@ -226,7 +272,7 @@ async fn set_watchlist_then_status_match_then_subscribe_filter() {
     let mut stream = client
         .subscribe(
             EventFilter {
-                instruments: vec!["600519".to_string()],
+                instruments: vec!["TEST_CODE_600519".to_string()],
                 event_kinds: vec![],
             },
             None,
@@ -244,8 +290,8 @@ async fn set_watchlist_then_status_match_then_subscribe_filter() {
         amount: 1e8,
         reason: "涨跌幅变化".into(),
     };
-    hub.push_event(&mk("600519"));
-    hub.push_event(&mk("000001"));
+    hub.push_event(&mk("TEST_CODE_600519"));
+    hub.push_event(&mk("TEST_CODE_000001"));
 
     use futures::StreamExt;
     let got = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
@@ -254,8 +300,8 @@ async fn set_watchlist_then_status_match_then_subscribe_filter() {
         .expect("流未结束")
         .expect("事件无错误");
     assert_eq!(
-        got.instrument, "600519",
-        "filter 只投递 600519, 000001 被过滤"
+        got.instrument, "TEST_CODE_600519",
+        "filter 只投递 TEST_CODE_600519, TEST_CODE_000001 被过滤"
     );
     handle.abort();
 }
