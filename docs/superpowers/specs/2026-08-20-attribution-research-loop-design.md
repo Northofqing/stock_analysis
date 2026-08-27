@@ -1229,6 +1229,12 @@ dependency revision  = 75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e
 identity mode        = request_bound_tdx_hs300_v1
 ```
 
+`dependency revision` 不允许在 adapter 中人工复制。`build.rs` 必须从本次构建实际使用的
+`Cargo.lock` 中唯一的 `magic-tdx-rs` Git source 解析 `#<resolved-commit>`，验证其为 40 位
+小写十六进制提交，并通过编译期环境值注入合同。缺失、重复、非目标仓库或非精确提交都必须使
+构建失败；`Cargo.lock` 变更必须触发重建。由此 provider 实际代码、request/batch hash 和审计
+`source` 使用同一个 resolved revision，依赖升级不会留下声称旧 revision 的审计数据。
+
 `BenchmarkProviderAttestation::production_default()` 不再保存可误设的身份布尔，而保存类型化
 `RequestBoundTdxHs300V1`。`admit(request)` 必须先验证 canonical instrument 与上述合同完全相等，
 再返回协议合同能力值；后续每一页的 provider 请求、base request hash、canonical acquisition
@@ -1236,7 +1242,7 @@ bytes、batch ID 和 `BatchEvidence.source` 全部从同一个能力值生成。
 
 ```text
 受信任且锁定 revision 的 TDX IndexBars 协议
-  + 同一连接上的精确 market/code/category/fq/page 请求
+  + 同一次 typed client acquisition 的精确 market/code/category/fq/page 请求
   + 请求范围、分页内容与完整批次的确定性 hash
   + 完整性/OHLC/交易日覆盖校验
   + BR-159 append-only receipt
@@ -1261,8 +1267,8 @@ acquisition seam，避免把“看到了数据”冒充“数据已准入”。
 | `TechnicalBars` / 旧 benchmark fetch | reject | 不恢复旧路径、不回退、不旁路 manifest |
 | `monitor/main.rs` | reject | 本修订不接 scheduler，避免扩大到未授权生产集成 |
 
-新增或保持的失败边界：未注册 instrument 仍为 `benchmark_instrument_unsupported`；协议合同不匹配
-为非 retryable `benchmark_identity_contract_mismatch`；Minute1 仍为
+新增或保持的失败边界：未注册 instrument 仍为 `benchmark_instrument_unsupported`；生产 registry 与
+协议合同共用 `HS300_CANONICAL`，不另设一个校验顺序上不可达的 identity mismatch reason；Minute1 仍为
 `benchmark_time_semantics_unavailable`；网络、分页、OHLC、交易日覆盖、hash、BR-159 或 segment
 链失败继续使用既有 typed outcome/reason/retryability，禁止 mock、空结果或昨日数据 fallback。
 

@@ -116,6 +116,7 @@ magic-gateway = [
 # tonic 0.14 重构: configure()/compile() 移入 tonic-prost-build
 # (tonic-build 0.14 只保留 Service codegen; tonic-prost-build 传递依赖 tonic-build)
 tonic-prost-build = "0.14"
+toml = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 pam = "0.7"           # PAM 跨平台认证 (Linux/macOS, 用 0.7 因 0.8 与 rustc 1.97+ 编译失败)

@@ -2048,15 +2048,15 @@ mod tests {
 
         let day = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
         let request = crate::data_gateway::BenchmarkRequest {
-            instrument: "sh000905".to_owned(),
+            instrument: "TEST_CODE_UNSUPPORTED".to_owned(),
             range: crate::data_gateway::BenchmarkRange::Daily { from: day, to: day },
         };
         let expected_request_hash = super::super::benchmark::canonical_base_request_hash(&request);
         let error = ReviewDataGateway::new()
             .benchmark_bars(request)
             .await
-            .expect_err("unsupported benchmark must fail before provider access");
-        assert_eq!(error.reason_code(), "benchmark_instrument_unsupported");
+            .expect_err("TEST_CODE benchmark must fail before provider access");
+        assert_eq!(error.reason_code(), "benchmark_test_identity_rejected");
 
         let mut connection = DatabaseManager::get().get_conn().unwrap();
         let after = diesel::sql_query(
@@ -2078,7 +2078,7 @@ mod tests {
         assert_eq!(row.provider, "Tdx");
         assert_eq!(row.request_hash, expected_request_hash);
         assert_eq!(row.outcome, "unsupported");
-        assert_eq!(row.reason_code, "benchmark_instrument_unsupported");
+        assert_eq!(row.reason_code, "benchmark_test_identity_rejected");
         assert_eq!(row.retryable, 0);
     }
 

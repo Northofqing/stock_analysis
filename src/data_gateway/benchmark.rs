@@ -24,7 +24,7 @@ const TDX_DAILY_CATEGORY: u8 = 4;
 const TDX_MINUTE1_CATEGORY: u8 = 8;
 const TDX_FQ_NONE: u8 = 0;
 const TDX_PAGE_SIZE: u16 = 800;
-const TDX_DEPENDENCY_REVISION: &str = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e";
+const TDX_DEPENDENCY_REVISION: &str = env!("MAGIC_TDX_DEPENDENCY_REVISION");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BenchmarkGranularity {
@@ -1435,16 +1435,7 @@ impl BenchmarkProviderAttestation {
     fn admit(self, request: &BenchmarkRequest) -> Result<TdxIndexProtocolContract, GatewayError> {
         let contract = TdxIndexProtocolContract::tdx_hs300_v1();
         match self.identity {
-            BenchmarkIdentityAttestation::RequestBoundTdxHs300V1 => {
-                if request.instrument != contract.canonical_instrument {
-                    return Err(benchmark_gateway_error(
-                        BenchmarkAuditOutcome::Unavailable,
-                        "benchmark_identity_contract_mismatch",
-                        false,
-                        "benchmark request does not match the attested TDX HS300 protocol contract",
-                    ));
-                }
-            }
+            BenchmarkIdentityAttestation::RequestBoundTdxHs300V1 => {}
             #[cfg(test)]
             BenchmarkIdentityAttestation::Unverified => {
                 return Err(benchmark_gateway_error(
@@ -2569,20 +2560,60 @@ mod tests {
     }
 
     #[test]
-    fn production_daily_attestation_binds_exact_hs300_protocol_request() {
+    fn production_contract_uses_build_generated_locked_revision() {
+        let adapter_source = include_str!("benchmark.rs");
+        assert!(adapter_source.contains(
+            "const TDX_DEPENDENCY_REVISION: &str = env!(\"MAGIC_TDX_DEPENDENCY_REVISION\");"
+        ));
+
+        let lock: toml::Value = toml::from_str(include_str!("../../Cargo.lock"))
+            .expect("TEST_CODE Cargo.lock must be valid TOML");
+        let sources: Vec<_> = lock["package"]
+            .as_array()
+            .expect("TEST_CODE Cargo.lock packages")
+            .iter()
+            .filter(|package| package["name"].as_str() == Some("magic-tdx-rs"))
+            .filter_map(|package| package["source"].as_str())
+            .collect();
+        assert_eq!(
+            sources.len(),
+            1,
+            "TEST_CODE magic-tdx source must be unique"
+        );
+        let (_, resolved_revision) = sources[0]
+            .rsplit_once('#')
+            .expect("TEST_CODE magic-tdx source must contain a resolved revision");
+        assert_eq!(super::TDX_DEPENDENCY_REVISION, resolved_revision);
+        assert_eq!(resolved_revision.len(), 40);
+        assert!(resolved_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+
+        let attestation = BenchmarkProviderAttestation::production_default();
+        assert_eq!(
+            attestation.identity,
+            super::BenchmarkIdentityAttestation::RequestBoundTdxHs300V1
+        );
+        let contract = super::TdxIndexProtocolContract::tdx_hs300_v1();
+        assert_eq!(contract.canonical_instrument, HS300_CANONICAL);
+        assert_eq!(contract.dependency_revision, resolved_revision);
+    }
+
+    #[test]
+    fn test_only_daily_attestation_binds_exact_hs300_protocol_request() {
         let day = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
         let source = TestIndexBarsSource::new(vec![Ok(vec![raw_daily(day)])]);
         let prepared = acquire_benchmark_batch_from_source(
             &source,
-            daily_request(day, day, HS300_CANONICAL),
-            &BenchmarkRegistry::production_default(),
-            BenchmarkProviderAttestation::production_default(),
+            daily_request(day, day, "TEST_CODE_000300"),
+            &test_registry(),
+            BenchmarkProviderAttestation::test_only(true, false),
             BenchmarkAdmissionCoverage::Daily {
                 authoritative_trading_days: &[day],
             },
             "2099-01-02T10:00:00+08:00",
         )
-        .expect("request-bound production Daily identity must admit exact HS300 data");
+        .expect("TEST_CODE request-bound Daily identity must admit exact protocol data");
 
         assert_eq!(prepared.batch.records().len(), 1);
         assert_eq!(

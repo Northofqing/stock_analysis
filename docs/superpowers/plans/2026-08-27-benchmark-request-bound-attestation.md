@@ -170,6 +170,16 @@ git add src/data_gateway/benchmark.rs src/data_gateway/review.rs
 git commit -m "fix: bind benchmark identity to trusted TDX request"
 ```
 
+- [x] **Step 7: 关闭独立 review 发现的 revision 双写缺口。**
+
+`build.rs` 从 `Cargo.lock` 中 `magic-tdx-rs` 的 resolved Git source 生成编译期 revision；
+Benchmark 合同不再持有手写提交。回归测试同时验证 adapter 使用生成值，且该值等于 lockfile
+唯一 source 的 40 位 commit。lockfile 缺失、歧义、仓库不匹配或 commit 非法均在构建时失败。
+
+Actual: RED 精确失败于 adapter 仍为手写常量；实现后 GREEN 1/1。Benchmark 默认/无默认特性
+均 27/27、Review 审计入口 1/1、CLI 6/6 通过。独立 review 同时发现并关闭测试真实代码与
+不可达 identity mismatch reason，设计证据从“同一连接”校正为“同一次 typed client acquisition”。
+
 ### Task 3: Gate 验证、真实采集与归因闭环
 
 **Files:**
