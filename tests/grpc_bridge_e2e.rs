@@ -145,11 +145,84 @@ async fn bridge_all_hooked_ops_fixture_roundtrip() {
     let mut server = spawn_fixture_server(port);
     std::env::set_var("GRPC_MARKET_ADDR", format!("http://127.0.0.1:{port}"));
     wait_ready(port).await;
+    let bridge = grpc_source::bridge_for("OutcomeDailyBars")
+        .expect("TEST_CODE bridge lookup")
+        .expect("DATA_GATEWAY_GRPC enables one local bridge");
+    let test_code = "TEST_CODE_600519".to_owned();
     let mut raw_client = GrpcMarketClient::connect(&format!("http://127.0.0.1:{port}"))
         .await
         .expect("connect raw fixture client");
 
     let date = NaiveDate::from_ymd_opt(2026, 8, 15).unwrap();
+
+    // ---- Gate C: LocalBridge dormant typed wrappers ----
+    let announcements = bridge.announcements_async().await.unwrap();
+    assert_eq!(announcements.records().len(), 1);
+    assert_eq!(announcements.evidence().batch_id, "fixture-b1");
+    assert_eq!(announcements.records()[0].code, test_code);
+
+    let futures_delivery = bridge.futures_delivery_async().await.unwrap();
+    assert_eq!(futures_delivery.records().len(), 1);
+    assert_eq!(futures_delivery.evidence().batch_id, "fixture-b1");
+    assert_eq!(
+        futures_delivery.records()[0].contract_code,
+        "TEST_CODE_IF2608"
+    );
+    assert_eq!(futures_delivery.records()[0].product_code, "TEST_CODE_IF");
+
+    let board_constituents = bridge.board_constituents_async(&test_code).await.unwrap();
+    assert_eq!(board_constituents.records().len(), 1);
+    assert_eq!(board_constituents.evidence().batch_id, "fixture-b1");
+    assert_eq!(board_constituents.records()[0].instrument_code, test_code);
+    assert_eq!(
+        board_constituents.records()[0].board_code,
+        "TEST_CODE_BK0475"
+    );
+
+    let research_reports = bridge.research_reports_async(&test_code, 5).await.unwrap();
+    assert_eq!(research_reports.records().len(), 1);
+    assert_eq!(research_reports.evidence().batch_id, "fixture-b1");
+    assert_eq!(
+        research_reports.records()[0].title,
+        "TEST_CODE_测试证券:2026年中报点评"
+    );
+
+    let technical_bars = bridge
+        .technical_bars_async(std::slice::from_ref(&test_code), 100)
+        .await
+        .unwrap();
+    assert_eq!(technical_bars.records().len(), 1);
+    assert_eq!(technical_bars.evidence().batch_id, "fixture-b1");
+
+    let intraday_shape = bridge.intraday_shape_async(&test_code).await.unwrap();
+    assert_eq!(intraday_shape.records().len(), 1);
+    assert_eq!(intraday_shape.evidence().batch_id, "fixture-b1");
+
+    for error in [
+        bridge.foreign_exchange_async().await.unwrap_err(),
+        bridge.economic_calendar_async().await.unwrap_err(),
+        bridge
+            .market_statistics_async(std::slice::from_ref(&test_code))
+            .await
+            .unwrap_err(),
+        bridge.provider_top_n_pair_async(date).await.unwrap_err(),
+    ] {
+        assert_eq!(error.reason_code(), "invalid_evidence");
+        assert!(!error.retryable());
+    }
+
+    let news_error = bridge
+        .instrument_news_async(std::slice::from_ref(&test_code), 5)
+        .await
+        .expect_err("production identity resolver rejects TEST_CODE before RPC");
+    assert_eq!(news_error.reason_code(), "invalid_request");
+    assert!(!news_error.retryable());
+
+    // GlobalIndices is advertised but has no fixture response arm; preserve
+    // the existing unsupported fail-closed contract instead of fabricating data.
+    let global_indices_error = bridge.global_indices_async().await.unwrap_err();
+    assert_eq!(global_indices_error.reason_code(), "invalid_request");
+    assert!(!global_indices_error.retryable());
 
     // ---- M2 首批 ----
     let quotes = blocking(
