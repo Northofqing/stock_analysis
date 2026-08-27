@@ -249,6 +249,7 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use stock_analysis::grpc_client::errors::ErrorDetail;
+    use stock_analysis::grpc_server::{start, ServerConfig};
 
     fn admitted_capability(operation: Operation) -> Capability {
         Capability {
@@ -414,5 +415,33 @@ mod tests {
 
         assert!(safe.contains("operation=Connect"));
         assert!(!safe.contains("TEST_CODE_LEAK_SENTINEL_9F3A"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn isolated_fixture_probe_reaches_t0_and_fails_closed_on_test_identity() {
+        let (addr, handle, _hub) = start(ServerConfig {
+            fixture_mode: true,
+            port: 0,
+            ..Default::default()
+        })
+        .await
+        .expect("TEST_CODE fixture server");
+
+        let error = run(Args {
+            addr: format!("http://{addr}"),
+            code: "TEST_CODE_600519".to_owned(),
+        })
+        .await
+        .expect_err("production T0 resolver must reject TEST_CODE after safe earlier probes");
+        handle.abort();
+
+        let safe = error.to_string();
+        assert_eq!(
+            safe,
+            "operation=T0Evidence reason_code=invalid_evidence retryable=false"
+        );
+        for forbidden in ["TEST_CODE_600519", "price", "token", "/"] {
+            assert!(!safe.contains(forbidden), "probe error leaked {forbidden}");
+        }
     }
 }
