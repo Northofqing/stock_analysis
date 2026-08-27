@@ -799,6 +799,139 @@ mod tests {
         assert!(failed.observations[0].last_success_at.is_some());
     }
 
+    #[test]
+    fn tracker_fail_closed_transition_matrix() {
+        let tracker = CapabilityTracker::default();
+        let wall = FixedOffset::east_opt(8 * 3600)
+            .unwrap()
+            .with_ymd_and_hms(2026, 8, 28, 9, 30, 0)
+            .unwrap();
+
+        assert_eq!(
+            tracker.record_attempt_started(Capability::Quote, " ", wall),
+            Err("provider must not be blank".to_owned())
+        );
+        tracker.register_unsupported(Capability::MoneyFlow).unwrap();
+        assert_eq!(
+            tracker.record_attempt_started(Capability::MoneyFlow, "TEST_CODE_provider", wall),
+            Err("unsupported capability cannot be attempted".to_owned())
+        );
+        assert_eq!(
+            tracker.record_success(
+                CapabilitySuccess {
+                    capability: Capability::News,
+                    provider: "TEST_CODE_provider".to_owned(),
+                    provider_observed_at: Some(wall),
+                    locally_observed_at: wall,
+                },
+                Instant::now(),
+            ),
+            Err("capability not registered".to_owned())
+        );
+
+        tracker.register_supported(Capability::Kline).unwrap();
+        assert_eq!(
+            tracker.record_success(
+                CapabilitySuccess {
+                    capability: Capability::Kline,
+                    provider: "TEST_CODE_provider".to_owned(),
+                    provider_observed_at: Some(wall),
+                    locally_observed_at: wall,
+                },
+                Instant::now(),
+            ),
+            Err("success requires a supported started attempt".to_owned())
+        );
+        assert_eq!(
+            tracker.record_failure(CapabilityFailure {
+                capability: Capability::Kline,
+                provider: "TEST_CODE_provider".to_owned(),
+                locally_observed_at: wall,
+                reason_code: "TEST_CODE_not_started".to_owned(),
+                retryable: false,
+                next_retry_at: None,
+            }),
+            Err("failure requires a supported started attempt".to_owned())
+        );
+
+        tracker.register_supported(Capability::News).unwrap();
+        tracker
+            .record_attempt_started(Capability::News, "TEST_CODE_provider", wall)
+            .unwrap();
+        assert_eq!(
+            tracker.record_success(
+                CapabilitySuccess {
+                    capability: Capability::News,
+                    provider: " ".to_owned(),
+                    provider_observed_at: Some(wall),
+                    locally_observed_at: wall,
+                },
+                Instant::now(),
+            ),
+            Err("provider must not be blank".to_owned())
+        );
+
+        tracker.register_supported(Capability::OrderBook).unwrap();
+        tracker
+            .record_attempt_started(Capability::OrderBook, "TEST_CODE_provider", wall)
+            .unwrap();
+        for (provider, reason_code) in [(" ", "TEST_CODE_failure"), ("TEST_CODE_provider", " ")] {
+            assert_eq!(
+                tracker.record_failure(CapabilityFailure {
+                    capability: Capability::OrderBook,
+                    provider: provider.to_owned(),
+                    locally_observed_at: wall,
+                    reason_code: reason_code.to_owned(),
+                    retryable: true,
+                    next_retry_at: None,
+                }),
+                Err("provider and reason_code must not be blank".to_owned())
+            );
+        }
+
+        tracker
+            .record_attempt_started(Capability::Kline, "TEST_CODE_provider", wall)
+            .unwrap();
+        tracker
+            .record_attempt_started(Capability::Quote, "TEST_CODE_provider", wall)
+            .unwrap();
+        tracker
+            .record_failure(CapabilityFailure {
+                capability: Capability::Quote,
+                provider: "TEST_CODE_provider".to_owned(),
+                locally_observed_at: wall,
+                reason_code: "TEST_CODE_provider_unavailable".to_owned(),
+                retryable: true,
+                next_retry_at: Some(wall + chrono::Duration::seconds(30)),
+            })
+            .unwrap();
+
+        let snapshot = tracker
+            .snapshot_at(CapabilityNow {
+                wall,
+                monotonic: Instant::now(),
+                expected_now: true,
+            })
+            .unwrap();
+        let quote = snapshot
+            .observations
+            .iter()
+            .find(|observation| observation.capability == Capability::Quote)
+            .expect("TEST_CODE Quote observation");
+        assert_eq!(quote.state, CapabilityState::Failed);
+        assert_eq!(quote.provider.as_deref(), Some("TEST_CODE_provider"));
+        assert_eq!(
+            quote.last_error_code.as_deref(),
+            Some("TEST_CODE_provider_unavailable")
+        );
+        assert_eq!(quote.retryable, Some(true));
+        assert_eq!(
+            quote.next_retry_at,
+            Some(wall + chrono::Duration::seconds(30))
+        );
+        assert!(snapshot.first_probe_complete);
+    }
+
     fn input_all_fresh() -> DataHealthInput {
         DataHealthInput {
             capabilities: Capability::ALL

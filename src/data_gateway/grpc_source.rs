@@ -4313,6 +4313,249 @@ mod tests {
         assert!(error.retryable());
     }
 
+    fn br238_query(schema: &str, version: u32, data: serde_json::Value) -> QueryResult {
+        QueryResult {
+            admission: pb::AdmissionState::Admitted,
+            selected_provider: "Tdx".to_owned(),
+            batch_id: "TEST_CODE_OPENING_BATCH".to_owned(),
+            complete: true,
+            observed_at: "2026-08-17T01:30:00.250Z".to_owned(),
+            source_at: "2026-08-17T01:30:00Z".to_owned(),
+            records: vec![pb::CanonicalPayload {
+                schema: schema.to_owned(),
+                schema_version: version,
+                content_type: "application/json; charset=utf-8".to_owned(),
+                data: serde_json::to_vec(&data).expect("TEST_CODE canonical payload"),
+            }],
+            source: "TEST_CODE_tdx".to_owned(),
+            diagnostic_blocker: String::new(),
+        }
+    }
+
+    #[test]
+    fn br238_opening_canaries_cover_exact_and_fail_closed_identity_evidence_matrix() {
+        const CODE: &str = "TEST_CODE_600519";
+
+        let quote_query = br238_query(
+            "market.realtime_quotes",
+            1,
+            serde_json::json!([{
+                "code": CODE,
+                "name": "TEST_CODE_SECURITY",
+                "price": 10.0,
+                "change_pct": 1.0,
+                "previous_close": 9.9
+            }]),
+        );
+        let quotes = convert::realtime_quotes(&quote_query).expect("TEST_CODE quote batch");
+        exact_quote_canary(CODE, &quotes).expect("exact quote identity");
+        assert_eq!(
+            opening_route("RealtimeQuotes", "LocalBridgeV1", &quotes, true)
+                .expect("exact quote opening route")
+                .records,
+            1
+        );
+
+        let book_query = br238_query(
+            "market.order_books",
+            1,
+            serde_json::json!([{
+                "code": CODE,
+                "bids": [{"price": 9.99, "quantity": 100.0}],
+                "asks": [{"price": 10.01, "quantity": 100.0}],
+                "total_bid_quantity": 100.0,
+                "total_ask_quantity": 100.0,
+                "source_at": "2026-08-17T01:30:00Z"
+            }]),
+        );
+        let books = convert::order_books(&book_query).expect("TEST_CODE order-book batch");
+        exact_book_canary(CODE, &books).expect("exact order-book identity");
+        assert_eq!(
+            opening_route("OrderBooks", "LocalBridgeV1", &books, true)
+                .expect("exact order-book opening route")
+                .records,
+            1
+        );
+
+        let membership_query = br238_query(
+            "market.board_constituents",
+            1,
+            serde_json::json!([{
+                "instrument_code": CODE,
+                "board_code": "TEST_CODE_BK0475",
+                "board_name": "TEST_CODE_BOARD",
+                "kind": "Concept"
+            }]),
+        );
+        let memberships =
+            convert::board_constituents(&membership_query).expect("TEST_CODE membership batch");
+        exact_membership_canary(CODE, &memberships).expect("exact membership identity");
+        assert_eq!(
+            opening_route("BoardConstituents", "LocalBridgeV1", &memberships, true,)
+                .expect("exact membership opening route")
+                .records,
+            1
+        );
+
+        let t0_data = serde_json::json!({
+            "requested_at": "2026-08-17T01:29:59Z",
+            "source_at": "2026-08-17T01:30:00Z",
+            "observed_at": "2026-08-17T01:30:00.250Z",
+            "batch_id": "TEST_CODE_OPENING_BATCH",
+            "time_untrustworthy": false,
+            "records": [{
+                "instrument": {
+                    "exchange": "Shanghai",
+                    "code": CODE,
+                    "asset_class": "Equity"
+                },
+                "code": CODE,
+                "requested_at": "2026-08-17T01:29:59Z",
+                "source_at": "2026-08-17T01:30:00Z",
+                "observed_at": "2026-08-17T01:30:00.250Z",
+                "batch_id": "TEST_CODE_OPENING_BATCH",
+                "quote": {
+                    "price": 10.0,
+                    "last_close": 9.9,
+                    "open": 9.95,
+                    "high": 10.1,
+                    "low": 9.8,
+                    "volume": 1000.0,
+                    "amount": 10000.0,
+                    "bids": [
+                        {"price": 9.99, "volume": 100.0},
+                        {"price": 9.98, "volume": 100.0},
+                        {"price": 9.97, "volume": 100.0},
+                        {"price": 9.96, "volume": 100.0},
+                        {"price": 9.95, "volume": 100.0}
+                    ],
+                    "asks": [
+                        {"price": 10.01, "volume": 100.0},
+                        {"price": 10.02, "volume": 100.0},
+                        {"price": 10.03, "volume": 100.0},
+                        {"price": 10.04, "volume": 100.0},
+                        {"price": 10.05, "volume": 100.0}
+                    ]
+                },
+                "settled_daily": [],
+                "completed_five_minute": [{
+                    "at": "2026-08-17T09:35:00+08:00",
+                    "open": 10.0,
+                    "high": 10.1,
+                    "low": 9.9,
+                    "close": 10.0,
+                    "volume": 1000.0,
+                    "amount": 10000.0
+                }],
+                "intraday_average_price": 9.98
+            }],
+            "rejections": []
+        });
+        let t0_query = br238_query("market.t0_evidence", 2, t0_data);
+        let t0 = convert::t0_evidence_batch(&t0_query).expect("TEST_CODE T0 batch");
+        exact_t0_canary(CODE, &t0).expect("exact T0 identity");
+        assert_eq!(
+            opening_t0_route(&t0)
+                .expect("exact T0 opening route")
+                .records,
+            1
+        );
+
+        let empty = convert::realtime_quotes(&br238_query(
+            "market.realtime_quotes",
+            1,
+            serde_json::json!([]),
+        ))
+        .expect("TEST_CODE verified-empty quote batch");
+        let error = opening_route("RealtimeQuotes", "LocalBridgeV1", &empty, true)
+            .expect_err("empty canary must fail closed");
+        assert_eq!(error.reason_code(), "opening_canary_empty");
+
+        for (case, data) in [
+            (
+                "wrong",
+                serde_json::json!([{
+                    "code": "TEST_CODE_600520",
+                    "name": "TEST_CODE_SECURITY",
+                    "price": 10.0,
+                    "change_pct": 1.0,
+                    "previous_close": 9.9
+                }]),
+            ),
+            (
+                "duplicate",
+                serde_json::json!([
+                    {
+                        "code": CODE,
+                        "name": "TEST_CODE_SECURITY",
+                        "price": 10.0,
+                        "change_pct": 1.0,
+                        "previous_close": 9.9
+                    },
+                    {
+                        "code": CODE,
+                        "name": "TEST_CODE_SECURITY",
+                        "price": 10.0,
+                        "change_pct": 1.0,
+                        "previous_close": 9.9
+                    }
+                ]),
+            ),
+        ] {
+            let batch = convert::realtime_quotes(&br238_query("market.realtime_quotes", 1, data))
+                .expect("TEST_CODE identity batch");
+            let error = exact_quote_canary(CODE, &batch)
+                .expect_err("wrong or duplicate quote identity must fail closed");
+            assert_eq!(
+                error.reason_code(),
+                "opening_canary_identity_mismatch",
+                "case={case}"
+            );
+        }
+
+        let mut rejected_t0 = t0.clone();
+        rejected_t0
+            .rejections
+            .push(crate::data_gateway::MagicTdxT0Rejection {
+                code: CODE.to_owned(),
+                reason_code: "TEST_CODE_rejected",
+                detail: "TEST_CODE rejected evidence".to_owned(),
+                retryable: false,
+            });
+        let error = exact_t0_canary(CODE, &rejected_t0)
+            .expect_err("a T0 rejection must fail the exact canary");
+        assert_eq!(error.reason_code(), "opening_canary_identity_mismatch");
+
+        let mut empty_source = quotes.clone();
+        match &mut empty_source {
+            GatewayBatch::Available { evidence, .. } => evidence.source.clear(),
+            GatewayBatch::VerifiedEmpty(_) => panic!("TEST_CODE quote batch must be available"),
+        }
+        let error = opening_route("RealtimeQuotes", "LocalBridgeV1", &empty_source, true)
+            .expect_err("blank source must fail closed");
+        assert_eq!(error.reason_code(), "invalid_evidence");
+
+        let mut empty_batch = quotes.clone();
+        match &mut empty_batch {
+            GatewayBatch::Available { evidence, .. } => evidence.batch_id.clear(),
+            GatewayBatch::VerifiedEmpty(_) => panic!("TEST_CODE quote batch must be available"),
+        }
+        let error = opening_route("RealtimeQuotes", "LocalBridgeV1", &empty_batch, true)
+            .expect_err("blank batch identity must fail closed");
+        assert_eq!(error.reason_code(), "invalid_evidence");
+
+        let mut future_source = quotes;
+        match &mut future_source {
+            GatewayBatch::Available { evidence, .. } => {
+                evidence.source_at = Some("2026-08-17T01:30:01Z".to_owned());
+            }
+            GatewayBatch::VerifiedEmpty(_) => panic!("TEST_CODE quote batch must be available"),
+        }
+        let error = opening_route("RealtimeQuotes", "LocalBridgeV1", &future_source, true)
+            .expect_err("source_at later than observed_at must fail closed");
+        assert_eq!(error.reason_code(), "invalid_evidence");
+    }
+
     #[test]
     fn br238_diagnostic_report_retains_a_failure_and_later_success() {
         let mut report = OpeningDiagnosticReport::default();
@@ -4440,6 +4683,119 @@ mod tests {
         assert_eq!(failed.rejected_count, 1);
         assert_eq!(failed.reason_code, "instrument_cutoff_empty");
         assert_eq!(failed.retryable, 1);
+    }
+
+    #[test]
+    fn br159_opening_audits_cover_available_empty_failure_and_overflow() {
+        let _env = test_grpc_env_guard();
+        use diesel::prelude::*;
+        use diesel::sql_types::{BigInt, Integer, Text};
+
+        #[derive(Debug, QueryableByName, PartialEq, Eq)]
+        struct PersistedOpeningAudit {
+            #[diesel(sql_type = Text)]
+            capability: String,
+            #[diesel(sql_type = Text)]
+            outcome: String,
+            #[diesel(sql_type = BigInt)]
+            accepted_count: i64,
+            #[diesel(sql_type = BigInt)]
+            rejected_count: i64,
+            #[diesel(sql_type = Text)]
+            reason_code: String,
+            #[diesel(sql_type = Integer)]
+            retryable: i32,
+        }
+
+        const PHASE: &str = "TEST_CODE_GATE_C_TASK7D";
+        crate::database::DatabaseManager::init(None).expect("TEST_CODE audit database");
+
+        let report = OpeningReadinessReport {
+            routes: vec![
+                br238_ready_route("Announcements", ProviderId::Cninfo),
+                OpeningRouteReadiness {
+                    records: 0,
+                    ..br238_ready_route("BoardConstituents", ProviderId::Tdx)
+                },
+            ],
+            degraded_routes: vec![],
+        };
+        audit_opening_readiness_report(PHASE, &report)
+            .expect("TEST_CODE available and empty audit rows");
+
+        let failure = GatewayError::classified(
+            "TEST_CODE_Opening",
+            Some(ProviderId::Tdx),
+            "unavailable",
+            "TEST_CODE_provider_unavailable",
+            true,
+            "TEST_CODE failure",
+        );
+        audit_opening_readiness_failure(PHASE, &failure).expect("TEST_CODE failure audit row");
+
+        let load_rows = || {
+            let mut connection = crate::database::DatabaseManager::get()
+                .get_conn()
+                .expect("TEST_CODE audit connection");
+            diesel::sql_query(
+                "SELECT capability, outcome, accepted_count, rejected_count, reason_code, retryable \
+                 FROM data_acquisition_audit \
+                 WHERE capability LIKE 'TEST_CODE_GATE_C_TASK7D-%' \
+                 ORDER BY id ASC",
+            )
+            .load::<PersistedOpeningAudit>(&mut connection)
+            .expect("TEST_CODE opening audit rows")
+        };
+
+        let rows = load_rows();
+        assert_eq!(
+            rows,
+            vec![
+                PersistedOpeningAudit {
+                    capability: "TEST_CODE_GATE_C_TASK7D-Announcements".to_owned(),
+                    outcome: "available".to_owned(),
+                    accepted_count: 1,
+                    rejected_count: 0,
+                    reason_code: "accepted".to_owned(),
+                    retryable: 0,
+                },
+                PersistedOpeningAudit {
+                    capability: "TEST_CODE_GATE_C_TASK7D-BoardConstituents".to_owned(),
+                    outcome: "verified_empty".to_owned(),
+                    accepted_count: 0,
+                    rejected_count: 0,
+                    reason_code: "verified_empty".to_owned(),
+                    retryable: 0,
+                },
+                PersistedOpeningAudit {
+                    capability: "TEST_CODE_GATE_C_TASK7D-TEST_CODE_Opening".to_owned(),
+                    outcome: "unavailable".to_owned(),
+                    accepted_count: 0,
+                    rejected_count: 1,
+                    reason_code: "TEST_CODE_provider_unavailable".to_owned(),
+                    retryable: 1,
+                },
+            ]
+        );
+
+        let overflow = OpeningReadinessReport {
+            routes: vec![OpeningRouteReadiness {
+                records: usize::MAX,
+                ..br238_ready_route("TEST_CODE_Overflow", ProviderId::Tdx)
+            }],
+            degraded_routes: vec![],
+        };
+        let error = audit_opening_readiness_report(PHASE, &overflow)
+            .expect_err("SQLite INTEGER overflow must fail before persistence");
+        assert_eq!(error.audit_outcome(), "unavailable");
+        assert_eq!(error.reason_code(), "acquisition_audit_unavailable");
+        assert!(error.retryable());
+        assert!(error.message().contains("accepted_count_overflow"));
+        assert_eq!(
+            load_rows(),
+            rows,
+            "overflow must not append a partial audit row"
+        );
     }
 
     #[test]
