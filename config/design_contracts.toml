@@ -12,18 +12,18 @@ score_max = 100
 insufficient_cap_relation = "threshold_minus_one"
 
 # BR-252 / docs/superpowers/specs/2026-08-02-gate-d-coverage-closure-design.md §10.4
-# 当前 PR 覆盖率棘轮基线来自 1a2bfa8 上两次独立、计数一致的
+# 当前 PR 覆盖率棘轮基线来自 3edb5d6 上两次独立、计数与逐行布尔覆盖一致的
 # workspace/all-features 新鲜报告；见设计 §10.14。
 # 比例判定必须使用整数交叉相乘；普通修改不得降低任一 baseline。
 [coverage]
 schema = 1
-source_sha = "1a2bfa82a2edfb4c2f7e0f5bd0019bd4f1ab4642"
+source_sha = "3edb5d6c9aed0919bc1146d13e25f9c1576a2827"
 bootstrap_approved = true
 bootstrap_rule = "BR-252"
-global_covered = 202873
-global_count = 260127
-core_covered = 158672
-core_count = 203777
+global_covered = 202888
+global_count = 260143
+core_covered = 158687
+core_count = 203793
 core_file_count = 218
 pr_core_patch_min = 90
 pr_other_patch_min = 85
