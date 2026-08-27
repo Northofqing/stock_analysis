@@ -271,3 +271,145 @@ data_gateway 开关（P4）：每个 Gateway 内部加分支——`GRPC_MARKET_A
 5. `grep -RIn 'GRPC_MARKET_ADDR' src/data_gateway/` 显示开关存在且默认分支走现有路径；
    未设置 env 时 monitor 行为与迁移前一致（旧 push log 与数据不受影响）。
 6. proto 文件未修改（`git diff grpc/market.proto` 为空）。
+
+## 11. 2026-08-27 修订：T0 批次时间合同与本地双进程切换
+
+### 11.1 背景与已确认事实
+
+2026-08-27 盘中真实探针确认，monitor 同时消费两条彼此独立的 gRPC 路径：
+
+- `LocalBridgeV1` 指向 `127.0.0.1:18082`，承载 `T0Evidence`、`OrderBooks`、
+  `HistoricalBars` 等本地委托；
+- authenticated `ExternalV1` 使用 client bundle 的独立远端 endpoint，承载静态开盘能力。
+
+因此，远端服务恢复不能证明本地 `grpc_market_server` 已部署。事发时本地 release
+进程与二进制均早于当前 checkout；真实 `T0Evidence` RPC 虽返回 `ADMITTED`、
+`complete=true` 和非空记录，但 `completed_five_minute[].at` 是
+`YYYY-MM-DDTHH:MM:SS` 无 offset 字符串。服务端直接 `serde_json::to_value` 一个包含
+`NaiveDateTime` 的领域对象，而客户端按 RFC3339 instant 严格解析，最终以
+`invalid_evidence` 拒绝整批。客户端拒绝是正确的 AGENTS 2.3 fail-closed 行为。
+
+同一时段的精确 RPC 还确认：
+
+- `OrderBooks` 可由真实 Tencent provider 返回完整五档、批次身份和来源时间；
+- `MoneyFlows` 返回非重试 `unsupported_contract`，原因是规范化资金流所需的
+  `magic-emquant-rs` licensed bridge 未链接；
+- `BoardFlows` 与逐证券 `MoneyFlows` 是不同合同，禁止互相冒充。
+
+### 11.2 方案选择
+
+采用“显式 T0 wire DTO + 严格 consumer + 候选端口联合切换”。
+
+拒绝以下方案：
+
+1. **只重启当前服务**：源码边界仍会输出无 offset 时间，不能消除根因。
+2. **客户端猜测无时区字符串为北京时间**：把坏合同解释为真值，违反 2.3/BR-238。
+3. **以 BoardFlows 或零值填补 MoneyFlow**：伪造能力，违反 2.1/2.2/2.8。
+
+### 11.3 `market.t0_evidence` v2 wire 合同
+
+`MagicTdxT0Evidence` 继续作为进程内领域对象；`grpc_server::delegate` 不再直接序列化
+该对象，而是投影为服务端拥有的显式 wire DTO。v2 payload 固定包含：
+
+```text
+T0EvidenceBatchWireV2
+├── requested_at       RFC3339 instant
+├── source_at          RFC3339 instant，必须与 envelope 一致
+├── observed_at        RFC3339 instant，必须与 envelope 一致
+├── batch_id           非空，必须与 envelope 一致
+├── time_untrustworthy bool
+├── records[]
+└── rejections[]
+```
+
+每个 `completed_five_minute[].at` 必须是带 `+08:00` offset 的 RFC3339 时间。TDX
+五分钟标签在 provider 适配层已被验证为 A 股交易日历的中国标准时间 civil label；
+wire 投影使用固定 `+08:00` 表达该既有语义，不依赖部署主机的 `Local` 时区。
+
+客户端必须：
+
+1. 只接纳 v2 已登记 schema；无时区、错误 offset、非法日期一律 `invalid_evidence`；
+2. 校验 payload 批次身份与 gRPC envelope 完全一致；
+3. 将已验证的 `+08:00` civil label 无损恢复为现有领域对象的 `NaiveDateTime`，不得用
+   `.naive_utc()` 改变交易时刻；
+4. 空 `records` 时从批级 `requested_at` 恢复批次，保留全部 rejection，禁止用
+   `observed_at` 或 consumer 当前时间代填；
+5. `time_untrustworthy` 采用“服务端已标记 OR 客户端按真实接收时间复核后标记”；未来
+   时间、时间倒置和证据冲突仍是硬错误。
+
+v1 与 v2 不做猜测兼容。旧 monitor 与新 server、或新 monitor 与旧 server 的 schema
+不匹配必须显式失败，因此生产切换必须把 server 与 monitor 作为一个发布单元。
+
+### 11.4 OrderBook 能力归因
+
+MoneyFlow 保持 `Unsupported/Missing`，直到规范化逐证券真实 provider 被单独接入并通过
+准入，不在本修订中改变。
+
+OrderBook 只允许在 monitor 进程内完成下列全部条件后刷新成功时间：
+
+- T0 响应是 `complete=true`、`ADMITTED` 且批次证据一致；
+- 请求代码集合无重复，返回 record/rejection 集合与请求集合一一对应；
+- 所有请求代码均为成功 record，rejections 为空；
+- 每条 record 的五档盘口、价格和时间均通过现有严格校验。
+
+任一代码失败时不得用其他代码的成功把全局 OrderBook 标成健康。该“全请求集合原子
+成功后才刷新能力”的规则在实现前登记为 **BR-253**。不新增独立轮询器、不增加 provider
+流量，也不修改推送节流；复用现有 30 秒 T0 真实读取结果。
+
+### 11.5 数据流与失败处理
+
+```text
+TDX 中国标准时间 civil bar
+  -> MagicTdxT0Evidence（领域校验）
+  -> T0EvidenceBatchWireV2（显式 +08:00 / 批级证据）
+  -> LocalBridgeV1 gRPC envelope
+  -> v2 consumer（schema + 批次身份 + 时间 + 数值校验）
+  -> MagicTdxT0Batch
+  -> exact requested outcomes 校验
+  -> 买卖策略；仅全批成功时刷新 OrderBook capability
+```
+
+任何 DTO 构造、时间绑定、schema、批次身份、代码集合、数值或 freshness 失败均返回
+结构化错误并保留 provider/reason/retryable 审计；不得降级为本地 library、空成功、旧
+schema 或默认时间。MoneyFlow 的 `unsupported_contract` 是真实能力状态，不参与 T0
+成功判定，也不得被 BoardFlows 成功覆盖。
+
+### 11.6 测试与真实验证
+
+实现按失败测试先行：
+
+- 非空五分钟 bar 的 server/client round-trip 保持 `13:05 +08:00` 对应的原交易标签；
+- v2 空 records + 非空 rejections 可无损恢复 `requested_at`；
+- 无 offset、非 `+08:00`、未来时间、时间倒置、envelope 冲突全部拒绝；
+- 服务端 `source_at/observed_at/batch_id` 与 payload 冲突时拒绝；
+- 只有 exact 全请求成功才刷新 OrderBook，部分成功、重复、缺失、额外代码均不刷新；
+- 既有 quote 5 秒门和 T0 `time_untrustworthy` 规则不被放宽。
+
+离线 Gate B/C 全部通过后，在独立临时 target 构建候选 server/monitor，并在备用端口启动
+真实 server。候选探针必须覆盖 `T0Evidence`、`RealtimeQuotes`、`OrderBooks`、
+`HistoricalBars`，输出只保留脱敏计数、provider、admission、freshness 和结构化错误。
+
+候选通过后停止旧 monitor，再停止旧 server，安装并启动两份候选二进制。切换后先验证
+health/capability/T0，再恢复常驻监控；任一检查失败立即成对回滚。随后运行登记的真实
+日线 backfill，要求 `stock_daily.MAX(date)` 满足不落后超过一个交易日，并连续观察两个
+严格五分钟窗口。未通过 freshness、审计或 live 探针时状态保持 In Progress/Blocked。
+
+### 11.7 回滚与旧模块关系
+
+| 模块 | 处理 | 理由 |
+|---|---|---|
+| `MagicTdxGateway::get_t0_evidence_batch` | adopt | 保留真实 provider、质量门和完整 outcome 语义 |
+| `delegate::fetch_t0_evidence` 直接 `serde_json::to_value` | reject | 泄漏 `NaiveDateTime`，无法形成稳定 wire 合同 |
+| `convert::t0_evidence_batch` 严格时间/证据校验 | adopt + deepen | 保持 fail-closed，补充 v2 批级身份和正确 civil-time 恢复 |
+| `BoardFlows` 作为 MoneyFlow | reject | 数据族和方法学不同，不具备来源证明 |
+| 独立 OrderBook capability 轮询 | reject | 现有 T0 已有真实读取，避免新增流量与并发状态 |
+
+切换前记录旧 PID、启动参数、二进制 SHA-256，并把旧 server/monitor 复制到唯一临时备份
+目录。回滚恢复两份旧二进制及原启动参数；源码通过 PR 的 `git revert <sha>` 回滚。
+日线 backfill 只追加/幂等接纳已验证真实批次，不以删除历史记录作为常规回滚手段。
+
+### 11.8 非目标
+
+本修订不处理 authenticated ExternalV1 的 ThePaper provider、持仓台账、durable delivery
+拒绝或损坏的历史 dispatcher JSONL；这些问题拥有独立根因和审计/回滚边界，不与 T0
+数据合同混合修改。本修订不解除订单门禁、不授权真实下单，也不改变策略阈值。
