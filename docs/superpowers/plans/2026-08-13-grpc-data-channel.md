@@ -1870,7 +1870,7 @@ async fn health_and_capabilities() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn six_representative_ops_fixture_roundtrip() {
+async fn fixture_operations_roundtrip() {
     let (addr, handle) = start(ServerConfig {
         fixture_mode: true,
         port: 0,
@@ -3716,7 +3716,7 @@ PR 描述必须包含：
 
 **Interfaces:**
 - Consumes: Task 6 的 `run(Args)`、fixture `start(ServerConfig)`、
-  `six_representative_ops_fixture_roundtrip`。
+  `fixture_operations_roundtrip`。
 - Produces: 一个真实 loopback fixture probe 的 fail-closed 回归，以及全部已登记 fixture operation
   的 raw-wire 回归；不产生 live/provider 证据。
 
@@ -3775,7 +3775,7 @@ async fn isolated_fixture_probe_reaches_t0_and_fails_closed_on_test_identity() {
 
 - [ ] **Step 3: 扩充 fixture raw-wire operation 表**
 
-在 `six_representative_ops_fixture_roundtrip` 的 `cases` 追加以下精确条目：
+在 `fixture_operations_roundtrip` 的 `cases` 追加以下精确条目：
 
 ```rust
 (Operation::OrderBooks, "market.order_books", "TEST_CODE_600519"),

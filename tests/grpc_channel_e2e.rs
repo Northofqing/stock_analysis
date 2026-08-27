@@ -187,7 +187,7 @@ async fn health_and_capabilities() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn six_representative_ops_fixture_roundtrip() {
+async fn fixture_operations_roundtrip() {
     let (addr, handle, _hub) = start(ServerConfig {
         fixture_mode: true,
         port: 0,
