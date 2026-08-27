@@ -6,8 +6,9 @@
 //! 签名说明 (实测, 非计划假设): data_gateway 全部是 async fn (内部自行
 //! spawn_blocking), 所以 fetch 本身是 async, handler 直接 await, 不套 spawn_blocking。
 //! 记录结构体没有 derive Serialize → 逐字段 json! 映射 (字段名 = 结构体字段名);
-//! M1 扩展的 14 个 fetch 中已 derive Serialize 的 record (FinancialStatement/
-//! MagicTdxT0Evidence/GeneralWebResearchRecord) 用 serde_json::to_value 直出。
+//! M1 扩展的 14 个 fetch 中，已 derive Serialize 的 record
+//! (FinancialStatement/GeneralWebResearchRecord) 用 serde_json::to_value 直出；
+//! T0 v2 批次由 t0_wire 的显式 DTO 序列化，固定投影中国时段 civil label。
 use crate::data_gateway::outcome_daily_bars::{
     fetch_magic_tdx_outcome_adaptive, OutcomeTransportFailure, RawOutcomeFetch,
 };
