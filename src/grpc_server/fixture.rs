@@ -152,6 +152,11 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
         )),
         Operation::T0Evidence => {
             let data = serde_json::json!({
+                "requested_at": live_at,
+                "source_at": live_at,
+                "observed_at": live_at,
+                "batch_id": "fixture-b1",
+                "time_untrustworthy": false,
                 "records": [{
                     "instrument": "SH600519",
                     "code": "600519",
@@ -183,7 +188,15 @@ pub fn fixture_response(op: Operation, schema: &str, version: u32) -> Option<Que
                         ]
                     },
                     "settled_daily": [],
-                    "completed_five_minute": [],
+                    "completed_five_minute": [{
+                        "at": "2026-08-13T13:05:00+08:00",
+                        "open": 1498.0,
+                        "high": 1501.0,
+                        "low": 1497.0,
+                        "close": 1500.0,
+                        "volume": 12000.0,
+                        "amount": 1.8e7
+                    }],
                     "intraday_average_price": 1498.0
                 }],
                 "rejections": []

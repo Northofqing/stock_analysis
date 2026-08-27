@@ -8,7 +8,7 @@
 //! 递归防护: server 子进程显式 env_remove("DATA_GATEWAY_GRPC") — delegate 内部调用
 //! 本地网关 (fetch_technical_bars → fifteen_min_bars 等), 若继承 env 会形成
 //! 桥 → 服务端 → 本地网关 → 桥 的无限递归。这是生产部署的强制约束 (M4 banner 文档化)。
-use chrono::{Duration, NaiveDate, Utc};
+use chrono::{Duration, NaiveDate, Timelike, Utc};
 use magic_market_core::{
     AssetClass, CorporateActionCategory, Exchange, FlowInterval, InstrumentId, MarketRankingKind,
     NorthboundChannel, ProviderId, StatementKind,
@@ -266,6 +266,8 @@ async fn bridge_all_hooked_ops_fixture_roundtrip() {
     .await;
     assert_eq!(t0.records.len(), 1, "T0Evidence records");
     assert_eq!(t0.records[0].code, "600519", "T0Evidence 保真");
+    assert_eq!(t0.records[0].completed_five_minute.len(), 1);
+    assert_eq!(t0.records[0].completed_five_minute[0].at.time().hour(), 13);
     assert!(
         t0.rejections.is_empty(),
         "T0Evidence rejections 空 (fixture)"

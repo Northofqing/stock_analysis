@@ -92,6 +92,9 @@ async fn six_representative_ops_fixture_roundtrip() {
         assert!(result.complete, "{schema} complete=true");
         assert_eq!(result.records.len(), 1, "{schema} 1 条 fixture 记录");
         assert_eq!(result.records[0].schema, schema);
+        if op == Operation::T0Evidence {
+            assert_eq!(result.records[0].schema_version, 2);
+        }
         let parsed: serde_json::Value = serde_json::from_slice(&result.records[0].data).unwrap();
         // 多数 op 视图是数组; T0Evidence 是 {"records": [...], "rejections": [...]} 对象,
         // 非数组时整体检查 (serde_json Index<usize> 对非数组返回 Null)。
