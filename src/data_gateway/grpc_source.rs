@@ -2031,6 +2031,14 @@ fn require_exact_response_codes(
     Ok(())
 }
 
+fn complete_t0_batch_proves_order_book(
+    requested_len: usize,
+    record_len: usize,
+    rejection_len: usize,
+) -> bool {
+    requested_len > 0 && record_len == requested_len && rejection_len == 0
+}
+
 fn opening_t0_route(batch: &MagicTdxT0Batch) -> Result<OpeningRouteReadiness, GatewayError> {
     if batch.source.trim().is_empty() || batch.batch_id.trim().is_empty() {
         return Err(GatewayError::invalid_evidence(
@@ -3370,6 +3378,18 @@ impl GrpcSource {
                 "T0Evidence outcomes do not exactly match the requested instrument set",
             ));
         }
+        if complete_t0_batch_proves_order_book(
+            codes.len(),
+            batch.records.len(),
+            batch.rejections.len(),
+        ) {
+            crate::monitor::data_mode::mark_capability_success(
+                crate::monitor::data_mode::Capability::OrderBook,
+            )
+            .map_err(|error| {
+                GatewayError::unavailable("T0Evidence", Some(batch.provider), false, error)
+            })?;
+        }
         Ok(batch)
     }
 
@@ -3561,6 +3581,14 @@ mod tests {
     use prost::Message; // pb::ErrorDetail::encode_to_vec
                         // env 是进程级: 这些测试并行时会互相看到对方的 env (race)。
                         // 共享锁串行化 env 敏感的测试 (M3 全量并行跑时暴露)。
+
+    #[test]
+    fn br253_t0_order_book_requires_a_nonempty_all_record_batch() {
+        assert!(complete_t0_batch_proves_order_book(7, 7, 0));
+        assert!(!complete_t0_batch_proves_order_book(7, 6, 1));
+        assert!(!complete_t0_batch_proves_order_book(7, 7, 1));
+        assert!(!complete_t0_batch_proves_order_book(0, 0, 0));
+    }
 
     #[test]
     fn br243_sync_context_returns_typed_retryable_timeout() {
