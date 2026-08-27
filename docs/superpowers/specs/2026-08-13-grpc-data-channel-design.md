@@ -356,6 +356,12 @@ OrderBook 只允许在 monitor 进程内完成下列全部条件后刷新成功�
 成功后才刷新能力”的规则在实现前登记为 **BR-253**。不新增独立轮询器、不增加 provider
 流量，也不修改推送节流；复用现有 30 秒 T0 真实读取结果。
 
+BR-253 的成功标记是 monitor 进程的真实 provider-backed OrderBook 准入，因而触发
+BR-216：OrderBook 必须作为关键 DataMode capability。其成功时间缺失或超过既有 600 秒
+预算时进入 `Degraded`，而不是 `Unsafe`；Quote 仍是唯一直接进入 `Unsafe` 的 capability。
+MoneyFlow 未接入其独立逐证券真实 provider，继续保持辅助能力。这里“不修改推送节流”
+只排除 dedup/rate-limit 变更，不能压制 DataMode 的既有安全后果。
+
 ### 11.5 数据流与失败处理
 
 ```text

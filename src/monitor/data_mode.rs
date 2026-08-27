@@ -9,10 +9,9 @@
 //!   Full/Degraded --(Quote staleness > 120s)--> Unsafe
 //!   Degraded --(全部 Capability 恢复)--> Full
 //!
-//! 关键设计: **OrderBook 恒缺不拖累全局模式** (PR2-2.1 专项要求)
-//!   - OrderBook Missing → 计入 `missing_capabilities`, 但 DataMode 仍可 Full
-//!   - 只有缺盘口时, 推送横幅显示 "[⚠️ 缺盘口深度: 本条不含承接判断]"
-//!   - 业务侧 (T-07 候选触发) 缺盘口时 EvidenceQuality=Missing, 但不阻塞触发
+//! BR-216: MoneyFlow 仍未接入逐证券真实 provider，保持辅助能力；BR-253 的严格 T0
+//! 全批准入已把 OrderBook 接入真实 provider。因此 OrderBook Missing 或超过其 600s
+//! 预算会使 DataMode 降为 Degraded；只有 Quote 断流会使其进入 Unsafe。
 
 #[cfg(test)]
 use chrono::Utc;
@@ -324,12 +323,12 @@ impl Capability {
     /// false = 辅助能力, 缺失只挂横幅, 不降级
     ///
     /// BR-216: 判定依据是"是否已接入真实 provider", 不是"是否重要"。
-    /// MoneyFlow 与 OrderBook 在 monitor 进程内均无生产取数路径
-    /// (BR-190 记 `provider_capability_not_live_admitted`), 若继续算关键能力,
-    /// `critical_stale` 恒非空、Full 分支永不可达, 安全门恒红即等于失效,
-    /// 反而掩盖 Quote 真实断流。二者一旦接入真实 provider 必须改回 true。
+    /// MoneyFlow 仍无逐证券真实 provider（BR-190
+    /// `provider_capability_not_live_admitted`），若将其算作关键能力会让
+    /// `critical_stale` 恒非空、Full 分支永不可达。OrderBook 已由 BR-253 的严格 T0
+    /// 全批准入标记成功，必须作为关键能力参与 DataMode。
     pub fn is_critical(self) -> bool {
-        !matches!(self, Capability::OrderBook | Capability::MoneyFlow)
+        !matches!(self, Capability::MoneyFlow)
     }
 }
 
@@ -565,9 +564,9 @@ impl DataHealth {
 /// PR2-2.1 主评估函数
 ///
 /// 规则:
-///   1. 任一**关键** capability 缺失或 staleness > critical_max_age_secs → Degraded
+///   1. 任一**关键** capability 缺失或超过其注册的新鲜度预算 → Degraded
 ///   2. Quote staleness > critical_max_age_secs (即行情断流) → Unsafe
-///   3. OrderBook 缺失只计入 missing, 不触发 Degraded (专项要求)
+///   3. OrderBook 使用既有 600s 预算；缺失或超期进入 Degraded，绝不升级为 Unsafe
 ///   4. 全 Full 且全 fresh → Full
 ///
 /// `prev` 由调用方从 history 表恢复, 首次评估传 None.
@@ -623,7 +622,7 @@ pub fn evaluate(input: &DataHealthInput, prev: Option<DataMode>) -> DataHealth {
         };
     }
 
-    // 3. 仅辅助能力缺失 (OrderBook) → Full, 横幅提示
+    // 3. 仅辅助能力（当前仅 MoneyFlow）缺失 → Full, 横幅提示
     DataHealth {
         mode: DataMode::Full,
         missing,
@@ -689,8 +688,8 @@ fn input_from_successes_at(
 /// Build a health snapshot from actual process-local source successes.
 ///
 /// A capability absent from the tracker has never succeeded in this process and
-/// is therefore reported as Missing. OrderBook is intentionally never marked by
-/// current production code because no real depth source is wired yet.
+/// is therefore reported as Missing. BR-253 marks OrderBook only after a strict,
+/// exact, fully successful T0 batch from its real provider.
 pub fn current_data_health_input(
     critical_max_age_secs: u64,
     orderbook_max_age_secs: u64,
@@ -715,7 +714,7 @@ mod tests {
     fn br148_new_capabilities_are_warming_or_unsupported() {
         let t = CapabilityTracker::new();
         t.register_supported(Capability::Quote).unwrap();
-        t.register_unsupported(Capability::OrderBook).unwrap();
+        t.register_unsupported(Capability::MoneyFlow).unwrap();
         let wall = FixedOffset::east_opt(8 * 3600)
             .unwrap()
             .with_ymd_and_hms(2026, 7, 22, 9, 0, 0)
@@ -735,13 +734,13 @@ mod tests {
                 .state,
             CapabilityState::Warming
         );
-        let ob = s
+        let money_flow = s
             .observations
             .iter()
-            .find(|o| o.capability == Capability::OrderBook)
+            .find(|o| o.capability == Capability::MoneyFlow)
             .unwrap();
-        assert_eq!(ob.state, CapabilityState::Unsupported);
-        assert!(ob.next_retry_at.is_none());
+        assert_eq!(money_flow.state, CapabilityState::Unsupported);
+        assert!(money_flow.next_retry_at.is_none());
     }
 
     #[test]
@@ -822,12 +821,11 @@ mod tests {
     }
 
     #[test]
-    fn full_when_only_orderbook_missing() {
+    fn degraded_when_only_orderbook_missing_after_provider_admission() {
         let mut input = input_all_fresh();
         input.capabilities[4] = CapabilityStatus::missing(Capability::OrderBook);
         let h = evaluate(&input, Some(DataMode::Full));
-        // OrderBook 缺失 → Full, 但 missing 包含
-        assert_eq!(h.mode, DataMode::Full, "OrderBook 缺失不降级");
+        assert_eq!(h.mode, DataMode::Degraded);
         assert!(h.missing.contains(&Capability::OrderBook));
     }
 
@@ -838,6 +836,17 @@ mod tests {
         input.capabilities[4] = CapabilityStatus::fresh(Capability::OrderBook, 300);
         let h = evaluate(&input, None);
         assert_eq!(h.mode, DataMode::Full);
+    }
+
+    #[test]
+    fn degraded_when_orderbook_exceeds_its_existing_budget() {
+        let mut input = input_all_fresh();
+        input.capabilities[4] =
+            CapabilityStatus::fresh(Capability::OrderBook, input.orderbook_max_age_secs + 1);
+        assert_eq!(
+            evaluate(&input, Some(DataMode::Full)).mode,
+            DataMode::Degraded
+        );
     }
 
     // ---- Degraded 场景 ----
@@ -916,6 +925,12 @@ mod tests {
         );
     }
 
+    #[test]
+    fn br216_provider_backed_orderbook_is_critical() {
+        assert!(Capability::OrderBook.is_critical());
+        assert!(!Capability::MoneyFlow.is_critical());
+    }
+
     // ---- Unsafe 场景 ----
 
     #[test]
@@ -980,8 +995,8 @@ mod tests {
             "MoneyFlow 未接入真实 provider, 不得永久压低 DataMode"
         );
         assert!(
-            !Capability::OrderBook.is_critical(),
-            "OrderBook 辅助, 缺失不降级"
+            Capability::OrderBook.is_critical(),
+            "BR-253 已准入真实 OrderBook，缺失必须降级"
         );
     }
 

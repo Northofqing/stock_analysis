@@ -3217,10 +3217,14 @@ git commit -m "fix(grpc): strictly reconstruct T0 wire v2 batches"
 
 **Files:**
 - Modify: `src/data_gateway/grpc_source.rs`
+- Modify: `src/monitor/data_mode.rs`
+- Modify: `docs/business_rules.md`
+- Modify: `docs/superpowers/specs/2026-08-13-grpc-data-channel-design.md`
+- Modify: `docs/superpowers/plans/2026-08-13-grpc-data-channel.md`
 
 **Interfaces:**
 - Consumes: 已通过 `convert::t0_evidence_batch_at` 和现有 exact-outcome 集合门的批次计数。
-- Produces: `complete_t0_batch_proves_order_book(requested_len, record_len, rejection_len) -> bool`；成功时调用 `mark_capability_success(Capability::OrderBook)`。
+- Produces: `complete_t0_batch_proves_order_book(requested_len, record_len, rejection_len) -> bool`；成功时调用 `mark_capability_success(Capability::OrderBook)`，并按 BR-216 让已接入真实 provider 的全局 OrderBook 作为关键能力参与 DataMode。
 
 - [ ] **Step 1: 写纯函数失败测试**
 
@@ -3292,6 +3296,81 @@ Expected: PASS。
 ```bash
 git add src/data_gateway/grpc_source.rs
 git commit -m "fix(monitor): admit OrderBook only from complete T0 batches"
+```
+
+- [ ] **Step 7: 写 BR-216 分类失败测试**
+
+审查发现：全局 `OrderBook` 成功标记已经证明真实 provider 接入，而 BR-216 明确要求该能力
+接入后恢复为关键能力。先修改 `src/monitor/data_mode.rs` 的既有测试，使其表达当前合同：
+
+```rust
+#[test]
+fn degraded_when_only_orderbook_missing_after_provider_admission() {
+    let mut input = input_all_fresh();
+    input.capabilities[4] = CapabilityStatus::missing(Capability::OrderBook);
+    let h = evaluate(&input, Some(DataMode::Full));
+    assert_eq!(h.mode, DataMode::Degraded);
+    assert!(h.missing.contains(&Capability::OrderBook));
+}
+
+#[test]
+fn br216_provider_backed_orderbook_is_critical() {
+    assert!(Capability::OrderBook.is_critical());
+    assert!(!Capability::MoneyFlow.is_critical());
+}
+```
+
+保留 `OrderBook` 300 秒、预算 600 秒仍为 Full 的既有测试，并增加超过 600 秒进入 Degraded
+的断言；不得把 OrderBook 缺失升级为 Unsafe，Quote 仍是唯一直接触发 Unsafe 的能力。
+
+- [ ] **Step 8: 验证分类测试先失败**
+
+Run: `cargo test --lib monitor::data_mode::tests::br216_provider_backed_orderbook_is_critical -- --exact`
+
+Run: `cargo test --lib monitor::data_mode::tests::degraded_when_only_orderbook_missing_after_provider_admission -- --exact`
+
+Expected: FAIL；现有实现仍把 OrderBook 归辅助并对缺失返回 Full。
+
+- [ ] **Step 9: 实现 BR-216 分类并同步设计真相**
+
+`Capability::is_critical` 只把仍无真实 provider 的 `MoneyFlow` 归为辅助：
+
+```rust
+pub fn is_critical(self) -> bool {
+    !matches!(self, Capability::MoneyFlow)
+}
+```
+
+同步修改 `data_mode.rs` 的模块说明、`evaluate` 规则说明、分支注释和
+`current_data_health_input` 注释：OrderBook 已由 BR-253 的严格 T0 全批准入标记；缺失或超过
+既有 `orderbook_max_age_secs` 时进入 Degraded，仍不得伪造成功或替代 MoneyFlow。
+
+在设计 §11.4 和 BR-253 中明确：`mark_capability_success(OrderBook)` 是全局真实 provider
+准入，因此触发 BR-216 的关键能力分类；“不修改推送节流”只表示不修改 dedup/rate-limit，
+不能压制 DataMode 的既有安全后果。不修改任何 config threshold。
+
+- [ ] **Step 10: 验证 DataMode、网关和规则合同**
+
+Run: `cargo test --lib monitor::data_mode::tests:: -- --nocapture`
+
+Run: `cargo test --lib data_gateway::grpc_source::tests:: -- --nocapture`
+
+Run: `bash tools/compliance/lib/check_business_rules.sh`
+
+Run: `bash tools/compliance/lib/check_design_contradiction.sh`
+
+Run: `cargo clippy --lib --all-features -- -D warnings`
+
+Expected: 全部 PASS；MoneyFlow 仍是辅助/unsupported，OrderBook 新鲜时 Full、缺失或超过 600 秒时 Degraded，Quote 断流仍为 Unsafe。
+
+- [ ] **Step 11: 提交审查修复**
+
+```bash
+git add docs/business_rules.md \
+  docs/superpowers/specs/2026-08-13-grpc-data-channel-design.md \
+  docs/superpowers/plans/2026-08-13-grpc-data-channel.md \
+  src/monitor/data_mode.rs
+git commit -m "fix(monitor): make admitted OrderBook critical"
 ```
 
 ---
