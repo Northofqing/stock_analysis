@@ -2048,15 +2048,15 @@ mod tests {
 
         let day = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
         let request = crate::data_gateway::BenchmarkRequest {
-            instrument: crate::data_gateway::HS300_CANONICAL.to_owned(),
+            instrument: "sh000905".to_owned(),
             range: crate::data_gateway::BenchmarkRange::Daily { from: day, to: day },
         };
         let expected_request_hash = super::super::benchmark::canonical_base_request_hash(&request);
         let error = ReviewDataGateway::new()
             .benchmark_bars(request)
             .await
-            .expect_err("production identity attestation is intentionally unavailable");
-        assert_eq!(error.reason_code(), "benchmark_identity_unverified");
+            .expect_err("unsupported benchmark must fail before provider access");
+        assert_eq!(error.reason_code(), "benchmark_instrument_unsupported");
 
         let mut connection = DatabaseManager::get().get_conn().unwrap();
         let after = diesel::sql_query(
@@ -2074,7 +2074,12 @@ mod tests {
         )
         .get_result::<BenchmarkTransportAuditRow>(&mut *connection)
         .expect("failed provider acquisition audit");
+        assert_eq!(row.capability, "BenchmarkBars");
+        assert_eq!(row.provider, "Tdx");
         assert_eq!(row.request_hash, expected_request_hash);
+        assert_eq!(row.outcome, "unsupported");
+        assert_eq!(row.reason_code, "benchmark_instrument_unsupported");
+        assert_eq!(row.retryable, 0);
     }
 
     #[tokio::test]

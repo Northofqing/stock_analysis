@@ -76,7 +76,7 @@ Expected: FAIL，测试在 source access 前得到 `benchmark_identity_unverifie
 Actual: exit 101；1 failed / 3002 filtered。失败值为
 `GatewayError { capability: "BenchmarkBars", provider: Some(Tdx), audit_outcome: "unavailable", reason_code: "benchmark_identity_unverified", retryable: false }`，定位于生产 attestation，符合预期 RED。
 
-- [ ] **Step 4: 提交 Gate A + RED。**
+- [x] **Step 4: 提交 Gate A + RED。**
 
 ```bash
 git add docs/superpowers/specs/2026-08-20-attribution-research-loop-design.md \
@@ -84,6 +84,8 @@ git add docs/superpowers/specs/2026-08-20-attribution-research-loop-design.md \
   src/data_gateway/benchmark.rs
 git commit -m "test: freeze benchmark request-bound attestation"
 ```
+
+Actual: commit `d2dc4dc`。
 
 ### Task 2: 实现类型化 TDX HS300 请求绑定
 
@@ -96,7 +98,7 @@ git commit -m "test: freeze benchmark request-bound attestation"
 - Consumes: `BenchmarkProviderAttestation::admit(&BenchmarkRequest)` 和锁定的 Magic TDX revision。
 - Produces: 私有 `TdxIndexProtocolContract` 能力；`admit` 返回该能力并供 page request/hash/evidence 使用。
 
-- [ ] **Step 1: 用类型化 identity mode 替换生产身份布尔。**
+- [x] **Step 1: 用类型化 identity mode 替换生产身份布尔。**
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,14 +125,14 @@ struct TdxIndexProtocolContract {
 `request.instrument == contract.canonical_instrument`，Minute1 再独立检查时间标签语义，并返回
 `TdxIndexProtocolContract`。测试专用 variant 只允许测试 registry 路径，不进入生产构建。
 
-- [ ] **Step 2: 让同一合同生成所有 provider 身份字段。**
+- [x] **Step 2: 让同一合同生成所有 provider 身份字段。**
 
 把 `canonical_base_request_hash`、`fetch_raw_benchmark_pages`、
 `canonical_acquisition_bytes`、raw identity anchor 和 `BatchEvidence.source` 中的
 market/code/category/fq/revision 改为从 `TdxIndexProtocolContract` 读取；保留既有 hash domain，
 避免使已保存 V1 manifest 在无迁移情况下失效。
 
-- [ ] **Step 3: 保持 Minute1 和 unsupported identity fail-closed。**
+- [x] **Step 3: 保持 Minute1 和 unsupported identity fail-closed。**
 
 更新既有 `attestation_fails_before_source_access_and_minute_semantics_are_independent`：Daily 改由
 Task 1 正向测试覆盖；Minute1 仍断言 `benchmark_time_semantics_unavailable` 且 source offsets 为空。
@@ -140,13 +142,13 @@ Task 1 正向测试覆盖；Minute1 仍断言 `benchmark_time_semantics_unavaila
 `audit_persists_benchmark_outcome_independently_from_retryability` 使用显式测试专用 `Unverified`
 attestation 继续覆盖 `benchmark_identity_unverified` 错误分类。
 
-- [ ] **Step 4: 让 ReviewDataGateway 入口测试不依赖真实网络。**
+- [x] **Step 4: 让 ReviewDataGateway 入口测试不依赖真实网络。**
 
 把 `benchmark_entrypoint_delegates_to_library_and_appends_exactly_one_audit_row` 的请求改为
 未注册 `sh000905`，断言 `benchmark_instrument_unsupported`、精确 request hash，以及
 `BenchmarkBars` 审计行只增加一条；这只验证委派/审计，不把网络可用性写入单元测试。
 
-- [ ] **Step 5: 运行 GREEN 和定向回归。**
+- [x] **Step 5: 运行 GREEN 和定向回归。**
 
 ```bash
 cargo test --lib data_gateway::benchmark --all-features -- --test-threads=1
@@ -157,7 +159,11 @@ cargo test --bin strategy_attribution --all-features -- --test-threads=1
 
 Expected: 全部 exit 0；Daily 正向测试访问一次 TEST source，Minute1/unsupported 均零 source access。
 
-- [ ] **Step 6: 提交最小实现。**
+Actual: all-features Benchmark 26/26、no-default Benchmark 26/26、Review 单审计入口 1/1、CLI 6/6
+均 exit 0；`cargo clippy --lib --all-features -- -D warnings` exit 0。no-default 的本次
+`contract` warning 已清零，剩余 62 个 warning 均来自未修改路径。
+
+- [x] **Step 6: 提交最小实现。**
 
 ```bash
 git add src/data_gateway/benchmark.rs src/data_gateway/review.rs
