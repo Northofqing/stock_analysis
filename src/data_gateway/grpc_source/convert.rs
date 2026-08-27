@@ -5470,6 +5470,382 @@ mod tests {
     }
 
     #[test]
+    fn offline_fixture_converters_cover_dormant_available_empty_and_invalid_contracts() {
+        macro_rules! assert_converter_contract {
+            (
+                $case:literal,
+                $converter:path,
+                $provider_name:literal,
+                $provider:expr,
+                $source:literal,
+                $available_value:expr,
+                |$records:ident| $identity_assertion:block,
+                |$invalid:ident| $invalid_mutation:block
+            ) => {{
+                let available_value: Value = $available_value;
+                let available_json = serde_json::to_string(&available_value)
+                    .expect("TEST_CODE available converter JSON");
+                let available_query = mk_q(&available_json, $provider_name, $source);
+                let available = $converter(&available_query)
+                    .unwrap_or_else(|error| panic!("{} available failed: {error}", $case));
+                assert_eq!(available.records().len(), 1, "{} record count", $case);
+                assert_eq!(available.evidence().provider, $provider, "{} provider", $case);
+                assert_eq!(available.evidence().source, $source, "{} source", $case);
+                assert_eq!(available.evidence().batch_id, "b-1", "{} batch_id", $case);
+                let $records = available.records();
+                $identity_assertion
+
+                let empty_query = mk_q("[]", $provider_name, $source);
+                let empty = $converter(&empty_query)
+                    .unwrap_or_else(|error| panic!("{} verified-empty failed: {error}", $case));
+                assert!(empty.is_verified_empty(), "{} empty state", $case);
+                assert_eq!(empty.evidence().provider, $provider, "{} empty provider", $case);
+                assert_eq!(empty.evidence().batch_id, "b-1", "{} empty batch_id", $case);
+
+                let mut $invalid = available_value;
+                $invalid_mutation
+                let invalid_json = serde_json::to_string(&$invalid)
+                    .expect("TEST_CODE invalid converter JSON");
+                let invalid_query = mk_q(&invalid_json, $provider_name, $source);
+                let error = $converter(&invalid_query)
+                    .expect_err(concat!($case, " invalid evidence must fail closed"));
+                assert_eq!(error.reason_code(), "invalid_evidence", "{} invalid reason", $case);
+            }};
+        }
+
+        assert_converter_contract!(
+            "global_indices",
+            global_indices,
+            "Tdx",
+            ProviderId::Tdx,
+            "TEST_CODE_source",
+            serde_json::json!([{
+                "code": "DowJones",
+                "name": "TEST_CODE_DJ",
+                "value": 41000.0,
+                "change": 12.0,
+                "change_percent": 0.03,
+                "source_at": "2026-08-15T09:35:00+08:00"
+            }]),
+            |records| {
+                assert_eq!(records[0].name, "TEST_CODE_DJ");
+            },
+            |invalid| {
+                invalid[0]["code"] = serde_json::json!("TEST_CODE_UNKNOWN");
+            }
+        );
+
+        assert_converter_contract!(
+            "foreign_exchange",
+            foreign_exchange,
+            "Tdx",
+            ProviderId::Tdx,
+            "TEST_CODE_source",
+            serde_json::json!([{
+                "pair": "UsdCny",
+                "name": "TEST_CODE_USD_CNY",
+                "rate": 7.15,
+                "change": null,
+                "change_percent": null,
+                "source_at": "2026-08-15T09:35:00+08:00"
+            }]),
+            |records| {
+                assert_eq!(records[0].name, "TEST_CODE_USD_CNY");
+            },
+            |invalid| {
+                invalid[0]["pair"] = serde_json::json!("TEST_CODE_USDCNY");
+            }
+        );
+
+        assert_converter_contract!(
+            "announcements",
+            announcements,
+            "Tdx",
+            ProviderId::Tdx,
+            "TEST_CODE_source",
+            serde_json::json!([{
+                "announcement_id": "TEST_CODE_A1",
+                "code": "TEST_CODE_600519",
+                "category": null,
+                "title": "TEST_CODE 公告",
+                "published_at": "2026-08-15T09:00:00+08:00",
+                "url": "https://example.com/TEST_CODE_A1"
+            }]),
+            |records| {
+                assert_eq!(records[0].announcement_id, "TEST_CODE_A1");
+                assert_eq!(records[0].code, "TEST_CODE_600519");
+            },
+            |invalid| {
+                invalid[0]
+                    .as_object_mut()
+                    .expect("TEST_CODE announcement object")
+                    .remove("title");
+            }
+        );
+
+        assert_converter_contract!(
+            "economic_calendar",
+            economic_calendar,
+            "Jin10",
+            ProviderId::Jin10,
+            "TEST_CODE_source",
+            serde_json::json!([{
+                "event_id": "TEST_CODE_E1",
+                "indicator_id": 123,
+                "country": "CN",
+                "name": "TEST_CODE CPI",
+                "period": "2026-07",
+                "scheduled_at": "2026-08-15T09:30:00+08:00",
+                "released_at": "2026-08-15T09:30:00+08:00",
+                "previous": "0.6",
+                "consensus": "0.7",
+                "actual": "0.8",
+                "revised": null,
+                "unit": "%",
+                "importance": 3,
+                "impact": "positive"
+            }]),
+            |records| {
+                assert_eq!(records[0].event_id, "TEST_CODE_E1");
+            },
+            |invalid| {
+                invalid[0]["importance"] = serde_json::json!("bad");
+            }
+        );
+
+        assert_converter_contract!(
+            "futures_delivery",
+            futures_delivery,
+            "Tdx",
+            ProviderId::Tdx,
+            "TEST_CODE_source",
+            serde_json::json!([{
+                "contract_code": "TEST_CODE_IF2608",
+                "product_code": "TEST_CODE_IF",
+                "last_trading_date": null,
+                "delivery_date": "2026-08-21",
+                "notice_url": "https://example.com/TEST_CODE_FD"
+            }]),
+            |records| {
+                assert_eq!(records[0].contract_code, "TEST_CODE_IF2608");
+            },
+            |invalid| {
+                invalid[0]["delivery_date"] = serde_json::json!("bad-date");
+            }
+        );
+
+        assert_converter_contract!(
+            "market_statistics",
+            market_statistics,
+            "Tdx",
+            ProviderId::Tdx,
+            "TEST_CODE_source",
+            serde_json::json!([{
+                "code": "TEST_CODE_600519",
+                "turnover_rate": 0.42,
+                "trailing_pe": 28.5,
+                "static_pe": 26.0,
+                "pb": 9.2,
+                "total_market_cap": 1880000000000.0,
+                "floating_market_cap": 1880000000000.0,
+                "upper_limit": 1650.0,
+                "lower_limit": 1350.0,
+                "volume_ratio": 1.1
+            }]),
+            |records| {
+                assert_eq!(records[0].instrument().code(), "TEST_CODE_600519");
+            },
+            |invalid| {
+                invalid[0]["upper_limit"] = serde_json::json!(0.0);
+            }
+        );
+
+        assert_converter_contract!(
+            "technical_bars",
+            technical_bars,
+            "Tdx",
+            ProviderId::Tdx,
+            "TEST_CODE_source",
+            serde_json::json!([{
+                "open": 10.0,
+                "close": 10.1,
+                "high": 10.2,
+                "low": 9.9,
+                "vol": 1000.0,
+                "amount": 10000.0,
+                "at": "2026-08-15T10:30:00+08:00"
+            }]),
+            |records| {
+                assert_eq!(records[0].datetime, "2026-08-15T10:30:00+08:00");
+            },
+            |invalid| {
+                invalid[0]
+                    .as_object_mut()
+                    .expect("TEST_CODE technical bar object")
+                    .remove("at");
+            }
+        );
+
+        assert_converter_contract!(
+            "intraday_shape",
+            intraday_shape,
+            "Tdx",
+            ProviderId::Tdx,
+            "TEST_CODE_source",
+            serde_json::json!([{
+                "date": "2026-08-15",
+                "pre_close": 1500.0,
+                "open_pct": 0.2,
+                "high_pct": 2.1,
+                "low_pct": -0.8,
+                "close_pct": 1.3,
+                "amplitude": 2.9,
+                "tail_30m_pct": 0.5,
+                "shape_label": "TEST_CODE_SHAPE"
+            }]),
+            |records| {
+                assert_eq!(records[0].shape_label, "TEST_CODE_SHAPE");
+            },
+            |invalid| {
+                invalid[0]
+                    .as_object_mut()
+                    .expect("TEST_CODE intraday shape object")
+                    .remove("shape_label");
+            }
+        );
+
+        assert_converter_contract!(
+            "market_dragon_tiger",
+            market_dragon_tiger,
+            "Tdx",
+            ProviderId::Tdx,
+            "TEST_CODE_source",
+            serde_json::json!([{
+                "exchange": "Shanghai",
+                "code": "TEST_CODE_600519",
+                "ranking_net_amount_yuan": 150000000.0,
+                "disclosures": []
+            }]),
+            |records| {
+                assert_eq!(records[0].code, "TEST_CODE_600519");
+            },
+            |invalid| {
+                invalid[0]
+                    .as_object_mut()
+                    .expect("TEST_CODE dragon-tiger object")
+                    .remove("exchange");
+            }
+        );
+
+        assert_converter_contract!(
+            "board_constituents",
+            board_constituents,
+            "Tdx",
+            ProviderId::Tdx,
+            "TEST_CODE_source",
+            serde_json::json!([{
+                "instrument_code": "TEST_CODE_600519",
+                "board_code": "TEST_CODE_BK0475",
+                "board_name": "TEST_CODE_BOARD",
+                "kind": "Concept"
+            }]),
+            |records| {
+                assert_eq!(records[0].instrument_code, "TEST_CODE_600519");
+            },
+            |invalid| {
+                invalid[0]["kind"] = serde_json::json!("TEST_CODE_UNKNOWN");
+            }
+        );
+
+        assert_converter_contract!(
+            "research_reports",
+            research_reports,
+            "Tdx",
+            ProviderId::Tdx,
+            "TEST_CODE_source",
+            serde_json::json!([{
+                "code": "TEST_CODE_600519",
+                "report_id": "TEST_CODE_R1",
+                "title": "TEST_CODE REPORT",
+                "organization": "TEST_CODE_ORG",
+                "rating": "Buy",
+                "published_at": "2026-08-15T09:00:00+08:00",
+                "canonical_url": "https://example.com/TEST_CODE_R1",
+                "target_price_upper": 12.0,
+                "target_price_lower": 10.0
+            }]),
+            |records| {
+                assert_eq!(records[0].report_id, "TEST_CODE_R1");
+            },
+            |invalid| {
+                invalid[0]
+                    .as_object_mut()
+                    .expect("TEST_CODE research report object")
+                    .remove("report_id");
+            }
+        );
+
+        assert_converter_contract!(
+            "provider_top_n_rankings",
+            provider_top_n_rankings,
+            "Eastmoney",
+            ProviderId::Eastmoney,
+            "eastmoney-web",
+            serde_json::json!([{
+                "metric": "VolumeRatio",
+                "ordinal": 1,
+                "code": "TEST_CODE_600519",
+                "label": "TEST_CODE_SECURITY",
+                "value": 3.2,
+                "unit": "Multiple",
+                "trading_date": "2026-08-15",
+                "filter_identity": "TEST_CODE_FILTER",
+                "provider_declared_total": 20,
+                "inspected_row_count": 20
+            }]),
+            |records| {
+                assert_eq!(records[0].instrument.code(), "TEST_CODE_600519");
+            },
+            |invalid| {
+                invalid[0]["ordinal"] = serde_json::json!(0);
+            }
+        );
+
+        assert_converter_contract!(
+            "instrument_news",
+            instrument_news,
+            "Sina",
+            ProviderId::Sina,
+            "TEST_CODE_source",
+            serde_json::json!([{
+                "code": "TEST_CODE_600519",
+                "title": "TEST_CODE NEWS",
+                "summary": "TEST_CODE SUMMARY",
+                "url": "https://example.com/TEST_CODE_NEWS",
+                "source": "Sina",
+                "source_name": "TEST_CODE SINA",
+                "category": "TEST_CODE CATEGORY",
+                "external_id": "TEST_CODE_N1",
+                "published_at": "2026-08-15T09:00:00+08:00",
+                "fetched_at": "2026-08-15T09:00:01+08:00",
+                "content_hash": "TEST_CODE_HASH"
+            }]),
+            |records| {
+                assert_eq!(
+                    records[0].persistence_item().code.as_deref(),
+                    Some("TEST_CODE_600519")
+                );
+            },
+            |invalid| {
+                invalid[0]
+                    .as_object_mut()
+                    .expect("TEST_CODE instrument news object")
+                    .remove("content_hash");
+            }
+        );
+    }
+
+    #[test]
     fn missing_evidence_is_fail_closed() {
         // provider 空 → Err, 不静默猜 Tdx。
         let q = mk_q(
