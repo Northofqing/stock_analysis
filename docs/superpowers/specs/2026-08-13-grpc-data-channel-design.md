@@ -429,3 +429,58 @@ health/capability/T0，再恢复常驻监控；任一检查失败立即成对回
 本修订不处理 authenticated ExternalV1 的 ThePaper provider、持仓台账、durable delivery
 拒绝或损坏的历史 dispatcher JSONL；这些问题拥有独立根因和审计/回滚边界，不与 T0
 数据合同混合修改。本修订不解除订单门禁、不授权真实下单，也不改变策略阈值。
+
+### 11.9 Gate C 聚焦收口与合并边界
+
+Task 7 的新鲜全仓验证确认 Gate B 与离线合规均通过，但当前分支不能合并：PR coverage
+provenance 仍绑定旧 `source_sha`；其他生产改动行覆盖率为 `329/475=69.26%`，低于
+85%；candidate global/core 覆盖率均低于已审计 BR-252 baseline。与此同时，Gate D 的
+global/core 覆盖率为 77.58%/77.45%，距离 80%/95% 的固定发布下限仍有跨项目历史缺口。
+删除门禁、降低阈值、缩小分母、增加 no-region 豁免或把 fixture 结果冒充 live evidence
+均不允许。
+
+本修订选择“只闭合 Gate C、Gate D 保持 Release Blocked”的最小可合并路径：
+
+1. **只补测试，不改生产行为。** 优先覆盖本 PR 已改变的
+   `grpc_local_readiness_probe`、`grpc_server::fixture`、`grpc_server::delegate`，使其他
+   生产改动可执行行覆盖率至少 85%；同时通过既有 fixture/typed converter/monitor
+   capability 的真实分支断言覆盖当前未覆盖的核心路径，使 candidate global/core 比例均
+   不低于 `f05f506` 已审计 baseline。Task 7 的 75 行 other、476 行 global、461 行 core
+   只是当前报告分母下的诊断下限，不进入配置，也不得作为缩分母依据。
+2. **测试身份继续隔离。** 所有新增证券测试数据使用 `TEST_CODE_`；production probe 的默认
+   真实证券参数只在非 fixture 运行入口保留。测试不得放宽 production converter/resolver，
+   不得发送真实订单、真实通知或外部网络请求。
+3. **固定同一源码与测试集。** 测试提交完成且全仓验证通过后，冻结一个字面 Git commit
+   作为新的 coverage source。之后不得再修改 `src/`、测试、Cargo/build 输入；若发生变化，
+   已生成报告全部失效并重新开始。
+4. **双报告闭合 provenance。** 在同一冻结 commit、同一工具身份、同一 workspace/all-features
+   命令上独立完整运行 coverage 两次。两次必须都是零失败，且 global/core 的
+   covered/count、core file count、JSON/LCOV source set 完全一致；任一不一致都不得更新
+   baseline，必须先诊断非确定性。
+5. **最后更新合同证据。** 只有双报告一致且 candidate 不低于旧 baseline 后，才在后续独立
+   文档/合同提交中同步更新 BR-252、覆盖率设计证据和
+   `config/design_contracts.toml [coverage]` 的 `source_sha`、整数计数与工具身份。PR
+   90%/85% 及 Release 80%/95% 阈值保持不变，不增加 `reviewed_no_region`。
+6. **重新验证 Gate C。** 对合同提交后的同一 coverage 输入重新执行 fmt、strict Clippy、
+   workspace/all-features tests、offline compliance、PR coverage checker、diff 和敏感信息审查，
+   再由独立 reviewer 复核。只有 Gate C 全部 PASS 才可创建 merge-ready PR。
+
+Gate C 合并与 Gate D 发布必须保持两个状态：本方案即使成功，也只能写
+`Gate-C: PASS`、`Gate-D: Release Blocked`。不得启动 Task 8 候选端口、生产 freshness、
+双进程切换或部署；全仓 80%/95% 覆盖率治理作为独立后续项目，不吸收到本次买卖策略/T0
+改动中。
+
+失败处理与回滚如下：
+
+- patch coverage 未达标或 ratchet 回退：返回 Gate B，只补相应行为测试；
+- 双报告计数/source set 不一致：保持旧合同，返回 Gate A 诊断 coverage 非确定性；
+- 报告后源码、测试或工具身份变化：废弃本轮报告并从冻结步骤重跑；
+- 合同字段与设计/BR 不一致：Gate C 阻断，回滚独立合同提交；
+- 功能测试或数据红线失败：回到对应 Task 3/4/5/6，禁止用 coverage-only 断言掩盖错误。
+
+| 模块 | 处理 | 理由 |
+|---|---|---|
+| 现有 T0/fixture/probe 测试 seam | adopt + deepen | 覆盖真实失败分支，不改变生产语义 |
+| `tools/coverage/check_thresholds.py` | adopt unchanged | 保持 BR-252 唯一 PR/release policy seam |
+| `[coverage]` baseline | rebind after double report | 绑定当前真实源码和可复现整数计数，不得回填或降低 |
+| Release 80%/95% 门禁 | defer, never weaken | 属于独立全仓治理；继续阻断 Task 8 和发布 |
