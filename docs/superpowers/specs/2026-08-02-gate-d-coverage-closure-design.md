@@ -2949,3 +2949,48 @@ PR 除 AGENTS §3.1 字段外必须增加：
 该纠正只修复初始证据事实，不缩小分母、不删测试、不改变生产代码，也不把 Gate D 标记为
 通过。未来若需再次修改 baseline，必须重新进入 Gate A、更新 BR-252 并提供至少两次独立的
 同源码完整报告证据。
+
+### 10.14 Task 7E 当前源码基线重绑证据（2026-08-28）
+
+Task 7A–7D 的测试补强完成后，Task 7E 在完整 Gate B 与离线 PR 合规通过、tracked
+worktree clean 的字面源码 `1a2bfa82a2edfb4c2f7e0f5bd0019bd4f1ab4642` 上重新执行
+BR-252 双报告流程。工具身份为 rustc `1.95.0`（commit
+`59807616e1fa2540724bfbac14d7976d7e4a3860`）、LLVM `22.1.2`、cargo `1.95.0`
+（commit `f2d3ce0bd`）与 cargo-llvm-cov `0.8.7`，与固定合同一致。
+
+两轮均在同一个唯一 `/private/tmp` 目录中保存证据，但每轮开始前都执行独立
+`cargo llvm-cov clean --workspace`，随后完整运行 workspace/all-features 测试并以零失败结束。
+两轮 release diagnostic 的完整五元组一致：global `202873/260127`、core
+`158672/203777`、core 文件数 `218`。两轮 JSON source set 和两轮 LCOV source set
+均各含 `440` 个路径，排序后逐项相等；每轮 JSON 与 LCOV 的集合也相等。
+
+报告 SHA-256 如下，分别绑定四个实际工件，不把不同轮次的字节哈希相等误列为复现条件：
+
+| 工件 | SHA-256 |
+|---|---|
+| run1 JSON | `303e053bae4d2f93a85cde3f4433244ba9dbe6da845dd504a37b397bee6929e7` |
+| run1 LCOV | `fb2e0291a6b86a5cd91ccd008f6c4d9f8c004e7f85766f38f7d4e11eb0504314` |
+| run2 JSON | `9ff32af6173eadb4c4156b523f20f0721a309615a5aebe268df85bcba2b4479d` |
+| run2 LCOV | `91b038aa851fc8a9db8805fec02f4d23bfca42749456522defcb0b4aa8f7ce64` |
+
+候选 baseline 按整数交叉乘不低于 §10.13 的旧 baseline：
+
+```text
+202873 * 258810 = 52505561130 >= 201256 * 260127 = 52352119512
+158672 * 202935 = 32200102320 >= 157635 * 203777 = 32122387395
+```
+
+因此 `[coverage]` 只把 `source_sha` 和 global/core covered/count 重绑到上述当前源码事实；
+`core_file_count=218`、工具身份、PR core/other patch 下限 90%/85%、Release global/core
+下限 80%/95%，以及 `coverage.reviewed_no_region` 的路径集合与每个文件内容哈希全部保持不变。
+这不是阈值放宽、分母缩减或豁免扩张。
+
+候选合同写入后，PR policy checker 以 exit 0 给出 global `202873/260127=77.99%`、
+core `158672/203777=77.87%`（218 文件）、core patch `863/887=97.29%`
+（要求 90%）与 other production patch `448/496=90.32%`（要求 85%）；design
+contradiction 和 business-rule 门禁也均 exit 0。
+
+本阶段的结论严格分层：Task 7E candidate provenance 已闭合，但独立 Task 7F 尚未执行，
+因此不得把 Gate C 记为最终完成。两轮 Release 检查都按预期 exit 1，global 仅 `77.99%`、
+core 仅 `77.87%`，历史 Gate D 覆盖率债务继续 `Release Blocked`；production freshness
+明确 `NOT RUN`，live provider、生产数据库、审计签字和部署证据均不在本任务范围。

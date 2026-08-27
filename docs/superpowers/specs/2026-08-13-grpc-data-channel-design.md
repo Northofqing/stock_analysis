@@ -484,3 +484,40 @@ Gate C 合并与 Gate D 发布必须保持两个状态：本方案即使成功�
 | `tools/coverage/check_thresholds.py` | adopt unchanged | 保持 BR-252 唯一 PR/release policy seam |
 | `[coverage]` baseline | rebind after double report | 绑定当前真实源码和可复现整数计数，不得回填或降低 |
 | Release 80%/95% 门禁 | defer, never weaken | 属于独立全仓治理；继续阻断 Task 8 和发布 |
+
+### 11.10 Task 7E 双报告 provenance 证据（2026-08-28）
+
+Task 7E 在 Gate B 与离线 PR 合规均通过、tracked worktree clean 后冻结字面源码
+`1a2bfa82a2edfb4c2f7e0f5bd0019bd4f1ab4642`。工具身份固定为 rustc `1.95.0`
+（commit `59807616e1fa2540724bfbac14d7976d7e4a3860`）、LLVM `22.1.2`、cargo
+`1.95.0`（commit `f2d3ce0bd`）与 cargo-llvm-cov `0.8.7`。在同一唯一临时目录中，每轮
+均先执行 `cargo llvm-cov clean --workspace`，再独立运行完整 workspace/all-features 测试；
+两轮均零失败，且得到完全相同的五元组：
+
+| 报告 | global covered/count | core covered/count | core 文件数 | JSON/LCOV source set |
+|---|---:|---:|---:|---:|
+| run1 | `202873/260127` | `158672/203777` | `218` | 各 `440`，相互一致 |
+| run2 | `202873/260127` | `158672/203777` | `218` | 各 `440`，相互一致 |
+
+两轮 source set 逐项比较相等；报告本身保留各自独立的字节身份：
+
+- run1 JSON SHA-256：`303e053bae4d2f93a85cde3f4433244ba9dbe6da845dd504a37b397bee6929e7`
+- run1 LCOV SHA-256：`fb2e0291a6b86a5cd91ccd008f6c4d9f8c004e7f85766f38f7d4e11eb0504314`
+- run2 JSON SHA-256：`9ff32af6173eadb4c4156b523f20f0721a309615a5aebe268df85bcba2b4479d`
+- run2 LCOV SHA-256：`91b038aa851fc8a9db8805fec02f4d23bfca42749456522defcb0b4aa8f7ce64`
+
+候选值相对旧 BR-252 baseline 的整数棘轮均不回退：global 为
+`202873 × 258810 = 52505561130 >= 201256 × 260127 = 52352119512`；core 为
+`158672 × 202935 = 32200102320 >= 157635 × 203777 = 32122387395`。因此只重绑
+`source_sha` 与精确 covered/count；`core_file_count=218`、PR 90%/85%、Release
+80%/95%、工具身份及 `reviewed_no_region` 集合与内容哈希均不变。
+
+更新候选合同后，Task 7E 的 PR checker 以 exit 0 验证 global `202873/260127`
+（`77.99%`）、core `158672/203777`（`77.87%`，218 文件）、core patch
+`863/887=97.29%`（要求 90%）以及 other production patch `448/496=90.32%`
+（要求 85%）；design contradiction 与 business-rule 门禁也均 exit 0。
+
+Gate C 与 Gate D 必须继续分层：Task 7E 仅闭合 candidate provenance，尚需独立 Task 7F
+复跑后才能确认 Gate C；两轮 Release 诊断均以 exit 1 给出 global `77.99%`、core
+`77.87%`，所以 Gate D 继续 `Release Blocked`。本阶段 production freshness 明示
+`NOT RUN`，没有启动 monitor/server、访问生产数据库、通知、订单或部署。
