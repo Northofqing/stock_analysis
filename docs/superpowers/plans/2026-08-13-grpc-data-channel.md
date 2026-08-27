@@ -4085,8 +4085,9 @@ audit_opening_readiness_failure("TEST_CODE_GATE_C", &failure).unwrap();
 
 随后查询 `data_acquisition_audit`，按 capability 前缀 `TEST_CODE_GATE_C-` 断言 available、
 verified_empty、failure 三行的 accepted/rejected/retryable/reason_code。最后把单 route 的
-`records=usize::MAX` 传给 `audit_opening_readiness_report`，断言
-`reason_code()=="accepted_count_overflow"` 且没有部分新增审计行。
+`records=usize::MAX` 传给 `audit_opening_readiness_report`，沿用既有 BR-246 审计失败合同断言
+`reason_code()=="acquisition_audit_unavailable"`、`retryable()==true` 且 message 包含
+`accepted_count_overflow`；同时断言没有部分新增审计行。不得为测试改变生产错误分类。
 
 - [ ] **Step 3: 新增 CapabilityTracker fail-closed matrix**
 
