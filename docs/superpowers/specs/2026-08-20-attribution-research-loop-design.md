@@ -1176,3 +1176,122 @@ identity 的权威形式为 `magic-tdx-index-bars@<TDX_DEPENDENCY_REVISION>`：�
 表示会保守 fail-closed，而同字符串掩盖不同真实 revision 属于上游 evidence contract 违规，不在
 本 exact-string 组合合同内。business-rules 仍精确保持既有 60 errors / 157 warnings，因此该接受
 只关闭本 bounded task，不改变整体 Gate 状态。
+
+### 15.14 Daily 基准请求绑定身份验收（2026-08-27）
+
+#### 15.14.1 决策、授权与问题证据
+
+用户确认 Magic TDX 数据源及其指数 K 线协议为可信来源，并授权先修复基准数据问题、恢复正常
+归因。本修订只验收 `sh000300` 的 `Daily` 请求绑定身份；不验收 Minute1 标签语义，不授权
+monitor scheduler、订单、推送或正式策略结论。
+
+2026-08-27 的真实只读 probe 对精确请求 `market=1, code=000300, category=4, fq=0` 返回 800 条
+原始行，其中目标交易日一条，来源为
+`magic-tdx-index-bars@75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e`。原始行不回显 instrument，
+所以 `BenchmarkProbeReport.identity_verification` 继续保留 `Unverified`；它只描述响应字段，不能
+代替正式请求绑定证明。随后获授权执行的 `capture --commit` 在访问 provider 前失败，留下而不删除
+BR-159 审计 `id=966954`，segment/manifest 均为零：
+
+```text
+$ rg -n 'identity_verified: false|production_default\(\)|benchmark_identity_unverified' \
+    src/data_gateway/benchmark.rs
+1360:    const fn production_default() -> Self {
+1362:            identity_verified: false,
+1379:                "benchmark_identity_unverified",
+1462:    if let Err(error) = BenchmarkProviderAttestation::production_default().admit(&request) {
+
+$ sqlite3 -readonly data/stock_analysis.db \
+  "SELECT id,capability,provider,source,outcome,reason_code,retryable,request_count,accepted_count,rejected_count FROM data_acquisition_audit WHERE id=966954;"
+966954|BenchmarkBars|Tdx|review-data-gateway|unavailable|benchmark_identity_unverified|0|1|0|1
+
+$ sqlite3 -readonly data/stock_analysis.db \
+  "SELECT 'segment',COUNT(*) FROM benchmark_segment_revision UNION ALL SELECT 'manifest',COUNT(*) FROM benchmark_manifest;"
+segment|0
+manifest|0
+```
+
+根因不是来源内容不可信，而是实现把“响应逐行回显代码”当成唯一身份形式，并把生产 attestation
+永久固定为 `false`；这与同仓库 `OutcomeDailyBars` 已采用的 canonical code/market/provider +
+request/result hash 绑定模式不一致。直接改成无条件 `true` 会丢失证明依据，禁止采用。
+
+#### 15.14.2 类型化请求绑定合同与数据流
+
+Benchmark adapter 内新增私有、不可由调用方构造的 `TdxIndexProtocolContract`，唯一生产值固定：
+
+```text
+canonical instrument = sh000300
+provider             = Tdx
+market/code          = 1 / 000300
+Daily category       = 4
+Minute1 category     = 8
+adjustment/fq        = 0 / None
+dependency revision  = 75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e
+identity mode        = request_bound_tdx_hs300_v1
+```
+
+`BenchmarkProviderAttestation::production_default()` 不再保存可误设的身份布尔，而保存类型化
+`RequestBoundTdxHs300V1`。`admit(request)` 必须先验证 canonical instrument 与上述合同完全相等，
+再返回协议合同能力值；后续每一页的 provider 请求、base request hash、canonical acquisition
+bytes、batch ID 和 `BatchEvidence.source` 全部从同一个能力值生成。这样，正式准入证明的是：
+
+```text
+受信任且锁定 revision 的 TDX IndexBars 协议
+  + 同一连接上的精确 market/code/category/fq/page 请求
+  + 请求范围、分页内容与完整批次的确定性 hash
+  + 完整性/OHLC/交易日覆盖校验
+  + BR-159 append-only receipt
+```
+
+任一 canonical instrument、协议参数、revision、分页、范围、内容 hash 或审计绑定不一致均显式
+失败，不返回部分批次。Daily 通过身份合同后才允许访问来源；Minute1 即使身份合同成立，仍必须在
+访问来源前返回 `benchmark_time_semantics_unavailable`，因为分钟结束标签尚未验收。
+
+Raw diagnostic seam 继续使用同一协议参数做机械请求，但其 DTO 不获得 `Verified` variant、不能
+生成 `GatewayBatch`/receipt/segment，也不能更新 attestation。正式身份验收只存在于 admitted
+acquisition seam，避免把“看到了数据”冒充“数据已准入”。
+
+#### 15.14.3 失败模式、旧模块关系与范围
+
+| 模块 | adopt/reject | 处理 |
+| --- | --- | --- |
+| `outcome_daily_bars` | adopt | 复用精确请求/响应绑定思想，不复制其面向个股的复杂 DTO |
+| `historical_bars` | adopt | 保留 trusted-provider + audited request envelope 先例，不改代码 |
+| `BenchmarkProbeReport` | preserve | 继续报告 provider echo 缺失和 raw `Unverified`，不冒充准入 |
+| `BenchmarkBars` gRPC | preserve | server 使用同一 library admission；client 继续重验 request、batch 与 receipt |
+| `TechnicalBars` / 旧 benchmark fetch | reject | 不恢复旧路径、不回退、不旁路 manifest |
+| `monitor/main.rs` | reject | 本修订不接 scheduler，避免扩大到未授权生产集成 |
+
+新增或保持的失败边界：未注册 instrument 仍为 `benchmark_instrument_unsupported`；协议合同不匹配
+为非 retryable `benchmark_identity_contract_mismatch`；Minute1 仍为
+`benchmark_time_semantics_unavailable`；网络、分页、OHLC、交易日覆盖、hash、BR-159 或 segment
+链失败继续使用既有 typed outcome/reason/retryability，禁止 mock、空结果或昨日数据 fallback。
+
+本修订不改 config/threshold，不新增 dedup/filter/sort/limit 规则，继续引用 BR-251。数据红线为
+2.1、2.2、2.3、2.4、2.7、2.8；2.9 为 N/A，2.10 无新增规则。
+
+#### 15.14.4 TDD、验收与回滚
+
+测试 seam 固定为：注入 `IndexBarsSource` 的完整 Benchmark acquisition 行为、
+`ReviewDataGateway::benchmark_bars` 的单审计入口，以及真实 `strategy_attribution` CLI。必须先保留
+RED：生产 Daily 精确 HS300 请求当前返回 `benchmark_identity_unverified`；GREEN 后断言 source
+收到且只收到 `market=1/code=000300/category=4/fq=0`，返回批次 source revision、request hash、
+记录和覆盖全部一致。另测 production Minute1 仍在 source access 前失败，unsupported identity
+仍零访问，入口失败仍只追加一条 BR-159 审计。
+
+Gate B/C 使用 §15.9 的仓库标准命令，并新增 CLI all/no-default release build。真实验收使用：
+
+```bash
+target/release/strategy_attribution capture --db data/stock_analysis.db \
+  --instrument sh000300 --granularity daily --from 2026-08-27 --to 2026-08-27 \
+  --commit --format json
+```
+
+成功标准为：退出码 0；新增一条 accepted `BenchmarkBars/Tdx` BR-159 receipt；新增而不覆盖一个
+Daily segment/manifest；Reader 以返回的 exact manifest hash 读回 2026-08-27；随后
+`scheduled`/`replay` 使用显式 manifest 时不再出现 `benchmark_identity_unverified`。若后续成交、
+费用、个股历史收盘或其他证据失败，必须按其真实 typed reason 报告，不能把“Benchmark 已恢复”
+扩大成“所有归因输入均已可用”。
+
+代码/文档回滚只使用 `git revert` 回退本节证据中冻结的实际提交 SHA，并停止新 writer。失败审计 `id=966954`、任何新
+acquisition/segment/manifest/report/failure 事实不得删除、覆盖或回退；架构问题回 Gate A，代码
+问题回 Gate B，数据红线问题在 Gate B 修复后重做本节失败模式审查。

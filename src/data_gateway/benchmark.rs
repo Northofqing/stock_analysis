@@ -2498,6 +2498,38 @@ mod tests {
     }
 
     #[test]
+    fn production_daily_attestation_binds_exact_hs300_protocol_request() {
+        let day = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
+        let source = TestIndexBarsSource::new(vec![Ok(vec![raw_daily(day)])]);
+        let prepared = acquire_benchmark_batch_from_source(
+            &source,
+            daily_request(day, day, HS300_CANONICAL),
+            &BenchmarkRegistry::production_default(),
+            BenchmarkProviderAttestation::production_default(),
+            BenchmarkAdmissionCoverage::Daily {
+                authoritative_trading_days: &[day],
+            },
+            "2099-01-02T10:00:00+08:00",
+        )
+        .expect("request-bound production Daily identity must admit exact HS300 data");
+
+        assert_eq!(prepared.batch.records().len(), 1);
+        assert_eq!(
+            prepared.batch.evidence().source,
+            format!(
+                "magic-tdx-index-bars@{}",
+                super::TDX_DEPENDENCY_REVISION
+            )
+        );
+        let requests = source.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].market, 1);
+        assert_eq!(requests[0].code, "000300");
+        assert_eq!(requests[0].category, 4);
+        assert_eq!(requests[0].fq_type, 0);
+    }
+
+    #[test]
     #[serial]
     fn raw_diagnostic_accesses_source_without_minting_admitted_evidence() {
         let _env = super::super::grpc_source::test_grpc_env_guard();
