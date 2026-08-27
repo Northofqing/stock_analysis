@@ -3378,6 +3378,8 @@ impl GrpcSource {
                 "T0Evidence outcomes do not exactly match the requested instrument set",
             ));
         }
+        // BR-253: only strict v2 conversion plus exact outcomes for a nonempty,
+        // all-record, zero-rejection batch may refresh OrderBook.
         if complete_t0_batch_proves_order_book(
             codes.len(),
             batch.records.len(),
