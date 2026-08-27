@@ -4150,6 +4150,59 @@ git commit -m "test(monitor): cover opening readiness failure matrix"
 
 ---
 
+### Task 7D-R: 修复 coverage 合同消费者的陈旧 baseline 夹具
+
+**Files:**
+- Modify: `tests/test_data_freshness_check.rs`
+
+**Interfaces:**
+- Consumes: `config/design_contracts.toml [coverage]` 与公开脚本
+  `tools/compliance/lib/check_pr_evidence.sh`。
+- Produces: 随当前合同构造的有效 PR evidence，以及只修改目标字段的 mismatch/bootstrap 负例；
+  不改 checker、生产代码、阈值或 coverage 分类。
+
+- [ ] **Step 1: 保留 Task 7F 的真实 RED**
+
+`cargo test --workspace --all-targets --all-features -- --test-threads=1` 已在
+`tests/test_data_freshness_check.rs` 得到 13 passed / 2 failed、exit 101：acceptance body 和
+bootstrap body 仍硬编码旧 `f05f506` baseline，因此先被当前合同校验拒绝。不得把失败改写成
+checker 放宽。
+
+- [ ] **Step 2: 让测试通过公开合同构造 PR body**
+
+在测试文件中新增 test-only TOML 解析 helper，读取当前 `[coverage]` 的 `source_sha`、
+global/core covered/count 与三项工具版本，构造完整 PR body。三个既有测试分别使用：
+
+- acceptance：当前合同全部字段 + `Bootstrap-Baseline: true`，必须 PASS；
+- baseline mismatch：只把 global 改为 `1/1`，其余保持当前合同，必须报 contract mismatch；
+- bootstrap mismatch：当前合同全部字段 + `Bootstrap-Baseline: false`，配合既有 base SHA，必须
+  到达并报告 bootstrap 状态不一致。
+
+不得用字符串替换硬编码下一次 source SHA；不得让测试读取 checker 输出后反向生成期望。
+
+- [ ] **Step 3: 跑聚焦与完整目标**
+
+```bash
+cargo test --test test_data_freshness_check pr_evidence_ -- --test-threads=1
+cargo test --test test_data_freshness_check -- --test-threads=1
+cargo clippy --test test_data_freshness_check --all-features -- -D warnings
+cargo fmt --all -- --check
+```
+
+Expected: PR evidence 聚焦 4/4，完整目标 15/15，Clippy/fmt exit 0。
+
+- [ ] **Step 4: Commit and invalidate old reports**
+
+```bash
+git add tests/test_data_freshness_check.rs
+git commit -m "test(compliance): derive PR evidence from coverage contract"
+```
+
+提交后 `/private/tmp/stock-analysis-t0-gatec-coverage.Q5RBwA` 仅保留为失败复盘证据；不得继续用它
+更新或验证 baseline。回到 Task 7E，从新测试提交重新冻结 SHA、完整跑 Gate B 和两轮 coverage。
+
+---
+
 ### Task 7E: 冻结源码，生成两份同源码 coverage 并闭合 BR-252 provenance
 
 **Files:**

@@ -461,6 +461,9 @@ global/core 覆盖率为 77.58%/77.45%，距离 80%/95% 的固定发布下限仍
    文档/合同提交中同步更新 BR-252、覆盖率设计证据和
    `config/design_contracts.toml [coverage]` 的 `source_sha`、整数计数与工具身份。PR
    90%/85% 及 Release 80%/95% 阈值保持不变，不增加 `reviewed_no_region`。
+   `check_pr_evidence.sh` 的集成测试必须从当前 TOML 合同独立构造有效 PR body；不得硬编码
+   会随 baseline 重绑而过期的 SHA/整数。拒绝用例只修改目标字段，确保能到达所验证的失败
+   分支，而不是被更早的陈旧 baseline 校验截断。
 6. **重新验证 Gate C。** 对合同提交后的同一 coverage 输入重新执行 fmt、strict Clippy、
    workspace/all-features tests、offline compliance、PR coverage checker、diff 和敏感信息审查，
    再由独立 reviewer 复核。只有 Gate C 全部 PASS 才可创建 merge-ready PR。
@@ -476,6 +479,8 @@ Gate C 合并与 Gate D 发布必须保持两个状态：本方案即使成功�
 - 双报告计数/source set 不一致：保持旧合同，返回 Gate A 诊断 coverage 非确定性；
 - 报告后源码、测试或工具身份变化：废弃本轮报告并从冻结步骤重跑；
 - 合同字段与设计/BR 不一致：Gate C 阻断，回滚独立合同提交；
+- 合同重绑后 PR-evidence 集成测试失败：返回 Gate A/B，先把测试消费者改为读取当前合同；
+  该测试提交使既有双报告失效，必须冻结新 SHA 并重新生成两轮报告；
 - 功能测试或数据红线失败：回到对应 Task 3/4/5/6，禁止用 coverage-only 断言掩盖错误。
 
 | 模块 | 处理 | 理由 |
