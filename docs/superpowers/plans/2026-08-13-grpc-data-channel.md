@@ -4203,6 +4203,59 @@ git commit -m "test(compliance): derive PR evidence from coverage contract"
 
 ---
 
+### Task 7D-N: 消除固定 TEST 数据库清理的 coverage 非确定性
+
+**Files:**
+- Modify: `src/database/concepts.rs`（只改 `#[cfg(test)] mod tests`）
+
+**Interfaces:**
+- Consumes: `test_board_rotations_dao_lifecycle` 的精确 `./test_data/test.db` 测试路径。
+- Produces: 同一轮内覆盖“文件存在”和“不存在”的显式 cleanup；不改生产 DAO、数据库路径或
+  `DatabaseManager` 行为。
+
+- [ ] **Step 1: 固定双报告 RED**
+
+冻结 SHA `1880ef1ddd1c32b553f4e5f75c3f23708550a0e6` 的两轮完整报告位于
+`/private/tmp/stock-analysis-t0-gatec-coverage.Zhh0bt`。run1 为 global/core
+`202872/260127`、`158671/203777`，run2 为 `202873/260127`、`158672/203777`；LCOV 布尔
+覆盖差异唯一为 `src/database/concepts.rs:584`，run1=0、run2=1。根因是固定 test DB 只在上轮
+遗留文件存在时执行 `remove_file`。
+
+- [ ] **Step 2: 新增显式 test-only cleanup helper**
+
+在测试模块新增 `remove_test_file_if_present(path: &Path) -> std::io::Result<()>`：删除成功与
+`ErrorKind::NotFound` 都返回成功，其他错误原样返回。`test_board_rotations_dao_lifecycle` 在使用
+真实 TEST DB 前必须：
+
+1. 创建唯一 cleanup probe 文件并调用 helper，确定性覆盖存在分支；
+2. 对同一已删除 probe 再调用 helper，确定性覆盖不存在分支；
+3. 对精确 `./test_data/test.db` 调用 helper，并对任何非 NotFound 错误显式失败。
+
+probe 必须位于 `./test_data`、名字含 `unique_suffix()`，且在继续数据库初始化前已删除。禁止
+删除目录、使用通配符、忽略任意 I/O 错误或接触生产数据库。
+
+- [ ] **Step 3: 聚焦验证**
+
+```bash
+cargo test --lib database::concepts::tests::test_board_rotations_dao_lifecycle -- --exact --test-threads=1
+cargo clippy --lib --tests --all-features -- -D warnings
+cargo fmt --all -- --check
+```
+
+Expected: 定向 1/1、Clippy/fmt exit 0；diff 仅测试模块且不含 silent cleanup。
+
+- [ ] **Step 4: Commit and invalidate mismatched reports**
+
+```bash
+git add src/database/concepts.rs
+git commit -m "test(database): make concept cleanup coverage deterministic"
+```
+
+提交后 `Zhh0bt` 仅作非确定性复盘证据，不得用于 baseline。回到 Task 7E，从新提交重新冻结、
+完整 Gate B，并在一个全新目录运行两份报告。
+
+---
+
 ### Task 7E: 冻结源码，生成两份同源码 coverage 并闭合 BR-252 provenance
 
 **Files:**

@@ -456,7 +456,9 @@ global/core 覆盖率为 77.58%/77.45%，距离 80%/95% 的固定发布下限仍
 4. **双报告闭合 provenance。** 在同一冻结 commit、同一工具身份、同一 workspace/all-features
    命令上独立完整运行 coverage 两次。两次必须都是零失败，且 global/core 的
    covered/count、core file count、JSON/LCOV source set 完全一致；任一不一致都不得更新
-   baseline，必须先诊断非确定性。
+   baseline，必须先诊断非确定性。测试清理不得依赖上轮遗留文件是否存在；对于必须复用固定
+   TEST 路径的测试，应在单次测试中确定性执行存在/不存在两种清理结果，使覆盖线集合不受
+   前一轮运行状态影响。
 5. **最后更新合同证据。** 只有双报告一致且 candidate 不低于旧 baseline 后，才在后续独立
    文档/合同提交中同步更新 BR-252、覆盖率设计证据和
    `config/design_contracts.toml [coverage]` 的 `source_sha`、整数计数与工具身份。PR
@@ -477,6 +479,8 @@ Gate C 合并与 Gate D 发布必须保持两个状态：本方案即使成功�
 
 - patch coverage 未达标或 ratchet 回退：返回 Gate B，只补相应行为测试；
 - 双报告计数/source set 不一致：保持旧合同，返回 Gate A 诊断 coverage 非确定性；
+- 双报告仅有测试清理分支漂移：定位精确文件/行，补确定性 TEST cleanup 回归；该源码测试
+  提交同样使现有报告失效，必须重新冻结并双跑；
 - 报告后源码、测试或工具身份变化：废弃本轮报告并从冻结步骤重跑；
 - 合同字段与设计/BR 不一致：Gate C 阻断，回滚独立合同提交；
 - 合同重绑后 PR-evidence 集成测试失败：返回 Gate A/B，先把测试消费者改为读取当前合同；
