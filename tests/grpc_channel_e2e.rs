@@ -1,28 +1,164 @@
 //! 集成测试: 真起 grpc_server (fixture 模式, 随机端口) → GrpcMarketClient 调用。
 //! 离线确定性, 不连真实网络。
+use regex::Regex;
 use stock_analysis::grpc_client::client::GrpcMarketClient;
 use stock_analysis::grpc_client::pb::magic::market::v1::{EventCursor, EventFilter, Operation};
 use stock_analysis::grpc_server::events::{DetectedEvent, EventHub, EventKind};
 use stock_analysis::grpc_server::{start, ServerConfig};
 
+#[derive(Clone, Copy)]
+enum Task6SourceKind {
+    FixtureOrE2e,
+    ProductionProbe,
+}
+
+fn task6_security_identity_violations(source: &str, kind: Task6SourceKind) -> Vec<String> {
+    let quoted_identity = Regex::new(r#"\"((?:SH|SZ)?[0-9]{6})\""#).unwrap();
+    let numeric_identity_field = Regex::new(
+        r#"(?x)
+        (?:
+            \"(?:code|codes|instrument|instruments|instrument_code|instrument_id|leader_code|member_code|security_code)\"
+            |
+            \b(?:code|codes|instrument|instruments|instrument_code|instrument_id|leader_code|member_code|security_code)\b
+        )
+        \s*[:=]\s*
+        ((?:SH|SZ)?[0-9]{6})\b
+        "#,
+    )
+    .unwrap();
+    let test_module_start = source.find("#[cfg(test)]").unwrap_or(source.len());
+    let mut violations = Vec::new();
+
+    for captures in quoted_identity.captures_iter(source) {
+        let literal = captures.get(1).unwrap();
+        let direct_identity_context = matches!(kind, Task6SourceKind::FixtureOrE2e)
+            || (literal.start() >= test_module_start
+                && preceding_identity_field(source, literal.start()));
+        if direct_identity_context && looks_like_real_a_share_identity(literal.as_str()) {
+            violations.push(format!(
+                "real security identity in Rust literal at byte {}",
+                literal.start()
+            ));
+        }
+    }
+
+    for captures in numeric_identity_field.captures_iter(source) {
+        let identity = captures.get(1).unwrap();
+        if looks_like_real_a_share_identity(identity.as_str()) {
+            violations.push(format!(
+                "numeric security identity in fixture field at byte {}",
+                identity.start()
+            ));
+        }
+    }
+
+    violations
+}
+
+fn looks_like_real_a_share_identity(value: &str) -> bool {
+    if value.starts_with("TEST_CODE_") {
+        return false;
+    }
+    if let Some(code) = value
+        .strip_prefix("SH")
+        .or_else(|| value.strip_prefix("SZ"))
+    {
+        return code.len() == 6 && code.bytes().all(|byte| byte.is_ascii_digit());
+    }
+    value.len() == 6
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && matches!(value.as_bytes()[0], b'0' | b'3' | b'4' | b'6' | b'8' | b'9')
+}
+
+fn preceding_identity_field(source: &str, literal_start: usize) -> bool {
+    let context_start = source[..literal_start]
+        .char_indices()
+        .rev()
+        .nth(160)
+        .map_or(0, |(index, _)| index);
+    let compact: String = source[context_start..literal_start]
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+
+    [
+        "code",
+        "codes",
+        "instrument",
+        "instruments",
+        "instrument_code",
+        "instrument_id",
+        "leader_code",
+        "member_code",
+        "security_code",
+    ]
+    .iter()
+    .any(|field| {
+        compact.ends_with(&format!("{field}:"))
+            || compact.ends_with(&format!("{field}:["))
+            || compact.ends_with(&format!("{field}="))
+            || compact.ends_with(&format!("\"{field}\":"))
+            || compact.ends_with(&format!("\"{field}\":["))
+    })
+}
+
 #[test]
 fn task6_fixture_sources_use_only_test_security_identities() {
     let sources = [
-        include_str!("../src/grpc_server/fixture.rs"),
-        include_str!("grpc_bridge_e2e.rs"),
-        include_str!("grpc_channel_e2e.rs"),
-        include_str!("../src/bin/grpc_local_readiness_probe.rs"),
+        (
+            "src/grpc_server/fixture.rs",
+            include_str!("../src/grpc_server/fixture.rs"),
+            Task6SourceKind::FixtureOrE2e,
+        ),
+        (
+            "tests/grpc_bridge_e2e.rs",
+            include_str!("grpc_bridge_e2e.rs"),
+            Task6SourceKind::FixtureOrE2e,
+        ),
+        (
+            "tests/grpc_channel_e2e.rs",
+            include_str!("grpc_channel_e2e.rs"),
+            Task6SourceKind::FixtureOrE2e,
+        ),
+        (
+            "src/bin/grpc_local_readiness_probe.rs",
+            include_str!("../src/bin/grpc_local_readiness_probe.rs"),
+            Task6SourceKind::ProductionProbe,
+        ),
     ];
-    let exact_json_real_identity = ["\"", "600", "519", "\""].concat();
-    let prefixed_real_identity = ["SH", "600", "519"].concat();
 
-    for source in sources {
-        assert!(!source.contains(&exact_json_real_identity));
-        assert!(!source.contains(&prefixed_real_identity));
+    for (path, source, kind) in sources {
+        let violations = task6_security_identity_violations(source, kind);
+        assert!(violations.is_empty(), "{path}: {violations:?}");
     }
-    for fixture_or_e2e in &sources[..3] {
-        assert!(fixture_or_e2e.contains("TEST_CODE_"));
-    }
+}
+
+#[test]
+fn task6_identity_guard_rejects_unknown_real_security_codes() {
+    let bare = ["688", "321"].concat();
+    let sh_prefixed = ["S", "H", "601", "899"].concat();
+    let sz_prefixed = ["S", "Z", "300", "777"].concat();
+    let fixture_json = format!(r#"[{{"code":"{bare}"}},{{"instrument_code":"{sh_prefixed}"}}]"#);
+    let source =
+        format!("const FIXTURE: &str = r#\"{fixture_json}\"#;\nlet code = \"{sz_prefixed}\";");
+
+    let violations = task6_security_identity_violations(&source, Task6SourceKind::FixtureOrE2e);
+
+    assert_eq!(violations.len(), 3, "{violations:?}");
+}
+
+#[test]
+fn task6_identity_guard_ignores_ports_times_and_numeric_values() {
+    let source = r#"
+        let port = 18083;
+        let timestamp = 20260827130500_i64;
+        let price = 600001.0;
+        let civil_time = "2026-08-27T13:05:00+08:00";
+    "#;
+
+    let violations = task6_security_identity_violations(source, Task6SourceKind::FixtureOrE2e);
+
+    assert!(violations.is_empty(), "{violations:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
