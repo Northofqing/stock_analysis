@@ -200,15 +200,14 @@ bash tools/compliance/check.sh --policy pr
 cargo llvm-cov --workspace --all-features --json --output-path target/coverage/coverage.json -- --test-threads=1
 cargo llvm-cov report --lcov --output-path target/coverage/lcov.info
 python3 tools/coverage/check_thresholds.py --policy pr --report target/coverage/coverage.json \
-  --lcov target/coverage/lcov.info --base-ref c6024e5 --bootstrap-baseline
-cargo build --release --bin strategy_attribution
-cargo build --release --bin strategy_attribution --no-default-features
+  --lcov target/coverage/lcov.info --base-ref master
 ```
 
 Actual: fmt、strict workspace Clippy、隔离全量 tests、PR compliance 和 coverage ratchet 均
-exit 0；core patch 91.83%，other production patch 85.18%，global/core 77.76%/77.68% 均未低于
-同源码基线。默认/no-default CLI 及 monitor release build 通过。Gate C PASS；Gate D 因固定
-80%/95%、freshness/live/auditor 未闭合保持 Release Blocked。
+exit 0；core patch 94.34%，other production patch N/A（无可执行变更行），global/core
+202960/260224 = 77.99% 与 158758/203874 = 77.87%，均高于最新 `master` 的覆盖率比例。
+默认与 no-default Benchmark 聚焦测试均 27/27，CLI 6/6。Gate C PASS；Gate D 因固定
+80%/95%、freshness、完整 live attribution 与 auditor 未闭合保持 Release Blocked。
 
 - [x] **Step 2: 执行真实 Daily capture。**
 

@@ -1304,21 +1304,24 @@ acquisition/segment/manifest/report/failure 事实不得删除、覆盖或回退
 
 #### 15.14.5 Gate C、真实提交与下一阻塞证据（2026-08-28）
 
-实现提交为 `d2dc4dc`（RED）、`9fa4357`（request-bound Daily identity）、`722e808`
-（lockfile-derived provider revision）和 `ccc047c`（同源码覆盖率合同）。隔离工作树中的完整
+最终分支基于 `master@2ae8c4d`，实现提交为 `d0259ab`（RED）、`492fd55`
+（request-bound Daily identity）、`0c28395`（lockfile-derived provider revision）和
+`1717aab`（真实证据）。隔离工作树中的完整
 `cargo test --workspace --all-targets --all-features -- --test-threads=1` 退出 0：lib
-2997 passed / 7 ignored、monitor 685 passed / 4 ignored，CLI 6/6，其余 binary/integration/bench
+3015 passed / 7 ignored、monitor 685 passed / 4 ignored，CLI 6/6，其余 binary/integration/bench
 目标零失败。`cargo fmt --all -- --check`、workspace/all-targets/all-features strict Clippy、
-`bash tools/compliance/check.sh --policy pr` 和默认/no-default `strategy_attribution` release build
-均退出 0。no-default build 仍显示未修改路径的既有 unused/dead-code warning，不是 strict
-all-features Clippy 的错误。
+`bash tools/compliance/check.sh --policy pr` 均退出 0；默认与 no-default Benchmark 聚焦测试均
+27/27，no-default 测试仍显示未修改路径的既有 unused/dead-code warning，不是 strict all-features
+Clippy 的错误。
 
 同一源码、rustc 1.95.0、LLVM 22.1.2、cargo-llvm-cov 0.8.7 的完整覆盖率报告得到：global
-`201326/258891 = 77.76%`、core `157705/203016 = 77.68%`（218 files）、core patch
-`13776/15001 = 91.83%`、other production patch `8368/9824 = 85.18%`。PR policy 与 coverage
-ratchet 退出 0；固定 90%/85% 及 release 80%/95% 阈值未修改。loopback fixture 在 filesystem
-sandbox 内首次得到 `Operation not permitted`，按同一命令在允许本机 loopback 的隔离环境重跑后
-所有测试通过并生成报告；这不是业务断言豁免。Gate C 通过，Gate D 仍因 global/core 未达
+`202960/260224 = 77.99%`、core `158758/203874 = 77.87%`（218 files）、core patch
+`150/159 = 94.34%`、other production patch N/A（零可执行变更行）。两项比例均高于最新
+`master` 的 202888/260143 与 158687/203793；PR policy 与 coverage ratchet 退出 0，固定
+90%/85% 及 release 80%/95% 阈值未修改。loopback fixture 在 filesystem sandbox 内会得到
+`Operation not permitted`，在允许本机 loopback 的同一隔离工作树执行后所有测试通过并生成
+报告；首次报告写出因 `target/coverage/` 不存在退出 1，随后仅从已通过测试生成的 profile 重建
+JSON/LCOV 并由 checker 验证，不重复或豁免业务断言。Gate C 通过，Gate D 仍因 global/core 未达
 80%/95%、production freshness 未在本轮签发、完整 live attribution 与 auditor 未闭合而保持
 `Release Blocked`。
 
