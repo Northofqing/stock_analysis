@@ -133,7 +133,20 @@ pub fn scope_epoch_fills(
                 quarantined: false,
             });
         match (state.quarantined, fill.row.direction.as_str()) {
-            (false, "buy" | "sell") => attributable.push(fill.row.clone()),
+            (false, "buy") => {
+                state.total_quantity = state
+                    .total_quantity
+                    .checked_add(fill.quantity)
+                    .ok_or_else(|| "attribution_epoch_quantity_overflow".to_owned())?;
+                attributable.push(fill.row.clone());
+            }
+            (false, "sell") => {
+                if fill.quantity > state.total_quantity {
+                    return Err("attribution_epoch_cumulative_oversell".to_owned());
+                }
+                state.total_quantity -= fill.quantity;
+                attributable.push(fill.row.clone());
+            }
             (true, "buy") => {
                 state.total_quantity = state
                     .total_quantity
@@ -191,35 +204,60 @@ pub fn canonical_legacy_carry_manifest_hash(carry: &[LegacyCarryPosition]) -> St
     hex::encode(hasher.finalize())
 }
 
-pub fn canonical_exclusion_manifest_hash(exclusions: &[EpochExclusion]) -> String {
-    let mut sorted = exclusions.to_vec();
-    sorted.sort_by(|left, right| {
+pub fn canonical_exclusion_manifest_hash(
+    exclusions: &[EpochExclusion],
+    source_rows: &[EconomicFillRow],
+) -> Result<String, String> {
+    let sources = canonical_source_fill_index(source_rows)?;
+    let mut sorted = Vec::with_capacity(exclusions.len());
+    for exclusion in exclusions {
+        let (occurred_at, source) = sources
+            .get(&exclusion.fill_id)
+            .ok_or_else(|| "attribution_epoch_exclusion_source_missing".to_owned())?;
+        if source.code != exclusion.code
+            || source.direction != exclusion.direction
+            || u64::try_from(source.quantity).ok() != Some(exclusion.quantity)
+        {
+            return Err("attribution_epoch_exclusion_source_mismatch".to_owned());
+        }
+        sorted.push((*occurred_at, exclusion));
+    }
+    sorted.sort_by(|(left_time, left), (right_time, right)| {
         (
-            left.code.as_str(),
+            *left_time,
             left.fill_id,
-            left.direction.as_str(),
             exclusion_reason_tag(left.reason),
+            left.code.as_str(),
+            left.direction.as_str(),
             left.quantity,
         )
             .cmp(&(
-                right.code.as_str(),
+                *right_time,
                 right.fill_id,
-                right.direction.as_str(),
                 exclusion_reason_tag(right.reason),
+                right.code.as_str(),
+                right.direction.as_str(),
                 right.quantity,
             ))
     });
     let mut hasher = Sha256::new();
     hasher.update(EXCLUSION_MANIFEST_DOMAIN);
     hasher.update((sorted.len() as u64).to_be_bytes());
-    for exclusion in sorted {
+    for (occurred_at, exclusion) in sorted {
+        update_len_prefixed(
+            &mut hasher,
+            occurred_at
+                .format("%Y-%m-%d %H:%M:%S%.9f")
+                .to_string()
+                .as_bytes(),
+        );
         hasher.update(exclusion.fill_id.to_be_bytes());
         update_len_prefixed(&mut hasher, exclusion.code.as_bytes());
         update_len_prefixed(&mut hasher, exclusion.direction.as_bytes());
         hasher.update(exclusion.quantity.to_be_bytes());
         hasher.update([exclusion_reason_tag(exclusion.reason)]);
     }
-    hex::encode(hasher.finalize())
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Hashes only the canonical ordered fill IDs, because the complete fills are
@@ -260,10 +298,7 @@ fn validate_rows<'a>(
         if effective_date.is_some_and(|date| occurred_at.date() < date) {
             return Err("attribution_epoch_fill_before_effective_date".to_owned());
         }
-        let quantity = u64::try_from(row.quantity)
-            .ok()
-            .filter(|quantity| *quantity > 0 && quantity.is_multiple_of(100))
-            .ok_or_else(|| "attribution_epoch_quantity_invalid".to_owned())?;
+        let quantity = validate_quantity(row)?;
         validated.push(ValidatedEpochFill {
             row,
             occurred_at,
@@ -271,6 +306,27 @@ fn validate_rows<'a>(
         });
     }
     Ok(validated)
+}
+
+fn canonical_source_fill_index<'a>(
+    source_rows: &'a [EconomicFillRow],
+) -> Result<BTreeMap<i64, (NaiveDateTime, &'a EconomicFillRow)>, String> {
+    let mut seen_ids = HashSet::new();
+    let mut seen_plan_ids = HashSet::new();
+    let mut sources = BTreeMap::new();
+    for row in source_rows {
+        let occurred_at = validate_fill_facts(row, &mut seen_ids, &mut seen_plan_ids)?;
+        validate_quantity(row)?;
+        sources.insert(row.id, (occurred_at, row));
+    }
+    Ok(sources)
+}
+
+fn validate_quantity(row: &EconomicFillRow) -> Result<u64, String> {
+    u64::try_from(row.quantity)
+        .ok()
+        .filter(|quantity| *quantity > 0 && quantity.is_multiple_of(100))
+        .ok_or_else(|| "attribution_epoch_quantity_invalid".to_owned())
 }
 
 fn validate_fill_facts<'a>(
@@ -648,6 +704,15 @@ mod tests {
             scope_epoch_fills(&unordered, date("2026-08-03"), &[]).unwrap_err(),
             "attribution_epoch_order_invalid"
         );
+
+        let equal_timestamp_reversed_ids = vec![
+            fill(2, TEST_CODE_600001, "buy", 10.0, 100, "2026-08-03 09:30:00"),
+            fill(1, TEST_CODE_600002, "buy", 20.0, 100, "2026-08-03 09:30:00"),
+        ];
+        assert_eq!(
+            scope_epoch_fills(&equal_timestamp_reversed_ids, date("2026-08-03"), &[]).unwrap_err(),
+            "attribution_epoch_order_invalid"
+        );
     }
 
     #[test]
@@ -691,6 +756,55 @@ mod tests {
             )
             .unwrap_err(),
             "attribution_epoch_cumulative_oversell"
+        );
+
+        assert_eq!(
+            scope_epoch_fills(&oversell, date("2026-08-03"), &[]).unwrap_err(),
+            "attribution_epoch_cumulative_oversell"
+        );
+
+        let post_release_oversell = vec![
+            fill(
+                2,
+                TEST_CODE_600001,
+                "sell",
+                10.0,
+                100,
+                "2026-08-03 09:30:00",
+            ),
+            fill(
+                3,
+                TEST_CODE_600001,
+                "sell",
+                10.0,
+                100,
+                "2026-08-04 09:30:00",
+            ),
+        ];
+        assert_eq!(
+            scope_epoch_fills(
+                &post_release_oversell,
+                date("2026-08-03"),
+                &[LegacyCarryPosition {
+                    code: TEST_CODE_600001.to_owned(),
+                    quantity: 100,
+                }],
+            )
+            .unwrap_err(),
+            "attribution_epoch_cumulative_oversell"
+        );
+
+        let zero_quantity = [fill(
+            4,
+            TEST_CODE_600002,
+            "buy",
+            20.0,
+            0,
+            "2026-08-03 09:30:00",
+        )];
+        assert_eq!(
+            scope_epoch_fills(&zero_quantity, date("2026-08-03"), &[]).unwrap_err(),
+            "attribution_epoch_quantity_invalid"
         );
 
         let max_hundred = u64::MAX / 100 * 100;
@@ -812,11 +926,42 @@ mod tests {
                 reason: EpochExclusionReason::MixedLegacyCarryExit,
             },
         ];
+        let exclusion_sources = vec![
+            fill(3, TEST_CODE_600001, "buy", 10.0, 100, "2026-08-03 10:00:00"),
+            fill(
+                4,
+                TEST_CODE_600002,
+                "sell",
+                20.0,
+                100,
+                "2026-08-03 09:30:00",
+            ),
+        ];
         let mut reordered_exclusions = exclusions.clone();
         reordered_exclusions.reverse();
         assert_eq!(
-            canonical_exclusion_manifest_hash(&exclusions),
-            canonical_exclusion_manifest_hash(&reordered_exclusions)
+            canonical_exclusion_manifest_hash(&exclusions, &exclusion_sources)
+                .expect("TEST_CODE exclusion hash"),
+            canonical_exclusion_manifest_hash(&reordered_exclusions, &exclusion_sources)
+                .expect("TEST_CODE exclusion hash")
+        );
+
+        let rebound_sources = vec![
+            fill(3, TEST_CODE_600001, "buy", 10.0, 100, "2026-08-03 09:00:00"),
+            fill(
+                4,
+                TEST_CODE_600002,
+                "sell",
+                20.0,
+                100,
+                "2026-08-03 09:30:00",
+            ),
+        ];
+        assert_ne!(
+            canonical_exclusion_manifest_hash(&exclusions, &exclusion_sources)
+                .expect("TEST_CODE exclusion hash"),
+            canonical_exclusion_manifest_hash(&exclusions, &rebound_sources)
+                .expect("TEST_CODE timestamp rebinding must change hash")
         );
 
         let fills = vec![
@@ -826,7 +971,8 @@ mod tests {
         let mut reordered_fills = fills.clone();
         reordered_fills.reverse();
         let carry_hash = canonical_legacy_carry_manifest_hash(&carry);
-        let exclusion_hash = canonical_exclusion_manifest_hash(&exclusions);
+        let exclusion_hash = canonical_exclusion_manifest_hash(&exclusions, &exclusion_sources)
+            .expect("TEST_CODE exclusion hash");
         let fills_hash = canonical_scoped_fill_manifest_hash(&fills).expect("TEST_CODE hash");
         assert_eq!(
             fills_hash,
