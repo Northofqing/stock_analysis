@@ -1301,3 +1301,64 @@ Daily segment/manifest；Reader 以返回的 exact manifest hash 读回 2026-08-
 代码/文档回滚只使用 `git revert` 回退本节证据中冻结的实际提交 SHA，并停止新 writer。失败审计 `id=966954`、任何新
 acquisition/segment/manifest/report/failure 事实不得删除、覆盖或回退；架构问题回 Gate A，代码
 问题回 Gate B，数据红线问题在 Gate B 修复后重做本节失败模式审查。
+
+#### 15.14.5 Gate C、真实提交与下一阻塞证据（2026-08-28）
+
+实现提交为 `d2dc4dc`（RED）、`9fa4357`（request-bound Daily identity）、`722e808`
+（lockfile-derived provider revision）和 `ccc047c`（同源码覆盖率合同）。隔离工作树中的完整
+`cargo test --workspace --all-targets --all-features -- --test-threads=1` 退出 0：lib
+2997 passed / 7 ignored、monitor 685 passed / 4 ignored，CLI 6/6，其余 binary/integration/bench
+目标零失败。`cargo fmt --all -- --check`、workspace/all-targets/all-features strict Clippy、
+`bash tools/compliance/check.sh --policy pr` 和默认/no-default `strategy_attribution` release build
+均退出 0。no-default build 仍显示未修改路径的既有 unused/dead-code warning，不是 strict
+all-features Clippy 的错误。
+
+同一源码、rustc 1.95.0、LLVM 22.1.2、cargo-llvm-cov 0.8.7 的完整覆盖率报告得到：global
+`201326/258891 = 77.76%`、core `157705/203016 = 77.68%`（218 files）、core patch
+`13776/15001 = 91.83%`、other production patch `8368/9824 = 85.18%`。PR policy 与 coverage
+ratchet 退出 0；固定 90%/85% 及 release 80%/95% 阈值未修改。loopback fixture 在 filesystem
+sandbox 内首次得到 `Operation not permitted`，按同一命令在允许本机 loopback 的隔离环境重跑后
+所有测试通过并生成报告；这不是业务断言豁免。Gate C 通过，Gate D 仍因 global/core 未达
+80%/95%、production freshness 未在本轮签发、完整 live attribution 与 auditor 未闭合而保持
+`Release Blocked`。
+
+用户授权的生产命令固定业务日而非使用当前日期：
+
+```bash
+target/release/strategy_attribution capture --instrument sh000300 --granularity daily \
+  --from 2026-08-27 --to 2026-08-27 --db data/stock_analysis.db --commit --format json
+```
+
+filesystem sandbox 内的首次 provider 调用显式失败并保留 BR-159 audit `id=978013`、reason
+`provider_transport`；在获准访问真实 TDX 网络后，同一命令退出 0。写入后的 SQLite
+`quick_check=ok`，正式事实为：
+
+| 证据 | 值 |
+| --- | --- |
+| BR-159 accepted audit | `id=1002704`，request/accepted/rejected=`1/1/0` |
+| provider/source | `Tdx` / `magic-tdx-index-bars@75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e` |
+| request hash | `1c4f57a0a5e37c5bbbfb0b8d24b4ab6080b84a14e8c7eaa770c88708096fe892` |
+| batch ID | `7d49b27740f5766fe2eeee12ac4456b6176c7a36834fce02cdb4fdb1cf9507f3` |
+| segment | `f0c8c46005e5d1025dcbe8e4c28005914e9092f09b46a87a9d75c41326571643` |
+| manifest | `80036750a9a09fe5a89b25197f0ca73ef3ebca9e124dcdae1d2fe6a62ea52f3c` |
+| coverage | `sh000300 / Daily / 2026-08-27..2026-08-27 / 1 row` |
+
+segment、manifest、manifest-acquisition association 以及两条 genesis hash chain 均已追加并绑定
+audit `1002704`；不存在 UPDATE/DELETE。由此 `benchmark_identity_unverified` 已从生产 Daily
+路径解除，Minute1 仍未启用。
+
+随后使用 exact manifest 的只读 replay 不再在 benchmark 阶段失败，而在 `trade_evidence` 返回
+`paper_trade_source_failed`。`economic_position_probe` 给出精确根因：
+
+```text
+PaperTradeSource: economic sell id=520 violates A-share T+1 for 002594:
+buy_date=2026-08-11 sell_date=2026-08-11
+```
+
+只读全量 FIFO 盘点确认 898 条 Filled 中有 9 个卖单消耗当日买入 lot；`id=520` 卖出 3200
+股时旧批次只有 3100 股，余下 100 股来自同日 `id=490`。对应 `order_audit id=837` 的
+business ID、方向、价格、数量与 UTC quote time 均一一匹配，说明来源可信地记录了旧实现实际
+发生的非法模拟成交，并非时区解析误判。现有历史事实还留下 325 个代码、49,500 股净纸面持仓，
+且没有不可变纸面空仓确认；因此不能把 2026-08-27 擅自设为干净纪元。按 2.3/2.7、BR-248/
+BR-251，禁止删除、改时、缩量、跳过或把坏成交当零；本次不得提交 attribution report。恢复
+新纪元必须另有用户确认的纸面空仓事实或权威纸面持仓基线设计，不能由本修订推断。

@@ -190,7 +190,7 @@ Actual: RED 精确失败于 adapter 仍为手写常量；实现后 GREEN 1/1。B
 - Consumes: `strategy_attribution capture` 返回的 exact `manifest哈希`。
 - Produces: accepted BR-159 receipt、不可变 Daily segment/manifest、Reader/归因 CLI 的真实结果或下一个准确 typed blocker。
 
-- [ ] **Step 1: 执行 Gate B/C。**
+- [x] **Step 1: 执行 Gate B/C。**
 
 ```bash
 cargo fmt --all -- --check
@@ -205,7 +205,12 @@ cargo build --release --bin strategy_attribution
 cargo build --release --bin strategy_attribution --no-default-features
 ```
 
-- [ ] **Step 2: 执行真实 Daily capture。**
+Actual: fmt、strict workspace Clippy、隔离全量 tests、PR compliance 和 coverage ratchet 均
+exit 0；core patch 91.83%，other production patch 85.18%，global/core 77.76%/77.68% 均未低于
+同源码基线。默认/no-default CLI 及 monitor release build 通过。Gate C PASS；Gate D 因固定
+80%/95%、freshness/live/auditor 未闭合保持 Release Blocked。
+
+- [x] **Step 2: 执行真实 Daily capture。**
 
 ```bash
 target/release/strategy_attribution capture --db data/stock_analysis.db \
@@ -216,11 +221,22 @@ target/release/strategy_attribution capture --db data/stock_analysis.db \
 Expected: exit 0，输出一个 manifest hash；`data_acquisition_audit` 新增 accepted
 `BenchmarkBars/Tdx` 行，`benchmark_segment_revision` 与 `benchmark_manifest` 各新增或幂等返回一项。
 
-- [ ] **Step 3: 使用 exact manifest 运行归因 CLI。**
+Actual: sandbox 内首次 transport failure 保留 audit `978013`；获准真实网络后 exit 0。
+accepted audit `1002704`（1/1/0），source revision `75ee2a2...e7000e`，segment
+`f0c8c460...571643`，manifest `80036750...52f3c`，一条 2026-08-27 Daily 记录；关联、segment
+chain、manifest chain 和 `PRAGMA quick_check` 均通过。
+
+- [x] **Step 3: 使用 exact manifest 运行归因 CLI。**
 
 从 Step 2 JSON 读取 manifest hash，按 `strategy_attribution scheduled --help` 的现行参数格式传入
 同一业务日。Expected: 不再出现 `benchmark_identity_unverified`；成功则核对报告 manifest，其他
 输入失败则保存其真实 typed reason，禁止补值或伪称全链成功。
+
+Actual: benchmark 阶段不再出现 identity failure；只读 replay 在 `trade_evidence` 以
+`paper_trade_source_failed` 退出。精确阻塞为 `paper_trades.id=520` 卖出 002594 时消耗同日
+`id=490` 买入的 100 股，违反 T+1；全量盘点共 9 个同类卖单。历史来源和对应 order audit
+一一匹配，禁止改写或跳过；没有纸面空仓确认且仍有 325 个代码/49,500 股净持仓，因此未执行
+归因 `--commit`，等待用户提供新纪元空仓确认或权威纸面持仓基线。
 
 - [ ] **Step 4: 追加真实证据并完成独立 review。**
 
