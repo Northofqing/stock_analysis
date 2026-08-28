@@ -322,6 +322,13 @@ impl AttributionDatabaseSession {
                         "BR-251 attribution schema initialization failed",
                     )
                 })?;
+                super::attribution_epochs::create_schema(&mut connection).map_err(|_| {
+                    unavailable(
+                        "attribution_schema_unavailable",
+                        true,
+                        "BR-255 attribution epoch schema initialization failed",
+                    )
+                })?;
             }
         }
         drop(connection);
@@ -2447,6 +2454,9 @@ mod tests {
             "attribution_run_audit",
             "attribution_report_revision",
             "attribution_failure_audit",
+            "attribution_sample_epoch_receipt",
+            "attribution_epoch_attempt_audit",
+            "paper_attribution_epoch_daily",
         ] {
             let count = diesel::sql_query(
                 "SELECT COUNT(*) AS value FROM sqlite_master WHERE type='table' AND name=?",
