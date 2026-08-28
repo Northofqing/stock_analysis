@@ -24,7 +24,7 @@ const TDX_DAILY_CATEGORY: u8 = 4;
 const TDX_MINUTE1_CATEGORY: u8 = 8;
 const TDX_FQ_NONE: u8 = 0;
 const TDX_PAGE_SIZE: u16 = 800;
-const TDX_DEPENDENCY_REVISION: &str = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e";
+const TDX_DEPENDENCY_REVISION: &str = env!("MAGIC_TDX_DEPENDENCY_REVISION");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BenchmarkGranularity {
@@ -1350,16 +1350,70 @@ impl BenchmarkAuditOutcome {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchmarkIdentityAttestation {
+    RequestBoundTdxHs300V1,
+    #[cfg(test)]
+    Unverified,
+    #[cfg(test)]
+    TestOnlyTdxHs300V1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TdxIndexProtocolContract {
+    market: u8,
+    code: &'static str,
+    daily_category: u8,
+    minute1_category: u8,
+    fq_type: u8,
+    dependency_revision: &'static str,
+}
+
+impl TdxIndexProtocolContract {
+    const fn tdx_hs300_v1() -> Self {
+        Self {
+            market: TDX_MARKET,
+            code: TDX_CODE,
+            daily_category: TDX_DAILY_CATEGORY,
+            minute1_category: TDX_MINUTE1_CATEGORY,
+            fq_type: TDX_FQ_NONE,
+            dependency_revision: TDX_DEPENDENCY_REVISION,
+        }
+    }
+
+    const fn category_for(self, range: &BenchmarkRange) -> u8 {
+        match range {
+            BenchmarkRange::Daily { .. } => self.daily_category,
+            BenchmarkRange::Minute1 { .. } => self.minute1_category,
+        }
+    }
+
+    fn page_request(self, range: &BenchmarkRange, offset: u32) -> IndexPageRequest {
+        IndexPageRequest {
+            market: self.market,
+            code: self.code,
+            category: self.category_for(range),
+            fq_type: self.fq_type,
+            offset,
+            count: TDX_PAGE_SIZE,
+        }
+    }
+
+    fn source(self) -> String {
+        format!("magic-tdx-index-bars@{}", self.dependency_revision)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct BenchmarkProviderAttestation {
-    identity_verified: bool,
+    identity: BenchmarkIdentityAttestation,
     minute_end_semantics_verified: bool,
 }
 
 impl BenchmarkProviderAttestation {
     const fn production_default() -> Self {
         Self {
-            identity_verified: false,
+            identity: BenchmarkIdentityAttestation::RequestBoundTdxHs300V1,
             minute_end_semantics_verified: false,
         }
     }
@@ -1367,19 +1421,30 @@ impl BenchmarkProviderAttestation {
     #[cfg(test)]
     const fn test_only(identity_verified: bool, minute_end_semantics_verified: bool) -> Self {
         Self {
-            identity_verified,
+            identity: if identity_verified {
+                BenchmarkIdentityAttestation::TestOnlyTdxHs300V1
+            } else {
+                BenchmarkIdentityAttestation::Unverified
+            },
             minute_end_semantics_verified,
         }
     }
 
-    fn admit(self, request: &BenchmarkRequest) -> Result<(), GatewayError> {
-        if !self.identity_verified {
-            return Err(benchmark_gateway_error(
-                BenchmarkAuditOutcome::Unavailable,
-                "benchmark_identity_unverified",
-                false,
-                "TDX sh000300 identity attestation is unavailable",
-            ));
+    fn admit(self, request: &BenchmarkRequest) -> Result<TdxIndexProtocolContract, GatewayError> {
+        let contract = TdxIndexProtocolContract::tdx_hs300_v1();
+        match self.identity {
+            BenchmarkIdentityAttestation::RequestBoundTdxHs300V1 => {}
+            #[cfg(test)]
+            BenchmarkIdentityAttestation::Unverified => {
+                return Err(benchmark_gateway_error(
+                    BenchmarkAuditOutcome::Unavailable,
+                    "benchmark_identity_unverified",
+                    false,
+                    "TDX benchmark request-bound identity attestation is unavailable",
+                ));
+            }
+            #[cfg(test)]
+            BenchmarkIdentityAttestation::TestOnlyTdxHs300V1 => {}
         }
         if matches!(request.range, BenchmarkRange::Minute1 { .. })
             && !self.minute_end_semantics_verified
@@ -1391,7 +1456,7 @@ impl BenchmarkProviderAttestation {
                 "TDX Minute1 end-label semantics attestation is unavailable",
             ));
         }
-        Ok(())
+        Ok(contract)
     }
 }
 
@@ -1459,12 +1524,15 @@ pub(super) async fn acquire_production_benchmark_bars(
             result: Err(error),
         };
     }
-    if let Err(error) = BenchmarkProviderAttestation::production_default().admit(&request) {
-        return BenchmarkAcquisitionOutcome {
-            request_hash,
-            result: Err(error),
-        };
-    }
+    let contract = match BenchmarkProviderAttestation::production_default().admit(&request) {
+        Ok(contract) => contract,
+        Err(error) => {
+            return BenchmarkAcquisitionOutcome {
+                request_hash,
+                result: Err(error),
+            };
+        }
+    };
 
     let coverage = match verified_benchmark_coverage(&request) {
         Ok(coverage) => coverage,
@@ -1478,7 +1546,7 @@ pub(super) async fn acquire_production_benchmark_bars(
 
     #[cfg(not(feature = "magic-gateway"))]
     {
-        let _ = coverage;
+        let _ = (coverage, contract);
         BenchmarkAcquisitionOutcome {
             request_hash,
             result: Err(benchmark_gateway_error(
@@ -1502,6 +1570,7 @@ pub(super) async fn acquire_production_benchmark_bars(
                         &source,
                         request,
                         &registry,
+                        contract,
                         BenchmarkAdmissionCoverage::Daily {
                             authoritative_trading_days,
                         },
@@ -1512,6 +1581,7 @@ pub(super) async fn acquire_production_benchmark_bars(
                     &source,
                     request,
                     &registry,
+                    contract,
                     BenchmarkAdmissionCoverage::Minute1,
                     &observed_at,
                 ),
@@ -1675,10 +1745,8 @@ impl BenchmarkRequest {
 }
 
 pub(super) fn canonical_base_request_hash(request: &BenchmarkRequest) -> String {
-    let category = match request.range {
-        BenchmarkRange::Daily { .. } => TDX_DAILY_CATEGORY,
-        BenchmarkRange::Minute1 { .. } => TDX_MINUTE1_CATEGORY,
-    };
+    let contract = TdxIndexProtocolContract::tdx_hs300_v1();
+    let category = contract.category_for(&request.range);
     let mut hasher = Sha256::new();
     hasher.update(b"BR251_TDX_INDEX_REQUEST_BASE_V1\0");
     update_length_prefixed(&mut hasher, request.instrument.as_bytes());
@@ -1694,9 +1762,9 @@ pub(super) fn canonical_base_request_hash(request: &BenchmarkRequest) -> String 
             update_length_prefixed(&mut hasher, to.to_rfc3339().as_bytes());
         }
     }
-    hasher.update([TDX_MARKET, category, TDX_FQ_NONE]);
-    update_length_prefixed(&mut hasher, TDX_CODE.as_bytes());
-    update_length_prefixed(&mut hasher, TDX_DEPENDENCY_REVISION.as_bytes());
+    hasher.update([contract.market, category, contract.fq_type]);
+    update_length_prefixed(&mut hasher, contract.code.as_bytes());
+    update_length_prefixed(&mut hasher, contract.dependency_revision.as_bytes());
     hex::encode(hasher.finalize())
 }
 
@@ -1787,26 +1855,23 @@ fn acquire_benchmark_batch_from_source(
     observed_at: &str,
 ) -> Result<PreparedBenchmarkBatch, GatewayError> {
     validate_benchmark_request(registry, &request).map_err(benchmark_admission_error)?;
-    attestation.admit(&request)?;
-    fetch_and_admit_benchmark_batch(source, request, registry, coverage, observed_at)
+    let contract = attestation.admit(&request)?;
+    fetch_and_admit_benchmark_batch(source, request, registry, contract, coverage, observed_at)
 }
 
 fn fetch_and_admit_benchmark_batch(
     source: &impl IndexBarsSource,
     request: BenchmarkRequest,
     registry: &BenchmarkRegistry,
+    contract: TdxIndexProtocolContract,
     coverage: BenchmarkAdmissionCoverage<'_>,
     observed_at: &str,
 ) -> Result<PreparedBenchmarkBatch, GatewayError> {
     validate_benchmark_request(registry, &request).map_err(benchmark_admission_error)?;
-    let category = match request.range {
-        BenchmarkRange::Daily { .. } => TDX_DAILY_CATEGORY,
-        BenchmarkRange::Minute1 { .. } => TDX_MINUTE1_CATEGORY,
-    };
-    let pages = fetch_raw_benchmark_pages(source, &request, category)?;
+    let pages = fetch_raw_benchmark_pages(source, &request, contract)?;
 
     let request_hash = canonical_base_request_hash(&request);
-    let canonical_bytes = canonical_acquisition_bytes(&request, category, &pages)?;
+    let canonical_bytes = canonical_acquisition_bytes(&request, contract, &pages)?;
     let batch_id = domain_hash(b"BR251_TDX_INDEX_BATCH_V1\0", &canonical_bytes);
 
     let mut selected = Vec::new();
@@ -1824,7 +1889,7 @@ fn fetch_and_admit_benchmark_batch(
         .map_err(benchmark_admission_error)?;
     let evidence = BatchEvidence {
         provider: ProviderId::Tdx,
-        source: format!("magic-tdx-index-bars@{TDX_DEPENDENCY_REVISION}"),
+        source: contract.source(),
         source_at: None,
         observed_at: observed_at.to_owned(),
         batch_id,
@@ -1841,7 +1906,7 @@ fn fetch_and_admit_benchmark_batch(
 fn fetch_raw_benchmark_pages(
     source: &impl IndexBarsSource,
     request: &BenchmarkRequest,
-    category: u8,
+    contract: TdxIndexProtocolContract,
 ) -> Result<Vec<(u32, Vec<RawIndexBar>)>, GatewayError> {
     let requested_start = range_start_key(&request.range)?;
     let mut pages = Vec::new();
@@ -1849,14 +1914,7 @@ fn fetch_raw_benchmark_pages(
     let mut previous_oldest = None;
 
     loop {
-        let rows = source.fetch_page(IndexPageRequest {
-            market: TDX_MARKET,
-            code: TDX_CODE,
-            category,
-            fq_type: TDX_FQ_NONE,
-            offset,
-            count: TDX_PAGE_SIZE,
-        })?;
+        let rows = source.fetch_page(contract.page_request(&request.range, offset))?;
         if rows.is_empty() {
             return Err(benchmark_gateway_error(
                 BenchmarkAuditOutcome::Partial,
@@ -1963,11 +2021,9 @@ fn probe_raw_benchmark_from_source(
             "raw benchmark diagnostic observed_at is not RFC3339",
         )
     })?;
-    let category = match request.range {
-        BenchmarkRange::Daily { .. } => TDX_DAILY_CATEGORY,
-        BenchmarkRange::Minute1 { .. } => TDX_MINUTE1_CATEGORY,
-    };
-    let pages = fetch_raw_benchmark_pages(source, &request, category)?;
+    let contract = TdxIndexProtocolContract::tdx_hs300_v1();
+    let category = contract.category_for(&request.range);
+    let pages = fetch_raw_benchmark_pages(source, &request, contract)?;
 
     let mut keyed_rows = Vec::new();
     let mut page_traces = Vec::with_capacity(pages.len());
@@ -2065,16 +2121,16 @@ fn probe_raw_benchmark_from_source(
         request_hash: canonical_base_request_hash(&request),
         identity_anchor: BenchmarkRawIdentityAnchor {
             canonical_instrument: request.instrument,
-            provider_market: TDX_MARKET,
-            provider_code: TDX_CODE,
+            provider_market: contract.market,
+            provider_code: contract.code,
             provider_category: category,
-            adjustment_mode: TDX_FQ_NONE,
+            adjustment_mode: contract.fq_type,
             provider_identity_echo: None,
             identity_verification: BenchmarkRawIdentityVerification::Unverified,
         },
         granularity,
         provider: "Tdx".to_owned(),
-        source: format!("magic-tdx-index-bars@{TDX_DEPENDENCY_REVISION}"),
+        source: contract.source(),
         source_at: None,
         observed_at: observed_at.to_owned(),
         provider_reported_total: None,
@@ -2090,7 +2146,7 @@ fn probe_raw_benchmark_from_source(
             BenchmarkRawMinuteLabelSemantics::NotApplicable
         },
         minute_raw_time_samples,
-        protocol_revision: TDX_DEPENDENCY_REVISION,
+        protocol_revision: contract.dependency_revision,
     })
 }
 
@@ -2207,7 +2263,7 @@ fn raw_time_key(row: &RawIndexBar, range: &BenchmarkRange) -> Result<i64, Gatewa
 
 fn canonical_acquisition_bytes(
     request: &BenchmarkRequest,
-    category: u8,
+    contract: TdxIndexProtocolContract,
     pages: &[(u32, Vec<RawIndexBar>)],
 ) -> Result<Vec<u8>, GatewayError> {
     let mut canonical = Vec::new();
@@ -2225,9 +2281,13 @@ fn canonical_acquisition_bytes(
             append_length_prefixed(&mut canonical, to.to_rfc3339().as_bytes())?;
         }
     }
-    canonical.extend_from_slice(&[TDX_MARKET, category, TDX_FQ_NONE]);
-    append_length_prefixed(&mut canonical, TDX_CODE.as_bytes())?;
-    append_length_prefixed(&mut canonical, TDX_DEPENDENCY_REVISION.as_bytes())?;
+    canonical.extend_from_slice(&[
+        contract.market,
+        contract.category_for(&request.range),
+        contract.fq_type,
+    ]);
+    append_length_prefixed(&mut canonical, contract.code.as_bytes())?;
+    append_length_prefixed(&mut canonical, contract.dependency_revision.as_bytes())?;
     append_collection_len(&mut canonical, pages.len())?;
     for (offset, rows) in pages {
         canonical.extend_from_slice(&offset.to_be_bytes());
@@ -2436,7 +2496,6 @@ mod tests {
         BenchmarkBarTime, BenchmarkError, BenchmarkEvidenceWire, BenchmarkGrpcResponseWire,
         BenchmarkProviderAttestation, BenchmarkRange, BenchmarkRegistry, BenchmarkRequest,
         BenchmarkUnsupported, BenchmarkWireTime, IndexBarsSource, IndexPageRequest, RawIndexBar,
-        HS300_CANONICAL,
     };
     use crate::data_gateway::review::AuditedBenchmarkBatch;
     use crate::data_gateway::{BatchEvidence, GatewayBatch, GatewayError};
@@ -2495,6 +2554,74 @@ mod tests {
 
     fn test_registry() -> BenchmarkRegistry {
         BenchmarkRegistry::test_only(["TEST_CODE_000300"])
+    }
+
+    #[test]
+    fn production_contract_uses_build_generated_locked_revision() {
+        let adapter_source = include_str!("benchmark.rs");
+        assert!(adapter_source.contains(
+            "const TDX_DEPENDENCY_REVISION: &str = env!(\"MAGIC_TDX_DEPENDENCY_REVISION\");"
+        ));
+
+        let lock: toml::Value = toml::from_str(include_str!("../../Cargo.lock"))
+            .expect("TEST_CODE Cargo.lock must be valid TOML");
+        let sources: Vec<_> = lock["package"]
+            .as_array()
+            .expect("TEST_CODE Cargo.lock packages")
+            .iter()
+            .filter(|package| package["name"].as_str() == Some("magic-tdx-rs"))
+            .filter_map(|package| package["source"].as_str())
+            .collect();
+        assert_eq!(
+            sources.len(),
+            1,
+            "TEST_CODE magic-tdx source must be unique"
+        );
+        let (_, resolved_revision) = sources[0]
+            .rsplit_once('#')
+            .expect("TEST_CODE magic-tdx source must contain a resolved revision");
+        assert_eq!(super::TDX_DEPENDENCY_REVISION, resolved_revision);
+        assert_eq!(resolved_revision.len(), 40);
+        assert!(resolved_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+
+        let attestation = BenchmarkProviderAttestation::production_default();
+        assert_eq!(
+            attestation.identity,
+            super::BenchmarkIdentityAttestation::RequestBoundTdxHs300V1
+        );
+        let contract = super::TdxIndexProtocolContract::tdx_hs300_v1();
+        assert_eq!(contract.dependency_revision, resolved_revision);
+    }
+
+    #[test]
+    fn test_only_daily_attestation_binds_exact_hs300_protocol_request() {
+        let day = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
+        let source = TestIndexBarsSource::new(vec![Ok(vec![raw_daily(day)])]);
+        let prepared = acquire_benchmark_batch_from_source(
+            &source,
+            daily_request(day, day, "TEST_CODE_000300"),
+            &test_registry(),
+            BenchmarkProviderAttestation::test_only(true, false),
+            BenchmarkAdmissionCoverage::Daily {
+                authoritative_trading_days: &[day],
+            },
+            "2099-01-02T10:00:00+08:00",
+        )
+        .expect("TEST_CODE request-bound Daily identity must admit exact protocol data");
+
+        assert_eq!(prepared.batch.records().len(), 1);
+        assert_eq!(
+            prepared.batch.evidence().source,
+            format!("magic-tdx-index-bars@{}", super::TDX_DEPENDENCY_REVISION)
+        );
+        let requests = source.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].market, 1);
+        assert_eq!(requests[0].code, "000300");
+        assert_eq!(requests[0].category, 4);
+        assert_eq!(requests[0].fq_type, 0);
     }
 
     #[test]
@@ -2569,21 +2696,6 @@ mod tests {
         );
         assert!(report.minute_raw_time_samples.is_empty());
         assert_eq!(audit_count(), audit_count_before);
-
-        let admitted_source = TestIndexBarsSource::new(vec![]);
-        let error = acquire_benchmark_batch_from_source(
-            &admitted_source,
-            daily_request(admitted_day, admitted_day, HS300_CANONICAL),
-            &BenchmarkRegistry::production_default(),
-            BenchmarkProviderAttestation::production_default(),
-            BenchmarkAdmissionCoverage::Daily {
-                authoritative_trading_days: &[admitted_day],
-            },
-            "2099-01-02T10:00:00+08:00",
-        )
-        .expect_err("production admitted acquisition must remain unattested");
-        assert_eq!(error.reason_code(), "benchmark_identity_unverified");
-        assert!(admitted_source.offsets().is_empty());
     }
 
     #[test]
@@ -2923,42 +3035,13 @@ mod tests {
     }
 
     #[test]
-    fn production_registry_only_accepts_the_canonical_hs300_identity() {
+    fn production_registry_rejects_test_identity() {
         let trading_day = date(21);
         let coverage = BenchmarkAdmissionCoverage::Daily {
             authoritative_trading_days: &[trading_day],
         };
         let bars = vec![bar(BenchmarkBarTime::Daily(trading_day))];
 
-        assert!(admit_benchmark_batch(
-            &BenchmarkRegistry::production_default(),
-            daily_request(trading_day, trading_day, HS300_CANONICAL),
-            bars.clone(),
-            coverage,
-        )
-        .is_ok());
-        assert_eq!(
-            admit_benchmark_batch(
-                &BenchmarkRegistry::production_default(),
-                daily_request(trading_day, trading_day, "sh000905"),
-                bars.clone(),
-                coverage,
-            ),
-            Err(BenchmarkError::Unsupported(
-                BenchmarkUnsupported::UnsupportedInstrument
-            ))
-        );
-        assert_eq!(
-            admit_benchmark_batch(
-                &BenchmarkRegistry::production_default(),
-                daily_request(trading_day, trading_day, "sz000001"),
-                bars.clone(),
-                coverage,
-            ),
-            Err(BenchmarkError::Unsupported(
-                BenchmarkUnsupported::UnsupportedInstrument
-            ))
-        );
         assert_eq!(
             admit_benchmark_batch(
                 &BenchmarkRegistry::production_default(),
@@ -3484,8 +3567,8 @@ mod tests {
         let empty_source = TestIndexBarsSource::new(vec![]);
         let unsupported = acquire_benchmark_batch_from_source(
             &empty_source,
-            daily_request(day, day, "sh000905"),
-            &BenchmarkRegistry::production_default(),
+            daily_request(day, day, "TEST_CODE_000905"),
+            &test_registry(),
             BenchmarkProviderAttestation::test_only(true, true),
             BenchmarkAdmissionCoverage::Daily {
                 authoritative_trading_days: &[day],
@@ -3495,9 +3578,9 @@ mod tests {
         .expect_err("unregistered benchmark must be unsupported");
         let identity_unavailable = acquire_benchmark_batch_from_source(
             &empty_source,
-            daily_request(day, day, HS300_CANONICAL),
-            &BenchmarkRegistry::production_default(),
-            BenchmarkProviderAttestation::production_default(),
+            daily_request(day, day, "TEST_CODE_000300"),
+            &test_registry(),
+            BenchmarkProviderAttestation::test_only(false, true),
             BenchmarkAdmissionCoverage::Daily {
                 authoritative_trading_days: &[day],
             },
@@ -3656,7 +3739,7 @@ mod tests {
             let request = daily_request(day, day, "TEST_CODE_000300");
             let canonical = super::canonical_acquisition_bytes(
                 &request,
-                super::TDX_DAILY_CATEGORY,
+                super::TdxIndexProtocolContract::tdx_hs300_v1(),
                 &[(0, vec![raw])],
             )
             .expect("TEST_CODE canonical identity");
@@ -3689,7 +3772,7 @@ mod tests {
         let changed_range_request = daily_request(day, next_day, "TEST_CODE_000300");
         let changed_range_canonical = super::canonical_acquisition_bytes(
             &changed_range_request,
-            super::TDX_DAILY_CATEGORY,
+            super::TdxIndexProtocolContract::tdx_hs300_v1(),
             &[(0, vec![base.clone()])],
         )
         .expect("TEST_CODE changed-range canonical identity");
@@ -3750,7 +3833,7 @@ mod tests {
     fn daily_authority_is_typed_unavailable_outside_the_immutable_calendar() {
         let day = NaiveDate::from_ymd_opt(2099, 1, 5).unwrap();
         let error = super::verified_benchmark_coverage(&BenchmarkRequest {
-            instrument: HS300_CANONICAL.to_owned(),
+            instrument: "TEST_CODE_000300".to_owned(),
             range: BenchmarkRange::Daily { from: day, to: day },
         })
         .expect_err("calendar coverage must not be guessed from weekdays");
@@ -3788,28 +3871,26 @@ mod tests {
     }
 
     #[test]
-    fn attestation_fails_before_source_access_and_minute_semantics_are_independent() {
+    fn unverified_identity_and_minute_semantics_fail_before_source_access() {
         let day = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
         let source = TestIndexBarsSource::new(vec![]);
         let identity_error = acquire_benchmark_batch_from_source(
             &source,
-            BenchmarkRequest {
-                instrument: HS300_CANONICAL.to_owned(),
-                range: BenchmarkRange::Daily { from: day, to: day },
-            },
-            &BenchmarkRegistry::production_default(),
-            BenchmarkProviderAttestation::production_default(),
+            daily_request(day, day, "TEST_CODE_000300"),
+            &test_registry(),
+            BenchmarkProviderAttestation::test_only(false, true),
             BenchmarkAdmissionCoverage::Daily {
                 authoritative_trading_days: &[day],
             },
             "2099-01-02T10:00:00+08:00",
         )
-        .expect_err("production identity is not attested");
+        .expect_err("explicitly unverified identity is not admitted");
         assert_eq!(
             identity_error.reason_code(),
             "benchmark_identity_unverified"
         );
 
+        assert!(!BenchmarkProviderAttestation::production_default().minute_end_semantics_verified);
         let minute_error = acquire_benchmark_batch_from_source(
             &source,
             minute_request(
@@ -3821,7 +3902,7 @@ mod tests {
             BenchmarkAdmissionCoverage::Minute1,
             "2099-01-02T10:00:00+08:00",
         )
-        .expect_err("minute-end semantics are independently unattested");
+        .expect_err("production minute-end semantics remain independently unattested");
         assert_eq!(
             minute_error.reason_code(),
             "benchmark_time_semantics_unavailable"

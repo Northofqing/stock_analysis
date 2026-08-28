@@ -10,10 +10,21 @@
 //! 上游合同文件本身零修改 — 上游更新 proto 后本地自动跟随。
 use std::path::PathBuf;
 
+#[path = "build_support/magic_tdx_lock.rs"]
+mod magic_tdx_lock;
+
 fn main() {
     // tonic 0.14 重构: configure()/compile() 从 tonic_build 移到 tonic-prost-build
     // (tonic_build 0.14 只保留 Service codegen, "Prost functionality has been moved
     //  to tonic-prost-build" — 见 tonic-build-0.14.6 lib.rs 顶部注释)。API 等价。
+    let manifest_dir =
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let lock_path = manifest_dir.join("Cargo.lock");
+    let magic_tdx_revision = locked_magic_tdx_revision(&lock_path);
+    println!("cargo:rustc-env=MAGIC_TDX_DEPENDENCY_REVISION={magic_tdx_revision}");
+    println!("cargo:rerun-if-changed={}", lock_path.display());
+    println!("cargo:rerun-if-changed=build_support/magic_tdx_lock.rs");
+
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let upstream = "client-bundle/market.proto";
     let content = std::fs::read_to_string(upstream)
@@ -31,6 +42,39 @@ fn main() {
         .expect("compile market_local.proto (上游合同 + 本地扩展)");
     println!("cargo:rerun-if-changed={upstream}");
     println!("cargo:rerun-if-changed=build.rs");
+}
+
+fn locked_magic_tdx_revision(lock_path: &std::path::Path) -> String {
+    const PACKAGE: &str = "magic-tdx-rs";
+    let lock_bytes = std::fs::read_to_string(lock_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", lock_path.display()));
+    let lock: toml::Value = lock_bytes
+        .parse()
+        .unwrap_or_else(|error| panic!("parse {}: {error}", lock_path.display()));
+    let packages = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .unwrap_or_else(|| panic!("{} has no package array", lock_path.display()));
+    let matches: Vec<_> = packages
+        .iter()
+        .filter(|package| package.get("name").and_then(toml::Value::as_str) == Some(PACKAGE))
+        .collect();
+    let [package] = matches.as_slice() else {
+        panic!(
+            "{} must contain exactly one {PACKAGE} package, found {}",
+            lock_path.display(),
+            matches.len()
+        );
+    };
+    let source = package
+        .get("source")
+        .and_then(toml::Value::as_str)
+        .unwrap_or_else(|| panic!("{PACKAGE} must have a locked Git source"));
+    let revision =
+        magic_tdx_lock::exact_locked_magic_tdx_revision(source).unwrap_or_else(|error| {
+            panic!("{PACKAGE} source is not an exact locked revision: {error}")
+        });
+    revision.to_owned()
 }
 
 /// 本地扩展块 (注释解释来源与用户决策)。
