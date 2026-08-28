@@ -94,7 +94,11 @@ const ATTEMPT_TABLE: &str = r#"CREATE TABLE attribution_epoch_attempt_audit (
     record_hash TEXT NOT NULL UNIQUE CHECK(length(record_hash) = 64),
     created_at TEXT NOT NULL,
     retention_deadline TEXT NOT NULL,
-    CHECK((epoch_id IS NULL) = (success_receipt_hash IS NULL))
+    CHECK(
+        (outcome = 'success' AND epoch_id IS NOT NULL AND success_receipt_hash IS NOT NULL)
+        OR
+        (outcome <> 'success' AND epoch_id IS NULL AND success_receipt_hash IS NULL)
+    )
 )"#;
 
 const ATTEMPT_CHAIN_TABLE: &str = r#"CREATE TABLE attribution_epoch_attempt_chain (
@@ -489,6 +493,25 @@ fn install_triggers(conn: &mut SqliteConnection, table: &str) -> diesel::QueryRe
 }
 
 fn validate_schema(conn: &mut SqliteConnection) -> diesel::QueryResult<()> {
+    let protected_trigger_count = diesel::sql_query(
+        "SELECT COUNT(*) AS count FROM sqlite_master
+         WHERE type = 'trigger' AND tbl_name IN (
+            'attribution_sample_epoch_receipt',
+            'attribution_sample_epoch_receipt_chain',
+            'attribution_legacy_carry_item',
+            'attribution_epoch_attempt_audit',
+            'attribution_epoch_attempt_chain',
+            'paper_attribution_epoch_daily',
+            'paper_attribution_epoch_daily_chain'
+         )",
+    )
+    .get_result::<CountRow>(conn)?
+    .count;
+    if protected_trigger_count != 14 {
+        return Err(integrity(format!(
+            "BR-255 protected trigger registry has {protected_trigger_count} entries instead of 14"
+        )));
+    }
     for (name, expected) in TABLES {
         let row = diesel::sql_query(
             "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -560,7 +583,13 @@ fn parse_utc(value: &str, field: &str) -> diesel::QueryResult<DateTime<Utc>> {
     if parsed.offset().local_minus_utc() != 0 {
         return Err(integrity(format!("BR-255 {field} is not UTC")));
     }
-    Ok(parsed.with_timezone(&Utc))
+    let utc = parsed.with_timezone(&Utc);
+    if utc.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string() != value {
+        return Err(integrity(format!(
+            "BR-255 {field} does not use canonical millisecond UTC bytes"
+        )));
+    }
+    Ok(utc)
 }
 
 fn validate_window(created_at: &str, deadline: &str, family: &str) -> diesel::QueryResult<()> {
@@ -791,14 +820,13 @@ fn validate_sequence(conn: &mut SqliteConnection, table: &str) -> diesel::QueryR
         .into_iter()
         .map(|row| row.id)
         .collect::<Vec<_>>();
-    let sequence = diesel::sql_query("SELECT seq FROM sqlite_sequence WHERE name = ?")
+    let sequences = diesel::sql_query("SELECT seq FROM sqlite_sequence WHERE name = ?")
         .bind::<Text, _>(table)
-        .get_result::<SequenceRow>(conn)
-        .optional()?;
-    let exact = match sequence {
-        None => ids.is_empty(),
-        Some(SequenceRow { seq: Some(seq) }) if seq > 0 => ids.iter().copied().eq(1..=seq),
-        Some(_) => false,
+        .load::<SequenceRow>(conn)?;
+    let exact = match sequences.as_slice() {
+        [SequenceRow { seq: Some(0) }] => ids.is_empty(),
+        [SequenceRow { seq: Some(seq) }] if *seq > 0 => ids.iter().copied().eq(1..=*seq),
+        _ => false,
     };
     if !exact {
         return Err(integrity(format!(
@@ -1008,7 +1036,10 @@ fn validate_attempts(conn: &mut SqliteConnection) -> diesel::QueryResult<Vec<Per
             || row.source.trim().is_empty()
             || row.outcome.trim().is_empty()
             || row.reason_code.trim().is_empty()
-            || (row.epoch_id.is_some() != row.success_receipt_hash.is_some())
+            || ((row.outcome == "success")
+                != (row.epoch_id.is_some() && row.success_receipt_hash.is_some()))
+            || (row.outcome != "success"
+                && (row.epoch_id.is_some() || row.success_receipt_hash.is_some()))
             || row
                 .epoch_id
                 .as_deref()
@@ -1144,6 +1175,23 @@ pub(super) fn create_schema(conn: &mut SqliteConnection) -> diesel::QueryResult<
                 .execute(conn)?;
             install_triggers(conn, table)?;
         }
+        if existing == 0 {
+            for (table, _) in TABLES {
+                let registered =
+                    diesel::sql_query("SELECT COUNT(*) AS count FROM sqlite_sequence WHERE name=?")
+                        .bind::<Text, _>(table)
+                        .get_result::<CountRow>(conn)?
+                        .count;
+                if registered != 0 {
+                    return Err(integrity(format!(
+                        "BR-255 fresh sequence registry already contains {table}"
+                    )));
+                }
+                diesel::sql_query("INSERT INTO sqlite_sequence(name, seq) VALUES (?, 0)")
+                    .bind::<Text, _>(table)
+                    .execute(conn)?;
+            }
+        }
         validate_all(conn).map(|_| ())
     })
 }
@@ -1193,9 +1241,6 @@ impl<'a> AttributionEpochStore<'a> {
         &self,
         selector: &AttributionEpochSelector,
     ) -> Result<ResolvedAttributionEpoch, AttributionEpochStoreError> {
-        if matches!(selector, AttributionEpochSelector::Legacy) {
-            return Ok(ResolvedAttributionEpoch::Legacy);
-        }
         let mut conn =
             self.database
                 .get_conn()
@@ -1204,9 +1249,37 @@ impl<'a> AttributionEpochStore<'a> {
                     retryable: true,
                     detail: format!("BR-255 epoch database connection unavailable: {error}"),
                 })?;
+        let existing = diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM sqlite_master
+             WHERE type = 'table' AND name IN (
+                'attribution_sample_epoch_receipt',
+                'attribution_sample_epoch_receipt_chain',
+                'attribution_legacy_carry_item',
+                'attribution_epoch_attempt_audit',
+                'attribution_epoch_attempt_chain',
+                'paper_attribution_epoch_daily',
+                'paper_attribution_epoch_daily_chain'
+             )",
+        )
+        .get_result::<CountRow>(&mut conn)
+        .map_err(map_integrity)?
+        .count;
+        if existing == 0 {
+            return match selector {
+                AttributionEpochSelector::Legacy => Ok(ResolvedAttributionEpoch::Legacy),
+                _ => Err(unavailable(
+                    "BR-255 attribution epoch storage has not been installed",
+                )),
+            };
+        }
+        if existing != 7 {
+            return Err(failed_integrity(format!(
+                "BR-255 attribution epoch schema is partial: {existing} of 7 tables"
+            )));
+        }
         let rows = validate_all(&mut conn).map_err(map_integrity)?;
         match selector {
-            AttributionEpochSelector::Legacy => unreachable!(),
+            AttributionEpochSelector::Legacy => Ok(ResolvedAttributionEpoch::Legacy),
             AttributionEpochSelector::Active => {
                 if rows.is_empty() {
                     return Err(unavailable(
@@ -1254,7 +1327,10 @@ impl<'a> AttributionEpochStore<'a> {
             || input.outcome.trim().is_empty()
             || input.reason_code.trim().is_empty()
             || !lower_hash(&input.source_summary_hash)
-            || input.epoch_id.is_some() != input.success_receipt_hash.is_some()
+            || ((input.outcome == "success")
+                != (input.epoch_id.is_some() && input.success_receipt_hash.is_some()))
+            || (input.outcome != "success"
+                && (input.epoch_id.is_some() || input.success_receipt_hash.is_some()))
             || input
                 .epoch_id
                 .as_deref()
@@ -1537,6 +1613,74 @@ mod tests {
     }
 
     #[test]
+    fn fresh_schema_registers_every_empty_autoincrement_sequence() {
+        let database = TestDatabase::new();
+        let mut conn = database.manager.get_conn().unwrap();
+        for (table, _) in TABLES {
+            let row_count = diesel::sql_query(format!("SELECT COUNT(*) AS count FROM {table}"))
+                .get_result::<CountRow>(&mut conn)
+                .unwrap()
+                .count;
+            assert_eq!(
+                row_count, 0,
+                "TEST_CODE schema init wrote a fact to {table}"
+            );
+            let sequence = diesel::sql_query("SELECT seq FROM sqlite_sequence WHERE name=?")
+                .bind::<Text, _>(table)
+                .get_result::<SequenceRow>(&mut conn)
+                .optional()
+                .unwrap();
+            assert_eq!(sequence.and_then(|row| row.seq), Some(0), "{table}");
+        }
+        diesel::sql_query(
+            "DELETE FROM sqlite_sequence WHERE name='attribution_sample_epoch_receipt'",
+        )
+        .execute(&mut conn)
+        .unwrap();
+        drop(conn);
+        assert_eq!(
+            AttributionEpochStore::new(&database.manager)
+                .verify_active()
+                .unwrap_err()
+                .reason_code(),
+            "attribution_epoch_integrity_failed"
+        );
+    }
+
+    #[test]
+    fn coordinated_history_and_sequence_deletion_cannot_look_pristine() {
+        let database = TestDatabase::new();
+        AttributionEpochStore::new(&database.manager)
+            .append_attempt(sample_attempt())
+            .unwrap();
+        let mut conn = database.manager.get_conn().unwrap();
+        for table in [
+            "attribution_epoch_attempt_chain",
+            "attribution_epoch_attempt_audit",
+        ] {
+            diesel::sql_query(format!("DROP TRIGGER trg_{table}_no_delete"))
+                .execute(&mut conn)
+                .unwrap();
+            diesel::sql_query(format!("DELETE FROM {table}"))
+                .execute(&mut conn)
+                .unwrap();
+            install_triggers(&mut conn, table).unwrap();
+            diesel::sql_query("DELETE FROM sqlite_sequence WHERE name=?")
+                .bind::<Text, _>(table)
+                .execute(&mut conn)
+                .unwrap();
+        }
+        drop(conn);
+        assert_eq!(
+            AttributionEpochStore::new(&database.manager)
+                .load_selector(&AttributionEpochSelector::Legacy)
+                .unwrap_err()
+                .reason_code(),
+            "attribution_epoch_integrity_failed"
+        );
+    }
+
+    #[test]
     fn partial_epoch_schema_is_integrity_failure_instead_of_silent_completion() {
         let mut conn = SqliteConnection::establish(":memory:").unwrap();
         diesel::sql_query(RECEIPT_TABLE).execute(&mut conn).unwrap();
@@ -1572,6 +1716,124 @@ mod tests {
             .load_selector(&AttributionEpochSelector::Active)
             .expect_err("TEST_CODE no-op trigger must fail closed");
         assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
+    }
+
+    #[test]
+    fn every_protected_table_blocks_both_update_and_delete() {
+        let database = TestDatabase::new();
+        populate_all_protected_tables(&database.manager);
+        let mut conn = database.manager.get_conn().unwrap();
+        for (table, _) in TABLES {
+            assert!(
+                diesel::sql_query(format!("UPDATE {table} SET id=id WHERE id=1"))
+                    .execute(&mut conn)
+                    .is_err(),
+                "TEST_CODE {table} UPDATE protection"
+            );
+            assert!(
+                diesel::sql_query(format!("DELETE FROM {table} WHERE id=1"))
+                    .execute(&mut conn)
+                    .is_err(),
+                "TEST_CODE {table} DELETE protection"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_selector_validates_present_epoch_storage_and_extra_triggers_fail_closed() {
+        for extra_trigger in [false, true] {
+            let database = TestDatabase::new();
+            let mut conn = database.manager.get_conn().unwrap();
+            if extra_trigger {
+                diesel::sql_query(
+                    "CREATE TRIGGER TEST_CODE_unexpected_epoch_insert
+                     BEFORE INSERT ON attribution_sample_epoch_receipt BEGIN SELECT 1; END",
+                )
+                .execute(&mut conn)
+                .unwrap();
+            } else {
+                diesel::sql_query("DROP TRIGGER trg_attribution_sample_epoch_receipt_no_delete")
+                    .execute(&mut conn)
+                    .unwrap();
+            }
+            drop(conn);
+            let error = AttributionEpochStore::new(&database.manager)
+                .load_selector(&AttributionEpochSelector::Legacy)
+                .expect_err("TEST_CODE Legacy must validate retained epoch storage");
+            assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
+        }
+    }
+
+    #[test]
+    fn canonical_timestamp_fraction_and_month_end_retention_are_exact() {
+        assert!(parse_utc("2026-08-28T08:00:00.0Z", "TEST_CODE timestamp").is_err());
+        assert!(parse_utc("2026-08-28T08:00:00.000000000Z", "TEST_CODE timestamp").is_err());
+        assert!(parse_utc("2026-08-28T08:00:00.000Z", "TEST_CODE timestamp").is_ok());
+        assert!(validate_window(
+            "2024-02-29T08:00:00.000Z",
+            "2029-02-28T08:00:00.000Z",
+            "TEST_CODE leap retention"
+        )
+        .is_ok());
+        assert!(validate_window(
+            "2024-02-29T08:00:00.000Z",
+            "2029-02-28T07:59:59.999Z",
+            "TEST_CODE leap retention"
+        )
+        .is_err());
+        assert!(validate_window(
+            "2024-01-31T08:00:00.000Z",
+            "2029-01-31T08:00:00.000Z",
+            "TEST_CODE month-end retention"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn success_attempt_requires_exact_receipt_and_non_success_forbids_one() {
+        let database = TestDatabase::new();
+        let store = AttributionEpochStore::new(&database.manager);
+        let mut success_without_receipt = sample_attempt();
+        success_without_receipt.outcome = "success".to_owned();
+        assert_eq!(
+            store
+                .append_attempt(success_without_receipt)
+                .unwrap_err()
+                .reason_code(),
+            "attribution_epoch_integrity_failed"
+        );
+
+        let receipt_hash = insert_success(&database.manager, None);
+        let mut failure_with_receipt = sample_attempt();
+        failure_with_receipt.epoch_id = Some("a".repeat(64));
+        failure_with_receipt.success_receipt_hash = Some(receipt_hash.clone());
+        assert_eq!(
+            store
+                .append_attempt(failure_with_receipt)
+                .unwrap_err()
+                .reason_code(),
+            "attribution_epoch_integrity_failed"
+        );
+
+        let mut exact_success = sample_attempt();
+        exact_success.outcome = "success".to_owned();
+        exact_success.epoch_id = Some("a".repeat(64));
+        exact_success.success_receipt_hash = Some("f".repeat(64));
+        assert_eq!(
+            store
+                .append_attempt(exact_success.clone())
+                .unwrap_err()
+                .reason_code(),
+            "attribution_epoch_integrity_failed"
+        );
+        exact_success.success_receipt_hash = Some(receipt_hash);
+        assert_eq!(
+            store
+                .append_attempt(exact_success)
+                .unwrap()
+                .attempt_audit_id,
+            1
+        );
     }
 
     #[test]
@@ -1702,6 +1964,65 @@ mod tests {
         );
         insert_persisted_receipt(&mut conn, &mut row);
         row.receipt_hash
+    }
+
+    fn insert_success_with_single_carry(manager: &DatabaseManager) -> String {
+        let mut conn = manager.get_conn().unwrap();
+        let carry = vec![LegacyCarryPosition {
+            code: "600000".to_owned(),
+            quantity: 100,
+        }];
+        let mut receipt = sample_persisted_receipt(
+            "a".repeat(64),
+            None,
+            1,
+            100,
+            canonical_legacy_carry_manifest_hash(&carry),
+        );
+        insert_persisted_receipt(&mut conn, &mut receipt);
+        let mut item = PersistedCarry {
+            id: 0,
+            epoch_receipt_id: receipt.id,
+            code: carry[0].code.clone(),
+            quantity: 100,
+            item_index: 0,
+            predecessor_item_hash: CARRY_GENESIS.to_owned(),
+            item_hash: String::new(),
+            created_at: receipt.created_at,
+            retention_deadline: receipt.retention_deadline,
+        };
+        item.item_hash = carry_hash(&item).unwrap();
+        diesel::sql_query(
+            "INSERT INTO attribution_legacy_carry_item
+             (epoch_receipt_id, code, quantity, item_index, predecessor_item_hash,
+              item_hash, created_at, retention_deadline)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind::<BigInt, _>(item.epoch_receipt_id)
+        .bind::<Text, _>(&item.code)
+        .bind::<BigInt, _>(item.quantity)
+        .bind::<BigInt, _>(item.item_index)
+        .bind::<Text, _>(&item.predecessor_item_hash)
+        .bind::<Text, _>(&item.item_hash)
+        .bind::<Text, _>(&item.created_at)
+        .bind::<Text, _>(&item.retention_deadline)
+        .execute(&mut conn)
+        .unwrap();
+        item.item_hash
+    }
+
+    fn populate_all_protected_tables(manager: &DatabaseManager) {
+        insert_success_with_single_carry(manager);
+        let store = AttributionEpochStore::new(manager);
+        store.append_attempt(sample_attempt()).unwrap();
+        store
+            .append_daily(AttributionEpochDailyAppend {
+                epoch_id: "a".repeat(64),
+                date: NaiveDate::from_ymd_opt(2026, 8, 28).unwrap(),
+                signal_family: "all".to_owned(),
+                payload: serde_json::json!({"closed": 1}),
+            })
+            .unwrap();
     }
 
     fn sample_persisted_receipt(
@@ -1906,6 +2227,263 @@ mod tests {
                 .unwrap_err()
                 .reason_code(),
             "attribution_epoch_integrity_failed"
+        );
+    }
+
+    #[test]
+    fn semantic_fact_tamper_is_detected_for_every_hash_family() {
+        for (table, statement) in [
+            (
+                "attribution_sample_epoch_receipt",
+                "UPDATE attribution_sample_epoch_receipt SET paper_trade_high_water=13 WHERE id=1",
+            ),
+            (
+                "attribution_legacy_carry_item",
+                "UPDATE attribution_legacy_carry_item SET quantity=200 WHERE id=1",
+            ),
+            (
+                "attribution_epoch_attempt_audit",
+                "UPDATE attribution_epoch_attempt_audit SET reason_code='TEST_CODE_changed' WHERE id=1",
+            ),
+            (
+                "paper_attribution_epoch_daily",
+                "UPDATE paper_attribution_epoch_daily SET signal_family='changed' WHERE id=1",
+            ),
+        ] {
+            let database = TestDatabase::new();
+            populate_all_protected_tables(&database.manager);
+            let mut conn = database.manager.get_conn().unwrap();
+            diesel::sql_query(format!("DROP TRIGGER trg_{table}_no_update"))
+                .execute(&mut conn)
+                .unwrap();
+            diesel::sql_query(statement).execute(&mut conn).unwrap();
+            install_triggers(&mut conn, table).unwrap();
+            drop(conn);
+            assert_eq!(
+                AttributionEpochStore::new(&database.manager)
+                    .load_selector(&AttributionEpochSelector::Legacy)
+                    .unwrap_err()
+                    .reason_code(),
+                "attribution_epoch_integrity_failed",
+                "TEST_CODE semantic tamper in {table}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_semantic_preimage_field_changes_its_family_hash() {
+        macro_rules! changed {
+            ($hash:ident, $row:ident, $field:ident, $value:expr) => {{
+                let mut mutation = $row.clone();
+                mutation.$field = $value;
+                assert_ne!(
+                    $hash(&$row).unwrap(),
+                    $hash(&mutation).unwrap(),
+                    "TEST_CODE {} must be hash-bound",
+                    stringify!($field)
+                );
+            }};
+        }
+
+        let receipt = sample_persisted_receipt(
+            "a".repeat(64),
+            None,
+            0,
+            0,
+            canonical_legacy_carry_manifest_hash(&[]),
+        );
+        changed!(receipt_hash, receipt, epoch_id, "b".repeat(64));
+        changed!(
+            receipt_hash,
+            receipt,
+            cutover_completed_trading_date,
+            "2026-08-27".to_owned()
+        );
+        changed!(
+            receipt_hash,
+            receipt,
+            effective_trading_date,
+            "2026-09-01".to_owned()
+        );
+        changed!(receipt_hash, receipt, paper_trade_high_water, 13);
+        changed!(
+            receipt_hash,
+            receipt,
+            legacy_filled_manifest_hash,
+            "7".repeat(64)
+        );
+        changed!(
+            receipt_hash,
+            receipt,
+            terminal_binding_manifest_hash,
+            "7".repeat(64)
+        );
+        changed!(receipt_hash, receipt, order_audit_high_water, 15);
+        changed!(receipt_hash, receipt, order_audit_tip_hash, "7".repeat(64));
+        changed!(
+            receipt_hash,
+            receipt,
+            calendar_authority_hash,
+            "7".repeat(64)
+        );
+        changed!(
+            receipt_hash,
+            receipt,
+            legacy_carry_manifest_hash,
+            "7".repeat(64)
+        );
+        changed!(receipt_hash, receipt, carry_item_count, 1);
+        changed!(receipt_hash, receipt, carry_total_quantity, 100);
+        changed!(
+            receipt_hash,
+            receipt,
+            position_projection_hash,
+            "7".repeat(64)
+        );
+        changed!(
+            receipt_hash,
+            receipt,
+            previous_epoch_receipt_hash,
+            Some("7".repeat(64))
+        );
+        changed!(receipt_hash, receipt, decision_basis, "changed".to_owned());
+        changed!(
+            receipt_hash,
+            receipt,
+            created_at,
+            "2026-08-28T08:00:00.001Z".to_owned()
+        );
+        changed!(
+            receipt_hash,
+            receipt,
+            retention_deadline,
+            "2031-08-28T08:00:00.001Z".to_owned()
+        );
+
+        let carry = PersistedCarry {
+            id: 1,
+            epoch_receipt_id: 1,
+            code: "600000".to_owned(),
+            quantity: 100,
+            item_index: 0,
+            predecessor_item_hash: CARRY_GENESIS.to_owned(),
+            item_hash: String::new(),
+            created_at: "2026-08-28T08:00:00.000Z".to_owned(),
+            retention_deadline: "2031-08-28T08:00:00.000Z".to_owned(),
+        };
+        changed!(carry_hash, carry, epoch_receipt_id, 2);
+        changed!(carry_hash, carry, code, "600001".to_owned());
+        changed!(carry_hash, carry, quantity, 200);
+        changed!(carry_hash, carry, item_index, 1);
+        changed!(carry_hash, carry, predecessor_item_hash, "7".repeat(64));
+        changed!(
+            carry_hash,
+            carry,
+            created_at,
+            "2026-08-28T08:00:00.001Z".to_owned()
+        );
+        changed!(
+            carry_hash,
+            carry,
+            retention_deadline,
+            "2031-08-28T08:00:00.001Z".to_owned()
+        );
+
+        let attempt = PersistedAttempt {
+            id: 1,
+            source: "monitor".to_owned(),
+            invoked_at: "2026-08-28T07:40:00.000Z".to_owned(),
+            completed_session_date: Some("2026-08-28".to_owned()),
+            effective_date: Some("2026-08-31".to_owned()),
+            outcome: "unavailable".to_owned(),
+            reason_code: "window_closed".to_owned(),
+            retryable: 1,
+            source_summary_hash: "1".repeat(64),
+            epoch_id: None,
+            success_receipt_hash: None,
+            predecessor_attempt_hash: ATTEMPT_GENESIS.to_owned(),
+            record_hash: String::new(),
+            created_at: "2026-08-28T08:00:00.000Z".to_owned(),
+            retention_deadline: "2031-08-28T08:00:00.000Z".to_owned(),
+        };
+        changed!(attempt_hash, attempt, source, "cli".to_owned());
+        changed!(
+            attempt_hash,
+            attempt,
+            invoked_at,
+            "2026-08-28T07:40:00.001Z".to_owned()
+        );
+        changed!(
+            attempt_hash,
+            attempt,
+            completed_session_date,
+            Some("2026-08-27".to_owned())
+        );
+        changed!(
+            attempt_hash,
+            attempt,
+            effective_date,
+            Some("2026-09-01".to_owned())
+        );
+        changed!(attempt_hash, attempt, outcome, "failed".to_owned());
+        changed!(attempt_hash, attempt, reason_code, "changed".to_owned());
+        changed!(attempt_hash, attempt, retryable, 0);
+        changed!(attempt_hash, attempt, source_summary_hash, "7".repeat(64));
+        changed!(attempt_hash, attempt, epoch_id, Some("7".repeat(64)));
+        changed!(
+            attempt_hash,
+            attempt,
+            success_receipt_hash,
+            Some("7".repeat(64))
+        );
+        changed!(
+            attempt_hash,
+            attempt,
+            predecessor_attempt_hash,
+            "7".repeat(64)
+        );
+        changed!(
+            attempt_hash,
+            attempt,
+            created_at,
+            "2026-08-28T08:00:00.001Z".to_owned()
+        );
+        changed!(
+            attempt_hash,
+            attempt,
+            retention_deadline,
+            "2031-08-28T08:00:00.001Z".to_owned()
+        );
+
+        let daily = PersistedDaily {
+            id: 1,
+            epoch_id: "a".repeat(64),
+            date: "2026-08-28".to_owned(),
+            signal_family: "all".to_owned(),
+            payload_json: "{\"closed\":1}".to_owned(),
+            payload_hash: "1".repeat(64),
+            predecessor_daily_hash: DAILY_GENESIS.to_owned(),
+            record_hash: String::new(),
+            created_at: "2026-08-28T08:00:00.000Z".to_owned(),
+            retention_deadline: "2031-08-28T08:00:00.000Z".to_owned(),
+        };
+        changed!(daily_hash, daily, epoch_id, "b".repeat(64));
+        changed!(daily_hash, daily, date, "2026-08-29".to_owned());
+        changed!(daily_hash, daily, signal_family, "other".to_owned());
+        changed!(daily_hash, daily, payload_json, "{\"closed\":2}".to_owned());
+        changed!(daily_hash, daily, payload_hash, "7".repeat(64));
+        changed!(daily_hash, daily, predecessor_daily_hash, "7".repeat(64));
+        changed!(
+            daily_hash,
+            daily,
+            created_at,
+            "2026-08-28T08:00:00.001Z".to_owned()
+        );
+        changed!(
+            daily_hash,
+            daily,
+            retention_deadline,
+            "2031-08-28T08:00:00.001Z".to_owned()
         );
     }
 }
