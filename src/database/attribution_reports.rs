@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, Months, NaiveDate, Utc};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Integer, Nullable, Text};
@@ -16,7 +16,9 @@ const SCHEMA_VERSION: i32 = 1;
 const RUN_CHAIN_GENESIS: &str = "BR251_ATTRIBUTION_RUN_CHAIN_GENESIS_V1";
 const REPORT_CHAIN_GENESIS: &str = "BR251_ATTRIBUTION_REPORT_CHAIN_GENESIS_V1";
 const FAILURE_CHAIN_GENESIS: &str = "BR251_ATTRIBUTION_FAILURE_CHAIN_GENESIS_V1";
-const IMMUTABLE_TABLES: [(&str, &str); 6] = [
+const REPORT_EPOCH_BINDING_CHAIN_GENESIS: &str =
+    "BR255_ATTRIBUTION_REPORT_EPOCH_BINDING_CHAIN_GENESIS_V1";
+const CORE_IMMUTABLE_TABLES: [(&str, &str); 6] = [
     ("attribution_run_audit", "run audit"),
     ("attribution_run_chain", "run chain"),
     ("attribution_report_revision", "report revision"),
@@ -24,6 +26,59 @@ const IMMUTABLE_TABLES: [(&str, &str); 6] = [
     ("attribution_failure_audit", "failure audit"),
     ("attribution_failure_chain", "failure chain"),
 ];
+const BINDING_IMMUTABLE_TABLES: [(&str, &str); 2] = [
+    ("attribution_report_epoch_binding", "report epoch binding"),
+    (
+        "attribution_report_epoch_binding_chain",
+        "report epoch binding chain",
+    ),
+];
+const IMMUTABLE_TABLES: [(&str, &str); 8] = [
+    ("attribution_run_audit", "run audit"),
+    ("attribution_run_chain", "run chain"),
+    ("attribution_report_revision", "report revision"),
+    ("attribution_report_chain", "report chain"),
+    ("attribution_report_epoch_binding", "report epoch binding"),
+    (
+        "attribution_report_epoch_binding_chain",
+        "report epoch binding chain",
+    ),
+    ("attribution_failure_audit", "failure audit"),
+    ("attribution_failure_chain", "failure chain"),
+];
+const REPORT_EPOCH_BINDING_TABLE_SQL: &str = r#"CREATE TABLE IF NOT EXISTS attribution_report_epoch_binding (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+    report_revision_id INTEGER NOT NULL UNIQUE,
+    binding_kind TEXT NOT NULL CHECK(binding_kind IN ('legacy', 'epoch')),
+    epoch_id TEXT CHECK(epoch_id IS NULL OR length(epoch_id) = 64),
+    epoch_receipt_hash TEXT CHECK(epoch_receipt_hash IS NULL OR length(epoch_receipt_hash) = 64),
+    effective_date TEXT,
+    legacy_carry_manifest_hash TEXT CHECK(legacy_carry_manifest_hash IS NULL OR length(legacy_carry_manifest_hash) = 64),
+    exclusion_manifest_hash TEXT CHECK(exclusion_manifest_hash IS NULL OR length(exclusion_manifest_hash) = 64),
+    binding_manifest_hash TEXT NOT NULL CHECK(length(binding_manifest_hash) = 64),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    retention_deadline TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+60 months')),
+    FOREIGN KEY(report_revision_id) REFERENCES attribution_report_revision(id),
+    CHECK(
+        (binding_kind = 'legacy' AND epoch_id IS NULL AND epoch_receipt_hash IS NULL
+            AND effective_date IS NULL AND legacy_carry_manifest_hash IS NULL
+            AND exclusion_manifest_hash IS NULL)
+        OR
+        (binding_kind = 'epoch' AND epoch_id IS NOT NULL AND epoch_receipt_hash IS NOT NULL
+            AND effective_date IS NOT NULL AND legacy_carry_manifest_hash IS NOT NULL
+            AND exclusion_manifest_hash IS NOT NULL)
+    )
+)"#;
+const REPORT_EPOCH_BINDING_CHAIN_TABLE_SQL: &str = r#"CREATE TABLE IF NOT EXISTS attribution_report_epoch_binding_chain (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_epoch_binding_id INTEGER NOT NULL UNIQUE,
+    previous_hash TEXT NOT NULL,
+    record_hash TEXT NOT NULL UNIQUE CHECK(length(record_hash) = 64),
+    created_at TEXT NOT NULL,
+    retention_deadline TEXT NOT NULL,
+    FOREIGN KEY(report_epoch_binding_id) REFERENCES attribution_report_epoch_binding(id)
+)"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttributionRunMode {
@@ -66,9 +121,23 @@ pub enum AttributionEvidenceHash {
     Unavailable(String),
 }
 
+/// Immutable sample epoch selected by one successful attribution report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum AttributionReportEpochBinding {
+    Legacy,
+    Epoch {
+        epoch_id: String,
+        epoch_receipt_hash: String,
+        effective_date: NaiveDate,
+        legacy_carry_manifest_hash: String,
+        exclusion_manifest_hash: String,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct AttributionReportAppend {
     pub invocation: AttributionInvocation,
+    pub epoch: AttributionReportEpochBinding,
     pub trade_hash: String,
     pub fee: AttributionEvidenceHash,
     pub stock_close_hash: String,
@@ -105,6 +174,9 @@ pub struct AttributionReportReceipt {
     pub report_revision: i32,
     pub predecessor_report_id: Option<i64>,
     pub report_record_hash: String,
+    pub epoch: AttributionReportEpochBinding,
+    pub epoch_binding_id: i64,
+    pub epoch_binding_record_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,6 +268,18 @@ pub struct AttributionDatabaseSession {
 struct AttributionQueryOnlyRow {
     #[diesel(sql_type = Integer)]
     query_only: i32,
+}
+
+#[derive(QueryableByName)]
+struct AttributionDeferredForeignKeysRow {
+    #[diesel(sql_type = Integer)]
+    defer_foreign_keys: i32,
+}
+
+#[derive(QueryableByName)]
+struct AttributionForeignKeysRow {
+    #[diesel(sql_type = Integer)]
+    foreign_keys: i32,
 }
 
 impl AttributionDatabaseSession {
@@ -388,6 +472,7 @@ struct PreparedInvocation {
 #[derive(Debug, Clone)]
 struct PreparedReport {
     invocation: PreparedInvocation,
+    epoch: PreparedEpochBinding,
     trade_hash: String,
     fee_status: String,
     fee_value: String,
@@ -400,6 +485,19 @@ struct PreparedReport {
     result_payload_hash: String,
     evidence_identity: String,
     report_identity: String,
+    binding_independent_identity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedEpochBinding {
+    value: AttributionReportEpochBinding,
+    binding_kind: String,
+    epoch_id: Option<String>,
+    epoch_receipt_hash: Option<String>,
+    effective_date: Option<String>,
+    legacy_carry_manifest_hash: Option<String>,
+    exclusion_manifest_hash: Option<String>,
+    binding_manifest_hash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -562,6 +660,89 @@ fn prepare_invocation(
     })
 }
 
+fn prepare_epoch_binding(
+    epoch: AttributionReportEpochBinding,
+) -> Result<PreparedEpochBinding, AttributionReportStoreError> {
+    match epoch {
+        AttributionReportEpochBinding::Legacy => {
+            let binding_manifest_hash =
+                hash_with_domain(b"BR255_ATTRIBUTION_REPORT_EPOCH_BINDING_V1", &[b"legacy"]);
+            Ok(PreparedEpochBinding {
+                value: AttributionReportEpochBinding::Legacy,
+                binding_kind: "legacy".to_owned(),
+                epoch_id: None,
+                epoch_receipt_hash: None,
+                effective_date: None,
+                legacy_carry_manifest_hash: None,
+                exclusion_manifest_hash: None,
+                binding_manifest_hash,
+            })
+        }
+        AttributionReportEpochBinding::Epoch {
+            epoch_id,
+            epoch_receipt_hash,
+            effective_date,
+            legacy_carry_manifest_hash,
+            exclusion_manifest_hash,
+        } => {
+            for (value, field) in [
+                (&epoch_id, "epoch_id"),
+                (&epoch_receipt_hash, "epoch_receipt_hash"),
+                (&legacy_carry_manifest_hash, "legacy_carry_manifest_hash"),
+                (&exclusion_manifest_hash, "exclusion_manifest_hash"),
+            ] {
+                validate_hash(value, field)?;
+            }
+            let effective_date_text = effective_date.format("%Y-%m-%d").to_string();
+            let binding_manifest_hash = hash_with_domain(
+                b"BR255_ATTRIBUTION_REPORT_EPOCH_BINDING_V1",
+                &[
+                    b"epoch",
+                    epoch_id.as_bytes(),
+                    epoch_receipt_hash.as_bytes(),
+                    effective_date_text.as_bytes(),
+                    legacy_carry_manifest_hash.as_bytes(),
+                    exclusion_manifest_hash.as_bytes(),
+                ],
+            );
+            Ok(PreparedEpochBinding {
+                value: AttributionReportEpochBinding::Epoch {
+                    epoch_id: epoch_id.clone(),
+                    epoch_receipt_hash: epoch_receipt_hash.clone(),
+                    effective_date,
+                    legacy_carry_manifest_hash: legacy_carry_manifest_hash.clone(),
+                    exclusion_manifest_hash: exclusion_manifest_hash.clone(),
+                },
+                binding_kind: "epoch".to_owned(),
+                epoch_id: Some(epoch_id),
+                epoch_receipt_hash: Some(epoch_receipt_hash),
+                effective_date: Some(effective_date_text),
+                legacy_carry_manifest_hash: Some(legacy_carry_manifest_hash),
+                exclusion_manifest_hash: Some(exclusion_manifest_hash),
+                binding_manifest_hash,
+            })
+        }
+    }
+}
+
+fn prepare_bound_invocation(
+    invocation: AttributionInvocation,
+    binding_manifest_hash: &str,
+) -> Result<PreparedInvocation, AttributionReportStoreError> {
+    let mut prepared = prepare_invocation(invocation)?;
+    prepared.series_identity = hash_with_domain(
+        b"BR255_ATTRIBUTION_SERIES_IDENTITY_V2",
+        &[
+            prepared.mode.as_bytes(),
+            prepared.target_from.as_bytes(),
+            prepared.target_to.as_bytes(),
+            prepared.rule_version.as_bytes(),
+            binding_manifest_hash.as_bytes(),
+        ],
+    );
+    Ok(prepared)
+}
+
 fn prepare_evidence(
     evidence: AttributionEvidenceHash,
     field: &str,
@@ -652,7 +833,20 @@ fn prepare_report(
     validate_hash(&input.stock_close_hash, "stock_close_hash")?;
     validate_hash(&input.benchmark_manifest_hash, "benchmark_manifest_hash")?;
     validate_hash(&input.calendar_authority_hash, "calendar_authority_hash")?;
-    let invocation = prepare_invocation(input.invocation)?;
+    let epoch = prepare_epoch_binding(input.epoch)?;
+    let base_invocation = prepare_invocation(input.invocation.clone())?;
+    let invocation = prepare_bound_invocation(input.invocation, &epoch.binding_manifest_hash)?;
+    if matches!(
+        &epoch.value,
+        AttributionReportEpochBinding::Epoch { effective_date, .. }
+            if NaiveDate::parse_from_str(&invocation.target_from, "%Y-%m-%d")
+                .is_ok_and(|target_from| target_from < *effective_date)
+    ) {
+        return Err(failed_integrity(
+            "attribution_epoch_binding_range_invalid",
+            "BR-255 epoch-bound report begins before the epoch effective date",
+        ));
+    }
     let (fee_status, fee_value) = prepare_evidence(input.fee, "fee evidence")?;
     let (regime_status, regime_value) = prepare_evidence(input.regime, "regime evidence")?;
     let result_payload_json = canonical_result_json(&input.result_payload)?;
@@ -661,9 +855,10 @@ fn prepare_report(
         &[result_payload_json.as_bytes()],
     );
     let evidence_identity = hash_with_domain(
-        b"BR251_ATTRIBUTION_EVIDENCE_IDENTITY_V1",
+        b"BR255_ATTRIBUTION_EVIDENCE_IDENTITY_V2",
         &[
             invocation.series_identity.as_bytes(),
+            epoch.binding_manifest_hash.as_bytes(),
             input.trade_hash.as_bytes(),
             fee_status.as_bytes(),
             fee_value.as_bytes(),
@@ -675,11 +870,37 @@ fn prepare_report(
         ],
     );
     let report_identity = hash_with_domain(
+        b"BR255_ATTRIBUTION_REPORT_IDENTITY_V2",
+        &[
+            evidence_identity.as_bytes(),
+            result_payload_hash.as_bytes(),
+            epoch.binding_manifest_hash.as_bytes(),
+        ],
+    );
+    let binding_independent_evidence_identity = hash_with_domain(
+        b"BR251_ATTRIBUTION_EVIDENCE_IDENTITY_V1",
+        &[
+            base_invocation.series_identity.as_bytes(),
+            input.trade_hash.as_bytes(),
+            fee_status.as_bytes(),
+            fee_value.as_bytes(),
+            input.stock_close_hash.as_bytes(),
+            input.benchmark_manifest_hash.as_bytes(),
+            input.calendar_authority_hash.as_bytes(),
+            regime_status.as_bytes(),
+            regime_value.as_bytes(),
+        ],
+    );
+    let binding_independent_identity = hash_with_domain(
         b"BR251_ATTRIBUTION_REPORT_IDENTITY_V1",
-        &[evidence_identity.as_bytes(), result_payload_hash.as_bytes()],
+        &[
+            binding_independent_evidence_identity.as_bytes(),
+            result_payload_hash.as_bytes(),
+        ],
     );
     Ok(PreparedReport {
         invocation,
+        epoch,
         trade_hash: input.trade_hash,
         fee_status,
         fee_value,
@@ -692,6 +913,7 @@ fn prepare_report(
         result_payload_hash,
         evidence_identity,
         report_identity,
+        binding_independent_identity,
     })
 }
 
@@ -859,6 +1081,50 @@ struct PersistedReport {
 }
 
 #[derive(Debug, Clone, QueryableByName, Serialize)]
+struct PersistedEpochBinding {
+    #[diesel(sql_type = BigInt)]
+    id: i64,
+    #[diesel(sql_type = Integer)]
+    schema_version: i32,
+    #[diesel(sql_type = BigInt)]
+    report_revision_id: i64,
+    #[diesel(sql_type = Text)]
+    binding_kind: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    epoch_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    epoch_receipt_hash: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    effective_date: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    legacy_carry_manifest_hash: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    exclusion_manifest_hash: Option<String>,
+    #[diesel(sql_type = Text)]
+    binding_manifest_hash: String,
+    #[diesel(sql_type = Text)]
+    created_at: String,
+    #[diesel(sql_type = Text)]
+    retention_deadline: String,
+}
+
+#[derive(Debug, Clone, QueryableByName)]
+struct PersistedEpochBindingChain {
+    #[diesel(sql_type = BigInt)]
+    id: i64,
+    #[diesel(sql_type = BigInt)]
+    row_id: i64,
+    #[diesel(sql_type = Text)]
+    previous_hash: String,
+    #[diesel(sql_type = Text)]
+    record_hash: String,
+    #[diesel(sql_type = Text)]
+    created_at: String,
+    #[diesel(sql_type = Text)]
+    retention_deadline: String,
+}
+
+#[derive(Debug, Clone, QueryableByName, Serialize)]
 struct PersistedFailure {
     #[diesel(sql_type = BigInt)]
     id: i64,
@@ -892,12 +1158,14 @@ struct ValidatedState {
     run_chains: Vec<PersistedChain>,
     reports: Vec<PersistedReport>,
     report_chains: Vec<PersistedChain>,
+    epoch_bindings: Vec<PersistedEpochBinding>,
+    epoch_binding_chains: Vec<PersistedEpochBindingChain>,
     failures: Vec<PersistedFailure>,
     failure_chains: Vec<PersistedChain>,
 }
 
 pub(super) fn create_schema(conn: &mut SqliteConnection) -> diesel::QueryResult<()> {
-    let existing_table_count = diesel::sql_query(
+    let existing_core_table_count = diesel::sql_query(
         "SELECT COUNT(*) AS count FROM sqlite_master
          WHERE type = 'table' AND name IN (
             'attribution_run_audit', 'attribution_run_chain',
@@ -907,8 +1175,26 @@ pub(super) fn create_schema(conn: &mut SqliteConnection) -> diesel::QueryResult<
     )
     .get_result::<CountRow>(conn)?
     .count;
-    if existing_table_count != 0 {
-        validate_immutable_triggers(conn)?;
+    if existing_core_table_count != 0 {
+        validate_immutable_triggers_for(conn, &CORE_IMMUTABLE_TABLES)?;
+    }
+    let existing_binding_table_count = diesel::sql_query(
+        "SELECT COUNT(*) AS count FROM sqlite_master
+         WHERE type = 'table' AND name IN (
+            'attribution_report_epoch_binding',
+            'attribution_report_epoch_binding_chain'
+         )",
+    )
+    .get_result::<CountRow>(conn)?
+    .count;
+    if existing_binding_table_count != 0 && existing_core_table_count != 6 {
+        return Err(integrity_query(
+            "attribution_epoch_binding_schema_invalid",
+            "BR-255 report epoch binding tables cannot exist without the complete BR-251 report store",
+        ));
+    }
+    if existing_binding_table_count != 0 {
+        validate_binding_schema(conn)?;
     }
     diesel::sql_query(
         "CREATE TABLE IF NOT EXISTS attribution_run_audit (
@@ -998,6 +1284,29 @@ pub(super) fn create_schema(conn: &mut SqliteConnection) -> diesel::QueryResult<
     )
     .execute(conn)?;
     immutable_triggers(conn, "attribution_report_chain", "report chain")?;
+
+    diesel::sql_query(REPORT_EPOCH_BINDING_TABLE_SQL).execute(conn)?;
+    immutable_triggers(
+        conn,
+        "attribution_report_epoch_binding",
+        "report epoch binding",
+    )?;
+    diesel::sql_query(REPORT_EPOCH_BINDING_CHAIN_TABLE_SQL).execute(conn)?;
+    immutable_triggers(
+        conn,
+        "attribution_report_epoch_binding_chain",
+        "report epoch binding chain",
+    )?;
+    if existing_binding_table_count == 0 {
+        for table in [
+            "attribution_report_epoch_binding",
+            "attribution_report_epoch_binding_chain",
+        ] {
+            diesel::sql_query("INSERT INTO sqlite_sequence(name, seq) VALUES (?, 0)")
+                .bind::<Text, _>(table)
+                .execute(conn)?;
+        }
+    }
 
     diesel::sql_query(
         "CREATE TABLE IF NOT EXISTS attribution_failure_audit (
@@ -1089,6 +1398,7 @@ fn validate_autoincrement_highwater(
         .optional()?;
     let exact_sequence = match sequence {
         None => ids.is_empty(),
+        Some(SequenceRow { seq: Some(0) }) => ids.is_empty(),
         Some(SequenceRow {
             seq: Some(highwater),
         }) if highwater > 0 => ids.iter().copied().eq(1..=highwater),
@@ -1099,6 +1409,32 @@ fn validate_autoincrement_highwater(
             "attribution_sequence_highwater_invalid",
             format!(
                 "BR-251 {table} AUTOINCREMENT high-water does not match its full append-only identity sequence"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_registered_autoincrement_highwater(
+    conn: &mut SqliteConnection,
+    table: &str,
+    ids: &[i64],
+) -> diesel::QueryResult<()> {
+    let sequences = diesel::sql_query("SELECT seq FROM sqlite_sequence WHERE name = ?")
+        .bind::<Text, _>(table)
+        .load::<SequenceRow>(conn)?;
+    let exact = match sequences.as_slice() {
+        [SequenceRow { seq: Some(0) }] => ids.is_empty(),
+        [SequenceRow {
+            seq: Some(highwater),
+        }] if *highwater > 0 => ids.iter().copied().eq(1..=*highwater),
+        _ => false,
+    };
+    if !exact {
+        return Err(integrity_query(
+            "attribution_sequence_highwater_invalid",
+            format!(
+                "BR-255 {table} AUTOINCREMENT registry does not match its full append-only identity sequence"
             ),
         ));
     }
@@ -1139,11 +1475,17 @@ fn expected_trigger_sql(table: &str, label: &str, event: &str) -> String {
 }
 
 fn normalized_sql(sql: &str) -> String {
-    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+    sql.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace(" IF NOT EXISTS", "")
 }
 
-fn validate_immutable_triggers(conn: &mut SqliteConnection) -> diesel::QueryResult<()> {
-    for (table, label) in IMMUTABLE_TABLES {
+fn validate_immutable_triggers_for(
+    conn: &mut SqliteConnection,
+    tables: &[(&str, &str)],
+) -> diesel::QueryResult<()> {
+    for &(table, label) in tables {
         for event in ["UPDATE", "DELETE"] {
             let expected = expected_trigger_sql(table, label, event);
             let name = format!("trg_{table}_no_{}", event.to_ascii_lowercase());
@@ -1172,6 +1514,60 @@ fn validate_immutable_triggers(conn: &mut SqliteConnection) -> diesel::QueryResu
         }
     }
     Ok(())
+}
+
+fn validate_immutable_triggers(conn: &mut SqliteConnection) -> diesel::QueryResult<()> {
+    validate_immutable_triggers_for(conn, &IMMUTABLE_TABLES)
+}
+
+fn validate_binding_schema(conn: &mut SqliteConnection) -> diesel::QueryResult<()> {
+    let protected_trigger_count = diesel::sql_query(
+        "SELECT COUNT(*) AS count FROM sqlite_master
+         WHERE type = 'trigger' AND tbl_name IN (
+            'attribution_report_epoch_binding',
+            'attribution_report_epoch_binding_chain'
+         )",
+    )
+    .get_result::<CountRow>(conn)?
+    .count;
+    if protected_trigger_count != 4 {
+        return Err(integrity_query(
+            "attribution_epoch_binding_trigger_registry_invalid",
+            format!(
+                "BR-255 report epoch binding trigger registry has {protected_trigger_count} entries instead of 4"
+            ),
+        ));
+    }
+    for (table, expected) in [
+        (
+            "attribution_report_epoch_binding",
+            REPORT_EPOCH_BINDING_TABLE_SQL,
+        ),
+        (
+            "attribution_report_epoch_binding_chain",
+            REPORT_EPOCH_BINDING_CHAIN_TABLE_SQL,
+        ),
+    ] {
+        let row = diesel::sql_query(
+            "SELECT name, name AS table_name, sql FROM sqlite_master
+             WHERE type = 'table' AND name = ?",
+        )
+        .bind::<Text, _>(table)
+        .get_result::<TriggerSchemaRow>(conn)
+        .optional()?;
+        if !row.is_some_and(|row| {
+            row.name == table
+                && row
+                    .sql
+                    .is_some_and(|sql| normalized_sql(&sql) == normalized_sql(expected))
+        }) {
+            return Err(integrity_query(
+                "attribution_epoch_binding_schema_invalid",
+                format!("BR-255 canonical report epoch binding table changed: {table}"),
+            ));
+        }
+    }
+    validate_immutable_triggers_for(conn, &BINDING_IMMUTABLE_TABLES)
 }
 
 fn load_runs(conn: &mut SqliteConnection) -> diesel::QueryResult<Vec<PersistedRun>> {
@@ -1211,6 +1607,30 @@ fn load_report_chains(conn: &mut SqliteConnection) -> diesel::QueryResult<Vec<Pe
         "SELECT report_revision_id AS row_id, previous_hash, record_hash, created_at,
                 retention_deadline
          FROM attribution_report_chain ORDER BY report_revision_id ASC",
+    )
+    .load(conn)
+}
+
+fn load_epoch_bindings(
+    conn: &mut SqliteConnection,
+) -> diesel::QueryResult<Vec<PersistedEpochBinding>> {
+    diesel::sql_query(
+        "SELECT id, schema_version, report_revision_id, binding_kind, epoch_id,
+                epoch_receipt_hash, effective_date, legacy_carry_manifest_hash,
+                exclusion_manifest_hash, binding_manifest_hash, created_at,
+                retention_deadline
+         FROM attribution_report_epoch_binding ORDER BY id ASC",
+    )
+    .load(conn)
+}
+
+fn load_epoch_binding_chains(
+    conn: &mut SqliteConnection,
+) -> diesel::QueryResult<Vec<PersistedEpochBindingChain>> {
+    diesel::sql_query(
+        "SELECT id, report_epoch_binding_id AS row_id, previous_hash, record_hash,
+                created_at, retention_deadline
+         FROM attribution_report_epoch_binding_chain ORDER BY id ASC",
     )
     .load(conn)
 }
@@ -1266,6 +1686,16 @@ fn new_retention_window(conn: &mut SqliteConnection) -> diesel::QueryResult<Rete
     .get_result(conn)
 }
 
+fn new_binding_retention_window(
+    conn: &mut SqliteConnection,
+) -> diesel::QueryResult<RetentionWindow> {
+    diesel::sql_query(
+        "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AS created_at,
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+60 months') AS retention_deadline",
+    )
+    .get_result(conn)
+}
+
 fn validate_chain<T: Serialize>(
     rows: &[T],
     ids: impl Iterator<Item = i64>,
@@ -1307,6 +1737,214 @@ fn validate_chain<T: Serialize>(
             return Err(integrity_query(
                 "attribution_chain_hash_mismatch",
                 format!("BR-251 {family} chain hash mismatch at row {id}"),
+            ));
+        }
+        previous = chain.record_hash.clone();
+    }
+    Ok(())
+}
+
+fn parse_canonical_millisecond_utc(value: &str, field: &str) -> diesel::QueryResult<DateTime<Utc>> {
+    let parsed = DateTime::parse_from_rfc3339(value).map_err(|error| {
+        integrity_query(
+            "attribution_epoch_binding_time_invalid",
+            format!("BR-255 invalid {field}: {error}"),
+        )
+    })?;
+    let utc = parsed.with_timezone(&Utc);
+    if parsed.offset().local_minus_utc() != 0
+        || utc.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string() != value
+    {
+        return Err(integrity_query(
+            "attribution_epoch_binding_time_invalid",
+            format!("BR-255 {field} is not canonical millisecond UTC"),
+        ));
+    }
+    Ok(utc)
+}
+
+fn validate_binding_retention_window(
+    created_at: &str,
+    retention_deadline: &str,
+    family: &str,
+) -> diesel::QueryResult<()> {
+    let created = parse_canonical_millisecond_utc(created_at, &format!("{family} created_at"))?;
+    let retained = parse_canonical_millisecond_utc(
+        retention_deadline,
+        &format!("{family} retention_deadline"),
+    )?;
+    let minimum = created.checked_add_months(Months::new(60)).ok_or_else(|| {
+        integrity_query(
+            "attribution_epoch_binding_retention_invalid",
+            format!("BR-255 {family} retention overflow"),
+        )
+    })?;
+    if retained < minimum {
+        return Err(integrity_query(
+            "attribution_epoch_binding_retention_invalid",
+            format!("BR-255 {family} retention is shorter than 60 natural months"),
+        ));
+    }
+    Ok(())
+}
+
+fn persisted_epoch_binding_value(
+    row: &PersistedEpochBinding,
+) -> diesel::QueryResult<AttributionReportEpochBinding> {
+    match row.binding_kind.as_str() {
+        "legacy"
+            if row.epoch_id.is_none()
+                && row.epoch_receipt_hash.is_none()
+                && row.effective_date.is_none()
+                && row.legacy_carry_manifest_hash.is_none()
+                && row.exclusion_manifest_hash.is_none() =>
+        {
+            Ok(AttributionReportEpochBinding::Legacy)
+        }
+        "epoch" => {
+            let effective_date = row
+                .effective_date
+                .as_deref()
+                .ok_or_else(|| {
+                    integrity_query(
+                        "attribution_epoch_binding_content_invalid",
+                        format!("BR-255 epoch binding {} has no effective date", row.id),
+                    )
+                })
+                .and_then(|value| {
+                    let parsed = NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|error| {
+                        integrity_query(
+                            "attribution_epoch_binding_content_invalid",
+                            format!("BR-255 epoch binding {} date: {error}", row.id),
+                        )
+                    })?;
+                    if parsed.format("%Y-%m-%d").to_string() != value {
+                        return Err(integrity_query(
+                            "attribution_epoch_binding_content_invalid",
+                            format!("BR-255 epoch binding {} date is noncanonical", row.id),
+                        ));
+                    }
+                    Ok(parsed)
+                })?;
+            Ok(AttributionReportEpochBinding::Epoch {
+                epoch_id: row.epoch_id.clone().ok_or_else(|| {
+                    integrity_query(
+                        "attribution_epoch_binding_content_invalid",
+                        format!("BR-255 epoch binding {} has no epoch ID", row.id),
+                    )
+                })?,
+                epoch_receipt_hash: row.epoch_receipt_hash.clone().ok_or_else(|| {
+                    integrity_query(
+                        "attribution_epoch_binding_content_invalid",
+                        format!("BR-255 epoch binding {} has no receipt hash", row.id),
+                    )
+                })?,
+                effective_date,
+                legacy_carry_manifest_hash: row.legacy_carry_manifest_hash.clone().ok_or_else(
+                    || {
+                        integrity_query(
+                            "attribution_epoch_binding_content_invalid",
+                            format!("BR-255 epoch binding {} has no carry manifest", row.id),
+                        )
+                    },
+                )?,
+                exclusion_manifest_hash: row.exclusion_manifest_hash.clone().ok_or_else(|| {
+                    integrity_query(
+                        "attribution_epoch_binding_content_invalid",
+                        format!("BR-255 epoch binding {} has no exclusion manifest", row.id),
+                    )
+                })?,
+            })
+        }
+        _ => Err(integrity_query(
+            "attribution_epoch_binding_content_invalid",
+            format!(
+                "BR-255 epoch binding {} has inconsistent variant fields",
+                row.id
+            ),
+        )),
+    }
+}
+
+fn validate_epoch_binding_row(
+    row: &PersistedEpochBinding,
+) -> diesel::QueryResult<PreparedEpochBinding> {
+    if row.id <= 0 || row.report_revision_id <= 0 || row.schema_version != SCHEMA_VERSION {
+        return Err(integrity_query(
+            "attribution_epoch_binding_schema_invalid",
+            format!("BR-255 epoch binding {} violates schema invariants", row.id),
+        ));
+    }
+    validate_binding_retention_window(
+        &row.created_at,
+        &row.retention_deadline,
+        "report epoch binding",
+    )?;
+    let prepared =
+        prepare_epoch_binding(persisted_epoch_binding_value(row)?).map_err(typed_store_error)?;
+    if row.binding_kind != prepared.binding_kind
+        || row.epoch_id != prepared.epoch_id
+        || row.epoch_receipt_hash != prepared.epoch_receipt_hash
+        || row.effective_date != prepared.effective_date
+        || row.legacy_carry_manifest_hash != prepared.legacy_carry_manifest_hash
+        || row.exclusion_manifest_hash != prepared.exclusion_manifest_hash
+        || row.binding_manifest_hash != prepared.binding_manifest_hash
+    {
+        return Err(integrity_query(
+            "attribution_epoch_binding_identity_mismatch",
+            format!("BR-255 epoch binding {} content/hash mismatch", row.id),
+        ));
+    }
+    Ok(prepared)
+}
+
+fn validate_epoch_binding_chain(
+    rows: &[PersistedEpochBinding],
+    chains: &[PersistedEpochBindingChain],
+) -> diesel::QueryResult<()> {
+    if rows.len() != chains.len() {
+        return Err(integrity_query(
+            "attribution_epoch_binding_chain_length_mismatch",
+            format!(
+                "BR-255 report epoch binding rows={} chains={}",
+                rows.len(),
+                chains.len()
+            ),
+        ));
+    }
+    let mut previous = REPORT_EPOCH_BINDING_CHAIN_GENESIS.to_owned();
+    for (index, (row, chain)) in rows.iter().zip(chains).enumerate() {
+        let expected_chain_id = i64::try_from(index + 1).map_err(|_| {
+            integrity_query(
+                "attribution_epoch_binding_chain_invalid",
+                "BR-255 report epoch binding chain index overflow",
+            )
+        })?;
+        validate_binding_retention_window(
+            &chain.created_at,
+            &chain.retention_deadline,
+            "report epoch binding chain",
+        )?;
+        let expected_hash = chain_record_hash(
+            b"BR255_ATTRIBUTION_REPORT_EPOCH_BINDING_RECORD_V1",
+            &previous,
+            row,
+            &chain.created_at,
+            &chain.retention_deadline,
+        )?;
+        if chain.id != expected_chain_id
+            || chain.row_id != row.id
+            || chain.previous_hash != previous
+            || chain.record_hash != expected_hash
+            || chain.created_at != row.created_at
+            || chain.retention_deadline != row.retention_deadline
+        {
+            return Err(integrity_query(
+                "attribution_epoch_binding_chain_invalid",
+                format!(
+                    "BR-255 report epoch binding chain mismatch at row {}",
+                    row.id
+                ),
             ));
         }
         previous = chain.record_hash.clone();
@@ -1363,7 +2001,10 @@ fn validate_available_or_unavailable(
     }
 }
 
-fn validate_report_row(report: &PersistedReport) -> diesel::QueryResult<()> {
+fn validate_report_row(
+    report: &PersistedReport,
+    binding: Option<&PersistedEpochBinding>,
+) -> diesel::QueryResult<()> {
     if report.schema_version != SCHEMA_VERSION || report.id <= 0 || report.revision <= 0 {
         return Err(integrity_query(
             "attribution_report_schema_invalid",
@@ -1371,7 +2012,7 @@ fn validate_report_row(report: &PersistedReport) -> diesel::QueryResult<()> {
         ));
     }
     let synthetic_invoked_at = "2000-01-01T00:00:00+08:00";
-    let invocation = parse_persisted_invocation(
+    let mut invocation = parse_persisted_invocation(
         &report.mode,
         &report.target_from,
         &report.target_to,
@@ -1379,6 +2020,19 @@ fn validate_report_row(report: &PersistedReport) -> diesel::QueryResult<()> {
         synthetic_invoked_at,
     )
     .map_err(typed_store_error)?;
+    let prepared_binding = binding.map(validate_epoch_binding_row).transpose()?;
+    if let Some(binding) = &prepared_binding {
+        invocation.series_identity = hash_with_domain(
+            b"BR255_ATTRIBUTION_SERIES_IDENTITY_V2",
+            &[
+                invocation.mode.as_bytes(),
+                invocation.target_from.as_bytes(),
+                invocation.target_to.as_bytes(),
+                invocation.rule_version.as_bytes(),
+                binding.binding_manifest_hash.as_bytes(),
+            ],
+        );
+    }
     for (value, field) in [
         (&report.trade_hash, "trade_hash"),
         (&report.stock_close_hash, "stock_close_hash"),
@@ -1410,24 +2064,53 @@ fn validate_report_row(report: &PersistedReport) -> diesel::QueryResult<()> {
         b"BR251_ATTRIBUTION_RESULT_PAYLOAD_V1",
         &[canonical.as_bytes()],
     );
-    let evidence_identity = hash_with_domain(
-        b"BR251_ATTRIBUTION_EVIDENCE_IDENTITY_V1",
-        &[
-            invocation.series_identity.as_bytes(),
-            report.trade_hash.as_bytes(),
-            report.fee_status.as_bytes(),
-            report.fee_value.as_bytes(),
-            report.stock_close_hash.as_bytes(),
-            report.benchmark_manifest_hash.as_bytes(),
-            report.calendar_authority_hash.as_bytes(),
-            report.regime_status.as_bytes(),
-            report.regime_value.as_bytes(),
-        ],
-    );
-    let report_identity = hash_with_domain(
-        b"BR251_ATTRIBUTION_REPORT_IDENTITY_V1",
-        &[evidence_identity.as_bytes(), result_hash.as_bytes()],
-    );
+    let evidence_identity = if let Some(binding) = &prepared_binding {
+        hash_with_domain(
+            b"BR255_ATTRIBUTION_EVIDENCE_IDENTITY_V2",
+            &[
+                invocation.series_identity.as_bytes(),
+                binding.binding_manifest_hash.as_bytes(),
+                report.trade_hash.as_bytes(),
+                report.fee_status.as_bytes(),
+                report.fee_value.as_bytes(),
+                report.stock_close_hash.as_bytes(),
+                report.benchmark_manifest_hash.as_bytes(),
+                report.calendar_authority_hash.as_bytes(),
+                report.regime_status.as_bytes(),
+                report.regime_value.as_bytes(),
+            ],
+        )
+    } else {
+        hash_with_domain(
+            b"BR251_ATTRIBUTION_EVIDENCE_IDENTITY_V1",
+            &[
+                invocation.series_identity.as_bytes(),
+                report.trade_hash.as_bytes(),
+                report.fee_status.as_bytes(),
+                report.fee_value.as_bytes(),
+                report.stock_close_hash.as_bytes(),
+                report.benchmark_manifest_hash.as_bytes(),
+                report.calendar_authority_hash.as_bytes(),
+                report.regime_status.as_bytes(),
+                report.regime_value.as_bytes(),
+            ],
+        )
+    };
+    let report_identity = if let Some(binding) = &prepared_binding {
+        hash_with_domain(
+            b"BR255_ATTRIBUTION_REPORT_IDENTITY_V2",
+            &[
+                evidence_identity.as_bytes(),
+                result_hash.as_bytes(),
+                binding.binding_manifest_hash.as_bytes(),
+            ],
+        )
+    } else {
+        hash_with_domain(
+            b"BR251_ATTRIBUTION_REPORT_IDENTITY_V1",
+            &[evidence_identity.as_bytes(), result_hash.as_bytes()],
+        )
+    };
     if report.series_identity != invocation.series_identity
         || report.result_payload_json != canonical
         || report.result_payload_hash != result_hash
@@ -1450,14 +2133,49 @@ fn report_invocation_matches_run(report: &PersistedReport, run: &PersistedRun) -
         && report.series_identity == run.series_identity
 }
 
+fn persisted_binding_independent_identity(report: &PersistedReport) -> diesel::QueryResult<String> {
+    let invocation = parse_persisted_invocation(
+        &report.mode,
+        &report.target_from,
+        &report.target_to,
+        &report.rule_version,
+        "2000-01-01T00:00:00+08:00",
+    )
+    .map_err(typed_store_error)?;
+    let evidence_identity = hash_with_domain(
+        b"BR251_ATTRIBUTION_EVIDENCE_IDENTITY_V1",
+        &[
+            invocation.series_identity.as_bytes(),
+            report.trade_hash.as_bytes(),
+            report.fee_status.as_bytes(),
+            report.fee_value.as_bytes(),
+            report.stock_close_hash.as_bytes(),
+            report.benchmark_manifest_hash.as_bytes(),
+            report.calendar_authority_hash.as_bytes(),
+            report.regime_status.as_bytes(),
+            report.regime_value.as_bytes(),
+        ],
+    );
+    Ok(hash_with_domain(
+        b"BR251_ATTRIBUTION_REPORT_IDENTITY_V1",
+        &[
+            evidence_identity.as_bytes(),
+            report.result_payload_hash.as_bytes(),
+        ],
+    ))
+}
+
 fn validate_all_state(conn: &mut SqliteConnection) -> diesel::QueryResult<ValidatedState> {
     validate_immutable_triggers(conn)?;
+    validate_binding_schema(conn)?;
     validate_chain_cardinalities(conn)?;
     let state = ValidatedState {
         runs: load_runs(conn)?,
         run_chains: load_run_chains(conn)?,
         reports: load_reports(conn)?,
         report_chains: load_report_chains(conn)?,
+        epoch_bindings: load_epoch_bindings(conn)?,
+        epoch_binding_chains: load_epoch_binding_chains(conn)?,
         failures: load_failures(conn)?,
         failure_chains: load_failure_chains(conn)?,
     };
@@ -1476,11 +2194,52 @@ fn validate_all_state(conn: &mut SqliteConnection) -> diesel::QueryResult<Valida
         "attribution_failure_audit",
         &state.failures.iter().map(|row| row.id).collect::<Vec<_>>(),
     )?;
+    validate_registered_autoincrement_highwater(
+        conn,
+        "attribution_report_epoch_binding",
+        &state
+            .epoch_bindings
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+    )?;
+    validate_registered_autoincrement_highwater(
+        conn,
+        "attribution_report_epoch_binding_chain",
+        &state
+            .epoch_binding_chains
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+    )?;
+    validate_epoch_binding_chain(&state.epoch_bindings, &state.epoch_binding_chains)?;
+    let mut binding_report_ids = HashSet::new();
+    for binding in &state.epoch_bindings {
+        validate_epoch_binding_row(binding)?;
+        if !binding_report_ids.insert(binding.report_revision_id)
+            || !state
+                .reports
+                .iter()
+                .any(|report| report.id == binding.report_revision_id)
+        {
+            return Err(integrity_query(
+                "attribution_epoch_binding_report_invalid",
+                format!(
+                    "BR-255 epoch binding {} references an invalid report revision",
+                    binding.id
+                ),
+            ));
+        }
+    }
     let mut report_ids = HashSet::new();
     let mut evidence_ids = HashSet::new();
     let mut report_by_series = HashMap::<String, (i64, i32)>::new();
     for report in &state.reports {
-        validate_report_row(report)?;
+        let binding = state
+            .epoch_bindings
+            .iter()
+            .find(|binding| binding.report_revision_id == report.id);
+        validate_report_row(report, binding)?;
         if !report_ids.insert(report.report_identity.clone())
             || !evidence_ids.insert(report.evidence_identity.clone())
         {
@@ -1552,9 +2311,7 @@ fn validate_all_state(conn: &mut SqliteConnection) -> diesel::QueryResult<Valida
             &run.invoked_at,
         )
         .map_err(typed_store_error)?;
-        if run.series_identity != invocation.series_identity
-            || !is_lower_hex_hash(&run.outcome_identity)
-        {
+        if !is_lower_hex_hash(&run.outcome_identity) {
             return Err(integrity_query(
                 "attribution_run_identity_mismatch",
                 format!("BR-251 run row {} identity mismatch", run.id),
@@ -1563,6 +2320,9 @@ fn validate_all_state(conn: &mut SqliteConnection) -> diesel::QueryResult<Valida
         let cross_link_valid = match run.outcome.as_str() {
             "report_appended" => {
                 report_source_runs.get(&run.id).copied() == Some(run.outcome_identity.as_str())
+                    && reports_by_identity
+                        .get(run.outcome_identity.as_str())
+                        .is_some_and(|report| report.series_identity == run.series_identity)
                     && !failure_source_runs.contains_key(&run.id)
             }
             "report_reused" => {
@@ -1574,6 +2334,7 @@ fn validate_all_state(conn: &mut SqliteConnection) -> diesel::QueryResult<Valida
             }
             "failure" => {
                 failure_source_runs.get(&run.id).copied() == Some(run.outcome_identity.as_str())
+                    && run.series_identity == invocation.series_identity
                     && !report_source_runs.contains_key(&run.id)
             }
             _ => false,
@@ -1879,8 +2640,11 @@ fn report_receipt(
     run: AttributionRunReceipt,
     report: &PersistedReport,
     chain: &PersistedChain,
-) -> AttributionReportReceipt {
-    AttributionReportReceipt {
+    epoch_binding: &PersistedEpochBinding,
+    epoch_binding_chain: &PersistedEpochBindingChain,
+) -> diesel::QueryResult<AttributionReportReceipt> {
+    let epoch = persisted_epoch_binding_value(epoch_binding)?;
+    Ok(AttributionReportReceipt {
         run,
         report_revision_id: report.id,
         report_identity: report.report_identity.clone(),
@@ -1890,17 +2654,19 @@ fn report_receipt(
         report_revision: report.revision,
         predecessor_report_id: report.predecessor_report_id,
         report_record_hash: chain.record_hash.clone(),
-    }
+        epoch,
+        epoch_binding_id: epoch_binding.id,
+        epoch_binding_record_hash: epoch_binding_chain.record_hash.clone(),
+    })
 }
 
-fn insert_report(
+fn insert_report_row(
     conn: &mut SqliteConnection,
     prepared: &PreparedReport,
     source_run_id: i64,
     revision: i32,
     predecessor_report_id: Option<i64>,
-    previous_hash: &str,
-) -> diesel::QueryResult<(PersistedReport, PersistedChain)> {
+) -> diesel::QueryResult<PersistedReport> {
     let affected = diesel::sql_query(
         "INSERT INTO attribution_report_revision (
             schema_version, report_identity, series_identity, evidence_identity,
@@ -1938,7 +2704,7 @@ fn insert_report(
             format!("BR-251 report insert affected {affected} rows"),
         ));
     }
-    let report = diesel::sql_query(
+    diesel::sql_query(
         "SELECT id, schema_version, report_identity, series_identity, evidence_identity,
                 source_run_id, mode, target_from, target_to, rule_version, trade_hash,
                 fee_status, fee_value, stock_close_hash, benchmark_manifest_hash,
@@ -1947,7 +2713,14 @@ fn insert_report(
                 retention_deadline
          FROM attribution_report_revision WHERE id = last_insert_rowid()",
     )
-    .get_result::<PersistedReport>(conn)?;
+    .get_result::<PersistedReport>(conn)
+}
+
+fn insert_report_chain(
+    conn: &mut SqliteConnection,
+    report: &PersistedReport,
+    previous_hash: &str,
+) -> diesel::QueryResult<PersistedChain> {
     let window = new_retention_window(conn)?;
     let record_hash = chain_record_hash(
         b"BR251_ATTRIBUTION_REPORT_RECORD_V1",
@@ -1973,16 +2746,88 @@ fn insert_report(
             format!("BR-251 report chain insert affected {chain_affected} rows"),
         ));
     }
-    Ok((
-        report.clone(),
-        PersistedChain {
-            row_id: report.id,
-            previous_hash: previous_hash.to_string(),
-            record_hash,
-            created_at: window.created_at,
-            retention_deadline: window.retention_deadline,
-        },
-    ))
+    Ok(PersistedChain {
+        row_id: report.id,
+        previous_hash: previous_hash.to_string(),
+        record_hash,
+        created_at: window.created_at,
+        retention_deadline: window.retention_deadline,
+    })
+}
+
+fn insert_epoch_binding(
+    conn: &mut SqliteConnection,
+    prepared: &PreparedEpochBinding,
+    report_revision_id: i64,
+    previous_hash: &str,
+) -> diesel::QueryResult<(PersistedEpochBinding, PersistedEpochBindingChain)> {
+    let window = new_binding_retention_window(conn)?;
+    let affected = diesel::sql_query(
+        "INSERT INTO attribution_report_epoch_binding (
+            schema_version, report_revision_id, binding_kind, epoch_id,
+            epoch_receipt_hash, effective_date, legacy_carry_manifest_hash,
+            exclusion_manifest_hash, binding_manifest_hash, created_at,
+            retention_deadline
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind::<Integer, _>(SCHEMA_VERSION)
+    .bind::<BigInt, _>(report_revision_id)
+    .bind::<Text, _>(&prepared.binding_kind)
+    .bind::<Nullable<Text>, _>(prepared.epoch_id.as_deref())
+    .bind::<Nullable<Text>, _>(prepared.epoch_receipt_hash.as_deref())
+    .bind::<Nullable<Text>, _>(prepared.effective_date.as_deref())
+    .bind::<Nullable<Text>, _>(prepared.legacy_carry_manifest_hash.as_deref())
+    .bind::<Nullable<Text>, _>(prepared.exclusion_manifest_hash.as_deref())
+    .bind::<Text, _>(&prepared.binding_manifest_hash)
+    .bind::<Text, _>(&window.created_at)
+    .bind::<Text, _>(&window.retention_deadline)
+    .execute(conn)?;
+    if affected != 1 {
+        return Err(integrity_query(
+            "attribution_epoch_binding_insert_count_invalid",
+            format!("BR-255 epoch binding insert affected {affected} rows"),
+        ));
+    }
+    let row = diesel::sql_query(
+        "SELECT id, schema_version, report_revision_id, binding_kind, epoch_id,
+                epoch_receipt_hash, effective_date, legacy_carry_manifest_hash,
+                exclusion_manifest_hash, binding_manifest_hash, created_at,
+                retention_deadline
+         FROM attribution_report_epoch_binding WHERE id = last_insert_rowid()",
+    )
+    .get_result::<PersistedEpochBinding>(conn)?;
+    let record_hash = chain_record_hash(
+        b"BR255_ATTRIBUTION_REPORT_EPOCH_BINDING_RECORD_V1",
+        previous_hash,
+        &row,
+        &window.created_at,
+        &window.retention_deadline,
+    )?;
+    let chain_affected = diesel::sql_query(
+        "INSERT INTO attribution_report_epoch_binding_chain (
+            report_epoch_binding_id, previous_hash, record_hash, created_at,
+            retention_deadline
+         ) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind::<BigInt, _>(row.id)
+    .bind::<Text, _>(previous_hash)
+    .bind::<Text, _>(&record_hash)
+    .bind::<Text, _>(&window.created_at)
+    .bind::<Text, _>(&window.retention_deadline)
+    .execute(conn)?;
+    if chain_affected != 1 {
+        return Err(integrity_query(
+            "attribution_epoch_binding_chain_insert_count_invalid",
+            format!("BR-255 epoch binding chain insert affected {chain_affected} rows"),
+        ));
+    }
+    let chain = diesel::sql_query(
+        "SELECT id, report_epoch_binding_id AS row_id, previous_hash, record_hash,
+                created_at, retention_deadline
+         FROM attribution_report_epoch_binding_chain WHERE id = last_insert_rowid()",
+    )
+    .get_result::<PersistedEpochBindingChain>(conn)?;
+    Ok((row, chain))
 }
 
 fn insert_failure(
@@ -2102,6 +2947,23 @@ impl<'a> AttributionReportStore<'a> {
                             "BR-251 same evidence identity produced a different result payload",
                         ));
                     }
+                    let existing_binding = state
+                        .epoch_bindings
+                        .iter()
+                        .find(|binding| binding.report_revision_id == existing.id)
+                        .ok_or_else(|| {
+                            integrity_query(
+                                "attribution_epoch_binding_reuse_missing",
+                                "BR-255 reused report has no explicit epoch binding",
+                            )
+                        })?;
+                    let retained_prepared = validate_epoch_binding_row(existing_binding)?;
+                    if retained_prepared != prepared.epoch {
+                        return Err(integrity_query(
+                            "attribution_epoch_binding_reuse_mismatch",
+                            "BR-255 same report identity resolved to a different epoch binding",
+                        ));
+                    }
                     let run = insert_run(
                         conn,
                         &prepared.invocation,
@@ -2130,7 +2992,51 @@ impl<'a> AttributionReportStore<'a> {
                                 "BR-251 reused report chain disappeared inside transaction",
                             )
                         })?;
-                    return Ok(report_receipt(run, report, chain));
+                    let epoch_binding = retained
+                        .epoch_bindings
+                        .iter()
+                        .find(|binding| binding.report_revision_id == report.id)
+                        .ok_or_else(|| {
+                            integrity_query(
+                                "attribution_epoch_binding_reuse_missing",
+                                "BR-255 reused report binding disappeared inside transaction",
+                            )
+                        })?;
+                    let epoch_binding_chain = retained
+                        .epoch_binding_chains
+                        .iter()
+                        .find(|chain| chain.row_id == epoch_binding.id)
+                        .ok_or_else(|| {
+                            integrity_query(
+                                "attribution_epoch_binding_chain_missing",
+                                "BR-255 reused report binding chain disappeared inside transaction",
+                            )
+                        })?;
+                    return report_receipt(
+                        run,
+                        report,
+                        chain,
+                        epoch_binding,
+                        epoch_binding_chain,
+                    );
+                }
+                for existing in &state.reports {
+                    let Some(existing_binding) = state
+                        .epoch_bindings
+                        .iter()
+                        .find(|binding| binding.report_revision_id == existing.id)
+                    else {
+                        continue;
+                    };
+                    if persisted_binding_independent_identity(existing)?
+                        == prepared.binding_independent_identity
+                        && validate_epoch_binding_row(existing_binding)? != prepared.epoch
+                    {
+                        return Err(integrity_query(
+                            "attribution_epoch_binding_identity_conflict",
+                            "BR-255 the same binding-independent report identity cannot be rebound to different epoch evidence",
+                        ));
+                    }
                 }
                 if state
                     .reports
@@ -2158,6 +3064,57 @@ impl<'a> AttributionReportStore<'a> {
                     .transpose()?
                     .unwrap_or(1);
                 let predecessor_report_id = predecessor.map(|report| report.id);
+                let next_run_id = state
+                    .runs
+                    .last()
+                    .map_or(Ok(1_i64), |run| {
+                        run.id.checked_add(1).ok_or_else(|| {
+                            integrity_query(
+                                "attribution_run_id_overflow",
+                                "BR-251 next attribution run ID exceeds i64",
+                            )
+                        })
+                    })?;
+                let foreign_keys = diesel::sql_query("PRAGMA foreign_keys")
+                    .get_result::<AttributionForeignKeysRow>(conn)?
+                    .foreign_keys;
+                if foreign_keys != 1 {
+                    return Err(integrity_query(
+                        "attribution_foreign_keys_disabled",
+                        "BR-255 report binding transaction requires SQLite foreign-key enforcement",
+                    ));
+                }
+                diesel::sql_query("PRAGMA defer_foreign_keys = ON").execute(conn)?;
+                let deferred = diesel::sql_query("PRAGMA defer_foreign_keys")
+                    .get_result::<AttributionDeferredForeignKeysRow>(conn)?
+                    .defer_foreign_keys;
+                if deferred != 1 {
+                    return Err(integrity_query(
+                        "attribution_deferred_foreign_keys_unavailable",
+                        "BR-255 report binding transaction could not defer its forward run FK",
+                    ));
+                }
+                let report_tail = state
+                    .report_chains
+                    .last()
+                    .map_or(REPORT_CHAIN_GENESIS, |chain| chain.record_hash.as_str());
+                let report = insert_report_row(
+                    conn,
+                    &prepared,
+                    next_run_id,
+                    revision,
+                    predecessor_report_id,
+                )?;
+                let binding_tail = state.epoch_binding_chains.last().map_or(
+                    REPORT_EPOCH_BINDING_CHAIN_GENESIS,
+                    |chain| chain.record_hash.as_str(),
+                );
+                let (epoch_binding, _) = insert_epoch_binding(
+                    conn,
+                    &prepared.epoch,
+                    report.id,
+                    binding_tail,
+                )?;
                 let run = insert_run(
                     conn,
                     &prepared.invocation,
@@ -2165,18 +3122,16 @@ impl<'a> AttributionReportStore<'a> {
                     &prepared.report_identity,
                     run_tail,
                 )?;
-                let report_tail = state
-                    .report_chains
-                    .last()
-                    .map_or(REPORT_CHAIN_GENESIS, |chain| chain.record_hash.as_str());
-                let (report, _) = insert_report(
-                    conn,
-                    &prepared,
-                    run.run_audit_id,
-                    revision,
-                    predecessor_report_id,
-                    report_tail,
-                )?;
+                if run.run_audit_id != next_run_id {
+                    return Err(integrity_query(
+                        "attribution_run_id_reservation_mismatch",
+                        format!(
+                            "BR-255 reserved run ID {next_run_id} but inserted {}",
+                            run.run_audit_id
+                        ),
+                    ));
+                }
+                insert_report_chain(conn, &report, report_tail)?;
                 let retained = validate_all_state(conn)?;
                 let retained_report = retained
                     .reports
@@ -2198,7 +3153,27 @@ impl<'a> AttributionReportStore<'a> {
                             "BR-251 inserted report chain disappeared inside transaction",
                         )
                     })?;
-                Ok(report_receipt(run, retained_report, chain))
+                let retained_binding = retained
+                    .epoch_bindings
+                    .iter()
+                    .find(|candidate| candidate.id == epoch_binding.id)
+                    .ok_or_else(|| {
+                        integrity_query(
+                            "attribution_epoch_binding_insert_missing",
+                            "BR-255 inserted report epoch binding disappeared inside transaction",
+                        )
+                    })?;
+                let binding_chain = retained
+                    .epoch_binding_chains
+                    .iter()
+                    .find(|chain| chain.row_id == retained_binding.id)
+                    .ok_or_else(|| {
+                        integrity_query(
+                            "attribution_epoch_binding_chain_missing",
+                            "BR-255 inserted report epoch binding chain disappeared inside transaction",
+                        )
+                    })?;
+                report_receipt(run, retained_report, chain, retained_binding, binding_chain)
             })();
             body.map_err(|error| {
                 transaction_body_error(error, "BR-251 attribution report transaction body")
@@ -2295,7 +3270,7 @@ mod tests {
     use chrono::{DateTime, NaiveDate};
     use diesel::connection::SimpleConnection;
     use diesel::prelude::*;
-    use diesel::sql_types::{BigInt, Integer, Text};
+    use diesel::sql_types::{BigInt, Integer, Nullable, Text};
 
     use super::*;
     use crate::database::DatabaseManager;
@@ -2340,6 +3315,24 @@ mod tests {
         result_payload_json: String,
         #[diesel(sql_type = Text)]
         result_payload_hash: String,
+    }
+
+    #[derive(QueryableByName)]
+    struct EpochBindingFactsRow {
+        #[diesel(sql_type = Text)]
+        binding_kind: String,
+        #[diesel(sql_type = Nullable<Text>)]
+        epoch_id: Option<String>,
+        #[diesel(sql_type = Nullable<Text>)]
+        epoch_receipt_hash: Option<String>,
+        #[diesel(sql_type = Nullable<Text>)]
+        effective_date: Option<String>,
+        #[diesel(sql_type = Nullable<Text>)]
+        legacy_carry_manifest_hash: Option<String>,
+        #[diesel(sql_type = Nullable<Text>)]
+        exclusion_manifest_hash: Option<String>,
+        #[diesel(sql_type = Text)]
+        binding_manifest_hash: String,
     }
 
     fn schema_connection() -> SqliteConnection {
@@ -2453,6 +3446,8 @@ mod tests {
             "benchmark_manifest",
             "attribution_run_audit",
             "attribution_report_revision",
+            "attribution_report_epoch_binding",
+            "attribution_report_epoch_binding_chain",
             "attribution_failure_audit",
             "attribution_sample_epoch_receipt",
             "attribution_epoch_attempt_audit",
@@ -2563,6 +3558,7 @@ mod tests {
     ) -> AttributionReportAppend {
         AttributionReportAppend {
             invocation: scheduled_invocation(invoked_at),
+            epoch: AttributionReportEpochBinding::Legacy,
             trade_hash: lower_hash('a'),
             fee: AttributionEvidenceHash::Available(lower_hash('b')),
             stock_close_hash: lower_hash('c'),
@@ -2571,6 +3567,394 @@ mod tests {
             regime: AttributionEvidenceHash::Unavailable("market_regime_unavailable".to_string()),
             result_payload,
         }
+    }
+
+    fn resolved_epoch_binding(seed: char) -> AttributionReportEpochBinding {
+        AttributionReportEpochBinding::Epoch {
+            epoch_id: lower_hash(seed),
+            epoch_receipt_hash: lower_hash('b'),
+            effective_date: NaiveDate::from_ymd_opt(2026, 8, 24)
+                .expect("TEST_CODE epoch effective date"),
+            legacy_carry_manifest_hash: lower_hash('c'),
+            exclusion_manifest_hash: lower_hash('d'),
+        }
+    }
+
+    #[test]
+    fn epoch_binding_legacy_report_is_explicit_and_immutable() {
+        let database = TestDatabase::new();
+        let receipt = AttributionReportStore::new(&database.manager)
+            .commit_report(report_append(
+                "2026-08-21T15:30:00+08:00",
+                serde_json::json!({"status": "ResearchOnly"}),
+            ))
+            .expect("TEST_CODE legacy report binding");
+
+        assert_eq!(receipt.epoch, AttributionReportEpochBinding::Legacy);
+        assert_eq!(database.count("attribution_report_epoch_binding"), 1);
+        assert_eq!(database.count("attribution_report_epoch_binding_chain"), 1);
+        let mut conn = database.manager.get_conn().expect("TEST_CODE binding read");
+        let kind = diesel::sql_query(
+            "SELECT binding_kind AS name FROM attribution_report_epoch_binding
+             WHERE report_revision_id = ?",
+        )
+        .bind::<BigInt, _>(receipt.report_revision_id)
+        .get_result::<NameRow>(&mut conn)
+        .expect("TEST_CODE retained legacy binding")
+        .name;
+        assert_eq!(kind, "legacy");
+    }
+
+    #[test]
+    fn epoch_binding_resolved_fields_are_exact_and_same_binding_reuses_revision() {
+        let database = TestDatabase::new();
+        let store = AttributionReportStore::new(&database.manager);
+        let mut first_input = report_append(
+            "2026-08-24T15:40:00+08:00",
+            serde_json::json!({"status": "ResearchOnly"}),
+        );
+        first_input.epoch = resolved_epoch_binding('a');
+        first_input.invocation.target_from =
+            NaiveDate::from_ymd_opt(2026, 8, 24).expect("TEST_CODE epoch target");
+        first_input.invocation.target_to = first_input.invocation.target_from;
+        let first = store
+            .commit_report(first_input)
+            .expect("TEST_CODE resolved epoch report");
+        let mut retry_input = report_append(
+            "2026-08-25T15:40:00+08:00",
+            serde_json::json!({"status": "ResearchOnly"}),
+        );
+        retry_input.epoch = resolved_epoch_binding('a');
+        retry_input.invocation.target_from =
+            NaiveDate::from_ymd_opt(2026, 8, 24).expect("TEST_CODE epoch target");
+        retry_input.invocation.target_to = retry_input.invocation.target_from;
+        let retry = store
+            .commit_report(retry_input)
+            .expect("TEST_CODE idempotent resolved epoch report");
+
+        assert_eq!(first.report_revision_id, retry.report_revision_id);
+        assert_eq!(first.epoch_binding_id, retry.epoch_binding_id);
+        assert_eq!(first.epoch, resolved_epoch_binding('a'));
+        assert_eq!(retry.epoch, resolved_epoch_binding('a'));
+        assert_eq!(database.count("attribution_report_revision"), 1);
+        assert_eq!(database.count("attribution_report_epoch_binding"), 1);
+        assert_eq!(database.count("attribution_report_epoch_binding_chain"), 1);
+        assert_eq!(database.count("attribution_run_audit"), 2);
+
+        let mut conn = database.manager.get_conn().expect("TEST_CODE binding read");
+        let row = diesel::sql_query(
+            "SELECT binding_kind, epoch_id, epoch_receipt_hash, effective_date,
+                    legacy_carry_manifest_hash, exclusion_manifest_hash,
+                    binding_manifest_hash
+             FROM attribution_report_epoch_binding WHERE report_revision_id = ?",
+        )
+        .bind::<BigInt, _>(first.report_revision_id)
+        .get_result::<EpochBindingFactsRow>(&mut conn)
+        .expect("TEST_CODE retained resolved binding");
+        assert_eq!(row.binding_kind, "epoch");
+        assert_eq!(row.epoch_id, Some(lower_hash('a')));
+        assert_eq!(row.epoch_receipt_hash, Some(lower_hash('b')));
+        assert_eq!(row.effective_date.as_deref(), Some("2026-08-24"));
+        assert_eq!(row.legacy_carry_manifest_hash, Some(lower_hash('c')));
+        assert_eq!(row.exclusion_manifest_hash, Some(lower_hash('d')));
+        assert!(is_lower_hex_hash(&row.binding_manifest_hash));
+    }
+
+    #[test]
+    fn epoch_binding_same_report_identity_with_different_binding_is_integrity() {
+        let database = TestDatabase::new();
+        let store = AttributionReportStore::new(&database.manager);
+        let target = NaiveDate::from_ymd_opt(2026, 8, 24).expect("TEST_CODE epoch target");
+        let mut first = report_append(
+            "2026-08-24T15:40:00+08:00",
+            serde_json::json!({"status": "ResearchOnly"}),
+        );
+        first.invocation.target_from = target;
+        first.invocation.target_to = target;
+        first.epoch = resolved_epoch_binding('a');
+        store
+            .commit_report(first)
+            .expect("TEST_CODE initial epoch binding");
+
+        let mut rebound = report_append(
+            "2026-08-25T15:40:00+08:00",
+            serde_json::json!({"status": "ResearchOnly"}),
+        );
+        rebound.invocation.target_from = target;
+        rebound.invocation.target_to = target;
+        rebound.epoch = resolved_epoch_binding('e');
+        let error = store
+            .commit_report(rebound)
+            .expect_err("TEST_CODE report identity must not be rebound");
+        assert!(matches!(
+            error,
+            AttributionReportStoreError::FailedIntegrity {
+                reason_code: "attribution_epoch_binding_identity_conflict",
+                ..
+            }
+        ));
+        assert_eq!(database.count("attribution_run_audit"), 1);
+        assert_eq!(database.count("attribution_report_revision"), 1);
+        assert_eq!(database.count("attribution_report_epoch_binding"), 1);
+    }
+
+    #[test]
+    fn epoch_binding_insert_failure_rolls_back_report_binding_and_run() {
+        let database = TestDatabase::new();
+        reject_inserts(&database, "attribution_report_epoch_binding_chain");
+        let error = AttributionReportStore::new(&database.manager)
+            .commit_report(report_append(
+                "2026-08-21T15:30:00+08:00",
+                serde_json::json!({"status": "ResearchOnly"}),
+            ))
+            .expect_err("TEST_CODE binding-chain insert must roll back");
+
+        assert!(matches!(
+            error,
+            AttributionReportStoreError::FailedIntegrity { .. }
+        ));
+        assert_all_attribution_tables_empty(&database);
+        assert_eq!(
+            sequence_highwater(&database, "attribution_report_epoch_binding"),
+            Some(0)
+        );
+        assert_eq!(
+            sequence_highwater(&database, "attribution_report_epoch_binding_chain"),
+            Some(0)
+        );
+        let mut conn = database
+            .manager
+            .get_conn()
+            .expect("TEST_CODE rollback foreign-key state");
+        assert_eq!(
+            diesel::sql_query("PRAGMA defer_foreign_keys")
+                .get_result::<AttributionDeferredForeignKeysRow>(&mut conn)
+                .expect("TEST_CODE rollback resets deferred foreign keys")
+                .defer_foreign_keys,
+            0
+        );
+    }
+
+    #[test]
+    fn epoch_binding_update_delete_and_short_retention_are_rejected() {
+        let database = database_with_report();
+        let mut conn = database
+            .manager
+            .get_conn()
+            .expect("TEST_CODE binding guard");
+        assert!(diesel::sql_query(
+            "UPDATE attribution_report_epoch_binding SET binding_kind = binding_kind",
+        )
+        .execute(&mut conn)
+        .is_err());
+        assert!(
+            diesel::sql_query("DELETE FROM attribution_report_epoch_binding")
+                .execute(&mut conn)
+                .is_err()
+        );
+        assert!(diesel::sql_query(
+            "UPDATE attribution_report_epoch_binding_chain SET previous_hash = previous_hash",
+        )
+        .execute(&mut conn)
+        .is_err());
+        assert!(
+            diesel::sql_query("DELETE FROM attribution_report_epoch_binding_chain")
+                .execute(&mut conn)
+                .is_err()
+        );
+
+        diesel::sql_query("DROP TRIGGER trg_attribution_report_epoch_binding_no_update")
+            .execute(&mut conn)
+            .expect("TEST_CODE drop binding update guard");
+        diesel::sql_query(
+            "UPDATE attribution_report_epoch_binding SET retention_deadline = created_at",
+        )
+        .execute(&mut conn)
+        .expect("TEST_CODE shorten binding retention");
+        restore_table_triggers(&mut conn, "attribution_report_epoch_binding");
+        drop(conn);
+        assert!(startup_fails(&database));
+        assert!(trigger_preappend_fails(&database));
+
+        let chain_database = database_with_report();
+        let mut conn = chain_database
+            .manager
+            .get_conn()
+            .expect("TEST_CODE binding chain retention");
+        diesel::sql_query("DROP TRIGGER trg_attribution_report_epoch_binding_chain_no_update")
+            .execute(&mut conn)
+            .expect("TEST_CODE drop binding chain update guard");
+        diesel::sql_query(
+            "UPDATE attribution_report_epoch_binding_chain
+             SET retention_deadline = created_at",
+        )
+        .execute(&mut conn)
+        .expect("TEST_CODE shorten binding chain retention");
+        restore_table_triggers(&mut conn, "attribution_report_epoch_binding_chain");
+        drop(conn);
+        assert!(startup_fails(&chain_database));
+        assert!(trigger_preappend_fails(&chain_database));
+    }
+
+    #[test]
+    fn epoch_binding_bad_tail_content_chain_and_sequence_drift_fail_closed() {
+        let missing_tail = database_with_report();
+        let mut conn = missing_tail
+            .manager
+            .get_conn()
+            .expect("TEST_CODE missing binding tail");
+        diesel::sql_query("DROP TRIGGER trg_attribution_report_epoch_binding_chain_no_delete")
+            .execute(&mut conn)
+            .expect("TEST_CODE drop binding chain delete guard");
+        diesel::sql_query("DELETE FROM attribution_report_epoch_binding_chain WHERE id = 1")
+            .execute(&mut conn)
+            .expect("TEST_CODE delete binding chain tail");
+        restore_table_triggers(&mut conn, "attribution_report_epoch_binding_chain");
+        drop(conn);
+        assert!(startup_fails(&missing_tail));
+        assert!(trigger_preappend_fails(&missing_tail));
+
+        let content_tamper = database_with_report();
+        let mut conn = content_tamper
+            .manager
+            .get_conn()
+            .expect("TEST_CODE binding content tamper");
+        diesel::sql_query("DROP TRIGGER trg_attribution_report_epoch_binding_no_update")
+            .execute(&mut conn)
+            .expect("TEST_CODE drop binding update guard");
+        diesel::sql_query(
+            "UPDATE attribution_report_epoch_binding
+             SET binding_manifest_hash = ? WHERE id = 1",
+        )
+        .bind::<Text, _>(lower_hash('f'))
+        .execute(&mut conn)
+        .expect("TEST_CODE mutate binding content");
+        restore_table_triggers(&mut conn, "attribution_report_epoch_binding");
+        drop(conn);
+        assert!(startup_fails(&content_tamper));
+        assert!(trigger_preappend_fails(&content_tamper));
+
+        let chain_tamper = database_with_report();
+        let mut conn = chain_tamper
+            .manager
+            .get_conn()
+            .expect("TEST_CODE binding chain tamper");
+        diesel::sql_query("DROP TRIGGER trg_attribution_report_epoch_binding_chain_no_update")
+            .execute(&mut conn)
+            .expect("TEST_CODE drop binding chain update guard");
+        diesel::sql_query(
+            "UPDATE attribution_report_epoch_binding_chain
+             SET record_hash = ? WHERE id = 1",
+        )
+        .bind::<Text, _>(lower_hash('e'))
+        .execute(&mut conn)
+        .expect("TEST_CODE mutate binding chain");
+        restore_table_triggers(&mut conn, "attribution_report_epoch_binding_chain");
+        drop(conn);
+        assert!(startup_fails(&chain_tamper));
+        assert!(trigger_preappend_fails(&chain_tamper));
+
+        let sequence_drift = TestDatabase::new();
+        let mut conn = sequence_drift
+            .manager
+            .get_conn()
+            .expect("TEST_CODE binding sequence drift");
+        diesel::sql_query(
+            "UPDATE sqlite_sequence SET seq = 7
+             WHERE name = 'attribution_report_epoch_binding'",
+        )
+        .execute(&mut conn)
+        .expect("TEST_CODE drift binding sequence");
+        drop(conn);
+        assert!(startup_fails(&sequence_drift));
+        assert!(trigger_preappend_fails(&sequence_drift));
+    }
+
+    #[test]
+    fn epoch_binding_transaction_restores_immediate_foreign_key_enforcement() {
+        let database = database_with_report();
+        let mut conn = database
+            .manager
+            .get_conn()
+            .expect("TEST_CODE foreign-key state");
+        let deferred = diesel::sql_query("PRAGMA defer_foreign_keys")
+            .get_result::<AttributionDeferredForeignKeysRow>(&mut conn)
+            .expect("TEST_CODE deferred foreign key state")
+            .defer_foreign_keys;
+        assert_eq!(deferred, 0);
+        assert!(
+            diesel::sql_query(
+                "INSERT INTO attribution_report_epoch_binding (
+                    schema_version, report_revision_id, binding_kind,
+                    binding_manifest_hash
+                 ) VALUES (1, 999999, 'legacy', ?)",
+            )
+            .bind::<Text, _>(lower_hash('a'))
+            .execute(&mut conn)
+            .is_err(),
+            "TEST_CODE FK enforcement must be immediate after commit"
+        );
+    }
+
+    #[test]
+    fn epoch_binding_transaction_inserts_report_binding_chain_then_exact_run() {
+        let database = TestDatabase::new();
+        let mut conn = database
+            .manager
+            .get_conn()
+            .expect("TEST_CODE transaction order connection");
+        conn.batch_execute(
+            "CREATE TEMP TRIGGER TEST_CODE_binding_requires_report_before_insert
+             BEFORE INSERT ON attribution_report_epoch_binding
+             WHEN NOT EXISTS (
+                    SELECT 1 FROM attribution_report_revision
+                    WHERE id = NEW.report_revision_id
+                )
+                OR EXISTS (
+                    SELECT 1 FROM attribution_run_audit AS run
+                    JOIN attribution_report_revision AS report
+                      ON report.source_run_id = run.id
+                    WHERE report.id = NEW.report_revision_id
+                )
+             BEGIN SELECT RAISE(ABORT, 'TEST_CODE report/binding order invalid'); END;
+
+             CREATE TEMP TRIGGER TEST_CODE_run_requires_binding_chain_before_insert
+             BEFORE INSERT ON attribution_run_audit
+             WHEN NEW.outcome = 'report_appended' AND NOT EXISTS (
+                    SELECT 1 FROM attribution_report_revision AS report
+                    JOIN attribution_report_epoch_binding AS binding
+                      ON binding.report_revision_id = report.id
+                    JOIN attribution_report_epoch_binding_chain AS chain
+                      ON chain.report_epoch_binding_id = binding.id
+                    WHERE report.report_identity = NEW.outcome_identity
+                )
+             BEGIN SELECT RAISE(ABORT, 'TEST_CODE binding/run order invalid'); END;
+
+             CREATE TEMP TRIGGER TEST_CODE_report_chain_requires_run_before_insert
+             BEFORE INSERT ON attribution_report_chain
+             WHEN NOT EXISTS (
+                    SELECT 1 FROM attribution_report_revision AS report
+                    JOIN attribution_run_audit AS run ON run.id = report.source_run_id
+                    JOIN attribution_report_epoch_binding AS binding
+                      ON binding.report_revision_id = report.id
+                    JOIN attribution_report_epoch_binding_chain AS chain
+                      ON chain.report_epoch_binding_id = binding.id
+                    WHERE report.id = NEW.report_revision_id
+                )
+             BEGIN SELECT RAISE(ABORT, 'TEST_CODE run/report-chain order invalid'); END;",
+        )
+        .expect("TEST_CODE install transaction-order sentinels");
+        drop(conn);
+
+        let receipt = AttributionReportStore::new(&database.manager)
+            .commit_report(report_append(
+                "2026-08-21T15:30:00+08:00",
+                serde_json::json!({"status": "ResearchOnly"}),
+            ))
+            .expect("TEST_CODE canonical transaction order");
+        assert_eq!(receipt.run.run_audit_id, 1);
+        assert_eq!(receipt.report_revision_id, 1);
+        assert_eq!(receipt.epoch_binding_id, 1);
     }
 
     fn failure_append() -> AttributionFailureAppend {
@@ -2590,6 +3974,8 @@ mod tests {
             "attribution_run_chain",
             "attribution_report_revision",
             "attribution_report_chain",
+            "attribution_report_epoch_binding",
+            "attribution_report_epoch_binding_chain",
             "attribution_failure_audit",
             "attribution_failure_chain",
         ] {
@@ -2625,6 +4011,89 @@ mod tests {
         database
     }
 
+    fn seed_implicit_legacy_report(database: &TestDatabase) {
+        let input = report_append(
+            "2026-08-21T15:30:00+08:00",
+            serde_json::json!({"status": "ResearchOnly", "history": "legacy"}),
+        );
+        let legacy_invocation = prepare_invocation(input.invocation.clone())
+            .expect("TEST_CODE prepare historical invocation");
+        let mut prepared = prepare_report(input).expect("TEST_CODE prepare historical report");
+        let evidence_identity = hash_with_domain(
+            b"BR251_ATTRIBUTION_EVIDENCE_IDENTITY_V1",
+            &[
+                legacy_invocation.series_identity.as_bytes(),
+                prepared.trade_hash.as_bytes(),
+                prepared.fee_status.as_bytes(),
+                prepared.fee_value.as_bytes(),
+                prepared.stock_close_hash.as_bytes(),
+                prepared.benchmark_manifest_hash.as_bytes(),
+                prepared.calendar_authority_hash.as_bytes(),
+                prepared.regime_status.as_bytes(),
+                prepared.regime_value.as_bytes(),
+            ],
+        );
+        let report_identity = hash_with_domain(
+            b"BR251_ATTRIBUTION_REPORT_IDENTITY_V1",
+            &[
+                evidence_identity.as_bytes(),
+                prepared.result_payload_hash.as_bytes(),
+            ],
+        );
+        prepared.invocation = legacy_invocation;
+        prepared.evidence_identity = evidence_identity;
+        prepared.report_identity = report_identity.clone();
+
+        let mut conn = database
+            .manager
+            .get_conn()
+            .expect("TEST_CODE historical report connection");
+        let run = insert_run(
+            &mut conn,
+            &prepared.invocation,
+            "report_appended",
+            &report_identity,
+            RUN_CHAIN_GENESIS,
+        )
+        .expect("TEST_CODE historical run");
+        let report = insert_report_row(&mut conn, &prepared, run.run_audit_id, 1, None)
+            .expect("TEST_CODE historical report");
+        insert_report_chain(&mut conn, &report, REPORT_CHAIN_GENESIS)
+            .expect("TEST_CODE historical report chain");
+        validate_all_state(&mut conn).expect("TEST_CODE implicit legacy history validates");
+    }
+
+    #[test]
+    fn epoch_binding_new_legacy_report_does_not_rewrite_unbound_history() {
+        let database = TestDatabase::new();
+        seed_implicit_legacy_report(&database);
+        assert_eq!(database.count("attribution_report_revision"), 1);
+        assert_eq!(database.count("attribution_report_epoch_binding"), 0);
+
+        let receipt = AttributionReportStore::new(&database.manager)
+            .commit_report(report_append(
+                "2026-08-22T15:30:00+08:00",
+                serde_json::json!({"status": "ResearchOnly", "history": "new"}),
+            ))
+            .expect("TEST_CODE append explicit legacy binding after old history");
+        assert_eq!(receipt.epoch, AttributionReportEpochBinding::Legacy);
+        assert_eq!(database.count("attribution_report_revision"), 2);
+        assert_eq!(database.count("attribution_report_epoch_binding"), 1);
+        let mut conn = database
+            .manager
+            .get_conn()
+            .expect("TEST_CODE historical binding read");
+        let bound_report_id = diesel::sql_query(
+            "SELECT report_revision_id AS value
+             FROM attribution_report_epoch_binding ORDER BY id",
+        )
+        .get_result::<IntegerRow>(&mut conn)
+        .expect("TEST_CODE only new report is bound")
+        .value;
+        assert_eq!(bound_report_id, receipt.report_revision_id);
+        assert_ne!(bound_report_id, 1);
+    }
+
     fn database_with_failure() -> TestDatabase {
         let database = TestDatabase::new();
         AttributionReportStore::new(&database.manager)
@@ -2639,6 +4108,8 @@ mod tests {
             .get_conn()
             .expect("TEST_CODE delete report invocation connection");
         for trigger in [
+            "trg_attribution_report_epoch_binding_chain_no_delete",
+            "trg_attribution_report_epoch_binding_no_delete",
             "trg_attribution_report_chain_no_delete",
             "trg_attribution_report_revision_no_delete",
             "trg_attribution_run_chain_no_delete",
@@ -2649,6 +4120,8 @@ mod tests {
                 .expect("TEST_CODE drop report invocation delete trigger");
         }
         for table in [
+            "attribution_report_epoch_binding_chain",
+            "attribution_report_epoch_binding",
             "attribution_report_chain",
             "attribution_report_revision",
             "attribution_run_chain",
@@ -2659,6 +4132,11 @@ mod tests {
                 .expect("TEST_CODE delete unique report invocation row");
         }
         for (table, label) in [
+            (
+                "attribution_report_epoch_binding_chain",
+                "report epoch binding chain",
+            ),
+            ("attribution_report_epoch_binding", "report epoch binding"),
             ("attribution_report_chain", "report chain"),
             ("attribution_report_revision", "report revision"),
             ("attribution_run_chain", "run chain"),
@@ -2783,17 +4261,31 @@ mod tests {
             .get_conn()
             .expect("TEST_CODE report paired deletion connection");
         for trigger in [
+            "trg_attribution_report_epoch_binding_chain_no_delete",
+            "trg_attribution_report_epoch_binding_no_delete",
             "trg_attribution_report_chain_no_delete",
             "trg_attribution_report_revision_no_delete",
             "trg_attribution_run_chain_no_delete",
             "trg_attribution_run_audit_no_delete",
             "trg_attribution_report_chain_no_update",
+            "trg_attribution_report_epoch_binding_chain_no_update",
             "trg_attribution_run_chain_no_update",
         ] {
             diesel::sql_query(format!("DROP TRIGGER {trigger}"))
                 .execute(&mut conn)
                 .expect("TEST_CODE drop report paired deletion trigger");
         }
+        diesel::sql_query(
+            "DELETE FROM attribution_report_epoch_binding_chain
+             WHERE report_epoch_binding_id = ?",
+        )
+        .bind::<BigInt, _>(id)
+        .execute(&mut conn)
+        .expect("TEST_CODE delete report epoch binding chain pair");
+        diesel::sql_query("DELETE FROM attribution_report_epoch_binding WHERE id = ?")
+            .bind::<BigInt, _>(id)
+            .execute(&mut conn)
+            .expect("TEST_CODE delete report epoch binding pair");
         diesel::sql_query("DELETE FROM attribution_report_chain WHERE report_revision_id = ?")
             .bind::<BigInt, _>(id)
             .execute(&mut conn)
@@ -2835,6 +4327,11 @@ mod tests {
             ("attribution_report_chain", "report_revision_id"),
         );
         for (table, label) in [
+            (
+                "attribution_report_epoch_binding_chain",
+                "report epoch binding chain",
+            ),
+            ("attribution_report_epoch_binding", "report epoch binding"),
             ("attribution_report_chain", "report chain"),
             ("attribution_report_revision", "report revision"),
             ("attribution_run_chain", "run chain"),
@@ -3190,7 +4687,7 @@ mod tests {
     }
 
     #[test]
-    fn migrations_create_all_six_immutable_attribution_tables() {
+    fn migrations_create_exact_immutable_attribution_table_registry() {
         let mut conn = SqliteConnection::establish(":memory:")
             .expect("TEST_CODE establish migration database");
         DatabaseManager::run_migrations_for_test(&mut conn)
@@ -3210,12 +4707,19 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "attribution_epoch_attempt_audit",
+                "attribution_epoch_attempt_chain",
                 "attribution_failure_audit",
                 "attribution_failure_chain",
+                "attribution_legacy_carry_item",
                 "attribution_report_chain",
+                "attribution_report_epoch_binding",
+                "attribution_report_epoch_binding_chain",
                 "attribution_report_revision",
                 "attribution_run_audit",
                 "attribution_run_chain",
+                "attribution_sample_epoch_receipt",
+                "attribution_sample_epoch_receipt_chain",
             ]
         );
 
@@ -3232,18 +4736,32 @@ mod tests {
         assert_eq!(
             trigger_names,
             vec![
+                "trg_attribution_epoch_attempt_audit_no_delete",
+                "trg_attribution_epoch_attempt_audit_no_update",
+                "trg_attribution_epoch_attempt_chain_no_delete",
+                "trg_attribution_epoch_attempt_chain_no_update",
                 "trg_attribution_failure_audit_no_delete",
                 "trg_attribution_failure_audit_no_update",
                 "trg_attribution_failure_chain_no_delete",
                 "trg_attribution_failure_chain_no_update",
+                "trg_attribution_legacy_carry_item_no_delete",
+                "trg_attribution_legacy_carry_item_no_update",
                 "trg_attribution_report_chain_no_delete",
                 "trg_attribution_report_chain_no_update",
+                "trg_attribution_report_epoch_binding_chain_no_delete",
+                "trg_attribution_report_epoch_binding_chain_no_update",
+                "trg_attribution_report_epoch_binding_no_delete",
+                "trg_attribution_report_epoch_binding_no_update",
                 "trg_attribution_report_revision_no_delete",
                 "trg_attribution_report_revision_no_update",
                 "trg_attribution_run_audit_no_delete",
                 "trg_attribution_run_audit_no_update",
                 "trg_attribution_run_chain_no_delete",
                 "trg_attribution_run_chain_no_update",
+                "trg_attribution_sample_epoch_receipt_chain_no_delete",
+                "trg_attribution_sample_epoch_receipt_chain_no_update",
+                "trg_attribution_sample_epoch_receipt_no_delete",
+                "trg_attribution_sample_epoch_receipt_no_update",
             ]
         );
 
@@ -3272,6 +4790,24 @@ mod tests {
         .expect("TEST_CODE count partial attribution tables")
         .value;
         assert_eq!(table_count, 1);
+
+        let mut binding_only = SqliteConnection::establish(":memory:")
+            .expect("TEST_CODE establish binding-only schema database");
+        diesel::sql_query(REPORT_EPOCH_BINDING_TABLE_SQL)
+            .execute(&mut binding_only)
+            .expect("TEST_CODE create isolated binding table");
+        assert!(
+            super::create_schema(&mut binding_only).is_err(),
+            "TEST_CODE binding-only partial schema must fail before repair"
+        );
+        let binding_only_count = diesel::sql_query(
+            "SELECT COUNT(*) AS value FROM sqlite_master
+             WHERE type = 'table' AND name LIKE 'attribution_%'",
+        )
+        .get_result::<IntegerRow>(&mut binding_only)
+        .expect("TEST_CODE count binding-only tables")
+        .value;
+        assert_eq!(binding_only_count, 1);
     }
 
     #[test]
@@ -4038,6 +5574,10 @@ mod tests {
             "trg_attribution_report_revision_no_delete",
             "trg_attribution_report_chain_no_update",
             "trg_attribution_report_chain_no_delete",
+            "trg_attribution_report_epoch_binding_no_update",
+            "trg_attribution_report_epoch_binding_no_delete",
+            "trg_attribution_report_epoch_binding_chain_no_update",
+            "trg_attribution_report_epoch_binding_chain_no_delete",
             "trg_attribution_failure_audit_no_update",
             "trg_attribution_failure_audit_no_delete",
             "trg_attribution_failure_chain_no_update",

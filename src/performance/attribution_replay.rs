@@ -41,8 +41,9 @@ use crate::database::attribution_epochs::{
 };
 use crate::database::attribution_reports::{
     AttributionEvidenceHash, AttributionFailureAppend, AttributionFailureReceipt,
-    AttributionInvocation, AttributionReportAppend, AttributionReportReceipt,
-    AttributionReportStore, AttributionReportStoreError, AttributionRunMode,
+    AttributionInvocation, AttributionReportAppend, AttributionReportEpochBinding,
+    AttributionReportReceipt, AttributionReportStore, AttributionReportStoreError,
+    AttributionRunMode,
 };
 use crate::database::order_audit::{
     validate_canonical_order_audit_chain, CanonicalOrderAuditChainRow, CanonicalOrderAuditRow,
@@ -3675,6 +3676,42 @@ impl PreparedAttributionReport {
     pub fn calendar_authority_hash(&self) -> &str {
         &self.calendar_authority_hash
     }
+
+    fn report_epoch_binding(&self) -> Result<AttributionReportEpochBinding, ReplayError> {
+        match self.epoch_selector() {
+            AttributionEpochSelector::Legacy => Ok(AttributionReportEpochBinding::Legacy),
+            AttributionEpochSelector::Active | AttributionEpochSelector::Exact(_) => {
+                let (
+                    Some(epoch_id),
+                    Some(epoch_receipt_hash),
+                    Some(effective_date),
+                    Some(legacy_carry_manifest_hash),
+                    Some(exclusion_manifest_hash),
+                ) = (
+                    self.epoch_id(),
+                    self.epoch_receipt_hash(),
+                    self.epoch_effective_date(),
+                    self.legacy_carry_manifest_hash(),
+                    self.exclusion_manifest_hash(),
+                )
+                else {
+                    return Err(ReplayError::new(
+                        ReplayErrorClass::FailedIntegrity,
+                        ReplayStage::Epoch,
+                        "attribution_report_epoch_binding_missing",
+                        false,
+                    ));
+                };
+                Ok(AttributionReportEpochBinding::Epoch {
+                    epoch_id: epoch_id.to_owned(),
+                    epoch_receipt_hash: epoch_receipt_hash.to_owned(),
+                    effective_date,
+                    legacy_carry_manifest_hash: legacy_carry_manifest_hash.to_owned(),
+                    exclusion_manifest_hash: exclusion_manifest_hash.to_owned(),
+                })
+            }
+        }
+    }
 }
 
 /// Opaque result of committing exactly one prepared attribution report.
@@ -4189,9 +4226,11 @@ impl<'a> AttributionReplayRunner<'a> {
                 return Err(error.with_failure_receipt(receipt));
             }
         };
+        let epoch = prepared.report_epoch_binding()?;
         let receipt = AttributionReportStore::new(self.database)
             .commit_report(AttributionReportAppend {
                 invocation: prepared.invocation.clone(),
+                epoch,
                 trade_hash: prepared.trade_manifest_hash.clone(),
                 fee: prepared.fee.clone(),
                 stock_close_hash: prepared.stock_close_manifest_hash.clone(),
@@ -6117,6 +6156,8 @@ mod tests {
             "attribution_run_chain",
             "attribution_report_revision",
             "attribution_report_chain",
+            "attribution_report_epoch_binding",
+            "attribution_report_epoch_binding_chain",
             "attribution_failure_audit",
             "attribution_failure_chain",
         ]
@@ -6504,16 +6545,17 @@ mod tests {
             },
         );
 
+        let active_request = ReplayRequest {
+            mode: ReplayMode::Range {
+                from: date("2026-08-24"),
+                to: date("2026-08-26"),
+                invoked_at: shanghai_at("2026-08-26", 15, 30, 0),
+            },
+            epoch: AttributionEpochSelector::Active,
+            benchmark_day_manifests: benchmark_day_manifests.clone(),
+        };
         let prepared = runner
-            .preview(ReplayRequest {
-                mode: ReplayMode::Range {
-                    from: date("2026-08-24"),
-                    to: date("2026-08-26"),
-                    invoked_at: shanghai_at("2026-08-26", 15, 30, 0),
-                },
-                epoch: AttributionEpochSelector::Active,
-                benchmark_day_manifests: benchmark_day_manifests.clone(),
-            })
+            .preview(active_request.clone())
             .expect("TEST_CODE active epoch replay");
 
         assert_eq!(prepared.epoch_selector(), &AttributionEpochSelector::Active);
@@ -6547,6 +6589,29 @@ mod tests {
             serde_json::from_slice(prepared.canonical_result_bytes()).unwrap();
         assert_eq!(payload["epoch"]["selector"], "active");
         assert_eq!(payload["epoch"]["excluded_fill_count"], 2);
+        let expected_binding = AttributionReportEpochBinding::Epoch {
+            epoch_id: receipt.epoch_id.clone(),
+            epoch_receipt_hash: receipt.receipt_hash.clone(),
+            effective_date: receipt.effective_trading_date,
+            legacy_carry_manifest_hash: receipt.legacy_carry_manifest_hash.clone(),
+            exclusion_manifest_hash: prepared.exclusion_manifest_hash().unwrap().to_owned(),
+        };
+        assert_eq!(prepared.report_epoch_binding().unwrap(), expected_binding);
+        let mut missing_binding = prepared.clone();
+        missing_binding.report.epoch.receipt_hash = None;
+        let missing_error = missing_binding
+            .report_epoch_binding()
+            .expect_err("TEST_CODE active report cannot omit epoch receipt binding");
+        assert_eq!(missing_error.stage(), ReplayStage::Epoch);
+        assert_eq!(
+            missing_error.code(),
+            "attribution_report_epoch_binding_missing"
+        );
+        let committed = runner
+            .commit_with_report(active_request)
+            .expect("TEST_CODE active epoch report commit");
+        assert_eq!(committed.receipt().epoch, expected_binding);
+        assert_eq!(committed.receipt().report_revision, 1);
         let exact = runner
             .preview(ReplayRequest {
                 mode: ReplayMode::Range {
@@ -6950,7 +7015,10 @@ mod tests {
             .expect_err("TEST_CODE formal current-day failure");
         assert_eq!(current_committed.code(), "current_session_incomplete");
         assert!(current_committed.failure_receipt().is_some());
-        assert_eq!(attribution_table_counts(&path), vec![1, 1, 0, 0, 1, 1]);
+        assert_eq!(
+            attribution_table_counts(&path),
+            vec![1, 1, 0, 0, 0, 0, 1, 1]
+        );
 
         let weekend_committed = runner
             .commit(scheduled_request(
@@ -6964,7 +7032,10 @@ mod tests {
             "benchmark_day_manifest_unavailable"
         );
         assert!(weekend_committed.failure_receipt().is_some());
-        assert_eq!(attribution_table_counts(&path), vec![2, 2, 0, 0, 2, 2]);
+        assert_eq!(
+            attribution_table_counts(&path),
+            vec![2, 2, 0, 0, 0, 0, 2, 2]
+        );
 
         let before_preview_failures = runner_readonly_counts(&path);
         let before_preview_objects = sqlite_object_stats(&path);
@@ -7044,7 +7115,10 @@ mod tests {
             .expect_err("TEST_CODE pre-close formal invocation is incomplete");
         assert_eq!(incomplete.code(), "current_session_incomplete");
         assert!(incomplete.failure_receipt().is_some());
-        assert_eq!(attribution_table_counts(&path), vec![3, 3, 0, 0, 3, 3]);
+        assert_eq!(
+            attribution_table_counts(&path),
+            vec![3, 3, 0, 0, 0, 0, 3, 3]
+        );
         drop(runner);
         drop(manager);
         remove_database(path);
@@ -7747,7 +7821,7 @@ mod tests {
         assert!(!weekend_error
             .redacted_message()
             .contains(&weekend_path.to_string_lossy().to_string()));
-        assert_eq!(attribution_table_counts(&weekend_path), vec![0; 6]);
+        assert_eq!(attribution_table_counts(&weekend_path), vec![0; 8]);
         drop(weekend_runner);
         drop(weekend_manager);
         remove_database(weekend_path);
@@ -7810,7 +7884,7 @@ mod tests {
         assert_eq!(storage.class(), ReplayErrorClass::Storage);
         assert_eq!(storage.stage(), ReplayStage::Store);
         assert!(storage.failure_receipt().is_none());
-        assert_eq!(attribution_table_counts(&store_path), vec![0; 6]);
+        assert_eq!(attribution_table_counts(&store_path), vec![0; 8]);
         drop(store_runner);
         drop(store_manager);
         remove_database(store_path);
@@ -7861,6 +7935,7 @@ mod tests {
             initial.as_slice()
         );
         let friday = friday_committed.receipt().clone();
+        assert_eq!(friday.epoch, AttributionReportEpochBinding::Legacy);
         let saturday = runner
             .commit(scheduled_request(
                 shanghai_at("2026-08-22", 15, 30, 0),
@@ -7879,7 +7954,10 @@ mod tests {
         assert_eq!(friday.report_identity, sunday.report_identity);
         assert_ne!(friday.run.run_audit_id, saturday.run.run_audit_id);
         assert_ne!(saturday.run.run_audit_id, sunday.run.run_audit_id);
-        assert_eq!(attribution_table_counts(&path), vec![3, 3, 1, 1, 0, 0]);
+        assert_eq!(
+            attribution_table_counts(&path),
+            vec![3, 3, 1, 1, 1, 1, 0, 0]
+        );
 
         let retained_payload: String = Connection::open(&path)
             .unwrap()
@@ -7913,7 +7991,10 @@ mod tests {
             Some(friday.report_revision_id)
         );
         assert_ne!(revised.report_identity, friday.report_identity);
-        assert_eq!(attribution_table_counts(&path), vec![4, 4, 2, 2, 0, 0]);
+        assert_eq!(
+            attribution_table_counts(&path),
+            vec![4, 4, 2, 2, 2, 2, 0, 0]
+        );
         drop(runner);
         drop(manager);
         remove_database(path);
