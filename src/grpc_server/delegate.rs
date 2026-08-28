@@ -6,8 +6,9 @@
 //! 签名说明 (实测, 非计划假设): data_gateway 全部是 async fn (内部自行
 //! spawn_blocking), 所以 fetch 本身是 async, handler 直接 await, 不套 spawn_blocking。
 //! 记录结构体没有 derive Serialize → 逐字段 json! 映射 (字段名 = 结构体字段名);
-//! M1 扩展的 14 个 fetch 中已 derive Serialize 的 record (FinancialStatement/
-//! MagicTdxT0Evidence/GeneralWebResearchRecord) 用 serde_json::to_value 直出。
+//! M1 扩展的 14 个 fetch 中，已 derive Serialize 的 record
+//! (FinancialStatement/GeneralWebResearchRecord) 用 serde_json::to_value 直出；
+//! T0 v2 批次由 t0_wire 的显式 DTO 序列化，固定投影中国时段 civil label。
 use crate::data_gateway::outcome_daily_bars::{
     fetch_magic_tdx_outcome_adaptive, OutcomeTransportFailure, RawOutcomeFetch,
 };
@@ -1924,36 +1925,23 @@ async fn fetch_intraday_shape(params: &Value) -> Result<Fetched, DelegateError> 
 }
 
 /// T0 证据: MagicTdxGateway::get_t0_evidence_batch (同步阻塞, 直接调用)。
-/// MagicTdxT0Evidence/Rejection 已 derive Serialize → to_value 直出。
+/// 通过显式 wire DTO 输出，已验证的五分钟 civil label 固定标注为 +08:00。
 async fn fetch_t0_evidence(params: &Value) -> Result<Fetched, DelegateError> {
     let codes = crate::grpc_contract::params::resolve_codes(params)?;
     let batch = MagicTdxGateway::new()
         .get_t0_evidence_batch(&codes, chrono::Utc::now())
         .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(format!("T0 证据不可用: {e}"))))?;
-    let records: Vec<Value> = batch
-        .records
-        .iter()
-        .map(|r| {
-            serde_json::to_value(r)
-                .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(e.to_string())))
-        })
-        .collect::<Result<_, _>>()?;
-    let rejections: Vec<Value> = batch
-        .rejections
-        .iter()
-        .map(|r| {
-            serde_json::to_value(r)
-                .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(e.to_string())))
-        })
-        .collect::<Result<_, _>>()?;
-    let view = json!({ "records": records, "rejections": rejections });
+    let data = crate::grpc_server::t0_wire::encode_t0_batch_v2(&batch).map_err(|error| {
+        DelegateError::Fetch(FetchFailure::unknown(format!(
+            "T0 v2 batch serialization failed: {error}"
+        )))
+    })?;
     Ok(Fetched {
-        data: serde_json::to_vec(&view)
-            .map_err(|e| DelegateError::Fetch(FetchFailure::unknown(e.to_string())))?,
+        data,
         source_at: batch.source_at.to_rfc3339(),
         observed_at: batch.observed_at.to_rfc3339(),
-        provider: format!("{:?}", ProviderId::Tdx),
-        source: "magic_tdx_t0".to_string(),
+        provider: format!("{:?}", batch.provider),
+        source: batch.source,
         batch_id: batch.batch_id,
     })
 }

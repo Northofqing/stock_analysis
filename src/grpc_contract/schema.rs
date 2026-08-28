@@ -194,7 +194,7 @@ const SCHEMAS: &[OpSchema] = &[
     OpSchema {
         operation: Operation::T0Evidence,
         schema_name: "market.t0_evidence",
-        schema_version: 1,
+        schema_version: 2,
     },
     OpSchema {
         operation: Operation::OutcomeDailyBars,
@@ -242,6 +242,13 @@ mod tests {
         let schema = schema_for(Operation::BenchmarkBars).expect("BenchmarkBars schema");
         assert_eq!(schema.schema_name, "market.benchmark_bars");
         assert_eq!(schema.schema_version, 1);
+    }
+
+    #[test]
+    fn t0_evidence_uses_frozen_v2_schema() {
+        let schema = schema_for(Operation::T0Evidence).expect("T0Evidence schema");
+        assert_eq!(schema.schema_name, "market.t0_evidence");
+        assert_eq!(schema.schema_version, 2);
     }
 
     #[test]

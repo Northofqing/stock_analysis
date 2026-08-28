@@ -538,6 +538,7 @@ impl DatabaseManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{io, path::Path};
 
     struct ConceptsGuard {
         code: String,
@@ -570,6 +571,14 @@ mod tests {
             .as_nanos()
     }
 
+    fn remove_test_file_if_present(path: &Path) -> io::Result<()> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     // B-002 DAO 测试约束: DatabaseManager 是 OnceCell 单例, init() 仅生效一次.
     // 全部 DAO 测试共用同一份 ./test_data/test.db, 用唯一 date 隔离, 不假定空表.
     const TEST_DATE: &str = "2099-01-01"; // 远期日期, 不与生产 / 其他测试冲突
@@ -578,12 +587,24 @@ mod tests {
     /// 拆 3 个独立测试因 OnceCell 限制都共享同一 DB, 写在一起避免干扰.
     #[test]
     fn test_board_rotations_dao_lifecycle() {
+        let test_data_dir = Path::new("./test_data");
         let test_db = std::path::PathBuf::from("./test_data/test.db");
-        std::fs::create_dir_all("./test_data").ok();
-        if test_db.exists() {
-            let _ = std::fs::remove_file(&test_db);
-        }
-        let _ = DatabaseManager::init(Some(test_db));
+        std::fs::create_dir_all(test_data_dir)
+            .expect("create TEST_CODE board rotations test data directory");
+        let cleanup_probe = test_data_dir.join(format!(
+            "TEST_CODE_concepts_cleanup_probe_{}.tmp",
+            unique_suffix()
+        ));
+        std::fs::write(&cleanup_probe, b"TEST_CODE cleanup probe")
+            .expect("create TEST_CODE concept cleanup probe");
+        remove_test_file_if_present(&cleanup_probe)
+            .expect("remove existing TEST_CODE concept cleanup probe");
+        remove_test_file_if_present(&cleanup_probe)
+            .expect("accept missing TEST_CODE concept cleanup probe");
+        remove_test_file_if_present(&test_db)
+            .expect("remove exact TEST_CODE board rotations database if present");
+        DatabaseManager::init(Some(test_db))
+            .expect("initialize exact TEST_CODE board rotations database");
         let db = DatabaseManager::get();
 
         // === 场景 1: round-trip, 2 个 board 写入, 验证字段 + 排序 ===

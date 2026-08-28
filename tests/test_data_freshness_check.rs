@@ -7,6 +7,25 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+struct DesignContracts {
+    coverage: CoverageContract,
+}
+
+#[derive(Debug, Deserialize)]
+struct CoverageContract {
+    source_sha: String,
+    global_covered: u64,
+    global_count: u64,
+    core_covered: u64,
+    core_count: u64,
+    rustc_release: String,
+    llvm_version: String,
+    cargo_llvm_cov_version: String,
+}
+
 fn script_path() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("tools/compliance/lib/check_data_freshness.sh");
@@ -21,6 +40,45 @@ fn compliance_script_path() -> PathBuf {
 
 fn pr_evidence_script_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/compliance/lib/check_pr_evidence.sh")
+}
+
+fn coverage_contract() -> CoverageContract {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/design_contracts.toml");
+    let contents = std::fs::read_to_string(&path).expect("应能读取 design contracts");
+    toml::from_str::<DesignContracts>(&contents)
+        .expect("coverage contract 应为有效 TOML")
+        .coverage
+}
+
+fn complete_pr_evidence_body(
+    coverage: &CoverageContract,
+    bootstrap_baseline: bool,
+    global: (u64, u64),
+) -> String {
+    format!(
+        r#"Refs: spec §10.12
+Data-Redlines: [2.4, 2.7, 2.10]
+OldModules: checker | adopt | deepen
+Threshold-Proof: spec §10.4 and config/design_contracts.toml [coverage]
+Business-Rules: BR-252
+Rollback: git revert TEST_CODE
+Gate-Policy: PR=core-patch90+other-patch85+ratchet; Release=global80+core95+freshness+live
+Bootstrap-Baseline: {bootstrap_baseline}
+Baseline-Source-SHA: {}
+Baseline-Global: {}/{}
+Baseline-Core: {}/{}
+Coverage-Tools: rustc={}; LLVM={}; cargo-llvm-cov={}
+Gate-C: PASS
+Gate-D: Release Blocked"#,
+        coverage.source_sha,
+        global.0,
+        global.1,
+        coverage.core_covered,
+        coverage.core_count,
+        coverage.rustc_release,
+        coverage.llvm_version,
+        coverage.cargo_llvm_cov_version,
+    )
 }
 
 fn run_pr_evidence(body: &str) -> std::process::Output {
@@ -287,65 +345,37 @@ Rollback: git revert TEST_CODE"#;
 
 #[test]
 fn pr_evidence_accepts_complete_separate_gate_c_and_gate_d_results() {
-    let body = r#"Refs: spec §10.12
-Data-Redlines: [2.4, 2.7, 2.10]
-OldModules: checker | adopt | deepen
-Threshold-Proof: spec §10.4 and config/design_contracts.toml [coverage]
-Business-Rules: BR-252
-Rollback: git revert TEST_CODE
-Gate-Policy: PR=core-patch90+other-patch85+ratchet; Release=global80+core95+freshness+live
-Bootstrap-Baseline: true
-Baseline-Source-SHA: f05f506e744898319b6ba059580ab17bf65004cf
-Baseline-Global: 201256/258810
-Baseline-Core: 157635/202935
-Coverage-Tools: rustc=1.95.0; LLVM=22.1.2; cargo-llvm-cov=0.8.7
-Gate-C: PASS
-Gate-D: Release Blocked"#;
-    let output = run_pr_evidence(body);
+    let coverage = coverage_contract();
+    let body = complete_pr_evidence_body(
+        &coverage,
+        true,
+        (coverage.global_covered, coverage.global_count),
+    );
+    let output = run_pr_evidence(&body);
     assert!(output.status.success(), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stdout).contains("PASS"));
 }
 
 #[test]
 fn pr_evidence_rejects_baseline_values_that_do_not_match_the_contract() {
-    let body = r#"Refs: spec §10.12
-Data-Redlines: [2.4, 2.7, 2.10]
-OldModules: checker | adopt | deepen
-Threshold-Proof: spec §10.4 and config/design_contracts.toml [coverage]
-Business-Rules: BR-252
-Rollback: git revert TEST_CODE
-Gate-Policy: PR=core-patch90+other-patch85+ratchet; Release=global80+core95+freshness+live
-Bootstrap-Baseline: true
-Baseline-Source-SHA: f05f506e744898319b6ba059580ab17bf65004cf
-Baseline-Global: 1/1
-Baseline-Core: 157635/202935
-Coverage-Tools: rustc=1.95.0; LLVM=22.1.2; cargo-llvm-cov=0.8.7
-Gate-C: PASS
-Gate-D: Release Blocked"#;
-    let output = run_pr_evidence(body);
+    let coverage = coverage_contract();
+    let body = complete_pr_evidence_body(&coverage, true, (1, 1));
+    let output = run_pr_evidence(&body);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stderr).contains("does not match contract"));
 }
 
 #[test]
 fn pr_evidence_bootstrap_flag_must_match_the_base_contract_state() {
-    let body = r#"Refs: spec §10.12
-Data-Redlines: [2.4, 2.7, 2.10]
-OldModules: checker | adopt | deepen
-Threshold-Proof: spec §10.4 and config/design_contracts.toml [coverage]
-Business-Rules: BR-252
-Rollback: git revert TEST_CODE
-Gate-Policy: PR=core-patch90+other-patch85+ratchet; Release=global80+core95+freshness+live
-Bootstrap-Baseline: false
-Baseline-Source-SHA: f05f506e744898319b6ba059580ab17bf65004cf
-Baseline-Global: 201256/258810
-Baseline-Core: 157635/202935
-Coverage-Tools: rustc=1.95.0; LLVM=22.1.2; cargo-llvm-cov=0.8.7
-Gate-C: PASS
-Gate-D: Release Blocked"#;
+    let coverage = coverage_contract();
+    let body = complete_pr_evidence_body(
+        &coverage,
+        false,
+        (coverage.global_covered, coverage.global_count),
+    );
     let output = Command::new("bash")
         .arg(pr_evidence_script_path())
-        .env("PR_BODY", body)
+        .env("PR_BODY", &body)
         .env("PR_BASE_SHA", "c6024e5")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()

@@ -8,7 +8,7 @@
 
 **Tech Stack:** tonic 0.14（client+server 生成）、prost 0.14、tonic-build 0.14（build-dependency）、tokio-stream 0.1（ReceiverStream）、tokio、serde_json、anyhow。
 
-**Spec:** `docs/superpowers/specs/2026-08-13-grpc-data-channel-design.md`（已批准，commit 61ee717）
+**Spec:** `docs/superpowers/specs/2026-08-13-grpc-data-channel-design.md`（§11.9 Gate C 聚焦收口已批准，commit `e056a7f`）
 
 ## Global Constraints
 
@@ -1870,7 +1870,7 @@ async fn health_and_capabilities() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn six_representative_ops_fixture_roundtrip() {
+async fn fixture_operations_roundtrip() {
     let (addr, handle) = start(ServerConfig {
         fixture_mode: true,
         port: 0,
@@ -2678,3 +2678,1852 @@ git commit -m "feat(grpc): P2 事件生成器 + Subscribe/Replay/GetListenerStat
 - gRPC 数据通道（P0-P2）交付：客户端 24 op 可查、服务端真实 provider 委托、事件流可用。
 - **现有程序零改动**：monitor 二进制/14 处 push_governor_v3/289 单测未触碰；`Cargo.toml` 仅加 tonic/prost/tokio-stream/tonic-build 4 个依赖（thiserror/chrono/log/env_logger/futures/serde_json 均已在册）。
 - 未做（下个计划）：P3 监听器 + 飞书推送（grpc_event_listener + push_forward + 新 PushKind）；P4 data_gateway 开关迁移；P5 文档交接。
+
+---
+
+# T0 Wire v2 与本地双进程切换实施计划（2026-08-27 修订）
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** 修复 T0 五分钟时间无时区与空批次不可重建问题，仅在全请求批次真实成功时归因 OrderBook，并安全部署同版本 server/monitor 后恢复日线 freshness。
+
+**Architecture:** 保留 `MagicTdxGateway` 的领域校验，在 `grpc_server` 增加只负责 v2 序列化的显式 wire 模块；客户端严格验证 schema、`+08:00` civil label 和批级证据后恢复现有领域对象。server 与 monitor 使用同一源码候选、备用端口验证、成对切换与成对回滚；MoneyFlow 继续保持显式 Unsupported。
+
+**Tech Stack:** Rust 2021、chrono 0.4、serde/serde_json、tonic/prost、SQLite、Bash 合规门禁、cargo-llvm-cov 0.8.7。
+
+**Spec:** `docs/superpowers/specs/2026-08-13-grpc-data-channel-design.md` §11（批准并固化于 commit `6818738`）
+
+## Global Constraints
+
+- 生产路径不得使用 mock；fixture 仅存在于 `#[cfg(test)]` 或 `fixture_mode=true` 隔离路径（2.1/2.5）。
+- `completed_five_minute[].at` v2 只接受显式 `+08:00`；无 offset、其他 offset、未来/倒置时间全部 fail-closed（2.2/2.3/2.4）。
+- payload 的 `source_at`、`observed_at`、`batch_id` 必须与 gRPC envelope 相同；空 records 不得用当前时间补 `requested_at`（2.2/2.7/BR-238）。
+- MoneyFlow 不接假 provider，不以 BoardFlows 代替，保持 `unsupported_contract`（2.1/2.8）。
+- BR-253 必须先登记，再实现“全请求集合成功才刷新 OrderBook capability”（2.10）。
+- 不修改 `grpc/market.proto`、策略阈值、订单门禁、推送节流或真实下单授权。
+- 不触碰未跟踪的根目录 `task_plan.md`、`findings.md`、`progress.md`。
+- Gate C 使用 `--policy pr`；Gate D 必须显式绑定固定生产 DB，不能用日期或日历覆盖绕过 freshness。
+
+---
+
+### Task 1: 先登记 BR-253
+
+**Files:**
+- Modify: `docs/business_rules.md`
+
+**Interfaces:**
+- Consumes: 设计 §11.4 的全请求集合原子成功条件。
+- Produces: `BR-253`，供 `src/data_gateway/grpc_source.rs` 的实现和 PR `Business-Rules` 字段引用。
+
+- [ ] **Step 1: 在规则表登记 BR-253**
+
+追加一行（保持表格现有格式）：
+
+```markdown
+| BR-253 | 🟡 Gate A approved；Gate B/C pending | T0 的 OrderBook capability 只能在 monitor 进程完成同一真实请求批次的全部准入后刷新：响应必须 ADMITTED、complete=true，payload/envelope 批次身份与时间一致，请求代码非空且无重复，record/rejection outcomes 与请求集合一一对应，所有请求代码均为成功 record、rejections 为空，并且每条五档盘口、价格和时间通过严格校验。部分成功、空 records、任一 rejection、重复/缺失/额外代码、无时区或坏时间均不得刷新；不得新增伪探针、以其他标的成功代表失败标的，或用 BoardFlows/MoneyFlow 替代盘口证据。 | `docs/superpowers/specs/2026-08-13-grpc-data-channel-design.md` §11.4, `src/data_gateway/grpc_source.rs` |
+```
+
+- [ ] **Step 2: 验证规则登记**
+
+Run: `bash tools/compliance/lib/check_business_rules.sh`
+
+Expected: exit 0，输出 business-rule check PASS；不得出现未登记集合判定。
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add docs/business_rules.md
+git commit -m "docs: register atomic T0 order-book admission"
+```
+
+---
+
+### Task 2: 冻结 `market.t0_evidence` schema v2
+
+**Files:**
+- Modify: `src/grpc_contract/schema.rs`
+
+**Interfaces:**
+- Consumes: `Operation::T0Evidence` 与既有 `OpSchema` 注册表。
+- Produces: `schema_for(Operation::T0Evidence) -> OpSchema { schema_name: "market.t0_evidence", schema_version: 2 }`；server handler 和 client request builder 自动共享。
+
+- [ ] **Step 1: 写失败测试**
+
+在 `src/grpc_contract/schema.rs` 测试模块增加：
+
+```rust
+#[test]
+fn t0_evidence_uses_frozen_v2_schema() {
+    let schema = schema_for(Operation::T0Evidence).expect("T0Evidence schema");
+    assert_eq!(schema.schema_name, "market.t0_evidence");
+    assert_eq!(schema.schema_version, 2);
+}
+```
+
+- [ ] **Step 2: 验证测试先失败**
+
+Run: `cargo test --lib grpc_contract::schema::tests::t0_evidence_uses_frozen_v2_schema -- --exact`
+
+Expected: FAIL，左值为 `1`、右值为 `2`。
+
+- [ ] **Step 3: 最小实现**
+
+只修改 T0 条目：
+
+```rust
+OpSchema {
+    operation: Operation::T0Evidence,
+    schema_name: "market.t0_evidence",
+    schema_version: 2,
+},
+```
+
+- [ ] **Step 4: 验证 schema 与错误版本门**
+
+Run: `cargo test --lib grpc_contract::schema::tests::`
+
+Run: `cargo test --lib grpc_contract::validate::tests::`
+
+Expected: PASS；现有 `rejects_unsupported_version` 继续证明未知版本被拒绝。
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/grpc_contract/schema.rs
+git commit -m "feat(grpc): freeze T0 evidence wire v2"
+```
+
+---
+
+### Task 3: 服务端用显式 wire DTO 输出 `+08:00`
+
+**Files:**
+- Create: `src/grpc_server/t0_wire.rs`
+- Modify: `src/grpc_server/mod.rs`
+- Modify: `src/grpc_server/delegate.rs`
+
+**Interfaces:**
+- Consumes: `&MagicTdxT0Batch`，其中五分钟 `at` 是已校验的 A 股中国标准时间 civil label。
+- Produces: `pub(super) fn encode_t0_batch_v2(batch: &MagicTdxT0Batch) -> Result<Vec<u8>, serde_json::Error>`。
+
+- [ ] **Step 1: 注册 wire 模块并写失败测试**
+
+先在 `src/grpc_server/mod.rs` 增加 `mod t0_wire;`。在新文件测试模块构造
+`TEST_CODE_T0_001` 批次，并写以下核心断言：
+
+```rust
+#[test]
+fn encodes_batch_identity_and_china_session_offset() {
+    let batch = sample_batch_with_bar(
+        NaiveDate::from_ymd_opt(2026, 8, 27)
+            .unwrap()
+            .and_hms_opt(13, 5, 0)
+            .unwrap(),
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&encode_t0_batch_v2(&batch).unwrap()).unwrap();
+
+    assert_eq!(value["requested_at"], batch.requested_at.to_rfc3339());
+    assert_eq!(value["source_at"], batch.source_at.to_rfc3339());
+    assert_eq!(value["observed_at"], batch.observed_at.to_rfc3339());
+    assert_eq!(value["batch_id"], "TEST_CODE_T0_BATCH_001");
+    assert_eq!(value["time_untrustworthy"], false);
+    assert_eq!(
+        value["records"][0]["completed_five_minute"][0]["at"],
+        "2026-08-27T13:05:00+08:00"
+    );
+}
+```
+
+测试模块使用以下本地 helper；不得为测试新增 production fixture 或默认数据路径：
+
+```rust
+fn sample_batch_with_bar(at: NaiveDateTime) -> MagicTdxT0Batch {
+    let requested_at = Utc.with_ymd_and_hms(2026, 8, 27, 5, 4, 59).unwrap();
+    let source_at = Utc.with_ymd_and_hms(2026, 8, 27, 5, 5, 0).unwrap();
+    let observed_at = source_at + chrono::Duration::milliseconds(250);
+    let book = || {
+        std::array::from_fn(|index| T0BookLevel {
+            price: 9.95 + index as f64 * 0.01,
+            volume: 100.0,
+        })
+    };
+    let record = MagicTdxT0Evidence {
+        instrument: InstrumentId::new(
+            Exchange::Shanghai,
+            "TEST_CODE_T0_001",
+            AssetClass::Equity,
+        )
+        .unwrap(),
+        code: "TEST_CODE_T0_001".to_owned(),
+        requested_at,
+        source_at,
+        observed_at,
+        batch_id: "TEST_CODE_T0_BATCH_001".to_owned(),
+        quote: MagicTdxT0Quote {
+            price: 10.0,
+            last_close: 9.9,
+            open: 9.95,
+            high: 10.1,
+            low: 9.8,
+            volume: 1_000.0,
+            amount: 10_000.0,
+            bids: book(),
+            asks: book(),
+        },
+        settled_daily: Vec::new(),
+        completed_five_minute: vec![MagicTdxT0FiveMinuteBar {
+            at,
+            open: 10.0,
+            high: 10.1,
+            low: 9.9,
+            close: 10.0,
+            volume: 1_000.0,
+            amount: 10_000.0,
+        }],
+        intraday_average_price: 10.0,
+    };
+    MagicTdxT0Batch {
+        provider: ProviderId::Tdx,
+        source: "TEST_CODE_magic_tdx_t0".to_owned(),
+        requested_at,
+        source_at,
+        observed_at,
+        batch_id: "TEST_CODE_T0_BATCH_001".to_owned(),
+        records: vec![record],
+        rejections: Vec::new(),
+        time_untrustworthy: false,
+    }
+}
+```
+
+测试 imports 必须包含 `T0BookLevel`、`ProviderId`、`InstrumentId`、`Exchange`、
+`AssetClass`、`NaiveDateTime`、`TimeZone` 与 `Utc`。
+
+- [ ] **Step 2: 验证测试因模块不存在而失败**
+
+Run: `cargo test --lib grpc_server::t0_wire::tests::encodes_batch_identity_and_china_session_offset -- --exact`
+
+Expected: FAIL，仅因 `encode_t0_batch_v2` 尚不存在；如果是类型字段不匹配，先修正测试构造器
+使其与当前 `MagicTdxT0Batch` 完全一致，再重新确认 RED。
+
+- [ ] **Step 3: 实现 DTO 与固定时区投影**
+
+`src/grpc_server/t0_wire.rs` 使用以下类型边界；字段不得改用 `Value`：
+
+```rust
+use crate::data_gateway::{
+    MagicTdxT0Batch, MagicTdxT0DailyBar, MagicTdxT0Evidence,
+    MagicTdxT0FiveMinuteBar, MagicTdxT0Quote, MagicTdxT0Rejection,
+};
+use crate::magic_compat::InstrumentId;
+use chrono::{FixedOffset, SecondsFormat, TimeZone};
+use serde::Serialize;
+
+const CHINA_OFFSET_SECONDS: i32 = 8 * 60 * 60;
+
+#[derive(Serialize)]
+struct T0EvidenceBatchWireV2<'a> {
+    requested_at: String,
+    source_at: String,
+    observed_at: String,
+    batch_id: &'a str,
+    time_untrustworthy: bool,
+    records: Vec<T0EvidenceRecordWireV2<'a>>,
+    rejections: &'a [MagicTdxT0Rejection],
+}
+
+#[derive(Serialize)]
+struct T0EvidenceRecordWireV2<'a> {
+    instrument: &'a InstrumentId,
+    code: &'a str,
+    requested_at: String,
+    source_at: String,
+    observed_at: String,
+    batch_id: &'a str,
+    quote: &'a MagicTdxT0Quote,
+    settled_daily: &'a [MagicTdxT0DailyBar],
+    completed_five_minute: Vec<T0FiveMinuteBarWireV2>,
+    intraday_average_price: f64,
+}
+
+#[derive(Serialize)]
+struct T0FiveMinuteBarWireV2 {
+    at: String,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: f64,
+    amount: f64,
+}
+
+fn china_session_at(bar: &MagicTdxT0FiveMinuteBar) -> String {
+    let offset = FixedOffset::east_opt(CHINA_OFFSET_SECONDS).expect("static +08:00 offset");
+    offset
+        .from_local_datetime(&bar.at)
+        .single()
+        .expect("fixed offset has one local mapping")
+        .to_rfc3339_opts(SecondsFormat::Secs, false)
+}
+
+pub(super) fn encode_t0_batch_v2(
+    batch: &MagicTdxT0Batch,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let records = batch.records.iter().map(T0EvidenceRecordWireV2::from).collect();
+    serde_json::to_vec(&T0EvidenceBatchWireV2 {
+        requested_at: batch.requested_at.to_rfc3339(),
+        source_at: batch.source_at.to_rfc3339(),
+        observed_at: batch.observed_at.to_rfc3339(),
+        batch_id: &batch.batch_id,
+        time_untrustworthy: batch.time_untrustworthy,
+        records,
+        rejections: &batch.rejections,
+    })
+}
+```
+
+为 `T0EvidenceRecordWireV2<'a>` 实现以下映射；数值逐字段原样复制，不做 clamp、默认或过滤：
+
+```rust
+impl<'a> From<&'a MagicTdxT0Evidence> for T0EvidenceRecordWireV2<'a> {
+    fn from(record: &'a MagicTdxT0Evidence) -> Self {
+        Self {
+            instrument: &record.instrument,
+            code: &record.code,
+            requested_at: record.requested_at.to_rfc3339(),
+            source_at: record.source_at.to_rfc3339(),
+            observed_at: record.observed_at.to_rfc3339(),
+            batch_id: &record.batch_id,
+            quote: &record.quote,
+            settled_daily: &record.settled_daily,
+            completed_five_minute: record
+                .completed_five_minute
+                .iter()
+                .map(|bar| T0FiveMinuteBarWireV2 {
+                    at: china_session_at(bar),
+                    open: bar.open,
+                    high: bar.high,
+                    low: bar.low,
+                    close: bar.close,
+                    volume: bar.volume,
+                    amount: bar.amount,
+                })
+                .collect(),
+            intraday_average_price: record.intraday_average_price,
+        }
+    }
+}
+```
+
+- [ ] **Step 4: 接入 delegate**
+
+在 `src/grpc_server/mod.rs` 增加 `mod t0_wire;`。把 `fetch_t0_evidence` 中 records/rejections 的直接 `serde_json::to_value` 和 `json!` 视图替换为：
+
+```rust
+let data = crate::grpc_server::t0_wire::encode_t0_batch_v2(&batch).map_err(|error| {
+    DelegateError::Fetch(FetchFailure::unknown(format!(
+        "T0 v2 batch serialization failed: {error}"
+    )))
+})?;
+```
+
+`Fetched` 的 provider/source/source_at/observed_at/batch_id 继续来自同一 `batch`；不得重新取时。
+
+- [ ] **Step 5: 验证服务端测试**
+
+Run: `cargo test --lib grpc_server::t0_wire::tests::`
+
+Run: `cargo test --lib grpc_server::delegate::tests::`
+
+Expected: PASS；编码后的 bar 明确带 `+08:00`，批级身份完整。
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/grpc_server/t0_wire.rs src/grpc_server/mod.rs src/grpc_server/delegate.rs
+git commit -m "fix(grpc): serialize T0 batches with explicit China time"
+```
+
+---
+
+### Task 4: 客户端严格解析 v2 并支持空 records
+
+**Files:**
+- Modify: `src/data_gateway/grpc_source/convert.rs`
+- Modify: `docs/superpowers/plans/2026-08-13-grpc-data-channel.md`
+
+**Interfaces:**
+- Consumes: `T0EvidenceBatchWireV2` canonical JSON、`QueryResult` envelope 和 consumer `now`。
+- Produces: 现有 `t0_evidence_batch(q) -> Result<MagicTdxT0Batch, GatewayError>` 与 `t0_evidence_batch_at(q, now)`；不改变调用方类型。
+
+- [ ] **Step 1: 把测试 fixture 改成 v2 并加入非空 bar**
+
+`live_t0_q()` 的 payload 设置：
+
+```rust
+q.records[0].schema = "market.t0_evidence".to_string();
+q.records[0].schema_version = 2;
+```
+
+JSON 顶层加入与 envelope 一致的 `requested_at/source_at/observed_at/batch_id` 和
+`"time_untrustworthy": false`，record 的 `completed_five_minute` 加入：
+
+```json
+[{"at":"2026-08-17T09:35:00+08:00","open":10.0,"high":10.1,"low":9.9,"close":10.0,"volume":1000.0,"amount":10000.0}]
+```
+
+- [ ] **Step 2: 写失败测试**
+
+增加以下测试：
+
+```rust
+#[test]
+fn br253_t0_v2_preserves_china_session_civil_label() {
+    let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
+    let batch = t0_evidence_batch_at(&live_t0_q(), now).unwrap();
+    assert_eq!(
+        batch.records[0].completed_five_minute[0].at,
+        NaiveDate::from_ymd_opt(2026, 8, 17)
+            .unwrap()
+            .and_hms_opt(9, 35, 0)
+            .unwrap()
+    );
+}
+
+#[test]
+fn br253_t0_v2_rebuilds_empty_record_batch_from_batch_requested_at() {
+    let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
+    let mut q = live_t0_q();
+    let mut view: Value = serde_json::from_slice(&q.records[0].data).unwrap();
+    view["records"] = serde_json::json!([]);
+    view["rejections"] = serde_json::json!([{
+        "code": "TEST_CODE_600519",
+        "reason_code": "quote_stale",
+        "detail": "TEST_CODE source time unavailable",
+        "retryable": true
+    }]);
+    q.records[0].data = serde_json::to_vec(&view).unwrap();
+
+    let batch = t0_evidence_batch_at(&q, now).unwrap();
+    assert!(batch.records.is_empty());
+    assert_eq!(batch.rejections.len(), 1);
+    assert_eq!(batch.requested_at, Utc.with_ymd_and_hms(2026, 8, 17, 1, 29, 59).unwrap());
+}
+```
+
+再增加以下两组表驱动测试，明确覆盖无时区、错误时区和批级证据冲突：
+
+```rust
+#[test]
+fn br253_t0_v2_rejects_missing_or_wrong_session_offset() {
+    let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
+    for raw_at in ["2026-08-17T09:35:00", "2026-08-17T01:35:00Z"] {
+        let mut q = live_t0_q();
+        let mut view: Value = serde_json::from_slice(&q.records[0].data).unwrap();
+        view["records"][0]["completed_five_minute"][0]["at"] =
+            serde_json::json!(raw_at);
+        q.records[0].data = serde_json::to_vec(&view).unwrap();
+
+        let error = t0_evidence_batch_at(&q, now)
+            .expect_err("T0 session bars must carry an explicit +08:00 offset");
+        assert_eq!(error.reason_code(), "invalid_evidence", "at={raw_at}");
+    }
+}
+
+#[test]
+fn br253_t0_v2_rejects_batch_envelope_conflicts() {
+    let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
+    for (field, conflicting_value) in [
+        ("batch_id", serde_json::json!("TEST_CODE_T0_BATCH_CONFLICT")),
+        ("source_at", serde_json::json!("2026-08-17T01:29:59Z")),
+        ("observed_at", serde_json::json!("2026-08-17T01:30:00.249Z")),
+    ] {
+        let mut q = live_t0_q();
+        let mut view: Value = serde_json::from_slice(&q.records[0].data).unwrap();
+        view[field] = conflicting_value;
+        q.records[0].data = serde_json::to_vec(&view).unwrap();
+
+        let error = t0_evidence_batch_at(&q, now)
+            .expect_err("canonical T0 batch identity must equal the gRPC envelope");
+        assert_eq!(error.reason_code(), "invalid_evidence", "field={field}");
+    }
+}
+```
+
+- [ ] **Step 3: 验证 RED**
+
+Run: `cargo test --lib data_gateway::grpc_source::convert::tests::br253_t0_v2 -- --nocapture`
+
+Expected: 至少 civil-label 测试因 `.naive_utc()` 得到 `01:35` 而失败；空批测试因缺 record source minimum 而失败。
+
+- [ ] **Step 4: 实现严格 `+08:00` parser**
+
+在 converter 的 T0 私有 helper 区加入：
+
+```rust
+const T0_SCHEMA: &str = "market.t0_evidence";
+const T0_SCHEMA_VERSION: u32 = 2;
+const CHINA_OFFSET_SECONDS: i32 = 8 * 60 * 60;
+
+fn t0_china_session_at(value: &Value) -> Result<NaiveDateTime, GatewayError> {
+    let capability = "T0Evidence";
+    let raw = as_str(value, "at", capability)?;
+    let parsed = DateTime::parse_from_rfc3339(&raw)
+        .map_err(|_| err(capability, "T0 five-minute at must be RFC3339"))?;
+    if parsed.offset().local_minus_utc() != CHINA_OFFSET_SECONDS {
+        return Err(err(capability, "T0 five-minute at must use explicit +08:00"));
+    }
+    Ok(parsed.naive_local())
+}
+```
+
+`t0_evidence_batch` 在解析 JSON 前要求 `q.records[0]` 的 schema、version、content type
+精确等于 `market.t0_evidence`、`2`、`application/json; charset=utf-8`；从 JSON 顶层解析
+批级字段并与 `evidence_of(q)` 的 source/observed/batch ID 比较。
+分钟 bar 使用 `t0_china_session_at`，禁止 `.naive_utc()`。`requested_at` 只从顶层读取；
+record 仍必须与顶层 requested/observed/batch 一致。
+
+- [ ] **Step 5: 保留服务端不可信标记并允许真实空拒绝批次**
+
+把最终合并改为：
+
+```rust
+batch.time_untrustworthy = batch.time_untrustworthy
+    || batch_time_untrustworthy
+    || record_time_untrustworthy;
+```
+
+最早 record source 校验只在 `records` 非空时执行；空 records 必须仍通过顶层/envelope
+source_at 一致性和时间顺序校验，且由调用方 exact outcomes 检查其 rejections。
+
+- [ ] **Step 6: 验证 T0 converter 全部测试**
+
+Run: `cargo test --lib data_gateway::grpc_source::convert::tests::br253_t0_v2 -- --nocapture`
+
+Run: `cargo test --lib data_gateway::grpc_source::convert::tests:: -- --nocapture`
+
+Expected: 全部 PASS；旧的未来/倒置/价格非法门继续 PASS。
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/data_gateway/grpc_source/convert.rs
+git commit -m "fix(grpc): strictly reconstruct T0 wire v2 batches"
+```
+
+- [ ] **Step 8: 修复 converter 单测的 TEST_CODE 身份隔离**
+
+审查确认 `live_t0_q()` 仍用 `600519`/`SH600519`，违反 AGENTS 2.5。把 Task 4 T0 fixture 的
+record/code/instrument 和冲突用例统一改为 `TEST_CODE_600519` / `TEST_CODE_600520`。
+
+production `instrument_for` 继续拒绝 TEST_CODE；只在 `#[cfg(test)]` 单元测试构建中加入一个
+明确的 TEST_CODE identity seam：从 `TEST_CODE_` 后缀推断测试 exchange，但构造出的
+`InstrumentId.code` 必须保留完整 TEST_CODE，不得剥前缀冒充真实标的。无前缀 production
+路径完全不变；integration/release 构建不得包含该 seam。增加 malformed TEST_CODE 后缀拒绝测试。
+
+- [ ] **Step 9: 验证单元测试隔离且生产构建不放宽**
+
+Run: `cargo test --lib data_gateway::grpc_source::convert::tests::br253_t0_v2 -- --nocapture`
+
+Run: `cargo test --lib data_gateway::grpc_source::convert::tests:: -- --nocapture`
+
+Run: `cargo build --release --bin grpc_local_readiness_probe`
+
+Run: `cargo clippy --lib --all-features -- -D warnings`
+
+Expected: converter 全部 PASS；测试输出身份保持 TEST_CODE；release/normal library 仍使用原生产
+resolver，未开启 fixture 时 TEST_CODE 不能形成完整 typed readiness。
+
+- [ ] **Step 10: 提交隔离修复**
+
+```bash
+git add src/data_gateway/grpc_source/convert.rs \
+  docs/superpowers/plans/2026-08-13-grpc-data-channel.md
+git commit -m "test(grpc): isolate T0 converter identities"
+```
+
+---
+
+### Task 5: 仅在全批成功后刷新 OrderBook capability
+
+**Files:**
+- Modify: `src/data_gateway/grpc_source.rs`
+- Modify: `src/monitor/data_mode.rs`
+- Modify: `docs/business_rules.md`
+- Modify: `docs/superpowers/specs/2026-08-13-grpc-data-channel-design.md`
+- Modify: `docs/superpowers/plans/2026-08-13-grpc-data-channel.md`
+
+**Interfaces:**
+- Consumes: 已通过 `convert::t0_evidence_batch_at` 和现有 exact-outcome 集合门的批次计数。
+- Produces: `complete_t0_batch_proves_order_book(requested_len, record_len, rejection_len) -> bool`；成功时调用 `mark_capability_success(Capability::OrderBook)`，并按 BR-216 让已接入真实 provider 的全局 OrderBook 作为关键能力参与 DataMode。
+
+- [ ] **Step 1: 写纯函数失败测试**
+
+为测试模块增加以下计数边界测试；identity 完整性仍由当前
+`t0_evidence_batch_async` 的 `HashSet` exact-outcome 门负责：
+
+```rust
+#[test]
+fn br253_t0_order_book_requires_a_nonempty_all_record_batch() {
+    assert!(complete_t0_batch_proves_order_book(7, 7, 0));
+    assert!(!complete_t0_batch_proves_order_book(7, 6, 1));
+    assert!(!complete_t0_batch_proves_order_book(7, 7, 1));
+    assert!(!complete_t0_batch_proves_order_book(0, 0, 0));
+}
+```
+
+- [ ] **Step 2: 验证 RED**
+
+Run: `cargo test --lib data_gateway::grpc_source::tests::br253_t0_order_book -- --nocapture`
+
+Expected: FAIL，`complete_t0_batch_proves_order_book` 尚不存在。
+
+- [ ] **Step 3: 保留 exact outcome 门并实现全覆盖谓词**
+
+保留 `t0_evidence_batch_async` 中现有集合逻辑原位不动，在模块私有区加入：
+
+```rust
+fn complete_t0_batch_proves_order_book(
+    requested_len: usize,
+    record_len: usize,
+    rejection_len: usize,
+) -> bool {
+    requested_len > 0 && record_len == requested_len && rejection_len == 0
+}
+```
+
+该谓词只能在现有 `outcome_set == requested` 硬门之后调用；不得移动到硬门之前，也不得删除
+重复、缺失、额外 outcome 的拒绝逻辑。
+
+- [ ] **Step 4: 在 consumer admission 后刷新 capability**
+
+`t0_evidence_batch_async` 的顺序固定为：query → v2 converter → 现有 exact outcomes →
+full coverage → capability mark → return。在现有 exact-outcome `if` 块之后加入：
+
+```rust
+if complete_t0_batch_proves_order_book(
+    codes.len(),
+    batch.records.len(),
+    batch.rejections.len(),
+) {
+    crate::monitor::data_mode::mark_capability_success(
+        crate::monitor::data_mode::Capability::OrderBook,
+    )
+    .map_err(|error| GatewayError::unavailable("T0Evidence", Some(batch.provider), false, error))?;
+}
+Ok(batch)
+```
+
+部分批次仍返回其真实 records/rejections 给策略上层，但不得刷新全局 OrderBook。
+
+- [ ] **Step 5: 验证 helper 与既有 live wrapper 测试**
+
+Run: `cargo test --lib data_gateway::grpc_source::tests:: -- --nocapture`
+
+Expected: PASS。
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/data_gateway/grpc_source.rs
+git commit -m "fix(monitor): admit OrderBook only from complete T0 batches"
+```
+
+- [ ] **Step 7: 写 BR-216 分类失败测试**
+
+审查发现：全局 `OrderBook` 成功标记已经证明真实 provider 接入，而 BR-216 明确要求该能力
+接入后恢复为关键能力。先修改 `src/monitor/data_mode.rs` 的既有测试，使其表达当前合同：
+
+```rust
+#[test]
+fn degraded_when_only_orderbook_missing_after_provider_admission() {
+    let mut input = input_all_fresh();
+    input.capabilities[4] = CapabilityStatus::missing(Capability::OrderBook);
+    let h = evaluate(&input, Some(DataMode::Full));
+    assert_eq!(h.mode, DataMode::Degraded);
+    assert!(h.missing.contains(&Capability::OrderBook));
+}
+
+#[test]
+fn br216_provider_backed_orderbook_is_critical() {
+    assert!(Capability::OrderBook.is_critical());
+    assert!(!Capability::MoneyFlow.is_critical());
+}
+```
+
+保留 `OrderBook` 300 秒、预算 600 秒仍为 Full 的既有测试，并增加超过 600 秒进入 Degraded
+的断言；不得把 OrderBook 缺失升级为 Unsafe，Quote 仍是唯一直接触发 Unsafe 的能力。
+
+- [ ] **Step 8: 验证分类测试先失败**
+
+Run: `cargo test --lib monitor::data_mode::tests::br216_provider_backed_orderbook_is_critical -- --exact`
+
+Run: `cargo test --lib monitor::data_mode::tests::degraded_when_only_orderbook_missing_after_provider_admission -- --exact`
+
+Expected: FAIL；现有实现仍把 OrderBook 归辅助并对缺失返回 Full。
+
+- [ ] **Step 9: 实现 BR-216 分类并同步设计真相**
+
+`Capability::is_critical` 只把仍无真实 provider 的 `MoneyFlow` 归为辅助：
+
+```rust
+pub fn is_critical(self) -> bool {
+    !matches!(self, Capability::MoneyFlow)
+}
+```
+
+同步修改 `data_mode.rs` 的模块说明、`evaluate` 规则说明、分支注释和
+`current_data_health_input` 注释：OrderBook 已由 BR-253 的严格 T0 全批准入标记；缺失或超过
+既有 `orderbook_max_age_secs` 时进入 Degraded，仍不得伪造成功或替代 MoneyFlow。
+
+在设计 §11.4 和 BR-253 中明确：`mark_capability_success(OrderBook)` 是全局真实 provider
+准入，因此触发 BR-216 的关键能力分类；“不修改推送节流”只表示不修改 dedup/rate-limit，
+不能压制 DataMode 的既有安全后果。不修改任何 config threshold。
+
+- [ ] **Step 10: 验证 DataMode、网关和规则合同**
+
+Run: `cargo test --lib monitor::data_mode::tests:: -- --nocapture`
+
+Run: `cargo test --lib data_gateway::grpc_source::tests:: -- --nocapture`
+
+Run: `bash tools/compliance/lib/check_business_rules.sh`
+
+Run: `bash tools/compliance/lib/check_design_contradiction.sh`
+
+Run: `cargo clippy --lib --all-features -- -D warnings`
+
+Expected: 全部 PASS；MoneyFlow 仍是辅助/unsupported，OrderBook 新鲜时 Full、缺失或超过 600 秒时 Degraded，Quote 断流仍为 Unsafe。
+
+- [ ] **Step 11: 提交审查修复**
+
+```bash
+git add docs/business_rules.md \
+  docs/superpowers/specs/2026-08-13-grpc-data-channel-design.md \
+  docs/superpowers/plans/2026-08-13-grpc-data-channel.md \
+  src/monitor/data_mode.rs
+git commit -m "fix(monitor): make admitted OrderBook critical"
+```
+
+---
+
+### Task 6: 更新 fixture、端到端回归并增加脱敏本地探针
+
+**Files:**
+- Modify: `src/grpc_server/fixture.rs`
+- Modify: `tests/grpc_bridge_e2e.rs`
+- Modify: `tests/grpc_channel_e2e.rs`
+- Create: `src/bin/grpc_local_readiness_probe.rs`
+- Modify: `docs/superpowers/specs/2026-08-13-grpc-data-channel-design.md`
+- Modify: `docs/superpowers/plans/2026-08-13-grpc-data-channel.md`
+
+**Interfaces:**
+- Consumes: 同一候选 server 的 `GrpcMarketClient` 和四个已冻结 operation。
+- Produces: 只输出 operation/provider/records/time_untrustworthy/status 的 operator probe；不输出证券代码、价格、原始 payload、token 或证书路径。
+
+- [ ] **Step 1: 把 T0 fixture 更新为 v2**
+
+顶层加入 `requested_at/source_at/observed_at/batch_id/time_untrustworthy`，并加入一根
+`+08:00` 五分钟 bar。fixture response 的 payload version 继续使用 handler 传入的 `version`，
+因此 T0 自动为 2，其他 op 保持 1。
+
+- [ ] **Step 2: 加强两个 e2e 断言**
+
+`tests/grpc_channel_e2e.rs` 在 T0 case 断言 `result.records[0].schema_version == 2`。
+`tests/grpc_bridge_e2e.rs` 在 T0 round-trip 后断言：
+
+```rust
+assert_eq!(t0.records[0].completed_five_minute.len(), 1);
+assert_eq!(t0.records[0].completed_five_minute[0].at.time().hour(), 13);
+assert!(t0.rejections.is_empty());
+```
+
+测试模块引入 `chrono::Timelike`。
+
+- [ ] **Step 3: 写 probe 参数和结果模型测试**
+
+`grpc_local_readiness_probe.rs` 定义：
+
+```rust
+#[derive(clap::Parser)]
+struct Args {
+    #[arg(long, default_value = "http://127.0.0.1:18083")]
+    addr: String,
+    #[arg(long, default_value = "600396")]
+    code: String,
+}
+
+fn format_result(
+    operation: &str,
+    provider: &str,
+    records: usize,
+    time_untrustworthy: &str,
+    status: &str,
+) -> String {
+    format!(
+        "operation={operation} provider={provider} records={records} \
+         time_untrustworthy={time_untrustworthy} status={status}"
+    )
+}
+
+fn print_result(
+    operation: &str,
+    provider: &str,
+    records: usize,
+    time_untrustworthy: &str,
+    status: &str,
+) {
+    println!(
+        "{}",
+        format_result(operation, provider, records, time_untrustworthy, status)
+    );
+}
+```
+
+单元测试直接调用 `format_result("T0Evidence", "Tdx", 1, "false", "available")`，断言
+等于固定五字段字符串，并断言不含 `600396`、`price`、`token` 和 `/`。
+
+- [ ] **Step 4: 实现四项 typed probe**
+
+连接后依次执行 health、capabilities、`RealtimeQuotes`、`OrderBooks`、`T0Evidence`、
+`HistoricalBars`。所有 query 都用 `GrpcMarketClient::query` 与对应 converter；请求形状固定为：
+
+```rust
+let code = args.code.clone();
+let quote_q = client
+    .query(Operation::RealtimeQuotes, serde_json::json!({"codes": [&code]}))
+    .await
+    .map_err(|error| safe_grpc("RealtimeQuotes", error))?;
+let quotes = convert::realtime_quotes_at(&quote_q, Utc::now())
+    .map_err(|error| safe_gateway("RealtimeQuotes", error))?;
+
+let book_q = client
+    .query(Operation::OrderBooks, serde_json::json!({"codes": [&code]}))
+    .await
+    .map_err(|error| safe_grpc("OrderBooks", error))?;
+let books = convert::order_books_at(&book_q, Utc::now())
+    .map_err(|error| safe_gateway("OrderBooks", error))?;
+
+let t0_q = client
+    .query(Operation::T0Evidence, serde_json::json!({"codes": [&code]}))
+    .await
+    .map_err(|error| safe_grpc("T0Evidence", error))?;
+let t0 = convert::t0_evidence_batch_at(&t0_q, Utc::now())
+    .map_err(|error| safe_gateway("T0Evidence", error))?;
+
+let daily_q = client
+    .query(
+        Operation::HistoricalBars,
+        serde_json::json!({"codes": [&code], "days": 5}),
+    )
+    .await
+    .map_err(|error| safe_grpc("HistoricalBars", error))?;
+let daily = convert::historical_bars(&code, &daily_q)
+    .map_err(|error| safe_gateway("HistoricalBars", error))?;
+```
+
+`safe_grpc(context: &'static str, error: GrpcError) -> anyhow::Error` 只读取
+`error.details().reason_code/retryable`；`safe_gateway(context: &'static str,
+error: GatewayError) -> anyhow::Error` 只读取 `error.reason_code()/retryable()`。两者不得格式化
+原始 `error`。health 必须 `live && ready`，capabilities 必须证明四个 operation 都是
+`ADMITTED && runtime_available`。Quote/OrderBooks/T0 都要求恰好一条请求 code 对应 record；
+T0 还要求 `rejections.is_empty()`；HistoricalBars 要求非空。任一失败立即非零退出。
+
+成功输出分别调用 `print_result`；provider 只用已接纳 batch evidence 的 `ProviderId` 枚举名，
+非 T0 的 `time_untrustworthy` 输出 `not_applicable`，T0 输出真实布尔值。不得输出证券代码、
+价格、原始 payload、原始错误 message、token 或证书路径。
+
+- [ ] **Step 5: 跑 fixture 与桥接 e2e**
+
+Run: `cargo test --test grpc_channel_e2e -- --test-threads=1`
+
+Run: `cargo test --test grpc_bridge_e2e -- --test-threads=1`
+
+Run: `cargo test --bin grpc_local_readiness_probe`
+
+Expected: 全部 PASS；fixture 隔离且测试代码符合 `TEST_CODE` 约束。
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/grpc_server/fixture.rs tests/grpc_bridge_e2e.rs tests/grpc_channel_e2e.rs src/bin/grpc_local_readiness_probe.rs
+git commit -m "test(grpc): cover T0 v2 roundtrip and local readiness"
+```
+
+- [ ] **Step 7: 修复 fixture 的 test/live identity 隔离**
+
+审查确认现有 fixture 与两个 E2E 仍用 `600519`/`SH600519` 真实标的身份，违反 AGENTS 2.5。
+把 `src/grpc_server/fixture.rs` 内全部证券 fixture identity，以及两份 E2E 能安全经过现有
+测试 seam 的 query、事件、断言统一改为 `TEST_CODE_600519`（其他测试标的同样必须使用
+`TEST_CODE_` 前缀）。T0 `instrument` 与 `code` 必须保持同一测试身份；fixture 仍只允许在
+`GRPC_GATEWAY_TEST_FIXTURE=1` 隔离路径启用。operator probe 的生产默认 `600396` 保持不变，
+但 fixture 动态测试必须显式传 `--code TEST_CODE_600519`。
+
+部分 high-level bridge adapter 会在发出 RPC 前通过 production identity resolver，按设计拒绝
+`TEST_CODE_`；禁止为了 E2E 修改/放宽 production converter 或 resolver。对这些 operation，
+E2E 改用同一 fixture server 的 `GrpcMarketClient::query`，断言 admission、schema/version、
+批次身份与 TEST_CODE raw payload；不得声称这是 typed domain round-trip。T0 producer DTO 与
+consumer converter 的 TEST_CODE typed 语义分别由 Tasks 3/4 单测证明；真实完整 typed
+server/client round-trip 必须由 Task 8 未开启 fixture 的候选端口 probe 证明。
+
+在设计 §11.6 记录该分层验证边界，避免后续把 raw fixture 合同测试误写成 live/typed 证据。
+
+增加静态隔离回归：逐个扫描上述四个 Task 6 源文件的字符串字面量/fixture JSON，凡值形似
+A 股六位证券身份（含 SH/SZ 前缀）都必须以 `TEST_CODE_` 开头。不得只排除两个已知字面量，
+也不得仅证明“文件里至少有一个 TEST_CODE”后放行；禁止靠注释豁免。
+
+- [ ] **Step 8: 为 probe 失败与脱敏路径补自动测试**
+
+把 inline 判断提取为不接收/不格式化证券代码的私有纯函数，并覆盖：
+
+- health 任一 `live=false` 或 `ready=false` 返回 `not_ready`；
+- 四个 capability 任一不是 `ADMITTED && runtime_available` 返回
+  `required_capability_unavailable`；
+- Quote/OrderBooks 单记录 identity/count 不匹配返回 `record_identity_mismatch`；
+- T0 identity/count 不匹配或任一 rejection 返回
+  `record_identity_or_rejection_mismatch`；
+- HistoricalBars 空记录返回 `records_unavailable`；
+- gRPC/gateway error 的输出只含 operation/reason_code/retryable，不含原始 message、测试
+  sentinel、证券代码、价格、token 或路径。
+
+将主体提取为 `async fn run(args: Args) -> anyhow::Result<()>`，`main` 只解析参数并返回
+`run(args).await`；自动测试使用无监听 loopback 地址证明连接失败返回 `Err`，且脱敏错误不含
+传入的 `TEST_CODE` sentinel。Rust `main -> Result` 的非零退出语义不得被 catch 后改成成功。
+
+- [ ] **Step 9: 验证隔离、失败路径和全部 E2E**
+
+Run: `cargo test --test grpc_channel_e2e -- --test-threads=1`
+
+Run: `cargo test --test grpc_bridge_e2e -- --test-threads=1`
+
+Run: `cargo test --bin grpc_local_readiness_probe -- --test-threads=1`
+
+Run: `rg -n '"600519"|SH600519' src/grpc_server/fixture.rs tests/grpc_bridge_e2e.rs tests/grpc_channel_e2e.rs src/bin/grpc_local_readiness_probe.rs`
+
+Expected: 三组测试全部 PASS；`rg` 无输出、exit 1；fixture 只能用 TEST_CODE，失败测试不泄露
+sentinel 或原始错误。
+
+- [ ] **Step 10: 提交审查修复**
+
+```bash
+git add src/grpc_server/fixture.rs tests/grpc_bridge_e2e.rs tests/grpc_channel_e2e.rs \
+  src/bin/grpc_local_readiness_probe.rs \
+  docs/superpowers/specs/2026-08-13-grpc-data-channel-design.md \
+  docs/superpowers/plans/2026-08-13-grpc-data-channel.md
+git commit -m "test(grpc): isolate fixture identities and probe failures"
+```
+
+---
+
+### Task 7: Gate B/C、覆盖率和 PR 证据
+
+**Files:**
+- Modify if evidence requires: PR description only；不把运行日志或凭据写入仓库。
+
+**Interfaces:**
+- Consumes: Tasks 1-6 的固定提交。
+- Produces: Gate B/C 结果、BR-253 PR diff coverage 和完整 PR 证据字段。
+
+- [ ] **Step 1: 格式和 strict Clippy**
+
+Run: `cargo fmt --check`
+
+Run: `cargo clippy --all-targets --all-features -- -D warnings`
+
+Expected: exit 0。
+
+- [ ] **Step 2: 全仓测试**
+
+Run: `cargo test --workspace --all-features -- --test-threads=1`
+
+Expected: exit 0；任何失败先按根因返回对应任务，不得标记 pre-existing 后跳过。
+
+- [ ] **Step 3: Gate C 合规**
+
+Run: `bash tools/compliance/check.sh --policy pr`
+
+Expected: `ALL CHECKS PASSED`，freshness 明确显示 `NOT RUN`（Gate C offline）。
+
+- [ ] **Step 4: 生成并检查 BR-253 PR coverage**
+
+```bash
+mkdir -p target/coverage
+cargo llvm-cov --workspace --all-features --json --output-path target/coverage/coverage.json -- --test-threads=1
+cargo llvm-cov report --lcov --output-path target/coverage/lcov.info
+python3 tools/coverage/check_thresholds.py --policy pr --report target/coverage/coverage.json --lcov target/coverage/lcov.info --base-ref master
+```
+
+Expected: changed core executable lines >=90%、其他 changed source lines >=85%，global/core 不低于已登记 baseline。
+
+- [ ] **Step 5: 审查 staged diff 和敏感信息**
+
+先验证 Gate D 全仓覆盖率门：
+
+```bash
+python3 tools/coverage/check_thresholds.py --policy release --report target/coverage/coverage.json --lcov target/coverage/lcov.info
+```
+
+Expected: 本命令只记录 Gate D 诊断。global <80% 或 core <95% 时状态必须为
+`Release Blocked`，但只要 Gate C 已满足，不把跨项目 Gate D 历史缺口吸收到本次合并；
+Task 8 继续禁止执行。
+
+然后审查 diff：
+
+Run: `git diff master...HEAD --check`
+
+Run: `git diff master...HEAD --name-only`
+
+Run: `git diff master...HEAD | rg -n "bearer|client-key|private_key|token"`
+
+Expected: 前两项干净且文件范围符合计划；敏感词扫描只能命中文档中的禁止说明或既有类型名，不得出现凭据值/路径内容。
+
+- [ ] **Step 6: 准备 PR 必填字段**
+
+PR 描述必须包含：
+
+```markdown
+### Refs
+- spec: `docs/superpowers/specs/2026-08-13-grpc-data-channel-design.md §11`
+- design commit: `6818738`
+
+### Data-Redlines
+- [2.1, 2.2, 2.3, 2.4, 2.7, 2.8, 2.10]
+
+### OldModules
+| module | adopt/reject | reason |
+| --- | --- | --- |
+| `MagicTdxGateway::get_t0_evidence_batch` | adopt | retain real provider and quality gates |
+| direct `serde_json::to_value` T0 record wire | reject | leaks timezone-free NaiveDateTime |
+| strict T0 converter | adopt/deepen | retain fail-closed and add v2 batch identity |
+
+### Threshold-Proof
+- N/A: no threshold/config change.
+
+### Business-Rules
+- BR-238, BR-243, BR-253
+
+### Rollback
+- Restore the paired server/monitor binaries recorded by SHA-256; after merge, record the literal merge commit in release evidence and run `git revert` against that exact commit.
+```
+
+---
+
+### Task 7A: 用隔离 probe 与 fixture case 闭合 other-production patch coverage
+
+**Files:**
+- Modify: `src/bin/grpc_local_readiness_probe.rs`（只改 `#[cfg(test)] mod tests`）
+- Modify: `tests/grpc_channel_e2e.rs`
+
+**Interfaces:**
+- Consumes: Task 6 的 `run(Args)`、fixture `start(ServerConfig)`、
+  `fixture_operations_roundtrip`。
+- Produces: 一个真实 loopback fixture probe 的 fail-closed 回归，以及全部已登记 fixture operation
+  的 raw-wire 回归；不产生 live/provider 证据。
+
+- [ ] **Step 1: 固定当前 other-production RED**
+
+Run:
+
+```bash
+awk 'BEGIN{p=0;c=0;h=0} /^SF:.*src\/bin\/grpc_local_readiness_probe.rs$/{p=1} p&&/^DA:/{split(substr($0,4),a,",");c++;h+=(a[2]>0)} p&&/^end_of_record$/{printf "%d/%d %.2f%%\n",h,c,100*h/c;exit !(100*h>=85*c)}' target/coverage/lcov.info
+```
+
+Expected: 输出 `179/299 59.87%`，exit 1。该结果只证明旧报告缺口，不是最终 provenance。
+
+- [ ] **Step 2: 增加完整 probe 的隔离失败链测试**
+
+在 probe 测试模块增加 import：
+
+```rust
+use stock_analysis::grpc_server::{start, ServerConfig};
+```
+
+增加测试：
+
+```rust
+#[tokio::test(flavor = "multi_thread")]
+async fn isolated_fixture_probe_reaches_t0_and_fails_closed_on_test_identity() {
+    let (addr, handle, _hub) = start(ServerConfig {
+        fixture_mode: true,
+        port: 0,
+        ..Default::default()
+    })
+    .await
+    .expect("TEST_CODE fixture server");
+
+    let error = run(Args {
+        addr: format!("http://{addr}"),
+        code: "TEST_CODE_600519".to_owned(),
+    })
+    .await
+    .expect_err("production T0 resolver must reject TEST_CODE after safe earlier probes");
+    handle.abort();
+
+    let safe = error.to_string();
+    assert_eq!(
+        safe,
+        "operation=T0Evidence reason_code=invalid_evidence retryable=false"
+    );
+    for forbidden in ["TEST_CODE_600519", "price", "token", "/"] {
+        assert!(!safe.contains(forbidden), "probe error leaked {forbidden}");
+    }
+}
+```
+
+该测试必须真实经过 Health、Capabilities、RealtimeQuotes、OrderBooks，再在 T0 typed converter
+处拒绝 TEST_CODE。禁止为使 T0 成功而修改 production resolver。
+
+- [ ] **Step 3: 扩充 fixture raw-wire operation 表**
+
+在 `fixture_operations_roundtrip` 的 `cases` 追加以下精确条目：
+
+```rust
+(Operation::OrderBooks, "market.order_books", "TEST_CODE_600519"),
+(Operation::MoneyFlows, "market.money_flows", "TEST_CODE_600519"),
+(Operation::ForeignExchange, "market.foreign_exchange", "TEST_CODE_USDCNY"),
+(Operation::FuturesDelivery, "market.futures_delivery", "TEST_CODE_IF2608"),
+(Operation::DragonTiger, "market.dragon_tiger", "TEST_CODE_600519"),
+(Operation::BlockTrades, "market.block_trades", "TEST_CODE_600519"),
+(Operation::BoardDirectory, "board.directory", "TEST_CODE_BK0475"),
+(Operation::BoardConstituents, "board.constituents", "TEST_CODE_600519"),
+(Operation::BoardFlows, "board.flows", "TEST_CODE_BK0475"),
+(Operation::MarketRankings, "market.market_rankings", "TEST_CODE_BK0475"),
+(Operation::ConceptHits, "market.concept_hits", "TEST_CODE_BK0475"),
+(Operation::MarketStatistics, "market.market_statistics", "TEST_CODE_600519"),
+(Operation::ResearchReports, "research.reports", "TEST_CODE_600519"),
+(Operation::NorthboundDaily, "market.northbound_daily", "TEST_CODE_600519"),
+(Operation::FinancialStatements, "market.financial_statements", "TEST_CODE_600519"),
+(Operation::FundFlowSeries, "market.fund_flow_series", "TEST_CODE_600519"),
+(Operation::ProviderTopNRankings, "market.provider_top_n_rankings", "TEST_CODE_600519"),
+(Operation::CorporateActions, "market.corporate_actions", "TEST_CODE_600519"),
+```
+
+沿用循环的 `complete`、单 payload、schema/version、JSON 和 TEST_CODE 内容断言；不得为这些
+case 新增生产 fixture fallback。
+
+- [ ] **Step 4: 跑聚焦测试与隔离 guard**
+
+Run:
+
+```bash
+cargo test --bin grpc_local_readiness_probe tests::isolated_fixture_probe_reaches_t0_and_fails_closed_on_test_identity -- --exact --test-threads=1
+cargo test --bin grpc_local_readiness_probe -- --test-threads=1
+cargo test --test grpc_channel_e2e -- --test-threads=1
+```
+
+Expected: 全部 PASS；probe safe error 不含 code/price/token/path；Task 6 identity guard 继续 PASS。
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/bin/grpc_local_readiness_probe.rs tests/grpc_channel_e2e.rs
+git commit -m "test(grpc): cover isolated readiness probe branches"
+```
+
+---
+
+### Task 7B: 通过同一 fixture bridge 覆盖 dormant typed wrappers
+
+**Files:**
+- Modify: `tests/grpc_bridge_e2e.rs`
+
+**Interfaces:**
+- Consumes: 已启用的单进程 `grpc_source::bridge_for("OutcomeDailyBars")`、同一随机端口 fixture
+  server 与 `TEST_CODE_600519`。
+- Produces: LocalBridge typed wrapper 的 available/invalid-evidence 分层证据；不改任何 production
+  converter、resolver 或 fixture。
+
+- [ ] **Step 1: 在现有唯一 bridge E2E 中取得同一个 source**
+
+在 `bridge_all_hooked_ops_fixture_roundtrip` 完成 `wait_ready` 后加入：
+
+```rust
+let bridge = grpc_source::bridge_for("OutcomeDailyBars")
+    .expect("TEST_CODE bridge lookup")
+    .expect("DATA_GATEWAY_GRPC enables one local bridge");
+let test_code = "TEST_CODE_600519".to_owned();
+```
+
+不得新建第二个 env-sensitive integration test；现有测试负责最终 `reset_bridge()` 和子进程回收。
+
+- [ ] **Step 2: 覆盖无证券 resolver 且 fixture 已实现的 available wrappers**
+
+在同一测试内加入以下调用和精确计数断言：
+
+```rust
+assert_eq!(bridge.announcements_async().await.unwrap().records().len(), 1);
+assert_eq!(bridge.futures_delivery_async().await.unwrap().records().len(), 1);
+assert_eq!(
+    bridge.board_constituents_async(&test_code).await.unwrap().records().len(),
+    1
+);
+assert_eq!(
+    bridge.research_reports_async(&test_code, 5).await.unwrap().records().len(),
+    1
+);
+assert_eq!(
+    bridge
+        .technical_bars_async(std::slice::from_ref(&test_code), 100)
+        .await
+        .unwrap()
+        .records()
+        .len(),
+    1
+);
+assert_eq!(bridge.intraday_shape_async(&test_code).await.unwrap().records().len(), 1);
+```
+
+每个 batch 还必须断言 `evidence().batch_id == "fixture-b1"`；字符串记录必须保留对应
+TEST_CODE，不用真实证券代码替换。
+
+- [ ] **Step 3: 覆盖 fixture 与 production contract 不一致的显式拒绝**
+
+加入以下断言：
+
+```rust
+for error in [
+    bridge.foreign_exchange_async().await.unwrap_err(),
+    bridge.economic_calendar_async().await.unwrap_err(),
+    bridge
+        .market_statistics_async(std::slice::from_ref(&test_code))
+        .await
+        .unwrap_err(),
+    bridge.provider_top_n_pair_async(date).await.unwrap_err(),
+] {
+    assert_eq!(error.reason_code(), "invalid_evidence");
+    assert!(!error.retryable());
+}
+
+let news_error = bridge
+    .instrument_news_async(std::slice::from_ref(&test_code), 5)
+    .await
+    .expect_err("production identity resolver rejects TEST_CODE before RPC");
+assert_eq!(news_error.reason_code(), "invalid_request");
+assert!(!news_error.retryable());
+```
+
+ForeignExchange fixture 的 `TEST_CODE_USDCNY` 和 EconomicCalendar fixture 的 numeric optional
+字段故意不冒充合法 typed contract；测试必须保留显式错误，不修生产代码迎合 fixture。
+
+`GlobalIndices` 当前没有 fixture operation，必须覆盖现有 unsupported fail-closed，而不是新增
+fixture 或伪造 Available：
+
+```rust
+let global_indices_error = bridge.global_indices_async().await.unwrap_err();
+assert_eq!(global_indices_error.reason_code(), "invalid_request");
+assert!(!global_indices_error.retryable());
+```
+
+- [ ] **Step 4: 跑 bridge 与 resolver 隔离回归**
+
+Run:
+
+```bash
+cargo test --test grpc_bridge_e2e --all-features bridge_all_hooked_ops_fixture_roundtrip -- --exact --test-threads=1
+cargo test --test grpc_channel_e2e task6_fixture_sources_use_only_test_security_identities -- --exact --test-threads=1
+```
+
+Expected: 2/2 命令 PASS；LocalBridge fixture 不访问真实 provider，production identity rejection 保留。
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add tests/grpc_bridge_e2e.rs
+git commit -m "test(grpc): exercise dormant bridge wrappers"
+```
+
+---
+
+### Task 7C: 补齐 converter 的 available、verified-empty 与 invalid-evidence 矩阵
+
+**Files:**
+- Modify: `src/data_gateway/grpc_source/convert.rs`（只改 `#[cfg(test)] mod tests`）
+
+**Interfaces:**
+- Consumes: 现有 `mk_q(data, provider, source)`、各 converter 与 `cfg(test)` TEST_CODE exchange
+  seam。
+- Produces: 纯函数 converter 覆盖；不改非测试函数签名或行为。
+
+- [ ] **Step 1: 写 available/empty/invalid 的表驱动测试**
+
+新增 `offline_fixture_converters_cover_dormant_available_empty_and_invalid_contracts`。每个 case
+必须先用下面的精确 payload 得到 Available，再用 `mk_q("[]", provider, source)` 得到
+VerifiedEmpty，最后修改列出的字段并断言 `reason_code()=="invalid_evidence"`：
+
+| converter | provider/source | Available payload | invalid mutation |
+|---|---|---|---|
+| `global_indices` | `Tdx/TEST_CODE_source` | `[{"code":"DowJones","name":"TEST_CODE_DJ","value":41000.0,"change":12.0,"change_percent":0.03,"source_at":"2026-08-15T09:35:00+08:00"}]` | `code="TEST_CODE_UNKNOWN"` |
+| `foreign_exchange` | `Tdx/TEST_CODE_source` | `[{"pair":"UsdCny","name":"TEST_CODE_USD_CNY","rate":7.15,"change":null,"change_percent":null,"source_at":"2026-08-15T09:35:00+08:00"}]` | `pair="TEST_CODE_USDCNY"` |
+| `announcements` | `Tdx/TEST_CODE_source` | `[{"announcement_id":"TEST_CODE_A1","code":"TEST_CODE_600519","category":null,"title":"TEST_CODE 公告","published_at":"2026-08-15T09:00:00+08:00","url":"https://example.com/TEST_CODE_A1"}]` | 删除 `title` |
+| `economic_calendar` | `Jin10/TEST_CODE_source` | `[{"event_id":"TEST_CODE_E1","indicator_id":123,"country":"CN","name":"TEST_CODE CPI","period":"2026-07","scheduled_at":"2026-08-15T09:30:00+08:00","released_at":"2026-08-15T09:30:00+08:00","previous":"0.6","consensus":"0.7","actual":"0.8","revised":null,"unit":"%","importance":3,"impact":"positive"}]` | `importance="bad"` |
+| `futures_delivery` | `Tdx/TEST_CODE_source` | `[{"contract_code":"TEST_CODE_IF2608","product_code":"TEST_CODE_IF","last_trading_date":null,"delivery_date":"2026-08-21","notice_url":"https://example.com/TEST_CODE_FD"}]` | `delivery_date="bad-date"` |
+| `market_statistics` | `Tdx/TEST_CODE_source` | `[{"code":"TEST_CODE_600519","turnover_rate":0.42,"trailing_pe":28.5,"static_pe":26.0,"pb":9.2,"total_market_cap":1880000000000.0,"floating_market_cap":1880000000000.0,"upper_limit":1650.0,"lower_limit":1350.0,"volume_ratio":1.1}]` | `upper_limit=0.0` |
+| `technical_bars` | `Tdx/TEST_CODE_source` | `[{"open":10.0,"close":10.1,"high":10.2,"low":9.9,"vol":1000.0,"amount":10000.0,"at":"2026-08-15T10:30:00+08:00"}]` | 删除 `at` |
+| `intraday_shape` | `Tdx/TEST_CODE_source` | `[{"date":"2026-08-15","pre_close":1500.0,"open_pct":0.2,"high_pct":2.1,"low_pct":-0.8,"close_pct":1.3,"amplitude":2.9,"tail_30m_pct":0.5,"shape_label":"TEST_CODE_SHAPE"}]` | 删除 `shape_label` |
+
+测试使用 `serde_json::Value` 做 mutation 后再 `serde_json::to_string`，禁止在 production parser
+中增加默认值。Available 分支至少断言 record count、TEST_CODE identity（适用时）、provider 和
+batch_id；VerifiedEmpty 分支断言 `is_verified_empty()`。
+
+- [ ] **Step 2: 覆盖剩余 identity-bearing converter**
+
+在同一测试函数后半段加入以下精确 payload：
+
+| converter | provider/source | Available payload | invalid mutation |
+|---|---|---|---|
+| `market_dragon_tiger` | `Tdx/TEST_CODE_source` | `[{"exchange":"Shanghai","code":"TEST_CODE_600519","ranking_net_amount_yuan":150000000.0,"disclosures":[]}]` | 删除 `exchange` |
+| `board_constituents` | `Tdx/TEST_CODE_source` | `[{"instrument_code":"TEST_CODE_600519","board_code":"TEST_CODE_BK0475","board_name":"TEST_CODE_BOARD","kind":"Concept"}]` | `kind="TEST_CODE_UNKNOWN"` |
+| `research_reports` | `Tdx/TEST_CODE_source` | `[{"code":"TEST_CODE_600519","report_id":"TEST_CODE_R1","title":"TEST_CODE REPORT","organization":"TEST_CODE_ORG","rating":"Buy","published_at":"2026-08-15T09:00:00+08:00","canonical_url":"https://example.com/TEST_CODE_R1","target_price_upper":12.0,"target_price_lower":10.0}]` | 删除 `report_id` |
+| `provider_top_n_rankings` | `Eastmoney/eastmoney-web` | `[{"metric":"VolumeRatio","ordinal":1,"code":"TEST_CODE_600519","label":"TEST_CODE_SECURITY","value":3.2,"unit":"Multiple","trading_date":"2026-08-15","filter_identity":"TEST_CODE_FILTER","provider_declared_total":20,"inspected_row_count":20}]` | `ordinal=0` |
+| `instrument_news` | `Sina/TEST_CODE_source` | `[{"code":"TEST_CODE_600519","title":"TEST_CODE NEWS","summary":"TEST_CODE SUMMARY","url":"https://example.com/TEST_CODE_NEWS","source":"Sina","source_name":"TEST_CODE SINA","category":"TEST_CODE CATEGORY","external_id":"TEST_CODE_N1","published_at":"2026-08-15T09:00:00+08:00","fetched_at":"2026-08-15T09:00:01+08:00","content_hash":"TEST_CODE_HASH"}]` | 删除 `content_hash` |
+
+每个 converter 都执行 Available、VerifiedEmpty 和表中 invalid-evidence 断言；不得调用
+`grpc_server::fixture_response` 私有函数，也不得把 fixture 值移入 production converter。
+
+- [ ] **Step 3: 跑 RED/GREEN 与全 converter suite**
+
+Run before adding the test:
+
+```bash
+cargo test --lib --all-features data_gateway::grpc_source::convert::tests::offline_fixture_converters_cover_dormant_available_empty_and_invalid_contracts -- --exact --test-threads=1
+```
+
+Expected RED: 输出 `running 0 tests`（Cargo 通常 exit 0），证明测试名称尚不存在；该结果只算
+RED/缺口证据，不得计为通过验证。GREEN 必须明确显示新测试 1/1。
+
+Run after adding the test:
+
+```bash
+cargo test --lib --all-features data_gateway::grpc_source::convert::tests::offline_fixture_converters_cover_dormant_available_empty_and_invalid_contracts -- --exact --test-threads=1
+cargo test --lib --all-features data_gateway::grpc_source::convert::tests -- --test-threads=1
+```
+
+Expected GREEN: 新测试 1/1，converter suite 全部 PASS。
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add src/data_gateway/grpc_source/convert.rs
+git commit -m "test(grpc): cover dormant converter contracts"
+```
+
+---
+
+### Task 7D: 覆盖 opening canary、BR-159 audit 与 DataMode tracker 边界
+
+**Files:**
+- Modify: `src/data_gateway/grpc_source.rs`（只改 `#[cfg(test)] mod tests`）
+- Modify: `src/monitor/data_mode.rs`（只改 `#[cfg(test)] mod tests`）
+
+**Interfaces:**
+- Consumes: `opening_route`、四个 exact canary、`opening_t0_route`、
+  `audit_opening_readiness_report/failure`、`CapabilityTracker`。
+- Produces: fail-closed 证据矩阵与 SQLite 测试审计；不触发 provider、通知、订单或生产 DB。
+
+- [ ] **Step 1: 新增 opening canary 纯函数矩阵**
+
+新增测试 `br238_opening_canaries_cover_exact_and_fail_closed_identity_evidence_matrix`。在测试模块
+内用 `QueryResult` + `CanonicalPayload` 构造 helper：
+
+```rust
+fn br238_query(schema: &str, version: u32, data: serde_json::Value) -> QueryResult {
+    QueryResult {
+        admission: pb::AdmissionState::Admitted,
+        selected_provider: "Tdx".to_owned(),
+        batch_id: "TEST_CODE_OPENING_BATCH".to_owned(),
+        complete: true,
+        observed_at: "2026-08-17T01:30:00.250Z".to_owned(),
+        source_at: "2026-08-17T01:30:00Z".to_owned(),
+        records: vec![pb::CanonicalPayload {
+            schema: schema.to_owned(),
+            schema_version: version,
+            content_type: "application/json; charset=utf-8".to_owned(),
+            data: serde_json::to_vec(&data).unwrap(),
+        }],
+        source: "TEST_CODE_tdx".to_owned(),
+        diagnostic_blocker: String::new(),
+    }
+}
+```
+
+用现有 converter 从 TEST_CODE JSON 产生 quote/book/membership/T0 batch，分别断言 exact code
+成功；再对空数组、错 code、重复 code、T0 rejection、空 source、空 batch、
+`source_at > observed_at` 断言精确 `opening_canary_empty`、
+`opening_canary_identity_mismatch` 或 `invalid_evidence`。T0 v2 JSON 沿用 Task 4
+`live_t0_q()` 字段集，batch/code 固定 `TEST_CODE_OPENING_BATCH`/`TEST_CODE_600519`。
+
+- [ ] **Step 2: 新增 BR-159 测试数据库审计矩阵**
+
+新增测试 `br159_opening_audits_cover_available_empty_failure_and_overflow`：
+
+```rust
+let _env = test_grpc_env_guard();
+crate::database::DatabaseManager::init(None).expect("TEST_CODE audit database");
+
+let report = OpeningReadinessReport {
+    routes: vec![
+        br238_ready_route("Announcements", ProviderId::Cninfo),
+        OpeningRouteReadiness {
+            records: 0,
+            ..br238_ready_route("BoardConstituents", ProviderId::Tdx)
+        },
+    ],
+    degraded_routes: vec![],
+};
+audit_opening_readiness_report("TEST_CODE_GATE_C", &report).unwrap();
+
+let failure = GatewayError::classified(
+    "TEST_CODE_Opening",
+    Some(ProviderId::Tdx),
+    "unavailable",
+    "TEST_CODE_provider_unavailable",
+    true,
+    "TEST_CODE failure",
+);
+audit_opening_readiness_failure("TEST_CODE_GATE_C", &failure).unwrap();
+```
+
+随后查询 `data_acquisition_audit`，按 capability 前缀 `TEST_CODE_GATE_C-` 断言 available、
+verified_empty、failure 三行的 accepted/rejected/retryable/reason_code。最后把单 route 的
+`records=usize::MAX` 传给 `audit_opening_readiness_report`，沿用既有 BR-246 审计失败合同断言
+`reason_code()=="acquisition_audit_unavailable"`、`retryable()==true` 且 message 包含
+`accepted_count_overflow`；同时断言没有部分新增审计行。不得为测试改变生产错误分类。
+
+- [ ] **Step 3: 新增 CapabilityTracker fail-closed matrix**
+
+新增 `tracker_fail_closed_transition_matrix`，使用局部 tracker 和固定时间：
+
+```rust
+let tracker = CapabilityTracker::default();
+let wall = FixedOffset::east_opt(8 * 3600)
+    .unwrap()
+    .with_ymd_and_hms(2026, 8, 28, 9, 30, 0)
+    .unwrap();
+
+assert_eq!(
+    tracker.record_attempt_started(Capability::Quote, " ", wall),
+    Err("provider must not be blank".to_owned())
+);
+tracker.register_unsupported(Capability::MoneyFlow).unwrap();
+assert_eq!(
+    tracker.record_attempt_started(Capability::MoneyFlow, "TEST_CODE_provider", wall),
+    Err("unsupported capability cannot be attempted".to_owned())
+);
+assert_eq!(
+    tracker.record_success(
+        CapabilitySuccess {
+            capability: Capability::News,
+            provider: "TEST_CODE_provider".to_owned(),
+            provider_observed_at: Some(wall),
+            locally_observed_at: wall,
+        },
+        Instant::now(),
+    ),
+    Err("capability not registered".to_owned())
+);
+```
+
+继续覆盖 supported-but-not-started success/failure、blank reason/provider failure；最后对 Quote
+完成合法 started→failure，断言 snapshot state=`Failed`、reason、retryable 和
+`first_probe_complete=true`。所有状态只存在于局部 tracker。
+
+- [ ] **Step 4: 跑聚焦和模块测试**
+
+Run:
+
+```bash
+cargo test --lib --all-features data_gateway::grpc_source::tests::br238_opening_canaries_cover_exact_and_fail_closed_identity_evidence_matrix -- --exact --test-threads=1
+cargo test --lib --all-features data_gateway::grpc_source::tests::br159_opening_audits_cover_available_empty_failure_and_overflow -- --exact --test-threads=1
+cargo test --lib --all-features monitor::data_mode::tests::tracker_fail_closed_transition_matrix -- --exact --test-threads=1
+cargo test --lib --all-features data_gateway::grpc_source::tests -- --test-threads=1
+cargo test --lib --all-features monitor::data_mode::tests -- --test-threads=1
+```
+
+Expected: 全部 PASS；SQLite 只用 `DatabaseManager::init(None)` 测试库；无 provider/sink/order 调用。
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/data_gateway/grpc_source.rs src/monitor/data_mode.rs
+git commit -m "test(monitor): cover opening readiness failure matrix"
+```
+
+---
+
+### Task 7D-R: 修复 coverage 合同消费者的陈旧 baseline 夹具
+
+**Files:**
+- Modify: `tests/test_data_freshness_check.rs`
+
+**Interfaces:**
+- Consumes: `config/design_contracts.toml [coverage]` 与公开脚本
+  `tools/compliance/lib/check_pr_evidence.sh`。
+- Produces: 随当前合同构造的有效 PR evidence，以及只修改目标字段的 mismatch/bootstrap 负例；
+  不改 checker、生产代码、阈值或 coverage 分类。
+
+- [ ] **Step 1: 保留 Task 7F 的真实 RED**
+
+`cargo test --workspace --all-targets --all-features -- --test-threads=1` 已在
+`tests/test_data_freshness_check.rs` 得到 13 passed / 2 failed、exit 101：acceptance body 和
+bootstrap body 仍硬编码旧 `f05f506` baseline，因此先被当前合同校验拒绝。不得把失败改写成
+checker 放宽。
+
+- [ ] **Step 2: 让测试通过公开合同构造 PR body**
+
+在测试文件中新增 test-only TOML 解析 helper，读取当前 `[coverage]` 的 `source_sha`、
+global/core covered/count 与三项工具版本，构造完整 PR body。三个既有测试分别使用：
+
+- acceptance：当前合同全部字段 + `Bootstrap-Baseline: true`，必须 PASS；
+- baseline mismatch：只把 global 改为 `1/1`，其余保持当前合同，必须报 contract mismatch；
+- bootstrap mismatch：当前合同全部字段 + `Bootstrap-Baseline: false`，配合既有 base SHA，必须
+  到达并报告 bootstrap 状态不一致。
+
+不得用字符串替换硬编码下一次 source SHA；不得让测试读取 checker 输出后反向生成期望。
+
+- [ ] **Step 3: 跑聚焦与完整目标**
+
+```bash
+cargo test --test test_data_freshness_check pr_evidence_ -- --test-threads=1
+cargo test --test test_data_freshness_check -- --test-threads=1
+cargo clippy --test test_data_freshness_check --all-features -- -D warnings
+cargo fmt --all -- --check
+```
+
+Expected: PR evidence 聚焦 4/4，完整目标 15/15，Clippy/fmt exit 0。
+
+- [ ] **Step 4: Commit and invalidate old reports**
+
+```bash
+git add tests/test_data_freshness_check.rs
+git commit -m "test(compliance): derive PR evidence from coverage contract"
+```
+
+提交后 `/private/tmp/stock-analysis-t0-gatec-coverage.Q5RBwA` 仅保留为失败复盘证据；不得继续用它
+更新或验证 baseline。回到 Task 7E，从新测试提交重新冻结 SHA、完整跑 Gate B 和两轮 coverage。
+
+---
+
+### Task 7D-N: 消除固定 TEST 数据库清理的 coverage 非确定性
+
+**Files:**
+- Modify: `src/database/concepts.rs`（只改 `#[cfg(test)] mod tests`）
+
+**Interfaces:**
+- Consumes: `test_board_rotations_dao_lifecycle` 的精确 `./test_data/test.db` 测试路径。
+- Produces: 同一轮内覆盖“文件存在”和“不存在”的显式 cleanup；不改生产 DAO、数据库路径或
+  `DatabaseManager` 行为。
+
+- [ ] **Step 1: 固定双报告 RED**
+
+冻结 SHA `1880ef1ddd1c32b553f4e5f75c3f23708550a0e6` 的两轮完整报告位于
+`/private/tmp/stock-analysis-t0-gatec-coverage.Zhh0bt`。run1 为 global/core
+`202872/260127`、`158671/203777`，run2 为 `202873/260127`、`158672/203777`；LCOV 布尔
+覆盖差异唯一为 `src/database/concepts.rs:584`，run1=0、run2=1。根因是固定 test DB 只在上轮
+遗留文件存在时执行 `remove_file`。
+
+- [ ] **Step 2: 新增显式 test-only cleanup helper**
+
+在测试模块新增 `remove_test_file_if_present(path: &Path) -> std::io::Result<()>`：删除成功与
+`ErrorKind::NotFound` 都返回成功，其他错误原样返回。`test_board_rotations_dao_lifecycle` 在使用
+真实 TEST DB 前必须：
+
+1. 创建唯一 cleanup probe 文件并调用 helper，确定性覆盖存在分支；
+2. 对同一已删除 probe 再调用 helper，确定性覆盖不存在分支；
+3. 对精确 `./test_data/test.db` 调用 helper，并对任何非 NotFound 错误显式失败。
+
+probe 必须位于 `./test_data`、名字含 `unique_suffix()`，且在继续数据库初始化前已删除。禁止
+删除目录、使用通配符、忽略任意 I/O 错误或接触生产数据库。
+
+- [ ] **Step 3: 聚焦验证**
+
+```bash
+cargo test --lib database::concepts::tests::test_board_rotations_dao_lifecycle -- --exact --test-threads=1
+cargo clippy --lib --tests --all-features -- -D warnings
+cargo fmt --all -- --check
+```
+
+Expected: 定向 1/1、Clippy/fmt exit 0；diff 仅测试模块且不含 silent cleanup。
+
+- [ ] **Step 4: Commit and invalidate mismatched reports**
+
+```bash
+git add src/database/concepts.rs
+git commit -m "test(database): make concept cleanup coverage deterministic"
+```
+
+提交后 `Zhh0bt` 仅作非确定性复盘证据，不得用于 baseline。回到 Task 7E，从新提交重新冻结、
+完整 Gate B，并在一个全新目录运行两份报告。
+
+---
+
+### Task 7E: 冻结源码，生成两份同源码 coverage 并闭合 BR-252 provenance
+
+**Files:**
+- Modify after two matching reports: `config/design_contracts.toml`
+- Modify after two matching reports: `docs/business_rules.md`
+- Modify after two matching reports: `docs/superpowers/specs/2026-08-13-grpc-data-channel-design.md`
+- Modify after two matching reports: `docs/superpowers/specs/2026-08-02-gate-d-coverage-closure-design.md`
+- Runtime only: 唯一 `/private/tmp/stock-analysis-t0-gatec-coverage.*` 下的
+  `run1.{json,lcov}`、`run2.{json,lcov}`
+
+**Interfaces:**
+- Consumes: Tasks 7A–7D 的 clean test-only HEAD。
+- Produces: 一个字面 `source_sha`、两份计数一致的完整报告、非回退 candidate baseline；
+  90/85 与 80/95 阈值不变。
+
+- [ ] **Step 1: 先跑 test-only HEAD 的完整 Gate B**
+
+Run:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets --all-features -- --test-threads=1
+bash tools/compliance/check.sh --policy pr
+git status --short
+```
+
+Expected: 前四项 exit 0；freshness 明示 NOT RUN；status 无 tracked 改动。此时记录字面 HEAD
+为唯一 coverage source；后续报告完成前不得再改 `src/`、`tests/`、Cargo 或 build 输入。
+
+- [ ] **Step 2: 生成第一份完整 JSON/LCOV**
+
+Run:
+
+```bash
+T0_GATEC_COVERAGE_DIR="$(mktemp -d /private/tmp/stock-analysis-t0-gatec-coverage.XXXXXX)"
+readonly T0_GATEC_COVERAGE_DIR
+cargo llvm-cov clean --workspace
+cargo llvm-cov --workspace --all-features --json --output-path "$T0_GATEC_COVERAGE_DIR/run1.json" -- --test-threads=1
+cargo llvm-cov report --lcov --output-path "$T0_GATEC_COVERAGE_DIR/run1.lcov"
+python3 tools/coverage/check_thresholds.py --policy release --report "$T0_GATEC_COVERAGE_DIR/run1.json"
+```
+
+Expected: coverage tests 0 failed；JSON/LCOV 写出。最后一项因固定 80/95 尚未达到而 exit 1，
+但必须输出新鲜 global/core covered/count；不得把该诊断记为 Gate D PASS。
+
+- [ ] **Step 3: 清理 profile 后独立生成第二份报告**
+
+Run:
+
+```bash
+cargo llvm-cov clean --workspace
+cargo llvm-cov --workspace --all-features --json --output-path "$T0_GATEC_COVERAGE_DIR/run2.json" -- --test-threads=1
+cargo llvm-cov report --lcov --output-path "$T0_GATEC_COVERAGE_DIR/run2.lcov"
+python3 tools/coverage/check_thresholds.py --policy release --report "$T0_GATEC_COVERAGE_DIR/run2.json"
+```
+
+Expected: 与 run1 相同：测试 0 failed，release diagnostic exit 1。
+
+- [ ] **Step 4: 比较整数、core file count 与 source set**
+
+保存两次 release diagnostic 的完整五元组
+`global_covered/global_count/core_covered/core_count/core_file_count`，并运行：
+
+```bash
+jq -r '.data[0].files[].filename' "$T0_GATEC_COVERAGE_DIR/run1.json" | sort > "$T0_GATEC_COVERAGE_DIR/run1-json-sources.txt"
+jq -r '.data[0].files[].filename' "$T0_GATEC_COVERAGE_DIR/run2.json" | sort > "$T0_GATEC_COVERAGE_DIR/run2-json-sources.txt"
+sed -n 's/^SF://p' "$T0_GATEC_COVERAGE_DIR/run1.lcov" | sort > "$T0_GATEC_COVERAGE_DIR/run1-lcov-sources.txt"
+sed -n 's/^SF://p' "$T0_GATEC_COVERAGE_DIR/run2.lcov" | sort > "$T0_GATEC_COVERAGE_DIR/run2-lcov-sources.txt"
+cmp "$T0_GATEC_COVERAGE_DIR/run1-json-sources.txt" "$T0_GATEC_COVERAGE_DIR/run2-json-sources.txt"
+cmp "$T0_GATEC_COVERAGE_DIR/run1-lcov-sources.txt" "$T0_GATEC_COVERAGE_DIR/run2-lcov-sources.txt"
+```
+
+Expected: 两轮 global/core covered/count、core file count、JSON source set、LCOV source set
+逐项相等；candidate 必须满足整数交叉乘：
+
+```text
+candidate_global_covered * 258810 >= 201256 * candidate_global_count
+candidate_core_covered   * 202935 >= 157635 * candidate_core_count
+```
+
+任一不相等或任一比例回退：不得编辑合同，返回 Task 7B/7C/7D 补测试后重新冻结并跑两轮。
+
+- [ ] **Step 5: 用双报告的精确值更新合同和证据**
+
+仅在 Step 4 通过后：
+
+- `source_sha` 写 Task 7E Step 1 的字面 40 位 commit；
+- `global_covered/global_count/core_covered/core_count/core_file_count` 写两份报告一致的整数；
+- rustc/LLVM/cargo-llvm-cov identity 写报告实际值且必须与现有固定工具一致；
+- `pr_core_patch_min=90`、`pr_other_patch_min=85`、`release_global_min=80`、
+  `release_core_min=95` 原样保留；
+- `coverage.reviewed_no_region` 集合与 hash 原样保留；
+- BR-252 与两个设计文档记录 source SHA、两轮整数、报告 SHA-256、Gate C/Release 分层结论。
+
+然后用 run2 做 candidate contract 验证：
+
+```bash
+python3 tools/coverage/check_thresholds.py --policy pr --report "$T0_GATEC_COVERAGE_DIR/run2.json" --lcov "$T0_GATEC_COVERAGE_DIR/run2.lcov" --base-ref master
+bash tools/compliance/lib/check_design_contradiction.sh
+bash tools/compliance/lib/check_business_rules.sh
+```
+
+Expected: PR coverage exit 0；core patch >=90%、other patch >=85%、global/core ratchet PASS；
+两项文档门禁 exit 0。失败时不提交合同。
+
+- [ ] **Step 6: Commit provenance closure**
+
+`docs` 已被 ignore 但目标文件均已跟踪；禁止 `git add -f`。使用：
+
+```bash
+git add config/design_contracts.toml
+git add -u -- docs/business_rules.md docs/superpowers/specs/2026-08-13-grpc-data-channel-design.md docs/superpowers/specs/2026-08-02-gate-d-coverage-closure-design.md
+git diff --cached --check
+git commit -m "test(coverage): rebind Gate C baseline evidence"
+```
+
+---
+
+### Task 7F: 最终独立 Gate C 与 merge-ready PR 证据
+
+**Files:**
+- Runtime only: fresh coverage report and PR description；不得提交日志、凭据、DB 或二进制。
+
+**Interfaces:**
+- Consumes: Task 7E 的 clean HEAD 与已提交 BR-252 contract。
+- Produces: 独立 Gate C 结论；Gate D 必须继续标记 `Release Blocked`。
+
+- [ ] **Step 1: 独立 reviewer 重跑完整 Gate C**
+
+Run:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets --all-features -- --test-threads=1
+bash tools/compliance/check.sh --policy pr
+cargo llvm-cov clean --workspace
+cargo llvm-cov --workspace --all-features --json --output-path target/coverage/final.json -- --test-threads=1
+cargo llvm-cov report --lcov --output-path target/coverage/final.lcov
+python3 tools/coverage/check_thresholds.py --policy pr --report target/coverage/final.json --lcov target/coverage/final.lcov --base-ref master
+```
+
+Expected: 全部 exit 0；freshness 明示 NOT RUN；coverage 整数与 Task 7E 双报告一致。
+
+- [ ] **Step 2: 独立审查范围和敏感信息**
+
+Run:
+
+```bash
+git diff master...HEAD --check
+git diff master...HEAD --name-only
+git diff master...HEAD | rg -n "bearer|client-key|private_key|token"
+```
+
+Expected: diff clean；只含计划路径；敏感词只命中文档禁止说明或测试 sentinel，无凭据值或
+证书路径。reviewer 必须给出 Critical/Important/Minor=0 才能 PASS。
+
+- [ ] **Step 3: 生成 merge-ready PR 描述但不部署**
+
+沿用 Task 7 Step 6 的 Refs/Data-Redlines/OldModules/Threshold-Proof/Business-Rules/Rollback，
+并增加：
+
+```markdown
+### Gate-Policy
+- PR=core-patch90+other-patch85+ratchet
+- Release=global80+core95+freshness+live
+
+### Gate-C
+- PASS
+
+### Gate-D
+- Release Blocked: global/core 80%/95%、production freshness、live provider 和 auditor sign-off 未闭合
+```
+
+只有 Gate C 和独立审查全部 PASS 才可创建 merge-ready PR。不得运行 Task 8、停止进程、
+回填生产日线或部署二进制；合并后仍不能称为 Release Ready/Done。
+
+---
+
+### Task 8: 候选端口验证、成对切换、日线修复与观察
+
+**Files:**
+- Runtime only: unique `/private/tmp` candidate/backup directories and production DB through registered backfill；不提交二进制、日志或 DB。
+
+**Interfaces:**
+- Consumes: Gate B/C/coverage 全通过的同一 HEAD。
+- Produces: 同版本 server/monitor、通过真实 typed probe 的本地数据链、通过 2.4 freshness 的 `stock_daily`，以及两个严格五分钟观察窗口。
+
+- [ ] **Step 1: 记录旧运行身份，不做变更**
+
+Run: `lsof -nP -iTCP:18082 -sTCP:LISTEN`
+
+Run: `pgrep -fl 'target/.*/monitor|target/.*/grpc_market_server'`
+
+从输出逐一人工抄录进程号，并立即用 `ps -p` 的进程选择参数及 `lsof -p` 的进程选择参数
+复核启动时间、完整命令和打开文件；命令中必须直接写入刚抄录的十进制进程号。再对输出中
+解析出的两个绝对二进制路径逐一运行 `shasum -a 256`，命令中直接写绝对路径。后续 kill
+必须使用这里人工核对后的字面量进程号，不得使用 glob、命令替换或未验证环境变量。
+
+- [ ] **Step 2: 在独立 target 构建候选**
+
+运行以下命令创建唯一目录并把绝对路径赋给任务专用只读变量：
+
+```bash
+T0_CANDIDATE_TARGET="$(mktemp -d /private/tmp/stock-analysis-t0-v2-candidate.XXXXXX)"
+readonly T0_CANDIDATE_TARGET
+CARGO_TARGET_DIR="$T0_CANDIDATE_TARGET" cargo build --release --bin grpc_market_server --bin monitor --bin grpc_local_readiness_probe
+```
+
+Expected: exit 0；workspace 的 `target/release` 尚未被覆盖。
+
+- [ ] **Step 3: 在 18083 启动真实候选 server**
+
+候选 server 环境必须继承生产 provider/DB 配置，但明确 unset `DATA_GATEWAY_GRPC`，并设置
+`GRPC_MARKET_PORT=18083`。启动后运行：
+
+```bash
+"$T0_CANDIDATE_TARGET/release/grpc_local_readiness_probe" --addr http://127.0.0.1:18083
+```
+
+Expected: health ready；Quote/OrderBooks/T0Evidence/HistoricalBars 全部 status=available，T0
+`time_untrustworthy` 可真实显示但不能有 invalid_evidence；输出不含代码、价格或凭据。
+
+- [ ] **Step 4: 备份旧二进制并成对切换**
+
+用 `mktemp -d /private/tmp/stock-analysis-t0-v2-rollback.XXXXXX` 创建唯一备份目录，复制 Step 1
+解析出的两份旧二进制并保存各自 SHA-256。先向已核对的旧 monitor 字面量进程号发送
+SIGINT 并确认退出，再向旧 server 字面量进程号发送 SIGTERM 并确认 18082 释放；随后把候选 server/monitor 安装
+到 Step 1 的精确绝对路径并校验 hash，先启动 server，再启动 monitor。
+
+- [ ] **Step 5: 切换后立即验证，否则回滚**
+
+Run: `target/release/grpc_local_readiness_probe --addr http://127.0.0.1:18082`
+
+Expected: 四项全部 available。若失败：停止两份新进程，恢复 rollback 目录两份旧二进制并
+核对旧 hash，先启动旧 server 再启动旧 monitor；任务状态记 Blocked，不进入 backfill。
+
+- [ ] **Step 6: 修复生产日线 freshness**
+
+在新 server probe 全绿后运行：
+
+```bash
+STOCK_DB=/Users/zhangzhen/Desktop/Quant/stock_analysis/data/stock_analysis.db bash tools/one_shot/backfill_daily.sh
+STOCK_DB=/Users/zhangzhen/Desktop/Quant/stock_analysis/data/stock_analysis.db bash tools/compliance/lib/check_data_freshness.sh
+```
+
+Expected: backfill 只接纳真实 HistoricalBars 批次；freshness PASS，`MAX(date)` 落后不超过一个交易日。
+
+- [ ] **Step 7: Gate D release compliance**
+
+Run: `STOCK_DB=/Users/zhangzhen/Desktop/Quant/stock_analysis/data/stock_analysis.db bash tools/compliance/check.sh --policy release`
+
+Expected: `ALL CHECKS PASSED`。不得设置 `FRESHNESS_TODAY` 或 `TRADING_CALENDAR`。
+
+- [ ] **Step 8: 连续观察两个严格五分钟窗口**
+
+每个窗口使用 SQLite `julianday(created_at) >= julianday('now','-5 minutes')` 统计最近五分钟
+真实审计；禁止 ISO `T...Z` 与 SQLite 空格时间字符串直接比较。验收：
+
+- T0 不再出现 `premature end of input`、无 offset 或 `invalid_evidence`；
+- OrderBook 只有完整 T0 批次才刷新，部分批次不刷新；
+- MoneyFlow 仍明确 `unsupported_contract`，不被 BoardFlows 成功覆盖；
+- Quote/OrderBook freshness 失败保留结构化错误，不输出价格型建议；
+- 无订单授权、门禁放宽或伪造 fallback。
+
+- [ ] **Step 9: 创建 PR 并等待检查**
+
+用 Task 7 的完整描述创建 PR；等待 coverage/compliance/test checks 全部结束。任一检查失败按
+根因返回 Gate A/B/C，不合并。全部通过且 live evidence 完整后才可声明本修订 Done；Gate D
+覆盖率或外部 provider 阻塞时必须保持 In Progress/Blocked。

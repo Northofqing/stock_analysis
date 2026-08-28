@@ -42,7 +42,7 @@ use crate::magic_compat::{
     NorthboundChannel, PositiveU32, Price, Ratio,
 };
 use crate::selection::schema_v2::OutcomeTransportAttemptPreimage;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use serde_json::Value;
 
 /// bridge 缺证据时的 capability 标记 (audit_outcome=invalid_evidence)。
@@ -1939,7 +1939,18 @@ fn parse_market_ranking_unit(
 }
 
 fn instrument_for(code: &str, capability: &'static str) -> Result<InstrumentId, GatewayError> {
-    let exchange = match crate::grpc_contract::params::exchange_of(code) {
+    #[cfg(test)]
+    let exchange_code = match code.strip_prefix("TEST_CODE_") {
+        Some(suffix) if suffix.len() == 6 && suffix.as_bytes().iter().all(u8::is_ascii_digit) => {
+            suffix
+        }
+        Some(_) => return Err(err(capability, "TEST_CODE suffix 必须是六位 ASCII 数字")),
+        None => code,
+    };
+    #[cfg(not(test))]
+    let exchange_code = code;
+
+    let exchange = match crate::grpc_contract::params::exchange_of(exchange_code) {
         "Shanghai" => Exchange::Shanghai,
         "Shenzhen" => Exchange::Shenzhen,
         "Beijing" => Exchange::Beijing,
@@ -3433,12 +3444,29 @@ pub fn limit_pools(
     }
 }
 
-/// T0 证据批: 视图是 {"records": [...], "rejections": [...]} 对象 (delegate
-/// fetch_t0_evidence 契约; record 字段 serde 直出)。
+const T0_SCHEMA: &str = "market.t0_evidence";
+const T0_SCHEMA_VERSION: u32 = 2;
+const CHINA_OFFSET_SECONDS: i32 = 8 * 60 * 60;
+
+fn t0_china_session_at(value: &Value) -> Result<NaiveDateTime, GatewayError> {
+    let capability = "T0Evidence";
+    let raw = as_str(value, "at", capability)?;
+    let parsed = DateTime::parse_from_rfc3339(&raw)
+        .map_err(|_| err(capability, "T0 five-minute at must be RFC3339"))?;
+    if parsed.offset().local_minus_utc() != CHINA_OFFSET_SECONDS {
+        return Err(err(
+            capability,
+            "T0 five-minute at must use explicit +08:00",
+        ));
+    }
+    Ok(parsed.naive_local())
+}
+
+/// T0 证据批: 视图是含批级证据、records 与 rejections 的 v2 对象
+/// (grpc_server::t0_wire 契约)。
 /// 返回 MagicTdxT0Batch (records + rejections 全量) — 与本地
 /// MagicTdxGateway::get_t0_evidence_batch 对齐, rejections 绝不丢弃。
-/// 空 records 无法从当前 wire 视图恢复 batch.requested_at，显式拒绝，绝不以
-/// observed_at 或 consumer now 代填。
+/// requested_at 只从批级字段恢复；空 records 也绝不以 observed_at 或 consumer now 代填。
 pub fn t0_evidence_batch(q: &QueryResult) -> Result<MagicTdxT0Batch, GatewayError> {
     let capability = "T0Evidence";
     let ev = evidence_of(q, capability)?;
@@ -3458,12 +3486,69 @@ pub fn t0_evidence_batch(q: &QueryResult) -> Result<MagicTdxT0Batch, GatewayErro
         ));
     }
     let payload = &q.records[0];
-    // 合同 (M1): 视图必须是对象 {"records","rejections"}，不接纳数组兼容形状。
+    if payload.schema != T0_SCHEMA
+        || payload.schema_version != T0_SCHEMA_VERSION
+        || payload.content_type != CANONICAL_JSON_CONTENT_TYPE
+    {
+        return Err(err(
+            capability,
+            "T0Evidence schema/version/content-type 冲突",
+        ));
+    }
+    // 合同 v2: 视图必须是含批级证据的对象，不接纳 v1 或数组兼容形状。
     let value: Value = serde_json::from_slice(&payload.data)
         .map_err(|e| err(capability, format!("T0Evidence 视图非 JSON: {e}")))?;
     let view = value
         .as_object()
         .ok_or_else(|| err(capability, "T0Evidence 视图必须是 JSON 对象"))?;
+    let requested_at_raw = as_str(&value, "requested_at", capability)?;
+    let source_at_raw = as_str(&value, "source_at", capability)?;
+    let observed_at_raw = as_str(&value, "observed_at", capability)?;
+    let batch_id = as_str(&value, "batch_id", capability)?;
+    let time_untrustworthy = as_bool(&value, "time_untrustworthy", capability)?;
+    let requested_at = crate::data_gateway::parse_evidence_instant(
+        capability,
+        ev.provider,
+        "batch.requested_at",
+        &requested_at_raw,
+    )?;
+    let source_at = crate::data_gateway::parse_evidence_instant(
+        capability,
+        ev.provider,
+        "batch.source_at",
+        &source_at_raw,
+    )?;
+    let observed_at = crate::data_gateway::parse_evidence_instant(
+        capability,
+        ev.provider,
+        "batch.observed_at",
+        &observed_at_raw,
+    )?;
+    let envelope_source_at_raw = ev
+        .source_at
+        .as_deref()
+        .ok_or_else(|| err(capability, "T0Evidence envelope source_at 缺失"))?;
+    let envelope_source_at = crate::data_gateway::parse_evidence_instant(
+        capability,
+        ev.provider,
+        "envelope.source_at",
+        envelope_source_at_raw,
+    )?;
+    let envelope_observed_at = crate::data_gateway::parse_evidence_instant(
+        capability,
+        ev.provider,
+        "envelope.observed_at",
+        &ev.observed_at,
+    )?;
+    if source_at != envelope_source_at
+        || observed_at != envelope_observed_at
+        || batch_id != ev.batch_id
+    {
+        return Err(err(
+            capability,
+            "T0Evidence batch identity conflicts with gRPC envelope",
+        ));
+    }
     let records = view
         .get("records")
         .and_then(Value::as_array)
@@ -3521,7 +3606,7 @@ pub fn t0_evidence_batch(q: &QueryResult) -> Result<MagicTdxT0Batch, GatewayErro
             .iter()
             .map(|b| {
                 Ok(MagicTdxT0FiveMinuteBar {
-                    at: as_rfc3339(b, "at", capability)?.naive_utc(),
+                    at: t0_china_session_at(b)?,
                     open: as_f64(b, "open", capability)?,
                     high: as_f64(b, "high", capability)?,
                     low: as_f64(b, "low", capability)?,
@@ -3535,28 +3620,41 @@ pub fn t0_evidence_batch(q: &QueryResult) -> Result<MagicTdxT0Batch, GatewayErro
         let requested_at_raw = as_str(v, "requested_at", capability)?;
         let source_at_raw = as_str(v, "source_at", capability)?;
         let observed_at_raw = as_str(v, "observed_at", capability)?;
+        let record_requested_at = crate::data_gateway::parse_evidence_instant(
+            capability,
+            ev.provider,
+            "record.requested_at",
+            &requested_at_raw,
+        )?;
+        let record_source_at = crate::data_gateway::parse_evidence_instant(
+            capability,
+            ev.provider,
+            "record.source_at",
+            &source_at_raw,
+        )?;
+        let record_observed_at = crate::data_gateway::parse_evidence_instant(
+            capability,
+            ev.provider,
+            "record.observed_at",
+            &observed_at_raw,
+        )?;
+        let record_batch_id = as_str(v, "batch_id", capability)?;
+        if record_requested_at != requested_at
+            || record_observed_at != observed_at
+            || record_batch_id != batch_id
+        {
+            return Err(err(
+                capability,
+                format!("T0 record evidence differs from batch: code={code}"),
+            ));
+        }
         out.push(MagicTdxT0Evidence {
             instrument: instrument_for(&code, capability)?,
             code,
-            requested_at: crate::data_gateway::parse_evidence_instant(
-                capability,
-                ev.provider,
-                "record.requested_at",
-                &requested_at_raw,
-            )?,
-            source_at: crate::data_gateway::parse_evidence_instant(
-                capability,
-                ev.provider,
-                "record.source_at",
-                &source_at_raw,
-            )?,
-            observed_at: crate::data_gateway::parse_evidence_instant(
-                capability,
-                ev.provider,
-                "record.observed_at",
-                &observed_at_raw,
-            )?,
-            batch_id: as_str(v, "batch_id", capability)?,
+            requested_at: record_requested_at,
+            source_at: record_source_at,
+            observed_at: record_observed_at,
+            batch_id: record_batch_id,
             quote: MagicTdxT0Quote {
                 price: quote_obj
                     .get("price")
@@ -3609,38 +3707,16 @@ pub fn t0_evidence_batch(q: &QueryResult) -> Result<MagicTdxT0Batch, GatewayErro
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    // 批级时间戳从服务端 envelope 原样解析；requested_at 仅记录级存在，
-    // 空记录无法无损重建，必须显式失败，不能用 observed_at/consumer now 代填。
-    let requested_at = out.first().map(|r| r.requested_at).ok_or_else(|| {
-        err(
-            capability,
-            "T0Evidence 空 records 缺 requested_at，无法保真重建",
-        )
-    })?;
-    let source_at_raw = ev
-        .source_at
-        .as_deref()
-        .ok_or_else(|| err(capability, "T0Evidence source_at 缺失"))?;
     Ok(MagicTdxT0Batch {
         provider: ev.provider,
         source: ev.source.clone(),
         requested_at,
-        source_at: crate::data_gateway::parse_evidence_instant(
-            capability,
-            ev.provider,
-            "source_at",
-            source_at_raw,
-        )?,
-        observed_at: crate::data_gateway::parse_evidence_instant(
-            capability,
-            ev.provider,
-            "observed_at",
-            &ev.observed_at,
-        )?,
-        batch_id: ev.batch_id.clone(),
+        source_at,
+        observed_at,
+        batch_id,
         records: out,
         rejections,
-        time_untrustworthy: false, // t0_evidence_batch_at 按 lenient 门回填
+        time_untrustworthy,
     })
 }
 
@@ -3812,7 +3888,7 @@ pub fn t0_evidence_batch_at(
                 .unwrap_or(record.source_at),
         );
     }
-    if minimum_record_source_at != Some(batch.source_at) {
+    if !batch.records.is_empty() && minimum_record_source_at != Some(batch.source_at) {
         return Err(err(
             capability,
             format!(
@@ -3823,7 +3899,8 @@ pub fn t0_evidence_batch_at(
     }
     // 2026-08-21 用户指令: 拿不到可信时间 → 跳过 age 门但必须标注, 推送方据
     // time_untrustworthy 打印「时间不可信」, 禁止静默放行。
-    batch.time_untrustworthy = batch_time_untrustworthy || record_time_untrustworthy;
+    batch.time_untrustworthy =
+        batch.time_untrustworthy || batch_time_untrustworthy || record_time_untrustworthy;
     if batch.time_untrustworthy {
         log::warn!(
             "[{capability}][时间不可信] 整批已放宽 age 门: source_at={source_at} \
@@ -5393,6 +5470,382 @@ mod tests {
     }
 
     #[test]
+    fn offline_fixture_converters_cover_dormant_available_empty_and_invalid_contracts() {
+        macro_rules! assert_converter_contract {
+            (
+                $case:literal,
+                $converter:path,
+                $provider_name:literal,
+                $provider:expr,
+                $source:literal,
+                $available_value:expr,
+                |$records:ident| $identity_assertion:block,
+                |$invalid:ident| $invalid_mutation:block
+            ) => {{
+                let available_value: Value = $available_value;
+                let available_json = serde_json::to_string(&available_value)
+                    .expect("TEST_CODE available converter JSON");
+                let available_query = mk_q(&available_json, $provider_name, $source);
+                let available = $converter(&available_query)
+                    .unwrap_or_else(|error| panic!("{} available failed: {error}", $case));
+                assert_eq!(available.records().len(), 1, "{} record count", $case);
+                assert_eq!(available.evidence().provider, $provider, "{} provider", $case);
+                assert_eq!(available.evidence().source, $source, "{} source", $case);
+                assert_eq!(available.evidence().batch_id, "b-1", "{} batch_id", $case);
+                let $records = available.records();
+                $identity_assertion
+
+                let empty_query = mk_q("[]", $provider_name, $source);
+                let empty = $converter(&empty_query)
+                    .unwrap_or_else(|error| panic!("{} verified-empty failed: {error}", $case));
+                assert!(empty.is_verified_empty(), "{} empty state", $case);
+                assert_eq!(empty.evidence().provider, $provider, "{} empty provider", $case);
+                assert_eq!(empty.evidence().batch_id, "b-1", "{} empty batch_id", $case);
+
+                let mut $invalid = available_value;
+                $invalid_mutation
+                let invalid_json = serde_json::to_string(&$invalid)
+                    .expect("TEST_CODE invalid converter JSON");
+                let invalid_query = mk_q(&invalid_json, $provider_name, $source);
+                let error = $converter(&invalid_query)
+                    .expect_err(concat!($case, " invalid evidence must fail closed"));
+                assert_eq!(error.reason_code(), "invalid_evidence", "{} invalid reason", $case);
+            }};
+        }
+
+        assert_converter_contract!(
+            "global_indices",
+            global_indices,
+            "Tdx",
+            ProviderId::Tdx,
+            "TEST_CODE_source",
+            serde_json::json!([{
+                "code": "DowJones",
+                "name": "TEST_CODE_DJ",
+                "value": 41000.0,
+                "change": 12.0,
+                "change_percent": 0.03,
+                "source_at": "2026-08-15T09:35:00+08:00"
+            }]),
+            |records| {
+                assert_eq!(records[0].name, "TEST_CODE_DJ");
+            },
+            |invalid| {
+                invalid[0]["code"] = serde_json::json!("TEST_CODE_UNKNOWN");
+            }
+        );
+
+        assert_converter_contract!(
+            "foreign_exchange",
+            foreign_exchange,
+            "Tdx",
+            ProviderId::Tdx,
+            "TEST_CODE_source",
+            serde_json::json!([{
+                "pair": "UsdCny",
+                "name": "TEST_CODE_USD_CNY",
+                "rate": 7.15,
+                "change": null,
+                "change_percent": null,
+                "source_at": "2026-08-15T09:35:00+08:00"
+            }]),
+            |records| {
+                assert_eq!(records[0].name, "TEST_CODE_USD_CNY");
+            },
+            |invalid| {
+                invalid[0]["pair"] = serde_json::json!("TEST_CODE_USDCNY");
+            }
+        );
+
+        assert_converter_contract!(
+            "announcements",
+            announcements,
+            "Tdx",
+            ProviderId::Tdx,
+            "TEST_CODE_source",
+            serde_json::json!([{
+                "announcement_id": "TEST_CODE_A1",
+                "code": "TEST_CODE_600519",
+                "category": null,
+                "title": "TEST_CODE 公告",
+                "published_at": "2026-08-15T09:00:00+08:00",
+                "url": "https://example.com/TEST_CODE_A1"
+            }]),
+            |records| {
+                assert_eq!(records[0].announcement_id, "TEST_CODE_A1");
+                assert_eq!(records[0].code, "TEST_CODE_600519");
+            },
+            |invalid| {
+                invalid[0]
+                    .as_object_mut()
+                    .expect("TEST_CODE announcement object")
+                    .remove("title");
+            }
+        );
+
+        assert_converter_contract!(
+            "economic_calendar",
+            economic_calendar,
+            "Jin10",
+            ProviderId::Jin10,
+            "TEST_CODE_source",
+            serde_json::json!([{
+                "event_id": "TEST_CODE_E1",
+                "indicator_id": 123,
+                "country": "CN",
+                "name": "TEST_CODE CPI",
+                "period": "2026-07",
+                "scheduled_at": "2026-08-15T09:30:00+08:00",
+                "released_at": "2026-08-15T09:30:00+08:00",
+                "previous": "0.6",
+                "consensus": "0.7",
+                "actual": "0.8",
+                "revised": null,
+                "unit": "%",
+                "importance": 3,
+                "impact": "positive"
+            }]),
+            |records| {
+                assert_eq!(records[0].event_id, "TEST_CODE_E1");
+            },
+            |invalid| {
+                invalid[0]["importance"] = serde_json::json!("bad");
+            }
+        );
+
+        assert_converter_contract!(
+            "futures_delivery",
+            futures_delivery,
+            "Tdx",
+            ProviderId::Tdx,
+            "TEST_CODE_source",
+            serde_json::json!([{
+                "contract_code": "TEST_CODE_IF2608",
+                "product_code": "TEST_CODE_IF",
+                "last_trading_date": null,
+                "delivery_date": "2026-08-21",
+                "notice_url": "https://example.com/TEST_CODE_FD"
+            }]),
+            |records| {
+                assert_eq!(records[0].contract_code, "TEST_CODE_IF2608");
+            },
+            |invalid| {
+                invalid[0]["delivery_date"] = serde_json::json!("bad-date");
+            }
+        );
+
+        assert_converter_contract!(
+            "market_statistics",
+            market_statistics,
+            "Tdx",
+            ProviderId::Tdx,
+            "TEST_CODE_source",
+            serde_json::json!([{
+                "code": "TEST_CODE_600519",
+                "turnover_rate": 0.42,
+                "trailing_pe": 28.5,
+                "static_pe": 26.0,
+                "pb": 9.2,
+                "total_market_cap": 1880000000000.0,
+                "floating_market_cap": 1880000000000.0,
+                "upper_limit": 1650.0,
+                "lower_limit": 1350.0,
+                "volume_ratio": 1.1
+            }]),
+            |records| {
+                assert_eq!(records[0].instrument().code(), "TEST_CODE_600519");
+            },
+            |invalid| {
+                invalid[0]["upper_limit"] = serde_json::json!(0.0);
+            }
+        );
+
+        assert_converter_contract!(
+            "technical_bars",
+            technical_bars,
+            "Tdx",
+            ProviderId::Tdx,
+            "TEST_CODE_source",
+            serde_json::json!([{
+                "open": 10.0,
+                "close": 10.1,
+                "high": 10.2,
+                "low": 9.9,
+                "vol": 1000.0,
+                "amount": 10000.0,
+                "at": "2026-08-15T10:30:00+08:00"
+            }]),
+            |records| {
+                assert_eq!(records[0].datetime, "2026-08-15T10:30:00+08:00");
+            },
+            |invalid| {
+                invalid[0]
+                    .as_object_mut()
+                    .expect("TEST_CODE technical bar object")
+                    .remove("at");
+            }
+        );
+
+        assert_converter_contract!(
+            "intraday_shape",
+            intraday_shape,
+            "Tdx",
+            ProviderId::Tdx,
+            "TEST_CODE_source",
+            serde_json::json!([{
+                "date": "2026-08-15",
+                "pre_close": 1500.0,
+                "open_pct": 0.2,
+                "high_pct": 2.1,
+                "low_pct": -0.8,
+                "close_pct": 1.3,
+                "amplitude": 2.9,
+                "tail_30m_pct": 0.5,
+                "shape_label": "TEST_CODE_SHAPE"
+            }]),
+            |records| {
+                assert_eq!(records[0].shape_label, "TEST_CODE_SHAPE");
+            },
+            |invalid| {
+                invalid[0]
+                    .as_object_mut()
+                    .expect("TEST_CODE intraday shape object")
+                    .remove("shape_label");
+            }
+        );
+
+        assert_converter_contract!(
+            "market_dragon_tiger",
+            market_dragon_tiger,
+            "Tdx",
+            ProviderId::Tdx,
+            "TEST_CODE_source",
+            serde_json::json!([{
+                "exchange": "Shanghai",
+                "code": "TEST_CODE_600519",
+                "ranking_net_amount_yuan": 150000000.0,
+                "disclosures": []
+            }]),
+            |records| {
+                assert_eq!(records[0].code, "TEST_CODE_600519");
+            },
+            |invalid| {
+                invalid[0]
+                    .as_object_mut()
+                    .expect("TEST_CODE dragon-tiger object")
+                    .remove("exchange");
+            }
+        );
+
+        assert_converter_contract!(
+            "board_constituents",
+            board_constituents,
+            "Tdx",
+            ProviderId::Tdx,
+            "TEST_CODE_source",
+            serde_json::json!([{
+                "instrument_code": "TEST_CODE_600519",
+                "board_code": "TEST_CODE_BK0475",
+                "board_name": "TEST_CODE_BOARD",
+                "kind": "Concept"
+            }]),
+            |records| {
+                assert_eq!(records[0].instrument_code, "TEST_CODE_600519");
+            },
+            |invalid| {
+                invalid[0]["kind"] = serde_json::json!("TEST_CODE_UNKNOWN");
+            }
+        );
+
+        assert_converter_contract!(
+            "research_reports",
+            research_reports,
+            "Tdx",
+            ProviderId::Tdx,
+            "TEST_CODE_source",
+            serde_json::json!([{
+                "code": "TEST_CODE_600519",
+                "report_id": "TEST_CODE_R1",
+                "title": "TEST_CODE REPORT",
+                "organization": "TEST_CODE_ORG",
+                "rating": "Buy",
+                "published_at": "2026-08-15T09:00:00+08:00",
+                "canonical_url": "https://example.com/TEST_CODE_R1",
+                "target_price_upper": 12.0,
+                "target_price_lower": 10.0
+            }]),
+            |records| {
+                assert_eq!(records[0].report_id, "TEST_CODE_R1");
+            },
+            |invalid| {
+                invalid[0]
+                    .as_object_mut()
+                    .expect("TEST_CODE research report object")
+                    .remove("report_id");
+            }
+        );
+
+        assert_converter_contract!(
+            "provider_top_n_rankings",
+            provider_top_n_rankings,
+            "Eastmoney",
+            ProviderId::Eastmoney,
+            "eastmoney-web",
+            serde_json::json!([{
+                "metric": "VolumeRatio",
+                "ordinal": 1,
+                "code": "TEST_CODE_600519",
+                "label": "TEST_CODE_SECURITY",
+                "value": 3.2,
+                "unit": "Multiple",
+                "trading_date": "2026-08-15",
+                "filter_identity": "TEST_CODE_FILTER",
+                "provider_declared_total": 20,
+                "inspected_row_count": 20
+            }]),
+            |records| {
+                assert_eq!(records[0].instrument.code(), "TEST_CODE_600519");
+            },
+            |invalid| {
+                invalid[0]["ordinal"] = serde_json::json!(0);
+            }
+        );
+
+        assert_converter_contract!(
+            "instrument_news",
+            instrument_news,
+            "Sina",
+            ProviderId::Sina,
+            "TEST_CODE_source",
+            serde_json::json!([{
+                "code": "TEST_CODE_600519",
+                "title": "TEST_CODE NEWS",
+                "summary": "TEST_CODE SUMMARY",
+                "url": "https://example.com/TEST_CODE_NEWS",
+                "source": "Sina",
+                "source_name": "TEST_CODE SINA",
+                "category": "TEST_CODE CATEGORY",
+                "external_id": "TEST_CODE_N1",
+                "published_at": "2026-08-15T09:00:00+08:00",
+                "fetched_at": "2026-08-15T09:00:01+08:00",
+                "content_hash": "TEST_CODE_HASH"
+            }]),
+            |records| {
+                assert_eq!(
+                    records[0].persistence_item().code.as_deref(),
+                    Some("TEST_CODE_600519")
+                );
+            },
+            |invalid| {
+                invalid[0]
+                    .as_object_mut()
+                    .expect("TEST_CODE instrument news object")
+                    .remove("content_hash");
+            }
+        );
+    }
+
+    #[test]
     fn missing_evidence_is_fail_closed() {
         // provider 空 → Err, 不静默猜 Tdx。
         let q = mk_q(
@@ -5497,14 +5950,188 @@ mod tests {
 
     fn live_t0_q() -> QueryResult {
         let mut q = mk_q(
-            r#"{"records":[{"instrument":{"exchange":"Shanghai","code":"600519","asset_class":"Equity"},"code":"600519","requested_at":"2026-08-17T01:29:59Z","source_at":"2026-08-17T01:30:00Z","observed_at":"2026-08-17T01:30:00.250Z","batch_id":"TEST_CODE_T0_BATCH_001","quote":{"price":10.0,"last_close":9.9,"open":9.95,"high":10.1,"low":9.8,"volume":1000.0,"amount":10000.0,"bids":[{"price":9.99,"volume":100.0},{"price":9.98,"volume":100.0},{"price":9.97,"volume":100.0},{"price":9.96,"volume":100.0},{"price":9.95,"volume":100.0}],"asks":[{"price":10.01,"volume":100.0},{"price":10.02,"volume":100.0},{"price":10.03,"volume":100.0},{"price":10.04,"volume":100.0},{"price":10.05,"volume":100.0}]},"settled_daily":[],"completed_five_minute":[],"intraday_average_price":9.98}],"rejections":[]}"#,
+            r#"{"requested_at":"2026-08-17T01:29:59Z","source_at":"2026-08-17T01:30:00Z","observed_at":"2026-08-17T01:30:00.250Z","batch_id":"TEST_CODE_T0_BATCH_001","time_untrustworthy":false,"records":[{"instrument":{"exchange":"Shanghai","code":"TEST_CODE_600519","asset_class":"Equity"},"code":"TEST_CODE_600519","requested_at":"2026-08-17T01:29:59Z","source_at":"2026-08-17T01:30:00Z","observed_at":"2026-08-17T01:30:00.250Z","batch_id":"TEST_CODE_T0_BATCH_001","quote":{"price":10.0,"last_close":9.9,"open":9.95,"high":10.1,"low":9.8,"volume":1000.0,"amount":10000.0,"bids":[{"price":9.99,"volume":100.0},{"price":9.98,"volume":100.0},{"price":9.97,"volume":100.0},{"price":9.96,"volume":100.0},{"price":9.95,"volume":100.0}],"asks":[{"price":10.01,"volume":100.0},{"price":10.02,"volume":100.0},{"price":10.03,"volume":100.0},{"price":10.04,"volume":100.0},{"price":10.05,"volume":100.0}]},"settled_daily":[],"completed_five_minute":[{"at":"2026-08-17T09:35:00+08:00","open":10.0,"high":10.1,"low":9.9,"close":10.0,"volume":1000.0,"amount":10000.0}],"intraday_average_price":9.98}],"rejections":[]}"#,
             "Tdx",
             "TEST_CODE_magic_tdx_t0",
         );
+        q.records[0].schema = "market.t0_evidence".to_string();
+        q.records[0].schema_version = 2;
         q.batch_id = "TEST_CODE_T0_BATCH_001".to_string();
         q.source_at = "1786930200.000000000".to_string();
         q.observed_at = "1786930200.250000000".to_string();
         q
+    }
+
+    #[test]
+    fn br253_t0_v2_preserves_china_session_civil_label() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
+        let batch = t0_evidence_batch_at(&live_t0_q(), now).unwrap();
+        assert_eq!(batch.records[0].code, "TEST_CODE_600519");
+        assert_eq!(batch.records[0].instrument.code(), "TEST_CODE_600519");
+        assert_eq!(
+            batch.records[0].completed_five_minute[0].at,
+            NaiveDate::from_ymd_opt(2026, 8, 17)
+                .unwrap()
+                .and_hms_opt(9, 35, 0)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn br253_t0_v2_preserves_alternate_test_code_identity() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
+        let mut q = live_t0_q();
+        let mut view: Value = serde_json::from_slice(&q.records[0].data).unwrap();
+        view["records"][0]["instrument"]["code"] = serde_json::json!("TEST_CODE_600520");
+        view["records"][0]["code"] = serde_json::json!("TEST_CODE_600520");
+        q.records[0].data = serde_json::to_vec(&view).unwrap();
+
+        let batch = t0_evidence_batch_at(&q, now).unwrap();
+        assert_eq!(batch.records[0].code, "TEST_CODE_600520");
+        assert_eq!(batch.records[0].instrument.code(), "TEST_CODE_600520");
+    }
+
+    #[test]
+    fn br253_t0_v2_rejects_malformed_test_code_suffix() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
+        for malformed in [
+            "TEST_CODE_",
+            "TEST_CODE_60051",
+            "TEST_CODE_600519X",
+            "TEST_CODE_NOT_CODE",
+        ] {
+            let mut q = live_t0_q();
+            let mut view: Value = serde_json::from_slice(&q.records[0].data).unwrap();
+            view["records"][0]["instrument"]["code"] = serde_json::json!(malformed);
+            view["records"][0]["code"] = serde_json::json!(malformed);
+            q.records[0].data = serde_json::to_vec(&view).unwrap();
+
+            let error = t0_evidence_batch_at(&q, now)
+                .expect_err("malformed TEST_CODE suffix must fail closed");
+            assert_eq!(error.reason_code(), "invalid_evidence", "code={malformed}");
+        }
+    }
+
+    #[test]
+    fn br253_t0_v2_rebuilds_empty_record_batch_from_batch_requested_at() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
+        let mut q = live_t0_q();
+        let mut view: Value = serde_json::from_slice(&q.records[0].data).unwrap();
+        view["records"] = serde_json::json!([]);
+        view["rejections"] = serde_json::json!([{
+            "code": "TEST_CODE_600519",
+            "reason_code": "quote_stale",
+            "detail": "TEST_CODE source time unavailable",
+            "retryable": true
+        }]);
+        q.records[0].data = serde_json::to_vec(&view).unwrap();
+
+        let batch = t0_evidence_batch_at(&q, now).unwrap();
+        assert!(batch.records.is_empty());
+        assert_eq!(batch.rejections.len(), 1);
+        assert_eq!(
+            batch.requested_at,
+            Utc.with_ymd_and_hms(2026, 8, 17, 1, 29, 59).unwrap()
+        );
+    }
+
+    #[test]
+    fn br253_t0_v2_rejects_missing_or_wrong_session_offset() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
+        for raw_at in [
+            "2026-08-17T09:35:00",
+            "2026-08-17T01:35:00Z",
+            "2026-08-17T10:35:00+09:00",
+        ] {
+            let mut q = live_t0_q();
+            let mut view: Value = serde_json::from_slice(&q.records[0].data).unwrap();
+            view["records"][0]["completed_five_minute"][0]["at"] = serde_json::json!(raw_at);
+            q.records[0].data = serde_json::to_vec(&view).unwrap();
+
+            let error = t0_evidence_batch_at(&q, now)
+                .expect_err("T0 session bars must carry an explicit +08:00 offset");
+            assert_eq!(error.reason_code(), "invalid_evidence", "at={raw_at}");
+        }
+    }
+
+    #[test]
+    fn br253_t0_v2_rejects_noncanonical_payload_identity() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
+        let mut cases = Vec::new();
+
+        let mut wrong_schema = live_t0_q();
+        wrong_schema.records[0].schema = "TEST_CODE_market.t0_evidence".to_string();
+        cases.push(("schema", wrong_schema));
+
+        let mut wrong_version = live_t0_q();
+        wrong_version.records[0].schema_version = 1;
+        cases.push(("schema_version", wrong_version));
+
+        let mut wrong_content_type = live_t0_q();
+        wrong_content_type.records[0].content_type = "application/json".to_string();
+        cases.push(("content_type", wrong_content_type));
+
+        for (field, q) in cases {
+            let error = t0_evidence_batch_at(&q, now)
+                .expect_err("T0 consumer must accept only the frozen canonical v2 payload");
+            assert_eq!(error.reason_code(), "invalid_evidence", "field={field}");
+        }
+    }
+
+    #[test]
+    fn br253_t0_v2_rejects_batch_envelope_conflicts() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
+        for (field, conflicting_value) in [
+            ("batch_id", serde_json::json!("TEST_CODE_T0_BATCH_CONFLICT")),
+            ("source_at", serde_json::json!("2026-08-17T01:29:59Z")),
+            ("observed_at", serde_json::json!("2026-08-17T01:30:00.249Z")),
+        ] {
+            let mut q = live_t0_q();
+            let mut view: Value = serde_json::from_slice(&q.records[0].data).unwrap();
+            view[field] = conflicting_value;
+            q.records[0].data = serde_json::to_vec(&view).unwrap();
+
+            let error = t0_evidence_batch_at(&q, now)
+                .expect_err("canonical T0 batch identity must equal the gRPC envelope");
+            assert_eq!(error.reason_code(), "invalid_evidence", "field={field}");
+        }
+    }
+
+    #[test]
+    fn br253_t0_v2_rejects_record_batch_identity_conflicts() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
+        for (field, conflicting_value) in [
+            ("requested_at", serde_json::json!("2026-08-17T01:29:58Z")),
+            ("observed_at", serde_json::json!("2026-08-17T01:30:00.249Z")),
+            (
+                "batch_id",
+                serde_json::json!("TEST_CODE_T0_RECORD_CONFLICT"),
+            ),
+        ] {
+            let mut q = live_t0_q();
+            let mut view: Value = serde_json::from_slice(&q.records[0].data).unwrap();
+            view["records"][0][field] = conflicting_value;
+            q.records[0].data = serde_json::to_vec(&view).unwrap();
+
+            let error = t0_evidence_batch_at(&q, now)
+                .expect_err("record T0 batch identity must equal the batch-level identity");
+            assert_eq!(error.reason_code(), "invalid_evidence", "field={field}");
+        }
+    }
+
+    #[test]
+    fn br253_t0_v2_preserves_server_time_untrustworthy() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
+        let mut q = live_t0_q();
+        let mut view: Value = serde_json::from_slice(&q.records[0].data).unwrap();
+        view["time_untrustworthy"] = serde_json::json!(true);
+        q.records[0].data = serde_json::to_vec(&view).unwrap();
+
+        let batch = t0_evidence_batch_at(&q, now).unwrap();
+        assert!(
+            batch.time_untrustworthy,
+            "server-side time distrust must survive consumer freshness checks"
+        );
     }
 
     #[test]
@@ -5528,6 +6155,7 @@ mod tests {
         let mut q = live_t0_q();
         q.source_at = "1786930199.999999999".to_string();
         let mut view: Value = serde_json::from_slice(&q.records[0].data).unwrap();
+        view["source_at"] = Value::String("1786930199.999999999".to_string());
         view["records"][0]["source_at"] = Value::String("1786930199.999999999".to_string());
         q.records[0].data = serde_json::to_vec(&view).unwrap();
 

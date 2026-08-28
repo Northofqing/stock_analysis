@@ -6,6 +6,7 @@ pub mod delegate;
 pub mod events;
 pub mod fixture;
 pub mod handlers;
+mod t0_wire;
 
 use crate::grpc_client::pb::magic::market::v1::{
     system_service_server::{SystemService, SystemServiceServer},
