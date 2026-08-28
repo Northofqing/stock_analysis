@@ -144,8 +144,8 @@ attestation 继续覆盖 `benchmark_identity_unverified` 错误分类。
 - [x] **Step 4: 让 ReviewDataGateway 入口测试不依赖真实网络。**
 
 把 `benchmark_entrypoint_delegates_to_library_and_appends_exactly_one_audit_row` 的请求改为
-未注册 `sh000905`，断言 `benchmark_instrument_unsupported`、精确 request hash，以及
-`BenchmarkBars` 审计行只增加一条；这只验证委派/审计，不把网络可用性写入单元测试。
+测试身份 `TEST_CODE_UNSUPPORTED`，断言 `benchmark_test_identity_rejected`、精确 request hash，
+以及 `BenchmarkBars` 审计行只增加一条；这只验证委派/审计，不把真实证券身份或网络可用性写入单元测试。
 
 - [x] **Step 5: 运行 GREEN 和定向回归。**
 
