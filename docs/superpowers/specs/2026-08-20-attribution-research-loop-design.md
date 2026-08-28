@@ -1230,14 +1230,15 @@ identity mode        = request_bound_tdx_hs300_v1
 ```
 
 `dependency revision` 不允许在 adapter 中人工复制。`build.rs` 必须从本次构建实际使用的
-`Cargo.lock` 中唯一的 `magic-tdx-rs` Git source 解析 `#<resolved-commit>`，验证其为 40 位
-小写十六进制提交，并通过编译期环境值注入合同。缺失、重复、非目标仓库或非精确提交都必须使
-构建失败；`Cargo.lock` 变更必须触发重建。由此 provider 实际代码、request/batch hash 和审计
+`Cargo.lock` 中唯一的 `magic-tdx-rs` Git source 解析
+`?rev=<requested-commit>#<resolved-commit>`，要求二者是相同的 40 位小写十六进制提交，并通过
+编译期环境值注入合同。branch/tag、短 SHA、额外 query、缺失、重复、非目标仓库或请求/解析提交
+不一致都必须使构建失败；`Cargo.lock` 变更必须触发重建。由此 provider 实际代码、request/batch hash 和审计
 `source` 使用同一个 resolved revision，依赖升级不会留下声称旧 revision 的审计数据。
 
 `BenchmarkProviderAttestation::production_default()` 不再保存可误设的身份布尔，而保存类型化
-`RequestBoundTdxHs300V1`。`admit(request)` 必须先验证 canonical instrument 与上述合同完全相等，
-再返回协议合同能力值；后续每一页的 provider 请求、base request hash、canonical acquisition
+`RequestBoundTdxHs300V1`。生产入口必须先通过 production registry 验证 canonical instrument，
+再由 `admit(request)` 检查身份模式与 Minute1 语义并返回协议合同能力值；后续每一页的 provider 请求、base request hash、canonical acquisition
 bytes、batch ID 和 `BatchEvidence.source` 全部从同一个能力值生成。这样，正式准入证明的是：
 
 ```text
@@ -1279,10 +1280,11 @@ acquisition seam，避免把“看到了数据”冒充“数据已准入”。
 
 测试 seam 固定为：注入 `IndexBarsSource` 的完整 Benchmark acquisition 行为、
 `ReviewDataGateway::benchmark_bars` 的单审计入口，以及真实 `strategy_attribution` CLI。必须先保留
-RED：生产 Daily 精确 HS300 请求当前返回 `benchmark_identity_unverified`；GREEN 后断言 source
-收到且只收到 `market=1/code=000300/category=4/fq=0`，返回批次 source revision、request hash、
-记录和覆盖全部一致。另测 production Minute1 仍在 source access 前失败，unsupported identity
-仍零访问，入口失败仍只追加一条 BR-159 审计。
+RED：构建脚本必须拒绝 branch/tag/短 SHA/额外 query/请求与解析提交不一致；GREEN 后以
+`TEST_CODE` registry 断言 source 收到且只收到 `market=1/code=000300/category=4/fq=0`，返回批次
+source revision、request hash、记录和覆盖全部一致。测试不得构造真实证券请求；production Daily
+精确 HS300 的准入由真实 capture 证据验证。另以 `TEST_CODE` 请求验证 Minute1 仍在 source access
+前失败、unsupported identity 仍零访问，入口失败仍只追加一条 BR-159 审计。
 
 Gate B/C 使用 §15.9 的仓库标准命令，并新增 CLI all/no-default release build。真实验收使用：
 

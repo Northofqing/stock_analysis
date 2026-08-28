@@ -111,7 +111,6 @@ enum BenchmarkIdentityAttestation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TdxIndexProtocolContract {
-    canonical_instrument: &'static str,
     market: u8,
     code: &'static str,
     daily_category: u8,
@@ -121,9 +120,9 @@ struct TdxIndexProtocolContract {
 }
 ```
 
-`production_default()` 固定为 `RequestBoundTdxHs300V1`；`admit` 对生产请求验证
-`request.instrument == contract.canonical_instrument`，Minute1 再独立检查时间标签语义，并返回
-`TdxIndexProtocolContract`。测试专用 variant 只允许测试 registry 路径，不进入生产构建。
+`production_default()` 固定为 `RequestBoundTdxHs300V1`。生产入口先由 production registry 验证
+canonical instrument，再由 `admit` 检查类型化身份模式与 Minute1 时间标签语义并返回
+`TdxIndexProtocolContract`。测试专用 variant 只允许 `TEST_CODE` registry 路径，不进入生产构建。
 
 - [x] **Step 2: 让同一合同生成所有 provider 身份字段。**
 

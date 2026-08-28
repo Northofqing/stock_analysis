@@ -12,8 +12,8 @@ score_max = 100
 insufficient_cap_relation = "threshold_minus_one"
 
 # BR-252 / docs/superpowers/specs/2026-08-02-gate-d-coverage-closure-design.md §10.4
-# 当前 PR 覆盖率棘轮基线来自 3edb5d6 上两次独立、计数与逐行布尔覆盖一致的
-# workspace/all-features 新鲜报告；见设计 §10.14。
+# 当前 PR 覆盖率棘轮基线由 source_sha 对应源码的 workspace/all-features 新鲜报告生成；
+# 计数须与逐行布尔覆盖一致，历史起点与推进证据见设计 §10.14。
 # 比例判定必须使用整数交叉相乘；普通修改不得降低任一 baseline。
 [coverage]
 schema = 1

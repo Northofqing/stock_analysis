@@ -1361,7 +1361,6 @@ enum BenchmarkIdentityAttestation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TdxIndexProtocolContract {
-    canonical_instrument: &'static str,
     market: u8,
     code: &'static str,
     daily_category: u8,
@@ -1373,7 +1372,6 @@ struct TdxIndexProtocolContract {
 impl TdxIndexProtocolContract {
     const fn tdx_hs300_v1() -> Self {
         Self {
-            canonical_instrument: HS300_CANONICAL,
             market: TDX_MARKET,
             code: TDX_CODE,
             daily_category: TDX_DAILY_CATEGORY,
@@ -2498,7 +2496,6 @@ mod tests {
         BenchmarkBarTime, BenchmarkError, BenchmarkEvidenceWire, BenchmarkGrpcResponseWire,
         BenchmarkProviderAttestation, BenchmarkRange, BenchmarkRegistry, BenchmarkRequest,
         BenchmarkUnsupported, BenchmarkWireTime, IndexBarsSource, IndexPageRequest, RawIndexBar,
-        HS300_CANONICAL,
     };
     use crate::data_gateway::review::AuditedBenchmarkBatch;
     use crate::data_gateway::{BatchEvidence, GatewayBatch, GatewayError};
@@ -2595,7 +2592,6 @@ mod tests {
             super::BenchmarkIdentityAttestation::RequestBoundTdxHs300V1
         );
         let contract = super::TdxIndexProtocolContract::tdx_hs300_v1();
-        assert_eq!(contract.canonical_instrument, HS300_CANONICAL);
         assert_eq!(contract.dependency_revision, resolved_revision);
     }
 
@@ -3039,42 +3035,13 @@ mod tests {
     }
 
     #[test]
-    fn production_registry_only_accepts_the_canonical_hs300_identity() {
+    fn production_registry_rejects_test_identity() {
         let trading_day = date(21);
         let coverage = BenchmarkAdmissionCoverage::Daily {
             authoritative_trading_days: &[trading_day],
         };
         let bars = vec![bar(BenchmarkBarTime::Daily(trading_day))];
 
-        assert!(admit_benchmark_batch(
-            &BenchmarkRegistry::production_default(),
-            daily_request(trading_day, trading_day, HS300_CANONICAL),
-            bars.clone(),
-            coverage,
-        )
-        .is_ok());
-        assert_eq!(
-            admit_benchmark_batch(
-                &BenchmarkRegistry::production_default(),
-                daily_request(trading_day, trading_day, "sh000905"),
-                bars.clone(),
-                coverage,
-            ),
-            Err(BenchmarkError::Unsupported(
-                BenchmarkUnsupported::UnsupportedInstrument
-            ))
-        );
-        assert_eq!(
-            admit_benchmark_batch(
-                &BenchmarkRegistry::production_default(),
-                daily_request(trading_day, trading_day, "sz000001"),
-                bars.clone(),
-                coverage,
-            ),
-            Err(BenchmarkError::Unsupported(
-                BenchmarkUnsupported::UnsupportedInstrument
-            ))
-        );
         assert_eq!(
             admit_benchmark_batch(
                 &BenchmarkRegistry::production_default(),
@@ -3600,8 +3567,8 @@ mod tests {
         let empty_source = TestIndexBarsSource::new(vec![]);
         let unsupported = acquire_benchmark_batch_from_source(
             &empty_source,
-            daily_request(day, day, "sh000905"),
-            &BenchmarkRegistry::production_default(),
+            daily_request(day, day, "TEST_CODE_000905"),
+            &test_registry(),
             BenchmarkProviderAttestation::test_only(true, true),
             BenchmarkAdmissionCoverage::Daily {
                 authoritative_trading_days: &[day],
@@ -3611,8 +3578,8 @@ mod tests {
         .expect_err("unregistered benchmark must be unsupported");
         let identity_unavailable = acquire_benchmark_batch_from_source(
             &empty_source,
-            daily_request(day, day, HS300_CANONICAL),
-            &BenchmarkRegistry::production_default(),
+            daily_request(day, day, "TEST_CODE_000300"),
+            &test_registry(),
             BenchmarkProviderAttestation::test_only(false, true),
             BenchmarkAdmissionCoverage::Daily {
                 authoritative_trading_days: &[day],
@@ -3866,7 +3833,7 @@ mod tests {
     fn daily_authority_is_typed_unavailable_outside_the_immutable_calendar() {
         let day = NaiveDate::from_ymd_opt(2099, 1, 5).unwrap();
         let error = super::verified_benchmark_coverage(&BenchmarkRequest {
-            instrument: HS300_CANONICAL.to_owned(),
+            instrument: "TEST_CODE_000300".to_owned(),
             range: BenchmarkRange::Daily { from: day, to: day },
         })
         .expect_err("calendar coverage must not be guessed from weekdays");
@@ -3909,11 +3876,8 @@ mod tests {
         let source = TestIndexBarsSource::new(vec![]);
         let identity_error = acquire_benchmark_batch_from_source(
             &source,
-            BenchmarkRequest {
-                instrument: HS300_CANONICAL.to_owned(),
-                range: BenchmarkRange::Daily { from: day, to: day },
-            },
-            &BenchmarkRegistry::production_default(),
+            daily_request(day, day, "TEST_CODE_000300"),
+            &test_registry(),
             BenchmarkProviderAttestation::test_only(false, true),
             BenchmarkAdmissionCoverage::Daily {
                 authoritative_trading_days: &[day],
@@ -3926,17 +3890,15 @@ mod tests {
             "benchmark_identity_unverified"
         );
 
+        assert!(!BenchmarkProviderAttestation::production_default().minute_end_semantics_verified);
         let minute_error = acquire_benchmark_batch_from_source(
             &source,
-            BenchmarkRequest {
-                instrument: HS300_CANONICAL.to_owned(),
-                range: BenchmarkRange::Minute1 {
-                    from: minute("2026-08-21T09:31:00+08:00"),
-                    to: minute("2026-08-21T09:32:00+08:00"),
-                },
-            },
-            &BenchmarkRegistry::production_default(),
-            BenchmarkProviderAttestation::production_default(),
+            minute_request(
+                minute("2026-08-21T09:31:00+08:00"),
+                minute("2026-08-21T09:32:00+08:00"),
+            ),
+            &test_registry(),
+            BenchmarkProviderAttestation::test_only(true, false),
             BenchmarkAdmissionCoverage::Minute1,
             "2099-01-02T10:00:00+08:00",
         )

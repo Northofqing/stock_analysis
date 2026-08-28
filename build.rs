@@ -10,6 +10,9 @@
 //! 上游合同文件本身零修改 — 上游更新 proto 后本地自动跟随。
 use std::path::PathBuf;
 
+#[path = "build_support/magic_tdx_lock.rs"]
+mod magic_tdx_lock;
+
 fn main() {
     // tonic 0.14 重构: configure()/compile() 从 tonic_build 移到 tonic-prost-build
     // (tonic_build 0.14 只保留 Service codegen, "Prost functionality has been moved
@@ -20,6 +23,7 @@ fn main() {
     let magic_tdx_revision = locked_magic_tdx_revision(&lock_path);
     println!("cargo:rustc-env=MAGIC_TDX_DEPENDENCY_REVISION={magic_tdx_revision}");
     println!("cargo:rerun-if-changed={}", lock_path.display());
+    println!("cargo:rerun-if-changed=build_support/magic_tdx_lock.rs");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let upstream = "client-bundle/market.proto";
@@ -42,8 +46,6 @@ fn main() {
 
 fn locked_magic_tdx_revision(lock_path: &std::path::Path) -> String {
     const PACKAGE: &str = "magic-tdx-rs";
-    const SOURCE_REPOSITORY: &str = "git+https://github.com/Northofqing/magic-market-data-rs.git";
-
     let lock_bytes = std::fs::read_to_string(lock_path)
         .unwrap_or_else(|error| panic!("read {}: {error}", lock_path.display()));
     let lock: toml::Value = lock_bytes
@@ -68,22 +70,10 @@ fn locked_magic_tdx_revision(lock_path: &std::path::Path) -> String {
         .get("source")
         .and_then(toml::Value::as_str)
         .unwrap_or_else(|| panic!("{PACKAGE} must have a locked Git source"));
-    let (repository, revision) = source
-        .rsplit_once('#')
-        .unwrap_or_else(|| panic!("{PACKAGE} source must contain a resolved commit: {source}"));
-    let (repository, query) = repository
-        .split_once('?')
-        .unwrap_or_else(|| panic!("{PACKAGE} source must contain an exact Git query: {source}"));
-    if repository != SOURCE_REPOSITORY || query.is_empty() {
-        panic!("{PACKAGE} source repository is not admitted: {source}");
-    }
-    if revision.len() != 40
-        || !revision
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        panic!("{PACKAGE} resolved commit is not 40 lowercase hexadecimal characters");
-    }
+    let revision =
+        magic_tdx_lock::exact_locked_magic_tdx_revision(source).unwrap_or_else(|error| {
+            panic!("{PACKAGE} source is not an exact locked revision: {error}")
+        });
     revision.to_owned()
 }
 
