@@ -2327,6 +2327,12 @@ fn canonical_fill_fee_evidence_hash(evidence: &FillFeeEvidence) -> String {
     hex::encode(hasher.finalize())
 }
 
+fn canonical_missing_fill_ids(required: &HashSet<i64>, seen: &HashSet<i64>) -> Vec<i64> {
+    let mut missing = required.difference(seen).copied().collect::<Vec<_>>();
+    missing.sort_unstable();
+    missing
+}
+
 fn validate_fee_ledger(
     ledger: Option<&AuthoritativeFillFeeLedger>,
     fills: &[ReplayFillEvidence],
@@ -2374,7 +2380,7 @@ fn validate_fee_ledger(
         }
     }
     if seen != fill_ids {
-        let missing = fill_ids.difference(&seen).copied().collect::<Vec<_>>();
+        let missing = canonical_missing_fill_ids(&fill_ids, &seen);
         return Err(AttributionReplayError::integrity(
             AttributionIntegrityFailure::FeeEvidence,
             format!("fee evidence is missing fill ids {missing:?}"),
@@ -2438,10 +2444,7 @@ fn validate_epoch_fee_ledger(
         }
     }
     if !attributable_ids.is_subset(&seen) {
-        let missing = attributable_ids
-            .difference(&seen)
-            .copied()
-            .collect::<Vec<_>>();
+        let missing = canonical_missing_fill_ids(&attributable_ids, &seen);
         return Err(AttributionReplayError::integrity(
             AttributionIntegrityFailure::FeeEvidence,
             format!("fee evidence is missing attributable fill ids {missing:?}"),
@@ -3821,6 +3824,15 @@ impl FailureEvidenceSummary {
         self.released_codes = FailureEvidenceState::Available(epoch.released_codes().to_string());
     }
 
+    fn record_scoped_epoch_replay(
+        &mut self,
+        epoch: &AttributionEpochReplayEvidence,
+        fills: &[ReplayFillEvidence],
+    ) {
+        self.record_epoch_evidence(epoch);
+        self.trade = FailureEvidenceState::Available(replay_trade_manifest_hash(epoch, fills));
+    }
+
     fn record_load_failure(
         &mut self,
         failure: &AttributionReplayLoadFailure,
@@ -3959,8 +3971,8 @@ struct PrepareFailure {
 }
 
 struct ScopedVerifiedEpochReplay {
+    verified_fills: Vec<ReplayFillEvidence>,
     fills: Vec<ReplayFillEvidence>,
-    fees: FeeEvidenceAvailability,
     epoch: AttributionEpochReplayEvidence,
 }
 
@@ -3968,7 +3980,6 @@ fn scope_verified_epoch_replay(
     selector: &AttributionEpochSelector,
     receipt: &AttributionEpochReceipt,
     verified: &VerifiedEpochFillSet,
-    fee_ledger: Option<&AuthoritativeFillFeeLedger>,
 ) -> Result<ScopedVerifiedEpochReplay, AttributionReplayError> {
     if canonical_legacy_carry_manifest_hash(verified.carry()) != receipt.legacy_carry_manifest_hash
     {
@@ -4038,7 +4049,6 @@ fn scope_verified_epoch_replay(
             "scoped epoch fill lost its database-issued terminal evidence",
         ));
     }
-    let fees = validate_epoch_fee_ledger(fee_ledger, &verified_fills, &attributable_fills)?;
     let epoch = AttributionEpochReplayEvidence::resolved(
         selector.clone(),
         receipt,
@@ -4052,8 +4062,8 @@ fn scope_verified_epoch_replay(
         verified.order_audit_tip_hash().to_owned(),
     );
     Ok(ScopedVerifiedEpochReplay {
+        verified_fills,
         fills: attributable_fills,
-        fees,
         epoch,
     })
 }
@@ -4290,12 +4300,8 @@ impl<'a> AttributionReplayRunner<'a> {
                     }
                 };
                 drop(conn);
-                let scoped = match scope_verified_epoch_replay(
-                    &admitted.epoch,
-                    receipt,
-                    &verified,
-                    self.fee_ledger.as_ref(),
-                ) {
+                let scoped = match scope_verified_epoch_replay(&admitted.epoch, receipt, &verified)
+                {
                     Ok(scoped) => scoped,
                     Err(error) => {
                         return Err(Box::new(PrepareFailure {
@@ -4305,11 +4311,27 @@ impl<'a> AttributionReplayRunner<'a> {
                         }));
                     }
                 };
-                summary.record_epoch_evidence(&scoped.epoch);
+                summary.record_scoped_epoch_replay(&scoped.epoch, &scoped.fills);
+                let fees = match validate_epoch_fee_ledger(
+                    self.fee_ledger.as_ref(),
+                    &scoped.verified_fills,
+                    &scoped.fills,
+                ) {
+                    Ok(fees) => fees,
+                    Err(error) => {
+                        let error = map_attribution_error(ReplayStage::TradeEvidence, error);
+                        summary.fee = FailureEvidenceState::Unavailable(error.failure_fingerprint);
+                        return Err(Box::new(PrepareFailure {
+                            error,
+                            invocation,
+                            evidence: summary,
+                        }));
+                    }
+                };
                 self.loader.load_verified_epoch_tail_with_progress(
                     &replay_request,
                     scoped.fills,
-                    scoped.fees,
+                    fees,
                     scoped.epoch,
                 )
             }
@@ -6544,6 +6566,290 @@ mod tests {
         assert_ne!(prepared.trade_manifest_hash(), exact.trade_manifest_hash());
         drop(runner);
         drop(session);
+        remove_database(path);
+    }
+
+    #[test]
+    fn epoch_fee_failure_preserves_scoped_progress_and_audits_trade_evidence() {
+        let (path, session, receipt) = activated_carry_epoch_database("epoch_fee_failure_progress");
+        append_epoch_source_fill(
+            &path,
+            3,
+            "buy",
+            12.0,
+            100,
+            "2026-08-24 01:31:05",
+            "2026-08-24T09:31:05+08:00",
+            "Momentum",
+        );
+        append_epoch_source_fill(
+            &path,
+            4,
+            "sell",
+            12.5,
+            200,
+            "2026-08-25 01:32:05",
+            "2026-08-25T09:32:05+08:00",
+            "ExitByRule",
+        );
+        append_epoch_source_fill(
+            &path,
+            5,
+            "buy",
+            20.0,
+            100,
+            "2026-08-25 02:00:05",
+            "2026-08-25T10:00:05+08:00",
+            "Breakout",
+        );
+        append_epoch_source_fill(
+            &path,
+            6,
+            "sell",
+            22.0,
+            100,
+            "2026-08-26 02:00:05",
+            "2026-08-26T10:00:05+08:00",
+            "ExitByRule",
+        );
+        let runner = AttributionReplayRunner::new_for_test_with_fee_ledger(
+            session.database(),
+            AttributionReplayLoader::new(&path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+            AuthoritativeFillFeeLedger {
+                entries: vec![fee(3, 90.0), fee(4, 90.0)],
+            },
+        );
+        let request = |selector| ReplayRequest {
+            mode: ReplayMode::Range {
+                from: date("2026-08-24"),
+                to: date("2026-08-26"),
+                invoked_at: shanghai_at("2026-08-26", 15, 30, 0),
+            },
+            epoch: selector,
+            benchmark_day_manifests: Vec::new(),
+        };
+        let expected_fee_fingerprint = runner_failure_leaf_fingerprint(
+            ReplayErrorClass::FailedIntegrity,
+            ReplayStage::TradeEvidence,
+            "fee_evidence_failed",
+            false,
+            b"fee evidence is missing attributable fill ids [5, 6]",
+            None,
+            None,
+        );
+        let mut selector_summaries = Vec::new();
+
+        for selector in [
+            AttributionEpochSelector::Active,
+            AttributionEpochSelector::Exact(receipt.epoch_id.clone()),
+        ] {
+            let admitted = admit_replay_request(request(selector.clone())).unwrap();
+            let mut summaries = BTreeSet::new();
+            for _ in 0..32 {
+                let failure = runner
+                    .prepare(&admitted)
+                    .expect_err("TEST_CODE incomplete attributable fees must fail preparation");
+                assert_eq!(failure.error.stage(), ReplayStage::TradeEvidence);
+                assert_eq!(failure.error.code(), "fee_evidence_failed");
+                assert_eq!(failure.error.failure_fingerprint, expected_fee_fingerprint);
+                assert_eq!(
+                    failure.evidence.epoch_id,
+                    FailureEvidenceState::Available(receipt.epoch_id.clone())
+                );
+                assert_eq!(
+                    failure.evidence.epoch_receipt,
+                    FailureEvidenceState::Available(receipt.receipt_hash.clone())
+                );
+                assert_eq!(
+                    failure.evidence.legacy_carry,
+                    FailureEvidenceState::Available(receipt.legacy_carry_manifest_hash.clone())
+                );
+                assert!(matches!(
+                    failure.evidence.exclusions,
+                    FailureEvidenceState::Available(_)
+                ));
+                assert_eq!(
+                    failure.evidence.remaining_quarantine,
+                    FailureEvidenceState::Available(canonical_legacy_carry_manifest_hash(&[]))
+                );
+                assert_eq!(
+                    failure.evidence.released_codes,
+                    FailureEvidenceState::Available("1".to_owned())
+                );
+                assert!(matches!(
+                    failure.evidence.trade,
+                    FailureEvidenceState::Available(_)
+                ));
+                assert_eq!(failure.evidence.stock_close, FailureEvidenceState::Unknown);
+                assert_eq!(
+                    failure.evidence.fee,
+                    FailureEvidenceState::Unavailable(expected_fee_fingerprint)
+                );
+                summaries.insert(failure.evidence.source_summary_hash(&failure.error));
+            }
+            assert_eq!(summaries.len(), 1);
+            let expected_summary = summaries.into_iter().next().unwrap();
+            let error = runner
+                .commit(request(selector))
+                .expect_err("TEST_CODE epoch fee failure must be audited");
+            assert_eq!(error.stage(), ReplayStage::TradeEvidence);
+            let failure_id = error.failure_receipt().unwrap().failure_audit_id;
+            let retained: (String, String, String) = Connection::open(&path)
+                .unwrap()
+                .query_row(
+                    "SELECT stage,code,source_summary_hash
+                     FROM attribution_failure_audit WHERE id=?1",
+                    [failure_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(retained.0, "trade_evidence");
+            assert_eq!(retained.1, "fee_evidence_failed");
+            assert_eq!(retained.2, expected_summary);
+            selector_summaries.push(expected_summary);
+        }
+        assert_ne!(selector_summaries[0], selector_summaries[1]);
+        drop(runner);
+        drop(session);
+        remove_database(path);
+    }
+
+    #[test]
+    fn epoch_duplicate_unknown_and_malformed_fees_fail_at_trade_evidence() {
+        let (path, session, _) = activated_epoch_database("epoch_fee_integrity_stage");
+        append_epoch_source_fill(
+            &path,
+            3,
+            "buy",
+            20.0,
+            100,
+            "2026-08-24 02:00:05",
+            "2026-08-24T10:00:05+08:00",
+            "Breakout",
+        );
+        append_epoch_source_fill(
+            &path,
+            4,
+            "sell",
+            22.0,
+            100,
+            "2026-08-25 02:00:05",
+            "2026-08-25T10:00:05+08:00",
+            "ExitByRule",
+        );
+        let mut malformed = fee(3, 1.0);
+        malformed.evidence_hash = "f".repeat(64);
+        let cases = [
+            (
+                "duplicate",
+                AuthoritativeFillFeeLedger {
+                    entries: vec![fee(3, 1.0), fee(3, 1.0), fee(4, 1.0)],
+                },
+            ),
+            (
+                "unknown",
+                AuthoritativeFillFeeLedger {
+                    entries: vec![fee(3, 1.0), fee(4, 1.0), fee(999, 1.0)],
+                },
+            ),
+            (
+                "malformed",
+                AuthoritativeFillFeeLedger {
+                    entries: vec![malformed, fee(4, 1.0)],
+                },
+            ),
+        ];
+
+        for (label, ledger) in cases {
+            let runner = AttributionReplayRunner::new_for_test_with_fee_ledger(
+                session.database(),
+                AttributionReplayLoader::new(&path),
+                "TEST_CODE_000300",
+                "TEST_CODE_MINUTE_END_LABEL",
+                ledger,
+            );
+            let error = runner
+                .preview(ReplayRequest {
+                    mode: ReplayMode::Range {
+                        from: date("2026-08-24"),
+                        to: date("2026-08-25"),
+                        invoked_at: shanghai_at("2026-08-25", 15, 30, 0),
+                    },
+                    epoch: AttributionEpochSelector::Active,
+                    benchmark_day_manifests: Vec::new(),
+                })
+                .unwrap_err();
+            assert_eq!(error.stage(), ReplayStage::TradeEvidence, "{label}");
+            assert_eq!(error.code(), "fee_evidence_failed", "{label}");
+        }
+        drop(session);
+        remove_database(path);
+    }
+
+    #[test]
+    fn legacy_multi_missing_fee_ids_have_one_canonical_failure_identity() {
+        let path = complete_database("legacy_multi_missing_fee_identity");
+        let manager = crate::database::attribution_reports::test_runner_database_manager(&path);
+        let runner = AttributionReplayRunner::new_for_test_with_fee_ledger(
+            &manager,
+            AttributionReplayLoader::new(&path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+            AuthoritativeFillFeeLedger {
+                entries: Vec::new(),
+            },
+        );
+        let request = || scheduled_request(shanghai_at("2026-08-21", 15, 30, 0), Vec::new());
+        let admitted = admit_replay_request(request()).unwrap();
+        let expected_fee_fingerprint = runner_failure_leaf_fingerprint(
+            ReplayErrorClass::FailedIntegrity,
+            ReplayStage::TradeEvidence,
+            "fee_evidence_failed",
+            false,
+            b"fee evidence is missing fill ids [1, 2]",
+            None,
+            None,
+        );
+        let mut summaries = BTreeSet::new();
+        for _ in 0..32 {
+            let failure = runner
+                .prepare(&admitted)
+                .expect_err("TEST_CODE multiple legacy fees are missing");
+            assert_eq!(failure.error.stage(), ReplayStage::TradeEvidence);
+            assert_eq!(failure.error.failure_fingerprint, expected_fee_fingerprint);
+            assert!(matches!(
+                failure.evidence.trade,
+                FailureEvidenceState::Available(_)
+            ));
+            assert!(matches!(
+                failure.evidence.stock_close,
+                FailureEvidenceState::Available(_)
+            ));
+            assert_eq!(
+                failure.evidence.fee,
+                FailureEvidenceState::Unavailable(expected_fee_fingerprint)
+            );
+            summaries.insert(failure.evidence.source_summary_hash(&failure.error));
+        }
+        assert_eq!(summaries.len(), 1);
+        let expected_summary = summaries.into_iter().next().unwrap();
+        let error = runner
+            .commit(request())
+            .expect_err("TEST_CODE canonical legacy fee failure must be audited");
+        let failure_id = error.failure_receipt().unwrap().failure_audit_id;
+        let retained: String = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT source_summary_hash FROM attribution_failure_audit WHERE id=?1",
+                [failure_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, expected_summary);
+        drop(runner);
+        drop(manager);
         remove_database(path);
     }
 
