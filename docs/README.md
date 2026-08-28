@@ -11,7 +11,6 @@
 
 | 文档 | 用途 |
 | --- | --- |
-| [`ENGINEERING_RULES_V2.md`](ENGINEERING_RULES_V2.md) | Gate A→D、证据、失败和回滚合同 |
 | [`business_rules.md`](business_rules.md) | 业务规则注册表 |
 | [`operations/2026-08-18-data-grpc-known-issues.md`](operations/2026-08-18-data-grpc-known-issues.md) | 数据源与 gRPC 故障活清单（证据、影响、状态、验收） |
 | [`superpowers/specs/2026-07-25-unified-data-final-cutover-design.md`](superpowers/specs/2026-07-25-unified-data-final-cutover-design.md) | 统一金融/新闻 Gateway 最终切换设计 |
@@ -51,7 +50,6 @@ Runtime TOML 由 monitor 启动时的 `src/config.rs::load_all()` 单次读取�
 
 | 文件 | 用途 |
 |---|---|
-| `ENGINEERING_RULES_V2.md` | 工程规则 v2 |
 | `business_rules.md` | 业务规则注册表 |
 | `业务规则清单-registry.md` | 业务规则中文清单 |
 | `crontab.example` | crontab 模板 |

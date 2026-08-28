@@ -1,6 +1,5 @@
 # Business Rules — registered decisions for logic involving dedup / mutex / filter / sort / limit
 
-> Per AGENTS.md §2.10: "Logic involving dedup / mutex / filter / sort / limit MUST be registered in docs/business_rules.md first."
 > Each BR has a stable ID (BR-NNN), a one-line intent, and a code pointer.
 > BR-192 supersession: for counted-delivery SQLite, immutable audit, and
 > push-log authorities, the physical-isolation amendment supersedes all prior

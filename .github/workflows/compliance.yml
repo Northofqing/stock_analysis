@@ -18,7 +18,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y sqlite3 python3
       # BR-252: hosted PR CI owns offline Gate C evidence, not production freshness.
-      - name: AGENTS.md Gate C 离线合规门禁
+      - name: 离线合规检查
         run: bash tools/compliance/check.sh --policy pr
       - name: 单元测试 + e2e
         # 修复 C-2 (2026-06-29 codex review): e2e_prediction_verify 是 R-1 critical 修复的回归门禁,

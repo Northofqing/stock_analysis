@@ -1,89 +1,157 @@
 # Stock Analysis
 
-面向 A 股的实时数据、新闻分析、持仓监控、受控推送与盘后复盘系统。
-生产运行采用“数据服务端 + monitor”双进程：服务端统一接入固定 revision
-的 Magic Market providers，monitor 只通过 gRPC 消费已验证数据，并将关键
-决策、投递回执和状态迁移写入不可变审计链。
+面向 A 股的实时数据接入、新闻分析、持仓监控、机会识别、受控推送和盘后复盘系统。
+项目以 Rust 编写，生产环境采用数据服务端与监控进程分离的双进程架构。
 
-> 这是实盘数据系统。任何缺失、过期、冲突或来源不明的数据都必须显式失败，
-> 不允许用 mock、默认值、代码前缀推断或静默降级冒充真实依据。开发与发布先读
-> [`AGENTS.md`](AGENTS.md) 和
-> [`docs/ENGINEERING_RULES_V2.md`](docs/ENGINEERING_RULES_V2.md)。
+## 主要能力
 
-## 当前状态
+- 统一接入行情、历史 K 线、公告、全球新闻、板块、资金流和研究数据。
+- 对持仓、自选股、新闻事件和市场状态进行持续监控。
+- 生成盘前、盘中、盘后及专题分析结果。
+- 通过持久化投递协调器处理去重、租约、投递结果和恢复。
+- 保存结构化事件、决策记录、投递回执与审计数据。
+- 提供龙虎榜、RSI、胜率模拟、策略归因、回填和数据探针等命令行工具。
 
-- 2026-08-19 的纠正版源码已通过 fresh Gate C：全仓格式化、严格全 feature
-  Clippy、全工作区测试和 compliance 均为零退出；release server、no-default
-  monitor 与认证 probe 也已重新构建。
-- 认证 probe 已分别在隔离端口和生产端口验证 exact `LimitPools`，五条必需的
-  非新闻路线全部通过；四条 GlobalNews 全部尝试并由两个独立 provider 达到
-  quorum，另外两条保留为显式 degraded，没有改标或补值。
-- 当前纠正版 `grpc_market_server` 与 `monitor` 已按受控顺序切换，分别独占
-  18082 listener 和生产投递 lease。发布状态仍是
-  **In Progress / Live Receipt Pending / Do Not Merge**：必须取得纠正版进程的
-  一条真实 provider-backed 业务投递、typed Feishu receipt 和 durable/audit
-  精确关联后，才可完成受控 Gate D、PR 和 `master` 合并。
-- 历史 P-01 盘前新闻热点取得过真实 Feishu Accepted receipt，并完成 durable
-  decision、BusinessDateOnce claim、sink result、immutable audit 与 JSONL
-  delivery audit 的精确关联；该证据只证明该次 P-01，不证明修复后候选版本或
-  opening release gate。
-- 纠正版 Gate C 证据只覆盖当前构建源码；后续若再改 Rust，必须重新运行完整
-  Gate C，不能沿用本次结果。
-- BR-202 正式 coverage authority 尚未实现；即使其他门重新通过，也只能由有时限
-  的受控例外覆盖这一项，不能表述为普通 Gate D 完成。详见
-  [`2026-08-19 release cutover controlled exception`](docs/operations/2026-08-19-release-cutover-controlled-exception.md)。
-- 实时持仓/现金仍要求 30 秒内的真实账户快照；旧截图或数据库历史记录不能满足
-  盘中账户 authority。其他活动问题见
-  [`gRPC known issues`](docs/operations/2026-08-18-data-grpc-known-issues.md)。
-
-## 架构
+## 系统架构
 
 ```text
 Magic Market providers / remote client-bundle
                     │
                     ▼
-          grpc_market_server (default features)
-                    │  typed gRPC + evidence
+          grpc_market_server
+          (provider host)
+                    │
+                    │ typed gRPC
                     ▼
-          monitor (--no-default-features)
-             │       │        │
-             │       │        └─ news / review / intraday producers
-             │       └─ data freshness and admission gates
-             └─ durable delivery coordinator
-                         │
-                         ├─ typed Feishu receipt
-                         ├─ SQLite decision/attempt/sink authority
-                         └─ retained hash-chained JSONL audit
+                 monitor
+        ┌───────────┼───────────┐
+        ▼           ▼           ▼
+     market       news       review
+    producers    producers   producers
+        └───────────┼───────────┘
+                    ▼
+       durable delivery coordinator
+                    │
+          ┌─────────┼─────────┐
+          ▼         ▼         ▼
+       Feishu    SQLite     JSONL audit
+       receipt   authority  hash chain
 ```
 
-主要边界：
+生产部署中：
 
-- `src/data_gateway/`：公共金融和新闻数据的统一准入、证据与新鲜度校验。
-- `src/grpc_server/`、`src/grpc_client/`：本地服务端、ExternalV1 与 LocalBridge 合同。
-- `src/bin/monitor/`：常驻调度、P-01、NewsFlash、NewsAI、盘中与复盘生产者。
-- `src/durable_delivery/`：计数型投递、去重、lease、恢复、typed receipt 与不可变状态。
-- `src/event/`：事件 envelope、投递审计和 retained hash chain。
-- `docs/business_rules.md`：去重、过滤、排序、限额和互斥规则的权威注册表。
+- `grpc_market_server` 使用默认 feature，承载固定 revision 的 Magic Market providers。
+- `monitor` 使用 `--no-default-features` 构建，只通过 gRPC 消费数据。
+- 两个进程使用同一个业务数据库，但职责和 provider 依赖相互隔离。
+
+## 代码结构
+
+| 路径 | 用途 |
+| --- | --- |
+| `src/data_gateway/` | 公共金融、行情和新闻数据的统一接入层 |
+| `src/grpc_server/` | 数据服务端实现 |
+| `src/grpc_client/` | monitor 使用的 gRPC 客户端 |
+| `src/bin/monitor/` | 常驻监控、推送、盘中任务和复盘任务 |
+| `src/portfolio/` | 持仓、交易和账户快照 |
+| `src/signal/` | 信号与信号集合 |
+| `src/opportunity/` | 新闻、产业链和候选机会发现 |
+| `src/review/` | 日度、周度和策略复盘 |
+| `src/decision/` | 排除、轮动和决策支持 |
+| `src/risk/` | 订单、资金和仓位风险逻辑 |
+| `src/durable_delivery/` | 持久化投递、去重、租约和恢复 |
+| `src/event/` | 事件 envelope、投递记录和审计链 |
+| `docs/` | 架构、历史版本、运行手册和业务文档 |
+
+## 环境要求
+
+- Rust stable toolchain
+- SQLite
+- C/C++ 构建工具链
+- Protocol Buffers 编译环境
+- 可访问 Cargo 与锁定 Git 依赖的网络环境
+- macOS/Linux；PAM 相关功能仅在 Unix 平台启用
+
+## 配置
+
+从示例文件开始配置本地环境：
+
+```bash
+cp .env.example .env
+```
+
+常用配置项：
+
+| 变量 | 用途 |
+| --- | --- |
+| `STOCK_LIST` | 逗号分隔的自选证券代码 |
+| `DATABASE_PATH` | 主业务数据库路径 |
+| `MONITOR_ENABLED` | 是否启用常驻 monitor |
+| `DATA_GATEWAY_GRPC` | monitor 是否通过 gRPC 数据通道运行 |
+| `GRPC_MARKET_ADDR` | 数据服务端地址，默认 `http://127.0.0.1:18082` |
+| `GRPC_MARKET_CLIENT_BUNDLE` | 客户端证书与连接配置目录 |
+
+运行时 TOML 输入为：
+
+- `config/strategy.toml`
+- `config/chain.toml`
+
+完整示例和注释见 [`.env.example`](.env.example)。
 
 ## 构建
 
-需要 Rust stable、SQLite、可用的 C/C++ 工具链，以及能解析锁定 Git 依赖的环境。
+构建默认命令行程序：
 
 ```bash
-# 数据 provider 宿主：默认 feature 包含 magic-gateway
-cargo build --release --bin grpc_market_server
+cargo build
+```
 
-# 生产 monitor 与认证探针：不链接 provider 实现，只走 gRPC
+构建生产数据服务端：
+
+```bash
+cargo build --release --bin grpc_market_server
+```
+
+构建不链接 provider 实现的生产 monitor 和认证探针：
+
+```bash
 cargo build --release --no-default-features \
   --bin monitor --bin grpc_bundle_probe
 ```
 
-禁止把 `monitor` 构建成默认 feature 后再声称完成生产数据隔离。
+## 本地运行
+
+运行默认程序：
+
+```bash
+cargo run --bin stock_analysis
+```
+
+运行隔离的 monitor 测试流程，不执行外部投递：
+
+```bash
+cargo run --no-default-features --bin monitor -- --test --push-dry-run
+```
+
+执行手动盘后复盘：
+
+```bash
+cargo run --no-default-features --bin monitor -- --review
+```
+
+常用检查：
+
+```bash
+cargo fmt --all -- --check
+cargo check --workspace --all-targets
+cargo test --lib
+```
 
 ## client-bundle
 
-`client-bundle/` 保存 mTLS CA、客户端证书/私钥、Bearer token、proto 与连接描述。
-它是本机私有运行资产，不是源码：
+`client-bundle/` 保存 mTLS CA、客户端证书、私钥、Bearer token、proto 和连接描述。
+它是本机私有运行资产，不属于源码，不应提交到 Git 或输出到日志。
+
+建议权限：
 
 ```bash
 chmod 700 client-bundle
@@ -93,18 +161,11 @@ chmod 600 client-bundle/bearer-token.txt \
   client-bundle/connection.txt
 ```
 
-- 不提交、复制到日志、终端回显或写入 README。
-- 证书、私钥、token 和 connection 必须由同一已授权 bundle 提供。
-- 更新 bundle 后先运行认证 probe；transport 成功不等于数据准入成功。
+## 生产启动
 
-## 生产启动顺序
+生产环境先启动数据服务端，再验证连接，最后启动唯一 monitor 实例。
 
-`.env` 至少应明确 `MONITOR_ENABLED=true`、`DATA_GATEWAY_GRPC=1`、
-`DATABASE_PATH` 和 `GRPC_MARKET_CLIENT_BUNDLE`。不要把账户或 token 值写进命令历史。
-
-1. 确认没有旧 monitor 持有
-   `data/locks/production/monitor-delivery.lock`，且 18082 没有旧 listener。
-2. 启动 default-feature `grpc_market_server`：
+1. 启动数据服务端：
 
    ```bash
    GRPC_MARKET_PORT=18082 \
@@ -112,7 +173,7 @@ chmod 600 client-bundle/bearer-token.txt \
    ./target/release/grpc_market_server
    ```
 
-3. 在启动 monitor 前执行认证 opening probe：
+2. 执行 client-bundle opening probe：
 
    ```bash
    GRPC_MARKET_ADDR=http://127.0.0.1:18082 \
@@ -120,7 +181,7 @@ chmod 600 client-bundle/bearer-token.txt \
      --bundle /absolute/path/to/client-bundle --opening
    ```
 
-4. 只有 probe exit 0 且输出 `opening_static_ready=true` 时才启动唯一 monitor：
+3. 启动 monitor：
 
    ```bash
    MONITOR_ENABLED=true \
@@ -131,57 +192,38 @@ chmod 600 client-bundle/bearer-token.txt \
    ./target/release/monitor
    ```
 
-5. 验收必须看到真实 provider-backed Accepted receipt 以及数据库/JSONL 精确关联。
-   listener、banner、普通日志或 transport handshake 都不能单独作为发布成功证据。
+生产环境应确保 18082 端口只有一个数据服务端监听，并且只有一个 monitor 持有投递租约。
+账户、证书、token、持仓列表和 webhook 等敏感值不要写入 README、命令历史或日志。
 
-生产切换、失败回滚和证据格式以
-[`controlled exception`](docs/operations/2026-08-19-release-cutover-controlled-exception.md)
-及后续正式 release runbook 为准。
+## 常用工具
 
-## 数据与安全红线
+| 命令 | 用途 |
+| --- | --- |
+| `cargo run --bin lhb_query` | 龙虎榜查询 |
+| `cargo run --bin rsi_optimize` | RSI 参数优化 |
+| `cargo run --bin winrate_simulator` | 胜率模拟 |
+| `cargo run --bin strategy_attribution` | 策略归因 |
+| `cargo run --bin backfill_daily` | 日线数据回填 |
+| `cargo run --bin grpc_local_readiness_probe` | 本地 gRPC readiness 检查 |
+| `cargo run --bin gateway_quote_probe` | 行情网关探针 |
 
-- 实时行情最多 5 秒；持仓/现金最多 30 秒；净值必须同交易日；日线最多落后 1 个交易日。
-- 价格必须为正；时间序列 gap/duplicate、证据冲突或批次不完整均显式失败。
-- 涨跌停和订单价格范围只能使用同标的、同交易日、来源明确的上下限或显式
-  `NoLimit`；禁止按代码、板块、ST 名称或默认百分比推断。
-- `TEST_CODE` 只能进入测试环境；生产必须拒绝，测试环境也必须拒绝真实证券订单。
-- 订单还必须满足现金、100 股整数倍、单笔 100 万元上限、60 秒幂等，以及
-  50 万元以上二次确认。
-- 所有关键数据流、订单和权威投递保留来源、时间、决策依据与至少五年的防篡改审计。
+更多可执行程序见 `src/bin/`。
 
-完整规则见 [`AGENTS.md`](AGENTS.md)。
+## 文档
 
-## 开发与验证
+- [文档总索引](docs/README.md)
+- [业务规则注册表](docs/business_rules.md)
+- [数据源清单](docs/data-sources-inventory.md)
+- [gRPC 已知问题](docs/operations/2026-08-18-data-grpc-known-issues.md)
+- [Agent 规则退役说明](RULES_RETIREMENT.md)
 
-每项修改按 Gate A → B → C → D 推进。涉及去重、mutex、过滤、排序或限额时，
-必须先登记 [`docs/business_rules.md`](docs/business_rules.md) 中的 BR 编号。
+## 仓库级 Agent 指令
 
-```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets --all-features -- --test-threads=1
-bash tools/compliance/check.sh
-```
-
-数据新鲜度失败时运行官方回填入口，然后重新执行 compliance：
-
-```bash
-bash tools/one_shot/backfill_daily.sh
-```
-
-任务只有在测试、失败路径、审计证据和合规检查全部满足后才是 Done；否则必须标记
-为 In Progress 或 Blocked。当前 BR-202 coverage authority 缺口仍属于发布后续项。
-
-## 文档入口
-
-- [`docs/README.md`](docs/README.md)：文档索引与版本演进。
-- [`docs/business_rules.md`](docs/business_rules.md)：业务规则注册表。
-- [`docs/data-sources-inventory.md`](docs/data-sources-inventory.md)：数据源与能力清单。
-- [`docs/operations/2026-08-18-data-grpc-known-issues.md`](docs/operations/2026-08-18-data-grpc-known-issues.md)：当前数据/gRPC 问题。
-- [`docs/superpowers/specs/2026-08-17-client-bundle-opening-readiness-design.md`](docs/superpowers/specs/2026-08-17-client-bundle-opening-readiness-design.md)：client-bundle 与 opening readiness 设计。
+仓库不再提供 `AGENTS.md`、工程规则伴随文件或 Copilot 项目指令。
+[`CLAUDE.md`](CLAUDE.md) 只保留项目命令、架构和配置事实，不定义额外开发流程。
+历史文档中出现的旧规则名称仅用于记录当时背景。
 
 ## 许可证与责任
 
-本仓库当前未声明开源许可证。它包含真实交易系统逻辑，仅供已授权环境使用；任何
-自动交易、实盘推送或账户接入都必须由操作员独立审查并遵守适用法律、券商规则和
-仓库安全门禁。
+本仓库当前未声明开源许可证，仅供已授权环境使用。自动交易、实盘推送和账户接入
+涉及真实资金与外部系统，使用者应独立评估风险并遵守适用法律、券商和平台要求。
