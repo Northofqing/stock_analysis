@@ -6,9 +6,19 @@
 //! 归因口径: 已实现 (FIFO 带 lot 归属) + 未实现浮盈 (未平仓 lot × 收盘价).
 
 use chrono::NaiveDate;
-use diesel::RunQueryDsl;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+use crate::database::attribution_epochs::{
+    AttributionEpochDailyBatchAppend, AttributionEpochDailyFamilyAppend,
+    AttributionEpochDailySourceBinding, AttributionEpochStore, AttributionEpochStoreError,
+};
+use crate::database::DatabaseManager;
+use crate::performance::attribution_epoch::{
+    canonical_exclusion_manifest_hash, canonical_legacy_carry_manifest_hash,
+    canonical_scoped_fill_manifest_hash, scope_epoch_fills, AttributionEpochSelector,
+    EpochExclusion, LegacyCarryPosition,
+};
 
 /// 入场信号族 (归因维度). spec §4.1.
 /// Ord 派生供 Task 3 的 BTreeMap 聚合排序使用.
@@ -133,7 +143,7 @@ pub struct AttributionFillRow {
 }
 
 /// 已实现交易归因 — 每笔卖出按匹配到的入场 lot 拆分归属.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TradeAttribution {
     pub sell_id: i64,
     pub code: String,
@@ -161,7 +171,7 @@ pub struct OpenLot {
 /// (id>0, code 非空, price>0 finite, qty>0 且 %100==0, 时间序校验, oversell 拒绝,
 /// 非 finite PnL 拒绝), 区别: 匹配时携带入场 lot 的 plan_id/family/suspicious 归属.
 /// 跨 lot 匹配时 PnL 按数量比例拆分 (每段生成一条 TradeAttribution).
-/// 发射谓词 = 仅当日卖出 (fifo_match_from 的 emit_from=None 特例, compute_daily 语义).
+/// 发射谓词 = 仅当日卖出 (fifo_match_from 的 emit_from=None 特例, epoch daily 语义).
 /// 返回 (当日已实现归因列表, 未平仓 lot 列表).
 pub fn fifo_match(
     rows: &[AttributionFillRow],
@@ -173,8 +183,8 @@ pub fn fifo_match(
 /// FIFO 匹配核心 (发射谓词参数化, CRIT-1 修复):
 /// - `emit_from = None`    → 仅发射 `timestamp.date() == target_date` 的卖出
 ///   (与旧 fifo_match 行为逐字节一致; fifo_match 2-arg wrapper 保持公开 API 稳定,
-///   compute_daily 与既有日级测试不受影响).
-/// - `emit_from = Some(d)` → 发射 `timestamp.date() >= d` 的全部卖出 (compute_window
+///   epoch daily 与既有日级测试不受影响).
+/// - `emit_from = Some(d)` → 发射 `timestamp.date() >= d` 的全部卖出 (epoch window
 ///   30 天窗口语义; FIFO 匹配仍对全部 rows 执行 — 窗口前买入照常被窗口卖出消耗).
 ///
 /// 校验 (身份/时间戳/越界/无序/oversell 等) 与 emit_from 无关, 全部 rows 一视同仁.
@@ -318,7 +328,7 @@ pub fn fifo_match_from(
 }
 
 /// 单族聚合 (spec §4.2).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FamilyAggregate {
     pub family: SignalFamily,
     pub realized_trades: i64,
@@ -336,7 +346,7 @@ pub struct FamilyAggregate {
     pub suspicious_pnl: f64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DailyAttribution {
     pub date: NaiveDate,
     pub families: Vec<FamilyAggregate>,
@@ -349,6 +359,416 @@ pub struct WindowAttribution {
     pub days: u32,
     pub end: NaiveDate,
     pub families: Vec<FamilyAggregate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AttributionEpochDailyEvidence {
+    pub selector: AttributionEpochSelector,
+    pub epoch_id: String,
+    pub receipt_hash: String,
+    pub effective_date: NaiveDate,
+    pub cutoff_date: NaiveDate,
+    pub paper_trade_high_water: i64,
+    pub order_audit_high_water: i64,
+    pub legacy_carry_manifest_hash: String,
+    pub exclusion_manifest_hash: String,
+    pub scoped_fill_manifest_hash: String,
+    pub verified_filled_manifest_hash: String,
+    pub verified_terminal_binding_manifest_hash: String,
+    pub verified_order_audit_tip_hash: String,
+    pub exclusions: Vec<EpochExclusion>,
+    pub remaining_quarantine: Vec<LegacyCarryPosition>,
+    pub released_codes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EpochDailyAttribution {
+    daily: DailyAttribution,
+    epoch: AttributionEpochDailyEvidence,
+}
+
+impl EpochDailyAttribution {
+    pub fn daily(&self) -> &DailyAttribution {
+        &self.daily
+    }
+
+    pub fn epoch(&self) -> &AttributionEpochDailyEvidence {
+        &self.epoch
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EpochWindowAttribution {
+    window: WindowAttribution,
+    epoch: AttributionEpochDailyEvidence,
+}
+
+impl EpochWindowAttribution {
+    pub fn window(&self) -> &WindowAttribution {
+        &self.window
+    }
+
+    pub fn epoch(&self) -> &AttributionEpochDailyEvidence {
+        &self.epoch
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributionEpochDailyFamilyReceipt {
+    pub epoch_daily_id: i64,
+    pub signal_family: String,
+    pub revision: u64,
+    pub payload_hash: String,
+    pub record_hash: String,
+    pub created_at: String,
+    pub retention_deadline: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributionEpochDailyReceipt {
+    pub epoch_id: String,
+    pub date: NaiveDate,
+    pub receipts: Vec<AttributionEpochDailyFamilyReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttributionEpochRuntimeError {
+    Unavailable {
+        reason_code: &'static str,
+        retryable: bool,
+        detail: String,
+    },
+    FailedIntegrity {
+        reason_code: &'static str,
+        detail: String,
+    },
+}
+
+impl AttributionEpochRuntimeError {
+    pub fn reason_code(&self) -> &'static str {
+        match self {
+            Self::Unavailable { reason_code, .. } | Self::FailedIntegrity { reason_code, .. } => {
+                reason_code
+            }
+        }
+    }
+
+    pub fn retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Unavailable {
+                retryable: true,
+                ..
+            }
+        )
+    }
+}
+
+impl std::fmt::Display for AttributionEpochRuntimeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable {
+                reason_code,
+                retryable,
+                detail,
+            } => write!(
+                formatter,
+                "{reason_code} (unavailable, retryable={retryable}): {detail}"
+            ),
+            Self::FailedIntegrity {
+                reason_code,
+                detail,
+            } => write!(formatter, "{reason_code} (failed_integrity): {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for AttributionEpochRuntimeError {}
+
+impl From<AttributionEpochStoreError> for AttributionEpochRuntimeError {
+    fn from(error: AttributionEpochStoreError) -> Self {
+        match error {
+            AttributionEpochStoreError::Unavailable {
+                reason_code,
+                retryable,
+                detail,
+            } => Self::Unavailable {
+                reason_code,
+                retryable,
+                detail,
+            },
+            AttributionEpochStoreError::FailedIntegrity {
+                reason_code,
+                detail,
+            } => Self::FailedIntegrity {
+                reason_code,
+                detail,
+            },
+        }
+    }
+}
+
+pub fn compute_epoch_daily(
+    database: &DatabaseManager,
+    date: NaiveDate,
+    prices: &HashMap<String, f64>,
+) -> Result<EpochDailyAttribution, AttributionEpochRuntimeError> {
+    let (rows, epoch) = load_scoped_epoch_rows(database, date, date)?;
+    let (attributions, open) = fifo_match(&rows, date).map_err(|detail| {
+        runtime_integrity(
+            "attribution_epoch_aggregation_failed",
+            format!("BR-255 daily attribution aggregation: {detail}"),
+        )
+    })?;
+    let top_trades = top_trades(&attributions);
+    let families = aggregate_families(&attributions, &open, prices);
+    Ok(EpochDailyAttribution {
+        daily: DailyAttribution {
+            date,
+            families,
+            top_trades,
+        },
+        epoch,
+    })
+}
+
+pub fn compute_epoch_window(
+    database: &DatabaseManager,
+    end: NaiveDate,
+    days: u32,
+    prices: &HashMap<String, f64>,
+) -> Result<EpochWindowAttribution, AttributionEpochRuntimeError> {
+    if days == 0 {
+        return Err(runtime_integrity(
+            "attribution_epoch_window_invalid",
+            "BR-255 epoch attribution window must contain at least one day",
+        ));
+    }
+    let start = end
+        .checked_sub_signed(chrono::Duration::days(i64::from(days) - 1))
+        .ok_or_else(|| {
+            runtime_integrity(
+                "attribution_epoch_window_invalid",
+                "BR-255 epoch attribution window underflowed the supported date range",
+            )
+        })?;
+    let (rows, epoch) = load_scoped_epoch_rows(database, start, end)?;
+    let window = aggregate_window(end, days, &rows, prices).map_err(|detail| {
+        runtime_integrity(
+            "attribution_epoch_aggregation_failed",
+            format!("BR-255 window attribution aggregation: {detail}"),
+        )
+    })?;
+    Ok(EpochWindowAttribution { window, epoch })
+}
+
+pub fn persist_epoch_daily(
+    database: &DatabaseManager,
+    daily: &EpochDailyAttribution,
+) -> Result<AttributionEpochDailyReceipt, AttributionEpochRuntimeError> {
+    if daily.epoch.selector != AttributionEpochSelector::Active
+        || daily.daily.date != daily.epoch.cutoff_date
+        || daily.daily.date < daily.epoch.effective_date
+    {
+        return Err(runtime_integrity(
+            "attribution_epoch_daily_binding_invalid",
+            "BR-255 daily attribution is not bound to its active epoch cutoff",
+        ));
+    }
+
+    #[derive(Serialize)]
+    struct DailyFamilyPayload<'a> {
+        schema_version: &'static str,
+        date: NaiveDate,
+        epoch: &'a AttributionEpochDailyEvidence,
+        family: Option<&'a FamilyAggregate>,
+        top_trades: Vec<&'a TradeAttribution>,
+    }
+
+    let mut families = Vec::with_capacity(daily.daily.families.len().max(1));
+    if daily.daily.families.is_empty() {
+        let payload = serde_json::to_value(DailyFamilyPayload {
+            schema_version: "BR-255_ATTRIBUTION_EPOCH_DAILY_V1",
+            date: daily.daily.date,
+            epoch: &daily.epoch,
+            family: None,
+            top_trades: daily.daily.top_trades.iter().collect(),
+        })
+        .map_err(|error| {
+            runtime_integrity(
+                "attribution_epoch_daily_serialization_failed",
+                format!("BR-255 serialize empty daily attribution: {error}"),
+            )
+        })?;
+        families.push(AttributionEpochDailyFamilyAppend {
+            signal_family: "all".to_owned(),
+            payload,
+        });
+    } else {
+        for family in &daily.daily.families {
+            let payload = serde_json::to_value(DailyFamilyPayload {
+                schema_version: "BR-255_ATTRIBUTION_EPOCH_DAILY_V1",
+                date: daily.daily.date,
+                epoch: &daily.epoch,
+                family: Some(family),
+                top_trades: daily
+                    .daily
+                    .top_trades
+                    .iter()
+                    .filter(|trade| trade.entry_family == family.family)
+                    .collect(),
+            })
+            .map_err(|error| {
+                runtime_integrity(
+                    "attribution_epoch_daily_serialization_failed",
+                    format!(
+                        "BR-255 serialize {} daily attribution: {error}",
+                        family.family.as_str()
+                    ),
+                )
+            })?;
+            families.push(AttributionEpochDailyFamilyAppend {
+                signal_family: family.family.as_str().to_owned(),
+                payload,
+            });
+        }
+    }
+
+    let stored = AttributionEpochStore::new(database)
+        .append_verified_daily_batch(
+            AttributionEpochDailyBatchAppend {
+                epoch_id: daily.epoch.epoch_id.clone(),
+                date: daily.daily.date,
+                families,
+            },
+            AttributionEpochDailySourceBinding {
+                epoch_id: daily.epoch.epoch_id.clone(),
+                receipt_hash: daily.epoch.receipt_hash.clone(),
+                effective_date: daily.epoch.effective_date,
+                cutoff_date: daily.epoch.cutoff_date,
+                paper_trade_high_water: daily.epoch.paper_trade_high_water,
+                order_audit_high_water: daily.epoch.order_audit_high_water,
+                legacy_carry_manifest_hash: daily.epoch.legacy_carry_manifest_hash.clone(),
+                verified_filled_manifest_hash: daily.epoch.verified_filled_manifest_hash.clone(),
+                verified_terminal_binding_manifest_hash: daily
+                    .epoch
+                    .verified_terminal_binding_manifest_hash
+                    .clone(),
+                verified_order_audit_tip_hash: daily.epoch.verified_order_audit_tip_hash.clone(),
+                exclusion_manifest_hash: daily.epoch.exclusion_manifest_hash.clone(),
+                scoped_fill_manifest_hash: daily.epoch.scoped_fill_manifest_hash.clone(),
+                remaining_quarantine_manifest_hash: canonical_legacy_carry_manifest_hash(
+                    &daily.epoch.remaining_quarantine,
+                ),
+                released_codes: daily.epoch.released_codes,
+            },
+        )
+        .map_err(AttributionEpochRuntimeError::from)?;
+    Ok(AttributionEpochDailyReceipt {
+        epoch_id: stored.epoch_id,
+        date: stored.date,
+        receipts: stored
+            .receipts
+            .into_iter()
+            .map(|receipt| AttributionEpochDailyFamilyReceipt {
+                epoch_daily_id: receipt.epoch_daily_id,
+                signal_family: receipt.signal_family,
+                revision: receipt.revision,
+                payload_hash: receipt.payload_hash,
+                record_hash: receipt.record_hash,
+                created_at: receipt.created_at,
+                retention_deadline: receipt.retention_deadline,
+            })
+            .collect(),
+    })
+}
+
+fn load_scoped_epoch_rows(
+    database: &DatabaseManager,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Result<(Vec<AttributionFillRow>, AttributionEpochDailyEvidence), AttributionEpochRuntimeError>
+{
+    let (receipt, verified) = AttributionEpochStore::new(database)
+        .load_active_verified_fills_until(from, to)
+        .map_err(AttributionEpochRuntimeError::from)?;
+    let source_rows = verified
+        .fills()
+        .iter()
+        .map(|fill| fill.fill().clone())
+        .collect::<Vec<_>>();
+    let scoped = scope_epoch_fills(
+        &source_rows,
+        receipt.effective_trading_date,
+        verified.carry(),
+    )
+    .map_err(|detail| {
+        runtime_integrity(
+            "attribution_epoch_scope_failed",
+            format!("BR-255 daily attribution fill scoping: {detail}"),
+        )
+    })?;
+    let exclusion_manifest_hash =
+        canonical_exclusion_manifest_hash(&scoped.exclusions, &source_rows).map_err(|detail| {
+            runtime_integrity(
+                "attribution_epoch_scope_failed",
+                format!("BR-255 daily attribution exclusion manifest: {detail}"),
+            )
+        })?;
+    let scoped_fill_manifest_hash = canonical_scoped_fill_manifest_hash(&scoped.attributable)
+        .map_err(|detail| {
+            runtime_integrity(
+                "attribution_epoch_scope_failed",
+                format!("BR-255 daily attribution scoped manifest: {detail}"),
+            )
+        })?;
+    let rows = scoped
+        .attributable
+        .iter()
+        .map(|fill| AttributionFillRow {
+            id: fill.id,
+            code: fill.code.clone(),
+            direction: fill.direction.clone(),
+            fill_price: fill.fill_price,
+            quantity: fill.quantity,
+            local_ts: fill.occurred_at.clone(),
+            plan_id: fill.plan_id.clone(),
+            virtual_reason: fill.virtual_reason.clone(),
+        })
+        .collect();
+    Ok((
+        rows,
+        AttributionEpochDailyEvidence {
+            selector: AttributionEpochSelector::Active,
+            epoch_id: receipt.epoch_id,
+            receipt_hash: receipt.receipt_hash,
+            effective_date: receipt.effective_trading_date,
+            cutoff_date: to,
+            paper_trade_high_water: receipt.paper_trade_high_water,
+            order_audit_high_water: receipt.order_audit_high_water,
+            legacy_carry_manifest_hash: receipt.legacy_carry_manifest_hash,
+            exclusion_manifest_hash,
+            scoped_fill_manifest_hash,
+            verified_filled_manifest_hash: verified.filled_manifest_hash().to_owned(),
+            verified_terminal_binding_manifest_hash: verified
+                .terminal_binding_manifest_hash()
+                .to_owned(),
+            verified_order_audit_tip_hash: verified.order_audit_tip_hash().to_owned(),
+            exclusions: scoped.exclusions,
+            remaining_quarantine: scoped.remaining_quarantine,
+            released_codes: scoped.released_codes,
+        },
+    ))
+}
+
+fn runtime_integrity(
+    reason_code: &'static str,
+    detail: impl Into<String>,
+) -> AttributionEpochRuntimeError {
+    AttributionEpochRuntimeError::FailedIntegrity {
+        reason_code,
+        detail: detail.into(),
+    }
 }
 
 /// 聚合: 已实现 (卖出归因) + 未实现浮盈 (未平仓 lot × close).
@@ -424,24 +844,6 @@ pub fn aggregate_families(
     families
 }
 
-const FILLS_UNTIL_SQL: &str = "SELECT id, code, direction, fill_price, quantity, \
-     datetime(ts, 'localtime') AS local_ts, plan_id, virtual_reason \
-     FROM paper_trades \
-     WHERE datetime(ts, 'localtime') < datetime(?, '+1 day') AND status = 'Filled' \
-     ORDER BY datetime(ts, 'localtime') ASC, id ASC";
-
-/// 查询截至日期 (含) 的全部 Filled 成交 (与 snapshot.rs 查询同构, 多带 plan_id/virtual_reason).
-pub fn query_fills_until(date: NaiveDate) -> Result<Vec<AttributionFillRow>, String> {
-    let mut conn = crate::database::DatabaseManager::get()
-        .get_conn()
-        .map_err(|e| format!("DB: {e}"))?;
-    let date_str = date.format("%Y-%m-%d").to_string();
-    diesel::sql_query(FILLS_UNTIL_SQL)
-        .bind::<diesel::sql_types::Text, _>(&date_str)
-        .load::<AttributionFillRow>(&mut conn)
-        .map_err(|e| format!("query paper_trades attribution: {e}"))
-}
-
 /// Top 盈亏交易明细 (spec §4.4 item 5, 当日): 盈利 (pnl>0) 按 pnl 降序 ≤5 在前,
 /// 亏损 (pnl<0) 按 pnl 升序 (最负在前) ≤5 在后; pnl==0 不入列.
 fn top_trades(attributions: &[TradeAttribution]) -> Vec<TradeAttribution> {
@@ -460,33 +862,6 @@ fn top_trades(attributions: &[TradeAttribution]) -> Vec<TradeAttribution> {
     winners.truncate(5);
     losers.truncate(5);
     winners.into_iter().chain(losers).cloned().collect()
-}
-
-/// 当日归因: 已实现 (当日卖出 FIFO 全局匹配) + 浮盈 (截至当日未平仓 × close).
-pub fn compute_daily(
-    date: NaiveDate,
-    prices: &HashMap<String, f64>,
-) -> Result<DailyAttribution, String> {
-    let rows = query_fills_until(date)?;
-    let (attributions, open) = fifo_match(&rows, date)?;
-    let top_trades = top_trades(&attributions);
-    let families = aggregate_families(&attributions, &open, prices);
-    Ok(DailyAttribution {
-        date,
-        families,
-        top_trades,
-    })
-}
-
-/// 30 天滚动窗口 (spec §4.5): 已实现 = 窗口内每日卖出 FIFO 全局匹配 (对历史全部 lot),
-/// 浮盈 = 期末未平仓 × close. 窗口 = end−(days−1) ..= end 共 days 个自然日.
-pub fn compute_window(
-    end: NaiveDate,
-    days: u32,
-    prices: &HashMap<String, f64>,
-) -> Result<WindowAttribution, String> {
-    let rows = query_fills_until(end)?;
-    aggregate_window(end, days, &rows, prices)
 }
 
 /// 窗口聚合纯函数 (不触 DB, 供单测直测): start = end − (days−1) 天 (含首尾共 days 个
@@ -508,69 +883,6 @@ pub fn aggregate_window(
         end,
         families,
     })
-}
-
-/// 建表 DDL (spec §4.3). const 供单测文本断言 (Step 1 测试依赖此 const).
-const DDL_SQL: &str = "CREATE TABLE IF NOT EXISTS paper_attribution_daily (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            date            TEXT NOT NULL,
-            signal_family   TEXT NOT NULL,
-            realized_trades INTEGER NOT NULL DEFAULT 0,
-            realized_pnl    REAL NOT NULL DEFAULT 0.0,
-            open_lots       INTEGER NOT NULL DEFAULT 0,
-            unrealized_pnl  REAL NOT NULL DEFAULT 0.0,
-            total_pnl       REAL NOT NULL DEFAULT 0.0,
-            wins            INTEGER NOT NULL DEFAULT 0,
-            losses          INTEGER NOT NULL DEFAULT 0,
-            win_rate        REAL,
-            unvalued_lots   INTEGER NOT NULL DEFAULT 0,
-            suspicious_lots INTEGER NOT NULL DEFAULT 0,
-            created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(date, signal_family)
-        )";
-
-/// 插入 SQL. const 供单测文本断言 (Step 1 测试依赖此 const).
-const PERSIST_SQL: &str = "INSERT OR REPLACE INTO paper_attribution_daily \
-             (date, signal_family, realized_trades, realized_pnl, open_lots, unrealized_pnl, \
-              total_pnl, wins, losses, win_rate, unvalued_lots, suspicious_lots) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-
-/// 建表 (spec §4.3 DDL). 幂等, 与 paper_performance_snapshot 并行, 不 UPDATE 历史行.
-pub fn ensure_attribution_table() -> Result<(), String> {
-    let mut conn = crate::database::DatabaseManager::get()
-        .get_conn()
-        .map_err(|e| format!("DB: {e}"))?;
-    diesel::sql_query(DDL_SQL)
-        .execute(&mut conn)
-        .map_err(|e| format!("create paper_attribution_daily: {e}"))?;
-    Ok(())
-}
-
-/// 写入当日归因 (INSERT OR REPLACE, 当日重算幂等).
-pub fn persist_daily(daily: &DailyAttribution) -> Result<(), String> {
-    ensure_attribution_table()?;
-    let mut conn = crate::database::DatabaseManager::get()
-        .get_conn()
-        .map_err(|e| format!("DB: {e}"))?;
-    let date_str = daily.date.format("%Y-%m-%d").to_string();
-    for row in &daily.families {
-        diesel::sql_query(PERSIST_SQL)
-            .bind::<diesel::sql_types::Text, _>(&date_str)
-            .bind::<diesel::sql_types::Text, _>(row.family.as_str())
-            .bind::<diesel::sql_types::BigInt, _>(row.realized_trades)
-            .bind::<diesel::sql_types::Double, _>(row.realized_pnl)
-            .bind::<diesel::sql_types::BigInt, _>(row.open_lots)
-            .bind::<diesel::sql_types::Double, _>(row.unrealized_pnl)
-            .bind::<diesel::sql_types::Double, _>(row.total_pnl)
-            .bind::<diesel::sql_types::BigInt, _>(row.wins)
-            .bind::<diesel::sql_types::BigInt, _>(row.losses)
-            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(row.win_rate)
-            .bind::<diesel::sql_types::BigInt, _>(row.unvalued_lots)
-            .bind::<diesel::sql_types::BigInt, _>(row.suspicious_lots)
-            .execute(&mut conn)
-            .map_err(|e| format!("insert paper_attribution_daily: {e}"))?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1239,31 +1551,5 @@ mod tests {
             .find(|f| f.family == SignalFamily::PostCloseFundInflow)
             .expect("fund family");
         assert_eq!(fund.suspicious_lots, 1);
-    }
-
-    #[test]
-    fn ddl_const_declares_unique_per_date_and_family() {
-        // 当日重算幂等锚点 (spec §4.3): UNIQUE(date, signal_family) + INSERT OR REPLACE
-        assert!(DDL_SQL.contains("CREATE TABLE IF NOT EXISTS paper_attribution_daily"));
-        assert!(DDL_SQL.contains("UNIQUE(date, signal_family)"));
-        assert!(DDL_SQL.contains("unvalued_lots"));
-        assert!(DDL_SQL.contains("suspicious_lots"));
-    }
-
-    #[test]
-    fn persist_const_has_12_bind_slots_matching_12_columns() {
-        // INSERT OR REPLACE (当日幂等, 与 snapshot 同模式) + 12 列 ↔ 12 个绑定占位
-        assert!(PERSIST_SQL.contains("INSERT OR REPLACE INTO paper_attribution_daily"));
-        let cols = PERSIST_SQL
-            .split('(')
-            .nth(2)
-            .expect("column list")
-            .split(',')
-            .count();
-        let binds = PERSIST_SQL.matches('?').count();
-        assert_eq!(
-            cols, binds,
-            "columns ({cols}) must equal bind slots ({binds})"
-        );
     }
 }

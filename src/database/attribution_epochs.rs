@@ -20,7 +20,8 @@ use crate::database::order_audit::{
     AUDIT_CHAIN_GENESIS,
 };
 use crate::performance::attribution_epoch::{
-    build_legacy_carry, canonical_legacy_carry_manifest_hash, AttributionEpochSelector,
+    build_legacy_carry, canonical_exclusion_manifest_hash, canonical_legacy_carry_manifest_hash,
+    canonical_scoped_fill_manifest_hash, scope_epoch_fills, AttributionEpochSelector,
     EpochActivationSource, LegacyCarryPosition,
 };
 use crate::performance::economic_position::EconomicFillRow;
@@ -365,14 +366,54 @@ pub(crate) struct AttributionEpochDailyAppend {
     pub(crate) payload: serde_json::Value,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct AttributionEpochDailyFamilyAppend {
+    pub(crate) signal_family: String,
+    pub(crate) payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AttributionEpochDailyBatchAppend {
+    pub(crate) epoch_id: String,
+    pub(crate) date: NaiveDate,
+    pub(crate) families: Vec<AttributionEpochDailyFamilyAppend>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AttributionEpochDailySourceBinding {
+    pub(crate) epoch_id: String,
+    pub(crate) receipt_hash: String,
+    pub(crate) effective_date: NaiveDate,
+    pub(crate) cutoff_date: NaiveDate,
+    pub(crate) paper_trade_high_water: i64,
+    pub(crate) order_audit_high_water: i64,
+    pub(crate) legacy_carry_manifest_hash: String,
+    pub(crate) verified_filled_manifest_hash: String,
+    pub(crate) verified_terminal_binding_manifest_hash: String,
+    pub(crate) verified_order_audit_tip_hash: String,
+    pub(crate) exclusion_manifest_hash: String,
+    pub(crate) scoped_fill_manifest_hash: String,
+    pub(crate) remaining_quarantine_manifest_hash: String,
+    pub(crate) released_codes: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)] // Returned by the Task 7 daily persistence seam.
 pub(crate) struct AttributionEpochDailyReceipt {
     pub(crate) epoch_daily_id: i64,
+    pub(crate) signal_family: String,
+    pub(crate) revision: u64,
     pub(crate) payload_hash: String,
     pub(crate) record_hash: String,
     pub(crate) created_at: String,
     pub(crate) retention_deadline: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AttributionEpochDailyBatchReceipt {
+    pub(crate) epoch_id: String,
+    pub(crate) date: NaiveDate,
+    pub(crate) receipts: Vec<AttributionEpochDailyReceipt>,
 }
 
 pub struct AttributionEpochStore<'a> {
@@ -1482,6 +1523,102 @@ fn validate_daily(conn: &mut SqliteConnection) -> diesel::QueryResult<Vec<Persis
     Ok(rows)
 }
 
+fn daily_receipt(
+    state: &[PersistedDaily],
+    row: &PersistedDaily,
+) -> diesel::QueryResult<AttributionEpochDailyReceipt> {
+    let revision = state
+        .iter()
+        .filter(|candidate| {
+            candidate.id <= row.id
+                && candidate.epoch_id == row.epoch_id
+                && candidate.date == row.date
+                && candidate.signal_family == row.signal_family
+        })
+        .count();
+    Ok(AttributionEpochDailyReceipt {
+        epoch_daily_id: row.id,
+        signal_family: row.signal_family.clone(),
+        revision: u64::try_from(revision)
+            .map_err(|_| integrity("BR-255 epoch daily revision overflow"))?,
+        payload_hash: row.payload_hash.clone(),
+        record_hash: row.record_hash.clone(),
+        created_at: row.created_at.clone(),
+        retention_deadline: row.retention_deadline.clone(),
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static DAILY_BATCH_FAILURE_AFTER: std::cell::Cell<Option<usize>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+struct DailyBatchFailureInjection;
+
+#[cfg(test)]
+impl Drop for DailyBatchFailureInjection {
+    fn drop(&mut self) {
+        DAILY_BATCH_FAILURE_AFTER.set(None);
+    }
+}
+
+#[cfg(test)]
+fn inject_daily_batch_failure_after(writes: usize) -> DailyBatchFailureInjection {
+    DAILY_BATCH_FAILURE_AFTER.set(Some(writes));
+    DailyBatchFailureInjection
+}
+
+#[cfg(test)]
+fn maybe_inject_daily_batch_failure(completed_writes: usize) -> diesel::QueryResult<()> {
+    if DAILY_BATCH_FAILURE_AFTER.get() == Some(completed_writes) {
+        return Err(integrity(
+            "TEST_CODE injected epoch daily batch failure after completed family write",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static ACTIVE_VERIFIED_SOURCE_DRIFT: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+struct ActiveVerifiedSourceDriftInjection;
+
+#[cfg(test)]
+impl Drop for ActiveVerifiedSourceDriftInjection {
+    fn drop(&mut self) {
+        ACTIVE_VERIFIED_SOURCE_DRIFT.set(false);
+    }
+}
+
+#[cfg(test)]
+fn inject_active_verified_source_drift() -> ActiveVerifiedSourceDriftInjection {
+    ACTIVE_VERIFIED_SOURCE_DRIFT.set(true);
+    ActiveVerifiedSourceDriftInjection
+}
+
+#[cfg(test)]
+fn maybe_inject_active_verified_source_drift(
+    conn: &mut SqliteConnection,
+) -> Result<(), AttributionEpochStoreError> {
+    if ACTIVE_VERIFIED_SOURCE_DRIFT.replace(false) {
+        diesel::sql_query(
+            "UPDATE paper_trades SET fill_price=fill_price+1.0
+             WHERE id=(SELECT MIN(id) FROM paper_trades)",
+        )
+        .execute(conn)
+        .map_err(AttributionEpochStoreError::from)?;
+    }
+    Ok(())
+}
+
 fn validate_all(conn: &mut SqliteConnection) -> diesel::QueryResult<Vec<PersistedReceipt>> {
     validate_schema(conn)?;
     for (table, _) in TABLES {
@@ -2569,6 +2706,77 @@ pub(crate) fn load_verified_epoch_fills_until(
     })
 }
 
+fn validate_daily_source_binding(
+    conn: &mut SqliteConnection,
+    binding: &AttributionEpochDailySourceBinding,
+) -> Result<(), AttributionEpochStoreError> {
+    let active = match load_selector_with_connection(conn, &AttributionEpochSelector::Active)? {
+        ResolvedAttributionEpoch::Epoch(receipt) => receipt,
+        ResolvedAttributionEpoch::Legacy => unreachable!("active selector cannot resolve Legacy"),
+    };
+    if binding.cutoff_date < binding.effective_date
+        || active.epoch_id != binding.epoch_id
+        || active.receipt_hash != binding.receipt_hash
+        || active.effective_trading_date != binding.effective_date
+        || active.paper_trade_high_water != binding.paper_trade_high_water
+        || active.order_audit_high_water != binding.order_audit_high_water
+        || active.legacy_carry_manifest_hash != binding.legacy_carry_manifest_hash
+    {
+        return Err(failed_integrity(
+            "BR-255 epoch daily binding differs from the active retained receipt",
+        ));
+    }
+    let resolved = ResolvedAttributionEpoch::Epoch(active.clone());
+    let verified = load_verified_epoch_fills_until(conn, &resolved, binding.cutoff_date)?;
+    if verified.filled_manifest_hash() != binding.verified_filled_manifest_hash
+        || verified.terminal_binding_manifest_hash()
+            != binding.verified_terminal_binding_manifest_hash
+        || verified.order_audit_tip_hash() != binding.verified_order_audit_tip_hash
+    {
+        return Err(failed_integrity(
+            "BR-255 epoch daily verified source changed after computation",
+        ));
+    }
+    let source_rows = verified
+        .fills()
+        .iter()
+        .map(|fill| fill.fill().clone())
+        .collect::<Vec<_>>();
+    let scoped = scope_epoch_fills(
+        &source_rows,
+        active.effective_trading_date,
+        verified.carry(),
+    )
+    .map_err(|detail| {
+        failed_integrity(format!(
+            "BR-255 epoch daily source rescoping failed: {detail}"
+        ))
+    })?;
+    let exclusion_manifest_hash =
+        canonical_exclusion_manifest_hash(&scoped.exclusions, &source_rows).map_err(|detail| {
+            failed_integrity(format!(
+                "BR-255 epoch daily exclusion revalidation failed: {detail}"
+            ))
+        })?;
+    let scoped_fill_manifest_hash = canonical_scoped_fill_manifest_hash(&scoped.attributable)
+        .map_err(|detail| {
+            failed_integrity(format!(
+                "BR-255 epoch daily scoped fill revalidation failed: {detail}"
+            ))
+        })?;
+    if exclusion_manifest_hash != binding.exclusion_manifest_hash
+        || scoped_fill_manifest_hash != binding.scoped_fill_manifest_hash
+        || canonical_legacy_carry_manifest_hash(&scoped.remaining_quarantine)
+            != binding.remaining_quarantine_manifest_hash
+        || scoped.released_codes != binding.released_codes
+    {
+        return Err(failed_integrity(
+            "BR-255 epoch daily scoped evidence changed after computation",
+        ));
+    }
+    Ok(())
+}
+
 fn load_selector_with_connection(
     conn: &mut SqliteConnection,
     selector: &AttributionEpochSelector,
@@ -3009,6 +3217,48 @@ impl<'a> AttributionEpochStore<'a> {
         load_selector_with_connection(&mut conn, selector)
     }
 
+    pub(crate) fn load_active_verified_fills_until(
+        &self,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<(AttributionEpochReceipt, VerifiedEpochFillSet), AttributionEpochStoreError> {
+        if from > to {
+            return Err(failed_integrity(
+                "BR-255 epoch attribution source range is reversed",
+            ));
+        }
+        let mut conn =
+            self.database
+                .get_conn()
+                .map_err(|error| AttributionEpochStoreError::Unavailable {
+                    reason_code: "attribution_epoch_storage_unavailable",
+                    retryable: true,
+                    detail: format!("BR-255 epoch database connection unavailable: {error}"),
+                })?;
+        conn.transaction::<_, AttributionEpochStoreError, _>(|conn| {
+            let resolved = load_selector_with_connection(conn, &AttributionEpochSelector::Active)?;
+            let receipt = match &resolved {
+                ResolvedAttributionEpoch::Epoch(receipt) => receipt.clone(),
+                ResolvedAttributionEpoch::Legacy => {
+                    unreachable!("active selector cannot resolve Legacy")
+                }
+            };
+            if from < receipt.effective_trading_date {
+                return Err(AttributionEpochStoreError::FailedIntegrity {
+                    reason_code: "attribution_epoch_range_before_effective",
+                    detail: format!(
+                        "BR-255 attribution range {from}..={to} precedes effective date {}",
+                        receipt.effective_trading_date
+                    ),
+                });
+            }
+            #[cfg(test)]
+            maybe_inject_active_verified_source_drift(conn)?;
+            let verified = load_verified_epoch_fills_until(conn, &resolved, to)?;
+            Ok((receipt, verified))
+        })
+    }
+
     pub fn verify_active(&self) -> Result<AttributionEpochReceipt, AttributionEpochStoreError> {
         match self.load_selector(&AttributionEpochSelector::Active)? {
             ResolvedAttributionEpoch::Epoch(receipt) => Ok(receipt),
@@ -3125,14 +3375,70 @@ impl<'a> AttributionEpochStore<'a> {
         &self,
         input: AttributionEpochDailyAppend,
     ) -> Result<AttributionEpochDailyReceipt, AttributionEpochStoreError> {
-        if !lower_hash(&input.epoch_id) || input.signal_family.trim().is_empty() {
-            return Err(failed_integrity("BR-255 invalid epoch daily append input"));
+        let mut batch = self.append_daily_batch_core(
+            AttributionEpochDailyBatchAppend {
+                epoch_id: input.epoch_id,
+                date: input.date,
+                families: vec![AttributionEpochDailyFamilyAppend {
+                    signal_family: input.signal_family,
+                    payload: input.payload,
+                }],
+            },
+            None,
+        )?;
+        Ok(batch
+            .receipts
+            .pop()
+            .expect("validated batch-of-one returns exactly one receipt"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn append_daily_batch(
+        &self,
+        input: AttributionEpochDailyBatchAppend,
+    ) -> Result<AttributionEpochDailyBatchReceipt, AttributionEpochStoreError> {
+        self.append_daily_batch_core(input, None)
+    }
+
+    pub(crate) fn append_verified_daily_batch(
+        &self,
+        input: AttributionEpochDailyBatchAppend,
+        source: AttributionEpochDailySourceBinding,
+    ) -> Result<AttributionEpochDailyBatchReceipt, AttributionEpochStoreError> {
+        self.append_daily_batch_core(input, Some(source))
+    }
+
+    fn append_daily_batch_core(
+        &self,
+        input: AttributionEpochDailyBatchAppend,
+        source: Option<AttributionEpochDailySourceBinding>,
+    ) -> Result<AttributionEpochDailyBatchReceipt, AttributionEpochStoreError> {
+        if !lower_hash(&input.epoch_id) || input.families.is_empty() {
+            return Err(failed_integrity("BR-255 invalid epoch daily batch input"));
         }
-        let payload_json = serde_json::to_string(&input.payload).map_err(|error| {
-            failed_integrity(format!("BR-255 serialize daily payload: {error}"))
-        })?;
-        let payload_hash = hash_json(b"BR255_ATTRIBUTION_EPOCH_DAILY_PAYLOAD_V1\0", &payload_json)
-            .map_err(map_integrity)?;
+        let mut seen = HashSet::with_capacity(input.families.len());
+        let mut prepared = Vec::with_capacity(input.families.len());
+        for family in input.families {
+            if family.signal_family.trim().is_empty()
+                || family.signal_family.trim() != family.signal_family
+                || !seen.insert(family.signal_family.clone())
+            {
+                return Err(failed_integrity(
+                    "BR-255 invalid or duplicate epoch daily signal family",
+                ));
+            }
+            let payload_json = serde_json::to_string(&family.payload).map_err(|error| {
+                failed_integrity(format!("BR-255 serialize daily payload: {error}"))
+            })?;
+            let payload_hash =
+                hash_json(b"BR255_ATTRIBUTION_EPOCH_DAILY_PAYLOAD_V1\0", &payload_json)
+                    .map_err(map_integrity)?;
+            prepared.push((family.signal_family, payload_json, payload_hash));
+        }
+        prepared.sort_by(|left, right| left.0.cmp(&right.0));
+        let epoch_id = input.epoch_id;
+        let date = input.date;
+        let date_string = date.to_string();
         let mut conn =
             self.database
                 .get_conn()
@@ -3141,87 +3447,104 @@ impl<'a> AttributionEpochStore<'a> {
                     retryable: true,
                     detail: format!("BR-255 epoch database connection unavailable: {error}"),
                 })?;
-        conn.immediate_transaction::<_, diesel::result::Error, _>(|conn| {
-            let state = validate_daily(conn)?;
-            let receipts = validate_all(conn)?;
-            if !receipts
-                .iter()
-                .any(|receipt| receipt.epoch_id == input.epoch_id)
-            {
-                return Err(integrity(
+        conn.immediate_transaction::<_, AttributionEpochStoreError, _>(|conn| {
+            let mut state = validate_daily(conn).map_err(map_integrity)?;
+            let epochs = validate_all(conn).map_err(map_integrity)?;
+            if !epochs.iter().any(|receipt| receipt.epoch_id == epoch_id) {
+                return Err(failed_integrity(
                     "BR-255 epoch daily append references an unknown epoch",
                 ));
             }
-            if let Some(existing) = state.iter().find(|row| {
-                row.epoch_id == input.epoch_id
-                    && row.date == input.date.to_string()
-                    && row.signal_family == input.signal_family
-                    && row.payload_hash == payload_hash
-            }) {
-                return Ok(AttributionEpochDailyReceipt {
-                    epoch_daily_id: existing.id,
-                    payload_hash: existing.payload_hash.clone(),
-                    record_hash: existing.record_hash.clone(),
-                    created_at: existing.created_at.clone(),
-                    retention_deadline: existing.retention_deadline.clone(),
-                });
+            if let Some(source) = source.as_ref() {
+                if source.epoch_id != epoch_id || source.cutoff_date != date {
+                    return Err(failed_integrity(
+                        "BR-255 verified epoch daily batch identity is inconsistent",
+                    ));
+                }
+                validate_daily_source_binding(conn, source)?;
             }
-            let previous = state
-                .last()
-                .map_or(DAILY_GENESIS, |row| row.record_hash.as_str());
-            let window = new_window(conn)?;
-            let mut row = PersistedDaily {
-                id: 0,
-                epoch_id: input.epoch_id.clone(),
-                date: input.date.to_string(),
-                signal_family: input.signal_family.clone(),
-                payload_json,
-                payload_hash,
-                predecessor_daily_hash: previous.to_owned(),
-                record_hash: String::new(),
-                created_at: window.created_at,
-                retention_deadline: window.retention_deadline,
-            };
-            row.record_hash = daily_hash(&row)?;
-            diesel::sql_query(
-                "INSERT INTO paper_attribution_epoch_daily
-                 (epoch_id, date, signal_family, payload_json, payload_hash,
-                  predecessor_daily_hash, record_hash, created_at, retention_deadline)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind::<Text, _>(&row.epoch_id)
-            .bind::<Text, _>(&row.date)
-            .bind::<Text, _>(&row.signal_family)
-            .bind::<Text, _>(&row.payload_json)
-            .bind::<Text, _>(&row.payload_hash)
-            .bind::<Text, _>(&row.predecessor_daily_hash)
-            .bind::<Text, _>(&row.record_hash)
-            .bind::<Text, _>(&row.created_at)
-            .bind::<Text, _>(&row.retention_deadline)
-            .execute(conn)?;
-            row.id = diesel::select(diesel::dsl::sql::<BigInt>("last_insert_rowid()"))
-                .get_result(conn)?;
-            diesel::sql_query(
-                "INSERT INTO paper_attribution_epoch_daily_chain
-                 (epoch_daily_id, previous_hash, record_hash, created_at, retention_deadline)
-                 VALUES (?, ?, ?, ?, ?)",
-            )
-            .bind::<BigInt, _>(row.id)
-            .bind::<Text, _>(&row.predecessor_daily_hash)
-            .bind::<Text, _>(&row.record_hash)
-            .bind::<Text, _>(&row.created_at)
-            .bind::<Text, _>(&row.retention_deadline)
-            .execute(conn)?;
-            validate_all(conn)?;
-            Ok(AttributionEpochDailyReceipt {
-                epoch_daily_id: row.id,
-                payload_hash: row.payload_hash,
-                record_hash: row.record_hash,
-                created_at: row.created_at,
-                retention_deadline: row.retention_deadline,
+            let mut batch_receipts = Vec::with_capacity(prepared.len());
+            #[cfg(test)]
+            let mut completed_writes = 0_usize;
+            for (signal_family, payload_json, payload_hash) in &prepared {
+                let existing = state
+                    .iter()
+                    .find(|row| {
+                        row.epoch_id == epoch_id
+                            && row.date == date_string
+                            && row.signal_family == *signal_family
+                            && row.payload_hash == *payload_hash
+                    })
+                    .cloned();
+                if let Some(existing) = existing {
+                    batch_receipts.push(daily_receipt(&state, &existing).map_err(map_integrity)?);
+                    continue;
+                }
+                #[cfg(test)]
+                maybe_inject_daily_batch_failure(completed_writes).map_err(map_integrity)?;
+                let previous = state
+                    .last()
+                    .map_or(DAILY_GENESIS, |row| row.record_hash.as_str());
+                let window = new_window(conn).map_err(map_integrity)?;
+                let mut row = PersistedDaily {
+                    id: 0,
+                    epoch_id: epoch_id.clone(),
+                    date: date_string.clone(),
+                    signal_family: signal_family.clone(),
+                    payload_json: payload_json.clone(),
+                    payload_hash: payload_hash.clone(),
+                    predecessor_daily_hash: previous.to_owned(),
+                    record_hash: String::new(),
+                    created_at: window.created_at,
+                    retention_deadline: window.retention_deadline,
+                };
+                row.record_hash = daily_hash(&row).map_err(map_integrity)?;
+                diesel::sql_query(
+                    "INSERT INTO paper_attribution_epoch_daily
+                     (epoch_id, date, signal_family, payload_json, payload_hash,
+                      predecessor_daily_hash, record_hash, created_at, retention_deadline)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind::<Text, _>(&row.epoch_id)
+                .bind::<Text, _>(&row.date)
+                .bind::<Text, _>(&row.signal_family)
+                .bind::<Text, _>(&row.payload_json)
+                .bind::<Text, _>(&row.payload_hash)
+                .bind::<Text, _>(&row.predecessor_daily_hash)
+                .bind::<Text, _>(&row.record_hash)
+                .bind::<Text, _>(&row.created_at)
+                .bind::<Text, _>(&row.retention_deadline)
+                .execute(conn)
+                .map_err(AttributionEpochStoreError::from)?;
+                row.id = diesel::select(diesel::dsl::sql::<BigInt>("last_insert_rowid()"))
+                    .get_result(conn)
+                    .map_err(AttributionEpochStoreError::from)?;
+                diesel::sql_query(
+                    "INSERT INTO paper_attribution_epoch_daily_chain
+                     (epoch_daily_id, previous_hash, record_hash, created_at, retention_deadline)
+                     VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind::<BigInt, _>(row.id)
+                .bind::<Text, _>(&row.predecessor_daily_hash)
+                .bind::<Text, _>(&row.record_hash)
+                .bind::<Text, _>(&row.created_at)
+                .bind::<Text, _>(&row.retention_deadline)
+                .execute(conn)
+                .map_err(AttributionEpochStoreError::from)?;
+                state.push(row.clone());
+                batch_receipts.push(daily_receipt(&state, &row).map_err(map_integrity)?);
+                #[cfg(test)]
+                {
+                    completed_writes += 1;
+                }
+            }
+            validate_all(conn).map_err(map_integrity)?;
+            Ok(AttributionEpochDailyBatchReceipt {
+                epoch_id: epoch_id.clone(),
+                date,
+                receipts: batch_receipts,
             })
         })
-        .map_err(map_integrity)
     }
 }
 
@@ -3241,6 +3564,495 @@ mod tests {
             source: crate::performance::attribution_epoch::EpochActivationSource::Monitor,
             invoked_at: DateTime::parse_from_rfc3339(raw).expect("TEST_CODE fixed invocation"),
         }
+    }
+
+    fn activated_test_database() -> (TestDatabase, AttributionEpochReceipt) {
+        let database = TestDatabase::new();
+        install_activation_source(&database.manager);
+        let receipt = AttributionEpochStore::new(&database.manager)
+            .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
+            .expect("TEST_CODE active epoch");
+        (database, receipt)
+    }
+
+    fn assert_daily_storage_pristine(database: &DatabaseManager) {
+        let mut conn = database.get_conn().unwrap();
+        assert!(load_daily(&mut conn).unwrap().is_empty());
+        for table in [
+            "paper_attribution_epoch_daily",
+            "paper_attribution_epoch_daily_chain",
+        ] {
+            let count = diesel::sql_query(format!("SELECT COUNT(*) AS count FROM {table}"))
+                .get_result::<CountRow>(&mut conn)
+                .unwrap()
+                .count;
+            assert_eq!(count, 0, "TEST_CODE pristine row count for {table}");
+            let seq = diesel::sql_query("SELECT seq FROM sqlite_sequence WHERE name=?")
+                .bind::<Text, _>(table)
+                .get_result::<SequenceRow>(&mut conn)
+                .unwrap()
+                .seq;
+            assert_eq!(seq, Some(0));
+        }
+    }
+
+    fn daily_test_batch(
+        date: NaiveDate,
+        families: &[(&str, i64)],
+    ) -> AttributionEpochDailyBatchAppend {
+        AttributionEpochDailyBatchAppend {
+            epoch_id: "a".repeat(64),
+            date,
+            families: families
+                .iter()
+                .map(
+                    |(signal_family, closed)| AttributionEpochDailyFamilyAppend {
+                        signal_family: (*signal_family).to_owned(),
+                        payload: serde_json::json!({"closed": closed}),
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    fn daily_test_append() -> AttributionEpochDailyAppend {
+        AttributionEpochDailyAppend {
+            epoch_id: "a".repeat(64),
+            date: NaiveDate::from_ymd_opt(2026, 8, 28).unwrap(),
+            signal_family: "NewsCatalyst".to_owned(),
+            payload: serde_json::json!({"closed": 1}),
+        }
+    }
+
+    type TestFill<'a> = (i64, &'a str, &'a str, i64, &'a str);
+
+    fn append_test_fills(manager: &DatabaseManager, fills: &[TestFill<'_>]) {
+        for &(id, plan_id, direction, quantity, occurred_at) in fills {
+            append_activation_fill(manager, id, plan_id, direction, quantity, occurred_at);
+        }
+    }
+
+    #[test]
+    fn daily_compute_without_active_epoch_fails_before_legacy_source_read() {
+        let database = TestDatabase::new();
+        let error = crate::performance::attribution::compute_epoch_daily(
+            &database.manager,
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+            &HashMap::new(),
+        )
+        .expect_err("TEST_CODE missing active epoch must fail closed");
+
+        assert_eq!(error.reason_code(), "attribution_epoch_unavailable");
+        assert!(!error.retryable());
+    }
+
+    #[test]
+    fn daily_compute_maps_prefix_drift_and_terminal_mismatch_to_typed_integrity() {
+        let prefix = activated_test_database().0;
+        let mut conn = prefix.manager.get_conn().unwrap();
+        diesel::sql_query("UPDATE paper_trades SET fill_price=11.0 WHERE id=1")
+            .execute(&mut conn)
+            .unwrap();
+        drop(conn);
+        let prefix_error = crate::performance::attribution::compute_epoch_daily(
+            &prefix.manager,
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+            &HashMap::new(),
+        )
+        .expect_err("TEST_CODE frozen paper prefix drift must fail compute");
+        assert_eq!(
+            prefix_error.reason_code(),
+            "attribution_epoch_integrity_failed"
+        );
+
+        let terminal = activated_test_database().0;
+        append_duplicate_terminal(&terminal.manager);
+        let terminal_error = crate::performance::attribution::compute_epoch_daily(
+            &terminal.manager,
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+            &HashMap::new(),
+        )
+        .expect_err("TEST_CODE duplicate terminal binding must fail compute");
+        assert_eq!(
+            terminal_error.reason_code(),
+            "attribution_epoch_integrity_failed"
+        );
+    }
+
+    #[test]
+    fn active_selector_and_verified_source_share_one_rollback_safe_snapshot() {
+        let database = activated_test_database().0;
+        let _drift = inject_active_verified_source_drift();
+
+        let error = crate::performance::attribution::compute_epoch_daily(
+            &database.manager,
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+            &HashMap::new(),
+        )
+        .expect_err("TEST_CODE source drift inside active read snapshot must fail wholly");
+        assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
+        crate::performance::attribution::compute_epoch_daily(
+            &database.manager,
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+            &HashMap::new(),
+        )
+        .expect("TEST_CODE injected source mutation rolls back with failed read snapshot");
+    }
+
+    #[test]
+    fn daily_compute_rejects_post_highwater_fill_before_effective_date() {
+        let database = activated_test_database().0;
+        append_activation_fill(
+            &database.manager,
+            3,
+            "TEST_CODE_PLAN_LATE",
+            "buy",
+            100,
+            "2026-08-28 07:45:00",
+        );
+
+        let error = crate::performance::attribution::compute_epoch_daily(
+            &database.manager,
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+            &HashMap::new(),
+        )
+        .expect_err("TEST_CODE late source must not produce daily output");
+        assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
+    }
+
+    #[test]
+    fn daily_compute_quarantines_carry_through_flat_then_attributes_new_cycle() {
+        let (database, receipt) = activated_test_database();
+        append_test_fills(
+            &database.manager,
+            &[
+                (
+                    3,
+                    "TEST_CODE_PLAN_OVERLAP_BUY",
+                    "buy",
+                    100,
+                    "2026-08-31 02:00:00",
+                ),
+                (
+                    4,
+                    "TEST_CODE_PLAN_FLAT_SELL",
+                    "sell",
+                    200,
+                    "2026-08-31 03:00:00",
+                ),
+                (
+                    5,
+                    "TEST_CODE_PLAN_FRESH_BUY",
+                    "buy",
+                    100,
+                    "2026-08-31 04:00:00",
+                ),
+                (
+                    6,
+                    "TEST_CODE_PLAN_FRESH_SELL",
+                    "sell",
+                    100,
+                    "2026-09-01 02:00:00",
+                ),
+            ],
+        );
+
+        let result = crate::performance::attribution::compute_epoch_daily(
+            &database.manager,
+            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+            &HashMap::new(),
+        )
+        .expect("TEST_CODE active epoch daily attribution");
+
+        assert_eq!(result.epoch().epoch_id, receipt.epoch_id);
+        assert_eq!(result.epoch().receipt_hash, receipt.receipt_hash);
+        assert_eq!(result.epoch().effective_date.to_string(), "2026-08-31");
+        assert_eq!(result.epoch().exclusions.len(), 3);
+        assert_eq!(
+            result
+                .epoch()
+                .exclusions
+                .iter()
+                .map(|item| item.fill_id)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 4]
+        );
+        assert!(result.epoch().remaining_quarantine.is_empty());
+        assert_eq!(result.epoch().released_codes, 1);
+        assert_eq!(result.daily().date.to_string(), "2026-09-01");
+        assert_eq!(
+            result
+                .daily()
+                .families
+                .iter()
+                .map(|family| family.realized_trades)
+                .sum::<i64>(),
+            1,
+            "TEST_CODE only the post-flat lifecycle is attributable"
+        );
+    }
+
+    #[test]
+    fn epoch_window_rejects_a_range_before_the_effective_date() {
+        let database = activated_test_database().0;
+
+        let error = crate::performance::attribution::compute_epoch_window(
+            &database.manager,
+            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+            3,
+            &HashMap::new(),
+        )
+        .expect_err("TEST_CODE window start before effective must not be clipped");
+
+        assert_eq!(
+            error.reason_code(),
+            "attribution_epoch_range_before_effective"
+        );
+    }
+
+    #[test]
+    fn epoch_window_uses_scoped_rows_from_effective_date_through_end() {
+        let database = activated_test_database().0;
+        append_test_fills(
+            &database.manager,
+            &[
+                (
+                    3,
+                    "TEST_CODE_PLAN_CARRY_EXIT",
+                    "sell",
+                    100,
+                    "2026-08-31 02:00:00",
+                ),
+                (
+                    4,
+                    "TEST_CODE_PLAN_WINDOW_BUY",
+                    "buy",
+                    100,
+                    "2026-08-31 03:00:00",
+                ),
+                (
+                    5,
+                    "TEST_CODE_PLAN_WINDOW_SELL",
+                    "sell",
+                    100,
+                    "2026-09-01 02:00:00",
+                ),
+            ],
+        );
+
+        let result = crate::performance::attribution::compute_epoch_window(
+            &database.manager,
+            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+            2,
+            &HashMap::new(),
+        )
+        .expect("TEST_CODE epoch-scoped two-day window");
+
+        assert_eq!(result.window().days, 2);
+        assert_eq!(result.window().end.to_string(), "2026-09-01");
+        assert_eq!(result.epoch().exclusions.len(), 1);
+        assert_eq!(result.epoch().exclusions[0].fill_id, 3);
+        assert_eq!(result.epoch().released_codes, 1);
+        assert_eq!(
+            result
+                .window()
+                .families
+                .iter()
+                .map(|family| family.realized_trades)
+                .sum::<i64>(),
+            1
+        );
+    }
+
+    #[test]
+    fn daily_persist_revalidates_active_source_and_writes_nothing_after_late_fill() {
+        let database = activated_test_database().0;
+        append_test_fills(
+            &database.manager,
+            &[
+                (
+                    3,
+                    "TEST_CODE_PLAN_CARRY_EXIT",
+                    "sell",
+                    100,
+                    "2026-08-31 02:00:00",
+                ),
+                (
+                    4,
+                    "TEST_CODE_PLAN_DAILY_BUY",
+                    "buy",
+                    100,
+                    "2026-08-31 03:00:00",
+                ),
+                (
+                    5,
+                    "TEST_CODE_PLAN_DAILY_SELL",
+                    "sell",
+                    100,
+                    "2026-09-01 02:00:00",
+                ),
+            ],
+        );
+        let daily = crate::performance::attribution::compute_epoch_daily(
+            &database.manager,
+            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+            &HashMap::new(),
+        )
+        .expect("TEST_CODE computed daily evidence");
+        append_activation_fill(
+            &database.manager,
+            6,
+            "TEST_CODE_PLAN_LATE_AFTER_COMPUTE",
+            "buy",
+            100,
+            "2026-08-28 07:45:00",
+        );
+
+        let error = crate::performance::attribution::persist_epoch_daily(&database.manager, &daily)
+            .expect_err("TEST_CODE late source invalidates the computed evidence");
+        assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
+        assert_daily_storage_pristine(&database.manager);
+    }
+
+    #[test]
+    fn daily_persist_writes_nothing_after_audit_only_terminal_drift() {
+        let database = activated_test_database().0;
+        let daily = crate::performance::attribution::compute_epoch_daily(
+            &database.manager,
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+            &HashMap::new(),
+        )
+        .expect("TEST_CODE computed before audit-only drift");
+        append_duplicate_terminal(&database.manager);
+
+        let error = crate::performance::attribution::persist_epoch_daily(&database.manager, &daily)
+            .expect_err("TEST_CODE duplicate terminal audit invalidates daily evidence");
+        assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
+        assert_daily_storage_pristine(&database.manager);
+    }
+
+    #[test]
+    fn daily_persist_writes_nothing_if_active_epoch_changes_after_compute() {
+        let (database, active) = activated_test_database();
+        append_test_fills(
+            &database.manager,
+            &[
+                (
+                    3,
+                    "TEST_CODE_PLAN_CARRY_EXIT",
+                    "sell",
+                    100,
+                    "2026-08-31 02:00:00",
+                ),
+                (
+                    4,
+                    "TEST_CODE_PLAN_DAILY_BUY",
+                    "buy",
+                    100,
+                    "2026-08-31 03:00:00",
+                ),
+            ],
+        );
+        let daily = crate::performance::attribution::compute_epoch_daily(
+            &database.manager,
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+            &HashMap::new(),
+        )
+        .expect("TEST_CODE computed first-epoch daily evidence");
+        insert_success(&database.manager, Some(active.receipt_hash));
+
+        let error = crate::performance::attribution::persist_epoch_daily(&database.manager, &daily)
+            .expect_err("TEST_CODE changed active receipt set must fail closed");
+        assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
+        assert_daily_storage_pristine(&database.manager);
+    }
+
+    #[test]
+    fn daily_persist_reuses_identical_payload_appends_revision_and_preserves_legacy_rows() {
+        let database = TestDatabase::new();
+        install_activation_source(&database.manager);
+        let mut conn = database.manager.get_conn().unwrap();
+        conn.batch_execute(
+            "CREATE TABLE paper_attribution_daily(date TEXT PRIMARY KEY, marker TEXT NOT NULL);
+             INSERT INTO paper_attribution_daily(date,marker)
+             VALUES ('2026-08-28','TEST_CODE legacy bytes');",
+        )
+        .unwrap();
+        drop(conn);
+        AttributionEpochStore::new(&database.manager)
+            .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
+            .expect("TEST_CODE active epoch");
+        append_test_fills(
+            &database.manager,
+            &[
+                (
+                    3,
+                    "TEST_CODE_PLAN_CARRY_EXIT",
+                    "sell",
+                    100,
+                    "2026-08-31 02:00:00",
+                ),
+                (
+                    4,
+                    "TEST_CODE_PLAN_OPEN_BUY",
+                    "buy",
+                    100,
+                    "2026-08-31 03:00:00",
+                ),
+            ],
+        );
+
+        let mut first_prices = HashMap::new();
+        first_prices.insert("TEST_CODE_600001".to_owned(), 11.0);
+        let first_daily = crate::performance::attribution::compute_epoch_daily(
+            &database.manager,
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+            &first_prices,
+        )
+        .unwrap();
+        let first =
+            crate::performance::attribution::persist_epoch_daily(&database.manager, &first_daily)
+                .unwrap();
+        let reused =
+            crate::performance::attribution::persist_epoch_daily(&database.manager, &first_daily)
+                .unwrap();
+        assert_eq!(first, reused);
+        assert_eq!(first.receipts.len(), 1);
+        assert_eq!(first.receipts[0].revision, 1);
+
+        let mut revised_prices = HashMap::new();
+        revised_prices.insert("TEST_CODE_600001".to_owned(), 12.0);
+        let revised_daily = crate::performance::attribution::compute_epoch_daily(
+            &database.manager,
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+            &revised_prices,
+        )
+        .unwrap();
+        let revised =
+            crate::performance::attribution::persist_epoch_daily(&database.manager, &revised_daily)
+                .unwrap();
+        assert_eq!(revised.receipts.len(), 1);
+        assert_eq!(revised.receipts[0].revision, 2);
+        assert_ne!(
+            revised.receipts[0].epoch_daily_id,
+            first.receipts[0].epoch_daily_id
+        );
+
+        let mut conn = database.manager.get_conn().unwrap();
+        assert_eq!(validate_daily(&mut conn).unwrap().len(), 2);
+        let legacy_count =
+            diesel::sql_query("SELECT COUNT(*) AS count FROM paper_attribution_daily")
+                .get_result::<CountRow>(&mut conn)
+                .unwrap()
+                .count;
+        let marker = diesel::sql_query(
+            "SELECT marker AS file FROM paper_attribution_daily WHERE date='2026-08-28'",
+        )
+        .get_result::<DatabaseFileRow>(&mut conn)
+        .unwrap()
+        .file;
+        assert_eq!(legacy_count, 1);
+        assert_eq!(marker, "TEST_CODE legacy bytes");
     }
 
     struct TestDatabaseCleanup {
@@ -4835,6 +5647,187 @@ mod tests {
                 .unwrap()
                 .count;
             assert_eq!(count, expected, "TEST_CODE one-to-one append for {table}");
+        }
+    }
+
+    #[test]
+    fn daily_batch_sorts_families_and_atomically_reuses_or_revises_each_family() {
+        let database = TestDatabase::new();
+        insert_success(&database.manager, None);
+        let store = AttributionEpochStore::new(&database.manager);
+        let date = NaiveDate::from_ymd_opt(2026, 8, 28).unwrap();
+
+        let first = store
+            .append_daily_batch(daily_test_batch(
+                date,
+                &[("VolumeSurge", 2), ("NewsCatalyst", 1)],
+            ))
+            .expect("TEST_CODE first canonical daily batch");
+        assert_eq!(
+            first
+                .receipts
+                .iter()
+                .map(|receipt| (receipt.signal_family.as_str(), receipt.revision))
+                .collect::<Vec<_>>(),
+            vec![("NewsCatalyst", 1), ("VolumeSurge", 1)]
+        );
+
+        let mixed = store
+            .append_daily_batch(daily_test_batch(
+                date,
+                &[("VolumeSurge", 3), ("NewsCatalyst", 1)],
+            ))
+            .expect("TEST_CODE mixed reuse and revision batch");
+        assert_eq!(mixed.receipts[0], first.receipts[0]);
+        assert_eq!(mixed.receipts[1].signal_family, "VolumeSurge");
+        assert_eq!(mixed.receipts[1].revision, 2);
+        assert_ne!(
+            mixed.receipts[1].epoch_daily_id,
+            first.receipts[1].epoch_daily_id
+        );
+
+        let mut conn = database.manager.get_conn().unwrap();
+        assert_eq!(validate_daily(&mut conn).unwrap().len(), 3);
+        assert_eq!(
+            load_chain(
+                &mut conn,
+                "paper_attribution_epoch_daily_chain",
+                "epoch_daily_id"
+            )
+            .unwrap()
+            .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn daily_batch_rejects_duplicate_families_without_writes_and_order_is_deterministic() {
+        let database = TestDatabase::new();
+        insert_success(&database.manager, None);
+        let store = AttributionEpochStore::new(&database.manager);
+        let date = NaiveDate::from_ymd_opt(2026, 8, 28).unwrap();
+        let duplicate = store
+            .append_daily_batch(daily_test_batch(
+                date,
+                &[("NewsCatalyst", 1), ("NewsCatalyst", 2)],
+            ))
+            .expect_err("TEST_CODE duplicate families invalidate the whole batch");
+        assert_eq!(
+            duplicate.reason_code(),
+            "attribution_epoch_integrity_failed"
+        );
+        let mut conn = database.manager.get_conn().unwrap();
+        assert!(validate_daily(&mut conn).unwrap().is_empty());
+        let seq = diesel::sql_query(
+            "SELECT seq FROM sqlite_sequence WHERE name='paper_attribution_epoch_daily'",
+        )
+        .get_result::<SequenceRow>(&mut conn)
+        .unwrap()
+        .seq;
+        assert_eq!(seq, Some(0));
+        drop(conn);
+
+        let reversed = store
+            .append_daily_batch(daily_test_batch(
+                date,
+                &[("VolumeSurge", 2), ("NewsCatalyst", 1)],
+            ))
+            .unwrap();
+        let canonical = store
+            .append_daily_batch(daily_test_batch(
+                date,
+                &[("NewsCatalyst", 1), ("VolumeSurge", 2)],
+            ))
+            .unwrap();
+        assert_eq!(reversed, canonical);
+    }
+
+    #[test]
+    fn daily_batch_mid_write_failure_rolls_back_facts_chains_and_sequences() {
+        let database = TestDatabase::new();
+        insert_success(&database.manager, None);
+        let store = AttributionEpochStore::new(&database.manager);
+        let _injection = inject_daily_batch_failure_after(1);
+
+        let error = store
+            .append_daily_batch(daily_test_batch(
+                NaiveDate::from_ymd_opt(2026, 8, 28).unwrap(),
+                &[("NewsCatalyst", 1), ("VolumeSurge", 2)],
+            ))
+            .expect_err("TEST_CODE injected second-family failure rolls back first family");
+        assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
+        assert_daily_storage_pristine(&database.manager);
+    }
+
+    #[test]
+    fn daily_append_fails_closed_on_trigger_sequence_retention_payload_and_chain_tamper() {
+        for case in ["trigger", "sequence", "retention", "payload", "chain"] {
+            let database = TestDatabase::new();
+            insert_success(&database.manager, None);
+            let store = AttributionEpochStore::new(&database.manager);
+            store.append_daily(daily_test_append()).unwrap();
+            let mut conn = database.manager.get_conn().unwrap();
+            match case {
+                "trigger" => {
+                    diesel::sql_query("DROP TRIGGER trg_paper_attribution_epoch_daily_no_update")
+                        .execute(&mut conn)
+                        .unwrap();
+                }
+                "sequence" => {
+                    diesel::sql_query(
+                        "UPDATE sqlite_sequence SET seq=0
+                         WHERE name='paper_attribution_epoch_daily'",
+                    )
+                    .execute(&mut conn)
+                    .unwrap();
+                }
+                "retention" => {
+                    diesel::sql_query("DROP TRIGGER trg_paper_attribution_epoch_daily_no_update")
+                        .execute(&mut conn)
+                        .unwrap();
+                    diesel::sql_query(
+                        "UPDATE paper_attribution_epoch_daily
+                         SET retention_deadline=created_at WHERE id=1",
+                    )
+                    .execute(&mut conn)
+                    .unwrap();
+                    install_triggers(&mut conn, "paper_attribution_epoch_daily").unwrap();
+                }
+                "payload" => {
+                    diesel::sql_query("DROP TRIGGER trg_paper_attribution_epoch_daily_no_update")
+                        .execute(&mut conn)
+                        .unwrap();
+                    diesel::sql_query(
+                        "UPDATE paper_attribution_epoch_daily
+                         SET payload_json='{\"closed\":2}' WHERE id=1",
+                    )
+                    .execute(&mut conn)
+                    .unwrap();
+                    install_triggers(&mut conn, "paper_attribution_epoch_daily").unwrap();
+                }
+                "chain" => {
+                    diesel::sql_query(
+                        "DROP TRIGGER trg_paper_attribution_epoch_daily_chain_no_delete",
+                    )
+                    .execute(&mut conn)
+                    .unwrap();
+                    diesel::sql_query("DELETE FROM paper_attribution_epoch_daily_chain")
+                        .execute(&mut conn)
+                        .unwrap();
+                    install_triggers(&mut conn, "paper_attribution_epoch_daily_chain").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            drop(conn);
+
+            let error = store
+                .append_daily(daily_test_append())
+                .expect_err("TEST_CODE corrupted daily state must never be reused");
+            assert_eq!(
+                error.reason_code(),
+                "attribution_epoch_integrity_failed",
+                "TEST_CODE daily corruption case {case}"
+            );
         }
     }
 
