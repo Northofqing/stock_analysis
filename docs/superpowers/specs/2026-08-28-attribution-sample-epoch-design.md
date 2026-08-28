@@ -96,7 +96,7 @@
 - `decision_basis="BR-255"`、canonical UTC `created_at`、精确 retention deadline；
 - `receipt_hash`。
 
-成功表使用 `INTEGER PRIMARY KEY AUTOINCREMENT`，并安装、逐字验证 canonical no-update/no-delete triggers。活动纪元由完整校验后的最新成功链确定，不使用可变 `active` 标记。BR-255 v1 的 monitor 只允许创建一个固定 activation domain；同内容重试返回原凭证，不同内容冲突失败。
+成功表使用 `INTEGER PRIMARY KEY AUTOINCREMENT`，并安装、逐字验证 canonical no-update/no-delete triggers。活动纪元由完整校验后的最新成功链确定，不使用可变 `active` 标记；读取必须验证全部 success rows，任何尾部缺失、漂移或断链都整次失败，禁止跳过坏尾后回退到更早纪元。BR-255 v1 的 monitor 只允许创建一个固定 activation domain；同内容重试返回原凭证，不同内容冲突失败。
 
 ### 6.2 `AttributionLegacyCarryItem`
 
