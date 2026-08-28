@@ -4,6 +4,9 @@
 //! Every read and append verifies the complete retained state before returning.
 
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, FixedOffset, Months, NaiveDate, NaiveTime, SecondsFormat, Utc};
 use diesel::prelude::*;
@@ -369,6 +372,21 @@ pub(crate) struct AttributionEpochDailyReceipt {
 
 pub struct AttributionEpochStore<'a> {
     database: &'a DatabaseManager,
+    read_only_preview_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviewFileSnapshot {
+    byte_len: u64,
+    byte_hash: String,
+    modified: std::time::SystemTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviewSqliteSnapshot {
+    main: PreviewFileSnapshot,
+    wal: Option<PreviewFileSnapshot>,
+    shm: Option<PreviewFileSnapshot>,
 }
 
 #[derive(QueryableByName)]
@@ -558,14 +576,24 @@ struct FrozenPaperFill {
     direction: String,
     #[diesel(sql_type = Double)]
     requested_price: f64,
+    #[diesel(sql_type = Text)]
+    status: String,
     #[diesel(sql_type = Nullable<Double>)]
     fill_price: Option<f64>,
+    #[diesel(sql_type = Nullable<Text>)]
+    not_fill_reason: Option<String>,
     #[diesel(sql_type = BigInt)]
     quantity: i64,
     #[diesel(sql_type = Text)]
     occurred_at: String,
     #[diesel(sql_type = Text)]
     virtual_reason: String,
+    #[diesel(sql_type = Text)]
+    account_mode: String,
+    #[diesel(sql_type = Text)]
+    data_mode: String,
+    #[diesel(sql_type = Text)]
+    updated_at: String,
 }
 
 impl FrozenPaperFill {
@@ -610,6 +638,150 @@ struct FrozenSourceProjection {
 struct DatabaseFileRow {
     #[diesel(sql_type = Text)]
     file: String,
+}
+
+fn sqlite_sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
+    let mut leaf = database_path.as_os_str().to_os_string();
+    leaf.push(suffix);
+    PathBuf::from(leaf)
+}
+
+fn preview_file_snapshot(path: &Path) -> Result<PreviewFileSnapshot, AttributionEpochStoreError> {
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        activation_unavailable(
+            "attribution_epoch_preview_storage_unavailable",
+            true,
+            format!("BR-255 cannot stat read-only preview file {path:?}: {error}"),
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(activation_unavailable(
+            "attribution_epoch_preview_storage_unavailable",
+            false,
+            format!("BR-255 read-only preview target is not a regular file: {path:?}"),
+        ));
+    }
+    let modified = metadata.modified().map_err(|error| {
+        activation_unavailable(
+            "attribution_epoch_preview_storage_unavailable",
+            true,
+            format!("BR-255 cannot read preview mtime for {path:?}: {error}"),
+        )
+    })?;
+    let mut file = File::open(path).map_err(|error| {
+        activation_unavailable(
+            "attribution_epoch_preview_storage_unavailable",
+            true,
+            format!("BR-255 cannot open preview file {path:?}: {error}"),
+        )
+    })?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            activation_unavailable(
+                "attribution_epoch_preview_storage_unavailable",
+                true,
+                format!("BR-255 cannot hash preview file {path:?}: {error}"),
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(PreviewFileSnapshot {
+        byte_len: metadata.len(),
+        byte_hash: hex::encode(digest.finalize()),
+        modified,
+    })
+}
+
+fn optional_preview_file_snapshot(
+    path: &Path,
+) -> Result<Option<PreviewFileSnapshot>, AttributionEpochStoreError> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => preview_file_snapshot(path).map(Some),
+        Ok(_) => Err(activation_unavailable(
+            "attribution_epoch_preview_storage_unavailable",
+            false,
+            format!("BR-255 SQLite preview sidecar is not a regular file: {path:?}"),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(activation_unavailable(
+            "attribution_epoch_preview_storage_unavailable",
+            true,
+            format!("BR-255 cannot stat SQLite preview sidecar {path:?}: {error}"),
+        )),
+    }
+}
+
+fn preview_sqlite_snapshot(
+    database_path: &Path,
+) -> Result<PreviewSqliteSnapshot, AttributionEpochStoreError> {
+    Ok(PreviewSqliteSnapshot {
+        main: preview_file_snapshot(database_path)?,
+        wal: optional_preview_file_snapshot(&sqlite_sidecar_path(database_path, "-wal"))?,
+        shm: optional_preview_file_snapshot(&sqlite_sidecar_path(database_path, "-shm"))?,
+    })
+}
+
+fn reject_preview_wal_state(
+    _database_path: &Path,
+    snapshot: &PreviewSqliteSnapshot,
+) -> Result<(), AttributionEpochStoreError> {
+    if snapshot.wal.is_some() || snapshot.shm.is_some() {
+        return Err(activation_unavailable(
+            "attribution_epoch_preview_live_wal",
+            true,
+            "BR-255 read-only preview refuses existing WAL/SHM state because it cannot both consume live WAL facts and guarantee sidecar immutability",
+        ));
+    }
+    Ok(())
+}
+
+fn sqlite_header_uses_wal(database_path: &Path) -> Result<bool, AttributionEpochStoreError> {
+    let mut header = [0_u8; 20];
+    File::open(database_path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .map_err(|error| {
+            activation_unavailable(
+                "attribution_epoch_preview_storage_unavailable",
+                true,
+                format!("BR-255 cannot inspect SQLite preview header: {error}"),
+            )
+        })?;
+    Ok(header[18] == 2 || header[19] == 2)
+}
+
+fn read_only_sqlite_uri(
+    database_path: &Path,
+    clean_wal_header: bool,
+) -> Result<String, AttributionEpochStoreError> {
+    let raw = database_path.to_str().ok_or_else(|| {
+        activation_unavailable(
+            "attribution_epoch_preview_storage_unavailable",
+            false,
+            "BR-255 read-only preview path is not valid UTF-8",
+        )
+    })?;
+    let mut encoded = String::with_capacity(raw.len());
+    for byte in raw.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b':' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(char::from(*byte))
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    if clean_wal_header {
+        // `immutable=1` is safe only after the caller proved WAL/SHM absent.
+        // The after-snapshot prevents returning a stale preview if a writer
+        // creates either sidecar while this immutable snapshot is open.
+        Ok(format!("file:{encoded}?mode=ro&immutable=1"))
+    } else {
+        Ok(format!("file:{encoded}?mode=ro"))
+    }
 }
 
 #[derive(Serialize)]
@@ -1450,6 +1622,30 @@ fn activation_unavailable(
     }
 }
 
+fn activation_error_context(
+    stage: &'static str,
+    error: AttributionEpochStoreError,
+) -> AttributionEpochStoreError {
+    match error {
+        AttributionEpochStoreError::Unavailable {
+            reason_code,
+            retryable,
+            detail,
+        } => AttributionEpochStoreError::Unavailable {
+            reason_code,
+            retryable,
+            detail: format!("BR-255 stage={stage}: {detail}"),
+        },
+        AttributionEpochStoreError::FailedIntegrity {
+            reason_code,
+            detail,
+        } => AttributionEpochStoreError::FailedIntegrity {
+            reason_code,
+            detail: format!("BR-255 stage={stage}: {detail}"),
+        },
+    }
+}
+
 fn resolve_activation_calendar(
     invoked_at: DateTime<FixedOffset>,
 ) -> Result<(NaiveDate, NaiveDate, String), AttributionEpochStoreError> {
@@ -1519,19 +1715,138 @@ fn load_paper_high_water(conn: &mut SqliteConnection) -> diesel::QueryResult<i64
         .map(|row| row.id)
 }
 
-fn load_frozen_paper_fills(
+fn load_frozen_paper_rows(
     conn: &mut SqliteConnection,
     high_water: i64,
 ) -> diesel::QueryResult<Vec<FrozenPaperFill>> {
     diesel::sql_query(
-        "SELECT id,plan_id,code,name,direction,price AS requested_price,fill_price,
-                quantity,CAST(ts AS TEXT) AS occurred_at,virtual_reason
+        "SELECT id,plan_id,code,name,direction,price AS requested_price,status,fill_price,
+                not_fill_reason,quantity,CAST(ts AS TEXT) AS occurred_at,virtual_reason,
+                account_mode,data_mode,CAST(updated_at AS TEXT) AS updated_at
          FROM paper_trades
-         WHERE status='Filled' AND id <= ?
-         ORDER BY CAST(ts AS TEXT) ASC, id ASC",
+         WHERE id <= ?
+         ORDER BY id ASC",
     )
     .bind::<BigInt, _>(high_water)
     .load(conn)
+}
+
+fn validate_paper_identity(code: &str) -> Result<(), AttributionEpochStoreError> {
+    crate::risk::env_guard::validate_symbol_for_current_env(code).map_err(|detail| {
+        failed_integrity(format!(
+            "BR-255 paper identity environment mismatch: {detail}"
+        ))
+    })?;
+    if let Some(canonical) = code.strip_prefix("TEST_CODE_") {
+        if canonical.len() != 6 || !canonical.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(failed_integrity(format!(
+                "BR-255 TEST_CODE paper identity is invalid: {code:?}"
+            )));
+        }
+        return Ok(());
+    }
+    let identity = crate::data_gateway::instrument_identity::resolve_production_equity(code, None)
+        .map_err(|error| {
+            failed_integrity(format!("BR-255 paper equity identity is invalid: {error}"))
+        })?;
+    identity.require_a_share().map_err(|error| {
+        failed_integrity(format!("BR-255 paper equity identity is invalid: {error}"))
+    })?;
+    Ok(())
+}
+
+fn validate_frozen_paper_row(
+    row: &FrozenPaperFill,
+) -> Result<chrono::NaiveDateTime, AttributionEpochStoreError> {
+    if row.id <= 0 {
+        return Err(failed_integrity(format!(
+            "BR-255 paper source contains non-positive id={}",
+            row.id
+        )));
+    }
+    if row.plan_id.trim().is_empty() || row.name.trim().is_empty() {
+        return Err(failed_integrity(format!(
+            "BR-255 paper id={} has an empty plan or name identity",
+            row.id
+        )));
+    }
+    validate_paper_identity(&row.code)?;
+    if !matches!(row.direction.as_str(), "buy" | "sell") {
+        return Err(failed_integrity(format!(
+            "BR-255 paper id={} direction is invalid: {:?}",
+            row.id, row.direction
+        )));
+    }
+    if !row.requested_price.is_finite() || row.requested_price <= 0.0 {
+        return Err(failed_integrity(format!(
+            "BR-255 paper id={} requested price is invalid",
+            row.id
+        )));
+    }
+    u32::try_from(row.quantity)
+        .ok()
+        .filter(|quantity| *quantity > 0 && quantity.is_multiple_of(100))
+        .ok_or_else(|| {
+            failed_integrity(format!(
+                "BR-255 paper id={} quantity is invalid: {}",
+                row.id, row.quantity
+            ))
+        })?;
+    let normalized_reason = row
+        .not_fill_reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty());
+    match row.status.as_str() {
+        "Filled"
+            if row
+                .fill_price
+                .is_none_or(|price| !price.is_finite() || price <= 0.0)
+                || normalized_reason.is_some() =>
+        {
+            return Err(failed_integrity(format!(
+                "BR-255 Filled paper id={} has incomplete terminal facts",
+                row.id
+            )));
+        }
+        "NotFilled" | "Invalidated" if row.fill_price.is_some() || normalized_reason.is_none() => {
+            return Err(failed_integrity(format!(
+                "BR-255 {} paper id={} has incomplete terminal facts",
+                row.status, row.id
+            )));
+        }
+        "Filled" | "NotFilled" | "Invalidated" => {}
+        other => {
+            return Err(failed_integrity(format!(
+                "BR-255 paper id={} status is invalid: {other:?}",
+                row.id
+            )));
+        }
+    }
+    if row.virtual_reason.trim().is_empty()
+        || !matches!(
+            row.account_mode.as_str(),
+            "Normal" | "ReduceOnly" | "Frozen"
+        )
+        || !matches!(row.data_mode.as_str(), "Full" | "Degraded" | "Unsafe")
+    {
+        return Err(failed_integrity(format!(
+            "BR-255 paper id={} decision/risk context is incomplete",
+            row.id
+        )));
+    }
+    let occurred_at =
+        parse_paper_fill_timestamp(row.id, &row.occurred_at).map_err(failed_integrity)?;
+    let updated_at = parse_paper_fill_timestamp(row.id, &row.updated_at).map_err(|detail| {
+        failed_integrity(format!("BR-255 paper id={} updated_at: {detail}", row.id))
+    })?;
+    if updated_at < occurred_at {
+        return Err(failed_integrity(format!(
+            "BR-255 paper id={} updated_at precedes its persisted timestamp",
+            row.id
+        )));
+    }
+    Ok(occurred_at)
 }
 
 fn load_order_audit_rows(
@@ -1580,23 +1895,39 @@ fn analyze_source_projection(
             "BR-255 paper high-water regressed current={current_paper_high_water} frozen={paper_trade_high_water}"
         )));
     }
-    let fills = load_frozen_paper_fills(conn, paper_trade_high_water)?;
-    for row in &fills {
-        if !row.requested_price.is_finite() || row.requested_price <= 0.0 {
+    let paper_rows = load_frozen_paper_rows(conn, paper_trade_high_water)?;
+    let mut paper_ids = HashSet::with_capacity(paper_rows.len());
+    let mut paper_plans = HashSet::with_capacity(paper_rows.len());
+    for row in &paper_rows {
+        if !paper_ids.insert(row.id) {
             return Err(failed_integrity(format!(
-                "BR-255 Filled paper id={} requested price is invalid",
+                "BR-255 paper source contains duplicate id={}",
                 row.id
             )));
         }
-        let occurred_at =
-            parse_paper_fill_timestamp(row.id, &row.occurred_at).map_err(failed_integrity)?;
+        if !paper_plans.insert(row.plan_id.as_str()) {
+            return Err(failed_integrity(format!(
+                "BR-255 paper source contains duplicate plan_id={:?}",
+                row.plan_id
+            )));
+        }
+        let occurred_at = validate_frozen_paper_row(row)?;
         if reject_after_completed && occurred_at.date() > completed_session {
             return Err(failed_integrity(format!(
-                "BR-255 frozen paper id={} is dated after completed session {completed_session}",
+                "BR-255 paper id={} is dated after completed session {completed_session}",
                 row.id
             )));
         }
     }
+    let mut fills = paper_rows
+        .into_iter()
+        .filter(|row| row.status == "Filled")
+        .collect::<Vec<_>>();
+    fills.sort_by(|left, right| {
+        left.occurred_at
+            .cmp(&right.occurred_at)
+            .then(left.id.cmp(&right.id))
+    });
     let economic_fills = fills
         .iter()
         .map(FrozenPaperFill::economic)
@@ -1670,14 +2001,24 @@ fn analyze_source_projection(
             .or_default()
             .push(audit);
     }
-    let shanghai = FixedOffset::east_opt(8 * 60 * 60)
-        .ok_or_else(|| failed_integrity("BR-255 +08:00 offset is unavailable"))?;
     let mut bindings = Vec::with_capacity(fills.len());
     for paper in &fills {
         let matches = terminals
             .get(paper.plan_id.as_str())
-            .map(Vec::as_slice)
-            .unwrap_or_default();
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|terminal| {
+                terminal.code == paper.code
+                    && terminal.decision_basis == paper.virtual_reason
+                    && terminal.side == paper.direction
+                    && terminal.requested_price.to_bits() == paper.requested_price.to_bits()
+                    && terminal.execution_price.map(f64::to_bits)
+                        == paper.fill_price.map(f64::to_bits)
+                    && terminal.quantity == paper.quantity
+                    && terminal.failure_reason.is_none()
+            })
+            .collect::<Vec<_>>();
         if matches.len() != 1 {
             return Err(failed_integrity(format!(
                 "BR-255 Filled paper id={} has {} terminal audit bindings",
@@ -1692,18 +2033,7 @@ fn analyze_source_projection(
                 terminal.id
             ))
         })?;
-        let fill_price = paper.fill_price.ok_or_else(|| {
-            failed_integrity(format!(
-                "BR-255 Filled paper id={} has no fill price",
-                paper.id
-            ))
-        })?;
-        if terminal.code != paper.code
-            || terminal.side != paper.direction
-            || terminal.requested_price.to_bits() != paper.requested_price.to_bits()
-            || execution_price.to_bits() != fill_price.to_bits()
-            || terminal.quantity != paper.quantity
-            || !terminal.requested_price.is_finite()
+        if !terminal.requested_price.is_finite()
             || terminal.requested_price <= 0.0
             || !execution_price.is_finite()
             || execution_price <= 0.0
@@ -1713,7 +2043,7 @@ fn analyze_source_projection(
                 paper.id, terminal.id
             )));
         }
-        let terminal_time = terminal
+        let quote_observed_at = terminal
             .quote_observed_at
             .as_deref()
             .filter(|value| !value.trim().is_empty())
@@ -1730,8 +2060,40 @@ fn analyze_source_projection(
                         terminal.id
                     ))
                 })
+            })?;
+        let terminal_at = parse_paper_fill_timestamp(terminal.id, &terminal.created_at)
+            .map_err(|detail| {
+                failed_integrity(format!(
+                    "BR-255 terminal audit id={} created_at is invalid: {detail}",
+                    terminal.id
+                ))
             })?
-            .with_timezone(&shanghai);
+            .and_utc();
+        let quote_observed_at_utc = quote_observed_at.with_timezone(&Utc);
+        if quote_observed_at_utc > terminal_at {
+            return Err(failed_integrity(format!(
+                "BR-255 terminal audit id={} quote time is in the future",
+                terminal.id
+            )));
+        }
+        let quote_age = terminal_at
+            .signed_duration_since(quote_observed_at_utc)
+            .num_milliseconds();
+        if quote_age > 5_000 {
+            return Err(failed_integrity(format!(
+                "BR-255 terminal audit id={} quote is stale by {quote_age}ms",
+                terminal.id
+            )));
+        }
+        let paper_created_at = parse_paper_fill_timestamp(paper.id, &paper.occurred_at)
+            .map_err(failed_integrity)?
+            .and_utc();
+        if paper_created_at + chrono::Duration::seconds(1) < quote_observed_at_utc {
+            return Err(failed_integrity(format!(
+                "BR-255 paper id={} persistence time precedes terminal quote evidence",
+                paper.id
+            )));
+        }
         let terminal_audit_hash = chain_hashes.get(&terminal.id).ok_or_else(|| {
             failed_integrity(format!(
                 "BR-255 terminal audit id={} has no canonical chain hash",
@@ -1742,7 +2104,7 @@ fn analyze_source_projection(
             paper_trade_id: paper.id,
             terminal_audit_id: terminal.id,
             terminal_audit_hash: (*terminal_audit_hash).to_owned(),
-            terminal_time: terminal_time.to_rfc3339(),
+            terminal_time: terminal_at.to_rfc3339_opts(SecondsFormat::Millis, true),
         });
     }
     let terminal_binding_manifest_hash = hash_json(
@@ -2159,68 +2521,135 @@ pub(crate) fn load_verified_epoch_fills_until(
 
 impl<'a> AttributionEpochStore<'a> {
     pub fn new(database: &'a DatabaseManager) -> Self {
-        Self { database }
+        let read_only_preview_path =
+            database
+                .selection_connection_source
+                .as_ref()
+                .and_then(|source| {
+                    super::sqlite_open_route_from_retained_parent(&source.parent, &source.leaf).ok()
+                });
+        Self {
+            database,
+            read_only_preview_path,
+        }
+    }
+
+    /// Supplies the filesystem route used only to establish a cold `mode=ro`
+    /// preview connection. Activation continues to use the manager's verified
+    /// write connection and never trusts this route for mutation authority.
+    pub fn with_read_only_preview_path(
+        database: &'a DatabaseManager,
+        database_path: PathBuf,
+    ) -> Self {
+        Self {
+            database,
+            read_only_preview_path: Some(database_path),
+        }
     }
 
     pub fn preview_activation(
         &self,
         request: &EpochActivationRequest,
     ) -> Result<EpochActivationPreview, AttributionEpochStoreError> {
-        let mut conn = self.database.get_conn().map_err(|error| {
+        let database_path = self.read_only_preview_path.as_ref().ok_or_else(|| {
             activation_unavailable(
-                "attribution_epoch_storage_unavailable",
-                true,
-                format!("BR-255 preview database connection unavailable: {error}"),
+                "attribution_epoch_preview_read_only_path_unavailable",
+                false,
+                "BR-255 preview requires a database-owned cold read-only route",
             )
         })?;
-        let existing_tables = diesel::sql_query(
-            "SELECT COUNT(*) AS count FROM sqlite_master
-             WHERE type='table' AND name IN (
-                'attribution_sample_epoch_receipt',
-                'attribution_sample_epoch_receipt_chain',
-                'attribution_legacy_carry_item',
-                'attribution_epoch_attempt_audit',
-                'attribution_epoch_attempt_chain',
-                'paper_attribution_epoch_daily',
-                'paper_attribution_epoch_daily_chain'
-             )",
-        )
-        .get_result::<CountRow>(&mut conn)?
-        .count;
-        if existing_tables != 0 && existing_tables != 7 {
-            return Err(failed_integrity(format!(
-                "BR-255 preview found partial epoch schema: {existing_tables} of 7 tables"
-            )));
-        }
-        if existing_tables == 7 {
-            let receipts = validate_all(&mut conn)?;
-            if receipts.len() > 1 {
-                return Err(failed_integrity(
-                    "BR-255 v1 preview found multiple activation receipts",
-                ));
-            }
-            if let Some(row) = receipts.first() {
-                let receipt = receipt_value(row)?;
-                let source = ensure_source_matches_receipt(&mut conn, &receipt)?;
-                return activation_preview(
-                    true,
-                    receipt.cutover_completed_trading_date,
-                    receipt.effective_trading_date,
-                    source,
-                    &receipt.calendar_authority_hash,
-                );
-            }
-        }
         let (completed, effective, calendar_hash) =
             resolve_activation_calendar(request.invoked_at)?;
-        let source = analyze_source_projection(&mut conn, completed, None, true)?;
-        activation_preview(false, completed, effective, source, &calendar_hash)
+        let before = preview_sqlite_snapshot(database_path)?;
+        if let Err(error) = reject_preview_wal_state(database_path, &before) {
+            let after = preview_sqlite_snapshot(database_path)?;
+            if after != before {
+                return Err(failed_integrity(
+                    "BR-255 SQLite files changed while refusing unsafe preview WAL state",
+                ));
+            }
+            return Err(error);
+        }
+        let clean_wal_header = sqlite_header_uses_wal(database_path)?;
+        let primary = (|| {
+            let read_only_url = read_only_sqlite_uri(database_path, clean_wal_header)?;
+            let mut conn = SqliteConnection::establish(&read_only_url).map_err(|error| {
+                activation_unavailable(
+                    "attribution_epoch_preview_storage_unavailable",
+                    true,
+                    format!("BR-255 cold read-only preview connection unavailable: {error}"),
+                )
+            })?;
+            diesel::sql_query("PRAGMA query_only=ON")
+                .execute(&mut conn)
+                .map_err(|error| {
+                    activation_unavailable(
+                        "attribution_epoch_preview_storage_unavailable",
+                        true,
+                        format!("BR-255 preview connection is not query-only: {error}"),
+                    )
+                })?;
+            conn.transaction::<_, AttributionEpochStoreError, _>(|conn| {
+                let existing_tables = diesel::sql_query(
+                    "SELECT COUNT(*) AS count FROM sqlite_master
+                     WHERE type='table' AND name IN (
+                        'attribution_sample_epoch_receipt',
+                        'attribution_sample_epoch_receipt_chain',
+                        'attribution_legacy_carry_item',
+                        'attribution_epoch_attempt_audit',
+                        'attribution_epoch_attempt_chain',
+                        'paper_attribution_epoch_daily',
+                        'paper_attribution_epoch_daily_chain'
+                     )",
+                )
+                .get_result::<CountRow>(conn)?
+                .count;
+                if existing_tables != 0 && existing_tables != 7 {
+                    return Err(failed_integrity(format!(
+                        "BR-255 preview found partial epoch schema: {existing_tables} of 7 tables"
+                    )));
+                }
+                if existing_tables == 7 {
+                    let receipts = validate_all(conn)?;
+                    if receipts.len() > 1 {
+                        return Err(failed_integrity(
+                            "BR-255 v1 preview found multiple activation receipts",
+                        ));
+                    }
+                    if let Some(row) = receipts.first() {
+                        let receipt = receipt_value(row)?;
+                        let source = ensure_source_matches_receipt(conn, &receipt)?;
+                        return activation_preview(
+                            true,
+                            receipt.cutover_completed_trading_date,
+                            receipt.effective_trading_date,
+                            source,
+                            &receipt.calendar_authority_hash,
+                        );
+                    }
+                }
+                let source = analyze_source_projection(conn, completed, None, true)?;
+                activation_preview(false, completed, effective, source, &calendar_hash)
+            })
+        })();
+        let after = preview_sqlite_snapshot(database_path)?;
+        if after != before {
+            return Err(failed_integrity(
+                "BR-255 read-only preview changed main/WAL/SHM bytes, existence, or mtime",
+            ));
+        }
+        primary
     }
 
     pub fn activate_once(
         &self,
         request: EpochActivationRequest,
     ) -> Result<AttributionEpochReceipt, AttributionEpochStoreError> {
+        let (completed, effective, calendar_hash) =
+            match resolve_activation_calendar(request.invoked_at) {
+                Ok(resolved) => resolved,
+                Err(error) => return self.return_audited_failure(&request, error),
+            };
         let mut conn = match self.database.get_conn() {
             Ok(conn) => conn,
             Err(error) => {
@@ -2244,7 +2673,9 @@ impl<'a> AttributionEpochStore<'a> {
             };
         let invoked_at = canonical_invoked_at(request.invoked_at);
         let primary = conn.immediate_transaction::<_, AttributionEpochStoreError, _>(|conn| {
-            let receipts = validate_all(conn)?;
+            let receipts = validate_all(conn).map_err(|error| {
+                activation_error_context("activation_transaction_validate_initial", error.into())
+            })?;
             if receipts.len() > 1 {
                 return Err(failed_integrity(
                     "BR-255 v1 activation found multiple success receipts",
@@ -2252,7 +2683,9 @@ impl<'a> AttributionEpochStore<'a> {
             }
             if let Some(row) = receipts.first() {
                 let receipt = receipt_value(row)?;
-                ensure_source_matches_receipt(conn, &receipt)?;
+                ensure_source_matches_receipt(conn, &receipt).map_err(|error| {
+                    activation_error_context("activation_idempotent_verify_source", error)
+                })?;
                 insert_attempt_on_conn(
                     conn,
                     &AttributionEpochAttemptAppend {
@@ -2267,17 +2700,28 @@ impl<'a> AttributionEpochStore<'a> {
                         epoch_id: Some(receipt.epoch_id.clone()),
                         success_receipt_hash: Some(receipt.receipt_hash.clone()),
                     },
-                )?;
-                validate_all(conn)?;
+                )
+                .map_err(|error| {
+                    activation_error_context("activation_idempotent_append_attempt", error)
+                })?;
+                validate_all(conn).map_err(|error| {
+                    activation_error_context(
+                        "activation_idempotent_validate_committed_state",
+                        error.into(),
+                    )
+                })?;
                 return Ok(receipt);
             }
-
-            let (completed, effective, calendar_hash) =
-                resolve_activation_calendar(request.invoked_at)?;
-            let source_before = analyze_source_projection(conn, completed, None, true)?;
+            let source_before =
+                analyze_source_projection(conn, completed, None, true).map_err(|error| {
+                    activation_error_context("activation_first_analyze_source", error)
+                })?;
             let preview =
                 activation_preview(false, completed, effective, source_before, &calendar_hash)?;
-            let receipt = insert_activation_receipt(conn, &preview, &calendar_hash)?;
+            let receipt =
+                insert_activation_receipt(conn, &preview, &calendar_hash).map_err(|error| {
+                    activation_error_context("activation_first_insert_receipt", error)
+                })?;
             insert_attempt_on_conn(
                 conn,
                 &AttributionEpochAttemptAppend {
@@ -2292,8 +2736,12 @@ impl<'a> AttributionEpochStore<'a> {
                     epoch_id: Some(receipt.epoch_id.clone()),
                     success_receipt_hash: Some(receipt.receipt_hash.clone()),
                 },
-            )?;
-            let source_after = analyze_source_projection(conn, completed, None, true)?;
+            )
+            .map_err(|error| activation_error_context("activation_first_append_attempt", error))?;
+            let source_after =
+                analyze_source_projection(conn, completed, None, true).map_err(|error| {
+                    activation_error_context("activation_first_reanalyze_source", error)
+                })?;
             let after =
                 activation_preview(false, completed, effective, source_after, &calendar_hash)?;
             if after != preview {
@@ -2301,8 +2749,12 @@ impl<'a> AttributionEpochStore<'a> {
                     "BR-255 source position projection changed during activation",
                 ));
             }
-            validate_all(conn)?;
-            ensure_source_matches_receipt(conn, &receipt)?;
+            validate_all(conn).map_err(|error| {
+                activation_error_context("activation_first_validate_written_state", error.into())
+            })?;
+            ensure_source_matches_receipt(conn, &receipt).map_err(|error| {
+                activation_error_context("activation_first_verify_written_source", error)
+            })?;
             Ok(receipt)
         });
         drop(conn);
@@ -2330,13 +2782,20 @@ impl<'a> AttributionEpochStore<'a> {
                         "BR-255 committed activation read-back is not query-only: {error}"
                     ))
                 })?;
-            let rows = validate_all(&mut read_only)?;
+            let rows = validate_all(&mut read_only).map_err(|error| {
+                activation_error_context(
+                    "post_commit_read_back_validate_retained_state",
+                    error.into(),
+                )
+            })?;
             if rows.len() != 1 || receipt_value(&rows[0])? != receipt {
                 return Err(failed_integrity(
                     "BR-255 committed activation read-back receipt differs",
                 ));
             }
-            verify_epoch_source_prefix(&mut read_only, &receipt)?;
+            verify_epoch_source_prefix(&mut read_only, &receipt).map_err(|error| {
+                activation_error_context("post_commit_read_back_verify_source_prefix", error)
+            })?;
             Ok(())
         })();
         if let Err(error) = read_back {
@@ -2709,9 +3168,30 @@ mod tests {
         }
     }
 
-    struct TestDatabase {
+    struct TestDatabaseCleanup {
         path: PathBuf,
+    }
+
+    impl Drop for TestDatabaseCleanup {
+        fn drop(&mut self) {
+            if self.path == PathBuf::from(":memory:") {
+                return;
+            }
+            for suffix in ["", "-wal", "-shm"] {
+                let candidate = PathBuf::from(format!("{}{}", self.path.display(), suffix));
+                if let Err(error) = std::fs::remove_file(&candidate) {
+                    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+                }
+            }
+        }
+    }
+
+    struct TestDatabase {
+        // Fields drop in declaration order. Close the pool before unlinking its
+        // WAL files so fixture cleanup cannot race live SQLite handles.
         manager: DatabaseManager,
+        path: PathBuf,
+        _cleanup: TestDatabaseCleanup,
     }
 
     impl TestDatabase {
@@ -2720,6 +3200,18 @@ mod tests {
         }
 
         fn with_options(pool_size: u32, install_epoch_schema: bool) -> Self {
+            Self::with_journal_options(pool_size, install_epoch_schema, false)
+        }
+
+        fn with_wal_options(pool_size: u32, install_epoch_schema: bool) -> Self {
+            Self::with_journal_options(pool_size, install_epoch_schema, true)
+        }
+
+        fn with_journal_options(
+            pool_size: u32,
+            install_epoch_schema: bool,
+            production_wal: bool,
+        ) -> Self {
             let nonce = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("TEST_CODE clock")
@@ -2730,6 +3222,21 @@ mod tests {
                 nonce
             ));
             let database_url = path.to_string_lossy().into_owned();
+            if production_wal {
+                let mut bootstrap = SqliteConnection::establish(&database_url)
+                    .expect("TEST_CODE SQLite bootstrap connection");
+                diesel::sql_query("PRAGMA busy_timeout = 5000")
+                    .execute(&mut bootstrap)
+                    .expect("TEST_CODE bootstrap busy timeout");
+                let journal_mode = diesel::sql_query("PRAGMA journal_mode = WAL")
+                    .get_result::<super::super::JournalModeRow>(&mut bootstrap)
+                    .expect("TEST_CODE bootstrap WAL mode")
+                    .journal_mode;
+                assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+                super::super::configure_sqlite_connection(&mut bootstrap)
+                    .expect("TEST_CODE bootstrap SQLite configuration");
+                drop(bootstrap);
+            }
             let pool = super::super::build_sqlite_pool_with_size(database_url, pool_size)
                 .expect("TEST_CODE isolated SQLite pool");
             if install_epoch_schema {
@@ -2737,12 +3244,13 @@ mod tests {
                 create_schema(&mut conn).expect("TEST_CODE epoch schema");
             }
             Self {
-                path,
                 manager: DatabaseManager {
                     pool,
                     selection_connection_source: None,
                     selection_schema_authority: None,
                 },
+                path: path.clone(),
+                _cleanup: TestDatabaseCleanup { path },
             }
         }
 
@@ -2754,26 +3262,15 @@ mod tests {
                 create_schema(&mut conn).expect("TEST_CODE in-memory epoch schema");
             }
             Self {
-                path: PathBuf::from(":memory:"),
                 manager: DatabaseManager {
                     pool,
                     selection_connection_source: None,
                     selection_schema_authority: None,
                 },
-            }
-        }
-    }
-
-    impl Drop for TestDatabase {
-        fn drop(&mut self) {
-            if self.path == PathBuf::from(":memory:") {
-                return;
-            }
-            for suffix in ["", "-wal", "-shm"] {
-                let candidate = PathBuf::from(format!("{}{}", self.path.display(), suffix));
-                if let Err(error) = std::fs::remove_file(&candidate) {
-                    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
-                }
+                path: PathBuf::from(":memory:"),
+                _cleanup: TestDatabaseCleanup {
+                    path: PathBuf::from(":memory:"),
+                },
             }
         }
     }
@@ -2789,7 +3286,9 @@ mod tests {
                 id INTEGER PRIMARY KEY, plan_id TEXT NOT NULL UNIQUE,
                 code TEXT NOT NULL, name TEXT NOT NULL, direction TEXT NOT NULL,
                 price REAL NOT NULL, quantity INTEGER NOT NULL, status TEXT NOT NULL,
-                fill_price REAL, virtual_reason TEXT NOT NULL, ts TEXT NOT NULL
+                fill_price REAL, not_fill_reason TEXT, virtual_reason TEXT NOT NULL,
+                account_mode TEXT NOT NULL, data_mode TEXT NOT NULL,
+                ts TEXT NOT NULL, updated_at TEXT NOT NULL
              );
              CREATE TABLE order_audit (
                 id INTEGER PRIMARY KEY, business_order_id TEXT NOT NULL,
@@ -2811,26 +3310,28 @@ mod tests {
                 "TEST_CODE_PLAN_BUY",
                 "buy",
                 200_i64,
-                "2026-08-27 10:00:00",
+                "2026-08-27 02:00:00",
             ),
             (
                 2_i64,
                 "TEST_CODE_PLAN_SELL",
                 "sell",
                 100_i64,
-                "2026-08-28 10:00:00",
+                "2026-08-28 02:00:00",
             ),
         ] {
             diesel::sql_query(
                 "INSERT INTO paper_trades
-                 (id,plan_id,code,name,direction,price,quantity,status,fill_price,virtual_reason,ts)
-                 VALUES (?,?,'TEST_CODE_600001','TEST_CODE company',?,10.0,?,'Filled',10.0,
-                         'TEST_CODE activation',?)",
+                 (id,plan_id,code,name,direction,price,quantity,status,fill_price,not_fill_reason,
+                  virtual_reason,account_mode,data_mode,ts,updated_at)
+                 VALUES (?,?,'TEST_CODE_600001','TEST_CODE company',?,10.0,?,'Filled',10.0,NULL,
+                         'TEST_CODE activation','Normal','Full',?,?)",
             )
             .bind::<BigInt, _>(id)
             .bind::<Text, _>(plan)
             .bind::<Text, _>(direction)
             .bind::<BigInt, _>(quantity)
+            .bind::<Text, _>(timestamp)
             .bind::<Text, _>(timestamp)
             .execute(&mut conn)
             .expect("TEST_CODE paper fill");
@@ -2838,16 +3339,23 @@ mod tests {
                 id,
                 business_order_id: plan.to_owned(),
                 source: "PaperTrade".to_owned(),
-                decision_basis: "TEST_CODE terminal".to_owned(),
+                decision_basis: "TEST_CODE activation".to_owned(),
                 side: direction.to_owned(),
                 code: "TEST_CODE_600001".to_owned(),
                 requested_price: 10.0,
                 execution_price: Some(10.0),
                 quantity,
-                quote_observed_at: Some(format!("{}T{}+08:00", &timestamp[..10], &timestamp[11..])),
+                quote_observed_at: Some(format!(
+                    "{}T{}+08:00",
+                    &timestamp[..10],
+                    match &timestamp[11..] {
+                        "02:00:00" => "10:00:00",
+                        other => other,
+                    }
+                )),
                 outcome: "Filled".to_owned(),
                 failure_reason: None,
-                created_at: "2026-08-28 15:30:00".to_owned(),
+                created_at: format!("{} 02:00:01", &timestamp[..10]),
             };
             diesel::sql_query(
                 "INSERT INTO order_audit
@@ -2879,7 +3387,7 @@ mod tests {
             .bind::<BigInt, _>(id)
             .bind::<Text, _>(&previous)
             .bind::<Text, _>(&record_hash)
-            .bind::<Text, _>("2026-08-28 15:30:00")
+            .bind::<Text, _>(&audit.created_at)
             .execute(&mut conn)
             .expect("TEST_CODE audit chain row");
             previous = record_hash;
@@ -2907,14 +3415,16 @@ mod tests {
             });
         diesel::sql_query(
             "INSERT INTO paper_trades
-             (id,plan_id,code,name,direction,price,quantity,status,fill_price,virtual_reason,ts)
-             VALUES (?,?,'TEST_CODE_600001','TEST_CODE company',?,10.0,?,'Filled',10.0,
-                     'TEST_CODE activation',?)",
+             (id,plan_id,code,name,direction,price,quantity,status,fill_price,not_fill_reason,
+              virtual_reason,account_mode,data_mode,ts,updated_at)
+             VALUES (?,?,'TEST_CODE_600001','TEST_CODE company',?,10.0,?,'Filled',10.0,NULL,
+                     'TEST_CODE activation','Normal','Full',?,?)",
         )
         .bind::<BigInt, _>(id)
         .bind::<Text, _>(plan)
         .bind::<Text, _>(direction)
         .bind::<BigInt, _>(quantity)
+        .bind::<Text, _>(timestamp)
         .bind::<Text, _>(timestamp)
         .execute(&mut conn)
         .unwrap();
@@ -2922,16 +3432,26 @@ mod tests {
             id,
             business_order_id: plan.to_owned(),
             source: "PaperTrade".to_owned(),
-            decision_basis: "TEST_CODE terminal".to_owned(),
+            decision_basis: "TEST_CODE activation".to_owned(),
             side: direction.to_owned(),
             code: "TEST_CODE_600001".to_owned(),
             requested_price: 10.0,
             execution_price: Some(10.0),
             quantity,
-            quote_observed_at: Some(format!("{}T{}+08:00", &timestamp[..10], &timestamp[11..])),
+            quote_observed_at: Some(
+                chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%d %H:%M:%S")
+                    .unwrap()
+                    .and_utc()
+                    .with_timezone(&FixedOffset::east_opt(8 * 60 * 60).unwrap())
+                    .to_rfc3339(),
+            ),
             outcome: "Filled".to_owned(),
             failure_reason: None,
-            created_at: "2026-08-31 15:30:00".to_owned(),
+            created_at: (chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%d %H:%M:%S")
+                .unwrap()
+                + chrono::Duration::seconds(1))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string(),
         };
         diesel::sql_query(
             "INSERT INTO order_audit
@@ -2962,16 +3482,108 @@ mod tests {
         .bind::<BigInt, _>(id)
         .bind::<Text, _>(&previous)
         .bind::<Text, _>(&record_hash)
-        .bind::<Text, _>("2026-08-31 15:30:00")
+        .bind::<Text, _>(&audit.created_at)
         .execute(&mut conn)
         .unwrap();
+    }
+
+    fn rewrite_test_audit_chain(manager: &DatabaseManager) {
+        use crate::database::order_audit::canonical_order_audit_record_hash;
+
+        let mut conn = manager.get_conn().unwrap();
+        let audits = load_order_audit_rows(&mut conn).unwrap();
+        let mut previous = AUDIT_CHAIN_GENESIS.to_owned();
+        for audit in audits {
+            let record_hash = canonical_order_audit_record_hash(&previous, &audit).unwrap();
+            diesel::sql_query(
+                "UPDATE order_audit_chain SET previous_hash=?,record_hash=?
+                 WHERE order_audit_id=?",
+            )
+            .bind::<Text, _>(&previous)
+            .bind::<Text, _>(&record_hash)
+            .bind::<BigInt, _>(audit.id)
+            .execute(&mut conn)
+            .unwrap();
+            previous = record_hash;
+        }
+    }
+
+    fn append_duplicate_terminal(manager: &DatabaseManager) {
+        use crate::database::order_audit::{
+            canonical_order_audit_record_hash, CanonicalOrderAuditRow,
+        };
+
+        let mut conn = manager.get_conn().unwrap();
+        let previous = load_order_audit_chain_rows(&mut conn)
+            .unwrap()
+            .last()
+            .unwrap()
+            .record_hash
+            .clone();
+        let audit = CanonicalOrderAuditRow {
+            id: 3,
+            business_order_id: "TEST_CODE_PLAN_BUY".to_owned(),
+            source: "PaperTrade".to_owned(),
+            decision_basis: "TEST_CODE activation".to_owned(),
+            side: "buy".to_owned(),
+            code: "TEST_CODE_600001".to_owned(),
+            requested_price: 10.0,
+            execution_price: Some(10.0),
+            quantity: 200,
+            quote_observed_at: Some("2026-08-27T10:00:00+08:00".to_owned()),
+            outcome: "Filled".to_owned(),
+            failure_reason: None,
+            created_at: "2026-08-27 02:00:01".to_owned(),
+        };
+        diesel::sql_query(
+            "INSERT INTO order_audit
+             (id,business_order_id,source,decision_basis,side,code,requested_price,
+              execution_price,quantity,quote_observed_at,outcome,failure_reason,created_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        )
+        .bind::<BigInt, _>(audit.id)
+        .bind::<Text, _>(&audit.business_order_id)
+        .bind::<Text, _>(&audit.source)
+        .bind::<Text, _>(&audit.decision_basis)
+        .bind::<Text, _>(&audit.side)
+        .bind::<Text, _>(&audit.code)
+        .bind::<Double, _>(audit.requested_price)
+        .bind::<Nullable<Double>, _>(audit.execution_price)
+        .bind::<BigInt, _>(audit.quantity)
+        .bind::<Nullable<Text>, _>(&audit.quote_observed_at)
+        .bind::<Text, _>(&audit.outcome)
+        .bind::<Nullable<Text>, _>(&audit.failure_reason)
+        .bind::<Text, _>(&audit.created_at)
+        .execute(&mut conn)
+        .unwrap();
+        let record_hash = canonical_order_audit_record_hash(&previous, &audit).unwrap();
+        diesel::sql_query(
+            "INSERT INTO order_audit_chain
+             (order_audit_id,previous_hash,record_hash,created_at) VALUES (?,?,?,?)",
+        )
+        .bind::<BigInt, _>(audit.id)
+        .bind::<Text, _>(&previous)
+        .bind::<Text, _>(&record_hash)
+        .bind::<Text, _>(&audit.created_at)
+        .execute(&mut conn)
+        .unwrap();
+    }
+
+    fn activation_error_detail(error: AttributionEpochStoreError) -> String {
+        match error {
+            AttributionEpochStoreError::FailedIntegrity { detail, .. }
+            | AttributionEpochStoreError::Unavailable { detail, .. } => detail,
+        }
     }
 
     #[test]
     fn activation_preview_and_commit_freeze_one_verified_epoch() {
         let database = TestDatabase::new();
         install_activation_source(&database.manager);
-        let store = AttributionEpochStore::new(&database.manager);
+        let store = AttributionEpochStore::with_read_only_preview_path(
+            &database.manager,
+            database.path.clone(),
+        );
         let request = activation_request("2026-08-28T15:40:00+08:00");
 
         let preview = store
@@ -3007,7 +3619,7 @@ mod tests {
             "TEST_CODE_PLAN_NEW",
             "buy",
             100,
-            "2026-08-31 10:00:00",
+            "2026-08-31 02:00:00",
         );
         let retried = store
             .activate_once(activation_request("2026-09-01T15:40:00+08:00"))
@@ -3031,7 +3643,7 @@ mod tests {
             "TEST_CODE_PLAN_LATE",
             "buy",
             100,
-            "2026-08-28 15:45:00",
+            "2026-08-28 07:45:00",
         );
         let mut conn = database.manager.get_conn().unwrap();
         let error = load_verified_epoch_fills_until(
@@ -3041,6 +3653,82 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
+    }
+
+    #[test]
+    fn activation_retry_revalidates_every_invocation_before_idempotent_success() {
+        let database = TestDatabase::new();
+        install_activation_source(&database.manager);
+        let store = AttributionEpochStore::new(&database.manager);
+        let receipt = store
+            .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
+            .unwrap();
+
+        for (raw, expected) in [
+            (
+                "2026-08-28T15:40:00+07:00",
+                "attribution_epoch_invalid_timezone",
+            ),
+            (
+                "2026-08-29T15:40:00+08:00",
+                "attribution_epoch_non_trading_day",
+            ),
+            (
+                "2026-08-28T15:34:59+08:00",
+                "attribution_epoch_window_not_open",
+            ),
+            (
+                "2026-08-28T15:50:01+08:00",
+                "attribution_epoch_window_closed",
+            ),
+            (
+                "2027-01-04T15:40:00+08:00",
+                "attribution_epoch_calendar_coverage_unavailable",
+            ),
+        ] {
+            let error = store.activate_once(activation_request(raw)).unwrap_err();
+            assert_eq!(error.reason_code(), expected, "TEST_CODE {raw}");
+        }
+
+        let mut conn = database.manager.get_conn().unwrap();
+        assert_eq!(
+            receipt_value(&validate_all(&mut conn).unwrap()[0]).unwrap(),
+            receipt
+        );
+        let attempts = validate_attempts(&mut conn).unwrap();
+        assert_eq!(
+            attempts
+                .iter()
+                .filter(|attempt| attempt.outcome == "success")
+                .count(),
+            1
+        );
+        assert_eq!(attempts.len(), 6);
+    }
+
+    #[test]
+    fn activation_high_water_includes_valid_non_filled_paper_rows() {
+        let database = TestDatabase::new();
+        install_activation_source(&database.manager);
+        let mut conn = database.manager.get_conn().unwrap();
+        diesel::sql_query(
+            "INSERT INTO paper_trades
+             (id,plan_id,code,name,direction,price,quantity,status,fill_price,not_fill_reason,
+              virtual_reason,account_mode,data_mode,ts,updated_at)
+             VALUES (3,'TEST_CODE_NOT_FILLED','TEST_CODE_600001','TEST_CODE company',
+                     'buy',10.0,100,'NotFilled',NULL,'TEST_CODE limit up',
+                     'TEST_CODE activation','ReduceOnly','Degraded',
+                     '2026-08-28 03:00:00','2026-08-28 03:00:01')",
+        )
+        .execute(&mut conn)
+        .unwrap();
+        drop(conn);
+
+        let receipt = AttributionEpochStore::new(&database.manager)
+            .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
+            .unwrap();
+        assert_eq!(receipt.paper_trade_high_water, 3);
+        assert_eq!(receipt.carry_total_quantity, 100);
     }
 
     #[test]
@@ -3072,10 +3760,15 @@ mod tests {
             })
         };
         let before = [snapshot(""), snapshot("-wal"), snapshot("-shm")];
-        let preview = AttributionEpochStore::new(&database.manager)
-            .preview_activation(&activation_request("2026-08-28T15:40:00+08:00"))
-            .unwrap();
+        let held_pool_connection = database.manager.get_conn().unwrap();
+        let preview = AttributionEpochStore::with_read_only_preview_path(
+            &database.manager,
+            database.path.clone(),
+        )
+        .preview_activation(&activation_request("2026-08-28T15:40:00+08:00"))
+        .unwrap();
         assert!(!preview.activated);
+        drop(held_pool_connection);
         assert_eq!(
             [snapshot(""), snapshot("-wal"), snapshot("-shm")],
             before,
@@ -3090,6 +3783,106 @@ mod tests {
         .unwrap()
         .count;
         assert_eq!(tables, 0);
+    }
+
+    #[test]
+    fn activation_preview_fails_before_reading_a_live_wal_and_preserves_sidecars() {
+        let database = TestDatabase::with_options(1, false);
+        install_activation_source(&database.manager);
+        let mut writer = database.manager.get_conn().unwrap();
+        writer
+            .batch_execute(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE TEST_CODE_live_wal_fact(id INTEGER PRIMARY KEY);
+                 INSERT INTO TEST_CODE_live_wal_fact(id) VALUES (1);",
+            )
+            .unwrap();
+        let snapshot = |suffix: &str| {
+            let path = PathBuf::from(format!("{}{}", database.path.display(), suffix));
+            std::fs::read(&path).ok().map(|bytes| {
+                let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+                (bytes, modified)
+            })
+        };
+        let before = [snapshot(""), snapshot("-wal"), snapshot("-shm")];
+        assert!(before[1].is_some(), "TEST_CODE WAL sidecar must be live");
+        assert!(before[2].is_some(), "TEST_CODE SHM sidecar must be live");
+
+        let error = AttributionEpochStore::with_read_only_preview_path(
+            &database.manager,
+            database.path.clone(),
+        )
+        .preview_activation(&activation_request("2026-08-28T15:40:00+08:00"))
+        .unwrap_err();
+        assert_eq!(error.reason_code(), "attribution_epoch_preview_live_wal");
+        assert_eq!([snapshot(""), snapshot("-wal"), snapshot("-shm")], before);
+        drop(writer);
+    }
+
+    #[test]
+    fn activation_preview_reads_a_clean_wal_mode_header_without_creating_sidecars() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "TEST_CODE_clean_wal_preview_{}_{}.sqlite",
+            std::process::id(),
+            nonce
+        ));
+        let mut source = SqliteConnection::establish(path.to_str().unwrap()).unwrap();
+        source
+            .batch_execute(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE paper_trades (
+                    id INTEGER PRIMARY KEY, plan_id TEXT NOT NULL UNIQUE,
+                    code TEXT NOT NULL, name TEXT NOT NULL, direction TEXT NOT NULL,
+                    price REAL NOT NULL, quantity INTEGER NOT NULL, status TEXT NOT NULL,
+                    fill_price REAL, not_fill_reason TEXT, virtual_reason TEXT NOT NULL,
+                    account_mode TEXT NOT NULL, data_mode TEXT NOT NULL,
+                    ts TEXT NOT NULL, updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE order_audit (
+                    id INTEGER PRIMARY KEY, business_order_id TEXT NOT NULL,
+                    source TEXT NOT NULL, decision_basis TEXT NOT NULL, side TEXT NOT NULL,
+                    code TEXT NOT NULL, requested_price REAL NOT NULL, execution_price REAL,
+                    quantity INTEGER NOT NULL, quote_observed_at TEXT, outcome TEXT NOT NULL,
+                    failure_reason TEXT, created_at TEXT NOT NULL
+                 );
+                 CREATE TABLE order_audit_chain (
+                    order_audit_id INTEGER PRIMARY KEY, previous_hash TEXT NOT NULL,
+                    record_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
+                 );
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap();
+        drop(source);
+        for sidecar in [
+            sqlite_sidecar_path(&path, "-wal"),
+            sqlite_sidecar_path(&path, "-shm"),
+        ] {
+            if let Err(error) = std::fs::remove_file(&sidecar) {
+                assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+            }
+        }
+        assert!(!sqlite_sidecar_path(&path, "-wal").exists());
+        assert!(!sqlite_sidecar_path(&path, "-shm").exists());
+        let main_bytes = std::fs::read(&path).unwrap();
+        assert_eq!(main_bytes[18], 2, "TEST_CODE header read version");
+        assert_eq!(main_bytes[19], 2, "TEST_CODE header write version");
+        let before = preview_sqlite_snapshot(&path).unwrap();
+
+        let authority = TestDatabase::in_memory();
+        let preview =
+            AttributionEpochStore::with_read_only_preview_path(&authority.manager, path.clone())
+                .preview_activation(&activation_request("2026-08-28T15:40:00+08:00"))
+                .unwrap();
+        assert!(!preview.activated);
+        assert_eq!(preview.paper_trade_high_water, 0);
+        assert_eq!(preview.order_audit_high_water, 0);
+        assert_eq!(preview_sqlite_snapshot(&path).unwrap(), before);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -3126,8 +3919,15 @@ mod tests {
 
     #[test]
     fn activation_concurrent_callers_share_one_receipt() {
-        let database = TestDatabase::with_options(4, true);
+        let database = TestDatabase::with_wal_options(4, true);
         install_activation_source(&database.manager);
+        let mut conn = database.manager.get_conn().unwrap();
+        let journal_mode = diesel::sql_query("PRAGMA journal_mode")
+            .get_result::<super::super::JournalModeRow>(&mut conn)
+            .unwrap()
+            .journal_mode;
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        drop(conn);
         let barrier = std::sync::Barrier::new(2);
         let receipts = std::thread::scope(|scope| {
             let handles = (0..2)
@@ -3215,10 +4015,11 @@ mod tests {
         let mut conn = database.manager.get_conn().unwrap();
         diesel::sql_query(
             "INSERT INTO paper_trades
-             (id,plan_id,code,name,direction,price,quantity,status,fill_price,virtual_reason,ts)
+             (id,plan_id,code,name,direction,price,quantity,status,fill_price,not_fill_reason,
+              virtual_reason,account_mode,data_mode,ts,updated_at)
              VALUES (3,'TEST_CODE_MISSING_TERMINAL','TEST_CODE_600001','TEST_CODE company',
-                     'buy',10.0,100,'Filled',10.0,'TEST_CODE missing terminal',
-                     '2026-08-28 11:00:00')",
+                     'buy',10.0,100,'Filled',10.0,NULL,'TEST_CODE missing terminal',
+                     'Normal','Full','2026-08-28 03:00:00','2026-08-28 03:00:00')",
         )
         .execute(&mut conn)
         .unwrap();
@@ -3235,15 +4036,171 @@ mod tests {
     }
 
     #[test]
+    fn activation_rejects_every_malformed_paper_row_before_filled_projection() {
+        for (label, mutation, expected_detail) in [
+            (
+                "unknown status",
+                "UPDATE paper_trades SET status='TEST_CODE_UNKNOWN' WHERE id=1",
+                "status",
+            ),
+            (
+                "non-terminal status",
+                "UPDATE paper_trades SET status='SignalTriggered' WHERE id=1",
+                "status",
+            ),
+            (
+                "direction",
+                "UPDATE paper_trades SET direction='BUY' WHERE id=1",
+                "direction",
+            ),
+            (
+                "requested price",
+                "UPDATE paper_trades SET price=0.0 WHERE id=1",
+                "requested price",
+            ),
+            (
+                "quantity",
+                "UPDATE paper_trades SET quantity=50 WHERE id=1",
+                "quantity",
+            ),
+            (
+                "filled reason",
+                "UPDATE paper_trades SET not_fill_reason='TEST_CODE impossible' WHERE id=1",
+                "Filled",
+            ),
+            (
+                "risk mode",
+                "UPDATE paper_trades SET account_mode='TEST_CODE_UNKNOWN' WHERE id=1",
+                "risk context",
+            ),
+        ] {
+            let database = TestDatabase::new();
+            install_activation_source(&database.manager);
+            let mut conn = database.manager.get_conn().unwrap();
+            diesel::sql_query(mutation).execute(&mut conn).unwrap();
+            drop(conn);
+
+            let error = AttributionEpochStore::new(&database.manager)
+                .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
+                .unwrap_err();
+            assert_eq!(
+                error.reason_code(),
+                "attribution_epoch_integrity_failed",
+                "TEST_CODE {label}"
+            );
+            assert!(
+                activation_error_detail(error).contains(expected_detail),
+                "TEST_CODE {label} did not name {expected_detail}"
+            );
+            let mut conn = database.manager.get_conn().unwrap();
+            assert!(load_receipts(&mut conn).unwrap().is_empty());
+            assert_eq!(validate_attempts(&mut conn).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn activation_rejects_oversell_duplicate_terminal_and_audit_chain_corruption() {
+        for label in ["oversell", "duplicate terminal", "audit chain"] {
+            let database = TestDatabase::new();
+            install_activation_source(&database.manager);
+            match label {
+                "oversell" => {
+                    let mut conn = database.manager.get_conn().unwrap();
+                    diesel::sql_query("UPDATE paper_trades SET quantity=300 WHERE id=2")
+                        .execute(&mut conn)
+                        .unwrap();
+                    diesel::sql_query("UPDATE order_audit SET quantity=300 WHERE id=2")
+                        .execute(&mut conn)
+                        .unwrap();
+                    drop(conn);
+                    rewrite_test_audit_chain(&database.manager);
+                }
+                "duplicate terminal" => append_duplicate_terminal(&database.manager),
+                "audit chain" => {
+                    let mut conn = database.manager.get_conn().unwrap();
+                    diesel::sql_query(
+                        "UPDATE order_audit_chain SET record_hash=? WHERE order_audit_id=2",
+                    )
+                    .bind::<Text, _>("0".repeat(64))
+                    .execute(&mut conn)
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let error = AttributionEpochStore::new(&database.manager)
+                .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
+                .unwrap_err();
+            assert_eq!(
+                error.reason_code(),
+                "attribution_epoch_integrity_failed",
+                "TEST_CODE {label}"
+            );
+            let mut conn = database.manager.get_conn().unwrap();
+            assert!(load_receipts(&mut conn).unwrap().is_empty());
+            assert_eq!(validate_attempts(&mut conn).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn activation_rejects_terminal_time_mismatch_and_future_quote() {
+        for (label, quote, terminal_at, expected_detail) in [
+            (
+                "stale terminal",
+                "2026-08-27T10:00:00+08:00",
+                "2026-08-27 02:00:10",
+                "stale",
+            ),
+            (
+                "future quote",
+                "2026-08-27T10:00:02+08:00",
+                "2026-08-27 02:00:01",
+                "future",
+            ),
+            (
+                "quote after paper persistence",
+                "2026-08-27T10:00:02+08:00",
+                "2026-08-27 02:00:03",
+                "persistence time",
+            ),
+        ] {
+            let database = TestDatabase::new();
+            install_activation_source(&database.manager);
+            let mut conn = database.manager.get_conn().unwrap();
+            diesel::sql_query("UPDATE order_audit SET quote_observed_at=?,created_at=? WHERE id=1")
+                .bind::<Text, _>(quote)
+                .bind::<Text, _>(terminal_at)
+                .execute(&mut conn)
+                .unwrap();
+            drop(conn);
+            rewrite_test_audit_chain(&database.manager);
+
+            let error = AttributionEpochStore::new(&database.manager)
+                .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
+                .unwrap_err();
+            assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
+            assert!(
+                activation_error_detail(error).contains(expected_detail),
+                "TEST_CODE {label} did not name {expected_detail}"
+            );
+            let mut conn = database.manager.get_conn().unwrap();
+            assert!(load_receipts(&mut conn).unwrap().is_empty());
+            assert_eq!(validate_attempts(&mut conn).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
     fn activation_preview_rejects_partial_epoch_schema_without_healing_it() {
         let database = TestDatabase::with_options(1, false);
         install_activation_source(&database.manager);
         let mut conn = database.manager.get_conn().unwrap();
         diesel::sql_query(RECEIPT_TABLE).execute(&mut conn).unwrap();
         drop(conn);
-        let error = AttributionEpochStore::new(&database.manager)
-            .preview_activation(&activation_request("2026-08-28T15:40:00+08:00"))
-            .unwrap_err();
+        let error = AttributionEpochStore::with_read_only_preview_path(
+            &database.manager,
+            database.path.clone(),
+        )
+        .preview_activation(&activation_request("2026-08-28T15:40:00+08:00"))
+        .unwrap_err();
         assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
         let mut conn = database.manager.get_conn().unwrap();
         let count = diesel::sql_query(
