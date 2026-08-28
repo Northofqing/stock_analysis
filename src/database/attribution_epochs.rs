@@ -2569,6 +2569,90 @@ pub(crate) fn load_verified_epoch_fills_until(
     })
 }
 
+fn load_selector_with_connection(
+    conn: &mut SqliteConnection,
+    selector: &AttributionEpochSelector,
+) -> Result<ResolvedAttributionEpoch, AttributionEpochStoreError> {
+    let existing = diesel::sql_query(
+        "SELECT COUNT(*) AS count FROM sqlite_master
+         WHERE type = 'table' AND name IN (
+            'attribution_sample_epoch_receipt',
+            'attribution_sample_epoch_receipt_chain',
+            'attribution_legacy_carry_item',
+            'attribution_epoch_attempt_audit',
+            'attribution_epoch_attempt_chain',
+            'paper_attribution_epoch_daily',
+            'paper_attribution_epoch_daily_chain'
+         )",
+    )
+    .get_result::<CountRow>(conn)
+    .map_err(map_integrity)?
+    .count;
+    if existing == 0 {
+        return match selector {
+            AttributionEpochSelector::Legacy => Ok(ResolvedAttributionEpoch::Legacy),
+            _ => Err(unavailable(
+                "BR-255 attribution epoch storage has not been installed",
+            )),
+        };
+    }
+    if existing != 7 {
+        return Err(failed_integrity(format!(
+            "BR-255 attribution epoch schema is partial: {existing} of 7 tables"
+        )));
+    }
+    let rows = validate_all(conn).map_err(map_integrity)?;
+    match selector {
+        AttributionEpochSelector::Legacy => Ok(ResolvedAttributionEpoch::Legacy),
+        AttributionEpochSelector::Active => {
+            if rows.is_empty() {
+                return Err(unavailable(
+                    "BR-255 active attribution epoch has not been established",
+                ));
+            }
+            if rows.len() != 1 {
+                return Err(failed_integrity(
+                    "BR-255 v1 requires exactly one success receipt",
+                ));
+            }
+            receipt_value(&rows[0])
+                .map(ResolvedAttributionEpoch::Epoch)
+                .map_err(map_integrity)
+        }
+        AttributionEpochSelector::Exact(epoch_id) => rows
+            .iter()
+            .find(|row| row.epoch_id == *epoch_id)
+            .ok_or_else(|| {
+                unavailable(format!(
+                    "BR-255 exact attribution epoch is unavailable: {epoch_id}"
+                ))
+            })
+            .and_then(|row| {
+                receipt_value(row)
+                    .map(ResolvedAttributionEpoch::Epoch)
+                    .map_err(map_integrity)
+            }),
+    }
+}
+
+/// Fully validates and resolves one exact epoch using the caller's existing
+/// SQLite transaction connection. This read-only crate seam does not acquire a
+/// second connection or begin a nested transaction.
+pub(crate) fn load_exact_on_connection(
+    conn: &mut SqliteConnection,
+    epoch_id: &str,
+) -> Result<AttributionEpochReceipt, AttributionEpochStoreError> {
+    match load_selector_with_connection(
+        conn,
+        &AttributionEpochSelector::Exact(epoch_id.to_owned()),
+    )? {
+        ResolvedAttributionEpoch::Epoch(receipt) => Ok(receipt),
+        ResolvedAttributionEpoch::Legacy => Err(failed_integrity(
+            "BR-255 exact attribution epoch unexpectedly resolved as Legacy",
+        )),
+    }
+}
+
 impl<'a> AttributionEpochStore<'a> {
     pub fn new(database: &'a DatabaseManager) -> Self {
         let read_only_preview_path =
@@ -2922,66 +3006,7 @@ impl<'a> AttributionEpochStore<'a> {
                     retryable: true,
                     detail: format!("BR-255 epoch database connection unavailable: {error}"),
                 })?;
-        let existing = diesel::sql_query(
-            "SELECT COUNT(*) AS count FROM sqlite_master
-             WHERE type = 'table' AND name IN (
-                'attribution_sample_epoch_receipt',
-                'attribution_sample_epoch_receipt_chain',
-                'attribution_legacy_carry_item',
-                'attribution_epoch_attempt_audit',
-                'attribution_epoch_attempt_chain',
-                'paper_attribution_epoch_daily',
-                'paper_attribution_epoch_daily_chain'
-             )",
-        )
-        .get_result::<CountRow>(&mut conn)
-        .map_err(map_integrity)?
-        .count;
-        if existing == 0 {
-            return match selector {
-                AttributionEpochSelector::Legacy => Ok(ResolvedAttributionEpoch::Legacy),
-                _ => Err(unavailable(
-                    "BR-255 attribution epoch storage has not been installed",
-                )),
-            };
-        }
-        if existing != 7 {
-            return Err(failed_integrity(format!(
-                "BR-255 attribution epoch schema is partial: {existing} of 7 tables"
-            )));
-        }
-        let rows = validate_all(&mut conn).map_err(map_integrity)?;
-        match selector {
-            AttributionEpochSelector::Legacy => Ok(ResolvedAttributionEpoch::Legacy),
-            AttributionEpochSelector::Active => {
-                if rows.is_empty() {
-                    return Err(unavailable(
-                        "BR-255 active attribution epoch has not been established",
-                    ));
-                }
-                if rows.len() != 1 {
-                    return Err(failed_integrity(
-                        "BR-255 v1 requires exactly one success receipt",
-                    ));
-                }
-                receipt_value(&rows[0])
-                    .map(ResolvedAttributionEpoch::Epoch)
-                    .map_err(map_integrity)
-            }
-            AttributionEpochSelector::Exact(epoch_id) => rows
-                .iter()
-                .find(|row| row.epoch_id == *epoch_id)
-                .ok_or_else(|| {
-                    unavailable(format!(
-                        "BR-255 exact attribution epoch is unavailable: {epoch_id}"
-                    ))
-                })
-                .and_then(|row| {
-                    receipt_value(row)
-                        .map(ResolvedAttributionEpoch::Epoch)
-                        .map_err(map_integrity)
-                }),
-        }
+        load_selector_with_connection(&mut conn, selector)
     }
 
     pub fn verify_active(&self) -> Result<AttributionEpochReceipt, AttributionEpochStoreError> {
@@ -3670,6 +3695,36 @@ mod tests {
         assert_eq!(receipt.epoch_id, preview.epoch_id);
         assert_eq!(receipt.paper_trade_high_water, 2);
         assert_eq!(store.verify_active().unwrap(), receipt);
+    }
+
+    #[test]
+    fn exact_loader_fully_validates_on_callers_transaction_connection() {
+        let database = TestDatabase::new();
+        install_activation_source(&database.manager);
+        let receipt = AttributionEpochStore::new(&database.manager)
+            .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
+            .expect("TEST_CODE activate exact-loader epoch");
+        let mut conn = database
+            .manager
+            .get_conn()
+            .expect("TEST_CODE caller-owned transaction connection");
+
+        conn.immediate_transaction::<_, diesel::result::Error, _>(|conn| {
+            let loaded = load_exact_on_connection(conn, &receipt.epoch_id)
+                .expect("TEST_CODE exact loader inside existing write transaction");
+            assert_eq!(loaded, receipt);
+
+            diesel::sql_query("DROP TRIGGER trg_attribution_sample_epoch_receipt_no_update")
+                .execute(conn)?;
+            let error = load_exact_on_connection(conn, &receipt.epoch_id)
+                .expect_err("TEST_CODE same-connection trigger drift must fail full validation");
+            assert!(matches!(
+                error,
+                AttributionEpochStoreError::FailedIntegrity { .. }
+            ));
+            Ok(())
+        })
+        .expect("TEST_CODE caller transaction remains usable");
     }
 
     #[test]
