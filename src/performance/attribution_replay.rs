@@ -15,6 +15,11 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::attribution::SignalFamily;
+use super::attribution_epoch::{
+    canonical_exclusion_manifest_hash, canonical_legacy_carry_manifest_hash,
+    canonical_scoped_fill_manifest_hash, scope_epoch_fills, AttributionEpochSelector,
+    EpochExclusion, EpochExclusionReason, LegacyCarryPosition,
+};
 use super::economic_position::{
     rebuild_economic_positions, rebuild_economic_positions_with_replay_fees,
     select_economic_rows_through, CostBasisKind, EconomicFillRow, EntryFamilyComposition,
@@ -29,6 +34,10 @@ use crate::calendar::{
 use crate::data_gateway::{
     BenchmarkBar, BenchmarkBarTime, BenchmarkError, BenchmarkRange, BenchmarkReader,
     BenchmarkRequest, BenchmarkUnsupported, HS300_CANONICAL,
+};
+use crate::database::attribution_epochs::{
+    load_verified_epoch_fills_until, AttributionEpochReceipt, AttributionEpochStore,
+    AttributionEpochStoreError, ResolvedAttributionEpoch, VerifiedEpochFillSet,
 };
 use crate::database::attribution_reports::{
     AttributionEvidenceHash, AttributionFailureAppend, AttributionFailureReceipt,
@@ -248,6 +257,7 @@ pub enum AttributionConclusion {
 pub struct AttributionComputationReport {
     from: NaiveDate,
     to: NaiveDate,
+    epoch: AttributionEpochReplayEvidence,
     #[serde(rename = "source_fill_ids")]
     canonical_source_fill_ids: Vec<i64>,
     total_closed_cycles: usize,
@@ -299,6 +309,62 @@ impl AttributionComputationReport {
 
     pub fn to(&self) -> NaiveDate {
         self.to
+    }
+
+    pub fn epoch(&self) -> &AttributionEpochReplayEvidence {
+        &self.epoch
+    }
+
+    pub fn epoch_selector(&self) -> &AttributionEpochSelector {
+        self.epoch.selector()
+    }
+
+    pub fn epoch_id(&self) -> Option<&str> {
+        self.epoch.epoch_id()
+    }
+
+    pub fn epoch_receipt_hash(&self) -> Option<&str> {
+        self.epoch.receipt_hash()
+    }
+
+    pub fn epoch_effective_date(&self) -> Option<NaiveDate> {
+        self.epoch.effective_date()
+    }
+
+    pub fn legacy_carry_manifest_hash(&self) -> Option<&str> {
+        self.epoch.legacy_carry_manifest_hash()
+    }
+
+    pub fn exclusion_manifest_hash(&self) -> Option<&str> {
+        self.epoch.exclusion_manifest_hash()
+    }
+
+    pub fn remaining_quarantine(&self) -> &[LegacyCarryPosition] {
+        self.epoch.remaining_quarantine()
+    }
+
+    pub fn released_codes(&self) -> usize {
+        self.epoch.released_codes()
+    }
+
+    pub fn excluded_fills(&self) -> &[EpochExclusion] {
+        self.epoch.excluded_fills()
+    }
+
+    pub fn overlap_buy_count(&self) -> usize {
+        self.epoch.overlap_buy_count()
+    }
+
+    pub fn overlap_sell_count(&self) -> usize {
+        self.epoch.overlap_sell_count()
+    }
+
+    pub fn mixed_exit_count(&self) -> usize {
+        self.epoch.mixed_exit_count()
+    }
+
+    pub fn excluded_fill_count(&self) -> usize {
+        self.epoch.excluded_fill_count()
     }
 
     pub fn source_fill_ids(&self) -> &[i64] {
@@ -683,6 +749,161 @@ impl StockCloseManifest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AttributionReplayCapabilitySeal([u8; 32]);
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AttributionEpochReplayEvidence {
+    selector: AttributionEpochSelector,
+    epoch_id: Option<String>,
+    receipt_hash: Option<String>,
+    effective_date: Option<NaiveDate>,
+    legacy_carry_manifest_hash: Option<String>,
+    exclusion_manifest_hash: Option<String>,
+    remaining_quarantine: Vec<LegacyCarryPosition>,
+    released_codes: usize,
+    excluded_fills: Vec<EpochExclusion>,
+    overlap_buy_count: usize,
+    overlap_sell_count: usize,
+    mixed_exit_count: usize,
+    excluded_fill_count: usize,
+    #[serde(skip)]
+    scoped_fill_manifest_hash: String,
+    #[serde(skip)]
+    verified_filled_manifest_hash: Option<String>,
+    #[serde(skip)]
+    verified_terminal_binding_manifest_hash: Option<String>,
+    #[serde(skip)]
+    verified_order_audit_tip_hash: Option<String>,
+}
+
+impl AttributionEpochReplayEvidence {
+    fn legacy(scoped_fill_manifest_hash: String) -> Self {
+        Self {
+            selector: AttributionEpochSelector::Legacy,
+            epoch_id: None,
+            receipt_hash: None,
+            effective_date: None,
+            legacy_carry_manifest_hash: None,
+            exclusion_manifest_hash: None,
+            remaining_quarantine: Vec::new(),
+            released_codes: 0,
+            excluded_fills: Vec::new(),
+            overlap_buy_count: 0,
+            overlap_sell_count: 0,
+            mixed_exit_count: 0,
+            excluded_fill_count: 0,
+            scoped_fill_manifest_hash,
+            verified_filled_manifest_hash: None,
+            verified_terminal_binding_manifest_hash: None,
+            verified_order_audit_tip_hash: None,
+        }
+    }
+
+    fn resolved(
+        selector: AttributionEpochSelector,
+        receipt: &AttributionEpochReceipt,
+        exclusions: Vec<EpochExclusion>,
+        exclusion_manifest_hash: String,
+        remaining_quarantine: Vec<LegacyCarryPosition>,
+        released_codes: usize,
+        scoped_fill_manifest_hash: String,
+        verified_filled_manifest_hash: String,
+        verified_terminal_binding_manifest_hash: String,
+        verified_order_audit_tip_hash: String,
+    ) -> Self {
+        let overlap_buy_count = exclusions
+            .iter()
+            .filter(|item| {
+                item.reason == EpochExclusionReason::LegacyCarryOverlap && item.direction == "buy"
+            })
+            .count();
+        let overlap_sell_count = exclusions
+            .iter()
+            .filter(|item| {
+                item.reason == EpochExclusionReason::LegacyCarryOverlap && item.direction == "sell"
+            })
+            .count();
+        let mixed_exit_count = exclusions
+            .iter()
+            .filter(|item| item.reason == EpochExclusionReason::MixedLegacyCarryExit)
+            .count();
+        let excluded_fill_count = exclusions
+            .iter()
+            .map(|item| item.fill_id)
+            .collect::<BTreeSet<_>>()
+            .len();
+        Self {
+            selector,
+            epoch_id: Some(receipt.epoch_id.clone()),
+            receipt_hash: Some(receipt.receipt_hash.clone()),
+            effective_date: Some(receipt.effective_trading_date),
+            legacy_carry_manifest_hash: Some(receipt.legacy_carry_manifest_hash.clone()),
+            exclusion_manifest_hash: Some(exclusion_manifest_hash),
+            remaining_quarantine,
+            released_codes,
+            excluded_fills: exclusions,
+            overlap_buy_count,
+            overlap_sell_count,
+            mixed_exit_count,
+            excluded_fill_count,
+            scoped_fill_manifest_hash,
+            verified_filled_manifest_hash: Some(verified_filled_manifest_hash),
+            verified_terminal_binding_manifest_hash: Some(verified_terminal_binding_manifest_hash),
+            verified_order_audit_tip_hash: Some(verified_order_audit_tip_hash),
+        }
+    }
+
+    pub fn selector(&self) -> &AttributionEpochSelector {
+        &self.selector
+    }
+
+    pub fn epoch_id(&self) -> Option<&str> {
+        self.epoch_id.as_deref()
+    }
+
+    pub fn receipt_hash(&self) -> Option<&str> {
+        self.receipt_hash.as_deref()
+    }
+
+    pub fn effective_date(&self) -> Option<NaiveDate> {
+        self.effective_date
+    }
+
+    pub fn legacy_carry_manifest_hash(&self) -> Option<&str> {
+        self.legacy_carry_manifest_hash.as_deref()
+    }
+
+    pub fn exclusion_manifest_hash(&self) -> Option<&str> {
+        self.exclusion_manifest_hash.as_deref()
+    }
+
+    pub fn remaining_quarantine(&self) -> &[LegacyCarryPosition] {
+        &self.remaining_quarantine
+    }
+
+    pub fn released_codes(&self) -> usize {
+        self.released_codes
+    }
+
+    pub fn excluded_fills(&self) -> &[EpochExclusion] {
+        &self.excluded_fills
+    }
+
+    pub fn overlap_buy_count(&self) -> usize {
+        self.overlap_buy_count
+    }
+
+    pub fn overlap_sell_count(&self) -> usize {
+        self.overlap_sell_count
+    }
+
+    pub fn mixed_exit_count(&self) -> usize {
+        self.mixed_exit_count
+    }
+
+    pub fn excluded_fill_count(&self) -> usize {
+        self.excluded_fill_count
+    }
+}
+
 /// Loader 签发的 BR-251 replay capability。
 ///
 /// 外部 caller 可读取兼容投影，但不能构造缺少私有 seal 的 capability；任何投影换绑都会在
@@ -710,6 +931,7 @@ pub struct AttributionReplayEvidence {
     pub fills: Vec<ReplayFillEvidence>,
     pub stock_closes: StockCloseManifest,
     pub fees: FeeEvidenceAvailability,
+    epoch: AttributionEpochReplayEvidence,
     trade_manifest_hash: String,
     capability_seal: AttributionReplayCapabilitySeal,
 }
@@ -721,16 +943,25 @@ impl AttributionReplayEvidence {
         fills: Vec<ReplayFillEvidence>,
         stock_closes: StockCloseManifest,
         fees: FeeEvidenceAvailability,
+        epoch: AttributionEpochReplayEvidence,
     ) -> Self {
-        let trade_manifest_hash = replay_trade_manifest_hash(&fills);
-        let capability_seal =
-            replay_capability_seal(from, to, &fills, &stock_closes, &fees, &trade_manifest_hash);
+        let trade_manifest_hash = replay_trade_manifest_hash(&epoch, &fills);
+        let capability_seal = replay_capability_seal(
+            from,
+            to,
+            &fills,
+            &stock_closes,
+            &fees,
+            &epoch,
+            &trade_manifest_hash,
+        );
         Self {
             from,
             to,
             fills,
             stock_closes,
             fees,
+            epoch,
             trade_manifest_hash,
             capability_seal,
         }
@@ -754,6 +985,10 @@ impl AttributionReplayEvidence {
 
     pub fn fees(&self) -> &FeeEvidenceAvailability {
         &self.fees
+    }
+
+    pub fn epoch(&self) -> &AttributionEpochReplayEvidence {
+        &self.epoch
     }
 
     pub fn trade_manifest_hash(&self) -> &str {
@@ -797,17 +1032,63 @@ fn update_canonical_replay_fill(hasher: &mut Sha256, evidence: &ReplayFillEviden
     update_len_prefixed(hasher, evidence.terminal_time.to_rfc3339().as_bytes());
 }
 
+fn update_epoch_replay_evidence(hasher: &mut Sha256, epoch: &AttributionEpochReplayEvidence) {
+    update_len_prefixed(hasher, epoch.selector.canonical_value().as_bytes());
+    update_optional_text(hasher, epoch.epoch_id.as_deref());
+    update_optional_text(hasher, epoch.receipt_hash.as_deref());
+    update_optional_text(
+        hasher,
+        epoch.effective_date.map(|date| date.to_string()).as_deref(),
+    );
+    update_optional_text(hasher, epoch.legacy_carry_manifest_hash.as_deref());
+    update_optional_text(hasher, epoch.exclusion_manifest_hash.as_deref());
+    update_len_prefixed(hasher, epoch.scoped_fill_manifest_hash.as_bytes());
+    update_optional_text(hasher, epoch.verified_filled_manifest_hash.as_deref());
+    update_optional_text(
+        hasher,
+        epoch.verified_terminal_binding_manifest_hash.as_deref(),
+    );
+    update_optional_text(hasher, epoch.verified_order_audit_tip_hash.as_deref());
+    hasher.update((epoch.remaining_quarantine.len() as u64).to_be_bytes());
+    for position in &epoch.remaining_quarantine {
+        update_len_prefixed(hasher, position.code.as_bytes());
+        hasher.update(position.quantity.to_be_bytes());
+    }
+    hasher.update((epoch.released_codes as u64).to_be_bytes());
+    hasher.update((epoch.excluded_fills.len() as u64).to_be_bytes());
+    for exclusion in &epoch.excluded_fills {
+        hasher.update(exclusion.fill_id.to_be_bytes());
+        update_len_prefixed(hasher, exclusion.code.as_bytes());
+        update_len_prefixed(hasher, exclusion.direction.as_bytes());
+        hasher.update(exclusion.quantity.to_be_bytes());
+        hasher.update([match exclusion.reason {
+            EpochExclusionReason::LegacyCarryOverlap => 1,
+            EpochExclusionReason::MixedLegacyCarryExit => 2,
+        }]);
+    }
+    for count in [
+        epoch.overlap_buy_count,
+        epoch.overlap_sell_count,
+        epoch.mixed_exit_count,
+        epoch.excluded_fill_count,
+    ] {
+        hasher.update((count as u64).to_be_bytes());
+    }
+}
+
 fn replay_capability_seal(
     from: NaiveDate,
     to: NaiveDate,
     fills: &[ReplayFillEvidence],
     stock_closes: &StockCloseManifest,
     fees: &FeeEvidenceAvailability,
+    epoch: &AttributionEpochReplayEvidence,
     trade_manifest_hash: &str,
 ) -> AttributionReplayCapabilitySeal {
     let mut hasher = Sha256::new();
     hasher.update(REPLAY_CAPABILITY_SEAL_DOMAIN);
     update_len_prefixed(&mut hasher, trade_manifest_hash.as_bytes());
+    update_epoch_replay_evidence(&mut hasher, epoch);
     update_len_prefixed(&mut hasher, from.to_string().as_bytes());
     update_len_prefixed(&mut hasher, to.to_string().as_bytes());
     hasher.update((fills.len() as u64).to_be_bytes());
@@ -851,9 +1132,15 @@ fn replay_capability_seal(
     AttributionReplayCapabilitySeal(hasher.finalize().into())
 }
 
-fn replay_trade_manifest_hash(fills: &[ReplayFillEvidence]) -> String {
+fn replay_trade_manifest_hash(
+    epoch: &AttributionEpochReplayEvidence,
+    fills: &[ReplayFillEvidence],
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(REPLAY_TRADE_MANIFEST_HASH_DOMAIN);
+    update_len_prefixed(&mut hasher, epoch.selector.canonical_value().as_bytes());
+    update_optional_text(&mut hasher, epoch.receipt_hash.as_deref());
+    update_len_prefixed(&mut hasher, epoch.scoped_fill_manifest_hash.as_bytes());
     hasher.update((fills.len() as u64).to_be_bytes());
     for evidence in fills {
         update_canonical_replay_fill(&mut hasher, evidence);
@@ -870,9 +1157,24 @@ fn validate_replay_capability(
         &evidence.fills,
         &evidence.stock_closes,
         &evidence.fees,
+        &evidence.epoch,
         &evidence.trade_manifest_hash,
     );
-    if replay_trade_manifest_hash(&evidence.fills) != evidence.trade_manifest_hash
+    let economic_rows = evidence
+        .fills
+        .iter()
+        .map(|fill| fill.fill.clone())
+        .collect::<Vec<_>>();
+    let scoped_fill_manifest_hash =
+        canonical_scoped_fill_manifest_hash(&economic_rows).map_err(|detail| {
+            AttributionReplayError::integrity(
+                AttributionIntegrityFailure::ReplayEvidence,
+                format!("replay scoped fill manifest is invalid: {detail}"),
+            )
+        })?;
+    if scoped_fill_manifest_hash != evidence.epoch.scoped_fill_manifest_hash
+        || replay_trade_manifest_hash(&evidence.epoch, &evidence.fills)
+            != evidence.trade_manifest_hash
         || expected != evidence.capability_seal
     {
         return Err(AttributionReplayError::integrity(
@@ -1068,7 +1370,21 @@ impl AttributionReplayLoader {
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Trade, None))?;
-        progress.trade_manifest_hash = Some(replay_trade_manifest_hash(&fills));
+        let scoped_fill_manifest_hash = canonical_scoped_fill_manifest_hash(
+            &fills
+                .iter()
+                .map(|evidence| evidence.fill.clone())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|detail| {
+            AttributionReplayError::integrity(
+                AttributionIntegrityFailure::ReplayEvidence,
+                format!("legacy replay scoped fill manifest is invalid: {detail}"),
+            )
+        })
+        .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Trade, None))?;
+        let epoch = AttributionEpochReplayEvidence::legacy(scoped_fill_manifest_hash);
+        progress.trade_manifest_hash = Some(replay_trade_manifest_hash(&epoch, &fills));
         let required_close_keys =
             derive_required_close_keys(&fills, &request.required_trading_dates).map_err(
                 |error| progress.failure(error, AttributionReplayLoadStage::Trade, None),
@@ -1153,6 +1469,148 @@ impl AttributionReplayLoader {
             fills,
             stock_closes,
             fees,
+            epoch,
+        ))
+    }
+
+    fn load_verified_epoch_tail_with_progress(
+        &self,
+        request: &AttributionReplayRequest,
+        fills: Vec<ReplayFillEvidence>,
+        fees: FeeEvidenceAvailability,
+        epoch: AttributionEpochReplayEvidence,
+    ) -> Result<AttributionReplayEvidence, AttributionReplayLoadFailure> {
+        let mut progress = AttributionReplayLoadProgress {
+            trade_manifest_hash: Some(replay_trade_manifest_hash(&epoch, &fills)),
+            stock_close_manifest_hash: None,
+            fee: Some(fees.clone()),
+        };
+        validate_request(request).map_err(|error| {
+            progress.failure(error, AttributionReplayLoadStage::StockClose, None)
+        })?;
+        let canonical_database = self.database.canonicalize().map_err(|error| {
+            progress.failure(
+                AttributionReplayError::integrity(
+                    AttributionIntegrityFailure::DatabaseIdentity,
+                    format!("explicit database path cannot be resolved: {error}"),
+                ),
+                AttributionReplayLoadStage::StockClose,
+                None,
+            )
+        })?;
+        let before_metadata = canonical_database.metadata().map_err(|error| {
+            progress.failure(
+                AttributionReplayError::integrity(
+                    AttributionIntegrityFailure::DatabaseIdentity,
+                    format!("explicit database metadata unavailable: {error}"),
+                ),
+                AttributionReplayLoadStage::StockClose,
+                None,
+            )
+        })?;
+        if !before_metadata.is_file() {
+            return Err(progress.failure(
+                AttributionReplayError::integrity(
+                    AttributionIntegrityFailure::DatabaseIdentity,
+                    "explicit database path is not a regular file",
+                ),
+                AttributionReplayLoadStage::StockClose,
+                None,
+            ));
+        }
+        let expected_identity = FileIdentity::of(&before_metadata);
+        let mut connection = open_query_only_connection(&canonical_database).map_err(|error| {
+            progress.failure(error, AttributionReplayLoadStage::StockClose, None)
+        })?;
+        verify_main_database(&connection, &canonical_database, expected_identity).map_err(
+            |error| progress.failure(error, AttributionReplayLoadStage::StockClose, None),
+        )?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|error| source_read_error("begin one read transaction", error))
+            .map_err(|error| {
+                progress.failure(error, AttributionReplayLoadStage::StockClose, None)
+            })?;
+        let required_close_keys =
+            derive_required_close_keys(&fills, &request.required_trading_dates).map_err(
+                |error| progress.failure(error, AttributionReplayLoadStage::StockClose, None),
+            )?;
+        let raw_closes =
+            load_stock_closes(&transaction, &required_close_keys).map_err(|error| {
+                progress.failure(error, AttributionReplayLoadStage::StockClose, None)
+            })?;
+        let stock_closes =
+            build_stock_close_manifest(raw_closes, &required_close_keys).map_err(|failure| {
+                progress.failure(
+                    failure.error,
+                    AttributionReplayLoadStage::StockClose,
+                    failure.failure_date,
+                )
+            })?;
+        progress.stock_close_manifest_hash = Some(stock_closes.manifest_hash().to_owned());
+        verify_transaction_main_database(&transaction, &canonical_database, expected_identity)
+            .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Finalize, None))?;
+        #[cfg(test)]
+        run_after_read_test_hook();
+        let during_identity = canonical_database
+            .metadata()
+            .map(|metadata| FileIdentity::of(&metadata))
+            .map_err(|error| {
+                progress.failure(
+                    AttributionReplayError::integrity(
+                        AttributionIntegrityFailure::DatabaseIdentity,
+                        format!("database identity re-check during read failed: {error}"),
+                    ),
+                    AttributionReplayLoadStage::Finalize,
+                    None,
+                )
+            })?;
+        if during_identity != expected_identity {
+            return Err(progress.failure(
+                AttributionReplayError::integrity(
+                    AttributionIntegrityFailure::DatabaseIdentity,
+                    "database file identity changed during read",
+                ),
+                AttributionReplayLoadStage::Finalize,
+                None,
+            ));
+        }
+        transaction
+            .commit()
+            .map_err(|error| source_read_error("finish read transaction", error))
+            .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Finalize, None))?;
+        verify_main_database(&connection, &canonical_database, expected_identity)
+            .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Finalize, None))?;
+        let after_identity = canonical_database
+            .metadata()
+            .map(|metadata| FileIdentity::of(&metadata))
+            .map_err(|error| {
+                progress.failure(
+                    AttributionReplayError::integrity(
+                        AttributionIntegrityFailure::DatabaseIdentity,
+                        format!("database identity re-check after read failed: {error}"),
+                    ),
+                    AttributionReplayLoadStage::Finalize,
+                    None,
+                )
+            })?;
+        if after_identity != expected_identity {
+            return Err(progress.failure(
+                AttributionReplayError::integrity(
+                    AttributionIntegrityFailure::DatabaseIdentity,
+                    "database file identity changed after read",
+                ),
+                AttributionReplayLoadStage::Finalize,
+                None,
+            ));
+        }
+        Ok(AttributionReplayEvidence::issued(
+            request.from,
+            request.to,
+            fills,
+            stock_closes,
+            fees,
+            epoch,
         ))
     }
 }
@@ -1925,6 +2383,81 @@ fn validate_fee_ledger(
     Ok(FeeEvidenceAvailability::Available(ledger.clone()))
 }
 
+fn validate_epoch_fee_ledger(
+    ledger: Option<&AuthoritativeFillFeeLedger>,
+    verified_fills: &[ReplayFillEvidence],
+    attributable_fills: &[ReplayFillEvidence],
+) -> Result<FeeEvidenceAvailability, AttributionReplayError> {
+    let Some(ledger) = ledger else {
+        return Ok(FeeEvidenceAvailability::Unavailable {
+            code: AttributionUnavailable::FeeEvidenceUnavailable,
+            retryable: false,
+            detail: "explicit authoritative per-fill fee ledger is unavailable".to_owned(),
+        });
+    };
+    let verified_ids = verified_fills
+        .iter()
+        .map(|evidence| evidence.fill.id)
+        .collect::<HashSet<_>>();
+    let attributable_ids = attributable_fills
+        .iter()
+        .map(|evidence| evidence.fill.id)
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    for entry in &ledger.entries {
+        if !verified_ids.contains(&entry.fill_id) {
+            return Err(AttributionReplayError::integrity(
+                AttributionIntegrityFailure::FeeEvidence,
+                format!(
+                    "fee evidence references unknown verified fill id={}",
+                    entry.fill_id
+                ),
+            ));
+        }
+        if !seen.insert(entry.fill_id) {
+            return Err(AttributionReplayError::integrity(
+                AttributionIntegrityFailure::FeeEvidence,
+                format!("duplicate fee evidence for fill id={}", entry.fill_id),
+            ));
+        }
+        if !entry.adverse_cost.is_finite()
+            || entry.adverse_cost < 0.0
+            || entry.source.trim().is_empty()
+            || entry.authority.trim().is_empty()
+            || entry.evidence_id.trim().is_empty()
+            || !is_lowercase_sha256(&entry.evidence_hash)
+            || canonical_fill_fee_evidence_hash(entry) != entry.evidence_hash
+        {
+            return Err(AttributionReplayError::integrity(
+                AttributionIntegrityFailure::FeeEvidence,
+                format!(
+                    "invalid authoritative fee evidence for fill id={}",
+                    entry.fill_id
+                ),
+            ));
+        }
+    }
+    if !attributable_ids.is_subset(&seen) {
+        let missing = attributable_ids
+            .difference(&seen)
+            .copied()
+            .collect::<Vec<_>>();
+        return Err(AttributionReplayError::integrity(
+            AttributionIntegrityFailure::FeeEvidence,
+            format!("fee evidence is missing attributable fill ids {missing:?}"),
+        ));
+    }
+    let projected = AuthoritativeFillFeeLedger {
+        entries: ledger
+            .entries
+            .iter()
+            .filter(|entry| attributable_ids.contains(&entry.fill_id))
+            .cloned()
+            .collect(),
+    };
+    validate_fee_ledger(Some(&projected), attributable_fills)
+}
+
 fn is_lowercase_sha256(value: &str) -> bool {
     value.len() == 64
         && value
@@ -2682,6 +3215,7 @@ pub fn compute_attribution_range(
     issue_attribution_report(AttributionComputationReport {
         from: evidence.from,
         to: evidence.to,
+        epoch: evidence.epoch.clone(),
         canonical_source_fill_ids: source_fill_ids.clone(),
         total_closed_cycles,
         total_open_cycles,
@@ -2777,7 +3311,7 @@ pub fn canonical_attribution_report_hash(
 }
 
 const ATTRIBUTION_REPLAY_RULE_VERSION: &str = "BR-251-v1";
-const RUNNER_SOURCE_SUMMARY_DOMAIN: &[u8] = b"BR251_RUNNER_SOURCE_SUMMARY_V2\0";
+const RUNNER_SOURCE_SUMMARY_DOMAIN: &[u8] = b"BR255_RUNNER_SOURCE_SUMMARY_V3\0";
 const RUNNER_FAILURE_LEAF_DOMAIN: &[u8] = b"BR251_RUNNER_FAILURE_LEAF_V1\0";
 #[cfg(test)]
 const RUNNER_TEST_SEMANTICS_DOMAIN: &[u8] = b"BR251_RUNNER_TEST_SEMANTICS_V1\0";
@@ -2803,6 +3337,7 @@ pub enum ReplayMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayRequest {
     pub mode: ReplayMode,
+    pub epoch: AttributionEpochSelector,
     pub benchmark_day_manifests: Vec<BenchmarkDayManifest>,
 }
 
@@ -2823,6 +3358,7 @@ pub enum ReplayErrorClass {
 pub enum ReplayStage {
     Request,
     Calendar,
+    Epoch,
     TradeEvidence,
     Benchmark,
     Compute,
@@ -2840,6 +3376,7 @@ impl ReplayStage {
         match self {
             Self::Request => "request",
             Self::Calendar => "calendar",
+            Self::Epoch => "epoch",
             Self::TradeEvidence => "trade_evidence",
             Self::Benchmark => "benchmark",
             Self::Compute => "compute",
@@ -3060,6 +3597,58 @@ impl PreparedAttributionReport {
         &self.report
     }
 
+    pub fn epoch_selector(&self) -> &AttributionEpochSelector {
+        self.report.epoch_selector()
+    }
+
+    pub fn epoch_id(&self) -> Option<&str> {
+        self.report.epoch_id()
+    }
+
+    pub fn epoch_receipt_hash(&self) -> Option<&str> {
+        self.report.epoch_receipt_hash()
+    }
+
+    pub fn epoch_effective_date(&self) -> Option<NaiveDate> {
+        self.report.epoch_effective_date()
+    }
+
+    pub fn legacy_carry_manifest_hash(&self) -> Option<&str> {
+        self.report.legacy_carry_manifest_hash()
+    }
+
+    pub fn exclusion_manifest_hash(&self) -> Option<&str> {
+        self.report.exclusion_manifest_hash()
+    }
+
+    pub fn remaining_quarantine(&self) -> &[LegacyCarryPosition] {
+        self.report.remaining_quarantine()
+    }
+
+    pub fn released_codes(&self) -> usize {
+        self.report.released_codes()
+    }
+
+    pub fn excluded_fills(&self) -> &[EpochExclusion] {
+        self.report.excluded_fills()
+    }
+
+    pub fn overlap_buy_count(&self) -> usize {
+        self.report.overlap_buy_count()
+    }
+
+    pub fn overlap_sell_count(&self) -> usize {
+        self.report.overlap_sell_count()
+    }
+
+    pub fn mixed_exit_count(&self) -> usize {
+        self.report.mixed_exit_count()
+    }
+
+    pub fn excluded_fill_count(&self) -> usize {
+        self.report.excluded_fill_count()
+    }
+
     pub fn canonical_result_bytes(&self) -> &[u8] {
         &self.canonical_result_bytes
     }
@@ -3108,6 +3697,7 @@ impl CommittedAttributionReport {
 #[derive(Debug, Clone)]
 struct AdmittedReplayRequest {
     mode: ReplayMode,
+    epoch: AttributionEpochSelector,
     provisional_invocation: AttributionInvocation,
     benchmark_day_manifests: Vec<BenchmarkDayManifest>,
 }
@@ -3115,6 +3705,7 @@ struct AdmittedReplayRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FailureEvidenceState {
     Unknown,
+    NotApplicable,
     Unavailable([u8; 32]),
     Available(String),
 }
@@ -3126,8 +3717,15 @@ struct FailureEvidenceSummary {
     target_from: NaiveDate,
     target_to: NaiveDate,
     rule_version: String,
+    epoch_selector: String,
     requested_benchmark_days: Vec<BenchmarkDayManifest>,
     calendar: FailureEvidenceState,
+    epoch_id: FailureEvidenceState,
+    epoch_receipt: FailureEvidenceState,
+    legacy_carry: FailureEvidenceState,
+    exclusions: FailureEvidenceState,
+    remaining_quarantine: FailureEvidenceState,
+    released_codes: FailureEvidenceState,
     trade: FailureEvidenceState,
     stock_close: FailureEvidenceState,
     fee: FailureEvidenceState,
@@ -3152,8 +3750,15 @@ impl FailureEvidenceSummary {
             target_from: admitted.provisional_invocation.target_from,
             target_to: admitted.provisional_invocation.target_to,
             rule_version: admitted.provisional_invocation.rule_version.clone(),
+            epoch_selector: admitted.epoch.canonical_value(),
             requested_benchmark_days: admitted.benchmark_day_manifests.clone(),
             calendar: FailureEvidenceState::Unknown,
+            epoch_id: FailureEvidenceState::Unknown,
+            epoch_receipt: FailureEvidenceState::Unknown,
+            legacy_carry: FailureEvidenceState::Unknown,
+            exclusions: FailureEvidenceState::Unknown,
+            remaining_quarantine: FailureEvidenceState::Unknown,
+            released_codes: FailureEvidenceState::Unknown,
             trade: FailureEvidenceState::Unknown,
             stock_close: FailureEvidenceState::Unknown,
             fee: FailureEvidenceState::Unknown,
@@ -3168,10 +3773,52 @@ impl FailureEvidenceSummary {
     }
 
     fn record_replay_evidence(&mut self, evidence: &AttributionReplayEvidence) {
+        self.record_epoch_evidence(evidence.epoch());
         self.trade = FailureEvidenceState::Available(evidence.trade_manifest_hash().to_owned());
         self.stock_close =
             FailureEvidenceState::Available(evidence.stock_closes().manifest_hash().to_owned());
         self.fee = failure_fee_state(evidence.fees());
+    }
+
+    fn record_resolved_epoch(&mut self, epoch: &ResolvedAttributionEpoch) {
+        match epoch {
+            ResolvedAttributionEpoch::Legacy => {
+                self.epoch_id = FailureEvidenceState::NotApplicable;
+                self.epoch_receipt = FailureEvidenceState::NotApplicable;
+                self.legacy_carry = FailureEvidenceState::NotApplicable;
+                self.exclusions = FailureEvidenceState::NotApplicable;
+                self.remaining_quarantine = FailureEvidenceState::NotApplicable;
+                self.released_codes = FailureEvidenceState::NotApplicable;
+            }
+            ResolvedAttributionEpoch::Epoch(receipt) => {
+                self.epoch_id = FailureEvidenceState::Available(receipt.epoch_id.clone());
+                self.epoch_receipt = FailureEvidenceState::Available(receipt.receipt_hash.clone());
+                self.legacy_carry =
+                    FailureEvidenceState::Available(receipt.legacy_carry_manifest_hash.clone());
+            }
+        }
+    }
+
+    fn record_epoch_evidence(&mut self, epoch: &AttributionEpochReplayEvidence) {
+        if matches!(epoch.selector(), AttributionEpochSelector::Legacy) {
+            return;
+        }
+        if let Some(epoch_id) = epoch.epoch_id() {
+            self.epoch_id = FailureEvidenceState::Available(epoch_id.to_owned());
+        }
+        if let Some(receipt_hash) = epoch.receipt_hash() {
+            self.epoch_receipt = FailureEvidenceState::Available(receipt_hash.to_owned());
+        }
+        if let Some(carry_hash) = epoch.legacy_carry_manifest_hash() {
+            self.legacy_carry = FailureEvidenceState::Available(carry_hash.to_owned());
+        }
+        if let Some(exclusion_hash) = epoch.exclusion_manifest_hash() {
+            self.exclusions = FailureEvidenceState::Available(exclusion_hash.to_owned());
+        }
+        self.remaining_quarantine = FailureEvidenceState::Available(
+            canonical_legacy_carry_manifest_hash(epoch.remaining_quarantine()),
+        );
+        self.released_codes = FailureEvidenceState::Available(epoch.released_codes().to_string());
     }
 
     fn record_load_failure(
@@ -3231,12 +3878,19 @@ impl FailureEvidenceSummary {
         update_len_prefixed(&mut hasher, self.target_from.to_string().as_bytes());
         update_len_prefixed(&mut hasher, self.target_to.to_string().as_bytes());
         update_len_prefixed(&mut hasher, self.rule_version.as_bytes());
+        update_len_prefixed(&mut hasher, self.epoch_selector.as_bytes());
         hasher.update((self.requested_benchmark_days.len() as u64).to_be_bytes());
         for binding in &self.requested_benchmark_days {
             update_len_prefixed(&mut hasher, binding.trading_date.to_string().as_bytes());
             update_len_prefixed(&mut hasher, binding.manifest_hash.as_bytes());
         }
         update_failure_evidence_state(&mut hasher, &self.calendar);
+        update_failure_evidence_state(&mut hasher, &self.epoch_id);
+        update_failure_evidence_state(&mut hasher, &self.epoch_receipt);
+        update_failure_evidence_state(&mut hasher, &self.legacy_carry);
+        update_failure_evidence_state(&mut hasher, &self.exclusions);
+        update_failure_evidence_state(&mut hasher, &self.remaining_quarantine);
+        update_failure_evidence_state(&mut hasher, &self.released_codes);
         update_failure_evidence_state(&mut hasher, &self.trade);
         update_failure_evidence_state(&mut hasher, &self.stock_close);
         update_failure_evidence_state(&mut hasher, &self.fee);
@@ -3256,6 +3910,7 @@ impl FailureEvidenceSummary {
 fn update_failure_evidence_state(hasher: &mut Sha256, state: &FailureEvidenceState) {
     match state {
         FailureEvidenceState::Unknown => hasher.update([0]),
+        FailureEvidenceState::NotApplicable => hasher.update([3]),
         FailureEvidenceState::Unavailable(fingerprint) => {
             hasher.update([1]);
             hasher.update(fingerprint);
@@ -3301,6 +3956,106 @@ struct PrepareFailure {
     error: ReplayError,
     invocation: AttributionInvocation,
     evidence: FailureEvidenceSummary,
+}
+
+struct ScopedVerifiedEpochReplay {
+    fills: Vec<ReplayFillEvidence>,
+    fees: FeeEvidenceAvailability,
+    epoch: AttributionEpochReplayEvidence,
+}
+
+fn scope_verified_epoch_replay(
+    selector: &AttributionEpochSelector,
+    receipt: &AttributionEpochReceipt,
+    verified: &VerifiedEpochFillSet,
+    fee_ledger: Option<&AuthoritativeFillFeeLedger>,
+) -> Result<ScopedVerifiedEpochReplay, AttributionReplayError> {
+    if canonical_legacy_carry_manifest_hash(verified.carry()) != receipt.legacy_carry_manifest_hash
+    {
+        return Err(AttributionReplayError::integrity(
+            AttributionIntegrityFailure::ReplayEvidence,
+            "verified retained carry differs from the resolved receipt",
+        ));
+    }
+    let shanghai = FixedOffset::east_opt(8 * 60 * 60).ok_or_else(|| {
+        AttributionReplayError::integrity(
+            AttributionIntegrityFailure::ReplayEvidence,
+            "Shanghai fixed offset is unavailable",
+        )
+    })?;
+    let verified_fills = verified
+        .fills()
+        .iter()
+        .map(|source| ReplayFillEvidence {
+            fill: source.fill().clone(),
+            terminal_audit_id: source.terminal_audit_id(),
+            terminal_audit_hash: source.terminal_audit_hash().to_owned(),
+            terminal_time: source.terminal_time().with_timezone(&shanghai),
+        })
+        .collect::<Vec<_>>();
+    let source_rows = verified_fills
+        .iter()
+        .map(|evidence| evidence.fill.clone())
+        .collect::<Vec<_>>();
+    let scoped = scope_epoch_fills(
+        &source_rows,
+        receipt.effective_trading_date,
+        verified.carry(),
+    )
+    .map_err(|detail| {
+        AttributionReplayError::integrity(
+            AttributionIntegrityFailure::ReplayEvidence,
+            format!("epoch fill scoping failed: {detail}"),
+        )
+    })?;
+    let exclusion_manifest_hash =
+        canonical_exclusion_manifest_hash(&scoped.exclusions, &source_rows).map_err(|detail| {
+            AttributionReplayError::integrity(
+                AttributionIntegrityFailure::ReplayEvidence,
+                format!("epoch exclusion manifest failed: {detail}"),
+            )
+        })?;
+    let scoped_fill_manifest_hash = canonical_scoped_fill_manifest_hash(&scoped.attributable)
+        .map_err(|detail| {
+            AttributionReplayError::integrity(
+                AttributionIntegrityFailure::ReplayEvidence,
+                format!("epoch scoped fill manifest failed: {detail}"),
+            )
+        })?;
+    let attributable_ids = scoped
+        .attributable
+        .iter()
+        .map(|row| row.id)
+        .collect::<HashSet<_>>();
+    let attributable_fills = verified_fills
+        .iter()
+        .filter(|evidence| attributable_ids.contains(&evidence.fill.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if attributable_fills.len() != attributable_ids.len() {
+        return Err(AttributionReplayError::integrity(
+            AttributionIntegrityFailure::ReplayEvidence,
+            "scoped epoch fill lost its database-issued terminal evidence",
+        ));
+    }
+    let fees = validate_epoch_fee_ledger(fee_ledger, &verified_fills, &attributable_fills)?;
+    let epoch = AttributionEpochReplayEvidence::resolved(
+        selector.clone(),
+        receipt,
+        scoped.exclusions,
+        exclusion_manifest_hash,
+        scoped.remaining_quarantine,
+        scoped.released_codes,
+        scoped_fill_manifest_hash,
+        verified.filled_manifest_hash().to_owned(),
+        verified.terminal_binding_manifest_hash().to_owned(),
+        verified.order_audit_tip_hash().to_owned(),
+    );
+    Ok(ScopedVerifiedEpochReplay {
+        fills: attributable_fills,
+        fees,
+        epoch,
+    })
 }
 
 /// Production construction always keeps minute-label semantics unverified.
@@ -3464,13 +4219,102 @@ impl<'a> AttributionReplayRunner<'a> {
             target_to: calendar.target_to(),
             ..admitted.provisional_invocation.clone()
         };
+        let resolved_epoch = match &admitted.epoch {
+            AttributionEpochSelector::Legacy => ResolvedAttributionEpoch::Legacy,
+            selector => match AttributionEpochStore::new(self.database).load_selector(selector) {
+                Ok(epoch) => epoch,
+                Err(error) => {
+                    return Err(Box::new(PrepareFailure {
+                        error: map_epoch_store_error(error),
+                        invocation,
+                        evidence: summary,
+                    }));
+                }
+            },
+        };
+        summary.record_resolved_epoch(&resolved_epoch);
         let replay_request = AttributionReplayRequest {
             from: calendar.target_from(),
             to: calendar.target_to(),
             required_trading_dates: calendar.required_trading_dates().to_vec(),
             fee_ledger: self.fee_ledger.clone(),
         };
-        let evidence = match self.loader.load_with_progress(&replay_request) {
+        let loaded = match &resolved_epoch {
+            ResolvedAttributionEpoch::Legacy => self.loader.load_with_progress(&replay_request),
+            ResolvedAttributionEpoch::Epoch(receipt) => {
+                if calendar.target_from() < receipt.effective_trading_date {
+                    return Err(Box::new(PrepareFailure {
+                        error: ReplayError::new(
+                            ReplayErrorClass::FailedIntegrity,
+                            ReplayStage::Epoch,
+                            "attribution_epoch_range_before_effective",
+                            false,
+                        ),
+                        invocation,
+                        evidence: summary,
+                    }));
+                }
+                let mut conn = match self.database.get_conn() {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        return Err(Box::new(PrepareFailure {
+                            error: ReplayError::new(
+                                ReplayErrorClass::Unavailable,
+                                ReplayStage::Epoch,
+                                "attribution_epoch_storage_unavailable",
+                                true,
+                            )
+                            .with_typed_failure(
+                                "attribution_epoch_storage_unavailable",
+                                error.to_string().as_bytes(),
+                                None,
+                                None,
+                            ),
+                            invocation,
+                            evidence: summary,
+                        }));
+                    }
+                };
+                let verified = match load_verified_epoch_fills_until(
+                    &mut conn,
+                    &resolved_epoch,
+                    calendar.target_to(),
+                ) {
+                    Ok(verified) => verified,
+                    Err(error) => {
+                        return Err(Box::new(PrepareFailure {
+                            error: map_epoch_store_error(error),
+                            invocation,
+                            evidence: summary,
+                        }));
+                    }
+                };
+                drop(conn);
+                let scoped = match scope_verified_epoch_replay(
+                    &admitted.epoch,
+                    receipt,
+                    &verified,
+                    self.fee_ledger.as_ref(),
+                ) {
+                    Ok(scoped) => scoped,
+                    Err(error) => {
+                        return Err(Box::new(PrepareFailure {
+                            error: map_attribution_error(ReplayStage::Epoch, error),
+                            invocation,
+                            evidence: summary,
+                        }));
+                    }
+                };
+                summary.record_epoch_evidence(&scoped.epoch);
+                self.loader.load_verified_epoch_tail_with_progress(
+                    &replay_request,
+                    scoped.fills,
+                    scoped.fees,
+                    scoped.epoch,
+                )
+            }
+        };
+        let evidence = match loaded {
             Ok(evidence) => evidence,
             Err(failure) => {
                 let error = map_current_session_evidence_error(
@@ -3610,6 +4454,17 @@ fn admit_replay_request(request: ReplayRequest) -> Result<AdmittedReplayRequest,
             false,
         ));
     }
+    if matches!(
+        &request.epoch,
+        AttributionEpochSelector::Exact(epoch_id) if !is_lowercase_sha256(epoch_id)
+    ) {
+        return Err(ReplayError::new(
+            ReplayErrorClass::FailedIntegrity,
+            ReplayStage::Request,
+            "invalid_attribution_epoch_selector",
+            false,
+        ));
+    }
     let (mode, target_from, target_to) = match &request.mode {
         ReplayMode::Scheduled { invoked_at } => (
             AttributionRunMode::Scheduled,
@@ -3633,6 +4488,7 @@ fn admit_replay_request(request: ReplayRequest) -> Result<AdmittedReplayRequest,
     };
     Ok(AdmittedReplayRequest {
         mode: request.mode,
+        epoch: request.epoch,
         provisional_invocation: AttributionInvocation {
             mode,
             target_from,
@@ -3932,6 +4788,32 @@ fn map_attribution_error(stage: ReplayStage, error: AttributionReplayError) -> R
     }
 }
 
+fn map_epoch_store_error(error: AttributionEpochStoreError) -> ReplayError {
+    match error {
+        AttributionEpochStoreError::Unavailable {
+            reason_code,
+            retryable,
+            detail,
+        } => ReplayError::new(
+            ReplayErrorClass::Unavailable,
+            ReplayStage::Epoch,
+            reason_code,
+            retryable,
+        )
+        .with_typed_failure(reason_code, detail.as_bytes(), None, None),
+        AttributionEpochStoreError::FailedIntegrity {
+            reason_code,
+            detail,
+        } => ReplayError::new(
+            ReplayErrorClass::FailedIntegrity,
+            ReplayStage::Epoch,
+            reason_code,
+            false,
+        )
+        .with_typed_failure(reason_code, detail.as_bytes(), None, None),
+    }
+}
+
 fn map_attribution_load_failure(failure: &AttributionReplayLoadFailure) -> ReplayError {
     let mut mapped = match &failure.error {
         AttributionReplayError::Unavailable {
@@ -4223,10 +5105,135 @@ fn validate_dependency_metric(
     }
 }
 
+fn validate_epoch_report_projection(
+    epoch: &AttributionEpochReplayEvidence,
+) -> Result<(), AttributionReplayError> {
+    let legacy = matches!(epoch.selector, AttributionEpochSelector::Legacy);
+    if legacy {
+        if epoch.epoch_id.is_some()
+            || epoch.receipt_hash.is_some()
+            || epoch.effective_date.is_some()
+            || epoch.legacy_carry_manifest_hash.is_some()
+            || epoch.exclusion_manifest_hash.is_some()
+            || !epoch.remaining_quarantine.is_empty()
+            || epoch.released_codes != 0
+            || !epoch.excluded_fills.is_empty()
+            || epoch.overlap_buy_count != 0
+            || epoch.overlap_sell_count != 0
+            || epoch.mixed_exit_count != 0
+            || epoch.excluded_fill_count != 0
+        {
+            return Err(canonical_report_error(
+                "legacy report fabricated attribution epoch evidence",
+            ));
+        }
+        return Ok(());
+    }
+    let (
+        Some(epoch_id),
+        Some(receipt_hash),
+        Some(_effective_date),
+        Some(carry_hash),
+        Some(exclusion_hash),
+    ) = (
+        epoch.epoch_id.as_deref(),
+        epoch.receipt_hash.as_deref(),
+        epoch.effective_date,
+        epoch.legacy_carry_manifest_hash.as_deref(),
+        epoch.exclusion_manifest_hash.as_deref(),
+    )
+    else {
+        return Err(canonical_report_error(
+            "resolved epoch report is missing receipt/carry/exclusion evidence",
+        ));
+    };
+    if !is_lowercase_sha256(epoch_id)
+        || !is_lowercase_sha256(receipt_hash)
+        || !is_lowercase_sha256(carry_hash)
+        || !is_lowercase_sha256(exclusion_hash)
+        || !epoch
+            .verified_filled_manifest_hash
+            .as_deref()
+            .is_some_and(is_lowercase_sha256)
+        || !epoch
+            .verified_terminal_binding_manifest_hash
+            .as_deref()
+            .is_some_and(is_lowercase_sha256)
+        || !epoch
+            .verified_order_audit_tip_hash
+            .as_deref()
+            .is_some_and(is_lowercase_sha256)
+        || matches!(
+            &epoch.selector,
+            AttributionEpochSelector::Exact(expected) if expected != epoch_id
+        )
+        || matches!(epoch.selector, AttributionEpochSelector::Legacy)
+    {
+        return Err(canonical_report_error(
+            "resolved epoch report identities are inconsistent",
+        ));
+    }
+    if epoch.remaining_quarantine.iter().any(|position| {
+        position.code.trim().is_empty()
+            || position.quantity == 0
+            || !position.quantity.is_multiple_of(100)
+    }) || epoch
+        .remaining_quarantine
+        .windows(2)
+        .any(|pair| pair[0].code >= pair[1].code)
+    {
+        return Err(canonical_report_error(
+            "resolved epoch remaining quarantine is noncanonical",
+        ));
+    }
+    let overlap_buy_count = epoch
+        .excluded_fills
+        .iter()
+        .filter(|item| {
+            item.reason == EpochExclusionReason::LegacyCarryOverlap && item.direction == "buy"
+        })
+        .count();
+    let overlap_sell_count = epoch
+        .excluded_fills
+        .iter()
+        .filter(|item| {
+            item.reason == EpochExclusionReason::LegacyCarryOverlap && item.direction == "sell"
+        })
+        .count();
+    let mixed_exit_count = epoch
+        .excluded_fills
+        .iter()
+        .filter(|item| item.reason == EpochExclusionReason::MixedLegacyCarryExit)
+        .count();
+    let excluded_fill_count = epoch
+        .excluded_fills
+        .iter()
+        .map(|item| item.fill_id)
+        .collect::<BTreeSet<_>>()
+        .len();
+    if epoch.excluded_fills.iter().any(|item| {
+        item.fill_id <= 0
+            || item.code.trim().is_empty()
+            || !matches!(item.direction.as_str(), "buy" | "sell")
+            || item.quantity == 0
+            || !item.quantity.is_multiple_of(100)
+    }) || epoch.overlap_buy_count != overlap_buy_count
+        || epoch.overlap_sell_count != overlap_sell_count
+        || epoch.mixed_exit_count != mixed_exit_count
+        || epoch.excluded_fill_count != excluded_fill_count
+    {
+        return Err(canonical_report_error(
+            "resolved epoch exclusion statistics are inconsistent",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_and_normalize_attribution_report_projection(
     report: &AttributionComputationReport,
 ) -> Result<AttributionComputationReport, AttributionReplayError> {
     let mut report = report.clone();
+    validate_epoch_report_projection(&report.epoch)?;
     let family_closed_cycles = checked_cardinality_sum(
         report
             .family_attribution
@@ -4605,6 +5612,10 @@ mod tests {
         BatchEvidence, BenchmarkBar, BenchmarkBarTime, BenchmarkCapture, BenchmarkRange,
         BenchmarkRequest, GatewayBatch,
     };
+    use crate::database::attribution_epochs::EpochActivationRequest;
+    use crate::database::attribution_reports::{
+        AttributionDatabaseAccess, AttributionDatabaseSession,
+    };
     use crate::database::data_acquisition_audit::DataAcquisitionAuditRecord;
     use crate::database::order_audit::{
         canonical_order_audit_record_hash, CanonicalOrderAuditRow, AUDIT_CHAIN_GENESIS,
@@ -4651,6 +5662,198 @@ mod tests {
                     close REAL, data_source TEXT, created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                  );",
+            )
+            .unwrap();
+    }
+
+    fn create_epoch_replay_schema(connection: &Connection) {
+        connection
+            .execute_batch(
+                "CREATE TABLE paper_trades (
+                    id INTEGER PRIMARY KEY, plan_id TEXT NOT NULL UNIQUE,
+                    code TEXT NOT NULL, name TEXT NOT NULL, direction TEXT NOT NULL,
+                    price REAL NOT NULL, quantity INTEGER NOT NULL, status TEXT NOT NULL,
+                    fill_price REAL, not_fill_reason TEXT, virtual_reason TEXT NOT NULL,
+                    account_mode TEXT NOT NULL, data_mode TEXT NOT NULL,
+                    ts TEXT NOT NULL, updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE order_audit (
+                    id INTEGER PRIMARY KEY, business_order_id TEXT NOT NULL,
+                    source TEXT NOT NULL, decision_basis TEXT NOT NULL, side TEXT NOT NULL,
+                    code TEXT NOT NULL, requested_price REAL NOT NULL, execution_price REAL,
+                    quantity INTEGER NOT NULL, quote_observed_at TEXT, outcome TEXT NOT NULL,
+                    failure_reason TEXT, created_at TEXT NOT NULL
+                 );
+                 CREATE TABLE order_audit_chain (
+                    order_audit_id INTEGER PRIMARY KEY, previous_hash TEXT NOT NULL,
+                    record_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
+                 );
+                 CREATE TABLE stock_daily (
+                    id INTEGER PRIMARY KEY, code TEXT NOT NULL, date TEXT NOT NULL,
+                    close REAL, data_source TEXT, created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_epoch_source_fill(
+        path: &Path,
+        id: i64,
+        side: &str,
+        price: f64,
+        quantity: i64,
+        paper_utc: &str,
+        quote_shanghai: &str,
+        reason: &str,
+    ) {
+        let connection = Connection::open(path).unwrap();
+        let previous_hash = connection
+            .query_row(
+                "SELECT record_hash FROM order_audit_chain ORDER BY order_audit_id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap_or_else(|_| AUDIT_CHAIN_GENESIS.to_owned());
+        let plan_id = format!("TEST_CODE_EPOCH_PLAN_{id}");
+        connection
+            .execute(
+                "INSERT INTO paper_trades
+                 (id,plan_id,code,name,direction,price,quantity,status,fill_price,not_fill_reason,
+                  virtual_reason,account_mode,data_mode,ts,updated_at)
+                 VALUES (?1,?2,'TEST_CODE_600001','TEST_CODE epoch company',?3,?4,?5,
+                         'Filled',?4,NULL,?6,'Normal','Full',?7,?7)",
+                params![id, plan_id, side, price, quantity, reason, paper_utc],
+            )
+            .unwrap();
+        let quote = DateTime::parse_from_rfc3339(quote_shanghai).unwrap();
+        let created_at = (quote.with_timezone(&chrono::Utc) + Duration::seconds(1))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let audit = CanonicalOrderAuditRow {
+            id,
+            business_order_id: plan_id,
+            source: "PaperTrade".to_owned(),
+            decision_basis: reason.to_owned(),
+            side: side.to_owned(),
+            code: "TEST_CODE_600001".to_owned(),
+            requested_price: price,
+            execution_price: Some(price),
+            quantity,
+            quote_observed_at: Some(quote_shanghai.to_owned()),
+            outcome: "Filled".to_owned(),
+            failure_reason: None,
+            created_at: created_at.clone(),
+        };
+        connection
+            .execute(
+                "INSERT INTO order_audit VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                params![
+                    audit.id,
+                    audit.business_order_id,
+                    audit.source,
+                    audit.decision_basis,
+                    audit.side,
+                    audit.code,
+                    audit.requested_price,
+                    audit.execution_price,
+                    audit.quantity,
+                    audit.quote_observed_at,
+                    audit.outcome,
+                    audit.failure_reason,
+                    audit.created_at,
+                ],
+            )
+            .unwrap();
+        let record_hash = canonical_order_audit_record_hash(&previous_hash, &audit).unwrap();
+        connection
+            .execute(
+                "INSERT INTO order_audit_chain VALUES (?1,?2,?3,?4)",
+                params![id, previous_hash, record_hash, created_at],
+            )
+            .unwrap();
+    }
+
+    fn activated_epoch_database(
+        label: &str,
+    ) -> (PathBuf, AttributionDatabaseSession, AttributionEpochReceipt) {
+        let path = test_database_path(label);
+        create_epoch_replay_schema(&Connection::open(&path).unwrap());
+        append_epoch_source_fill(
+            &path,
+            1,
+            "buy",
+            10.0,
+            100,
+            "2026-08-20 01:31:05",
+            "2026-08-20T09:31:05+08:00",
+            "Breakout",
+        );
+        append_epoch_source_fill(
+            &path,
+            2,
+            "sell",
+            11.0,
+            100,
+            "2026-08-21 06:20:00",
+            "2026-08-21T14:20:00+08:00",
+            "ExitByRule",
+        );
+        let session =
+            AttributionDatabaseSession::open(&path, AttributionDatabaseAccess::AppendOnly).unwrap();
+        let receipt = AttributionEpochStore::new(session.database())
+            .activate_once(EpochActivationRequest {
+                source: crate::performance::attribution_epoch::EpochActivationSource::Cli,
+                invoked_at: shanghai_at("2026-08-21", 15, 40, 0),
+            })
+            .unwrap();
+        (path, session, receipt)
+    }
+
+    fn activated_carry_epoch_database(
+        label: &str,
+    ) -> (PathBuf, AttributionDatabaseSession, AttributionEpochReceipt) {
+        let path = test_database_path(label);
+        create_epoch_replay_schema(&Connection::open(&path).unwrap());
+        append_epoch_source_fill(
+            &path,
+            1,
+            "buy",
+            10.0,
+            200,
+            "2026-08-20 01:31:05",
+            "2026-08-20T09:31:05+08:00",
+            "Breakout",
+        );
+        append_epoch_source_fill(
+            &path,
+            2,
+            "sell",
+            11.0,
+            100,
+            "2026-08-21 06:20:00",
+            "2026-08-21T14:20:00+08:00",
+            "ExitByRule",
+        );
+        let session =
+            AttributionDatabaseSession::open(&path, AttributionDatabaseAccess::AppendOnly).unwrap();
+        let receipt = AttributionEpochStore::new(session.database())
+            .activate_once(EpochActivationRequest {
+                source: crate::performance::attribution_epoch::EpochActivationSource::Cli,
+                invoked_at: shanghai_at("2026-08-21", 15, 40, 0),
+            })
+            .unwrap();
+        (path, session, receipt)
+    }
+
+    fn append_epoch_close(path: &Path, id: i64, day: &str, close: f64) {
+        Connection::open(path)
+            .unwrap()
+            .execute(
+                "INSERT INTO stock_daily
+                 VALUES (?1,'TEST_CODE_600001',?2,?3,'TEST_CODE_SOURCE',?2,?2)",
+                params![id, day, close],
             )
             .unwrap();
     }
@@ -4964,8 +6167,384 @@ mod tests {
     ) -> ReplayRequest {
         ReplayRequest {
             mode: ReplayMode::Scheduled { invoked_at },
+            epoch: AttributionEpochSelector::Legacy,
             benchmark_day_manifests,
         }
+    }
+
+    #[test]
+    fn epoch_active_missing_fails_at_epoch_before_legacy_trade_evidence() {
+        let path = complete_database("epoch_active_missing");
+        Connection::open(&path)
+            .unwrap()
+            .execute("DROP TABLE paper_trades", [])
+            .unwrap();
+        let manager = crate::database::attribution_reports::test_runner_database_manager(&path);
+        let runner = AttributionReplayRunner::new_for_test(
+            &manager,
+            AttributionReplayLoader::new(&path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+        );
+
+        let error = runner
+            .preview(ReplayRequest {
+                mode: ReplayMode::Scheduled {
+                    invoked_at: shanghai_at("2026-08-21", 15, 30, 0),
+                },
+                epoch: AttributionEpochSelector::Active,
+                benchmark_day_manifests: Vec::new(),
+            })
+            .expect_err("TEST_CODE active epoch must not fall back to legacy replay");
+
+        assert_eq!(error.stage(), ReplayStage::Epoch);
+        assert_eq!(error.code(), "attribution_epoch_unavailable");
+        assert_eq!(ReplayStage::Epoch.as_str(), "epoch");
+        drop(runner);
+        drop(manager);
+        remove_database(path);
+    }
+
+    #[test]
+    fn epoch_legacy_explicitly_preserves_truthful_t_plus_one_failure() {
+        let path = complete_database("epoch_legacy_t_plus_one");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE paper_trades SET ts='2026-08-20 14:20:00' WHERE id=2",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE order_audit
+                 SET quote_observed_at='2026-08-20T14:20:00+08:00' WHERE id=2",
+                [],
+            )
+            .unwrap();
+        rehash_audits(&connection);
+        drop(connection);
+        let manager = crate::database::attribution_reports::test_runner_database_manager(&path);
+        let runner = AttributionReplayRunner::new_for_test(
+            &manager,
+            AttributionReplayLoader::new(&path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+        );
+
+        let error = runner
+            .preview(ReplayRequest {
+                mode: ReplayMode::Range {
+                    from: date("2026-08-20"),
+                    to: date("2026-08-20"),
+                    invoked_at: shanghai_at("2026-08-21", 15, 30, 0),
+                },
+                epoch: AttributionEpochSelector::Legacy,
+                benchmark_day_manifests: Vec::new(),
+            })
+            .expect_err("TEST_CODE legacy replay must preserve the old T+1 failure");
+
+        assert_eq!(error.stage(), ReplayStage::TradeEvidence);
+        assert_eq!(error.code(), "paper_trade_source_failed");
+        drop(runner);
+        drop(manager);
+        remove_database(path);
+    }
+
+    #[test]
+    fn epoch_exact_unknown_is_typed_unavailable_after_retained_state_validation() {
+        let (path, session, _) = activated_epoch_database("epoch_exact_unknown");
+        let runner = AttributionReplayRunner::new_for_test(
+            session.database(),
+            AttributionReplayLoader::new(&path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+        );
+
+        let error = runner
+            .preview(ReplayRequest {
+                mode: ReplayMode::Range {
+                    from: date("2026-08-24"),
+                    to: date("2026-08-24"),
+                    invoked_at: shanghai_at("2026-08-24", 15, 30, 0),
+                },
+                epoch: AttributionEpochSelector::Exact("f".repeat(64)),
+                benchmark_day_manifests: Vec::new(),
+            })
+            .expect_err("TEST_CODE unknown exact epoch must be unavailable");
+
+        assert_eq!(error.stage(), ReplayStage::Epoch);
+        assert_eq!(error.code(), "attribution_epoch_unavailable");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "DROP TRIGGER trg_attribution_sample_epoch_receipt_chain_no_update",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE attribution_sample_epoch_receipt_chain
+                 SET record_hash=?1 WHERE id=1",
+                ["e".repeat(64)],
+            )
+            .unwrap();
+        drop(connection);
+        let integrity = runner
+            .preview(ReplayRequest {
+                mode: ReplayMode::Range {
+                    from: date("2026-08-24"),
+                    to: date("2026-08-24"),
+                    invoked_at: shanghai_at("2026-08-24", 15, 30, 0),
+                },
+                epoch: AttributionEpochSelector::Exact("d".repeat(64)),
+                benchmark_day_manifests: Vec::new(),
+            })
+            .expect_err("TEST_CODE bad retained state must precede exact absence");
+        assert_eq!(integrity.stage(), ReplayStage::Epoch);
+        assert_eq!(integrity.code(), "attribution_epoch_integrity_failed");
+        drop(runner);
+        drop(session);
+        remove_database(path);
+    }
+
+    #[test]
+    fn epoch_range_before_effective_is_rejected_without_clipping() {
+        let (path, session, _) = activated_epoch_database("epoch_range_before_effective");
+        let runner = AttributionReplayRunner::new_for_test(
+            session.database(),
+            AttributionReplayLoader::new(&path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+        );
+
+        let error = runner
+            .preview(ReplayRequest {
+                mode: ReplayMode::Range {
+                    from: date("2026-08-21"),
+                    to: date("2026-08-24"),
+                    invoked_at: shanghai_at("2026-08-24", 15, 30, 0),
+                },
+                epoch: AttributionEpochSelector::Active,
+                benchmark_day_manifests: Vec::new(),
+            })
+            .expect_err("TEST_CODE epoch range must not be silently clipped");
+
+        assert_eq!(error.stage(), ReplayStage::Epoch);
+        assert_eq!(error.code(), "attribution_epoch_range_before_effective");
+        drop(runner);
+        drop(session);
+        remove_database(path);
+    }
+
+    #[test]
+    fn epoch_failure_summary_binds_selector_resolved_receipt_carry_and_exclusions() {
+        let (path, session, receipt) = activated_epoch_database("epoch_failure_summary");
+        let mode = ReplayMode::Range {
+            from: date("2026-08-24"),
+            to: date("2026-08-24"),
+            invoked_at: shanghai_at("2026-08-24", 15, 30, 0),
+        };
+        let legacy = admit_replay_request(ReplayRequest {
+            mode: mode.clone(),
+            epoch: AttributionEpochSelector::Legacy,
+            benchmark_day_manifests: Vec::new(),
+        })
+        .unwrap();
+        let active = admit_replay_request(ReplayRequest {
+            mode,
+            epoch: AttributionEpochSelector::Active,
+            benchmark_day_manifests: Vec::new(),
+        })
+        .unwrap();
+        let error = ReplayError::new(
+            ReplayErrorClass::Unavailable,
+            ReplayStage::Epoch,
+            "attribution_epoch_unavailable",
+            false,
+        );
+        let legacy_hash = FailureEvidenceSummary::new(&legacy).source_summary_hash(&error);
+        let mut unresolved = FailureEvidenceSummary::new(&active);
+        let unresolved_hash = unresolved.source_summary_hash(&error);
+        assert_ne!(legacy_hash, unresolved_hash);
+
+        unresolved.record_resolved_epoch(&ResolvedAttributionEpoch::Epoch(receipt.clone()));
+        let resolved_hash = unresolved.source_summary_hash(&error);
+        assert_ne!(unresolved_hash, resolved_hash);
+        let epoch = AttributionEpochReplayEvidence::resolved(
+            AttributionEpochSelector::Active,
+            &receipt,
+            Vec::new(),
+            canonical_exclusion_manifest_hash(&[], &[]).unwrap(),
+            Vec::new(),
+            0,
+            canonical_scoped_fill_manifest_hash(&[]).unwrap(),
+            "1".repeat(64),
+            "2".repeat(64),
+            "3".repeat(64),
+        );
+        unresolved.record_epoch_evidence(&epoch);
+        assert_ne!(resolved_hash, unresolved.source_summary_hash(&error));
+        drop(session);
+        remove_database(path);
+    }
+
+    #[test]
+    fn epoch_quarantine_excludes_complete_overlap_until_flat_and_projects_fee_denominator() {
+        let (path, session, receipt) = activated_carry_epoch_database("epoch_quarantine_and_fees");
+        append_epoch_source_fill(
+            &path,
+            3,
+            "buy",
+            12.0,
+            100,
+            "2026-08-24 01:31:05",
+            "2026-08-24T09:31:05+08:00",
+            "Momentum",
+        );
+        append_epoch_source_fill(
+            &path,
+            4,
+            "sell",
+            12.5,
+            200,
+            "2026-08-25 01:32:05",
+            "2026-08-25T09:32:05+08:00",
+            "ExitByRule",
+        );
+        append_epoch_source_fill(
+            &path,
+            5,
+            "buy",
+            20.0,
+            100,
+            "2026-08-25 02:00:05",
+            "2026-08-25T10:00:05+08:00",
+            "Breakout",
+        );
+        append_epoch_source_fill(
+            &path,
+            6,
+            "sell",
+            22.0,
+            100,
+            "2026-08-26 02:00:05",
+            "2026-08-26T10:00:05+08:00",
+            "ExitByRule",
+        );
+        for (id, day, close) in [
+            (1, "2026-08-24", 12.1),
+            (2, "2026-08-25", 20.2),
+            (3, "2026-08-26", 22.1),
+        ] {
+            append_epoch_close(&path, id, day, close);
+        }
+        let benchmark_day_manifests = vec![
+            append_test_benchmark_manifest(session.database(), date("2026-08-24"), 0.0),
+            append_test_benchmark_manifest(session.database(), date("2026-08-25"), 10.0),
+            append_test_benchmark_manifest(session.database(), date("2026-08-26"), 20.0),
+        ];
+        let quarantine_runner = AttributionReplayRunner::new_for_test(
+            session.database(),
+            AttributionReplayLoader::new(&path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+        );
+        let still_quarantined = quarantine_runner
+            .preview(ReplayRequest {
+                mode: ReplayMode::Range {
+                    from: date("2026-08-24"),
+                    to: date("2026-08-24"),
+                    invoked_at: shanghai_at("2026-08-24", 15, 30, 0),
+                },
+                epoch: AttributionEpochSelector::Active,
+                benchmark_day_manifests: vec![benchmark_day_manifests[0].clone()],
+            })
+            .expect("TEST_CODE unresolved carry remains quarantined");
+        assert_eq!(
+            still_quarantined.remaining_quarantine(),
+            &[LegacyCarryPosition {
+                code: "TEST_CODE_600001".to_owned(),
+                quantity: 200,
+            }]
+        );
+        assert_eq!(still_quarantined.released_codes(), 0);
+        assert_eq!(still_quarantined.excluded_fill_count(), 1);
+        assert!(still_quarantined.report().source_fill_ids().is_empty());
+        drop(quarantine_runner);
+        let runner = AttributionReplayRunner::new_for_test_with_fee_ledger(
+            session.database(),
+            AttributionReplayLoader::new(&path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+            AuthoritativeFillFeeLedger {
+                entries: vec![fee(3, 90.0), fee(4, 90.0), fee(5, 5.0), fee(6, 5.0)],
+            },
+        );
+
+        let prepared = runner
+            .preview(ReplayRequest {
+                mode: ReplayMode::Range {
+                    from: date("2026-08-24"),
+                    to: date("2026-08-26"),
+                    invoked_at: shanghai_at("2026-08-26", 15, 30, 0),
+                },
+                epoch: AttributionEpochSelector::Active,
+                benchmark_day_manifests: benchmark_day_manifests.clone(),
+            })
+            .expect("TEST_CODE active epoch replay");
+
+        assert_eq!(prepared.epoch_selector(), &AttributionEpochSelector::Active);
+        assert_eq!(prepared.epoch_id(), Some(receipt.epoch_id.as_str()));
+        assert_eq!(
+            prepared.epoch_receipt_hash(),
+            Some(receipt.receipt_hash.as_str())
+        );
+        assert_eq!(prepared.epoch_effective_date(), Some(date("2026-08-24")));
+        assert_eq!(prepared.remaining_quarantine(), &[]);
+        assert_eq!(prepared.released_codes(), 1);
+        assert_eq!(prepared.overlap_buy_count(), 1);
+        assert_eq!(prepared.overlap_sell_count(), 1);
+        assert_eq!(prepared.mixed_exit_count(), 1);
+        assert_eq!(prepared.excluded_fill_count(), 2);
+        assert_eq!(prepared.excluded_fills().len(), 3);
+        assert_eq!(prepared.report().source_fill_ids(), &[5, 6]);
+        assert_eq!(prepared.report().total_closed_cycles(), 1);
+        let MetricAvailability::Available(basis) = prepared.report().fee_basis() else {
+            panic!("TEST_CODE attributable fee basis must remain complete");
+        };
+        assert_eq!(
+            basis
+                .bindings
+                .iter()
+                .map(|binding| binding.fill_id)
+                .collect::<Vec<_>>(),
+            vec![5, 6]
+        );
+        let payload: serde_json::Value =
+            serde_json::from_slice(prepared.canonical_result_bytes()).unwrap();
+        assert_eq!(payload["epoch"]["selector"], "active");
+        assert_eq!(payload["epoch"]["excluded_fill_count"], 2);
+        let exact = runner
+            .preview(ReplayRequest {
+                mode: ReplayMode::Range {
+                    from: date("2026-08-24"),
+                    to: date("2026-08-26"),
+                    invoked_at: shanghai_at("2026-08-26", 15, 30, 0),
+                },
+                epoch: AttributionEpochSelector::Exact(receipt.epoch_id.clone()),
+                benchmark_day_manifests,
+            })
+            .expect("TEST_CODE retained exact epoch replay");
+        assert_eq!(
+            exact.epoch_selector(),
+            &AttributionEpochSelector::Exact(receipt.epoch_id.clone())
+        );
+        assert_eq!(exact.report().source_fill_ids(), &[5, 6]);
+        assert_ne!(prepared.trade_manifest_hash(), exact.trade_manifest_hash());
+        drop(runner);
+        drop(session);
+        remove_database(path);
     }
 
     #[test]
@@ -4989,6 +6568,7 @@ mod tests {
                 mode: ReplayMode::Scheduled {
                     invoked_at: shanghai_at("2026-08-21", 15, 30, 0),
                 },
+                epoch: AttributionEpochSelector::Legacy,
                 benchmark_day_manifests: benchmark_day_manifests.clone(),
             })
             .expect("TEST_CODE scheduled preview");
@@ -4999,6 +6579,7 @@ mod tests {
                     to: date("2026-08-21"),
                     invoked_at: shanghai_at("2026-08-22", 15, 30, 0),
                 },
+                epoch: AttributionEpochSelector::Legacy,
                 benchmark_day_manifests,
             })
             .expect("TEST_CODE same-day range preview");
@@ -5007,6 +6588,14 @@ mod tests {
             range.canonical_result_bytes()
         );
         assert_eq!(scheduled.report().total_closed_cycles(), 1);
+        assert_eq!(
+            scheduled.epoch_selector(),
+            &AttributionEpochSelector::Legacy
+        );
+        assert_eq!(scheduled.epoch_id(), None);
+        assert_eq!(scheduled.epoch_receipt_hash(), None);
+        assert_eq!(scheduled.legacy_carry_manifest_hash(), None);
+        assert_eq!(scheduled.exclusion_manifest_hash(), None);
         assert_eq!(scheduled.trade_manifest_hash().len(), 64);
         assert_eq!(scheduled.calendar_authority_hash().len(), 64);
         assert_eq!(runner_readonly_counts(&path), before_counts);
@@ -5842,6 +7431,7 @@ mod tests {
                     to: date("2026-08-24"),
                     invoked_at: shanghai_at("2026-08-24", 15, 30, 0),
                 },
+                epoch: AttributionEpochSelector::Legacy,
                 benchmark_day_manifests: Vec::new(),
             })
             .expect_err("TEST_CODE weekend fill must fail before benchmark lookup");
@@ -7074,6 +8664,13 @@ mod tests {
         fills: Vec<ReplayFillEvidence>,
         fees: Option<Vec<FillFeeEvidence>>,
     ) -> AttributionReplayEvidence {
+        let scoped_fill_manifest_hash = canonical_scoped_fill_manifest_hash(
+            &fills
+                .iter()
+                .map(|evidence| evidence.fill.clone())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|_| "f".repeat(64));
         AttributionReplayEvidence::issued(
             date(from),
             date(to),
@@ -7092,6 +8689,7 @@ mod tests {
                     FeeEvidenceAvailability::Available(AuthoritativeFillFeeLedger { entries })
                 },
             ),
+            AttributionEpochReplayEvidence::legacy(scoped_fill_manifest_hash),
         )
     }
 
@@ -7157,6 +8755,52 @@ mod tests {
             report.net_win_rate,
             MetricAvailability::Available(Some(value)) if value == 1.0
         ));
+    }
+
+    #[test]
+    fn epoch_capability_seal_rejects_selector_receipt_carry_exclusion_and_scope_rebinding() {
+        let evidence = replay_evidence("2026-08-20", "2026-08-20", Vec::new(), Some(Vec::new()));
+        let assert_rejected = |candidate: AttributionReplayEvidence| {
+            assert!(matches!(
+                compute_attribution_range(&candidate, &[], &verified_minute_labels()),
+                Err(AttributionReplayError::FailedIntegrity {
+                    code: AttributionIntegrityFailure::ReplayEvidence,
+                    ..
+                })
+            ));
+        };
+
+        let mut selector = evidence.clone();
+        selector.epoch.selector = AttributionEpochSelector::Active;
+        assert_rejected(selector);
+
+        let mut receipt = evidence.clone();
+        receipt.epoch.epoch_id = Some("a".repeat(64));
+        receipt.epoch.receipt_hash = Some("b".repeat(64));
+        assert_rejected(receipt);
+
+        let mut carry = evidence.clone();
+        carry.epoch.legacy_carry_manifest_hash = Some("c".repeat(64));
+        carry.epoch.remaining_quarantine = vec![LegacyCarryPosition {
+            code: "TEST_CODE_600001".to_owned(),
+            quantity: 100,
+        }];
+        assert_rejected(carry);
+
+        let mut exclusion = evidence.clone();
+        exclusion.epoch.exclusion_manifest_hash = Some("d".repeat(64));
+        exclusion.epoch.excluded_fills = vec![EpochExclusion {
+            fill_id: 1,
+            code: "TEST_CODE_600001".to_owned(),
+            direction: "buy".to_owned(),
+            quantity: 100,
+            reason: EpochExclusionReason::LegacyCarryOverlap,
+        }];
+        assert_rejected(exclusion);
+
+        let mut scoped = evidence;
+        scoped.epoch.scoped_fill_manifest_hash = "e".repeat(64);
+        assert_rejected(scoped);
     }
 
     #[test]

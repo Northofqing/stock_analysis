@@ -223,6 +223,7 @@ impl VerifiedEpochFill {
 #[allow(dead_code)] // Task 5 consumes the verified deep-module source capability.
 pub(crate) struct VerifiedEpochFillSet {
     fills: Vec<VerifiedEpochFill>,
+    carry: Vec<LegacyCarryPosition>,
     filled_manifest_hash: String,
     terminal_binding_manifest_hash: String,
     order_audit_tip_hash: String,
@@ -232,6 +233,10 @@ pub(crate) struct VerifiedEpochFillSet {
 impl VerifiedEpochFillSet {
     pub(crate) fn fills(&self) -> &[VerifiedEpochFill] {
         &self.fills
+    }
+
+    pub(crate) fn carry(&self) -> &[LegacyCarryPosition] {
+        &self.carry
     }
 
     pub(crate) fn filled_manifest_hash(&self) -> &str {
@@ -2447,6 +2452,13 @@ pub(crate) fn verify_epoch_source_prefix(
     conn: &mut SqliteConnection,
     epoch: &AttributionEpochReceipt,
 ) -> Result<(), AttributionEpochStoreError> {
+    verified_epoch_retained_carry(conn, epoch).map(|_| ())
+}
+
+fn verified_epoch_retained_carry(
+    conn: &mut SqliteConnection,
+    epoch: &AttributionEpochReceipt,
+) -> Result<Vec<LegacyCarryPosition>, AttributionEpochStoreError> {
     let rows = validate_all(conn)?;
     let persisted = rows
         .iter()
@@ -2458,7 +2470,28 @@ pub(crate) fn verify_epoch_source_prefix(
             "BR-255 caller receipt differs from canonical retained receipt",
         ));
     }
-    ensure_source_matches_receipt(conn, epoch).map(|_| ())
+    ensure_source_matches_receipt(conn, epoch)?;
+    let carry = load_carry(conn)?
+        .into_iter()
+        .filter(|row| row.epoch_receipt_id == persisted.id)
+        .map(|row| {
+            Ok(LegacyCarryPosition {
+                code: row.code,
+                quantity: u64::try_from(row.quantity)
+                    .map_err(|_| failed_integrity("BR-255 retained carry quantity is invalid"))?,
+            })
+        })
+        .collect::<Result<Vec<_>, AttributionEpochStoreError>>()?;
+    let (count, total) = carry_summary(&carry)?;
+    if count != epoch.carry_item_count
+        || total != epoch.carry_total_quantity
+        || canonical_legacy_carry_manifest_hash(&carry) != epoch.legacy_carry_manifest_hash
+    {
+        return Err(failed_integrity(
+            "BR-255 retained carry changed after complete epoch validation",
+        ));
+    }
+    Ok(carry)
 }
 
 #[allow(dead_code)] // Task 5 wires this deep verified source capability into replay.
@@ -2467,15 +2500,16 @@ pub(crate) fn load_verified_epoch_fills_until(
     epoch: &ResolvedAttributionEpoch,
     to: NaiveDate,
 ) -> Result<VerifiedEpochFillSet, AttributionEpochStoreError> {
-    let (completed, paper_high_water, audit_high_water, effective) = match epoch {
-        ResolvedAttributionEpoch::Legacy => (to, 0, 0, None),
+    let (completed, paper_high_water, audit_high_water, effective, carry) = match epoch {
+        ResolvedAttributionEpoch::Legacy => (to, 0, 0, None, Vec::new()),
         ResolvedAttributionEpoch::Epoch(receipt) => {
-            verify_epoch_source_prefix(conn, receipt)?;
+            let carry = verified_epoch_retained_carry(conn, receipt)?;
             (
                 receipt.cutover_completed_trading_date,
                 receipt.paper_trade_high_water,
                 receipt.order_audit_high_water,
                 Some(receipt.effective_trading_date),
+                carry,
             )
         }
     };
@@ -2528,6 +2562,7 @@ pub(crate) fn load_verified_epoch_fills_until(
     }
     Ok(VerifiedEpochFillSet {
         fills,
+        carry,
         filled_manifest_hash: source.legacy_filled_manifest_hash,
         terminal_binding_manifest_hash: source.terminal_binding_manifest_hash,
         order_audit_tip_hash: source.order_audit_tip_hash,
@@ -3685,6 +3720,40 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
+    }
+
+    #[test]
+    fn verified_epoch_fill_set_exposes_fully_validated_retained_carry() {
+        let database = TestDatabase::new();
+        install_activation_source(&database.manager);
+        let receipt = AttributionEpochStore::new(&database.manager)
+            .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
+            .unwrap();
+        append_activation_fill(
+            &database.manager,
+            3,
+            "TEST_CODE_PLAN_AFTER_EPOCH",
+            "buy",
+            100,
+            "2026-08-31 02:00:00",
+        );
+
+        let mut conn = database.manager.get_conn().unwrap();
+        let verified = load_verified_epoch_fills_until(
+            &mut conn,
+            &ResolvedAttributionEpoch::Epoch(receipt),
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            verified.carry(),
+            &[LegacyCarryPosition {
+                code: "TEST_CODE_600001".to_owned(),
+                quantity: 100,
+            }]
+        );
+        assert_eq!(verified.fills().len(), 1);
     }
 
     #[test]

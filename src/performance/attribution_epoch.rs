@@ -23,6 +23,25 @@ pub enum AttributionEpochSelector {
     Exact(String),
 }
 
+impl AttributionEpochSelector {
+    pub fn canonical_value(&self) -> String {
+        match self {
+            Self::Active => "active".to_owned(),
+            Self::Legacy => "legacy".to_owned(),
+            Self::Exact(epoch_id) => format!("exact:{epoch_id}"),
+        }
+    }
+}
+
+impl serde::Serialize for AttributionEpochSelector {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.canonical_value())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct LegacyCarryPosition {
     pub code: String,
@@ -30,6 +49,7 @@ pub struct LegacyCarryPosition {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EpochExclusionReason {
     LegacyCarryOverlap,
     MixedLegacyCarryExit,
