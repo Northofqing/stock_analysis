@@ -2001,32 +2001,39 @@ fn analyze_source_projection(
             .or_default()
             .push(audit);
     }
+    let shanghai = FixedOffset::east_opt(8 * 60 * 60)
+        .ok_or_else(|| failed_integrity("BR-255 Shanghai fixed offset is unavailable"))?;
     let mut bindings = Vec::with_capacity(fills.len());
     for paper in &fills {
-        let matches = terminals
+        let candidates = terminals
             .get(paper.plan_id.as_str())
             .into_iter()
             .flatten()
             .copied()
-            .filter(|terminal| {
-                terminal.code == paper.code
-                    && terminal.decision_basis == paper.virtual_reason
-                    && terminal.side == paper.direction
-                    && terminal.requested_price.to_bits() == paper.requested_price.to_bits()
-                    && terminal.execution_price.map(f64::to_bits)
-                        == paper.fill_price.map(f64::to_bits)
-                    && terminal.quantity == paper.quantity
-                    && terminal.failure_reason.is_none()
-            })
             .collect::<Vec<_>>();
-        if matches.len() != 1 {
+        if candidates.len() != 1 {
             return Err(failed_integrity(format!(
-                "BR-255 Filled paper id={} has {} terminal audit bindings",
+                "BR-255 Filled paper id={} has {} terminal audit candidates",
                 paper.id,
-                matches.len()
+                candidates.len()
             )));
         }
-        let terminal = matches[0];
+        let terminal = candidates[0];
+        let exact = terminal.source == "PaperTrade"
+            && terminal.outcome == "Filled"
+            && terminal.code == paper.code
+            && terminal.decision_basis == paper.virtual_reason
+            && terminal.side == paper.direction
+            && terminal.requested_price.to_bits() == paper.requested_price.to_bits()
+            && terminal.execution_price.map(f64::to_bits) == paper.fill_price.map(f64::to_bits)
+            && terminal.quantity == paper.quantity
+            && terminal.failure_reason.is_none();
+        if !exact {
+            return Err(failed_integrity(format!(
+                "BR-255 Filled paper id={} and terminal audit id={} do not exactly bind source/code/side/prices/quantity/outcome/decision/failure",
+                paper.id, terminal.id
+            )));
+        }
         let execution_price = terminal.execution_price.ok_or_else(|| {
             failed_integrity(format!(
                 "BR-255 Filled audit id={} has no execution price",
@@ -2088,6 +2095,14 @@ fn analyze_source_projection(
         let paper_created_at = parse_paper_fill_timestamp(paper.id, &paper.occurred_at)
             .map_err(failed_integrity)?
             .and_utc();
+        let paper_business_date = paper_created_at.date_naive();
+        let quote_business_date = quote_observed_at.with_timezone(&shanghai).date_naive();
+        if paper_business_date != quote_business_date {
+            return Err(failed_integrity(format!(
+                "BR-255 paper id={} business date {paper_business_date} differs from terminal audit id={} quote business date {quote_business_date}",
+                paper.id, terminal.id
+            )));
+        }
         if paper_created_at + chrono::Duration::seconds(1) < quote_observed_at_utc {
             return Err(failed_integrity(format!(
                 "BR-255 paper id={} persistence time precedes terminal quote evidence",
@@ -3569,6 +3584,23 @@ mod tests {
         .unwrap();
     }
 
+    fn append_semantically_mismatched_duplicate_terminal(manager: &DatabaseManager) {
+        append_duplicate_terminal(manager);
+        let mut conn = manager.get_conn().unwrap();
+        diesel::sql_query(
+            "UPDATE order_audit
+             SET decision_basis='TEST_CODE mismatched decision',
+                 failure_reason='TEST_CODE mismatched failure',
+                 quote_observed_at='2026-08-27T10:00:09+08:00',
+                 created_at='2026-08-27 02:00:10'
+             WHERE id=3",
+        )
+        .execute(&mut conn)
+        .unwrap();
+        drop(conn);
+        rewrite_test_audit_chain(manager);
+    }
+
     fn activation_error_detail(error: AttributionEpochStoreError) -> String {
         match error {
             AttributionEpochStoreError::FailedIntegrity { detail, .. }
@@ -4139,6 +4171,100 @@ mod tests {
             assert!(load_receipts(&mut conn).unwrap().is_empty());
             assert_eq!(validate_attempts(&mut conn).unwrap().len(), 1);
         }
+    }
+
+    #[test]
+    fn mismatched_duplicate_terminal_fails_activation_and_verified_loading() {
+        let activation_database = TestDatabase::new();
+        install_activation_source(&activation_database.manager);
+        append_semantically_mismatched_duplicate_terminal(&activation_database.manager);
+
+        let activation_error = AttributionEpochStore::new(&activation_database.manager)
+            .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
+            .unwrap_err();
+        assert_eq!(
+            activation_error.reason_code(),
+            "attribution_epoch_integrity_failed"
+        );
+        assert!(activation_error_detail(activation_error).contains("2 terminal audit candidates"));
+
+        let loading_database = TestDatabase::new();
+        install_activation_source(&loading_database.manager);
+        let receipt = AttributionEpochStore::new(&loading_database.manager)
+            .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
+            .unwrap();
+        append_semantically_mismatched_duplicate_terminal(&loading_database.manager);
+        let mut conn = loading_database.manager.get_conn().unwrap();
+        let loading_error = load_verified_epoch_fills_until(
+            &mut conn,
+            &ResolvedAttributionEpoch::Epoch(receipt),
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            loading_error.reason_code(),
+            "attribution_epoch_integrity_failed"
+        );
+        assert!(activation_error_detail(loading_error).contains("2 terminal audit candidates"));
+    }
+
+    #[test]
+    fn quote_business_date_mismatch_fails_activation_and_verified_loading() {
+        let activation_database = TestDatabase::new();
+        install_activation_source(&activation_database.manager);
+        let mut conn = activation_database.manager.get_conn().unwrap();
+        diesel::sql_query(
+            "UPDATE paper_trades
+             SET ts='2026-08-27 23:59:59',updated_at='2026-08-27 23:59:59'
+             WHERE id=1",
+        )
+        .execute(&mut conn)
+        .unwrap();
+        diesel::sql_query(
+            "UPDATE order_audit
+             SET quote_observed_at='2026-08-28T08:00:00+08:00',
+                 created_at='2026-08-28 00:00:00'
+             WHERE id=1",
+        )
+        .execute(&mut conn)
+        .unwrap();
+        drop(conn);
+        rewrite_test_audit_chain(&activation_database.manager);
+
+        let activation_error = AttributionEpochStore::new(&activation_database.manager)
+            .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
+            .unwrap_err();
+        assert_eq!(
+            activation_error.reason_code(),
+            "attribution_epoch_integrity_failed"
+        );
+        assert!(activation_error_detail(activation_error).contains("business date"));
+
+        let loading_database = TestDatabase::new();
+        install_activation_source(&loading_database.manager);
+        let receipt = AttributionEpochStore::new(&loading_database.manager)
+            .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
+            .unwrap();
+        append_activation_fill(
+            &loading_database.manager,
+            3,
+            "TEST_CODE_PLAN_DATE_MISMATCH",
+            "buy",
+            100,
+            "2026-08-31 23:59:59",
+        );
+        let mut conn = loading_database.manager.get_conn().unwrap();
+        let loading_error = load_verified_epoch_fills_until(
+            &mut conn,
+            &ResolvedAttributionEpoch::Epoch(receipt),
+            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            loading_error.reason_code(),
+            "attribution_epoch_integrity_failed"
+        );
+        assert!(activation_error_detail(loading_error).contains("business date"));
     }
 
     #[test]
