@@ -1317,7 +1317,7 @@ acquisition/segment/manifest/report/failure 事实不得删除、覆盖或回退
 Clippy 的错误。
 
 同一源码、rustc 1.95.0、LLVM 22.1.2、cargo-llvm-cov 0.8.7 的完整覆盖率报告得到：global
-`202932/260197 = 77.99%`、core `158730/203847 = 77.87%`（218 files）、core patch
+`202935/260197 = 77.99%`、core `158731/203847 = 77.87%`（218 files）、core patch
 `147/157 = 93.63%`、other production patch N/A（零可执行变更行）。两项比例均高于最新
 `master` 的 202888/260143 与 158687/203793；PR policy 与 coverage ratchet 退出 0，固定
 90%/85% 及 release 80%/95% 阈值未修改。loopback fixture 在 filesystem sandbox 内会得到

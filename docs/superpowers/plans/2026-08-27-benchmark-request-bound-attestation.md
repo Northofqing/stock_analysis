@@ -204,7 +204,7 @@ python3 tools/coverage/check_thresholds.py --policy pr --report target/coverage/
 
 Actual: fmt、strict workspace Clippy、隔离全量 tests、PR compliance 和 coverage ratchet 均
 exit 0；core patch 93.63%，other production patch N/A（无可执行变更行），global/core
-202932/260197 = 77.99% 与 158730/203847 = 77.87%，均高于最新 `master` 的覆盖率比例。
+202935/260197 = 77.99% 与 158731/203847 = 77.87%，均高于最新 `master` 的覆盖率比例。
 默认与 no-default Benchmark 聚焦测试均 27/27，CLI 6/6。Gate C PASS；Gate D 因固定
 80%/95%、freshness、完整 live attribution 与 auditor 未闭合保持 Release Blocked。
 
