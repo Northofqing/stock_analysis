@@ -308,6 +308,8 @@ impl PrFixture {
         let root = checkout.path();
         std::fs::create_dir_all(root.join("src/risk")).expect("create core source directory");
         std::fs::create_dir_all(root.join("src/agent")).expect("create other source directory");
+        std::fs::create_dir_all(root.join("build_support"))
+            .expect("create build support directory");
         std::fs::create_dir_all(root.join("config")).expect("create config directory");
 
         write_source(
@@ -316,6 +318,11 @@ impl PrFixture {
             if case.delete_core_tail_only { 20 } else { 10 },
         );
         write_source(&root.join("src/agent/example.rs"), "base_other", 20);
+        write_source(
+            &root.join("build_support/magic_tdx_lock.rs"),
+            "base_build_support",
+            1,
+        );
         git(root, &["init", "-q"]);
         git(root, &["add", "."]);
         git(root, &["commit", "-qm", "base source"]);
@@ -704,6 +711,33 @@ fn pr_policy_rejects_source_changes_after_the_registered_source_sha() {
     git(
         fixture.checkout.path(),
         &["commit", "-qm", "source changed after report authority"],
+    );
+
+    let output = fixture.run(fixture.bootstrap);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("coverage inputs changed after coverage.source_sha"));
+}
+
+#[test]
+fn pr_policy_rejects_build_support_changes_after_the_registered_source_sha() {
+    let fixture = PrFixture::new(&PrCase::default());
+    write_source(
+        &fixture
+            .checkout
+            .path()
+            .join("build_support/magic_tdx_lock.rs"),
+        "after_report",
+        2,
+    );
+    git(fixture.checkout.path(), &["add", "."]);
+    git(
+        fixture.checkout.path(),
+        &[
+            "commit",
+            "-qm",
+            "build support changed after report authority",
+        ],
     );
 
     let output = fixture.run(fixture.bootstrap);

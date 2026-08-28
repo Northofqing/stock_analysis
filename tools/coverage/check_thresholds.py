@@ -438,7 +438,7 @@ def verify_tool_identity(contract: CoverageContract) -> None:
 
 
 def verify_source_binding(contract: CoverageContract, repository: pathlib.Path) -> None:
-    inputs = ["src", "Cargo.toml", "Cargo.lock", "build.rs"]
+    inputs = ["src", "build_support", "Cargo.toml", "Cargo.lock", "build.rs"]
     if not git_succeeds(
         repository, ["merge-base", "--is-ancestor", contract.source_sha, "HEAD"]
     ):
