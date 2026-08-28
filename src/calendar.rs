@@ -448,6 +448,22 @@ pub fn verified_prev_a_share_trading_day(from: NaiveDate) -> Result<NaiveDate, S
     }
 }
 
+/// Resolve the following A-share trading day using only the immutable,
+/// fail-closed exchange-calendar authority.
+pub fn verified_next_a_share_trading_day(from: NaiveDate) -> Result<NaiveDate, String> {
+    let mut candidate = from
+        .checked_add_signed(chrono::Duration::days(1))
+        .ok_or_else(|| "A-share trading-calendar next-date overflow".to_owned())?;
+    loop {
+        if verified_a_share_trading_day(candidate)? {
+            return Ok(candidate);
+        }
+        candidate = candidate
+            .checked_add_signed(chrono::Duration::days(1))
+            .ok_or_else(|| "A-share trading-calendar next-date overflow".to_owned())?;
+    }
+}
+
 /// 添加节假日（运行时注入，用于测试或动态更新）
 /// review #14: poison 时 log error 而非静默丢弃, 让调用方知道 add 失败.
 pub fn add_holidays(dates: &[NaiveDate]) {
@@ -820,6 +836,33 @@ mod tests {
         if let Ok(mut guard) = HOLIDAYS.write() {
             guard.remove(&trading_day);
         }
+    }
+
+    #[test]
+    fn verified_next_a_share_trading_day_skips_weekend_and_closure() {
+        assert_eq!(
+            verified_next_a_share_trading_day(
+                NaiveDate::from_ymd_opt(2026, 9, 30).expect("TEST_CODE date")
+            )
+            .expect("TEST_CODE next trading day"),
+            NaiveDate::from_ymd_opt(2026, 10, 8).expect("TEST_CODE date")
+        );
+        assert_eq!(
+            verified_next_a_share_trading_day(
+                NaiveDate::from_ymd_opt(2026, 8, 28).expect("TEST_CODE date")
+            )
+            .expect("TEST_CODE next trading day"),
+            NaiveDate::from_ymd_opt(2026, 8, 31).expect("TEST_CODE date")
+        );
+    }
+
+    #[test]
+    fn verified_next_a_share_trading_day_fails_outside_checked_in_coverage() {
+        let error = verified_next_a_share_trading_day(
+            NaiveDate::from_ymd_opt(2026, 12, 31).expect("TEST_CODE date")
+        )
+        .expect_err("TEST_CODE missing next-year authority must fail");
+        assert!(error.contains("coverage unavailable"));
     }
 
     #[test]
