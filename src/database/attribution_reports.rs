@@ -10,7 +10,11 @@ use diesel::sql_types::{BigInt, Integer, Nullable, Text};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use super::attribution_epochs::{
+    AttributionEpochReceipt, AttributionEpochStore, ResolvedAttributionEpoch,
+};
 use super::DatabaseManager;
+use crate::performance::attribution_epoch::AttributionEpochSelector;
 
 const SCHEMA_VERSION: i32 = 1;
 const RUN_CHAIN_GENESIS: &str = "BR251_ATTRIBUTION_RUN_CHAIN_GENESIS_V1";
@@ -135,16 +139,16 @@ pub enum AttributionReportEpochBinding {
 }
 
 #[derive(Debug, Clone)]
-pub struct AttributionReportAppend {
-    pub invocation: AttributionInvocation,
-    pub epoch: AttributionReportEpochBinding,
-    pub trade_hash: String,
-    pub fee: AttributionEvidenceHash,
-    pub stock_close_hash: String,
-    pub benchmark_manifest_hash: String,
-    pub calendar_authority_hash: String,
-    pub regime: AttributionEvidenceHash,
-    pub result_payload: serde_json::Value,
+pub(crate) struct AttributionReportAppend {
+    pub(crate) invocation: AttributionInvocation,
+    pub(crate) epoch: AttributionReportEpochBinding,
+    pub(crate) trade_hash: String,
+    pub(crate) fee: AttributionEvidenceHash,
+    pub(crate) stock_close_hash: String,
+    pub(crate) benchmark_manifest_hash: String,
+    pub(crate) calendar_authority_hash: String,
+    pub(crate) regime: AttributionEvidenceHash,
+    pub(crate) result_payload: serde_json::Value,
 }
 
 #[derive(Debug, Clone)]
@@ -498,6 +502,18 @@ struct PreparedEpochBinding {
     legacy_carry_manifest_hash: Option<String>,
     exclusion_manifest_hash: Option<String>,
     binding_manifest_hash: String,
+}
+
+#[derive(QueryableByName)]
+struct PersistedEpochAuthority {
+    #[diesel(sql_type = Text)]
+    epoch_id: String,
+    #[diesel(sql_type = Text)]
+    receipt_hash: String,
+    #[diesel(sql_type = Text)]
+    effective_trading_date: String,
+    #[diesel(sql_type = Text)]
+    legacy_carry_manifest_hash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -915,6 +931,86 @@ fn prepare_report(
         report_identity,
         binding_independent_identity,
     })
+}
+
+fn epoch_authority_matches_receipt(
+    prepared: &PreparedEpochBinding,
+    receipt: &AttributionEpochReceipt,
+) -> bool {
+    let effective_date = receipt
+        .effective_trading_date
+        .format("%Y-%m-%d")
+        .to_string();
+    prepared.epoch_id.as_deref() == Some(receipt.epoch_id.as_str())
+        && prepared.epoch_receipt_hash.as_deref() == Some(receipt.receipt_hash.as_str())
+        && prepared.effective_date.as_deref() == Some(effective_date.as_str())
+        && prepared.legacy_carry_manifest_hash.as_deref()
+            == Some(receipt.legacy_carry_manifest_hash.as_str())
+}
+
+fn verify_epoch_authority_before_transaction(
+    database: &DatabaseManager,
+    prepared: &PreparedEpochBinding,
+) -> Result<(), AttributionReportStoreError> {
+    let Some(epoch_id) = prepared.epoch_id.as_ref() else {
+        return Ok(());
+    };
+    let resolved = AttributionEpochStore::new(database)
+        .load_selector(&AttributionEpochSelector::Exact(epoch_id.clone()))
+        .map_err(|error| {
+            failed_integrity(
+                "attribution_epoch_binding_authority_invalid",
+                format!("BR-255 report epoch authority failed retained-state validation: {error}"),
+            )
+        })?;
+    let ResolvedAttributionEpoch::Epoch(receipt) = resolved else {
+        return Err(failed_integrity(
+            "attribution_epoch_binding_authority_invalid",
+            "BR-255 exact report epoch authority resolved as Legacy",
+        ));
+    };
+    if !epoch_authority_matches_receipt(prepared, &receipt) {
+        return Err(failed_integrity(
+            "attribution_epoch_binding_authority_mismatch",
+            "BR-255 report epoch binding differs from the canonical retained receipt",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_epoch_authority_in_transaction(
+    conn: &mut SqliteConnection,
+    prepared: &PreparedEpochBinding,
+) -> diesel::QueryResult<()> {
+    let Some(epoch_id) = prepared.epoch_id.as_ref() else {
+        return Ok(());
+    };
+    let retained = diesel::sql_query(
+        "SELECT epoch_id, receipt_hash, effective_trading_date,
+                legacy_carry_manifest_hash
+         FROM attribution_sample_epoch_receipt WHERE epoch_id = ?",
+    )
+    .bind::<Text, _>(epoch_id)
+    .get_result::<PersistedEpochAuthority>(conn)
+    .optional()?
+    .ok_or_else(|| {
+        integrity_query(
+            "attribution_epoch_binding_authority_changed",
+            "BR-255 exact epoch receipt disappeared before report append",
+        )
+    })?;
+    if retained.epoch_id != *epoch_id
+        || prepared.epoch_receipt_hash.as_deref() != Some(retained.receipt_hash.as_str())
+        || prepared.effective_date.as_deref() != Some(retained.effective_trading_date.as_str())
+        || prepared.legacy_carry_manifest_hash.as_deref()
+            != Some(retained.legacy_carry_manifest_hash.as_str())
+    {
+        return Err(integrity_query(
+            "attribution_epoch_binding_authority_changed",
+            "BR-255 exact epoch receipt changed before report append",
+        ));
+    }
+    Ok(())
 }
 
 fn prepare_failure(
@@ -2915,11 +3011,12 @@ impl<'a> AttributionReportStore<'a> {
         Self { database }
     }
 
-    pub fn commit_report(
+    pub(crate) fn commit_report(
         &self,
         input: AttributionReportAppend,
     ) -> Result<AttributionReportReceipt, AttributionReportStoreError> {
         let prepared = prepare_report(input)?;
+        verify_epoch_authority_before_transaction(self.database, &prepared.epoch)?;
         let mut conn = self.database.get_conn().map_err(|error| {
             unavailable(
                 "attribution_storage_unavailable",
@@ -2930,6 +3027,7 @@ impl<'a> AttributionReportStore<'a> {
         conn.immediate_transaction::<_, diesel::result::Error, _>(|conn| {
             let body = (|| -> diesel::QueryResult<AttributionReportReceipt> {
                 let state = validate_all_state(conn)?;
+                verify_epoch_authority_in_transaction(conn, &prepared.epoch)?;
                 let run_tail = state
                     .run_chains
                     .last()
@@ -3273,7 +3371,12 @@ mod tests {
     use diesel::sql_types::{BigInt, Integer, Nullable, Text};
 
     use super::*;
+    use crate::database::attribution_epochs::EpochActivationRequest;
+    use crate::database::order_audit::{
+        canonical_order_audit_record_hash, CanonicalOrderAuditRow, AUDIT_CHAIN_GENESIS,
+    };
     use crate::database::DatabaseManager;
+    use crate::performance::attribution_epoch::EpochActivationSource;
 
     #[derive(QueryableByName)]
     struct NameRow {
@@ -3515,6 +3618,111 @@ mod tests {
             }
         }
 
+        fn with_authoritative_epoch() -> (Self, AttributionEpochReceipt) {
+            let database = Self::new();
+            {
+                let mut conn = database
+                    .manager
+                    .get_conn()
+                    .expect("TEST_CODE epoch source schema connection");
+                conn.batch_execute(
+                    "CREATE TABLE paper_trades (
+                        id INTEGER PRIMARY KEY, plan_id TEXT NOT NULL UNIQUE,
+                        code TEXT NOT NULL, name TEXT NOT NULL, direction TEXT NOT NULL,
+                        price REAL NOT NULL, quantity INTEGER NOT NULL, status TEXT NOT NULL,
+                        fill_price REAL, not_fill_reason TEXT, virtual_reason TEXT NOT NULL,
+                        account_mode TEXT NOT NULL, data_mode TEXT NOT NULL,
+                        ts TEXT NOT NULL, updated_at TEXT NOT NULL
+                     );
+                     CREATE TABLE order_audit (
+                        id INTEGER PRIMARY KEY, business_order_id TEXT NOT NULL,
+                        source TEXT NOT NULL, decision_basis TEXT NOT NULL, side TEXT NOT NULL,
+                        code TEXT NOT NULL, requested_price REAL NOT NULL, execution_price REAL,
+                        quantity INTEGER NOT NULL, quote_observed_at TEXT, outcome TEXT NOT NULL,
+                        failure_reason TEXT, created_at TEXT NOT NULL
+                     );
+                     CREATE TABLE order_audit_chain (
+                        order_audit_id INTEGER PRIMARY KEY, previous_hash TEXT NOT NULL,
+                        record_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
+                     );
+                     INSERT INTO paper_trades VALUES
+                        (1,'TEST_CODE_EPOCH_PLAN_1','TEST_CODE_600001','TEST_CODE company',
+                         'buy',10.0,100,'Filled',10.0,NULL,'Breakout','Normal','Full',
+                         '2026-08-20 01:31:05','2026-08-20 01:31:05'),
+                        (2,'TEST_CODE_EPOCH_PLAN_2','TEST_CODE_600001','TEST_CODE company',
+                         'sell',11.0,100,'Filled',11.0,NULL,'ExitByRule','Normal','Full',
+                         '2026-08-21 06:20:00','2026-08-21 06:20:00');
+                     INSERT INTO order_audit VALUES
+                        (1,'TEST_CODE_EPOCH_PLAN_1','PaperTrade','Breakout','buy',
+                         'TEST_CODE_600001',10.0,10.0,100,'2026-08-20T09:31:05+08:00',
+                         'Filled',NULL,'2026-08-20 01:31:06'),
+                        (2,'TEST_CODE_EPOCH_PLAN_2','PaperTrade','ExitByRule','sell',
+                         'TEST_CODE_600001',11.0,11.0,100,'2026-08-21T14:20:00+08:00',
+                         'Filled',NULL,'2026-08-21 06:20:01');",
+                )
+                .expect("TEST_CODE epoch source schema");
+                let audits = [
+                    CanonicalOrderAuditRow {
+                        id: 1,
+                        business_order_id: "TEST_CODE_EPOCH_PLAN_1".to_owned(),
+                        source: "PaperTrade".to_owned(),
+                        decision_basis: "Breakout".to_owned(),
+                        side: "buy".to_owned(),
+                        code: "TEST_CODE_600001".to_owned(),
+                        requested_price: 10.0,
+                        execution_price: Some(10.0),
+                        quantity: 100,
+                        quote_observed_at: Some("2026-08-20T09:31:05+08:00".to_owned()),
+                        outcome: "Filled".to_owned(),
+                        failure_reason: None,
+                        created_at: "2026-08-20 01:31:06".to_owned(),
+                    },
+                    CanonicalOrderAuditRow {
+                        id: 2,
+                        business_order_id: "TEST_CODE_EPOCH_PLAN_2".to_owned(),
+                        source: "PaperTrade".to_owned(),
+                        decision_basis: "ExitByRule".to_owned(),
+                        side: "sell".to_owned(),
+                        code: "TEST_CODE_600001".to_owned(),
+                        requested_price: 11.0,
+                        execution_price: Some(11.0),
+                        quantity: 100,
+                        quote_observed_at: Some("2026-08-21T14:20:00+08:00".to_owned()),
+                        outcome: "Filled".to_owned(),
+                        failure_reason: None,
+                        created_at: "2026-08-21 06:20:01".to_owned(),
+                    },
+                ];
+                let mut previous = AUDIT_CHAIN_GENESIS.to_owned();
+                for audit in audits {
+                    let record_hash = canonical_order_audit_record_hash(&previous, &audit)
+                        .expect("TEST_CODE canonical order audit hash");
+                    diesel::sql_query(
+                        "INSERT INTO order_audit_chain
+                         (order_audit_id, previous_hash, record_hash, created_at)
+                         VALUES (?, ?, ?, ?)",
+                    )
+                    .bind::<BigInt, _>(audit.id)
+                    .bind::<Text, _>(&previous)
+                    .bind::<Text, _>(&record_hash)
+                    .bind::<Text, _>(&audit.created_at)
+                    .execute(&mut conn)
+                    .expect("TEST_CODE canonical order audit chain");
+                    previous = record_hash;
+                }
+                super::super::attribution_epochs::create_schema(&mut conn)
+                    .expect("TEST_CODE epoch schema");
+            }
+            let receipt = AttributionEpochStore::new(&database.manager)
+                .activate_once(EpochActivationRequest {
+                    source: EpochActivationSource::Cli,
+                    invoked_at: DateTime::parse_from_rfc3339("2026-08-21T15:40:00+08:00")
+                        .expect("TEST_CODE epoch invocation"),
+                })
+                .expect("TEST_CODE activate authoritative epoch");
+            (database, receipt)
+        }
+
         fn count(&self, table: &str) -> i64 {
             let mut conn = self.manager.get_conn().expect("TEST_CODE DB connection");
             diesel::sql_query(format!("SELECT COUNT(*) AS value FROM {table}"))
@@ -3569,7 +3777,7 @@ mod tests {
         }
     }
 
-    fn resolved_epoch_binding(seed: char) -> AttributionReportEpochBinding {
+    fn unverified_epoch_binding(seed: char) -> AttributionReportEpochBinding {
         AttributionReportEpochBinding::Epoch {
             epoch_id: lower_hash(seed),
             epoch_receipt_hash: lower_hash('b'),
@@ -3577,6 +3785,19 @@ mod tests {
                 .expect("TEST_CODE epoch effective date"),
             legacy_carry_manifest_hash: lower_hash('c'),
             exclusion_manifest_hash: lower_hash('d'),
+        }
+    }
+
+    fn resolved_epoch_binding(
+        receipt: &AttributionEpochReceipt,
+        exclusion_seed: char,
+    ) -> AttributionReportEpochBinding {
+        AttributionReportEpochBinding::Epoch {
+            epoch_id: receipt.epoch_id.clone(),
+            epoch_receipt_hash: receipt.receipt_hash.clone(),
+            effective_date: receipt.effective_trading_date,
+            legacy_carry_manifest_hash: receipt.legacy_carry_manifest_hash.clone(),
+            exclusion_manifest_hash: lower_hash(exclusion_seed),
         }
     }
 
@@ -3607,13 +3828,13 @@ mod tests {
 
     #[test]
     fn epoch_binding_resolved_fields_are_exact_and_same_binding_reuses_revision() {
-        let database = TestDatabase::new();
+        let (database, epoch_receipt) = TestDatabase::with_authoritative_epoch();
         let store = AttributionReportStore::new(&database.manager);
         let mut first_input = report_append(
             "2026-08-24T15:40:00+08:00",
             serde_json::json!({"status": "ResearchOnly"}),
         );
-        first_input.epoch = resolved_epoch_binding('a');
+        first_input.epoch = resolved_epoch_binding(&epoch_receipt, 'd');
         first_input.invocation.target_from =
             NaiveDate::from_ymd_opt(2026, 8, 24).expect("TEST_CODE epoch target");
         first_input.invocation.target_to = first_input.invocation.target_from;
@@ -3624,7 +3845,7 @@ mod tests {
             "2026-08-25T15:40:00+08:00",
             serde_json::json!({"status": "ResearchOnly"}),
         );
-        retry_input.epoch = resolved_epoch_binding('a');
+        retry_input.epoch = resolved_epoch_binding(&epoch_receipt, 'd');
         retry_input.invocation.target_from =
             NaiveDate::from_ymd_opt(2026, 8, 24).expect("TEST_CODE epoch target");
         retry_input.invocation.target_to = retry_input.invocation.target_from;
@@ -3634,8 +3855,8 @@ mod tests {
 
         assert_eq!(first.report_revision_id, retry.report_revision_id);
         assert_eq!(first.epoch_binding_id, retry.epoch_binding_id);
-        assert_eq!(first.epoch, resolved_epoch_binding('a'));
-        assert_eq!(retry.epoch, resolved_epoch_binding('a'));
+        assert_eq!(first.epoch, resolved_epoch_binding(&epoch_receipt, 'd'));
+        assert_eq!(retry.epoch, resolved_epoch_binding(&epoch_receipt, 'd'));
         assert_eq!(database.count("attribution_report_revision"), 1);
         assert_eq!(database.count("attribution_report_epoch_binding"), 1);
         assert_eq!(database.count("attribution_report_epoch_binding_chain"), 1);
@@ -3652,17 +3873,242 @@ mod tests {
         .get_result::<EpochBindingFactsRow>(&mut conn)
         .expect("TEST_CODE retained resolved binding");
         assert_eq!(row.binding_kind, "epoch");
-        assert_eq!(row.epoch_id, Some(lower_hash('a')));
-        assert_eq!(row.epoch_receipt_hash, Some(lower_hash('b')));
+        assert_eq!(row.epoch_id, Some(epoch_receipt.epoch_id));
+        assert_eq!(row.epoch_receipt_hash, Some(epoch_receipt.receipt_hash));
         assert_eq!(row.effective_date.as_deref(), Some("2026-08-24"));
-        assert_eq!(row.legacy_carry_manifest_hash, Some(lower_hash('c')));
+        assert_eq!(
+            row.legacy_carry_manifest_hash,
+            Some(epoch_receipt.legacy_carry_manifest_hash)
+        );
         assert_eq!(row.exclusion_manifest_hash, Some(lower_hash('d')));
         assert!(is_lower_hex_hash(&row.binding_manifest_hash));
     }
 
     #[test]
-    fn epoch_binding_same_report_identity_with_different_binding_is_integrity() {
+    fn epoch_binding_missing_authoritative_receipt_fails_without_writes() {
         let database = TestDatabase::new();
+        let mut input = report_append(
+            "2026-08-24T15:40:00+08:00",
+            serde_json::json!({"status": "ResearchOnly"}),
+        );
+        input.epoch = unverified_epoch_binding('a');
+        input.invocation.target_from =
+            NaiveDate::from_ymd_opt(2026, 8, 24).expect("TEST_CODE epoch target");
+        input.invocation.target_to = input.invocation.target_from;
+        let sequence_tables = [
+            "attribution_run_audit",
+            "attribution_report_revision",
+            "attribution_report_epoch_binding",
+            "attribution_report_epoch_binding_chain",
+        ];
+        let sequence_before = sequence_tables.map(|table| sequence_highwater(&database, table));
+
+        let error = AttributionReportStore::new(&database.manager)
+            .commit_report(input)
+            .expect_err("TEST_CODE nonexistent epoch receipt must not bind a report");
+
+        assert!(matches!(
+            error,
+            AttributionReportStoreError::FailedIntegrity { .. }
+        ));
+        for table in [
+            "attribution_run_audit",
+            "attribution_run_chain",
+            "attribution_report_revision",
+            "attribution_report_chain",
+            "attribution_report_epoch_binding",
+            "attribution_report_epoch_binding_chain",
+            "attribution_failure_audit",
+            "attribution_failure_chain",
+        ] {
+            assert_eq!(
+                database.count(table),
+                0,
+                "TEST_CODE unexpected write to {table}"
+            );
+        }
+        for (index, table) in sequence_tables.into_iter().enumerate() {
+            assert_eq!(
+                sequence_highwater(&database, table),
+                sequence_before[index],
+                "TEST_CODE sequence advanced for {table}"
+            );
+        }
+    }
+
+    #[test]
+    fn epoch_binding_each_field_mutation_changes_identity_or_fails_closed() {
+        let (database, epoch_receipt) = TestDatabase::with_authoritative_epoch();
+        let store = AttributionReportStore::new(&database.manager);
+        let target = NaiveDate::from_ymd_opt(2026, 8, 24).expect("TEST_CODE epoch target");
+        let valid = resolved_epoch_binding(&epoch_receipt, 'd');
+        let mut initial = report_append(
+            "2026-08-24T15:40:00+08:00",
+            serde_json::json!({"status": "ResearchOnly"}),
+        );
+        initial.invocation.target_from = target;
+        initial.invocation.target_to = target;
+        initial.epoch = valid.clone();
+        store
+            .commit_report(initial)
+            .expect("TEST_CODE canonical epoch-bound report");
+
+        let mut epoch_id = valid.clone();
+        let AttributionReportEpochBinding::Epoch {
+            epoch_id: value, ..
+        } = &mut epoch_id
+        else {
+            unreachable!()
+        };
+        *value = lower_hash('f');
+        let mut receipt_hash = valid.clone();
+        let AttributionReportEpochBinding::Epoch {
+            epoch_receipt_hash: value,
+            ..
+        } = &mut receipt_hash
+        else {
+            unreachable!()
+        };
+        *value = lower_hash('f');
+        let mut effective_date = valid.clone();
+        let AttributionReportEpochBinding::Epoch {
+            effective_date: value,
+            ..
+        } = &mut effective_date
+        else {
+            unreachable!()
+        };
+        *value = NaiveDate::from_ymd_opt(2026, 8, 23).expect("TEST_CODE altered effective");
+        let mut carry_manifest = valid.clone();
+        let AttributionReportEpochBinding::Epoch {
+            legacy_carry_manifest_hash: value,
+            ..
+        } = &mut carry_manifest
+        else {
+            unreachable!()
+        };
+        *value = lower_hash('f');
+        let mut exclusion_manifest = valid;
+        let AttributionReportEpochBinding::Epoch {
+            exclusion_manifest_hash: value,
+            ..
+        } = &mut exclusion_manifest
+        else {
+            unreachable!()
+        };
+        *value = lower_hash('f');
+
+        let mutations = [
+            (
+                "epoch_id",
+                epoch_id,
+                "attribution_epoch_binding_authority_invalid",
+            ),
+            (
+                "epoch_receipt_hash",
+                receipt_hash,
+                "attribution_epoch_binding_authority_mismatch",
+            ),
+            (
+                "effective_date",
+                effective_date,
+                "attribution_epoch_binding_authority_mismatch",
+            ),
+            (
+                "legacy_carry_manifest_hash",
+                carry_manifest,
+                "attribution_epoch_binding_authority_mismatch",
+            ),
+            (
+                "exclusion_manifest_hash",
+                exclusion_manifest,
+                "attribution_epoch_binding_identity_conflict",
+            ),
+        ];
+        let counts_before = IMMUTABLE_TABLES.map(|(table, _)| database.count(table));
+        let sequences_before =
+            IMMUTABLE_TABLES.map(|(table, _)| sequence_highwater(&database, table));
+        for (field, epoch, reason_code) in mutations {
+            let mut retry = report_append(
+                "2026-08-25T15:40:00+08:00",
+                serde_json::json!({"status": "ResearchOnly"}),
+            );
+            retry.invocation.target_from = target;
+            retry.invocation.target_to = target;
+            retry.epoch = epoch;
+            let error = store
+                .commit_report(retry)
+                .expect_err("TEST_CODE mutated epoch binding must not append");
+            assert_eq!(error.reason_code(), reason_code, "TEST_CODE field={field}");
+            for (index, (table, _)) in IMMUTABLE_TABLES.iter().enumerate() {
+                assert_eq!(
+                    database.count(table),
+                    counts_before[index],
+                    "TEST_CODE field={field} wrote {table}"
+                );
+                assert_eq!(
+                    sequence_highwater(&database, table),
+                    sequences_before[index],
+                    "TEST_CODE field={field} advanced {table} sequence"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn epoch_binding_corrupt_retained_epoch_fails_full_validation_without_writes() {
+        let (database, epoch_receipt) = TestDatabase::with_authoritative_epoch();
+        let mut input = report_append(
+            "2026-08-24T15:40:00+08:00",
+            serde_json::json!({"status": "ResearchOnly"}),
+        );
+        input.invocation.target_from = epoch_receipt.effective_trading_date;
+        input.invocation.target_to = epoch_receipt.effective_trading_date;
+        input.epoch = resolved_epoch_binding(&epoch_receipt, 'd');
+        let sequences_before =
+            IMMUTABLE_TABLES.map(|(table, _)| sequence_highwater(&database, table));
+        {
+            let mut conn = database
+                .manager
+                .get_conn()
+                .expect("TEST_CODE corrupt epoch");
+            diesel::sql_query("DROP TRIGGER trg_attribution_sample_epoch_receipt_no_update")
+                .execute(&mut conn)
+                .expect("TEST_CODE disable epoch receipt update guard");
+            diesel::sql_query(
+                "UPDATE attribution_sample_epoch_receipt
+                 SET position_projection_hash = ? WHERE epoch_id = ?",
+            )
+            .bind::<Text, _>(lower_hash('f'))
+            .bind::<Text, _>(&epoch_receipt.epoch_id)
+            .execute(&mut conn)
+            .expect("TEST_CODE corrupt non-binding retained receipt field");
+        }
+
+        let error = AttributionReportStore::new(&database.manager)
+            .commit_report(input)
+            .expect_err("TEST_CODE corrupt retained epoch must fail before report write");
+        assert_eq!(
+            error.reason_code(),
+            "attribution_epoch_binding_authority_invalid"
+        );
+        for (index, (table, _)) in IMMUTABLE_TABLES.iter().enumerate() {
+            assert_eq!(
+                database.count(table),
+                0,
+                "TEST_CODE unexpected write to {table}"
+            );
+            assert_eq!(
+                sequence_highwater(&database, table),
+                sequences_before[index],
+                "TEST_CODE sequence advanced for {table}"
+            );
+        }
+    }
+
+    #[test]
+    fn epoch_binding_same_report_identity_with_different_binding_is_integrity() {
+        let (database, epoch_receipt) = TestDatabase::with_authoritative_epoch();
         let store = AttributionReportStore::new(&database.manager);
         let target = NaiveDate::from_ymd_opt(2026, 8, 24).expect("TEST_CODE epoch target");
         let mut first = report_append(
@@ -3671,7 +4117,7 @@ mod tests {
         );
         first.invocation.target_from = target;
         first.invocation.target_to = target;
-        first.epoch = resolved_epoch_binding('a');
+        first.epoch = resolved_epoch_binding(&epoch_receipt, 'd');
         store
             .commit_report(first)
             .expect("TEST_CODE initial epoch binding");
@@ -3682,7 +4128,7 @@ mod tests {
         );
         rebound.invocation.target_from = target;
         rebound.invocation.target_to = target;
-        rebound.epoch = resolved_epoch_binding('e');
+        rebound.epoch = resolved_epoch_binding(&epoch_receipt, 'e');
         let error = store
             .commit_report(rebound)
             .expect_err("TEST_CODE report identity must not be rebound");
@@ -4808,6 +5254,42 @@ mod tests {
         .expect("TEST_CODE count binding-only tables")
         .value;
         assert_eq!(binding_only_count, 1);
+    }
+
+    #[test]
+    fn startup_and_preappend_reject_altered_binding_companion_schema() {
+        let database = TestDatabase::new();
+        {
+            let mut conn = database
+                .manager
+                .get_conn()
+                .expect("TEST_CODE altered binding schema connection");
+            diesel::sql_query("DROP TABLE attribution_report_epoch_binding_chain")
+                .execute(&mut conn)
+                .expect("TEST_CODE drop canonical binding chain table");
+            diesel::sql_query(
+                "CREATE TABLE attribution_report_epoch_binding_chain (
+                    id INTEGER PRIMARY KEY,
+                    report_epoch_binding_id INTEGER NOT NULL UNIQUE,
+                    previous_hash TEXT NOT NULL,
+                    record_hash TEXT NOT NULL UNIQUE CHECK(length(record_hash) = 64),
+                    created_at TEXT NOT NULL,
+                    retention_deadline TEXT NOT NULL
+                 )",
+            )
+            .execute(&mut conn)
+            .expect("TEST_CODE install binding chain without AUTOINCREMENT or FK");
+            restore_table_triggers(&mut conn, "attribution_report_epoch_binding_chain");
+        }
+
+        assert!(
+            startup_fails(&database),
+            "TEST_CODE startup must reject altered binding companion schema"
+        );
+        assert!(
+            report_preappend_fails(&database),
+            "TEST_CODE preappend must reject altered binding companion schema"
+        );
     }
 
     #[test]

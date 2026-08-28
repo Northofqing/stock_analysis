@@ -6612,16 +6612,17 @@ mod tests {
             .expect("TEST_CODE active epoch report commit");
         assert_eq!(committed.receipt().epoch, expected_binding);
         assert_eq!(committed.receipt().report_revision, 1);
+        let exact_request = ReplayRequest {
+            mode: ReplayMode::Range {
+                from: date("2026-08-24"),
+                to: date("2026-08-26"),
+                invoked_at: shanghai_at("2026-08-26", 15, 30, 0),
+            },
+            epoch: AttributionEpochSelector::Exact(receipt.epoch_id.clone()),
+            benchmark_day_manifests,
+        };
         let exact = runner
-            .preview(ReplayRequest {
-                mode: ReplayMode::Range {
-                    from: date("2026-08-24"),
-                    to: date("2026-08-26"),
-                    invoked_at: shanghai_at("2026-08-26", 15, 30, 0),
-                },
-                epoch: AttributionEpochSelector::Exact(receipt.epoch_id.clone()),
-                benchmark_day_manifests,
-            })
+            .preview(exact_request.clone())
             .expect("TEST_CODE retained exact epoch replay");
         assert_eq!(
             exact.epoch_selector(),
@@ -6629,6 +6630,17 @@ mod tests {
         );
         assert_eq!(exact.report().source_fill_ids(), &[5, 6]);
         assert_ne!(prepared.trade_manifest_hash(), exact.trade_manifest_hash());
+        let exact_binding = exact
+            .report_epoch_binding()
+            .expect("TEST_CODE sealed Exact report binding");
+        assert!(matches!(
+            &exact_binding,
+            AttributionReportEpochBinding::Epoch { .. }
+        ));
+        let exact_committed = runner
+            .commit_with_report(exact_request)
+            .expect("TEST_CODE Exact epoch report commit");
+        assert_eq!(exact_committed.receipt().epoch, exact_binding);
         drop(runner);
         drop(session);
         remove_database(path);
