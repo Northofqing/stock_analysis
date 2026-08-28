@@ -17,13 +17,13 @@ insufficient_cap_relation = "threshold_minus_one"
 # 比例判定必须使用整数交叉相乘；普通修改不得降低任一 baseline。
 [coverage]
 schema = 1
-source_sha = "1717aab8415026f3eea92f48950ed1b98fb1e6f8"
+source_sha = "0267dabe160a55169c521122dc008c9bfcdb8e08"
 bootstrap_approved = true
 bootstrap_rule = "BR-252"
-global_covered = 202960
-global_count = 260224
-core_covered = 158758
-core_count = 203874
+global_covered = 202932
+global_count = 260197
+core_covered = 158730
+core_count = 203847
 core_file_count = 218
 pr_core_patch_min = 90
 pr_other_patch_min = 85

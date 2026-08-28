@@ -1308,7 +1308,7 @@ acquisition/segment/manifest/report/failure 事实不得删除、覆盖或回退
 
 最终分支基于 `master@2ae8c4d`，实现提交为 `d0259ab`（RED）、`492fd55`
 （request-bound Daily identity）、`0c28395`（lockfile-derived provider revision）和
-`1717aab`（真实证据）。隔离工作树中的完整
+`1717aab`（真实证据），审查加固提交为 `0267dab`（精确 rev 合同与测试身份隔离）。隔离工作树中的完整
 `cargo test --workspace --all-targets --all-features -- --test-threads=1` 退出 0：lib
 3015 passed / 7 ignored、monitor 685 passed / 4 ignored，CLI 6/6，其余 binary/integration/bench
 目标零失败。`cargo fmt --all -- --check`、workspace/all-targets/all-features strict Clippy、
@@ -1317,8 +1317,8 @@ acquisition/segment/manifest/report/failure 事实不得删除、覆盖或回退
 Clippy 的错误。
 
 同一源码、rustc 1.95.0、LLVM 22.1.2、cargo-llvm-cov 0.8.7 的完整覆盖率报告得到：global
-`202960/260224 = 77.99%`、core `158758/203874 = 77.87%`（218 files）、core patch
-`150/159 = 94.34%`、other production patch N/A（零可执行变更行）。两项比例均高于最新
+`202932/260197 = 77.99%`、core `158730/203847 = 77.87%`（218 files）、core patch
+`147/157 = 93.63%`、other production patch N/A（零可执行变更行）。两项比例均高于最新
 `master` 的 202888/260143 与 158687/203793；PR policy 与 coverage ratchet 退出 0，固定
 90%/85% 及 release 80%/95% 阈值未修改。loopback fixture 在 filesystem sandbox 内会得到
 `Operation not permitted`，在允许本机 loopback 的同一隔离工作树执行后所有测试通过并生成
