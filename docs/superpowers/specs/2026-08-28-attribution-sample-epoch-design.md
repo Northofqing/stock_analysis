@@ -33,7 +33,7 @@
 - 新纪元在功能部署后的下一个完整、经验证交易日生效。
 - 使用不可变高水位切换凭证，不给历史成交回填 `epoch_id`，不修改所有成交 writer。
 - `monitor` 在首次安全收盘窗口自动提交一次，以后只验证，不自动产生第二次重置。
-- 切换时建立“旧持仓隔离池”：只记录每个代码的剩余数量，不采用旧成本、不计算旧收益。
+- 切换时建立“旧持仓隔离池”：只记录每个代码的剩余数量，不采用旧成本、不计算旧收益；有 carry 的代码从边界起整段隔离，直到其实际数量首次回到零。
 - 新纪元样本不足现有 200 个闭环或 84 天门槛时保持 `InsufficientSample` / `ResearchOnly`，禁止用 legacy 样本补足。
 - 归因错误不影响行情、模拟交易或订单运行，但归因本身必须保持 `Unavailable` 并留下失败审计。
 
@@ -106,7 +106,7 @@
 - 对应高水位和来源 manifest hash；
 - canonical item hash、创建时间和 retention deadline。
 
-隔离池只证明旧账本在边界处记录的剩余数量。它不包含 cost price、buy date、PnL、signal family 或虚构 fill。构建器仍严格验证身份、方向、正价格、100 股整数数量、`(ts,id)` 顺序和累计不得超卖；唯一不在 legacy 阶段执行的是 T+1 经济合法性，因为该失败正是被隔离的历史问题。
+隔离池只证明旧账本在边界处记录的剩余数量。它不包含 cost price、buy date、PnL、signal family 或虚构 fill。构建器仍严格验证身份、方向、正价格、100 股整数数量、`(ts,id)` 顺序和累计不得超卖；唯一不在 legacy 阶段执行的是 T+1 经济合法性，因为该失败正是被隔离的历史问题。某代码只要 carry 非零，边界后的买入和卖出都进入该代码的 quarantine overlay；overlay 只维护严格数量连续性，直到总数量首次回到零，不拆分成交或费用。
 
 ### 6.3 `AttributionEpochAttemptAudit`
 
@@ -147,14 +147,15 @@
 
 ### 8.2 carry 消耗
 
-经济重建为每个代码维护两类数量：`LegacyCarry` 与新纪元 FIFO lots。卖出按以下固定顺序处理：
+纪元预处理器为每个代码维护 `LegacyCarry`、边界后 quarantine 数量和“已回到零”状态；它先产生可归因完整行与明确排除项，再把可归因行交给既有 BR-248 FIFO/T+1/费用引擎。固定顺序为：
 
-1. 先消耗 `LegacyCarry`；该数量不形成收益样本，累计到 `legacy_carry_excluded_quantity`。
-2. 若一笔 sell 同时跨越 carry 和新纪元 lot，则整笔 sell 不进入闭环指标；被该 sell 消耗的新 lot 标记为 `MixedLegacyCarryExit`，从开放样本移除并进入明确排除计数。禁止按比例猜测费用或把部分 sell 冒充完整新闭环。
-3. 只有 sell 开始前该代码 carry 已为零，且其全部数量可由满足 T+1 的新纪元 lots 覆盖时，才形成新闭环样本。
-4. 总数量不足、T+1 违规、乱序、重复或坏价格继续使整次新纪元 replay 失败。
+1. 某代码初始 carry 为零时，从生效日起直接把其完整成交行交给 BR-248 引擎。
+2. 某代码初始 carry 非零时，边界后的每条 buy/sell 都以完整 fill 为 `LegacyCarryOverlap` 排除，只更新严格数量 overlay；sell 在数量意义上先消耗原 carry，再消耗边界后买入，但不拆分该 fill 或其费用。
+3. overlay 累计不得为负；首次精确回到零的那条 sell 仍属于排除段。只有其后的下一条完整成交才可开始新归因周期。
+4. 跨 carry 与边界后买入的 sell 额外记为 `MixedLegacyCarryExit`；整条 sell 和隔离段内全部买入保持排除，禁止按比例猜测费用、缩量或构造 synthetic fill。
+5. 隔离解除后的完整成交继续执行既有 T+1、超卖、费用和闭环验证；任何失败使整次新纪元 replay 失败。
 
-报告必须展示剩余 carry 代码/股数、legacy-only exit 数量、mixed exit 数量、新闭环数量和所有排除 reason。排除项不进入胜率、收益、费用或样本门槛分母。
+报告必须展示仍在 quarantine 的代码/股数、`LegacyCarryOverlap` 买卖数量、mixed exit 数量、已解除隔离代码数、新闭环数量和所有排除 reason。排除项不进入胜率、收益、费用或样本门槛分母。
 
 ### 8.3 legacy 访问
 
@@ -226,7 +227,7 @@ BR-255 只 supersede BR-251 的两处窄限制：允许 monitor 自动创建/验
 ### 13.2 归因行为
 
 - fixture 含旧 sell id 520 同构 T+1 缺陷及合法新纪元闭环：legacy 明确失败，新纪元成功构造研究报告；
-- carry-only sell、mixed carry/new sell、carry 清零后的纯新 sell；mixed fill 不按比例猜费用；
+- carry-only sell、隔离期新 buy、mixed carry/new sell、回到零的 terminal sell、归零后的全新闭环；隔离段不拆 fill、不按比例猜费用；
 - 高水位后迟到成交、旧前缀改写、audit 缺失/重复/断链全部失败；
 - range 早于 effective date 不裁剪；样本不足不借 legacy；
 - report commit 必须有 epoch binding，旧报告保持 legacy。
@@ -277,7 +278,7 @@ cargo build --release --bin monitor
 - legacy 事实完整保留，legacy replay 仍真实报告其错误；
 - 模拟交易引擎的持仓和成交行为在切换前后不变；
 - monitor 自动且仅一次建立可重验的纪元凭证；
-- 旧持仓退出不会导致新归因 oversell，也不会进入新收益样本；
+- 旧持仓及其与边界后买入重叠的整段退出不会导致新归因 oversell，也不会进入新收益样本；该代码归零后的新闭环可正常进入；
 - 纯新纪元闭环按既有 BR-251 FIFO/T+1/费用/benchmark 合同正常归因；
 - 样本不足、证据缺失、迟到数据和篡改均显式失败或降为 ResearchOnly，不产生虚假成功；
 - Gate C 全部通过且 PR 证据完整后才允许合并；Gate D 未闭合前不发布策略有效性结论。
