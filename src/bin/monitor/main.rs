@@ -145,6 +145,7 @@ mod dryrun_report; // v26: dry-run 自动报告
 
 mod v13_diag; // v13.27: 端到端诊断
 
+mod attribution_epoch_runtime;
 mod blocking_market_data;
 mod closing_valuation_runtime;
 mod data_mode_probe;
@@ -8391,6 +8392,36 @@ async fn monitor_loop() {
             }
             // 任务#3: 每日 15:10 快照过期检查（收盘后用户应上传当日快照）
             let now = chrono::Local::now();
+            if now.hour() == 15 && (35..=50).contains(&now.minute()) {
+                match attribution_epoch_runtime::run_attribution_epoch_tick(
+                    stock_analysis::database::DatabaseManager::get(),
+                    now.fixed_offset(),
+                ) {
+                    attribution_epoch_runtime::AttributionEpochTickOutcome::Activated(receipt) => {
+                        log::info!(
+                            "[attribution-epoch] activated epoch_id={}",
+                            receipt.epoch_id
+                        );
+                    }
+                    attribution_epoch_runtime::AttributionEpochTickOutcome::Verified(receipt) => {
+                        log::debug!("[attribution-epoch] verified epoch_id={}", receipt.epoch_id);
+                    }
+                    attribution_epoch_runtime::AttributionEpochTickOutcome::Unavailable {
+                        code,
+                        retryable,
+                    } => {
+                        log::warn!(
+                            "[attribution-epoch] unavailable code={code} retryable={retryable}"
+                        );
+                    }
+                    attribution_epoch_runtime::AttributionEpochTickOutcome::FailedIntegrity {
+                        code,
+                    } => {
+                        log::error!("[attribution-epoch] failed_integrity code={code}");
+                    }
+                    attribution_epoch_runtime::AttributionEpochTickOutcome::OutsideWindow => {}
+                }
+            }
             if now.hour() == 15 && (10..=13).contains(&now.minute()) {
                 check_snapshot_staleness_and_notify().await;
             }
@@ -8532,7 +8563,8 @@ async fn monitor_loop() {
             if now.hour() == 15 && (5..=20).contains(&now.minute()) {
                 use std::collections::HashMap;
                 use stock_analysis::performance::attribution::{
-                    compute_daily, compute_window, persist_daily,
+                    compute_epoch_daily, compute_epoch_window, persist_epoch_daily,
+                    AttributionEpochRuntimeError,
                 };
                 use stock_analysis::performance::report::{render_full_markdown, render_summary};
                 static ATTRIBUTION_LAST_RUN: std::sync::Mutex<Option<chrono::NaiveDate>> =
@@ -8544,23 +8576,41 @@ async fn monitor_loop() {
                     .map(|d| d == today)
                     .unwrap_or(false);
                 if !already_run {
-                    match (|| -> Result<String, String> {
-                        let quotes = market_data::fetch_position_quotes()?;
+                    match (|| -> Result<String, AttributionEpochRuntimeError> {
+                        let quotes = market_data::fetch_position_quotes().map_err(|detail| {
+                            AttributionEpochRuntimeError::Unavailable {
+                                reason_code: "attribution_market_prices_unavailable",
+                                retryable: true,
+                                detail,
+                            }
+                        })?;
                         // 生产价格映射 (build_price_map 是 cfg(test) 辅助, 生产内联同构构造)
                         let prices: HashMap<String, f64> =
                             quotes.iter().map(|q| (q.code.clone(), q.price)).collect();
-                        let daily = compute_daily(today, &prices)?;
-                        persist_daily(&daily)?;
-                        let window = compute_window(today, 30, &prices)?;
-                        let md = render_full_markdown(&daily, &window);
-                        std::fs::create_dir_all("data/attribution")
-                            .map_err(|e| format!("create data/attribution: {e}"))?;
+                        let database = stock_analysis::database::DatabaseManager::get();
+                        let daily = compute_epoch_daily(database, today, &prices)?;
+                        let window = compute_epoch_window(database, today, 30, &prices)?;
+                        persist_epoch_daily(database, &daily)?;
+                        let md = render_full_markdown(daily.daily(), window.window());
+                        std::fs::create_dir_all("data/attribution").map_err(|error| {
+                            AttributionEpochRuntimeError::Unavailable {
+                                reason_code: "attribution_report_storage_unavailable",
+                                retryable: true,
+                                detail: format!("create data/attribution: {error}"),
+                            }
+                        })?;
                         std::fs::write(
                             format!("data/attribution/{}.md", today.format("%Y-%m-%d")),
                             md,
                         )
-                        .map_err(|e| format!("write attribution md: {e}"))?;
-                        Ok(render_summary(&daily, &window))
+                        .map_err(|error| {
+                            AttributionEpochRuntimeError::Unavailable {
+                                reason_code: "attribution_report_storage_unavailable",
+                                retryable: true,
+                                detail: format!("write attribution md: {error}"),
+                            }
+                        })?;
+                        Ok(render_summary(daily.daily(), window.window()))
                     })() {
                         Ok(text) => {
                             let outcome =
@@ -8570,8 +8620,22 @@ async fn monitor_loop() {
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner()) = Some(today);
                         }
-                        Err(e) => {
-                            log::warn!("[attribution] 15:05 归因计算失败 (允许 30s 后重试): {e}");
+                        Err(AttributionEpochRuntimeError::Unavailable {
+                            reason_code,
+                            retryable,
+                            detail,
+                        }) => {
+                            log::warn!(
+                                "[attribution] 15:05 归因 unavailable code={reason_code} retryable={retryable} (允许 30s 后重试): {detail}"
+                            );
+                        }
+                        Err(AttributionEpochRuntimeError::FailedIntegrity {
+                            reason_code,
+                            detail,
+                        }) => {
+                            log::error!(
+                                "[attribution] 15:05 归因 failed_integrity code={reason_code} (允许 30s 后重试): {detail}"
+                            );
                         }
                     }
                 }

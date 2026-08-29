@@ -196,10 +196,17 @@ pub struct EpochActivationPreview {
 
 /// Domain-verified activation result whose receipt and render projection were
 /// frozen from the same activation transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpochActivationDisposition {
+    Activated,
+    AlreadyActive,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpochActivationOutcome {
     receipt: AttributionEpochReceipt,
     projection: EpochActivationPreview,
+    disposition: EpochActivationDisposition,
 }
 
 impl EpochActivationOutcome {
@@ -209,6 +216,10 @@ impl EpochActivationOutcome {
 
     pub fn projection(&self) -> &EpochActivationPreview {
         &self.projection
+    }
+
+    pub const fn disposition(&self) -> EpochActivationDisposition {
+        self.disposition
     }
 
     fn into_receipt(self) -> AttributionEpochReceipt {
@@ -2405,6 +2416,7 @@ fn activation_preview(
 fn verified_activation_outcome(
     receipt: AttributionEpochReceipt,
     source: FrozenSourceProjection,
+    disposition: EpochActivationDisposition,
 ) -> Result<EpochActivationOutcome, AttributionEpochStoreError> {
     let projection = activation_preview(
         true,
@@ -2436,6 +2448,7 @@ fn verified_activation_outcome(
     Ok(EpochActivationOutcome {
         receipt,
         projection,
+        disposition,
     })
 }
 
@@ -3234,7 +3247,11 @@ impl<'a> AttributionEpochStore<'a> {
                         error.into(),
                     )
                 })?;
-                return verified_activation_outcome(receipt, source);
+                return verified_activation_outcome(
+                    receipt,
+                    source,
+                    EpochActivationDisposition::AlreadyActive,
+                );
             }
             let source_before =
                 analyze_source_projection(conn, completed, None, true).map_err(|error| {
@@ -3291,7 +3308,7 @@ impl<'a> AttributionEpochStore<'a> {
             let source = ensure_source_matches_receipt(conn, &receipt).map_err(|error| {
                 activation_error_context("activation_first_verify_written_source", error)
             })?;
-            verified_activation_outcome(receipt, source)
+            verified_activation_outcome(receipt, source, EpochActivationDisposition::Activated)
         });
         drop(conn);
 
@@ -5154,6 +5171,7 @@ mod tests {
         let outcome = store
             .activate_once_with_outcome(request.clone())
             .expect("TEST_CODE atomic activation with verified render projection");
+        assert_eq!(outcome.disposition(), EpochActivationDisposition::Activated);
         let receipt = outcome.receipt();
         let committed = outcome.projection();
         assert_eq!(receipt.epoch_id, preview.epoch_id);
@@ -5186,6 +5204,10 @@ mod tests {
         let retried = store
             .activate_once_with_outcome(request)
             .expect("TEST_CODE idempotent rich activation retry");
+        assert_eq!(
+            retried.disposition(),
+            EpochActivationDisposition::AlreadyActive
+        );
         assert_eq!(retried.receipt(), receipt);
         assert_eq!(retried.projection(), committed);
     }
@@ -5617,13 +5639,15 @@ mod tests {
         assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
         drop(conn);
         let barrier = std::sync::Barrier::new(2);
-        let receipts = std::thread::scope(|scope| {
+        let outcomes = std::thread::scope(|scope| {
             let handles = (0..2)
                 .map(|_| {
                     scope.spawn(|| {
                         barrier.wait();
                         AttributionEpochStore::new(&database.manager)
-                            .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
+                            .activate_once_with_outcome(activation_request(
+                                "2026-08-28T15:40:00+08:00",
+                            ))
                             .unwrap()
                     })
                 })
@@ -5633,7 +5657,17 @@ mod tests {
                 .map(|handle| handle.join().unwrap())
                 .collect::<Vec<_>>()
         });
-        assert_eq!(receipts[0], receipts[1]);
+        assert_eq!(outcomes[0].receipt(), outcomes[1].receipt());
+        let activated = outcomes
+            .iter()
+            .filter(|outcome| outcome.disposition() == EpochActivationDisposition::Activated)
+            .count();
+        let already_active = outcomes
+            .iter()
+            .filter(|outcome| outcome.disposition() == EpochActivationDisposition::AlreadyActive)
+            .count();
+        assert_eq!(activated, 1);
+        assert_eq!(already_active, 1);
         let mut conn = database.manager.get_conn().unwrap();
         assert_eq!(validate_all(&mut conn).unwrap().len(), 1);
         assert_eq!(validate_attempts(&mut conn).unwrap().len(), 2);
