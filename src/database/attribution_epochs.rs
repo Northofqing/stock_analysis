@@ -1284,12 +1284,63 @@ fn load_chain(
     .load(conn)
 }
 
+#[cfg(test)]
+struct PostCommitReadBackHook {
+    ready: std::sync::mpsc::SyncSender<Vec<i64>>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static POST_COMMIT_READ_BACK_HOOK: std::cell::RefCell<Option<PostCommitReadBackHook>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+struct PostCommitReadBackHookGuard;
+
+#[cfg(test)]
+impl Drop for PostCommitReadBackHookGuard {
+    fn drop(&mut self) {
+        POST_COMMIT_READ_BACK_HOOK.with(|hook| *hook.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn install_post_commit_read_back_hook(hook: PostCommitReadBackHook) -> PostCommitReadBackHookGuard {
+    POST_COMMIT_READ_BACK_HOOK.with(|slot| {
+        assert!(slot.borrow().is_none(), "TEST_CODE hook already installed");
+        *slot.borrow_mut() = Some(hook);
+    });
+    PostCommitReadBackHookGuard
+}
+
+#[cfg(test)]
+fn pause_post_commit_read_back_after_attempt_chain_ids(ids: &[i64]) {
+    POST_COMMIT_READ_BACK_HOOK.with(|slot| {
+        let Some(hook) = slot.borrow_mut().take() else {
+            return;
+        };
+        hook.ready
+            .send(ids.to_vec())
+            .expect("TEST_CODE reader-ready notification");
+        hook.release
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("TEST_CODE reader release within safety bound");
+    });
+}
+
 fn validate_sequence(conn: &mut SqliteConnection, table: &str) -> diesel::QueryResult<()> {
     let ids = diesel::sql_query(format!("SELECT id FROM {table} ORDER BY id ASC"))
         .load::<IdRow>(conn)?
         .into_iter()
         .map(|row| row.id)
         .collect::<Vec<_>>();
+    #[cfg(test)]
+    if table == "attribution_epoch_attempt_chain" {
+        pause_post_commit_read_back_after_attempt_chain_ids(&ids);
+    }
     let sequences = diesel::sql_query("SELECT seq FROM sqlite_sequence WHERE name = ?")
         .bind::<Text, _>(table)
         .load::<SequenceRow>(conn)?;
@@ -3121,6 +3172,46 @@ fn preview_activation_at_resolved_path(
     primary
 }
 
+fn verify_post_commit_read_back(
+    database_file: &str,
+    receipt: &AttributionEpochReceipt,
+) -> Result<(), AttributionEpochStoreError> {
+    if database_file.trim().is_empty() {
+        return Err(failed_integrity(
+            "BR-255 committed activation cannot be reopened read-only",
+        ));
+    }
+    let read_only_url = format!("file:{database_file}?mode=ro");
+    let mut read_only = SqliteConnection::establish(&read_only_url).map_err(|error| {
+        failed_integrity(format!(
+            "BR-255 committed activation read-back connection failed: {error}"
+        ))
+    })?;
+    diesel::sql_query("PRAGMA query_only=ON")
+        .execute(&mut read_only)
+        .map_err(|error| {
+            failed_integrity(format!(
+                "BR-255 committed activation read-back is not query-only: {error}"
+            ))
+        })?;
+    read_only.transaction::<_, AttributionEpochStoreError, _>(|conn| {
+        let rows = validate_all(conn).map_err(|error| {
+            activation_error_context(
+                "post_commit_read_back_validate_retained_state",
+                error.into(),
+            )
+        })?;
+        if rows.len() != 1 || &receipt_value(&rows[0])? != receipt {
+            return Err(failed_integrity(
+                "BR-255 committed activation read-back receipt differs",
+            ));
+        }
+        verify_epoch_source_prefix(conn, receipt).map_err(|error| {
+            activation_error_context("post_commit_read_back_verify_source_prefix", error)
+        })
+    })
+}
+
 impl<'a> AttributionEpochStore<'a> {
     pub fn new(database: &'a DatabaseManager) -> Self {
         let read_only_preview_path = database
@@ -3321,41 +3412,7 @@ impl<'a> AttributionEpochStore<'a> {
             Err(error) => return self.return_audited_failure(&request, error),
         };
         let receipt = outcome.receipt();
-        let read_back = (|| {
-            if database_file.trim().is_empty() {
-                return Err(failed_integrity(
-                    "BR-255 committed activation cannot be reopened read-only",
-                ));
-            }
-            let read_only_url = format!("file:{database_file}?mode=ro");
-            let mut read_only = SqliteConnection::establish(&read_only_url).map_err(|error| {
-                failed_integrity(format!(
-                    "BR-255 committed activation read-back connection failed: {error}"
-                ))
-            })?;
-            diesel::sql_query("PRAGMA query_only=ON")
-                .execute(&mut read_only)
-                .map_err(|error| {
-                    failed_integrity(format!(
-                        "BR-255 committed activation read-back is not query-only: {error}"
-                    ))
-                })?;
-            let rows = validate_all(&mut read_only).map_err(|error| {
-                activation_error_context(
-                    "post_commit_read_back_validate_retained_state",
-                    error.into(),
-                )
-            })?;
-            if rows.len() != 1 || &receipt_value(&rows[0])? != receipt {
-                return Err(failed_integrity(
-                    "BR-255 committed activation read-back receipt differs",
-                ));
-            }
-            verify_epoch_source_prefix(&mut read_only, receipt).map_err(|error| {
-                activation_error_context("post_commit_read_back_verify_source_prefix", error)
-            })?;
-            Ok(())
-        })();
+        let read_back = verify_post_commit_read_back(&database_file, receipt);
         if let Err(error) = read_back {
             return self.return_audited_failure(&request, error);
         }
@@ -5675,6 +5732,84 @@ mod tests {
         let mut conn = database.manager.get_conn().unwrap();
         assert_eq!(validate_all(&mut conn).unwrap().len(), 1);
         assert_eq!(validate_attempts(&mut conn).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn post_commit_read_back_pins_attempt_chain_snapshot_during_second_attempt_commit() {
+        let database = TestDatabase::with_wal_options(4, true);
+        install_activation_source(&database.manager);
+        let receipt = AttributionEpochStore::new(&database.manager)
+            .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
+            .expect("TEST_CODE initial committed activation");
+        let (ready, ready_wait) = std::sync::mpsc::sync_channel(1);
+        let (release, release_wait) = std::sync::mpsc::sync_channel(1);
+        let reader_path = database.path.clone();
+        let reader_receipt = receipt.clone();
+        let writer_input = AttributionEpochAttemptAppend {
+            source: "TEST_CODE read-back interleaving".to_owned(),
+            invoked_at: "2026-08-28T07:40:00.000Z".to_owned(),
+            completed_session_date: Some(receipt.cutover_completed_trading_date),
+            effective_date: Some(receipt.effective_trading_date),
+            outcome: "success".to_owned(),
+            reason_code: "TEST_CODE idempotent success".to_owned(),
+            retryable: false,
+            source_summary_hash: receipt.receipt_hash.clone(),
+            epoch_id: Some(receipt.epoch_id.clone()),
+            success_receipt_hash: Some(receipt.receipt_hash.clone()),
+        };
+        let writer_database = &database.manager;
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(move || {
+                let _hook = install_post_commit_read_back_hook(PostCommitReadBackHook {
+                    ready,
+                    release: release_wait,
+                });
+                verify_post_commit_read_back(&reader_path.to_string_lossy(), &reader_receipt)
+            });
+            assert_eq!(
+                ready_wait
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("TEST_CODE reader reached attempt-chain IDs"),
+                vec![1]
+            );
+            let (writer_done, writer_result) = std::sync::mpsc::sync_channel(1);
+            let writer = scope.spawn(move || {
+                writer_done
+                    .send(AttributionEpochStore::new(writer_database).append_attempt(writer_input))
+                    .expect("TEST_CODE writer result notification");
+            });
+            let writer_result = writer_result.recv_timeout(std::time::Duration::from_secs(10));
+            release
+                .send(())
+                .expect("TEST_CODE reader release before joins");
+            writer.join().expect("TEST_CODE writer join");
+            writer_result
+                .expect("TEST_CODE writer returned before reader release")
+                .expect("TEST_CODE writer append succeeds");
+            reader
+                .join()
+                .expect("TEST_CODE reader join")
+                .expect("TEST_CODE pinned read-back succeeds");
+        });
+        let mut conn = database.manager.get_conn().unwrap();
+        assert_eq!(validate_all(&mut conn).unwrap().len(), 1);
+        let ids = load_chain(
+            &mut conn,
+            "attribution_epoch_attempt_chain",
+            "attempt_audit_id",
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| row.id)
+        .collect::<Vec<_>>();
+        let sequence = diesel::sql_query(
+            "SELECT seq FROM sqlite_sequence WHERE name='attribution_epoch_attempt_chain'",
+        )
+        .get_result::<SequenceRow>(&mut conn)
+        .unwrap()
+        .seq;
+        assert_eq!(ids, [1, 2]);
+        assert_eq!(sequence, Some(2));
     }
 
     #[test]
