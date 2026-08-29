@@ -3444,7 +3444,10 @@ impl<'a> AttributionEpochStore<'a> {
 
         let (outcome, authority) = match primary {
             Ok(outcome) => outcome,
-            Err(error) => return self.return_audited_failure(&request, error),
+            Err(error) => {
+                drop(checkout);
+                return self.return_audited_failure(&request, error);
+            }
         };
         let receipt = outcome.receipt();
         let read_back = verify_post_commit_read_back(&mut checkout, &authority, receipt);
@@ -3633,74 +3636,10 @@ impl<'a> AttributionEpochStore<'a> {
         checkout.immediate_transaction_with_authority(
             map_database_authority_error,
             |conn, _authority| {
-                let state = validate_attempts(conn)?;
                 validate_all(conn)?;
-                let previous = state
-                    .last()
-                    .map_or(ATTEMPT_GENESIS, |row| row.record_hash.as_str());
-                let window = new_window(conn)?;
-                let mut row = PersistedAttempt {
-                    id: 0,
-                    source: input.source.clone(),
-                    invoked_at: input.invoked_at.clone(),
-                    completed_session_date: input
-                        .completed_session_date
-                        .map(|date| date.to_string()),
-                    effective_date: input.effective_date.map(|date| date.to_string()),
-                    outcome: input.outcome.clone(),
-                    reason_code: input.reason_code.clone(),
-                    retryable: i32::from(input.retryable),
-                    source_summary_hash: input.source_summary_hash.clone(),
-                    epoch_id: input.epoch_id.clone(),
-                    success_receipt_hash: input.success_receipt_hash.clone(),
-                    predecessor_attempt_hash: previous.to_owned(),
-                    record_hash: String::new(),
-                    created_at: window.created_at.clone(),
-                    retention_deadline: window.retention_deadline.clone(),
-                };
-                row.record_hash = attempt_hash(&row)?;
-                diesel::sql_query(
-                    "INSERT INTO attribution_epoch_attempt_audit
-                 (source, invoked_at, completed_session_date, effective_date, outcome, reason_code,
-                  retryable, source_summary_hash, epoch_id, success_receipt_hash,
-                  predecessor_attempt_hash, record_hash, created_at, retention_deadline)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                )
-                .bind::<Text, _>(&row.source)
-                .bind::<Text, _>(&row.invoked_at)
-                .bind::<Nullable<Text>, _>(&row.completed_session_date)
-                .bind::<Nullable<Text>, _>(&row.effective_date)
-                .bind::<Text, _>(&row.outcome)
-                .bind::<Text, _>(&row.reason_code)
-                .bind::<Integer, _>(row.retryable)
-                .bind::<Text, _>(&row.source_summary_hash)
-                .bind::<Nullable<Text>, _>(&row.epoch_id)
-                .bind::<Nullable<Text>, _>(&row.success_receipt_hash)
-                .bind::<Text, _>(&row.predecessor_attempt_hash)
-                .bind::<Text, _>(&row.record_hash)
-                .bind::<Text, _>(&row.created_at)
-                .bind::<Text, _>(&row.retention_deadline)
-                .execute(conn)?;
-                row.id = diesel::select(diesel::dsl::sql::<BigInt>("last_insert_rowid()"))
-                    .get_result(conn)?;
-                diesel::sql_query(
-                    "INSERT INTO attribution_epoch_attempt_chain
-                 (attempt_audit_id, previous_hash, record_hash, created_at, retention_deadline)
-                 VALUES (?, ?, ?, ?, ?)",
-                )
-                .bind::<BigInt, _>(row.id)
-                .bind::<Text, _>(&row.predecessor_attempt_hash)
-                .bind::<Text, _>(&row.record_hash)
-                .bind::<Text, _>(&row.created_at)
-                .bind::<Text, _>(&row.retention_deadline)
-                .execute(conn)?;
+                let receipt = insert_attempt_on_conn(conn, &input)?;
                 validate_all(conn)?;
-                Ok(AttributionEpochAttemptReceipt {
-                    attempt_audit_id: row.id,
-                    record_hash: row.record_hash,
-                    created_at: row.created_at,
-                    retention_deadline: row.retention_deadline,
-                })
+                Ok(receipt)
             },
         )
     }
@@ -4028,7 +3967,7 @@ mod tests {
 
     #[test]
     fn unattested_manager_keeps_operational_queries_but_daily_authority_is_unavailable() {
-        let database = TestDatabase::new();
+        let database = TestDatabase::with_options(1, true);
         let mut operational = database
             .manager
             .get_conn()
@@ -6275,7 +6214,11 @@ mod tests {
         let error = AttributionEpochStore::new(&database.manager)
             .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
             .unwrap_err();
-        assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
+        assert_eq!(
+            error.reason_code(),
+            "attribution_epoch_integrity_failed",
+            "TEST_CODE full activation error: {error}"
+        );
         let mut conn = database.manager.get_conn().unwrap();
         assert!(load_receipts(&mut conn).unwrap().is_empty());
         let attempts = validate_attempts(&mut conn).unwrap();

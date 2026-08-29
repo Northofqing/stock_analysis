@@ -868,7 +868,7 @@ fn verify_sqlite_connection_object(
             sqlite_manager_error("descriptor-anchored SQLite connection has no main database")
         })?;
     if Path::new(&main.file) != expected_route {
-        return Err(sqlite_manager_error(format!(
+        return Err(descriptor_integrity_manager_error(format!(
             "descriptor-anchored SQLite connection escaped owner route: expected {:?}, got {:?}",
             expected_route, main.file
         )));
@@ -882,7 +882,7 @@ fn verify_sqlite_connection_object(
             ))
         })?;
     if actual != expected_identity {
-        return Err(sqlite_manager_error(format!(
+        return Err(descriptor_integrity_manager_error(format!(
             "descriptor-anchored SQLite inode mismatch: expected {:?}, got {:?}",
             expected_identity, actual
         )));
@@ -991,7 +991,7 @@ fn openat_regular_for_attestation(
         })?
         .is_file()
     {
-        return Err(sqlite_manager_error(format!(
+        return Err(descriptor_integrity_manager_error(format!(
             "descriptor_identity_changed: pinned {role} is not a regular file"
         )));
     }
@@ -1019,7 +1019,7 @@ fn open_shared_shm_anchor(
     let actual =
         FileObjectIdentity::from_file(&file).map_err(descriptor_attestation_manager_error)?;
     if actual != expected.identity(SqliteObjectRole::Shm) {
-        return Err(sqlite_manager_error(
+        return Err(descriptor_integrity_manager_error(
             "descriptor_identity_changed: separately pinned SHM anchor differs from attested SQLite SHM",
         ));
     }
@@ -1046,7 +1046,7 @@ fn commit_descriptor_pool_evidence(
         .map_err(|_| sqlite_manager_error("descriptor pool-evidence lock is poisoned"))?;
     match state.as_ref() {
         Some(existing) if existing.expected_objects != proposed.expected_objects => {
-            Err(sqlite_manager_error(
+            Err(descriptor_integrity_manager_error(
                 "descriptor_identity_changed: SQLite main/WAL/SHM objects changed between connections",
             ))
         }
@@ -1054,7 +1054,7 @@ fn commit_descriptor_pool_evidence(
             let actual = FileObjectIdentity::from_file(&existing.shared_shm_anchor)
                 .map_err(descriptor_attestation_manager_error)?;
             if actual != existing.expected_objects.identity(SqliteObjectRole::Shm) {
-                return Err(sqlite_manager_error(
+                return Err(descriptor_integrity_manager_error(
                     "descriptor_identity_changed: process-shared SHM anchor changed identity",
                 ));
             }
@@ -1130,7 +1130,7 @@ fn validate_connection_attestation_token_protection(
     .map_err(|error| sqlite_configuration_error("read attestation token protection", error))?
     .count;
     if count != 2 {
-        return Err(sqlite_manager_error(
+        return Err(descriptor_integrity_manager_error(
             "descriptor_identity_changed: attestation token protection changed",
         ));
     }
@@ -1151,7 +1151,9 @@ fn validate_registered_descriptor_connection(
         .lock()
         .map_err(|_| sqlite_manager_error("descriptor connection-proof lock is poisoned"))?;
     let proof = proofs.get(&token).ok_or_else(|| {
-        sqlite_manager_error("descriptor-bound connection has no registered fd attestation")
+        descriptor_integrity_manager_error(
+            "descriptor-bound connection has no registered fd attestation",
+        )
     })?;
     proof
         .handles
@@ -1160,13 +1162,13 @@ fn validate_registered_descriptor_connection(
     let shared_shm = FileObjectIdentity::from_file(&proof.shared_shm_anchor)
         .map_err(descriptor_attestation_manager_error)?;
     if shared_shm != proof.expected_objects.identity(SqliteObjectRole::Shm) {
-        return Err(sqlite_manager_error(
+        return Err(descriptor_integrity_manager_error(
             "descriptor_identity_changed: process-shared SHM proof changed identity",
         ));
     }
     let current_objects = capture_pinned_sqlite_object_set(source)?;
     if &current_objects != proof.expected_objects.as_ref() {
-        return Err(sqlite_manager_error(
+        return Err(descriptor_integrity_manager_error(
             "descriptor_identity_changed: current main/WAL/SHM leaves differ from retained connection proof",
         ));
     }
@@ -1747,7 +1749,7 @@ fn validate_live_registered_descriptor_connection(
     connection: &mut SqliteConnection,
 ) -> Result<SqliteFileIdentity, ConnectionManagerError> {
     registered_descriptor_connection_identity(source, connection)
-        .map_err(|error| sqlite_manager_error(error.to_string()))
+        .map_err(database_authority_manager_error)
 }
 
 fn registered_descriptor_connection_identity(
@@ -1824,19 +1826,19 @@ fn validate_retained_namespace(
     source: &DescriptorSqliteSource,
 ) -> Result<(), ConnectionManagerError> {
     let root = SqliteObjectIdentity::from_metadata(&source.root.metadata().map_err(|error| {
-        sqlite_manager_error(format!(
+        descriptor_integrity_manager_error(format!(
             "descriptor_identity_changed: fstat retained root: {error}"
         ))
     })?);
     let parent =
         SqliteObjectIdentity::from_metadata(&source.parent.metadata().map_err(|error| {
-            sqlite_manager_error(format!(
+            descriptor_integrity_manager_error(format!(
                 "descriptor_identity_changed: fstat retained database parent: {error}"
             ))
         })?);
     let database = SqliteObjectIdentity::from_metadata(
         &source.database_anchor.metadata().map_err(|error| {
-            sqlite_manager_error(format!(
+            descriptor_integrity_manager_error(format!(
                 "descriptor_identity_changed: fstat retained database: {error}"
             ))
         })?,
@@ -1845,7 +1847,7 @@ fn validate_retained_namespace(
         || parent != source.parent_identity
         || database != source.database_object_identity
     {
-        return Err(sqlite_manager_error(
+        return Err(descriptor_integrity_manager_error(
             "descriptor_identity_changed: retained owner namespace changed identity",
         ));
     }
@@ -1855,7 +1857,7 @@ fn validate_retained_namespace(
         != FileObjectIdentity::from_file(&source.database_anchor)
             .map_err(descriptor_attestation_manager_error)?
     {
-        return Err(sqlite_manager_error(
+        return Err(descriptor_integrity_manager_error(
             "descriptor_identity_changed: fixed database leaf no longer names owner database",
         ));
     }
@@ -1865,7 +1867,27 @@ fn validate_retained_namespace(
 fn descriptor_attestation_manager_error(
     error: DescriptorAttestationError,
 ) -> ConnectionManagerError {
-    sqlite_manager_error(error.to_string())
+    let kind = match &error {
+        DescriptorAttestationError::Unavailable { .. } => DescriptorManagerErrorKind::Unavailable,
+        DescriptorAttestationError::Ambiguous { .. }
+        | DescriptorAttestationError::IdentityChanged { .. }
+        | DescriptorAttestationError::JournalModeUnsupported { .. } => {
+            DescriptorManagerErrorKind::Integrity
+        }
+    };
+    descriptor_manager_error(kind, error.to_string())
+}
+
+fn database_authority_manager_error(error: DatabaseAuthorityError) -> ConnectionManagerError {
+    let kind = match &error {
+        DatabaseAuthorityError::DescriptorAttestationUnavailable { .. } => {
+            DescriptorManagerErrorKind::Unavailable
+        }
+        DatabaseAuthorityError::DescriptorIntegrityFailed { .. } => {
+            DescriptorManagerErrorKind::Integrity
+        }
+    };
+    descriptor_manager_error(kind, error.to_string())
 }
 
 impl ManageConnection for SqliteConnectionManager {
@@ -1880,8 +1902,7 @@ impl ManageConnection for SqliteConnectionManager {
                     .connect_lock
                     .lock()
                     .map_err(|_| sqlite_manager_error("descriptor connect lock is poisoned"))?;
-                descriptor_integrity_latch(source)
-                    .map_err(|error| sqlite_manager_error(error.to_string()))?;
+                descriptor_integrity_latch(source).map_err(database_authority_manager_error)?;
                 source
                     .connection_proofs
                     .lock()
@@ -1909,7 +1930,7 @@ impl ManageConnection for SqliteConnectionManager {
                 configure_sqlite_connection(&mut connection)?;
                 let actual = Self::verify_descriptor_connection(source, &mut connection, &route)?;
                 if actual != source.identity {
-                    return Err(sqlite_manager_error(
+                    return Err(descriptor_integrity_manager_error(
                         "descriptor_identity_changed: SQLite main connection escaped owner inode",
                     ));
                 }
@@ -1934,7 +1955,7 @@ impl ManageConnection for SqliteConnectionManager {
                 let existing_evidence = current_descriptor_pool_evidence(source)?;
                 let expected_objects = match existing_evidence.as_ref() {
                     Some(existing) if existing.expected_objects.as_ref() != &observed_objects => {
-                        return Err(sqlite_manager_error(
+                        return Err(descriptor_integrity_manager_error(
                             "descriptor_identity_changed: SQLite main/WAL/SHM objects changed between connections",
                         ));
                     }
@@ -2179,6 +2200,48 @@ fn sqlite_manager_error(detail: impl Into<String>) -> ConnectionManagerError {
     )))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DescriptorManagerErrorKind {
+    Unavailable,
+    Integrity,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{detail}")]
+struct DescriptorManagerError {
+    kind: DescriptorManagerErrorKind,
+    detail: String,
+}
+
+fn descriptor_manager_error(
+    kind: DescriptorManagerErrorKind,
+    detail: impl Into<String>,
+) -> ConnectionManagerError {
+    ConnectionManagerError::QueryError(diesel::result::Error::QueryBuilderError(Box::new(
+        DescriptorManagerError {
+            kind,
+            detail: detail.into(),
+        },
+    )))
+}
+
+fn descriptor_integrity_manager_error(detail: impl Into<String>) -> ConnectionManagerError {
+    descriptor_manager_error(DescriptorManagerErrorKind::Integrity, detail)
+}
+
+fn descriptor_manager_error_kind(
+    error: &ConnectionManagerError,
+) -> Option<DescriptorManagerErrorKind> {
+    match error {
+        ConnectionManagerError::QueryError(diesel::result::Error::QueryBuilderError(error)) => {
+            error
+                .downcast_ref::<DescriptorManagerError>()
+                .map(|error| error.kind)
+        }
+        _ => None,
+    }
+}
+
 impl CustomizeConnection<SqliteConnection, ConnectionManagerError> for SqliteConnectionCustomizer {
     fn on_acquire(&self, conn: &mut SqliteConnection) -> Result<(), ConnectionManagerError> {
         configure_sqlite_connection(conn)
@@ -2247,12 +2310,9 @@ fn install_descriptor_readback_connection(
     manager: &SqliteConnectionManager,
     source: &Arc<DescriptorSqliteSource>,
 ) -> Result<(), DatabaseAuthorityError> {
-    let mut reader = manager.connect().map_err(|error| {
-        descriptor_readback_initialization_error(
-            source,
-            format!("establish source-owned descriptor-attested read-back connection: {error}"),
-        )
-    })?;
+    let mut reader = manager
+        .connect()
+        .map_err(|error| descriptor_readback_initialization_error(source, error))?;
     diesel::sql_query("PRAGMA query_only=ON")
         .execute(&mut reader)
         .map_err(
@@ -2279,13 +2339,11 @@ fn install_descriptor_readback_connection(
 
 fn descriptor_readback_initialization_error(
     source: &DescriptorSqliteSource,
-    detail: String,
+    error: ConnectionManagerError,
 ) -> DatabaseAuthorityError {
-    if detail.contains("descriptor_identity_changed")
-        || detail.contains("descriptor_attestation_ambiguous")
-        || detail.contains("descriptor_journal_mode_unsupported")
-        || detail.contains("descriptor_integrity_failed")
-    {
+    let detail =
+        format!("establish source-owned descriptor-attested read-back connection: {error}");
+    if descriptor_manager_error_kind(&error) == Some(DescriptorManagerErrorKind::Integrity) {
         latch_descriptor_integrity_failure(source, detail)
     } else {
         DatabaseAuthorityError::DescriptorAttestationUnavailable { detail }
@@ -4301,6 +4359,28 @@ mod tests {
     use super::*;
     use crate::models::StockPosition;
     use chrono::NaiveDate;
+
+    #[test]
+    fn descriptor_connection_error_classification_is_typed() {
+        let integrity = descriptor_integrity_manager_error("wording without a reason code");
+        assert_eq!(
+            descriptor_manager_error_kind(&integrity),
+            Some(DescriptorManagerErrorKind::Integrity)
+        );
+
+        let unavailable =
+            descriptor_attestation_manager_error(DescriptorAttestationError::Unavailable {
+                detail: "source temporarily unavailable".into(),
+            });
+        assert_eq!(
+            descriptor_manager_error_kind(&unavailable),
+            Some(DescriptorManagerErrorKind::Unavailable)
+        );
+
+        let misleading_text =
+            sqlite_manager_error("descriptor_identity_changed is only display text here");
+        assert_eq!(descriptor_manager_error_kind(&misleading_text), None);
+    }
 
     #[derive(QueryableByName)]
     struct BusyTimeoutValue {

@@ -179,7 +179,7 @@ CLI 默认选择活动纪元。显式 `--epoch legacy` 可读取旧报告或重�
 - 默认 preview，只读解析日历、显示拟切换完成日/生效日及数据库中可验证的拟高水位，不初始化 writer；
 - `--commit` 必须同时有显式 `--db`，调用与 monitor 相同的 service；
 - preview 数据库必须保持逐字节不变；
-- 盘中返回 `current_session_incomplete`；不在安全窗口或日期不可用返回 typed Unavailable；
+- 15:35 前（含盘中）返回 retryable typed Unavailable `attribution_epoch_window_not_open`；15:50 后返回 non-retryable `attribution_epoch_window_closed`，日期不可用也返回 typed Unavailable；
 - 同内容 commit 返回原 receipt；不同内容或已有冲突 activation 返回 integrity failure。
 
 `scheduled`、`replay`、`quarter` 增加可选 `--epoch`；省略时选择活动纪元，输出固定包含 epoch ID、生效日、carry/exclusion 统计和纪元内 manifest。`capture` 的 benchmark 语义不变。

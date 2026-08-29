@@ -1519,7 +1519,9 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::path::{Path, PathBuf};
+    use std::process::{Child, ChildStdout, Command as ProcessCommand, Stdio};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use clap::Parser;
@@ -1645,6 +1647,119 @@ mod tests {
                 fs::remove_file(target).expect("TEST_CODE remove exact temporary database file");
             }
         }
+    }
+
+    const LIVE_WAL_KEEPER_PATH_ENV: &str =
+        "STOCK_ANALYSIS_TEST_CODE_STRATEGY_ATTRIBUTION_LIVE_WAL_KEEPER_PATH";
+    const LIVE_WAL_KEEPER_READY: &str = "TEST_CODE_LIVE_WAL_KEEPER_READY";
+
+    struct LiveWalKeeperProcess {
+        child: Option<Child>,
+        stdout: BufReader<ChildStdout>,
+    }
+
+    impl LiveWalKeeperProcess {
+        fn spawn(path: &Path) -> Self {
+            let mut child = ProcessCommand::new(
+                std::env::current_exe().expect("TEST_CODE locate current strategy test binary"),
+            )
+            .args([
+                "--exact",
+                "tests::reset_sample_live_wal_keeper_child_process",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(LIVE_WAL_KEEPER_PATH_ENV, path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("TEST_CODE spawn external live WAL keeper");
+            let stdout = child
+                .stdout
+                .take()
+                .expect("TEST_CODE capture live WAL keeper stdout");
+            Self {
+                child: Some(child),
+                stdout: BufReader::new(stdout),
+            }
+        }
+
+        fn wait_until_ready(&mut self) {
+            let mut line = String::new();
+            while self
+                .stdout
+                .read_line(&mut line)
+                .expect("TEST_CODE read WAL keeper readiness")
+                != 0
+            {
+                if line.contains(LIVE_WAL_KEEPER_READY) {
+                    return;
+                }
+                line.clear();
+            }
+            panic!("TEST_CODE external live WAL keeper never became ready");
+        }
+
+        fn release(mut self) {
+            self.child
+                .as_mut()
+                .expect("TEST_CODE live WAL keeper child")
+                .stdin
+                .as_mut()
+                .expect("TEST_CODE external WAL keeper stdin")
+                .write_all(&[1])
+                .expect("TEST_CODE release external WAL keeper");
+            let mut child = self.child.take().expect("TEST_CODE live WAL keeper child");
+            child.stdin.take();
+            let status = child.wait().unwrap_or_else(|error| {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("TEST_CODE wait for WAL keeper: {error}");
+            });
+            assert!(
+                status.success(),
+                "TEST_CODE external WAL keeper must exit cleanly"
+            );
+        }
+    }
+
+    impl Drop for LiveWalKeeperProcess {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                child.stdin.take();
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[test]
+    fn reset_sample_live_wal_keeper_child_process() {
+        let Some(path) = std::env::var_os(LIVE_WAL_KEEPER_PATH_ENV) else {
+            return;
+        };
+        let keeper = Connection::open(PathBuf::from(path)).expect("TEST_CODE child WAL keeper");
+        let journal_mode: String = keeper
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .expect("TEST_CODE child enables WAL mode");
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        keeper
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE TEST_CODE_live_wal_guard(id INTEGER PRIMARY KEY);
+                 INSERT INTO TEST_CODE_live_wal_guard(id) VALUES (1);",
+            )
+            .expect("TEST_CODE child retains legitimate live WAL");
+        println!("{LIVE_WAL_KEEPER_READY}");
+        std::io::stdout()
+            .flush()
+            .expect("TEST_CODE child flushes ready marker");
+        let mut release = [0_u8; 1];
+        std::io::stdin()
+            .read_exact(&mut release)
+            .expect("TEST_CODE parent releases WAL keeper");
+        drop(keeper);
     }
 
     fn scalar(connection: &Connection, sql: &str) -> i64 {
@@ -2295,18 +2410,8 @@ mod tests {
         let path = test_database_path("reset_commit_live_wal");
         create_source_schema(&path);
         append_activation_carry_source(&path);
-        let keeper = Connection::open(&path).expect("TEST_CODE live WAL keeper");
-        let journal_mode: String = keeper
-            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
-            .expect("TEST_CODE enable live WAL mode");
-        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
-        keeper
-            .execute_batch(
-                "PRAGMA wal_autocheckpoint=0;
-                 CREATE TABLE TEST_CODE_live_wal_guard(id INTEGER PRIMARY KEY);
-                 INSERT INTO TEST_CODE_live_wal_guard(id) VALUES (1);",
-            )
-            .expect("TEST_CODE retain legitimate live WAL");
+        let mut keeper = LiveWalKeeperProcess::spawn(&path);
+        keeper.wait_until_ready();
         assert!(sidecar(&path, "-wal").exists());
         assert!(sidecar(&path, "-shm").exists());
 
@@ -2323,14 +2428,12 @@ mod tests {
             "json",
         ])
         .expect("TEST_CODE live WAL reset commit command");
-        let output = execute(&cli)
-            .await
-            .expect("TEST_CODE legitimate live WAL must not hide committed success");
+        let output = execute(&cli).await;
+        keeper.release();
+        let output = output.expect("TEST_CODE legitimate live WAL must not hide committed success");
         let value: Value = serde_json::from_str(&output).expect("TEST_CODE live WAL receipt JSON");
         assert_eq!(value["数据库已写入"], true);
         assert_eq!(value["receipt身份"].as_str().map(str::len), Some(64));
-
-        drop(keeper);
         cleanup_database(&path);
     }
 
