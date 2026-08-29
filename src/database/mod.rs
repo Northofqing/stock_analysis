@@ -21,12 +21,12 @@ use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{File, Metadata};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -243,6 +243,7 @@ pub struct DatabaseManager {
     pool: DbPool,
     attribution_pool: Option<DbPool>,
     attribution_connection_source: Option<Arc<DescriptorSqliteSource>>,
+    readonly_attribution_snapshot: Option<TemporaryAttributionSnapshot>,
     #[allow(dead_code)]
     selection_connection_source: Option<Arc<DescriptorSqliteSource>>,
     #[allow(dead_code)]
@@ -304,6 +305,16 @@ struct BusyTimeoutPragmaRow {
 struct WalAutocheckpointPragmaRow {
     #[diesel(sql_type = diesel::sql_types::Integer)]
     wal_autocheckpoint: i32,
+}
+
+#[derive(QueryableByName)]
+struct WalCheckpointRow {
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    busy: i32,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    log: i32,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    checkpointed: i32,
 }
 
 #[derive(QueryableByName)]
@@ -370,6 +381,23 @@ pub(crate) enum DatabaseAuthorityError {
     DescriptorAttestationUnavailable { detail: String },
     #[error("descriptor_integrity_failed: {detail}")]
     DescriptorIntegrityFailed { detail: String },
+}
+
+#[derive(Debug)]
+pub(crate) enum AttributionReadTransactionError<E> {
+    Operation(E),
+    StorageUnavailable { detail: String },
+    Authority(DatabaseAuthorityError),
+    SnapshotIntegrity { detail: String },
+    Transaction { detail: String },
+}
+
+impl<E> From<diesel::result::Error> for AttributionReadTransactionError<E> {
+    fn from(error: diesel::result::Error) -> Self {
+        Self::Transaction {
+            detail: error.to_string(),
+        }
+    }
 }
 
 impl DatabaseAuthorityError {
@@ -1032,6 +1060,303 @@ fn detached_readonly_snapshot_bytes(
     Ok(detached)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadonlyAttributionFileSnapshot {
+    identity: SqliteObjectIdentity,
+    modified: std::time::SystemTime,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadonlyAttributionSourceSnapshot {
+    main: ReadonlyAttributionFileSnapshot,
+    wal: Option<ReadonlyAttributionFileSnapshot>,
+    shm: Option<ReadonlyAttributionFileSnapshot>,
+}
+
+fn sqlite_sidecar_path(database: &Path, suffix: &str) -> PathBuf {
+    let mut path = database.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+fn capture_readonly_attribution_file(
+    path: &Path,
+    required: bool,
+) -> Result<Option<ReadonlyAttributionFileSnapshot>, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("inspect {}: {error}", path.display())),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "read-only attribution snapshot source is not a regular file: {}",
+            path.display()
+        ));
+    }
+    let identity = SqliteObjectIdentity::from_metadata(&metadata);
+    let modified = metadata
+        .modified()
+        .map_err(|error| format!("read modification time for {}: {error}", path.display()))?;
+    let expected_len = metadata.len();
+    let mut file = File::open(path)
+        .map_err(|error| format!("open read-only snapshot file {}: {error}", path.display()))?;
+    let opened_metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect opened snapshot file {}: {error}", path.display()))?;
+    if SqliteObjectIdentity::from_metadata(&opened_metadata) != identity
+        || opened_metadata.modified().map_err(|error| {
+            format!(
+                "read opened snapshot modification time for {}: {error}",
+                path.display()
+            )
+        })? != modified
+        || opened_metadata.len() != expected_len
+    {
+        return Err(format!(
+            "read-only attribution snapshot file changed while opening: {}",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::with_capacity(expected_len.try_into().unwrap_or(0));
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("read snapshot file {}: {error}", path.display()))?;
+    let after_read = file
+        .metadata()
+        .map_err(|error| format!("re-inspect snapshot file {}: {error}", path.display()))?;
+    if SqliteObjectIdentity::from_metadata(&after_read) != identity
+        || after_read.modified().map_err(|error| {
+            format!(
+                "re-read snapshot modification time for {}: {error}",
+                path.display()
+            )
+        })? != modified
+        || after_read.len() != expected_len
+        || bytes.len() as u64 != expected_len
+    {
+        return Err(format!(
+            "read-only attribution snapshot file changed while reading: {}",
+            path.display()
+        ));
+    }
+    let named_after_read = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("re-inspect snapshot pathname {}: {error}", path.display()))?;
+    if SqliteObjectIdentity::from_metadata(&named_after_read) != identity {
+        return Err(format!(
+            "read-only attribution snapshot pathname changed while reading: {}",
+            path.display()
+        ));
+    }
+    Ok(Some(ReadonlyAttributionFileSnapshot {
+        identity,
+        modified,
+        bytes,
+    }))
+}
+
+fn capture_readonly_attribution_source(
+    database: &Path,
+) -> Result<ReadonlyAttributionSourceSnapshot, String> {
+    Ok(ReadonlyAttributionSourceSnapshot {
+        main: capture_readonly_attribution_file(database, true)?
+            .expect("required read-only attribution main database must be present"),
+        wal: capture_readonly_attribution_file(&sqlite_sidecar_path(database, "-wal"), false)?,
+        shm: capture_readonly_attribution_file(&sqlite_sidecar_path(database, "-shm"), false)?,
+    })
+}
+
+static NEXT_READONLY_ATTRIBUTION_SNAPSHOT: AtomicU64 = AtomicU64::new(0);
+
+struct TemporaryAttributionSnapshot {
+    directory: PathBuf,
+    database: PathBuf,
+    cleaned: bool,
+}
+
+impl TemporaryAttributionSnapshot {
+    fn create(source: &ReadonlyAttributionSourceSnapshot) -> Result<Self, String> {
+        let directory = loop {
+            let sequence = NEXT_READONLY_ATTRIBUTION_SNAPSHOT.fetch_add(1, Ordering::Relaxed);
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            let candidate = std::env::temp_dir().join(format!(
+                "stock-analysis-attribution-snapshot-{}-{nonce}-{sequence}",
+                std::process::id()
+            ));
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "create private attribution snapshot directory: {error}"
+                    ));
+                }
+            }
+        };
+        let database = directory.join("snapshot.db");
+        let mut snapshot = Self {
+            directory,
+            database,
+            cleaned: false,
+        };
+        snapshot.write_file(&snapshot.database.clone(), &source.main.bytes)?;
+        let copied_wal = source.wal.as_ref().filter(|wal| !wal.bytes.is_empty());
+        if let Some(wal) = copied_wal {
+            snapshot.write_file(&sqlite_sidecar_path(&snapshot.database, "-wal"), &wal.bytes)?;
+            snapshot.materialize_copied_wal()?;
+        }
+        Ok(snapshot)
+    }
+
+    fn write_file(&mut self, path: &Path, bytes: &[u8]) -> Result<(), String> {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+            .map_err(|error| {
+                format!("create detached snapshot file {}: {error}", path.display())
+            })?;
+        file.write_all(bytes)
+            .map_err(|error| format!("write detached snapshot file {}: {error}", path.display()))
+    }
+
+    fn database_path(&self) -> &Path {
+        &self.database
+    }
+
+    fn materialize_copied_wal(&self) -> Result<(), String> {
+        // This writer is confined to the private detached directory. It does
+        // not execute schema or application writes; it only materializes the
+        // already captured logical snapshot so the later mode=ro pool never
+        // needs to rebuild source WAL state.
+        let database_url = self.database.to_string_lossy().into_owned();
+        let mut bootstrap = SqliteConnection::establish(&database_url).map_err(|error| {
+            format!(
+                "establish private attribution WAL bootstrap {}: {error}",
+                self.database.display()
+            )
+        })?;
+        let checkpoint = diesel::sql_query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .get_result::<WalCheckpointRow>(&mut bootstrap)
+            .map_err(|error| {
+                format!(
+                    "checkpoint private attribution WAL {}: {error}",
+                    self.database.display()
+                )
+            })?;
+        if checkpoint.busy != 0
+            || checkpoint.log < 0
+            || checkpoint.checkpointed < 0
+            || checkpoint.log != checkpoint.checkpointed
+        {
+            return Err(format!(
+                "private attribution WAL checkpoint incomplete (requires busy=0 and non-negative equal frame counts): busy={}, log={}, checkpointed={}",
+                checkpoint.busy, checkpoint.log, checkpoint.checkpointed
+            ));
+        }
+        let journal_mode = diesel::sql_query("PRAGMA journal_mode=DELETE")
+            .get_result::<JournalModeRow>(&mut bootstrap)
+            .map_err(|error| {
+                format!(
+                    "normalize private attribution snapshot journal mode {}: {error}",
+                    self.database.display()
+                )
+            })?
+            .journal_mode;
+        if !journal_mode.eq_ignore_ascii_case("delete") {
+            return Err(format!(
+                "private attribution snapshot retained journal_mode={journal_mode} after WAL checkpoint"
+            ));
+        }
+        drop(bootstrap);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = sqlite_sidecar_path(&self.database, suffix);
+            match std::fs::metadata(&sidecar) {
+                Ok(metadata) if metadata.len() == 0 => {}
+                Ok(metadata) => {
+                    return Err(format!(
+                        "private attribution {suffix} retained {} bytes after DELETE normalization",
+                        metadata.len()
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "inspect private attribution {suffix} after DELETE normalization: {error}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cleanup(&mut self) -> Result<(), String> {
+        if self.cleaned {
+            return Ok(());
+        }
+        let known = [
+            self.database.clone(),
+            sqlite_sidecar_path(&self.database, "-wal"),
+            sqlite_sidecar_path(&self.database, "-shm"),
+        ];
+        let mut unknown = Vec::new();
+        for entry in std::fs::read_dir(&self.directory).map_err(|error| {
+            format!(
+                "inspect detached snapshot directory {}: {error}",
+                self.directory.display()
+            )
+        })? {
+            let path = entry
+                .map_err(|error| format!("inspect detached snapshot entry: {error}"))?
+                .path();
+            if !known.contains(&path) {
+                unknown.push(path);
+            }
+        }
+        if !unknown.is_empty() {
+            return Err(format!(
+                "detached snapshot directory contains unknown entries: {}",
+                unknown
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        for path in known {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "remove detached snapshot file {}: {error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        std::fs::remove_dir(&self.directory).map_err(|error| {
+            format!(
+                "remove detached snapshot directory {}: {error}",
+                self.directory.display()
+            )
+        })?;
+        self.cleaned = true;
+        Ok(())
+    }
+}
+
+impl Drop for TemporaryAttributionSnapshot {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
 fn validate_live_registered_descriptor_connection(
     source: &DescriptorSqliteSource,
     connection: &mut SqliteConnection,
@@ -1311,6 +1636,9 @@ struct SqliteConnectionConfiguration {
 #[derive(Debug)]
 struct SqliteConnectionCustomizer;
 
+#[derive(Debug)]
+struct ReadonlySqliteConnectionCustomizer;
+
 const SQLITE_POOL_SIZE: u32 = 10;
 const REQUIRED_SQLITE_CONFIGURATION: SqliteConnectionConfiguration =
     SqliteConnectionConfiguration {
@@ -1318,6 +1646,20 @@ const REQUIRED_SQLITE_CONFIGURATION: SqliteConnectionConfiguration =
         synchronous: 2,
         busy_timeout: 5_000,
         wal_autocheckpoint: 1_000,
+    };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadonlySqliteConnectionConfiguration {
+    foreign_keys: i32,
+    busy_timeout: i32,
+    query_only: i32,
+}
+
+const REQUIRED_READONLY_SQLITE_CONFIGURATION: ReadonlySqliteConnectionConfiguration =
+    ReadonlySqliteConnectionConfiguration {
+        foreign_keys: 1,
+        busy_timeout: 5_000,
+        query_only: 1,
     };
 
 fn validate_required_text(field: &str, value: &str) -> Result<(), String> {
@@ -1367,6 +1709,40 @@ fn configure_sqlite_connection(conn: &mut SqliteConnection) -> Result<(), Connec
     let actual = read_sqlite_connection_configuration(conn)?;
     if actual != REQUIRED_SQLITE_CONFIGURATION {
         return Err(sqlite_configuration_mismatch(actual));
+    }
+    Ok(())
+}
+
+fn configure_readonly_sqlite_connection(
+    conn: &mut SqliteConnection,
+) -> Result<(), ConnectionManagerError> {
+    for (label, statement) in [
+        ("query_only=ON", "PRAGMA query_only = ON"),
+        ("foreign_keys=ON", "PRAGMA foreign_keys = ON"),
+        ("busy_timeout=5000", "PRAGMA busy_timeout = 5000"),
+    ] {
+        diesel::sql_query(statement)
+            .execute(conn)
+            .map_err(|error| sqlite_configuration_error(label, error))?;
+    }
+    let actual = ReadonlySqliteConnectionConfiguration {
+        foreign_keys: diesel::sql_query("PRAGMA foreign_keys")
+            .get_result::<ForeignKeysPragmaRow>(conn)
+            .map_err(|error| sqlite_configuration_error("read foreign_keys", error))?
+            .foreign_keys,
+        busy_timeout: diesel::sql_query("PRAGMA busy_timeout")
+            .get_result::<BusyTimeoutPragmaRow>(conn)
+            .map_err(|error| sqlite_configuration_error("read busy_timeout", error))?
+            .timeout,
+        query_only: diesel::sql_query("PRAGMA query_only")
+            .get_result::<QueryOnlyPragmaRow>(conn)
+            .map_err(|error| sqlite_configuration_error("read query_only", error))?
+            .query_only,
+    };
+    if actual != REQUIRED_READONLY_SQLITE_CONFIGURATION {
+        return Err(sqlite_manager_error(format!(
+            "read-only SQLite PRAGMA verification failed: expected {REQUIRED_READONLY_SQLITE_CONFIGURATION:?}, got {actual:?}"
+        )));
     }
     Ok(())
 }
@@ -1424,12 +1800,31 @@ impl CustomizeConnection<SqliteConnection, ConnectionManagerError> for SqliteCon
     }
 }
 
+impl CustomizeConnection<SqliteConnection, ConnectionManagerError>
+    for ReadonlySqliteConnectionCustomizer
+{
+    fn on_acquire(&self, conn: &mut SqliteConnection) -> Result<(), ConnectionManagerError> {
+        configure_readonly_sqlite_connection(conn)
+    }
+}
+
 fn build_sqlite_pool(database_url: String) -> Result<DbPool, PoolError> {
     build_sqlite_pool_with_size(database_url, SQLITE_POOL_SIZE)
 }
 
 fn build_sqlite_pool_with_size(database_url: String, max_size: u32) -> Result<DbPool, PoolError> {
     build_sqlite_pool_from_manager(SqliteConnectionManager::legacy(database_url), max_size)
+}
+
+fn build_readonly_sqlite_pool_with_size(
+    database_url: String,
+    max_size: u32,
+) -> Result<DbPool, PoolError> {
+    Pool::builder()
+        .max_size(max_size)
+        .test_on_check_out(true)
+        .connection_customizer(Box::new(ReadonlySqliteConnectionCustomizer))
+        .build(SqliteConnectionManager::legacy(database_url))
 }
 
 fn build_attested_sqlite_pool_with_size(
@@ -1768,6 +2163,7 @@ impl DatabaseManager {
             pool,
             attribution_pool,
             attribution_connection_source,
+            readonly_attribution_snapshot: None,
             selection_connection_source: None,
             selection_schema_authority: None,
         };
@@ -1805,6 +2201,7 @@ impl DatabaseManager {
             pool,
             attribution_pool: Some(attribution_pool),
             attribution_connection_source: Some(Arc::clone(&selection_connection_source)),
+            readonly_attribution_snapshot: None,
             selection_connection_source: Some(selection_connection_source),
             selection_schema_authority: Some(authority),
         })
@@ -1926,6 +2323,59 @@ impl DatabaseManager {
         Ok(checkout)
     }
 
+    /// Runs one deferred attribution read transaction from this manager's
+    /// owned database. Append-only managers use their descriptor-attested
+    /// checkout. Read-only CLI managers use only the primary pool backed by
+    /// their session-owned detached snapshot. The callback cannot supply or
+    /// switch a pathname.
+    pub(crate) fn attribution_read_transaction<T, E, F>(
+        &self,
+        operation: F,
+    ) -> Result<T, AttributionReadTransactionError<E>>
+    where
+        F: FnOnce(&mut SqliteConnection) -> Result<T, E>,
+    {
+        if self.attribution_pool.is_some() || self.attribution_connection_source.is_some() {
+            let mut checkout = self
+                .attribution_checkout()
+                .map_err(AttributionReadTransactionError::Authority)?;
+            checkout.transaction_with_authority(
+                AttributionReadTransactionError::Authority,
+                |connection, _authority| {
+                    operation(connection).map_err(AttributionReadTransactionError::Operation)
+                },
+            )
+        } else if self.readonly_attribution_snapshot.is_some() {
+            let mut connection = self.get_conn().map_err(|error| {
+                AttributionReadTransactionError::StorageUnavailable {
+                    detail: error.to_string(),
+                }
+            })?;
+            let query_only = diesel::sql_query("PRAGMA query_only")
+                .get_result::<QueryOnlyPragmaRow>(&mut connection)?
+                .query_only;
+            if query_only != 1 {
+                return Err(AttributionReadTransactionError::SnapshotIntegrity {
+                    detail: format!(
+                        "session-owned attribution snapshot has invalid query_only={query_only}"
+                    ),
+                });
+            }
+            connection.transaction(|connection| {
+                operation(connection).map_err(AttributionReadTransactionError::Operation)
+            })
+        } else {
+            let mut connection = self.get_conn().map_err(|error| {
+                AttributionReadTransactionError::StorageUnavailable {
+                    detail: error.to_string(),
+                }
+            })?;
+            connection.transaction(|connection| {
+                operation(connection).map_err(AttributionReadTransactionError::Operation)
+            })
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn retains_verified_selection_authority(&self) -> bool {
         self.selection_schema_authority.is_some()
@@ -1976,7 +2426,11 @@ impl DatabaseManager {
     /// 获取数据库连接
     pub fn get_conn(&self) -> Result<DbConnection, Box<dyn std::error::Error>> {
         let mut conn = self.pool.get()?;
-        configure_sqlite_connection(&mut conn)?;
+        if self.readonly_attribution_snapshot.is_some() {
+            configure_readonly_sqlite_connection(&mut conn)?;
+        } else {
+            configure_sqlite_connection(&mut conn)?;
+        }
         Ok(conn)
     }
 
@@ -3485,6 +3939,7 @@ mod tests {
                     pool: selection_pool,
                     attribution_pool: Some(attribution_pool),
                     attribution_connection_source: Some(Arc::clone(&source)),
+                    readonly_attribution_snapshot: None,
                     selection_connection_source: Some(source),
                     selection_schema_authority: None,
                 },

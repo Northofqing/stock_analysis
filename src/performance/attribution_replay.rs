@@ -7,6 +7,9 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone, Timelike};
+use diesel::prelude::RunQueryDsl;
+use diesel::sql_types::{BigInt, Double, Nullable, Text};
+use diesel::sqlite::{Sqlite, SqliteConnection};
 use rusqlite::{
     params_from_iter, types::Value, Connection, ErrorCode, OpenFlags, Transaction,
     TransactionBehavior,
@@ -36,7 +39,7 @@ use crate::data_gateway::{
     BenchmarkRequest, BenchmarkUnsupported, HS300_CANONICAL,
 };
 use crate::database::attribution_epochs::{
-    load_verified_epoch_fills_until, AttributionEpochReceipt, AttributionEpochStore,
+    load_selector_with_connection, load_verified_epoch_fills_until, AttributionEpochReceipt,
     AttributionEpochStoreError, ResolvedAttributionEpoch, VerifiedEpochFillSet,
 };
 use crate::database::attribution_reports::{
@@ -48,7 +51,7 @@ use crate::database::attribution_reports::{
 use crate::database::order_audit::{
     validate_canonical_order_audit_chain, CanonicalOrderAuditChainRow, CanonicalOrderAuditRow,
 };
-use crate::database::DatabaseManager;
+use crate::database::{AttributionReadTransactionError, DatabaseAuthorityError, DatabaseManager};
 use crate::trading::paper_lot_ledger::parse_paper_fill_timestamp;
 
 const STOCK_CLOSE_HASH_DOMAIN: &[u8] = b"BR251_STOCK_CLOSE_MANIFEST_V1\0";
@@ -1222,14 +1225,21 @@ struct PaperTradeSourceRow {
     requested_price: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, diesel::QueryableByName)]
 struct RawStockCloseRow {
+    #[diesel(sql_type = BigInt)]
     id: i64,
+    #[diesel(sql_type = Text)]
     code: String,
+    #[diesel(sql_type = Text)]
     date: String,
+    #[diesel(sql_type = Nullable<Double>)]
     close: Option<f64>,
+    #[diesel(sql_type = Nullable<Text>)]
     data_source: Option<String>,
+    #[diesel(sql_type = Text)]
     created_at: String,
+    #[diesel(sql_type = Text)]
     updated_at: String,
 }
 
@@ -1484,8 +1494,8 @@ impl AttributionReplayLoader {
         ))
     }
 
-    fn load_verified_epoch_tail_with_progress(
-        &self,
+    fn load_verified_epoch_tail_with_connection(
+        connection: &mut SqliteConnection,
         request: &AttributionReplayRequest,
         fills: Vec<ReplayFillEvidence>,
         fees: FeeEvidenceAvailability,
@@ -1499,55 +1509,12 @@ impl AttributionReplayLoader {
         validate_request(request).map_err(|error| {
             progress.failure(error, AttributionReplayLoadStage::StockClose, None)
         })?;
-        let canonical_database = self.database.canonicalize().map_err(|error| {
-            progress.failure(
-                AttributionReplayError::integrity(
-                    AttributionIntegrityFailure::DatabaseIdentity,
-                    format!("explicit database path cannot be resolved: {error}"),
-                ),
-                AttributionReplayLoadStage::StockClose,
-                None,
-            )
-        })?;
-        let before_metadata = canonical_database.metadata().map_err(|error| {
-            progress.failure(
-                AttributionReplayError::integrity(
-                    AttributionIntegrityFailure::DatabaseIdentity,
-                    format!("explicit database metadata unavailable: {error}"),
-                ),
-                AttributionReplayLoadStage::StockClose,
-                None,
-            )
-        })?;
-        if !before_metadata.is_file() {
-            return Err(progress.failure(
-                AttributionReplayError::integrity(
-                    AttributionIntegrityFailure::DatabaseIdentity,
-                    "explicit database path is not a regular file",
-                ),
-                AttributionReplayLoadStage::StockClose,
-                None,
-            ));
-        }
-        let expected_identity = FileIdentity::of(&before_metadata);
-        let mut connection = open_query_only_connection(&canonical_database).map_err(|error| {
-            progress.failure(error, AttributionReplayLoadStage::StockClose, None)
-        })?;
-        verify_main_database(&connection, &canonical_database, expected_identity).map_err(
-            |error| progress.failure(error, AttributionReplayLoadStage::StockClose, None),
-        )?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Deferred)
-            .map_err(|error| source_read_error("begin one read transaction", error))
-            .map_err(|error| {
-                progress.failure(error, AttributionReplayLoadStage::StockClose, None)
-            })?;
         let required_close_keys =
             derive_required_close_keys(&fills, &request.required_trading_dates).map_err(
                 |error| progress.failure(error, AttributionReplayLoadStage::StockClose, None),
             )?;
-        let raw_closes =
-            load_stock_closes(&transaction, &required_close_keys).map_err(|error| {
+        let raw_closes = load_stock_closes_with_connection(connection, &required_close_keys)
+            .map_err(|error| {
                 progress.failure(error, AttributionReplayLoadStage::StockClose, None)
             })?;
         let stock_closes =
@@ -1559,62 +1526,6 @@ impl AttributionReplayLoader {
                 )
             })?;
         progress.stock_close_manifest_hash = Some(stock_closes.manifest_hash().to_owned());
-        verify_transaction_main_database(&transaction, &canonical_database, expected_identity)
-            .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Finalize, None))?;
-        #[cfg(test)]
-        run_after_read_test_hook();
-        let during_identity = canonical_database
-            .metadata()
-            .map(|metadata| FileIdentity::of(&metadata))
-            .map_err(|error| {
-                progress.failure(
-                    AttributionReplayError::integrity(
-                        AttributionIntegrityFailure::DatabaseIdentity,
-                        format!("database identity re-check during read failed: {error}"),
-                    ),
-                    AttributionReplayLoadStage::Finalize,
-                    None,
-                )
-            })?;
-        if during_identity != expected_identity {
-            return Err(progress.failure(
-                AttributionReplayError::integrity(
-                    AttributionIntegrityFailure::DatabaseIdentity,
-                    "database file identity changed during read",
-                ),
-                AttributionReplayLoadStage::Finalize,
-                None,
-            ));
-        }
-        transaction
-            .commit()
-            .map_err(|error| source_read_error("finish read transaction", error))
-            .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Finalize, None))?;
-        verify_main_database(&connection, &canonical_database, expected_identity)
-            .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Finalize, None))?;
-        let after_identity = canonical_database
-            .metadata()
-            .map(|metadata| FileIdentity::of(&metadata))
-            .map_err(|error| {
-                progress.failure(
-                    AttributionReplayError::integrity(
-                        AttributionIntegrityFailure::DatabaseIdentity,
-                        format!("database identity re-check after read failed: {error}"),
-                    ),
-                    AttributionReplayLoadStage::Finalize,
-                    None,
-                )
-            })?;
-        if after_identity != expected_identity {
-            return Err(progress.failure(
-                AttributionReplayError::integrity(
-                    AttributionIntegrityFailure::DatabaseIdentity,
-                    "database file identity changed after read",
-                ),
-                AttributionReplayLoadStage::Finalize,
-                None,
-            ));
-        }
         Ok(AttributionReplayEvidence::issued(
             request.from,
             request.to,
@@ -1939,6 +1850,47 @@ fn load_stock_closes(
             rows.collect::<Result<Vec<_>, _>>()
                 .map_err(|error| source_read_error("decode exact stock close source", error))?,
         );
+    }
+    Ok(result)
+}
+
+fn load_stock_closes_with_connection(
+    connection: &mut SqliteConnection,
+    required_keys: &BTreeSet<(String, NaiveDate)>,
+) -> Result<Vec<RawStockCloseRow>, AttributionReplayError> {
+    let keys = required_keys.iter().collect::<Vec<_>>();
+    let mut result = Vec::new();
+    for chunk in keys.chunks(STOCK_CLOSE_KEYS_PER_QUERY) {
+        let mut query = diesel::sql_query(
+            "SELECT id,code,date,close,data_source,
+                    CAST(created_at AS TEXT) AS created_at,
+                    CAST(updated_at AS TEXT) AS updated_at
+             FROM stock_daily WHERE ",
+        )
+        .into_boxed::<Sqlite>();
+        for (index, (code, date)) in chunk.iter().enumerate() {
+            if index != 0 {
+                query = query.sql(" OR ");
+            }
+            query = query
+                .sql("(code = ")
+                .sql("?")
+                .bind::<Text, _>((*code).clone())
+                .sql(" AND date = ")
+                .sql("?")
+                .bind::<Text, _>(date.format("%Y-%m-%d").to_string())
+                .sql(")");
+        }
+        query = query.sql(" ORDER BY code ASC, date ASC, id ASC");
+        let rows = query
+            .load::<RawStockCloseRow>(connection)
+            .map_err(|error| {
+                AttributionReplayError::integrity(
+                    AttributionIntegrityFailure::SourceRead,
+                    format!("read exact stock close source: {error}"),
+                )
+            })?;
+        result.extend(rows);
     }
     Ok(result)
 }
@@ -4021,6 +3973,47 @@ struct PrepareFailure {
     evidence: FailureEvidenceSummary,
 }
 
+enum EpochReplaySnapshotFailure {
+    Epoch(AttributionEpochStoreError),
+    Replay(ReplayError),
+    Load(AttributionReplayLoadFailure),
+}
+
+fn map_epoch_replay_transaction_error(
+    error: AttributionReadTransactionError<EpochReplaySnapshotFailure>,
+) -> EpochReplaySnapshotFailure {
+    match error {
+        AttributionReadTransactionError::Operation(error) => error,
+        AttributionReadTransactionError::StorageUnavailable { detail }
+        | AttributionReadTransactionError::Transaction { detail } => {
+            EpochReplaySnapshotFailure::Epoch(AttributionEpochStoreError::Unavailable {
+                reason_code: "attribution_epoch_storage_unavailable",
+                retryable: true,
+                detail: format!("BR-255 epoch replay snapshot unavailable: {detail}"),
+            })
+        }
+        AttributionReadTransactionError::Authority(
+            DatabaseAuthorityError::DescriptorAttestationUnavailable { detail },
+        ) => EpochReplaySnapshotFailure::Epoch(AttributionEpochStoreError::Unavailable {
+            reason_code: "attribution_database_authority_unavailable",
+            retryable: false,
+            detail: format!("BR-255 epoch replay database authority unavailable: {detail}"),
+        }),
+        AttributionReadTransactionError::Authority(
+            DatabaseAuthorityError::DescriptorIntegrityFailed { detail },
+        ) => EpochReplaySnapshotFailure::Epoch(AttributionEpochStoreError::FailedIntegrity {
+            reason_code: "attribution_epoch_integrity_failed",
+            detail: format!("BR-255 epoch replay database authority changed: {detail}"),
+        }),
+        AttributionReadTransactionError::SnapshotIntegrity { detail } => {
+            EpochReplaySnapshotFailure::Epoch(AttributionEpochStoreError::FailedIntegrity {
+                reason_code: "attribution_epoch_integrity_failed",
+                detail: format!("BR-255 epoch replay snapshot integrity failed: {detail}"),
+            })
+        }
+    }
+}
+
 struct ScopedVerifiedEpochReplay {
     verified_fills: Vec<ReplayFillEvidence>,
     fills: Vec<ReplayFillEvidence>,
@@ -4286,111 +4279,97 @@ impl<'a> AttributionReplayRunner<'a> {
             target_to: calendar.target_to(),
             ..admitted.provisional_invocation.clone()
         };
-        let resolved_epoch = match &admitted.epoch {
-            AttributionEpochSelector::Legacy => ResolvedAttributionEpoch::Legacy,
-            selector => match AttributionEpochStore::new(self.database).load_selector(selector) {
-                Ok(epoch) => epoch,
-                Err(error) => {
-                    return Err(Box::new(PrepareFailure {
-                        error: map_epoch_store_error(error),
-                        invocation,
-                        evidence: summary,
-                    }));
-                }
-            },
-        };
-        summary.record_resolved_epoch(&resolved_epoch);
         let replay_request = AttributionReplayRequest {
             from: calendar.target_from(),
             to: calendar.target_to(),
             required_trading_dates: calendar.required_trading_dates().to_vec(),
             fee_ledger: self.fee_ledger.clone(),
         };
-        let loaded = match &resolved_epoch {
-            ResolvedAttributionEpoch::Legacy => self.loader.load_with_progress(&replay_request),
-            ResolvedAttributionEpoch::Epoch(receipt) => {
-                if calendar.target_from() < receipt.effective_trading_date {
-                    return Err(Box::new(PrepareFailure {
-                        error: ReplayError::new(
-                            ReplayErrorClass::FailedIntegrity,
-                            ReplayStage::Epoch,
-                            "attribution_epoch_range_before_effective",
-                            false,
-                        ),
-                        invocation,
-                        evidence: summary,
-                    }));
-                }
-                let mut conn = match self.database.get_conn() {
-                    Ok(conn) => conn,
-                    Err(error) => {
-                        return Err(Box::new(PrepareFailure {
-                            error: ReplayError::new(
-                                ReplayErrorClass::Unavailable,
-                                ReplayStage::Epoch,
-                                "attribution_epoch_storage_unavailable",
-                                true,
-                            )
-                            .with_typed_failure(
-                                "attribution_epoch_storage_unavailable",
-                                error.to_string().as_bytes(),
-                                None,
-                                None,
-                            ),
-                            invocation,
-                            evidence: summary,
-                        }));
-                    }
-                };
-                let verified = match load_verified_epoch_fills_until(
-                    &mut conn,
-                    &resolved_epoch,
-                    calendar.target_to(),
-                ) {
-                    Ok(verified) => verified,
-                    Err(error) => {
+        let loaded = match &admitted.epoch {
+            AttributionEpochSelector::Legacy => {
+                summary.record_resolved_epoch(&ResolvedAttributionEpoch::Legacy);
+                self.loader.load_with_progress(&replay_request)
+            }
+            selector => {
+                let snapshot = self
+                    .database
+                    .attribution_read_transaction(|connection| {
+                        let resolved = load_selector_with_connection(connection, selector)
+                            .map_err(EpochReplaySnapshotFailure::Epoch)?;
+                        summary.record_resolved_epoch(&resolved);
+                        let receipt = match &resolved {
+                            ResolvedAttributionEpoch::Epoch(receipt) => receipt,
+                            ResolvedAttributionEpoch::Legacy => {
+                                unreachable!("Active/Exact cannot resolve Legacy")
+                            }
+                        };
+                        if calendar.target_from() < receipt.effective_trading_date {
+                            return Err(EpochReplaySnapshotFailure::Epoch(
+                                AttributionEpochStoreError::FailedIntegrity {
+                                    reason_code: "attribution_epoch_range_before_effective",
+                                    detail: format!(
+                                        "BR-255 attribution range {}..={} precedes effective date {}",
+                                        calendar.target_from(),
+                                        calendar.target_to(),
+                                        receipt.effective_trading_date
+                                    ),
+                                },
+                            ));
+                        }
+                        let verified = load_verified_epoch_fills_until(
+                            connection,
+                            &resolved,
+                            calendar.target_to(),
+                        )
+                        .map_err(EpochReplaySnapshotFailure::Epoch)?;
+                        let scoped = scope_verified_epoch_replay(selector, receipt, &verified)
+                            .map_err(|error| {
+                                EpochReplaySnapshotFailure::Replay(map_attribution_error(
+                                    ReplayStage::Epoch,
+                                    error,
+                                ))
+                            })?;
+                        summary.record_scoped_epoch_replay(&scoped.epoch, &scoped.fills);
+                        let fees = validate_epoch_fee_ledger(
+                            self.fee_ledger.as_ref(),
+                            &scoped.verified_fills,
+                            &scoped.fills,
+                        )
+                        .map_err(|error| {
+                            let error =
+                                map_attribution_error(ReplayStage::TradeEvidence, error);
+                            summary.fee =
+                                FailureEvidenceState::Unavailable(error.failure_fingerprint);
+                            EpochReplaySnapshotFailure::Replay(error)
+                        })?;
+                        AttributionReplayLoader::load_verified_epoch_tail_with_connection(
+                            connection,
+                            &replay_request,
+                            scoped.fills,
+                            fees,
+                            scoped.epoch,
+                        )
+                        .map_err(EpochReplaySnapshotFailure::Load)
+                    })
+                    .map_err(map_epoch_replay_transaction_error);
+                match snapshot {
+                    Ok(evidence) => Ok(evidence),
+                    Err(EpochReplaySnapshotFailure::Load(failure)) => Err(failure),
+                    Err(EpochReplaySnapshotFailure::Epoch(error)) => {
                         return Err(Box::new(PrepareFailure {
                             error: map_epoch_store_error(error),
                             invocation,
                             evidence: summary,
                         }));
                     }
-                };
-                drop(conn);
-                let scoped = match scope_verified_epoch_replay(&admitted.epoch, receipt, &verified)
-                {
-                    Ok(scoped) => scoped,
-                    Err(error) => {
-                        return Err(Box::new(PrepareFailure {
-                            error: map_attribution_error(ReplayStage::Epoch, error),
-                            invocation,
-                            evidence: summary,
-                        }));
-                    }
-                };
-                summary.record_scoped_epoch_replay(&scoped.epoch, &scoped.fills);
-                let fees = match validate_epoch_fee_ledger(
-                    self.fee_ledger.as_ref(),
-                    &scoped.verified_fills,
-                    &scoped.fills,
-                ) {
-                    Ok(fees) => fees,
-                    Err(error) => {
-                        let error = map_attribution_error(ReplayStage::TradeEvidence, error);
-                        summary.fee = FailureEvidenceState::Unavailable(error.failure_fingerprint);
+                    Err(EpochReplaySnapshotFailure::Replay(error)) => {
                         return Err(Box::new(PrepareFailure {
                             error,
                             invocation,
                             evidence: summary,
                         }));
                     }
-                };
-                self.loader.load_verified_epoch_tail_with_progress(
-                    &replay_request,
-                    scoped.fills,
-                    fees,
-                    scoped.epoch,
-                )
+                }
             }
         };
         let evidence = match loaded {
@@ -5691,7 +5670,7 @@ mod tests {
         BatchEvidence, BenchmarkBar, BenchmarkBarTime, BenchmarkCapture, BenchmarkRange,
         BenchmarkRequest, GatewayBatch,
     };
-    use crate::database::attribution_epochs::EpochActivationRequest;
+    use crate::database::attribution_epochs::{AttributionEpochStore, EpochActivationRequest};
     use crate::database::attribution_reports::{
         AttributionDatabaseAccess, AttributionDatabaseSession,
     };
@@ -6510,6 +6489,76 @@ mod tests {
         drop(runner);
         drop(session);
         remove_database(path);
+    }
+
+    #[test]
+    fn active_and_exact_replay_never_mix_epoch_fills_with_loader_database_closes() {
+        let (epoch_path, session, receipt) =
+            activated_epoch_database("epoch_single_snapshot_manager");
+        append_epoch_source_fill(
+            &epoch_path,
+            3,
+            "buy",
+            12.0,
+            100,
+            "2026-08-24 01:31:05",
+            "2026-08-24T09:31:05+08:00",
+            "Breakout",
+        );
+        append_epoch_source_fill(
+            &epoch_path,
+            4,
+            "sell",
+            13.0,
+            100,
+            "2026-08-25 06:20:00",
+            "2026-08-25T14:20:00+08:00",
+            "ExitByRule",
+        );
+        let benchmark_day_manifests = [date("2026-08-24"), date("2026-08-25")]
+            .into_iter()
+            .enumerate()
+            .map(|(index, day)| {
+                append_test_benchmark_manifest(session.database(), day, index as f64)
+            })
+            .collect::<Vec<_>>();
+
+        let loader_path = test_database_path("epoch_single_snapshot_loader");
+        create_epoch_replay_schema(&Connection::open(&loader_path).unwrap());
+        append_epoch_close(&loader_path, 1, "2026-08-24", 12.0);
+        append_epoch_close(&loader_path, 2, "2026-08-25", 13.0);
+        let runner = AttributionReplayRunner::new_for_test(
+            session.database(),
+            AttributionReplayLoader::new(&loader_path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+        );
+        let request = |epoch| ReplayRequest {
+            mode: ReplayMode::Range {
+                from: date("2026-08-24"),
+                to: date("2026-08-25"),
+                invoked_at: shanghai_at("2026-08-25", 15, 30, 0),
+            },
+            epoch,
+            benchmark_day_manifests: benchmark_day_manifests.clone(),
+        };
+
+        for selector in [
+            AttributionEpochSelector::Active,
+            AttributionEpochSelector::Exact(receipt.epoch_id.clone()),
+        ] {
+            let error = runner
+                .preview(request(selector))
+                .expect_err("TEST_CODE epoch replay must not read closes from the loader database");
+            assert_eq!(error.class(), ReplayErrorClass::Unavailable);
+            assert_eq!(error.stage(), ReplayStage::TradeEvidence);
+            assert_eq!(error.code(), "stock_close_unavailable");
+        }
+
+        drop(runner);
+        drop(session);
+        remove_database(epoch_path);
+        remove_database(loader_path);
     }
 
     #[test]

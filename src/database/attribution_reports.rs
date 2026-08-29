@@ -319,15 +319,61 @@ impl AttributionDatabaseSession {
             ));
         }
 
+        let readonly_attribution_snapshot = match access {
+            AttributionDatabaseAccess::ReadOnly => {
+                let before = super::capture_readonly_attribution_source(&database_path).map_err(
+                    |detail| {
+                        failed_integrity(
+                            "attribution_database_snapshot_integrity_failed",
+                            format!(
+                                "BR-251 attribution read-only source cannot be captured: {detail}"
+                            ),
+                        )
+                    },
+                )?;
+                let snapshot =
+                    super::TemporaryAttributionSnapshot::create(&before).map_err(|detail| {
+                        unavailable(
+                            "attribution_database_unavailable",
+                            true,
+                            format!(
+                                "BR-251 private attribution snapshot cannot be created: {detail}"
+                            ),
+                        )
+                    })?;
+                let after = super::capture_readonly_attribution_source(&database_path).map_err(
+                    |detail| {
+                        failed_integrity(
+                            "attribution_database_snapshot_integrity_failed",
+                            format!(
+                                "BR-251 attribution read-only source cannot be re-verified: {detail}"
+                            ),
+                        )
+                    },
+                )?;
+                if after != before {
+                    return Err(failed_integrity(
+                        "attribution_database_snapshot_integrity_failed",
+                        "BR-251 attribution source main/WAL/SHM changed while copying the read-only snapshot",
+                    ));
+                }
+                Some(snapshot)
+            }
+            AttributionDatabaseAccess::AppendOnly => None,
+        };
         let database_url = match access {
             AttributionDatabaseAccess::ReadOnly => {
-                let mut url = url::Url::from_file_path(&database_path).map_err(|_| {
+                let snapshot = readonly_attribution_snapshot
+                    .as_ref()
+                    .expect("read-only access must retain its detached snapshot");
+                let mut url = url::Url::from_file_path(snapshot.database_path()).map_err(|_| {
                     failed_integrity(
                         "attribution_database_identity_invalid",
-                        "BR-251 attribution database path cannot form a SQLite URI",
+                        "BR-251 detached attribution snapshot path cannot form a SQLite URI",
                     )
                 })?;
                 url.query_pairs_mut().append_pair("mode", "ro");
+                url.query_pairs_mut().append_pair("immutable", "1");
                 url.to_string()
             }
             AttributionDatabaseAccess::AppendOnly => database_path
@@ -381,7 +427,15 @@ impl AttributionDatabaseSession {
                 (Some(pool), Some(source))
             }
         };
-        let pool = super::build_sqlite_pool_with_size(database_url, 1).map_err(|_| {
+        let pool = match access {
+            AttributionDatabaseAccess::ReadOnly => {
+                super::build_readonly_sqlite_pool_with_size(database_url, 1)
+            }
+            AttributionDatabaseAccess::AppendOnly => {
+                super::build_sqlite_pool_with_size(database_url, 1)
+            }
+        }
+        .map_err(|_| {
             unavailable(
                 "attribution_database_unavailable",
                 true,
@@ -392,6 +446,7 @@ impl AttributionDatabaseSession {
             pool,
             attribution_pool,
             attribution_connection_source,
+            readonly_attribution_snapshot,
             selection_connection_source: None,
             selection_schema_authority: None,
         };
@@ -500,6 +555,7 @@ pub(crate) fn test_runner_database_manager(path: &std::path::Path) -> DatabaseMa
         pool,
         attribution_pool: None,
         attribution_connection_source: None,
+        readonly_attribution_snapshot: None,
         selection_connection_source: None,
         selection_schema_authority: None,
     }
@@ -3602,6 +3658,7 @@ mod tests {
                     pool,
                     attribution_pool: None,
                     attribution_connection_source: None,
+                    readonly_attribution_snapshot: None,
                     selection_connection_source: None,
                     selection_schema_authority: None,
                 },

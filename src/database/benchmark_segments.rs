@@ -3031,6 +3031,7 @@ mod tests {
                     pool,
                     attribution_pool: None,
                     attribution_connection_source: None,
+                    readonly_attribution_snapshot: None,
                     selection_connection_source: None,
                     selection_schema_authority: None,
                 },

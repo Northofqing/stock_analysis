@@ -3010,7 +3010,7 @@ fn map_database_authority_error(error: DatabaseAuthorityError) -> AttributionEpo
     }
 }
 
-fn load_selector_with_connection(
+pub(crate) fn load_selector_with_connection(
     conn: &mut SqliteConnection,
     selector: &AttributionEpochSelector,
 ) -> Result<ResolvedAttributionEpoch, AttributionEpochStoreError> {
@@ -4617,6 +4617,7 @@ mod tests {
             pool: pool_b,
             attribution_pool: Some(attribution_pool_b),
             attribution_connection_source: Some(source_b),
+            readonly_attribution_snapshot: None,
             selection_connection_source: None,
             selection_schema_authority: None,
         };
@@ -4857,6 +4858,7 @@ mod tests {
                     pool,
                     attribution_pool,
                     attribution_connection_source,
+                    readonly_attribution_snapshot: None,
                     selection_connection_source: None,
                     selection_schema_authority: None,
                 },
@@ -4877,6 +4879,7 @@ mod tests {
                     pool,
                     attribution_pool: None,
                     attribution_connection_source: None,
+                    readonly_attribution_snapshot: None,
                     selection_connection_source: None,
                     selection_schema_authority: None,
                 },
@@ -4925,6 +4928,7 @@ mod tests {
                     pool,
                     attribution_pool: Some(attribution_pool),
                     attribution_connection_source: Some(source),
+                    readonly_attribution_snapshot: None,
                     selection_connection_source: None,
                     selection_schema_authority: None,
                 },
