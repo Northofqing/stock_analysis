@@ -899,11 +899,17 @@ fn validate_live_registered_descriptor_connection(
     source: &DescriptorSqliteSource,
     connection: &mut SqliteConnection,
 ) -> Result<SqliteFileIdentity, ConnectionManagerError> {
-    descriptor_integrity_latch(source).map_err(|error| sqlite_manager_error(error.to_string()))?;
-    validate_registered_descriptor_connection(source, connection).map_err(|error| {
-        let latched = latch_descriptor_integrity_failure(source, error.to_string());
-        sqlite_manager_error(latched.to_string())
-    })
+    registered_descriptor_connection_identity(source, connection)
+        .map_err(|error| sqlite_manager_error(error.to_string()))
+}
+
+fn registered_descriptor_connection_identity(
+    source: &DescriptorSqliteSource,
+    connection: &mut SqliteConnection,
+) -> Result<SqliteFileIdentity, DatabaseAuthorityError> {
+    descriptor_integrity_latch(source)?;
+    validate_registered_descriptor_connection(source, connection)
+        .map_err(|error| latch_descriptor_integrity_failure(source, error.to_string()))
 }
 
 fn registered_descriptor_connection_authority(
@@ -1667,6 +1673,18 @@ impl DatabaseManager {
         })
     }
 
+    fn selection_connection_bound_identity(
+        &self,
+        connection: &mut DbConnection,
+    ) -> Result<SqliteFileIdentity, DatabaseAuthorityError> {
+        let source = self.selection_connection_source.as_ref().ok_or_else(|| {
+            DatabaseAuthorityError::DescriptorAttestationUnavailable {
+                detail: "selection checkout has no descriptor connection source".into(),
+            }
+        })?;
+        registered_descriptor_connection_identity(source, &mut *connection)
+    }
+
     /// Proves the exact checkout used by an authoritative selection read is
     /// attached to the GlobalSchema owner's retained database inode.
     ///
@@ -1682,13 +1700,13 @@ impl DatabaseManager {
                 "authoritative selection reads require amended-schema descriptor authority",
             )
         })?;
+        let pinned = authority.pinned_database_for_pool()?;
+        let actual = self.selection_connection_bound_identity(connection)?;
         let source = self.selection_connection_source.as_ref().ok_or_else(|| {
             std::io::Error::other(
                 "authoritative selection reads require descriptor connection source",
             )
         })?;
-        let pinned = authority.pinned_database_for_pool()?;
-        let actual = validate_registered_descriptor_connection(source, &mut *connection)?;
         let evidence = current_descriptor_pool_evidence(source)?.ok_or_else(|| {
             std::io::Error::other("authoritative selection pool has no descriptor evidence")
         })?;
@@ -3298,6 +3316,46 @@ mod tests {
         }
     }
 
+    struct SharedSelectionAttributionDatabase {
+        manager: DatabaseManager,
+        _database: TemporarySqliteDatabase,
+    }
+
+    impl SharedSelectionAttributionDatabase {
+        fn new(prefix: &str) -> Self {
+            let database = TemporarySqliteDatabase::new(prefix);
+            let database_url = database.database_url();
+            let mut bootstrap = SqliteConnection::establish(&database_url)
+                .expect("create shared selection/attribution SQLite database");
+            let journal_mode = diesel::sql_query("PRAGMA journal_mode = WAL")
+                .get_result::<JournalModeRow>(&mut bootstrap)
+                .expect("enable WAL for shared selection/attribution database")
+                .journal_mode;
+            assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+            configure_sqlite_connection(&mut bootstrap)
+                .expect("configure shared selection/attribution database");
+            drop(bootstrap);
+
+            let (attribution_pool, source) = build_attested_sqlite_pool_with_size(&database.0, 1)
+                .expect("build no-self-heal attribution pool");
+            let selection_manager = SqliteConnectionManager {
+                source: SqliteConnectionSource::Descriptor(Arc::clone(&source)),
+            };
+            let selection_pool = build_sqlite_pool_from_manager(selection_manager, 1)
+                .expect("build checkout-validating selection pool");
+            Self {
+                manager: DatabaseManager {
+                    pool: selection_pool,
+                    attribution_pool: Some(attribution_pool),
+                    attribution_connection_source: Some(Arc::clone(&source)),
+                    selection_connection_source: Some(source),
+                    selection_schema_authority: None,
+                },
+                _database: database,
+            }
+        }
+    }
+
     // OnceCell 单例全局共享，测试共用同一路径避免竞态
     static TEST_DB: &str = "./test_data/test.db";
 
@@ -3345,6 +3403,83 @@ mod tests {
             .count;
             assert_eq!(count, 1, "attribution checkout is separately attested");
         }
+    }
+
+    #[test]
+    fn attribution_latch_blocks_an_already_checked_out_selection_connection() {
+        let database = SharedSelectionAttributionDatabase::new(
+            "selection_checkout_observes_attribution_latch",
+        );
+        let mut selection = database.manager.get_conn().unwrap();
+        database
+            .manager
+            .selection_connection_bound_identity(&mut selection)
+            .expect("selection checkout starts attested");
+        let mut attribution = database.manager.attribution_checkout().unwrap();
+        diesel::sql_query(format!(
+            "DROP TRIGGER {DESCRIPTOR_ATTESTATION_NO_UPDATE_TRIGGER}"
+        ))
+        .execute(attribution.connection_for_test())
+        .expect("remove attribution registration protection");
+        let first = attribution
+            .authority()
+            .expect_err("attribution drift must latch integrity");
+
+        let selection_error = database
+            .manager
+            .selection_connection_bound_identity(&mut selection)
+            .expect_err("already checked-out selection must observe the shared latch");
+        assert!(matches!(
+            selection_error,
+            DatabaseAuthorityError::DescriptorIntegrityFailed { .. }
+        ));
+        assert_eq!(selection_error.to_string(), first.to_string());
+    }
+
+    #[test]
+    fn selection_integrity_failure_latches_for_later_authority_operations() {
+        let database =
+            SharedSelectionAttributionDatabase::new("selection_checkout_sets_shared_latch");
+        let source = Arc::clone(
+            database
+                .manager
+                .selection_connection_source
+                .as_ref()
+                .expect("selection source"),
+        );
+        let mut selection = database.manager.get_conn().unwrap();
+        diesel::sql_query(format!(
+            "DROP TRIGGER {DESCRIPTOR_ATTESTATION_NO_DELETE_TRIGGER}"
+        ))
+        .execute(&mut selection)
+        .expect("remove selection registration protection");
+        let first = database
+            .manager
+            .selection_connection_bound_identity(&mut selection)
+            .expect_err("selection-time registration drift must fail integrity");
+        assert!(matches!(
+            first,
+            DatabaseAuthorityError::DescriptorIntegrityFailed { .. }
+        ));
+
+        let attribution_error = match database.manager.attribution_checkout() {
+            Ok(_) => panic!("later attribution checkout must observe selection latch"),
+            Err(error) => error,
+        };
+        assert_eq!(attribution_error.to_string(), first.to_string());
+        let later_selection = database
+            .manager
+            .selection_connection_bound_identity(&mut selection)
+            .expect_err("later selection validation must preserve first failure");
+        assert_eq!(later_selection.to_string(), first.to_string());
+
+        let connector = SqliteConnectionManager {
+            source: SqliteConnectionSource::Descriptor(source),
+        };
+        assert!(
+            connector.connect().is_err(),
+            "later descriptor connect must observe selection latch"
+        );
     }
 
     #[test]
