@@ -57,6 +57,22 @@ unsafe extern "C" {
 
 pub type DbConnection = PooledConnection<SqliteConnectionManager>;
 
+/// Opaque identity of the actual SQLite main/WAL/SHM objects used by one
+/// descriptor-attested checkout. Callers cannot construct this value from a
+/// pathname or from source contents.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DatabaseConnectionAuthority {
+    objects: Arc<PinnedSqliteObjectSet>,
+}
+
+impl std::fmt::Debug for DatabaseConnectionAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DatabaseConnectionAuthority")
+            .finish_non_exhaustive()
+    }
+}
+
 // ============================================================================
 // 数据库管理器 - 单例模式
 // ============================================================================
@@ -706,6 +722,30 @@ fn validate_registered_descriptor_connection(
     Ok(actual)
 }
 
+fn registered_descriptor_connection_authority(
+    source: &DescriptorSqliteSource,
+    connection: &mut SqliteConnection,
+) -> Result<DatabaseConnectionAuthority, ConnectionManagerError> {
+    validate_registered_descriptor_connection(source, connection)?;
+    let token = connection_attestation_token(connection)?;
+    let objects = {
+        let proofs = source
+            .connection_proofs
+            .lock()
+            .map_err(|_| sqlite_manager_error("descriptor connection-proof lock is poisoned"))?;
+        let proof = proofs.get(&token).ok_or_else(|| {
+            sqlite_manager_error("descriptor-bound connection has no registered fd attestation")
+        })?;
+        proof
+            .handles
+            .validate(&proof.expected_objects)
+            .map_err(descriptor_attestation_manager_error)?;
+        Arc::clone(&proof.expected_objects)
+    };
+    validate_registered_descriptor_connection(source, connection)?;
+    Ok(DatabaseConnectionAuthority { objects })
+}
+
 fn validate_retained_namespace(
     source: &DescriptorSqliteSource,
 ) -> Result<(), ConnectionManagerError> {
@@ -1017,12 +1057,39 @@ impl CustomizeConnection<SqliteConnection, ConnectionManagerError> for SqliteCon
     }
 }
 
-fn build_sqlite_pool(database_url: String) -> Result<DbPool, PoolError> {
-    build_sqlite_pool_with_size(database_url, SQLITE_POOL_SIZE)
-}
-
 fn build_sqlite_pool_with_size(database_url: String, max_size: u32) -> Result<DbPool, PoolError> {
     build_sqlite_pool_from_manager(SqliteConnectionManager::legacy(database_url), max_size)
+}
+
+fn build_attested_sqlite_pool_with_size(
+    database_path: &Path,
+    max_size: u32,
+) -> Result<(DbPool, Arc<DescriptorSqliteSource>), Box<dyn std::error::Error>> {
+    let parent_path = database_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let leaf = database_path.file_name().ok_or_else(|| {
+        std::io::Error::other("descriptor-attested SQLite database has no leaf component")
+    })?;
+    let parent = File::open(parent_path)?;
+    let root = parent.try_clone()?;
+    let database_file = openat_regular_for_attestation(&parent, leaf, "SQLite main database")?;
+    let pinned = PinnedSqliteDatabase::from_owner_descriptors(
+        root,
+        parent,
+        leaf.to_os_string(),
+        PathBuf::from(leaf),
+        database_file,
+    )?;
+    let manager = SqliteConnectionManager::descriptor(pinned)?;
+    let source = manager.descriptor_source().ok_or_else(|| {
+        DatabaseAuthorityError::DescriptorAttestationUnavailable {
+            detail: "descriptor manager did not retain its attestation source".into(),
+        }
+    })?;
+    let pool = build_sqlite_pool_from_manager(manager, max_size)?;
+    Ok((pool, source))
 }
 
 fn build_sqlite_pool_from_manager(
@@ -1142,7 +1209,8 @@ impl DatabaseManager {
         configure_sqlite_connection(&mut bootstrap_conn)?;
         drop(bootstrap_conn);
 
-        let pool = build_sqlite_pool(database_url)?;
+        let (pool, connection_source) =
+            build_attested_sqlite_pool_with_size(&path, SQLITE_POOL_SIZE)?;
 
         // 运行迁移
         let mut conn = pool.get()?;
@@ -1303,7 +1371,7 @@ impl DatabaseManager {
         drop(conn);
         let db = DatabaseManager {
             pool,
-            selection_connection_source: None,
+            selection_connection_source: Some(connection_source),
             selection_schema_authority: None,
         };
         DB_INSTANCE.set(db).map_err(|_| "数据库已经初始化")?;
@@ -1406,6 +1474,25 @@ impl DatabaseManager {
             parent: parent_identity,
             database: database_identity,
             database_relative_identity: database_relative_identity.to_owned(),
+        })
+    }
+
+    /// Attests the exact checked-out SQLite connection from registered
+    /// main/WAL/SHM descriptors. Managers without descriptor ownership fail
+    /// closed; there is deliberately no pathname fallback.
+    pub(crate) fn attribution_connection_authority(
+        &self,
+        connection: &mut SqliteConnection,
+    ) -> Result<DatabaseConnectionAuthority, DatabaseAuthorityError> {
+        let source = self.selection_connection_source.as_ref().ok_or_else(|| {
+            DatabaseAuthorityError::DescriptorAttestationUnavailable {
+                detail: "attribution checkout has no descriptor-attested connection source".into(),
+            }
+        })?;
+        registered_descriptor_connection_authority(source, connection).map_err(|error| {
+            DatabaseAuthorityError::DescriptorAttestationUnavailable {
+                detail: format!("attribution checkout descriptor proof failed: {error}"),
+            }
         })
     }
 

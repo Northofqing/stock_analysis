@@ -10,11 +10,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::database::attribution_epochs::{
-    AttributionDatabaseAuthority, AttributionEpochDailyBatchAppend,
-    AttributionEpochDailyFamilyAppend, AttributionEpochDailySourceBinding, AttributionEpochStore,
-    AttributionEpochStoreError,
+    AttributionEpochDailyBatchAppend, AttributionEpochDailyFamilyAppend,
+    AttributionEpochDailySourceBinding, AttributionEpochStore, AttributionEpochStoreError,
 };
-use crate::database::DatabaseManager;
+use crate::database::{DatabaseConnectionAuthority, DatabaseManager};
 use crate::performance::attribution_epoch::{
     canonical_exclusion_manifest_hash, canonical_legacy_carry_manifest_hash,
     canonical_scoped_fill_manifest_hash, scope_epoch_fills, AttributionEpochSelector,
@@ -373,6 +372,7 @@ pub struct AttributionEpochDailyEvidence {
     pub frozen_order_audit_high_water: i64,
     pub source_paper_trade_high_water: i64,
     pub source_order_audit_high_water: i64,
+    pub all_status_paper_manifest_hash: String,
     pub legacy_carry_manifest_hash: String,
     pub exclusion_manifest_hash: String,
     pub scoped_fill_manifest_hash: String,
@@ -388,7 +388,7 @@ pub struct AttributionEpochDailyEvidence {
 pub struct EpochDailyAttribution {
     daily: DailyAttribution,
     epoch: AttributionEpochDailyEvidence,
-    database_authority: AttributionDatabaseAuthority,
+    database_authority: DatabaseConnectionAuthority,
 }
 
 impl EpochDailyAttribution {
@@ -405,7 +405,7 @@ impl EpochDailyAttribution {
 pub struct EpochWindowAttribution {
     window: WindowAttribution,
     epoch: AttributionEpochDailyEvidence,
-    database_authority: AttributionDatabaseAuthority,
+    database_authority: DatabaseConnectionAuthority,
 }
 
 impl EpochWindowAttribution {
@@ -661,6 +661,7 @@ pub fn persist_epoch_daily(
                 frozen_order_audit_high_water: daily.epoch.frozen_order_audit_high_water,
                 source_paper_trade_high_water: daily.epoch.source_paper_trade_high_water,
                 source_order_audit_high_water: daily.epoch.source_order_audit_high_water,
+                all_status_paper_manifest_hash: daily.epoch.all_status_paper_manifest_hash.clone(),
                 legacy_carry_manifest_hash: daily.epoch.legacy_carry_manifest_hash.clone(),
                 verified_filled_manifest_hash: daily.epoch.verified_filled_manifest_hash.clone(),
                 verified_terminal_binding_manifest_hash: daily
@@ -704,7 +705,7 @@ fn load_scoped_epoch_rows(
     (
         Vec<AttributionFillRow>,
         AttributionEpochDailyEvidence,
-        AttributionDatabaseAuthority,
+        DatabaseConnectionAuthority,
     ),
     AttributionEpochRuntimeError,
 > {
@@ -767,6 +768,7 @@ fn load_scoped_epoch_rows(
             frozen_order_audit_high_water: receipt.order_audit_high_water,
             source_paper_trade_high_water: verified.current_paper_trade_high_water(),
             source_order_audit_high_water: verified.current_order_audit_high_water(),
+            all_status_paper_manifest_hash: verified.all_status_paper_manifest_hash().to_owned(),
             legacy_carry_manifest_hash: receipt.legacy_carry_manifest_hash,
             exclusion_manifest_hash,
             scoped_fill_manifest_hash,

@@ -6,7 +6,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, FixedOffset, Months, NaiveDate, NaiveTime, SecondsFormat, Utc};
@@ -15,7 +14,7 @@ use diesel::sql_types::{BigInt, Double, Integer, Nullable, Text};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::DatabaseManager;
+use super::{DatabaseConnectionAuthority, DatabaseManager};
 use crate::database::order_audit::{
     validate_canonical_order_audit_chain, CanonicalOrderAuditChainRow, CanonicalOrderAuditRow,
     AUDIT_CHAIN_GENESIS,
@@ -228,6 +227,7 @@ pub(crate) struct VerifiedEpochFillSet {
     carry: Vec<LegacyCarryPosition>,
     current_paper_trade_high_water: i64,
     current_order_audit_high_water: i64,
+    all_status_paper_manifest_hash: String,
     filled_manifest_hash: String,
     terminal_binding_manifest_hash: String,
     order_audit_tip_hash: String,
@@ -251,6 +251,10 @@ impl VerifiedEpochFillSet {
         self.current_order_audit_high_water
     }
 
+    pub(crate) fn all_status_paper_manifest_hash(&self) -> &str {
+        &self.all_status_paper_manifest_hash
+    }
+
     pub(crate) fn filled_manifest_hash(&self) -> &str {
         &self.filled_manifest_hash
     }
@@ -261,21 +265,6 @@ impl VerifiedEpochFillSet {
 
     pub(crate) fn order_audit_tip_hash(&self) -> &str {
         &self.order_audit_tip_hash
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct AttributionDatabaseAuthority {
-    canonical_main_path: PathBuf,
-    device: u64,
-    inode: u64,
-}
-
-impl std::fmt::Debug for AttributionDatabaseAuthority {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("AttributionDatabaseAuthority")
-            .finish_non_exhaustive()
     }
 }
 
@@ -407,7 +396,7 @@ pub(crate) struct AttributionEpochDailyBatchAppend {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AttributionEpochDailySourceBinding {
-    pub(crate) database_authority: AttributionDatabaseAuthority,
+    pub(crate) database_authority: DatabaseConnectionAuthority,
     pub(crate) epoch_id: String,
     pub(crate) receipt_hash: String,
     pub(crate) effective_date: NaiveDate,
@@ -416,6 +405,7 @@ pub(crate) struct AttributionEpochDailySourceBinding {
     pub(crate) frozen_order_audit_high_water: i64,
     pub(crate) source_paper_trade_high_water: i64,
     pub(crate) source_order_audit_high_water: i64,
+    pub(crate) all_status_paper_manifest_hash: String,
     pub(crate) legacy_carry_manifest_hash: String,
     pub(crate) verified_filled_manifest_hash: String,
     pub(crate) verified_terminal_binding_manifest_hash: String,
@@ -700,6 +690,7 @@ struct TerminalBindingManifestItem {
 struct FrozenSourceProjection {
     paper_trade_high_water: i64,
     order_audit_high_water: i64,
+    all_status_paper_manifest_hash: String,
     fills: Vec<FrozenPaperFill>,
     bindings: Vec<TerminalBindingManifestItem>,
     carry: Vec<LegacyCarryPosition>,
@@ -2069,7 +2060,12 @@ fn analyze_source_projection(
     let paper_rows = load_frozen_paper_rows(conn, paper_trade_high_water)?;
     let mut paper_ids = HashSet::with_capacity(paper_rows.len());
     let mut paper_plans = HashSet::with_capacity(paper_rows.len());
-    for row in &paper_rows {
+    for (index, row) in paper_rows.iter().enumerate() {
+        if index > 0 && paper_rows[index - 1].id >= row.id {
+            return Err(failed_integrity(
+                "BR-255 paper source identities are not strictly increasing",
+            ));
+        }
         if !paper_ids.insert(row.id) {
             return Err(failed_integrity(format!(
                 "BR-255 paper source contains duplicate id={}",
@@ -2090,6 +2086,10 @@ fn analyze_source_projection(
             )));
         }
     }
+    let all_status_paper_manifest_hash = hash_json(
+        b"BR255_ATTRIBUTION_ALL_STATUS_PAPER_MANIFEST_V1\0",
+        &paper_rows,
+    )?;
     let mut fills = paper_rows
         .into_iter()
         .filter(|row| row.status == "Filled")
@@ -2300,6 +2300,7 @@ fn analyze_source_projection(
     Ok(FrozenSourceProjection {
         paper_trade_high_water,
         order_audit_high_water,
+        all_status_paper_manifest_hash,
         fills,
         bindings,
         carry,
@@ -2731,63 +2732,19 @@ pub(crate) fn load_verified_epoch_fills_until(
         carry,
         current_paper_trade_high_water: source.paper_trade_high_water,
         current_order_audit_high_water: source.order_audit_high_water,
+        all_status_paper_manifest_hash: source.all_status_paper_manifest_hash,
         filled_manifest_hash: source.legacy_filled_manifest_hash,
         terminal_binding_manifest_hash: source.terminal_binding_manifest_hash,
         order_audit_tip_hash: source.order_audit_tip_hash,
     })
 }
 
-fn attribution_database_authority(
-    conn: &mut SqliteConnection,
-) -> Result<AttributionDatabaseAuthority, AttributionEpochStoreError> {
-    fn observe(
-        conn: &mut SqliteConnection,
-    ) -> Result<AttributionDatabaseAuthority, AttributionEpochStoreError> {
-        let main = diesel::sql_query("SELECT file FROM pragma_database_list WHERE name='main'")
-            .get_result::<DatabaseFileRow>(conn)
-            .map_err(AttributionEpochStoreError::from)?;
-        if main.file.trim().is_empty() {
-            return Err(failed_integrity(
-                "BR-255 attribution database main authority has no file identity",
-            ));
-        }
-        let canonical_main_path = std::fs::canonicalize(&main.file).map_err(|error| {
-            failed_integrity(format!(
-                "BR-255 canonicalize attribution database main authority: {error}"
-            ))
-        })?;
-        let metadata = canonical_main_path.metadata().map_err(|error| {
-            failed_integrity(format!(
-                "BR-255 stat attribution database main authority: {error}"
-            ))
-        })?;
-        if !metadata.is_file() {
-            return Err(failed_integrity(
-                "BR-255 attribution database main authority is not a regular file",
-            ));
-        }
-        Ok(AttributionDatabaseAuthority {
-            canonical_main_path,
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
-    }
-
-    let first = observe(conn)?;
-    let second = observe(conn)?;
-    if first != second {
-        return Err(failed_integrity(
-            "BR-255 attribution database main authority changed while observed",
-        ));
-    }
-    Ok(first)
-}
-
 fn validate_daily_source_binding(
+    database: &DatabaseManager,
     conn: &mut SqliteConnection,
     binding: &AttributionEpochDailySourceBinding,
 ) -> Result<(), AttributionEpochStoreError> {
-    if attribution_database_authority(conn)? != binding.database_authority {
+    if attribution_database_authority(database, conn)? != binding.database_authority {
         return Err(failed_integrity(
             "BR-255 epoch daily binding belongs to a different database authority",
         ));
@@ -2812,6 +2769,7 @@ fn validate_daily_source_binding(
     let verified = load_verified_epoch_fills_until(conn, &resolved, binding.cutoff_date)?;
     if verified.current_paper_trade_high_water() != binding.source_paper_trade_high_water
         || verified.current_order_audit_high_water() != binding.source_order_audit_high_water
+        || verified.all_status_paper_manifest_hash() != binding.all_status_paper_manifest_hash
         || verified.filled_manifest_hash() != binding.verified_filled_manifest_hash
         || verified.terminal_binding_manifest_hash()
             != binding.verified_terminal_binding_manifest_hash
@@ -2858,12 +2816,25 @@ fn validate_daily_source_binding(
             "BR-255 epoch daily scoped evidence changed after computation",
         ));
     }
-    if attribution_database_authority(conn)? != binding.database_authority {
+    if attribution_database_authority(database, conn)? != binding.database_authority {
         return Err(failed_integrity(
             "BR-255 epoch daily database authority changed during source validation",
         ));
     }
     Ok(())
+}
+
+fn attribution_database_authority(
+    database: &DatabaseManager,
+    conn: &mut SqliteConnection,
+) -> Result<DatabaseConnectionAuthority, AttributionEpochStoreError> {
+    database
+        .attribution_connection_authority(conn)
+        .map_err(|error| AttributionEpochStoreError::Unavailable {
+            reason_code: "attribution_database_authority_unavailable",
+            retryable: false,
+            detail: format!("BR-255 attribution checkout authority unavailable: {error}"),
+        })
 }
 
 fn load_selector_with_connection(
@@ -3314,7 +3285,7 @@ impl<'a> AttributionEpochStore<'a> {
         (
             AttributionEpochReceipt,
             VerifiedEpochFillSet,
-            AttributionDatabaseAuthority,
+            DatabaseConnectionAuthority,
         ),
         AttributionEpochStoreError,
     > {
@@ -3332,7 +3303,7 @@ impl<'a> AttributionEpochStore<'a> {
                     detail: format!("BR-255 epoch database connection unavailable: {error}"),
                 })?;
         conn.transaction::<_, AttributionEpochStoreError, _>(|conn| {
-            let database_authority = attribution_database_authority(conn)?;
+            let database_authority = attribution_database_authority(self.database, conn)?;
             let resolved = load_selector_with_connection(conn, &AttributionEpochSelector::Active)?;
             let receipt = match &resolved {
                 ResolvedAttributionEpoch::Epoch(receipt) => receipt.clone(),
@@ -3352,7 +3323,7 @@ impl<'a> AttributionEpochStore<'a> {
             #[cfg(test)]
             maybe_inject_active_verified_source_drift(conn)?;
             let verified = load_verified_epoch_fills_until(conn, &resolved, to)?;
-            if attribution_database_authority(conn)? != database_authority {
+            if attribution_database_authority(self.database, conn)? != database_authority {
                 return Err(failed_integrity(
                     "BR-255 attribution database authority changed during active source read",
                 ));
@@ -3563,7 +3534,7 @@ impl<'a> AttributionEpochStore<'a> {
                         "BR-255 verified epoch daily batch identity is inconsistent",
                     ));
                 }
-                validate_daily_source_binding(conn, source)?;
+                validate_daily_source_binding(self.database, conn, source)?;
             }
             let mut batch_receipts = Vec::with_capacity(prepared.len());
             #[cfg(test)]
@@ -3642,7 +3613,8 @@ impl<'a> AttributionEpochStore<'a> {
             }
             validate_all(conn).map_err(map_integrity)?;
             if let Some(source) = source.as_ref() {
-                if attribution_database_authority(conn)? != source.database_authority {
+                if attribution_database_authority(self.database, conn)? != source.database_authority
+                {
                     return Err(failed_integrity(
                         "BR-255 epoch daily database authority changed during batch append",
                     ));
@@ -3676,7 +3648,7 @@ mod tests {
     }
 
     fn activated_test_database() -> (TestDatabase, AttributionEpochReceipt) {
-        let database = TestDatabase::new();
+        let database = TestDatabase::attested();
         install_activation_source(&database.manager);
         let receipt = AttributionEpochStore::new(&database.manager)
             .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
@@ -3743,7 +3715,7 @@ mod tests {
 
     #[test]
     fn daily_compute_without_active_epoch_fails_before_legacy_source_read() {
-        let database = TestDatabase::new();
+        let database = TestDatabase::attested();
         let error = crate::performance::attribution::compute_epoch_daily(
             &database.manager,
             NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
@@ -4097,6 +4069,54 @@ mod tests {
     }
 
     #[test]
+    fn daily_persist_rejects_valid_non_filled_content_mutation_without_highwater_change() {
+        for status in ["NotFilled", "Invalidated"] {
+            let database = activated_test_database().0;
+            append_non_filled_paper(&database.manager, 3, status);
+            let daily = crate::performance::attribution::compute_epoch_daily(
+                &database.manager,
+                NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+                &HashMap::new(),
+            )
+            .expect("TEST_CODE computed after valid non-filled row");
+            let mut conn = database.manager.get_conn().unwrap();
+            diesel::sql_query(
+                "UPDATE paper_trades
+                 SET not_fill_reason='TEST_CODE another valid rejection reason',
+                     updated_at='2026-08-31 04:00:02'
+                 WHERE id=3",
+            )
+            .execute(&mut conn)
+            .unwrap();
+            drop(conn);
+
+            let error =
+                crate::performance::attribution::persist_epoch_daily(&database.manager, &daily)
+                    .expect_err("TEST_CODE all-status content drift must reject persist");
+            assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
+            assert_daily_storage_pristine(&database.manager);
+        }
+    }
+
+    #[test]
+    fn daily_persist_rejects_valid_non_filled_gap_insert_below_existing_highwater() {
+        let database = activated_test_database().0;
+        append_non_filled_paper(&database.manager, 4, "NotFilled");
+        let daily = crate::performance::attribution::compute_epoch_daily(
+            &database.manager,
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+            &HashMap::new(),
+        )
+        .expect("TEST_CODE computed with an unused paper identity below MAX(id)");
+        append_non_filled_paper(&database.manager, 3, "Invalidated");
+
+        let error = crate::performance::attribution::persist_epoch_daily(&database.manager, &daily)
+            .expect_err("TEST_CODE below-highwater insertion must reject persist");
+        assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
+        assert_daily_storage_pristine(&database.manager);
+    }
+
+    #[test]
     fn daily_persist_rejects_an_identical_but_distinct_database_authority() {
         let database_a = activated_test_database().0;
         let daily = crate::performance::attribution::compute_epoch_daily(
@@ -4118,8 +4138,104 @@ mod tests {
     }
 
     #[test]
+    fn daily_authority_is_checkout_attested_and_rejects_byte_identical_path_replacement() {
+        let database_a = TestDatabase::with_wal_options(2, true);
+        install_activation_source(&database_a.manager);
+        AttributionEpochStore::new(&database_a.manager)
+            .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
+            .expect("TEST_CODE active epoch in database A");
+
+        let mut first = database_a.manager.get_conn().unwrap();
+        let first_authority = database_a
+            .manager
+            .attribution_connection_authority(&mut first)
+            .expect("TEST_CODE first checkout authority");
+        let mut second = database_a.manager.get_conn().unwrap();
+        let second_authority = database_a
+            .manager
+            .attribution_connection_authority(&mut second)
+            .expect("TEST_CODE second checkout authority");
+        assert_eq!(first_authority, second_authority);
+        drop(second);
+        diesel::sql_query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&mut first)
+            .expect("TEST_CODE checkpoint database A before byte copy");
+        drop(first);
+
+        let replacement_copy = database_a.path.with_extension("replacement-copy.sqlite");
+        std::fs::copy(&database_a.path, &replacement_copy)
+            .expect("TEST_CODE copy byte-identical database B");
+        assert_eq!(
+            std::fs::read(&database_a.path).unwrap(),
+            std::fs::read(&replacement_copy).unwrap()
+        );
+        let daily = crate::performance::attribution::compute_epoch_daily(
+            &database_a.manager,
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+            &HashMap::new(),
+        )
+        .expect("TEST_CODE computed from attested database A");
+        let mut detached_checkout = database_a.manager.get_conn().unwrap();
+
+        let detached_main = database_a.path.with_extension("detached-a.sqlite");
+        std::fs::rename(&database_a.path, &detached_main)
+            .expect("TEST_CODE detach open database A main");
+        for suffix in ["-wal", "-shm"] {
+            let source = sqlite_sidecar_path(&database_a.path, suffix);
+            if source.exists() {
+                std::fs::rename(&source, sqlite_sidecar_path(&detached_main, suffix))
+                    .expect("TEST_CODE detach open database A sidecar");
+            }
+        }
+        std::fs::copy(&replacement_copy, &database_a.path)
+            .expect("TEST_CODE install byte-identical database B at original pathname");
+        assert_eq!(
+            std::fs::read(&database_a.path).unwrap(),
+            std::fs::read(&replacement_copy).unwrap()
+        );
+
+        let mut bootstrap_b = SqliteConnection::establish(&database_a.path.to_string_lossy())
+            .expect("TEST_CODE open replacement database B");
+        let journal_mode = diesel::sql_query("PRAGMA journal_mode = WAL")
+            .get_result::<super::super::JournalModeRow>(&mut bootstrap_b)
+            .unwrap()
+            .journal_mode;
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        drop(bootstrap_b);
+        let (pool_b, source_b) =
+            super::super::build_attested_sqlite_pool_with_size(&database_a.path, 1)
+                .expect("TEST_CODE attested replacement database B pool");
+        let manager_b = DatabaseManager {
+            pool: pool_b,
+            selection_connection_source: Some(source_b),
+            selection_schema_authority: None,
+        };
+
+        database_a
+            .manager
+            .attribution_connection_authority(&mut detached_checkout)
+            .expect_err("TEST_CODE detached A checkout must fail closed after namespace drift");
+        let error = crate::performance::attribution::persist_epoch_daily(&manager_b, &daily)
+            .expect_err("TEST_CODE replacement B must reject detached A evidence");
+        assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
+        assert_daily_storage_pristine(&manager_b);
+
+        drop(detached_checkout);
+        drop(manager_b);
+        drop(database_a);
+        for path in [
+            replacement_copy,
+            detached_main.clone(),
+            sqlite_sidecar_path(&detached_main, "-wal"),
+            sqlite_sidecar_path(&detached_main, "-shm"),
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
     fn daily_persist_reuses_identical_payload_appends_revision_and_preserves_legacy_rows() {
-        let database = TestDatabase::new();
+        let database = TestDatabase::attested();
         install_activation_source(&database.manager);
         let mut conn = database.manager.get_conn().unwrap();
         conn.batch_execute(
@@ -4236,6 +4352,10 @@ mod tests {
             Self::with_options(1, true)
         }
 
+        fn attested() -> Self {
+            Self::with_wal_options(1, true)
+        }
+
         fn with_options(pool_size: u32, install_epoch_schema: bool) -> Self {
             Self::with_journal_options(pool_size, install_epoch_schema, false)
         }
@@ -4274,8 +4394,16 @@ mod tests {
                     .expect("TEST_CODE bootstrap SQLite configuration");
                 drop(bootstrap);
             }
-            let pool = super::super::build_sqlite_pool_with_size(database_url, pool_size)
-                .expect("TEST_CODE isolated SQLite pool");
+            let (pool, selection_connection_source) = if production_wal {
+                let (pool, source) =
+                    super::super::build_attested_sqlite_pool_with_size(&path, pool_size)
+                        .expect("TEST_CODE descriptor-attested SQLite pool");
+                (pool, Some(source))
+            } else {
+                let pool = super::super::build_sqlite_pool_with_size(database_url, pool_size)
+                    .expect("TEST_CODE isolated SQLite pool");
+                (pool, None)
+            };
             if install_epoch_schema {
                 let mut conn = pool.get().expect("TEST_CODE schema connection");
                 create_schema(&mut conn).expect("TEST_CODE epoch schema");
@@ -4283,7 +4411,7 @@ mod tests {
             Self {
                 manager: DatabaseManager {
                     pool,
-                    selection_connection_source: None,
+                    selection_connection_source,
                     selection_schema_authority: None,
                 },
                 path: path.clone(),
@@ -4331,12 +4459,20 @@ mod tests {
                 .execute(&mut source_conn)
                 .expect("TEST_CODE exact SQLite content snapshot");
             drop(source_conn);
-            let pool = super::super::build_sqlite_pool_with_size(database_url, 1)
-                .expect("TEST_CODE snapshot SQLite pool");
+            let mut bootstrap = SqliteConnection::establish(&path.to_string_lossy())
+                .expect("TEST_CODE snapshot WAL bootstrap");
+            let journal_mode = diesel::sql_query("PRAGMA journal_mode = WAL")
+                .get_result::<super::super::JournalModeRow>(&mut bootstrap)
+                .expect("TEST_CODE snapshot WAL mode")
+                .journal_mode;
+            assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+            drop(bootstrap);
+            let (pool, source) = super::super::build_attested_sqlite_pool_with_size(&path, 1)
+                .expect("TEST_CODE snapshot descriptor-attested SQLite pool");
             Self {
                 manager: DatabaseManager {
                     pool,
-                    selection_connection_source: None,
+                    selection_connection_source: Some(source),
                     selection_schema_authority: None,
                 },
                 path: path.clone(),
@@ -4563,11 +4699,12 @@ mod tests {
             "INSERT INTO paper_trades
              (id,plan_id,code,name,direction,price,quantity,status,fill_price,not_fill_reason,
               virtual_reason,account_mode,data_mode,ts,updated_at)
-             VALUES (?,'TEST_CODE_PLAN_NON_FILLED','TEST_CODE_600001','TEST_CODE company',
+             VALUES (?,?,'TEST_CODE_600001','TEST_CODE company',
                      'buy',10.0,100,?,NULL,'TEST_CODE rejected','TEST_CODE late status',
                      'Normal','Full','2026-08-31 04:00:00','2026-08-31 04:00:01')",
         )
         .bind::<BigInt, _>(id)
+        .bind::<Text, _>(format!("TEST_CODE_PLAN_NON_FILLED_{id}"))
         .bind::<Text, _>(status)
         .execute(&mut conn)
         .unwrap();
