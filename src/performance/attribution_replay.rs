@@ -6728,8 +6728,7 @@ mod tests {
         let unresolved_hash = unresolved.source_summary_hash(&error);
         assert_ne!(legacy_hash, unresolved_hash);
 
-        unresolved
-            .record_resolved_epoch(&ResolvedAttributionEpoch::Epoch(Box::new(receipt.clone())));
+        unresolved.record_resolved_epoch(&ResolvedAttributionEpoch::Epoch(receipt.clone()));
         let resolved_hash = unresolved.source_summary_hash(&error);
         assert_ne!(unresolved_hash, resolved_hash);
         let epoch = AttributionEpochReplayEvidence::resolved(

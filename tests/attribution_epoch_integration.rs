@@ -405,7 +405,7 @@ fn activation_boundary_keeps_real_legacy_t_plus_one_fixture_and_active_exact_fai
         AttributionEpochStore::new(database)
             .load_selector(&AttributionEpochSelector::Active),
         Ok(stock_analysis::database::attribution_epochs::ResolvedAttributionEpoch::Epoch(found))
-            if found.as_ref() == &receipt
+            if found == receipt
     ));
 
     // The tamper is constrained to this one temporary TEST_CODE database. A
