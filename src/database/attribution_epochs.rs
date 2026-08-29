@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, FixedOffset, Months, NaiveDate, NaiveTime, SecondsFormat, Utc};
@@ -225,6 +226,8 @@ impl VerifiedEpochFill {
 pub(crate) struct VerifiedEpochFillSet {
     fills: Vec<VerifiedEpochFill>,
     carry: Vec<LegacyCarryPosition>,
+    current_paper_trade_high_water: i64,
+    current_order_audit_high_water: i64,
     filled_manifest_hash: String,
     terminal_binding_manifest_hash: String,
     order_audit_tip_hash: String,
@@ -240,6 +243,14 @@ impl VerifiedEpochFillSet {
         &self.carry
     }
 
+    pub(crate) fn current_paper_trade_high_water(&self) -> i64 {
+        self.current_paper_trade_high_water
+    }
+
+    pub(crate) fn current_order_audit_high_water(&self) -> i64 {
+        self.current_order_audit_high_water
+    }
+
     pub(crate) fn filled_manifest_hash(&self) -> &str {
         &self.filled_manifest_hash
     }
@@ -250,6 +261,21 @@ impl VerifiedEpochFillSet {
 
     pub(crate) fn order_audit_tip_hash(&self) -> &str {
         &self.order_audit_tip_hash
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct AttributionDatabaseAuthority {
+    canonical_main_path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl std::fmt::Debug for AttributionDatabaseAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AttributionDatabaseAuthority")
+            .finish_non_exhaustive()
     }
 }
 
@@ -381,12 +407,15 @@ pub(crate) struct AttributionEpochDailyBatchAppend {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AttributionEpochDailySourceBinding {
+    pub(crate) database_authority: AttributionDatabaseAuthority,
     pub(crate) epoch_id: String,
     pub(crate) receipt_hash: String,
     pub(crate) effective_date: NaiveDate,
     pub(crate) cutoff_date: NaiveDate,
-    pub(crate) paper_trade_high_water: i64,
-    pub(crate) order_audit_high_water: i64,
+    pub(crate) frozen_paper_trade_high_water: i64,
+    pub(crate) frozen_order_audit_high_water: i64,
+    pub(crate) source_paper_trade_high_water: i64,
+    pub(crate) source_order_audit_high_water: i64,
     pub(crate) legacy_carry_manifest_hash: String,
     pub(crate) verified_filled_manifest_hash: String,
     pub(crate) verified_terminal_binding_manifest_hash: String,
@@ -2700,16 +2729,69 @@ pub(crate) fn load_verified_epoch_fills_until(
     Ok(VerifiedEpochFillSet {
         fills,
         carry,
+        current_paper_trade_high_water: source.paper_trade_high_water,
+        current_order_audit_high_water: source.order_audit_high_water,
         filled_manifest_hash: source.legacy_filled_manifest_hash,
         terminal_binding_manifest_hash: source.terminal_binding_manifest_hash,
         order_audit_tip_hash: source.order_audit_tip_hash,
     })
 }
 
+fn attribution_database_authority(
+    conn: &mut SqliteConnection,
+) -> Result<AttributionDatabaseAuthority, AttributionEpochStoreError> {
+    fn observe(
+        conn: &mut SqliteConnection,
+    ) -> Result<AttributionDatabaseAuthority, AttributionEpochStoreError> {
+        let main = diesel::sql_query("SELECT file FROM pragma_database_list WHERE name='main'")
+            .get_result::<DatabaseFileRow>(conn)
+            .map_err(AttributionEpochStoreError::from)?;
+        if main.file.trim().is_empty() {
+            return Err(failed_integrity(
+                "BR-255 attribution database main authority has no file identity",
+            ));
+        }
+        let canonical_main_path = std::fs::canonicalize(&main.file).map_err(|error| {
+            failed_integrity(format!(
+                "BR-255 canonicalize attribution database main authority: {error}"
+            ))
+        })?;
+        let metadata = canonical_main_path.metadata().map_err(|error| {
+            failed_integrity(format!(
+                "BR-255 stat attribution database main authority: {error}"
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(failed_integrity(
+                "BR-255 attribution database main authority is not a regular file",
+            ));
+        }
+        Ok(AttributionDatabaseAuthority {
+            canonical_main_path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    let first = observe(conn)?;
+    let second = observe(conn)?;
+    if first != second {
+        return Err(failed_integrity(
+            "BR-255 attribution database main authority changed while observed",
+        ));
+    }
+    Ok(first)
+}
+
 fn validate_daily_source_binding(
     conn: &mut SqliteConnection,
     binding: &AttributionEpochDailySourceBinding,
 ) -> Result<(), AttributionEpochStoreError> {
+    if attribution_database_authority(conn)? != binding.database_authority {
+        return Err(failed_integrity(
+            "BR-255 epoch daily binding belongs to a different database authority",
+        ));
+    }
     let active = match load_selector_with_connection(conn, &AttributionEpochSelector::Active)? {
         ResolvedAttributionEpoch::Epoch(receipt) => receipt,
         ResolvedAttributionEpoch::Legacy => unreachable!("active selector cannot resolve Legacy"),
@@ -2718,8 +2800,8 @@ fn validate_daily_source_binding(
         || active.epoch_id != binding.epoch_id
         || active.receipt_hash != binding.receipt_hash
         || active.effective_trading_date != binding.effective_date
-        || active.paper_trade_high_water != binding.paper_trade_high_water
-        || active.order_audit_high_water != binding.order_audit_high_water
+        || active.paper_trade_high_water != binding.frozen_paper_trade_high_water
+        || active.order_audit_high_water != binding.frozen_order_audit_high_water
         || active.legacy_carry_manifest_hash != binding.legacy_carry_manifest_hash
     {
         return Err(failed_integrity(
@@ -2728,7 +2810,9 @@ fn validate_daily_source_binding(
     }
     let resolved = ResolvedAttributionEpoch::Epoch(active.clone());
     let verified = load_verified_epoch_fills_until(conn, &resolved, binding.cutoff_date)?;
-    if verified.filled_manifest_hash() != binding.verified_filled_manifest_hash
+    if verified.current_paper_trade_high_water() != binding.source_paper_trade_high_water
+        || verified.current_order_audit_high_water() != binding.source_order_audit_high_water
+        || verified.filled_manifest_hash() != binding.verified_filled_manifest_hash
         || verified.terminal_binding_manifest_hash()
             != binding.verified_terminal_binding_manifest_hash
         || verified.order_audit_tip_hash() != binding.verified_order_audit_tip_hash
@@ -2772,6 +2856,11 @@ fn validate_daily_source_binding(
     {
         return Err(failed_integrity(
             "BR-255 epoch daily scoped evidence changed after computation",
+        ));
+    }
+    if attribution_database_authority(conn)? != binding.database_authority {
+        return Err(failed_integrity(
+            "BR-255 epoch daily database authority changed during source validation",
         ));
     }
     Ok(())
@@ -3221,7 +3310,14 @@ impl<'a> AttributionEpochStore<'a> {
         &self,
         from: NaiveDate,
         to: NaiveDate,
-    ) -> Result<(AttributionEpochReceipt, VerifiedEpochFillSet), AttributionEpochStoreError> {
+    ) -> Result<
+        (
+            AttributionEpochReceipt,
+            VerifiedEpochFillSet,
+            AttributionDatabaseAuthority,
+        ),
+        AttributionEpochStoreError,
+    > {
         if from > to {
             return Err(failed_integrity(
                 "BR-255 epoch attribution source range is reversed",
@@ -3236,6 +3332,7 @@ impl<'a> AttributionEpochStore<'a> {
                     detail: format!("BR-255 epoch database connection unavailable: {error}"),
                 })?;
         conn.transaction::<_, AttributionEpochStoreError, _>(|conn| {
+            let database_authority = attribution_database_authority(conn)?;
             let resolved = load_selector_with_connection(conn, &AttributionEpochSelector::Active)?;
             let receipt = match &resolved {
                 ResolvedAttributionEpoch::Epoch(receipt) => receipt.clone(),
@@ -3255,7 +3352,12 @@ impl<'a> AttributionEpochStore<'a> {
             #[cfg(test)]
             maybe_inject_active_verified_source_drift(conn)?;
             let verified = load_verified_epoch_fills_until(conn, &resolved, to)?;
-            Ok((receipt, verified))
+            if attribution_database_authority(conn)? != database_authority {
+                return Err(failed_integrity(
+                    "BR-255 attribution database authority changed during active source read",
+                ));
+            }
+            Ok((receipt, verified, database_authority))
         })
     }
 
@@ -3539,6 +3641,13 @@ impl<'a> AttributionEpochStore<'a> {
                 }
             }
             validate_all(conn).map_err(map_integrity)?;
+            if let Some(source) = source.as_ref() {
+                if attribution_database_authority(conn)? != source.database_authority {
+                    return Err(failed_integrity(
+                        "BR-255 epoch daily database authority changed during batch append",
+                    ));
+                }
+            }
             Ok(AttributionEpochDailyBatchReceipt {
                 epoch_id: epoch_id.clone(),
                 date,
@@ -3968,6 +4077,47 @@ mod tests {
     }
 
     #[test]
+    fn daily_persist_rejects_late_non_filled_paper_highwater_without_audit_change() {
+        for status in ["NotFilled", "Invalidated"] {
+            let database = activated_test_database().0;
+            let daily = crate::performance::attribution::compute_epoch_daily(
+                &database.manager,
+                NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+                &HashMap::new(),
+            )
+            .expect("TEST_CODE computed before all-status source drift");
+            append_non_filled_paper(&database.manager, 3, status);
+
+            let error =
+                crate::performance::attribution::persist_epoch_daily(&database.manager, &daily)
+                    .expect_err("TEST_CODE all-status paper highwater drift must reject persist");
+            assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
+            assert_daily_storage_pristine(&database.manager);
+        }
+    }
+
+    #[test]
+    fn daily_persist_rejects_an_identical_but_distinct_database_authority() {
+        let database_a = activated_test_database().0;
+        let daily = crate::performance::attribution::compute_epoch_daily(
+            &database_a.manager,
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+            &HashMap::new(),
+        )
+        .expect("TEST_CODE computed from database A");
+        let database_b = TestDatabase::snapshot_of(&database_a);
+
+        let error =
+            crate::performance::attribution::persist_epoch_daily(&database_b.manager, &daily)
+                .expect_err("TEST_CODE database B must not accept database A evidence");
+        assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
+        assert_daily_storage_pristine(&database_b.manager);
+
+        crate::performance::attribution::persist_epoch_daily(&database_a.manager, &daily)
+            .expect("TEST_CODE originating database authority remains accepted");
+    }
+
+    #[test]
     fn daily_persist_reuses_identical_payload_appends_revision_and_preserves_legacy_rows() {
         let database = TestDatabase::new();
         install_activation_source(&database.manager);
@@ -4158,6 +4308,39 @@ mod tests {
                 _cleanup: TestDatabaseCleanup {
                     path: PathBuf::from(":memory:"),
                 },
+            }
+        }
+
+        fn snapshot_of(source: &Self) -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("TEST_CODE clock")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "TEST_CODE_attribution_epochs_snapshot_{}_{}.sqlite",
+                std::process::id(),
+                nonce
+            ));
+            let database_url = path.to_string_lossy().into_owned();
+            let mut source_conn = source
+                .manager
+                .get_conn()
+                .expect("TEST_CODE source snapshot");
+            diesel::sql_query("VACUUM INTO ?")
+                .bind::<Text, _>(&database_url)
+                .execute(&mut source_conn)
+                .expect("TEST_CODE exact SQLite content snapshot");
+            drop(source_conn);
+            let pool = super::super::build_sqlite_pool_with_size(database_url, 1)
+                .expect("TEST_CODE snapshot SQLite pool");
+            Self {
+                manager: DatabaseManager {
+                    pool,
+                    selection_connection_source: None,
+                    selection_schema_authority: None,
+                },
+                path: path.clone(),
+                _cleanup: TestDatabaseCleanup { path },
             }
         }
     }
@@ -4370,6 +4553,22 @@ mod tests {
         .bind::<Text, _>(&previous)
         .bind::<Text, _>(&record_hash)
         .bind::<Text, _>(&audit.created_at)
+        .execute(&mut conn)
+        .unwrap();
+    }
+
+    fn append_non_filled_paper(manager: &DatabaseManager, id: i64, status: &str) {
+        let mut conn = manager.get_conn().unwrap();
+        diesel::sql_query(
+            "INSERT INTO paper_trades
+             (id,plan_id,code,name,direction,price,quantity,status,fill_price,not_fill_reason,
+              virtual_reason,account_mode,data_mode,ts,updated_at)
+             VALUES (?,'TEST_CODE_PLAN_NON_FILLED','TEST_CODE_600001','TEST_CODE company',
+                     'buy',10.0,100,?,NULL,'TEST_CODE rejected','TEST_CODE late status',
+                     'Normal','Full','2026-08-31 04:00:00','2026-08-31 04:00:01')",
+        )
+        .bind::<BigInt, _>(id)
+        .bind::<Text, _>(status)
         .execute(&mut conn)
         .unwrap();
     }

@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::database::attribution_epochs::{
-    AttributionEpochDailyBatchAppend, AttributionEpochDailyFamilyAppend,
-    AttributionEpochDailySourceBinding, AttributionEpochStore, AttributionEpochStoreError,
+    AttributionDatabaseAuthority, AttributionEpochDailyBatchAppend,
+    AttributionEpochDailyFamilyAppend, AttributionEpochDailySourceBinding, AttributionEpochStore,
+    AttributionEpochStoreError,
 };
 use crate::database::DatabaseManager;
 use crate::performance::attribution_epoch::{
@@ -368,8 +369,10 @@ pub struct AttributionEpochDailyEvidence {
     pub receipt_hash: String,
     pub effective_date: NaiveDate,
     pub cutoff_date: NaiveDate,
-    pub paper_trade_high_water: i64,
-    pub order_audit_high_water: i64,
+    pub frozen_paper_trade_high_water: i64,
+    pub frozen_order_audit_high_water: i64,
+    pub source_paper_trade_high_water: i64,
+    pub source_order_audit_high_water: i64,
     pub legacy_carry_manifest_hash: String,
     pub exclusion_manifest_hash: String,
     pub scoped_fill_manifest_hash: String,
@@ -385,6 +388,7 @@ pub struct AttributionEpochDailyEvidence {
 pub struct EpochDailyAttribution {
     daily: DailyAttribution,
     epoch: AttributionEpochDailyEvidence,
+    database_authority: AttributionDatabaseAuthority,
 }
 
 impl EpochDailyAttribution {
@@ -401,6 +405,7 @@ impl EpochDailyAttribution {
 pub struct EpochWindowAttribution {
     window: WindowAttribution,
     epoch: AttributionEpochDailyEvidence,
+    database_authority: AttributionDatabaseAuthority,
 }
 
 impl EpochWindowAttribution {
@@ -513,7 +518,7 @@ pub fn compute_epoch_daily(
     date: NaiveDate,
     prices: &HashMap<String, f64>,
 ) -> Result<EpochDailyAttribution, AttributionEpochRuntimeError> {
-    let (rows, epoch) = load_scoped_epoch_rows(database, date, date)?;
+    let (rows, epoch, database_authority) = load_scoped_epoch_rows(database, date, date)?;
     let (attributions, open) = fifo_match(&rows, date).map_err(|detail| {
         runtime_integrity(
             "attribution_epoch_aggregation_failed",
@@ -529,6 +534,7 @@ pub fn compute_epoch_daily(
             top_trades,
         },
         epoch,
+        database_authority,
     })
 }
 
@@ -552,14 +558,18 @@ pub fn compute_epoch_window(
                 "BR-255 epoch attribution window underflowed the supported date range",
             )
         })?;
-    let (rows, epoch) = load_scoped_epoch_rows(database, start, end)?;
+    let (rows, epoch, database_authority) = load_scoped_epoch_rows(database, start, end)?;
     let window = aggregate_window(end, days, &rows, prices).map_err(|detail| {
         runtime_integrity(
             "attribution_epoch_aggregation_failed",
             format!("BR-255 window attribution aggregation: {detail}"),
         )
     })?;
-    Ok(EpochWindowAttribution { window, epoch })
+    Ok(EpochWindowAttribution {
+        window,
+        epoch,
+        database_authority,
+    })
 }
 
 pub fn persist_epoch_daily(
@@ -642,12 +652,15 @@ pub fn persist_epoch_daily(
                 families,
             },
             AttributionEpochDailySourceBinding {
+                database_authority: daily.database_authority.clone(),
                 epoch_id: daily.epoch.epoch_id.clone(),
                 receipt_hash: daily.epoch.receipt_hash.clone(),
                 effective_date: daily.epoch.effective_date,
                 cutoff_date: daily.epoch.cutoff_date,
-                paper_trade_high_water: daily.epoch.paper_trade_high_water,
-                order_audit_high_water: daily.epoch.order_audit_high_water,
+                frozen_paper_trade_high_water: daily.epoch.frozen_paper_trade_high_water,
+                frozen_order_audit_high_water: daily.epoch.frozen_order_audit_high_water,
+                source_paper_trade_high_water: daily.epoch.source_paper_trade_high_water,
+                source_order_audit_high_water: daily.epoch.source_order_audit_high_water,
                 legacy_carry_manifest_hash: daily.epoch.legacy_carry_manifest_hash.clone(),
                 verified_filled_manifest_hash: daily.epoch.verified_filled_manifest_hash.clone(),
                 verified_terminal_binding_manifest_hash: daily
@@ -687,9 +700,15 @@ fn load_scoped_epoch_rows(
     database: &DatabaseManager,
     from: NaiveDate,
     to: NaiveDate,
-) -> Result<(Vec<AttributionFillRow>, AttributionEpochDailyEvidence), AttributionEpochRuntimeError>
-{
-    let (receipt, verified) = AttributionEpochStore::new(database)
+) -> Result<
+    (
+        Vec<AttributionFillRow>,
+        AttributionEpochDailyEvidence,
+        AttributionDatabaseAuthority,
+    ),
+    AttributionEpochRuntimeError,
+> {
+    let (receipt, verified, database_authority) = AttributionEpochStore::new(database)
         .load_active_verified_fills_until(from, to)
         .map_err(AttributionEpochRuntimeError::from)?;
     let source_rows = verified
@@ -744,8 +763,10 @@ fn load_scoped_epoch_rows(
             receipt_hash: receipt.receipt_hash,
             effective_date: receipt.effective_trading_date,
             cutoff_date: to,
-            paper_trade_high_water: receipt.paper_trade_high_water,
-            order_audit_high_water: receipt.order_audit_high_water,
+            frozen_paper_trade_high_water: receipt.paper_trade_high_water,
+            frozen_order_audit_high_water: receipt.order_audit_high_water,
+            source_paper_trade_high_water: verified.current_paper_trade_high_water(),
+            source_order_audit_high_water: verified.current_order_audit_high_water(),
             legacy_carry_manifest_hash: receipt.legacy_carry_manifest_hash,
             exclusion_manifest_hash,
             scoped_fill_manifest_hash,
@@ -758,6 +779,7 @@ fn load_scoped_epoch_rows(
             remaining_quarantine: scoped.remaining_quarantine,
             released_codes: scoped.released_codes,
         },
+        database_authority,
     ))
 }
 
