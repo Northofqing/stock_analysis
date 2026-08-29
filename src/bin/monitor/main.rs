@@ -5434,6 +5434,34 @@ async fn main() {
             }
         });
 
+        // BR-255: once an epoch exists, every service startup verifies its
+        // complete retained state and frozen source prefix. This path is
+        // verify-only: a missing epoch remains eligible for the normal daily
+        // activation window, and any failure is reported without preventing
+        // unrelated long-running trading tasks from starting.
+        match attribution_epoch_runtime::run_attribution_epoch_startup_verify(
+            stock_analysis::database::DatabaseManager::get(),
+        ) {
+            attribution_epoch_runtime::AttributionEpochStartupOutcome::Verified(receipt) => {
+                log::info!(
+                    "[attribution-epoch][startup] verified epoch_id={} receipt_hash={}",
+                    receipt.epoch_id,
+                    receipt.receipt_hash
+                );
+            }
+            attribution_epoch_runtime::AttributionEpochStartupOutcome::MissingOrUnavailable {
+                code,
+                retryable,
+            } => {
+                log::warn!(
+                    "[attribution-epoch][startup] missing_or_unavailable code={code} retryable={retryable}"
+                );
+            }
+            attribution_epoch_runtime::AttributionEpochStartupOutcome::FailedIntegrity { code } => {
+                log::error!("[attribution-epoch][startup] failed_integrity code={code}");
+            }
+        }
+
         // BR-108/BR-116: establish the conservative governance context before
         // any long-running loop starts. This must run outside the market-active
         // branch so after-hours, weekends, and startup source failures can still

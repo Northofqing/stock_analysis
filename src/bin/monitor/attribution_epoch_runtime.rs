@@ -36,6 +36,13 @@ pub enum AttributionEpochTickOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttributionEpochStartupOutcome {
+    Verified(AttributionEpochReceipt),
+    MissingOrUnavailable { code: String, retryable: bool },
+    FailedIntegrity { code: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CalendarObservation {
     TradingDay,
     NonTradingDay,
@@ -143,6 +150,10 @@ trait AttributionEpochRuntime {
     ) -> Result<ActivationObservation, RuntimeFailure>;
 }
 
+trait AttributionEpochStartupRuntime {
+    fn verify_existing(&self) -> Result<AttributionEpochReceipt, RuntimeFailure>;
+}
+
 struct DatabaseAttributionEpochRuntime<'a> {
     database: &'a DatabaseManager,
 }
@@ -175,6 +186,28 @@ impl AttributionEpochRuntime for DatabaseAttributionEpochRuntime<'_> {
             EpochActivationDisposition::AlreadyActive => {
                 Ok(ActivationObservation::Existing(receipt))
             }
+        }
+    }
+}
+
+impl AttributionEpochStartupRuntime for DatabaseAttributionEpochRuntime<'_> {
+    fn verify_existing(&self) -> Result<AttributionEpochReceipt, RuntimeFailure> {
+        AttributionEpochStore::new(self.database)
+            .verify_active_retained_state()
+            .map_err(RuntimeFailure::from)
+    }
+}
+
+fn run_startup_with_runtime<R: AttributionEpochStartupRuntime>(
+    runtime: &R,
+) -> AttributionEpochStartupOutcome {
+    match runtime.verify_existing() {
+        Ok(receipt) => AttributionEpochStartupOutcome::Verified(receipt),
+        Err(RuntimeFailure::Unavailable { code, retryable }) => {
+            AttributionEpochStartupOutcome::MissingOrUnavailable { code, retryable }
+        }
+        Err(RuntimeFailure::FailedIntegrity { code }) => {
+            AttributionEpochStartupOutcome::FailedIntegrity { code }
         }
     }
 }
@@ -272,6 +305,12 @@ pub fn run_attribution_epoch_tick(
         &ATTRIBUTION_EPOCH_LAST_SUCCESS,
         now,
     )
+}
+
+pub fn run_attribution_epoch_startup_verify(
+    database: &DatabaseManager,
+) -> AttributionEpochStartupOutcome {
+    run_startup_with_runtime(&DatabaseAttributionEpochRuntime { database })
 }
 
 #[cfg(test)]
@@ -446,6 +485,79 @@ mod tests {
         }
     }
 
+    struct FakeStartupRuntime {
+        outcome: RefCell<Option<Result<AttributionEpochReceipt, RuntimeFailure>>>,
+        calls: Cell<usize>,
+    }
+
+    impl AttributionEpochStartupRuntime for FakeStartupRuntime {
+        fn verify_existing(&self) -> Result<AttributionEpochReceipt, RuntimeFailure> {
+            self.calls.set(self.calls.get() + 1);
+            self.outcome
+                .borrow_mut()
+                .take()
+                .expect("TEST_CODE startup verification outcome configured")
+        }
+    }
+
+    #[test]
+    fn startup_verification_returns_receipt_without_calendar_or_activation_input() {
+        let expected = receipt(&"d".repeat(64));
+        let runtime = FakeStartupRuntime {
+            outcome: RefCell::new(Some(Ok(expected.clone()))),
+            calls: Cell::new(0),
+        };
+
+        assert_eq!(
+            run_startup_with_runtime(&runtime),
+            AttributionEpochStartupOutcome::Verified(expected)
+        );
+        assert_eq!(runtime.calls.get(), 1);
+    }
+
+    #[test]
+    fn startup_missing_or_unavailable_is_structured_without_activation() {
+        for (code, retryable) in [
+            ("attribution_epoch_unavailable", false),
+            ("TEST_CODE_storage_busy", true),
+        ] {
+            let runtime = FakeStartupRuntime {
+                outcome: RefCell::new(Some(Err(RuntimeFailure::Unavailable {
+                    code: code.to_owned(),
+                    retryable,
+                }))),
+                calls: Cell::new(0),
+            };
+
+            assert_eq!(
+                run_startup_with_runtime(&runtime),
+                AttributionEpochStartupOutcome::MissingOrUnavailable {
+                    code: code.to_owned(),
+                    retryable,
+                }
+            );
+            assert_eq!(runtime.calls.get(), 1);
+        }
+    }
+
+    #[test]
+    fn startup_integrity_failure_preserves_reason_and_returns_to_caller() {
+        let runtime = FakeStartupRuntime {
+            outcome: RefCell::new(Some(Err(RuntimeFailure::FailedIntegrity {
+                code: "TEST_CODE_source_integrity".to_owned(),
+            }))),
+            calls: Cell::new(0),
+        };
+
+        assert_eq!(
+            run_startup_with_runtime(&runtime),
+            AttributionEpochStartupOutcome::FailedIntegrity {
+                code: "TEST_CODE_source_integrity".to_owned(),
+            }
+        );
+        assert_eq!(runtime.calls.get(), 1);
+    }
+
     #[test]
     fn successful_activation_sets_latch_and_prevents_repeat_work() {
         let expected = receipt(&"a".repeat(64));
@@ -569,5 +681,30 @@ mod tests {
         assert!(block.contains("run_attribution_epoch_tick("));
         assert!(block.contains("attribution_epoch_now,"));
         assert!(!block.contains("now.fixed_offset()"));
+    }
+
+    #[test]
+    fn main_runs_startup_verify_once_before_long_running_loops_and_continues_on_failure() {
+        let main = include_str!("main.rs");
+        let verify = main
+            .find("run_attribution_epoch_startup_verify(")
+            .expect("TEST_CODE startup epoch verification call");
+        let loops = verify
+            + main[verify..]
+                .find("let main_loops = async")
+                .expect("TEST_CODE long-running loop construction");
+        let startup = &main[verify..loops];
+
+        assert!(verify < loops);
+        assert_eq!(
+            main.matches("run_attribution_epoch_startup_verify(")
+                .count(),
+            1
+        );
+        assert!(startup.contains("AttributionEpochStartupOutcome::Verified"));
+        assert!(startup.contains("AttributionEpochStartupOutcome::MissingOrUnavailable"));
+        assert!(startup.contains("AttributionEpochStartupOutcome::FailedIntegrity"));
+        assert!(!startup.contains("exit_after_jsonl_writer"));
+        assert!(!startup.contains("std::process::exit"));
     }
 }

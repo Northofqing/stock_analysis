@@ -3548,6 +3548,29 @@ impl<'a> AttributionEpochStore<'a> {
         })
     }
 
+    /// Resolves the retained active epoch from one descriptor-attested,
+    /// deferred read transaction. This startup seam never activates an epoch
+    /// or appends attempt evidence when no active receipt exists.
+    pub fn verify_active_retained_state(
+        &self,
+    ) -> Result<AttributionEpochReceipt, AttributionEpochStoreError> {
+        let mut checkout = self
+            .database
+            .attribution_checkout()
+            .map_err(map_database_authority_error)?;
+        checkout.transaction_with_authority(map_database_authority_error, |conn, _authority| {
+            let receipt =
+                match load_selector_with_connection(conn, &AttributionEpochSelector::Active)? {
+                    ResolvedAttributionEpoch::Epoch(receipt) => receipt,
+                    ResolvedAttributionEpoch::Legacy => {
+                        unreachable!("active selector cannot resolve Legacy")
+                    }
+                };
+            verify_epoch_source_prefix(conn, &receipt)?;
+            Ok(receipt)
+        })
+    }
+
     pub fn verify_active(&self) -> Result<AttributionEpochReceipt, AttributionEpochStoreError> {
         match self.load_selector(&AttributionEpochSelector::Active)? {
             ResolvedAttributionEpoch::Epoch(receipt) => Ok(receipt),
@@ -7044,6 +7067,82 @@ mod tests {
                 .unwrap(),
             ResolvedAttributionEpoch::Legacy
         );
+    }
+
+    #[test]
+    fn startup_verify_without_epoch_is_read_only_and_typed_unavailable() {
+        let database = TestDatabase::attested();
+        let store = AttributionEpochStore::new(&database.manager);
+        let tables = TABLES.map(|(table, _)| table);
+        let retained_state = |manager: &DatabaseManager| {
+            let mut conn = manager
+                .get_conn()
+                .expect("TEST_CODE startup verification state connection");
+            tables
+                .iter()
+                .map(|table| {
+                    let count = diesel::sql_query(format!("SELECT COUNT(*) AS count FROM {table}"))
+                        .get_result::<CountRow>(&mut conn)
+                        .expect("TEST_CODE startup verification retained count")
+                        .count;
+                    let sequence =
+                        diesel::sql_query("SELECT seq FROM sqlite_sequence WHERE name=?")
+                            .bind::<Text, _>(*table)
+                            .get_result::<SequenceRow>(&mut conn)
+                            .expect("TEST_CODE startup verification retained sequence")
+                            .seq;
+                    ((*table).to_owned(), count, sequence)
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = retained_state(&database.manager);
+
+        let error = store
+            .verify_active_retained_state()
+            .expect_err("TEST_CODE startup verification must not invent an epoch");
+
+        assert_eq!(error.reason_code(), "attribution_epoch_unavailable");
+        assert_eq!(retained_state(&database.manager), before);
+    }
+
+    #[test]
+    fn startup_verify_returns_receipt_and_detects_frozen_source_tamper() {
+        let (database, receipt) = activated_test_database();
+        let store = AttributionEpochStore::new(&database.manager);
+        let attempt_count = |manager: &DatabaseManager| {
+            diesel::sql_query("SELECT COUNT(*) AS count FROM attribution_epoch_attempt_audit")
+                .get_result::<CountRow>(
+                    &mut manager
+                        .get_conn()
+                        .expect("TEST_CODE startup attempt count connection"),
+                )
+                .expect("TEST_CODE startup attempt count")
+                .count
+        };
+        let before = attempt_count(&database.manager);
+
+        assert_eq!(
+            store
+                .verify_active_retained_state()
+                .expect("TEST_CODE startup returns the verified receipt"),
+            receipt
+        );
+        assert_eq!(attempt_count(&database.manager), before);
+
+        diesel::sql_query("UPDATE paper_trades SET fill_price=fill_price+1.0 WHERE id=1")
+            .execute(
+                &mut database
+                    .manager
+                    .get_conn()
+                    .expect("TEST_CODE startup source tamper connection"),
+            )
+            .expect("TEST_CODE tamper frozen startup source");
+
+        let error = store
+            .verify_active_retained_state()
+            .expect_err("TEST_CODE startup must fail closed on frozen source tamper");
+        assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
+        assert_eq!(attempt_count(&database.manager), before);
     }
 
     #[test]
