@@ -2918,6 +2918,127 @@ pub(crate) fn load_exact_on_connection(
     }
 }
 
+fn resolve_explicit_preview_path(supplied: &Path) -> Result<PathBuf, AttributionEpochStoreError> {
+    let supplied_metadata = std::fs::symlink_metadata(supplied).map_err(|error| {
+        activation_unavailable(
+            "attribution_epoch_preview_storage_unavailable",
+            false,
+            format!("BR-255 explicit preview database is unavailable: {error}"),
+        )
+    })?;
+    if supplied_metadata.file_type().is_symlink() || !supplied_metadata.is_file() {
+        return Err(failed_integrity(
+            "BR-255 explicit preview database must be a non-symlink regular file",
+        ));
+    }
+    let resolved = std::fs::canonicalize(supplied).map_err(|error| {
+        activation_unavailable(
+            "attribution_epoch_preview_storage_unavailable",
+            false,
+            format!("BR-255 explicit preview database cannot be resolved: {error}"),
+        )
+    })?;
+    let resolved_metadata = std::fs::symlink_metadata(&resolved).map_err(|error| {
+        activation_unavailable(
+            "attribution_epoch_preview_storage_unavailable",
+            false,
+            format!("BR-255 resolved preview database is unavailable: {error}"),
+        )
+    })?;
+    if resolved_metadata.file_type().is_symlink() || !resolved_metadata.is_file() {
+        return Err(failed_integrity(
+            "BR-255 resolved preview database is not a regular file",
+        ));
+    }
+    Ok(resolved)
+}
+
+fn preview_activation_at_resolved_path(
+    database_path: &Path,
+    request: &EpochActivationRequest,
+) -> Result<EpochActivationPreview, AttributionEpochStoreError> {
+    let (completed, effective, calendar_hash) = resolve_activation_calendar(request.invoked_at)?;
+    let before = preview_sqlite_snapshot(database_path)?;
+    if let Err(error) = reject_preview_wal_state(database_path, &before) {
+        let after = preview_sqlite_snapshot(database_path)?;
+        if after != before {
+            return Err(failed_integrity(
+                "BR-255 SQLite files changed while refusing unsafe preview WAL state",
+            ));
+        }
+        return Err(error);
+    }
+    let clean_wal_header = sqlite_header_uses_wal(database_path)?;
+    let primary = (|| {
+        let read_only_url = read_only_sqlite_uri(database_path, clean_wal_header)?;
+        let mut conn = SqliteConnection::establish(&read_only_url).map_err(|error| {
+            activation_unavailable(
+                "attribution_epoch_preview_storage_unavailable",
+                true,
+                format!("BR-255 cold read-only preview connection unavailable: {error}"),
+            )
+        })?;
+        diesel::sql_query("PRAGMA query_only=ON")
+            .execute(&mut conn)
+            .map_err(|error| {
+                activation_unavailable(
+                    "attribution_epoch_preview_storage_unavailable",
+                    true,
+                    format!("BR-255 preview connection is not query-only: {error}"),
+                )
+            })?;
+        conn.transaction::<_, AttributionEpochStoreError, _>(|conn| {
+            let existing_tables = diesel::sql_query(
+                "SELECT COUNT(*) AS count FROM sqlite_master
+                 WHERE type='table' AND name IN (
+                    'attribution_sample_epoch_receipt',
+                    'attribution_sample_epoch_receipt_chain',
+                    'attribution_legacy_carry_item',
+                    'attribution_epoch_attempt_audit',
+                    'attribution_epoch_attempt_chain',
+                    'paper_attribution_epoch_daily',
+                    'paper_attribution_epoch_daily_chain'
+                 )",
+            )
+            .get_result::<CountRow>(conn)?
+            .count;
+            if existing_tables != 0 && existing_tables != 7 {
+                return Err(failed_integrity(format!(
+                    "BR-255 preview found partial epoch schema: {existing_tables} of 7 tables"
+                )));
+            }
+            if existing_tables == 7 {
+                let receipts = validate_all(conn)?;
+                if receipts.len() > 1 {
+                    return Err(failed_integrity(
+                        "BR-255 v1 preview found multiple activation receipts",
+                    ));
+                }
+                if let Some(row) = receipts.first() {
+                    let receipt = receipt_value(row)?;
+                    let source = ensure_source_matches_receipt(conn, &receipt)?;
+                    return activation_preview(
+                        true,
+                        receipt.cutover_completed_trading_date,
+                        receipt.effective_trading_date,
+                        source,
+                        &receipt.calendar_authority_hash,
+                    );
+                }
+            }
+            let source = analyze_source_projection(conn, completed, None, true)?;
+            activation_preview(false, completed, effective, source, &calendar_hash)
+        })
+    })();
+    let after = preview_sqlite_snapshot(database_path)?;
+    if after != before {
+        return Err(failed_integrity(
+            "BR-255 read-only preview changed main/WAL/SHM bytes, existence, or mtime",
+        ));
+    }
+    primary
+}
+
 impl<'a> AttributionEpochStore<'a> {
     pub fn new(database: &'a DatabaseManager) -> Self {
         let read_only_preview_path = database
@@ -2950,94 +3071,25 @@ impl<'a> AttributionEpochStore<'a> {
         &self,
         request: &EpochActivationRequest,
     ) -> Result<EpochActivationPreview, AttributionEpochStoreError> {
-        let database_path = self.read_only_preview_path.as_ref().ok_or_else(|| {
+        let supplied_path = self.read_only_preview_path.as_ref().ok_or_else(|| {
             activation_unavailable(
                 "attribution_epoch_preview_read_only_path_unavailable",
                 false,
                 "BR-255 preview requires a database-owned cold read-only route",
             )
         })?;
-        let (completed, effective, calendar_hash) =
-            resolve_activation_calendar(request.invoked_at)?;
-        let before = preview_sqlite_snapshot(database_path)?;
-        if let Err(error) = reject_preview_wal_state(database_path, &before) {
-            let after = preview_sqlite_snapshot(database_path)?;
-            if after != before {
-                return Err(failed_integrity(
-                    "BR-255 SQLite files changed while refusing unsafe preview WAL state",
-                ));
-            }
-            return Err(error);
-        }
-        let clean_wal_header = sqlite_header_uses_wal(database_path)?;
-        let primary = (|| {
-            let read_only_url = read_only_sqlite_uri(database_path, clean_wal_header)?;
-            let mut conn = SqliteConnection::establish(&read_only_url).map_err(|error| {
-                activation_unavailable(
-                    "attribution_epoch_preview_storage_unavailable",
-                    true,
-                    format!("BR-255 cold read-only preview connection unavailable: {error}"),
-                )
-            })?;
-            diesel::sql_query("PRAGMA query_only=ON")
-                .execute(&mut conn)
-                .map_err(|error| {
-                    activation_unavailable(
-                        "attribution_epoch_preview_storage_unavailable",
-                        true,
-                        format!("BR-255 preview connection is not query-only: {error}"),
-                    )
-                })?;
-            conn.transaction::<_, AttributionEpochStoreError, _>(|conn| {
-                let existing_tables = diesel::sql_query(
-                    "SELECT COUNT(*) AS count FROM sqlite_master
-                     WHERE type='table' AND name IN (
-                        'attribution_sample_epoch_receipt',
-                        'attribution_sample_epoch_receipt_chain',
-                        'attribution_legacy_carry_item',
-                        'attribution_epoch_attempt_audit',
-                        'attribution_epoch_attempt_chain',
-                        'paper_attribution_epoch_daily',
-                        'paper_attribution_epoch_daily_chain'
-                     )",
-                )
-                .get_result::<CountRow>(conn)?
-                .count;
-                if existing_tables != 0 && existing_tables != 7 {
-                    return Err(failed_integrity(format!(
-                        "BR-255 preview found partial epoch schema: {existing_tables} of 7 tables"
-                    )));
-                }
-                if existing_tables == 7 {
-                    let receipts = validate_all(conn)?;
-                    if receipts.len() > 1 {
-                        return Err(failed_integrity(
-                            "BR-255 v1 preview found multiple activation receipts",
-                        ));
-                    }
-                    if let Some(row) = receipts.first() {
-                        let receipt = receipt_value(row)?;
-                        let source = ensure_source_matches_receipt(conn, &receipt)?;
-                        return activation_preview(
-                            true,
-                            receipt.cutover_completed_trading_date,
-                            receipt.effective_trading_date,
-                            source,
-                            &receipt.calendar_authority_hash,
-                        );
-                    }
-                }
-                let source = analyze_source_projection(conn, completed, None, true)?;
-                activation_preview(false, completed, effective, source, &calendar_hash)
-            })
-        })();
-        let after = preview_sqlite_snapshot(database_path)?;
-        if after != before {
-            return Err(failed_integrity(
-                "BR-255 read-only preview changed main/WAL/SHM bytes, existence, or mtime",
-            ));
-        }
-        primary
+        let database_path = resolve_explicit_preview_path(supplied_path)?;
+        preview_activation_at_resolved_path(&database_path, request)
+    }
+
+    /// Runs the same cold, immutable preview directly against an explicit path
+    /// without constructing a regular SQLite pool or installing any schema.
+    pub fn preview_activation_at_path(
+        database_path: impl AsRef<Path>,
+        request: &EpochActivationRequest,
+    ) -> Result<EpochActivationPreview, AttributionEpochStoreError> {
+        let database_path = resolve_explicit_preview_path(database_path.as_ref())?;
+        preview_activation_at_resolved_path(&database_path, request)
     }
 
     pub fn activate_once(
@@ -5361,6 +5413,45 @@ mod tests {
         assert_eq!(preview.order_audit_high_water, 0);
         assert_eq!(preview_sqlite_snapshot(&path).unwrap(), before);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_only_activation_preview_rejects_symlink_and_non_regular_targets() {
+        let database = TestDatabase::with_options(1, false);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("TEST_CODE clock")
+            .as_nanos();
+        let link = std::env::temp_dir().join(format!(
+            "TEST_CODE_attribution_epoch_preview_symlink_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::os::unix::fs::symlink(&database.path, &link)
+            .expect("TEST_CODE create exact preview symlink");
+
+        let symlink_error = AttributionEpochStore::preview_activation_at_path(
+            &link,
+            &activation_request("2026-08-28T15:40:00+08:00"),
+        )
+        .expect_err("TEST_CODE path-only preview rejects symlink leaf");
+        assert_eq!(
+            symlink_error.reason_code(),
+            "attribution_epoch_integrity_failed"
+        );
+
+        let directory_error = AttributionEpochStore::preview_activation_at_path(
+            std::env::temp_dir(),
+            &activation_request("2026-08-28T15:40:00+08:00"),
+        )
+        .expect_err("TEST_CODE path-only preview rejects directory");
+        assert_eq!(
+            directory_error.reason_code(),
+            "attribution_epoch_integrity_failed"
+        );
+
+        std::fs::remove_file(link).expect("TEST_CODE remove exact preview symlink");
     }
 
     #[test]

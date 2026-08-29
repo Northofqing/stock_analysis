@@ -9,16 +9,23 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::{json, Value};
 use stock_analysis::calendar::{
-    resolve_verified_scheduled_replay, VerifiedCalendarError, VerifiedCalendarErrorKind,
-    VerifiedReplayCalendar,
+    resolve_verified_replay_range, resolve_verified_scheduled_replay, VerifiedCalendarError,
+    VerifiedCalendarErrorKind, VerifiedReplayCalendar,
 };
 use stock_analysis::data_gateway::{
     probe_benchmark_request, BenchmarkCapture, BenchmarkError, BenchmarkProbeReport,
     BenchmarkRange, BenchmarkRequest, HS300_CANONICAL,
 };
+use stock_analysis::database::attribution_epochs::{
+    AttributionEpochReceipt, AttributionEpochStore, AttributionEpochStoreError,
+    EpochActivationPreview, EpochActivationRequest,
+};
 use stock_analysis::database::attribution_reports::{
     AttributionDatabaseAccess, AttributionDatabaseSession, AttributionReportReceipt,
     AttributionReportStoreError,
+};
+use stock_analysis::performance::attribution_epoch::{
+    canonical_legacy_carry_manifest_hash, AttributionEpochSelector, EpochActivationSource,
 };
 use stock_analysis::performance::attribution_replay::{
     AttributionConclusion, AttributionReplayLoader, AttributionReplayRunner, BenchmarkDayManifest,
@@ -71,6 +78,18 @@ enum Command {
         #[arg(long, value_enum, default_value_t)]
         format: OutputFormat,
     },
+    /// 预览归因样本 epoch；仅显式 commit 才冻结并追加激活凭据。
+    ResetSample {
+        #[arg(long)]
+        db: PathBuf,
+        /// 显式 +08:00 激活时刻；省略时使用当前上海时刻。
+        #[arg(long)]
+        at: Option<DateTime<FixedOffset>>,
+        #[arg(long, default_value_t = false)]
+        commit: bool,
+        #[arg(long, value_enum, default_value_t)]
+        format: OutputFormat,
+    },
     /// 解析最近完成业务日并运行归因；默认只读预览。
     Scheduled {
         #[arg(long)]
@@ -79,6 +98,8 @@ enum Command {
         at: Option<DateTime<FixedOffset>>,
         #[arg(long = "manifest", required = true)]
         manifests: Vec<ManifestArg>,
+        #[arg(long, default_value = "active")]
+        epoch: EpochSelectorArg,
         #[arg(long, default_value_t = false)]
         commit: bool,
         #[arg(long, value_enum, default_value_t)]
@@ -96,6 +117,8 @@ enum Command {
         at: Option<DateTime<FixedOffset>>,
         #[arg(long = "manifest", required = true)]
         manifests: Vec<ManifestArg>,
+        #[arg(long, default_value = "active")]
+        epoch: EpochSelectorArg,
         #[arg(long, default_value_t = false)]
         commit: bool,
         #[arg(long, value_enum, default_value_t)]
@@ -113,6 +136,8 @@ enum Command {
         at: Option<DateTime<FixedOffset>>,
         #[arg(long = "manifest", required = true)]
         manifests: Vec<ManifestArg>,
+        #[arg(long, default_value = "active")]
+        epoch: EpochSelectorArg,
         #[arg(long, default_value_t = false)]
         commit: bool,
         #[arg(long, value_enum, default_value_t)]
@@ -147,6 +172,28 @@ enum OutputFormat {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ManifestArg(BenchmarkDayManifest);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EpochSelectorArg(AttributionEpochSelector);
+
+impl FromStr for EpochSelectorArg {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "active" => Ok(Self(AttributionEpochSelector::Active)),
+            "legacy" => Ok(Self(AttributionEpochSelector::Legacy)),
+            hash if hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
+            {
+                Ok(Self(AttributionEpochSelector::Exact(hash.to_owned())))
+            }
+            _ => Err("epoch 必须为 active、legacy 或64位小写sha256".to_owned()),
+        }
+    }
+}
 
 impl FromStr for ManifestArg {
     type Err = String;
@@ -524,6 +571,76 @@ fn render_capture_receipt(
             receipt.segment_hashes.join("、")
         ),
     }
+}
+
+fn render_reset_sample(
+    preview: &EpochActivationPreview,
+    calendar_authority_hash: &str,
+    receipt_hash: Option<&str>,
+    database_written: bool,
+    format: OutputFormat,
+) -> Result<String, AppError> {
+    let carry_manifest_hash = canonical_legacy_carry_manifest_hash(&preview.carry);
+    Ok(match format {
+        OutputFormat::Json => json!({
+            "状态": "ResearchOnly",
+            "模式": if database_written { "归因样本重置提交" } else { "归因样本重置预览" },
+            "数据库已写入": database_written,
+            "已存在激活": preview.activated,
+            "epoch": {
+                "身份": preview.epoch_id,
+                "completed交易日": preview.completed_session_date,
+                "effective交易日": preview.effective_date
+            },
+            "冻结源": {
+                "paper_trade高水位": preview.paper_trade_high_water,
+                "order_audit高水位": preview.order_audit_high_water,
+                "legacy成交manifest哈希": preview.legacy_filled_manifest_hash,
+                "terminal绑定manifest哈希": preview.terminal_binding_manifest_hash,
+                "order_audit_tip哈希": preview.order_audit_tip_hash,
+                "position投影哈希": preview.position_projection_hash
+            },
+            "carry": {
+                "manifest哈希": carry_manifest_hash,
+                "代码与股数": output_value(&preview.carry, "epoch_carry_serialization_failed")?
+            },
+            "日历权威哈希": calendar_authority_hash,
+            "receipt身份": receipt_hash,
+            "研究边界": "ResearchOnly：仅用于归因样本隔离，不构成策略成功、交易或下单结论"
+        })
+        .to_string(),
+        OutputFormat::Markdown => {
+            let carry = if preview.carry.is_empty() {
+                "无".to_owned()
+            } else {
+                preview
+                    .carry
+                    .iter()
+                    .map(|position| format!("{}={}", position.code, position.quantity))
+                    .collect::<Vec<_>>()
+                    .join("、")
+            };
+            format!(
+                "# 归因样本重置{}\n\n- 状态：ResearchOnly\n- 数据库已写入：{}\n- 已存在激活：{}\n- Epoch 身份：{}\n- Completed 交易日：{}\n- Effective 交易日：{}\n- Paper trade 高水位：{}\n- Order audit 高水位：{}\n- Legacy 成交 manifest 哈希：{}\n- Terminal 绑定 manifest 哈希：{}\n- Order audit tip 哈希：{}\n- Position 投影哈希：{}\n- Carry manifest 哈希：{}\n- Carry 代码/股数：{}\n- 日历权威哈希：{}\n- Receipt 身份：{}\n- 研究边界：ResearchOnly，仅用于归因样本隔离，不构成策略成功、交易或下单结论",
+                if database_written { "提交" } else { "预览" },
+                if database_written { "是" } else { "否" },
+                if preview.activated { "是" } else { "否" },
+                preview.epoch_id,
+                preview.completed_session_date,
+                preview.effective_date,
+                preview.paper_trade_high_water,
+                preview.order_audit_high_water,
+                preview.legacy_filled_manifest_hash,
+                preview.terminal_binding_manifest_hash,
+                preview.order_audit_tip_hash,
+                preview.position_projection_hash,
+                carry_manifest_hash,
+                carry,
+                calendar_authority_hash,
+                receipt_hash.unwrap_or("未提交")
+            )
+        }
+    })
 }
 
 fn output_value<T: Serialize + ?Sized>(value: &T, code: &'static str) -> Result<Value, AppError> {
@@ -963,10 +1080,34 @@ fn map_database_error(error: AttributionReportStoreError) -> AppError {
     }
 }
 
+fn map_epoch_store_error(error: AttributionEpochStoreError) -> AppError {
+    match error {
+        AttributionEpochStoreError::Unavailable {
+            reason_code,
+            retryable,
+            ..
+        } => AppError {
+            class: AppErrorClass::Unavailable,
+            stage: "epoch",
+            code: reason_code.to_owned(),
+            retryable,
+            failure_audit_id: None,
+        },
+        AttributionEpochStoreError::FailedIntegrity { reason_code, .. } => AppError {
+            class: AppErrorClass::FailedIntegrity,
+            stage: "epoch",
+            code: reason_code.to_owned(),
+            retryable: false,
+            failure_audit_id: None,
+        },
+    }
+}
+
 fn replay_stage(stage: ReplayStage) -> &'static str {
     match stage {
         ReplayStage::Request => "request",
         ReplayStage::Calendar => "calendar",
+        ReplayStage::Epoch => "epoch",
         ReplayStage::TradeEvidence => "trade_evidence",
         ReplayStage::Benchmark => "benchmark",
         ReplayStage::Compute => "compute",
@@ -995,11 +1136,87 @@ fn manifest_bindings(manifests: &[ManifestArg]) -> Vec<BenchmarkDayManifest> {
     manifests.iter().map(|item| item.0.clone()).collect()
 }
 
+fn load_reset_sample_preview(
+    database_path: &Path,
+    request: &EpochActivationRequest,
+) -> Result<EpochActivationPreview, AppError> {
+    AttributionEpochStore::preview_activation_at_path(database_path, request)
+        .map_err(map_epoch_store_error)
+}
+
+fn execute_reset_sample_preview(
+    database_path: &Path,
+    request: &EpochActivationRequest,
+    format: OutputFormat,
+) -> Result<String, AppError> {
+    let preview = load_reset_sample_preview(database_path, request)?;
+    let calendar =
+        resolve_verified_replay_range(preview.completed_session_date, preview.effective_date)
+            .map_err(map_calendar_error)?;
+    render_reset_sample(&preview, calendar.authority_hash(), None, false, format)
+}
+
+fn preview_matches_receipt(
+    preview: &EpochActivationPreview,
+    receipt: &AttributionEpochReceipt,
+) -> Result<(), AppError> {
+    let carry_item_count = u64::try_from(preview.carry.len())
+        .map_err(|_| AppError::output_integrity("epoch_carry_count_overflow"))?;
+    let carry_total_quantity = preview.carry.iter().try_fold(0_u64, |total, position| {
+        total.checked_add(position.quantity)
+    });
+    let carry_total_quantity = carry_total_quantity
+        .ok_or_else(|| AppError::output_integrity("epoch_carry_quantity_overflow"))?;
+    if !preview.activated
+        || preview.epoch_id != receipt.epoch_id
+        || preview.completed_session_date != receipt.cutover_completed_trading_date
+        || preview.effective_date != receipt.effective_trading_date
+        || preview.paper_trade_high_water != receipt.paper_trade_high_water
+        || preview.order_audit_high_water != receipt.order_audit_high_water
+        || preview.legacy_filled_manifest_hash != receipt.legacy_filled_manifest_hash
+        || preview.terminal_binding_manifest_hash != receipt.terminal_binding_manifest_hash
+        || preview.order_audit_tip_hash != receipt.order_audit_tip_hash
+        || preview.position_projection_hash != receipt.position_projection_hash
+        || canonical_legacy_carry_manifest_hash(&preview.carry)
+            != receipt.legacy_carry_manifest_hash
+        || carry_item_count != receipt.carry_item_count
+        || carry_total_quantity != receipt.carry_total_quantity
+    {
+        return Err(AppError::output_integrity("epoch_commit_readback_mismatch"));
+    }
+    Ok(())
+}
+
+fn execute_reset_sample_commit(
+    database_path: &Path,
+    request: &EpochActivationRequest,
+    format: OutputFormat,
+) -> Result<String, AppError> {
+    let session =
+        AttributionDatabaseSession::open(database_path, AttributionDatabaseAccess::AppendOnly)
+            .map_err(map_database_error)?;
+    let receipt = AttributionEpochStore::new(session.database())
+        .activate_once(request.clone())
+        .map_err(map_epoch_store_error)?;
+    drop(session);
+
+    let preview = load_reset_sample_preview(database_path, request)?;
+    preview_matches_receipt(&preview, &receipt)?;
+    render_reset_sample(
+        &preview,
+        &receipt.calendar_authority_hash,
+        Some(&receipt.receipt_hash),
+        true,
+        format,
+    )
+}
+
 fn command_format(command: &Command) -> OutputFormat {
     match command {
         Command::Resolve { format, .. }
         | Command::Probe { format, .. }
         | Command::Capture { format, .. }
+        | Command::ResetSample { format, .. }
         | Command::Scheduled { format, .. }
         | Command::Replay { format, .. }
         | Command::Quarter { format, .. } => *format,
@@ -1010,6 +1227,7 @@ fn execute_replay(
     database_path: &Path,
     mode: ReplayMode,
     manifests: &[ManifestArg],
+    epoch: AttributionEpochSelector,
     commit: bool,
     format: OutputFormat,
 ) -> Result<String, AppError> {
@@ -1024,6 +1242,7 @@ fn execute_replay(
     let runner = AttributionReplayRunner::new(session.database(), loader);
     let request = ReplayRequest {
         mode,
+        epoch,
         benchmark_day_manifests: manifest_bindings(manifests),
     };
     if commit {
@@ -1079,10 +1298,27 @@ async fn execute(cli: &Cli) -> Result<String, AppError> {
             let receipt = capture.commit(preview).map_err(map_benchmark_error)?;
             Ok(render_capture_receipt(&receipt, *format))
         }
+        Command::ResetSample {
+            db,
+            at,
+            commit,
+            format,
+        } => {
+            let invoked_at = invocation_time(*at)?;
+            let request = EpochActivationRequest {
+                source: EpochActivationSource::Cli,
+                invoked_at,
+            };
+            if *commit {
+                return execute_reset_sample_commit(db, &request, *format);
+            }
+            execute_reset_sample_preview(db, &request, *format)
+        }
         Command::Scheduled {
             db,
             at,
             manifests,
+            epoch,
             commit,
             format,
         } => {
@@ -1091,6 +1327,7 @@ async fn execute(cli: &Cli) -> Result<String, AppError> {
                 db,
                 ReplayMode::Scheduled { invoked_at },
                 manifests,
+                epoch.0.clone(),
                 *commit,
                 *format,
             )
@@ -1101,6 +1338,7 @@ async fn execute(cli: &Cli) -> Result<String, AppError> {
             to,
             at,
             manifests,
+            epoch,
             commit,
             format,
         } => {
@@ -1116,6 +1354,7 @@ async fn execute(cli: &Cli) -> Result<String, AppError> {
                     invoked_at,
                 },
                 manifests,
+                epoch.0.clone(),
                 *commit,
                 *format,
             )
@@ -1126,6 +1365,7 @@ async fn execute(cli: &Cli) -> Result<String, AppError> {
             quarter,
             at,
             manifests,
+            epoch,
             commit,
             format,
         } => {
@@ -1138,6 +1378,7 @@ async fn execute(cli: &Cli) -> Result<String, AppError> {
                     invoked_at,
                 },
                 manifests,
+                epoch.0.clone(),
                 *commit,
                 *format,
             )
@@ -1197,18 +1438,22 @@ mod tests {
                     id INTEGER PRIMARY KEY, plan_id TEXT NOT NULL UNIQUE,
                     code TEXT NOT NULL, name TEXT NOT NULL, direction TEXT NOT NULL,
                     price REAL NOT NULL, quantity INTEGER NOT NULL, status TEXT NOT NULL,
-                    fill_price REAL, virtual_reason TEXT NOT NULL, ts TEXT NOT NULL
+                    fill_price REAL, not_fill_reason TEXT, virtual_reason TEXT NOT NULL,
+                    account_mode TEXT NOT NULL, data_mode TEXT NOT NULL,
+                    ts TEXT NOT NULL, updated_at TEXT NOT NULL
                  );
                  CREATE TABLE order_audit (
                     id INTEGER PRIMARY KEY, business_order_id TEXT NOT NULL,
                     source TEXT NOT NULL, decision_basis TEXT NOT NULL, side TEXT NOT NULL,
                     code TEXT NOT NULL, requested_price REAL NOT NULL, execution_price REAL,
                     quantity INTEGER NOT NULL, quote_observed_at TEXT, outcome TEXT NOT NULL,
-                    failure_reason TEXT, created_at TEXT NOT NULL
+                    failure_reason TEXT,
+                    created_at TEXT NOT NULL DEFAULT '2026-08-27 02:00:01'
                  );
                  CREATE TABLE order_audit_chain (
                     order_audit_id INTEGER PRIMARY KEY, previous_hash TEXT NOT NULL,
-                    record_hash TEXT NOT NULL, created_at TEXT NOT NULL
+                    record_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT '2026-08-27 02:00:01'
                  );
                  CREATE TABLE stock_daily (
                     id INTEGER PRIMARY KEY, code TEXT NOT NULL, date TEXT NOT NULL,
@@ -1217,6 +1462,43 @@ mod tests {
                  );",
             )
             .expect("TEST_CODE source schema");
+    }
+
+    fn append_activation_carry_source(path: &Path) {
+        use stock_analysis::database::order_audit::OrderAuditRecord;
+
+        let connection = Connection::open(path).expect("TEST_CODE activation source database");
+        connection
+            .execute(
+                "INSERT INTO paper_trades
+                 (id,plan_id,code,name,direction,price,quantity,status,fill_price,not_fill_reason,
+                  virtual_reason,account_mode,data_mode,ts,updated_at)
+                 VALUES (1,'TEST_CODE_PLAN_BUY','TEST_CODE_600001','TEST_CODE company','buy',
+                         10.0,100,'Filled',10.0,NULL,'TEST_CODE activation','Normal','Full',
+                         '2026-08-27 02:00:00','2026-08-27 02:00:00')",
+                [],
+            )
+            .expect("TEST_CODE legacy paper fill");
+        drop(connection);
+
+        let session = AttributionDatabaseSession::open(path, AttributionDatabaseAccess::AppendOnly)
+            .expect("TEST_CODE activation source session");
+        session
+            .database()
+            .record_order_audit(&OrderAuditRecord {
+                business_order_id: "TEST_CODE_PLAN_BUY",
+                source: "PaperTrade",
+                decision_basis: "TEST_CODE activation",
+                side: "buy",
+                code: "TEST_CODE_600001",
+                requested_price: 10.0,
+                execution_price: Some(10.0),
+                quantity: 100,
+                quote_observed_at: Some("2026-08-27T10:00:00+08:00"),
+                outcome: "Filled",
+                failure_reason: None,
+            })
+            .expect("TEST_CODE canonical terminal audit chain");
     }
 
     fn sidecar(path: &Path, suffix: &str) -> PathBuf {
@@ -1351,11 +1633,12 @@ mod tests {
     }
 
     #[test]
-    fn parser_exposes_six_commands_and_requires_explicit_database_and_manifests() {
+    fn parser_exposes_seven_commands_and_requires_explicit_database_and_manifests() {
         for command in [
             "resolve",
             "probe",
             "capture",
+            "reset-sample",
             "scheduled",
             "replay",
             "quarter",
@@ -1392,6 +1675,105 @@ mod tests {
             "5",
             "--manifest",
             &manifest(),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn replay_commands_default_to_active_and_accept_only_stable_epoch_selectors() {
+        let scheduled = Cli::try_parse_from([
+            "strategy_attribution",
+            "scheduled",
+            "--db",
+            "TEST_CODE.sqlite",
+            "--manifest",
+            &manifest(),
+        ])
+        .expect("TEST_CODE scheduled active selector default");
+        assert!(matches!(
+            scheduled.command,
+            Command::Scheduled {
+                epoch: EpochSelectorArg(AttributionEpochSelector::Active),
+                ..
+            }
+        ));
+
+        for (raw, expected) in [
+            ("legacy".to_owned(), AttributionEpochSelector::Legacy),
+            (
+                "a".repeat(64),
+                AttributionEpochSelector::Exact("a".repeat(64)),
+            ),
+        ] {
+            let parsed = Cli::try_parse_from([
+                "strategy_attribution",
+                "replay",
+                "--db",
+                "TEST_CODE.sqlite",
+                "--from",
+                "2026-08-21",
+                "--to",
+                "2026-08-21",
+                "--manifest",
+                &manifest(),
+                "--epoch",
+                raw.as_str(),
+            ])
+            .expect("TEST_CODE stable explicit selector");
+            assert!(matches!(
+                parsed.command,
+                Command::Replay {
+                    epoch: EpochSelectorArg(ref actual),
+                    ..
+                } if actual == &expected
+            ));
+        }
+
+        for invalid in ["arbitrary".to_owned(), "a".repeat(63), "A".repeat(64)] {
+            assert!(Cli::try_parse_from([
+                "strategy_attribution",
+                "quarter",
+                "--db",
+                "TEST_CODE.sqlite",
+                "--year",
+                "2026",
+                "--quarter",
+                "3",
+                "--manifest",
+                &manifest(),
+                "--epoch",
+                invalid.as_str(),
+            ])
+            .is_err());
+        }
+
+        assert!(Cli::try_parse_from([
+            "strategy_attribution",
+            "capture",
+            "--granularity",
+            "daily",
+            "--from",
+            "2026-08-21",
+            "--to",
+            "2026-08-21",
+            "--epoch",
+            "legacy",
+        ])
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["strategy_attribution", "resolve", "--epoch", "legacy",]).is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "strategy_attribution",
+            "probe",
+            "--granularity",
+            "daily",
+            "--from",
+            "2026-08-21",
+            "--to",
+            "2026-08-21",
+            "--epoch",
+            "legacy",
         ])
         .is_err());
     }
@@ -1483,6 +1865,299 @@ mod tests {
         assert_eq!(value["真实适配器已调用"], false);
         assert_eq!(value["writer已初始化"], false);
         assert_eq!(value["预期自然季度"], json!(["2026-Q1", "2026-Q2"]));
+    }
+
+    #[tokio::test]
+    async fn reset_sample_preview_is_research_only_and_byte_immutable() {
+        let path = test_database_path("reset_preview");
+        create_source_schema(&path);
+        let before = database_state(&path);
+        let path_text = path.to_string_lossy().into_owned();
+        let cli = Cli::try_parse_from([
+            "strategy_attribution",
+            "reset-sample",
+            "--db",
+            path_text.as_str(),
+            "--at",
+            "2026-08-28T15:40:00+08:00",
+            "--format",
+            "json",
+        ])
+        .expect("TEST_CODE reset preview command");
+
+        let output = execute(&cli)
+            .await
+            .expect("TEST_CODE reset preview succeeds");
+        let value: Value = serde_json::from_str(&output).expect("TEST_CODE reset preview JSON");
+        assert_eq!(value["状态"], "ResearchOnly");
+        assert_eq!(value["数据库已写入"], false);
+        assert_eq!(value["epoch"]["completed交易日"], "2026-08-28");
+        assert_eq!(value["epoch"]["effective交易日"], "2026-08-31");
+        assert_eq!(value["冻结源"]["paper_trade高水位"], 0);
+        assert_eq!(value["冻结源"]["order_audit高水位"], 0);
+        assert_eq!(value["carry"]["代码与股数"], json!([]));
+        assert_eq!(value["epoch"]["身份"].as_str().map(str::len), Some(64));
+        assert_eq!(
+            value["carry"]["manifest哈希"].as_str().map(str::len),
+            Some(64)
+        );
+        assert_eq!(value["日历权威哈希"].as_str().map(str::len), Some(64));
+        assert_eq!(value["receipt身份"], Value::Null);
+
+        let markdown = Cli::try_parse_from([
+            "strategy_attribution",
+            "reset-sample",
+            "--db",
+            path_text.as_str(),
+            "--at",
+            "2026-08-28T15:40:00+08:00",
+        ])
+        .expect("TEST_CODE reset Markdown preview command");
+        let markdown = execute(&markdown)
+            .await
+            .expect("TEST_CODE reset Markdown preview succeeds");
+        for field in [
+            "数据库已写入：否",
+            "Epoch 身份：",
+            "Paper trade 高水位：",
+            "Order audit 高水位：",
+            "Carry manifest 哈希：",
+            "Carry 代码/股数：",
+            "日历权威哈希：",
+            "Receipt 身份：未提交",
+            "研究边界：ResearchOnly",
+        ] {
+            assert!(markdown.contains(field), "TEST_CODE Markdown field {field}");
+        }
+        assert_eq!(database_state(&path), before);
+        cleanup_database(&path);
+    }
+
+    #[tokio::test]
+    async fn reset_sample_preview_preserves_clean_wal_header_without_sidecars() {
+        let path = test_database_path("reset_preview_clean_wal");
+        create_source_schema(&path);
+        let connection = Connection::open(&path).expect("TEST_CODE clean WAL source");
+        let journal_mode: String = connection
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .expect("TEST_CODE enable WAL header");
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("TEST_CODE clean WAL checkpoint");
+        drop(connection);
+        for sidecar in [sidecar(&path, "-wal"), sidecar(&path, "-shm")] {
+            if sidecar.exists() {
+                fs::remove_file(sidecar).expect("TEST_CODE remove clean WAL sidecar");
+            }
+        }
+        let before = database_state(&path);
+        assert!(before[1].is_none());
+        assert!(before[2].is_none());
+        let path_text = path.to_string_lossy().into_owned();
+        let cli = Cli::try_parse_from([
+            "strategy_attribution",
+            "reset-sample",
+            "--db",
+            path_text.as_str(),
+            "--at",
+            "2026-08-28T15:40:00+08:00",
+            "--format",
+            "json",
+        ])
+        .expect("TEST_CODE clean WAL reset preview command");
+
+        execute(&cli)
+            .await
+            .expect("TEST_CODE clean WAL reset preview succeeds");
+        assert_eq!(database_state(&path), before);
+        cleanup_database(&path);
+    }
+
+    #[tokio::test]
+    async fn reset_sample_rejects_wrong_timezone_and_service_marks_ineligible_times_unavailable() {
+        let path = test_database_path("reset_time_boundary");
+        create_source_schema(&path);
+        let before = database_state(&path);
+        let path_text = path.to_string_lossy().into_owned();
+
+        assert!(Cli::try_parse_from([
+            "strategy_attribution",
+            "reset-sample",
+            "--db",
+            path_text.as_str(),
+            "--at",
+            "2026-08-28 15:40:00",
+        ])
+        .is_err());
+
+        let wrong_timezone = Cli::try_parse_from([
+            "strategy_attribution",
+            "reset-sample",
+            "--db",
+            path_text.as_str(),
+            "--at",
+            "2026-08-28T15:40:00+09:00",
+        ])
+        .expect("TEST_CODE RFC3339 grammar accepts offset before CLI validation");
+        let timezone_error = execute(&wrong_timezone)
+            .await
+            .expect_err("TEST_CODE reset requires exact +08:00");
+        assert_eq!(timezone_error.class, AppErrorClass::Usage);
+        assert_eq!(
+            timezone_error.code,
+            "invocation_timezone_must_be_plus_08_00"
+        );
+
+        for (at, expected_code, retryable) in [
+            (
+                "2026-08-28T09:00:00+08:00",
+                "attribution_epoch_window_not_open",
+                true,
+            ),
+            (
+                "2026-08-28T14:30:00+08:00",
+                "attribution_epoch_window_not_open",
+                true,
+            ),
+            (
+                "2026-08-28T15:51:00+08:00",
+                "attribution_epoch_window_closed",
+                false,
+            ),
+            (
+                "2026-08-29T15:40:00+08:00",
+                "attribution_epoch_non_trading_day",
+                false,
+            ),
+            (
+                "2026-10-01T15:40:00+08:00",
+                "attribution_epoch_non_trading_day",
+                false,
+            ),
+        ] {
+            let cli = Cli::try_parse_from([
+                "strategy_attribution",
+                "reset-sample",
+                "--db",
+                path_text.as_str(),
+                "--at",
+                at,
+            ])
+            .expect("TEST_CODE ineligible reset grammar");
+            let error = execute(&cli)
+                .await
+                .expect_err("TEST_CODE activation service rejects ineligible time");
+            assert_eq!(error.class, AppErrorClass::Unavailable, "TEST_CODE {at}");
+            assert_eq!(error.code, expected_code, "TEST_CODE {at}");
+            assert_eq!(error.retryable, retryable, "TEST_CODE {at}");
+        }
+        assert_eq!(database_state(&path), before);
+        cleanup_database(&path);
+    }
+
+    #[tokio::test]
+    async fn reset_sample_commit_returns_complete_receipt_and_retry_reuses_single_epoch() {
+        let path = test_database_path("reset_commit_retry");
+        create_source_schema(&path);
+        append_activation_carry_source(&path);
+        let path_text = path.to_string_lossy().into_owned();
+        let cli = Cli::try_parse_from([
+            "strategy_attribution",
+            "reset-sample",
+            "--db",
+            path_text.as_str(),
+            "--at",
+            "2026-08-28T15:40:00+08:00",
+            "--commit",
+            "--format",
+            "json",
+        ])
+        .expect("TEST_CODE reset commit command");
+
+        let first = execute(&cli).await.expect("TEST_CODE first reset commit");
+        let retried = execute(&cli)
+            .await
+            .expect("TEST_CODE idempotent reset retry");
+        let first: Value = serde_json::from_str(&first).expect("TEST_CODE first receipt JSON");
+        let retried: Value =
+            serde_json::from_str(&retried).expect("TEST_CODE retried receipt JSON");
+        assert_eq!(first["状态"], "ResearchOnly");
+        assert_eq!(first["数据库已写入"], true);
+        assert_eq!(first["epoch"]["completed交易日"], "2026-08-28");
+        assert_eq!(first["epoch"]["effective交易日"], "2026-08-31");
+        assert_eq!(first["冻结源"]["paper_trade高水位"], 1);
+        assert_eq!(first["冻结源"]["order_audit高水位"], 1);
+        assert_eq!(
+            first["carry"]["代码与股数"],
+            json!([{"code": "TEST_CODE_600001", "quantity": 100}])
+        );
+        assert_eq!(first["epoch"]["身份"], retried["epoch"]["身份"]);
+        assert_eq!(first["receipt身份"], retried["receipt身份"]);
+        assert_eq!(first["receipt身份"].as_str().map(str::len), Some(64));
+        assert_eq!(first["日历权威哈希"].as_str().map(str::len), Some(64));
+        assert_eq!(
+            first["carry"]["manifest哈希"].as_str().map(str::len),
+            Some(64)
+        );
+
+        let connection = Connection::open(&path).expect("TEST_CODE inspect epoch commit");
+        assert_eq!(
+            scalar(
+                &connection,
+                "SELECT COUNT(*) FROM attribution_sample_epoch_receipt"
+            ),
+            1
+        );
+        assert_eq!(
+            scalar(
+                &connection,
+                "SELECT COUNT(*) FROM attribution_sample_epoch_receipt_chain"
+            ),
+            1
+        );
+        assert_eq!(
+            scalar(
+                &connection,
+                "SELECT COUNT(DISTINCT success_receipt_hash) FROM attribution_epoch_attempt_audit WHERE outcome='success'"
+            ),
+            1
+        );
+        drop(connection);
+        cleanup_database(&path);
+    }
+
+    #[tokio::test]
+    async fn scheduled_active_selector_fails_closed_without_legacy_fallback() {
+        let path = test_database_path("active_no_legacy_fallback");
+        create_source_schema(&path);
+        drop(
+            AttributionDatabaseSession::open(&path, AttributionDatabaseAccess::AppendOnly)
+                .expect("TEST_CODE install epoch schema without activation"),
+        );
+        let before = database_state(&path);
+        let path_text = path.to_string_lossy().into_owned();
+        let manifest = manifest();
+        let cli = Cli::try_parse_from([
+            "strategy_attribution",
+            "scheduled",
+            "--db",
+            path_text.as_str(),
+            "--at",
+            "2026-08-21T15:30:00+08:00",
+            "--manifest",
+            manifest.as_str(),
+        ])
+        .expect("TEST_CODE active scheduled command");
+
+        let error = execute(&cli)
+            .await
+            .expect_err("TEST_CODE missing active epoch must fail closed");
+        assert_eq!(error.class, AppErrorClass::Unavailable);
+        assert_eq!(error.stage, "epoch");
+        assert_eq!(error.code, "attribution_epoch_unavailable");
+        assert_eq!(database_state(&path), before);
+        cleanup_database(&path);
     }
 
     #[tokio::test]
