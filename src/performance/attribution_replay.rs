@@ -6473,10 +6473,12 @@ mod tests {
         assert_eq!(prepared.mixed_exit_count(), 1);
         assert_eq!(prepared.report().source_fill_ids(), &[560, 570]);
         assert_eq!(prepared.report().total_closed_cycles(), 1);
+        assert_eq!(prepared.report().coverage_days(), Some(2));
         assert!(matches!(
             prepared.report().conclusion(),
             AttributionConclusion::InsufficientSample { reasons, .. }
                 if reasons.iter().any(|reason| reason.contains("closed_cycles_1_below_200"))
+                    && reasons.iter().any(|reason| reason.contains("coverage_days_2_below_84"))
         ));
         let committed = runner
             .commit_with_report(request(AttributionEpochSelector::Active))
