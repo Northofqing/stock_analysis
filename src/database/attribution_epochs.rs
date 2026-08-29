@@ -306,7 +306,7 @@ impl VerifiedEpochFillSet {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedAttributionEpoch {
     Legacy,
-    Epoch(AttributionEpochReceipt),
+    Epoch(Box<AttributionEpochReceipt>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2958,7 +2958,7 @@ fn load_selector_with_connection(
                 ));
             }
             receipt_value(&rows[0])
-                .map(ResolvedAttributionEpoch::Epoch)
+                .map(|receipt| ResolvedAttributionEpoch::Epoch(Box::new(receipt)))
                 .map_err(map_integrity)
         }
         AttributionEpochSelector::Exact(epoch_id) => rows
@@ -2971,7 +2971,7 @@ fn load_selector_with_connection(
             })
             .and_then(|row| {
                 receipt_value(row)
-                    .map(ResolvedAttributionEpoch::Epoch)
+                    .map(|receipt| ResolvedAttributionEpoch::Epoch(Box::new(receipt)))
                     .map_err(map_integrity)
             }),
     }
@@ -2988,7 +2988,7 @@ pub(crate) fn load_exact_on_connection(
         conn,
         &AttributionEpochSelector::Exact(epoch_id.to_owned()),
     )? {
-        ResolvedAttributionEpoch::Epoch(receipt) => Ok(receipt),
+        ResolvedAttributionEpoch::Epoch(receipt) => Ok(*receipt),
         ResolvedAttributionEpoch::Legacy => Err(failed_integrity(
             "BR-255 exact attribution epoch unexpectedly resolved as Legacy",
         )),
@@ -3453,7 +3453,7 @@ impl<'a> AttributionEpochStore<'a> {
         checkout.transaction_with_authority(map_database_authority_error, |conn, authority| {
             let resolved = load_selector_with_connection(conn, &AttributionEpochSelector::Active)?;
             let receipt = match &resolved {
-                ResolvedAttributionEpoch::Epoch(receipt) => receipt.clone(),
+                ResolvedAttributionEpoch::Epoch(receipt) => receipt.as_ref().clone(),
                 ResolvedAttributionEpoch::Legacy => {
                     unreachable!("active selector cannot resolve Legacy")
                 }
@@ -3476,7 +3476,7 @@ impl<'a> AttributionEpochStore<'a> {
 
     pub fn verify_active(&self) -> Result<AttributionEpochReceipt, AttributionEpochStoreError> {
         match self.load_selector(&AttributionEpochSelector::Active)? {
-            ResolvedAttributionEpoch::Epoch(receipt) => Ok(receipt),
+            ResolvedAttributionEpoch::Epoch(receipt) => Ok(*receipt),
             ResolvedAttributionEpoch::Legacy => unreachable!(),
         }
     }
@@ -4647,7 +4647,7 @@ mod tests {
 
     impl Drop for TestDatabaseCleanup {
         fn drop(&mut self) {
-            if self.path == PathBuf::from(":memory:") {
+            if self.path.as_path() == Path::new(":memory:") {
                 return;
             }
             for suffix in ["", "-wal", "-shm"] {
@@ -5266,7 +5266,7 @@ mod tests {
         let mut conn = database.manager.get_conn().unwrap();
         let verified = load_verified_epoch_fills_until(
             &mut conn,
-            &ResolvedAttributionEpoch::Epoch(receipt.clone()),
+            &ResolvedAttributionEpoch::Epoch(Box::new(receipt.clone())),
             NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
         )
         .unwrap();
@@ -5285,7 +5285,7 @@ mod tests {
         let mut conn = database.manager.get_conn().unwrap();
         let error = load_verified_epoch_fills_until(
             &mut conn,
-            &ResolvedAttributionEpoch::Epoch(receipt),
+            &ResolvedAttributionEpoch::Epoch(Box::new(receipt)),
             NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
         )
         .unwrap_err();
@@ -5311,7 +5311,7 @@ mod tests {
         let mut conn = database.manager.get_conn().unwrap();
         let verified = load_verified_epoch_fills_until(
             &mut conn,
-            &ResolvedAttributionEpoch::Epoch(receipt),
+            &ResolvedAttributionEpoch::Epoch(Box::new(receipt)),
             NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
         )
         .unwrap();
@@ -5887,7 +5887,7 @@ mod tests {
         let mut conn = loading_database.manager.get_conn().unwrap();
         let loading_error = load_verified_epoch_fills_until(
             &mut conn,
-            &ResolvedAttributionEpoch::Epoch(receipt),
+            &ResolvedAttributionEpoch::Epoch(Box::new(receipt)),
             NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
         )
         .unwrap_err();
@@ -5946,7 +5946,7 @@ mod tests {
         let mut conn = loading_database.manager.get_conn().unwrap();
         let loading_error = load_verified_epoch_fills_until(
             &mut conn,
-            &ResolvedAttributionEpoch::Epoch(receipt),
+            &ResolvedAttributionEpoch::Epoch(Box::new(receipt)),
             NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
         )
         .unwrap_err();
@@ -6728,7 +6728,7 @@ mod tests {
     }
 
     fn insert_persisted_receipt(conn: &mut SqliteConnection, row: &mut PersistedReceipt) {
-        row.receipt_hash = receipt_hash(&row).unwrap();
+        row.receipt_hash = receipt_hash(row).unwrap();
         diesel::sql_query(
             "INSERT INTO attribution_sample_epoch_receipt
              (epoch_id, cutover_completed_trading_date, effective_trading_date,

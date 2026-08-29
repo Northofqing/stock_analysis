@@ -809,10 +809,11 @@ fn connection_attestation_token(
 fn validate_connection_attestation_token_protection(
     connection: &mut SqliteConnection,
 ) -> Result<(), ConnectionManagerError> {
-    let count = diesel::sql_query(format!(
+    let count = diesel::sql_query(
         "SELECT COUNT(*) AS count FROM sqlite_temp_master \
          WHERE type='trigger' AND name IN (?, ?)"
-    ))
+            .to_string(),
+    )
     .bind::<diesel::sql_types::Text, _>(DESCRIPTOR_ATTESTATION_NO_UPDATE_TRIGGER)
     .bind::<diesel::sql_types::Text, _>(DESCRIPTOR_ATTESTATION_NO_DELETE_TRIGGER)
     .get_result::<SqliteAttestationTriggerCountRow>(connection)

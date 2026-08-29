@@ -859,7 +859,7 @@ mod tests {
     #[test]
     fn verified_next_a_share_trading_day_fails_outside_checked_in_coverage() {
         let error = verified_next_a_share_trading_day(
-            NaiveDate::from_ymd_opt(2026, 12, 31).expect("TEST_CODE date")
+            NaiveDate::from_ymd_opt(2026, 12, 31).expect("TEST_CODE date"),
         )
         .expect_err("TEST_CODE missing next-year authority must fail");
         assert!(error.contains("coverage unavailable"));

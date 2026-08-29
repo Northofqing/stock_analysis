@@ -328,9 +328,9 @@ fn validate_rows<'a>(
     Ok(validated)
 }
 
-fn canonical_source_fill_index<'a>(
-    source_rows: &'a [EconomicFillRow],
-) -> Result<BTreeMap<i64, (NaiveDateTime, &'a EconomicFillRow)>, String> {
+fn canonical_source_fill_index(
+    source_rows: &[EconomicFillRow],
+) -> Result<BTreeMap<i64, (NaiveDateTime, &EconomicFillRow)>, String> {
     let mut seen_ids = HashSet::new();
     let mut seen_plan_ids = HashSet::new();
     let mut sources = BTreeMap::new();

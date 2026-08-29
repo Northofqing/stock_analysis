@@ -801,32 +801,29 @@ impl AttributionEpochReplayEvidence {
     fn resolved(
         selector: AttributionEpochSelector,
         receipt: &AttributionEpochReceipt,
-        exclusions: Vec<EpochExclusion>,
-        exclusion_manifest_hash: String,
-        remaining_quarantine: Vec<LegacyCarryPosition>,
-        released_codes: usize,
-        scoped_fill_manifest_hash: String,
-        verified_filled_manifest_hash: String,
-        verified_terminal_binding_manifest_hash: String,
-        verified_order_audit_tip_hash: String,
+        scope: ResolvedAttributionEpochReplayScope,
     ) -> Self {
-        let overlap_buy_count = exclusions
+        let overlap_buy_count = scope
+            .exclusions
             .iter()
             .filter(|item| {
                 item.reason == EpochExclusionReason::LegacyCarryOverlap && item.direction == "buy"
             })
             .count();
-        let overlap_sell_count = exclusions
+        let overlap_sell_count = scope
+            .exclusions
             .iter()
             .filter(|item| {
                 item.reason == EpochExclusionReason::LegacyCarryOverlap && item.direction == "sell"
             })
             .count();
-        let mixed_exit_count = exclusions
+        let mixed_exit_count = scope
+            .exclusions
             .iter()
             .filter(|item| item.reason == EpochExclusionReason::MixedLegacyCarryExit)
             .count();
-        let excluded_fill_count = exclusions
+        let excluded_fill_count = scope
+            .exclusions
             .iter()
             .map(|item| item.fill_id)
             .collect::<BTreeSet<_>>()
@@ -837,18 +834,20 @@ impl AttributionEpochReplayEvidence {
             receipt_hash: Some(receipt.receipt_hash.clone()),
             effective_date: Some(receipt.effective_trading_date),
             legacy_carry_manifest_hash: Some(receipt.legacy_carry_manifest_hash.clone()),
-            exclusion_manifest_hash: Some(exclusion_manifest_hash),
-            remaining_quarantine,
-            released_codes,
-            excluded_fills: exclusions,
+            exclusion_manifest_hash: Some(scope.exclusion_manifest_hash),
+            remaining_quarantine: scope.remaining_quarantine,
+            released_codes: scope.released_codes,
+            excluded_fills: scope.exclusions,
             overlap_buy_count,
             overlap_sell_count,
             mixed_exit_count,
             excluded_fill_count,
-            scoped_fill_manifest_hash,
-            verified_filled_manifest_hash: Some(verified_filled_manifest_hash),
-            verified_terminal_binding_manifest_hash: Some(verified_terminal_binding_manifest_hash),
-            verified_order_audit_tip_hash: Some(verified_order_audit_tip_hash),
+            scoped_fill_manifest_hash: scope.scoped_fill_manifest_hash,
+            verified_filled_manifest_hash: Some(scope.verified_filled_manifest_hash),
+            verified_terminal_binding_manifest_hash: Some(
+                scope.verified_terminal_binding_manifest_hash,
+            ),
+            verified_order_audit_tip_hash: Some(scope.verified_order_audit_tip_hash),
         }
     }
 
@@ -903,6 +902,17 @@ impl AttributionEpochReplayEvidence {
     pub fn excluded_fill_count(&self) -> usize {
         self.excluded_fill_count
     }
+}
+
+struct ResolvedAttributionEpochReplayScope {
+    exclusions: Vec<EpochExclusion>,
+    exclusion_manifest_hash: String,
+    remaining_quarantine: Vec<LegacyCarryPosition>,
+    released_codes: usize,
+    scoped_fill_manifest_hash: String,
+    verified_filled_manifest_hash: String,
+    verified_terminal_binding_manifest_hash: String,
+    verified_order_audit_tip_hash: String,
 }
 
 /// Loader 签发的 BR-251 replay capability。
@@ -4093,14 +4103,18 @@ fn scope_verified_epoch_replay(
     let epoch = AttributionEpochReplayEvidence::resolved(
         selector.clone(),
         receipt,
-        scoped.exclusions,
-        exclusion_manifest_hash,
-        scoped.remaining_quarantine,
-        scoped.released_codes,
-        scoped_fill_manifest_hash,
-        verified.filled_manifest_hash().to_owned(),
-        verified.terminal_binding_manifest_hash().to_owned(),
-        verified.order_audit_tip_hash().to_owned(),
+        ResolvedAttributionEpochReplayScope {
+            exclusions: scoped.exclusions,
+            exclusion_manifest_hash,
+            remaining_quarantine: scoped.remaining_quarantine,
+            released_codes: scoped.released_codes,
+            scoped_fill_manifest_hash,
+            verified_filled_manifest_hash: verified.filled_manifest_hash().to_owned(),
+            verified_terminal_binding_manifest_hash: verified
+                .terminal_binding_manifest_hash()
+                .to_owned(),
+            verified_order_audit_tip_hash: verified.order_audit_tip_hash().to_owned(),
+        },
     );
     Ok(ScopedVerifiedEpochReplay {
         verified_fills,
@@ -6714,20 +6728,23 @@ mod tests {
         let unresolved_hash = unresolved.source_summary_hash(&error);
         assert_ne!(legacy_hash, unresolved_hash);
 
-        unresolved.record_resolved_epoch(&ResolvedAttributionEpoch::Epoch(receipt.clone()));
+        unresolved
+            .record_resolved_epoch(&ResolvedAttributionEpoch::Epoch(Box::new(receipt.clone())));
         let resolved_hash = unresolved.source_summary_hash(&error);
         assert_ne!(unresolved_hash, resolved_hash);
         let epoch = AttributionEpochReplayEvidence::resolved(
             AttributionEpochSelector::Active,
             &receipt,
-            Vec::new(),
-            canonical_exclusion_manifest_hash(&[], &[]).unwrap(),
-            Vec::new(),
-            0,
-            canonical_scoped_fill_manifest_hash(&[]).unwrap(),
-            "1".repeat(64),
-            "2".repeat(64),
-            "3".repeat(64),
+            ResolvedAttributionEpochReplayScope {
+                exclusions: Vec::new(),
+                exclusion_manifest_hash: canonical_exclusion_manifest_hash(&[], &[]).unwrap(),
+                remaining_quarantine: Vec::new(),
+                released_codes: 0,
+                scoped_fill_manifest_hash: canonical_scoped_fill_manifest_hash(&[]).unwrap(),
+                verified_filled_manifest_hash: "1".repeat(64),
+                verified_terminal_binding_manifest_hash: "2".repeat(64),
+                verified_order_audit_tip_hash: "3".repeat(64),
+            },
         );
         unresolved.record_epoch_evidence(&epoch);
         assert_ne!(resolved_hash, unresolved.source_summary_hash(&error));
