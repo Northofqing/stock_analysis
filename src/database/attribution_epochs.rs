@@ -1381,10 +1381,6 @@ fn validate_sequence(conn: &mut SqliteConnection, table: &str) -> diesel::QueryR
         .into_iter()
         .map(|row| row.id)
         .collect::<Vec<_>>();
-    #[cfg(test)]
-    if table == "attribution_epoch_attempt_chain" {
-        pause_post_commit_read_back_after_attempt_chain_ids(&ids);
-    }
     let sequences = diesel::sql_query("SELECT seq FROM sqlite_sequence WHERE name = ?")
         .bind::<Text, _>(table)
         .load::<SequenceRow>(conn)?;
@@ -3232,6 +3228,15 @@ fn verify_post_commit_read_back(
                 error.into(),
             )
         })?;
+        #[cfg(test)]
+        {
+            let attempt_chain_ids =
+                load_chain(conn, "attribution_epoch_attempt_chain", "attempt_audit_id")?
+                    .into_iter()
+                    .map(|row| row.id)
+                    .collect::<Vec<_>>();
+            pause_post_commit_read_back_after_attempt_chain_ids(&attempt_chain_ids);
+        }
         if rows.len() != 1 || &receipt_value(&rows[0])? != receipt {
             return Err(failed_integrity(
                 "BR-255 committed activation read-back receipt differs",
@@ -5900,7 +5905,7 @@ mod tests {
         let hook_route = route.clone();
         let hook_detached = detached.clone();
         let hook_replacement = replacement.clone();
-        let _hook = super::super::install_retained_readback_before_open_hook(move || {
+        let _hook = super::super::install_retained_readback_after_checkpoint_hook(move || {
             let mut source = SqliteConnection::establish(&hook_route.to_string_lossy())
                 .expect("TEST_CODE open committed database A for logical clone");
             let checkpoint = diesel::sql_query("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -5947,14 +5952,17 @@ mod tests {
     }
 
     #[test]
-    fn fresh_retained_read_back_catches_same_inode_corruption_hidden_by_writer_cache() {
+    fn reused_descriptor_read_back_catches_same_inode_corruption_after_prior_snapshot() {
         use std::io::{Seek, SeekFrom, Write};
 
         let database = TestDatabase::with_wal_options(4, true);
         install_activation_source(&database.manager);
+        AttributionEpochStore::new(&database.manager)
+            .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
+            .expect("TEST_CODE source-owned reader completes its first read-back snapshot");
         let route = database.path.clone();
         let before = std::fs::metadata(&route).unwrap();
-        let _hook = super::super::install_retained_readback_before_open_hook(move || {
+        let _hook = super::super::install_retained_readback_after_checkpoint_hook(move || {
             let mut retained_main = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&route)
@@ -5969,9 +5977,7 @@ mod tests {
 
         let error = AttributionEpochStore::new(&database.manager)
             .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
-            .expect_err(
-                "TEST_CODE fresh retained-main read-back must reject same-inode corruption",
-            );
+            .expect_err("TEST_CODE reused descriptor reader must reject same-inode corruption");
         assert_ne!(
             error.reason_code(),
             "epoch_attempt_persisted_failure",
@@ -5980,10 +5986,13 @@ mod tests {
     }
 
     #[test]
-    fn authority_bound_read_back_uses_a_fresh_pinned_readonly_connection() {
+    fn authority_bound_read_back_uses_an_independent_attested_query_only_connection() {
         let database = TestDatabase::attested();
         let mut checkout = database.manager.attribution_checkout().unwrap();
         let authority = checkout.authority().unwrap();
+        let writer_token =
+            super::super::connection_attestation_token(checkout.connection_for_test())
+                .expect("TEST_CODE writer registration token");
 
         let error = checkout
             .authority_bound_readonly_snapshot(
@@ -6015,8 +6024,14 @@ mod tests {
                     .get_result::<CountRow>(connection)?
                     .count;
                     assert_eq!(
-                        registration_tables, 0,
-                        "TEST_CODE detached reader must not reuse the writer connection"
+                        registration_tables, 1,
+                        "TEST_CODE descriptor reader retains its own attestation registration"
+                    );
+                    let reader_token = super::super::connection_attestation_token(connection)
+                        .expect("TEST_CODE reader registration token");
+                    assert_ne!(
+                        reader_token, writer_token,
+                        "TEST_CODE descriptor reader must not reuse the writer registration"
                     );
                     diesel::sql_query("CREATE TABLE TEST_CODE_read_back_write(value INTEGER)")
                         .execute(connection)?;
@@ -6074,67 +6089,95 @@ mod tests {
     }
 
     #[test]
-    fn post_commit_read_back_pins_attempt_chain_snapshot_during_second_attempt_commit() {
+    fn complete_activations_serialize_post_commit_read_back_snapshots() {
         let database = TestDatabase::with_wal_options(4, true);
         install_activation_source(&database.manager);
-        let receipt = AttributionEpochStore::new(&database.manager)
-            .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
-            .expect("TEST_CODE initial committed activation");
-        let (ready, ready_wait) = std::sync::mpsc::sync_channel(1);
-        let (release, release_wait) = std::sync::mpsc::sync_channel(1);
-        let reader_receipt = receipt.clone();
-        let writer_input = AttributionEpochAttemptAppend {
-            source: "TEST_CODE read-back interleaving".to_owned(),
-            invoked_at: "2026-08-28T07:40:00.000Z".to_owned(),
-            completed_session_date: Some(receipt.cutover_completed_trading_date),
-            effective_date: Some(receipt.effective_trading_date),
-            outcome: "success".to_owned(),
-            reason_code: "TEST_CODE idempotent success".to_owned(),
-            retryable: false,
-            source_summary_hash: receipt.receipt_hash.clone(),
-            epoch_id: Some(receipt.epoch_id.clone()),
-            success_receipt_hash: Some(receipt.receipt_hash.clone()),
-        };
-        let writer_database = &database.manager;
-        let reader_database = &database.manager;
-        std::thread::scope(|scope| {
-            let reader = scope.spawn(move || {
+        let (first_ready, first_ready_wait) = std::sync::mpsc::sync_channel(1);
+        let (first_release, first_release_wait) = std::sync::mpsc::sync_channel(1);
+        let (second_boundary, second_boundary_wait) = std::sync::mpsc::sync_channel(1);
+        let (second_continue, second_continue_wait) = std::sync::mpsc::sync_channel(1);
+        let (second_contending, second_contending_wait) = std::sync::mpsc::sync_channel(1);
+        let (second_acquired, second_acquired_wait) = std::sync::mpsc::sync_channel(1);
+        let request = activation_request("2026-08-28T15:40:00+08:00");
+        let first_request = request.clone();
+        let manager = &database.manager;
+
+        let (first, second, second_acquired_while_first_held) = std::thread::scope(|scope| {
+            let first = scope.spawn(move || {
                 let _hook = install_post_commit_read_back_hook(PostCommitReadBackHook {
-                    ready,
-                    release: release_wait,
+                    ready: first_ready,
+                    release: first_release_wait,
                 });
-                let mut checkout = reader_database.attribution_checkout().unwrap();
-                let authority = checkout.authority().unwrap();
-                verify_post_commit_read_back(&mut checkout, &authority, &reader_receipt)
+                AttributionEpochStore::new(manager).activate_once_with_outcome(first_request)
             });
             assert_eq!(
-                ready_wait
+                first_ready_wait
                     .recv_timeout(std::time::Duration::from_secs(10))
-                    .expect("TEST_CODE reader reached attempt-chain IDs"),
+                    .expect("TEST_CODE first activation reached attempt-chain snapshot"),
                 vec![1]
             );
-            let (writer_done, writer_result) = std::sync::mpsc::sync_channel(1);
-            let writer = scope.spawn(move || {
-                let result = AttributionEpochStore::new(writer_database)
-                    .append_attempt(writer_input)
-                    .map(|_| ());
-                writer_done
-                    .send(result)
-                    .expect("TEST_CODE writer result notification");
+
+            let second = scope.spawn(move || {
+                let _hook = super::super::install_readback_serialization_hook(
+                    move || {
+                        second_boundary
+                            .send(())
+                            .expect("TEST_CODE second activation reached read-back boundary");
+                        second_continue_wait
+                            .recv_timeout(std::time::Duration::from_secs(10))
+                            .expect("TEST_CODE allow second activation to contend for read-back");
+                        second_contending
+                            .send(())
+                            .expect("TEST_CODE second activation is contending for read-back");
+                    },
+                    move || {
+                        second_acquired
+                            .send(())
+                            .expect("TEST_CODE second activation acquired read-back boundary");
+                    },
+                );
+                AttributionEpochStore::new(manager).activate_once_with_outcome(request)
             });
-            let writer_result = writer_result.recv_timeout(std::time::Duration::from_secs(10));
-            release
+
+            second_boundary_wait
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("TEST_CODE idempotent activation committed before read-back boundary");
+            second_continue
                 .send(())
-                .expect("TEST_CODE reader release before joins");
-            writer.join().expect("TEST_CODE writer join");
-            writer_result
-                .expect("TEST_CODE writer returned before reader release")
-                .expect("TEST_CODE writer append succeeds");
-            reader
-                .join()
-                .expect("TEST_CODE reader join")
-                .expect("TEST_CODE pinned read-back succeeds");
+                .expect("TEST_CODE let second activation contend for read-back");
+            second_contending_wait
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("TEST_CODE second activation left the boundary hook");
+            let second_acquired_while_first_held = second_acquired_wait
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .is_ok();
+            first_release
+                .send(())
+                .expect("TEST_CODE release first read-back before joins");
+            if !second_acquired_while_first_held {
+                second_acquired_wait
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("TEST_CODE second activation acquired after first release");
+            }
+            (
+                first.join().expect("TEST_CODE first activation join"),
+                second.join().expect("TEST_CODE second activation join"),
+                second_acquired_while_first_held,
+            )
         });
+
+        assert!(
+            !second_acquired_while_first_held,
+            "TEST_CODE second complete activation must wait for source-owned read-back serialization"
+        );
+        let first = first.expect("TEST_CODE first complete activation succeeds");
+        let second = second.expect("TEST_CODE second complete activation succeeds");
+        assert_eq!(first.receipt(), second.receipt());
+        assert_eq!(first.disposition(), EpochActivationDisposition::Activated);
+        assert_eq!(
+            second.disposition(),
+            EpochActivationDisposition::AlreadyActive
+        );
         let mut conn = database.manager.get_conn().unwrap();
         assert_eq!(validate_all(&mut conn).unwrap().len(), 1);
         let ids = load_chain(
