@@ -1,6 +1,6 @@
 # 归因样本纪元重置设计
 
-> 状态：Gate A 书面设计待复核；未开发、未发布、未写入生产纪元。
+> 状态：Gate A/B PASS；Gate C 因既有 workspace/help、离线合规 helper 与 coverage 证据缺口保持 blocked；Gate D / production freshness blocked。实现已在功能分支完成，尚未合并、发布或写入生产纪元。
 >
 > 日期：2026-08-28
 >
@@ -128,7 +128,7 @@
 6. 加载完整 paper/audit 来源，严格验证结构、身份、顺序、价格、数量、方向、terminal binding 和完整 order-audit chain；不对 legacy 运行 T+1 经济重建。
 7. 计算全部行高水位、legacy Filled manifest、binding manifest、audit tip 和旧持仓隔离池。
 8. 在同一事务内计算切换前模拟持仓数量投影 hash，插入 epoch/carry/success-attempt，再重新计算投影；两次必须逐代码、数量和 hash 完全一致。
-9. 提交并用新的只读连接重验成功凭证、carry manifest、trigger、chain 和高水位前缀。
+9. 提交后，使用同一数据库 descriptor source 持有且独立于写者的 query-only WAL 连接，在一个新的只读事务中重验成功凭证、carry manifest、trigger、chain 和高水位前缀；读连接与原写连接的 main/WAL/SHM authority 在返回成功前都必须再次验证。
 10. 返回 typed receipt；不创建订单、不修改 paper row、不推送策略结论。
 
 ## 8. 活动纪元读取与旧持仓隔离
