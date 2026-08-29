@@ -190,6 +190,30 @@ pub struct EpochActivationPreview {
     pub terminal_binding_manifest_hash: String,
     pub order_audit_tip_hash: String,
     pub position_projection_hash: String,
+    pub calendar_authority_hash: String,
+    pub receipt_hash: Option<String>,
+}
+
+/// Domain-verified activation result whose receipt and render projection were
+/// frozen from the same activation transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpochActivationOutcome {
+    receipt: AttributionEpochReceipt,
+    projection: EpochActivationPreview,
+}
+
+impl EpochActivationOutcome {
+    pub fn receipt(&self) -> &AttributionEpochReceipt {
+        &self.receipt
+    }
+
+    pub fn projection(&self) -> &EpochActivationPreview {
+        &self.projection
+    }
+
+    fn into_receipt(self) -> AttributionEpochReceipt {
+        self.receipt
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2358,6 +2382,7 @@ fn activation_preview(
     effective: NaiveDate,
     source: FrozenSourceProjection,
     calendar_authority_hash: &str,
+    receipt_hash: Option<String>,
 ) -> Result<EpochActivationPreview, AttributionEpochStoreError> {
     let epoch_id = epoch_identity(completed, effective, &source, calendar_authority_hash)?;
     Ok(EpochActivationPreview {
@@ -2372,6 +2397,45 @@ fn activation_preview(
         terminal_binding_manifest_hash: source.terminal_binding_manifest_hash,
         order_audit_tip_hash: source.order_audit_tip_hash,
         position_projection_hash: source.position_projection_hash,
+        calendar_authority_hash: calendar_authority_hash.to_owned(),
+        receipt_hash,
+    })
+}
+
+fn verified_activation_outcome(
+    receipt: AttributionEpochReceipt,
+    source: FrozenSourceProjection,
+) -> Result<EpochActivationOutcome, AttributionEpochStoreError> {
+    let projection = activation_preview(
+        true,
+        receipt.cutover_completed_trading_date,
+        receipt.effective_trading_date,
+        source,
+        &receipt.calendar_authority_hash,
+        Some(receipt.receipt_hash.clone()),
+    )?;
+    let (carry_item_count, carry_total_quantity) = carry_summary(&projection.carry)?;
+    if projection.epoch_id != receipt.epoch_id
+        || projection.paper_trade_high_water != receipt.paper_trade_high_water
+        || projection.order_audit_high_water != receipt.order_audit_high_water
+        || projection.legacy_filled_manifest_hash != receipt.legacy_filled_manifest_hash
+        || projection.terminal_binding_manifest_hash != receipt.terminal_binding_manifest_hash
+        || projection.order_audit_tip_hash != receipt.order_audit_tip_hash
+        || projection.position_projection_hash != receipt.position_projection_hash
+        || projection.calendar_authority_hash != receipt.calendar_authority_hash
+        || projection.receipt_hash.as_deref() != Some(receipt.receipt_hash.as_str())
+        || canonical_legacy_carry_manifest_hash(&projection.carry)
+            != receipt.legacy_carry_manifest_hash
+        || carry_item_count != receipt.carry_item_count
+        || carry_total_quantity != receipt.carry_total_quantity
+    {
+        return Err(failed_integrity(
+            "BR-255 activation receipt and frozen render projection differ",
+        ));
+    }
+    Ok(EpochActivationOutcome {
+        receipt,
+        projection,
     })
 }
 
@@ -3023,11 +3087,12 @@ fn preview_activation_at_resolved_path(
                         receipt.effective_trading_date,
                         source,
                         &receipt.calendar_authority_hash,
+                        Some(receipt.receipt_hash),
                     );
                 }
             }
             let source = analyze_source_projection(conn, completed, None, true)?;
-            activation_preview(false, completed, effective, source, &calendar_hash)
+            activation_preview(false, completed, effective, source, &calendar_hash, None)
         })
     })();
     let after = preview_sqlite_snapshot(database_path)?;
@@ -3096,6 +3161,14 @@ impl<'a> AttributionEpochStore<'a> {
         &self,
         request: EpochActivationRequest,
     ) -> Result<AttributionEpochReceipt, AttributionEpochStoreError> {
+        self.activate_once_with_outcome(request)
+            .map(EpochActivationOutcome::into_receipt)
+    }
+
+    pub fn activate_once_with_outcome(
+        &self,
+        request: EpochActivationRequest,
+    ) -> Result<EpochActivationOutcome, AttributionEpochStoreError> {
         let (completed, effective, calendar_hash) =
             match resolve_activation_calendar(request.invoked_at) {
                 Ok(resolved) => resolved,
@@ -3134,7 +3207,7 @@ impl<'a> AttributionEpochStore<'a> {
             }
             if let Some(row) = receipts.first() {
                 let receipt = receipt_value(row)?;
-                ensure_source_matches_receipt(conn, &receipt).map_err(|error| {
+                let source = ensure_source_matches_receipt(conn, &receipt).map_err(|error| {
                     activation_error_context("activation_idempotent_verify_source", error)
                 })?;
                 insert_attempt_on_conn(
@@ -3161,14 +3234,20 @@ impl<'a> AttributionEpochStore<'a> {
                         error.into(),
                     )
                 })?;
-                return Ok(receipt);
+                return verified_activation_outcome(receipt, source);
             }
             let source_before =
                 analyze_source_projection(conn, completed, None, true).map_err(|error| {
                     activation_error_context("activation_first_analyze_source", error)
                 })?;
-            let preview =
-                activation_preview(false, completed, effective, source_before, &calendar_hash)?;
+            let preview = activation_preview(
+                false,
+                completed,
+                effective,
+                source_before,
+                &calendar_hash,
+                None,
+            )?;
             let receipt =
                 insert_activation_receipt(conn, &preview, &calendar_hash).map_err(|error| {
                     activation_error_context("activation_first_insert_receipt", error)
@@ -3193,8 +3272,14 @@ impl<'a> AttributionEpochStore<'a> {
                 analyze_source_projection(conn, completed, None, true).map_err(|error| {
                     activation_error_context("activation_first_reanalyze_source", error)
                 })?;
-            let after =
-                activation_preview(false, completed, effective, source_after, &calendar_hash)?;
+            let after = activation_preview(
+                false,
+                completed,
+                effective,
+                source_after,
+                &calendar_hash,
+                None,
+            )?;
             if after != preview {
                 return Err(failed_integrity(
                     "BR-255 source position projection changed during activation",
@@ -3203,17 +3288,18 @@ impl<'a> AttributionEpochStore<'a> {
             validate_all(conn).map_err(|error| {
                 activation_error_context("activation_first_validate_written_state", error.into())
             })?;
-            ensure_source_matches_receipt(conn, &receipt).map_err(|error| {
+            let source = ensure_source_matches_receipt(conn, &receipt).map_err(|error| {
                 activation_error_context("activation_first_verify_written_source", error)
             })?;
-            Ok(receipt)
+            verified_activation_outcome(receipt, source)
         });
         drop(conn);
 
-        let receipt = match primary {
-            Ok(receipt) => receipt,
+        let outcome = match primary {
+            Ok(outcome) => outcome,
             Err(error) => return self.return_audited_failure(&request, error),
         };
+        let receipt = outcome.receipt();
         let read_back = (|| {
             if database_file.trim().is_empty() {
                 return Err(failed_integrity(
@@ -3239,12 +3325,12 @@ impl<'a> AttributionEpochStore<'a> {
                     error.into(),
                 )
             })?;
-            if rows.len() != 1 || receipt_value(&rows[0])? != receipt {
+            if rows.len() != 1 || &receipt_value(&rows[0])? != receipt {
                 return Err(failed_integrity(
                     "BR-255 committed activation read-back receipt differs",
                 ));
             }
-            verify_epoch_source_prefix(&mut read_only, &receipt).map_err(|error| {
+            verify_epoch_source_prefix(&mut read_only, receipt).map_err(|error| {
                 activation_error_context("post_commit_read_back_verify_source_prefix", error)
             })?;
             Ok(())
@@ -3252,7 +3338,7 @@ impl<'a> AttributionEpochStore<'a> {
         if let Err(error) = read_back {
             return self.return_audited_failure(&request, error);
         }
-        Ok(receipt)
+        Ok(outcome)
     }
 
     fn return_audited_failure<T>(
@@ -5056,6 +5142,8 @@ mod tests {
             .preview_activation(&request)
             .expect("TEST_CODE activation preview");
         assert!(!preview.activated);
+        assert_eq!(preview.receipt_hash, None);
+        assert_eq!(preview.calendar_authority_hash.len(), 64);
         assert_eq!(preview.completed_session_date.to_string(), "2026-08-28");
         assert_eq!(preview.effective_date.to_string(), "2026-08-31");
         assert_eq!(preview.paper_trade_high_water, 2);
@@ -5063,12 +5151,43 @@ mod tests {
         assert_eq!(preview.carry[0].code, "TEST_CODE_600001");
         assert_eq!(preview.carry[0].quantity, 100);
 
-        let receipt = store
-            .activate_once(request)
-            .expect("TEST_CODE atomic activation");
+        let outcome = store
+            .activate_once_with_outcome(request.clone())
+            .expect("TEST_CODE atomic activation with verified render projection");
+        let receipt = outcome.receipt();
+        let committed = outcome.projection();
         assert_eq!(receipt.epoch_id, preview.epoch_id);
         assert_eq!(receipt.paper_trade_high_water, 2);
-        assert_eq!(store.verify_active().unwrap(), receipt);
+        assert!(committed.activated);
+        assert_eq!(committed.epoch_id, receipt.epoch_id);
+        assert_eq!(
+            committed.calendar_authority_hash,
+            receipt.calendar_authority_hash
+        );
+        assert_eq!(
+            committed.receipt_hash.as_deref(),
+            Some(receipt.receipt_hash.as_str())
+        );
+        assert_eq!(&store.verify_active().unwrap(), receipt);
+
+        let retained = store
+            .preview_activation(&request)
+            .expect("TEST_CODE retained activation preview");
+        assert!(retained.activated);
+        assert_eq!(
+            retained.calendar_authority_hash,
+            receipt.calendar_authority_hash
+        );
+        assert_eq!(
+            retained.receipt_hash.as_deref(),
+            Some(receipt.receipt_hash.as_str())
+        );
+
+        let retried = store
+            .activate_once_with_outcome(request)
+            .expect("TEST_CODE idempotent rich activation retry");
+        assert_eq!(retried.receipt(), receipt);
+        assert_eq!(retried.projection(), committed);
     }
 
     #[test]

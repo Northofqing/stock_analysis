@@ -3653,6 +3653,10 @@ impl PreparedAttributionReport {
         self.report.excluded_fill_count()
     }
 
+    pub fn scoped_fill_manifest_hash(&self) -> &str {
+        &self.report.epoch.scoped_fill_manifest_hash
+    }
+
     pub fn canonical_result_bytes(&self) -> &[u8] {
         &self.canonical_result_bytes
     }

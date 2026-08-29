@@ -9,15 +9,15 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::{json, Value};
 use stock_analysis::calendar::{
-    resolve_verified_replay_range, resolve_verified_scheduled_replay, VerifiedCalendarError,
-    VerifiedCalendarErrorKind, VerifiedReplayCalendar,
+    resolve_verified_scheduled_replay, VerifiedCalendarError, VerifiedCalendarErrorKind,
+    VerifiedReplayCalendar,
 };
 use stock_analysis::data_gateway::{
     probe_benchmark_request, BenchmarkCapture, BenchmarkError, BenchmarkProbeReport,
     BenchmarkRange, BenchmarkRequest, HS300_CANONICAL,
 };
 use stock_analysis::database::attribution_epochs::{
-    AttributionEpochReceipt, AttributionEpochStore, AttributionEpochStoreError,
+    AttributionEpochStore, AttributionEpochStoreError, EpochActivationOutcome,
     EpochActivationPreview, EpochActivationRequest,
 };
 use stock_analysis::database::attribution_reports::{
@@ -26,6 +26,7 @@ use stock_analysis::database::attribution_reports::{
 };
 use stock_analysis::performance::attribution_epoch::{
     canonical_legacy_carry_manifest_hash, AttributionEpochSelector, EpochActivationSource,
+    EpochExclusion, LegacyCarryPosition,
 };
 use stock_analysis::performance::attribution_replay::{
     AttributionConclusion, AttributionReplayLoader, AttributionReplayRunner, BenchmarkDayManifest,
@@ -573,13 +574,23 @@ fn render_capture_receipt(
     }
 }
 
+enum ResetSampleOutcome<'a> {
+    Preview(&'a EpochActivationPreview),
+    Committed(&'a EpochActivationOutcome),
+}
+
 fn render_reset_sample(
-    preview: &EpochActivationPreview,
-    calendar_authority_hash: &str,
-    receipt_hash: Option<&str>,
-    database_written: bool,
+    outcome: ResetSampleOutcome<'_>,
     format: OutputFormat,
 ) -> Result<String, AppError> {
+    let (preview, database_written, receipt_hash) = match outcome {
+        ResetSampleOutcome::Preview(preview) => (preview, false, preview.receipt_hash.as_deref()),
+        ResetSampleOutcome::Committed(outcome) => (
+            outcome.projection(),
+            true,
+            Some(outcome.receipt().receipt_hash.as_str()),
+        ),
+    };
     let carry_manifest_hash = canonical_legacy_carry_manifest_hash(&preview.carry);
     Ok(match format {
         OutputFormat::Json => json!({
@@ -604,7 +615,7 @@ fn render_reset_sample(
                 "manifest哈希": carry_manifest_hash,
                 "代码与股数": output_value(&preview.carry, "epoch_carry_serialization_failed")?
             },
-            "日历权威哈希": calendar_authority_hash,
+            "日历权威哈希": preview.calendar_authority_hash,
             "receipt身份": receipt_hash,
             "研究边界": "ResearchOnly：仅用于归因样本隔离，不构成策略成功、交易或下单结论"
         })
@@ -636,7 +647,7 @@ fn render_reset_sample(
                 preview.position_projection_hash,
                 carry_manifest_hash,
                 carry,
-                calendar_authority_hash,
+                preview.calendar_authority_hash,
                 receipt_hash.unwrap_or("未提交")
             )
         }
@@ -735,6 +746,148 @@ fn conclusion_value(conclusion: &AttributionConclusion) -> Result<Value, AppErro
             ),
         ])),
     }
+}
+
+struct AttributionEpochRenderProjection<'a> {
+    selector: &'a AttributionEpochSelector,
+    epoch_id: Option<&'a str>,
+    receipt_hash: Option<&'a str>,
+    effective_date: Option<NaiveDate>,
+    legacy_carry_manifest_hash: Option<&'a str>,
+    remaining_quarantine: &'a [LegacyCarryPosition],
+    released_codes: usize,
+    exclusion_manifest_hash: Option<&'a str>,
+    excluded_fills: &'a [EpochExclusion],
+    excluded_fill_count: usize,
+    overlap_buy_count: usize,
+    overlap_sell_count: usize,
+    mixed_exit_count: usize,
+    scoped_fill_manifest_hash: &'a str,
+}
+
+impl<'a> From<&'a PreparedAttributionReport> for AttributionEpochRenderProjection<'a> {
+    fn from(prepared: &'a PreparedAttributionReport) -> Self {
+        Self {
+            selector: prepared.epoch_selector(),
+            epoch_id: prepared.epoch_id(),
+            receipt_hash: prepared.epoch_receipt_hash(),
+            effective_date: prepared.epoch_effective_date(),
+            legacy_carry_manifest_hash: prepared.legacy_carry_manifest_hash(),
+            remaining_quarantine: prepared.remaining_quarantine(),
+            released_codes: prepared.released_codes(),
+            exclusion_manifest_hash: prepared.exclusion_manifest_hash(),
+            excluded_fills: prepared.excluded_fills(),
+            excluded_fill_count: prepared.excluded_fill_count(),
+            overlap_buy_count: prepared.overlap_buy_count(),
+            overlap_sell_count: prepared.overlap_sell_count(),
+            mixed_exit_count: prepared.mixed_exit_count(),
+            scoped_fill_manifest_hash: prepared.scoped_fill_manifest_hash(),
+        }
+    }
+}
+
+fn epoch_evidence_value(epoch: &AttributionEpochRenderProjection<'_>) -> Result<Value, AppError> {
+    Ok(output_object([
+        ("选择器", Value::String(epoch.selector.canonical_value())),
+        (
+            "epoch身份",
+            output_value(&epoch.epoch_id, "report_epoch_serialization_failed")?,
+        ),
+        (
+            "receipt哈希",
+            output_value(&epoch.receipt_hash, "report_epoch_serialization_failed")?,
+        ),
+        (
+            "effective日期",
+            output_value(&epoch.effective_date, "report_epoch_serialization_failed")?,
+        ),
+        (
+            "legacy carry manifest哈希",
+            output_value(
+                &epoch.legacy_carry_manifest_hash,
+                "report_epoch_serialization_failed",
+            )?,
+        ),
+        (
+            "剩余隔离持仓",
+            output_value(
+                epoch.remaining_quarantine,
+                "report_epoch_serialization_failed",
+            )?,
+        ),
+        (
+            "释放代码数",
+            output_value(&epoch.released_codes, "report_epoch_serialization_failed")?,
+        ),
+        (
+            "排除manifest哈希",
+            output_value(
+                &epoch.exclusion_manifest_hash,
+                "report_epoch_serialization_failed",
+            )?,
+        ),
+        (
+            "排除明细",
+            output_value(epoch.excluded_fills, "report_epoch_serialization_failed")?,
+        ),
+        (
+            "排除成交数",
+            output_value(
+                &epoch.excluded_fill_count,
+                "report_epoch_serialization_failed",
+            )?,
+        ),
+        (
+            "overlap买入数",
+            output_value(
+                &epoch.overlap_buy_count,
+                "report_epoch_serialization_failed",
+            )?,
+        ),
+        (
+            "overlap卖出数",
+            output_value(
+                &epoch.overlap_sell_count,
+                "report_epoch_serialization_failed",
+            )?,
+        ),
+        (
+            "mixed-exit数",
+            output_value(&epoch.mixed_exit_count, "report_epoch_serialization_failed")?,
+        ),
+        (
+            "scoped成交manifest哈希",
+            Value::String(epoch.scoped_fill_manifest_hash.to_owned()),
+        ),
+    ]))
+}
+
+fn epoch_evidence_markdown(
+    epoch: &AttributionEpochRenderProjection<'_>,
+) -> Result<String, AppError> {
+    let not_applicable = "不适用";
+    Ok(format!(
+        "- Epoch 选择器：{}\n- Epoch 身份：{}\n- Receipt 哈希：{}\n- Effective 日期：{}\n- Legacy carry manifest 哈希：{}\n- 剩余隔离持仓：{}\n- 释放代码数：{}\n- 排除 manifest 哈希：{}\n- 排除明细：{}\n- 排除成交数：{}\n- Overlap 买入数：{}\n- Overlap 卖出数：{}\n- Mixed-exit 数：{}\n- Scoped 成交 manifest 哈希：{}",
+        epoch.selector.canonical_value(),
+        epoch.epoch_id.unwrap_or(not_applicable),
+        epoch.receipt_hash.unwrap_or(not_applicable),
+        epoch
+            .effective_date
+            .map_or_else(|| not_applicable.to_owned(), |date| date.to_string()),
+        epoch.legacy_carry_manifest_hash.unwrap_or(not_applicable),
+        output_value(
+            epoch.remaining_quarantine,
+            "report_epoch_serialization_failed"
+        )?,
+        epoch.released_codes,
+        epoch.exclusion_manifest_hash.unwrap_or(not_applicable),
+        output_value(epoch.excluded_fills, "report_epoch_serialization_failed")?,
+        epoch.excluded_fill_count,
+        epoch.overlap_buy_count,
+        epoch.overlap_sell_count,
+        epoch.mixed_exit_count,
+        epoch.scoped_fill_manifest_hash,
+    ))
 }
 
 fn prepared_report_value(prepared: &PreparedAttributionReport) -> Result<Value, AppError> {
@@ -848,6 +1001,7 @@ fn prepared_report_value(prepared: &PreparedAttributionReport) -> Result<Value, 
             output_value(report.fee_basis(), "report_outcome_serialization_failed")?,
         ),
     ]);
+    let epoch = AttributionEpochRenderProjection::from(prepared);
     Ok(output_object([
         ("状态", Value::String("ResearchOnly".to_owned())),
         (
@@ -855,6 +1009,7 @@ fn prepared_report_value(prepared: &PreparedAttributionReport) -> Result<Value, 
             Value::String("本报告只用于研究，不构成策略成功、交易或下单结论".to_owned()),
         ),
         ("运行", run),
+        ("归因纪元", epoch_evidence_value(&epoch)?),
         ("证据清单", manifests),
         ("样本", samples),
         ("指标", metrics),
@@ -897,8 +1052,10 @@ fn render_prepared_report(
         "report_family_serialization_failed",
     )?
     .to_string();
+    let epoch = AttributionEpochRenderProjection::from(prepared);
+    let epoch_evidence = epoch_evidence_markdown(&epoch)?;
     Ok(format!(
-        "# 买卖策略历史归因（ResearchOnly）\n\n- 运行模式：{:?}\n- 运行时刻：{}\n- 目标范围：{} 至 {}\n- 规则版本：{}\n- 总周期：{}（闭合 {}，开放/右删失 {}）\n- 覆盖自然日：{}\n- 成交 Manifest：{}\n- 个股收盘 Manifest：{}\n- 基准组合 Manifest：{}\n- 日历权威 Manifest：{}\n\n## 指标与完整分母\n\n- 毛收益：{}\n- 基准收益：{}\n- 毛超额收益：{}\n- 净收益：{}\n- 净超额收益：{}\n- 毛胜率：{}\n- 净胜率可用性：{}\n- 按入场族归因：{}\n\n## 样本门与结论\n\n{}\n\n> 本报告只用于研究，不构成策略成功、交易或下单结论。不可用原因保留在总分母中，缺失字段未补零。",
+        "# 买卖策略历史归因（ResearchOnly）\n\n- 运行模式：{:?}\n- 运行时刻：{}\n- 目标范围：{} 至 {}\n- 规则版本：{}\n- 总周期：{}（闭合 {}，开放/右删失 {}）\n- 覆盖自然日：{}\n- 成交 Manifest：{}\n- 个股收盘 Manifest：{}\n- 基准组合 Manifest：{}\n- 日历权威 Manifest：{}\n\n## 归因纪元证据\n\n{}\n\n## 指标与完整分母\n\n- 毛收益：{}\n- 基准收益：{}\n- 毛超额收益：{}\n- 净收益：{}\n- 净超额收益：{}\n- 毛胜率：{}\n- 净胜率可用性：{}\n- 按入场族归因：{}\n\n## 样本门与结论\n\n{}\n\n> 本报告只用于研究，不构成策略成功、交易或下单结论。不可用原因保留在总分母中，缺失字段未补零。",
         invocation.mode,
         invocation.invoked_at.to_rfc3339(),
         invocation.target_from,
@@ -914,6 +1071,7 @@ fn render_prepared_report(
         prepared.stock_close_manifest_hash(),
         prepared.benchmark_manifest_hash(),
         prepared.calendar_authority_hash(),
+        epoch_evidence,
         metric_value(report.gross())?,
         metric_value(report.benchmark())?,
         metric_value(report.gross_excess())?,
@@ -1150,41 +1308,7 @@ fn execute_reset_sample_preview(
     format: OutputFormat,
 ) -> Result<String, AppError> {
     let preview = load_reset_sample_preview(database_path, request)?;
-    let calendar =
-        resolve_verified_replay_range(preview.completed_session_date, preview.effective_date)
-            .map_err(map_calendar_error)?;
-    render_reset_sample(&preview, calendar.authority_hash(), None, false, format)
-}
-
-fn preview_matches_receipt(
-    preview: &EpochActivationPreview,
-    receipt: &AttributionEpochReceipt,
-) -> Result<(), AppError> {
-    let carry_item_count = u64::try_from(preview.carry.len())
-        .map_err(|_| AppError::output_integrity("epoch_carry_count_overflow"))?;
-    let carry_total_quantity = preview.carry.iter().try_fold(0_u64, |total, position| {
-        total.checked_add(position.quantity)
-    });
-    let carry_total_quantity = carry_total_quantity
-        .ok_or_else(|| AppError::output_integrity("epoch_carry_quantity_overflow"))?;
-    if !preview.activated
-        || preview.epoch_id != receipt.epoch_id
-        || preview.completed_session_date != receipt.cutover_completed_trading_date
-        || preview.effective_date != receipt.effective_trading_date
-        || preview.paper_trade_high_water != receipt.paper_trade_high_water
-        || preview.order_audit_high_water != receipt.order_audit_high_water
-        || preview.legacy_filled_manifest_hash != receipt.legacy_filled_manifest_hash
-        || preview.terminal_binding_manifest_hash != receipt.terminal_binding_manifest_hash
-        || preview.order_audit_tip_hash != receipt.order_audit_tip_hash
-        || preview.position_projection_hash != receipt.position_projection_hash
-        || canonical_legacy_carry_manifest_hash(&preview.carry)
-            != receipt.legacy_carry_manifest_hash
-        || carry_item_count != receipt.carry_item_count
-        || carry_total_quantity != receipt.carry_total_quantity
-    {
-        return Err(AppError::output_integrity("epoch_commit_readback_mismatch"));
-    }
-    Ok(())
+    render_reset_sample(ResetSampleOutcome::Preview(&preview), format)
 }
 
 fn execute_reset_sample_commit(
@@ -1195,20 +1319,10 @@ fn execute_reset_sample_commit(
     let session =
         AttributionDatabaseSession::open(database_path, AttributionDatabaseAccess::AppendOnly)
             .map_err(map_database_error)?;
-    let receipt = AttributionEpochStore::new(session.database())
-        .activate_once(request.clone())
+    let outcome = AttributionEpochStore::new(session.database())
+        .activate_once_with_outcome(request.clone())
         .map_err(map_epoch_store_error)?;
-    drop(session);
-
-    let preview = load_reset_sample_preview(database_path, request)?;
-    preview_matches_receipt(&preview, &receipt)?;
-    render_reset_sample(
-        &preview,
-        &receipt.calendar_authority_hash,
-        Some(&receipt.receipt_hash),
-        true,
-        format,
-    )
+    render_reset_sample(ResetSampleOutcome::Committed(&outcome), format)
 }
 
 fn command_format(command: &Command) -> OutputFormat {
@@ -2125,6 +2239,213 @@ mod tests {
         );
         drop(connection);
         cleanup_database(&path);
+    }
+
+    #[tokio::test]
+    async fn reset_sample_existing_epoch_preview_keeps_frozen_receipt_and_calendar() {
+        let path = test_database_path("reset_existing_preview");
+        create_source_schema(&path);
+        append_activation_carry_source(&path);
+        let path_text = path.to_string_lossy().into_owned();
+        let commit = Cli::try_parse_from([
+            "strategy_attribution",
+            "reset-sample",
+            "--db",
+            path_text.as_str(),
+            "--at",
+            "2026-08-28T15:40:00+08:00",
+            "--commit",
+            "--format",
+            "json",
+        ])
+        .expect("TEST_CODE retained preview commit command");
+        let committed: Value = serde_json::from_str(
+            &execute(&commit)
+                .await
+                .expect("TEST_CODE retained preview activation"),
+        )
+        .expect("TEST_CODE retained preview commit JSON");
+
+        let preview = Cli::try_parse_from([
+            "strategy_attribution",
+            "reset-sample",
+            "--db",
+            path_text.as_str(),
+            "--at",
+            "2026-08-28T15:40:00+08:00",
+            "--format",
+            "json",
+        ])
+        .expect("TEST_CODE retained preview command");
+        let preview: Value = serde_json::from_str(
+            &execute(&preview)
+                .await
+                .expect("TEST_CODE retained preview succeeds"),
+        )
+        .expect("TEST_CODE retained preview JSON");
+        assert_eq!(preview["数据库已写入"], false);
+        assert_eq!(preview["已存在激活"], true);
+        assert_eq!(preview["receipt身份"], committed["receipt身份"]);
+        assert_eq!(preview["日历权威哈希"], committed["日历权威哈希"]);
+        cleanup_database(&path);
+    }
+
+    #[tokio::test]
+    async fn reset_sample_commit_succeeds_while_legitimate_wal_sidecars_are_live() {
+        let path = test_database_path("reset_commit_live_wal");
+        create_source_schema(&path);
+        append_activation_carry_source(&path);
+        let keeper = Connection::open(&path).expect("TEST_CODE live WAL keeper");
+        let journal_mode: String = keeper
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .expect("TEST_CODE enable live WAL mode");
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        keeper
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE TEST_CODE_live_wal_guard(id INTEGER PRIMARY KEY);
+                 INSERT INTO TEST_CODE_live_wal_guard(id) VALUES (1);",
+            )
+            .expect("TEST_CODE retain legitimate live WAL");
+        assert!(sidecar(&path, "-wal").exists());
+        assert!(sidecar(&path, "-shm").exists());
+
+        let path_text = path.to_string_lossy().into_owned();
+        let cli = Cli::try_parse_from([
+            "strategy_attribution",
+            "reset-sample",
+            "--db",
+            path_text.as_str(),
+            "--at",
+            "2026-08-28T15:40:00+08:00",
+            "--commit",
+            "--format",
+            "json",
+        ])
+        .expect("TEST_CODE live WAL reset commit command");
+        let output = execute(&cli)
+            .await
+            .expect("TEST_CODE legitimate live WAL must not hide committed success");
+        let value: Value = serde_json::from_str(&output).expect("TEST_CODE live WAL receipt JSON");
+        assert_eq!(value["数据库已写入"], true);
+        assert_eq!(value["receipt身份"].as_str().map(str::len), Some(64));
+
+        drop(keeper);
+        cleanup_database(&path);
+    }
+
+    #[test]
+    fn epoch_evidence_rendering_keeps_legacy_nulls_and_complete_active_evidence() {
+        use stock_analysis::performance::attribution_epoch::{
+            EpochExclusion, EpochExclusionReason, LegacyCarryPosition,
+        };
+
+        let legacy_selector = AttributionEpochSelector::Legacy;
+        let legacy_scoped_manifest = "1".repeat(64);
+        let legacy = AttributionEpochRenderProjection {
+            selector: &legacy_selector,
+            epoch_id: None,
+            receipt_hash: None,
+            effective_date: None,
+            legacy_carry_manifest_hash: None,
+            remaining_quarantine: &[],
+            released_codes: 0,
+            exclusion_manifest_hash: None,
+            excluded_fills: &[],
+            excluded_fill_count: 0,
+            overlap_buy_count: 0,
+            overlap_sell_count: 0,
+            mixed_exit_count: 0,
+            scoped_fill_manifest_hash: &legacy_scoped_manifest,
+        };
+        let legacy_json = epoch_evidence_value(&legacy).expect("TEST_CODE Legacy epoch JSON");
+        assert_eq!(legacy_json["选择器"], "legacy");
+        for field in [
+            "epoch身份",
+            "receipt哈希",
+            "effective日期",
+            "legacy carry manifest哈希",
+            "排除manifest哈希",
+        ] {
+            assert_eq!(legacy_json[field], Value::Null, "TEST_CODE Legacy {field}");
+        }
+        assert_eq!(legacy_json["剩余隔离持仓"], json!([]));
+        assert_eq!(legacy_json["排除明细"], json!([]));
+        let legacy_markdown =
+            epoch_evidence_markdown(&legacy).expect("TEST_CODE Legacy epoch Markdown");
+        assert!(legacy_markdown.contains("Epoch 选择器：legacy"));
+        assert!(legacy_markdown.contains("Epoch 身份：不适用"));
+        assert!(legacy_markdown.contains("Receipt 哈希：不适用"));
+
+        let quarantine = [LegacyCarryPosition {
+            code: "TEST_CODE_600001".to_owned(),
+            quantity: 80,
+        }];
+        let exclusions = [EpochExclusion {
+            fill_id: 7,
+            code: "TEST_CODE_600001".to_owned(),
+            direction: "buy".to_owned(),
+            quantity: 20,
+            reason: EpochExclusionReason::LegacyCarryOverlap,
+        }];
+        let active_selector = AttributionEpochSelector::Active;
+        let active_epoch_id = "2".repeat(64);
+        let active_receipt_hash = "3".repeat(64);
+        let active_carry_manifest = "4".repeat(64);
+        let active_exclusion_manifest = "5".repeat(64);
+        let active_scoped_manifest = "6".repeat(64);
+        let active = AttributionEpochRenderProjection {
+            selector: &active_selector,
+            epoch_id: Some(&active_epoch_id),
+            receipt_hash: Some(&active_receipt_hash),
+            effective_date: NaiveDate::from_ymd_opt(2026, 8, 31),
+            legacy_carry_manifest_hash: Some(&active_carry_manifest),
+            remaining_quarantine: &quarantine,
+            released_codes: 1,
+            exclusion_manifest_hash: Some(&active_exclusion_manifest),
+            excluded_fills: &exclusions,
+            excluded_fill_count: 1,
+            overlap_buy_count: 1,
+            overlap_sell_count: 2,
+            mixed_exit_count: 3,
+            scoped_fill_manifest_hash: &active_scoped_manifest,
+        };
+        let active_json = epoch_evidence_value(&active).expect("TEST_CODE Active epoch JSON");
+        assert_eq!(active_json["选择器"], "active");
+        assert_eq!(active_json["epoch身份"], "2".repeat(64));
+        assert_eq!(active_json["receipt哈希"], "3".repeat(64));
+        assert_eq!(active_json["effective日期"], "2026-08-31");
+        assert_eq!(active_json["剩余隔离持仓"], json!(&quarantine));
+        assert_eq!(active_json["释放代码数"], 1);
+        assert_eq!(active_json["排除明细"], json!(&exclusions));
+        assert_eq!(active_json["排除成交数"], 1);
+        assert_eq!(active_json["overlap买入数"], 1);
+        assert_eq!(active_json["overlap卖出数"], 2);
+        assert_eq!(active_json["mixed-exit数"], 3);
+        assert_eq!(active_json["scoped成交manifest哈希"], "6".repeat(64));
+        let active_markdown =
+            epoch_evidence_markdown(&active).expect("TEST_CODE Active epoch Markdown");
+        for field in [
+            "Epoch 选择器：active",
+            "Epoch 身份：",
+            "Receipt 哈希：",
+            "Effective 日期：2026-08-31",
+            "Legacy carry manifest 哈希：",
+            "剩余隔离持仓：",
+            "释放代码数：1",
+            "排除 manifest 哈希：",
+            "排除明细：",
+            "排除成交数：1",
+            "Overlap 买入数：1",
+            "Overlap 卖出数：2",
+            "Mixed-exit 数：3",
+            "Scoped 成交 manifest 哈希：",
+        ] {
+            assert!(
+                active_markdown.contains(field),
+                "TEST_CODE Markdown {field}"
+            );
+        }
     }
 
     #[tokio::test]
