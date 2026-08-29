@@ -349,6 +349,8 @@ impl AttributionDatabaseSession {
         })?;
         let database = DatabaseManager {
             pool,
+            attribution_pool: None,
+            attribution_connection_source: None,
             selection_connection_source: None,
             selection_schema_authority: None,
         };
@@ -455,6 +457,8 @@ pub(crate) fn test_runner_database_manager(path: &std::path::Path) -> DatabaseMa
     }
     DatabaseManager {
         pool,
+        attribution_pool: None,
+        attribution_connection_source: None,
         selection_connection_source: None,
         selection_schema_authority: None,
     }
@@ -3555,6 +3559,8 @@ mod tests {
                 path,
                 manager: DatabaseManager {
                     pool,
+                    attribution_pool: None,
+                    attribution_connection_source: None,
                     selection_connection_source: None,
                     selection_schema_authority: None,
                 },

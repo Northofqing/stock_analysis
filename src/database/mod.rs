@@ -21,6 +21,7 @@ use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{File, Metadata};
+use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "macos")]
@@ -65,11 +66,85 @@ pub(crate) struct DatabaseConnectionAuthority {
     objects: Arc<PinnedSqliteObjectSet>,
 }
 
+pub(crate) struct AttestedAttributionCheckout {
+    connection: DbConnection,
+    source: Arc<DescriptorSqliteSource>,
+}
+
 impl std::fmt::Debug for DatabaseConnectionAuthority {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("DatabaseConnectionAuthority")
             .finish_non_exhaustive()
+    }
+}
+
+impl AttestedAttributionCheckout {
+    pub(crate) fn authority(
+        &mut self,
+    ) -> Result<DatabaseConnectionAuthority, DatabaseAuthorityError> {
+        registered_descriptor_connection_authority(&self.source, &mut self.connection)
+    }
+
+    pub(crate) fn transaction_with_authority<T, E, F, M>(
+        &mut self,
+        map_authority: M,
+        operation: F,
+    ) -> Result<T, E>
+    where
+        E: From<diesel::result::Error>,
+        F: FnOnce(&mut SqliteConnection, &DatabaseConnectionAuthority) -> Result<T, E>,
+        M: Fn(DatabaseAuthorityError) -> E + Copy,
+    {
+        let source = Arc::clone(&self.source);
+        self.connection.transaction(|connection| {
+            let before = registered_descriptor_connection_authority(&source, connection)
+                .map_err(map_authority)?;
+            let result = operation(connection, &before)?;
+            let after = registered_descriptor_connection_authority(&source, connection)
+                .map_err(map_authority)?;
+            if after != before {
+                return Err(map_authority(
+                    DatabaseAuthorityError::DescriptorIntegrityFailed {
+                        detail: "attribution database authority changed during transaction".into(),
+                    },
+                ));
+            }
+            Ok(result)
+        })
+    }
+
+    pub(crate) fn immediate_transaction_with_authority<T, E, F, M>(
+        &mut self,
+        map_authority: M,
+        operation: F,
+    ) -> Result<T, E>
+    where
+        E: From<diesel::result::Error>,
+        F: FnOnce(&mut SqliteConnection, &DatabaseConnectionAuthority) -> Result<T, E>,
+        M: Fn(DatabaseAuthorityError) -> E + Copy,
+    {
+        let source = Arc::clone(&self.source);
+        self.connection.immediate_transaction(|connection| {
+            let before = registered_descriptor_connection_authority(&source, connection)
+                .map_err(map_authority)?;
+            let result = operation(connection, &before)?;
+            let after = registered_descriptor_connection_authority(&source, connection)
+                .map_err(map_authority)?;
+            if after != before {
+                return Err(map_authority(
+                    DatabaseAuthorityError::DescriptorIntegrityFailed {
+                        detail: "attribution database authority changed during transaction".into(),
+                    },
+                ));
+            }
+            Ok(result)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connection_for_test(&mut self) -> &mut SqliteConnection {
+        &mut self.connection
     }
 }
 
@@ -88,6 +163,8 @@ pub struct DatabaseManager {
     // before the owner capability releases its database/audit descriptors and
     // exclusive GlobalSchema maintenance lease.
     pool: DbPool,
+    attribution_pool: Option<DbPool>,
+    attribution_connection_source: Option<Arc<DescriptorSqliteSource>>,
     #[allow(dead_code)]
     selection_connection_source: Option<Arc<DescriptorSqliteSource>>,
     #[allow(dead_code)]
@@ -165,6 +242,12 @@ struct SqliteAttestationTokenRow {
     token: String,
 }
 
+#[derive(QueryableByName)]
+struct SqliteAttestationTriggerCountRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    count: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SqliteFileIdentity {
     device: u64,
@@ -201,6 +284,8 @@ impl SqliteObjectIdentity {
 pub(crate) enum DatabaseAuthorityError {
     #[error("descriptor_attestation_unavailable: {detail}")]
     DescriptorAttestationUnavailable { detail: String },
+    #[error("descriptor_integrity_failed: {detail}")]
+    DescriptorIntegrityFailed { detail: String },
 }
 
 impl DatabaseAuthorityError {
@@ -208,6 +293,7 @@ impl DatabaseAuthorityError {
     pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::DescriptorAttestationUnavailable { .. } => "descriptor_attestation_unavailable",
+            Self::DescriptorIntegrityFailed { .. } => "descriptor_integrity_failed",
         }
     }
 }
@@ -364,6 +450,7 @@ struct DescriptorSqliteSource {
     connect_lock: Mutex<()>,
     pool_evidence: Mutex<Option<DescriptorPoolEvidence>>,
     connection_proofs: Mutex<HashMap<String, DescriptorConnectionProof>>,
+    registration_namespace: String,
     next_connection_id: AtomicU64,
 }
 
@@ -419,6 +506,7 @@ impl SqliteConnectionManager {
                 connect_lock: Mutex::new(()),
                 pool_evidence: Mutex::new(None),
                 connection_proofs: Mutex::new(HashMap::new()),
+                registration_namespace: descriptor_registration_namespace()?,
                 next_connection_id: AtomicU64::new(0),
             })),
         })
@@ -438,6 +526,18 @@ impl SqliteConnectionManager {
     ) -> Result<SqliteFileIdentity, ConnectionManagerError> {
         verify_sqlite_connection_object(source.identity, connection, expected_route)
     }
+}
+
+fn descriptor_registration_namespace() -> Result<String, DatabaseAuthorityError> {
+    let mut random = [0_u8; 32];
+    File::open("/dev/urandom")
+        .and_then(|mut source| source.read_exact(&mut random))
+        .map_err(
+            |error| DatabaseAuthorityError::DescriptorAttestationUnavailable {
+                detail: format!("cannot issue descriptor source registration identity: {error}"),
+            },
+        )?;
+    Ok(hex::encode(random))
 }
 
 fn verify_sqlite_connection_object(
@@ -655,6 +755,10 @@ fn commit_descriptor_pool_evidence(
 
 const DESCRIPTOR_ATTESTATION_TEMP_TABLE: &str =
     "__stock_analysis_descriptor_connection_attestation";
+const DESCRIPTOR_ATTESTATION_NO_UPDATE_TRIGGER: &str =
+    "__stock_analysis_descriptor_connection_attestation_no_update";
+const DESCRIPTOR_ATTESTATION_NO_DELETE_TRIGGER: &str =
+    "__stock_analysis_descriptor_connection_attestation_no_delete";
 
 fn install_connection_attestation_token(
     connection: &mut SqliteConnection,
@@ -673,6 +777,17 @@ fn install_connection_attestation_token(
     .bind::<diesel::sql_types::Text, _>(token)
     .execute(connection)
     .map_err(|error| sqlite_configuration_error("install attestation token", error))?;
+    for (name, operation) in [
+        (DESCRIPTOR_ATTESTATION_NO_UPDATE_TRIGGER, "UPDATE"),
+        (DESCRIPTOR_ATTESTATION_NO_DELETE_TRIGGER, "DELETE"),
+    ] {
+        diesel::sql_query(format!(
+            "CREATE TEMP TRIGGER {name} BEFORE {operation} ON {DESCRIPTOR_ATTESTATION_TEMP_TABLE} \
+             BEGIN SELECT RAISE(ABORT, 'descriptor attestation registration is immutable'); END"
+        ))
+        .execute(connection)
+        .map_err(|error| sqlite_configuration_error("protect attestation token", error))?;
+    }
     Ok(())
 }
 
@@ -687,6 +802,26 @@ fn connection_attestation_token(
     .map_err(|error| sqlite_configuration_error("read attestation token", error))
 }
 
+fn validate_connection_attestation_token_protection(
+    connection: &mut SqliteConnection,
+) -> Result<(), ConnectionManagerError> {
+    let count = diesel::sql_query(format!(
+        "SELECT COUNT(*) AS count FROM sqlite_temp_master \
+         WHERE type='trigger' AND name IN (?, ?)"
+    ))
+    .bind::<diesel::sql_types::Text, _>(DESCRIPTOR_ATTESTATION_NO_UPDATE_TRIGGER)
+    .bind::<diesel::sql_types::Text, _>(DESCRIPTOR_ATTESTATION_NO_DELETE_TRIGGER)
+    .get_result::<SqliteAttestationTriggerCountRow>(connection)
+    .map_err(|error| sqlite_configuration_error("read attestation token protection", error))?
+    .count;
+    if count != 2 {
+        return Err(sqlite_manager_error(
+            "descriptor_identity_changed: attestation token protection changed",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_registered_descriptor_connection(
     source: &DescriptorSqliteSource,
     connection: &mut SqliteConnection,
@@ -694,6 +829,7 @@ fn validate_registered_descriptor_connection(
     validate_retained_namespace(source)?;
     let route = sqlite_open_route(source)?;
     let actual = SqliteConnectionManager::verify_descriptor_connection(source, connection, &route)?;
+    validate_connection_attestation_token_protection(connection)?;
     let token = connection_attestation_token(connection)?;
     let proofs = source
         .connection_proofs
@@ -725,25 +861,61 @@ fn validate_registered_descriptor_connection(
 fn registered_descriptor_connection_authority(
     source: &DescriptorSqliteSource,
     connection: &mut SqliteConnection,
-) -> Result<DatabaseConnectionAuthority, ConnectionManagerError> {
-    validate_registered_descriptor_connection(source, connection)?;
-    let token = connection_attestation_token(connection)?;
+) -> Result<DatabaseConnectionAuthority, DatabaseAuthorityError> {
+    let integrity = |detail: String| DatabaseAuthorityError::DescriptorIntegrityFailed { detail };
+    validate_retained_namespace(source).map_err(|error| integrity(error.to_string()))?;
+    validate_connection_attestation_token_protection(connection)
+        .map_err(|error| integrity(error.to_string()))?;
+    let token =
+        connection_attestation_token(connection).map_err(|error| integrity(error.to_string()))?;
     let objects = {
         let proofs = source
             .connection_proofs
             .lock()
-            .map_err(|_| sqlite_manager_error("descriptor connection-proof lock is poisoned"))?;
+            .map_err(|_| integrity("descriptor connection-proof lock is poisoned".into()))?;
         let proof = proofs.get(&token).ok_or_else(|| {
-            sqlite_manager_error("descriptor-bound connection has no registered fd attestation")
+            integrity("descriptor-bound connection has no registered fd attestation".into())
         })?;
         proof
             .handles
             .validate(&proof.expected_objects)
-            .map_err(descriptor_attestation_manager_error)?;
+            .map_err(|error| integrity(error.to_string()))?;
+        let shared_shm = FileObjectIdentity::from_file(&proof.shared_shm_anchor)
+            .map_err(|error| integrity(error.to_string()))?;
+        if shared_shm != proof.expected_objects.identity(SqliteObjectRole::Shm) {
+            return Err(integrity(
+                "process-shared SHM proof changed identity".into(),
+            ));
+        }
         Arc::clone(&proof.expected_objects)
     };
-    validate_registered_descriptor_connection(source, connection)?;
+    let current_objects =
+        capture_pinned_sqlite_object_set(source).map_err(|error| integrity(error.to_string()))?;
+    if current_objects != *objects {
+        return Err(integrity(
+            "current main/WAL/SHM objects differ from the registered checkout".into(),
+        ));
+    }
     Ok(DatabaseConnectionAuthority { objects })
+}
+
+fn validate_attribution_source_namespace(
+    source: &DescriptorSqliteSource,
+) -> Result<(), DatabaseAuthorityError> {
+    let integrity = |detail: String| DatabaseAuthorityError::DescriptorIntegrityFailed { detail };
+    validate_retained_namespace(source).map_err(|error| integrity(error.to_string()))?;
+    if let Some(evidence) =
+        current_descriptor_pool_evidence(source).map_err(|error| integrity(error.to_string()))?
+    {
+        let current = capture_pinned_sqlite_object_set(source)
+            .map_err(|error| integrity(error.to_string()))?;
+        if current != *evidence.expected_objects {
+            return Err(integrity(
+                "current main/WAL/SHM objects differ from attribution pool evidence".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_retained_namespace(
@@ -891,7 +1063,8 @@ impl ManageConnection for SqliteConnectionManager {
                 validate_retained_namespace(source)?;
                 Self::verify_descriptor_connection(source, &mut connection, &route)?;
                 let token = format!(
-                    "descriptor-connection-{:016x}",
+                    "descriptor-source-{}-connection-{:016x}",
+                    source.registration_namespace,
                     source.next_connection_id.fetch_add(1, Ordering::Relaxed)
                 );
                 install_connection_attestation_token(&mut connection, &token)?;
@@ -1057,6 +1230,10 @@ impl CustomizeConnection<SqliteConnection, ConnectionManagerError> for SqliteCon
     }
 }
 
+fn build_sqlite_pool(database_url: String) -> Result<DbPool, PoolError> {
+    build_sqlite_pool_with_size(database_url, SQLITE_POOL_SIZE)
+}
+
 fn build_sqlite_pool_with_size(database_url: String, max_size: u32) -> Result<DbPool, PoolError> {
     build_sqlite_pool_from_manager(SqliteConnectionManager::legacy(database_url), max_size)
 }
@@ -1209,8 +1386,17 @@ impl DatabaseManager {
         configure_sqlite_connection(&mut bootstrap_conn)?;
         drop(bootstrap_conn);
 
-        let (pool, connection_source) =
-            build_attested_sqlite_pool_with_size(&path, SQLITE_POOL_SIZE)?;
+        let (attribution_pool, attribution_connection_source) =
+            match build_attested_sqlite_pool_with_size(&path, 2) {
+                Ok((pool, source)) => (Some(pool), Some(source)),
+                Err(error) => {
+                    log::warn!(
+                        "BR-255 attribution descriptor attestation unavailable; operational database remains active: {error}"
+                    );
+                    (None, None)
+                }
+            };
+        let pool = build_sqlite_pool(database_url)?;
 
         // 运行迁移
         let mut conn = pool.get()?;
@@ -1371,7 +1557,9 @@ impl DatabaseManager {
         drop(conn);
         let db = DatabaseManager {
             pool,
-            selection_connection_source: Some(connection_source),
+            attribution_pool,
+            attribution_connection_source,
+            selection_connection_source: None,
             selection_schema_authority: None,
         };
         DB_INSTANCE.set(db).map_err(|_| "数据库已经初始化")?;
@@ -1404,7 +1592,9 @@ impl DatabaseManager {
             configure_sqlite_connection(&mut connection)?;
         }
         Ok(Self {
-            pool,
+            pool: pool.clone(),
+            attribution_pool: Some(pool),
+            attribution_connection_source: Some(Arc::clone(&selection_connection_source)),
             selection_connection_source: Some(selection_connection_source),
             selection_schema_authority: Some(authority),
         })
@@ -1477,23 +1667,33 @@ impl DatabaseManager {
         })
     }
 
-    /// Attests the exact checked-out SQLite connection from registered
-    /// main/WAL/SHM descriptors. Managers without descriptor ownership fail
-    /// closed; there is deliberately no pathname fallback.
-    pub(crate) fn attribution_connection_authority(
+    /// Acquires a branded attribution checkout and its matching descriptor
+    /// source from this manager. No API accepts a caller-supplied connection.
+    pub(crate) fn attribution_checkout(
         &self,
-        connection: &mut SqliteConnection,
-    ) -> Result<DatabaseConnectionAuthority, DatabaseAuthorityError> {
-        let source = self.selection_connection_source.as_ref().ok_or_else(|| {
+    ) -> Result<AttestedAttributionCheckout, DatabaseAuthorityError> {
+        let pool = self.attribution_pool.as_ref().ok_or_else(|| {
             DatabaseAuthorityError::DescriptorAttestationUnavailable {
-                detail: "attribution checkout has no descriptor-attested connection source".into(),
+                detail: "manager has no descriptor-attested attribution pool".into(),
             }
         })?;
-        registered_descriptor_connection_authority(source, connection).map_err(|error| {
+        let source = self.attribution_connection_source.as_ref().ok_or_else(|| {
             DatabaseAuthorityError::DescriptorAttestationUnavailable {
-                detail: format!("attribution checkout descriptor proof failed: {error}"),
+                detail: "manager has no descriptor-attested attribution source".into(),
             }
-        })
+        })?;
+        validate_attribution_source_namespace(source)?;
+        let connection = pool.get().map_err(|error| {
+            DatabaseAuthorityError::DescriptorAttestationUnavailable {
+                detail: format!("descriptor-attested attribution checkout unavailable: {error}"),
+            }
+        })?;
+        let mut checkout = AttestedAttributionCheckout {
+            connection,
+            source: Arc::clone(source),
+        };
+        checkout.authority()?;
+        Ok(checkout)
     }
 
     #[cfg(test)]
@@ -3036,6 +3236,40 @@ mod tests {
         init_db_for_test();
         let db = DatabaseManager::get();
         assert!(db.get_conn().is_ok());
+    }
+
+    #[test]
+    fn operational_pool_is_isolated_from_optional_attribution_attestation() {
+        #[derive(QueryableByName)]
+        struct CountRow {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            count: i64,
+        }
+
+        init_db_for_test();
+        let database = DatabaseManager::get();
+        let mut operational = database
+            .get_conn()
+            .expect("operational database remains available");
+        let count = diesel::sql_query(format!(
+            "SELECT COUNT(*) AS count FROM sqlite_temp_master WHERE type='table' AND name='{}'",
+            DESCRIPTOR_ATTESTATION_TEMP_TABLE
+        ))
+        .get_result::<CountRow>(&mut operational)
+        .expect("inspect operational TEMP schema")
+        .count;
+        assert_eq!(count, 0, "operational checkout must remain legacy");
+
+        if let Ok(mut attribution) = database.attribution_checkout() {
+            let count = diesel::sql_query(format!(
+                "SELECT COUNT(*) AS count FROM sqlite_temp_master WHERE type='table' AND name='{}'",
+                DESCRIPTOR_ATTESTATION_TEMP_TABLE
+            ))
+            .get_result::<CountRow>(attribution.connection_for_test())
+            .expect("inspect attribution TEMP schema")
+            .count;
+            assert_eq!(count, 1, "attribution checkout is separately attested");
+        }
     }
 
     #[test]

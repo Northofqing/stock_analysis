@@ -14,7 +14,7 @@ use diesel::sql_types::{BigInt, Double, Integer, Nullable, Text};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::{DatabaseConnectionAuthority, DatabaseManager};
+use super::{DatabaseAuthorityError, DatabaseConnectionAuthority, DatabaseManager};
 use crate::database::order_audit::{
     validate_canonical_order_audit_chain, CanonicalOrderAuditChainRow, CanonicalOrderAuditRow,
     AUDIT_CHAIN_GENESIS,
@@ -2740,11 +2740,11 @@ pub(crate) fn load_verified_epoch_fills_until(
 }
 
 fn validate_daily_source_binding(
-    database: &DatabaseManager,
     conn: &mut SqliteConnection,
+    authority: &DatabaseConnectionAuthority,
     binding: &AttributionEpochDailySourceBinding,
 ) -> Result<(), AttributionEpochStoreError> {
-    if attribution_database_authority(database, conn)? != binding.database_authority {
+    if authority != &binding.database_authority {
         return Err(failed_integrity(
             "BR-255 epoch daily binding belongs to a different database authority",
         ));
@@ -2816,25 +2816,22 @@ fn validate_daily_source_binding(
             "BR-255 epoch daily scoped evidence changed after computation",
         ));
     }
-    if attribution_database_authority(database, conn)? != binding.database_authority {
-        return Err(failed_integrity(
-            "BR-255 epoch daily database authority changed during source validation",
-        ));
-    }
     Ok(())
 }
 
-fn attribution_database_authority(
-    database: &DatabaseManager,
-    conn: &mut SqliteConnection,
-) -> Result<DatabaseConnectionAuthority, AttributionEpochStoreError> {
-    database
-        .attribution_connection_authority(conn)
-        .map_err(|error| AttributionEpochStoreError::Unavailable {
-            reason_code: "attribution_database_authority_unavailable",
-            retryable: false,
-            detail: format!("BR-255 attribution checkout authority unavailable: {error}"),
-        })
+fn map_database_authority_error(error: DatabaseAuthorityError) -> AttributionEpochStoreError {
+    match error {
+        DatabaseAuthorityError::DescriptorAttestationUnavailable { detail } => {
+            AttributionEpochStoreError::Unavailable {
+                reason_code: "attribution_database_authority_unavailable",
+                retryable: false,
+                detail: format!("BR-255 attribution checkout authority unavailable: {detail}"),
+            }
+        }
+        DatabaseAuthorityError::DescriptorIntegrityFailed { detail } => failed_integrity(format!(
+            "BR-255 attribution checkout descriptor integrity: {detail}"
+        )),
+    }
 }
 
 fn load_selector_with_connection(
@@ -2923,13 +2920,13 @@ pub(crate) fn load_exact_on_connection(
 
 impl<'a> AttributionEpochStore<'a> {
     pub fn new(database: &'a DatabaseManager) -> Self {
-        let read_only_preview_path =
-            database
-                .selection_connection_source
-                .as_ref()
-                .and_then(|source| {
-                    super::sqlite_open_route_from_retained_parent(&source.parent, &source.leaf).ok()
-                });
+        let read_only_preview_path = database
+            .attribution_connection_source
+            .as_ref()
+            .or(database.selection_connection_source.as_ref())
+            .and_then(|source| {
+                super::sqlite_open_route_from_retained_parent(&source.parent, &source.leaf).ok()
+            });
         Self {
             database,
             read_only_preview_path,
@@ -3294,16 +3291,11 @@ impl<'a> AttributionEpochStore<'a> {
                 "BR-255 epoch attribution source range is reversed",
             ));
         }
-        let mut conn =
-            self.database
-                .get_conn()
-                .map_err(|error| AttributionEpochStoreError::Unavailable {
-                    reason_code: "attribution_epoch_storage_unavailable",
-                    retryable: true,
-                    detail: format!("BR-255 epoch database connection unavailable: {error}"),
-                })?;
-        conn.transaction::<_, AttributionEpochStoreError, _>(|conn| {
-            let database_authority = attribution_database_authority(self.database, conn)?;
+        let mut checkout = self
+            .database
+            .attribution_checkout()
+            .map_err(map_database_authority_error)?;
+        checkout.transaction_with_authority(map_database_authority_error, |conn, authority| {
             let resolved = load_selector_with_connection(conn, &AttributionEpochSelector::Active)?;
             let receipt = match &resolved {
                 ResolvedAttributionEpoch::Epoch(receipt) => receipt.clone(),
@@ -3323,12 +3315,7 @@ impl<'a> AttributionEpochStore<'a> {
             #[cfg(test)]
             maybe_inject_active_verified_source_drift(conn)?;
             let verified = load_verified_epoch_fills_until(conn, &resolved, to)?;
-            if attribution_database_authority(self.database, conn)? != database_authority {
-                return Err(failed_integrity(
-                    "BR-255 attribution database authority changed during active source read",
-                ));
-            }
-            Ok((receipt, verified, database_authority))
+            Ok((receipt, verified, authority.clone()))
         })
     }
 
@@ -3512,6 +3499,25 @@ impl<'a> AttributionEpochStore<'a> {
         let epoch_id = input.epoch_id;
         let date = input.date;
         let date_string = date.to_string();
+        if let Some(source) = source.as_ref() {
+            let mut checkout = self
+                .database
+                .attribution_checkout()
+                .map_err(map_database_authority_error)?;
+            return checkout.immediate_transaction_with_authority(
+                map_database_authority_error,
+                |conn, authority| {
+                    append_daily_batch_on_connection(
+                        conn,
+                        &epoch_id,
+                        date,
+                        &date_string,
+                        &prepared,
+                        Some((source, authority)),
+                    )
+                },
+            );
+        }
         let mut conn =
             self.database
                 .get_conn()
@@ -3521,112 +3527,118 @@ impl<'a> AttributionEpochStore<'a> {
                     detail: format!("BR-255 epoch database connection unavailable: {error}"),
                 })?;
         conn.immediate_transaction::<_, AttributionEpochStoreError, _>(|conn| {
-            let mut state = validate_daily(conn).map_err(map_integrity)?;
-            let epochs = validate_all(conn).map_err(map_integrity)?;
-            if !epochs.iter().any(|receipt| receipt.epoch_id == epoch_id) {
-                return Err(failed_integrity(
-                    "BR-255 epoch daily append references an unknown epoch",
-                ));
-            }
-            if let Some(source) = source.as_ref() {
-                if source.epoch_id != epoch_id || source.cutoff_date != date {
-                    return Err(failed_integrity(
-                        "BR-255 verified epoch daily batch identity is inconsistent",
-                    ));
-                }
-                validate_daily_source_binding(self.database, conn, source)?;
-            }
-            let mut batch_receipts = Vec::with_capacity(prepared.len());
-            #[cfg(test)]
-            let mut completed_writes = 0_usize;
-            for (signal_family, payload_json, payload_hash) in &prepared {
-                let existing = state
-                    .iter()
-                    .find(|row| {
-                        row.epoch_id == epoch_id
-                            && row.date == date_string
-                            && row.signal_family == *signal_family
-                            && row.payload_hash == *payload_hash
-                    })
-                    .cloned();
-                if let Some(existing) = existing {
-                    batch_receipts.push(daily_receipt(&state, &existing).map_err(map_integrity)?);
-                    continue;
-                }
-                #[cfg(test)]
-                maybe_inject_daily_batch_failure(completed_writes).map_err(map_integrity)?;
-                let previous = state
-                    .last()
-                    .map_or(DAILY_GENESIS, |row| row.record_hash.as_str());
-                let window = new_window(conn).map_err(map_integrity)?;
-                let mut row = PersistedDaily {
-                    id: 0,
-                    epoch_id: epoch_id.clone(),
-                    date: date_string.clone(),
-                    signal_family: signal_family.clone(),
-                    payload_json: payload_json.clone(),
-                    payload_hash: payload_hash.clone(),
-                    predecessor_daily_hash: previous.to_owned(),
-                    record_hash: String::new(),
-                    created_at: window.created_at,
-                    retention_deadline: window.retention_deadline,
-                };
-                row.record_hash = daily_hash(&row).map_err(map_integrity)?;
-                diesel::sql_query(
-                    "INSERT INTO paper_attribution_epoch_daily
-                     (epoch_id, date, signal_family, payload_json, payload_hash,
-                      predecessor_daily_hash, record_hash, created_at, retention_deadline)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                )
-                .bind::<Text, _>(&row.epoch_id)
-                .bind::<Text, _>(&row.date)
-                .bind::<Text, _>(&row.signal_family)
-                .bind::<Text, _>(&row.payload_json)
-                .bind::<Text, _>(&row.payload_hash)
-                .bind::<Text, _>(&row.predecessor_daily_hash)
-                .bind::<Text, _>(&row.record_hash)
-                .bind::<Text, _>(&row.created_at)
-                .bind::<Text, _>(&row.retention_deadline)
-                .execute(conn)
-                .map_err(AttributionEpochStoreError::from)?;
-                row.id = diesel::select(diesel::dsl::sql::<BigInt>("last_insert_rowid()"))
-                    .get_result(conn)
-                    .map_err(AttributionEpochStoreError::from)?;
-                diesel::sql_query(
-                    "INSERT INTO paper_attribution_epoch_daily_chain
-                     (epoch_daily_id, previous_hash, record_hash, created_at, retention_deadline)
-                     VALUES (?, ?, ?, ?, ?)",
-                )
-                .bind::<BigInt, _>(row.id)
-                .bind::<Text, _>(&row.predecessor_daily_hash)
-                .bind::<Text, _>(&row.record_hash)
-                .bind::<Text, _>(&row.created_at)
-                .bind::<Text, _>(&row.retention_deadline)
-                .execute(conn)
-                .map_err(AttributionEpochStoreError::from)?;
-                state.push(row.clone());
-                batch_receipts.push(daily_receipt(&state, &row).map_err(map_integrity)?);
-                #[cfg(test)]
-                {
-                    completed_writes += 1;
-                }
-            }
-            validate_all(conn).map_err(map_integrity)?;
-            if let Some(source) = source.as_ref() {
-                if attribution_database_authority(self.database, conn)? != source.database_authority
-                {
-                    return Err(failed_integrity(
-                        "BR-255 epoch daily database authority changed during batch append",
-                    ));
-                }
-            }
-            Ok(AttributionEpochDailyBatchReceipt {
-                epoch_id: epoch_id.clone(),
-                date,
-                receipts: batch_receipts,
-            })
+            append_daily_batch_on_connection(conn, &epoch_id, date, &date_string, &prepared, None)
         })
     }
+}
+
+fn append_daily_batch_on_connection(
+    conn: &mut SqliteConnection,
+    epoch_id: &str,
+    date: NaiveDate,
+    date_string: &str,
+    prepared: &[(String, String, String)],
+    source: Option<(
+        &AttributionEpochDailySourceBinding,
+        &DatabaseConnectionAuthority,
+    )>,
+) -> Result<AttributionEpochDailyBatchReceipt, AttributionEpochStoreError> {
+    let mut state = validate_daily(conn).map_err(map_integrity)?;
+    let epochs = validate_all(conn).map_err(map_integrity)?;
+    if !epochs.iter().any(|receipt| receipt.epoch_id == epoch_id) {
+        return Err(failed_integrity(
+            "BR-255 epoch daily append references an unknown epoch",
+        ));
+    }
+    if let Some((source, authority)) = source {
+        if source.epoch_id != epoch_id || source.cutoff_date != date {
+            return Err(failed_integrity(
+                "BR-255 verified epoch daily batch identity is inconsistent",
+            ));
+        }
+        validate_daily_source_binding(conn, authority, source)?;
+    }
+    let mut batch_receipts = Vec::with_capacity(prepared.len());
+    #[cfg(test)]
+    let mut completed_writes = 0_usize;
+    for (signal_family, payload_json, payload_hash) in prepared {
+        let existing = state
+            .iter()
+            .find(|row| {
+                row.epoch_id == epoch_id
+                    && row.date == date_string
+                    && row.signal_family == *signal_family
+                    && row.payload_hash == *payload_hash
+            })
+            .cloned();
+        if let Some(existing) = existing {
+            batch_receipts.push(daily_receipt(&state, &existing).map_err(map_integrity)?);
+            continue;
+        }
+        #[cfg(test)]
+        maybe_inject_daily_batch_failure(completed_writes).map_err(map_integrity)?;
+        let previous = state
+            .last()
+            .map_or(DAILY_GENESIS, |row| row.record_hash.as_str());
+        let window = new_window(conn).map_err(map_integrity)?;
+        let mut row = PersistedDaily {
+            id: 0,
+            epoch_id: epoch_id.to_owned(),
+            date: date_string.to_owned(),
+            signal_family: signal_family.clone(),
+            payload_json: payload_json.clone(),
+            payload_hash: payload_hash.clone(),
+            predecessor_daily_hash: previous.to_owned(),
+            record_hash: String::new(),
+            created_at: window.created_at,
+            retention_deadline: window.retention_deadline,
+        };
+        row.record_hash = daily_hash(&row).map_err(map_integrity)?;
+        diesel::sql_query(
+            "INSERT INTO paper_attribution_epoch_daily
+             (epoch_id, date, signal_family, payload_json, payload_hash,
+              predecessor_daily_hash, record_hash, created_at, retention_deadline)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind::<Text, _>(&row.epoch_id)
+        .bind::<Text, _>(&row.date)
+        .bind::<Text, _>(&row.signal_family)
+        .bind::<Text, _>(&row.payload_json)
+        .bind::<Text, _>(&row.payload_hash)
+        .bind::<Text, _>(&row.predecessor_daily_hash)
+        .bind::<Text, _>(&row.record_hash)
+        .bind::<Text, _>(&row.created_at)
+        .bind::<Text, _>(&row.retention_deadline)
+        .execute(conn)
+        .map_err(AttributionEpochStoreError::from)?;
+        row.id = diesel::select(diesel::dsl::sql::<BigInt>("last_insert_rowid()"))
+            .get_result(conn)
+            .map_err(AttributionEpochStoreError::from)?;
+        diesel::sql_query(
+            "INSERT INTO paper_attribution_epoch_daily_chain
+             (epoch_daily_id, previous_hash, record_hash, created_at, retention_deadline)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind::<BigInt, _>(row.id)
+        .bind::<Text, _>(&row.predecessor_daily_hash)
+        .bind::<Text, _>(&row.record_hash)
+        .bind::<Text, _>(&row.created_at)
+        .bind::<Text, _>(&row.retention_deadline)
+        .execute(conn)
+        .map_err(AttributionEpochStoreError::from)?;
+        state.push(row.clone());
+        batch_receipts.push(daily_receipt(&state, &row).map_err(map_integrity)?);
+        #[cfg(test)]
+        {
+            completed_writes += 1;
+        }
+    }
+    validate_all(conn).map_err(map_integrity)?;
+    Ok(AttributionEpochDailyBatchReceipt {
+        epoch_id: epoch_id.to_owned(),
+        date,
+        receipts: batch_receipts,
+    })
 }
 
 #[cfg(test)]
@@ -3725,6 +3737,31 @@ mod tests {
 
         assert_eq!(error.reason_code(), "attribution_epoch_unavailable");
         assert!(!error.retryable());
+    }
+
+    #[test]
+    fn unattested_manager_keeps_operational_queries_but_daily_authority_is_unavailable() {
+        let database = TestDatabase::new();
+        let mut operational = database
+            .manager
+            .get_conn()
+            .expect("TEST_CODE operational legacy checkout remains available");
+        let one = diesel::select(diesel::dsl::sql::<BigInt>("1"))
+            .get_result::<i64>(&mut operational)
+            .expect("TEST_CODE unrelated operational query succeeds");
+        assert_eq!(one, 1);
+        drop(operational);
+
+        let error = crate::performance::attribution::compute_epoch_daily(
+            &database.manager,
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+            &HashMap::new(),
+        )
+        .expect_err("TEST_CODE unattested attribution authority must be unavailable");
+        assert_eq!(
+            error.reason_code(),
+            "attribution_database_authority_unavailable"
+        );
     }
 
     #[test]
@@ -4145,20 +4182,18 @@ mod tests {
             .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
             .expect("TEST_CODE active epoch in database A");
 
-        let mut first = database_a.manager.get_conn().unwrap();
-        let first_authority = database_a
-            .manager
-            .attribution_connection_authority(&mut first)
+        let mut first = database_a.manager.attribution_checkout().unwrap();
+        let first_authority = first
+            .authority()
             .expect("TEST_CODE first checkout authority");
-        let mut second = database_a.manager.get_conn().unwrap();
-        let second_authority = database_a
-            .manager
-            .attribution_connection_authority(&mut second)
+        let mut second = database_a.manager.attribution_checkout().unwrap();
+        let second_authority = second
+            .authority()
             .expect("TEST_CODE second checkout authority");
         assert_eq!(first_authority, second_authority);
         drop(second);
         diesel::sql_query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&mut first)
+            .execute(first.connection_for_test())
             .expect("TEST_CODE checkpoint database A before byte copy");
         drop(first);
 
@@ -4175,7 +4210,7 @@ mod tests {
             &HashMap::new(),
         )
         .expect("TEST_CODE computed from attested database A");
-        let mut detached_checkout = database_a.manager.get_conn().unwrap();
+        let mut detached_checkout = database_a.manager.attribution_checkout().unwrap();
 
         let detached_main = database_a.path.with_extension("detached-a.sqlite");
         std::fs::rename(&database_a.path, &detached_main)
@@ -4202,19 +4237,60 @@ mod tests {
             .journal_mode;
         assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
         drop(bootstrap_b);
-        let (pool_b, source_b) =
+        let (attribution_pool_b, source_b) =
             super::super::build_attested_sqlite_pool_with_size(&database_a.path, 1)
                 .expect("TEST_CODE attested replacement database B pool");
+        let pool_b = super::super::build_sqlite_pool_with_size(
+            database_a.path.to_string_lossy().into_owned(),
+            1,
+        )
+        .expect("TEST_CODE replacement database B operational pool");
         let manager_b = DatabaseManager {
             pool: pool_b,
-            selection_connection_source: Some(source_b),
+            attribution_pool: Some(attribution_pool_b),
+            attribution_connection_source: Some(source_b),
+            selection_connection_source: None,
             selection_schema_authority: None,
         };
 
-        database_a
-            .manager
-            .attribution_connection_authority(&mut detached_checkout)
+        let mut genuine_b_checkout = manager_b.attribution_checkout().unwrap();
+        let manager_b_token =
+            super::super::connection_attestation_token(genuine_b_checkout.connection_for_test())
+                .expect("TEST_CODE read manager B registration token");
+        let manager_a_token =
+            super::super::connection_attestation_token(detached_checkout.connection_for_test())
+                .expect("TEST_CODE read detached manager A registration token");
+        assert_ne!(manager_a_token, manager_b_token);
+        diesel::sql_query(format!(
+            "UPDATE {} SET token=? WHERE slot=1",
+            super::super::DESCRIPTOR_ATTESTATION_TEMP_TABLE
+        ))
+        .bind::<Text, _>(&manager_b_token)
+        .execute(detached_checkout.connection_for_test())
+        .expect_err("TEST_CODE attestation token update must be trigger-protected");
+        diesel::sql_query(format!(
+            "DELETE FROM {} WHERE slot=1",
+            super::super::DESCRIPTOR_ATTESTATION_TEMP_TABLE
+        ))
+        .execute(detached_checkout.connection_for_test())
+        .expect_err("TEST_CODE attestation token delete must be trigger-protected");
+        assert_ne!(genuine_b_checkout.authority().unwrap(), first_authority);
+        drop(genuine_b_checkout);
+
+        let drift = detached_checkout
+            .authority()
             .expect_err("TEST_CODE detached A checkout must fail closed after namespace drift");
+        assert!(matches!(
+            drift,
+            DatabaseAuthorityError::DescriptorIntegrityFailed { .. }
+        ));
+        let same_manager_error =
+            crate::performance::attribution::persist_epoch_daily(&database_a.manager, &daily)
+                .expect_err("TEST_CODE original manager must reject its drifted namespace");
+        assert_eq!(
+            same_manager_error.reason_code(),
+            "attribution_epoch_integrity_failed"
+        );
         let error = crate::performance::attribution::persist_epoch_daily(&manager_b, &daily)
             .expect_err("TEST_CODE replacement B must reject detached A evidence");
         assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
@@ -4394,16 +4470,16 @@ mod tests {
                     .expect("TEST_CODE bootstrap SQLite configuration");
                 drop(bootstrap);
             }
-            let (pool, selection_connection_source) = if production_wal {
+            let (attribution_pool, attribution_connection_source) = if production_wal {
                 let (pool, source) =
                     super::super::build_attested_sqlite_pool_with_size(&path, pool_size)
-                        .expect("TEST_CODE descriptor-attested SQLite pool");
-                (pool, Some(source))
+                        .expect("TEST_CODE descriptor-attested attribution pool");
+                (Some(pool), Some(source))
             } else {
-                let pool = super::super::build_sqlite_pool_with_size(database_url, pool_size)
-                    .expect("TEST_CODE isolated SQLite pool");
-                (pool, None)
+                (None, None)
             };
+            let pool = super::super::build_sqlite_pool_with_size(database_url, pool_size)
+                .expect("TEST_CODE isolated operational SQLite pool");
             if install_epoch_schema {
                 let mut conn = pool.get().expect("TEST_CODE schema connection");
                 create_schema(&mut conn).expect("TEST_CODE epoch schema");
@@ -4411,7 +4487,9 @@ mod tests {
             Self {
                 manager: DatabaseManager {
                     pool,
-                    selection_connection_source,
+                    attribution_pool,
+                    attribution_connection_source,
+                    selection_connection_source: None,
                     selection_schema_authority: None,
                 },
                 path: path.clone(),
@@ -4429,6 +4507,8 @@ mod tests {
             Self {
                 manager: DatabaseManager {
                     pool,
+                    attribution_pool: None,
+                    attribution_connection_source: None,
                     selection_connection_source: None,
                     selection_schema_authority: None,
                 },
@@ -4467,12 +4547,17 @@ mod tests {
                 .journal_mode;
             assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
             drop(bootstrap);
-            let (pool, source) = super::super::build_attested_sqlite_pool_with_size(&path, 1)
-                .expect("TEST_CODE snapshot descriptor-attested SQLite pool");
+            let (attribution_pool, source) =
+                super::super::build_attested_sqlite_pool_with_size(&path, 1)
+                    .expect("TEST_CODE snapshot descriptor-attested SQLite pool");
+            let pool = super::super::build_sqlite_pool_with_size(database_url, 1)
+                .expect("TEST_CODE snapshot operational SQLite pool");
             Self {
                 manager: DatabaseManager {
                     pool,
-                    selection_connection_source: Some(source),
+                    attribution_pool: Some(attribution_pool),
+                    attribution_connection_source: Some(source),
+                    selection_connection_source: None,
                     selection_schema_authority: None,
                 },
                 path: path.clone(),
