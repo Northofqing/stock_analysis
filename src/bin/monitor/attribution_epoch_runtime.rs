@@ -1,4 +1,4 @@
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveTime};
+use chrono::{DateTime, FixedOffset, NaiveDate, Timelike, Utc};
 use std::sync::Mutex;
 use stock_analysis::database::attribution_epochs::{
     AttributionEpochReceipt, AttributionEpochStore, AttributionEpochStoreError,
@@ -8,6 +8,23 @@ use stock_analysis::database::DatabaseManager;
 use stock_analysis::performance::attribution_epoch::EpochActivationSource;
 
 static ATTRIBUTION_EPOCH_LAST_SUCCESS: Mutex<Option<NaiveDate>> = Mutex::new(None);
+const SHANGHAI_OFFSET_SECONDS: i32 = 8 * 60 * 60;
+
+pub fn shanghai_attribution_epoch_time(
+    now_utc: DateTime<Utc>,
+) -> Result<DateTime<FixedOffset>, &'static str> {
+    let offset = FixedOffset::east_opt(SHANGHAI_OFFSET_SECONDS)
+        .ok_or("attribution_epoch_shanghai_offset_invalid")?;
+    Ok(now_utc.with_timezone(&offset))
+}
+
+pub fn attribution_epoch_window_open(now: &DateTime<FixedOffset>) -> bool {
+    if now.offset().local_minus_utc() != SHANGHAI_OFFSET_SECONDS || now.hour() != 15 {
+        return false;
+    }
+    let local_point = (now.minute(), now.second(), now.nanosecond());
+    ((35, 0, 0)..=(50, 0, 0)).contains(&local_point)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttributionEpochTickOutcome {
@@ -99,21 +116,13 @@ fn decide_attribution_epoch_tick(
         CalendarObservation::TradingDay => {}
     }
 
-    if now.offset().local_minus_utc() != 8 * 60 * 60 {
+    if now.offset().local_minus_utc() != SHANGHAI_OFFSET_SECONDS {
         return AttributionEpochTickDecision::Unavailable {
             code: "attribution_epoch_invalid_timezone".to_owned(),
             retryable: false,
         };
     }
-    let (Some(start), Some(end)) = (
-        NaiveTime::from_hms_opt(15, 35, 0),
-        NaiveTime::from_hms_opt(15, 50, 0),
-    ) else {
-        return AttributionEpochTickDecision::FailedIntegrity {
-            code: "attribution_epoch_window_definition_invalid".to_owned(),
-        };
-    };
-    if now.time() < start || now.time() > end {
+    if !attribution_epoch_window_open(&now) {
         return AttributionEpochTickDecision::OutsideWindow;
     }
 
@@ -268,13 +277,19 @@ pub fn run_attribution_epoch_tick(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{DateTime, FixedOffset, NaiveDate};
+    use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
     fn at(raw: &str) -> DateTime<FixedOffset> {
         DateTime::parse_from_rfc3339(raw).expect("TEST_CODE valid +08 timestamp")
+    }
+
+    fn utc_at(raw: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(raw)
+            .expect("TEST_CODE valid UTC timestamp")
+            .with_timezone(&Utc)
     }
 
     fn receipt(epoch_id: &str) -> AttributionEpochReceipt {
@@ -379,6 +394,22 @@ mod tests {
                     code: code.to_owned(),
                 }
             );
+        }
+    }
+
+    #[test]
+    fn utc_boundaries_map_to_the_exact_shanghai_activation_window() {
+        for (utc, expected_local, expected_open) in [
+            ("2026-08-28T07:34:00Z", "2026-08-28T15:34:00+08:00", false),
+            ("2026-08-28T07:35:00Z", "2026-08-28T15:35:00+08:00", true),
+            ("2026-08-28T07:50:00Z", "2026-08-28T15:50:00+08:00", true),
+            ("2026-08-28T07:50:01Z", "2026-08-28T15:50:01+08:00", false),
+            ("2026-08-28T07:51:00Z", "2026-08-28T15:51:00+08:00", false),
+        ] {
+            let shanghai = shanghai_attribution_epoch_time(utc_at(utc))
+                .expect("TEST_CODE fixed Shanghai offset");
+            assert_eq!(shanghai.to_rfc3339(), expected_local);
+            assert_eq!(attribution_epoch_window_open(&shanghai), expected_open);
         }
     }
 
@@ -519,5 +550,24 @@ mod tests {
             .expect("TEST_CODE unavailable arm");
         assert!(success < push && push < unavailable);
         assert!(!block[unavailable..].contains("push_governor_v3(&text"));
+    }
+
+    #[test]
+    fn main_wires_epoch_activation_to_explicit_shanghai_time() {
+        let main = include_str!("main.rs");
+        let block = main
+            .split_once("// 任务#3: 每日 15:10 快照过期检查")
+            .expect("TEST_CODE monitor timing marker")
+            .1
+            .split_once("if now.hour() == 15 && (10..=13).contains(&now.minute())")
+            .expect("TEST_CODE unrelated Local timing boundary")
+            .0;
+
+        assert!(block.contains("shanghai_attribution_epoch_time(chrono::Utc::now())"));
+        assert!(block.contains("attribution_epoch_window_open("));
+        assert!(block.contains("&attribution_epoch_now"));
+        assert!(block.contains("run_attribution_epoch_tick("));
+        assert!(block.contains("attribution_epoch_now,"));
+        assert!(!block.contains("now.fixed_offset()"));
     }
 }

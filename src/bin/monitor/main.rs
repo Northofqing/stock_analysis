@@ -8392,35 +8392,50 @@ async fn monitor_loop() {
             }
             // 任务#3: 每日 15:10 快照过期检查（收盘后用户应上传当日快照）
             let now = chrono::Local::now();
-            if now.hour() == 15 && (35..=50).contains(&now.minute()) {
-                match attribution_epoch_runtime::run_attribution_epoch_tick(
-                    stock_analysis::database::DatabaseManager::get(),
-                    now.fixed_offset(),
-                ) {
-                    attribution_epoch_runtime::AttributionEpochTickOutcome::Activated(receipt) => {
-                        log::info!(
-                            "[attribution-epoch] activated epoch_id={}",
-                            receipt.epoch_id
-                        );
+            match attribution_epoch_runtime::shanghai_attribution_epoch_time(chrono::Utc::now()) {
+                Ok(attribution_epoch_now)
+                    if attribution_epoch_runtime::attribution_epoch_window_open(
+                        &attribution_epoch_now,
+                    ) =>
+                {
+                    match attribution_epoch_runtime::run_attribution_epoch_tick(
+                        stock_analysis::database::DatabaseManager::get(),
+                        attribution_epoch_now,
+                    ) {
+                        attribution_epoch_runtime::AttributionEpochTickOutcome::Activated(
+                            receipt,
+                        ) => {
+                            log::info!(
+                                "[attribution-epoch] activated epoch_id={}",
+                                receipt.epoch_id
+                            );
+                        }
+                        attribution_epoch_runtime::AttributionEpochTickOutcome::Verified(
+                            receipt,
+                        ) => {
+                            log::debug!(
+                                "[attribution-epoch] verified epoch_id={}",
+                                receipt.epoch_id
+                            );
+                        }
+                        attribution_epoch_runtime::AttributionEpochTickOutcome::Unavailable {
+                            code,
+                            retryable,
+                        } => {
+                            log::warn!(
+                                "[attribution-epoch] unavailable code={code} retryable={retryable}"
+                            );
+                        }
+                        attribution_epoch_runtime::AttributionEpochTickOutcome::FailedIntegrity {
+                            code,
+                        } => {
+                            log::error!("[attribution-epoch] failed_integrity code={code}");
+                        }
+                        attribution_epoch_runtime::AttributionEpochTickOutcome::OutsideWindow => {}
                     }
-                    attribution_epoch_runtime::AttributionEpochTickOutcome::Verified(receipt) => {
-                        log::debug!("[attribution-epoch] verified epoch_id={}", receipt.epoch_id);
-                    }
-                    attribution_epoch_runtime::AttributionEpochTickOutcome::Unavailable {
-                        code,
-                        retryable,
-                    } => {
-                        log::warn!(
-                            "[attribution-epoch] unavailable code={code} retryable={retryable}"
-                        );
-                    }
-                    attribution_epoch_runtime::AttributionEpochTickOutcome::FailedIntegrity {
-                        code,
-                    } => {
-                        log::error!("[attribution-epoch] failed_integrity code={code}");
-                    }
-                    attribution_epoch_runtime::AttributionEpochTickOutcome::OutsideWindow => {}
                 }
+                Ok(_) => {}
+                Err(code) => log::error!("[attribution-epoch] failed_integrity code={code}"),
             }
             if now.hour() == 15 && (10..=13).contains(&now.minute()) {
                 check_snapshot_staleness_and_notify().await;
