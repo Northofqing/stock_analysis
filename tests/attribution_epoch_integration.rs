@@ -119,6 +119,30 @@ fn cleanup_test_code_database(path: &std::path::Path) {
     }
 }
 
+#[test]
+fn append_only_session_commit_uses_descriptor_attested_read_back() {
+    let path = isolated_path();
+    create_test_code_source_schema(&path);
+    let session = open_test_code_session(&path);
+    let request = EpochActivationRequest {
+        source: EpochActivationSource::Cli,
+        invoked_at: chrono::DateTime::parse_from_rfc3339("2026-08-28T15:40:00+08:00").unwrap(),
+    };
+
+    let receipt = AttributionEpochStore::new(session.database())
+        .activate_once(request)
+        .expect("TEST_CODE append-only session commits through attested read-back");
+    assert_eq!(
+        AttributionEpochStore::new(session.database())
+            .verify_active()
+            .expect("TEST_CODE retained session receipt"),
+        receipt
+    );
+
+    drop(session);
+    cleanup_test_code_database(&path);
+}
+
 fn append_pair(
     database: &DatabaseManager,
     id: i64,

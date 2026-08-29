@@ -144,6 +144,82 @@ impl AttestedAttributionCheckout {
         })
     }
 
+    /// Serializes the just-committed database while this branded writer still
+    /// proves its main/WAL/SHM authority, then runs one fresh deferred
+    /// transaction on a new read-only, query-only in-memory connection.
+    ///
+    /// The SQLite route is never used for read-back identity. Authority is
+    /// checked before and after serialization and again after the detached
+    /// snapshot transaction, so an object replacement latches integrity even
+    /// when the serialized bytes would otherwise remain logically valid.
+    pub(crate) fn authority_bound_readonly_snapshot<T, E, F, M>(
+        &mut self,
+        expected: &DatabaseConnectionAuthority,
+        map_authority: M,
+        operation: F,
+    ) -> Result<T, E>
+    where
+        E: From<diesel::result::Error>,
+        F: FnOnce(&mut SqliteConnection) -> Result<T, E>,
+        M: Fn(DatabaseAuthorityError) -> E + Copy,
+    {
+        let before = registered_descriptor_connection_authority(&self.source, &mut self.connection)
+            .map_err(map_authority)?;
+        require_matching_database_authority(
+            &self.source,
+            expected,
+            &before,
+            "serialized read-back writer differs from committed authority",
+        )
+        .map_err(map_authority)?;
+
+        let serialized = self.connection.serialize_database_to_buffer();
+        let after_serialize =
+            registered_descriptor_connection_authority(&self.source, &mut self.connection)
+                .map_err(map_authority)?;
+        require_matching_database_authority(
+            &self.source,
+            expected,
+            &after_serialize,
+            "database authority changed while serializing read-back snapshot",
+        )
+        .map_err(map_authority)?;
+        let detached_bytes = detached_readonly_snapshot_bytes(&self.source, serialized.as_slice())
+            .map_err(map_authority)?;
+
+        let snapshot_result = (|| {
+            let mut reader = SqliteConnection::establish(":memory:").map_err(|error| {
+                map_authority(DatabaseAuthorityError::DescriptorAttestationUnavailable {
+                    detail: format!("cannot establish detached read-back connection: {error}"),
+                })
+            })?;
+            reader.deserialize_readonly_database_from_buffer(&detached_bytes)?;
+            diesel::sql_query("PRAGMA query_only=ON").execute(&mut reader)?;
+            let query_only = diesel::sql_query("PRAGMA query_only")
+                .get_result::<QueryOnlyPragmaRow>(&mut reader)?
+                .query_only;
+            if query_only != 1 {
+                return Err(map_authority(
+                    DatabaseAuthorityError::DescriptorAttestationUnavailable {
+                        detail: "detached read-back connection is not query-only".into(),
+                    },
+                ));
+            }
+            reader.transaction(operation)
+        })();
+        let after_snapshot =
+            registered_descriptor_connection_authority(&self.source, &mut self.connection)
+                .map_err(map_authority)?;
+        require_matching_database_authority(
+            &self.source,
+            expected,
+            &after_snapshot,
+            "database authority changed during detached read-back snapshot",
+        )
+        .map_err(map_authority)?;
+        snapshot_result
+    }
+
     #[cfg(test)]
     pub(crate) fn connection_for_test(&mut self) -> &mut SqliteConnection {
         &mut self.connection
@@ -228,6 +304,12 @@ struct BusyTimeoutPragmaRow {
 struct WalAutocheckpointPragmaRow {
     #[diesel(sql_type = diesel::sql_types::Integer)]
     wal_autocheckpoint: i32,
+}
+
+#[derive(QueryableByName)]
+struct QueryOnlyPragmaRow {
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    query_only: i32,
 }
 
 #[derive(QueryableByName)]
@@ -894,6 +976,60 @@ fn latch_descriptor_integrity_failure(
             detail: "descriptor source integrity latch is poisoned".into(),
         },
     }
+}
+
+fn require_matching_database_authority(
+    source: &DescriptorSqliteSource,
+    expected: &DatabaseConnectionAuthority,
+    actual: &DatabaseConnectionAuthority,
+    context: &str,
+) -> Result<(), DatabaseAuthorityError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(latch_descriptor_integrity_failure(
+            source,
+            context.to_owned(),
+        ))
+    }
+}
+
+fn detached_readonly_snapshot_bytes(
+    source: &DescriptorSqliteSource,
+    serialized: &[u8],
+) -> Result<Vec<u8>, DatabaseAuthorityError> {
+    const SQLITE_HEADER_BYTES: usize = 100;
+    const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+    const HEADER_WRITE_VERSION: usize = 18;
+    const HEADER_READ_VERSION: usize = 19;
+
+    if serialized.len() < SQLITE_HEADER_BYTES || serialized.get(..16) != Some(SQLITE_MAGIC) {
+        return Err(latch_descriptor_integrity_failure(
+            source,
+            "serialized read-back snapshot has an invalid SQLite header".into(),
+        ));
+    }
+    let versions = (
+        serialized[HEADER_READ_VERSION],
+        serialized[HEADER_WRITE_VERSION],
+    );
+    if !matches!(versions, (1, 1) | (2, 2)) {
+        return Err(latch_descriptor_integrity_failure(
+            source,
+            format!(
+                "serialized read-back snapshot has unsupported read/write versions {versions:?}"
+            ),
+        ));
+    }
+
+    // sqlite3_serialize returns the complete logical database image, but a
+    // WAL-backed source retains (2,2) in the file-format header. A detached
+    // read-only deserialization has no WAL route, so normalize only those two
+    // format bytes to rollback-journal (1,1); all business pages remain exact.
+    let mut detached = serialized.to_vec();
+    detached[HEADER_READ_VERSION] = 1;
+    detached[HEADER_WRITE_VERSION] = 1;
+    Ok(detached)
 }
 
 fn validate_live_registered_descriptor_connection(
@@ -3404,6 +3540,58 @@ mod tests {
             .count;
             assert_eq!(count, 1, "attribution checkout is separately attested");
         }
+    }
+
+    #[test]
+    fn detached_readonly_snapshot_normalizes_only_valid_sqlite_journal_versions() {
+        let database = TemporarySqliteDatabase::new("detached_snapshot_header");
+        let database_url = database.database_url();
+        let mut bootstrap = SqliteConnection::establish(&database_url).unwrap();
+        let journal_mode = diesel::sql_query("PRAGMA journal_mode = WAL")
+            .get_result::<JournalModeRow>(&mut bootstrap)
+            .unwrap()
+            .journal_mode;
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        drop(bootstrap);
+        let (_pool, source) = build_attested_sqlite_pool_with_size(&database.0, 1).unwrap();
+
+        let mut wal_image = vec![0xa5; 100];
+        wal_image[..16].copy_from_slice(b"SQLite format 3\0");
+        wal_image[18] = 2;
+        wal_image[19] = 2;
+        let normalized = detached_readonly_snapshot_bytes(&source, &wal_image).unwrap();
+        assert_eq!(&normalized[..18], &wal_image[..18]);
+        assert_eq!(normalized[18..20], [1, 1]);
+        assert_eq!(&normalized[20..], &wal_image[20..]);
+
+        let mut rollback_image = wal_image.clone();
+        rollback_image[18] = 1;
+        rollback_image[19] = 1;
+        assert_eq!(
+            detached_readonly_snapshot_bytes(&source, &rollback_image).unwrap(),
+            rollback_image
+        );
+
+        for (label, invalid) in [("short", vec![0_u8; 99]), ("bad magic", vec![0_u8; 100])] {
+            let error = detached_readonly_snapshot_bytes(&source, &invalid)
+                .expect_err("invalid SQLite header must fail closed");
+            assert!(
+                matches!(
+                    error,
+                    DatabaseAuthorityError::DescriptorIntegrityFailed { .. }
+                ),
+                "TEST_CODE {label} image returned {error:?}"
+            );
+        }
+
+        let mut mixed = wal_image;
+        mixed[19] = 1;
+        let error = detached_readonly_snapshot_bytes(&source, &mixed)
+            .expect_err("mixed SQLite journal versions must fail closed");
+        assert!(matches!(
+            error,
+            DatabaseAuthorityError::DescriptorIntegrityFailed { .. }
+        ));
     }
 
     #[test]

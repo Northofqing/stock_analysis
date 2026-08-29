@@ -741,6 +741,7 @@ struct FrozenSourceProjection {
     position_projection_hash: String,
 }
 
+#[cfg(test)]
 #[derive(QueryableByName)]
 struct DatabaseFileRow {
     #[diesel(sql_type = Text)]
@@ -1307,12 +1308,19 @@ thread_local! {
 }
 
 #[cfg(test)]
+thread_local! {
+    static POST_COMMIT_BEFORE_READ_BACK_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
 struct PostCommitReadBackHookGuard;
 
 #[cfg(test)]
 impl Drop for PostCommitReadBackHookGuard {
     fn drop(&mut self) {
         POST_COMMIT_READ_BACK_HOOK.with(|hook| *hook.borrow_mut() = None);
+        POST_COMMIT_BEFORE_READ_BACK_HOOK.with(|hook| *hook.borrow_mut() = None);
     }
 }
 
@@ -1324,6 +1332,29 @@ fn install_post_commit_read_back_hook(hook: PostCommitReadBackHook) -> PostCommi
     });
     PostCommitReadBackHookGuard
 }
+
+#[cfg(test)]
+fn install_post_commit_before_read_back_hook(
+    hook: impl FnOnce() + 'static,
+) -> PostCommitReadBackHookGuard {
+    POST_COMMIT_BEFORE_READ_BACK_HOOK.with(|slot| {
+        assert!(slot.borrow().is_none(), "TEST_CODE hook already installed");
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+    PostCommitReadBackHookGuard
+}
+
+#[cfg(test)]
+fn run_post_commit_before_read_back_hook() {
+    POST_COMMIT_BEFORE_READ_BACK_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_post_commit_before_read_back_hook() {}
 
 #[cfg(test)]
 fn pause_post_commit_read_back_after_attempt_chain_ids(ids: &[i64]) {
@@ -3186,28 +3217,12 @@ fn preview_activation_at_resolved_path(
 }
 
 fn verify_post_commit_read_back(
-    database_file: &str,
+    checkout: &mut super::AttestedAttributionCheckout,
+    authority: &DatabaseConnectionAuthority,
     receipt: &AttributionEpochReceipt,
 ) -> Result<(), AttributionEpochStoreError> {
-    if database_file.trim().is_empty() {
-        return Err(failed_integrity(
-            "BR-255 committed activation cannot be reopened read-only",
-        ));
-    }
-    let read_only_url = format!("file:{database_file}?mode=ro");
-    let mut read_only = SqliteConnection::establish(&read_only_url).map_err(|error| {
-        failed_integrity(format!(
-            "BR-255 committed activation read-back connection failed: {error}"
-        ))
-    })?;
-    diesel::sql_query("PRAGMA query_only=ON")
-        .execute(&mut read_only)
-        .map_err(|error| {
-            failed_integrity(format!(
-                "BR-255 committed activation read-back is not query-only: {error}"
-            ))
-        })?;
-    read_only.transaction::<_, AttributionEpochStoreError, _>(|conn| {
+    run_post_commit_before_read_back_hook();
+    checkout.authority_bound_readonly_snapshot(authority, map_database_authority_error, |conn| {
         let rows = validate_all(conn).map_err(|error| {
             activation_error_context(
                 "post_commit_read_back_validate_retained_state",
@@ -3295,51 +3310,90 @@ impl<'a> AttributionEpochStore<'a> {
                 Ok(resolved) => resolved,
                 Err(error) => return self.return_audited_failure(&request, error),
             };
-        let mut conn = match self.database.get_conn() {
-            Ok(conn) => conn,
+        let mut checkout = match self.database.attribution_checkout() {
+            Ok(checkout) => checkout,
             Err(error) => {
-                let primary = activation_unavailable(
-                    "attribution_epoch_storage_unavailable",
-                    true,
-                    format!("BR-255 activation database connection unavailable: {error}"),
-                );
+                let primary = map_database_authority_error(error);
                 return self.return_audited_failure(&request, primary);
             }
         };
-        let database_file =
-            match diesel::sql_query("SELECT file FROM pragma_database_list WHERE name='main'")
-                .get_result::<DatabaseFileRow>(&mut conn)
-            {
-                Ok(row) => row.file,
-                Err(error) => {
-                    drop(conn);
-                    return self.return_audited_failure(&request, error.into());
-                }
-            };
         let invoked_at = canonical_invoked_at(request.invoked_at);
-        let primary = conn.immediate_transaction::<_, AttributionEpochStoreError, _>(|conn| {
-            let receipts = validate_all(conn).map_err(|error| {
-                activation_error_context("activation_transaction_validate_initial", error.into())
-            })?;
-            if receipts.len() > 1 {
-                return Err(failed_integrity(
-                    "BR-255 v1 activation found multiple success receipts",
-                ));
-            }
-            if let Some(row) = receipts.first() {
-                let receipt = receipt_value(row)?;
-                let source = ensure_source_matches_receipt(conn, &receipt).map_err(|error| {
-                    activation_error_context("activation_idempotent_verify_source", error)
+        let primary = checkout.immediate_transaction_with_authority(
+            map_database_authority_error,
+            |conn, authority| {
+                let receipts = validate_all(conn).map_err(|error| {
+                    activation_error_context(
+                        "activation_transaction_validate_initial",
+                        error.into(),
+                    )
                 })?;
+                if receipts.len() > 1 {
+                    return Err(failed_integrity(
+                        "BR-255 v1 activation found multiple success receipts",
+                    ));
+                }
+                if let Some(row) = receipts.first() {
+                    let receipt = receipt_value(row)?;
+                    let source =
+                        ensure_source_matches_receipt(conn, &receipt).map_err(|error| {
+                            activation_error_context("activation_idempotent_verify_source", error)
+                        })?;
+                    insert_attempt_on_conn(
+                        conn,
+                        &AttributionEpochAttemptAppend {
+                            source: source_name(request.source).to_owned(),
+                            invoked_at: invoked_at.clone(),
+                            completed_session_date: Some(receipt.cutover_completed_trading_date),
+                            effective_date: Some(receipt.effective_trading_date),
+                            outcome: "success".to_owned(),
+                            reason_code: "attribution_epoch_idempotent_success".to_owned(),
+                            retryable: false,
+                            source_summary_hash: receipt.receipt_hash.clone(),
+                            epoch_id: Some(receipt.epoch_id.clone()),
+                            success_receipt_hash: Some(receipt.receipt_hash.clone()),
+                        },
+                    )
+                    .map_err(|error| {
+                        activation_error_context("activation_idempotent_append_attempt", error)
+                    })?;
+                    validate_all(conn).map_err(|error| {
+                        activation_error_context(
+                            "activation_idempotent_validate_committed_state",
+                            error.into(),
+                        )
+                    })?;
+                    return verified_activation_outcome(
+                        receipt,
+                        source,
+                        EpochActivationDisposition::AlreadyActive,
+                    )
+                    .map(|outcome| (outcome, authority.clone()));
+                }
+                let source_before = analyze_source_projection(conn, completed, None, true)
+                    .map_err(|error| {
+                        activation_error_context("activation_first_analyze_source", error)
+                    })?;
+                let preview = activation_preview(
+                    false,
+                    completed,
+                    effective,
+                    source_before,
+                    &calendar_hash,
+                    None,
+                )?;
+                let receipt =
+                    insert_activation_receipt(conn, &preview, &calendar_hash).map_err(|error| {
+                        activation_error_context("activation_first_insert_receipt", error)
+                    })?;
                 insert_attempt_on_conn(
                     conn,
                     &AttributionEpochAttemptAppend {
                         source: source_name(request.source).to_owned(),
                         invoked_at: invoked_at.clone(),
-                        completed_session_date: Some(receipt.cutover_completed_trading_date),
-                        effective_date: Some(receipt.effective_trading_date),
+                        completed_session_date: Some(completed),
+                        effective_date: Some(effective),
                         outcome: "success".to_owned(),
-                        reason_code: "attribution_epoch_idempotent_success".to_owned(),
+                        reason_code: "attribution_epoch_activated".to_owned(),
                         retryable: false,
                         source_summary_hash: receipt.receipt_hash.clone(),
                         epoch_id: Some(receipt.epoch_id.clone()),
@@ -3347,85 +3401,46 @@ impl<'a> AttributionEpochStore<'a> {
                     },
                 )
                 .map_err(|error| {
-                    activation_error_context("activation_idempotent_append_attempt", error)
+                    activation_error_context("activation_first_append_attempt", error)
                 })?;
+                let source_after =
+                    analyze_source_projection(conn, completed, None, true).map_err(|error| {
+                        activation_error_context("activation_first_reanalyze_source", error)
+                    })?;
+                let after = activation_preview(
+                    false,
+                    completed,
+                    effective,
+                    source_after,
+                    &calendar_hash,
+                    None,
+                )?;
+                if after != preview {
+                    return Err(failed_integrity(
+                        "BR-255 source position projection changed during activation",
+                    ));
+                }
                 validate_all(conn).map_err(|error| {
                     activation_error_context(
-                        "activation_idempotent_validate_committed_state",
+                        "activation_first_validate_written_state",
                         error.into(),
                     )
                 })?;
-                return verified_activation_outcome(
-                    receipt,
-                    source,
-                    EpochActivationDisposition::AlreadyActive,
-                );
-            }
-            let source_before =
-                analyze_source_projection(conn, completed, None, true).map_err(|error| {
-                    activation_error_context("activation_first_analyze_source", error)
+                let source = ensure_source_matches_receipt(conn, &receipt).map_err(|error| {
+                    activation_error_context("activation_first_verify_written_source", error)
                 })?;
-            let preview = activation_preview(
-                false,
-                completed,
-                effective,
-                source_before,
-                &calendar_hash,
-                None,
-            )?;
-            let receipt =
-                insert_activation_receipt(conn, &preview, &calendar_hash).map_err(|error| {
-                    activation_error_context("activation_first_insert_receipt", error)
-                })?;
-            insert_attempt_on_conn(
-                conn,
-                &AttributionEpochAttemptAppend {
-                    source: source_name(request.source).to_owned(),
-                    invoked_at: invoked_at.clone(),
-                    completed_session_date: Some(completed),
-                    effective_date: Some(effective),
-                    outcome: "success".to_owned(),
-                    reason_code: "attribution_epoch_activated".to_owned(),
-                    retryable: false,
-                    source_summary_hash: receipt.receipt_hash.clone(),
-                    epoch_id: Some(receipt.epoch_id.clone()),
-                    success_receipt_hash: Some(receipt.receipt_hash.clone()),
-                },
-            )
-            .map_err(|error| activation_error_context("activation_first_append_attempt", error))?;
-            let source_after =
-                analyze_source_projection(conn, completed, None, true).map_err(|error| {
-                    activation_error_context("activation_first_reanalyze_source", error)
-                })?;
-            let after = activation_preview(
-                false,
-                completed,
-                effective,
-                source_after,
-                &calendar_hash,
-                None,
-            )?;
-            if after != preview {
-                return Err(failed_integrity(
-                    "BR-255 source position projection changed during activation",
-                ));
-            }
-            validate_all(conn).map_err(|error| {
-                activation_error_context("activation_first_validate_written_state", error.into())
-            })?;
-            let source = ensure_source_matches_receipt(conn, &receipt).map_err(|error| {
-                activation_error_context("activation_first_verify_written_source", error)
-            })?;
-            verified_activation_outcome(receipt, source, EpochActivationDisposition::Activated)
-        });
-        drop(conn);
+                verified_activation_outcome(receipt, source, EpochActivationDisposition::Activated)
+                    .map(|outcome| (outcome, authority.clone()))
+            },
+        );
 
-        let outcome = match primary {
+        let (outcome, authority) = match primary {
             Ok(outcome) => outcome,
             Err(error) => return self.return_audited_failure(&request, error),
         };
         let receipt = outcome.receipt();
-        let read_back = verify_post_commit_read_back(&database_file, receipt);
+        let read_back = verify_post_commit_read_back(&mut checkout, &authority, receipt);
+        drop(checkout);
         if let Err(error) = read_back {
             return self.return_audited_failure(&request, error);
         }
@@ -3603,83 +3618,83 @@ impl<'a> AttributionEpochStore<'a> {
             return Err(failed_integrity("BR-255 invalid attempt append input"));
         }
         parse_utc(&input.invoked_at, "attempt invoked_at").map_err(map_integrity)?;
-        let mut conn =
-            self.database
-                .get_conn()
-                .map_err(|error| AttributionEpochStoreError::Unavailable {
-                    reason_code: "attribution_epoch_storage_unavailable",
-                    retryable: true,
-                    detail: format!("BR-255 epoch database connection unavailable: {error}"),
-                })?;
-        conn.immediate_transaction::<_, diesel::result::Error, _>(|conn| {
-            let state = validate_attempts(conn)?;
-            validate_all(conn)?;
-            let previous = state
-                .last()
-                .map_or(ATTEMPT_GENESIS, |row| row.record_hash.as_str());
-            let window = new_window(conn)?;
-            let mut row = PersistedAttempt {
-                id: 0,
-                source: input.source.clone(),
-                invoked_at: input.invoked_at.clone(),
-                completed_session_date: input.completed_session_date.map(|date| date.to_string()),
-                effective_date: input.effective_date.map(|date| date.to_string()),
-                outcome: input.outcome.clone(),
-                reason_code: input.reason_code.clone(),
-                retryable: i32::from(input.retryable),
-                source_summary_hash: input.source_summary_hash.clone(),
-                epoch_id: input.epoch_id.clone(),
-                success_receipt_hash: input.success_receipt_hash.clone(),
-                predecessor_attempt_hash: previous.to_owned(),
-                record_hash: String::new(),
-                created_at: window.created_at.clone(),
-                retention_deadline: window.retention_deadline.clone(),
-            };
-            row.record_hash = attempt_hash(&row)?;
-            diesel::sql_query(
-                "INSERT INTO attribution_epoch_attempt_audit
+        let mut checkout = self
+            .database
+            .attribution_checkout()
+            .map_err(map_database_authority_error)?;
+        checkout.immediate_transaction_with_authority(
+            map_database_authority_error,
+            |conn, _authority| {
+                let state = validate_attempts(conn)?;
+                validate_all(conn)?;
+                let previous = state
+                    .last()
+                    .map_or(ATTEMPT_GENESIS, |row| row.record_hash.as_str());
+                let window = new_window(conn)?;
+                let mut row = PersistedAttempt {
+                    id: 0,
+                    source: input.source.clone(),
+                    invoked_at: input.invoked_at.clone(),
+                    completed_session_date: input
+                        .completed_session_date
+                        .map(|date| date.to_string()),
+                    effective_date: input.effective_date.map(|date| date.to_string()),
+                    outcome: input.outcome.clone(),
+                    reason_code: input.reason_code.clone(),
+                    retryable: i32::from(input.retryable),
+                    source_summary_hash: input.source_summary_hash.clone(),
+                    epoch_id: input.epoch_id.clone(),
+                    success_receipt_hash: input.success_receipt_hash.clone(),
+                    predecessor_attempt_hash: previous.to_owned(),
+                    record_hash: String::new(),
+                    created_at: window.created_at.clone(),
+                    retention_deadline: window.retention_deadline.clone(),
+                };
+                row.record_hash = attempt_hash(&row)?;
+                diesel::sql_query(
+                    "INSERT INTO attribution_epoch_attempt_audit
                  (source, invoked_at, completed_session_date, effective_date, outcome, reason_code,
                   retryable, source_summary_hash, epoch_id, success_receipt_hash,
                   predecessor_attempt_hash, record_hash, created_at, retention_deadline)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind::<Text, _>(&row.source)
-            .bind::<Text, _>(&row.invoked_at)
-            .bind::<Nullable<Text>, _>(&row.completed_session_date)
-            .bind::<Nullable<Text>, _>(&row.effective_date)
-            .bind::<Text, _>(&row.outcome)
-            .bind::<Text, _>(&row.reason_code)
-            .bind::<Integer, _>(row.retryable)
-            .bind::<Text, _>(&row.source_summary_hash)
-            .bind::<Nullable<Text>, _>(&row.epoch_id)
-            .bind::<Nullable<Text>, _>(&row.success_receipt_hash)
-            .bind::<Text, _>(&row.predecessor_attempt_hash)
-            .bind::<Text, _>(&row.record_hash)
-            .bind::<Text, _>(&row.created_at)
-            .bind::<Text, _>(&row.retention_deadline)
-            .execute(conn)?;
-            row.id = diesel::select(diesel::dsl::sql::<BigInt>("last_insert_rowid()"))
-                .get_result(conn)?;
-            diesel::sql_query(
-                "INSERT INTO attribution_epoch_attempt_chain
+                )
+                .bind::<Text, _>(&row.source)
+                .bind::<Text, _>(&row.invoked_at)
+                .bind::<Nullable<Text>, _>(&row.completed_session_date)
+                .bind::<Nullable<Text>, _>(&row.effective_date)
+                .bind::<Text, _>(&row.outcome)
+                .bind::<Text, _>(&row.reason_code)
+                .bind::<Integer, _>(row.retryable)
+                .bind::<Text, _>(&row.source_summary_hash)
+                .bind::<Nullable<Text>, _>(&row.epoch_id)
+                .bind::<Nullable<Text>, _>(&row.success_receipt_hash)
+                .bind::<Text, _>(&row.predecessor_attempt_hash)
+                .bind::<Text, _>(&row.record_hash)
+                .bind::<Text, _>(&row.created_at)
+                .bind::<Text, _>(&row.retention_deadline)
+                .execute(conn)?;
+                row.id = diesel::select(diesel::dsl::sql::<BigInt>("last_insert_rowid()"))
+                    .get_result(conn)?;
+                diesel::sql_query(
+                    "INSERT INTO attribution_epoch_attempt_chain
                  (attempt_audit_id, previous_hash, record_hash, created_at, retention_deadline)
                  VALUES (?, ?, ?, ?, ?)",
-            )
-            .bind::<BigInt, _>(row.id)
-            .bind::<Text, _>(&row.predecessor_attempt_hash)
-            .bind::<Text, _>(&row.record_hash)
-            .bind::<Text, _>(&row.created_at)
-            .bind::<Text, _>(&row.retention_deadline)
-            .execute(conn)?;
-            validate_all(conn)?;
-            Ok(AttributionEpochAttemptReceipt {
-                attempt_audit_id: row.id,
-                record_hash: row.record_hash,
-                created_at: row.created_at,
-                retention_deadline: row.retention_deadline,
-            })
-        })
-        .map_err(map_integrity)
+                )
+                .bind::<BigInt, _>(row.id)
+                .bind::<Text, _>(&row.predecessor_attempt_hash)
+                .bind::<Text, _>(&row.record_hash)
+                .bind::<Text, _>(&row.created_at)
+                .bind::<Text, _>(&row.retention_deadline)
+                .execute(conn)?;
+                validate_all(conn)?;
+                Ok(AttributionEpochAttemptReceipt {
+                    attempt_audit_id: row.id,
+                    record_hash: row.record_hash,
+                    created_at: row.created_at,
+                    retention_deadline: row.retention_deadline,
+                })
+            },
+        )
     }
 
     #[allow(dead_code)]
@@ -3903,6 +3918,18 @@ mod tests {
     use diesel::sql_types::Text;
 
     use super::*;
+
+    #[derive(QueryableByName)]
+    struct TestWalCheckpointRow {
+        #[diesel(sql_type = Integer)]
+        busy: i32,
+        #[diesel(column_name = log)]
+        #[diesel(sql_type = Integer)]
+        _log: i32,
+        #[diesel(column_name = checkpointed)]
+        #[diesel(sql_type = Integer)]
+        _checkpointed: i32,
+    }
 
     fn activation_request(raw: &str) -> EpochActivationRequest {
         EpochActivationRequest {
@@ -4766,7 +4793,7 @@ mod tests {
 
     impl TestDatabase {
         fn new() -> Self {
-            Self::with_options(1, true)
+            Self::with_wal_options(1, true)
         }
 
         fn attested() -> Self {
@@ -4904,6 +4931,29 @@ mod tests {
                 path: path.clone(),
                 _cleanup: TestDatabaseCleanup { path },
             }
+        }
+
+        fn cold_snapshot_route(&self) -> (PathBuf, TestDatabaseCleanup) {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("TEST_CODE clock")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "TEST_CODE_attribution_epochs_cold_snapshot_{}_{}.sqlite",
+                std::process::id(),
+                nonce
+            ));
+            let mut source = self
+                .manager
+                .get_conn()
+                .expect("TEST_CODE cold snapshot source");
+            diesel::sql_query("VACUUM INTO ?")
+                .bind::<Text, _>(path.to_string_lossy().as_ref())
+                .execute(&mut source)
+                .expect("TEST_CODE cold immutable snapshot");
+            drop(source);
+            let cleanup = TestDatabaseCleanup { path: path.clone() };
+            (path, cleanup)
         }
     }
 
@@ -5244,17 +5294,15 @@ mod tests {
 
     #[test]
     fn activation_preview_and_commit_freeze_one_verified_epoch() {
-        let database = TestDatabase::new();
-        install_activation_source(&database.manager);
-        let store = AttributionEpochStore::with_read_only_preview_path(
-            &database.manager,
-            database.path.clone(),
-        );
         let request = activation_request("2026-08-28T15:40:00+08:00");
-
-        let preview = store
-            .preview_activation(&request)
-            .expect("TEST_CODE activation preview");
+        let preview_database = TestDatabase::with_options(1, true);
+        install_activation_source(&preview_database.manager);
+        let preview = AttributionEpochStore::with_read_only_preview_path(
+            &preview_database.manager,
+            preview_database.path.clone(),
+        )
+        .preview_activation(&request)
+        .expect("TEST_CODE activation preview");
         assert!(!preview.activated);
         assert_eq!(preview.receipt_hash, None);
         assert_eq!(preview.calendar_authority_hash.len(), 64);
@@ -5265,6 +5313,9 @@ mod tests {
         assert_eq!(preview.carry[0].code, "TEST_CODE_600001");
         assert_eq!(preview.carry[0].quantity, 100);
 
+        let database = TestDatabase::snapshot_of(&preview_database);
+        drop(preview_database);
+        let store = AttributionEpochStore::new(&database.manager);
         let outcome = store
             .activate_once_with_outcome(request.clone())
             .expect("TEST_CODE atomic activation with verified render projection");
@@ -5285,8 +5336,8 @@ mod tests {
         );
         assert_eq!(&store.verify_active().unwrap(), receipt);
 
-        let retained = store
-            .preview_activation(&request)
+        let (retained_path, _retained_cleanup) = database.cold_snapshot_route();
+        let retained = AttributionEpochStore::preview_activation_at_path(&retained_path, &request)
             .expect("TEST_CODE retained activation preview");
         assert!(retained.activated);
         assert_eq!(
@@ -5314,9 +5365,9 @@ mod tests {
         const CANONICAL_EMPTY_AUDIT_TIP: &str =
             "2d962b67053f74fb37fbde126d8f7cc54d9568a3f55dad49ecbf0e7b1dd8340b";
 
-        let database = TestDatabase::new();
-        install_activation_source(&database.manager);
-        database
+        let preview_database = TestDatabase::with_options(1, true);
+        install_activation_source(&preview_database.manager);
+        preview_database
             .manager
             .get_conn()
             .expect("TEST_CODE empty source connection")
@@ -5326,20 +5377,22 @@ mod tests {
                  DELETE FROM paper_trades;",
             )
             .expect("TEST_CODE empty attribution source");
-        let store = AttributionEpochStore::with_read_only_preview_path(
-            &database.manager,
-            database.path.clone(),
-        );
         let request = activation_request("2026-08-28T15:40:00+08:00");
 
-        let preview = store
-            .preview_activation(&request)
-            .expect("TEST_CODE empty-source activation preview");
+        let preview = AttributionEpochStore::with_read_only_preview_path(
+            &preview_database.manager,
+            preview_database.path.clone(),
+        )
+        .preview_activation(&request)
+        .expect("TEST_CODE empty-source activation preview");
         assert_eq!(preview.paper_trade_high_water, 0);
         assert_eq!(preview.order_audit_high_water, 0);
         assert!(preview.carry.is_empty());
         assert_eq!(preview.order_audit_tip_hash, CANONICAL_EMPTY_AUDIT_TIP);
 
+        let database = TestDatabase::snapshot_of(&preview_database);
+        drop(preview_database);
+        let store = AttributionEpochStore::new(&database.manager);
         let activated = store
             .activate_once_with_outcome(request.clone())
             .expect("TEST_CODE empty-source activation commit");
@@ -5826,6 +5879,162 @@ mod tests {
     }
 
     #[test]
+    fn activation_fails_closed_if_database_route_is_replaced_before_read_back() {
+        let database = TestDatabase::with_wal_options(4, true);
+        install_activation_source(&database.manager);
+        let detached = database.path.with_extension("detached-a.sqlite");
+        let replacement = database.path.with_extension("replacement-b.sqlite");
+        let _detached_cleanup = TestDatabaseCleanup {
+            path: detached.clone(),
+        };
+        let _replacement_cleanup = TestDatabaseCleanup {
+            path: replacement.clone(),
+        };
+        let route = database.path.clone();
+        let hook_route = route.clone();
+        let hook_detached = detached.clone();
+        let hook_replacement = replacement.clone();
+        let _hook = install_post_commit_before_read_back_hook(move || {
+            let mut source = SqliteConnection::establish(&hook_route.to_string_lossy())
+                .expect("TEST_CODE open committed database A for logical clone");
+            let checkpoint = diesel::sql_query("PRAGMA wal_checkpoint(TRUNCATE)")
+                .get_result::<TestWalCheckpointRow>(&mut source)
+                .expect("TEST_CODE checkpoint committed database A");
+            assert_eq!(checkpoint.busy, 0, "TEST_CODE checkpoint is uncontended");
+            drop(source);
+            std::fs::copy(&hook_route, &hook_replacement)
+                .expect("TEST_CODE create byte-identical database B");
+            assert_eq!(
+                std::fs::read(&hook_route).expect("TEST_CODE read database A bytes"),
+                std::fs::read(&hook_replacement).expect("TEST_CODE read database B bytes")
+            );
+
+            std::fs::rename(&hook_route, &hook_detached)
+                .expect("TEST_CODE detach committed database A main");
+            for suffix in ["-wal", "-shm"] {
+                let source = sqlite_sidecar_path(&hook_route, suffix);
+                if source.exists() {
+                    std::fs::rename(&source, sqlite_sidecar_path(&hook_detached, suffix))
+                        .expect("TEST_CODE detach committed database A sidecar");
+                }
+            }
+            std::fs::rename(&hook_replacement, &hook_route)
+                .expect("TEST_CODE install logically identical database B at route");
+            let mut replacement_connection =
+                SqliteConnection::establish(&hook_route.to_string_lossy())
+                    .expect("TEST_CODE open replacement database B");
+            let journal_mode = diesel::sql_query("PRAGMA journal_mode = WAL")
+                .get_result::<super::super::JournalModeRow>(&mut replacement_connection)
+                .expect("TEST_CODE replacement database B WAL mode")
+                .journal_mode;
+            assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        });
+
+        let error = AttributionEpochStore::new(&database.manager)
+            .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
+            .expect_err("TEST_CODE route replacement must not read database B as committed A");
+        assert_eq!(
+            error.reason_code(),
+            "epoch_attempt_audit_unavailable",
+            "TEST_CODE detached authority cannot claim a persisted failure audit: {error}"
+        );
+    }
+
+    #[test]
+    fn authority_bound_read_back_uses_a_new_readonly_deserialized_connection() {
+        let database = TestDatabase::attested();
+        let mut checkout = database.manager.attribution_checkout().unwrap();
+        let authority = checkout.authority().unwrap();
+
+        let error = checkout
+            .authority_bound_readonly_snapshot(
+                &authority,
+                map_database_authority_error,
+                |connection| {
+                    let query_only = diesel::sql_query("PRAGMA query_only")
+                        .get_result::<super::super::QueryOnlyPragmaRow>(connection)?
+                        .query_only;
+                    assert_eq!(query_only, 1, "TEST_CODE read-back enforces query_only");
+                    let retained_tables = diesel::sql_query(
+                        "SELECT COUNT(*) AS count FROM sqlite_master \
+                         WHERE type='table' AND name='attribution_sample_epoch_receipt'",
+                    )
+                    .get_result::<CountRow>(connection)?
+                    .count;
+                    assert_eq!(retained_tables, 1);
+                    let retained_receipts = diesel::sql_query(
+                        "SELECT COUNT(*) AS count FROM attribution_sample_epoch_receipt",
+                    )
+                    .get_result::<CountRow>(connection)?
+                    .count;
+                    assert_eq!(retained_receipts, 0);
+                    let registration_tables = diesel::sql_query(format!(
+                        "SELECT COUNT(*) AS count FROM sqlite_temp_master \
+                         WHERE type='table' AND name='{}'",
+                        super::super::DESCRIPTOR_ATTESTATION_TEMP_TABLE
+                    ))
+                    .get_result::<CountRow>(connection)?
+                    .count;
+                    assert_eq!(
+                        registration_tables, 0,
+                        "TEST_CODE detached reader must not reuse the writer connection"
+                    );
+                    diesel::sql_query("CREATE TABLE TEST_CODE_read_back_write(value INTEGER)")
+                        .execute(connection)?;
+                    Ok::<_, AttributionEpochStoreError>(())
+                },
+            )
+            .expect_err("TEST_CODE authority-bound read-back must reject writes");
+        assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
+        assert_eq!(checkout.authority().unwrap(), authority);
+        let mut operational = database.manager.get_conn().unwrap();
+        let created = diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM sqlite_master \
+             WHERE type='table' AND name='TEST_CODE_read_back_write'",
+        )
+        .get_result::<CountRow>(&mut operational)
+        .unwrap()
+        .count;
+        assert_eq!(created, 0);
+    }
+
+    #[test]
+    fn serialized_read_back_authority_exit_failure_overrides_operation_error() {
+        let database = TestDatabase::attested();
+        let detached = database.path.with_extension("detached-read-back.sqlite");
+        let _detached_cleanup = TestDatabaseCleanup {
+            path: detached.clone(),
+        };
+        let route = database.path.clone();
+        let mut checkout = database.manager.attribution_checkout().unwrap();
+        let authority = checkout.authority().unwrap();
+
+        let error = checkout
+            .authority_bound_readonly_snapshot(
+                &authority,
+                map_database_authority_error,
+                |_connection| {
+                    std::fs::rename(&route, &detached).unwrap();
+                    for suffix in ["-wal", "-shm"] {
+                        let source = sqlite_sidecar_path(&route, suffix);
+                        if source.exists() {
+                            std::fs::rename(&source, sqlite_sidecar_path(&detached, suffix))
+                                .unwrap();
+                        }
+                    }
+                    Err::<(), _>(AttributionEpochStoreError::Unavailable {
+                        reason_code: "TEST_CODE_operation_error",
+                        retryable: false,
+                        detail: "TEST_CODE operation failed before authority exit".into(),
+                    })
+                },
+            )
+            .expect_err("TEST_CODE authority exit failure must override operation error");
+        assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
+        assert!(!error.to_string().contains("TEST_CODE_operation_error"));
+    }
+
+    #[test]
     fn post_commit_read_back_pins_attempt_chain_snapshot_during_second_attempt_commit() {
         let database = TestDatabase::with_wal_options(4, true);
         install_activation_source(&database.manager);
@@ -5834,7 +6043,6 @@ mod tests {
             .expect("TEST_CODE initial committed activation");
         let (ready, ready_wait) = std::sync::mpsc::sync_channel(1);
         let (release, release_wait) = std::sync::mpsc::sync_channel(1);
-        let reader_path = database.path.clone();
         let reader_receipt = receipt.clone();
         let writer_input = AttributionEpochAttemptAppend {
             source: "TEST_CODE read-back interleaving".to_owned(),
@@ -5849,13 +6057,16 @@ mod tests {
             success_receipt_hash: Some(receipt.receipt_hash.clone()),
         };
         let writer_database = &database.manager;
+        let reader_database = &database.manager;
         std::thread::scope(|scope| {
             let reader = scope.spawn(move || {
                 let _hook = install_post_commit_read_back_hook(PostCommitReadBackHook {
                     ready,
                     release: release_wait,
                 });
-                verify_post_commit_read_back(&reader_path.to_string_lossy(), &reader_receipt)
+                let mut checkout = reader_database.attribution_checkout().unwrap();
+                let authority = checkout.authority().unwrap();
+                verify_post_commit_read_back(&mut checkout, &authority, &reader_receipt)
             });
             assert_eq!(
                 ready_wait
@@ -5865,8 +6076,22 @@ mod tests {
             );
             let (writer_done, writer_result) = std::sync::mpsc::sync_channel(1);
             let writer = scope.spawn(move || {
+                let result = writer_database
+                    .get_conn()
+                    .map_err(|error| {
+                        activation_unavailable(
+                            "TEST_CODE_writer_connection_unavailable",
+                            false,
+                            error.to_string(),
+                        )
+                    })
+                    .and_then(|mut connection| {
+                        connection.immediate_transaction(|connection| {
+                            insert_attempt_on_conn(connection, &writer_input)
+                        })
+                    });
                 writer_done
-                    .send(AttributionEpochStore::new(writer_database).append_attempt(writer_input))
+                    .send(result)
                     .expect("TEST_CODE writer result notification");
             });
             let writer_result = writer_result.recv_timeout(std::time::Duration::from_secs(10));
@@ -6261,7 +6486,7 @@ mod tests {
 
     #[test]
     fn activation_busy_is_retryable_and_never_claims_success_when_audit_is_locked() {
-        let database = TestDatabase::with_options(2, true);
+        let database = TestDatabase::with_wal_options(2, true);
         install_activation_source(&database.manager);
         let mut locker = database.manager.get_conn().unwrap();
         let mut contender = database.manager.get_conn().unwrap();
@@ -6289,19 +6514,16 @@ mod tests {
     }
 
     #[test]
-    fn activation_read_back_failure_never_returns_committed_success() {
+    fn activation_without_descriptor_authority_never_writes_or_claims_audit() {
         let database = TestDatabase::in_memory();
         install_activation_source(&database.manager);
         let error = AttributionEpochStore::new(&database.manager)
             .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
             .unwrap_err();
-        assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
+        assert_eq!(error.reason_code(), "epoch_attempt_audit_unavailable");
         let mut conn = database.manager.get_conn().unwrap();
-        assert_eq!(validate_all(&mut conn).unwrap().len(), 1);
-        let attempts = validate_attempts(&mut conn).unwrap();
-        assert_eq!(attempts.len(), 2);
-        assert_eq!(attempts[0].outcome, "success");
-        assert_eq!(attempts[1].outcome, "failed_integrity");
+        assert!(validate_all(&mut conn).unwrap().is_empty());
+        assert!(validate_attempts(&mut conn).unwrap().is_empty());
     }
 
     #[test]

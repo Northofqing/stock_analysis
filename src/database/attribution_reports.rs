@@ -340,6 +340,47 @@ impl AttributionDatabaseSession {
                 })?
                 .to_owned(),
         };
+        let (attribution_pool, attribution_connection_source) = match access {
+            AttributionDatabaseAccess::ReadOnly => (None, None),
+            AttributionDatabaseAccess::AppendOnly => {
+                let mut bootstrap = SqliteConnection::establish(&database_url).map_err(|_| {
+                    unavailable(
+                        "attribution_database_authority_unavailable",
+                        false,
+                        "BR-255 append-only attribution WAL bootstrap is unavailable",
+                    )
+                })?;
+                let journal_mode = diesel::sql_query("PRAGMA journal_mode = WAL")
+                    .get_result::<super::JournalModeRow>(&mut bootstrap)
+                    .map_err(|_| {
+                        unavailable(
+                            "attribution_database_authority_unavailable",
+                            false,
+                            "BR-255 append-only attribution database cannot enter WAL mode",
+                        )
+                    })?
+                    .journal_mode;
+                if !journal_mode.eq_ignore_ascii_case("wal") {
+                    return Err(unavailable(
+                        "attribution_database_authority_unavailable",
+                        false,
+                        "BR-255 append-only attribution database did not retain WAL mode",
+                    ));
+                }
+                drop(bootstrap);
+                let (pool, source) = super::build_attested_sqlite_pool_with_size(&database_path, 1)
+                    .map_err(|error| {
+                        unavailable(
+                            "attribution_database_authority_unavailable",
+                            false,
+                            format!(
+                                "BR-255 append-only attribution descriptor attestation is unavailable: {error}"
+                            ),
+                        )
+                    })?;
+                (Some(pool), Some(source))
+            }
+        };
         let pool = super::build_sqlite_pool_with_size(database_url, 1).map_err(|_| {
             unavailable(
                 "attribution_database_unavailable",
@@ -349,8 +390,8 @@ impl AttributionDatabaseSession {
         })?;
         let database = DatabaseManager {
             pool,
-            attribution_pool: None,
-            attribution_connection_source: None,
+            attribution_pool,
+            attribution_connection_source,
             selection_connection_source: None,
             selection_schema_authority: None,
         };
