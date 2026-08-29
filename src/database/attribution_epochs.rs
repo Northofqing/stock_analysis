@@ -4175,6 +4175,95 @@ mod tests {
     }
 
     #[test]
+    fn daily_persist_latches_idle_registered_checkout_drift_instead_of_pool_self_healing() {
+        let database = activated_test_database().0;
+        let daily = crate::performance::attribution::compute_epoch_daily(
+            &database.manager,
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+            &HashMap::new(),
+        )
+        .expect("TEST_CODE computed before idle checkout drift");
+        let mut checkout = database.manager.attribution_checkout().unwrap();
+        diesel::sql_query(format!(
+            "DROP TRIGGER {}",
+            super::super::DESCRIPTOR_ATTESTATION_NO_UPDATE_TRIGGER
+        ))
+        .execute(checkout.connection_for_test())
+        .expect("TEST_CODE remove one live registration protection trigger");
+        drop(checkout);
+
+        let error = crate::performance::attribution::persist_epoch_daily(&database.manager, &daily)
+            .expect_err("TEST_CODE registered checkout drift must poison attribution source");
+        assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
+        assert_daily_storage_pristine(&database.manager);
+    }
+
+    #[test]
+    fn transaction_exit_integrity_overrides_business_error_and_rolls_back() {
+        fn drift_then_fail(
+            connection: &mut SqliteConnection,
+            _authority: &DatabaseConnectionAuthority,
+        ) -> Result<(), AttributionEpochStoreError> {
+            diesel::sql_query("INSERT INTO TEST_CODE_authority_exit_probe(marker) VALUES (1)")
+                .execute(connection)?;
+            diesel::sql_query(format!(
+                "DROP TRIGGER {}",
+                super::super::DESCRIPTOR_ATTESTATION_NO_UPDATE_TRIGGER
+            ))
+            .execute(connection)?;
+            Err(AttributionEpochStoreError::Unavailable {
+                reason_code: "TEST_CODE_business_error",
+                retryable: false,
+                detail: "TEST_CODE operation failed after authority drift".into(),
+            })
+        }
+
+        for immediate in [false, true] {
+            let database = TestDatabase::attested();
+            let mut operational = database.manager.get_conn().unwrap();
+            diesel::sql_query(
+                "CREATE TABLE TEST_CODE_authority_exit_probe (marker INTEGER NOT NULL)",
+            )
+            .execute(&mut operational)
+            .unwrap();
+            drop(operational);
+            let mut checkout = database.manager.attribution_checkout().unwrap();
+
+            let result = if immediate {
+                checkout.immediate_transaction_with_authority(
+                    map_database_authority_error,
+                    drift_then_fail,
+                )
+            } else {
+                checkout.transaction_with_authority(map_database_authority_error, drift_then_fail)
+            };
+            let error =
+                result.expect_err("TEST_CODE exit authority must override the operation error");
+            assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
+
+            let mut operational = database.manager.get_conn().unwrap();
+            let count =
+                diesel::sql_query("SELECT COUNT(*) AS count FROM TEST_CODE_authority_exit_probe")
+                    .get_result::<CountRow>(&mut operational)
+                    .unwrap()
+                    .count;
+            assert_eq!(
+                count, 0,
+                "TEST_CODE authority failure rolls back operation, immediate={immediate}"
+            );
+            drop(operational);
+            let followup = match database.manager.attribution_checkout() {
+                Ok(_) => panic!("TEST_CODE first integrity failure must remain latched"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                followup,
+                DatabaseAuthorityError::DescriptorIntegrityFailed { .. }
+            ));
+        }
+    }
+
+    #[test]
     fn daily_authority_is_checkout_attested_and_rejects_byte_identical_path_replacement() {
         let database_a = TestDatabase::with_wal_options(2, true);
         install_activation_source(&database_a.manager);
