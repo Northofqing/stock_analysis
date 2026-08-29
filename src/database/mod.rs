@@ -795,26 +795,35 @@ impl SqliteConnectionManager {
         }
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        Ok(Self {
-            source: SqliteConnectionSource::Descriptor(Arc::new(DescriptorSqliteSource {
-                health: ConnectionManager::new(":memory:"),
-                root: Arc::new(database.root),
-                parent: Arc::new(database.parent),
-                leaf: database.leaf,
-                root_identity: database.root_identity,
-                parent_identity: database.parent_identity,
-                database_object_identity: database.database_object_identity,
-                identity: database.identity,
-                database_anchor: Arc::new(database.database_file),
-                connect_lock: Mutex::new(()),
-                readback_connection: Mutex::new(None),
-                pool_evidence: Mutex::new(None),
-                connection_proofs: Mutex::new(HashMap::new()),
-                first_integrity_failure: Mutex::new(None),
-                registration_namespace: descriptor_registration_namespace()?,
-                next_connection_id: AtomicU64::new(0),
-            })),
-        })
+        {
+            let manager = Self {
+                source: SqliteConnectionSource::Descriptor(Arc::new(DescriptorSqliteSource {
+                    health: ConnectionManager::new(":memory:"),
+                    root: Arc::new(database.root),
+                    parent: Arc::new(database.parent),
+                    leaf: database.leaf,
+                    root_identity: database.root_identity,
+                    parent_identity: database.parent_identity,
+                    database_object_identity: database.database_object_identity,
+                    identity: database.identity,
+                    database_anchor: Arc::new(database.database_file),
+                    connect_lock: Mutex::new(()),
+                    readback_connection: Mutex::new(None),
+                    pool_evidence: Mutex::new(None),
+                    connection_proofs: Mutex::new(HashMap::new()),
+                    first_integrity_failure: Mutex::new(None),
+                    registration_namespace: descriptor_registration_namespace()?,
+                    next_connection_id: AtomicU64::new(0),
+                })),
+            };
+            let source = manager.descriptor_source().ok_or_else(|| {
+                DatabaseAuthorityError::DescriptorAttestationUnavailable {
+                    detail: "descriptor manager did not retain its attestation source".into(),
+                }
+            })?;
+            install_descriptor_readback_connection(&manager, &source)?;
+            Ok(manager)
+        }
     }
 
     fn descriptor_source(&self) -> Option<Arc<DescriptorSqliteSource>> {
@@ -2230,7 +2239,6 @@ fn build_attested_sqlite_pool_with_size(
             detail: "descriptor manager did not retain its attestation source".into(),
         }
     })?;
-    install_descriptor_readback_connection(&manager, &source)?;
     let pool = build_attribution_sqlite_pool_from_manager(manager, max_size)?;
     Ok((pool, source))
 }
@@ -2238,30 +2246,50 @@ fn build_attested_sqlite_pool_with_size(
 fn install_descriptor_readback_connection(
     manager: &SqliteConnectionManager,
     source: &Arc<DescriptorSqliteSource>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), DatabaseAuthorityError> {
     let mut reader = manager.connect().map_err(|error| {
-        std::io::Error::other(format!(
-            "establish source-owned descriptor-attested read-back connection: {error}"
-        ))
+        descriptor_readback_initialization_error(
+            source,
+            format!("establish source-owned descriptor-attested read-back connection: {error}"),
+        )
     })?;
     diesel::sql_query("PRAGMA query_only=ON")
         .execute(&mut reader)
-        .map_err(|error| {
-            std::io::Error::other(format!("enable source-owned read-back query_only: {error}"))
-        })?;
+        .map_err(
+            |error| DatabaseAuthorityError::DescriptorAttestationUnavailable {
+                detail: format!("enable source-owned read-back query_only: {error}"),
+            },
+        )?;
     require_query_only_readback(source, &mut reader)?;
     registered_descriptor_connection_authority(source, &mut reader)?;
-    let mut slot = source
-        .readback_connection
-        .lock()
-        .map_err(|_| std::io::Error::other("read-back connection lock is poisoned"))?;
+    let mut slot = source.readback_connection.lock().map_err(|_| {
+        DatabaseAuthorityError::DescriptorIntegrityFailed {
+            detail: "read-back connection lock is poisoned".into(),
+        }
+    })?;
     if slot.is_some() {
-        return Err(
-            std::io::Error::other("descriptor source already owns a read-back connection").into(),
-        );
+        return Err(latch_descriptor_integrity_failure(
+            source,
+            "descriptor source already owns a read-back connection".into(),
+        ));
     }
     *slot = Some(reader);
     Ok(())
+}
+
+fn descriptor_readback_initialization_error(
+    source: &DescriptorSqliteSource,
+    detail: String,
+) -> DatabaseAuthorityError {
+    if detail.contains("descriptor_identity_changed")
+        || detail.contains("descriptor_attestation_ambiguous")
+        || detail.contains("descriptor_journal_mode_unsupported")
+        || detail.contains("descriptor_integrity_failed")
+    {
+        latch_descriptor_integrity_failure(source, detail)
+    } else {
+        DatabaseAuthorityError::DescriptorAttestationUnavailable { detail }
+    }
 }
 
 fn build_sqlite_pool_from_manager(

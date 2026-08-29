@@ -3564,6 +3564,79 @@ mod tests {
         }
     }
 
+    fn install_attribution_activation_fixture(manager: &DatabaseManager) {
+        use crate::database::order_audit::{
+            canonical_order_audit_record_hash, CanonicalOrderAuditRow, AUDIT_CHAIN_GENESIS,
+        };
+        use diesel::sql_types::{BigInt, Double, Nullable, Text};
+        use diesel::RunQueryDsl;
+
+        let mut connection = manager
+            .get_conn()
+            .expect("TEST_CODE authority-owned fixture connection");
+        crate::database::attribution_epochs::create_schema(&mut connection)
+            .expect("TEST_CODE install attribution epoch schema");
+
+        let audit = CanonicalOrderAuditRow {
+            id: 1,
+            business_order_id: "TEST_CODE_AUTHORITY_ACTIVATION_BUY".into(),
+            source: "PaperTrade".into(),
+            decision_basis: "TEST_CODE authority-owned activation".into(),
+            side: "buy".into(),
+            code: "TEST_CODE_600001".into(),
+            requested_price: 10.0,
+            execution_price: Some(10.0),
+            quantity: 200,
+            quote_observed_at: Some("2026-08-27T10:00:00+08:00".into()),
+            outcome: "Filled".into(),
+            failure_reason: None,
+            created_at: "2026-08-27 02:00:01".into(),
+        };
+        let record_hash = canonical_order_audit_record_hash(AUDIT_CHAIN_GENESIS, &audit)
+            .expect("TEST_CODE canonical audit hash");
+        diesel::sql_query(
+            "INSERT INTO paper_trades
+                 (id,plan_id,code,name,direction,price,quantity,status,fill_price,not_fill_reason,
+                  virtual_reason,account_mode,data_mode,ts,updated_at)
+                 VALUES (1,?,'TEST_CODE_600001','TEST_CODE company','buy',10.0,200,'Filled',10.0,NULL,
+                         ?,'Normal','Full','2026-08-27 02:00:00','2026-08-27 02:00:00')",
+        )
+        .bind::<Text, _>(&audit.business_order_id)
+        .bind::<Text, _>(&audit.decision_basis)
+        .execute(&mut connection)
+        .expect("TEST_CODE insert activation paper fill");
+        diesel::sql_query(
+            "INSERT INTO order_audit
+                 (id,business_order_id,source,decision_basis,side,code,requested_price,
+                  execution_price,quantity,quote_observed_at,outcome,failure_reason,created_at)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        )
+        .bind::<BigInt, _>(audit.id)
+        .bind::<Text, _>(&audit.business_order_id)
+        .bind::<Text, _>(&audit.source)
+        .bind::<Text, _>(&audit.decision_basis)
+        .bind::<Text, _>(&audit.side)
+        .bind::<Text, _>(&audit.code)
+        .bind::<Double, _>(audit.requested_price)
+        .bind::<Nullable<Double>, _>(audit.execution_price)
+        .bind::<BigInt, _>(audit.quantity)
+        .bind::<Nullable<Text>, _>(&audit.quote_observed_at)
+        .bind::<Text, _>(&audit.outcome)
+        .bind::<Nullable<Text>, _>(&audit.failure_reason)
+        .bind::<Text, _>(&audit.created_at)
+        .execute(&mut connection)
+        .expect("TEST_CODE insert activation order audit");
+        diesel::sql_query(
+            "INSERT INTO order_audit_chain
+                 (order_audit_id,previous_hash,record_hash,created_at) VALUES (1,?,?,?)",
+        )
+        .bind::<Text, _>(AUDIT_CHAIN_GENESIS)
+        .bind::<Text, _>(&record_hash)
+        .bind::<Text, _>(&audit.created_at)
+        .execute(&mut connection)
+        .expect("TEST_CODE insert activation audit chain");
+    }
+
     #[test]
     fn identity_matrix_accepts_only_exact_stsa_generation_one() {
         let identity = classify_identity(
@@ -3723,6 +3796,59 @@ mod tests {
                     .expect("failed operational bind releases owner authority"),
             );
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn amended_schema_manager_completes_attribution_activation_read_back() {
+        let fixture = TestFixture::new(
+            "selection-amended-attribution-read-back",
+            STOCK_ANALYSIS_SQLITE_APPLICATION_ID,
+            STOCK_ANALYSIS_DB_SCHEMA_GENERATION,
+        );
+        fixture.install_final_selection_catalog();
+        let writer =
+            SelectionAuditWriter::for_test_code_root(&fixture.root).expect("TEST_CODE audit");
+        writer
+            .append(SelectionAuditRecord::new(
+                SelectionAuditPhase::V2GateDCanaryVerified,
+                "TEST_CODE_GATE_D",
+                "d".repeat(64),
+                chrono::DateTime::parse_from_rfc3339("2026-07-29T00:02:00+08:00")
+                    .expect("fixed timestamp"),
+            ))
+            .expect("append validated non-persistence V2 audit record");
+        let outcome = GlobalSchemaVersionOwner::for_test_code()
+            .inspect_selection_with_audit_for_test(&fixture.root, &writer)
+            .expect("TEST_CODE exact amended schema authority");
+        let authority = match outcome {
+            SelectionSchemaInspectionOutcome::Amended(authority) => authority,
+            SelectionSchemaInspectionOutcome::Diagnostic(_) => {
+                panic!("TEST_CODE exact amended snapshot must issue owner authority")
+            }
+        };
+        let manager = DatabaseManager::from_verified_amended_selection_schema(authority)
+            .expect("TEST_CODE construct authority-owned production manager");
+        // Post-construction fixture only: this isolates whether the production
+        // constructor itself retained the read-back capability. It does not
+        // change or make a claim about the exact GlobalSchema catalog contract.
+        install_attribution_activation_fixture(&manager);
+        let store = crate::database::attribution_epochs::AttributionEpochStore::new(&manager);
+        let receipt = store
+            .activate_once(
+                crate::database::attribution_epochs::EpochActivationRequest {
+                    source: crate::performance::attribution_epoch::EpochActivationSource::Monitor,
+                    invoked_at: chrono::DateTime::parse_from_rfc3339("2026-08-28T15:40:00+08:00")
+                        .expect("TEST_CODE fixed activation time"),
+                },
+            )
+            .expect("TEST_CODE authority-owned activation and read-back succeed");
+        assert_eq!(
+            store
+                .verify_active()
+                .expect("TEST_CODE authority-owned active receipt"),
+            receipt
+        );
     }
 
     #[test]
