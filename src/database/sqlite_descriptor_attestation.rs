@@ -306,6 +306,50 @@ pub(super) struct AttestedSqliteHandles {
     shm: RetainedSqliteHandle,
 }
 
+/// Proof that one newly opened SQLite reader retains the expected main
+/// database object. Immutable readers intentionally do not open WAL/SHM; the
+/// committing writer's full authority remains live and is verified separately.
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct AttestedReadOnlyMainHandle {
+    main: RetainedSqliteHandle,
+}
+
+impl AttestedReadOnlyMainHandle {
+    pub(super) fn from_delta(
+        before: &ProcessDescriptorSnapshot,
+        after: &ProcessDescriptorSnapshot,
+        expected_main: FileObjectIdentity,
+    ) -> Result<Self, DescriptorAttestationError> {
+        let matches = before
+            .delta(after)
+            .into_iter()
+            .filter(|candidate| candidate.identity == expected_main)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => Err(DescriptorAttestationError::unavailable(
+                "no persistent main descriptor appeared for the retained read-only connection",
+            )),
+            [candidate] => Ok(Self {
+                main: RetainedSqliteHandle {
+                    descriptor: candidate.descriptor,
+                    identity: candidate.identity,
+                },
+            }),
+            _ => Err(DescriptorAttestationError::ambiguous(format!(
+                "{} descriptors match the retained read-only main identity",
+                matches.len()
+            ))),
+        }
+    }
+
+    pub(super) fn validate(
+        &self,
+        expected_main: FileObjectIdentity,
+    ) -> Result<(), DescriptorAttestationError> {
+        self.main.validate(SqliteObjectRole::Main, expected_main)
+    }
+}
+
 impl AttestedSqliteHandles {
     #[cfg(test)]
     pub(super) fn from_delta(

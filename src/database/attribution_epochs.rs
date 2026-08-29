@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, FixedOffset, Months, NaiveDate, NaiveTime, SecondsFormat, Utc};
@@ -483,6 +484,9 @@ pub struct AttributionEpochStore<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreviewFileSnapshot {
+    device: u64,
+    inode: u64,
+    mode: u32,
     byte_len: u64,
     byte_hash: String,
     modified: std::time::SystemTime,
@@ -783,6 +787,30 @@ fn preview_file_snapshot(path: &Path) -> Result<PreviewFileSnapshot, Attribution
             format!("BR-255 cannot open preview file {path:?}: {error}"),
         )
     })?;
+    let opened = file.metadata().map_err(|error| {
+        activation_unavailable(
+            "attribution_epoch_preview_storage_unavailable",
+            true,
+            format!("BR-255 cannot fstat preview file {path:?}: {error}"),
+        )
+    })?;
+    let opened_modified = opened.modified().map_err(|error| {
+        activation_unavailable(
+            "attribution_epoch_preview_storage_unavailable",
+            true,
+            format!("BR-255 cannot read opened preview mtime for {path:?}: {error}"),
+        )
+    })?;
+    if opened.dev() != metadata.dev()
+        || opened.ino() != metadata.ino()
+        || opened.mode() != metadata.mode()
+        || opened.len() != metadata.len()
+        || opened_modified != modified
+    {
+        return Err(failed_integrity(format!(
+            "BR-255 preview file identity changed between stat and open: {path:?}"
+        )));
+    }
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -799,6 +827,9 @@ fn preview_file_snapshot(path: &Path) -> Result<PreviewFileSnapshot, Attribution
         digest.update(&buffer[..read]);
     }
     Ok(PreviewFileSnapshot {
+        device: opened.dev(),
+        inode: opened.ino(),
+        mode: opened.mode(),
         byte_len: metadata.len(),
         byte_hash: hex::encode(digest.finalize()),
         modified,
@@ -838,11 +869,13 @@ fn reject_preview_wal_state(
     _database_path: &Path,
     snapshot: &PreviewSqliteSnapshot,
 ) -> Result<(), AttributionEpochStoreError> {
-    if snapshot.wal.is_some() || snapshot.shm.is_some() {
+    let live_wal = snapshot.wal.as_ref().is_some_and(|wal| wal.byte_len != 0);
+    let orphaned_shm = snapshot.wal.is_none() && snapshot.shm.is_some();
+    if live_wal || orphaned_shm {
         return Err(activation_unavailable(
             "attribution_epoch_preview_live_wal",
             true,
-            "BR-255 read-only preview refuses existing WAL/SHM state because it cannot both consume live WAL facts and guarantee sidecar immutability",
+            "BR-255 read-only preview requires WAL to be absent or exactly zero bytes and refuses SHM without that WAL evidence",
         ));
     }
     Ok(())
@@ -883,9 +916,10 @@ fn read_only_sqlite_uri(
         }
     }
     if clean_wal_header {
-        // `immutable=1` is safe only after the caller proved WAL/SHM absent.
+        // `immutable=1` is safe only after the caller proved that WAL is
+        // absent or exactly zero bytes (SHM may remain from the live session).
         // The after-snapshot prevents returning a stale preview if a writer
-        // creates either sidecar while this immutable snapshot is open.
+        // changes main or either sidecar while this snapshot is open.
         Ok(format!("file:{encoded}?mode=ro&immutable=1"))
     } else {
         Ok(format!("file:{encoded}?mode=ro"))
@@ -1308,19 +1342,12 @@ thread_local! {
 }
 
 #[cfg(test)]
-thread_local! {
-    static POST_COMMIT_BEFORE_READ_BACK_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-        std::cell::RefCell::new(None);
-}
-
-#[cfg(test)]
 struct PostCommitReadBackHookGuard;
 
 #[cfg(test)]
 impl Drop for PostCommitReadBackHookGuard {
     fn drop(&mut self) {
         POST_COMMIT_READ_BACK_HOOK.with(|hook| *hook.borrow_mut() = None);
-        POST_COMMIT_BEFORE_READ_BACK_HOOK.with(|hook| *hook.borrow_mut() = None);
     }
 }
 
@@ -1332,29 +1359,6 @@ fn install_post_commit_read_back_hook(hook: PostCommitReadBackHook) -> PostCommi
     });
     PostCommitReadBackHookGuard
 }
-
-#[cfg(test)]
-fn install_post_commit_before_read_back_hook(
-    hook: impl FnOnce() + 'static,
-) -> PostCommitReadBackHookGuard {
-    POST_COMMIT_BEFORE_READ_BACK_HOOK.with(|slot| {
-        assert!(slot.borrow().is_none(), "TEST_CODE hook already installed");
-        *slot.borrow_mut() = Some(Box::new(hook));
-    });
-    PostCommitReadBackHookGuard
-}
-
-#[cfg(test)]
-fn run_post_commit_before_read_back_hook() {
-    POST_COMMIT_BEFORE_READ_BACK_HOOK.with(|slot| {
-        if let Some(hook) = slot.borrow_mut().take() {
-            hook();
-        }
-    });
-}
-
-#[cfg(not(test))]
-fn run_post_commit_before_read_back_hook() {}
 
 #[cfg(test)]
 fn pause_post_commit_read_back_after_attempt_chain_ids(ids: &[i64]) {
@@ -3221,7 +3225,6 @@ fn verify_post_commit_read_back(
     authority: &DatabaseConnectionAuthority,
     receipt: &AttributionEpochReceipt,
 ) -> Result<(), AttributionEpochStoreError> {
-    run_post_commit_before_read_back_hook();
     checkout.authority_bound_readonly_snapshot(authority, map_database_authority_error, |conn| {
         let rows = validate_all(conn).map_err(|error| {
             activation_error_context(
@@ -4940,29 +4943,6 @@ mod tests {
                 _cleanup: TestDatabaseCleanup { path },
             }
         }
-
-        fn cold_snapshot_route(&self) -> (PathBuf, TestDatabaseCleanup) {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("TEST_CODE clock")
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "TEST_CODE_attribution_epochs_cold_snapshot_{}_{}.sqlite",
-                std::process::id(),
-                nonce
-            ));
-            let mut source = self
-                .manager
-                .get_conn()
-                .expect("TEST_CODE cold snapshot source");
-            diesel::sql_query("VACUUM INTO ?")
-                .bind::<Text, _>(path.to_string_lossy().as_ref())
-                .execute(&mut source)
-                .expect("TEST_CODE cold immutable snapshot");
-            drop(source);
-            let cleanup = TestDatabaseCleanup { path: path.clone() };
-            (path, cleanup)
-        }
     }
 
     fn install_activation_source(manager: &DatabaseManager) {
@@ -5303,14 +5283,24 @@ mod tests {
     #[test]
     fn activation_preview_and_commit_freeze_one_verified_epoch() {
         let request = activation_request("2026-08-28T15:40:00+08:00");
-        let preview_database = TestDatabase::with_options(1, true);
-        install_activation_source(&preview_database.manager);
+        let database = TestDatabase::with_wal_options(1, true);
+        install_activation_source(&database.manager);
+        let mut preview_checkpoint = database.manager.attribution_checkout().unwrap();
+        let checkpoint = diesel::sql_query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .get_result::<TestWalCheckpointRow>(preview_checkpoint.connection_for_test())
+            .expect("TEST_CODE checkpoint same-session fixture before immutable preview");
+        assert_eq!(checkpoint.busy, 0);
+        assert_eq!(checkpoint._log, checkpoint._checkpointed);
+        drop(preview_checkpoint);
+        let preview_files = preview_sqlite_snapshot(&database.path).unwrap();
+        assert_eq!(preview_files.wal.as_ref().unwrap().byte_len, 0);
+        assert!(preview_files.shm.is_some());
         let preview = AttributionEpochStore::with_read_only_preview_path(
-            &preview_database.manager,
-            preview_database.path.clone(),
+            &database.manager,
+            database.path.clone(),
         )
         .preview_activation(&request)
-        .expect("TEST_CODE activation preview");
+        .expect("TEST_CODE same-database activation preview");
         assert!(!preview.activated);
         assert_eq!(preview.receipt_hash, None);
         assert_eq!(preview.calendar_authority_hash.len(), 64);
@@ -5320,9 +5310,11 @@ mod tests {
         assert_eq!(preview.order_audit_high_water, 2);
         assert_eq!(preview.carry[0].code, "TEST_CODE_600001");
         assert_eq!(preview.carry[0].quantity, 100);
+        assert_eq!(
+            preview_sqlite_snapshot(&database.path).unwrap(),
+            preview_files
+        );
 
-        let database = TestDatabase::snapshot_of(&preview_database);
-        drop(preview_database);
         let store = AttributionEpochStore::new(&database.manager);
         let outcome = store
             .activate_once_with_outcome(request.clone())
@@ -5344,9 +5336,11 @@ mod tests {
         );
         assert_eq!(&store.verify_active().unwrap(), receipt);
 
-        let (retained_path, _retained_cleanup) = database.cold_snapshot_route();
-        let retained = AttributionEpochStore::preview_activation_at_path(&retained_path, &request)
-            .expect("TEST_CODE retained activation preview");
+        let retained_files = preview_sqlite_snapshot(&database.path).unwrap();
+        assert_eq!(retained_files.wal.as_ref().unwrap().byte_len, 0);
+        assert!(retained_files.shm.is_some());
+        let retained = AttributionEpochStore::preview_activation_at_path(&database.path, &request)
+            .expect("TEST_CODE same-session retained activation preview");
         assert!(retained.activated);
         assert_eq!(
             retained.calendar_authority_hash,
@@ -5355,6 +5349,10 @@ mod tests {
         assert_eq!(
             retained.receipt_hash.as_deref(),
             Some(receipt.receipt_hash.as_str())
+        );
+        assert_eq!(
+            preview_sqlite_snapshot(&database.path).unwrap(),
+            retained_files
         );
 
         let retried = store
@@ -5902,7 +5900,7 @@ mod tests {
         let hook_route = route.clone();
         let hook_detached = detached.clone();
         let hook_replacement = replacement.clone();
-        let _hook = install_post_commit_before_read_back_hook(move || {
+        let _hook = super::super::install_retained_readback_before_open_hook(move || {
             let mut source = SqliteConnection::establish(&hook_route.to_string_lossy())
                 .expect("TEST_CODE open committed database A for logical clone");
             let checkpoint = diesel::sql_query("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -5949,7 +5947,40 @@ mod tests {
     }
 
     #[test]
-    fn authority_bound_read_back_uses_a_new_readonly_deserialized_connection() {
+    fn fresh_retained_read_back_catches_same_inode_corruption_hidden_by_writer_cache() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let database = TestDatabase::with_wal_options(4, true);
+        install_activation_source(&database.manager);
+        let route = database.path.clone();
+        let before = std::fs::metadata(&route).unwrap();
+        let _hook = super::super::install_retained_readback_before_open_hook(move || {
+            let mut retained_main = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&route)
+                .expect("TEST_CODE open retained main for same-inode corruption");
+            retained_main.seek(SeekFrom::Start(0)).unwrap();
+            retained_main.write_all(&[0_u8; 16]).unwrap();
+            retained_main.sync_all().unwrap();
+            let after = retained_main.metadata().unwrap();
+            assert_eq!(before.dev(), after.dev());
+            assert_eq!(before.ino(), after.ino());
+        });
+
+        let error = AttributionEpochStore::new(&database.manager)
+            .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
+            .expect_err(
+                "TEST_CODE fresh retained-main read-back must reject same-inode corruption",
+            );
+        assert_ne!(
+            error.reason_code(),
+            "epoch_attempt_persisted_failure",
+            "TEST_CODE corrupted retained storage cannot claim a persisted failure audit"
+        );
+    }
+
+    #[test]
+    fn authority_bound_read_back_uses_a_fresh_pinned_readonly_connection() {
         let database = TestDatabase::attested();
         let mut checkout = database.manager.attribution_checkout().unwrap();
         let authority = checkout.authority().unwrap();
@@ -6007,7 +6038,7 @@ mod tests {
     }
 
     #[test]
-    fn serialized_read_back_authority_exit_failure_overrides_operation_error() {
+    fn retained_read_back_authority_exit_failure_overrides_operation_error() {
         let database = TestDatabase::attested();
         let detached = database.path.with_extension("detached-read-back.sqlite");
         let _detached_cleanup = TestDatabaseCleanup {
@@ -6084,20 +6115,9 @@ mod tests {
             );
             let (writer_done, writer_result) = std::sync::mpsc::sync_channel(1);
             let writer = scope.spawn(move || {
-                let result = writer_database
-                    .get_conn()
-                    .map_err(|error| {
-                        activation_unavailable(
-                            "TEST_CODE_writer_connection_unavailable",
-                            false,
-                            error.to_string(),
-                        )
-                    })
-                    .and_then(|mut connection| {
-                        connection.immediate_transaction(|connection| {
-                            insert_attempt_on_conn(connection, &writer_input)
-                        })
-                    });
+                let result = AttributionEpochStore::new(writer_database)
+                    .append_attempt(writer_input)
+                    .map(|_| ());
                 writer_done
                     .send(result)
                     .expect("TEST_CODE writer result notification");

@@ -32,8 +32,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use self::sqlite_descriptor_attestation::{
-    validate_wal_journal_mode, AttestedSqliteHandles, DescriptorAttestationError,
-    FileObjectIdentity, PinnedSqliteObjectSet, ProcessDescriptorSnapshot, SqliteObjectRole,
+    validate_wal_journal_mode, AttestedReadOnlyMainHandle, AttestedSqliteHandles,
+    DescriptorAttestationError, FileObjectIdentity, PinnedSqliteObjectSet,
+    ProcessDescriptorSnapshot, SqliteObjectRole,
 };
 use crate::models::MaStatus;
 
@@ -70,6 +71,45 @@ pub(crate) struct AttestedAttributionCheckout {
     connection: DbConnection,
     source: Arc<DescriptorSqliteSource>,
 }
+
+#[cfg(test)]
+thread_local! {
+    static RETAINED_READBACK_BEFORE_OPEN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) struct RetainedReadBackHookGuard;
+
+#[cfg(test)]
+impl Drop for RetainedReadBackHookGuard {
+    fn drop(&mut self) {
+        RETAINED_READBACK_BEFORE_OPEN_HOOK.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_retained_readback_before_open_hook(
+    hook: impl FnOnce() + 'static,
+) -> RetainedReadBackHookGuard {
+    RETAINED_READBACK_BEFORE_OPEN_HOOK.with(|slot| {
+        assert!(slot.borrow().is_none(), "TEST_CODE hook already installed");
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+    RetainedReadBackHookGuard
+}
+
+#[cfg(test)]
+fn run_retained_readback_before_open_hook() {
+    RETAINED_READBACK_BEFORE_OPEN_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_retained_readback_before_open_hook() {}
 
 impl std::fmt::Debug for DatabaseConnectionAuthority {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -144,15 +184,43 @@ impl AttestedAttributionCheckout {
         })
     }
 
-    /// Serializes the just-committed database while this branded writer still
-    /// proves its main/WAL/SHM authority, then runs one fresh deferred
-    /// transaction on a new read-only, query-only in-memory connection.
+    /// Checkpoints the just-committed WAL through the branded writer, then
+    /// runs one deferred transaction on a fresh immutable reader opened from
+    /// the source's retained main-file descriptor.
     ///
-    /// The SQLite route is never used for read-back identity. Authority is
-    /// checked before and after serialization and again after the detached
-    /// snapshot transaction, so an object replacement latches integrity even
-    /// when the serialized bytes would otherwise remain logically valid.
+    /// The mutable pathname is never used to acquire the reader. The main
+    /// descriptor introduced by SQLite is attested against the committed
+    /// authority, while the writer keeps proving the complete main/WAL/SHM
+    /// authority before and after the operation.
     pub(crate) fn authority_bound_readonly_snapshot<T, E, F, M>(
+        &mut self,
+        expected: &DatabaseConnectionAuthority,
+        map_authority: M,
+        operation: F,
+    ) -> Result<T, E>
+    where
+        E: From<diesel::result::Error>,
+        F: FnOnce(&mut SqliteConnection) -> Result<T, E>,
+        M: Fn(DatabaseAuthorityError) -> E + Copy,
+    {
+        let read_result = self.retained_readonly_snapshot(expected, map_authority, operation);
+        let terminal =
+            registered_descriptor_connection_authority(&self.source, &mut self.connection)
+                .and_then(|after| {
+                    require_matching_database_authority(
+                        &self.source,
+                        expected,
+                        &after,
+                        "database authority changed during retained read-back snapshot",
+                    )
+                });
+        match terminal {
+            Err(error) => Err(map_authority(error)),
+            Ok(()) => read_result,
+        }
+    }
+
+    fn retained_readonly_snapshot<T, E, F, M>(
         &mut self,
         expected: &DatabaseConnectionAuthority,
         map_authority: M,
@@ -169,55 +237,102 @@ impl AttestedAttributionCheckout {
             &self.source,
             expected,
             &before,
-            "serialized read-back writer differs from committed authority",
+            "retained read-back writer differs from committed authority",
         )
         .map_err(map_authority)?;
 
-        let serialized = self.connection.serialize_database_to_buffer();
-        let after_serialize =
-            registered_descriptor_connection_authority(&self.source, &mut self.connection)
-                .map_err(map_authority)?;
-        require_matching_database_authority(
-            &self.source,
-            expected,
-            &after_serialize,
-            "database authority changed while serializing read-back snapshot",
-        )
-        .map_err(map_authority)?;
-        let detached_bytes = detached_readonly_snapshot_bytes(&self.source, serialized.as_slice())
-            .map_err(map_authority)?;
-
-        let snapshot_result = (|| {
-            let mut reader = SqliteConnection::establish(":memory:").map_err(|error| {
+        let checkpoint = diesel::sql_query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .get_result::<WalCheckpointRow>(&mut self.connection)
+            .map_err(|error| {
                 map_authority(DatabaseAuthorityError::DescriptorAttestationUnavailable {
-                    detail: format!("cannot establish detached read-back connection: {error}"),
+                    detail: format!("cannot checkpoint committed attribution WAL: {error}"),
                 })
             })?;
-            reader.deserialize_readonly_database_from_buffer(&detached_bytes)?;
-            diesel::sql_query("PRAGMA query_only=ON").execute(&mut reader)?;
-            let query_only = diesel::sql_query("PRAGMA query_only")
-                .get_result::<QueryOnlyPragmaRow>(&mut reader)?
-                .query_only;
-            if query_only != 1 {
-                return Err(map_authority(
-                    DatabaseAuthorityError::DescriptorAttestationUnavailable {
-                        detail: "detached read-back connection is not query-only".into(),
-                    },
-                ));
-            }
-            reader.transaction(operation)
-        })();
-        let after_snapshot =
+        if checkpoint.busy != 0
+            || checkpoint.log < 0
+            || checkpoint.checkpointed < 0
+            || checkpoint.log != checkpoint.checkpointed
+        {
+            return Err(map_authority(
+                DatabaseAuthorityError::DescriptorAttestationUnavailable {
+                    detail: format!(
+                        "committed attribution WAL checkpoint incomplete: busy={}, log={}, checkpointed={}",
+                        checkpoint.busy, checkpoint.log, checkpoint.checkpointed
+                    ),
+                },
+            ));
+        }
+
+        let after_checkpoint =
             registered_descriptor_connection_authority(&self.source, &mut self.connection)
                 .map_err(map_authority)?;
         require_matching_database_authority(
             &self.source,
             expected,
-            &after_snapshot,
-            "database authority changed during detached read-back snapshot",
+            &after_checkpoint,
+            "database authority changed during committed WAL checkpoint",
         )
         .map_err(map_authority)?;
-        snapshot_result
+        require_empty_retained_wal(&self.source, expected).map_err(map_authority)?;
+        run_retained_readback_before_open_hook();
+
+        let anchor = self.source.database_anchor.try_clone().map_err(|error| {
+            map_authority(DatabaseAuthorityError::DescriptorAttestationUnavailable {
+                detail: format!("cannot clone retained SQLite main descriptor: {error}"),
+            })
+        })?;
+        let expected_main = expected.objects.identity(SqliteObjectRole::Main);
+        let anchor_identity = FileObjectIdentity::from_file(&anchor)
+            .map_err(|error| map_authority(readback_attestation_error(&self.source, error)))?;
+        if anchor_identity != expected_main {
+            return Err(map_authority(latch_descriptor_integrity_failure(
+                &self.source,
+                "retained read-back main clone differs from committed authority".into(),
+            )));
+        }
+        let route = retained_main_descriptor_route(&anchor).map_err(map_authority)?;
+        let reader_url = format!("file:{route}?mode=ro&immutable=1");
+        let connect_guard = self.source.connect_lock.lock().map_err(|_| {
+            map_authority(DatabaseAuthorityError::DescriptorAttestationUnavailable {
+                detail: "retained read-back connection lock is poisoned".into(),
+            })
+        })?;
+        let descriptor_before = ProcessDescriptorSnapshot::capture()
+            .map_err(|error| map_authority(readback_attestation_error(&self.source, error)))?;
+        let mut reader = SqliteConnection::establish(&reader_url).map_err(|error| {
+            map_authority(DatabaseAuthorityError::DescriptorAttestationUnavailable {
+                detail: format!("cannot establish retained main read-back connection: {error}"),
+            })
+        })?;
+        let descriptor_after = ProcessDescriptorSnapshot::capture()
+            .map_err(|error| map_authority(readback_attestation_error(&self.source, error)))?;
+        let reader_handle = AttestedReadOnlyMainHandle::from_delta(
+            &descriptor_before,
+            &descriptor_after,
+            expected_main,
+        )
+        .map_err(|error| map_authority(readback_attestation_error(&self.source, error)))?;
+        reader_handle
+            .validate(expected_main)
+            .map_err(|error| map_authority(readback_attestation_error(&self.source, error)))?;
+        drop(connect_guard);
+        verify_retained_readback_route(&mut reader, &route, &self.source).map_err(map_authority)?;
+        diesel::sql_query("PRAGMA query_only=ON").execute(&mut reader)?;
+        let query_only = diesel::sql_query("PRAGMA query_only")
+            .get_result::<QueryOnlyPragmaRow>(&mut reader)?
+            .query_only;
+        if query_only != 1 {
+            return Err(map_authority(
+                DatabaseAuthorityError::DescriptorAttestationUnavailable {
+                    detail: "retained main read-back connection is not query-only".into(),
+                },
+            ));
+        }
+        let result = reader.transaction(operation);
+        reader_handle
+            .validate(expected_main)
+            .map_err(|error| map_authority(readback_attestation_error(&self.source, error)))?;
+        result
     }
 
     #[cfg(test)]
@@ -1024,42 +1139,105 @@ fn require_matching_database_authority(
     }
 }
 
-fn detached_readonly_snapshot_bytes(
+fn require_empty_retained_wal(
     source: &DescriptorSqliteSource,
-    serialized: &[u8],
-) -> Result<Vec<u8>, DatabaseAuthorityError> {
-    const SQLITE_HEADER_BYTES: usize = 100;
-    const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
-    const HEADER_WRITE_VERSION: usize = 18;
-    const HEADER_READ_VERSION: usize = 19;
-
-    if serialized.len() < SQLITE_HEADER_BYTES || serialized.get(..16) != Some(SQLITE_MAGIC) {
+    expected: &DatabaseConnectionAuthority,
+) -> Result<(), DatabaseAuthorityError> {
+    let wal_leaf = sqlite_sidecar_leaf(&source.leaf, "-wal");
+    let wal = openat_regular_for_attestation(source.parent.as_ref(), &wal_leaf, "SQLite WAL")
+        .map_err(
+            |error| DatabaseAuthorityError::DescriptorAttestationUnavailable {
+                detail: format!("cannot inspect checkpointed attribution WAL: {error}"),
+            },
+        )?;
+    let actual = FileObjectIdentity::from_file(&wal)
+        .map_err(|error| readback_attestation_error(source, error))?;
+    if actual != expected.objects.identity(SqliteObjectRole::Wal) {
         return Err(latch_descriptor_integrity_failure(
             source,
-            "serialized read-back snapshot has an invalid SQLite header".into(),
+            "checkpointed WAL differs from committed authority".into(),
         ));
     }
-    let versions = (
-        serialized[HEADER_READ_VERSION],
-        serialized[HEADER_WRITE_VERSION],
-    );
-    if !matches!(versions, (1, 1) | (2, 2)) {
+    let length = wal
+        .metadata()
+        .map_err(
+            |error| DatabaseAuthorityError::DescriptorAttestationUnavailable {
+                detail: format!("cannot fstat checkpointed attribution WAL: {error}"),
+            },
+        )?
+        .len();
+    if length != 0 {
+        return Err(DatabaseAuthorityError::DescriptorAttestationUnavailable {
+            detail: format!(
+                "committed attribution WAL remains live after TRUNCATE checkpoint: {length} bytes"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn readback_attestation_error(
+    source: &DescriptorSqliteSource,
+    error: DescriptorAttestationError,
+) -> DatabaseAuthorityError {
+    match error {
+        DescriptorAttestationError::Unavailable { detail } => {
+            DatabaseAuthorityError::DescriptorAttestationUnavailable { detail }
+        }
+        other => latch_descriptor_integrity_failure(source, other.to_string()),
+    }
+}
+
+fn retained_main_descriptor_route(anchor: &File) -> Result<String, DatabaseAuthorityError> {
+    #[cfg(target_os = "linux")]
+    {
+        return Ok(format!("/proc/self/fd/{}", anchor.as_raw_fd()));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return Ok(format!("/dev/fd/{}", anchor.as_raw_fd()));
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = anchor;
+        Err(DatabaseAuthorityError::DescriptorAttestationUnavailable {
+            detail: format!(
+                "platform {} has no retained-main descriptor route",
+                std::env::consts::OS
+            ),
+        })
+    }
+}
+
+fn verify_retained_readback_route(
+    reader: &mut SqliteConnection,
+    expected_route: &str,
+    source: &DescriptorSqliteSource,
+) -> Result<(), DatabaseAuthorityError> {
+    let main = diesel::sql_query("PRAGMA database_list")
+        .load::<SqliteDatabaseListRow>(reader)
+        .map_err(
+            |error| DatabaseAuthorityError::DescriptorAttestationUnavailable {
+                detail: format!("cannot inspect retained read-back database_list: {error}"),
+            },
+        )?
+        .into_iter()
+        .find(|row| row.name == "main")
+        .ok_or_else(
+            || DatabaseAuthorityError::DescriptorAttestationUnavailable {
+                detail: "retained read-back connection has no main database".into(),
+            },
+        )?;
+    if main.file != expected_route {
         return Err(latch_descriptor_integrity_failure(
             source,
             format!(
-                "serialized read-back snapshot has unsupported read/write versions {versions:?}"
+                "retained read-back connection escaped descriptor route: expected {expected_route:?}, got {:?}",
+                main.file
             ),
         ));
     }
-
-    // sqlite3_serialize returns the complete logical database image, but a
-    // WAL-backed source retains (2,2) in the file-format header. A detached
-    // read-only deserialization has no WAL route, so normalize only those two
-    // format bytes to rollback-journal (1,1); all business pages remain exact.
-    let mut detached = serialized.to_vec();
-    detached[HEADER_READ_VERSION] = 1;
-    detached[HEADER_WRITE_VERSION] = 1;
-    Ok(detached)
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4205,58 +4383,6 @@ mod tests {
             .count;
             assert_eq!(count, 1, "attribution checkout is separately attested");
         }
-    }
-
-    #[test]
-    fn detached_readonly_snapshot_normalizes_only_valid_sqlite_journal_versions() {
-        let database = TemporarySqliteDatabase::new("detached_snapshot_header");
-        let database_url = database.database_url();
-        let mut bootstrap = SqliteConnection::establish(&database_url).unwrap();
-        let journal_mode = diesel::sql_query("PRAGMA journal_mode = WAL")
-            .get_result::<JournalModeRow>(&mut bootstrap)
-            .unwrap()
-            .journal_mode;
-        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
-        drop(bootstrap);
-        let (_pool, source) = build_attested_sqlite_pool_with_size(&database.0, 1).unwrap();
-
-        let mut wal_image = vec![0xa5; 100];
-        wal_image[..16].copy_from_slice(b"SQLite format 3\0");
-        wal_image[18] = 2;
-        wal_image[19] = 2;
-        let normalized = detached_readonly_snapshot_bytes(&source, &wal_image).unwrap();
-        assert_eq!(&normalized[..18], &wal_image[..18]);
-        assert_eq!(normalized[18..20], [1, 1]);
-        assert_eq!(&normalized[20..], &wal_image[20..]);
-
-        let mut rollback_image = wal_image.clone();
-        rollback_image[18] = 1;
-        rollback_image[19] = 1;
-        assert_eq!(
-            detached_readonly_snapshot_bytes(&source, &rollback_image).unwrap(),
-            rollback_image
-        );
-
-        for (label, invalid) in [("short", vec![0_u8; 99]), ("bad magic", vec![0_u8; 100])] {
-            let error = detached_readonly_snapshot_bytes(&source, &invalid)
-                .expect_err("invalid SQLite header must fail closed");
-            assert!(
-                matches!(
-                    error,
-                    DatabaseAuthorityError::DescriptorIntegrityFailed { .. }
-                ),
-                "TEST_CODE {label} image returned {error:?}"
-            );
-        }
-
-        let mut mixed = wal_image;
-        mixed[19] = 1;
-        let error = detached_readonly_snapshot_bytes(&source, &mixed)
-            .expect_err("mixed SQLite journal versions must fail closed");
-        assert!(matches!(
-            error,
-            DatabaseAuthorityError::DescriptorIntegrityFailed { .. }
-        ));
     }
 
     #[test]

@@ -357,6 +357,7 @@ fn activation_boundary_keeps_real_legacy_t_plus_one_fixture_and_active_exact_fai
         "2026-08-28 14:00:00",
     );
     let source_before_preview = source_snapshot(database);
+    drop(session);
     let request = EpochActivationRequest {
         source: EpochActivationSource::Cli,
         invoked_at: chrono::DateTime::parse_from_rfc3339("2026-08-28T15:40:00+08:00").unwrap(),
@@ -367,14 +368,31 @@ fn activation_boundary_keeps_real_legacy_t_plus_one_fixture_and_active_exact_fai
     assert_eq!(preview.carry.len(), 1);
     assert_eq!(preview.carry[0].code, "TEST_CODE_600001");
     assert_eq!(preview.carry[0].quantity, 300);
+
+    let session = open_test_code_session(&path);
+    let database = session.database();
     assert_eq!(source_snapshot(database), source_before_preview);
 
     let receipt = AttributionEpochStore::new(database)
-        .activate_once(request)
+        .activate_once(request.clone())
         .expect("TEST_CODE activation isolates the known legacy T+1 defect");
     assert_eq!(receipt.paper_trade_high_water, 520);
     assert_eq!(receipt.carry_total_quantity, 300);
     assert_eq!(source_snapshot(database), source_before_preview);
+
+    let retained = AttributionEpochStore::preview_activation_at_path(&path, &request)
+        .expect("TEST_CODE same-session retained preview after committed checkpoint");
+    assert!(retained.activated);
+    assert_eq!(
+        retained.receipt_hash.as_deref(),
+        Some(receipt.receipt_hash.as_str())
+    );
+    assert_eq!(
+        AttributionEpochStore::new(database)
+            .activate_once(request)
+            .expect("TEST_CODE same-session idempotent activation"),
+        receipt
+    );
 
     // All boundary-after facts are fixture-owned.  They deliberately consume
     // the carry to zero before the independent, legal new lifecycle begins.
