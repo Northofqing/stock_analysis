@@ -5912,6 +5912,44 @@ mod tests {
         (path, session, receipt)
     }
 
+    fn activated_real_legacy_t_plus_one_epoch_database(
+        label: &str,
+    ) -> (PathBuf, AttributionDatabaseSession, AttributionEpochReceipt) {
+        let path = test_database_path(label);
+        create_epoch_replay_schema(&Connection::open(&path).unwrap());
+        append_epoch_source_fill(
+            &path,
+            510,
+            "buy",
+            10.0,
+            400,
+            "2026-08-28 02:00:00",
+            "2026-08-28T10:00:00+08:00",
+            "TEST_CODE legacy buy",
+        );
+        append_epoch_source_fill(
+            &path,
+            520,
+            "sell",
+            11.0,
+            100,
+            "2026-08-28 06:00:00",
+            "2026-08-28T14:00:00+08:00",
+            "TEST_CODE legacy same-day sell",
+        );
+        let session =
+            AttributionDatabaseSession::open(&path, AttributionDatabaseAccess::AppendOnly).unwrap();
+        let receipt = AttributionEpochStore::new(session.database())
+            .activate_once(EpochActivationRequest {
+                source: crate::performance::attribution_epoch::EpochActivationSource::Cli,
+                invoked_at: shanghai_at("2026-08-28", 15, 40, 0),
+            })
+            .unwrap();
+        assert_eq!(receipt.paper_trade_high_water, 520);
+        assert_eq!(receipt.carry_total_quantity, 300);
+        (path, session, receipt)
+    }
+
     fn append_epoch_close(path: &Path, id: i64, day: &str, close: f64) {
         Connection::open(path)
             .unwrap()
@@ -6274,23 +6312,30 @@ mod tests {
 
     #[test]
     fn epoch_legacy_explicitly_preserves_truthful_t_plus_one_failure() {
-        let path = complete_database("epoch_legacy_t_plus_one");
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute(
-                "UPDATE paper_trades SET ts='2026-08-20 14:20:00' WHERE id=2",
-                [],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "UPDATE order_audit
-                 SET quote_observed_at='2026-08-20T14:20:00+08:00' WHERE id=2",
-                [],
-            )
-            .unwrap();
-        rehash_audits(&connection);
-        drop(connection);
+        let path = test_database_path("epoch_legacy_t_plus_one");
+        create_epoch_replay_schema(&Connection::open(&path).unwrap());
+        // Keep the production regression identifiers and ordering intact: id
+        // 520 sells the id 510 lot on the same Shanghai trading day.
+        append_epoch_source_fill(
+            &path,
+            510,
+            "buy",
+            10.0,
+            400,
+            "2026-08-28 02:00:00",
+            "2026-08-28T10:00:00+08:00",
+            "TEST_CODE legacy buy",
+        );
+        append_epoch_source_fill(
+            &path,
+            520,
+            "sell",
+            11.0,
+            100,
+            "2026-08-28 06:00:00",
+            "2026-08-28T14:00:00+08:00",
+            "TEST_CODE legacy same-day sell",
+        );
         let manager = crate::database::attribution_reports::test_runner_database_manager(&path);
         let runner = AttributionReplayRunner::new_for_test(
             &manager,
@@ -6302,9 +6347,9 @@ mod tests {
         let error = runner
             .preview(ReplayRequest {
                 mode: ReplayMode::Range {
-                    from: date("2026-08-20"),
-                    to: date("2026-08-20"),
-                    invoked_at: shanghai_at("2026-08-21", 15, 30, 0),
+                    from: date("2026-08-28"),
+                    to: date("2026-08-28"),
+                    invoked_at: shanghai_at("2026-08-28", 15, 30, 0),
                 },
                 epoch: AttributionEpochSelector::Legacy,
                 benchmark_day_manifests: Vec::new(),
@@ -6316,6 +6361,238 @@ mod tests {
         drop(runner);
         drop(manager);
         remove_database(path);
+    }
+
+    #[test]
+    fn real_legacy_t_plus_one_fixture_replays_only_post_flat_cycle_and_seals_report_epoch() {
+        let (path, session, receipt) =
+            activated_real_legacy_t_plus_one_epoch_database("real_legacy_t_plus_one_e2e");
+        for (id, side, price, quantity, paper_utc, quote_shanghai, reason) in [
+            (
+                530,
+                "buy",
+                12.0,
+                200,
+                "2026-08-31 02:00:00",
+                "2026-08-31T10:00:00+08:00",
+                "TEST_CODE carry overlap buy",
+            ),
+            (
+                540,
+                "sell",
+                12.5,
+                400,
+                "2026-09-01 02:00:00",
+                "2026-09-01T10:00:00+08:00",
+                "TEST_CODE mixed carry exit",
+            ),
+            (
+                550,
+                "sell",
+                12.8,
+                100,
+                "2026-09-01 06:00:00",
+                "2026-09-01T14:00:00+08:00",
+                "TEST_CODE terminal carry exit",
+            ),
+            (
+                560,
+                "buy",
+                20.0,
+                100,
+                "2026-09-02 02:00:00",
+                "2026-09-02T10:00:00+08:00",
+                "Breakout",
+            ),
+            (
+                570,
+                "sell",
+                22.0,
+                100,
+                "2026-09-03 02:00:00",
+                "2026-09-03T10:00:00+08:00",
+                "ExitByRule",
+            ),
+        ] {
+            append_epoch_source_fill(
+                &path,
+                id,
+                side,
+                price,
+                quantity,
+                paper_utc,
+                quote_shanghai,
+                reason,
+            );
+        }
+        for (id, day, close) in [
+            (1, "2026-08-31", 12.0),
+            (2, "2026-09-01", 12.5),
+            (3, "2026-09-02", 20.0),
+            (4, "2026-09-03", 22.0),
+        ] {
+            append_epoch_close(&path, id, day, close);
+        }
+        let benchmark_day_manifests = [
+            date("2026-08-31"),
+            date("2026-09-01"),
+            date("2026-09-02"),
+            date("2026-09-03"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, day)| append_test_benchmark_manifest(session.database(), day, index as f64))
+        .collect::<Vec<_>>();
+        let runner = AttributionReplayRunner::new_for_test_with_fee_ledger(
+            session.database(),
+            AttributionReplayLoader::new(&path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+            AuthoritativeFillFeeLedger {
+                entries: vec![fee(560, 5.0), fee(570, 5.0)],
+            },
+        );
+        let request = |epoch| ReplayRequest {
+            mode: ReplayMode::Range {
+                from: date("2026-08-31"),
+                to: date("2026-09-03"),
+                invoked_at: shanghai_at("2026-09-03", 15, 30, 0),
+            },
+            epoch,
+            benchmark_day_manifests: benchmark_day_manifests.clone(),
+        };
+
+        let prepared = runner
+            .preview(request(AttributionEpochSelector::Active))
+            .expect("TEST_CODE active replay quarantines the legacy same-day defect");
+        assert_eq!(prepared.epoch_id(), Some(receipt.epoch_id.as_str()));
+        assert!(prepared.remaining_quarantine().is_empty());
+        assert_eq!(prepared.released_codes(), 1);
+        assert_eq!(prepared.overlap_buy_count(), 1);
+        assert_eq!(prepared.overlap_sell_count(), 2);
+        assert_eq!(prepared.mixed_exit_count(), 1);
+        assert_eq!(prepared.report().source_fill_ids(), &[560, 570]);
+        assert_eq!(prepared.report().total_closed_cycles(), 1);
+        assert!(matches!(
+            prepared.report().conclusion(),
+            AttributionConclusion::InsufficientSample { reasons, .. }
+                if reasons.iter().any(|reason| reason.contains("closed_cycles_1_below_200"))
+        ));
+        let committed = runner
+            .commit_with_report(request(AttributionEpochSelector::Active))
+            .expect("TEST_CODE active report must commit through its sealed epoch binding");
+        assert!(matches!(
+            committed.receipt().epoch,
+            AttributionReportEpochBinding::Epoch { ref epoch_id, .. } if epoch_id == &receipt.epoch_id
+        ));
+        let exact = runner
+            .preview(request(AttributionEpochSelector::Exact(
+                receipt.epoch_id.clone(),
+            )))
+            .expect("TEST_CODE exact epoch remains the same sealed receipt");
+        assert_eq!(exact.report().source_fill_ids(), &[560, 570]);
+        drop(runner);
+        drop(session);
+        remove_database(path);
+    }
+
+    #[test]
+    fn active_and_exact_replay_fail_closed_for_frozen_and_post_boundary_source_tamper() {
+        for case in [
+            "frozen_prefix",
+            "late_old_date",
+            "terminal_at_or_below_highwater",
+            "post_boundary_audit_chain",
+        ] {
+            let (path, session, receipt) =
+                activated_real_legacy_t_plus_one_epoch_database(&format!("{case}_replay_tamper"));
+            match case {
+                "frozen_prefix" => {
+                    Connection::open(&path)
+                        .unwrap()
+                        .execute("UPDATE paper_trades SET fill_price=10.5 WHERE id=510", [])
+                        .unwrap();
+                }
+                "late_old_date" => append_epoch_source_fill(
+                    &path,
+                    530,
+                    "buy",
+                    12.0,
+                    100,
+                    "2026-08-30 02:00:00",
+                    "2026-08-30T10:00:00+08:00",
+                    "TEST_CODE late pre-effective fill",
+                ),
+                "terminal_at_or_below_highwater" => {
+                    append_epoch_source_fill(
+                        &path,
+                        530,
+                        "buy",
+                        12.0,
+                        100,
+                        "2026-08-31 02:00:00",
+                        "2026-08-31T10:00:00+08:00",
+                        "TEST_CODE low terminal id",
+                    );
+                    let connection = Connection::open(&path).unwrap();
+                    connection
+                        .execute("UPDATE order_audit SET id=515 WHERE id=530", [])
+                        .unwrap();
+                }
+                "post_boundary_audit_chain" => {
+                    append_epoch_source_fill(
+                        &path,
+                        530,
+                        "buy",
+                        12.0,
+                        100,
+                        "2026-08-31 02:00:00",
+                        "2026-08-31T10:00:00+08:00",
+                        "TEST_CODE corrupted terminal chain",
+                    );
+                    let connection = Connection::open(&path).unwrap();
+                    connection
+                        .execute(
+                            "UPDATE order_audit_chain SET record_hash=?1 WHERE order_audit_id=530",
+                            ["f".repeat(64)],
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!("TEST_CODE fixed replay tamper case"),
+            }
+            let runner = AttributionReplayRunner::new_for_test(
+                session.database(),
+                AttributionReplayLoader::new(&path),
+                "TEST_CODE_000300",
+                "TEST_CODE_MINUTE_END_LABEL",
+            );
+            for epoch in [
+                AttributionEpochSelector::Active,
+                AttributionEpochSelector::Exact(receipt.epoch_id.clone()),
+            ] {
+                let error = runner
+                    .preview(ReplayRequest {
+                        mode: ReplayMode::Range {
+                            from: date("2026-08-31"),
+                            to: date("2026-08-31"),
+                            invoked_at: shanghai_at("2026-08-31", 15, 30, 0),
+                        },
+                        epoch,
+                        benchmark_day_manifests: Vec::new(),
+                    })
+                    .expect_err("TEST_CODE source tamper cannot return an Active/Exact report");
+                assert!(
+                    matches!(
+                        error.stage(),
+                        ReplayStage::Epoch | ReplayStage::TradeEvidence
+                    ),
+                    "TEST_CODE {case} must fail before benchmark/compute/store: {error:?}"
+                );
+            }
+            drop(runner);
+            drop(session);
+            remove_database(path);
+        }
     }
 
     #[test]
@@ -6578,6 +6855,11 @@ mod tests {
         assert_eq!(prepared.excluded_fills().len(), 3);
         assert_eq!(prepared.report().source_fill_ids(), &[5, 6]);
         assert_eq!(prepared.report().total_closed_cycles(), 1);
+        assert!(matches!(
+            prepared.report().conclusion(),
+            AttributionConclusion::InsufficientSample { reasons, .. }
+                if reasons.iter().any(|reason| reason.contains("closed_cycles_1_below_200"))
+        ));
         let MetricAvailability::Available(basis) = prepared.report().fee_basis() else {
             panic!("TEST_CODE attributable fee basis must remain complete");
         };

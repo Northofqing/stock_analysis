@@ -3,11 +3,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Double, Nullable, Text};
+use rusqlite::Connection as RawConnection;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use stock_analysis::database::attribution_epochs::{AttributionEpochStore, EpochActivationRequest};
+use stock_analysis::database::attribution_reports::{
+    AttributionDatabaseAccess, AttributionDatabaseSession,
+};
 use stock_analysis::database::DatabaseManager;
-use stock_analysis::performance::attribution_epoch::EpochActivationSource;
+use stock_analysis::performance::attribution_epoch::{
+    AttributionEpochSelector, EpochActivationSource,
+};
 
 #[derive(QueryableByName)]
 struct CountRow {
@@ -63,6 +69,54 @@ fn isolated_path() -> PathBuf {
         std::process::id(),
         nonce
     ))
+}
+
+fn create_test_code_source_schema(path: &std::path::Path) {
+    let connection = RawConnection::open(path).expect("TEST_CODE create isolated source database");
+    connection
+        .execute_batch(
+            "CREATE TABLE paper_trades (
+                id INTEGER PRIMARY KEY, plan_id TEXT NOT NULL UNIQUE,
+                code TEXT NOT NULL, name TEXT NOT NULL, direction TEXT NOT NULL,
+                price REAL NOT NULL, quantity INTEGER NOT NULL, status TEXT NOT NULL,
+                fill_price REAL, not_fill_reason TEXT, virtual_reason TEXT NOT NULL,
+                account_mode TEXT NOT NULL, data_mode TEXT NOT NULL,
+                ts TEXT NOT NULL, updated_at TEXT NOT NULL
+             );
+             CREATE TABLE order_audit (
+                id INTEGER PRIMARY KEY, business_order_id TEXT NOT NULL,
+                source TEXT NOT NULL, decision_basis TEXT NOT NULL, side TEXT NOT NULL,
+                code TEXT NOT NULL, requested_price REAL NOT NULL, execution_price REAL,
+                quantity INTEGER NOT NULL, quote_observed_at TEXT, outcome TEXT NOT NULL,
+                failure_reason TEXT, created_at TEXT NOT NULL
+             );
+             CREATE TABLE order_audit_chain (
+                order_audit_id INTEGER PRIMARY KEY, previous_hash TEXT NOT NULL,
+                record_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
+             );
+             CREATE TABLE stock_daily (
+                id INTEGER PRIMARY KEY, code TEXT NOT NULL, date TEXT NOT NULL,
+                close REAL, data_source TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+             );",
+        )
+        .expect("TEST_CODE source schema");
+}
+
+fn open_test_code_session(path: &std::path::Path) -> AttributionDatabaseSession {
+    AttributionDatabaseSession::open(path, AttributionDatabaseAccess::AppendOnly)
+        .expect("TEST_CODE append-only attribution session")
+}
+
+fn cleanup_test_code_database(path: &std::path::Path) {
+    for candidate in [
+        path.to_path_buf(),
+        PathBuf::from(format!("{}-wal", path.display())),
+        PathBuf::from(format!("{}-shm", path.display())),
+    ] {
+        if candidate.exists() {
+            std::fs::remove_file(candidate).expect("TEST_CODE remove exact temporary database");
+        }
+    }
 }
 
 fn append_pair(
@@ -199,7 +253,7 @@ fn source_snapshot(database: &DatabaseManager) -> (String, String, String) {
 #[test]
 fn activation_concurrency_freezes_one_receipt_without_source_mutation() {
     let path = isolated_path();
-    DatabaseManager::init(Some(path)).expect("TEST_CODE isolated database initialization");
+    DatabaseManager::init(Some(path.clone())).expect("TEST_CODE isolated database initialization");
     let database = DatabaseManager::get();
     append_pair(
         database,
@@ -251,4 +305,252 @@ fn activation_concurrency_freezes_one_receipt_without_source_mutation() {
             .unwrap()
             .count;
     assert_eq!(receipts, 1);
+}
+
+#[test]
+fn activation_boundary_keeps_real_legacy_t_plus_one_fixture_and_active_exact_fail_closed() {
+    let path = isolated_path();
+    create_test_code_source_schema(&path);
+    let session = open_test_code_session(&path);
+    let database = session.database();
+
+    // This is the historical defect shape: the same-day sell consumes the
+    // legacy buy, but activation may still freeze its quantity-only carry.
+    append_pair(
+        database,
+        510,
+        "TEST_CODE_LEGACY_BUY_510",
+        "buy",
+        400,
+        "2026-08-28 10:00:00",
+    );
+    append_pair(
+        database,
+        520,
+        "TEST_CODE_LEGACY_SAME_DAY_SELL_520",
+        "sell",
+        100,
+        "2026-08-28 14:00:00",
+    );
+    let source_before_preview = source_snapshot(database);
+    let request = EpochActivationRequest {
+        source: EpochActivationSource::Cli,
+        invoked_at: chrono::DateTime::parse_from_rfc3339("2026-08-28T15:40:00+08:00").unwrap(),
+    };
+    let preview = AttributionEpochStore::preview_activation_at_path(&path, &request)
+        .expect("TEST_CODE reset-sample preview");
+    assert_eq!(preview.paper_trade_high_water, 520);
+    assert_eq!(preview.carry.len(), 1);
+    assert_eq!(preview.carry[0].code, "TEST_CODE_600001");
+    assert_eq!(preview.carry[0].quantity, 300);
+    assert_eq!(source_snapshot(database), source_before_preview);
+
+    let receipt = AttributionEpochStore::new(database)
+        .activate_once(request)
+        .expect("TEST_CODE activation isolates the known legacy T+1 defect");
+    assert_eq!(receipt.paper_trade_high_water, 520);
+    assert_eq!(receipt.carry_total_quantity, 300);
+    assert_eq!(source_snapshot(database), source_before_preview);
+
+    // All boundary-after facts are fixture-owned.  They deliberately consume
+    // the carry to zero before the independent, legal new lifecycle begins.
+    append_pair(
+        database,
+        530,
+        "TEST_CODE_OVERLAP_BUY_530",
+        "buy",
+        200,
+        "2026-08-31 10:00:00",
+    );
+    append_pair(
+        database,
+        540,
+        "TEST_CODE_MIXED_EXIT_540",
+        "sell",
+        400,
+        "2026-09-01 10:00:00",
+    );
+    append_pair(
+        database,
+        550,
+        "TEST_CODE_TERMINAL_CARRY_EXIT_550",
+        "sell",
+        100,
+        "2026-09-01 14:00:00",
+    );
+    append_pair(
+        database,
+        560,
+        "TEST_CODE_FRESH_BUY_560",
+        "buy",
+        100,
+        "2026-09-02 10:00:00",
+    );
+    append_pair(
+        database,
+        570,
+        "TEST_CODE_FRESH_SELL_570",
+        "sell",
+        100,
+        "2026-09-03 10:00:00",
+    );
+    let retry = AttributionEpochStore::new(database)
+        .activate_once(EpochActivationRequest {
+            source: EpochActivationSource::Monitor,
+            invoked_at: chrono::DateTime::parse_from_rfc3339("2026-09-03T15:40:00+08:00").unwrap(),
+        })
+        .expect("TEST_CODE post-boundary retry verifies only the frozen prefix");
+    assert_eq!(retry, receipt);
+    assert!(matches!(
+        AttributionEpochStore::new(database)
+            .load_selector(&AttributionEpochSelector::Active),
+        Ok(stock_analysis::database::attribution_epochs::ResolvedAttributionEpoch::Epoch(found))
+            if found == receipt
+    ));
+
+    // The tamper is constrained to this one temporary TEST_CODE database. A
+    // bad retained tail must reject both current and exact reads, never fall
+    // back to legacy or an earlier receipt.
+    let mut conn = database.get_conn().expect("TEST_CODE tamper connection");
+    diesel::sql_query("DROP TRIGGER trg_attribution_sample_epoch_receipt_chain_no_update")
+        .execute(&mut conn)
+        .expect("TEST_CODE permit isolated retained-tail tamper");
+    diesel::sql_query(
+        "UPDATE attribution_sample_epoch_receipt_chain SET record_hash=? WHERE epoch_receipt_id=1",
+    )
+    .bind::<Text, _>("f".repeat(64))
+    .execute(&mut conn)
+    .expect("TEST_CODE isolated bad receipt tail");
+    drop(conn);
+
+    for selector in [
+        AttributionEpochSelector::Active,
+        AttributionEpochSelector::Exact(receipt.epoch_id.clone()),
+    ] {
+        let error = AttributionEpochStore::new(database)
+            .load_selector(&selector)
+            .expect_err("TEST_CODE Active/Exact retained-tail tamper must fail closed");
+        assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
+    }
+    drop(session);
+    cleanup_test_code_database(&path);
+}
+
+#[test]
+fn retained_epoch_tamper_matrix_rejects_active_and_exact_without_legacy_fallback() {
+    for case in [
+        "receipt_tail",
+        "carry_item_hash",
+        "attempt_chain",
+        "receipt_retention",
+        "receipt_sequence",
+        "canonical_trigger",
+    ] {
+        let path = isolated_path();
+        create_test_code_source_schema(&path);
+        let session = open_test_code_session(&path);
+        let database = session.database();
+        append_pair(
+            database,
+            510,
+            "TEST_CODE_TAMPER_BUY_510",
+            "buy",
+            400,
+            "2026-08-28 10:00:00",
+        );
+        append_pair(
+            database,
+            520,
+            "TEST_CODE_TAMPER_SELL_520",
+            "sell",
+            100,
+            "2026-08-28 14:00:00",
+        );
+        let receipt = AttributionEpochStore::new(database)
+            .activate_once(EpochActivationRequest {
+                source: EpochActivationSource::Cli,
+                invoked_at: chrono::DateTime::parse_from_rfc3339("2026-08-28T15:40:00+08:00")
+                    .unwrap(),
+            })
+            .expect("TEST_CODE independent tamper fixture activation");
+        let mut conn = database
+            .get_conn()
+            .expect("TEST_CODE isolated tamper connection");
+        match case {
+            "receipt_tail" => {
+                diesel::sql_query(
+                    "DROP TRIGGER trg_attribution_sample_epoch_receipt_chain_no_update",
+                )
+                .execute(&mut conn)
+                .unwrap();
+                diesel::sql_query(
+                    "UPDATE attribution_sample_epoch_receipt_chain SET record_hash=? WHERE id=1",
+                )
+                .bind::<Text, _>("f".repeat(64))
+                .execute(&mut conn)
+                .unwrap();
+            }
+            "carry_item_hash" => {
+                diesel::sql_query("DROP TRIGGER trg_attribution_legacy_carry_item_no_update")
+                    .execute(&mut conn)
+                    .unwrap();
+                diesel::sql_query(
+                    "UPDATE attribution_legacy_carry_item SET item_hash=? WHERE id=1",
+                )
+                .bind::<Text, _>("f".repeat(64))
+                .execute(&mut conn)
+                .unwrap();
+            }
+            "attempt_chain" => {
+                diesel::sql_query("DROP TRIGGER trg_attribution_epoch_attempt_chain_no_update")
+                    .execute(&mut conn)
+                    .unwrap();
+                diesel::sql_query(
+                    "UPDATE attribution_epoch_attempt_chain SET record_hash=? WHERE id=1",
+                )
+                .bind::<Text, _>("f".repeat(64))
+                .execute(&mut conn)
+                .unwrap();
+            }
+            "receipt_retention" => {
+                diesel::sql_query("DROP TRIGGER trg_attribution_sample_epoch_receipt_no_update")
+                    .execute(&mut conn)
+                    .unwrap();
+                diesel::sql_query(
+                    "UPDATE attribution_sample_epoch_receipt SET retention_deadline=created_at WHERE id=1",
+                )
+                .execute(&mut conn)
+                .unwrap();
+            }
+            "receipt_sequence" => {
+                diesel::sql_query(
+                    "UPDATE sqlite_sequence SET seq=0 WHERE name='attribution_sample_epoch_receipt'",
+                )
+                .execute(&mut conn)
+                .unwrap();
+            }
+            "canonical_trigger" => {
+                diesel::sql_query("DROP TRIGGER trg_attribution_epoch_attempt_chain_no_delete")
+                    .execute(&mut conn)
+                    .unwrap();
+            }
+            _ => unreachable!("TEST_CODE fixed tamper case"),
+        }
+        drop(conn);
+        for selector in [
+            AttributionEpochSelector::Active,
+            AttributionEpochSelector::Exact(receipt.epoch_id.clone()),
+        ] {
+            let error = AttributionEpochStore::new(database)
+                .load_selector(&selector)
+                .expect_err("TEST_CODE retained tamper must never fall back");
+            assert_eq!(
+                error.reason_code(),
+                "attribution_epoch_integrity_failed",
+                "{case}"
+            );
+        }
+        drop(session);
+        cleanup_test_code_database(&path);
+    }
 }
