@@ -31,6 +31,8 @@ const RECEIPT_GENESIS: &str = "BR255_ATTRIBUTION_EPOCH_RECEIPT_GENESIS_V1";
 const CARRY_GENESIS: &str = "BR255_ATTRIBUTION_LEGACY_CARRY_GENESIS_V1";
 const ATTEMPT_GENESIS: &str = "BR255_ATTRIBUTION_EPOCH_ATTEMPT_GENESIS_V1";
 const DAILY_GENESIS: &str = "BR255_ATTRIBUTION_EPOCH_DAILY_GENESIS_V1";
+const EMPTY_ORDER_AUDIT_PREFIX_TIP_DOMAIN: &[u8] =
+    b"BR255_ATTRIBUTION_EMPTY_ORDER_AUDIT_PREFIX_TIP_V1\0";
 
 const TABLES: [(&str, &str); 7] = [
     ("attribution_sample_epoch_receipt", RECEIPT_TABLE),
@@ -1091,6 +1093,13 @@ fn hash_json<T: Serialize>(domain: &[u8], value: &T) -> diesel::QueryResult<Stri
     hasher.update((bytes.len() as u64).to_be_bytes());
     hasher.update(bytes);
     Ok(hex::encode(hasher.finalize()))
+}
+
+fn canonical_empty_order_audit_prefix_tip() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(EMPTY_ORDER_AUDIT_PREFIX_TIP_DOMAIN);
+    hasher.update(AUDIT_CHAIN_GENESIS.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 #[derive(Serialize)]
@@ -2232,10 +2241,14 @@ fn analyze_source_projection(
         .filter(|row| row.order_audit_id <= order_audit_high_water)
         .cloned()
         .collect::<Vec<_>>();
-    let order_audit_tip_hash = validate_canonical_order_audit_chain(&prefix_audits, &prefix_chain)
-        .map_err(|detail| failed_integrity(format!("BR-255 frozen audit prefix: {detail}")))?;
+    let mut order_audit_tip_hash =
+        validate_canonical_order_audit_chain(&prefix_audits, &prefix_chain)
+            .map_err(|detail| failed_integrity(format!("BR-255 frozen audit prefix: {detail}")))?;
     if order_audit_high_water == 0 && order_audit_tip_hash != AUDIT_CHAIN_GENESIS {
         return Err(failed_integrity("BR-255 empty audit prefix has a bad tip"));
+    }
+    if order_audit_high_water == 0 {
+        order_audit_tip_hash = canonical_empty_order_audit_prefix_tip();
     }
 
     let chain_hashes = prefix_chain
@@ -5271,6 +5284,61 @@ mod tests {
         );
         assert_eq!(retried.receipt(), receipt);
         assert_eq!(retried.projection(), committed);
+    }
+
+    #[test]
+    fn empty_order_audit_source_freezes_canonical_epoch_and_retries_idempotently() {
+        const CANONICAL_EMPTY_AUDIT_TIP: &str =
+            "2d962b67053f74fb37fbde126d8f7cc54d9568a3f55dad49ecbf0e7b1dd8340b";
+
+        let database = TestDatabase::new();
+        install_activation_source(&database.manager);
+        database
+            .manager
+            .get_conn()
+            .expect("TEST_CODE empty source connection")
+            .batch_execute(
+                "DELETE FROM order_audit_chain;
+                 DELETE FROM order_audit;
+                 DELETE FROM paper_trades;",
+            )
+            .expect("TEST_CODE empty attribution source");
+        let store = AttributionEpochStore::with_read_only_preview_path(
+            &database.manager,
+            database.path.clone(),
+        );
+        let request = activation_request("2026-08-28T15:40:00+08:00");
+
+        let preview = store
+            .preview_activation(&request)
+            .expect("TEST_CODE empty-source activation preview");
+        assert_eq!(preview.paper_trade_high_water, 0);
+        assert_eq!(preview.order_audit_high_water, 0);
+        assert!(preview.carry.is_empty());
+        assert_eq!(preview.order_audit_tip_hash, CANONICAL_EMPTY_AUDIT_TIP);
+
+        let activated = store
+            .activate_once_with_outcome(request.clone())
+            .expect("TEST_CODE empty-source activation commit");
+        assert_eq!(
+            activated.disposition(),
+            EpochActivationDisposition::Activated
+        );
+        assert_eq!(
+            activated.receipt().order_audit_tip_hash,
+            CANONICAL_EMPTY_AUDIT_TIP
+        );
+        assert_eq!(store.verify_active().unwrap(), *activated.receipt());
+
+        let retried = store
+            .activate_once_with_outcome(request)
+            .expect("TEST_CODE empty-source idempotent activation retry");
+        assert_eq!(
+            retried.disposition(),
+            EpochActivationDisposition::AlreadyActive
+        );
+        assert_eq!(retried.receipt(), activated.receipt());
+        assert_eq!(retried.projection(), activated.projection());
     }
 
     #[test]
