@@ -5662,6 +5662,7 @@ mod tests {
     use std::path::PathBuf;
 
     use chrono::{DateTime, Duration, FixedOffset, NaiveDate, TimeZone, Timelike};
+    use diesel::connection::SimpleConnection;
     use rusqlite::{params, Connection};
 
     use super::*;
@@ -6304,6 +6305,57 @@ mod tests {
     }
 
     #[test]
+    fn public_runner_requires_database_authority_for_active_and_exact_but_not_legacy() {
+        let path = complete_database("public_runner_no_attribution_authority");
+        let manager = crate::database::attribution_reports::
+            test_runner_database_manager_without_attribution_read_authority(&path);
+        let benchmark_day_manifests = [date("2026-08-20"), date("2026-08-21")]
+            .into_iter()
+            .enumerate()
+            .map(|(index, day)| append_test_benchmark_manifest(&manager, day, index as f64))
+            .collect::<Vec<_>>();
+        let request = |epoch| ReplayRequest {
+            mode: ReplayMode::Range {
+                from: date("2026-08-20"),
+                to: date("2026-08-21"),
+                invoked_at: shanghai_at("2026-08-21", 15, 30, 0),
+            },
+            epoch,
+            benchmark_day_manifests: benchmark_day_manifests.clone(),
+        };
+
+        let legacy_runner = AttributionReplayRunner::new_for_test(
+            &manager,
+            AttributionReplayLoader::new(&path),
+            "TEST_CODE_000300",
+            "TEST_CODE_MINUTE_END_LABEL",
+        );
+        let legacy = legacy_runner
+            .preview(request(AttributionEpochSelector::Legacy))
+            .expect("TEST_CODE Legacy remains available through its loader without DB authority");
+        assert_eq!(legacy.report().source_fill_ids(), &[1, 2]);
+        drop(legacy_runner);
+
+        let runner = AttributionReplayRunner::new(&manager, AttributionReplayLoader::new(&path));
+        for selector in [
+            AttributionEpochSelector::Active,
+            AttributionEpochSelector::Exact("f".repeat(64)),
+        ] {
+            let error = runner
+                .preview(request(selector))
+                .expect_err("TEST_CODE Active/Exact require manager-owned database authority");
+            assert_eq!(error.class(), ReplayErrorClass::Unavailable);
+            assert_eq!(error.stage(), ReplayStage::Epoch);
+            assert_eq!(error.code(), "attribution_database_authority_unavailable");
+            assert!(!error.retryable());
+        }
+
+        drop(runner);
+        drop(manager);
+        remove_database(path);
+    }
+
+    #[test]
     fn epoch_legacy_explicitly_preserves_truthful_t_plus_one_failure() {
         let path = test_database_path("epoch_legacy_t_plus_one");
         create_epoch_replay_schema(&Connection::open(&path).unwrap());
@@ -6559,6 +6611,74 @@ mod tests {
         drop(session);
         remove_database(epoch_path);
         remove_database(loader_path);
+    }
+
+    #[test]
+    fn exact_stock_close_reader_accepts_empty_required_keys_without_source_access() {
+        let mut connection = <SqliteConnection as diesel::Connection>::establish(":memory:")
+            .expect("TEST_CODE establish empty exact close database");
+
+        let rows = load_stock_closes_with_connection(&mut connection, &BTreeSet::new())
+            .expect("TEST_CODE empty exact close keys require no stock_daily source");
+
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn exact_stock_close_reader_chunks_401_keys_and_preserves_global_order() {
+        let mut connection = <SqliteConnection as diesel::Connection>::establish(":memory:")
+            .expect("TEST_CODE establish chunked exact close database");
+        connection
+            .batch_execute(
+                "CREATE TABLE stock_daily (
+                    id INTEGER PRIMARY KEY, code TEXT NOT NULL, date TEXT NOT NULL,
+                    close REAL, data_source TEXT, created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                 );",
+            )
+            .expect("TEST_CODE create chunked stock_daily source");
+        let day = date("2026-08-21");
+        let required_keys = (0..401)
+            .rev()
+            .map(|index| {
+                let code = format!("TEST_CODE_{index:03}");
+                diesel::sql_query(
+                    "INSERT INTO stock_daily
+                     (id,code,date,close,data_source,created_at,updated_at)
+                     VALUES (?,?,?,?,?,?,?)",
+                )
+                .bind::<BigInt, _>(i64::from(index) + 1)
+                .bind::<Text, _>(code.clone())
+                .bind::<Text, _>(day.format("%Y-%m-%d").to_string())
+                .bind::<Double, _>(100.0 + f64::from(index))
+                .bind::<Text, _>("TEST_CODE_SOURCE")
+                .bind::<Text, _>("2026-08-21")
+                .bind::<Text, _>("2026-08-21")
+                .execute(&mut connection)
+                .expect("TEST_CODE insert chunked stock close");
+                (code, day)
+            })
+            .collect::<BTreeSet<_>>();
+
+        let rows = load_stock_closes_with_connection(&mut connection, &required_keys)
+            .expect("TEST_CODE 401 exact close keys span two deterministic chunks");
+        let observed = rows
+            .iter()
+            .map(|row| (row.code.clone(), row.date.clone(), row.id))
+            .collect::<Vec<_>>();
+        let expected = required_keys
+            .iter()
+            .enumerate()
+            .map(|(index, (code, day))| {
+                (
+                    code.clone(),
+                    day.format("%Y-%m-%d").to_string(),
+                    index as i64 + 1,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(observed, expected);
     }
 
     #[test]

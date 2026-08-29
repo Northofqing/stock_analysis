@@ -244,6 +244,8 @@ pub struct DatabaseManager {
     attribution_pool: Option<DbPool>,
     attribution_connection_source: Option<Arc<DescriptorSqliteSource>>,
     readonly_attribution_snapshot: Option<TemporaryAttributionSnapshot>,
+    #[cfg(test)]
+    allow_unattested_attribution_reads_for_test: bool,
     #[allow(dead_code)]
     selection_connection_source: Option<Arc<DescriptorSqliteSource>>,
     #[allow(dead_code)]
@@ -1074,6 +1076,37 @@ struct ReadonlyAttributionSourceSnapshot {
     shm: Option<ReadonlyAttributionFileSnapshot>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ReadonlyAttributionSnapshotError {
+    Unavailable { detail: String, retryable: bool },
+    Integrity { detail: String },
+}
+
+fn readonly_snapshot_io_retryable(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+    )
+}
+
+fn readonly_snapshot_io_unavailable(
+    context: impl Into<String>,
+    error: std::io::Error,
+) -> ReadonlyAttributionSnapshotError {
+    ReadonlyAttributionSnapshotError::Unavailable {
+        detail: format!("{}: {error}", context.into()),
+        retryable: readonly_snapshot_io_retryable(error.kind()),
+    }
+}
+
+fn readonly_snapshot_integrity(detail: impl Into<String>) -> ReadonlyAttributionSnapshotError {
+    ReadonlyAttributionSnapshotError::Integrity {
+        detail: detail.into(),
+    }
+}
+
 fn sqlite_sidecar_path(database: &Path, suffix: &str) -> PathBuf {
     let mut path = database.as_os_str().to_os_string();
     path.push(suffix);
@@ -1083,70 +1116,119 @@ fn sqlite_sidecar_path(database: &Path, suffix: &str) -> PathBuf {
 fn capture_readonly_attribution_file(
     path: &Path,
     required: bool,
-) -> Result<Option<ReadonlyAttributionFileSnapshot>, String> {
+) -> Result<Option<ReadonlyAttributionFileSnapshot>, ReadonlyAttributionSnapshotError> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("inspect {}: {error}", path.display())),
+        Err(error) => {
+            return Err(readonly_snapshot_io_unavailable(
+                format!("inspect {}", path.display()),
+                error,
+            ));
+        }
     };
     if !metadata.file_type().is_file() {
-        return Err(format!(
+        return Err(readonly_snapshot_integrity(format!(
             "read-only attribution snapshot source is not a regular file: {}",
             path.display()
-        ));
+        )));
     }
     let identity = SqliteObjectIdentity::from_metadata(&metadata);
-    let modified = metadata
-        .modified()
-        .map_err(|error| format!("read modification time for {}: {error}", path.display()))?;
+    let modified = metadata.modified().map_err(|error| {
+        readonly_snapshot_io_unavailable(
+            format!("read modification time for {}", path.display()),
+            error,
+        )
+    })?;
     let expected_len = metadata.len();
-    let mut file = File::open(path)
-        .map_err(|error| format!("open read-only snapshot file {}: {error}", path.display()))?;
-    let opened_metadata = file
-        .metadata()
-        .map_err(|error| format!("inspect opened snapshot file {}: {error}", path.display()))?;
-    if SqliteObjectIdentity::from_metadata(&opened_metadata) != identity
-        || opened_metadata.modified().map_err(|error| {
+    let mut file = File::open(path).map_err(|error| {
+        readonly_snapshot_io_unavailable(
+            format!("open read-only snapshot file {}", path.display()),
+            error,
+        )
+    })?;
+    let opened_metadata = file.metadata().map_err(|error| {
+        readonly_snapshot_io_unavailable(
+            format!("inspect opened snapshot file {}", path.display()),
+            error,
+        )
+    })?;
+    let opened_modified = opened_metadata.modified().map_err(|error| {
+        readonly_snapshot_io_unavailable(
             format!(
-                "read opened snapshot modification time for {}: {error}",
+                "read opened snapshot modification time for {}",
                 path.display()
-            )
-        })? != modified
+            ),
+            error,
+        )
+    })?;
+    if SqliteObjectIdentity::from_metadata(&opened_metadata) != identity
+        || opened_modified != modified
         || opened_metadata.len() != expected_len
     {
-        return Err(format!(
+        return Err(readonly_snapshot_integrity(format!(
             "read-only attribution snapshot file changed while opening: {}",
             path.display()
-        ));
+        )));
     }
     let mut bytes = Vec::with_capacity(expected_len.try_into().unwrap_or(0));
-    file.read_to_end(&mut bytes)
-        .map_err(|error| format!("read snapshot file {}: {error}", path.display()))?;
-    let after_read = file
-        .metadata()
-        .map_err(|error| format!("re-inspect snapshot file {}: {error}", path.display()))?;
+    file.read_to_end(&mut bytes).map_err(|error| {
+        readonly_snapshot_io_unavailable(format!("read snapshot file {}", path.display()), error)
+    })?;
+    let after_read = file.metadata().map_err(|error| {
+        readonly_snapshot_io_unavailable(
+            format!("re-inspect snapshot file {}", path.display()),
+            error,
+        )
+    })?;
+    let after_modified = after_read.modified().map_err(|error| {
+        readonly_snapshot_io_unavailable(
+            format!("re-read snapshot modification time for {}", path.display()),
+            error,
+        )
+    })?;
     if SqliteObjectIdentity::from_metadata(&after_read) != identity
-        || after_read.modified().map_err(|error| {
-            format!(
-                "re-read snapshot modification time for {}: {error}",
-                path.display()
-            )
-        })? != modified
+        || after_modified != modified
         || after_read.len() != expected_len
         || bytes.len() as u64 != expected_len
     {
-        return Err(format!(
+        return Err(readonly_snapshot_integrity(format!(
             "read-only attribution snapshot file changed while reading: {}",
             path.display()
-        ));
+        )));
     }
-    let named_after_read = std::fs::symlink_metadata(path)
-        .map_err(|error| format!("re-inspect snapshot pathname {}: {error}", path.display()))?;
-    if SqliteObjectIdentity::from_metadata(&named_after_read) != identity {
-        return Err(format!(
+    let named_after_read = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(readonly_snapshot_integrity(format!(
+                "read-only attribution snapshot pathname disappeared while reading: {}",
+                path.display()
+            )));
+        }
+        Err(error) => {
+            return Err(readonly_snapshot_io_unavailable(
+                format!("re-inspect snapshot pathname {}", path.display()),
+                error,
+            ));
+        }
+    };
+    let named_modified = named_after_read.modified().map_err(|error| {
+        readonly_snapshot_io_unavailable(
+            format!(
+                "re-read snapshot pathname modification time for {}",
+                path.display()
+            ),
+            error,
+        )
+    })?;
+    if SqliteObjectIdentity::from_metadata(&named_after_read) != identity
+        || named_modified != modified
+        || named_after_read.len() != expected_len
+    {
+        return Err(readonly_snapshot_integrity(format!(
             "read-only attribution snapshot pathname changed while reading: {}",
             path.display()
-        ));
+        )));
     }
     Ok(Some(ReadonlyAttributionFileSnapshot {
         identity,
@@ -1157,13 +1239,66 @@ fn capture_readonly_attribution_file(
 
 fn capture_readonly_attribution_source(
     database: &Path,
-) -> Result<ReadonlyAttributionSourceSnapshot, String> {
+) -> Result<ReadonlyAttributionSourceSnapshot, ReadonlyAttributionSnapshotError> {
     Ok(ReadonlyAttributionSourceSnapshot {
         main: capture_readonly_attribution_file(database, true)?
             .expect("required read-only attribution main database must be present"),
         wal: capture_readonly_attribution_file(&sqlite_sidecar_path(database, "-wal"), false)?,
         shm: capture_readonly_attribution_file(&sqlite_sidecar_path(database, "-shm"), false)?,
     })
+}
+
+fn verify_readonly_attribution_file_unchanged(
+    path: &Path,
+    expected: Option<&ReadonlyAttributionFileSnapshot>,
+) -> Result<(), ReadonlyAttributionSnapshotError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) if expected.is_none() => {
+            return Err(readonly_snapshot_integrity(format!(
+                "read-only attribution snapshot pathname appeared while copying: {}",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && expected.is_none() => {
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(readonly_snapshot_integrity(format!(
+                "read-only attribution snapshot pathname disappeared while copying: {}",
+                path.display()
+            )));
+        }
+        Err(error) => {
+            return Err(readonly_snapshot_io_unavailable(
+                format!("re-inspect snapshot pathname {}", path.display()),
+                error,
+            ));
+        }
+    }
+    let actual = capture_readonly_attribution_file(path, expected.is_some())?;
+    if actual.as_ref() != expected {
+        return Err(readonly_snapshot_integrity(format!(
+            "read-only attribution snapshot identity/mtime/length/bytes changed while copying: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn verify_readonly_attribution_source_unchanged(
+    database: &Path,
+    expected: &ReadonlyAttributionSourceSnapshot,
+) -> Result<(), ReadonlyAttributionSnapshotError> {
+    verify_readonly_attribution_file_unchanged(database, Some(&expected.main))?;
+    verify_readonly_attribution_file_unchanged(
+        &sqlite_sidecar_path(database, "-wal"),
+        expected.wal.as_ref(),
+    )?;
+    verify_readonly_attribution_file_unchanged(
+        &sqlite_sidecar_path(database, "-shm"),
+        expected.shm.as_ref(),
+    )
 }
 
 static NEXT_READONLY_ATTRIBUTION_SNAPSHOT: AtomicU64 = AtomicU64::new(0);
@@ -1175,7 +1310,9 @@ struct TemporaryAttributionSnapshot {
 }
 
 impl TemporaryAttributionSnapshot {
-    fn create(source: &ReadonlyAttributionSourceSnapshot) -> Result<Self, String> {
+    fn create(
+        source: &ReadonlyAttributionSourceSnapshot,
+    ) -> Result<Self, ReadonlyAttributionSnapshotError> {
         let directory = loop {
             let sequence = NEXT_READONLY_ATTRIBUTION_SNAPSHOT.fetch_add(1, Ordering::Relaxed);
             let nonce = std::time::SystemTime::now()
@@ -1192,8 +1329,9 @@ impl TemporaryAttributionSnapshot {
                 Ok(()) => break candidate,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => {
-                    return Err(format!(
-                        "create private attribution snapshot directory: {error}"
+                    return Err(readonly_snapshot_io_unavailable(
+                        "create private attribution snapshot directory",
+                        error,
                     ));
                 }
             }
@@ -1213,65 +1351,76 @@ impl TemporaryAttributionSnapshot {
         Ok(snapshot)
     }
 
-    fn write_file(&mut self, path: &Path, bytes: &[u8]) -> Result<(), String> {
+    fn write_file(
+        &mut self,
+        path: &Path,
+        bytes: &[u8],
+    ) -> Result<(), ReadonlyAttributionSnapshotError> {
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(path)
             .map_err(|error| {
-                format!("create detached snapshot file {}: {error}", path.display())
+                readonly_snapshot_io_unavailable(
+                    format!("create detached snapshot file {}", path.display()),
+                    error,
+                )
             })?;
-        file.write_all(bytes)
-            .map_err(|error| format!("write detached snapshot file {}: {error}", path.display()))
+        file.write_all(bytes).map_err(|error| {
+            readonly_snapshot_io_unavailable(
+                format!("write detached snapshot file {}", path.display()),
+                error,
+            )
+        })
     }
 
     fn database_path(&self) -> &Path {
         &self.database
     }
 
-    fn materialize_copied_wal(&self) -> Result<(), String> {
+    fn materialize_copied_wal(&self) -> Result<(), ReadonlyAttributionSnapshotError> {
         // This writer is confined to the private detached directory. It does
         // not execute schema or application writes; it only materializes the
         // already captured logical snapshot so the later mode=ro pool never
         // needs to rebuild source WAL state.
         let database_url = self.database.to_string_lossy().into_owned();
         let mut bootstrap = SqliteConnection::establish(&database_url).map_err(|error| {
-            format!(
+            readonly_snapshot_integrity(format!(
                 "establish private attribution WAL bootstrap {}: {error}",
                 self.database.display()
-            )
+            ))
         })?;
         let checkpoint = diesel::sql_query("PRAGMA wal_checkpoint(TRUNCATE)")
             .get_result::<WalCheckpointRow>(&mut bootstrap)
             .map_err(|error| {
-                format!(
+                readonly_snapshot_integrity(format!(
                     "checkpoint private attribution WAL {}: {error}",
                     self.database.display()
-                )
+                ))
             })?;
         if checkpoint.busy != 0
             || checkpoint.log < 0
             || checkpoint.checkpointed < 0
             || checkpoint.log != checkpoint.checkpointed
         {
-            return Err(format!(
+            return Err(readonly_snapshot_integrity(format!(
                 "private attribution WAL checkpoint incomplete (requires busy=0 and non-negative equal frame counts): busy={}, log={}, checkpointed={}",
                 checkpoint.busy, checkpoint.log, checkpoint.checkpointed
-            ));
+            )));
         }
         let journal_mode = diesel::sql_query("PRAGMA journal_mode=DELETE")
             .get_result::<JournalModeRow>(&mut bootstrap)
             .map_err(|error| {
-                format!(
+                readonly_snapshot_integrity(format!(
                     "normalize private attribution snapshot journal mode {}: {error}",
                     self.database.display()
-                )
+                ))
             })?
             .journal_mode;
         if !journal_mode.eq_ignore_ascii_case("delete") {
-            return Err(format!(
+            return Err(readonly_snapshot_integrity(format!(
                 "private attribution snapshot retained journal_mode={journal_mode} after WAL checkpoint"
-            ));
+            )));
         }
         drop(bootstrap);
         for suffix in ["-wal", "-shm"] {
@@ -1279,15 +1428,16 @@ impl TemporaryAttributionSnapshot {
             match std::fs::metadata(&sidecar) {
                 Ok(metadata) if metadata.len() == 0 => {}
                 Ok(metadata) => {
-                    return Err(format!(
+                    return Err(readonly_snapshot_integrity(format!(
                         "private attribution {suffix} retained {} bytes after DELETE normalization",
                         metadata.len()
-                    ));
+                    )));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    return Err(format!(
-                        "inspect private attribution {suffix} after DELETE normalization: {error}"
+                    return Err(readonly_snapshot_io_unavailable(
+                        format!("inspect private attribution {suffix} after DELETE normalization"),
+                        error,
                     ));
                 }
             }
@@ -1303,6 +1453,7 @@ impl TemporaryAttributionSnapshot {
             self.database.clone(),
             sqlite_sidecar_path(&self.database, "-wal"),
             sqlite_sidecar_path(&self.database, "-shm"),
+            sqlite_sidecar_path(&self.database, "-journal"),
         ];
         let mut unknown = Vec::new();
         for entry in std::fs::read_dir(&self.directory).map_err(|error| {
@@ -1353,7 +1504,11 @@ impl TemporaryAttributionSnapshot {
 
 impl Drop for TemporaryAttributionSnapshot {
     fn drop(&mut self) {
-        let _ = self.cleanup();
+        if self.cleanup().is_err() {
+            log::warn!(
+                "detached attribution snapshot cleanup failed; path and content details redacted"
+            );
+        }
     }
 }
 
@@ -2164,6 +2319,8 @@ impl DatabaseManager {
             attribution_pool,
             attribution_connection_source,
             readonly_attribution_snapshot: None,
+            #[cfg(test)]
+            allow_unattested_attribution_reads_for_test: false,
             selection_connection_source: None,
             selection_schema_authority: None,
         };
@@ -2202,6 +2359,8 @@ impl DatabaseManager {
             attribution_pool: Some(attribution_pool),
             attribution_connection_source: Some(Arc::clone(&selection_connection_source)),
             readonly_attribution_snapshot: None,
+            #[cfg(test)]
+            allow_unattested_attribution_reads_for_test: false,
             selection_connection_source: Some(selection_connection_source),
             selection_schema_authority: Some(authority),
         })
@@ -2326,8 +2485,9 @@ impl DatabaseManager {
     /// Runs one deferred attribution read transaction from this manager's
     /// owned database. Append-only managers use their descriptor-attested
     /// checkout. Read-only CLI managers use only the primary pool backed by
-    /// their session-owned detached snapshot. The callback cannot supply or
-    /// switch a pathname.
+    /// their session-owned detached snapshot. Managers with neither authority
+    /// fail closed; only explicitly-capable unit-test fixtures may use the
+    /// ordinary pool. The callback cannot supply or switch a pathname.
     pub(crate) fn attribution_read_transaction<T, E, F>(
         &self,
         operation: F,
@@ -2365,14 +2525,22 @@ impl DatabaseManager {
                 operation(connection).map_err(AttributionReadTransactionError::Operation)
             })
         } else {
-            let mut connection = self.get_conn().map_err(|error| {
-                AttributionReadTransactionError::StorageUnavailable {
-                    detail: error.to_string(),
-                }
-            })?;
-            connection.transaction(|connection| {
-                operation(connection).map_err(AttributionReadTransactionError::Operation)
-            })
+            #[cfg(test)]
+            if self.allow_unattested_attribution_reads_for_test {
+                let mut connection = self.get_conn().map_err(|error| {
+                    AttributionReadTransactionError::StorageUnavailable {
+                        detail: error.to_string(),
+                    }
+                })?;
+                return connection.transaction(|connection| {
+                    operation(connection).map_err(AttributionReadTransactionError::Operation)
+                });
+            }
+            return Err(AttributionReadTransactionError::Authority(
+                DatabaseAuthorityError::DescriptorAttestationUnavailable {
+                    detail: "manager has no authoritative attribution read capability".into(),
+                },
+            ));
         }
     }
 
@@ -3907,6 +4075,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn readonly_snapshot_source_io_is_typed_unavailable() {
+        let missing = std::env::temp_dir().join(format!(
+            "{}.missing",
+            unique_test_label("readonly_snapshot_source_io")
+        ));
+        let error = capture_readonly_attribution_source(&missing)
+            .expect_err("TEST_CODE missing snapshot source must be unavailable");
+        assert!(matches!(
+            error,
+            ReadonlyAttributionSnapshotError::Unavailable {
+                retryable: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn detached_snapshot_cleanup_owns_exact_sqlite_rollback_journal() {
+        let directory = std::env::temp_dir().join(unique_test_label("snapshot_cleanup_journal"));
+        std::fs::create_dir(&directory).expect("TEST_CODE create snapshot cleanup directory");
+        let database = directory.join("snapshot.db");
+        std::fs::write(&database, b"TEST_CODE database")
+            .expect("TEST_CODE create owned snapshot database");
+        std::fs::write(
+            sqlite_sidecar_path(&database, "-journal"),
+            b"TEST_CODE journal",
+        )
+        .expect("TEST_CODE create owned rollback journal");
+        let mut snapshot = TemporaryAttributionSnapshot {
+            directory: directory.clone(),
+            database,
+            cleaned: false,
+        };
+
+        snapshot
+            .cleanup()
+            .expect("TEST_CODE exact SQLite rollback journal is an owned artifact");
+        assert!(!directory.exists());
+    }
+
     struct SharedSelectionAttributionDatabase {
         manager: DatabaseManager,
         _database: TemporarySqliteDatabase,
@@ -3940,6 +4149,7 @@ mod tests {
                     attribution_pool: Some(attribution_pool),
                     attribution_connection_source: Some(Arc::clone(&source)),
                     readonly_attribution_snapshot: None,
+                    allow_unattested_attribution_reads_for_test: false,
                     selection_connection_source: Some(source),
                     selection_schema_authority: None,
                 },

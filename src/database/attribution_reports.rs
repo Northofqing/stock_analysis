@@ -289,74 +289,79 @@ impl AttributionDatabaseSession {
         access: AttributionDatabaseAccess,
     ) -> Result<Self, AttributionReportStoreError> {
         let path = path.as_ref();
-        let supplied_metadata = std::fs::symlink_metadata(path).map_err(|_| {
+        let supplied_metadata = std::fs::symlink_metadata(path).map_err(|error| {
+            let retryable = super::readonly_snapshot_io_retryable(error.kind());
             unavailable(
                 "attribution_database_unavailable",
-                false,
-                "BR-251 explicit attribution database is unavailable",
+                retryable,
+                format!("BR-251 explicit attribution database is unavailable: {error}"),
             )
         })?;
         if supplied_metadata.file_type().is_symlink() || !supplied_metadata.is_file() {
-            return Err(failed_integrity(
-                "attribution_database_identity_invalid",
-                "BR-251 explicit attribution database must be an existing regular file",
-            ));
+            return Err(match access {
+                AttributionDatabaseAccess::ReadOnly => failed_integrity(
+                    "attribution_database_snapshot_integrity_failed",
+                    "BR-251 read-only attribution snapshot source must be an existing regular file",
+                ),
+                AttributionDatabaseAccess::AppendOnly => failed_integrity(
+                    "attribution_database_identity_invalid",
+                    "BR-251 explicit attribution database must be an existing regular file",
+                ),
+            });
         }
-        let database_path = std::fs::canonicalize(path).map_err(|_| {
+        let database_path = std::fs::canonicalize(path).map_err(|error| {
+            let retryable = super::readonly_snapshot_io_retryable(error.kind());
             unavailable(
                 "attribution_database_unavailable",
-                false,
-                "BR-251 explicit attribution database cannot be resolved",
+                retryable,
+                format!("BR-251 explicit attribution database cannot be resolved: {error}"),
             )
         })?;
-        if !std::fs::metadata(&database_path)
-            .map(|metadata| metadata.is_file())
-            .unwrap_or(false)
-        {
-            return Err(failed_integrity(
-                "attribution_database_identity_invalid",
-                "BR-251 resolved attribution database is not a regular file",
-            ));
+        let resolved_metadata = std::fs::metadata(&database_path).map_err(|error| {
+            let retryable = super::readonly_snapshot_io_retryable(error.kind());
+            unavailable(
+                "attribution_database_unavailable",
+                retryable,
+                format!("BR-251 resolved attribution database is unavailable: {error}"),
+            )
+        })?;
+        if !resolved_metadata.is_file() {
+            return Err(match access {
+                AttributionDatabaseAccess::ReadOnly => failed_integrity(
+                    "attribution_database_snapshot_integrity_failed",
+                    "BR-251 resolved read-only attribution snapshot source is not a regular file",
+                ),
+                AttributionDatabaseAccess::AppendOnly => failed_integrity(
+                    "attribution_database_identity_invalid",
+                    "BR-251 resolved attribution database is not a regular file",
+                ),
+            });
         }
 
         let readonly_attribution_snapshot = match access {
             AttributionDatabaseAccess::ReadOnly => {
                 let before = super::capture_readonly_attribution_source(&database_path).map_err(
-                    |detail| {
-                        failed_integrity(
-                            "attribution_database_snapshot_integrity_failed",
-                            format!(
-                                "BR-251 attribution read-only source cannot be captured: {detail}"
-                            ),
+                    |error| {
+                        map_readonly_snapshot_error(
+                            "BR-251 attribution read-only source cannot be captured",
+                            error,
                         )
                     },
                 )?;
                 let snapshot =
-                    super::TemporaryAttributionSnapshot::create(&before).map_err(|detail| {
-                        unavailable(
-                            "attribution_database_unavailable",
-                            true,
-                            format!(
-                                "BR-251 private attribution snapshot cannot be created: {detail}"
-                            ),
+                    super::TemporaryAttributionSnapshot::create(&before).map_err(|error| {
+                        map_readonly_snapshot_error(
+                            "BR-251 private attribution snapshot cannot be created",
+                            error,
                         )
                     })?;
-                let after = super::capture_readonly_attribution_source(&database_path).map_err(
-                    |detail| {
-                        failed_integrity(
-                            "attribution_database_snapshot_integrity_failed",
-                            format!(
-                                "BR-251 attribution read-only source cannot be re-verified: {detail}"
-                            ),
+                super::verify_readonly_attribution_source_unchanged(&database_path, &before)
+                    .map_err(|error| {
+                        map_readonly_snapshot_error(
+                            "BR-251 attribution read-only source cannot be re-verified",
+                            error,
                         )
-                    },
-                )?;
-                if after != before {
-                    return Err(failed_integrity(
-                        "attribution_database_snapshot_integrity_failed",
-                        "BR-251 attribution source main/WAL/SHM changed while copying the read-only snapshot",
-                    ));
-                }
+                    })?;
                 Some(snapshot)
             }
             AttributionDatabaseAccess::AppendOnly => None,
@@ -447,6 +452,8 @@ impl AttributionDatabaseSession {
             attribution_pool,
             attribution_connection_source,
             readonly_attribution_snapshot,
+            #[cfg(test)]
+            allow_unattested_attribution_reads_for_test: false,
             selection_connection_source: None,
             selection_schema_authority: None,
         };
@@ -532,6 +539,14 @@ impl AttributionDatabaseSession {
 
 #[cfg(test)]
 pub(crate) fn test_runner_database_manager(path: &std::path::Path) -> DatabaseManager {
+    test_runner_database_manager_with_attribution_read_authority(path, true)
+}
+
+#[cfg(test)]
+fn test_runner_database_manager_with_attribution_read_authority(
+    path: &std::path::Path,
+    allow_unattested_attribution_reads_for_test: bool,
+) -> DatabaseManager {
     let database_url = path.to_string_lossy().into_owned();
     let mut bootstrap = SqliteConnection::establish(&database_url)
         .expect("TEST_CODE establish replay runner database");
@@ -556,9 +571,17 @@ pub(crate) fn test_runner_database_manager(path: &std::path::Path) -> DatabaseMa
         attribution_pool: None,
         attribution_connection_source: None,
         readonly_attribution_snapshot: None,
+        allow_unattested_attribution_reads_for_test,
         selection_connection_source: None,
         selection_schema_authority: None,
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_runner_database_manager_without_attribution_read_authority(
+    path: &std::path::Path,
+) -> DatabaseManager {
+    test_runner_database_manager_with_attribution_read_authority(path, false)
 }
 
 #[derive(Debug, Clone)]
@@ -632,6 +655,23 @@ fn unavailable(
         reason_code,
         retryable,
         detail: detail.into(),
+    }
+}
+
+fn map_readonly_snapshot_error(
+    context: &str,
+    error: super::ReadonlyAttributionSnapshotError,
+) -> AttributionReportStoreError {
+    match error {
+        super::ReadonlyAttributionSnapshotError::Unavailable { detail, retryable } => unavailable(
+            "attribution_database_unavailable",
+            retryable,
+            format!("{context}: {detail}"),
+        ),
+        super::ReadonlyAttributionSnapshotError::Integrity { detail } => failed_integrity(
+            "attribution_database_snapshot_integrity_failed",
+            format!("{context}: {detail}"),
+        ),
     }
 }
 
@@ -3560,6 +3600,7 @@ mod tests {
             missing_error.reason_code(),
             "attribution_database_unavailable"
         );
+        assert!(!missing_error.retryable());
         assert!(!missing.exists());
 
         let append_only =
@@ -3619,6 +3660,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn readonly_session_classifies_corrupt_nonempty_wal_as_snapshot_integrity() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("TEST_CODE clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "TEST_CODE_attribution_corrupt_wal_{}_{}.sqlite",
+            std::process::id(),
+            nonce
+        ));
+        let mut bootstrap = SqliteConnection::establish(&path.to_string_lossy())
+            .expect("TEST_CODE corrupt WAL bootstrap");
+        diesel::sql_query("PRAGMA journal_mode = WAL")
+            .execute(&mut bootstrap)
+            .expect("TEST_CODE corrupt WAL mode");
+        bootstrap
+            .batch_execute(
+                "CREATE TABLE legacy_guard(value TEXT NOT NULL);\
+                 INSERT INTO legacy_guard(value) VALUES ('unchanged');",
+            )
+            .expect("TEST_CODE corrupt WAL sentinel");
+        drop(bootstrap);
+        let wal = PathBuf::from(format!("{}-wal", path.display()));
+        std::fs::write(&wal, [0xA5; 32]).expect("TEST_CODE install corrupt nonempty WAL");
+
+        let error =
+            match AttributionDatabaseSession::open(&path, AttributionDatabaseAccess::ReadOnly) {
+                Ok(_) => panic!("TEST_CODE corrupt WAL must fail closed"),
+                Err(error) => error,
+            };
+        assert_eq!(
+            error.reason_code(),
+            "attribution_database_snapshot_integrity_failed"
+        );
+        assert!(!error.retryable());
+
+        for suffix in ["", "-wal", "-shm"] {
+            let candidate = PathBuf::from(format!("{}{}", path.display(), suffix));
+            if let Err(error) = std::fs::remove_file(&candidate) {
+                assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+            }
+        }
+    }
+
     struct TestDatabase {
         path: PathBuf,
         manager: DatabaseManager,
@@ -3659,6 +3745,7 @@ mod tests {
                     attribution_pool: None,
                     attribution_connection_source: None,
                     readonly_attribution_snapshot: None,
+                    allow_unattested_attribution_reads_for_test: true,
                     selection_connection_source: None,
                     selection_schema_authority: None,
                 },
