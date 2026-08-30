@@ -1,26 +1,18 @@
-//! UnverifiedSourceUnit / CorporateActionCategory / CorporateActionStatus /
-//! CorporateActionTerms 本地镜像 (M5, Task #76, feature 关时使用)。
-//! 与上游 magic_market_core rev 75ee2a2 (lifecycle.rs) 同构:
-//! 变体集/字段/serde 表示/校验语义与错误字符串逐字一致
-//! (convert.rs 用 from_value 反序列化 Terms, 校验必须生效)。
+//! Locally owned source-unit and corporate-action lifecycle types.
+//! Validation and serde representations are stable transport contracts.
 
-#[cfg(not(feature = "magic-gateway"))]
 use serde::{de, Deserialize, Deserializer, Serialize};
 
-#[cfg(not(feature = "magic-gateway"))]
 use super::instrument::CoreError;
-#[cfg(not(feature = "magic-gateway"))]
 use super::value::{FiniteNumber, Price, Ratio, RatioUnit};
 
 /// A provider-native quantity whose physical unit has not been independently verified.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum UnverifiedSourceUnit {
     ProviderNative,
 }
 
 /// Source-published lifecycle state.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CorporateActionStatus {
     Implemented,
@@ -30,7 +22,6 @@ pub enum CorporateActionStatus {
 }
 
 /// Corporate action family.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CorporateActionCategory {
     Distribution,
@@ -50,7 +41,6 @@ pub enum CorporateActionCategory {
 }
 
 /// Checked economic terms for one corporate action.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum CorporateActionTerms {
     Distribution {
@@ -86,7 +76,6 @@ pub enum CorporateActionTerms {
     },
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl CorporateActionTerms {
     pub fn distribution(
         cash_per_share: Option<FiniteNumber>,
@@ -262,7 +251,6 @@ impl CorporateActionTerms {
     }
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl<'de> Deserialize<'de> for CorporateActionTerms {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

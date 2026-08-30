@@ -2,7 +2,7 @@ use crate::data_gateway::{
     MagicTdxT0Batch, MagicTdxT0DailyBar, MagicTdxT0Evidence, MagicTdxT0FiveMinuteBar,
     MagicTdxT0Quote, MagicTdxT0Rejection,
 };
-use crate::magic_compat::InstrumentId;
+use crate::market_domain::InstrumentId;
 use chrono::{FixedOffset, SecondsFormat, TimeZone};
 use serde::Serialize;
 
@@ -105,7 +105,7 @@ mod tests {
     use crate::data_gateway::{
         MagicTdxT0Batch, MagicTdxT0Evidence, MagicTdxT0FiveMinuteBar, MagicTdxT0Quote, T0BookLevel,
     };
-    use crate::magic_compat::{AssetClass, Exchange, InstrumentId, ProviderId};
+    use crate::market_domain::{AssetClass, Exchange, InstrumentId, ProviderId};
     use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc};
 
     #[test]

@@ -23,7 +23,7 @@ use crate::data_gateway::{
     HistoricalBarsGateway, IntradayShapeFact, IntradayShapeGateway,
 };
 use crate::data_provider::KlineData;
-use crate::magic_compat::FlowInterval;
+use crate::market_domain::FlowInterval;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -334,7 +334,7 @@ mod tests {
 
     fn financial_evidence(source: &str) -> crate::company_financials::FinancialProjectionEvidence {
         crate::company_financials::FinancialProjectionEvidence {
-            provider: crate::magic_compat::ProviderId::Sina,
+            provider: crate::market_domain::ProviderId::Sina,
             source: source.to_string(),
             source_at: Some("2026-06-30".to_string()),
             observed_at: "2026-07-18T10:00:00+08:00".to_string(),

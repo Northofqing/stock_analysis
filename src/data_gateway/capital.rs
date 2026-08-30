@@ -14,8 +14,8 @@
 //! `spawn_blocking`, so they cannot drop a blocking runtime on a Tokio worker.
 
 #[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{DataBatch, Exchange, RatioUnit, SourceEvidence};
-use crate::magic_compat::{
+use crate::market_domain::{DataBatch, Exchange, RatioUnit, SourceEvidence};
+use crate::market_domain::{
     FiniteNumber, FlowInterval, InstrumentId, IsoDate, MarketRankingKind, MarketRankingUnit,
     NonEmptyText, NorthboundChannel, PositiveU32, ProviderId,
 };
@@ -1008,7 +1008,7 @@ fn validate_provider_top_n_side(
 mod br240_transport_neutral_tests {
     use super::*;
     use crate::data_gateway::BatchEvidence;
-    use crate::magic_compat::{AssetClass, Exchange};
+    use crate::market_domain::{AssetClass, Exchange};
 
     fn evidence(batch_id: &str) -> BatchEvidence {
         BatchEvidence {
@@ -1511,7 +1511,7 @@ fn source_date(
 
 #[cfg(feature = "magic-gateway")]
 fn required_money(
-    value: Option<crate::magic_compat::Money>,
+    value: Option<crate::market_domain::Money>,
     field: &str,
     code: &str,
 ) -> Result<f64, GatewayError> {
@@ -1526,7 +1526,7 @@ fn required_money(
 
 #[cfg(feature = "magic-gateway")]
 fn required_percent(
-    value: Option<crate::magic_compat::Ratio>,
+    value: Option<crate::market_domain::Ratio>,
     field: &str,
     code: &str,
 ) -> Result<f64, GatewayError> {
@@ -1903,7 +1903,7 @@ mod tests {
         NORTHBOUND_CAPABILITY, PROVIDER_TOP_N_MAIN_NET_INFLOW_CAPABILITY,
         PROVIDER_TOP_N_VOLUME_RATIO_CAPABILITY,
     };
-    use crate::magic_compat::{
+    use crate::market_domain::{
         AssetClass, DataBatch, Exchange, FiniteNumber, FlowInterval, InstrumentId, IsoDate,
         MarketRankingKind, MarketRankingUnit, Money, NonEmptyText, NorthboundChannel, PositiveU32,
         Provenance, ProviderId, Quantity, Ratio, RatioUnit, SourceEvidence,
@@ -3033,7 +3033,7 @@ mod tests {
                 FailureAction::TryNext,
             ),
             (
-                EastmoneyError::Core(crate::magic_compat::CoreError::InvalidRequest(
+                EastmoneyError::Core(crate::market_domain::CoreError::InvalidRequest(
                     "TEST_CODE".to_owned(),
                 )),
                 FailureKind::Quality,
@@ -3101,7 +3101,7 @@ mod tests {
                 FailureAction::TryNext,
             ),
             (
-                ExchangeError::Core(crate::magic_compat::CoreError::InvalidRequest(
+                ExchangeError::Core(crate::market_domain::CoreError::InvalidRequest(
                     "TEST_CODE".to_owned(),
                 )),
                 FailureKind::Quality,
@@ -3161,7 +3161,7 @@ mod tests {
                 false,
             ),
             (
-                EastmoneyError::Core(crate::magic_compat::CoreError::InvalidRequest(
+                EastmoneyError::Core(crate::market_domain::CoreError::InvalidRequest(
                     "TEST_CODE".to_owned(),
                 )),
                 "partial",
@@ -3241,7 +3241,7 @@ mod tests {
                 false,
             ),
             (
-                ExchangeError::Core(crate::magic_compat::CoreError::InvalidRequest(
+                ExchangeError::Core(crate::market_domain::CoreError::InvalidRequest(
                     "TEST_CODE".to_owned(),
                 )),
                 "partial",

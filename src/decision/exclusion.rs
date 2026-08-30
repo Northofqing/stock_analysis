@@ -364,7 +364,7 @@ mod tests {
         GatewayBatch::Available {
             records,
             evidence: crate::data_gateway::BatchEvidence {
-                provider: crate::magic_compat::ProviderId::Tdx,
+                provider: crate::market_domain::ProviderId::Tdx,
                 source: "TEST_CODE_tdx-block-files".to_owned(),
                 source_at: None,
                 observed_at: "1785290400.000000000".to_owned(),

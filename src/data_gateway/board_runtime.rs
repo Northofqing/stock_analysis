@@ -5,8 +5,8 @@ use super::review::audit_blocking_join_failure;
 use super::review::{acquisition_request_hash, audit_gateway_result};
 use super::{BatchEvidence, GatewayBatch, GatewayError};
 #[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{DataBatch, FlowInterval, PositiveU32};
-use crate::magic_compat::{InstrumentId, ProviderId};
+use crate::market_domain::{DataBatch, FlowInterval, PositiveU32};
+use crate::market_domain::{InstrumentId, ProviderId};
 #[cfg(feature = "magic-gateway")]
 use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
 #[cfg(feature = "magic-gateway")]
@@ -760,7 +760,7 @@ fn ensure_complete(
 
 fn validate_source_evidence(
     capability: &'static str,
-    record: &crate::magic_compat::SourceEvidence,
+    record: &crate::market_domain::SourceEvidence,
     batch: &BatchEvidence,
     provider: ProviderId,
 ) -> Result<(), GatewayError> {
@@ -955,7 +955,7 @@ mod tests {
         validate_source_evidence, BatchEvidence, BoardDataGateway, BoardKind, GatewayBatch,
         DIRECTORY_CAPABILITY, FLOW_CAPABILITY, MEMBERSHIP_CAPABILITY,
     };
-    use crate::magic_compat::{Exchange, ProviderId, SourceEvidence};
+    use crate::market_domain::{Exchange, ProviderId, SourceEvidence};
     #[cfg(feature = "magic-gateway")]
     use magic_eastmoney_rs::EastmoneyError;
     #[cfg(feature = "magic-gateway")]

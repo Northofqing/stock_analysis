@@ -278,7 +278,7 @@ fn render_section(
 mod tests {
     use super::{apply_with_index_change, project_index_change};
     use crate::data_gateway::{BatchEvidence, GatewayBatch, RealtimeIndexQuote};
-    use crate::magic_compat::ProviderId;
+    use crate::market_domain::ProviderId;
     use crate::pipeline::AnalysisResult;
     use chrono::{TimeZone, Utc};
 

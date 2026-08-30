@@ -15,7 +15,7 @@ use crate::data_gateway::{
     BatchEvidence, BenchmarkBar, BenchmarkBarTime, BenchmarkError, BenchmarkGranularity,
     BenchmarkRange, BenchmarkRequest,
 };
-use crate::magic_compat::ProviderId;
+use crate::market_domain::ProviderId;
 
 const SEGMENT_CHAIN_GENESIS: &str = "BR251_BENCHMARK_SEGMENT_CHAIN_GENESIS_V1";
 const MANIFEST_CHAIN_GENESIS: &str = "BR251_BENCHMARK_MANIFEST_CHAIN_GENESIS_V1";
@@ -2916,7 +2916,7 @@ mod tests {
         HS300_CANONICAL,
     };
     use crate::database::data_acquisition_audit::DataAcquisitionAuditRecord;
-    use crate::magic_compat::ProviderId;
+    use crate::market_domain::ProviderId;
 
     #[derive(QueryableByName)]
     struct CountRow {

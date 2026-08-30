@@ -10,11 +10,11 @@
 //! estimated at this boundary.
 
 #[cfg(all(test, feature = "magic-gateway"))]
-use crate::magic_compat::Exchange;
-use crate::magic_compat::ProviderId;
-use crate::magic_compat::SecurityBar;
+use crate::market_domain::Exchange;
+use crate::market_domain::ProviderId;
+use crate::market_domain::SecurityBar;
 #[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{AssetClass, DataBatch, InstrumentId};
+use crate::market_domain::{AssetClass, DataBatch, InstrumentId};
 #[cfg(feature = "magic-gateway")]
 use chrono::Local;
 use chrono::NaiveDate;
@@ -1714,7 +1714,7 @@ mod tests {
     use crate::data_gateway::security_lifecycle::{
         AdmittedListingDate, CorporateActionState, ListingDateState,
     };
-    use crate::magic_compat::{Money, Price, Provenance, Quantity};
+    use crate::market_domain::{Money, Price, Provenance, Quantity};
 
     fn bar(
         date: &str,

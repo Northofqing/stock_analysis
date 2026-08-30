@@ -1,8 +1,8 @@
 //! BR-066/BR-164/BR-172 evidence-preserving Sina instrument-news gateway.
 
 #[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{DataBatch, Exchange, IsoDate, PositiveU32};
-use crate::magic_compat::{ProviderId, SourceEvidence};
+use crate::market_domain::{DataBatch, Exchange, IsoDate, PositiveU32};
+use crate::market_domain::{ProviderId, SourceEvidence};
 use chrono::{DateTime, Utc};
 #[cfg(feature = "magic-gateway")]
 // NewsProvider 是 method-resolution trait (正文无 :: 用法), 提供
@@ -524,7 +524,7 @@ fn gateway_router_error(provider: Option<ProviderId>, error: RouterError) -> Gat
 #[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
-    use crate::magic_compat::{
+    use crate::market_domain::{
         AssetClass, DataBatch, Exchange, InstrumentId, IsoDate, NonEmptyText, Provenance,
         ProviderId, SourceEvidence,
     };

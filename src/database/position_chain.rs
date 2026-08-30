@@ -341,7 +341,7 @@ impl DatabaseManager {
 #[cfg(test)]
 mod tests {
     use crate::data_gateway::{BatchEvidence, BoardKind, PositionChainAssignment};
-    use crate::magic_compat::ProviderId;
+    use crate::market_domain::ProviderId;
     use diesel::connection::SimpleConnection;
     use diesel::prelude::*;
 

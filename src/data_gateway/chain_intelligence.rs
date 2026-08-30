@@ -20,7 +20,7 @@ use crate::database::data_acquisition_audit::DataAcquisitionAuditRecord;
 #[cfg(feature = "magic-gateway")]
 use crate::database::DatabaseManager;
 #[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{
+use crate::market_domain::{
     AssetClass, DataBatch, Exchange, InstrumentId, LimitPoolEntry, PositiveU32, ProviderId,
 };
 #[cfg(feature = "magic-gateway")]
@@ -1928,7 +1928,7 @@ mod tests {
             ),
             tdx_error(
                 "TEST_CODE_capability",
-                TdxError::Core(crate::magic_compat::NonEmptyText::new("").expect_err("core error")),
+                TdxError::Core(crate::market_domain::NonEmptyText::new("").expect_err("core error")),
             ),
         ];
         assert!(tdx[..6].iter().all(GatewayError::retryable));

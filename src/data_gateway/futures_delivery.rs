@@ -6,9 +6,9 @@ use super::review::{acquisition_request_hash, audit_gateway_result};
 #[cfg(feature = "magic-gateway")]
 use super::BatchEvidence;
 use super::{GatewayBatch, GatewayError};
-use crate::magic_compat::ProviderId;
+use crate::market_domain::ProviderId;
 #[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{DataBatch, PositiveU32};
+use crate::market_domain::{DataBatch, PositiveU32};
 #[cfg(feature = "magic-gateway")]
 use chrono::Datelike;
 use chrono::NaiveDate;
@@ -373,7 +373,7 @@ fn cffex_gateway_error(error: ExchangeError) -> GatewayError {
 #[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
-    use crate::magic_compat::{IsoDate, NonEmptyText, Provenance, SourceEvidence};
+    use crate::market_domain::{IsoDate, NonEmptyText, Provenance, SourceEvidence};
     use magic_exchange_rs::TlsBackend;
     use magic_market_core::HttpsUrl;
 

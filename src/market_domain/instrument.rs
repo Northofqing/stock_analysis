@@ -1,16 +1,11 @@
-//! Exchange / AssetClass / InstrumentId / CoreError 本地镜像 (M5, Task #76,
-//! feature 关时使用)。与上游 magic_market_core (pin rev 75ee2a2,
-//! crates/magic-market-core/src/instrument.rs + error.rs) 同构:
-//! 变体集/字段/serde 表示/校验语义/Display 字符串一致 (wire 是 JSON)。
+//! Locally owned exchange, asset-class, instrument, and core error types.
+//! Variant, field, validation, and serde representations are stable contracts.
 
-#[cfg(not(feature = "magic-gateway"))]
 use serde::{de, Deserialize, Deserializer, Serialize};
-#[cfg(not(feature = "magic-gateway"))]
 use std::fmt;
 
 /// Errors raised while constructing core values.
 /// 与上游同 derive 集 (Debug, PartialEq) + thiserror Display 字符串。
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, PartialEq)]
 pub enum CoreError {
     InvalidValue {
@@ -22,7 +17,6 @@ pub enum CoreError {
     InvalidRequest(String),
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl fmt::Display for CoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -39,11 +33,9 @@ impl fmt::Display for CoreError {
     }
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl std::error::Error for CoreError {}
 
 /// Trading venue.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Exchange {
     Shanghai,
@@ -52,7 +44,6 @@ pub enum Exchange {
 }
 
 /// Instrument category.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AssetClass {
     Equity,
@@ -63,7 +54,6 @@ pub enum AssetClass {
 }
 
 /// Validated exchange instrument identifier.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct InstrumentId {
     exchange: Exchange,
@@ -71,7 +61,6 @@ pub struct InstrumentId {
     asset_class: AssetClass,
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl InstrumentId {
     /// Constructs an identifier.
     pub fn new(
@@ -108,7 +97,6 @@ impl InstrumentId {
     }
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl<'de> Deserialize<'de> for InstrumentId {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

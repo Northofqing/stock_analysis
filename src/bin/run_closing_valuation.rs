@@ -165,7 +165,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use stock_analysis::data_provider::KlineData;
-    use stock_analysis::magic_compat::ProviderId;
+    use stock_analysis::market_domain::ProviderId;
 
     fn evidence() -> BatchEvidence {
         BatchEvidence {

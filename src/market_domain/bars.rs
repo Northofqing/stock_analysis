@@ -1,20 +1,13 @@
-//! BarInterval / Adjustment / Bar 本地镜像 (M5, Task #76, feature 关时使用)。
-//! 与上游 magic_market_core rev 75ee2a2 (provider.rs 1140-1538) 同构:
-//! 字段/derive 集/校验语义/错误字符串逐字一致。
-//! convert.rs (bridge 生产路径) 依赖 Bar 的 Deserialize 表示。
+//! Locally owned bar interval, adjustment, and bar types.
+//! Field and serde representations are stable transport contracts.
 
-#[cfg(not(feature = "magic-gateway"))]
 use serde::{de, Deserialize, Deserializer, Serialize};
 
-#[cfg(not(feature = "magic-gateway"))]
 use super::instrument::{CoreError, InstrumentId};
-#[cfg(not(feature = "magic-gateway"))]
 use super::value::{Money, Price, Quantity};
-#[cfg(not(feature = "magic-gateway"))]
 use super::ProviderId;
 
 /// OHLCV bar granularity.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BarInterval {
     Minute1,
@@ -29,7 +22,6 @@ pub enum BarInterval {
 }
 
 /// Price adjustment applied by the source to a historical bar.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Adjustment {
     Unadjusted,
@@ -37,7 +29,6 @@ pub enum Adjustment {
     Backward,
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 fn valid_iso_date(value: &str) -> bool {
     if value.len() != 10
         || value.as_bytes()[4] != b'-'
@@ -65,7 +56,6 @@ fn valid_iso_date(value: &str) -> bool {
     (1..=days).contains(&day)
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 fn valid_clock_time(value: &str) -> bool {
     if value.len() != 8
         || value.as_bytes()[2] != b':'
@@ -83,7 +73,6 @@ fn valid_clock_time(value: &str) -> bool {
     hour < 24 && minute < 60 && second < 60
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 fn valid_bar_time(value: &str, interval: BarInterval) -> bool {
     match interval {
         BarInterval::Minute1
@@ -102,7 +91,6 @@ fn valid_bar_time(value: &str, interval: BarInterval) -> bool {
     }
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 fn checked_text(field: &'static str, value: impl Into<String>) -> Result<String, CoreError> {
     let value = value.into();
     let trimmed = value.trim();
@@ -123,7 +111,6 @@ fn checked_text(field: &'static str, value: impl Into<String>) -> Result<String,
     Ok(trimmed.to_owned())
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 fn ensure_nonnegative_money(field: &'static str, value: Option<Money>) -> Result<(), CoreError> {
     if let Some(money) = value {
         if money.get() < 0.0 {
@@ -138,7 +125,6 @@ fn ensure_nonnegative_money(field: &'static str, value: Option<Money>) -> Result
 }
 
 /// Provider-neutral OHLCV bar with record-level source evidence.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Bar {
     instrument: InstrumentId,
@@ -157,7 +143,6 @@ pub struct Bar {
     batch_id: String,
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl Bar {
     /// Builds a bar and rejects inconsistent OHLC ranges.
     #[allow(clippy::too_many_arguments)]
@@ -258,7 +243,6 @@ impl Bar {
     }
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl<'de> Deserialize<'de> for Bar {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

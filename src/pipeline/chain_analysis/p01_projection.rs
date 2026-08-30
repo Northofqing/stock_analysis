@@ -11,7 +11,7 @@ use thiserror::Error;
 use crate::data_gateway::{GatewayBatch, ReviewDataGateway};
 use crate::database::concepts::ChainDailyRow;
 use crate::database::DatabaseManager;
-use crate::magic_compat::{LimitPoolEntry, LimitPoolKind, ProviderId};
+use crate::market_domain::{LimitPoolEntry, LimitPoolKind, ProviderId};
 
 const RECORD_HASH_DOMAIN: &[u8] = b"P01_LIMIT_POOL_RECORD_V1\0";
 const CHAIN_ROW_HASH_DOMAIN: &[u8] = b"P01_CHAIN_ROW_V1\0";
@@ -459,7 +459,7 @@ mod tests {
 
     use crate::data_gateway::{BatchEvidence, GatewayBatch};
     use crate::database::DatabaseManager;
-    use crate::magic_compat::{
+    use crate::market_domain::{
         AssetClass, Exchange, InstrumentId, IsoDate, LimitPoolEntry, LimitPoolKind, NonEmptyText,
         PositiveU32, Price, ProviderId, Ratio, RatioUnit, SourceEvidence,
     };

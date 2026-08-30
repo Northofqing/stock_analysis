@@ -118,7 +118,7 @@ impl DataService {
                     audit_state,
                 } => {
                     let exact_server_failure = failure.provider
-                        == Some(crate::magic_compat::ProviderId::Tdx)
+                        == Some(crate::market_domain::ProviderId::Tdx)
                         && crate::data_gateway::grpc_source::benchmark_server_failure_is_exact(
                             audit_outcome,
                             failure.reason_code,

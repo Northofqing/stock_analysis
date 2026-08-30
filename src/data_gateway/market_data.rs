@@ -8,10 +8,10 @@
 //! provider. No consumer-owned HTTP or legacy parser is retained.
 
 #[cfg(all(test, feature = "magic-gateway"))]
-use crate::magic_compat::Exchange;
-use crate::magic_compat::ProviderId;
+use crate::market_domain::Exchange;
+use crate::market_domain::ProviderId;
 #[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{AssetClass, InstrumentId, RatioUnit};
+use crate::market_domain::{AssetClass, InstrumentId, RatioUnit};
 #[cfg(all(test, feature = "magic-gateway"))]
 use chrono::FixedOffset;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -774,7 +774,7 @@ const SHANGHAI_OFFSET_SECONDS: i32 = 8 * 60 * 60;
 fn admit_quote_batch(
     storage_codes: &[String],
     provider: ProviderId,
-    batch: crate::magic_compat::DataBatch<Quote>,
+    batch: crate::market_domain::DataBatch<Quote>,
     mode: QuoteAdmissionMode,
 ) -> Result<GatewayBatch<RealtimeMarketQuote>, GatewayError> {
     admit_quote_batch_at(Utc::now(), storage_codes, provider, batch, mode)
@@ -786,7 +786,7 @@ fn admit_quote_batch_at(
     now: DateTime<Utc>,
     storage_codes: &[String],
     provider: ProviderId,
-    batch: crate::magic_compat::DataBatch<Quote>,
+    batch: crate::market_domain::DataBatch<Quote>,
     mode: QuoteAdmissionMode,
 ) -> Result<GatewayBatch<RealtimeMarketQuote>, GatewayError> {
     let evidence = BatchEvidence::from_provenance(provider, batch.provenance())?;
@@ -1089,7 +1089,7 @@ fn classify_sina_error(error: SinaError) -> SourceError {
 #[cfg(all(test, feature = "magic-gateway"))]
 mod tests {
     use super::*;
-    use crate::magic_compat::{
+    use crate::market_domain::{
         DataBatch, Money, Price, Provenance, Quantity, Ratio, SourceEvidence,
     };
 

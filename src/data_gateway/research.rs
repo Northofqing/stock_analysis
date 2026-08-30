@@ -6,9 +6,9 @@ use super::review::{acquisition_request_hash, audit_gateway_result};
 #[cfg(feature = "magic-gateway")]
 use super::BatchEvidence;
 use super::{GatewayBatch, GatewayError};
-use crate::magic_compat::ProviderId;
+use crate::market_domain::ProviderId;
 #[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{DataBatch, PositiveU32};
+use crate::market_domain::{DataBatch, PositiveU32};
 #[cfg(feature = "magic-gateway")]
 use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
 #[cfg(feature = "magic-gateway")]
@@ -196,7 +196,7 @@ fn normalize_reports_batch(
 
 #[cfg(feature = "magic-gateway")]
 fn validate_record_evidence(
-    record: &crate::magic_compat::SourceEvidence,
+    record: &crate::market_domain::SourceEvidence,
     batch: &BatchEvidence,
 ) -> Result<(), GatewayError> {
     if record.provider() != batch.provider
@@ -217,7 +217,7 @@ fn validate_code(code: &str) -> Result<&str, GatewayError> {
     Ok(code)
 }
 
-fn a_share_instrument(code: &str) -> Result<crate::magic_compat::InstrumentId, GatewayError> {
+fn a_share_instrument(code: &str) -> Result<crate::market_domain::InstrumentId, GatewayError> {
     #[cfg(test)]
     let resolved = super::instrument_identity::resolve_test_equity(code, None);
     #[cfg(not(test))]
@@ -277,7 +277,7 @@ fn eastmoney_gateway_error(error: EastmoneyError) -> GatewayError {
 #[cfg(feature = "magic-gateway")]
 mod tests {
     use super::{build_request, eastmoney_gateway_error, normalize_reports_batch};
-    use crate::magic_compat::{
+    use crate::market_domain::{
         AssetClass, DataBatch, Exchange, InstrumentId, NonEmptyText, Price, Provenance, ProviderId,
         SourceEvidence,
     };

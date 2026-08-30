@@ -1,16 +1,11 @@
-//! MarketRankingKind / MarketRankingUnit / GlobalIndexCode / FxPair
-//! 本地镜像 (M5, Task #76, feature 关时使用)。
-//! 与上游 magic_market_core rev 75ee2a2 (signals.rs + global.rs) 同构:
-//! 变体集/serde 表示一致 (wire 是 JSON, convert.rs 依赖)。
+//! Locally owned ranking, global-index, and FX-pair types.
+//! Variant and serde representations are stable transport contracts.
 
-#[cfg(not(feature = "magic-gateway"))]
 use serde::{Deserialize, Serialize};
 
-#[cfg(not(feature = "magic-gateway"))]
 use super::evidence::NonEmptyText;
 
 /// Ranking metric identity.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MarketRankingKind {
     VolumeRatio,
@@ -23,7 +18,6 @@ pub enum MarketRankingKind {
 }
 
 /// Unit carried by a ranking metric.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MarketRankingUnit {
     /// Turnover volume divided by the comparable recent average.
@@ -39,7 +33,6 @@ pub enum MarketRankingUnit {
 }
 
 /// Side of a dragon-tiger (LHB) disclosure seat.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DragonTigerSide {
     Buy,
@@ -47,7 +40,6 @@ pub enum DragonTigerSide {
 }
 
 /// Global equity-index identity.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum GlobalIndexCode {
     DowJones,
@@ -59,7 +51,6 @@ pub enum GlobalIndexCode {
 }
 
 /// Foreign-exchange currency-pair identity.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FxPair {
     UsdCny,

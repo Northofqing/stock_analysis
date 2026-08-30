@@ -564,7 +564,7 @@ mod tests_monitor_historical_gateway_projection {
     };
     use stock_analysis::data_gateway::BatchEvidence;
     use stock_analysis::data_provider::{AdjustType, KlineData};
-    use stock_analysis::magic_compat::ProviderId;
+    use stock_analysis::market_domain::ProviderId;
 
     fn evidence() -> BatchEvidence {
         BatchEvidence {
@@ -3998,7 +3998,7 @@ mod tests_br238_opening_readiness {
     use stock_analysis::data_gateway::grpc_source::{
         OpeningReadinessReport, OpeningRouteReadiness,
     };
-    use stock_analysis::magic_compat::ProviderId;
+    use stock_analysis::market_domain::ProviderId;
 
     #[test]
     fn br238_readiness_banners_are_stable_and_secret_free() {
@@ -8103,7 +8103,7 @@ async fn prepare_holding_plan_messages(
 ) -> Result<Vec<PreparedHoldingPlan>, String> {
     use sha2::{Digest, Sha256};
     use stock_analysis::database::user_position_snapshot::latest_user_position_snapshot;
-    use stock_analysis::magic_compat::{AssetClass, Exchange, InstrumentId};
+    use stock_analysis::market_domain::{AssetClass, Exchange, InstrumentId};
 
     let snapshot = latest_user_position_snapshot()
         .map_err(|error| format!("持仓快照读取失败: {error}"))?
@@ -8220,7 +8220,7 @@ async fn prepare_close_call_messages(
 ) -> Result<Vec<PreparedCloseCall>, String> {
     use sha2::{Digest, Sha256};
     use stock_analysis::database::user_position_snapshot::latest_user_position_snapshot;
-    use stock_analysis::magic_compat::{AssetClass, Exchange, InstrumentId};
+    use stock_analysis::market_domain::{AssetClass, Exchange, InstrumentId};
 
     let snapshot = latest_user_position_snapshot()
         .map_err(|error| format!("持仓快照读取失败: {error}"))?
@@ -11366,7 +11366,7 @@ mod tests_v17_4_d {
         stock_analysis::data_gateway::GatewayBatch::Available {
             records,
             evidence: stock_analysis::data_gateway::BatchEvidence {
-                provider: stock_analysis::magic_compat::ProviderId::Eastmoney,
+                provider: stock_analysis::market_domain::ProviderId::Eastmoney,
                 source: "TEST_CODE_eastmoney-board-flow".to_owned(),
                 source_at: Some("1785290400.000000000".to_owned()),
                 observed_at: "1785290401.000000000".to_owned(),
@@ -12082,7 +12082,7 @@ mod tests_br140_review_chain_isolation {
             },
         ];
         let evidence = stock_analysis::data_gateway::BatchEvidence {
-            provider: stock_analysis::magic_compat::ProviderId::Eastmoney,
+            provider: stock_analysis::market_domain::ProviderId::Eastmoney,
             source: "TEST_CODE_eastmoney-web".to_string(),
             source_at: Some("2099-01-02".to_string()),
             observed_at: "2099-01-02T16:00:00+08:00".to_string(),

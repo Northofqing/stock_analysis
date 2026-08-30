@@ -2,9 +2,9 @@
 //! Unified A-01/R-03 provider admission, evidence retention and acquisition audit.
 
 #[cfg(feature = "magic-gateway")]
-use crate::magic_compat::IsoDate;
-use crate::magic_compat::ProviderId;
-use crate::magic_compat::{LimitPoolEntry, LimitPoolKind, PositiveU32};
+use crate::market_domain::IsoDate;
+use crate::market_domain::ProviderId;
+use crate::market_domain::{LimitPoolEntry, LimitPoolKind, PositiveU32};
 use chrono::NaiveDate;
 #[cfg(feature = "magic-gateway")]
 use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
@@ -98,7 +98,7 @@ pub struct BatchEvidence {
 impl BatchEvidence {
     pub fn from_provenance(
         provider: ProviderId,
-        provenance: &crate::magic_compat::Provenance,
+        provenance: &crate::market_domain::Provenance,
     ) -> Result<Self, GatewayError> {
         let batch_id = provenance.batch_id().ok_or_else(|| {
             GatewayError::invalid_evidence(
@@ -1128,7 +1128,7 @@ pub(crate) fn route_exact_date_upper_limit_pool(
 fn validate_routed_limit_pool_batch(
     capability: &'static str,
     provider: ProviderId,
-    batch: &crate::magic_compat::DataBatch<LimitPoolEntry>,
+    batch: &crate::market_domain::DataBatch<LimitPoolEntry>,
     expected_date: NaiveDate,
 ) -> Result<(), GatewayError> {
     if !matches!(provider, ProviderId::Eastmoney | ProviderId::Tonghuashun) {
@@ -1605,7 +1605,7 @@ mod tests {
         AttributionDatabaseAccess, AttributionDatabaseSession,
     };
     use crate::database::DatabaseManager;
-    use crate::magic_compat::{
+    use crate::market_domain::{
         AssetClass, DataBatch, Exchange, InstrumentId, IsoDate, Money, NonEmptyText, Price,
         Provenance, Quantity, Ratio, RatioUnit, SourceEvidence,
     };
@@ -1891,7 +1891,7 @@ mod tests {
             .expect("batch id");
 
         let evidence =
-            BatchEvidence::from_provenance(crate::magic_compat::ProviderId::Tdx, &provenance)
+            BatchEvidence::from_provenance(crate::market_domain::ProviderId::Tdx, &provenance)
                 .expect("valid evidence");
 
         assert_eq!(evidence.source, "TEST_CODE_tdx-smart");
@@ -1903,7 +1903,7 @@ mod tests {
     #[test]
     fn br158_verified_empty_is_not_unavailable() {
         let evidence = BatchEvidence {
-            provider: crate::magic_compat::ProviderId::Tdx,
+            provider: crate::market_domain::ProviderId::Tdx,
             source: "TEST_CODE_tdx-smart".to_string(),
             source_at: Some("2099-01-02".to_string()),
             observed_at: "2099-01-02T10:00:00+08:00".to_string(),
@@ -1916,7 +1916,7 @@ mod tests {
 
         let unavailable = GatewayError::unavailable(
             "A-01",
-            Some(crate::magic_compat::ProviderId::Tdx),
+            Some(crate::market_domain::ProviderId::Tdx),
             true,
             "TEST_CODE transport unavailable",
         );

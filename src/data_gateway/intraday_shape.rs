@@ -4,7 +4,7 @@
 //! batch. Prices, previous close, and five-minute bars are never joined from
 //! different providers or batches.
 
-use crate::magic_compat::ProviderId;
+use crate::market_domain::ProviderId;
 use chrono::{DateTime, Local, NaiveDate, NaiveTime, SecondsFormat, Utc};
 
 use super::instrument_identity::resolve_production_equity;
@@ -463,10 +463,10 @@ mod tests {
             })
             .collect();
         let record = MagicTdxT0Evidence {
-            instrument: crate::magic_compat::InstrumentId::new(
-                crate::magic_compat::Exchange::Shanghai,
+            instrument: crate::market_domain::InstrumentId::new(
+                crate::market_domain::Exchange::Shanghai,
                 "TEST_CODE_600396",
-                crate::magic_compat::AssetClass::Equity,
+                crate::market_domain::AssetClass::Equity,
             )
             .unwrap(),
             code: "TEST_CODE_600396".to_owned(),
@@ -555,10 +555,10 @@ mod tests {
         );
 
         let mut instrument_mismatched = fixture();
-        instrument_mismatched.records[0].instrument = crate::magic_compat::InstrumentId::new(
-            crate::magic_compat::Exchange::Shanghai,
+        instrument_mismatched.records[0].instrument = crate::market_domain::InstrumentId::new(
+            crate::market_domain::Exchange::Shanghai,
             "TEST_CODE_600397",
-            crate::magic_compat::AssetClass::Equity,
+            crate::market_domain::AssetClass::Equity,
         )
         .unwrap();
         assert_eq!(

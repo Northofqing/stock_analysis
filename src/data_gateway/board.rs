@@ -27,8 +27,8 @@ use super::instrument_identity::resolve_test_equity;
 #[cfg(feature = "magic-gateway")]
 use super::instrument_identity::{CanonicalEquityIdentity, EquityIdentityError};
 #[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{DataBatch, NonEmptyText, PositiveU32, SourceEvidence};
-use crate::magic_compat::{Exchange, ProviderId};
+use crate::market_domain::{DataBatch, NonEmptyText, PositiveU32, SourceEvidence};
+use crate::market_domain::{Exchange, ProviderId};
 use crate::selection::schema_v2::{
     canonical_json as schema_canonical_json, sha256_bytes as schema_sha256_bytes,
     sha256_json as schema_sha256_json, ArtifactHashPreimage as SchemaArtifactHashPreimage,
@@ -1500,7 +1500,7 @@ const fn exchange_token(exchange: Exchange) -> &'static str {
 #[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
-    use crate::magic_compat::{AssetClass, InstrumentId, NonEmptyText, Provenance, SourceEvidence};
+    use crate::market_domain::{AssetClass, InstrumentId, NonEmptyText, Provenance, SourceEvidence};
 
     const TEST_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 

@@ -1,23 +1,16 @@
-//! NonEmptyText / SourceEvidence / EvidenceTimestamp 本地镜像 (M5, Task #76,
-//! feature 关时使用)。与上游 magic_market_core (pin rev 75ee2a2,
-//! crates/magic-market-core/src/validated.rs + evidence.rs + probe.rs) 同构:
-//! 字段/serde 表示/校验语义/时间格式接受逻辑一致 (wire 是 JSON)。
+//! Locally owned NonEmptyText, SourceEvidence, and EvidenceTimestamp types.
+//! Field, validation, and serde representations are stable transport contracts.
 
-#[cfg(not(feature = "magic-gateway"))]
 use serde::{de, Deserialize, Deserializer, Serialize};
-#[cfg(not(feature = "magic-gateway"))]
 use std::fmt;
 
-#[cfg(not(feature = "magic-gateway"))]
 const MAX_TEXT_CHARS: usize = 16_384;
 
 /// Trimmed, non-empty, control-free text bounded for untrusted source payloads.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct NonEmptyText(String);
 
-#[cfg(not(feature = "magic-gateway"))]
 impl NonEmptyText {
     pub fn new(value: impl Into<String>) -> Result<Self, super::instrument::CoreError> {
         let value = value.into();
@@ -55,14 +48,12 @@ impl NonEmptyText {
     }
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl fmt::Display for NonEmptyText {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl<'de> Deserialize<'de> for NonEmptyText {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -73,7 +64,6 @@ impl<'de> Deserialize<'de> for NonEmptyText {
 }
 
 /// Record-level source and observation evidence.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SourceEvidence {
     provider: super::provider_id::ProviderId,
@@ -82,7 +72,6 @@ pub struct SourceEvidence {
     batch_id: NonEmptyText,
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl SourceEvidence {
     pub fn new(
         provider: super::provider_id::ProviderId,
@@ -122,7 +111,6 @@ impl SourceEvidence {
     }
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl<'de> Deserialize<'de> for SourceEvidence {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -152,13 +140,11 @@ impl<'de> Deserialize<'de> for SourceEvidence {
 ///
 /// This type intentionally carries no "source" or "observed" role. Callers must
 /// keep those roles explicit and must never substitute one for the other.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EvidenceTimestamp {
     unix_nanos: i128,
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl EvidenceTimestamp {
     /// Parses the timestamp formats accepted by provider admission.
     pub fn parse(value: &str) -> Result<Self, super::instrument::CoreError> {
@@ -188,15 +174,12 @@ impl EvidenceTimestamp {
     }
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 const NANOS_PER_SECOND: i128 = 1_000_000_000;
-#[cfg(not(feature = "magic-gateway"))]
 const NANOS_PER_MILLISECOND: i128 = 1_000_000;
 
 // ---- 以下镜像 probe.rs 的 parse_evidence_time + is_unambiguous_instant ----
 // (格式接受语义是 admission 契约, 与上游逐分支一致; 变更必须对照上游)
 
-#[cfg(not(feature = "magic-gateway"))]
 fn is_unambiguous_instant(value: &str) -> bool {
     if let Some(millis) = value.strip_prefix("unix-ms:") {
         return !millis.is_empty() && millis.bytes().all(|byte| byte.is_ascii_digit());
@@ -232,7 +215,6 @@ fn is_unambiguous_instant(value: &str) -> bool {
             && suffix.as_bytes().get(3) == Some(&b':')
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 fn parse_evidence_time(value: &str) -> Option<i128> {
     if let Some(millis) = value.strip_prefix("unix-ms:") {
         if millis.is_empty() || !millis.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -326,14 +308,12 @@ fn parse_evidence_time(value: &str) -> Option<i128> {
         .and_then(|nanos| nanos.checked_add(fraction_nanos))
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 fn epoch_with_fraction(seconds: &str, fraction: &str) -> Option<i128> {
     i128::from(seconds.parse::<i64>().ok()?)
         .checked_mul(NANOS_PER_SECOND)?
         .checked_add(fraction_to_nanos(fraction)?)
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 fn fraction_to_nanos(fraction: &str) -> Option<i128> {
     if fraction.is_empty()
         || fraction.len() > 9
@@ -345,7 +325,6 @@ fn fraction_to_nanos(fraction: &str) -> Option<i128> {
     parsed.checked_mul(10_i128.pow(u32::try_from(9 - fraction.len()).ok()?))
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 fn parse_component(bytes: &[u8], start: usize, end: usize) -> Option<i64> {
     let text = std::str::from_utf8(bytes.get(start..end)?).ok()?;
     text.bytes()
@@ -353,7 +332,6 @@ fn parse_component(bytes: &[u8], start: usize, end: usize) -> Option<i64> {
         .then(|| text.parse().ok())?
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 fn days_in_month(year: i64, month: i64) -> i64 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -364,7 +342,6 @@ fn days_in_month(year: i64, month: i64) -> i64 {
     }
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
     let adjusted_year = year.checked_sub(i64::from(month <= 2))?;
     let era = adjusted_year.div_euclid(400);

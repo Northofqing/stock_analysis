@@ -2,7 +2,7 @@
 
 //! BR-156/BR-164 Magic TDX Gateway evidence adapter for event-scoped selection.
 
-use crate::magic_compat::Exchange;
+use crate::market_domain::Exchange;
 use crate::selection::model::{
     DirectMentionEvidence, SecurityIdentity, SecurityMarket, SecurityMasterSnapshot,
 };

@@ -7,8 +7,8 @@ use super::review::{acquisition_request_hash, audit_gateway_result};
 use super::BatchEvidence;
 use super::{GatewayBatch, GatewayError};
 #[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{DataBatch, PositiveU32};
-use crate::magic_compat::{ProviderId, SourceEvidence};
+use crate::market_domain::{DataBatch, PositiveU32};
+use crate::market_domain::{ProviderId, SourceEvidence};
 use chrono::{DateTime, Utc};
 #[cfg(feature = "magic-gateway")]
 use chrono::{FixedOffset, NaiveDateTime, TimeZone};
@@ -394,7 +394,7 @@ fn parse_observed_at(value: &str) -> Result<DateTime<Utc>, GatewayError> {
 }
 
 #[cfg(feature = "magic-gateway")]
-fn optional_text(value: Option<crate::magic_compat::NonEmptyText>) -> Option<String> {
+fn optional_text(value: Option<crate::market_domain::NonEmptyText>) -> Option<String> {
     value.map(|value| value.as_str().to_owned())
 }
 
@@ -424,7 +424,7 @@ fn jin10_gateway_error(error: Jin10Error) -> GatewayError {
 #[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
-    use crate::magic_compat::{
+    use crate::market_domain::{
         DataBatch, NonEmptyText, PositiveU32, Provenance, ProviderId, SourceEvidence,
     };
     use magic_market_core::EconomicEvent;

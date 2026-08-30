@@ -7,9 +7,9 @@ use super::review::{acquisition_request_hash, audit_gateway_result};
 use super::BatchEvidence;
 use super::GatewayBatch;
 use super::GatewayError;
-use crate::magic_compat::ProviderId;
+use crate::market_domain::ProviderId;
 #[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{DataBatch, IsoDate, PositiveU32};
+use crate::market_domain::{DataBatch, IsoDate, PositiveU32};
 use chrono::{DateTime, NaiveDate, Utc};
 #[cfg(feature = "magic-gateway")]
 use magic_cninfo_rs::{CninfoClient, CninfoError};
@@ -417,7 +417,7 @@ fn parse_observed_at(value: &str) -> Result<DateTime<Utc>, GatewayError> {
 #[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
-    use crate::magic_compat::{
+    use crate::market_domain::{
         AssetClass, DataBatch, Exchange, InstrumentId, NonEmptyText, Provenance, ProviderId,
         SourceEvidence,
     };

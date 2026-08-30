@@ -4,7 +4,7 @@ use crate::data_gateway::{
     BatchEvidence, BoardDataGateway, BoardKind, BoardMembershipRecord, GatewayBatch, GatewayError,
 };
 use crate::database::DatabaseManager;
-use crate::magic_compat::ProviderId;
+use crate::market_domain::ProviderId;
 use futures::{stream, StreamExt};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -379,7 +379,7 @@ pub async fn refresh_position_chains(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::magic_compat::ProviderId;
+    use crate::market_domain::ProviderId;
     use std::collections::BTreeMap;
 
     fn evidence() -> BatchEvidence {

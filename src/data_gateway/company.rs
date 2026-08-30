@@ -4,10 +4,10 @@
 //! line-item keys, units or explicit missing values. Market statistics retain
 //! every optional field as `Option`; absence is never converted to zero.
 
-use crate::magic_compat::ProviderId;
+use crate::market_domain::ProviderId;
 #[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{DataBatch, Exchange, InstrumentId, RatioUnit};
-pub use crate::magic_compat::{FinancialLine, FinancialStatement, MarketStatistics, StatementKind};
+use crate::market_domain::{DataBatch, Exchange, InstrumentId, RatioUnit};
+pub use crate::market_domain::{FinancialLine, FinancialStatement, MarketStatistics, StatementKind};
 #[cfg(feature = "magic-gateway")]
 use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone, Utc};
 #[cfg(feature = "magic-gateway")]
@@ -983,7 +983,7 @@ fn classify_tencent_error(error: TencentError) -> SourceError {
 #[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
-    use crate::magic_compat::{
+    use crate::market_domain::{
         Exchange, FiniteNumber, IsoDate, Money, NonEmptyText, Price, Provenance, Ratio,
         SourceEvidence,
     };
@@ -1869,7 +1869,7 @@ mod tests {
             SinaError::Decode("TEST_CODE".to_owned()),
             SinaError::Protocol("TEST_CODE".to_owned()),
             SinaError::Unsupported("TEST_CODE".to_owned()),
-            SinaError::Core(crate::magic_compat::CoreError::InvalidRequest(
+            SinaError::Core(crate::market_domain::CoreError::InvalidRequest(
                 "TEST_CODE".to_owned(),
             )),
         ] {
@@ -1885,7 +1885,7 @@ mod tests {
             TencentError::Decode("TEST_CODE".to_owned()),
             TencentError::Protocol("TEST_CODE".to_owned()),
             TencentError::Unsupported("TEST_CODE".to_owned()),
-            TencentError::Core(crate::magic_compat::CoreError::InvalidRequest(
+            TencentError::Core(crate::market_domain::CoreError::InvalidRequest(
                 "TEST_CODE".to_owned(),
             )),
         ] {

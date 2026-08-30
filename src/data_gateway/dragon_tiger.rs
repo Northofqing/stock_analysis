@@ -7,8 +7,8 @@ use super::review::{acquisition_request_hash, audit_gateway_result};
 use super::BatchEvidence;
 use super::{GatewayBatch, GatewayError};
 #[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{AssetClass, IsoDate, PositiveU32};
-use crate::magic_compat::{DragonTigerSide, Exchange, ProviderId};
+use crate::market_domain::{AssetClass, IsoDate, PositiveU32};
+use crate::market_domain::{DragonTigerSide, Exchange, ProviderId};
 use chrono::NaiveDate;
 #[cfg(feature = "magic-gateway")]
 use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
@@ -359,7 +359,7 @@ fn validate_instrument(asset_class: AssetClass, code: &str) -> Result<(), Gatewa
 
 #[cfg(feature = "magic-gateway")]
 fn validate_record_evidence(
-    record: &crate::magic_compat::SourceEvidence,
+    record: &crate::market_domain::SourceEvidence,
     batch: &BatchEvidence,
 ) -> Result<(), GatewayError> {
     if record.provider() != ProviderId::Eastmoney
@@ -565,7 +565,7 @@ fn router_gateway_error(provider: Option<ProviderId>, error: RouterError) -> Gat
 #[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
-    use crate::magic_compat::{InstrumentId, Money, NonEmptyText, SourceEvidence};
+    use crate::market_domain::{InstrumentId, Money, NonEmptyText, SourceEvidence};
     use magic_market_core::{DragonTigerEntry, DragonTigerSeat};
 
     fn disclosure(

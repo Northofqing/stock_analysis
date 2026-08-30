@@ -106,7 +106,7 @@ mod tests {
     use super::*;
     use crate::data_gateway::BatchEvidence;
     use crate::data_provider::AdjustType;
-    use crate::magic_compat::ProviderId;
+    use crate::market_domain::ProviderId;
 
     fn kline(date: chrono::NaiveDate) -> KlineData {
         KlineData {

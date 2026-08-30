@@ -469,7 +469,7 @@ mod tests {
     use super::*;
     use crate::data_gateway::{AdmittedDailyBars, BatchEvidence};
     use crate::data_provider::{AdjustType, KlineData};
-    use crate::magic_compat::ProviderId;
+    use crate::market_domain::ProviderId;
 
     fn unique_code(label: &str) -> String {
         format!(

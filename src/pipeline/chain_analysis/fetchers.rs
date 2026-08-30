@@ -483,7 +483,7 @@ mod tests {
         resolve_after_market_catalysts, resolve_cluster_news,
     };
     use crate::data_gateway::DragonTigerStockReview;
-    use crate::magic_compat::Exchange;
+    use crate::market_domain::Exchange;
     use std::collections::{HashMap, HashSet};
 
     fn search_result(

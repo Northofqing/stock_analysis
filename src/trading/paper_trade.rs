@@ -17,7 +17,7 @@
 //!
 //! v16.3 Commit 1: evaluate 改签名接 quote_price, 加 5 态 Invalidated (滑点 > MAX_SLIPPAGE_PCT=2%)
 
-use crate::magic_compat::InstrumentId;
+use crate::market_domain::InstrumentId;
 use chrono::NaiveDate;
 use diesel::prelude::*;
 use serde::Serialize;
@@ -1234,10 +1234,10 @@ mod tests {
         PaperTradeTerminalBindingV1::new(
             7,
             "TEST_CODE_PLAN_BR192",
-            crate::magic_compat::InstrumentId::new(
-                crate::magic_compat::Exchange::Shanghai,
+            crate::market_domain::InstrumentId::new(
+                crate::market_domain::Exchange::Shanghai,
                 "TEST_CODE_600001",
-                crate::magic_compat::AssetClass::Equity,
+                crate::market_domain::AssetClass::Equity,
             )
             .unwrap(),
             chrono::NaiveDate::from_ymd_opt(2026, 7, 30).unwrap(),

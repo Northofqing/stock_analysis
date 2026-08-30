@@ -1275,7 +1275,7 @@ mod tests {
     use crate::data_provider::consensus::{ConsensusData, RecentReport};
     use crate::data_provider::{AdjustType, KlineData};
     use crate::indicators::DivergenceType;
-    use crate::magic_compat::ProviderId;
+    use crate::market_domain::ProviderId;
     use crate::notification::NotificationService;
     use crate::strategy::{BollMacdAction, BollMacdSignal};
     use crate::trend_analyzer::{BuySignal, StockTrendAnalyzer, TrendAnalysisResult};

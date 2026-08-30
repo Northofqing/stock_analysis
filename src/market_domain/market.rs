@@ -1,22 +1,14 @@
-//! LimitPoolKind / LimitPoolEntry / StatementKind / FinancialLine /
-//! FinancialStatement / MarketStatistics 本地镜像 (M5, Task #76, feature 关时使用)。
-//! 与上游 magic_market_core rev 75ee2a2 (limit_pool.rs + company.rs + enrichment.rs)
-//! 同构: 字段/serde 表示/校验语义一致 (wire 是 JSON, convert.rs 依赖)。
+//! Locally owned limit-pool, financial-statement, and market-statistics types.
+//! Field and serde representations are stable transport contracts.
 
-#[cfg(not(feature = "magic-gateway"))]
 use serde::{de, Deserialize, Deserializer, Serialize};
 
-#[cfg(not(feature = "magic-gateway"))]
 use super::evidence::{NonEmptyText, SourceEvidence};
-#[cfg(not(feature = "magic-gateway"))]
 use super::instrument::InstrumentId;
-#[cfg(not(feature = "magic-gateway"))]
 use super::record::IsoDate;
-#[cfg(not(feature = "magic-gateway"))]
 use super::value::{FiniteNumber, Money, PositiveU32, Price, Quantity, Ratio};
 
 /// Kind of price-limit pool (board) membership.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LimitPoolKind {
     Upper,
@@ -26,7 +18,6 @@ pub enum LimitPoolKind {
 }
 
 /// A single record from a price-limit pool.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LimitPoolEntry {
     pub kind: LimitPoolKind,
@@ -50,7 +41,6 @@ pub struct LimitPoolEntry {
 }
 
 /// Financial-statement family.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StatementKind {
     Balance,
@@ -59,7 +49,6 @@ pub enum StatementKind {
 }
 
 /// A single line of a financial statement.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FinancialLine {
     pub key: NonEmptyText,
@@ -69,7 +58,6 @@ pub struct FinancialLine {
 }
 
 /// One reported financial statement.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FinancialStatement {
     pub instrument: InstrumentId,
@@ -82,7 +70,6 @@ pub struct FinancialStatement {
 }
 
 /// Valuation, capitalization and trading statistics adjacent to a quote.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MarketStatistics {
     instrument: InstrumentId,
@@ -98,7 +85,6 @@ pub struct MarketStatistics {
     evidence: SourceEvidence,
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl MarketStatistics {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -176,7 +162,6 @@ impl MarketStatistics {
     }
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 fn ensure_nonnegative(
     field: &'static str,
     value: Option<Money>,
@@ -193,7 +178,6 @@ fn ensure_nonnegative(
     Ok(())
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Deserialize)]
 struct MarketStatisticsWire {
     instrument: InstrumentId,
@@ -209,7 +193,6 @@ struct MarketStatisticsWire {
     evidence: SourceEvidence,
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl<'de> Deserialize<'de> for MarketStatistics {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

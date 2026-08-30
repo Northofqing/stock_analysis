@@ -13,7 +13,7 @@
 //!
 //! 纯计算函数与网络/DB 薄壳分离: 单测不依赖网络。
 
-use crate::magic_compat::SecurityBar;
+use crate::market_domain::SecurityBar;
 use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 
 use crate::data_gateway::historical_bars::HistoricalBarsGateway;

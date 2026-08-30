@@ -6,7 +6,7 @@
 //!
 //! Business rules: BR-092, BR-151, BR-153, BR-171, BR-187.
 
-use crate::magic_compat::{InstrumentId, ProviderId};
+use crate::market_domain::{InstrumentId, ProviderId};
 use anyhow::{anyhow, Result};
 #[cfg(feature = "magic-gateway")]
 use chrono::TimeZone;
@@ -269,9 +269,9 @@ fn normalized_identity(code: &str) -> Result<T0RequestIdentity> {
         ));
     }
     let market = match identity.exchange() {
-        crate::magic_compat::Exchange::Shanghai => 1,
-        crate::magic_compat::Exchange::Shenzhen => 0,
-        crate::magic_compat::Exchange::Beijing => 2,
+        crate::market_domain::Exchange::Shanghai => 1,
+        crate::market_domain::Exchange::Shenzhen => 0,
+        crate::market_domain::Exchange::Beijing => 2,
     };
     Ok(T0RequestIdentity {
         market,

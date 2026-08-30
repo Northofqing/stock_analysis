@@ -1660,7 +1660,7 @@ mod tests {
         GlobalNewsRecord,
         crate::data_gateway::BatchEvidence,
     ) {
-        use crate::magic_compat::{ProviderId, SourceEvidence};
+        use crate::market_domain::{ProviderId, SourceEvidence};
         use chrono::{DateTime, Utc};
 
         let provider = GlobalNewsProvider::Jin10;
@@ -1756,7 +1756,7 @@ mod tests {
 
     #[test]
     fn flash_fact_with_mismatched_record_batch_is_rejected() {
-        use crate::magic_compat::{ProviderId, SourceEvidence};
+        use crate::market_domain::{ProviderId, SourceEvidence};
         use chrono::{DateTime, Utc};
 
         let (provider, mut record, batch_evidence) =

@@ -13,7 +13,7 @@ use crate::data_gateway::{
     BatchEvidence, GatewayBatch, GatewayError, GlobalNewsGateway, GlobalNewsProvider,
     GlobalNewsRecord,
 };
-use crate::magic_compat::ProviderId;
+use crate::market_domain::ProviderId;
 use crate::signal::market_event::MarketEvent;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -1087,7 +1087,7 @@ fn classify_gateway_error(error: &GatewayError) -> (&'static str, &'static str, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::magic_compat::{ProviderId, SourceEvidence};
+    use crate::market_domain::{ProviderId, SourceEvidence};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct TypedFixturePort {

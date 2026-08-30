@@ -194,7 +194,7 @@ mod tests {
     use chrono::Local;
     use stock_analysis::data_gateway::BatchEvidence;
     use stock_analysis::data_provider::KlineData;
-    use stock_analysis::magic_compat::ProviderId;
+    use stock_analysis::market_domain::ProviderId;
 
     fn evidence() -> BatchEvidence {
         BatchEvidence {

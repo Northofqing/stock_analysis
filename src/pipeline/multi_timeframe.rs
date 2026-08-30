@@ -230,7 +230,7 @@ fn finish_bar(pending: PendingBar, shanghai: &FixedOffset) -> MinuteBar {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::magic_compat::ProviderId;
+    use crate::market_domain::ProviderId;
     use chrono::TimeZone;
 
     fn bars(count: usize, step_minutes: i64) -> Vec<MinuteBar> {

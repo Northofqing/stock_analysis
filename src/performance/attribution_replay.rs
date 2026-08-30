@@ -5679,7 +5679,7 @@ mod tests {
     use crate::database::order_audit::{
         canonical_order_audit_record_hash, CanonicalOrderAuditRow, AUDIT_CHAIN_GENESIS,
     };
-    use crate::magic_compat::ProviderId;
+    use crate::market_domain::ProviderId;
 
     fn date(raw: &str) -> NaiveDate {
         NaiveDate::parse_from_str(raw, "%Y-%m-%d").unwrap()

@@ -1,20 +1,15 @@
-//! RatioUnit / Ratio / Price / Quantity / Money / FiniteNumber / PositiveU32
-//! 本地镜像 (M5, Task #76, feature 关时使用)。
-//! 与上游 magic_market_core rev 75ee2a2 (value.rs + validated.rs) 同构:
-//! derive 集/校验语义/serde 表示一致 (wire 是 JSON, convert.rs 依赖)。
+//! Locally owned validated numeric and financial value types.
+//! Validation and serde representations are stable transport contracts.
 
-#[cfg(not(feature = "magic-gateway"))]
 use serde::{de, Deserialize, Deserializer, Serialize};
 
 /// Unit for a ratio.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RatioUnit {
     Decimal,
     Percent,
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 macro_rules! finite_type {
     ($name:ident, $field:literal, $pred:expr, $reason:literal) => {
         #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -50,25 +45,20 @@ macro_rules! finite_type {
     };
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 finite_type!(Price, "price", |v: f64| v > 0.0, "must be positive");
-#[cfg(not(feature = "magic-gateway"))]
 finite_type!(
     Quantity,
     "quantity",
     |v: f64| v >= 0.0,
     "must be non-negative"
 );
-#[cfg(not(feature = "magic-gateway"))]
 finite_type!(Money, "money", |_v: f64| true, "must be finite");
 
 /// Any finite signed scalar supplied by a source or deterministic analysis.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct FiniteNumber(f64);
 
-#[cfg(not(feature = "magic-gateway"))]
 impl FiniteNumber {
     pub fn new(value: f64) -> Result<Self, super::instrument::CoreError> {
         if !value.is_finite() {
@@ -86,7 +76,6 @@ impl FiniteNumber {
     }
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl<'de> Deserialize<'de> for FiniteNumber {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -97,12 +86,10 @@ impl<'de> Deserialize<'de> for FiniteNumber {
 }
 
 /// Positive one-based count or rank.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct PositiveU32(u32);
 
-#[cfg(not(feature = "magic-gateway"))]
 impl PositiveU32 {
     pub fn new(value: u32) -> Result<Self, super::instrument::CoreError> {
         if value == 0 {
@@ -120,7 +107,6 @@ impl PositiveU32 {
     }
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl<'de> Deserialize<'de> for PositiveU32 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -131,14 +117,12 @@ impl<'de> Deserialize<'de> for PositiveU32 {
 }
 
 /// A finite decimal or percentage ratio.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Ratio {
     value: f64,
     unit: RatioUnit,
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl Ratio {
     pub fn decimal(v: f64) -> Result<Self, super::instrument::CoreError> {
         Self::new(v, RatioUnit::Decimal)
@@ -162,7 +146,6 @@ impl Ratio {
     }
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl<'de> Deserialize<'de> for Ratio {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

@@ -675,7 +675,7 @@ pub(super) fn build_br196_normalized_source_previews() -> Result<Vec<(&'static s
                     | SourcePushKind::AnalystUpgrade
             ) {
                 let evidence = SourceBatchEvidence::new(
-                    stock_analysis::magic_compat::ProviderId::Eastmoney,
+                    stock_analysis::market_domain::ProviderId::Eastmoney,
                     source,
                     Some(now.date_naive().to_string()),
                     now.to_rfc3339(),
@@ -1356,7 +1356,7 @@ mod tests {
         stock_analysis::announcement::AnnouncementBatch {
             announcements: vec![announcement],
             evidence: stock_analysis::data_gateway::BatchEvidence {
-                provider: stock_analysis::magic_compat::ProviderId::Cninfo,
+                provider: stock_analysis::market_domain::ProviderId::Cninfo,
                 source: "TEST_CODE_cninfo-market".to_string(),
                 source_at: Some("2026-08-04T00:00:00+08:00".to_string()),
                 observed_at: observed_at.to_string(),
@@ -1726,7 +1726,7 @@ mod tests {
         crate::v14_adapter::_reset_dedup_for_test();
         let observed_at = Local::now();
         let source_evidence = SourceBatchEvidence::new(
-            stock_analysis::magic_compat::ProviderId::Eastmoney,
+            stock_analysis::market_domain::ProviderId::Eastmoney,
             " Wind".into(),
             None,
             observed_at.to_rfc3339(),
@@ -1834,7 +1834,7 @@ mod tests {
     }
 
     fn test_source_batch(
-        provider: stock_analysis::magic_compat::ProviderId,
+        provider: stock_analysis::market_domain::ProviderId,
         source: &str,
         batch_id: &str,
         content_byte: char,
@@ -1853,7 +1853,7 @@ mod tests {
     #[test]
     fn br210_latest_batch_observation_accepts_mixed_magic_encodings() {
         let financial = SourceBatchEvidence::new(
-            stock_analysis::magic_compat::ProviderId::Sina,
+            stock_analysis::market_domain::ProviderId::Sina,
             "TEST_CODE_sina-financial".to_string(),
             None,
             "1785799979.851045000".to_string(),
@@ -1862,7 +1862,7 @@ mod tests {
         )
         .expect("Sina fractional epoch evidence");
         let consensus = SourceBatchEvidence::new(
-            stock_analysis::magic_compat::ProviderId::Eastmoney,
+            stock_analysis::market_domain::ProviderId::Eastmoney,
             "TEST_CODE_eastmoney-consensus".to_string(),
             None,
             "unix-ms:1785799980851".to_string(),
@@ -1884,7 +1884,7 @@ mod tests {
         let batch = stock_analysis::data_gateway::GatewayBatch::Available {
             records: vec![data],
             evidence: stock_analysis::data_gateway::BatchEvidence {
-                provider: stock_analysis::magic_compat::ProviderId::Eastmoney,
+                provider: stock_analysis::market_domain::ProviderId::Eastmoney,
                 source: "TEST_CODE_eastmoney-research".into(),
                 source_at: None,
                 observed_at: observed_at.clone(),
@@ -1895,7 +1895,7 @@ mod tests {
         let projected = project_consensus_batch(batch).expect("evidence-backed projection");
         assert_eq!(
             projected.evidence.provider,
-            stock_analysis::magic_compat::ProviderId::Eastmoney
+            stock_analysis::market_domain::ProviderId::Eastmoney
         );
         assert_eq!(projected.evidence.source, "TEST_CODE_eastmoney-research");
         assert_eq!(projected.evidence.source_at, None);
@@ -1910,7 +1910,7 @@ mod tests {
         let batch = stock_analysis::data_gateway::GatewayBatch::Available {
             records: vec![data.clone(), data],
             evidence: stock_analysis::data_gateway::BatchEvidence {
-                provider: stock_analysis::magic_compat::ProviderId::Eastmoney,
+                provider: stock_analysis::market_domain::ProviderId::Eastmoney,
                 source: "TEST_CODE_eastmoney-research".into(),
                 source_at: None,
                 observed_at: Local::now().to_rfc3339(),
@@ -1971,13 +1971,13 @@ mod tests {
             Local::now().date_naive(),
             vec![
                 test_source_batch(
-                    stock_analysis::magic_compat::ProviderId::Sina,
+                    stock_analysis::market_domain::ProviderId::Sina,
                     "TEST_CODE_FINANCIAL_PROVIDER",
                     "TEST_CODE_FINANCIAL_BATCH",
                     'a',
                 ),
                 test_source_batch(
-                    stock_analysis::magic_compat::ProviderId::Eastmoney,
+                    stock_analysis::market_domain::ProviderId::Eastmoney,
                     "TEST_CODE_CONSENSUS_PROVIDER",
                     "TEST_CODE_CONSENSUS_BATCH",
                     'b',
@@ -2012,13 +2012,13 @@ mod tests {
             Local::now().date_naive(),
             vec![
                 test_source_batch(
-                    stock_analysis::magic_compat::ProviderId::Sina,
+                    stock_analysis::market_domain::ProviderId::Sina,
                     "TEST_CODE_FINANCIAL_PROVIDER",
                     "TEST_CODE_FINANCIAL_BATCH",
                     'c',
                 ),
                 test_source_batch(
-                    stock_analysis::magic_compat::ProviderId::Eastmoney,
+                    stock_analysis::market_domain::ProviderId::Eastmoney,
                     "TEST_CODE_CONSENSUS_PROVIDER",
                     "TEST_CODE_CONSENSUS_BATCH",
                     'd',

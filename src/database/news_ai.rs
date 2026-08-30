@@ -540,14 +540,14 @@ fn invalid(message: impl Into<String>) -> NewsAiAssessmentAuditError {
 }
 
 fn source_provider_tag(
-    provider: crate::magic_compat::ProviderId,
+    provider: crate::market_domain::ProviderId,
 ) -> NewsAiAssessmentAuditResult<&'static str> {
     match provider {
-        crate::magic_compat::ProviderId::Eastmoney => Ok("eastmoney"),
-        crate::magic_compat::ProviderId::Cailianpress => Ok("cailianpress"),
-        crate::magic_compat::ProviderId::Jin10 => Ok("jin10"),
-        crate::magic_compat::ProviderId::ThePaper => Ok("thepaper"),
-        crate::magic_compat::ProviderId::Sina => Ok("sina"),
+        crate::market_domain::ProviderId::Eastmoney => Ok("eastmoney"),
+        crate::market_domain::ProviderId::Cailianpress => Ok("cailianpress"),
+        crate::market_domain::ProviderId::Jin10 => Ok("jin10"),
+        crate::market_domain::ProviderId::ThePaper => Ok("thepaper"),
+        crate::market_domain::ProviderId::Sina => Ok("sina"),
         _ => Err(invalid(format!(
             "news provider is not admitted by BR-172: {provider:?}"
         ))),
@@ -1990,8 +1990,8 @@ impl DatabaseManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::magic_compat::ProviderId;
-    use crate::magic_compat::SourceEvidence;
+    use crate::market_domain::ProviderId;
+    use crate::market_domain::SourceEvidence;
     use crate::monitor::news_ai::NewsAiReserveOutcome;
     use chrono::{FixedOffset, NaiveDate, TimeZone, Utc};
     use diesel::connection::SimpleConnection;

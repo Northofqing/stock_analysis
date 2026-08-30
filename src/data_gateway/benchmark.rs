@@ -12,7 +12,7 @@ use crate::database::benchmark_segments::{
     BenchmarkSegmentStoreError, SegmentState,
 };
 use crate::database::DatabaseManager;
-use crate::magic_compat::ProviderId;
+use crate::market_domain::ProviderId;
 use crate::strategy::core::BenchmarkSeries;
 
 pub const HS300_CANONICAL: &str = "sh000300";
@@ -2758,7 +2758,7 @@ mod tests {
         ] {
             let mapped = map_gateway_error(GatewayError::classified(
                 "BenchmarkBars",
-                Some(crate::magic_compat::ProviderId::Tdx),
+                Some(crate::market_domain::ProviderId::Tdx),
                 "partial",
                 reason_code,
                 true,
@@ -2775,7 +2775,7 @@ mod tests {
 
         let bad_data = map_gateway_error(GatewayError::classified(
             "BenchmarkBars",
-            Some(crate::magic_compat::ProviderId::Tdx),
+            Some(crate::market_domain::ProviderId::Tdx),
             "partial",
             "benchmark_page_order_or_duplicate",
             false,
@@ -2801,7 +2801,7 @@ mod tests {
             batch: GatewayBatch::Available {
                 records: vec![expected_bar.clone()],
                 evidence: BatchEvidence {
-                    provider: crate::magic_compat::ProviderId::Tdx,
+                    provider: crate::market_domain::ProviderId::Tdx,
                     source: "TEST_CODE_magic-tdx-index-bars".to_owned(),
                     source_at: None,
                     observed_at: "2026-08-21T15:01:00+08:00".to_owned(),
@@ -2922,7 +2922,7 @@ mod tests {
             batch: GatewayBatch::Available {
                 records: vec![expected_bar.clone()],
                 evidence: BatchEvidence {
-                    provider: crate::magic_compat::ProviderId::Tdx,
+                    provider: crate::market_domain::ProviderId::Tdx,
                     source: "TEST_CODE_magic-tdx-index-bars".to_owned(),
                     source_at: None,
                     observed_at: "2026-08-21T09:31:01+08:00".to_owned(),
@@ -3636,7 +3636,7 @@ mod tests {
             let returned =
                 crate::data_gateway::review::audit_gateway_result_with_receipt::<BenchmarkBar>(
                     "TEST_CODE-BenchmarkOutcome",
-                    crate::magic_compat::ProviderId::Tdx,
+                    crate::market_domain::ProviderId::Tdx,
                     &request_hash,
                     Err(error),
                 )

@@ -8,7 +8,7 @@
 use crate::grpc_client::pb::magic::market::v1::{
     CanonicalPayload, Operation, QueryRequest, RequestContext,
 };
-use crate::magic_compat::{AssetClass, InstrumentId};
+use crate::market_domain::{AssetClass, InstrumentId};
 use chrono::{DateTime, FixedOffset, NaiveDate};
 use serde_json::{Map, Value};
 

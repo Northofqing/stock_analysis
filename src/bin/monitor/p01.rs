@@ -9,7 +9,7 @@ use stock_analysis::data_gateway::{
     BatchEvidence, GatewayBatch, MarketCapabilitiesGateway, SinaInstrumentNewsGateway,
     SinaInstrumentNewsRecord,
 };
-use stock_analysis::magic_compat::ProviderId;
+use stock_analysis::market_domain::ProviderId;
 use stock_analysis::pipeline::chain_analysis::p01_projection::{
     acquire_and_persist_p01_chain, P01CompletedDayEvidence,
 };
@@ -1612,7 +1612,7 @@ mod tests {
     use stock_analysis::data_gateway::{BatchEvidence, GatewayBatch, SinaInstrumentNewsRecord};
     use stock_analysis::data_provider::news_item::{content_hash, NewsItem};
     use stock_analysis::database::concepts::ChainDailyRow;
-    use stock_analysis::magic_compat::{
+    use stock_analysis::market_domain::{
         AssetClass, Exchange, InstrumentId, IsoDate, LimitPoolEntry, LimitPoolKind, NonEmptyText,
         Price, ProviderId, Ratio, RatioUnit, SourceEvidence,
     };

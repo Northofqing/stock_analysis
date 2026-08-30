@@ -7,7 +7,7 @@
 //! and provider evidence preimage. No router or fallback provider participates
 //! in this path.
 
-use crate::magic_compat::{
+use crate::market_domain::{
     Adjustment, AssetClass, Bar, BarInterval, DataBatch, InstrumentId, ProviderId,
 };
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveTime};
@@ -3317,9 +3317,9 @@ fn outcome_instrument(code: &str, canonical_market: &str) -> Result<InstrumentId
         ));
     }
     let expected_market = match identity.exchange() {
-        crate::magic_compat::Exchange::Shanghai => "SH",
-        crate::magic_compat::Exchange::Shenzhen => "SZ",
-        crate::magic_compat::Exchange::Beijing => unreachable!("Beijing rejected above"),
+        crate::market_domain::Exchange::Shanghai => "SH",
+        crate::market_domain::Exchange::Shenzhen => "SZ",
+        crate::market_domain::Exchange::Beijing => unreachable!("Beijing rejected above"),
     };
     if canonical_market != expected_market {
         return Err(GatewayError::invalid_request(
@@ -3429,7 +3429,7 @@ fn validate_unit_contract() -> Result<(), GatewayError> {
 #[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
-    use crate::magic_compat::{Money, Price, Provenance, Quantity};
+    use crate::market_domain::{Money, Price, Provenance, Quantity};
     use chrono::Duration;
 
     fn date(value: &str) -> NaiveDate {

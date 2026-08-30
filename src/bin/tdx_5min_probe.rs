@@ -45,7 +45,7 @@ fn main() {
     if bars.is_empty() {
         return;
     }
-    let bar_ts = |b: &stock_analysis::magic_compat::SecurityBar| -> String {
+    let bar_ts = |b: &stock_analysis::market_domain::SecurityBar| -> String {
         format!(
             "{:04}-{:02}-{:02} {:02}:{:02}",
             b.year, b.month, b.day, b.hour, b.minute
@@ -53,8 +53,8 @@ fn main() {
     };
     // 统计周五 (2026-08-07) 的 bar
     let mut friday_count = 0usize;
-    let mut friday_first: Option<&stock_analysis::magic_compat::SecurityBar> = None;
-    let mut friday_last: Option<&stock_analysis::magic_compat::SecurityBar> = None;
+    let mut friday_first: Option<&stock_analysis::market_domain::SecurityBar> = None;
+    let mut friday_last: Option<&stock_analysis::market_domain::SecurityBar> = None;
     for b in bars.iter() {
         if b.year == 2026 && b.month == 8 && b.day == 7 {
             friday_count += 1;

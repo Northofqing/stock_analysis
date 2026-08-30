@@ -4,7 +4,7 @@
 //! module only projects the gateway's complete, audited facts into the small
 //! domain shape consumed by scoring and prompt rendering.
 
-use crate::magic_compat::FlowInterval;
+use crate::market_domain::FlowInterval;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
@@ -176,7 +176,7 @@ pub fn format_for_prompt(flow: &MoneyFlowSummary, shape: &IntradayShape) -> Stri
 mod tests {
     use super::*;
     use crate::data_gateway::BatchEvidence;
-    use crate::magic_compat::ProviderId;
+    use crate::market_domain::ProviderId;
 
     #[test]
     fn projection_keeps_missing_price_change_explicit() {

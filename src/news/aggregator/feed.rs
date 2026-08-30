@@ -129,7 +129,7 @@ pub(super) fn record_to_market_event(
 mod tests {
     use super::*;
     use crate::data_gateway::BatchEvidence;
-    use crate::magic_compat::{ProviderId, SourceEvidence};
+    use crate::market_domain::{ProviderId, SourceEvidence};
     use chrono::{DateTime, Utc};
 
     fn test_record(provider: GlobalNewsProvider) -> GlobalNewsRecord {

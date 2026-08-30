@@ -71,7 +71,7 @@ impl AnalysisPipeline {
                     (
                         data,
                         BatchEvidence {
-                            provider: crate::magic_compat::ProviderId::Tdx,
+                            provider: crate::market_domain::ProviderId::Tdx,
                             source: "TEST_CODE_isolated_backtest".to_string(),
                             source_at: Some("2026-07-26T01:00:00Z".to_string()),
                             observed_at: "2026-07-26T01:00:01Z".to_string(),
@@ -993,7 +993,7 @@ mod tests {
     use crate::data_provider::KlineData;
     use crate::database::data_acquisition_audit::DataAcquisitionAuditRecord;
     use crate::database::DatabaseManager;
-    use crate::magic_compat::ProviderId;
+    use crate::market_domain::ProviderId;
     use crate::strategy::core::{BacktestState, BacktestSummary};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};

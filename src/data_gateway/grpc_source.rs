@@ -34,12 +34,12 @@ use crate::grpc_client::client::GrpcMarketClient;
 use crate::grpc_client::envelope::QueryResult;
 use crate::grpc_client::errors::GrpcError;
 use crate::grpc_client::pb::magic::market::v1::{AdmissionState, Operation};
-use crate::magic_compat::SecurityBar;
-use crate::magic_compat::{
+use crate::market_domain::SecurityBar;
+use crate::market_domain::{
     FinancialStatement, FlowInterval, InstrumentId, MarketStatistics, NorthboundChannel,
     StatementKind,
 };
-use crate::magic_compat::{LimitPoolEntry, LimitPoolKind, ProviderId};
+use crate::market_domain::{LimitPoolEntry, LimitPoolKind, ProviderId};
 use chrono::{DateTime, FixedOffset, NaiveDate};
 use prost::Message;
 use serde_json::Value;
@@ -3578,7 +3578,7 @@ mod tests {
     use super::*;
     use crate::grpc_client::errors::{ErrorDetail, GrpcError};
     use crate::grpc_client::pb::magic::market::v1 as pb;
-    use crate::magic_compat::ProviderId;
+    use crate::market_domain::ProviderId;
     use chrono::TimeZone;
     use prost::Message; // pb::ErrorDetail::encode_to_vec
                         // env 是进程级: 这些测试并行时会互相看到对方的 env (race)。
@@ -4853,9 +4853,9 @@ mod tests {
     #[test]
     fn br238_instrument_news_request_reuses_one_captured_upper_bound() {
         let instrument = InstrumentId::new(
-            crate::magic_compat::Exchange::Shanghai,
+            crate::market_domain::Exchange::Shanghai,
             "TEST_CODE_600396",
-            crate::magic_compat::AssetClass::Equity,
+            crate::market_domain::AssetClass::Equity,
         )
         .expect("TEST_CODE canonical instrument");
         let start = NaiveDate::from_ymd_opt(2026, 8, 18).expect("TEST_CODE start");

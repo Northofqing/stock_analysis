@@ -7,12 +7,12 @@
 //! only source-published `Implemented` actions are projected.
 
 #[cfg(all(test, feature = "magic-gateway"))]
-use crate::magic_compat::Exchange;
-use crate::magic_compat::{
+use crate::market_domain::Exchange;
+use crate::market_domain::{
     AssetClass, CorporateActionCategory, CorporateActionTerms, InstrumentId, ProviderId,
 };
 #[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{CorporateActionStatus, DataBatch, IsoDate, SourceEvidence};
+use crate::market_domain::{CorporateActionStatus, DataBatch, IsoDate, SourceEvidence};
 use chrono::NaiveDate;
 #[cfg(feature = "magic-gateway")]
 use chrono::{DateTime, FixedOffset, TimeZone, Utc};
@@ -941,7 +941,7 @@ fn tdx_gateway_error(capability: &'static str, error: TdxError) -> GatewayError 
 #[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
-    use crate::magic_compat::{FiniteNumber, Provenance, SourceEvidence};
+    use crate::market_domain::{FiniteNumber, Provenance, SourceEvidence};
     use magic_market_core::{DataStatus, PriceLimitRule};
 
     const OBSERVED_AT: &str = "2026-07-27T01:00:00Z";

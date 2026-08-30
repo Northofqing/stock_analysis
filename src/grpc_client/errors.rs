@@ -111,8 +111,8 @@ fn request_id_correlation(value: &str) -> Option<String> {
     Some(format!("sha256:{}", hex::encode(digest.finalize())))
 }
 
-fn known_provider(value: &str) -> Option<crate::magic_compat::ProviderId> {
-    use crate::magic_compat::ProviderId;
+fn known_provider(value: &str) -> Option<crate::market_domain::ProviderId> {
+    use crate::market_domain::ProviderId;
 
     Some(match value {
         "Tdx" => ProviderId::Tdx,

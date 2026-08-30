@@ -418,7 +418,7 @@ mod tests {
     use super::*;
     use crate::data_gateway::{AdmittedDailyBars, BatchEvidence};
     use crate::data_provider::{AdjustType, KlineData};
-    use crate::magic_compat::ProviderId;
+    use crate::market_domain::ProviderId;
 
     fn dt(d: &str) -> NaiveDateTime {
         NaiveDateTime::parse_from_str(&format!("{} 10:00:00", d), "%Y-%m-%d %H:%M:%S").unwrap()

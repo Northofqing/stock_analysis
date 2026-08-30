@@ -12,9 +12,9 @@ use super::review::{acquisition_request_hash, audit_gateway_result};
 #[cfg(feature = "magic-gateway")]
 use super::BatchEvidence;
 use super::{GatewayBatch, GatewayError};
-use crate::magic_compat::ProviderId;
+use crate::market_domain::ProviderId;
 #[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{IsoDate, PositiveU32};
+use crate::market_domain::{IsoDate, PositiveU32};
 use chrono::NaiveDate;
 #[cfg(feature = "magic-gateway")]
 use magic_eastmoney_rs::EastmoneyClient;
@@ -141,7 +141,7 @@ fn fetch_block_trades(
 
     let mut reviews: Vec<BlockTradeReview> = Vec::new();
     let mut issues: Vec<String> = Vec::new();
-    let mut first_provenance: Option<crate::magic_compat::Provenance> = None;
+    let mut first_provenance: Option<crate::market_domain::Provenance> = None;
 
     for code in codes {
         let identity = resolve_production_equity(code, None).map_err(|error| {

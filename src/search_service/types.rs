@@ -1,6 +1,6 @@
 //! 搜索服务共享类型与抽象（原 search_service.rs 头部）
 
-use crate::magic_compat::ProviderId;
+use crate::market_domain::ProviderId;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -13,7 +13,7 @@ use crate::data_gateway::{BatchEvidence, GlobalNewsRecord};
 /// One current-day global-news fact with the exact immutable Gateway batch
 /// that admitted it.
 ///
-/// The record retains its provider-owned [`crate::magic_compat::SourceEvidence`].
+/// The record retains its provider-owned [`crate::market_domain::SourceEvidence`].
 /// Keeping both levels together prevents downstream candidate scoring from
 /// turning a title into an unattributed string.
 #[derive(Debug, Clone, PartialEq, Eq)]

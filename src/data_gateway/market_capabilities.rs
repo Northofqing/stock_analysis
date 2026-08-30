@@ -5,11 +5,11 @@
 //! identity-consistent batch that carries all evidence and fields required by
 //! that consumer contract. Missing fields never become zeroes.
 
-use crate::magic_compat::ProviderId;
+use crate::market_domain::ProviderId;
 #[cfg(all(test, feature = "magic-gateway"))]
-use crate::magic_compat::RatioUnit;
+use crate::market_domain::RatioUnit;
 #[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{AssetClass, DataBatch, Exchange, InstrumentId};
+use crate::market_domain::{AssetClass, DataBatch, Exchange, InstrumentId};
 use chrono::{DateTime, NaiveDate, Utc};
 #[cfg(feature = "magic-gateway")]
 use chrono::{FixedOffset, NaiveDateTime, TimeZone, Timelike};
@@ -1853,7 +1853,7 @@ fn validate_book_order(
 #[cfg(test)]
 #[cfg(feature = "magic-gateway")]
 fn required_money(
-    value: Option<crate::magic_compat::Money>,
+    value: Option<crate::market_domain::Money>,
     provider: ProviderId,
     code: &str,
     field: &str,
@@ -1997,7 +1997,7 @@ fn classify_sina_error(error: SinaError) -> SourceError {
 #[cfg(all(test, feature = "magic-gateway"))]
 mod tests {
     use super::*;
-    use crate::magic_compat::{DataBatch, Money, Price, Provenance, Quantity, Ratio};
+    use crate::market_domain::{DataBatch, Money, Price, Provenance, Quantity, Ratio};
     #[cfg(feature = "magic-gateway")]
     use magic_market_core::{BookLevel, MoneyFlow, PriceLimitRule};
 
@@ -2535,7 +2535,7 @@ mod tests {
         );
         assert_eq!(
             classify_tencent_error(TencentError::Core(
-                crate::magic_compat::CoreError::InvalidRequest("TEST_CODE".to_owned())
+                crate::market_domain::CoreError::InvalidRequest("TEST_CODE".to_owned())
             ))
             .kind(),
             FailureKind::Evidence

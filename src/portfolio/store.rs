@@ -526,7 +526,7 @@ struct LedgerRow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::magic_compat::ProviderId;
+    use crate::market_domain::ProviderId;
     use chrono::{TimeZone, Utc};
     use std::path::PathBuf;
 

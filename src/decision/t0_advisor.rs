@@ -8,7 +8,7 @@
 //! Business rules: BR-151, BR-153.
 
 use crate::data_gateway::{MagicTdxT0DailyBar, MagicTdxT0Evidence, MagicTdxT0FiveMinuteBar};
-use crate::magic_compat::InstrumentId;
+use crate::market_domain::InstrumentId;
 use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -806,10 +806,10 @@ mod tests {
             volume: 1_100.0,
         });
         MagicTdxT0Evidence {
-            instrument: crate::magic_compat::InstrumentId::new(
-                crate::magic_compat::Exchange::Shanghai,
+            instrument: crate::market_domain::InstrumentId::new(
+                crate::market_domain::Exchange::Shanghai,
                 "TEST_CODE_600396",
-                crate::magic_compat::AssetClass::Equity,
+                crate::market_domain::AssetClass::Equity,
             )
             .unwrap(),
             code: "TEST_CODE_600396".to_string(),

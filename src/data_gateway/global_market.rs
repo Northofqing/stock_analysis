@@ -7,8 +7,8 @@ use super::review::{acquisition_request_hash, audit_gateway_result};
 use super::BatchEvidence;
 use super::{GatewayBatch, GatewayError};
 #[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{DataBatch, RatioUnit};
-use crate::magic_compat::{FxPair, GlobalIndexCode, ProviderId};
+use crate::market_domain::{DataBatch, RatioUnit};
+use crate::market_domain::{FxPair, GlobalIndexCode, ProviderId};
 use chrono::{DateTime, Utc};
 #[cfg(feature = "magic-gateway")]
 // GlobalIndexProvider/ForeignExchangeProvider 是 method-resolution trait
@@ -417,7 +417,7 @@ fn validate_batch<T>(
 fn validate_record_evidence(
     capability: &'static str,
     batch: &BatchEvidence,
-    record: &crate::magic_compat::SourceEvidence,
+    record: &crate::market_domain::SourceEvidence,
 ) -> Result<(), GatewayError> {
     if record.provider() != ProviderId::Sina
         || record.batch_id() != batch.batch_id
@@ -575,7 +575,7 @@ fn sina_gateway_error(capability: &'static str, error: SinaError) -> GatewayErro
 #[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
-    use crate::magic_compat::{
+    use crate::market_domain::{
         FiniteNumber, NonEmptyText, Price, Provenance, Ratio, SourceEvidence,
     };
 

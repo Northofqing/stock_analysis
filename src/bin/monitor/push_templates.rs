@@ -1456,19 +1456,19 @@ pub fn render_review_lhb_gateway(
                     .unwrap_or_else(|| "源未提供".to_string())
             ));
             for side in [
-                stock_analysis::magic_compat::DragonTigerSide::Buy,
-                stock_analysis::magic_compat::DragonTigerSide::Sell,
+                stock_analysis::market_domain::DragonTigerSide::Buy,
+                stock_analysis::market_domain::DragonTigerSide::Sell,
             ] {
                 out.push_str(match side {
-                    stock_analysis::magic_compat::DragonTigerSide::Buy => "\n   买入席位:",
-                    stock_analysis::magic_compat::DragonTigerSide::Sell => "\n   卖出席位:",
+                    stock_analysis::market_domain::DragonTigerSide::Buy => "\n   买入席位:",
+                    stock_analysis::market_domain::DragonTigerSide::Sell => "\n   卖出席位:",
                 });
                 for seat in disclosure.seats.iter().filter(|seat| seat.side == side) {
                     out.push_str(&format!(
                         "\n     {}{} {} | {}{}",
                         match side {
-                            stock_analysis::magic_compat::DragonTigerSide::Buy => "买",
-                            stock_analysis::magic_compat::DragonTigerSide::Sell => "卖",
+                            stock_analysis::market_domain::DragonTigerSide::Buy => "买",
+                            stock_analysis::market_domain::DragonTigerSide::Sell => "卖",
                         },
                         seat.rank,
                         seat.seat_name,
@@ -1503,11 +1503,11 @@ fn format_r04_money(value: f64) -> String {
     }
 }
 
-const fn exchange_label(exchange: stock_analysis::magic_compat::Exchange) -> &'static str {
+const fn exchange_label(exchange: stock_analysis::market_domain::Exchange) -> &'static str {
     match exchange {
-        stock_analysis::magic_compat::Exchange::Shanghai => "SH",
-        stock_analysis::magic_compat::Exchange::Shenzhen => "SZ",
-        stock_analysis::magic_compat::Exchange::Beijing => "BJ",
+        stock_analysis::market_domain::Exchange::Shanghai => "SH",
+        stock_analysis::market_domain::Exchange::Shenzhen => "SZ",
+        stock_analysis::market_domain::Exchange::Beijing => "BJ",
     }
 }
 
@@ -5292,8 +5292,8 @@ fn parse_paper_trade_sqlite_time(
 fn paper_trade_instrument_for_env(
     code: &str,
     env: stock_analysis::risk::env_guard::TradingEnv,
-) -> Result<stock_analysis::magic_compat::InstrumentId, String> {
-    use stock_analysis::magic_compat::{AssetClass, InstrumentId};
+) -> Result<stock_analysis::market_domain::InstrumentId, String> {
+    use stock_analysis::market_domain::{AssetClass, InstrumentId};
 
     let canonical_code = match env {
         stock_analysis::risk::env_guard::TradingEnv::Prod => code,
@@ -6130,11 +6130,11 @@ fn r09_sha256(bytes: &[u8]) -> String {
 }
 
 fn r09_metric_label(
-    metric: &stock_analysis::magic_compat::MarketRankingKind,
+    metric: &stock_analysis::market_domain::MarketRankingKind,
 ) -> Result<&'static str, String> {
     match metric {
-        stock_analysis::magic_compat::MarketRankingKind::VolumeRatio => Ok("volume_ratio"),
-        stock_analysis::magic_compat::MarketRankingKind::MainNetInflow => Ok("main_net_inflow"),
+        stock_analysis::market_domain::MarketRankingKind::VolumeRatio => Ok("volume_ratio"),
+        stock_analysis::market_domain::MarketRankingKind::MainNetInflow => Ok("main_net_inflow"),
         other => Err(format!(
             "R-09 fixed metric contract rejected unsupported metric {other:?}"
         )),
@@ -6142,11 +6142,11 @@ fn r09_metric_label(
 }
 
 fn r09_unit_label(
-    unit: &stock_analysis::magic_compat::MarketRankingUnit,
+    unit: &stock_analysis::market_domain::MarketRankingUnit,
 ) -> Result<&'static str, String> {
     match unit {
-        stock_analysis::magic_compat::MarketRankingUnit::Multiple => Ok("multiple"),
-        stock_analysis::magic_compat::MarketRankingUnit::Yuan => Ok("yuan"),
+        stock_analysis::market_domain::MarketRankingUnit::Multiple => Ok("multiple"),
+        stock_analysis::market_domain::MarketRankingUnit::Yuan => Ok("yuan"),
         other => Err(format!(
             "R-09 fixed metric contract rejected unsupported unit {other:?}"
         )),
@@ -6155,7 +6155,7 @@ fn r09_unit_label(
 
 fn r09_request_binding(
     request: &stock_analysis::data_gateway::capital::ProviderTopNRequestEvidence,
-    expected_metric: &stock_analysis::magic_compat::MarketRankingKind,
+    expected_metric: &stock_analysis::market_domain::MarketRankingKind,
     review_date: chrono::NaiveDate,
 ) -> Result<ProviderTopNRequestBinding, String> {
     let expected_date = review_date.format("%Y-%m-%d").to_string();
@@ -6193,7 +6193,7 @@ fn r09_batch_binding<T>(
     let evidence = batch.evidence();
     if batch.is_verified_empty()
         || batch.records().is_empty()
-        || evidence.provider != stock_analysis::magic_compat::ProviderId::Eastmoney
+        || evidence.provider != stock_analysis::market_domain::ProviderId::Eastmoney
         || evidence.source != "eastmoney-web"
         || evidence.source_at.is_some()
         || evidence.observed_at.trim().is_empty()
@@ -6225,8 +6225,8 @@ fn r09_batch_binding<T>(
 
 fn r09_projection_rows(
     records: &[stock_analysis::data_gateway::capital::ProviderTopNFact],
-    expected_metric: &stock_analysis::magic_compat::MarketRankingKind,
-    expected_unit: &stock_analysis::magic_compat::MarketRankingUnit,
+    expected_metric: &stock_analysis::market_domain::MarketRankingKind,
+    expected_unit: &stock_analysis::market_domain::MarketRankingUnit,
     expected_date: chrono::NaiveDate,
     expected_filter: &str,
 ) -> Result<Vec<ProviderTopNProjectionRow>, String> {
@@ -6249,7 +6249,7 @@ fn r09_projection_rows(
                 || record.trading_date.as_str() != expected_date
                 || record.filter_identity.as_str() != expected_filter
                 || record.instrument.asset_class()
-                    != stock_analysis::magic_compat::AssetClass::Equity
+                    != stock_analysis::market_domain::AssetClass::Equity
                 || record.instrument.code().trim().is_empty()
                 || record.label.as_str().is_empty()
             {
@@ -6328,12 +6328,12 @@ fn prepare_r09_provider_top_n_report(
 ) -> Result<PreparedProviderTopNReport, String> {
     let volume_request = r09_request_binding(
         &pair.volume_ratio_request,
-        &stock_analysis::magic_compat::MarketRankingKind::VolumeRatio,
+        &stock_analysis::market_domain::MarketRankingKind::VolumeRatio,
         review_date,
     )?;
     let inflow_request = r09_request_binding(
         &pair.main_net_inflow_request,
-        &stock_analysis::magic_compat::MarketRankingKind::MainNetInflow,
+        &stock_analysis::market_domain::MarketRankingKind::MainNetInflow,
         review_date,
     )?;
     let volume_batch = r09_batch_binding(&pair.volume_ratio)?;
@@ -6343,15 +6343,15 @@ fn prepare_r09_provider_top_n_report(
     }
     let volume_projection = r09_projection_rows(
         pair.volume_ratio.records(),
-        &stock_analysis::magic_compat::MarketRankingKind::VolumeRatio,
-        &stock_analysis::magic_compat::MarketRankingUnit::Multiple,
+        &stock_analysis::market_domain::MarketRankingKind::VolumeRatio,
+        &stock_analysis::market_domain::MarketRankingUnit::Multiple,
         review_date,
         &volume_request.filter_identity,
     )?;
     let inflow_projection = r09_projection_rows(
         pair.main_net_inflow.records(),
-        &stock_analysis::magic_compat::MarketRankingKind::MainNetInflow,
-        &stock_analysis::magic_compat::MarketRankingUnit::Yuan,
+        &stock_analysis::market_domain::MarketRankingKind::MainNetInflow,
+        &stock_analysis::market_domain::MarketRankingUnit::Yuan,
         review_date,
         &inflow_request.filter_identity,
     )?;
@@ -6789,7 +6789,7 @@ mod br192_provider_top_n_tests {
         BatchEvidence, GatewayBatch, ProviderTopNFact, ProviderTopNPair,
         ProviderTopNRequestEvidence,
     };
-    use stock_analysis::magic_compat::{
+    use stock_analysis::market_domain::{
         AssetClass, Exchange, FiniteNumber, InstrumentId, IsoDate, MarketRankingKind,
         MarketRankingUnit, NonEmptyText, PositiveU32, ProviderId,
     };
@@ -7873,7 +7873,7 @@ fn prepare_tomorrow_watch_delivery(
     lhb_records: &[stock_analysis::data_gateway::DragonTigerStockReview],
     rendered: String,
 ) -> Result<PreparedReviewLhbDelivery, String> {
-    use stock_analysis::magic_compat::ProviderId;
+    use stock_analysis::market_domain::ProviderId;
     if evidence.provider != ProviderId::Eastmoney {
         return Err(format!(
             "R-07 provider mismatch: expected Eastmoney, got {:?}",
@@ -9909,7 +9909,7 @@ fn prepare_r08_public_calendar(
 #[serde(deny_unknown_fields)]
 struct R08ProviderEvidenceBinding {
     component: String,
-    provider: stock_analysis::magic_compat::ProviderId,
+    provider: stock_analysis::market_domain::ProviderId,
     source: String,
     source_at: Option<String>,
     observed_at: String,
@@ -9945,14 +9945,14 @@ struct R08FuturesFactBinding {
 #[serde(deny_unknown_fields)]
 struct R08IndexFactBinding {
     source_order_ordinal: usize,
-    code: stock_analysis::magic_compat::GlobalIndexCode,
+    code: stock_analysis::market_domain::GlobalIndexCode,
     name: String,
     value: f64,
     change: f64,
     change_percent: f64,
     source_at: String,
     observed_at: String,
-    provider: stock_analysis::magic_compat::ProviderId,
+    provider: stock_analysis::market_domain::ProviderId,
     batch_id: String,
 }
 
@@ -9960,14 +9960,14 @@ struct R08IndexFactBinding {
 #[serde(deny_unknown_fields)]
 struct R08FxFactBinding {
     source_order_ordinal: usize,
-    pair: stock_analysis::magic_compat::FxPair,
+    pair: stock_analysis::market_domain::FxPair,
     name: String,
     rate: f64,
     change: Option<f64>,
     change_percent: Option<f64>,
     source_at: String,
     observed_at: String,
-    provider: stock_analysis::magic_compat::ProviderId,
+    provider: stock_analysis::market_domain::ProviderId,
     batch_id: String,
 }
 
@@ -10071,7 +10071,7 @@ fn r08_is_sha256_hex(value: &str) -> bool {
 fn validate_r08_public_binding_fields(
     binding: R08PublicSourceBinding,
 ) -> Result<ValidatedR08PublicBinding, &'static str> {
-    use stock_analysis::magic_compat::ProviderId;
+    use stock_analysis::market_domain::ProviderId;
 
     const INVALID: &str = "counted_r08_source_only_binding_invalid";
     let business_date = chrono::NaiveDate::parse_from_str(&binding.business_date, "%Y-%m-%d")
@@ -10352,7 +10352,7 @@ pub(super) fn validate_r08_public_source_binding_canonical_bytes(
 
 fn r08_provider_evidence_binding<T>(
     component: &str,
-    expected_provider: stock_analysis::magic_compat::ProviderId,
+    expected_provider: stock_analysis::market_domain::ProviderId,
     expected_source: &str,
     batch: &stock_analysis::data_gateway::GatewayBatch<T>,
 ) -> Result<(R08ProviderEvidenceBinding, chrono::DateTime<chrono::Utc>), String> {
@@ -10418,7 +10418,7 @@ fn prepare_r08_counted_delivery(
     >,
 ) -> Result<PreparedR08CountedDelivery, String> {
     use stock_analysis::data_gateway::GatewayBatch;
-    use stock_analysis::magic_compat::ProviderId;
+    use stock_analysis::market_domain::ProviderId;
 
     if r08_reminder_trading_date(business_date) != reminder_date {
         return Err("R-08 reminder date must be the next trading day".to_string());
@@ -10853,12 +10853,12 @@ fn build_global_indices_summary(
         .iter()
         .map(|record| {
             let name = match record.code {
-                stock_analysis::magic_compat::GlobalIndexCode::DowJones => "道琼斯",
-                stock_analysis::magic_compat::GlobalIndexCode::NasdaqComposite => "纳斯达克",
-                stock_analysis::magic_compat::GlobalIndexCode::Sp500 => "标普500",
-                stock_analysis::magic_compat::GlobalIndexCode::Nikkei225 => "日经225",
-                stock_analysis::magic_compat::GlobalIndexCode::HangSeng => "恒生指数",
-                stock_analysis::magic_compat::GlobalIndexCode::Ftse100 => "富时100",
+                stock_analysis::market_domain::GlobalIndexCode::DowJones => "道琼斯",
+                stock_analysis::market_domain::GlobalIndexCode::NasdaqComposite => "纳斯达克",
+                stock_analysis::market_domain::GlobalIndexCode::Sp500 => "标普500",
+                stock_analysis::market_domain::GlobalIndexCode::Nikkei225 => "日经225",
+                stock_analysis::market_domain::GlobalIndexCode::HangSeng => "恒生指数",
+                stock_analysis::market_domain::GlobalIndexCode::Ftse100 => "富时100",
             };
             format!("{name} {:+.2}%", record.change_percent)
         })
@@ -11296,7 +11296,7 @@ mod tests_br140_r08_partial_components {
                     Ok(announcement_batch(review_date)),
                     Err(stock_analysis::data_gateway::GatewayError::unavailable(
                         "event_calendar",
-                        Some(stock_analysis::magic_compat::ProviderId::Cffex),
+                        Some(stock_analysis::market_domain::ProviderId::Cffex),
                         false,
                         format!(
                             "provider_unsupported: unsupported by {review_date} {reminder_date}"
@@ -11390,7 +11390,7 @@ mod tests_br140_r08_partial_components {
         stock_analysis::data_gateway::GatewayBatch::Available {
             records,
             evidence: stock_analysis::data_gateway::BatchEvidence {
-                provider: stock_analysis::magic_compat::ProviderId::Cffex,
+                provider: stock_analysis::market_domain::ProviderId::Cffex,
                 source: "cffex-official-notice".to_string(),
                 source_at: Some("2026-07-16".to_string()),
                 observed_at: "2026-07-16T08:00:00Z".to_string(),
@@ -11413,7 +11413,7 @@ mod tests_br140_r08_partial_components {
                 canonical_url: "https://example.invalid/TEST_CODE_announcement".to_string(),
             }],
             evidence: stock_analysis::data_gateway::BatchEvidence {
-                provider: stock_analysis::magic_compat::ProviderId::Cninfo,
+                provider: stock_analysis::market_domain::ProviderId::Cninfo,
                 source: "cninfo-market".to_string(),
                 source_at: Some(format!("{business_date}T18:00:00+08:00")),
                 observed_at: format!("{business_date}T18:01:00+08:00"),
@@ -11425,7 +11425,7 @@ mod tests_br140_r08_partial_components {
     fn indices_batch(
     ) -> stock_analysis::data_gateway::GatewayBatch<stock_analysis::data_gateway::GlobalIndexFact>
     {
-        use stock_analysis::magic_compat::{GlobalIndexCode, ProviderId};
+        use stock_analysis::market_domain::{GlobalIndexCode, ProviderId};
 
         let observed_at = chrono::DateTime::parse_from_rfc3339("2026-07-21T13:00:00Z")
             .unwrap()
@@ -11469,7 +11469,7 @@ mod tests_br140_r08_partial_components {
     fn fx_batch(
     ) -> stock_analysis::data_gateway::GatewayBatch<stock_analysis::data_gateway::ForeignExchangeFact>
     {
-        use stock_analysis::magic_compat::{FxPair, ProviderId};
+        use stock_analysis::market_domain::{FxPair, ProviderId};
 
         let observed_at = chrono::DateTime::parse_from_rfc3339("2026-07-21T13:00:01Z")
             .unwrap()
@@ -11893,7 +11893,7 @@ mod tests_br140_r08_partial_components {
         let business_date = chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap();
         let cffex = stock_analysis::data_gateway::GatewayBatch::VerifiedEmpty(
             stock_analysis::data_gateway::BatchEvidence {
-                provider: stock_analysis::magic_compat::ProviderId::Cffex,
+                provider: stock_analysis::market_domain::ProviderId::Cffex,
                 source: "cffex-official-notice".to_string(),
                 source_at: None,
                 observed_at: "2026-07-21T13:00:01Z".to_string(),
@@ -12461,7 +12461,7 @@ fn prepare_review_lhb_delivery(
     stocks: &[stock_analysis::data_gateway::DragonTigerStockReview],
     evidence: &stock_analysis::data_gateway::BatchEvidence,
 ) -> Result<PreparedReviewLhbDelivery, String> {
-    use stock_analysis::magic_compat::{DragonTigerSide, ProviderId};
+    use stock_analysis::market_domain::{DragonTigerSide, ProviderId};
 
     if evidence.provider != ProviderId::Eastmoney {
         return Err(format!(
@@ -13029,7 +13029,7 @@ mod tests_r_dispatchers {
             BatchEvidence, DragonTigerSeatReview, DragonTigerSourceDisclosure,
             DragonTigerStockReview,
         };
-        use stock_analysis::magic_compat::{DragonTigerSide, Exchange, ProviderId};
+        use stock_analysis::market_domain::{DragonTigerSide, Exchange, ProviderId};
 
         let disclosure = |trade_id: &str, net_amount_yuan: f64| {
             let mut seats = Vec::with_capacity(10);
@@ -13187,7 +13187,7 @@ mod tests_r_dispatchers {
             BatchEvidence, DragonTigerSeatReview, DragonTigerSourceDisclosure,
             DragonTigerStockReview,
         };
-        use stock_analysis::magic_compat::{DragonTigerSide, Exchange, ProviderId};
+        use stock_analysis::market_domain::{DragonTigerSide, Exchange, ProviderId};
 
         let stocks = vec![DragonTigerStockReview {
             exchange: Exchange::Shanghai,
@@ -13343,7 +13343,7 @@ mod tests_r_dispatchers {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Err(stock_analysis::data_gateway::GatewayError::unavailable(
                     "R-04",
-                    Some(stock_analysis::magic_compat::ProviderId::Eastmoney),
+                    Some(stock_analysis::market_domain::ProviderId::Eastmoney),
                     true,
                     "TEST_CODE provider must not run",
                 ))
@@ -13426,7 +13426,7 @@ mod tests_r_dispatchers {
     #[tokio::test]
     async fn br162_r04_preserves_wait_empty_and_unavailable_outcomes() {
         use stock_analysis::data_gateway::{BatchEvidence, GatewayBatch, GatewayError};
-        use stock_analysis::magic_compat::ProviderId;
+        use stock_analysis::market_domain::ProviderId;
 
         let before = dispatch_r04_lhb_outcome_with_loader(
             "2026-07-21",
@@ -15357,7 +15357,7 @@ pub fn build_test_template_catalog(
     use stock_analysis::decision::t0_advisor::{
         PriceZone, T0Metrics, T0PlanState, T0StructuredPlan, TrendStatus, ZoneSource,
     };
-    use stock_analysis::magic_compat::{DragonTigerSide, Exchange as CoreExchange, ProviderId};
+    use stock_analysis::market_domain::{DragonTigerSide, Exchange as CoreExchange, ProviderId};
     use stock_analysis::market_analyzer::sector_monitor::{
         AnomalyReason, ConceptBoard, UnexplainedMove,
     };
@@ -16428,7 +16428,7 @@ mod tests_br232_tomorrow_watch_quotes {
             change_percent: 1.0,
             source_at: observed_at - chrono::Duration::hours(6),
             observed_at,
-            provider: stock_analysis::magic_compat::ProviderId::Tencent,
+            provider: stock_analysis::market_domain::ProviderId::Tencent,
             batch_id: "TEST_CODE_br233_settled_batch".to_owned(),
         }
     }
@@ -16670,7 +16670,7 @@ mod tests {
     #[test]
     fn br099_candidate_assembly_removes_only_held_and_keeps_watch_candidate() {
         use stock_analysis::data_gateway::BatchEvidence;
-        use stock_analysis::magic_compat::ProviderId;
+        use stock_analysis::market_domain::ProviderId;
         use stock_analysis::market_data::TopStock;
         use stock_analysis::opportunity::candidate_panel::{merge_candidates, CandidateSource};
 
@@ -16762,7 +16762,7 @@ mod tests {
         use stock_analysis::data_gateway::{
             company::MarketStatistics, BatchEvidence, GatewayBatch,
         };
-        use stock_analysis::magic_compat::{
+        use stock_analysis::market_domain::{
             AssetClass, Exchange, FiniteNumber, InstrumentId, ProviderId, SourceEvidence,
         };
 
@@ -21823,7 +21823,7 @@ mod tests {
     #[test]
     fn br138_dispatcher_r08_excludes_local_only_lifecycle_rows() {
         use stock_analysis::data_gateway::{BatchEvidence, EventAnnouncement, GatewayBatch};
-        use stock_analysis::magic_compat::ProviderId;
+        use stock_analysis::market_domain::ProviderId;
         let batch = GatewayBatch::Available {
             records: vec![EventAnnouncement {
                 announcement_id: "TEST_CODE_DISPATCHER_R08_LOCAL".to_string(),
@@ -21851,7 +21851,7 @@ mod tests {
     #[test]
     fn br199_r08_missing_cninfo_category_stays_explicitly_missing() {
         use stock_analysis::data_gateway::{BatchEvidence, EventAnnouncement, GatewayBatch};
-        use stock_analysis::magic_compat::ProviderId;
+        use stock_analysis::market_domain::ProviderId;
         let batch = GatewayBatch::Available {
             records: vec![EventAnnouncement {
                 announcement_id: "TEST_CODE_R08_MISSING_CATEGORY".to_string(),

@@ -25,8 +25,8 @@ use crate::data_gateway::{
     SinaInstrumentNewsGateway,
 };
 use crate::grpc_client::pb::magic::market::v1::Operation;
-use crate::magic_compat::{FlowInterval, NorthboundChannel, StatementKind};
-use crate::magic_compat::{InstrumentId, LimitPoolEntry, LimitPoolKind, ProviderId};
+use crate::market_domain::{FlowInterval, NorthboundChannel, StatementKind};
+use crate::market_domain::{InstrumentId, LimitPoolEntry, LimitPoolKind, ProviderId};
 use chrono::{Datelike, Local, NaiveDate};
 use serde_json::{json, Value};
 
@@ -2358,7 +2358,7 @@ mod tests {
         capital::{ProviderTopNFact, ProviderTopNPair, ProviderTopNRequestEvidence},
         BatchEvidence, BoardMembershipRecord, GatewayBatch,
     };
-    use crate::magic_compat::{
+    use crate::market_domain::{
         AssetClass, Exchange, FiniteNumber, IsoDate, MarketRankingKind, MarketRankingUnit, Money,
         NonEmptyText, PositiveU32, Price, Quantity, Ratio, RatioUnit, SourceEvidence,
     };

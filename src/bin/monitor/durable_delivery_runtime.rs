@@ -18,7 +18,7 @@ use stock_analysis::durable_delivery::{
     ScheduleHydrationState, TaskBinding,
 };
 use stock_analysis::event::DurableDeliveryImmutableAppend;
-use stock_analysis::magic_compat::{AssetClass, Exchange, InstrumentId};
+use stock_analysis::market_domain::{AssetClass, Exchange, InstrumentId};
 
 use crate::notify::{DailyReportSubKind, PushKind, PushOutcome};
 

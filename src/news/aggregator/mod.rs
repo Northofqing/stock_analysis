@@ -169,7 +169,7 @@ pub fn build_market_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::magic_compat::{ProviderId, SourceEvidence};
+    use crate::market_domain::{ProviderId, SourceEvidence};
     use crate::signal::market_event::{Direction, EventType};
     use chrono::{TimeZone, Utc};
 

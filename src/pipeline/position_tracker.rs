@@ -768,7 +768,7 @@ mod tests {
                     kind: crate::data_gateway::BoardKind::Industry,
                 }],
                 evidence: crate::data_gateway::BatchEvidence {
-                    provider: crate::magic_compat::ProviderId::Tdx,
+                    provider: crate::market_domain::ProviderId::Tdx,
                     source: "TEST_CODE_tdx-board-memberships".to_string(),
                     source_at: None,
                     observed_at: "2026-07-27T09:30:01+08:00".to_string(),

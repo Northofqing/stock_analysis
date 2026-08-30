@@ -149,7 +149,7 @@ fn extract_reduction_pct(title: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::magic_compat::ProviderId;
+    use crate::market_domain::ProviderId;
 
     fn keywords() -> AnnounceKeywordsFile {
         AnnounceKeywordsFile {

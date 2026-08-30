@@ -5,8 +5,8 @@ use super::review::audit_blocking_join_failure;
 use super::review::{acquisition_request_hash, audit_gateway_result};
 use super::{BatchEvidence, GatewayBatch, GatewayError};
 #[cfg(feature = "magic-gateway")]
-use crate::magic_compat::{DataBatch, PositiveU32};
-use crate::magic_compat::{ProviderId, SourceEvidence};
+use crate::market_domain::{DataBatch, PositiveU32};
+use crate::market_domain::{ProviderId, SourceEvidence};
 use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
 #[cfg(feature = "magic-gateway")]
 use magic_cls_rs::{ClsClient, ClsError};
@@ -583,7 +583,7 @@ fn thepaper_gateway_error(provider: GlobalNewsProvider, error: ThePaperError) ->
 #[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
-    use crate::magic_compat::{NonEmptyText, Provenance};
+    use crate::market_domain::{NonEmptyText, Provenance};
     use magic_market_core::HttpsUrl;
 
     fn observed_at(after: &str) -> String {

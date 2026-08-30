@@ -6,7 +6,7 @@
 //! receives one complete, ordered Tencent batch or an explicit failure; it no
 //! longer owns a Tencent URL, HTTP client, retry loop, or wire parser.
 
-use crate::magic_compat::{AssetClass, DataBatch, Exchange, InstrumentId, ProviderId, RatioUnit};
+use crate::market_domain::{AssetClass, DataBatch, Exchange, InstrumentId, ProviderId, RatioUnit};
 use chrono::{DateTime, Utc};
 #[cfg(feature = "magic-gateway")]
 use magic_market_core::{DataStatus, Quote, RealtimeQuotes};
@@ -312,7 +312,7 @@ fn required_text<'a>(
 }
 
 fn required_value(
-    value: Option<crate::magic_compat::Price>,
+    value: Option<crate::market_domain::Price>,
     code: &str,
     field: &str,
 ) -> Result<f64, GatewayError> {
@@ -381,7 +381,7 @@ fn tencent_gateway_error(error: TencentError) -> GatewayError {
 #[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
-    use crate::magic_compat::{Money, Price, Provenance, Quantity, Ratio};
+    use crate::market_domain::{Money, Price, Provenance, Quantity, Ratio};
 
     struct QuoteFixture {
         exchange: Exchange,

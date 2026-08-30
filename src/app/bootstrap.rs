@@ -530,7 +530,7 @@ mod tests {
     use clap::Parser;
     use stock_analysis::data_gateway::market_capabilities::MarketSecurityIdentity;
     use stock_analysis::data_gateway::{BatchEvidence, GatewayBatch};
-    use stock_analysis::magic_compat::ProviderId;
+    use stock_analysis::market_domain::ProviderId;
 
     fn metadata_evidence() -> BatchEvidence {
         BatchEvidence {

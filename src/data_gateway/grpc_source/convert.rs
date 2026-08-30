@@ -31,11 +31,11 @@ use crate::data_gateway::{
 };
 use crate::data_provider::{consensus::ConsensusData, news_item::NewsItem, AdjustType, KlineData};
 use crate::grpc_client::envelope::QueryResult;
-use crate::magic_compat::SecurityBar;
-use crate::magic_compat::{
+use crate::market_domain::SecurityBar;
+use crate::market_domain::{
     AssetClass, Exchange, InstrumentId, NonEmptyText, ProviderId, SourceEvidence,
 };
-use crate::magic_compat::{
+use crate::market_domain::{
     Bar, CorporateActionCategory, CorporateActionTerms, DataBatch, DragonTigerSide,
     FinancialStatement, FiniteNumber, FlowInterval, FxPair, GlobalIndexCode, IsoDate,
     LimitPoolEntry, LimitPoolKind, MarketRankingKind, MarketRankingUnit, MarketStatistics, Money,

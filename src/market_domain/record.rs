@@ -1,20 +1,14 @@
-//! IsoDate / QualityReport / DataBatch / Provenance / FlowInterval /
-//! NorthboundChannel 本地镜像 (M5, Task #76, feature 关时使用)。
-//! 与上游 magic_market_core rev 75ee2a2 (validated.rs + batch.rs + capital.rs)
-//! 同构: 字段/serde 表示/校验语义一致 (wire 是 JSON, convert.rs 依赖)。
+//! Locally owned date, quality, batch, provenance, and capital-flow record types.
+//! Field, validation, and serde representations are stable transport contracts.
 
-#[cfg(not(feature = "magic-gateway"))]
 use serde::{de, Deserialize, Deserializer, Serialize};
-#[cfg(not(feature = "magic-gateway"))]
 use std::fmt;
 
 /// Valid Gregorian calendar date encoded as `YYYY-MM-DD`.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct IsoDate(String);
 
-#[cfg(not(feature = "magic-gateway"))]
 impl IsoDate {
     pub fn new(value: impl Into<String>) -> Result<Self, super::instrument::CoreError> {
         let value = value.into();
@@ -33,14 +27,12 @@ impl IsoDate {
     }
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl fmt::Display for IsoDate {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl<'de> Deserialize<'de> for IsoDate {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -50,7 +42,6 @@ impl<'de> Deserialize<'de> for IsoDate {
     }
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 fn is_valid_iso_date(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() != 10
@@ -80,14 +71,12 @@ fn is_valid_iso_date(value: &str) -> bool {
 }
 
 /// Quality state attached to returned records.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QualityReport {
     complete: bool,
     issues: Vec<String>,
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl QualityReport {
     fn new(issues: Vec<String>) -> Result<Self, super::instrument::CoreError> {
         let mut checked = Vec::with_capacity(issues.len());
@@ -122,7 +111,6 @@ impl QualityReport {
     }
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl Default for QualityReport {
     fn default() -> Self {
         Self {
@@ -132,7 +120,6 @@ impl Default for QualityReport {
     }
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl<'de> Deserialize<'de> for QualityReport {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -155,7 +142,6 @@ impl<'de> Deserialize<'de> for QualityReport {
 }
 
 /// Source and retrieval timestamps for a batch.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Provenance {
     source: String,
@@ -165,7 +151,6 @@ pub struct Provenance {
     batch_id: Option<String>,
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl Provenance {
     pub fn new(
         source: impl Into<String>,
@@ -209,7 +194,6 @@ impl Provenance {
     }
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 fn checked_text(
     field: &'static str,
     value: impl Into<String>,
@@ -233,7 +217,6 @@ fn checked_text(
     Ok(trimmed.to_owned())
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl<'de> Deserialize<'de> for Provenance {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -263,7 +246,6 @@ impl<'de> Deserialize<'de> for Provenance {
 }
 
 /// Records plus provenance and quality metadata.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DataBatch<T> {
     records: Vec<T>,
@@ -271,7 +253,6 @@ pub struct DataBatch<T> {
     quality: QualityReport,
 }
 
-#[cfg(not(feature = "magic-gateway"))]
 impl<T> DataBatch<T> {
     pub fn strict(records: Vec<T>, provenance: Provenance) -> Self {
         Self {
@@ -308,7 +289,6 @@ impl<T> DataBatch<T> {
 }
 
 /// Fund-flow reporting interval.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FlowInterval {
     Minute1,
@@ -319,7 +299,6 @@ pub enum FlowInterval {
 }
 
 /// Stock Connect northbound venue whose daily statistics are being requested.
-#[cfg(not(feature = "magic-gateway"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NorthboundChannel {
     Shanghai,
