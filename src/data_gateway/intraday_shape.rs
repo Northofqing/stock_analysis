@@ -1,6 +1,6 @@
-//! BR-187 evidence-preserving Magic TDX intraday-shape boundary.
+//! BR-187 evidence-preserving intraday-shape boundary.
 //!
-//! The shape is a pure projection of one already validated Magic TDX T0
+//! The shape is a pure projection of one already validated remote T0
 //! batch. Prices, previous close, and five-minute bars are never joined from
 //! different providers or batches.
 
@@ -10,14 +10,10 @@ use chrono::{DateTime, Local, NaiveDate, NaiveTime, SecondsFormat, Utc};
 use super::instrument_identity::resolve_production_equity;
 #[cfg(test)]
 use super::instrument_identity::resolve_test_equity;
-use super::magic_tdx::MagicTdxGateway;
-use super::magic_tdx_t0::{
-    MagicTdxT0Batch, MagicTdxT0Evidence, MagicTdxT0FiveMinuteBar, T0_QUOTE_MAX_AGE_SECS,
-};
 use super::review::{
-    acquisition_request_hash, audit_blocking_join_failure, audit_gateway_result, BatchEvidence,
-    GatewayBatch, GatewayError,
+    acquisition_request_hash, audit_gateway_result, BatchEvidence, GatewayBatch, GatewayError,
 };
+use super::t0_evidence::{T0Batch, T0Evidence, T0FiveMinuteBar, T0_QUOTE_MAX_AGE_SECS};
 
 const CAPABILITY: &str = "IntradayShape";
 const SOURCE: &str = "magic_tdx_t0";
@@ -82,37 +78,6 @@ impl IntradayShapeGateway {
                 );
             }
         }
-        let worker_hash = request_hash.clone();
-        let joined = tokio::task::spawn_blocking(move || {
-            let result = validate_requested_code(&requested_code).and_then(|storage_code| {
-                let observed_at = Utc::now();
-                MagicTdxGateway::new()
-                    .get_t0_evidence_batch(std::slice::from_ref(&storage_code), observed_at)
-                    .map_err(|error| {
-                        GatewayError::unavailable(
-                            CAPABILITY,
-                            Some(ProviderId::Tdx),
-                            true,
-                            format!("Magic TDX T0 acquisition failed: {error:#}"),
-                        )
-                    })
-                    .and_then(|batch| project_t0_batch(&storage_code, batch))
-            });
-            audit_gateway_result(CAPABILITY, ProviderId::Tdx, &worker_hash, result)
-        })
-        .await;
-        match joined {
-            Ok(result) => result,
-            Err(error) => {
-                audit_blocking_join_failure(
-                    CAPABILITY,
-                    ProviderId::Tdx,
-                    request_hash,
-                    error.to_string(),
-                )
-                .await
-            }
-        }
     }
 }
 
@@ -142,7 +107,7 @@ fn validate_requested_code(code: &str) -> Result<String, GatewayError> {
 
 fn project_t0_batch(
     required_code: &str,
-    batch: MagicTdxT0Batch,
+    batch: T0Batch,
 ) -> Result<GatewayBatch<IntradayShapeFact>, GatewayError> {
     if batch.observed_at < batch.requested_at || batch.source_at > batch.observed_at {
         return invalid_evidence(format!(
@@ -155,10 +120,10 @@ fn project_t0_batch(
             CAPABILITY,
             Some(ProviderId::Tdx),
             "partial",
-            rejection.reason_code,
+            rejection.gateway_reason_code(),
             rejection.retryable,
             format!(
-                "Magic TDX T0 rejected {}: {}",
+                "remote T0 evidence rejected {}: {}",
                 rejection.code, rejection.detail
             ),
         ));
@@ -207,7 +172,7 @@ fn project_record(
     requested_at: DateTime<Utc>,
     source_at: DateTime<Utc>,
     observed_at: DateTime<Utc>,
-    record: MagicTdxT0Evidence,
+    record: T0Evidence,
 ) -> Result<IntradayShapeFact, GatewayError> {
     if record.code != required_code || record.instrument.code() != required_code {
         return invalid_evidence(format!(
@@ -336,8 +301,8 @@ fn validate_quote_prices(
 fn select_source_day_bars<'a>(
     code: &str,
     source_date: NaiveDate,
-    bars: &'a [MagicTdxT0FiveMinuteBar],
-) -> Result<Vec<&'a MagicTdxT0FiveMinuteBar>, GatewayError> {
+    bars: &'a [T0FiveMinuteBar],
+) -> Result<Vec<&'a T0FiveMinuteBar>, GatewayError> {
     let selected = bars
         .iter()
         .filter(|bar| bar.at.date() == source_date)
@@ -356,7 +321,7 @@ fn select_source_day_bars<'a>(
     Ok(selected)
 }
 
-fn tail_anchor<'a>(bars: &'a [&'a MagicTdxT0FiveMinuteBar]) -> Option<&'a MagicTdxT0FiveMinuteBar> {
+fn tail_anchor<'a>(bars: &'a [&'a T0FiveMinuteBar]) -> Option<&'a T0FiveMinuteBar> {
     let threshold = NaiveTime::from_hms_opt(14, 30, 0).expect("valid fixed time");
     bars.iter().copied().find(|bar| bar.at.time() >= threshold)
 }
@@ -433,7 +398,7 @@ fn rfc3339(value: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_gateway::magic_tdx_t0::{MagicTdxT0Quote, MagicTdxT0Rejection, T0BookLevel};
+    use crate::data_gateway::t0_evidence::{T0BookLevel, T0Quote, T0Rejection};
     use chrono::TimeZone;
 
     fn book() -> [T0BookLevel; 5] {
@@ -443,13 +408,13 @@ mod tests {
         })
     }
 
-    fn fixture() -> MagicTdxT0Batch {
+    fn fixture() -> T0Batch {
         let source_at = Utc.with_ymd_and_hms(2026, 7, 29, 7, 0, 0).unwrap();
         let observed_at = source_at + chrono::Duration::seconds(2);
         let date = source_at.with_timezone(&Local).date_naive();
         let bars = [(9, 35, 10.0), (9, 40, 10.1), (14, 30, 10.2), (14, 35, 10.3)]
             .into_iter()
-            .map(|(hour, minute, close)| MagicTdxT0FiveMinuteBar {
+            .map(|(hour, minute, close)| T0FiveMinuteBar {
                 at: date
                     .and_hms_opt(hour, minute, 0)
                     .expect("valid fixture time"),
@@ -461,7 +426,7 @@ mod tests {
                 amount: close * 1_000.0,
             })
             .collect();
-        let record = MagicTdxT0Evidence {
+        let record = T0Evidence {
             instrument: crate::market_domain::InstrumentId::new(
                 crate::market_domain::Exchange::Shanghai,
                 "TEST_CODE_600396",
@@ -473,7 +438,7 @@ mod tests {
             source_at,
             observed_at,
             batch_id: "TEST_CODE_INTRADAY_BATCH".to_owned(),
-            quote: MagicTdxT0Quote {
+            quote: T0Quote {
                 price: 10.4,
                 last_close: 10.0,
                 open: 10.1,
@@ -488,7 +453,7 @@ mod tests {
             completed_five_minute: bars,
             intraday_average_price: 10.2,
         };
-        MagicTdxT0Batch {
+        T0Batch {
             provider: ProviderId::Tdx,
             source: "TEST_CODE_magic_tdx_t0".to_owned(),
             requested_at: source_at - chrono::Duration::seconds(1),
@@ -521,9 +486,9 @@ mod tests {
     #[test]
     fn br187_rejects_partial_or_cross_batch_evidence() {
         let mut partial = fixture();
-        partial.rejections.push(MagicTdxT0Rejection {
+        partial.rejections.push(T0Rejection {
             code: "TEST_CODE_600396".to_owned(),
-            reason_code: "five_minute_gap",
+            reason_code: "five_minute_gap".to_owned(),
             detail: "TEST_CODE fixture gap".to_owned(),
             retryable: false,
         });
@@ -572,9 +537,9 @@ mod tests {
     fn br187_preserves_missing_exact_confirmation_contract_as_a_blocker() {
         let mut blocked = fixture();
         blocked.records.clear();
-        blocked.rejections.push(MagicTdxT0Rejection {
+        blocked.rejections.push(T0Rejection {
             code: "TEST_CODE_600396".to_owned(),
-            reason_code: "manual_confirmation_contract_unavailable",
+            reason_code: "manual_confirmation_contract_unavailable".to_owned(),
             detail: "TEST_CODE missing settled-daily provenance and lifecycle evidence".to_owned(),
             retryable: false,
         });

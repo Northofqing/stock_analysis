@@ -8971,7 +8971,7 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
 
 /// R-12: 盘后 15min 买入事件研究 — 只衡量虚拟仓入场与 boll_macd 入场后的
 /// 短期价格路径，不把卖出原因或事件上涨比例冒充完整策略胜率。
-/// T0 做T 信号依赖实时五档盘口 (MagicTdxT0Evidence bid/ask + 分时均价), 历史不可得 →
+/// T0 做T 信号依赖实时五档盘口 (T0Evidence bid/ask + 分时均价), 历史不可得 →
 /// 由 render_r12 文本标注"不可回测" (用户已确认)。
 /// 研究窗口 = 近 30 自然日；网络拉取 + SQLite 读表在
 /// spawn_blocking 内；任一来源或结构失败均显式失败，不发布部分结果。
@@ -15357,10 +15357,10 @@ pub fn build_test_template_catalog(
     use stock_analysis::decision::t0_advisor::{
         PriceZone, T0Metrics, T0PlanState, T0StructuredPlan, TrendStatus, ZoneSource,
     };
-    use stock_analysis::market_domain::{DragonTigerSide, Exchange as CoreExchange, ProviderId};
     use stock_analysis::market_analyzer::sector_monitor::{
         AnomalyReason, ConceptBoard, UnexplainedMove,
     };
+    use stock_analysis::market_domain::{DragonTigerSide, Exchange as CoreExchange, ProviderId};
     use stock_analysis::monitor::detector::{AlertCategory, AlertDetail, AlertEvent, AlertLevel};
 
     const EXPECTED_CATALOG_TOTAL: usize = 56;
@@ -16670,8 +16670,8 @@ mod tests {
     #[test]
     fn br099_candidate_assembly_removes_only_held_and_keeps_watch_candidate() {
         use stock_analysis::data_gateway::BatchEvidence;
-        use stock_analysis::market_domain::ProviderId;
         use stock_analysis::market_data::TopStock;
+        use stock_analysis::market_domain::ProviderId;
         use stock_analysis::opportunity::candidate_panel::{merge_candidates, CandidateSource};
 
         let evidence = |source: &str, batch_id: &str| BatchEvidence {

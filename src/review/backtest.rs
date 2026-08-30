@@ -5,7 +5,7 @@
 //!   1. 虚拟仓已成交买入事件 (paper_trades Filled buy, 9 类入场来源)
 //!   2. boll_macd 信号 (15min 滑动窗口 detect_boll_macd_signal)
 //!   3. T0 做T 信号 — 依赖实时五档盘口 + 分时均价 (t0_advisor::evaluate_structured
-//!      需要 MagicTdxT0Evidence 实时数据), 历史回放不可得 → 标注不可回测。
+//!      需要 T0Evidence 实时数据), 历史回放不可得 → 标注不可回测。
 //!
 //! 数据: TDX 15 分钟 K线 (get_security_bars KLINE_15MIN=1, 升序 旧→新,
 //! 单次 ≤800 根 ≈ 50 交易日)。本模块只操作原始 SecurityBar；boll_macd

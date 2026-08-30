@@ -7849,8 +7849,7 @@ fn paper_sell_paused(phase: &str) -> bool {
     true
 }
 
-async fn prepare_magic_tdx_t0_messages() -> Result<Vec<PreparedT0Advice>, String> {
-    use stock_analysis::data_gateway::MagicTdxGateway;
+async fn prepare_t0_messages() -> Result<Vec<PreparedT0Advice>, String> {
     use stock_analysis::decision::t0_advisor::{
         evaluate_structured, T0PlanDecision, T0PlanDecisionBindingV1, T0Position,
         T0PositionSnapshotBindingV1,
@@ -7892,16 +7891,13 @@ async fn prepare_magic_tdx_t0_messages() -> Result<Vec<PreparedT0Advice>, String
         .iter()
         .map(|position| position.code.clone())
         .collect::<Vec<_>>();
-    let observed_at = chrono::Utc::now();
-    let batch = blocking_market_data::run_blocking_market_data(
-        "BR-153 Magic TDX Gateway T0 evidence",
-        move || {
-            MagicTdxGateway::new()
-                .get_t0_evidence_batch(&codes, observed_at)
+    let batch =
+        blocking_market_data::run_blocking_market_data("BR-153 remote T0 evidence", move || {
+            stock_analysis::data_gateway::grpc_source::bridge_for("T0Evidence")
+                .and_then(|bridge| bridge.t0_evidence_batch(&codes))
                 .map_err(|error| error.to_string())
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     log::info!(
         "[做T-持仓][BR-153] batch={} source_at={} observed_at={} records={} rejected={}",
@@ -10250,7 +10246,7 @@ async fn monitor_loop() {
                         // BR-151 / BR-153: user-confirmed holdings + Magic TDX-only
                         // evidence. This path emits reverse-T observations, not orders.
                         if last_t0_scan.elapsed().as_secs() >= 30 {
-                            match prepare_magic_tdx_t0_messages().await {
+                            match prepare_t0_messages().await {
                                 Ok(messages) => {
                                     let mut outcomes = Vec::with_capacity(messages.len());
                                     for prepared in messages {

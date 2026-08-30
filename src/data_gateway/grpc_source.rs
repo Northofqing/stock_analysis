@@ -23,9 +23,9 @@ use crate::data_gateway::{
     EventAnnouncement, ForeignExchangeFact, FuturesDeliveryFact, GatewayBatch, GatewayError,
     GeneralWebResearchBatch, GeneralWebResearchProvider, GlobalIndexFact, GlobalNewsProvider,
     GlobalNewsRecord, ImplementedCorporateAction, InstrumentFundFlowFact, IntradayShapeFact,
-    MagicTdxT0Batch, MarketMinutePoint, MarketMoneyFlow, MarketOrderBook, MarketSecurityMetadata,
+    MarketMinutePoint, MarketMoneyFlow, MarketOrderBook, MarketSecurityMetadata,
     NorthboundDailyFact, ProviderTopNFact, RealtimeIndexQuote, RealtimeMarketQuote,
-    ResearchReportFact, SinaInstrumentNewsRecord, UpperLimitRecord,
+    ResearchReportFact, SinaInstrumentNewsRecord, T0Batch, UpperLimitRecord,
 };
 use crate::data_provider::{consensus::ConsensusData, KlineData};
 use crate::grpc_client::client::GrpcMarketClient;
@@ -1956,7 +1956,7 @@ fn exact_membership_canary(
     Ok(())
 }
 
-fn exact_t0_canary(requested_code: &str, batch: &MagicTdxT0Batch) -> Result<(), GatewayError> {
+fn exact_t0_canary(requested_code: &str, batch: &T0Batch) -> Result<(), GatewayError> {
     if !batch.rejections.is_empty()
         || batch.records.len() != 1
         || batch.records[0].code != requested_code
@@ -2013,7 +2013,7 @@ fn complete_t0_batch_proves_order_book(
     requested_len > 0 && record_len == requested_len && rejection_len == 0
 }
 
-fn opening_t0_route(batch: &MagicTdxT0Batch) -> Result<OpeningRouteReadiness, GatewayError> {
+fn opening_t0_route(batch: &T0Batch) -> Result<OpeningRouteReadiness, GatewayError> {
     if batch.source.trim().is_empty() || batch.batch_id.trim().is_empty() {
         return Err(GatewayError::invalid_evidence(
             "OpeningReadiness",
@@ -3301,12 +3301,8 @@ impl GrpcSource {
         block_on(self.limit_pools_async(trading_date))
     }
 
-    /// T0 证据批: 返回 MagicTdxT0Batch (records + rejections 全量, 与本地
-    /// MagicTdxGateway::get_t0_evidence_batch 对齐 — rejections 不能丢)。
-    pub async fn t0_evidence_batch_async(
-        &self,
-        codes: &[String],
-    ) -> Result<MagicTdxT0Batch, GatewayError> {
+    /// T0 证据批: 返回 T0Batch (records + rejections 全量)，拒绝项不能丢。
+    pub async fn t0_evidence_batch_async(&self, codes: &[String]) -> Result<T0Batch, GatewayError> {
         let q = self
             .query_op(Operation::T0Evidence, serde_json::json!({ "codes": codes }))
             .await?;
@@ -3353,7 +3349,7 @@ impl GrpcSource {
     }
 
     /// 同步包装 (spawn_blocking / 纯同步线程)。
-    pub fn t0_evidence_batch(&self, codes: &[String]) -> Result<MagicTdxT0Batch, GatewayError> {
+    pub fn t0_evidence_batch(&self, codes: &[String]) -> Result<T0Batch, GatewayError> {
         block_on(self.t0_evidence_batch_async(codes))
     }
 
@@ -3401,7 +3397,7 @@ impl GrpcSource {
 
     /// outcome 复盘日线 (P4 M3): 服务端执行 adaptive 抓取 (claim 台账留客户端),
     /// 视图重建 RawOutcomeFetch / OutcomeTransportFailure (error+attempts 保真)。
-    /// 参数与 fetch_magic_tdx_outcome_adaptive 对齐 (instrument 对象 round-trip)。
+    /// instrument 对象必须完整 round-trip。
     pub async fn outcome_daily_bars_async(
         &self,
         instrument: InstrumentId,
@@ -4466,9 +4462,9 @@ mod tests {
         let mut rejected_t0 = t0.clone();
         rejected_t0
             .rejections
-            .push(crate::data_gateway::MagicTdxT0Rejection {
+            .push(crate::data_gateway::T0Rejection {
                 code: CODE.to_owned(),
-                reason_code: "TEST_CODE_rejected",
+                reason_code: "TEST_CODE_rejected".to_owned(),
                 detail: "TEST_CODE rejected evidence".to_owned(),
                 retryable: false,
             });

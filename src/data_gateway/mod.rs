@@ -23,10 +23,6 @@ pub mod historical_bars;
 pub mod index;
 pub mod instrument_identity;
 pub mod intraday_shape;
-pub mod magic_tdx;
-#[cfg(feature = "magic-gateway")]
-pub mod magic_tdx_selection;
-pub mod magic_tdx_t0;
 pub mod market_capabilities;
 pub mod market_data;
 pub mod outcome_daily_bars;
@@ -35,6 +31,7 @@ pub mod research;
 pub mod review;
 pub mod security_lifecycle;
 pub mod sina_instrument_news;
+pub mod t0_evidence;
 
 pub use benchmark::{
     admit_benchmark_batch, probe_benchmark_request, AdmittedBenchmarkBatch,
@@ -89,11 +86,6 @@ pub use global_news::{GlobalNewsGateway, GlobalNewsProvider, GlobalNewsRecord};
 pub use historical_bars::{daily_bar_provider_label, AdmittedDailyBars, HistoricalBarsGateway};
 pub use index::{IndexDataGateway, RealtimeIndexQuote};
 pub use intraday_shape::{IntradayShapeFact, IntradayShapeGateway};
-pub use magic_tdx::MagicTdxGateway;
-pub use magic_tdx_t0::{
-    MagicTdxT0Batch, MagicTdxT0DailyBar, MagicTdxT0Evidence, MagicTdxT0FiveMinuteBar,
-    MagicTdxT0Quote, MagicTdxT0Rejection, T0BookLevel,
-};
 pub use market_capabilities::{
     MarketBookLevel, MarketCapabilitiesGateway, MarketMinutePoint, MarketMoneyFlow,
     MarketOrderBook, MarketSecurityMetadata, SecurityBoard, METADATA_PROVIDER_ORDER,
@@ -116,3 +108,6 @@ pub use security_lifecycle::{
     SecurityLifecycleGateway,
 };
 pub use sina_instrument_news::{SinaInstrumentNewsGateway, SinaInstrumentNewsRecord};
+pub use t0_evidence::{
+    T0Batch, T0BookLevel, T0DailyBar, T0Evidence, T0FiveMinuteBar, T0Quote, T0Rejection,
+};

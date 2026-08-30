@@ -7,7 +7,7 @@
 //!
 //! Business rules: BR-151, BR-153.
 
-use crate::data_gateway::{MagicTdxT0DailyBar, MagicTdxT0Evidence, MagicTdxT0FiveMinuteBar};
+use crate::data_gateway::{T0DailyBar, T0Evidence, T0FiveMinuteBar};
 use crate::market_domain::InstrumentId;
 use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use serde::Serialize;
@@ -189,7 +189,7 @@ pub struct T0PlanDecisionBindingV1 {
 impl T0PlanDecisionBindingV1 {
     pub fn new(
         position: &T0Position,
-        evidence: &MagicTdxT0Evidence,
+        evidence: &T0Evidence,
         plan: &T0StructuredPlan,
     ) -> Result<Self, String> {
         if evidence.code != evidence.instrument.code()
@@ -309,7 +309,7 @@ fn simple_ma(values: &[f64], period: usize) -> Option<f64> {
     Some(tail.iter().sum::<f64>() / period as f64)
 }
 
-fn atr14(bars: &[MagicTdxT0DailyBar]) -> Option<f64> {
+fn atr14(bars: &[T0DailyBar]) -> Option<f64> {
     let start = bars.len().checked_sub(15)?;
     let ranges = bars[start + 1..]
         .iter()
@@ -323,9 +323,7 @@ fn atr14(bars: &[MagicTdxT0DailyBar]) -> Option<f64> {
     (!ranges.is_empty()).then(|| ranges.iter().sum::<f64>() / ranges.len() as f64)
 }
 
-fn grouped_five_minute(
-    bars: &[MagicTdxT0FiveMinuteBar],
-) -> BTreeMap<NaiveDate, Vec<&MagicTdxT0FiveMinuteBar>> {
+fn grouped_five_minute(bars: &[T0FiveMinuteBar]) -> BTreeMap<NaiveDate, Vec<&T0FiveMinuteBar>> {
     let mut grouped = BTreeMap::new();
     for bar in bars {
         grouped
@@ -336,7 +334,7 @@ fn grouped_five_minute(
     grouped
 }
 
-fn volume_ratios(evidence: &MagicTdxT0Evidence) -> Option<(f64, f64)> {
+fn volume_ratios(evidence: &T0Evidence) -> Option<(f64, f64)> {
     let today = evidence
         .observed_at
         .with_timezone(&chrono::Local)
@@ -408,7 +406,7 @@ fn classify_trend(
     Some((trend, ma5, ma10, ma20))
 }
 
-fn confirmed_daily_pivots(bars: &[MagicTdxT0DailyBar]) -> Vec<(f64, ZoneSource)> {
+fn confirmed_daily_pivots(bars: &[T0DailyBar]) -> Vec<(f64, ZoneSource)> {
     bars.iter()
         .rev()
         .take(20)
@@ -435,10 +433,7 @@ fn confirmed_daily_pivots(bars: &[MagicTdxT0DailyBar]) -> Vec<(f64, ZoneSource)>
         .collect()
 }
 
-fn confirmed_intraday_pivots(
-    bars: &[MagicTdxT0FiveMinuteBar],
-    today: NaiveDate,
-) -> Vec<(f64, ZoneSource)> {
+fn confirmed_intraday_pivots(bars: &[T0FiveMinuteBar], today: NaiveDate) -> Vec<(f64, ZoneSource)> {
     bars.iter()
         .filter(|bar| bar.at.date() == today)
         .cloned()
@@ -493,7 +488,7 @@ fn distance_to_zone(price: f64, zone: &PriceZone) -> f64 {
     }
 }
 
-pub fn evaluate_structured(position: &T0Position, evidence: &MagicTdxT0Evidence) -> T0PlanDecision {
+pub fn evaluate_structured(position: &T0Position, evidence: &T0Evidence) -> T0PlanDecision {
     if position.code != evidence.code {
         return T0PlanDecision::Rejected(no_plan(
             position,
@@ -719,7 +714,7 @@ pub fn evaluate_structured(position: &T0Position, evidence: &MagicTdxT0Evidence)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_gateway::{MagicTdxT0Quote, T0BookLevel};
+    use crate::data_gateway::{T0BookLevel, T0Quote};
     use chrono::{Duration, Local, TimeZone, Utc};
 
     fn position(quantity: u64) -> T0Position {
@@ -738,12 +733,12 @@ mod tests {
         }
     }
 
-    fn daily_bars() -> Vec<MagicTdxT0DailyBar> {
+    fn daily_bars() -> Vec<T0DailyBar> {
         let start = NaiveDate::from_ymd_opt(2026, 6, 22).unwrap();
         (0..24)
             .map(|index| {
                 let close = 15.0 + (index % 4) as f64 * 0.12;
-                MagicTdxT0DailyBar {
+                T0DailyBar {
                     date: start + Duration::days(index as i64),
                     open: close - 0.08,
                     high: close + 0.60,
@@ -756,7 +751,7 @@ mod tests {
             .collect()
     }
 
-    fn five_minute_bars(observed_at: chrono::DateTime<Utc>) -> Vec<MagicTdxT0FiveMinuteBar> {
+    fn five_minute_bars(observed_at: chrono::DateTime<Utc>) -> Vec<T0FiveMinuteBar> {
         let today = observed_at.with_timezone(&Local).date_naive();
         let mut out = Vec::new();
         for day_offset in [5_i64, 4, 3, 2, 1] {
@@ -764,7 +759,7 @@ mod tests {
             for slot in 0..6 {
                 let at =
                     date.and_hms_opt(9, 35, 0).expect("fixture time") + Duration::minutes(slot * 5);
-                out.push(MagicTdxT0FiveMinuteBar {
+                out.push(T0FiveMinuteBar {
                     at,
                     open: 15.70,
                     high: 15.82,
@@ -778,7 +773,7 @@ mod tests {
         for slot in 0..6 {
             let at =
                 today.and_hms_opt(9, 35, 0).expect("fixture time") + Duration::minutes(slot * 5);
-            out.push(MagicTdxT0FiveMinuteBar {
+            out.push(T0FiveMinuteBar {
                 at,
                 open: 15.70,
                 high: 15.82,
@@ -791,7 +786,7 @@ mod tests {
         out
     }
 
-    fn evidence() -> MagicTdxT0Evidence {
+    fn evidence() -> T0Evidence {
         let observed_at = Local
             .with_ymd_and_hms(2026, 7, 23, 10, 1, 0)
             .single()
@@ -805,7 +800,7 @@ mod tests {
             price: 15.69 + index as f64 * 0.01,
             volume: 1_100.0,
         });
-        MagicTdxT0Evidence {
+        T0Evidence {
             instrument: crate::market_domain::InstrumentId::new(
                 crate::market_domain::Exchange::Shanghai,
                 "TEST_CODE_600396",
@@ -818,7 +813,7 @@ mod tests {
             observed_at,
             batch_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .to_string(),
-            quote: MagicTdxT0Quote {
+            quote: T0Quote {
                 price: 15.68,
                 last_close: 15.20,
                 open: 15.30,
@@ -998,7 +993,7 @@ mod tests {
         }
     }
 
-    fn flatten_prices(value: &mut MagicTdxT0Evidence, close: f64, half_range: f64) {
+    fn flatten_prices(value: &mut T0Evidence, close: f64, half_range: f64) {
         value.quote.price = close;
         value.intraday_average_price = close;
         for bar in &mut value.settled_daily {

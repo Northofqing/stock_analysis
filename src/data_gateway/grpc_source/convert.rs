@@ -22,12 +22,11 @@ use crate::data_gateway::{
     GatewayError, GeneralWebResearchBatch, GeneralWebResearchBatchEvidence,
     GeneralWebResearchProvider, GeneralWebResearchRecord, GlobalIndexFact, GlobalNewsProvider,
     GlobalNewsRecord, ImplementedCorporateAction, InstrumentFundFlowFact, IntradayShapeFact,
-    MagicTdxT0Batch, MagicTdxT0DailyBar, MagicTdxT0Evidence, MagicTdxT0FiveMinuteBar,
-    MagicTdxT0Quote, MagicTdxT0Rejection, MarketBookLevel, MarketMinutePoint, MarketMoneyFlow,
-    MarketOrderBook, MarketSecurityMetadata, NorthboundDailyFact, NorthboundQuotaFact,
-    NorthboundTopTurnoverFact, ProviderTopNFact, RealtimeIndexQuote, RealtimeMarketQuote,
-    ResearchReportFact, ResearchUseScope, SecurityBoard, SinaInstrumentNewsRecord, T0BookLevel,
-    UpperLimitRecord,
+    MarketBookLevel, MarketMinutePoint, MarketMoneyFlow, MarketOrderBook, MarketSecurityMetadata,
+    NorthboundDailyFact, NorthboundQuotaFact, NorthboundTopTurnoverFact, ProviderTopNFact,
+    RealtimeIndexQuote, RealtimeMarketQuote, ResearchReportFact, ResearchUseScope, SecurityBoard,
+    SinaInstrumentNewsRecord, T0Batch, T0BookLevel, T0DailyBar, T0Evidence, T0FiveMinuteBar,
+    T0Quote, T0Rejection, UpperLimitRecord,
 };
 use crate::data_provider::{consensus::ConsensusData, news_item::NewsItem, AdjustType, KlineData};
 use crate::grpc_client::envelope::QueryResult;
@@ -3464,10 +3463,9 @@ fn t0_china_session_at(value: &Value) -> Result<NaiveDateTime, GatewayError> {
 
 /// T0 证据批: 视图是含批级证据、records 与 rejections 的 v2 对象
 /// (grpc_server::t0_wire 契约)。
-/// 返回 MagicTdxT0Batch (records + rejections 全量) — 与本地
-/// MagicTdxGateway::get_t0_evidence_batch 对齐, rejections 绝不丢弃。
+/// 返回 T0Batch (records + rejections 全量), rejections 绝不丢弃。
 /// requested_at 只从批级字段恢复；空 records 也绝不以 observed_at 或 consumer now 代填。
-pub fn t0_evidence_batch(q: &QueryResult) -> Result<MagicTdxT0Batch, GatewayError> {
+pub fn t0_evidence_batch(q: &QueryResult) -> Result<T0Batch, GatewayError> {
     let capability = "T0Evidence";
     let ev = evidence_of(q, capability)?;
     if !q.complete {
@@ -3588,7 +3586,7 @@ pub fn t0_evidence_batch(q: &QueryResult) -> Result<MagicTdxT0Batch, GatewayErro
             .ok_or_else(|| err(capability, "T0Evidence settled_daily 非数组"))?
             .iter()
             .map(|b| {
-                Ok(MagicTdxT0DailyBar {
+                Ok(T0DailyBar {
                     date: as_date(b, "date", capability)?,
                     open: as_f64(b, "open", capability)?,
                     high: as_f64(b, "high", capability)?,
@@ -3605,7 +3603,7 @@ pub fn t0_evidence_batch(q: &QueryResult) -> Result<MagicTdxT0Batch, GatewayErro
             .ok_or_else(|| err(capability, "T0Evidence completed_five_minute 非数组"))?
             .iter()
             .map(|b| {
-                Ok(MagicTdxT0FiveMinuteBar {
+                Ok(T0FiveMinuteBar {
                     at: t0_china_session_at(b)?,
                     open: as_f64(b, "open", capability)?,
                     high: as_f64(b, "high", capability)?,
@@ -3648,14 +3646,14 @@ pub fn t0_evidence_batch(q: &QueryResult) -> Result<MagicTdxT0Batch, GatewayErro
                 format!("T0 record evidence differs from batch: code={code}"),
             ));
         }
-        out.push(MagicTdxT0Evidence {
+        out.push(T0Evidence {
             instrument: instrument_for(&code, capability)?,
             code,
             requested_at: record_requested_at,
             source_at: record_source_at,
             observed_at: record_observed_at,
             batch_id: record_batch_id,
-            quote: MagicTdxT0Quote {
+            quote: T0Quote {
                 price: quote_obj
                     .get("price")
                     .and_then(Value::as_f64)
@@ -3699,15 +3697,15 @@ pub fn t0_evidence_batch(q: &QueryResult) -> Result<MagicTdxT0Batch, GatewayErro
         .iter()
         .map(|r| {
             let code = as_str(r, "code", capability)?;
-            Ok(MagicTdxT0Rejection {
+            Ok(T0Rejection {
                 code,
-                reason_code: Box::leak(as_str(r, "reason_code", capability)?.into_boxed_str()),
+                reason_code: as_str(r, "reason_code", capability)?,
                 detail: as_str(r, "detail", capability)?,
                 retryable: as_bool(r, "retryable", capability)?,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(MagicTdxT0Batch {
+    Ok(T0Batch {
         provider: ev.provider,
         source: ev.source.clone(),
         requested_at,
@@ -3750,10 +3748,7 @@ fn require_non_negative_live_value(
     }
 }
 
-fn validate_t0_live_quote(
-    quote: &MagicTdxT0Quote,
-    capability: &'static str,
-) -> Result<(), GatewayError> {
+fn validate_t0_live_quote(quote: &T0Quote, capability: &'static str) -> Result<(), GatewayError> {
     for (field, value) in [
         ("quote.price", quote.price),
         ("quote.last_close", quote.last_close),
@@ -3787,10 +3782,7 @@ fn validate_t0_live_quote(
 }
 
 /// RPC 完成后的 consumer-side T0 完整批次门。
-pub fn t0_evidence_batch_at(
-    q: &QueryResult,
-    now: DateTime<Utc>,
-) -> Result<MagicTdxT0Batch, GatewayError> {
+pub fn t0_evidence_batch_at(q: &QueryResult, now: DateTime<Utc>) -> Result<T0Batch, GatewayError> {
     let capability = "T0Evidence";
     let (envelope, source_at, observed_at, batch_time_untrustworthy) =
         live_evidence_times_lenient(q, capability, now)?;

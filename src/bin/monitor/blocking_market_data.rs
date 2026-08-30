@@ -77,7 +77,7 @@ mod tests {
     }
 
     #[test]
-    fn br153_t0_path_uses_magic_tdx_only() {
+    fn br153_t0_path_uses_remote_evidence_only() {
         let source = include_str!("main.rs");
         let start = source
             .find("// BR-151 / BR-153 T0 START")
@@ -88,8 +88,9 @@ mod tests {
             .expect("BR-153 T0 end marker");
         let t0_source = &source[start..end];
 
-        assert!(t0_source.contains("MagicTdxGateway"));
-        assert!(t0_source.contains("BR-153 Magic TDX Gateway T0 evidence"));
+        assert!(t0_source.contains("bridge_for(\"T0Evidence\")"));
+        assert!(t0_source.contains("t0_evidence_batch"));
+        assert!(t0_source.contains("BR-153 remote T0 evidence"));
         assert!(t0_source.contains("run_blocking_market_data"));
         assert!(t0_source.contains("evaluate_structured"));
         assert!(!t0_source.contains("fetch_eastmoney_quotes"));

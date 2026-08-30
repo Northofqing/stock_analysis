@@ -392,8 +392,8 @@ mod quote_batch_tests {
     use super::*;
     use stock_analysis::data_gateway::{BatchEvidence, GatewayBatch, RealtimeMarketQuote};
     use stock_analysis::data_provider::{AdjustType, KlineData};
-    use stock_analysis::market_domain::ProviderId;
     use stock_analysis::market_data::TopStock;
+    use stock_analysis::market_domain::ProviderId;
 
     fn quote(code: &str) -> TopStock {
         TopStock {

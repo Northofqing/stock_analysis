@@ -421,19 +421,21 @@ fn br158_a01_history_reuses_the_canonical_historical_bars_gateway() {
 }
 
 #[test]
-fn br164_magic_tdx_gateway_does_not_duplicate_realtime_market_data() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/data_gateway/magic_tdx.rs");
+fn br164_t0_evidence_is_provider_neutral() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/data_gateway/t0_evidence.rs");
     let body = fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
 
     assert!(
-        body.contains("get_t0_evidence_batch"),
-        "BR-153 MagicTdxGateway must retain its T0 evidence contract"
+        body.contains("pub struct T0Batch") && body.contains("validate_quote_freshness"),
+        "BR-153 must retain provider-neutral T0 evidence and freshness contracts"
     );
     for forbidden in [
-        "MagicTdxRealtimeQuote",
-        "MagicTdxRealtimeBatch",
-        "fetch_realtime_quotes",
+        "magic_tdx_rs",
+        "TdxHqClient",
+        "get_security_quotes",
+        "get_security_bars",
+        "fetch_magic_tdx",
         "TdxSmartClient",
     ] {
         assert!(
