@@ -555,25 +555,9 @@ impl ReviewDataGateway {
         request: crate::data_gateway::BenchmarkRequest,
     ) -> Result<AuditedBenchmarkBatch, GatewayError> {
         match super::grpc_source::bridge_for("BenchmarkBars") {
-            Ok(Some(source)) => finish_benchmark_bridge_attempt(
+            Ok(source) => finish_benchmark_bridge_attempt(
                 &request,
                 source.benchmark_bars_async(&request).await,
-            ),
-            Ok(None) if std::env::var("DATA_GATEWAY_GRPC").as_deref() != Ok("1") => {
-                self.benchmark_bars_library(request).await
-            }
-            Ok(None) => finish_benchmark_bridge_attempt(
-                &request,
-                Err(super::grpc_source::BenchmarkGrpcFailure::client_before_send(
-                    GatewayError::classified(
-                        "GrpcBridge",
-                        None,
-                        "unavailable",
-                        "bridge_disabled",
-                        false,
-                        "BenchmarkBars gRPC bridge is configured but disabled; library fallback is forbidden",
-                    ),
-                )),
             ),
             Err(error) => finish_benchmark_bridge_attempt(
                 &request,
@@ -590,31 +574,12 @@ impl ReviewDataGateway {
         request: crate::data_gateway::BenchmarkRequest,
     ) -> Result<AuditedBenchmarkBatch, GatewayError> {
         match super::grpc_source::bridge_for("BenchmarkBars") {
-            Ok(Some(source)) => finish_benchmark_bridge_attempt_in(
+            Ok(source) => finish_benchmark_bridge_attempt_in(
                 database,
                 &request,
                 source
                     .benchmark_bars_async_for_local_readmission(&request)
                     .await,
-            ),
-            Ok(None) if std::env::var("DATA_GATEWAY_GRPC").as_deref() != Ok("1") => {
-                self.benchmark_bars_library_audited_into(database, request)
-                    .await
-                    .map_err(GatewayAuditFailure::into_error)
-            }
-            Ok(None) => finish_benchmark_bridge_attempt_in(
-                database,
-                &request,
-                Err(super::grpc_source::BenchmarkGrpcFailure::client_before_send(
-                    GatewayError::classified(
-                        "GrpcBridge",
-                        None,
-                        "unavailable",
-                        "bridge_disabled",
-                        false,
-                        "BenchmarkBars gRPC bridge is configured but disabled; library fallback is forbidden",
-                    ),
-                )),
             ),
             Err(error) => finish_benchmark_bridge_attempt_in(
                 database,
@@ -704,14 +669,13 @@ impl ReviewDataGateway {
     ) -> Result<GatewayBatch<UpperLimitRecord>, GatewayError> {
         let request_hash =
             acquisition_request_hash("R-03", format!("{trading_date}:{WHOLE_LIMIT_POOL_BOUND}"));
-        // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端,
+        // P4 M3: gRPC 桥 (remote gRPC 时替换 transport; audit 留客户端,
         // audit_routed 不校验 provider 一致性 — 与本地 Custom provider 对等)。
         match super::grpc_source::bridge_for("UpperLimitPoolReview") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.upper_limit_pool_review_async(trading_date).await;
                 return audit_routed_gateway_result("R-03", &request_hash, result);
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_routed_gateway_result("R-03", &request_hash, Err(error));
             }
@@ -726,7 +690,7 @@ impl ReviewDataGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]
@@ -771,13 +735,12 @@ impl ReviewDataGateway {
         // bridge failure is terminal for this attempt; never fall back to a
         // library provider after transport/schema/evidence failure.
         match super::grpc_source::bridge_for("LimitPools") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge
                     .limit_pools(trading_date)
                     .and_then(|batch| admit_current_upper_limit_pool(batch, trading_date));
                 return audit_routed_gateway_result(CAPABILITY, &request_hash, result);
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_routed_gateway_result(CAPABILITY, &request_hash, Err(error));
             }
@@ -806,7 +769,7 @@ impl ReviewDataGateway {
                 "provider_transport",
                 true,
                 &format!(
-                    "library transport disabled: DATA_GATEWAY_GRPC=1 required (trading_date={trading_date})"
+                    "remote market-data transport required (trading_date={trading_date})"
                 ),
             ));
         }
@@ -2095,9 +2058,6 @@ mod tests {
         .unwrap()
         .count;
         drop(connection);
-
-        std::env::set_var("DATA_GATEWAY_GRPC", "1");
-        std::env::remove_var("DATA_GATEWAY_GRPC_DISABLED");
         std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:1");
         super::super::grpc_source::reset_bridge();
         let day = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
@@ -2107,7 +2067,6 @@ mod tests {
                 range: crate::data_gateway::BenchmarkRange::Daily { from: day, to: day },
             })
             .await;
-        std::env::remove_var("DATA_GATEWAY_GRPC");
         std::env::remove_var("GRPC_MARKET_ADDR");
         super::super::grpc_source::reset_bridge();
 
@@ -2153,9 +2112,6 @@ mod tests {
         .unwrap()
         .count;
         drop(connection);
-
-        std::env::set_var("DATA_GATEWAY_GRPC", "1");
-        std::env::set_var("DATA_GATEWAY_GRPC_DISABLED", "BenchmarkBars");
         super::super::grpc_source::reset_bridge();
         let day = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
         let result = ReviewDataGateway::new()
@@ -2164,8 +2120,6 @@ mod tests {
                 range: crate::data_gateway::BenchmarkRange::Daily { from: day, to: day },
             })
             .await;
-        std::env::remove_var("DATA_GATEWAY_GRPC");
-        std::env::remove_var("DATA_GATEWAY_GRPC_DISABLED");
         super::super::grpc_source::reset_bridge();
 
         let error = result.expect_err("a configured bridge opt-out must remain terminal");
@@ -3352,16 +3306,12 @@ mod tests {
     fn br213_no_feature_current_pool_uses_enabled_local_bridge() {
         let _env = super::super::grpc_source::test_grpc_env_guard();
         DatabaseManager::init(None).expect("TEST_CODE audit database init");
-        std::env::set_var("DATA_GATEWAY_GRPC", "1");
-        std::env::remove_var("DATA_GATEWAY_GRPC_DISABLED");
         std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
         std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:1");
         super::super::grpc_source::reset_bridge();
 
         let result = ReviewDataGateway::new()
             .current_upper_limit_pool(NaiveDate::from_ymd_opt(2099, 1, 2).unwrap());
-
-        std::env::remove_var("DATA_GATEWAY_GRPC");
         std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
         std::env::remove_var("GRPC_MARKET_ADDR");
         super::super::grpc_source::reset_bridge();
@@ -3371,7 +3321,7 @@ mod tests {
         assert_eq!(error.reason_code(), "no_verified_batch");
         assert!(error.retryable());
         assert!(
-            !error.message().contains("library transport disabled"),
+            !error.message().contains("legacy local transport fallback"),
             "configured bridge must be attempted: {error}"
         );
 
@@ -3400,16 +3350,11 @@ mod tests {
     #[serial]
     fn br213_no_feature_disabled_bridge_fails_without_fallback_data() {
         let _env = super::super::grpc_source::test_grpc_env_guard();
-        std::env::set_var("DATA_GATEWAY_GRPC", "1");
-        std::env::set_var("DATA_GATEWAY_GRPC_DISABLED", "LimitPools");
         std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
         super::super::grpc_source::reset_bridge();
 
         let result = ReviewDataGateway::new()
             .current_upper_limit_pool(NaiveDate::from_ymd_opt(2099, 1, 2).unwrap());
-
-        std::env::remove_var("DATA_GATEWAY_GRPC");
-        std::env::remove_var("DATA_GATEWAY_GRPC_DISABLED");
         super::super::grpc_source::reset_bridge();
 
         let error = result.expect_err("disabled bridge has no no-feature provider fallback");

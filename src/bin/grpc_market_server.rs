@@ -7,18 +7,6 @@
 async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    // P4 M4 递归防护 (fail-closed, v15.x 出声): delegate 内部调用本地网关
-    // (fetch_technical_bars → fifteen_min_bars 等), 而桥钩子就在网关方法里。
-    // 本进程设 DATA_GATEWAY_GRPC=1 → 网关把请求桥回本服务端 → 无限递归。
-    // 生产部署约束: grpc_market_server 与 monitor 是不同进程, 只有 monitor 设此 env。
-    if std::env::var("DATA_GATEWAY_GRPC").as_deref() == Ok("1") {
-        eprintln!(
-            "[grpc_market_server] 启动失败: DATA_GATEWAY_GRPC=1 被禁止 — \
-             服务端 delegate 走本地网关, 该 env 会把请求桥回自身形成无限递归。\
-             请 unset DATA_GATEWAY_GRPC 后重启 (只有 monitor 进程可设此 env)。"
-        );
-        std::process::exit(2);
-    }
     // M4c: A-10 delegate (op 44/45/61) 执行 build_for_date 计算+stage+publish,
     // 需要与 monitor 同一 SQLite 库 (DATABASE_PATH, 默认 ./data/stock_analysis.db)。
     // 未 init → DatabaseManager::try_get()=None → A-10 delegate 生产必失败。

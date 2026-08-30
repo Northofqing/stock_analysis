@@ -166,9 +166,9 @@ impl BoardDataGateway {
     ) -> Result<GatewayBatch<BoardDirectoryFact>, GatewayError> {
         let request_hash =
             acquisition_request_hash(DIRECTORY_CAPABILITY, format!("{kind:?}:{limit}"));
-        // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
+        // P4 M3: gRPC 桥 (remote gRPC 时替换 transport; audit 留客户端)。
         match super::grpc_source::bridge_for("BoardDirectory") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.board_directory_async(kind, limit).await;
                 let audit_provider = result
                     .as_ref()
@@ -181,7 +181,6 @@ impl BoardDataGateway {
                     result,
                 );
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     DIRECTORY_CAPABILITY,
@@ -201,7 +200,7 @@ impl BoardDataGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]
@@ -235,9 +234,9 @@ impl BoardDataGateway {
     ) -> Result<GatewayBatch<BoardMembershipRecord>, GatewayError> {
         let code = validate_code(code, MEMBERSHIP_CAPABILITY)?.to_owned();
         let request_hash = acquisition_request_hash(MEMBERSHIP_CAPABILITY, &code);
-        // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
+        // P4 M3: gRPC 桥 (remote gRPC 时替换 transport; audit 留客户端)。
         match super::grpc_source::bridge_for("BoardConstituents") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.board_constituents_async(&code).await;
                 let audit_provider = result
                     .as_ref()
@@ -250,7 +249,6 @@ impl BoardDataGateway {
                     result,
                 );
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     MEMBERSHIP_CAPABILITY,
@@ -270,7 +268,7 @@ impl BoardDataGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]
@@ -307,7 +305,7 @@ impl BoardDataGateway {
         // BR-238: 同步消费者复用与 async memberships 完全相同的 gRPC
         // acquisition + audit 分支；桥失败显式返回，绝不降级 library。
         match super::grpc_source::bridge_for("BoardConstituents") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.board_constituents(&code);
                 let audit_provider = result
                     .as_ref()
@@ -320,7 +318,6 @@ impl BoardDataGateway {
                     result,
                 );
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     MEMBERSHIP_CAPABILITY,
@@ -340,7 +337,7 @@ impl BoardDataGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                &format!("library transport disabled: DATA_GATEWAY_GRPC=1 required (code={code})"),
+                &format!("remote market-data transport required (code={code})"),
             ));
         }
         #[cfg(feature = "magic-gateway")]
@@ -356,9 +353,9 @@ impl BoardDataGateway {
     ) -> Result<GatewayBatch<BoardFlowFact>, GatewayError> {
         let request_hash =
             acquisition_request_hash(FLOW_CAPABILITY, format!("{kind:?}:Day1:{limit}"));
-        // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
+        // P4 M3: gRPC 桥 (remote gRPC 时替换 transport; audit 留客户端)。
         match super::grpc_source::bridge_for("BoardFlows") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.board_flows_async(kind, limit).await;
                 let audit_provider = result
                     .as_ref()
@@ -371,7 +368,6 @@ impl BoardDataGateway {
                     result,
                 );
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     FLOW_CAPABILITY,
@@ -391,7 +387,7 @@ impl BoardDataGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]
@@ -430,7 +426,7 @@ impl BoardDataGateway {
             acquisition_request_hash(FLOW_CAPABILITY, format!("{kind:?}:Day1:{limit}"));
         // P4 M3: gRPC 桥 (同步路径, spawn_blocking 内调用 → block_on)。
         match super::grpc_source::bridge_for("BoardFlows") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.board_flows(kind, limit);
                 let audit_provider = result
                     .as_ref()
@@ -443,7 +439,6 @@ impl BoardDataGateway {
                     result,
                 );
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     FLOW_CAPABILITY,
@@ -463,7 +458,7 @@ impl BoardDataGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]
@@ -1213,8 +1208,6 @@ mod no_magic_bridge_tests {
     fn grpc_env_guard_blocking_membership_uses_bridge_when_enabled() {
         let _env = super::super::grpc_source::test_grpc_env_guard();
         DatabaseManager::init(None).expect("TEST_CODE audit database init");
-        std::env::set_var("DATA_GATEWAY_GRPC", "1");
-        std::env::remove_var("DATA_GATEWAY_GRPC_DISABLED");
         std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
         std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:1");
         super::super::grpc_source::reset_bridge();
@@ -1229,7 +1222,7 @@ mod no_magic_bridge_tests {
         assert_eq!(error.reason_code(), "no_verified_batch");
         assert!(error.retryable());
         assert!(
-            !error.message().contains("library transport disabled"),
+            !error.message().contains("legacy local transport fallback"),
             "blocking entry must try the configured bridge: {error}"
         );
     }

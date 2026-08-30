@@ -170,9 +170,9 @@ impl CapitalDataGateway {
         let storage_code = code.to_owned();
         let canonical = format!("{storage_code}:{interval:?}:{limit}");
         let request_hash = acquisition_request_hash(FUND_FLOW_CAPABILITY, &canonical);
-        // P4 M4b: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
+        // P4 M4b: gRPC 桥 (remote gRPC 时替换 transport; audit 留客户端)。
         match super::grpc_source::bridge_for("FundFlowSeries") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge
                     .fund_flow_series_async(&storage_code, interval, limit)
                     .await;
@@ -187,7 +187,6 @@ impl CapitalDataGateway {
                     result,
                 );
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     FUND_FLOW_CAPABILITY,
@@ -207,7 +206,7 @@ impl CapitalDataGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]
@@ -272,10 +271,10 @@ impl CapitalDataGateway {
         let volume_request_hash = volume_request_evidence.request_hash.clone();
         #[cfg(feature = "magic-gateway")]
         let inflow_request_hash = inflow_request_evidence.request_hash.clone();
-        // P4 M4b: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; 双路 audit 留
+        // P4 M4b: gRPC 桥 (remote gRPC 时替换 transport; 双路 audit 留
         // 客户端, request evidence 是本地构造的 (桥只换 transport 数据)。
         match super::grpc_source::bridge_for("ProviderTopNRankings") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 return match bridge.provider_top_n_pair_async(trading_date).await {
                     Ok((volume, inflow)) => {
                         let volume_audited = audit_gateway_result(
@@ -328,7 +327,6 @@ impl CapitalDataGateway {
                     }
                 };
             }
-            Ok(None) => {}
             Err(error) => {
                 let volume_audited = audit_gateway_result::<ProviderTopNFact>(
                     PROVIDER_TOP_N_VOLUME_RATIO_CAPABILITY,
@@ -363,7 +361,7 @@ impl CapitalDataGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]
@@ -422,9 +420,9 @@ impl CapitalDataGateway {
     ) -> Result<GatewayBatch<NorthboundDailyFact>, GatewayError> {
         let canonical = format!("{trading_date}:{channel:?}");
         let request_hash = acquisition_request_hash(NORTHBOUND_CAPABILITY, &canonical);
-        // P4 M4b: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
+        // P4 M4b: gRPC 桥 (remote gRPC 时替换 transport; audit 留客户端)。
         match super::grpc_source::bridge_for("NorthboundDaily") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.northbound_daily_async(trading_date, channel).await;
                 let audit_provider = result
                     .as_ref()
@@ -437,7 +435,6 @@ impl CapitalDataGateway {
                     result,
                 );
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     NORTHBOUND_CAPABILITY,
@@ -457,7 +454,7 @@ impl CapitalDataGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]

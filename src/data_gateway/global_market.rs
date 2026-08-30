@@ -68,11 +68,11 @@ impl GlobalMarketGateway {
     pub async fn us_indices(&self) -> Result<GatewayBatch<GlobalIndexFact>, GatewayError> {
         let request_hash =
             acquisition_request_hash(INDEX_CAPABILITY, "DowJones,NasdaqComposite,Sp500");
-        // P4 M3 钩子 (2026-08-17 补): DATA_GATEWAY_GRPC=1 → gRPC 通道 (fail-closed,
+        // P4 M3 钩子 (2026-08-17 补): remote gRPC → gRPC 通道 (fail-closed,
         // audit 对等)。此前 GlobalIndices 服务端 delegate/桥方法已存在但网关钩子缺失
         // → 零 magic 生产构建 push_templates.rs us_indices 每天 fail-closed 报错。
         match super::grpc_source::bridge_for("GlobalIndices") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.global_indices_async().await;
                 let audit_provider = result
                     .as_ref()
@@ -85,7 +85,6 @@ impl GlobalMarketGateway {
                     result,
                 );
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     INDEX_CAPABILITY,
@@ -105,7 +104,7 @@ impl GlobalMarketGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]
@@ -153,9 +152,9 @@ impl GlobalMarketGateway {
     /// Acquires exactly the USD/CNY quote.
     pub async fn usd_cny(&self) -> Result<GatewayBatch<ForeignExchangeFact>, GatewayError> {
         let request_hash = acquisition_request_hash(FX_CAPABILITY, "UsdCny");
-        // P4 M3 钩子: DATA_GATEWAY_GRPC=1 → gRPC 通道 (fail-closed, audit 对等)。
+        // P4 M3 钩子: remote gRPC → gRPC 通道 (fail-closed, audit 对等)。
         match super::grpc_source::bridge_for("ForeignExchange") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.foreign_exchange_async().await;
                 let audit_provider = result
                     .as_ref()
@@ -163,7 +162,6 @@ impl GlobalMarketGateway {
                     .unwrap_or(ProviderId::Sina);
                 return audit_gateway_result(FX_CAPABILITY, audit_provider, &request_hash, result);
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     FX_CAPABILITY,
@@ -183,7 +181,7 @@ impl GlobalMarketGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]

@@ -53,9 +53,9 @@ impl BlockTradesGateway {
         trading_date: NaiveDate,
     ) -> Result<GatewayBatch<BlockTradeReview>, GatewayError> {
         let request_hash = acquisition_request_hash(CAPABILITY, codes.join(","));
-        // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
+        // P4 M3: gRPC 桥 (remote gRPC 时替换 transport; audit 留客户端)。
         match super::grpc_source::bridge_for("BlockTrades") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.block_trades_async(codes, trading_date).await;
                 let audit_provider = result
                     .as_ref()
@@ -63,7 +63,6 @@ impl BlockTradesGateway {
                     .unwrap_or(ProviderId::Eastmoney);
                 return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     CAPABILITY,
@@ -83,7 +82,7 @@ impl BlockTradesGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]

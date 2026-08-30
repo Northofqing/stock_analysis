@@ -1,8 +1,6 @@
-//! P4 M2: data_gateway → gRPC 桥 (双进程模式: monitor 连独立 grpc_market_server)。
-//! env 契约:
-//! - `DATA_GATEWAY_GRPC=1` 启用 (缺省 library 模式, 出声默认 v15.x);
-//! - `GRPC_MARKET_ADDR` 服务端地址 (默认 http://127.0.0.1:18082);
-//! - `DATA_GATEWAY_GRPC_DISABLED=RealtimeQuotes,HistoricalBars` 按 op 名 opt-out。
+//! data_gateway → gRPC bridge for the remote market-data provider host.
+//! `GRPC_MARKET_ADDR` selects the server address and defaults to
+//! `http://127.0.0.1:18082`.
 //!
 //! fail-closed: 服务端不可达 / 证据链缺失 → GatewayError::unavailable
 //! (retryable=true) 或 invalid_evidence, 绝不静默回退 library。
@@ -948,6 +946,7 @@ fn require_external_live_capabilities(
 /// 泄露上游自由文本，也不通过 Box::leak 建立无界进程内存。
 fn reason_code_static(s: &str) -> &'static str {
     const KNOWN: &[&str] = &[
+        "no_current_reports",
         "no_verified_batch",
         "invalid_request",
         "invalid_evidence",
@@ -1029,6 +1028,7 @@ pub const HOOKED_OPS: &[&str] = &[
     "BoardRanking",
     "BenchmarkBars",
     "Consensus",
+    "ChainBatch",
     "CorporateActions",
     "DragonTiger",
     "EconomicCalendar",
@@ -1054,37 +1054,25 @@ pub const HOOKED_OPS: &[&str] = &[
     "ResearchReports",
     "SecurityMetadata",
     "SemanticSearch",
+    "StrongStockReasons",
     "T0Evidence",
     "TechnicalBars",
     "UpperLimitPoolReview",
 ];
 
-/// 保持本地 (library 模式) 的网关能力 — P4 M3 风险条款: 服务端 op 已实现或
-/// 半实现, 但桥保真未经验证 → 不静默切换, 出声 banner 列 follow-up。
-/// 接桥时从本表删除并移入 HOOKED_OPS。
-pub const KEEP_LOCAL_OPS: &[&str] = &["strong_stock_reasons"];
+/// All declared market-data operations are remote.
+pub const KEEP_LOCAL_OPS: &[&str] = &[];
 
-/// 网关钩子入口: DATA_GATEWAY_GRPC=1 且 op 未被 DISABLED → Some(Arc<GrpcSource>)
-/// (惰性连接, 失败不缓存); 否则 Ok(None) (library 路径)。
-/// 连接失败 → Err(unavailable retryable) (fail-closed)。
-pub fn bridge_for(op: &str) -> Result<Option<Arc<GrpcSource>>, GatewayError> {
-    if std::env::var("DATA_GATEWAY_GRPC").as_deref() != Ok("1") {
-        return Ok(None);
-    }
-    let disabled = std::env::var("DATA_GATEWAY_GRPC_DISABLED").unwrap_or_default();
-    if disabled.split(',').any(|name| name.trim() == op) {
-        log::warn!(
-            "[data_gateway] gRPC 桥: op {op} 被 DATA_GATEWAY_GRPC_DISABLED 排除, 走 library"
-        );
-        return Ok(None);
-    }
+/// Return the process-wide remote bridge. Construction is lazy and connection
+/// failures remain typed, retryable gateway errors at the operation boundary.
+pub fn bridge_for(_op: &str) -> Result<Arc<GrpcSource>, GatewayError> {
     let cell = SOURCE.get_or_init(|| Mutex::new(None));
     if let Some(source) = cell
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
     {
-        return Ok(Some(source.clone()));
+        return Ok(source.clone());
     }
     // 连接是惰性的: 此处只注册桥实例 (连接在首个方法调用 ensure_connected 做,
     // 避免 block_on 在 async 上下文 panic; 失败不缓存语义在方法层保持)。
@@ -1099,7 +1087,7 @@ pub fn bridge_for(op: &str) -> Result<Option<Arc<GrpcSource>>, GatewayError> {
     *cell
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(arc.clone());
-    Ok(Some(arc))
+    Ok(arc)
 }
 
 /// 测试/重置用: 清空桥缓存 (重连)。
@@ -1122,12 +1110,7 @@ pub(crate) struct TestGrpcEnvGuard {
 
 #[cfg(test)]
 pub(crate) fn test_grpc_env_guard() -> TestGrpcEnvGuard {
-    const KEYS: &[&str] = &[
-        "DATA_GATEWAY_GRPC",
-        "DATA_GATEWAY_GRPC_DISABLED",
-        "GRPC_MARKET_ADDR",
-        "GRPC_MARKET_CLIENT_BUNDLE",
-    ];
+    const KEYS: &[&str] = &["GRPC_MARKET_ADDR", "GRPC_MARKET_CLIENT_BUNDLE"];
     let lock = TEST_GRPC_ENV_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1746,16 +1729,7 @@ pub fn audit_opening_readiness_failure(
 }
 
 fn required_opening_bridge(op_name: &'static str) -> Result<Arc<GrpcSource>, GatewayError> {
-    bridge_for(op_name)?.ok_or_else(|| {
-        GatewayError::classified(
-            "OpeningReadiness",
-            None,
-            "unavailable",
-            "external_bridge_disabled",
-            false,
-            format!("开盘 readiness 要求 DATA_GATEWAY_GRPC=1 且 {op_name} 未被禁用"),
-        )
-    })
+    bridge_for(op_name)
 }
 
 async fn current_external_opening_capabilities(
@@ -2286,22 +2260,9 @@ pub async fn external_live_opening_readiness() -> Result<OpeningReadinessReport,
     })
 }
 
-/// M4 启动 banner (v15.x 出声原则): 数据源模式必须打印, 默认 library。
-/// 语义与 bridge_for 完全一致 (DATA_GATEWAY_GRPC=1 才走 gRPC)。
-/// main.rs [broker] 启动完成后调用。
+/// Startup banner for the single remote provider-host mode.
 pub fn startup_banner() -> String {
-    let mode = if std::env::var("DATA_GATEWAY_GRPC").as_deref() == Ok("1") {
-        "grpc"
-    } else {
-        "library"
-    };
     let server = std::env::var("GRPC_MARKET_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
-    let disabled = std::env::var("DATA_GATEWAY_GRPC_DISABLED").unwrap_or_default();
-    let disabled = if disabled.is_empty() {
-        "无".to_string()
-    } else {
-        disabled
-    };
     let external =
         if std::env::var_os("GRPC_MARKET_CLIENT_BUNDLE").is_some_and(|value| !value.is_empty()) {
             "configured"
@@ -2309,13 +2270,9 @@ pub fn startup_banner() -> String {
             "unconfigured"
         };
     format!(
-        "[data_gateway] 数据源模式 = {mode} | server = {server} | external-v1 = {external} | 桥接 {} ops | \
-         禁用 = {disabled} | 保持本地 {} ops: {} \
-         (P-01: LimitPools 已桥接完整 LimitPoolEntry; strong_stock_reasons 的 op 45 \
-          扁平视图不消费, monitor 复盘经 chain_batch op 61 拿完整 VisibleChainBatch)",
-        HOOKED_OPS.len(),
-        KEEP_LOCAL_OPS.len(),
-        KEEP_LOCAL_OPS.join(",")
+        "[data_gateway] 数据源模式 = grpc | provider-host = {server} | \
+         external-v1 = {external} | 远端 {} ops",
+        HOOKED_OPS.len()
     )
 }
 
@@ -3548,29 +3505,11 @@ impl GrpcSource {
     }
 }
 
-/// M4c: A-10 完整 batch 静态入口 (catalyst_review 复盘消费, 无桥实例上下文)。
-/// gRPC 模式 (DATA_GATEWAY_GRPC=1) → 服务端计算+写库, 返回完整 batch;
-/// library 模式 → Ok(None), 调用方走本地 build_for_date (默认出声, v15.x);
-/// gRPC 模式失败 → Err (fail-closed, 绝不静默回退 library 重算)。
+/// A-10 complete-batch remote entry point.
 pub async fn fetch_chain_batch_grpc(
     date: &str,
-) -> Result<Option<crate::database::chain_intelligence::VisibleChainBatch>, GatewayError> {
-    if std::env::var("DATA_GATEWAY_GRPC").as_deref() != Ok("1") {
-        return Ok(None);
-    }
-    let source = bridge_for("ChainBatch")?.ok_or_else(|| {
-        GatewayError::classified(
-            "A-10",
-            Some(ProviderId::Custom),
-            "unavailable",
-            "bridge_disabled",
-            true,
-            "ChainBatch 被 DATA_GATEWAY_GRPC_DISABLED 排除, 复盘需要完整 batch \
-             — 不静默回退 library (fail-closed)"
-                .to_string(),
-        )
-    })?;
-    source.chain_batch_async(date).await.map(Some)
+) -> Result<crate::database::chain_intelligence::VisibleChainBatch, GatewayError> {
+    bridge_for("ChainBatch")?.chain_batch_async(date).await
 }
 
 #[cfg(test)]
@@ -3820,6 +3759,17 @@ mod tests {
         ] {
             assert_eq!(reason_code_static(reason), reason, "reason={reason}");
         }
+    }
+
+    /// BR-159: 服务器分类 no_current_reports (业务态: 180 天窗口无报告) 必须过
+    /// reason_code_static 保真还原, 不折叠成 internal (2026-08-30 诊断: 13 只
+    /// 股票被折叠显示为 internal)。
+    #[test]
+    fn no_current_reports_survives_reason_code_static() {
+        assert_eq!(
+            reason_code_static("no_current_reports"),
+            "no_current_reports"
+        );
     }
 
     #[test]
@@ -4986,12 +4936,11 @@ mod tests {
     }
 
     #[test]
-    fn bridge_disabled_without_env() {
+    fn bridge_exists_without_legacy_mode_environment() {
         let _env = test_grpc_env_guard();
-        std::env::remove_var("DATA_GATEWAY_GRPC");
-        std::env::remove_var("DATA_GATEWAY_GRPC_DISABLED");
         std::env::remove_var("GRPC_MARKET_ADDR");
-        assert!(bridge_for("RealtimeQuotes").unwrap().is_none());
+        reset_bridge();
+        assert!(bridge_for("RealtimeQuotes").is_ok());
     }
 
     #[test]
@@ -5025,12 +4974,7 @@ mod tests {
 
     #[test]
     fn grpc_env_guard_restores_env_and_cache_after_panic_and_reacquires() {
-        const KEYS: &[&str] = &[
-            "DATA_GATEWAY_GRPC",
-            "DATA_GATEWAY_GRPC_DISABLED",
-            "GRPC_MARKET_ADDR",
-            "GRPC_MARKET_CLIENT_BUNDLE",
-        ];
+        const KEYS: &[&str] = &["GRPC_MARKET_ADDR", "GRPC_MARKET_CLIENT_BUNDLE"];
         let baseline_guard = test_grpc_env_guard();
         let before: Vec<_> = KEYS
             .iter()
@@ -5039,8 +4983,6 @@ mod tests {
         drop(baseline_guard);
         let unwound = std::panic::catch_unwind(|| {
             let _env = test_grpc_env_guard();
-            std::env::set_var("DATA_GATEWAY_GRPC", "1");
-            std::env::set_var("DATA_GATEWAY_GRPC_DISABLED", "TEST_CODE_disabled");
             std::env::set_var("GRPC_MARKET_ADDR", "http://TEST_CODE_changed:1");
             std::env::set_var("GRPC_MARKET_CLIENT_BUNDLE", "/TEST_CODE_changed_bundle");
             let _ = bridge_for("RealtimeQuotes").expect("TEST_CODE configured bridge");
@@ -5066,33 +5008,15 @@ mod tests {
     }
 
     #[test]
-    fn bridge_disabled_by_op_name() {
-        let _env = test_grpc_env_guard();
-        std::env::set_var("DATA_GATEWAY_GRPC", "1");
-        std::env::set_var("DATA_GATEWAY_GRPC_DISABLED", "RealtimeQuotes");
-        std::env::remove_var("GRPC_MARKET_ADDR");
-        assert!(
-            bridge_for("RealtimeQuotes").unwrap().is_none(),
-            "DISABLED 命中 → library"
-        );
-        std::env::remove_var("DATA_GATEWAY_GRPC");
-        std::env::remove_var("DATA_GATEWAY_GRPC_DISABLED");
-    }
-
-    #[test]
-    fn bridge_enabled_but_unreachable_is_fail_closed() {
+    fn bridge_unreachable_is_fail_closed() {
         // 连接是惰性的: bridge_for 只注册实例, fail-closed 在方法层
         // (首个查询 ensure_connected 失败 → unavailable retryable)。
         let _env = test_grpc_env_guard();
-        std::env::set_var("DATA_GATEWAY_GRPC", "1");
         std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:1");
         reset_bridge();
-        let bridge = bridge_for("RealtimeQuotes")
-            .unwrap()
-            .expect("bridge 实例存在");
+        let bridge = bridge_for("RealtimeQuotes").expect("bridge 实例存在");
         let err = bridge.realtime_quotes(&["600519".to_string()]).unwrap_err();
         assert!(err.retryable(), "服务端不可达必须 retryable");
-        std::env::remove_var("DATA_GATEWAY_GRPC");
         std::env::remove_var("GRPC_MARKET_ADDR");
         reset_bridge();
     }
@@ -5104,78 +5028,35 @@ mod tests {
         // tokio "Cannot start a runtime from within a runtime"。修复后 async
         // worker 走独立 std 线程路径 → 服务端不可达返回 Err 而非 panic。
         let _env = test_grpc_env_guard();
-        std::env::set_var("DATA_GATEWAY_GRPC", "1");
         std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:1");
         reset_bridge();
-        let bridge = bridge_for("RealtimeQuotes")
-            .unwrap()
-            .expect("bridge 实例存在");
+        let bridge = bridge_for("RealtimeQuotes").expect("bridge 实例存在");
         let err = bridge.realtime_quotes(&["600519".to_string()]).unwrap_err();
         assert!(
             err.retryable(),
             "async worker 路径也必须 fail-closed retryable"
         );
-        std::env::remove_var("DATA_GATEWAY_GRPC");
         std::env::remove_var("GRPC_MARKET_ADDR");
         reset_bridge();
     }
 
     #[test]
-    fn startup_banner_defaults_to_library() {
+    fn startup_banner_is_grpc_only() {
         let _env = test_grpc_env_guard();
-        std::env::remove_var("DATA_GATEWAY_GRPC");
-        std::env::remove_var("DATA_GATEWAY_GRPC_DISABLED");
-        std::env::remove_var("GRPC_MARKET_ADDR");
-        let b = startup_banner();
-        assert!(
-            b.contains("数据源模式 = library"),
-            "默认必须 library (v15.x 出声): {b}"
-        );
-        assert!(
-            b.contains("server = http://127.0.0.1:18082"),
-            "默认地址: {b}"
-        );
-        assert!(b.contains("禁用 = 无"), "无禁用: {b}");
-        assert!(b.contains("保持本地 1 ops"), "keep-local 计数: {b}");
-    }
-
-    #[test]
-    fn startup_banner_grpc_mode_and_disabled() {
-        let _env = test_grpc_env_guard();
-        std::env::set_var("DATA_GATEWAY_GRPC", "1");
-        std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:19001");
-        std::env::set_var("DATA_GATEWAY_GRPC_DISABLED", "T0Evidence,InstrumentNews");
-        let b = startup_banner();
-        assert!(b.contains("数据源模式 = grpc"), "grpc 模式: {b}");
-        assert!(
-            b.contains("server = http://127.0.0.1:19001"),
-            "显式地址: {b}"
-        );
-        assert!(
-            b.contains("禁用 = T0Evidence,InstrumentNews"),
-            "禁用列表: {b}"
-        );
-        assert!(b.contains("保持本地 1 ops"), "keep-local 计数: {b}");
-        assert!(
-            b.contains("chain_batch op 61"),
-            "M4c keep-local 原因出声 (op 61 消费): {b}"
-        );
-        std::env::remove_var("DATA_GATEWAY_GRPC");
-        std::env::remove_var("DATA_GATEWAY_GRPC_DISABLED");
-        std::env::remove_var("GRPC_MARKET_ADDR");
+        let banner = startup_banner();
+        assert!(banner.contains("数据源模式 = grpc"), "{banner}");
+        assert!(!banner.contains("library"), "{banner}");
+        assert!(!banner.contains("保持本地"), "{banner}");
     }
 
     #[test]
     fn br231_external_bundle_is_captured_but_never_printed() {
         let _env = test_grpc_env_guard();
         let secret_marker = "/TEST_CODE_private_bundle_marker";
-        std::env::set_var("DATA_GATEWAY_GRPC", "1");
         std::env::set_var("GRPC_MARKET_CLIENT_BUNDLE", secret_marker);
         reset_bridge();
 
-        let bridge = bridge_for("SecurityMetadata")
-            .expect("bridge config")
-            .expect("bridge enabled");
+        let bridge = bridge_for("SecurityMetadata").expect("bridge config");
         assert_eq!(
             bridge.external_bundle.as_deref(),
             Some(std::path::Path::new(secret_marker))
@@ -5187,7 +5068,6 @@ mod tests {
             "bundle path must stay secret-safe: {banner}"
         );
 
-        std::env::remove_var("DATA_GATEWAY_GRPC");
         std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
         reset_bridge();
     }
@@ -5195,27 +5075,22 @@ mod tests {
     #[test]
     fn br231_security_identity_requires_external_bundle() {
         let _env = test_grpc_env_guard();
-        std::env::set_var("DATA_GATEWAY_GRPC", "1");
         std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
         reset_bridge();
 
-        let bridge = bridge_for("SecurityMetadata")
-            .expect("bridge config")
-            .expect("bridge enabled");
+        let bridge = bridge_for("SecurityMetadata").expect("bridge config");
         let error = block_on(bridge.ensure_external_connected(Operation::SecurityMetadata))
             .expect_err("identity must not fall back to the local bridge contract");
         assert_eq!(error.capability(), "GrpcExternalV1");
         assert_eq!(error.reason_code(), "external_bundle_unconfigured");
         assert!(!error.retryable());
 
-        std::env::remove_var("DATA_GATEWAY_GRPC");
         reset_bridge();
     }
 
     #[test]
     fn br238_configured_global_news_never_falls_back_to_local_bridge() {
         let _env = test_grpc_env_guard();
-        std::env::set_var("DATA_GATEWAY_GRPC", "1");
         std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:1");
         std::env::set_var(
             "GRPC_MARKET_CLIENT_BUNDLE",
@@ -5223,16 +5098,13 @@ mod tests {
         );
         reset_bridge();
 
-        let bridge = bridge_for("GlobalNews")
-            .expect("bridge config")
-            .expect("bridge enabled");
+        let bridge = bridge_for("GlobalNews").expect("bridge config");
         let error = block_on(bridge.global_news_async(GlobalNewsProvider::Jin10, 1))
             .expect_err("configured ExternalV1 failure must not fall back to LocalBridgeV1");
         assert_eq!(error.capability(), "GrpcExternalV1");
         assert_eq!(error.reason_code(), "external_bundle_invalid");
         assert!(!error.retryable());
 
-        std::env::remove_var("DATA_GATEWAY_GRPC");
         std::env::remove_var("GRPC_MARKET_ADDR");
         std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
         reset_bridge();
@@ -5241,7 +5113,6 @@ mod tests {
     #[test]
     fn br238_opening_readiness_requires_external_bundle() {
         let _env = test_grpc_env_guard();
-        std::env::set_var("DATA_GATEWAY_GRPC", "1");
         std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
         reset_bridge();
 
@@ -5250,7 +5121,6 @@ mod tests {
         assert_eq!(error.capability(), "GrpcExternalV1");
         assert_eq!(error.reason_code(), "external_bundle_unconfigured");
 
-        std::env::remove_var("DATA_GATEWAY_GRPC");
         reset_bridge();
     }
 
@@ -5357,20 +5227,16 @@ mod tests {
     #[test]
     fn br231_undelivered_external_contract_is_rejected_before_connection() {
         let _env = test_grpc_env_guard();
-        std::env::set_var("DATA_GATEWAY_GRPC", "1");
         std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
         reset_bridge();
 
-        let bridge = bridge_for("BoardConstituents")
-            .expect("bridge config")
-            .expect("bridge enabled");
+        let bridge = bridge_for("BoardConstituents").expect("bridge config");
         let error =
             block_on(bridge.query_external_op(Operation::BoardConstituents, serde_json::json!({})))
                 .expect_err("undelivered contract must be rejected before I/O");
         assert_eq!(error.reason_code(), "external_contract_rejected");
         assert!(!error.retryable());
 
-        std::env::remove_var("DATA_GATEWAY_GRPC");
         reset_bridge();
     }
 
@@ -5385,12 +5251,22 @@ mod tests {
     }
 
     #[test]
+    fn every_declared_operation_is_remote() {
+        assert!(KEEP_LOCAL_OPS.is_empty());
+        assert!(HOOKED_OPS.contains(&"StrongStockReasons"));
+        assert!(HOOKED_OPS.contains(&"ChainBatch"));
+    }
+
+    #[test]
     fn hooked_ops_match_bridge_for_call_sites() {
         // Spec Evidence Rule: banner 的 HOOKED_OPS 必须与真实钩子一致, 防 rot。
         // 扫 src/data_gateway/ 下除 grpc_source.rs 外各文件的 bridge_for 调用
         // (grpc_source.rs 自身的 bridge_for 是单测不是钩子), 去重后集合断言相等。
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/data_gateway");
-        let mut found: Vec<String> = Vec::new();
+        // These operations are owned by this module rather than a sibling
+        // gateway file: ChainBatch has a typed helper below, while
+        // StrongStockReasons is a declared remote-only contract view.
+        let mut found: Vec<String> = vec!["ChainBatch".to_owned(), "StrongStockReasons".to_owned()];
         let mut entries: Vec<_> = std::fs::read_dir(&dir)
             .expect("src/data_gateway 可读")
             .filter_map(|e| e.ok())

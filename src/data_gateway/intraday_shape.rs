@@ -50,11 +50,11 @@ impl IntradayShapeGateway {
     ) -> Result<GatewayBatch<IntradayShapeFact>, GatewayError> {
         let requested_code = code.to_owned();
         let request_hash = acquisition_request_hash(CAPABILITY, &requested_code);
-        // P4 M4b: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
+        // P4 M4b: gRPC 桥 (remote gRPC 时替换 transport; audit 留客户端)。
         // 先走本地 validate (非法 code → invalid_request 语义与 library 对等),
         // 再桥取形 (服务端 fetch_intraday_shape 按 codes 视图输出)。
         match super::grpc_source::bridge_for("IntradayShape") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let storage_code = match validate_requested_code(&requested_code) {
                     Ok(valid) => valid,
                     Err(error) => {
@@ -73,7 +73,6 @@ impl IntradayShapeGateway {
                     .unwrap_or(ProviderId::Tdx);
                 return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     CAPABILITY,

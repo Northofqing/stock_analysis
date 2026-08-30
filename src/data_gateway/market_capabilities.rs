@@ -183,10 +183,10 @@ impl MarketCapabilitiesGateway {
                 .unwrap_or_else(|| "current".to_owned())
         );
         let request_hash = acquisition_request_hash(MINUTE_CAPABILITY, &canonical);
-        // P4 M2 钩子: DATA_GATEWAY_GRPC=1 → gRPC 通道 (fail-closed, 连接失败
+        // P4 M2 钩子: remote gRPC → gRPC 通道 (fail-closed, 连接失败
         // 也走 audit 对等, 不绕过 DataAcquisitionAuditRecord)。
         match super::grpc_source::bridge_for("MinuteData") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.minute_data_async(&storage_code).await;
                 let audit_provider = result
                     .as_ref()
@@ -199,7 +199,6 @@ impl MarketCapabilitiesGateway {
                     result,
                 );
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     MINUTE_CAPABILITY,
@@ -219,7 +218,7 @@ impl MarketCapabilitiesGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]
@@ -260,7 +259,7 @@ impl MarketCapabilitiesGateway {
         let request_hash = acquisition_request_hash(ORDER_BOOK_CAPABILITY, storage_codes.join(","));
         // P4 M2 钩子: gRPC 通道 (fail-closed, audit 对等)。
         match super::grpc_source::bridge_for("OrderBooks") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.order_books_async(&storage_codes).await;
                 let audit_provider = result
                     .as_ref()
@@ -273,7 +272,6 @@ impl MarketCapabilitiesGateway {
                     result,
                 );
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     ORDER_BOOK_CAPABILITY,
@@ -291,7 +289,7 @@ impl MarketCapabilitiesGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]
@@ -336,7 +334,7 @@ impl MarketCapabilitiesGateway {
         let request_hash = acquisition_request_hash(MONEY_FLOW_CAPABILITY, storage_codes.join(","));
         // P4 M2 钩子: gRPC 通道 (fail-closed, audit 对等)。
         match super::grpc_source::bridge_for("MoneyFlows") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.money_flows_async(&storage_codes).await;
                 let audit_provider = result
                     .as_ref()
@@ -349,7 +347,6 @@ impl MarketCapabilitiesGateway {
                     result,
                 );
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     MONEY_FLOW_CAPABILITY,
@@ -367,7 +364,7 @@ impl MarketCapabilitiesGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]
@@ -421,7 +418,7 @@ impl MarketCapabilitiesGateway {
         // P4 M2 钩子: gRPC 通道 (fail-closed, audit 对等; library 路径仍是
         // unsupported_security_metadata 显式错误)。
         match super::grpc_source::bridge_for("SecurityMetadata") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.security_metadata_async(&storage_codes).await;
                 let audit_provider = result
                     .as_ref()
@@ -434,7 +431,6 @@ impl MarketCapabilitiesGateway {
                     result,
                 );
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     METADATA_CAPABILITY,
@@ -452,7 +448,7 @@ impl MarketCapabilitiesGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]
@@ -491,7 +487,7 @@ impl MarketCapabilitiesGateway {
         // ExternalV1 SecurityMetadata contract. A configured bridge failure is
         // audited and returned; it never falls back to a different provider.
         match super::grpc_source::bridge_for("SecurityMetadata") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.security_identities_async(&storage_codes).await;
                 let audit_provider = match &result {
                     Ok(batch) => batch.evidence().provider,
@@ -504,7 +500,6 @@ impl MarketCapabilitiesGateway {
                     result,
                 );
             }
-            Ok(None) => {}
             Err(error) => {
                 let audit_provider = error.provider().unwrap_or(ProviderId::Custom);
                 return audit_gateway_result(
@@ -525,7 +520,7 @@ impl MarketCapabilitiesGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]

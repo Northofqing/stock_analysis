@@ -211,10 +211,10 @@ impl HistoricalBarsGateway {
                 format!("fifteen_min_bars invalid count: {count} (1..=800)"),
             ));
         }
-        // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; 本地无 audit,
+        // P4 M3: gRPC 桥 (remote gRPC 时替换 transport; 本地无 audit,
         // 桥路径亦不 audit — 与本地行为一致)。
         match super::grpc_source::bridge_for("TechnicalBars") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let batch = bridge
                     .technical_bars(&[code.to_string()], count as u32)
                     .map_err(|error| {
@@ -236,7 +236,6 @@ impl HistoricalBarsGateway {
                 }
                 return Ok(records);
             }
-            Ok(None) => {}
             Err(error) => {
                 return Err(GatewayError::unavailable(
                     CAPABILITY,
@@ -256,7 +255,7 @@ impl HistoricalBarsGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]
@@ -289,9 +288,9 @@ impl HistoricalBarsGateway {
 
     pub fn daily_bars(&self, code: &str, days: usize) -> Result<AdmittedDailyBars, GatewayError> {
         let request_hash = acquisition_request_hash(CAPABILITY, format!("{code}:{days}"));
-        // P4 M2 钩子: DATA_GATEWAY_GRPC=1 → gRPC 通道 (fail-closed, audit 对等)。
+        // P4 M2 钩子: remote gRPC → gRPC 通道 (fail-closed, audit 对等)。
         match super::grpc_source::bridge_for("HistoricalBars") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.daily_bars(code, days);
                 let audit_provider = result
                     .as_ref()
@@ -301,7 +300,6 @@ impl HistoricalBarsGateway {
                     audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result)?;
                 return AdmittedDailyBars::from_audited_batch(code.to_owned(), audited);
             }
-            Ok(None) => {}
             Err(error) => {
                 let audited =
                     audit_gateway_result(CAPABILITY, ProviderId::Tdx, &request_hash, Err(error))?;
@@ -318,7 +316,7 @@ impl HistoricalBarsGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]
@@ -346,9 +344,9 @@ impl HistoricalBarsGateway {
     ) -> Result<AdmittedDailyBars, GatewayError> {
         let code = code.to_owned();
         let request_hash = acquisition_request_hash(CAPABILITY, format!("{code}:{days}"));
-        // P4 M2 钩子: DATA_GATEWAY_GRPC=1 → gRPC 通道 (async 路径, 不 block_on)。
+        // P4 M2 钩子: remote gRPC → gRPC 通道 (async 路径, 不 block_on)。
         match super::grpc_source::bridge_for("HistoricalBars") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.daily_bars_async(&code, days).await;
                 let audit_provider = result
                     .as_ref()
@@ -358,7 +356,6 @@ impl HistoricalBarsGateway {
                     audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result)?;
                 return AdmittedDailyBars::from_audited_batch(code, audited);
             }
-            Ok(None) => {}
             Err(error) => {
                 let audited =
                     audit_gateway_result(CAPABILITY, ProviderId::Tdx, &request_hash, Err(error))?;
@@ -375,7 +372,7 @@ impl HistoricalBarsGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]
@@ -455,7 +452,7 @@ impl HistoricalBarsGateway {
                 "provider_transport",
                 true,
                 &format!(
-                    "library transport disabled: DATA_GATEWAY_GRPC=1 required (code={code}, days={days})"
+                    "remote market-data transport required (code={code}, days={days})"
                 ),
             ));
         }

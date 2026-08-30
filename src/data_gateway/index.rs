@@ -55,9 +55,9 @@ impl IndexDataGateway {
         storage_codes: &[String],
     ) -> Result<GatewayBatch<RealtimeIndexQuote>, GatewayError> {
         let request_hash = acquisition_request_hash(CAPABILITY, storage_codes.join(","));
-        // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
+        // P4 M3: gRPC 桥 (remote gRPC 时替换 transport; audit 留客户端)。
         match super::grpc_source::bridge_for("IndexQuotes") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 if storage_codes.is_empty() {
                     return Err(GatewayError::invalid_request(
                         CAPABILITY,
@@ -71,7 +71,6 @@ impl IndexDataGateway {
                     .unwrap_or(ProviderId::Tencent);
                 return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     CAPABILITY,
@@ -91,7 +90,7 @@ impl IndexDataGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]

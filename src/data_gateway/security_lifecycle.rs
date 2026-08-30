@@ -273,7 +273,7 @@ impl SecurityLifecycleGateway {
         // window 顺序 + build_instrument (含 Beijing 拒绝)。审计留客户端
         // (audit_gateway_result), 与服务端审计双写 — ProviderTopNRankings 先例。
         match super::grpc_source::bridge_for("CorporateActions") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 if window_start > window_end {
                     return Err(GatewayError::invalid_request(
                         LIFECYCLE_CAPABILITY,
@@ -308,7 +308,6 @@ impl SecurityLifecycleGateway {
                     corporate_actions: action_state(actions),
                 });
             }
-            Ok(None) => {}
             Err(error) => {
                 return Err(GatewayError::unavailable(
                     LIFECYCLE_CAPABILITY,
@@ -329,7 +328,7 @@ impl SecurityLifecycleGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]

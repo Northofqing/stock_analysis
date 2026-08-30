@@ -35,7 +35,7 @@ pub const fn cffex_futures_delivery_live_supported() -> bool {
 }
 
 /// no-feature (monitor 零 magic): 进程内无 CffexClient, 契约无从读取。
-/// 诚实声明 = false → 启动 banner 走 warn 分支 (出声, 与 DATA_GATEWAY_GRPC=1
+/// 诚实声明 = false → 启动 banner 走 warn 分支 (出声, 与 remote gRPC
 /// 下 gRPC 通道独立承载 R-08 交付不冲突)。
 #[cfg(not(feature = "magic-gateway"))]
 pub const fn cffex_futures_delivery_live_supported() -> bool {
@@ -67,9 +67,9 @@ impl FuturesDeliveryGateway {
         month: u32,
     ) -> Result<GatewayBatch<FuturesDeliveryFact>, GatewayError> {
         let request_hash = acquisition_request_hash(CAPABILITY, format!("{year:04}-{month:02}"));
-        // P4 M3 钩子: DATA_GATEWAY_GRPC=1 → gRPC 通道 (fail-closed, audit 对等)。
+        // P4 M3 钩子: remote gRPC → gRPC 通道 (fail-closed, audit 对等)。
         match super::grpc_source::bridge_for("FuturesDelivery") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.futures_delivery_async().await;
                 let audit_provider = result
                     .as_ref()
@@ -77,7 +77,6 @@ impl FuturesDeliveryGateway {
                     .unwrap_or(ProviderId::Cffex);
                 return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     CAPABILITY,
@@ -97,7 +96,7 @@ impl FuturesDeliveryGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]

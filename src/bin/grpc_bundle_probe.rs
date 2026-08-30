@@ -327,7 +327,6 @@ async fn main() -> anyhow::Result<()> {
     // Exercise the same nine route canaries used by the production monitor.
     // The bundle path stays process-local and is never printed.
     std::env::set_var("GRPC_MARKET_CLIENT_BUNDLE", &bundle);
-    std::env::set_var("DATA_GATEWAY_GRPC", "1");
     stock_analysis::data_gateway::grpc_source::reset_bridge();
     let report =
         stock_analysis::data_gateway::grpc_source::external_static_opening_diagnostics()

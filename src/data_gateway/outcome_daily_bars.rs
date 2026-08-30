@@ -609,12 +609,12 @@ impl OutcomeDailyBarsGateway {
         let maximum_latest_n = plan.maximum_latest_n;
         let window_start = plan.window_start;
         let fetched = tokio::task::spawn_blocking(move || {
-            // P4 M3 transport seam: bridge 可用时 (DATA_GATEWAY_GRPC=1) 走 gRPC
+            // P4 M3 transport seam: bridge 可用时 (remote gRPC) 走 gRPC
             // 通道 — 服务端执行同一 adaptive transport, 客户端 convert 重建
             // RawOutcomeFetch / OutcomeTransportFailure (error+attempts 保真)。
             // claim 台账与 audit (下方 audit_gateway_result) 始终留客户端。
             match super::grpc_source::bridge_for("OutcomeDailyBars") {
-                Ok(Some(bridge)) => bridge.outcome_daily_bars_adaptive(
+                Ok(bridge) => bridge.outcome_daily_bars_adaptive(
                     instrument.clone(),
                     wire_market.clone(),
                     wire_code.clone(),
@@ -622,29 +622,6 @@ impl OutcomeDailyBarsGateway {
                     maximum_latest_n,
                     window_start,
                 ),
-                #[cfg(feature = "magic-gateway")]
-                Ok(None) => fetch_magic_tdx_outcome_adaptive(
-                    instrument,
-                    wire_market,
-                    wire_code,
-                    expected_bar_count,
-                    maximum_latest_n,
-                    window_start,
-                ),
-                // no-feature (monitor 零 magic 构建): library transport 编译期
-                // 不存在。无 bridge 时显式失败 (fail-closed), 绝不静默回退。
-                #[cfg(not(feature = "magic-gateway"))]
-                Ok(None) => Err(OutcomeTransportFailure::new(
-                    GatewayError::classified(
-                        CAPABILITY,
-                        Some(ProviderId::Tdx),
-                        "unavailable",
-                        "provider_transport",
-                        true,
-                        "library transport disabled: DATA_GATEWAY_GRPC=1 required",
-                    ),
-                    Vec::new(),
-                )),
                 Err(error) => Err(OutcomeTransportFailure::new(
                     GatewayError::unavailable(
                         CAPABILITY,

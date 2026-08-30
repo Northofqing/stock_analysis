@@ -1,13 +1,6 @@
-//! P4 M3 双进程 smoke: spawn 真 grpc_market_server 二进制 (fixture 模式, 随机端口) →
-//! 测试进程 DATA_GATEWAY_GRPC=1 → 桥驱动网关全部已 hook op fetch →
+//! Dual-process smoke: spawn the provider host in fixture mode on a random
+//! port, then exercise every hooked remote gateway operation.
 //! 断言 GatewayBatch / evidence / 数据保真。
-//!
-//! 独立测试 binary 的原因: DATA_GATEWAY_GRPC 是进程级 env + OnceLock SOURCE 缓存,
-//! 不能与 library 模式测试同进程 (env/缓存会跨测试泄漏)。
-//!
-//! 递归防护: server 子进程显式 env_remove("DATA_GATEWAY_GRPC") — delegate 内部调用
-//! 本地网关 (fetch_technical_bars → fifteen_min_bars 等), 若继承 env 会形成
-//! 桥 → 服务端 → 本地网关 → 桥 的无限递归。这是生产部署的强制约束 (M4 banner 文档化)。
 use chrono::{Duration, NaiveDate, Timelike};
 use magic_market_core::{
     AssetClass, Exchange, FlowInterval, InstrumentId, NorthboundChannel, ProviderId, StatementKind,
@@ -70,7 +63,6 @@ fn spawn_fixture_server(port: u16) -> FixtureServerGuard {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_grpc_market_server"));
     cmd.env("GRPC_GATEWAY_TEST_FIXTURE", "1")
         .env("GRPC_MARKET_PORT", port.to_string())
-        .env_remove("DATA_GATEWAY_GRPC") // 递归防护 (见文件头)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     FixtureServerGuard {
@@ -131,7 +123,6 @@ async fn raw_fixture_wire(
 #[tokio::test(flavor = "multi_thread")]
 async fn bridge_all_hooked_ops_fixture_roundtrip() {
     // env 是进程级 + bridge SOURCE 一次性缓存 → 单 test 覆盖全部 op。
-    std::env::set_var("DATA_GATEWAY_GRPC", "1");
     // audit_gateway_result (桥路径 audit 留客户端) 写 DataAcquisitionAuditRecord →
     // 需数据库初始化 (与 e2e_dedup.rs 同模式)。
     std::fs::create_dir_all("./test_data").ok();
@@ -145,9 +136,7 @@ async fn bridge_all_hooked_ops_fixture_roundtrip() {
     let mut server = spawn_fixture_server(port);
     std::env::set_var("GRPC_MARKET_ADDR", format!("http://127.0.0.1:{port}"));
     wait_ready(port).await;
-    let bridge = grpc_source::bridge_for("OutcomeDailyBars")
-        .expect("TEST_CODE bridge lookup")
-        .expect("DATA_GATEWAY_GRPC enables one local bridge");
+    let bridge = grpc_source::bridge_for("OutcomeDailyBars").expect("TEST_CODE bridge lookup");
     let test_code = "TEST_CODE_600519".to_owned();
     let mut raw_client = GrpcMarketClient::connect(&format!("http://127.0.0.1:{port}"))
         .await
@@ -583,7 +572,6 @@ async fn bridge_all_hooked_ops_fixture_roundtrip() {
         move || {
             grpc_source::bridge_for("OutcomeDailyBars")
                 .expect("bridge")
-                .expect("桥未启用")
                 .outcome_daily_bars_adaptive(
                     InstrumentId::new(Exchange::Shanghai, "TEST_CODE_600519", AssetClass::Equity)
                         .expect("instrument"),

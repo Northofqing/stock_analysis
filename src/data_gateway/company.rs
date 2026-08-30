@@ -63,9 +63,9 @@ impl CompanyDataGateway {
             FINANCIAL_CAPABILITY,
             format!("{kind:?}:{}", storage_codes.join(",")),
         );
-        // P4 M4b: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
+        // P4 M4b: gRPC 桥 (remote gRPC 时替换 transport; audit 留客户端)。
         match super::grpc_source::bridge_for("FinancialStatements") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge
                     .financial_statements_async(&storage_codes, kind)
                     .await;
@@ -80,7 +80,6 @@ impl CompanyDataGateway {
                     result,
                 );
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     FINANCIAL_CAPABILITY,
@@ -100,7 +99,7 @@ impl CompanyDataGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]
@@ -166,9 +165,9 @@ impl CompanyDataGateway {
     ) -> Result<GatewayBatch<MarketStatistics>, GatewayError> {
         let storage_codes = codes.to_vec();
         let request_hash = acquisition_request_hash(STATISTICS_CAPABILITY, storage_codes.join(","));
-        // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
+        // P4 M3: gRPC 桥 (remote gRPC 时替换 transport; audit 留客户端)。
         match super::grpc_source::bridge_for("MarketStatistics") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.market_statistics_async(&storage_codes).await;
                 let audit_provider = result
                     .as_ref()
@@ -181,7 +180,6 @@ impl CompanyDataGateway {
                     result,
                 );
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     STATISTICS_CAPABILITY,
@@ -201,7 +199,7 @@ impl CompanyDataGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]

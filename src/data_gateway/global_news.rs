@@ -185,9 +185,9 @@ impl GlobalNewsGateway {
         let provider_id = provider.provider_id();
         let request_hash =
             acquisition_request_hash(capability, format!("{}:{limit}", provider.source()));
-        // P4 M3 钩子: DATA_GATEWAY_GRPC=1 → gRPC 通道 (fail-closed, audit 对等)。
+        // P4 M3 钩子: remote gRPC → gRPC 通道 (fail-closed, audit 对等)。
         match super::grpc_source::bridge_for("GlobalNews") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.global_news_async(provider, limit).await;
                 let audit_provider = result
                     .as_ref()
@@ -195,7 +195,6 @@ impl GlobalNewsGateway {
                     .unwrap_or(provider_id);
                 return audit_gateway_result(capability, audit_provider, &request_hash, result);
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(capability, provider_id, &request_hash, Err(error));
             }
@@ -210,7 +209,7 @@ impl GlobalNewsGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]

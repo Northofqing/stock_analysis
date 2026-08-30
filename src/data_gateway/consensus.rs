@@ -44,9 +44,9 @@ impl ConsensusDataGateway {
             CAPABILITY,
             format!("{code}:{REPORT_WINDOW_DAYS}:{REPORT_LIMIT}"),
         );
-        // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
+        // P4 M3: gRPC 桥 (remote gRPC 时替换 transport; audit 留客户端)。
         match super::grpc_source::bridge_for("Consensus") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.consensus_async(&code).await;
                 let audit_provider = result
                     .as_ref()
@@ -54,7 +54,6 @@ impl ConsensusDataGateway {
                     .unwrap_or(ProviderId::Eastmoney);
                 return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     CAPABILITY,
@@ -74,7 +73,7 @@ impl ConsensusDataGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]

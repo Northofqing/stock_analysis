@@ -79,10 +79,10 @@ impl SinaInstrumentNewsGateway {
                 to.to_rfc3339()
             ),
         );
-        // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
+        // P4 M3: gRPC 桥 (remote gRPC 时替换 transport; audit 留客户端)。
         // from_days 契约: 生产调用方传 now-30d..now, 等价服务端"近 N 日"语义。
         match super::grpc_source::bridge_for("InstrumentNews") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let from_days = (to - from).num_days().clamp(1, 30) as u32;
                 let result = bridge
                     .instrument_news_async(std::slice::from_ref(&code), from_days)
@@ -93,7 +93,6 @@ impl SinaInstrumentNewsGateway {
                     .unwrap_or(ProviderId::Sina);
                 return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     CAPABILITY,
@@ -113,7 +112,7 @@ impl SinaInstrumentNewsGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]

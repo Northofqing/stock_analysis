@@ -2193,7 +2193,6 @@ mod tests {
     async fn grpc_env_guard_benchmark_delegate_uses_library_without_recursion() {
         let _env = crate::data_gateway::grpc_source::test_grpc_env_guard();
         crate::database::DatabaseManager::init(None).expect("TEST_CODE audit database init");
-        std::env::set_var("DATA_GATEWAY_GRPC", "1");
         std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:1");
         crate::data_gateway::grpc_source::reset_bridge();
 
@@ -2208,8 +2207,6 @@ mod tests {
         )
         .expect("TEST_CODE request JSON");
         let result = fetch_benchmark_bars(&params).await;
-
-        std::env::remove_var("DATA_GATEWAY_GRPC");
         std::env::remove_var("GRPC_MARKET_ADDR");
         crate::data_gateway::grpc_source::reset_bridge();
 

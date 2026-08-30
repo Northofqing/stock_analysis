@@ -207,9 +207,9 @@ impl MarketDataGateway {
         codes: &[String],
     ) -> Result<GatewayBatch<RealtimeMarketQuote>, GatewayError> {
         let request_hash = acquisition_request_hash(CAPABILITY, codes.join(","));
-        // P4 M2 钩子: DATA_GATEWAY_GRPC=1 → gRPC 通道 (fail-closed, audit 对等)。
+        // P4 M2 钩子: remote gRPC → gRPC 通道 (fail-closed, audit 对等)。
         match super::grpc_source::bridge_for("RealtimeQuotes") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.realtime_quotes(codes);
                 let audit_provider = result
                     .as_ref()
@@ -217,7 +217,6 @@ impl MarketDataGateway {
                     .unwrap_or(ProviderId::Tdx);
                 return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     CAPABILITY,
@@ -237,7 +236,7 @@ impl MarketDataGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]
@@ -301,7 +300,7 @@ impl MarketDataGateway {
                 "unavailable",
                 "provider_transport",
                 true,
-                "library transport disabled: DATA_GATEWAY_GRPC=1 required",
+                "remote market-data transport required",
             ));
         }
         #[cfg(feature = "magic-gateway")]
