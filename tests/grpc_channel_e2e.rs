@@ -1,10 +1,11 @@
-//! 集成测试: 真起 grpc_server (fixture 模式, 随机端口) → GrpcMarketClient 调用。
+//! Integration test: start a test-local fixture server on a random port.
 //! 离线确定性, 不连真实网络。
+mod support;
+
 use regex::Regex;
 use stock_analysis::grpc_client::client::GrpcMarketClient;
 use stock_analysis::grpc_client::pb::magic::market::v1::{EventCursor, EventFilter, Operation};
-use stock_analysis::grpc_server::events::{DetectedEvent, EventHub, EventKind};
-use stock_analysis::grpc_server::{start, ServerConfig};
+use support::grpc_fixture::{start_fixture_server, DetectedEvent, EventHub, EventKind};
 
 #[derive(Clone, Copy)]
 enum Task6SourceKind {
@@ -106,8 +107,8 @@ fn preceding_identity_field(source: &str, literal_start: usize) -> bool {
 fn task6_fixture_sources_use_only_test_security_identities() {
     let sources = [
         (
-            "src/grpc_server/fixture.rs",
-            include_str!("../src/grpc_server/fixture.rs"),
+            "tests/support/grpc_fixture/data.rs",
+            include_str!("support/grpc_fixture/data.rs"),
             Task6SourceKind::FixtureOrE2e,
         ),
         (
@@ -163,14 +164,8 @@ fn task6_identity_guard_ignores_ports_times_and_numeric_values() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn health_and_capabilities() {
-    let (addr, handle, _hub) = start(ServerConfig {
-        fixture_mode: true,
-        port: 0,
-        ..Default::default()
-    })
-    .await
-    .unwrap();
-    let addr = format!("http://{addr}");
+    let server = start_fixture_server(0).await.unwrap();
+    let addr = format!("http://{}", server.addr());
     let mut client = GrpcMarketClient::connect(&addr).await.unwrap();
     let health = client.get_health().await.unwrap();
     assert!(health.live && health.ready);
@@ -183,19 +178,12 @@ async fn health_and_capabilities() {
     assert!(caps
         .iter()
         .any(|capability| capability.operation == Operation::BenchmarkBars as i32));
-    handle.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn fixture_operations_roundtrip() {
-    let (addr, handle, _hub) = start(ServerConfig {
-        fixture_mode: true,
-        port: 0,
-        ..Default::default()
-    })
-    .await
-    .unwrap();
-    let mut client = GrpcMarketClient::connect(&format!("http://{addr}"))
+    let server = start_fixture_server(0).await.unwrap();
+    let mut client = GrpcMarketClient::connect(&format!("http://{}", server.addr()))
         .await
         .unwrap();
 
@@ -367,19 +355,13 @@ async fn fixture_operations_roundtrip() {
         };
         assert!(haystack.contains(probe), "{schema} 内容含 {probe}");
     }
-    handle.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn subscribe_receives_injected_events_with_monotonic_cursor() {
-    let (addr, handle, hub) = start(ServerConfig {
-        fixture_mode: true,
-        port: 0,
-        ..Default::default()
-    })
-    .await
-    .unwrap();
-    let mut client = GrpcMarketClient::connect(&format!("http://{addr}"))
+    let server = start_fixture_server(0).await.unwrap();
+    let hub = server.hub();
+    let mut client = GrpcMarketClient::connect(&format!("http://{}", server.addr()))
         .await
         .unwrap();
     let mut stream = client
@@ -417,7 +399,6 @@ async fn subscribe_receives_injected_events_with_monotonic_cursor() {
     let cursor = envelope.cursor.unwrap();
     assert_eq!(cursor.sequence, 1);
     assert_eq!(cursor.generation, hub.latest_cursor().generation);
-    handle.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -449,14 +430,9 @@ async fn set_watchlist_then_status_match_then_subscribe_filter() {
     // README (client-bundle) 流程: SetWatchlist 完全替换 → GetListenerStatus
     // 直到 desired/applied revisions+lists 匹配 → Subscribe.filter.instruments
     // 只过滤投递事件。本地 server 同步应用 (desired==applied), 一次即匹配。
-    let (addr, handle, hub) = start(ServerConfig {
-        fixture_mode: true,
-        port: 0,
-        ..Default::default()
-    })
-    .await
-    .unwrap();
-    let mut client = GrpcMarketClient::connect(&format!("http://{addr}"))
+    let server = start_fixture_server(0).await.unwrap();
+    let hub = server.hub();
+    let mut client = GrpcMarketClient::connect(&format!("http://{}", server.addr()))
         .await
         .unwrap();
 
@@ -525,19 +501,12 @@ async fn set_watchlist_then_status_match_then_subscribe_filter() {
         got.instrument, "TEST_CODE_600519",
         "filter 只投递 TEST_CODE_600519, TEST_CODE_000001 被过滤"
     );
-    handle.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn unknown_schema_rejected() {
-    let (addr, handle, _hub) = start(ServerConfig {
-        fixture_mode: true,
-        port: 0,
-        ..Default::default()
-    })
-    .await
-    .unwrap();
-    let mut client = GrpcMarketClient::connect(&format!("http://{addr}"))
+    let server = start_fixture_server(0).await.unwrap();
+    let mut client = GrpcMarketClient::connect(&format!("http://{}", server.addr()))
         .await
         .unwrap();
     // OptionData 未实现 → 客户端拦截。
@@ -549,5 +518,4 @@ async fn unknown_schema_rejected() {
         err,
         stock_analysis::grpc_client::errors::GrpcError::Unimplemented { .. }
     ));
-    handle.abort();
 }

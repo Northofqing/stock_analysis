@@ -222,18 +222,13 @@ where
 // 修复 Top10#7 (2026-06-29 audit): 共享 HTTP client (4 个预配置, 避免 28 处散落 builder)
 pub mod http_client;
 
-// grpc 数据通道 (docs/superpowers/plans/2026-08-13-grpc-data-channel.md Task 1):
-// 合同注册表 (服务端/客户端共享) + 客户端网络层; 唯一合同源 grpc/market.proto
+// gRPC client data channel: the contract registry and network client share the
+// single protobuf source in grpc/market.proto. The provider host lives outside
+// this repository.
 pub mod grpc_client;
 pub mod grpc_contract;
-/// M5 (Task #76): grpc_market_server 是 magic-* 数据提供者宿主 — 只在
-/// magic-gateway (默认) 构建存在。monitor (--no-default-features) 不编译
-/// server, 走 grpc_client 桥。仅 src/bin/grpc_market_server.rs 引用。
-#[cfg(feature = "magic-gateway")]
-pub mod grpc_server;
 
-// M5 (Task #76): magic-* 类型兼容层 — feature 开 = 重导出真实类型,
-// feature 关 (monitor --no-default-features) = 本地镜像 (serde/Debug 与上游一致)
+// Provider-neutral market domain types owned by this client repository.
 pub mod market_domain;
 
 #[cfg(test)]

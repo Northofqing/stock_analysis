@@ -1,5 +1,5 @@
-//! fixture 数据 (离线确定性测试): GRPC_GATEWAY_TEST_FIXTURE=1 时 handler 返回这些数据。
-use crate::grpc_client::pb::magic::market::v1::{
+//! Provider-neutral canned responses for the integration-test fixture server.
+use stock_analysis::grpc_client::pb::magic::market::v1::{
     AdmissionState, CanonicalPayload, Operation, QueryResponse,
 };
 

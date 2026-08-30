@@ -17,8 +17,9 @@ const REQUIRED_OPERATIONS: [Operation; 4] = [
 
 #[derive(Parser)]
 struct Args {
-    #[arg(long, default_value = "http://127.0.0.1:18083")]
-    addr: String,
+    /// External market-data service address. `--addr` overrides GRPC_MARKET_ADDR.
+    #[arg(long)]
+    addr: Option<String>,
     #[arg(long, default_value = "600396")]
     code: String,
 }
@@ -115,7 +116,11 @@ fn daily_failure(records: usize) -> Option<anyhow::Error> {
 
 async fn run(args: Args) -> anyhow::Result<()> {
     let code = args.code.clone();
-    let mut client = GrpcMarketClient::connect(&args.addr)
+    let addr = args
+        .addr
+        .or_else(|| std::env::var("GRPC_MARKET_ADDR").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:18083".to_owned());
+    let mut client = GrpcMarketClient::connect(&addr)
         .await
         .map_err(|error| safe_grpc("Connect", error))?;
 
@@ -249,7 +254,6 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use stock_analysis::grpc_client::errors::ErrorDetail;
-    use stock_analysis::grpc_server::{start, ServerConfig};
 
     fn admitted_capability(operation: Operation) -> Capability {
         Capability {
@@ -406,7 +410,7 @@ mod tests {
         let addr = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
         let error = run(Args {
-            addr,
+            addr: Some(addr),
             code: "TEST_CODE_LEAK_SENTINEL_9F3A".to_string(),
         })
         .await
@@ -415,33 +419,5 @@ mod tests {
 
         assert!(safe.contains("operation=Connect"));
         assert!(!safe.contains("TEST_CODE_LEAK_SENTINEL_9F3A"));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn isolated_fixture_probe_reaches_t0_and_fails_closed_on_test_identity() {
-        let (addr, handle, _hub) = start(ServerConfig {
-            fixture_mode: true,
-            port: 0,
-            ..Default::default()
-        })
-        .await
-        .expect("TEST_CODE fixture server");
-
-        let error = run(Args {
-            addr: format!("http://{addr}"),
-            code: "TEST_CODE_600519".to_owned(),
-        })
-        .await
-        .expect_err("production T0 resolver must reject TEST_CODE after safe earlier probes");
-        handle.abort();
-
-        let safe = error.to_string();
-        assert_eq!(
-            safe,
-            "operation=T0Evidence reason_code=invalid_evidence retryable=false"
-        );
-        for forbidden in ["TEST_CODE_600519", "price", "token", "/"] {
-            assert!(!safe.contains(forbidden), "probe error leaked {forbidden}");
-        }
     }
 }

@@ -1,13 +1,9 @@
-//! Dual-process smoke: spawn the provider host in fixture mode on a random
-//! port, then exercise every hooked remote gateway operation.
+//! Start a test-local fixture server, then exercise every hooked remote gateway operation.
 //! 断言 GatewayBatch / evidence / 数据保真。
+mod support;
+
 use chrono::{Duration, NaiveDate, Timelike};
-use magic_market_core::{
-    AssetClass, Exchange, FlowInterval, InstrumentId, NorthboundChannel, ProviderId, StatementKind,
-};
 use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::time::{Duration as StdDuration, Instant};
 use stock_analysis::data_gateway::board_ranking::BoardRankingGateway;
 use stock_analysis::data_gateway::{
     grpc_source, BlockTradesGateway, BoardDataGateway, BoardKind, CapitalDataGateway,
@@ -19,56 +15,10 @@ use stock_analysis::database::DatabaseManager;
 use stock_analysis::grpc_client::client::GrpcMarketClient;
 use stock_analysis::grpc_client::envelope::QueryResult;
 use stock_analysis::grpc_client::pb::magic::market::v1::{AdmissionState, Operation};
-
-/// 拿空闲端口 (绑定后 drop; 竞态窗口对测试可接受)。
-fn free_port() -> u16 {
-    std::net::TcpListener::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-struct FixtureServerGuard {
-    child: Option<Child>,
-}
-
-impl FixtureServerGuard {
-    fn terminate_and_reap(&mut self) -> std::io::Result<ExitStatus> {
-        let child = self.child.as_mut().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "fixture server child already reaped",
-            )
-        })?;
-        // kill may report InvalidInput if the server exited between the last
-        // assertion and cleanup. wait remains mandatory so the child is reaped.
-        let _ = child.kill();
-        let status = child.wait()?;
-        self.child = None;
-        Ok(status)
-    }
-}
-
-impl Drop for FixtureServerGuard {
-    fn drop(&mut self) {
-        if self.child.is_some() {
-            let _ = self.terminate_and_reap();
-        }
-    }
-}
-
-/// spawn fixture 模式 server (cargo 为集成测试提供 CARGO_BIN_EXE_* 路径)。
-fn spawn_fixture_server(port: u16) -> FixtureServerGuard {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_grpc_market_server"));
-    cmd.env("GRPC_GATEWAY_TEST_FIXTURE", "1")
-        .env("GRPC_MARKET_PORT", port.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    FixtureServerGuard {
-        child: Some(cmd.spawn().expect("spawn grpc_market_server")),
-    }
-}
+use stock_analysis::market_domain::{
+    AssetClass, Exchange, FlowInterval, InstrumentId, NorthboundChannel, ProviderId, StatementKind,
+};
+use support::start_fixture_server;
 
 /// sync 网关方法 (realtime_quotes/fifteen_min_bars/fetch_top/index/t0) 的调用
 /// 契约: block_on 判别器三路安全 (async worker → 独立线程; spawn_blocking →
@@ -82,19 +32,6 @@ where
     tokio::task::spawn_blocking(f)
         .await
         .unwrap_or_else(|e| panic!("spawn_blocking join 失败 ({what}): {e}"))
-}
-
-/// TCP 可达 + 短暂稳定窗口后返回。
-async fn wait_ready(port: u16) {
-    let deadline = Instant::now() + StdDuration::from_secs(15);
-    while Instant::now() < deadline {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            tokio::time::sleep(StdDuration::from_millis(500)).await;
-            return;
-        }
-        tokio::time::sleep(StdDuration::from_millis(100)).await;
-    }
-    panic!("grpc_market_server 15s 内未就绪 (port {port})");
 }
 
 async fn raw_fixture_wire(
@@ -132,13 +69,14 @@ async fn bridge_all_hooked_ops_fixture_roundtrip() {
     ));
     DatabaseManager::init(Some(db_path)).expect("audit database init");
     grpc_source::reset_bridge();
-    let port = free_port();
-    let mut server = spawn_fixture_server(port);
-    std::env::set_var("GRPC_MARKET_ADDR", format!("http://127.0.0.1:{port}"));
-    wait_ready(port).await;
+    let server = start_fixture_server(0)
+        .await
+        .expect("start test-local fixture server");
+    let addr = format!("http://{}", server.addr());
+    std::env::set_var("GRPC_MARKET_ADDR", &addr);
     let bridge = grpc_source::bridge_for("OutcomeDailyBars").expect("TEST_CODE bridge lookup");
     let test_code = "TEST_CODE_600519".to_owned();
-    let mut raw_client = GrpcMarketClient::connect(&format!("http://127.0.0.1:{port}"))
+    let mut raw_client = GrpcMarketClient::connect(&addr)
         .await
         .expect("connect raw fixture client");
 
@@ -602,8 +540,6 @@ async fn bridge_all_hooked_ops_fixture_roundtrip() {
         "OutcomeDailyBars quality 保真"
     );
 
-    server
-        .terminate_and_reap()
-        .expect("terminate and reap server");
+    server.stop().await;
     grpc_source::reset_bridge();
 }
