@@ -157,6 +157,8 @@ fn safe_wire_provider(value: &str) -> Option<String> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KnownReasonCode {
+    /// 业务态: 180 天窗口无研究报告 (server 分类, BR-159 保真还原, 非错误)。
+    NoCurrentReports,
     NoVerifiedBatch,
     InvalidRequest,
     InvalidEvidence,
@@ -181,6 +183,7 @@ enum KnownReasonCode {
 impl KnownReasonCode {
     fn from_wire(value: &str) -> Option<Self> {
         Some(match value {
+            "no_current_reports" => Self::NoCurrentReports,
             "no_verified_batch" => Self::NoVerifiedBatch,
             "invalid_request" => Self::InvalidRequest,
             "invalid_evidence" => Self::InvalidEvidence,
@@ -208,6 +211,7 @@ impl KnownReasonCode {
 
     const fn as_str(self) -> &'static str {
         match self {
+            Self::NoCurrentReports => "no_current_reports",
             Self::NoVerifiedBatch => "no_verified_batch",
             Self::InvalidRequest => "invalid_request",
             Self::InvalidEvidence => "invalid_evidence",
@@ -573,6 +577,32 @@ mod tests {
         assert_eq!(request_43.len(), "sha256:".len() + 64);
         assert_ne!(request_43, "req-43");
         assert_ne!(request_43, request_42);
+    }
+
+    /// BR-159: server 分类 no_current_reports (业务态: 180 天窗口无报告) 必须在
+    /// wire 解码层保真 — safe_wire_reason_code 的 KnownReasonCode 白名单不能把它
+    /// 折叠成 internal (2026-08-30 诊断: client 侧 13 只股票 audit 仍显示 internal,
+    /// 折叠发生在 grpc_client/errors.rs, 早于 grpc_source.rs 的 reason_code_static)。
+    #[test]
+    fn no_current_reports_survives_wire_detail_decode() {
+        let detail = crate::grpc_client::pb::magic::market::v1::ErrorDetail {
+            request_id: "req-ncr".to_string(),
+            operation: 8,
+            provider: "Eastmoney".to_string(),
+            reason_code: "no_current_reports".to_string(),
+            retryable: false,
+            ..Default::default()
+        };
+        let status =
+            tonic::Status::with_details(Code::Internal, "取数失败", detail.encode_to_vec().into());
+        let err = GrpcError::from(status);
+        assert!(matches!(err, GrpcError::Internal { .. }));
+        assert_eq!(err.details().provider.as_deref(), Some("Eastmoney"));
+        assert_eq!(
+            err.details().reason_code.as_deref(),
+            Some("no_current_reports")
+        );
+        assert_eq!(err.details().retryable, Some(false));
     }
 
     #[test]
