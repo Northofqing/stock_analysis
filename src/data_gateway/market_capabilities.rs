@@ -1,9 +1,8 @@
 //! BR-164 evidence-preserving market capability gateways.
 //!
-//! Each route is ordered only by capabilities implemented at the pinned
-//! `magic-market-data-rs` revision. A source can win only with an
-//! identity-consistent batch that carries all evidence and fields required by
-//! that consumer contract. Missing fields never become zeroes.
+//! Provider order is part of the versioned remote contract. A source can win
+//! only with an identity-consistent batch carrying every field and evidence
+//! item required by the consumer. Missing fields never become zeroes.
 
 use crate::market_domain::ProviderId;
 

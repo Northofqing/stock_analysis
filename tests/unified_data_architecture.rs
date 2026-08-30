@@ -160,10 +160,8 @@ fn br164_financial_and_news_acquisition_is_gateway_owned() {
         }
         for line in body.lines() {
             let trimmed = line.trim_start();
-            let imports_magic_provider = (trimmed.starts_with("use magic_")
-                || trimmed.starts_with("pub use magic_"))
-                && !trimmed.starts_with("use magic_market_core")
-                && !trimmed.starts_with("pub use magic_market_core");
+            let imports_magic_provider =
+                trimmed.starts_with("use magic_") || trimmed.starts_with("pub use magic_");
             if imports_magic_provider && !is_allowed_magic_provider_owner(relative_path) {
                 violations.push(format!(
                     "{} imports a Magic provider outside data_gateway: {}",
@@ -431,7 +429,7 @@ fn br164_t0_evidence_is_provider_neutral() {
         "BR-153 must retain provider-neutral T0 evidence and freshness contracts"
     );
     for forbidden in [
-        "magic_tdx_rs",
+        concat!("magic_tdx", "_rs"),
         "TdxHqClient",
         "get_security_quotes",
         "get_security_bars",

@@ -6,17 +6,12 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
-use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const MAX_RESULTS: usize = 50;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -59,14 +54,6 @@ impl GeneralWebResearchProvider {
             "Tavily" => Some(Self::Tavily),
             "SerpApi" => Some(Self::SerpApi),
             _ => None,
-        }
-    }
-
-    const fn credential_env_name(self) -> &'static str {
-        match self {
-            Self::Bocha => "BOCHA_API_KEYS",
-            Self::Tavily => "TAVILY_API_KEYS",
-            Self::SerpApi => "SERPAPI_KEYS",
         }
     }
 }
@@ -221,42 +208,17 @@ struct RawResearchRecord {
 #[derive(Clone)]
 pub struct GeneralWebResearchGateway {
     provider: GeneralWebResearchProvider,
-    api_keys: Arc<Vec<String>>,
-    key_cursor: Arc<AtomicUsize>,
-    client: reqwest::Client,
 }
 
 impl GeneralWebResearchGateway {
-    pub fn new(provider: GeneralWebResearchProvider, api_keys: Vec<String>) -> Self {
-        let api_keys = api_keys
-            .into_iter()
-            .map(|key| key.trim().to_string())
-            .filter(|key| !key.is_empty())
-            .collect();
-        Self {
-            provider,
-            api_keys: Arc::new(api_keys),
-            key_cursor: Arc::new(AtomicUsize::new(0)),
-            client: reqwest::Client::new(),
-        }
+    pub const fn new(provider: GeneralWebResearchProvider) -> Self {
+        Self { provider }
     }
 
-    /// Build from process credentials without exposing the environment
-    /// variable name outside the Gateway boundary.
+    /// Compatibility factory for callers that construct all gateways from
+    /// process configuration. Provider credentials live in the remote host.
     pub fn from_environment(provider: GeneralWebResearchProvider) -> Self {
-        let api_keys = std::env::var(provider.credential_env_name())
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| {
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|key| !key.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-        Self::new(provider, api_keys)
+        Self::new(provider)
     }
 
     pub const fn provider(&self) -> GeneralWebResearchProvider {
@@ -264,8 +226,8 @@ impl GeneralWebResearchGateway {
     }
 
     pub fn is_available(&self) -> bool {
-        // P4 M4b 批次 1B: grpc 模式桥存在即视为可用 (API key 服务端持有)。
-        // 保持 SearchService 路由语义 — 桥故障在调用时显式报错, 不静默回退。
+        // The remote host owns credentials. Bridge initialization is the only
+        // local availability signal; call failures remain explicit.
         super::grpc_source::bridge_for("SemanticSearch").is_ok()
     }
 
@@ -284,7 +246,6 @@ impl GeneralWebResearchGateway {
                 format!("query must be non-empty and limit must be within 1..={MAX_RESULTS}"),
             ));
         }
-        // BR-242: grpc 模式保留调用方选择的 exact provider，API key 仍由服务端持有。
         match super::grpc_source::bridge_for("SemanticSearch") {
             Ok(bridge) => {
                 return match bridge
@@ -311,277 +272,6 @@ impl GeneralWebResearchGateway {
                 ));
             }
         }
-        let api_key = self.next_key().ok_or_else(|| {
-            GeneralWebResearchError::new(
-                self.provider,
-                "missing_credentials",
-                false,
-                GeneralWebResearchStage::Request,
-                "no non-empty API key is configured",
-            )
-        })?;
-        let observed_at = Utc::now();
-        let raw = match self.provider {
-            GeneralWebResearchProvider::Bocha => self.search_bocha(query, limit, api_key).await?,
-            GeneralWebResearchProvider::Tavily => self.search_tavily(query, limit, api_key).await?,
-            GeneralWebResearchProvider::SerpApi => {
-                self.search_serpapi(query, limit, api_key).await?
-            }
-        };
-        admit_records(self.provider, query, limit, observed_at, raw)
-    }
-
-    fn next_key(&self) -> Option<&str> {
-        let len = self.api_keys.len();
-        if len == 0 {
-            return None;
-        }
-        let index = self.key_cursor.fetch_add(1, Ordering::Relaxed) % len;
-        self.api_keys.get(index).map(String::as_str)
-    }
-
-    async fn search_bocha(
-        &self,
-        query: &str,
-        limit: usize,
-        api_key: &str,
-    ) -> Result<Vec<RawResearchRecord>, GeneralWebResearchError> {
-        #[derive(Serialize)]
-        struct Request<'a> {
-            query: &'a str,
-            freshness: &'static str,
-            summary: bool,
-            count: usize,
-        }
-        #[derive(Deserialize)]
-        struct Page {
-            name: String,
-            snippet: Option<String>,
-            summary: Option<String>,
-            url: String,
-            #[serde(rename = "siteName")]
-            site_name: Option<String>,
-            #[serde(rename = "datePublished")]
-            date_published: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct Pages {
-            value: Vec<Page>,
-        }
-        #[derive(Deserialize)]
-        struct Data {
-            #[serde(rename = "webPages")]
-            web_pages: Option<Pages>,
-        }
-        #[derive(Deserialize)]
-        struct Response {
-            code: u32,
-            msg: Option<String>,
-            data: Option<Data>,
-        }
-
-        let response = self
-            .client
-            .post("https://api.bocha.cn/v1/web-search")
-            .bearer_auth(api_key)
-            .json(&Request {
-                query,
-                freshness: "oneWeek",
-                summary: true,
-                count: limit,
-            })
-            .timeout(REQUEST_TIMEOUT)
-            .send()
-            .await
-            .map_err(|error| self.transport_error(error))?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(self.status_error(status));
-        }
-        let payload: Response = response
-            .json()
-            .await
-            .map_err(|error| self.protocol_error(error))?;
-        if payload.code != 200 {
-            return Err(GeneralWebResearchError::new(
-                self.provider,
-                "provider_rejected",
-                false,
-                GeneralWebResearchStage::Protocol,
-                payload
-                    .msg
-                    .unwrap_or_else(|| format!("provider code {}", payload.code)),
-            ));
-        }
-        Ok(payload
-            .data
-            .and_then(|data| data.web_pages)
-            .map(|pages| pages.value)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|page| RawResearchRecord {
-                title: page.name,
-                snippet: page.summary.or(page.snippet).unwrap_or_default(),
-                url: page.url,
-                publisher: page.site_name,
-                published_at_raw: page.date_published,
-            })
-            .collect())
-    }
-
-    async fn search_tavily(
-        &self,
-        query: &str,
-        limit: usize,
-        api_key: &str,
-    ) -> Result<Vec<RawResearchRecord>, GeneralWebResearchError> {
-        #[derive(Serialize)]
-        struct Request<'a> {
-            query: &'a str,
-            search_depth: &'static str,
-            max_results: usize,
-            include_answer: bool,
-            include_raw_content: bool,
-            days: u32,
-        }
-        #[derive(Deserialize)]
-        struct Item {
-            title: String,
-            content: String,
-            url: String,
-            published_date: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct Response {
-            results: Vec<Item>,
-        }
-
-        let response = self
-            .client
-            .post("https://api.tavily.com/search")
-            .bearer_auth(api_key)
-            .json(&Request {
-                query,
-                search_depth: "advanced",
-                max_results: limit,
-                include_answer: false,
-                include_raw_content: false,
-                days: 7,
-            })
-            .timeout(REQUEST_TIMEOUT)
-            .send()
-            .await
-            .map_err(|error| self.transport_error(error))?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(self.status_error(status));
-        }
-        let payload: Response = response
-            .json()
-            .await
-            .map_err(|error| self.protocol_error(error))?;
-        Ok(payload
-            .results
-            .into_iter()
-            .map(|item| RawResearchRecord {
-                title: item.title,
-                snippet: item.content,
-                url: item.url,
-                publisher: None,
-                published_at_raw: item.published_date,
-            })
-            .collect())
-    }
-
-    async fn search_serpapi(
-        &self,
-        query: &str,
-        limit: usize,
-        api_key: &str,
-    ) -> Result<Vec<RawResearchRecord>, GeneralWebResearchError> {
-        #[derive(Deserialize)]
-        struct Item {
-            title: String,
-            snippet: Option<String>,
-            link: String,
-            source: Option<String>,
-            date: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct Response {
-            organic_results: Option<Vec<Item>>,
-        }
-        let limit_text = limit.to_string();
-
-        let response = self
-            .client
-            .get("https://serpapi.com/search")
-            .query(&[
-                ("engine", "baidu"),
-                ("q", query),
-                ("api_key", api_key),
-                ("num", limit_text.as_str()),
-            ])
-            .timeout(REQUEST_TIMEOUT)
-            .send()
-            .await
-            .map_err(|error| self.transport_error(error))?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(self.status_error(status));
-        }
-        let payload: Response = response
-            .json()
-            .await
-            .map_err(|error| self.protocol_error(error))?;
-        Ok(payload
-            .organic_results
-            .unwrap_or_default()
-            .into_iter()
-            .map(|item| RawResearchRecord {
-                title: item.title,
-                snippet: item.snippet.unwrap_or_default(),
-                url: item.link,
-                publisher: item.source,
-                published_at_raw: item.date,
-            })
-            .collect())
-    }
-
-    fn transport_error(&self, error: reqwest::Error) -> GeneralWebResearchError {
-        GeneralWebResearchError::new(
-            self.provider,
-            "transport",
-            true,
-            GeneralWebResearchStage::Transport,
-            error.to_string(),
-        )
-    }
-
-    fn protocol_error(&self, error: reqwest::Error) -> GeneralWebResearchError {
-        GeneralWebResearchError::new(
-            self.provider,
-            "protocol",
-            false,
-            GeneralWebResearchStage::Protocol,
-            error.to_string(),
-        )
-    }
-
-    fn status_error(&self, status: StatusCode) -> GeneralWebResearchError {
-        let (reason_code, retryable) = match status {
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ("authentication", false),
-            StatusCode::TOO_MANY_REQUESTS => ("rate_limited", true),
-            value if value.is_server_error() => ("provider_rejected", true),
-            _ => ("provider_rejected", false),
-        };
-        GeneralWebResearchError::new(
-            self.provider,
-            reason_code,
-            retryable,
-            GeneralWebResearchStage::Transport,
-            format!("HTTP {status}"),
-        )
     }
 }
 
@@ -862,15 +552,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_request_and_missing_credentials_are_typed() {
-        let gateway = GeneralWebResearchGateway::new(GeneralWebResearchProvider::Bocha, Vec::new());
+    async fn invalid_request_is_typed_before_transport() {
+        let gateway = GeneralWebResearchGateway::new(GeneralWebResearchProvider::Bocha);
         let invalid = gateway.search("", 0).await.unwrap_err();
         assert_eq!(invalid.reason_code(), "invalid_request");
         assert!(!invalid.retryable());
         assert_eq!(invalid.stage(), GeneralWebResearchStage::Request);
-
-        let missing = gateway.search("TEST_CODE query", 1).await.unwrap_err();
-        assert_eq!(missing.reason_code(), "missing_credentials");
-        assert!(!missing.retryable());
     }
 }

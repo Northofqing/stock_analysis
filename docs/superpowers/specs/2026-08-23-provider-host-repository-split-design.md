@@ -1,6 +1,14 @@
 # 数据提供者宿主独立仓库拆分设计
 
-**状态：** Gate A 候选。用户已于 2026-08-23 批准总体架构、证据归属、失败语义、迁移顺序和测试策略。本文不代表 Gate B、C 或 D 已完成。
+**状态：** 设计已批准；`stock_analysis` 的 Phase 5 删除工作已于 2026-08-31 完成。跨仓发布和生产证据仍由外部 provider-host 仓库负责。
+
+## 实施状态（2026-08-31）
+
+- `Cargo.toml`、`Cargo.lock` 和生效 Cargo 依赖图已不含 `magic-*` 包；
+- 本地 provider server、provider-only probes、旧 feature gate 和所有本地 fallback 已删除；
+- `stock_analysis` 只保留 provider-neutral 领域类型、gRPC 客户端和准入校验；
+- gRPC 集成测试使用 `tests/support/grpc_fixture.rs` 中的测试专用服务，不恢复生产 provider host；
+- 本文其余“当前事实”保留为 2026-08-23 的设计基线和迁移审计记录。
 
 ## 1. 目标
 
@@ -17,7 +25,7 @@
 - 数据源、新鲜度、校验和审计失败始终显式返回；
 - 修改 `stock_analysis` 的普通业务代码不再重新编译 provider 实现。
 
-## 2. 当前事实证据
+## 2. 设计时基线（2026-08-23）
 
 本设计基于 2026-08-23 对当前 HEAD 的只读检查：
 
@@ -31,7 +39,7 @@
 - `src/data_gateway/grpc_source.rs::KEEP_LOCAL_OPS` 仍包含 `strong_stock_reasons`；
 - `docs/superpowers/plans/2026-08-15-p4-migration.md` 把彻底删除 manifest 依赖定义为 M5 终态，但当前只落地了 feature 隔离。
 
-因此，当前实现只把 provider 排除在生产 monitor 构建之外，并未把 provider 从仓库或默认开发、测试依赖图中移除。
+因此，当时实现只把 provider 排除在生产 monitor 构建之外，并未把 provider 从仓库或默认开发、测试依赖图中移除；该基线已由上述 Phase 5 完成状态取代。
 
 ## 3. 范围
 

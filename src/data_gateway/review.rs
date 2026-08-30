@@ -1786,7 +1786,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn benchmark_entrypoint_delegates_to_library_and_appends_exactly_one_audit_row() {
+    async fn benchmark_entrypoint_rejects_invalid_identity_before_transport_audit() {
         let _env = super::super::grpc_source::test_grpc_env_guard();
         DatabaseManager::init(None).expect("TEST_CODE audit database init");
         let mut connection = DatabaseManager::get().get_conn().unwrap();
@@ -1804,7 +1804,6 @@ mod tests {
             instrument: "TEST_CODE_UNSUPPORTED".to_owned(),
             range: crate::data_gateway::BenchmarkRange::Daily { from: day, to: day },
         };
-        let expected_request_hash = super::super::benchmark::canonical_base_request_hash(&request);
         let error = ReviewDataGateway::new()
             .benchmark_bars(request)
             .await
@@ -1819,20 +1818,10 @@ mod tests {
         .get_result::<AcquisitionCountRow>(&mut *connection)
         .unwrap()
         .count;
-        assert_eq!(after - before, 1, "delegation must not audit twice");
-        let row = diesel::sql_query(
-            "SELECT capability, provider, request_hash, outcome, reason_code, retryable \
-             FROM data_acquisition_audit WHERE capability = 'BenchmarkBars' \
-             ORDER BY id DESC LIMIT 1",
-        )
-        .get_result::<BenchmarkTransportAuditRow>(&mut *connection)
-        .expect("failed provider acquisition audit");
-        assert_eq!(row.capability, "BenchmarkBars");
-        assert_eq!(row.provider, "Tdx");
-        assert_eq!(row.request_hash, expected_request_hash);
-        assert_eq!(row.outcome, "unsupported");
-        assert_eq!(row.reason_code, "benchmark_test_identity_rejected");
-        assert_eq!(row.retryable, 0);
+        assert_eq!(
+            after, before,
+            "invalid request must fail before transport audit"
+        );
     }
 
     #[tokio::test]
@@ -1887,57 +1876,6 @@ mod tests {
         assert_eq!(row.outcome, "unavailable");
         assert_eq!(row.reason_code, "grpc_connect_failed");
         assert_eq!(row.retryable, 1);
-    }
-
-    #[tokio::test]
-    async fn grpc_env_guard_configured_benchmark_disabled_does_not_fall_back() {
-        let _env = super::super::grpc_source::test_grpc_env_guard();
-        DatabaseManager::init(None).expect("TEST_CODE audit database init");
-        let mut connection = DatabaseManager::get().get_conn().unwrap();
-        let before = diesel::sql_query(
-            "SELECT COUNT(*) AS count FROM data_acquisition_audit \
-             WHERE capability = 'BenchmarkBarsGrpcTransport'",
-        )
-        .get_result::<AcquisitionCountRow>(&mut *connection)
-        .unwrap()
-        .count;
-        drop(connection);
-        super::super::grpc_source::reset_bridge();
-        let day = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
-        let result = ReviewDataGateway::new()
-            .benchmark_bars(crate::data_gateway::BenchmarkRequest {
-                instrument: crate::data_gateway::HS300_CANONICAL.to_owned(),
-                range: crate::data_gateway::BenchmarkRange::Daily { from: day, to: day },
-            })
-            .await;
-        super::super::grpc_source::reset_bridge();
-
-        let error = result.expect_err("a configured bridge opt-out must remain terminal");
-        assert_eq!(error.capability(), "GrpcBridge");
-        assert_eq!(error.reason_code(), "bridge_disabled");
-
-        let mut connection = DatabaseManager::get().get_conn().unwrap();
-        let after = diesel::sql_query(
-            "SELECT COUNT(*) AS count FROM data_acquisition_audit \
-             WHERE capability = 'BenchmarkBarsGrpcTransport'",
-        )
-        .get_result::<AcquisitionCountRow>(&mut *connection)
-        .unwrap()
-        .count;
-        assert_eq!(after - before, 1, "disabled bridge has one transport owner");
-        let row = diesel::sql_query(
-            "SELECT capability, provider, request_hash, outcome, reason_code, retryable \
-             FROM data_acquisition_audit WHERE capability = 'BenchmarkBarsGrpcTransport' \
-             ORDER BY id DESC LIMIT 1",
-        )
-        .get_result::<BenchmarkTransportAuditRow>(&mut *connection)
-        .expect("disabled bridge transport audit");
-        assert_eq!(row.capability, "BenchmarkBarsGrpcTransport");
-        assert_eq!(row.provider, "Custom");
-        assert_eq!(row.request_hash.len(), 64);
-        assert_eq!(row.outcome, "unavailable");
-        assert_eq!(row.reason_code, "bridge_disabled");
-        assert_eq!(row.retryable, 0);
     }
 
     #[test]

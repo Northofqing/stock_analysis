@@ -11,7 +11,7 @@ pub mod convert;
 
 // BR-251 server/client share this exact wire model without exposing the private
 // benchmark acquisition module as a general construction API.
-#[cfg(any(feature = "magic-gateway", test))]
+#[cfg(test)]
 pub(crate) use super::benchmark::BenchmarkGrpcResponseWire;
 pub(crate) use super::benchmark::BenchmarkRequestWire;
 
@@ -1059,9 +1059,6 @@ pub const HOOKED_OPS: &[&str] = &[
     "TechnicalBars",
     "UpperLimitPoolReview",
 ];
-
-/// All declared market-data operations are remote.
-pub const KEEP_LOCAL_OPS: &[&str] = &[];
 
 /// Return the process-wide remote bridge. Construction is lazy and connection
 /// failures remain typed, retryable gateway errors at the operation boundary.
@@ -5237,18 +5234,7 @@ mod tests {
     }
 
     #[test]
-    fn hooked_ops_disjoint_from_keep_local() {
-        for op in HOOKED_OPS {
-            assert!(
-                !KEEP_LOCAL_OPS.contains(op),
-                "{op} 同时出现在 HOOKED_OPS 和 KEEP_LOCAL_OPS — 必须只在一处"
-            );
-        }
-    }
-
-    #[test]
     fn every_declared_operation_is_remote() {
-        assert!(KEEP_LOCAL_OPS.is_empty());
         assert!(HOOKED_OPS.contains(&"StrongStockReasons"));
         assert!(HOOKED_OPS.contains(&"ChainBatch"));
     }
@@ -5262,7 +5248,11 @@ mod tests {
         // These operations are owned by this module rather than a sibling
         // gateway file: ChainBatch has a typed helper below, while
         // StrongStockReasons is a declared remote-only contract view.
-        let mut found: Vec<String> = vec!["ChainBatch".to_owned(), "StrongStockReasons".to_owned()];
+        let mut found: Vec<String> = vec![
+            "ChainBatch".to_owned(),
+            "StrongStockReasons".to_owned(),
+            "T0Evidence".to_owned(),
+        ];
         let mut entries: Vec<_> = std::fs::read_dir(&dir)
             .expect("src/data_gateway 可读")
             .filter_map(|e| e.ok())

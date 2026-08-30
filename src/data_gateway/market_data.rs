@@ -81,6 +81,26 @@ impl AdmittedRealtimeQuote {
     pub const fn evidence(&self) -> &BatchEvidence {
         &self.evidence
     }
+
+    /// Pure test seam. This symbol is absent from production builds and keeps
+    /// test/live identities physically distinct.
+    #[cfg(test)]
+    pub(crate) fn from_test_fixture(
+        record: RealtimeMarketQuote,
+        evidence: BatchEvidence,
+    ) -> Result<Self, GatewayError> {
+        if !record.code.starts_with("TEST_CODE_")
+            || !evidence.source.starts_with("TEST_CODE")
+            || !evidence.batch_id.starts_with("TEST_CODE")
+        {
+            return Err(GatewayError::invalid_request(
+                CAPABILITY,
+                "realtime-quote fixtures must use TEST_CODE identities",
+            ));
+        }
+        validate_admitted_projection(&record, &evidence)?;
+        Ok(Self { record, evidence })
+    }
 }
 
 /// A non-empty realtime quote batch whose records remain bound to the exact

@@ -33,6 +33,11 @@ use crate::selection::schema_v2::{
     DOMAIN_PROVIDER_CAPABILITY, OUTCOME_ADAPTIVE_POLICY_VERSION, OUTCOME_PARENT_DESIGN_SHA256,
     OUTCOME_TDX_HISTORICAL_PAGE_SIZE, UPSTREAM_REVISION,
 };
+#[cfg(test)]
+use crate::selection::schema_v2::{
+    OutcomeProviderErrorPreimage, OutcomeTransportEvidencePreimage,
+    OutcomeTransportRequestPreimage, OutcomeTransportResultPreimage,
+};
 
 use super::historical_bars::{finalize_outcome_sequence_async, OutcomeLifecycleAdmission};
 use super::instrument_identity::{resolve_production_equity, EquitySegment};
@@ -188,6 +193,30 @@ impl OutcomeAcquisitionFailure {
             self.available_evidence,
             self.transport_attempts,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_only_after_provider(
+        request_evidence: RequestEvidenceColumns,
+        reason_code: &'static str,
+        retryable: bool,
+        available_evidence: Option<OutcomeProviderAvailableEvidencePreimage>,
+    ) -> Self {
+        let transport_attempts =
+            test_only_transport_attempts(&request_evidence, available_evidence.as_ref());
+        Self {
+            request_evidence: Some(request_evidence),
+            error: GatewayError::classified(
+                CAPABILITY,
+                Some(ProviderId::Tdx),
+                "partial",
+                reason_code,
+                retryable,
+                "TEST_CODE typed acquisition failure",
+            ),
+            available_evidence,
+            transport_attempts: Some(transport_attempts),
+        }
     }
 }
 
@@ -1052,6 +1081,133 @@ fn latest_successful_transport_result_hash(
         .rev()
         .find(|attempt| attempt.result.terminal_state == "available")
         .map(|attempt| attempt.result_hash.clone())
+}
+
+#[cfg(test)]
+fn test_only_transport_attempts(
+    request_columns: &RequestEvidenceColumns,
+    available_evidence: Option<&OutcomeProviderAvailableEvidencePreimage>,
+) -> OutcomeTransportAttemptsPreimage {
+    let request: crate::selection::schema_v2::RequestEvidencePreimage =
+        serde_json::from_str(&request_columns.request_evidence_json).expect("typed test request");
+    let parameters: OutcomeMarketRequestParametersPreimage =
+        serde_json::from_str(&request.parameters_json).expect("typed test parameters");
+    let capability: ProviderCapabilityHashPreimage =
+        serde_json::from_str(&request.provider_capability_json).expect("typed test capability");
+    let expected_bar_count =
+        u16::try_from(parameters.applicable_trading_dates.len()).expect("small test window");
+    let transport_request = OutcomeTransportRequestPreimage {
+        provider: capability.provider.clone(),
+        source: PROVIDER_SOURCE.into(),
+        canonical_stock_code: parameters.canonical_stock_code.clone(),
+        canonical_market: parameters.canonical_market.clone(),
+        interval: parameters.interval.as_str().into(),
+        adjustment: parameters.adjustment.as_str().into(),
+        latest_n: expected_bar_count,
+    };
+    let result = if let Some(available_evidence) = available_evidence {
+        let provider_projection = &available_evidence.provider_evidence;
+        let source = provider_projection
+            .source
+            .clone()
+            .unwrap_or_else(|| PROVIDER_SOURCE.into());
+        let source_at = provider_projection
+            .source_at
+            .clone()
+            .or_else(|| parameters.applicable_trading_dates.last().cloned());
+        let observed_at = provider_projection
+            .observed_at
+            .clone()
+            .unwrap_or_else(|| "2026-07-28T07:01:00.000000000Z".into());
+        let batch_id = provider_projection
+            .batch_id
+            .clone()
+            .unwrap_or_else(|| "TEST_CODE_TRANSPORT_BATCH".into());
+        let batch_content = OutcomeTransportBatchContentPreimage {
+            provider: transport_request.provider.clone(),
+            source: source.clone(),
+            records: parameters
+                .applicable_trading_dates
+                .iter()
+                .map(|market_date| OutcomeTransportBarFingerprint {
+                    market_date: market_date.clone(),
+                    open: "10".into(),
+                    high: "11".into(),
+                    low: "9".into(),
+                    close: "10.5".into(),
+                    core_volume_lots: "10".into(),
+                    amount: Some("10500".into()),
+                    provider: "Tdx".into(),
+                    batch_id: batch_id.clone(),
+                })
+                .collect(),
+        };
+        let provider_evidence = OutcomeTransportEvidencePreimage {
+            source,
+            source_at,
+            observed_at,
+            batch_id,
+            record_count: u32::from(expected_bar_count),
+            batch_content_hash: sha256_json(&batch_content).expect("test content hash"),
+            batch_content,
+        };
+        OutcomeTransportResultPreimage {
+            terminal_state: "available".into(),
+            requested_latest_n: expected_bar_count,
+            actual_count: Some(expected_bar_count),
+            provider_evidence_hash: Some(
+                sha256_json(&provider_evidence).expect("test evidence hash"),
+            ),
+            provider_evidence: Some(provider_evidence),
+            provider_error: None,
+            provider_error_hash: None,
+        }
+    } else {
+        let provider_error = OutcomeProviderErrorPreimage {
+            variant: "connection_timeout".into(),
+            coded_error: None,
+            io_kind: None,
+            raw_os_error: None,
+            retry_attempts: None,
+            structured_detail_hash: None,
+            historical_bar_cardinality: None,
+        };
+        OutcomeTransportResultPreimage {
+            terminal_state: "provider_error".into(),
+            requested_latest_n: expected_bar_count,
+            actual_count: None,
+            provider_evidence: None,
+            provider_evidence_hash: None,
+            provider_error_hash: Some(
+                sha256_json(&provider_error).expect("test provider-error hash"),
+            ),
+            provider_error: Some(provider_error),
+        }
+    };
+    let attempt = OutcomeTransportAttemptPreimage {
+        request_ordinal: 0,
+        request_hash: sha256_json(&transport_request).expect("test transport request hash"),
+        request: transport_request,
+        result_hash: sha256_json(&result).expect("test transport result hash"),
+        result,
+    };
+    OutcomeTransportAttemptsPreimage {
+        domain: DOMAIN_OUTCOME_TRANSPORT_ATTEMPTS.into(),
+        design_sha256: DESIGN_SHA256.into(),
+        amendment_design_sha256: AMENDMENT_DESIGN_SHA256.into(),
+        row_request_hash: request_columns.request_hash.clone(),
+        request_evidence_hash: request_columns.request_evidence_hash.clone(),
+        provider_capability_hash: request.provider_capability_hash,
+        provider_revision: UPSTREAM_REVISION.into(),
+        request_parameters_hash: request.parameters_json_hash,
+        provider_request_hash: sha256_json(&"TEST_CODE_PROVIDER_REQUEST").unwrap(),
+        verified_due_binding_hash: sha256_json(&"TEST_CODE_VERIFIED_DUE").unwrap(),
+        adaptive_policy_version: OUTCOME_ADAPTIVE_POLICY_VERSION.into(),
+        expected_bar_count,
+        maximum_latest_n: expected_bar_count,
+        selected_transport_result_hash: available_evidence.map(|_| attempt.result_hash.clone()),
+        attempts_in_request_order: vec![attempt],
+    }
 }
 
 fn outcome_transport_attempts_preimage(

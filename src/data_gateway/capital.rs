@@ -1,7 +1,6 @@
 //! BR-164 typed capital-data boundary.
 //!
-//! The gateway only exposes capabilities proved by the pinned
-//! `magic-market-data-rs` revision:
+//! The gateway exposes only capabilities admitted from the remote contract:
 //!
 //! - Eastmoney instrument fund-flow series (`Minute1` and `Day1`);
 //! - Eastmoney source-limited post-close provider Top-N rankings;
@@ -10,8 +9,7 @@
 //! Every admitted batch is complete, identity-consistent, ordered, fresh for
 //! its contract, and carries provider/batch/source/observation evidence.
 //! Missing monetary components are rejected instead of being relabelled as
-//! zero. Blocking provider clients are created, used and dropped inside
-//! `spawn_blocking`, so they cannot drop a blocking runtime on a Tokio worker.
+//! zero. This repository does not construct provider clients.
 
 use crate::market_domain::{
     FiniteNumber, FlowInterval, InstrumentId, IsoDate, MarketRankingKind, MarketRankingUnit,
@@ -28,9 +26,8 @@ const NORTHBOUND_CAPABILITY: &str = "CapitalNorthboundDaily";
 const EASTMONEY_SOURCE: &str = "eastmoney-web";
 const HKEX_SOURCE: &str = "hkex-official";
 const PROVIDER_TOP_N_LIMIT: u32 = 20;
-// Upstream `EastmoneyClient::provider_top_n_a_share_request` 的固定 A-share
-// filter identity。桥模式本地构造 request evidence 时必须与 library transport
-// 使用同一 filter, 才能保证 canonical request_hash 一致。
+// Remote ProviderTopNRankings contract 的固定 A-share filter identity。客户端
+// 构造 request evidence 时必须使用同一 filter，才能保证 canonical request_hash 一致。
 const PROVIDER_TOP_N_A_SHARE_FILTER: &str =
     "m:0+t:6+f:!2,m:0+t:13+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2,m:0+t:81+s:262144+f:!2";
 const OBSERVATION_MAX_AGE_MILLIS: i64 = 30_000;

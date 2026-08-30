@@ -15,9 +15,9 @@ pub struct GeneralWebSearchProvider {
 }
 
 impl GeneralWebSearchProvider {
-    pub fn new(provider: GeneralWebResearchProvider, api_keys: Vec<String>) -> Self {
+    pub fn new(provider: GeneralWebResearchProvider) -> Self {
         Self {
-            gateway: GeneralWebResearchGateway::new(provider, api_keys),
+            gateway: GeneralWebResearchGateway::new(provider),
         }
     }
 
@@ -111,12 +111,12 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn missing_credentials_remain_typed_and_fail_closed() {
-        let provider = GeneralWebSearchProvider::new(GeneralWebResearchProvider::Bocha, Vec::new());
-        let response = provider.search("TEST_CODE query", 1).await;
+    async fn invalid_request_remains_typed_and_fail_closed() {
+        let provider = GeneralWebSearchProvider::new(GeneralWebResearchProvider::Bocha);
+        let response = provider.search("", 0).await;
         assert!(!response.success);
         let failure = response.failure.expect("typed failure");
-        assert_eq!(failure.reason_code, "missing_credentials");
+        assert_eq!(failure.reason_code, "invalid_request");
         assert!(!failure.retryable);
         assert_eq!(failure.stage, "request");
     }

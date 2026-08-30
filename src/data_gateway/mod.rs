@@ -53,10 +53,6 @@ pub use capital::{
     CapitalDataGateway, InstrumentFundFlowFact, NorthboundDailyFact, NorthboundQuotaFact,
     NorthboundTopTurnoverFact, ProviderTopNFact, ProviderTopNPair, ProviderTopNRequestEvidence,
 };
-#[cfg(feature = "magic-gateway")]
-pub use chain_intelligence::{
-    build_chain_intelligence_batch, BoardMembershipFact, ChainIntelligenceGateway,
-};
 pub use chain_intelligence::{
     ChainIntelligencePolicy, ChainSourceEvidence, ChainSourceRejection, UpperLimitFact,
 };

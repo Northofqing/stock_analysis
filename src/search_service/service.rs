@@ -190,7 +190,6 @@ impl SearchService {
                 info!("已配置 SerpAPI 搜索，共 {} 个 API Key", keys.len());
                 providers.push(Box::new(GeneralWebSearchProvider::new(
                     GeneralWebResearchProvider::SerpApi,
-                    keys,
                 )));
             }
         }
@@ -201,7 +200,6 @@ impl SearchService {
                 info!("已配置 Bocha 搜索，共 {} 个 API Key", keys.len());
                 providers.push(Box::new(GeneralWebSearchProvider::new(
                     GeneralWebResearchProvider::Bocha,
-                    keys,
                 )));
             }
         }
@@ -212,7 +210,6 @@ impl SearchService {
                 info!("已配置 Tavily 搜索，共 {} 个 API Key", keys.len());
                 providers.push(Box::new(GeneralWebSearchProvider::new(
                     GeneralWebResearchProvider::Tavily,
-                    keys,
                 )));
             }
         }

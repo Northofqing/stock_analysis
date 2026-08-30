@@ -1,7 +1,7 @@
 # `magic-*` 依赖彻底删除设计
 
 **日期：** 2026-08-30
-**状态：** 用户已批准
+**状态：** 已批准并于 2026-08-31 完成
 **上位设计：** `docs/superpowers/specs/2026-08-23-provider-host-repository-split-design.md`
 
 ## 1. 目标

@@ -636,6 +636,6 @@ mod tests {
                 "legacy A-10 source: {forbidden}"
             );
         }
-        assert!(loader.contains("ChainIntelligenceGateway"));
+        assert!(loader.contains("fetch_chain_batch_grpc"));
     }
 }

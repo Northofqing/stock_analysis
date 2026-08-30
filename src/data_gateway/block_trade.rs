@@ -1,8 +1,7 @@
 //! BR-223 evidence-preserving 盘后大宗交易 Gateway (BlockTrades)。
 //!
-//! 数据源: 上游 magic-eastmoney-rs `BlockTrades` trait (东财 RPT_DATA_BLOCKTRADE,
-//! 按代码查询)。聚合批次证据 = 首个成功真实批次的 provenance (逐代码真实证据
-//! 保留在上游记录内, 不合成 batch_id, 遵守 BR-164)。
+//! 数据由远端 `BlockTrades` gRPC operation 获取。聚合批次证据 = 首个成功
+//! 真实批次的 provenance（逐代码真实证据保留在记录内，不合成 batch_id）。
 
 use super::review::{acquisition_request_hash, audit_gateway_result};
 
@@ -43,7 +42,6 @@ impl BlockTradesGateway {
         trading_date: NaiveDate,
     ) -> Result<GatewayBatch<BlockTradeReview>, GatewayError> {
         let request_hash = acquisition_request_hash(CAPABILITY, codes.join(","));
-        // P4 M3: gRPC 桥 (remote gRPC 时替换 transport; audit 留客户端)。
         match super::grpc_source::bridge_for("BlockTrades") {
             Ok(bridge) => {
                 let result = bridge.block_trades_async(codes, trading_date).await;
@@ -62,7 +60,5 @@ impl BlockTradesGateway {
                 );
             }
         }
-        // no-feature (monitor 零 magic): library transport 不存在。
-        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
     }
 }

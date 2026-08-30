@@ -158,9 +158,8 @@ impl HistoricalBarsGateway {
     }
 
     /// 15 分钟 K线（升序，旧→新）。R-12 盘后回测取数，覆盖虚拟仓全部
-    /// 历史信号 (7/14 起, 800 根 ≈ 50 交易日)。走 magic-tdx 直连
-    /// (与 magic_tdx_t0 同构), 复用进程级 cached_tdx_hq_client 连接,
-    /// 不参与 daily-bars router (router 只承载日K语义)。
+    /// 历史信号（7/14 起，800 根约 50 个交易日）。使用远端 TechnicalBars
+    /// operation，不参与 daily-bars route（日 K 使用独立语义）。
     ///
     /// 失败/空 batch 显式返回 GatewayError, 不静默填零。
     pub fn fifteen_min_bars(

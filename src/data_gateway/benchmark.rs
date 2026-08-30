@@ -3594,11 +3594,10 @@ mod tests {
             base_identity.1,
             super::domain_hash(b"BR251_TDX_INDEX_BATCH_V1\0", &changed_range_canonical)
         );
-        assert!(first
-            .batch
-            .evidence()
-            .source
-            .contains("75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e"));
+        assert_eq!(
+            first.batch.evidence().source,
+            "magic-tdx-index-bars@remote-grpc-contract-v1"
+        );
 
         let mut malformed = raw_daily(day);
         malformed.close = f64::NAN;
