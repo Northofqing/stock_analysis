@@ -109,6 +109,20 @@ DATABASE_PATH=/absolute/path/to/data/stock_analysis.db \
 开发环境也可用 `grpc_local_readiness_probe --addr <URL>` 检查一个已运行的外部服务。
 账户、证书、token、持仓列表和 webhook 等敏感值不要写入 README、命令历史或日志。
 
+## 已知问题
+
+| 问题 | 状态 |
+| --- | --- |
+| GlobalNews-ThePaper 失败被折叠为 `internal` (audit reason_code 刷屏) | 预存, 未修 |
+| BR-178: selection-v2 recovery 每 60s GlobalSchema authority 失配刷屏 | 预存, 低优先 |
+| CompanyFinancialStatements/Sina 证据不匹配 → `invalid_evidence` | 预存数据质量问题 |
+
+2026-08-31: consensus/research 数据问题已修复并部署验证 —
+缺评级记录不再整批拒绝 (BR-119/688548, 剔除后其余记录保留); 上游空响应
+(`data=[]`) 按 VerifiedEmpty 业务态分类而非 Protocol/invalid_evidence
+(605178/300128); `no_current_reports` 业务态在 gRPC wire 保真, 不再折叠为
+`internal`。上游修复位于 magic-market-data-rs 48ae41b。
+
 ## 常用工具
 
 | 命令 | 用途 |
