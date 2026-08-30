@@ -4,22 +4,12 @@
 //! 按代码查询)。聚合批次证据 = 首个成功真实批次的 provenance (逐代码真实证据
 //! 保留在上游记录内, 不合成 batch_id, 遵守 BR-164)。
 
-#[cfg(feature = "magic-gateway")]
-use super::instrument_identity::resolve_production_equity;
-#[cfg(feature = "magic-gateway")]
-use super::review::audit_blocking_join_failure;
 use super::review::{acquisition_request_hash, audit_gateway_result};
-#[cfg(feature = "magic-gateway")]
-use super::BatchEvidence;
+
 use super::{GatewayBatch, GatewayError};
 use crate::market_domain::ProviderId;
-#[cfg(feature = "magic-gateway")]
-use crate::market_domain::{IsoDate, PositiveU32};
+
 use chrono::NaiveDate;
-#[cfg(feature = "magic-gateway")]
-use magic_eastmoney_rs::EastmoneyClient;
-#[cfg(feature = "magic-gateway")]
-use magic_market_core::{BlockTrades, InstrumentDateRangeRequest};
 
 const CAPABILITY: &str = "BlockTrades";
 
@@ -74,154 +64,5 @@ impl BlockTradesGateway {
         }
         // no-feature (monitor 零 magic): library transport 不存在。
         // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
-        #[cfg(not(feature = "magic-gateway"))]
-        {
-            return Err(GatewayError::classified(
-                CAPABILITY,
-                Some(ProviderId::Eastmoney),
-                "unavailable",
-                "provider_transport",
-                true,
-                "remote market-data transport required",
-            ));
-        }
-        #[cfg(feature = "magic-gateway")]
-        {
-            let codes_owned = codes.to_vec();
-            let result: Result<GatewayBatch<BlockTradeReview>, GatewayError> =
-                match tokio::task::spawn_blocking(move || {
-                    fetch_block_trades(&codes_owned, trading_date)
-                })
-                .await
-                {
-                    Ok(result) => result,
-                    Err(error) => {
-                        audit_blocking_join_failure(
-                            CAPABILITY,
-                            ProviderId::Eastmoney,
-                            request_hash.clone(),
-                            error.to_string(),
-                        )
-                        .await
-                    }
-                };
-            audit_gateway_result(CAPABILITY, ProviderId::Eastmoney, &request_hash, result)
-        }
     }
-}
-
-#[cfg(feature = "magic-gateway")]
-fn fetch_block_trades(
-    codes: &[String],
-    trading_date: NaiveDate,
-) -> Result<GatewayBatch<BlockTradeReview>, GatewayError> {
-    let client = EastmoneyClient::new().map_err(|error| {
-        GatewayError::unavailable(
-            CAPABILITY,
-            Some(ProviderId::Eastmoney),
-            true,
-            format!("EastmoneyClient::new failed: {error}"),
-        )
-    })?;
-    let day = IsoDate::new(trading_date.format("%Y-%m-%d").to_string()).map_err(|error| {
-        GatewayError::invalid_evidence(
-            CAPABILITY,
-            Some(ProviderId::Eastmoney),
-            format!("invalid trading date {}: {error}", trading_date),
-        )
-    })?;
-    let limit = PositiveU32::new(100).map_err(|error| {
-        GatewayError::invalid_evidence(
-            CAPABILITY,
-            Some(ProviderId::Eastmoney),
-            format!("limit: {error}"),
-        )
-    })?;
-
-    let mut reviews: Vec<BlockTradeReview> = Vec::new();
-    let mut issues: Vec<String> = Vec::new();
-    let mut first_provenance: Option<crate::market_domain::Provenance> = None;
-
-    for code in codes {
-        let identity = resolve_production_equity(code, None).map_err(|error| {
-            GatewayError::invalid_evidence(
-                CAPABILITY,
-                Some(ProviderId::Eastmoney),
-                format!("resolve {code}: {error}"),
-            )
-        })?;
-        let request = InstrumentDateRangeRequest::new(identity.instrument().clone(), limit)
-            .and_then(|request| request.with_range(day.clone(), day.clone()))
-            .map_err(|error| {
-                GatewayError::unavailable(
-                    CAPABILITY,
-                    Some(ProviderId::Eastmoney),
-                    true,
-                    format!("request {code}: {error}"),
-                )
-            })?;
-        match client.block_trades(&request) {
-            Ok(batch) => {
-                if first_provenance.is_none() {
-                    first_provenance = Some(batch.provenance().clone());
-                }
-                for record in batch.records() {
-                    let code = record.instrument.code().to_string();
-                    reviews.push(BlockTradeReview {
-                        code,
-                        traded_at: record
-                            .traded_at
-                            .as_ref()
-                            .map(|value| value.as_str().to_string()),
-                        price: record.price.get(),
-                        close_price: record.close_price.as_ref().map(|value| value.get()),
-                        premium_ratio: record.premium_ratio.as_ref().map(|value| value.get()),
-                        volume: record.volume.get(),
-                        amount: record.amount.as_ref().map(|value| value.get()),
-                        buyer: record
-                            .buyer
-                            .as_ref()
-                            .map(|value| value.as_str().to_string()),
-                        seller: record
-                            .seller
-                            .as_ref()
-                            .map(|value| value.as_str().to_string()),
-                    });
-                }
-            }
-            Err(error) => issues.push(format!("{code}: {error}")),
-        }
-    }
-
-    if reviews.is_empty() && !issues.is_empty() {
-        return Err(GatewayError::unavailable(
-            CAPABILITY,
-            Some(ProviderId::Eastmoney),
-            true,
-            format!("all block-trade queries failed: {}", issues.join("; ")),
-        ));
-    }
-    let provenance = first_provenance.as_ref().ok_or_else(|| {
-        GatewayError::unavailable(
-            CAPABILITY,
-            Some(ProviderId::Eastmoney),
-            true,
-            "no block-trade batch provenance".to_string(),
-        )
-    })?;
-    let evidence =
-        BatchEvidence::from_provenance(ProviderId::Eastmoney, provenance).map_err(|error| {
-            GatewayError::invalid_evidence(
-                CAPABILITY,
-                Some(ProviderId::Eastmoney),
-                format!("provenance: {error}"),
-            )
-        })?;
-    if reviews.is_empty() {
-        return Ok(GatewayBatch::VerifiedEmpty(evidence));
-    }
-    Ok(GatewayBatch::Available {
-        records: reviews,
-        evidence,
-    })
 }

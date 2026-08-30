@@ -1,22 +1,10 @@
 //! Registered business rules: BR-158, BR-159, BR-213, BR-238.
 //! Unified A-01/R-03 provider admission, evidence retention and acquisition audit.
 
-#[cfg(feature = "magic-gateway")]
-use crate::market_domain::IsoDate;
 use crate::market_domain::ProviderId;
 use crate::market_domain::{LimitPoolEntry, LimitPoolKind, PositiveU32};
 use chrono::NaiveDate;
-#[cfg(feature = "magic-gateway")]
-use magic_eastmoney_rs::{EastmoneyClient, EastmoneyError};
-#[cfg(feature = "magic-gateway")]
-use magic_market_core::{LimitPoolRequest, LimitPools};
-#[cfg(feature = "magic-gateway")]
-use magic_market_router::{
-    AcceptancePolicy, AttemptStatus, FailureKind, LimitPoolRouter, RouterError, SourceError,
-    SourceFn,
-};
-#[cfg(feature = "magic-gateway")]
-use magic_ths_rs::{ThsClient, ThsError};
+
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -682,39 +670,6 @@ impl ReviewDataGateway {
         }
         // no-feature (monitor 零 magic): library transport 不存在。
         // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
-        #[cfg(not(feature = "magic-gateway"))]
-        {
-            return Err(GatewayError::classified(
-                "R-03",
-                Some(ProviderId::Custom),
-                "unavailable",
-                "provider_transport",
-                true,
-                "remote market-data transport required",
-            ));
-        }
-        #[cfg(feature = "magic-gateway")]
-        {
-            let worker_request_hash = request_hash.clone();
-            let joined = tokio::task::spawn_blocking(move || {
-                let result = route_exact_date_upper_limit_pool("R-03", trading_date)
-                    .and_then(|batch| map_r03_upper_limit_batch(batch, trading_date));
-                audit_routed_gateway_result("R-03", &worker_request_hash, result)
-            })
-            .await;
-            match joined {
-                Ok(result) => result,
-                Err(error) => {
-                    audit_blocking_join_failure(
-                        "R-03",
-                        ProviderId::Custom,
-                        request_hash,
-                        error.to_string(),
-                    )
-                    .await
-                }
-            }
-        }
     }
 
     /// Exact-date upper-limit membership batch for the BR-213 market display
@@ -745,7 +700,6 @@ impl ReviewDataGateway {
                 return audit_routed_gateway_result(CAPABILITY, &request_hash, Err(error));
             }
         }
-        self.current_upper_limit_pool_library(trading_date)
     }
 
     /// Library-only server seam for LocalBridge `LimitPools`.
@@ -758,31 +712,17 @@ impl ReviewDataGateway {
         trading_date: NaiveDate,
     ) -> Result<GatewayBatch<LimitPoolEntry>, GatewayError> {
         const CAPABILITY: &str = "BR-213-UpperLimitPool";
-        // no-feature (monitor 零 magic): library transport 不存在。
-        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
-        #[cfg(not(feature = "magic-gateway"))]
-        {
-            return Err(GatewayError::classified(
-                CAPABILITY,
-                Some(ProviderId::Custom),
-                "unavailable",
-                "provider_transport",
-                true,
-                &format!(
-                    "remote market-data transport required (trading_date={trading_date})"
-                ),
-            ));
-        }
-        #[cfg(feature = "magic-gateway")]
-        {
-            let request_hash = limit_pool_acquisition_request_hash(
-                CAPABILITY,
-                LimitPoolAcquisitionProfile::InProcessRouterV1,
-                trading_date,
-            )?;
-            let result = route_exact_date_upper_limit_pool(CAPABILITY, trading_date);
-            audit_routed_gateway_result(CAPABILITY, &request_hash, result)
-        }
+        Err(GatewayError::classified(
+            CAPABILITY,
+            Some(ProviderId::Custom),
+            "unavailable",
+            "provider_transport",
+            true,
+            &format!(
+                "in-process limit-pool acquisition was removed \
+                 (trading_date={trading_date})"
+            ),
+        ))
     }
 }
 
@@ -1021,71 +961,6 @@ fn project_a01_daily_closes(
         })
         .collect();
     Ok(GatewayBatch::Available { records, evidence })
-}
-
-#[cfg(feature = "magic-gateway")]
-fn build_limit_pool_request(trading_date: NaiveDate) -> Result<LimitPoolRequest, GatewayError> {
-    let iso_date = IsoDate::new(trading_date.format("%Y-%m-%d").to_string())
-        .map_err(|error| GatewayError::invalid_request("R-03", error.to_string()))?;
-    let limit = PositiveU32::new(WHOLE_LIMIT_POOL_BOUND)
-        .map_err(|error| GatewayError::invalid_request("R-03", error.to_string()))?;
-    LimitPoolRequest::new(LimitPoolKind::Upper, iso_date, limit)
-        .map_err(|error| GatewayError::invalid_request("R-03", error.to_string()))
-}
-
-#[cfg(feature = "magic-gateway")]
-pub(crate) fn route_exact_date_upper_limit_pool(
-    capability: &'static str,
-    expected_date: NaiveDate,
-) -> Result<GatewayBatch<LimitPoolEntry>, GatewayError> {
-    let request = build_limit_pool_request(expected_date)?;
-    let mut router = LimitPoolRouter::new(
-        AcceptancePolicy::new()
-            .with_require_complete(true)
-            .with_require_source_at(true)
-            .with_accept_complete_empty(true),
-    );
-    router
-        .register(SourceFn::new(
-            ProviderId::Eastmoney,
-            |request: &LimitPoolRequest| {
-                EastmoneyClient::new()
-                    .map_err(eastmoney_source_error)?
-                    .limit_pool(request)
-                    .map_err(eastmoney_source_error)
-            },
-        ))
-        .map_err(|error| gateway_router_error(capability, None, error))?;
-    router
-        .register(SourceFn::new(
-            ProviderId::Tonghuashun,
-            |request: &LimitPoolRequest| {
-                ThsClient::new()
-                    .map_err(ths_source_error)?
-                    .limit_pool(request)
-                    .map_err(ths_source_error)
-            },
-        ))
-        .map_err(|error| gateway_router_error(capability, None, error))?;
-    let routed = router
-        .route(&request)
-        .map_err(|error| gateway_router_error(capability, None, error))?;
-    let selected_provider = routed.selected_provider();
-    let attempts = routed.attempts().to_vec();
-    let batch = routed.into_batch();
-    log::info!(
-        "[DataGateway][{capability}][BR-159] selected_provider={selected_provider:?} route_attempts={attempts:?}"
-    );
-    validate_routed_limit_pool_batch(capability, selected_provider, &batch, expected_date)?;
-    let evidence = BatchEvidence::from_provenance(selected_provider, batch.provenance())?;
-    if batch.records().is_empty() {
-        Ok(GatewayBatch::VerifiedEmpty(evidence))
-    } else {
-        Ok(GatewayBatch::Available {
-            records: batch.into_records(),
-            evidence,
-        })
-    }
 }
 
 fn validate_routed_limit_pool_batch(
@@ -1476,90 +1351,6 @@ pub(super) async fn audit_blocking_join_failure<T: Send + 'static>(
     })
 }
 
-#[cfg(feature = "magic-gateway")]
-fn eastmoney_source_error(error: EastmoneyError) -> SourceError {
-    let message = error.to_string();
-    match error {
-        EastmoneyError::InvalidRequest(_) => {
-            SourceError::stop(FailureKind::InvalidRequest, message)
-        }
-        EastmoneyError::Transport(_) => SourceError::try_next(FailureKind::Transport, message),
-        EastmoneyError::ResponseTooLarge { .. } => {
-            SourceError::try_next(FailureKind::Quality, message)
-        }
-        EastmoneyError::Unsupported(_) => SourceError::try_next(FailureKind::Unsupported, message),
-        EastmoneyError::Decode(_) | EastmoneyError::Protocol(_) => {
-            SourceError::try_next(FailureKind::Protocol, message)
-        }
-        EastmoneyError::VerifiedEmpty(_) => SourceError::try_next(FailureKind::NoData, message),
-        EastmoneyError::Core(_) => SourceError::try_next(FailureKind::Evidence, message),
-    }
-}
-
-#[cfg(feature = "magic-gateway")]
-fn ths_source_error(error: ThsError) -> SourceError {
-    let message = error.to_string();
-    match error {
-        ThsError::InvalidRequest(_) => SourceError::stop(FailureKind::InvalidRequest, message),
-        ThsError::Unsupported(_) => SourceError::try_next(FailureKind::Unsupported, message),
-        ThsError::Authentication(_) | ThsError::HttpStatus(_) => {
-            SourceError::try_next(FailureKind::Provider, message)
-        }
-        ThsError::RateLimited => SourceError::try_next(FailureKind::RateLimited, message),
-        ThsError::Transport(_) => SourceError::try_next(FailureKind::Transport, message),
-        ThsError::Decode(_) | ThsError::Schema(_) => {
-            SourceError::try_next(FailureKind::Protocol, message)
-        }
-        ThsError::Incomplete(_) => SourceError::try_next(FailureKind::Quality, message),
-        ThsError::VerifiedEmpty(_) => SourceError::try_next(FailureKind::NoData, message),
-        ThsError::ProbeAdmission(_) | ThsError::Core(_) => {
-            SourceError::try_next(FailureKind::Evidence, message)
-        }
-    }
-}
-
-#[cfg(feature = "magic-gateway")]
-fn gateway_router_error(
-    capability: &'static str,
-    provider: Option<ProviderId>,
-    error: RouterError,
-) -> GatewayError {
-    let terminal_kind = error
-        .attempts()
-        .iter()
-        .rev()
-        .find_map(|attempt| match attempt.status() {
-            AttemptStatus::Failed { kind, .. } | AttemptStatus::Rejected { kind, .. } => {
-                Some(*kind)
-            }
-            AttemptStatus::Selected => None,
-        });
-    let (audit_outcome, reason_code, retryable) = match terminal_kind {
-        Some(FailureKind::InvalidRequest) | None => {
-            ("invalid_request", "router_invalid_request", false)
-        }
-        Some(FailureKind::Unsupported) => ("unsupported", "router_unsupported", false),
-        Some(
-            FailureKind::Transport
-            | FailureKind::Timeout
-            | FailureKind::RateLimited
-            | FailureKind::Provider
-            | FailureKind::NoData,
-        ) => ("unavailable", "router_unavailable", true),
-        Some(FailureKind::Protocol | FailureKind::Quality | FailureKind::Evidence) => {
-            ("partial", "router_batch_rejected", false)
-        }
-    };
-    GatewayError::classified(
-        capability,
-        provider,
-        audit_outcome,
-        reason_code,
-        retryable,
-        error.to_string(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1618,7 +1409,6 @@ mod tests {
         retryable: i32,
     }
 
-    #[cfg(not(feature = "magic-gateway"))]
     #[derive(Debug, QueryableByName)]
     struct AcquisitionRequestAuditRow {
         #[diesel(sql_type = Text)]
@@ -3107,23 +2897,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "magic-gateway")]
-    fn br159_limit_pool_requests_are_bounded() {
-        let date = NaiveDate::from_ymd_opt(2099, 1, 2).unwrap();
-        let request = build_limit_pool_request(date).expect("bounded whole-market request");
-        assert_eq!(request.kind(), LimitPoolKind::Upper);
-        assert_eq!(request.limit().get(), WHOLE_LIMIT_POOL_BOUND);
-        assert_eq!(
-            acquisition_request_hash("TEST_CODE", "request"),
-            acquisition_request_hash("TEST_CODE", "request")
-        );
-        assert_ne!(
-            acquisition_request_hash("TEST_CODE", "request"),
-            acquisition_request_hash("TEST_CODE", "other")
-        );
-    }
-
-    #[test]
     fn br159_limit_pool_mapping_is_provider_specific_and_rejects_wrong_kind_or_date() {
         let date = NaiveDate::from_ymd_opt(2099, 1, 2).unwrap();
         for (provider, expected_theme) in [
@@ -3300,7 +3073,6 @@ mod tests {
         assert_eq!(row.batch_id.as_deref(), Some(expected_batch_id.as_str()));
     }
 
-    #[cfg(not(feature = "magic-gateway"))]
     #[test]
     #[serial]
     fn br213_no_feature_current_pool_uses_enabled_local_bridge() {
@@ -3345,62 +3117,22 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "magic-gateway"))]
     #[test]
     #[serial]
-    fn br213_no_feature_disabled_bridge_fails_without_fallback_data() {
+    fn br213_without_configuration_uses_default_remote_bridge() {
         let _env = super::super::grpc_source::test_grpc_env_guard();
+        DatabaseManager::init(None).expect("TEST_CODE audit database init");
         std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
+        std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:1");
         super::super::grpc_source::reset_bridge();
 
         let result = ReviewDataGateway::new()
             .current_upper_limit_pool(NaiveDate::from_ymd_opt(2099, 1, 2).unwrap());
         super::super::grpc_source::reset_bridge();
 
-        let error = result.expect_err("disabled bridge has no no-feature provider fallback");
-        assert_eq!(error.capability(), "BR-213-UpperLimitPool");
-        assert_eq!(error.reason_code(), "provider_transport");
+        let error = result.expect_err("unreachable default remote bridge must fail closed");
+        assert_eq!(error.capability(), "GrpcBridge");
+        assert_eq!(error.reason_code(), "no_verified_batch");
         assert!(error.retryable());
-    }
-
-    #[test]
-    #[cfg(feature = "magic-gateway")]
-    fn br159_limit_pool_provider_error_mappers_preserve_retry_policy() {
-        let eastmoney_cases = [
-            eastmoney_source_error(EastmoneyError::InvalidRequest("TEST_CODE".into())),
-            eastmoney_source_error(EastmoneyError::Transport("TEST_CODE".into())),
-            eastmoney_source_error(EastmoneyError::ResponseTooLarge { limit: 1 }),
-            eastmoney_source_error(EastmoneyError::Unsupported("TEST_CODE".into())),
-            eastmoney_source_error(EastmoneyError::Decode("TEST_CODE".into())),
-            eastmoney_source_error(EastmoneyError::Protocol("TEST_CODE".into())),
-        ];
-        assert_eq!(eastmoney_cases[0].kind(), FailureKind::InvalidRequest);
-        assert_eq!(
-            eastmoney_cases[0].action(),
-            magic_market_router::FailureAction::Stop
-        );
-        assert!(eastmoney_cases[1..]
-            .iter()
-            .all(|error| error.action() == magic_market_router::FailureAction::TryNext));
-        assert_eq!(eastmoney_cases[1].kind(), FailureKind::Transport);
-        assert_eq!(eastmoney_cases[2].kind(), FailureKind::Quality);
-        assert_eq!(eastmoney_cases[3].kind(), FailureKind::Unsupported);
-        assert!(eastmoney_cases[4..]
-            .iter()
-            .all(|error| error.kind() == FailureKind::Protocol));
-
-        let ths_cases = [
-            ths_source_error(ThsError::InvalidRequest("TEST_CODE".into())),
-            ths_source_error(ThsError::Transport("TEST_CODE".into())),
-            ths_source_error(ThsError::Schema("TEST_CODE".into())),
-            ths_source_error(ThsError::Incomplete("TEST_CODE".into())),
-        ];
-        assert_eq!(
-            ths_cases[0].action(),
-            magic_market_router::FailureAction::Stop
-        );
-        assert_eq!(ths_cases[1].kind(), FailureKind::Transport);
-        assert_eq!(ths_cases[2].kind(), FailureKind::Protocol);
-        assert_eq!(ths_cases[3].kind(), FailureKind::Quality);
     }
 }

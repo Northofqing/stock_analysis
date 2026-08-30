@@ -180,37 +180,13 @@ pub async fn probe_benchmark_request(
     validate_benchmark_request(&registry, &request)
         .map_err(benchmark_admission_error)
         .map_err(map_gateway_error)?;
-
-    #[cfg(not(feature = "magic-gateway"))]
-    {
-        let _ = request;
-        Err(map_gateway_error(benchmark_gateway_error(
-            BenchmarkAuditOutcome::Unavailable,
-            "provider_transport",
-            true,
-            "Magic TDX library transport is disabled",
-        )))
-    }
-
-    #[cfg(feature = "magic-gateway")]
-    {
-        let joined = tokio::task::spawn_blocking(move || {
-            let source = TdxIndexBarsSource::connect()?;
-            let observed_at =
-                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-            probe_raw_benchmark_from_source(&source, request, &registry, observed_at.as_str())
-        })
-        .await;
-        match joined {
-            Ok(result) => result.map_err(map_gateway_error),
-            Err(error) => Err(map_gateway_error(benchmark_gateway_error(
-                BenchmarkAuditOutcome::Unavailable,
-                "blocking_task_failed",
-                true,
-                format!("TDX raw benchmark diagnostic worker failed: {error}"),
-            ))),
-        }
-    }
+    let _ = request;
+    Err(map_gateway_error(benchmark_gateway_error(
+        BenchmarkAuditOutcome::Unavailable,
+        "provider_transport",
+        true,
+        "raw benchmark provider diagnostics are unavailable over the remote transport",
+    )))
 }
 
 pub struct BenchmarkCapture<'a> {
@@ -674,7 +650,7 @@ impl BenchmarkWireTime {
 }
 
 impl BenchmarkBarWire {
-    #[cfg(any(feature = "magic-gateway", test))]
+    #[cfg(test)]
     fn from_bar(bar: &BenchmarkBar) -> Self {
         let at = match bar.at {
             BenchmarkBarTime::Daily(date) => BenchmarkWireTime::from_date(date),
@@ -709,7 +685,7 @@ impl BenchmarkBarWire {
 }
 
 impl BenchmarkEvidenceWire {
-    #[cfg(any(feature = "magic-gateway", test))]
+    #[cfg(test)]
     fn from_evidence(evidence: &super::review::BatchEvidence) -> Self {
         Self {
             provider: format!("{:?}", evidence.provider),
@@ -821,7 +797,7 @@ fn benchmark_trading_calendar_error(message: impl Into<String>) -> GatewayError 
 }
 
 impl BenchmarkAuditReceiptWire {
-    #[cfg(any(feature = "magic-gateway", test))]
+    #[cfg(test)]
     fn from_receipt(
         receipt: &crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt,
     ) -> Self {
@@ -868,7 +844,7 @@ impl BenchmarkAuditReceiptWire {
 }
 
 impl BenchmarkGrpcResponseWire {
-    #[cfg(any(feature = "magic-gateway", test))]
+    #[cfg(test)]
     pub(crate) fn from_audited(
         request: &BenchmarkRequest,
         audited: &super::review::AuditedBenchmarkBatch,
@@ -1543,70 +1519,15 @@ pub(super) async fn acquire_production_benchmark_bars(
             };
         }
     };
-
-    #[cfg(not(feature = "magic-gateway"))]
-    {
-        let _ = (coverage, contract);
-        BenchmarkAcquisitionOutcome {
-            request_hash,
-            result: Err(benchmark_gateway_error(
-                BenchmarkAuditOutcome::Unavailable,
-                "provider_transport",
-                true,
-                "Magic TDX library transport is disabled",
-            )),
-        }
-    }
-
-    #[cfg(feature = "magic-gateway")]
-    {
-        let joined = tokio::task::spawn_blocking(move || {
-            let source = TdxIndexBarsSource::connect()?;
-            let observed_at =
-                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-            match &coverage {
-                OwnedBenchmarkCoverage::Daily(authoritative_trading_days) => {
-                    fetch_and_admit_benchmark_batch(
-                        &source,
-                        request,
-                        &registry,
-                        contract,
-                        BenchmarkAdmissionCoverage::Daily {
-                            authoritative_trading_days,
-                        },
-                        &observed_at,
-                    )
-                }
-                OwnedBenchmarkCoverage::Minute1 => fetch_and_admit_benchmark_batch(
-                    &source,
-                    request,
-                    &registry,
-                    contract,
-                    BenchmarkAdmissionCoverage::Minute1,
-                    &observed_at,
-                ),
-            }
-        })
-        .await;
-        match joined {
-            Ok(Ok(prepared)) => BenchmarkAcquisitionOutcome {
-                request_hash: prepared.request_hash,
-                result: Ok(prepared.batch),
-            },
-            Ok(Err(error)) => BenchmarkAcquisitionOutcome {
-                request_hash,
-                result: Err(error),
-            },
-            Err(error) => BenchmarkAcquisitionOutcome {
-                request_hash,
-                result: Err(benchmark_gateway_error(
-                    BenchmarkAuditOutcome::Unavailable,
-                    "blocking_task_failed",
-                    true,
-                    format!("TDX benchmark worker failed: {error}"),
-                )),
-            },
-        }
+    let _ = (coverage, contract);
+    BenchmarkAcquisitionOutcome {
+        request_hash,
+        result: Err(benchmark_gateway_error(
+            BenchmarkAuditOutcome::Unavailable,
+            "provider_transport",
+            true,
+            "benchmark library acquisition is unavailable over the remote transport",
+        )),
     }
 }
 
@@ -1771,78 +1692,6 @@ pub(super) fn canonical_base_request_hash(request: &BenchmarkRequest) -> String 
 fn update_length_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_be_bytes());
     hasher.update(bytes);
-}
-
-#[cfg(feature = "magic-gateway")]
-struct TdxIndexBarsSource {
-    client: magic_tdx_rs::TdxHqClient,
-}
-
-#[cfg(feature = "magic-gateway")]
-impl TdxIndexBarsSource {
-    fn connect() -> Result<Self, GatewayError> {
-        let client = magic_tdx_rs::TdxHqClient::new();
-        let connected = client.connect_to_any(None).map_err(|error| {
-            benchmark_gateway_error(
-                BenchmarkAuditOutcome::Unavailable,
-                "provider_transport",
-                true,
-                format!("Magic TDX connection failed: {error}"),
-            )
-        })?;
-        if !connected {
-            return Err(benchmark_gateway_error(
-                BenchmarkAuditOutcome::Unavailable,
-                "provider_transport",
-                true,
-                "Magic TDX did not establish a connection",
-            ));
-        }
-        Ok(Self { client })
-    }
-}
-
-#[cfg(feature = "magic-gateway")]
-impl IndexBarsSource for TdxIndexBarsSource {
-    fn fetch_page(&self, request: IndexPageRequest) -> Result<Vec<RawIndexBar>, GatewayError> {
-        self.client
-            .get_index_bars(
-                request.category,
-                request.market,
-                request.code,
-                request.offset,
-                request.count,
-                request.fq_type,
-            )
-            .map(|rows| {
-                rows.into_iter()
-                    .map(|row| RawIndexBar {
-                        year: row.year,
-                        month: row.month,
-                        day: row.day,
-                        hour: row.hour,
-                        minute: row.minute,
-                        datetime: row.datetime,
-                        open: row.open,
-                        high: row.high,
-                        low: row.low,
-                        close: row.close,
-                        volume: Some(row.vol),
-                        amount: Some(row.amount),
-                        up_count: row.up_count,
-                        down_count: row.down_count,
-                    })
-                    .collect()
-            })
-            .map_err(|error| {
-                benchmark_gateway_error(
-                    BenchmarkAuditOutcome::Partial,
-                    "provider_transport",
-                    true,
-                    format!("Magic TDX index page failed: {error}"),
-                )
-            })
-    }
 }
 
 #[cfg(test)]
