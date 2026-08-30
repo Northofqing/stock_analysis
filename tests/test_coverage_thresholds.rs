@@ -319,7 +319,7 @@ impl PrFixture {
         );
         write_source(&root.join("src/agent/example.rs"), "base_other", 20);
         write_source(
-            &root.join("build_support/magic_tdx_lock.rs"),
+            &root.join("build_support/sample.rs"),
             "base_build_support",
             1,
         );
@@ -726,7 +726,7 @@ fn pr_policy_rejects_build_support_changes_after_the_registered_source_sha() {
         &fixture
             .checkout
             .path()
-            .join("build_support/magic_tdx_lock.rs"),
+            .join("build_support/sample.rs"),
         "after_report",
         2,
     );

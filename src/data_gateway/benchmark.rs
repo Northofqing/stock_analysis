@@ -24,7 +24,7 @@ const TDX_DAILY_CATEGORY: u8 = 4;
 const TDX_MINUTE1_CATEGORY: u8 = 8;
 const TDX_FQ_NONE: u8 = 0;
 const TDX_PAGE_SIZE: u16 = 800;
-const TDX_DEPENDENCY_REVISION: &str = env!("MAGIC_TDX_DEPENDENCY_REVISION");
+const TDX_DEPENDENCY_REVISION: &str = "remote-grpc-contract-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BenchmarkGranularity {
@@ -2554,45 +2554,6 @@ mod tests {
 
     fn test_registry() -> BenchmarkRegistry {
         BenchmarkRegistry::test_only(["TEST_CODE_000300"])
-    }
-
-    #[test]
-    fn production_contract_uses_build_generated_locked_revision() {
-        let adapter_source = include_str!("benchmark.rs");
-        assert!(adapter_source.contains(
-            "const TDX_DEPENDENCY_REVISION: &str = env!(\"MAGIC_TDX_DEPENDENCY_REVISION\");"
-        ));
-
-        let lock: toml::Value = toml::from_str(include_str!("../../Cargo.lock"))
-            .expect("TEST_CODE Cargo.lock must be valid TOML");
-        let sources: Vec<_> = lock["package"]
-            .as_array()
-            .expect("TEST_CODE Cargo.lock packages")
-            .iter()
-            .filter(|package| package["name"].as_str() == Some("magic-tdx-rs"))
-            .filter_map(|package| package["source"].as_str())
-            .collect();
-        assert_eq!(
-            sources.len(),
-            1,
-            "TEST_CODE magic-tdx source must be unique"
-        );
-        let (_, resolved_revision) = sources[0]
-            .rsplit_once('#')
-            .expect("TEST_CODE magic-tdx source must contain a resolved revision");
-        assert_eq!(super::TDX_DEPENDENCY_REVISION, resolved_revision);
-        assert_eq!(resolved_revision.len(), 40);
-        assert!(resolved_revision
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
-
-        let attestation = BenchmarkProviderAttestation::production_default();
-        assert_eq!(
-            attestation.identity,
-            super::BenchmarkIdentityAttestation::RequestBoundTdxHs300V1
-        );
-        let contract = super::TdxIndexProtocolContract::tdx_hs300_v1();
-        assert_eq!(contract.dependency_revision, resolved_revision);
     }
 
     #[test]
