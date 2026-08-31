@@ -13,6 +13,9 @@ pub struct ReviewRunContext {
     /// 2026-08-06: 手动 --review 时跳过 21:00 龙虎榜发布门 (R-04/R-07 立即
     /// 尝试, 未发布数据由 dispatcher 内部降级 + 出声)。自动调度保持等待。
     manual_override: bool,
+    /// 2026-08-31: 复盘欠账补推 (历史交易日 review_date < 今天, 错过原定窗口)。
+    /// 仅补推路径为 true; 推送带 [补推] 标注 + 原 business_date, 由接收方判断时效。
+    backfill: bool,
 }
 
 impl ReviewRunContext {
@@ -22,6 +25,7 @@ impl ReviewRunContext {
             review_date: stock_analysis::calendar::latest_completed_trading_day_at(observed_at),
             observed_at,
             manual_override: false,
+            backfill: false,
         }
     }
 
@@ -31,11 +35,32 @@ impl ReviewRunContext {
             review_date: stock_analysis::calendar::latest_completed_trading_day_at(observed_at),
             observed_at,
             manual_override: true,
+            backfill: false,
+        }
+    }
+
+    /// 复盘欠账补推: 固定 review_date 为指定历史交易日 (绕过
+    /// `latest_completed_trading_day_at` 推导), manual_override=true 放行
+    /// R-04 门; 跨天时 `eligibility_time()` 自动取 23:59:59 → R-07 的
+    /// 21:00 门同样打开。推送由 dispatch 层带 [补推] 标注。
+    pub fn at_business_date(
+        business_date: chrono::NaiveDate,
+        observed_at: chrono::NaiveDateTime,
+    ) -> Self {
+        Self {
+            review_date: business_date,
+            observed_at,
+            manual_override: true,
+            backfill: true,
         }
     }
 
     pub fn manual_override(self) -> bool {
         self.manual_override
+    }
+
+    pub fn backfill(self) -> bool {
+        self.backfill
     }
 
     pub fn review_date(self) -> chrono::NaiveDate {
@@ -1150,6 +1175,7 @@ impl ReviewScheduleState {
                 review_date: now.date(),
                 observed_at: now,
                 manual_override: false,
+                backfill: false,
             },
         )
     }
@@ -1882,6 +1908,7 @@ mod tests {
             review_date: day(),
             observed_at: observed_date.and_hms_opt(3, 0, 0).unwrap(),
             manual_override: false,
+            backfill: false,
         };
         let preflight = review_preflight(
             context,
@@ -1914,6 +1941,7 @@ mod tests {
                 review_date: day(),
                 observed_at: day().and_hms_opt(hour, minute, second).unwrap(),
                 manual_override: false,
+                backfill: false,
             };
             let preflight = review_preflight(context, &a10, false);
             assert_eq!(
@@ -1932,6 +1960,7 @@ mod tests {
                 review_date: day(),
                 observed_at: at_datetime(3, 0),
                 manual_override: false,
+                backfill: false,
             },
             &a10,
             true,
@@ -1952,6 +1981,7 @@ mod tests {
             review_date: day(),
             observed_at: day().and_hms_opt(7, 0, 0).unwrap(),
             manual_override: false,
+            backfill: false,
         };
 
         std::env::set_var("STOCK_ANALYSIS_QUIET_HOUR_OVERRIDE", "0");
@@ -1983,6 +2013,7 @@ mod tests {
                     review_date: day(),
                     observed_at: day().succ_opt().unwrap().and_hms_opt(3, 0, 0).unwrap(),
                     manual_override: false,
+                    backfill: false,
                 },
             )
             .pop()
@@ -2398,6 +2429,7 @@ mod tests {
                 review_date: day(),
                 observed_at: at_datetime(19, 0),
                 manual_override: false,
+                backfill: false,
             },
             &due,
             false,
@@ -2585,6 +2617,7 @@ mod tests {
                     review_date: day(),
                     observed_at: day().succ_opt().unwrap().and_hms_opt(3, 0, 0).unwrap(),
                     manual_override: false,
+                    backfill: false,
                 },
             )
             .pop()
@@ -2642,6 +2675,7 @@ mod tests {
             review_date: day(),
             observed_at: at_datetime(15, 0),
             manual_override: false,
+            backfill: false,
         };
         let preflight = review_preflight(context, &due, true);
 
@@ -2705,6 +2739,7 @@ mod tests {
                 .and_hms_opt(hour, minute, second)
                 .expect("valid TEST_CODE review time"),
             manual_override: false,
+            backfill: false,
         };
 
         assert!(matches!(
@@ -2982,6 +3017,7 @@ mod tests {
             review_date: day(),
             observed_at: at_datetime(15, 34),
             manual_override: false,
+            backfill: false,
         };
 
         let preflight = review_preflight(context, &due, false);
@@ -3005,6 +3041,7 @@ mod tests {
             review_date: chrono::NaiveDate::from_ymd_opt(2026, 7, 31).unwrap(),
             observed_at: saturday,
             manual_override: false,
+            backfill: false,
         };
 
         let preflight = review_preflight(context, &due, false);
@@ -3020,6 +3057,7 @@ mod tests {
             review_date: day().succ_opt().unwrap(),
             observed_at: at_datetime(19, 0),
             manual_override: false,
+            backfill: false,
         };
 
         let preflight = review_preflight(context, &due, false);
@@ -3043,6 +3081,7 @@ mod tests {
             review_date: day(),
             observed_at: at_datetime(19, 0),
             manual_override: false,
+            backfill: false,
         };
 
         let preflight = review_preflight(context, &due, true);
@@ -3160,6 +3199,71 @@ mod tests {
         assert_eq!(
             phases.account_required,
             std::collections::BTreeSet::from([ReviewTask::R03])
+        );
+    }
+
+    #[test]
+    fn backfill_at_business_date_fixes_date_and_opens_cross_day_gates() {
+        // 历史交易日 2026-07-20 (周一), 今天 07-22 补推: review_date 固定,
+        // 不再走 latest_completed_trading_day_at 推导。
+        let business_date = chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        let now = day().and_hms_opt(3, 0, 0).unwrap();
+        let ctx = ReviewRunContext::at_business_date(business_date, now);
+
+        assert_eq!(ctx.review_date(), business_date);
+        assert_eq!(ctx.business_date(), business_date);
+        assert!(ctx.manual_override());
+        assert!(ctx.backfill());
+        // 跨天: observed_at.date() > review_date → eligibility_time = 23:59:59
+        assert_eq!(
+            ctx.eligibility_time(),
+            chrono::NaiveTime::from_hms_opt(23, 59, 59).unwrap()
+        );
+
+        // R-07 21:00 门开 (23:59:59 >= 21:00)
+        let runnable = std::collections::BTreeSet::from([ReviewTask::R07]);
+        let preflight = review_preflight(ctx, &runnable, false);
+        assert_eq!(preflight.runnable, runnable);
+
+        // R-04 门: manual_override=true 放行
+        let runnable = std::collections::BTreeSet::from([ReviewTask::R04]);
+        let preflight = review_preflight(ctx, &runnable, false);
+        assert_eq!(preflight.runnable, runnable);
+
+        // 同日窗口内补推不应发生 (review_date == today 不走 backfill 构造);
+        // 对照: 普通 at() 构造在同日 21:00 前 R-07 仍被门等待。
+        let same_day = ReviewRunContext::at(day().and_hms_opt(20, 0, 0).unwrap());
+        assert!(!same_day.backfill());
+        let runnable = std::collections::BTreeSet::from([ReviewTask::R07]);
+        let preflight = review_preflight(same_day, &runnable, false);
+        assert!(preflight.runnable.is_empty());
+        assert!(matches!(
+            preflight.outcome_for(ReviewTask::R07),
+            Some(ReviewTaskOutcome::ExpectedWait { .. })
+        ));
+    }
+
+    #[test]
+    fn backfill_eligibility_is_end_of_observed_day_only_when_cross_day() {
+        let business_date = chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap();
+        // 同一天 (今天就是 business_date) 的 at_business_date: eligibility 用实际时间。
+        let ctx = ReviewRunContext::at_business_date(
+            business_date,
+            business_date.and_hms_opt(20, 0, 0).unwrap(),
+        );
+        assert_eq!(
+            ctx.eligibility_time(),
+            chrono::NaiveTime::from_hms_opt(20, 0, 0).unwrap()
+        );
+        // 但 backfill 扫描只对历史交易日发起, 不会构造同日 backfill — 此测试
+        // 仅锁定 eligibility_time 的纯函数行为, 防止回退破坏跨天语义。
+        let cross = ReviewRunContext::at_business_date(
+            business_date.pred_opt().unwrap(),
+            day().and_hms_opt(3, 0, 0).unwrap(),
+        );
+        assert_eq!(
+            cross.eligibility_time(),
+            chrono::NaiveTime::from_hms_opt(23, 59, 59).unwrap()
         );
     }
 }

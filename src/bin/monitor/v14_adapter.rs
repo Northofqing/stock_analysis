@@ -1327,10 +1327,12 @@ fn signal_event_for_news_ai(
 fn news_ai_profile() -> TemplateMetadata {
     let mut profile = default_profile_for_kind(PushKind::NewsToIdea);
     profile.category = stock_analysis::push_l2::TemplateCategory::News;
-    // BR-172 explicitly forbids the generic public-source DataMode::Down
-    // exemption: AI delivery requires the real combined-account context at
-    // full data health.
-    profile.data_mode_min = DataMode::Full;
+    // BR-249 (2026-08-31): Full 门经 8/21→8/31 实测 data_mode 恒 degraded
+    // （critical_stale 恒非空、Full 分支不可达，见 data_mode.rs BR-216 注释），
+    // NewsAI 结构性 0 推送。Degraded = 行情可用仅辅助能力缺；NewsAI 为证据
+    // 绑定的分析卡而非交易指令，放行 Degraded。其余门（launch/audit 健康/
+    // dry-run/L6/绑定校验）全部保持，BR-172 审计链不变。
+    profile.data_mode_min = DataMode::Degraded;
     profile.always_send_on_data_source_down = false;
     profile
 }
@@ -1691,7 +1693,9 @@ mod tests {
     #[test]
     fn br172_news_ai_gate_requires_full_data_without_down_exemption() {
         let profile = news_ai_profile();
-        assert_eq!(profile.data_mode_min, DataMode::Full);
+        // BR-249 (2026-08-31): Full 门实测恒不可达（data_mode 恒 degraded），
+        // NewsAI 降级至 Degraded 放行；DataMode::Down 豁免仍被禁止，其余门保持。
+        assert_eq!(profile.data_mode_min, DataMode::Degraded);
         assert!(!profile.always_send_on_data_source_down);
     }
 

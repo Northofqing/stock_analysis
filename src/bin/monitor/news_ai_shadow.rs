@@ -15,10 +15,10 @@ use stock_analysis::data_gateway::{HistoricalBarsGateway, MarketDataGateway};
 use stock_analysis::llm::LlmRegistry;
 use stock_analysis::monitor::news_ai::{
     deliver_governed_news_ai, AdmittedNewsFact, GovernedNewsAiDelivery, NewsAIAnalyzer,
-    NewsAiDeliveryAuditReceipt, NewsAiDeliveryReservation, NewsAiGovernedDeliveryOutcome,
-    NewsAiGovernedDeliveryPort, NewsAiPhysicalPushOutcome, NewsAiPredictionLinkReceipt,
-    NewsAiRequest, NewsAiReserveOutcome, NewsMarketContext, NewsMarketSnapshot,
-    NEWS_AI_ANALYSIS_VERSION,
+    NewsAiChainContext, NewsAiDeliveryAuditReceipt, NewsAiDeliveryReservation,
+    NewsAiGovernedDeliveryOutcome, NewsAiGovernedDeliveryPort, NewsAiPhysicalPushOutcome,
+    NewsAiPredictionLinkReceipt, NewsAiRequest, NewsAiReserveOutcome, NewsMarketContext,
+    NewsMarketSnapshot, NEWS_AI_ANALYSIS_VERSION,
 };
 use stock_analysis::news::aggregator::AdmittedGlobalNewsBatch;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -390,6 +390,45 @@ enum CandidateOutcome {
     },
 }
 
+/// BR-249: 读取目标股产业链上下文。
+///
+/// 1. chain_daily 最新涨停主线簇（断点 A 落库）中找目标股所属主线、簇规模、
+///    近 10 自然日上榜天数（与 pipeline::extra_context::chain_mainline_note
+///    同一数据链路）；2. BR-170 持仓产业链板块归属。任一步失败返回空上下文——
+///    链数据是辅助证据，不阻塞逐条评估，空字段进 prompt/hash 均被容忍。
+fn load_chain_context(code: &str) -> NewsAiChainContext {
+    let db = stock_analysis::database::get_db();
+    let mut ctx = NewsAiChainContext::default();
+    match db.get_latest_chain_clusters_strict() {
+        Ok(rows) => {
+            for row in &rows {
+                let codes: Vec<String> = match serde_json::from_str(&row.stocks) {
+                    Ok(codes) => codes,
+                    Err(_) => continue,
+                };
+                if codes.iter().any(|candidate| candidate == code) {
+                    ctx.mainline_concept = Some(row.concept.clone());
+                    ctx.mainline_cluster_size = Some(codes.len());
+                    ctx.mainline_date = Some(row.date.clone());
+                    if let Ok(as_of) = chrono::NaiveDate::parse_from_str(&row.date, "%Y-%m-%d") {
+                        if let Ok(streak) =
+                            db.get_chain_appearance_days_as_of_strict(&row.concept, 10, as_of)
+                        {
+                            ctx.mainline_streak_days = Some(streak);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        Err(_) => {}
+    }
+    if let Ok(Some(link)) = db.linked_position_chain(code) {
+        ctx.board_name = Some(link.board_name);
+    }
+    ctx
+}
+
 async fn assess_candidate(
     analyzer: Option<&NewsAIAnalyzer>,
     status: &NewsAiRuntimeStatus,
@@ -461,7 +500,13 @@ async fn assess_candidate(
     let market =
         NewsMarketSnapshot::try_from_admitted(&candidate.target_code, context, as_of, daily, quote)
             .map_err(|error| error.to_string())?;
-    let request = NewsAiRequest::try_new(fact, market, Vec::new(), NEWS_AI_ANALYSIS_VERSION)
+    // BR-249: 产业链上下文（chain_daily 最新涨停主线簇 + BR-170 板块归属）。
+    // 读取失败降级为空上下文，不阻塞逐条评估。
+    let chain_code = candidate.target_code.clone();
+    let chain = tokio::task::spawn_blocking(move || load_chain_context(&chain_code))
+        .await
+        .map_err(|error| format!("chain context task failed: {error}"))?;
+    let request = NewsAiRequest::try_new(fact, market, Vec::new(), NEWS_AI_ANALYSIS_VERSION, chain)
         .map_err(|error| error.to_string())?;
     let assessment = analyzer
         .assess(&request)

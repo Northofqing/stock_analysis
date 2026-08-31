@@ -9,10 +9,14 @@
 
 use anyhow::Result;
 use chrono::Local;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::OpenOptions;
 use std::io::Write;
 use stock_analysis::data_gateway::{AdmittedDailyBars, BatchEvidence, HistoricalBarsGateway};
+use stock_analysis::data_provider::KlineData;
 use stock_analysis::database::DatabaseManager;
+use stock_analysis::strategy::core::BacktestState;
 use stock_analysis::strategy::rsi::{RsiBacktest, RsiConfig, SingleRsiResult};
 use stock_analysis::strategy::TradeAction;
 
@@ -59,6 +63,8 @@ const STOCK_POOL: &[(&str, &str)] = &[
     ("000001", "平安银行"),
 ];
 
+const BACKTEST_TRADING_DAYS: usize = 250;
+
 struct PresetStats {
     name: String,
     config: RsiConfig,
@@ -68,7 +74,8 @@ struct PresetStats {
     stocks_with_trades: usize,
     stocks_tested: usize,
     per_stock: Vec<SingleStockStat>,
-    avg_return_pct: f64,
+    total_return_pct: f64,
+    annualized_return_pct: f64,
     data_evidence: Vec<(String, BatchEvidence)>,
 }
 
@@ -136,6 +143,52 @@ fn compute_stock_stat(r: &SingleRsiResult) -> SingleStockStat {
     }
 }
 
+fn portfolio_returns_pct(results: &[SingleRsiResult], initial_capital: f64) -> (f64, f64) {
+    if results.is_empty() || initial_capital <= 0.0 {
+        return (0.0, 0.0);
+    }
+
+    let mut dates = BTreeMap::new();
+    let value_maps: Vec<HashMap<String, f64>> = results
+        .iter()
+        .map(|result| {
+            result
+                .daily_values
+                .iter()
+                .map(|(date, value)| {
+                    let key = date.format("%Y-%m-%d").to_string();
+                    dates.entry(key.clone()).or_insert_with(|| *date);
+                    (key, *value)
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut state = BacktestState::new(initial_capital * results.len() as f64);
+    state.daily_values = dates
+        .into_iter()
+        .map(|(key, date)| {
+            let value = value_maps
+                .iter()
+                .map(|values| values.get(&key).copied().unwrap_or(initial_capital))
+                .sum();
+            (date, value)
+        })
+        .collect();
+
+    (state.total_return() * 100.0, state.annual_return() * 100.0)
+}
+
+fn chronological_klines(klines: &[KlineData]) -> Cow<'_, [KlineData]> {
+    if klines.windows(2).all(|pair| pair[0].date <= pair[1].date) {
+        Cow::Borrowed(klines)
+    } else {
+        let mut sorted = klines.to_vec();
+        sorted.sort_unstable_by_key(|kline| kline.date);
+        Cow::Owned(sorted)
+    }
+}
+
 fn retain_pool_entry(
     code: &str,
     name: &str,
@@ -152,13 +205,13 @@ fn retain_pool_entry(
 }
 
 const fn pool_record_count_is_sufficient(record_count: usize) -> bool {
-    record_count >= 250
+    record_count >= BACKTEST_TRADING_DAYS
 }
 
 fn fetch_pool(gateway: &HistoricalBarsGateway) -> Vec<StockHistory> {
     let mut out = Vec::new();
     for (code, name) in STOCK_POOL.iter() {
-        match gateway.required_daily_bars(code, 7000) {
+        match gateway.required_daily_bars(code, BACKTEST_TRADING_DAYS) {
             Ok(bars) => match retain_pool_entry(code, name, bars) {
                 Ok(history) => {
                     eprintln!(
@@ -190,10 +243,11 @@ fn run_preset(name: &str, config: RsiConfig, pool: &[StockHistory]) -> Result<Pr
     let mut total_round_trips = 0;
     let mut total_wins = 0;
     let mut stocks_with_trades = 0;
-    let mut total_return_sum = 0.0f64;
+    let mut successful_results = Vec::new();
 
     for history in pool {
-        match engine.run_single(&history.code, &history.name, history.bars.records()) {
+        let klines = chronological_klines(history.bars.records());
+        match engine.run_single(&history.code, &history.name, klines.as_ref()) {
             Ok(res) => {
                 let st = compute_stock_stat(&res);
                 if st.round_trips > 0 {
@@ -202,8 +256,8 @@ fn run_preset(name: &str, config: RsiConfig, pool: &[StockHistory]) -> Result<Pr
                 total_trades += st.trades;
                 total_round_trips += st.round_trips;
                 total_wins += st.wins;
-                total_return_sum += st.return_pct;
                 per_stock.push(st);
+                successful_results.push(res);
             }
             Err(e) => {
                 eprintln!("  [{}] 回测失败: {}", history.code, e);
@@ -212,11 +266,8 @@ fn run_preset(name: &str, config: RsiConfig, pool: &[StockHistory]) -> Result<Pr
     }
 
     let stocks_tested = pool.len();
-    let avg_return = if stocks_tested > 0 {
-        total_return_sum / stocks_tested as f64
-    } else {
-        0.0
-    };
+    let (total_return_pct, annualized_return_pct) =
+        portfolio_returns_pct(&successful_results, config.initial_capital);
 
     Ok(PresetStats {
         name: name.to_string(),
@@ -227,7 +278,8 @@ fn run_preset(name: &str, config: RsiConfig, pool: &[StockHistory]) -> Result<Pr
         stocks_with_trades,
         stocks_tested,
         per_stock,
-        avg_return_pct: avg_return,
+        total_return_pct,
+        annualized_return_pct,
         data_evidence: pool
             .iter()
             .map(|history| (history.code.clone(), history.bars.evidence().clone()))
@@ -266,7 +318,11 @@ fn format_preset_report(s: &PresetStats) -> String {
             "🔴 未达"
         }
     ));
-    out.push_str(&format!("- 平均收益：{:.2}%\n", s.avg_return_pct));
+    out.push_str(&format!("- 组合累计收益：{:+.2}%\n", s.total_return_pct));
+    out.push_str(&format!(
+        "- 组合年化收益：{:+.2}%\n",
+        s.annualized_return_pct
+    ));
     if !s.data_evidence.is_empty() {
         out.push_str("- 数据批次：\n");
         for (code, evidence) in &s.data_evidence {
@@ -318,6 +374,21 @@ fn format_preset_report(s: &PresetStats) -> String {
     }
     out.push('\n');
     out
+}
+
+fn format_compare_row(s: &PresetStats, win_rate_pct: f64) -> String {
+    format!(
+        "| {} | {}/{} | {} | {} | {} | **{:.2}%** | {:+.2}% | {:+.2}% |\n",
+        s.name,
+        s.stocks_with_trades,
+        s.stocks_tested,
+        s.total_trades,
+        s.total_round_trips,
+        s.total_wins,
+        win_rate_pct,
+        s.total_return_pct,
+        s.annualized_return_pct
+    )
 }
 
 fn append_to_log(text: &str) -> Result<()> {
@@ -407,8 +478,12 @@ fn main() -> Result<()> {
                 "\n## 🔄 Compare 批次（{}）\n\n",
                 Local::now().format("%Y-%m-%d %H:%M:%S")
             ));
-            combined.push_str("| Preset | 股票(有交易) | 总交易 | 平仓 | 胜 | 胜率 | 平均收益 |\n");
-            combined.push_str("|--------|------------|--------|------|----|------|---------|\n");
+            combined.push_str(
+                "| Preset | 股票(有交易) | 总交易 | 平仓 | 胜 | 胜率 | 累计收益 | 年化收益 |\n",
+            );
+            combined.push_str(
+                "|--------|------------|--------|------|----|------|---------|---------|\n",
+            );
             let mut details = String::new();
             for (name, cfg) in all_presets() {
                 println!("📈 跑 {}", name);
@@ -418,17 +493,7 @@ fn main() -> Result<()> {
                 } else {
                     0.0
                 };
-                combined.push_str(&format!(
-                    "| {} | {}/{} | {} | {} | {} | **{:.2}%** | {:+.2}% |\n",
-                    s.name,
-                    s.stocks_with_trades,
-                    s.stocks_tested,
-                    s.total_trades,
-                    s.total_round_trips,
-                    s.total_wins,
-                    wr,
-                    s.avg_return_pct
-                ));
+                combined.push_str(&format_compare_row(&s, wr));
                 details.push_str(&format_preset_report(&s));
             }
             combined.push('\n');
@@ -448,6 +513,8 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+    use stock_analysis::data_provider::{AdjustType, KlineData};
     use stock_analysis::strategy::Trade;
 
     #[test]
@@ -495,7 +562,8 @@ mod tests {
 
         let empty = run_preset("TEST_CODE_empty", RsiConfig::default(), &[]).unwrap();
         assert_eq!(empty.stocks_tested, 0);
-        assert_eq!(empty.avg_return_pct, 0.0);
+        assert_eq!(empty.total_return_pct, 0.0);
+        assert_eq!(empty.annualized_return_pct, 0.0);
         let empty_report = format_preset_report(&empty);
         assert!(empty_report.contains("🔴 未达"));
 
@@ -508,11 +576,95 @@ mod tests {
             stocks_with_trades: 1,
             stocks_tested: 1,
             per_stock: vec![stat],
-            avg_return_pct: 5.0,
+            total_return_pct: 5.0,
+            annualized_return_pct: 10.0,
             data_evidence: Vec::new(),
         };
         let report = format_preset_report(&stats);
         assert!(report.contains("✅ 达标"));
         assert!(report.contains("TEST_CODE_000001"));
+        assert!(report.contains("组合年化收益：+10.00%"));
+
+        let compare_row = format_compare_row(&stats, 100.0);
+        assert!(compare_row.contains("| +5.00% | +10.00% |"));
+    }
+
+    #[test]
+    fn equal_weight_portfolio_uses_calendar_year_cagr() {
+        let start = Local
+            .with_ymd_and_hms(2025, 1, 1, 15, 0, 0)
+            .single()
+            .unwrap();
+        let end = Local
+            .with_ymd_and_hms(2026, 1, 1, 15, 0, 0)
+            .single()
+            .unwrap();
+        let result = |code: &str, final_value: f64| SingleRsiResult {
+            code: code.to_string(),
+            name: code.to_string(),
+            initial_capital: 100.0,
+            final_value,
+            trades: Vec::new(),
+            daily_values: vec![(start, 100.0), (end, final_value)],
+            signals: Vec::new(),
+            rsi_values: Vec::new(),
+        };
+
+        let results = vec![
+            result("TEST_CODE_GAIN", 120.0),
+            result("TEST_CODE_FLAT", 100.0),
+        ];
+        let (total_return_pct, annualized_return_pct) = portfolio_returns_pct(&results, 100.0);
+
+        assert!((total_return_pct - 10.0).abs() < 1e-9);
+        assert!((annualized_return_pct - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn provider_descending_bars_are_ordered_before_backtest() {
+        let kline = |year, month, day| KlineData {
+            date: chrono::NaiveDate::from_ymd_opt(year, month, day).unwrap(),
+            open: 10.0,
+            high: 10.0,
+            low: 10.0,
+            close: 10.0,
+            volume: 1.0,
+            amount: 10.0,
+            pct_chg: 0.0,
+            intraday_price: None,
+            settled: true,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            eps: None,
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
+            is_limit_up: false,
+            is_limit_down: false,
+            is_suspended: false,
+            adjust: AdjustType::None,
+        };
+        let descending = vec![kline(2026, 8, 31), kline(2026, 8, 28)];
+
+        let ordered = chronological_klines(&descending);
+
+        assert_eq!(
+            ordered[0].date,
+            chrono::NaiveDate::from_ymd_opt(2026, 8, 28).unwrap()
+        );
+        assert_eq!(
+            ordered[1].date,
+            chrono::NaiveDate::from_ymd_opt(2026, 8, 31).unwrap()
+        );
     }
 }

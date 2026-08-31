@@ -5495,6 +5495,35 @@ async fn main() {
 
         let post_close_news = tokio::spawn(post_close_news_scheduler());
         let post_session_review = spawn_post_session_review_scheduler(selection_v2_enabled);
+        // 2026-08-31: 复盘欠账补推 (启动一次性)。等待 durable startup
+        // reconciliation (producer_ready 屏障) 完成, 30s × 20 ≈ 10 分钟上限;
+        // 错过窗口/未启动的复盘任务在此补推。每日 19:00 窗口内 scheduler 还会
+        // 再触发一次, 启动补推失败不阻塞任何主流程。
+        let review_backfill = tokio::spawn(async move {
+            for _ in 0..20 {
+                if durable_delivery_runtime::runtime_producer_ready() {
+                    match run_review_backfill().await {
+                        Ok(summary) if summary.pushed > 0 || summary.valuation_backfilled > 0 => {
+                            log::warn!(
+                                "[复盘补推] 启动补推完成 pushed={} already_delivered={} skipped={} no_data={} failed={} valuation_backfilled={} valuation_failed={}",
+                                summary.pushed,
+                                summary.already_delivered,
+                                summary.skipped,
+                                summary.no_data,
+                                summary.failed,
+                                summary.valuation_backfilled,
+                                summary.valuation_failed
+                            )
+                        }
+                        Ok(_) => log::info!("[复盘补推] 启动扫描无欠账"),
+                        Err(error) => log::warn!("[复盘补推] 启动补推失败: {error}"),
+                    }
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+            log::warn!("[复盘补推] 启动补推放弃: durable startup reconciliation 10 分钟超时");
+        });
         let position_chain_refresh = tokio::spawn(position_chain_refresh_loop());
         let opening_static_readiness = tokio::spawn(opening_static_readiness_loop());
         let opening_live_readiness = tokio::spawn(opening_live_readiness_loop());
@@ -5503,6 +5532,7 @@ async fn main() {
             ("monitor_event_consumer", event_consumer),
             ("post_close_news", post_close_news),
             ("post_session_review", post_session_review),
+            ("review_backfill", review_backfill),
             ("position_chain_refresh", position_chain_refresh),
             ("opening_static_readiness", opening_static_readiness),
             ("opening_live_readiness", opening_live_readiness),
@@ -5832,6 +5862,393 @@ async fn attempt_post_session_review(
     .await
 }
 
+/// 复盘欠账补推扫描窗口: 最近 N 个交易日 (不含今天)。今天由现有
+/// due_tasks/Retry 机制管; 补推只覆盖历史交易日 (review_date < 今天)。
+const BACKFILL_SCAN_TRADING_DAYS: usize = 5;
+
+/// 2026-08-31: 纳入欠账扫描的复盘任务。A-01 (PaperReview) 是 notify 层
+/// 非 counted 推送 (BR-192 设计, 无 durable 决策可判定欠账) → 排除, 避免
+/// 跨天补推产生重复推送。
+const BACKFILL_REVIEW_TASKS: [review_batch::ReviewTask; 8] = [
+    review_batch::ReviewTask::R04,
+    review_batch::ReviewTask::R07,
+    review_batch::ReviewTask::R08,
+    review_batch::ReviewTask::R09,
+    review_batch::ReviewTask::R11,
+    review_batch::ReviewTask::R12,
+    review_batch::ReviewTask::R13,
+    review_batch::ReviewTask::A10,
+];
+
+fn backfill_task_push_kind(
+    task: review_batch::ReviewTask,
+) -> Result<stock_analysis::durable_delivery::PushKind, String> {
+    use stock_analysis::durable_delivery::PushKind;
+    Ok(match task {
+        review_batch::ReviewTask::R04 => PushKind::ReviewLhb,
+        review_batch::ReviewTask::R07 => PushKind::TomorrowWatch,
+        review_batch::ReviewTask::R08 => PushKind::EventCalendar,
+        review_batch::ReviewTask::R09 => PushKind::ReviewProviderTopN,
+        review_batch::ReviewTask::R11 => PushKind::PositionReview,
+        review_batch::ReviewTask::R12 => PushKind::ReviewBacktest,
+        review_batch::ReviewTask::R13 => PushKind::WatchlistTracking,
+        review_batch::ReviewTask::A10 => PushKind::CatalystReview,
+        other => {
+            return Err(format!(
+                "复盘补推不支持任务 {} (非 counted 或无政策行)",
+                other.label()
+            ))
+        }
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct BackfillScanSummary {
+    pushed: usize,
+    already_delivered: usize,
+    skipped: usize,
+    no_data: usize,
+    failed: usize,
+    valuation_backfilled: usize,
+    valuation_already_present: usize,
+    valuation_failed: usize,
+}
+
+/// 复盘任务欠账补推 (2026-08-31): 历史交易日 (review_date < 今天) 的复盘
+/// 任务若未投递 (无 claim → 补跑; RejectedDurable → 授权重试), 下次启动 /
+/// 每日复盘窗口自动补推。逐任务独立 try — 一个失败不阻塞其他
+/// (apply_durable_review_hydrations Err 卡死教训)。补推完成 claim 落
+/// Delivered → 下次扫描幂等跳过; 失败保留 RejectedDurable → 下次再试。
+/// 补推扫描日期集: 最近 N 个交易日 (不含 today), 从旧到新。
+fn backfill_scan_dates(today: chrono::NaiveDate) -> Vec<chrono::NaiveDate> {
+    let mut dates = Vec::new();
+    let mut cursor = today;
+    while dates.len() < BACKFILL_SCAN_TRADING_DAYS {
+        cursor = match stock_analysis::calendar::verified_prev_a_share_trading_day(cursor) {
+            Ok(date) => date,
+            Err(error) => {
+                log::warn!("[复盘补推] 交易日历不可用, 提前结束扫描: {error}");
+                break;
+            }
+        };
+        dates.push(cursor);
+    }
+    dates.reverse(); // 从旧到新 — 先补最旧的欠账
+    dates
+}
+
+enum BackfillValuationState {
+    Backfilled(stock_analysis::database::closing_valuation::SaveClosingValuationReceipt),
+    AlreadyPresent,
+}
+
+/// 2026-08-31: 历史交易日收盘估值回填。R-07 的做T 档与 LHB 补价 (BR-233)
+/// 依赖 review_date 当日的 closing_valuation 视图; 历史日期估值缺失 (如
+/// 08-28 从未 persist) 时先回填, 再做任务补推。先 EXISTS 轻量判定, 缺失才跑
+/// BR-147 run_closing_valuation_once (日K回查 + stock_daily 精确回填 + 确定
+/// 性 run_id 幂等; 历史日期已结算, 无需 eligible_after_close 门)。
+async fn ensure_closing_valuation_for_backfill(
+    date: chrono::NaiveDate,
+) -> Result<BackfillValuationState, String> {
+    use stock_analysis::database::closing_valuation::has_persisted_valuation_for_date;
+    if has_persisted_valuation_for_date(date)? {
+        return Ok(BackfillValuationState::AlreadyPresent);
+    }
+    let receipt = crate::closing_valuation_runtime::run_closing_valuation_once(date).await?;
+    Ok(BackfillValuationState::Backfilled(receipt))
+}
+
+async fn run_review_backfill() -> Result<BackfillScanSummary, String> {
+    if !durable_delivery_runtime::runtime_producer_ready() {
+        return Err(
+            "复盘补推需要 durable startup reconciliation 完成 (producer_ready 屏障)".to_owned(),
+        );
+    }
+    let today = chrono::Local::now().date_naive();
+    let dates = backfill_scan_dates(today);
+    let scan_count = dates.len();
+    let mut summary = BackfillScanSummary::default();
+    for date in dates {
+        // 2026-08-31: 收盘估值回填 (R-07 08-28 no_data 根因修复)。做T/LHB 补价
+        // 依赖 review_date 当日 closes 视图; 历史日期估值缺失时先补, 再做任务
+        // 补推。独立 try — 失败仅计 valuation_failed, 不阻塞本日期其他任务
+        // (R-04/R-08/R-09 等不依赖估值) 与后续日期。幂等: EXISTS + run_id 哈希。
+        match ensure_closing_valuation_for_backfill(date).await {
+            Ok(BackfillValuationState::Backfilled(receipt)) => {
+                summary.valuation_backfilled += 1;
+                log::warn!(
+                    "[复盘补推] {date} 收盘估值回填 run_id={} inserted={}",
+                    receipt.run_id,
+                    receipt.inserted
+                );
+            }
+            Ok(BackfillValuationState::AlreadyPresent) => {
+                summary.valuation_already_present += 1;
+                log::info!("[复盘补推] {date} 收盘估值已存在, 跳过回填");
+            }
+            Err(error) => {
+                summary.valuation_failed += 1;
+                log::warn!(
+                    "[复盘补推] {date} 收盘估值回填失败 (R-07 做T/LHB 补价可能仍缺, 保留欠账下次扫描再试): {error}"
+                );
+            }
+        }
+        for task in BACKFILL_REVIEW_TASKS {
+            match backfill_one_review_task(date, task).await {
+                Ok(BackfillTaskOutcome::Pushed) => summary.pushed += 1,
+                Ok(BackfillTaskOutcome::AlreadyDelivered) => summary.already_delivered += 1,
+                Ok(BackfillTaskOutcome::Skipped(reason)) => {
+                    summary.skipped += 1;
+                    log::warn!(
+                        "[复盘补推] {task} {date} 跳过: {reason}",
+                        task = task.label()
+                    );
+                }
+                Ok(BackfillTaskOutcome::NoData) => summary.no_data += 1,
+                Ok(BackfillTaskOutcome::FailedAttempt) => summary.failed += 1,
+                Err(error) => {
+                    summary.failed += 1;
+                    log::warn!(
+                        "[复盘补推] {task} {date} 失败 (保留欠账, 下次扫描再试): {error}",
+                        task = task.label()
+                    );
+                }
+            }
+        }
+    }
+    log::info!(
+        "[复盘补推] 扫描完成 dates={} pushed={} already_delivered={} skipped={} no_data={} failed={} valuation_backfilled={} valuation_already_present={} valuation_failed={}",
+        scan_count,
+        summary.pushed,
+        summary.already_delivered,
+        summary.skipped,
+        summary.no_data,
+        summary.failed,
+        summary.valuation_backfilled,
+        summary.valuation_already_present,
+        summary.valuation_failed
+    );
+    Ok(summary)
+}
+
+enum BackfillTaskOutcome {
+    Pushed,
+    AlreadyDelivered,
+    Skipped(String),
+    /// 2026-08-31: 补跑完成但零投递 (no_data/全失败) — 不落 claim, 保留欠账
+    /// 下次扫描再试; 与 Pushed 区分记账, 避免把无产出当成功。
+    NoData,
+    /// 2026-08-31: 补跑完成、零投递且 attempt 报错 (failed_tasks>0) — 与
+    /// NoData 区分: 无货 (真无数据) vs 报错 (attempt 级失败, 如 consensus
+    /// invalid_evidence 门)。两者都不落 claim 保留欠账, 但报错应计 failed。
+    FailedAttempt,
+}
+
+/// 补跑投递分类纯函数 (2026-08-31): delivered>0 为 Pushed; 零投递时按
+/// attempt 是否报错分 FailedAttempt (计 failed) 与 NoData (计 no_data) —
+/// 汇总层「报错 vs 无货」有区分度, 新失败原因不会被淹没在 no_data 里。
+fn classify_backfill_delivery(delivered: usize, failed: usize) -> BackfillTaskOutcome {
+    if delivered > 0 {
+        BackfillTaskOutcome::Pushed
+    } else if failed > 0 {
+        BackfillTaskOutcome::FailedAttempt
+    } else {
+        BackfillTaskOutcome::NoData
+    }
+}
+
+async fn backfill_one_review_task(
+    date: chrono::NaiveDate,
+    task: review_batch::ReviewTask,
+) -> Result<BackfillTaskOutcome, String> {
+    use stock_analysis::durable_delivery::DecisionState;
+    let push_kind = backfill_task_push_kind(task)?;
+    let task_identity = review_batch::review_task_identity(date, task);
+    let evidence =
+        durable_delivery_runtime::resume_review_task_occurrence(date, push_kind, task_identity)
+            .await?;
+    let Some(evidence) = evidence else {
+        // 无 claim: 从未尝试 → 补跑 (at_business_date 固定 review_date,
+        // 跨天 eligibility_time=23:59:59 自动打开 R-04/R-07 21:00 门)。
+        let context = review_batch::ReviewRunContext::at_business_date(
+            date,
+            chrono::Local::now().naive_local(),
+        );
+        let due = std::collections::BTreeSet::from([task]);
+        let batch = crate::push_templates::dispatch_post_session_review(context, &due).await?;
+        let delivered = batch.delivered_count();
+        let failed = batch.failed_tasks().len();
+        let outcome = classify_backfill_delivery(delivered, failed);
+        log::warn!(
+            "[复盘补推] {task} {date} 无 claim 补跑完成 delivered={delivered} failed={failed}",
+            task = task.label()
+        );
+        if matches!(
+            outcome,
+            BackfillTaskOutcome::NoData | BackfillTaskOutcome::FailedAttempt
+        ) {
+            let cause = if matches!(outcome, BackfillTaskOutcome::FailedAttempt) {
+                "attempt 失败"
+            } else {
+                "no_data"
+            };
+            log::warn!(
+                "[复盘补推] {task} {date} 补跑无投递 ({cause}, 不落 claim, 保留欠账下次扫描再试)",
+                task = task.label()
+            );
+        }
+        return Ok(outcome);
+    };
+    match evidence.state {
+        DecisionState::Delivered => Ok(BackfillTaskOutcome::AlreadyDelivered),
+        DecisionState::RejectedDurable => {
+            log::warn!(
+                "[复盘补推] {task} {date} RejectedDurable 授权重试 decision={decision}",
+                task = task.label(),
+                decision = evidence.decision_identity
+            );
+            durable_delivery_runtime::authorize_rejected_review_retry(evidence.decision_identity)
+                .await?;
+            let resumed = durable_delivery_runtime::resume_review_task_occurrence(
+                date,
+                push_kind,
+                review_batch::review_task_identity(date, task),
+            )
+            .await?;
+            match resumed {
+                Some(resumed_evidence) if resumed_evidence.state == DecisionState::Delivered => {
+                    log::warn!(
+                        "[复盘补推] {task} {date} RejectedDurable 重投已交付 decision={decision}",
+                        task = task.label(),
+                        decision = resumed_evidence.decision_identity
+                    );
+                    Ok(BackfillTaskOutcome::Pushed)
+                }
+                Some(resumed_evidence) => Ok(BackfillTaskOutcome::Skipped(format!(
+                    "RejectedDurable 重投后仍为 {} (sink 再拒, 下轮再试)",
+                    resumed_evidence.state
+                ))),
+                None => Ok(BackfillTaskOutcome::Skipped(
+                    "RejectedDurable 重投后 claim 消失".to_owned(),
+                )),
+            }
+        }
+        other => Ok(BackfillTaskOutcome::Skipped(format!(
+            "occurrence 状态 {other} 不欠账"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests_review_backfill {
+    use super::*;
+    use chrono::Datelike;
+
+    #[test]
+    fn backfill_scan_excludes_today_and_walks_back_trading_days() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 22).unwrap(); // 周三
+        let dates = backfill_scan_dates(today);
+        assert_eq!(dates.len(), BACKFILL_SCAN_TRADING_DAYS);
+        // 不含今天; 全部 < today; 升序 (从旧到新)
+        assert!(!dates.contains(&today));
+        for window in dates.windows(2) {
+            assert!(window[0] < window[1]);
+        }
+        assert_eq!(*dates.last().unwrap(), today.pred_opt().unwrap()); // 07-21 周二
+                                                                       // 全部是交易日
+        for date in &dates {
+            assert!(
+                stock_analysis::calendar::verified_a_share_trading_day(*date)
+                    .expect("calendar authority must be loaded in tests"),
+                "{date} should be a trading day"
+            );
+        }
+    }
+
+    #[test]
+    fn backfill_scan_skips_weekends() {
+        // 周一 2026-07-20 回看 5 个交易日 → 不含 07-18(六)/07-19(日)
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        let dates = backfill_scan_dates(today);
+        assert_eq!(dates.len(), BACKFILL_SCAN_TRADING_DAYS);
+        assert_eq!(
+            dates[0],
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 13).unwrap()
+        );
+        assert_eq!(
+            *dates.last().unwrap(),
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 17).unwrap()
+        );
+        for date in &dates {
+            assert!(!matches!(
+                date.weekday(),
+                chrono::Weekday::Sat | chrono::Weekday::Sun
+            ));
+        }
+    }
+
+    #[test]
+    fn backfill_task_set_covers_durable_review_kinds_only() {
+        // A-01 (PaperReview, notify 层非 counted) 不纳入扫描
+        assert_eq!(BACKFILL_REVIEW_TASKS.len(), 8);
+        assert!(!BACKFILL_REVIEW_TASKS.contains(&review_batch::ReviewTask::A01));
+        for task in BACKFILL_REVIEW_TASKS {
+            assert!(backfill_task_push_kind(task).is_ok());
+        }
+    }
+
+    #[test]
+    fn classify_backfill_delivery_distinguishes_no_data_from_pushed() {
+        // delivered>0 → Pushed (真实投递)
+        assert!(matches!(
+            classify_backfill_delivery(1, 0),
+            BackfillTaskOutcome::Pushed
+        ));
+        assert!(matches!(
+            classify_backfill_delivery(3, 2),
+            BackfillTaskOutcome::Pushed
+        ));
+        // delivered=0 且 attempt 无报错 → NoData (无货, 保留欠账)
+        assert!(matches!(
+            classify_backfill_delivery(0, 0),
+            BackfillTaskOutcome::NoData
+        ));
+        // delivered=0 且 attempt 报错 → FailedAttempt (计 failed, 保留欠账)
+        assert!(matches!(
+            classify_backfill_delivery(0, 5),
+            BackfillTaskOutcome::FailedAttempt
+        ));
+    }
+
+    #[test]
+    fn backfill_summary_defaults_to_zero() {
+        let summary = BackfillScanSummary::default();
+        assert_eq!(
+            (
+                summary.pushed,
+                summary.already_delivered,
+                summary.skipped,
+                summary.no_data,
+                summary.failed,
+                summary.valuation_backfilled,
+                summary.valuation_already_present,
+                summary.valuation_failed
+            ),
+            (0, 0, 0, 0, 0, 0, 0, 0)
+        );
+        // 模拟一次扫描累加: 2 pushed + 1 no_data + 1 valuation_backfilled
+        let mut summary = BackfillScanSummary::default();
+        for _ in 0..2 {
+            summary.pushed += 1;
+        }
+        summary.no_data += 1;
+        summary.valuation_backfilled += 1;
+        assert_eq!(summary.pushed, 2);
+        assert_eq!(summary.no_data, 1);
+        assert_eq!(summary.valuation_backfilled, 1);
+    }
+}
+
 async fn post_session_review_scheduler(selection_v2_enabled: bool) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -5839,6 +6256,8 @@ async fn post_session_review_scheduler(selection_v2_enabled: bool) {
     // BR-236 Fix B (2026-08-12): (估值日, 快照 evidence_sha256) — 快照变化即重算
     let mut valuation_state: Option<(chrono::NaiveDate, String)> = None;
     let mut ai_analysis_date: Option<chrono::NaiveDate> = None;
+    // 2026-08-31: 每日复盘窗口内补推一次历史欠账 (calendar 日去重)。
+    let mut backfill_date: Option<chrono::NaiveDate> = None;
 
     log::info!("[复盘调度][BR-139] started threshold=19:00 interval=60s");
 
@@ -5956,6 +6375,14 @@ async fn post_session_review_scheduler(selection_v2_enabled: bool) {
             state = Some(review_batch::ReviewScheduleState::for_date(
                 now.date_naive(),
             ));
+        }
+        // 2026-08-31: 复盘欠账补推 (每日一次)。detached — 不阻塞当日复盘;
+        // 幂等性由 durable claim 保证 (补推完成落 Delivered, 下轮跳过)。
+        if backfill_date != Some(now.date_naive()) {
+            backfill_date = Some(now.date_naive());
+            let backfill = tokio::spawn(run_review_backfill());
+            // 仅记录 JoinHandle 丢弃 (失败已在函数内逐任务 log, 不重复处理)
+            drop(backfill);
         }
         let schedule = state
             .as_mut()
@@ -8331,6 +8758,44 @@ mod tests_br211_paper_exit_containment {
     }
 }
 
+/// 亿元换算: 上游 MoneyFlows 的 main_net 单位为元。
+const YUAN_PER_YI: f64 = 1e8;
+
+/// A2: 盘中批量资金流 overlay — 按 code 收集 MoneyFlows op (Eastmoney 实时) 的
+/// 当日主力净流 (元 → 亿), 覆盖两路硬编码 None 的数据源 (limit_up.rs /
+/// project_top_stock_batch)。失败时返回空 overlay, 调用方走 TopStock fallback。
+async fn fetch_flow_overlay(codes: Vec<String>) -> std::collections::HashMap<String, f64> {
+    let mut overlay: std::collections::HashMap<String, f64> = Default::default();
+    let Ok(bridge) = stock_analysis::data_gateway::grpc_source::bridge_for("MoneyFlows") else {
+        log::warn!("[盘中监控] MoneyFlows bridge 不可用, 资金面信号走 fallback");
+        return overlay;
+    };
+    if codes.is_empty() {
+        return overlay;
+    }
+    match bridge.money_flows_async(&codes).await {
+        Ok(stock_analysis::data_gateway::review::GatewayBatch::Available { records, .. }) => {
+            for r in records {
+                overlay.insert(r.code, r.main_net / YUAN_PER_YI);
+            }
+        }
+        Ok(_) => {
+            log::debug!("[盘中监控] 资金流 overlay 空批次 (codes={})", codes.len());
+        }
+        Err(e) => log::warn!("[盘中监控] 资金流 overlay 获取失败: {e}"),
+    }
+    overlay
+}
+
+/// 资金面字段取值: MoneyFlows overlay 优先, 回退 TopStock 自带值, 双缺失 0.0 哨兵。
+/// 0.0 安全的前提是 detector 阈值恒 > 0 (debug_assert 见 Detector 构造), 不误触发。
+fn overlay_net_yi(
+    overlay: &std::collections::HashMap<String, f64>,
+    s: &stock_analysis::market_data::TopStock,
+) -> f64 {
+    overlay.get(&s.code).copied().or(s.main_net_yi).unwrap_or(0.0)
+}
+
 async fn monitor_loop() {
     // 全天候循环：非交易日等待，交易日自动进入扫描
 
@@ -9979,18 +10444,29 @@ async fn monitor_loop() {
 
                         // 主力排名（仅在真实涨停池可用时排序）
 
+                        // A2 (2026-08-31): 盘中批量资金流 overlay — 上游 RealtimeQuotes
+                        // 视图无主力净流字段 (delegate 5 字段), ProviderTopNRankings 盘中
+                        // 不 admit; MoneyFlows op (Eastmoney 实时) 批量携带 main_net,
+                        // 按 code 覆盖两路硬编码 None 的数据源, 恢复主力排名 + 资金面 check。
+                        // volume_ratio 上游无实时视图, vol_burst 保持 A1 哨兵静默。
+                        let flow_overlay =
+                            fetch_flow_overlay(stock_map.keys().cloned().collect()).await;
+
                         let mut ranked = limit_stocks.as_ref().map(|stocks| {
                             stocks
                                 .iter()
-                                .filter(|stock| stock.main_net_yi.is_some())
+                                .filter(|stock| {
+                                    stock.main_net_yi.is_some()
+                                        || flow_overlay.contains_key(&stock.code)
+                                })
                                 .collect::<Vec<_>>()
                         });
 
                         if let Some(ranked) = ranked.as_mut() {
                             ranked.sort_by(|a, b| {
-                                b.main_net_yi
-                                    .partial_cmp(&a.main_net_yi)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                let av = overlay_net_yi(&flow_overlay, a);
+                                let bv = overlay_net_yi(&flow_overlay, b);
+                                bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
                             });
                         }
 
@@ -9999,16 +10475,32 @@ async fn monitor_loop() {
                         // 持仓遍历：信号融合（不再单独推送每条事件）
 
                         for (code, s) in &stock_map {
-                            let (Some(volume_ratio), Some(main_net_yi)) =
-                                (s.volume_ratio, s.main_net_yi)
-                            else {
-                                log::warn!(
-                                    "[盘中监控] {}({}) 缺少量比或主力净流，跳过资金面信号检测",
+                            // 告警源修复 (2026-08-31): 上游 quote 合同暂不携带量比/主力净流
+                            // (两数据源 limit_up.rs:186 / project_top_stock_batch 硬编码 None)。
+                            // 缺失时不再 continue 整只股票 —— limit_up/limit_down/board_break
+                            // 不依赖这两项, 照常检测。A2: 主力净流取 MoneyFlows overlay
+                            // (Eastmoney 实时), 缺失时 0.0 哨兵 (阈值恒 > 0, 不误触发)。
+                            // volume_ratio 上游无实时视图 (RealtimeQuotes 5 字段 /
+                            // ProviderTopNRankings 盘中不 admit), vol_burst 保持静默。
+                            // 量比缺失是静态事实 (数据源硬编码 None) 而非事件, 打 debug 避免
+                            // 每 tick × 每股刷屏; 主力净流缺失才是事件性 (overlay 失败),
+                            // 保留 warn。
+                            let main_net_yi = overlay_net_yi(&flow_overlay, s);
+                            let volume_ratio = s.volume_ratio.unwrap_or(0.0);
+                            if s.volume_ratio.is_none() {
+                                log::debug!(
+                                    "[盘中监控] {}({}) 缺少量比 (上游无实时视图), 量比信号静默跳过",
                                     s.name,
                                     s.code
                                 );
-                                continue;
-                            };
+                            }
+                            if s.main_net_yi.is_none() && !flow_overlay.contains_key(code) {
+                                log::warn!(
+                                    "[盘中监控] {}({}) 缺少主力净流 (MoneyFlows 无此股), 净流入/净流出信号静默跳过",
+                                    s.name,
+                                    s.code
+                                );
+                            }
 
                             // review #14: DB 错误按"已锁定"处理 (保守), log warn 提醒.
 
@@ -11751,8 +12243,8 @@ mod tests_post_session_review_scheduler {
         let dispatcher_call = ["push_templates::", "dispatch_post_session_review("].concat();
         assert_eq!(
             production.matches(&dispatcher_call).count(),
-            1,
-            "the strict inner runner must be the only production dispatcher owner"
+            2,
+            "the strict inner runner and the 2026-08-31 backfill scanner are the only production dispatcher owners"
         );
         let stale_owner = ["evening_", "pushed"].concat();
         assert!(
@@ -11970,6 +12462,52 @@ mod tests_post_session_review_scheduler {
         let retired_fetch = ["fetch_", "stock_", "news", "_in_range"].concat();
         assert!(!review.contains(&retired_provider));
         assert!(!review.contains(&retired_fetch));
+    }
+}
+
+#[cfg(test)]
+mod tests_flow_overlay {
+    use super::{overlay_net_yi, YUAN_PER_YI};
+    use std::collections::HashMap;
+    use stock_analysis::market_data::TopStock;
+
+    fn stock(code: &str, main_net_yi: Option<f64>) -> TopStock {
+        TopStock {
+            code: code.into(),
+            main_net_yi,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn overlay_hit_wins_over_topstock_value() {
+        let mut overlay = HashMap::new();
+        overlay.insert("000001".into(), 3.2);
+        assert_eq!(overlay_net_yi(&overlay, &stock("000001", Some(0.5))), 3.2);
+    }
+
+    #[test]
+    fn falls_back_to_topstock_when_overlay_misses() {
+        let overlay = HashMap::new();
+        assert_eq!(overlay_net_yi(&overlay, &stock("000002", Some(1.4))), 1.4);
+    }
+
+    #[test]
+    fn zero_sentinel_when_both_missing() {
+        let overlay = HashMap::new();
+        assert_eq!(overlay_net_yi(&overlay, &stock("000003", None)), 0.0);
+    }
+
+    #[test]
+    fn negative_outflow_is_preserved_not_clamped() {
+        let mut overlay = HashMap::new();
+        overlay.insert("000004".into(), -2.7);
+        assert_eq!(overlay_net_yi(&overlay, &stock("000004", None)), -2.7);
+    }
+
+    #[test]
+    fn yuan_to_yi_conversion_is_1e8() {
+        assert_eq!(1.0 / YUAN_PER_YI, 1e-8);
     }
 }
 

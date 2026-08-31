@@ -1684,7 +1684,7 @@ fn resume_review_task_occurrence_blocking(
     };
 
     let mut reconciled_hydrations = reconcile_current_decision(state, &existing.decision_identity)?;
-    if state
+    let stored_state = state
         .coordinator
         .decision_state(&existing.decision_identity)
         .map_err(|error| {
@@ -1692,9 +1692,14 @@ fn resume_review_task_occurrence_blocking(
                 "read BR-239 review occurrence {}: {error}",
                 existing.decision_identity
             )
-        })?
-        == DecisionState::Reserved
-    {
+        })?;
+    // 2026-08-31: 补推路径对 RejectedDurable 同样尝试 resume —
+    // `resume_deliverable` 内部仅对 retry_authorized 的 RejectedDurable 重开
+    // attempt (`reacquire_rejected`), 未授权时安全 no-op, 不会产生副作用。
+    if matches!(
+        stored_state,
+        DecisionState::Reserved | DecisionState::RejectedDurable
+    ) {
         state
             .coordinator
             .resume_deliverable(
@@ -1730,6 +1735,35 @@ fn resume_review_task_occurrence_blocking(
         state: final_evidence.state,
         schedule_hydration: final_evidence.schedule_hydration,
     }))
+}
+
+/// 2026-08-31: 复盘欠账补推 — 显式授权一个 RejectedDurable 复盘决策重试。
+/// 仅 RejectedDurable 状态可授权; 授权后下一次 `resume_review_task_occurrence`
+/// 会经 `resume_deliverable` 重开 attempt 并重投 sink。
+pub async fn authorize_rejected_review_retry(decision_identity: String) -> Result<(), String> {
+    let state = runtime_state()?;
+    let coordinator = Arc::clone(&state.coordinator);
+    tokio::task::spawn_blocking(move || {
+        coordinator
+            .authorize_rejected_retry(&decision_identity)
+            .map_err(|error| {
+                format!(
+                    "authorize BR-239 review occurrence {} retry: {error}",
+                    decision_identity
+                )
+            })
+    })
+    .await
+    .map_err(|error| format!("authorize BR-239 review occurrence retry join failed: {error}"))?
+}
+
+/// 2026-08-31: 启动补推前探活 — 只有完成 startup reconciliation 后
+/// `resume_review_task_occurrence` 才可用 (producer_ready 屏障)。
+pub fn runtime_producer_ready() -> bool {
+    runtime_state()
+        .ok()
+        .map(|state| state.producer_ready.load(Ordering::Acquire))
+        .unwrap_or(false)
 }
 
 pub fn replay_terminal_envelope(

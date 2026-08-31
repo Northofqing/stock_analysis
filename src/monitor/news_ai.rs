@@ -32,7 +32,10 @@ const REALTIME_MAX_AGE_SECONDS: i64 = 5;
 const DATA_EVIDENCE_FUTURE_TOLERANCE_SECONDS: i64 = 90;
 const REQUIRED_DAILY_HISTORY: usize = 20;
 const MODEL_CALL_TIMEOUT_SECONDS: u64 = 45;
-pub const NEWS_AI_ANALYSIS_VERSION: &str = "news_ai_v1";
+// BR-249 (2026-08-31): v2 加入产业链上下文（normalized_prompt chain_context 块 +
+// 证据哈希纳入链字段）。assessment identity 含 version，切 v2 后历史 v1 记录
+// 不命中 dedup，已评估快讯会以 v2 重评（per-tick 5 条限速，非风暴）。
+pub const NEWS_AI_ANALYSIS_VERSION: &str = "news_ai_v2";
 pub const NEWS_AI_SYSTEM_PROMPT_V1: &str = concat!(
     "You are an evidence-bound A-share news analyst. ",
     "Use only the supplied normalized evidence. ",
@@ -561,12 +564,29 @@ pub struct OptionalNewsMetric {
     pub status: EvidenceStatus<f64>,
 }
 
+/// 2026-08-31 (BR-249): NewsAI 产业链上下文——目标股所在涨停主线（chain_daily，
+/// 断点 A 落库）与 BR-170 官方板块归属。数据缺失时保持 None，评估不阻塞。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewsAiChainContext {
+    /// 目标股所在最近涨停主线名（chain_daily.concept）
+    pub mainline_concept: Option<String>,
+    /// 主线簇内涨停股数
+    pub mainline_cluster_size: Option<usize>,
+    /// 主线证据日期（chain_daily.date）
+    pub mainline_date: Option<String>,
+    /// 近 10 自然日该主线上榜天数
+    pub mainline_streak_days: Option<i64>,
+    /// BR-170 持仓产业链板块名
+    pub board_name: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewsAiRequest {
     fact: AdmittedNewsFact,
     market: NewsMarketSnapshot,
     optional_metrics: Vec<OptionalNewsMetric>,
     analysis_version: String,
+    chain: NewsAiChainContext,
     evidence_hash: String,
     normalized_prompt: String,
 }
@@ -577,6 +597,7 @@ impl NewsAiRequest {
         market: NewsMarketSnapshot,
         mut optional_metrics: Vec<OptionalNewsMetric>,
         analysis_version: &str,
+        chain: NewsAiChainContext,
     ) -> Result<Self, NewsAiError> {
         if analysis_version.trim().is_empty() {
             return Err(market_error("analysis version is empty"));
@@ -590,14 +611,15 @@ impl NewsAiRequest {
         }
         validate_optional_metrics(&mut optional_metrics, market.as_of)?;
         let evidence_hash =
-            hash_request_evidence(&fact, &market, &optional_metrics, analysis_version);
+            hash_request_evidence(&fact, &market, &optional_metrics, analysis_version, &chain);
         let normalized_prompt =
-            build_normalized_prompt(&fact, &market, &optional_metrics, analysis_version)?;
+            build_normalized_prompt(&fact, &market, &optional_metrics, analysis_version, &chain)?;
         Ok(Self {
             fact,
             market,
             optional_metrics,
             analysis_version: analysis_version.to_owned(),
+            chain,
             evidence_hash,
             normalized_prompt,
         })
@@ -617,6 +639,10 @@ impl NewsAiRequest {
 
     pub fn analysis_version(&self) -> &str {
         &self.analysis_version
+    }
+
+    pub fn chain(&self) -> &NewsAiChainContext {
+        &self.chain
     }
 
     pub fn evidence_hash(&self) -> &str {
@@ -1060,6 +1086,7 @@ impl AuditedNewsAiAssessment {
         let fact = request.fact().clone();
         let analysis_version = request.analysis_version().to_owned();
         let identity = NewsAiDeliveryIdentity::from_fact(&fact, &analysis_version);
+        let chain = Some(request.chain().clone());
         Ok(Self {
             delivery: GovernedNewsAiDelivery {
                 fact,
@@ -1067,6 +1094,7 @@ impl AuditedNewsAiAssessment {
                 assessment,
                 assessment_audit_record_sha256: assessment_audit_record_sha256.to_owned(),
                 identity,
+                chain,
             },
         })
     }
@@ -1098,6 +1126,8 @@ impl AuditedNewsAiAssessment {
                 assessment,
                 assessment_audit_record_sha256: assessment_audit_record_sha256.to_owned(),
                 identity,
+                // BR-249: 持久化重建路径无链快照；渲染卡如实标注。
+                chain: None,
             },
         })
     }
@@ -1115,6 +1145,8 @@ pub struct GovernedNewsAiDelivery {
     assessment: NewsAiAssessment,
     assessment_audit_record_sha256: String,
     identity: NewsAiDeliveryIdentity,
+    /// BR-249: 评估时的产业链上下文快照。DB 重建路径（恢复推送）为 None。
+    chain: Option<NewsAiChainContext>,
 }
 
 impl GovernedNewsAiDelivery {
@@ -1148,9 +1180,42 @@ impl GovernedNewsAiDelivery {
             NewsImpact::Positive => "正面",
             NewsImpact::MajorPositive => "重大正面",
         };
+        let chain_line = match &self.chain {
+            // BR-249: 评估期链快照。命中主线后 date/size/streak 可能解析失败为
+            // None（如 streak 查询失败），缺失字段以「—」占位，不因此断言
+            // 「不在主线中」；链上下文整体缺失时如实标注「未检出」，不做否定断言。
+            Some(chain) => match chain.mainline_concept.as_deref() {
+                Some(concept) => {
+                    let date = chain.mainline_date.as_deref().unwrap_or("—");
+                    let size = chain
+                        .mainline_cluster_size
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "—".to_owned());
+                    let streak = chain
+                        .mainline_streak_days
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "—".to_owned());
+                    match chain.board_name.as_deref() {
+                        Some(board) => format!(
+                            "所属主线「{concept}」（{date} 簇内 {size} 只，近10日上榜 {streak} 天）；板块：{board}"
+                        ),
+                        None => format!(
+                            "所属主线「{concept}」（{date} 簇内 {size} 只，近10日上榜 {streak} 天）"
+                        ),
+                    }
+                }
+                None => match chain.board_name.as_deref() {
+                    Some(board) => format!("板块：{board}；未检出所属主线"),
+                    None => "（未检出所属主线）".to_owned(),
+                },
+            },
+            // BR-249: DB 重建的恢复推送没有评估期链快照，如实标注而非推断。
+            None => "（恢复推送，无链快照）".to_owned(),
+        };
         format!(
             "🧠 AI 新闻证据分析\n\
              标的：{}\n\
+             产业链：{}\n\
              标题：{}\n\
              来源：{} / {:?}\n\
              发布时间：{}\n\
@@ -1164,6 +1229,7 @@ impl GovernedNewsAiDelivery {
              投递身份：{}\n\
              ⚠️ 仅为来源绑定的模型分析，不构成交易建议。",
             self.fact.target_code(),
+            chain_line,
             self.fact.title(),
             self.fact.source(),
             self.fact.provider(),
@@ -2006,6 +2072,7 @@ fn build_normalized_prompt(
     market: &NewsMarketSnapshot,
     metrics: &[OptionalNewsMetric],
     analysis_version: &str,
+    chain: &NewsAiChainContext,
 ) -> Result<String, NewsAiError> {
     let mut available = BTreeMap::new();
     let mut unavailable = BTreeMap::new();
@@ -2058,6 +2125,15 @@ fn build_normalized_prompt(
             "average_volume_20d": market.metrics.average_volume_20d,
             "quote": quote,
         },
+        "chain_context": {
+            "mainline_concept": chain.mainline_concept,
+            "mainline_cluster_size": chain.mainline_cluster_size,
+            "mainline_date": chain.mainline_date,
+            "mainline_streak_days": chain.mainline_streak_days,
+            "board_name": chain.board_name,
+            "note": "target's latest limit-up mainline cluster and official board \
+                     affiliation, when available; missing fields must not be inferred"
+        },
         "available_optional_metrics": available,
         "unavailable_optional_metrics": unavailable,
         "required_output_schema": {
@@ -2081,6 +2157,7 @@ fn hash_request_evidence(
     market: &NewsMarketSnapshot,
     metrics: &[OptionalNewsMetric],
     analysis_version: &str,
+    chain: &NewsAiChainContext,
 ) -> String {
     let mut hasher = Sha256::new();
     hash_field(&mut hasher, fact.target_code());
@@ -2185,6 +2262,22 @@ fn hash_request_evidence(
             }
         }
     }
+    // BR-249: 产业链上下文进入证据哈希（审计完整性），但不进 assessment
+    // identity（dedup key 保持稳定，链数据变化不触发同快讯重评）。
+    // ⚠️ 时效性说明：该哈希是评估时刻的链状态快照（评估后 chain_daily
+    // 更新不会重算），input_evidence_sha256/normalized_prompt_sha256 不能从
+    // 当前链状态重算；持久化重建路径不重验哈希（chain: None 如实标注）。
+    hash_field(&mut hasher, chain.mainline_concept.as_deref().unwrap_or(""));
+    hash_field(
+        &mut hasher,
+        &chain.mainline_cluster_size.unwrap_or(0).to_string(),
+    );
+    hash_field(&mut hasher, chain.mainline_date.as_deref().unwrap_or(""));
+    hash_field(
+        &mut hasher,
+        &chain.mainline_streak_days.unwrap_or(0).to_string(),
+    );
+    hash_field(&mut hasher, chain.board_name.as_deref().unwrap_or(""));
     format!("{:x}", hasher.finalize())
 }
 
@@ -2703,6 +2796,7 @@ mod tests {
                 },
             }],
             "TEST_CODE_news_ai_v1",
+            NewsAiChainContext::default(),
         )
         .expect("TEST_CODE request")
     }

@@ -200,6 +200,15 @@ pub struct Detector {
 
 impl Detector {
     pub fn new(config: DetectorConfig) -> Self {
+        // 0.0 哨兵契约 (盘中扫描 overlay fallback): 资金面/量比阈值必须 > 0,
+        // 否则缺失数据 (0.0) 会与阈值恒等误触发净流入/净流出/量比告警。
+        debug_assert!(
+            config.main_inflow_yi > 0.0 && config.main_outflow_yi > 0.0 && config.vol_ratio_threshold > 0.0,
+            "0.0 哨兵要求资金面阈值恒 > 0, 当前 inflow={} outflow={} vol={}",
+            config.main_inflow_yi,
+            config.main_outflow_yi,
+            config.vol_ratio_threshold
+        );
         Self { config }
     }
 

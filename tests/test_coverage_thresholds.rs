@@ -723,10 +723,7 @@ fn pr_policy_rejects_source_changes_after_the_registered_source_sha() {
 fn pr_policy_rejects_build_support_changes_after_the_registered_source_sha() {
     let fixture = PrFixture::new(&PrCase::default());
     write_source(
-        &fixture
-            .checkout
-            .path()
-            .join("build_support/sample.rs"),
+        &fixture.checkout.path().join("build_support/sample.rs"),
         "after_report",
         2,
     );

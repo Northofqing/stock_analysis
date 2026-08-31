@@ -142,6 +142,34 @@ fn persisted_valuation_view_for_date_conn(
     materialize_valuation_view(c, row)
 }
 
+/// 轻量缺估值判定 (2026-08-31 复盘补推用): 该 price_date 是否存在任意
+/// closing_valuation_run 行。存在行 ⇒ 估值完整 (run_blocking 只在全部持仓
+/// 取得同日有限正收盘价后才 persist, closing_valuation_runtime.rs run_blocking,
+/// covered==total), 且同 run_id 行存在则其 price_date 必为该日期 (run_id
+/// 内容哈希含 price_date) — EXISTS 即精确日期判定。
+///
+/// 比 persisted_valuation_view_for_date 更轻 (不 materialize items) 且不因
+/// 脏日期行 (如测试注入的 'not-a-date') 报 Err — 判定「缺失 vs 失败」不误伤。
+pub fn has_persisted_valuation_for_date(price_date: chrono::NaiveDate) -> Result<bool, String> {
+    let db = crate::database::DatabaseManager::get();
+    let mut c = db.get_conn().map_err(|e| e.to_string())?;
+    has_persisted_valuation_for_date_conn(&mut c, price_date)
+}
+
+fn has_persisted_valuation_for_date_conn(
+    c: &mut SqliteConnection,
+    price_date: chrono::NaiveDate,
+) -> Result<bool, String> {
+    let row: Option<IdRow> = diesel::sql_query(
+        "SELECT id AS _id FROM closing_valuation_run WHERE price_date=?1 LIMIT 1",
+    )
+    .bind::<diesel::sql_types::Text, _>(price_date.format("%Y-%m-%d").to_string())
+    .get_result(&mut *c)
+    .optional()
+    .map_err(|e| e.to_string())?;
+    Ok(row.is_some())
+}
+
 fn latest_persisted_valuation_view_with_conn(
     c: &mut SqliteConnection,
 ) -> Result<Option<ClosingValuationView>, String> {
@@ -260,6 +288,51 @@ mod tests {
         )
         .expect("for_date read")
         .is_none());
+    }
+
+    #[test]
+    fn has_persisted_valuation_for_date_is_exact_and_lightweight() {
+        let mut conn = connection();
+        // 空库 → false
+        assert!(!has_persisted_valuation_for_date_conn(
+            &mut conn,
+            NaiveDate::from_ymd_opt(2026, 8, 6).expect("date")
+        )
+        .expect("empty read"));
+
+        let mut prior = view(vec![item("TEST_CODE_000001", Some(11.0))]);
+        prior.price_date = NaiveDate::from_ymd_opt(2026, 8, 6).expect("date");
+        save_closing_valuation_with_conn(&mut conn, &prior).expect("insert prior date");
+
+        // 精确日期匹配, 不是 latest 语义
+        assert!(has_persisted_valuation_for_date_conn(
+            &mut conn,
+            NaiveDate::from_ymd_opt(2026, 8, 6).expect("date")
+        )
+        .expect("exact read"));
+        assert!(!has_persisted_valuation_for_date_conn(
+            &mut conn,
+            NaiveDate::from_ymd_opt(2026, 8, 7).expect("date")
+        )
+        .expect("adjacent read"));
+
+        // 脏日期行存在时, 其他日期的 EXISTS 判定不受影响 (不做日期解析)
+        diesel::sql_query(
+            "INSERT INTO closing_valuation_run(run_id,price_date,provider,covered,total,total_market_value,total_unrealized_pnl) VALUES ('cv_v1_dirty','not-a-date','test',1,1,NULL,NULL)",
+        )
+        .execute(&mut conn)
+        .expect("dirty row");
+        assert!(has_persisted_valuation_for_date_conn(
+            &mut conn,
+            NaiveDate::from_ymd_opt(2026, 8, 6).expect("date")
+        )
+        .expect("read with dirty row"));
+        // 脏行存在时 clean 日期的 EXISTS 仍精确 (不命中 'not-a-date')
+        assert!(!has_persisted_valuation_for_date_conn(
+            &mut conn,
+            NaiveDate::from_ymd_opt(2026, 8, 8).expect("date")
+        )
+        .expect("clean adjacent read"));
     }
 
     #[test]

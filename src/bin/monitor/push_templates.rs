@@ -8030,17 +8030,23 @@ where
     runner(date.to_owned()).await
 }
 
-async fn dispatch_tomorrow_watch_outcome(date: &str) -> crate::review_batch::ReviewTaskOutcome {
+async fn dispatch_tomorrow_watch_outcome(
+    date: &str,
+    backfill: bool,
+) -> crate::review_batch::ReviewTaskOutcome {
     dispatch_tomorrow_watch_outcome_with_runner(
         date,
         inspect_r07_review_occurrence,
-        |owned_date| async move { dispatch_tomorrow_watch_after_preflight(&owned_date).await },
+        move |owned_date| async move {
+            dispatch_tomorrow_watch_after_preflight(&owned_date, backfill).await
+        },
     )
     .await
 }
 
 async fn dispatch_tomorrow_watch_after_preflight(
     date: &str,
+    backfill: bool,
 ) -> crate::review_batch::ReviewTaskOutcome {
     use stock_analysis::opportunity::candidate_panel::EvidenceTier;
     use stock_analysis::review::tomorrow_watchlist::{
@@ -8334,6 +8340,30 @@ async fn dispatch_tomorrow_watch_after_preflight(
     }
 
     let items = dedup(items);
+    // 2026-08-31: 补推源诊断 — 四源各自产出条数, no_data 时直接可判根因
+    // (closes 视图命中数 = 做T 档估值是否就绪; lhb_evidence = LHB counted 源
+    // 是否有货)。正常路径 (backfill=false) 零开销。
+    if backfill {
+        let mut by_source = [0usize; 4];
+        for item in &items {
+            match item.source {
+                WatchSource::AGradeNotTriggered => by_source[0] += 1,
+                WatchSource::LhbStrong => by_source[1] += 1,
+                WatchSource::LimitChainLeader => by_source[2] += 1,
+                WatchSource::T0Candidate => by_source[3] += 1,
+            }
+        }
+        log::warn!(
+            "[R-07][补推] date={date} 源产出 A档={} 龙虎榜={} 涨停链={} 做T={} dedup合计={} closes视图={} lhb_evidence={}",
+            by_source[0],
+            by_source[1],
+            by_source[2],
+            by_source[3],
+            items.len(),
+            closes.len(),
+            lhb_evidence.is_some()
+        );
+    }
     if items.is_empty() {
         log_dispatcher_attempt("R-07", false, 0, "tomorrow watchlist empty");
         return crate::review_batch::ReviewTaskOutcome::no_data(
@@ -8355,7 +8385,12 @@ async fn dispatch_tomorrow_watch_after_preflight(
             reason: &item.reason,
         });
     }
-    let text = render_tomorrow_watch(date, &borrowed);
+    let text = if backfill {
+        // 2026-08-31: 复盘欠账补推 — 推送带 [补推] 标注 + 原 business_date。
+        format!("[补推]\n{}", render_tomorrow_watch(date, &borrowed))
+    } else {
+        render_tomorrow_watch(date, &borrowed)
+    };
     let prepared = match (&lhb_evidence, lhb_records.is_empty()) {
         (Some(evidence), false) => {
             match prepare_tomorrow_watch_delivery(trading_date, evidence, &lhb_records, text) {
@@ -8429,6 +8464,13 @@ async fn dispatch_tomorrow_watch_after_preflight(
     )
     .await;
     let dispatcher_error = push_outcome_dispatcher_error(&push_result);
+    // 2026-08-31: 补推在 dispatcher_log 的 error 字段留 backfill 标记
+    // (不新建 kind, 保统计口径); 真实失败 error 优先保留。
+    let dispatcher_error = if backfill && dispatcher_error.is_empty() {
+        "backfill".to_owned()
+    } else {
+        dispatcher_error
+    };
     log_dispatcher_attempt(
         "R-07",
         push_result.is_pushed(),
@@ -9525,6 +9567,17 @@ pub async fn dispatch_post_session_review(
         date,
         context.manual_override()
     );
+    if context.backfill() {
+        // 2026-08-31: 复盘欠账补推 — 原定窗口已过, 补推带 [补推] 标注。
+        let tasks = due
+            .iter()
+            .map(|task| task.label())
+            .collect::<Vec<_>>()
+            .join(",");
+        log::warn!(
+            "[复盘补推] business_date={date} 任务=[{tasks}] 原定窗口已过, 补推 (claim 落 Delivered 后幂等跳过)"
+        );
+    }
 
     let is_test = stock_analysis::risk::env_guard::runtime_is_test_process()
         || stock_analysis::risk::env_guard::current_env()
@@ -9572,7 +9625,7 @@ pub async fn dispatch_post_session_review(
             if phases.source_only.contains(&ReviewTask::R07) {
                 Some((
                     ReviewTask::R07,
-                    dispatch_tomorrow_watch_outcome(&date).await,
+                    dispatch_tomorrow_watch_outcome(&date, context.backfill()).await,
                 ))
             } else {
                 None

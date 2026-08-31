@@ -3599,6 +3599,28 @@ impl DurableDeliveryCoordinator {
         })
     }
 
+    /// 2026-08-31: 复盘欠账补推授权 — 仅 RejectedDurable 决策可被授权重试。
+    /// sink 拒绝时 `retry_authorized` 由拒因决定; 本函数是补推路径的显式授权
+    /// (错过窗口/进程未启时, 无 sink 拒因可依据, 由调度器决定重试)。授权后
+    /// `resume_deliverable` 会对该决策走 `reacquire_rejected` 重开 attempt。
+    pub fn authorize_rejected_retry(&self, decision_identity: &str) -> Result<()> {
+        let state = self.decision_state(decision_identity)?;
+        if state != DecisionState::RejectedDurable {
+            return Err(DurableDeliveryError::IllegalTransition {
+                from: state.to_string(),
+                to: "retry_authorized".to_owned(),
+            });
+        }
+        self.with_connection(|connection| {
+            connection.execute(
+                "UPDATE delivery_decisions SET retry_authorized=1,updated_at=datetime('now')
+                 WHERE decision_identity=?1 AND state='RejectedDurable'",
+                [decision_identity],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn resume_deliverable(
         &self,
         decision_identity: &str,

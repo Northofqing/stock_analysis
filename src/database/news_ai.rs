@@ -1992,7 +1992,7 @@ mod tests {
     use super::*;
     use crate::market_domain::ProviderId;
     use crate::market_domain::SourceEvidence;
-    use crate::monitor::news_ai::NewsAiReserveOutcome;
+    use crate::monitor::news_ai::{NewsAiChainContext, NewsAiReserveOutcome};
     use chrono::{FixedOffset, NaiveDate, TimeZone, Utc};
     use diesel::connection::SimpleConnection;
 
@@ -2137,8 +2137,14 @@ mod tests {
             quote: None,
         })
         .expect("market snapshot");
-        let request = NewsAiRequest::try_new(fact, market, Vec::new(), "TEST_CODE_NEWS_AI_CORE_V1")
-            .expect("NewsAI request");
+        let request = NewsAiRequest::try_new(
+            fact,
+            market,
+            Vec::new(),
+            "TEST_CODE_NEWS_AI_CORE_V1",
+            NewsAiChainContext::default(),
+        )
+        .expect("NewsAI request");
         let response = r#"{"impact":"positive","confidence":82,"uncertainty":"TEST_CODE execution may vary","core_logic":"TEST_CODE evidence-bound positive impact"}"#;
         let receipt = ModelCallReceipt::try_new(
             "TEST_CODE_MODEL_PROVIDER",
