@@ -8243,37 +8243,34 @@ struct PreparedT0Advice {
     binding: durable_delivery_runtime::CountedDeliveryBinding,
 }
 
-/// PaperSell 生产 gate (v19 review 2026-08-12, invalid_position_ledger):
-/// 成本为全部历史买入混合摊薄 (Σamt/Σqty), T+1 用 MIN(ts) 最早买入日, 无批次
-/// 账本 → 生产 100 笔虚拟卖出含 3 笔收益率 >100% (最高 +22751% 为买价记录错误)、
-/// 11 笔当日买入即卖、7 笔买入后 60s 内卖出 (最短 5s)。暂停投递直到批次账本重建。
-/// 默认禁用, 仅 `PAPER_SELL_ENABLED=1` 显式启用 (v15.x 静默路径可见: 启动 banner
-/// 一次 + 跳过 warn 节流 30 分钟)。
+/// PaperSell 生产 gate — 已解除 (2026-09-01):
+/// v19 review (2026-08-12) 曾因无批次账本暂停投递 (混合摊薄成本 + MIN(ts) T+1 →
+/// 收益率 >100% / 当日即卖 / 60s 内卖)。FIFO 批次账本已重建并接线
+/// (paper_lot_ledger.rs, 2026-08-23 de283aa..73174c1; paper_sell.rs:207
+/// rebuild_paper_positions), 模块测试 11/11 + 11/11 全绿, 默认放行。
+/// 逃生口: `PAPER_SELL_DISABLED=1` 显式禁用 (启动 banner 一次 + 跳过 warn 节流)。
 fn paper_sell_paused(phase: &str) -> bool {
-    if std::env::var("PAPER_SELL_ENABLED")
+    if std::env::var("PAPER_SELL_DISABLED")
         .map(|value| value == "1")
         .unwrap_or(false)
     {
-        return false;
+        static BANNER: std::sync::Once = std::sync::Once::new();
+        BANNER.call_once(|| {
+            log::warn!("[paper_sell] disabled=manual; 虚拟盘卖出投递暂停 (PAPER_SELL_DISABLED=1)");
+        });
+        static LAST_WARN_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let last = LAST_WARN_SECS.load(std::sync::atomic::Ordering::Relaxed);
+        if now_secs.saturating_sub(last) >= 1800 {
+            LAST_WARN_SECS.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+            log::warn!("[paper_sell] {phase} disabled=manual; 跳过虚拟盘卖出扫描");
+        }
+        return true;
     }
-    static BANNER: std::sync::Once = std::sync::Once::new();
-    BANNER.call_once(|| {
-        log::warn!(
-            "[paper_sell] disabled=invalid_position_ledger; 虚拟盘卖出投递暂停 \
-             (成本摊薄/T+1 账本错误待批次账本重建; PAPER_SELL_ENABLED=1 显式启用)"
-        );
-    });
-    static LAST_WARN_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    let last = LAST_WARN_SECS.load(std::sync::atomic::Ordering::Relaxed);
-    if now_secs.saturating_sub(last) >= 1800 {
-        LAST_WARN_SECS.store(now_secs, std::sync::atomic::Ordering::Relaxed);
-        log::warn!("[paper_sell] {phase} disabled=invalid_position_ledger; 跳过虚拟盘卖出扫描");
-    }
-    true
+    false
 }
 
 async fn prepare_t0_messages() -> Result<Vec<PreparedT0Advice>, String> {
@@ -8937,7 +8934,7 @@ async fn monitor_loop() {
                             log::warn!("[evening_review] 失败: {}", e);
                         }
                         // BR-234: 收盘后卖出评估 — 无交易时段守卫，收盘 K 线完整评估
-                        // (v19 review 同盘中: invalid_position_ledger 暂停, 见 paper_sell_paused)
+                        // (盘后卖出: FIFO 账本已重建 2026-08-23, gate 已解除 2026-09-01, 见 paper_sell_paused)
                         if !paper_sell_paused("盘后") {
                             match stock_analysis::trading::paper_sell::scan_and_sell_post_close(
                                 risk_context,
