@@ -223,6 +223,15 @@ enum VerifiedReadPurpose {
 }
 
 impl DatabaseManager {
+    /// BR-178: GlobalSchema amended-schema authority 是否已接线。
+    ///
+    /// 生产 legacy 构造 (`DatabaseManager::init`) 不持有 authority, 权威读
+    /// (verified read/recovery) 必然 failed closed; selection-v2 属未发布能力,
+    /// 调度方在 authority 缺失时应明确跳过而非每 60s 刷屏失败。
+    pub(crate) fn selection_schema_authority_available(&self) -> bool {
+        self.selection_schema_authority.is_some()
+    }
+
     /// Executes one schema-v2 authoritative read against the process-owned
     /// production database and the fixed production selection-audit root.
     ///

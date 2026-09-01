@@ -1098,6 +1098,20 @@ impl OutcomeSettlementOwner {
                 "production outcome tick requires the process-owned database",
             )
         })?;
+        // BR-178 (2026-09-01): 生产 legacy 构造不持有 GlobalSchema amended-schema
+        // authority (selection-v2 未发布, from_verified_amended_selection_schema
+        // 无生产接线); 权威读必 failed closed。recovery/due 队列无真实欠账
+        // (selection_outcomes/candidates/runs 全空), 此处明确跳过并一次性说明,
+        // 而非每 60s 刷屏 failed closed。authority 接线后此门自动放行。
+        if !database.selection_schema_authority_available() {
+            static SKIP_BANNER: std::sync::Once = std::sync::Once::new();
+            SKIP_BANNER.call_once(|| {
+                log::warn!(
+                    "[selection-v2][BR-178] GlobalSchema authority 未接线 (selection-v2 未发布); recovery/due tick 明确跳过, 不再每分钟 failed closed"
+                );
+            });
+            return Ok(OutcomeSettlementTickSummary::default());
+        }
         let non_outcome_recovery = database
             .with_verified_selection_v2_recovery_model(|model| {
                 Ok(model.recovery_queues()?.into_ordered_non_outcome())
