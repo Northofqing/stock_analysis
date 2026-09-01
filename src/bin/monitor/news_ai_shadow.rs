@@ -429,17 +429,45 @@ fn load_chain_context(code: &str) -> NewsAiChainContext {
     ctx
 }
 
+/// BR-250: 经证券身份统一 Gateway 解析标的名称 (display-only, 仅卡片渲染)。
+///
+/// 与 BR-225 resolve_preopen_head_names 同一数据来源。名称不进 identity/证据
+/// 哈希, 失败降级为 None 不阻塞逐条评估——与产业链上下文同一容错哲学。
+async fn resolve_target_name(code: &str) -> Option<String> {
+    use stock_analysis::data_gateway::{GatewayBatch, MarketCapabilitiesGateway};
+    let codes = vec![code.to_owned()];
+    let batch = MarketCapabilitiesGateway::new()
+        .security_identities(&codes)
+        .await
+        .ok()?;
+    let records = match batch {
+        GatewayBatch::Available { records, .. } => records,
+        GatewayBatch::VerifiedEmpty(_) => return None,
+    };
+    records
+        .into_iter()
+        .find(|record| record.code == code)
+        .map(|record| record.name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+}
+
 async fn assess_candidate(
     analyzer: Option<&NewsAIAnalyzer>,
     status: &NewsAiRuntimeStatus,
     candidate: &NewsAiCandidate,
 ) -> Result<CandidateOutcome, String> {
-    let fact = AdmittedNewsFact::from_admitted_global(
+    let mut fact = AdmittedNewsFact::from_admitted_global(
         &candidate.batch,
         candidate.record_index,
         &candidate.target_code,
     )
     .map_err(|error| error.to_string())?;
+    // BR-250: 注入证券名称供卡片渲染; 解析失败保持 None, 不阻塞评估。
+    let name_code = candidate.target_code.clone();
+    let name = resolve_target_name(&name_code).await;
+    if let Some(name) = name {
+        fact = fact.with_target_name(name);
+    }
 
     let identity_fact = fact.clone();
     let existing = tokio::task::spawn_blocking(move || {

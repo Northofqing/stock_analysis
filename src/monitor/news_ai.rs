@@ -113,6 +113,11 @@ pub struct AdmittedNewsFact {
     record: AdmittedNewsSourceRecord,
     batch: BatchEvidence,
     target_code: String,
+    /// BR-250: 仅卡片渲染用证券名称 (display-only)。不进 identity/证据哈希/
+    /// prompt/DB——同 code 恒同 name, 不会改变 dedup 幂等。实时路径由
+    /// news_ai_shadow 经证券身份统一 Gateway 解析注入; 持久化重建路径无
+    /// 来源, 保持 None, 渲染如实降级为仅代码。
+    target_name: Option<String>,
 }
 
 impl AdmittedNewsFact {
@@ -201,6 +206,7 @@ impl AdmittedNewsFact {
             record: AdmittedNewsSourceRecord::Global(record.clone()),
             batch: batch.clone(),
             target_code: target_code.to_owned(),
+            target_name: None,
         })
     }
 
@@ -266,7 +272,20 @@ impl AdmittedNewsFact {
             record: AdmittedNewsSourceRecord::Sina(record.clone()),
             batch: batch.clone(),
             target_code: target_code.to_owned(),
+            target_name: None,
         })
+    }
+
+    /// BR-250: 注入证券名称 (display-only, 仅渲染用)。调用方须只以统一证券
+    /// 身份来源填充; 不参与 identity/哈希, 幂等不受影响。
+    /// 库公开: bin/monitor (news_ai_shadow) 是独立 crate, 需经此注入。
+    pub fn with_target_name(mut self, name: String) -> Self {
+        self.target_name = Some(name);
+        self
+    }
+
+    pub fn target_name(&self) -> Option<&str> {
+        self.target_name.as_deref()
     }
 
     pub fn provider(&self) -> ProviderId {
@@ -1212,6 +1231,12 @@ impl GovernedNewsAiDelivery {
             // BR-249: DB 重建的恢复推送没有评估期链快照，如实标注而非推断。
             None => "（恢复推送，无链快照）".to_owned(),
         };
+        // BR-250: 标的名称仅渲染用。实时路径已注入「名称（代码）」; 名称缺失
+        // (持久化恢复推送) 如实降级为仅代码, 不做本地合成。
+        let target_line = match self.fact.target_name() {
+            Some(name) => format!("{}（{}）", name, self.fact.target_code()),
+            None => self.fact.target_code().to_owned(),
+        };
         format!(
             "🧠 AI 新闻证据分析\n\
              标的：{}\n\
@@ -1228,7 +1253,7 @@ impl GovernedNewsAiDelivery {
              评估审计：{}\n\
              投递身份：{}\n\
              ⚠️ 仅为来源绑定的模型分析，不构成交易建议。",
-            self.fact.target_code(),
+            target_line,
             chain_line,
             self.fact.title(),
             self.fact.source(),
@@ -2813,6 +2838,102 @@ mod tests {
         assert_eq!(fact.item_id(), "TEST_CODE_NEWS_ITEM");
         assert_eq!(fact.source_batch_id(), "TEST_CODE_NEWS_BATCH");
         assert_eq!(fact.target_code(), "TEST_CODE_600519");
+        assert_eq!(fact.target_name(), None, "BR-250 构造缺省无名称");
+    }
+
+    #[test]
+    fn br250_target_name_is_display_only_and_does_not_change_identity() {
+        let observed_at = instant("2026-07-27T01:00:03Z");
+        let fact = AdmittedNewsFact::from_global(
+            &global_record(observed_at),
+            &news_batch(observed_at),
+            "TEST_CODE_600519",
+        )
+        .expect("exact evidence must be admitted");
+        let named = fact.clone().with_target_name("TEST_CODE_名称".to_owned());
+        assert_eq!(named.target_name(), Some("TEST_CODE_名称"));
+        // BR-250 幂等红线: 名称仅渲染用, 不得进入投递身份哈希。
+        assert_eq!(
+            NewsAiDeliveryIdentity::from_fact(&fact, "TEST_CODE_news_ai_v1").sha256(),
+            NewsAiDeliveryIdentity::from_fact(&named, "TEST_CODE_news_ai_v1").sha256(),
+            "target_name 改变投递身份 = dedup 幂等被破坏"
+        );
+    }
+
+    #[test]
+    fn br250_target_name_renders_name_with_code_and_absent_falls_back_to_code_only() {
+        let observed_at = instant("2026-07-27T01:00:03Z");
+        let as_of = observed_at;
+        let named_request = NewsAiRequest::try_new(
+            AdmittedNewsFact::from_global(
+                &global_record(observed_at),
+                &news_batch(observed_at),
+                "TEST_CODE_600519",
+            )
+            .expect("TEST_CODE admitted fact")
+            .with_target_name("TEST_CODE_名称".to_owned()),
+            post_close_snapshot(as_of),
+            vec![],
+            "TEST_CODE_news_ai_v1",
+            NewsAiChainContext::default(),
+        )
+        .expect("TEST_CODE named request");
+        let response = r#"{
+            "impact":"positive",
+            "confidence":70,
+            "uncertainty":"TEST_CODE 尚需核对",
+            "core_logic":"TEST_CODE 合同可能提升收入"
+        }"#;
+        let receipt = ModelCallReceipt::try_new(
+            "TEST_CODE_model_provider",
+            "TEST_CODE_model",
+            Some("TEST_CODE_request_id"),
+            named_request.normalized_prompt(),
+            response,
+            instant("2026-07-27T01:00:04Z"),
+            instant("2026-07-27T01:00:05Z"),
+        )
+        .unwrap();
+        let assessment =
+            NewsAiAssessment::from_model_response(&named_request, response, Some(receipt)).unwrap();
+        let audited = AuditedNewsAiAssessment::try_from_assessment_audit(
+            named_request,
+            assessment,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        let card = audited.delivery().render_card();
+        assert!(
+            card.contains("标的：TEST_CODE_名称（TEST_CODE_600519）"),
+            "BR-250 注入名称后卡片应为「名称（代码）」, 实际: {card}"
+        );
+
+        // 持久化恢复路径: 名称缺省 None → 降级仅代码。
+        let bare_request = request();
+        let receipt = ModelCallReceipt::try_new(
+            "TEST_CODE_model_provider",
+            "TEST_CODE_model",
+            Some("TEST_CODE_request_id"),
+            bare_request.normalized_prompt(),
+            response,
+            instant("2026-07-27T01:00:04Z"),
+            instant("2026-07-27T01:00:05Z"),
+        )
+        .unwrap();
+        let assessment = NewsAiAssessment::from_model_response(&bare_request, response, Some(receipt))
+            .unwrap();
+        let audited = AuditedNewsAiAssessment::try_from_assessment_audit(
+            bare_request,
+            assessment,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        let bare_card = audited.delivery().render_card();
+        assert!(
+            bare_card.contains("标的：TEST_CODE_600519"),
+            "BR-250 名称缺失应降级为仅代码, 实际: {bare_card}"
+        );
+        assert!(!bare_card.contains("（TEST_CODE_600519）"));
     }
 
     #[test]
