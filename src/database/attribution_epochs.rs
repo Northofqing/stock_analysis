@@ -20,6 +20,7 @@ use crate::database::order_audit::{
     validate_canonical_order_audit_chain, CanonicalOrderAuditChainRow, CanonicalOrderAuditRow,
     AUDIT_CHAIN_GENESIS,
 };
+use crate::performance::attribution::{DailyAttribution, WindowAttribution};
 use crate::performance::attribution_epoch::{
     build_legacy_carry, canonical_exclusion_manifest_hash, canonical_legacy_carry_manifest_hash,
     canonical_scoped_fill_manifest_hash, scope_epoch_fills, AttributionEpochSelector,
@@ -234,9 +235,11 @@ impl EpochActivationOutcome {
 #[allow(dead_code)] // Task 5 consumes the verified deep-module source capability.
 pub(crate) struct VerifiedEpochFill {
     fill: EconomicFillRow,
-    terminal_audit_id: i64,
-    terminal_audit_hash: String,
-    terminal_time: DateTime<FixedOffset>,
+    /// None = 前审计时代 legacy fill (order_audit 链 2026-08-11 才启用, 325 条
+    /// 7/10-7/16 Filled paper 无审计行可绑定; paper_trades 即其权威记录)。
+    terminal_audit_id: Option<i64>,
+    terminal_audit_hash: Option<String>,
+    terminal_time: Option<DateTime<FixedOffset>>,
 }
 
 #[allow(dead_code)] // Task 5 consumes these immutable source accessors.
@@ -245,15 +248,15 @@ impl VerifiedEpochFill {
         &self.fill
     }
 
-    pub(crate) fn terminal_audit_id(&self) -> i64 {
+    pub(crate) fn terminal_audit_id(&self) -> Option<i64> {
         self.terminal_audit_id
     }
 
-    pub(crate) fn terminal_audit_hash(&self) -> &str {
-        &self.terminal_audit_hash
+    pub(crate) fn terminal_audit_hash(&self) -> Option<&str> {
+        self.terminal_audit_hash.as_deref()
     }
 
-    pub(crate) fn terminal_time(&self) -> DateTime<FixedOffset> {
+    pub(crate) fn terminal_time(&self) -> Option<DateTime<FixedOffset>> {
         self.terminal_time
     }
 }
@@ -2216,6 +2219,16 @@ fn analyze_source_projection(
             )));
         }
     }
+    // BR-255 repudiation model: 计划被 Invalidated (e.g. 2026-09-01 BR-250 治理
+    // 36 条 8/11-8/12 同日破损成交) = 成交被废弃。其历史 Filled 审计行保留为
+    // 账本记录 (审计链追加不可变, 不重写历史), 但该计划已不在 frozen fills 中。
+    // 此类审计行豁免"must reference a frozen plan"一致性检查, 否则激活永远
+    // 无法建立 (终端绑定只消费 fills, 豁免不影响经济 fills 投影)。
+    let repudiated_plans = paper_rows
+        .iter()
+        .filter(|row| row.status == "Invalidated")
+        .map(|row| row.plan_id.clone())
+        .collect::<HashSet<String>>();
     let all_status_paper_manifest_hash = hash_json(
         b"BR255_ATTRIBUTION_ALL_STATUS_PAPER_MANIFEST_V1\0",
         &paper_rows,
@@ -2295,7 +2308,9 @@ fn analyze_source_projection(
         .iter()
         .filter(|row| row.source == "PaperTrade" && row.outcome == "Filled")
     {
-        if !paper_plans.contains(audit.business_order_id.as_str()) {
+        if !paper_plans.contains(audit.business_order_id.as_str())
+            && !repudiated_plans.contains(audit.business_order_id.as_str())
+        {
             return Err(failed_integrity(format!(
                 "BR-255 Filled PaperTrade audit id={} has no frozen paper plan {}",
                 audit.id, audit.business_order_id
@@ -2306,6 +2321,16 @@ fn analyze_source_projection(
             .or_default()
             .push(audit);
     }
+    // BR-255 pre-audit legacy: order_audit 链 2026-08-11 才启用, 此前的 Filled
+    // paper (2026-09-01 生产: 325 条 7/10-7/16) 没有任何审计行。此类 fill 保留在
+    // 经济投影 (carry/scoping 照常消费), 但无 terminal 可绑定 —— paper_trades
+    // 即其权威记录, 终端绑定清单只覆盖审计时代的 fills。有审计行却无 Filled
+    // audit 的计划仍走下方严格检查 (状态不一致, 照常失败)。
+    let audited_plans = audits
+        .iter()
+        .filter(|row| row.source == "PaperTrade")
+        .map(|row| row.business_order_id.as_str())
+        .collect::<HashSet<_>>();
     let shanghai = FixedOffset::east_opt(8 * 60 * 60)
         .ok_or_else(|| failed_integrity("BR-255 Shanghai fixed offset is unavailable"))?;
     let mut bindings = Vec::with_capacity(fills.len());
@@ -2316,6 +2341,10 @@ fn analyze_source_projection(
             .flatten()
             .copied()
             .collect::<Vec<_>>();
+        if candidates.is_empty() && !audited_plans.contains(paper.plan_id.as_str()) {
+            // 前审计时代 legacy fill: 无审计行可绑定 (见上方 audited_plans 注释)。
+            continue;
+        }
         if candidates.len() != 1 {
             return Err(failed_integrity(format!(
                 "BR-255 Filled paper id={} has {} terminal audit candidates",
@@ -2324,10 +2353,15 @@ fn analyze_source_projection(
             )));
         }
         let terminal = candidates[0];
+        // decision_basis 前缀绑定: 生产卖出审计在 decision_basis 尾部追加 FIFO
+        // 证据 (BR134_FIFO_V1;...), paper.virtual_reason 必须原样为前缀
+        // (2026-09-01 实测: 254 条 BR-234 卖出全部带证据后缀, 前缀恒成立)。
         let exact = terminal.source == "PaperTrade"
             && terminal.outcome == "Filled"
             && terminal.code == paper.code
-            && terminal.decision_basis == paper.virtual_reason
+            && terminal
+                .decision_basis
+                .starts_with(paper.virtual_reason.as_str())
             && terminal.side == paper.direction
             && terminal.requested_price.to_bits() == paper.requested_price.to_bits()
             && terminal.execution_price.map(f64::to_bits) == paper.fill_price.map(f64::to_bits)
@@ -2442,6 +2476,81 @@ fn analyze_source_projection(
         terminal_binding_manifest_hash,
         order_audit_tip_hash,
         position_projection_hash,
+    })
+}
+
+/// 只读重建投影 (补跑工具用): 以 completed_session 时刻的源投影返回
+/// (全部经济 fills + 截至该日的 legacy carry)。与激活投影同构 (同一个
+/// analyze_source_projection), 不落库、不动审计链。
+pub(crate) fn reconstructed_source_projection(
+    conn: &mut SqliteConnection,
+    completed_session: NaiveDate,
+) -> Result<(Vec<EconomicFillRow>, Vec<LegacyCarryPosition>), AttributionEpochStoreError> {
+    let projection = analyze_source_projection(conn, completed_session, None, false)?;
+    let economic = projection
+        .fills
+        .iter()
+        .map(FrozenPaperFill::economic)
+        .collect::<Vec<_>>();
+    Ok((economic, projection.carry))
+}
+
+/// 只读重建 (补跑工具): BR-255 epoch 一次性激活 + 链表不可变 → 早于
+/// effective_date 的日期无法经 load_active_verified_fills_until 的 range gate,
+/// 也无法回滚重激活。以 completed_session (目标日前一交易日) 的投影 +
+/// 目标日 fills, 用与 epoch 路径完全相同的纯引擎 (scope_epoch_fills →
+/// fifo_match → aggregate) 重建 target_date 报告。零 DB 写入, 无 epoch 绑定/
+/// 持久化 (与 8/26/8/28 pre-epoch 报告同性质)。生产 15:05 tick 不走此路径。
+pub fn reconstruct_epoch_daily(
+    database: &DatabaseManager,
+    completed_session: NaiveDate,
+    target_date: NaiveDate,
+    prices: &std::collections::HashMap<String, f64>,
+) -> Result<(DailyAttribution, WindowAttribution), AttributionEpochStoreError> {
+    let mut checkout = database
+        .attribution_checkout()
+        .map_err(map_database_authority_error)?;
+    checkout.transaction_with_authority(map_database_authority_error, |conn, _authority| {
+        let (fills, carry) = reconstructed_source_projection(conn, completed_session)?;
+        let target_rows = fills
+            .into_iter()
+            .filter(|fill| {
+                parse_paper_fill_timestamp(fill.id, &fill.occurred_at)
+                    .map(|at| at.date() == target_date)
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        let scoped = crate::performance::attribution_epoch::scope_epoch_fills(
+            &target_rows,
+            target_date,
+            &carry,
+        )
+        .map_err(|detail| failed_integrity(format!("BR-255 reconstruction fill scoping: {detail}")))?;
+        let rows = scoped
+            .attributable
+            .iter()
+            .map(|fill| crate::performance::attribution::AttributionFillRow {
+                id: fill.id,
+                code: fill.code.clone(),
+                direction: fill.direction.clone(),
+                fill_price: fill.fill_price,
+                quantity: fill.quantity,
+                local_ts: fill.occurred_at.clone(),
+                plan_id: fill.plan_id.clone(),
+                virtual_reason: fill.virtual_reason.clone(),
+            })
+            .collect::<Vec<_>>();
+        let (attributions, open) = crate::performance::attribution::fifo_match(&rows, target_date)
+            .map_err(|detail| failed_integrity(format!("BR-255 reconstruction FIFO match: {detail}")))?;
+        let families = crate::performance::attribution::aggregate_families(&attributions, &open, prices);
+        let daily = DailyAttribution {
+            date: target_date,
+            families,
+            top_trades: crate::performance::attribution::top_trades(&attributions),
+        };
+        let window = crate::performance::attribution::aggregate_window(target_date, 30, &rows, prices)
+            .map_err(|detail| failed_integrity(format!("BR-255 reconstruction window: {detail}")))?;
+        Ok((daily, window))
     })
 }
 
@@ -2880,9 +2989,17 @@ pub(crate) fn load_verified_epoch_fills_until(
         if occurred_at.date() > to {
             continue;
         }
-        let binding = bindings.get(&paper.id).ok_or_else(|| {
-            failed_integrity(format!("BR-255 fill id={} lost terminal binding", paper.id))
-        })?;
+        let Some(binding) = bindings.get(&paper.id) else {
+            // 前审计时代 legacy fill: 投影期豁免绑定 (见 analyze_source_projection),
+            // 无 terminal 证据, 不适用冻结 high-water 检查。
+            fills.push(VerifiedEpochFill {
+                fill: paper.economic(),
+                terminal_audit_id: None,
+                terminal_audit_hash: None,
+                terminal_time: None,
+            });
+            continue;
+        };
         if effective.is_some() && binding.terminal_audit_id <= audit_high_water {
             return Err(failed_integrity(format!(
                 "BR-255 post-epoch fill id={} binds audit id={} at/below frozen high-water",
@@ -2898,9 +3015,9 @@ pub(crate) fn load_verified_epoch_fills_until(
             })?;
         fills.push(VerifiedEpochFill {
             fill: paper.economic(),
-            terminal_audit_id: binding.terminal_audit_id,
-            terminal_audit_hash: binding.terminal_audit_hash.clone(),
-            terminal_time,
+            terminal_audit_id: Some(binding.terminal_audit_id),
+            terminal_audit_hash: Some(binding.terminal_audit_hash.clone()),
+            terminal_time: Some(terminal_time),
         });
     }
     Ok(VerifiedEpochFillSet {
@@ -3952,6 +4069,217 @@ mod tests {
     }
 
     #[test]
+    fn activation_exempts_repudiated_plans_from_frozen_plan_audit_gate() {
+        // 生产形态 (2026-09-01 BR-250 治理): 计划被 Invalidated (fill_price=NULL,
+        // not_fill_reason 留审计), 但其历史 Filled 审计行保留 → gate 豁免,
+        // 激活必须成功; 孤儿 Filled 审计 (无任何计划) 仍必须失败。
+        let database = TestDatabase::attested();
+        install_activation_source(&database.manager);
+        append_activation_fill(
+            &database.manager,
+            70001,
+            "plan-buy-ok",
+            "buy",
+            100,
+            "2026-08-28 10:00:00",
+        );
+        append_activation_fill(
+            &database.manager,
+            70002,
+            "plan-broken-sell",
+            "sell",
+            200,
+            "2026-08-28 10:05:00",
+        );
+        // 把计划 2 治理为 Invalidated (mirror 生产 36 条破损单状态)。
+        let mut conn = database.manager.get_conn().unwrap();
+        diesel::sql_query(
+            "UPDATE paper_trades
+             SET status='Invalidated', fill_price=NULL,
+                 not_fill_reason='TEST_CODE 破损成交治理'
+             WHERE id=70002",
+        )
+        .execute(&mut conn)
+        .unwrap();
+        drop(conn);
+
+        // 前审计时代 legacy fill: 计划无任何审计行 (order_audit 链 2026-08-11
+        // 才启用, 生产 325 条 7/10-7/16 Filled paper 同形状)。
+        let mut conn = database.manager.get_conn().unwrap();
+        diesel::sql_query(
+            "INSERT INTO paper_trades
+             (id,plan_id,code,name,direction,price,quantity,status,fill_price,not_fill_reason,
+              virtual_reason,account_mode,data_mode,ts,updated_at)
+             VALUES (?,?,'TEST_CODE_600001','TEST_CODE company','buy',10.0,300,'Filled',10.0,NULL,
+                     'TEST_CODE legacy','Normal','Full',?,?)",
+        )
+        .bind::<BigInt, _>(70003)
+        .bind::<Text, _>("plan-legacy-buy")
+        .bind::<Text, _>("2026-07-10 10:00:00")
+        .bind::<Text, _>("2026-07-10 10:00:00")
+        .execute(&mut conn)
+        .unwrap();
+        drop(conn);
+
+        let receipt = AttributionEpochStore::new(&database.manager)
+            .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
+            .expect("TEST_CODE repudiated plan Filled audit must be exempt");
+        assert_eq!(
+            receipt.cutover_completed_trading_date.to_string(),
+            "2026-08-28"
+        );
+
+        // loader: 冻结 high-water 之内的 fills (70001-70003) 不重载; 追加在激活
+        // 之后的 fill 按生产形态加载: 带审计的 70004 绑 terminal, legacy 70005
+        // (无审计) 为 None, Invalidated 70006 不在 fills。
+        append_activation_fill(
+            &database.manager,
+            70004,
+            "plan-post-audited",
+            "buy",
+            100,
+            "2026-08-31 02:00:00",
+        );
+        let mut conn = database.manager.get_conn().unwrap();
+        diesel::sql_query(
+            "INSERT INTO paper_trades
+             (id,plan_id,code,name,direction,price,quantity,status,fill_price,not_fill_reason,
+              virtual_reason,account_mode,data_mode,ts,updated_at)
+             VALUES (?,?,'TEST_CODE_600001','TEST_CODE company','buy',10.0,400,'Filled',10.0,NULL,
+                     'TEST_CODE legacy','Normal','Full',?,?)",
+        )
+        .bind::<BigInt, _>(70005)
+        .bind::<Text, _>("plan-post-legacy")
+        .bind::<Text, _>("2026-08-31 02:00:00")
+        .bind::<Text, _>("2026-08-31 02:00:00")
+        .execute(&mut conn)
+        .unwrap();
+        drop(conn);
+        append_activation_fill(
+            &database.manager,
+            70006,
+            "plan-post-invalidated",
+            "sell",
+            100,
+            "2026-08-31 02:05:00",
+        );
+        let mut conn = database.manager.get_conn().unwrap();
+        diesel::sql_query(
+            "UPDATE paper_trades SET status='Invalidated', fill_price=NULL,
+                 not_fill_reason='TEST_CODE 破损成交治理' WHERE id=70006",
+        )
+        .execute(&mut conn)
+        .unwrap();
+        drop(conn);
+        let mut conn = database.manager.get_conn().unwrap();
+        let verified = load_verified_epoch_fills_until(
+            &mut conn,
+            &ResolvedAttributionEpoch::Epoch(receipt),
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+        )
+        .unwrap();
+        let bound = verified
+            .fills
+            .iter()
+            .find(|fill| fill.fill.id == 70004)
+            .unwrap();
+        assert_eq!(bound.terminal_audit_id, Some(70004));
+        let legacy = verified
+            .fills
+            .iter()
+            .find(|fill| fill.fill.id == 70005)
+            .unwrap();
+        assert_eq!(legacy.terminal_audit_id, None);
+        assert!(verified
+            .fills
+            .iter()
+            .all(|fill| !matches!(fill.fill.id, 70001 | 70002 | 70003 | 70006)));
+        drop(conn);
+
+        // 孤儿 Filled 审计 (计划不存在) 仍必须被 gate 拒绝。
+        let orphan = TestDatabase::attested();
+        install_activation_source(&orphan.manager);
+        append_activation_fill(
+            &orphan.manager,
+            70001,
+            "plan-buy-ok",
+            "buy",
+            100,
+            "2026-08-28 10:00:00",
+        );
+        let mut conn = orphan.manager.get_conn().unwrap();
+        let previous = load_order_audit_chain_rows(&mut conn)
+            .unwrap()
+            .last()
+            .map_or(AUDIT_CHAIN_GENESIS.to_owned(), |row| {
+                row.record_hash.clone()
+            });
+        let orphan_audit = CanonicalOrderAuditRow {
+            id: 70099,
+            business_order_id: "plan-never-created".to_owned(),
+            source: "PaperTrade".to_owned(),
+            decision_basis: "TEST_CODE activation".to_owned(),
+            side: "sell".to_owned(),
+            code: "TEST_CODE_600002".to_owned(),
+            requested_price: 10.0,
+            execution_price: Some(10.0),
+            quantity: 100,
+            quote_observed_at: Some(
+                "2026-08-28T10:05:00+08:00".to_owned(),
+            ),
+            outcome: "Filled".to_owned(),
+            failure_reason: None,
+            created_at: "2026-08-28 10:05:00".to_owned(),
+        };
+        diesel::sql_query(
+            "INSERT INTO order_audit
+             (id,business_order_id,source,decision_basis,side,code,requested_price,
+              execution_price,quantity,quote_observed_at,outcome,failure_reason,created_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        )
+        .bind::<BigInt, _>(orphan_audit.id)
+        .bind::<Text, _>(&orphan_audit.business_order_id)
+        .bind::<Text, _>(&orphan_audit.source)
+        .bind::<Text, _>(&orphan_audit.decision_basis)
+        .bind::<Text, _>(&orphan_audit.side)
+        .bind::<Text, _>(&orphan_audit.code)
+        .bind::<Double, _>(orphan_audit.requested_price)
+        .bind::<Nullable<Double>, _>(orphan_audit.execution_price)
+        .bind::<BigInt, _>(orphan_audit.quantity)
+        .bind::<Nullable<Text>, _>(orphan_audit.quote_observed_at.as_deref())
+        .bind::<Text, _>(&orphan_audit.outcome)
+        .bind::<Nullable<Text>, _>(&orphan_audit.failure_reason)
+        .bind::<Text, _>(&orphan_audit.created_at)
+        .execute(&mut conn)
+        .unwrap();
+        let orphan_hash =
+            crate::database::order_audit::canonical_order_audit_record_hash(
+                &previous,
+                &orphan_audit,
+            )
+            .expect("TEST_CODE chain hash");
+        diesel::sql_query(
+            "INSERT INTO order_audit_chain
+             (order_audit_id,previous_hash,record_hash,created_at) VALUES (?,?,?,?)",
+        )
+        .bind::<BigInt, _>(orphan_audit.id)
+        .bind::<Text, _>(previous)
+        .bind::<Text, _>(orphan_hash)
+        .bind::<Text, _>(&orphan_audit.created_at)
+        .execute(&mut conn)
+        .unwrap();
+        drop(conn);
+        let error = AttributionEpochStore::new(&orphan.manager)
+            .activate_once(activation_request("2026-08-28T15:40:00+08:00"))
+            .expect_err("TEST_CODE orphan Filled audit must still fail");
+        assert_eq!(error.reason_code(), "attribution_epoch_integrity_failed");
+        assert!(
+            format!("{error}").contains("has no frozen paper plan"),
+            "TEST_CODE error mentions the orphan plan: {error}"
+        );
+    }
+
+    #[test]
     fn daily_compute_without_active_epoch_fails_before_legacy_source_read() {
         let database = TestDatabase::attested();
         let error = crate::performance::attribution::compute_epoch_daily(
@@ -4137,21 +4465,38 @@ mod tests {
     }
 
     #[test]
-    fn epoch_window_rejects_a_range_before_the_effective_date() {
+    fn epoch_window_clamps_to_effective_when_requested_range_precedes_it() {
+        // BR-255 (2026-09-02): 30 日滚动窗口在 epoch 生效首月必然伸到 effective
+        // 之前, 生产 15:05 tick 与补跑工具传 days=30 无条件 → 原硬错误契约让
+        // 9/2-9/30 每天 FailedIntegrity, persist 永不执行。窗口语义 = epoch 内
+        // 滚动概览 → 截断到 effective, days 同步为真实跨度。fixture effective=8/31。
         let database = activated_test_database().0;
 
-        let error = crate::performance::attribution::compute_epoch_window(
+        let window = crate::performance::attribution::compute_epoch_window(
             &database.manager,
             NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
             3,
             &HashMap::new(),
         )
-        .expect_err("TEST_CODE window start before effective must not be clipped");
+        .expect("TEST_CODE window start before effective clamps to effective");
 
-        assert_eq!(
-            error.reason_code(),
-            "attribution_epoch_range_before_effective"
-        );
+        assert_eq!(window.window().days, 2, "TEST_CODE clipped to 8/31..=9/1");
+        assert_eq!(window.window().end.to_string(), "2026-09-01");
+    }
+
+    #[test]
+    fn epoch_window_rejects_end_before_the_effective_date() {
+        let database = activated_test_database().0;
+
+        let error = crate::performance::attribution::compute_epoch_window(
+            &database.manager,
+            NaiveDate::from_ymd_opt(2026, 8, 30).unwrap(),
+            3,
+            &HashMap::new(),
+        )
+        .expect_err("TEST_CODE window end before effective remains an error");
+
+        assert_eq!(error.reason_code(), "attribution_epoch_window_invalid");
     }
 
     #[test]
@@ -6199,15 +6544,74 @@ mod tests {
     fn activation_source_failure_rolls_back_receipt_then_appends_failure_attempt() {
         let database = TestDatabase::new();
         install_activation_source(&database.manager);
+        // Filled paper 的审计行存在但 outcome=Failed: 计划在 audited_plans 内,
+        // 无 Filled terminal → 状态不一致, 激活必须失败 (非 legacy 豁免形状)。
         let mut conn = database.manager.get_conn().unwrap();
         diesel::sql_query(
             "INSERT INTO paper_trades
              (id,plan_id,code,name,direction,price,quantity,status,fill_price,not_fill_reason,
               virtual_reason,account_mode,data_mode,ts,updated_at)
-             VALUES (3,'TEST_CODE_MISSING_TERMINAL','TEST_CODE_600001','TEST_CODE company',
-                     'buy',10.0,100,'Filled',10.0,NULL,'TEST_CODE missing terminal',
+             VALUES (3,'TEST_CODE_AUDITED_FAILED','TEST_CODE_600001','TEST_CODE company',
+                     'buy',10.0,100,'Filled',10.0,NULL,'TEST_CODE audited failed',
                      'Normal','Full','2026-08-28 03:00:00','2026-08-28 03:00:00')",
         )
+        .execute(&mut conn)
+        .unwrap();
+        let previous = load_order_audit_chain_rows(&mut conn)
+            .unwrap()
+            .last()
+            .map_or(AUDIT_CHAIN_GENESIS.to_owned(), |row| {
+                row.record_hash.clone()
+            });
+        let failed_audit = CanonicalOrderAuditRow {
+            id: 3,
+            business_order_id: "TEST_CODE_AUDITED_FAILED".to_owned(),
+            source: "PaperTrade".to_owned(),
+            decision_basis: "TEST_CODE activation".to_owned(),
+            side: "buy".to_owned(),
+            code: "TEST_CODE_600001".to_owned(),
+            requested_price: 10.0,
+            execution_price: Some(10.0),
+            quantity: 100,
+            quote_observed_at: Some("2026-08-28T10:00:00+08:00".to_owned()),
+            outcome: "Failed".to_owned(),
+            failure_reason: Some("TEST_CODE forced".to_owned()),
+            created_at: "2026-08-28 03:00:00".to_owned(),
+        };
+        diesel::sql_query(
+            "INSERT INTO order_audit
+             (id,business_order_id,source,decision_basis,side,code,requested_price,
+              execution_price,quantity,quote_observed_at,outcome,failure_reason,created_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        )
+        .bind::<BigInt, _>(failed_audit.id)
+        .bind::<Text, _>(&failed_audit.business_order_id)
+        .bind::<Text, _>(&failed_audit.source)
+        .bind::<Text, _>(&failed_audit.decision_basis)
+        .bind::<Text, _>(&failed_audit.side)
+        .bind::<Text, _>(&failed_audit.code)
+        .bind::<Double, _>(failed_audit.requested_price)
+        .bind::<Nullable<Double>, _>(failed_audit.execution_price)
+        .bind::<BigInt, _>(failed_audit.quantity)
+        .bind::<Nullable<Text>, _>(failed_audit.quote_observed_at.as_deref())
+        .bind::<Text, _>(&failed_audit.outcome)
+        .bind::<Nullable<Text>, _>(failed_audit.failure_reason.as_deref())
+        .bind::<Text, _>(&failed_audit.created_at)
+        .execute(&mut conn)
+        .unwrap();
+        let record_hash = crate::database::order_audit::canonical_order_audit_record_hash(
+            &previous,
+            &failed_audit,
+        )
+        .unwrap();
+        diesel::sql_query(
+            "INSERT INTO order_audit_chain
+             (order_audit_id,previous_hash,record_hash,created_at) VALUES (?,?,?,?)",
+        )
+        .bind::<BigInt, _>(failed_audit.id)
+        .bind::<Text, _>(previous)
+        .bind::<Text, _>(record_hash)
+        .bind::<Text, _>(&failed_audit.created_at)
         .execute(&mut conn)
         .unwrap();
         drop(conn);
@@ -6218,6 +6622,10 @@ mod tests {
             error.reason_code(),
             "attribution_epoch_integrity_failed",
             "TEST_CODE full activation error: {error}"
+        );
+        assert!(
+            format!("{error}").contains("0 terminal audit candidates"),
+            "TEST_CODE error names the audited-without-Filled-terminal: {error}"
         );
         let mut conn = database.manager.get_conn().unwrap();
         assert!(load_receipts(&mut conn).unwrap().is_empty());

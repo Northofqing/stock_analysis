@@ -9061,7 +9061,6 @@ async fn monitor_loop() {
             // 15:05 失败后 minute==5 条件永不再真 → 当天归因永久缺失的 bug)。
             // 成功才记 ATTRIBUTION_LAST_RUN → 窗口内失败持续重试, 跨日不重复成功推送。
             if now.hour() == 15 && (5..=20).contains(&now.minute()) {
-                use std::collections::HashMap;
                 use stock_analysis::performance::attribution::{
                     compute_epoch_daily, compute_epoch_window, persist_epoch_daily,
                     AttributionEpochRuntimeError,
@@ -9077,16 +9076,18 @@ async fn monitor_loop() {
                     .unwrap_or(false);
                 if !already_run {
                     match (|| -> Result<String, AttributionEpochRuntimeError> {
-                        let quotes = market_data::fetch_position_quotes().map_err(|detail| {
-                            AttributionEpochRuntimeError::Unavailable {
+                        // 收盘后 RealtimeQuotes 五秒新鲜度门必挂 (BR-217/218,
+                        // 9/1+9/2 归因两次实锤) → 改用 HistoricalDailyBars 收盘价
+                        // (tdx-smart, 与 attribution_backfill 工具同源, 无新鲜度门);
+                        // bar 缺失返回 Err → Unavailable retryable, 15:05-15:20
+                        // 窗口内每 tick 重试 (成功才记 ATTRIBUTION_LAST_RUN)。
+                        let prices = market_data::fetch_attribution_close_prices(today).map_err(
+                            |detail| AttributionEpochRuntimeError::Unavailable {
                                 reason_code: "attribution_market_prices_unavailable",
                                 retryable: true,
                                 detail,
-                            }
-                        })?;
-                        // 生产价格映射 (build_price_map 是 cfg(test) 辅助, 生产内联同构构造)
-                        let prices: HashMap<String, f64> =
-                            quotes.iter().map(|q| (q.code.clone(), q.price)).collect();
+                            },
+                        )?;
                         let database = stock_analysis::database::DatabaseManager::get();
                         let daily = compute_epoch_daily(database, today, &prices)?;
                         let window = compute_epoch_window(database, today, 30, &prices)?;

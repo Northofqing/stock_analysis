@@ -79,6 +79,99 @@ fn mark_capability_success(
     stock_analysis::monitor::data_mode::mark_capability_success(capability)
 }
 
+/// BR-255 归因收盘价 (2026-09-02): 15:05 收盘后 RealtimeQuotes 因 BR-217/218
+/// 五秒新鲜度门 100% fail-closed (数据源冻结后报价年龄必超 5s, 9/1+9/2 归因
+/// 两次实锤 Sina cooldown), 归因改用 HistoricalDailyBars (tdx-smart) — 与
+/// attribution_backfill 工具同源: 无新鲜度门, 收盘价落库后 24/7 可用 (R-13
+/// 复盘同源)。目标日 bar 缺失按 Err 返回 (调用方按 retryable 处理, 15:05-15:20
+/// 窗口内每 tick 重试), 绝不 panic。
+pub fn fetch_attribution_close_prices(
+    today: chrono::NaiveDate,
+) -> Result<std::collections::HashMap<String, f64>, String> {
+    // 持仓代码: BR-226 用户快照 (24h 新鲜) 优先, 否则本地持仓 (与归因同规则)。
+    let mut codes: Vec<String> =
+        match stock_analysis::database::user_position_snapshot::latest_user_position_snapshot() {
+            Ok(Some(snapshot)) if !snapshot.confirm_empty => {
+                let fresh = chrono::Local::now()
+                    .signed_duration_since(snapshot.effective_at.with_timezone(&chrono::Local))
+                    .num_hours()
+                    <= 24;
+                if fresh {
+                    snapshot.items.iter().map(|item| item.code.clone()).collect()
+                } else {
+                    stock_analysis::portfolio::get_positions()
+                        .map_err(|error| format!("持仓批次查询失败: {error}"))?
+                        .into_iter()
+                        .map(|position| position.code)
+                        .collect()
+                }
+            }
+            _ => stock_analysis::portfolio::get_positions()
+                .map_err(|error| format!("持仓批次查询失败: {error}"))?
+                .into_iter()
+                .map(|position| position.code)
+                .collect(),
+        };
+    if codes.is_empty() {
+        return Err("持仓列表为空, 无法拉取归因收盘价".to_string());
+    }
+    // 当日成交代码并入覆盖: 未估值 lot 全部来自当日新开仓 (快照只覆盖持仓代码),
+    // 不并入则当日新开仓浮盈无法估值 (2026-09-01 实测教训)。只读查询。
+    {
+        use diesel::prelude::*;
+        #[derive(diesel::QueryableByName)]
+        struct CodeRow {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            code: String,
+        }
+        let mut conn = stock_analysis::database::DatabaseManager::get()
+            .get_conn()
+            .map_err(|error| format!("数据库连接失败: {error}"))?;
+        let window_start = format!("{} 00:00:00", today.format("%Y-%m-%d"));
+        let window_end = format!(
+            "{} 00:00:00",
+            today.succ_opt().expect("日期上溢").format("%Y-%m-%d")
+        );
+        let trade_codes: Vec<String> = diesel::sql_query(
+            "SELECT DISTINCT code FROM paper_trades WHERE status = 'Filled' AND ts >= ? AND ts < ?",
+        )
+        .bind::<diesel::sql_types::Text, _>(&window_start)
+        .bind::<diesel::sql_types::Text, _>(&window_end)
+        .load::<CodeRow>(&mut conn)
+        .map_err(|error| format!("当日成交代码查询失败: {error}"))?
+        .into_iter()
+        .map(|row| row.code)
+        .collect();
+        codes.extend(trade_codes);
+        codes.sort();
+        codes.dedup();
+    }
+
+    let gateway = stock_analysis::data_gateway::HistoricalBarsGateway::new();
+    let mut prices: std::collections::HashMap<String, f64> =
+        std::collections::HashMap::with_capacity(codes.len());
+    for code in &codes {
+        // 回拉窗口 5 天 (目标日=今天, 保证今日 bar 在返回区间内)。
+        let admitted = gateway
+            .required_daily_bars(code, 5)
+            .map_err(|error| format!("统一行情网关日线不可用 (上游 gRPC 失败): {error}"))?;
+        let bar = admitted
+            .records()
+            .iter()
+            .find(|k| k.date == today)
+            .ok_or_else(|| {
+                let dates: Vec<String> = admitted
+                    .records()
+                    .iter()
+                    .map(|k| k.date.to_string())
+                    .collect();
+                format!("{code}: 目标日 {today} 无日线记录 (可用: {})", dates.join(","))
+            })?;
+        prices.insert(code.clone(), bar.close);
+    }
+    Ok(prices)
+}
+
 /// BR-164 持仓实时行情：只消费统一 Magic provider Gateway。
 pub fn fetch_position_quotes() -> Result<Vec<stock_analysis::market_data::TopStock>, String> {
     // BR-227: 无券商时持仓代码来自 BR-226 用户确认快照 (24h 新鲜度),

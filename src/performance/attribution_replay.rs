@@ -701,9 +701,11 @@ pub struct AttributionReplayRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReplayFillEvidence {
     pub fill: EconomicFillRow,
-    pub terminal_audit_id: i64,
-    pub terminal_audit_hash: String,
-    pub terminal_time: DateTime<FixedOffset>,
+    /// None = 前审计时代 legacy fill (BR-255: order_audit 链 2026-08-11 启用前
+    /// 的 Filled paper 无审计行可绑定, paper_trades 即其权威记录)。
+    pub terminal_audit_id: Option<i64>,
+    pub terminal_audit_hash: Option<String>,
+    pub terminal_time: Option<DateTime<FixedOffset>>,
 }
 
 impl ReplayFillEvidence {
@@ -711,15 +713,15 @@ impl ReplayFillEvidence {
         &self.fill
     }
 
-    pub fn terminal_audit_id(&self) -> i64 {
+    pub fn terminal_audit_id(&self) -> Option<i64> {
         self.terminal_audit_id
     }
 
-    pub fn terminal_audit_hash(&self) -> &str {
-        &self.terminal_audit_hash
+    pub fn terminal_audit_hash(&self) -> Option<&str> {
+        self.terminal_audit_hash.as_deref()
     }
 
-    pub fn terminal_time(&self) -> DateTime<FixedOffset> {
+    pub fn terminal_time(&self) -> Option<DateTime<FixedOffset>> {
         self.terminal_time
     }
 }
@@ -1041,9 +1043,22 @@ fn update_canonical_replay_fill(hasher: &mut Sha256, evidence: &ReplayFillEviden
     hasher.update(fill.quantity.to_be_bytes());
     update_len_prefixed(hasher, fill.occurred_at.as_bytes());
     update_len_prefixed(hasher, fill.virtual_reason.as_bytes());
-    hasher.update(evidence.terminal_audit_id.to_be_bytes());
-    update_len_prefixed(hasher, evidence.terminal_audit_hash.as_bytes());
-    update_len_prefixed(hasher, evidence.terminal_time.to_rfc3339().as_bytes());
+    match evidence.terminal_audit_id {
+        Some(audit_id) => {
+            hasher.update([1]);
+            hasher.update(audit_id.to_be_bytes());
+            update_len_prefixed(
+                hasher,
+                evidence.terminal_audit_hash.as_deref().unwrap_or_default().as_bytes(),
+            );
+            update_optional_text(
+                hasher,
+                evidence.terminal_time.map(|time| time.to_rfc3339()).as_deref(),
+            );
+        }
+        // 前审计时代 legacy fill: 无 terminal 证据, 显式 marker 防证据交换。
+        None => hasher.update([0]),
+    }
 }
 
 fn update_epoch_replay_evidence(hasher: &mut Sha256, epoch: &AttributionEpochReplayEvidence) {
@@ -2060,9 +2075,9 @@ fn bind_all_terminals(
         })?;
         result.push(ReplayFillEvidence {
             fill: paper.fill.clone(),
-            terminal_audit_id: terminal.id,
-            terminal_audit_hash: (*terminal_audit_hash).to_owned(),
-            terminal_time,
+            terminal_audit_id: Some(terminal.id),
+            terminal_audit_hash: Some((*terminal_audit_hash).to_owned()),
+            terminal_time: Some(terminal_time),
         });
     }
     Ok(result)
@@ -2842,13 +2857,43 @@ fn validate_replay_fill_bindings(
     let mut audit_ids = BTreeSet::new();
     let mut audit_hashes = BTreeSet::new();
     for fill in &evidence.fills {
-        if fill.terminal_audit_id <= 0
-            || !audit_ids.insert(fill.terminal_audit_id)
-            || !is_lowercase_sha256(&fill.terminal_audit_hash)
-            || !audit_hashes.insert(fill.terminal_audit_hash.as_str())
-            || !is_shanghai_offset(&fill.terminal_time)
-            || fill.terminal_time.date_naive() > evidence.to
-            || by_fill.insert(fill.fill.id, fill).is_some()
+        if by_fill.insert(fill.fill.id, fill).is_some() {
+            return Err(AttributionReplayError::integrity(
+                AttributionIntegrityFailure::ReplayEvidence,
+                format!(
+                    "invalid replay terminal binding for fill id={}",
+                    fill.fill.id
+                ),
+            ));
+        }
+        // 前审计时代 legacy fill: 投影期豁免 (BR-255), 无 terminal 证据可校验。
+        let Some(audit_id) = fill.terminal_audit_id else {
+            continue;
+        };
+        let Some(audit_hash) = fill.terminal_audit_hash.as_deref() else {
+            return Err(AttributionReplayError::integrity(
+                AttributionIntegrityFailure::ReplayEvidence,
+                format!(
+                    "invalid replay terminal binding for fill id={}",
+                    fill.fill.id
+                ),
+            ));
+        };
+        let Some(terminal_time) = fill.terminal_time else {
+            return Err(AttributionReplayError::integrity(
+                AttributionIntegrityFailure::ReplayEvidence,
+                format!(
+                    "invalid replay terminal binding for fill id={}",
+                    fill.fill.id
+                ),
+            ));
+        };
+        if audit_id <= 0
+            || !audit_ids.insert(audit_id)
+            || !is_lowercase_sha256(audit_hash)
+            || !audit_hashes.insert(audit_hash)
+            || !is_shanghai_offset(&terminal_time)
+            || terminal_time.date_naive() > evidence.to
         {
             return Err(AttributionReplayError::integrity(
                 AttributionIntegrityFailure::ReplayEvidence,
@@ -2880,7 +2925,31 @@ fn exact_cycle_anchor(
             format!("economic cycle fill id={fill_id} fields mismatch replay binding"),
         ));
     }
-    Ok(evidence.terminal_time)
+    if let Some(terminal_time) = evidence.terminal_time {
+        return Ok(terminal_time);
+    }
+    // 前审计时代 legacy fill: 无 audit quote 时间, 以 paper fill 时间锚定
+    // (审计时代 quote 与 fill ≤5s, 时间锚同义)。
+    let occurred_at = parse_paper_fill_timestamp(fill_id, &evidence.fill.occurred_at).map_err(
+        |detail| {
+            AttributionReplayError::integrity(
+                AttributionIntegrityFailure::ReplayEvidence,
+                format!("economic cycle legacy fill id={fill_id} timestamp invalid: {detail}"),
+            )
+        },
+    )?;
+    let shanghai = FixedOffset::east_opt(8 * 60 * 60).ok_or_else(|| {
+        AttributionReplayError::integrity(
+            AttributionIntegrityFailure::ReplayEvidence,
+            "Shanghai fixed offset is unavailable",
+        )
+    })?;
+    occurred_at.and_local_timezone(shanghai).earliest().ok_or_else(|| {
+        AttributionReplayError::integrity(
+            AttributionIntegrityFailure::ReplayEvidence,
+            format!("economic cycle legacy fill id={fill_id} Shanghai mapping failed"),
+        )
+    })
 }
 
 fn research_limitations() -> Vec<String> {
@@ -4044,8 +4113,10 @@ fn scope_verified_epoch_replay(
         .map(|source| ReplayFillEvidence {
             fill: source.fill().clone(),
             terminal_audit_id: source.terminal_audit_id(),
-            terminal_audit_hash: source.terminal_audit_hash().to_owned(),
-            terminal_time: source.terminal_time().with_timezone(&shanghai),
+            terminal_audit_hash: source.terminal_audit_hash().map(str::to_owned),
+            terminal_time: source
+                .terminal_time()
+                .map(|time| time.with_timezone(&shanghai)),
         })
         .collect::<Vec<_>>();
     let source_rows = verified_fills
@@ -4590,8 +4661,12 @@ fn validate_fill_calendar_authority(
                 )
             })?
             .date();
-        let terminal_date = fill.terminal_time().date_naive();
-        for date in [paper_date, terminal_date] {
+        // 前审计时代 legacy fill 无 terminal, 仅校验 paper 日期。
+        let mut dates = vec![paper_date];
+        if let Some(terminal_time) = fill.terminal_time() {
+            dates.push(terminal_time.date_naive());
+        }
+        for date in dates {
             match verified_a_share_trading_day(date) {
                 Ok(true) => {}
                 Ok(false) => {
@@ -4619,20 +4694,22 @@ fn validate_fill_calendar_authority(
                 }
             }
         }
-        if paper_date != terminal_date {
-            let detail = format!("{paper_date}|{terminal_date}");
-            return Err(ReplayError::new(
-                ReplayErrorClass::FailedIntegrity,
-                ReplayStage::Calendar,
-                "fill_terminal_date_mismatch",
-                false,
-            )
-            .with_typed_failure(
-                "fill_terminal_date_mismatch",
-                detail.as_bytes(),
-                Some(paper_date),
-                None,
-            ));
+        if let Some(terminal_date) = fill.terminal_time().map(|time| time.date_naive()) {
+            if paper_date != terminal_date {
+                let detail = format!("{paper_date}|{terminal_date}");
+                return Err(ReplayError::new(
+                    ReplayErrorClass::FailedIntegrity,
+                    ReplayStage::Calendar,
+                    "fill_terminal_date_mismatch",
+                    false,
+                )
+                .with_typed_failure(
+                    "fill_terminal_date_mismatch",
+                    detail.as_bytes(),
+                    Some(paper_date),
+                    None,
+                ));
+            }
         }
     }
     Ok(())
@@ -4720,7 +4797,7 @@ fn load_runner_benchmarks(
         evidence
             .fills()
             .iter()
-            .map(|fill| fill.terminal_time().date_naive()),
+            .filter_map(|fill| fill.terminal_time().map(|time| time.date_naive())),
     );
     let supplied_dates = supplied
         .iter()
@@ -8557,7 +8634,7 @@ mod tests {
             .expect("complete read-only evidence");
         assert_eq!(evidence.fills.len(), 2);
         assert_eq!(
-            evidence.fills[0].terminal_time.to_rfc3339(),
+            evidence.fills[0].terminal_time.unwrap().to_rfc3339(),
             "2026-08-20T09:31:05+08:00"
         );
         assert_eq!(evidence.stock_closes.entries.len(), 2);
@@ -9524,9 +9601,9 @@ mod tests {
                 occurred_at: occurred_at.to_owned(),
                 virtual_reason: reason.to_owned(),
             },
-            terminal_audit_id: 10_000 + id,
-            terminal_audit_hash: format!("{:064x}", 10_000 + id),
-            terminal_time: instant(terminal_at),
+            terminal_audit_id: Some(10_000 + id),
+            terminal_audit_hash: Some(format!("{:064x}", 10_000 + id)),
+            terminal_time: Some(instant(terminal_at)),
         }
     }
 
@@ -9710,7 +9787,7 @@ mod tests {
             fills.clone(),
             Some(vec![fee(1, 1.0), fee(2, 1.0)]),
         );
-        rebound_terminal.fills[0].terminal_time = instant("2026-08-20T09:31:06+08:00");
+        rebound_terminal.fills[0].terminal_time = Some(instant("2026-08-20T09:31:06+08:00"));
         assert!(matches!(
             compute_attribution_range(&rebound_terminal, &bars, &verified_minute_labels()),
             Err(AttributionReplayError::FailedIntegrity {
@@ -10077,13 +10154,13 @@ mod tests {
         let mut cases = Vec::new();
         let mut unknown_520 = valid.clone();
         unknown_520[0].fill.id = 520;
-        unknown_520[0].terminal_audit_id = 10_520;
-        unknown_520[0].terminal_audit_hash = format!("{:064x}", 10_520);
+        unknown_520[0].terminal_audit_id = Some(10_520);
+        unknown_520[0].terminal_audit_hash = Some(format!("{:064x}", 10_520));
         unknown_520[0].fill.virtual_reason = "TEST_CODE_UNKNOWN_FAMILY".to_owned();
         cases.push(unknown_520);
         let mut t1 = valid.clone();
         t1[1].fill.occurred_at = "2026-08-20 14:00:00".to_owned();
-        t1[1].terminal_time = instant("2026-08-20T14:00:00+08:00");
+        t1[1].terminal_time = Some(instant("2026-08-20T14:00:00+08:00"));
         cases.push(t1);
         let mut oversell = valid.clone();
         oversell[1].fill.quantity = 200;

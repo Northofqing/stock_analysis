@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use crate::database::attribution_epochs::{
     AttributionEpochDailyBatchAppend, AttributionEpochDailyFamilyAppend,
     AttributionEpochDailySourceBinding, AttributionEpochStore, AttributionEpochStoreError,
+    ResolvedAttributionEpoch,
 };
 use crate::database::{DatabaseConnectionAuthority, DatabaseManager};
 use crate::performance::attribution_epoch::{
@@ -550,7 +551,8 @@ pub fn compute_epoch_window(
             "BR-255 epoch attribution window must contain at least one day",
         ));
     }
-    let start = end
+    let mut days = days;
+    let mut start = end
         .checked_sub_signed(chrono::Duration::days(i64::from(days) - 1))
         .ok_or_else(|| {
             runtime_integrity(
@@ -558,6 +560,30 @@ pub fn compute_epoch_window(
                 "BR-255 epoch attribution window underflowed the supported date range",
             )
         })?;
+    // BR-255 (2026-09-02 实锤): 30 日滚动窗口在 epoch 生效首月必然伸到
+    // effective 之前 (effective=9/2 → 首日窗口 start=8/4), 而
+    // load_active_verified_fills_until 以 attribution_epoch_range_before_effective
+    // 拒绝跨纪元 range → 生产 15:05 tick 与补跑工具双双 FailedIntegrity,
+    // persist 永不执行, 当天归因永久缺失 (9/2 实测: tick 挂行情, 补跑挂此 guard,
+    // 9/3-9/30 若不改则每天必挂)。窗口语义 = epoch 内滚动概览 → 截断到
+    // effective 而非失败: epoch fills 只存在于 >= effective, 截断零数据损失。
+    // days 同步截断为真实跨度 (首月报告天数诚实, FIFO 边界同源)。
+    if let ResolvedAttributionEpoch::Epoch(receipt) = AttributionEpochStore::new(database)
+        .load_selector(&AttributionEpochSelector::Active)
+        .map_err(AttributionEpochRuntimeError::from)?
+    {
+        if end < receipt.effective_trading_date {
+            return Err(runtime_integrity(
+                "attribution_epoch_window_invalid",
+                format!(
+                    "BR-255 window end {end} precedes epoch effective {}",
+                    receipt.effective_trading_date
+                ),
+            ));
+        }
+        start = start.max(receipt.effective_trading_date);
+        days = end.signed_duration_since(start).num_days() as u32 + 1;
+    }
     let (rows, epoch, database_authority) = load_scoped_epoch_rows(database, start, end)?;
     let window = aggregate_window(end, days, &rows, prices).map_err(|detail| {
         runtime_integrity(
@@ -870,7 +896,7 @@ pub fn aggregate_families(
 
 /// Top 盈亏交易明细 (spec §4.4 item 5, 当日): 盈利 (pnl>0) 按 pnl 降序 ≤5 在前,
 /// 亏损 (pnl<0) 按 pnl 升序 (最负在前) ≤5 在后; pnl==0 不入列.
-fn top_trades(attributions: &[TradeAttribution]) -> Vec<TradeAttribution> {
+pub(crate) fn top_trades(attributions: &[TradeAttribution]) -> Vec<TradeAttribution> {
     let mut winners: Vec<&TradeAttribution> = attributions.iter().filter(|a| a.pnl > 0.0).collect();
     winners.sort_by(|a, b| {
         b.pnl
