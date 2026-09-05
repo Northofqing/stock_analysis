@@ -4,7 +4,7 @@
 
 代码基线：`07781bf386aafdf202851ae928efee8920387058`。
 
-隔离分支 codex/push-reliability-20260905，Rust/Cargo 基线 07781bf386aafdf202851ae928efee8920387058。ACTIVE 仅代表源码接线，STARVED/OPT-IN/INACTIVE 不被激活；源码审计不等于制品部署、TransportAccepted 或用户已读。四时段为 Epic；MigrationUnit 依真实共享状态键及 occurrence 归属，列明非原子层，不冻结完整迁移顺序。13 个 ReviewTask 当前 7 ACTIVE / 4 INACTIVE / 2 STARVED。仅保存 market-review/deep-analysis/名单回放不列发送 producer。NOT CHECKED：完整 RFC/WBS/离线 HTML/CI/运行时 Foundation/部署/真实接收/工期。
+隔离分支 codex/push-reliability-20260905，Rust/Cargo 基线 07781bf386aafdf202851ae928efee8920387058。ACTIVE 仅代表源码接线，STARVED/OPT-IN/INACTIVE 不被激活；源码审计不等于制品部署、TransportAccepted 或用户已读。四时段为 Epic；MigrationUnit 依真实共享状态键及 occurrence 归属，列明非原子层，不冻结完整迁移顺序。13 个 ReviewTask 当前 7 ACTIVE / 4 INACTIVE / 2 STARVED。仅保存 market-review/deep-analysis/名单回放不列发送 producer；monitor --replay-force则是真实历史文本发送入口，单列enum外producer，非force dry-run不发。BUSINESS能力目录明确排除启动health运维webhook：src/bin/monitor/main.rs健康失败调用webhook_alert::on_health_fail→src/bin/monitor/webhook_alert.rs::send_webhook_alert，Prod配置ALERT_WEBHOOK_URL时确实会HTTP POST，未配置Disabled、Test隔离；不意味着无发送。按已批准Q54，外部分页/operational alert与业务回执独立，需另建ops-alert目录及receipt审计，不并入业务kind/owner。NOT CHECKED：完整 RFC/WBS/离线 HTML/CI/运行时 Foundation/部署/真实接收/工期。
 
 NOT CHECKED：完整 RFC / WBS / 离线 HTML / CI / 运行时 Foundation / 部署 / 真实接收；不推导迁移顺序或工期。
 
@@ -100,6 +100,7 @@ NOT CHECKED：完整 RFC / WBS / 离线 HTML / CI / 运行时 Foundation / 部�
 - chain-post-close-timer：QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。；enum外timer，不拥有ReviewTask identity/ReviewScheduleState。（Unit MU-chain-post-close）
 - chain-preopen-timer：QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。；enum外timer，不拥有ReviewTask identity/ReviewScheduleState。（Unit MU-chain-preopen）
 - cli-chain：QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。；enum外chain，不是IndustryChain R03或IndustryChainIntraday I03。（Unit MU-cli-chain）
+- cli-replay-force：历史原始文本只做类型/非空/REPLAY标记校验，未重新绑定当前业务source或原业务claim；新的pid/进程序号replay identity与原始消息、必需渠道TransportAccepted尚缺不可变receipt合同。；force重跑可为相同行再次生成replay id并发送；本地attempt/result hash链和push_log不保证跨进程去重、发送后崩溃恢复或用户已读。；terminal replay在普通all-date startup barrier之前独立执行；eager artifact绑定不等于startup reconciliation完成，不借用counted既存decision/lease/receipt owner。（Unit MU-cli-replay-force）
 - cli-single-default：QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。；enum外 producer：没有 PushKind，不能把实际发送入口增加到65-kind enum。（Unit MU-cli-single）
 - cli-single-lhb：QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。；enum外 producer：没有 PushKind，不能把实际发送入口增加到65-kind enum。（Unit MU-cli-single）
 - cli-single-schedule：QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。；enum外 producer：没有 PushKind，不能把实际发送入口增加到65-kind enum。（Unit MU-cli-single）
@@ -332,6 +333,22 @@ completion owner：run_chain_analysis_mode(invocation) 的 Result&lt;()&gt;；�
 策略：send false/Err只warn仍Ok；bool仅至少一个channel成功，无durable通知cursor，同分钟重跑可覆盖报告。 证据：src/app/modes.rs::run_chain_analysis_mode；src/notification/service.rs::send。
 
 已知缺口：QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。；enum外chain，不是IndustryChain R03或IndustryChainIntraday I03。
+
+### cli-replay-force
+
+时段：盘前、集合竞价、盘中、盘后；occurrence：CLI replay date / historical push.source original id / fresh replay id(pid,sequence)；Unit：MU-cli-replay-force。
+
+completion owner：MonitorReplayPublisher replay envelope.id → replay_audit/YYYY.jsonl attempt/result hash chain；ReplayRunner invocation summary。
+
+触发：monitor --replay=YYYY-MM-DD --replay-force 可在任意时刻执行，无业务交易日/时窗门；先完成runtime mode、delivery-audit preflight及eager artifact绑定，再进入terminal event分支，结束后在普通startup reconciliation barrier之前退出。非force默认dry-run只校验计数，不调用publisher。 证据：src/bin/monitor/main.rs::main；src/event/cli.rs::parse_args；src/event/replay.rs::ReplayRunner；src/bin/monitor/durable_delivery_runtime.rs::eager_bind_runtime_artifacts。
+
+输入：读取runtime_data_path(event_bus)/指定日期.jsonl中的历史push.source行，要求payload.text为非空字符串；保留原source/payload及original id，生成replay-{original_id}-{pid}-{sequence}，写replay_of、当前ts并为正文前置[REPLAY date]标记。原payload.kind不将本入口归入该业务PushKind。 证据：src/bin/monitor/main.rs::runtime_data_path；src/event/replay.rs::ReplayRunner；src/event/replay.rs::fresh_replay_id。
+
+权威事实：仅显式force和已标记的push.source/text准入；publisher在V10_DRY_RUN_PUSH=1时拒绝。先写并sync本地attempt/authorized hash-chain审计，再await真实sink，随后写result/published或sink_failed；FileReplayAuditSink验证既有年度链。该本地记录和runner summary不是durable外部接收authority。 证据：src/bin/monitor/main.rs::&lt;N, A&gt; stock_analysis::event::ReplayPublisher for MonitorReplayPublisher&lt;N, A&gt; where N: ReplayNotificationSink, A: ReplayAuditSink,；src/bin/monitor/main.rs::ReplayAuditSink for FileReplayAuditSink；src/bin/monitor/main.rs::FileReplayAuditSink。
+
+策略：RealReplayNotificationSink直接调用notify::push_wechat→namespace校验、push_log保存及配置的真实transport，不经过原业务governor/counted envelope恢复；rate_ms仅相邻发送尝试节流。sink=false令publish Err并使summary.failed递增，published只在publisher Ok后增加，任意failed使CLI exit1；发送后result审计失败也会计failed，不能推断未发。 证据：src/bin/monitor/main.rs::ReplayNotificationSink for RealReplayNotificationSink；src/bin/monitor/notify.rs::push_wechat；src/bin/monitor/notify.rs::push_wechat_with_attempt_marker；src/bin/monitor/main.rs::&lt;N, A&gt; stock_analysis::event::ReplayPublisher for MonitorReplayPublisher&lt;N, A&gt; where N: ReplayNotificationSink, A: ReplayAuditSink,；src/event/replay.rs::ReplayRunner；src/bin/monitor/main.rs::main。
+
+已知缺口：历史原始文本只做类型/非空/REPLAY标记校验，未重新绑定当前业务source或原业务claim；新的pid/进程序号replay identity与原始消息、必需渠道TransportAccepted尚缺不可变receipt合同。；force重跑可为相同行再次生成replay id并发送；本地attempt/result hash链和push_log不保证跨进程去重、发送后崩溃恢复或用户已读。；terminal replay在普通all-date startup barrier之前独立执行；eager artifact绑定不等于startup reconciliation完成，不借用counted既存decision/lease/receipt owner。
 
 ### cli-single-default
 
@@ -1735,6 +1752,7 @@ completion owner：L4(virtual_watch,空 code,空 sub_kind)；共享 monitor_loop
 - MU-chain-post-close：chain-post-close-timer；owner monitor_loop::CHAIN_POST_LAST[calendar_date]。独立static日期门；与另一timer/CLI无共同durable通知cursor。业务日和封口calendar date不同。
 - MU-chain-preopen：chain-preopen-timer；owner monitor_loop::CHAIN_PREOPEN_LAST[calendar_date]。独立static日期门；与另一timer/CLI无共同durable通知cursor。业务日和封口calendar date不同。
 - MU-cli-chain：cli-chain；owner run_chain_analysis_mode(invocation) 的 Result&lt;()&gt;；无独立持久通知 cursor。CLI单次函数完成；与两个timer仅共享分析代码/业务报告，不能由共享函数合并日期状态。
+- MU-cli-replay-force：cli-replay-force；owner MonitorReplayPublisher replay envelope.id → replay_audit/YYYY.jsonl attempt/result hash chain；ReplayRunner invocation summary。显式历史文本重发的独立本地attempt/result与runner计数；不是原业务PushKind的完成owner，也不是counted decision/claim或外部TransportAccepted receipt。
 - MU-cli-single：cli-single-default、cli-single-lhb、cli-single-schedule；owner AnalysisPipeline::process_stock_inner(invocation,code) 的 Option&lt;AnalysisResult&gt;；无持久通知 completion cursor。default CLI/schedule/LHB 复用同每次每票流程；共享分析数据库只是业务状态，未存在跨调用原子通知 owner。
 - MU-cli-summary：cli-summary-default、cli-summary-lhb、cli-summary-schedule；owner AnalysisPipeline::run(invocation) 的 results / send_summary_notification_to 返回值；无持久通知 completion cursor。default CLI/schedule/LHB 的每次结果集汇总；同日报告文件名不是通知owner，与单股形态分开。
 - MU-close-call：close-call、startup-resume-close-call；owner counted decision(CloseCall,Ticket,close-call:{date}:{code},source fingerprint,subject,policy,rendered hash)。独立 CloseCall binding；外 close_call_pushed 不是 durable receipt，也没有 HoldingPlan 日表。 普通启动all-date恢复既存immutable envelope也归此同一durable owner；启动barrier不是独立通知完成键。
@@ -1929,6 +1947,17 @@ Rust 符号按词法声明定位；impl 使用去掉 impl 和左花括号后的�
 | r13-counted | src/bin/monitor/push_templates.rs | dispatch_r13_counted_delivery | 9250–9357 | 6f5e02278b83d0e5f3917dae7f1482f8d18783cca9eb9bf26d4c52a2242e2ca5 |
 | r13-source | src/review/watchlist_tracking.rs | check_watchlist_today | 99–166 | 7d74a80175bd9e5a894851f590a9023a7c3d448d4320e813c911402313a3de48 |
 | r13-watchlist | src/bin/monitor/push_templates.rs | dispatch_r13_watchlist_tracking_outcome | 9447–9544 | 84cc08eaf684f4362ee15291b40a500befb02ef974e61c90630a6d2b1aba9477 |
+| replay-artifact-bind | src/bin/monitor/durable_delivery_runtime.rs | eager_bind_runtime_artifacts | 1190–1192 | 5992f1f282f869b280d56b2645632319d9b39355bf810bc3bfa76ddad4bc2974 |
+| replay-audit | src/bin/monitor/main.rs | ReplayAuditSink for FileReplayAuditSink | 3067–3127 | 93bdaddf67d928042b9bc8dc9ef70c9863a8c48d8e808ae567e5b8f7451172b0 |
+| replay-audit-chain | src/bin/monitor/main.rs | FileReplayAuditSink | 3013–3064 | b784d20d10c3bc4d2fe3357b8d6f2b8fabce067b71ff962ac090995e3a506e0b |
+| replay-cli | src/event/cli.rs | parse_args | 77–239 | b60900354094ed68b5e4bf20e1a1f636ae3419352b1b0cafc039dccf6034cc82 |
+| replay-identity | src/event/replay.rs | fresh_replay_id | 20–28 | b7c211307f0dbea5b7ab25daae83edd522062644e775ca29ae1a4eeb1c6abd4c |
+| replay-publisher | src/bin/monitor/main.rs | &lt;N, A&gt; stock_analysis::event::ReplayPublisher for MonitorReplayPublisher&lt;N, A&gt; where N: ReplayNotificationSink, A: ReplayAuditSink, | 3136–3193 | dc12977be4017e4495b28fe9a05ba6f1a99f3c86de58b5fd4e54b1f085fa53c0 |
+| replay-runner | src/event/replay.rs | ReplayRunner | 96–195 | af3f708304973c8721f34a279f1f228b3fa73fa61be062043b0ef9a7f381face |
+| replay-runtime-path | src/bin/monitor/main.rs | runtime_data_path | 3464–3467 | 7c3d128469e33a856319847fd7b931c9b5e03b88cfd1faccd39d13676d87d964 |
+| replay-sink | src/bin/monitor/main.rs | ReplayNotificationSink for RealReplayNotificationSink | 2992–2996 | 55a4cdd54df00601131e208d215ceb85d4e0d3ad80774c65b7d6ad76d2b339ff |
+| replay-transport | src/bin/monitor/notify.rs | push_wechat_with_attempt_marker | 3141–3388 | 27679ed00787e49c7ab0b2a6c6be5e9157dabe495b945739def0f28981363ac5 |
+| replay-wechat | src/bin/monitor/notify.rs | push_wechat | 3133–3139 | f08c1eafab1ea2d77be6ba9c18a4f1e99f4de3d44fcb21c2a961bb381b983649 |
 | review-attempt | src/bin/monitor/main.rs | attempt_post_session_review | 5847–5863 | 782349a727eb32a182d57aea26c17c6284e2f899c57df1815c1e5adb3310e883 |
 | review-authorize | src/bin/monitor/durable_delivery_runtime.rs | authorize_rejected_review_retry | 1743–1758 | e8089211c626d0da33a7587b1d29f4a4ecfea41c8902e45fa783fc68b8813db4 |
 | review-auto | src/bin/monitor/main.rs | post_session_review_scheduler | 6252–6447 | 9ca55c77783826618b7d05cfce0f0e3174abc748ec4a14d90e841a12dcf40ebb |

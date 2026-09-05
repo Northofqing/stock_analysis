@@ -3151,6 +3151,105 @@
       "end_line": 9544
     },
     {
+      "id": "replay-artifact-bind",
+      "path": "src/bin/monitor/durable_delivery_runtime.rs",
+      "symbol": "eager_bind_runtime_artifacts",
+      "kind": "rust_fn",
+      "symbol_sha256": "5992f1f282f869b280d56b2645632319d9b39355bf810bc3bfa76ddad4bc2974",
+      "start_line": 1190,
+      "end_line": 1192
+    },
+    {
+      "id": "replay-audit",
+      "path": "src/bin/monitor/main.rs",
+      "symbol": "ReplayAuditSink for FileReplayAuditSink",
+      "kind": "rust_impl",
+      "symbol_sha256": "93bdaddf67d928042b9bc8dc9ef70c9863a8c48d8e808ae567e5b8f7451172b0",
+      "start_line": 3067,
+      "end_line": 3127
+    },
+    {
+      "id": "replay-audit-chain",
+      "path": "src/bin/monitor/main.rs",
+      "symbol": "FileReplayAuditSink",
+      "kind": "rust_impl",
+      "symbol_sha256": "b784d20d10c3bc4d2fe3357b8d6f2b8fabce067b71ff962ac090995e3a506e0b",
+      "start_line": 3013,
+      "end_line": 3064
+    },
+    {
+      "id": "replay-cli",
+      "path": "src/event/cli.rs",
+      "symbol": "parse_args",
+      "kind": "rust_fn",
+      "symbol_sha256": "b60900354094ed68b5e4bf20e1a1f636ae3419352b1b0cafc039dccf6034cc82",
+      "start_line": 77,
+      "end_line": 239
+    },
+    {
+      "id": "replay-identity",
+      "path": "src/event/replay.rs",
+      "symbol": "fresh_replay_id",
+      "kind": "rust_fn",
+      "symbol_sha256": "b7c211307f0dbea5b7ab25daae83edd522062644e775ca29ae1a4eeb1c6abd4c",
+      "start_line": 20,
+      "end_line": 28
+    },
+    {
+      "id": "replay-publisher",
+      "path": "src/bin/monitor/main.rs",
+      "symbol": "<N, A> stock_analysis::event::ReplayPublisher for MonitorReplayPublisher<N, A> where N: ReplayNotificationSink, A: ReplayAuditSink,",
+      "kind": "rust_impl",
+      "symbol_sha256": "dc12977be4017e4495b28fe9a05ba6f1a99f3c86de58b5fd4e54b1f085fa53c0",
+      "start_line": 3136,
+      "end_line": 3193
+    },
+    {
+      "id": "replay-runner",
+      "path": "src/event/replay.rs",
+      "symbol": "ReplayRunner",
+      "kind": "rust_impl",
+      "symbol_sha256": "af3f708304973c8721f34a279f1f228b3fa73fa61be062043b0ef9a7f381face",
+      "start_line": 96,
+      "end_line": 195
+    },
+    {
+      "id": "replay-runtime-path",
+      "path": "src/bin/monitor/main.rs",
+      "symbol": "runtime_data_path",
+      "kind": "rust_fn",
+      "symbol_sha256": "7c3d128469e33a856319847fd7b931c9b5e03b88cfd1faccd39d13676d87d964",
+      "start_line": 3464,
+      "end_line": 3467
+    },
+    {
+      "id": "replay-sink",
+      "path": "src/bin/monitor/main.rs",
+      "symbol": "ReplayNotificationSink for RealReplayNotificationSink",
+      "kind": "rust_impl",
+      "symbol_sha256": "55a4cdd54df00601131e208d215ceb85d4e0d3ad80774c65b7d6ad76d2b339ff",
+      "start_line": 2992,
+      "end_line": 2996
+    },
+    {
+      "id": "replay-transport",
+      "path": "src/bin/monitor/notify.rs",
+      "symbol": "push_wechat_with_attempt_marker",
+      "kind": "rust_fn",
+      "symbol_sha256": "27679ed00787e49c7ab0b2a6c6be5e9157dabe495b945739def0f28981363ac5",
+      "start_line": 3141,
+      "end_line": 3388
+    },
+    {
+      "id": "replay-wechat",
+      "path": "src/bin/monitor/notify.rs",
+      "symbol": "push_wechat",
+      "kind": "rust_fn",
+      "symbol_sha256": "f08c1eafab1ea2d77be6ba9c18a4f1e99f4de3d44fcb21c2a961bb381b983649",
+      "start_line": 3133,
+      "end_line": 3139
+    },
+    {
       "id": "review-attempt",
       "path": "src/bin/monitor/main.rs",
       "symbol": "attempt_post_session_review",

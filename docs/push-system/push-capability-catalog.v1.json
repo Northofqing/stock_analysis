@@ -2,7 +2,7 @@
   "schema_version": 1,
   "status": "PROVISIONAL",
   "baseline_commit": "07781bf386aafdf202851ae928efee8920387058",
-  "scope": "隔离分支 codex/push-reliability-20260905，Rust/Cargo 基线 07781bf386aafdf202851ae928efee8920387058。ACTIVE 仅代表源码接线，STARVED/OPT-IN/INACTIVE 不被激活；源码审计不等于制品部署、TransportAccepted 或用户已读。四时段为 Epic；MigrationUnit 依真实共享状态键及 occurrence 归属，列明非原子层，不冻结完整迁移顺序。13 个 ReviewTask 当前 7 ACTIVE / 4 INACTIVE / 2 STARVED。仅保存 market-review/deep-analysis/名单回放不列发送 producer。NOT CHECKED：完整 RFC/WBS/离线 HTML/CI/运行时 Foundation/部署/真实接收/工期。",
+  "scope": "隔离分支 codex/push-reliability-20260905，Rust/Cargo 基线 07781bf386aafdf202851ae928efee8920387058。ACTIVE 仅代表源码接线，STARVED/OPT-IN/INACTIVE 不被激活；源码审计不等于制品部署、TransportAccepted 或用户已读。四时段为 Epic；MigrationUnit 依真实共享状态键及 occurrence 归属，列明非原子层，不冻结完整迁移顺序。13 个 ReviewTask 当前 7 ACTIVE / 4 INACTIVE / 2 STARVED。仅保存 market-review/deep-analysis/名单回放不列发送 producer；monitor --replay-force则是真实历史文本发送入口，单列enum外producer，非force dry-run不发。BUSINESS能力目录明确排除启动health运维webhook：src/bin/monitor/main.rs健康失败调用webhook_alert::on_health_fail→src/bin/monitor/webhook_alert.rs::send_webhook_alert，Prod配置ALERT_WEBHOOK_URL时确实会HTTP POST，未配置Disabled、Test隔离；不意味着无发送。按已批准Q54，外部分页/operational alert与业务回执独立，需另建ops-alert目录及receipt审计，不并入业务kind/owner。NOT CHECKED：完整 RFC/WBS/离线 HTML/CI/运行时 Foundation/部署/真实接收/工期。",
   "enum_evidence_id": "push-kind",
   "kinds": [
     {
@@ -6914,6 +6914,76 @@
       ]
     },
     {
+      "id": "cli-replay-force",
+      "kinds": [
+
+      ],
+      "phase_epics": [
+        "盘前",
+        "集合竞价",
+        "盘中",
+        "盘后"
+      ],
+      "occurrence_family": "CLI replay date / historical push.source original id / fresh replay id(pid,sequence)",
+      "completion_owner": "MonitorReplayPublisher replay envelope.id → replay_audit/YYYY.jsonl attempt/result hash chain；ReplayRunner invocation summary",
+      "migration_unit_id": "MU-cli-replay-force",
+      "trigger": {
+        "description": "monitor --replay=YYYY-MM-DD --replay-force 可在任意时刻执行，无业务交易日/时窗门；先完成runtime mode、delivery-audit preflight及eager artifact绑定，再进入terminal event分支，结束后在普通startup reconciliation barrier之前退出。非force默认dry-run只校验计数，不调用publisher。",
+        "evidence_ids": [
+          "monitor-main",
+          "replay-cli",
+          "replay-runner",
+          "replay-artifact-bind"
+        ]
+      },
+      "source": {
+        "description": "读取runtime_data_path(event_bus)/指定日期.jsonl中的历史push.source行，要求payload.text为非空字符串；保留原source/payload及original id，生成replay-{original_id}-{pid}-{sequence}，写replay_of、当前ts并为正文前置[REPLAY date]标记。原payload.kind不将本入口归入该业务PushKind。",
+        "evidence_ids": [
+          "replay-runtime-path",
+          "replay-runner",
+          "replay-identity"
+        ]
+      },
+      "authority": {
+        "description": "仅显式force和已标记的push.source/text准入；publisher在V10_DRY_RUN_PUSH=1时拒绝。先写并sync本地attempt/authorized hash-chain审计，再await真实sink，随后写result/published或sink_failed；FileReplayAuditSink验证既有年度链。该本地记录和runner summary不是durable外部接收authority。",
+        "evidence_ids": [
+          "replay-publisher",
+          "replay-audit",
+          "replay-audit-chain"
+        ]
+      },
+      "policy": {
+        "description": "RealReplayNotificationSink直接调用notify::push_wechat→namespace校验、push_log保存及配置的真实transport，不经过原业务governor/counted envelope恢复；rate_ms仅相邻发送尝试节流。sink=false令publish Err并使summary.failed递增，published只在publisher Ok后增加，任意failed使CLI exit1；发送后result审计失败也会计failed，不能推断未发。",
+        "evidence_ids": [
+          "replay-sink",
+          "replay-wechat",
+          "replay-transport",
+          "replay-publisher",
+          "replay-runner",
+          "monitor-main"
+        ]
+      },
+      "evidence_ids": [
+        "monitor-main",
+        "replay-cli",
+        "replay-runner",
+        "replay-artifact-bind",
+        "replay-runtime-path",
+        "replay-identity",
+        "replay-publisher",
+        "replay-audit",
+        "replay-audit-chain",
+        "replay-sink",
+        "replay-wechat",
+        "replay-transport"
+      ],
+      "known_gaps": [
+        "历史原始文本只做类型/非空/REPLAY标记校验，未重新绑定当前业务source或原业务claim；新的pid/进程序号replay identity与原始消息、必需渠道TransportAccepted尚缺不可变receipt合同。",
+        "force重跑可为相同行再次生成replay id并发送；本地attempt/result hash链和push_log不保证跨进程去重、发送后崩溃恢复或用户已读。",
+        "terminal replay在普通all-date startup barrier之前独立执行；eager artifact绑定不等于startup reconciliation完成，不借用counted既存decision/lease/receipt owner。"
+      ]
+    },
+    {
       "id": "cli-single-default",
       "kinds": [
 
@@ -9307,6 +9377,23 @@
         "review date announcement/stage / empty-code rolling cooldown"
       ],
       "phase_epics": [
+        "盘后"
+      ]
+    },
+    {
+      "id": "MU-cli-replay-force",
+      "completion_owner": "MonitorReplayPublisher replay envelope.id → replay_audit/YYYY.jsonl attempt/result hash chain；ReplayRunner invocation summary",
+      "note": "显式历史文本重发的独立本地attempt/result与runner计数；不是原业务PushKind的完成owner，也不是counted decision/claim或外部TransportAccepted receipt。",
+      "producer_ids": [
+        "cli-replay-force"
+      ],
+      "occurrence_families": [
+        "CLI replay date / historical push.source original id / fresh replay id(pid,sequence)"
+      ],
+      "phase_epics": [
+        "盘前",
+        "集合竞价",
+        "盘中",
         "盘后"
       ]
     },
