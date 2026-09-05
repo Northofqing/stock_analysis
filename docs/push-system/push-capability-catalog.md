@@ -1,0 +1,1721 @@
+# 推送能力源审计目录
+
+状态：PROVISIONAL；ACTIVE 仅表示源码接线，不表示 Ready、已部署或已接收。
+
+代码基线：`07781bf386aafdf202851ae928efee8920387058`。
+
+隔离分支 codex/push-reliability-20260905，Rust/Cargo 基线 07781bf386aafdf202851ae928efee8920387058。ACTIVE 仅代表源码接线，STARVED/OPT-IN/INACTIVE 不被激活；源码审计不等于制品部署、TransportAccepted 或用户已读。四时段为 Epic；MigrationUnit 依真实共享状态键及 occurrence 归属，列明非原子层，不冻结完整迁移顺序。13 个 ReviewTask 当前 7 ACTIVE / 4 INACTIVE / 2 STARVED。仅保存 market-review/deep-analysis/名单回放不列发送 producer。NOT CHECKED：完整 RFC/WBS/离线 HTML/CI/运行时 Foundation/部署/真实接收/工期。
+
+NOT CHECKED：完整 RFC / WBS / 离线 HTML / CI / 运行时 Foundation / 部署 / 真实接收；不推导迁移顺序或工期。
+
+本文件由 JSON 目录生成。四时段是 Epic，MigrationUnit 按 occurrence 与 completion owner 归属。
+
+## 盘前
+
+| kind | 状态 | producer | Unit | 证据符号 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| AccountMode | ACTIVE | account-mode-main | MU-account-mode | src/bin/monitor/main.rs::evaluate_account_mode_hook; src/bin/monitor/main.rs::main; src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence; src/bin/monitor/notify.rs::push_presented_v3; src/bin/monitor/push_templates.rs::dispatch_outcome; src/bin/monitor/push_templates.rs::finalize_account_mode_delivery; src/bin/monitor/push_templates.rs::plan_account_mode_notification; src/bin/monitor/push_templates.rs::push_account_mode_change; src/bin/monitor/push_templates.rs::record_uncounted_cooldown; src/bin/monitor/v14_adapter.rs::dedup_cooldown; src/bin/monitor/v14_adapter.rs::signal_event_for_kind; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | 服务启动/周期及盘前reset可跨盘中/盘后；主log_id.pushed只确认主消息，不证明Frozen副推。 |
+| Announcement | ACTIVE | news-announcement | MU-announcement | src/bin/monitor/main.rs::news_monitor_loop; src/bin/monitor/notify.rs::push_presented_source_fact_v3; src/bin/monitor/v14_adapter.rs::signal_event_for_source_fact; src/bin/monitor/v17_sources.rs::push_normalized_event; src/bin/monitor/v17_sources.rs::route_announcement_batch; src/bin/monitor/v17_sources.rs::route_announcements_with_provenance; src/monitor/news_monitor.rs::claim_dedup_key; src/monitor/news_monitor.rs::release_dedup_key; src/news/aggregator/classifier.rs::classify_announcement_with_provenance; src/push_l1/event.rs::make_source_fact_event_id; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | 新闻轮询可跨盘前/盘中/盘后；annroute claim/source-fact L4两层分离，公告失败不走legacy补发。 |
+| CandidateTriggered | INACTIVE |  |  | src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/push_templates.rs::dispatch_candidate_triggered_daily; src/bin/monitor/push_templates.rs::push_candidate_triggered | 真实caller存在但三层受阻：market active后要求Closed/盘前；下游promotion参数None；即使通过也缺counted binding。preopen_aux_pushed是未完成外门，不造活动producer。 |
+| DailyReport | INACTIVE |  |  | src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/main.rs::reject_unbound_alert_delivery | 预期盘前/盘后；两处daily report counted binding缺失，legacy告警/summary拒绝，无发送caller。 |
+| DataMode | ACTIVE | data-mode | MU-data-mode | src/bin/monitor/main.rs::commit_data_mode_status_result; src/bin/monitor/main.rs::commit_due_unsafe_heartbeat; src/bin/monitor/main.rs::evaluate_data_mode_hook; src/bin/monitor/main.rs::main; src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence; src/bin/monitor/notify.rs::push_presented_v3; src/bin/monitor/push_templates.rs::ModeDispatchResult; src/bin/monitor/push_templates.rs::data_mode_notification_plan; src/bin/monitor/push_templates.rs::push_data_mode_change; src/bin/monitor/v14_adapter.rs::dedup_cooldown; src/bin/monitor/v14_adapter.rs::signal_event_for_kind; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | 跨盘前/盘中/盘后health hook；EstablishedSilently也推进LATEST，Delivery失败清pending，状态确认不是receipt。 |
+| MarketActionAlert | ACTIVE | account-frozen-side, order-update-alert | MU-frozen-side, MU-order-alert | src/bin/monitor/main.rs::main; src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence; src/bin/monitor/notify.rs::push_presented_v3; src/bin/monitor/push_templates.rs::finalize_account_mode_delivery; src/bin/monitor/push_templates.rs::push_account_mode_change; src/bin/monitor/v14_adapter.rs::dedup_cooldown; src/bin/monitor/v14_adapter.rs::signal_event_for_kind; src/bin/monitor/v17_sources.rs::MarketActionState; src/bin/monitor/v17_sources.rs::handle_monitor_event; src/bin/monitor/v17_sources.rs::normalize_market_action; src/bin/monitor/v17_sources.rs::push_normalized_event; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | 跨盘前/盘中/盘后；OrderUpdate seen tuple与新Frozen副推拥有不同状态/code域，不借AccountMode主pushed。 |
+| NewsFlashCritical | INACTIVE |  |  | src/bin/monitor/main.rs::news_monitor_loop; src/bin/monitor/news_aggregator_init.rs::push_flash_reservations; src/bin/monitor/news_aggregator_init.rs::reserve; src/bin/monitor/news_aggregator_init.rs::settle | 预期盘前/盘中/盘后；共用gate/dispatcher但no_authoritative_strength_provider，reserve仅构造Aggregated。N01 accepted-event/critical quota与N02 window域分开；QN05保留在同gate活动N02的known_gaps，不造Critical producer/Unit。 |
+| PolicyHit | INACTIVE |  |  | src/bin/monitor/v14_adapter.rs::map_push_kind; src/bin/monitor/v17_sources.rs::push_normalized_event; src/news/aggregator/classifier.rs::classify_policy | 预期盘前/盘中/盘后；classify_policy仅定义/tests，normalized adapter/metadata/注释均非生产源caller，无producer/Unit。 |
+| PreopenNewsHot | ACTIVE | p01-compensation, p01-scheduled | MU-p01 | src/bin/monitor/main.rs::main; src/bin/monitor/notify.rs::push_counted_with_binding; src/bin/monitor/p01.rs::classify_compensation_due; src/bin/monitor/p01.rs::classify_scheduled_due; src/bin/monitor/p01.rs::load_p01_input_binding; src/bin/monitor/p01.rs::p01_scheduler_loop; src/bin/monitor/p01.rs::run_p01_compensation_once; src/bin/monitor/p01.rs::run_p01_once_with_ports; src/bin/monitor/p01.rs::schedule_occurrence_identity; src/durable_delivery/coordinator.rs::inspect_business_date_once_claim; src/durable_delivery/model.rs::DeliveryEnvelope; src/durable_delivery/model.rs::compiled_policy_catalog | P01自动09:00–09:15与当日09:15后显式compensation共同claim；补偿不能恢复Scheduled Reserved信封。 |
+| SnapshotStale | ACTIVE | snapshot-stale-startup, snapshot-stale-timer | MU-snapshot-stale | src/bin/monitor/main.rs::SnapshotReminderGate; src/bin/monitor/main.rs::check_snapshot_staleness_and_notify; src/bin/monitor/main.rs::main; src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/main.rs::trading_days_since; src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence; src/bin/monitor/notify.rs::push_presented_v3; src/bin/monitor/v14_adapter.rs::dedup_cooldown; src/bin/monitor/v14_adapter.rs::signal_event_for_kind; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | 无时段限制启动入口跨四Epic，15:10–15:13定时；同static LAST日期gate，至少五工作日summary过期。 |
+
+## 集合竞价
+
+| kind | 状态 | producer | Unit | 证据符号 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| AuctionRepush | ACTIVE | auction-repush | MU-auction-candidates | src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence; src/bin/monitor/notify.rs::push_presented_v3; src/bin/monitor/push_templates.rs::dispatch_auction_repush; src/bin/monitor/push_templates.rs::dispatch_outcome; src/bin/monitor/push_templates.rs::load_real_candidate_batch; src/bin/monitor/push_templates.rs::record_uncounted_cooldown; src/bin/monitor/v14_adapter.rs::dedup_cooldown; src/bin/monitor/v14_adapter.rs::signal_event_for_kind; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | 与CandidateBoard同tick双true封session外门；两种通知自身冷却独立。 |
+| AuctionVolume | ACTIVE | auction-volume | MU-auction-volume | src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence; src/bin/monitor/notify.rs::push_presented_v3; src/bin/monitor/push_templates.rs::dispatch_auction_volume_daily; src/bin/monitor/push_templates.rs::dispatch_outcome; src/bin/monitor/push_templates.rs::load_auction_volume_snapshot_real; src/bin/monitor/push_templates.rs::record_uncounted_cooldown; src/bin/monitor/v14_adapter.rs::dedup_cooldown; src/bin/monitor/v14_adapter.rs::signal_event_for_kind; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | 外层new_items与dispatcher快照独立读取；true才封外层code set，不证明两批相等。 |
+| CandidateBoard | ACTIVE | candidate-board | MU-auction-candidates | src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence; src/bin/monitor/notify.rs::push_presented_v3; src/bin/monitor/push_templates.rs::candidate_snapshot_persist; src/bin/monitor/push_templates.rs::candidate_snapshot_previous; src/bin/monitor/push_templates.rs::dispatch_candidate_board; src/bin/monitor/push_templates.rs::dispatch_outcome; src/bin/monitor/push_templates.rs::load_real_candidate_batch; src/bin/monitor/push_templates.rs::record_uncounted_cooldown; src/bin/monitor/v14_adapter.rs::dedup_cooldown; src/bin/monitor/v14_adapter.rs::signal_event_for_kind; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | 与AuctionRepush共双bool外门；先失效子推并推进日期快照，再发主卡，空批不做空集失效。 |
+| CandidateInvalidated | ACTIVE | candidate-invalidated | MU-auction-candidates | src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence; src/bin/monitor/notify.rs::push_presented_v3; src/bin/monitor/push_templates.rs::candidate_snapshot_persist; src/bin/monitor/push_templates.rs::candidate_snapshot_previous; src/bin/monitor/push_templates.rs::dispatch_candidate_board; src/bin/monitor/push_templates.rs::dispatch_outcome; src/bin/monitor/push_templates.rs::push_candidate_invalidated; src/bin/monitor/push_templates.rs::record_uncounted_cooldown; src/bin/monitor/v14_adapter.rs::dedup_cooldown; src/bin/monitor/v14_adapter.rs::signal_event_for_kind; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | CandidateBoard差分子推bool被丢弃，随后快照推进可丢失败差分；空候选不做失效。 |
+| PaperTrade | ACTIVE | paper-trade-terminal | MU-paper-trade | src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/notify.rs::push_counted_with_binding; src/bin/monitor/push_templates.rs::dispatch_paper_trade_daily; src/bin/monitor/push_templates.rs::load_today_paper_trade_reports; src/bin/monitor/push_templates.rs::prepare_paper_trade_daily; src/durable_delivery/coordinator.rs::inspect_business_date_once_claim; src/durable_delivery/model.rs::DeliveryEnvelope; src/durable_delivery/model.rs::compiled_policy_catalog | 消费真实当日严格交易完成态，按terminal transition counted；业务成交与通知decision分开。 |
+| VirtualWatch | STARVED | virtual-watch-confirm, virtual-watch-pilot | MU-virtual-watch | src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence; src/bin/monitor/notify.rs::push_presented_v3; src/bin/monitor/push_templates.rs::dispatch_virtual_watch_daily; src/bin/monitor/v14_adapter.rs::dedup_cooldown; src/bin/monitor/v14_adapter.rs::signal_event_for_kind; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | pilot空post_close导致vector无输入；confirm依赖同vector非空全零价，补价先改变资格；快照不是通知完成。 |
+
+## 盘中
+
+| kind | 状态 | producer | Unit | 证据符号 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| CloseCall | ACTIVE | close-call | MU-close-call | src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/main.rs::prepare_close_call_messages; src/bin/monitor/notify.rs::push_counted_with_binding; src/durable_delivery/coordinator.rs::inspect_business_date_once_claim; src/durable_delivery/model.rs::DeliveryEnvelope; src/durable_delivery/model.rs::compiled_policy_catalog | t≥14:55 counted per ticket，只有下界；零条也封close_call_pushed，失败保留。 |
+| EtfClosingCallAuction | INACTIVE |  |  | src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/push_templates.rs::dispatch_etf_closing_call_auction | dispatcher仅定义无生产caller；monitor中的注释/未使用etf_closing_pushed不构成owner或活动producer。 |
+| ForbiddenOps | INACTIVE |  |  | src/bin/monitor/notify.rs::PushKind; src/bin/monitor/v14_adapter.rs::map_push_kind | 全src仅renderer/preview/tests、registry/durable映射，无生产caller。 |
+| FundInflow | INACTIVE |  |  | src/bin/monitor/notify.rs::PushKind; src/bin/monitor/notify.rs::dispatch_table_init_audit; src/bin/monitor/v14_adapter.rs::map_push_kind | 全src负向caller审计仅enum/label/cooldown/adapter/BR196 fixture；无业务dispatch，不造活动producer。 |
+| HoldingEvent | INACTIVE |  |  | src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/main.rs::reject_unbound_alert_delivery | 无生产发送caller；legacy summary停在counted binding不可用，reject_unbound_alert_delivery明确sink_calls=0；renderer/registry/fixture不构成producer。 |
+| HoldingPlan | ACTIVE | holding-plan-manual, holding-plan-periodic | MU-holding-plan | src/bin/monitor/main.rs::current_banner; src/bin/monitor/main.rs::holding_plan_daily_pushed; src/bin/monitor/main.rs::holding_plan_daily_record; src/bin/monitor/main.rs::main; src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/main.rs::prepare_holding_plan_messages; src/bin/monitor/main.rs::run_daily_pushes; src/bin/monitor/notify.rs::push_counted_with_binding; src/durable_delivery/coordinator.rs::inspect_business_date_once_claim; src/durable_delivery/model.rs::DeliveryEnvelope; src/durable_delivery/model.rs::compiled_policy_catalog | 定时counted有holding_plan_daily副表；manual同family但新CLI受banner阻断，无日表；canonical时间可改变decision。 |
+| IndustryChainIntraday | ACTIVE | industry-chain-manual, industry-chain-periodic | MU-industry-intraday | src/bin/monitor/main.rs::current_banner; src/bin/monitor/main.rs::main; src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/main.rs::run_daily_pushes; src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence; src/bin/monitor/notify.rs::push_presented_v3; src/bin/monitor/push_templates.rs::dispatch_industry_chain_intraday_daily; src/bin/monitor/push_templates.rs::dispatch_industry_chain_intraday_daily_result; src/bin/monitor/push_templates.rs::dispatch_industry_chain_intraday_periodic; src/bin/monitor/push_templates.rs::dispatch_outcome; src/bin/monitor/push_templates.rs::record_uncounted_cooldown; src/bin/monitor/v14_adapter.rs::dedup_cooldown; src/bin/monitor/v14_adapter.rs::signal_event_for_kind; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | I03定时与manual共空code冷却，wrapper对Empty/Deduped语义不同；新CLI先banner Err。 |
+| IntradayMarket | ACTIVE | market-manual-i01, market-preopen-probe, market-snapshot-warning, market-view-periodic | MU-intraday-market | src/bin/monitor/main.rs::current_banner; src/bin/monitor/main.rs::main; src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/main.rs::render_board_flow_market_view; src/bin/monitor/main.rs::run_daily_pushes; src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence; src/bin/monitor/notify.rs::push_presented_v3; src/bin/monitor/push_templates.rs::dispatch_intraday_market_daily_result; src/bin/monitor/v14_adapter.rs::dedup_cooldown; src/bin/monitor/v14_adapter.rs::signal_event_for_kind; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | 定时flow view、15:05快照警告、受阻盘前probe、受banner阻断manual共空code冷却，各自外门独立。 |
+| LimitBoards | ACTIVE | limit-boards-first, limit-boards-second, limit-boards-third-plus | MU-limit-boards | src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence; src/bin/monitor/notify.rs::push_presented_v3; src/bin/monitor/push_templates.rs::render_limit_boards_shape; src/bin/monitor/v14_adapter.rs::dedup_cooldown; src/bin/monitor/v14_adapter.rs::signal_event_for_kind; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | 首板/二板/三板+三producer共享预写code set和空code冷却，失败不回滚set。 |
+| NewsCatalyst | ACTIVE | catalyst-announcement, catalyst-manual | MU-news-catalyst | src/bin/monitor/main.rs::current_banner; src/bin/monitor/main.rs::main; src/bin/monitor/main.rs::news_monitor_loop; src/bin/monitor/main.rs::run_daily_pushes; src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence; src/bin/monitor/notify.rs::push_presented_v3; src/bin/monitor/push_templates.rs::dispatch_news_catalyst_daily; src/bin/monitor/push_templates.rs::dispatch_outcome; src/bin/monitor/push_templates.rs::load_news_catalyst_snapshot_real; src/bin/monitor/push_templates.rs::push_news_catalyst; src/bin/monitor/push_templates.rs::record_uncounted_cooldown; src/bin/monitor/v14_adapter.rs::dedup_cooldown; src/bin/monitor/v14_adapter.rs::signal_event_for_kind; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | 公告触发重新读快照，无独立durable occurrence；manual已接线但新CLI被banner拒绝。 |
+| NewsFlashAggregated | ACTIVE | news-flash-aggregate | MU-news-flash-aggregate | src/bin/monitor/main.rs::news_monitor_loop; src/bin/monitor/news_aggregator_init.rs::push_flash_reservations; src/bin/monitor/news_aggregator_init.rs::reserve; src/bin/monitor/news_aggregator_init.rs::reserve_from_authority; src/bin/monitor/news_aggregator_init.rs::settle; src/bin/monitor/notify.rs::push_news_flash_v3; src/event/mod.rs::reconcile_news_flash_business_date | 盘中/盘后四窗口accepted-window独立settlement；fresh authority+exact receipt，N01缺强度authority不被本入口补足。 |
+| NewsRanked | INACTIVE |  |  | src/bin/monitor/notify.rs::PushKind; src/bin/monitor/notify.rs::dispatch_table_init_audit | dispatch_table_init_audit明确disabled=no_producer；shadow/metadata/fixture不是生产入口。 |
+| NewsToIdea | ACTIVE | d01-announcement, d01-manual, news-ai-same-tick | MU-d01, MU-news-ai | src/bin/monitor/main.rs::current_banner; src/bin/monitor/main.rs::main; src/bin/monitor/main.rs::news_monitor_loop; src/bin/monitor/main.rs::run_daily_pushes; src/bin/monitor/news_ai_shadow.rs::NewsAiGovernedDeliveryPort for ProductionNewsAiDeliveryPort; src/bin/monitor/news_ai_shadow.rs::assess_candidate; src/bin/monitor/news_ai_shadow.rs::run_same_tick_batches; src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence; src/bin/monitor/notify.rs::push_presented_v3; src/bin/monitor/notify.rs::send_preflighted_news_ai_analysis_v3; src/bin/monitor/push_templates.rs::dispatch_news_to_idea_daily; src/bin/monitor/push_templates.rs::dispatch_outcome; src/bin/monitor/push_templates.rs::load_news_to_idea_snapshot_real; src/bin/monitor/push_templates.rs::push_news_to_idea; src/bin/monitor/push_templates.rs::record_uncounted_cooldown; src/bin/monitor/v14_adapter.rs::dedup_cooldown; src/bin/monitor/v14_adapter.rs::signal_event_for_kind; src/database/news_ai.rs::core_assessment_id; src/database/news_ai.rs::reserve_news_ai_delivery_on_conn; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | 普通D01公告/manual memo与集合竞价/盘中NewsAI assessment链分属不同Unit；manual新CLI受banner阻断。 |
+| PaperSell | ACTIVE | paper-sell-intraday, paper-sell-post-close | MU-paper-sell | src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/main.rs::paper_sell_paused; src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence; src/bin/monitor/notify.rs::push_presented_v3; src/bin/monitor/v14_adapter.rs::dedup_cooldown; src/bin/monitor/v14_adapter.rs::signal_event_for_kind; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity; src/trading/paper_sell.rs::already_sold_today; src/trading/paper_sell.rs::evaluate_and_sell; src/trading/paper_sell.rs::scan_and_sell; src/trading/paper_sell.rs::scan_and_sell_post_close | 盘中与15:30盘后共享code/day/Filled防重；先成交后通知，失败仅warn，不恢复卖出事实。 |
+| PostFixedPriceFill | STARVED | post-fixed-fill | MU-fixed-fill | src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence; src/bin/monitor/notify.rs::push_presented_v3; src/bin/monitor/push_templates.rs::dispatch_outcome; src/bin/monitor/push_templates.rs::dispatch_trade_pipeline_fills_result; src/bin/monitor/push_templates.rs::fetch_pending_trade_events; src/bin/monitor/push_templates.rs::record_uncounted_cooldown; src/bin/monitor/push_templates.rs::register_trade_event_source; src/bin/monitor/v14_adapter.rs::dedup_cooldown; src/bin/monitor/v14_adapter.rs::signal_event_for_kind; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | 同未注册源但独立T15事件校验与300s timer，无消费ack/cursor。 |
+| PostFixedPriceOrder | STARVED | post-fixed-order | MU-fixed-order | src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence; src/bin/monitor/notify.rs::push_presented_v3; src/bin/monitor/push_templates.rs::dispatch_outcome; src/bin/monitor/push_templates.rs::dispatch_trade_pipeline_orders_result; src/bin/monitor/push_templates.rs::fetch_pending_trade_events; src/bin/monitor/push_templates.rs::record_uncounted_cooldown; src/bin/monitor/push_templates.rs::register_trade_event_source; src/bin/monitor/v14_adapter.rs::dedup_cooldown; src/bin/monitor/v14_adapter.rs::signal_event_for_kind; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | 盘中/盘后Epic的T14源OnceLock未注册，register_trade_event_source仅定义；900s独立timer保持due。 |
+| SectorAnomaly | ACTIVE | sector-anomaly | MU-sector-anomaly | src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/notify.rs::push_counted_with_binding; src/bin/monitor/push_templates.rs::dispatch_sector_anomaly_daily; src/bin/monitor/push_templates.rs::push_sector_anomaly_counted; src/durable_delivery/coordinator.rs::inspect_business_date_once_claim; src/durable_delivery/model.rs::DeliveryEnvelope; src/durable_delivery/model.rs::compiled_policy_catalog | 独立于SectorTop的BusinessDateOnce claim/timer；false延后一小时，新闻归因canonical缺口保留。 |
+| SectorTop | ACTIVE | sector-top | MU-sector-top | src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/notify.rs::push_counted_with_binding; src/bin/monitor/push_templates.rs::dispatch_sector_top_daily_result; src/bin/monitor/push_templates.rs::push_sector_top_counted; src/durable_delivery/coordinator.rs::inspect_business_date_once_claim; src/durable_delivery/model.rs::DeliveryEnvelope; src/durable_delivery/model.rs::compiled_policy_catalog | 独立BusinessDateOnce claim与一小时timer；false也推进timer。 |
+| StPriceLimitChanged | ACTIVE | st-price-limit-batch | MU-st-price | src/bin/monitor/main.rs::dispatch_st_price_limit_batch; src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence; src/bin/monitor/notify.rs::push_presented_v3; src/bin/monitor/push_templates.rs::dispatch_outcome; src/bin/monitor/push_templates.rs::dispatch_st_price_limit_changed; src/bin/monitor/push_templates.rs::record_uncounted_cooldown; src/bin/monitor/v14_adapter.rs::dedup_cooldown; src/bin/monitor/v14_adapter.rs::signal_event_for_kind; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | 真实ST持仓整批prepare后逐票发；一票失败保留外门，Ok含零条封st_price_pushed；5%→10%是实参而非动态规则authority。 |
+| T0Advice | ACTIVE | t0-advice | MU-t0 | src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/main.rs::prepare_t0_messages; src/bin/monitor/notify.rs::push_counted_with_binding; src/decision/t0_advisor.rs::T0PlanDecisionBindingV1; src/durable_delivery/coordinator.rs::inspect_business_date_once_claim; src/durable_delivery/model.rs::DeliveryEnvelope; src/durable_delivery/model.rs::compiled_policy_catalog | 独立T0 decision hash与30s timer，非HoldingPlan owner；Forbidden/Rejected不产生消息。 |
+| TurnoverTop | INACTIVE |  |  | src/bin/monitor/notify.rs::PushKind; src/bin/monitor/v14_adapter.rs::map_push_kind | 全src只有render_turnover_top/load_turnover_top_real定义、preview/tests与metadata，未形成生产dispatch。 |
+
+## 盘后
+
+| kind | 状态 | producer | Unit | 证据符号 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| AnalystUpgrade | ACTIVE | analyst-upgrade | MU-analyst | src/bin/monitor/main.rs::news_monitor_loop; src/bin/monitor/notify.rs::push_presented_source_fact_v3; src/bin/monitor/v14_adapter.rs::signal_event_for_source_fact; src/bin/monitor/v17_sources.rs::analyst_upgrade_event; src/bin/monitor/v17_sources.rs::poll_earnings_and_analyst; src/news/aggregator/analyst_state.rs::observe; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | observe先推进评级map，独立analyst poll timer在send前推进；失败后同report可能Duplicate。 |
+| AttributionDaily | ACTIVE | attribution-daily | MU-attribution-daily | src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence; src/bin/monitor/v14_adapter.rs::dedup_cooldown; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | 仅ATTRIBUTION_LAST_RUN日期门；cooldown=None，L4无冷却owner；分析/存储成功后任何发送outcome均封日。 |
+| BlockTradeIntradayConfirm | ACTIVE | block-confirm-side-route | MU-block-confirm | src/bin/monitor/main.rs::backfill_one_review_task; src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence; src/bin/monitor/notify.rs::push_presented_v3; src/bin/monitor/push_templates.rs::dispatch_block_trade_intraday_confirm; src/bin/monitor/push_templates.rs::dispatch_block_trade_review; src/bin/monitor/push_templates.rs::dispatch_outcome; src/bin/monitor/push_templates.rs::dispatch_post_session_review; src/bin/monitor/push_templates.rs::record_uncounted_cooldown; src/bin/monitor/v14_adapter.rs::dedup_cooldown; src/bin/monitor/v14_adapter.rs::map_push_kind; src/bin/monitor/v14_adapter.rs::signal_event_for_kind; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | 名称含Intraday，实际盘后review side route；逐票两层300s冷却，无交易记录durable occurrence。 |
+| BlockTradePriceRange | INACTIVE |  |  | src/bin/monitor/push_templates.rs::dispatch_block_trade_price_range; src/bin/monitor/push_templates.rs::dispatch_block_trade_review | 唯一生产caller固定传None block_price_range，guard恒拒绝，校正Task3初判；review.price作平均价也不解除区间要求，无活动owner/Unit。 |
+| CapitalVerify | INACTIVE |  |  | src/bin/monitor/notify.rs::PushKind; src/bin/monitor/notify.rs::dispatch_table_init_audit; src/bin/monitor/v14_adapter.rs::map_push_kind | metadata/子类映射/计算结果不构成发送入口，全src无生产caller。 |
+| CatalystReview | ACTIVE | review-a10-auto, review-a10-backfill, review-a10-manual, review-a10-push | MU-review-a10 | src/bin/monitor/durable_delivery_runtime.rs::authorize_rejected_review_retry; src/bin/monitor/durable_delivery_runtime.rs::resume_review_task_occurrence; src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge; src/bin/monitor/main.rs::attempt_post_session_review; src/bin/monitor/main.rs::backfill_one_review_task; src/bin/monitor/main.rs::post_session_review_scheduler; src/bin/monitor/main.rs::run_daily_pushes; src/bin/monitor/main.rs::run_review_backfill; src/bin/monitor/main.rs::run_review_only; src/bin/monitor/notify.rs::push_counted_with_binding; src/bin/monitor/push_templates.rs::dispatch_catalyst_review_daily_outcome; src/bin/monitor/push_templates.rs::dispatch_post_session_review; src/bin/monitor/push_templates.rs::dispatch_r12_backtest_outcome_with_runner; src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable; src/bin/monitor/review_batch.rs::ReviewRunContext; src/bin/monitor/review_batch.rs::ReviewScheduleState; src/bin/monitor/review_batch.rs::review_preflight; src/bin/monitor/review_batch.rs::review_task_identity; src/durable_delivery/coordinator.rs::inspect_business_date_once_claim; src/durable_delivery/coordinator.rs::inspect_review_task_occurrence; src/durable_delivery/model.rs::DeliveryEnvelope; src/durable_delivery/model.rs::compiled_policy_catalog; src/review/catalyst_review.rs::load_catalyst_review_snapshot_real | A10 auto/manual/backfill及--push同业务日共claim；后置名单保存不原子，real历史loader不等于stored replay。 |
+| EarningsBeat | OPT-IN | earnings-beat | MU-earnings-beat | src/bin/monitor/main.rs::news_monitor_loop; src/bin/monitor/notify.rs::push_presented_source_fact_v3; src/bin/monitor/v14_adapter.rs::signal_event_for_source_fact; src/bin/monitor/v17_sources.rs::earnings_classification_gate; src/bin/monitor/v17_sources.rs::earnings_classification_to_event; src/bin/monitor/v17_sources.rs::poll_earnings_and_analyst; src/bin/monitor/v17_sources.rs::push_normalized_event; src/news/aggregator/classifier.rs::classify_earnings; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | EARNINGS_BEAT_ENABLED=1才分类，gate在provider I/O后；与Miss轮询共享但L4 kind完成键不同。 |
+| EarningsMiss | OPT-IN | earnings-miss | MU-earnings-miss | src/bin/monitor/main.rs::news_monitor_loop; src/bin/monitor/notify.rs::push_presented_source_fact_v3; src/bin/monitor/v14_adapter.rs::signal_event_for_source_fact; src/bin/monitor/v17_sources.rs::earnings_classification_gate; src/bin/monitor/v17_sources.rs::earnings_classification_to_event; src/bin/monitor/v17_sources.rs::poll_earnings_and_analyst; src/bin/monitor/v17_sources.rs::push_normalized_event; src/news/aggregator/classifier.rs::classify_earnings; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | 同opt-in来源扫描的负向分类；不得把Beat发送成功当Miss完成，保持独立Unit。 |
+| EventCalendar | ACTIVE | review-r08-auto, review-r08-backfill, review-r08-manual | MU-review-r08 | src/bin/monitor/durable_delivery_runtime.rs::authorize_rejected_review_retry; src/bin/monitor/durable_delivery_runtime.rs::resume_review_task_occurrence; src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge; src/bin/monitor/main.rs::attempt_post_session_review; src/bin/monitor/main.rs::backfill_one_review_task; src/bin/monitor/main.rs::post_session_review_scheduler; src/bin/monitor/main.rs::run_review_backfill; src/bin/monitor/main.rs::run_review_only; src/bin/monitor/notify.rs::push_counted_with_binding; src/bin/monitor/push_templates.rs::dispatch_post_session_review; src/bin/monitor/push_templates.rs::dispatch_r08_event_calendar_outcome_with_loader; src/bin/monitor/push_templates.rs::dispatch_r12_backtest_outcome_with_runner; src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable; src/bin/monitor/review_batch.rs::ReviewRunContext; src/bin/monitor/review_batch.rs::ReviewScheduleState; src/bin/monitor/review_batch.rs::review_preflight; src/bin/monitor/review_batch.rs::review_task_identity; src/data_gateway/review.rs::GatewayError; src/durable_delivery/coordinator.rs::inspect_business_date_once_claim; src/durable_delivery/coordinator.rs::inspect_review_task_occurrence; src/durable_delivery/model.rs::DeliveryEnvelope; src/durable_delivery/model.rs::compiled_policy_catalog | R08 Rolling review occurrence；必需CFFEX错误保留typed retryability，其余三组件可degraded；首批源错无持久任务终态。 |
+| FactorIC | INACTIVE |  |  | src/bin/monitor/notify.rs::PushKind; src/bin/monitor/notify.rs::dispatch_table_init_audit; src/bin/monitor/v14_adapter.rs::map_push_kind | 只有DailyReportSubKind/dispatch metadata、计算报告和durable适配，无此kind发送caller。 |
+| G5bAttribution | ACTIVE | g5b-attribution | MU-g5b-attribution | src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence; src/bin/monitor/v14_adapter.rs::dedup_cooldown; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | 仅G5B_LAST_RUN独立日期门；cooldown=None，L4无冷却owner；整批尝试后封日不等于接收。 |
+| IndustryChain | STARVED | review-r03-auto, review-r03-manual | MU-review-r03-auto, MU-review-r03-manual | src/bin/monitor/main.rs::post_session_review_scheduler; src/bin/monitor/main.rs::run_review_backfill; src/bin/monitor/main.rs::run_review_only; src/bin/monitor/push_templates.rs::dispatch_post_session_review; src/bin/monitor/push_templates.rs::dispatch_r03_industry_chain_outcome; src/bin/monitor/review_batch.rs::ReviewRunContext; src/bin/monitor/review_batch.rs::ReviewScheduleState; src/durable_delivery/model.rs::compiled_policy_catalog | R03 LegacyAccountGate typed AccountMetricsIncomplete阻断provider/renderer/sink；auto/manual任务状态独立，无claim的潜在B不作活动owner。 |
+| IpoCatalyst | ACTIVE | ipo-catalyst-side-route | MU-ipo-catalyst | src/bin/monitor/main.rs::backfill_one_review_task; src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence; src/bin/monitor/notify.rs::push_presented_v3; src/bin/monitor/push_templates.rs::dispatch_ipo_catalyst; src/bin/monitor/push_templates.rs::dispatch_outcome; src/bin/monitor/push_templates.rs::dispatch_post_session_review; src/bin/monitor/push_templates.rs::record_uncounted_cooldown; src/bin/monitor/v14_adapter.rs::dedup_cooldown; src/bin/monitor/v14_adapter.rs::signal_event_for_kind; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | review side route，R08同日缓存仅输入复用；空code默认1800s双层冷却，无每日一次owner。 |
+| IpoListingApproval | INACTIVE |  |  | src/bin/monitor/main.rs::run_review_only; src/bin/monitor/notify.rs::PushKind | run_review_only明确disabled=no_producer；IPO催化side route不发送此kind。 |
+| IpoProspectus | INACTIVE |  |  | src/bin/monitor/main.rs::run_review_only; src/bin/monitor/notify.rs::PushKind | run_review_only明确disabled=no_producer；不将IpoCatalyst另一路当本kind。 |
+| PaperReview | STARVED | paper-review-daily-auto, paper-review-daily-manual, paper-review-daily-push, paper-review-noon | MU-paper-review-daily, MU-paper-review-noon | src/bin/monitor/main.rs::attempt_post_session_review; src/bin/monitor/main.rs::monitor_loop; src/bin/monitor/main.rs::post_session_review_scheduler; src/bin/monitor/main.rs::run_daily_pushes; src/bin/monitor/main.rs::run_review_backfill; src/bin/monitor/main.rs::run_review_only; src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence; src/bin/monitor/notify.rs::push_presented_v3; src/bin/monitor/push_templates.rs::classify_a01_target; src/bin/monitor/push_templates.rs::dispatch_outcome; src/bin/monitor/push_templates.rs::dispatch_paper_review_daily_outcome; src/bin/monitor/push_templates.rs::dispatch_paper_review_noon; src/bin/monitor/push_templates.rs::dispatch_post_session_review; src/bin/monitor/push_templates.rs::load_paper_review_snapshot_real; src/bin/monitor/push_templates.rs::push_paper_review_outcome; src/bin/monitor/push_templates.rs::record_uncounted_cooldown; src/bin/monitor/review_batch.rs::ReviewRunContext; src/bin/monitor/review_batch.rs::ReviewScheduleState; src/bin/monitor/v14_adapter.rs::dedup_cooldown; src/bin/monitor/v14_adapter.rs::signal_event_for_kind; src/push_l4/dispatcher.rs::commit_with_identity; src/push_l4/dispatcher.rs::reserve_with_identity | A01自产观察链缺输入；daily/manual/--push可消费合法exact已完成T+1历史记录，自动历史backfill排除；noon today结构受阻且bool仍封日，code/noon-code均保留。 |
+| PositionReview | ACTIVE | review-r11-auto, review-r11-backfill, review-r11-manual | MU-review-r11 | src/bin/monitor/durable_delivery_runtime.rs::authorize_rejected_review_retry; src/bin/monitor/durable_delivery_runtime.rs::resume_review_task_occurrence; src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge; src/bin/monitor/main.rs::attempt_post_session_review; src/bin/monitor/main.rs::backfill_one_review_task; src/bin/monitor/main.rs::post_session_review_scheduler; src/bin/monitor/main.rs::run_review_backfill; src/bin/monitor/main.rs::run_review_only; src/bin/monitor/notify.rs::push_counted_with_binding; src/bin/monitor/push_templates.rs::dispatch_position_review_outcome; src/bin/monitor/push_templates.rs::dispatch_post_session_review; src/bin/monitor/push_templates.rs::dispatch_r12_backtest_outcome_with_runner; src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable; src/bin/monitor/review_batch.rs::ReviewRunContext; src/bin/monitor/review_batch.rs::ReviewScheduleState; src/bin/monitor/review_batch.rs::review_preflight; src/bin/monitor/review_batch.rs::review_task_identity; src/durable_delivery/coordinator.rs::inspect_business_date_once_claim; src/durable_delivery/coordinator.rs::inspect_review_task_occurrence; src/durable_delivery/model.rs::DeliveryEnvelope; src/durable_delivery/model.rs::compiled_policy_catalog | R11精确d估值与latest summary/行业/AI正文的authority分开；三入口共享原日claim。 |
+| ReviewBacktest | INACTIVE |  |  | src/bin/monitor/durable_delivery_runtime.rs::resume_review_task_occurrence; src/bin/monitor/main.rs::backfill_one_review_task; src/bin/monitor/push_templates.rs::dispatch_r12_backtest_outcome_with_runner; src/durable_delivery/model.rs::compiled_policy_catalog | R12_TECHNICAL_BARS_PUBLISHED=false，新producer在loader/provider前Disabled，校正Task3初判；8-task backfill仍可恢复既存immutable decision，此为恢复路径说明，不冒充活动producer/Unit；无claim仍Disabled。 |
+| ReviewFailure | INACTIVE |  |  | src/bin/monitor/push_templates.rs::dispatch_r06_failure_real; src/bin/monitor/review_batch.rs::review_preflight | R06缺evidence-bound classified failure outcome，明确Disabled；无活动发送owner，backfill排除。 |
+| ReviewLhb | ACTIVE | review-r04-auto, review-r04-backfill, review-r04-manual | MU-review-r04 | src/bin/monitor/durable_delivery_runtime.rs::authorize_rejected_review_retry; src/bin/monitor/durable_delivery_runtime.rs::resume_review_task_occurrence; src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge; src/bin/monitor/main.rs::attempt_post_session_review; src/bin/monitor/main.rs::backfill_one_review_task; src/bin/monitor/main.rs::post_session_review_scheduler; src/bin/monitor/main.rs::run_review_backfill; src/bin/monitor/main.rs::run_review_only; src/bin/monitor/notify.rs::push_counted_with_binding; src/bin/monitor/push_templates.rs::dispatch_post_session_review; src/bin/monitor/push_templates.rs::dispatch_r04_lhb_outcome_with_loader; src/bin/monitor/push_templates.rs::dispatch_r12_backtest_outcome_with_runner; src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable; src/bin/monitor/review_batch.rs::ReviewRunContext; src/bin/monitor/review_batch.rs::ReviewScheduleState; src/bin/monitor/review_batch.rs::review_preflight; src/bin/monitor/review_batch.rs::review_task_identity; src/durable_delivery/coordinator.rs::inspect_business_date_once_claim; src/durable_delivery/coordinator.rs::inspect_review_task_occurrence; src/durable_delivery/model.rs::DeliveryEnvelope; src/durable_delivery/model.rs::compiled_policy_catalog | R04三入口共原日BusinessDateOnce；auto实际at_manual提前绕21:00，来源校验不豁免。 |
+| ReviewMarket | INACTIVE |  |  | src/bin/monitor/push_templates.rs::dispatch_r02_review_market_real; src/bin/monitor/review_batch.rs::ReviewScheduleState; src/bin/monitor/review_batch.rs::review_preflight | R02缺完整review-date市场batch，preflight/dispatcher Disabled；独立auto/manual任务审计不生成通知producer，backfill排除。 |
+| ReviewProviderTopN | ACTIVE | review-r09-auto, review-r09-backfill, review-r09-manual | MU-review-r09 | src/bin/monitor/durable_delivery_runtime.rs::authorize_rejected_review_retry; src/bin/monitor/durable_delivery_runtime.rs::resume_review_task_occurrence; src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge; src/bin/monitor/main.rs::attempt_post_session_review; src/bin/monitor/main.rs::backfill_one_review_task; src/bin/monitor/main.rs::post_session_review_scheduler; src/bin/monitor/main.rs::run_review_backfill; src/bin/monitor/main.rs::run_review_only; src/bin/monitor/notify.rs::push_counted_with_binding; src/bin/monitor/push_templates.rs::dispatch_post_session_review; src/bin/monitor/push_templates.rs::dispatch_r09_provider_top_n_outcome_with_loader; src/bin/monitor/push_templates.rs::dispatch_r12_backtest_outcome_with_runner; src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable; src/bin/monitor/review_batch.rs::ReviewRunContext; src/bin/monitor/review_batch.rs::ReviewScheduleState; src/bin/monitor/review_batch.rs::review_preflight; src/bin/monitor/review_batch.rs::review_task_identity; src/durable_delivery/coordinator.rs::inspect_business_date_once_claim; src/durable_delivery/coordinator.rs::inspect_review_task_occurrence; src/durable_delivery/model.rs::DeliveryEnvelope; src/durable_delivery/model.rs::compiled_policy_catalog | R09两份Eastmoney来源限定榜单，同日15:35门；三入口共享原日immutable decision。 |
+| ReviewSignal | INACTIVE |  |  | src/bin/monitor/main.rs::post_session_review_scheduler; src/bin/monitor/push_templates.rs::dispatch_r05_signal_review_real; src/bin/monitor/review_batch.rs::review_preflight | R05缺append-only signal→delivery→execution→settlement outcome，明确Disabled；不把订单表当生产源，backfill排除。 |
+| SectorTier | INACTIVE |  |  | src/bin/monitor/notify.rs::PushKind; src/bin/monitor/notify.rs::dispatch_table_init_audit; src/bin/monitor/v14_adapter.rs::map_push_kind | metadata/适配/领域同名enum不是PushKind producer；全src无发送caller。 |
+| StockPick | INACTIVE |  |  | src/bin/monitor/notify.rs::PushKind; src/bin/monitor/push_templates.rs::load_real_candidate_batch; src/bin/monitor/v14_adapter.rs::map_push_kind | 候选台CandidateSource::StockPick是上游候选输入，不是独立StockPick发送caller。 |
+| TomorrowWatch | ACTIVE | review-r07-auto, review-r07-backfill, review-r07-manual | MU-review-r07 | src/bin/monitor/durable_delivery_runtime.rs::authorize_rejected_review_retry; src/bin/monitor/durable_delivery_runtime.rs::resume_review_task_occurrence; src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge; src/bin/monitor/main.rs::attempt_post_session_review; src/bin/monitor/main.rs::backfill_one_review_task; src/bin/monitor/main.rs::post_session_review_scheduler; src/bin/monitor/main.rs::run_review_backfill; src/bin/monitor/main.rs::run_review_only; src/bin/monitor/notify.rs::push_counted_with_binding; src/bin/monitor/push_templates.rs::dispatch_post_session_review; src/bin/monitor/push_templates.rs::dispatch_r12_backtest_outcome_with_runner; src/bin/monitor/push_templates.rs::dispatch_tomorrow_watch_after_preflight; src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable; src/bin/monitor/review_batch.rs::ReviewRunContext; src/bin/monitor/review_batch.rs::ReviewScheduleState; src/bin/monitor/review_batch.rs::review_preflight; src/bin/monitor/review_batch.rs::review_task_identity; src/durable_delivery/coordinator.rs::inspect_business_date_once_claim; src/durable_delivery/coordinator.rs::inspect_review_task_occurrence; src/durable_delivery/model.rs::DeliveryEnvelope; src/durable_delivery/model.rs::compiled_policy_catalog | R07三入口共原日claim；当日manual也等21:00，四源与LHB counted lineage缺口保留。 |
+| WatchlistTracking | ACTIVE | review-r13-auto, review-r13-backfill, review-r13-manual | MU-review-r13 | src/bin/monitor/durable_delivery_runtime.rs::authorize_rejected_review_retry; src/bin/monitor/durable_delivery_runtime.rs::resume_review_task_occurrence; src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge; src/bin/monitor/main.rs::attempt_post_session_review; src/bin/monitor/main.rs::backfill_one_review_task; src/bin/monitor/main.rs::post_session_review_scheduler; src/bin/monitor/main.rs::run_review_backfill; src/bin/monitor/main.rs::run_review_only; src/bin/monitor/notify.rs::push_counted_with_binding; src/bin/monitor/push_templates.rs::dispatch_post_session_review; src/bin/monitor/push_templates.rs::dispatch_r12_backtest_outcome_with_runner; src/bin/monitor/push_templates.rs::dispatch_r13_counted_delivery; src/bin/monitor/push_templates.rs::dispatch_r13_watchlist_tracking_outcome; src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable; src/bin/monitor/review_batch.rs::ReviewRunContext; src/bin/monitor/review_batch.rs::ReviewScheduleState; src/bin/monitor/review_batch.rs::review_preflight; src/bin/monitor/review_batch.rs::review_task_identity; src/durable_delivery/coordinator.rs::inspect_business_date_once_claim; src/durable_delivery/coordinator.rs::inspect_review_task_occurrence; src/durable_delivery/model.rs::DeliveryEnvelope; src/durable_delivery/model.rs::compiled_policy_catalog; src/review/watchlist_tracking.rs::check_watchlist_today | R13三入口共原日claim；历史数据受latest两根K限制，Delivered后save_outcomes失败仅warn，重入不补保存。 |
+| WeeklySOP | INACTIVE |  |  | src/bin/monitor/notify.rs::PushKind; src/bin/monitor/v14_adapter.rs::map_push_kind | enum/label/adapter及fixture命中，无业务dispatch。 |
+
+## enum 外生产路径
+
+- chain-post-close-timer：QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。；enum外timer，不拥有ReviewTask identity/ReviewScheduleState。（Unit MU-chain-post-close）
+- chain-preopen-timer：QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。；enum外timer，不拥有ReviewTask identity/ReviewScheduleState。（Unit MU-chain-preopen）
+- cli-chain：QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。；enum外chain，不是IndustryChain R03或IndustryChainIntraday I03。（Unit MU-cli-chain）
+- cli-single-default：QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。；enum外 producer：没有 PushKind，不能把实际发送入口增加到65-kind enum。（Unit MU-cli-single）
+- cli-single-lhb：QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。；enum外 producer：没有 PushKind，不能把实际发送入口增加到65-kind enum。（Unit MU-cli-single）
+- cli-single-schedule：QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。；enum外 producer：没有 PushKind，不能把实际发送入口增加到65-kind enum。（Unit MU-cli-single）
+- cli-summary-default：QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。；enum外 producer：复用single/summary上游但通知形态独立，非PushKind。（Unit MU-cli-summary）
+- cli-summary-lhb：QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。；enum外 producer：复用single/summary上游但通知形态独立，非PushKind。（Unit MU-cli-summary）
+- cli-summary-schedule：QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。；enum外 producer：复用single/summary上游但通知形态独立，非PushKind。（Unit MU-cli-summary）
+
+## producer 与完成边界
+
+### account-frozen-side
+
+时段：盘前、盘中、盘后；occurrence：new noninitial account transition to Frozen；Unit：MU-frozen-side。
+
+completion owner：L4(market_action_alert,FROZEN,空 sub_kind)；触发资格来自 account_mode_log 新建事实，无副推持久确认列。
+
+触发：仅新建、非首次建立且新模式 Frozen；不论主消息结果也可尝试副推，pending 主重试不再是 new transition。 证据：src/bin/monitor/push_templates.rs::push_account_mode_change。
+
+输入：normalized frozen:{prev}:{new}，code=FROZEN，trigger reason 来自账户评估。 证据：src/bin/monitor/push_templates.rs::push_account_mode_change。
+
+权威事实：MarketActionAlert generic presented 路径；不是 source-fact route，不拥有主 log.pushed。 证据：src/bin/monitor/v17_sources.rs::push_normalized_event；src/bin/monitor/push_templates.rs::finalize_account_mode_delivery。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 副推 bool 丢弃，失败不补；实际 key 保留 FROZEN。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/push_templates.rs::push_account_mode_change；src/bin/monitor/v17_sources.rs::push_normalized_event。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### account-mode-main
+
+时段：盘前、盘中、盘后；occurrence：persisted account mode log_id / transition；Unit：MU-account-mode。
+
+completion owner：account_mode_log[log_id].pushed（同模式未确认复用 log_id）。
+
+触发：服务启动/周期及 ≥08:30 reset 补偿评估；reset BR021_LAST_RUN 仅 hook true 封日。 证据：src/bin/monitor/main.rs::main；src/bin/monitor/main.rs::monitor_loop；src/bin/monitor/main.rs::evaluate_account_mode_hook。
+
+输入：真实账户 metrics、持久 latest row/prev 和 mode evaluation，首次建立也审计。 证据：src/bin/monitor/main.rs::evaluate_account_mode_hook；src/bin/monitor/push_templates.rs::push_account_mode_change。
+
+权威事实：同模式 pushed=0 复用 pending log_id，变更 insert 新 row；NoChange 仅无发送 no-op。 证据：src/bin/monitor/push_templates.rs::plan_account_mode_notification；src/bin/monitor/push_templates.rs::push_account_mode_change。
+
+策略：T-01/generic；先 insert 后发送，仅主 Pushed 调 confirm，mark 失败 Err；主通知结果不证明 Frozen 副消息。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/push_templates.rs::dispatch_outcome；src/bin/monitor/push_templates.rs::record_uncounted_cooldown；src/bin/monitor/push_templates.rs::finalize_account_mode_delivery；src/bin/monitor/push_templates.rs::push_account_mode_change。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### analyst-upgrade
+
+时段：盘后；occurrence：code/broker/report_id source fact；Unit：MU-analyst。
+
+completion owner：L4(analyst_upgrade,source_fact_event_id(analyst:{code}:{broker}:{report_id}),空 sub_kind)。
+
+触发：HoldingEarnings outer tick 的独立 analyst poll，盘后窗口且有 our_codes。 证据：src/bin/monitor/main.rs::news_monitor_loop；src/bin/monitor/v17_sources.rs::poll_earnings_and_analyst。
+
+输入：consensus recent_reports 的 broker/rating/publish_date，报告 title 为 report_id proxy。 证据：src/bin/monitor/v17_sources.rs::poll_earnings_and_analyst；src/bin/monitor/v17_sources.rs::analyst_upgrade_event。
+
+权威事实：observe 相同 code/broker 历史评级后辨认 Upgrade；先更新 map 再返回，重复 report/date 拒绝；来源校验不等于推送接收。 证据：src/news/aggregator/analyst_state.rs::observe；src/bin/monitor/v17_sources.rs::analyst_upgrade_event。
+
+策略：source-fact governance/L4；source fetch 成功先推进 analyst timer，再集中发送，失败不回滚 rating 或 timer。 证据：src/bin/monitor/v17_sources.rs::poll_earnings_and_analyst；src/bin/monitor/notify.rs::push_presented_source_fact_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_source_fact；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。；先更新评级可让发送失败后的相同 report 变成 Duplicate，缺通知恢复。
+
+### attribution-daily
+
+时段：盘后；occurrence：calendar date / AttributionDaily batch；Unit：MU-attribution-daily。
+
+completion owner：monitor_loop::ATTRIBUTION_LAST_RUN[calendar_date]。
+
+触发：intraday_loop 的15:05–15:20独立日期门。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+输入：epoch daily/window、当日收盘价，经计算/完整性校验先 persist 再保存 Markdown；分析/存储失败不封。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+权威事实：计算/LLM/账本及报告仅是业务来源和分析产物，不是发送接受证据。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+策略：generic governance；此 kind 的 cooldown_secs=None，dedup_cooldown 不增加 fallback；L4 直接放行且 commit 直接返回。取得 text 后任何 push outcome 都封日。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/main.rs::monitor_loop。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### auction-repush
+
+时段：集合竞价；occurrence：auction session / top5 current candidate batch；Unit：MU-auction-candidates。
+
+completion owner：monitor_loop.post_close_candidates_notified[session]；candidate_board_snapshot[{date}].jsonl 最末 code 集（双层非原子推进链）。
+
+触发：09:20–09:25 且 post_close_candidates_notified=false，与 CandidateBoard 同 tick；双 dispatcher 均 true 才封外门。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+输入：load_real_candidate_batch，合法价格/heat 排 top5；空批/全无正价 false。 证据：src/bin/monitor/push_templates.rs::load_real_candidate_batch；src/bin/monitor/push_templates.rs::dispatch_auction_repush。
+
+权威事实：真实候选事实和 A-02 token；不把主卡或失效子推的结果当本消息 receipt。 证据：src/bin/monitor/push_templates.rs::dispatch_auction_repush。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 AuctionRepush 空 code 冷却独立；一项失败重跑两项，已成功项可能因冷却返回非 Pushed，使双 true 外门仍不封。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/push_templates.rs::dispatch_outcome；src/bin/monitor/push_templates.rs::record_uncounted_cooldown；src/bin/monitor/push_templates.rs::dispatch_auction_repush；src/bin/monitor/main.rs::monitor_loop。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### auction-volume
+
+时段：集合竞价；occurrence：auction session / not-yet-notified top10 code set；Unit：MU-auction-volume。
+
+completion owner：monitor_loop.auction_vol_notified[session,code]；独立 L4(auction_volume,空 code,空 sub_kind)。
+
+触发：Auction session 且 t≥09:20，每约 30s 从涨停池量比排序取尚未通知 top10。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+输入：外层涨停池 new_items；dispatcher 独立加载真实竞价 snapshot，并检查有限正价格/量比。 证据：src/bin/monitor/push_templates.rs::load_auction_volume_snapshot_real；src/bin/monitor/push_templates.rs::dispatch_auction_volume_daily。
+
+权威事实：真实 snapshot、banner、T-11 token；只有 dispatcher true 才把外层 new_items 写 set。 证据：src/bin/monitor/push_templates.rs::dispatch_auction_volume_daily；src/bin/monitor/main.rs::monitor_loop。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 发送后 recorder 错误可让函数 false，空外层候选不调用。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/push_templates.rs::dispatch_outcome；src/bin/monitor/push_templates.rs::record_uncounted_cooldown；src/bin/monitor/push_templates.rs::dispatch_auction_volume_daily。
+
+已知缺口：QS01：AuctionVolume 外层 new_items 与 dispatcher 再加载 snapshot.items 没有同批 identity 绑定；true 不证明两个股票集合相等。；QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### block-confirm-side-route
+
+时段：盘后；occurrence：block trade record / per-code rolling cooldown；Unit：MU-block-confirm。
+
+completion owner：COOLDOWN_TABLE(BlockTradeIntradayConfirm,code)；L4(block_trade_intraday_confirm,code,空 sub_kind)。
+
+触发：生产复盘batch side route，包括无claim单task历史补推；portfolio+STOCK_LIST非空才进入；测试环境在loader前拒绝。 证据：src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/main.rs::backfill_one_review_task。
+
+输入：BlockTradesGateway.market_review(codes,d)；300/301/688票，Agreed、正价、正整百量、Gem/Star、real_time_confirm。 证据：src/bin/monitor/push_templates.rs::dispatch_block_trade_review；src/bin/monitor/push_templates.rs::dispatch_block_trade_intraday_confirm。
+
+权威事实：真实大宗条目及BR-033条件；side结果不进入batch.tasks，不借ReviewScheduleState完成。 证据：src/bin/monitor/push_templates.rs::dispatch_block_trade_review；src/bin/monitor/push_templates.rs::dispatch_block_trade_intraday_confirm；src/bin/monitor/push_templates.rs::dispatch_post_session_review。
+
+策略：两层300s/code冷却；provider Err/VerifiedEmpty/不匹配→0；单票false不阻后票，只true累加，无批次封日，失败不写成功冷却。实际L4 kind为block_trade_intraday_confirm。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/push_templates.rs::dispatch_outcome；src/bin/monitor/push_templates.rs::record_uncounted_cooldown；src/bin/monitor/v14_adapter.rs::map_push_kind；src/bin/monitor/push_templates.rs::dispatch_block_trade_intraday_confirm。
+
+已知缺口：QR05：block-confirm 缺真实交易记录 identity/历史业务日的逐条确认；IPO 缺 date+announcement/stage occurrence 与 receipt，目前两层时间冷却不能回答这些问题。；QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### candidate-board
+
+时段：集合竞价；occurrence：candidate-board date / nonempty candidate batch；Unit：MU-auction-candidates。
+
+completion owner：monitor_loop.post_close_candidates_notified[session]；candidate_board_snapshot[{date}].jsonl 最末 code 集（双层非原子推进链）。
+
+触发：同 auction 外门的第二 dispatcher；双 true 才完成 session 外门。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+输入：真实候选 batch 与日期快照上一行 code 集；读取/解析失败视 None，空 batch 提前 false，不做空集失效 diff。 证据：src/bin/monitor/push_templates.rs::load_real_candidate_batch；src/bin/monitor/push_templates.rs::dispatch_candidate_board；src/bin/monitor/push_templates.rs::candidate_snapshot_previous。
+
+权威事实：主卡候选事实、P-05 token；先失效子推、保存 strong 样本与快照，再发主卡，业务保存不能确认通知。 证据：src/bin/monitor/push_templates.rs::dispatch_candidate_board；src/bin/monitor/push_templates.rs::candidate_snapshot_persist。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 CandidateBoard/空 code 冷却；快照写错被丢弃，主卡失败不回滚快照。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/push_templates.rs::dispatch_outcome；src/bin/monitor/push_templates.rs::record_uncounted_cooldown；src/bin/monitor/push_templates.rs::dispatch_candidate_board。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。；外层双 bool 和快照不是事务；子差分可能在失败后丢失。
+
+### candidate-invalidated
+
+时段：集合竞价；occurrence：candidate-board date / previous−current code；Unit：MU-auction-candidates。
+
+completion owner：monitor_loop.post_close_candidates_notified[session]；candidate_board_snapshot[{date}].jsonl 最末 code 集（双层非原子推进链）。
+
+触发：CandidateBoard 非空 batch 的 previous−current 每票调用；没有独立 timer。 证据：src/bin/monitor/push_templates.rs::dispatch_candidate_board。
+
+输入：同日期快照末行与当前 code set 的差分；当前全空时主 dispatcher 直接跳过。 证据：src/bin/monitor/push_templates.rs::dispatch_candidate_board；src/bin/monitor/push_templates.rs::candidate_snapshot_previous。
+
+权威事实：失效事实来自集合差分，T-08 token；每票 bool 被调用者丢弃。 证据：src/bin/monitor/push_templates.rs::push_candidate_invalidated；src/bin/monitor/push_templates.rs::dispatch_candidate_board。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 CandidateInvalidated/code 的独立冷却；不影响主卡/外门判断，随后 persist 删除该 code 可让下一 tick 无差分。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/push_templates.rs::dispatch_outcome；src/bin/monitor/push_templates.rs::record_uncounted_cooldown；src/bin/monitor/push_templates.rs::dispatch_candidate_board；src/bin/monitor/push_templates.rs::candidate_snapshot_persist。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### catalyst-announcement
+
+时段：盘中；occurrence：latest board_rotations/chain_clusters / 空 code 冷却；Unit：MU-news-catalyst。
+
+completion owner：L4(news_catalyst,空 code,空 sub_kind)；模板 COOLDOWN_TABLE(NewsCatalyst,空 code)。
+
+触发：重要公告 normalized Pushed 且 SignalStateMachine 产生 Important alert 后调用。 证据：src/bin/monitor/main.rs::news_monitor_loop。
+
+输入：重新读取真实 board_rotations/chain_clusters 快照，校验数值；可选 LLM 板块映射失败可降级。 证据：src/bin/monitor/push_templates.rs::load_news_catalyst_snapshot_real；src/bin/monitor/push_templates.rs::dispatch_news_catalyst_daily。
+
+权威事实：banner 和真实来源校验后 acquire presentation token；触发时间/标题不授予载荷 lineage 或发送 receipt authority。 证据：src/bin/monitor/push_templates.rs::dispatch_news_catalyst_daily；src/bin/monitor/push_templates.rs::push_news_catalyst。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 无独立完成游标；空/坏 source 或 send false 不形成成功。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/push_templates.rs::dispatch_outcome；src/bin/monitor/push_templates.rs::record_uncounted_cooldown；src/bin/monitor/push_templates.rs::dispatch_news_catalyst_daily；src/bin/monitor/push_templates.rs::push_news_catalyst。
+
+已知缺口：QN02：触发公告与重新读取的候选台/board rotation/cluster 未建立可验证 batch/event/payload lineage join；上游 seen/signal 已推进。；QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### catalyst-manual
+
+时段：盘中；occurrence：latest board_rotations/chain_clusters / 空 code 冷却；Unit：MU-news-catalyst。
+
+completion owner：L4(news_catalyst,空 code,空 sub_kind)；模板 COOLDOWN_TABLE(NewsCatalyst,空 code)。
+
+触发：--push Intraday 已接线，但新进程在 current_banner()? 处 Err，health/banner 只在互斥 service 分支初始化，未到达 dispatcher。kind 因其他入口仍 ACTIVE。 证据：src/bin/monitor/main.rs::run_daily_pushes；src/bin/monitor/main.rs::current_banner；src/bin/monitor/main.rs::main。
+
+输入：重新读取真实 board_rotations/chain_clusters 快照，校验数值；可选 LLM 板块映射失败可降级。 证据：src/bin/monitor/push_templates.rs::load_news_catalyst_snapshot_real；src/bin/monitor/push_templates.rs::dispatch_news_catalyst_daily。
+
+权威事实：banner 和真实来源校验后 acquire presentation token；触发时间/标题不授予载荷 lineage 或发送 receipt authority。 证据：src/bin/monitor/push_templates.rs::dispatch_news_catalyst_daily；src/bin/monitor/push_templates.rs::push_news_catalyst。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 无独立完成游标；空/坏 source 或 send false 不形成成功。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/push_templates.rs::dispatch_outcome；src/bin/monitor/push_templates.rs::record_uncounted_cooldown；src/bin/monitor/push_templates.rs::dispatch_news_catalyst_daily；src/bin/monitor/push_templates.rs::push_news_catalyst。
+
+已知缺口：QN02：触发公告与重新读取的候选台/board rotation/cluster 未建立可验证 batch/event/payload lineage join；上游 seen/signal 已推进。；QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### chain-post-close-timer
+
+时段：盘后；occurrence：calendar date / 15:30≤t&lt;15:35 / latest completed business date；Unit：MU-chain-post-close。
+
+completion owner：monitor_loop::CHAIN_POST_LAST[calendar_date]。
+
+触发：intraday_loop仅检查15:30≤t&lt;15:35，没有market_loop交易日guard，周末/节假日也可能运行；send_notify固定true。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+输入：同chain loader：latest completed业务日涨停池+最新快讯，跨calendar日可复用此前业务日。 证据：src/app/modes.rs::run_chain_analysis_mode。
+
+权威事实：仅run_chain_analysis_mode返回Ok才写CHAIN_POST_LAST；source/analysis/save Err不封，窗口外无补偿。 证据：src/bin/monitor/main.rs::monitor_loop；src/app/modes.rs::run_chain_analysis_mode。
+
+策略：send false/Err被chain函数吞入Ok，所以仍封calendar日；重启丢内存门，同业务日可跨calendar日再发，business_date+HHMM报告名可能覆盖。 证据：src/bin/monitor/main.rs::monitor_loop；src/app/modes.rs::run_chain_analysis_mode；src/notification/service.rs::send。
+
+已知缺口：QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。；enum外timer，不拥有ReviewTask identity/ReviewScheduleState。
+
+### chain-preopen-timer
+
+时段：盘前；occurrence：calendar date / 09:05≤t&lt;09:15 / latest completed business date；Unit：MU-chain-preopen。
+
+completion owner：monitor_loop::CHAIN_PREOPEN_LAST[calendar_date]。
+
+触发：intraday_loop仅检查09:05≤t&lt;09:15，没有market_loop交易日guard，周末/节假日也可能运行；send_notify固定true。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+输入：同chain loader：latest completed业务日涨停池+最新快讯，跨calendar日可复用此前业务日。 证据：src/app/modes.rs::run_chain_analysis_mode。
+
+权威事实：仅run_chain_analysis_mode返回Ok才写CHAIN_PREOPEN_LAST；source/analysis/save Err不封，窗口外无补偿。 证据：src/bin/monitor/main.rs::monitor_loop；src/app/modes.rs::run_chain_analysis_mode。
+
+策略：send false/Err被chain函数吞入Ok，所以仍封calendar日；重启丢内存门，同业务日可跨calendar日再发，business_date+HHMM报告名可能覆盖。 证据：src/bin/monitor/main.rs::monitor_loop；src/app/modes.rs::run_chain_analysis_mode；src/notification/service.rs::send。
+
+已知缺口：QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。；enum外timer，不拥有ReviewTask identity/ReviewScheduleState。
+
+### cli-chain
+
+时段：盘前、集合竞价、盘中、盘后；occurrence：CLI invocation / latest completed business date；Unit：MU-cli-chain。
+
+completion owner：run_chain_analysis_mode(invocation) 的 Result&lt;()&gt;；无独立持久通知 cursor。
+
+触发：src/main --chain-analysis 进入run_chain_analysis_mode，--no-notify控制send_notify。 证据：src/main.rs::main；src/app/modes.rs::run_chain_analysis_mode。
+
+输入：latest_completed_trading_day_at、该日涨停池+最新财联社快讯→chain analysis，新闻错误可降级无背景。 证据：src/app/modes.rs::run_chain_analysis_mode。
+
+权威事实：分析报告先保存chain_analysis_businessdate_HHMM.md，再send；source/analysis/save Err传播，文件/函数Ok不是接收。 证据：src/app/modes.rs::run_chain_analysis_mode。
+
+策略：send false/Err只warn仍Ok；bool仅至少一个channel成功，无durable通知cursor，同分钟重跑可覆盖报告。 证据：src/app/modes.rs::run_chain_analysis_mode；src/notification/service.rs::send。
+
+已知缺口：QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。；enum外chain，不是IndustryChain R03或IndustryChainIntraday I03。
+
+### cli-single-default
+
+时段：盘前、集合竞价、盘中、盘后；occurrence：pipeline invocation / code / single_notify；Unit：MU-cli-single。
+
+completion owner：AnalysisPipeline::process_stock_inner(invocation,code) 的 Option&lt;AnalysisResult&gt;；无持久通知 completion cursor。
+
+触发：src/main CLI default→run_analysis→pipeline.run；deep_analysis分支仅run_and_save，排除发送。 single_notify &amp;&amp; send_notification，非dry_run才发。 证据：src/main.rs::main；src/app/modes.rs::run_analysis；src/pipeline/mod.rs::AnalysisPipeline；src/pipeline/analyze.rs::process_stock_inner。
+
+输入：真实行情/分析和可选持仓跟踪；空数据、分析/持仓跟踪/保存失败返回None，不发。 证据：src/pipeline/analyze.rs::process_stock_inner。
+
+权威事实：先 save_analysis_result，再 notifier.send；该分析库记录是业务事实，不是推送receipt。 证据：src/pipeline/analyze.rs::process_stock_inner；src/notification/service.rs::send。
+
+策略：--no-notify关闭；send Ok(false)也进入“成功”日志，Err仍最终Some(result)；NotificationService只返回至少一个渠道成功的bool，无durable ack。 证据：src/pipeline/analyze.rs::process_stock_inner；src/notification/service.rs::send。
+
+已知缺口：QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。；enum外 producer：没有 PushKind，不能把实际发送入口增加到65-kind enum。
+
+### cli-single-lhb
+
+时段：盘前、集合竞价、盘中、盘后；occurrence：pipeline invocation / code / single_notify；Unit：MU-cli-single。
+
+completion owner：AnalysisPipeline::process_stock_inner(invocation,code) 的 Option&lt;AnalysisResult&gt;；无持久通知 completion cursor。
+
+触发：CLI LHB指定/latest completed日期→DragonTigerGateway披露评分筛选→剔除92开头→pipeline.run；VerifiedEmpty/筛后空则Ok无发送；不走R04 counted。 single_notify &amp;&amp; send_notification，非dry_run才发。 证据：src/main.rs::main；src/app/modes.rs::run_lhb_analysis；src/pipeline/mod.rs::AnalysisPipeline；src/pipeline/analyze.rs::process_stock_inner。
+
+输入：真实行情/分析和可选持仓跟踪；空数据、分析/持仓跟踪/保存失败返回None，不发。 证据：src/pipeline/analyze.rs::process_stock_inner。
+
+权威事实：先 save_analysis_result，再 notifier.send；该分析库记录是业务事实，不是推送receipt。 证据：src/pipeline/analyze.rs::process_stock_inner；src/notification/service.rs::send。
+
+策略：--no-notify关闭；send Ok(false)也进入“成功”日志，Err仍最终Some(result)；NotificationService只返回至少一个渠道成功的bool，无durable ack。 证据：src/pipeline/analyze.rs::process_stock_inner；src/notification/service.rs::send。
+
+已知缺口：QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。；enum外 producer：没有 PushKind，不能把实际发送入口增加到65-kind enum。
+
+### cli-single-schedule
+
+时段：盘前、集合竞价、盘中、盘后；occurrence：pipeline invocation / code / single_notify；Unit：MU-cli-single。
+
+completion owner：AnalysisPipeline::process_stock_inner(invocation,code) 的 Option&lt;AnalysisResult&gt;；无持久通知 completion cursor。
+
+触发：CLI schedule 的 interval或clock/weekday/run_now→execute_once→execute_analysis 每次新建pipeline；计数/下次时点随loop推进，analysis Err只log。market_review_only分支只保存，排除发送。 single_notify &amp;&amp; send_notification，非dry_run才发。 证据：src/main.rs::main；src/app/schedule.rs::run_scheduled_analysis；src/app/schedule.rs::execute_analysis；src/app/modes.rs::run_market_review_only；src/pipeline/mod.rs::AnalysisPipeline；src/pipeline/analyze.rs::process_stock_inner。
+
+输入：真实行情/分析和可选持仓跟踪；空数据、分析/持仓跟踪/保存失败返回None，不发。 证据：src/pipeline/analyze.rs::process_stock_inner。
+
+权威事实：先 save_analysis_result，再 notifier.send；该分析库记录是业务事实，不是推送receipt。 证据：src/pipeline/analyze.rs::process_stock_inner；src/notification/service.rs::send。
+
+策略：--no-notify关闭；send Ok(false)也进入“成功”日志，Err仍最终Some(result)；NotificationService只返回至少一个渠道成功的bool，无durable ack。 证据：src/pipeline/analyze.rs::process_stock_inner；src/notification/service.rs::send。
+
+已知缺口：QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。；enum外 producer：没有 PushKind，不能把实际发送入口增加到65-kind enum。
+
+### cli-summary-default
+
+时段：盘前、集合竞价、盘中、盘后；occurrence：pipeline invocation / nonempty results / summary；Unit：MU-cli-summary。
+
+completion owner：AnalysisPipeline::run(invocation) 的 results / send_summary_notification_to 返回值；无持久通知 completion cursor。
+
+触发：src/main CLI default→run_analysis→pipeline.run；deep_analysis分支仅run_and_save，排除发送。 !single_notify &amp;&amp; send_notification &amp;&amp; !dry_run &amp;&amp; results非空。 证据：src/main.rs::main；src/app/modes.rs::run_analysis；src/pipeline/mod.rs::AnalysisPipeline。
+
+输入：同一pipeline结果集，可并入chain/market-regime段；图失败可继续，强制Markdown/backtest文件保存Err传播。 证据：src/pipeline/mod.rs::send_live_summary；src/pipeline/summary_notify.rs::send_summary_notification_to。
+
+权威事实：reports/stock_analysis_YYYYMMDD.md及图、回测文件仅分析产物；同日多次可覆盖，不建立通知claim。 证据：src/pipeline/summary_notify.rs::send_summary_notification_to。
+
+策略：send false按Ok，Err仅log，函数最终Ok→pipeline返回results；NotificationService success_count&gt;0并非要求渠道全部TransportAccepted。 证据：src/pipeline/summary_notify.rs::send_summary_notification_to；src/notification/service.rs::send；src/pipeline/mod.rs::AnalysisPipeline。
+
+已知缺口：QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。；enum外 producer：复用single/summary上游但通知形态独立，非PushKind。
+
+### cli-summary-lhb
+
+时段：盘前、集合竞价、盘中、盘后；occurrence：pipeline invocation / nonempty results / summary；Unit：MU-cli-summary。
+
+completion owner：AnalysisPipeline::run(invocation) 的 results / send_summary_notification_to 返回值；无持久通知 completion cursor。
+
+触发：CLI LHB指定/latest completed日期→DragonTigerGateway披露评分筛选→剔除92开头→pipeline.run；VerifiedEmpty/筛后空则Ok无发送；不走R04 counted。 !single_notify &amp;&amp; send_notification &amp;&amp; !dry_run &amp;&amp; results非空。 证据：src/main.rs::main；src/app/modes.rs::run_lhb_analysis；src/pipeline/mod.rs::AnalysisPipeline。
+
+输入：同一pipeline结果集，可并入chain/market-regime段；图失败可继续，强制Markdown/backtest文件保存Err传播。 证据：src/pipeline/mod.rs::send_live_summary；src/pipeline/summary_notify.rs::send_summary_notification_to。
+
+权威事实：reports/stock_analysis_YYYYMMDD.md及图、回测文件仅分析产物；同日多次可覆盖，不建立通知claim。 证据：src/pipeline/summary_notify.rs::send_summary_notification_to。
+
+策略：send false按Ok，Err仅log，函数最终Ok→pipeline返回results；NotificationService success_count&gt;0并非要求渠道全部TransportAccepted。 证据：src/pipeline/summary_notify.rs::send_summary_notification_to；src/notification/service.rs::send；src/pipeline/mod.rs::AnalysisPipeline。
+
+已知缺口：QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。；enum外 producer：复用single/summary上游但通知形态独立，非PushKind。
+
+### cli-summary-schedule
+
+时段：盘前、集合竞价、盘中、盘后；occurrence：pipeline invocation / nonempty results / summary；Unit：MU-cli-summary。
+
+completion owner：AnalysisPipeline::run(invocation) 的 results / send_summary_notification_to 返回值；无持久通知 completion cursor。
+
+触发：CLI schedule 的 interval或clock/weekday/run_now→execute_once→execute_analysis 每次新建pipeline；计数/下次时点随loop推进，analysis Err只log。market_review_only分支只保存，排除发送。 !single_notify &amp;&amp; send_notification &amp;&amp; !dry_run &amp;&amp; results非空。 证据：src/main.rs::main；src/app/schedule.rs::run_scheduled_analysis；src/app/schedule.rs::execute_analysis；src/app/modes.rs::run_market_review_only；src/pipeline/mod.rs::AnalysisPipeline。
+
+输入：同一pipeline结果集，可并入chain/market-regime段；图失败可继续，强制Markdown/backtest文件保存Err传播。 证据：src/pipeline/mod.rs::send_live_summary；src/pipeline/summary_notify.rs::send_summary_notification_to。
+
+权威事实：reports/stock_analysis_YYYYMMDD.md及图、回测文件仅分析产物；同日多次可覆盖，不建立通知claim。 证据：src/pipeline/summary_notify.rs::send_summary_notification_to。
+
+策略：send false按Ok，Err仅log，函数最终Ok→pipeline返回results；NotificationService success_count&gt;0并非要求渠道全部TransportAccepted。 证据：src/pipeline/summary_notify.rs::send_summary_notification_to；src/notification/service.rs::send；src/pipeline/mod.rs::AnalysisPipeline。
+
+已知缺口：QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。；enum外 producer：复用single/summary上游但通知形态独立，非PushKind。
+
+### close-call
+
+时段：盘中；occurrence：close-call:{date}:{code}；Unit：MU-close-call。
+
+completion owner：counted decision(CloseCall,Ticket,close-call:{date}:{code},source fingerprint,subject,policy,rendered hash)。
+
+触发：market 分支 t≥14:55 且 close_call_pushed=false；源码仅有时间下界。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+输入：确认持仓快照+行情/成本；收益≤−3% 票，缺价/非法成本/未跳水 skip。 证据：src/bin/monitor/main.rs::prepare_close_call_messages。
+
+权威事实：T-12 token、InternalDurable/Ticket source binding；canonical 含本次观测时间。 证据：src/bin/monitor/main.rs::prepare_close_call_messages。
+
+策略：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 Rolling/86400s；全 Pushed/Deduped（包括零条）封 bool，source/投递失败保留。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/main.rs::monitor_loop。
+
+已知缺口：QS02：含每次 now 的 canonical 可使相同可读 occurrence 产生不同 decision；日表、rolling 冷却和 immutable-envelope 恢复的冲突/重复边界尚缺离线合同核验。；QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### d01-announcement
+
+时段：盘中；occurrence：code:name / 1h memo；载荷候选与空 code 通知键分离；Unit：MU-d01。
+
+completion owner：D01_LAST_PUSH[code:name]；COOLDOWN_TABLE(NewsToIdea,空 code)；L4 无冷却（PerTicket 缺 code）。
+
+触发：重要公告 normalized Pushed 且 SignalStateMachine 产生 Important alert 后调用。 证据：src/bin/monitor/main.rs::news_monitor_loop。
+
+输入：重新加载真实候选台 top、行情和现有 evidence；可选 LLM reasons 失败降级，不直接传触发公告。 证据：src/bin/monitor/push_templates.rs::load_news_to_idea_snapshot_real；src/bin/monitor/push_templates.rs::dispatch_news_to_idea_daily。
+
+权威事实：banner 和真实来源校验后 acquire presentation token；触发时间/标题不授予载荷 lineage 或发送 receipt authority。 证据：src/bin/monitor/push_templates.rs::dispatch_news_to_idea_daily；src/bin/monitor/push_templates.rs::push_news_to_idea。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 D01 实际空 code 规范化为 None，NewsToIdea 的 PerTicket 缺 code 令 dedup_cooldown=None，所以 L4 不读写冷却；模板 COOLDOWN_TABLE(NewsToIdea,空 code) 仍有1200s冷却。memo 1h 仅 send 成功且所需 BuyDip virtual buy 成功后 insert；virtual buy 失败可能已发送却返回 false。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/push_templates.rs::dispatch_outcome；src/bin/monitor/push_templates.rs::record_uncounted_cooldown；src/bin/monitor/push_templates.rs::dispatch_news_to_idea_daily；src/bin/monitor/push_templates.rs::push_news_to_idea。
+
+已知缺口：QN02：触发公告与重新读取的候选台/board rotation/cluster 未建立可验证 batch/event/payload lineage join；上游 seen/signal 已推进。；QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### d01-manual
+
+时段：盘中；occurrence：code:name / 1h memo；载荷候选与空 code 通知键分离；Unit：MU-d01。
+
+completion owner：D01_LAST_PUSH[code:name]；COOLDOWN_TABLE(NewsToIdea,空 code)；L4 无冷却（PerTicket 缺 code）。
+
+触发：--push Intraday 已接线，但新进程在 current_banner()? 处 Err，health/banner 只在互斥 service 分支初始化，未到达 dispatcher。kind 因其他入口仍 ACTIVE。 证据：src/bin/monitor/main.rs::run_daily_pushes；src/bin/monitor/main.rs::current_banner；src/bin/monitor/main.rs::main。
+
+输入：重新加载真实候选台 top、行情和现有 evidence；可选 LLM reasons 失败降级，不直接传触发公告。 证据：src/bin/monitor/push_templates.rs::load_news_to_idea_snapshot_real；src/bin/monitor/push_templates.rs::dispatch_news_to_idea_daily。
+
+权威事实：banner 和真实来源校验后 acquire presentation token；触发时间/标题不授予载荷 lineage 或发送 receipt authority。 证据：src/bin/monitor/push_templates.rs::dispatch_news_to_idea_daily；src/bin/monitor/push_templates.rs::push_news_to_idea。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 D01 实际空 code 规范化为 None，NewsToIdea 的 PerTicket 缺 code 令 dedup_cooldown=None，所以 L4 不读写冷却；模板 COOLDOWN_TABLE(NewsToIdea,空 code) 仍有1200s冷却。memo 1h 仅 send 成功且所需 BuyDip virtual buy 成功后 insert；virtual buy 失败可能已发送却返回 false。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/push_templates.rs::dispatch_outcome；src/bin/monitor/push_templates.rs::record_uncounted_cooldown；src/bin/monitor/push_templates.rs::dispatch_news_to_idea_daily；src/bin/monitor/push_templates.rs::push_news_to_idea。
+
+已知缺口：QN02：触发公告与重新读取的候选台/board rotation/cluster 未建立可验证 batch/event/payload lineage join；上游 seen/signal 已推进。；QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### data-mode
+
+时段：盘前、盘中、盘后；occurrence：health mode transition / Unsafe missing fingerprint；Unit：MU-data-mode。
+
+completion owner：LATEST_DATA_MODE；DATA_MODE_PENDING_STABLE(mode,since)；DATA_MODE_UNSAFE_REMINDER(fingerprint,external_confirmed_at,heartbeat_at)。
+
+触发：服务启动/周期评估真实 health；模式变化或同 Unsafe missing fingerprint 变化可发，未变 Unsafe 可仅内部 heartbeat。 证据：src/bin/monitor/main.rs::main；src/bin/monitor/main.rs::evaluate_data_mode_hook。
+
+输入：current_data_health_input 的能力缺失/时效；banner 从真实 health 更新。 证据：src/bin/monitor/main.rs::evaluate_data_mode_hook；src/bin/monitor/push_templates.rs::push_data_mode_change。
+
+权威事实：EstablishedSilently 也 is_confirmed 并推进 LATEST；外部 reminder 只在 Delivery(Pushed) 更新，heartbeat 仅 publish 成功提交。 证据：src/bin/monitor/push_templates.rs::ModeDispatchResult；src/bin/monitor/main.rs::commit_data_mode_status_result；src/bin/monitor/main.rs::commit_due_unsafe_heartbeat；src/bin/monitor/main.rs::evaluate_data_mode_hook。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 →Unsafe 立即，其余转换 300s；Delivery 任意结果清 pending，非 Pushed 保留旧 LATEST，Err 早退。静默确认可能使后续不再识别 transition。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/push_templates.rs::data_mode_notification_plan；src/bin/monitor/main.rs::evaluate_data_mode_hook。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### earnings-beat
+
+时段：盘后；occurrence：EarningsBeat/code/report_date source fact；Unit：MU-earnings-beat。
+
+completion owner：L4(earnings_beat,source_fact_event_id(earnings:{code}:{report_date}),空 sub_kind)。
+
+触发：HoldingEarnings phase、盘后分析窗口、our_codes；每票 financials+consensus 取得后才检查 EARNINGS_BEAT_ENABLED=1。 证据：src/bin/monitor/main.rs::news_monitor_loop；src/bin/monitor/v17_sources.rs::poll_earnings_and_analyst；src/bin/monitor/v17_sources.rs::earnings_classification_gate。
+
+输入：financial/consensus evidence、NOTICE_DATE、最新 observed_at；根据 EPS 分类正向/负向阈值。 证据：src/bin/monitor/v17_sources.rs::poll_earnings_and_analyst；src/bin/monitor/v17_sources.rs::earnings_classification_to_event；src/news/aggregator/classifier.rs::classify_earnings。
+
+权威事实：validated source-fact evidence 与 event identity 绑定；当前比较合同不足，保持 OPT-IN，默认不分类。 证据：src/bin/monitor/v17_sources.rs::earnings_classification_to_event；src/bin/monitor/v17_sources.rs::earnings_classification_gate；src/bin/monitor/v17_sources.rs::push_normalized_event。
+
+策略：source-fact L4 保留 kind 区分；last_poll_earnings 在 source 成功后、send 前推进，即使 gate 关闭；发送失败不回滚轮询 timer。 证据：src/bin/monitor/v17_sources.rs::poll_earnings_and_analyst；src/bin/monitor/notify.rs::push_presented_source_fact_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_source_fact；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity。
+
+已知缺口：QN04：累计/单季/全年 EPS、报告期/预测年度和新鲜度缺少可拒绝错配的比较 authority；保持默认禁用的 OPT-IN。；QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### earnings-miss
+
+时段：盘后；occurrence：EarningsMiss/code/report_date source fact；Unit：MU-earnings-miss。
+
+completion owner：L4(earnings_miss,source_fact_event_id(earnings:{code}:{report_date}),空 sub_kind)。
+
+触发：HoldingEarnings phase、盘后分析窗口、our_codes；每票 financials+consensus 取得后才检查 EARNINGS_BEAT_ENABLED=1。 证据：src/bin/monitor/main.rs::news_monitor_loop；src/bin/monitor/v17_sources.rs::poll_earnings_and_analyst；src/bin/monitor/v17_sources.rs::earnings_classification_gate。
+
+输入：financial/consensus evidence、NOTICE_DATE、最新 observed_at；根据 EPS 分类正向/负向阈值。 证据：src/bin/monitor/v17_sources.rs::poll_earnings_and_analyst；src/bin/monitor/v17_sources.rs::earnings_classification_to_event；src/news/aggregator/classifier.rs::classify_earnings。
+
+权威事实：validated source-fact evidence 与 event identity 绑定；当前比较合同不足，保持 OPT-IN，默认不分类。 证据：src/bin/monitor/v17_sources.rs::earnings_classification_to_event；src/bin/monitor/v17_sources.rs::earnings_classification_gate；src/bin/monitor/v17_sources.rs::push_normalized_event。
+
+策略：source-fact L4 保留 kind 区分；last_poll_earnings 在 source 成功后、send 前推进，即使 gate 关闭；发送失败不回滚轮询 timer。 证据：src/bin/monitor/v17_sources.rs::poll_earnings_and_analyst；src/bin/monitor/notify.rs::push_presented_source_fact_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_source_fact；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity。
+
+已知缺口：QN04：累计/单季/全年 EPS、报告期/预测年度和新鲜度缺少可拒绝错配的比较 authority；保持默认禁用的 OPT-IN。；QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### g5b-attribution
+
+时段：盘后；occurrence：calendar date / G5bAttribution batch；Unit：MU-g5b-attribution。
+
+completion owner：monitor_loop::G5B_LAST_RUN[calendar_date]。
+
+触发：intraday_loop 的15:05–15:20独立日期门。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+输入：今日告警 top events → receipt-bearing LLM assessment → append row →摘要；LLM receipt 是分析来源。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+权威事实：计算/LLM/账本及报告仅是业务来源和分析产物，不是发送接受证据。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+策略：generic governance；此 kind 的 cooldown_secs=None，dedup_cooldown 不增加 fallback；L4 直接放行且 commit 直接返回。空 records 封日；无 provider continue 不封；每条分析/append 失败 continue，整批末仍封日，发送仅 log。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/main.rs::monitor_loop。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### holding-plan-manual
+
+时段：盘中；occurrence：holding-plan:{date}:{code}；Unit：MU-holding-plan。
+
+completion owner：counted decision(HoldingPlan,Ticket,holding-plan:{date}:{code},source fingerprint,subject,policy,rendered hash)。
+
+触发：--push Intraday 的 I-04 已接线，新 CLI 在 current_banner()? Err，未进入 prepare/send；本分支不查写 holding_plan_daily、不拥有 timer。 证据：src/bin/monitor/main.rs::run_daily_pushes；src/bin/monitor/main.rs::main；src/bin/monitor/main.rs::current_banner。
+
+输入：用户确认持仓快照+统一行情+成本收益，准备 Reduce/Add/Hold，缺价/非法成本逐票 skip。 证据：src/bin/monitor/main.rs::prepare_holding_plan_messages。
+
+权威事实：T-03 token、InternalDurable/Ticket binding，canonical 含 observed_at；业务日表不证明发送与写表原子。 证据：src/bin/monitor/main.rs::prepare_holding_plan_messages；src/bin/monitor/main.rs::holding_plan_daily_record。
+
+策略：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 Rolling/1800s；定时仅全 Pushed/Deduped（包括零条）推进 timer，确认票再记日表，写错只 log；manual 无日表且函数尾可 Ok。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/main.rs::monitor_loop；src/bin/monitor/main.rs::run_daily_pushes；src/bin/monitor/main.rs::holding_plan_daily_record。
+
+已知缺口：QS02：含每次 now 的 canonical 可使相同可读 occurrence 产生不同 decision；日表、rolling 冷却和 immutable-envelope 恢复的冲突/重复边界尚缺离线合同核验。；QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### holding-plan-periodic
+
+时段：盘中；occurrence：holding-plan:{date}:{code}；Unit：MU-holding-plan。
+
+completion owner：counted decision(HoldingPlan,Ticket,holding-plan:{date}:{code},source fingerprint,subject,policy,rendered hash)。
+
+触发：每 1800s 的 last_holding_plan；先查 holding_plan_daily(plan_date,code) 排除已记录票。 证据：src/bin/monitor/main.rs::monitor_loop；src/bin/monitor/main.rs::holding_plan_daily_pushed。
+
+输入：用户确认持仓快照+统一行情+成本收益，准备 Reduce/Add/Hold，缺价/非法成本逐票 skip。 证据：src/bin/monitor/main.rs::prepare_holding_plan_messages。
+
+权威事实：T-03 token、InternalDurable/Ticket binding，canonical 含 observed_at；业务日表不证明发送与写表原子。 证据：src/bin/monitor/main.rs::prepare_holding_plan_messages；src/bin/monitor/main.rs::holding_plan_daily_record。
+
+策略：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 Rolling/1800s；定时仅全 Pushed/Deduped（包括零条）推进 timer，确认票再记日表，写错只 log；manual 无日表且函数尾可 Ok。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/main.rs::monitor_loop；src/bin/monitor/main.rs::run_daily_pushes；src/bin/monitor/main.rs::holding_plan_daily_record。
+
+已知缺口：QS02：含每次 now 的 canonical 可使相同可读 occurrence 产生不同 decision；日表、rolling 冷却和 immutable-envelope 恢复的冲突/重复边界尚缺离线合同核验。；QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### industry-chain-manual
+
+时段：盘中；occurrence：I03 latest chain snapshot / 空 code 冷却；Unit：MU-industry-intraday。
+
+completion owner：L4(industry_chain_intraday,空 code,空 sub_kind)；COOLDOWN_TABLE(IndustryChainIntraday,空 code)。
+
+触发：--push I-03 新进程先遇 banner Err，未到 dispatcher；无 timer。 证据：src/bin/monitor/main.rs::run_daily_pushes；src/bin/monitor/main.rs::main；src/bin/monitor/main.rs::current_banner。
+
+输入：真实 chain snapshot，可选 LLM supplement trigger，LLM 失效用原 trigger，源缺失不伪造。 证据：src/bin/monitor/push_templates.rs::dispatch_industry_chain_intraday_daily_result。
+
+权威事实：banner/I-03 token 与真实快照数值；发送后 recorder 失败可使已发消息返回 Failed。 证据：src/bin/monitor/push_templates.rs::dispatch_industry_chain_intraday_daily_result。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 periodic 把 Empty/Deduped 视已确认，daily/manual wrapper 只 Pushed 为 true；两者共享相同空 code 冷却。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/push_templates.rs::dispatch_outcome；src/bin/monitor/push_templates.rs::record_uncounted_cooldown；src/bin/monitor/push_templates.rs::dispatch_industry_chain_intraday_daily；src/bin/monitor/push_templates.rs::dispatch_industry_chain_intraday_periodic；src/bin/monitor/push_templates.rs::dispatch_industry_chain_intraday_daily_result。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### industry-chain-periodic
+
+时段：盘中；occurrence：I03 latest chain snapshot / 空 code 冷却；Unit：MU-industry-intraday。
+
+completion owner：L4(industry_chain_intraday,空 code,空 sub_kind)；COOLDOWN_TABLE(IndustryChainIntraday,空 code)。
+
+触发：每 900s 调 periodic wrapper；Empty/Pushed/Deduped 才推进 last_industry_chain_intraday。 证据：src/bin/monitor/main.rs::monitor_loop；src/bin/monitor/push_templates.rs::dispatch_industry_chain_intraday_periodic。
+
+输入：真实 chain snapshot，可选 LLM supplement trigger，LLM 失效用原 trigger，源缺失不伪造。 证据：src/bin/monitor/push_templates.rs::dispatch_industry_chain_intraday_daily_result。
+
+权威事实：banner/I-03 token 与真实快照数值；发送后 recorder 失败可使已发消息返回 Failed。 证据：src/bin/monitor/push_templates.rs::dispatch_industry_chain_intraday_daily_result。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 periodic 把 Empty/Deduped 视已确认，daily/manual wrapper 只 Pushed 为 true；两者共享相同空 code 冷却。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/push_templates.rs::dispatch_outcome；src/bin/monitor/push_templates.rs::record_uncounted_cooldown；src/bin/monitor/push_templates.rs::dispatch_industry_chain_intraday_daily；src/bin/monitor/push_templates.rs::dispatch_industry_chain_intraday_periodic；src/bin/monitor/push_templates.rs::dispatch_industry_chain_intraday_daily_result。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### ipo-catalyst-side-route
+
+时段：盘后；occurrence：review date announcement/stage / empty-code rolling cooldown；Unit：MU-ipo-catalyst。
+
+completion owner：COOLDOWN_TABLE(IpoCatalyst,空 code)；L4(ipo_catalyst,空 code,空 sub_kind)。
+
+触发：复盘batch在registered tasks之后调用，生产无claim单task补推也会触发；不是独立ReviewTask。 证据：src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/main.rs::backfill_one_review_task。
+
+输入：CNInfo review-date公告，优先R08同date内存records；标题stage/keyword→公司名→供应链字典，未命中用TDX板块/成员+证券identity。 证据：src/bin/monitor/push_templates.rs::dispatch_ipo_catalyst。
+
+权威事实：来源/keyword与可验证公司映射；动态板块失败局部skip仍可出卡，缓存不提供receipt。 证据：src/bin/monitor/push_templates.rs::dispatch_ipo_catalyst。
+
+策略：A-11 generic，空code默认1800s模板+L4冷却；无公告/无hit/源错false，非Pushed=false，无日终态；历史不同日期会共享空code冷却。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/push_templates.rs::dispatch_outcome；src/bin/monitor/push_templates.rs::record_uncounted_cooldown；src/bin/monitor/push_templates.rs::dispatch_ipo_catalyst。
+
+已知缺口：QR05：block-confirm 缺真实交易记录 identity/历史业务日的逐条确认；IPO 缺 date+announcement/stage occurrence 与 receipt，目前两层时间冷却不能回答这些问题。；QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### limit-boards-first
+
+时段：盘中；occurrence：limit-up board session / 首板/level=1；Unit：MU-limit-boards。
+
+completion owner：monitor_loop.board_notified[session,code]；L4(limit_boards,空 code,空 sub_kind)。
+
+触发：涨停池/board_level_cache 形成 首板/level=1 lines；send 前先 board_notified.insert(code)。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+输入：真实涨停池字段与连板级数；缺 main_flow/volume_ratio 展示暂无，不把正文 code 视治理显式 identity。 证据：src/bin/monitor/main.rs::monitor_loop；src/bin/monitor/push_templates.rs::render_limit_boards_shape。
+
+权威事实：L-01 presentation token 与形态 renderer；治理参数 code=None、sub_kind=None。 证据：src/bin/monitor/main.rs::monitor_loop；src/bin/monitor/push_templates.rs::render_limit_boards_shape；src/bin/monitor/notify.rs::push_presented_v3。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 发送/renderer/token 失败不删除 code，结果被忽略；首板提交的全局冷却可能压住其他形态。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/main.rs::monitor_loop。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### limit-boards-second
+
+时段：盘中；occurrence：limit-up board session / 二板/level=2；Unit：MU-limit-boards。
+
+completion owner：monitor_loop.board_notified[session,code]；L4(limit_boards,空 code,空 sub_kind)。
+
+触发：涨停池/board_level_cache 形成 二板/level=2 lines；send 前先 board_notified.insert(code)。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+输入：真实涨停池字段与连板级数；缺 main_flow/volume_ratio 展示暂无，不把正文 code 视治理显式 identity。 证据：src/bin/monitor/main.rs::monitor_loop；src/bin/monitor/push_templates.rs::render_limit_boards_shape。
+
+权威事实：L-02 presentation token 与形态 renderer；治理参数 code=None、sub_kind=None。 证据：src/bin/monitor/main.rs::monitor_loop；src/bin/monitor/push_templates.rs::render_limit_boards_shape；src/bin/monitor/notify.rs::push_presented_v3。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 发送/renderer/token 失败不删除 code，结果被忽略；首板提交的全局冷却可能压住其他形态。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/main.rs::monitor_loop。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### limit-boards-third-plus
+
+时段：盘中；occurrence：limit-up board session / 三板及以上/level≥3；Unit：MU-limit-boards。
+
+completion owner：monitor_loop.board_notified[session,code]；L4(limit_boards,空 code,空 sub_kind)。
+
+触发：涨停池/board_level_cache 形成 三板及以上/level≥3 lines；send 前先 board_notified.insert(code)。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+输入：真实涨停池字段与连板级数；缺 main_flow/volume_ratio 展示暂无，不把正文 code 视治理显式 identity。 证据：src/bin/monitor/main.rs::monitor_loop；src/bin/monitor/push_templates.rs::render_limit_boards_shape。
+
+权威事实：L-03 presentation token 与形态 renderer；治理参数 code=None、sub_kind=None。 证据：src/bin/monitor/main.rs::monitor_loop；src/bin/monitor/push_templates.rs::render_limit_boards_shape；src/bin/monitor/notify.rs::push_presented_v3。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 发送/renderer/token 失败不删除 code，结果被忽略；首板提交的全局冷却可能压住其他形态。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/main.rs::monitor_loop。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### market-manual-i01
+
+时段：盘中；occurrence：I01 sector snapshot manual；Unit：MU-intraday-market。
+
+completion owner：L4(intraday_market,空 code,空 sub_kind)。
+
+触发：--push I01 新 CLI 在 banner Err 停止，未进入 source/send。 证据：src/bin/monitor/main.rs::run_daily_pushes；src/bin/monitor/main.rs::current_banner；src/bin/monitor/main.rs::main。
+
+输入：独立 load_sector_snapshot_real 路径，不是定时 flow view。 证据：src/bin/monitor/push_templates.rs::dispatch_intraday_market_daily_result。
+
+权威事实：实际来源、banner/展示及 generic governance 约束；提醒事实或探测结果不授予发送 receipt。 证据：src/bin/monitor/main.rs::run_daily_pushes；src/bin/monitor/main.rs::current_banner；src/bin/monitor/main.rs::main；src/bin/monitor/push_templates.rs::dispatch_intraday_market_daily_result。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 daily wrapper 仅 Pushed true，Empty/Deduped false；无 CLI 独立完成表。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/main.rs::run_daily_pushes；src/bin/monitor/main.rs::current_banner；src/bin/monitor/main.rs::main；src/bin/monitor/push_templates.rs::dispatch_intraday_market_daily_result。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### market-preopen-probe
+
+时段：盘前；occurrence：calendar date / legacy preopen probe；Unit：MU-intraday-market。
+
+completion owner：L4(intraday_market,空 code,空 sub_kind)。
+
+触发：先等待 market active 又要求 Closed/09:00–09:15，probe 内再限 09:10–09:20，当前结构受阻；实际交集止于09:15。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+输入：三只基准票统一行情，空批/provider Err 才出警告，worker Err 仅日志。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+权威事实：实际来源、banner/展示及 generic governance 约束；提醒事实或探测结果不授予发送 receipt。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 PREOPEN_PROBE_LAST 在 match/send 前已写；受 preopen_aux_pushed 上游门抑制，非 P01 owner。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/main.rs::monitor_loop。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### market-snapshot-warning
+
+时段：盘后；occurrence：calendar date / snapshot age warning；Unit：MU-intraday-market。
+
+completion owner：L4(intraday_market,空 code,空 sub_kind)。
+
+触发：15:05 检用户确认持仓快照；非空仓 age&gt;6h、无记录或读错产生预警。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+输入：用户快照 effective_at/confirm_empty；不是 SnapshotStale 的账户 summary。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+权威事实：实际来源、banner/展示及 generic governance 约束；提醒事实或探测结果不授予发送 receipt。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 SNAP_REMIND_LAST 无需提醒或任何发送结果都封日；失败当日不重试。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/main.rs::monitor_loop。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### market-view-periodic
+
+时段：盘中；occurrence：300s board-flow view；Unit：MU-intraday-market。
+
+completion owner：L4(intraday_market,空 code,空 sub_kind)。
+
+触发：每 300s 从 BoardDataGateway Concept day1_flows top10 构造直接文本；非 I01 sector_snapshot dispatcher。 证据：src/bin/monitor/main.rs::monitor_loop；src/bin/monitor/main.rs::render_board_flow_market_view。
+
+输入：真实 board flow 批次/排序字段，renderer 检查批次。 证据：src/bin/monitor/main.rs::render_board_flow_market_view。
+
+权威事实：实际来源、banner/展示及 generic governance 约束；提醒事实或探测结果不授予发送 receipt。 证据：src/bin/monitor/main.rs::monitor_loop；src/bin/monitor/main.rs::render_board_flow_market_view。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 Pushed/Deduped 或真实空文本推进 last_market_view；source/worker 错误和未确认保持 due。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/main.rs::monitor_loop；src/bin/monitor/main.rs::render_board_flow_market_view。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### news-ai-same-tick
+
+时段：集合竞价、盘中；occurrence：immutable NewsAI assessment identity / reservation attempt；Unit：MU-news-ai。
+
+completion owner：news_ai_delivery_event(delivery_identity_sha256=assessment_id,reservation,state)；assessment=provider+batch_id+item_id+target_code+analysis_version hash。
+
+触发：selection_v2_enabled 且 trading/auction，同 tick admitted global batches 经 exact A-share candidate 进入 assess；已有 audit 可恢复。 证据：src/bin/monitor/main.rs::news_monitor_loop；src/bin/monitor/news_ai_shadow.rs::run_same_tick_batches。
+
+输入：AdmittedNewsFact、真实 daily/quote、receipt-bearing model assessment 和 immutable audited assessment。 证据：src/bin/monitor/news_ai_shadow.rs::assess_candidate；src/database/news_ai.rs::core_assessment_id。
+
+权威事实：governance preflight 在 durable SinkStarted 之前；Reserved 可复用，pre-sink 可 rollback；Delivered 只补 PredictionLinked；SinkStarted/PostSinkRecovery 抑制自动重发。 证据：src/bin/monitor/news_ai_shadow.rs::NewsAiGovernedDeliveryPort for ProductionNewsAiDeliveryPort；src/database/news_ai.rs::reserve_news_ai_delivery_on_conn。
+
+策略：NewsAI 独立 delivery identity 与 reservation；当前 sink Attempted(bool) 再写本地 audit，Pushed 后落 Delivered 并 link prediction，不是 BR-192 counted 接线证明。 证据：src/bin/monitor/notify.rs::send_preflighted_news_ai_analysis_v3；src/bin/monitor/news_ai_shadow.rs::NewsAiGovernedDeliveryPort for ProductionNewsAiDeliveryPort。
+
+已知缺口：QN03：NewsAI bool sink/本地 audit 尚未绑定真实 TransportAccepted；SinkStarted/PostSinkRecovery 的对账终结入口未证实，Deduped 只抑制自动重发。
+
+### news-announcement
+
+时段：盘前、盘中、盘后；occurrence：provider announcement external_id / observed business date；Unit：MU-announcement。
+
+completion owner：news_dedup.key=annroute:{observed_date}:{source}:{external_id}；独立 L4(announcement,source_fact_event_id,空 sub_kind)。
+
+触发：news_monitor_loop 轮询 AnnouncementBatch；normalized route 负责匹配公告，失败不会 legacy 重发。 证据：src/bin/monitor/main.rs::news_monitor_loop；src/bin/monitor/v17_sources.rs::route_announcement_batch。
+
+输入：AnnouncementBatch 的 observed_at、source、external_id；可验证持仓及注册自选决定受众。 证据：src/bin/monitor/v17_sources.rs::route_announcement_batch；src/news/aggregator/classifier.rs::classify_announcement_with_provenance。
+
+权威事实：来源验证先于 lifecycle/keyword/audience；认领 annroute，非 Pushed 释放；存储不可用显式降级内存 L4。 证据：src/bin/monitor/v17_sources.rs::route_announcements_with_provenance；src/monitor/news_monitor.rs::claim_dedup_key；src/monitor/news_monitor.rs::release_dedup_key。
+
+策略：source-fact governance：event_id 为 source_fact:{kind}:{external_id} SHA256 前 8 字节；L4 business_identity 取该 event_id，不含 annroute 日期/source，sub_kind 为空。 证据：src/bin/monitor/v17_sources.rs::push_normalized_event；src/bin/monitor/notify.rs::push_presented_source_fact_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_source_fact；src/push_l1/event.rs::make_source_fact_event_id；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity。
+
+已知缺口：QN01：annroute 认领后崩溃缺少区分未发/已发的 receipt 与恢复入口；正常非 Pushed release 不能充作崩溃补偿。；QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。；seen_titles 和 SignalStateMachine 在 downstream 之前推进；后续 D01/I02 的相同 alert 不保证重触发。
+
+### news-flash-aggregate
+
+时段：盘中、盘后；occurrence：business_date / 09:30、11:30、13:00、15:00 half-open 300s window；Unit：MU-news-flash-aggregate。
+
+completion owner：NewsFlash authority accepted-window(business_date,window) / window_state[index]；reservation_identity_sha256+attempt_ordinal。
+
+触发：同 tick SourceOnly projected facts 入 buffer；四窗口各 [target,target+300s)，取 top3；无数据不封窗口。 证据：src/bin/monitor/main.rs::news_monitor_loop；src/bin/monitor/news_aggregator_init.rs::reserve。
+
+输入：admitted projected events 的 event_id、provider provenance、publication/fetched_at 和当日校验；immutable source-failure audit 后刷新 authority。 证据：src/bin/monitor/main.rs::news_monitor_loop；src/bin/monitor/news_aggregator_init.rs::reserve；src/event/mod.rs::reconcile_news_flash_business_date。
+
+权威事实：fresh authority snapshot 授权 reserve；exact terminal receipt 匹配 reservation/presentation/evidence hash/attempt。Accepted 才 Committed；reject/pre-sink 回 Eligible；Uncertain 保留 unresolved。 证据：src/bin/monitor/news_aggregator_init.rs::reserve_from_authority；src/bin/monitor/news_aggregator_init.rs::settle；src/event/mod.rs::reconcile_news_flash_business_date。
+
+策略：N02 按业务日/window 完成；N01 critical_committed 与 critical_pending 管 quota/capacity，当前 reserve 只造 Aggregated；二者不共享完成键。 证据：src/bin/monitor/news_aggregator_init.rs::reserve；src/bin/monitor/news_aggregator_init.rs::settle；src/bin/monitor/news_aggregator_init.rs::push_flash_reservations；src/bin/monitor/notify.rs::push_news_flash_v3。
+
+已知缺口：QN05：同 gate 的 N01 缺 authoritative strength provider，当前不构造 Critical reservation；需要不可变强度证据、quota/recovery 合同，N02 receipt 不代替 N01 authority。；receipt binding mismatch 保留不确定，日志计数与 process-local gate 不代替 immutable authority。
+
+### order-update-alert
+
+时段：盘前、盘中、盘后；occurrence：OrderUpdate / code action shares change；Unit：MU-order-alert。
+
+completion owner：MarketActionState.seen[code]=(action,shares)；L4(market_action_alert,code,空 sub_kind)。
+
+触发：服务 EventBus 订阅收到 OrderUpdate，code/action/shares tuple 变化才继续。 证据：src/bin/monitor/main.rs::main；src/bin/monitor/v17_sources.rs::handle_monitor_event。
+
+输入：实际 OrderUpdate payload，经 normalize_market_action 校验。 证据：src/bin/monitor/v17_sources.rs::normalize_market_action；src/bin/monitor/v17_sources.rs::MarketActionState。
+
+权威事实：seen[code] 在发送前 accept/update；map 实现无 date/reset，同 tuple 重复被拒。 证据：src/bin/monitor/v17_sources.rs::MarketActionState；src/bin/monitor/v17_sources.rs::handle_monitor_event。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 normalize/token/governance/sink 失败不回滚 seen；订单事实不是推送 receipt。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/v17_sources.rs::push_normalized_event；src/bin/monitor/v17_sources.rs::handle_monitor_event。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### p01-compensation
+
+时段：盘前；occurrence：p01:{business_date}；Unit：MU-p01。
+
+completion owner：business_date_once_claims(business_date,PreopenNewsHot,None,GLOBAL) → immutable decision / occurrence=p01:{business_date}。
+
+触发：显式 --compensate=P-01，指定业务日须为今天且 t≥09:15；仍归盘前 Epic。 证据：src/bin/monitor/main.rs::main；src/bin/monitor/p01.rs::run_p01_compensation_once；src/bin/monitor/p01.rs::classify_compensation_due。
+
+输入：已完成交易日涨停池、证券 identity、个股新闻批次，经 P01InputBinding 绑定 canonical mode/text/source hash。 证据：src/bin/monitor/p01.rs::load_p01_input_binding；src/bin/monitor/p01.rs::schedule_occurrence_identity。
+
+权威事实：先 inspect claim 再 load；补偿 capability/date scope 校验；Delivered/Rejected/ManualRejected/Uncertain 复用既存裁决，Reserved 仅恢复已存信封。 证据：src/bin/monitor/p01.rs::run_p01_once_with_ports；src/bin/monitor/p01.rs::run_p01_compensation_once。
+
+策略：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 Global/BusinessDateOnce；compensation 禁止恢复 Scheduled Reserved，返回 p01_scheduled_claim_late_resume_forbidden；Compensation Reserved 才可恢复。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/p01.rs::run_p01_once_with_ports。
+
+已知缺口：调度 terminal_business_date 只拥有当前进程调度终态；UncertainManualReview 保留对账，不以日志或 Pushed 代替 durable 裁决。
+
+### p01-scheduled
+
+时段：盘前；occurrence：p01:{business_date}；Unit：MU-p01。
+
+completion owner：business_date_once_claims(business_date,PreopenNewsHot,None,GLOBAL) → immutable decision / occurrence=p01:{business_date}。
+
+触发：resident 30 秒 tick，已验证交易日 09:00≤t&lt;09:15。 证据：src/bin/monitor/main.rs::main；src/bin/monitor/p01.rs::p01_scheduler_loop；src/bin/monitor/p01.rs::classify_scheduled_due。
+
+输入：已完成交易日涨停池、证券 identity、个股新闻批次，经 P01InputBinding 绑定 canonical mode/text/source hash。 证据：src/bin/monitor/p01.rs::load_p01_input_binding；src/bin/monitor/p01.rs::schedule_occurrence_identity。
+
+权威事实：先 inspect claim 再 load；补偿 capability/date scope 校验；Delivered/Rejected/ManualRejected/Uncertain 复用既存裁决，Reserved 仅恢复已存信封。 证据：src/bin/monitor/p01.rs::run_p01_once_with_ports；src/bin/monitor/p01.rs::run_p01_compensation_once。
+
+策略：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 Global/BusinessDateOnce；compensation 禁止恢复 Scheduled Reserved，返回 p01_scheduled_claim_late_resume_forbidden；Compensation Reserved 才可恢复。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/p01.rs::run_p01_once_with_ports。
+
+已知缺口：调度 terminal_business_date 只拥有当前进程调度终态；UncertainManualReview 保留对账，不以日志或 Pushed 代替 durable 裁决。
+
+### paper-review-daily-auto
+
+时段：盘后；occurrence：virtual observation code / exact completed T+1；Unit：MU-paper-review-daily。
+
+completion owner：COOLDOWN_TABLE(PaperReview,code)；L4(paper_review,code,空 sub_kind)。
+
+触发：交易日19:00起独立A01 due，review context取latest completed；当前自产观察输入链缺失。 证据：src/bin/monitor/main.rs::post_session_review_scheduler；src/bin/monitor/main.rs::attempt_post_session_review；src/bin/monitor/push_templates.rs::dispatch_post_session_review。
+
+输入：合法virtual observation记录，ReviewDataGateway.a01_daily_bars，60根K唯一且正收盘；取首条合法exact T+1=d且已完成记录。 证据：src/bin/monitor/push_templates.rs::load_paper_review_snapshot_real；src/bin/monitor/push_templates.rs::classify_a01_target。
+
+权威事实：日期资格与真实bars共同约束；当前自产链 STARVED，但不能断言历史记录不存在。 证据：src/bin/monitor/push_templates.rs::load_paper_review_snapshot_real；src/bin/monitor/push_templates.rs::classify_a01_target；src/bin/monitor/push_templates.rs::dispatch_paper_review_daily_outcome。
+
+策略：A01 non-counted；模板冷却和L4均保留code，86400s；NoData/失败不是接受，wrapper仅Delivered=true，auto可将NoData Terminal；不在8项backfill。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/push_templates.rs::dispatch_outcome；src/bin/monitor/push_templates.rs::record_uncounted_cooldown；src/bin/monitor/push_templates.rs::push_paper_review_outcome；src/bin/monitor/push_templates.rs::dispatch_paper_review_daily_outcome；src/bin/monitor/main.rs::run_review_backfill；src/bin/monitor/review_batch.rs::ReviewScheduleState。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+
+### paper-review-daily-manual
+
+时段：盘后；occurrence：virtual observation code / exact completed T+1；Unit：MU-paper-review-daily。
+
+completion owner：COOLDOWN_TABLE(PaperReview,code)；L4(paper_review,code,空 sub_kind)。
+
+触发：--review A01，临时date/task audit；已有合法历史输入只在 exact T+1 完成后可消费。 证据：src/bin/monitor/main.rs::run_review_only；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/push_templates.rs::dispatch_post_session_review。
+
+输入：合法virtual observation记录，ReviewDataGateway.a01_daily_bars，60根K唯一且正收盘；取首条合法exact T+1=d且已完成记录。 证据：src/bin/monitor/push_templates.rs::load_paper_review_snapshot_real；src/bin/monitor/push_templates.rs::classify_a01_target。
+
+权威事实：日期资格与真实bars共同约束；当前自产链 STARVED，但不能断言历史记录不存在。 证据：src/bin/monitor/push_templates.rs::load_paper_review_snapshot_real；src/bin/monitor/push_templates.rs::classify_a01_target；src/bin/monitor/push_templates.rs::dispatch_paper_review_daily_outcome。
+
+策略：A01 non-counted；模板冷却和L4均保留code，86400s；NoData/失败不是接受，wrapper仅Delivered=true，auto可将NoData Terminal；不在8项backfill。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/push_templates.rs::dispatch_outcome；src/bin/monitor/push_templates.rs::record_uncounted_cooldown；src/bin/monitor/push_templates.rs::push_paper_review_outcome；src/bin/monitor/push_templates.rs::dispatch_paper_review_daily_outcome；src/bin/monitor/main.rs::run_review_backfill；src/bin/monitor/review_batch.rs::ReviewScheduleState。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+
+### paper-review-daily-push
+
+时段：盘后；occurrence：virtual observation code / exact completed T+1；Unit：MU-paper-review-daily。
+
+completion owner：COOLDOWN_TABLE(PaperReview,code)；L4(paper_review,code,空 sub_kind)。
+
+触发：--push Evening/Outside以当前calendar date调用daily；失败仅收集，函数尾仍Ok；不是授权自动历史回放。 证据：src/bin/monitor/main.rs::run_daily_pushes。
+
+输入：合法virtual observation记录，ReviewDataGateway.a01_daily_bars，60根K唯一且正收盘；取首条合法exact T+1=d且已完成记录。 证据：src/bin/monitor/push_templates.rs::load_paper_review_snapshot_real；src/bin/monitor/push_templates.rs::classify_a01_target。
+
+权威事实：日期资格与真实bars共同约束；当前自产链 STARVED，但不能断言历史记录不存在。 证据：src/bin/monitor/push_templates.rs::load_paper_review_snapshot_real；src/bin/monitor/push_templates.rs::classify_a01_target；src/bin/monitor/push_templates.rs::dispatch_paper_review_daily_outcome。
+
+策略：A01 non-counted；模板冷却和L4均保留code，86400s；NoData/失败不是接受，wrapper仅Delivered=true，auto可将NoData Terminal；不在8项backfill。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/push_templates.rs::dispatch_outcome；src/bin/monitor/push_templates.rs::record_uncounted_cooldown；src/bin/monitor/push_templates.rs::push_paper_review_outcome；src/bin/monitor/push_templates.rs::dispatch_paper_review_daily_outcome；src/bin/monitor/main.rs::run_review_backfill；src/bin/monitor/review_batch.rs::ReviewScheduleState。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+
+### paper-review-noon
+
+时段：盘中；occurrence：today / noon exact T+1 completion gate；Unit：MU-paper-review-noon。
+
+completion owner：monitor_loop::NOON_SNAP_LAST[calendar_date]；潜在模板/L4(PaperReview,noon-code,空 sub_kind)。
+
+触发：13:00–13:04 传 today 调 noon；合法记录要求 exact T+1=d 且已完成，今天13点未完成，补历史数据也不能解除。 证据：src/bin/monitor/main.rs::monitor_loop；src/bin/monitor/push_templates.rs::dispatch_paper_review_noon；src/bin/monitor/push_templates.rs::classify_a01_target。
+
+输入：合法 virtual observation 历史记录和 a01_daily_bars；此入口 today 完成日门排除输入。 证据：src/bin/monitor/push_templates.rs::load_paper_review_snapshot_real；src/bin/monitor/push_templates.rs::classify_a01_target。
+
+权威事实：业务 completed-through 资格与通知状态分开；当前不构造有效 noon 消息。 证据：src/bin/monitor/push_templates.rs::classify_a01_target；src/bin/monitor/push_templates.rs::dispatch_paper_review_noon。
+
+策略：noon bool 被忽略，NOON_SNAP_LAST 无条件封日；假设可达，模板与 L4 保留 noon-code，非 Global 空 code。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/push_templates.rs::dispatch_outcome；src/bin/monitor/push_templates.rs::record_uncounted_cooldown；src/bin/monitor/push_templates.rs::dispatch_paper_review_noon；src/bin/monitor/push_templates.rs::push_paper_review_outcome；src/bin/monitor/main.rs::monitor_loop。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。；kind 保留 STARVED 的异质入口，noon 明确是时间结构受阻而非补快照可恢复。
+
+### paper-sell-intraday
+
+时段：盘中；occurrence：paper sell code/day/Filled；Unit：MU-paper-sell。
+
+completion owner：paper_trades(code,direction=sell,status=Filled,date(ts))；L4(paper_sell,code,空 sub_kind)。
+
+触发：30 秒 risk-context tick，scan_and_sell 有交易时段门；仅 PAPER_SELL_DISABLED=1 暂停。 证据：src/bin/monitor/main.rs::monitor_loop；src/bin/monitor/main.rs::paper_sell_paused；src/trading/paper_sell.rs::scan_and_sell。
+
+输入：FIFO 可卖历史批次、行情/指标、风险上下文，simulate_with_audit_evidence 返回 Filled 才产出 sold。 证据：src/trading/paper_sell.rs::evaluate_and_sell；src/trading/paper_sell.rs::already_sold_today。
+
+权威事实：先持久成交再逐条 generic push；内层单票 Err log 后继续，不凭成交获得接收 authority。 证据：src/trading/paper_sell.rs::evaluate_and_sell；src/bin/monitor/main.rs::monitor_loop。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 未 Pushed 仅 warn，不撤销成交；已卖防重阻止两个入口自然重建今日失败通知。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/trading/paper_sell.rs::already_sold_today；src/bin/monitor/main.rs::monitor_loop。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### paper-sell-post-close
+
+时段：盘后；occurrence：paper sell code/day/Filled；Unit：MU-paper-sell。
+
+completion owner：paper_trades(code,direction=sell,status=Filled,date(ts))；L4(paper_sell,code,空 sub_kind)。
+
+触发：15:30 有效 risk context、evening_review 后扫描，scan_and_sell_post_close 绕过盘中时间 guard；同显式暂停开关。 证据：src/bin/monitor/main.rs::monitor_loop；src/bin/monitor/main.rs::paper_sell_paused；src/trading/paper_sell.rs::scan_and_sell_post_close。
+
+输入：FIFO 可卖历史批次、行情/指标、风险上下文，simulate_with_audit_evidence 返回 Filled 才产出 sold。 证据：src/trading/paper_sell.rs::evaluate_and_sell；src/trading/paper_sell.rs::already_sold_today。
+
+权威事实：先持久成交再逐条 generic push；内层单票 Err log 后继续，不凭成交获得接收 authority。 证据：src/trading/paper_sell.rs::evaluate_and_sell；src/bin/monitor/main.rs::monitor_loop。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 未 Pushed 仅 warn，不撤销成交；已卖防重阻止两个入口自然重建今日失败通知。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/trading/paper_sell.rs::already_sold_today；src/bin/monitor/main.rs::monitor_loop。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### paper-trade-terminal
+
+时段：集合竞价；occurrence：PaperTradeTerminalBindingV1.terminal_transition_id()；Unit：MU-paper-trade。
+
+completion owner：counted decision(PaperTrade,Ticket,terminal_transition_id,source fingerprint,subject,policy,rendered hash)。
+
+触发：Auction 非 ≥09:20 分支约 30 秒消费当日 Filled/NotFilled/Invalidated 完成态。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+输入：当日 paper_trades 精确 join order_audit 与 chain；缺终态证据/多重匹配拒绝，任一 source 失败整批 false。 证据：src/bin/monitor/push_templates.rs::load_today_paper_trade_reports；src/bin/monitor/push_templates.rs::prepare_paper_trade_daily。
+
+权威事实：terminal binding 为 InternalDurable/Ticket，交易终态不是通知完成，T-10 token。 证据：src/bin/monitor/push_templates.rs::prepare_paper_trade_daily；src/bin/monitor/push_templates.rs::dispatch_paper_trade_daily。
+
+策略：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 Rolling/300s；每项 Pushed/Deduped，全部确认才 true；空批 false，外层仅记录日志，无额外日门。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/push_templates.rs::dispatch_paper_trade_daily。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### post-fixed-fill
+
+时段：盘中、盘后；occurrence：registered trade source / fill event；Unit：MU-fixed-fill。
+
+completion owner：monitor_loop.last_post_fixed_fill[session]；L4(post_fixed_price_fill,code,空 sub_kind)。
+
+触发：market branch 独立 300s periodic；当前无 registered source 时 Failed，timer 不推进。 证据：src/bin/monitor/main.rs::monitor_loop；src/bin/monitor/push_templates.rs::register_trade_event_source；src/bin/monitor/push_templates.rs::fetch_pending_trade_events。
+
+输入：fetch_pending_trade_events 只筛 fill，校验 正价/整手/next_session_carry；全 src register_trade_event_source 仅定义。 证据：src/bin/monitor/push_templates.rs::dispatch_trade_pipeline_fills_result；src/bin/monitor/push_templates.rs::fetch_pending_trade_events；src/bin/monitor/push_templates.rs::register_trade_event_source。
+
+权威事实：T14/T15 source 仅 fetch，无消费 ack；非法事件整批 Failed，不能从正文订单号推出 durable identity。 证据：src/bin/monitor/push_templates.rs::dispatch_trade_pipeline_fills_result。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 假设有源，Empty 或 Pushed/Deduped 才推进，失败保持 due；本次不注册/激活。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/push_templates.rs::dispatch_outcome；src/bin/monitor/push_templates.rs::record_uncounted_cooldown；src/bin/monitor/push_templates.rs::dispatch_trade_pipeline_fills_result。
+
+已知缺口：QS04：T14/T15 source 尚未注册；fetch 接口缺稳定事件 identity、消费 ack 和不确定发送恢复，order_id 正文不能代替 durable completion。；QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### post-fixed-order
+
+时段：盘中、盘后；occurrence：registered trade source / order event；Unit：MU-fixed-order。
+
+completion owner：monitor_loop.last_post_fixed_order[session]；L4(post_fixed_price_order,code,空 sub_kind)。
+
+触发：market branch 独立 900s periodic；当前无 registered source 时 Failed，timer 不推进。 证据：src/bin/monitor/main.rs::monitor_loop；src/bin/monitor/push_templates.rs::register_trade_event_source；src/bin/monitor/push_templates.rs::fetch_pending_trade_events。
+
+输入：fetch_pending_trade_events 只筛 order，校验 order_id/status/正价/整手；全 src register_trade_event_source 仅定义。 证据：src/bin/monitor/push_templates.rs::dispatch_trade_pipeline_orders_result；src/bin/monitor/push_templates.rs::fetch_pending_trade_events；src/bin/monitor/push_templates.rs::register_trade_event_source。
+
+权威事实：T14/T15 source 仅 fetch，无消费 ack；非法事件整批 Failed，不能从正文订单号推出 durable identity。 证据：src/bin/monitor/push_templates.rs::dispatch_trade_pipeline_orders_result。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 假设有源，Empty 或 Pushed/Deduped 才推进，失败保持 due；本次不注册/激活。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/push_templates.rs::dispatch_outcome；src/bin/monitor/push_templates.rs::record_uncounted_cooldown；src/bin/monitor/push_templates.rs::dispatch_trade_pipeline_orders_result。
+
+已知缺口：QS04：T14/T15 source 尚未注册；fetch 接口缺稳定事件 identity、消费 ack 和不确定发送恢复，order_id 正文不能代替 durable completion。；QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### review-a10-auto
+
+时段：盘后；occurrence：review_task_identity(date,A10) / original business date；Unit：MU-review-a10。
+
+completion owner：business_date_once_claims(business_date,CatalystReview,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,A10)。
+
+触发：交易日19:00起每60秒，A10 独立 due 状态；attempt 实际 at_manual，R04提前而R07仍等21:00。 证据：src/bin/monitor/main.rs::post_session_review_scheduler；src/bin/monitor/main.rs::attempt_post_session_review；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::dispatch_post_session_review。
+
+输入：real load_catalyst_review_snapshot_real→fetch_chain_batch_grpc(d)，验证VisibleChainBatch/observed_at；无claim历史也走real loader，不自动stored replay。 证据：src/bin/monitor/push_templates.rs::dispatch_catalyst_review_daily_outcome；src/review/catalyst_review.rs::load_catalyst_review_snapshot_real。
+
+权威事实：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 durable terminal preflight/occurrence 与 task identity/date/hash 严格核对；Delivered 缺 hydration 返回可重试失败，Uncertain/Rejected hydration Terminal 不等于送达。 证据：src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/push_templates.rs::dispatch_catalyst_review_daily_outcome。
+
+策略：Global/BusinessDateOnce/86400s；claim主键仅date/kind/sub_kind/scope，task identity属于关联decision。空leading NoData；真实loader解析/缺observed_at等Err统一Failed(true)，loader成功后的None防御与非法日期/binding为永久失败。batch quiet前置DeferredUntil零provider/sink，--push直daily不经前置门；Pushed后save_watchlist失败只warn；subject=snapshot.date:source_batch_id hash。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_catalyst_review_daily_outcome。
+
+已知缺口：QR04：A10 名单/R13 outcomes 在 Delivered 后保存失败只 warn，已有 decision preflight 跳过后置保存；缺只修业务记录的恢复 owner。A10 无 claim 历史 real loader 与 stored 首批授权也未解决。；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+
+### review-a10-backfill
+
+时段：盘后；occurrence：review_task_identity(date,A10) / original business date；Unit：MU-review-a10。
+
+completion owner：business_date_once_claims(business_date,CatalystReview,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,A10)。
+
+触发：backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。 本 producer 仅 A10。 证据：src/bin/monitor/main.rs::run_review_backfill；src/bin/monitor/main.rs::backfill_one_review_task；src/bin/monitor/durable_delivery_runtime.rs::resume_review_task_occurrence；src/bin/monitor/durable_delivery_runtime.rs::authorize_rejected_review_retry；src/durable_delivery/coordinator.rs::inspect_review_task_occurrence；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_r12_backtest_outcome_with_runner。
+
+输入：real load_catalyst_review_snapshot_real→fetch_chain_batch_grpc(d)，验证VisibleChainBatch/observed_at；无claim历史也走real loader，不自动stored replay。 证据：src/bin/monitor/push_templates.rs::dispatch_catalyst_review_daily_outcome；src/review/catalyst_review.rs::load_catalyst_review_snapshot_real。
+
+权威事实：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 durable terminal preflight/occurrence 与 task identity/date/hash 严格核对；Delivered 缺 hydration 返回可重试失败，Uncertain/Rejected hydration Terminal 不等于送达。 证据：src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/push_templates.rs::dispatch_catalyst_review_daily_outcome。
+
+策略：Global/BusinessDateOnce/86400s；claim主键仅date/kind/sub_kind/scope，task identity属于关联decision。空leading NoData；真实loader解析/缺observed_at等Err统一Failed(true)，loader成功后的None防御与非法日期/binding为永久失败。batch quiet前置DeferredUntil零provider/sink，--push直daily不经前置门；Pushed后save_watchlist失败只warn；subject=snapshot.date:source_batch_id hash。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_catalyst_review_daily_outcome。
+
+已知缺口：QR04：A10 名单/R13 outcomes 在 Delivered 后保存失败只 warn，已有 decision preflight 跳过后置保存；缺只修业务记录的恢复 owner。A10 无 claim 历史 real loader 与 stored 首批授权也未解决。；backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。
+
+### review-a10-manual
+
+时段：盘后；occurrence：review_task_identity(date,A10) / original business date；Unit：MU-review-a10。
+
+completion owner：business_date_once_claims(business_date,CatalystReview,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,A10)。
+
+触发：--review 取 latest completed review_date，一次13任务；A10 临时audit state不直接改auto state，Complete/Partial可Ok，NoDelivery Err。 证据：src/bin/monitor/main.rs::run_review_only；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::dispatch_post_session_review。
+
+输入：real load_catalyst_review_snapshot_real→fetch_chain_batch_grpc(d)，验证VisibleChainBatch/observed_at；无claim历史也走real loader，不自动stored replay。 证据：src/bin/monitor/push_templates.rs::dispatch_catalyst_review_daily_outcome；src/review/catalyst_review.rs::load_catalyst_review_snapshot_real。
+
+权威事实：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 durable terminal preflight/occurrence 与 task identity/date/hash 严格核对；Delivered 缺 hydration 返回可重试失败，Uncertain/Rejected hydration Terminal 不等于送达。 证据：src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/push_templates.rs::dispatch_catalyst_review_daily_outcome。
+
+策略：Global/BusinessDateOnce/86400s；claim主键仅date/kind/sub_kind/scope，task identity属于关联decision。空leading NoData；真实loader解析/缺observed_at等Err统一Failed(true)，loader成功后的None防御与非法日期/binding为永久失败。batch quiet前置DeferredUntil零provider/sink，--push直daily不经前置门；Pushed后save_watchlist失败只warn；subject=snapshot.date:source_batch_id hash。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_catalyst_review_daily_outcome。
+
+已知缺口：QR04：A10 名单/R13 outcomes 在 Delivered 后保存失败只 warn，已有 decision preflight 跳过后置保存；缺只修业务记录的恢复 owner。A10 无 claim 历史 real loader 与 stored 首批授权也未解决。；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+
+### review-a10-push
+
+时段：盘后；occurrence：review_task_identity(date,A10) / original business date；Unit：MU-review-a10。
+
+completion owner：business_date_once_claims(business_date,CatalystReview,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,A10)。
+
+触发：--push Evening/Outside 用当前 calendar date 直 daily，未经过 Intraday banner gate 或batch A10 quiet前置；与其他入口仅选中相同业务日才共享claim，失败收集后函数尾仍Ok。 证据：src/bin/monitor/main.rs::run_daily_pushes；src/bin/monitor/push_templates.rs::dispatch_catalyst_review_daily_outcome。
+
+输入：real load_catalyst_review_snapshot_real→fetch_chain_batch_grpc(d)，验证VisibleChainBatch/observed_at；无claim历史也走real loader，不自动stored replay。 证据：src/bin/monitor/push_templates.rs::dispatch_catalyst_review_daily_outcome；src/review/catalyst_review.rs::load_catalyst_review_snapshot_real。
+
+权威事实：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 durable terminal preflight/occurrence 与 task identity/date/hash 严格核对；Delivered 缺 hydration 返回可重试失败，Uncertain/Rejected hydration Terminal 不等于送达。 证据：src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/push_templates.rs::dispatch_catalyst_review_daily_outcome。
+
+策略：Global/BusinessDateOnce/86400s；claim主键仅date/kind/sub_kind/scope，task identity属于关联decision。空leading NoData；真实loader解析/缺observed_at等Err统一Failed(true)，loader成功后的None防御与非法日期/binding为永久失败。batch quiet前置DeferredUntil零provider/sink，--push直daily不经前置门；Pushed后save_watchlist失败只warn；subject=snapshot.date:source_batch_id hash。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_catalyst_review_daily_outcome。
+
+已知缺口：QR04：A10 名单/R13 outcomes 在 Delivered 后保存失败只 warn，已有 decision preflight 跳过后置保存；缺只修业务记录的恢复 owner。A10 无 claim 历史 real loader 与 stored 首批授权也未解决。；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+
+### review-r03-auto
+
+时段：盘后；occurrence：R03/auto date/task attempted dependency；Unit：MU-review-r03-auto。
+
+completion owner：post_session_review_scheduler::ReviewScheduleState(date).tasks[R03]。
+
+触发：交易日19:00起自动due R03，LegacyAccountGate typed AccountMetricsIncomplete，1/5/15退避。 证据：src/bin/monitor/main.rs::post_session_review_scheduler；src/bin/monitor/push_templates.rs::dispatch_post_session_review。
+
+输入：portfolio projection 不是 verified broker batch+同批 trade-sync watermark；R03 下游 portfolio→涨停chain实现存在，但主batch在account_required门前停止。 证据：src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_r03_industry_chain_outcome。
+
+权威事实：LegacyAccountGate 返回 typed retryable Failed，不授予 provider/renderer/sink；backfill集合排除R03。 证据：src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/main.rs::run_review_backfill；src/bin/monitor/review_batch.rs::ReviewRunContext。
+
+策略：当前只推进独立任务state/audit；潜在 IndustryChain Global/BusinessDateOnce policy 未被该入口达成，STARVED/账户门受阻保持。 证据：src/bin/monitor/review_batch.rs::ReviewScheduleState；src/durable_delivery/model.rs::compiled_policy_catalog；src/bin/monitor/push_templates.rs::dispatch_r03_industry_chain_outcome。
+
+已知缺口：auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+
+### review-r03-manual
+
+时段：盘后；occurrence：R03/manual date/task attempted dependency；Unit：MU-review-r03-manual。
+
+completion owner：run_review_only::temporary audit_state(invocation,date).tasks[R03]。
+
+触发：--review 的R03临时audit，manual不豁免账户来源。 证据：src/bin/monitor/main.rs::run_review_only；src/bin/monitor/push_templates.rs::dispatch_post_session_review。
+
+输入：portfolio projection 不是 verified broker batch+同批 trade-sync watermark；R03 下游 portfolio→涨停chain实现存在，但主batch在account_required门前停止。 证据：src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_r03_industry_chain_outcome。
+
+权威事实：LegacyAccountGate 返回 typed retryable Failed，不授予 provider/renderer/sink；backfill集合排除R03。 证据：src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/main.rs::run_review_backfill；src/bin/monitor/review_batch.rs::ReviewRunContext。
+
+策略：当前只推进独立任务state/audit；潜在 IndustryChain Global/BusinessDateOnce policy 未被该入口达成，STARVED/账户门受阻保持。 证据：src/bin/monitor/review_batch.rs::ReviewScheduleState；src/durable_delivery/model.rs::compiled_policy_catalog；src/bin/monitor/push_templates.rs::dispatch_r03_industry_chain_outcome。
+
+已知缺口：auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+
+### review-r04-auto
+
+时段：盘后；occurrence：review_task_identity(date,R04) / original business date；Unit：MU-review-r04。
+
+completion owner：business_date_once_claims(business_date,ReviewLhb,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R04)。
+
+触发：交易日19:00起每60秒，R04 独立 due 状态；attempt 实际 at_manual，R04提前而R07仍等21:00。 证据：src/bin/monitor/main.rs::post_session_review_scheduler；src/bin/monitor/main.rs::attempt_post_session_review；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::dispatch_post_session_review。
+
+输入：DragonTigerGateway.market_review(d,5,5) 完整 top5 披露/买五，Provider observed_at/as_of/batch。 证据：src/bin/monitor/push_templates.rs::dispatch_r04_lhb_outcome_with_loader。
+
+权威事实：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 durable terminal preflight/occurrence 与 task identity/date/hash 严格核对；Delivered 缺 hydration 返回可重试失败，Uncertain/Rejected hydration Terminal 不等于送达。 证据：src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/push_templates.rs::dispatch_r04_lhb_outcome_with_loader。
+
+策略：Global/BusinessDateOnce/86400s；claim主键仅date/kind/sub_kind/scope，task identity属于关联decision。R04 自动 attempt 实际构造 at_manual，batch 传23:59:59，19:00即可尝试；manual同样可绕21:00，但来源不豁免。VerifiedEmpty→NoData，source按typed retryability，binding/token永久失败。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_r04_lhb_outcome_with_loader。
+
+已知缺口：auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+
+### review-r04-backfill
+
+时段：盘后；occurrence：review_task_identity(date,R04) / original business date；Unit：MU-review-r04。
+
+completion owner：business_date_once_claims(business_date,ReviewLhb,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R04)。
+
+触发：backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。 本 producer 仅 R04。 证据：src/bin/monitor/main.rs::run_review_backfill；src/bin/monitor/main.rs::backfill_one_review_task；src/bin/monitor/durable_delivery_runtime.rs::resume_review_task_occurrence；src/bin/monitor/durable_delivery_runtime.rs::authorize_rejected_review_retry；src/durable_delivery/coordinator.rs::inspect_review_task_occurrence；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_r12_backtest_outcome_with_runner。
+
+输入：DragonTigerGateway.market_review(d,5,5) 完整 top5 披露/买五，Provider observed_at/as_of/batch。 证据：src/bin/monitor/push_templates.rs::dispatch_r04_lhb_outcome_with_loader。
+
+权威事实：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 durable terminal preflight/occurrence 与 task identity/date/hash 严格核对；Delivered 缺 hydration 返回可重试失败，Uncertain/Rejected hydration Terminal 不等于送达。 证据：src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/push_templates.rs::dispatch_r04_lhb_outcome_with_loader。
+
+策略：Global/BusinessDateOnce/86400s；claim主键仅date/kind/sub_kind/scope，task identity属于关联decision。R04 自动 attempt 实际构造 at_manual，batch 传23:59:59，19:00即可尝试；manual同样可绕21:00，但来源不豁免。VerifiedEmpty→NoData，source按typed retryability，binding/token永久失败。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_r04_lhb_outcome_with_loader。
+
+已知缺口：backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。
+
+### review-r04-manual
+
+时段：盘后；occurrence：review_task_identity(date,R04) / original business date；Unit：MU-review-r04。
+
+completion owner：business_date_once_claims(business_date,ReviewLhb,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R04)。
+
+触发：--review 取 latest completed review_date，一次13任务；R04 临时audit state不直接改auto state，Complete/Partial可Ok，NoDelivery Err。 证据：src/bin/monitor/main.rs::run_review_only；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::dispatch_post_session_review。
+
+输入：DragonTigerGateway.market_review(d,5,5) 完整 top5 披露/买五，Provider observed_at/as_of/batch。 证据：src/bin/monitor/push_templates.rs::dispatch_r04_lhb_outcome_with_loader。
+
+权威事实：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 durable terminal preflight/occurrence 与 task identity/date/hash 严格核对；Delivered 缺 hydration 返回可重试失败，Uncertain/Rejected hydration Terminal 不等于送达。 证据：src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/push_templates.rs::dispatch_r04_lhb_outcome_with_loader。
+
+策略：Global/BusinessDateOnce/86400s；claim主键仅date/kind/sub_kind/scope，task identity属于关联decision。R04 自动 attempt 实际构造 at_manual，batch 传23:59:59，19:00即可尝试；manual同样可绕21:00，但来源不豁免。VerifiedEmpty→NoData，source按typed retryability，binding/token永久失败。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_r04_lhb_outcome_with_loader。
+
+已知缺口：auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+
+### review-r07-auto
+
+时段：盘后；occurrence：review_task_identity(date,R07) / original business date；Unit：MU-review-r07。
+
+completion owner：business_date_once_claims(business_date,TomorrowWatch,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R07)。
+
+触发：交易日19:00起每60秒，R07 独立 due 状态；attempt 实际 at_manual，R04提前而R07仍等21:00。 证据：src/bin/monitor/main.rs::post_session_review_scheduler；src/bin/monitor/main.rs::attempt_post_session_review；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::dispatch_post_session_review。
+
+输入：A档候选、龙虎榜、涨停链、做T持仓四源；龙虎榜/做T补价使用精确d估值与strict settled-close。counted 必须非空 LHB Provider binding。 证据：src/bin/monitor/push_templates.rs::dispatch_tomorrow_watch_after_preflight。
+
+权威事实：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 durable terminal preflight/occurrence 与 task identity/date/hash 严格核对；Delivered 缺 hydration 返回可重试失败，Uncertain/Rejected hydration Terminal 不等于送达。 证据：src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/push_templates.rs::dispatch_tomorrow_watch_after_preflight。
+
+策略：Global/BusinessDateOnce/86400s；claim主键仅date/kind/sub_kind/scope，task identity属于关联decision。当日 manual/auto 均等21:00，历史跨日 eligibility=23:59:59；空候选或无 LHB source→NoData；逐源 warn/skip，不是四源同批证明。只有无 claim backfill 重建加补推正文，既存 envelope 不变。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_tomorrow_watch_after_preflight。
+
+已知缺口：QR02：R07 非 LHB 三源和渲染主体缺统一不可变 batch lineage；无 claim 历史重建会读当前候选 context，LHB binding/正文 hash 不证明四源同业务日。；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+
+### review-r07-backfill
+
+时段：盘后；occurrence：review_task_identity(date,R07) / original business date；Unit：MU-review-r07。
+
+completion owner：business_date_once_claims(business_date,TomorrowWatch,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R07)。
+
+触发：backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。 本 producer 仅 R07。 证据：src/bin/monitor/main.rs::run_review_backfill；src/bin/monitor/main.rs::backfill_one_review_task；src/bin/monitor/durable_delivery_runtime.rs::resume_review_task_occurrence；src/bin/monitor/durable_delivery_runtime.rs::authorize_rejected_review_retry；src/durable_delivery/coordinator.rs::inspect_review_task_occurrence；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_r12_backtest_outcome_with_runner。
+
+输入：A档候选、龙虎榜、涨停链、做T持仓四源；龙虎榜/做T补价使用精确d估值与strict settled-close。counted 必须非空 LHB Provider binding。 证据：src/bin/monitor/push_templates.rs::dispatch_tomorrow_watch_after_preflight。
+
+权威事实：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 durable terminal preflight/occurrence 与 task identity/date/hash 严格核对；Delivered 缺 hydration 返回可重试失败，Uncertain/Rejected hydration Terminal 不等于送达。 证据：src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/push_templates.rs::dispatch_tomorrow_watch_after_preflight。
+
+策略：Global/BusinessDateOnce/86400s；claim主键仅date/kind/sub_kind/scope，task identity属于关联decision。当日 manual/auto 均等21:00，历史跨日 eligibility=23:59:59；空候选或无 LHB source→NoData；逐源 warn/skip，不是四源同批证明。只有无 claim backfill 重建加补推正文，既存 envelope 不变。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_tomorrow_watch_after_preflight。
+
+已知缺口：QR02：R07 非 LHB 三源和渲染主体缺统一不可变 batch lineage；无 claim 历史重建会读当前候选 context，LHB binding/正文 hash 不证明四源同业务日。；backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。
+
+### review-r07-manual
+
+时段：盘后；occurrence：review_task_identity(date,R07) / original business date；Unit：MU-review-r07。
+
+completion owner：business_date_once_claims(business_date,TomorrowWatch,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R07)。
+
+触发：--review 取 latest completed review_date，一次13任务；R07 临时audit state不直接改auto state，Complete/Partial可Ok，NoDelivery Err。 证据：src/bin/monitor/main.rs::run_review_only；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::dispatch_post_session_review。
+
+输入：A档候选、龙虎榜、涨停链、做T持仓四源；龙虎榜/做T补价使用精确d估值与strict settled-close。counted 必须非空 LHB Provider binding。 证据：src/bin/monitor/push_templates.rs::dispatch_tomorrow_watch_after_preflight。
+
+权威事实：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 durable terminal preflight/occurrence 与 task identity/date/hash 严格核对；Delivered 缺 hydration 返回可重试失败，Uncertain/Rejected hydration Terminal 不等于送达。 证据：src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/push_templates.rs::dispatch_tomorrow_watch_after_preflight。
+
+策略：Global/BusinessDateOnce/86400s；claim主键仅date/kind/sub_kind/scope，task identity属于关联decision。当日 manual/auto 均等21:00，历史跨日 eligibility=23:59:59；空候选或无 LHB source→NoData；逐源 warn/skip，不是四源同批证明。只有无 claim backfill 重建加补推正文，既存 envelope 不变。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_tomorrow_watch_after_preflight。
+
+已知缺口：QR02：R07 非 LHB 三源和渲染主体缺统一不可变 batch lineage；无 claim 历史重建会读当前候选 context，LHB binding/正文 hash 不证明四源同业务日。；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+
+### review-r08-auto
+
+时段：盘后；occurrence：review_task_identity(date,R08) / original business date；Unit：MU-review-r08。
+
+completion owner：durable review occurrence(business_date,EventCalendar,None,GLOBAL,review_task_identity(date,R08)) → Rolling immutable decision。
+
+触发：交易日19:00起每60秒，R08 独立 due 状态；attempt 实际 at_manual，R04提前而R07仍等21:00。 证据：src/bin/monitor/main.rs::post_session_review_scheduler；src/bin/monitor/main.rs::attempt_post_session_review；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::dispatch_post_session_review。
+
+输入：CNInfo 公告、必需 CFFEX 交割、美国指数、USD/CNY；review d 与下一交易日 reminder 分开，Provider canonical。 证据：src/bin/monitor/push_templates.rs::dispatch_r08_event_calendar_outcome_with_loader。
+
+权威事实：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 durable terminal preflight/occurrence 与 task identity/date/hash 严格核对；Delivered 缺 hydration 返回可重试失败，Uncertain/Rejected hydration Terminal 不等于送达。 证据：src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/push_templates.rs::dispatch_r08_event_calendar_outcome_with_loader。
+
+策略：EventCalendar Global/Rolling/86400s，不存在BusinessDateOnce claim；按review occurrence查持久decision。CFFEX 获取失败始终保留 GatewayError.retryable，invalid_evidence/invalid_request 为永久；其他三个组件可明确 degraded。首批获取失败未产生 decision，state/audit 无跨重启终态保证；R08可零item Delivered hydration。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_r08_event_calendar_outcome_with_loader；src/data_gateway/review.rs::GatewayError；src/durable_delivery/coordinator.rs::inspect_review_task_occurrence。
+
+已知缺口：QR01：R08 首批 GatewaySource 失败尚无通知 decision 时仅内存 Terminal/退避加 append audit；缺持久任务终态与版本恢复，旧无 failure artifact 不能补造 typed authority。；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+
+### review-r08-backfill
+
+时段：盘后；occurrence：review_task_identity(date,R08) / original business date；Unit：MU-review-r08。
+
+completion owner：durable review occurrence(business_date,EventCalendar,None,GLOBAL,review_task_identity(date,R08)) → Rolling immutable decision。
+
+触发：backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。 本 producer 仅 R08。 证据：src/bin/monitor/main.rs::run_review_backfill；src/bin/monitor/main.rs::backfill_one_review_task；src/bin/monitor/durable_delivery_runtime.rs::resume_review_task_occurrence；src/bin/monitor/durable_delivery_runtime.rs::authorize_rejected_review_retry；src/durable_delivery/coordinator.rs::inspect_review_task_occurrence；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_r12_backtest_outcome_with_runner。
+
+输入：CNInfo 公告、必需 CFFEX 交割、美国指数、USD/CNY；review d 与下一交易日 reminder 分开，Provider canonical。 证据：src/bin/monitor/push_templates.rs::dispatch_r08_event_calendar_outcome_with_loader。
+
+权威事实：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 durable terminal preflight/occurrence 与 task identity/date/hash 严格核对；Delivered 缺 hydration 返回可重试失败，Uncertain/Rejected hydration Terminal 不等于送达。 证据：src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/push_templates.rs::dispatch_r08_event_calendar_outcome_with_loader。
+
+策略：EventCalendar Global/Rolling/86400s，不存在BusinessDateOnce claim；按review occurrence查持久decision。CFFEX 获取失败始终保留 GatewayError.retryable，invalid_evidence/invalid_request 为永久；其他三个组件可明确 degraded。首批获取失败未产生 decision，state/audit 无跨重启终态保证；R08可零item Delivered hydration。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_r08_event_calendar_outcome_with_loader；src/data_gateway/review.rs::GatewayError；src/durable_delivery/coordinator.rs::inspect_review_task_occurrence。
+
+已知缺口：QR01：R08 首批 GatewaySource 失败尚无通知 decision 时仅内存 Terminal/退避加 append audit；缺持久任务终态与版本恢复，旧无 failure artifact 不能补造 typed authority。；backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。
+
+### review-r08-manual
+
+时段：盘后；occurrence：review_task_identity(date,R08) / original business date；Unit：MU-review-r08。
+
+completion owner：durable review occurrence(business_date,EventCalendar,None,GLOBAL,review_task_identity(date,R08)) → Rolling immutable decision。
+
+触发：--review 取 latest completed review_date，一次13任务；R08 临时audit state不直接改auto state，Complete/Partial可Ok，NoDelivery Err。 证据：src/bin/monitor/main.rs::run_review_only；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::dispatch_post_session_review。
+
+输入：CNInfo 公告、必需 CFFEX 交割、美国指数、USD/CNY；review d 与下一交易日 reminder 分开，Provider canonical。 证据：src/bin/monitor/push_templates.rs::dispatch_r08_event_calendar_outcome_with_loader。
+
+权威事实：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 durable terminal preflight/occurrence 与 task identity/date/hash 严格核对；Delivered 缺 hydration 返回可重试失败，Uncertain/Rejected hydration Terminal 不等于送达。 证据：src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/push_templates.rs::dispatch_r08_event_calendar_outcome_with_loader。
+
+策略：EventCalendar Global/Rolling/86400s，不存在BusinessDateOnce claim；按review occurrence查持久decision。CFFEX 获取失败始终保留 GatewayError.retryable，invalid_evidence/invalid_request 为永久；其他三个组件可明确 degraded。首批获取失败未产生 decision，state/audit 无跨重启终态保证；R08可零item Delivered hydration。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_r08_event_calendar_outcome_with_loader；src/data_gateway/review.rs::GatewayError；src/durable_delivery/coordinator.rs::inspect_review_task_occurrence。
+
+已知缺口：QR01：R08 首批 GatewaySource 失败尚无通知 decision 时仅内存 Terminal/退避加 append audit；缺持久任务终态与版本恢复，旧无 failure artifact 不能补造 typed authority。；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+
+### review-r09-auto
+
+时段：盘后；occurrence：review_task_identity(date,R09) / original business date；Unit：MU-review-r09。
+
+completion owner：business_date_once_claims(business_date,ReviewProviderTopN,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R09)。
+
+触发：交易日19:00起每60秒，R09 独立 due 状态；attempt 实际 at_manual，R04提前而R07仍等21:00。 证据：src/bin/monitor/main.rs::post_session_review_scheduler；src/bin/monitor/main.rs::attempt_post_session_review；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::dispatch_post_session_review。
+
+输入：CapitalDataGateway.provider_top_n_pair(d) 两份Eastmoney榜单，稳定排序投影/canonical/正文hash；仅来源限定 TopN。 证据：src/bin/monitor/push_templates.rs::dispatch_r09_provider_top_n_outcome_with_loader。
+
+权威事实：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 durable terminal preflight/occurrence 与 task identity/date/hash 严格核对；Delivered 缺 hydration 返回可重试失败，Uncertain/Rejected hydration Terminal 不等于送达。 证据：src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/push_templates.rs::dispatch_r09_provider_top_n_outcome_with_loader。
+
+策略：Global/BusinessDateOnce/86400s；claim主键仅date/kind/sub_kind/scope，task identity属于关联decision。同日15:35前 ExpectedWait，未来日永久 Failed；source按typed retryability，canonical失败retryable，envelope/token永久失败。直接deliver_presented_envelope，Delivered 仍核 hydration。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_r09_provider_top_n_outcome_with_loader。
+
+已知缺口：auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+
+### review-r09-backfill
+
+时段：盘后；occurrence：review_task_identity(date,R09) / original business date；Unit：MU-review-r09。
+
+completion owner：business_date_once_claims(business_date,ReviewProviderTopN,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R09)。
+
+触发：backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。 本 producer 仅 R09。 证据：src/bin/monitor/main.rs::run_review_backfill；src/bin/monitor/main.rs::backfill_one_review_task；src/bin/monitor/durable_delivery_runtime.rs::resume_review_task_occurrence；src/bin/monitor/durable_delivery_runtime.rs::authorize_rejected_review_retry；src/durable_delivery/coordinator.rs::inspect_review_task_occurrence；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_r12_backtest_outcome_with_runner。
+
+输入：CapitalDataGateway.provider_top_n_pair(d) 两份Eastmoney榜单，稳定排序投影/canonical/正文hash；仅来源限定 TopN。 证据：src/bin/monitor/push_templates.rs::dispatch_r09_provider_top_n_outcome_with_loader。
+
+权威事实：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 durable terminal preflight/occurrence 与 task identity/date/hash 严格核对；Delivered 缺 hydration 返回可重试失败，Uncertain/Rejected hydration Terminal 不等于送达。 证据：src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/push_templates.rs::dispatch_r09_provider_top_n_outcome_with_loader。
+
+策略：Global/BusinessDateOnce/86400s；claim主键仅date/kind/sub_kind/scope，task identity属于关联decision。同日15:35前 ExpectedWait，未来日永久 Failed；source按typed retryability，canonical失败retryable，envelope/token永久失败。直接deliver_presented_envelope，Delivered 仍核 hydration。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_r09_provider_top_n_outcome_with_loader。
+
+已知缺口：backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。
+
+### review-r09-manual
+
+时段：盘后；occurrence：review_task_identity(date,R09) / original business date；Unit：MU-review-r09。
+
+completion owner：business_date_once_claims(business_date,ReviewProviderTopN,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R09)。
+
+触发：--review 取 latest completed review_date，一次13任务；R09 临时audit state不直接改auto state，Complete/Partial可Ok，NoDelivery Err。 证据：src/bin/monitor/main.rs::run_review_only；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::dispatch_post_session_review。
+
+输入：CapitalDataGateway.provider_top_n_pair(d) 两份Eastmoney榜单，稳定排序投影/canonical/正文hash；仅来源限定 TopN。 证据：src/bin/monitor/push_templates.rs::dispatch_r09_provider_top_n_outcome_with_loader。
+
+权威事实：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 durable terminal preflight/occurrence 与 task identity/date/hash 严格核对；Delivered 缺 hydration 返回可重试失败，Uncertain/Rejected hydration Terminal 不等于送达。 证据：src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/push_templates.rs::dispatch_r09_provider_top_n_outcome_with_loader。
+
+策略：Global/BusinessDateOnce/86400s；claim主键仅date/kind/sub_kind/scope，task identity属于关联decision。同日15:35前 ExpectedWait，未来日永久 Failed；source按typed retryability，canonical失败retryable，envelope/token永久失败。直接deliver_presented_envelope，Delivered 仍核 hydration。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_r09_provider_top_n_outcome_with_loader。
+
+已知缺口：auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+
+### review-r11-auto
+
+时段：盘后；occurrence：review_task_identity(date,R11) / original business date；Unit：MU-review-r11。
+
+completion owner：business_date_once_claims(business_date,PositionReview,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R11)。
+
+触发：交易日19:00起每60秒，R11 独立 due 状态；attempt 实际 at_manual，R04提前而R07仍等21:00。 证据：src/bin/monitor/main.rs::post_session_review_scheduler；src/bin/monitor/main.rs::attempt_post_session_review；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::dispatch_post_session_review。
+
+输入：latest用户确认账户summary、精确d persisted closing valuation、portfolio行业projection；可选AI失败跳过；canonical为date+items。 证据：src/bin/monitor/push_templates.rs::dispatch_position_review_outcome。
+
+权威事实：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 durable terminal preflight/occurrence 与 task identity/date/hash 严格核对；Delivered 缺 hydration 返回可重试失败，Uncertain/Rejected hydration Terminal 不等于送达。 证据：src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/push_templates.rs::dispatch_position_review_outcome。
+
+策略：Global/BusinessDateOnce/86400s；claim主键仅date/kind/sub_kind/scope，task identity属于关联decision。缺summary/精确估值或校验不合格 NoData，读取/worker错retryable；先 inspect 既存decision 再取数/AI；subject=d:position-review hash。全文历史as-of并未由items证明。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_position_review_outcome。
+
+已知缺口：QR03：R11 source canonical 仅 date+items；latest summary、行业 projection 和 AI 正文缺统一历史 as-of/immutable evidence 绑定，精确估值日不证明全文同批。；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+
+### review-r11-backfill
+
+时段：盘后；occurrence：review_task_identity(date,R11) / original business date；Unit：MU-review-r11。
+
+completion owner：business_date_once_claims(business_date,PositionReview,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R11)。
+
+触发：backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。 本 producer 仅 R11。 证据：src/bin/monitor/main.rs::run_review_backfill；src/bin/monitor/main.rs::backfill_one_review_task；src/bin/monitor/durable_delivery_runtime.rs::resume_review_task_occurrence；src/bin/monitor/durable_delivery_runtime.rs::authorize_rejected_review_retry；src/durable_delivery/coordinator.rs::inspect_review_task_occurrence；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_r12_backtest_outcome_with_runner。
+
+输入：latest用户确认账户summary、精确d persisted closing valuation、portfolio行业projection；可选AI失败跳过；canonical为date+items。 证据：src/bin/monitor/push_templates.rs::dispatch_position_review_outcome。
+
+权威事实：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 durable terminal preflight/occurrence 与 task identity/date/hash 严格核对；Delivered 缺 hydration 返回可重试失败，Uncertain/Rejected hydration Terminal 不等于送达。 证据：src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/push_templates.rs::dispatch_position_review_outcome。
+
+策略：Global/BusinessDateOnce/86400s；claim主键仅date/kind/sub_kind/scope，task identity属于关联decision。缺summary/精确估值或校验不合格 NoData，读取/worker错retryable；先 inspect 既存decision 再取数/AI；subject=d:position-review hash。全文历史as-of并未由items证明。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_position_review_outcome。
+
+已知缺口：QR03：R11 source canonical 仅 date+items；latest summary、行业 projection 和 AI 正文缺统一历史 as-of/immutable evidence 绑定，精确估值日不证明全文同批。；backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。
+
+### review-r11-manual
+
+时段：盘后；occurrence：review_task_identity(date,R11) / original business date；Unit：MU-review-r11。
+
+completion owner：business_date_once_claims(business_date,PositionReview,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R11)。
+
+触发：--review 取 latest completed review_date，一次13任务；R11 临时audit state不直接改auto state，Complete/Partial可Ok，NoDelivery Err。 证据：src/bin/monitor/main.rs::run_review_only；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::dispatch_post_session_review。
+
+输入：latest用户确认账户summary、精确d persisted closing valuation、portfolio行业projection；可选AI失败跳过；canonical为date+items。 证据：src/bin/monitor/push_templates.rs::dispatch_position_review_outcome。
+
+权威事实：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 durable terminal preflight/occurrence 与 task identity/date/hash 严格核对；Delivered 缺 hydration 返回可重试失败，Uncertain/Rejected hydration Terminal 不等于送达。 证据：src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/push_templates.rs::dispatch_position_review_outcome。
+
+策略：Global/BusinessDateOnce/86400s；claim主键仅date/kind/sub_kind/scope，task identity属于关联decision。缺summary/精确估值或校验不合格 NoData，读取/worker错retryable；先 inspect 既存decision 再取数/AI；subject=d:position-review hash。全文历史as-of并未由items证明。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_position_review_outcome。
+
+已知缺口：QR03：R11 source canonical 仅 date+items；latest summary、行业 projection 和 AI 正文缺统一历史 as-of/immutable evidence 绑定，精确估值日不证明全文同批。；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+
+### review-r13-auto
+
+时段：盘后；occurrence：review_task_identity(date,R13) / original business date；Unit：MU-review-r13。
+
+completion owner：business_date_once_claims(business_date,WatchlistTracking,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R13)。
+
+触发：交易日19:00起每60秒，R13 独立 due 状态；attempt 实际 at_manual，R04提前而R07仍等21:00。 证据：src/bin/monitor/main.rs::post_session_review_scheduler；src/bin/monitor/main.rs::attempt_post_session_review；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::dispatch_post_session_review。
+
+输入：latest_watchlist_before(d)名单，经check_watchlist_today核对；canonical投影名单日期/票/连板与close/change/limit/streak。 证据：src/bin/monitor/push_templates.rs::dispatch_r13_watchlist_tracking_outcome；src/review/watchlist_tracking.rs::check_watchlist_today；src/bin/monitor/push_templates.rs::dispatch_r13_counted_delivery。
+
+权威事实：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 durable terminal preflight/occurrence 与 task identity/date/hash 严格核对；Delivered 缺 hydration 返回可重试失败，Uncertain/Rejected hydration Terminal 不等于送达。 证据：src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/push_templates.rs::dispatch_r13_watchlist_tracking_outcome。
+
+策略：Global/BusinessDateOnce/86400s；claim主键仅date/kind/sub_kind/scope，task identity属于关联decision。无名单 NoData，读取/核对全失败retryable，允许部分skipped后发送；latest两根日K须latest.date=d，历史重建有限制。Delivered后save_outcomes失败只warn，既存decision重入不补保存；subject=d:watch_date hash。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_r13_watchlist_tracking_outcome。
+
+已知缺口：QR04：A10 名单/R13 outcomes 在 Delivered 后保存失败只 warn，已有 decision preflight 跳过后置保存；缺只修业务记录的恢复 owner。A10 无 claim 历史 real loader 与 stored 首批授权也未解决。；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+
+### review-r13-backfill
+
+时段：盘后；occurrence：review_task_identity(date,R13) / original business date；Unit：MU-review-r13。
+
+completion owner：business_date_once_claims(business_date,WatchlistTracking,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R13)。
+
+触发：backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。 本 producer 仅 R13。 证据：src/bin/monitor/main.rs::run_review_backfill；src/bin/monitor/main.rs::backfill_one_review_task；src/bin/monitor/durable_delivery_runtime.rs::resume_review_task_occurrence；src/bin/monitor/durable_delivery_runtime.rs::authorize_rejected_review_retry；src/durable_delivery/coordinator.rs::inspect_review_task_occurrence；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_r12_backtest_outcome_with_runner。
+
+输入：latest_watchlist_before(d)名单，经check_watchlist_today核对；canonical投影名单日期/票/连板与close/change/limit/streak。 证据：src/bin/monitor/push_templates.rs::dispatch_r13_watchlist_tracking_outcome；src/review/watchlist_tracking.rs::check_watchlist_today；src/bin/monitor/push_templates.rs::dispatch_r13_counted_delivery。
+
+权威事实：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 durable terminal preflight/occurrence 与 task identity/date/hash 严格核对；Delivered 缺 hydration 返回可重试失败，Uncertain/Rejected hydration Terminal 不等于送达。 证据：src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/push_templates.rs::dispatch_r13_watchlist_tracking_outcome。
+
+策略：Global/BusinessDateOnce/86400s；claim主键仅date/kind/sub_kind/scope，task identity属于关联decision。无名单 NoData，读取/核对全失败retryable，允许部分skipped后发送；latest两根日K须latest.date=d，历史重建有限制。Delivered后save_outcomes失败只warn，既存decision重入不补保存；subject=d:watch_date hash。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_r13_watchlist_tracking_outcome。
+
+已知缺口：QR04：A10 名单/R13 outcomes 在 Delivered 后保存失败只 warn，已有 decision preflight 跳过后置保存；缺只修业务记录的恢复 owner。A10 无 claim 历史 real loader 与 stored 首批授权也未解决。；backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。
+
+### review-r13-manual
+
+时段：盘后；occurrence：review_task_identity(date,R13) / original business date；Unit：MU-review-r13。
+
+completion owner：business_date_once_claims(business_date,WatchlistTracking,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R13)。
+
+触发：--review 取 latest completed review_date，一次13任务；R13 临时audit state不直接改auto state，Complete/Partial可Ok，NoDelivery Err。 证据：src/bin/monitor/main.rs::run_review_only；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::dispatch_post_session_review。
+
+输入：latest_watchlist_before(d)名单，经check_watchlist_today核对；canonical投影名单日期/票/连板与close/change/limit/streak。 证据：src/bin/monitor/push_templates.rs::dispatch_r13_watchlist_tracking_outcome；src/review/watchlist_tracking.rs::check_watchlist_today；src/bin/monitor/push_templates.rs::dispatch_r13_counted_delivery。
+
+权威事实：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 durable terminal preflight/occurrence 与 task identity/date/hash 严格核对；Delivered 缺 hydration 返回可重试失败，Uncertain/Rejected hydration Terminal 不等于送达。 证据：src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/push_templates.rs::dispatch_r13_watchlist_tracking_outcome。
+
+策略：Global/BusinessDateOnce/86400s；claim主键仅date/kind/sub_kind/scope，task identity属于关联decision。无名单 NoData，读取/核对全失败retryable，允许部分skipped后发送；latest两根日K须latest.date=d，历史重建有限制。Delivered后save_outcomes失败只warn，既存decision重入不补保存；subject=d:watch_date hash。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/review_batch.rs::ReviewRunContext；src/bin/monitor/review_batch.rs::review_task_identity；src/bin/monitor/review_batch.rs::ReviewScheduleState；src/bin/monitor/review_batch.rs::review_preflight；src/bin/monitor/push_templates.rs::review_outcome_from_existing_durable；src/bin/monitor/main.rs::apply_durable_review_hydrations_and_acknowledge；src/bin/monitor/push_templates.rs::dispatch_post_session_review；src/bin/monitor/push_templates.rs::dispatch_r13_watchlist_tracking_outcome。
+
+已知缺口：QR04：A10 名单/R13 outcomes 在 Delivered 后保存失败只 warn，已有 decision preflight 跳过后置保存；缺只修业务记录的恢复 owner。A10 无 claim 历史 real loader 与 stored 首批授权也未解决。；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+
+### sector-anomaly
+
+时段：盘中；occurrence：sector-anomaly:{date}；Unit：MU-sector-anomaly。
+
+completion owner：business_date_once_claims(business_date,SectorAnomaly,None,GLOBAL) → immutable decision / occurrence=sector-anomaly:{date}。
+
+触发：独立 3600s tick；daily wrapper 只 Pushed=true，无论 true/false 外层均推进本 timer 一小时。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+输入：新闻标题可降级空串，detect_unexplained_moves 的真实 moves；canonical 未含完整新闻归因。 证据：src/bin/monitor/push_templates.rs::dispatch_sector_anomaly_daily；src/bin/monitor/push_templates.rs::push_sector_anomaly_counted；src/bin/monitor/main.rs::monitor_loop。
+
+权威事实：InternalDurable/Global；canonical 数值与时间、subject、正文绑定；额外新闻 lineage 不因该标签获得证明。 证据：src/bin/monitor/push_templates.rs::push_sector_anomaly_counted。
+
+策略：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 BusinessDateOnce/86400s；Empty/source Err/Denied/Deduped 的 false 延后扫描，不等于 durable claim 已完成。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/push_templates.rs::dispatch_sector_anomaly_daily；src/bin/monitor/push_templates.rs::push_sector_anomaly_counted。
+
+已知缺口：QS03：SectorAnomaly 的新闻归因未全部进入 moves canonical；缺少授权“无法解释”结论的不可变 news/moves 批次关联。
+
+### sector-top
+
+时段：盘中；occurrence：sector-top:{date}；Unit：MU-sector-top。
+
+completion owner：business_date_once_claims(business_date,SectorTop,None,GLOBAL) → immutable decision / occurrence=sector-top:{date}。
+
+触发：独立 3600s tick；daily wrapper 只 Pushed=true，无论 true/false 外层均推进本 timer 一小时。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+输入：fetch_board_ranking("f3",5) 的真实领涨板块。 证据：src/bin/monitor/push_templates.rs::dispatch_sector_top_daily_result；src/bin/monitor/push_templates.rs::push_sector_top_counted；src/bin/monitor/main.rs::monitor_loop。
+
+权威事实：InternalDurable/Global；canonical 数值与时间、subject、正文绑定；额外新闻 lineage 不因该标签获得证明。 证据：src/bin/monitor/push_templates.rs::push_sector_top_counted。
+
+策略：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 BusinessDateOnce/86400s；Empty/source Err/Denied/Deduped 的 false 延后扫描，不等于 durable claim 已完成。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/push_templates.rs::dispatch_sector_top_daily_result；src/bin/monitor/push_templates.rs::push_sector_top_counted。
+
+### snapshot-stale-startup
+
+时段：盘前、集合竞价、盘中、盘后；occurrence：today / ≥5 weekday-old account summary；Unit：MU-snapshot-stale。
+
+completion owner：check_snapshot_staleness_and_notify::LAST:SnapshotReminderGate(today,last_confirmed,in_flight)。
+
+触发：服务初始化后无时段 gate，可跨四 Epic。 证据：src/bin/monitor/main.rs::main；src/bin/monitor/main.rs::check_snapshot_staleness_and_notify。
+
+输入：latest user_account_summary.effective_at，计数仅排周末，至少滞后五工作日；无记录/新鲜/&lt;5日直接 return 不封。 证据：src/bin/monitor/main.rs::check_snapshot_staleness_and_notify；src/bin/monitor/main.rs::trading_days_since。
+
+权威事实：同 static try_begin 预约，finish 仅在 Pushed/Deduped 封日，其余清 in_flight 保留重试。 证据：src/bin/monitor/main.rs::SnapshotReminderGate；src/bin/monitor/main.rs::check_snapshot_staleness_and_notify。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 startup 确认会抑制定时；启动失败定时仍可重试，同一天不是两份 owner。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/main.rs::check_snapshot_staleness_and_notify。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### snapshot-stale-timer
+
+时段：盘后；occurrence：today / ≥5 weekday-old account summary；Unit：MU-snapshot-stale。
+
+completion owner：check_snapshot_staleness_and_notify::LAST:SnapshotReminderGate(today,last_confirmed,in_flight)。
+
+触发：intraday_loop 在15:10–15:13调用。 证据：src/bin/monitor/main.rs::monitor_loop；src/bin/monitor/main.rs::check_snapshot_staleness_and_notify。
+
+输入：latest user_account_summary.effective_at，计数仅排周末，至少滞后五工作日；无记录/新鲜/&lt;5日直接 return 不封。 证据：src/bin/monitor/main.rs::check_snapshot_staleness_and_notify；src/bin/monitor/main.rs::trading_days_since。
+
+权威事实：同 static try_begin 预约，finish 仅在 Pushed/Deduped 封日，其余清 in_flight 保留重试。 证据：src/bin/monitor/main.rs::SnapshotReminderGate；src/bin/monitor/main.rs::check_snapshot_staleness_and_notify。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 startup 确认会抑制定时；启动失败定时仍可重试，同一天不是两份 owner。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/main.rs::check_snapshot_staleness_and_notify。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### st-price-limit-batch
+
+时段：盘中；occurrence：ST portfolio batch / session ≥09:30；Unit：MU-st-price。
+
+completion owner：monitor_loop.st_price_pushed[session]；L4(st_price_limit_changed,code,空 sub_kind)。
+
+触发：market active 分支 t≥09:30 且未 st_price_pushed。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+输入：真实 ST 持仓 metadata、execution_quote 和重算风险线；先完整 prepare 再发送。 证据：src/bin/monitor/main.rs::dispatch_st_price_limit_batch；src/bin/monitor/push_templates.rs::dispatch_st_price_limit_changed。
+
+权威事实：当前实参为 5%→10%，并非动态规则事件 authority；T-16 token/generic。 证据：src/bin/monitor/main.rs::dispatch_st_price_limit_batch；src/bin/monitor/push_templates.rs::dispatch_st_price_limit_changed。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 source/prepare Err 不发；一票 false 即 Err、已发票不回滚；外层 Ok(count) 包括0才封 bool。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/push_templates.rs::dispatch_outcome；src/bin/monitor/push_templates.rs::record_uncounted_cooldown；src/bin/monitor/main.rs::dispatch_st_price_limit_batch；src/bin/monitor/main.rs::monitor_loop。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### t0-advice
+
+时段：盘中；occurrence：t0 decision domain/canonical SHA256；Unit：MU-t0。
+
+completion owner：counted decision(T0Advice,Ticket,T0PlanDecisionBindingV1.decision_id(),source fingerprint,subject,policy,rendered hash)。
+
+触发：每 30s 持仓做 T evaluate_structured 的 Advice 分支；Forbidden/Rejected 不出消息。 证据：src/bin/monitor/main.rs::monitor_loop；src/bin/monitor/main.rs::prepare_t0_messages。
+
+输入：确认持仓与 Magic TDX evidence、计划、真实 bars/quote；Provider observed_at/as_of/batch 进入 binding。 证据：src/bin/monitor/main.rs::prepare_t0_messages；src/decision/t0_advisor.rs::T0PlanDecisionBindingV1。
+
+权威事实：T-05 token；可审计 T0PlanDecisionBindingV1；放宽时效分支正文标明不可信。 证据：src/bin/monitor/main.rs::prepare_t0_messages；src/decision/t0_advisor.rs::T0PlanDecisionBindingV1。
+
+策略：counted envelope 绑定 business date、kind/sub_kind、scope、occurrence、source fingerprint、subject、policy version 和 rendered hash；source canonical 另存 SHA 并验证。共享数据库/预算不构成共享 decision。 Ticket/Rolling 1800s；空批或全 Pushed/Deduped 推进 last_t0_scan，source/token/Denied/SinkError 保持 due。 证据：src/bin/monitor/notify.rs::push_counted_with_binding；src/durable_delivery/model.rs::compiled_policy_catalog；src/durable_delivery/model.rs::DeliveryEnvelope；src/durable_delivery/coordinator.rs::inspect_business_date_once_claim；src/bin/monitor/main.rs::monitor_loop。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。
+
+### virtual-watch-confirm
+
+时段：盘中；occurrence：virtual observation session / confirm；Unit：MU-virtual-watch。
+
+completion owner：L4(virtual_watch,空 code,空 sub_kind)；共享 monitor_loop.virtual_observation vector / virtual_snapshot_persisted[session]。
+
+触发：Confirm 模式、Morning、vector 非空且全部 price=0；当前 vector 为空故受阻，loader 不新增成员。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+输入：观察 vector 的 code/name/price；只有正价项能入快照/出卡，confirm 补价后按 confirm_shares 计算。 证据：src/bin/monitor/main.rs::monitor_loop；src/bin/monitor/push_templates.rs::dispatch_virtual_watch_daily。
+
+权威事实：持久观察快照是业务输入；pilot 先写 snapshot flag 再 send，confirm 先补价再快照再 send，没有 virtual_confirmed 标志。 证据：src/bin/monitor/main.rs::monitor_loop；src/bin/monitor/push_templates.rs::dispatch_virtual_watch_daily。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 confirm bool 被忽略；任何一项价格变正会失去全零资格，失败不恢复资格或快照 flag。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/push_templates.rs::dispatch_virtual_watch_daily。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。；STARVED：当前自产 vector 无输入；历史文件不能证明此入口可产新观察。
+
+### virtual-watch-pilot
+
+时段：集合竞价；occurrence：virtual observation session / pilot；Unit：MU-virtual-watch。
+
+completion owner：L4(virtual_watch,空 code,空 sub_kind)；共享 monitor_loop.virtual_observation vector / virtual_snapshot_persisted[session]。
+
+触发：竞价 pilot 从 post_close 文本填 vector，但源码将其置空，当前无输入。 证据：src/bin/monitor/main.rs::monitor_loop。
+
+输入：观察 vector 的 code/name/price；只有正价项能入快照/出卡，confirm 补价后按 confirm_shares 计算。 证据：src/bin/monitor/main.rs::monitor_loop；src/bin/monitor/push_templates.rs::dispatch_virtual_watch_daily。
+
+权威事实：持久观察快照是业务输入；pilot 先写 snapshot flag 再 send，confirm 先补价再快照再 send，没有 virtual_confirmed 标志。 证据：src/bin/monitor/main.rs::monitor_loop；src/bin/monitor/push_templates.rs::dispatch_virtual_watch_daily。
+
+策略：注册展示/通用 governance；L4 键为 event.kind、实际 code（无 code 则空串）、sub_kind；仅有效非零 cooldown 写冷却。Pushed/bool 是当前实现结果，不推断外部接收。 confirm bool 被忽略；任何一项价格变正会失去全零资格，失败不恢复资格或快照 flag。 证据：src/bin/monitor/notify.rs::push_governor_inner_with_source_evidence；src/bin/monitor/notify.rs::push_presented_v3；src/bin/monitor/v14_adapter.rs::signal_event_for_kind；src/bin/monitor/v14_adapter.rs::dedup_cooldown；src/push_l4/dispatcher.rs::reserve_with_identity；src/push_l4/dispatcher.rs::commit_with_identity；src/bin/monitor/push_templates.rs::dispatch_virtual_watch_daily。
+
+已知缺口：QS05：generic bool/L4 的结果未形成真实 TransportAccepted 与崩溃恢复绑定；业务记录、文件、内存 confirmed 和本地 audit 均不能证明外部接收。；STARVED：当前自产 vector 无输入；历史文件不能证明此入口可产新观察。
+
+## MigrationUnit
+
+- MU-account-mode：account-mode-main；owner account_mode_log[log_id].pushed（同模式未确认复用 log_id）。账户主通知与 Frozen 副推不是同完成列；hook 成功还要求最终 banner 刷新。
+- MU-analyst：analyst-upgrade；owner L4(analyst_upgrade,source_fact_event_id(analyst:{code}:{broker}:{report_id}),空 sub_kind)。AnalystStateStore(code,broker) 观察事实及独立 last_poll_analyst 不等于通知完成。
+- MU-announcement：news-announcement；owner news_dedup.key=annroute:{observed_date}:{source}:{external_id}；独立 L4(announcement,source_fact_event_id,空 sub_kind)。公告 claim 与 L4 两层不原子；正常失败释放认领，未发现 crash receipt 恢复。
+- MU-attribution-daily：attribution-daily；owner monitor_loop::ATTRIBUTION_LAST_RUN[calendar_date]。仅该外层日期门；cooldown_secs=None，经 dedup_cooldown 保持 None，L4 reserve/commit 不读写冷却，不造 L4 owner。
+- MU-auction-candidates：auction-repush、candidate-board、candidate-invalidated；owner monitor_loop.post_close_candidates_notified[session]；candidate_board_snapshot[{date}].jsonl 最末 code 集（双层非原子推进链）。A02/主卡共享同一双 bool 外门；失效子推由主卡同一快照推进。三 kind 的 L4/模板键各自独立，此 Unit 保留实际共享推进链，不声称存在共同原子 receipt。
+- MU-auction-volume：auction-volume；owner monitor_loop.auction_vol_notified[session,code]；独立 L4(auction_volume,空 code,空 sub_kind)。外层选股 set 在 dispatcher true 后 insert；两次数据读取与推送 recorder 并非原子完成。
+- MU-block-confirm：block-confirm-side-route；owner COOLDOWN_TABLE(BlockTradeIntradayConfirm,code)；L4(block_trade_intraday_confirm,code,空 sub_kind)。非ReviewTask side route，逐票两层300s冷却；无交易记录/业务日期durable identity或批次日门。
+- MU-chain-post-close：chain-post-close-timer；owner monitor_loop::CHAIN_POST_LAST[calendar_date]。独立static日期门；与另一timer/CLI无共同durable通知cursor。业务日和封口calendar date不同。
+- MU-chain-preopen：chain-preopen-timer；owner monitor_loop::CHAIN_PREOPEN_LAST[calendar_date]。独立static日期门；与另一timer/CLI无共同durable通知cursor。业务日和封口calendar date不同。
+- MU-cli-chain：cli-chain；owner run_chain_analysis_mode(invocation) 的 Result&lt;()&gt;；无独立持久通知 cursor。CLI单次函数完成；与两个timer仅共享分析代码/业务报告，不能由共享函数合并日期状态。
+- MU-cli-single：cli-single-default、cli-single-lhb、cli-single-schedule；owner AnalysisPipeline::process_stock_inner(invocation,code) 的 Option&lt;AnalysisResult&gt;；无持久通知 completion cursor。default CLI/schedule/LHB 复用同每次每票流程；共享分析数据库只是业务状态，未存在跨调用原子通知 owner。
+- MU-cli-summary：cli-summary-default、cli-summary-lhb、cli-summary-schedule；owner AnalysisPipeline::run(invocation) 的 results / send_summary_notification_to 返回值；无持久通知 completion cursor。default CLI/schedule/LHB 的每次结果集汇总；同日报告文件名不是通知owner，与单股形态分开。
+- MU-close-call：close-call；owner counted decision(CloseCall,Ticket,close-call:{date}:{code},source fingerprint,subject,policy,rendered hash)。独立 CloseCall binding；外 close_call_pushed 不是 durable receipt，也没有 HoldingPlan 日表。
+- MU-d01：d01-announcement、d01-manual；owner D01_LAST_PUSH[code:name]；COOLDOWN_TABLE(NewsToIdea,空 code)；L4 无冷却（PerTicket 缺 code）。公告触发与 --push 下游共用内存 memo/模板冷却；optional_dispatch_code 将空 code 转 None，dedup_cooldown 对 PerTicket 返回 None，L4 不读写冷却。CLI 新进程 banner 阻断，不虚构跨进程 claim。
+- MU-data-mode：data-mode；owner LATEST_DATA_MODE；DATA_MODE_PENDING_STABLE(mode,since)；DATA_MODE_UNSAFE_REMINDER(fingerprint,external_confirmed_at,heartbeat_at)。三个内存状态层并非 durable receipt；内部 heartbeat 和外部通知确认明确分开。
+- MU-earnings-beat：earnings-beat；owner L4(earnings_beat,source_fact_event_id(earnings:{code}:{report_date}),空 sub_kind)。同 earnings 扫描与 last_poll_earnings[code]，但 Beat/Miss 的 event.kind 不同，最终 Unit 分开；共享轮询不是原子通知完成。
+- MU-earnings-miss：earnings-miss；owner L4(earnings_miss,source_fact_event_id(earnings:{code}:{report_date}),空 sub_kind)。同 earnings 扫描与 last_poll_earnings[code]，但 Beat/Miss 的 event.kind 不同，最终 Unit 分开；共享轮询不是原子通知完成。
+- MU-fixed-fill：post-fixed-fill；owner monitor_loop.last_post_fixed_fill[session]；L4(post_fixed_price_fill,code,空 sub_kind)。当前 TradeEventSource OnceLock 无生产注册；保留已接线但 STARVED 路径，timer 各自独立，不能制造消费 ack。
+- MU-fixed-order：post-fixed-order；owner monitor_loop.last_post_fixed_order[session]；L4(post_fixed_price_order,code,空 sub_kind)。当前 TradeEventSource OnceLock 无生产注册；保留已接线但 STARVED 路径，timer 各自独立，不能制造消费 ack。
+- MU-frozen-side：account-frozen-side；owner L4(market_action_alert,FROZEN,空 sub_kind)；触发资格来自 account_mode_log 新建事实，无副推持久确认列。Frozen 主 log 创建是单向 trigger 依赖；主 pushed 不是副推完成 authority。
+- MU-g5b-attribution：g5b-attribution；owner monitor_loop::G5B_LAST_RUN[calendar_date]。仅该外层日期门；cooldown_secs=None，经 dedup_cooldown 保持 None，L4 reserve/commit 不读写冷却，不造 L4 owner。
+- MU-holding-plan：holding-plan-manual、holding-plan-periodic；owner counted decision(HoldingPlan,Ticket,holding-plan:{date}:{code},source fingerprint,subject,policy,rendered hash)。定时与 --push 复用同 counted family；实际 source/rendered hash 相同才是同 decision，不能凭可读 occurrence 声称每日唯一。
+- MU-industry-intraday：industry-chain-manual、industry-chain-periodic；owner L4(industry_chain_intraday,空 code,空 sub_kind)；COOLDOWN_TABLE(IndustryChainIntraday,空 code)。定时和 manual 同一通知冷却；仅 periodic 有 last_industry_chain_intraday；与 R03/enum 外 chain 分开。
+- MU-intraday-market：market-manual-i01、market-preopen-probe、market-snapshot-warning、market-view-periodic；owner L4(intraday_market,空 code,空 sub_kind)。四入口共享实际空 code 冷却，但 last_market_view、SNAP_REMIND_LAST、PREOPEN_PROBE_LAST 和无状态 CLI 各有独立外门；不等于同一原子日级 owner。
+- MU-ipo-catalyst：ipo-catalyst-side-route；owner COOLDOWN_TABLE(IpoCatalyst,空 code)；L4(ipo_catalyst,空 code,空 sub_kind)。非ReviewTask且无日级LAST/claim；R08同date公告缓存只复用输入，非共享发送完成。
+- MU-limit-boards：limit-boards-first、limit-boards-second、limit-boards-third-plus；owner monitor_loop.board_notified[session,code]；L4(limit_boards,空 code,空 sub_kind)。三展示形态共享预先 insert 的 code set 与同一空 code 冷却，token 不产生子类去重。
+- MU-news-ai：news-ai-same-tick；owner news_ai_delivery_event(delivery_identity_sha256=assessment_id,reservation,state)；assessment=provider+batch_id+item_id+target_code+analysis_version hash。NewsToIdea 的 NewsAI producer 与 D01 分离：此处是 append-only assessment/delivery/prediction 状态链。
+- MU-news-catalyst：catalyst-announcement、catalyst-manual；owner L4(news_catalyst,空 code,空 sub_kind)；模板 COOLDOWN_TABLE(NewsCatalyst,空 code)。I02 无独立 durable occurrence；公告和手动分支的共享下游冷却与 D01 memo 不同。
+- MU-news-flash-aggregate：news-flash-aggregate；owner NewsFlash authority accepted-window(business_date,window) / window_state[index]；reservation_identity_sha256+attempt_ordinal。N02 各窗口 own settlement；N01 critical accepted-event/quota 域独立且当前不产生 producer，不借 N02 激活。
+- MU-order-alert：order-update-alert；owner MarketActionState.seen[code]=(action,shares)；L4(market_action_alert,code,空 sub_kind)。EventBus 订单事实状态先推进；与 Frozen 不同 code/触发和生命周期，不按共享 kind 合并。
+- MU-p01：p01-compensation、p01-scheduled；owner business_date_once_claims(business_date,PreopenNewsHot,None,GLOBAL) → immutable decision / occurrence=p01:{business_date}。scheduler 与 compensation 使用同一四列 claim；render mode/hash 不产生第二个 claim。
+- MU-paper-review-daily：paper-review-daily-auto、paper-review-daily-manual、paper-review-daily-push；owner COOLDOWN_TABLE(PaperReview,code)；L4(paper_review,code,空 sub_kind)。A01 auto/manual/--push 的实际股票code冷却同范围；Global metadata不清code。无counted decision，自动历史backfill明确排除A01；与noon-code分开。
+- MU-paper-review-noon：paper-review-noon；owner monitor_loop::NOON_SNAP_LAST[calendar_date]；潜在模板/L4(PaperReview,noon-code,空 sub_kind)。noon 当前结构受阻，外门仍推进；与 daily 的实际 code 键分开，没有 durable 通知 owner。
+- MU-paper-sell：paper-sell-intraday、paper-sell-post-close；owner paper_trades(code,direction=sell,status=Filled,date(ts))；L4(paper_sell,code,空 sub_kind)。两个入口共享 code/day/Filled 卖出防重；Filled 是业务成交事实，发送在返回 sold 后发生，没有共同通知事务。
+- MU-paper-trade：paper-trade-terminal；owner counted decision(PaperTrade,Ticket,terminal_transition_id,source fingerprint,subject,policy,rendered hash)。PaperTradeTerminalBindingV1 的交易终态 occurrence 与通知 decision 分离，不与卖出 code/day/Filled 防重合并。
+- MU-review-a10：review-a10-auto、review-a10-backfill、review-a10-manual、review-a10-push；owner business_date_once_claims(business_date,CatalystReview,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,A10)。A10 auto/manual/backfill/--push 共原业务日通知owner；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+- MU-review-r03-auto：review-r03-auto；owner post_session_review_scheduler::ReviewScheduleState(date).tasks[R03]。R03 的账户依赖门目前不给 dispatcher 发送权限；没有活动 counted completion可用于合并两入口。潜在IndustryChain/date/GLOBAL policy不等于已存在通知owner。
+- MU-review-r03-manual：review-r03-manual；owner run_review_only::temporary audit_state(invocation,date).tasks[R03]。R03 的账户依赖门目前不给 dispatcher 发送权限；没有活动 counted completion可用于合并两入口。潜在IndustryChain/date/GLOBAL policy不等于已存在通知owner。
+- MU-review-r04：review-r04-auto、review-r04-backfill、review-r04-manual；owner business_date_once_claims(business_date,ReviewLhb,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R04)。R04 auto/manual/backfill 共原业务日通知owner；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+- MU-review-r07：review-r07-auto、review-r07-backfill、review-r07-manual；owner business_date_once_claims(business_date,TomorrowWatch,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R07)。R07 auto/manual/backfill 共原业务日通知owner；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+- MU-review-r08：review-r08-auto、review-r08-backfill、review-r08-manual；owner durable review occurrence(business_date,EventCalendar,None,GLOBAL,review_task_identity(date,R08)) → Rolling immutable decision。R08 auto/manual/backfill 共原业务日通知owner；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+- MU-review-r09：review-r09-auto、review-r09-backfill、review-r09-manual；owner business_date_once_claims(business_date,ReviewProviderTopN,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R09)。R09 auto/manual/backfill 共原业务日通知owner；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+- MU-review-r11：review-r11-auto、review-r11-backfill、review-r11-manual；owner business_date_once_claims(business_date,PositionReview,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R11)。R11 auto/manual/backfill 共原业务日通知owner；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+- MU-review-r13：review-r13-auto、review-r13-backfill、review-r13-manual；owner business_date_once_claims(business_date,WatchlistTracking,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R13)。R13 auto/manual/backfill 共原业务日通知owner；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。
+- MU-sector-anomaly：sector-anomaly；owner business_date_once_claims(business_date,SectorAnomaly,None,GLOBAL) → immutable decision / occurrence=sector-anomaly:{date}。SectorAnomaly 的 kind、claim 和外层 last_sector_anomaly 独立；同 coordinator/budget 不合并。
+- MU-sector-top：sector-top；owner business_date_once_claims(business_date,SectorTop,None,GLOBAL) → immutable decision / occurrence=sector-top:{date}。SectorTop 的 kind、claim 和外层 last_sector_top 独立；同 coordinator/budget 不合并。
+- MU-snapshot-stale：snapshot-stale-startup、snapshot-stale-timer；owner check_snapshot_staleness_and_notify::LAST:SnapshotReminderGate(today,last_confirmed,in_flight)。startup 和 timer 同函数 static 日期预约/确认；与持仓快照 6h 警告分开。
+- MU-st-price：st-price-limit-batch；owner monitor_loop.st_price_pushed[session]；L4(st_price_limit_changed,code,空 sub_kind)。外层批次 bool 与逐票冷却分层；零条 Ok 也封口，部分发送不回滚。
+- MU-t0：t0-advice；owner counted decision(T0Advice,Ticket,T0PlanDecisionBindingV1.decision_id(),source fingerprint,subject,policy,rendered hash)。独立 T0 decision canonical hash，不能因为同持仓/DB 与 HoldingPlan 合并；last_t0_scan 只为调度。
+- MU-virtual-watch：virtual-watch-confirm、virtual-watch-pilot；owner L4(virtual_watch,空 code,空 sub_kind)；共享 monitor_loop.virtual_observation vector / virtual_snapshot_persisted[session]。两入口的共享 vector 和快照是业务状态，独立于冷却；当前唯一 vector 填充受空 post_close 限制。
+
+## 原工作树未移入项
+
+- PaperBuy：仅原混合工作树存在，本隔离分支未移入。
+- Watchdog：仅原混合工作树存在，本隔离分支未移入。
+
+## 稳定证据索引
+
+Rust 符号按词法声明定位；impl 使用去掉 impl 和左花括号后的完整头，仅折叠空白，保留泛型、trait for 和 where。重复声明失败。模块必须有内联主体；无主体声明及不能可靠定位的语法不猜测。哈希包含声明行至闭合行的原始字节及实际行结束符。
+
+| evidence | 文件 | 符号 | 行 | SHA256 |
+| --- | --- | --- | --- | --- |
+| a01-daily | src/bin/monitor/push_templates.rs | dispatch_paper_review_daily_outcome | 4600–4621 | a86019318b90cd5c5be12d2f8cdfa1d54fb6aad3889143c3591b62ec426adef9 |
+| a01-eligibility | src/bin/monitor/push_templates.rs | classify_a01_target | 4257–4275 | 08395886a3510cf532970fc8de1d12316975551edc30f36336995b27e632ab39 |
+| a01-noon | src/bin/monitor/push_templates.rs | dispatch_paper_review_noon | 4633–4652 | 30a80189630bb0d4bddd47e4a7b6d07f5211a2ffbadda1ac495cb6c97f48485e |
+| a01-push | src/bin/monitor/push_templates.rs | push_paper_review_outcome | 14278–14292 | bbb9a47b02a57bc62f4f56a132113e080bec6c1ded17c1403f6430eee56fb0e8 |
+| a01-source | src/bin/monitor/push_templates.rs | load_paper_review_snapshot_real | 4390–4567 | c1e6a0fcba72b0c4ec1d79f8c2206f7f5c6bc0237a1d86e6a247c10fab4a33b8 |
+| a10-catalyst | src/bin/monitor/push_templates.rs | dispatch_catalyst_review_daily_outcome | 13622–13825 | 045d1a6be0197d87c8d1cc96d8e5c25cebb227d3f3b693e81c852d11007bb74d |
+| a10-source | src/review/catalyst_review.rs | load_catalyst_review_snapshot_real | 184–191 | dcf837fe2d1935efe533025935fe7add1c56d5e4d88fedd903da217d4038cc05 |
+| account-finalize | src/bin/monitor/push_templates.rs | finalize_account_mode_delivery | 1844–1852 | 48882873b249027477a44a59252ba73561ec0d080085bb0ebef8c93529cab36a |
+| account-hook | src/bin/monitor/main.rs | evaluate_account_mode_hook | 2240–2362 | aa38f8cedcea27c441c8ffaaa82fdf205720a1ec6149188632354d7e74c8e055 |
+| account-plan | src/bin/monitor/push_templates.rs | plan_account_mode_notification | 1867–1888 | c8f7a21b743df34582732ed194efbd7c97ae3a59b3db9afc349ae6d5fdc8a3de |
+| account-push | src/bin/monitor/push_templates.rs | push_account_mode_change | 1901–2070 | 9019c4c03bb45cafcf9109d044bfe540235cd2de93db3057f44fc21b10edeca7 |
+| adapter-cooldown | src/bin/monitor/v14_adapter.rs | dedup_cooldown | 959–974 | 375fba5d168458f04f096299ba9916924a0a46a75eb9023ae16f49945444da13 |
+| adapter-kind | src/bin/monitor/v14_adapter.rs | map_push_kind | 1160–1257 | 038747a55aba483753e152f32caaf9359081b1a25b4aac0de725628f41a1fad8 |
+| adapter-signal | src/bin/monitor/v14_adapter.rs | signal_event_for_kind | 1266–1276 | 966912fb2494451345cc57ba9f93b9fb96084aa06b8aca2cad0625a57ac9d83a |
+| adapter-source-fact | src/bin/monitor/v14_adapter.rs | signal_event_for_source_fact | 1278–1296 | 846b07c6f0cf0a3735e271d3530dd726ba8888882ca8fb6aa73c86e6477c634e |
+| alert-disabled | src/bin/monitor/main.rs | reject_unbound_alert_delivery | 11523–11531 | 247697fad658e6941f517171be260d28a0f46fa852f16dc77e27766509a5aa05 |
+| analyst-event | src/bin/monitor/v17_sources.rs | analyst_upgrade_event | 922–960 | b3f8f59e4233ec27b92009be2a13fadf75aa7bc0eaec9ad653ecc5b985de77a4 |
+| analyst-observe | src/news/aggregator/analyst_state.rs | observe | 70–170 | 1cd0eb6f291762c22f8d7032810c8b5678ab4d57643a32463635fe2320291694 |
+| announcement-batch | src/bin/monitor/v17_sources.rs | route_announcement_batch | 324–362 | 213c29de7b0dea3c128787565aa38662a90a9bfa8fe36c2e2709b2b4a46141c3 |
+| announcement-claim | src/monitor/news_monitor.rs | claim_dedup_key | 450–466 | 3e57b9f98b0832017cc3bb90d7f2766ec459504e8031290ecce7d4d925bfbaf7 |
+| announcement-classify | src/news/aggregator/classifier.rs | classify_announcement_with_provenance | 225–269 | 99fa6417070fc378bca997ae04b67b24ebe03d450efbe0cebf20e4416852ccd3 |
+| announcement-release | src/monitor/news_monitor.rs | release_dedup_key | 469–481 | 70671374ab1510ae8bd41133f208080decef1d09f8fa783807e04e4c327e92fc |
+| announcement-route | src/bin/monitor/v17_sources.rs | route_announcements_with_provenance | 364–540 | 96047303bf7b83e054c363e36c092a58f0891f4062b81650f5d6499eaee77e93 |
+| auction-repush | src/bin/monitor/push_templates.rs | dispatch_auction_repush | 7220–7275 | 302ff8bb4c6773afb77a2d9360ae2280ef9dad2cf41bf661cffccb19956c140d |
+| auction-source | src/bin/monitor/push_templates.rs | load_auction_volume_snapshot_real | 5874–5934 | 4d66934563f8907e6ce417d3b9eccfca6ef866f757173a3eb52f581f1e8de0b9 |
+| auction-volume | src/bin/monitor/push_templates.rs | dispatch_auction_volume_daily | 5937–6017 | c0de1a5b95efcbb14a09c4743a10e62aa56e1fb62e0a74b3318f66487e3e4420 |
+| banner-read | src/bin/monitor/main.rs | current_banner | 1680–1686 | 74cbe9fc566db12573b14a40ca7b78da487db2f6468b3d12ecb029f399da27f0 |
+| block-confirm | src/bin/monitor/push_templates.rs | dispatch_block_trade_intraday_confirm | 5129–5174 | c53dc19697f08bc942c34bc5afd03ab3229e9cfcda0c23654b70fa03b116e2ee |
+| block-range | src/bin/monitor/push_templates.rs | dispatch_block_trade_price_range | 5178–5215 | 453e74335e301177207e5e3f74932d88d1a1d4b808b7f568f9ad3ba0d3791375 |
+| block-review | src/bin/monitor/push_templates.rs | dispatch_block_trade_review | 7684–7748 | d2b78104780e81a71f8857b2ffd2d5d90699a68231a3a0d968a3993df3ef0055 |
+| candidate-board | src/bin/monitor/push_templates.rs | dispatch_candidate_board | 7790–7865 | c1ae8c78502e15a31deafe8632597785e321b2d538d532b5d343874a4429b754 |
+| candidate-invalidated | src/bin/monitor/push_templates.rs | push_candidate_invalidated | 14340–14358 | 24b235cf6b293a3e87de998ef583295b1a8d00ff61e7a0b2d2a389f675b251e8 |
+| candidate-snapshot-read | src/bin/monitor/push_templates.rs | candidate_snapshot_previous | 7763–7769 | 492863d686adf73bb360ab145df5b6e290dd097dfd225b9a9135c67494d96041 |
+| candidate-snapshot-write | src/bin/monitor/push_templates.rs | candidate_snapshot_persist | 7771–7787 | 4f461b206b87e99d66d6e0b7f2f0895d89a1fb0861060324f0db31809c8c00ef |
+| candidate-source | src/bin/monitor/push_templates.rs | load_real_candidate_batch | 3829–3886 | 6a307e1efe446e3631b954b2b26d67fa3d45903171958169b9e6dc9829553e50 |
+| candidate-trigger | src/bin/monitor/push_templates.rs | dispatch_candidate_triggered_daily | 5714–5836 | 4481af71336cdfe6bb8bfcdcf8d584d31c50c84ca540d576500bd409f2165403 |
+| candidate-trigger-push | src/bin/monitor/push_templates.rs | push_candidate_triggered | 14321–14337 | 192586e18639c30b08e48f09054fb3fa63b6cfe3d73c614d97993ad68d182aed |
+| catalyst-dispatch | src/bin/monitor/push_templates.rs | dispatch_news_catalyst_daily | 2981–3077 | 52f0972ef6a23f8704013ce12a3e2db84b08015e8f056765ffb9d450a56145e5 |
+| catalyst-push | src/bin/monitor/push_templates.rs | push_news_catalyst | 14140–14156 | f4c9468125b0620cdbcf416a3a076f856e90294c129fad75a6dccfcef2fb7c46 |
+| catalyst-source | src/bin/monitor/push_templates.rs | load_news_catalyst_snapshot_real | 2876–2972 | 385165b1d81a54db1327e83a4a27609cada3640d872cfe4ab546b6b042263c09 |
+| channel-send | src/notification/service.rs | send | 126–267 | 9aacf73b87a21f0582510ea8557b525ab9a4921c3a177fe27c9dd950e15b7cef |
+| claim-inspect | src/durable_delivery/coordinator.rs | inspect_business_date_once_claim | 2848–2955 | 331aa3d0d8940bd36124d8d529b5c19cbc17dfa99e3f2a891120d7f24056f277 |
+| cli-analysis | src/app/modes.rs | run_analysis | 14–81 | 8b133898feed996642a6018d56041ae87d19c06bacc6c413484b3662a7bbe54b |
+| cli-chain | src/app/modes.rs | run_chain_analysis_mode | 106–183 | f484d704bf305598ae2bc267d3b9bfa2b8c6ff6fe8fb12f3638a4f19f18f1005 |
+| cli-lhb | src/app/modes.rs | run_lhb_analysis | 186–328 | 94170df3a80a32857be729ff85314b8f5d9f8ee5873737cce085141a85dc831d |
+| cli-live-summary | src/pipeline/mod.rs | send_live_summary | 664–732 | 91959f895de4eb1613b7100befa42ccd8255df70a9c26b72e87174809b93fd65 |
+| cli-main | src/main.rs | main | 26–120 | c7c5bf4973c642a4f9b6e5459df33360fcf531a9cc0a2314ab61e855a23391a2 |
+| cli-save-only | src/app/modes.rs | run_market_review_only | 83–103 | 7e3d8f02303dd94350c5a34c3415455c9e7ff0da283c27fff436b9baa2b66e12 |
+| cli-schedule | src/app/schedule.rs | run_scheduled_analysis | 16–28 | 7a6830dbe680d7a15fa3e527e086acd8ccc58ae51ff97e13e5e0cbdad0d3ca25 |
+| cli-schedule-execute | src/app/schedule.rs | execute_analysis | 237–261 | 53222bb2a7ce1424fe4d7cd8838a8ff3b1eb4c451d6eb86dc4788545bdc7e1e7 |
+| cli-stock | src/pipeline/analyze.rs | process_stock_inner | 1137–1262 | 67ea88df4e81eb16fd2a311aaa66d5e2df7f94b818714fa5b64b7ea81c7998de |
+| cli-summary | src/pipeline/summary_notify.rs | send_summary_notification_to | 64–115 | 18fe44a82dac5682ac013b38d6e7aeb9d082be005ce9582f3cc287b7e6020402 |
+| close-call | src/bin/monitor/main.rs | prepare_close_call_messages | 8637–8708 | ad302ec4a6bac23f64fdc8384642a215df2874a12c828266259a2fcad26e8307 |
+| counted-envelope | src/durable_delivery/model.rs | DeliveryEnvelope | 611–797 | b3b78718f491158f6d63810ebb5cdcf6931eb90480d0b90a857580581778a3ee |
+| counted-policy | src/durable_delivery/model.rs | compiled_policy_catalog | 409–543 | 53a9474b3582d0ac255883f4309ab193bced63860d21b85f2d11ea56024edb9b |
+| counted-push | src/bin/monitor/notify.rs | push_counted_with_binding | 2891–2933 | e4f341cda75a6b8da063bdf45979716362a87dd244e311e6d816c5a281746401 |
+| d01-dispatch | src/bin/monitor/push_templates.rs | dispatch_news_to_idea_daily | 4077–4184 | 55d14728732e8f543ed4bb00e877927d25c45903f07f113376e6652ff446be30 |
+| d01-push | src/bin/monitor/push_templates.rs | push_news_to_idea | 14255–14271 | d107ecd6c552a15e56fc2714b60d6f14259cb6401ed62a16b81553cad6ad48e1 |
+| d01-source | src/bin/monitor/push_templates.rs | load_news_to_idea_snapshot_real | 3891–3935 | 8f6baa797a1ceba0c862bad940cd67e1fff3e17c2487cb61cac4162a70d05f43 |
+| data-mode-commit | src/bin/monitor/main.rs | commit_data_mode_status_result | 2523–2538 | 0469f9ee7f5cfb99be2173a8eeaad141cdb48f9aedb7e7cb14c8c41963374fdf |
+| data-mode-heartbeat | src/bin/monitor/main.rs | commit_due_unsafe_heartbeat | 2540–2562 | 1d3bfd1d3f9d1835c5b7dbc3a8e524bc18b6d7c8da00b60433b61be693f19be7 |
+| data-mode-hook | src/bin/monitor/main.rs | evaluate_data_mode_hook | 2564–2786 | 4ec28d97ec629b3e5e47949895cb1e0d051771525c855e6a2cc2a6b02dc6eb82 |
+| data-mode-plan | src/bin/monitor/push_templates.rs | data_mode_notification_plan | 14388–14430 | 8611539b7d455a56cbc6eee52f12a3ef79b54bc4d2f619227835add0e58760cc |
+| data-mode-push | src/bin/monitor/push_templates.rs | push_data_mode_change | 14447–14549 | a9c886698beba3c7ff2bf432a33c8d38d8d3fb40fb52c733b332a962713e0432 |
+| data-mode-result | src/bin/monitor/push_templates.rs | ModeDispatchResult | 14438–14445 | ab1990f140fc3dcb0e7e04740cc74152991cbb8b3a01201c7049fb51431cf735 |
+| dispatch-disabled | src/bin/monitor/notify.rs | dispatch_table_init_audit | 920–944 | c19b79d199cddf2cd93cde80f1e6be472892806053ca66e4eadf75fd7a1ea330 |
+| earnings-classify | src/news/aggregator/classifier.rs | classify_earnings | 143–210 | b26b711a2cb59a9bce573ea425e9c30c8401a396a029e0d037fff560c501d4c0 |
+| earnings-event | src/bin/monitor/v17_sources.rs | earnings_classification_to_event | 848–919 | 1966aa3f44a003e1b9a6bfeb59964f93ce48996da724eccfbb484d736b8495e8 |
+| earnings-gate | src/bin/monitor/v17_sources.rs | earnings_classification_gate | 818–846 | 41944a772ea037c95ccb56deaee8d02d31920caca121173d66a18bec0e20e22d |
+| earnings-poll | src/bin/monitor/v17_sources.rs | poll_earnings_and_analyst | 997–1209 | 7dc761495e25d77192f91a1250b538b962953a40feae9eeb85eac43144e2a37d |
+| etf-unused | src/bin/monitor/push_templates.rs | dispatch_etf_closing_call_auction | 5095–5125 | 98ee2bc4319c28e69ed9a59bc5ad1c7fdb35810bdd7d0e7be5ae7282e0ef3c91 |
+| fixed-fill | src/bin/monitor/push_templates.rs | dispatch_trade_pipeline_fills_result | 4805–4866 | 1c6b189e591a5b68e2433d7c96e34d1a51d222deb362f1bf69cfdc69b9550718 |
+| fixed-order | src/bin/monitor/push_templates.rs | dispatch_trade_pipeline_orders_result | 4726–4791 | 7e0b18a98a3b69944e4154c9bf8b98044cb5a82fe0873ba9aa227613ba610542 |
+| flash-authority | src/bin/monitor/news_aggregator_init.rs | reserve_from_authority | 454–470 | 43141321565481e466211ed3a0cb22358acd875192c704888eb961f8b23c5777 |
+| flash-delivery | src/bin/monitor/news_aggregator_init.rs | push_flash_reservations | 1059–1158 | 8878bcb7f036b9a23c1a4f21d9224aa9c21e8bdac9a9176255e25fb944119c06 |
+| flash-push | src/bin/monitor/notify.rs | push_news_flash_v3 | 2678–2859 | 90d4ee0662015a6af46fc683dc78f7943ba2d4089e83ff900ecbb1e7c613a6c0 |
+| flash-reconcile | src/event/mod.rs | reconcile_news_flash_business_date | 909–915 | 2563369aed707d8579090f652954ad68bf02974b02c749bbcda77d1594057696 |
+| flash-reserve | src/bin/monitor/news_aggregator_init.rs | reserve | 478–610 | d5687bb9ba36b84708bf27f43b412681e3fdcdbb38a8dc88f3b89a92175b7044 |
+| flash-settle | src/bin/monitor/news_aggregator_init.rs | settle | 621–697 | be66602202f48133102d4a1e10861e355a852be890e8bbf553d75863f44bfa2f |
+| gateway-error | src/data_gateway/review.rs | GatewayError | 207–312 | 2a06766c47ce728a779c16c5a8949bec475cb89eea4383845ebc1bcdabac5cf2 |
+| generic-governor | src/bin/monitor/notify.rs | push_governor_inner_with_source_evidence | 2217–2308 | 2f1a625193465ad06099dd4dd1e5982bc3ba9cda6235d4ca58515e653d7caf36 |
+| holding-plan | src/bin/monitor/main.rs | prepare_holding_plan_messages | 8520–8621 | 4a7dcb8883e5c61fcb6be898663d88156b5664d2bc763b91bb03a0069d5cae40 |
+| holding-plan-read | src/bin/monitor/main.rs | holding_plan_daily_pushed | 8461–8491 | 53b16b40745be651df00ad612bccb98b5ce7e413058aaa9720fae1c564125835 |
+| holding-plan-write | src/bin/monitor/main.rs | holding_plan_daily_record | 8494–8512 | 1d2519e34a33aa63a82462e1f7e208bc10335382fc3bb3fa33f6d05c1c0c4558 |
+| industry-daily | src/bin/monitor/push_templates.rs | dispatch_industry_chain_intraday_daily | 3459–3463 | 985e2e283421d2e62f35c86d79577b21adf8f117943cdaa3fa831065497d39ec |
+| industry-periodic | src/bin/monitor/push_templates.rs | dispatch_industry_chain_intraday_periodic | 3465–3469 | 8680675e06844962a27b281376ee94a7965d36c25abd144ce2e2921a17fdd013 |
+| industry-result | src/bin/monitor/push_templates.rs | dispatch_industry_chain_intraday_daily_result | 3337–3457 | ab1e451f0a3a0a73440b885cbc9befd089edb1dffc7b06d27f4a21caf48bcbb1 |
+| ipo-catalyst | src/bin/monitor/push_templates.rs | dispatch_ipo_catalyst | 7421–7633 | 339b08693540528408b3f3a254de7099134bc25a5910ddb382ee3262eea39912 |
+| l4-commit | src/push_l4/dispatcher.rs | commit_with_identity | 161–184 | 597eb455191f67220b89c146439f1d9ba79ff18d3301d04724aa3547e30209c5 |
+| l4-reserve | src/push_l4/dispatcher.rs | reserve_with_identity | 123–152 | 9982afbb73d322b9fdb71c3760c4d4e99f6fd48c08eb9a1a3666d95ba2180b94 |
+| limit-board-render | src/bin/monitor/push_templates.rs | render_limit_boards_shape | 9871–9890 | 5d45fcccde3340ce07e9ffaafcd1a4a3e25ae0799095b5f528b0c07fc5ddfbca |
+| manual-push | src/bin/monitor/main.rs | run_daily_pushes | 1490–1662 | 8e7214c28b77d7ec747b0213828b71ebf092bca0e36c7ad2ee8bd86470442b15 |
+| market-daily | src/bin/monitor/push_templates.rs | dispatch_intraday_market_daily_result | 2616–2652 | e1d0d3615bc575f356c9e5f704f9f3d5c7291dd4d4250a63bc198d15fc54c10c |
+| market-render | src/bin/monitor/main.rs | render_board_flow_market_view | 11299–11376 | f263bce59b7d7ca7ae24dd8a17768fc991377ad9907d0b9973ef6424aee1db1d |
+| monitor-loop | src/bin/monitor/main.rs | monitor_loop | 8796–11297 | bbe0ec47b797a2e920a1a50d640923ada9f13e18ebee8384a09226f7e2bf6c6a |
+| monitor-main | src/bin/monitor/main.rs | main | 4472–5563 | 7ae40e88681a10ea6a6434bda4abfcd29cd1d5e9c4ec5595649d93b0dac3616a |
+| news-ai-assess | src/bin/monitor/news_ai_shadow.rs | assess_candidate | 454–566 | 0fc9f70fc0b40aac0d849a499c86c4b7be073fe926aaf65bf72bfe60feafa60e |
+| news-ai-identity | src/database/news_ai.rs | core_assessment_id | 714–727 | 0039000588ca28d9a45a1406cdef363494e68afef8089e518c28c765b5a4e41e |
+| news-ai-port | src/bin/monitor/news_ai_shadow.rs | NewsAiGovernedDeliveryPort for ProductionNewsAiDeliveryPort | 590–701 | a79a4b74500ce5d95cd4fcc29d15e4cdcab557834adbedc4c69b01da6467226c |
+| news-ai-reserve | src/database/news_ai.rs | reserve_news_ai_delivery_on_conn | 1302–1374 | c51cfa11a547a93b270bf7a8a26264b6aba5569df5243fd2d5b49f1c520f5ad5 |
+| news-ai-sink | src/bin/monitor/notify.rs | send_preflighted_news_ai_analysis_v3 | 2601–2673 | 08ce189f91d85593b6400268f555548eacf199a4f27fa1cb35d180f48f2db706 |
+| news-ai-tick | src/bin/monitor/news_ai_shadow.rs | run_same_tick_batches | 265–328 | 11d2527efe760c48748a8cb74e1f71d2556260e40bbe251925d8b336d00eb4e0 |
+| news-loop | src/bin/monitor/main.rs | news_monitor_loop | 7571–8237 | 8ad2cc3af882ce60b00e8891d70f492d772056c459a2e94da4bcc211f1ae9bef |
+| normalized-event | src/bin/monitor/v17_sources.rs | push_normalized_event | 716–788 | 0fb9436c659e665cc079a52904967333f97744a9908c40959c5b4b053f2416e7 |
+| order-event | src/bin/monitor/v17_sources.rs | handle_monitor_event | 207–220 | 6d28b6f01053aa80f80258161ea4142045a34ae4972c611f096f161eff7a225d |
+| order-normalize | src/bin/monitor/v17_sources.rs | normalize_market_action | 178–204 | 4a6aea55052c9dca382a39a1b6e7b4c59055d18ac2de610f974666460043450b |
+| order-register | src/bin/monitor/push_templates.rs | register_trade_event_source | 4695–4699 | b8c90bfef5380351e27bb5948a6d95053c4d9460e016492a8d210b03d24b38e1 |
+| order-source | src/bin/monitor/push_templates.rs | fetch_pending_trade_events | 4701–4707 | 374ceabfbe0ee4bf67e66b605aa094a6fff0251bb5b7f6ab4bb04f9e3b1c556b |
+| order-state | src/bin/monitor/v17_sources.rs | MarketActionState | 157–175 | 1ac231db630dcbc8b1a0122040b5773b73abf571da33daca77d05e120717e728 |
+| p01-compensate | src/bin/monitor/p01.rs | run_p01_compensation_once | 1462–1486 | b13b7dd4880a3b90fabb5af6ee76735924ab9885095facf28c70b4063267f917 |
+| p01-compensation-due | src/bin/monitor/p01.rs | classify_compensation_due | 1509–1529 | f9336f84be6da2e3012c6d1301e75c2beaaf1c615dcf586a93bc5d28a65699f2 |
+| p01-identity | src/bin/monitor/p01.rs | schedule_occurrence_identity | 322–324 | 0e94a6cd32c00f24eabd454d8a3d8942a95ddce8b34e2c0ced016712b910d9c8 |
+| p01-once | src/bin/monitor/p01.rs | run_p01_once_with_ports | 1284–1392 | c96ca7a4924acc5a0df85c30ad1c65a2d432c3fafbcc48a5805c4095c011a4f0 |
+| p01-scheduled-due | src/bin/monitor/p01.rs | classify_scheduled_due | 1488–1507 | 9a5c2282e23468a05212c1fd6e7f3f497880ef610df0195304dab132d0229617 |
+| p01-scheduler | src/bin/monitor/p01.rs | p01_scheduler_loop | 1531–1602 | 7886395561363eb38c7de07d613be450b86fae40db875afbbb4096618436ad31 |
+| p01-source | src/bin/monitor/p01.rs | load_p01_input_binding | 484–534 | 7c35e4424fa5a092ca44f2a950837e293c1ad41e040a647f8aeecea1b872df02 |
+| paper-sell-close | src/trading/paper_sell.rs | scan_and_sell_post_close | 361–365 | ca27548c131e5f9ce34290875488cada291c2afcda52270ea2171aa7b33bc213 |
+| paper-sell-dedup | src/trading/paper_sell.rs | already_sold_today | 308–325 | fe5a11e20a2448888d82e97061d1f8c0f28e3cd083519a79c7a8b4443965e88c |
+| paper-sell-evaluate | src/trading/paper_sell.rs | evaluate_and_sell | 385–482 | ebdcabb0609a5c873bd5d951bf47e9d26ac31cbba7a6331a25e6b1b6d56a49ea |
+| paper-sell-gate | src/bin/monitor/main.rs | paper_sell_paused | 8252–8274 | 7b68cd6892190b0fc9bc8fbec795032fa62dfee577dbbdb5a36e51539daf5293 |
+| paper-sell-scan | src/trading/paper_sell.rs | scan_and_sell | 353–358 | 61b4c6ea6c4e7fdccccaf297a40d5ec6686d6d25ef5568982aeb8e94c919b5b0 |
+| paper-trade | src/bin/monitor/push_templates.rs | dispatch_paper_trade_daily | 5633–5694 | 0d11ff2c7834742cdc32d2b6591e597f6195b1200c3f31a482fc6b24678c9e78 |
+| paper-trade-prepare | src/bin/monitor/push_templates.rs | prepare_paper_trade_daily | 5583–5630 | 5b80f56ee85a79711e240b6070c397ce526a9d49dbdbbf80fd4c536efd19e0fb |
+| paper-trade-source | src/bin/monitor/push_templates.rs | load_today_paper_trade_reports | 5528–5573 | 94b1ea9faf6088c333300d6a6df7213c3f4b1309d430489d21d4a2ba282a916f |
+| pipeline-run | src/pipeline/mod.rs | AnalysisPipeline | 350–738 | 00ba71c73b62df265e6285d75a94e565a7e18e195237a109902206213033fa9a |
+| policy-classify | src/news/aggregator/classifier.rs | classify_policy | 316–359 | f27e0e3c78d80984eb1fcad44b073bbb5373b64d5caa648cf6ec4a16b67761b7 |
+| presented-push | src/bin/monitor/notify.rs | push_presented_v3 | 2877–2884 | 0886b989aaeee1fc6d22e211eef6b3dd5f15753606bfce1231b67a3080357b67 |
+| push-kind | src/bin/monitor/notify.rs | PushKind | 45–197 | 55f5bf642a15e4d98fc430cbee14c9ac70343bdd8a24d274d7e50e54a8352a9a |
+| r02-disabled | src/bin/monitor/push_templates.rs | dispatch_r02_review_market_real | 9820–9825 | 8b92a81d0e285c685be0167f89843587cf9198793a7119e6c62ee093304a797c |
+| r03-chain | src/bin/monitor/push_templates.rs | dispatch_r03_industry_chain_outcome | 12239–12442 | 65c8cdda384711bcf3f0f61b78a7b6ed9dd6324ec00be06ea60476c3e30b8da8 |
+| r04-lhb | src/bin/monitor/push_templates.rs | dispatch_r04_lhb_outcome_with_loader | 12838–12993 | 787e16332dbb45bb6d5ec5f9abbc6db1440c8677bb47615b352e73b56cdd3f97 |
+| r05-disabled | src/bin/monitor/push_templates.rs | dispatch_r05_signal_review_real | 13012–13017 | 69039b60be4cb1b2f7d792876db32c8e53c53ce348dbccebeacd04d3039e1d37 |
+| r06-disabled | src/bin/monitor/push_templates.rs | dispatch_r06_failure_real | 13021–13026 | cfe566cb2b70f8e6840b55dbff5e4b7d51927cd9de18db598010ff49fe6b764f |
+| r07-source | src/bin/monitor/push_templates.rs | dispatch_tomorrow_watch_after_preflight | 8047–8481 | 90fa807cb4d3487e2e4be80bdee58edf170d493dc30e916f9428bd376c79dd2a |
+| r08-calendar | src/bin/monitor/push_templates.rs | dispatch_r08_event_calendar_outcome_with_loader | 11027–11216 | 6933e5b9008eb845fd9b53196dcaa78ebdbb130c4c9d5abe1a3d1c0ac3818bf7 |
+| r09-provider | src/bin/monitor/push_templates.rs | dispatch_r09_provider_top_n_outcome_with_loader | 6651–6763 | c1a6252ee7a3f1a9ff4f98b7657d07903f469c9f956c39666d84b69839835090 |
+| r11-position | src/bin/monitor/push_templates.rs | dispatch_position_review_outcome | 8797–9012 | 37177c34009d686efcaeb65b94ef5d45de0cbccd89795db86409735a34298467 |
+| r12-disabled | src/bin/monitor/push_templates.rs | dispatch_r12_backtest_outcome_with_runner | 9086–9102 | a9126b7bf9401e8a309ae503e4adb4f6bcdb9640d0441a71e05f502f72715c9d |
+| r13-counted | src/bin/monitor/push_templates.rs | dispatch_r13_counted_delivery | 9250–9357 | 6f5e02278b83d0e5f3917dae7f1482f8d18783cca9eb9bf26d4c52a2242e2ca5 |
+| r13-source | src/review/watchlist_tracking.rs | check_watchlist_today | 99–166 | 7d74a80175bd9e5a894851f590a9023a7c3d448d4320e813c911402313a3de48 |
+| r13-watchlist | src/bin/monitor/push_templates.rs | dispatch_r13_watchlist_tracking_outcome | 9447–9544 | 84cc08eaf684f4362ee15291b40a500befb02ef974e61c90630a6d2b1aba9477 |
+| review-attempt | src/bin/monitor/main.rs | attempt_post_session_review | 5847–5863 | 782349a727eb32a182d57aea26c17c6284e2f899c57df1815c1e5adb3310e883 |
+| review-authorize | src/bin/monitor/durable_delivery_runtime.rs | authorize_rejected_review_retry | 1743–1758 | e8089211c626d0da33a7587b1d29f4a4ecfea41c8902e45fa783fc68b8813db4 |
+| review-auto | src/bin/monitor/main.rs | post_session_review_scheduler | 6252–6447 | 9ca55c77783826618b7d05cfce0f0e3174abc748ec4a14d90e841a12dcf40ebb |
+| review-backfill | src/bin/monitor/main.rs | run_review_backfill | 5961–6032 | 4496af40af78aa1dd1d087ca991c4d8eac4a46ee2cdd9a822a8cf0620f7683e7 |
+| review-backfill-one | src/bin/monitor/main.rs | backfill_one_review_task | 6060–6140 | d071bb9c621c788d46caf5337c1f18aca6822727b544f151a076165c0d796dea |
+| review-batch | src/bin/monitor/push_templates.rs | dispatch_post_session_review | 9546–9810 | 69d2985df54edff2bffb708b132d65d48e355bf560596309aa35ebfeef96fd40 |
+| review-context | src/bin/monitor/review_batch.rs | ReviewRunContext | 21–94 | 32c4ca97cee4378d7edc26279b577e09106620f93d3c348104f51ba6503dfa89 |
+| review-existing | src/bin/monitor/push_templates.rs | review_outcome_from_existing_durable | 6542–6635 | 8eb5423b512cee6acefcd16308e9a4a5b72ebc3b92ff34f5c45739edc2570b79 |
+| review-hydration | src/bin/monitor/main.rs | apply_durable_review_hydrations_and_acknowledge | 5609–5628 | 4a2e5ba462fd080f134eeb13d7b1e0c10509ac326ede55ada73b475c87798e10 |
+| review-identity | src/bin/monitor/review_batch.rs | review_task_identity | 520–522 | cd0157c3cbce5c5cf5a89884a66b32ff05db2b0163f323f262d1c377c92aa06a |
+| review-manual | src/bin/monitor/main.rs | run_review_only | 5632–5746 | dedee04ccb824f578012bd9ceb1febfed209359419fab8954c515040c8f7d5d2 |
+| review-occurrence-inspect | src/durable_delivery/coordinator.rs | inspect_review_task_occurrence | 3035–3179 | e41d5ecf01e3280eb69d24a46efc82ac8a1574c1a8de8cd61165f03f10f07fc8 |
+| review-preflight | src/bin/monitor/review_batch.rs | review_preflight | 1638–1755 | 26b620fafa396abd1be235cc8ec48903a44a6350ed87d79ef56b666f286fa712 |
+| review-resume | src/bin/monitor/durable_delivery_runtime.rs | resume_review_task_occurrence | 1628–1657 | aa526e788b8788c0f944370f773b92ebe8900e35baa7da03c2f7f6ffb98a1aed |
+| review-schedule-state | src/bin/monitor/review_batch.rs | ReviewScheduleState | 1207–1588 | 46b898dca29db4f0a5bb4de741a0654f9793a1b9890ddcc57ce9dc17db2c5d47 |
+| sector-anomaly | src/bin/monitor/push_templates.rs | dispatch_sector_anomaly_daily | 16500–16530 | f4814317268e47902f55641dd2048dcae6b5d9db5f0cd44864754e8dd7522750 |
+| sector-anomaly-counted | src/bin/monitor/push_templates.rs | push_sector_anomaly_counted | 14175–14224 | 5e759789a586d8f3a1d4ed2fbb88c0b87b3a2e05248ee9f5444b946029cac3d0 |
+| sector-top | src/bin/monitor/push_templates.rs | dispatch_sector_top_daily_result | 16405–16439 | f260a8f06cb1d97a6166ced2a75bac4cd900fa646d03688716493d6dd6e02d54 |
+| sector-top-counted | src/bin/monitor/push_templates.rs | push_sector_top_counted | 16442–16487 | 2b295d2acd04d52953415042a37cb65d52c6167a7780b70a6ebe31e82982c514 |
+| snapshot-days | src/bin/monitor/main.rs | trading_days_since | 1946–1957 | c787026abdbc1299c2cb0673fb9b3b9f3398770125366f04b59fcbfb6867f446 |
+| snapshot-gate | src/bin/monitor/main.rs | SnapshotReminderGate | 1856–1881 | d27ea3e281f6f8ed711c95b229ed5e1ae21cbe91093d40e34476ecd4ce700077 |
+| snapshot-reminder | src/bin/monitor/main.rs | check_snapshot_staleness_and_notify | 1887–1943 | b6aa35e4a3a05df2896449d70165b8000582e41b51f902c7d72e33565eaf81b6 |
+| source-fact-identity | src/push_l1/event.rs | make_source_fact_event_id | 233–238 | a004b532077c1fa847bad4b53a482933fde63457c47f743647f9c4e2d1a1244b |
+| source-fact-push | src/bin/monitor/notify.rs | push_presented_source_fact_v3 | 3057–3066 | 478eb963854aaa166267e156b20d7d2e1ec1791cd64292c537add671ea4e7827 |
+| st-batch | src/bin/monitor/main.rs | dispatch_st_price_limit_batch | 1699–1759 | 2229968b680b2facbe97cbb3b8fa1c2dc7d4e61fe369ffd964ac325843395c3e |
+| st-push | src/bin/monitor/push_templates.rs | dispatch_st_price_limit_changed | 5038–5088 | cb5f5d3e886cc6b18b386f1fc562a9bc5f979cbd3f487cdadb3116c1b088fd20 |
+| t0-binding | src/decision/t0_advisor.rs | T0PlanDecisionBindingV1 | 189–272 | 0233225f75be6c323e763089af0722958a5e2388299a7e03f75f866ec534fa83 |
+| t0-prepare | src/bin/monitor/main.rs | prepare_t0_messages | 8276–8429 | 6198b3530dfc44fb4b8279a30430a409082e1d5cbebc132b1c21561d6ee841c8 |
+| template-cooldown | src/bin/monitor/push_templates.rs | record_uncounted_cooldown | 14587–14596 | a1a835b4d1126e8a5c8d267b0c6455593e3f4406d048b26a992b7701bd31f64f |
+| template-dispatch | src/bin/monitor/push_templates.rs | dispatch_outcome | 14627–14671 | 883789f0fe236bd3d377b8c26d35a5424ae9e8299be92e1f6ed375a165a37bbc |
+| virtual-watch | src/bin/monitor/push_templates.rs | dispatch_virtual_watch_daily | 837–889 | 7e0f7daa3a3a20d3e72d1463a1f5eabf4f6100bedd9a2d05037a4163a51d3245 |
