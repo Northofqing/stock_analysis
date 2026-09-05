@@ -36,7 +36,7 @@ PROVISIONAL。源码基线为 `07781bf386aafdf202851ae928efee8920387058`，隔�
 | ForbiddenOps | 盘中 | INACTIVE | 无 caller；T:720 render_forbidden_ops 仅 renderer、preview/tests，durable/registry 仅映射 | 无活动 owner |
 | PaperTrade | 集合竞价 | ACTIVE | M:10046 monitor_loop → T:5633 dispatch_paper_trade_daily，读取当日严格完成态 | Task5 待核成交记录与通知键 |
 | PaperSell | 盘中/盘后 | ACTIVE | M:8860、8951 monitor_loop 两入口；M:8248 paper_sell_paused 默认放行 | Task5 待核共享 code/day/Filled 事实 |
-| SnapshotStale | 盘后 | ACTIVE | M:1934 check_snapshot_staleness_and_notify；M:8907 附近 15:10–15:13 调用 | Task5 待核独立 LAST/SnapshotReminderGate |
+| SnapshotStale | 盘前/集合竞价/盘中/盘后 | ACTIVE | M:1887 check_snapshot_staleness_and_notify；M:5477 服务启动调用无时段门，可跨时段；M:8926 定时 15:10–15:13 调用 | Task5 核两 caller 是否共享 LAST/SnapshotReminderGate 完成范围 |
 | AttributionDaily | 盘后 | ACTIVE | M:9118 monitor_loop 归因报告发送 | Task5 待核 ATTRIBUTION_LAST_RUN |
 | G5bAttribution | 盘后 | ACTIVE | M:9219 monitor_loop 深链归因摘要发送 | Task5 待核 G5B_LAST_RUN |
 | CloseCall | 盘中 | ACTIVE | M:8637 prepare_close_call_messages；M:11156 monitor_loop 尾盘 counted dispatch | Task5 待核 close_call_pushed |
@@ -63,7 +63,7 @@ PROVISIONAL。源码基线为 `07781bf386aafdf202851ae928efee8920387058`，隔�
 | EtfClosingCallAuction | 盘中 | INACTIVE | 无 caller；T:5095 dispatch_etf_closing_call_auction 只有定义，M:11133 仅注释/未使用状态 | 无活动 owner |
 | BlockTradeIntradayConfirm | 盘后 | ACTIVE | T:9700 附近复盘 side route → T:7684 dispatch_block_trade_review → T:5129 dispatch_block_trade_intraday_confirm；名称含 Intraday 但实际盘后调用 | Task6 待核非 ReviewTask side route |
 | BlockTradePriceRange | 盘后 | ACTIVE | T:7684 dispatch_block_trade_review → T:5178 dispatch_block_trade_price_range | Task6 待核交易记录/票级键 |
-| PaperReview | 盘中/盘后 | STARVED | T:4600 daily outcome、T:4633 noon、M:1490 --push；T:4390 读取 virtual observation 历史快照，当前新增写入链被空 vector 阻断；历史文件有数据时仍可处理 | Task6 核 A01；Task5 核 NOON_SNAP_LAST |
+| PaperReview | 盘中/盘后 | STARVED | 入口异质：M:9019 → T:4633 noon 在 13:00–13:04 传 today，T:4267–4274 exact T+1/已完成日门使其结构性受阻，补数据不能恢复；T:4600 daily、M:1490 --push 和复盘历史补推仅在 exact T+1 已完成且有合法历史记录时可消费，当前自产快照链缺输入 | Task6 核 daily/历史 A01；Task5 核受阻 noon/NOON_SNAP_LAST，勿将 STARVED 概括成仅缺数据 |
 | CandidateInvalidated | 集合竞价 | ACTIVE | T:7790 dispatch_candidate_board 的差分子推，T:7824 丢弃 push_candidate_invalidated 结果 | Task5 待核快照与外层双层边界 |
 | IpoListingApproval | 盘后 | INACTIVE | 无 caller；M:5652 run_review_only 明示 disabled=no_producer；不能把 IpoCatalyst 当此 kind | 无活动 owner |
 | IpoProspectus | 盘后 | INACTIVE | 无 caller；M:5652 run_review_only 同一明确声明 | 无活动 owner |
@@ -85,8 +85,10 @@ PROVISIONAL。源码基线为 `07781bf386aafdf202851ae928efee8920387058`，隔�
 | P01 自动及补偿 | P:1531 p01_scheduler_loop；M:4993 调 P:1462 run_p01_compensation_once | 两入口必须保留；是否共享完成 occurrence 留 Task4 |
 | 手动 --push | M:5325 → M:1490 run_daily_pushes | 按 OpportunitySchedule 窗口调用 I01/I02/I03/I04/D01/A01/A10；盘前明确转 P01 专用入口；dry-run 与 smoke 不算生产 |
 | 自动复盘 | M:6252 post_session_review_scheduler；M:6449 spawn_post_session_review_scheduler | 进入 T:9546 dispatch_post_session_review；不同 ReviewTask 不是同一个完成键 |
-| 手动复盘 | M:5632 run_review_only → M:5770 附近 run_strict_review_only_inner | 使用 at_manual；R:1707 后允许绕过 21:00 龙虎榜时间门，不能推断绕过来源验证 |
+| 手动复盘 | M:5632 run_review_only → M:5770 附近 run_strict_review_only_inner | 使用 at_manual；R:1707 仅 R04 可绕过 21:00 门，R:1719 后 R07 仍按 eligibility_time 保留 21:00 门；来源验证不豁免 |
 | 历史补推 | M:5961 run_review_backfill → M:6060 backfill_one_review_task | 保留旧业务日和 claim 恢复入口，Task6 核无 claim、RejectedDurable 授权和恢复边界 |
+| 快照过期启动/定时 | M:5477、8926 → M:1887 check_snapshot_staleness_and_notify | 启动无时段门；定时仅 15:10–15:13。两 caller 的共享完成范围留 Task5 |
+| PaperReview 午盘/daily/历史 | M:9019 传 today → T:4633 noon；T:4600 daily outcome，M:1490 --push 及复盘补推 | noon 在 13:00–13:04 的 today 尚未完成，T:4267–4274 与 T:4425–4433 排除合法记录；daily/历史必须有合法记录且 exact T+1 已完成。不能推断补齐快照即可恢复 noon |
 | CLI 单股（enum 外） | src/main.rs:95 后模式分派 → src/app/modes.rs:14 run_analysis → src/pipeline/mod.rs:505 AnalysisPipeline::run → src/pipeline/analyze.rs:1137 process_stock_inner、1255 send | single_notify/send_notification 控制；先保存分析结果，再发送；无独立持久通知完成游标，不虚构新的 authority |
 | CLI 汇总（enum 外） | src/pipeline/mod.rs:643、723 → src/pipeline/summary_notify.rs:64 send_summary_notification_to、109 send | 单次 pipeline 执行的汇总；文件保存不是消息接收 |
 | CLI 产业链（enum 外） | src/main.rs:85 → src/app/modes.rs:106 run_chain_analysis_mode、176 send | --no-notify 控制；独立于 monitor PushKind::IndustryChain 的受阻 R03 |
@@ -133,7 +135,7 @@ rg -n 'AlertManager|push_alert\(' src --glob '*.rs'
 ## 已证实风险与关系（前次 16 项复核）
 
 1. **候选双层状态**：M:9785/9789 两 dispatcher 同 tick、双 bool 才封 `post_close_candidates_notified`。T:7790 空 batch 直接返回；T:7763 末行读取失败化 None；T:7771 写错丢弃；T:7824 失效推送 bool 丢弃，T:7853 在主卡发送前推进快照。外层闸门与子快照不原子；失败后差分消失、双 bool 与各 cooldown 交互留 Task5。
-2. **VirtualWatch 缺输入**：M:9807 附近空 post_close，经 M:9842 唯一 push 填充 vector；M:9944/10207 的快照写入均依赖该观察集合。历史快照可以保留，但不能声称当前自产链正常。PaperReview 对历史输入的处理见 T:4390，空则 NoData，不代表通知完成。
+2. **VirtualWatch 缺输入与 PaperReview 时间门是两件事**：M:9807 附近空 post_close，经 M:9842 唯一 push 填充 vector；M:9944/10207 的快照写入均依赖该观察集合。PaperReview daily/历史入口只在合法历史记录的 exact T+1 已完成时可消费。noon 则在 M:9019 传 today，T:4406–4409 以 today 为 review_date；src/calendar.rs:586–591 在 15:00 前将 completed_through 设为前交易日，T:4267–4274 使合法记录 Pending/OutOfWindow，T:4425–4433 跳过。因此 noon 结构性受阻，补数据不能恢复；空输入 NoData 也不是通知完成。
 3. **PaperSell 两入口仍活动**：M:8248 gate 仅显式 PAPER_SELL_DISABLED=1 暂停；M:8860/8951 在卖出结果后发送。src/trading/paper_sell.rs:308 already_sold_today 按 code、sell、Filled、date(ts) 查重，462 先 simulate_with_audit_evidence；成交事实不等于通知接收。Task5 核两入口共享范围。
 4. **预检位置不等于盘前可达**：M:9450 附近先等待 is_market_active，M:9595 后又要求 Closed 和 09:00–09:15，导致旧 P03/09:10 预检结构受阻；独立 P01 不使用该状态。
 5. **板块计时器独立**：M:10998/11016 是两个 timer；M:11002/11007、11041/11044 各自成功或失败都推进一小时，不是共享 completion owner。
@@ -144,11 +146,11 @@ rg -n 'AlertManager|push_alert\(' src --glob '*.rs'
 10. **业绩与评级两张 map**：M:7922 后 HoldingEarnings/盘后窗口/our_codes 门；V:997 的 earnings/analyst 每 code timer 独立，来源取得后、最终发送前推进。V:818 gate 默认关闭但位于 provider 拉取之后，关闭分类不代表零 I/O。
 11. **评级观察先推进**：src/news/aggregator/analyst_state.rs:70 observe，130 后先插入再返回 Upgrade；同 report/date 返回 Duplicate。V:1149 后才构造升级事件，失败不自动回滚观察事实。
 12. **两路市场异常**：V:157 MarketActionState 的 code→(action,shares) 在发送前更新；T:2027 Frozen 副推丢结果；T:1844 finalize_account_mode_delivery 只以主 AccountMode Pushed 标 log_id。两消息不能共用成功证明。
-13. **两种过期提醒不同**：M:1934 SnapshotStale 在至少五交易日过期后使用 SnapshotReminderGate::try_begin/finish；M:9284 的 IntradayMarket 则有 SNAP_REMIND_LAST。不要按同“快照”词合并。
+13. **过期提醒入口和状态范围**：SnapshotStale 的 M:1887 函数由 M:5477 服务启动无时段门调用，也由 M:8926 在 15:10–15:13 调用；至少五交易日过期后使用 SnapshotReminderGate::try_begin/finish，两 caller 是否共享完成范围留 Task5。M:9284 的 IntradayMarket 使用 SNAP_REMIND_LAST，不要按同“快照”词合并。
 14. **复盘阶段与 side route**：R:499 dependency、T:9546 batch 分阶段；R03 受账户依赖门，R02/R05/R06 由 R:1638 preflight 禁用；T:9700 后的大宗/IPO 为非 ReviewTask side route，测试环境先拒绝它们。
 15. **复盘终态不是统一 Accepted**：R:1236 apply_for_run 按 date/task 更新，Delivered/NoData/Disabled/永久 Failed 均可 Terminal；可重试错误 1/5/15 分钟。自动/手动/补推作用域留 Task6，不能把同 struct 当单 owner。
 16. **ST 与 ETF 不能按注释类推**：M:1699 先准备完整 ST 批再发，一项失败返回 Err，M:11115 外层 Ok（含零条）才置 st_price_pushed；T:5095 ETF 虽有 dispatcher，但全 src 无 caller。src/portfolio/mod.rs:161 实际读取 ST metadata，不沿用旧“标记写死”注释。
 
 补充归因完成缺口：M:9118 后不论推送 outcome 都封 ATTRIBUTION_LAST_RUN；M:9238 在 G5b 整批尝试后封日，不能把首批输入修复说成通知完成修复；M:9019/9024 午盘 PaperReview 忽略 bool 封 NOON_SNAP_LAST。通用入口 N:2217 先拒绝 counted kind；source-fact 路径 V:716 与 MarketAction generic 路径不同。这里只记录源码，不运行任何实际发送。
 
-后续交接：Task4 冻结新闻/P01/N01/N02 的 occurrence、source、authority、policy；Task5 冻结状态驱动入口和 enum 外 CLI/定时的实际完成边界；Task6 冻结各 ReviewTask 及 side route。最终 Task7 重新核对工作表后生成三份正式候选产物，不能把本表行号直接冒充 locator item hash。
+后续交接：Task4 冻结新闻/P01/N01/N02 的 occurrence、source、authority、policy；Task5 冻结状态驱动入口和 enum 外 CLI/定时的实际完成边界，特别核 SnapshotStale 启动/定时共享范围和结构性受阻 noon 的 NOON_SNAP_LAST；Task6 冻结各 ReviewTask 及 side route，区分 PaperReview daily/历史 exact T+1 已完成门，并保留仅 R04 手动绕过 21:00、R07 仍等待的差异。最终 Task7 重新核对工作表后生成三份正式候选产物，不能把本表行号直接冒充 locator item hash。
