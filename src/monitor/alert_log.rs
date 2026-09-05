@@ -134,7 +134,8 @@ impl AlertLog {
     }
 
     pub fn read_today(&self) -> Vec<String> {
-        if self.ensure_io_allowed().is_err() {
+        if let Err(error) = self.ensure_io_allowed() {
+            log::warn!("[alert_log] read_today 拒绝读取默认生产归档: {error}");
             return Vec::new();
         }
         match fs::read_to_string(dated_file(&self.dir, "md")) {
@@ -156,7 +157,8 @@ impl AlertLog {
     }
 
     pub fn read_today_records(&self) -> Vec<AlertRecord> {
-        if self.ensure_io_allowed().is_err() {
+        if let Err(error) = self.ensure_io_allowed() {
+            log::warn!("[alert_log] read_today_records 拒绝读取默认生产归档: {error}");
             return Vec::new();
         }
         let Ok(content) = fs::read_to_string(dated_file(&self.dir, "jsonl")) else {
@@ -410,6 +412,7 @@ mod tests {
             archive.append_jsonl(&e()).unwrap_err().kind(),
             std::io::ErrorKind::PermissionDenied
         );
+        assert!(archive.read_today().is_empty());
         assert!(archive.read_today_records().is_empty());
     }
 
