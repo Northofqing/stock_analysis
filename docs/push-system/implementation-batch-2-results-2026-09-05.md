@@ -1,6 +1,6 @@
 # 第二批推送可靠性：来源、目录与源码证据交付记录
 
-> 当前仍在实施：Task1–Task6的来源、工具和源码业务审计已通过独立复核；Task7正在统一生成机器目录、证据manifest与中文视图，本报告尚未完成整批验收。不是Foundation Ready、生产上线或全量方案完成声明。
+> Task1–Task7的来源、工具、源码业务审计和三个目录制品均已完成独立复核；当前只剩整批最终门禁与总状态同步。不是Foundation Ready、生产上线或全量方案完成声明。
 
 ## 范围与边界
 
@@ -9,7 +9,7 @@
 - 原工作区的67项混合源报告与本分支65项枚举分开。PaperBuy/Watchdog没有移入本分支，不能用原报告行号充当这里的已验证证据。
 - 本批只落实已批准的来源治理、可校验目录与稳定源码证据前置；完整RFC、WBS重算、离线HTML、CI、运行时Foundation及交易窗口晋级另有后续门禁。
 
-## 已通过的六个任务
+## 已通过的七个任务
 
 ### Task1：不可变设计来源
 
@@ -57,22 +57,29 @@ v18.2–v18.4文件自声明v20.x，v18.5自声明v20.0，记录为版本标签�
 
 关键校正包括：自动scheduler也构造`at_manual`，使R04自动19:00路径绕过21:00门，而R07仍等待；R12因技术K线能力常量为false而禁止新producer，但既有durable decision仍可独立恢复；backfill只扫描8个counted任务且A01明确排除，每个单任务batch仍会执行Block Trade/IPO side-route；BlockTradePriceRange上游固定传None而下游必填，当前恒拒；产业链09:05/15:30 timer没有交易日guard，发送false/Err又被内部吞为Ok，可能跨calendar date重复发送同一business date。单股/汇总/产业链CLI的文件保存和bool返回均不是durable receipt。
 
-## Task3–Task7及整批验证（尚未完成）
+### Task7：机器目录、源码证据与中文视图
 
-首次真实审计确认65个enum、467个src Rust文件加两份Cargo文件及16组源码事实，并发现旧范围未列出的`--push`手工入口与P01补偿入口。实现者拒绝用概括性owner或占位producer生成目录；现按入口/no-caller、新闻、状态驱动、复盘四个切片审计，Task7才统一生成目录、完整manifest和Markdown。这些机械数量不等于已完成生产者审计或部署验证。
+目录提交`9f9640c`，普通启动恢复修订`483d3ad`。最终三个制品精确覆盖65个kind（36 ACTIVE、22 INACTIVE、5 STARVED、2 OPT-IN）、101个producer（含15个普通启动恢复入口、9个枚举外入口）、51个MigrationUnit、184个完整symbol证据/31个Rust证据文件，以及469个冻结文件（467个`src/**/*.rs`加两份Cargo文件）。所有INACTIVE均保持空producer；所有非INACTIVE均有源码审计入口。PaperBuy/Watchdog仅作为“原混合工作树存在、隔离基线未移入”的排除项，不伪造证据。
+
+独立复核发现首版只登记正常业务入口和显式补偿，遗漏了服务普通启动时对全日期既存持久信封的恢复。修订后新增15条恢复producer：14条复用原通知owner与Unit，R03既存counted decision单独建Unit；恢复使用原不可变信封和原claim/decision，不重新取当前source，也不按共享startup循环合并成全局完成状态。11个相关INACTIVE仍无新producer，但说明既存历史decision可能被恢复。限定复核确认遗漏已关闭，无新增Critical/Important。
+
+普通D01另经源码核正：空code加`PerTicket`不会产生L4冷却，真实完成边界是`D01_LAST_PUSH[code:name]`与NewsToIdea模板冷却表；Beat/Miss即使共享扫描也因L4 kind键不同拆Unit。P01普通all-date startup可恢复Scheduled信封，不受显式compensation的模式禁令约束，但仍只消费原P01 claim/信封。上述均是冻结源码行为，不是运行时改造。
+
+## 整批验证（进行中）
 
 | 已执行验证 | 结果及对应版本 |
 | --- | --- |
 | 来源CLI测试 | f30c4a4：11 tests / 91 assertions，通过 |
 | 工具CLI测试 | 435fa91：25 tests / 307 assertions，通过 |
 | Task1/Task2独立及修订复核 | 无未关闭Critical/Important；真实业务目录属于Task3 |
-| 真实根目录draft/strict/render | Task2结束时按阶段预期报告两个JSON缺失，不能称为目录通过 |
+| 真实根目录draft/strict/render | Task7：draft通过；strict仅剩两个PROVISIONAL（提交前另有预期dirty）；write→check→write字节幂等 |
 | 首次真实审计 | 65 enum / 469 scope files / 16组直接源码事实；未生成成品、无提交，剩余边界已拆分 |
 | Task3入口/无caller清单 | 10b38e9：65/65；15个无生产caller；修订复核PASS |
 | Task4新闻边界 | d15f35b：13条producer/分支；10个完成域；9个候选Unit；5个具体未决；复核PASS |
 | Task5状态/交易边界 | ce581b5：37条producer/入口；25个候选边界族/Unit；5个具体未决；复核PASS |
 | Task6复盘/枚举外边界 | c0a4029：13 task（7/4/2）；21边界；17候选Unit；6未决；复核PASS |
-| 整批最终验证/最终review | 待Task7完成后执行 |
+| Task7真实目录与启动恢复 | 483d3ad：65 kind / 101 producer / 51 Unit / 184 evidence / 469冻结文件；限定复核PASS |
+| 整批最终验证/最终review | 正在执行；完成前不升级PROVISIONAL状态 |
 
 Task1留下一个非阻塞Minor：不存在的root目前诊断为`catalog_missing`，不影响失败退出，但诊断可更精确；交给整批review最终定级。
 
@@ -96,6 +103,10 @@ Task1留下一个非阻塞Minor：不存在的root目前诊断为`catalog_missin
 16. 将R12与BlockTradePriceRange按当前能力门/必填输入判为INACTIVE，同时保留既有R12 decision恢复：避免把潜在dispatcher当活动producer；代价是恢复历史信封和创建新通知必须作为两个不同能力测试。
 17. backfill只承认源码中的8任务白名单，A01不虚构历史扫描入口；单任务batch仍执行Block Trade/IPO side-route：代价是后续要隔离side-route副作用，否则一次补推扫描可能重复触发与目标task无关的通知。
 18. 产业链09:05/15:30 occurrence同时保留business date与calendar date，显式记录无交易日guard和`Ok(false/Err)`封日：代价是可靠化需新增持久cursor、交易日门和不确定发送恢复，不能复用报告文件或内存日期状态。
+19. Earnings Beat与Miss即使共享扫描入口仍按不同L4 kind键拆Unit：共享timer不等于共享原子完成状态；代价是迁移要维护两个通知单元及其协调关系。
+20. D01按真实空code/PerTicket路径不登记L4冷却owner，使用进程内`D01_LAST_PUSH[code:name]`和模板冷却表：避免把未执行的通用L4分支当防重；代价是现有完成状态不持久，进程重启后的重复与恢复仍需Foundation解决。
+21. 普通启动all-date reconciliation作为显式恢复producer层登记，14条复用原owner/Unit，R03既存decision单独建Unit，不建立“全局startup Unit”：共享恢复循环不是共享通知完成原子性；代价是目录和后续实现必须分别建模正常生产与既存信封恢复，并始终服从原claim、lease/fence和不可变信封。
+22. INACTIVE表示当前不能创建新producer，不等于历史持久decision绝不会恢复：11个相关kind继续保持空producer并在note中说明恢复边界；代价是能力状态需同时表达“新建能力”和“历史恢复能力”，测试也必须分成两类。
 
 ## 保护与未检查项
 

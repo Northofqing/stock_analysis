@@ -131,11 +131,11 @@ assert_includes out + err, 'source_sha_mismatch'
 
 **文件：** 新增docs/push-system/push-capability-catalog.v1.json、push-evidence-manifest.v1.json、push-capability-catalog.md。使用已复核Task3–Task6工作表，但仍对每条最终关系及symbol做源码核对。
 
-- [ ] 使用既定schema覆盖真实65-kind精确集合；所有非INACTIVE有source-reviewed producer，INACTIVE空producer列表有明确禁用/无caller证据。收录enum外CLI单股/汇总/chain及09:05/15:30 chain，PaperBuy/Watchdog只作未移入排除。
-- [ ] 逐producer填trigger/source/authority/policy/evidence、occurrence/completion owner，并按实际共享owner形成MigrationUnit和四时段Epics；工作表中的pending不得进入成品。目录是候选，不冻结完整迁移顺序/工期。
-- [ ] manifest冻结07781bf全部467个src Rust文件和Cargo.toml/Cargo.lock，使用已复核locator产生原始item SHA及派生行号。基线/当前字节、集合、symbol、enum和引用全部由工具核对，不自动刷新。
-- [ ] 明确运行source check、真实draft、严格检查、一次Markdown --write、--check和二次生成幂等；strict只剩PROVISIONAL/dirty，不能隐藏内容错误。记录真实时延及kind/producer/Unit/evidence/file准确数量。
-- [ ] 只提交三个成品文件，report task-7-report.md。保持PROVISIONAL；不写Foundation Ready、部署/TransportAccepted/用户已读、完整RFC/WBS/HTML/CI或未经精确WBS的工期。完成独立review后进入整批验证。
+- [x] 使用既定schema覆盖真实65-kind精确集合；所有非INACTIVE有source-reviewed producer，INACTIVE空producer列表有明确禁用/无caller证据。收录enum外CLI单股/汇总/chain及09:05/15:30 chain，PaperBuy/Watchdog只作未移入排除。
+- [x] 逐producer填trigger/source/authority/policy/evidence、occurrence/completion owner，并按实际共享owner形成MigrationUnit和四时段Epics；工作表中的pending不得进入成品。目录是候选，不冻结完整迁移顺序/工期。
+- [x] manifest冻结07781bf全部467个src Rust文件和Cargo.toml/Cargo.lock，使用已复核locator产生原始item SHA及派生行号。基线/当前字节、集合、symbol、enum和引用全部由工具核对，不自动刷新。
+- [x] 明确运行source check、真实draft、严格检查、一次Markdown --write、--check和二次生成幂等；strict只剩PROVISIONAL/dirty，不能隐藏内容错误。记录真实时延及kind/producer/Unit/evidence/file准确数量。
+- [x] 只提交三个成品文件，report task-7-report.md。保持PROVISIONAL；不写Foundation Ready、部署/TransportAccepted/用户已读、完整RFC/WBS/HTML/CI或未经精确WBS的工期。独立限定复核发现并关闭普通启动恢复遗漏，无未关闭Critical/Important，进入整批验证。
 
 ## 整批验证和交付
 
