@@ -14,6 +14,12 @@
 /data
 /deploy
 /docs
+!/docs/
+/docs/*
+!/docs/push-system/
+/docs/push-system/*
+!/docs/push-system/implementation-batch-1-2026-09-05.md
+!/docs/push-system/implementation-batch-1-results-2026-09-05.md
 /logs
 /reports
 /target
@@ -22,4 +28,3 @@
 /tests
 /tools
 /skills-lock.json
-
