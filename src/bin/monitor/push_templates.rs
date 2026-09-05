@@ -11369,7 +11369,7 @@ mod tests_br140_r08_partial_components {
         .await;
 
         assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
-        match outcome {
+        match &outcome {
             crate::review_batch::ReviewTaskOutcome::Failed { failure } => {
                 if let crate::review_batch::ReviewTaskFailure::GatewaySource(failure) = failure {
                     assert!(failure.retryable);
@@ -11383,6 +11383,30 @@ mod tests_br140_r08_partial_components {
             }
             _ => panic!("R-08 unsupported CFFEX should remain retryable"),
         }
+
+        let business_date = chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap();
+        let mut state = crate::review_batch::ReviewScheduleState::for_date(business_date);
+        let transitions = state.apply(
+            &crate::review_batch::ReviewBatchOutcome::new(vec![(
+                crate::review_batch::ReviewTask::R08,
+                outcome,
+            )]),
+            business_date.and_hms_opt(19, 0, 0).unwrap(),
+        );
+        assert_eq!(transitions.len(), 1);
+        assert!(transitions[0].retryable);
+        assert_eq!(
+            transitions[0].next_attempt.as_deref(),
+            Some("2026-07-21T19:01:00")
+        );
+        assert!(!state.is_due(
+            crate::review_batch::ReviewTask::R08,
+            business_date.and_hms_milli_opt(19, 0, 59, 999).unwrap(),
+        ));
+        assert!(state.is_due(
+            crate::review_batch::ReviewTask::R08,
+            business_date.and_hms_opt(19, 1, 0).unwrap(),
+        ));
     }
 
     #[tokio::test]
