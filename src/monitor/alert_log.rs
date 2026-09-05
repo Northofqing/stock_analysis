@@ -378,6 +378,24 @@ mod tests {
     }
 
     #[test]
+    fn public_archive_append_operations_return_path_io_failures() {
+        let json_temp = tempfile::tempdir().unwrap();
+        fs::create_dir(dated_file(json_temp.path(), "jsonl")).unwrap();
+        let json_archive = AlertLog::for_test(json_temp.path()).unwrap();
+        assert!(json_archive.append_jsonl(&e()).is_err());
+
+        let md_temp = tempfile::tempdir().unwrap();
+        fs::create_dir(dated_file(md_temp.path(), "md")).unwrap();
+        let md_archive = AlertLog::for_test(md_temp.path()).unwrap();
+        assert!(md_archive.append_md(&e()).is_err());
+
+        let batch_temp = tempfile::tempdir().unwrap();
+        fs::create_dir(dated_file(batch_temp.path(), "jsonl")).unwrap();
+        let batch_archive = AlertLog::for_test(batch_temp.path()).unwrap();
+        assert!(batch_archive.append_batch(&[e()]).is_err());
+    }
+
+    #[test]
     fn test_today_stats() {
         let temp = tempfile::tempdir().unwrap();
         let archive = AlertLog::for_test(temp.path()).unwrap();
@@ -399,11 +417,14 @@ mod tests {
     fn test_archive_rejects_production_default_directory() {
         assert!(AlertLog::for_test(alerts_dir()).is_err());
         assert!(AlertLog::for_test("reports/../reports/alerts").is_err());
-        let temp = tempfile::tempdir().unwrap();
-        let alias = temp.path().join("production-alerts-alias");
-        std::os::unix::fs::symlink(std::env::current_dir().unwrap().join(alerts_dir()), &alias)
-            .unwrap();
-        assert!(AlertLog::for_test(alias).is_err());
+        #[cfg(unix)]
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let alias = temp.path().join("production-alerts-alias");
+            std::os::unix::fs::symlink(std::env::current_dir().unwrap().join(alerts_dir()), &alias)
+                .unwrap();
+            assert!(AlertLog::for_test(alias).is_err());
+        }
     }
 
     #[test]
@@ -424,11 +445,20 @@ mod tests {
         let mut production = normal_legacy.clone();
         production["origin"] = serde_json::json!("production");
         production["code"] = serde_json::json!("000001");
-        let content = [normal_legacy, legacy_test_code, test_origin, production]
-            .into_iter()
-            .map(|value| value.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let mut unknown_origin = normal_legacy.clone();
+        unknown_origin["origin"] = serde_json::json!("future_origin");
+        unknown_origin["code"] = serde_json::json!("600002");
+        let content = [
+            normal_legacy,
+            legacy_test_code,
+            test_origin,
+            production,
+            unknown_origin,
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
         fs::create_dir_all(temp.path()).unwrap();
         fs::write(dated_file(temp.path(), "jsonl"), format!("{content}\n")).unwrap();
 
