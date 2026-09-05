@@ -51,7 +51,7 @@ module ArchitectureDocs
           actual = Digest::SHA256.hexdigest(decision_bytes)
           expected = decisions.fetch('sha256')
           errors << "approved_decisions_sha_mismatch path=#{decisions['path']} expected=#{expected} actual=#{actual}" unless actual == expected
-          errors.concat(question_errors(decision_bytes))
+          errors.concat(question_errors(decision_bytes, decisions['path']))
         else
           errors << "approved_decisions_missing path=#{decisions['path']}"
         end
@@ -130,6 +130,7 @@ module ArchitectureDocs
 
     def safe_path(root, relative_path)
       return nil unless relative_path.is_a?(String)
+      return nil if relative_path.include?("\0")
 
       path = Pathname.new(relative_path)
       return nil if path.absolute? || path.cleanpath.to_s == '..' || path.cleanpath.to_s.start_with?('../')
@@ -145,8 +146,10 @@ module ArchitectureDocs
       nil
     end
 
-    def question_errors(bytes)
+    def question_errors(bytes, path)
       text = bytes.force_encoding(Encoding::UTF_8)
+      return ["approved_decisions_encoding_invalid path=#{path}"] unless text.valid_encoding?
+
       first = text[/^## Q1--Q55.*?(?=^## Q56--Q108)/m].to_s
       second = text[/^## Q56--Q108.*?(?=^## |\z)/m].to_s
       questions = (first + second).scan(/^\|\s*(\d+)\s*\|/).flatten.map(&:to_i)

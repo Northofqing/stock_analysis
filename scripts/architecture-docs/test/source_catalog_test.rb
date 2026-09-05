@@ -72,6 +72,53 @@ class SourceCatalogTest < Minitest::Test
     end
   end
 
+  def test_cli_rejects_nul_source_and_approved_decision_paths_without_a_backtrace
+    with_fixture do |root|
+      mutate_catalog(root) { |catalog| catalog['sources'].first['path'] = "docs/\0source.md" }
+      out, err, result = run_cli(root)
+      refute result.success?
+      assert_includes out + err, 'source_path_invalid'
+      refute_includes out + err, 'source_catalog.rb:'
+
+      reset_fixture_catalog(root)
+      mutate_catalog(root) { |catalog| catalog['approved_decisions']['path'] = "docs/\0decisions.md" }
+      out, err, result = run_cli(root)
+      refute result.success?
+      assert_includes out + err, 'approved_decisions_path_invalid'
+      refute_includes out + err, 'source_catalog.rb:'
+    end
+  end
+
+  def test_cli_rejects_non_string_source_and_approved_decision_paths
+    with_fixture do |root|
+      mutate_catalog(root) { |catalog| catalog['sources'].first['path'] = 42 }
+      out, err, result = run_cli(root)
+      refute result.success?
+      assert_includes out + err, 'source_field_invalid'
+      refute_includes out + err, 'source_catalog.rb:'
+
+      reset_fixture_catalog(root)
+      mutate_catalog(root) { |catalog| catalog['approved_decisions']['path'] = ['docs/decisions.md'] }
+      out, err, result = run_cli(root)
+      refute result.success?
+      assert_includes out + err, 'approved_decisions_field_invalid'
+      refute_includes out + err, 'source_catalog.rb:'
+    end
+  end
+
+  def test_cli_rejects_invalid_approved_decision_encoding_without_a_backtrace
+    with_fixture do |root|
+      invalid_bytes = "\xFF\n".b
+      File.binwrite(File.join(root, 'docs/decisions.md'), invalid_bytes)
+      update_decisions_hash(root, invalid_bytes)
+
+      out, err, result = run_cli(root)
+      refute result.success?
+      assert_includes out + err, 'approved_decisions_encoding_invalid'
+      refute_includes out + err, 'source_catalog.rb:'
+    end
+  end
+
   def test_cli_rejects_invalid_schema_status_and_missing_required_fields
     with_fixture do |root|
       cases = [
