@@ -204,6 +204,21 @@ class SourceCatalogTest < Minitest::Test
     end
   end
 
+  def test_cli_distinguishes_missing_and_non_directory_roots_from_missing_catalogs
+    Dir.mktmpdir('source-root-test') do |parent|
+      ordinary_file = File.join(parent, 'file')
+      File.binwrite(ordinary_file, 'not a directory')
+      [[File.join(parent, 'missing'), 'root_missing'], [ordinary_file, 'root_invalid'],
+       [parent, 'catalog_missing']].each do |root, reason|
+        out, err, result = run_cli(root)
+        assert_equal 1, result.exitstatus, out + err
+        assert_includes out + err, reason
+        refute_includes out + err, 'source_catalog.rb:'
+        refute_includes out + err, 'catalog_missing' unless reason == 'catalog_missing'
+      end
+    end
+  end
+
   private
 
   def run_cli(root, *args)

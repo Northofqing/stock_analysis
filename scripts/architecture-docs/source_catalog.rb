@@ -11,7 +11,11 @@ module ArchitectureDocs
     module_function
 
     def validate(root)
-      root = File.realpath(File.expand_path(root))
+      root = File.expand_path(root)
+      return ["root_missing path=#{root}"] unless File.exist?(root)
+      return ["root_invalid path=#{root}"] unless File.directory?(root)
+
+      root = File.realpath(root)
       catalog_path = safe_path(root, CATALOG_PATH)
       return ["catalog_path_invalid path=#{CATALOG_PATH}"] unless catalog_path
 

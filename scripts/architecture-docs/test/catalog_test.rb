@@ -169,6 +169,28 @@ class CatalogTest < Minitest::Test
     end
   end
 
+  def test_inline_impl_duplicates_are_ambiguous_even_when_another_impl_starts_a_line
+    with_fixture do |root|
+      source = "mod a { struct Foo; impl Foo {} }\nstruct Foo;\nimpl Foo {}\n"
+      add_code_evidence(root, source, 'Foo', 'rust_impl', 3, 3)
+      out, err, result = cli(root)
+      assert_equal 1, result.exitstatus, out + err
+      assert_includes out + err, 'symbol_ambiguous symbol=Foo'
+    end
+  end
+
+  def test_inline_generic_impl_ignores_masked_declarations_and_preserves_complete_header
+    with_fixture do |root|
+      source = "// impl<'a, T> Trait for Foo<'a, T> where T: Send {}\n" +
+               "const TEXT: &str = r#\"impl<'a, T> Trait for Foo<'a, T> where T: Send {}\"#;\n" +
+               "/* impl<'a, T> Trait for Foo<'a, T> where T: Send {} */\n" +
+               "mod a { unsafe impl<'a, T> Trait for Foo<'a, T> where T: Send {} }\n"
+      add_code_evidence(root, source, "<'a, T> Trait for Foo<'a, T> where T: Send", 'rust_impl', 4, 4)
+      out, err, result = cli(root)
+      assert_equal 0, result.exitstatus, out + err
+    end
+  end
+
   def test_strict_dirty_and_provisional_never_hide_actual_drift
     with_fixture do |root|
       out, err, result = Open3.capture3(RbConfig.ruby, CHECK_CATALOG, '--root', root)

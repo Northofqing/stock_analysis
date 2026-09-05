@@ -71,7 +71,8 @@ module ArchitectureDocs
       masked = mask(source)
       matches = []
       if kind == 'rust_impl'
-        masked.to_enum(:scan, /^\s*(?:unsafe\s+)?impl\b/n).each do
+        # Rust items may follow another item or an opening module brace inline.
+        masked.to_enum(:scan, /\bimpl\b/n).each do
           declaration = Regexp.last_match
           offset = masked.index('impl', declaration.begin(0))
           opening = body_opening(masked, offset)
