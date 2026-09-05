@@ -32,7 +32,7 @@ end
 root = File.realpath(File.expand_path(root))
 path = ArchitectureDocs::SourceCatalog.safe_path(root, 'docs/push-system/push-capability-catalog.md')
 expected_path = File.join(root, 'docs/push-system/push-capability-catalog.md')
-unless path == expected_path && File.realpath(File.dirname(path)) == File.dirname(path) &&
+unless !File.symlink?(expected_path) && path == expected_path && File.realpath(File.dirname(path)) == File.dirname(path) &&
        (!File.exist?(path) || (File.file?(path) && File.stat(path).nlink == 1))
   puts 'markdown_path_invalid'
   exit 1

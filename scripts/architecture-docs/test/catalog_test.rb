@@ -368,6 +368,56 @@ class CatalogTest < Minitest::Test
     end
   end
 
+  def test_renderer_rejects_dangling_symlink_without_creating_its_target
+    Dir.mktmpdir('catalog-owned-parent-') do |parent|
+      with_fixture(parent) do |root|
+        target = File.join(parent, 'must-not-be-created.md')
+        output = File.join(root, 'docs/push-system/push-capability-catalog.md')
+        File.symlink(target, output)
+        assert File.symlink?(output)
+        refute File.exist?(target)
+        out, err, result = Open3.capture3(RbConfig.ruby, RENDER_CATALOG, '--root', root, '--write')
+        refute File.exist?(target), 'renderer followed the dangling symlink outside the fixture root'
+        assert_equal 1, result.exitstatus, out + err
+        assert_includes out + err, 'markdown_path_invalid'
+        assert File.symlink?(output)
+      end
+    end
+  end
+
+  def test_signature_fragments_cannot_bypass_complete_identifier_ambiguity
+    [
+      ["mod a { fn send() {} }\nmod b { fn send(x: u8) {} }\n", 'send()', 'send', 'rust_fn'],
+      ["mod a { enum Event { One } }\nmod b { enum Event { Two } }\n", 'Event { One', 'Event', 'rust_enum'],
+      ["mod a { mod inner { fn first() {} } }\nmod b { mod inner { fn second() {} } }\n", 'inner { fn first()', 'inner', 'rust_mod']
+    ].each do |source, fragment, identifier, kind|
+      with_fixture do |root|
+        add_code_evidence(root, source, fragment, kind, 1, 1)
+        out, err, result = cli(root)
+        assert_equal 1, result.exitstatus, out + err
+        assert_includes out + err, 'symbol_identifier_invalid'
+        mutate(root, 'push-evidence-manifest.v1.json') { |manifest| manifest['evidence'].last['symbol'] = identifier }
+        out, err, result = cli(root)
+        assert_equal 1, result.exitstatus, out + err
+        assert_includes out + err, 'symbol_ambiguous'
+      end
+    end
+  end
+
+  def test_complete_raw_identifiers_are_supported_for_functions_enums_and_modules
+    [
+      ['fn r#type() {}', 'r#type', 'rust_fn'],
+      ['enum r#match { One }', 'r#match', 'rust_enum'],
+      ['mod r#type {}', 'r#type', 'rust_mod']
+    ].each do |source, identifier, kind|
+      with_fixture do |root|
+        add_code_evidence(root, source, identifier, kind, 1, 1)
+        out, err, result = cli(root)
+        assert_equal 0, result.exitstatus, out + err
+      end
+    end
+  end
+
   def test_missing_owner_and_noninteger_schema_fail_with_reason_codes
     with_fixture do |root|
       add_producer(root)
@@ -462,8 +512,8 @@ class CatalogTest < Minitest::Test
     File.binwrite(File.join(root, path), JSON.pretty_generate(object) + "\n")
   end
 
-  def with_fixture
-    Dir.mktmpdir('push-catalog-') do |root|
+  def with_fixture(parent = nil)
+    Dir.mktmpdir('push-catalog-', parent) do |root|
       FileUtils.mkdir_p(File.join(root, 'docs/push-system'))
       FileUtils.mkdir_p(File.join(root, 'src'))
       source = "pub enum PushKind {\n    One,\n}\n"

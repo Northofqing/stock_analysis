@@ -65,6 +65,9 @@ module ArchitectureDocs
     def locate(source, symbol, kind)
       keyword = { 'rust_fn' => 'fn', 'rust_enum' => 'enum', 'rust_impl' => 'impl', 'rust_mod' => 'mod' }[kind]
       raise Invalid, "evidence_kind_invalid kind=#{kind}" unless keyword
+      if kind != 'rust_impl' && !identifier?(symbol)
+        raise Invalid, "symbol_identifier_invalid symbol=#{symbol}"
+      end
       masked = mask(source)
       matches = []
       if kind == 'rust_impl'
@@ -77,8 +80,13 @@ module ArchitectureDocs
           matches << offset if header == symbol.b
         end
       else
-        pattern = Regexp.new("\\b#{keyword}\\s+".b + Regexp.escape(symbol.b) + '(?![A-Za-z0-9_\x80-\xff])'.b, Regexp::NOENCODING)
-        masked.to_enum(:scan, pattern).each { matches << Regexp.last_match.begin(0) }
+        # Extract whole declaration identifiers before comparison. User-supplied
+        # signature fragments must never select one of several same-named items.
+        pattern = /\b#{keyword}\s+((?:r#)?[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*)/n
+        masked.to_enum(:scan, pattern).each do
+          declaration = Regexp.last_match
+          matches << declaration.begin(0) if declaration[1] == symbol.b && identifier?(declaration[1])
+        end
       end
       raise Invalid, "symbol_missing symbol=#{symbol}" if matches.empty?
       raise Invalid, "symbol_ambiguous symbol=#{symbol}" unless matches.length == 1
@@ -103,6 +111,13 @@ module ArchitectureDocs
         'end_line' => masked.byteslice(0, cursor).count("\n") + 1,
         'body' => masked.byteslice(opening + 1, cursor - opening - 2)
       }
+    end
+
+    def identifier?(symbol)
+      return false unless symbol.is_a?(String)
+
+      identifier = symbol.dup.force_encoding(Encoding::UTF_8)
+      identifier.valid_encoding? && identifier.match?(/\A(?:r#)?[_\p{XID_Start}][\p{XID_Continue}]*\z/)
     end
 
     def body_opening(masked, offset)
