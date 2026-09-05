@@ -32,7 +32,7 @@
 
 `push-capability-catalog.v1.json`顶层：`schema_version:1,status:"PROVISIONAL",baseline_commit,scope,enum_evidence_id,kinds,producers,migration_units,excluded_worktree_additions`。kinds每项：`kind,primary_phase,status,producer_ids,evidence_ids,note`。phase固定中文盘前/集合竞价/盘中/盘后；status为ACTIVE/INACTIVE/STARVED/OPT-IN。producer每项：`id,kinds,phase_epics,occurrence_family,completion_owner,migration_unit_id,trigger,source,authority,policy,evidence_ids,known_gaps`；trigger/source/authority/policy各包含中文说明及对应evidence_ids。Unit每项：`id,producer_ids,completion_owner,occurrence_families,phase_epics,note`。没有producer的INACTIVE保留空producer_ids并有明确禁用/无caller证据与说明，不能虚构正在运行的producer。
 
-所有非INACTIVE kind必须有source-reviewed producer；有renderer但不可达的producer保留明确不可达/缺输入语义。共享kind不强行合并producer；共享原子completion owner的producer必须放在同一Unit并解释原因。目录是源审计候选，不自动冻结完整迁移顺序或工期。
+所有非INACTIVE kind必须有source-reviewed producer；有renderer但不可达的producer保留明确不可达/缺输入语义。共享kind不强行合并producer；共享原子completion owner的producer必须放在同一Unit并解释原因。completion owner必须按实际状态标识及其occurrence/key范围区分，不能因为处于同一函数、同一状态类型或同一数据库而合并。目录是源审计候选，不自动冻结完整迁移顺序或工期。
 
 `scope`必须明确隔离代码基线、源码审计≠部署证明、完整RFC/运行时Foundation/离线HTML/CI/工期尚未完成。`excluded_worktree_additions`精确记录PaperBuy/Watchdog及“仅原混合工作树存在，本分支未移入”的原因，不给它们伪造本分支源码证据。
 
@@ -54,9 +54,9 @@
 | docs/v19.x/v19.1-review-enhancement.md | 26ca82982ebdc8c6cab9251dc00f250b57a33e5e90821db25705c87be23ad2ef |
 | docs/v19.x/v19.2-ai-analysis-improvement.md | ac7b2430ee5cf043314bd37aea622fbc16e42c27e4cea6bb9e50ef787b3b99ea |
 
-- [ ] 校验原文件SHA，按原字节导入，校验目标SHA。批准表同样先后比对SHA。若apply_patch未保留末尾字节，报告实际差异，不擅自声称相同或修改原文件。
-- [ ] source catalog逐项抄录真实标题/声明：v18.2–v18.4标题为v20.x，v18.5为v20.0；只描述“位于v18.x且文件自声明v20的版本标签冲突”，不说文件放错。push-template-catalog是97f28b9/57-kind历史快照，不能作为当前65-kind目录。
-- [ ] 在公开CLI写正常临时fixture的失败测试，随后实现最小成功路径。测试必须通过Open3调用CLI，不只直接调用内部helper。fixture使用Dir.mktmpdir和File.binwrite，仅写自己拥有的临时根；source catalogue fixture可用最小一项且不硬编码项目九项数量，项目级九项校验另列。
+- [x] 校验原文件SHA，按原字节导入，校验目标SHA。批准表同样先后比对SHA。若apply_patch未保留末尾字节，报告实际差异，不擅自声称相同或修改原文件。
+- [x] source catalog逐项抄录真实标题/声明：v18.2–v18.4标题为v20.x，v18.5为v20.0；只描述“位于v18.x且文件自声明v20的版本标签冲突”，不说文件放错。push-template-catalog是97f28b9/57-kind历史快照，不能作为当前65-kind目录。
+- [x] 在公开CLI写正常临时fixture的失败测试，随后实现最小成功路径。测试必须通过Open3调用CLI，不只直接调用内部helper。fixture使用Dir.mktmpdir和File.binwrite，仅写自己拥有的临时根；source catalogue fixture可用最小一项且不硬编码项目九项数量，项目级九项校验另列。
 
 ```ruby
 out, err, result = Open3.capture3(RbConfig.ruby, CHECK_SOURCES,
@@ -69,10 +69,10 @@ refute result.success?
 assert_includes out + err, 'source_sha_mismatch'
 ```
 
-- [ ] 公共实现接口为`ArchitectureDocs::SourceCatalog.validate(root)`，返回字符串错误数组；所有读路径先检查相对路径/真实路径在root内，错误包含稳定原因码和path/id。CLI成功exit0，验证失败exit1，未知参数exit2；不修改任何输入文件。
-- [ ] 逐个增加并验证：source缺失/字节漂移、重复ID/path、非法或越界路径、catalog schema/status不合法、缺必需字段、批准表SHA变化或108题缺失/重复（按两段表抽取完整Q1–108，不把superseded Q71删掉）。所有fixture使用108题的完整小表，再逐案制造缺失/重复；question_count不得配置成其他数量来绕过批准表覆盖。
-- [ ] `ruby scripts/architecture-docs/test/source_catalog_test.rb`及`ruby scripts/architecture-docs/check-sources.rb --root .`通过；项目级确认九份固定hash/批准表字节相同，所有导入路径可纳管。Ruby语法及`git diff --check`通过。
-- [ ] 仅提交本任务文件，报告写task-1-report.md，包含RED/GREEN命令输出、源导入前后hash、剩余未交付的整体门禁。不要运行或改写原工作区的归档、源码、索引。
+- [x] 公共实现接口为`ArchitectureDocs::SourceCatalog.validate(root)`，返回字符串错误数组；所有读路径先检查相对路径/真实路径在root内，错误包含稳定原因码和path/id。CLI成功exit0，验证失败exit1，未知参数exit2；不修改任何输入文件。
+- [x] 逐个增加并验证：source缺失/字节漂移、重复ID/path、非法或越界路径、catalog schema/status不合法、缺必需字段、批准表SHA变化或108题缺失/重复（按两段表抽取完整Q1–108，不把superseded Q71删掉）。所有fixture使用108题的完整小表，再逐案制造缺失/重复；question_count不得配置成其他数量来绕过批准表覆盖。
+- [x] `ruby scripts/architecture-docs/test/source_catalog_test.rb`及`ruby scripts/architecture-docs/check-sources.rb --root .`通过；项目级确认九份固定hash/批准表字节相同，所有导入路径可纳管。Ruby语法及`git diff --check`通过。
+- [x] 仅提交本任务文件，报告写task-1-report.md，包含RED/GREEN命令输出、源导入前后hash、剩余未交付的整体门禁。不要运行或改写原工作区的归档、源码、索引。
 
 ## Task 2: 65-kind源审计目录、稳定symbol证据和漂移门禁
 
@@ -97,7 +97,7 @@ assert_includes out + err, 'enum_coverage_mismatch'
 ```
 
 - [ ] 使用既定schema人工审计所有实际enum项。kind集与enum精确相等，重复/缺项失败；本基线期望65，不能把校验器写成永远只接受65。phase/status来自源码可达性及明确禁用/缺源/opt-in条件，不由level/展示注册表推断ACTIVE。
-- [ ] 逐producer记录trigger、source、authority、policy、occurrence和completion owner，每个关系都关联实际symbol证据。强制核查：NewsToIdea普通D01与NewsAI；IntradayMarket盘中概览/09:10不可达预检/15:05持仓过期；MarketActionAlert账户模式/交易异常；PaperSell盘中/盘后；CandidateBoard、CandidateInvalidated、AuctionRepush共享tick/completion；SectorTop/SectorAnomaly共享timer；复盘及大宗/业绩家族。不得用一个main函数引用代替dispatch/source/finalize等全部语义证据。
+- [ ] 逐producer记录trigger、source、authority、policy、occurrence和completion owner，每个关系都关联实际symbol证据。强制核查：NewsToIdea普通D01与NewsAI；IntradayMarket盘中概览/09:10不可达预检/15:05持仓过期；MarketActionAlert账户模式/交易异常；PaperSell盘中/盘后；CandidateBoard、CandidateInvalidated、AuctionRepush共享tick/completion；SectorTop/SectorAnomaly各自timer；复盘及大宗/业绩家族。不得用一个main函数引用代替dispatch/source/finalize等全部语义证据。
 - [ ] 收录enum外生产路径：CLI单股/汇总、09:05/15:30产业链报告。它们用producer记录但kinds允许空数组且有明确原因；不能为了凑65漏掉非enum路径。无生产caller的AlertManager只作排除说明，不虚构为活跃第五条路径。
 - [ ] 每个证据文件冻结07781bf中的Git字节SHA并与工作区一致；locator产生symbol哈希和行号。Git基线须为真实完整commit且为当前HEAD祖先；新commit仅改文档不要求改代码基线。生产代码更改必须让旧manifest失败，不能在检查时自动刷新期望值。
 - [ ] `ArchitectureDocs::Catalog.validate(root, strict:)`返回原因码错误数组，调用SourceCatalog；验证所有schema字段类型/状态/引用、enum集、kind→producer→Unit双向一致、同completion-owner的Unit归属、phase合法、排除项不在enum、evidence完整且无重复/悬挂/歧义。严格模式另检查PROVISIONAL和非ignored脏状态，draft仅跳过这两个条件。文件SHA与symbol SHA失败必须都可诊断，不能被状态检查提前掩盖。
@@ -109,5 +109,7 @@ assert_includes out + err, 'enum_coverage_mismatch'
 ## 整批验证和交付
 
 源码始终保持07781bf。运行两个Ruby测试文件、来源校验、目录draft、Markdown freshness、两次生成幂等、所有新Ruby语法、git diff --check；严格失败必须明确为PROVISIONAL/dirty而非掩盖内容错误。全套运行时Rust测试、全量RFC/WBS/离线HTML/CI不在本批验收内，不复用首批绿灯宣称它们完成。
+
+导入核对后的格式例外：v18.4来源第219/278行、v18.5来源第109/138/142/433行原有行尾空格，保留原字节和已批准SHA；整批裸range `git diff --check`会保留这六处诊断，其他文件仍须零格式错误，不更改全局whitespace配置。v19.0原文无末尾LF；apply_patch导入时多加的唯一LF经原目标字节断言后机械移除，原文件保持只读，目标SHA重新一致。
 
 中文结果写docs/push-system/implementation-batch-2-results-2026-09-05.md，原目录implementation-status入口更新。本批按Task1→Task2顺序实施/分别review，最后对07781bf以来整批review。保留来源及先前事故参考件，分支/worktree不清理、不自动合并。
