@@ -3385,6 +3385,114 @@
       "end_line": 5088
     },
     {
+      "id": "startup-all-pending",
+      "path": "src/durable_delivery/coordinator.rs",
+      "symbol": "reconcile_all_pending",
+      "kind": "rust_fn",
+      "symbol_sha256": "f3c83c0431971edc0740a44fe528cde98962fae39e66bac9be4bb9eb0a939aff",
+      "start_line": 3735,
+      "end_line": 3766
+    },
+    {
+      "id": "startup-barrier",
+      "path": "src/bin/monitor/durable_delivery_runtime.rs",
+      "symbol": "ensure_startup_reconciled",
+      "kind": "rust_fn",
+      "symbol_sha256": "7b302f78dd70b27de1f6ab669d66d0edd2289453fd72774271840c539aa57676",
+      "start_line": 1166,
+      "end_line": 1185
+    },
+    {
+      "id": "startup-begin-attempt",
+      "path": "src/durable_delivery/coordinator.rs",
+      "symbol": "begin_attempt",
+      "kind": "rust_fn",
+      "symbol_sha256": "ad070e3320996684e2dcce99f936fc44a2d309998accfb3e53eb63f10d0b229d",
+      "start_line": 4793,
+      "end_line": 4941
+    },
+    {
+      "id": "startup-expired-attempt",
+      "path": "src/durable_delivery/coordinator.rs",
+      "symbol": "recover_one_expired_attempt",
+      "kind": "rust_fn",
+      "symbol_sha256": "cc37d93adedd661de031fe08d4bfb1775b3a422a924ecf47520ac6b08eae72dc",
+      "start_line": 5233,
+      "end_line": 5339
+    },
+    {
+      "id": "startup-kind-map",
+      "path": "src/bin/monitor/durable_delivery_runtime.rs",
+      "symbol": "durable_kind_and_sub_kind_with_override",
+      "kind": "rust_fn",
+      "symbol_sha256": "08f83684eabedbaf5fdfb848e2e8af147b3fd693c6c504a68f54accc23b81ee6",
+      "start_line": 2274,
+      "end_line": 2322
+    },
+    {
+      "id": "startup-list-deliverable",
+      "path": "src/durable_delivery/coordinator.rs",
+      "symbol": "build_reconcile_summary",
+      "kind": "rust_fn",
+      "symbol_sha256": "2372254ffb0eb37695a0d4daab0a3dc48ce46b19cd9fd302664473cdd76d79d6",
+      "start_line": 5865,
+      "end_line": 5976
+    },
+    {
+      "id": "startup-reacquire",
+      "path": "src/durable_delivery/coordinator.rs",
+      "symbol": "reacquire_rejected",
+      "kind": "rust_fn",
+      "symbol_sha256": "2d896a192637b3359b0454adf55ef484c00d630cfc9ea8ebe9f8aa9f731fad7a",
+      "start_line": 4736,
+      "end_line": 4791
+    },
+    {
+      "id": "startup-reconcile",
+      "path": "src/bin/monitor/durable_delivery_runtime.rs",
+      "symbol": "reconcile_startup_blocking",
+      "kind": "rust_fn",
+      "symbol_sha256": "693aa3d83894d1d70c0b7d1abb053f4f238cc4dea2b9f30a57e39e3436962b10",
+      "start_line": 2074,
+      "end_line": 2124
+    },
+    {
+      "id": "startup-resume",
+      "path": "src/durable_delivery/coordinator.rs",
+      "symbol": "resume_deliverable",
+      "kind": "rust_fn",
+      "symbol_sha256": "a2920da27c547667eafe9f399b48163a2a6248f6b19460e0663ac373e373aa38",
+      "start_line": 3624,
+      "end_line": 3673
+    },
+    {
+      "id": "startup-review-hydrate",
+      "path": "src/bin/monitor/review_batch.rs",
+      "symbol": "apply_durable_hydrations_with_evidence",
+      "kind": "rust_fn",
+      "symbol_sha256": "cc69d0d5929f8d49e25783192fbc214e537ab6341f0fd7daa42c14356c846787",
+      "start_line": 1447,
+      "end_line": 1557
+    },
+    {
+      "id": "startup-review-task-map",
+      "path": "src/bin/monitor/review_batch.rs",
+      "symbol": "ReviewTask",
+      "kind": "rust_impl",
+      "symbol_sha256": "e96ef91f4958a02a1250bab12af9f189387eb0c402f1120c1fab737babff988f",
+      "start_line": 442,
+      "end_line": 516
+    },
+    {
+      "id": "startup-sink",
+      "path": "src/bin/monitor/durable_delivery_runtime.rs",
+      "symbol": "AuthoritativeSinkPort for MagiclawAuthoritativeSink",
+      "kind": "rust_impl",
+      "symbol_sha256": "6cc3bc16698a626e3ed22aebbb7cc039d380dd7d0d3290b3a362769d6f0c3be9",
+      "start_line": 1073,
+      "end_line": 1097
+    },
+    {
       "id": "t0-binding",
       "path": "src/decision/t0_advisor.rs",
       "symbol": "T0PlanDecisionBindingV1",

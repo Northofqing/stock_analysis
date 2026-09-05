@@ -14,9 +14,21 @@
       ],
       "evidence_ids": [
         "alert-disabled",
-        "monitor-loop"
+        "monitor-loop",
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink"
       ],
-      "note": "无生产发送caller；legacy summary停在counted binding不可用，reject_unbound_alert_delivery明确sink_calls=0；renderer/registry/fixture不构成producer。"
+      "note": "新claim/新producer审计：无生产发送caller；legacy summary停在counted binding不可用，reject_unbound_alert_delivery明确sink_calls=0；renderer/registry/fixture不构成producer。 既存decision恢复边界：runtime映射为durable HoldingEvent/None。普通启动all-date barrier仍可从已存immutable envelope恢复Reserved或已获retry授权的RejectedDurable；不受正常loader/任务时窗/最近5日backfill限制，不重取当前source，foreign lease/Uncertain不盲发。仅说明历史counted decision的可恢复能力，未查询其存在性；状态保持INACTIVE且producer_ids为空，不造活动producer/Unit。"
     },
     {
       "kind": "DailyReport",
@@ -27,9 +39,21 @@
       ],
       "evidence_ids": [
         "monitor-loop",
-        "alert-disabled"
+        "alert-disabled",
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink"
       ],
-      "note": "预期盘前/盘后；两处daily report counted binding缺失，legacy告警/summary拒绝，无发送caller。"
+      "note": "新claim/新producer审计：预期盘前/盘后；两处daily report counted binding缺失，legacy告警/summary拒绝，无发送caller。 既存decision恢复边界：runtime将DailyReport映射为durable DailyReport；requested sub_kind可为None/FactorIC/SectorTier/CapitalVerify。普通启动all-date barrier仍可从已存immutable envelope恢复Reserved或已获retry授权的RejectedDurable；不受正常loader/任务时窗/最近5日backfill限制，不重取当前source，foreign lease/Uncertain不盲发。仅说明历史counted decision的可恢复能力，未查询其存在性；状态保持INACTIVE且producer_ids为空，不造活动producer/Unit。"
     },
     {
       "kind": "Announcement",
@@ -122,7 +146,8 @@
       "primary_phase": "盘中",
       "status": "ACTIVE",
       "producer_ids": [
-        "sector-top"
+        "sector-top",
+        "startup-resume-sector-top"
       ],
       "evidence_ids": [
         "monitor-loop",
@@ -131,9 +156,20 @@
         "counted-push",
         "counted-policy",
         "counted-envelope",
-        "claim-inspect"
+        "claim-inspect",
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink"
       ],
-      "note": "独立BusinessDateOnce claim与一小时timer；false也推进timer。"
+      "note": "独立BusinessDateOnce claim与一小时timer；false也推进timer。 另有普通启动all-date既存immutable envelope恢复producer，归原durable owner/Unit；不受正常loader/业务时窗/backfill最近5日限制，不生成新claim。"
     },
     {
       "kind": "FundInflow",
@@ -181,9 +217,21 @@
       "evidence_ids": [
         "push-kind",
         "dispatch-disabled",
-        "adapter-kind"
+        "adapter-kind",
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink"
       ],
-      "note": "只有DailyReportSubKind/dispatch metadata、计算报告和durable适配，无此kind发送caller。"
+      "note": "新claim/新producer审计：只有DailyReportSubKind/dispatch metadata、计算报告和durable适配，无此kind发送caller。 既存decision恢复边界：runtime将FactorIC映射为durable DailyReport/sub_kind=FactorIC，不是独立durable kind。普通启动all-date barrier仍可从已存immutable envelope恢复Reserved或已获retry授权的RejectedDurable；不受正常loader/任务时窗/最近5日backfill限制，不重取当前source，foreign lease/Uncertain不盲发。仅说明历史counted decision的可恢复能力，未查询其存在性；状态保持INACTIVE且producer_ids为空，不造活动producer/Unit。"
     },
     {
       "kind": "SectorTier",
@@ -195,9 +243,21 @@
       "evidence_ids": [
         "push-kind",
         "dispatch-disabled",
-        "adapter-kind"
+        "adapter-kind",
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink"
       ],
-      "note": "metadata/适配/领域同名enum不是PushKind producer；全src无发送caller。"
+      "note": "新claim/新producer审计：metadata/适配/领域同名enum不是PushKind producer；全src无发送caller。 既存decision恢复边界：runtime将SectorTier映射为durable DailyReport/sub_kind=SectorTier，不是独立durable kind。普通启动all-date barrier仍可从已存immutable envelope恢复Reserved或已获retry授权的RejectedDurable；不受正常loader/任务时窗/最近5日backfill限制，不重取当前source，foreign lease/Uncertain不盲发。仅说明历史counted decision的可恢复能力，未查询其存在性；状态保持INACTIVE且producer_ids为空，不造活动producer/Unit。"
     },
     {
       "kind": "CapitalVerify",
@@ -209,9 +269,21 @@
       "evidence_ids": [
         "push-kind",
         "dispatch-disabled",
-        "adapter-kind"
+        "adapter-kind",
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink"
       ],
-      "note": "metadata/子类映射/计算结果不构成发送入口，全src无生产caller。"
+      "note": "新claim/新producer审计：metadata/子类映射/计算结果不构成发送入口，全src无生产caller。 既存decision恢复边界：runtime将CapitalVerify映射为durable DailyReport/sub_kind=CapitalVerify，不是独立durable kind。普通启动all-date barrier仍可从已存immutable envelope恢复Reserved或已获retry授权的RejectedDurable；不受正常loader/任务时窗/最近5日backfill限制，不重取当前source，foreign lease/Uncertain不盲发。仅说明历史counted decision的可恢复能力，未查询其存在性；状态保持INACTIVE且producer_ids为空，不造活动producer/Unit。"
     },
     {
       "kind": "WeeklySOP",
@@ -246,7 +318,8 @@
       "status": "STARVED",
       "producer_ids": [
         "review-r03-auto",
-        "review-r03-manual"
+        "review-r03-manual",
+        "startup-resume-industry-chain"
       ],
       "evidence_ids": [
         "review-auto",
@@ -256,9 +329,25 @@
         "review-context",
         "review-schedule-state",
         "counted-policy",
-        "review-manual"
+        "review-manual",
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink",
+        "claim-inspect",
+        "startup-review-hydrate",
+        "startup-review-task-map",
+        "review-hydration"
       ],
-      "note": "R03 LegacyAccountGate typed AccountMetricsIncomplete阻断provider/renderer/sink；auto/manual任务状态独立，无claim的潜在B不作活动owner。"
+      "note": "R03新claim仍由LegacyAccountGate typed AccountMetricsIncomplete阻断provider/renderer/sink；auto/manual任务状态独立。普通启动可恢复既存IndustryChain counted claim，单独producer/Unit拥有该immutable decision；经核验hydration关联auto/manual，不激活新claim。"
     },
     {
       "kind": "TurnoverTop",
@@ -365,7 +454,8 @@
       "status": "ACTIVE",
       "producer_ids": [
         "holding-plan-periodic",
-        "holding-plan-manual"
+        "holding-plan-manual",
+        "startup-resume-holding-plan"
       ],
       "evidence_ids": [
         "monitor-loop",
@@ -378,16 +468,27 @@
         "claim-inspect",
         "manual-push",
         "monitor-main",
-        "banner-read"
+        "banner-read",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink"
       ],
-      "note": "定时counted有holding_plan_daily副表；manual同family但新CLI受banner阻断，无日表；canonical时间可改变decision。"
+      "note": "定时counted有holding_plan_daily副表；manual同family但新CLI受banner阻断，无日表；canonical时间可改变decision。 另有普通启动all-date既存immutable envelope恢复producer，归原durable owner/Unit；不受正常loader/业务时窗/backfill最近5日限制，不生成新claim。"
     },
     {
       "kind": "T0Advice",
       "primary_phase": "盘中",
       "status": "ACTIVE",
       "producer_ids": [
-        "t0-advice"
+        "t0-advice",
+        "startup-resume-t0-advice"
       ],
       "evidence_ids": [
         "monitor-loop",
@@ -396,9 +497,20 @@
         "counted-push",
         "counted-policy",
         "counted-envelope",
-        "claim-inspect"
+        "claim-inspect",
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink"
       ],
-      "note": "独立T0 decision hash与30s timer，非HoldingPlan owner；Forbidden/Rejected不产生消息。"
+      "note": "独立T0 decision hash与30s timer，非HoldingPlan owner；Forbidden/Rejected不产生消息。 另有普通启动all-date既存immutable envelope恢复producer，归原durable owner/Unit；不受正常loader/业务时窗/backfill最近5日限制，不生成新claim。"
     },
     {
       "kind": "CandidateTriggered",
@@ -410,9 +522,21 @@
       "evidence_ids": [
         "monitor-loop",
         "candidate-trigger",
-        "candidate-trigger-push"
+        "candidate-trigger-push",
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink"
       ],
-      "note": "真实caller存在但三层受阻：market active后要求Closed/盘前；下游promotion参数None；即使通过也缺counted binding。preopen_aux_pushed是未完成外门，不造活动producer。"
+      "note": "新claim/新producer审计：真实caller存在但三层受阻：market active后要求Closed/盘前；下游promotion参数None；即使通过也缺counted binding。preopen_aux_pushed是未完成外门，不造活动producer。 既存decision恢复边界：runtime映射为durable CandidateTriggered/None。普通启动all-date barrier仍可从已存immutable envelope恢复Reserved或已获retry授权的RejectedDurable；不受正常loader/任务时窗/最近5日backfill限制，不重取当前source，foreign lease/Uncertain不盲发。仅说明历史counted decision的可恢复能力，未查询其存在性；状态保持INACTIVE且producer_ids为空，不造活动producer/Unit。"
     },
     {
       "kind": "ForbiddenOps",
@@ -423,16 +547,29 @@
       ],
       "evidence_ids": [
         "push-kind",
-        "adapter-kind"
+        "adapter-kind",
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink"
       ],
-      "note": "全src仅renderer/preview/tests、registry/durable映射，无生产caller。"
+      "note": "新claim/新producer审计：全src仅renderer/preview/tests、registry/durable映射，无生产caller。 既存decision恢复边界：runtime映射为durable ForbiddenOps/None。普通启动all-date barrier仍可从已存immutable envelope恢复Reserved或已获retry授权的RejectedDurable；不受正常loader/任务时窗/最近5日backfill限制，不重取当前source，foreign lease/Uncertain不盲发。仅说明历史counted decision的可恢复能力，未查询其存在性；状态保持INACTIVE且producer_ids为空，不造活动producer/Unit。"
     },
     {
       "kind": "PaperTrade",
       "primary_phase": "集合竞价",
       "status": "ACTIVE",
       "producer_ids": [
-        "paper-trade-terminal"
+        "paper-trade-terminal",
+        "startup-resume-paper-trade"
       ],
       "evidence_ids": [
         "monitor-loop",
@@ -442,9 +579,20 @@
         "counted-push",
         "counted-policy",
         "counted-envelope",
-        "claim-inspect"
+        "claim-inspect",
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink"
       ],
-      "note": "消费真实当日严格交易完成态，按terminal transition counted；业务成交与通知decision分开。"
+      "note": "消费真实当日严格交易完成态，按terminal transition counted；业务成交与通知decision分开。 另有普通启动all-date既存immutable envelope恢复producer，归原durable owner/Unit；不受正常loader/业务时窗/backfill最近5日限制，不生成新claim。"
     },
     {
       "kind": "PaperSell",
@@ -530,7 +678,8 @@
       "primary_phase": "盘中",
       "status": "ACTIVE",
       "producer_ids": [
-        "close-call"
+        "close-call",
+        "startup-resume-close-call"
       ],
       "evidence_ids": [
         "monitor-loop",
@@ -538,9 +687,20 @@
         "counted-push",
         "counted-policy",
         "counted-envelope",
-        "claim-inspect"
+        "claim-inspect",
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink"
       ],
-      "note": "t≥14:55 counted per ticket，只有下界；零条也封close_call_pushed，失败保留。"
+      "note": "t≥14:55 counted per ticket，只有下界；零条也封close_call_pushed，失败保留。 另有普通启动all-date既存immutable envelope恢复producer，归原durable owner/Unit；不受正常loader/业务时窗/backfill最近5日限制，不生成新claim。"
     },
     {
       "kind": "ReviewMarket",
@@ -552,9 +712,21 @@
       "evidence_ids": [
         "review-preflight",
         "r02-disabled",
-        "review-schedule-state"
+        "review-schedule-state",
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink"
       ],
-      "note": "R02缺完整review-date市场batch，preflight/dispatcher Disabled；独立auto/manual任务审计不生成通知producer，backfill排除。"
+      "note": "新claim/新producer审计：R02缺完整review-date市场batch，preflight/dispatcher Disabled；独立auto/manual任务审计不生成通知producer，backfill排除。 既存decision恢复边界：runtime映射为durable ReviewMarket/None。普通启动all-date barrier仍可从已存immutable envelope恢复Reserved或已获retry授权的RejectedDurable；不受正常loader/任务时窗/最近5日backfill限制，不重取当前source，foreign lease/Uncertain不盲发。仅说明历史counted decision的可恢复能力，未查询其存在性；状态保持INACTIVE且producer_ids为空，不造活动producer/Unit。"
     },
     {
       "kind": "ReviewLhb",
@@ -563,7 +735,8 @@
       "producer_ids": [
         "review-r04-auto",
         "review-r04-manual",
-        "review-r04-backfill"
+        "review-r04-backfill",
+        "startup-resume-review-lhb"
       ],
       "evidence_ids": [
         "review-auto",
@@ -586,9 +759,22 @@
         "review-resume",
         "review-authorize",
         "review-occurrence-inspect",
-        "r12-disabled"
+        "r12-disabled",
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink",
+        "startup-review-hydrate",
+        "startup-review-task-map"
       ],
-      "note": "R04三入口共原日BusinessDateOnce；auto实际at_manual提前绕21:00，来源校验不豁免。"
+      "note": "R04三入口共原日BusinessDateOnce；auto实际at_manual提前绕21:00，来源校验不豁免。 另有普通启动all-date既存immutable envelope恢复producer，归原durable owner/Unit；不受正常loader/业务时窗/backfill最近5日限制，不生成新claim。"
     },
     {
       "kind": "ReviewSignal",
@@ -600,9 +786,21 @@
       "evidence_ids": [
         "review-preflight",
         "r05-disabled",
-        "review-auto"
+        "review-auto",
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink"
       ],
-      "note": "R05缺append-only signal→delivery→execution→settlement outcome，明确Disabled；不把订单表当生产源，backfill排除。"
+      "note": "新claim/新producer审计：R05缺append-only signal→delivery→execution→settlement outcome，明确Disabled；不把订单表当生产源，backfill排除。 既存decision恢复边界：runtime映射为durable ReviewSignal/None。普通启动all-date barrier仍可从已存immutable envelope恢复Reserved或已获retry授权的RejectedDurable；不受正常loader/任务时窗/最近5日backfill限制，不重取当前source，foreign lease/Uncertain不盲发。仅说明历史counted decision的可恢复能力，未查询其存在性；状态保持INACTIVE且producer_ids为空，不造活动producer/Unit。"
     },
     {
       "kind": "ReviewFailure",
@@ -613,9 +811,21 @@
       ],
       "evidence_ids": [
         "review-preflight",
-        "r06-disabled"
+        "r06-disabled",
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink"
       ],
-      "note": "R06缺evidence-bound classified failure outcome，明确Disabled；无活动发送owner，backfill排除。"
+      "note": "新claim/新producer审计：R06缺evidence-bound classified failure outcome，明确Disabled；无活动发送owner，backfill排除。 既存decision恢复边界：runtime映射为durable ReviewFailure/None。普通启动all-date barrier仍可从已存immutable envelope恢复Reserved或已获retry授权的RejectedDurable；不受正常loader/任务时窗/最近5日backfill限制，不重取当前source，foreign lease/Uncertain不盲发。仅说明历史counted decision的可恢复能力，未查询其存在性；状态保持INACTIVE且producer_ids为空，不造活动producer/Unit。"
     },
     {
       "kind": "TomorrowWatch",
@@ -624,7 +834,8 @@
       "producer_ids": [
         "review-r07-auto",
         "review-r07-manual",
-        "review-r07-backfill"
+        "review-r07-backfill",
+        "startup-resume-tomorrow-watch"
       ],
       "evidence_ids": [
         "review-auto",
@@ -647,9 +858,22 @@
         "review-resume",
         "review-authorize",
         "review-occurrence-inspect",
-        "r12-disabled"
+        "r12-disabled",
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink",
+        "startup-review-hydrate",
+        "startup-review-task-map"
       ],
-      "note": "R07三入口共原日claim；当日manual也等21:00，四源与LHB counted lineage缺口保留。"
+      "note": "R07三入口共原日claim；当日manual也等21:00，四源与LHB counted lineage缺口保留。 另有普通启动all-date既存immutable envelope恢复producer，归原durable owner/Unit；不受正常loader/业务时窗/backfill最近5日限制，不生成新claim。"
     },
     {
       "kind": "EventCalendar",
@@ -658,7 +882,8 @@
       "producer_ids": [
         "review-r08-auto",
         "review-r08-manual",
-        "review-r08-backfill"
+        "review-r08-backfill",
+        "startup-resume-event-calendar"
       ],
       "evidence_ids": [
         "review-auto",
@@ -682,9 +907,22 @@
         "review-backfill-one",
         "review-resume",
         "review-authorize",
-        "r12-disabled"
+        "r12-disabled",
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink",
+        "startup-review-hydrate",
+        "startup-review-task-map"
       ],
-      "note": "R08 Rolling review occurrence；必需CFFEX错误保留typed retryability，其余三组件可degraded；首批源错无持久任务终态。"
+      "note": "R08 Rolling review occurrence；必需CFFEX错误保留typed retryability，其余三组件可degraded；首批源错无持久任务终态。 另有普通启动all-date既存immutable envelope恢复producer，归原durable owner/Unit；不受正常loader/业务时窗/backfill最近5日限制，不生成新claim。"
     },
     {
       "kind": "ReviewProviderTopN",
@@ -693,7 +931,8 @@
       "producer_ids": [
         "review-r09-auto",
         "review-r09-manual",
-        "review-r09-backfill"
+        "review-r09-backfill",
+        "startup-resume-review-provider-top-n"
       ],
       "evidence_ids": [
         "review-auto",
@@ -716,9 +955,22 @@
         "review-resume",
         "review-authorize",
         "review-occurrence-inspect",
-        "r12-disabled"
+        "r12-disabled",
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink",
+        "startup-review-hydrate",
+        "startup-review-task-map"
       ],
-      "note": "R09两份Eastmoney来源限定榜单，同日15:35门；三入口共享原日immutable decision。"
+      "note": "R09两份Eastmoney来源限定榜单，同日15:35门；三入口共享原日immutable decision。 另有普通启动all-date既存immutable envelope恢复producer，归原durable owner/Unit；不受正常loader/业务时窗/backfill最近5日限制，不生成新claim。"
     },
     {
       "kind": "PositionReview",
@@ -727,7 +979,8 @@
       "producer_ids": [
         "review-r11-auto",
         "review-r11-manual",
-        "review-r11-backfill"
+        "review-r11-backfill",
+        "startup-resume-position-review"
       ],
       "evidence_ids": [
         "review-auto",
@@ -750,9 +1003,22 @@
         "review-resume",
         "review-authorize",
         "review-occurrence-inspect",
-        "r12-disabled"
+        "r12-disabled",
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink",
+        "startup-review-hydrate",
+        "startup-review-task-map"
       ],
-      "note": "R11精确d估值与latest summary/行业/AI正文的authority分开；三入口共享原日claim。"
+      "note": "R11精确d估值与latest summary/行业/AI正文的authority分开；三入口共享原日claim。 另有普通启动all-date既存immutable envelope恢复producer，归原durable owner/Unit；不受正常loader/业务时窗/backfill最近5日限制，不生成新claim。"
     },
     {
       "kind": "ReviewBacktest",
@@ -765,9 +1031,21 @@
         "r12-disabled",
         "review-backfill-one",
         "review-resume",
-        "counted-policy"
+        "counted-policy",
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink"
       ],
-      "note": "R12_TECHNICAL_BARS_PUBLISHED=false，新producer在loader/provider前Disabled，校正Task3初判；8-task backfill仍可恢复既存immutable decision，此为恢复路径说明，不冒充活动producer/Unit；无claim仍Disabled。"
+      "note": "新claim/新producer审计：R12_TECHNICAL_BARS_PUBLISHED=false，新producer在loader/provider前Disabled，校正Task3初判；8-task backfill仍可恢复既存immutable decision，此为恢复路径说明，不冒充活动producer/Unit；无claim仍Disabled。 既存decision恢复边界：runtime映射为durable ReviewBacktest/None。普通启动all-date barrier仍可从已存immutable envelope恢复Reserved或已获retry授权的RejectedDurable；不受正常loader/任务时窗/最近5日backfill限制，不重取当前source，foreign lease/Uncertain不盲发。仅说明历史counted decision的可恢复能力，未查询其存在性；状态保持INACTIVE且producer_ids为空，不造活动producer/Unit。 R12的8-task backfill不是唯一恢复路径，普通启动在backfill之前且不受该任务集合限制。"
     },
     {
       "kind": "WatchlistTracking",
@@ -776,7 +1054,8 @@
       "producer_ids": [
         "review-r13-auto",
         "review-r13-manual",
-        "review-r13-backfill"
+        "review-r13-backfill",
+        "startup-resume-watchlist-tracking"
       ],
       "evidence_ids": [
         "review-auto",
@@ -801,9 +1080,22 @@
         "review-resume",
         "review-authorize",
         "review-occurrence-inspect",
-        "r12-disabled"
+        "r12-disabled",
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink",
+        "startup-review-hydrate",
+        "startup-review-task-map"
       ],
-      "note": "R13三入口共原日claim；历史数据受latest两根K限制，Delivered后save_outcomes失败仅warn，重入不补保存。"
+      "note": "R13三入口共原日claim；历史数据受latest两根K限制，Delivered后save_outcomes失败仅warn，重入不补保存。 另有普通启动all-date既存immutable envelope恢复producer，归原durable owner/Unit；不受正常loader/业务时窗/backfill最近5日限制，不生成新claim。"
     },
     {
       "kind": "PreopenNewsHot",
@@ -811,7 +1103,8 @@
       "status": "ACTIVE",
       "producer_ids": [
         "p01-scheduled",
-        "p01-compensation"
+        "p01-compensation",
+        "startup-resume-preopen-news-hot"
       ],
       "evidence_ids": [
         "monitor-main",
@@ -825,9 +1118,19 @@
         "counted-policy",
         "counted-envelope",
         "claim-inspect",
-        "p01-compensation-due"
+        "p01-compensation-due",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink"
       ],
-      "note": "P01自动09:00–09:15与当日09:15后显式compensation共同claim；补偿不能恢复Scheduled Reserved信封。"
+      "note": "P01自动09:00–09:15与当日09:15后显式compensation共同claim；补偿不能恢复Scheduled Reserved信封。 另有普通启动all-date既存immutable envelope恢复producer，归原durable owner/Unit；不受正常loader/业务时窗/backfill最近5日限制，不生成新claim。 Scheduled Reserved的晚恢复禁令只属显式compensation，普通启动不检查该mode时窗。"
     },
     {
       "kind": "IntradayMarket",
@@ -887,7 +1190,8 @@
       "primary_phase": "盘中",
       "status": "ACTIVE",
       "producer_ids": [
-        "sector-anomaly"
+        "sector-anomaly",
+        "startup-resume-sector-anomaly"
       ],
       "evidence_ids": [
         "monitor-loop",
@@ -896,9 +1200,20 @@
         "counted-push",
         "counted-policy",
         "counted-envelope",
-        "claim-inspect"
+        "claim-inspect",
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink"
       ],
-      "note": "独立于SectorTop的BusinessDateOnce claim/timer；false延后一小时，新闻归因canonical缺口保留。"
+      "note": "独立于SectorTop的BusinessDateOnce claim/timer；false延后一小时，新闻归因canonical缺口保留。 另有普通启动all-date既存immutable envelope恢复producer，归原durable owner/Unit；不受正常loader/业务时窗/backfill最近5日限制，不生成新claim。"
     },
     {
       "kind": "NewsToIdea",
@@ -942,7 +1257,8 @@
         "review-a10-auto",
         "review-a10-manual",
         "review-a10-backfill",
-        "review-a10-push"
+        "review-a10-push",
+        "startup-resume-catalyst-review"
       ],
       "evidence_ids": [
         "review-auto",
@@ -967,9 +1283,22 @@
         "review-authorize",
         "review-occurrence-inspect",
         "r12-disabled",
-        "manual-push"
+        "manual-push",
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink",
+        "startup-review-hydrate",
+        "startup-review-task-map"
       ],
-      "note": "A10 auto/manual/backfill及--push同业务日共claim；后置名单保存不原子，real历史loader不等于stored replay。"
+      "note": "A10 auto/manual/backfill及--push同业务日共claim；后置名单保存不原子，real历史loader不等于stored replay。 另有普通启动all-date既存immutable envelope恢复producer，归原durable owner/Unit；不受正常loader/业务时窗/backfill最近5日限制，不生成新claim。"
     },
     {
       "kind": "IndustryChainIntraday",
@@ -4450,7 +4779,7 @@
       "completion_owner": "business_date_once_claims(business_date,ReviewLhb,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R04)",
       "migration_unit_id": "MU-review-r04",
       "trigger": {
-        "description": "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。 本 producer 仅 R04。",
+        "description": "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。普通启动另有不受此5日/8-task集合限制的all-date恢复，backfill不是唯一恢复入口。 本 producer 仅 R04。",
         "evidence_ids": [
           "review-backfill",
           "review-backfill-one",
@@ -4522,7 +4851,7 @@
         "claim-inspect"
       ],
       "known_gaps": [
-        "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。"
+        "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。普通启动另有不受此5日/8-task集合限制的all-date恢复，backfill不是唯一恢复入口。"
       ]
     },
     {
@@ -4698,7 +5027,7 @@
       "completion_owner": "business_date_once_claims(business_date,TomorrowWatch,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R07)",
       "migration_unit_id": "MU-review-r07",
       "trigger": {
-        "description": "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。 本 producer 仅 R07。",
+        "description": "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。普通启动另有不受此5日/8-task集合限制的all-date恢复，backfill不是唯一恢复入口。 本 producer 仅 R07。",
         "evidence_ids": [
           "review-backfill",
           "review-backfill-one",
@@ -4771,7 +5100,7 @@
       ],
       "known_gaps": [
         "QR02：R07 非 LHB 三源和渲染主体缺统一不可变 batch lineage；无 claim 历史重建会读当前候选 context，LHB binding/正文 hash 不证明四源同业务日。",
-        "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。"
+        "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。普通启动另有不受此5日/8-task集合限制的all-date恢复，backfill不是唯一恢复入口。"
       ]
     },
     {
@@ -4955,7 +5284,7 @@
       "completion_owner": "durable review occurrence(business_date,EventCalendar,None,GLOBAL,review_task_identity(date,R08)) → Rolling immutable decision",
       "migration_unit_id": "MU-review-r08",
       "trigger": {
-        "description": "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。 本 producer 仅 R08。",
+        "description": "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。普通启动另有不受此5日/8-task集合限制的all-date恢复，backfill不是唯一恢复入口。 本 producer 仅 R08。",
         "evidence_ids": [
           "review-backfill",
           "review-backfill-one",
@@ -5031,7 +5360,7 @@
       ],
       "known_gaps": [
         "QR01：R08 首批 GatewaySource 失败尚无通知 decision 时仅内存 Terminal/退避加 append audit；缺持久任务终态与版本恢复，旧无 failure artifact 不能补造 typed authority。",
-        "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。"
+        "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。普通启动另有不受此5日/8-task集合限制的all-date恢复，backfill不是唯一恢复入口。"
       ]
     },
     {
@@ -5205,7 +5534,7 @@
       "completion_owner": "business_date_once_claims(business_date,ReviewProviderTopN,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R09)",
       "migration_unit_id": "MU-review-r09",
       "trigger": {
-        "description": "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。 本 producer 仅 R09。",
+        "description": "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。普通启动另有不受此5日/8-task集合限制的all-date恢复，backfill不是唯一恢复入口。 本 producer 仅 R09。",
         "evidence_ids": [
           "review-backfill",
           "review-backfill-one",
@@ -5277,7 +5606,7 @@
         "claim-inspect"
       ],
       "known_gaps": [
-        "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。"
+        "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。普通启动另有不受此5日/8-task集合限制的all-date恢复，backfill不是唯一恢复入口。"
       ]
     },
     {
@@ -5453,7 +5782,7 @@
       "completion_owner": "business_date_once_claims(business_date,PositionReview,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R11)",
       "migration_unit_id": "MU-review-r11",
       "trigger": {
-        "description": "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。 本 producer 仅 R11。",
+        "description": "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。普通启动另有不受此5日/8-task集合限制的all-date恢复，backfill不是唯一恢复入口。 本 producer 仅 R11。",
         "evidence_ids": [
           "review-backfill",
           "review-backfill-one",
@@ -5526,7 +5855,7 @@
       ],
       "known_gaps": [
         "QR03：R11 source canonical 仅 date+items；latest summary、行业 projection 和 AI 正文缺统一历史 as-of/immutable evidence 绑定，精确估值日不证明全文同批。",
-        "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。"
+        "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。普通启动另有不受此5日/8-task集合限制的all-date恢复，backfill不是唯一恢复入口。"
       ]
     },
     {
@@ -5710,7 +6039,7 @@
       "completion_owner": "business_date_once_claims(business_date,WatchlistTracking,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R13)",
       "migration_unit_id": "MU-review-r13",
       "trigger": {
-        "description": "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。 本 producer 仅 R13。",
+        "description": "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。普通启动另有不受此5日/8-task集合限制的all-date恢复，backfill不是唯一恢复入口。 本 producer 仅 R13。",
         "evidence_ids": [
           "review-backfill",
           "review-backfill-one",
@@ -5787,7 +6116,7 @@
       ],
       "known_gaps": [
         "QR04：A10 名单/R13 outcomes 在 Delivered 后保存失败只 warn，已有 decision preflight 跳过后置保存；缺只修业务记录的恢复 owner。A10 无 claim 历史 real loader 与 stored 首批授权也未解决。",
-        "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。"
+        "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。普通启动另有不受此5日/8-task集合限制的all-date恢复，backfill不是唯一恢复入口。"
       ]
     },
     {
@@ -5967,7 +6296,7 @@
       "completion_owner": "business_date_once_claims(business_date,CatalystReview,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,A10)",
       "migration_unit_id": "MU-review-a10",
       "trigger": {
-        "description": "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。 本 producer 仅 A10。",
+        "description": "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。普通启动另有不受此5日/8-task集合限制的all-date恢复，backfill不是唯一恢复入口。 本 producer 仅 A10。",
         "evidence_ids": [
           "review-backfill",
           "review-backfill-one",
@@ -6042,7 +6371,7 @@
       ],
       "known_gaps": [
         "QR04：A10 名单/R13 outcomes 在 Delivered 后保存失败只 warn，已有 decision preflight 跳过后置保存；缺只修业务记录的恢复 owner。A10 无 claim 历史 real loader 与 stored 首批授权也未解决。",
-        "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。"
+        "backfill 只扫描最近5个已验证历史交易日且不含今天，8项为R04/R07/R08/R09/R11/R12/R13/A10，各项独立。先 resume 原日 occurrence，Reserved 恢复 immutable envelope；RejectedDurable 路径显式授权再恢复，Uncertain/ManualRejected 不盲发。无 claim 才单task重建 batch，仍触发 block/IPO side routes；Disabled/ExpectedWait/DeferredUntil 也可能被统计成 NoData，统计不是 durable 终态。R12 既存 decision 恢复仅是恢复代码，新 producer 仍 Disabled，不为其建立活动 producer/Unit。普通启动另有不受此5日/8-task集合限制的all-date恢复，backfill不是唯一恢复入口。"
       ]
     },
     {
@@ -7070,6 +7399,1209 @@
         "QR06：enum 外路径缺独立持久通知 cursor，把 calendar date/window、business date、输入/载荷和要求渠道的 TransportAccepted 关联；两 timer 无交易日 guard，跨日同业务日再发与同分钟报告覆盖尚未解决。",
         "enum外timer，不拥有ReviewTask identity/ReviewScheduleState。"
       ]
+    },
+    {
+      "id": "startup-resume-holding-plan",
+      "kinds": [
+        "HoldingPlan"
+      ],
+      "phase_epics": [
+        "盘中"
+      ],
+      "occurrence_family": "holding-plan:{date}:{code}",
+      "completion_owner": "counted decision(HoldingPlan,Ticket,holding-plan:{date}:{code},source fingerprint,subject,policy,rendered hash)",
+      "migration_unit_id": "MU-holding-plan",
+      "trigger": {
+        "description": "普通启动完成core DB绑定后，ensure_startup_reconciled形成all-date startup barrier，早于常驻任务、--review和--push；扫描delivery_decisions全部日期，不受正常loader、业务发送时窗、交易日门或backfill最近5日/8-task集合限制。显式P01 compensation独占命令跳过全局barrier。",
+        "evidence_ids": [
+          "monitor-main",
+          "startup-barrier",
+          "startup-reconcile",
+          "startup-all-pending",
+          "startup-list-deliverable"
+        ]
+      },
+      "source": {
+        "description": "只读取已存immutable envelope的原business_date、kind/sub_kind、scope、occurrence、source binding、policy version、rendered content/hash及关联decision；从stored envelope构造attempt request，不调用当前行情、账户、新闻、review loader/provider/LLM，不以新source替换原载荷。",
+        "evidence_ids": [
+          "startup-kind-map",
+          "counted-envelope",
+          "startup-resume",
+          "startup-begin-attempt"
+        ]
+      },
+      "authority": {
+        "description": "发送权限仅来自既存decision/state及reservation/claim、retry_authorized、lease/fence；reconcile先完成本地append/payload固定点，再对deliverable decision直接begin_attempt/sink。已存authority不表示当前来源已重新验证，也不证明本环境存在这类历史记录。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink"
+        ]
+      },
+      "policy": {
+        "description": "仅Reserved及retry_authorized=true的RejectedDurable可进入恢复；Rejected需重新取得原claim/rolling head与所需预算reservation，不在启动中新增retry授权。begin_attempt要求Reserved和唯一authoritative sink；原rendered content/hash直接送namespace绑定sink。未过期foreign lease和UncertainManualReview保留，不盲发；过期AttemptInFlight撤销fence并转Uncertain而非自动重发。每个decision启动内最多恢复一次，仍deliverable或本地固定点失败则阻止新producer激活。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink"
+        ]
+      },
+      "evidence_ids": [
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink"
+      ],
+      "known_gaps": [
+        "启动恢复只证明源码可达性；未查询历史decision是否存在，也未验证部署、真实TransportAccepted或用户已读。",
+        "启动恢复原信封不重新执行正常producer的source freshness/业务时窗门；该边界不是当前源已再次授权的证明。"
+      ]
+    },
+    {
+      "id": "startup-resume-t0-advice",
+      "kinds": [
+        "T0Advice"
+      ],
+      "phase_epics": [
+        "盘中"
+      ],
+      "occurrence_family": "t0 decision domain/canonical SHA256",
+      "completion_owner": "counted decision(T0Advice,Ticket,T0PlanDecisionBindingV1.decision_id(),source fingerprint,subject,policy,rendered hash)",
+      "migration_unit_id": "MU-t0",
+      "trigger": {
+        "description": "普通启动完成core DB绑定后，ensure_startup_reconciled形成all-date startup barrier，早于常驻任务、--review和--push；扫描delivery_decisions全部日期，不受正常loader、业务发送时窗、交易日门或backfill最近5日/8-task集合限制。显式P01 compensation独占命令跳过全局barrier。",
+        "evidence_ids": [
+          "monitor-main",
+          "startup-barrier",
+          "startup-reconcile",
+          "startup-all-pending",
+          "startup-list-deliverable"
+        ]
+      },
+      "source": {
+        "description": "只读取已存immutable envelope的原business_date、kind/sub_kind、scope、occurrence、source binding、policy version、rendered content/hash及关联decision；从stored envelope构造attempt request，不调用当前行情、账户、新闻、review loader/provider/LLM，不以新source替换原载荷。",
+        "evidence_ids": [
+          "startup-kind-map",
+          "counted-envelope",
+          "startup-resume",
+          "startup-begin-attempt"
+        ]
+      },
+      "authority": {
+        "description": "发送权限仅来自既存decision/state及reservation/claim、retry_authorized、lease/fence；reconcile先完成本地append/payload固定点，再对deliverable decision直接begin_attempt/sink。已存authority不表示当前来源已重新验证，也不证明本环境存在这类历史记录。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink"
+        ]
+      },
+      "policy": {
+        "description": "仅Reserved及retry_authorized=true的RejectedDurable可进入恢复；Rejected需重新取得原claim/rolling head与所需预算reservation，不在启动中新增retry授权。begin_attempt要求Reserved和唯一authoritative sink；原rendered content/hash直接送namespace绑定sink。未过期foreign lease和UncertainManualReview保留，不盲发；过期AttemptInFlight撤销fence并转Uncertain而非自动重发。每个decision启动内最多恢复一次，仍deliverable或本地固定点失败则阻止新producer激活。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink"
+        ]
+      },
+      "evidence_ids": [
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink"
+      ],
+      "known_gaps": [
+        "启动恢复只证明源码可达性；未查询历史decision是否存在，也未验证部署、真实TransportAccepted或用户已读。",
+        "启动恢复原信封不重新执行正常producer的source freshness/业务时窗门；该边界不是当前源已再次授权的证明。"
+      ]
+    },
+    {
+      "id": "startup-resume-paper-trade",
+      "kinds": [
+        "PaperTrade"
+      ],
+      "phase_epics": [
+        "集合竞价"
+      ],
+      "occurrence_family": "PaperTradeTerminalBindingV1.terminal_transition_id()",
+      "completion_owner": "counted decision(PaperTrade,Ticket,terminal_transition_id,source fingerprint,subject,policy,rendered hash)",
+      "migration_unit_id": "MU-paper-trade",
+      "trigger": {
+        "description": "普通启动完成core DB绑定后，ensure_startup_reconciled形成all-date startup barrier，早于常驻任务、--review和--push；扫描delivery_decisions全部日期，不受正常loader、业务发送时窗、交易日门或backfill最近5日/8-task集合限制。显式P01 compensation独占命令跳过全局barrier。",
+        "evidence_ids": [
+          "monitor-main",
+          "startup-barrier",
+          "startup-reconcile",
+          "startup-all-pending",
+          "startup-list-deliverable"
+        ]
+      },
+      "source": {
+        "description": "只读取已存immutable envelope的原business_date、kind/sub_kind、scope、occurrence、source binding、policy version、rendered content/hash及关联decision；从stored envelope构造attempt request，不调用当前行情、账户、新闻、review loader/provider/LLM，不以新source替换原载荷。",
+        "evidence_ids": [
+          "startup-kind-map",
+          "counted-envelope",
+          "startup-resume",
+          "startup-begin-attempt"
+        ]
+      },
+      "authority": {
+        "description": "发送权限仅来自既存decision/state及reservation/claim、retry_authorized、lease/fence；reconcile先完成本地append/payload固定点，再对deliverable decision直接begin_attempt/sink。已存authority不表示当前来源已重新验证，也不证明本环境存在这类历史记录。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink"
+        ]
+      },
+      "policy": {
+        "description": "仅Reserved及retry_authorized=true的RejectedDurable可进入恢复；Rejected需重新取得原claim/rolling head与所需预算reservation，不在启动中新增retry授权。begin_attempt要求Reserved和唯一authoritative sink；原rendered content/hash直接送namespace绑定sink。未过期foreign lease和UncertainManualReview保留，不盲发；过期AttemptInFlight撤销fence并转Uncertain而非自动重发。每个decision启动内最多恢复一次，仍deliverable或本地固定点失败则阻止新producer激活。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink"
+        ]
+      },
+      "evidence_ids": [
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink"
+      ],
+      "known_gaps": [
+        "启动恢复只证明源码可达性；未查询历史decision是否存在，也未验证部署、真实TransportAccepted或用户已读。",
+        "启动恢复原信封不重新执行正常producer的source freshness/业务时窗门；该边界不是当前源已再次授权的证明。"
+      ]
+    },
+    {
+      "id": "startup-resume-close-call",
+      "kinds": [
+        "CloseCall"
+      ],
+      "phase_epics": [
+        "盘中"
+      ],
+      "occurrence_family": "close-call:{date}:{code}",
+      "completion_owner": "counted decision(CloseCall,Ticket,close-call:{date}:{code},source fingerprint,subject,policy,rendered hash)",
+      "migration_unit_id": "MU-close-call",
+      "trigger": {
+        "description": "普通启动完成core DB绑定后，ensure_startup_reconciled形成all-date startup barrier，早于常驻任务、--review和--push；扫描delivery_decisions全部日期，不受正常loader、业务发送时窗、交易日门或backfill最近5日/8-task集合限制。显式P01 compensation独占命令跳过全局barrier。",
+        "evidence_ids": [
+          "monitor-main",
+          "startup-barrier",
+          "startup-reconcile",
+          "startup-all-pending",
+          "startup-list-deliverable"
+        ]
+      },
+      "source": {
+        "description": "只读取已存immutable envelope的原business_date、kind/sub_kind、scope、occurrence、source binding、policy version、rendered content/hash及关联decision；从stored envelope构造attempt request，不调用当前行情、账户、新闻、review loader/provider/LLM，不以新source替换原载荷。",
+        "evidence_ids": [
+          "startup-kind-map",
+          "counted-envelope",
+          "startup-resume",
+          "startup-begin-attempt"
+        ]
+      },
+      "authority": {
+        "description": "发送权限仅来自既存decision/state及reservation/claim、retry_authorized、lease/fence；reconcile先完成本地append/payload固定点，再对deliverable decision直接begin_attempt/sink。已存authority不表示当前来源已重新验证，也不证明本环境存在这类历史记录。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink"
+        ]
+      },
+      "policy": {
+        "description": "仅Reserved及retry_authorized=true的RejectedDurable可进入恢复；Rejected需重新取得原claim/rolling head与所需预算reservation，不在启动中新增retry授权。begin_attempt要求Reserved和唯一authoritative sink；原rendered content/hash直接送namespace绑定sink。未过期foreign lease和UncertainManualReview保留，不盲发；过期AttemptInFlight撤销fence并转Uncertain而非自动重发。每个decision启动内最多恢复一次，仍deliverable或本地固定点失败则阻止新producer激活。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink"
+        ]
+      },
+      "evidence_ids": [
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink"
+      ],
+      "known_gaps": [
+        "启动恢复只证明源码可达性；未查询历史decision是否存在，也未验证部署、真实TransportAccepted或用户已读。",
+        "启动恢复原信封不重新执行正常producer的source freshness/业务时窗门；该边界不是当前源已再次授权的证明。"
+      ]
+    },
+    {
+      "id": "startup-resume-sector-top",
+      "kinds": [
+        "SectorTop"
+      ],
+      "phase_epics": [
+        "盘中"
+      ],
+      "occurrence_family": "sector-top:{date}",
+      "completion_owner": "business_date_once_claims(business_date,SectorTop,None,GLOBAL) → immutable decision / occurrence=sector-top:{date}",
+      "migration_unit_id": "MU-sector-top",
+      "trigger": {
+        "description": "普通启动完成core DB绑定后，ensure_startup_reconciled形成all-date startup barrier，早于常驻任务、--review和--push；扫描delivery_decisions全部日期，不受正常loader、业务发送时窗、交易日门或backfill最近5日/8-task集合限制。显式P01 compensation独占命令跳过全局barrier。",
+        "evidence_ids": [
+          "monitor-main",
+          "startup-barrier",
+          "startup-reconcile",
+          "startup-all-pending",
+          "startup-list-deliverable"
+        ]
+      },
+      "source": {
+        "description": "只读取已存immutable envelope的原business_date、kind/sub_kind、scope、occurrence、source binding、policy version、rendered content/hash及关联decision；从stored envelope构造attempt request，不调用当前行情、账户、新闻、review loader/provider/LLM，不以新source替换原载荷。",
+        "evidence_ids": [
+          "startup-kind-map",
+          "counted-envelope",
+          "startup-resume",
+          "startup-begin-attempt"
+        ]
+      },
+      "authority": {
+        "description": "发送权限仅来自既存decision/state及reservation/claim、retry_authorized、lease/fence；reconcile先完成本地append/payload固定点，再对deliverable decision直接begin_attempt/sink。已存authority不表示当前来源已重新验证，也不证明本环境存在这类历史记录。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink"
+        ]
+      },
+      "policy": {
+        "description": "仅Reserved及retry_authorized=true的RejectedDurable可进入恢复；Rejected需重新取得原claim/rolling head与所需预算reservation，不在启动中新增retry授权。begin_attempt要求Reserved和唯一authoritative sink；原rendered content/hash直接送namespace绑定sink。未过期foreign lease和UncertainManualReview保留，不盲发；过期AttemptInFlight撤销fence并转Uncertain而非自动重发。每个decision启动内最多恢复一次，仍deliverable或本地固定点失败则阻止新producer激活。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink"
+        ]
+      },
+      "evidence_ids": [
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink"
+      ],
+      "known_gaps": [
+        "启动恢复只证明源码可达性；未查询历史decision是否存在，也未验证部署、真实TransportAccepted或用户已读。",
+        "启动恢复原信封不重新执行正常producer的source freshness/业务时窗门；该边界不是当前源已再次授权的证明。"
+      ]
+    },
+    {
+      "id": "startup-resume-sector-anomaly",
+      "kinds": [
+        "SectorAnomaly"
+      ],
+      "phase_epics": [
+        "盘中"
+      ],
+      "occurrence_family": "sector-anomaly:{date}",
+      "completion_owner": "business_date_once_claims(business_date,SectorAnomaly,None,GLOBAL) → immutable decision / occurrence=sector-anomaly:{date}",
+      "migration_unit_id": "MU-sector-anomaly",
+      "trigger": {
+        "description": "普通启动完成core DB绑定后，ensure_startup_reconciled形成all-date startup barrier，早于常驻任务、--review和--push；扫描delivery_decisions全部日期，不受正常loader、业务发送时窗、交易日门或backfill最近5日/8-task集合限制。显式P01 compensation独占命令跳过全局barrier。",
+        "evidence_ids": [
+          "monitor-main",
+          "startup-barrier",
+          "startup-reconcile",
+          "startup-all-pending",
+          "startup-list-deliverable"
+        ]
+      },
+      "source": {
+        "description": "只读取已存immutable envelope的原business_date、kind/sub_kind、scope、occurrence、source binding、policy version、rendered content/hash及关联decision；从stored envelope构造attempt request，不调用当前行情、账户、新闻、review loader/provider/LLM，不以新source替换原载荷。",
+        "evidence_ids": [
+          "startup-kind-map",
+          "counted-envelope",
+          "startup-resume",
+          "startup-begin-attempt"
+        ]
+      },
+      "authority": {
+        "description": "发送权限仅来自既存decision/state及reservation/claim、retry_authorized、lease/fence；reconcile先完成本地append/payload固定点，再对deliverable decision直接begin_attempt/sink。已存authority不表示当前来源已重新验证，也不证明本环境存在这类历史记录。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink"
+        ]
+      },
+      "policy": {
+        "description": "仅Reserved及retry_authorized=true的RejectedDurable可进入恢复；Rejected需重新取得原claim/rolling head与所需预算reservation，不在启动中新增retry授权。begin_attempt要求Reserved和唯一authoritative sink；原rendered content/hash直接送namespace绑定sink。未过期foreign lease和UncertainManualReview保留，不盲发；过期AttemptInFlight撤销fence并转Uncertain而非自动重发。每个decision启动内最多恢复一次，仍deliverable或本地固定点失败则阻止新producer激活。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink"
+        ]
+      },
+      "evidence_ids": [
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink"
+      ],
+      "known_gaps": [
+        "启动恢复只证明源码可达性；未查询历史decision是否存在，也未验证部署、真实TransportAccepted或用户已读。",
+        "启动恢复原信封不重新执行正常producer的source freshness/业务时窗门；该边界不是当前源已再次授权的证明。"
+      ]
+    },
+    {
+      "id": "startup-resume-preopen-news-hot",
+      "kinds": [
+        "PreopenNewsHot"
+      ],
+      "phase_epics": [
+        "盘前"
+      ],
+      "occurrence_family": "p01:{business_date}",
+      "completion_owner": "business_date_once_claims(business_date,PreopenNewsHot,None,GLOBAL) → immutable decision / occurrence=p01:{business_date}",
+      "migration_unit_id": "MU-p01",
+      "trigger": {
+        "description": "普通启动完成core DB绑定后，ensure_startup_reconciled形成all-date startup barrier，早于常驻任务、--review和--push；扫描delivery_decisions全部日期，不受正常loader、业务发送时窗、交易日门或backfill最近5日/8-task集合限制。显式P01 compensation独占命令跳过全局barrier。",
+        "evidence_ids": [
+          "monitor-main",
+          "startup-barrier",
+          "startup-reconcile",
+          "startup-all-pending",
+          "startup-list-deliverable"
+        ]
+      },
+      "source": {
+        "description": "只读取已存immutable envelope的原business_date、kind/sub_kind、scope、occurrence、source binding、policy version、rendered content/hash及关联decision；从stored envelope构造attempt request，不调用当前行情、账户、新闻、review loader/provider/LLM，不以新source替换原载荷。",
+        "evidence_ids": [
+          "startup-kind-map",
+          "counted-envelope",
+          "startup-resume",
+          "startup-begin-attempt"
+        ]
+      },
+      "authority": {
+        "description": "发送权限仅来自既存decision/state及reservation/claim、retry_authorized、lease/fence；reconcile先完成本地append/payload固定点，再对deliverable decision直接begin_attempt/sink。已存authority不表示当前来源已重新验证，也不证明本环境存在这类历史记录。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink"
+        ]
+      },
+      "policy": {
+        "description": "仅Reserved及retry_authorized=true的RejectedDurable可进入恢复；Rejected需重新取得原claim/rolling head与所需预算reservation，不在启动中新增retry授权。begin_attempt要求Reserved和唯一authoritative sink；原rendered content/hash直接送namespace绑定sink。未过期foreign lease和UncertainManualReview保留，不盲发；过期AttemptInFlight撤销fence并转Uncertain而非自动重发。每个decision启动内最多恢复一次，仍deliverable或本地固定点失败则阻止新producer激活。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink"
+        ]
+      },
+      "evidence_ids": [
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink"
+      ],
+      "known_gaps": [
+        "启动恢复只证明源码可达性；未查询历史decision是否存在，也未验证部署、真实TransportAccepted或用户已读。",
+        "启动恢复原信封不重新执行正常producer的source freshness/业务时窗门；该边界不是当前源已再次授权的证明。",
+        "P01 compensation的Scheduled Reserved晚恢复禁令仅约束显式补偿入口；普通启动all-date恢复不检查该mode/09:00–09:15时窗，仍复用相同P01 claim，不能混写为全局禁令。"
+      ]
+    },
+    {
+      "id": "startup-resume-review-lhb",
+      "kinds": [
+        "ReviewLhb"
+      ],
+      "phase_epics": [
+        "盘后"
+      ],
+      "occurrence_family": "review_task_identity(date,R04) / original business date",
+      "completion_owner": "business_date_once_claims(business_date,ReviewLhb,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R04)",
+      "migration_unit_id": "MU-review-r04",
+      "trigger": {
+        "description": "普通启动完成core DB绑定后，ensure_startup_reconciled形成all-date startup barrier，早于常驻任务、--review和--push；扫描delivery_decisions全部日期，不受正常loader、业务发送时窗、交易日门或backfill最近5日/8-task集合限制。显式P01 compensation独占命令跳过全局barrier。",
+        "evidence_ids": [
+          "monitor-main",
+          "startup-barrier",
+          "startup-reconcile",
+          "startup-all-pending",
+          "startup-list-deliverable"
+        ]
+      },
+      "source": {
+        "description": "只读取已存immutable envelope的原business_date、kind/sub_kind、scope、occurrence、source binding、policy version、rendered content/hash及关联decision；从stored envelope构造attempt request，不调用当前行情、账户、新闻、review loader/provider/LLM，不以新source替换原载荷。",
+        "evidence_ids": [
+          "startup-kind-map",
+          "counted-envelope",
+          "startup-resume",
+          "startup-begin-attempt"
+        ]
+      },
+      "authority": {
+        "description": "发送权限仅来自既存decision/state及reservation/claim、retry_authorized、lease/fence；reconcile先完成本地append/payload固定点，再对deliverable decision直接begin_attempt/sink。已存authority不表示当前来源已重新验证，也不证明本环境存在这类历史记录。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink"
+        ]
+      },
+      "policy": {
+        "description": "仅Reserved及retry_authorized=true的RejectedDurable可进入恢复；Rejected需重新取得原claim/rolling head与所需预算reservation，不在启动中新增retry授权。begin_attempt要求Reserved和唯一authoritative sink；原rendered content/hash直接送namespace绑定sink。未过期foreign lease和UncertainManualReview保留，不盲发；过期AttemptInFlight撤销fence并转Uncertain而非自动重发。每个decision启动内最多恢复一次，仍deliverable或本地固定点失败则阻止新producer激活。 review终态的既存task transition经date/task/hash核验后hydrate并ack；原业务日通知owner不变。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink",
+          "startup-review-hydrate",
+          "startup-review-task-map",
+          "review-hydration",
+          "review-schedule-state",
+          "review-auto",
+          "review-manual"
+        ]
+      },
+      "evidence_ids": [
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink",
+        "startup-review-hydrate",
+        "startup-review-task-map",
+        "review-hydration",
+        "review-schedule-state",
+        "review-auto",
+        "review-manual"
+      ],
+      "known_gaps": [
+        "启动恢复只证明源码可达性；未查询历史decision是否存在，也未验证部署、真实TransportAccepted或用户已读。",
+        "启动恢复原信封不重新执行正常producer的source freshness/业务时窗门；该边界不是当前源已再次授权的证明。",
+        "review hydration仅在schedule.date匹配且task identity/basis/hash一致时消费，foreign-date transition继续pending；Terminal包括Rejected/Uncertain，不等于Delivered，且不自动补齐通知后的业务保存。"
+      ]
+    },
+    {
+      "id": "startup-resume-tomorrow-watch",
+      "kinds": [
+        "TomorrowWatch"
+      ],
+      "phase_epics": [
+        "盘后"
+      ],
+      "occurrence_family": "review_task_identity(date,R07) / original business date",
+      "completion_owner": "business_date_once_claims(business_date,TomorrowWatch,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R07)",
+      "migration_unit_id": "MU-review-r07",
+      "trigger": {
+        "description": "普通启动完成core DB绑定后，ensure_startup_reconciled形成all-date startup barrier，早于常驻任务、--review和--push；扫描delivery_decisions全部日期，不受正常loader、业务发送时窗、交易日门或backfill最近5日/8-task集合限制。显式P01 compensation独占命令跳过全局barrier。",
+        "evidence_ids": [
+          "monitor-main",
+          "startup-barrier",
+          "startup-reconcile",
+          "startup-all-pending",
+          "startup-list-deliverable"
+        ]
+      },
+      "source": {
+        "description": "只读取已存immutable envelope的原business_date、kind/sub_kind、scope、occurrence、source binding、policy version、rendered content/hash及关联decision；从stored envelope构造attempt request，不调用当前行情、账户、新闻、review loader/provider/LLM，不以新source替换原载荷。",
+        "evidence_ids": [
+          "startup-kind-map",
+          "counted-envelope",
+          "startup-resume",
+          "startup-begin-attempt"
+        ]
+      },
+      "authority": {
+        "description": "发送权限仅来自既存decision/state及reservation/claim、retry_authorized、lease/fence；reconcile先完成本地append/payload固定点，再对deliverable decision直接begin_attempt/sink。已存authority不表示当前来源已重新验证，也不证明本环境存在这类历史记录。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink"
+        ]
+      },
+      "policy": {
+        "description": "仅Reserved及retry_authorized=true的RejectedDurable可进入恢复；Rejected需重新取得原claim/rolling head与所需预算reservation，不在启动中新增retry授权。begin_attempt要求Reserved和唯一authoritative sink；原rendered content/hash直接送namespace绑定sink。未过期foreign lease和UncertainManualReview保留，不盲发；过期AttemptInFlight撤销fence并转Uncertain而非自动重发。每个decision启动内最多恢复一次，仍deliverable或本地固定点失败则阻止新producer激活。 review终态的既存task transition经date/task/hash核验后hydrate并ack；原业务日通知owner不变。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink",
+          "startup-review-hydrate",
+          "startup-review-task-map",
+          "review-hydration",
+          "review-schedule-state",
+          "review-auto",
+          "review-manual"
+        ]
+      },
+      "evidence_ids": [
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink",
+        "startup-review-hydrate",
+        "startup-review-task-map",
+        "review-hydration",
+        "review-schedule-state",
+        "review-auto",
+        "review-manual"
+      ],
+      "known_gaps": [
+        "启动恢复只证明源码可达性；未查询历史decision是否存在，也未验证部署、真实TransportAccepted或用户已读。",
+        "启动恢复原信封不重新执行正常producer的source freshness/业务时窗门；该边界不是当前源已再次授权的证明。",
+        "review hydration仅在schedule.date匹配且task identity/basis/hash一致时消费，foreign-date transition继续pending；Terminal包括Rejected/Uncertain，不等于Delivered，且不自动补齐通知后的业务保存。"
+      ]
+    },
+    {
+      "id": "startup-resume-event-calendar",
+      "kinds": [
+        "EventCalendar"
+      ],
+      "phase_epics": [
+        "盘后"
+      ],
+      "occurrence_family": "review_task_identity(date,R08) / original business date",
+      "completion_owner": "durable review occurrence(business_date,EventCalendar,None,GLOBAL,review_task_identity(date,R08)) → Rolling immutable decision",
+      "migration_unit_id": "MU-review-r08",
+      "trigger": {
+        "description": "普通启动完成core DB绑定后，ensure_startup_reconciled形成all-date startup barrier，早于常驻任务、--review和--push；扫描delivery_decisions全部日期，不受正常loader、业务发送时窗、交易日门或backfill最近5日/8-task集合限制。显式P01 compensation独占命令跳过全局barrier。",
+        "evidence_ids": [
+          "monitor-main",
+          "startup-barrier",
+          "startup-reconcile",
+          "startup-all-pending",
+          "startup-list-deliverable"
+        ]
+      },
+      "source": {
+        "description": "只读取已存immutable envelope的原business_date、kind/sub_kind、scope、occurrence、source binding、policy version、rendered content/hash及关联decision；从stored envelope构造attempt request，不调用当前行情、账户、新闻、review loader/provider/LLM，不以新source替换原载荷。",
+        "evidence_ids": [
+          "startup-kind-map",
+          "counted-envelope",
+          "startup-resume",
+          "startup-begin-attempt"
+        ]
+      },
+      "authority": {
+        "description": "发送权限仅来自既存decision/state及reservation/claim、retry_authorized、lease/fence；reconcile先完成本地append/payload固定点，再对deliverable decision直接begin_attempt/sink。已存authority不表示当前来源已重新验证，也不证明本环境存在这类历史记录。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink"
+        ]
+      },
+      "policy": {
+        "description": "仅Reserved及retry_authorized=true的RejectedDurable可进入恢复；Rejected需重新取得原claim/rolling head与所需预算reservation，不在启动中新增retry授权。begin_attempt要求Reserved和唯一authoritative sink；原rendered content/hash直接送namespace绑定sink。未过期foreign lease和UncertainManualReview保留，不盲发；过期AttemptInFlight撤销fence并转Uncertain而非自动重发。每个decision启动内最多恢复一次，仍deliverable或本地固定点失败则阻止新producer激活。 review终态的既存task transition经date/task/hash核验后hydrate并ack；原业务日通知owner不变。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink",
+          "startup-review-hydrate",
+          "startup-review-task-map",
+          "review-hydration",
+          "review-schedule-state",
+          "review-auto",
+          "review-manual"
+        ]
+      },
+      "evidence_ids": [
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink",
+        "startup-review-hydrate",
+        "startup-review-task-map",
+        "review-hydration",
+        "review-schedule-state",
+        "review-auto",
+        "review-manual"
+      ],
+      "known_gaps": [
+        "启动恢复只证明源码可达性；未查询历史decision是否存在，也未验证部署、真实TransportAccepted或用户已读。",
+        "启动恢复原信封不重新执行正常producer的source freshness/业务时窗门；该边界不是当前源已再次授权的证明。",
+        "review hydration仅在schedule.date匹配且task identity/basis/hash一致时消费，foreign-date transition继续pending；Terminal包括Rejected/Uncertain，不等于Delivered，且不自动补齐通知后的业务保存。"
+      ]
+    },
+    {
+      "id": "startup-resume-review-provider-top-n",
+      "kinds": [
+        "ReviewProviderTopN"
+      ],
+      "phase_epics": [
+        "盘后"
+      ],
+      "occurrence_family": "review_task_identity(date,R09) / original business date",
+      "completion_owner": "business_date_once_claims(business_date,ReviewProviderTopN,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R09)",
+      "migration_unit_id": "MU-review-r09",
+      "trigger": {
+        "description": "普通启动完成core DB绑定后，ensure_startup_reconciled形成all-date startup barrier，早于常驻任务、--review和--push；扫描delivery_decisions全部日期，不受正常loader、业务发送时窗、交易日门或backfill最近5日/8-task集合限制。显式P01 compensation独占命令跳过全局barrier。",
+        "evidence_ids": [
+          "monitor-main",
+          "startup-barrier",
+          "startup-reconcile",
+          "startup-all-pending",
+          "startup-list-deliverable"
+        ]
+      },
+      "source": {
+        "description": "只读取已存immutable envelope的原business_date、kind/sub_kind、scope、occurrence、source binding、policy version、rendered content/hash及关联decision；从stored envelope构造attempt request，不调用当前行情、账户、新闻、review loader/provider/LLM，不以新source替换原载荷。",
+        "evidence_ids": [
+          "startup-kind-map",
+          "counted-envelope",
+          "startup-resume",
+          "startup-begin-attempt"
+        ]
+      },
+      "authority": {
+        "description": "发送权限仅来自既存decision/state及reservation/claim、retry_authorized、lease/fence；reconcile先完成本地append/payload固定点，再对deliverable decision直接begin_attempt/sink。已存authority不表示当前来源已重新验证，也不证明本环境存在这类历史记录。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink"
+        ]
+      },
+      "policy": {
+        "description": "仅Reserved及retry_authorized=true的RejectedDurable可进入恢复；Rejected需重新取得原claim/rolling head与所需预算reservation，不在启动中新增retry授权。begin_attempt要求Reserved和唯一authoritative sink；原rendered content/hash直接送namespace绑定sink。未过期foreign lease和UncertainManualReview保留，不盲发；过期AttemptInFlight撤销fence并转Uncertain而非自动重发。每个decision启动内最多恢复一次，仍deliverable或本地固定点失败则阻止新producer激活。 review终态的既存task transition经date/task/hash核验后hydrate并ack；原业务日通知owner不变。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink",
+          "startup-review-hydrate",
+          "startup-review-task-map",
+          "review-hydration",
+          "review-schedule-state",
+          "review-auto",
+          "review-manual"
+        ]
+      },
+      "evidence_ids": [
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink",
+        "startup-review-hydrate",
+        "startup-review-task-map",
+        "review-hydration",
+        "review-schedule-state",
+        "review-auto",
+        "review-manual"
+      ],
+      "known_gaps": [
+        "启动恢复只证明源码可达性；未查询历史decision是否存在，也未验证部署、真实TransportAccepted或用户已读。",
+        "启动恢复原信封不重新执行正常producer的source freshness/业务时窗门；该边界不是当前源已再次授权的证明。",
+        "review hydration仅在schedule.date匹配且task identity/basis/hash一致时消费，foreign-date transition继续pending；Terminal包括Rejected/Uncertain，不等于Delivered，且不自动补齐通知后的业务保存。"
+      ]
+    },
+    {
+      "id": "startup-resume-position-review",
+      "kinds": [
+        "PositionReview"
+      ],
+      "phase_epics": [
+        "盘后"
+      ],
+      "occurrence_family": "review_task_identity(date,R11) / original business date",
+      "completion_owner": "business_date_once_claims(business_date,PositionReview,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R11)",
+      "migration_unit_id": "MU-review-r11",
+      "trigger": {
+        "description": "普通启动完成core DB绑定后，ensure_startup_reconciled形成all-date startup barrier，早于常驻任务、--review和--push；扫描delivery_decisions全部日期，不受正常loader、业务发送时窗、交易日门或backfill最近5日/8-task集合限制。显式P01 compensation独占命令跳过全局barrier。",
+        "evidence_ids": [
+          "monitor-main",
+          "startup-barrier",
+          "startup-reconcile",
+          "startup-all-pending",
+          "startup-list-deliverable"
+        ]
+      },
+      "source": {
+        "description": "只读取已存immutable envelope的原business_date、kind/sub_kind、scope、occurrence、source binding、policy version、rendered content/hash及关联decision；从stored envelope构造attempt request，不调用当前行情、账户、新闻、review loader/provider/LLM，不以新source替换原载荷。",
+        "evidence_ids": [
+          "startup-kind-map",
+          "counted-envelope",
+          "startup-resume",
+          "startup-begin-attempt"
+        ]
+      },
+      "authority": {
+        "description": "发送权限仅来自既存decision/state及reservation/claim、retry_authorized、lease/fence；reconcile先完成本地append/payload固定点，再对deliverable decision直接begin_attempt/sink。已存authority不表示当前来源已重新验证，也不证明本环境存在这类历史记录。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink"
+        ]
+      },
+      "policy": {
+        "description": "仅Reserved及retry_authorized=true的RejectedDurable可进入恢复；Rejected需重新取得原claim/rolling head与所需预算reservation，不在启动中新增retry授权。begin_attempt要求Reserved和唯一authoritative sink；原rendered content/hash直接送namespace绑定sink。未过期foreign lease和UncertainManualReview保留，不盲发；过期AttemptInFlight撤销fence并转Uncertain而非自动重发。每个decision启动内最多恢复一次，仍deliverable或本地固定点失败则阻止新producer激活。 review终态的既存task transition经date/task/hash核验后hydrate并ack；原业务日通知owner不变。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink",
+          "startup-review-hydrate",
+          "startup-review-task-map",
+          "review-hydration",
+          "review-schedule-state",
+          "review-auto",
+          "review-manual"
+        ]
+      },
+      "evidence_ids": [
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink",
+        "startup-review-hydrate",
+        "startup-review-task-map",
+        "review-hydration",
+        "review-schedule-state",
+        "review-auto",
+        "review-manual"
+      ],
+      "known_gaps": [
+        "启动恢复只证明源码可达性；未查询历史decision是否存在，也未验证部署、真实TransportAccepted或用户已读。",
+        "启动恢复原信封不重新执行正常producer的source freshness/业务时窗门；该边界不是当前源已再次授权的证明。",
+        "review hydration仅在schedule.date匹配且task identity/basis/hash一致时消费，foreign-date transition继续pending；Terminal包括Rejected/Uncertain，不等于Delivered，且不自动补齐通知后的业务保存。"
+      ]
+    },
+    {
+      "id": "startup-resume-watchlist-tracking",
+      "kinds": [
+        "WatchlistTracking"
+      ],
+      "phase_epics": [
+        "盘后"
+      ],
+      "occurrence_family": "review_task_identity(date,R13) / original business date",
+      "completion_owner": "business_date_once_claims(business_date,WatchlistTracking,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R13)",
+      "migration_unit_id": "MU-review-r13",
+      "trigger": {
+        "description": "普通启动完成core DB绑定后，ensure_startup_reconciled形成all-date startup barrier，早于常驻任务、--review和--push；扫描delivery_decisions全部日期，不受正常loader、业务发送时窗、交易日门或backfill最近5日/8-task集合限制。显式P01 compensation独占命令跳过全局barrier。",
+        "evidence_ids": [
+          "monitor-main",
+          "startup-barrier",
+          "startup-reconcile",
+          "startup-all-pending",
+          "startup-list-deliverable"
+        ]
+      },
+      "source": {
+        "description": "只读取已存immutable envelope的原business_date、kind/sub_kind、scope、occurrence、source binding、policy version、rendered content/hash及关联decision；从stored envelope构造attempt request，不调用当前行情、账户、新闻、review loader/provider/LLM，不以新source替换原载荷。",
+        "evidence_ids": [
+          "startup-kind-map",
+          "counted-envelope",
+          "startup-resume",
+          "startup-begin-attempt"
+        ]
+      },
+      "authority": {
+        "description": "发送权限仅来自既存decision/state及reservation/claim、retry_authorized、lease/fence；reconcile先完成本地append/payload固定点，再对deliverable decision直接begin_attempt/sink。已存authority不表示当前来源已重新验证，也不证明本环境存在这类历史记录。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink"
+        ]
+      },
+      "policy": {
+        "description": "仅Reserved及retry_authorized=true的RejectedDurable可进入恢复；Rejected需重新取得原claim/rolling head与所需预算reservation，不在启动中新增retry授权。begin_attempt要求Reserved和唯一authoritative sink；原rendered content/hash直接送namespace绑定sink。未过期foreign lease和UncertainManualReview保留，不盲发；过期AttemptInFlight撤销fence并转Uncertain而非自动重发。每个decision启动内最多恢复一次，仍deliverable或本地固定点失败则阻止新producer激活。 review终态的既存task transition经date/task/hash核验后hydrate并ack；原业务日通知owner不变。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink",
+          "startup-review-hydrate",
+          "startup-review-task-map",
+          "review-hydration",
+          "review-schedule-state",
+          "review-auto",
+          "review-manual"
+        ]
+      },
+      "evidence_ids": [
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink",
+        "startup-review-hydrate",
+        "startup-review-task-map",
+        "review-hydration",
+        "review-schedule-state",
+        "review-auto",
+        "review-manual"
+      ],
+      "known_gaps": [
+        "启动恢复只证明源码可达性；未查询历史decision是否存在，也未验证部署、真实TransportAccepted或用户已读。",
+        "启动恢复原信封不重新执行正常producer的source freshness/业务时窗门；该边界不是当前源已再次授权的证明。",
+        "review hydration仅在schedule.date匹配且task identity/basis/hash一致时消费，foreign-date transition继续pending；Terminal包括Rejected/Uncertain，不等于Delivered，且不自动补齐通知后的业务保存。"
+      ]
+    },
+    {
+      "id": "startup-resume-catalyst-review",
+      "kinds": [
+        "CatalystReview"
+      ],
+      "phase_epics": [
+        "盘后"
+      ],
+      "occurrence_family": "review_task_identity(date,A10) / original business date",
+      "completion_owner": "business_date_once_claims(business_date,CatalystReview,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,A10)",
+      "migration_unit_id": "MU-review-a10",
+      "trigger": {
+        "description": "普通启动完成core DB绑定后，ensure_startup_reconciled形成all-date startup barrier，早于常驻任务、--review和--push；扫描delivery_decisions全部日期，不受正常loader、业务发送时窗、交易日门或backfill最近5日/8-task集合限制。显式P01 compensation独占命令跳过全局barrier。",
+        "evidence_ids": [
+          "monitor-main",
+          "startup-barrier",
+          "startup-reconcile",
+          "startup-all-pending",
+          "startup-list-deliverable"
+        ]
+      },
+      "source": {
+        "description": "只读取已存immutable envelope的原business_date、kind/sub_kind、scope、occurrence、source binding、policy version、rendered content/hash及关联decision；从stored envelope构造attempt request，不调用当前行情、账户、新闻、review loader/provider/LLM，不以新source替换原载荷。",
+        "evidence_ids": [
+          "startup-kind-map",
+          "counted-envelope",
+          "startup-resume",
+          "startup-begin-attempt"
+        ]
+      },
+      "authority": {
+        "description": "发送权限仅来自既存decision/state及reservation/claim、retry_authorized、lease/fence；reconcile先完成本地append/payload固定点，再对deliverable decision直接begin_attempt/sink。已存authority不表示当前来源已重新验证，也不证明本环境存在这类历史记录。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink"
+        ]
+      },
+      "policy": {
+        "description": "仅Reserved及retry_authorized=true的RejectedDurable可进入恢复；Rejected需重新取得原claim/rolling head与所需预算reservation，不在启动中新增retry授权。begin_attempt要求Reserved和唯一authoritative sink；原rendered content/hash直接送namespace绑定sink。未过期foreign lease和UncertainManualReview保留，不盲发；过期AttemptInFlight撤销fence并转Uncertain而非自动重发。每个decision启动内最多恢复一次，仍deliverable或本地固定点失败则阻止新producer激活。 review终态的既存task transition经date/task/hash核验后hydrate并ack；原业务日通知owner不变。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink",
+          "startup-review-hydrate",
+          "startup-review-task-map",
+          "review-hydration",
+          "review-schedule-state",
+          "review-auto",
+          "review-manual"
+        ]
+      },
+      "evidence_ids": [
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink",
+        "startup-review-hydrate",
+        "startup-review-task-map",
+        "review-hydration",
+        "review-schedule-state",
+        "review-auto",
+        "review-manual"
+      ],
+      "known_gaps": [
+        "启动恢复只证明源码可达性；未查询历史decision是否存在，也未验证部署、真实TransportAccepted或用户已读。",
+        "启动恢复原信封不重新执行正常producer的source freshness/业务时窗门；该边界不是当前源已再次授权的证明。",
+        "review hydration仅在schedule.date匹配且task identity/basis/hash一致时消费，foreign-date transition继续pending；Terminal包括Rejected/Uncertain，不等于Delivered，且不自动补齐通知后的业务保存。"
+      ]
+    },
+    {
+      "id": "startup-resume-industry-chain",
+      "kinds": [
+        "IndustryChain"
+      ],
+      "phase_epics": [
+        "盘后"
+      ],
+      "occurrence_family": "review_task_identity(date,R03) / existing original business date",
+      "completion_owner": "business_date_once_claims(business_date,IndustryChain,None,GLOBAL) → existing immutable decision / occurrence=review_task_identity(date,R03)",
+      "migration_unit_id": "MU-review-r03-stored-recovery",
+      "trigger": {
+        "description": "普通启动完成core DB绑定后，ensure_startup_reconciled形成all-date startup barrier，早于常驻任务、--review和--push；扫描delivery_decisions全部日期，不受正常loader、业务发送时窗、交易日门或backfill最近5日/8-task集合限制。显式P01 compensation独占命令跳过全局barrier。 本入口不创建R03新claim；不经过LegacyAccountGate。",
+        "evidence_ids": [
+          "monitor-main",
+          "startup-barrier",
+          "startup-reconcile",
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "review-batch"
+        ]
+      },
+      "source": {
+        "description": "只读取已存immutable envelope的原business_date、kind/sub_kind、scope、occurrence、source binding、policy version、rendered content/hash及关联decision；从stored envelope构造attempt request，不调用当前行情、账户、新闻、review loader/provider/LLM，不以新source替换原载荷。 本producer只消费已存IndustryChain/None的R03信封。",
+        "evidence_ids": [
+          "startup-kind-map",
+          "counted-envelope",
+          "startup-resume",
+          "startup-begin-attempt"
+        ]
+      },
+      "authority": {
+        "description": "发送权限仅来自既存decision/state及reservation/claim、retry_authorized、lease/fence；reconcile先完成本地append/payload固定点，再对deliverable decision直接begin_attempt/sink。已存authority不表示当前来源已重新验证，也不证明本环境存在这类历史记录。 既存R03 claim不依赖当前auto/manual临时任务状态授予发送权限。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink",
+          "claim-inspect"
+        ]
+      },
+      "policy": {
+        "description": "仅Reserved及retry_authorized=true的RejectedDurable可进入恢复；Rejected需重新取得原claim/rolling head与所需预算reservation，不在启动中新增retry授权。begin_attempt要求Reserved和唯一authoritative sink；原rendered content/hash直接送namespace绑定sink。未过期foreign lease和UncertainManualReview保留，不盲发；过期AttemptInFlight撤销fence并转Uncertain而非自动重发。每个decision启动内最多恢复一次，仍deliverable或本地固定点失败则阻止新producer激活。 ReviewTask::ALL/from_label包含R03；持久task transition按匹配schedule date、task identity和hash应用，再ack，可关联auto常驻state与manual临时audit；foreign日期仍pending。",
+        "evidence_ids": [
+          "startup-all-pending",
+          "startup-list-deliverable",
+          "startup-resume",
+          "startup-begin-attempt",
+          "startup-reacquire",
+          "startup-expired-attempt",
+          "startup-sink",
+          "startup-review-hydrate",
+          "startup-review-task-map",
+          "review-hydration",
+          "review-schedule-state",
+          "review-auto",
+          "review-manual"
+        ]
+      },
+      "evidence_ids": [
+        "monitor-main",
+        "startup-barrier",
+        "startup-reconcile",
+        "startup-all-pending",
+        "startup-list-deliverable",
+        "review-batch",
+        "startup-kind-map",
+        "counted-envelope",
+        "startup-resume",
+        "startup-begin-attempt",
+        "startup-reacquire",
+        "startup-expired-attempt",
+        "startup-sink",
+        "claim-inspect",
+        "startup-review-hydrate",
+        "startup-review-task-map",
+        "review-hydration",
+        "review-schedule-state",
+        "review-auto",
+        "review-manual"
+      ],
+      "known_gaps": [
+        "R03仍STARVED：新claim的LegacyAccountGate缺verified broker batch+同批trade-sync watermark；既存信封恢复不修复此来源门。",
+        "未查询既存R03 decision是否实际存在；hydration Terminal包括Rejected/Uncertain，不等于已送达，不与两个新claim入口的task-state owner合并。"
+      ]
     }
   ],
   "migration_units": [
@@ -7092,10 +8624,11 @@
     {
       "id": "MU-p01",
       "completion_owner": "business_date_once_claims(business_date,PreopenNewsHot,None,GLOBAL) → immutable decision / occurrence=p01:{business_date}",
-      "note": "scheduler 与 compensation 使用同一四列 claim；render mode/hash 不产生第二个 claim。",
+      "note": "scheduler 与 compensation 使用同一四列 claim；render mode/hash 不产生第二个 claim。 普通启动all-date恢复既存immutable envelope也归此同一durable owner；启动barrier不是独立通知完成键。",
       "producer_ids": [
         "p01-scheduled",
-        "p01-compensation"
+        "p01-compensation",
+        "startup-resume-preopen-news-hot"
       ],
       "occurrence_families": [
         "p01:{business_date}"
@@ -7258,9 +8791,10 @@
     {
       "id": "MU-paper-trade",
       "completion_owner": "counted decision(PaperTrade,Ticket,terminal_transition_id,source fingerprint,subject,policy,rendered hash)",
-      "note": "PaperTradeTerminalBindingV1 的交易终态 occurrence 与通知 decision 分离，不与卖出 code/day/Filled 防重合并。",
+      "note": "PaperTradeTerminalBindingV1 的交易终态 occurrence 与通知 decision 分离，不与卖出 code/day/Filled 防重合并。 普通启动all-date恢复既存immutable envelope也归此同一durable owner；启动barrier不是独立通知完成键。",
       "producer_ids": [
-        "paper-trade-terminal"
+        "paper-trade-terminal",
+        "startup-resume-paper-trade"
       ],
       "occurrence_families": [
         "PaperTradeTerminalBindingV1.terminal_transition_id()"
@@ -7290,10 +8824,11 @@
     {
       "id": "MU-holding-plan",
       "completion_owner": "counted decision(HoldingPlan,Ticket,holding-plan:{date}:{code},source fingerprint,subject,policy,rendered hash)",
-      "note": "定时与 --push 复用同 counted family；实际 source/rendered hash 相同才是同 decision，不能凭可读 occurrence 声称每日唯一。",
+      "note": "定时与 --push 复用同 counted family；实际 source/rendered hash 相同才是同 decision，不能凭可读 occurrence 声称每日唯一。 普通启动all-date恢复既存immutable envelope也归此同一durable owner；启动barrier不是独立通知完成键。",
       "producer_ids": [
         "holding-plan-periodic",
-        "holding-plan-manual"
+        "holding-plan-manual",
+        "startup-resume-holding-plan"
       ],
       "occurrence_families": [
         "holding-plan:{date}:{code}"
@@ -7305,9 +8840,10 @@
     {
       "id": "MU-t0",
       "completion_owner": "counted decision(T0Advice,Ticket,T0PlanDecisionBindingV1.decision_id(),source fingerprint,subject,policy,rendered hash)",
-      "note": "独立 T0 decision canonical hash，不能因为同持仓/DB 与 HoldingPlan 合并；last_t0_scan 只为调度。",
+      "note": "独立 T0 decision canonical hash，不能因为同持仓/DB 与 HoldingPlan 合并；last_t0_scan 只为调度。 普通启动all-date恢复既存immutable envelope也归此同一durable owner；启动barrier不是独立通知完成键。",
       "producer_ids": [
-        "t0-advice"
+        "t0-advice",
+        "startup-resume-t0-advice"
       ],
       "occurrence_families": [
         "t0 decision domain/canonical SHA256"
@@ -7319,9 +8855,10 @@
     {
       "id": "MU-close-call",
       "completion_owner": "counted decision(CloseCall,Ticket,close-call:{date}:{code},source fingerprint,subject,policy,rendered hash)",
-      "note": "独立 CloseCall binding；外 close_call_pushed 不是 durable receipt，也没有 HoldingPlan 日表。",
+      "note": "独立 CloseCall binding；外 close_call_pushed 不是 durable receipt，也没有 HoldingPlan 日表。 普通启动all-date恢复既存immutable envelope也归此同一durable owner；启动barrier不是独立通知完成键。",
       "producer_ids": [
-        "close-call"
+        "close-call",
+        "startup-resume-close-call"
       ],
       "occurrence_families": [
         "close-call:{date}:{code}"
@@ -7370,9 +8907,10 @@
     {
       "id": "MU-sector-top",
       "completion_owner": "business_date_once_claims(business_date,SectorTop,None,GLOBAL) → immutable decision / occurrence=sector-top:{date}",
-      "note": "SectorTop 的 kind、claim 和外层 last_sector_top 独立；同 coordinator/budget 不合并。",
+      "note": "SectorTop 的 kind、claim 和外层 last_sector_top 独立；同 coordinator/budget 不合并。 普通启动all-date恢复既存immutable envelope也归此同一durable owner；启动barrier不是独立通知完成键。",
       "producer_ids": [
-        "sector-top"
+        "sector-top",
+        "startup-resume-sector-top"
       ],
       "occurrence_families": [
         "sector-top:{date}"
@@ -7384,9 +8922,10 @@
     {
       "id": "MU-sector-anomaly",
       "completion_owner": "business_date_once_claims(business_date,SectorAnomaly,None,GLOBAL) → immutable decision / occurrence=sector-anomaly:{date}",
-      "note": "SectorAnomaly 的 kind、claim 和外层 last_sector_anomaly 独立；同 coordinator/budget 不合并。",
+      "note": "SectorAnomaly 的 kind、claim 和外层 last_sector_anomaly 独立；同 coordinator/budget 不合并。 普通启动all-date恢复既存immutable envelope也归此同一durable owner；启动barrier不是独立通知完成键。",
       "producer_ids": [
-        "sector-anomaly"
+        "sector-anomaly",
+        "startup-resume-sector-anomaly"
       ],
       "occurrence_families": [
         "sector-anomaly:{date}"
@@ -7582,11 +9121,12 @@
     {
       "id": "MU-review-r04",
       "completion_owner": "business_date_once_claims(business_date,ReviewLhb,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R04)",
-      "note": "R04 auto/manual/backfill 共原业务日通知owner；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。",
+      "note": "R04 auto/manual/backfill 共原业务日通知owner；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。 普通启动all-date恢复既存immutable envelope也归此同一durable owner；启动barrier不是独立通知完成键。",
       "producer_ids": [
         "review-r04-auto",
         "review-r04-manual",
-        "review-r04-backfill"
+        "review-r04-backfill",
+        "startup-resume-review-lhb"
       ],
       "occurrence_families": [
         "review_task_identity(date,R04) / original business date"
@@ -7598,11 +9138,12 @@
     {
       "id": "MU-review-r07",
       "completion_owner": "business_date_once_claims(business_date,TomorrowWatch,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R07)",
-      "note": "R07 auto/manual/backfill 共原业务日通知owner；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。",
+      "note": "R07 auto/manual/backfill 共原业务日通知owner；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。 普通启动all-date恢复既存immutable envelope也归此同一durable owner；启动barrier不是独立通知完成键。",
       "producer_ids": [
         "review-r07-auto",
         "review-r07-manual",
-        "review-r07-backfill"
+        "review-r07-backfill",
+        "startup-resume-tomorrow-watch"
       ],
       "occurrence_families": [
         "review_task_identity(date,R07) / original business date"
@@ -7614,11 +9155,12 @@
     {
       "id": "MU-review-r08",
       "completion_owner": "durable review occurrence(business_date,EventCalendar,None,GLOBAL,review_task_identity(date,R08)) → Rolling immutable decision",
-      "note": "R08 auto/manual/backfill 共原业务日通知owner；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。",
+      "note": "R08 auto/manual/backfill 共原业务日通知owner；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。 普通启动all-date恢复既存immutable envelope也归此同一durable owner；启动barrier不是独立通知完成键。",
       "producer_ids": [
         "review-r08-auto",
         "review-r08-manual",
-        "review-r08-backfill"
+        "review-r08-backfill",
+        "startup-resume-event-calendar"
       ],
       "occurrence_families": [
         "review_task_identity(date,R08) / original business date"
@@ -7630,11 +9172,12 @@
     {
       "id": "MU-review-r09",
       "completion_owner": "business_date_once_claims(business_date,ReviewProviderTopN,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R09)",
-      "note": "R09 auto/manual/backfill 共原业务日通知owner；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。",
+      "note": "R09 auto/manual/backfill 共原业务日通知owner；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。 普通启动all-date恢复既存immutable envelope也归此同一durable owner；启动barrier不是独立通知完成键。",
       "producer_ids": [
         "review-r09-auto",
         "review-r09-manual",
-        "review-r09-backfill"
+        "review-r09-backfill",
+        "startup-resume-review-provider-top-n"
       ],
       "occurrence_families": [
         "review_task_identity(date,R09) / original business date"
@@ -7646,11 +9189,12 @@
     {
       "id": "MU-review-r11",
       "completion_owner": "business_date_once_claims(business_date,PositionReview,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R11)",
-      "note": "R11 auto/manual/backfill 共原业务日通知owner；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。",
+      "note": "R11 auto/manual/backfill 共原业务日通知owner；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。 普通启动all-date恢复既存immutable envelope也归此同一durable owner；启动barrier不是独立通知完成键。",
       "producer_ids": [
         "review-r11-auto",
         "review-r11-manual",
-        "review-r11-backfill"
+        "review-r11-backfill",
+        "startup-resume-position-review"
       ],
       "occurrence_families": [
         "review_task_identity(date,R11) / original business date"
@@ -7662,11 +9206,12 @@
     {
       "id": "MU-review-r13",
       "completion_owner": "business_date_once_claims(business_date,WatchlistTracking,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R13)",
-      "note": "R13 auto/manual/backfill 共原业务日通知owner；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。",
+      "note": "R13 auto/manual/backfill 共原业务日通知owner；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。 普通启动all-date恢复既存immutable envelope也归此同一durable owner；启动barrier不是独立通知完成键。",
       "producer_ids": [
         "review-r13-auto",
         "review-r13-manual",
-        "review-r13-backfill"
+        "review-r13-backfill",
+        "startup-resume-watchlist-tracking"
       ],
       "occurrence_families": [
         "review_task_identity(date,R13) / original business date"
@@ -7678,12 +9223,13 @@
     {
       "id": "MU-review-a10",
       "completion_owner": "business_date_once_claims(business_date,CatalystReview,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,A10)",
-      "note": "A10 auto/manual/backfill/--push 共原业务日通知owner；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。",
+      "note": "A10 auto/manual/backfill/--push 共原业务日通知owner；auto 的 ReviewScheduleState(date).tasks[task] 按日期/任务独立；先 hydration，再 due/attempt，clone→hydrate→apply legacy→append audit→commit。manual 每次新建临时 audit state；两者共享 durable decision 才能通过 hydration 关联。Delivered/NoData/Disabled/永久 Failed 可为 Terminal，retryable Failed 按1/5/15分钟退避，ExpectedWait/DeferredUntil 有各自时间门，均不等于全部送达。 普通启动all-date恢复既存immutable envelope也归此同一durable owner；启动barrier不是独立通知完成键。",
       "producer_ids": [
         "review-a10-auto",
         "review-a10-manual",
         "review-a10-backfill",
-        "review-a10-push"
+        "review-a10-push",
+        "startup-resume-catalyst-review"
       ],
       "occurrence_families": [
         "review_task_identity(date,A10) / original business date"
@@ -7695,7 +9241,7 @@
     {
       "id": "MU-review-r03-auto",
       "completion_owner": "post_session_review_scheduler::ReviewScheduleState(date).tasks[R03]",
-      "note": "R03 的账户依赖门目前不给 dispatcher 发送权限；没有活动 counted completion可用于合并两入口。潜在IndustryChain/date/GLOBAL policy不等于已存在通知owner。",
+      "note": "R03 的新claim账户依赖门目前不给 dispatcher 发送权限；两入口的当前任务state/audit独立，不能借潜在counted policy合并。既存IndustryChain counted decision由独立startup恢复producer/Unit拥有；其hydration可关联两个任务状态，不改变此处新claim门。",
       "producer_ids": [
         "review-r03-auto"
       ],
@@ -7709,7 +9255,7 @@
     {
       "id": "MU-review-r03-manual",
       "completion_owner": "run_review_only::temporary audit_state(invocation,date).tasks[R03]",
-      "note": "R03 的账户依赖门目前不给 dispatcher 发送权限；没有活动 counted completion可用于合并两入口。潜在IndustryChain/date/GLOBAL policy不等于已存在通知owner。",
+      "note": "R03 的新claim账户依赖门目前不给 dispatcher 发送权限；两入口的当前任务state/audit独立，不能借潜在counted policy合并。既存IndustryChain counted decision由独立startup恢复producer/Unit拥有；其hydration可关联两个任务状态，不改变此处新claim门。",
       "producer_ids": [
         "review-r03-manual"
       ],
@@ -7842,6 +9388,20 @@
       ],
       "occurrence_families": [
         "calendar date / 15:30≤t<15:35 / latest completed business date"
+      ],
+      "phase_epics": [
+        "盘后"
+      ]
+    },
+    {
+      "id": "MU-review-r03-stored-recovery",
+      "completion_owner": "business_date_once_claims(business_date,IndustryChain,None,GLOBAL) → existing immutable decision / occurrence=review_task_identity(date,R03)",
+      "note": "仅拥有既存R03 counted claim/decision的启动恢复，不与auto进程task state或manual临时audit拼接为同owner；准确的durable hydration可关联这两入口，但新claim仍被账户门阻断。",
+      "producer_ids": [
+        "startup-resume-industry-chain"
+      ],
+      "occurrence_families": [
+        "review_task_identity(date,R03) / existing original business date"
       ],
       "phase_epics": [
         "盘后"
