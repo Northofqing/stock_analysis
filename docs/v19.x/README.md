@@ -8,6 +8,8 @@
 >
 > **痛点证据：** `/private/tmp/stock_analysis_monitor.log`（19,843 行 / 7h49m）
 
+> **来源注记（2026-09-05）：** v19.0 正文保留的 `AGENTS.md`、`docs/ENGINEERING_RULES_V2.md` 与 `CLAUDE.md` 规则指针已经退役，仅作历史设计语境，不是当前规则入口。另有四份纳管来源位于 `docs/v18.x/`，但文件分别自声明 v20.x（v18.2–v18.4）与 v20.0（v18.5）；这是目录位置与自声明版本的标签冲突，不改写原来源。
+
 ## 推荐入口
 
 [v19.0 Operational Clarity 设计](v19.0-operational-clarity-design.md) 是当前主设计文档。它整合痛点实证、设计原则、版本划分、PR 拆分与核心模块设计。
