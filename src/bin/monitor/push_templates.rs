@@ -11078,6 +11078,12 @@ where
     }
     let (announcements, futures_delivery_batch, overnight_indices_batch, overnight_fx_batch) =
         loader(review_date, reminder_date).await;
+    if let Err(error) = &futures_delivery_batch {
+        let reason = format!("r08_cffex_component_unavailable: {error}");
+        log::error!("[R-08][BR-140] {reason}");
+        log_dispatcher_attempt("R-08", false, 0, &reason);
+        return ReviewTaskOutcome::gateway_failed(error);
+    }
     let announcements = announcements.map_err(|error| format!("CNInfo 全市场公告不可用: {error}"));
     let futures_delivery = futures_delivery_batch
         .as_ref()
@@ -11350,7 +11356,7 @@ mod tests_br140_r08_partial_components {
                     Err(stock_analysis::data_gateway::GatewayError::unavailable(
                         "event_calendar",
                         Some(stock_analysis::market_domain::ProviderId::Cffex),
-                        false,
+                        true,
                         format!(
                             "provider_unsupported: unsupported by {review_date} {reminder_date}"
                         ),
@@ -11365,20 +11371,61 @@ mod tests_br140_r08_partial_components {
         assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
         match outcome {
             crate::review_batch::ReviewTaskOutcome::Failed { failure } => {
-                if let crate::review_batch::ReviewTaskFailure::ExistingSourceFailure {
-                    retryable,
-                    reason,
-                } = failure
-                {
-                    assert!(retryable);
-                    assert!(reason.contains("r08_cffex_component_unavailable"));
-                    assert!(reason.contains("provider_unsupported"));
+                if let crate::review_batch::ReviewTaskFailure::GatewaySource(failure) = failure {
+                    assert!(failure.retryable);
+                    assert_eq!(failure.provider.as_deref(), Some("Cffex"));
+                    assert_eq!(failure.audit_outcome, "unavailable");
+                    assert_eq!(failure.reason_code, "no_verified_batch");
+                    assert!(failure.reason.contains("provider_unsupported"));
                 } else {
-                    panic!("R-08 expected existing source failure on unsupported CFFEX");
+                    panic!("R-08 expected typed gateway failure on unsupported CFFEX");
                 }
             }
             _ => panic!("R-08 unsupported CFFEX should remain retryable"),
         }
+    }
+
+    #[tokio::test]
+    async fn br199_r08_permanent_cffex_failure_is_terminal_without_transport_reclassification() {
+        let business_date = chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap();
+        let outcome = dispatch_r08_event_calendar_outcome_with_loader(
+            "2026-07-21",
+            |_| async { Ok(None) },
+            move |review_date, _reminder_date| async move {
+                (
+                    Ok(announcement_batch(review_date)),
+                    Err(stock_analysis::data_gateway::GatewayError::unavailable(
+                        "futures_delivery",
+                        None,
+                        false,
+                        "http request rejected by permanent contract",
+                    )),
+                    Ok(indices_batch()),
+                    Ok(fx_batch()),
+                )
+            },
+        )
+        .await;
+
+        let mut state = crate::review_batch::ReviewScheduleState::for_date(business_date);
+        let transitions = state.apply(
+            &crate::review_batch::ReviewBatchOutcome::new(vec![(
+                crate::review_batch::ReviewTask::R08,
+                outcome,
+            )]),
+            business_date.and_hms_opt(19, 0, 0).unwrap(),
+        );
+
+        assert!(!state.is_due(
+            crate::review_batch::ReviewTask::R08,
+            business_date.and_hms_opt(23, 0, 0).unwrap(),
+        ));
+        assert_eq!(transitions.len(), 1);
+        assert!(!transitions[0].retryable);
+        assert!(!transitions[0].success);
+        assert!(!transitions[0]
+            .reason_code
+            .starts_with("source_transport_failed"));
     }
 
     #[test]
