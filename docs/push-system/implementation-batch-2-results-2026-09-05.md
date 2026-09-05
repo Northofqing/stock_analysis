@@ -1,6 +1,6 @@
 # 第二批推送可靠性：来源、目录与源码证据交付记录
 
-> 当前仍在实施：Task1来源治理、Task2工具和Task3入口清单已通过独立复核；Task4–Task6继续核对业务完成边界，Task7统一生成目录，本报告尚未完成整批验收。不是Foundation Ready、生产上线或全量方案完成声明。
+> 当前仍在实施：Task1来源治理、Task2工具、Task3入口清单和Task4新闻边界已通过独立复核；Task5–Task6继续核对其他业务完成边界，Task7统一生成目录，本报告尚未完成整批验收。不是Foundation Ready、生产上线或全量方案完成声明。
 
 ## 范围与边界
 
@@ -9,7 +9,7 @@
 - 原工作区的67项混合源报告与本分支65项枚举分开。PaperBuy/Watchdog没有移入本分支，不能用原报告行号充当这里的已验证证据。
 - 本批只落实已批准的来源治理、可校验目录与稳定源码证据前置；完整RFC、WBS重算、离线HTML、CI、运行时Foundation及交易窗口晋级另有后续门禁。
 
-## 已通过的三个任务
+## 已通过的四个任务
 
 ### Task1：不可变设计来源
 
@@ -39,6 +39,12 @@ v18.2–v18.4文件自声明v20.x，v18.5自声明v20.0，记录为版本标签�
 
 独立复核补出了两项重要边界并已关闭：SnapshotStale除15:10定时器外还会在服务启动时跨时段执行；PaperReview午盘today与“已完成交易日、exact T+1”条件冲突，补齐历史快照也不能恢复该入口。另澄清只有R04手动复盘可绕过21:00门，R07仍需等待。Task3只冻结入口与初判，新闻、状态驱动、复盘owner仍分别由Task4–Task6核验，不能将初判当成最终目录。
 
+### Task4：新闻、来源事实与持久发送边界
+
+新闻章节提交`5c91eb8`，精度修订`d15f35b`。共审计13条producer/分类分支，另保留PolicyHit无producer裁决；形成10个主完成键域、9个候选MigrationUnit和5个具体未决。独立复核无Critical/Important，并关闭了公告legacy回退措辞与L4键域派生关系两项Minor。
+
+关键结论是：P01自动与补偿共享`p01:{business_date}`/GLOBAL持久claim，但补偿不能接管Scheduled模式留下的Reserved信封；普通D01与NewsAI虽然共用NewsToIdea kind，却使用不同的完成状态，NewsAI当前没有进入BR-192 counted coordinator；N01没有权威强度源且没有生产Critical reservation，源码也没有证明它与N02共享日配额。Announcement、D01/I02、Earnings/Analyst均存在上游状态在通知完成前推进的风险，工作表已逐项记录重试与不确定边界。
+
 ## Task3–Task7及整批验证（尚未完成）
 
 首次真实审计确认65个enum、467个src Rust文件加两份Cargo文件及16组源码事实，并发现旧范围未列出的`--push`手工入口与P01补偿入口。实现者拒绝用概括性owner或占位producer生成目录；现按入口/no-caller、新闻、状态驱动、复盘四个切片审计，Task7才统一生成目录、完整manifest和Markdown。这些机械数量不等于已完成生产者审计或部署验证。
@@ -51,7 +57,8 @@ v18.2–v18.4文件自声明v20.x，v18.5自声明v20.0，记录为版本标签�
 | 真实根目录draft/strict/render | Task2结束时按阶段预期报告两个JSON缺失，不能称为目录通过 |
 | 首次真实审计 | 65 enum / 469 scope files / 16组直接源码事实；未生成成品、无提交，剩余边界已拆分 |
 | Task3入口/无caller清单 | 10b38e9：65/65；15个无生产caller；修订复核PASS |
-| 整批最终验证/最终review | 待Task4–Task7完成后执行 |
+| Task4新闻边界 | d15f35b：13条producer/分支；10个完成域；9个候选Unit；5个具体未决；复核PASS |
+| 整批最终验证/最终review | 待Task5–Task7完成后执行 |
 
 Task1留下一个非阻塞Minor：不存在的root目前诊断为`catalog_missing`，不影响失败退出，但诊断可更精确；交给整批review最终定级。
 
@@ -65,6 +72,9 @@ Task1留下一个非阻塞Minor：不存在的root目前诊断为`catalog_missin
 6. impl符号使用仅折叠空白的完整声明头：防止同类型不同impl被混用；代价是复杂未支持形状需换用精确函数证据或后续扩展，不能猜测定位。
 7. 将原Task2拆成工具Task2和真实目录Task3顺序复核：分开验证工具正确性与业务判断，原要求全部保留；代价是多一次任务交接/复核，真实目录交付前不得宣布本批完成。
 8. 不允许用概括性owner或占位producer填满65项：按剩余风险增加入口/no-caller、新闻、状态驱动、复盘四个审计切片，再由Task7组装；代价是增加顺序任务与独立复核，并多一份可追溯审计工作表，Task7通过前本批仍未完成。
+9. P01自动与补偿按同一业务日claim进入同一迁移单元，但保留render mode和Reserved恢复限制：避免把同一日事件拆成两条通知；代价是补偿不能盲接自动模式的不确定信封，必须先对账或显式恢复。
+10. 普通D01与NewsAI即使共用NewsToIdea kind也拆为不同迁移单元：前者是进程内memo/L4，后者是assessment identity与追加式delivery event；代价是目录和迁移要维护两套完成语义，NewsAI在接入真实TransportAccepted前不能宣称可靠送达。
+11. N01与N02按当前源码分开额度和完成域，不落实设计中的“共享配额”假设：N01没有生产Critical reservation，N02只有窗口状态；代价是未来接入权威强度源或共享额度时必须重新审计并修改目录，当前不能提前复用N02活跃性证明N01可用。
 
 ## 保护与未检查项
 

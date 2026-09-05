@@ -105,10 +105,10 @@ assert_includes out + err, 'source_sha_mismatch'
 
 **文件：** 仅追加push-source-audit-worksheet-2026-09-05.md的新闻审计章节，不改Task3的65-kind集合行。
 
-- [ ] 完整核对Announcement、PreopenNewsHot/P01 scheduler+compensation、NewsToIdea普通D01与NewsAI、NewsCatalyst、NewsFlashCritical/Aggregated、PolicyHit、EarningsBeat/Miss、AnalystUpgrade，以及N01/N02的source/trigger/authority/policy/occurrence/completion owner。
-- [ ] NewsAI从admitted same-tick facts经assess/preflight/send到durable occurrence/finalize；区分本地audit、sink attempt、TransportAccepted，不从日志文案升级authority。N01/N02区分共享quota和各occurrence/settle owner。
-- [ ] P01自动与补偿是否复用同一schedule occurrence/claim按源码裁决；D01 smoke fixture排除。Earnings opt-in位于provider I/O之后、AnalystState observe先于发送等顺序要有直接symbol证据。
-- [ ] 每项写明确owner标识/key范围、失败是否推进/回滚/重试和多入口归属建议；无法证明的点保留具体未决，不用概括文案。提交仅工作表追加，report task-4-report.md，独立review后进入Task5。
+- [x] 完整核对Announcement、PreopenNewsHot/P01 scheduler+compensation、NewsToIdea普通D01与NewsAI、NewsCatalyst、NewsFlashCritical/Aggregated、PolicyHit、EarningsBeat/Miss、AnalystUpgrade，以及N01/N02的source/trigger/authority/policy/occurrence/completion owner。
+- [x] NewsAI从admitted same-tick facts经assess/preflight/send到durable occurrence/finalize；区分本地audit、sink attempt、TransportAccepted，不从日志文案升级authority。N01/N02区分共享quota和各occurrence/settle owner。
+- [x] P01自动与补偿是否复用同一schedule occurrence/claim按源码裁决；D01 smoke fixture排除。Earnings opt-in位于provider I/O之后、AnalystState observe先于发送等顺序要有直接symbol证据。
+- [x] 每项写明确owner标识/key范围、失败是否推进/回滚/重试和多入口归属建议；无法证明的点保留具体未决，不用概括文案。提交仅工作表追加，report task-4-report.md，独立review后进入Task5。
 
 ## Task 5: 状态驱动、盘中/竞价及交易相关边界审计
 
