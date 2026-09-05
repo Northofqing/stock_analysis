@@ -91,20 +91,51 @@ assert_includes out + err, 'source_sha_mismatch'
 - [x] 自审后完整运行catalog_test.rb与来源测试一次、新Ruby语法及新文件diff --check通过。真实根check-sources应通过；真实check-catalog在Task3尚未交付时必须明确报告catalog/manifest缺失，不为了使其通过造假目录。CLI输出明确NOTCHECKED完整RFC/WBS/离线HTML/CI/运行时Foundation/部署/真实接收。
 - [x] 只提交五个工具/测试文件，不force-add ignored scratch、不提交controller plan。task-2-report.md记录RED/GREEN命令/输出、公开接口及剩余真实业务目录任务。Task2 BASE=6412b58，完成工具独立review后才进入Task3。
 
-## Task 3: 65-kind真实源审计目录与证据交付
+## Task 3: 65-kind入口与无caller清单
 
-**文件：** 新增docs/push-system/push-capability-catalog.v1.json、push-evidence-manifest.v1.json、push-capability-catalog.md。使用Task2已经独立复核的CLI/locator，原则上不改工具接口；如发现真实阻点，向controller报告具体证据，不改Rust源码迎合工具或目录。
+**文件：** 新增docs/push-system/push-source-audit-worksheet-2026-09-05.md。它是人工源码审计工作表，不是最终machine catalog；后续Task4–Task6按独立diff追加，Task7消费并重新核对。
 
-输入：本分支src/bin/monitor/notify.rs真实enum及生产源码。原工作区all-push-kinds-2026-09-05.md、comprehensive-reanalysis-2026-09-05.md、蓝图§24只提供审计线索；必须重新查本分支07781bf代码，不能把混合源行号或历史逻辑当已验证事实。首批R08/G5b修复以当前代码为准。
+- [ ] 以07781bf的PushKind enum为集合，工作表用可机械抽取的单表逐项列65个kind且仅一次，包含初判phase/status、真实producer入口symbol或无caller裁决、owner待核状态；一条kind多producer可列多个入口。用一次性Ruby对比工作表kind集与RustEvidence.enum_variants，失败不得提交。
+- [ ] 对INACTIVE/no-caller集合逐kind做全src负向caller审计，排除enum声明、metadata、renderer、适配表、测试和smoke；absence需记录命令/匹配分类，优先补充明确disabled/no_producer/preflight符号作为正证据。不能因旧报告说无caller就通过。
+- [ ] 收录全部已识别入口面：monitor/news/P01 scheduler、P01 compensation、--push run_daily_pushes、复盘auto/manual/backfill、CLI单股/汇总/chain和09:05/15:30 chain；仅save file的run_market_review_only不是发送producer，AlertManager无production caller仅作排除。
+- [ ] 将前次partial task-3-report中的16项已验证源码事实重新核对后写入工作表“已证实风险/关系”，并把News/状态驱动/复盘的待核owner分别指向Task4/5/6；不得把pending写成已证实完成。
+- [ ] 只提交工作表；report task-3-report.md追加集合对比、负向审计命令/结果和剩余owner清单。无真实JSON/manifest/生成Markdown，不改工具或Rust。完成独立review后才进入Task4。
 
-- [ ] 使用既定schema人工审计所有实际enum项，kind集与enum精确相等；本基线预期65，校验器不能写死65。phase/status根据真实可达性与禁用/缺源/opt-in条件，不由level/展示注册表推断ACTIVE；没有producer的INACTIVE使用空列表和明确禁用/无caller证据。
-- [ ] 逐producer记录trigger、source、authority、policy、occurrence及实际completion owner，各关系关联真实symbol。强制核查NewsToIdea普通D01与NewsAI；IntradayMarket盘中概览/09:10不可达预检/15:05持仓过期；MarketActionAlert账户冻结/OrderUpdate；PaperSell盘中/盘后；CandidateBoard/CandidateInvalidated/AuctionRepush共享外层tick及子快照；SectorTop/SectorAnomaly各自timer；复盘、大宗及业绩家族。不能用一个main函数代替全部dispatch/source/finalize证据。
-- [ ] 收录enum外CLI单股/汇总、产业链CLI及09:05/15:30定时报表。producer的kinds可为空但需说明原因；无生产caller的AlertManager只作排除说明。原工作树PaperBuy/Watchdog仅记录未移入，不伪造本分支证据。
-- [ ] 按producer/occurrence/completion owner构建MigrationUnit及phase Epics，共享实际owner的producer不可拆分；同函数/同状态类型/同数据库不等于共享owner。复盘自动/手动/历史补推等入口按真实状态作用域说明；无独立通知游标的CLI明示缺失，不能虚构新authority。
-- [ ] evidence manifest冻结07781bf386aafdf202851ae928efee8920387058的全部src Rust文件与Cargo元数据集合；使用已复核locator产生原始item哈希和派生行号，当前字节必须一致。不得手填虚假行号、盲取同名首项、在检查时自动刷新期望；人工语义审计与机器结构一致性检查明确区分。
-- [ ] 通过现有工具验证真实来源和目录draft；严格检查只能剩PROVISIONAL/dirty而非隐藏内容错误。明确生成一次Markdown，再执行--check和二次生成幂等；Markdown须能看到四时段、逐producer具体业务关系及symbol证据、enum外路径、已知风险和范围限制，不仅是kind名称表。
-- [ ] 只提交三个业务目录/证据/Markdown文件。task-3-report.md报告准确kind/producer/Unit/evidence/file数量、源码审计证据、CLI命令/输出、无法证实的具体关系。保持PROVISIONAL，不新增工期总数或Foundation Ready标签，不将源码接线当部署/TransportAccepted/用户已读证明。
-- [ ] 若某条逻辑、owner或lexer定位不能在此基线证实，报告具体阻点由controller处理，不用概括性占位文案宣布全量已核验。完成独立spec+quality review后进入整批验证与最终review。
+## Task 4: 新闻、来源事实与持久发送边界审计
+
+**文件：** 仅追加push-source-audit-worksheet-2026-09-05.md的新闻审计章节，不改Task3的65-kind集合行。
+
+- [ ] 完整核对Announcement、PreopenNewsHot/P01 scheduler+compensation、NewsToIdea普通D01与NewsAI、NewsCatalyst、NewsFlashCritical/Aggregated、PolicyHit、EarningsBeat/Miss、AnalystUpgrade，以及N01/N02的source/trigger/authority/policy/occurrence/completion owner。
+- [ ] NewsAI从admitted same-tick facts经assess/preflight/send到durable occurrence/finalize；区分本地audit、sink attempt、TransportAccepted，不从日志文案升级authority。N01/N02区分共享quota和各occurrence/settle owner。
+- [ ] P01自动与补偿是否复用同一schedule occurrence/claim按源码裁决；D01 smoke fixture排除。Earnings opt-in位于provider I/O之后、AnalystState observe先于发送等顺序要有直接symbol证据。
+- [ ] 每项写明确owner标识/key范围、失败是否推进/回滚/重试和多入口归属建议；无法证明的点保留具体未决，不用概括文案。提交仅工作表追加，report task-4-report.md，独立review后进入Task5。
+
+## Task 5: 状态驱动、盘中/竞价及交易相关边界审计
+
+**文件：** 仅追加同一工作表的状态驱动章节。
+
+- [ ] 完整核对DataMode pending/retry/confirm、HoldingPlan、T0Advice、CloseCall的counted binding与外层timer；VirtualWatch剩余路径；IntradayMarket三个producer；MarketActionAlert两入口；PaperSell盘中/盘后；CandidateBoard/CandidateInvalidated/AuctionRepush；SectorTop/SectorAnomaly；大宗/ST/ETF及其他盘中/集合竞价producer。
+- [ ] 对每个producer记录真实触发、source、authority、policy、occurrence与completion owner标识/key；区分业务状态落库、发送结果、外层闸门和子快照。共享函数/DB/类型不自动合并Unit，共享实际原子owner不得拆。
+- [ ] 明确已证实风险：PaperSell先成交后通知且共用code/day Filled；候选失效bool/快照推进及空集缺失；预检窗口结构不可达；sector独立timer；AccountMode Frozen副推不受主完成列证明。提交仅工作表追加，report task-5-report.md，独立review后进入Task6。
+
+## Task 6: 复盘、补推及side-route边界审计
+
+**文件：** 仅追加同一工作表的复盘章节。
+
+- [ ] 对13个ReviewTask逐项核对dependency、source/dispatcher/policy、自动ReviewScheduleState(date,task)、manual临时audit state、backfill durable claim/retry作用域；不同入口如共享真实decision identity需说明，不能按同一struct合并。
+- [ ] 核对R08首批新GatewayError永久/重试分类与旧二进制兼容限制；RejectedDurable授权重试、Uncertain不盲重发；NoData/Disabled/permanent Failed/ExpectedWait各自对终态的影响。
+- [ ] 核对block trade与IPO side route、LHB/chain/单股/汇总CLI边界；side route不是ReviewTask时不借用其完成状态，只有保存文件的路径排除。
+- [ ] 提交仅工作表追加，report task-6-report.md，包含每个Rxx入口/owner及无法证实项。独立review后进入Task7。
+
+## Task 7: 真实目录、证据manifest与中文生成视图
+
+**文件：** 新增docs/push-system/push-capability-catalog.v1.json、push-evidence-manifest.v1.json、push-capability-catalog.md。使用已复核Task3–Task6工作表，但仍对每条最终关系及symbol做源码核对。
+
+- [ ] 使用既定schema覆盖真实65-kind精确集合；所有非INACTIVE有source-reviewed producer，INACTIVE空producer列表有明确禁用/无caller证据。收录enum外CLI单股/汇总/chain及09:05/15:30 chain，PaperBuy/Watchdog只作未移入排除。
+- [ ] 逐producer填trigger/source/authority/policy/evidence、occurrence/completion owner，并按实际共享owner形成MigrationUnit和四时段Epics；工作表中的pending不得进入成品。目录是候选，不冻结完整迁移顺序/工期。
+- [ ] manifest冻结07781bf全部467个src Rust文件和Cargo.toml/Cargo.lock，使用已复核locator产生原始item SHA及派生行号。基线/当前字节、集合、symbol、enum和引用全部由工具核对，不自动刷新。
+- [ ] 明确运行source check、真实draft、严格检查、一次Markdown --write、--check和二次生成幂等；strict只剩PROVISIONAL/dirty，不能隐藏内容错误。记录真实时延及kind/producer/Unit/evidence/file准确数量。
+- [ ] 只提交三个成品文件，report task-7-report.md。保持PROVISIONAL；不写Foundation Ready、部署/TransportAccepted/用户已读、完整RFC/WBS/HTML/CI或未经精确WBS的工期。完成独立review后进入整批验证。
 
 ## 整批验证和交付
 
@@ -112,4 +143,4 @@ assert_includes out + err, 'source_sha_mismatch'
 
 导入核对后的格式例外：v18.4来源第219/278行、v18.5来源第109/138/142/433行原有行尾空格，保留原字节和已批准SHA；整批裸range `git diff --check`会保留这六处诊断，其他文件仍须零格式错误，不更改全局whitespace配置。v19.0原文无末尾LF；apply_patch导入时多加的唯一LF经原目标字节断言后机械移除，原文件保持只读，目标SHA重新一致。
 
-中文结果写docs/push-system/implementation-batch-2-results-2026-09-05.md，原目录implementation-status入口更新。本批按Task1→Task2→Task3顺序实施/分别review，最后对07781bf以来整批review。保留来源及先前事故参考件，分支/worktree不清理、不自动合并。
+中文结果写docs/push-system/implementation-batch-2-results-2026-09-05.md，原目录implementation-status入口更新。本批按Task1→Task7顺序实施/分别review，最后对07781bf以来整批review。保留来源及先前事故参考件，分支/worktree不清理、不自动合并。
