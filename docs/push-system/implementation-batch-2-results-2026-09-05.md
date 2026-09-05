@@ -1,6 +1,6 @@
 # 第二批推送可靠性：来源、目录与源码证据交付记录
 
-> 当前仍在实施：Task1来源治理、Task2工具、Task3入口清单、Task4新闻边界和Task5状态/交易边界已通过独立复核；Task6继续核对复盘与枚举外入口，Task7统一生成目录，本报告尚未完成整批验收。不是Foundation Ready、生产上线或全量方案完成声明。
+> 当前仍在实施：Task1–Task6的来源、工具和源码业务审计已通过独立复核；Task7正在统一生成机器目录、证据manifest与中文视图，本报告尚未完成整批验收。不是Foundation Ready、生产上线或全量方案完成声明。
 
 ## 范围与边界
 
@@ -9,7 +9,7 @@
 - 原工作区的67项混合源报告与本分支65项枚举分开。PaperBuy/Watchdog没有移入本分支，不能用原报告行号充当这里的已验证证据。
 - 本批只落实已批准的来源治理、可校验目录与稳定源码证据前置；完整RFC、WBS重算、离线HTML、CI、运行时Foundation及交易窗口晋级另有后续门禁。
 
-## 已通过的五个任务
+## 已通过的六个任务
 
 ### Task1：不可变设计来源
 
@@ -51,6 +51,12 @@ v18.2–v18.4文件自声明v20.x，v18.5自声明v20.0，记录为版本标签�
 
 源码还证实：DataMode可用`EstablishedSilently`推进`LATEST_DATA_MODE`，发送失败会清pending；独立`--push`进程在Account/Data banner初始化前运行并退出，使I01/I02/I03/D01/HoldingPlan手工入口接线存在但不可达；PaperSell先落业务成交再通知，失败后当日成交防重会阻止自然重建；候选失效结果、快照与外层双dispatcher不原子；Attribution/G5b、15:05快照警告、午盘PaperReview及板块timer均存在不按发送确认推进状态的路径。Task6已明确接收枚举外CLI和09:05/15:30产业链timer。
 
+### Task6：复盘、补推、side-route与枚举外入口
+
+复盘章节提交`ed1a702`，修订`c0a4029`。13个ReviewTask状态为7 ACTIVE、4 INACTIVE、2 STARVED；形成21个审计边界族、17个候选Unit和6个具体未决。独立复核发现并关闭了R08 typed retryability、A10来源时间错误分类、产业链timer非交易日范围、BlockTradeConfirm真实L4 kind及定位精度问题。
+
+关键校正包括：自动scheduler也构造`at_manual`，使R04自动19:00路径绕过21:00门，而R07仍等待；R12因技术K线能力常量为false而禁止新producer，但既有durable decision仍可独立恢复；backfill只扫描8个counted任务且A01明确排除，每个单任务batch仍会执行Block Trade/IPO side-route；BlockTradePriceRange上游固定传None而下游必填，当前恒拒；产业链09:05/15:30 timer没有交易日guard，发送false/Err又被内部吞为Ok，可能跨calendar date重复发送同一business date。单股/汇总/产业链CLI的文件保存和bool返回均不是durable receipt。
+
 ## Task3–Task7及整批验证（尚未完成）
 
 首次真实审计确认65个enum、467个src Rust文件加两份Cargo文件及16组源码事实，并发现旧范围未列出的`--push`手工入口与P01补偿入口。实现者拒绝用概括性owner或占位producer生成目录；现按入口/no-caller、新闻、状态驱动、复盘四个切片审计，Task7才统一生成目录、完整manifest和Markdown。这些机械数量不等于已完成生产者审计或部署验证。
@@ -65,7 +71,8 @@ v18.2–v18.4文件自声明v20.x，v18.5自声明v20.0，记录为版本标签�
 | Task3入口/无caller清单 | 10b38e9：65/65；15个无生产caller；修订复核PASS |
 | Task4新闻边界 | d15f35b：13条producer/分支；10个完成域；9个候选Unit；5个具体未决；复核PASS |
 | Task5状态/交易边界 | ce581b5：37条producer/入口；25个候选边界族/Unit；5个具体未决；复核PASS |
-| 整批最终验证/最终review | 待Task6–Task7完成后执行 |
+| Task6复盘/枚举外边界 | c0a4029：13 task（7/4/2）；21边界；17候选Unit；6未决；复核PASS |
+| 整批最终验证/最终review | 待Task7完成后执行 |
 
 Task1留下一个非阻塞Minor：不存在的root目前诊断为`catalog_missing`，不影响失败退出，但诊断可更精确；交给整批review最终定级。
 
@@ -85,6 +92,10 @@ Task1留下一个非阻塞Minor：不存在的root目前诊断为`catalog_missin
 12. 将`--push`盘中手工入口登记为“已接线但当前受阻”，不按dispatcher存在判为可用：新CLI进程在banner初始化分支之前退出；代价是后续若要恢复手工推送，必须先重构启动上下文并重新验证其与定时入口的完成owner。
 13. DataMode的模式确认状态与通知完成分层记录：`EstablishedSilently`和失败后清pending都不能作为送达证明；代价是运行时迁移不能只复用`LATEST_DATA_MODE`，需要独立的通知attempt/receipt/恢复状态。
 14. AttributionDaily与G5bAttribution只登记实际外层日期门，不虚构L4冷却：`cooldown_secs=None`直接放行且不读写冷却；代价是后续可靠化需要显式新增持久通知owner，不能依赖现有L4补偿重复或漏推。
+15. 以实际调用参数裁决复盘时间门，而不按入口名称区分自动/手动：自动attempt同样使用`at_manual`，所以R04在19:00可提前，R07仍等待；代价是修复时必须先决定这是有意策略还是接线错误，并避免一刀切取消manual override。
+16. 将R12与BlockTradePriceRange按当前能力门/必填输入判为INACTIVE，同时保留既有R12 decision恢复：避免把潜在dispatcher当活动producer；代价是恢复历史信封和创建新通知必须作为两个不同能力测试。
+17. backfill只承认源码中的8任务白名单，A01不虚构历史扫描入口；单任务batch仍执行Block Trade/IPO side-route：代价是后续要隔离side-route副作用，否则一次补推扫描可能重复触发与目标task无关的通知。
+18. 产业链09:05/15:30 occurrence同时保留business date与calendar date，显式记录无交易日guard和`Ok(false/Err)`封日：代价是可靠化需新增持久cursor、交易日门和不确定发送恢复，不能复用报告文件或内存日期状态。
 
 ## 保护与未检查项
 

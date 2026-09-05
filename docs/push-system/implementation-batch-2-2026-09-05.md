@@ -122,10 +122,10 @@ assert_includes out + err, 'source_sha_mismatch'
 
 **文件：** 仅追加同一工作表的复盘章节。
 
-- [ ] 对13个ReviewTask逐项核对dependency、source/dispatcher/policy、自动ReviewScheduleState(date,task)、manual临时audit state、backfill durable claim/retry作用域；不同入口如共享真实decision identity需说明，不能按同一struct合并。
-- [ ] 核对R08首批新GatewayError永久/重试分类与旧二进制兼容限制；RejectedDurable授权重试、Uncertain不盲重发；NoData/Disabled/permanent Failed/ExpectedWait各自对终态的影响。
-- [ ] 核对block trade与IPO side route、LHB/chain/单股/汇总CLI边界；side route不是ReviewTask时不借用其完成状态，只有保存文件的路径排除。
-- [ ] 提交仅工作表追加，report task-6-report.md，包含每个Rxx入口/owner及无法证实项。独立review后进入Task7。
+- [x] 对13个ReviewTask逐项核对dependency、source/dispatcher/policy、自动ReviewScheduleState(date,task)、manual临时audit state、backfill durable claim/retry作用域；不同入口如共享真实decision identity需说明，不能按同一struct合并。
+- [x] 核对R08首批新GatewayError永久/重试分类与旧二进制兼容限制；RejectedDurable授权重试、Uncertain不盲重发；NoData/Disabled/permanent Failed/ExpectedWait各自对终态的影响。
+- [x] 核对block trade与IPO side route、LHB/chain/单股/汇总CLI边界；side route不是ReviewTask时不借用其完成状态，只有保存文件的路径排除。
+- [x] 提交仅工作表追加，report task-6-report.md，包含每个Rxx入口/owner及无法证实项。独立review后进入Task7。
 
 ## Task 7: 真实目录、证据manifest与中文生成视图
 
