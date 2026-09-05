@@ -114,9 +114,9 @@ assert_includes out + err, 'source_sha_mismatch'
 
 **文件：** 仅追加同一工作表的状态驱动章节。
 
-- [ ] 完整核对DataMode pending/retry/confirm、HoldingPlan、T0Advice、CloseCall的counted binding与外层timer；VirtualWatch剩余路径；IntradayMarket三个producer；MarketActionAlert两入口；PaperSell盘中/盘后；CandidateBoard/CandidateInvalidated/AuctionRepush；SectorTop/SectorAnomaly；大宗/ST/ETF及其他盘中/集合竞价producer。
-- [ ] 对每个producer记录真实触发、source、authority、policy、occurrence与completion owner标识/key；区分业务状态落库、发送结果、外层闸门和子快照。共享函数/DB/类型不自动合并Unit，共享实际原子owner不得拆。
-- [ ] 明确已证实风险：PaperSell先成交后通知且共用code/day Filled；候选失效bool/快照推进及空集缺失；预检窗口结构不可达；sector独立timer；AccountMode Frozen副推不受主完成列证明。提交仅工作表追加，report task-5-report.md，独立review后进入Task6。
+- [x] 完整核对DataMode pending/retry/confirm、HoldingPlan、T0Advice、CloseCall的counted binding与外层timer；VirtualWatch剩余路径；IntradayMarket三个producer；MarketActionAlert两入口；PaperSell盘中/盘后；CandidateBoard/CandidateInvalidated/AuctionRepush；SectorTop/SectorAnomaly；大宗/ST/ETF及其他盘中/集合竞价producer。
+- [x] 对每个producer记录真实触发、source、authority、policy、occurrence与completion owner标识/key；区分业务状态落库、发送结果、外层闸门和子快照。共享函数/DB/类型不自动合并Unit，共享实际原子owner不得拆。
+- [x] 明确已证实风险：PaperSell先成交后通知且共用code/day Filled；候选失效bool/快照推进及空集缺失；预检窗口结构不可达；sector独立timer；AccountMode Frozen副推不受主完成列证明。提交仅工作表追加，report task-5-report.md，独立review后进入Task6。
 
 ## Task 6: 复盘、补推及side-route边界审计
 
