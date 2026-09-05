@@ -95,11 +95,11 @@ assert_includes out + err, 'source_sha_mismatch'
 
 **文件：** 新增docs/push-system/push-source-audit-worksheet-2026-09-05.md。它是人工源码审计工作表，不是最终machine catalog；后续Task4–Task6按独立diff追加，Task7消费并重新核对。
 
-- [ ] 以07781bf的PushKind enum为集合，工作表用可机械抽取的单表逐项列65个kind且仅一次，包含初判phase/status、真实producer入口symbol或无caller裁决、owner待核状态；一条kind多producer可列多个入口。用一次性Ruby对比工作表kind集与RustEvidence.enum_variants，失败不得提交。
-- [ ] 对INACTIVE/no-caller集合逐kind做全src负向caller审计，排除enum声明、metadata、renderer、适配表、测试和smoke；absence需记录命令/匹配分类，优先补充明确disabled/no_producer/preflight符号作为正证据。不能因旧报告说无caller就通过。
-- [ ] 收录全部已识别入口面：monitor/news/P01 scheduler、P01 compensation、--push run_daily_pushes、复盘auto/manual/backfill、CLI单股/汇总/chain和09:05/15:30 chain；仅save file的run_market_review_only不是发送producer，AlertManager无production caller仅作排除。
-- [ ] 将前次partial task-3-report中的16项已验证源码事实重新核对后写入工作表“已证实风险/关系”，并把News/状态驱动/复盘的待核owner分别指向Task4/5/6；不得把pending写成已证实完成。
-- [ ] 只提交工作表；report task-3-report.md追加集合对比、负向审计命令/结果和剩余owner清单。无真实JSON/manifest/生成Markdown，不改工具或Rust。完成独立review后才进入Task4。
+- [x] 以07781bf的PushKind enum为集合，工作表用可机械抽取的单表逐项列65个kind且仅一次，包含初判phase/status、真实producer入口symbol或无caller裁决、owner待核状态；一条kind多producer可列多个入口。用一次性Ruby对比工作表kind集与RustEvidence.enum_variants，失败不得提交。
+- [x] 对INACTIVE/no-caller集合逐kind做全src负向caller审计，排除enum声明、metadata、renderer、适配表、测试和smoke；absence需记录命令/匹配分类，优先补充明确disabled/no_producer/preflight符号作为正证据。不能因旧报告说无caller就通过。
+- [x] 收录全部已识别入口面：monitor/news/P01 scheduler、P01 compensation、--push run_daily_pushes、复盘auto/manual/backfill、CLI单股/汇总/chain和09:05/15:30 chain；仅save file的run_market_review_only不是发送producer，AlertManager无production caller仅作排除。
+- [x] 将前次partial task-3-report中的16项已验证源码事实重新核对后写入工作表“已证实风险/关系”，并把News/状态驱动/复盘的待核owner分别指向Task4/5/6；不得把pending写成已证实完成。
+- [x] 只提交工作表；report task-3-report.md追加集合对比、负向审计命令/结果和剩余owner清单。无真实JSON/manifest/生成Markdown，不改工具或Rust。完成独立review后才进入Task4。
 
 ## Task 4: 新闻、来源事实与持久发送边界审计
 
