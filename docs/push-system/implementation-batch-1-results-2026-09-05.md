@@ -1,6 +1,6 @@
 # 推送可靠性首批开发结果（2026-09-05）
 
-当前状态：两项代码修复均完成实现、任务级独立复核和整批定向验证，最终源码提交2f07ac2；整批代码审查待完成。不是完整方案或生产验收完成声明。开发区样本保全曾失败，补救披露通过不等于事故被逆转。
+当前状态：两项代码修复均完成实现、定向验证、整批代码审查及修订复核，最终源码提交90275fe。没有剩余代码审查阻塞项；不是完整方案或生产验收完成声明。开发区样本保全曾失败，补救披露通过不等于事故被逆转。
 
 ## 开发边界
 
@@ -27,7 +27,7 @@
 
 限制：失败终止只覆盖当前内存调度实例，尚未实现跨重启source-failure封锁。新代码可读旧existing_source_failure记录，但旧二进制不能解析新gateway_source标签；生产发布前需要具备兼容能力的回退制品，不能直接回退a673043后读取新审计。
 
-## 2. 告警/G5b：基线复现与实现目标
+## 2. 告警/G5b：基线复现与已实现防线
 
 基线5项alert_log旧测试全部通过，却在独立开发区写出默认生产相对路径 `reports/alerts/20260905.jsonl`（326字节，含TEST_CODE_000001）和md（278字节）。这证明“测试绿灯”并不等于“测试没有污染运行输入”。对应原08-31实际G5b污染样本，未删除任何原文件。
 
@@ -41,7 +41,7 @@
 
 ## 源码证据索引
 
-以下行号以隔离分支的源码提交为准，不适用于原目录含R-07等改动的混合工作树。表中生产代码在b31a0cf已固定，后续审查补丁仅追加测试；同时给出符号，避免后续行号漂移导致误认。
+以下行号以隔离分支最终源码90275fe为准，不适用于原目录含R-07等改动的混合工作树。同时给出符号，避免后续行号漂移导致误认。最终审查修订只增加读取被拒绝时的warning及其分支覆盖，不改变返回类型或准入策略。
 
 | 行为 | 源文件与起始行 | 可核实的代码依据 |
 | --- | --- | --- |
@@ -51,8 +51,8 @@
 | 审计稳定分类 | `src/bin/monitor/review_batch.rs:1324` | gateway能力及reason_code组成分类，transition保留完整快照 |
 | 显式临时归档 | `src/monitor/alert_log.rs:44` | AlertLog::for_test规范化路径并拒绝production子树，origin=Test |
 | 默认I/O隔离 | `src/monitor/alert_log.rs:77` | ensure_io_allowed同时检查测试进程与TradingEnv，先于创建目录/打开文件 |
-| 历史输入过滤 | `src/monitor/alert_log.rs:158` | read_today_records在生产实例跳过不合格记录及反序列化错误，并warning |
-| 来源兼容/统一准入 | `src/monitor/alert_log.rs:237` | serde默认LegacyUnknown；is_production_eligible拒绝Test及TEST_CODE前缀 |
+| 历史输入过滤 | `src/monitor/alert_log.rs:159` | read_today_records在生产实例跳过不合格记录及反序列化错误，并warning |
+| 来源兼容/统一准入 | `src/monitor/alert_log.rs:239` | serde默认LegacyUnknown；is_production_eligible拒绝Test及TEST_CODE前缀 |
 | 模型调用前拒绝 | `src/monitor/attribution_deep.rs:123` | assess先返回IneligibleRecord，provider尚未调用 |
 | 选取与输出拒绝 | `src/monitor/attribution_deep.rs:275` | top_events_for_deep先过滤再排序限额；append_deep_attribution_row:301先准入及运行环境检查再建目录 |
 
@@ -78,7 +78,7 @@ cargo test --offline --profile dev --lib monitor::alert::tests
 
 首次基线构建exit0，6m15s；旧R08 28/28、alert_log 5/5、G5b13/13通过。本批筛选测试使用dev profile复用依赖，不改默认并行。已有lib84项、lib test43项dead_code warnings；全仓cargo fmt检查存在无关既有差异，未整体格式化。完整默认并行全项目测试尚未执行，不以筛选测试冒充发布门禁。
 
-最终对源码2f07ac2由controller重新执行以上命令，采用`set -e`及`set -o pipefail`保留管道真实退出状态，整组exit0：
+整批对源码2f07ac2由controller重新执行以上命令，采用`set -e`及`set -o pipefail`保留管道真实退出状态，整组exit0；之后90275fe的增量验证另列，不把旧版本测试冒充对新版本全量重跑：
 
 | 命令/过滤器 | 结果 |
 | --- | --- |
@@ -95,6 +95,10 @@ cargo test --offline --profile dev --lib monitor::alert::tests
 四个改动Rust文件的`rustfmt --edition 2021 --check`、`git diff --check a673043..HEAD`及工作区diff检查exit0。本批两份文档的2条相对链接、10条源码行号存在/边界检查通过；这只是定位检查，语义证据由源码与独立review核实。原目录冻结分析校验器`ruby docs/push-system/verify-reanalysis.rb`通过166项；它仍对应原混合源快照，不与隔离分支构建证据混算。
 
 最终整组命令执行前后，当前非原始开发参考件JSONL SHA保持`7b065405571d49bb898ec997cf7fe92d43e68c5dbbfe6b3d4f9de0b32aee5470`、MD SHA保持`69265ebc6172a80cbf47cb2beade4420f10186e72915da32d170386dc2427519`。此结果仅证明这轮修复后测试没有继续改写，不能补回事故前的原始保真。
+
+最终整批审查覆盖a673043至320dba1：未发现Critical/Important代码问题，唯一Minor是默认读取被守卫拦截时缺少拒绝原因日志。90275fe补上read_today/read_today_records的warning，并让既有公开默认I/O测试同时覆盖两条拒绝分支。修订后alert回归9/9、限定格式检查通过；controller对同一源码增量monitor构建exit0（3m41s，84项既有warnings），四个改动源文件格式及diff检查通过。现存非原始参考件前后哈希仍一致。
+
+原最终reviewer对320dba1至90275fe执行一次限定复核：唯一Minor已关闭，未发现新破坏，Spec/quality通过。日志断言没有安装全局logger，测试验证两条公开拒绝分支；warning内容由源码复核，不声称用测试捕获了日志文本。源码由实施者修改，报告完成后controller只接手Git提交元数据，没有绕过源码复核。
 
 ## 4. 未提交改动如何处理
 
