@@ -34,6 +34,8 @@
 
 所有非INACTIVE kind必须有source-reviewed producer；有renderer但不可达的producer保留明确不可达/缺输入语义。共享kind不强行合并producer；共享原子completion owner的producer必须放在同一Unit并解释原因。completion owner必须按实际状态标识及其occurrence/key范围区分，不能因为处于同一函数、同一状态类型或同一数据库而合并。目录是源审计候选，不自动冻结完整迁移顺序或工期。
 
+`rust_impl`的symbol细化为去掉`impl`关键字和末尾左花括号后的完整impl头，仅折叠空白、保留泛型/trait/for/where。支持普通inherent/trait及常见泛型头；同规范化头重复时失败，不按类型名任取一个impl。不支持或不能可靠定位的形状必须明确失败；这是词法定位器而非完整Rust解析器。实际目录优先引用精确下游函数及枚举，不要求为了使用impl而扩大证据范围。
+
 `scope`必须明确隔离代码基线、源码审计≠部署证明、完整RFC/运行时Foundation/离线HTML/CI/工期尚未完成。`excluded_worktree_additions`精确记录PaperBuy/Watchdog及“仅原混合工作树存在，本分支未移入”的原因，不给它们伪造本分支源码证据。
 
 ## Task 1: 不可变设计来源与校验接口
@@ -74,37 +76,35 @@ assert_includes out + err, 'source_sha_mismatch'
 - [x] `ruby scripts/architecture-docs/test/source_catalog_test.rb`及`ruby scripts/architecture-docs/check-sources.rb --root .`通过；项目级确认九份固定hash/批准表字节相同，所有导入路径可纳管。Ruby语法及`git diff --check`通过。
 - [x] 仅提交本任务文件，报告写task-1-report.md，包含RED/GREEN命令输出、源导入前后hash、剩余未交付的整体门禁。不要运行或改写原工作区的归档、源码、索引。
 
-## Task 2: 65-kind源审计目录、稳定symbol证据和漂移门禁
+## Task 2: 稳定symbol定位、目录校验和渲染工具
 
-**文件：** 新增docs/push-system/push-capability-catalog.v1.json、push-evidence-manifest.v1.json、push-capability-catalog.md；scripts/architecture-docs/rust_evidence.rb、catalog.rb、check-catalog.rb、render-catalog.rb、test/catalog_test.rb。可复用Task1的SourceCatalog，不改变其公共返回合同。不得改Rust源码来迎合目录或旧行号。
+**拆分说明：** 原Task2的工具和真实业务审计拆成Task2→Task3顺序实施/独立复核，原验收要求全部保留。Task2不生成真实目录来填补尚未审计的业务判断。
 
-输入：本分支src/bin/monitor/notify.rs真实enum及生产源码。原工作区all-push-kinds-2026-09-05.md、comprehensive-reanalysis-2026-09-05.md、蓝图§24只提供审计线索；必须重新查本分支当前代码，不能把其混合源行号或历史逻辑当已验证事实。尤其首批已修的R08/G5b不得继续写成原错误仍存在。
+**文件：** 新增scripts/architecture-docs/rust_evidence.rb、catalog.rb、check-catalog.rb、render-catalog.rb、test/catalog_test.rb。复用已复核Task1的SourceCatalog.validate(root)，不改变其错误数组合同。真实catalog/manifest/Markdown由Task3交付。
 
-- [ ] 建立`ArchitectureDocs::RustEvidence`，按Ruby读取Rust源码，屏蔽普通/原始字符串、字符、行/嵌套块注释后做声明和配对花括号定位；不要用第一条相似文本或原行号替代symbol。同名声明歧义必须失败。证据哈希使用原始完整item字节（含声明行至闭合行，统一包含实际行结束符），而不是去注释后的文本。
-- [ ] 先通过公开check-catalog CLI的最小临时Git仓库测试正常目录成功（实现前失败），再逐项实现/增加负例。fixture使用真实`git -C fixture_root init/add/commit`且仅设置该次commit的`-c user.*`参数，不改用户git配置；Root作为参数而非Dir.chdir。
+- [x] 建立ArchitectureDocs::RustEvidence，屏蔽普通/原始字符串、字符、行/嵌套块注释后做声明和配对花括号定位。同名歧义失败；按文件与接口合同支持rust_fn/rust_enum/rust_impl/rust_mod，完整原始item字节（声明行至闭合行，包括实际换行）产生SHA/行号。不得拿行号、相似文本或去注释后字节当身份；常见泛型/生命周期和不支持形状的失败关闭需有测试。
+- [x] 先通过公开check-catalog CLI的最小临时Git仓库测试正常目录成功（实现前失败），再逐项增加负例。fixture用Dir.mktmpdir/File.binwrite和真实git -C fixture_root init/add/commit；仅当次commit的-c user.*参数，不改全局git配置、cwd或env。fixture无需真实65项，但需完整108题source校验输入。
+- [x] 冻结逻辑对manifest中的文件逐一比较基线Git字节与当前字节，files集合精确覆盖基线全部src/**/*.rs及存在的Cargo.toml/Cargo.lock，当前同范围集合相同；新文件、隐藏目录文件与注释变化也不得绕过。Git基线须完整真实commit且为当前HEAD祖先，不在检查时自动刷新任何期望。
+- [x] ArchitectureDocs::Catalog.validate(root, strict:)返回原因码字符串错误数组并调用SourceCatalog；验证既定schema所有字段类型/状态/引用、enum精确集合、kind→producer→Unit双向一致、共享completion-owner的Unit归属、phase合法、排除项不在enum、evidence无重复/悬挂/歧义。严格模式另拒绝PROVISIONAL和非ignored脏状态；draft仅跳过这两个条件。文件与symbol错误必须同时可诊断，不被状态检查掩盖。
+- [x] 公开CLI负例覆盖enum缺失/新增/重复、catalog重复kind、缺producer/owner、共享owner拆Unit、悬挂evidence、source/源码字节漂移（含注释）、symbol改名/重复、伪造行号/哈希/无效commit/非祖先、字符串/注释中假声明、非法路径和symlink逃逸、严格PROVISIONAL/dirty及draft内容漂移。无效JSON、非法结构与未知参数明确失败；CLI未知参数exit2、验证失败exit1、有效draft exit0。
+- [x] render-catalog.rb按四时段生成kind/status/producer/Unit/具体symbol证据，并单列enum外路径和原工作树未移入项。--root ROOT --check只读比对，陈旧/缺失exit1；--write仅写该根内docs/push-system/push-capability-catalog.md，不重写证据。临时根测试两次生成幂等。
+- [x] 自审后完整运行catalog_test.rb与来源测试一次、新Ruby语法及新文件diff --check通过。真实根check-sources应通过；真实check-catalog在Task3尚未交付时必须明确报告catalog/manifest缺失，不为了使其通过造假目录。CLI输出明确NOTCHECKED完整RFC/WBS/离线HTML/CI/运行时Foundation/部署/真实接收。
+- [x] 只提交五个工具/测试文件，不force-add ignored scratch、不提交controller plan。task-2-report.md记录RED/GREEN命令/输出、公开接口及剩余真实业务目录任务。Task2 BASE=6412b58，完成工具独立review后才进入Task3。
 
-```ruby
-out, err, result = Open3.capture3(RbConfig.ruby, CHECK_CATALOG,
-                                '--root', fixture_root, '--draft')
-assert result.success?, out + err
-# fixture的enum新增一项，但不改catalog；草稿模式同样不能豁免。
-File.binwrite(File.join(fixture_root, 'src/notify.rs'),
-              "pub enum PushKind {\n    One,\n    Two,\n}\n")
-out, err, result = Open3.capture3(RbConfig.ruby, CHECK_CATALOG,
-                                '--root', fixture_root, '--draft')
-refute result.success?
-assert_includes out + err, 'enum_coverage_mismatch'
-```
+## Task 3: 65-kind真实源审计目录与证据交付
 
-- [ ] 使用既定schema人工审计所有实际enum项。kind集与enum精确相等，重复/缺项失败；本基线期望65，不能把校验器写成永远只接受65。phase/status来自源码可达性及明确禁用/缺源/opt-in条件，不由level/展示注册表推断ACTIVE。
-- [ ] 逐producer记录trigger、source、authority、policy、occurrence和completion owner，每个关系都关联实际symbol证据。强制核查：NewsToIdea普通D01与NewsAI；IntradayMarket盘中概览/09:10不可达预检/15:05持仓过期；MarketActionAlert账户模式/交易异常；PaperSell盘中/盘后；CandidateBoard、CandidateInvalidated、AuctionRepush共享tick/completion；SectorTop/SectorAnomaly各自timer；复盘及大宗/业绩家族。不得用一个main函数引用代替dispatch/source/finalize等全部语义证据。
-- [ ] 收录enum外生产路径：CLI单股/汇总、09:05/15:30产业链报告。它们用producer记录但kinds允许空数组且有明确原因；不能为了凑65漏掉非enum路径。无生产caller的AlertManager只作排除说明，不虚构为活跃第五条路径。
-- [ ] 每个证据文件冻结07781bf中的Git字节SHA并与工作区一致；locator产生symbol哈希和行号。Git基线须为真实完整commit且为当前HEAD祖先；新commit仅改文档不要求改代码基线。生产代码更改必须让旧manifest失败，不能在检查时自动刷新期望值。
-- [ ] `ArchitectureDocs::Catalog.validate(root, strict:)`返回原因码错误数组，调用SourceCatalog；验证所有schema字段类型/状态/引用、enum集、kind→producer→Unit双向一致、同completion-owner的Unit归属、phase合法、排除项不在enum、evidence完整且无重复/悬挂/歧义。严格模式另检查PROVISIONAL和非ignored脏状态，draft仅跳过这两个条件。文件SHA与symbol SHA失败必须都可诊断，不能被状态检查提前掩盖。
-- [ ] 覆盖负例：enum缺失/新增/重复、catalog重复kind、缺producer/owner、共享owner被拆Unit、悬挂evidence、source/代码字节漂移（含注释）、symbol改名/重复、伪造行号/哈希/无效commit/非祖先、字符串及注释中的假声明、非法路径、严格拒绝PROVISIONAL/dirty但draft也拒绝实际内容漂移。无效JSON和未知CLI参数应明确失败，不回退空目录成功。
-- [ ] Markdown从JSON生成，按四时段列kind/status/producer/Unit和具体证据符号，并单列enum外和原工作树未移入项。`render-catalog.rb --root ROOT --check`只读比较、陈旧/缺失exit1；`--write`只写本文件，不重写证据。测试产物放临时根，真实目录只在明确生成交付时写。
-- [ ] `ruby scripts/architecture-docs/test/catalog_test.rb`、来源测试、两条draft校验和Markdown --check均通过；严格目录检查应明确仅剩PROVISIONAL/dirty条件，不存在内容/漂移失败。输出必须声明没有检查完整RFC/WBS/离线HTML/CI/运行时Foundation/部署/真实接收。
-- [ ] 仅提交本任务文件，报告task-2-report.md列准确kind/producer/Unit/证据数量，源审计与部署证据分开；不得新增工期总数或Foundation Ready标签。若某条无法在此基线证实，报告具体阻点让controller处理，不编造完成owner或宣布全部已证实。
+**文件：** 新增docs/push-system/push-capability-catalog.v1.json、push-evidence-manifest.v1.json、push-capability-catalog.md。使用Task2已经独立复核的CLI/locator，原则上不改工具接口；如发现真实阻点，向controller报告具体证据，不改Rust源码迎合工具或目录。
+
+输入：本分支src/bin/monitor/notify.rs真实enum及生产源码。原工作区all-push-kinds-2026-09-05.md、comprehensive-reanalysis-2026-09-05.md、蓝图§24只提供审计线索；必须重新查本分支07781bf代码，不能把混合源行号或历史逻辑当已验证事实。首批R08/G5b修复以当前代码为准。
+
+- [ ] 使用既定schema人工审计所有实际enum项，kind集与enum精确相等；本基线预期65，校验器不能写死65。phase/status根据真实可达性与禁用/缺源/opt-in条件，不由level/展示注册表推断ACTIVE；没有producer的INACTIVE使用空列表和明确禁用/无caller证据。
+- [ ] 逐producer记录trigger、source、authority、policy、occurrence及实际completion owner，各关系关联真实symbol。强制核查NewsToIdea普通D01与NewsAI；IntradayMarket盘中概览/09:10不可达预检/15:05持仓过期；MarketActionAlert账户冻结/OrderUpdate；PaperSell盘中/盘后；CandidateBoard/CandidateInvalidated/AuctionRepush共享外层tick及子快照；SectorTop/SectorAnomaly各自timer；复盘、大宗及业绩家族。不能用一个main函数代替全部dispatch/source/finalize证据。
+- [ ] 收录enum外CLI单股/汇总、产业链CLI及09:05/15:30定时报表。producer的kinds可为空但需说明原因；无生产caller的AlertManager只作排除说明。原工作树PaperBuy/Watchdog仅记录未移入，不伪造本分支证据。
+- [ ] 按producer/occurrence/completion owner构建MigrationUnit及phase Epics，共享实际owner的producer不可拆分；同函数/同状态类型/同数据库不等于共享owner。复盘自动/手动/历史补推等入口按真实状态作用域说明；无独立通知游标的CLI明示缺失，不能虚构新authority。
+- [ ] evidence manifest冻结07781bf386aafdf202851ae928efee8920387058的全部src Rust文件与Cargo元数据集合；使用已复核locator产生原始item哈希和派生行号，当前字节必须一致。不得手填虚假行号、盲取同名首项、在检查时自动刷新期望；人工语义审计与机器结构一致性检查明确区分。
+- [ ] 通过现有工具验证真实来源和目录draft；严格检查只能剩PROVISIONAL/dirty而非隐藏内容错误。明确生成一次Markdown，再执行--check和二次生成幂等；Markdown须能看到四时段、逐producer具体业务关系及symbol证据、enum外路径、已知风险和范围限制，不仅是kind名称表。
+- [ ] 只提交三个业务目录/证据/Markdown文件。task-3-report.md报告准确kind/producer/Unit/evidence/file数量、源码审计证据、CLI命令/输出、无法证实的具体关系。保持PROVISIONAL，不新增工期总数或Foundation Ready标签，不将源码接线当部署/TransportAccepted/用户已读证明。
+- [ ] 若某条逻辑、owner或lexer定位不能在此基线证实，报告具体阻点由controller处理，不用概括性占位文案宣布全量已核验。完成独立spec+quality review后进入整批验证与最终review。
 
 ## 整批验证和交付
 
@@ -112,4 +112,4 @@ assert_includes out + err, 'enum_coverage_mismatch'
 
 导入核对后的格式例外：v18.4来源第219/278行、v18.5来源第109/138/142/433行原有行尾空格，保留原字节和已批准SHA；整批裸range `git diff --check`会保留这六处诊断，其他文件仍须零格式错误，不更改全局whitespace配置。v19.0原文无末尾LF；apply_patch导入时多加的唯一LF经原目标字节断言后机械移除，原文件保持只读，目标SHA重新一致。
 
-中文结果写docs/push-system/implementation-batch-2-results-2026-09-05.md，原目录implementation-status入口更新。本批按Task1→Task2顺序实施/分别review，最后对07781bf以来整批review。保留来源及先前事故参考件，分支/worktree不清理、不自动合并。
+中文结果写docs/push-system/implementation-batch-2-results-2026-09-05.md，原目录implementation-status入口更新。本批按Task1→Task2→Task3顺序实施/分别review，最后对07781bf以来整批review。保留来源及先前事故参考件，分支/worktree不清理、不自动合并。
