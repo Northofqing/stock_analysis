@@ -2323,3 +2323,243 @@ fn w06_catalog_queries_preserve_enum_and_external_producer_registrations() {
     assert_eq!(chain_unit.id().as_str(), "MU-chain-preopen");
     assert_eq!(catalog.producers_for_unit(chain_unit.id()), vec![chain]);
 }
+
+fn w06_mutated_catalog<F>(
+    mutate: F,
+) -> std::result::Result<super::MachineCatalog, super::MachineCatalogError>
+where
+    F: FnOnce(&mut serde_json::Value),
+{
+    let mut value: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../docs/push-system/push-capability-catalog.v1.json"
+    ))
+    .unwrap();
+    mutate(&mut value);
+    let bytes = serde_json::to_vec(&value).unwrap();
+    let expected = super::ExactBytes::new(bytes.clone()).sha256().clone();
+    super::MachineCatalog::parse_v1_exact(&bytes, &expected)
+}
+
+#[test]
+fn w06_catalog_rejects_header_count_status_and_sensitive_parse_drift() {
+    let bundled = include_bytes!("../../../docs/push-system/push-capability-catalog.v1.json");
+    assert!(matches!(
+        super::MachineCatalog::parse_v1_exact(bundled, &digest('f')),
+        Err(super::MachineCatalogError::DigestMismatch { .. })
+    ));
+    assert!(matches!(
+        w06_mutated_catalog(|catalog| catalog["schema_version"] = serde_json::json!(2)),
+        Err(super::MachineCatalogError::UnsupportedSchemaVersion { actual: 2 })
+    ));
+    assert!(matches!(
+        w06_mutated_catalog(|catalog| catalog["status"] = serde_json::json!("CURRENT")),
+        Err(super::MachineCatalogError::UnsupportedCatalogStatus)
+    ));
+    assert!(matches!(
+        w06_mutated_catalog(|catalog| {
+            catalog["producers"].as_array_mut().unwrap().pop();
+        }),
+        Err(super::MachineCatalogError::CountMismatch {
+            entity: super::CatalogEntity::Producer,
+            expected: 102,
+            actual: 101,
+        })
+    ));
+    assert!(matches!(
+        w06_mutated_catalog(|catalog| {
+            let active = catalog["kinds"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|kind| kind["status"] == "ACTIVE")
+                .unwrap();
+            active["status"] = serde_json::json!("INACTIVE");
+        }),
+        Err(super::MachineCatalogError::StatusCountMismatch {
+            status: super::CatalogStatus::Active,
+            expected: 36,
+            actual: 35,
+        })
+    ));
+
+    let malformed = br#"{"trigger":"catalog-secret""#;
+    let malformed_sha = super::ExactBytes::new(malformed.to_vec()).sha256().clone();
+    let error = super::MachineCatalog::parse_v1_exact(malformed, &malformed_sha).unwrap_err();
+    assert!(matches!(
+        error,
+        super::MachineCatalogError::InvalidJson { .. }
+    ));
+    assert!(!format!("{error:?}").contains("catalog-secret"));
+}
+
+#[test]
+fn w06_catalog_rejects_kind_producer_and_enum_external_drift() {
+    assert!(matches!(
+        w06_mutated_catalog(|catalog| {
+            let kind = catalog["kinds"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|kind| kind["kind"] == "PreopenNewsHot")
+                .unwrap();
+            kind["producer_ids"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|id| id != "p01-scheduled");
+        }),
+        Err(super::MachineCatalogError::RelationshipMismatch {
+            relation: super::CatalogRelation::KindProducer,
+            ref id,
+        }) if id == "PreopenNewsHot"
+    ));
+
+    assert!(matches!(
+        w06_mutated_catalog(|catalog| {
+            let producer = catalog["producers"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|producer| producer["id"] == "chain-preopen-timer")
+                .unwrap();
+            producer["kinds"] = serde_json::json!(["IndustryChain"]);
+        }),
+        Err(super::MachineCatalogError::EnumExternalCountMismatch {
+            expected: 10,
+            actual: 9,
+        })
+    ));
+
+    assert!(matches!(
+        w06_mutated_catalog(|catalog| {
+            let producer = catalog["producers"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|producer| producer["id"] == "p01-scheduled")
+                .unwrap();
+            producer["kinds"] = serde_json::json!(["PreopenNewsHot", "DailyReport"]);
+        }),
+        Err(super::MachineCatalogError::ProducerKindCardinality {
+            ref producer_id,
+            actual: 2,
+        }) if producer_id == "p01-scheduled"
+    ));
+}
+
+#[test]
+fn w06_catalog_rejects_unit_reverse_owner_family_and_phase_drift() {
+    let mutate_unit =
+        |catalog: &mut serde_json::Value, unit_id: &str, field: &str, value: serde_json::Value| {
+            let unit = catalog["migration_units"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|unit| unit["id"] == unit_id)
+                .unwrap();
+            unit[field] = value;
+        };
+
+    assert!(matches!(
+        w06_mutated_catalog(|catalog| {
+            mutate_unit(
+                catalog,
+                "MU-p01",
+                "producer_ids",
+                serde_json::json!(["p01-compensation", "startup-resume-preopen-news-hot"]),
+            );
+        }),
+        Err(super::MachineCatalogError::RelationshipMismatch {
+            relation: super::CatalogRelation::UnitProducer,
+            ref id,
+        }) if id == "MU-p01"
+    ));
+    assert!(matches!(
+        w06_mutated_catalog(|catalog| {
+            mutate_unit(
+                catalog,
+                "MU-p01",
+                "completion_owner",
+                serde_json::json!("different owner"),
+            );
+        }),
+        Err(super::MachineCatalogError::RelationshipMismatch {
+            relation: super::CatalogRelation::CompletionOwner,
+            ref id,
+        }) if id == "MU-p01"
+    ));
+    assert!(matches!(
+        w06_mutated_catalog(|catalog| {
+            mutate_unit(
+                catalog,
+                "MU-p01",
+                "occurrence_families",
+                serde_json::json!(["different occurrence"]),
+            );
+        }),
+        Err(super::MachineCatalogError::RelationshipMismatch {
+            relation: super::CatalogRelation::OccurrenceFamilies,
+            ref id,
+        }) if id == "MU-p01"
+    ));
+    assert!(matches!(
+        w06_mutated_catalog(|catalog| {
+            mutate_unit(
+                catalog,
+                "MU-p01",
+                "phase_epics",
+                serde_json::json!(["盘中"]),
+            );
+        }),
+        Err(super::MachineCatalogError::RelationshipMismatch {
+            relation: super::CatalogRelation::PhaseEpics,
+            ref id,
+        }) if id == "MU-p01"
+    ));
+}
+
+#[test]
+fn w06_catalog_rejects_duplicate_owner_and_duplicate_or_empty_members() {
+    assert!(matches!(
+        w06_mutated_catalog(|catalog| {
+            let units = catalog["migration_units"].as_array_mut().unwrap();
+            let first_owner = units[0]["completion_owner"].clone();
+            units[1]["completion_owner"] = first_owner;
+        }),
+        Err(super::MachineCatalogError::RelationshipMismatch {
+            relation: super::CatalogRelation::DuplicateCompletionOwner,
+            ..
+        })
+    ));
+    assert!(matches!(
+        w06_mutated_catalog(|catalog| {
+            let producer = catalog["producers"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|producer| producer["id"] == "p01-scheduled")
+                .unwrap();
+            producer["phase_epics"] = serde_json::json!(["盘前", "盘前"]);
+        }),
+        Err(super::MachineCatalogError::DuplicateMember {
+            entity: super::CatalogEntity::Producer,
+            field: "phase_epics",
+            ref id,
+        }) if id == "p01-scheduled"
+    ));
+    assert!(matches!(
+        w06_mutated_catalog(|catalog| {
+            let producer = catalog["producers"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|producer| producer["id"] == "p01-scheduled")
+                .unwrap();
+            producer["phase_epics"] = serde_json::json!([]);
+        }),
+        Err(super::MachineCatalogError::EmptyMembers {
+            entity: super::CatalogEntity::Producer,
+            field: "phase_epics",
+            ref id,
+        }) if id == "p01-scheduled"
+    ));
+}
