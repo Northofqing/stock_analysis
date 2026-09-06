@@ -139,7 +139,7 @@ assert_includes out + err, 'source_sha_mismatch'
 
 ## 整批验证和交付
 
-**完成状态：** 本批来源、目录、工具、生成视图与独立双轴审查已完成；最终HEAD为`767a76e7deeeca4022133c940d13ba4930789529`。目录保持PROVISIONAL，严格检查仅因两个JSON的发布状态失败，不是内容失败。运行时Foundation、完整RFC/WBS、离线HTML、CI、部署、真实接收和全套Rust测试仍不属于本批完成范围。
+**完成状态：** 本批来源、目录、工具、生成视图与独立双轴审查已完成；最终技术审查基线为`767a76e7deeeca4022133c940d13ba4930789529`，其后仅提交结果收尾文档。目录保持PROVISIONAL，严格检查仅因两个JSON的发布状态失败，不是内容失败。运行时Foundation、完整RFC/WBS、离线HTML、CI、部署、真实接收和全套Rust测试仍不属于本批完成范围。
 
 源码始终保持07781bf。运行两个Ruby测试文件、来源校验、目录draft、Markdown freshness、两次生成幂等、所有新Ruby语法、git diff --check；严格失败必须明确为PROVISIONAL/dirty而非掩盖内容错误。全套运行时Rust测试、全量RFC/WBS/离线HTML/CI不在本批验收内，不复用首批绿灯宣称它们完成。
 
