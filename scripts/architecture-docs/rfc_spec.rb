@@ -848,14 +848,25 @@ module ArchitectureDocs
       return false unless bytes
       workflow = YAML.safe_load(bytes)
       return false unless workflow.is_a?(Hash) && workflow['jobs'].is_a?(Hash)
+      # v1 不解析继承 defaults：任何 workflow/job defaults 均需另行扩展合同。
+      # 这里只证明保守的本地执行形状，不等于远端 Actions 已运行或通过。
+      return false if workflow.key?('defaults')
       workflow['jobs'].values.any? do |job|
-        job.is_a?(Hash) && job['if'] != false && job['steps'].is_a?(Array) && job['steps'].any? do |step|
-          step.is_a?(Hash) && !step.key?('uses') && step['if'] != false && step['run'].is_a?(String) &&
+        ci_execution_options?(job) && job['steps'].is_a?(Array) && job['steps'].any? do |step|
+          ci_execution_options?(step) && !step.key?('uses') && step['run'].is_a?(String) &&
             step['run'].strip == 'ruby scripts/architecture-docs/check.rb --check'
         end
       end
     rescue Psych::Exception, ArgumentError
       false
+    end
+
+    def ci_execution_options?(scope)
+      scope.is_a?(Hash) &&
+        (!scope.key?('if') || scope['if'].equal?(true)) &&
+        (!scope.key?('continue-on-error') || scope['continue-on-error'].equal?(false)) &&
+        (!scope.key?('shell') || %w[bash sh].include?(scope['shell'])) &&
+        !scope.key?('defaults') && !scope.key?('working-directory')
     end
 
     def content_errors(root)

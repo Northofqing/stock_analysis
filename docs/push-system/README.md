@@ -2,11 +2,11 @@
 
 状态：`PROVISIONAL`。本批输入冻结日期为 `2026-09-06`。源码接线、历史统计、原工作区文档和拟议设计必须分开阅读；它们不等于部署证明、远端 `TransportAccepted` 或用户已读。
 
-第三批 RFC/SQL/WBS 规格与机器校验候选完成（独立整批审查前）。[第三批交接结果](implementation-batch-3-results-2026-09-06.md) 记录干净 checker HEAD 的 317 runs / 4152 assertions、六条内容门禁和临时 SQLite 证据。独立整批审查待 Controller 执行，不能据此提升发布状态。
+第三批 RFC/SQL/WBS 仍为交接候选。[第三批交接结果](implementation-batch-3-results-2026-09-06.md) 记录 clean HEAD 的 fresh 测试、六条内容门禁、临时 SQLite 证据及已知审查发现的修复进度。最终整批复审待 Controller 执行，不能据此提升发布状态。
 
 ## 事实边界与阅读顺序
 
-1. [已批准决策](grill-decisions-2026-09-02.md) 与 [设计来源目录](design-source-catalog.v1.json) 记录设计约束及来源裁决。
+1. [已批准决策](grill-decisions-2026-09-02.md) 与 [设计来源目录](../../design-source-catalog.v1.json) 记录设计约束及来源裁决。
 2. [65-kind 能力目录](push-capability-catalog.md)、[机器目录](push-capability-catalog.v1.json) 和 [源码证据 manifest](push-evidence-manifest.v1.json) 记录隔离分支在 Rust 基线 `07781bf386aafdf202851ae928efee8920387058` 的源码接线。
 3. [RFC 输入 manifest](rfc-input-manifest.v1.json) 冻结下列八份原工作区输入的原始字节、尺寸、SHA-256、角色与冲突。冻结不提升其事实权限。
 4. [实施 RFC](push-system-implementation-rfc.md) 定义身份、应用结果、完成权威、跨库恢复、调度/readiness、shadow/activation/operator、保留期与验收合同；[独立 SQLite CLI 规格](push-system-foundation.v1.sql) 与 RFC 嵌入逐字节一致，仅在临时数据库验证。

@@ -69,6 +69,67 @@ class RfcSpecTest < Minitest::Test
     end
   end
 
+  ci_execution_bypasses = {
+    'job_expression_false'=>['job', "if: '${{ false }}'"],
+    'step_expression_false'=>['step', "if: '${{ false }}'"],
+    'job_boolean_false'=>['job', 'if: false'],
+    'job_string_true'=>['job', "if: 'true'"],
+    'step_string_true'=>['step', "if: 'true'"],
+    'job_null_if'=>['job', 'if: null'],
+    'step_null_if'=>['step', 'if: null'],
+    'job_continue'=>['job', 'continue-on-error: true'],
+    'step_continue'=>['step', 'continue-on-error: true'],
+    'job_continue_expression'=>['job', "continue-on-error: '${{ false }}'"],
+    'step_continue_string'=>['step', "continue-on-error: 'false'"],
+    'step_echo_shell'=>['step', 'shell: echo {0}'],
+    'step_shell_expression'=>['step', "shell: '${{ matrix.shell }}'"],
+    'step_shell_null'=>['step', 'shell: null'],
+    'step_working_directory'=>['step', 'working-directory: /tmp'],
+    'step_working_directory_dot'=>['step', 'working-directory: .'],
+    'workflow_default_shell'=>['workflow', "defaults:\n  run:\n    shell: echo {0}"],
+    'job_default_shell'=>['job', "defaults:\n  run:\n    shell: echo {0}"],
+    'workflow_default_directory'=>['workflow', "defaults:\n  run:\n    working-directory: /tmp"],
+    'job_default_directory'=>['job', "defaults:\n  run:\n    working-directory: /tmp"],
+    'workflow_defaults_null'=>['workflow', 'defaults: null'],
+    'job_defaults_empty'=>['job', 'defaults: {}'],
+    'workflow_unsupported_defaults'=>['workflow', "defaults:\n  unknown: true"],
+    'job_unsupported_defaults'=>['job', "defaults:\n  run:\n    unknown: true"]
+  }
+  ci_execution_bypasses.each do |name, pair|
+    define_method("test_wave2_ci_execution_rejects_#{name}") do
+      scope, fragment = pair
+      with_fixture do |root|
+        workflow = "jobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ruby scripts/architecture-docs/check.rb --check\n"
+        case scope
+        when 'workflow'
+          workflow = fragment + "\n" + workflow
+        when 'job'
+          workflow = workflow.sub("    steps:\n", fragment.lines.map { |line| '    ' + line }.join.rstrip + "\n    steps:\n")
+        when 'step'
+          workflow += fragment.lines.map { |line| '        ' + line }.join.rstrip + "\n"
+        end
+        FileUtils.mkdir_p(File.join(root, '.github/workflows'))
+        File.write(File.join(root, '.github/workflows/ci.yml'), workflow)
+        assert_cli_error(root, 'ci_rfc_gate_missing', '--check')
+      end
+    end
+  end
+
+  def test_wave2_ci_execution_accepts_minimal_bash_sh_and_explicit_safe_booleans
+    [nil, 'bash', 'sh'].each do |shell|
+      with_fixture do |root|
+        FileUtils.mkdir_p(File.join(root, '.github/workflows'))
+        step_shell = shell ? "        shell: #{shell}\n" : ''
+        File.write(File.join(root, '.github/workflows/ci.yml'),
+          "jobs:\n  docs:\n    if: true\n    continue-on-error: false\n    runs-on: ubuntu-latest\n    steps:\n      - if: true\n        continue-on-error: false\n        run: ruby scripts/architecture-docs/check.rb --check\n" + step_shell)
+        out, err, status = Open3.capture3(RbConfig.ruby, CLI, '--root', root, '--check')
+        assert_equal 1, status.exitstatus, out + err
+        assert_equal %w[rfc_status_provisional wbs_status_provisional rfc_html_missing], out.lines.map(&:strip)
+        assert_empty err
+      end
+    end
+  end
+
   def test_strict_release_artifacts_reject_directories_and_symlink_paths
     {'docs/push-system/push-system-implementation-rfc.html' => 'rfc_html_missing',
      '.github/workflows/ci.yml' => 'ci_rfc_gate_missing'}.each do |relative, reason|
