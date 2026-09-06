@@ -9,6 +9,7 @@ use super::Sha256Digest;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum CanonicalValue {
     Null,
+    Bool(bool),
     String(String),
     Unsigned(u64),
     Array(Vec<CanonicalValue>),
@@ -56,6 +57,11 @@ fn write_json_object(output: &mut Vec<u8>, fields: &BTreeMap<&'static str, Canon
 fn write_json_value(output: &mut Vec<u8>, value: &CanonicalValue) {
     match value {
         CanonicalValue::Null => output.extend_from_slice(b"null"),
+        CanonicalValue::Bool(value) => output.extend_from_slice(if *value {
+            b"true".as_slice()
+        } else {
+            b"false".as_slice()
+        }),
         CanonicalValue::String(value) => write_json_string(output, value),
         CanonicalValue::Unsigned(value) => output.extend_from_slice(value.to_string().as_bytes()),
         CanonicalValue::Array(values) => {

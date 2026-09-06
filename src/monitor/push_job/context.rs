@@ -6,6 +6,7 @@ use chrono::NaiveDate;
 
 use super::canonical::{canonical_digest, canonical_preimage, CanonicalValue};
 use super::delivery::TemplateVersion;
+use super::facts::PreparationCapture;
 use super::facts::{source_ref_value, ExternalId, SourceProvider, SourceRef, SourceRefId};
 use super::identity::{derive_occurrence_id, namespace_value, validate_text};
 use super::{
@@ -251,6 +252,14 @@ impl RunContextFactory {
     pub(super) fn expected_source_contract_id(&self) -> &SourceContractId {
         &self.binding.source_contract_id
     }
+
+    pub(crate) fn begin_capture(&self, input: RunContextInput) -> Result<PreparationCapture> {
+        let context = self.build_context(input)?;
+        Ok(PreparationCapture::new(
+            context,
+            self.expected_source_contract_id().clone(),
+        ))
+    }
 }
 
 fn trigger_matches(binding: &CatalogRunBinding, trigger: &Trigger) -> bool {
@@ -471,7 +480,7 @@ pub(super) enum ContextFixtureCase {
 }
 
 #[cfg(test)]
-pub(super) fn context_fixture(case: ContextFixtureCase) -> Result<RunContext> {
+fn context_fixture_parts(case: ContextFixtureCase) -> Result<(RunContextFactory, RunContextInput)> {
     let source_contract_id = SourceContractId::try_new("auction-source".to_owned())?;
     let event_source_contract = if matches!(case, ContextFixtureCase::WrongEventSourceContract) {
         SourceContractId::try_new("other-source".to_owned())?
@@ -535,18 +544,33 @@ pub(super) fn context_fixture(case: ContextFixtureCase) -> Result<RunContext> {
         source_contract_version: SourceContractVersion::try_new("auction-source-v2".to_owned())?,
         template_version: TemplateVersion::try_new("auction-card-v3".to_owned())?,
     });
-    factory.build_context(RunContextInput {
-        run_id: RunId::try_new("run-20260907-090500".to_owned())?,
-        calendar_date: CalendarDate::parse("2026-09-07")?,
-        phase: PhaseEpic::Auction,
-        trigger,
-        occurrence: OccurrenceIdentityMaterial::new(
-            BusinessDate::parse("2026-09-07")?,
-            occurrence_family,
-            super::OccurrenceKey::try_new("main".to_owned())?,
-        ),
-        captured_business_time: UtcMicros::try_new(1_788_743_100_000_000)?,
-    })
+    Ok((
+        factory,
+        RunContextInput {
+            run_id: RunId::try_new("run-20260907-090500".to_owned())?,
+            calendar_date: CalendarDate::parse("2026-09-07")?,
+            phase: PhaseEpic::Auction,
+            trigger,
+            occurrence: OccurrenceIdentityMaterial::new(
+                BusinessDate::parse("2026-09-07")?,
+                occurrence_family,
+                super::OccurrenceKey::try_new("main".to_owned())?,
+            ),
+            captured_business_time: UtcMicros::try_new(1_788_743_100_000_000)?,
+        },
+    ))
+}
+
+#[cfg(test)]
+pub(super) fn context_fixture(case: ContextFixtureCase) -> Result<RunContext> {
+    let (factory, input) = context_fixture_parts(case)?;
+    factory.build_context(input)
+}
+
+#[cfg(test)]
+pub(super) fn capture_capability_fixture() -> Result<PreparationCapture> {
+    let (factory, input) = context_fixture_parts(ContextFixtureCase::ValidScheduled)?;
+    factory.begin_capture(input)
 }
 
 #[cfg(test)]

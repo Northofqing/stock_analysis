@@ -18,7 +18,11 @@ pub use delivery::{
     DeliveryResultView, DurableSchemaVersion, DurableStateProjection, TemplateId, TemplateVersion,
     TerminalDisposition, TerminalRefId, VerifiedTerminalRef, WeakOutcome, WeakOutcomeKind,
 };
-pub use facts::{ExternalId, SourceProvider, SourceRef, SourceRefId};
+pub use facts::{
+    CaptureStateView, CapturedFacts, ExactBytes, ExternalId, FactsPresence, ModelId,
+    ModelOutputRef, ModelVersion, PreparationCapture, PreparationError, PreparedFacts,
+    PreparedFactsSnapshot, ProtectedRef, SourceProvider, SourceRef, SourceRefId, SourceTime,
+};
 pub use identity::{
     derive_intent_id, derive_occurrence_id, derive_schedule_occurrence_id, AudienceId,
     BusinessDate, CalendarId, CompletionOwnerId, IntentId, IntentIdentityMaterial, Namespace,
@@ -64,6 +68,14 @@ pub enum PushJobError {
     PolicyViolation(&'static str),
     #[error("invalid run context: {0}")]
     InvalidRunContext(&'static str),
+    #[error("invalid source references: {0}")]
+    InvalidSourceReferences(&'static str),
+    #[error("invalid model output references: {0}")]
+    InvalidModelOutputReferences(&'static str),
+    #[error("invalid verified-empty evidence: {0}")]
+    InvalidVerifiedEmptyEvidence(&'static str),
+    #[error("invalid prepared facts: {0}")]
+    InvalidPreparedFacts(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, PushJobError>;

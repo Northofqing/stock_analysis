@@ -1243,7 +1243,8 @@ fn w04_verified_empty_requires_evidence_bound_to_context_and_source() {
         SourceContractId::try_new("auction-source".to_owned()).expect("valid source"),
         digest('e'),
         UtcMicros::try_new(1_788_743_100_000_002).expect("valid verified time"),
-    );
+    )
+    .expect("valid empty evidence shape");
     let source = w04_source_ref("source-empty", "auction-source", 'e');
     let result = capture.capture_once(|_| {
         Ok(CapturedFacts::try_new(
@@ -1272,7 +1273,8 @@ fn w04_verified_empty_requires_evidence_bound_to_context_and_source() {
                 SourceContractId::try_new("auction-source".to_owned()).expect("valid source"),
                 digest('e'),
                 UtcMicros::try_new(1_788_743_100_000_002).expect("valid verified time"),
-            );
+            )
+            .expect("valid empty evidence shape");
             Ok(CapturedFacts::try_new(
                 SourceContractId::try_new("auction-source".to_owned()).expect("valid source"),
                 SourceContractVersion::try_new("auction-source-v2".to_owned())
@@ -1311,8 +1313,14 @@ fn w04_active_and_shadow_share_the_same_immutable_snapshot() {
         .expect("first capture succeeds");
     let shadow = active.clone();
     assert!(active.shares_instance_with(&shadow));
-    assert_eq!(active.facts().model_output_refs(), &[model]);
-    assert_eq!(shadow.facts().model_output_refs(), &[model]);
+    assert_eq!(
+        active.facts().model_output_refs(),
+        std::slice::from_ref(&model)
+    );
+    assert_eq!(
+        shadow.facts().model_output_refs(),
+        std::slice::from_ref(&model)
+    );
 }
 
 #[test]
