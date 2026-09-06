@@ -114,7 +114,7 @@ impl AuthorityAttemptBinding {
 pub(crate) enum AuthorityQuery {
     Missing,
     PendingSeal,
-    Terminal(AuthorityTerminalRecord),
+    Terminal(Box<AuthorityTerminalRecord>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -205,7 +205,7 @@ pub(crate) fn verify_terminal(
     {
         AuthorityQuery::Missing => return Err(TerminalAuthorityError::TerminalMissing),
         AuthorityQuery::PendingSeal => return Err(TerminalAuthorityError::TerminalPendingSeal),
-        AuthorityQuery::Terminal(record) => record,
+        AuthorityQuery::Terminal(record) => *record,
     };
 
     if record.authority_class != descriptor.authority_class {

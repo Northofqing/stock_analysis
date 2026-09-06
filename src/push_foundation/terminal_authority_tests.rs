@@ -39,7 +39,7 @@ impl FakeAuthority {
                 durable_schema_version: DurableSchemaVersion::try_new("durable-v5".to_owned())
                     .unwrap(),
             },
-            result: RefCell::new(Ok(AuthorityQuery::Terminal(record))),
+            result: RefCell::new(Ok(AuthorityQuery::Terminal(Box::new(record)))),
             calls: Cell::new(0),
             queried_decisions: RefCell::new(Vec::new()),
         }
@@ -648,7 +648,7 @@ fn w09_finalization_rejects_authority_drift_after_the_initial_verification() {
     let mut changed = fixture.record;
     changed.ref_id = TerminalRefId::try_new("disposition-replaced".to_owned()).unwrap();
     changed.binding_sha256 = terminal_binding_sha256(&changed);
-    *authority.result.borrow_mut() = Ok(AuthorityQuery::Terminal(changed));
+    *authority.result.borrow_mut() = Ok(AuthorityQuery::Terminal(Box::new(changed)));
 
     assert!(matches!(
         reverify_for_finalization(
@@ -680,7 +680,7 @@ fn w09_finalization_repeats_full_binding_validation_and_fails_closed() {
     let mut changed = fixture.record;
     changed.subject = SubjectId::entity("600000.SH".to_owned()).unwrap();
     changed.binding_sha256 = terminal_binding_sha256(&changed);
-    *authority.result.borrow_mut() = Ok(AuthorityQuery::Terminal(changed));
+    *authority.result.borrow_mut() = Ok(AuthorityQuery::Terminal(Box::new(changed)));
 
     assert!(matches!(
         reverify_for_finalization(
