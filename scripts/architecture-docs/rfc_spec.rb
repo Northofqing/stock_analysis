@@ -127,11 +127,11 @@ module ArchitectureDocs
         'retention_class' => 'RetentionClass'
       }
     }.freeze
-    REQUIRED_SECTIONS = ['Metadata', 'Scope and authority', 'Navigation and canonical rules (PROPOSED)',
-      'Type: JobDecision (PROPOSED)', 'Type: DeliveryResult (PROPOSED)', 'Completion branches (PROPOSED)',
-      'Monitor to durable mapping (CURRENT)', 'Unmapped monitor kinds (CURRENT status; PROPOSED treatment)',
-      'Durable states (CURRENT); application projection (PROPOSED)', 'Type: ReasonCode (PROPOSED)',
-      'Adapter conformance (PROPOSED)', 'Task2 verification boundary'].freeze
+    REQUIRED_SECTIONS = ['元数据', '范围与事实权限', '阅读导航与规范化规则（PROPOSED）',
+      '类型：JobDecision（PROPOSED）', '类型：DeliveryResult（PROPOSED）', '业务完成分支（PROPOSED）',
+      'monitor 到 durable 的映射（CURRENT）', '未直接映射的 monitor 类型（CURRENT 状态；PROPOSED 处置）',
+      'durable 状态（CURRENT）与应用投影（PROPOSED）', '类型：ReasonCode（PROPOSED）',
+      '适配器一致性合同（PROPOSED）', 'Task2 验证边界'].freeze
     MAPPINGS = [
       ["HoldingPlan","HoldingPlan","None"],
       ["HoldingEvent","HoldingEvent","None"],
@@ -158,7 +158,7 @@ module ArchitectureDocs
       ["FactorIC","DailyReport","FactorIC"],
       ["SectorTier","DailyReport","SectorTier"],
       ["CapitalVerify","DailyReport","CapitalVerify"],
-      ["DailyReport","DailyReport","requested FactorIC/SectorTier/CapitalVerify or None"]
+      ["DailyReport","DailyReport","按请求选择 FactorIC/SectorTier/CapitalVerify 或 None"]
     ].freeze
     JOB_PAYLOADS = {
       'Ready' => 'PreparedPush', 'NoData' => '{reason:ReasonCode,evidence_sha256:Sha256}',
@@ -178,20 +178,20 @@ module ArchitectureDocs
       'Blocked' => %w[ReasonCode none never]
     }.freeze
     STATE_PROJECTIONS = {
-      'Reserved' => %w[Blocked no lease_fenced_first_attempt no],
-      'AttemptInFlight' => %w[Blocked no never_until_reconciled no],
-      'AcceptedAuditPending' => %w[Blocked no never after_authority_sealed],
-      'AcceptedTaskTransitionPending' => %w[Blocked no never after_authority_sealed],
-      'Delivered' => %w[TransportAccepted/AlreadyTerminal yes never accepted_binding_only],
-      'RejectedAuditPending' => %w[Blocked no never_until_reconciled no],
-      'RejectedTaskTransitionPending' => %w[Blocked no never_until_reconciled no],
-      'RejectedDurable' => %w[TransportRejected/AlreadyTerminal yes explicit_authorization_only rejection_proposal_no_cursor],
-      'UncertainAuditPending' => %w[Blocked no never no],
-      'UncertainTaskTransitionPending' => %w[Blocked no never no],
-      'UncertainManualReview' => %w[TransportUncertain/AlreadyTerminal yes never quarantine_no_cursor],
-      'ManualRejectedAuditPending' => %w[Blocked no never no],
-      'ManualRejectedTaskTransitionPending' => %w[Blocked no never no],
-      'ManualResolvedRejected' => %w[AlreadyTerminal yes never manual_not_delivered_no_cursor]
+      'Reserved' => %w[Blocked 否 lease_fenced_first_attempt 否],
+      'AttemptInFlight' => %w[Blocked 否 never_until_reconciled 否],
+      'AcceptedAuditPending' => %w[Blocked 否 never after_authority_sealed],
+      'AcceptedTaskTransitionPending' => %w[Blocked 否 never after_authority_sealed],
+      'Delivered' => %w[TransportAccepted/AlreadyTerminal 是 never accepted_binding_only],
+      'RejectedAuditPending' => %w[Blocked 否 never_until_reconciled 否],
+      'RejectedTaskTransitionPending' => %w[Blocked 否 never_until_reconciled 否],
+      'RejectedDurable' => %w[TransportRejected/AlreadyTerminal 是 explicit_authorization_only rejection_proposal_no_cursor],
+      'UncertainAuditPending' => %w[Blocked 否 never 否],
+      'UncertainTaskTransitionPending' => %w[Blocked 否 never 否],
+      'UncertainManualReview' => %w[TransportUncertain/AlreadyTerminal 是 never quarantine_no_cursor],
+      'ManualRejectedAuditPending' => %w[Blocked 否 never 否],
+      'ManualRejectedTaskTransitionPending' => %w[Blocked 否 never 否],
+      'ManualResolvedRejected' => %w[AlreadyTerminal 是 never manual_not_delivered_no_cursor]
     }.freeze
     REASONS = %w[
       schedule.not_trading_day
@@ -235,6 +235,55 @@ module ArchitectureDocs
       operator.evidence_invalid
       operator.resolution_conflict
     ].freeze
+    SEMANTIC_CONTRACTS = {
+      '身份合同（PROPOSED）' => {
+        header: ["规则","函数","有序材料","排除材料","冲突处置","依据"],
+        rows: [
+          ["PreparedPushIntent","SHA256CanonicalTuple","namespace,unit_id,completion_owner,source_contract_id,occurrence,subject,audience","payload_sha256,rendered_sha256,evidence_sha256","ResolutionRequired"],
+          ["TerminalBinding","SHA256CanonicalTuple","ref_id,authority_class,namespace,decision_id,attempt_id,intent_id,unit_id,occurrence,business_date,subject,audience,template_id,template_version,rendered_sha256,terminal_disposition,evidence_sha256,durable_schema_version","verified_at,binding_sha256","Blocked"]
+        ],
+        error: 'rfc_identity_contract_invalid'
+      },
+      '终态完成合同（PROPOSED）' => {
+        header: ["处置","绑定校验","游标必要策略","时段提案","游标提案","禁止行为","依据"],
+        rows: [
+          ["Accepted","RequeryExactBinding","AllowedAuthority+BoundCursor+AcceptedBoundOnly","OnAccepted","AdvanceAccepted","NeverInferFromVariant"],
+          ["ManualConfirmedAccepted","RequeryExactBinding","AllowedAuthority+BoundCursor+AcceptedBoundOnly+AcceptedOrManualBound","OnAccepted","AdvanceManualAccepted","NeverTransportAccepted"],
+          ["Rejected","RequeryExactBinding","RegisteredPolicy","KeepOpen","None","NeverAdvanceOrBlindRetry"],
+          ["Uncertain","RequeryExactBinding","QuarantineThenVerifiedManual","KeepOpen","None","NeverAdvanceOrBlindRetry"],
+          ["ManualConfirmedNotDelivered","RequeryExactBinding","RegisteredPolicy","KeepOpen","None","NeverAdvance"]
+        ],
+        error: 'rfc_completion_binding_invalid'
+      },
+      '适配器一致性合同（PROPOSED）' => {
+        header: ["规则","适用对象","规范值","依据"],
+        rows: [
+          ["p01_owner_group","MU-p01","SharedBusinessOccurrenceOwner"],
+          ["n02_authority","MU-news-flash-aggregate","PreserveWindowReservationAttemptSettlement"],
+          ["application_contract","GenericCounted,P01Dedicated,N02Dedicated","OneApplicationResultAndFinalizerContract"],
+          ["facts_instance","Active,Shadow","SameImmutablePreparedFactsIncludingModelOutputs"],
+          ["projection","project","Pure"],
+          ["shadow_compare","Shadow","JobDecision,SemanticProjection.sha256,rendered_sha256,ReasonCode,completion_proposal"],
+          ["shadow_exclusions","Shadow","attempt_id,latency,diagnostic_timestamp"],
+          ["shadow_side_effects","Shadow","None"],
+          ["payload_drift","SameIntent","ResolutionRequired"],
+          ["empty_source","Prepare","VerifiedEmptyOnly"],
+          ["weak_authority","COMPAT,LocalAudit,SinkAttempt,Ok,Log","NeverTransportAccepted"]
+        ],
+        error: 'rfc_adapter_contract_invalid'
+      }
+    }.freeze
+    CANONICAL_EXCEPTIONS = {
+      'PreparedFacts' => {'canonical_facts' => '外部原始字节', 'facts_sha256' => '派生且排除自身'},
+      'SemanticProjection' => {'canonical_bytes' => '派生且排除自身', 'sha256' => '派生且排除自身'},
+      'PreparedPush' => {'rendered_bytes' => '外部原始字节'},
+      'VerifiedTerminalRef' => {'verified_at' => '派生且排除自身', 'binding_sha256' => '派生且排除自身'}
+    }.freeze
+    FIELD_RULE_REFERENCES = {
+      ['PreparedPush', 'intent_id'] => ['IdentityRule::PreparedPushIntent', 'rfc_identity_contract_invalid'],
+      ['VerifiedTerminalRef', 'binding_sha256'] => ['IdentityRule::TerminalBinding', 'rfc_identity_contract_invalid'],
+      ['CompletionPolicy', 'already_terminal_policy'] => ['CompletionRule::AlreadyTerminal', 'rfc_completion_binding_invalid']
+    }.freeze
     module_function
 
     def validate(root, strict: false)
@@ -285,7 +334,7 @@ module ArchitectureDocs
         errors << "rfc_section_duplicate name=#{name}" if sections.key?(name)
         sections[name] = body
       end
-      required = REQUIRED_SECTIONS + TYPE_FIELDS.keys.map { |name| "Type: #{name} (PROPOSED)" }
+      required = (REQUIRED_SECTIONS + SEMANTIC_CONTRACTS.keys + TYPE_FIELDS.keys.map { |name| "类型：#{name}（PROPOSED）" }).uniq
       required.each do |name|
         errors << "rfc_section_missing name=#{name}" unless sections.key?(name)
       end
@@ -300,52 +349,73 @@ module ArchitectureDocs
           errors << "rfc_reference_invalid type=#{type} id=#{id}"
         end
       end
-      required.reject { |name| name == 'Metadata' }.each do |name|
+      required.reject { |name| name == '元数据' }.each do |name|
         body = sections[name]
         errors << "rfc_section_evidence_missing name=#{name}" if body && references(body).empty?
       end
       TYPE_FIELDS.each do |name, fields|
-        body = sections["Type: #{name} (PROPOSED)"]
+        body = sections["类型：#{name}（PROPOSED）"]
         next unless body
-        unless body.match?(/Creator: .+\. Consumer: .+\./)
+        unless body.match?(/创建者：.+。消费者：.+。/)
           errors << "rfc_type_lifecycle_missing type=#{name}"
         end
-        rows = table(body, %w[field type invariant canonical], name, errors)
+        rows = table(body, %w[字段 类型 不变量 规范化], name, errors)
         errors << "rfc_type_fields_invalid type=#{name}" unless rows.map(&:first).sort == fields.keys.sort
         rows.each do |row|
           errors << "rfc_field_type_invalid type=#{name} field=#{row[0]}" unless fields[row[0]] == row[1]
-          unless ['include', 'external exact bytes', 'derived self-excluded'].include?(row[3])
+          expected_mode = CANONICAL_EXCEPTIONS.fetch(name, {}).fetch(row[0], '纳入')
+          unless row[3] == expected_mode
             errors << "rfc_canonical_rule_invalid type=#{name} field=#{row[0]}"
           end
+          rule = FIELD_RULE_REFERENCES[[name, row[0]]]
+          errors << "#{rule[1]} type=#{name} field=#{row[0]}" if rule && row[2] != rule[0]
         end
       end
       errors.concat(outcome_errors(sections))
       errors.concat(mapping_errors(sections, catalog))
       errors.concat(state_reason_errors(sections))
+      errors.concat(semantic_contract_errors(sections))
+      errors
+    end
+
+    def semantic_contract_errors(sections)
+      errors = []
+      SEMANTIC_CONTRACTS.each do |name, profile|
+        rows = section_table(sections, name, profile[:header], errors).map { |row| row[0...-1] }
+        errors << profile[:error] unless rows.sort == profile[:rows].sort
+      end
       errors
     end
 
     def outcome_errors(sections)
       errors = []
-      jobs = section_table(sections, 'Type: JobDecision (PROPOSED)',
-                           %w[variant payload allowed_input proposal forbidden refs], errors)
+      jobs = section_table(sections, '类型：JobDecision（PROPOSED）',
+                           %w[分支 载荷 允许输入 业务提案 禁止行为 依据], errors)
       errors << 'rfc_job_variants_invalid' unless jobs.map(&:first).sort == JOB_PAYLOADS.keys.sort
       jobs.each do |row|
         errors << "rfc_job_payload_invalid variant=#{row[0]}" unless JOB_PAYLOADS[row[0]] == row[1]
       end
-      delivery = section_table(sections, 'Type: DeliveryResult (PROPOSED)',
-                               %w[variant payload authority authoritative_completion condition refs], errors)
+      delivery = section_table(sections, '类型：DeliveryResult（PROPOSED）',
+                               %w[分支 载荷 权威类别 权威完成推进 条件 依据], errors)
       errors << 'rfc_delivery_variants_invalid' unless delivery.map(&:first).sort == DELIVERY.keys.sort
       delivery.each do |row|
         errors << "rfc_delivery_authority_invalid variant=#{row[0]}" unless DELIVERY[row[0]] == row[1, 3]
+        if row[0] == 'AlreadyTerminal' && row[4] != 'CompletionRule::AlreadyTerminal'
+          errors << 'rfc_completion_binding_invalid'
+        end
       end
-      completion = section_table(sections, 'Completion branches (PROPOSED)',
-                                 %w[input allowed_policy schedule_proposal cursor_proposal forbidden refs], errors)
+      completion = section_table(sections, '业务完成分支（PROPOSED）',
+                                 %w[输入 允许策略 时段提案 游标提案 禁止行为 依据], errors)
       expected = JOB_PAYLOADS.keys + DELIVERY.keys
       errors << 'rfc_completion_branches_invalid' unless completion.map(&:first).sort == expected.sort
       completion.each do |row|
         unless %w[TransportAccepted AlreadyTerminal].include?(row[0]) || row[3] == 'None'
           errors << "rfc_completion_authority_invalid input=#{row[0]}"
+        end
+        if row[0] == 'AlreadyTerminal'
+          expected_rule = ['CompletionRule::AlreadyTerminal', 'CompletionRule::AlreadyTerminal.schedule',
+                           'CompletionRule::AlreadyTerminal.cursor', 'CompletionRule::AlreadyTerminal.forbidden']
+          errors << 'rfc_completion_binding_invalid' unless row[1, 4] == expected_rule
         end
       end
       errors
@@ -353,13 +423,13 @@ module ArchitectureDocs
 
     def mapping_errors(sections, catalog)
       errors = []
-      mapped = section_table(sections, 'Monitor to durable mapping (CURRENT)',
-                             %w[monitor_kind durable_kind sub_kind refs], errors).map { |row| row[0, 3] }
+      mapped = section_table(sections, 'monitor 到 durable 的映射（CURRENT）',
+                             %w[monitor类型 durable类型 子类型 依据], errors).map { |row| row[0, 3] }
       errors << 'rfc_mapping_invalid' unless mapped.sort == MAPPINGS.sort
       all_kinds = catalog['kinds'].map { |kind| kind['kind'] }
       errors << 'rfc_mapping_catalog_invalid' unless (MAPPINGS.map(&:first) - all_kinds).empty?
-      unmapped = section_table(sections, 'Unmapped monitor kinds (CURRENT status; PROPOSED treatment)',
-                               %w[monitor_kind status treatment refs], errors).map { |row| row[0, 3] }
+      unmapped = section_table(sections, '未直接映射的 monitor 类型（CURRENT 状态；PROPOSED 处置）',
+                               %w[monitor类型 状态 处置 依据], errors).map { |row| row[0, 3] }
       actions = {'ACTIVE' => 'adapt_or_conform', 'INACTIVE' => 'keep_inactive',
                  'STARVED' => 'retain_starved', 'OPT-IN' => 'retain_opt_in'}
       expected = catalog['kinds'].reject { |kind| MAPPINGS.any? { |row| row[0] == kind['kind'] } }.map do |kind|
@@ -371,13 +441,13 @@ module ArchitectureDocs
 
     def state_reason_errors(sections)
       errors = []
-      states = section_table(sections, 'Durable states (CURRENT); application projection (PROPOSED)',
-                             %w[state application_result terminal automatic_send_retry business_finalizer refs], errors)
+      states = section_table(sections, 'durable 状态（CURRENT）与应用投影（PROPOSED）',
+                             %w[状态 应用结果 传输处置终态 自动发送重试 业务最终化 依据], errors)
       errors << 'rfc_states_invalid' unless states.map(&:first).sort == STATE_PROJECTIONS.keys.sort
       states.each do |row|
         errors << "rfc_state_projection_invalid state=#{row[0]}" unless STATE_PROJECTIONS[row[0]] == row[1, 4]
       end
-      reasons = section_table(sections, 'Type: ReasonCode (PROPOSED)', %w[code condition handling refs], errors).map(&:first)
+      reasons = section_table(sections, '类型：ReasonCode（PROPOSED）', %w[代码 条件 处理 依据], errors).map(&:first)
       errors << 'rfc_reason_duplicate' unless reasons.uniq == reasons
       namespaces = REASONS.map { |code| code.split('.').first }.uniq
       reasons.each do |code|
@@ -413,7 +483,7 @@ module ArchitectureDocs
           errors << "rfc_table_invalid name=#{name}"
           false
         else
-          if header.last == 'refs' && references(row.last).empty?
+          if header.last == '依据' && references(row.last).empty?
             errors << "rfc_row_evidence_missing name=#{name} row=#{row.first}"
           end
           true

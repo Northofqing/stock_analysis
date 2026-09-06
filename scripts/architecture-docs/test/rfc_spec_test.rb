@@ -54,8 +54,8 @@ class RfcSpecTest < Minitest::Test
 
   def test_domain_contract_sections_fields_and_references_are_enforced
     cases = [
-      ['rfc_section_missing', proc { |s| s.sub('## Type: PreparedFacts (PROPOSED)', '## Deleted facts') }],
-      ['rfc_section_duplicate', proc { |s| s + "\n## Type: RunContext (PROPOSED)\n[Q:33]\n" }],
+      ['rfc_section_missing', proc { |s| s.sub('## 类型：PreparedFacts（PROPOSED）', '## 已删除事实合同') }],
+      ['rfc_section_duplicate', proc { |s| s + "\n## 类型：RunContext（PROPOSED）\n[Q:33]\n" }],
       ['rfc_type_fields_invalid', proc { |s| s.sub(/^\| run_id \|.*\n/, '') }],
       ['rfc_table_invalid', proc { |s| s.sub('| run_id | RunId |', '| run_id | |') }],
       ['rfc_field_type_invalid', proc { |s| s.sub('| run_id | RunId |', '| run_id | bool |') }],
@@ -80,14 +80,14 @@ class RfcSpecTest < Minitest::Test
       ['rfc_delivery_variants_invalid', proc { |s| s.sub(/^\| PartiallyAccepted \| CompatibilityEvidenceRef.*\n/, '') }],
       ['rfc_delivery_authority_invalid', proc { |s| s.sub('| BestEffortAccepted | CompatibilityEvidenceRef | compat | never |', '| BestEffortAccepted | VerifiedTerminalRef | strong | policy_bound |') }],
       ['rfc_delivery_authority_invalid', proc { |s| s.sub('| PartiallyAccepted | CompatibilityEvidenceRef | compat | never |', '| PartiallyAccepted | CompatibilityEvidenceRef | compat | policy_bound |') }],
-      ['rfc_completion_authority_invalid', proc { |s| s.sub('| BestEffortAccepted | CompatibilityObservation | Local observation only | None |', '| BestEffortAccepted | CompatibilityObservation | Local observation only | AdvanceAccepted |') }],
+      ['rfc_completion_authority_invalid', proc { |s| s.sub('| BestEffortAccepted | CompatibilityObservation | 仅记录本地观察 | None |', '| BestEffortAccepted | CompatibilityObservation | 仅记录本地观察 | AdvanceAccepted |') }],
       ['rfc_mapping_invalid', proc { |s| s.sub('| FactorIC | DailyReport | FactorIC |', '| FactorIC | DailyReport | None |') }],
       ['rfc_mapping_invalid', proc { |s| s.sub(/^\| HoldingPlan \| HoldingPlan.*\n/, '') }],
       ['rfc_mapping_invalid', proc { |s| s.sub('| FactorIC | DailyReport | FactorIC |', '| FactorIC | FactorIC | FactorIC |') }],
       ['rfc_unmapped_invalid', proc { |s| s.sub('| Announcement | ACTIVE | adapt_or_conform |', '| Announcement | INACTIVE | keep_inactive |') }],
       ['rfc_unmapped_invalid', proc { |s| s.sub(/^\| PolicyHit \| INACTIVE.*\n/, '') }],
       ['rfc_states_invalid', proc { |s| s.sub(/^\| Reserved \| Blocked.*\n/, '') }],
-      ['rfc_state_projection_invalid', proc { |s| s.sub('| UncertainManualReview | TransportUncertain/AlreadyTerminal | yes | never |', '| UncertainManualReview | TransportAccepted | yes | automatic |') }],
+      ['rfc_state_projection_invalid', proc { |s| s.sub('| UncertainManualReview | TransportUncertain/AlreadyTerminal | 是 | never |', '| UncertainManualReview | TransportAccepted | 是 | automatic |') }],
       ['rfc_reason_duplicate', proc { |s| s.sub('| input.source_unready |', '| input.source_unavailable |') }],
       ['rfc_reason_namespace_invalid', proc { |s| s.sub('| input.source_unready |', '| source_unready |') }],
       ['rfc_reason_coverage_invalid', proc { |s| s.sub(/^\| operator.unauthorized \|.*\n/, '') }]
@@ -102,7 +102,7 @@ class RfcSpecTest < Minitest::Test
 
   def test_malformed_tables_return_content_errors_without_backtraces
     with_fixture do |root|
-      change_text(root) { |s| s.sub('| code | condition | handling | refs |', "|\n| code | condition | handling | refs |") }
+      change_text(root) { |s| s.sub('| 代码 | 条件 | 处理 | 依据 |', "|\n| 代码 | 条件 | 处理 | 依据 |") }
       assert_cli_error(root, 'rfc_table_invalid')
     end
     with_fixture do |root|
@@ -194,6 +194,69 @@ class RfcSpecTest < Minitest::Test
       assert_equal errors, ArchitectureDocs::RfcSpec.validate(root)
       assert_cli_error(root, 'rfc_reference_invalid')
       assert_equal before, snapshot(root)
+    end
+  end
+
+  def test_semantic_reversal_identity_payload_material_is_rejected
+    with_fixture do |root|
+      change_text(root) { |s| s.sub('namespace,unit_id,completion_owner,source_contract_id,occurrence,subject,audience', 'namespace,unit_id,completion_owner,source_contract_id,occurrence,subject,audience,payload_sha256') }
+      assert_cli_error(root, 'rfc_identity_contract_invalid')
+    end
+  end
+
+  def test_semantic_reversal_already_terminal_bypass_is_rejected
+    with_fixture do |root|
+      change_text(root) do |s|
+        s.sub('| AlreadyTerminal | VerifiedTerminalRef | strong | policy_bound | CompletionRule::AlreadyTerminal |',
+              '| AlreadyTerminal | VerifiedTerminalRef | strong | policy_bound | SkipExactBindingAndAdvanceAll |')
+         .sub('| AlreadyTerminal | CompletionRule::AlreadyTerminal | CompletionRule::AlreadyTerminal.schedule | CompletionRule::AlreadyTerminal.cursor | CompletionRule::AlreadyTerminal.forbidden |',
+              '| AlreadyTerminal | SkipExactBinding | Close | AdvanceEveryDisposition | None |')
+      end
+      assert_cli_error(root, 'rfc_completion_binding_invalid')
+    end
+  end
+
+  def test_semantic_reversal_empty_adapter_contract_is_rejected
+    with_fixture do |root|
+      change_text(root) { |s| s.sub(/## 适配器一致性合同（PROPOSED）\n.*?(?=## Task2 验证边界)/m, "## 适配器一致性合同（PROPOSED）\n\n[Q:27]\n\n") }
+      assert_cli_error(root, 'rfc_adapter_contract_invalid')
+    end
+  end
+
+  def test_semantic_reversal_run_identity_hash_exclusion_is_rejected
+    with_fixture do |root|
+      change_text(root) { |s| s.sub(/^\| run_id \|.*$/) { |row| row.sub('| 纳入 |', '| 派生且排除自身 |') } }
+      assert_cli_error(root, 'rfc_canonical_rule_invalid')
+    end
+  end
+
+  def test_semantic_contract_values_cannot_be_replaced_with_weaker_rules
+    cases = [
+      ['rfc_identity_contract_invalid', proc { |s| s.sub('| intent_id | IntentId | IdentityRule::PreparedPushIntent |', '| intent_id | IntentId | 包含 payload 哈希 |') }],
+      ['rfc_identity_contract_invalid', proc { |s| s.sub('| payload_sha256,rendered_sha256,evidence_sha256 |', '| None |') }],
+      ['rfc_completion_binding_invalid', proc { |s| s.sub('| Accepted | RequeryExactBinding |', '| Accepted | SkipBinding |') }],
+      ['rfc_completion_binding_invalid', proc { |s| s.sub('| Rejected | RequeryExactBinding | RegisteredPolicy | KeepOpen | None |', '| Rejected | RequeryExactBinding | RegisteredPolicy | KeepOpen | AdvanceAccepted |') }],
+      ['rfc_completion_binding_invalid', proc { |s| s.sub('| AdvanceManualAccepted | NeverTransportAccepted |', '| AdvanceAccepted | NeverTransportAccepted |') }],
+      ['rfc_adapter_contract_invalid', proc { |s| s.sub('| n02_authority | MU-news-flash-aggregate | PreserveWindowReservationAttemptSettlement |', '| n02_authority | MU-news-flash-aggregate | CopyGenericReceipts |') }],
+      ['rfc_adapter_contract_invalid', proc { |s| s.sub('| shadow_side_effects | Shadow | None |', '| shadow_side_effects | Shadow | ProviderQuery |') }],
+      ['rfc_canonical_rule_invalid', proc { |s| s.sub(/^\| verified_at \|.*$/) { |row| row.sub('| 派生且排除自身 |', '| 纳入 |') } }]
+    ]
+    cases.each do |code, mutation|
+      with_fixture do |root|
+        change_text(root, &mutation)
+        assert_cli_error(root, code)
+      end
+    end
+  end
+
+  def test_chinese_contract_headings_and_table_headers_remain_required
+    with_fixture do |root|
+      change_text(root) { |s| s.sub('## 身份合同（PROPOSED）', '## Identity contract (PROPOSED)') }
+      assert_cli_error(root, 'rfc_section_missing')
+    end
+    with_fixture do |root|
+      change_text(root) { |s| s.sub('| 字段 | 类型 | 不变量 | 规范化 |', '| field | type | invariant | canonical |') }
+      assert_cli_error(root, 'rfc_table_invalid')
     end
   end
 
