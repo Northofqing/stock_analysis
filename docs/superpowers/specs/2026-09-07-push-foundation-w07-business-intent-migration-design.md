@@ -1,6 +1,6 @@
 # 推送 Foundation W07 Business Intent Schema 与迁移设计
 
-**状态：** 已设计，待按测试先行实现；不接 production database、caller、scheduler、provider、sink、finalizer 或 activation。
+**状态：** 已实现并完成 fresh 验证；结果见 `docs/push-system/implementation-w07-results-2026-09-07.md`。未接 production database、caller、scheduler、provider、sink、finalizer 或 activation；W08--W21 与 52 个 Migration Unit 仍待完成。
 
 **决策日期：** 2026-09-07
 
