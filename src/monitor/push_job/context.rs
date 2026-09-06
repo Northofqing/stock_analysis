@@ -4,10 +4,14 @@ use std::collections::BTreeMap;
 
 use chrono::NaiveDate;
 
-use super::canonical::{canonical_digest, canonical_preimage, CanonicalValue};
+#[cfg(test)]
+use super::canonical::canonical_preimage;
+use super::canonical::{canonical_digest, CanonicalValue};
 use super::delivery::TemplateVersion;
 use super::facts::PreparationCapture;
-use super::facts::{source_ref_value, ExternalId, SourceProvider, SourceRef, SourceRefId};
+use super::facts::{source_ref_value, SourceRef};
+#[cfg(test)]
+use super::facts::{ExternalId, SourceProvider, SourceRefId};
 use super::identity::{derive_occurrence_id, namespace_value, validate_text};
 use super::{
     BusinessDate, Namespace, OccurrenceFamily, OccurrenceId, OccurrenceIdentityMaterial,
@@ -15,6 +19,7 @@ use super::{
     UnitId, UtcMicros,
 };
 
+#[cfg_attr(not(test), allow(dead_code))]
 const RUN_CONTEXT_SCHEMA_VERSION: u32 = 1;
 
 macro_rules! context_text {
@@ -170,6 +175,8 @@ pub enum TriggerView<'a> {
     },
 }
 
+// W06 catalog registration is the first non-test constructor of these binding values.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RegisteredTrigger {
     Scheduled(ScheduleId),
@@ -177,6 +184,7 @@ enum RegisteredTrigger {
     Manual,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CatalogRunBinding {
     namespace: Namespace,
@@ -191,6 +199,7 @@ pub(crate) struct CatalogRunBinding {
     template_version: TemplateVersion,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RunContextInput {
     run_id: RunId,
@@ -201,11 +210,13 @@ pub(crate) struct RunContextInput {
     captured_business_time: UtcMicros,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) struct RunContextFactory {
     binding: CatalogRunBinding,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl RunContextFactory {
     pub(crate) fn new(binding: CatalogRunBinding) -> Self {
         Self { binding }
@@ -262,6 +273,7 @@ impl RunContextFactory {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn trigger_matches(binding: &CatalogRunBinding, trigger: &Trigger) -> bool {
     match (&binding.trigger, &trigger.0) {
         (

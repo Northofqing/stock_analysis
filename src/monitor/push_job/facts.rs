@@ -604,6 +604,8 @@ pub enum PreparationError {
     AlreadyAttempted { state: CaptureStateView },
 }
 
+// W06 catalog wiring is the first non-test path that constructs an Open capability.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CaptureState {
     Open,
@@ -629,6 +631,7 @@ pub struct PreparationCapture {
 }
 
 impl PreparationCapture {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn new(context: RunContext, expected_source_contract_id: SourceContractId) -> Self {
         Self {
             context,

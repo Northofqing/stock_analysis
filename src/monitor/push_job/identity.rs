@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 
 use chrono::NaiveDate;
 
-use super::canonical::{canonical_digest, canonical_preimage, CanonicalValue};
+#[cfg(test)]
+use super::canonical::canonical_preimage;
+use super::canonical::{canonical_digest, CanonicalValue};
 use super::{PushJobError, Result};
 
 const TEXT_RULE: &str = "must be 1..=512 UTF-8 bytes, trimmed, and contain no NUL";
