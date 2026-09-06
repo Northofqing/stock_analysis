@@ -18,6 +18,8 @@ const SQLITE3_PATH: &str = "/usr/bin/sqlite3";
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum FoundationMigrationError {
+    #[error("bundled push-foundation digest metadata is invalid")]
+    InvalidBundledDigest,
     #[error("bundled push-foundation DDL digest mismatch")]
     ScriptDigestMismatch {
         expected: Sha256Digest,
@@ -27,6 +29,8 @@ pub enum FoundationMigrationError {
     DatabasePathNotAbsolute,
     #[error("business database parent directory does not exist")]
     DatabaseParentMissing,
+    #[error("business database parent directory metadata is unreadable")]
+    DatabaseParentUnreadable,
     #[error("business database parent directory must not be a symbolic link")]
     DatabaseParentSymlink,
     #[error("business database parent is not a directory")]
@@ -35,6 +39,8 @@ pub enum FoundationMigrationError {
     DatabaseTargetSymlink,
     #[error("business database target is not a regular file")]
     DatabaseTargetNotRegular,
+    #[error("business database target metadata is unreadable")]
+    DatabaseTargetUnreadable,
     #[error("fixed SQLite CLI is unavailable")]
     SqliteCliUnavailable,
     #[error("failed to write exact DDL bytes to SQLite CLI")]
@@ -59,8 +65,8 @@ pub struct FoundationSchemaMigration {
 
 impl FoundationSchemaMigration {
     pub fn bundled() -> Result<Self, FoundationMigrationError> {
-        let expected = parse_digest(DDL_SHA256);
-        let actual = digest(DDL_BYTES);
+        let expected = parse_digest(DDL_SHA256)?;
+        let actual = digest(DDL_BYTES)?;
         if actual != expected {
             return Err(FoundationMigrationError::ScriptDigestMismatch { expected, actual });
         }
@@ -120,7 +126,7 @@ impl FoundationSchemaMigration {
         if !output.status.success() {
             return Err(FoundationMigrationError::MigrationRejected {
                 exit_code: output.status.code(),
-                stderr_sha256: digest(&output.stderr),
+                stderr_sha256: digest(&output.stderr)?,
             });
         }
 
@@ -165,8 +171,10 @@ fn validate_database_path(database: &Path) -> Result<(), FoundationMigrationErro
     let parent = database
         .parent()
         .ok_or(FoundationMigrationError::DatabaseParentMissing)?;
-    let parent_metadata = fs::symlink_metadata(parent)
-        .map_err(|_| FoundationMigrationError::DatabaseParentMissing)?;
+    let parent_metadata = fs::symlink_metadata(parent).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => FoundationMigrationError::DatabaseParentMissing,
+        _ => FoundationMigrationError::DatabaseParentUnreadable,
+    })?;
     if parent_metadata.file_type().is_symlink() {
         return Err(FoundationMigrationError::DatabaseParentSymlink);
     }
@@ -183,7 +191,7 @@ fn validate_database_path(database: &Path) -> Result<(), FoundationMigrationErro
         }
         Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(FoundationMigrationError::DatabaseTargetNotRegular),
+        Err(_) => Err(FoundationMigrationError::DatabaseTargetUnreadable),
     }
 }
 
@@ -201,6 +209,11 @@ fn attest(
         .map_err(|_| FoundationMigrationError::AttestationFailed {
             check: "query_only",
         })?;
+    if query_count(&connection, "PRAGMA query_only", "query_only")? != 1 {
+        return Err(FoundationMigrationError::AttestationFailed {
+            check: "query_only",
+        });
+    }
 
     let header_count = query_count(
         &connection,
@@ -269,11 +282,11 @@ fn query_count(
         .map_err(|_| FoundationMigrationError::AttestationFailed { check })
 }
 
-fn digest(bytes: &[u8]) -> Sha256Digest {
+fn digest(bytes: &[u8]) -> Result<Sha256Digest, FoundationMigrationError> {
     parse_digest(&hex::encode(Sha256::digest(bytes)))
 }
 
-fn parse_digest(value: &str) -> Sha256Digest {
+fn parse_digest(value: &str) -> Result<Sha256Digest, FoundationMigrationError> {
     Sha256Digest::parse("push_foundation_ddl_sha256", value)
-        .unwrap_or_else(|_| unreachable!("compile-time SHA-256 constants and digests are valid"))
+        .map_err(|_| FoundationMigrationError::InvalidBundledDigest)
 }

@@ -282,10 +282,16 @@ fn w07_wrong_version_is_rejected_without_rewriting_original_database() {
         .unwrap()
         .apply_to(&database)
         .unwrap_err();
-    assert!(matches!(
-        error,
-        FoundationMigrationError::MigrationRejected { .. }
-    ));
+    match &error {
+        FoundationMigrationError::MigrationRejected {
+            exit_code,
+            stderr_sha256,
+        } => {
+            assert_ne!(*exit_code, Some(0));
+            assert_eq!(stderr_sha256.as_str().len(), 64);
+        }
+        other => panic!("expected typed migration rejection, got {other:?}"),
+    }
     let rendered_error = format!("{error:?}");
     assert!(!rendered_error.contains("migration-secret"));
     assert!(!rendered_error.contains("legacy-foundation"));
