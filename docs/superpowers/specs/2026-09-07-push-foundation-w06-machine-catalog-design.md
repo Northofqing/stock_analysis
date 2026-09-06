@@ -77,7 +77,7 @@ API 不提供 insert/remove/mutable getter，不提供 unknown-string fallback�
 6. 在局部 builder 中建立索引并执行全部闭合检查。
 7. 只有所有检查通过才返回不可变 `MachineCatalog`；不存在部分可用注册表。
 
-`bundled()` 只调用这一条路径，并使用编译期常量 expected SHA。测试/后续版本工具可以显式调用 `parse_v1_exact`，但必须提供与 bytes 相符的 digest；自定义 digest 不能跳过 65/102/52 与闭合门禁。
+`bundled()` 只调用这一条路径，并使用编译期常量 expected SHA。`parse_v1_exact` 只对 `push_job` 内部测试/版本实现可见，不是公开 authority；即便内部测试提供 mutation bytes 自身的 digest，也不能跳过 65/102/52、10 个 enum 外身份集合与闭合门禁。
 
 ## 5. 双向闭合不变量
 

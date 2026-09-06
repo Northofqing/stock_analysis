@@ -19,6 +19,18 @@ const EXPECTED_KIND_COUNT: usize = 65;
 const EXPECTED_PRODUCER_COUNT: usize = 102;
 const EXPECTED_UNIT_COUNT: usize = 52;
 const EXPECTED_ENUM_EXTERNAL_PRODUCER_COUNT: usize = 10;
+const EXPECTED_ENUM_EXTERNAL_PRODUCER_IDS: [&str; 10] = [
+    "chain-post-close-timer",
+    "chain-preopen-timer",
+    "cli-chain",
+    "cli-replay-force",
+    "cli-single-default",
+    "cli-single-lhb",
+    "cli-single-schedule",
+    "cli-summary-default",
+    "cli-summary-lhb",
+    "cli-summary-schedule",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MachineCatalogStatus {
@@ -83,6 +95,8 @@ pub enum MachineCatalogError {
         "machine catalog enum-external producer count mismatch: expected {expected}, got {actual}"
     )]
     EnumExternalCountMismatch { expected: usize, actual: usize },
+    #[error("machine catalog enum-external producer identity set mismatch")]
+    EnumExternalIdentityMismatch,
     #[error("invalid machine catalog {field} for {entity:?}")]
     InvalidValue {
         entity: CatalogEntity,
@@ -231,7 +245,7 @@ impl MachineCatalog {
         Self::parse_v1_exact(BUNDLED_CATALOG_BYTES, &expected)
     }
 
-    pub fn parse_v1_exact(
+    pub(super) fn parse_v1_exact(
         bytes: &[u8],
         expected_sha256: &Sha256Digest,
     ) -> Result<Self, MachineCatalogError> {
@@ -422,6 +436,18 @@ impl MachineCatalog {
                 expected: EXPECTED_ENUM_EXTERNAL_PRODUCER_COUNT,
                 actual: external_count,
             });
+        }
+        let actual_external_ids = self
+            .producers
+            .iter()
+            .filter(|producer| producer.monitor_kind.is_none())
+            .map(|producer| producer.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let expected_external_ids = EXPECTED_ENUM_EXTERNAL_PRODUCER_IDS
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if actual_external_ids != expected_external_ids {
+            return Err(MachineCatalogError::EnumExternalIdentityMismatch);
         }
 
         for kind in &self.kinds {

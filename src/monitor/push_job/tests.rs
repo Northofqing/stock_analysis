@@ -2685,3 +2685,63 @@ fn w06_catalog_rejects_duplicate_kind_and_unit_members_and_empty_unit_sets() {
         })
     ));
 }
+
+#[test]
+fn w06_catalog_queries_round_trip_every_producer_and_unit() {
+    let catalog = super::MachineCatalog::bundled().unwrap();
+    for producer in catalog.producers() {
+        let unit = catalog
+            .unit_for_producer(producer.id())
+            .expect("every producer resolves its registered Unit");
+        assert_eq!(unit.id(), producer.unit_id());
+        assert!(catalog
+            .producers_for_unit(unit.id())
+            .iter()
+            .any(|candidate| candidate.id() == producer.id()));
+        if let Some(kind) = producer.monitor_kind() {
+            assert!(catalog
+                .producers_for_kind(kind)
+                .iter()
+                .any(|candidate| candidate.id() == producer.id()));
+        }
+    }
+    for unit in catalog.units() {
+        assert_eq!(catalog.unit(unit.id()), Some(unit));
+        assert_eq!(
+            catalog
+                .producers_for_unit(unit.id())
+                .iter()
+                .map(|producer| producer.id())
+                .collect::<std::collections::BTreeSet<_>>(),
+            unit.producer_ids().iter().collect()
+        );
+    }
+}
+
+#[test]
+fn w06_catalog_rejects_enum_external_identity_swap_even_when_count_is_ten() {
+    assert!(matches!(
+        w06_mutated_catalog(|catalog| {
+            let producers = catalog["producers"].as_array_mut().unwrap();
+            producers
+                .iter_mut()
+                .find(|producer| producer["id"] == "chain-preopen-timer")
+                .unwrap()["kinds"] = serde_json::json!(["IndustryChain"]);
+            producers
+                .iter_mut()
+                .find(|producer| producer["id"] == "review-r03-auto")
+                .unwrap()["kinds"] = serde_json::json!([]);
+
+            let industry_chain = catalog["kinds"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|kind| kind["kind"] == "IndustryChain")
+                .unwrap();
+            let producer_ids = industry_chain["producer_ids"].as_array_mut().unwrap();
+            producer_ids.retain(|id| id != "review-r03-auto");
+            producer_ids.push(serde_json::json!("chain-preopen-timer"));
+        }),
+        Err(super::MachineCatalogError::EnumExternalIdentityMismatch)
+    ));
+}
