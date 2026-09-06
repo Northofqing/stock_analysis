@@ -36,7 +36,7 @@ class RfcSpecTest < Minitest::Test
     with_fixture do |root|
       File.write(File.join(root, 'docs/push-system/push-system-implementation-rfc.html'), '<html></html>')
       FileUtils.mkdir_p(File.join(root, '.github/workflows'))
-      File.write(File.join(root, '.github/workflows/ci.yml'), "jobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          ruby scripts/architecture-docs/check.rb --check\n")
+      File.write(File.join(root, '.github/workflows/ci.yml'), "on: push\njobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          ruby scripts/architecture-docs/check.rb --check\n")
       2.times do
         out, err, result = Open3.capture3(RbConfig.ruby, CLI, '--root', root, '--check')
         assert_equal 1, result.exitstatus, out + err
@@ -51,15 +51,15 @@ class RfcSpecTest < Minitest::Test
 
   def test_strict_ci_rejects_comments_prose_other_commands_and_invalid_yaml
     [
-      "# ruby scripts/architecture-docs/check.rb --check\njobs: {}\n",
-      "description: ruby scripts/architecture-docs/check.rb --check\n",
-      "jobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - name: ruby scripts/architecture-docs/check.rb --check\n        run: echo skipped\n",
-      "jobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ruby scripts/architecture-docs/check.rb --check\n",
-      "jobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ruby scripts/architecture-docs/check-rfc.rb --check\n",
-      "jobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          cat <<'TEXT'\n          ruby scripts/architecture-docs/check.rb --check\n          TEXT\n",
-      "jobs: [broken\n",
-      "jobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        run: ruby scripts/architecture-docs/check.rb --check\n",
-      "jobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - if: false\n        run: ruby scripts/architecture-docs/check.rb --check\n"
+      "# ruby scripts/architecture-docs/check.rb --check\non: push\njobs: {}\n",
+      "on: push\ndescription: ruby scripts/architecture-docs/check.rb --check\n",
+      "on: push\njobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - name: ruby scripts/architecture-docs/check.rb --check\n        run: echo skipped\n",
+      "on: push\njobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ruby scripts/architecture-docs/check.rb --check\n",
+      "on: push\njobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ruby scripts/architecture-docs/check-rfc.rb --check\n",
+      "on: push\njobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          cat <<'TEXT'\n          ruby scripts/architecture-docs/check.rb --check\n          TEXT\n",
+      "on: push\njobs: [broken\n",
+      "on: push\njobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        run: ruby scripts/architecture-docs/check.rb --check\n",
+      "on: push\njobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - if: false\n        run: ruby scripts/architecture-docs/check.rb --check\n"
     ].each do |workflow|
       with_fixture do |root|
         FileUtils.mkdir_p(File.join(root, '.github/workflows'))
@@ -99,7 +99,7 @@ class RfcSpecTest < Minitest::Test
     define_method("test_wave2_ci_execution_rejects_#{name}") do
       scope, fragment = pair
       with_fixture do |root|
-        workflow = "jobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ruby scripts/architecture-docs/check.rb --check\n"
+        workflow = "on: push\njobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ruby scripts/architecture-docs/check.rb --check\n"
         case scope
         when 'workflow'
           workflow = fragment + "\n" + workflow
@@ -130,7 +130,7 @@ class RfcSpecTest < Minitest::Test
   }.each do |name, mutation|
     define_method("test_wave2_narrow_execution_rejects_#{name}") do
       with_fixture do |root|
-        workflow = "jobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ruby scripts/architecture-docs/check.rb --check\n"
+        workflow = "on: push\njobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ruby scripts/architecture-docs/check.rb --check\n"
         changed = mutation.call(workflow)
         refute_equal workflow, changed
         FileUtils.mkdir_p(File.join(root, '.github/workflows'))
@@ -146,7 +146,66 @@ class RfcSpecTest < Minitest::Test
         FileUtils.mkdir_p(File.join(root, '.github/workflows'))
         step_shell = shell ? "        shell: #{shell}\n" : ''
         File.write(File.join(root, '.github/workflows/ci.yml'),
-          "jobs:\n  docs:\n    if: true\n    continue-on-error: false\n    runs-on: ubuntu-latest\n    steps:\n      - if: true\n        continue-on-error: false\n        run: ruby scripts/architecture-docs/check.rb --check\n" + step_shell)
+          "on: push\njobs:\n  docs:\n    if: true\n    continue-on-error: false\n    runs-on: ubuntu-latest\n    steps:\n      - if: true\n        continue-on-error: false\n        run: ruby scripts/architecture-docs/check.rb --check\n" + step_shell)
+        out, err, status = Open3.capture3(RbConfig.ruby, CLI, '--root', root, '--check')
+        assert_equal 1, status.exitstatus, out + err
+        assert_equal %w[rfc_status_provisional wbs_status_provisional rfc_html_missing], out.lines.map(&:strip)
+        assert_empty err
+      end
+    end
+  end
+
+  workflow_envelope_mutations = {
+    'missing_on'=>proc { |text| text.sub("on: push\n", '') },
+    'null_trigger'=>proc { |text| text.sub('on: push', 'on: null') },
+    'empty_trigger'=>proc { |text| text.sub('on: push', "on: ''") },
+    'empty_sequence'=>proc { |text| text.sub('on: push', 'on: []') },
+    'expression_trigger'=>proc { |text| text.sub('on: push', "on: '${{ github.event_name }}'") },
+    'unknown_trigger'=>proc { |text| text.sub('on: push', 'on: made_up_event') },
+    'unknown_sequence_event'=>proc { |text| text.sub('on: push', 'on: [push, made_up_event]') },
+    'null_sequence_event'=>proc { |text| text.sub('on: push', 'on: [push, null]') },
+    'nested_sequence'=>proc { |text| text.sub('on: push', 'on: [push, [pull_request]]') },
+    'duplicate_sequence_event'=>proc { |text| text.sub('on: push', 'on: [push, push]') },
+    'mapping_trigger'=>proc { |text| text.sub('on: push', "on:\n  push:") },
+    'unknown_top_key'=>proc { |text| "unknown: true\n" + text },
+    'top_timeout'=>proc { |text| "timeout-minutes: 0\n" + text },
+    'top_env'=>proc { |text| "env: {}\n" + text },
+    'top_defaults'=>proc { |text| "defaults: {}\n" + text },
+    'duplicate_on'=>proc { |text| "on: pull_request\n" + text },
+    'duplicate_jobs'=>proc { |text| text + text.sub("on: push\n", '') },
+    'duplicate_step_key'=>proc { |text| text.sub('- run:', "- run: echo skipped\n        run:") },
+    'yaml11_if_yes'=>proc { |text| text + "        if: yes\n" },
+    'yaml11_continue_no'=>proc { |text| text + "        continue-on-error: no\n" },
+    'literal_true_key'=>proc { |text| text.sub('on: push', 'true: push') },
+    'quoted_true_key'=>proc { |text| text.sub('on: push', "'true': push") },
+    'missing_jobs'=>proc { |text| text.sub(/^jobs:\n.*\z/m, '') },
+    'empty_jobs'=>proc { |text| text.sub(/^jobs:\n.*\z/m, "jobs: {}\n") },
+    'invalid_job_id'=>proc { |text| text.sub('  docs:', '  123:') },
+    'invalid_name'=>proc { |text| "name: {}\n" + text },
+    'duplicate_name'=>proc { |text| "name: first\nname: second\n" + text },
+    'multiple_documents'=>proc { |text| text + "---\non: push\njobs: {}\n" }
+  }
+  workflow_envelope_mutations.each do |name, mutation|
+    define_method("test_wave3_workflow_envelope_rejects_#{name}") do
+      with_fixture do |root|
+        workflow = "on: push\njobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ruby scripts/architecture-docs/check.rb --check\n"
+        changed = mutation.call(workflow)
+        refute_equal workflow, changed
+        FileUtils.mkdir_p(File.join(root, '.github/workflows'))
+        File.write(File.join(root, '.github/workflows/ci.yml'), changed)
+        assert_cli_error(root, 'ci_rfc_gate_missing', '--check')
+      end
+    end
+  end
+
+  def test_wave3_real_workflow_scalar_sequence_and_literal_on_keys
+    ["on: push", "on: pull_request", "on: workflow_dispatch",
+     "on: [push, pull_request, workflow_dispatch]", "on:\n  - push\n  - pull_request",
+     "'on': push", '"on": workflow_dispatch'].each do |trigger|
+      with_fixture do |root|
+        FileUtils.mkdir_p(File.join(root, '.github/workflows'))
+        File.write(File.join(root, '.github/workflows/ci.yml'),
+          "name: RFC contract\n#{trigger}\njobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ruby scripts/architecture-docs/check.rb --check\n")
         out, err, status = Open3.capture3(RbConfig.ruby, CLI, '--root', root, '--check')
         assert_equal 1, status.exitstatus, out + err
         assert_equal %w[rfc_status_provisional wbs_status_provisional rfc_html_missing], out.lines.map(&:strip)
@@ -162,7 +221,7 @@ class RfcSpecTest < Minitest::Test
         path = File.join(root, relative)
         FileUtils.mkdir_p(File.dirname(path))
         saved = path + '.saved'
-        File.write(saved, "jobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ruby scripts/architecture-docs/check.rb --check\n")
+        File.write(saved, "on: push\njobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ruby scripts/architecture-docs/check.rb --check\n")
         File.symlink(saved, path)
         assert_cli_error(root, reason, '--check')
         File.unlink(path)

@@ -846,11 +846,11 @@ module ArchitectureDocs
     def ci_rfc_gate?(root)
       bytes = release_document(root, '.github/workflows/ci.yml')
       return false unless bytes
+      return false unless ci_workflow_envelope?(bytes)
       workflow = YAML.safe_load(bytes)
       return false unless workflow.is_a?(Hash) && workflow['jobs'].is_a?(Hash)
-      # v1 不解析继承 defaults：任何 workflow/job defaults 均需另行扩展合同。
-      # 这里只证明保守的本地执行形状，不等于远端 Actions 已运行或通过。
-      return false if workflow.key?('defaults') || workflow.key?('env')
+      return false if workflow.key?('name') && (!workflow['name'].is_a?(String) || workflow['name'].strip.empty?)
+      return false unless workflow['jobs'].keys.all? { |id| id.is_a?(String) && id.match?(/\A[A-Za-z_][A-Za-z0-9_-]*\z/) }
       workflow['jobs'].values.any? do |job|
         ci_gate_job?(job) && job['steps'].any? do |step|
           ci_gate_step?(step) && step['run'].is_a?(String) &&
@@ -859,6 +859,44 @@ module ArchitectureDocs
       end
     rescue Psych::Exception, ArgumentError
       false
+    end
+
+    # Psych 的 YAML 1.1 对象加载会把未加引号的 on 键转成 true。
+    # 先检查 AST 原字面值；不把 literal true、重复键或未知触发器当可调度 envelope。
+    def ci_workflow_envelope?(bytes)
+      stream = YAML.parse_stream(bytes)
+      return false unless stream.children.length == 1
+      mapping = stream.children.first.root
+      return false unless mapping.is_a?(Psych::Nodes::Mapping) && ci_unique_yaml_keys?(mapping)
+      fields = mapping.children.each_slice(2).map { |key, value| [key.value, value] }.to_h
+      return false unless (fields.keys - %w[name on jobs]).empty? && fields.key?('on') && fields.key?('jobs')
+      return false unless fields['jobs'].is_a?(Psych::Nodes::Mapping)
+      trigger = fields['on']
+      events = trigger.is_a?(Psych::Nodes::Sequence) ? trigger.children : [trigger]
+      return false if events.empty?
+      return false unless events.all? { |event| event.is_a?(Psych::Nodes::Scalar) && event.tag.nil? && %w[push pull_request workflow_dispatch].include?(event.value) }
+      events.map(&:value).uniq.length == events.length
+    end
+
+    def ci_unique_yaml_keys?(root)
+      pending = [root]
+      until pending.empty?
+        node = pending.pop
+        if node.is_a?(Psych::Nodes::Mapping)
+          keys = node.children.each_slice(2).map(&:first)
+          return false unless keys.all? { |key| key.is_a?(Psych::Nodes::Scalar) && key.tag.nil? }
+          return false unless keys.map(&:value).uniq.length == keys.length
+          node.children.each_slice(2) do |key, value|
+            expected = {'if' => 'true', 'continue-on-error' => 'false'}[key.value]
+            next unless expected
+            # YAML 1.1 的 yes/no 不能冒充本合同的布尔 true/false。
+            return false unless value.is_a?(Psych::Nodes::Scalar) && value.tag.nil? &&
+                                value.plain && value.value == expected
+          end
+        end
+        pending.concat(node.children || [])
+      end
+      true
     end
 
     def ci_gate_job?(job)
