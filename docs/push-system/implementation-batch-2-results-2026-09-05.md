@@ -94,7 +94,7 @@ Task1留下一个非阻塞Minor：不存在的root目前诊断为`catalog_missin
 7. 将原Task2拆成工具Task2和真实目录Task3顺序复核：分开验证工具正确性与业务判断，原要求全部保留；代价是多一次任务交接/复核，真实目录交付前不得宣布本批完成。
 8. 不允许用概括性owner或占位producer填满65项：按剩余风险增加入口/no-caller、新闻、状态驱动、复盘四个审计切片，再由Task7组装；代价是增加顺序任务与独立复核，并多一份可追溯审计工作表，Task7通过前本批仍未完成。
 9. P01自动与补偿按同一业务日claim进入同一迁移单元，但保留render mode和Reserved恢复限制：避免把同一日事件拆成两条通知；代价是补偿不能盲接自动模式的不确定信封，必须先对账或显式恢复。
-10. 普通D01与NewsAI即使共用NewsToIdea kind也拆为不同迁移单元：前者是进程内memo/L4，后者是assessment identity与追加式delivery event；代价是目录和迁移要维护两套完成语义，NewsAI在接入真实TransportAccepted前不能宣称可靠送达。
+10. 普通D01与NewsAI即使共用NewsToIdea kind也拆为不同迁移单元：前者是进程内`D01_LAST_PUSH[code:name]`与模板`COOLDOWN_TABLE(NewsToIdea,空code)`，当前空code/PerTicket路径不读写L4冷却；后者是assessment identity与追加式delivery event。代价是目录和迁移要维护两套完成语义，D01重启后没有持久完成证明，NewsAI在接入真实TransportAccepted前不能宣称可靠送达。
 11. N01与N02按当前源码分开额度和完成域，不落实设计中的“共享配额”假设：N01没有生产Critical reservation，N02只有窗口状态；代价是未来接入权威强度源或共享额度时必须重新审计并修改目录，当前不能提前复用N02活跃性证明N01可用。
 12. 将`--push`盘中手工入口登记为“已接线但当前受阻”，不按dispatcher存在判为可用：新CLI进程在banner初始化分支之前退出；代价是后续若要恢复手工推送，必须先重构启动上下文并重新验证其与定时入口的完成owner。
 13. DataMode的模式确认状态与通知完成分层记录：`EstablishedSilently`和失败后清pending都不能作为送达证明；代价是运行时迁移不能只复用`LATEST_DATA_MODE`，需要独立的通知attempt/receipt/恢复状态。
