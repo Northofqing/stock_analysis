@@ -109,6 +109,79 @@ class RfcSpecTest < Minitest::Test
     end
   end
 
+  occurrence_cas_mutations = [
+    ['类型：ScheduleOccurrence', 'version', nil, nil, 'rfc_type_fields_invalid type=ScheduleOccurrence'],
+    ['类型：ScheduleOccurrence', 'version', 'u64', 'bool', 'rfc_field_type_invalid type=ScheduleOccurrence field=version'],
+    ['类型：ScheduleOccurrence', 'version', 'ScheduleVersionRule::v1', 'UsePushIntentVersion', 'rfc_schedule_version_invalid'],
+    ['调度身份', 'ScheduleOccurrence', 'source_contract_id |', 'source_contract_id,version |', 'rfc_schedule_identity_invalid'],
+    ['调度版本与转换提交', 'storage_owner', 'BusinessDBSameTransactionIndependentOfPushIntentVersion', 'PushIntentVersionOnly', 'rfc_schedule_version_invalid'],
+    ['调度版本与转换提交', 'initial_version', 'Zero', 'One', 'rfc_schedule_version_invalid'],
+    ['调度版本与转换提交', 'create_conflict', 'ReadExistingNeverOverwriteOrReset', 'ResetVersionToZero', 'rfc_schedule_version_invalid'],
+    ['调度版本与转换提交', 'request_guard', 'ExactIdFromStatusExpectedVersion', 'IdOnly', 'rfc_schedule_version_invalid'],
+    ['调度版本与转换提交', 'fence_guard', 'CurrentUnitGenerationManifestOwnerAndExpectedGeneration', 'CachedFenceAllowed', 'rfc_schedule_version_invalid'],
+    ['调度版本与转换提交', 'success_version', 'CheckedExpectedVersionPlusOne', 'KeepVersion', 'rfc_schedule_version_invalid'],
+    ['调度版本与转换提交', 'atomic_commit', 'StateVersionReasonAndTransitionEvidenceOneBusinessTransaction', 'SeparateEvidenceCommit', 'rfc_schedule_version_invalid'],
+    ['调度版本与转换提交', 'zero_rows', 'NoStateOrVersionWriteNoEventNoPrepareProviderLLMSinkCursorOrder', 'AppendEventAnyway', 'rfc_schedule_version_invalid'],
+    ['调度版本与转换提交', 'conflict_recovery', 'RereadOccurrenceAndCurrentFenceReevaluateNeverBlindRetry', 'RetrySameRequest', 'rfc_schedule_version_invalid'],
+    ['调度版本与转换提交', 'identity_version', 'ExcludedFromScheduleOccurrenceId', 'IncludedInIdentity', 'rfc_schedule_version_invalid'],
+    ['调度版本与转换提交', 'overflow', 'RefuseNoWritesNoEvents', 'WrapToZero', 'rfc_schedule_version_invalid'],
+    ['调度版本与转换提交', 'commit_ack_unknown', 'RequeryOccurrenceAndVersionEventBeforeAnyNewRequest', 'RetryImmediately', 'rfc_schedule_version_invalid'],
+    ['类型：ScheduleOccurrenceTransitionRequest', 'expected_version', 'ScheduleVersionRule::v1', 'UsePushIntentVersion', 'rfc_schedule_version_invalid'],
+    ['调度版本与转换提交', 'initial_state', 'Expected', 'Eligible', 'rfc_schedule_version_invalid'],
+    ['调度版本与转换提交', 'lifecycle_guard', 'RegisteredEdgeReasonAuthorityWindowAndEvidence', 'SkipWindowAndEvidence', 'rfc_schedule_version_invalid'],
+    ['调度身份', 'ScheduleOccurrence', 'activation_generation,version,expected_version,build', 'activation_generation,build', 'rfc_schedule_identity_invalid']
+  ]
+  %w[schedule_occurrence_id from_status to_status expected_version expected_generation fence_token reason evidence_refs].each do |field|
+    occurrence_cas_mutations << ['类型：ScheduleOccurrenceTransitionRequest', field, nil, nil, 'rfc_type_fields_invalid type=ScheduleOccurrenceTransitionRequest']
+  end
+  occurrence_cas_mutations.each_with_index do |(section, key, from, to, error), index|
+    define_method("test_occurrence_cas_mutation_#{index}_#{key}") do
+      with_fixture do |root|
+        change_text(root) do |s|
+          pattern = /^## #{Regexp.escape(section)}（PROPOSED）\n.*?(?=^## |\z)/m
+          assert_equal 1, s.scan(pattern).length
+          s.sub(pattern) do |body|
+            row_pattern = /^\| #{Regexp.escape(key)} \|.*\n/
+            assert_equal 1, body.scan(row_pattern).length
+            body.sub(row_pattern) { |row| from ? row.sub(from, to) : '' }
+          end
+        end
+        require_relative '../rfc_spec'
+        errors = ArchitectureDocs::RfcSpec.validate(root)
+        refute_includes errors.join("\n"), 'rfc_section_duplicate'
+        assert_cli_error(root, error)
+      end
+    end
+  end
+
+  def test_occurrence_cas_contract_cannot_be_removed
+    with_fixture do |root|
+      change_text(root) do |s|
+        s.sub(/^## 调度版本与转换提交（PROPOSED）\n.*?(?=^## |\z)/m, '')
+      end
+      assert_cli_error(root, 'rfc_schedule_version_invalid')
+    end
+  end
+
+  def test_occurrence_cas_contract_allows_prose_and_row_reordering
+    require_relative '../rfc_spec'
+    with_fixture do |root|
+      change_text(root) do |s|
+        s.sub(/^## 调度版本与转换提交（PROPOSED）\n.*?(?=^## |\z)/m) do |body|
+          lines = body.lines
+          positions = lines.each_index.select { |i| lines[i].match?(/^\| [a-z_]+ \|/) }
+          assert_equal 14, positions.length
+          reversed = positions.map { |i| lines[i] }.reverse
+          positions.each_with_index { |position, i| lines[position] = reversed[i] }
+          lines.join + "\n补充说明：展示次序与中文解释不改变原子提交规则。\n\n"
+        end
+      end
+      assert_equal [], ArchitectureDocs::RfcSpec.validate(root)
+      out, err, result = Open3.capture3(RbConfig.ruby, CLI, '--root', root, '--draft')
+      assert_equal 0, result.exitstatus, out + err
+    end
+  end
+
   def test_draft_still_rejects_metadata_counts_and_frozen_dependency_drift
     cases = [
       ['rfc_version_invalid', proc { |m| m['version'] = 'invented-v2' }],

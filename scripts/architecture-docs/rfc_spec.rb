@@ -37,9 +37,20 @@ module ArchitectureDocs
         'window_end' => 'UtcMicros',
         'catch_up_policy' => 'CatchUpPolicy',
         'status' => 'ScheduleStatus',
+        'version' => 'u64',
         'reason' => 'ReasonCode',
         'created_at' => 'UtcMicros',
         'updated_at' => 'UtcMicros',
+      },
+      'ScheduleOccurrenceTransitionRequest' => {
+        'schedule_occurrence_id' => 'Sha256',
+        'from_status' => 'ScheduleStatus',
+        'to_status' => 'ScheduleStatus',
+        'expected_version' => 'u64',
+        'expected_generation' => 'u64',
+        'fence_token' => 'ActivationFence',
+        'reason' => 'ReasonCode',
+        'evidence_refs' => 'Vec<EvidenceRef>'
       },
       'OperationalReadinessSnapshot' => {
         'snapshot_id' => 'Sha256',
@@ -233,6 +244,7 @@ module ArchitectureDocs
       'ManualResolvedRejected' => %w[AlreadyTerminal 是 never manual_not_delivered_no_cursor]
     }.freeze
     REASONS = %w[
+      schedule.occurrence_conflict
       schedule.window_open
       schedule.deferred
       input.source_recovered
@@ -439,10 +451,30 @@ module ArchitectureDocs
     }.freeze
     # v1 规范表的固定语义；只校验结构化单元格，不复制叙述或整份 RFC 快照。
     ROLLOUT_CONTRACTS = {
+      '调度版本与转换提交（PROPOSED）' => {
+        header: %w[规则 适用范围 规范值 依据],
+        rows: [
+          ['storage_owner', 'ScheduleOccurrenceStateAndTransitionEvidence', 'BusinessDBSameTransactionIndependentOfPushIntentVersion'],
+          ['initial_state', 'FirstUniqueOccurrenceInsert', 'Expected'],
+          ['initial_version', 'FirstUniqueOccurrenceInsert', 'Zero'],
+          ['create_conflict', 'ExistingScheduleOccurrenceId', 'ReadExistingNeverOverwriteOrReset'],
+          ['request_guard', 'EveryLifecycleTransition', 'ExactIdFromStatusExpectedVersion'],
+          ['fence_guard', 'EveryLifecycleTransition', 'CurrentUnitGenerationManifestOwnerAndExpectedGeneration'],
+          ['lifecycle_guard', 'EveryLifecycleTransition', 'RegisteredEdgeReasonAuthorityWindowAndEvidence'],
+          ['success_version', 'ExactlyOneRowCAS', 'CheckedExpectedVersionPlusOne'],
+          ['overflow', 'ExpectedVersionAtU64Max', 'RefuseNoWritesNoEvents'],
+          ['atomic_commit', 'SuccessfulTransition', 'StateVersionReasonAndTransitionEvidenceOneBusinessTransaction'],
+          ['zero_rows', 'FailedCAS', 'NoStateOrVersionWriteNoEventNoPrepareProviderLLMSinkCursorOrder'],
+          ['conflict_recovery', 'schedule.occurrence_conflict', 'RereadOccurrenceAndCurrentFenceReevaluateNeverBlindRetry'],
+          ['identity_version', 'OccurrenceVersionAndRequestExpectedVersion', 'ExcludedFromScheduleOccurrenceId'],
+          ['commit_ack_unknown', 'SameOccurrenceAndProposedResultVersion', 'RequeryOccurrenceAndVersionEventBeforeAnyNewRequest']
+        ],
+        error: 'rfc_schedule_version_invalid'
+      },
       "调度身份（PROPOSED）" => {
         header: ["规则","函数","有序材料","排除材料","依据"],
         rows: [
-          ["ScheduleOccurrence","SHA256CanonicalTuple","schema_version,namespace,unit_id,producer_id,schedule_or_trigger_id,calendar_id,business_date,occurrence_family,occurrence_key,completion_owner,source_contract_id","wall_clock_tick,phase_epic,activation_generation,build,payload_sha256,rendered_sha256,evidence_sha256"],
+          ["ScheduleOccurrence","SHA256CanonicalTuple","schema_version,namespace,unit_id,producer_id,schedule_or_trigger_id,calendar_id,business_date,occurrence_family,occurrence_key,completion_owner,source_contract_id","wall_clock_tick,phase_epic,activation_generation,version,expected_version,build,payload_sha256,rendered_sha256,evidence_sha256"],
         ],
         error: 'rfc_schedule_identity_invalid'
       },
@@ -724,6 +756,8 @@ module ArchitectureDocs
     }.freeze
     FIELD_RULE_REFERENCES = {
       ['ScheduleOccurrence', 'schedule_occurrence_id'] => ['ScheduleIdentity::v1', 'rfc_schedule_identity_invalid'],
+      ['ScheduleOccurrence', 'version'] => ['ScheduleVersionRule::v1', 'rfc_schedule_version_invalid'],
+      ['ScheduleOccurrenceTransitionRequest', 'expected_version'] => ['ScheduleVersionRule::v1', 'rfc_schedule_version_invalid'],
       ['PreparedPush', 'intent_id'] => ['IdentityRule::PreparedPushIntent', 'rfc_identity_contract_invalid'],
       ['VerifiedTerminalRef', 'binding_sha256'] => ['IdentityRule::TerminalBinding', 'rfc_identity_contract_invalid'],
       ['CompletionPolicy', 'already_terminal_policy'] => ['CompletionRule::AlreadyTerminal', 'rfc_completion_binding_invalid']

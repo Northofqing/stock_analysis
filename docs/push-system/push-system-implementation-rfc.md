@@ -467,6 +467,7 @@ operator/告警适配器及测试。规范化材料是精确 ASCII 代码，不�
 | schedule.window_not_open | 捕获业务时间早于有效窗口 | 保持 occurrence 待处理，直到具备资格 | [Q:101] [Q:28] |
 | schedule.window_expired | 捕获业务时间超过补偿窗口 | 仅产生策略允许的 schedule 提案，不暗示投递 | [Q:101] [Q:28] |
 | schedule.occurrence_closed | 精确调度 occurrence 已关闭 | 不产生新调度，通知状态仍独立 | [Q:101] [Q:86] |
+| schedule.occurrence_conflict | occurrence 的原状态、版本或转换提交前提冲突 | 零写作用拒绝，重读原 occurrence 与当前 fence 后重新评估；禁止盲重试 | [Q:77] [Q:86] [Q:101] |
 | schedule.window_open | authority 授予有效窗口资格 | 按 current version/gate 进入 Eligible | [Q:28] [Q:101] |
 | schedule.deferred | 策略允许下一 eligible session | 保存原 identity 和下一资格引用 | [Q:86] [Q:101] |
 | input.source_recovered | 来源证据及版本已恢复 | 记录恢复事件，重验窗口与 readiness | [Q:30] [Q:101] |
@@ -868,11 +869,56 @@ LLM、发送或订单。SQL 行为测试不是进程级 durable 故障注入，�
 | window_end | UtcMicros | 不含终点且大于起点 | 纳入 |
 | catch_up_policy | CatchUpPolicy | 下表四种策略闭集 | 纳入 |
 | status | ScheduleStatus | 生命周期表闭集 | 纳入 |
+| version | u64 | ScheduleVersionRule::v1 | 纳入 |
 | reason | ReasonCode | 当前转换的稳定原因 | 纳入 |
 | created_at | UtcMicros | 首次创建时间 | 纳入 |
-| updated_at | UtcMicros | 单调更新；转换使用独立 expected-version CAS | 纳入 |
+| updated_at | UtcMicros | 单调更新；不能代替 occurrence 自身的 version | 纳入 |
 
 字段的规范化用于快照序列化；身份哈希仅取下一表的有序子集，不能误用整份快照。所有类型均是拟议合同，未新增运行时类型或表。
+
+## 类型：ScheduleOccurrenceTransitionRequest（PROPOSED）
+
+创建者：持有当前 gate/fence 的 scheduler、恢复器或 completion owner，读取持久 occurrence 后构造不可变请求。消费者：业务库的 occurrence 转换入口。[Q:28] [Q:77] [Q:80] [Q:86]
+
+| 字段 | 类型 | 不变量 | 规范化 |
+| --- | --- | --- | --- |
+| schedule_occurrence_id | Sha256 | 必须引用已持久化的同一 occurrence | 纳入 |
+| from_status | ScheduleStatus | 请求构造时读取的原状态，提交时必须仍相等 | 纳入 |
+| to_status | ScheduleStatus | 仅允许调度生命周期表中的边 | 纳入 |
+| expected_version | u64 | ScheduleVersionRule::v1 | 纳入 |
+| expected_generation | u64 | 必须等于当前 Unit gate 的 generation | 纳入 |
+| fence_token | ActivationFence | 完整绑定 unit_id、generation、manifest_sha256、physical_owner，不能使用缓存值授权 | 纳入 |
+| reason | ReasonCode | 与对应生命周期边的 ReasonCode 相同 | 纳入 |
+| evidence_refs | Vec<EvidenceRef> | 已获许可且不可变的窗口、来源或完成提案证据 | 纳入 |
+
+`ActivationFence` 是前文 common_fence 的类型化四元组，generation 同时必须等于 expected_generation。请求不携带新的业务身份，也不以 push_intents.version 作为 expected_version。转换入口只校验已经准备好的不可变证据引用；自身不调用 provider/LLM 或发送，不以失败后的补采集掩盖 CAS 冲突。
+
+## 调度版本与转换提交（PROPOSED）
+
+[Q:28] [Q:77] [Q:80] [Q:86]。本表是 `ScheduleVersionRule::v1` 的唯一规范定义，覆盖尚无业务 intent 的 Expected、Eligible、Deferred、BlockedOnInput 以及其余全部调度状态。
+
+| 规则 | 适用范围 | 规范值 | 依据 |
+| --- | --- | --- | --- |
+| storage_owner | ScheduleOccurrenceStateAndTransitionEvidence | BusinessDBSameTransactionIndependentOfPushIntentVersion | [Q:28] [Q:86] |
+| initial_state | FirstUniqueOccurrenceInsert | Expected | [Q:28] |
+| initial_version | FirstUniqueOccurrenceInsert | Zero | [Q:77] |
+| create_conflict | ExistingScheduleOccurrenceId | ReadExistingNeverOverwriteOrReset | [Q:16] [Q:77] |
+| request_guard | EveryLifecycleTransition | ExactIdFromStatusExpectedVersion | [Q:77] |
+| fence_guard | EveryLifecycleTransition | CurrentUnitGenerationManifestOwnerAndExpectedGeneration | [Q:80] |
+| lifecycle_guard | EveryLifecycleTransition | RegisteredEdgeReasonAuthorityWindowAndEvidence | [Q:28] [Q:86] |
+| success_version | ExactlyOneRowCAS | CheckedExpectedVersionPlusOne | [Q:77] |
+| overflow | ExpectedVersionAtU64Max | RefuseNoWritesNoEvents | [Q:77] |
+| atomic_commit | SuccessfulTransition | StateVersionReasonAndTransitionEvidenceOneBusinessTransaction | [Q:86] |
+| zero_rows | FailedCAS | NoStateOrVersionWriteNoEventNoPrepareProviderLLMSinkCursorOrder | [Q:77] |
+| conflict_recovery | schedule.occurrence_conflict | RereadOccurrenceAndCurrentFenceReevaluateNeverBlindRetry | [Q:77] |
+| identity_version | OccurrenceVersionAndRequestExpectedVersion | ExcludedFromScheduleOccurrenceId | [Q:16] |
+| commit_ack_unknown | SameOccurrenceAndProposedResultVersion | RequeryOccurrenceAndVersionEventBeforeAnyNewRequest | [Q:77] |
+
+首次按唯一 schedule_occurrence_id 插入 Expected、version=0 及创建证据，三者同一业务库事务提交；并发 create 只读取获胜的原 occurrence，不能重置版本。之后每次合法转换都要求持久行的 ID、from_status、version=expected_version 同时匹配，并在提交临界区重新校验完整当前 fence、expected_generation、逐边 authority/窗口/证据与 ReasonCode。fence 检查必须与 owner 晋级串行，不能检查后再用旧缓存提交。成功恰好更新一行，version 经溢出检查后严格加一；status、version、reason、updated_at 与 transition evidence 共同提交，任何写入或证据追加失败均整体回滚。
+
+转换证据以 `(schedule_occurrence_id, result_version)` 唯一关联，保存 from_status、to_status、expected_version、result_version、当前 fence 引用、ReasonCode、输入证据 hash 和提交时间；创建证据使用 result_version=0。提交确认丢失时先重查该事件和行版本，已提交则返回既有事实；不得重复追加事件或把已成功转换再执行一次。这里规定未来业务库 occurrence registry 的存储与事务合同，不借用 push_intents.version，不修改 Task3 的独立 SQL，也不宣称注册表已经实现。
+
+CAS 零行或原状态/版本冲突返回 `schedule.occurrence_conflict`；不追加任何转换事件、不修改状态/版本、不调用 prepare/provider/LLM/sink、不推进游标或产生订单。恢复器重新读取原 occurrence、已提交转换证据及当前 fence，重新评估目标边、窗口与输入；若别的请求已完成同一转换则只返回原事实，只有仍有合法下一步时才构造新的 expected_version 请求，禁止原请求盲重试。陈旧 generation/owner 分别沿用 `activation.generation_conflict` / `activation.owner_conflict`，同样零写作用。version 是快照和并发控制材料，不参与 schedule_occurrence_id，启动 catch-up 与正常 due 仍只合并同一身份。
 
 ## 调度身份（PROPOSED）
 
@@ -880,13 +926,13 @@ LLM、发送或订单。SQL 行为测试不是进程级 durable 故障注入，�
 
 | 规则 | 函数 | 有序材料 | 排除材料 | 依据 |
 | --- | --- | --- | --- | --- |
-| ScheduleOccurrence | SHA256CanonicalTuple | schema_version,namespace,unit_id,producer_id,schedule_or_trigger_id,calendar_id,business_date,occurrence_family,occurrence_key,completion_owner,source_contract_id | wall_clock_tick,phase_epic,activation_generation,build,payload_sha256,rendered_sha256,evidence_sha256 | [Q:16] [Q:86] |
+| ScheduleOccurrence | SHA256CanonicalTuple | schema_version,namespace,unit_id,producer_id,schedule_or_trigger_id,calendar_id,business_date,occurrence_family,occurrence_key,completion_owner,source_contract_id | wall_clock_tick,phase_epic,activation_generation,version,expected_version,build,payload_sha256,rendered_sha256,evidence_sha256 | [Q:16] [Q:86] |
 
 `schema_version=ScheduleOccurrence/v1` 使用本 RFC 的 canonical tuple 编码及 SHA-256。activation generation 是执行 fence；重启或晋级不改变同一业务 occurrence 的身份。calendar date、采样时间、analytics 时间和消息 receipt 时间不能替代 business date。盘前、集合竞价、盘中、盘后只做规划/观察 Epic，不持有 occurrence、游标或完成状态；不同 producer/owner/occurrence 不因同一 phase 或一分钟合并。
 
 ## 调度生命周期（PROPOSED）
 
-[Q:28] [Q:86]。所有边采用 occurrence 的 expected-version CAS，保留原身份和转换证据；状态闭集为 `Expected / Eligible / Prepared / Closed / Missed / Deferred / BlockedOnInput`。`Prepared` 仅表示准备结果已经持久化，不代表发送。通知最终化仍使用 Task2/Task3 合同。
+[Q:28] [Q:86]。所有边使用 ScheduleOccurrenceTransitionRequest，并无条件遵守「调度版本与转换提交」的 ScheduleVersionRule::v1，保留原身份和转换证据；状态闭集为 `Expected / Eligible / Prepared / Closed / Missed / Deferred / BlockedOnInput`。`Prepared` 仅表示准备结果已经持久化，不代表发送。通知最终化仍使用 Task2/Task3 合同。
 
 | 起点 | 终点 | 权威 | 窗口与版本条件 | 持久事实 | 禁止副作用 | ReasonCode | 依据 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
