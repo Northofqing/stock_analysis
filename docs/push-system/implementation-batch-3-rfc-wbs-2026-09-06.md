@@ -140,16 +140,16 @@ prepare(RunContext) -> PreparedFacts -> project() -> JobDecision
 - 修改：`scripts/architecture-docs/rfc_spec.rb`
 - 修改：`scripts/architecture-docs/test/rfc_spec_test.rb`
 
-- [ ] 定义 `PhaseScheduler` 的业务日 authority、occurrence identity、catch-up/restart、同 tick 合并、时窗过期和非交易日行为；盘前/竞价/盘中/盘后只做 Epic 分类。
-- [ ] 定义 `CoreUnready`、`ProducerUnready`、`BlockedOnInput` 的 typed snapshot、进程 exit/readiness probe、部署可观察输出和恢复事件；不得用日志代替门禁。
-- [ ] 定义 activation `Disabled→Shadow→Active→Draining→Disabled` 及回滚的新 generation/CAS；所有新旧 physical owner 必须读取同一 gate/fence，单个交易日只晋级一个 Unit。
-- [ ] 定义 shadow exact compare：共享 PreparedFacts，对比 JobDecision、SemanticProjection hash、render hash、ReasonCode 和 completion proposal；禁止 provider 二次调用、DB 写、游标推进、LLM 重算、订单或发送。
-- [ ] 定义 operator `inspect/reconcile/resolve-uncertain/promote/rollback` 请求/输出、typed evidence、双人/单人权限边界、审计身份、拒绝原因和 dry-run；用户/指定操作员执行生产晋级。
-- [ ] 定义 retention/security：非终态永不自动清理；迁移证据至少 90 天；法规/投递审计遵守 v18/v19 来源的 WORM `>5年` 要求，更严格的监管/模型/交易策略继续优先且没有统一五年上限；清理需要 terminal binding、journal 和审计。
-- [ ] 通用 Unit 门禁固定 unit/failure/crash/shadow/dedup/rollback 六类；当前 65-kind 基线的业务样本至少覆盖 08-31 历史补推、N02 receipt 时间、TEST_CODE G5b、NewsAI 跨 batch、09-01 254 sell、Attribution/G5b sink fail、R03、R08、NoData/Disabled/Uncertain 和双 DB 冲突/回滚。09-04 的 29 条 PaperBuy 与 Watchdog 只作为非基线设计/回放反例，不生成 Unit、不证明当前源码能力、不激活 producer。
-- [ ] 增加 validator 反例，保证缺状态边、缺命令、缺样本、把日志当 readiness、允许 shadow 副作用、允许删除非终态都会失败。
-- [ ] 运行 RFC/input/source/catalog 测试及真实 draft、SQLite DDL 执行、`git diff --check`。
-- [ ] 独立规格复核 Q16/Q31/Q44/Q79--Q84/Q88/Q99/Q100 和最近样本；独立质量复核 cutover 双发、回滚、权限和可观测性。修复后提交 `docs: specify push rollout and acceptance gates`。
+- [x] 定义 `PhaseScheduler` 的业务日 authority、occurrence identity、catch-up/restart、同 tick 合并、时窗过期和非交易日行为；盘前/竞价/盘中/盘后只做 Epic 分类。
+- [x] 定义 `CoreUnready`、`ProducerUnready`、`BlockedOnInput` 的 typed snapshot、进程 exit/readiness probe、部署可观察输出和恢复事件；不得用日志代替门禁。
+- [x] 定义 activation `Disabled→Shadow→Active→Draining→Disabled` 及回滚的新 generation/CAS；所有新旧 physical owner 必须读取同一 gate/fence，单个交易日只晋级一个 Unit。
+- [x] 定义 shadow exact compare：共享 PreparedFacts，对比 JobDecision、SemanticProjection hash、render hash、ReasonCode 和 completion proposal；禁止 provider 二次调用、DB 写、游标推进、LLM 重算、订单或发送。
+- [x] 定义 operator `inspect/reconcile/resolve-uncertain/promote/rollback` 请求/输出、typed evidence、双人/单人权限边界、审计身份、拒绝原因和 dry-run；用户/指定操作员执行生产晋级。
+- [x] 定义 retention/security：非终态永不自动清理；迁移证据至少 90 天；法规/投递审计遵守 v18/v19 来源的 WORM `>5年` 要求，更严格的监管/模型/交易策略继续优先且没有统一五年上限；清理需要 terminal binding、journal 和审计。
+- [x] 通用 Unit 门禁固定 unit/failure/crash/shadow/dedup/rollback 六类；当前 65-kind 基线的业务样本至少覆盖 08-31 历史补推、N02 receipt 时间、TEST_CODE G5b、NewsAI 跨 batch、09-01 254 sell、Attribution/G5b sink fail、R03、R08、NoData/Disabled/Uncertain 和双 DB 冲突/回滚。09-04 的 29 条 PaperBuy 与 Watchdog 只作为非基线设计/回放反例，不生成 Unit、不证明当前源码能力、不激活 producer。
+- [x] 增加 validator 反例，保证缺状态边、缺命令、缺样本、把日志当 readiness、允许 shadow 副作用、允许删除非终态都会失败。
+- [x] 运行 RFC/input/source/catalog 测试及真实 draft、SQLite DDL 执行、`git diff --check`。
+- [x] 独立规格复核 Q16/Q31/Q44/Q79--Q84/Q88/Q99/Q100 和最近样本；独立质量复核 cutover 双发、回滚、权限和可观测性。修复后提交 `docs: specify push rollout and acceptance gates`。
 
 ## Task 5：W01--W21 与 52 MigrationUnit 精确 WBS
 
