@@ -53,6 +53,10 @@ pub use projection::{
     SemanticProjection, Severity, SourceBinding, SubKind, SubKindValue, Suppression,
 };
 
+pub(crate) use projection::derive_decision_id;
+#[cfg(test)]
+pub(crate) use projection::w08_prepared_push_fixture;
+
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum PushJobError {
     #[error("invalid {field}: {reason}")]

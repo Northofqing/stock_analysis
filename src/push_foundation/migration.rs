@@ -160,7 +160,7 @@ impl MigrationReceipt {
     }
 }
 
-fn validate_database_path(database: &Path) -> Result<(), FoundationMigrationError> {
+pub(super) fn validate_database_path(database: &Path) -> Result<(), FoundationMigrationError> {
     if !database.is_absolute() {
         return Err(FoundationMigrationError::DatabasePathNotAbsolute);
     }
@@ -204,6 +204,13 @@ fn attest(
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|_| FoundationMigrationError::AttestationOpenFailed)?;
+    attest_connection(&connection, ddl_sha256)
+}
+
+pub(super) fn attest_connection(
+    connection: &Connection,
+    ddl_sha256: &Sha256Digest,
+) -> Result<MigrationReceipt, FoundationMigrationError> {
     connection
         .execute_batch("PRAGMA query_only=ON;")
         .map_err(|_| FoundationMigrationError::AttestationFailed {

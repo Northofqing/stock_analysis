@@ -798,6 +798,15 @@ impl PreparedPush {
         self.rendered_bytes.as_bytes()
     }
 
+    /// Exact restart snapshot. Raw rendered bytes remain a separate outbox column; this snapshot
+    /// binds them by length and SHA-256 and never embeds their contents.
+    pub fn canonical_snapshot_bytes(&self) -> ExactBytes {
+        ExactBytes::new(canonical_preimage(
+            "PreparedPush/v1",
+            &prepared_push_fields(self),
+        ))
+    }
+
     pub fn compare_immutable(&self, other: &Self) -> PreparedPushComparison {
         if self.intent_id != other.intent_id {
             PreparedPushComparison::DifferentIntent
@@ -818,7 +827,7 @@ pub enum PreparedPushComparison {
     ResolutionRequired { reason: ReasonCode },
 }
 
-fn derive_decision_id(intent_id: &IntentId) -> DecisionId {
+pub(crate) fn derive_decision_id(intent_id: &IntentId) -> DecisionId {
     DecisionId::from_digest(&canonical_digest(
         "PreparedPushDecision/v1",
         &BTreeMap::from([(
@@ -1122,7 +1131,11 @@ fn reason_time_payload(
 }
 
 fn prepared_push_value(push: &PreparedPush) -> CanonicalValue {
-    CanonicalValue::Object(BTreeMap::from([
+    CanonicalValue::Object(prepared_push_fields(push))
+}
+
+fn prepared_push_fields(push: &PreparedPush) -> BTreeMap<&'static str, CanonicalValue> {
+    BTreeMap::from([
         (
             "decision_id",
             CanonicalValue::String(push.decision_id.as_str().to_owned()),
@@ -1158,7 +1171,7 @@ fn prepared_push_value(push: &PreparedPush) -> CanonicalValue {
             "unit_id",
             CanonicalValue::String(push.unit_id.as_str().to_owned()),
         ),
-    ]))
+    ])
 }
 
 fn exact_bytes_value(bytes: &ExactBytes) -> CanonicalValue {
@@ -1208,4 +1221,51 @@ pub(super) fn projector_fixture(context: &RunContext) -> Result<DecisionProjecto
         ),
     )
     .map_err(|_| PushJobError::InvalidRunContext("projection fixture binding mismatch"))
+}
+
+#[cfg(test)]
+pub(crate) fn w08_prepared_push_fixture() -> PreparedPush {
+    let source_contract_id = SourceContractId::try_new("auction-source".to_owned()).unwrap();
+    let occurrence = super::derive_occurrence_id(&super::OccurrenceIdentityMaterial::new(
+        super::BusinessDate::parse("2026-09-07").unwrap(),
+        super::OccurrenceFamily::try_new("auction-session".to_owned()).unwrap(),
+        super::OccurrenceKey::try_new("main".to_owned()).unwrap(),
+    ));
+    let subject = SubjectId::entity("000001.SZ".to_owned()).unwrap();
+    let intent_id = derive_intent_id(&IntentIdentityMaterial::new(
+        Namespace::Production,
+        UnitId::try_new("MU-auction".to_owned()).unwrap(),
+        CompletionOwnerId::try_new("owner-auction".to_owned()).unwrap(),
+        source_contract_id.clone(),
+        occurrence.clone(),
+        subject.clone(),
+        AudienceId::try_new("portfolio-owner".to_owned()).unwrap(),
+    ));
+    let rendered_bytes = ExactBytes::new(b"first render  \nline two!".to_vec());
+    let rendered_sha256 = rendered_bytes.sha256().clone();
+    PreparedPush {
+        decision_id: derive_decision_id(&intent_id),
+        intent_id,
+        unit_id: UnitId::try_new("MU-auction".to_owned()).unwrap(),
+        occurrence,
+        subject,
+        run_context_sha256: Sha256Digest::parse("fixture", &"c".repeat(64)).unwrap(),
+        prepared_facts_sha256: Sha256Digest::parse("fixture", &"d".repeat(64)).unwrap(),
+        semantic_projection_sha256: Sha256Digest::parse("fixture", &"e".repeat(64)).unwrap(),
+        source_binding: SourceBinding {
+            source_contract_id: source_contract_id.clone(),
+            source_contract_version: SourceContractVersion::try_new("auction-source-v2".to_owned())
+                .unwrap(),
+            source_refs: vec![SourceRef::new(
+                super::SourceRefId::try_new("source-1".to_owned()).unwrap(),
+                super::SourceProvider::try_new("fixture-provider".to_owned()).unwrap(),
+                super::ExternalId::try_new("external-1".to_owned()).unwrap(),
+                source_contract_id,
+                Sha256Digest::parse("fixture", &"a".repeat(64)).unwrap(),
+            )],
+            evidence_fingerprint: Sha256Digest::parse("fixture", &"b".repeat(64)).unwrap(),
+        },
+        rendered_bytes,
+        rendered_sha256,
+    }
 }
