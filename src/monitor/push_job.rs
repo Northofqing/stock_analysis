@@ -6,6 +6,7 @@ mod delivery;
 mod facts;
 mod identity;
 mod policy;
+mod projection;
 
 pub use context::{
     AuthenticatedOperatorRef, CalendarDate, CommandId, GitSha40, PhaseEpic, RunContext, ScheduleId,
@@ -38,6 +39,10 @@ pub use policy::{
     NoDataPolicy, ReasonCode, RetentionClass, RetryDirective, RetryEligibility, RetryPolicy,
     ScheduleCloseBranch, ScheduleClosePolicy, ScheduleDirective, UncertainPolicy,
     VerifiedEmptyEvidenceRef,
+};
+pub use projection::{
+    DecisionProjector, MonitorKind, ProjectionError, SemanticInput, SemanticProjection, Severity,
+    SubKind, SubKindValue, Suppression,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -77,6 +82,8 @@ pub enum PushJobError {
     InvalidVerifiedEmptyEvidence(&'static str),
     #[error("invalid prepared facts: {0}")]
     InvalidPreparedFacts(&'static str),
+    #[error("unknown monitor kind: {0}")]
+    InvalidMonitorKind(String),
 }
 
 pub type Result<T> = std::result::Result<T, PushJobError>;

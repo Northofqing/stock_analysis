@@ -540,7 +540,7 @@ fn source_time_value(source_time: &SourceTime) -> CanonicalValue {
     ]))
 }
 
-fn model_output_ref_value(model_output_ref: &ModelOutputRef) -> CanonicalValue {
+pub(super) fn model_output_ref_value(model_output_ref: &ModelOutputRef) -> CanonicalValue {
     CanonicalValue::Object(BTreeMap::from([
         (
             "input_sha256",

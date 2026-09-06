@@ -276,7 +276,7 @@ pub(super) fn namespace_value(namespace: &Namespace) -> CanonicalValue {
     ]))
 }
 
-fn subject_value(subject: &SubjectId) -> CanonicalValue {
+pub(super) fn subject_value(subject: &SubjectId) -> CanonicalValue {
     let (kind, value) = match subject {
         SubjectId::Global => ("Global", CanonicalValue::Null),
         SubjectId::Entity(value) => ("Entity", CanonicalValue::String(value.as_str().to_owned())),

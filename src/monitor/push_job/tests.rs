@@ -1650,8 +1650,16 @@ fn w05_semantic_projection_is_deterministic_and_context_bound() {
     assert_eq!(first.template_id().as_str(), "auction-card");
     assert_eq!(first.template_version().as_str(), "auction-card-v3");
     assert_eq!(
+        first.evidence_fingerprint().as_str(),
+        "be26edc2f3f2f21a8c2851de35d2935985b1742b329920e311d59e833274e606"
+    );
+    assert_eq!(
+        first.canonical_bytes().as_bytes(),
+        b"SemanticProjection/v1\0{\"audience\":\"portfolio-owner\",\"business_subject\":{\"kind\":\"Entity\",\"value\":\"000001.SZ\"},\"completion_policy_id\":\"auction-notification\",\"completion_policy_version\":\"policy-v1\",\"evidence_fingerprint\":\"be26edc2f3f2f21a8c2851de35d2935985b1742b329920e311d59e833274e606\",\"monitor_kind\":\"AuctionVolume\",\"occurrence\":\"d5881448142d550c9e73bd4c7d61ed8da16587a6beee0f6dced16c5420b11e0d\",\"severity\":\"Important\",\"sub_kind\":{\"kind\":\"None\",\"value\":null},\"suppression\":{\"eligible_after\":null,\"kind\":\"Eligible\",\"reason\":null},\"template_id\":\"auction-card\",\"template_version\":\"auction-card-v3\"}"
+    );
+    assert_eq!(
         first.sha256().as_str(),
-        "W05_SEMANTIC_PROJECTION_GOLDEN_TO_BE_REPLACED"
+        "7ea07990d419f36a9632fbff8dd52efbb383b51257166d57d9af3be5e7f058f1"
     );
 }
 
