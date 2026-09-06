@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "status": "PROVISIONAL",
+  "source_workspace": "root-worktree-snapshot",
+  "captured_date": "2026-09-06",
+  "inputs": [
+    {
+      "id": "architecture-blueprint-markdown",
+      "path": "docs/Project_Architecture_Blueprint.md",
+      "bytes": 165130,
+      "sha256": "a1acf98ec960880934285d1a71ecf6fba068d809b08174ab51871a91645f2f75",
+      "role": "当前架构与拟议设计的语义源",
+      "authority": "原工作区 semantic source snapshot；当前架构断言和拟议设计须分别阅读，不替代隔离分支源码证据与已批准决策。",
+      "conflicts": [
+        "源文档的当前工作树、规模与 CURRENT 断言属于原快照，不证明本隔离分支或部署制品；冲突以冻结源码及能力目录重新核对。"
+      ]
+    },
+    {
+      "id": "architecture-blueprint-html",
+      "path": "docs/Project_Architecture_Blueprint.html",
+      "bytes": 540856,
+      "sha256": "4c4b8b8a34206dc7cde66c4a7c6e330679bb2cdba7341b4ee54e83d494a80107",
+      "role": "用户指定的 derived visual snapshot，不是独立语义真相",
+      "authority": "derived visual snapshot",
+      "conflicts": [
+        "HTML 是冻结的派生视觉输入，不是独立语义真相；不得覆盖 Markdown、已批准决策或隔离分支源码裁决，也不代表本批已重建或验收 HTML。"
+      ]
+    },
+    {
+      "id": "comprehensive-reanalysis-2026-09-05",
+      "path": "docs/push-system/comprehensive-reanalysis-2026-09-05.md",
+      "bytes": 47302,
+      "sha256": "46b644f7e17fa0854276a928ae1e4f70b918b5f973fd16e5267d77b37d73abbd",
+      "role": "08-31--09-04 生产证据分析/风险/验收样本",
+      "authority": "历史生产样本的分析与风险输入，不是实施方案完成证明或实时生产验收。",
+      "conflicts": [
+        "原报告来自含未合并路径的工作区；67-kind 等源码断言不覆盖本分支的 65-kind 冻结能力目录。"
+      ]
+    },
+    {
+      "id": "recent-push-evidence-2026-09-05",
+      "path": "docs/push-system/recent-push-evidence-2026-09-05.json",
+      "bytes": 405754,
+      "sha256": "0d10d3ad158378c6c34ddab4ab9d074019f78e956248e1c7830e7224c909ed54",
+      "role": "脱敏聚合证据，不等于实时生产状态",
+      "authority": "冻结的脱敏历史聚合证据；各数据库读取不构成跨库原子快照。",
+      "conflicts": [
+        "本地发送声明、统计与保存结果不能自动等同远端 TransportAccepted 或用户已读；本任务不重新采集生产证据。"
+      ]
+    },
+    {
+      "id": "all-push-kinds-2026-09-05",
+      "path": "docs/push-system/all-push-kinds-2026-09-05.md",
+      "bytes": 27905,
+      "sha256": "50ee2e5fa63b9584475e7a471b1ea0646e81e47335e2960be605b7acafca3390",
+      "role": "原冲突工作区67-kind非基线证据；不得给PaperBuy/Watchdog创建本分支Unit/激活证明",
+      "authority": "non-baseline evidence：原混合工作区的 67-kind 审计快照。",
+      "conflicts": [
+        "non-baseline evidence：本隔离分支以 07781bf386aafdf202851ae928efee8920387058 的 65-kind 能力目录为源码基线；不得用此 67-kind 快照替代。",
+        "PaperBuy/Watchdog 在原混合工作树存在，本隔离分支未移入；仅为 excluded_worktree_additions，不创建本分支 MigrationUnit 或激活证明。"
+      ]
+    },
+    {
+      "id": "push-documentation-hardening-plan",
+      "path": "docs/push-system/push-documentation-hardening-plan.md",
+      "bytes": 9426,
+      "sha256": "752024603b5cb67e031a433f5a3496bb7ea567e91e8bece36061f715c6197fef",
+      "role": "原硬化计划验收与后续HTML/CI边界",
+      "authority": "原计划与验收边界快照，不是本批执行状态或完成证明。",
+      "conflicts": [
+        "导入不执行原计划中的步骤；后续 HTML/CI 与完整 RFC、WBS、运行时 Foundation 的验收不能由输入冻结推断。"
+      ]
+    },
+    {
+      "id": "reanalyse-recent-pushes-script",
+      "path": "docs/push-system/reanalyse-recent-pushes.rb",
+      "bytes": 20408,
+      "sha256": "1f4b5dbf2efeef914a083f52f4963661bad8bc7b11fe66f145bdbaf820cc080a",
+      "role": "派生程序快照，本任务不执行生产读取",
+      "authority": "历史证据的派生程序输入快照，仅做字节冻结和 Ruby 语法检查。",
+      "conflicts": [
+        "程序存在或语法通过不证明重跑结果；本任务不执行脚本、不访问生产数据库。"
+      ]
+    },
+    {
+      "id": "verify-reanalysis-script",
+      "path": "docs/push-system/verify-reanalysis.rb",
+      "bytes": 4230,
+      "sha256": "c535ff7c2ff7864cf98fba8ab139f247cdde4701a99c1956836518735a6938ec",
+      "role": "证据内部一致性校验快照",
+      "authority": "证据内部一致性校验程序的冻结快照，本任务仅做 Ruby 语法检查。",
+      "conflicts": [
+        "不执行导入脚本；内部一致性不等同实时生产状态、部署证明或外部投递回执。"
+      ]
+    }
+  ]
+}
