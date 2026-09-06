@@ -128,7 +128,9 @@ source_contract_id + source_contract_version
 template_version
 ```
 
-调用方只能提供本次捕获值：`run_id`、business/calendar date、phase、trigger、occurrence、captured business time。factory 校验这些值与 binding 一致，再构造 `RunContext`。`RunContextFactory::begin_capture` 返回 `PreparationCapture`，后者除公开可读的 `RunContext` 外，还私有保存 catalog 给出的预期 `source_contract_id`；这是必要的，因为 RFC 的 `RunContext` 只有 source-contract version、没有 ID。首次 captured facts 的 ID 和版本必须分别与这两个冻结值一致。
+调用方只能提供本次捕获值：`run_id`、business/calendar date、phase、trigger、`OccurrenceIdentityMaterial`、captured business time。factory 先验证 occurrence family 等于 binding 注册家族，再派生 RFC 所需的 `OccurrenceId`；已经散列的不透明 ID 不能反向证明它来自正确家族。Test namespace 内嵌的 run ID 还必须等于本次 `run_id`。factory 完成这些校验后构造 `RunContext`。
+
+`RunContextFactory::begin_capture` 返回 `PreparationCapture`，后者除公开可读的 `RunContext` 外，还私有保存 catalog 给出的预期 `source_contract_id`；这是必要的，因为 RFC 的 `RunContext` 只有 source-contract version、没有 ID。首次 captured facts 的 ID 和版本必须分别与这两个冻结值一致。
 
 W04 测试使用 crate-private catalog binding fixture；W06 实现正式 catalog lookup 并成为 factory 的唯一生产创建者。不得为了方便把 RFC 未声明的 `source_contract_id` 塞进 `RunContext` canonical 对象。
 
