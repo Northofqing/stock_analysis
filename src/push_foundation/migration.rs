@@ -27,6 +27,8 @@ pub enum FoundationMigrationError {
     DatabasePathNotAbsolute,
     #[error("business database parent directory does not exist")]
     DatabaseParentMissing,
+    #[error("business database parent directory must not be a symbolic link")]
+    DatabaseParentSymlink,
     #[error("business database parent is not a directory")]
     DatabaseParentNotDirectory,
     #[error("business database target must not be a symbolic link")]
@@ -163,13 +165,11 @@ fn validate_database_path(database: &Path) -> Result<(), FoundationMigrationErro
     let parent = database
         .parent()
         .ok_or(FoundationMigrationError::DatabaseParentMissing)?;
-    let parent_metadata = fs::metadata(parent).map_err(|_| {
-        if parent.exists() {
-            FoundationMigrationError::DatabaseParentNotDirectory
-        } else {
-            FoundationMigrationError::DatabaseParentMissing
-        }
-    })?;
+    let parent_metadata = fs::symlink_metadata(parent)
+        .map_err(|_| FoundationMigrationError::DatabaseParentMissing)?;
+    if parent_metadata.file_type().is_symlink() {
+        return Err(FoundationMigrationError::DatabaseParentSymlink);
+    }
     if !parent_metadata.is_dir() {
         return Err(FoundationMigrationError::DatabaseParentNotDirectory);
     }
