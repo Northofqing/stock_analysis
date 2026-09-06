@@ -265,7 +265,7 @@ impl IntentIdentityMaterial {
     }
 }
 
-pub(super) fn namespace_value(namespace: &Namespace) -> CanonicalValue {
+pub(crate) fn namespace_value(namespace: &Namespace) -> CanonicalValue {
     let (kind, run_id) = match namespace {
         Namespace::Production => ("Production", CanonicalValue::Null),
         Namespace::Test { run_id } => ("Test", CanonicalValue::String(run_id.as_str().to_owned())),
@@ -276,7 +276,7 @@ pub(super) fn namespace_value(namespace: &Namespace) -> CanonicalValue {
     ]))
 }
 
-pub(super) fn subject_value(subject: &SubjectId) -> CanonicalValue {
+pub(crate) fn subject_value(subject: &SubjectId) -> CanonicalValue {
     let (kind, value) = match subject {
         SubjectId::Global => ("Global", CanonicalValue::Null),
         SubjectId::Entity(value) => ("Entity", CanonicalValue::String(value.as_str().to_owned())),

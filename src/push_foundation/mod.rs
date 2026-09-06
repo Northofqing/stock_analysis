@@ -2,6 +2,7 @@
 
 mod intent_store;
 mod migration;
+mod terminal_authority;
 
 pub use intent_store::{
     BusinessIntentStore, InitialDecisionKind, InitialIntentDraft, InitialIntentIdentity,
@@ -11,6 +12,7 @@ pub use intent_store::{
 #[cfg(test)]
 pub(crate) use intent_store::{InitialCommitFault, TransitionFault};
 pub use migration::{FoundationMigrationError, FoundationSchemaMigration, MigrationReceipt};
+pub use terminal_authority::TerminalTemplateBinding;
 
 #[cfg(test)]
 mod terminal_authority_tests;

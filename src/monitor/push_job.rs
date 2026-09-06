@@ -9,7 +9,8 @@ mod identity;
 mod policy;
 mod projection;
 
-pub(crate) use canonical::{canonical_preimage, raw_digest, CanonicalValue};
+pub(crate) use canonical::{canonical_digest, canonical_preimage, raw_digest, CanonicalValue};
+pub(crate) use identity::{namespace_value, subject_value};
 
 pub use context::{
     AuthenticatedOperatorRef, CalendarDate, CommandId, GitSha40, PhaseEpic, RunContext, ScheduleId,
@@ -22,6 +23,7 @@ pub use catalog::{
     MachineCatalogStatus,
 };
 
+pub(crate) use delivery::VerifiedTerminalParts;
 pub use delivery::{
     classify_durable_state, AttemptId, AuthorityClass, ChannelId, CompatId,
     CompatibilityEvidenceRef, CompletionEligibility, DecisionId, DeliveryAuthority, DeliveryResult,
@@ -55,6 +57,8 @@ pub use projection::{
     SemanticProjection, Severity, SourceBinding, SubKind, SubKindValue, Suppression,
 };
 
+#[cfg(test)]
+pub(crate) use policy::w09_completion_policy_fixture;
 pub(crate) use projection::derive_decision_id;
 #[cfg(test)]
 pub(crate) use projection::w08_prepared_push_fixture;

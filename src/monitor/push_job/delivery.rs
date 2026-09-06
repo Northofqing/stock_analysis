@@ -92,7 +92,53 @@ pub struct VerifiedTerminalRef {
     binding_sha256: Sha256Digest,
 }
 
+pub(crate) struct VerifiedTerminalParts {
+    pub(crate) ref_id: TerminalRefId,
+    pub(crate) authority_class: AuthorityClass,
+    pub(crate) namespace: Namespace,
+    pub(crate) decision_id: DecisionId,
+    pub(crate) attempt_id: Option<AttemptId>,
+    pub(crate) intent_id: IntentId,
+    pub(crate) unit_id: UnitId,
+    pub(crate) occurrence: OccurrenceId,
+    pub(crate) business_date: BusinessDate,
+    pub(crate) subject: SubjectId,
+    pub(crate) audience: AudienceId,
+    pub(crate) template_id: TemplateId,
+    pub(crate) template_version: TemplateVersion,
+    pub(crate) rendered_sha256: Sha256Digest,
+    pub(crate) terminal_disposition: TerminalDisposition,
+    pub(crate) evidence_sha256: Sha256Digest,
+    pub(crate) durable_schema_version: DurableSchemaVersion,
+    pub(crate) verified_at: UtcMicros,
+    pub(crate) binding_sha256: Sha256Digest,
+}
+
 impl VerifiedTerminalRef {
+    pub(crate) fn from_verified_parts(parts: VerifiedTerminalParts) -> Self {
+        Self {
+            ref_id: parts.ref_id,
+            authority_class: parts.authority_class,
+            namespace: parts.namespace,
+            decision_id: parts.decision_id,
+            attempt_id: parts.attempt_id,
+            intent_id: parts.intent_id,
+            unit_id: parts.unit_id,
+            occurrence: parts.occurrence,
+            business_date: parts.business_date,
+            subject: parts.subject,
+            audience: parts.audience,
+            template_id: parts.template_id,
+            template_version: parts.template_version,
+            rendered_sha256: parts.rendered_sha256,
+            terminal_disposition: parts.terminal_disposition,
+            evidence_sha256: parts.evidence_sha256,
+            durable_schema_version: parts.durable_schema_version,
+            verified_at: parts.verified_at,
+            binding_sha256: parts.binding_sha256,
+        }
+    }
+
     pub fn ref_id(&self) -> &TerminalRefId {
         &self.ref_id
     }
@@ -167,6 +213,10 @@ impl VerifiedTerminalRef {
 
     pub fn binding_sha256(&self) -> &Sha256Digest {
         &self.binding_sha256
+    }
+
+    pub fn into_delivery_result(self) -> DeliveryResult {
+        DeliveryResult::from_verified_terminal(self)
     }
 }
 
@@ -361,8 +411,6 @@ pub enum DeliveryResultView<'a> {
 }
 
 impl DeliveryResult {
-    // Kept non-public until W09 adds the durable requery and TerminalBinding verifier.
-    #[allow(dead_code)]
     pub(super) fn from_verified_terminal(terminal: VerifiedTerminalRef) -> Self {
         let kind = match terminal.terminal_disposition {
             TerminalDisposition::Accepted => DeliveryResultKind::TransportAccepted(terminal),

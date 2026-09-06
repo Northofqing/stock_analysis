@@ -536,6 +536,10 @@ impl CompletionPolicy {
     pub fn retention_class(&self) -> RetentionClass {
         self.retention_class
     }
+
+    pub(crate) fn allows_authority(&self, authority: AuthorityClass) -> bool {
+        self.allowed_authority.contains(&authority)
+    }
 }
 
 // Called by the W06-gated registration path and directly exercised by W03 tests.
@@ -957,6 +961,7 @@ fn directive(
 
 #[cfg(test)]
 pub(super) struct PolicyFixtureOptions {
+    pub(super) unit_id: &'static str,
     pub(super) completion_owner: &'static str,
     pub(super) catalog_completion_owner: &'static str,
     pub(super) advance_event: AdvanceEvent,
@@ -972,6 +977,7 @@ pub(super) struct PolicyFixtureOptions {
 #[cfg(test)]
 pub(super) fn fixture_policy_options() -> PolicyFixtureOptions {
     PolicyFixtureOptions {
+        unit_id: "MU-fixture",
         completion_owner: "fixture-owner",
         catalog_completion_owner: "fixture-owner",
         advance_event: AdvanceEvent::AcceptedOrManualBound,
@@ -989,7 +995,7 @@ pub(super) fn fixture_policy_options() -> PolicyFixtureOptions {
 pub(super) fn try_policy_fixture(options: PolicyFixtureOptions) -> Result<CompletionPolicy> {
     let owner = CompletionOwnerId::try_new(options.completion_owner.to_owned())?;
     let catalog_owner = CatalogOwnerRef::new(
-        UnitId::try_new("MU-fixture".to_owned())?,
+        UnitId::try_new(options.unit_id.to_owned())?,
         CompletionOwnerId::try_new(options.catalog_completion_owner.to_owned())?,
         Sha256Digest::parse("fixture catalog", &"d".repeat(64))?,
     );
@@ -1019,6 +1025,18 @@ pub(super) fn try_policy_fixture(options: PolicyFixtureOptions) -> Result<Comple
         options.finalizer_kind,
         RetentionClass::Trading,
     ))
+}
+
+#[cfg(test)]
+pub(crate) fn w09_completion_policy_fixture(
+    allowed_authority: Vec<AuthorityClass>,
+) -> CompletionPolicy {
+    let mut options = fixture_policy_options();
+    options.unit_id = "MU-auction";
+    options.completion_owner = "owner-auction";
+    options.catalog_completion_owner = "owner-auction";
+    options.allowed_authority = allowed_authority;
+    try_policy_fixture(options).expect("valid W09 completion policy fixture")
 }
 
 #[cfg(test)]

@@ -9,9 +9,10 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBeha
 
 use crate::monitor::push_job::{
     canonical_preimage, derive_decision_id, derive_intent_id, derive_occurrence_id, raw_digest,
-    AudienceId, BusinessDate, CanonicalValue, CompletionOwnerId, IntentId, IntentIdentityMaterial,
-    Namespace, OccurrenceFamily, OccurrenceIdentityMaterial, OccurrenceKey, PreparedPush,
-    ReasonCode, RunId, Sha256Digest, SourceContractId, SubjectId, UnitId, UtcMicros,
+    AudienceId, BusinessDate, CanonicalValue, CompletionOwnerId, DecisionId, IntentId,
+    IntentIdentityMaterial, Namespace, OccurrenceFamily, OccurrenceId, OccurrenceIdentityMaterial,
+    OccurrenceKey, PreparedPush, ReasonCode, RunId, Sha256Digest, SourceContractId, SubjectId,
+    UnitId, UtcMicros,
 };
 
 use super::migration::{attest_connection, validate_database_path};
@@ -525,6 +526,21 @@ pub struct IntentSnapshot {
     updated_at: UtcMicros,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AttestedReadyIntent {
+    pub(crate) namespace: Namespace,
+    pub(crate) decision_id: DecisionId,
+    pub(crate) intent_id: IntentId,
+    pub(crate) unit_id: UnitId,
+    pub(crate) occurrence: OccurrenceId,
+    pub(crate) business_date: BusinessDate,
+    pub(crate) completion_owner: CompletionOwnerId,
+    pub(crate) subject: SubjectId,
+    pub(crate) audience: AudienceId,
+    pub(crate) template_sha256: Sha256Digest,
+    pub(crate) rendered_sha256: Sha256Digest,
+}
+
 impl IntentSnapshot {
     pub fn intent_id(&self) -> &str {
         &self.intent_id
@@ -570,6 +586,60 @@ impl IntentSnapshot {
     }
     pub fn lease_until(&self) -> Option<UtcMicros> {
         self.lease_until
+    }
+
+    pub(crate) fn attested_ready_binding(&self) -> Result<AttestedReadyIntent, IntentStoreError> {
+        verify_snapshot(self)?;
+        if self.decision_kind != InitialDecisionKind::Ready {
+            return Err(IntentStoreError::IntegrityFailed {
+                check: "terminal_binding_requires_ready",
+            });
+        }
+        let namespace = parse_namespace(&self.namespace)?;
+        let subject = parse_subject(&self.subject)?;
+        let business_date =
+            BusinessDate::parse(&self.business_date).map_err(|_| integrity("business_date"))?;
+        let occurrence_material = OccurrenceIdentityMaterial::new(
+            business_date.clone(),
+            OccurrenceFamily::try_new(self.occurrence_family.clone())
+                .map_err(|_| integrity("occurrence_family"))?,
+            OccurrenceKey::try_new(self.occurrence_key.clone())
+                .map_err(|_| integrity("occurrence_key"))?,
+        );
+        let unit_id = UnitId::try_new(self.unit_id.clone()).map_err(|_| integrity("unit_id"))?;
+        let completion_owner = CompletionOwnerId::try_new(self.completion_owner.clone())
+            .map_err(|_| integrity("completion_owner"))?;
+        let source_contract_id = SourceContractId::try_new(self.source_contract_id.clone())
+            .map_err(|_| integrity("source_contract_id"))?;
+        let occurrence = derive_occurrence_id(&occurrence_material);
+        let audience =
+            AudienceId::try_new(self.audience.clone()).map_err(|_| integrity("audience"))?;
+        let intent_id = derive_intent_id(&IntentIdentityMaterial::new(
+            namespace.clone(),
+            unit_id.clone(),
+            completion_owner.clone(),
+            source_contract_id,
+            occurrence.clone(),
+            subject.clone(),
+            audience.clone(),
+        ));
+        let rendered_sha256 = self
+            .rendered_sha256
+            .clone()
+            .ok_or_else(|| integrity("ready_rendered_sha256"))?;
+        Ok(AttestedReadyIntent {
+            namespace,
+            decision_id: derive_decision_id(&intent_id),
+            intent_id,
+            unit_id,
+            occurrence,
+            business_date,
+            completion_owner,
+            subject,
+            audience,
+            template_sha256: self.template_sha256.clone(),
+            rendered_sha256,
+        })
     }
 
     fn immutable_matches(&self, draft: &InitialIntentDraft) -> bool {
