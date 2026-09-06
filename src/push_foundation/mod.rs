@@ -1,5 +1,6 @@
 //! Additive push-foundation persistence. No production database is selected or migrated here.
 
+mod business_finalizer;
 mod intent_store;
 mod migration;
 mod terminal_authority;
