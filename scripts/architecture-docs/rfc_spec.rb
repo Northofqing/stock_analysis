@@ -4,6 +4,7 @@ require 'json'
 require 'digest'
 require 'pathname'
 require_relative 'rfc_inputs'
+require_relative 'wbs'
 
 module ArchitectureDocs
   module RfcSpec
@@ -793,7 +794,9 @@ module ArchitectureDocs
       errors << 'rfc_catalog_statuses_invalid' unless statuses == STATUSES
       errors.concat(contract_errors(text, catalog, evidence, documents['decisions_sha256']))
       errors.concat(sql_errors(root, text))
+      errors.concat(Wbs.validate(root))
       errors << 'rfc_status_provisional' if strict
+      errors << 'wbs_status_provisional' if strict
       errors.uniq
     rescue Invalid => error
       [error.message]

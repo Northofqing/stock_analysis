@@ -24,6 +24,18 @@ class RfcSpecTest < Minitest::Test
     assert_empty err
   end
 
+  def test_wbs_is_a_generated_provisional_bridge_not_a_second_estimate_authority
+    with_fixture do |root|
+      assert_cli_error(root, 'wbs_status_provisional', '--check')
+      change_text(root) { |text| text.sub('828.99h', '828.98h') }
+      assert_cli_error(root, 'wbs_rfc_stale')
+    end
+    with_fixture do |root|
+      change_text(root) { |text| text.sub('<!-- RFC-WBS-BEGIN -->', '') }
+      assert_cli_error(root, 'wbs_markers_invalid')
+    end
+  end
+
   # 只突变唯一规范表；每个反例先证明原表和目标存在，排除重复章节造成的假绿。
   rollout_mutations = [
     ['调度身份', 'rfc_schedule_identity_invalid', 'ScheduleOccurrence', 'source_contract_id |', 'source_contract_id,activation_generation |'],
@@ -1011,6 +1023,7 @@ class RfcSpecTest < Minitest::Test
       inputs = JSON.parse(File.read(File.join(ROOT, 'docs/push-system/rfc-input-manifest.v1.json')))
       paths = [RFC] + DEPENDENCIES.map { |name| 'docs/push-system/' + name } + inputs['inputs'].map { |item| item['path'] }
       paths << SQL if File.file?(File.join(ROOT, SQL))
+      paths << 'docs/push-system/push-system-wbs.v1.json'
       paths.uniq.each do |path|
         destination = File.join(root, path)
         FileUtils.mkdir_p(File.dirname(destination))

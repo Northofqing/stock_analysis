@@ -1255,6 +1255,611 @@ dry-run 输出标记 Planned 的 before/after 投影，实际 affected_rows=0。
 
 本 RFC 继续为 PROVISIONAL。这些门禁只定义后续实施/验收合同，文档 validator 通过不代表运行时接线、生产晋级、WORM 部署或真实样本通过。Task4 不改 Rust/Cargo、SQL、目录、冻结来源或任何运行数据库；Unit 精确排期/风险波次映射由 Task5 承接，独立双轴复核由 Controller 安排。
 
+<!-- RFC-WBS-BEGIN -->
+## WBS 确定性摘要（PROVISIONAL）
+
+事实源为 [push-system-wbs.v1.json](push-system-wbs.v1.json)。本区间仅为生成视图；修改事实源后运行 render-wbs.rb --write。
+
+PROVISIONAL：规格非实现、非部署、非生产验收。旧 W01--W21 合计 98--142h 仅为历史对照，无法恢复旧逐项表；本表 lineage=reconstructed_2026-09-06，不拟合旧范围。
+
+catalog SHA256：`0aa6a2fd87ee9c235073cad3beef44229437f3fe62987b0db510ad36a93aace3`。Unit hash 对原catalog对象递归排序键后编码无空格/换行UTF-8 JSON，数组保持原顺序；这是对象快照hash，不是新增运行时身份合同。
+
+### Foundation：恰好 W01--W21
+
+| ID | 工作包 | O/M/P小时 | PERT小时 | 依赖 | 风险 | 验收 |
+| --- | --- | --- | --- | --- | --- | --- |
+| W01 | 身份、业务日、occurrence 与 source-contract 基础合同 | 8/12/20 | 12.67 |  | high | 同日期不同source-contract不能合并；重启及generation变化不改变 occurrence。 |
+| W02 | 应用 DeliveryResult 与现有 durable 类型适配 | 6/10/16 | 10.33 | W01 | high | BestEffort/Partial/NoChannel不得构造强终态，十四种durable状态逐一投影。 |
+| W03 | CompletionPolicy、ReasonCode 与 RetryPolicy | 8/13/22 | 13.67 | W01,W02 | high | NoData/Disabled/Uncertain分别判定调度、通知游标与人工处置；退避保留typed reason。 |
+| W04 | RunContext 与 PreparedFacts 单次取数 | 6/11/18 | 11.33 | W01,W03 | high | old/new共享同一PreparedFacts与捕获模型输出，第二次外部采集有拒绝计数。 |
+| W05 | SemanticProjection、PreparedPush 与 exact bytes 绑定 | 7/12/19 | 12.33 | W02,W04 | high | 同facts重建语义hash相同；首次渲染字节封存，重放不重新渲染。 |
+| W06 | catalog/Unit/completion-owner 运行时注册表 | 5/8/13 | 8.33 | W01,W03 | high | 65 kind/102 producer/52 Unit双向闭合，枚举外入口保留独立注册。 |
+| W07 | business intent schema 与迁移 | 9/15/24 | 15.5 | W01,W03,W06 | high | DDL重复应用不改原字节，拒绝版本冲突且保留原库与非终态事实。 |
+| W08 | append-only transition/outbox | 8/14/23 | 14.5 | W07 | high | 每个intent版本连续且前驱hash相连，commit和outbox之间逐边界崩溃可恢复。 |
+| W09 | VerifiedTerminalRef 构造与重验证 | 8/13/21 | 13.5 | W02,W05,W08 | high | 构造和finalize时重验authority/decision/bytes/subject全部绑定，弱audit永不冒充receipt。 |
+| W10 | 通用 finalizer 与业务 CAS | 10/16/26 | 16.67 | W03,W08,W09 | critical | CAS冲突进入ResolutionRequired；Accepted不可撤销，重复finalize只推进一次。 |
+| W11 | reconciler、lease/fence 与启动恢复 | 10/17/28 | 17.67 | W08,W09,W10 | high | 恢复所有原业务日既存intent；过期lease重取fence，Uncertain不得盲重发。 |
+| W12 | transport authority port 与通用 adapter | 7/12/20 | 12.5 | W02,W05,W09 | high | 逐required channel记录typed结果；Partial拒绝游标，强receipt保留exact bytes。 |
+| W13 | P01/N02 专用 conformance adapter | 9/14/25 | 15 | W03,W09,W12 | high | P01同日claim不分render-mode；N02 accepted-window独立于N01 critical quota。 |
+| W14 | PhaseScheduler 与 occurrence catch-up | 8/13/22 | 13.67 | W01,W03,W06,W11 | high | 窗口半开区间和原业务日catch-up可回放；closed occurrence不可重开。 |
+| W15 | readiness/operational snapshot 与 deploy probe | 6/10/17 | 10.5 | W06,W11,W14 | high | Core/Producer/Occurrence依赖缺失分别判级，恢复事件绑定前后snapshot及依赖版本。 |
+| W16 | activation manifest、generation CAS 与 owner fence | 10/16/27 | 16.83 | W06,W08,W11,W12 | critical | 同事务验证全Unit当日journal和generation；legacy/new四类actor共同fence。 |
+| W17 | shadow harness 与 typed diff | 7/11/19 | 11.67 | W04,W05,W12,W16 | high | exact typed diff只排除attempt/latency/diagnostic time；八副作用端口证明零调用。 |
+| W18 | operator inspect/reconcile/resolve/promote/rollback | 9/15/25 | 15.67 | W10,W11,W15,W16 | high | dry-run/refusal不写DB/journal；SingleControl允许认证一人，外部DualControl不得降级。 |
+| W19 | 指标、SLA、保留期与安全审计 | 6/10/18 | 10.67 | W08,W10,W15 | high | Accepted两周期目标/五分钟上限；未决永不自动删，监管审计严格大于五年。 |
+| W20 | fault/replay/dedup/rollback 回归 harness | 10/17/29 | 17.83 | W11,W13,W14,W17,W18,W19 | high | 测试namespace覆盖七步崩溃、拒绝/不确定、rollback；PaperBuy/Watchdog仅nonbaseline回放。 |
+| W21 | 发布编排、N/N-1 兼容和逐 Unit/tail-cleanup 门禁工具 | 6/10/17 | 10.5 | W16,W18,W19,W20 | high | 只交付编排/门禁工具；逐Unit cutover和tail cleanup人工工时在Unit行，90天及更严留存另等。 |
+
+W21只交付发布编排与清理门禁工具；逐Unit cutover准备、验证及tail-cleanup资格核验在Unit估算中。保留期届满后的生产删除不属于本次规格交付。
+
+### 四 Epic / 52 Unit
+
+| Epic | 关联Unit数 | 关联PERT小时 |
+| --- | --- | --- |
+| 盘前 | 13 | 141.32 |
+| 集合竞价 | 10 | 110.82 |
+| 盘中 | 28 | 294.48 |
+| 盘后 | 34 | 355.15 |
+
+跨Epic Unit在关联行重复展示，不能累加Epic行作为总数；去重后 52 Unit，547.65 小时。
+
+### Q44 十波映射
+
+| rank | CatalogUnit | physical-owner晋级session | 观察session |
+| --- | --- | --- | --- |
+| 1 | MU-cli-chain, MU-cli-single, MU-cli-summary | 3.0 | 3.0 |
+| 2 | MU-chain-preopen | 1.0 | 2.0 |
+| 3 | MU-chain-post-close | 1.0 | 2.0 |
+| 4 | MU-attribution-daily | 1.0 | 2.0 |
+| 5 | MU-g5b-attribution | 1.0 | 2.0 |
+| 6 | MU-intraday-market | 1.0 | 2.0 |
+| 7 | MU-auction-candidates | 1.0 | 2.0 |
+| 8 | MU-limit-boards | 1.0 | 2.0 |
+| 9 | MU-review-a10, MU-review-r04, MU-review-r07, MU-review-r08, MU-review-r09, MU-review-r11, MU-review-r13 | 7.0 | 14.0 |
+| 10 | MU-paper-review-daily, MU-paper-review-noon | 0.0 | 0.0 |
+
+同rank不代表有内部先后顺序：仍逐Unit逐交易日，同波内顺序须操作员另批。其他Unit rank=null，未经新批准不能追加为第十一波或按流量排序。rank1含CLI单股/汇总/产业链的enum外NotificationService报告typed BestEffort结果；replay-force独立。rank6覆盖15:05所属共享owner的四入口；rank9仅七个ACTIVE ReviewTask，R03三owner rank=null。rank10是PaperReview保持STARVED的conformance，不授予物理owner。
+
+### 可复算时间与首批关键路径
+
+O/M/P包含实现、评审和修复。逐行 PERT=round-half-up((O+4M+P)/6,2)，总计仅加保存的逐行PERT。Foundation 281.34h + Unit 547.65h = 828.99h / 8 = 103.62工程日。
+
+单开发者串行；缓冲只在总PERT上应用一次 20%=165.8h。工程区间为baseline 828.99h至含缓冲 994.79h，即 103.62至124.35个8小时工程日。外部等待/交易观察/同一风险不重复进入工时。
+
+工程DAG最长依赖路径：W01 → W02 → W03 → W06 → W07 → W08 → W09 → W10 → W11 → W14 → W15 → W18 → W20 → W21 → MU-paper-sell = 208.01h；这不是单开发者总历时。完整资源串行顺序存于JSON，可检查每条依赖。首批工程是全部Foundation加rank1--3的 MU-chain-post-close, MU-chain-preopen, MU-cli-chain, MU-cli-single, MU-cli-summary，共326.99h（无缓冲）。
+
+交易独立计算：42个owner-changing Unit，42次晋级 + 76次独立观察 = 118个串行eligible session；单日全局最多晋级一个Unit，下限42个晋级交易日。观察按每Unit晋级后串行保守场景；高风险/业务副作用至少两观察session，纯shadow不占名额。首批rank1--3至少12个session，同rank排列须另批。
+
+自然日场景从假设周一开始且不承诺日期：ceil(124.35)=125工程工作日 + 118交易session + 63外部等待工作日 = 306个串行业务日；只排周末时 7*floor((N-1)/5)+(N-1)%5+1 = 428自然日。该保守无重叠场景须另加交易所休市、人工批准和真实样本延迟，上限为null；非承诺，亦非把交易日直接当自然日。STARVED/OPT-IN激活及至少90天/更严留存届满等待均不在此场景，未排序Unit须新批准。
+
+近期08-31--09-04仅影响设计、回放与预修复，门禁引用RFC既有业务样本；PaperBuy/Watchdog仅nonbaseline反例，不新增第53/54 Unit。
+
+### 完整 52 Unit 附录
+
+#### MU-announcement — 公告路由
+
+owner：news_dedup.key=annroute:{observed_date}:{source}:{external_id}；独立 L4(announcement,source_fact_event_id,空 sub_kind)。Epic：盘中/盘前/盘后；producer：news-announcement。快照SHA：`9902e0d2725c97f50d26250447c361fbaf278b45f113157bd3560ce70f515fc2`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=5/9/16h；PERT=9.5h；风险=high；外部等待=1工作日；owner change=true；rank=null；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W14, W16, W17, W18, W19, W20, W21。日历：公告到达窗口，跨日source-id重现；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：两层非原子claim与L4拆开故障覆盖。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：source/external_id与observed_date需稳定绑定，claim释放后崩溃回放不得重复公告，L4不能替代receipt。
+
+#### MU-p01 — 盘前新闻P01
+
+owner：business_date_once_claims(business_date,PreopenNewsHot,None,GLOBAL) → immutable decision / occurrence=p01:{business_date}。Epic：盘前；producer：p01-compensation, p01-scheduled, startup-resume-preopen-news-hot。快照SHA：`973018c0000cf29fec4af83d629c9026672d440d810d0144ccb55cef69e351bf`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=7/12/21h；PERT=12.67h；风险=high；外部等待=2工作日；owner change=true；rank=null；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W06, W07, W08, W09, W10, W11, W12, W13, W14, W16, W17, W18, W19, W20, W21。日历：交易日盘前及补偿窗口；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：专用authority和补偿/恢复三入口共同封口。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：scheduler与compensation同business-date claim；render mode变化不增claim；原P01 envelope重验accepted绑定。；盘前新闻P01：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。
+
+#### MU-d01 — 公告选股D01
+
+owner：D01_LAST_PUSH&#91;code:name&#93;；COOLDOWN_TABLE(NewsToIdea,空 code)；L4 无冷却（PerTicket 缺 code）。Epic：盘中；producer：d01-announcement, d01-manual。快照SHA：`dc3b9e522c6ce52bb5ee0d96de577837929aed44d33d03a36329be53219aa1ff`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=5/8/15h；PERT=8.67h；风险=medium；外部等待=1工作日；owner change=true；rank=null；晋级/观察=1/1 session。
+
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W16, W17, W18, W19, W20, W21。日历：公告触发与显式manual窗口；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：不能把不存在的L4 owner实现为新增去重权限。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：公告与manual同code:name memo，空code的PerTicket确无L4冷却，banner拒绝不得推进memo。
+
+#### MU-news-catalyst — 新闻催化I02
+
+owner：L4(news_catalyst,空 code,空 sub_kind)；模板 COOLDOWN_TABLE(NewsCatalyst,空 code)。Epic：盘中；producer：catalyst-announcement, catalyst-manual。快照SHA：`949b777a3f783077f464d31c059d54094a08ab80aaea656d5029bce203411081`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=4/7/12h；PERT=7.33h；风险=medium；外部等待=0工作日；owner change=true；rank=null；晋级/观察=1/1 session。
+
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W16, W17, W18, W19, W20, W21。日历：公告eligible session与manual；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：共享下游冷却的两入口需要独立触发回放。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：I02空code模板/L4冷却独立于D01 memo；manual失败不消耗新公告完成资格。
+
+#### MU-news-ai — NewsAI业务通知
+
+owner：news_ai_delivery_event(delivery_identity_sha256=assessment_id,reservation,state)；assessment=provider+batch_id+item_id+target_code+analysis_version hash。Epic：盘中/集合竞价；producer：news-ai-same-tick。快照SHA：`896064314d797194f4135082a98cc4a92ba4a3dbc75fdbd5431727a04eafbb86`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=9/15/26h；PERT=15.83h；风险=high；外部等待=2工作日；owner change=true；rank=null；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W16, W17, W18, W19, W20, W21。日历：同tick及跨batch eligible session；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：近期样本优先预修复；batch是lineage，不能为降消息数抹掉修订。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：F03跨batch相同事实不新增通知；目标/受众/业务日及有效修订分别验证；保留assessment/delivery/prediction链。
+
+#### MU-news-flash-aggregate — N02新闻聚合窗口
+
+owner：NewsFlash authority accepted-window(business_date,window) / window_state&#91;index&#93;；reservation_identity_sha256+attempt_ordinal。Epic：盘中/盘后；producer：news-flash-aggregate。快照SHA：`f18feb9c210232349e986b911e1ea363c94777b1defc1ed395fbdb8e7c76d072`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=8/13/23h；PERT=13.83h；风险=high；外部等待=2工作日；owner change=true；rank=null；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W06, W07, W08, W09, W10, W11, W12, W13, W14, W16, W17, W18, W19, W20, W21。日历：每个聚合窗口完整session；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：专用accepted-window authority需窗口失败/恢复证明。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：F01/F10 receipt accepted_at与source analytics time分开；window reservation/attempt匹配，N01 critical quota不得借此激活。
+
+#### MU-earnings-beat — 业绩超预期OPT-IN
+
+owner：L4(earnings_beat,source_fact_event_id(earnings:{code}:{report_date}),空 sub_kind)。Epic：盘后；producer：earnings-beat。快照SHA：`ffb0284b313b642e0ffc8e2ac20e47480d10b16d201efb7c7f54508883431834`。
+
+隔离conformance与保持未激活；不切换physical owner，不补生产依赖。 O/M/P=3/6/10h；PERT=6.17h；风险=medium；外部等待=3工作日；owner change=false；rank=null；晋级/观察=0/0 session。
+
+依赖：W01, W02, W03, W04, W06, W07, W08, W09, W10, W11, W12, W15, W16, W17, W18, W19, W20, W21。日历：未启用时仅测试隔离conformance，启用另批；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：provider后配置门不授权自动开启功能。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：Beat保持OPT-IN未激活；缺分类配置/来源依赖可见，零消息不是通过；正向event.kind不得完成Miss。
+
+#### MU-earnings-miss — 业绩低预期OPT-IN
+
+owner：L4(earnings_miss,source_fact_event_id(earnings:{code}:{report_date}),空 sub_kind)。Epic：盘后；producer：earnings-miss。快照SHA：`6261c1595dbc226fd1371026ad1a13e0610d79ed672d13104417b79420aa9066`。
+
+隔离conformance与保持未激活；不切换physical owner，不补生产依赖。 O/M/P=3/5/9h；PERT=5.33h；风险=medium；外部等待=3工作日；owner change=false；rank=null；晋级/观察=0/0 session。
+
+依赖：W01, W02, W03, W04, W06, W07, W08, W09, W10, W11, W12, W15, W16, W17, W18, W19, W20, W21。日历：负向报告样本回放，启用另批；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：共享earnings轮询不构成共享通知owner。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：Miss保持OPT-IN未激活；缺配置/来源依赖可见，零消息不是通过；负向分类独立Beat并保留report_date。
+
+#### MU-analyst — 分析师上调
+
+owner：L4(analyst_upgrade,source_fact_event_id(analyst:{code}:{broker}:{report_id}),空 sub_kind)。Epic：盘后；producer：analyst-upgrade。快照SHA：`b8d35b3cdb814a0aec8195e0ff8879cb57279a30a808bb94204dd07dde52653d`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=4/7/13h；PERT=7.5h；风险=medium；外部等待=1工作日；owner change=true；rank=null；晋级/观察=1/1 session。
+
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W16, W17, W18, W19, W20, W21。日历：研报自然到达或批准灰盒；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：经纪商维度与报告修订的过度去重风险。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：code+broker+report_id稳定事件identity；AnalystStateStore观察推进不等于L4通知Accepted。
+
+#### MU-auction-volume — 竞价放量
+
+owner：monitor_loop.auction_vol_notified&#91;session,code&#93;；独立 L4(auction_volume,空 code,空 sub_kind)。Epic：集合竞价；producer：auction-volume。快照SHA：`4744895bba638a1295b300003568ec2576d9838283da63e267945a238c7ef19d`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=6/10/18h；PERT=10.67h；风险=high；外部等待=1工作日；owner change=true；rank=null；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W06, W07, W08, W09, W10, W11, W12, W14, W16, W17, W18, W19, W20, W21。日历：集合竞价完整eligible session；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：两次读取股票集合可能不一致，先修PreparedFacts。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：外层new_items与dispatcher snapshot.items须同批绑定；逐票有限正价格/量比，失败不得insert通知set。
+
+#### MU-auction-candidates — 竞价候选主卡与失效
+
+owner：monitor_loop.post_close_candidates_notified&#91;session&#93;；candidate_board_snapshot&#91;{date}&#93;.jsonl 最末 code 集（双层非原子推进链）。Epic：集合竞价；producer：auction-repush, candidate-board, candidate-invalidated。快照SHA：`5725bd51f9b8178e8988353b39e2e1d09ea862a10403498df569e58192467c5c`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=8/14/24h；PERT=14.67h；风险=high；外部等待=1工作日；owner change=true；rank=7；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W14, W16, W17, W18, W19, W20, W21。日历：集合竞价主卡及后续失效session；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：Q44 rank7按真实共享推进链迁移，不能按三kind拆owner。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：A02/主卡/失效共双bool和末尾code快照推进链；部分失败不提前持久快照，三kind独立receipt可追踪。
+
+#### MU-virtual-watch — 虚拟观察STARVED
+
+owner：L4(virtual_watch,空 code,空 sub_kind)；共享 monitor_loop.virtual_observation vector / virtual_snapshot_persisted&#91;session&#93;。Epic：盘中/集合竞价；producer：virtual-watch-confirm, virtual-watch-pilot。快照SHA：`99a6deef2592d3119027d1e59e6ab5471886be070d997504bb00a13a00e5cb68`。
+
+隔离conformance与保持未激活；不切换physical owner，不补生产依赖。 O/M/P=4/7/12h；PERT=7.33h；风险=high；外部等待=2工作日；owner change=false；rank=null；晋级/观察=0/0 session。
+
+依赖：W01, W02, W03, W04, W06, W07, W08, W09, W10, W11, W12, W15, W16, W17, W18, W19, W20, W21。日历：隔离pilot/confirm样本，来源恢复另批；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：业务vector和snapshot并非通知完成状态。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：保持STARVED未激活；空post_close/vector依赖缺失可见，零消息不是通过；confirm补价不得改变pilot资格来伪造成功。
+
+#### MU-paper-trade — 模拟交易终态通知
+
+owner：counted decision(PaperTrade,Ticket,terminal_transition_id,source fingerprint,subject,policy,rendered hash)。Epic：集合竞价；producer：paper-trade-terminal, startup-resume-paper-trade。快照SHA：`db43f13207c8ff2d4655384ffa4731aec8885dc1d048ef5beb309de016a35051`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=8/14/25h；PERT=14.83h；风险=critical；外部等待=1工作日；owner change=true；rank=null；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W16, W17, W18, W19, W20, W21。日历：交易终态出现后至少两eligible session；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：业务副作用需成交事实与通知崩溃分别追踪。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：PaperTradeTerminalBindingV1 terminal_transition_id与通知decision绑定；回放只恢复通知不再成交，不与PaperSell code/day/Filled合并。；模拟交易终态通知：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。
+
+#### MU-limit-boards — 连板三展示形态
+
+owner：monitor_loop.board_notified&#91;session,code&#93;；L4(limit_boards,空 code,空 sub_kind)。Epic：盘中；producer：limit-boards-first, limit-boards-second, limit-boards-third-plus。快照SHA：`1b14ee102bfe471333ceef536e63de838cda2ed5bcbdbf21974a3558398e1848`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=5/9/17h；PERT=9.67h；风险=high；外部等待=1工作日；owner change=true；rank=8；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W06, W07, W08, W09, W10, W11, W12, W14, W16, W17, W18, W19, W20, W21。日历：盘中连板变化完整session；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：rank8需要反证共享空code冷却吞掉其他票。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：first/second/third-plus共享code set；发送前insert的故障不得永久吞票；token不制造子类dedup identity。
+
+#### MU-holding-plan — 持仓计划
+
+owner：counted decision(HoldingPlan,Ticket,holding-plan:{date}:{code},source fingerprint,subject,policy,rendered hash)。Epic：盘中；producer：holding-plan-manual, holding-plan-periodic, startup-resume-holding-plan。快照SHA：`e7b8832319b67e4aa899f882895f3a92205c8427c6cd5c1fcf9f1ae50156b3c9`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=7/11/20h；PERT=11.83h；风险=high；外部等待=1工作日；owner change=true；rank=null；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W16, W17, W18, W19, W20, W21。日历：持仓发生及定时扫描session；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：多入口与immutable binding组合需要修订样本。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：定时/manual同holding-plan:date:code只有source/rendered hash一致才同decision；修订计划不可被日级展示名压掉。；持仓计划：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。
+
+#### MU-t0 — T0建议
+
+owner：counted decision(T0Advice,Ticket,T0PlanDecisionBindingV1.decision_id(),source fingerprint,subject,policy,rendered hash)。Epic：盘中；producer：startup-resume-t0-advice, t0-advice。快照SHA：`a3281d95ce7fb9e63b5fd57b94122e6498622e5eb6b166db1b6e790c0c9629d1`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=8/12/22h；PERT=13h；风险=critical；外部等待=1工作日；owner change=true；rank=null；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W16, W17, W18, W19, W20, W21。日历：T0 eligible时段至少两session；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：交易建议identity专用，错误重放有业务风险。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：T0PlanDecisionBindingV1 canonical decision与HoldingPlan独立；last_t0_scan不是完成游标；建议恢复不可重下单。；T0建议：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。
+
+#### MU-close-call — 尾盘操作提醒
+
+owner：counted decision(CloseCall,Ticket,close-call:{date}:{code},source fingerprint,subject,policy,rendered hash)。Epic：盘中；producer：close-call, startup-resume-close-call。快照SHA：`8acc5a1f5cdedf6fe69ad401a5e2b43e4c7ffcc4bbc3c040999328643d467299`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=6/10/18h；PERT=10.67h；风险=high；外部等待=0工作日；owner change=true；rank=null；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W06, W07, W08, W09, W10, W11, W12, W14, W16, W17, W18, W19, W20, W21。日历：尾盘窗口与次日startup回放；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：外层bool和durable计数不能互相覆盖。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：close-call:date:code绑定原decision；close_call_pushed不替代receipt；窗口过期后只恢复既存发送事实。；尾盘操作提醒：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。
+
+#### MU-industry-intraday — 盘中产业链I03
+
+owner：L4(industry_chain_intraday,空 code,空 sub_kind)；COOLDOWN_TABLE(IndustryChainIntraday,空 code)。Epic：盘中；producer：industry-chain-manual, industry-chain-periodic。快照SHA：`bddd8edca0d370ff23b34d00d4c4c8464e6198517da01e7fd94362e179822dfb`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=5/8/14h；PERT=8.5h；风险=medium；外部等待=0工作日；owner change=true；rank=null；晋级/观察=1/1 session。
+
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W16, W17, W18, W19, W20, W21。日历：盘中周期与manual自然occurrence；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：同业务分析名称涉及三个不同owner家族。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：periodic/manual共享I03空code冷却；last_industry_chain_intraday仅调度，不能共享R03或enum外chain的完成。
+
+#### MU-intraday-market — 盘中市场与15:05快照
+
+owner：L4(intraday_market,空 code,空 sub_kind)。Epic：盘中/盘前/盘后；producer：market-manual-i01, market-preopen-probe, market-snapshot-warning, market-view-periodic。快照SHA：`c5b00d9ee00a79dc9764b6d2190c5bb58d91e79c1ac250c7c548ea14f958cdd5`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=8/13/23h；PERT=13.83h；风险=high；外部等待=1工作日；owner change=true；rank=6；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W06, W07, W08, W09, W10, W11, W12, W14, W15, W16, W17, W18, W19, W20, W21。日历：15:05窗口及另外三入口独立回放；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：rank6按catalog整体owner而非只切一条producer。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：15:05 SNAP_REMIND_LAST与market view/preopen probe/manual外门分别保留；共享空code冷却不应让一次bool替四入口封日。
+
+#### MU-sector-top — 强势板块
+
+owner：business_date_once_claims(business_date,SectorTop,None,GLOBAL) → immutable decision / occurrence=sector-top:{date}。Epic：盘中；producer：sector-top, startup-resume-sector-top。快照SHA：`464dd154ba3a3ed4cbdc8b387a7c40aba56c03f741db19fd11fbdeab5e4b11f8`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=6/9/16h；PERT=9.67h；风险=high；外部等待=0工作日；owner change=true；rank=null；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W16, W17, W18, W19, W20, W21。日历：每日一次自然板块occurrence；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：共享coordinator不足以共享claim。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：SectorTop日claim只对自身kind完成；last_sector_top和coordinator budget分别验证，不能吞SectorAnomaly。；强势板块：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。
+
+#### MU-sector-anomaly — 板块异动
+
+owner：business_date_once_claims(business_date,SectorAnomaly,None,GLOBAL) → immutable decision / occurrence=sector-anomaly:{date}。Epic：盘中；producer：sector-anomaly, startup-resume-sector-anomaly。快照SHA：`fbc8da70ee1cf01acc5fd4ebfa38cce98cca09107ba689150ad8075405b5808c`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=6/10/17h；PERT=10.5h；风险=high；外部等待=0工作日；owner change=true；rank=null；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W16, W17, W18, W19, W20, W21。日历：异动eligible session与日边界；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：板块内容修订和独立预算分支需对照。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：SectorAnomaly异动source绑定自身日claim；外last_sector_anomaly失败保留重试，恢复不借SectorTop receipt。；板块异动：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。
+
+#### MU-data-mode — 数据模式通知
+
+owner：LATEST_DATA_MODE；DATA_MODE_PENDING_STABLE(mode,since)；DATA_MODE_UNSAFE_REMINDER(fingerprint,external_confirmed_at,heartbeat_at)。Epic：盘中/盘前/盘后；producer：data-mode。快照SHA：`10df8726c0af15198e568396b906a806bd230647ff1b148997185fe3e6c24736`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=7/12/20h；PERT=12.5h；风险=critical；外部等待=1工作日；owner change=true；rank=null；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W06, W07, W08, W09, W10, W11, W12, W15, W16, W17, W18, W19, W20, W21。日历：模式稳定窗口及不安全heartbeat两session；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：健康事件误确认会隐藏来源故障。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：LATEST/PENDING_STABLE/UNSAFE_REMINDER三个状态分开；heartbeat更新绝不伪造external_confirmed_at，fingerprint变化保留新资格。
+
+#### MU-account-mode — 账户模式主通知
+
+owner：account_mode_log&#91;log_id&#93;.pushed（同模式未确认复用 log_id）。Epic：盘中/盘前/盘后；producer：account-mode-main。快照SHA：`2d4260eaa1cfd73f061f0b62140852edb65c3db40d4ad7d5115c69dc86e871ad`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=7/11/19h；PERT=11.67h；风险=critical；外部等待=1工作日；owner change=true；rank=null；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W06, W07, W08, W09, W10, W11, W12, W15, W16, W17, W18, W19, W20, W21。日历：账户模式变化后两eligible session；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：主通知外部结果和hook/banner共同完成条件。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：同模式未确认复用log_id；account_mode_log.pushed须在typed receipt与最终banner刷新条件都满足后CAS。
+
+#### MU-frozen-side — Frozen副通知
+
+owner：L4(market_action_alert,FROZEN,空 sub_kind)；触发资格来自 account_mode_log 新建事实，无副推持久确认列。Epic：盘中/盘前/盘后；producer：account-frozen-side。快照SHA：`ab086af9985264e2d6444c483ed3d8777e37632768b74209f0ed313017e01ba9`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=5/9/15h；PERT=9.33h；风险=critical；外部等待=0工作日；owner change=true；rank=null；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W16, W17, W18, W19, W20, W21。日历：Frozen事件两eligible session；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：共享kind不能把主副通知合为一个receipt。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：新account_mode_log只触发Frozen副推；主pushed不得完成FROZEN code独立L4通知，失败保留副推intent。
+
+#### MU-order-alert — 订单变化通知
+
+owner：MarketActionState.seen&#91;code&#93;=(action,shares)；L4(market_action_alert,code,空 sub_kind)。Epic：盘中/盘前/盘后；producer：order-update-alert。快照SHA：`9b25b932fcc9df9b07cec62cdeca57917a508f7829fc1f321f9aa9cb6d0ba5ab`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=8/13/24h；PERT=14h；风险=critical；外部等待=1工作日；owner change=true；rank=null；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W16, W17, W18, W19, W20, W21。日历：真实订单变化样本或授权灰盒，两session；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：高风险业务状态先推进链需七步故障追踪。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：EventBus seen(code,action,shares)先变更不应吞通知；订单revision绑定通知intent，重放不能提交或修改订单。
+
+#### MU-paper-sell — 模拟卖出通知
+
+owner：paper_trades(code,direction=sell,status=Filled,date(ts))；L4(paper_sell,code,空 sub_kind)。Epic：盘中/盘后；producer：paper-sell-intraday, paper-sell-post-close。快照SHA：`7b04f33d2d4f56b2bfefbc99f64dc8ed0919b146c81ba98a03b769afad7c3c52`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=10/16/28h；PERT=17h；风险=critical；外部等待=1工作日；owner change=true；rank=null；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W16, W17, W18, W19, W20, W21。日历：盘中/盘后卖出两eligible session；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：近期优先回放但不改变Q44，Filled业务去重独立通知。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：F04的254条逐fill→intent追踪；部分通知失败恢复不得重跑模拟成交；分段latency不能用文件时间替Accepted时间。
+
+#### MU-snapshot-stale — 账户快照过期提醒
+
+owner：check_snapshot_staleness_and_notify::LAST:SnapshotReminderGate(today,last_confirmed,in_flight)。Epic：盘中/盘前/盘后/集合竞价；producer：snapshot-stale-startup, snapshot-stale-timer。快照SHA：`329470d64fb3428ea29b85fb601e1c33f0418e4fa236ac67df73155f7125f6fd`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=5/8/14h；PERT=8.5h；风险=high；外部等待=1工作日；owner change=true；rank=null；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W06, W07, W08, W09, W10, W11, W12, W14, W15, W16, W17, W18, W19, W20, W21。日历：启动与定时提醒跨交易日；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：同static函数预约恢复需要避免假confirmed。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：startup/timer共享SnapshotReminderGate today/in_flight/last_confirmed；拒绝释放预约，和持仓六小时警告分开。
+
+#### MU-attribution-daily — 每日归因
+
+owner：monitor_loop::ATTRIBUTION_LAST_RUN&#91;calendar_date&#93;。Epic：盘后；producer：attribution-daily。快照SHA：`83a1e47f85614639c578dc2958c0a15a32c2fc28f70aa6bfd2e6033801f6a955`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=6/10/18h；PERT=10.67h；风险=high；外部等待=1工作日；owner change=true；rank=4；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W14, W16, W17, W18, W19, W20, W21。日历：每日归因窗口及失败回放；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：rank4用独立通知cursor替分析成功bool。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：F05保存归因结果后sink失败只重用结果，不再调用LLM；ATTRIBUTION_LAST_RUN不得提前封日且不存在L4冷却owner。
+
+#### MU-g5b-attribution — G5b归因
+
+owner：monitor_loop::G5B_LAST_RUN&#91;calendar_date&#93;。Epic：盘后；producer：g5b-attribution。快照SHA：`5fcd04a289eb3489191fd28eb110e59d9e113741e5152cd5fe88d1289530a26c`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=8/12/21h；PERT=12.83h；风险=high；外部等待=1工作日；owner change=true；rank=5；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W14, W16, W17, W18, W19, W20, W21。日历：G5b日窗口与namespace隔离样本；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：rank5既需namespace拒绝又需无L4路径恢复。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：F02 test namespace在production provider/LLM/sink前拒绝；F05复用保存结果，G5B_LAST_RUN不因保存而封口。
+
+#### MU-fixed-order — 盘后定价订单STARVED
+
+owner：monitor_loop.last_post_fixed_order&#91;session&#93;；L4(post_fixed_price_order,code,空 sub_kind)。Epic：盘中/盘后；producer：post-fixed-order。快照SHA：`97cb996100829fa02d754960a89842f5522a8bffac5fb623ba272870e7fcc127`。
+
+隔离conformance与保持未激活；不切换physical owner，不补生产依赖。 O/M/P=4/7/13h；PERT=7.5h；风险=critical；外部等待=3工作日；owner change=false；rank=null；晋级/观察=0/0 session。
+
+依赖：W01, W02, W03, W04, W06, W07, W08, W09, W10, W11, W12, W15, W16, W17, W18, W19, W20, W21。日历：仅隔离T14事件样本，源注册另批；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：无生产注册必须保留阻断事实。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：保持STARVED未激活；TradeEventSource OnceLock未注册依赖可见，零消息不是通过；T14 900s timer不创造消费ack或订单。
+
+#### MU-fixed-fill — 盘后定价成交STARVED
+
+owner：monitor_loop.last_post_fixed_fill&#91;session&#93;；L4(post_fixed_price_fill,code,空 sub_kind)。Epic：盘中/盘后；producer：post-fixed-fill。快照SHA：`45d933a62d3868e45ec76db230ba27ae69fd299cb74c1f776d6070b75debea26`。
+
+隔离conformance与保持未激活；不切换physical owner，不补生产依赖。 O/M/P=5/8/14h；PERT=8.5h；风险=critical；外部等待=3工作日；owner change=false；rank=null；晋级/观察=0/0 session。
+
+依赖：W01, W02, W03, W04, W06, W07, W08, W09, W10, W11, W12, W15, W16, W17, W18, W19, W20, W21。日历：仅隔离T15成交样本，源注册另批；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：同缺源但成交事件identity/资格区别于订单。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：保持STARVED未激活；T15来源依赖缺失可见，零消息不是通过；300s timer按fill事件独立校验，不借T14完成。
+
+#### MU-st-price — ST价格限制批次
+
+owner：monitor_loop.st_price_pushed&#91;session&#93;；L4(st_price_limit_changed,code,空 sub_kind)。Epic：盘中；producer：st-price-limit-batch。快照SHA：`3e10a668bbfb29dbc716336e8e3d775a01c63e605f4c4f66a29ff8086b91d471`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=6/9/17h；PERT=9.83h；风险=high；外部等待=1工作日；owner change=true；rank=null；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W06, W07, W08, W09, W10, W11, W12, W14, W16, W17, W18, W19, W20, W21。日历：ST限制变化自然批次或授权灰盒；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：外批次bool吞掉空数据和部分失败。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：零条Ok不能封st_price_pushed；部分逐票Accepted不回滚也不遮蔽失败票，code冷却与批次关闭分开。
+
+#### MU-paper-review-noon — 午间PaperReview STARVED
+
+owner：monitor_loop::NOON_SNAP_LAST&#91;calendar_date&#93;；潜在模板/L4(PaperReview,noon-code,空 sub_kind)。Epic：盘中；producer：paper-review-noon。快照SHA：`945b17aa515e0191c6604ae0055064e1a91c48ee5b598123e3f8e01f7457441b`。
+
+隔离conformance与保持未激活；不切换physical owner，不补生产依赖。 O/M/P=4/6/11h；PERT=6.5h；风险=high；外部等待=2工作日；owner change=false；rank=10；晋级/观察=0/0 session。
+
+依赖：W01, W02, W03, W04, W06, W07, W08, W09, W10, W11, W12, W14, W15, W16, W17, W18, W19, W20, W21。日历：午间隔离conformance，来源恢复另批；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：rank10 noon外门和daily实际code并非同owner。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：保持STARVED未激活；today结构与来源缺依赖可见，零消息不是通过；NOON_SNAP_LAST不得因受阻bool封日，保留noon-code。
+
+#### MU-review-r04 — R04龙虎榜复盘
+
+owner：business_date_once_claims(business_date,ReviewLhb,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R04)。Epic：盘后；producer：review-r04-auto, review-r04-backfill, review-r04-manual, startup-resume-review-lhb。快照SHA：`cd5bf3bdd9de820950789aeb4610e33411811276f0007ee1f67d655086cc3efb`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=6/10/17h；PERT=10.5h；风险=high；外部等待=1工作日；owner change=true；rank=9；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W06, W07, W08, W09, W10, W11, W12, W14, W16, W17, W18, W19, W20, W21。日历：盘后自然R04及历史业务日回放；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：ReviewTask结果语义与同claim多入口结合。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：R04 auto/manual/backfill同原日期ReviewLhb claim；先hydrate再due/attempt，终态Rejected不能标作Delivered。；R04龙虎榜复盘：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。
+
+#### MU-review-r07 — R07明日观察
+
+owner：business_date_once_claims(business_date,TomorrowWatch,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R07)。Epic：盘后；producer：review-r07-auto, review-r07-backfill, review-r07-manual, startup-resume-tomorrow-watch。快照SHA：`3c6ba5e204dab31c199095c3ef33d3a49621729b36aee8414cf402910db24743`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=7/11/19h；PERT=11.67h；风险=high；外部等待=1工作日；owner change=true；rank=9；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W06, W07, W08, W09, W10, W11, W12, W14, W16, W17, W18, W19, W20, W21。日历：盘后R07与历史补推样本；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：近期历史回放优先，发送日不能替原业务日。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：F01 08-31补08-28 TomorrowWatch保留08-28业务日与原decision；manual临时audit不得覆盖自动task state。；R07明日观察：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。
+
+#### MU-review-r08 — R08事件日历
+
+owner：durable review occurrence(business_date,EventCalendar,None,GLOBAL,review_task_identity(date,R08)) → Rolling immutable decision。Epic：盘后；producer：review-r08-auto, review-r08-backfill, review-r08-manual, startup-resume-event-calendar。快照SHA：`3175fb884c35aaf43d8dd46950a53c30cf60891463416d5ffd20840f9be04f47`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=8/13/22h；PERT=13.67h；风险=high；外部等待=2工作日；owner change=true；rank=9；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W06, W07, W08, W09, W10, W11, W12, W14, W15, W16, W17, W18, W19, W20, W21。日历：事件来源能力恢复及盘后eligible窗口；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：固定source-contract故障与单次等待分开。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：F08保留nonretryable证据直至能力恢复；CFFEX需求不删除，Rolling occurrence按原R08业务日恢复，不能靠字符串判断可重试。；R08事件日历：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。
+
+#### MU-review-r09 — R09供应商TopN
+
+owner：business_date_once_claims(business_date,ReviewProviderTopN,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R09)。Epic：盘后；producer：review-r09-auto, review-r09-backfill, review-r09-manual, startup-resume-review-provider-top-n。快照SHA：`56e156d454d6b399d0e01bc9f92ba26fad986ed92f279cebec8c8719fafc5c53`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=6/9/16h；PERT=9.67h；风险=high；外部等待=1工作日；owner change=true；rank=9；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W06, W07, W08, W09, W10, W11, W12, W14, W16, W17, W18, W19, W20, W21。日历：供应商数据到齐后的盘后occurrence；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：来源迟到与业务结果终态的分支组合。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：ReviewProviderTopN auto/manual/backfill共日claim；ExpectedWait/DeferredUntil按时间门复核，永久Failed终态不增通知Accepted。；R09供应商TopN：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。
+
+#### MU-review-r11 — R11持仓复盘
+
+owner：business_date_once_claims(business_date,PositionReview,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R11)。Epic：盘后；producer：review-r11-auto, review-r11-backfill, review-r11-manual, startup-resume-position-review。快照SHA：`bbe650096450cb78c65a46efd74eb14918ca8e5c74b38172869e7896afbf5c37`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=7/12/20h；PERT=12.5h；风险=high；外部等待=1工作日；owner change=true；rank=9；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W06, W07, W08, W09, W10, W11, W12, W14, W16, W17, W18, W19, W20, W21。日历：盘后R11及两历史日期回放；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：多业务日样本要求逐intent而非单发送日统计。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：F01 08-31补08-26/08-28 PositionReview逐原日期绑定；新的持仓revision不改旧envelope，发送日期不冒充business_date。；R11持仓复盘：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。
+
+#### MU-review-r13 — R13观察池跟踪
+
+owner：business_date_once_claims(business_date,WatchlistTracking,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R13)。Epic：盘后；producer：review-r13-auto, review-r13-backfill, review-r13-manual, startup-resume-watchlist-tracking。快照SHA：`11589731da7bc5bf6282b46a42b22e8038ba7fd7326831363a722bfb2d3d039f`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=6/10/18h；PERT=10.67h；风险=high；外部等待=1工作日；owner change=true；rank=9；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W06, W07, W08, W09, W10, W11, W12, W14, W16, W17, W18, W19, W20, W21。日历：观察池有效输入的盘后窗口；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：业务outcome与通知游标双写需CAS故障覆盖。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：WatchlistTracking原日期claim共享auto/manual/backfill；append audit后才commit task state，重试不再次推进watchlist outcome。；R13观察池跟踪：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。
+
+#### MU-review-a10 — A10催化复盘
+
+owner：business_date_once_claims(business_date,CatalystReview,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,A10)。Epic：盘后；producer：review-a10-auto, review-a10-backfill, review-a10-manual, review-a10-push, startup-resume-catalyst-review。快照SHA：`7b81df249f49b286dfb59444b26e429b5d8b73cc6c24db34eefc74036ec93c33`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=7/11/18h；PERT=11.5h；风险=high；外部等待=1工作日；owner change=true；rank=9；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W06, W07, W08, W09, W10, W11, W12, W14, W16, W17, W18, W19, W20, W21。日历：催化复盘eligible窗口及四入口回放；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：多一个显式push入口增加去重和审计分支。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：A10 auto/manual/backfill/--push四入口只在同immutable decision下hydrate；催化事件修订独立，新invocation audit不授权再次送达。；A10催化复盘：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。
+
+#### MU-review-r03-auto — R03自动任务STARVED
+
+owner：post_session_review_scheduler::ReviewScheduleState(date).tasks&#91;R03&#93;。Epic：盘后；producer：review-r03-auto。快照SHA：`657e3873f935b219cd9ced22b179055c9ded8da2dab9de5d4e9ccf5e2c8d9cf3`。
+
+隔离conformance与保持未激活；不切换physical owner，不补生产依赖。 O/M/P=4/8/14h；PERT=8.33h；风险=high；外部等待=3工作日；owner change=false；rank=null；晋级/观察=0/0 session。
+
+依赖：W01, W02, W03, W04, W06, W07, W08, W09, W10, W11, W12, W14, W15, W16, W17, W18, W19, W20, W21。日历：隔离账户合同缺口，来源恢复另批；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：F07固定缺口应ProducerUnready，不归咎用户快照或轮询。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：保持STARVED新claim未激活；LegacyAccountGate缺verified broker batch及同批trade-sync watermark可见，零消息不是通过；自动tasks[R03]只由核验旧decision hydrate。
+
+#### MU-review-r03-manual — R03手动任务STARVED
+
+owner：run_review_only::temporary audit_state(invocation,date).tasks&#91;R03&#93;。Epic：盘后；producer：review-r03-manual。快照SHA：`917f69da6d89a475f93e583667cfe9a545cfb6b535ea53e07405a9f61ee868a7`。
+
+隔离conformance与保持未激活；不切换physical owner，不补生产依赖。 O/M/P=4/7/12h；PERT=7.33h；风险=high；外部等待=3工作日；owner change=false；rank=null；晋级/观察=0/0 session。
+
+依赖：W01, W02, W03, W04, W06, W07, W08, W09, W10, W11, W12, W15, W16, W17, W18, W19, W20, W21。日历：仅manual拒绝/历史hydrate回放；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：F07手动临时状态独立于auto，不合并潜在durable owner。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：保持STARVED新claim未激活；账户批次/水位缺依赖可见，零消息不是通过；每invocation临时audit不能冒充auto task owner或创建新claim。
+
+#### MU-paper-review-daily — 每日PaperReview STARVED
+
+owner：COOLDOWN_TABLE(PaperReview,code)；L4(paper_review,code,空 sub_kind)。Epic：盘后；producer：paper-review-daily-auto, paper-review-daily-manual, paper-review-daily-push。快照SHA：`6a1bf7c5ecc9814cfa1412be8dfbb545854ddd0e30fe74ee4a4e057f33ee5034`。
+
+隔离conformance与保持未激活；不切换physical owner，不补生产依赖。 O/M/P=5/9/16h；PERT=9.5h；风险=high；外部等待=2工作日；owner change=false；rank=10；晋级/观察=0/0 session。
+
+依赖：W01, W02, W03, W04, W06, W07, W08, W09, W10, W11, W12, W14, W15, W16, W17, W18, W19, W20, W21。日历：历史T+1隔离样本，生产激活另批；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：rank10不能把daily/manual/--push误写成现成counted decision。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：保持STARVED新链未激活；A01自产链缺依赖可见，零消息不是通过；合法exact已完成T+1历史记录可conformance，排除自动backfill并保留实际code。
+
+#### MU-block-confirm — 大宗交易逐条确认
+
+owner：COOLDOWN_TABLE(BlockTradeIntradayConfirm,code)；L4(block_trade_intraday_confirm,code,空 sub_kind)。Epic：盘后；producer：block-confirm-side-route。快照SHA：`047156d8d035761b9ea2e45611c99e04d860de2135019e21dda300ce8585ab36`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=6/10/18h；PERT=10.67h；风险=high；外部等待=1工作日；owner change=true；rank=null；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W16, W17, W18, W19, W20, W21。日历：交易记录自然出现及跨日回放；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：从两层冷却补真实逐条identity有设计风险。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：逐真实交易记录/历史business_date identity，300s模板/L4只冷却；同票两记录分别receipt，不虚构ReviewTask或批次日门。
+
+#### MU-ipo-catalyst — IPO催化事件
+
+owner：COOLDOWN_TABLE(IpoCatalyst,空 code)；L4(ipo_catalyst,空 code,空 sub_kind)。Epic：盘后；producer：ipo-catalyst-side-route。快照SHA：`8ce28f1c4086219cf88ee9d92a69486f51532a4cb151ee4ad17149a178f46759`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=5/9/15h；PERT=9.33h；风险=medium；外部等待=1工作日；owner change=true；rank=null；晋级/观察=1/1 session。
+
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W16, W17, W18, W19, W20, W21。日历：公告/stage自然变化或灰盒；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：无日LAST/claim，需要独立通知cursor。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：date+announcement+stage形成occurrence；R08日期公告cache仅输入复用，空code两层冷却不得合并不同IPO阶段。
+
+#### MU-cli-replay-force — 显式历史强制重放
+
+owner：MonitorReplayPublisher replay envelope.id → replay_audit/YYYY.jsonl attempt/result hash chain；ReplayRunner invocation summary。Epic：盘中/盘前/盘后/集合竞价；producer：cli-replay-force。快照SHA：`9c967d9fd51e6d06b4da5155faee51070c189d643ebe2a0fde33cc8dd32f71ca`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=9/14/25h；PERT=15h；风险=critical；外部等待=1工作日；owner change=true；rank=null；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W16, W17, W18, W19, W20, W21。日历：操作员批准重放窗口，两eligible session；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：独立replay owner不是普通startup或原业务claim；本批仅测试合同不执行发送。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：真实发送审计绑定原消息hash与新replay identity及required-channel receipt；dry-run零发送，force显式授权才能新attempt，跨进程崩溃不能借本地hash链证明Accepted。
+
+#### MU-cli-single — CLI单股报告
+
+owner：AnalysisPipeline::process_stock_inner(invocation,code) 的 Option<AnalysisResult>；无持久通知 completion cursor。Epic：盘中/盘前/盘后/集合竞价；producer：cli-single-default, cli-single-lhb, cli-single-schedule。快照SHA：`207eb4da6553f038d1fb9d3fabebdb1cf33198fa389c80997cf4251be952f7e4`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=4/7/12h；PERT=7.33h；风险=medium；外部等待=0工作日；owner change=true；rank=1；晋级/观察=1/1 session。
+
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W16, W17, W18, W19, W20, W21。日历：CLI调用与schedule/LHB各一次隔离回放；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：rank1最小typed结果切口，跨调用无原持久cursor。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：default/schedule/LHB每invocation+code通知结果为typed BestEffort；Option AnalysisResult或业务DB成功不推断强receipt，空结果不造通知。
+
+#### MU-cli-summary — CLI汇总报告
+
+owner：AnalysisPipeline::run(invocation) 的 results / send_summary_notification_to 返回值；无持久通知 completion cursor。Epic：盘中/盘前/盘后/集合竞价；producer：cli-summary-default, cli-summary-lhb, cli-summary-schedule。快照SHA：`f30beea312d5bcd4c154c65cb5968b17c431ef39ecf1a0c74c1d04e369e1abde`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=5/8/13h；PERT=8.33h；风险=medium；外部等待=0工作日；owner change=true；rank=1；晋级/观察=1/1 session。
+
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W16, W17, W18, W19, W20, W21。日历：三个CLI入口非空结果集回放；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：rank1汇总形态与单股通知分开验证。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：nonempty results汇总保存独立通知结果；文件同分钟重名不当作completion，single成功不能完成summary。
+
+#### MU-cli-chain — CLI产业链报告
+
+owner：run_chain_analysis_mode(invocation) 的 Result<()>；无独立持久通知 cursor。Epic：盘中/盘前/盘后/集合竞价；producer：cli-chain。快照SHA：`f99e1b311f12062db0002c69d68074a5e4532493a98d71143ffeb5d42e9edccf`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=4/8/14h；PERT=8.33h；风险=medium；外部等待=0工作日；owner change=true；rank=1；晋级/观察=1/1 session。
+
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W16, W17, W18, W19, W20, W21。日历：显式CLI invocation回放；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：rank1 enum外chain不合并R03/I03或两个timer。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：Result<()>只代表函数完成，typed BestEffort逐渠道呈现；latest completed business date绑定payload，不借timer日期门授权。
+
+#### MU-chain-preopen — 09:05产业链定时
+
+owner：monitor_loop::CHAIN_PREOPEN_LAST&#91;calendar_date&#93;。Epic：盘前；producer：chain-preopen-timer。快照SHA：`0c1944dbae3ad3fa21f7f4851cebbe7dbcde5d59dae46cf8047395271ea8b9a9`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=6/10/16h；PERT=10.33h；风险=high；外部等待=1工作日；owner change=true；rank=2；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W14, W16, W17, W18, W19, W20, W21。日历：交易日09:05至09:15自然occurrence；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：rank2 timer现无交易日guard，日期混淆需窗口回放。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：09:05≤t<09:15交易日guard；calendar封口日与latest completed业务日分开，跨自然日同业务结果不盲重发，CHAIN_PREOPEN_LAST按通知结果推进。
+
+#### MU-chain-post-close — 15:30产业链定时
+
+owner：monitor_loop::CHAIN_POST_LAST&#91;calendar_date&#93;。Epic：盘后；producer：chain-post-close-timer。快照SHA：`5596c2836c2023c75a26490bc5b5e1f3970e61b0b5eff025a22ac8f4fb9ff6f9`。
+
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=6/11/18h；PERT=11.33h；风险=high；外部等待=1工作日；owner change=true；rank=3；晋级/观察=1/2 session。
+
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W14, W16, W17, W18, W19, W20, W21。日历：交易日15:30至15:35自然occurrence；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：rank3五分钟窗口与分析耗时竞争，完成cursor独立。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：15:30≤t<15:35独立occurrence；CHAIN_POST_LAST不借preopen/CLI结果；同分钟报告文件覆盖不证明新通知成功。
+
+#### MU-review-r03-stored-recovery — R03既存事实恢复
+
+owner：business_date_once_claims(business_date,IndustryChain,None,GLOBAL) → existing immutable decision / occurrence=review_task_identity(date,R03)。Epic：盘后；producer：startup-resume-industry-chain。快照SHA：`f9850a92694dc1fcc215d432ea91aeed223685b6930572591d8a506b82f5b5d9`。
+
+隔离conformance与保持未激活；不切换physical owner，不补生产依赖。 O/M/P=6/10/19h；PERT=10.83h；风险=high；外部等待=2工作日；owner change=false；rank=null；晋级/观察=0/0 session。
+
+依赖：W01, W02, W03, W06, W07, W08, W09, W10, W11, W12, W13, W14, W15, W16, W17, W18, W19, W20, W21。日历：启动all-date旧信封隔离恢复，来源激活另批；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：独立既存durable owner不能与auto/manual临时任务状态合并。
+
+六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：保持STARVED新claim未激活；账户依赖缺失可见，零消息不是通过；只恢复原业务日existing IndustryChain decision，Rejected/Uncertain hydrate不能当已送达。；R03既存事实恢复：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。
+
+发布边界：draft校验只证明文档一致性；strict必须返回 wbs_status_provisional，不能用本WBS宣称实现、部署或真实接收完成。
+
+<!-- RFC-WBS-END -->
+
 ## 规范 DDL 原始嵌入（PROPOSED）
 
 独立 SQL 文件是唯一事实源；本节只复制原始字节，不维护手写变体。[Q:76] [Q:97]
