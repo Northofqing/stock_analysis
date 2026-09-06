@@ -1,8 +1,16 @@
 //! Application-level push contracts. This module is pure and has no runtime wiring.
 
+mod canonical;
+mod context;
 mod delivery;
+mod facts;
 mod identity;
 mod policy;
+
+pub use context::{
+    AuthenticatedOperatorRef, CalendarDate, CommandId, GitSha40, PhaseEpic, RunContext, ScheduleId,
+    Trigger, TriggerView,
+};
 
 pub use delivery::{
     classify_durable_state, AttemptId, AuthorityClass, ChannelId, CompatId,
@@ -10,6 +18,7 @@ pub use delivery::{
     DeliveryResultView, DurableSchemaVersion, DurableStateProjection, TemplateId, TemplateVersion,
     TerminalDisposition, TerminalRefId, VerifiedTerminalRef, WeakOutcome, WeakOutcomeKind,
 };
+pub use facts::{ExternalId, SourceProvider, SourceRef, SourceRefId};
 pub use identity::{
     derive_intent_id, derive_occurrence_id, derive_schedule_occurrence_id, AudienceId,
     BusinessDate, CalendarId, CompletionOwnerId, IntentId, IntentIdentityMaterial, Namespace,
@@ -35,6 +44,10 @@ pub enum PushJobError {
     },
     #[error("invalid business date: {0}")]
     InvalidBusinessDate(String),
+    #[error("invalid calendar date: {0}")]
+    InvalidCalendarDate(String),
+    #[error("invalid Git SHA-40")]
+    InvalidGitSha40,
     #[error("invalid sha256 for {field}")]
     InvalidSha256 { field: &'static str },
     #[error("UTC microseconds must be non-negative")]
@@ -49,6 +62,8 @@ pub enum PushJobError {
     InvalidCompletionPolicy(&'static str),
     #[error("completion policy violation: {0}")]
     PolicyViolation(&'static str),
+    #[error("invalid run context: {0}")]
+    InvalidRunContext(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, PushJobError>;

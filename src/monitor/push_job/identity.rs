@@ -3,18 +3,11 @@
 use std::collections::BTreeMap;
 
 use chrono::NaiveDate;
-use sha2::{Digest, Sha256};
 
+use super::canonical::{canonical_digest, canonical_preimage, CanonicalValue};
 use super::{PushJobError, Result};
 
 const TEXT_RULE: &str = "must be 1..=512 UTF-8 bytes, trimmed, and contain no NUL";
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum CanonicalValue {
-    Null,
-    String(String),
-    Object(BTreeMap<&'static str, CanonicalValue>),
-}
 
 pub(super) fn validate_text(field: &'static str, value: String) -> Result<String> {
     let valid =
@@ -101,7 +94,7 @@ impl Sha256Digest {
         &self.0
     }
 
-    fn from_bytes(bytes: [u8; 32]) -> Self {
+    pub(super) fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(hex::encode(bytes))
     }
 }
@@ -186,6 +179,18 @@ impl OccurrenceIdentityMaterial {
             occurrence_key,
         }
     }
+
+    pub fn business_date(&self) -> &BusinessDate {
+        &self.business_date
+    }
+
+    pub fn occurrence_family(&self) -> &OccurrenceFamily {
+        &self.occurrence_family
+    }
+
+    pub fn occurrence_key(&self) -> &OccurrenceKey {
+        &self.occurrence_key
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -258,7 +263,7 @@ impl IntentIdentityMaterial {
     }
 }
 
-fn namespace_value(namespace: &Namespace) -> CanonicalValue {
+pub(super) fn namespace_value(namespace: &Namespace) -> CanonicalValue {
     let (kind, run_id) = match namespace {
         Namespace::Production => ("Production", CanonicalValue::Null),
         Namespace::Test { run_id } => ("Test", CanonicalValue::String(run_id.as_str().to_owned())),
@@ -278,76 +283,6 @@ fn subject_value(subject: &SubjectId) -> CanonicalValue {
         ("kind", CanonicalValue::String(kind.to_owned())),
         ("value", value),
     ]))
-}
-
-fn canonical_preimage(
-    domain: &'static str,
-    fields: &BTreeMap<&'static str, CanonicalValue>,
-) -> Vec<u8> {
-    debug_assert!(domain.is_ascii() && !domain.contains('\0'));
-    let mut preimage = Vec::with_capacity(domain.len() + 1 + fields.len() * 32);
-    preimage.extend_from_slice(domain.as_bytes());
-    preimage.push(0);
-    write_json_object(&mut preimage, fields);
-    preimage
-}
-
-fn write_json_object(output: &mut Vec<u8>, fields: &BTreeMap<&'static str, CanonicalValue>) {
-    output.push(b'{');
-    for (index, (key, value)) in fields.iter().enumerate() {
-        if index != 0 {
-            output.push(b',');
-        }
-        write_json_string(output, key);
-        output.push(b':');
-        write_json_value(output, value);
-    }
-    output.push(b'}');
-}
-
-fn write_json_value(output: &mut Vec<u8>, value: &CanonicalValue) {
-    match value {
-        CanonicalValue::Null => output.extend_from_slice(b"null"),
-        CanonicalValue::String(value) => write_json_string(output, value),
-        CanonicalValue::Object(fields) => write_json_object(output, fields),
-    }
-}
-
-fn write_json_string(output: &mut Vec<u8>, value: &str) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-
-    output.push(b'"');
-    for character in value.chars() {
-        match character {
-            '"' => output.extend_from_slice(br#"\""#),
-            '\\' => output.extend_from_slice(br"\\"),
-            '\u{0008}' => output.extend_from_slice(br"\b"),
-            '\t' => output.extend_from_slice(br"\t"),
-            '\n' => output.extend_from_slice(br"\n"),
-            '\u{000c}' => output.extend_from_slice(br"\f"),
-            '\r' => output.extend_from_slice(br"\r"),
-            control if control <= '\u{001f}' => {
-                let byte = control as u8;
-                output.extend_from_slice(b"\\u00");
-                output.push(HEX[usize::from(byte >> 4)]);
-                output.push(HEX[usize::from(byte & 0x0f)]);
-            }
-            other => {
-                let mut encoded = [0; 4];
-                output.extend_from_slice(other.encode_utf8(&mut encoded).as_bytes());
-            }
-        }
-    }
-    output.push(b'"');
-}
-
-fn canonical_digest(
-    domain: &'static str,
-    fields: &BTreeMap<&'static str, CanonicalValue>,
-) -> Sha256Digest {
-    let mut hasher = Sha256::new();
-    hasher.update(canonical_preimage(domain, fields));
-    Sha256Digest::from_bytes(hasher.finalize().into())
 }
 
 fn occurrence_fields(
