@@ -288,6 +288,7 @@ module ArchitectureDocs
       activation.producer_unready
       shadow.semantic_diff
       shadow.side_effect_attempted
+      operator.not_delivered
       operator.unauthorized
       operator.evidence_invalid
       operator.resolution_conflict
@@ -370,8 +371,9 @@ module ArchitectureDocs
           ["PendingDispatch","Disabled","应用","显式禁用及版本 CAS","同库 CAS 并追加事件；保留原 Ready 材料","清除待处理事实或推进通知游标","policy.disabled"],
           ["AwaitingAuthority","AwaitingFinalizer","authority 适配器","私有重查精确绑定且策略允许","同库 CAS 并追加事件","仅凭日志或结果枚举晋级","intent.authority_verified"],
           ["AwaitingFinalizer","Completed","finalizer","再次精确绑定且策略允许及版本 CAS","同一事务执行完成事实 CAS 与事件","跨库原子性或跳过事件","finalizer.completed"],
+          ["AwaitingAuthority/ResolutionRequired","NotDelivered","已认证操作员与私有 authority 适配器","不投递终态合同的来源、精确绑定、独立审计及版本 CAS 全通过","同库 CAS 与不可变处置事件；解除未决阻断但保留失败","推进游标、重发、撤销 Accepted 或计入成功","operator.not_delivered"],
           ["PendingDispatch/AwaitingAuthority/AwaitingFinalizer/Completed/NoData/Disabled","ResolutionRequired","应用或 finalizer","材料或版本冲突并以重读版本 CAS","保留原材料与终态历史并阻断 Unit 晋级","覆盖材料或撤销既有游标","intent.payload_conflict/intent.expected_version_conflict/finalizer.cas_conflict"],
-          ["AwaitingAuthority/AwaitingFinalizer","ResolutionRequired","私有 authority 适配器","未知或人工不投递处置经重查且版本 CAS","隔离并保留原 decision 与处置证据","自动重发或自动推进通知游标","transport.uncertain/operator.resolution_conflict"],
+          ["AwaitingAuthority/AwaitingFinalizer","ResolutionRequired","私有 authority 适配器","未知或处置冲突经重查且版本 CAS","隔离并保留原 decision 与处置证据","自动重发或自动推进通知游标","transport.uncertain/operator.resolution_conflict"],
           ["ResolutionRequired","AwaitingFinalizer","已认证操作员与私有 authority 适配器","Ready 来源且处置清除冲突与原身份精确接受绑定、策略及版本 CAS","保留处置证据并只恢复最终化资格","自动解封或再次发送","intent.authority_verified"],
           ["PendingDispatch/AwaitingAuthority/AwaitingFinalizer/ResolutionRequired","SameState","lease 管理者","owner/until/generation 与版本 CAS","版本加一并追加事件","抢占未过期外来 lease","intent.lease_held/intent.dispatch_claimed"],
           ["AwaitingAuthority","SameState","authority 恢复器","原 decision 与版本 CAS","仅记录拒绝或审计阻塞并追加事件","盲重发或提前最终化","transport.rejected/finalizer.terminal_ref_invalid"],
@@ -396,11 +398,11 @@ module ArchitectureDocs
         rows: [
           ["Accepted","AwaitingFinalizer","私有 authority 适配器","终态已封存且 TerminalBinding 与 CompletionPolicy 均通过","仅记录完成提案后进入步骤六","把远端接受当业务完成","intent.authority_verified"],
           ["ManualConfirmedAccepted","AwaitingFinalizer","私有 authority 适配器","精确绑定且 AcceptedOrManualBound 策略允许","独立人工接受指标与完成提案","伪装 TransportAccepted","intent.authority_verified"],
-          ["AlreadyTerminal","DispositionDependent","私有 authority 适配器","重查 TerminalBinding 并逐处置执行终态完成合同","仅允许 Accepted 或合法人工接受进入步骤六","全处置推进或省略绑定","intent.authority_verified"],
+          ["AlreadyTerminal","DispositionDependent","私有 authority 适配器","重查 TerminalBinding 并逐处置执行终态完成合同","接受仅推进完成；不投递仅按专门合同收敛","全处置推进或省略绑定","intent.authority_verified/operator.not_delivered/transport.rejected/transport.uncertain"],
           ["AcceptedAuditPending/AcceptedTaskTransitionPending","AwaitingAuthority","恢复器","authority 尚未封存","仅恢复审计与 authority 内部转换","重发或业务最终化","finalizer.terminal_ref_invalid"],
           ["Rejected","AwaitingAuthority","dispatcher","当前显式重试授权及原 decision 与 lease CAS","仅授权时申请新 attempt","盲重试或推进游标","transport.rejected"],
           ["Uncertain","ResolutionRequired","恢复器","权威不确定性已确认","隔离并等待已认证人工解析","自动重发或自动清理","transport.uncertain"],
-          ["ManualConfirmedNotDelivered","ResolutionRequired","私有 authority 适配器","精确绑定与已认证处置","仅保存不投递处置事实","推进游标或自动改写为接受","operator.resolution_conflict"],
+          ["ManualConfirmedNotDelivered","NotDelivered","已认证操作员与私有 authority 适配器","不投递终态合同的来源、精确绑定、独立审计及版本 CAS 全通过","同库追加不投递终态事实；保留失败指标","推进游标、重发或冒充接受","operator.not_delivered"],
           ["COMPAT/Blocked","AwaitingAuthority","应用","无强 authority 终态","仅保留弱证据或阻塞诊断","构造 VerifiedTerminalRef 或权威完成","finalizer.terminal_ref_invalid"]
         ],
         error: 'rfc_authority_protocol_invalid'
@@ -414,7 +416,7 @@ module ArchitectureDocs
           ["4","authority","durable_decision_id+attempt_id","durable terminal 本地提交并封存","查询原 terminal 及未封存审计","封存后进入步骤五","以 sink attempt 或审计日志冒充终态"],
           ["5","私有 authority 适配器","IdentityRule::TerminalBinding","只读重验不产生新投递事实","从原 authority 再查引用与绑定","资格允许才进入步骤六","复制回执或跨事务复用未重验引用"],
           ["6","finalizer","intent_id+expected_version+event_id","一个业务事务的 CAS 与 transition 共同提交","查业务状态版本和稳定事件","失败整体回滚并重查；成功进入步骤七","CAS 零行追加或事件失败仍提交"],
-          ["7","业务应用","intent_id+result_version","提交后的确认与独立完成指标","查询既有 Completed 和事件","幂等返回既有完成事实","丢失确认导致二次发送或完成"]
+          ["7","业务应用","intent_id+result_version","提交后的确认与独立完成指标","查询既有 Completed/NotDelivered 和事件","幂等返回原终态事实与独立指标","丢失确认导致二次发送或完成"]
         ],
         error: 'rfc_cross_database_protocol_invalid'
       },
@@ -428,9 +430,9 @@ module ArchitectureDocs
           ["before_attempt","reservation","查询是否已记录 attempt","仅确认未尝试且 lease 有效","durable_decision_id+attempt_id","AwaitingAuthority","intent.dispatch_claimed"],
           ["after_attempt","attempt 可能已外发","查询原 attempt 并协调未知结果","否","durable_decision_id+attempt_id","ResolutionRequired","transport.uncertain"],
           ["before_terminal_commit","attempt 或待封存审计","恢复原 authority 并查询未知结果","否","durable_decision_id+attempt_id","AwaitingAuthority/ResolutionRequired","transport.uncertain"],
-          ["after_terminal_commit","durable terminal；确认可能丢失","查询原 terminal 并重新验证绑定","否","IdentityRule::TerminalBinding","AwaitingFinalizer","intent.authority_verified"],
+          ["after_terminal_commit","durable Accepted terminal；确认可能丢失","查询原 terminal 并重新验证绑定","否","IdentityRule::TerminalBinding","AwaitingFinalizer","intent.authority_verified"],
           ["before_reverify","durable terminal","私有 authority 重查绑定与资格","否","IdentityRule::TerminalBinding","AwaitingFinalizer","intent.authority_verified"],
-          ["after_reverify","durable terminal；引用仅在内存","重新查询而非恢复内存引用","否","IdentityRule::TerminalBinding","AwaitingFinalizer","finalizer.terminal_ref_invalid"],
+          ["after_reverify","durable Accepted terminal；引用仅在内存","重新查询而非恢复内存引用","否","IdentityRule::TerminalBinding","AwaitingFinalizer","finalizer.terminal_ref_invalid"],
           ["after_business_cas","旧业务提交事实；CAS 尚未提交","事务恢复回滚后查状态版本","否","intent_id+expected_version+event_id","AwaitingFinalizer","finalizer.transition_append_failed"],
           ["after_transition_append","旧业务提交事实；事件尚未提交","事务恢复回滚后查状态与事件","否","intent_id+expected_version+event_id","AwaitingFinalizer","finalizer.transition_append_failed"],
           ["after_business_commit","Completed 与事件；确认可能丢失","查既有终态及稳定事件并幂等确认","否","intent_id+result_version+event_id","Completed","finalizer.completed"],
@@ -440,6 +442,8 @@ module ArchitectureDocs
           ["accepted_audit_pending","Accepted 的未封存审计","仅修复 authority 审计和内部转换","否","durable_decision_id+attempt_id","AwaitingAuthority","finalizer.terminal_ref_invalid"],
           ["rejected_retry","已封存 Rejected","重新核对当前显式授权与 lease","仅显式授权产生新 attempt","durable_decision_id+new_attempt_id","AwaitingAuthority","transport.rejected"],
           ["uncertain","权威未知结果","隔离并等待已认证人工解析","否","durable_decision_id+attempt_id","ResolutionRequired","transport.uncertain"],
+          ["not_delivered_before_business_commit","不投递 terminal 与独立 operator audit 已封存","重查原 decision 精确绑定及版本；仅恢复业务终态事务","否","intent_id+expected_version+event_id","NotDelivered","operator.not_delivered"],
+          ["not_delivered_after_business_commit","NotDelivered 与不可变事件；确认可能丢失","查询原事件与关联 audit；返回已处置失败而非接受","否","intent_id+result_version+event_id","NotDelivered","operator.not_delivered"],
           ["payload_drift","原身份及不可变材料","重读并 CAS 隔离；保留冲突证据","否","intent_id","ResolutionRequired","intent.payload_conflict"],
           ["expected_version_conflict","获胜者提交事实","回滚本事务并重读 CAS 隔离","否","intent_id+expected_version","ResolutionRequired","intent.expected_version_conflict"],
           ["terminal_ref_invalid","原 durable 与业务事实","私有 authority 重新核验","否","IdentityRule::TerminalBinding","AwaitingAuthority/AwaitingFinalizer","finalizer.terminal_ref_invalid"],
@@ -453,6 +457,62 @@ module ArchitectureDocs
     }.freeze
     # v1 规范表的固定语义；只校验结构化单元格，不复制叙述或整份 RFC 快照。
     ROLLOUT_CONTRACTS = {
+      "不投递终态合同（PROPOSED）" => {
+        header: ["规则","适用范围","规范值","依据"],
+        rows: [
+          ["state","BusinessIntentState","NotDelivered；独立业务终态，不增加 durable 的十四态或 DeliveryResult 分支"],
+          ["entry","AwaitingAuthority/ResolutionRequired","仅 Ready；后者最近进入隔离必须来自同 intent/decision 的 AwaitingAuthority+transport.uncertain；历史不得已有 AwaitingFinalizer/Completed"],
+          ["verification","VerifiedTerminalRef","已认证操作员与生产 allowlist；私有 authority 重查精确 ManualConfirmedNotDelivered 绑定、外部证据哈希与独立 operator audit"],
+          ["commit","ExpectedVersionCAS","同一业务事务 CAS 与追加 event；包含 terminal_ref_id、terminal_disposition、terminal_decision_id、binding SHA、operator audit 引用与 SHA"],
+          ["storage_trust","SQLite/Application","SQL 验证边、原 decision、字段组与格式；应用验证身份认证、authority 真实性、hash 内容与事务包装"],
+          ["cursor","NotDelivered","永不推进通知游标；不授权重发；不作为 Accepted 或 ProductionVerified 成功样本"],
+          ["recovery","CommitAckLost","重查原 terminal 后只补本地终态事务；已提交时返回原 event；禁止再次外发"],
+          ["gate","ResolvedButFailed","解除未解决 ResolutionRequired/Uncertain 阻断；failure 门禁及失败指标仍保留，不自动批准晋级"],
+          ["retention","TerminalEvidence","关联原 intent、decision、transition、operator audit；满足最严格保留及清理资格才可清理，不因已处置立即删除"],
+          ["rollback","AcceptedHistory","NotDelivered 无离开边；AwaitingFinalizer/Completed 及其隔离历史不得撤销为不投递"]
+        ],
+        error: 'rfc_not_delivered_contract_invalid'
+      },
+      "运行里程碑（PROPOSED）" => {
+        header: ["标识","名称","前置条件","完成条件","本批状态","依据"],
+        rows: [
+          ["FoundationReady","Foundation Ready","TypedResultThenFinalizerReconcilerAndCompatibleSchemas","NoOwnerChange+EachAuthorityControlledAcceptedAndSameDecisionAlreadyDeliveredNoSecondSend+TestRestore+ParallelIsolation","NotAttained"],
+          ["P0ProductionVerified","P0 Production Verified","FoundationReady+Q44ApprovedNonNullWaveUnits","EachApplicableP0UnitFreshSixGatesAndAuthorizedNaturalOrLowFrequencyEvidence+RequiredChannelReceipts","NotAttained"],
+          ["ArchitectureReleaseCandidate","Architecture Release Candidate","FoundationReady+All52UnitsImplemented","42OwnerChangingAnd10ConformanceOnlyCodeContractsTestsComplete+NoImplicitActivation+DeletionGatesBeforeCleanup","NotAttained"],
+          ["ProgramProductionVerified","Program Production Verified","ArchitectureReleaseCandidate+All52UnitsVerified","CompleteCatalog+AllUnitsComplete+NoAccidentalActivationUncertainBacklogDuplicateReceiptGap+TailCleanup+FreshEvidence","NotAttained"]
+        ],
+        error: 'rfc_runtime_milestones_invalid'
+      },
+      "运行退出验收（PROPOSED）" => {
+        header: ["规则","适用范围","规范值","依据"],
+        rows: [
+          ["unit_inventory","CurrentCatalog","52 Units；42 owner-changing 与 10 conformance-only；不按 PushKind/count 推导 owner"],
+          ["nullable_waves","Q44","只使用 WBS 当前非空批准波次；null 不代表遗漏、不自动赋予第十一波或生产授权；全部 52 Unit 仍在项目退出范围"],
+          ["foundation_greybox","EachAuthoritativeRequiredChannel","受控 Accepted 与同一 decision 的 AlreadyDelivered/no-second-send；弱 COMPAT 或人工接受不得替代"],
+          ["unit_greybox","EachUnit","自然 occurrence；低频仅经批准确定性灰盒；conformance-only 验证原 owner 而非虚构接管"],
+          ["parallel_tests","DefaultParallelCI","默认并行无无法解释失败；进程全局状态测试隔离或显式强制串行并记录范围，禁止隐匿失败"],
+          ["backup_restore","BusinessDBAndDurableDB","分别备份并记录各自 hash 与边界；在 Test 恢复并对账；不是跨库原子快照"],
+          ["old_path_delete","PriorUnit","Accepted、same-decision replay、restart、fault、有效 session、Uncertain 全部门禁通过后，才在后续版本删除旧路径"],
+          ["release_pipeline","ReleaseNAndNPlus1","N 接管当前 Unit；N+1 清理前一 Unit 并可晋级下一 Unit；最后单独完成 tail cleanup"],
+          ["program_exit","All52Units","目录完整、所有 Unit 完成、无意外激活、未解决 Uncertain、陈旧 backlog、duplicate、receipt 缺口；清理结束并有 fresh evidence"],
+          ["failure_retained","NotDelivered","已处置不等于发送成功；保留失败指标与 failure 门禁，不能冲抵成功回执缺口"],
+          ["publication_boundary","ImplementationReady","仅文档发布资格；与四级 runtime milestone 正交，本批四级均未达到；后续 HTML/CI 发布不证明生产"],
+          ["historical_estimate","Q41","36–69 工程人日与 7–10 交易周是目录冻结前暂估；现行机器 WBS 重新建立基线，保留完整范围"],
+          ["priority","Q22Q26","先修假成功、过早状态与语义分裂；C0–C6 仅能力标签；Foundation→垂直 Unit→尾部清理"]
+        ],
+        error: 'rfc_runtime_exit_invalid'
+      },
+      "外部兼容（PROPOSED）" => {
+        header: ["表面","保持项","内部边界","验收","破坏性变化","依据"],
+        rows: [
+          ["cli","Invocation+Arguments+ExitStatus+Output","BoolToTypedResultViaCompatibilityAdapter","ExistingInvocationGoldenArgsExitStdoutStderr+InvalidArgsAndModeMatrix","SeparateVersionedDecision+Unit+Acceptance"],
+          ["config","Key+Default+Scope","PreserveExistingParsingDefaultsAndNamespace","ExistingKeyDefaultScopeGolden+MissingInvalidCrossScopeCases","SeparateVersionedDecision+Unit+Acceptance"],
+          ["subscription","Subscription+Audience+RequiredChannels","PreserveRoutingAndCompletionPolicy","SameSubscriptionAudienceChannelSet+MissingRequiredChannelRefusal","SeparateVersionedDecision+Unit+Acceptance"],
+          ["template","TemplateId+Version+RenderedBytes","InfrastructureMigrationNeverChangesWordingOrTemplate","SameFactsIdVersionExactFirstRenderedBytes+ReplayNoRerender","SeparateVersionedDecision+Unit+Acceptance"],
+          ["authority","COMPATWeakEvidence","NeverTransportAcceptedOrVerifiedTerminalRefOrCursorAdvance","WeakOutcomeMatrixRejectsAuthorityUpgradeAndCursorMutation","SeparateVersionedDecision+Unit+Acceptance"]
+        ],
+        error: 'rfc_external_compatibility_invalid'
+      },
       '调度版本与转换提交（PROPOSED）' => {
         header: %w[规则 适用范围 规范值 依据],
         rows: [
@@ -848,7 +908,7 @@ module ArchitectureDocs
         sections[name] = body
       end
       required = (REQUIRED_SECTIONS + SEMANTIC_CONTRACTS.keys + PERSISTENCE_CONTRACTS.keys + ROLLOUT_CONTRACTS.keys +
-                  ['业务持久化范围与 SQL 字节合同（PROPOSED）', '最终化事务与恢复边界（PROPOSED）', '规范 DDL 原始嵌入（PROPOSED）'] +
+                  ['裁决追踪（PROPOSED）', '业务持久化范围与 SQL 字节合同（PROPOSED）', '最终化事务与恢复边界（PROPOSED）', '规范 DDL 原始嵌入（PROPOSED）'] +
                   TYPE_FIELDS.keys.map { |name| "类型：#{name}（PROPOSED）" }).uniq
       required.each do |name|
         errors << "rfc_section_missing name=#{name}" unless sections.key?(name)
@@ -857,7 +917,11 @@ module ArchitectureDocs
         'Q' => decisions.scan(/^\| (\d+) \|/).flatten,
         'unit' => catalog['migration_units'].map { |entry| entry['id'] },
         'producer' => catalog['producers'].map { |entry| entry['id'] },
-        'evidence' => evidence['evidence'].map { |entry| entry['id'] }
+        'evidence' => evidence['evidence'].map { |entry| entry['id'] },
+        'gate' => ROLLOUT_CONTRACTS.fetch('通用晋级门禁（PROPOSED）')[:rows].map(&:first),
+        'milestone' => ROLLOUT_CONTRACTS.fetch('运行里程碑（PROPOSED）')[:rows].map(&:first),
+        'acceptance' => SAMPLE_BINDINGS.keys + ROLLOUT_CONTRACTS.fetch('外部兼容（PROPOSED）')[:rows].map(&:first) + ['not_delivered'],
+        'publication' => ['ImplementationReady']
       }
       references(text).each do |type, id|
         unless ids.key?(type) && ids[type].include?(id)
@@ -890,6 +954,32 @@ module ArchitectureDocs
       errors.concat(mapping_errors(sections, catalog))
       errors.concat(state_reason_errors(sections))
       errors.concat(semantic_contract_errors(sections))
+      errors.concat(trace_errors(sections, decisions, required, ids))
+      errors
+    end
+
+    # 选择来自逐字节冻结的 grill，而非另一份手写选择/摘要真相。
+    # 约束摘要由人工评审；机器只约束结构、选择、真实规范落点和可解析引用。
+    def trace_errors(sections, decisions, locators, ids)
+      errors = []
+      rows = section_table(sections, '裁决追踪（PROPOSED）',
+                           %w[Q 冻结选择 约束摘要 规范落点 证据或验收引用], errors)
+      expected = (1..55).map(&:to_s)
+      errors << 'rfc_trace_coverage_invalid' unless rows.map(&:first).sort == expected.sort
+      choices = decisions.scan(/^\| (\d+) \| ([ABC]) \|/).select { |pair| expected.include?(pair.first) }.to_h
+      allowed_loci = locators - ['裁决追踪（PROPOSED）', '元数据', '规范 DDL 原始嵌入（PROPOSED）']
+      rows.each do |row|
+        errors << "rfc_trace_choice_invalid q=#{row[0]}" unless choices[row[0]] == row[1]
+        unless allowed_loci.include?(row[3]) && sections.key?(row[3])
+          errors << "rfc_trace_locus_invalid q=#{row[0]}"
+        end
+        refs = references(row[4])
+        valid_refs = !refs.empty? && refs.all? do |type, id|
+          type != 'Q' && ids.key?(type) && ids[type].include?(id)
+        end
+        residue = row[4].gsub(/\[([A-Za-z]+):([^\]\n]+)\]/, '').strip
+        errors << "rfc_trace_refs_invalid q=#{row[0]}" unless valid_refs && residue.empty?
+      end
       errors
     end
 

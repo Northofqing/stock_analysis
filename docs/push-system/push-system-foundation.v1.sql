@@ -1,6 +1,7 @@
 .bail on
 -- SQLite CLI schema script；不能直接传给 library execute_batch。
 -- 固定兼容签名是版本身份，不是 SQLite 计算的内容哈希。
+-- 修订：v1-final-wave1-not-delivered；旧 v1 签名不兼容，拒绝自动迁移。
 -- PROPOSED：仅用于新建临时数据库验证；不是生产迁移器。
 -- 每个业务连接必须再次启用外键与递归 trigger；时间均为非负 UTC 微秒。
 PRAGMA foreign_keys=ON;
@@ -54,7 +55,7 @@ FROM sqlite_master WHERE sql IS NOT NULL AND (name IN (SELECT name FROM _push_v1
 CREATE TABLE IF NOT EXISTS push_foundation_schema (
   version INTEGER PRIMARY KEY CHECK(version=1),
   description TEXT NOT NULL CHECK(description='push-foundation-v1'),
-  schema_signature TEXT NOT NULL CHECK(typeof(schema_signature)='text' AND length(schema_signature)=64 AND length(CAST(schema_signature AS BLOB))=64 AND schema_signature NOT GLOB '*[^0-9a-f]*' AND schema_signature='ae30ae6f6a0d8fa805fc7594137c6d27e6af3a879dc3625fa76d8146eb5a94e5')
+  schema_signature TEXT NOT NULL CHECK(typeof(schema_signature)='text' AND length(schema_signature)=64 AND length(CAST(schema_signature AS BLOB))=64 AND schema_signature NOT GLOB '*[^0-9a-f]*' AND schema_signature='dd5f49a1f4e02ee1d585793cc2eff9c8b98b087b2ffd267f40c873c83960ecdd')
 );
 
 
@@ -69,7 +70,7 @@ SELECT 'check',
   (SELECT ok FROM _push_v1_probe WHERE phase='probe' ORDER BY id DESC LIMIT 1)=1
   OR (
     (SELECT count(*) FROM push_foundation_schema)=1
-    AND EXISTS(SELECT 1 FROM push_foundation_schema WHERE version=1 AND description='push-foundation-v1' AND schema_signature='ae30ae6f6a0d8fa805fc7594137c6d27e6af3a879dc3625fa76d8146eb5a94e5')
+    AND EXISTS(SELECT 1 FROM push_foundation_schema WHERE version=1 AND description='push-foundation-v1' AND schema_signature='dd5f49a1f4e02ee1d585793cc2eff9c8b98b087b2ffd267f40c873c83960ecdd')
     AND (SELECT count(*) FROM push_foundation_objects)=(SELECT count(*) FROM _push_v1_managed)
     AND NOT EXISTS(SELECT 1 FROM push_foundation_objects r WHERE NOT EXISTS(SELECT 1 FROM _push_v1_managed m WHERE m.name=r.name AND m.object_type=r.object_type))
     AND (SELECT count(*) FROM push_foundation_objects)=(SELECT count(*) FROM _push_v1_snapshot WHERE run_id=(SELECT MAX(id) FROM _push_v1_probe WHERE phase='probe'))
@@ -98,8 +99,8 @@ CREATE TABLE IF NOT EXISTS push_intents (
   evidence_sha256 TEXT NOT NULL CHECK(typeof(evidence_sha256)='text' AND length(evidence_sha256)=64 AND length(CAST(evidence_sha256 AS BLOB))=64 AND evidence_sha256 NOT GLOB '*[^0-9a-f]*'),
   template_sha256 TEXT NOT NULL CHECK(typeof(template_sha256)='text' AND length(template_sha256)=64 AND length(CAST(template_sha256 AS BLOB))=64 AND template_sha256 NOT GLOB '*[^0-9a-f]*'),
   source_contract_sha256 TEXT NOT NULL CHECK(typeof(source_contract_sha256)='text' AND length(source_contract_sha256)=64 AND length(CAST(source_contract_sha256 AS BLOB))=64 AND source_contract_sha256 NOT GLOB '*[^0-9a-f]*'),
-  state TEXT NOT NULL CHECK(state IN ('PendingDispatch','AwaitingAuthority','AwaitingFinalizer','Completed','NoData','Disabled','ResolutionRequired')),
-  previous_state TEXT CHECK(previous_state IS NULL OR previous_state IN ('PendingDispatch','AwaitingAuthority','AwaitingFinalizer','Completed','NoData','Disabled','ResolutionRequired')),
+  state TEXT NOT NULL CHECK(state IN ('PendingDispatch','AwaitingAuthority','AwaitingFinalizer','Completed','NotDelivered','NoData','Disabled','ResolutionRequired')),
+  previous_state TEXT CHECK(previous_state IS NULL OR previous_state IN ('PendingDispatch','AwaitingAuthority','AwaitingFinalizer','Completed','NotDelivered','NoData','Disabled','ResolutionRequired')),
   reason TEXT NOT NULL CHECK(typeof(reason)='text' AND length(CAST(reason AS BLOB))=length(reason) AND length(reason) BETWEEN 3 AND 96 AND reason NOT GLOB '*[^a-z0-9_.]*' AND substr(reason,1,instr(reason,'.')-1) IN ('schedule','input','policy','intent','transport','finalizer','activation','shadow','operator') AND substr(reason,instr(reason,'.')+1) GLOB '[a-z]*' AND instr(substr(reason,instr(reason,'.')+1),'.')=0),
   lease_owner TEXT CHECK(lease_owner IS NULL OR length(lease_owner) BETWEEN 1 AND 512),
   lease_until INTEGER CHECK(lease_until IS NULL OR (typeof(lease_until)='integer' AND lease_until>=0)),
@@ -171,6 +172,14 @@ WHEN NEW.version<>OLD.version+1 OR NEW.previous_state IS NOT OLD.state OR NEW.up
     OR (OLD.state='PendingDispatch' AND NEW.state='Disabled' AND NEW.reason='policy.disabled')
     OR (OLD.state IN ('AwaitingAuthority','ResolutionRequired') AND NEW.job_decision_kind='Ready' AND NEW.state='AwaitingFinalizer' AND NEW.reason='intent.authority_verified')
     OR (OLD.state='AwaitingFinalizer' AND NEW.state='Completed' AND NEW.reason='finalizer.completed')
+    OR (NEW.state='NotDelivered' AND NEW.job_decision_kind='Ready' AND NEW.reason='operator.not_delivered'
+      AND NOT EXISTS(SELECT 1 FROM push_intent_transitions a WHERE a.intent_id=OLD.intent_id AND a.to_state IN ('AwaitingFinalizer','Completed'))
+      AND (OLD.state='AwaitingAuthority' OR (OLD.state='ResolutionRequired' AND EXISTS(
+        SELECT 1 FROM push_intent_transitions u WHERE u.intent_id=OLD.intent_id
+          AND u.to_state='ResolutionRequired' AND u.from_state='AwaitingAuthority' AND u.reason='transport.uncertain'
+          AND u.result_version=(SELECT MAX(r.result_version) FROM push_intent_transitions r
+            WHERE r.intent_id=OLD.intent_id AND r.to_state='ResolutionRequired' AND r.from_state<>'ResolutionRequired')))))
+
     OR (OLD.state IN ('PendingDispatch','AwaitingAuthority','AwaitingFinalizer','Completed','NoData','Disabled') AND NEW.state='ResolutionRequired' AND NEW.reason IN ('intent.payload_conflict','intent.expected_version_conflict','finalizer.cas_conflict'))
     OR (OLD.state IN ('AwaitingAuthority','AwaitingFinalizer') AND NEW.state='ResolutionRequired' AND NEW.reason IN ('transport.uncertain','operator.resolution_conflict'))
   )
@@ -181,19 +190,29 @@ END;
 CREATE TABLE IF NOT EXISTS push_intent_transitions (
   event_id TEXT NOT NULL CHECK(typeof(event_id)='text' AND length(event_id)=64 AND length(CAST(event_id AS BLOB))=64 AND event_id NOT GLOB '*[^0-9a-f]*') PRIMARY KEY,
   intent_id TEXT NOT NULL CHECK(typeof(intent_id)='text' AND length(intent_id)=64 AND length(CAST(intent_id AS BLOB))=64 AND intent_id NOT GLOB '*[^0-9a-f]*') REFERENCES push_intents(intent_id),
-  from_state TEXT NOT NULL CHECK(from_state IN ('PendingDispatch','AwaitingAuthority','AwaitingFinalizer','Completed','NoData','Disabled','ResolutionRequired')),
-  to_state TEXT NOT NULL CHECK(to_state IN ('PendingDispatch','AwaitingAuthority','AwaitingFinalizer','Completed','NoData','Disabled','ResolutionRequired')),
+  from_state TEXT NOT NULL CHECK(from_state IN ('PendingDispatch','AwaitingAuthority','AwaitingFinalizer','Completed','NotDelivered','NoData','Disabled','ResolutionRequired')),
+  to_state TEXT NOT NULL CHECK(to_state IN ('PendingDispatch','AwaitingAuthority','AwaitingFinalizer','Completed','NotDelivered','NoData','Disabled','ResolutionRequired')),
   expected_version INTEGER NOT NULL CHECK(typeof(expected_version)='integer' AND expected_version>=0),
   result_version INTEGER NOT NULL CHECK(typeof(result_version)='integer' AND result_version=expected_version+1),
   previous_sha256 TEXT CHECK(previous_sha256 IS NULL OR (typeof(previous_sha256)='text' AND length(previous_sha256)=64 AND length(CAST(previous_sha256 AS BLOB))=64 AND previous_sha256 NOT GLOB '*[^0-9a-f]*')),
   canonical_sha256 TEXT NOT NULL CHECK(typeof(canonical_sha256)='text' AND length(canonical_sha256)=64 AND length(CAST(canonical_sha256 AS BLOB))=64 AND canonical_sha256 NOT GLOB '*[^0-9a-f]*'),
   actor TEXT NOT NULL CHECK(length(actor) BETWEEN 1 AND 512),
   reason TEXT NOT NULL CHECK(typeof(reason)='text' AND length(CAST(reason AS BLOB))=length(reason) AND length(reason) BETWEEN 3 AND 96 AND reason NOT GLOB '*[^a-z0-9_.]*' AND substr(reason,1,instr(reason,'.')-1) IN ('schedule','input','policy','intent','transport','finalizer','activation','shadow','operator') AND substr(reason,instr(reason,'.')+1) GLOB '[a-z]*' AND instr(substr(reason,instr(reason,'.')+1),'.')=0),
+  terminal_disposition TEXT CHECK(terminal_disposition IS NULL OR terminal_disposition IN ('Accepted','ManualConfirmedAccepted','ManualConfirmedNotDelivered')),
+  terminal_decision_id TEXT CHECK(terminal_decision_id IS NULL OR length(terminal_decision_id) BETWEEN 1 AND 512),
+  operator_audit_ref TEXT CHECK(operator_audit_ref IS NULL OR length(operator_audit_ref) BETWEEN 1 AND 512),
+  operator_audit_sha256 TEXT CHECK(operator_audit_sha256 IS NULL OR (typeof(operator_audit_sha256)='text' AND length(operator_audit_sha256)=64 AND length(CAST(operator_audit_sha256 AS BLOB))=64 AND operator_audit_sha256 NOT GLOB '*[^0-9a-f]*')),
   terminal_ref_id TEXT CHECK(terminal_ref_id IS NULL OR length(terminal_ref_id) BETWEEN 1 AND 512),
   terminal_binding_sha256 TEXT CHECK(terminal_binding_sha256 IS NULL OR (typeof(terminal_binding_sha256)='text' AND length(terminal_binding_sha256)=64 AND length(CAST(terminal_binding_sha256 AS BLOB))=64 AND terminal_binding_sha256 NOT GLOB '*[^0-9a-f]*')),
   occurred_at INTEGER NOT NULL CHECK(typeof(occurred_at)='integer' AND occurred_at>=0),
   CHECK((terminal_ref_id IS NULL)=(terminal_binding_sha256 IS NULL)),
-  CHECK((to_state='Completed')=(terminal_ref_id IS NOT NULL)),
+  CHECK((to_state IN ('Completed','NotDelivered'))=(terminal_ref_id IS NOT NULL)),
+  CHECK((to_state IN ('Completed','NotDelivered'))=(terminal_disposition IS NOT NULL)),
+  CHECK(to_state<>'Completed' OR terminal_disposition IN ('Accepted','ManualConfirmedAccepted')),
+  CHECK((to_state='NotDelivered')=(terminal_decision_id IS NOT NULL)),
+  CHECK((to_state='NotDelivered')=(operator_audit_ref IS NOT NULL)),
+  CHECK((to_state='NotDelivered')=(operator_audit_sha256 IS NOT NULL)),
+  CHECK(to_state<>'NotDelivered' OR (terminal_disposition='ManualConfirmedNotDelivered' AND reason='operator.not_delivered')),
   CHECK((result_version=1)=(previous_sha256 IS NULL)),
   UNIQUE(intent_id,result_version)
 );
@@ -201,6 +220,8 @@ CREATE TRIGGER IF NOT EXISTS push_intent_transitions_binding
 BEFORE INSERT ON push_intent_transitions
 WHEN EXISTS(SELECT 1 FROM push_intent_transitions WHERE event_id=NEW.event_id)
   OR NOT EXISTS(SELECT 1 FROM push_intents i WHERE i.intent_id=NEW.intent_id AND i.state=NEW.to_state AND i.previous_state=NEW.from_state AND i.version=NEW.result_version AND i.reason=NEW.reason AND i.updated_at<=NEW.occurred_at)
+  OR (NEW.to_state='NotDelivered' AND NOT EXISTS(SELECT 1 FROM push_intents i
+    WHERE i.intent_id=NEW.intent_id AND i.durable_decision_id=NEW.terminal_decision_id))
   OR (NEW.result_version>1 AND NOT EXISTS(SELECT 1 FROM push_intent_transitions p WHERE p.intent_id=NEW.intent_id AND p.result_version=NEW.expected_version AND p.to_state=NEW.from_state AND p.canonical_sha256=NEW.previous_sha256))
 BEGIN
   SELECT RAISE(ROLLBACK, 'intent.transition_binding_invalid');
@@ -285,6 +306,7 @@ CREATE TABLE IF NOT EXISTS push_promotion_journal (
   CHECK(window_end>window_start AND occurred_at>=window_start AND occurred_at<window_end),
   CHECK((generation=1)=(from_manifest_sha256 IS NULL)),
   CHECK((generation=1)=(previous_sha256 IS NULL)),
+  CHECK(reason='activation.applied'),
   CHECK((action='Rollback')=(rollback_target_sha256 IS NOT NULL)),
   UNIQUE(unit_id,generation)
 );
@@ -347,7 +369,7 @@ INSERT INTO _push_v1_probe(phase,ok)
 SELECT 'check',(SELECT count(*) FROM push_foundation_objects)=(SELECT count(*) FROM _push_v1_managed)
   AND NOT EXISTS(SELECT 1 FROM push_foundation_objects r WHERE NOT EXISTS(SELECT 1 FROM _push_v1_managed m WHERE m.name=r.name AND m.object_type=r.object_type));
 INSERT INTO push_foundation_schema(version,description,schema_signature)
-SELECT 1,'push-foundation-v1','ae30ae6f6a0d8fa805fc7594137c6d27e6af3a879dc3625fa76d8146eb5a94e5'
+SELECT 1,'push-foundation-v1','dd5f49a1f4e02ee1d585793cc2eff9c8b98b087b2ffd267f40c873c83960ecdd'
 WHERE NOT EXISTS(SELECT 1 FROM push_foundation_schema);
 
 COMMIT;

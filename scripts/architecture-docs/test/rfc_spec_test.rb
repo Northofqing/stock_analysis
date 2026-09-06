@@ -528,6 +528,235 @@ class RfcSpecTest < Minitest::Test
     end
   end
 
+  def test_wave1_manual_not_delivered_is_a_real_non_sending_terminal
+    with_database do |db, ddl|
+      seed_authority(db)
+      sql_ok(db, not_delivered_transaction)
+      assert_equal "NotDelivered|2\n", sql_ok(db, 'SELECT state,version FROM push_intents;')
+      assert_equal "ManualConfirmedNotDelivered|decision-1|operator-audit-1\n",
+        sql_ok(db, "SELECT terminal_disposition,terminal_decision_id,operator_audit_ref FROM push_intent_transitions WHERE to_state='NotDelivered';")
+      sql_ok(db, ddl)
+      assert_equal "NotDelivered|2\n", sql_ok(db, 'SELECT state,version FROM push_intents;')
+    end
+  end
+
+  def test_wave1_activation_success_requires_exact_reason_for_all_six_actions
+    with_database do |db, _ddl|
+      [['Disabled','Initialize'],['Shadow','EnterShadow'],['Active','Activate'],
+       ['Draining','Drain'],['Disabled','Disable'],['Disabled','Rollback']].each_with_index do |pair, index|
+        generation = index + 1
+        extra = generation == 6 ? {'rollback_target_sha256'=>"'#{manifest_hash(1)}'"} : {}
+        sql_ok(db, insert_manifest(generation, pair[0], extra))
+        %w[transport.uncertain activation.bogus].each do |reason|
+          sql_rejected(db, insert_journal(generation, pair[1], extra.merge('reason'=>"'#{reason}'")))
+        end
+        sql_ok(db, insert_journal(generation, pair[1], extra))
+      end
+      assert_equal "6|6\n", sql_ok(db, "SELECT count(*),sum(reason='activation.applied') FROM push_promotion_journal;")
+    end
+  end
+
+  %w[运行里程碑 外部兼容 裁决追踪].each do |contract|
+    define_method("test_wave1_public_cli_requires_#{contract}") do
+      with_fixture do |root|
+        path = File.join(root, RFC)
+        text = File.read(path)
+        name = "#{contract}（PROPOSED）"
+        text = text.sub(/^## #{Regexp.escape(name)}\n.*?(?=^## |\z)/m, '')
+        File.write(path, text)
+        assert_cli_error(root, "rfc_section_missing name=#{name}")
+      end
+    end
+  end
+
+  def test_wave1_not_delivered_requires_exact_terminal_group_reason_and_decision
+    [
+      {'terminal_ref_id'=>'NULL'}, {'terminal_binding_sha256'=>'NULL'},
+      {'terminal_disposition'=>"'Accepted'"}, {'terminal_decision_id'=>"'other-decision'"},
+      {'operator_audit_ref'=>'NULL'}, {'operator_audit_sha256'=>'NULL'},
+      {'operator_audit_sha256'=>"'bad'"}, {'reason'=>"'operator.resolution_conflict'"}
+    ].each do |fields|
+      with_database do |db, _ddl|
+        seed_authority(db)
+        sql_rejected(db, not_delivered_transaction('AwaitingAuthority', 1, fields))
+        assert_equal "AwaitingAuthority|1\n", sql_ok(db, 'SELECT state,version FROM push_intents;')
+        assert_equal "1\n", sql_ok(db, 'SELECT count(*) FROM push_intent_transitions;')
+      end
+    end
+    with_database do |db, _ddl|
+      seed_authority(db)
+      sql_rejected(db, not_delivered_transaction('AwaitingAuthority', 1, {}, 'operator.resolution_conflict'))
+      sql_rejected(db, not_delivered_transaction('AwaitingAuthority', 0))
+      assert_equal "AwaitingAuthority|1\n", sql_ok(db, 'SELECT state,version FROM push_intents;')
+    end
+  end
+
+  def test_wave1_not_delivered_allows_only_same_decision_uncertain_isolation_and_is_immutable
+    with_database do |db, _ddl|
+      seed_authority(db)
+      sql_ok(db, business_edge_transaction('AwaitingAuthority', 'ResolutionRequired', 1, 'transport.uncertain'))
+      sql_ok(db, business_edge_transaction('ResolutionRequired', 'ResolutionRequired', 2, 'intent.lease_held'))
+      sql_ok(db, not_delivered_transaction('ResolutionRequired', 3))
+      assert_equal "NotDelivered|4\n", sql_ok(db, 'SELECT state,version FROM push_intents;')
+      sql_rejected(db, "UPDATE push_intent_transitions SET terminal_disposition='Accepted' WHERE to_state='NotDelivered';")
+      sql_rejected(db, "DELETE FROM push_intent_transitions WHERE to_state='NotDelivered';")
+      sql_rejected(db, business_edge_transaction('NotDelivered', 'AwaitingAuthority', 4, 'intent.dispatch_claimed'))
+      sql_rejected(db, business_edge_transaction('NotDelivered', 'ResolutionRequired', 4, 'intent.payload_conflict'))
+    end
+    %w[intent.payload_conflict operator.resolution_conflict].each do |cause|
+      with_database do |db, _ddl|
+        seed_authority(db)
+        sql_ok(db, business_edge_transaction('AwaitingAuthority', 'ResolutionRequired', 1, cause))
+        sql_rejected(db, not_delivered_transaction('ResolutionRequired', 2))
+        assert_equal "ResolutionRequired|2\n", sql_ok(db, 'SELECT state,version FROM push_intents;')
+      end
+    end
+  end
+
+  def test_wave1_not_delivered_cannot_revoke_accepted_or_close_non_send_origins
+    %w[AwaitingFinalizer Completed].each do |accepted_state|
+      with_database do |db, _ddl|
+        seed_authority(db)
+        sql_ok(db, business_edge_transaction('AwaitingAuthority', 'AwaitingFinalizer', 1, 'intent.authority_verified'))
+        version = 2
+        if accepted_state == 'Completed'
+          sql_ok(db, business_edge_transaction('AwaitingFinalizer', 'Completed', 2, 'finalizer.completed',
+            'terminal_ref_id'=>"'accepted-ref'",'terminal_binding_sha256'=>"'#{'a' * 64}'"))
+          version = 3
+        end
+        sql_rejected(db, not_delivered_transaction(accepted_state, version))
+        sql_ok(db, business_edge_transaction(accepted_state, 'ResolutionRequired', version,
+          accepted_state == 'Completed' ? 'intent.payload_conflict' : 'transport.uncertain'))
+        sql_rejected(db, not_delivered_transaction('ResolutionRequired', version + 1))
+        assert_equal "ResolutionRequired|#{version+1}\n", sql_ok(db, 'SELECT state,version FROM push_intents;')
+      end
+    end
+    %w[NoData Disabled].each do |kind|
+      with_database do |db, _ddl|
+        sql_ok(db, insert_intent('job_decision_kind'=>"'#{kind}'",'state'=>"'#{kind}'",
+          'reason'=>kind == 'NoData' ? "'intent.no_data'" : "'policy.disabled'",
+          'prepared_push_bytes'=>'NULL','rendered_bytes'=>'NULL','payload_sha256'=>'NULL','rendered_sha256'=>'NULL'))
+        sql_rejected(db, not_delivered_transaction(kind, 0))
+        sql_ok(db, business_edge_transaction(kind, 'ResolutionRequired', 0, 'intent.payload_conflict'))
+        sql_rejected(db, not_delivered_transaction('ResolutionRequired', 1))
+      end
+    end
+    with_database do |db, _ddl|
+      sql_ok(db, insert_intent)
+      sql_rejected(db, not_delivered_transaction('PendingDispatch', 0))
+    end
+  end
+
+  def test_wave1_raw_cli_rejects_previous_v1_signature_without_business_changes
+    ddl = File.binread(File.join(ROOT, SQL))
+    current = ddl.match(/schema_signature='([a-f0-9]{64})'/)[1]
+    previous = 'ae30ae6f6a0d8fa805fc7594137c6d27e6af3a879dc3625fa76d8146eb5a94e5'
+    refute_equal previous, current
+    Dir.mktmpdir('rfc-previous-v1') do |dir|
+      db = File.join(dir, 'previous.sqlite3')
+      sql_ok(db, ddl.gsub(current, previous))
+      sql_ok(db, insert_intent)
+      before = sql_ok(db, 'SELECT name,sql FROM sqlite_master ORDER BY name; SELECT * FROM push_intents;')
+      out, err, status = Open3.capture3('/usr/bin/sqlite3', db, stdin_data: ddl)
+      refute_equal 0, status.exitstatus, out
+      assert_includes err, 'activation.manifest_mismatch'
+      assert_equal before, sql_ok(db, 'SELECT name,sql FROM sqlite_master ORDER BY name; SELECT * FROM push_intents;')
+    end
+  end
+
+  wave1_mutations = [
+    ['不投递终态合同','entry','任意状态均可不投递','rfc_not_delivered_contract_invalid'],
+    ['不投递终态合同','verification','无需认证或重验','rfc_not_delivered_contract_invalid'],
+    ['不投递终态合同','commit','先改状态后异步事件','rfc_not_delivered_contract_invalid'],
+    ['不投递终态合同','cursor','推进游标并计入成功','rfc_not_delivered_contract_invalid'],
+    ['不投递终态合同','gate','自动批准晋级','rfc_not_delivered_contract_invalid'],
+    ['运行里程碑','FoundationReady','OnlyCodeNoGreybox','rfc_runtime_milestones_invalid'],
+    ['运行里程碑','P0ProductionVerified','AllNullWavesAutoApproved','rfc_runtime_milestones_invalid'],
+    ['运行里程碑','ArchitectureReleaseCandidate','OnlyP0Needed','rfc_runtime_milestones_invalid'],
+    ['运行里程碑','ProgramProductionVerified','SomeUnitsAndStaleEvidenceAllowed','rfc_runtime_milestones_invalid'],
+    ['运行退出验收','unit_inventory','65 kinds 即 65 owners','rfc_runtime_exit_invalid'],
+    ['运行退出验收','nullable_waves','null 自动成为下一波','rfc_runtime_exit_invalid'],
+    ['运行退出验收','foundation_greybox','不同 decision 的日志即可','rfc_runtime_exit_invalid'],
+    ['运行退出验收','unit_greybox','conformance 强制新 owner','rfc_runtime_exit_invalid'],
+    ['运行退出验收','parallel_tests','忽略默认并行失败','rfc_runtime_exit_invalid'],
+    ['运行退出验收','backup_restore','两个库跨库原子快照无需 Test 恢复','rfc_runtime_exit_invalid'],
+    ['运行退出验收','old_path_delete','首个 Accepted 即删除','rfc_runtime_exit_invalid'],
+    ['运行退出验收','release_pipeline','接管同版本删除旧路径且无尾部清理','rfc_runtime_exit_invalid'],
+    ['运行退出验收','program_exit','允许 unresolved Uncertain 和 receipt 缺口','rfc_runtime_exit_invalid'],
+    ['运行退出验收','failure_retained','NotDelivered 抵消失败','rfc_runtime_exit_invalid'],
+    ['运行退出验收','publication_boundary','HTML 通过即生产完成','rfc_runtime_exit_invalid'],
+    ['外部兼容','cli','MayChangeExitOrArguments','rfc_external_compatibility_invalid'],
+    ['外部兼容','config','MayChangeDefaultOrScope','rfc_external_compatibility_invalid'],
+    ['外部兼容','subscription','MayDropRequiredChannels','rfc_external_compatibility_invalid'],
+    ['外部兼容','template','MayRerenderAndChangeWording','rfc_external_compatibility_invalid'],
+    ['外部兼容','authority','COMPATMayAdvanceCursor','rfc_external_compatibility_invalid']
+  ]
+  wave1_mutations.each_with_index do |(section, key, reversed, error), index|
+    define_method("test_wave1_semantic_mutation_#{index}_#{key}") do
+      with_fixture do |root|
+        change_text(root) do |text|
+          pattern = /^## #{Regexp.escape(section)}（PROPOSED）\n.*?(?=^## |\z)/m
+          text.sub(pattern) do |body|
+            body.sub(/^\| #{Regexp.escape(key)} \|.*$/) do |line|
+              cells = line.split('|', -1)
+              column = section == '运行里程碑' ? 4 : 3
+              cells[column] = " #{reversed} "
+              cells.join('|')
+            end
+          end
+        end
+        assert_cli_error(root, error)
+      end
+    end
+  end
+
+  def test_wave1_trace_rejects_missing_duplicate_wrong_choice_locus_and_refs
+    mutations = {
+      'missing'=>[proc { |row| '' }, 'rfc_trace_coverage_invalid'],
+      'duplicate'=>[proc { |row| row + row }, 'rfc_trace_coverage_invalid'],
+      'choice'=>[proc { |row| row.sub('| 4 | A |', '| 4 | B |') }, 'rfc_trace_choice_invalid'],
+      'locus'=>[proc { |row| row.sub('外部兼容（PROPOSED）', '不存在的规范章节') }, 'rfc_trace_locus_invalid'],
+      'empty_locus'=>[proc { |row| row.sub('外部兼容（PROPOSED）', '') }, 'rfc_table_invalid'],
+      'ref'=>[proc { |row| row.sub('[acceptance:cli]', '[acceptance:invented]') }, 'rfc_trace_refs_invalid'],
+      'q_only'=>[proc { |row| row.sub('[acceptance:cli]', '[Q:4]') }, 'rfc_trace_refs_invalid'],
+      'prose_ref'=>[proc { |row| row.sub('[acceptance:cli]', '[acceptance:cli] 已通过生产') }, 'rfc_trace_refs_invalid']
+    }
+    mutations.each do |name, pair|
+      with_fixture do |root|
+        change_text(root) { |text| text.sub(/^\| 4 \| A \|.*\n/, &pair[0]) }
+        assert_cli_error(root, pair[1])
+      end
+    end
+  end
+
+  def test_wave1_public_cli_accepts_prose_and_normative_row_reordering
+    with_fixture do |root|
+      change_text(root) do |text|
+        text = text.sub("## 裁决追踪（PROPOSED）\n", "## 裁决追踪（PROPOSED）\n\n本段解释可调整，不改变规范选择。\n")
+        %w[运行里程碑 运行退出验收 外部兼容 裁决追踪].each do |section|
+          text = text.sub(/^## #{Regexp.escape(section)}（PROPOSED）\n.*?(?=^## |\z)/m) do |body|
+            rows = body.lines.grep(/^\| /).drop(2)
+            remaining = rows.reverse
+            count = 0
+            body.lines.map do |line|
+              if line.start_with?('| ')
+                count += 1
+                count > 2 ? remaining.shift : line
+              else
+                line
+              end
+            end.join
+          end
+        end
+        text
+      end
+      out, err, status = Open3.capture3(RbConfig.ruby, CLI, '--root', root, '--draft')
+      assert_equal 0, status.exitstatus, out + err
+      assert_equal "rfc_spec_valid\n", out
+      assert_empty err
+    end
+  end
+
   def test_sql_file_is_required_by_the_public_cli
     with_fixture do |root|
       path = File.join(root, SQL)
@@ -958,7 +1187,7 @@ class RfcSpecTest < Minitest::Test
     mutants = {
       'missing_table' => [proc { |s| s.gsub('push_foundation_schema', 'absent_schema') },
                           proc { |db| assert_equal "1\n", sql_ok(db, 'SELECT version FROM push_foundation_schema;') }],
-      'illegal_state' => [proc { |s| s.gsub("'ResolutionRequired'", "'ResolutionRequired','Bogus'").sub("NEW.state='PendingDispatch'", "NEW.state IN ('PendingDispatch','Bogus')") },
+      'illegal_state' => [proc { |s| s.gsub("'Disabled','ResolutionRequired')", "'Disabled','ResolutionRequired','Bogus')").sub("NEW.state='PendingDispatch'", "NEW.state IN ('PendingDispatch','Bogus')") },
                          proc { |db| sql_rejected(db, insert_intent('state'=>"'Bogus'")) }],
       'payload_overwrite' => [proc { |s| s.sub(/CREATE TRIGGER IF NOT EXISTS push_intents_immutable\n.*?END;\n/m, '') },
                              proc { |db| sql_ok(db, insert_intent); sql_rejected(db, "UPDATE push_intents SET reason='intent.dispatch_claimed',previous_state=state,version=1,payload_sha256='#{'b' * 64}';") }],
@@ -1004,6 +1233,32 @@ class RfcSpecTest < Minitest::Test
   end
 
   private
+
+  def business_edge_transaction(from, to, version, reason, overrides = {})
+    event = transition_sql({'event_id'=>"'#{sha_id('edge-' + (version+1).to_s)}'",'from_state'=>"'#{from}'",'to_state'=>"'#{to}'",
+      'expected_version'=>version.to_s,'result_version'=>(version+1).to_s,
+      'previous_sha256'=>version.zero? ? 'NULL' : "'#{version.to_s * 64}'",
+      'canonical_sha256'=>"'#{(version+1).to_s * 64}'",'reason'=>"'#{reason}'",
+      'terminal_ref_id'=>'NULL','terminal_binding_sha256'=>'NULL','occurred_at'=>'10'}.merge(overrides))
+    "BEGIN IMMEDIATE; UPDATE push_intents SET previous_state=state,state='#{to}',version=version+1,reason='#{reason}',updated_at=10 WHERE intent_id='#{sha_id('intent-1')}' AND version=#{version} AND state='#{from}' AND lease_generation=0; #{event} COMMIT;"
+  end
+
+  def seed_authority(db)
+    sql_ok(db, insert_intent)
+    event = transition_sql('event_id'=>"'#{sha_id('event-1')}'",'from_state'=>"'PendingDispatch'",'to_state'=>"'AwaitingAuthority'",
+      'expected_version'=>'0','result_version'=>'1','previous_sha256'=>'NULL','canonical_sha256'=>"'#{'1' * 64}'",
+      'terminal_ref_id'=>'NULL','terminal_binding_sha256'=>'NULL','reason'=>"'intent.dispatch_claimed'")
+    sql_ok(db, "BEGIN IMMEDIATE; UPDATE push_intents SET previous_state=state,state='AwaitingAuthority',version=1,reason='intent.dispatch_claimed',updated_at=2; #{event} COMMIT;")
+  end
+
+  def not_delivered_transaction(from = 'AwaitingAuthority', version = 1, overrides = {}, reason = 'operator.not_delivered')
+    event = transition_sql({'event_id'=>"'#{sha_id('manual-' + version.to_s)}'",'from_state'=>"'#{from}'",'to_state'=>"'NotDelivered'",
+      'expected_version'=>version.to_s,'result_version'=>(version+1).to_s,'previous_sha256'=>"'#{version.to_s * 64}'",
+      'canonical_sha256'=>"'#{(version+1).to_s * 64}'",'actor'=>"'operator'",'reason'=>"'#{reason}'",
+      'terminal_disposition'=>"'ManualConfirmedNotDelivered'",'terminal_decision_id'=>"'decision-1'",
+      'operator_audit_ref'=>"'operator-audit-1'",'operator_audit_sha256'=>"'#{'b' * 64}'",'occurred_at'=>'10'}.merge(overrides))
+    "BEGIN IMMEDIATE; UPDATE push_intents SET previous_state=state,state='NotDelivered',version=version+1,reason='#{reason}',updated_at=10 WHERE intent_id='#{sha_id('intent-1')}' AND version=#{version} AND state='#{from}' AND lease_generation=0; #{event} COMMIT;"
+  end
 
   def with_database
     Dir.mktmpdir('rfc-sql-test') do |dir|
@@ -1054,7 +1309,11 @@ class RfcSpecTest < Minitest::Test
       'expected_version'=>'2','result_version'=>'3','previous_sha256'=>"'#{'2' * 64}'",'canonical_sha256'=>"'#{'3' * 64}'",
       'actor'=>"'finalizer'",'reason'=>"'finalizer.completed'",'terminal_ref_id'=>"'ref-1'",
       'terminal_binding_sha256'=>"'#{'a' * 64}'",'occurred_at'=>'4'}
-    insert_row('push_intent_transitions', values.merge(overrides))
+    values = values.merge(overrides)
+    unless values.key?('terminal_disposition')
+      values['terminal_disposition'] = values['to_state'] == "'Completed'" ? "'Accepted'" : 'NULL'
+    end
+    insert_row('push_intent_transitions', values)
   end
 
   def seed_finalizer(db)

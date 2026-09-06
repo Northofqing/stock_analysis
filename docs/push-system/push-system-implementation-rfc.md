@@ -31,6 +31,10 @@
 原工作区新增项；枚举外 CLI 生产者仍属于当前目录。[Q:21] [Q:30] [Q:59] [Q:65]
 [Q:93] [evidence:push-kind] [unit:MU-cli-single]
 
+只有共享原子 completion owner 的 producer/occurrence 家族才可分组；以冻结 52 Unit 目录
+为准，不因同 kind、文件或阶段合并。强路径只做 conformance 校正，STARVED/OPT-IN 保持原状。
+C0–C6 是能力标签，不是遗漏非活跃目录项或重排物理 owner 的理由。[Q:1] [Q:16] [Q:21] [Q:32]
+
 实施顺序为 Foundation → 原子 Unit 切片 → 尾部清理。四时段仅是 Epic，
 不是物理完成所有者的切换边界。本文不证明 Unit 晋级、HTML/CI 发布、运行时部署
 或用户已收到消息。[Q:16] [Q:17] [Q:23] [Q:26] [Q:42] [Q:74]
@@ -39,7 +43,8 @@
 
 后续章节依次定义字段、JobDecision、DeliveryResult、完成分支、身份与终态合同、
 CURRENT 映射和状态、ReasonCode、适配器一致性。引用使用方括号内的
-`Q:编号`、`unit:ID`、`producer:ID`、`evidence:ID`；校验器实际解析并核对
+`Q:编号`、`unit:ID`、`producer:ID`、`evidence:ID`，以及规范表声明的
+`acceptance:ID`、`gate:ID`、`milestone:ID`、`publication:ID`；校验器实际解析并核对
 冻结文档中的编号和身份，不以关键词出现代替引用检查。[Q:59] [Q:66]
 
 `prepare(RunContext) -> PreparedFacts -> project() -> Ready(PreparedPush) ->
@@ -505,6 +510,7 @@ operator/告警适配器及测试。规范化材料是精确 ASCII 代码，不�
 | activation.producer_unready | 注册生产者的依赖不可用 | 隔离该生产者，并使部署就绪失败 | [Q:101] [Q:12] |
 | shadow.semantic_diff | 类型化 decision/hash/reason/proposal 不一致 | 阻断晋级并保留比较证据 | [Q:101] [Q:83] |
 | shadow.side_effect_attempted | shadow 尝试 provider 重取、LLM、写入、发送或订单 | 拒绝动作并阻断晋级 | [Q:101] [Q:83] |
+| operator.not_delivered | 经认证处置并重查精确不投递终态 | 仅按不投递终态合同 CAS 到 NotDelivered；无通知游标或重发 | [Q:39] [Q:45] [Q:87] |
 | operator.unauthorized | 认证身份不具备已批准权限 | 拒绝请求并审计拒绝 | [Q:101] [Q:47] |
 | operator.evidence_invalid | 人工证据缺失、无效或披露过多 | 拒绝人工处置 | [Q:101] [Q:55] |
 | operator.resolution_conflict | 人工 expected_version 或绑定冲突 | ResolutionRequired，不盲目覆盖 | [Q:101] [Q:87] |
@@ -582,7 +588,8 @@ PendingDispatch/NoData/Disabled；只有 Ready 的创建事实同时是发送 ou
 或在 job_decision_kind=Ready、已认证人工处置清除冲突、原身份精确终态重验
 和策略允许后以新版本 CAS
 恢复到 `AwaitingFinalizer`；后者仍须步骤五重验并走步骤六，不授权再次发送。
-表内 `SameState` 是保持当前状态的规则
+同一 decision 的 Uncertain 隔离还可经不投递终态合同进入 `NotDelivered`，且该终态无离开边；
+不能用已接受历史或任意材料冲突代替 Uncertain 来源。表内 `SameState` 是保持当前状态的规则
 标识，不是数据库枚举。Received/Accepted/Rejected/Uncertain 均不是业务状态。
 [Q:28] [Q:75] [Q:85] [Q:86]
 
@@ -601,8 +608,11 @@ lease 到期解释为发送许可。[Q:76] [Q:90]
 `previous_sha256=NULL`，后续必须等于同 intent 前一版本事件的 canonical hash。
 canonical hash 使用 Task2 规范化，包含事件除自身 hash 外的所有持久字段；
 应用必须重算核验，SQLite 约束格式、版本链、当前 intent 的前态/结果态及 reason 匹配，
-不宣称能在标准 SQLite 中验证 SHA 运算或 authority。只有进入 Completed 的事件
-可且必须带 terminal_ref_id 和 terminal_binding_sha256；它们不是可重用回执。
+不宣称能在标准 SQLite 中验证 SHA 运算或 authority。只有进入 Completed/NotDelivered 的事件
+可且必须带 terminal_ref_id、terminal_disposition 和 terminal_binding_sha256；前者处置只能是
+Accepted/ManualConfirmedAccepted。后者另必须带与 intent 原 durable_decision_id 相等的
+terminal_decision_id、operator_audit_ref 与 operator_audit_sha256；其他事件这组字段全空。
+这只是引用和哈希，不是复制回执，更不是凭字段非空完成认证。
 [Q:78] [Q:87] [Q:97]
 
 所有 `*_sha256` 是 64 位小写十六进制，`build_commit` 是 40 位；每列同时检查
@@ -619,7 +629,8 @@ schema、template、source-contract、证据、批准身份/时间、窗口和�
 manifest 的 canonical SHA 由应用重算验证。下一代以旧 generation 和前驱身份
 为 CAS 条件 INSERT，唯一约束处理竞争。`push_promotion_journal` 是独立已执行
 事实，稳定事件身份使用 `PromotionV1(unit_id,generation)` 的 SHA-256，前驱和
-canonical 规则同上；manifest FK 绑定全部版本哈希，不复制另一套版本真相。
+canonical 规则同上；六种成功 journal action 的 reason 必须精确为 activation.applied；namespace 相同仍不代表
+成功边合法。manifest FK 绑定全部版本哈希，不复制另一套版本真相。
 批准/执行者须先经外部认证和授权，SQL 非空 actor 或与批准者相等不构成认证。
 [Q:79] [Q:80] [Q:81] [Q:98] [Q:99]
 
@@ -668,7 +679,6 @@ immutable；不能原生证明 SHA 与内容一致。这些应用
 | restart_reuse | prepared_push_bytes,rendered_bytes | 只读取原字节；禁止重新 provider/LLM/render | [Q:33] [Q:72] [Q:76] |
 | drift | SameIntent | 保留原字节并隔离 ResolutionRequired；禁止 UPDATE/REPLACE 覆盖 | [Q:77] [Q:89] |
 
-
 ## 持久化条件组与兼容守卫（PROPOSED）
 
 本表固定本轮 v1 的可解析最低约束，不能以近似文字替代。[Q:75] [Q:76] [Q:79]
@@ -705,8 +715,9 @@ trigger；metadata 两表及其保护 trigger 同样纳管。另拒绝挂在这�
 版本/签名不符均先失败，不能补建后自称兼容。metadata 不允许后补登记/改写；
 同一正确 v1 才可重执行并保留全部行与原字节。[Q:79] [Q:82] [Q:98]
 
-固定签名为 `ae30ae6f6a0d8fa805fc7594137c6d27e6af3a879dc3625fa76d8146eb5a94e5`，是
-`push-foundation-v1-task3-r1` 的版本身份，不是 SQLite 对 DDL 计算的内容摘要。
+固定签名为 `dd5f49a1f4e02ee1d585793cc2eff9c8b98b087b2ffd267f40c873c83960ecdd`，是
+`push-foundation-v1-final-wave1-not-delivered` 的版本身份，不是 SQLite 对 DDL 计算的内容摘要。本修订增加 NotDelivered 及事件证据组、
+收紧六个 activation 成功边；旧 task3-r1 v1 签名不兼容，入口即拒绝，不能自动升级。
 守卫证明受信首次登记后的定义未漂移；不验证任意存量业务行语义，不认证拥有
 任意 schema 写权限、同时伪造 metadata 与保护对象的恶意管理员，也不检查无关
 独立表的内部定义。首次部署只执行已通过文件字节和行为门禁的脚本；本任务不
@@ -728,8 +739,9 @@ trigger；metadata 两表及其保护 trigger 同样纳管。另拒绝挂在这�
 | PendingDispatch | Disabled | 应用 | 显式禁用及版本 CAS | 同库 CAS 并追加事件；保留原 Ready 材料 | 清除待处理事实或推进通知游标 | policy.disabled | [Q:75] [Q:76] [Q:77] [Q:89] [Q:97] |
 | AwaitingAuthority | AwaitingFinalizer | authority 适配器 | 私有重查精确绑定且策略允许 | 同库 CAS 并追加事件 | 仅凭日志或结果枚举晋级 | intent.authority_verified | [Q:75] [Q:76] [Q:77] [Q:89] [Q:97] |
 | AwaitingFinalizer | Completed | finalizer | 再次精确绑定且策略允许及版本 CAS | 同一事务执行完成事实 CAS 与事件 | 跨库原子性或跳过事件 | finalizer.completed | [Q:75] [Q:76] [Q:77] [Q:89] [Q:97] |
+| AwaitingAuthority/ResolutionRequired | NotDelivered | 已认证操作员与私有 authority 适配器 | 不投递终态合同的来源、精确绑定、独立审计及版本 CAS 全通过 | 同库 CAS 与不可变处置事件；解除未决阻断但保留失败 | 推进游标、重发、撤销 Accepted 或计入成功 | operator.not_delivered | [Q:39] [Q:45] [Q:78] [Q:97] |
 | PendingDispatch/AwaitingAuthority/AwaitingFinalizer/Completed/NoData/Disabled | ResolutionRequired | 应用或 finalizer | 材料或版本冲突并以重读版本 CAS | 保留原材料与终态历史并阻断 Unit 晋级 | 覆盖材料或撤销既有游标 | intent.payload_conflict/intent.expected_version_conflict/finalizer.cas_conflict | [Q:75] [Q:76] [Q:77] [Q:89] [Q:97] |
-| AwaitingAuthority/AwaitingFinalizer | ResolutionRequired | 私有 authority 适配器 | 未知或人工不投递处置经重查且版本 CAS | 隔离并保留原 decision 与处置证据 | 自动重发或自动推进通知游标 | transport.uncertain/operator.resolution_conflict | [Q:78] [Q:87] [Q:97] |
+| AwaitingAuthority/AwaitingFinalizer | ResolutionRequired | 私有 authority 适配器 | 未知或处置冲突经重查且版本 CAS | 隔离并保留原 decision 与处置证据 | 自动重发或自动推进通知游标 | transport.uncertain/operator.resolution_conflict | [Q:78] [Q:87] [Q:97] |
 | ResolutionRequired | AwaitingFinalizer | 已认证操作员与私有 authority 适配器 | Ready 来源且处置清除冲突与原身份精确接受绑定、策略及版本 CAS | 保留处置证据并只恢复最终化资格 | 自动解封或再次发送 | intent.authority_verified | [Q:77] [Q:78] [Q:87] [Q:97] |
 | PendingDispatch/AwaitingAuthority/AwaitingFinalizer/ResolutionRequired | SameState | lease 管理者 | owner/until/generation 与版本 CAS | 版本加一并追加事件 | 抢占未过期外来 lease | intent.lease_held/intent.dispatch_claimed | [Q:75] [Q:76] [Q:77] [Q:89] [Q:97] |
 
@@ -757,11 +769,11 @@ trigger；metadata 两表及其保护 trigger 同样纳管。另拒绝挂在这�
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Accepted | AwaitingFinalizer | 私有 authority 适配器 | 终态已封存且 TerminalBinding 与 CompletionPolicy 均通过 | 仅记录完成提案后进入步骤六 | 把远端接受当业务完成 | intent.authority_verified | [Q:78] [Q:86] [Q:87] |
 | ManualConfirmedAccepted | AwaitingFinalizer | 私有 authority 适配器 | 精确绑定且 AcceptedOrManualBound 策略允许 | 独立人工接受指标与完成提案 | 伪装 TransportAccepted | intent.authority_verified | [Q:78] [Q:86] [Q:87] |
-| AlreadyTerminal | DispositionDependent | 私有 authority 适配器 | 重查 TerminalBinding 并逐处置执行终态完成合同 | 仅允许 Accepted 或合法人工接受进入步骤六 | 全处置推进或省略绑定 | intent.authority_verified | [Q:78] [Q:86] [Q:87] |
+| AlreadyTerminal | DispositionDependent | 私有 authority 适配器 | 重查 TerminalBinding 并逐处置执行终态完成合同 | 接受仅推进完成；不投递仅按专门合同收敛 | 全处置推进或省略绑定 | intent.authority_verified/operator.not_delivered/transport.rejected/transport.uncertain | [Q:78] [Q:86] [Q:87] |
 | AcceptedAuditPending/AcceptedTaskTransitionPending | AwaitingAuthority | 恢复器 | authority 尚未封存 | 仅恢复审计与 authority 内部转换 | 重发或业务最终化 | finalizer.terminal_ref_invalid | [Q:78] [Q:86] [Q:87] |
 | Rejected | AwaitingAuthority | dispatcher | 当前显式重试授权及原 decision 与 lease CAS | 仅授权时申请新 attempt | 盲重试或推进游标 | transport.rejected | [Q:78] [Q:86] [Q:87] |
 | Uncertain | ResolutionRequired | 恢复器 | 权威不确定性已确认 | 隔离并等待已认证人工解析 | 自动重发或自动清理 | transport.uncertain | [Q:78] [Q:86] [Q:87] |
-| ManualConfirmedNotDelivered | ResolutionRequired | 私有 authority 适配器 | 精确绑定与已认证处置 | 仅保存不投递处置事实 | 推进游标或自动改写为接受 | operator.resolution_conflict | [Q:78] [Q:86] [Q:87] |
+| ManualConfirmedNotDelivered | NotDelivered | 已认证操作员与私有 authority 适配器 | 不投递终态合同的来源、精确绑定、独立审计及版本 CAS 全通过 | 同库追加不投递终态事实；保留失败指标 | 推进游标、重发或冒充接受 | operator.not_delivered | [Q:78] [Q:86] [Q:87] |
 | COMPAT/Blocked | AwaitingAuthority | 应用 | 无强 authority 终态 | 仅保留弱证据或阻塞诊断 | 构造 VerifiedTerminalRef 或权威完成 | finalizer.terminal_ref_invalid | [Q:78] [Q:86] [Q:87] |
 
 ## 跨库恢复顺序（PROPOSED）
@@ -776,7 +788,7 @@ trigger；metadata 两表及其保护 trigger 同样纳管。另拒绝挂在这�
 | 4 | authority | durable_decision_id+attempt_id | durable terminal 本地提交并封存 | 查询原 terminal 及未封存审计 | 封存后进入步骤五 | 以 sink attempt 或审计日志冒充终态 | [Q:76] [Q:78] [Q:90] [Q:97] |
 | 5 | 私有 authority 适配器 | IdentityRule::TerminalBinding | 只读重验不产生新投递事实 | 从原 authority 再查引用与绑定 | 资格允许才进入步骤六 | 复制回执或跨事务复用未重验引用 | [Q:76] [Q:78] [Q:90] [Q:97] |
 | 6 | finalizer | intent_id+expected_version+event_id | 一个业务事务的 CAS 与 transition 共同提交 | 查业务状态版本和稳定事件 | 失败整体回滚并重查；成功进入步骤七 | CAS 零行追加或事件失败仍提交 | [Q:76] [Q:78] [Q:90] [Q:97] |
-| 7 | 业务应用 | intent_id+result_version | 提交后的确认与独立完成指标 | 查询既有 Completed 和事件 | 幂等返回既有完成事实 | 丢失确认导致二次发送或完成 | [Q:76] [Q:78] [Q:90] [Q:97] |
+| 7 | 业务应用 | intent_id+result_version | 提交后的确认与独立完成指标 | 查询既有 Completed/NotDelivered 和事件 | 幂等返回原终态事实与独立指标 | 丢失确认导致二次发送或完成 | [Q:76] [Q:78] [Q:90] [Q:97] |
 
 ## 故障与提交确认矩阵（PROPOSED）
 
@@ -791,9 +803,9 @@ trigger；metadata 两表及其保护 trigger 同样纳管。另拒绝挂在这�
 | before_attempt | reservation | 查询是否已记录 attempt | 仅确认未尝试且 lease 有效 | durable_decision_id+attempt_id | AwaitingAuthority | intent.dispatch_claimed | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
 | after_attempt | attempt 可能已外发 | 查询原 attempt 并协调未知结果 | 否 | durable_decision_id+attempt_id | ResolutionRequired | transport.uncertain | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
 | before_terminal_commit | attempt 或待封存审计 | 恢复原 authority 并查询未知结果 | 否 | durable_decision_id+attempt_id | AwaitingAuthority/ResolutionRequired | transport.uncertain | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
-| after_terminal_commit | durable terminal；确认可能丢失 | 查询原 terminal 并重新验证绑定 | 否 | IdentityRule::TerminalBinding | AwaitingFinalizer | intent.authority_verified | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| after_terminal_commit | durable Accepted terminal；确认可能丢失 | 查询原 terminal 并重新验证绑定 | 否 | IdentityRule::TerminalBinding | AwaitingFinalizer | intent.authority_verified | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
 | before_reverify | durable terminal | 私有 authority 重查绑定与资格 | 否 | IdentityRule::TerminalBinding | AwaitingFinalizer | intent.authority_verified | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
-| after_reverify | durable terminal；引用仅在内存 | 重新查询而非恢复内存引用 | 否 | IdentityRule::TerminalBinding | AwaitingFinalizer | finalizer.terminal_ref_invalid | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| after_reverify | durable Accepted terminal；引用仅在内存 | 重新查询而非恢复内存引用 | 否 | IdentityRule::TerminalBinding | AwaitingFinalizer | finalizer.terminal_ref_invalid | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
 | after_business_cas | 旧业务提交事实；CAS 尚未提交 | 事务恢复回滚后查状态版本 | 否 | intent_id+expected_version+event_id | AwaitingFinalizer | finalizer.transition_append_failed | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
 | after_transition_append | 旧业务提交事实；事件尚未提交 | 事务恢复回滚后查状态与事件 | 否 | intent_id+expected_version+event_id | AwaitingFinalizer | finalizer.transition_append_failed | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
 | after_business_commit | Completed 与事件；确认可能丢失 | 查既有终态及稳定事件并幂等确认 | 否 | intent_id+result_version+event_id | Completed | finalizer.completed | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
@@ -803,6 +815,8 @@ trigger；metadata 两表及其保护 trigger 同样纳管。另拒绝挂在这�
 | accepted_audit_pending | Accepted 的未封存审计 | 仅修复 authority 审计和内部转换 | 否 | durable_decision_id+attempt_id | AwaitingAuthority | finalizer.terminal_ref_invalid | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
 | rejected_retry | 已封存 Rejected | 重新核对当前显式授权与 lease | 仅显式授权产生新 attempt | durable_decision_id+new_attempt_id | AwaitingAuthority | transport.rejected | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
 | uncertain | 权威未知结果 | 隔离并等待已认证人工解析 | 否 | durable_decision_id+attempt_id | ResolutionRequired | transport.uncertain | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| not_delivered_before_business_commit | 不投递 terminal 与独立 operator audit 已封存 | 重查原 decision 精确绑定及版本；仅恢复业务终态事务 | 否 | intent_id+expected_version+event_id | NotDelivered | operator.not_delivered | [Q:39] [Q:45] [Q:78] [Q:97] |
+| not_delivered_after_business_commit | NotDelivered 与不可变事件；确认可能丢失 | 查询原事件与关联 audit；返回已处置失败而非接受 | 否 | intent_id+result_version+event_id | NotDelivered | operator.not_delivered | [Q:39] [Q:45] [Q:78] [Q:97] |
 | payload_drift | 原身份及不可变材料 | 重读并 CAS 隔离；保留冲突证据 | 否 | intent_id | ResolutionRequired | intent.payload_conflict | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
 | expected_version_conflict | 获胜者提交事实 | 回滚本事务并重读 CAS 隔离 | 否 | intent_id+expected_version | ResolutionRequired | intent.expected_version_conflict | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
 | terminal_ref_invalid | 原 durable 与业务事实 | 私有 authority 重新核验 | 否 | IdentityRule::TerminalBinding | AwaitingAuthority/AwaitingFinalizer | finalizer.terminal_ref_invalid | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
@@ -818,10 +832,12 @@ trigger；metadata 两表及其保护 trigger 同样纳管。另拒绝挂在这�
 任何 audit pending 均不能提前进入业务最终化。步骤五每次从私有 authority 重查
 精确引用及 CompletionPolicy，步骤六失败重试前再次重查，禁止复用未验证快照。
 `AlreadyTerminal` 是处置容器而不是接受凭证；人工接受使用独立指标，不记成
-TransportAccepted。schedule 关闭、通知游标推进分别按策略写事实，不能互相代替。
+TransportAccepted。ManualConfirmedNotDelivered 按不投递终态合同收敛到独立业务终态，
+不是步骤六接受分支的完成资格。schedule 关闭、通知游标推进分别按策略写事实，不能互相代替。
 [Q:76] [Q:78] [Q:86] [Q:87]
 
-步骤六必须使用一个业务连接的 `BEGIN IMMEDIATE` 事务包装：
+步骤六有互斥的接受完成与不投递终态分支；后一分支只按不投递终态合同落状态和事件，
+绝不执行业务通知游标或其它接受完成副作用。两分支均必须使用一个业务连接的 `BEGIN IMMEDIATE` 事务包装：
 先执行绑定 owner/lease/generation/expected-version 的 CAS，立即读取 affected rows；
 零行执行 ROLLBACK、禁止追加事件，并重新查询原事件/状态区分提交确认丢失和真实
 冲突。只有一行时才追加稳定 transition 与本库完成 owner 所需事实；所有步骤成功
@@ -836,11 +852,12 @@ RAISE(ROLLBACK)，但 SQLite 通用 CHECK/UNIQUE 的默认 ABORT 只回滚该语
 分别验证 CAS 成功、零行零事件、事件绑定/格式/重复身份失败时旧状态版本不变。
 运行时事务包装器尚未实现，不以此文档测试宣称部署。[Q:76] [Q:97] [Q:100]
 
-步骤七确认丢失时重启只读取已存在的 Completed 和事件并返回原完成结果，不再
+步骤七确认丢失时重启只读取已存在的 Completed/NotDelivered 和事件并返回原终态结果，不再
 执行完成副作用。步骤四确认丢失同理先查既有 durable terminal；无论丢哪一库的
 确认，都不得通过新 decision/intent 身份再次发送。只有当前明确授权的 Rejected
 才能申请新 attempt；在途未知、Uncertain、Accepted 审计未封存都不得盲重发。
-ResolutionRequired、非终态及相关证据不得自动清理，按最严格保留类别处理。
+NotDelivered 必须继续关联原证据且计入失败；它是已处置终态，但仍受全部清理资格与
+严格保留期约束，绝不构成 Production Verified 成功样本。ResolutionRequired、非终态及相关证据不得自动清理，按最严格保留类别处理。
 [Q:76] [Q:85] [Q:88] [Q:90] [Q:100]
 
 本任务测试只连接新建临时 SQLite，不复制 data/** 或现存库，不调用 provider、
@@ -1140,7 +1157,9 @@ BlockedOnInput 默认不使全局 deployment readiness 失败，前提是不存�
 | promote | Unit | CurrentManifest+SixFreshGates+WaveRank+DailyJournal+OnlineApproval | OneOwnerCASAppendJournal | activation.generation_conflict | SupportedNoWrites | [Q:99] |
 | rollback | Unit | CompatibleRollbackTarget+CurrentFenceVersion+AuthenticatedRollbackPermission | NewGenerationCASAppendJournalPreserveAcceptedPending | activation.generation_conflict | SupportedNoWrites | [Q:80] |
 
-`reconcile` 只做已被原 intent/authority 授权的确定性恢复，不创建 occurrence，不盲发 Uncertain。人工处置先 inspect 同一 decision，再复核 exact terminal binding、current fence/current version；只追加 ManualConfirmedAccepted 或 ManualConfirmedNotDelivered，保留原 transport receipt。命令权限之外还需核对 namespace、Unit、合同和最小证据，不以非空 actor 授权。
+`reconcile` 只做已被原 intent/authority 授权的确定性恢复，不创建 occurrence，不盲发 Uncertain。人工处置先 inspect 同一 decision，再复核 exact terminal binding、current fence/current version；只追加 ManualConfirmedAccepted 或 ManualConfirmedNotDelivered，保留原 transport receipt。
+后者须先取得独立 operator audit 引用与哈希，再按不投递终态合同 CAS 收敛 NotDelivered；
+不撤销接受历史、不授权重发，失败指标保留。命令权限之外还需核对 namespace、Unit、合同和最小证据，不以非空 actor 授权。
 
 ## 操作员权限（PROPOSED）
 
@@ -1177,6 +1196,8 @@ dry-run 输出标记 Planned 的 before/after 投影，实际 affected_rows=0。
 | DeliveryAuditRegulatory | ApplicableRegulatoryStart | StrictlyGreaterThanFiveYears | ExternalWORMOrObjectLockNeverRewrite | [Q:88] |
 | ModelDecisionTrade | ApplicablePolicyStart | StrictestRegulatoryModelTradeSourcePolicy | NoUnifiedFiveYearMaximum | [Q:88] |
 
+NotDelivered 属于可重验的已处置终态，不是 Production Verified 成功证明；必须等关联 Unit
+获得独立 Production Verified 证据才满足迁移保留起算条件。未解决 ResolutionRequired 仍属非终态。
 迁移证据在合法终态与 Production Verified 两个条件均满足后起算至少 90 天；更严格策略继续优先。监管投递审计严格大于五年，不能固定为 1825 天，闰年、法规起算及更严格模型/交易来源规则必须正确处理，五年不是统一保留上限。
 
 ## 清理资格与安全（PROPOSED）
@@ -1254,6 +1275,146 @@ dry-run 输出标记 Planned 的 before/after 投影，实际 affected_rows=0。
 | Production | ApprovedNormalTypedReceiptAndSameDecisionIdempotentReplay | DisconnectKillDatabaseOrderOrManufactureFault | [Q:49] [Q:99] |
 
 本 RFC 继续为 PROVISIONAL。这些门禁只定义后续实施/验收合同，文档 validator 通过不代表运行时接线、生产晋级、WORM 部署或真实样本通过。Task4 不改 Rust/Cargo、SQL、目录、冻结来源或任何运行数据库；Unit 精确排期/风险波次映射由 Task5 承接，独立双轴复核由 Controller 安排。
+
+## 不投递终态合同（PROPOSED）
+
+[Q:39] [Q:45] [Q:46] [Q:78] [Q:87] [Q:88] [Q:97]
+
+| 规则 | 适用范围 | 规范值 | 依据 |
+| --- | --- | --- | --- |
+| state | BusinessIntentState | NotDelivered；独立业务终态，不增加 durable 的十四态或 DeliveryResult 分支 | [Q:39] [Q:45] [Q:46] [Q:78] [Q:87] [Q:88] [Q:97] |
+| entry | AwaitingAuthority/ResolutionRequired | 仅 Ready；后者最近进入隔离必须来自同 intent/decision 的 AwaitingAuthority+transport.uncertain；历史不得已有 AwaitingFinalizer/Completed | [Q:39] [Q:45] [Q:46] [Q:78] [Q:87] [Q:88] [Q:97] |
+| verification | VerifiedTerminalRef | 已认证操作员与生产 allowlist；私有 authority 重查精确 ManualConfirmedNotDelivered 绑定、外部证据哈希与独立 operator audit | [Q:39] [Q:45] [Q:46] [Q:78] [Q:87] [Q:88] [Q:97] |
+| commit | ExpectedVersionCAS | 同一业务事务 CAS 与追加 event；包含 terminal_ref_id、terminal_disposition、terminal_decision_id、binding SHA、operator audit 引用与 SHA | [Q:39] [Q:45] [Q:46] [Q:78] [Q:87] [Q:88] [Q:97] |
+| storage_trust | SQLite/Application | SQL 验证边、原 decision、字段组与格式；应用验证身份认证、authority 真实性、hash 内容与事务包装 | [Q:39] [Q:45] [Q:46] [Q:78] [Q:87] [Q:88] [Q:97] |
+| cursor | NotDelivered | 永不推进通知游标；不授权重发；不作为 Accepted 或 ProductionVerified 成功样本 | [Q:39] [Q:45] [Q:46] [Q:78] [Q:87] [Q:88] [Q:97] |
+| recovery | CommitAckLost | 重查原 terminal 后只补本地终态事务；已提交时返回原 event；禁止再次外发 | [Q:39] [Q:45] [Q:46] [Q:78] [Q:87] [Q:88] [Q:97] |
+| gate | ResolvedButFailed | 解除未解决 ResolutionRequired/Uncertain 阻断；failure 门禁及失败指标仍保留，不自动批准晋级 | [Q:39] [Q:45] [Q:46] [Q:78] [Q:87] [Q:88] [Q:97] |
+| retention | TerminalEvidence | 关联原 intent、decision、transition、operator audit；满足最严格保留及清理资格才可清理，不因已处置立即删除 | [Q:39] [Q:45] [Q:46] [Q:78] [Q:87] [Q:88] [Q:97] |
+| rollback | AcceptedHistory | NotDelivered 无离开边；AwaitingFinalizer/Completed 及其隔离历史不得撤销为不投递 | [Q:39] [Q:45] [Q:46] [Q:78] [Q:87] [Q:88] [Q:97] |
+
+## 运行里程碑（PROPOSED）
+
+[Q:5] [Q:15] [Q:17] [Q:25] [Q:42] [Q:44] [Q:50]
+
+| 标识 | 名称 | 前置条件 | 完成条件 | 本批状态 | 依据 |
+| --- | --- | --- | --- | --- | --- |
+| FoundationReady | Foundation Ready | TypedResultThenFinalizerReconcilerAndCompatibleSchemas | NoOwnerChange+EachAuthorityControlledAcceptedAndSameDecisionAlreadyDeliveredNoSecondSend+TestRestore+ParallelIsolation | NotAttained | [Q:5] [Q:15] [Q:17] [Q:25] [Q:42] [Q:44] [Q:50] |
+| P0ProductionVerified | P0 Production Verified | FoundationReady+Q44ApprovedNonNullWaveUnits | EachApplicableP0UnitFreshSixGatesAndAuthorizedNaturalOrLowFrequencyEvidence+RequiredChannelReceipts | NotAttained | [Q:5] [Q:15] [Q:17] [Q:25] [Q:42] [Q:44] [Q:50] |
+| ArchitectureReleaseCandidate | Architecture Release Candidate | FoundationReady+All52UnitsImplemented | 42OwnerChangingAnd10ConformanceOnlyCodeContractsTestsComplete+NoImplicitActivation+DeletionGatesBeforeCleanup | NotAttained | [Q:5] [Q:15] [Q:17] [Q:25] [Q:42] [Q:44] [Q:50] |
+| ProgramProductionVerified | Program Production Verified | ArchitectureReleaseCandidate+All52UnitsVerified | CompleteCatalog+AllUnitsComplete+NoAccidentalActivationUncertainBacklogDuplicateReceiptGap+TailCleanup+FreshEvidence | NotAttained | [Q:5] [Q:15] [Q:17] [Q:25] [Q:42] [Q:44] [Q:50] |
+
+## 运行退出验收（PROPOSED）
+
+[Q:20] [Q:21] [Q:22] [Q:23] [Q:26] [Q:29] [Q:41] [Q:44] [Q:50] [Q:51] [Q:53] [Q:69]
+
+| 规则 | 适用范围 | 规范值 | 依据 |
+| --- | --- | --- | --- |
+| unit_inventory | CurrentCatalog | 52 Units；42 owner-changing 与 10 conformance-only；不按 PushKind/count 推导 owner | [Q:20] [Q:21] [Q:22] [Q:23] [Q:26] [Q:29] [Q:41] [Q:44] [Q:50] [Q:51] [Q:53] [Q:69] |
+| nullable_waves | Q44 | 只使用 WBS 当前非空批准波次；null 不代表遗漏、不自动赋予第十一波或生产授权；全部 52 Unit 仍在项目退出范围 | [Q:20] [Q:21] [Q:22] [Q:23] [Q:26] [Q:29] [Q:41] [Q:44] [Q:50] [Q:51] [Q:53] [Q:69] |
+| foundation_greybox | EachAuthoritativeRequiredChannel | 受控 Accepted 与同一 decision 的 AlreadyDelivered/no-second-send；弱 COMPAT 或人工接受不得替代 | [Q:20] [Q:21] [Q:22] [Q:23] [Q:26] [Q:29] [Q:41] [Q:44] [Q:50] [Q:51] [Q:53] [Q:69] |
+| unit_greybox | EachUnit | 自然 occurrence；低频仅经批准确定性灰盒；conformance-only 验证原 owner 而非虚构接管 | [Q:20] [Q:21] [Q:22] [Q:23] [Q:26] [Q:29] [Q:41] [Q:44] [Q:50] [Q:51] [Q:53] [Q:69] |
+| parallel_tests | DefaultParallelCI | 默认并行无无法解释失败；进程全局状态测试隔离或显式强制串行并记录范围，禁止隐匿失败 | [Q:20] [Q:21] [Q:22] [Q:23] [Q:26] [Q:29] [Q:41] [Q:44] [Q:50] [Q:51] [Q:53] [Q:69] |
+| backup_restore | BusinessDBAndDurableDB | 分别备份并记录各自 hash 与边界；在 Test 恢复并对账；不是跨库原子快照 | [Q:20] [Q:21] [Q:22] [Q:23] [Q:26] [Q:29] [Q:41] [Q:44] [Q:50] [Q:51] [Q:53] [Q:69] |
+| old_path_delete | PriorUnit | Accepted、same-decision replay、restart、fault、有效 session、Uncertain 全部门禁通过后，才在后续版本删除旧路径 | [Q:20] [Q:21] [Q:22] [Q:23] [Q:26] [Q:29] [Q:41] [Q:44] [Q:50] [Q:51] [Q:53] [Q:69] |
+| release_pipeline | ReleaseNAndNPlus1 | N 接管当前 Unit；N+1 清理前一 Unit 并可晋级下一 Unit；最后单独完成 tail cleanup | [Q:20] [Q:21] [Q:22] [Q:23] [Q:26] [Q:29] [Q:41] [Q:44] [Q:50] [Q:51] [Q:53] [Q:69] |
+| program_exit | All52Units | 目录完整、所有 Unit 完成、无意外激活、未解决 Uncertain、陈旧 backlog、duplicate、receipt 缺口；清理结束并有 fresh evidence | [Q:20] [Q:21] [Q:22] [Q:23] [Q:26] [Q:29] [Q:41] [Q:44] [Q:50] [Q:51] [Q:53] [Q:69] |
+| failure_retained | NotDelivered | 已处置不等于发送成功；保留失败指标与 failure 门禁，不能冲抵成功回执缺口 | [Q:20] [Q:21] [Q:22] [Q:23] [Q:26] [Q:29] [Q:41] [Q:44] [Q:50] [Q:51] [Q:53] [Q:69] |
+| publication_boundary | ImplementationReady | 仅文档发布资格；与四级 runtime milestone 正交，本批四级均未达到；后续 HTML/CI 发布不证明生产 | [Q:20] [Q:21] [Q:22] [Q:23] [Q:26] [Q:29] [Q:41] [Q:44] [Q:50] [Q:51] [Q:53] [Q:69] |
+| historical_estimate | Q41 | 36–69 工程人日与 7–10 交易周是目录冻结前暂估；现行机器 WBS 重新建立基线，保留完整范围 | [Q:20] [Q:21] [Q:22] [Q:23] [Q:26] [Q:29] [Q:41] [Q:44] [Q:50] [Q:51] [Q:53] [Q:69] |
+| priority | Q22Q26 | 先修假成功、过早状态与语义分裂；C0–C6 仅能力标签；Foundation→垂直 Unit→尾部清理 | [Q:20] [Q:21] [Q:22] [Q:23] [Q:26] [Q:29] [Q:41] [Q:44] [Q:50] [Q:51] [Q:53] [Q:69] |
+
+## 外部兼容（PROPOSED）
+
+[Q:4] [Q:7] [Q:10] [Q:15] [Q:19] [Q:27]
+
+| 表面 | 保持项 | 内部边界 | 验收 | 破坏性变化 | 依据 |
+| --- | --- | --- | --- | --- | --- |
+| cli | Invocation+Arguments+ExitStatus+Output | BoolToTypedResultViaCompatibilityAdapter | ExistingInvocationGoldenArgsExitStdoutStderr+InvalidArgsAndModeMatrix | SeparateVersionedDecision+Unit+Acceptance | [Q:4] [Q:7] [Q:10] [Q:15] [Q:19] [Q:27] |
+| config | Key+Default+Scope | PreserveExistingParsingDefaultsAndNamespace | ExistingKeyDefaultScopeGolden+MissingInvalidCrossScopeCases | SeparateVersionedDecision+Unit+Acceptance | [Q:4] [Q:7] [Q:10] [Q:15] [Q:19] [Q:27] |
+| subscription | Subscription+Audience+RequiredChannels | PreserveRoutingAndCompletionPolicy | SameSubscriptionAudienceChannelSet+MissingRequiredChannelRefusal | SeparateVersionedDecision+Unit+Acceptance | [Q:4] [Q:7] [Q:10] [Q:15] [Q:19] [Q:27] |
+| template | TemplateId+Version+RenderedBytes | InfrastructureMigrationNeverChangesWordingOrTemplate | SameFactsIdVersionExactFirstRenderedBytes+ReplayNoRerender | SeparateVersionedDecision+Unit+Acceptance | [Q:4] [Q:7] [Q:10] [Q:15] [Q:19] [Q:27] |
+| authority | COMPATWeakEvidence | NeverTransportAcceptedOrVerifiedTerminalRefOrCursorAdvance | WeakOutcomeMatrixRejectsAuthorityUpgradeAndCursorMutation | SeparateVersionedDecision+Unit+Acceptance | [Q:4] [Q:7] [Q:10] [Q:15] [Q:19] [Q:27] |
+
+不投递处置在 durable 库封存后、业务事务前中断：重启先重查同一 decision 的
+ManualConfirmedNotDelivered，再以 expected-version 与当前 fence 追加本地 NotDelivered；
+独立 operator audit 必须已持久化且可重验。若 audit 写入成功而业务提交失败，仅留下可查询
+处置审计，不冒充业务完成；若提交确认丢失，只读既有终态与事件。不得补发，不得让旧
+AwaitingFinalizer/Completed 或其隔离记录逆转接受历史。schedule 关闭仍独立按策略，
+NotDelivered 自身不推进通知游标。[Q:39] [Q:45] [Q:53] [Q:78] [Q:87] [Q:97]
+
+以上兼容验收是未来每个 Unit 的行为合同，需从迁移前冻结外部基线取得 golden 样本，
+而不是本批虚构某个 CLI、配置或模板已完成运行验证。内部可把 bool 改为 typed result，
+外部 invocation/arguments/exit/output、配置默认与作用域、订阅路由和原始消息字节均由
+adapter 保留；异常修复若必须破坏旧外部语义，应独立批准并版本化，不藏在基础设施迁移中。
+文档 Implementation-Ready 尚未达到；之后离线 HTML/CI 发布也不授予任何 runtime milestone。
+[Q:4] [Q:42] [Q:69] [Q:105]
+
+## 裁决追踪（PROPOSED）
+
+[Q:63]。下表逐行保留 Q1–Q55 的冻结选择；约束摘要保留历史覆盖关系，
+不改写冻结 grill 字节。落点是当前稳定章节名，不沿用旧稿失效数字节号。
+依据列解析为冻结 evidence/Unit/producer，或本 RFC 规范验收、门禁、里程碑、
+明确的未来文档发布边界。publication:ImplementationReady 只指后续文档发布；
+不是已经完成的实现证据，也不能替代 runtime 验收。[Q:59] [Q:66] [Q:69]
+
+| Q | 冻结选择 | 约束摘要 | 规范落点 | 证据或验收引用 |
+| --- | --- | --- | --- | --- |
+| 1 | B | 覆盖活跃及高风险路径的 C0--C6；不激活 24 个 INACTIVE 类型。 24 是历史口径；当前冻结目录为 22 个 INACTIVE，仍全部不激活。 | 范围与事实权限 | [gate:unit] |
+| 2 | A | 只有获得可验证且已接受的权威结果后，业务通知游标才可推进。 | 终态完成合同（PROPOSED） | [gate:dedup] |
+| 3 | C | 初始按严重级别区分 Uncertain 的处理方式；Q9 随后禁止所有严重级别盲目重发。 | 通用晋级门禁（PROPOSED） | [gate:failure] |
+| 4 | A | 内部布尔结果迁移为类型化合同期间，保持外部 CLI、配置、订阅和模板兼容。 | 外部兼容（PROPOSED） | [acceptance:cli] |
+| 5 | B | 代码完成仅达到 Release Candidate；必须取得受控真实传输证据，才能达到 Production Verified。 | 运行里程碑（PROPOSED） | [milestone:ArchitectureReleaseCandidate] |
+| 6 | B | 迁移 P0 调用方前先建立最小结果合同，再增加 finalizer 与 reconciliation。 | 运行里程碑（PROPOSED） | [milestone:FoundationReady] |
+| 7 | B | 只有能提供类型化、可验证回执的传输通道才具有权威性；其他通道维持 COMPAT/BestEffort。 | 外部兼容（PROPOSED） | [acceptance:authority] |
+| 8 | A | 业务库负责通用通知意图与最终化记录；durable DB 保存下游尝试和回执。 | 跨库恢复顺序（PROPOSED） | [gate:crash] |
+| 9 | B | 任何严重级别都不得盲目重发 Uncertain；严重级别只影响检查和升级速度。 | 通用晋级门禁（PROPOSED） | [gate:failure] |
+| 10 | B | 重放时保持稳定身份和首次渲染字节不变；新的 occurrence 可使用新模板版本。 | 业务 outbox 字节恢复合同（PROPOSED） | [gate:dedup] |
+| 11 | C | 从小版本开始；Q16/Q31 将发布边界从 PushKind 细化为原子 MigrationUnit/晋级。 | 物理所有权与晋级合同（PROPOSED） | [gate:rollback] |
+| 12 | B | CoreUnready 阻断生产；ProducerUnready 隔离单个 producer，同时使部署就绪检查失败并告警。 | 运行就绪判定（PROPOSED） | [gate:unit] |
+| 13 | B | 新路径先进入 shadow；同一 occurrence 必须且只能有一个物理 owner。 | 物理所有权与晋级合同（PROPOSED） | [gate:shadow] |
+| 14 | A | 业务迁移只做增量、向前兼容变更；回滚时保留表和证据。 | 持久化条件组与兼容守卫（PROPOSED） | [gate:rollback] |
+| 15 | B | 每个权威传输通道都要提供受控 Accepted，以及同一 decision 的 AlreadyDelivered/未二次发送证据。 | 运行退出验收（PROPOSED） | [milestone:FoundationReady] |
+| 16 | B | 原子迁移身份是 producer + occurrence family + completion owner，而不是 PushKind 或源文件。 | 范围与事实权限 | [unit:MU-p01] |
+| 17 | A | 任何 Unit 晋级前，先发布一个不改变物理 owner 的 Foundation。 | 运行里程碑（PROPOSED） | [milestone:FoundationReady] |
+| 18 | B | 回滚时禁用新 producer/scheduler，但在状态收敛前保留 authority、finalizer、reconciler 和隔离栅栏。 | 物理所有权与晋级合同（PROPOSED） | [gate:rollback] |
+| 19 | B | shadow 精确匹配包括 audience、kind、occurrence、severity、suppression、policy、evidence，初期还包括字节。 | 影子精确比较（PROPOSED） | [gate:shadow] |
+| 20 | B | 只有 Accepted、重放、重启、故障、交易时段和 Uncertain 门禁全部通过后，才能在后续版本删除旧路径。 | 运行退出验收（PROPOSED） | [gate:rollback] |
+| 21 | A | 编目所有 ACTIVE、STARVED 和 OPT-IN 路径；强路径只做合规校正，仅迁移不合规接线，INACTIVE 保持禁用。 | 范围与事实权限 | [gate:unit] |
+| 22 | C | 优先处理假成功、过早状态变更和语义分裂，再处理 scheduler/template 的用户体验。 | 运行退出验收（PROPOSED） | [milestone:P0ProductionVerified] |
+| 23 | B | 采用流水线发布：版本 N 清理 Unit N-1，并可晋级 Unit N；最后保留一个尾部清理版本。 | 运行退出验收（PROPOSED） | [milestone:ProgramProductionVerified] |
+| 24 | B | 多个 Unit 可并行 shadow，但每次晋级只能让一个 Unit 获得物理所有权。 | 物理所有权与晋级合同（PROPOSED） | [gate:shadow] |
+| 25 | B | Foundation 阶段完成传输灰盒证明；随后每个 Unit 证明其自然 occurrence，或使用经授权的低频灰盒。 | 运行退出验收（PROPOSED） | [milestone:FoundationReady] |
+| 26 | B | C0--C6 仅作为能力标签；实施顺序为 Foundation → 垂直 Unit 切片 → 最终清理。 | 运行退出验收（PROPOSED） | [milestone:ProgramProductionVerified] |
+| 27 | B | 只设一个应用端口/结果合同；默认使用通用 coordinator；P01/N02 保留为经过一致性测试的专用 authority。 | 适配器一致性合同（PROPOSED） | [evidence:p01-identity] |
+| 28 | B | 所有定时且非 INACTIVE 的 producer 注册到 PhaseScheduler；事件驱动 producer 注册 trigger/readiness；INACTIVE 不创建 scheduler。 | 调度身份（PROPOSED） | [gate:unit] |
+| 29 | B | 只有精确、机器可读的 MigrationUnit 目录完成后，才冻结排期和估算。 | 运行退出验收（PROPOSED） | [publication:ImplementationReady] |
+| 30 | B | 保留 STARVED 和 OPT-IN 状态；恢复输入或激活必须另做产品决策。 | 运行就绪判定（PROPOSED） | [gate:unit] |
+| 31 | B | 一个制品可包含多个 disabled/shadow Unit；一次晋级只能变更一个物理 owner。 | 物理所有权与晋级合同（PROPOSED） | [gate:rollback] |
+| 32 | A | 只有共享原子 completion owner 的路径才可分组，包括已识别的候选、板块、复盘、大宗交易和财报家族。 | 范围与事实权限 | [gate:unit] |
+| 33 | B | 新旧 shadow projection 使用同一份不可变 PreparedFacts，包括已捕获的 LLM 输出。 | 适配器一致性合同（PROPOSED） | [gate:shadow] |
+| 34 | B | 拆分 prepare/project/deliver/finalize；shadow 只能执行 prepare/project。 | 影子副作用（PROPOSED） | [gate:shadow] |
+| 35 | B | 语义差异、重复发送、无法解释的游标移动、陈旧积压、未解决 Uncertain、CoreUnready 或 DB 不匹配均阻断晋级。 | 通用晋级门禁（PROPOSED） | [gate:failure] |
+| 36 | B | 每个交易日最多晋级一个物理 owner；开发和 shadow 工作可并行。 | 物理所有权与晋级合同（PROPOSED） | [milestone:P0ProductionVerified] |
+| 37 | B | 按风险观察：高频路径覆盖完整有效时段/样本；低频路径确定性重放；紧急或有副作用的 Unit 观察两个时段。 | 通用晋级门禁（PROPOSED） | [gate:failure] |
+| 38 | B | Accepted 到 Finalized 的目标为两个 reconcile 周期，硬上限五分钟；下一次晋级前不得存在超时状态。 | 通用晋级门禁（PROPOSED） | [gate:crash] |
+| 39 | B | Emergency 告警/解决 SLA 为 1/15 分钟，Important 为 5 分钟/4 小时，Info/Research 须在下一有效时段前完成或标为 NotDelivered。 | 不投递终态合同（PROPOSED） | [acceptance:not_delivered] |
+| 40 | B | shadow 精确比较只排除 attempt ID、延迟和日志时间戳；业务时间取自捕获的 RunContext。 | 影子精确比较（PROPOSED） | [gate:shadow] |
+| 41 | A | 保持完整范围，暂估 36--69 工程人日、7--10 个交易周；目录冻结后重新建立基线。 本文以现行机器 WBS 为重建基线，旧暂估不冒充当前总工期。 | 运行退出验收（PROPOSED） | [publication:ImplementationReady] |
+| 42 | B | 分开定义 Foundation Ready、P0 Production Verified、Architecture Release Candidate 和 Program Production Verified。 | 运行里程碑（PROPOSED） | [milestone:ProgramProductionVerified] |
+| 43 | A | 仅在用户或指定操作员在线时晋级；Codex 提供证据和命令，不进行无人值守裁决。 | 操作员权限（PROPOSED） | [gate:unit] |
+| 44 | A | 按已批准的风险顺序迁移 10 个 P0 Unit，从 CLI BestEffort 和链路报告开始。 当前 WBS 细化为十个批准风险波次及 nullable rank，不按旧数量捏造十个 owner。 | 运行退出验收（PROPOSED） | [milestone:P0ProductionVerified] |
+| 45 | B | 人工处置使用可审计 CLI，记录决策、结果、已认证操作员、原因和证据；禁止直接修改 DB。 | 操作员请求与输出（PROPOSED） | [acceptance:not_delivered] |
+| 46 | B | ManualConfirmedAccepted 与 TransportAccepted 必须区分，前者要求可复核的外部证据及其哈希。 | 权威处置与最终化资格（PROPOSED） | [acceptance:authority] |
+| 47 | B | 操作员身份来自已认证主机/服务身份及生产 allowlist，不得使用自由文本。 | 操作员权限（PROPOSED） | [acceptance:not_delivered] |
+| 48 | B | 终态迁移证据至少保留 90 天；非终态证据不得自动清理；更严格策略仍优先。 | 证据保留类别（PROPOSED） | [gate:unit] |
+| 49 | B | 测试命名空间覆盖拒绝、Uncertain、接受后崩溃、幂等 finalizer、重放、回滚和人工处置；禁止破坏性生产故障注入。 | 故障环境与验收边界（PROPOSED） | [gate:failure] |
+| 50 | B | Program Production Verified 要求目录精确、Unit 全部完成、无意外激活/Uncertain/积压/重复、传输证明完备、完成清理并取得新鲜回执。 | 运行退出验收（PROPOSED） | [milestone:ProgramProductionVerified] |
+| 51 | B | 规范 CI 在默认并行模式下不得有无法解释的失败；隔离进程级全局测试，或明确强制串行套件。 | 运行退出验收（PROPOSED） | [milestone:FoundationReady] |
+| 52 | B | 由唯一、带 schema 版本的 activation manifest 管理 Disabled/Shadow/Active/Draining，并记录其哈希。 | 激活转换（PROPOSED） | [gate:rollback] |
+| 53 | B | 分别备份和校验 business/durable DB，在 Test 环境演练恢复；不得声称存在跨库原子快照。 | 运行退出验收（PROPOSED） | [gate:crash] |
+| 54 | B | 运行故障通过结构化本地日志、readiness/health 和可查询 CLI 保持可见；外部分页告警与业务回执相互独立。 | 就绪查询与恢复合同（PROPOSED） | [gate:unit] |
+| 55 | B | 人工证据只保存最小元数据、受保护 URI 和内容哈希；不得保存密钥或非必要的消息/投资组合内容。 | 清理资格与安全（PROPOSED） | [acceptance:not_delivered] |
 
 <!-- RFC-WBS-BEGIN -->
 ## WBS 确定性摘要（PROVISIONAL）
@@ -1864,13 +2025,14 @@ owner：business_date_once_claims(business_date,IndustryChain,None,GLOBAL) → e
 
 独立 SQL 文件是唯一事实源；本节只复制原始字节，不维护手写变体。[Q:76] [Q:97]
 
-SQL SHA-256：1da5cce2beb9baf21a6863893736a5bc070c319eb562eb9b3bf52954f5d8247d
+SQL SHA-256：4bac8e58caa2f5d2362137b5e96dd087649044f45484a1284dbd7e1fd7baa953
 
 <!-- RFC-SQL-BEGIN -->
 ```sql
 .bail on
 -- SQLite CLI schema script；不能直接传给 library execute_batch。
 -- 固定兼容签名是版本身份，不是 SQLite 计算的内容哈希。
+-- 修订：v1-final-wave1-not-delivered；旧 v1 签名不兼容，拒绝自动迁移。
 -- PROPOSED：仅用于新建临时数据库验证；不是生产迁移器。
 -- 每个业务连接必须再次启用外键与递归 trigger；时间均为非负 UTC 微秒。
 PRAGMA foreign_keys=ON;
@@ -1924,7 +2086,7 @@ FROM sqlite_master WHERE sql IS NOT NULL AND (name IN (SELECT name FROM _push_v1
 CREATE TABLE IF NOT EXISTS push_foundation_schema (
   version INTEGER PRIMARY KEY CHECK(version=1),
   description TEXT NOT NULL CHECK(description='push-foundation-v1'),
-  schema_signature TEXT NOT NULL CHECK(typeof(schema_signature)='text' AND length(schema_signature)=64 AND length(CAST(schema_signature AS BLOB))=64 AND schema_signature NOT GLOB '*[^0-9a-f]*' AND schema_signature='ae30ae6f6a0d8fa805fc7594137c6d27e6af3a879dc3625fa76d8146eb5a94e5')
+  schema_signature TEXT NOT NULL CHECK(typeof(schema_signature)='text' AND length(schema_signature)=64 AND length(CAST(schema_signature AS BLOB))=64 AND schema_signature NOT GLOB '*[^0-9a-f]*' AND schema_signature='dd5f49a1f4e02ee1d585793cc2eff9c8b98b087b2ffd267f40c873c83960ecdd')
 );
 
 
@@ -1939,7 +2101,7 @@ SELECT 'check',
   (SELECT ok FROM _push_v1_probe WHERE phase='probe' ORDER BY id DESC LIMIT 1)=1
   OR (
     (SELECT count(*) FROM push_foundation_schema)=1
-    AND EXISTS(SELECT 1 FROM push_foundation_schema WHERE version=1 AND description='push-foundation-v1' AND schema_signature='ae30ae6f6a0d8fa805fc7594137c6d27e6af3a879dc3625fa76d8146eb5a94e5')
+    AND EXISTS(SELECT 1 FROM push_foundation_schema WHERE version=1 AND description='push-foundation-v1' AND schema_signature='dd5f49a1f4e02ee1d585793cc2eff9c8b98b087b2ffd267f40c873c83960ecdd')
     AND (SELECT count(*) FROM push_foundation_objects)=(SELECT count(*) FROM _push_v1_managed)
     AND NOT EXISTS(SELECT 1 FROM push_foundation_objects r WHERE NOT EXISTS(SELECT 1 FROM _push_v1_managed m WHERE m.name=r.name AND m.object_type=r.object_type))
     AND (SELECT count(*) FROM push_foundation_objects)=(SELECT count(*) FROM _push_v1_snapshot WHERE run_id=(SELECT MAX(id) FROM _push_v1_probe WHERE phase='probe'))
@@ -1968,8 +2130,8 @@ CREATE TABLE IF NOT EXISTS push_intents (
   evidence_sha256 TEXT NOT NULL CHECK(typeof(evidence_sha256)='text' AND length(evidence_sha256)=64 AND length(CAST(evidence_sha256 AS BLOB))=64 AND evidence_sha256 NOT GLOB '*[^0-9a-f]*'),
   template_sha256 TEXT NOT NULL CHECK(typeof(template_sha256)='text' AND length(template_sha256)=64 AND length(CAST(template_sha256 AS BLOB))=64 AND template_sha256 NOT GLOB '*[^0-9a-f]*'),
   source_contract_sha256 TEXT NOT NULL CHECK(typeof(source_contract_sha256)='text' AND length(source_contract_sha256)=64 AND length(CAST(source_contract_sha256 AS BLOB))=64 AND source_contract_sha256 NOT GLOB '*[^0-9a-f]*'),
-  state TEXT NOT NULL CHECK(state IN ('PendingDispatch','AwaitingAuthority','AwaitingFinalizer','Completed','NoData','Disabled','ResolutionRequired')),
-  previous_state TEXT CHECK(previous_state IS NULL OR previous_state IN ('PendingDispatch','AwaitingAuthority','AwaitingFinalizer','Completed','NoData','Disabled','ResolutionRequired')),
+  state TEXT NOT NULL CHECK(state IN ('PendingDispatch','AwaitingAuthority','AwaitingFinalizer','Completed','NotDelivered','NoData','Disabled','ResolutionRequired')),
+  previous_state TEXT CHECK(previous_state IS NULL OR previous_state IN ('PendingDispatch','AwaitingAuthority','AwaitingFinalizer','Completed','NotDelivered','NoData','Disabled','ResolutionRequired')),
   reason TEXT NOT NULL CHECK(typeof(reason)='text' AND length(CAST(reason AS BLOB))=length(reason) AND length(reason) BETWEEN 3 AND 96 AND reason NOT GLOB '*[^a-z0-9_.]*' AND substr(reason,1,instr(reason,'.')-1) IN ('schedule','input','policy','intent','transport','finalizer','activation','shadow','operator') AND substr(reason,instr(reason,'.')+1) GLOB '[a-z]*' AND instr(substr(reason,instr(reason,'.')+1),'.')=0),
   lease_owner TEXT CHECK(lease_owner IS NULL OR length(lease_owner) BETWEEN 1 AND 512),
   lease_until INTEGER CHECK(lease_until IS NULL OR (typeof(lease_until)='integer' AND lease_until>=0)),
@@ -2041,6 +2203,14 @@ WHEN NEW.version<>OLD.version+1 OR NEW.previous_state IS NOT OLD.state OR NEW.up
     OR (OLD.state='PendingDispatch' AND NEW.state='Disabled' AND NEW.reason='policy.disabled')
     OR (OLD.state IN ('AwaitingAuthority','ResolutionRequired') AND NEW.job_decision_kind='Ready' AND NEW.state='AwaitingFinalizer' AND NEW.reason='intent.authority_verified')
     OR (OLD.state='AwaitingFinalizer' AND NEW.state='Completed' AND NEW.reason='finalizer.completed')
+    OR (NEW.state='NotDelivered' AND NEW.job_decision_kind='Ready' AND NEW.reason='operator.not_delivered'
+      AND NOT EXISTS(SELECT 1 FROM push_intent_transitions a WHERE a.intent_id=OLD.intent_id AND a.to_state IN ('AwaitingFinalizer','Completed'))
+      AND (OLD.state='AwaitingAuthority' OR (OLD.state='ResolutionRequired' AND EXISTS(
+        SELECT 1 FROM push_intent_transitions u WHERE u.intent_id=OLD.intent_id
+          AND u.to_state='ResolutionRequired' AND u.from_state='AwaitingAuthority' AND u.reason='transport.uncertain'
+          AND u.result_version=(SELECT MAX(r.result_version) FROM push_intent_transitions r
+            WHERE r.intent_id=OLD.intent_id AND r.to_state='ResolutionRequired' AND r.from_state<>'ResolutionRequired')))))
+
     OR (OLD.state IN ('PendingDispatch','AwaitingAuthority','AwaitingFinalizer','Completed','NoData','Disabled') AND NEW.state='ResolutionRequired' AND NEW.reason IN ('intent.payload_conflict','intent.expected_version_conflict','finalizer.cas_conflict'))
     OR (OLD.state IN ('AwaitingAuthority','AwaitingFinalizer') AND NEW.state='ResolutionRequired' AND NEW.reason IN ('transport.uncertain','operator.resolution_conflict'))
   )
@@ -2051,19 +2221,29 @@ END;
 CREATE TABLE IF NOT EXISTS push_intent_transitions (
   event_id TEXT NOT NULL CHECK(typeof(event_id)='text' AND length(event_id)=64 AND length(CAST(event_id AS BLOB))=64 AND event_id NOT GLOB '*[^0-9a-f]*') PRIMARY KEY,
   intent_id TEXT NOT NULL CHECK(typeof(intent_id)='text' AND length(intent_id)=64 AND length(CAST(intent_id AS BLOB))=64 AND intent_id NOT GLOB '*[^0-9a-f]*') REFERENCES push_intents(intent_id),
-  from_state TEXT NOT NULL CHECK(from_state IN ('PendingDispatch','AwaitingAuthority','AwaitingFinalizer','Completed','NoData','Disabled','ResolutionRequired')),
-  to_state TEXT NOT NULL CHECK(to_state IN ('PendingDispatch','AwaitingAuthority','AwaitingFinalizer','Completed','NoData','Disabled','ResolutionRequired')),
+  from_state TEXT NOT NULL CHECK(from_state IN ('PendingDispatch','AwaitingAuthority','AwaitingFinalizer','Completed','NotDelivered','NoData','Disabled','ResolutionRequired')),
+  to_state TEXT NOT NULL CHECK(to_state IN ('PendingDispatch','AwaitingAuthority','AwaitingFinalizer','Completed','NotDelivered','NoData','Disabled','ResolutionRequired')),
   expected_version INTEGER NOT NULL CHECK(typeof(expected_version)='integer' AND expected_version>=0),
   result_version INTEGER NOT NULL CHECK(typeof(result_version)='integer' AND result_version=expected_version+1),
   previous_sha256 TEXT CHECK(previous_sha256 IS NULL OR (typeof(previous_sha256)='text' AND length(previous_sha256)=64 AND length(CAST(previous_sha256 AS BLOB))=64 AND previous_sha256 NOT GLOB '*[^0-9a-f]*')),
   canonical_sha256 TEXT NOT NULL CHECK(typeof(canonical_sha256)='text' AND length(canonical_sha256)=64 AND length(CAST(canonical_sha256 AS BLOB))=64 AND canonical_sha256 NOT GLOB '*[^0-9a-f]*'),
   actor TEXT NOT NULL CHECK(length(actor) BETWEEN 1 AND 512),
   reason TEXT NOT NULL CHECK(typeof(reason)='text' AND length(CAST(reason AS BLOB))=length(reason) AND length(reason) BETWEEN 3 AND 96 AND reason NOT GLOB '*[^a-z0-9_.]*' AND substr(reason,1,instr(reason,'.')-1) IN ('schedule','input','policy','intent','transport','finalizer','activation','shadow','operator') AND substr(reason,instr(reason,'.')+1) GLOB '[a-z]*' AND instr(substr(reason,instr(reason,'.')+1),'.')=0),
+  terminal_disposition TEXT CHECK(terminal_disposition IS NULL OR terminal_disposition IN ('Accepted','ManualConfirmedAccepted','ManualConfirmedNotDelivered')),
+  terminal_decision_id TEXT CHECK(terminal_decision_id IS NULL OR length(terminal_decision_id) BETWEEN 1 AND 512),
+  operator_audit_ref TEXT CHECK(operator_audit_ref IS NULL OR length(operator_audit_ref) BETWEEN 1 AND 512),
+  operator_audit_sha256 TEXT CHECK(operator_audit_sha256 IS NULL OR (typeof(operator_audit_sha256)='text' AND length(operator_audit_sha256)=64 AND length(CAST(operator_audit_sha256 AS BLOB))=64 AND operator_audit_sha256 NOT GLOB '*[^0-9a-f]*')),
   terminal_ref_id TEXT CHECK(terminal_ref_id IS NULL OR length(terminal_ref_id) BETWEEN 1 AND 512),
   terminal_binding_sha256 TEXT CHECK(terminal_binding_sha256 IS NULL OR (typeof(terminal_binding_sha256)='text' AND length(terminal_binding_sha256)=64 AND length(CAST(terminal_binding_sha256 AS BLOB))=64 AND terminal_binding_sha256 NOT GLOB '*[^0-9a-f]*')),
   occurred_at INTEGER NOT NULL CHECK(typeof(occurred_at)='integer' AND occurred_at>=0),
   CHECK((terminal_ref_id IS NULL)=(terminal_binding_sha256 IS NULL)),
-  CHECK((to_state='Completed')=(terminal_ref_id IS NOT NULL)),
+  CHECK((to_state IN ('Completed','NotDelivered'))=(terminal_ref_id IS NOT NULL)),
+  CHECK((to_state IN ('Completed','NotDelivered'))=(terminal_disposition IS NOT NULL)),
+  CHECK(to_state<>'Completed' OR terminal_disposition IN ('Accepted','ManualConfirmedAccepted')),
+  CHECK((to_state='NotDelivered')=(terminal_decision_id IS NOT NULL)),
+  CHECK((to_state='NotDelivered')=(operator_audit_ref IS NOT NULL)),
+  CHECK((to_state='NotDelivered')=(operator_audit_sha256 IS NOT NULL)),
+  CHECK(to_state<>'NotDelivered' OR (terminal_disposition='ManualConfirmedNotDelivered' AND reason='operator.not_delivered')),
   CHECK((result_version=1)=(previous_sha256 IS NULL)),
   UNIQUE(intent_id,result_version)
 );
@@ -2071,6 +2251,8 @@ CREATE TRIGGER IF NOT EXISTS push_intent_transitions_binding
 BEFORE INSERT ON push_intent_transitions
 WHEN EXISTS(SELECT 1 FROM push_intent_transitions WHERE event_id=NEW.event_id)
   OR NOT EXISTS(SELECT 1 FROM push_intents i WHERE i.intent_id=NEW.intent_id AND i.state=NEW.to_state AND i.previous_state=NEW.from_state AND i.version=NEW.result_version AND i.reason=NEW.reason AND i.updated_at<=NEW.occurred_at)
+  OR (NEW.to_state='NotDelivered' AND NOT EXISTS(SELECT 1 FROM push_intents i
+    WHERE i.intent_id=NEW.intent_id AND i.durable_decision_id=NEW.terminal_decision_id))
   OR (NEW.result_version>1 AND NOT EXISTS(SELECT 1 FROM push_intent_transitions p WHERE p.intent_id=NEW.intent_id AND p.result_version=NEW.expected_version AND p.to_state=NEW.from_state AND p.canonical_sha256=NEW.previous_sha256))
 BEGIN
   SELECT RAISE(ROLLBACK, 'intent.transition_binding_invalid');
@@ -2155,6 +2337,7 @@ CREATE TABLE IF NOT EXISTS push_promotion_journal (
   CHECK(window_end>window_start AND occurred_at>=window_start AND occurred_at<window_end),
   CHECK((generation=1)=(from_manifest_sha256 IS NULL)),
   CHECK((generation=1)=(previous_sha256 IS NULL)),
+  CHECK(reason='activation.applied'),
   CHECK((action='Rollback')=(rollback_target_sha256 IS NOT NULL)),
   UNIQUE(unit_id,generation)
 );
@@ -2217,7 +2400,7 @@ INSERT INTO _push_v1_probe(phase,ok)
 SELECT 'check',(SELECT count(*) FROM push_foundation_objects)=(SELECT count(*) FROM _push_v1_managed)
   AND NOT EXISTS(SELECT 1 FROM push_foundation_objects r WHERE NOT EXISTS(SELECT 1 FROM _push_v1_managed m WHERE m.name=r.name AND m.object_type=r.object_type));
 INSERT INTO push_foundation_schema(version,description,schema_signature)
-SELECT 1,'push-foundation-v1','ae30ae6f6a0d8fa805fc7594137c6d27e6af3a879dc3625fa76d8146eb5a94e5'
+SELECT 1,'push-foundation-v1','dd5f49a1f4e02ee1d585793cc2eff9c8b98b087b2ffd267f40c873c83960ecdd'
 WHERE NOT EXISTS(SELECT 1 FROM push_foundation_schema);
 
 COMMIT;
