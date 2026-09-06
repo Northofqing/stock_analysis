@@ -1,6 +1,6 @@
 # 推送 Foundation W09 终态权威重查设计
 
-**状态：** 已冻结设计，待实现与 fresh 门禁。W09 只建立 authority 端口、完整绑定校验和 finalize 前二次重查能力；不接生产 durable DB，不发送消息，不推进业务状态或通知游标。
+**状态：** 已完成实现、双轴评审与 fresh 门禁；结果证据见 `docs/push-system/implementation-w09-results-2026-09-07.md`。W09 只建立 authority 端口、完整绑定校验和 finalize 前二次重查能力；未接生产 durable DB，不发送消息，不推进业务状态或通知游标。
 
 **决策日期：** 2026-09-07
 
@@ -78,7 +78,7 @@ W08 `IntentSnapshot` 每次生成 W09 expectation 时必须再次运行自身完
 3. 逐项核对 namespace、intent、Unit、occurrence、business date、subject、audience、template ID/version、rendered SHA-256；
 4. 现场计算 `SHA256(evidence_bytes)` 并核对 authority 声明值；
 5. 按 `TerminalBinding/v1` 重新计算全字段 binding SHA-256，并核对 authority 声明值；
-6. `Accepted`、`Rejected`、`Uncertain` 必须有 attempt；两个人工处置允许在已校验的尝试前路径中没有 attempt；
+6. `Accepted`、`Uncertain` 必须有 attempt；`Rejected` 只有携带 attempt 或明确的 `ValidatedPreAttemptRejection` 证明时成立；两个人工处置只有携带 attempt 或明确的 `ValidatedManualWithoutAttempt` 证明时成立，普通 `None` 不能穿过类型边界；
 7. 仅在全部检查通过后构造不透明 `VerifiedTerminalRef`。
 
 错误只返回稳定分类和不含业务值的字段名，不泄露 receipt、渲染正文、subject、路径或数据库内容。
@@ -121,7 +121,7 @@ W09 不以“本地返回成功”“日志出现成功字样”“TCP 已连接
 | decision 或任一业务绑定不一致 | field mismatch | 只比较 disposition 后放行 |
 | evidence bytes/hash 不一致 | evidence hash mismatch | 信任声明 hash |
 | canonical binding/hash 不一致 | binding hash mismatch | 重新写 authority 事实 |
-| transport disposition 无 attempt | disposition/attempt mismatch | 当作尝试前拒绝 |
+| Accepted/Uncertain 无 attempt，或 Rejected/人工处置缺少对应的受校验无 attempt 证明 | disposition/attempt mismatch | 把普通 `None` 当作已校验的尝试前拒绝或人工处置 |
 | finalize 二查与 prior 稳定引用不同 | prior reference changed | 使用旧引用继续 CAS |
 | 仅 verified_at 改变 | 允许 | 把审计时间纳入稳定摘要 |
 
