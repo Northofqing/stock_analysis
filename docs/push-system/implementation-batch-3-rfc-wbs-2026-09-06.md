@@ -121,16 +121,16 @@ prepare(RunContext) -> PreparedFacts -> project() -> JobDecision
 
 **接口：** SQL 可由 `/usr/bin/sqlite3 TEMP_DB < push-system-foundation.v1.sql` 从空库执行，也可重复执行而不破坏现存行。RFC 使用 `RFC-SQL-BEGIN/END` 包住唯一一个 `sql` fence；validator 提取 fence 内原始字节（不含 fence/marker），与独立 SQL 文件二进制一致，并校验嵌入 SHA。
 
-- [ ] 先写失败测试，证明 SQL 缺表/约束、RFC 嵌入漂移、二次执行失败、非法状态插入、重复 intent payload 漂移静默覆盖、promotion journal 更新/删除会被接受时测试失败。
-- [ ] 定义业务库 `push_intents`：稳定 identity、Unit/业务日/occurrence/owner、payload/evidence/source-contract/template hash、业务状态、lease owner/until/generation、expected version、ReasonCode、时间字段；CAS 更新且 identity 不含 payload hash。
-- [ ] 定义仅追加 `push_intent_transitions`，包含前驱 hash、canonical hash、expected/result version、actor、reason 和 terminal ref identity；用 trigger 禁止 UPDATE/DELETE。
-- [ ] 定义版本化 `push_activation_manifests` 与仅追加 `push_promotion_journal`，包含 manifest/build/catalog/business-schema/durable-schema/template/source-contract 哈希、Unit、generation、批准者、窗口、证据和 rollback target；journal 禁止 UPDATE/DELETE。
-- [ ] 状态表精确定义 business intent、activation 和 authority 的合法转换、发起者、CAS 条件、持久副作用和非法路径。业务状态不复制 durable 14 态。
-- [ ] 跨库协议按步骤冻结：业务 intent/outbox commit → durable reserve/attempt → transport terminal → terminal ref reverify → 同一业务库事务内执行 business finalization CAS 与 append transition → commit；每步给出重启扫描和幂等键。CAS 影响零行时不得追加 transition，transition 追加失败必须回滚 intent CAS。
-- [ ] 故障矩阵覆盖每个 commit 前后、进程终止、DB busy、foreign lease、expired lease、Accepted 审计待定、Rejected retry、Uncertain、payload drift、expected-version 冲突、terminal ref 失效、业务 finalization 失败和回滚。
-- [ ] 明确不盲重发 Uncertain；`AlreadyTerminal`/人工接受仅在 exact binding 校验后推进；ResolutionRequired 阻断 Unit 晋级。
-- [ ] 用临时目录 SQLite 执行 DDL、PRAGMA/约束/trigger/CAS 样例和二次执行；另断言 finalization CAS+transition 同事务成功、CAS 零行无事件、事件约束失败时 intent 状态/版本不变。不得连接 `data/**`。运行 RFC/source/catalog 全套文档测试和 `git diff --check`。
-- [ ] 独立规格复核 Q76--Q82/Q86--Q90/Q97--Q100；独立质量复核 SQL 可执行性、append-only、防伪跨库原子性和 crash/resend 无歧义。修复后提交 `docs: define push persistence and recovery protocol`。
+- [x] 先写失败测试，证明 SQL 缺表/约束、RFC 嵌入漂移、二次执行失败、非法状态插入、重复 intent payload 漂移静默覆盖、promotion journal 更新/删除会被接受时测试失败。
+- [x] 定义业务库 `push_intents`：稳定 identity、Unit/业务日/occurrence/owner、payload/evidence/source-contract/template hash、业务状态、lease owner/until/generation、expected version、ReasonCode、时间字段；CAS 更新且 identity 不含 payload hash。
+- [x] 定义仅追加 `push_intent_transitions`，包含前驱 hash、canonical hash、expected/result version、actor、reason 和 terminal ref identity；用 trigger 禁止 UPDATE/DELETE。
+- [x] 定义版本化 `push_activation_manifests` 与仅追加 `push_promotion_journal`，包含 manifest/build/catalog/business-schema/durable-schema/template/source-contract 哈希、Unit、generation、批准者、窗口、证据和 rollback target；journal 禁止 UPDATE/DELETE。
+- [x] 状态表精确定义 business intent、activation 和 authority 的合法转换、发起者、CAS 条件、持久副作用和非法路径。业务状态不复制 durable 14 态。
+- [x] 跨库协议按步骤冻结：业务 intent/outbox commit → durable reserve/attempt → transport terminal → terminal ref reverify → 同一业务库事务内执行 business finalization CAS 与 append transition → commit；每步给出重启扫描和幂等键。CAS 影响零行时不得追加 transition，transition 追加失败必须回滚 intent CAS。
+- [x] 故障矩阵覆盖每个 commit 前后、进程终止、DB busy、foreign lease、expired lease、Accepted 审计待定、Rejected retry、Uncertain、payload drift、expected-version 冲突、terminal ref 失效、业务 finalization 失败和回滚。
+- [x] 明确不盲重发 Uncertain；`AlreadyTerminal`/人工接受仅在 exact binding 校验后推进；ResolutionRequired 阻断 Unit 晋级。
+- [x] 用临时目录 SQLite 执行 DDL、PRAGMA/约束/trigger/CAS 样例和二次执行；另断言 finalization CAS+transition 同事务成功、CAS 零行无事件、事件约束失败时 intent 状态/版本不变。不得连接 `data/**`。运行 RFC/source/catalog 全套文档测试和 `git diff --check`。
+- [x] 独立规格复核 Q76--Q82/Q86--Q90/Q97--Q100；独立质量复核 SQL 可执行性、append-only、防伪跨库原子性和 crash/resend 无歧义。修复后提交 `docs: define push persistence and recovery protocol`。
 
 ## Task 4：调度、readiness、shadow、activation、运维与验收合同
 
