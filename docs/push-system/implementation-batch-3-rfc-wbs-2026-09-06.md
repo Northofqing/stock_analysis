@@ -193,15 +193,15 @@ Git 历史和当前纳管文档只保留“旧 W01--W21 合计 98--142 小时”
 | W20 | fault/replay/dedup/rollback 回归 harness |
 | W21 | 发布编排、N/N-1 兼容和逐 Unit/tail-cleanup 门禁工具 |
 
-- [ ] 先写 RED 测试：不是恰好 W01--W21、lineage 缺失、不是恰好目录 52 Unit、重复/缺/额外 Unit、坏依赖/环、估算非正数或不满足 O≤M≤P、错误 PERT/汇总、缓冲重复计入、缺 phase/owner/risk/acceptance/外部等待/观察/晋级字段、RFC 摘要陈旧。
-- [ ] JSON 顶层固定 `assumptions/contingency/engineering_totals/trading_totals/calendar_scenarios/critical_path`。每个 W/Unit 固定 `id/name/scope/lineage/evidence_or_catalog_refs/dependencies/risk_class/optimistic_hours/most_likely_hours/pessimistic_hours/pert_hours/engineer_count/external_wait_business_days/calendar_constraints/acceptance_gates/rationale`；Unit 另含目录 completion owner/phase/producer 快照哈希、`changes_physical_owner`、`approved_promotion_rank`、`promotion_sessions`、`observation_sessions`。
-- [ ] 三点估算以 8 小时工程日计算，`PERT=(O+4M+P)/6`；一个 Codex 开发者串行实现，评审/修复计入工时。contingency 只在汇总层按明确百分比计算一次；外部等待、生产晋级和观察 session 单列，不藏入单元 PERT，也不与工程缓冲重复相加。
-- [ ] 工程时间输出总 PERT 小时、8 小时等效工程日和明确百分比缓冲后的区间；交易时间输出单 physical owner、每个 Unit 所需 promotion/observation session 的下限；日历时间说明周末/休市、样本、人工批准和外部依赖，不把交易日直接当自然日。
-- [ ] 依赖图无环；每个 Unit 至少依赖 W01--W03/W06--W12/W16--W20 中适用项，并按真实 owner/风险补充业务依赖。最近数据只能提高设计、回放和预修复分析优先级；生产 physical-owner 晋级顺序必须保留 Q44 已批准的 10 个 P0 Unit 顺序，未经新产品裁决不得以流量排序覆盖。
-- [ ] 52 个 Unit 逐项写三点估算和专属验收证据，不用统一乘数批量填充。`MU-cli-replay-force`、startup recovery、STARVED/OPT-IN owner 必须有不同的操作/恢复门禁。
-- [ ] renderer 生成 Foundation 表、四 Epic/52 Unit 汇总、首批关键路径、工程/交易/日历公式和完整 Unit 附录；重复 `--write` 字节相同。
-- [ ] 运行 WBS/RFC/input/source/catalog 测试、真实 `--check`、SQL 临时执行和 `git diff --check`。
-- [ ] 独立规格复核 Q41/Q44/Q62/Q74/Q93/Q102、52 Unit 一一映射和最近流量优先级；独立质量复核估算可复算、依赖无环、关键路径和晋级日历不混淆。修复后提交 `docs: add exact push migration WBS`。
+- [x] 先写 RED 测试：不是恰好 W01--W21、lineage 缺失、不是恰好目录 52 Unit、重复/缺/额外 Unit、坏依赖/环、估算非正数或不满足 O≤M≤P、错误 PERT/汇总、缓冲重复计入、缺 phase/owner/risk/acceptance/外部等待/观察/晋级字段、RFC 摘要陈旧。
+- [x] JSON 顶层固定 `assumptions/contingency/engineering_totals/trading_totals/calendar_scenarios/critical_path`。每个 W/Unit 固定 `id/name/scope/lineage/evidence_or_catalog_refs/dependencies/risk_class/optimistic_hours/most_likely_hours/pessimistic_hours/pert_hours/engineer_count/external_wait_business_days/calendar_constraints/acceptance_gates/rationale`；Unit 另含目录 completion owner/phase/producer 快照哈希、`changes_physical_owner`、`approved_promotion_rank`、`promotion_sessions`、`observation_sessions`。
+- [x] 三点估算以 8 小时工程日计算，`PERT=(O+4M+P)/6`；一个 Codex 开发者串行实现，评审/修复计入工时。contingency 只在汇总层按明确百分比计算一次；外部等待、生产晋级和观察 session 单列，不藏入单元 PERT，也不与工程缓冲重复相加。
+- [x] 工程时间输出总 PERT 小时、8 小时等效工程日和明确百分比缓冲后的区间；交易时间输出单 physical owner、每个 Unit 所需 promotion/observation session 的下限；日历时间说明周末/休市、样本、人工批准和外部依赖，不把交易日直接当自然日。
+- [x] 依赖图无环；每个 Unit 至少依赖 W01--W03/W06--W12/W16--W20 中适用项，并按真实 owner/风险补充业务依赖。最近数据只能提高设计、回放和预修复分析优先级；生产 physical-owner 晋级顺序必须保留 Q44 已批准的 10 个 P0 Unit 顺序，未经新产品裁决不得以流量排序覆盖。
+- [x] 52 个 Unit 逐项写三点估算和专属验收证据，不用统一乘数批量填充。`MU-cli-replay-force`、startup recovery、STARVED/OPT-IN owner 必须有不同的操作/恢复门禁。
+- [x] renderer 生成 Foundation 表、四 Epic/52 Unit 汇总、首批关键路径、工程/交易/日历公式和完整 Unit 附录；重复 `--write` 字节相同。
+- [x] 运行 WBS/RFC/input/source/catalog 测试、真实 `--check`、SQL 临时执行和 `git diff --check`。
+- [x] 独立规格复核 Q41/Q44/Q62/Q74/Q93/Q102、52 Unit 一一映射和最近流量优先级；独立质量复核估算可复算、依赖无环、关键路径和晋级日历不混淆。修复后提交 `docs: add exact push migration WBS`。
 
 ## Task 6：第三批整体验证、交接与未完成边界
 
