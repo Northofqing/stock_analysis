@@ -920,7 +920,9 @@ impl ReadyPreparation {
             rendered_bytes,
         );
         self.state = RenderState::Sealed;
-        Ok(JobDecision::new(JobDecisionKind::Ready(prepared_push)))
+        Ok(JobDecision::new(JobDecisionKind::Ready(Box::new(
+            prepared_push,
+        ))))
     }
 
     pub fn state(&self) -> RenderStateView {
@@ -943,7 +945,7 @@ impl ReadyPreparation {
 
 #[derive(Debug, Eq, PartialEq)]
 enum JobDecisionKind {
-    Ready(PreparedPush),
+    Ready(Box<PreparedPush>),
     NoData {
         reason: ReasonCode,
         evidence_sha256: Sha256Digest,
