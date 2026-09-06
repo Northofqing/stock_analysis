@@ -7,6 +7,8 @@ use crate::monitor::push_job::{
     TerminalDisposition, UtcMicros, VerifiedTerminalRef,
 };
 
+#[cfg(test)]
+pub(crate) use super::intent_store::TransitionFault as FinalizerFault;
 use super::intent_store::{
     BusinessIntentStore, IntentSnapshot, IntentState, IntentStoreError, LeaseOwnerId,
     TransitionActor, TransitionOutcome, TransitionReceipt,
@@ -111,6 +113,15 @@ pub(crate) enum AcceptedFinalizationOutcome {
         receipt: TransitionReceipt,
         directive: CompletionDirective,
     },
+    ResolutionRequired {
+        receipt: TransitionReceipt,
+    },
+}
+
+enum FinalizerStoreMode {
+    Normal,
+    #[cfg(test)]
+    Fault(FinalizerFault),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -213,6 +224,53 @@ pub(crate) fn commit_accepted_finalization(
     verified_at: UtcMicros,
     occurred_at: UtcMicros,
 ) -> Result<AcceptedFinalizationOutcome, BusinessFinalizerError> {
+    commit_accepted_finalization_inner(
+        store,
+        pending,
+        template,
+        policy,
+        authority,
+        verified_at,
+        occurred_at,
+        FinalizerStoreMode::Normal,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn commit_accepted_finalization_with_fault(
+    store: &mut BusinessIntentStore,
+    pending: PendingAcceptedFinalization,
+    template: &TerminalTemplateBinding,
+    policy: &CompletionPolicy,
+    authority: &dyn TerminalAuthorityPort,
+    verified_at: UtcMicros,
+    occurred_at: UtcMicros,
+    fault: FinalizerFault,
+) -> Result<AcceptedFinalizationOutcome, BusinessFinalizerError> {
+    commit_accepted_finalization_inner(
+        store,
+        pending,
+        template,
+        policy,
+        authority,
+        verified_at,
+        occurred_at,
+        FinalizerStoreMode::Fault(fault),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_accepted_finalization_inner(
+    store: &mut BusinessIntentStore,
+    pending: PendingAcceptedFinalization,
+    template: &TerminalTemplateBinding,
+    policy: &CompletionPolicy,
+    authority: &dyn TerminalAuthorityPort,
+    verified_at: UtcMicros,
+    occurred_at: UtcMicros,
+    mode: FinalizerStoreMode,
+) -> Result<AcceptedFinalizationOutcome, BusinessFinalizerError> {
     if verified_at > occurred_at {
         return Err(BusinessFinalizerError::InvalidRequest {
             check: "verification_after_transition",
@@ -221,12 +279,43 @@ pub(crate) fn commit_accepted_finalization(
     let current = store
         .inspect(&pending.intent_id)?
         .ok_or(IntentStoreError::IntentMissing)?;
-    store.inspect_transition_chain(&pending.intent_id)?;
+    let chain = store.inspect_transition_chain(&pending.intent_id)?;
+    if current.state() == IntentState::Completed {
+        let receipt = chain
+            .last()
+            .filter(|event| event.to_state() == IntentState::Completed)
+            .cloned()
+            .ok_or(IntentStoreError::IntegrityFailed {
+                check: "completed_head_event",
+            })?;
+        if receipt.matches_accepted_completion(
+            &pending.prior,
+            pending.qualified_version,
+            &pending.actor,
+            occurred_at,
+        ) {
+            let directive = accepted_directive(policy, &pending.prior)?;
+            return Ok(AcceptedFinalizationOutcome::AlreadyCommitted { receipt, directive });
+        }
+        return isolate_finalizer_conflict(
+            store,
+            &pending.intent_id,
+            &current,
+            &pending.actor,
+            occurred_at,
+        );
+    }
     if current.state() != IntentState::AwaitingFinalizer {
         return Err(BusinessFinalizerError::InvalidSourceState);
     }
     if current.version() != pending.qualified_version {
-        return Err(BusinessFinalizerError::BusinessCasConflict);
+        return isolate_finalizer_conflict(
+            store,
+            &pending.intent_id,
+            &current,
+            &pending.actor,
+            occurred_at,
+        );
     }
     if !pending.fence.matches(&current, occurred_at) {
         return Err(BusinessFinalizerError::FenceMismatch);
@@ -242,20 +331,55 @@ pub(crate) fn commit_accepted_finalization(
     )?;
     require_accepted_disposition(fresh.verified_terminal().terminal_disposition())?;
     let directive = accepted_directive(policy, fresh.verified_terminal())?;
-    match store.apply_accepted_finalization(
-        fresh,
-        current.version(),
-        &pending.actor,
-        occurred_at,
-        &pending.fence.owner,
-        pending.fence.generation,
-        pending.fence.until,
-    )? {
+    let transition = match mode {
+        FinalizerStoreMode::Normal => store.apply_accepted_finalization(
+            fresh,
+            current.version(),
+            &pending.actor,
+            occurred_at,
+            &pending.fence.owner,
+            pending.fence.generation,
+            pending.fence.until,
+        )?,
+        #[cfg(test)]
+        FinalizerStoreMode::Fault(fault) => store.apply_accepted_finalization_with_fault(
+            fresh,
+            current.version(),
+            &pending.actor,
+            occurred_at,
+            &pending.fence.owner,
+            pending.fence.generation,
+            pending.fence.until,
+            fault,
+        )?,
+    };
+    match transition {
         TransitionOutcome::Applied(receipt) => {
             Ok(AcceptedFinalizationOutcome::Applied { receipt, directive })
         }
         TransitionOutcome::AlreadyCommitted(receipt) => {
             Ok(AcceptedFinalizationOutcome::AlreadyCommitted { receipt, directive })
+        }
+        TransitionOutcome::Conflict { current } => isolate_finalizer_conflict(
+            store,
+            &pending.intent_id,
+            &current,
+            &pending.actor,
+            occurred_at,
+        ),
+    }
+}
+
+fn isolate_finalizer_conflict(
+    store: &mut BusinessIntentStore,
+    intent_id: &IntentId,
+    current: &IntentSnapshot,
+    actor: &TransitionActor,
+    occurred_at: UtcMicros,
+) -> Result<AcceptedFinalizationOutcome, BusinessFinalizerError> {
+    match store.apply_finalizer_conflict(intent_id, current, actor, occurred_at)? {
+        TransitionOutcome::Applied(receipt) | TransitionOutcome::AlreadyCommitted(receipt) => {
+            Ok(AcceptedFinalizationOutcome::ResolutionRequired { receipt })
         }
         TransitionOutcome::Conflict { .. } => Err(BusinessFinalizerError::BusinessCasConflict),
     }

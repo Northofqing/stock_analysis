@@ -808,6 +808,30 @@ impl TransitionReceipt {
         self.terminal_binding_sha256.as_ref()
     }
 
+    pub(crate) fn matches_accepted_completion(
+        &self,
+        terminal: &VerifiedTerminalRef,
+        expected_version: u64,
+        actor: &TransitionActor,
+        occurred_at: UtcMicros,
+    ) -> bool {
+        self.intent_id == terminal.intent_id().as_str()
+            && self.from_state == IntentState::AwaitingFinalizer
+            && self.to_state == IntentState::Completed
+            && self.expected_version == expected_version
+            && expected_version.checked_add(1) == Some(self.result_version)
+            && self.actor == actor.as_str()
+            && self.reason == ReasonCode::FinalizerCompleted
+            && self.occurred_at == occurred_at
+            && self.terminal_disposition.as_deref()
+                == Some(terminal_disposition_name(terminal.terminal_disposition()))
+            && self.terminal_decision_id.is_none()
+            && self.operator_audit_ref.is_none()
+            && self.operator_audit_sha256.is_none()
+            && self.terminal_ref_id.as_deref() == Some(terminal.ref_id().as_str())
+            && self.terminal_binding_sha256.as_ref() == Some(terminal.binding_sha256())
+    }
+
     fn from_command(
         command: &StoreTransitionCommand,
         previous_sha256: Option<Sha256Digest>,
@@ -901,6 +925,17 @@ pub(crate) enum TransitionFault {
     AfterCas,
     AfterAppend,
     AfterCommitAckLost,
+}
+
+#[cfg(test)]
+impl TransitionFault {
+    fn point(self) -> &'static str {
+        match self {
+            Self::AfterCas => "after_transition_cas",
+            Self::AfterAppend => "after_transition_append",
+            Self::AfterCommitAckLost => "after_transition_commit_ack_lost",
+        }
+    }
 }
 
 pub struct BusinessIntentStore {
@@ -1096,12 +1131,7 @@ impl BusinessIntentStore {
         command: &IntentTransitionCommand,
         fault: TransitionFault,
     ) -> Result<TransitionOutcome, IntentStoreError> {
-        let point = match fault {
-            TransitionFault::AfterCas => "after_transition_cas",
-            TransitionFault::AfterAppend => "after_transition_append",
-            TransitionFault::AfterCommitAckLost => "after_transition_commit_ack_lost",
-        };
-        self.apply_transition_inner(&StoreTransitionCommand::from(command), Some(point))
+        self.apply_transition_inner(&StoreTransitionCommand::from(command), Some(fault.point()))
     }
 
     pub(crate) fn apply_authority_qualification(
@@ -1143,39 +1173,74 @@ impl BusinessIntentStore {
         fence_generation: u64,
         fence_until: UtcMicros,
     ) -> Result<TransitionOutcome, IntentStoreError> {
-        let verified = terminal.verified_terminal();
+        let command = accepted_finalization_command(
+            terminal,
+            expected_version,
+            actor,
+            occurred_at,
+            fence_owner,
+            fence_generation,
+            fence_until,
+        )?;
+        self.apply_transition_inner(&command, None)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_accepted_finalization_with_fault(
+        &mut self,
+        terminal: FinalizationTerminalRef,
+        expected_version: u64,
+        actor: &TransitionActor,
+        occurred_at: UtcMicros,
+        fence_owner: &LeaseOwnerId,
+        fence_generation: u64,
+        fence_until: UtcMicros,
+        fault: TransitionFault,
+    ) -> Result<TransitionOutcome, IntentStoreError> {
+        let command = accepted_finalization_command(
+            terminal,
+            expected_version,
+            actor,
+            occurred_at,
+            fence_owner,
+            fence_generation,
+            fence_until,
+        )?;
+        self.apply_transition_inner(&command, Some(fault.point()))
+    }
+
+    pub(crate) fn apply_finalizer_conflict(
+        &mut self,
+        intent_id: &IntentId,
+        current: &IntentSnapshot,
+        actor: &TransitionActor,
+        occurred_at: UtcMicros,
+    ) -> Result<TransitionOutcome, IntentStoreError> {
         if !matches!(
-            verified.terminal_disposition(),
-            TerminalDisposition::Accepted | TerminalDisposition::ManualConfirmedAccepted
+            current.state,
+            IntentState::AwaitingFinalizer | IntentState::Completed
         ) {
             return Err(IntentStoreError::InvalidTransition {
-                check: "accepted_finalizer_disposition",
+                check: "finalizer_conflict_source_state",
+            });
+        }
+        if current.intent_id != intent_id.as_str() {
+            return Err(IntentStoreError::IntegrityFailed {
+                check: "finalizer_conflict_intent_id",
             });
         }
         let command = StoreTransitionCommand {
-            intent_id: verified.intent_id().clone(),
-            from_state: IntentState::AwaitingFinalizer,
-            to_state: IntentState::Completed,
-            expected_version,
+            intent_id: intent_id.clone(),
+            from_state: current.state,
+            to_state: IntentState::ResolutionRequired,
+            expected_version: current.version,
             actor: actor.clone(),
-            reason: ReasonCode::FinalizerCompleted,
+            reason: ReasonCode::FinalizerCasConflict,
             occurred_at,
-            lease_action: LeaseAction::Release {
-                owner: fence_owner.clone(),
-            },
-            required_fence: Some(ExpectedLeaseFence {
-                owner: fence_owner.as_str().to_owned(),
-                generation: fence_generation,
-                until: fence_until,
-            }),
-            terminal: TerminalTransitionFields {
-                terminal_disposition: Some(
-                    terminal_disposition_name(verified.terminal_disposition()).to_owned(),
-                ),
-                terminal_ref_id: Some(verified.ref_id().as_str().to_owned()),
-                terminal_binding_sha256: Some(verified.binding_sha256().clone()),
-                ..TerminalTransitionFields::default()
-            },
+            lease_action: LeaseAction::Preserve,
+            required_fence: None,
+            terminal: TerminalTransitionFields::default(),
         };
         self.apply_transition_inner(&command, None)
     }
@@ -1185,7 +1250,13 @@ impl BusinessIntentStore {
         command: &StoreTransitionCommand,
         fault: Option<&'static str>,
     ) -> Result<TransitionOutcome, IntentStoreError> {
-        let result_version = command.expected_version + 1;
+        let result_version = command
+            .expected_version
+            .checked_add(1)
+            .filter(|version| *version <= i64::MAX as u64)
+            .ok_or(IntentStoreError::InvalidTransition {
+                check: "version_overflow",
+            })?;
         let event_id = transition_event_id(
             command.intent_id.as_str(),
             command.expected_version,
@@ -1388,6 +1459,52 @@ impl BusinessIntentStore {
             })?;
         u64::try_from(count).map_err(|_| integrity("transition_count"))
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accepted_finalization_command(
+    terminal: FinalizationTerminalRef,
+    expected_version: u64,
+    actor: &TransitionActor,
+    occurred_at: UtcMicros,
+    fence_owner: &LeaseOwnerId,
+    fence_generation: u64,
+    fence_until: UtcMicros,
+) -> Result<StoreTransitionCommand, IntentStoreError> {
+    let verified = terminal.verified_terminal();
+    if !matches!(
+        verified.terminal_disposition(),
+        TerminalDisposition::Accepted | TerminalDisposition::ManualConfirmedAccepted
+    ) {
+        return Err(IntentStoreError::InvalidTransition {
+            check: "accepted_finalizer_disposition",
+        });
+    }
+    Ok(StoreTransitionCommand {
+        intent_id: verified.intent_id().clone(),
+        from_state: IntentState::AwaitingFinalizer,
+        to_state: IntentState::Completed,
+        expected_version,
+        actor: actor.clone(),
+        reason: ReasonCode::FinalizerCompleted,
+        occurred_at,
+        lease_action: LeaseAction::Release {
+            owner: fence_owner.clone(),
+        },
+        required_fence: Some(ExpectedLeaseFence {
+            owner: fence_owner.as_str().to_owned(),
+            generation: fence_generation,
+            until: fence_until,
+        }),
+        terminal: TerminalTransitionFields {
+            terminal_disposition: Some(
+                terminal_disposition_name(verified.terminal_disposition()).to_owned(),
+            ),
+            terminal_ref_id: Some(verified.ref_id().as_str().to_owned()),
+            terminal_binding_sha256: Some(verified.binding_sha256().clone()),
+            ..TerminalTransitionFields::default()
+        },
+    })
 }
 
 fn apply_lease_action(
