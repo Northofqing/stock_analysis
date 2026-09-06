@@ -1481,3 +1481,251 @@ fn w04_capture_unwind_does_not_reopen_the_capability() {
     assert_eq!(capture.attempt_count(), 1);
     assert_eq!(capture.rejected_count(), 1);
 }
+
+fn w05_projection_snapshot(
+    source_refs: Vec<SourceRef>,
+    source_times: Vec<super::SourceTime>,
+    model_output_refs: Vec<super::ModelOutputRef>,
+) -> (super::DecisionProjector, super::PreparedFactsSnapshot) {
+    use super::facts::capture_fixture;
+    use super::projection::projector_fixture;
+
+    let mut capture = capture_fixture().expect("valid W05 capture capability");
+    let projector = projector_fixture(capture.context()).expect("valid catalog-bound projector");
+    let snapshot = capture
+        .capture_once(|_| {
+            Ok(w04_present_facts(
+                "auction-source",
+                "auction-source-v2",
+                source_refs,
+                source_times,
+                model_output_refs,
+            )
+            .expect("valid W05 facts"))
+        })
+        .expect("W05 facts captured once");
+    (projector, snapshot)
+}
+
+fn w05_semantic_input() -> super::SemanticInput {
+    super::SemanticInput::new(
+        SubjectId::entity("000001.SZ".to_owned()).expect("valid subject"),
+        super::Severity::Important,
+        super::Suppression::eligible(),
+    )
+}
+
+#[test]
+fn w05_monitor_kind_is_the_exact_catalog_closed_set() {
+    use std::collections::BTreeSet;
+
+    use super::MonitorKind;
+
+    let expected = [
+        "HoldingEvent",
+        "DailyReport",
+        "Announcement",
+        "AuctionVolume",
+        "VirtualWatch",
+        "LimitBoards",
+        "SectorTop",
+        "FundInflow",
+        "AuctionRepush",
+        "FactorIC",
+        "SectorTier",
+        "CapitalVerify",
+        "WeeklySOP",
+        "StockPick",
+        "IndustryChain",
+        "TurnoverTop",
+        "CandidateBoard",
+        "NewsRanked",
+        "AccountMode",
+        "DataMode",
+        "HoldingPlan",
+        "T0Advice",
+        "CandidateTriggered",
+        "ForbiddenOps",
+        "PaperTrade",
+        "PaperSell",
+        "SnapshotStale",
+        "AttributionDaily",
+        "G5bAttribution",
+        "CloseCall",
+        "ReviewMarket",
+        "ReviewLhb",
+        "ReviewSignal",
+        "ReviewFailure",
+        "TomorrowWatch",
+        "EventCalendar",
+        "ReviewProviderTopN",
+        "PositionReview",
+        "ReviewBacktest",
+        "WatchlistTracking",
+        "PreopenNewsHot",
+        "IntradayMarket",
+        "NewsCatalyst",
+        "SectorAnomaly",
+        "NewsToIdea",
+        "CatalystReview",
+        "IndustryChainIntraday",
+        "PostFixedPriceOrder",
+        "PostFixedPriceFill",
+        "StPriceLimitChanged",
+        "EtfClosingCallAuction",
+        "BlockTradeIntradayConfirm",
+        "BlockTradePriceRange",
+        "PaperReview",
+        "CandidateInvalidated",
+        "IpoListingApproval",
+        "IpoProspectus",
+        "IpoCatalyst",
+        "PolicyHit",
+        "EarningsBeat",
+        "EarningsMiss",
+        "AnalystUpgrade",
+        "MarketActionAlert",
+        "NewsFlashCritical",
+        "NewsFlashAggregated",
+    ];
+    assert_eq!(MonitorKind::ALL.len(), 65);
+    assert_eq!(
+        MonitorKind::ALL
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        expected.iter().copied().collect::<BTreeSet<_>>().len(),
+        expected.len()
+    );
+    for (expected, kind) in expected.iter().zip(MonitorKind::ALL) {
+        assert_eq!(MonitorKind::try_from(*expected).expect("known kind"), kind);
+    }
+    assert!(MonitorKind::try_from("UnknownKind").is_err());
+}
+
+#[test]
+fn w05_semantic_projection_is_deterministic_and_context_bound() {
+    let source = w04_source_ref("source-1", "auction-source", 'a');
+    let model = w04_model_ref("model-a", '2');
+    let (projector, snapshot) = w05_projection_snapshot(
+        vec![source.clone()],
+        vec![super::SourceTime::observed_at(
+            source.source_ref_id().clone(),
+            None,
+        )],
+        vec![model],
+    );
+
+    let first = projector
+        .project_semantics(&snapshot, w05_semantic_input())
+        .expect("pure projection");
+    let rebuilt = projector
+        .project_semantics(&snapshot, w05_semantic_input())
+        .expect("same pure projection");
+    assert_eq!(first, rebuilt);
+    assert_eq!(first.canonical_bytes(), rebuilt.canonical_bytes());
+    assert_eq!(first.sha256(), rebuilt.sha256());
+    assert_eq!(first.sha256(), first.canonical_bytes().sha256());
+    assert_eq!(first.audience().as_str(), "portfolio-owner");
+    assert_eq!(
+        first.monitor_kind(),
+        Some(super::MonitorKind::AuctionVolume)
+    );
+    assert_eq!(first.sub_kind(), &super::SubKind::None);
+    assert_eq!(first.occurrence(), projector.occurrence());
+    assert_eq!(
+        first.business_subject(),
+        &SubjectId::entity("000001.SZ".to_owned()).unwrap()
+    );
+    assert_eq!(first.severity(), super::Severity::Important);
+    assert_eq!(first.suppression(), &super::Suppression::Eligible);
+    assert_eq!(
+        first.completion_policy_id().as_str(),
+        "auction-notification"
+    );
+    assert_eq!(first.completion_policy_version().as_str(), "policy-v1");
+    assert_eq!(first.template_id().as_str(), "auction-card");
+    assert_eq!(first.template_version().as_str(), "auction-card-v3");
+    assert_eq!(
+        first.sha256().as_str(),
+        "W05_SEMANTIC_PROJECTION_GOLDEN_TO_BE_REPLACED"
+    );
+}
+
+#[test]
+fn w05_evidence_fingerprint_preserves_source_and_model_order() {
+    let one = w04_source_ref("source-1", "auction-source", 'a');
+    let two = w04_source_ref("source-2", "auction-source", 'b');
+    let model_one = w04_model_ref("model-a", '2');
+    let model_two = w04_model_ref("model-b", '3');
+    let (first_projector, first_snapshot) = w05_projection_snapshot(
+        vec![one.clone(), two.clone()],
+        vec![
+            super::SourceTime::observed_at(one.source_ref_id().clone(), None),
+            super::SourceTime::as_of(two.source_ref_id().clone(), None),
+        ],
+        vec![model_one.clone(), model_two.clone()],
+    );
+    let (reversed_projector, reversed_snapshot) = w05_projection_snapshot(
+        vec![two.clone(), one.clone()],
+        vec![
+            super::SourceTime::as_of(two.source_ref_id().clone(), None),
+            super::SourceTime::observed_at(one.source_ref_id().clone(), None),
+        ],
+        vec![model_two, model_one],
+    );
+
+    let first = first_projector
+        .project_semantics(&first_snapshot, w05_semantic_input())
+        .unwrap();
+    let reversed = reversed_projector
+        .project_semantics(&reversed_snapshot, w05_semantic_input())
+        .unwrap();
+    assert_ne!(
+        first.evidence_fingerprint(),
+        reversed.evidence_fingerprint()
+    );
+    assert_ne!(first.sha256(), reversed.sha256());
+}
+
+#[test]
+fn w05_projection_rejects_facts_from_another_context_before_render() {
+    use super::context::{context_fixture, ContextFixtureCase};
+    use super::projection::projector_fixture;
+
+    let source = w04_source_ref("source-1", "auction-source", 'a');
+    let (_, snapshot) = w05_projection_snapshot(
+        vec![source.clone()],
+        vec![super::SourceTime::observed_at(
+            source.source_ref_id().clone(),
+            None,
+        )],
+        Vec::new(),
+    );
+    let other_context = context_fixture(ContextFixtureCase::ValidEvent).unwrap();
+    let other_projector = projector_fixture(&other_context).unwrap();
+    assert!(matches!(
+        other_projector.project_semantics(&snapshot, w05_semantic_input()),
+        Err(super::ProjectionError::ContextFactsMismatch)
+    ));
+}
+
+#[test]
+fn w05_projection_value_types_are_closed_and_validated() {
+    assert!(super::SubKind::try_registered(String::new()).is_err());
+    assert_eq!(super::SubKind::none(), super::SubKind::None);
+    assert_eq!(super::Severity::ALL.len(), 4);
+    assert_eq!(
+        super::Suppression::suppressed(
+            ReasonCode::PolicyCooldownActive,
+            Some(UtcMicros::try_new(1_788_743_200_000_000).unwrap()),
+        ),
+        super::Suppression::Suppressed {
+            reason: ReasonCode::PolicyCooldownActive,
+            eligible_after: Some(UtcMicros::try_new(1_788_743_200_000_000).unwrap()),
+        }
+    );
+}
