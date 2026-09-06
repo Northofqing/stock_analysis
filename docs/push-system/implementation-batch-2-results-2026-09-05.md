@@ -1,6 +1,6 @@
 # 第二批推送可靠性：来源、目录与源码证据交付记录
 
-> Task1–Task7的来源、工具、源码业务审计和三个目录制品均已完成独立复核；当前只剩整批最终门禁与总状态同步。不是Foundation Ready、生产上线或全量方案完成声明。
+> 第二批已完成：Task1–Task7、整批门禁与最终独立双轴审查均通过；机器目录仍按设计保持PROVISIONAL。不是Foundation Ready、生产上线或全量方案完成声明。
 
 ## 范围与边界
 
@@ -59,29 +59,32 @@ v18.2–v18.4文件自声明v20.x，v18.5自声明v20.0，记录为版本标签�
 
 ### Task7：机器目录、源码证据与中文视图
 
-目录提交`9f9640c`，普通启动恢复修订`483d3ad`。最终三个制品精确覆盖65个kind（36 ACTIVE、22 INACTIVE、5 STARVED、2 OPT-IN）、101个producer（含15个普通启动恢复入口、9个枚举外入口）、51个MigrationUnit、184个完整symbol证据/31个Rust证据文件，以及469个冻结文件（467个`src/**/*.rs`加两份Cargo文件）。所有INACTIVE均保持空producer；所有非INACTIVE均有源码审计入口。PaperBuy/Watchdog仅作为“原混合工作树存在、隔离基线未移入”的排除项，不伪造证据。
+目录提交`9f9640c`，普通启动恢复修订`483d3ad`，最终审查修订`de31751`。三个制品精确覆盖65个kind（36 ACTIVE、22 INACTIVE、5 STARVED、2 OPT-IN）、102个producer（含15个普通启动恢复入口、10个枚举外入口）、52个MigrationUnit、195个完整symbol证据/33个Rust证据文件，以及469个冻结文件（467个`src/**/*.rs`加两份Cargo文件）。所有INACTIVE均保持空producer；所有非INACTIVE均有源码审计入口。PaperBuy/Watchdog仅作为“原混合工作树存在、隔离基线未移入”的排除项，不伪造证据。
 
 独立复核发现首版只登记正常业务入口和显式补偿，遗漏了服务普通启动时对全日期既存持久信封的恢复。修订后新增15条恢复producer：14条复用原通知owner与Unit，R03既存counted decision单独建Unit；恢复使用原不可变信封和原claim/decision，不重新取当前source，也不按共享startup循环合并成全局完成状态。11个相关INACTIVE仍无新producer，但说明既存历史decision可能被恢复。限定复核确认遗漏已关闭，无新增Critical/Important。
 
 普通D01另经源码核正：空code加`PerTicket`不会产生L4冷却，真实完成边界是`D01_LAST_PUSH[code:name]`与NewsToIdea模板冷却表；Beat/Miss即使共享扫描也因L4 kind键不同拆Unit。P01普通all-date startup可恢复Scheduled信封，不受显式compensation的模式禁令约束，但仍只消费原P01 claim/信封。上述均是冻结源码行为，不是运行时改造。
 
-## 整批验证（进行中）
+整批审查另发现可真实发送的枚举外`--replay-force`：它在启动全局恢复门之前读取历史`push.source`正文，构造新replay ID/标记，经独立publisher/sink调用`push_wechat`，并写本地attempt/result哈希链。现已登记为独立producer/Unit并覆盖四个可执行时段；本地审计与runner summary仍不是要求渠道的TransportAccepted，也不借原业务PushKind或counted owner。启动健康webhook在Prod且配置URL时会真实POST，但按Q54属于与业务回执独立的运维分页告警，明确排除出本业务目录并保留独立ops-alert目录/receipt审计待办。
+
+## 整批验证（已完成）
 
 | 已执行验证 | 结果及对应版本 |
 | --- | --- |
-| 来源CLI测试 | f30c4a4：11 tests / 91 assertions，通过 |
-| 工具CLI测试 | 435fa91：25 tests / 307 assertions，通过 |
+| 来源CLI测试 | 最终HEAD：12 tests / 110 assertions，通过 |
+| 工具CLI测试 | 最终HEAD：32 tests / 355 assertions，通过；覆盖inline impl、opaque `impl Trait`、raw identifier和属性空白/注释边界 |
 | Task1/Task2独立及修订复核 | 无未关闭Critical/Important；真实业务目录属于Task3 |
-| 真实根目录draft/strict/render | Task7：draft通过；strict仅剩两个PROVISIONAL（提交前另有预期dirty）；write→check→write字节幂等 |
+| 真实根目录draft/strict/render | draft与render freshness通过；clean strict仅报告catalog/manifest两个PROVISIONAL；write→check→write字节幂等 |
 | 首次真实审计 | 65 enum / 469 scope files / 16组直接源码事实；未生成成品、无提交，剩余边界已拆分 |
 | Task3入口/无caller清单 | 10b38e9：65/65；15个无生产caller；修订复核PASS |
 | Task4新闻边界 | d15f35b：13条producer/分支；10个完成域；9个候选Unit；5个具体未决；复核PASS |
 | Task5状态/交易边界 | ce581b5：37条producer/入口；25个候选边界族/Unit；5个具体未决；复核PASS |
 | Task6复盘/枚举外边界 | c0a4029：13 task（7/4/2）；21边界；17候选Unit；6未决；复核PASS |
-| Task7真实目录与启动恢复 | 483d3ad：65 kind / 101 producer / 51 Unit / 184 evidence / 469冻结文件；限定复核PASS |
-| 整批最终验证/最终review | 正在执行；完成前不升级PROVISIONAL状态 |
+| Task7真实目录与启动恢复 | 65 kind / 102 producer / 52 Unit / 195 evidence / 469冻结文件；10个枚举外入口；限定复核PASS |
+| 源码与保护边界 | Rust/Cargo相对07781bf零差异；除两份不可变来源六处历史空格外新增diff-check通过；原目录160个unmerged及四份样本指纹不变 |
+| 整批最终review | Spec PASS、Quality PASS；最后一轮新增Critical/Important/Minor均为0 |
 
-Task1留下一个非阻塞Minor：不存在的root目前诊断为`catalog_missing`，不影响失败退出，但诊断可更精确；交给整批review最终定级。
+最终审查发现的缺失/非法root诊断、同行impl歧义、opaque `impl Trait`误识别和属性标记空白/注释边界均已通过公开CLI RED/GREEN回归关闭。当前真实manifest的17条`rust_impl`及全部195条evidence重新定位一致。
 
 ## 本轮裁决与代价
 
@@ -107,11 +110,15 @@ Task1留下一个非阻塞Minor：不存在的root目前诊断为`catalog_missin
 20. D01按真实空code/PerTicket路径不登记L4冷却owner，使用进程内`D01_LAST_PUSH[code:name]`和模板冷却表：避免把未执行的通用L4分支当防重；代价是现有完成状态不持久，进程重启后的重复与恢复仍需Foundation解决。
 21. 普通启动all-date reconciliation作为显式恢复producer层登记，14条复用原owner/Unit，R03既存decision单独建Unit，不建立“全局startup Unit”：共享恢复循环不是共享通知完成原子性；代价是目录和后续实现必须分别建模正常生产与既存信封恢复，并始终服从原claim、lease/fence和不可变信封。
 22. INACTIVE表示当前不能创建新producer，不等于历史持久decision绝不会恢复：11个相关kind继续保持空producer并在note中说明恢复边界；代价是能力状态需同时表达“新建能力”和“历史恢复能力”，测试也必须分成两类。
+23. `--replay-force`按独立枚举外producer/Unit登记，不借原业务kind、claim或startup恢复owner：它重放历史正文并生成新的replay身份，本地attempt/result审计只证明本机过程；代价是重复force、原正文当前有效性和要求渠道TransportAccepted仍需独立合同与操作门禁。
+24. Q54运维webhook明确排除出业务回执目录，而不是当成“没有发送”：Prod且配置URL时会真实POST，但与业务消息的完成状态相互独立；代价是后续还需单独建立ops-alert目录、receipt、重试和升级链审计。
 
 ## 保护与未检查项
 
 原目录源码差异指纹、160个unmerged索引项及08-31 alerts/G5b历史文件在Task1闭环后复核未变。隔离区09-05事故参考件也与本批开始时一致；这不撤销[首批样本保全事故](implementation-batch-1-results-2026-09-05.md)的原结论，不再将其称为未变的原始快照。
 
 格式例外仅为v18.4第219/278行、v18.5第109/138/142/433行原有空白，并由来源SHA防止扩大。最终检查须分别记录这六处历史诊断与新增文件结果。
+
+最终制品SHA-256：Markdown `0ce9aa6a5329d15ddd532ecba867fd403a1540d5eb6bdb7bf735dd354d26ae70`；catalog `0aa6a2fd87ee9c235073cad3beef44229437f3fe62987b0db510ad36a93aace3`；manifest `54dc705961da7a6deb458009d2125ee612257d82bad3c14b65d25642e09b64fa`。
 
 NOT CHECKED：完整RFC / WBS / 离线HTML / CI / 运行时Foundation / 部署 / 真实接收 / 全套Rust测试。旧二进制读取首批新gateway_source审计标签的兼容回退限制仍有效；本批不提供上线批准。
