@@ -21,7 +21,7 @@ module ArchitectureDocs
     INACTIVE = %w[remain_inactive missing_dependencies_visible zero_messages_not_pass].freeze
     REPLAY = %w[real_send_audit original_and_replay_identity dry_run_zero_send force_explicit_authorization].freeze
     WAVES = [
-      %w[MU-cli-single MU-cli-summary MU-cli-chain], %w[MU-chain-preopen], %w[MU-chain-post-close],
+      %w[MU-cli-single MU-cli-summary], %w[MU-chain-preopen], %w[MU-chain-post-close],
       %w[MU-attribution-daily], %w[MU-g5b-attribution], %w[MU-intraday-market],
       %w[MU-auction-candidates], %w[MU-limit-boards],
       %w[MU-review-r04 MU-review-r07 MU-review-r08 MU-review-r09 MU-review-r11 MU-review-r13 MU-review-a10],
@@ -60,7 +60,7 @@ module ArchitectureDocs
     module_function
 
     def parse(bytes)
-      JSON.parse(bytes, object_class: UniqueObject)
+      JSON.parse(bytes, object_class: UniqueObject, decimal_class: BigDecimal)
     end
 
     def read(root, path)
@@ -104,6 +104,12 @@ module ArchitectureDocs
       end
       fs, us = w.values_at('foundation_work_packages', 'migration_units')
       return (errors + ['wbs_rows_invalid']).sort unless objects?(fs) && objects?(us)
+      [['foundation_work_packages', fs], ['migration_units', us]].each do |path, rows|
+        rows.each_with_index do |row, index|
+          errors << "wbs_id_invalid path=#{path}[#{index}].id" unless text?(row['id'])
+        end
+      end
+      return errors.uniq.sort if errors.any? { |error| error.start_with?('wbs_id_invalid ') }
       fids = (1..21).map { |i| format('W%02d', i) }
       cids = catalog['migration_units'].map { |r| r['id'] }
       errors << 'wbs_foundation_set_invalid' unless fs.map { |r| r['id'] }.sort_by(&:to_s) == fids
@@ -334,6 +340,7 @@ module ArchitectureDocs
     end
 
     def cell(value)
+      value = value.to_s('F') if value.is_a?(BigDecimal)
       value.to_s.gsub('|', '&#124;').gsub('[', '&#91;').gsub(']', '&#93;').gsub("\n", '<br>')
     end
 
@@ -342,6 +349,7 @@ module ArchitectureDocs
     end
 
     def render(w)
+      w = render_values(w)
       e, t, c, cp = w.values_at('engineering_totals', 'trading_totals', 'calendar_scenarios', 'critical_path')
       fs, us = w.values_at('foundation_work_packages', 'migration_units')
       text = "## WBS 确定性摘要（PROVISIONAL）\n\n"
@@ -354,7 +362,7 @@ module ArchitectureDocs
       text += table(%w[Epic 关联Unit数 关联PERT小时], w['assumptions']['phase_epics'].map { |phase| members = us.select { |r| r['phase_epics'].include?(phase) }; [phase, members.length, sum(members, 'pert_hours')] })
       text += "\n跨Epic Unit在关联行重复展示，不能累加Epic行作为总数；去重后 #{us.length} Unit，#{e['migration_pert_hours']} 小时。\n\n### Q44 十波映射\n\n"
       text += table(%w[rank CatalogUnit physical-owner晋级session 观察session], cp['trading_rollout']['wave_groups'].map { |g| rows=us.select { |r| g['unit_ids'].include?(r['id']) }; [g['rank'], g['unit_ids'].join(', '), sum(rows, 'promotion_sessions'), sum(rows, 'observation_sessions')] })
-      text += "\n同rank不代表有内部先后顺序：仍逐Unit逐交易日，同波内顺序须操作员另批。其他Unit rank=null，未经新批准不能追加为第十一波或按流量排序。rank1含CLI单股/汇总/产业链的enum外NotificationService报告typed BestEffort结果；replay-force独立。rank6覆盖15:05所属共享owner的四入口；rank9仅七个ACTIVE ReviewTask，R03三owner rank=null。rank10是PaperReview保持STARVED的conformance，不授予物理owner。\n\n### 可复算时间与首批关键路径\n\n"
+      text += "\n同rank不代表有内部先后顺序：仍逐Unit逐交易日，同波内顺序须操作员另批。其他Unit rank=null，未经新批准不能追加为第十一波或按流量排序。rank1仅含default CLI单股/汇总的typed BestEffort结果；CLI产业链报告的历史批准范围有歧义，MU-cli-chain保持rank=null，纳入波次需要另行产品裁决；replay-force独立。rank6覆盖15:05所属共享owner的四入口；rank9仅七个ACTIVE ReviewTask，R03三owner rank=null。rank10是PaperReview保持STARVED的conformance，不授予物理owner。\n\n### 可复算时间与首批关键路径\n\n"
       text += "O/M/P包含实现、评审和修复。逐行 PERT=round-half-up((O+4M+P)/6,2)，总计仅加保存的逐行PERT。Foundation #{e['foundation_pert_hours']}h + Unit #{e['migration_pert_hours']}h = #{e['baseline_hours']}h / 8 = #{e['baseline_engineering_days']}工程日。\n\n"
       text += "单开发者串行；缓冲只在总PERT上应用一次 #{w['contingency']['percent']}%=#{e['contingency_hours']}h。工程区间为baseline #{e['baseline_hours']}h至含缓冲 #{e['buffered_hours']}h，即 #{e['baseline_engineering_days']}至#{e['buffered_engineering_days']}个8小时工程日。外部等待/交易观察/同一风险不重复进入工时。\n\n"
       text += "工程DAG最长依赖路径：#{cp['engineering']['dependency_longest_path'].join(' → ')} = #{cp['engineering']['dependency_path_hours']}h；这不是单开发者总历时。完整资源串行顺序存于JSON，可检查每条依赖。首批工程是全部Foundation加rank1--3的 #{cp['engineering']['first_batch_unit_ids'].join(', ')}，共#{cp['engineering']['first_batch_hours']}h（无缓冲）。\n\n"
@@ -372,15 +380,27 @@ module ArchitectureDocs
     end
 
     def decimal(n)
-      BigDecimal(n.to_s)
+      n.is_a?(Rational) ? n : BigDecimal(n.to_s).to_r
     end
 
     def rounded(n)
-      n.round(2, BigDecimal::ROUND_HALF_UP).to_f
+      # Keep the raw JSON decimal exact through division and half-up rounding.
+      value = decimal(n)
+      cents = (value.abs * 100 + Rational(1, 2)).floor * (value < 0 ? -1 : 1)
+      BigDecimal(cents.to_s) / 100
     end
 
     def sum(rows, key)
-      rounded(rows.reduce(BigDecimal('0')) { |n, r| n + decimal(r.fetch(key)) })
+      rounded(rows.reduce(Rational(0)) { |n, r| n + decimal(r.fetch(key)) })
+    end
+
+    def render_values(value)
+      case value
+      when BigDecimal then value.to_s('F')
+      when Hash then value.to_h { |key, item| [key, render_values(item)] }
+      when Array then value.map { |item| render_values(item) }
+      else value
+      end
     end
   end
 end

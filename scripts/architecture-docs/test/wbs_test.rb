@@ -171,6 +171,48 @@ class WbsTest < Minitest::Test
     end
   end
 
+  def test_review_cli_chain_is_not_an_approved_q44_report_unit
+    require_relative '../wbs'
+    with_fixture do |root|
+      mutate(root) { |w| w['migration_units'].find { |u| u['id']=='MU-cli-chain' }['approved_promotion_rank'] = 1 }
+      assert_includes ArchitectureDocs::Wbs.validate(root), 'wbs_rank_invalid id=MU-cli-chain'
+    end
+    w = JSON.parse(File.read(File.join(ROOT,WBS)))
+    assert_nil w['migration_units'].find { |u| u['id']=='MU-cli-chain' }['approved_promotion_rank']
+    assert_equal 318.66, w['critical_path']['engineering']['first_batch_hours']
+    assert_equal 10, w['critical_path']['trading_rollout']['first_batch_sessions']
+  end
+
+  def test_review_raw_decimal_below_half_up_boundary_is_not_promoted_by_float
+    require_relative '../wbs'
+    with_fixture do |root|
+      mutate(root) do |w|
+        w['foundation_work_packages'][0].merge!('optimistic_hours'=>1,'most_likely_hours'=>1,
+          'pessimistic_hours'=>'RAW_DECIMAL_BOUNDARY','pert_hours'=>1.01)
+      end
+      path = File.join(root,WBS)
+      File.write(path,File.read(path).sub('"RAW_DECIMAL_BOUNDARY"','1.029999999999999999'))
+      # Exact PERT is strictly below 1.005; therefore it rounds to 1.00.
+      assert_includes ArchitectureDocs::Wbs.validate(root), 'wbs_pert_mismatch id=W01'
+      File.write(path,File.read(path).sub('"pert_hours": 1.01','"pert_hours": 1.00'))
+      errors = ArchitectureDocs::Wbs.validate(root)
+      refute_includes errors,'wbs_pert_mismatch id=W01'
+      assert_includes errors,'wbs_engineering_totals_mismatch'
+    end
+  end
+
+  def test_review_invalid_nested_id_uses_a_stable_json_path
+    require_relative '../wbs'
+    with_fixture do |root|
+      mutate(root) { |w| w['migration_units'][0]['id'] = {'a'=>1,'b'=>2} }
+      first = ArchitectureDocs::Wbs.validate(root)
+      mutate(root) { |w| w['migration_units'][0]['id'] = {'b'=>2,'a'=>1} }
+      assert_equal first, ArchitectureDocs::Wbs.validate(root)
+      assert_includes first,'wbs_id_invalid path=migration_units[0].id'
+      assert_equal first.sort,first
+    end
+  end
+
   def test_reordering_catalog_object_keys_preserves_unit_canonical_hash_but_array_order_does_not
     with_fixture do |root|
       path = File.join(root, CATALOG)

@@ -93,9 +93,9 @@
         "W21",
         "MU-cli-single",
         "MU-cli-summary",
-        "MU-cli-chain",
         "MU-chain-preopen",
         "MU-chain-post-close",
+        "MU-cli-chain",
         "MU-news-ai",
         "MU-paper-sell",
         "MU-g5b-attribution",
@@ -166,18 +166,16 @@
       "first_batch_unit_ids": [
         "MU-chain-post-close",
         "MU-chain-preopen",
-        "MU-cli-chain",
         "MU-cli-single",
         "MU-cli-summary"
       ],
-      "first_batch_hours": 326.99
+      "first_batch_hours": 318.66
     },
     "trading_rollout": {
       "wave_groups": [
         {
           "rank": 1,
           "unit_ids": [
-            "MU-cli-chain",
             "MU-cli-single",
             "MU-cli-summary"
           ]
@@ -251,6 +249,7 @@
         "MU-announcement",
         "MU-auction-volume",
         "MU-block-confirm",
+        "MU-cli-chain",
         "MU-cli-replay-force",
         "MU-close-call",
         "MU-d01",
@@ -283,11 +282,10 @@
       "first_batch_unit_ids": [
         "MU-chain-post-close",
         "MU-chain-preopen",
-        "MU-cli-chain",
         "MU-cli-single",
         "MU-cli-summary"
       ],
-      "first_batch_sessions": 12
+      "first_batch_sessions": 10
     }
   },
   "foundation_work_packages": [
@@ -5259,7 +5257,7 @@
           }
         ]
       },
-      "rationale": "rank1 enum外chain不合并R03/I03或两个timer",
+      "rationale": "CLI产业链报告的历史批准范围有歧义：蓝图明确default CLI单股/汇总，未明确纳入独立run_chain_analysis_mode owner。保持rank=null，纳入波次需要另行产品裁决；工程范围仍保留，且不合并R03/I03或两个timer。",
       "completion_owner": "run_chain_analysis_mode(invocation) 的 Result<()>；无独立持久通知 cursor",
       "phase_epics": [
         "盘中",
@@ -5272,7 +5270,7 @@
       ],
       "catalog_unit_sha256": "f99e1b311f12062db0002c69d68074a5e4532493a98d71143ffeb5d42e9edccf",
       "changes_physical_owner": true,
-      "approved_promotion_rank": 1,
+      "approved_promotion_rank": null,
       "promotion_sessions": 1,
       "observation_sessions": 1
     },

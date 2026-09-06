@@ -1307,7 +1307,7 @@ W21只交付发布编排与清理门禁工具；逐Unit cutover准备、验证�
 
 | rank | CatalogUnit | physical-owner晋级session | 观察session |
 | --- | --- | --- | --- |
-| 1 | MU-cli-chain, MU-cli-single, MU-cli-summary | 3.0 | 3.0 |
+| 1 | MU-cli-single, MU-cli-summary | 2.0 | 2.0 |
 | 2 | MU-chain-preopen | 1.0 | 2.0 |
 | 3 | MU-chain-post-close | 1.0 | 2.0 |
 | 4 | MU-attribution-daily | 1.0 | 2.0 |
@@ -1318,7 +1318,7 @@ W21只交付发布编排与清理门禁工具；逐Unit cutover准备、验证�
 | 9 | MU-review-a10, MU-review-r04, MU-review-r07, MU-review-r08, MU-review-r09, MU-review-r11, MU-review-r13 | 7.0 | 14.0 |
 | 10 | MU-paper-review-daily, MU-paper-review-noon | 0.0 | 0.0 |
 
-同rank不代表有内部先后顺序：仍逐Unit逐交易日，同波内顺序须操作员另批。其他Unit rank=null，未经新批准不能追加为第十一波或按流量排序。rank1含CLI单股/汇总/产业链的enum外NotificationService报告typed BestEffort结果；replay-force独立。rank6覆盖15:05所属共享owner的四入口；rank9仅七个ACTIVE ReviewTask，R03三owner rank=null。rank10是PaperReview保持STARVED的conformance，不授予物理owner。
+同rank不代表有内部先后顺序：仍逐Unit逐交易日，同波内顺序须操作员另批。其他Unit rank=null，未经新批准不能追加为第十一波或按流量排序。rank1仅含default CLI单股/汇总的typed BestEffort结果；CLI产业链报告的历史批准范围有歧义，MU-cli-chain保持rank=null，纳入波次需要另行产品裁决；replay-force独立。rank6覆盖15:05所属共享owner的四入口；rank9仅七个ACTIVE ReviewTask，R03三owner rank=null。rank10是PaperReview保持STARVED的conformance，不授予物理owner。
 
 ### 可复算时间与首批关键路径
 
@@ -1326,9 +1326,9 @@ O/M/P包含实现、评审和修复。逐行 PERT=round-half-up((O+4M+P)/6,2)，
 
 单开发者串行；缓冲只在总PERT上应用一次 20%=165.8h。工程区间为baseline 828.99h至含缓冲 994.79h，即 103.62至124.35个8小时工程日。外部等待/交易观察/同一风险不重复进入工时。
 
-工程DAG最长依赖路径：W01 → W02 → W03 → W06 → W07 → W08 → W09 → W10 → W11 → W14 → W15 → W18 → W20 → W21 → MU-paper-sell = 208.01h；这不是单开发者总历时。完整资源串行顺序存于JSON，可检查每条依赖。首批工程是全部Foundation加rank1--3的 MU-chain-post-close, MU-chain-preopen, MU-cli-chain, MU-cli-single, MU-cli-summary，共326.99h（无缓冲）。
+工程DAG最长依赖路径：W01 → W02 → W03 → W06 → W07 → W08 → W09 → W10 → W11 → W14 → W15 → W18 → W20 → W21 → MU-paper-sell = 208.01h；这不是单开发者总历时。完整资源串行顺序存于JSON，可检查每条依赖。首批工程是全部Foundation加rank1--3的 MU-chain-post-close, MU-chain-preopen, MU-cli-single, MU-cli-summary，共318.66h（无缓冲）。
 
-交易独立计算：42个owner-changing Unit，42次晋级 + 76次独立观察 = 118个串行eligible session；单日全局最多晋级一个Unit，下限42个晋级交易日。观察按每Unit晋级后串行保守场景；高风险/业务副作用至少两观察session，纯shadow不占名额。首批rank1--3至少12个session，同rank排列须另批。
+交易独立计算：42个owner-changing Unit，42次晋级 + 76次独立观察 = 118个串行eligible session；单日全局最多晋级一个Unit，下限42个晋级交易日。观察按每Unit晋级后串行保守场景；高风险/业务副作用至少两观察session，纯shadow不占名额。首批rank1--3至少10个session，同rank排列须另批。
 
 自然日场景从假设周一开始且不承诺日期：ceil(124.35)=125工程工作日 + 118交易session + 63外部等待工作日 = 306个串行业务日；只排周末时 7*floor((N-1)/5)+(N-1)%5+1 = 428自然日。该保守无重叠场景须另加交易所休市、人工批准和真实样本延迟，上限为null；非承诺，亦非把交易日直接当自然日。STARVED/OPT-IN激活及至少90天/更严留存届满等待均不在此场景，未排序Unit须新批准。
 
@@ -1820,9 +1820,9 @@ owner：AnalysisPipeline::run(invocation) 的 results / send_summary_notificatio
 
 owner：run_chain_analysis_mode(invocation) 的 Result<()>；无独立持久通知 cursor。Epic：盘中/盘前/盘后/集合竞价；producer：cli-chain。快照SHA：`f99e1b311f12062db0002c69d68074a5e4532493a98d71143ffeb5d42e9edccf`。
 
-逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=4/8/14h；PERT=8.33h；风险=medium；外部等待=0工作日；owner change=true；rank=1；晋级/观察=1/1 session。
+逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。 O/M/P=4/8/14h；PERT=8.33h；风险=medium；外部等待=0工作日；owner change=true；rank=null；晋级/观察=1/1 session。
 
-依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W16, W17, W18, W19, W20, W21。日历：显式CLI invocation回放；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：rank1 enum外chain不合并R03/I03或两个timer。
+依赖：W01, W02, W03, W04, W05, W06, W07, W08, W09, W10, W11, W12, W16, W17, W18, W19, W20, W21。日历：显式CLI invocation回放；人工批准与样本不足可无限延期；非交易日不消耗交易session。。估算依据：CLI产业链报告的历史批准范围有歧义：蓝图明确default CLI单股/汇总，未明确纳入独立run_chain_analysis_mode owner。保持rank=null，纳入波次需要另行产品裁决；工程范围仍保留，且不合并R03/I03或两个timer。。
 
 六类共享门禁：unit, failure, crash, shadow, dedup, rollback（每Unit/build重新取证）；专属门禁：Result<()>只代表函数完成，typed BestEffort逐渠道呈现；latest completed business date绑定payload，不借timer日期门授权。
 
