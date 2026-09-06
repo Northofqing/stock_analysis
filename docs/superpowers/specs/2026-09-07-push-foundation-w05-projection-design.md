@@ -1,6 +1,6 @@
 # 推送 Foundation W05 语义投影与首次渲染封存设计
 
-**状态：** 已设计，待按测试先行实现；不接生产 caller、catalog loader、presentation、数据库、sink 或 scheduler。
+**状态：** 已按测试先行实现并完成切片验证；结果见 `docs/push-system/implementation-w05-results-2026-09-07.md`。未接生产 caller、catalog loader、presentation、数据库、sink 或 scheduler；W06--W21 与 52 个 Migration Unit 仍待完成。
 
 **决策日期：** 2026-09-07
 
