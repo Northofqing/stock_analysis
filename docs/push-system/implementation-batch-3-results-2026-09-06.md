@@ -1,6 +1,6 @@
 # 第三批 RFC/SQL/WBS 交接候选结果（2026-09-06）
 
-状态：`PROVISIONAL`；第三批 RFC/SQL/WBS 规格与机器校验候选完成（独立整批审查前）。**独立整批审查待 Controller 执行**；下列 Task 1--5 的独立复审结论不代替最终整批审查，第三批尚未宣告最终完成。
+状态：`PROVISIONAL`；**所有已知发现已修、最终整批复审待定**。这是实现者交接候选状态；Task 1--5 及修复波 1 的限定双轴 PASS 不代替 Controller 的最终整批 Spec/Quality 复审，第三批未宣告完成。
 
 本批把每条推送的身份、完成权威、跨库恢复、调度/readiness、shadow/activation/operator、保留期和逐 Unit 工期变成可失败的机器合同。它帮助实施者识别合同缺项、语义倒退和数值漂移，仍不证明线上推送问题已修复。
 
@@ -17,7 +17,32 @@
 | Task 5 精确 WBS | `846fa1b` / `edbb509` / `d45dada` | 首轮 1 Important、2 Minor：CLI-chain 未获晋级授权、Float 舍入、非法 ID 诊断不稳定；修复后限定复审 PASS/PASS，剩余 0/0/0。CLI-chain 保持未排序，等待单独产品裁决。 |
 | Task 6 候选验证 | checker `4a7ff33eb4136b6008359bb95428b1b5d062762f`；本交接候选另行提交 | checker 补齐四项 strict 发布原因码和 catalog 显式模式；最终独立 Spec/Quality 审查待 Controller 执行，最终审查及完成提交勾选保留未完成。 |
 
-Task 6 产品范围严格为七个路径：本结果、README、第三批计划、`rfc_spec.rb`、`rfc_spec_test.rb`、`check-catalog.rb`、`catalog_test.rb`。计划先补列漏记的四个 checker/test 路径；先提交 checker，再从该 clean HEAD fresh 验证，最后仅更新交接文档和候选状态。没有修改 RFC 正文、WBS、SQL、catalog/source/input、Rust/Cargo、HTML、CI/workflow、模板或 assets。
+Task 6 原始候选的产品范围为七个路径：本结果、README、第三批计划、`rfc_spec.rb`、`rfc_spec_test.rb`、`check-catalog.rb`、`catalog_test.rb`。计划先补列漏记的四个 checker/test 路径；先提交 checker，再从该 clean HEAD fresh 验证，最后仅更新交接文档和候选状态。该原始候选没有修改 RFC 正文、WBS、SQL、catalog/source/input、Rust/Cargo、HTML、CI/workflow、模板或 assets；后续修复波的独立范围见下文，不能把历史七文件限制误作整批当前范围。
+
+## 首次整批审查发现与修复波
+
+首次整批审查发现：ManualConfirmedNotDelivered 无合法业务终态收敛；四级 runtime milestone/
+program exit 缺少完整合同；Q4 外部兼容与 Q63 恰好 55 行正式追踪不足；activation 成功
+journal 的 ReasonCode 未精确绑定；Quality I1 的 CI gate 可被跳过/弱化执行仍误判；
+README 来源相对链接错误，交接结果的计数与 SHA 也需刷新。以下记录具体处置，
+不把自动 GREEN 升格为整批人工 PASS。
+
+| 波次 | 提交与范围 | 修复与复审边界 |
+| --- | --- | --- |
+| 修复波 1 | `77091b32b4850c80f3a9eb4dae2cc00f33ddfebc`；RFC、SQL、RFC validator/test | NotDelivered 与原 decision/authority/audit/CAS 绑定、成功 activation reason、四级 milestone、外部兼容、55 行 trace。Controller 交接的限定复审为 Spec PASS / Quality PASS；不是整批 PASS。 |
+| 修复波 2 | `ec7025a2db4a35869995786fb6bb7a8cc5c62aa1`；validator/test 与 README | 原 Quality I1 的执行参数白名单和来源链接；README 不再复制过期测试计数。 |
+| 波 2 补充窄合同 | `3695997fded6334d386a7077fceedbaaacc57fcb`；validator/test | Controller 抽查后区分 job/step：固定 runner、拒绝继承/环境/超时与无效 job 覆盖；之后从该 clean HEAD 完整 fresh 验证。 |
+
+波 1 新增 NotDelivered 是业务终态，不改 durable 的 14 态，不推进游标、不授权重发，
+不算 Accepted/ProductionVerified 成功；仍保留 failure gate/指标及严格保留义务。
+旧不兼容 v1 signature 拒绝自动迁移。本波没有再改 SQL/RFC；下表 SHA 是波 1 修复后的当前字节。
+Foundation Ready、P0 Production Verified、Architecture Release Candidate、Program Production
+Verified 四级均未达到；文档 Implementation-Ready 与 runtime 四级分开且同样未达到。
+
+波 2 公开 CLI 首轮 RED 为 **25/86/23 failures**；修复后含原 strict 的 GREEN 为 **29/235**。
+补充窄合同另行 RED **11/44/11 failures**；最终 CI/strict 定向 GREEN **40/301**。
+所有反例走公开 CLI，缺 runner、job shell/uses、三层 env、timeout/container 等均可见拒绝。
+旧 echo/here-doc 等负例补上合法 runner，避免用缺 runner 的旁路失败掩盖原命令判断。
 
 ## 输入与规格制品
 
@@ -42,21 +67,21 @@ Task 6 产品范围严格为七个路径：本结果、README、第三批计划�
 | --- | --- |
 | catalog | `0aa6a2fd87ee9c235073cad3beef44229437f3fe62987b0db510ad36a93aace3` |
 | WBS | `d56486ebbb0bba116d7ffae5f428860544c441157db5e4978c67811c825d8d0f` |
-| SQL | `1da5cce2beb9baf21a6863893736a5bc070c319eb562eb9b3bf52954f5d8247d` |
-| RFC | `a3e109f45c60b73e96bc070e1b17c3496e3ba542336bce2a0ad003457883cd67` |
+| SQL | `4bac8e58caa2f5d2362137b5e96dd087649044f45484a1284dbd7e1fd7baa953` |
+| RFC | `36cd4d9e4db275ffd6eef5f3920feac0516acd52da5bbf166ab2236c67872ba8` |
 
 ## 从 clean checker HEAD fresh 验证
 
-验证根为隔离 worktree `push-reliability-20260905`，HEAD=`4a7ff33eb4136b6008359bb95428b1b5d062762f`；开始及全部内容验证结束时 `git status --short` 均为空。下面五个入口分别运行，未复用 Task 5 的 312/4011 输出，未运行旧 archive-writing 测试。
+验证根为隔离 worktree `push-reliability-20260905`，HEAD=`3695997fded6334d386a7077fceedbaaacc57fcb`；先提交代码再验证，开始及全部内容验证结束时 `git status --short` 均为空。下面五个入口分别运行，未复用 Task 5、Task 6 或修复波 1 的旧计数，未运行旧 archive-writing 测试。
 
 | 完整命令 | runs | assertions | failures | errors | skips | exit |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `ruby scripts/architecture-docs/test/rfc_inputs_test.rb` | 12 | 238 | 0 | 0 | 0 | 0 |
 | `ruby scripts/architecture-docs/test/source_catalog_test.rb` | 12 | 110 | 0 | 0 | 0 | 0 |
 | `ruby scripts/architecture-docs/test/catalog_test.rb` | 33 | 393 | 0 | 0 | 0 | 0 |
-| `ruby scripts/architecture-docs/test/rfc_spec_test.rb` | 194 | 3002 | 0 | 0 | 0 | 0 |
+| `ruby scripts/architecture-docs/test/rfc_spec_test.rb` | 266 | 3677 | 0 | 0 | 0 | 0 |
 | `ruby scripts/architecture-docs/test/wbs_test.rb` | 66 | 409 | 0 | 0 | 0 | 0 |
-| 合计 | **317** | **4152** | **0** | **0** | **0** | 全部 0 |
+| 合计 | **389** | **4827** | **0** | **0** | **0** | 全部 0 |
 
 | 完整命令 | fresh 结果 | exit |
 | --- | --- | ---: |
@@ -85,7 +110,7 @@ provisional path=docs/push-system/push-capability-catalog.v1.json
 provisional path=docs/push-system/push-evidence-manifest.v1.json
 ```
 
-RFC HTML 只检查已批准目标 `docs/push-system/push-system-implementation-rfc.html` 的存在与合法普通文件边界；目录、路径组件链接、悬空链接不算交付，不发明 HTML freshness。CI v1 解析 `.github/workflows/ci.yml` 的 jobs/steps，识别独立 `run: ruby scripts/architecture-docs/check.rb --check`（可用单命令 block scalar）；注释、prose、echo、其他 checker、here-document、无效 uses/run 组合或布尔 false step 不算门禁。本批没有创建统一 checker 或修改 workflow，也没有执行 GitHub Actions。
+RFC HTML 只检查已批准目标 `docs/push-system/push-system-implementation-rfc.html` 的存在与合法普通文件边界；目录、路径组件链接、悬空链接不算交付，不发明 HTML freshness。CI v1 解析 `.github/workflows/ci.yml`，仅接受窄静态合同：候选 job 的 runner 必须精确为非表达式 `ubuntu-latest`；job 仅允许 name/runs-on/if/continue-on-error/steps，step 仅允许 name/id/run/if/continue-on-error/shell。job/step 的 if 只能 absent 或布尔 true，continue-on-error 只能 absent 或布尔 false；step shell 只能 absent/bash/sh。workflow defaults/env、job uses/shell/working-directory/defaults/env/container/timeout 及 step env/timeout/working-directory 等覆盖均拒绝。run 仍必须是独立 `ruby scripts/architecture-docs/check.rb --check`，可用单命令 block scalar。注释、prose、echo、其他 checker、here-document 或无效 uses/run 不算门禁。该合同不解析通用 Actions 执行语义，不证明远端工作流已运行或已通过。本批没有创建统一 checker 或修改 workflow，也没有执行 GitHub Actions。
 
 内容错误保留原原因码并排在发布原因码之前，不被过滤、改名或归入预期失败；公开 CLI 回归直接证明 `rfc_counts_invalid` 可与四个 blocker 同时返回。draft 不追加上述四码。catalog 的 `--draft|--check` 互斥，重复模式/未知参数 exit 2；无 mode 的既有 strict 行为保留兼容。
 
@@ -93,14 +118,14 @@ Task 6 的真实 TDD 记录：RFC 四码测试 RED 为 1 run / 2 assertions / 1 
 
 ## SQLite、语法和数值复算
 
-fresh DDL 使用 `mktemp -d /private/tmp/task6-ddl.XXXXXX` 创建新目录，实际 DB 为 `/private/tmp/task6-ddl.q1ijHL/foundation.sqlite3`；下面两次 `/usr/bin/sqlite3 DB < 文件` 均 exit 0，未打开 `data/**` 数据库：
+fresh DDL 使用 Ruby 标准库 `Dir.mktmpdir('final-wave2-ddl')` 创建全新临时目录，`Open3.capture3('/usr/bin/sqlite3', db, stdin_data: sql)` 两次执行均 exit 0，未额外传 `-bail`；它与下面原始重定向调用等价，未打开任何现存或 `data/**` 数据库：
 
 ```sh
 set -e
-task6_dbdir=$(mktemp -d /private/tmp/task6-ddl.XXXXXX)
-/usr/bin/sqlite3 "$task6_dbdir/foundation.sqlite3" < docs/push-system/push-system-foundation.v1.sql
-/usr/bin/sqlite3 "$task6_dbdir/foundation.sqlite3" < docs/push-system/push-system-foundation.v1.sql
-/usr/bin/sqlite3 "$task6_dbdir/foundation.sqlite3" 'PRAGMA foreign_keys=ON; PRAGMA foreign_keys; PRAGMA integrity_check; SELECT count(*) FROM push_foundation_objects; SELECT type,count(*) FROM sqlite_master GROUP BY type; PRAGMA foreign_key_check;'
+wave2_dbdir=$(mktemp -d /private/tmp/final-wave2-ddl.XXXXXX)
+/usr/bin/sqlite3 "$wave2_dbdir/foundation.sqlite3" < docs/push-system/push-system-foundation.v1.sql
+/usr/bin/sqlite3 "$wave2_dbdir/foundation.sqlite3" < docs/push-system/push-system-foundation.v1.sql
+/usr/bin/sqlite3 "$wave2_dbdir/foundation.sqlite3" 'PRAGMA foreign_keys=ON; PRAGMA foreign_keys; PRAGMA integrity_check; SELECT count(*) FROM push_foundation_objects; SELECT type,count(*) FROM sqlite_master GROUP BY type; PRAGMA foreign_key_check;'
 ```
 
 输出：foreign_keys=`1`，integrity_check=`ok`，`push_foundation_objects` 登记数=`25`；sqlite_master 总计 table=6、index=11、trigger=18；foreign_key_check 无违规行。fresh RFC 全套测试还实际执行以下 SQLite 公开事务/约束证据，不以 DDL 关键词存在代替行为：
@@ -115,7 +140,7 @@ task6_dbdir=$(mktemp -d /private/tmp/task6-ddl.XXXXXX)
 | `test_activation_is_versioned_and_journal_is_an_independent_append_only_fact` | 非法 activation 跳转拒绝；新 generation 回滚，journal/manifest 不可改写。 |
 | `test_raw_sqlite_cli_guards_do_not_repair_or_change_incompatible_databases`、`test_sql_guard_oracles_detect_real_weakened_schema_mutants` | 原始 CLI 对不兼容 schema fail closed；真正移除 guard 的 schema mutant 使对应行为断言失败。 |
 
-语法命令为 `ruby -c FILE`，逐个覆盖 `scripts/architecture-docs/*.rb`、`scripts/architecture-docs/test/*_test.rb` 及两份导入 Ruby 快照，共 19 文件，全部 Syntax OK/exit 0。`JSON.parse(File.binread(path), decimal_class: BigDecimal)` 逐个解析 `docs/push-system/*.json` 共 5 文件，全部成功。`git diff --check` 通过。
+语法命令为 `ruby -c FILE`，逐个覆盖 `scripts/architecture-docs/*.rb`、`scripts/architecture-docs/test/*_test.rb` 及两份导入 Ruby 快照，共 19 文件，全部 Syntax OK/exit 0。`JSON.parse(File.binread(path), decimal_class: BigDecimal)` 逐个解析 `docs/push-system/*.json` 共 5 文件，全部成功。本波 `git diff --check 77091b3..HEAD` 通过；whole-batch 的冻结输入尾空格例外另见下文，不声称全批 diff-check 通过。
 
 另用 Ruby 标准库 `json/digest/bigdecimal` 只读复算：JSON 数值直接转精确 Rational，每行按 `(O+4M+P)/6`、半入两位检查；逐行求和、20% 汇总缓冲、依赖 DAG 递归最长路径及首批 rank 1--3 分别重算，SHA 用 `Digest::SHA256.file` 读取。没有修改 JSON 或调用 renderer 写模式。
 
@@ -133,11 +158,21 @@ task6_dbdir=$(mktemp -d /private/tmp/task6-ddl.XXXXXX)
 
 ## 工作区与样本保护
 
-隔离区执行 `git diff --exit-code 07781bf386aafdf202851ae928efee8920387058 HEAD -- src Cargo.toml Cargo.lock`：exit 0、零 diff。Task 6 相对 `d45dada` 的产品 diff 只含上述七文件；没有 SQL、`src/**/*.rs`、Cargo、生产状态或 CI 变更。
+隔离区执行 `git diff --exit-code 07781bf386aafdf202851ae928efee8920387058 HEAD -- src Cargo.toml Cargo.lock`：exit 0、零 diff。修复波 2 相对 `77091b32b4850c80f3a9eb4dae2cc00f33ddfebc` 的最终产品范围精确为 rfc_spec.rb、rfc_spec_test.rb、README 和本 results 四文件；本波未修改 SQL/RFC 正文、WBS、冻结输入、Rust/Cargo、HTML、workflow 或生产状态。
+
+本波 `git diff --check 77091b32b4850c80f3a9eb4dae2cc00f33ddfebc..HEAD` 返回 0。
+`git diff --check 288e8b2..HEAD` 返回 **2**，仅下列不可变输入的 **11 处既有 trailing whitespace**：
+
+- `docs/Project_Architecture_Blueprint.md`：3、4、5、6、7、1093、1094 行。
+- `docs/push-system/comprehensive-reanalysis-2026-09-05.md`：3、4、5、6 行。
+
+这些是冻结输入中的 Markdown 双空格换行，必须保持输入 manifest 的字节/SHA；未修剪、
+未放宽仓库规则，也未声称 whole-batch diff-check 通过。输入门禁逐项验证其原 SHA，
+本波新改文件正常通过 diff-check。
 
 原 root 工作区只读执行 `git diff --name-only --diff-filter=U | sort -u | wc -l`，前后均为 **160**；`git diff --binary HEAD -- src tests Cargo.toml Cargo.lock | shasum -a 256` 前后均为 `3b0f746129bcdd108680af75da354fe087c00f300416483fdcab01705b48064e`。没有暂存、解决或修改原工作区。
 
-以下四份样本只读取 SHA，开始与结束一致；其中 `data/g5b` 是 JSONL 保护样本，只计算字节摘要，没有解析或连接生产数据库：
+以下四份样本只读取 SHA，开始与结束一致；其中 root `data/g5b/2026-08-31.jsonl` 经 Controller 对该精确路径特别授权，只读取原始字节 SHA，未解析内容、枚举 data 或连接数据库；这是样本完整性核对，不是生产查询：
 
 | 工作区 / 样本 | 前后相同 SHA-256 |
 | --- | --- |
@@ -155,6 +190,6 @@ task6_dbdir=$(mktemp -d /private/tmp/task6-ddl.XXXXXX)
 - 蓝图 §24/§25 未去拟议化；通用 offline HTML builder、RFC HTML、统一 `check.rb` 与 CI 接线未交付。
 - 未部署，没有 `TransportAccepted`、用户已读、交易结果或收益改善证明；没有 provider/LLM/message/order 调用。
 - PaperBuy/Watchdog 仍是原混乱工作树排除项；原工作区 160 conflicts 未解决。
-- Task 1--5 定点独立复审已通过；独立整批审查待 Controller 执行。最终需核 Q1--Q108、硬化计划 Task 2 与本计划验收，关闭全部 Critical/Important，Minor 修复或明确记录接受理由与成本。
+- Task 1--5 与修复波 1 定点独立复审已通过；首轮整批已知发现均有修复和 fresh 证据，但最终整批复审仍待 Controller。不得据限定 PASS 或自动测试将第三批标为完成。
 
-本提交只准备候选交接。Controller 返回整批独立 Spec/Quality 结论后，原实现者才更新最终状态、剩余计划勾选并提交 `docs: complete push RFC and WBS batch`。未 merge、未 push、未 deploy，保留隔离 worktree。
+本提交仅刷新最终整批复审候选，使用 `docs: refresh push RFC final review candidate`。Controller 返回整批独立 Spec/Quality 结论后，才可按明确授权更新最终状态与计划；本波不写完成提交、不修改计划勾选。未 merge、未 push、未 deploy，保留隔离 worktree。
