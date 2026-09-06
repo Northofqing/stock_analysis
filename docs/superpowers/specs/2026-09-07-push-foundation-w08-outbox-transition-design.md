@@ -1,6 +1,6 @@
 # 推送 Foundation W08 Outbox 与 Append-only Transition 设计
 
-**状态：** 已批准、待 TDD 实现。W08 只建立未接生产的业务 intent repository；不接 monitor、scheduler、provider、sink、durable authority、finalizer 或生产数据库。
+**状态：** 已完成并通过 TDD、双轴 review 与 fresh 门禁；实现证据见 `docs/push-system/implementation-w08-results-2026-09-07.md`。W08 只建立未接生产的业务 intent repository；不接 monitor、scheduler、provider、sink、durable authority、finalizer 或生产数据库。
 
 **决策日期：** 2026-09-07
 
