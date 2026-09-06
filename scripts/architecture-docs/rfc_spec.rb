@@ -275,6 +275,23 @@ module ArchitectureDocs
       }
     }.freeze
     PERSISTENCE_CONTRACTS = {
+      '持久化条件组与兼容守卫（PROPOSED）' => {
+        header: ["规则","对象","规范值","依据"],
+        rows: [
+          ["decision_origin","job_decision_kind","Ready/NoData/Disabled 是不可变的初始业务决定"],
+          ["ready_group","prepared_push_bytes,rendered_bytes,payload_sha256,rendered_sha256","Ready 必须整组非空且不可变"],
+          ["non_send_group","prepared_push_bytes,rendered_bytes,payload_sha256,rendered_sha256","初始 NoData/Disabled 必须整组 NULL；隔离后仍保持 NULL"],
+          ["ready_non_send_state","Ready→NoData/Disabled","保留原 Ready 字节与哈希，不改变 job_decision_kind"],
+          ["edge_reason","push_intents.reason","仅允许业务转换表的逐边 ReasonCode，不接受同命名空间任意代码"],
+          ["event_reason","push_intent_transitions.reason","必须等于本次 CAS 后的 intent.reason"],
+          ["canonical_identifiers","intent_id,transition.event_id,promotion.event_id","64 位小写十六进制 TEXT；应用重算身份内容"],
+          ["hash_storage","Sha256/GitSha40","同时校验 TEXT 类型、字符长度、BLOB 字节长度与小写十六进制"],
+          ["compat_entry","SQLite CLI schema script",".bail on；持久化 DDL 前快照对象，不用事后补建掩盖缺失"],
+          ["compat_inventory","25 个明确 name/type","metadata 与保护 trigger 纳管；拒绝挂在纳管表上的额外 trigger/index；保留独立无关表"],
+          ["compat_trust","v1 固定兼容签名与冻结定义登记","比较已登记入口对象字节，不认证同时伪造 metadata 与保护对象的恶意管理员"]
+        ],
+        error: 'rfc_persistence_invariants_invalid'
+      },
       '业务 outbox 字节恢复合同（PROPOSED）' => {
         header: %w[规则 材料 规范值 依据],
         rows: [
@@ -293,14 +310,16 @@ module ArchitectureDocs
           ["None","NoData","应用","已验证为空且策略允许","插入版本零并保留空证据","伪造终态引用或推进通知游标","intent.no_data"],
           ["None","Disabled","应用","显式禁用且策略允许","插入版本零禁用事实","把未就绪当禁用或推进通知游标","policy.disabled"],
           ["PendingDispatch","AwaitingAuthority","dispatcher","有效 lease 与 expected-version CAS","同库 CAS 并追加事件","先发后存或新建逃逸身份","intent.dispatch_claimed"],
-          ["PendingDispatch","NoData","应用","冻结空证据与策略及版本 CAS","同库 CAS 并追加事件","把来源错误当空或推进通知游标","intent.no_data"],
-          ["PendingDispatch","Disabled","应用","显式禁用及版本 CAS","同库 CAS 并追加事件","清除待处理事实或推进通知游标","policy.disabled"],
+          ["PendingDispatch","NoData","应用","冻结空证据与策略及版本 CAS","同库 CAS 并追加事件；保留原 Ready 材料","把来源错误当空或推进通知游标","intent.no_data"],
+          ["PendingDispatch","Disabled","应用","显式禁用及版本 CAS","同库 CAS 并追加事件；保留原 Ready 材料","清除待处理事实或推进通知游标","policy.disabled"],
           ["AwaitingAuthority","AwaitingFinalizer","authority 适配器","私有重查精确绑定且策略允许","同库 CAS 并追加事件","仅凭日志或结果枚举晋级","intent.authority_verified"],
           ["AwaitingFinalizer","Completed","finalizer","再次精确绑定且策略允许及版本 CAS","同一事务执行完成事实 CAS 与事件","跨库原子性或跳过事件","finalizer.completed"],
           ["PendingDispatch/AwaitingAuthority/AwaitingFinalizer/Completed/NoData/Disabled","ResolutionRequired","应用或 finalizer","材料或版本冲突并以重读版本 CAS","保留原材料与终态历史并阻断 Unit 晋级","覆盖材料或撤销既有游标","intent.payload_conflict/intent.expected_version_conflict/finalizer.cas_conflict"],
           ["AwaitingAuthority/AwaitingFinalizer","ResolutionRequired","私有 authority 适配器","未知或人工不投递处置经重查且版本 CAS","隔离并保留原 decision 与处置证据","自动重发或自动推进通知游标","transport.uncertain/operator.resolution_conflict"],
-          ["ResolutionRequired","AwaitingFinalizer","已认证操作员与私有 authority 适配器","处置清除冲突且原身份精确接受绑定与策略及版本 CAS","保留处置证据并只恢复最终化资格","自动解封或再次发送","intent.authority_verified"],
-          ["PendingDispatch/AwaitingAuthority/AwaitingFinalizer/ResolutionRequired","SameState","lease 管理者","owner/until/generation 与版本 CAS","版本加一并追加事件","抢占未过期外来 lease","intent.lease_held/intent.dispatch_claimed"]
+          ["ResolutionRequired","AwaitingFinalizer","已认证操作员与私有 authority 适配器","Ready 来源且处置清除冲突与原身份精确接受绑定、策略及版本 CAS","保留处置证据并只恢复最终化资格","自动解封或再次发送","intent.authority_verified"],
+          ["PendingDispatch/AwaitingAuthority/AwaitingFinalizer/ResolutionRequired","SameState","lease 管理者","owner/until/generation 与版本 CAS","版本加一并追加事件","抢占未过期外来 lease","intent.lease_held/intent.dispatch_claimed"],
+          ["AwaitingAuthority","SameState","authority 恢复器","原 decision 与版本 CAS","仅记录拒绝或审计阻塞并追加事件","盲重发或提前最终化","transport.rejected/finalizer.terminal_ref_invalid"],
+          ["AwaitingFinalizer","SameState","finalizer","原绑定重查失败与版本 CAS","只保留阻塞原因并追加事件","推进完成或绕过重验","finalizer.terminal_ref_invalid"]
         ],
         error: 'rfc_business_protocol_invalid'
       },

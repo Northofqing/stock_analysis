@@ -269,6 +269,22 @@ class RfcSpecTest < Minitest::Test
     end
   end
 
+  def test_public_cli_rejects_weakened_persistence_invariant_profiles
+    changes = [
+      ['Ready 必须整组非空且不可变','Ready 可以缺少字节'],
+      ['初始 NoData/Disabled 必须整组 NULL；隔离后仍保持 NULL','非发送必须伪造 PreparedPush'],
+      ['必须等于本次 CAS 后的 intent.reason','允许任意事件 reason'],
+      ['.bail on；持久化 DDL 前快照对象，不用事后补建掩盖缺失','先补建再检查兼容'],
+      ['同时校验 TEXT 类型、字符长度、BLOB 字节长度与小写十六进制','只检查字符长度和 GLOB']
+    ]
+    changes.each do |before, after|
+      with_fixture do |root|
+        change_text(root) { |body| body.sub(before, after) }
+        assert_cli_error(root, 'rfc_persistence_invariants_invalid')
+      end
+    end
+  end
+
   def test_public_cli_rejects_sql_byte_hash_marker_and_fence_drift
     cases = [
       ['rfc_sql_bytes_mismatch', proc { |s| s.sub('-- PROPOSED：', '-- 注释变化：') }],
@@ -327,7 +343,85 @@ class RfcSpecTest < Minitest::Test
       refute_empty sql_ok(db, 'PRAGMA foreign_key_list(push_promotion_journal);')
       sql_ok(db, insert_intent)
       sql_ok(db, ddl)
-      assert_equal "intent-1|PendingDispatch|0\n", sql_ok(db, 'SELECT intent_id,state,version FROM push_intents;')
+      assert_equal "#{sha_id('intent-1')}|PendingDispatch|0\n", sql_ok(db, 'SELECT intent_id,state,version FROM push_intents;')
+    end
+  end
+
+  def test_initial_non_sending_facts_require_no_prepared_push_group
+    %w[NoData Disabled].each do |kind|
+      with_database do |db, ddl|
+        group = %w[prepared_push_bytes rendered_bytes payload_sha256 rendered_sha256].map { |key| [key, 'NULL'] }.to_h
+        values = group.merge('state'=>"'#{kind}'", 'reason'=>kind == 'NoData' ? "'intent.no_data'" : "'policy.disabled'")
+        values['job_decision_kind'] = "'#{kind}'"
+        sql_ok(db, insert_intent(values))
+        sql_ok(db, ddl)
+        assert_equal "#{kind}|1|1\n", sql_ok(db, 'SELECT state,prepared_push_bytes IS NULL,rendered_bytes IS NULL FROM push_intents;')
+      end
+    end
+  end
+
+  def test_business_transition_reason_must_match_intent_and_the_legal_edge
+    with_database do |db, _ddl|
+      sql_ok(db, insert_intent)
+      sql_rejected(db, "UPDATE push_intents SET previous_state=state,state='AwaitingAuthority',version=1,reason='policy.disabled';")
+    end
+  end
+
+  def test_event_reason_cannot_disagree_with_successful_business_cas
+    with_database do |db, _ddl|
+      seed_finalizer(db)
+      sql_rejected(db, "BEGIN IMMEDIATE; #{finalization_update} #{transition_sql('reason'=>"'policy.disabled'")} COMMIT;")
+      assert_equal "AwaitingFinalizer|2\n", sql_ok(db, 'SELECT state,version FROM push_intents;')
+    end
+  end
+
+  def test_ddl_rejects_an_existing_wrong_schema_version_without_changing_it
+    Dir.mktmpdir('rfc-sql-incompatible') do |dir|
+      db = File.join(dir, 'wrong.sqlite3')
+      sql_ok(db, "CREATE TABLE push_foundation_schema(version INTEGER,description TEXT); INSERT INTO push_foundation_schema VALUES(999,'wrong');")
+      sql_rejected(db, File.binread(File.join(ROOT, SQL)))
+      assert_equal "999|wrong\n", sql_ok(db, 'SELECT * FROM push_foundation_schema;')
+      assert_equal "0\n", sql_ok(db, "SELECT count(*) FROM sqlite_master WHERE name='push_intents';")
+    end
+  end
+
+  def test_ddl_rejects_a_weakened_same_name_trigger_before_touching_business_rows
+    with_database do |db, ddl|
+      sql_ok(db, insert_intent)
+      before = sql_ok(db, "SELECT sql FROM sqlite_master WHERE name='push_intents_immutable';")
+      sql_ok(db, 'DROP TRIGGER push_intents_immutable; CREATE TRIGGER push_intents_immutable BEFORE UPDATE ON push_intents BEGIN SELECT 1; END;')
+      refute_equal before, sql_ok(db, "SELECT sql FROM sqlite_master WHERE name='push_intents_immutable';")
+      sql_rejected(db, ddl)
+      assert_equal "PendingDispatch|0\n", sql_ok(db, 'SELECT state,version FROM push_intents;')
+    end
+  end
+
+  def test_hashes_reject_embedded_nul_and_non_text_values
+    with_database do |db, _ddl|
+      nul = "CAST(X'#{('a' * 64 + "\0Z").unpack1('H*')}' AS TEXT)"
+      refute_equal "'#{'a' * 64}'", nul
+      sql_rejected(db, insert_intent('payload_sha256'=>nul))
+      sql_rejected(db, insert_intent('payload_sha256'=>"X'#{('a' * 64).unpack1('H*')}'"))
+    end
+  end
+
+  def test_intent_and_event_identities_are_sha256_text_not_opaque_labels
+    with_database do |db, _ddl|
+      sql_rejected(db, insert_intent('intent_id'=>"'short-intent'"))
+    end
+  end
+
+  def test_transition_event_id_cannot_be_a_short_label
+    with_database do |db, _ddl|
+      seed_finalizer(db)
+      sql_rejected(db, "BEGIN IMMEDIATE; #{finalization_update} #{transition_sql('event_id'=>"'short-event'")} COMMIT;")
+    end
+  end
+
+  def test_promotion_event_id_cannot_be_a_short_label
+    with_database do |db, _ddl|
+      sql_ok(db, insert_manifest(1, 'Disabled'))
+      sql_rejected(db, insert_journal(1, 'Initialize', 'event_id'=>"'short-promotion'"))
     end
   end
 
@@ -346,6 +440,113 @@ class RfcSpecTest < Minitest::Test
         sql_rejected(db, insert_intent(field=>"X'42'").sub('INSERT INTO', 'INSERT OR REPLACE INTO'))
       end
       assert_equal expected, sql_ok(db, 'SELECT hex(prepared_push_bytes),hex(rendered_bytes) FROM push_intents;')
+    end
+  end
+
+  def test_non_send_group_is_complete_immutable_and_cannot_enter_send_finalization
+    %w[NoData Disabled].each do |kind|
+      with_database do |db, ddl|
+        group = %w[prepared_push_bytes rendered_bytes payload_sha256 rendered_sha256].map { |key| [key,'NULL'] }.to_h
+        values = group.merge('job_decision_kind'=>"'#{kind}'",'state'=>"'#{kind}'",
+          'reason'=>kind == 'NoData' ? "'intent.no_data'" : "'policy.disabled'")
+        sql_rejected(db, insert_intent(values.reject { |key, _| group.key?(key) }))
+        group.each_key do |field|
+          material = field.end_with?('_bytes') ? "X'42'" : "'#{'a' * 64}'"
+          sql_rejected(db, insert_intent(values.merge(field=>material)))
+          sql_rejected(db, insert_intent(field=>'NULL'))
+        end
+        sql_ok(db, insert_intent(values))
+        event = transition_sql('event_id'=>"'#{sha_id('non-send')}'",'from_state'=>"'#{kind}'",'to_state'=>"'ResolutionRequired'",
+          'expected_version'=>'0','result_version'=>'1','previous_sha256'=>'NULL','canonical_sha256'=>"'#{'1' * 64}'",
+          'reason'=>"'intent.payload_conflict'",'terminal_ref_id'=>'NULL','terminal_binding_sha256'=>'NULL')
+        sql_ok(db, "BEGIN IMMEDIATE; UPDATE push_intents SET previous_state=state,state='ResolutionRequired',version=1,reason='intent.payload_conflict',updated_at=2 WHERE version=0 AND lease_generation=0; #{event} COMMIT;")
+        sql_ok(db, ddl)
+        assert_equal "#{kind}|ResolutionRequired|1|1\n", sql_ok(db, 'SELECT job_decision_kind,state,prepared_push_bytes IS NULL,payload_sha256 IS NULL FROM push_intents;')
+        sql_rejected(db, "UPDATE push_intents SET previous_state=state,state='AwaitingFinalizer',version=2,reason='intent.authority_verified';")
+        sql_rejected(db, "UPDATE push_intents SET previous_state=state,state='Completed',version=2,reason='finalizer.completed';")
+        sql_rejected(db, "UPDATE push_intents SET previous_state=state,version=2,reason='intent.dispatch_claimed',job_decision_kind='Ready';")
+      end
+    end
+  end
+
+  def test_ready_derived_no_data_retains_the_original_material_and_reason_binding
+    with_database do |db, ddl|
+      sql_ok(db, insert_intent)
+      event = transition_sql('event_id'=>"'#{sha_id('ready-no-data')}'",'from_state'=>"'PendingDispatch'",'to_state'=>"'NoData'",
+        'expected_version'=>'0','result_version'=>'1','previous_sha256'=>'NULL','canonical_sha256'=>"'#{'1' * 64}'",
+        'reason'=>"'intent.no_data'",'terminal_ref_id'=>'NULL','terminal_binding_sha256'=>'NULL')
+      sql_ok(db, "BEGIN IMMEDIATE; UPDATE push_intents SET previous_state=state,state='NoData',version=1,reason='intent.no_data',updated_at=2 WHERE version=0; #{event} COMMIT;")
+      sql_ok(db, ddl)
+      assert_equal "Ready|NoData|7B7D|00FF\n", sql_ok(db, 'SELECT job_decision_kind,state,hex(prepared_push_bytes),hex(rendered_bytes) FROM push_intents;')
+      assert_equal "intent.no_data|intent.no_data\n", sql_ok(db, 'SELECT i.reason,t.reason FROM push_intents i JOIN push_intent_transitions t ON t.intent_id=i.intent_id AND t.result_version=i.version;')
+    end
+  end
+
+  def test_raw_sqlite_cli_guards_do_not_repair_or_change_incompatible_databases
+    cases = [
+      "DROP TRIGGER push_intents_immutable;",
+      "DROP TRIGGER push_foundation_objects_update; CREATE TRIGGER push_foundation_objects_update BEFORE UPDATE ON push_foundation_objects BEGIN SELECT 1; END;",
+      "CREATE TRIGGER extra_hook BEFORE UPDATE ON push_intents BEGIN SELECT 1; END;",
+      "CREATE INDEX extra_index ON push_intents(state);"
+    ]
+    cases.each do |mutation|
+      with_database do |db, ddl|
+        sql_ok(db, insert_intent)
+        before = sql_ok(db, "SELECT name,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name;")
+        sql_ok(db, mutation)
+        changed = sql_ok(db, "SELECT name,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name;")
+        refute_equal before, changed
+        # 等价于 sqlite3 TEMP_DB < file：没有 helper 的 -bail 或 PRAGMA 前缀。
+        out, err, result = Open3.capture3('/usr/bin/sqlite3', db, stdin_data: ddl)
+        refute_equal 0, result.exitstatus, out
+        assert_includes err, 'activation.manifest_mismatch'
+        assert_equal changed, sql_ok(db, "SELECT name,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name;")
+        assert_equal "PendingDispatch|0\n", sql_ok(db, 'SELECT state,version FROM push_intents;')
+      end
+    end
+    Dir.mktmpdir('rfc-sql-signature') do |dir|
+      db = File.join(dir, 'wrong-signature.sqlite3')
+      sql_ok(db, "CREATE TABLE push_foundation_schema(version INTEGER,description TEXT,schema_signature TEXT); INSERT INTO push_foundation_schema VALUES(1,'push-foundation-v1','#{'0' * 64}');")
+      before = sql_ok(db, 'SELECT name,sql FROM sqlite_master ORDER BY name;')
+      out, _err, result = Open3.capture3('/usr/bin/sqlite3', db, stdin_data: File.binread(File.join(ROOT, SQL)))
+      refute_equal 0, result.exitstatus, out
+      assert_equal before, sql_ok(db, 'SELECT name,sql FROM sqlite_master ORDER BY name;')
+    end
+  end
+
+  def test_raw_sqlite_cli_keeps_unrelated_legacy_tables_and_can_repeat_in_one_connection
+    Dir.mktmpdir('rfc-sql-legacy') do |dir|
+      db = File.join(dir, 'legacy.sqlite3')
+      sql_ok(db, "CREATE TABLE push_legacy(value TEXT); INSERT INTO push_legacy VALUES('preserve'); CREATE INDEX push_legacy_index ON push_legacy(value); CREATE TRIGGER push_legacy_trigger BEFORE UPDATE ON push_legacy BEGIN SELECT 1; END;")
+      ddl = File.binread(File.join(ROOT, SQL))
+      out, err, result = Open3.capture3('/usr/bin/sqlite3', db, stdin_data: ddl + ddl)
+      assert_equal 0, result.exitstatus, out + err
+      assert_equal "preserve\n", sql_ok(db, 'SELECT value FROM push_legacy;')
+      assert_equal "25\n", sql_ok(db, 'SELECT count(*) FROM push_foundation_objects;')
+    end
+  end
+
+  def test_every_persisted_hash_check_rejects_nul_and_blob_values
+    with_database do |db, _ddl|
+      definitions = sql_ok(db, "SELECT sql FROM sqlite_master WHERE type='table' AND name LIKE 'push_%';")
+      columns = definitions.lines.select { |line| line.match?(/^  (\w+_sha256|schema_signature|build_commit|intent_id|event_id) TEXT/) }
+      assert_operator columns.length, :>=, 23
+      columns.each_with_index do |line, index|
+        name = line.strip.split.first
+        declaration = line.strip.sub(/,\z/, '').sub(' PRIMARY KEY', '').sub(/ REFERENCES \w+\(\w+\)/, '')
+        length = name == 'build_commit' ? 40 : 64
+        valid = name == 'schema_signature' ? sql_ok(db, 'SELECT schema_signature FROM push_foundation_schema;').strip : 'a' * length
+        sql_ok(db, "CREATE TABLE hash_probe_#{index}(#{declaration});")
+        sql_ok(db, "INSERT INTO hash_probe_#{index} VALUES('#{valid}');")
+        nul = "CAST(X'#{(valid + "\0Z").unpack1('H*')}' AS TEXT)"
+        refute_equal "'#{valid}'", nul
+        sql_rejected(db, "INSERT INTO hash_probe_#{index} VALUES(#{nul});")
+        sql_rejected(db, "INSERT INTO hash_probe_#{index} VALUES(X'#{valid.unpack1('H*')}');")
+      end
+      %w[intent.created intent.dispatch_claimed].each do |reason|
+        sql_rejected(db, insert_intent('reason'=>"CAST(X'#{(reason + "\0hidden").unpack1('H*')}' AS TEXT)"))
+      end
+      sql_rejected(db, insert_intent('business_date'=>"CAST(X'#{("2026-09-06\0hidden").unpack1('H*')}' AS TEXT)"))
     end
   end
 
@@ -375,13 +576,13 @@ class RfcSpecTest < Minitest::Test
       %w[namespace unit_id completion_owner occurrence_key source_contract_id source_contract_sha256
          payload_sha256 rendered_sha256 evidence_sha256 template_sha256 durable_decision_id subject audience].each do |field|
         value = field.end_with?('sha256') ? "'#{'b' * 64}'" : "'changed'"
-        sql_rejected(db, "UPDATE push_intents SET #{field}=#{value},version=version+1,previous_state=state WHERE intent_id='intent-1';")
+        sql_rejected(db, "UPDATE push_intents SET #{field}=#{value},version=version+1,previous_state=state WHERE intent_id='#{sha_id('intent-1')}';")
       end
       drift = insert_intent('payload_sha256' => "'#{'b' * 64}'")
       refute_equal insert_intent, drift
       sql_rejected(db, drift)
       sql_rejected(db, drift.sub('INSERT INTO', 'INSERT OR REPLACE INTO'))
-      alias_identity = insert_intent('intent_id'=>"'other-id'", 'payload_sha256'=>"'#{'b' * 64}'")
+      alias_identity = insert_intent('intent_id'=>"'#{sha_id('other-id')}'", 'payload_sha256'=>"'#{'b' * 64}'")
       refute_equal drift, alias_identity
       sql_rejected(db, alias_identity.sub('INSERT INTO', 'INSERT OR REPLACE INTO'))
       assert_equal "#{'a' * 64}\n", sql_ok(db, 'SELECT payload_sha256 FROM push_intents;')
@@ -406,7 +607,7 @@ class RfcSpecTest < Minitest::Test
       [transition_sql('result_version' => '99'), transition_sql('canonical_sha256' => "'BAD'"),
        transition_sql('terminal_ref_id'=>'NULL','terminal_binding_sha256'=>'NULL'),
        transition_sql('previous_sha256'=>"'#{'f' * 64}'"),
-       transition_sql('event_id' => "'event-2'")].each do |event|
+       transition_sql('event_id' => "'#{sha_id('event-2')}'")].each do |event|
         refute_equal transition_sql, event
         sql_rejected(db, "BEGIN IMMEDIATE;\n#{finalization_update}\n#{event}\nCOMMIT;")
         assert_equal "AwaitingFinalizer|2\n", sql_ok(db, 'SELECT state,version FROM push_intents;')
@@ -440,13 +641,13 @@ class RfcSpecTest < Minitest::Test
   def test_lease_takeover_requires_expiry_generation_and_version_cas
     with_database do |db, _ddl|
       seed_finalizer(db)
-      sql_rejected(db, "UPDATE push_intents SET previous_state=state,version=version+1,lease_owner='other',lease_generation=2,lease_until=200,updated_at=5 WHERE version=2 AND lease_generation=1;")
-      sql_rejected(db, "UPDATE push_intents SET previous_state=state,version=version+1,lease_owner='other',lease_until=200,updated_at=100 WHERE version=2 AND lease_generation=1;")
-      sql_ok(db, "UPDATE push_intents SET previous_state=state,version=version+1,lease_owner='other',lease_generation=2,lease_until=200,updated_at=100 WHERE version=99 AND lease_generation=1;")
+      sql_rejected(db, "UPDATE push_intents SET reason='intent.dispatch_claimed',previous_state=state,version=version+1,lease_owner='other',lease_generation=2,lease_until=200,updated_at=5 WHERE version=2 AND lease_generation=1;")
+      sql_rejected(db, "UPDATE push_intents SET reason='intent.dispatch_claimed',previous_state=state,version=version+1,lease_owner='other',lease_until=200,updated_at=100 WHERE version=2 AND lease_generation=1;")
+      sql_ok(db, "UPDATE push_intents SET reason='intent.dispatch_claimed',previous_state=state,version=version+1,lease_owner='other',lease_generation=2,lease_until=200,updated_at=100 WHERE version=99 AND lease_generation=1;")
       assert_equal "finalizer|1|2\n", sql_ok(db, 'SELECT lease_owner,lease_generation,version FROM push_intents;')
       event = transition_sql('from_state'=>"'AwaitingFinalizer'",'to_state'=>"'AwaitingFinalizer'",
         'terminal_ref_id'=>'NULL','terminal_binding_sha256'=>'NULL','occurred_at'=>'100','reason'=>"'intent.dispatch_claimed'")
-      sql_ok(db, "BEGIN IMMEDIATE; UPDATE push_intents SET previous_state=state,version=version+1,lease_owner='other',lease_generation=2,lease_until=200,updated_at=100 WHERE version=2 AND lease_generation=1 AND lease_until<=100; #{event} COMMIT;")
+      sql_ok(db, "BEGIN IMMEDIATE; UPDATE push_intents SET reason='intent.dispatch_claimed',previous_state=state,version=version+1,lease_owner='other',lease_generation=2,lease_until=200,updated_at=100 WHERE version=2 AND lease_generation=1 AND lease_until<=100; #{event} COMMIT;")
       assert_equal "other|2|3\n", sql_ok(db, 'SELECT lease_owner,lease_generation,version FROM push_intents;')
     end
   end
@@ -472,13 +673,13 @@ class RfcSpecTest < Minitest::Test
       [['AwaitingFinalizer','ResolutionRequired','intent.payload_conflict'],
        ['ResolutionRequired','AwaitingFinalizer','intent.authority_verified']].each_with_index do |row, index|
         version = index + 3
-        event = transition_sql('event_id'=>"'event-#{version}'",'from_state'=>"'#{row[0]}'",'to_state'=>"'#{row[1]}'",
+        event = transition_sql('event_id'=>"'#{sha_id('event-' + version.to_s)}'",'from_state'=>"'#{row[0]}'",'to_state'=>"'#{row[1]}'",
           'expected_version'=>(version-1).to_s,'result_version'=>version.to_s,
           'previous_sha256'=>"'#{(version-1).to_s * 64}'",'canonical_sha256'=>"'#{version.to_s * 64}'",
           'actor'=>"'operator'",'reason'=>"'#{row[2]}'",'terminal_ref_id'=>'NULL','terminal_binding_sha256'=>'NULL','occurred_at'=>'10')
-        sql_ok(db, "BEGIN IMMEDIATE; UPDATE push_intents SET previous_state=state,state='#{row[1]}',version=version+1,reason='#{row[2]}',updated_at=10 WHERE intent_id='intent-1' AND version=#{version-1} AND lease_generation=1; #{event} COMMIT;")
+        sql_ok(db, "BEGIN IMMEDIATE; UPDATE push_intents SET previous_state=state,state='#{row[1]}',version=version+1,reason='#{row[2]}',updated_at=10 WHERE intent_id='#{sha_id('intent-1')}' AND version=#{version-1} AND lease_generation=1; #{event} COMMIT;")
       end
-      assert_equal "intent-1|decision-1|AwaitingFinalizer|4\n", sql_ok(db, 'SELECT intent_id,durable_decision_id,state,version FROM push_intents;')
+      assert_equal "#{sha_id('intent-1')}|decision-1|AwaitingFinalizer|4\n", sql_ok(db, 'SELECT intent_id,durable_decision_id,state,version FROM push_intents;')
       sql_rejected(db, "UPDATE push_intents SET previous_state=state,state='PendingDispatch',version=5;")
     end
   end
@@ -490,10 +691,10 @@ class RfcSpecTest < Minitest::Test
     mutants = {
       'missing_table' => [proc { |s| s.gsub('push_foundation_schema', 'absent_schema') },
                           proc { |db| assert_equal "1\n", sql_ok(db, 'SELECT version FROM push_foundation_schema;') }],
-      'illegal_state' => [proc { |s| s.gsub("'ResolutionRequired'", "'ResolutionRequired','Bogus'").sub("'PendingDispatch','NoData','Disabled'", "'PendingDispatch','NoData','Disabled','Bogus'") },
+      'illegal_state' => [proc { |s| s.gsub("'ResolutionRequired'", "'ResolutionRequired','Bogus'").sub("NEW.state='PendingDispatch'", "NEW.state IN ('PendingDispatch','Bogus')") },
                          proc { |db| sql_rejected(db, insert_intent('state'=>"'Bogus'")) }],
       'payload_overwrite' => [proc { |s| s.sub(/CREATE TRIGGER IF NOT EXISTS push_intents_immutable\n.*?END;\n/m, '') },
-                             proc { |db| sql_ok(db, insert_intent); sql_rejected(db, "UPDATE push_intents SET previous_state=state,version=1,payload_sha256='#{'b' * 64}';") }],
+                             proc { |db| sql_ok(db, insert_intent); sql_rejected(db, "UPDATE push_intents SET reason='intent.dispatch_claimed',previous_state=state,version=1,payload_sha256='#{'b' * 64}';") }],
       'journal_update' => [proc { |s| s.sub(/CREATE TRIGGER IF NOT EXISTS push_promotion_journal_update\n.*?END;\n/m, '') },
                           proc { |db| sql_ok(db, insert_manifest(1,'Disabled')); sql_ok(db, insert_journal(1,'Initialize')); sql_rejected(db, "UPDATE push_promotion_journal SET actor='forged';") }],
       'journal_delete' => [proc { |s| s.sub(/CREATE TRIGGER IF NOT EXISTS push_promotion_journal_delete\n.*?END;\n/m, '') },
@@ -504,6 +705,10 @@ class RfcSpecTest < Minitest::Test
     mutants.each do |name, pair|
       mutation, oracle = pair
       mutant = mutation.call(ddl)
+      removed = {'payload_overwrite'=>'push_intents_immutable', 'journal_update'=>'push_promotion_journal_update',
+                 'journal_delete'=>'push_promotion_journal_delete'}[name]
+      # 同时构造错误的首次登记清单，才能单独检验业务保护；真实已登记库另测拒绝漂移。
+      mutant = mutant.sub("  ('#{removed}','trigger'),\n", '') if removed
       refute_equal ddl, mutant, name
       Dir.mktmpdir('rfc-sql-mutant') do |dir|
         db = File.join(dir, 'mutant.sqlite3')
@@ -559,22 +764,26 @@ class RfcSpecTest < Minitest::Test
     refute_empty err
   end
 
+  def sha_id(label)
+    Digest::SHA256.hexdigest(label)
+  end
+
   def insert_row(table, values)
     "INSERT INTO #{table} (#{values.keys.join(',')}) VALUES (#{values.values.join(',')});"
   end
 
   def insert_intent(overrides = {})
-    values = {'intent_id'=>"'intent-1'",'namespace'=>"'test'",'unit_id'=>"'MU-p01'",'business_date'=>"'2026-09-06'",
+    values = {'intent_id'=>"'#{sha_id('intent-1')}'",'namespace'=>"'test'",'unit_id'=>"'MU-p01'",'business_date'=>"'2026-09-06'",
       'occurrence_family'=>"'preopen'",'occurrence_key'=>"'P01'",'completion_owner'=>"'owner-1'",
       'source_contract_id'=>"'source-v1'",'subject'=>"'market'",'audience'=>"'test'",'durable_decision_id'=>"'decision-1'",
-      'prepared_push_bytes'=>"X'7B7D'",'rendered_bytes'=>"X'00FF'",
+      'job_decision_kind'=>"'Ready'",'prepared_push_bytes'=>"X'7B7D'",'rendered_bytes'=>"X'00FF'",
       'state'=>"'PendingDispatch'",'reason'=>"'intent.created'",'created_at'=>'1','updated_at'=>'1'}
     %w[payload rendered evidence template source_contract].each { |name| values[name + '_sha256'] = "'#{'a' * 64}'" }
     insert_row('push_intents', values.merge(overrides))
   end
 
   def transition_sql(overrides = {})
-    values = {'event_id'=>"'event-3'",'intent_id'=>"'intent-1'",'from_state'=>"'AwaitingFinalizer'",'to_state'=>"'Completed'",
+    values = {'event_id'=>"'#{sha_id('event-3')}'",'intent_id'=>"'#{sha_id('intent-1')}'",'from_state'=>"'AwaitingFinalizer'",'to_state'=>"'Completed'",
       'expected_version'=>'2','result_version'=>'3','previous_sha256'=>"'#{'2' * 64}'",'canonical_sha256'=>"'#{'3' * 64}'",
       'actor'=>"'finalizer'",'reason'=>"'finalizer.completed'",'terminal_ref_id'=>"'ref-1'",
       'terminal_binding_sha256'=>"'#{'a' * 64}'",'occurred_at'=>'4'}
@@ -585,17 +794,17 @@ class RfcSpecTest < Minitest::Test
     sql_ok(db, insert_intent)
     [['PendingDispatch','AwaitingAuthority'], ['AwaitingAuthority','AwaitingFinalizer']].each_with_index do |pair, index|
       version = index + 1
-      event = transition_sql('event_id'=>"'event-#{version}'",'from_state'=>"'#{pair[0]}'",'to_state'=>"'#{pair[1]}'",
+      event = transition_sql('event_id'=>"'#{sha_id('event-' + version.to_s)}'",'from_state'=>"'#{pair[0]}'",'to_state'=>"'#{pair[1]}'",
         'expected_version'=>index.to_s,'result_version'=>version.to_s,'previous_sha256'=>index.zero? ? 'NULL' : "'#{'1' * 64}'",
         'canonical_sha256'=>"'#{version.to_s * 64}'",'terminal_ref_id'=>'NULL','terminal_binding_sha256'=>'NULL',
         'reason'=>index.zero? ? "'intent.dispatch_claimed'" : "'intent.authority_verified'")
       lease = index.zero? ? ",lease_owner='finalizer',lease_until=100,lease_generation=1" : ''
-      sql_ok(db, "BEGIN IMMEDIATE; UPDATE push_intents SET previous_state=state,state='#{pair[1]}',version=version+1,updated_at=#{version + 1}#{lease} WHERE version=#{index}; #{event} COMMIT;")
+      sql_ok(db, "BEGIN IMMEDIATE; UPDATE push_intents SET previous_state=state,state='#{pair[1]}',version=version+1,updated_at=#{version + 1},reason=#{index.zero? ? "'intent.dispatch_claimed'" : "'intent.authority_verified'"}#{lease} WHERE version=#{index}; #{event} COMMIT;")
     end
   end
 
   def finalization_update
-    "UPDATE push_intents SET previous_state=state,state='Completed',version=version+1,updated_at=4 WHERE intent_id='intent-1' AND state='AwaitingFinalizer' AND version=2 AND lease_owner='finalizer' AND lease_generation=1 AND lease_until>4;"
+    "UPDATE push_intents SET reason='finalizer.completed',previous_state=state,state='Completed',version=version+1,updated_at=4 WHERE intent_id='#{sha_id('intent-1')}' AND state='AwaitingFinalizer' AND version=2 AND lease_owner='finalizer' AND lease_generation=1 AND lease_until>4;"
   end
 
   def manifest_hash(generation)
@@ -612,7 +821,7 @@ class RfcSpecTest < Minitest::Test
   end
 
   def insert_journal(generation, action, overrides = {})
-    insert_row('push_promotion_journal', {'event_id'=>"'promotion-#{generation}'",'unit_id'=>"'MU-p01'",'generation'=>generation.to_s,
+    insert_row('push_promotion_journal', {'event_id'=>"'#{sha_id('promotion-' + generation.to_s)}'",'unit_id'=>"'MU-p01'",'generation'=>generation.to_s,
       'from_manifest_sha256'=>generation == 1 ? 'NULL' : "'#{manifest_hash(generation - 1)}'",
       'to_manifest_sha256'=>"'#{manifest_hash(generation)}'",'actor'=>"'operator'",'action'=>"'#{action}'",
       'window_start'=>'1','window_end'=>'100','evidence_sha256'=>"'#{'a' * 64}'",'occurred_at'=>'2',
