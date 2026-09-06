@@ -130,7 +130,7 @@ template_version
 
 调用方只能提供本次捕获值：`run_id`、business/calendar date、phase、trigger、`OccurrenceIdentityMaterial`、captured business time。factory 先验证 occurrence family 等于 binding 注册家族，再派生 RFC 所需的 `OccurrenceId`；已经散列的不透明 ID 不能反向证明它来自正确家族。Test namespace 内嵌的 run ID 还必须等于本次 `run_id`。factory 完成这些校验后构造 `RunContext`。
 
-`RunContextFactory::begin_capture` 返回 `PreparationCapture`，后者除公开可读的 `RunContext` 外，还私有保存 catalog 给出的预期 `source_contract_id`；这是必要的，因为 RFC 的 `RunContext` 只有 source-contract version、没有 ID。首次 captured facts 的 ID 和版本必须分别与这两个冻结值一致。
+`RunContextFactory::begin_capture` 消耗一个不可 Clone 的 factory 并返回同样不可 Clone 的 `PreparationCapture`，后者除公开可读的 `RunContext` 外，还私有保存 catalog 给出的预期 `source_contract_id`；这是必要的，因为 RFC 的 `RunContext` 只有 source-contract version、没有 ID。首次 captured facts 的 ID 和版本必须分别与这两个冻结值一致。
 
 W04 测试使用 crate-private catalog binding fixture；W06 实现正式 catalog lookup 并成为 factory 的唯一生产创建者。不得为了方便把 RFC 未声明的 `source_contract_id` 塞进 `RunContext` canonical 对象。
 
@@ -156,7 +156,7 @@ content_sha256
 
 ### 7.2 `SourceTime`
 
-字段：`source_ref_id` 和 `observed_at: Option<UtcMicros>`。列表必须与 `source_refs` 一一对应且顺序相同；未知时间编码为 `null`，绝不补当前时间。
+字段：`source_ref_id`、`kind: ObservedAt | AsOf` 和 `value: Option<UtcMicros>`。列表必须与 `source_refs` 一一对应且顺序相同；kind 保留 provider 时间的业务语义，未知值显式编码为 `null`，绝不补当前时间。
 
 ### 7.3 `ModelOutputRef`
 
@@ -174,7 +174,7 @@ protected_ref
 
 ### 7.4 exact facts bytes
 
-`ExactBytes` 是不可变字节容器。它不接受字符串归一化，不尝试重排 JSON，也不重新序列化；`facts_sha256` 直接对原始 bytes 求 SHA-256。外层 `PreparedFacts` canonical 对象只编码 bytes 长度和 SHA，符合 RFC“外部原始字节”规则。
+`ExactBytes` 是不可变字节容器。它不接受字符串归一化，不尝试重排 JSON，也不重新序列化；`facts_sha256` 直接对原始 bytes 求 SHA-256。外层 `PreparedFacts` canonical 对象只编码 bytes 长度和 SHA，符合 RFC“外部原始字节”规则。`Debug` 同样只显示长度和 SHA，禁止意外打印事实正文。
 
 ## 8. `CapturedFacts` 与 verified empty
 
@@ -223,7 +223,7 @@ acquisition 失败返回 `PreparationError::AcquisitionFailed { reason: ReasonCo
 Arc<PreparedFacts>
 ```
 
-它只提供只读 `facts()` 和 `shares_instance_with()`。clone 只增加引用计数；没有 `Arc<Mutex<_>>`、interior mutability 或重新构建入口。W17 可把同一 snapshot 分发给 active 与 shadow project。
+它只提供只读 `facts()` 和 `shares_instance_with()`。snapshot 的 `PartialEq` 也使用 `Arc::ptr_eq`，防止调用方把“值相等的两次捕获”误当成“同一实例”；事实值若需比较使用其 canonical SHA。clone 只增加引用计数；`PreparedFacts` 自身不可 Clone，没有 `Arc<Mutex<_>>`、interior mutability 或重新构建入口。W17 可把同一 snapshot 分发给 active 与 shadow project。
 
 ## 10. 单次捕获状态机
 
@@ -285,7 +285,7 @@ impl PreparationCapture {
 | `w04_run_context_golden_hash_is_stable` | 15 字段、trigger、null/数组规则形成固定 bytes/SHA；复用 W01 后 W01 golden 不变 |
 | `w04_run_context_rejects_catalog_binding_mismatch` | Unit/producer/source version/build/catalog/generation 不能由 caller 任意漂移 |
 | `w04_exact_bytes_hash_original_payload` | 空格、字段顺序、非 UTF-8 bytes 都按原字节求 SHA，不重写 |
-| `w04_source_times_are_total_ordered_and_allow_unknown` | 与 source ref 一一对应；None 保留；缺失/重复/错序拒绝 |
+| `w04_source_times_are_total_ordered_and_allow_unknown` | 与 source ref 一一对应；ObservedAt/AsOf 不混淆；None 保留；缺失/重复/错序拒绝 |
 | `w04_source_and_model_refs_are_frozen` | 顺序不变、重复拒绝、模型输入输出 hash/protected ref 一次冻结 |
 | `w04_failure_cannot_be_labeled_verified_empty` | acquisition failure 不产生 PreparedFacts；verified empty 必须有 evidence |
 | `w04_active_and_shadow_share_same_snapshot` | clone 后 `Arc::ptr_eq` 为 true，model refs 相同且无重算入口 |

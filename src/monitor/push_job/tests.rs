@@ -1091,11 +1091,17 @@ fn w04_exact_bytes_hash_the_original_payload_without_rewriting() {
         non_utf8.sha256().as_str(),
         "0fa3e62511779f0398b77cad37b3cc4763bb96253b91fcd61500f8a979ad9920"
     );
+
+    let sensitive = ExactBytes::new(b"portfolio-secret-fact".to_vec());
+    let debug = format!("{sensitive:?}");
+    assert!(!debug.contains("portfolio-secret-fact"));
+    assert!(debug.contains("len"));
+    assert!(debug.contains(sensitive.sha256().as_str()));
 }
 
 #[test]
 fn w04_source_times_are_total_ordered_and_preserve_unknown() {
-    use super::{SourceRefId, SourceTime};
+    use super::{SourceRefId, SourceTime, SourceTimeKind};
 
     let one = w04_source_ref("source-1", "auction-source", 'a');
     let two = w04_source_ref("source-2", "auction-source", 'b');
@@ -1105,24 +1111,32 @@ fn w04_source_times_are_total_ordered_and_preserve_unknown() {
         "auction-source-v2",
         vec![one.clone(), two.clone()],
         vec![
-            SourceTime::new(one.source_ref_id().clone(), Some(at)),
-            SourceTime::new(two.source_ref_id().clone(), None),
+            SourceTime::observed_at(one.source_ref_id().clone(), Some(at)),
+            SourceTime::as_of(two.source_ref_id().clone(), None),
         ],
         Vec::new(),
     )
     .expect("total ordered source times");
-    assert_eq!(valid.provider_observed_at()[0].observed_at(), Some(at));
-    assert_eq!(valid.provider_observed_at()[1].observed_at(), None);
+    assert_eq!(
+        valid.provider_observed_at()[0].kind(),
+        SourceTimeKind::ObservedAt
+    );
+    assert_eq!(valid.provider_observed_at()[0].value(), Some(at));
+    assert_eq!(valid.provider_observed_at()[1].kind(), SourceTimeKind::AsOf);
+    assert_eq!(valid.provider_observed_at()[1].value(), None);
 
     let malformed = [
-        vec![SourceTime::new(one.source_ref_id().clone(), Some(at))],
+        vec![SourceTime::observed_at(
+            one.source_ref_id().clone(),
+            Some(at),
+        )],
         vec![
-            SourceTime::new(two.source_ref_id().clone(), None),
-            SourceTime::new(one.source_ref_id().clone(), Some(at)),
+            SourceTime::as_of(two.source_ref_id().clone(), None),
+            SourceTime::observed_at(one.source_ref_id().clone(), Some(at)),
         ],
         vec![
-            SourceTime::new(one.source_ref_id().clone(), Some(at)),
-            SourceTime::new(
+            SourceTime::observed_at(one.source_ref_id().clone(), Some(at)),
+            SourceTime::as_of(
                 SourceRefId::try_new("unknown-source".to_owned()).expect("valid id"),
                 None,
             ),
@@ -1155,8 +1169,8 @@ fn w04_source_and_model_references_are_ordered_unique_and_frozen() {
         "auction-source-v2",
         vec![one.clone(), one.clone()],
         vec![
-            SourceTime::new(one.source_ref_id().clone(), None),
-            SourceTime::new(one.source_ref_id().clone(), None),
+            SourceTime::observed_at(one.source_ref_id().clone(), None),
+            SourceTime::observed_at(one.source_ref_id().clone(), None),
         ],
         Vec::new(),
     )
@@ -1165,7 +1179,7 @@ fn w04_source_and_model_references_are_ordered_unique_and_frozen() {
         "auction-source",
         "auction-source-v2",
         vec![one.clone()],
-        vec![SourceTime::new(one.source_ref_id().clone(), None)],
+        vec![SourceTime::observed_at(one.source_ref_id().clone(), None)],
         vec![first_model.clone(), first_model.clone()],
     )
     .is_err());
@@ -1178,8 +1192,8 @@ fn w04_source_and_model_references_are_ordered_unique_and_frozen() {
                 "auction-source-v2",
                 vec![two.clone(), one.clone()],
                 vec![
-                    SourceTime::new(two.source_ref_id().clone(), None),
-                    SourceTime::new(one.source_ref_id().clone(), None),
+                    SourceTime::as_of(two.source_ref_id().clone(), None),
+                    SourceTime::observed_at(one.source_ref_id().clone(), None),
                 ],
                 vec![second_model.clone(), first_model.clone()],
             )
@@ -1218,7 +1232,10 @@ fn w04_capture_rejects_source_contract_id_and_version_drift() {
                 source_contract_id,
                 source_contract_version,
                 vec![source.clone()],
-                vec![SourceTime::new(source.source_ref_id().clone(), None)],
+                vec![SourceTime::observed_at(
+                    source.source_ref_id().clone(),
+                    None,
+                )],
                 Vec::new(),
             )
             .expect("locally consistent facts"))
@@ -1238,13 +1255,12 @@ fn w04_verified_empty_requires_evidence_bound_to_context_and_source() {
 
     let mut capture = capture_fixture().expect("valid capture capability");
     let wrong_occurrence = derive_occurrence_id(&occurrence_material());
-    let wrong_evidence = super::VerifiedEmptyEvidenceRef::try_new(
+    let wrong_evidence = super::VerifiedEmptyEvidenceRef::new(
         wrong_occurrence,
         SourceContractId::try_new("auction-source".to_owned()).expect("valid source"),
         digest('e'),
         UtcMicros::try_new(1_788_743_100_000_002).expect("valid verified time"),
-    )
-    .expect("valid empty evidence shape");
+    );
     let source = w04_source_ref("source-empty", "auction-source", 'e');
     let result = capture.capture_once(|_| {
         Ok(CapturedFacts::try_new(
@@ -1253,7 +1269,10 @@ fn w04_verified_empty_requires_evidence_bound_to_context_and_source() {
                 .expect("valid source version"),
             vec![source.clone()],
             ExactBytes::new(br#"{"items":[]}"#.to_vec()),
-            vec![SourceTime::new(source.source_ref_id().clone(), None)],
+            vec![SourceTime::observed_at(
+                source.source_ref_id().clone(),
+                None,
+            )],
             FactsPresence::VerifiedEmpty(wrong_evidence),
             Vec::new(),
         )
@@ -1268,20 +1287,22 @@ fn w04_verified_empty_requires_evidence_bound_to_context_and_source() {
     let source = w04_source_ref("source-empty", "auction-source", 'e');
     let snapshot = capture
         .capture_once(|context| {
-            let evidence = super::VerifiedEmptyEvidenceRef::try_new(
+            let evidence = super::VerifiedEmptyEvidenceRef::new(
                 context.occurrence().clone(),
                 SourceContractId::try_new("auction-source".to_owned()).expect("valid source"),
                 digest('e'),
                 UtcMicros::try_new(1_788_743_100_000_002).expect("valid verified time"),
-            )
-            .expect("valid empty evidence shape");
+            );
             Ok(CapturedFacts::try_new(
                 SourceContractId::try_new("auction-source".to_owned()).expect("valid source"),
                 SourceContractVersion::try_new("auction-source-v2".to_owned())
                     .expect("valid source version"),
                 vec![source.clone()],
                 ExactBytes::new(br#"{"items":[]}"#.to_vec()),
-                vec![SourceTime::new(source.source_ref_id().clone(), None)],
+                vec![SourceTime::observed_at(
+                    source.source_ref_id().clone(),
+                    None,
+                )],
                 FactsPresence::VerifiedEmpty(evidence),
                 Vec::new(),
             )
@@ -1305,7 +1326,10 @@ fn w04_active_and_shadow_share_the_same_immutable_snapshot() {
                 "auction-source",
                 "auction-source-v2",
                 vec![source.clone()],
-                vec![SourceTime::new(source.source_ref_id().clone(), None)],
+                vec![SourceTime::observed_at(
+                    source.source_ref_id().clone(),
+                    None,
+                )],
                 vec![model.clone()],
             )
             .expect("valid facts"))
@@ -1313,6 +1337,7 @@ fn w04_active_and_shadow_share_the_same_immutable_snapshot() {
         .expect("first capture succeeds");
     let shadow = active.clone();
     assert!(active.shares_instance_with(&shadow));
+    assert_eq!(active, shadow);
     assert_eq!(
         active.facts().model_output_refs(),
         std::slice::from_ref(&model)
@@ -1321,6 +1346,29 @@ fn w04_active_and_shadow_share_the_same_immutable_snapshot() {
         shadow.facts().model_output_refs(),
         std::slice::from_ref(&model)
     );
+
+    let mut separate_capture = capture_fixture().expect("valid separate capability");
+    let separate = separate_capture
+        .capture_once(|_| {
+            Ok(w04_present_facts(
+                "auction-source",
+                "auction-source-v2",
+                vec![source.clone()],
+                vec![SourceTime::observed_at(
+                    source.source_ref_id().clone(),
+                    None,
+                )],
+                vec![model.clone()],
+            )
+            .expect("same value facts"))
+        })
+        .expect("separate capture succeeds");
+    assert_eq!(
+        active.facts().canonical_sha256(),
+        separate.facts().canonical_sha256()
+    );
+    assert!(!active.shares_instance_with(&separate));
+    assert_ne!(active, separate);
 }
 
 #[test]
@@ -1340,7 +1388,10 @@ fn w04_second_capture_is_rejected_before_the_external_call() {
                 "auction-source",
                 "auction-source-v2",
                 vec![source.clone()],
-                vec![SourceTime::new(source.source_ref_id().clone(), None)],
+                vec![SourceTime::observed_at(
+                    source.source_ref_id().clone(),
+                    None,
+                )],
                 Vec::new(),
             )
             .expect("valid facts"))

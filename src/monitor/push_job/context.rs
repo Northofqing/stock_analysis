@@ -201,7 +201,7 @@ pub(crate) struct RunContextInput {
     captured_business_time: UtcMicros,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct RunContextFactory {
     binding: CatalogRunBinding,
 }
@@ -253,7 +253,7 @@ impl RunContextFactory {
         &self.binding.source_contract_id
     }
 
-    pub(crate) fn begin_capture(&self, input: RunContextInput) -> Result<PreparationCapture> {
+    pub(crate) fn begin_capture(self, input: RunContextInput) -> Result<PreparationCapture> {
         let context = self.build_context(input)?;
         Ok(PreparationCapture::new(
             context,
@@ -285,7 +285,7 @@ fn trigger_matches(binding: &CatalogRunBinding, trigger: &Trigger) -> bool {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct RunContext {
     schema_version: u32,
     run_id: RunId,

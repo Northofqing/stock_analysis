@@ -530,18 +530,18 @@ pub struct VerifiedEmptyEvidenceRef {
 }
 
 impl VerifiedEmptyEvidenceRef {
-    pub fn try_new(
+    pub fn new(
         occurrence: OccurrenceId,
         source_contract_id: SourceContractId,
         evidence_sha256: Sha256Digest,
         verified_at: UtcMicros,
-    ) -> Result<Self> {
-        Ok(Self {
+    ) -> Self {
+        Self {
             occurrence,
             source_contract_id,
             evidence_sha256,
             verified_at,
-        })
+        }
     }
 
     pub fn occurrence(&self) -> &OccurrenceId {

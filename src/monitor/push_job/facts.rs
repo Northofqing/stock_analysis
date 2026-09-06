@@ -1,6 +1,7 @@
 //! W04 source-reference values. Prepared facts and the capture state are added in the next slice.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::sync::Arc;
 
 use super::canonical::{canonical_digest, raw_digest, CanonicalValue};
@@ -107,17 +108,42 @@ pub(super) fn source_ref_value(source_ref: &SourceRef) -> CanonicalValue {
     ]))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub enum SourceTimeKind {
+    ObservedAt,
+    AsOf,
+}
+
+impl SourceTimeKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ObservedAt => "ObservedAt",
+            Self::AsOf => "AsOf",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct SourceTime {
     source_ref_id: SourceRefId,
-    observed_at: Option<UtcMicros>,
+    kind: SourceTimeKind,
+    value: Option<UtcMicros>,
 }
 
 impl SourceTime {
-    pub fn new(source_ref_id: SourceRefId, observed_at: Option<UtcMicros>) -> Self {
+    pub fn observed_at(source_ref_id: SourceRefId, value: Option<UtcMicros>) -> Self {
         Self {
             source_ref_id,
-            observed_at,
+            kind: SourceTimeKind::ObservedAt,
+            value,
+        }
+    }
+
+    pub fn as_of(source_ref_id: SourceRefId, value: Option<UtcMicros>) -> Self {
+        Self {
+            source_ref_id,
+            kind: SourceTimeKind::AsOf,
+            value,
         }
     }
 
@@ -125,8 +151,12 @@ impl SourceTime {
         &self.source_ref_id
     }
 
-    pub fn observed_at(&self) -> Option<UtcMicros> {
-        self.observed_at
+    pub fn kind(&self) -> SourceTimeKind {
+        self.kind
+    }
+
+    pub fn value(&self) -> Option<UtcMicros> {
+        self.value
     }
 }
 
@@ -177,10 +207,20 @@ impl ModelOutputRef {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ExactBytes {
     bytes: Vec<u8>,
     sha256: Sha256Digest,
+}
+
+impl fmt::Debug for ExactBytes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExactBytes")
+            .field("len", &self.bytes.len())
+            .field("sha256", &self.sha256.as_str())
+            .finish()
+    }
 }
 
 impl ExactBytes {
@@ -330,7 +370,7 @@ fn validate_model_output_refs(model_output_refs: &[ModelOutputRef]) -> Result<()
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct PreparedFacts {
     run_context_sha256: Sha256Digest,
     source_contract_id: SourceContractId,
@@ -484,16 +524,18 @@ fn prepared_facts_fields(facts: &PreparedFacts) -> BTreeMap<&'static str, Canoni
 fn source_time_value(source_time: &SourceTime) -> CanonicalValue {
     CanonicalValue::Object(BTreeMap::from([
         (
-            "observed_at",
-            source_time
-                .observed_at
-                .map_or(CanonicalValue::Null, |time| {
-                    CanonicalValue::Unsigned(time.get() as u64)
-                }),
+            "kind",
+            CanonicalValue::String(source_time.kind.as_str().to_owned()),
         ),
         (
             "source_ref_id",
             CanonicalValue::String(source_time.source_ref_id.as_str().to_owned()),
+        ),
+        (
+            "value",
+            source_time.value.map_or(CanonicalValue::Null, |time| {
+                CanonicalValue::Unsigned(time.get() as u64)
+            }),
         ),
     ]))
 }
@@ -523,8 +565,16 @@ fn model_output_ref_value(model_output_ref: &ModelOutputRef) -> CanonicalValue {
     ]))
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct PreparedFactsSnapshot(Arc<PreparedFacts>);
+
+impl PartialEq for PreparedFactsSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.shares_instance_with(other)
+    }
+}
+
+impl Eq for PreparedFactsSnapshot {}
 
 impl PreparedFactsSnapshot {
     pub fn facts(&self) -> &PreparedFacts {
@@ -562,6 +612,13 @@ enum CaptureState {
     Failed,
 }
 
+/// A capture capability cannot be copied into a second provider/LLM call path.
+///
+/// ```compile_fail
+/// use stock_analysis::monitor::push_job::PreparationCapture;
+/// fn requires_clone<T: Clone>() {}
+/// requires_clone::<PreparationCapture>();
+/// ```
 #[derive(Debug)]
 pub struct PreparationCapture {
     context: RunContext,

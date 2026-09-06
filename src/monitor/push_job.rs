@@ -22,6 +22,7 @@ pub use facts::{
     CaptureStateView, CapturedFacts, ExactBytes, ExternalId, FactsPresence, ModelId,
     ModelOutputRef, ModelVersion, PreparationCapture, PreparationError, PreparedFacts,
     PreparedFactsSnapshot, ProtectedRef, SourceProvider, SourceRef, SourceRefId, SourceTime,
+    SourceTimeKind,
 };
 pub use identity::{
     derive_intent_id, derive_occurrence_id, derive_schedule_occurrence_id, AudienceId,

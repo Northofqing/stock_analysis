@@ -88,7 +88,7 @@ cargo test --lib monitor::push_job::tests::w04_run_context -- --nocapture
 **修改：** `tests.rs`，不先写实现。
 
 - [ ] `w04_exact_bytes_hash_original_payload`：用两组语义相近但字节不同的 JSON，以及包含非 UTF-8 的 bytes，断言 SHA 都按原字节且不同。
-- [ ] `w04_source_times_are_total_ordered_and_allow_unknown`：两 source refs 对应 Some/None；缺失、重复、错序、陌生 ID 全部拒绝。
+- [ ] `w04_source_times_are_total_ordered_and_allow_unknown`：两 source refs 对应 ObservedAt(Some)/AsOf(None)；时间语义保留，缺失、重复、错序、陌生 ID 全部拒绝。
 - [ ] `w04_source_and_model_refs_are_frozen`：读取顺序等于输入顺序；重复 source ID、重复 model ref 拒绝。
 - [ ] `w04_source_contract_binding_is_exact`：captured source ID 不等于 capture catalog binding、version 不等于 context，均失败且不产生 snapshot。
 - [ ] `w04_failure_cannot_be_labeled_verified_empty`：typed acquisition failure 保留原 ReasonCode；没有 snapshot/empty completion evidence。
@@ -107,14 +107,14 @@ cargo test --lib monitor::push_job::tests::w04_run_context -- --nocapture
 - [ ] 在 Task 2 的 SourceRef 基础上定义受校验 `ModelId`、`ModelVersion`、`ProtectedRef`；`SourceTime` 固定 source ref ID + `Option<UtcMicros>`。
 - [ ] `ModelOutputRef` 固定 model/version/input SHA/output SHA/protected ref。
 - [ ] `ExactBytes` 保存 `Vec<u8>` 并预先派生 SHA；只给只读 bytes/len/SHA。
-- [ ] `VerifiedEmptyEvidenceRef::try_new` 显式接 occurrence/source ID/evidence SHA/time；不提供 transport terminal 转换。
+- [ ] `VerifiedEmptyEvidenceRef::new` 显式接已经受校验的 occurrence/source ID/evidence SHA/time；不伪造失败分支，不提供 transport terminal 转换。
 - [ ] `CapturedFacts::try_new` 检查 source ID 唯一、有序 time 一一对应、source contracts 相等、model ref 无重复、empty evidence 局部绑定。
 
 ### 4.2 PreparedFacts 和 snapshot
 
 - [ ] 构造 `PreparedFacts` 时验证 captured source ID 等于 capture 私有 expected ID、version 等于 context version、empty evidence occurrence 等于 context occurrence。
 - [ ] 字段精确对应 RFC 9 行；facts SHA 来自 exact bytes；只读 getters 不暴露内部 Vec 可变引用。
-- [ ] `PreparedFactsSnapshot(Arc<_>)` 实现 Clone、`facts()` 和 `shares_instance_with()`。
+- [ ] `PreparedFactsSnapshot(Arc<_>)` 实现 Clone、`facts()` 和 `shares_instance_with()`；snapshot equality 等同 `Arc::ptr_eq`，PreparedFacts 自身不可 Clone。
 
 ### 4.3 capture 状态机
 
