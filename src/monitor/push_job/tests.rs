@@ -1737,3 +1737,397 @@ fn w05_projection_value_types_are_closed_and_validated() {
         }
     );
 }
+
+fn w05_verified_empty_projection_snapshot(
+) -> (super::DecisionProjector, super::PreparedFactsSnapshot) {
+    use super::facts::capture_fixture;
+    use super::projection::projector_fixture;
+
+    let mut capture = capture_fixture().expect("valid W05 empty capture capability");
+    let projector = projector_fixture(capture.context()).expect("valid empty projector");
+    let source = w04_source_ref("source-empty", "auction-source", 'e');
+    let snapshot = capture
+        .capture_once(|context| {
+            let evidence = super::VerifiedEmptyEvidenceRef::new(
+                context.occurrence().clone(),
+                SourceContractId::try_new("auction-source".to_owned()).unwrap(),
+                digest('e'),
+                UtcMicros::try_new(1_788_743_100_000_002).unwrap(),
+            );
+            Ok(super::CapturedFacts::try_new(
+                SourceContractId::try_new("auction-source".to_owned()).unwrap(),
+                SourceContractVersion::try_new("auction-source-v2".to_owned()).unwrap(),
+                vec![source.clone()],
+                super::ExactBytes::new(br#"{"items":[]}"#.to_vec()),
+                vec![super::SourceTime::observed_at(
+                    source.source_ref_id().clone(),
+                    None,
+                )],
+                super::FactsPresence::VerifiedEmpty(evidence),
+                Vec::new(),
+            )
+            .unwrap())
+        })
+        .expect("verified empty captured once");
+    (projector, snapshot)
+}
+
+fn w05_ready_preparation() -> super::ReadyPreparation {
+    let source = w04_source_ref("source-1", "auction-source", 'a');
+    let model = w04_model_ref("model-a", '2');
+    let (projector, snapshot) = w05_projection_snapshot(
+        vec![source.clone()],
+        vec![super::SourceTime::observed_at(
+            source.source_ref_id().clone(),
+            None,
+        )],
+        vec![model],
+    );
+    projector
+        .prepare_ready(snapshot, w05_semantic_input())
+        .expect("eligible non-empty facts can prepare Ready")
+}
+
+#[test]
+fn w05_prepared_push_binds_all_fields_and_first_exact_rendered_bytes() {
+    use std::cell::Cell;
+
+    let calls = Cell::new(0_u64);
+    let mut preparation = w05_ready_preparation();
+    let semantic_sha = preparation.projection().sha256().clone();
+    let decision = preparation
+        .render_once(|projection| {
+            calls.set(calls.get() + 1);
+            assert_eq!(projection.sha256(), &semantic_sha);
+            b"auction card  \nline two\n".to_vec()
+        })
+        .expect("first UTF-8 render seals Ready");
+    assert_eq!(calls.get(), 1);
+    assert_eq!(preparation.state(), super::RenderStateView::Sealed);
+    assert_eq!(preparation.attempt_count(), 1);
+    assert_eq!(preparation.rejected_count(), 0);
+
+    let push = match decision.view() {
+        super::JobDecisionView::Ready(push) => push,
+        other => panic!("expected Ready, got {other:?}"),
+    };
+    assert_eq!(push.unit_id().as_str(), "MU-auction");
+    assert_eq!(push.occurrence(), preparation.projection().occurrence());
+    assert_eq!(push.subject(), preparation.projection().business_subject());
+    assert_eq!(push.run_context_sha256(), preparation.run_context_sha256());
+    assert_eq!(
+        push.semantic_projection_sha256(),
+        preparation.projection().sha256()
+    );
+    assert_eq!(
+        push.source_binding().source_contract_id().as_str(),
+        "auction-source"
+    );
+    assert_eq!(
+        push.source_binding().source_contract_version().as_str(),
+        "auction-source-v2"
+    );
+    assert_eq!(push.source_binding().source_refs().len(), 1);
+    assert_eq!(
+        push.source_binding().evidence_fingerprint(),
+        preparation.projection().evidence_fingerprint()
+    );
+    assert_eq!(
+        push.rendered_bytes().as_bytes(),
+        b"auction card  \nline two\n"
+    );
+    assert_eq!(push.rendered_sha256(), push.rendered_bytes().sha256());
+    assert_eq!(
+        push.rendered_sha256().as_str(),
+        "W05_RENDERED_BYTES_GOLDEN_TO_BE_REPLACED"
+    );
+    assert_eq!(
+        push.intent_id(),
+        &derive_intent_id(&IntentIdentityMaterial::new(
+            Namespace::Production,
+            UnitId::try_new("MU-auction".to_owned()).unwrap(),
+            CompletionOwnerId::try_new("owner-auction".to_owned()).unwrap(),
+            SourceContractId::try_new("auction-source".to_owned()).unwrap(),
+            push.occurrence().clone(),
+            push.subject().clone(),
+            AudienceId::try_new("portfolio-owner".to_owned()).unwrap(),
+        ))
+    );
+    assert_eq!(
+        push.decision_id().as_str(),
+        "W05_DECISION_ID_GOLDEN_TO_BE_REPLACED"
+    );
+    assert_eq!(decision.canonical_sha256(), decision.canonical_sha256());
+}
+
+#[test]
+fn w05_second_render_and_replay_never_execute_another_renderer() {
+    use std::cell::Cell;
+
+    let calls = Cell::new(0_u64);
+    let mut preparation = w05_ready_preparation();
+    let decision = preparation
+        .render_once(|_| {
+            calls.set(calls.get() + 1);
+            b"first immutable payload".to_vec()
+        })
+        .unwrap();
+    let second = preparation.render_once(|_| {
+        calls.set(calls.get() + 1);
+        panic!("second renderer must not execute")
+    });
+    assert!(matches!(
+        second,
+        Err(super::ProjectionError::RenderAlreadyAttempted {
+            state: super::RenderStateView::Sealed,
+        })
+    ));
+    assert_eq!(preparation.attempt_count(), 1);
+    assert_eq!(preparation.rejected_count(), 1);
+
+    for _ in 0..3 {
+        let push = match decision.view() {
+            super::JobDecisionView::Ready(push) => push,
+            _ => unreachable!(),
+        };
+        assert_eq!(push.replay_rendered_bytes(), b"first immutable payload");
+    }
+    assert_eq!(calls.get(), 1);
+}
+
+#[test]
+fn w05_invalid_utf8_and_renderer_panic_keep_render_capability_closed() {
+    use std::cell::Cell;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    let calls = Cell::new(0_u64);
+    let mut invalid = w05_ready_preparation();
+    let error = invalid
+        .render_once(|_| {
+            calls.set(calls.get() + 1);
+            vec![0xff, 0xfe]
+        })
+        .unwrap_err();
+    assert_eq!(error, super::ProjectionError::RenderedBytesNotUtf8);
+    assert_eq!(invalid.state(), super::RenderStateView::Failed);
+    assert!(invalid
+        .render_once(|_| panic!("failed render must stay closed"))
+        .is_err());
+
+    let mut panicking = w05_ready_preparation();
+    let unwind = catch_unwind(AssertUnwindSafe(|| {
+        let _: std::result::Result<super::JobDecision, super::ProjectionError> = panicking
+            .render_once(|_| {
+                calls.set(calls.get() + 1);
+                panic!("fixture renderer panic")
+            });
+    }));
+    assert!(unwind.is_err());
+    assert_eq!(panicking.state(), super::RenderStateView::Rendering);
+    assert!(panicking
+        .render_once(|_| panic!("panicked render must stay closed"))
+        .is_err());
+    assert_eq!(calls.get(), 2);
+}
+
+#[test]
+fn w05_same_intent_payload_drift_requires_resolution_without_new_identity() {
+    use super::facts::capture_fixture;
+    use super::projection::projector_fixture;
+
+    let mut capture = capture_fixture().unwrap();
+    let first_projector = projector_fixture(capture.context()).unwrap();
+    let second_projector = projector_fixture(capture.context()).unwrap();
+    let source = w04_source_ref("source-1", "auction-source", 'a');
+    let snapshot = capture
+        .capture_once(|_| {
+            Ok(w04_present_facts(
+                "auction-source",
+                "auction-source-v2",
+                vec![source.clone()],
+                vec![super::SourceTime::observed_at(
+                    source.source_ref_id().clone(),
+                    None,
+                )],
+                Vec::new(),
+            )
+            .unwrap())
+        })
+        .unwrap();
+    let mut first = first_projector
+        .prepare_ready(snapshot.clone(), w05_semantic_input())
+        .unwrap();
+    let mut second = second_projector
+        .prepare_ready(snapshot, w05_semantic_input())
+        .unwrap();
+    let first_decision = first.render_once(|_| b"payload-one".to_vec()).unwrap();
+    let second_decision = second.render_once(|_| b"payload-two".to_vec()).unwrap();
+    let first_push = match first_decision.view() {
+        super::JobDecisionView::Ready(push) => push,
+        _ => unreachable!(),
+    };
+    let second_push = match second_decision.view() {
+        super::JobDecisionView::Ready(push) => push,
+        _ => unreachable!(),
+    };
+    assert_eq!(first_push.intent_id(), second_push.intent_id());
+    assert_eq!(first_push.decision_id(), second_push.decision_id());
+    assert_eq!(
+        first_push.compare_immutable(second_push),
+        super::PreparedPushComparison::ResolutionRequired {
+            reason: ReasonCode::IntentPayloadConflict,
+        }
+    );
+    assert_eq!(
+        first_push.compare_immutable(first_push),
+        super::PreparedPushComparison::Identical
+    );
+}
+
+#[test]
+fn w05_job_decision_has_exact_seven_typed_branches() {
+    let (no_data_projector, empty) = w05_verified_empty_projection_snapshot();
+    let expected_empty_evidence = empty.facts().canonical_sha256();
+    let no_data = no_data_projector
+        .decide_no_data(&empty, ReasonCode::IntentNoData)
+        .unwrap();
+    assert!(matches!(
+        no_data.view(),
+        super::JobDecisionView::NoData {
+            reason: ReasonCode::IntentNoData,
+            evidence_sha256,
+        } if evidence_sha256 == &expected_empty_evidence
+    ));
+
+    let new_projector = || {
+        use super::context::{context_fixture, ContextFixtureCase};
+        use super::projection::projector_fixture;
+        let context = context_fixture(ContextFixtureCase::ValidScheduled).unwrap();
+        projector_fixture(&context).unwrap()
+    };
+    let disabled = new_projector()
+        .decide_disabled(ReasonCode::PolicyDisabled)
+        .unwrap();
+    assert!(matches!(
+        disabled.view(),
+        super::JobDecisionView::Disabled {
+            reason: ReasonCode::PolicyDisabled,
+        }
+    ));
+    let blocked = new_projector()
+        .decide_blocked_on_input(
+            ReasonCode::InputSourceUnavailable,
+            Some(UtcMicros::try_new(1_788_743_200_000_000).unwrap()),
+        )
+        .unwrap();
+    assert!(matches!(
+        blocked.view(),
+        super::JobDecisionView::BlockedOnInput {
+            reason: ReasonCode::InputSourceUnavailable,
+            retry_after: Some(value),
+        } if value.get() == 1_788_743_200_000_000
+    ));
+
+    let source = w04_source_ref("source-1", "auction-source", 'a');
+    let (suppressed_projector, suppressed_facts) = w05_projection_snapshot(
+        vec![source.clone()],
+        vec![super::SourceTime::observed_at(
+            source.source_ref_id().clone(),
+            None,
+        )],
+        Vec::new(),
+    );
+    let eligible_after = UtcMicros::try_new(1_788_743_300_000_000).unwrap();
+    let suppressed = suppressed_projector
+        .decide_suppressed(
+            &suppressed_facts,
+            super::SemanticInput::new(
+                SubjectId::Global,
+                super::Severity::Info,
+                super::Suppression::suppressed(
+                    ReasonCode::PolicyCooldownActive,
+                    Some(eligible_after),
+                ),
+            ),
+        )
+        .unwrap();
+    assert!(matches!(
+        suppressed.view(),
+        super::JobDecisionView::Suppressed {
+            reason: ReasonCode::PolicyCooldownActive,
+            eligible_after: Some(value),
+        } if value == eligible_after
+    ));
+    let retryable = new_projector()
+        .decide_retryable_failure(ReasonCode::InputSourceUnready, None)
+        .unwrap();
+    assert!(matches!(
+        retryable.view(),
+        super::JobDecisionView::RetryableFailure {
+            reason: ReasonCode::InputSourceUnready,
+            retry_after: None,
+        }
+    ));
+    let permanent = new_projector()
+        .decide_permanent_failure(ReasonCode::InputNamespaceViolation)
+        .unwrap();
+    assert!(matches!(
+        permanent.view(),
+        super::JobDecisionView::PermanentFailure {
+            reason: ReasonCode::InputNamespaceViolation,
+        }
+    ));
+
+    let mut ready_preparation = w05_ready_preparation();
+    let ready = ready_preparation
+        .render_once(|_| b"ready".to_vec())
+        .unwrap();
+    assert!(matches!(ready.view(), super::JobDecisionView::Ready(_)));
+    for decision in [no_data, disabled, blocked, suppressed, retryable, permanent] {
+        assert_eq!(decision.canonical_sha256(), decision.canonical_sha256());
+    }
+}
+
+#[test]
+fn w05_no_data_ready_and_suppressed_cannot_cross_fact_boundaries() {
+    let source = w04_source_ref("source-1", "auction-source", 'a');
+    let (present_projector, present) = w05_projection_snapshot(
+        vec![source.clone()],
+        vec![super::SourceTime::observed_at(
+            source.source_ref_id().clone(),
+            None,
+        )],
+        Vec::new(),
+    );
+    assert!(matches!(
+        present_projector.decide_no_data(&present, ReasonCode::IntentNoData),
+        Err(super::ProjectionError::NoDataRequiresVerifiedEmpty)
+    ));
+
+    let (empty_projector, empty) = w05_verified_empty_projection_snapshot();
+    assert!(matches!(
+        empty_projector.prepare_ready(empty, w05_semantic_input()),
+        Err(super::ProjectionError::VerifiedEmptyCannotBeReady)
+    ));
+
+    let source = w04_source_ref("source-1", "auction-source", 'a');
+    let (suppressed_projector, present) = w05_projection_snapshot(
+        vec![source.clone()],
+        vec![super::SourceTime::observed_at(
+            source.source_ref_id().clone(),
+            None,
+        )],
+        Vec::new(),
+    );
+    assert!(matches!(
+        suppressed_projector.prepare_ready(
+            present,
+            super::SemanticInput::new(
+                SubjectId::Global,
+                super::Severity::Info,
+                super::Suppression::suppressed(ReasonCode::PolicySuppressed, None),
+            ),
+        ),
+        Err(super::ProjectionError::SuppressedCannotBeReady)
+    ));
+}
