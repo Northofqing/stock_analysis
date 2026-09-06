@@ -218,6 +218,27 @@ impl VerifiedTerminalRef {
     pub fn into_delivery_result(self) -> DeliveryResult {
         DeliveryResult::from_verified_terminal(self)
     }
+
+    pub(crate) fn same_stable_binding(&self, other: &Self) -> bool {
+        self.ref_id == other.ref_id
+            && self.authority_class == other.authority_class
+            && self.namespace == other.namespace
+            && self.decision_id == other.decision_id
+            && self.attempt_id == other.attempt_id
+            && self.intent_id == other.intent_id
+            && self.unit_id == other.unit_id
+            && self.occurrence == other.occurrence
+            && self.business_date == other.business_date
+            && self.subject == other.subject
+            && self.audience == other.audience
+            && self.template_id == other.template_id
+            && self.template_version == other.template_version
+            && self.rendered_sha256 == other.rendered_sha256
+            && self.terminal_disposition == other.terminal_disposition
+            && self.evidence_sha256 == other.evidence_sha256
+            && self.durable_schema_version == other.durable_schema_version
+            && self.binding_sha256 == other.binding_sha256
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

@@ -105,6 +105,19 @@ pub(crate) trait TerminalAuthorityPort {
     ) -> Result<AuthorityQuery, AuthorityQueryFailure>;
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct FinalizationTerminalRef(VerifiedTerminalRef);
+
+impl FinalizationTerminalRef {
+    pub(crate) fn verified_terminal(&self) -> &VerifiedTerminalRef {
+        &self.0
+    }
+
+    pub(crate) fn into_verified_terminal(self) -> VerifiedTerminalRef {
+        self.0
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum TerminalAuthorityError {
     #[error("business intent cannot provide an attested Ready terminal binding")]
@@ -131,6 +144,8 @@ pub(crate) enum TerminalAuthorityError {
     TerminalBindingHashMismatch,
     #[error("transport terminal disposition requires an attempt identity")]
     AttemptRequired,
+    #[error("terminal authority changed since its prior verification")]
+    PriorReferenceChanged,
 }
 
 pub(crate) fn verify_terminal(
@@ -243,6 +258,21 @@ pub(crate) fn verify_terminal(
             binding_sha256: computed_binding,
         },
     ))
+}
+
+pub(crate) fn reverify_for_finalization(
+    prior: &VerifiedTerminalRef,
+    snapshot: &IntentSnapshot,
+    template: &TerminalTemplateBinding,
+    policy: &CompletionPolicy,
+    authority: &dyn TerminalAuthorityPort,
+    verified_at: UtcMicros,
+) -> Result<FinalizationTerminalRef, TerminalAuthorityError> {
+    let fresh = verify_terminal(snapshot, template, policy, authority, verified_at)?;
+    if !prior.same_stable_binding(&fresh) {
+        return Err(TerminalAuthorityError::PriorReferenceChanged);
+    }
+    Ok(FinalizationTerminalRef(fresh))
 }
 
 fn check_binding<T: Eq>(
