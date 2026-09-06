@@ -1,6 +1,6 @@
 # 推送 Foundation W04 单次事实捕获设计
 
-**状态：** 已设计，待按测试先行实现；不接生产 caller、provider、LLM、数据库、sink 或 scheduler。
+**状态：** W04 已按测试先行实现并完成切片级验证；仍未接生产 caller、provider、LLM、数据库、sink 或 scheduler。实现证据见 `docs/push-system/implementation-w04-results-2026-09-07.md`；W05--W21 与 52 个 Migration Unit 仍未完成。
 
 **决策日期：** 2026-09-07
 
