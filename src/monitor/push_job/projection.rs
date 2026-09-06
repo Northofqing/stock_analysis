@@ -303,6 +303,13 @@ impl DecisionProjector {
         if facts.facts().run_context_sha256() != &self.run_context_sha256 {
             return Err(ProjectionError::ContextFactsMismatch);
         }
+        if let Suppression::Suppressed { reason, .. } = &input.suppression {
+            if !reason.is_suppression_reason() {
+                return Err(ProjectionError::ReasonNotAllowed {
+                    branch: "Suppression",
+                });
+            }
+        }
         Ok(SemanticProjection::new(self, facts.facts(), input))
     }
 
@@ -401,6 +408,11 @@ impl DecisionProjector {
         self,
         reason: ReasonCode,
     ) -> std::result::Result<JobDecision, ProjectionError> {
+        if !reason.is_permanent_preparation_failure() {
+            return Err(ProjectionError::ReasonNotAllowed {
+                branch: "PermanentFailure",
+            });
+        }
         Ok(JobDecision::new(JobDecisionKind::PermanentFailure {
             reason,
         }))
@@ -878,6 +890,10 @@ impl ReadyPreparation {
 
     pub fn run_context_sha256(&self) -> &Sha256Digest {
         &self.projector.run_context_sha256
+    }
+
+    pub fn prepared_facts_sha256(&self) -> Sha256Digest {
+        self.facts.facts().canonical_sha256()
     }
 
     pub fn render_once<F>(&mut self, render: F) -> std::result::Result<JobDecision, ProjectionError>

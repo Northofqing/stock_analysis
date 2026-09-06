@@ -1816,6 +1816,10 @@ fn w05_prepared_push_binds_all_fields_and_first_exact_rendered_bytes() {
     assert_eq!(push.subject(), preparation.projection().business_subject());
     assert_eq!(push.run_context_sha256(), preparation.run_context_sha256());
     assert_eq!(
+        push.prepared_facts_sha256(),
+        &preparation.prepared_facts_sha256()
+    );
+    assert_eq!(
         push.semantic_projection_sha256(),
         preparation.projection().sha256()
     );
@@ -1861,7 +1865,6 @@ fn w05_prepared_push_binds_all_fields_and_first_exact_rendered_bytes() {
         push.decision_id().as_str(),
         "d20eb0fd113dc403bdc2942e6ffe0b5626c2b53bffd731c0c33e5f6b1c9e854f"
     );
-    assert_eq!(decision.canonical_sha256(), decision.canonical_sha256());
 }
 
 #[test]
@@ -1909,10 +1912,13 @@ fn w05_invalid_utf8_and_renderer_panic_keep_render_capability_closed() {
     let error = invalid
         .render_once(|_| {
             calls.set(calls.get() + 1);
-            vec![0xff, 0xfe]
+            let mut bytes = b"rendered-secret".to_vec();
+            bytes.push(0xff);
+            bytes
         })
         .unwrap_err();
     assert_eq!(error, super::ProjectionError::RenderedBytesNotUtf8);
+    assert!(!format!("{error:?}").contains("rendered-secret"));
     assert_eq!(invalid.state(), super::RenderStateView::Failed);
     assert!(invalid
         .render_once(|_| panic!("failed render must stay closed"))
@@ -1942,6 +1948,7 @@ fn w05_same_intent_payload_drift_requires_resolution_without_new_identity() {
     let mut capture = capture_fixture().unwrap();
     let first_projector = projector_fixture(capture.context()).unwrap();
     let second_projector = projector_fixture(capture.context()).unwrap();
+    let third_projector = projector_fixture(capture.context()).unwrap();
     let source = w04_source_ref("source-1", "auction-source", 'a');
     let snapshot = capture
         .capture_once(|_| {
@@ -1985,6 +1992,36 @@ fn w05_same_intent_payload_drift_requires_resolution_without_new_identity() {
     assert_eq!(
         first_push.compare_immutable(first_push),
         super::PreparedPushComparison::Identical
+    );
+
+    let source = w04_source_ref("source-1", "auction-source", 'a');
+    let (_, third_snapshot) = w05_projection_snapshot(
+        vec![source.clone()],
+        vec![super::SourceTime::observed_at(
+            source.source_ref_id().clone(),
+            None,
+        )],
+        Vec::new(),
+    );
+    let mut third = third_projector
+        .prepare_ready(
+            third_snapshot,
+            super::SemanticInput::new(
+                SubjectId::Global,
+                super::Severity::Important,
+                super::Suppression::eligible(),
+            ),
+        )
+        .unwrap();
+    let third_decision = third.render_once(|_| b"payload-one".to_vec()).unwrap();
+    let third_push = match third_decision.view() {
+        super::JobDecisionView::Ready(push) => push,
+        _ => unreachable!(),
+    };
+    assert_ne!(first_push.intent_id(), third_push.intent_id());
+    assert_eq!(
+        first_push.compare_immutable(third_push),
+        super::PreparedPushComparison::DifferentIntent
     );
 }
 
@@ -2087,9 +2124,11 @@ fn w05_job_decision_has_exact_seven_typed_branches() {
         .render_once(|_| b"ready".to_vec())
         .unwrap();
     assert!(matches!(ready.view(), super::JobDecisionView::Ready(_)));
+    let mut decision_hashes = std::collections::BTreeSet::from([ready.canonical_sha256()]);
     for decision in [no_data, disabled, blocked, suppressed, retryable, permanent] {
-        assert_eq!(decision.canonical_sha256(), decision.canonical_sha256());
+        assert!(decision_hashes.insert(decision.canonical_sha256()));
     }
+    assert_eq!(decision_hashes.len(), 7);
 }
 
 #[test]
@@ -2133,5 +2172,40 @@ fn w05_no_data_ready_and_suppressed_cannot_cross_fact_boundaries() {
             ),
         ),
         Err(super::ProjectionError::SuppressedCannotBeReady)
+    ));
+
+    let source = w04_source_ref("source-1", "auction-source", 'a');
+    let (invalid_suppression_projector, present) = w05_projection_snapshot(
+        vec![source.clone()],
+        vec![super::SourceTime::observed_at(
+            source.source_ref_id().clone(),
+            None,
+        )],
+        Vec::new(),
+    );
+    assert!(matches!(
+        invalid_suppression_projector.project_semantics(
+            &present,
+            super::SemanticInput::new(
+                SubjectId::Global,
+                super::Severity::Info,
+                super::Suppression::suppressed(ReasonCode::TransportUncertain, None),
+            ),
+        ),
+        Err(super::ProjectionError::ReasonNotAllowed {
+            branch: "Suppression",
+        })
+    ));
+
+    use super::context::{context_fixture, ContextFixtureCase};
+    use super::projection::projector_fixture;
+    let context = context_fixture(ContextFixtureCase::ValidScheduled).unwrap();
+    assert!(matches!(
+        projector_fixture(&context)
+            .unwrap()
+            .decide_permanent_failure(ReasonCode::TransportUncertain),
+        Err(super::ProjectionError::ReasonNotAllowed {
+            branch: "PermanentFailure",
+        })
     ));
 }

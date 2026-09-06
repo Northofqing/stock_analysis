@@ -118,6 +118,20 @@ impl ReasonCode {
                 | Self::InputNamespaceViolation
         )
     }
+
+    pub(super) const fn is_suppression_reason(self) -> bool {
+        matches!(
+            self,
+            Self::PolicyCooldownActive | Self::PolicyDailyBudgetFull | Self::PolicySuppressed
+        )
+    }
+
+    pub(super) const fn is_permanent_preparation_failure(self) -> bool {
+        matches!(
+            self,
+            Self::InputEvidenceInvalid | Self::InputNamespaceViolation
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
