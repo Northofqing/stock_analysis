@@ -15,6 +15,8 @@ pub use migration::{FoundationMigrationError, FoundationSchemaMigration, Migrati
 pub use terminal_authority::TerminalTemplateBinding;
 
 #[cfg(test)]
+mod business_finalizer_tests;
+#[cfg(test)]
 mod terminal_authority_tests;
 #[cfg(test)]
 mod tests;

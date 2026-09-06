@@ -24,15 +24,15 @@ use crate::monitor::push_job::{
 };
 
 #[derive(Clone)]
-struct FakeAuthority {
-    descriptor: AuthorityDescriptor,
-    result: RefCell<Result<AuthorityQuery, AuthorityQueryFailure>>,
-    calls: Cell<usize>,
-    queried_decisions: RefCell<Vec<String>>,
+pub(super) struct FakeAuthority {
+    pub(super) descriptor: AuthorityDescriptor,
+    pub(super) result: RefCell<Result<AuthorityQuery, AuthorityQueryFailure>>,
+    pub(super) calls: Cell<usize>,
+    pub(super) queried_decisions: RefCell<Vec<String>>,
 }
 
 impl FakeAuthority {
-    fn terminal(record: AuthorityTerminalRecord) -> Self {
+    pub(super) fn terminal(record: AuthorityTerminalRecord) -> Self {
         Self {
             descriptor: AuthorityDescriptor {
                 authority_class: AuthorityClass::GenericCounted,
@@ -63,19 +63,20 @@ impl TerminalAuthorityPort for FakeAuthority {
     }
 }
 
-struct Fixture {
-    _root: tempfile::TempDir,
-    snapshot: IntentSnapshot,
-    template: TerminalTemplateBinding,
-    policy: crate::monitor::push_job::CompletionPolicy,
-    record: AuthorityTerminalRecord,
+pub(super) struct Fixture {
+    pub(super) _root: tempfile::TempDir,
+    pub(super) database: std::path::PathBuf,
+    pub(super) snapshot: IntentSnapshot,
+    pub(super) template: TerminalTemplateBinding,
+    pub(super) policy: crate::monitor::push_job::CompletionPolicy,
+    pub(super) record: AuthorityTerminalRecord,
 }
 
-fn digest(byte: char) -> Sha256Digest {
+pub(super) fn digest(byte: char) -> Sha256Digest {
     Sha256Digest::parse("w09 fixture", &byte.to_string().repeat(64)).unwrap()
 }
 
-fn fixture() -> Fixture {
+pub(super) fn fixture() -> Fixture {
     let template = TerminalTemplateBinding::new(
         TemplateId::try_new("auction-card".to_owned()).unwrap(),
         TemplateVersion::try_new("auction-card-v3".to_owned()).unwrap(),
@@ -142,6 +143,7 @@ fn fixture() -> Fixture {
 
     Fixture {
         _root: root,
+        database,
         snapshot,
         template,
         policy: w09_completion_policy_fixture(
