@@ -217,12 +217,12 @@ Git 历史和当前纳管文档只保留“旧 W01--W21 合计 98--142 小时”
 
 补列四个 checker/test 路径以闭合本任务既有的 strict 原因码与显式 `check-catalog --check` 验收。先提交最小门禁及测试，从该干净 HEAD fresh 验证后提交交接候选；独立整批审查由 Controller 执行，通过后才更新最终勾选并提交最终完成记录。
 
-- [ ] 从干净 HEAD fresh 运行所有 `scripts/architecture-docs/test/*_test.rb`；记录 test/assertion 数和退出码，不引用旧输出。
-- [ ] fresh 运行 `check-rfc-inputs`、`check-sources`、`check-catalog --draft`、`check-rfc --draft`、`render-catalog --check`、`render-wbs --check`；内容门禁全部通过。
-- [ ] 在临时目录执行 SQL 两次，验证 schema、CHECK、append-only trigger、CAS、foreign key 和 journal；确认未打开 `data/**`。
-- [ ] 运行全部本批 Ruby 文件 `ruby -c`、JSON parse、WBS 计数/依赖/总数、`git diff --check`。
-- [ ] `check-rfc --check` 明确检查发布层并使用稳定原因码：`rfc_status_provisional`、`wbs_status_provisional`、`rfc_html_missing`、`ci_rfc_gate_missing`；对应负例进入测试。现阶段 strict 只允许这些发布层原因码；`check-catalog --check` 只允许既有 catalog/manifest 两个 PROVISIONAL。任何内容、SHA、coverage、SQL、WBS 或 freshness 错误均不得归入预期失败。
-- [ ] 比较 `src/**/*.rs`、Cargo.toml、Cargo.lock 相对 `07781bf` 为零差异；比较原工作区 160 unmerged 数量和既有保护样本指纹不变。
+- [x] 从干净 HEAD fresh 运行所有 `scripts/architecture-docs/test/*_test.rb`；记录 test/assertion 数和退出码，不引用旧输出。
+- [x] fresh 运行 `check-rfc-inputs`、`check-sources`、`check-catalog --draft`、`check-rfc --draft`、`render-catalog --check`、`render-wbs --check`；内容门禁全部通过。
+- [x] 在临时目录执行 SQL 两次，验证 schema、CHECK、append-only trigger、CAS、foreign key 和 journal；确认未打开 `data/**`。
+- [x] 运行全部本批 Ruby 文件 `ruby -c`、JSON parse、WBS 计数/依赖/总数、`git diff --check`。
+- [x] `check-rfc --check` 明确检查发布层并使用稳定原因码：`rfc_status_provisional`、`wbs_status_provisional`、`rfc_html_missing`、`ci_rfc_gate_missing`；对应负例进入测试。现阶段 strict 只允许这些发布层原因码；`check-catalog --check` 只允许既有 catalog/manifest 两个 PROVISIONAL。任何内容、SHA、coverage、SQL、WBS 或 freshness 错误均不得归入预期失败。
+- [x] 比较 `src/**/*.rs`、Cargo.toml、Cargo.lock 相对 `07781bf` 为零差异；比较原工作区 160 unmerged 数量和既有保护样本指纹不变。
 - [ ] 最终独立 Spec 审查逐条核 Q1--Q108、硬化计划任务 2 和本计划验收；最终独立 Quality 审查接口深度、跨库恢复、SQL、WBS/周期和测试。所有 Critical/Important 必须关闭；Minor 必须修复或在结果中明确接受及成本。
 - [ ] README 只把第三批标成“RFC/WBS 规格完成”；结果文档必须列出运行时未改、HTML/CI/蓝图拆分未做、52 Unit 未迁移、未部署/未真实接收。
 - [ ] 提交 `docs: complete push RFC and WBS batch`。不 merge、不 push、不 deploy，不删除隔离 worktree。
