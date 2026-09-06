@@ -70,7 +70,7 @@ pub(crate) struct AuthorityTerminalRecord {
     pub(crate) authority_class: AuthorityClass,
     pub(crate) namespace: Namespace,
     pub(crate) decision_id: DecisionId,
-    pub(crate) attempt_id: Option<AttemptId>,
+    pub(crate) attempt_binding: AuthorityAttemptBinding,
     pub(crate) intent_id: IntentId,
     pub(crate) unit_id: UnitId,
     pub(crate) occurrence: OccurrenceId,
@@ -85,6 +85,29 @@ pub(crate) struct AuthorityTerminalRecord {
     pub(crate) evidence_sha256: Sha256Digest,
     pub(crate) durable_schema_version: DurableSchemaVersion,
     pub(crate) binding_sha256: Sha256Digest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AuthorityAttemptBinding {
+    Attempt(AttemptId),
+    ValidatedPreAttemptRejection,
+    ValidatedManualWithoutAttempt,
+}
+
+impl AuthorityAttemptBinding {
+    fn attempt_id(&self) -> Option<&AttemptId> {
+        match self {
+            Self::Attempt(attempt_id) => Some(attempt_id),
+            Self::ValidatedPreAttemptRejection | Self::ValidatedManualWithoutAttempt => None,
+        }
+    }
+
+    fn into_attempt_id(self) -> Option<AttemptId> {
+        match self {
+            Self::Attempt(attempt_id) => Some(attempt_id),
+            Self::ValidatedPreAttemptRejection | Self::ValidatedManualWithoutAttempt => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -140,10 +163,12 @@ pub(crate) enum TerminalAuthorityError {
     BindingMismatch { field: &'static str },
     #[error("terminal authority evidence bytes do not match their SHA-256")]
     EvidenceHashMismatch,
+    #[error("terminal authority evidence bytes are empty")]
+    EvidenceMissing,
     #[error("terminal authority binding does not match its canonical SHA-256")]
     TerminalBindingHashMismatch,
-    #[error("transport terminal disposition requires an attempt identity")]
-    AttemptRequired,
+    #[error("terminal disposition and attempt binding are incompatible")]
+    DispositionAttemptMismatch,
     #[error("terminal authority changed since its prior verification")]
     PriorReferenceChanged,
 }
@@ -218,17 +243,21 @@ pub(crate) fn verify_terminal(
         &expected.rendered_sha256,
     )?;
 
+    if record.evidence_bytes.is_empty() {
+        return Err(TerminalAuthorityError::EvidenceMissing);
+    }
     if raw_digest(&record.evidence_bytes) != record.evidence_sha256 {
         return Err(TerminalAuthorityError::EvidenceHashMismatch);
     }
-    if matches!(
-        record.terminal_disposition,
-        TerminalDisposition::Accepted
-            | TerminalDisposition::Rejected
-            | TerminalDisposition::Uncertain
-    ) && record.attempt_id.is_none()
-    {
-        return Err(TerminalAuthorityError::AttemptRequired);
+    match (&record.attempt_binding, record.terminal_disposition) {
+        (AuthorityAttemptBinding::Attempt(_), _)
+        | (AuthorityAttemptBinding::ValidatedPreAttemptRejection, TerminalDisposition::Rejected)
+        | (
+            AuthorityAttemptBinding::ValidatedManualWithoutAttempt,
+            TerminalDisposition::ManualConfirmedAccepted
+            | TerminalDisposition::ManualConfirmedNotDelivered,
+        ) => {}
+        _ => return Err(TerminalAuthorityError::DispositionAttemptMismatch),
     }
     let computed_binding = terminal_binding_sha256(&record);
     if computed_binding != record.binding_sha256 {
@@ -241,7 +270,7 @@ pub(crate) fn verify_terminal(
             authority_class: record.authority_class,
             namespace: record.namespace,
             decision_id: record.decision_id,
-            attempt_id: record.attempt_id,
+            attempt_id: record.attempt_binding.into_attempt_id(),
             intent_id: record.intent_id,
             unit_id: record.unit_id,
             occurrence: record.occurrence,
@@ -315,8 +344,8 @@ fn terminal_binding_fields(
         (
             "attempt_id",
             record
-                .attempt_id
-                .as_ref()
+                .attempt_binding
+                .attempt_id()
                 .map_or(CanonicalValue::Null, |id| {
                     CanonicalValue::String(id.as_str().to_owned())
                 }),

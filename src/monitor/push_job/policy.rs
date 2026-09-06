@@ -1029,12 +1029,14 @@ pub(super) fn try_policy_fixture(options: PolicyFixtureOptions) -> Result<Comple
 
 #[cfg(test)]
 pub(crate) fn w09_completion_policy_fixture(
+    unit_id: &'static str,
+    completion_owner: &'static str,
     allowed_authority: Vec<AuthorityClass>,
 ) -> CompletionPolicy {
     let mut options = fixture_policy_options();
-    options.unit_id = "MU-auction";
-    options.completion_owner = "owner-auction";
-    options.catalog_completion_owner = "owner-auction";
+    options.unit_id = unit_id;
+    options.completion_owner = completion_owner;
+    options.catalog_completion_owner = completion_owner;
     options.allowed_authority = allowed_authority;
     try_policy_fixture(options).expect("valid W09 completion policy fixture")
 }

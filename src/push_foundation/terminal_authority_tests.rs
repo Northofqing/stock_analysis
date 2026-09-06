@@ -1,16 +1,17 @@
 use std::cell::{Cell, RefCell};
 
 use crate::monitor::push_job::{
-    raw_digest, w08_prepared_push_fixture, w09_completion_policy_fixture, AttemptId, AudienceId,
-    AuthorityClass, BusinessDate, DecisionId, DeliveryResultView, DurableSchemaVersion, Namespace,
+    derive_intent_id, derive_occurrence_id, raw_digest, w08_prepared_push_fixture,
+    w09_completion_policy_fixture, AttemptId, AudienceId, AuthorityClass, BusinessDate, DecisionId,
+    DeliveryResultView, DurableSchemaVersion, IntentIdentityMaterial, Namespace, RunId,
     Sha256Digest, SubjectId, TemplateId, TemplateVersion, TerminalDisposition, TerminalRefId,
     UtcMicros,
 };
 
 use super::terminal_authority::{
     reverify_for_finalization, terminal_binding_preimage_for_test, terminal_binding_sha256,
-    verify_terminal, AuthorityDescriptor, AuthorityQuery, AuthorityQueryFailure,
-    AuthorityTerminalRecord, TerminalAuthorityError, TerminalAuthorityPort,
+    verify_terminal, AuthorityAttemptBinding, AuthorityDescriptor, AuthorityQuery,
+    AuthorityQueryFailure, AuthorityTerminalRecord, TerminalAuthorityError, TerminalAuthorityPort,
     TerminalTemplateBinding,
 };
 use super::{
@@ -119,7 +120,9 @@ fn fixture() -> Fixture {
         authority_class: AuthorityClass::GenericCounted,
         namespace: Namespace::Production,
         decision_id: prepared.decision_id().clone(),
-        attempt_id: Some(AttemptId::try_new("attempt-7".to_owned()).unwrap()),
+        attempt_binding: AuthorityAttemptBinding::Attempt(
+            AttemptId::try_new("attempt-7".to_owned()).unwrap(),
+        ),
         intent_id: prepared.intent_id().clone(),
         unit_id: prepared.unit_id().clone(),
         occurrence: prepared.occurrence().clone(),
@@ -141,7 +144,11 @@ fn fixture() -> Fixture {
         _root: root,
         snapshot,
         template,
-        policy: w09_completion_policy_fixture(vec![AuthorityClass::GenericCounted]),
+        policy: w09_completion_policy_fixture(
+            "MU-auction",
+            "owner-auction",
+            vec![AuthorityClass::GenericCounted],
+        ),
         record,
     }
 }
@@ -149,6 +156,12 @@ fn fixture() -> Fixture {
 #[test]
 fn w09_terminal_binding_has_exact_canonical_material_and_excludes_verified_at() {
     let fixture = fixture();
+    assert_eq!(
+        fixture.template.sha256(),
+        &raw_digest(
+            b"TemplateBinding/v1\0{\"template_id\":\"auction-card\",\"template_version\":\"auction-card-v3\"}"
+        )
+    );
     let record = fixture.record;
     let expected = format!(
         concat!(
@@ -313,6 +326,121 @@ fn w09_recomputes_evidence_and_declared_binding_instead_of_trusting_hashes() {
 }
 
 #[test]
+fn w09_every_business_expectation_field_is_compared_before_construction() {
+    let fixture = fixture();
+    let mutations: [(&str, fn(&mut AuthorityTerminalRecord)); 8] = [
+        ("namespace", |record| {
+            record.namespace = Namespace::test(RunId::try_new("wrong-run".to_owned()).unwrap());
+        }),
+        ("intent_id", |record| {
+            record.intent_id = derive_intent_id(&IntentIdentityMaterial::new(
+                Namespace::Production,
+                UnitId::try_new("MU-other".to_owned()).unwrap(),
+                CompletionOwnerId::try_new("owner-other".to_owned()).unwrap(),
+                SourceContractId::try_new("source-other".to_owned()).unwrap(),
+                record.occurrence.clone(),
+                record.subject.clone(),
+                record.audience.clone(),
+            ));
+        }),
+        ("unit_id", |record| {
+            record.unit_id = UnitId::try_new("MU-other".to_owned()).unwrap();
+        }),
+        ("occurrence", |record| {
+            record.occurrence = derive_occurrence_id(&OccurrenceIdentityMaterial::new(
+                BusinessDate::parse("2026-09-08").unwrap(),
+                OccurrenceFamily::try_new("auction-session".to_owned()).unwrap(),
+                OccurrenceKey::try_new("main".to_owned()).unwrap(),
+            ));
+        }),
+        ("business_date", |record| {
+            record.business_date = BusinessDate::parse("2026-09-08").unwrap();
+        }),
+        ("audience", |record| {
+            record.audience = AudienceId::try_new("other-audience".to_owned()).unwrap();
+        }),
+        ("template_id", |record| {
+            record.template_id = TemplateId::try_new("other-template".to_owned()).unwrap();
+        }),
+        ("template_version", |record| {
+            record.template_version = TemplateVersion::try_new("other-v1".to_owned()).unwrap();
+        }),
+    ];
+
+    for (field, mutate) in mutations {
+        let mut record = fixture.record.clone();
+        mutate(&mut record);
+        record.binding_sha256 = terminal_binding_sha256(&record);
+        let authority = FakeAuthority::terminal(record);
+        assert!(matches!(
+            verify_terminal(
+                &fixture.snapshot,
+                &fixture.template,
+                &fixture.policy,
+                &authority,
+                UtcMicros::try_new(1_788_743_101_000_000).unwrap(),
+            ),
+            Err(TerminalAuthorityError::BindingMismatch { field: actual }) if actual == field
+        ));
+    }
+
+    let mut wrong_schema = fixture.record;
+    wrong_schema.durable_schema_version =
+        DurableSchemaVersion::try_new("durable-v4".to_owned()).unwrap();
+    wrong_schema.binding_sha256 = terminal_binding_sha256(&wrong_schema);
+    let authority = FakeAuthority::terminal(wrong_schema);
+    assert!(matches!(
+        verify_terminal(
+            &fixture.snapshot,
+            &fixture.template,
+            &fixture.policy,
+            &authority,
+            UtcMicros::try_new(1_788_743_101_000_000).unwrap(),
+        ),
+        Err(TerminalAuthorityError::AuthorityDescriptorMismatch {
+            field: "durable_schema_version"
+        })
+    ));
+}
+
+#[test]
+fn w09_template_and_nonempty_evidence_are_independent_fail_closed_gates() {
+    let fixture = fixture();
+    let wrong_template = TerminalTemplateBinding::new(
+        TemplateId::try_new("other-template".to_owned()).unwrap(),
+        TemplateVersion::try_new("v1".to_owned()).unwrap(),
+    );
+    let authority = FakeAuthority::terminal(fixture.record.clone());
+    assert!(matches!(
+        verify_terminal(
+            &fixture.snapshot,
+            &wrong_template,
+            &fixture.policy,
+            &authority,
+            UtcMicros::try_new(1_788_743_101_000_000).unwrap(),
+        ),
+        Err(TerminalAuthorityError::TemplateBindingMismatch)
+    ));
+    assert_eq!(authority.calls.get(), 0);
+
+    let mut empty_evidence = fixture.record;
+    empty_evidence.evidence_bytes.clear();
+    empty_evidence.evidence_sha256 = raw_digest(&[]);
+    empty_evidence.binding_sha256 = terminal_binding_sha256(&empty_evidence);
+    let authority = FakeAuthority::terminal(empty_evidence);
+    assert!(matches!(
+        verify_terminal(
+            &fixture.snapshot,
+            &fixture.template,
+            &fixture.policy,
+            &authority,
+            UtcMicros::try_new(1_788_743_101_000_000).unwrap(),
+        ),
+        Err(TerminalAuthorityError::EvidenceMissing)
+    ));
+}
+
+#[test]
 fn w09_transport_requires_attempt_but_manual_terminal_stays_already_terminal() {
     for disposition in [
         TerminalDisposition::Accepted,
@@ -321,7 +449,7 @@ fn w09_transport_requires_attempt_but_manual_terminal_stays_already_terminal() {
     ] {
         let fixture = fixture();
         let mut record = fixture.record;
-        record.attempt_id = None;
+        record.attempt_binding = AuthorityAttemptBinding::ValidatedManualWithoutAttempt;
         record.terminal_disposition = disposition;
         record.binding_sha256 = terminal_binding_sha256(&record);
         let authority = FakeAuthority::terminal(record);
@@ -333,9 +461,29 @@ fn w09_transport_requires_attempt_but_manual_terminal_stays_already_terminal() {
                 &authority,
                 UtcMicros::try_new(1_788_743_101_000_000).unwrap(),
             ),
-            Err(TerminalAuthorityError::AttemptRequired)
+            Err(TerminalAuthorityError::DispositionAttemptMismatch)
         ));
     }
+
+    let pre_attempt_fixture = fixture();
+    let mut pre_attempt_rejection = pre_attempt_fixture.record;
+    pre_attempt_rejection.attempt_binding = AuthorityAttemptBinding::ValidatedPreAttemptRejection;
+    pre_attempt_rejection.terminal_disposition = TerminalDisposition::Rejected;
+    pre_attempt_rejection.binding_sha256 = terminal_binding_sha256(&pre_attempt_rejection);
+    let authority = FakeAuthority::terminal(pre_attempt_rejection);
+    assert!(matches!(
+        verify_terminal(
+            &pre_attempt_fixture.snapshot,
+            &pre_attempt_fixture.template,
+            &pre_attempt_fixture.policy,
+            &authority,
+            UtcMicros::try_new(1_788_743_101_000_000).unwrap(),
+        )
+        .unwrap()
+        .into_delivery_result()
+        .view(),
+        DeliveryResultView::TransportRejected(terminal) if terminal.attempt_id().is_none()
+    ));
 
     for disposition in [
         TerminalDisposition::ManualConfirmedAccepted,
@@ -343,7 +491,7 @@ fn w09_transport_requires_attempt_but_manual_terminal_stays_already_terminal() {
     ] {
         let fixture = fixture();
         let mut record = fixture.record;
-        record.attempt_id = None;
+        record.attempt_binding = AuthorityAttemptBinding::ValidatedManualWithoutAttempt;
         record.terminal_disposition = disposition;
         record.binding_sha256 = terminal_binding_sha256(&record);
         let authority = FakeAuthority::terminal(record);
@@ -403,7 +551,11 @@ fn w09_missing_pending_unavailable_and_disallowed_authority_fail_closed() {
         assert_eq!(authority.calls.get(), 1);
     }
 
-    let disallowed_policy = w09_completion_policy_fixture(vec![AuthorityClass::P01Dedicated]);
+    let disallowed_policy = w09_completion_policy_fixture(
+        "MU-auction",
+        "owner-auction",
+        vec![AuthorityClass::P01Dedicated],
+    );
     let authority = FakeAuthority::terminal(fixture.record);
     assert!(matches!(
         verify_terminal(
@@ -415,6 +567,31 @@ fn w09_missing_pending_unavailable_and_disallowed_authority_fail_closed() {
         ),
         Err(TerminalAuthorityError::AuthorityNotAllowed)
     ));
+}
+
+#[test]
+fn w09_completion_policy_unit_and_owner_are_bound_before_authority_query() {
+    for (field, unit_id, owner) in [
+        ("unit_id", "MU-other", "owner-auction"),
+        ("completion_owner", "MU-auction", "owner-other"),
+    ] {
+        let fixture = fixture();
+        let policy =
+            w09_completion_policy_fixture(unit_id, owner, vec![AuthorityClass::GenericCounted]);
+        let authority = FakeAuthority::terminal(fixture.record);
+        assert!(matches!(
+            verify_terminal(
+                &fixture.snapshot,
+                &fixture.template,
+                &policy,
+                &authority,
+                UtcMicros::try_new(1_788_743_101_000_000).unwrap(),
+            ),
+            Err(TerminalAuthorityError::CompletionPolicyMismatch { field: actual })
+                if actual == field
+        ));
+        assert_eq!(authority.calls.get(), 0);
+    }
 }
 
 #[test]
