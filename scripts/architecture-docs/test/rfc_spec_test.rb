@@ -24,6 +24,91 @@ class RfcSpecTest < Minitest::Test
     assert_empty err
   end
 
+  # 只突变唯一规范表；每个反例先证明原表和目标存在，排除重复章节造成的假绿。
+  rollout_mutations = [
+    ['调度身份', 'rfc_schedule_identity_invalid', 'ScheduleOccurrence', 'source_contract_id |', 'source_contract_id,activation_generation |'],
+    ['运行就绪判定', 'rfc_readiness_invalid', 'CoreUnready', 'OperationalReadinessSnapshot', 'LogsOnly'],
+    ['运行就绪判定', 'rfc_readiness_invalid', 'ProducerUnready', '| false |', '| true |'],
+    ['运行就绪判定', 'rfc_readiness_invalid', 'BlockedOnInput', '| true | true |', '| true | false |'],
+    ['就绪查询与恢复合同', 'rfc_readiness_query_invalid', 'missing_active_contract', 'EscalateProducerUnready', 'RemainBlockedOnInput'],
+    ['就绪查询与恢复合同', 'rfc_readiness_query_invalid', 'log_pager', 'ProjectionOnlyNeverReadinessAuthority', 'LogsAreAuthority'],
+    ['操作员权限', 'rfc_operator_authorization_invalid', 'SingleControl', 'AuthenticatedOnlineUserOrProductionAllowlistedOperator', 'AnonymousOrFreeText'],
+    ['操作员权限', 'rfc_operator_authorization_invalid', 'SingleControl', 'V1BaselineOneMayApproveAndExecute', 'MandatoryTwoOperators'],
+    ['操作员权限', 'rfc_operator_authorization_invalid', 'DualControl', 'DistinctAuthenticatedPreparerAndApproverCannotDowngrade', 'SameIdentityAllowed'],
+    ['操作员权限', 'rfc_operator_authorization_invalid', 'dry_run_and_refusal', 'NoDBNoJournalNoOwnerChangeNoProviderNoLLMNoSinkNoOrder', 'WriteJournal'],
+    ['证据保留类别', 'rfc_retention_invalid', 'NonTerminal', 'NeverAutoDelete', 'DeleteAfter90Days'],
+    ['证据保留类别', 'rfc_retention_invalid', 'DeliveryAuditRegulatory', 'StrictlyGreaterThanFiveYears', '1825Days'],
+    ['证据保留类别', 'rfc_retention_invalid', 'ModelDecisionTrade', 'NoUnifiedFiveYearMaximum', 'FiveYearMaximum'],
+    ['物理所有权与晋级合同', 'rfc_activation_operations_invalid', 'common_fence', 'LegacyAndNewSchedulerProducerDispatcherFinalizer', 'NewSchedulerOnly'],
+    ['物理所有权与晋级合同', 'rfc_activation_operations_invalid', 'emergency_rollback', 'NewGenerationCASAppendJournalBlockLaterPromotionToday', 'ReuseOldGeneration'],
+    ['影子精确比较', 'rfc_shadow_compare_invalid', 'exclusions', 'attempt_id,latency,diagnostic_timestamp', 'attempt_id,latency,diagnostic_timestamp,business_date'],
+    ['调度恢复策略', 'rfc_schedule_recovery_invalid', 'non_trading_reason', 'EvaluationOnlyNoOccurrenceNoNoDataOrDisabledIntent', 'CreateNoDataIntent'],
+    ['就绪查询与恢复合同', 'rfc_readiness_query_invalid', 'activation.producer_unready', 'ProducerUnready |', 'BlockedOnInput |'],
+    ['就绪查询与恢复合同', 'rfc_readiness_query_invalid', 'input.source_unready', 'RegisteredContractOccurrenceEvidenceUnavailable', 'MissingProducerContract'],
+    ['物理所有权与晋级合同', 'rfc_activation_operations_invalid', 'quota_transaction', 'BEGIN IMMEDIATE', 'MemoryMutex'],
+    ['物理所有权与晋级合同', 'rfc_activation_operations_invalid', 'quota_calendar', 'CalendarBoundUTCStartInclusiveEndExclusive', 'LocalWallClockDate'],
+    ['物理所有权与晋级合同', 'rfc_activation_operations_invalid', 'quota_query', 'AllUnitsPromotionJournalOccurredAt', 'CurrentUnitOnly'],
+    ['物理所有权与晋级合同', 'rfc_activation_operations_invalid', 'quota_query', 'RejectAnyActivateOrRollbackInBusinessDateInterval', 'IgnoreRollback'],
+    ['物理所有权与晋级合同', 'rfc_activation_operations_invalid', 'quota_apply', 'SameImmediateTransaction', 'SeparateTransactions'],
+    ['操作员权限', 'rfc_operator_authorization_invalid', 'refusal_audit', 'IndependentControlPlaneAuditSinkOnly', 'BusinessSink'],
+    ['操作员权限', 'rfc_operator_authorization_invalid', 'dry_run_refusal_storage', 'NoWrites', 'WritesAllowed'],
+    ['风险波次顺序', 'rfc_risk_waves_invalid', '1', 'CLI report typed BestEffort result', 'PaperBuy'],
+    ['故障环境与验收边界', 'rfc_fault_environment_invalid', 'Production', 'ApprovedNormalTypedReceiptAndSameDecisionIdempotentReplay', 'KillDatabase'],
+    ['类型：ScheduleOccurrence', 'rfc_type_fields_invalid', 'calendar_id', nil, nil],
+    ['类型：OperationalReadinessSnapshot', 'rfc_type_fields_invalid', 'recovery_event_id', nil, nil],
+    ['业务验收样本', 'rfc_sample_bindings_invalid', 'historical_backfill_2026-08-31', '[unit:MU-review-r11]', '[unit:MU-review-r04]'],
+    ['业务验收样本', 'rfc_sample_bindings_invalid', 'news_ai_cross_batch', '[producer:news-ai-same-tick]', '[producer:d01-manual]'],
+    ['业务验收样本', 'rfc_acceptance_samples_invalid', 'historical_backfill_2026-08-31', 'TomorrowWatch+PositionReview', 'ReviewBackfill'],
+    ['业务验收样本', 'rfc_acceptance_samples_invalid', 'news_ai_cross_batch', 'NewsToIdea;producer=news-ai-same-tick', 'NewsAI'],
+    ['业务验收样本', 'rfc_acceptance_samples_invalid', 'r03_blocked_input', 'IndustryChain;ReviewTask=R03', 'R03'],
+    ['业务验收样本', 'rfc_acceptance_samples_invalid', 'r08_retryability', 'EventCalendar;ReviewTask=R08', 'R08'],
+    ['业务验收样本', 'rfc_acceptance_samples_invalid', 'n02_receipt_time', '§F01/§F10', '#f01-f10'],
+    ['业务验收样本', 'rfc_acceptance_samples_invalid', 'n02_receipt_time', 'comprehensive-reanalysis-2026-09-05.md', 'missing.md'],
+    ['操作员请求与输出', 'rfc_operator_wire_invalid', 'Response | mutation_journal_event_ref', 'AppliedMutationOnlyNullForInspectDryRunRefusal', 'AuditEnvelopeInMutationJournal'],
+    ['操作员请求与输出', 'rfc_operator_wire_invalid', 'Response | operator_audit_event_ref', nil, nil],
+    ['调度恢复策略', 'rfc_schedule_recovery_invalid', 'schema_version', 'ScheduleOccurrence/v1', 'ScheduleOccurrence/v2']
+  ]
+  {
+    '调度生命周期' => ['rfc_schedule_lifecycle_invalid', ['Expected | Eligible', 'Eligible | Prepared', 'Prepared | Closed', 'Expected | Missed', 'Eligible | Missed', 'Expected | Deferred', 'Eligible | Deferred', 'Expected | BlockedOnInput', 'Eligible | BlockedOnInput', 'BlockedOnInput | Eligible', 'BlockedOnInput | Missed', 'BlockedOnInput | Deferred', 'Deferred | Eligible']],
+    '调度恢复策略' => ['rfc_schedule_recovery_invalid', %w[ExpireWithoutCatchUp SameBusinessDayBeforeDeadline DeferToNextEligibleSession RecoverPersistedOnly coalesce non_trading_day independent_trigger INACTIVE STARVED OPT-IN]],
+    '操作员命令' => ['rfc_operator_commands_invalid', %w[inspect reconcile resolve-uncertain promote rollback]],
+    '通用晋级门禁' => ['rfc_rollout_gates_invalid', %w[unit failure crash shadow dedup rollback]],
+    '业务验收样本' => ['rfc_acceptance_samples_invalid', %w[historical_backfill_2026-08-31 n02_receipt_time g5b_test_namespace news_ai_cross_batch paper_sell_254_2026-09-01 attribution_g5b_sink_fail r03_blocked_input r08_retryability no_data_disabled_uncertain cross_db_conflict_rollback]],
+    '清理资格与安全' => ['rfc_cleanup_invalid', %w[terminal_binding transition_journal_audit retention_expiry legal_hold disclosure backup_integrity nonterminal_uncertain_resolution worm_mutation secrets_and_unnecessary_content]]
+  }.each do |section, (error, keys)|
+    keys.each { |key| rollout_mutations << [section, error, key, nil, nil] }
+  end
+  %w[provider_second_call llm_recompute business_db_write durable_db_write cursor_advance candidate_watchlist_outcome paper_order_fill transport_send].each do |key|
+    rollout_mutations << ['影子副作用', 'rfc_shadow_effects_invalid', key, 'Forbidden', 'Allowed']
+  end
+  %w[inspect reconcile resolve-uncertain promote rollback].each do |key|
+    rollout_mutations << ['操作员命令', 'rfc_operator_commands_invalid', key, "| #{key} |", "| renamed-#{key} |"]
+  end
+  %w[paper_buy_29_2026-09-04 watchdog_nonbaseline].each do |key|
+    rollout_mutations << ['非基线回放样本', 'rfc_nonbaseline_samples_invalid', key, 'NON_BASELINE_REPLAY_ONLY', 'CURRENT_65_KIND']
+    rollout_mutations << ['非基线回放样本', 'rfc_nonbaseline_samples_invalid', key, 'NoCatalogUnitNoBaselineCapabilityNoProducerActivationNoWaveChange', 'CreateUnitActivateProducer']
+    rollout_mutations << ['非基线回放样本', 'rfc_nonbaseline_samples_invalid', key, nil, nil]
+  end
+  rollout_mutations.each_with_index do |(section, error, key, from, to), index|
+    define_method("test_rollout_mutation_#{index}_#{key.gsub(/\W+/, '_')}") do
+      with_fixture do |root|
+        change_text(root) do |s|
+          pattern = /^## #{Regexp.escape(section)}（PROPOSED）\n.*?(?=^## |\z)/m
+          assert_equal 1, s.scan(pattern).length
+          s.sub(pattern) do |body|
+            row_pattern = /^\| #{Regexp.escape(key)} \|.*\n/
+            assert_equal 1, body.scan(row_pattern).length
+            body.sub(row_pattern) { |row| from ? row.sub(from, to) : '' }
+          end
+        end
+        require_relative '../rfc_spec'
+        errors = ArchitectureDocs::RfcSpec.validate(root)
+        refute_includes errors.join("\n"), 'rfc_section_duplicate'
+        assert_cli_error(root, error)
+      end
+    end
+  end
+
   def test_draft_still_rejects_metadata_counts_and_frozen_dependency_drift
     cases = [
       ['rfc_version_invalid', proc { |m| m['version'] = 'invented-v2' }],
@@ -50,6 +135,25 @@ class RfcSpecTest < Minitest::Test
         File.open(File.join(root, 'docs/push-system', name), 'ab') { |file| file.write("\n") }
         assert_cli_error(root, 'rfc_dependency_sha_mismatch')
       end
+    end
+  end
+
+  def test_rollout_contract_allows_explanation_and_table_row_reordering
+    require_relative '../rfc_spec'
+    with_fixture do |root|
+      change_text(root) do |s|
+        s.sub(/^## 影子副作用（PROPOSED）\n.*?(?=^## |\z)/m) do |body|
+          lines = body.lines
+          indexes = lines.each_index.select { |i| lines[i].match?(/^\| [a-z_]+ \|/) }
+          assert_equal 8, indexes.length
+          reversed = indexes.map { |i| lines[i] }.reverse
+          indexes.each_with_index { |position, i| lines[position] = reversed[i] }
+          lines.join + "\n补充说明：规范行可换展示次序，许可仍由闭集校验。\n\n"
+        end
+      end
+      assert_equal [], ArchitectureDocs::RfcSpec.validate(root)
+      out, err, result = Open3.capture3(RbConfig.ruby, CLI, '--root', root, '--draft')
+      assert_equal 0, result.exitstatus, out + err
     end
   end
 

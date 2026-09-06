@@ -2,7 +2,7 @@
 
 状态：**PROVISIONAL**。版本：`push-system-rfc-v1`。本文定义 PROPOSED 应用合同，
 不代表运行时代码已经实现、部署或取得远端回执。Task2 仅交付领域类型、应用结果、
-源码映射和 ReasonCode；Task3 增补 DDL/恢复设计，运行门禁与 WBS 仍属于 Task4/5，
+源码映射和 ReasonCode；Task3 增补 DDL/恢复设计，Task4 增补运行与验收合同，WBS 由 Task5 承接，
 本文不宣称这些合同已实现、部署或通过独立复审。[Q:56] [Q:61] [Q:69] [Q:108]
 
 ## 元数据
@@ -463,12 +463,16 @@ operator/告警适配器及测试。规范化材料是精确 ASCII 代码，不�
 
 | 代码 | 条件 | 处理 | 依据 |
 | --- | --- | --- | --- |
-| schedule.not_trading_day | 交易日 authority 确认为非交易日 | 按策略产生 NoData/Disabled，不发送 | [Q:101] [Q:28] |
+| schedule.not_trading_day | 交易日 authority 确认为非交易日 | 仅调度评估/观测原因；不创建交易时段 occurrence 或 NoData/Disabled intent | [Q:101] [Q:28] |
 | schedule.window_not_open | 捕获业务时间早于有效窗口 | 保持 occurrence 待处理，直到具备资格 | [Q:101] [Q:28] |
 | schedule.window_expired | 捕获业务时间超过补偿窗口 | 仅产生策略允许的 schedule 提案，不暗示投递 | [Q:101] [Q:28] |
 | schedule.occurrence_closed | 精确调度 occurrence 已关闭 | 不产生新调度，通知状态仍独立 | [Q:101] [Q:86] |
+| schedule.window_open | authority 授予有效窗口资格 | 按 current version/gate 进入 Eligible | [Q:28] [Q:101] |
+| schedule.deferred | 策略允许下一 eligible session | 保存原 identity 和下一资格引用 | [Q:86] [Q:101] |
+| input.source_recovered | 来源证据及版本已恢复 | 记录恢复事件，重验窗口与 readiness | [Q:30] [Q:101] |
+| activation.ready | 共享和作用域合同均校验通过 | 生成 Ready snapshot | [Q:12] [Q:101] |
 | input.source_unavailable | provider 读取失败 | BlockedOnInput，仅允许有界发送前重试 | [Q:101] [Q:12] |
-| input.source_unready | 所需生产者能力未就绪 | BlockedOnInput，并隔离生产者 | [Q:101] [Q:12] |
+| input.source_unready | 已注册合同下某 occurrence 的来源证据不可用 | BlockedOnInput；ACTIVE producer 合同缺失须用 activation.producer_unready 升级 ProducerUnready | [Q:101] [Q:12] |
 | input.evidence_invalid | 来源引用/哈希/时间绑定无效 | BlockedOnInput，不伪造事实 | [Q:101] [Q:59] |
 | input.no_verified_batch | 没有经过准入的同 tick 批次 | BlockedOnInput，NewsAI 不混用跨批次事实 | [Q:101] [Q:33] |
 | input.account_snapshot_missing | 所需账户快照缺失 | BlockedOnInput，不代入其他账户或组合 | [Q:101] [Q:12] |
@@ -842,6 +846,368 @@ ResolutionRequired、非终态及相关证据不得自动清理，按最严格�
 LLM、发送或订单。SQL 行为测试不是进程级 durable 故障注入，不证明生产两个库
 的真实恢复；故障矩阵是后续 Unit 实现必须执行的合同。运行门禁、WBS、HTML/CI
 发布仍留在 Task4/5/6，本 RFC 持续 PROVISIONAL。[Q:42] [Q:69] [Q:100] [Q:105]
+
+## 类型：ScheduleOccurrence（PROPOSED）
+
+创建者：PhaseScheduler，使用 catalog 绑定的交易日历/MarketSession authority。消费者：当前 owner 的 scheduler、恢复器及只读观测投影。[Q:16] [Q:28] [Q:86]
+
+| 字段 | 类型 | 不变量 | 规范化 |
+| --- | --- | --- | --- |
+| schedule_occurrence_id | Sha256 | ScheduleIdentity::v1 | 派生且排除自身 |
+| namespace | Namespace | Test 与 Production 隔离 | 纳入 |
+| unit_id | UnitId | catalog 原子迁移身份 | 纳入 |
+| producer_id | ProducerId | catalog producer | 纳入 |
+| schedule_or_trigger_id | NonEmptyText | 注册的 schedule 或 event/manual trigger | 纳入 |
+| calendar_id | NonEmptyText | catalog 绑定的交易日历版本引用 | 纳入 |
+| business_date | Date | 仅 MarketSession authority 提供 | 纳入 |
+| occurrence_family | NonEmptyText | catalog 声明的业务族 | 纳入 |
+| occurrence_key | NonEmptyText | 族内稳定键；不取当前 tick | 纳入 |
+| completion_owner | CatalogOwnerRef | catalog 原子完成 owner | 纳入 |
+| source_contract_id | NonEmptyText | catalog 绑定来源合同 | 纳入 |
+| window_start | UtcMicros | 含起点；由交易日历计算 | 纳入 |
+| window_end | UtcMicros | 不含终点且大于起点 | 纳入 |
+| catch_up_policy | CatchUpPolicy | 下表四种策略闭集 | 纳入 |
+| status | ScheduleStatus | 生命周期表闭集 | 纳入 |
+| reason | ReasonCode | 当前转换的稳定原因 | 纳入 |
+| created_at | UtcMicros | 首次创建时间 | 纳入 |
+| updated_at | UtcMicros | 单调更新；转换使用独立 expected-version CAS | 纳入 |
+
+字段的规范化用于快照序列化；身份哈希仅取下一表的有序子集，不能误用整份快照。所有类型均是拟议合同，未新增运行时类型或表。
+
+## 调度身份（PROPOSED）
+
+[Q:16] [Q:33] [Q:74] [Q:86]
+
+| 规则 | 函数 | 有序材料 | 排除材料 | 依据 |
+| --- | --- | --- | --- | --- |
+| ScheduleOccurrence | SHA256CanonicalTuple | schema_version,namespace,unit_id,producer_id,schedule_or_trigger_id,calendar_id,business_date,occurrence_family,occurrence_key,completion_owner,source_contract_id | wall_clock_tick,phase_epic,activation_generation,build,payload_sha256,rendered_sha256,evidence_sha256 | [Q:16] [Q:86] |
+
+`schema_version=ScheduleOccurrence/v1` 使用本 RFC 的 canonical tuple 编码及 SHA-256。activation generation 是执行 fence；重启或晋级不改变同一业务 occurrence 的身份。calendar date、采样时间、analytics 时间和消息 receipt 时间不能替代 business date。盘前、集合竞价、盘中、盘后只做规划/观察 Epic，不持有 occurrence、游标或完成状态；不同 producer/owner/occurrence 不因同一 phase 或一分钟合并。
+
+## 调度生命周期（PROPOSED）
+
+[Q:28] [Q:86]。所有边采用 occurrence 的 expected-version CAS，保留原身份和转换证据；状态闭集为 `Expected / Eligible / Prepared / Closed / Missed / Deferred / BlockedOnInput`。`Prepared` 仅表示准备结果已经持久化，不代表发送。通知最终化仍使用 Task2/Task3 合同。
+
+| 起点 | 终点 | 权威 | 窗口与版本条件 | 持久事实 | 禁止副作用 | ReasonCode | 依据 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Expected | Eligible | MarketSession | WindowOpen+CurrentVersion+ReadyGate | EligibilityEvent | ProviderOrSend | schedule.window_open | [Q:28] |
+| Eligible | Prepared | PhysicalOwner | WindowOpen+CurrentFence+VersionCAS | FrozenDecisionOrIntentRef | DispatchBeforeCommit | intent.created | [Q:76] |
+| Prepared | Closed | CompletionPolicy | BoundScheduleCloseProposal+VersionCAS | ScheduleClosureEvent | InferNotificationCursor | schedule.occurrence_closed | [Q:86] |
+| Expected | Missed | MarketSession | WindowExpired+NoCatchUp+VersionCAS | MissedEvent | StalePrepareOrSend | schedule.window_expired | [Q:28] |
+| Eligible | Missed | MarketSession | WindowExpired+NoCatchUp+VersionCAS | MissedEvent | StalePrepareOrSend | schedule.window_expired | [Q:28] |
+| Expected | Deferred | MarketSession | NextEligibleSession+VersionCAS | DeferredEvent+NextEligibilityRef | PrepareOrSend | schedule.deferred | [Q:28] |
+| Eligible | Deferred | MarketSession | NextEligibleSession+VersionCAS | DeferredEvent+NextEligibilityRef | PrepareOrSend | schedule.deferred | [Q:28] |
+| Expected | BlockedOnInput | SourceContract | UnavailableEvidence+VersionCAS | InputBlockEvent | EmptyAsNoDataOrPollPermanentGap | input.source_unavailable | [Q:30] |
+| Eligible | BlockedOnInput | SourceContract | UnavailableEvidence+VersionCAS | InputBlockEvent | EmptyAsNoDataOrPollPermanentGap | input.source_unavailable | [Q:30] |
+| BlockedOnInput | Eligible | SourceContract+MarketSession | RecoveryEvent+WindowOpen+ReadyGate+VersionCAS | InputRecoveryEvent | InventProducerOrIdentity | input.source_recovered | [Q:30] |
+| BlockedOnInput | Missed | MarketSession | WindowExpired+NoCatchUp+VersionCAS | MissedEvent | StalePrepareOrSend | schedule.window_expired | [Q:86] |
+| BlockedOnInput | Deferred | MarketSession | NextEligibleSession+VersionCAS | DeferredEvent+NextEligibilityRef | PrepareOrSend | schedule.deferred | [Q:86] |
+| Deferred | Eligible | MarketSession | NextEligibilityReached+ReadyGate+VersionCAS | DeferredRecoveryEvent | InventProducerOrIdentity | schedule.window_open | [Q:86] |
+
+`Deferred` 保存原 occurrence 及下一 eligible session 引用，下一窗口由 authority 重新授予资格并作 `Deferred→Eligible` CAS；不制造同一业务事件的新身份。
+
+## 调度恢复策略（PROPOSED）
+
+[Q:10] [Q:28] [Q:30] [Q:86]
+
+| 规则 | 适用范围 | 规范值 | 依据 |
+| --- | --- | --- | --- |
+| ExpireWithoutCatchUp | NewOccurrence | ExpiredMeansMissedNoSend | [Q:28] |
+| schema_version | ScheduleOccurrence | ScheduleOccurrence/v1 | [Q:16] |
+| SameBusinessDayBeforeDeadline | NewOccurrence | SameBusinessDateAndBeforeWindowEndOnly | [Q:28] |
+| DeferToNextEligibleSession | NewOccurrence | PreserveIdentityAndLinkNextSession | [Q:86] |
+| RecoverPersistedOnly | ExistingIntentOrDecision | OriginalIdentityAndBytesNoPrepareNoWindowOverride | [Q:10] |
+| coalesce | Tick+StartupCatchUp+NormalDue | SameScheduleOccurrenceIdOnly | [Q:16] |
+| non_trading_day | SessionBound | NoOccurrence | [Q:28] |
+| non_trading_reason | schedule.not_trading_day | EvaluationOnlyNoOccurrenceNoNoDataOrDisabledIntent | [Q:28] |
+| independent_trigger | CatalogSessionIndependentEventOrManual | AuthorityBusinessDateRequired | [Q:28] |
+| INACTIVE | CatalogMetadata | NoTimerNoProducer | [Q:28] |
+| STARVED | ExistingProducer | PreserveStateUntilProductAndInputApproval | [Q:30] |
+| OPT-IN | ExistingProducer | PreserveStateUntilExplicitProductApproval | [Q:30] |
+
+非 INACTIVE 定时 producer 注册日程定义，event producer 注册 trigger/readiness；注册本身不运行 producer。启动先恢复既有 intent/outbox/durable decision，以原 identity、原字节和原 authority 引用继续恢复；不能重新 provider/LLM/render，不能把当前窗口许可冒充新 occurrence。时窗过期只禁止新工作，不禁止原 intent 的 reconciliation。NoData/Disabled 的时段关闭由 CompletionPolicy 决定，不增加 Accepted，也不推进通知游标。
+
+## 类型：OperationalReadinessSnapshot（PROPOSED）
+
+创建者：独立 readiness evaluator，读取 namespace、authority、schema、manifest 与 producer 合同证据。消费者：health/readiness probe、部署门禁、CLI 和观测投影。[Q:12] [Q:54] [Q:101]
+
+| 字段 | 类型 | 不变量 | 规范化 |
+| --- | --- | --- | --- |
+| snapshot_id | Sha256 | canonical snapshot 哈希；不含自身 | 派生且排除自身 |
+| captured_at | UtcMicros | 本次观测时间 | 纳入 |
+| business_date | Date | 交易日历 authority | 纳入 |
+| build_commit | GitSha40 | 当前制品 | 纳入 |
+| activation_generation | u64 | 当前已审计 generation | 纳入 |
+| scope | ReadinessScope | Core、Producer 或 Occurrence 的 typed ID | 纳入 |
+| status | ReadinessStatus | Ready/CoreUnready/ProducerUnready/BlockedOnInput 闭集 | 纳入 |
+| reason | ReasonCode | 非 Ready 必须为对应稳定原因 | 纳入 |
+| dependency_refs | Vec<DependencyRef> | 合同版本与能力证据 | 纳入 |
+| affected_unit_ids | Vec<UnitId> | 非 Ready 为明确受影响集合；Core 包含全部启用 Unit | 纳入 |
+| affected_producer_ids | Vec<ProducerId> | 非 Ready 为明确受影响集合 | 纳入 |
+| recovery_event_id | RecoveryEventId | 可查询的恢复跟踪事件；未恢复标 Pending | 纳入 |
+| evidence_refs | Vec<EvidenceRef> | 类型、受保护 URI、SHA-256、来源及版本 | 纳入 |
+| liveness | bool | 与 deployment_ready 分离 | 纳入 |
+| deployment_ready | bool | 下表判定，不从日志推断 | 纳入 |
+| exit_disposition | ExitDisposition | Continue 或受控非零退出 | 纳入 |
+
+## 运行就绪判定（PROPOSED）
+
+[Q:12] [Q:54] [Q:101]
+
+| 状态 | 范围 | 权威 | 存活 | 部署就绪 | 退出处置 | 恢复事件 | ReasonCode | 依据 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Ready | EvaluatedScope | OperationalReadinessSnapshot | true | true | Continue | ReadyObserved | activation.ready | [Q:12] |
+| CoreUnready | SharedPrerequisites | OperationalReadinessSnapshot | UntilControlledExit | false | StartupNonzeroOrStopNewAndRecoverIsolateThenNonzero | CoreDependenciesRestored | activation.core_unready | [Q:12] |
+| ProducerUnready | AffectedProducers | OperationalReadinessSnapshot | true | false | IsolateAffectedContinueOthers | ProducerContractRestored | activation.producer_unready | [Q:12] |
+| BlockedOnInput | KnownOccurrence | OperationalReadinessSnapshot | true | true | ContinueWithoutOccurrenceWork | InputEvidenceRestored | input.source_unavailable | [Q:30] |
+
+Core 前提包括共享 namespace、durable、audit、typed authority、schema、manifest。启动前失败返回非零；运行中失败先停止新 occurrence、保留恢复与隔离，再受控非零退出。ProducerUnready 不阻断其他就绪 producer，但部署 readiness 失败并生成独立 operational alert。
+
+BlockedOnInput 默认不使全局 deployment readiness 失败，前提是不存在其他 Core/ProducerUnready；这是已知 occurrence 的来源证据阻断。ACTIVE producer 的 source/schedule/presentation/policy 合同本身缺失必须升级 ProducerUnready。永久缺能力不定时空转、不用空 Vec 冒充 NoData、不创建 producer；显式 capability/version recovery 事件才能重新评估。
+
+## 就绪查询与恢复合同（PROPOSED）
+
+[Q:12] [Q:54]
+
+| 规则 | 适用范围 | 规范值 | 依据 |
+| --- | --- | --- | --- |
+| authority | Health+Readiness+CLI | SameOperationalReadinessSnapshot | [Q:54] |
+| query_effects | AllQueries | NoProviderNoSinkNoTransition | [Q:54] |
+| log_pager | Logs+OptionalPager | ProjectionOnlyNeverReadinessAuthority | [Q:54] |
+| non_ready | CoreUnready+ProducerUnready+BlockedOnInput | StableReasonAffectedSetsQueryableRecoveryEvent | [Q:101] |
+| missing_active_contract | Source+Schedule+Presentation+Policy | EscalateProducerUnready | [Q:12] |
+| input.source_unready | RegisteredContractOccurrenceEvidenceUnavailable | BlockedOnInput | [Q:12] |
+| activation.producer_unready | ActiveProducerContractMissing | ProducerUnready | [Q:12] |
+| alert | ProducerUnready | IndependentOperationalAlert | [Q:12] |
+| recovery | AllScopes | AppendPendingOrRecoveredEventThenNewSnapshot | [Q:54] |
+
+部署输出包含 snapshot hash、generation、build、受影响 ID、ReasonCode、恢复事件及 `push_total/ready/conditional/compat/inactive/schedule_unreachable/producer_missing/source_missing/presentation_missing/durable_policy_missing` 计数。这些是同一 snapshot 的投影，不用日志出现与否决定 readiness。恢复事件记录前后 snapshot 引用、旧/新依赖版本、认证事件来源与时间，只有重新校验通过才恢复工作。
+
+## 物理所有权与晋级合同（PROPOSED）
+
+[Q:13] [Q:16] [Q:31] [Q:79] [Q:80] [Q:81] [Q:82] [Q:98]
+
+复用「激活转换」表的 `Disabled→Shadow→Active→Draining→Disabled` 与 rollback 新 generation/CAS；不建立第二张 activation 状态机、不修改 DDL。manifest 为期望，promotion journal 为已执行事实，启动必须核对二者。
+
+| 规则 | 适用范围 | 规范值 | 依据 |
+| --- | --- | --- | --- |
+| common_fence | LegacyAndNewSchedulerProducerDispatcherFinalizer | unit_id,generation,manifest_sha256,physical_owner | [Q:13] [Q:79] |
+| authorization | EveryActor | CurrentGateAndFenceRequired | [Q:98] |
+| Shadow | PhysicalOwner | None | [Q:13] |
+| Active | NewOccurrence | ManifestOwnerOnly | [Q:31] |
+| Draining | NewOccurrenceAndPrepare | ForbiddenPreserveAuthorityFinalizerReconcilerQuarantine | [Q:18] |
+| Disabled | PersistedFacts | PreserveAndFenceOldOwnerAgainstResend | [Q:82] |
+| daily_limit | NonEmergencyOwnerChangingPromotion | OneUnitPerBusinessDate | [Q:36] |
+| no_quota | ShadowOrNoOwnerChangeDeployment | DoesNotConsumeDailyPromotion | [Q:24] |
+| emergency_rollback | AnyTime | NewGenerationCASAppendJournalBlockLaterPromotionToday | [Q:80] [Q:99] |
+| parallel_shadow | MultipleUnits | ExactlyOneOwnerPerOccurrence | [Q:24] |
+| rollback_compatibility | LogicalOrFoundationCompatibleNMinusOne | PreserveAcceptedPendingFactsAndFences | [Q:82] |
+| quota_transaction | ActivationDB | BEGIN IMMEDIATE | [Q:36] [Q:80] |
+| quota_calendar | AuthorityBusinessDate | CalendarBoundUTCStartInclusiveEndExclusive | [Q:36] |
+| quota_query | AllUnitsPromotionJournalOccurredAt | RejectAnyActivateOrRollbackInBusinessDateInterval | [Q:36] [Q:99] |
+| quota_apply | SameImmediateTransaction | RevalidateGenerationThenAppendManifestAndJournalCommit | [Q:80] [Q:81] |
+| quota_authority | MemoryLockOrLogs | NeverSufficient | [Q:98] |
+
+旧缓存、旧 binary、非空 actor 或 manifest 单独存在均不授权发送。物理 owner 变化必须先 fence 旧 actor，审计最新 generation/journal 后才能授予新 owner；不能以重启创建逃逸 identity。Draining 的原稳定 intent 由当前执行 fence 保护的恢复职责继续处理，外部 Accepted 不可撤销，Uncertain 不盲重发。每日名额是全体 Unit 共用的交易日约束：activation DB 用 `BEGIN IMMEDIATE` 串行，按 catalog 绑定的交易日历 authority business-date 所对应 UTC 半开区间查询全部 Unit 的 journal `occurred_at`，任何 `Activate` 或当日 `Rollback` 都拒绝后续 promote；再重验 generation，写 manifest+journal 并提交同一事务。rollback 不受名额限制但写入新 generation/journal。不能靠内存锁或日志；现有 DDL 已有 occurred_at，区间及 calendar/version 必须绑定批准证据，不能改用 receipt 或本机日期。现有 SQL 的逐 Unit generation 约束不足以单独证明这个跨 Unit 上限；运行时实现必须另交验证证据。
+
+## 风险波次顺序（PROPOSED）
+
+[Q:44] [Q:16] [Q:36]。这十行是有序风险波次，不是十个已冻结原子 Unit。Task5 映射精确 catalog Unit；owner 边界拆分可同 rank，但仍逐 Unit、逐交易日，操作员记录同 rank 内顺序。PaperBuy/Watchdog 不改变此顺序。
+
+| 顺序 | 波次 | 晋级规则 | 依据 |
+| --- | --- | --- | --- |
+| 1 | CLI report typed BestEffort result | OneUnitPerBusinessDate | [Q:44] |
+| 2 | 09:05 chain | OneUnitPerBusinessDate | [Q:44] |
+| 3 | 15:30 chain | OneUnitPerBusinessDate | [Q:44] |
+| 4 | AttributionDaily | OneUnitPerBusinessDate | [Q:44] |
+| 5 | G5bAttribution | OneUnitPerBusinessDate | [Q:44] |
+| 6 | 15:05 snapshot occurrence | OneUnitPerBusinessDate | [Q:44] |
+| 7 | CandidateBoard + CandidateInvalidated | OneUnitPerBusinessDate | [Q:44] |
+| 8 | LimitBoards | OneUnitPerBusinessDate | [Q:44] |
+| 9 | ReviewTask result semantics | OneUnitPerBusinessDate | [Q:44] |
+| 10 | PaperReview-Starved conformance | OneUnitPerBusinessDate | [Q:44] [Q:30] |
+
+## 影子精确比较（PROPOSED）
+
+[Q:19] [Q:33] [Q:40] [Q:83]
+
+| 比较项 | 输入约束 | 判等规则 | 差异处置 | 依据 |
+| --- | --- | --- | --- | --- |
+| RunContext | SameInstance | ExactCapturedBusinessContext | BlockUnit:shadow.semantic_diff | [Q:33] |
+| PreparedFacts | SameImmutableInstance | IncludingCapturedModelOutputs | BlockUnit:shadow.semantic_diff | [Q:33] |
+| JobDecision | SharedFacts | ExactVariantAndAllFields | BlockUnit:shadow.semantic_diff | [Q:83] |
+| SemanticProjection.sha256 | SharedFacts | ExactSha256 | BlockUnit:shadow.semantic_diff | [Q:19] |
+| PreparedPush.rendered_sha256 | SharedFacts | ExactSha256AndBytes | BlockUnit:shadow.semantic_diff | [Q:19] |
+| ReasonCode | SharedFacts | ExactCode | BlockUnit:shadow.semantic_diff | [Q:83] |
+| completion_proposal | SharedFacts | ExactScheduleAndCursorProposal | BlockUnit:shadow.semantic_diff | [Q:86] |
+| exclusions | ComparisonOnly | attempt_id,latency,diagnostic_timestamp | NoOtherExclusions | [Q:40] |
+
+## 影子副作用（PROPOSED）
+
+[Q:34] [Q:83]。由一次外部采集得到 PreparedFacts，old/new 仅进行纯 prepare/project，禁止 shadow 自行重复取数。副作用端口使用可计数拒绝 capability，保存结构化零调用证明；没有看到日志不能证明零副作用。任一尝试产生 `shadow.side_effect_attempted` 并阻断 Unit。
+
+| 副作用 | 许可 | 失败处置 | 依据 |
+| --- | --- | --- | --- |
+| provider_second_call | Forbidden | BlockUnit:shadow.side_effect_attempted | [Q:83] |
+| llm_recompute | Forbidden | BlockUnit:shadow.side_effect_attempted | [Q:83] |
+| business_db_write | Forbidden | BlockUnit:shadow.side_effect_attempted | [Q:83] |
+| durable_db_write | Forbidden | BlockUnit:shadow.side_effect_attempted | [Q:83] |
+| cursor_advance | Forbidden | BlockUnit:shadow.side_effect_attempted | [Q:83] |
+| candidate_watchlist_outcome | Forbidden | BlockUnit:shadow.side_effect_attempted | [Q:83] |
+| paper_order_fill | Forbidden | BlockUnit:shadow.side_effect_attempted | [Q:83] |
+| transport_send | Forbidden | BlockUnit:shadow.side_effect_attempted | [Q:83] |
+
+## 操作员请求与输出（PROPOSED）
+
+[Q:45] [Q:47] [Q:99]。以下为可审计 CLI 的结构化 wire 合同；命令变更由应用校验及事务执行，任何 apply 禁止直接编辑 SQLite。
+
+| 方向 | 字段 | 类型 | 不变量 | 依据 |
+| --- | --- | --- | --- | --- |
+| Request | command_id | Sha256 | StableCommandIdentity | [Q:45] |
+| Request | command | OperatorCommand | inspect/reconcile/resolve-uncertain/promote/rollback | [Q:45] |
+| Request | target | TypedTargetRef | TargetTypeAndExactId | [Q:45] |
+| Request | expected_version | u64 | CurrentVersionCAS | [Q:77] |
+| Request | expected_generation | u64 | CurrentGenerationCAS | [Q:80] |
+| Request | dry_run | bool | RequiredForEveryCommand | [Q:45] |
+| Request | authenticated_operator_ref | AuthenticatedOperatorRef | HostOrServiceIdentityAndProductionAllowlist | [Q:47] |
+| Request | reason | ReasonCode | StableNamespacedCode | [Q:101] |
+| Request | evidence_refs | Vec<TypedEvidenceRef> | ProtectedURIAndSHA256AndTypeAndVersion | [Q:55] |
+| Request | requested_at | UtcMicros | CapturedRequestTime | [Q:45] |
+| Response | decision | OperatorDecision | Inspected/Planned/Applied/Refused | [Q:45] |
+| Response | before_refs | Vec<TypedStateRef> | ExactBeforeSnapshot | [Q:45] |
+| Response | after_refs | Vec<TypedStateRef> | AppliedOrExplicitlyProjected | [Q:45] |
+| Response | affected_rows | u64 | ZeroForDryRunRefusalOrInspect | [Q:45] |
+| Response | mutation_journal_event_ref | Option<MutationEventRef> | AppliedMutationOnlyNullForInspectDryRunRefusal | [Q:81] |
+| Response | operator_audit_event_ref | OperatorAuditEventRef | IndependentControlPlaneEnvelopeReference | [Q:45] [Q:55] |
+| Response | refusal_reason | Option<ReasonCode> | RequiredWhenRefused | [Q:101] |
+| Response | snapshot_sha256 | Sha256 | CanonicalResponseAndEvidenceBinding | [Q:45] |
+
+## 操作员命令（PROPOSED）
+
+[Q:45] [Q:46] [Q:99]
+
+| 命令 | 目标 | 最小证据 | 允许行为 | 拒绝原因 | 演练 | 依据 |
+| --- | --- | --- | --- | --- | --- | --- |
+| inspect | UnitOrIntentOrDecision | AuthenticatedIdentity+TargetRef | ReadOnlySnapshot | operator.unauthorized | SupportedNoWrites | [Q:45] |
+| reconcile | IntentOrUnit | CurrentVersionFence+AuthorityRefs | DeterministicIdempotentRecoveryOnly | intent.expected_version_conflict | SupportedNoWrites | [Q:45] |
+| resolve-uncertain | Decision | PriorInspect+ExactTerminalBinding+CurrentFenceVersion+ExternalEvidenceHash | AppendManualDispositionNeverRewriteReceipt | operator.resolution_conflict | SupportedNoWrites | [Q:46] |
+| promote | Unit | CurrentManifest+SixFreshGates+WaveRank+DailyJournal+OnlineApproval | OneOwnerCASAppendJournal | activation.generation_conflict | SupportedNoWrites | [Q:99] |
+| rollback | Unit | CompatibleRollbackTarget+CurrentFenceVersion+AuthenticatedRollbackPermission | NewGenerationCASAppendJournalPreserveAcceptedPending | activation.generation_conflict | SupportedNoWrites | [Q:80] |
+
+`reconcile` 只做已被原 intent/authority 授权的确定性恢复，不创建 occurrence，不盲发 Uncertain。人工处置先 inspect 同一 decision，再复核 exact terminal binding、current fence/current version；只追加 ManualConfirmedAccepted 或 ManualConfirmedNotDelivered，保留原 transport receipt。命令权限之外还需核对 namespace、Unit、合同和最小证据，不以非空 actor 授权。
+
+## 操作员权限（PROPOSED）
+
+[Q:43] [Q:47] [Q:99]
+
+| 规则 | 认证与审批 | 规范值 | 依据 |
+| --- | --- | --- | --- |
+| SingleControl | AuthenticatedOnlineUserOrProductionAllowlistedOperator | V1BaselineOneMayApproveAndExecute | [Q:43] [Q:47] |
+| DualControl | ExternalUnitOrOrganizationPolicy | DistinctAuthenticatedPreparerAndApproverCannotDowngrade | [Q:99] |
+| emergency_rollback | AuthenticatedOperatorWithRollbackPermission | SingleOperatorAllowedAuditRequired | [Q:99] |
+| Codex | EvidenceAndCommandPreparation | NeverProductionApproverOrExecutor | [Q:99] |
+| dry_run_and_refusal | EveryCommand | NoDBNoJournalNoOwnerChangeNoProviderNoLLMNoSinkNoOrder | [Q:45] |
+| unauthorized | MissingOrFreeTextIdentity | Refuse:operator.unauthorized | [Q:47] |
+| invalid_evidence | MissingInvalidOrUnboundEvidence | Refuse:operator.evidence_invalid | [Q:45] |
+| stale_version | ExpectedVersionConflict | Refuse:intent.expected_version_conflict | [Q:77] |
+| stale_generation | ExpectedGenerationConflict | Refuse:activation.generation_conflict | [Q:80] |
+| binding_conflict | TerminalOrOwnerBindingMismatch | Refuse:operator.resolution_conflict | [Q:46] |
+| refusal_audit | OperatorAuditEnvelope | IndependentControlPlaneAuditSinkOnly | [Q:45] [Q:55] |
+| audit_envelope | AuthenticatedIdentityOrUnauthenticatedMarker | CommandHashTimeReasonEvidenceHashSnapshotHash | [Q:45] [Q:55] |
+| dry_run_refusal_storage | BusinessDurableActivationDBAndPromotionJournal | NoWrites | [Q:45] |
+
+SingleControl 是 v1 人力基线：一名在线用户或 production allowlist 指定操作员可批准并执行；Codex 只准备证据和命令。外部策略要求 DualControl 时不能降级，preparer/approver 必须为不同认证身份。紧急 rollback 按显式 rollback 权限由单个认证操作员执行并留痕。在线批准必须绑定当前 command、Unit、manifest、generation、窗口和证据 hash，旧批准不覆盖新请求。
+
+dry-run 输出标记 Planned 的 before/after 投影，实际 affected_rows=0。拒绝返回 Refused、稳定 ReasonCode、当前快照 hash 和最小审计 envelope（含认证身份或未认证标记、请求 hash、时间与拒绝原因）；授权控制面的独立审计接收该 envelope，命令拒绝/dry-run 本身不写 DB/journal、不切 owner，不调用 provider/LLM/sink/order。这样拒绝可留审计且不会走成功 apply 的 journal 写入路径。
+
+## 证据保留类别（PROPOSED）
+
+[Q:48] [Q:55] [Q:88]。监管依据：[v18.1 §审计盲区](../v18.x/v18.1-strategic-gap-analysis.md) 的 `>5年` 与 [v19.0 §边界](../v19.x/v19.0-operational-clarity-design.md) 的 WORM/Object-Lock 边界。此处定义未来合同，不宣称外部 WORM 已部署或本地 SQLite 已具备该能力。
+
+| 类别 | 起算条件 | 最低策略 | 存储与清理 | 依据 |
+| --- | --- | --- | --- | --- |
+| NonTerminal | UntilVerifiedTerminal | NeverAutoDelete | PreserveIncludingUncertainAndResolutionRequired | [Q:88] |
+| MigrationEvidence | TerminalAndProductionVerified | AtLeast90DaysAfterBoth | CleanupEligibilityAllRequired | [Q:48] |
+| DeliveryAuditRegulatory | ApplicableRegulatoryStart | StrictlyGreaterThanFiveYears | ExternalWORMOrObjectLockNeverRewrite | [Q:88] |
+| ModelDecisionTrade | ApplicablePolicyStart | StrictestRegulatoryModelTradeSourcePolicy | NoUnifiedFiveYearMaximum | [Q:88] |
+
+迁移证据在合法终态与 Production Verified 两个条件均满足后起算至少 90 天；更严格策略继续优先。监管投递审计严格大于五年，不能固定为 1825 天，闰年、法规起算及更严格模型/交易来源规则必须正确处理，五年不是统一保留上限。
+
+## 清理资格与安全（PROPOSED）
+
+[Q:48] [Q:53] [Q:55] [Q:88]
+
+| 条件 | 规范值 | 依据 |
+| --- | --- | --- |
+| terminal_binding | VerifiedExactLegalBindingRequired | [Q:88] |
+| transition_journal_audit | AllLinkedIntegrityVerifiedRequired | [Q:81] |
+| retention_expiry | StrictestApplicablePolicyExpiredRequired | [Q:88] |
+| legal_hold | AbsentRequired | [Q:88] |
+| disclosure | MinimumMetadataProtectedURIHashOnly | [Q:55] |
+| backup_integrity | IndependentBackupsAndIntegrityEvidenceRequired | [Q:53] |
+| nonterminal_uncertain_resolution | NeverAutoDelete | [Q:88] |
+| worm_mutation | Forbidden | [Q:88] |
+| secrets_and_unnecessary_content | NoKeysCookiesWebhookURLUnnecessaryBodyOrPositions | [Q:55] |
+
+清理 eligibility 是全部条件的逻辑与，缺一项即拒绝；不能因 MigrationEvidence 的 90 天已到期越过法规留存。清理只追加处置审计，不改写 WORM；business/durable 独立备份和校验，不声称跨库原子快照。
+
+## 通用晋级门禁（PROPOSED）
+
+[Q:35] [Q:37] [Q:84] [Q:100]
+
+| 门禁 | 输入 | 通过证据 | 失败原因 | 阻断晋级 | 依据 |
+| --- | --- | --- | --- | --- | --- |
+| unit | CurrentUnitBuildCatalogContracts | TypedDecisionsExactBindingsAndAllBranches | input.evidence_invalid | true | [Q:84] |
+| failure | TestNamespaceFaultMatrix | RejectionUncertainIsolationNoFalseCompletion | transport.uncertain | true | [Q:84] |
+| crash | SevenStepCommitBoundaries | OriginalIdentityBytesRecoveryNoLostIntent | intent.transition_conflict | true | [Q:84] |
+| shadow | SharedContextFactsAndEffectCounters | ExactCompareZeroForbiddenEffects | shadow.semantic_diff | true | [Q:84] |
+| dedup | SameDecisionReplayAndBusinessRevisions | NoSecondSendNoOverDedupExactReceipt | intent.payload_conflict | true | [Q:84] |
+| rollback | PendingAcceptedUncertainAndOldOwner | NewGenerationJournalFenceNoResend | activation.owner_conflict | true | [Q:84] |
+
+每个 Unit 每次晋级前重新跑全部六门禁，证据绑定 Unit、build、manifest/schema/catalog/template/source-contract 哈希、generation、测试时间及样本范围；不能继承别的 Unit 或旧 build 的绿灯。任意 semantic diff、重复发送、未解释游标推进、超龄积压、未解决 Uncertain、CoreUnready、ProducerUnready 或双库不一致均阻断 promotion。
+
+高频路径观察至少一个完整 eligible session，条件允许时不少于三个 occurrence；每日/低频路径确定性回放加一次自然 occurrence 或明确授权灰盒；Emergency/业务副作用路径至少两个 eligible session。每个启用的 authoritative channel 必须有真实 typed Accepted 和同 decision AlreadyDelivered/无第二次发送证明，不能用日志、COMPAT 或人工接受替代。Accepted→Finalized 目标两个 reconcile 周期、硬上限五分钟；未收敛不得继续晋级。Uncertain 保留 Q39 的 Emergency 1/15 分钟、Important 5 分钟/4 小时、Info/Research 下一 eligible session 前人工处置标准，不假设 Codex 自动值守。
+
+## 业务验收样本（PROPOSED）
+
+[Q:100]。所有行都是要求，尚未执行/通过样本验收。基线为冻结 `07781bf` 的 65-kind/52-Unit；样本来自已有分析报告，未连接或复制 `data/**`、消息正文、数据库或私人数据。下表来源路径相对仓库根；F01--F12 与 §9 仅引用已分析结论。
+
+| 样本 | 基线身份 | 必须证明 | 禁止结论 | 门禁 | 来源路径 | 章节定位 | 依据 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| historical_backfill_2026-08-31 | CURRENT_65_KIND:TomorrowWatch+PositionReview | OriginalBusinessDateStableDecisionExactReplay | SendDateEqualsBusinessDateOrLogMeansAccepted | unit,dedup,crash | docs/push-system/comprehensive-reanalysis-2026-09-05.md | §F01/§9 | [Q:100] [unit:MU-review-r07] [unit:MU-review-r11] |
+| n02_receipt_time | CURRENT_65_KIND:NewsFlashAggregated | ReceiptAcceptedAtSeparateFromSourceAnalyticsTime | WindowTimeMeansDeliveryTimeOrMissingMeansLoss | unit,shadow | docs/push-system/comprehensive-reanalysis-2026-09-05.md | §F01/§F10 | [Q:100] [unit:MU-news-flash-aggregate] |
+| g5b_test_namespace | CURRENT_65_KIND:G5bAttribution | TestRecordsRejectedBeforeProductionProviderLLMSink | SymbolPrefixReplacesNamespaceOrDeletePollution | failure,unit,shadow | docs/push-system/comprehensive-reanalysis-2026-09-05.md | §F02 | [Q:100] [unit:MU-g5b-attribution] |
+| news_ai_cross_batch | CURRENT_65_KIND:NewsToIdea;producer=news-ai-same-tick | BatchOnlyNoNewNotificationValidRevisionRemainsDistinct | CountReductionTargetOrAssessmentHashMeansContentRevision | dedup,shadow,crash | docs/push-system/comprehensive-reanalysis-2026-09-05.md | §F03 | [Q:100] [producer:news-ai-same-tick] [unit:MU-news-ai] |
+| paper_sell_254_2026-09-01 | CURRENT_65_KIND:PaperSell | EachFillIntentTracePartialFailureRecoveryNoNewOrderSegmentLatency | 254MeansDuplicateOrFileLatencyMeansAcceptedLatency | unit,failure,crash,dedup | docs/push-system/comprehensive-reanalysis-2026-09-05.md | §F04 | [Q:100] [unit:MU-paper-sell] |
+| attribution_g5b_sink_fail | CURRENT_65_KIND:AttributionDaily+G5bAttribution | SavedResultsReuseNoLLMRecomputeNoEarlyCursor | AnalysisSavedMeansDelivered | failure,crash,shadow | docs/push-system/comprehensive-reanalysis-2026-09-05.md | §F05 | [Q:100] [unit:MU-attribution-daily] [unit:MU-g5b-attribution] |
+| r03_blocked_input | CURRENT_65_KIND:IndustryChain;ReviewTask=R03 | FixedContractGapVisibleNoPollingNoNewProducer | BlameUserSnapshotOrEmptyAsNoData | unit,failure | docs/push-system/comprehensive-reanalysis-2026-09-05.md | §F07 | [Q:100] [unit:MU-review-r03-auto] [unit:MU-review-r03-manual] |
+| r08_retryability | CURRENT_65_KIND:EventCalendar;ReviewTask=R08 | NonretryableEvidencePreservedUntilCapabilityRecovery | StringMeansRetryableOrDropCFFEXRequirement | unit,failure | docs/push-system/comprehensive-reanalysis-2026-09-05.md | §F08 | [Q:100] [unit:MU-review-r08] |
+| no_data_disabled_uncertain | CURRENT_65_KIND_SCOPE:AllApplicableUnits | SeparateScheduleNotificationManualCounts | EmptyMeansNoDataOrDisabledMeansAcceptedOrBlindResend | unit,failure,dedup | docs/push-system/comprehensive-reanalysis-2026-09-05.md | §9 | [Q:100] [Q:86] |
+| cross_db_conflict_rollback | CURRENT_65_KIND_SCOPE:AllApplicableUnits | CASConflictResolutionRequiredNewGenerationPreserveAccepted | OverwriteConflictOrUndoExternalAccepted | crash,rollback,dedup | docs/push-system/comprehensive-reanalysis-2026-09-05.md | §9 | [Q:100] [Q:80] |
+
+08-31 历史补推涉及 08-26 PositionReview、08-28 TomorrowWatch/PositionReview，引用 MU-review-r07/MU-review-r11；不制造 ReviewBackfill kind。NewsAI 是业务路径名，对应 NewsToIdea 的 news-ai-same-tick producer。batch 是 lineage；相同事实只换 batch 不新增通知，跨目标/受众/交易日及明确有效修订仍分别验证，保留原 assessment/audit 的严格留存。PaperSell 的 254 条只作逐 fill 追踪样本，不以数量推断重复；恢复通知不得重跑模拟成交。R03 的固定合同缺口与用户快照缺失不是同一根因，若 ACTIVE 合同缺失按 ProducerUnready 隔离，不能永久伪装 occurrence 级 BlockedOnInput。
+
+## 非基线回放样本（PROPOSED）
+
+[Q:30] [Q:44] [Q:100]
+
+| 样本 | 状态 | 允许证明 | 禁止结论 | 门禁 | 来源路径 | 章节定位 | 依据 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| paper_buy_29_2026-09-04 | NON_BASELINE_REPLAY_ONLY | DesignReplayFilledVersusNotFilled | NoCatalogUnitNoBaselineCapabilityNoProducerActivationNoWaveChange | unit,crash,dedup | docs/push-system/comprehensive-reanalysis-2026-09-05.md | §F04 | [Q:30] [Q:100] |
+| watchdog_nonbaseline | NON_BASELINE_REPLAY_ONLY | DesignReplayLateStartupSlowReviewMissingRegistrationAlertFailure | NoCatalogUnitNoBaselineCapabilityNoProducerActivationNoWaveChange | unit,failure,crash | docs/push-system/comprehensive-reanalysis-2026-09-05.md | §F06 | [Q:30] [Q:100] |
+
+09-04 的 29 条 PaperBuy 与 Watchdog 仅为 67-kind 根工作树的非基线反例：不创建 catalog Unit、不证明当前隔离源码或部署能力、不激活 producer、不改变 Q44 顺序。Watchdog 回放区分 expected/progress/attempt/Accepted，晚启动、慢 review、无注册和 alert sink 失败不能用 fired 位抹平；该设计不能反推基线已具备哨兵。
+
+## 故障环境与验收边界（PROPOSED）
+
+[Q:49] [Q:99] [Q:100]
+
+| 环境 | 许可 | 禁止行为 | 依据 |
+| --- | --- | --- | --- |
+| Test | RejectionUncertainCrashReplayRollbackManualResolution | ProductionNamespaceAccess | [Q:49] |
+| Production | ApprovedNormalTypedReceiptAndSameDecisionIdempotentReplay | DisconnectKillDatabaseOrderOrManufactureFault | [Q:49] [Q:99] |
+
+本 RFC 继续为 PROVISIONAL。这些门禁只定义后续实施/验收合同，文档 validator 通过不代表运行时接线、生产晋级、WORM 部署或真实样本通过。Task4 不改 Rust/Cargo、SQL、目录、冻结来源或任何运行数据库；Unit 精确排期/风险波次映射由 Task5 承接，独立双轴复核由 Controller 安排。
 
 ## 规范 DDL 原始嵌入（PROPOSED）
 

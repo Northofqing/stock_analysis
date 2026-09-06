@@ -21,6 +21,44 @@ module ArchitectureDocs
     STATUSES = {'ACTIVE' => 36, 'INACTIVE' => 22, 'STARVED' => 5, 'OPT-IN' => 2}.freeze
     class Invalid < StandardError; end
     TYPE_FIELDS = {
+      'ScheduleOccurrence' => {
+        'schedule_occurrence_id' => 'Sha256',
+        'namespace' => 'Namespace',
+        'unit_id' => 'UnitId',
+        'producer_id' => 'ProducerId',
+        'schedule_or_trigger_id' => 'NonEmptyText',
+        'calendar_id' => 'NonEmptyText',
+        'business_date' => 'Date',
+        'occurrence_family' => 'NonEmptyText',
+        'occurrence_key' => 'NonEmptyText',
+        'completion_owner' => 'CatalogOwnerRef',
+        'source_contract_id' => 'NonEmptyText',
+        'window_start' => 'UtcMicros',
+        'window_end' => 'UtcMicros',
+        'catch_up_policy' => 'CatchUpPolicy',
+        'status' => 'ScheduleStatus',
+        'reason' => 'ReasonCode',
+        'created_at' => 'UtcMicros',
+        'updated_at' => 'UtcMicros',
+      },
+      'OperationalReadinessSnapshot' => {
+        'snapshot_id' => 'Sha256',
+        'captured_at' => 'UtcMicros',
+        'business_date' => 'Date',
+        'build_commit' => 'GitSha40',
+        'activation_generation' => 'u64',
+        'scope' => 'ReadinessScope',
+        'status' => 'ReadinessStatus',
+        'reason' => 'ReasonCode',
+        'dependency_refs' => 'Vec<DependencyRef>',
+        'affected_unit_ids' => 'Vec<UnitId>',
+        'affected_producer_ids' => 'Vec<ProducerId>',
+        'recovery_event_id' => 'RecoveryEventId',
+        'evidence_refs' => 'Vec<EvidenceRef>',
+        'liveness' => 'bool',
+        'deployment_ready' => 'bool',
+        'exit_disposition' => 'ExitDisposition',
+      },
       'RunContext' => {
         'schema_version' => 'u32',
         'run_id' => 'RunId',
@@ -195,6 +233,10 @@ module ArchitectureDocs
       'ManualResolvedRejected' => %w[AlreadyTerminal 是 never manual_not_delivered_no_cursor]
     }.freeze
     REASONS = %w[
+      schedule.window_open
+      schedule.deferred
+      input.source_recovered
+      activation.ready
       schedule.not_trading_day
       schedule.window_not_open
       schedule.window_expired
@@ -395,13 +437,293 @@ module ArchitectureDocs
         error: 'rfc_fault_matrix_invalid'
       },
     }.freeze
+    # v1 规范表的固定语义；只校验结构化单元格，不复制叙述或整份 RFC 快照。
+    ROLLOUT_CONTRACTS = {
+      "调度身份（PROPOSED）" => {
+        header: ["规则","函数","有序材料","排除材料","依据"],
+        rows: [
+          ["ScheduleOccurrence","SHA256CanonicalTuple","schema_version,namespace,unit_id,producer_id,schedule_or_trigger_id,calendar_id,business_date,occurrence_family,occurrence_key,completion_owner,source_contract_id","wall_clock_tick,phase_epic,activation_generation,build,payload_sha256,rendered_sha256,evidence_sha256"],
+        ],
+        error: 'rfc_schedule_identity_invalid'
+      },
+      "调度生命周期（PROPOSED）" => {
+        header: ["起点","终点","权威","窗口与版本条件","持久事实","禁止副作用","ReasonCode","依据"],
+        rows: [
+          ["Expected","Eligible","MarketSession","WindowOpen+CurrentVersion+ReadyGate","EligibilityEvent","ProviderOrSend","schedule.window_open"],
+          ["Eligible","Prepared","PhysicalOwner","WindowOpen+CurrentFence+VersionCAS","FrozenDecisionOrIntentRef","DispatchBeforeCommit","intent.created"],
+          ["Prepared","Closed","CompletionPolicy","BoundScheduleCloseProposal+VersionCAS","ScheduleClosureEvent","InferNotificationCursor","schedule.occurrence_closed"],
+          ["Expected","Missed","MarketSession","WindowExpired+NoCatchUp+VersionCAS","MissedEvent","StalePrepareOrSend","schedule.window_expired"],
+          ["Eligible","Missed","MarketSession","WindowExpired+NoCatchUp+VersionCAS","MissedEvent","StalePrepareOrSend","schedule.window_expired"],
+          ["Expected","Deferred","MarketSession","NextEligibleSession+VersionCAS","DeferredEvent+NextEligibilityRef","PrepareOrSend","schedule.deferred"],
+          ["Eligible","Deferred","MarketSession","NextEligibleSession+VersionCAS","DeferredEvent+NextEligibilityRef","PrepareOrSend","schedule.deferred"],
+          ["Expected","BlockedOnInput","SourceContract","UnavailableEvidence+VersionCAS","InputBlockEvent","EmptyAsNoDataOrPollPermanentGap","input.source_unavailable"],
+          ["Eligible","BlockedOnInput","SourceContract","UnavailableEvidence+VersionCAS","InputBlockEvent","EmptyAsNoDataOrPollPermanentGap","input.source_unavailable"],
+          ["BlockedOnInput","Eligible","SourceContract+MarketSession","RecoveryEvent+WindowOpen+ReadyGate+VersionCAS","InputRecoveryEvent","InventProducerOrIdentity","input.source_recovered"],
+          ["BlockedOnInput","Missed","MarketSession","WindowExpired+NoCatchUp+VersionCAS","MissedEvent","StalePrepareOrSend","schedule.window_expired"],
+          ["BlockedOnInput","Deferred","MarketSession","NextEligibleSession+VersionCAS","DeferredEvent+NextEligibilityRef","PrepareOrSend","schedule.deferred"],
+          ["Deferred","Eligible","MarketSession","NextEligibilityReached+ReadyGate+VersionCAS","DeferredRecoveryEvent","InventProducerOrIdentity","schedule.window_open"],
+        ],
+        error: 'rfc_schedule_lifecycle_invalid'
+      },
+      "调度恢复策略（PROPOSED）" => {
+        header: ["规则","适用范围","规范值","依据"],
+        rows: [
+          ["ExpireWithoutCatchUp","NewOccurrence","ExpiredMeansMissedNoSend"],
+          ["schema_version","ScheduleOccurrence","ScheduleOccurrence/v1"],
+          ["SameBusinessDayBeforeDeadline","NewOccurrence","SameBusinessDateAndBeforeWindowEndOnly"],
+          ["DeferToNextEligibleSession","NewOccurrence","PreserveIdentityAndLinkNextSession"],
+          ["RecoverPersistedOnly","ExistingIntentOrDecision","OriginalIdentityAndBytesNoPrepareNoWindowOverride"],
+          ["coalesce","Tick+StartupCatchUp+NormalDue","SameScheduleOccurrenceIdOnly"],
+          ["non_trading_day","SessionBound","NoOccurrence"],
+          ["non_trading_reason","schedule.not_trading_day","EvaluationOnlyNoOccurrenceNoNoDataOrDisabledIntent"],
+          ["independent_trigger","CatalogSessionIndependentEventOrManual","AuthorityBusinessDateRequired"],
+          ["INACTIVE","CatalogMetadata","NoTimerNoProducer"],
+          ["STARVED","ExistingProducer","PreserveStateUntilProductAndInputApproval"],
+          ["OPT-IN","ExistingProducer","PreserveStateUntilExplicitProductApproval"],
+        ],
+        error: 'rfc_schedule_recovery_invalid'
+      },
+      "运行就绪判定（PROPOSED）" => {
+        header: ["状态","范围","权威","存活","部署就绪","退出处置","恢复事件","ReasonCode","依据"],
+        rows: [
+          ["Ready","EvaluatedScope","OperationalReadinessSnapshot","true","true","Continue","ReadyObserved","activation.ready"],
+          ["CoreUnready","SharedPrerequisites","OperationalReadinessSnapshot","UntilControlledExit","false","StartupNonzeroOrStopNewAndRecoverIsolateThenNonzero","CoreDependenciesRestored","activation.core_unready"],
+          ["ProducerUnready","AffectedProducers","OperationalReadinessSnapshot","true","false","IsolateAffectedContinueOthers","ProducerContractRestored","activation.producer_unready"],
+          ["BlockedOnInput","KnownOccurrence","OperationalReadinessSnapshot","true","true","ContinueWithoutOccurrenceWork","InputEvidenceRestored","input.source_unavailable"],
+        ],
+        error: 'rfc_readiness_invalid'
+      },
+      "就绪查询与恢复合同（PROPOSED）" => {
+        header: ["规则","适用范围","规范值","依据"],
+        rows: [
+          ["authority","Health+Readiness+CLI","SameOperationalReadinessSnapshot"],
+          ["query_effects","AllQueries","NoProviderNoSinkNoTransition"],
+          ["log_pager","Logs+OptionalPager","ProjectionOnlyNeverReadinessAuthority"],
+          ["non_ready","CoreUnready+ProducerUnready+BlockedOnInput","StableReasonAffectedSetsQueryableRecoveryEvent"],
+          ["missing_active_contract","Source+Schedule+Presentation+Policy","EscalateProducerUnready"],
+          ["input.source_unready","RegisteredContractOccurrenceEvidenceUnavailable","BlockedOnInput"],
+          ["activation.producer_unready","ActiveProducerContractMissing","ProducerUnready"],
+          ["alert","ProducerUnready","IndependentOperationalAlert"],
+          ["recovery","AllScopes","AppendPendingOrRecoveredEventThenNewSnapshot"],
+        ],
+        error: 'rfc_readiness_query_invalid'
+      },
+      "物理所有权与晋级合同（PROPOSED）" => {
+        header: ["规则","适用范围","规范值","依据"],
+        rows: [
+          ["common_fence","LegacyAndNewSchedulerProducerDispatcherFinalizer","unit_id,generation,manifest_sha256,physical_owner"],
+          ["authorization","EveryActor","CurrentGateAndFenceRequired"],
+          ["Shadow","PhysicalOwner","None"],
+          ["Active","NewOccurrence","ManifestOwnerOnly"],
+          ["Draining","NewOccurrenceAndPrepare","ForbiddenPreserveAuthorityFinalizerReconcilerQuarantine"],
+          ["Disabled","PersistedFacts","PreserveAndFenceOldOwnerAgainstResend"],
+          ["daily_limit","NonEmergencyOwnerChangingPromotion","OneUnitPerBusinessDate"],
+          ["no_quota","ShadowOrNoOwnerChangeDeployment","DoesNotConsumeDailyPromotion"],
+          ["emergency_rollback","AnyTime","NewGenerationCASAppendJournalBlockLaterPromotionToday"],
+          ["parallel_shadow","MultipleUnits","ExactlyOneOwnerPerOccurrence"],
+          ["rollback_compatibility","LogicalOrFoundationCompatibleNMinusOne","PreserveAcceptedPendingFactsAndFences"],
+          ["quota_transaction","ActivationDB","BEGIN IMMEDIATE"],
+          ["quota_calendar","AuthorityBusinessDate","CalendarBoundUTCStartInclusiveEndExclusive"],
+          ["quota_query","AllUnitsPromotionJournalOccurredAt","RejectAnyActivateOrRollbackInBusinessDateInterval"],
+          ["quota_apply","SameImmediateTransaction","RevalidateGenerationThenAppendManifestAndJournalCommit"],
+          ["quota_authority","MemoryLockOrLogs","NeverSufficient"],
+        ],
+        error: 'rfc_activation_operations_invalid'
+      },
+      "风险波次顺序（PROPOSED）" => {
+        header: ["顺序","波次","晋级规则","依据"],
+        rows: [
+          ["1","CLI report typed BestEffort result","OneUnitPerBusinessDate"],
+          ["2","09:05 chain","OneUnitPerBusinessDate"],
+          ["3","15:30 chain","OneUnitPerBusinessDate"],
+          ["4","AttributionDaily","OneUnitPerBusinessDate"],
+          ["5","G5bAttribution","OneUnitPerBusinessDate"],
+          ["6","15:05 snapshot occurrence","OneUnitPerBusinessDate"],
+          ["7","CandidateBoard + CandidateInvalidated","OneUnitPerBusinessDate"],
+          ["8","LimitBoards","OneUnitPerBusinessDate"],
+          ["9","ReviewTask result semantics","OneUnitPerBusinessDate"],
+          ["10","PaperReview-Starved conformance","OneUnitPerBusinessDate"],
+        ],
+        error: 'rfc_risk_waves_invalid'
+      },
+      "影子精确比较（PROPOSED）" => {
+        header: ["比较项","输入约束","判等规则","差异处置","依据"],
+        rows: [
+          ["RunContext","SameInstance","ExactCapturedBusinessContext","BlockUnit:shadow.semantic_diff"],
+          ["PreparedFacts","SameImmutableInstance","IncludingCapturedModelOutputs","BlockUnit:shadow.semantic_diff"],
+          ["JobDecision","SharedFacts","ExactVariantAndAllFields","BlockUnit:shadow.semantic_diff"],
+          ["SemanticProjection.sha256","SharedFacts","ExactSha256","BlockUnit:shadow.semantic_diff"],
+          ["PreparedPush.rendered_sha256","SharedFacts","ExactSha256AndBytes","BlockUnit:shadow.semantic_diff"],
+          ["ReasonCode","SharedFacts","ExactCode","BlockUnit:shadow.semantic_diff"],
+          ["completion_proposal","SharedFacts","ExactScheduleAndCursorProposal","BlockUnit:shadow.semantic_diff"],
+          ["exclusions","ComparisonOnly","attempt_id,latency,diagnostic_timestamp","NoOtherExclusions"],
+        ],
+        error: 'rfc_shadow_compare_invalid'
+      },
+      "影子副作用（PROPOSED）" => {
+        header: ["副作用","许可","失败处置","依据"],
+        rows: [
+          ["provider_second_call","Forbidden","BlockUnit:shadow.side_effect_attempted"],
+          ["llm_recompute","Forbidden","BlockUnit:shadow.side_effect_attempted"],
+          ["business_db_write","Forbidden","BlockUnit:shadow.side_effect_attempted"],
+          ["durable_db_write","Forbidden","BlockUnit:shadow.side_effect_attempted"],
+          ["cursor_advance","Forbidden","BlockUnit:shadow.side_effect_attempted"],
+          ["candidate_watchlist_outcome","Forbidden","BlockUnit:shadow.side_effect_attempted"],
+          ["paper_order_fill","Forbidden","BlockUnit:shadow.side_effect_attempted"],
+          ["transport_send","Forbidden","BlockUnit:shadow.side_effect_attempted"],
+        ],
+        error: 'rfc_shadow_effects_invalid'
+      },
+      "操作员请求与输出（PROPOSED）" => {
+        header: ["方向","字段","类型","不变量","依据"],
+        rows: [
+          ["Request","command_id","Sha256","StableCommandIdentity"],
+          ["Request","command","OperatorCommand","inspect/reconcile/resolve-uncertain/promote/rollback"],
+          ["Request","target","TypedTargetRef","TargetTypeAndExactId"],
+          ["Request","expected_version","u64","CurrentVersionCAS"],
+          ["Request","expected_generation","u64","CurrentGenerationCAS"],
+          ["Request","dry_run","bool","RequiredForEveryCommand"],
+          ["Request","authenticated_operator_ref","AuthenticatedOperatorRef","HostOrServiceIdentityAndProductionAllowlist"],
+          ["Request","reason","ReasonCode","StableNamespacedCode"],
+          ["Request","evidence_refs","Vec<TypedEvidenceRef>","ProtectedURIAndSHA256AndTypeAndVersion"],
+          ["Request","requested_at","UtcMicros","CapturedRequestTime"],
+          ["Response","decision","OperatorDecision","Inspected/Planned/Applied/Refused"],
+          ["Response","before_refs","Vec<TypedStateRef>","ExactBeforeSnapshot"],
+          ["Response","after_refs","Vec<TypedStateRef>","AppliedOrExplicitlyProjected"],
+          ["Response","affected_rows","u64","ZeroForDryRunRefusalOrInspect"],
+          ["Response","mutation_journal_event_ref","Option<MutationEventRef>","AppliedMutationOnlyNullForInspectDryRunRefusal"],
+          ["Response","operator_audit_event_ref","OperatorAuditEventRef","IndependentControlPlaneEnvelopeReference"],
+          ["Response","refusal_reason","Option<ReasonCode>","RequiredWhenRefused"],
+          ["Response","snapshot_sha256","Sha256","CanonicalResponseAndEvidenceBinding"],
+        ],
+        error: 'rfc_operator_wire_invalid'
+      },
+      "操作员命令（PROPOSED）" => {
+        header: ["命令","目标","最小证据","允许行为","拒绝原因","演练","依据"],
+        rows: [
+          ["inspect","UnitOrIntentOrDecision","AuthenticatedIdentity+TargetRef","ReadOnlySnapshot","operator.unauthorized","SupportedNoWrites"],
+          ["reconcile","IntentOrUnit","CurrentVersionFence+AuthorityRefs","DeterministicIdempotentRecoveryOnly","intent.expected_version_conflict","SupportedNoWrites"],
+          ["resolve-uncertain","Decision","PriorInspect+ExactTerminalBinding+CurrentFenceVersion+ExternalEvidenceHash","AppendManualDispositionNeverRewriteReceipt","operator.resolution_conflict","SupportedNoWrites"],
+          ["promote","Unit","CurrentManifest+SixFreshGates+WaveRank+DailyJournal+OnlineApproval","OneOwnerCASAppendJournal","activation.generation_conflict","SupportedNoWrites"],
+          ["rollback","Unit","CompatibleRollbackTarget+CurrentFenceVersion+AuthenticatedRollbackPermission","NewGenerationCASAppendJournalPreserveAcceptedPending","activation.generation_conflict","SupportedNoWrites"],
+        ],
+        error: 'rfc_operator_commands_invalid'
+      },
+      "操作员权限（PROPOSED）" => {
+        header: ["规则","认证与审批","规范值","依据"],
+        rows: [
+          ["SingleControl","AuthenticatedOnlineUserOrProductionAllowlistedOperator","V1BaselineOneMayApproveAndExecute"],
+          ["DualControl","ExternalUnitOrOrganizationPolicy","DistinctAuthenticatedPreparerAndApproverCannotDowngrade"],
+          ["emergency_rollback","AuthenticatedOperatorWithRollbackPermission","SingleOperatorAllowedAuditRequired"],
+          ["Codex","EvidenceAndCommandPreparation","NeverProductionApproverOrExecutor"],
+          ["dry_run_and_refusal","EveryCommand","NoDBNoJournalNoOwnerChangeNoProviderNoLLMNoSinkNoOrder"],
+          ["unauthorized","MissingOrFreeTextIdentity","Refuse:operator.unauthorized"],
+          ["invalid_evidence","MissingInvalidOrUnboundEvidence","Refuse:operator.evidence_invalid"],
+          ["stale_version","ExpectedVersionConflict","Refuse:intent.expected_version_conflict"],
+          ["stale_generation","ExpectedGenerationConflict","Refuse:activation.generation_conflict"],
+          ["binding_conflict","TerminalOrOwnerBindingMismatch","Refuse:operator.resolution_conflict"],
+          ["refusal_audit","OperatorAuditEnvelope","IndependentControlPlaneAuditSinkOnly"],
+          ["audit_envelope","AuthenticatedIdentityOrUnauthenticatedMarker","CommandHashTimeReasonEvidenceHashSnapshotHash"],
+          ["dry_run_refusal_storage","BusinessDurableActivationDBAndPromotionJournal","NoWrites"],
+        ],
+        error: 'rfc_operator_authorization_invalid'
+      },
+      "证据保留类别（PROPOSED）" => {
+        header: ["类别","起算条件","最低策略","存储与清理","依据"],
+        rows: [
+          ["NonTerminal","UntilVerifiedTerminal","NeverAutoDelete","PreserveIncludingUncertainAndResolutionRequired"],
+          ["MigrationEvidence","TerminalAndProductionVerified","AtLeast90DaysAfterBoth","CleanupEligibilityAllRequired"],
+          ["DeliveryAuditRegulatory","ApplicableRegulatoryStart","StrictlyGreaterThanFiveYears","ExternalWORMOrObjectLockNeverRewrite"],
+          ["ModelDecisionTrade","ApplicablePolicyStart","StrictestRegulatoryModelTradeSourcePolicy","NoUnifiedFiveYearMaximum"],
+        ],
+        error: 'rfc_retention_invalid'
+      },
+      "清理资格与安全（PROPOSED）" => {
+        header: ["条件","规范值","依据"],
+        rows: [
+          ["terminal_binding","VerifiedExactLegalBindingRequired"],
+          ["transition_journal_audit","AllLinkedIntegrityVerifiedRequired"],
+          ["retention_expiry","StrictestApplicablePolicyExpiredRequired"],
+          ["legal_hold","AbsentRequired"],
+          ["disclosure","MinimumMetadataProtectedURIHashOnly"],
+          ["backup_integrity","IndependentBackupsAndIntegrityEvidenceRequired"],
+          ["nonterminal_uncertain_resolution","NeverAutoDelete"],
+          ["worm_mutation","Forbidden"],
+          ["secrets_and_unnecessary_content","NoKeysCookiesWebhookURLUnnecessaryBodyOrPositions"],
+        ],
+        error: 'rfc_cleanup_invalid'
+      },
+      "通用晋级门禁（PROPOSED）" => {
+        header: ["门禁","输入","通过证据","失败原因","阻断晋级","依据"],
+        rows: [
+          ["unit","CurrentUnitBuildCatalogContracts","TypedDecisionsExactBindingsAndAllBranches","input.evidence_invalid","true"],
+          ["failure","TestNamespaceFaultMatrix","RejectionUncertainIsolationNoFalseCompletion","transport.uncertain","true"],
+          ["crash","SevenStepCommitBoundaries","OriginalIdentityBytesRecoveryNoLostIntent","intent.transition_conflict","true"],
+          ["shadow","SharedContextFactsAndEffectCounters","ExactCompareZeroForbiddenEffects","shadow.semantic_diff","true"],
+          ["dedup","SameDecisionReplayAndBusinessRevisions","NoSecondSendNoOverDedupExactReceipt","intent.payload_conflict","true"],
+          ["rollback","PendingAcceptedUncertainAndOldOwner","NewGenerationJournalFenceNoResend","activation.owner_conflict","true"],
+        ],
+        error: 'rfc_rollout_gates_invalid'
+      },
+      "业务验收样本（PROPOSED）" => {
+        header: ["样本","基线身份","必须证明","禁止结论","门禁","来源路径","章节定位","依据"],
+        rows: [
+          ["historical_backfill_2026-08-31","CURRENT_65_KIND:TomorrowWatch+PositionReview","OriginalBusinessDateStableDecisionExactReplay","SendDateEqualsBusinessDateOrLogMeansAccepted","unit,dedup,crash","docs/push-system/comprehensive-reanalysis-2026-09-05.md","§F01/§9"],
+          ["n02_receipt_time","CURRENT_65_KIND:NewsFlashAggregated","ReceiptAcceptedAtSeparateFromSourceAnalyticsTime","WindowTimeMeansDeliveryTimeOrMissingMeansLoss","unit,shadow","docs/push-system/comprehensive-reanalysis-2026-09-05.md","§F01/§F10"],
+          ["g5b_test_namespace","CURRENT_65_KIND:G5bAttribution","TestRecordsRejectedBeforeProductionProviderLLMSink","SymbolPrefixReplacesNamespaceOrDeletePollution","failure,unit,shadow","docs/push-system/comprehensive-reanalysis-2026-09-05.md","§F02"],
+          ["news_ai_cross_batch","CURRENT_65_KIND:NewsToIdea;producer=news-ai-same-tick","BatchOnlyNoNewNotificationValidRevisionRemainsDistinct","CountReductionTargetOrAssessmentHashMeansContentRevision","dedup,shadow,crash","docs/push-system/comprehensive-reanalysis-2026-09-05.md","§F03"],
+          ["paper_sell_254_2026-09-01","CURRENT_65_KIND:PaperSell","EachFillIntentTracePartialFailureRecoveryNoNewOrderSegmentLatency","254MeansDuplicateOrFileLatencyMeansAcceptedLatency","unit,failure,crash,dedup","docs/push-system/comprehensive-reanalysis-2026-09-05.md","§F04"],
+          ["attribution_g5b_sink_fail","CURRENT_65_KIND:AttributionDaily+G5bAttribution","SavedResultsReuseNoLLMRecomputeNoEarlyCursor","AnalysisSavedMeansDelivered","failure,crash,shadow","docs/push-system/comprehensive-reanalysis-2026-09-05.md","§F05"],
+          ["r03_blocked_input","CURRENT_65_KIND:IndustryChain;ReviewTask=R03","FixedContractGapVisibleNoPollingNoNewProducer","BlameUserSnapshotOrEmptyAsNoData","unit,failure","docs/push-system/comprehensive-reanalysis-2026-09-05.md","§F07"],
+          ["r08_retryability","CURRENT_65_KIND:EventCalendar;ReviewTask=R08","NonretryableEvidencePreservedUntilCapabilityRecovery","StringMeansRetryableOrDropCFFEXRequirement","unit,failure","docs/push-system/comprehensive-reanalysis-2026-09-05.md","§F08"],
+          ["no_data_disabled_uncertain","CURRENT_65_KIND_SCOPE:AllApplicableUnits","SeparateScheduleNotificationManualCounts","EmptyMeansNoDataOrDisabledMeansAcceptedOrBlindResend","unit,failure,dedup","docs/push-system/comprehensive-reanalysis-2026-09-05.md","§9"],
+          ["cross_db_conflict_rollback","CURRENT_65_KIND_SCOPE:AllApplicableUnits","CASConflictResolutionRequiredNewGenerationPreserveAccepted","OverwriteConflictOrUndoExternalAccepted","crash,rollback,dedup","docs/push-system/comprehensive-reanalysis-2026-09-05.md","§9"],
+        ],
+        error: 'rfc_acceptance_samples_invalid'
+      },
+      "非基线回放样本（PROPOSED）" => {
+        header: ["样本","状态","允许证明","禁止结论","门禁","来源路径","章节定位","依据"],
+        rows: [
+          ["paper_buy_29_2026-09-04","NON_BASELINE_REPLAY_ONLY","DesignReplayFilledVersusNotFilled","NoCatalogUnitNoBaselineCapabilityNoProducerActivationNoWaveChange","unit,crash,dedup","docs/push-system/comprehensive-reanalysis-2026-09-05.md","§F04"],
+          ["watchdog_nonbaseline","NON_BASELINE_REPLAY_ONLY","DesignReplayLateStartupSlowReviewMissingRegistrationAlertFailure","NoCatalogUnitNoBaselineCapabilityNoProducerActivationNoWaveChange","unit,failure,crash","docs/push-system/comprehensive-reanalysis-2026-09-05.md","§F06"],
+        ],
+        error: 'rfc_nonbaseline_samples_invalid'
+      },
+      "故障环境与验收边界（PROPOSED）" => {
+        header: ["环境","许可","禁止行为","依据"],
+        rows: [
+          ["Test","RejectionUncertainCrashReplayRollbackManualResolution","ProductionNamespaceAccess"],
+          ["Production","ApprovedNormalTypedReceiptAndSameDecisionIdempotentReplay","DisconnectKillDatabaseOrderOrManufactureFault"],
+        ],
+        error: 'rfc_fault_environment_invalid'
+      },
+    }.freeze
+    # 合法引用仍可能指向错误 Unit；样本绑定独立校验，不能只验证 ID 存在。
+    # 样本来源路径/章节闭集由 ROLLOUT_CONTRACTS 固定；RfcInputs 同时校验该来源存在与 SHA。
+    SAMPLE_BINDINGS = {
+      'historical_backfill_2026-08-31' => [['unit', 'MU-review-r07'], ['unit', 'MU-review-r11']],
+      'n02_receipt_time' => [['unit', 'MU-news-flash-aggregate']],
+      'g5b_test_namespace' => [['unit', 'MU-g5b-attribution']],
+      'news_ai_cross_batch' => [['producer', 'news-ai-same-tick'], ['unit', 'MU-news-ai']],
+      'paper_sell_254_2026-09-01' => [['unit', 'MU-paper-sell']],
+      'attribution_g5b_sink_fail' => [['unit', 'MU-attribution-daily'], ['unit', 'MU-g5b-attribution']],
+      'r03_blocked_input' => [['unit', 'MU-review-r03-auto'], ['unit', 'MU-review-r03-manual']],
+      'r08_retryability' => [['unit', 'MU-review-r08']],
+      'no_data_disabled_uncertain' => [],
+      'cross_db_conflict_rollback' => [],
+      'paper_buy_29_2026-09-04' => [],
+      'watchdog_nonbaseline' => []
+    }.freeze
     CANONICAL_EXCEPTIONS = {
+      'ScheduleOccurrence' => {'schedule_occurrence_id' => '派生且排除自身'},
+      'OperationalReadinessSnapshot' => {'snapshot_id' => '派生且排除自身'},
       'PreparedFacts' => {'canonical_facts' => '外部原始字节', 'facts_sha256' => '派生且排除自身'},
       'SemanticProjection' => {'canonical_bytes' => '派生且排除自身', 'sha256' => '派生且排除自身'},
       'PreparedPush' => {'rendered_bytes' => '外部原始字节'},
       'VerifiedTerminalRef' => {'verified_at' => '派生且排除自身', 'binding_sha256' => '派生且排除自身'}
     }.freeze
     FIELD_RULE_REFERENCES = {
+      ['ScheduleOccurrence', 'schedule_occurrence_id'] => ['ScheduleIdentity::v1', 'rfc_schedule_identity_invalid'],
       ['PreparedPush', 'intent_id'] => ['IdentityRule::PreparedPushIntent', 'rfc_identity_contract_invalid'],
       ['VerifiedTerminalRef', 'binding_sha256'] => ['IdentityRule::TerminalBinding', 'rfc_identity_contract_invalid'],
       ['CompletionPolicy', 'already_terminal_policy'] => ['CompletionRule::AlreadyTerminal', 'rfc_completion_binding_invalid']
@@ -457,7 +779,7 @@ module ArchitectureDocs
         errors << "rfc_section_duplicate name=#{name}" if sections.key?(name)
         sections[name] = body
       end
-      required = (REQUIRED_SECTIONS + SEMANTIC_CONTRACTS.keys + PERSISTENCE_CONTRACTS.keys +
+      required = (REQUIRED_SECTIONS + SEMANTIC_CONTRACTS.keys + PERSISTENCE_CONTRACTS.keys + ROLLOUT_CONTRACTS.keys +
                   ['业务持久化范围与 SQL 字节合同（PROPOSED）', '最终化事务与恢复边界（PROPOSED）', '规范 DDL 原始嵌入（PROPOSED）'] +
                   TYPE_FIELDS.keys.map { |name| "类型：#{name}（PROPOSED）" }).uniq
       required.each do |name|
@@ -505,9 +827,17 @@ module ArchitectureDocs
 
     def semantic_contract_errors(sections)
       errors = []
-      SEMANTIC_CONTRACTS.merge(PERSISTENCE_CONTRACTS).each do |name, profile|
-        rows = section_table(sections, name, profile[:header], errors).map { |row| row[0...-1] }
-        errors << profile[:error] unless rows.sort == profile[:rows].sort
+      SEMANTIC_CONTRACTS.merge(PERSISTENCE_CONTRACTS).merge(ROLLOUT_CONTRACTS).each do |name, profile|
+        rows = section_table(sections, name, profile[:header], errors)
+        errors << profile[:error] unless rows.map { |row| row[0...-1] }.sort == profile[:rows].sort
+        if ['业务验收样本（PROPOSED）', '非基线回放样本（PROPOSED）'].include?(name)
+          rows.each do |row|
+            bindings = references(row.last).select { |type, _| %w[unit producer].include?(type) }
+            unless bindings.sort == SAMPLE_BINDINGS.fetch(row.first, []).sort
+              errors << "rfc_sample_bindings_invalid sample=#{row.first}"
+            end
+          end
+        end
       end
       errors
     end
@@ -581,7 +911,7 @@ module ArchitectureDocs
         end
       end
       errors << 'rfc_reason_coverage_invalid' unless (REASONS - reasons).empty?
-      PERSISTENCE_CONTRACTS.each_value do |profile|
+      PERSISTENCE_CONTRACTS.merge(ROLLOUT_CONTRACTS).each_value do |profile|
         column = profile[:header].index('ReasonCode')
         next unless column
         profile[:rows].each do |row|
