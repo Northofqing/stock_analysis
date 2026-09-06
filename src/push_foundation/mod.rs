@@ -13,4 +13,6 @@ pub(crate) use intent_store::{InitialCommitFault, TransitionFault};
 pub use migration::{FoundationMigrationError, FoundationSchemaMigration, MigrationReceipt};
 
 #[cfg(test)]
+mod terminal_authority_tests;
+#[cfg(test)]
 mod tests;
