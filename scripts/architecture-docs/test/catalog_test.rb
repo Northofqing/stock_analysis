@@ -210,7 +210,9 @@ class CatalogTest < Minitest::Test
       ["fn build() { let _ = r#impl::Foo {}; }\n", '::Foo'],
       ["type Alias = impl std::fmt::Debug;\n", 'std::fmt::Debug'],
       ["fn consume(value: impl std::fmt::Debug) {}\n", 'std::fmt::Debug'],
-      ["fn build() { invoke!(impl Foo {}); }\n", 'Foo']
+      ["fn build() { invoke!(impl Foo {}); }\n", 'Foo'],
+      ["fn build() { values[0] impl Foo {} }\n", 'Foo'],
+      ["fn build() { values! [0] impl Foo {} }\n", 'Foo']
     ].each do |source, symbol|
       with_fixture do |root|
         add_code_evidence(root, source, symbol, 'rust_impl', 1, 1)
@@ -230,6 +232,31 @@ class CatalogTest < Minitest::Test
     ].each do |source, symbol|
       with_fixture do |root|
         add_code_evidence(root, source, symbol, 'rust_impl', 1, 1)
+        out, err, result = cli(root)
+        assert_equal 0, result.exitstatus, out + err
+      end
+    end
+  end
+
+  def test_spaced_attribute_markers_do_not_hide_duplicate_impl_items
+    ['# [allow(dead_code)]', '# /* gap */ [allow(dead_code)]',
+     '# ! [allow(dead_code)]', '# /* gap */ ! /* gap */ [allow(dead_code)]'].each do |attribute|
+      with_fixture do |root|
+        source = "mod one { #{attribute} impl Foo {} }\nimpl Foo {}\n"
+        add_code_evidence(root, source, 'Foo', 'rust_impl', 2, 2)
+        out, err, result = cli(root)
+        assert_equal 1, result.exitstatus, out + err
+        assert_includes out + err, 'symbol_ambiguous symbol=Foo'
+      end
+    end
+  end
+
+  def test_spaced_attribute_markers_allow_unique_impl_items
+    ['# [allow(dead_code)]', '# /* gap */ [allow(dead_code)]',
+     '# ! [allow(dead_code)]', '# /* gap */ ! /* gap */ [allow(dead_code)]'].each do |attribute|
+      with_fixture do |root|
+        source = "mod one { #{attribute} impl Foo {} }\n"
+        add_code_evidence(root, source, 'Foo', 'rust_impl', 1, 1)
         out, err, result = cli(root)
         assert_equal 0, result.exitstatus, out + err
       end

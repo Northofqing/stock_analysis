@@ -138,12 +138,13 @@ module ArchitectureDocs
         end
         return false unless depth.zero?
 
-        # cursor is just before the matching '['; require an attribute marker,
-        # not an arbitrary preceding array/index expression.
-        cursor -= 1 if cursor >= 0 && prefix.getbyte(cursor) == 33
-        return false unless cursor >= 0 && prefix.getbyte(cursor) == 35
+        # Rust permits whitespace/comments between attribute punctuation.
+        # Still require '#', not an arbitrary preceding array/index expression.
+        marker = prefix.byteslice(0, cursor + 1).rstrip
+        marker = marker.byteslice(0, marker.bytesize - 1).rstrip if marker.end_with?('!')
+        return false unless marker.end_with?('#')
 
-        prefix = prefix.byteslice(0, cursor).rstrip
+        prefix = marker.byteslice(0, marker.bytesize - 1).rstrip
       end
       prefix.empty? || [59, 123, 125].include?(prefix.getbyte(prefix.bytesize - 1))
     end
