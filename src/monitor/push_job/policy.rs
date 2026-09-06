@@ -96,7 +96,7 @@ reason_codes! {
 }
 
 impl ReasonCode {
-    const fn allows_input_backoff(self) -> bool {
+    pub(super) const fn allows_input_backoff(self) -> bool {
         matches!(
             self,
             Self::InputSourceUnavailable
@@ -104,6 +104,18 @@ impl ReasonCode {
                 | Self::InputEvidenceInvalid
                 | Self::InputNoVerifiedBatch
                 | Self::InputAccountSnapshotMissing
+        )
+    }
+
+    pub(super) const fn is_input_blocker(self) -> bool {
+        matches!(
+            self,
+            Self::InputSourceUnavailable
+                | Self::InputSourceUnready
+                | Self::InputEvidenceInvalid
+                | Self::InputNoVerifiedBatch
+                | Self::InputAccountSnapshotMissing
+                | Self::InputNamespaceViolation
         )
     }
 }

@@ -41,8 +41,9 @@ pub use policy::{
     VerifiedEmptyEvidenceRef,
 };
 pub use projection::{
-    DecisionProjector, MonitorKind, ProjectionError, SemanticInput, SemanticProjection, Severity,
-    SubKind, SubKindValue, Suppression,
+    DecisionProjector, JobDecision, JobDecisionView, MonitorKind, PreparedPush,
+    PreparedPushComparison, ProjectionError, ReadyPreparation, RenderStateView, SemanticInput,
+    SemanticProjection, Severity, SourceBinding, SubKind, SubKindValue, Suppression,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]

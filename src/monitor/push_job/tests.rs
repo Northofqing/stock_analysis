@@ -1839,7 +1839,7 @@ fn w05_prepared_push_binds_all_fields_and_first_exact_rendered_bytes() {
     assert_eq!(push.rendered_sha256(), push.rendered_bytes().sha256());
     assert_eq!(
         push.rendered_sha256().as_str(),
-        "W05_RENDERED_BYTES_GOLDEN_TO_BE_REPLACED"
+        "d0bff0170bb997419bcc1c855032d1aba19c1befcdc17ed17e88c6accd552146"
     );
     assert_eq!(
         push.intent_id(),
@@ -1854,8 +1854,12 @@ fn w05_prepared_push_binds_all_fields_and_first_exact_rendered_bytes() {
         ))
     );
     assert_eq!(
+        push.intent_id().as_str(),
+        "1908f4826597b7203a9ae287078d76f52e4cd1be16a301c43eb91ff3043a66bb"
+    );
+    assert_eq!(
         push.decision_id().as_str(),
-        "W05_DECISION_ID_GOLDEN_TO_BE_REPLACED"
+        "d20eb0fd113dc403bdc2942e6ffe0b5626c2b53bffd731c0c33e5f6b1c9e854f"
     );
     assert_eq!(decision.canonical_sha256(), decision.canonical_sha256());
 }

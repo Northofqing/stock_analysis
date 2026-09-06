@@ -6,9 +6,11 @@ use super::canonical::{canonical_digest, canonical_preimage, CanonicalValue};
 use super::facts::{model_output_ref_value, source_ref_value};
 use super::identity::{subject_value, validate_text};
 use super::{
-    AudienceId, CompletionOwnerId, CompletionPolicyId, CompletionPolicyVersion, ExactBytes,
-    Namespace, OccurrenceId, PreparedFacts, PreparedFactsSnapshot, PushJobError, ReasonCode,
-    Result, RunContext, Sha256Digest, SubjectId, TemplateId, TemplateVersion, UnitId, UtcMicros,
+    derive_intent_id, AudienceId, CompletionOwnerId, CompletionPolicyId, CompletionPolicyVersion,
+    DecisionId, ExactBytes, IntentId, IntentIdentityMaterial, Namespace, OccurrenceId,
+    PreparedFacts, PreparedFactsSnapshot, PushJobError, ReasonCode, Result, RunContext,
+    Sha256Digest, SourceContractId, SourceContractVersion, SourceRef, SubjectId, TemplateId,
+    TemplateVersion, UnitId, UtcMicros,
 };
 
 macro_rules! monitor_kinds {
@@ -245,6 +247,18 @@ pub enum ProjectionError {
     UnitBindingMismatch,
     #[error("prepared facts do not belong to the projector run context")]
     ContextFactsMismatch,
+    #[error("verified-empty facts cannot produce a Ready decision")]
+    VerifiedEmptyCannotBeReady,
+    #[error("a suppressed semantic projection cannot produce a Ready decision")]
+    SuppressedCannotBeReady,
+    #[error("NoData requires verified-empty facts")]
+    NoDataRequiresVerifiedEmpty,
+    #[error("reason is not allowed for {branch}")]
+    ReasonNotAllowed { branch: &'static str },
+    #[error("rendered bytes are not valid UTF-8")]
+    RenderedBytesNotUtf8,
+    #[error("render was already attempted while preparation was {state:?}")]
+    RenderAlreadyAttempted { state: RenderStateView },
 }
 
 /// A catalog-bound pure projector. It has no provider, model, clock, storage, or sink capability.
@@ -290,6 +304,116 @@ impl DecisionProjector {
             return Err(ProjectionError::ContextFactsMismatch);
         }
         Ok(SemanticProjection::new(self, facts.facts(), input))
+    }
+
+    pub fn prepare_ready(
+        self,
+        facts: PreparedFactsSnapshot,
+        input: SemanticInput,
+    ) -> std::result::Result<ReadyPreparation, ProjectionError> {
+        ReadyPreparation::new(self, facts, input)
+    }
+
+    pub fn decide_no_data(
+        self,
+        facts: &PreparedFactsSnapshot,
+        reason: ReasonCode,
+    ) -> std::result::Result<JobDecision, ProjectionError> {
+        self.verify_facts_context(facts)?;
+        if !facts.facts().verified_empty() {
+            return Err(ProjectionError::NoDataRequiresVerifiedEmpty);
+        }
+        if reason != ReasonCode::IntentNoData {
+            return Err(ProjectionError::ReasonNotAllowed { branch: "NoData" });
+        }
+        Ok(JobDecision::new(JobDecisionKind::NoData {
+            reason,
+            evidence_sha256: facts.facts().canonical_sha256(),
+        }))
+    }
+
+    pub fn decide_disabled(
+        self,
+        reason: ReasonCode,
+    ) -> std::result::Result<JobDecision, ProjectionError> {
+        if !matches!(
+            reason,
+            ReasonCode::PolicyDisabled | ReasonCode::PolicyOptInDisabled
+        ) {
+            return Err(ProjectionError::ReasonNotAllowed { branch: "Disabled" });
+        }
+        Ok(JobDecision::new(JobDecisionKind::Disabled { reason }))
+    }
+
+    pub fn decide_blocked_on_input(
+        self,
+        reason: ReasonCode,
+        retry_after: Option<UtcMicros>,
+    ) -> std::result::Result<JobDecision, ProjectionError> {
+        if !reason.is_input_blocker() {
+            return Err(ProjectionError::ReasonNotAllowed {
+                branch: "BlockedOnInput",
+            });
+        }
+        Ok(JobDecision::new(JobDecisionKind::BlockedOnInput {
+            reason,
+            retry_after,
+        }))
+    }
+
+    pub fn decide_suppressed(
+        self,
+        facts: &PreparedFactsSnapshot,
+        input: SemanticInput,
+    ) -> std::result::Result<JobDecision, ProjectionError> {
+        let projection = self.project_semantics(facts, input)?;
+        match projection.suppression {
+            Suppression::Eligible => Err(ProjectionError::ReasonNotAllowed {
+                branch: "Suppressed",
+            }),
+            Suppression::Suppressed {
+                reason,
+                eligible_after,
+            } => Ok(JobDecision::new(JobDecisionKind::Suppressed {
+                reason,
+                eligible_after,
+            })),
+        }
+    }
+
+    pub fn decide_retryable_failure(
+        self,
+        reason: ReasonCode,
+        retry_after: Option<UtcMicros>,
+    ) -> std::result::Result<JobDecision, ProjectionError> {
+        if !reason.allows_input_backoff() {
+            return Err(ProjectionError::ReasonNotAllowed {
+                branch: "RetryableFailure",
+            });
+        }
+        Ok(JobDecision::new(JobDecisionKind::RetryableFailure {
+            reason,
+            retry_after,
+        }))
+    }
+
+    pub fn decide_permanent_failure(
+        self,
+        reason: ReasonCode,
+    ) -> std::result::Result<JobDecision, ProjectionError> {
+        Ok(JobDecision::new(JobDecisionKind::PermanentFailure {
+            reason,
+        }))
+    }
+
+    fn verify_facts_context(
+        &self,
+        facts: &PreparedFactsSnapshot,
+    ) -> std::result::Result<(), ProjectionError> {
+        if facts.facts().run_context_sha256() != &self.run_context_sha256 {
+            return Err(ProjectionError::ContextFactsMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -528,6 +652,528 @@ fn suppression_value(suppression: &Suppression) -> CanonicalValue {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceBinding {
+    source_contract_id: SourceContractId,
+    source_contract_version: SourceContractVersion,
+    source_refs: Vec<SourceRef>,
+    evidence_fingerprint: Sha256Digest,
+}
+
+impl SourceBinding {
+    fn from_facts(facts: &PreparedFacts, evidence_fingerprint: Sha256Digest) -> Self {
+        Self {
+            source_contract_id: facts.source_contract_id().clone(),
+            source_contract_version: facts.source_contract_version().clone(),
+            source_refs: facts.source_refs().to_vec(),
+            evidence_fingerprint,
+        }
+    }
+
+    pub fn source_contract_id(&self) -> &SourceContractId {
+        &self.source_contract_id
+    }
+
+    pub fn source_contract_version(&self) -> &SourceContractVersion {
+        &self.source_contract_version
+    }
+
+    pub fn source_refs(&self) -> &[SourceRef] {
+        &self.source_refs
+    }
+
+    pub fn evidence_fingerprint(&self) -> &Sha256Digest {
+        &self.evidence_fingerprint
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct PreparedPush {
+    intent_id: IntentId,
+    decision_id: DecisionId,
+    unit_id: UnitId,
+    occurrence: OccurrenceId,
+    subject: SubjectId,
+    run_context_sha256: Sha256Digest,
+    prepared_facts_sha256: Sha256Digest,
+    semantic_projection_sha256: Sha256Digest,
+    source_binding: SourceBinding,
+    rendered_bytes: ExactBytes,
+    rendered_sha256: Sha256Digest,
+}
+
+impl PreparedPush {
+    fn from_first_render(
+        projector: &DecisionProjector,
+        facts: &PreparedFacts,
+        projection: &SemanticProjection,
+        rendered_bytes: ExactBytes,
+    ) -> Self {
+        let intent_id = derive_intent_id(&IntentIdentityMaterial::new(
+            projector.namespace.clone(),
+            projector.unit_id.clone(),
+            projector.binding.completion_owner.clone(),
+            facts.source_contract_id().clone(),
+            projector.occurrence.clone(),
+            projection.business_subject.clone(),
+            projection.audience.clone(),
+        ));
+        let decision_id = derive_decision_id(&intent_id);
+        let rendered_sha256 = rendered_bytes.sha256().clone();
+        Self {
+            intent_id,
+            decision_id,
+            unit_id: projector.unit_id.clone(),
+            occurrence: projector.occurrence.clone(),
+            subject: projection.business_subject.clone(),
+            run_context_sha256: projector.run_context_sha256.clone(),
+            prepared_facts_sha256: facts.canonical_sha256(),
+            semantic_projection_sha256: projection.sha256.clone(),
+            source_binding: SourceBinding::from_facts(
+                facts,
+                projection.evidence_fingerprint.clone(),
+            ),
+            rendered_bytes,
+            rendered_sha256,
+        }
+    }
+
+    pub fn intent_id(&self) -> &IntentId {
+        &self.intent_id
+    }
+
+    pub fn decision_id(&self) -> &DecisionId {
+        &self.decision_id
+    }
+
+    pub fn unit_id(&self) -> &UnitId {
+        &self.unit_id
+    }
+
+    pub fn occurrence(&self) -> &OccurrenceId {
+        &self.occurrence
+    }
+
+    pub fn subject(&self) -> &SubjectId {
+        &self.subject
+    }
+
+    pub fn run_context_sha256(&self) -> &Sha256Digest {
+        &self.run_context_sha256
+    }
+
+    pub fn prepared_facts_sha256(&self) -> &Sha256Digest {
+        &self.prepared_facts_sha256
+    }
+
+    pub fn semantic_projection_sha256(&self) -> &Sha256Digest {
+        &self.semantic_projection_sha256
+    }
+
+    pub fn source_binding(&self) -> &SourceBinding {
+        &self.source_binding
+    }
+
+    pub fn rendered_bytes(&self) -> &ExactBytes {
+        &self.rendered_bytes
+    }
+
+    pub fn rendered_sha256(&self) -> &Sha256Digest {
+        &self.rendered_sha256
+    }
+
+    pub fn replay_rendered_bytes(&self) -> &[u8] {
+        self.rendered_bytes.as_bytes()
+    }
+
+    pub fn compare_immutable(&self, other: &Self) -> PreparedPushComparison {
+        if self.intent_id != other.intent_id {
+            PreparedPushComparison::DifferentIntent
+        } else if self == other {
+            PreparedPushComparison::Identical
+        } else {
+            PreparedPushComparison::ResolutionRequired {
+                reason: ReasonCode::IntentPayloadConflict,
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreparedPushComparison {
+    DifferentIntent,
+    Identical,
+    ResolutionRequired { reason: ReasonCode },
+}
+
+fn derive_decision_id(intent_id: &IntentId) -> DecisionId {
+    DecisionId::from_digest(&canonical_digest(
+        "PreparedPushDecision/v1",
+        &BTreeMap::from([(
+            "intent_id",
+            CanonicalValue::String(intent_id.as_str().to_owned()),
+        )]),
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderStateView {
+    Open,
+    Rendering,
+    Sealed,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenderState {
+    Open,
+    Rendering,
+    Sealed,
+    Failed,
+}
+
+/// A Ready preparation cannot be copied into a second renderer path.
+///
+/// ```compile_fail
+/// use stock_analysis::monitor::push_job::ReadyPreparation;
+/// fn requires_clone<T: Clone>() {}
+/// requires_clone::<ReadyPreparation>();
+/// ```
+#[derive(Debug)]
+pub struct ReadyPreparation {
+    projector: DecisionProjector,
+    facts: PreparedFactsSnapshot,
+    projection: SemanticProjection,
+    state: RenderState,
+    attempt_count: u64,
+    rejected_count: u64,
+}
+
+impl ReadyPreparation {
+    fn new(
+        projector: DecisionProjector,
+        facts: PreparedFactsSnapshot,
+        input: SemanticInput,
+    ) -> std::result::Result<Self, ProjectionError> {
+        let projection = projector.project_semantics(&facts, input)?;
+        if facts.facts().verified_empty() {
+            return Err(ProjectionError::VerifiedEmptyCannotBeReady);
+        }
+        if matches!(projection.suppression, Suppression::Suppressed { .. }) {
+            return Err(ProjectionError::SuppressedCannotBeReady);
+        }
+        Ok(Self {
+            projector,
+            facts,
+            projection,
+            state: RenderState::Open,
+            attempt_count: 0,
+            rejected_count: 0,
+        })
+    }
+
+    pub fn projection(&self) -> &SemanticProjection {
+        &self.projection
+    }
+
+    pub fn run_context_sha256(&self) -> &Sha256Digest {
+        &self.projector.run_context_sha256
+    }
+
+    pub fn render_once<F>(&mut self, render: F) -> std::result::Result<JobDecision, ProjectionError>
+    where
+        F: FnOnce(&SemanticProjection) -> Vec<u8>,
+    {
+        let current = self.state();
+        if current != RenderStateView::Open {
+            self.rejected_count = self.rejected_count.saturating_add(1);
+            return Err(ProjectionError::RenderAlreadyAttempted { state: current });
+        }
+        self.state = RenderState::Rendering;
+        self.attempt_count = self.attempt_count.saturating_add(1);
+        let bytes = render(&self.projection);
+        if std::str::from_utf8(&bytes).is_err() {
+            self.state = RenderState::Failed;
+            return Err(ProjectionError::RenderedBytesNotUtf8);
+        }
+        let rendered_bytes = ExactBytes::new(bytes);
+        let prepared_push = PreparedPush::from_first_render(
+            &self.projector,
+            self.facts.facts(),
+            &self.projection,
+            rendered_bytes,
+        );
+        self.state = RenderState::Sealed;
+        Ok(JobDecision::new(JobDecisionKind::Ready(prepared_push)))
+    }
+
+    pub fn state(&self) -> RenderStateView {
+        match self.state {
+            RenderState::Open => RenderStateView::Open,
+            RenderState::Rendering => RenderStateView::Rendering,
+            RenderState::Sealed => RenderStateView::Sealed,
+            RenderState::Failed => RenderStateView::Failed,
+        }
+    }
+
+    pub fn attempt_count(&self) -> u64 {
+        self.attempt_count
+    }
+
+    pub fn rejected_count(&self) -> u64 {
+        self.rejected_count
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum JobDecisionKind {
+    Ready(PreparedPush),
+    NoData {
+        reason: ReasonCode,
+        evidence_sha256: Sha256Digest,
+    },
+    Disabled {
+        reason: ReasonCode,
+    },
+    BlockedOnInput {
+        reason: ReasonCode,
+        retry_after: Option<UtcMicros>,
+    },
+    Suppressed {
+        reason: ReasonCode,
+        eligible_after: Option<UtcMicros>,
+    },
+    RetryableFailure {
+        reason: ReasonCode,
+        retry_after: Option<UtcMicros>,
+    },
+    PermanentFailure {
+        reason: ReasonCode,
+    },
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct JobDecision {
+    kind: JobDecisionKind,
+}
+
+impl JobDecision {
+    fn new(kind: JobDecisionKind) -> Self {
+        Self { kind }
+    }
+
+    pub fn view(&self) -> JobDecisionView<'_> {
+        match &self.kind {
+            JobDecisionKind::Ready(push) => JobDecisionView::Ready(push),
+            JobDecisionKind::NoData {
+                reason,
+                evidence_sha256,
+            } => JobDecisionView::NoData {
+                reason: *reason,
+                evidence_sha256,
+            },
+            JobDecisionKind::Disabled { reason } => JobDecisionView::Disabled { reason: *reason },
+            JobDecisionKind::BlockedOnInput {
+                reason,
+                retry_after,
+            } => JobDecisionView::BlockedOnInput {
+                reason: *reason,
+                retry_after: *retry_after,
+            },
+            JobDecisionKind::Suppressed {
+                reason,
+                eligible_after,
+            } => JobDecisionView::Suppressed {
+                reason: *reason,
+                eligible_after: *eligible_after,
+            },
+            JobDecisionKind::RetryableFailure {
+                reason,
+                retry_after,
+            } => JobDecisionView::RetryableFailure {
+                reason: *reason,
+                retry_after: *retry_after,
+            },
+            JobDecisionKind::PermanentFailure { reason } => {
+                JobDecisionView::PermanentFailure { reason: *reason }
+            }
+        }
+    }
+
+    pub fn canonical_sha256(&self) -> Sha256Digest {
+        canonical_digest("JobDecision/v1", &job_decision_fields(&self.kind))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JobDecisionView<'a> {
+    Ready(&'a PreparedPush),
+    NoData {
+        reason: ReasonCode,
+        evidence_sha256: &'a Sha256Digest,
+    },
+    Disabled {
+        reason: ReasonCode,
+    },
+    BlockedOnInput {
+        reason: ReasonCode,
+        retry_after: Option<UtcMicros>,
+    },
+    Suppressed {
+        reason: ReasonCode,
+        eligible_after: Option<UtcMicros>,
+    },
+    RetryableFailure {
+        reason: ReasonCode,
+        retry_after: Option<UtcMicros>,
+    },
+    PermanentFailure {
+        reason: ReasonCode,
+    },
+}
+
+fn job_decision_fields(kind: &JobDecisionKind) -> BTreeMap<&'static str, CanonicalValue> {
+    let (variant, payload) = match kind {
+        JobDecisionKind::Ready(push) => ("Ready", prepared_push_value(push)),
+        JobDecisionKind::NoData {
+            reason,
+            evidence_sha256,
+        } => (
+            "NoData",
+            CanonicalValue::Object(BTreeMap::from([
+                (
+                    "evidence_sha256",
+                    CanonicalValue::String(evidence_sha256.as_str().to_owned()),
+                ),
+                ("reason", CanonicalValue::String(reason.as_str().to_owned())),
+            ])),
+        ),
+        JobDecisionKind::Disabled { reason } => ("Disabled", reason_payload(*reason)),
+        JobDecisionKind::BlockedOnInput {
+            reason,
+            retry_after,
+        } => (
+            "BlockedOnInput",
+            reason_time_payload(*reason, "retry_after", *retry_after),
+        ),
+        JobDecisionKind::Suppressed {
+            reason,
+            eligible_after,
+        } => (
+            "Suppressed",
+            reason_time_payload(*reason, "eligible_after", *eligible_after),
+        ),
+        JobDecisionKind::RetryableFailure {
+            reason,
+            retry_after,
+        } => (
+            "RetryableFailure",
+            reason_time_payload(*reason, "retry_after", *retry_after),
+        ),
+        JobDecisionKind::PermanentFailure { reason } => {
+            ("PermanentFailure", reason_payload(*reason))
+        }
+    };
+    BTreeMap::from([
+        ("payload", payload),
+        ("variant", CanonicalValue::String(variant.to_owned())),
+    ])
+}
+
+fn reason_payload(reason: ReasonCode) -> CanonicalValue {
+    CanonicalValue::Object(BTreeMap::from([(
+        "reason",
+        CanonicalValue::String(reason.as_str().to_owned()),
+    )]))
+}
+
+fn reason_time_payload(
+    reason: ReasonCode,
+    time_field: &'static str,
+    time: Option<UtcMicros>,
+) -> CanonicalValue {
+    CanonicalValue::Object(BTreeMap::from([
+        ("reason", CanonicalValue::String(reason.as_str().to_owned())),
+        (
+            time_field,
+            time.map_or(CanonicalValue::Null, |value| {
+                CanonicalValue::Unsigned(value.get() as u64)
+            }),
+        ),
+    ]))
+}
+
+fn prepared_push_value(push: &PreparedPush) -> CanonicalValue {
+    CanonicalValue::Object(BTreeMap::from([
+        (
+            "decision_id",
+            CanonicalValue::String(push.decision_id.as_str().to_owned()),
+        ),
+        (
+            "intent_id",
+            CanonicalValue::String(push.intent_id.as_str().to_owned()),
+        ),
+        (
+            "occurrence",
+            CanonicalValue::String(push.occurrence.as_str().to_owned()),
+        ),
+        (
+            "prepared_facts_sha256",
+            CanonicalValue::String(push.prepared_facts_sha256.as_str().to_owned()),
+        ),
+        ("rendered_bytes", exact_bytes_value(&push.rendered_bytes)),
+        (
+            "rendered_sha256",
+            CanonicalValue::String(push.rendered_sha256.as_str().to_owned()),
+        ),
+        (
+            "run_context_sha256",
+            CanonicalValue::String(push.run_context_sha256.as_str().to_owned()),
+        ),
+        (
+            "semantic_projection_sha256",
+            CanonicalValue::String(push.semantic_projection_sha256.as_str().to_owned()),
+        ),
+        ("source_binding", source_binding_value(&push.source_binding)),
+        ("subject", subject_value(&push.subject)),
+        (
+            "unit_id",
+            CanonicalValue::String(push.unit_id.as_str().to_owned()),
+        ),
+    ]))
+}
+
+fn exact_bytes_value(bytes: &ExactBytes) -> CanonicalValue {
+    CanonicalValue::Object(BTreeMap::from([
+        ("length", CanonicalValue::Unsigned(bytes.len() as u64)),
+        (
+            "sha256",
+            CanonicalValue::String(bytes.sha256().as_str().to_owned()),
+        ),
+    ]))
+}
+
+fn source_binding_value(binding: &SourceBinding) -> CanonicalValue {
+    CanonicalValue::Object(BTreeMap::from([
+        (
+            "evidence_fingerprint",
+            CanonicalValue::String(binding.evidence_fingerprint.as_str().to_owned()),
+        ),
+        (
+            "source_contract_id",
+            CanonicalValue::String(binding.source_contract_id.as_str().to_owned()),
+        ),
+        (
+            "source_contract_version",
+            CanonicalValue::String(binding.source_contract_version.as_str().to_owned()),
+        ),
+        (
+            "source_refs",
+            CanonicalValue::Array(binding.source_refs.iter().map(source_ref_value).collect()),
+        ),
+    ]))
+}
+
 #[cfg(test)]
 pub(super) fn projector_fixture(context: &RunContext) -> Result<DecisionProjector> {
     DecisionProjector::try_new(
@@ -543,12 +1189,5 @@ pub(super) fn projector_fixture(context: &RunContext) -> Result<DecisionProjecto
             TemplateId::try_new("auction-card".to_owned())?,
         ),
     )
-    .map_err(|error| match error {
-        ProjectionError::UnitBindingMismatch => {
-            PushJobError::InvalidRunContext("projection fixture unit mismatch")
-        }
-        ProjectionError::ContextFactsMismatch => {
-            PushJobError::InvalidPreparedFacts("projection fixture context mismatch")
-        }
-    })
+    .map_err(|_| PushJobError::InvalidRunContext("projection fixture binding mismatch"))
 }

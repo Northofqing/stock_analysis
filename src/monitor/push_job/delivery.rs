@@ -37,6 +37,12 @@ delivery_text_id!(TemplateId, "template_id");
 delivery_text_id!(TemplateVersion, "template_version");
 delivery_text_id!(TerminalRefId, "terminal_ref_id");
 
+impl DecisionId {
+    pub(super) fn from_digest(digest: &Sha256Digest) -> Self {
+        Self(digest.as_str().to_owned())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum AuthorityClass {
     GenericCounted,
