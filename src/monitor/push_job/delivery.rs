@@ -452,10 +452,9 @@ impl DeliveryResult {
             | DeliveryResultKind::AlreadyTerminal(_) => DeliveryAuthority::Strong,
             DeliveryResultKind::BestEffortAccepted(_)
             | DeliveryResultKind::PartiallyAccepted(_)
+            | DeliveryResultKind::NoChannelConfigured(_)
             | DeliveryResultKind::AllChannelsFailed(_) => DeliveryAuthority::Compat,
-            DeliveryResultKind::NoChannelConfigured(_) | DeliveryResultKind::Blocked(_) => {
-                DeliveryAuthority::None
-            }
+            DeliveryResultKind::Blocked(_) => DeliveryAuthority::None,
         }
     }
 

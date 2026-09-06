@@ -58,10 +58,28 @@ fn compatibility_evidence(
 
 #[test]
 fn w01_occurrence_golden_hash_is_stable() {
+    use super::identity::occurrence_preimage_fixture;
+
+    assert_eq!(
+        occurrence_preimage_fixture(&occurrence_material()),
+        b"OccurrenceId/v1\0{\"business_date\":\"2026-09-06\",\"occurrence_family\":\"daily\",\"occurrence_key\":\"close\"}"
+    );
     let id = derive_occurrence_id(&occurrence_material());
     assert_eq!(
         id.as_str(),
         "5752487f81e81737f173e01b354988cc335ae5cb537aa0cecd05bc613957cb7a"
+    );
+}
+
+#[test]
+fn w01_canonical_json_escaping_is_infallible_and_exact() {
+    use super::identity::canonical_string_preimage_fixture;
+
+    let input = "quote\" slash\\ line\n tab\t 中文 \u{001f}";
+    let expected = "Fixture/v1\0{\"value\":\"quote\\\" slash\\\\ line\\n tab\\t 中文 \\u001f\"}";
+    assert_eq!(
+        canonical_string_preimage_fixture(input),
+        expected.as_bytes()
     );
 }
 
@@ -73,6 +91,7 @@ fn w01_identity_value_types_reject_invalid_input() {
     assert!(BusinessDate::parse("2026-9-6").is_err());
     assert!(Sha256Digest::parse("payload", "ABC").is_err());
     assert!(UtcMicros::try_new(-1).is_err());
+    assert!(UnitId::try_new("x".repeat(513)).is_err());
 }
 
 #[test]
@@ -125,6 +144,95 @@ fn w01_outer_identities_bind_source_contract_without_changing_raw_occurrence() {
     assert_ne!(schedule("close-v1"), schedule("close-v2"));
     assert_ne!(intent("close-v1"), intent("close-v2"));
     assert_eq!(raw_id, derive_occurrence_id(&occurrence));
+}
+
+#[test]
+fn w01_outer_identities_bind_unit_producer_owner_and_namespace() {
+    let occurrence = occurrence_material();
+    let raw_id = derive_occurrence_id(&occurrence);
+    let schedule = |namespace: Namespace, unit: &str, producer: &str, owner: &str| {
+        derive_schedule_occurrence_id(&ScheduleOccurrenceIdentityMaterial::new(
+            namespace,
+            UnitId::try_new(unit.to_owned()).expect("valid unit"),
+            ProducerId::try_new(producer.to_owned()).expect("valid producer"),
+            ScheduleOrTriggerId::try_new("schedule-close".to_owned()).expect("valid schedule"),
+            CalendarId::try_new("a-share-calendar".to_owned()).expect("valid calendar"),
+            occurrence.clone(),
+            CompletionOwnerId::try_new(owner.to_owned()).expect("valid owner"),
+            SourceContractId::try_new("close-v1".to_owned()).expect("valid source"),
+        ))
+    };
+    let production = schedule(
+        Namespace::Production,
+        "MU-close",
+        "close-scheduled",
+        "owner-close",
+    );
+    assert_ne!(
+        production,
+        schedule(
+            Namespace::Production,
+            "MU-other",
+            "close-scheduled",
+            "owner-close"
+        )
+    );
+    assert_ne!(
+        production,
+        schedule(
+            Namespace::Production,
+            "MU-close",
+            "other-producer",
+            "owner-close"
+        )
+    );
+    assert_ne!(
+        production,
+        schedule(
+            Namespace::Production,
+            "MU-close",
+            "close-scheduled",
+            "other-owner"
+        )
+    );
+    assert_ne!(
+        production,
+        schedule(
+            Namespace::test(RunId::try_new("run-1".to_owned()).expect("valid run")),
+            "MU-close",
+            "close-scheduled",
+            "owner-close"
+        )
+    );
+
+    let intent = |namespace: Namespace, unit: &str, owner: &str| {
+        derive_intent_id(&IntentIdentityMaterial::new(
+            namespace,
+            UnitId::try_new(unit.to_owned()).expect("valid unit"),
+            CompletionOwnerId::try_new(owner.to_owned()).expect("valid owner"),
+            SourceContractId::try_new("close-v1".to_owned()).expect("valid source"),
+            raw_id.clone(),
+            SubjectId::Global,
+            AudienceId::try_new("portfolio-owner".to_owned()).expect("valid audience"),
+        ))
+    };
+    let production_intent = intent(Namespace::Production, "MU-close", "owner-close");
+    assert_ne!(
+        production_intent,
+        intent(Namespace::Production, "MU-other", "owner-close")
+    );
+    assert_ne!(
+        production_intent,
+        intent(Namespace::Production, "MU-close", "other-owner")
+    );
+    assert_ne!(
+        production_intent,
+        intent(
+            Namespace::test(RunId::try_new("run-1".to_owned()).expect("valid run")),
+            "MU-close",
+            "owner-close"
+        )
+    );
 }
 
 #[test]
@@ -187,15 +295,38 @@ fn w02_compatibility_results_enforce_matrix_and_never_finalize() {
     )
     .expect("valid mixed evidence");
     assert!(DeliveryResult::best_effort_accepted(mixed.clone()).is_err());
-    assert!(DeliveryResult::partially_accepted(mixed).is_ok());
+    let partial = DeliveryResult::partially_accepted(mixed).expect("partial matrix");
+    assert_eq!(partial.authority_class(), DeliveryAuthority::Compat);
+    assert_eq!(
+        partial.completion_eligibility(),
+        CompletionEligibility::Never
+    );
 
     let none = DeliveryResult::no_channel_configured();
     assert_eq!(
         none.reason_code(),
         Some(ReasonCode::TransportNoChannelConfigured)
     );
-    assert_eq!(none.authority_class(), DeliveryAuthority::None);
+    assert_eq!(none.authority_class(), DeliveryAuthority::Compat);
     assert_eq!(none.completion_eligibility(), CompletionEligibility::Never);
+
+    let unknown = compatibility_evidence(
+        &["feishu"],
+        &["feishu"],
+        &[("feishu", WeakOutcomeKind::Unknown)],
+    )
+    .expect("valid unknown evidence");
+    let failed = DeliveryResult::all_channels_failed(unknown).expect("all-failed matrix");
+    assert_eq!(failed.authority_class(), DeliveryAuthority::Compat);
+    assert_eq!(
+        failed.completion_eligibility(),
+        CompletionEligibility::Never
+    );
+    assert!(matches!(
+        failed.view(),
+        DeliveryResultView::AllChannelsFailed(evidence)
+            if evidence.weak_outcomes()[0].kind() == WeakOutcomeKind::Unknown
+    ));
 }
 
 #[test]
@@ -312,6 +443,8 @@ fn w02_verified_terminal_disposition_controls_strong_result_permissions() {
 
 #[test]
 fn w03_reason_code_registry_is_exact_and_round_trips() {
+    use std::collections::BTreeSet;
+
     let expected = [
         "schedule.not_trading_day",
         "schedule.window_not_open",
@@ -379,6 +512,23 @@ fn w03_reason_code_registry_is_exact_and_round_trips() {
         assert!(code.as_str().is_ascii());
         assert!(!code.as_str().contains('\0'));
     }
+    assert_eq!(
+        ReasonCode::ALL
+            .iter()
+            .map(|code| code.as_str().split('.').next().expect("reason namespace"))
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "activation",
+            "finalizer",
+            "input",
+            "intent",
+            "operator",
+            "policy",
+            "schedule",
+            "shadow",
+            "transport",
+        ])
+    );
     assert!(ReasonCode::try_from("transport.accepted").is_err());
 }
 
@@ -423,6 +573,12 @@ fn w03_retry_directive_preserves_reason_and_never_retries_uncertain() {
     };
     assert_eq!(
         rejected
+            .evaluate(now, 1, true, ReasonCode::TransportRejected)
+            .eligibility(),
+        RetryEligibility::NotBefore(not_before)
+    );
+    assert_eq!(
+        rejected
             .evaluate(not_before, 0, false, ReasonCode::TransportRejected)
             .eligibility(),
         RetryEligibility::RejectedAuthorizationRequired
@@ -438,6 +594,12 @@ fn w03_retry_directive_preserves_reason_and_never_retries_uncertain() {
             .evaluate(not_before, 1, true, ReasonCode::TransportRejected)
             .eligibility(),
         RetryEligibility::EligibleAuthorizedRejected
+    );
+    assert_eq!(
+        rejected
+            .evaluate(not_before, 0, true, ReasonCode::FinalizerCasConflict)
+            .eligibility(),
+        RetryEligibility::Never
     );
 }
 
@@ -596,29 +758,57 @@ fn w03_strong_terminal_matrix_separates_schedule_cursor_retry_and_manual() {
 fn w03_compatibility_results_require_observation_policy_and_never_complete() {
     use super::policy::{fixture_policy_options, try_policy_fixture};
 
-    let evidence = compatibility_evidence(
-        &["feishu"],
-        &["feishu"],
-        &[("feishu", WeakOutcomeKind::Accepted)],
-    )
-    .expect("valid compatibility evidence");
-    let delivery = DeliveryResult::best_effort_accepted(evidence).expect("valid weak result");
+    let deliveries = [
+        DeliveryResult::best_effort_accepted(
+            compatibility_evidence(
+                &["feishu"],
+                &["feishu"],
+                &[("feishu", WeakOutcomeKind::Accepted)],
+            )
+            .expect("valid all-accepted evidence"),
+        )
+        .expect("valid best-effort result"),
+        DeliveryResult::partially_accepted(
+            compatibility_evidence(
+                &["feishu", "wechat"],
+                &["feishu", "wechat"],
+                &[
+                    ("feishu", WeakOutcomeKind::Accepted),
+                    ("wechat", WeakOutcomeKind::Rejected),
+                ],
+            )
+            .expect("valid partial evidence"),
+        )
+        .expect("valid partial result"),
+        DeliveryResult::no_channel_configured(),
+        DeliveryResult::all_channels_failed(
+            compatibility_evidence(
+                &["feishu"],
+                &["feishu"],
+                &[("feishu", WeakOutcomeKind::Unknown)],
+            )
+            .expect("valid failed evidence"),
+        )
+        .expect("valid all-failed result"),
+    ];
 
     let bound = try_policy_fixture(fixture_policy_options()).expect("valid bound policy");
-    assert!(evaluate_completion(&bound, CompletionFact::Delivery(&delivery)).is_err());
-
     let mut observation = fixture_policy_options();
     observation.cursor_policy = CursorPolicy::Never;
     observation.allowed_authority.clear();
     observation.finalizer_kind = FinalizerKind::CompatibilityObservation;
     observation.close_all_schedule_branches = false;
     let observation = try_policy_fixture(observation).expect("valid observation policy");
-    let directive = evaluate_completion(&observation, CompletionFact::Delivery(&delivery))
-        .expect("compatibility observation is allowed");
-    assert_eq!(directive.schedule(), ScheduleDirective::KeepOpen);
-    assert_eq!(directive.cursor(), CursorDirective::Never);
-    assert_eq!(directive.retry().eligibility(), RetryEligibility::Never);
-    assert_eq!(directive.manual(), ManualDirective::None);
+
+    for delivery in &deliveries {
+        assert!(evaluate_completion(&bound, CompletionFact::Delivery(delivery)).is_err());
+        let directive = evaluate_completion(&observation, CompletionFact::Delivery(delivery))
+            .expect("compatibility observation is allowed");
+        assert_eq!(directive.schedule(), ScheduleDirective::KeepOpen);
+        assert_eq!(directive.cursor(), CursorDirective::Never);
+        assert_eq!(directive.retry().eligibility(), RetryEligibility::Never);
+        assert_eq!(directive.manual(), ManualDirective::None);
+    }
 }
 
 #[test]

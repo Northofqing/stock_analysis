@@ -3,12 +3,18 @@
 use std::collections::BTreeMap;
 
 use chrono::NaiveDate;
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{PushJobError, Result};
 
 const TEXT_RULE: &str = "must be 1..=512 UTF-8 bytes, trimmed, and contain no NUL";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CanonicalValue {
+    Null,
+    String(String),
+    Object(BTreeMap<&'static str, CanonicalValue>),
+}
 
 pub(super) fn validate_text(field: &'static str, value: String) -> Result<String> {
     let valid =
@@ -252,63 +258,133 @@ impl IntentIdentityMaterial {
     }
 }
 
-fn namespace_value(namespace: &Namespace) -> Value {
+fn namespace_value(namespace: &Namespace) -> CanonicalValue {
     let (kind, run_id) = match namespace {
-        Namespace::Production => ("Production", Value::Null),
-        Namespace::Test { run_id } => ("Test", Value::String(run_id.as_str().to_owned())),
+        Namespace::Production => ("Production", CanonicalValue::Null),
+        Namespace::Test { run_id } => ("Test", CanonicalValue::String(run_id.as_str().to_owned())),
     };
-    Value::Object(
-        BTreeMap::from([
-            ("kind".to_owned(), Value::String(kind.to_owned())),
-            ("run_id".to_owned(), run_id),
-        ])
-        .into_iter()
-        .collect(),
-    )
+    CanonicalValue::Object(BTreeMap::from([
+        ("kind", CanonicalValue::String(kind.to_owned())),
+        ("run_id", run_id),
+    ]))
 }
 
-fn subject_value(subject: &SubjectId) -> Value {
+fn subject_value(subject: &SubjectId) -> CanonicalValue {
     let (kind, value) = match subject {
-        SubjectId::Global => ("Global", Value::Null),
-        SubjectId::Entity(value) => ("Entity", Value::String(value.as_str().to_owned())),
+        SubjectId::Global => ("Global", CanonicalValue::Null),
+        SubjectId::Entity(value) => ("Entity", CanonicalValue::String(value.as_str().to_owned())),
     };
-    Value::Object(
-        BTreeMap::from([
-            ("kind".to_owned(), Value::String(kind.to_owned())),
-            ("value".to_owned(), value),
-        ])
-        .into_iter()
-        .collect(),
-    )
+    CanonicalValue::Object(BTreeMap::from([
+        ("kind", CanonicalValue::String(kind.to_owned())),
+        ("value", value),
+    ]))
 }
 
-fn canonical_digest(domain: &'static str, fields: BTreeMap<&'static str, Value>) -> Sha256Digest {
+fn canonical_preimage(
+    domain: &'static str,
+    fields: &BTreeMap<&'static str, CanonicalValue>,
+) -> Vec<u8> {
     debug_assert!(domain.is_ascii() && !domain.contains('\0'));
-    let json = serde_json::to_vec(&fields).expect("typed canonical fields serialize");
+    let mut preimage = Vec::with_capacity(domain.len() + 1 + fields.len() * 32);
+    preimage.extend_from_slice(domain.as_bytes());
+    preimage.push(0);
+    write_json_object(&mut preimage, fields);
+    preimage
+}
+
+fn write_json_object(output: &mut Vec<u8>, fields: &BTreeMap<&'static str, CanonicalValue>) {
+    output.push(b'{');
+    for (index, (key, value)) in fields.iter().enumerate() {
+        if index != 0 {
+            output.push(b',');
+        }
+        write_json_string(output, key);
+        output.push(b':');
+        write_json_value(output, value);
+    }
+    output.push(b'}');
+}
+
+fn write_json_value(output: &mut Vec<u8>, value: &CanonicalValue) {
+    match value {
+        CanonicalValue::Null => output.extend_from_slice(b"null"),
+        CanonicalValue::String(value) => write_json_string(output, value),
+        CanonicalValue::Object(fields) => write_json_object(output, fields),
+    }
+}
+
+fn write_json_string(output: &mut Vec<u8>, value: &str) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    output.push(b'"');
+    for character in value.chars() {
+        match character {
+            '"' => output.extend_from_slice(br#"\""#),
+            '\\' => output.extend_from_slice(br"\\"),
+            '\u{0008}' => output.extend_from_slice(br"\b"),
+            '\t' => output.extend_from_slice(br"\t"),
+            '\n' => output.extend_from_slice(br"\n"),
+            '\u{000c}' => output.extend_from_slice(br"\f"),
+            '\r' => output.extend_from_slice(br"\r"),
+            control if control <= '\u{001f}' => {
+                let byte = control as u8;
+                output.extend_from_slice(b"\\u00");
+                output.push(HEX[usize::from(byte >> 4)]);
+                output.push(HEX[usize::from(byte & 0x0f)]);
+            }
+            other => {
+                let mut encoded = [0; 4];
+                output.extend_from_slice(other.encode_utf8(&mut encoded).as_bytes());
+            }
+        }
+    }
+    output.push(b'"');
+}
+
+fn canonical_digest(
+    domain: &'static str,
+    fields: &BTreeMap<&'static str, CanonicalValue>,
+) -> Sha256Digest {
     let mut hasher = Sha256::new();
-    hasher.update(domain.as_bytes());
-    hasher.update([0]);
-    hasher.update(json);
+    hasher.update(canonical_preimage(domain, fields));
     Sha256Digest::from_bytes(hasher.finalize().into())
 }
 
-pub fn derive_occurrence_id(material: &OccurrenceIdentityMaterial) -> OccurrenceId {
-    let fields = BTreeMap::from([
+fn occurrence_fields(
+    material: &OccurrenceIdentityMaterial,
+) -> BTreeMap<&'static str, CanonicalValue> {
+    BTreeMap::from([
         (
             "business_date",
-            Value::String(material.business_date.as_str().to_owned()),
+            CanonicalValue::String(material.business_date.as_str().to_owned()),
         ),
         (
             "occurrence_family",
-            Value::String(material.occurrence_family.as_str().to_owned()),
+            CanonicalValue::String(material.occurrence_family.as_str().to_owned()),
         ),
         (
             "occurrence_key",
-            Value::String(material.occurrence_key.as_str().to_owned()),
+            CanonicalValue::String(material.occurrence_key.as_str().to_owned()),
         ),
-    ]);
-    let digest = canonical_digest("OccurrenceId/v1", fields);
+    ])
+}
+
+pub fn derive_occurrence_id(material: &OccurrenceIdentityMaterial) -> OccurrenceId {
+    let digest = canonical_digest("OccurrenceId/v1", &occurrence_fields(material));
     OccurrenceId(digest.as_str().to_owned())
+}
+
+#[cfg(test)]
+pub(super) fn occurrence_preimage_fixture(material: &OccurrenceIdentityMaterial) -> Vec<u8> {
+    canonical_preimage("OccurrenceId/v1", &occurrence_fields(material))
+}
+
+#[cfg(test)]
+pub(super) fn canonical_string_preimage_fixture(value: &str) -> Vec<u8> {
+    canonical_preimage(
+        "Fixture/v1",
+        &BTreeMap::from([("value", CanonicalValue::String(value.to_owned()))]),
+    )
 }
 
 pub fn derive_schedule_occurrence_id(
@@ -318,47 +394,47 @@ pub fn derive_schedule_occurrence_id(
     let fields = BTreeMap::from([
         (
             "business_date",
-            Value::String(occurrence.business_date.as_str().to_owned()),
+            CanonicalValue::String(occurrence.business_date.as_str().to_owned()),
         ),
         (
             "calendar_id",
-            Value::String(material.calendar_id.as_str().to_owned()),
+            CanonicalValue::String(material.calendar_id.as_str().to_owned()),
         ),
         (
             "completion_owner",
-            Value::String(material.completion_owner.as_str().to_owned()),
+            CanonicalValue::String(material.completion_owner.as_str().to_owned()),
         ),
         ("namespace", namespace_value(&material.namespace)),
         (
             "occurrence_family",
-            Value::String(occurrence.occurrence_family.as_str().to_owned()),
+            CanonicalValue::String(occurrence.occurrence_family.as_str().to_owned()),
         ),
         (
             "occurrence_key",
-            Value::String(occurrence.occurrence_key.as_str().to_owned()),
+            CanonicalValue::String(occurrence.occurrence_key.as_str().to_owned()),
         ),
         (
             "producer_id",
-            Value::String(material.producer_id.as_str().to_owned()),
+            CanonicalValue::String(material.producer_id.as_str().to_owned()),
         ),
         (
             "schedule_or_trigger_id",
-            Value::String(material.schedule_or_trigger_id.as_str().to_owned()),
+            CanonicalValue::String(material.schedule_or_trigger_id.as_str().to_owned()),
         ),
         (
             "schema_version",
-            Value::String("ScheduleOccurrence/v1".to_owned()),
+            CanonicalValue::String("ScheduleOccurrence/v1".to_owned()),
         ),
         (
             "source_contract_id",
-            Value::String(material.source_contract_id.as_str().to_owned()),
+            CanonicalValue::String(material.source_contract_id.as_str().to_owned()),
         ),
         (
             "unit_id",
-            Value::String(material.unit_id.as_str().to_owned()),
+            CanonicalValue::String(material.unit_id.as_str().to_owned()),
         ),
     ]);
-    let digest = canonical_digest("ScheduleOccurrence/v1", fields);
+    let digest = canonical_digest("ScheduleOccurrence/v1", &fields);
     ScheduleOccurrenceId(digest.as_str().to_owned())
 }
 
@@ -366,27 +442,27 @@ pub fn derive_intent_id(material: &IntentIdentityMaterial) -> IntentId {
     let fields = BTreeMap::from([
         (
             "audience",
-            Value::String(material.audience.as_str().to_owned()),
+            CanonicalValue::String(material.audience.as_str().to_owned()),
         ),
         (
             "completion_owner",
-            Value::String(material.completion_owner.as_str().to_owned()),
+            CanonicalValue::String(material.completion_owner.as_str().to_owned()),
         ),
         ("namespace", namespace_value(&material.namespace)),
         (
             "occurrence",
-            Value::String(material.occurrence.as_str().to_owned()),
+            CanonicalValue::String(material.occurrence.as_str().to_owned()),
         ),
         (
             "source_contract_id",
-            Value::String(material.source_contract_id.as_str().to_owned()),
+            CanonicalValue::String(material.source_contract_id.as_str().to_owned()),
         ),
         ("subject", subject_value(&material.subject)),
         (
             "unit_id",
-            Value::String(material.unit_id.as_str().to_owned()),
+            CanonicalValue::String(material.unit_id.as_str().to_owned()),
         ),
     ]);
-    let digest = canonical_digest("PreparedPushIntent/v1", fields);
+    let digest = canonical_digest("PreparedPushIntent/v1", &fields);
     IntentId(digest.as_str().to_owned())
 }
