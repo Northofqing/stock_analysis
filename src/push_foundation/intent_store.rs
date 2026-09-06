@@ -1,5 +1,6 @@
 //! Attested business-intent storage. This module selects no default database and has no sink.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -7,10 +8,10 @@ use std::time::Duration;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 
 use crate::monitor::push_job::{
-    derive_decision_id, derive_intent_id, derive_occurrence_id, AudienceId, BusinessDate,
-    CompletionOwnerId, IntentId, IntentIdentityMaterial, Namespace, OccurrenceFamily,
-    OccurrenceIdentityMaterial, OccurrenceKey, PreparedPush, ReasonCode, RunId, Sha256Digest,
-    SourceContractId, SubjectId, UnitId, UtcMicros,
+    canonical_preimage, derive_decision_id, derive_intent_id, derive_occurrence_id, raw_digest,
+    AudienceId, BusinessDate, CanonicalValue, CompletionOwnerId, IntentId, IntentIdentityMaterial,
+    Namespace, OccurrenceFamily, OccurrenceIdentityMaterial, OccurrenceKey, PreparedPush,
+    ReasonCode, RunId, Sha256Digest, SourceContractId, SubjectId, UnitId, UtcMicros,
 };
 
 use super::migration::{attest_connection, validate_database_path};
@@ -30,12 +31,19 @@ pub enum IntentStoreError {
     ConnectionSafeguardFailed,
     #[error("invalid initial intent: {check}")]
     InvalidInitialIntent { check: &'static str },
+    #[error("invalid intent transition: {check}")]
+    InvalidTransition { check: &'static str },
+    #[error("business intent does not exist")]
+    IntentMissing,
     #[error("immutable material conflicts with an existing intent")]
     ImmutableConflict { intent_id: String },
     #[error("business intent storage operation failed: {operation}")]
     StorageFailed { operation: &'static str },
     #[error("business intent persisted fact failed integrity check: {check}")]
     IntegrityFailed { check: &'static str },
+    #[cfg(test)]
+    #[error("injected W08 fault: {point}")]
+    InjectedFault { point: &'static str },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,6 +113,154 @@ impl IntentState {
             _ => Err(IntentStoreError::IntegrityFailed { check: "state" }),
         }
     }
+}
+
+fn validate_transition_text(
+    field: &'static str,
+    value: String,
+) -> Result<String, IntentStoreError> {
+    if value.is_empty() || value.len() > 512 || value.contains('\0') || value.trim() != value {
+        return Err(IntentStoreError::InvalidTransition { check: field });
+    }
+    Ok(value)
+}
+
+macro_rules! transition_text {
+    ($name:ident, $field:literal) => {
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn try_new(value: String) -> Result<Self, IntentStoreError> {
+                validate_transition_text($field, value).map(Self)
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+    };
+}
+
+transition_text!(TransitionActor, "transition_actor");
+transition_text!(LeaseOwnerId, "lease_owner");
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LeaseAction {
+    Preserve,
+    Acquire {
+        owner: LeaseOwnerId,
+        until: UtcMicros,
+    },
+    Release {
+        owner: LeaseOwnerId,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IntentTransitionCommand {
+    intent_id: IntentId,
+    from_state: IntentState,
+    to_state: IntentState,
+    expected_version: u64,
+    actor: TransitionActor,
+    reason: ReasonCode,
+    occurred_at: UtcMicros,
+    lease_action: LeaseAction,
+}
+
+impl IntentTransitionCommand {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        intent_id: IntentId,
+        from_state: IntentState,
+        to_state: IntentState,
+        expected_version: u64,
+        actor: TransitionActor,
+        reason: ReasonCode,
+        occurred_at: UtcMicros,
+        lease_action: LeaseAction,
+    ) -> Result<Self, IntentStoreError> {
+        if expected_version >= i64::MAX as u64 {
+            return Err(IntentStoreError::InvalidTransition {
+                check: "version_overflow",
+            });
+        }
+        if !nonterminal_edge_allowed(from_state, to_state, reason) {
+            return Err(IntentStoreError::InvalidTransition {
+                check: "edge_reason_not_allowed",
+            });
+        }
+        if let LeaseAction::Acquire { until, .. } = &lease_action {
+            if *until <= occurred_at {
+                return Err(IntentStoreError::InvalidTransition {
+                    check: "lease_until_not_future",
+                });
+            }
+        }
+        Ok(Self {
+            intent_id,
+            from_state,
+            to_state,
+            expected_version,
+            actor,
+            reason,
+            occurred_at,
+            lease_action,
+        })
+    }
+}
+
+fn nonterminal_edge_allowed(from: IntentState, to: IntentState, reason: ReasonCode) -> bool {
+    if from == to {
+        return matches!(
+            (from, reason),
+            (
+                IntentState::PendingDispatch
+                    | IntentState::AwaitingAuthority
+                    | IntentState::AwaitingFinalizer
+                    | IntentState::ResolutionRequired,
+                ReasonCode::IntentLeaseHeld | ReasonCode::IntentDispatchClaimed
+            ) | (
+                IntentState::AwaitingAuthority,
+                ReasonCode::TransportRejected | ReasonCode::FinalizerTerminalRefInvalid
+            ) | (
+                IntentState::AwaitingFinalizer,
+                ReasonCode::FinalizerTerminalRefInvalid
+            )
+        );
+    }
+    matches!(
+        (from, to, reason),
+        (
+            IntentState::PendingDispatch,
+            IntentState::AwaitingAuthority,
+            ReasonCode::IntentDispatchClaimed
+        ) | (
+            IntentState::PendingDispatch,
+            IntentState::NoData,
+            ReasonCode::IntentNoData
+        ) | (
+            IntentState::PendingDispatch,
+            IntentState::Disabled,
+            ReasonCode::PolicyDisabled
+        ) | (
+            IntentState::PendingDispatch
+                | IntentState::AwaitingAuthority
+                | IntentState::AwaitingFinalizer
+                | IntentState::Completed
+                | IntentState::NoData
+                | IntentState::Disabled,
+            IntentState::ResolutionRequired,
+            ReasonCode::IntentPayloadConflict
+                | ReasonCode::IntentExpectedVersionConflict
+                | ReasonCode::FinalizerCasConflict
+        ) | (
+            IntentState::AwaitingAuthority | IntentState::AwaitingFinalizer,
+            IntentState::ResolutionRequired,
+            ReasonCode::TransportUncertain | ReasonCode::OperatorResolutionConflict
+        )
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -419,6 +575,15 @@ impl IntentSnapshot {
     pub fn version(&self) -> u64 {
         self.version
     }
+    pub fn previous_state(&self) -> Option<IntentState> {
+        self.previous_state
+    }
+    pub fn lease_owner(&self) -> Option<&str> {
+        self.lease_owner.as_deref()
+    }
+    pub fn lease_until(&self) -> Option<UtcMicros> {
+        self.lease_until
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -433,6 +598,144 @@ impl InitialIntentOutcome {
             Self::Inserted(snapshot) | Self::ExistingIdentical(snapshot) => snapshot,
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransitionReceipt {
+    event_id: Sha256Digest,
+    intent_id: String,
+    from_state: IntentState,
+    to_state: IntentState,
+    expected_version: u64,
+    result_version: u64,
+    previous_sha256: Option<Sha256Digest>,
+    canonical_sha256: Sha256Digest,
+    actor: String,
+    reason: ReasonCode,
+    terminal_disposition: Option<String>,
+    terminal_decision_id: Option<String>,
+    operator_audit_ref: Option<String>,
+    operator_audit_sha256: Option<Sha256Digest>,
+    terminal_ref_id: Option<String>,
+    terminal_binding_sha256: Option<Sha256Digest>,
+    occurred_at: UtcMicros,
+}
+
+impl TransitionReceipt {
+    pub fn event_id(&self) -> &Sha256Digest {
+        &self.event_id
+    }
+    pub fn intent_id(&self) -> &str {
+        &self.intent_id
+    }
+    pub fn from_state(&self) -> IntentState {
+        self.from_state
+    }
+    pub fn to_state(&self) -> IntentState {
+        self.to_state
+    }
+    pub fn expected_version(&self) -> u64 {
+        self.expected_version
+    }
+    pub fn result_version(&self) -> u64 {
+        self.result_version
+    }
+    pub fn previous_sha256(&self) -> Option<&Sha256Digest> {
+        self.previous_sha256.as_ref()
+    }
+    pub fn canonical_sha256(&self) -> &Sha256Digest {
+        &self.canonical_sha256
+    }
+    pub fn actor(&self) -> &str {
+        &self.actor
+    }
+    pub fn reason(&self) -> ReasonCode {
+        self.reason
+    }
+    pub fn occurred_at(&self) -> UtcMicros {
+        self.occurred_at
+    }
+
+    fn from_command(
+        command: &IntentTransitionCommand,
+        previous_sha256: Option<Sha256Digest>,
+    ) -> Self {
+        let result_version = command.expected_version + 1;
+        let event_id = transition_event_id(
+            command.intent_id.as_str(),
+            command.expected_version,
+            result_version,
+        );
+        let mut receipt = Self {
+            event_id,
+            intent_id: command.intent_id.as_str().to_owned(),
+            from_state: command.from_state,
+            to_state: command.to_state,
+            expected_version: command.expected_version,
+            result_version,
+            previous_sha256,
+            canonical_sha256: Sha256Digest::from_bytes([0; 32]),
+            actor: command.actor.as_str().to_owned(),
+            reason: command.reason,
+            terminal_disposition: None,
+            terminal_decision_id: None,
+            operator_audit_ref: None,
+            operator_audit_sha256: None,
+            terminal_ref_id: None,
+            terminal_binding_sha256: None,
+            occurred_at: command.occurred_at,
+        };
+        receipt.canonical_sha256 = transition_canonical_sha256(&receipt);
+        receipt
+    }
+
+    fn matches_command(&self, command: &IntentTransitionCommand) -> bool {
+        self.intent_id == command.intent_id.as_str()
+            && self.from_state == command.from_state
+            && self.to_state == command.to_state
+            && self.expected_version == command.expected_version
+            && self.result_version == command.expected_version + 1
+            && self.actor == command.actor.as_str()
+            && self.reason == command.reason
+            && self.occurred_at == command.occurred_at
+            && self.terminal_disposition.is_none()
+            && self.terminal_decision_id.is_none()
+            && self.operator_audit_ref.is_none()
+            && self.operator_audit_sha256.is_none()
+            && self.terminal_ref_id.is_none()
+            && self.terminal_binding_sha256.is_none()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransitionOutcome {
+    Applied(TransitionReceipt),
+    AlreadyCommitted(TransitionReceipt),
+    Conflict { current: IntentSnapshot },
+}
+
+impl TransitionOutcome {
+    pub fn receipt(&self) -> Option<&TransitionReceipt> {
+        match self {
+            Self::Applied(receipt) | Self::AlreadyCommitted(receipt) => Some(receipt),
+            Self::Conflict { .. } => None,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InitialCommitFault {
+    BeforeCommit,
+    AfterCommitAckLost,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransitionFault {
+    AfterCas,
+    AfterAppend,
+    AfterCommitAckLost,
 }
 
 pub struct BusinessIntentStore {
@@ -487,6 +790,27 @@ impl BusinessIntentStore {
     pub fn record_initial(
         &mut self,
         draft: &InitialIntentDraft,
+    ) -> Result<InitialIntentOutcome, IntentStoreError> {
+        self.record_initial_inner(draft, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_initial_with_fault(
+        &mut self,
+        draft: &InitialIntentDraft,
+        fault: InitialCommitFault,
+    ) -> Result<InitialIntentOutcome, IntentStoreError> {
+        let point = match fault {
+            InitialCommitFault::BeforeCommit => "before_initial_commit",
+            InitialCommitFault::AfterCommitAckLost => "after_initial_commit_ack_lost",
+        };
+        self.record_initial_inner(draft, Some(point))
+    }
+
+    fn record_initial_inner(
+        &mut self,
+        draft: &InitialIntentDraft,
+        fault: Option<&'static str>,
     ) -> Result<InitialIntentOutcome, IntentStoreError> {
         let expected = draft.initial_snapshot();
         let transaction = self
@@ -553,11 +877,22 @@ impl BusinessIntentStore {
             .map_err(|_| IntentStoreError::StorageFailed {
                 operation: "insert_initial",
             })?;
+        if fault == Some("before_initial_commit") {
+            transaction
+                .rollback()
+                .map_err(|_| IntentStoreError::StorageFailed {
+                    operation: "rollback_initial_fault",
+                })?;
+            return Err(injected_fault("before_initial_commit"));
+        }
         transaction
             .commit()
             .map_err(|_| IntentStoreError::StorageFailed {
                 operation: "commit_initial",
             })?;
+        if fault == Some("after_initial_commit_ack_lost") {
+            return Err(injected_fault("after_initial_commit_ack_lost"));
+        }
 
         let persisted =
             self.inspect(&draft.intent_id)?
@@ -572,11 +907,175 @@ impl BusinessIntentStore {
         Ok(InitialIntentOutcome::Inserted(persisted))
     }
 
+    pub fn apply_nonterminal_transition(
+        &mut self,
+        command: &IntentTransitionCommand,
+    ) -> Result<TransitionOutcome, IntentStoreError> {
+        self.apply_nonterminal_transition_inner(command, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_nonterminal_transition_with_fault(
+        &mut self,
+        command: &IntentTransitionCommand,
+        fault: TransitionFault,
+    ) -> Result<TransitionOutcome, IntentStoreError> {
+        let point = match fault {
+            TransitionFault::AfterCas => "after_transition_cas",
+            TransitionFault::AfterAppend => "after_transition_append",
+            TransitionFault::AfterCommitAckLost => "after_transition_commit_ack_lost",
+        };
+        self.apply_nonterminal_transition_inner(command, Some(point))
+    }
+
+    fn apply_nonterminal_transition_inner(
+        &mut self,
+        command: &IntentTransitionCommand,
+        fault: Option<&'static str>,
+    ) -> Result<TransitionOutcome, IntentStoreError> {
+        let result_version = command.expected_version + 1;
+        let event_id = transition_event_id(
+            command.intent_id.as_str(),
+            command.expected_version,
+            result_version,
+        );
+        if let Some(existing) = query_transition(&self.connection, event_id.as_str())? {
+            let current = self
+                .inspect(&command.intent_id)?
+                .ok_or(IntentStoreError::IntentMissing)?;
+            return if existing.matches_command(command) {
+                Ok(TransitionOutcome::AlreadyCommitted(existing))
+            } else {
+                Ok(TransitionOutcome::Conflict { current })
+            };
+        }
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| IntentStoreError::StorageFailed {
+                operation: "begin_transition",
+            })?;
+        let current = query_intent(&transaction, command.intent_id.as_str())?
+            .ok_or(IntentStoreError::IntentMissing)?;
+        let chain = query_transition_chain(&transaction, &current)?;
+        if current.state != command.from_state || current.version != command.expected_version {
+            transaction
+                .rollback()
+                .map_err(|_| IntentStoreError::StorageFailed {
+                    operation: "rollback_transition_conflict",
+                })?;
+            return Ok(TransitionOutcome::Conflict { current });
+        }
+        if command.occurred_at < current.updated_at {
+            transaction
+                .rollback()
+                .map_err(|_| IntentStoreError::StorageFailed {
+                    operation: "rollback_transition_time",
+                })?;
+            return Err(IntentStoreError::InvalidTransition {
+                check: "occurred_at_before_current_update",
+            });
+        }
+        let previous_sha256 = chain.last().map(|event| event.canonical_sha256.clone());
+        let proposed = TransitionReceipt::from_command(command, previous_sha256);
+        let (lease_owner, lease_until, lease_generation) = apply_lease_action(&current, command)?;
+        let affected = transaction
+            .execute(
+                "UPDATE push_intents SET \
+                    state=?,previous_state=state,reason=?,lease_owner=?,lease_until=?,\
+                    lease_generation=?,version=?,updated_at=? \
+                 WHERE intent_id=? AND state=? AND version=? AND lease_generation=? \
+                   AND lease_owner IS ? AND lease_until IS ?",
+                params![
+                    command.to_state.as_str(),
+                    command.reason.as_str(),
+                    lease_owner,
+                    lease_until,
+                    as_i64("lease_generation", lease_generation)?,
+                    as_i64("result_version", result_version)?,
+                    command.occurred_at.get(),
+                    command.intent_id.as_str(),
+                    command.from_state.as_str(),
+                    as_i64("expected_version", command.expected_version)?,
+                    as_i64("current_lease_generation", current.lease_generation)?,
+                    current.lease_owner,
+                    current.lease_until.map(UtcMicros::get),
+                ],
+            )
+            .map_err(|_| IntentStoreError::StorageFailed {
+                operation: "cas_transition",
+            })?;
+        if affected != 1 {
+            transaction
+                .rollback()
+                .map_err(|_| IntentStoreError::StorageFailed {
+                    operation: "rollback_zero_row_cas",
+                })?;
+            let current = self
+                .inspect(&command.intent_id)?
+                .ok_or(IntentStoreError::IntentMissing)?;
+            return Ok(TransitionOutcome::Conflict { current });
+        }
+        if fault == Some("after_transition_cas") {
+            transaction
+                .rollback()
+                .map_err(|_| IntentStoreError::StorageFailed {
+                    operation: "rollback_after_cas_fault",
+                })?;
+            return Err(injected_fault("after_transition_cas"));
+        }
+
+        insert_transition(&transaction, &proposed)?;
+        if fault == Some("after_transition_append") {
+            transaction
+                .rollback()
+                .map_err(|_| IntentStoreError::StorageFailed {
+                    operation: "rollback_after_append_fault",
+                })?;
+            return Err(injected_fault("after_transition_append"));
+        }
+        if transaction.commit().is_err() {
+            if let Some(existing) = query_transition(&self.connection, event_id.as_str())? {
+                if existing.matches_command(command) {
+                    return Ok(TransitionOutcome::AlreadyCommitted(existing));
+                }
+            }
+            return Err(IntentStoreError::StorageFailed {
+                operation: "commit_transition",
+            });
+        }
+        if fault == Some("after_transition_commit_ack_lost") {
+            return Err(injected_fault("after_transition_commit_ack_lost"));
+        }
+
+        let persisted = query_transition(&self.connection, event_id.as_str())?
+            .ok_or_else(|| integrity("transition_post_commit_missing"))?;
+        if persisted != proposed {
+            return Err(integrity("transition_post_commit_mismatch"));
+        }
+        let current = self
+            .inspect(&command.intent_id)?
+            .ok_or(IntentStoreError::IntentMissing)?;
+        query_transition_chain(&self.connection, &current)?;
+        Ok(TransitionOutcome::Applied(persisted))
+    }
+
     pub fn inspect(
         &self,
         intent_id: &IntentId,
     ) -> Result<Option<IntentSnapshot>, IntentStoreError> {
         query_intent(&self.connection, intent_id.as_str())
+    }
+
+    pub fn inspect_transition_chain(
+        &self,
+        intent_id: &IntentId,
+    ) -> Result<Vec<TransitionReceipt>, IntentStoreError> {
+        let current = self
+            .inspect(intent_id)?
+            .ok_or(IntentStoreError::IntentMissing)?;
+        query_transition_chain(&self.connection, &current)
     }
 
     #[cfg(test)]
@@ -590,6 +1089,366 @@ impl BusinessIntentStore {
         u64::try_from(count).map_err(|_| IntentStoreError::IntegrityFailed {
             check: "intent_count",
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transition_count(&self, intent_id: &IntentId) -> Result<u64, IntentStoreError> {
+        let count: i64 = self
+            .connection
+            .query_row(
+                "SELECT count(*) FROM push_intent_transitions WHERE intent_id=?",
+                [intent_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|_| IntentStoreError::StorageFailed {
+                operation: "count_transitions",
+            })?;
+        u64::try_from(count).map_err(|_| integrity("transition_count"))
+    }
+}
+
+fn apply_lease_action(
+    current: &IntentSnapshot,
+    command: &IntentTransitionCommand,
+) -> Result<(Option<String>, Option<i64>, u64), IntentStoreError> {
+    match &command.lease_action {
+        LeaseAction::Preserve => Ok((
+            current.lease_owner.clone(),
+            current.lease_until.map(UtcMicros::get),
+            current.lease_generation,
+        )),
+        LeaseAction::Acquire { owner, until } => {
+            if current.lease_owner.as_deref() != Some(owner.as_str())
+                && current.lease_owner.is_some()
+                && current
+                    .lease_until
+                    .is_some_and(|existing_until| existing_until > command.occurred_at)
+            {
+                return Err(IntentStoreError::InvalidTransition {
+                    check: "foreign_lease_not_expired",
+                });
+            }
+            let generation = current.lease_generation.checked_add(1).ok_or(
+                IntentStoreError::InvalidTransition {
+                    check: "lease_generation_overflow",
+                },
+            )?;
+            Ok((
+                Some(owner.as_str().to_owned()),
+                Some(until.get()),
+                generation,
+            ))
+        }
+        LeaseAction::Release { owner } => {
+            if current.lease_owner.as_deref() != Some(owner.as_str()) {
+                return Err(IntentStoreError::InvalidTransition {
+                    check: "lease_release_owner_mismatch",
+                });
+            }
+            Ok((None, None, current.lease_generation))
+        }
+    }
+}
+
+fn insert_transition(
+    connection: &Connection,
+    receipt: &TransitionReceipt,
+) -> Result<(), IntentStoreError> {
+    connection
+        .execute(
+            "INSERT INTO push_intent_transitions(\
+                event_id,intent_id,from_state,to_state,expected_version,result_version,\
+                previous_sha256,canonical_sha256,actor,reason,terminal_disposition,\
+                terminal_decision_id,operator_audit_ref,operator_audit_sha256,terminal_ref_id,\
+                terminal_binding_sha256,occurred_at\
+             ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![
+                receipt.event_id.as_str(),
+                receipt.intent_id,
+                receipt.from_state.as_str(),
+                receipt.to_state.as_str(),
+                as_i64("expected_version", receipt.expected_version)?,
+                as_i64("result_version", receipt.result_version)?,
+                receipt.previous_sha256.as_ref().map(Sha256Digest::as_str),
+                receipt.canonical_sha256.as_str(),
+                receipt.actor,
+                receipt.reason.as_str(),
+                receipt.terminal_disposition,
+                receipt.terminal_decision_id,
+                receipt.operator_audit_ref,
+                receipt
+                    .operator_audit_sha256
+                    .as_ref()
+                    .map(Sha256Digest::as_str),
+                receipt.terminal_ref_id,
+                receipt
+                    .terminal_binding_sha256
+                    .as_ref()
+                    .map(Sha256Digest::as_str),
+                receipt.occurred_at.get(),
+            ],
+        )
+        .map_err(|_| IntentStoreError::StorageFailed {
+            operation: "append_transition",
+        })?;
+    Ok(())
+}
+
+fn transition_event_id(
+    intent_id: &str,
+    expected_version: u64,
+    result_version: u64,
+) -> Sha256Digest {
+    raw_digest(&canonical_preimage(
+        "IntentTransitionV1",
+        &BTreeMap::from([
+            (
+                "expected_version",
+                CanonicalValue::Unsigned(expected_version),
+            ),
+            ("intent_id", CanonicalValue::String(intent_id.to_owned())),
+            ("result_version", CanonicalValue::Unsigned(result_version)),
+        ]),
+    ))
+}
+
+fn transition_canonical_sha256(receipt: &TransitionReceipt) -> Sha256Digest {
+    raw_digest(&canonical_preimage(
+        "IntentTransitionV1",
+        &BTreeMap::from([
+            ("actor", CanonicalValue::String(receipt.actor.clone())),
+            (
+                "event_id",
+                CanonicalValue::String(receipt.event_id.as_str().to_owned()),
+            ),
+            (
+                "expected_version",
+                CanonicalValue::Unsigned(receipt.expected_version),
+            ),
+            (
+                "from_state",
+                CanonicalValue::String(receipt.from_state.as_str().to_owned()),
+            ),
+            (
+                "intent_id",
+                CanonicalValue::String(receipt.intent_id.clone()),
+            ),
+            (
+                "occurred_at",
+                CanonicalValue::Unsigned(receipt.occurred_at.get() as u64),
+            ),
+            (
+                "operator_audit_ref",
+                optional_string_value(receipt.operator_audit_ref.as_deref()),
+            ),
+            (
+                "operator_audit_sha256",
+                optional_digest_value(receipt.operator_audit_sha256.as_ref()),
+            ),
+            (
+                "previous_sha256",
+                optional_digest_value(receipt.previous_sha256.as_ref()),
+            ),
+            (
+                "reason",
+                CanonicalValue::String(receipt.reason.as_str().to_owned()),
+            ),
+            (
+                "result_version",
+                CanonicalValue::Unsigned(receipt.result_version),
+            ),
+            (
+                "terminal_binding_sha256",
+                optional_digest_value(receipt.terminal_binding_sha256.as_ref()),
+            ),
+            (
+                "terminal_decision_id",
+                optional_string_value(receipt.terminal_decision_id.as_deref()),
+            ),
+            (
+                "terminal_disposition",
+                optional_string_value(receipt.terminal_disposition.as_deref()),
+            ),
+            (
+                "terminal_ref_id",
+                optional_string_value(receipt.terminal_ref_id.as_deref()),
+            ),
+            (
+                "to_state",
+                CanonicalValue::String(receipt.to_state.as_str().to_owned()),
+            ),
+        ]),
+    ))
+}
+
+fn optional_string_value(value: Option<&str>) -> CanonicalValue {
+    value.map_or(CanonicalValue::Null, |value| {
+        CanonicalValue::String(value.to_owned())
+    })
+}
+
+fn optional_digest_value(value: Option<&Sha256Digest>) -> CanonicalValue {
+    optional_string_value(value.map(Sha256Digest::as_str))
+}
+
+fn query_transition(
+    connection: &Connection,
+    event_id: &str,
+) -> Result<Option<TransitionReceipt>, IntentStoreError> {
+    let raw = connection
+        .query_row(
+            "SELECT event_id,intent_id,from_state,to_state,expected_version,result_version,\
+                    previous_sha256,canonical_sha256,actor,reason,terminal_disposition,\
+                    terminal_decision_id,operator_audit_ref,operator_audit_sha256,terminal_ref_id,\
+                    terminal_binding_sha256,occurred_at \
+             FROM push_intent_transitions WHERE event_id=?",
+            [event_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, Option<String>>(15)?,
+                    row.get::<_, i64>(16)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| IntentStoreError::StorageFailed {
+            operation: "read_transition",
+        })?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    validate_transition_text("persisted_transition_actor", raw.8.clone())?;
+    let receipt = TransitionReceipt {
+        event_id: parse_digest("event_id", &raw.0)?,
+        intent_id: raw.1,
+        from_state: IntentState::parse(&raw.2)?,
+        to_state: IntentState::parse(&raw.3)?,
+        expected_version: parse_u64("transition_expected_version", raw.4)?,
+        result_version: parse_u64("transition_result_version", raw.5)?,
+        previous_sha256: parse_optional_digest("transition_previous_sha256", raw.6)?,
+        canonical_sha256: parse_digest("transition_canonical_sha256", &raw.7)?,
+        actor: raw.8,
+        reason: ReasonCode::try_from(raw.9.as_str()).map_err(|_| integrity("transition_reason"))?,
+        terminal_disposition: raw.10,
+        terminal_decision_id: raw.11,
+        operator_audit_ref: raw.12,
+        operator_audit_sha256: parse_optional_digest("operator_audit_sha256", raw.13)?,
+        terminal_ref_id: raw.14,
+        terminal_binding_sha256: parse_optional_digest("terminal_binding_sha256", raw.15)?,
+        occurred_at: parse_micros(raw.16)?,
+    };
+    verify_transition(&receipt)?;
+    Ok(Some(receipt))
+}
+
+fn verify_transition(receipt: &TransitionReceipt) -> Result<(), IntentStoreError> {
+    if receipt.result_version != receipt.expected_version + 1 {
+        return Err(integrity("transition_version_step"));
+    }
+    if (receipt.result_version == 1) != receipt.previous_sha256.is_none() {
+        return Err(integrity("transition_first_predecessor"));
+    }
+    if transition_event_id(
+        &receipt.intent_id,
+        receipt.expected_version,
+        receipt.result_version,
+    ) != receipt.event_id
+    {
+        return Err(integrity("transition_event_id"));
+    }
+    if transition_canonical_sha256(receipt) != receipt.canonical_sha256 {
+        return Err(integrity("transition_canonical_sha256"));
+    }
+    Ok(())
+}
+
+fn query_transition_chain(
+    connection: &Connection,
+    current: &IntentSnapshot,
+) -> Result<Vec<TransitionReceipt>, IntentStoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT event_id FROM push_intent_transitions \
+             WHERE intent_id=? ORDER BY result_version",
+        )
+        .map_err(|_| IntentStoreError::StorageFailed {
+            operation: "prepare_transition_chain",
+        })?;
+    let event_ids = statement
+        .query_map([current.intent_id.as_str()], |row| row.get::<_, String>(0))
+        .map_err(|_| IntentStoreError::StorageFailed {
+            operation: "query_transition_chain",
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|_| IntentStoreError::StorageFailed {
+            operation: "read_transition_chain",
+        })?;
+    drop(statement);
+    let mut chain = Vec::with_capacity(event_ids.len());
+    for event_id in event_ids {
+        let event = query_transition(connection, &event_id)?
+            .ok_or_else(|| integrity("transition_chain_member_missing"))?;
+        let expected_result_version = chain.len() as u64 + 1;
+        let expected_previous = chain
+            .last()
+            .map(|previous: &TransitionReceipt| &previous.canonical_sha256);
+        if event.result_version != expected_result_version
+            || event.expected_version + 1 != event.result_version
+            || event.previous_sha256.as_ref() != expected_previous
+            || chain
+                .last()
+                .is_some_and(|previous| previous.to_state != event.from_state)
+        {
+            return Err(integrity("transition_chain_continuity"));
+        }
+        chain.push(event);
+    }
+    if chain.len() as u64 != current.version {
+        return Err(integrity("intent_version_transition_count"));
+    }
+    if let Some(last) = chain.last() {
+        if last.to_state != current.state
+            || Some(last.from_state) != current.previous_state
+            || last.reason != current.reason
+        {
+            return Err(integrity("intent_transition_head_binding"));
+        }
+    } else if current.previous_state.is_some() {
+        return Err(integrity("initial_previous_state"));
+    }
+    Ok(chain)
+}
+
+fn as_i64(check: &'static str, value: u64) -> Result<i64, IntentStoreError> {
+    i64::try_from(value).map_err(|_| IntentStoreError::InvalidTransition { check })
+}
+
+fn injected_fault(point: &'static str) -> IntentStoreError {
+    #[cfg(test)]
+    {
+        IntentStoreError::InjectedFault { point }
+    }
+    #[cfg(not(test))]
+    {
+        let _ = point;
+        IntentStoreError::StorageFailed {
+            operation: "test_fault_unavailable",
+        }
     }
 }
 

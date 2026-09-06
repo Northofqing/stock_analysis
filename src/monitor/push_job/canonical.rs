@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use super::Sha256Digest;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum CanonicalValue {
+pub(crate) enum CanonicalValue {
     Null,
     Bool(bool),
     String(String),
@@ -16,7 +16,7 @@ pub(super) enum CanonicalValue {
     Object(BTreeMap<&'static str, CanonicalValue>),
 }
 
-pub(super) fn canonical_preimage(
+pub(crate) fn canonical_preimage(
     domain: &'static str,
     fields: &BTreeMap<&'static str, CanonicalValue>,
 ) -> Vec<u8> {
@@ -28,14 +28,14 @@ pub(super) fn canonical_preimage(
     preimage
 }
 
-pub(super) fn canonical_digest(
+pub(crate) fn canonical_digest(
     domain: &'static str,
     fields: &BTreeMap<&'static str, CanonicalValue>,
 ) -> Sha256Digest {
     raw_digest(&canonical_preimage(domain, fields))
 }
 
-pub(super) fn raw_digest(bytes: &[u8]) -> Sha256Digest {
+pub(crate) fn raw_digest(bytes: &[u8]) -> Sha256Digest {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     Sha256Digest::from_bytes(hasher.finalize().into())

@@ -9,6 +9,8 @@ mod identity;
 mod policy;
 mod projection;
 
+pub(crate) use canonical::{canonical_preimage, raw_digest, CanonicalValue};
+
 pub use context::{
     AuthenticatedOperatorRef, CalendarDate, CommandId, GitSha40, PhaseEpic, RunContext, ScheduleId,
     Trigger, TriggerView,

@@ -5,8 +5,11 @@ mod migration;
 
 pub use intent_store::{
     BusinessIntentStore, InitialDecisionKind, InitialIntentDraft, InitialIntentIdentity,
-    InitialIntentOutcome, IntentSnapshot, IntentState, IntentStoreError,
+    InitialIntentOutcome, IntentSnapshot, IntentState, IntentStoreError, IntentTransitionCommand,
+    LeaseAction, LeaseOwnerId, TransitionActor, TransitionOutcome, TransitionReceipt,
 };
+#[cfg(test)]
+pub(crate) use intent_store::{InitialCommitFault, TransitionFault};
 pub use migration::{FoundationMigrationError, FoundationSchemaMigration, MigrationReceipt};
 
 #[cfg(test)]
