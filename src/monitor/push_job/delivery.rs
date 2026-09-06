@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use crate::durable_delivery::DecisionState;
 
 use super::identity::validate_text;
+use super::policy::ReasonCode;
 use super::{
     AudienceId, BusinessDate, IntentId, Namespace, OccurrenceId, PushJobError, Result,
     Sha256Digest, SubjectId, UnitId, UtcMicros,
@@ -307,58 +308,6 @@ fn unique_channels(channels: &[ChannelId]) -> Option<BTreeSet<&str>> {
         .map(ChannelId::as_str)
         .collect::<BTreeSet<_>>();
     (unique.len() == channels.len()).then_some(unique)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
-pub enum ReasonCode {
-    TransportRejected,
-    TransportUncertain,
-    TransportNoChannelConfigured,
-    TransportAllChannelsFailed,
-    TransportPartiallyAccepted,
-    FinalizerTerminalRefInvalid,
-    FinalizerBindingMismatch,
-}
-
-impl ReasonCode {
-    pub const ALL: [Self; 7] = [
-        Self::TransportRejected,
-        Self::TransportUncertain,
-        Self::TransportNoChannelConfigured,
-        Self::TransportAllChannelsFailed,
-        Self::TransportPartiallyAccepted,
-        Self::FinalizerTerminalRefInvalid,
-        Self::FinalizerBindingMismatch,
-    ];
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::TransportRejected => "transport.rejected",
-            Self::TransportUncertain => "transport.uncertain",
-            Self::TransportNoChannelConfigured => "transport.no_channel_configured",
-            Self::TransportAllChannelsFailed => "transport.all_channels_failed",
-            Self::TransportPartiallyAccepted => "transport.partially_accepted",
-            Self::FinalizerTerminalRefInvalid => "finalizer.terminal_ref_invalid",
-            Self::FinalizerBindingMismatch => "finalizer.binding_mismatch",
-        }
-    }
-}
-
-impl TryFrom<&str> for ReasonCode {
-    type Error = PushJobError;
-
-    fn try_from(value: &str) -> Result<Self> {
-        match value {
-            "transport.rejected" => Ok(Self::TransportRejected),
-            "transport.uncertain" => Ok(Self::TransportUncertain),
-            "transport.no_channel_configured" => Ok(Self::TransportNoChannelConfigured),
-            "transport.all_channels_failed" => Ok(Self::TransportAllChannelsFailed),
-            "transport.partially_accepted" => Ok(Self::TransportPartiallyAccepted),
-            "finalizer.terminal_ref_invalid" => Ok(Self::FinalizerTerminalRefInvalid),
-            "finalizer.binding_mismatch" => Ok(Self::FinalizerBindingMismatch),
-            other => Err(PushJobError::InvalidReasonCode(other.to_owned())),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

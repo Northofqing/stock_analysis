@@ -2,13 +2,13 @@
 
 mod delivery;
 mod identity;
+mod policy;
 
 pub use delivery::{
     classify_durable_state, AttemptId, AuthorityClass, ChannelId, CompatId,
     CompatibilityEvidenceRef, CompletionEligibility, DecisionId, DeliveryAuthority, DeliveryResult,
-    DeliveryResultView, DurableSchemaVersion, DurableStateProjection, ReasonCode, TemplateId,
-    TemplateVersion, TerminalDisposition, TerminalRefId, VerifiedTerminalRef, WeakOutcome,
-    WeakOutcomeKind,
+    DeliveryResultView, DurableSchemaVersion, DurableStateProjection, TemplateId, TemplateVersion,
+    TerminalDisposition, TerminalRefId, VerifiedTerminalRef, WeakOutcome, WeakOutcomeKind,
 };
 pub use identity::{
     derive_intent_id, derive_occurrence_id, derive_schedule_occurrence_id, AudienceId,
@@ -16,6 +16,14 @@ pub use identity::{
     OccurrenceFamily, OccurrenceId, OccurrenceIdentityMaterial, OccurrenceKey, ProducerId, RunId,
     ScheduleOccurrenceId, ScheduleOccurrenceIdentityMaterial, ScheduleOrTriggerId, Sha256Digest,
     SourceContractId, SourceContractVersion, SubjectId, SubjectValue, UnitId, UtcMicros,
+};
+pub use policy::{
+    evaluate_completion, AdvanceEvent, AlreadyTerminalPolicy, CatalogOwnerRef, CompletionDirective,
+    CompletionFact, CompletionPolicy, CompletionPolicyId, CompletionPolicyVersion, CursorDirective,
+    CursorPolicy, DisabledEvidenceRef, DisabledPolicy, FinalizerKind, ManualDirective,
+    NoDataPolicy, ReasonCode, RetentionClass, RetryDirective, RetryEligibility, RetryPolicy,
+    ScheduleCloseBranch, ScheduleClosePolicy, ScheduleDirective, UncertainPolicy,
+    VerifiedEmptyEvidenceRef,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -37,6 +45,10 @@ pub enum PushJobError {
     InvalidDeliveryResult(&'static str),
     #[error("invalid reason code: {0}")]
     InvalidReasonCode(String),
+    #[error("invalid completion policy: {0}")]
+    InvalidCompletionPolicy(&'static str),
+    #[error("completion policy violation: {0}")]
+    PolicyViolation(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, PushJobError>;

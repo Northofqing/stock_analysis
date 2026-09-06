@@ -1,12 +1,14 @@
 use super::{
     classify_durable_state, derive_intent_id, derive_occurrence_id, derive_schedule_occurrence_id,
-    AudienceId, BusinessDate, CalendarId, ChannelId, CompatId, CompatibilityEvidenceRef,
-    CompletionEligibility, CompletionOwnerId, DeliveryAuthority, DeliveryResult,
-    DeliveryResultView, DurableStateProjection, IntentIdentityMaterial, Namespace,
-    OccurrenceFamily, OccurrenceIdentityMaterial, OccurrenceKey, ProducerId, ReasonCode, RunId,
-    ScheduleOccurrenceIdentityMaterial, ScheduleOrTriggerId, Sha256Digest, SourceContractId,
-    SourceContractVersion, SubjectId, TerminalDisposition, UnitId, UtcMicros, WeakOutcome,
-    WeakOutcomeKind,
+    evaluate_completion, AdvanceEvent, AudienceId, AuthorityClass, BusinessDate, CalendarId,
+    ChannelId, CompatId, CompatibilityEvidenceRef, CompletionEligibility, CompletionFact,
+    CompletionOwnerId, CursorDirective, CursorPolicy, DeliveryAuthority, DeliveryResult,
+    DeliveryResultView, DisabledPolicy, DurableStateProjection, FinalizerKind,
+    IntentIdentityMaterial, ManualDirective, Namespace, NoDataPolicy, OccurrenceFamily,
+    OccurrenceIdentityMaterial, OccurrenceKey, ProducerId, ReasonCode, RetryEligibility,
+    RetryPolicy, RunId, ScheduleDirective, ScheduleOccurrenceIdentityMaterial, ScheduleOrTriggerId,
+    Sha256Digest, SourceContractId, SourceContractVersion, SubjectId, TerminalDisposition, UnitId,
+    UtcMicros, WeakOutcome, WeakOutcomeKind,
 };
 
 fn occurrence_material() -> OccurrenceIdentityMaterial {
@@ -305,5 +307,426 @@ fn w02_verified_terminal_disposition_controls_strong_result_permissions() {
     assert_eq!(
         manual.completion_eligibility(),
         CompletionEligibility::PolicyBound
+    );
+}
+
+#[test]
+fn w03_reason_code_registry_is_exact_and_round_trips() {
+    let expected = [
+        "schedule.not_trading_day",
+        "schedule.window_not_open",
+        "schedule.window_expired",
+        "schedule.occurrence_closed",
+        "schedule.occurrence_conflict",
+        "schedule.window_open",
+        "schedule.deferred",
+        "input.source_recovered",
+        "activation.ready",
+        "input.source_unavailable",
+        "input.source_unready",
+        "input.evidence_invalid",
+        "input.no_verified_batch",
+        "input.account_snapshot_missing",
+        "input.namespace_violation",
+        "policy.disabled",
+        "policy.starved",
+        "policy.opt_in_disabled",
+        "policy.cooldown_active",
+        "policy.daily_budget_full",
+        "policy.suppressed",
+        "intent.payload_conflict",
+        "intent.expected_version_conflict",
+        "intent.lease_held",
+        "intent.transition_conflict",
+        "transport.rejected",
+        "transport.uncertain",
+        "transport.no_channel_configured",
+        "transport.all_channels_failed",
+        "transport.partially_accepted",
+        "finalizer.terminal_ref_invalid",
+        "finalizer.binding_mismatch",
+        "finalizer.cas_conflict",
+        "finalizer.deadline_exceeded",
+        "finalizer.transition_append_failed",
+        "activation.manifest_mismatch",
+        "activation.generation_conflict",
+        "activation.owner_conflict",
+        "activation.core_unready",
+        "activation.producer_unready",
+        "shadow.semantic_diff",
+        "shadow.side_effect_attempted",
+        "operator.not_delivered",
+        "operator.unauthorized",
+        "operator.evidence_invalid",
+        "operator.resolution_conflict",
+        "intent.created",
+        "intent.no_data",
+        "intent.dispatch_claimed",
+        "intent.authority_verified",
+        "finalizer.completed",
+        "activation.applied",
+    ];
+    assert_eq!(ReasonCode::ALL.len(), 52);
+    assert_eq!(
+        ReasonCode::ALL
+            .iter()
+            .map(|code| code.as_str())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    for code in ReasonCode::ALL {
+        assert_eq!(ReasonCode::try_from(code.as_str()), Ok(code));
+        assert!(code.as_str().is_ascii());
+        assert!(!code.as_str().contains('\0'));
+    }
+    assert!(ReasonCode::try_from("transport.accepted").is_err());
+}
+
+#[test]
+fn w03_retry_directive_preserves_reason_and_never_retries_uncertain() {
+    use std::num::NonZeroU32;
+
+    let now = UtcMicros::try_new(100).expect("valid time");
+    let not_before = UtcMicros::try_new(200).expect("valid time");
+    let waiting = RetryPolicy::InputBackoff { not_before }.evaluate(
+        now,
+        0,
+        false,
+        ReasonCode::InputSourceUnavailable,
+    );
+    assert_eq!(waiting.reason(), ReasonCode::InputSourceUnavailable);
+    assert_eq!(
+        waiting.eligibility(),
+        RetryEligibility::NotBefore(not_before)
+    );
+
+    let eligible = RetryPolicy::InputBackoff { not_before }.evaluate(
+        not_before,
+        0,
+        false,
+        ReasonCode::InputSourceUnavailable,
+    );
+    assert_eq!(eligible.eligibility(), RetryEligibility::EligibleInputRetry);
+
+    let uncertain = RetryPolicy::InputBackoff { not_before }.evaluate(
+        now,
+        1,
+        true,
+        ReasonCode::TransportUncertain,
+    );
+    assert_eq!(uncertain.eligibility(), RetryEligibility::Never);
+    assert_eq!(uncertain.reason(), ReasonCode::TransportUncertain);
+
+    let rejected = RetryPolicy::AuthorizedRejected {
+        not_before,
+        max_attempts: NonZeroU32::new(2).expect("nonzero attempts"),
+    };
+    assert_eq!(
+        rejected
+            .evaluate(not_before, 0, false, ReasonCode::TransportRejected)
+            .eligibility(),
+        RetryEligibility::RejectedAuthorizationRequired
+    );
+    assert_eq!(
+        rejected
+            .evaluate(not_before, 2, true, ReasonCode::TransportRejected)
+            .eligibility(),
+        RetryEligibility::AttemptsExhausted
+    );
+    assert_eq!(
+        rejected
+            .evaluate(not_before, 1, true, ReasonCode::TransportRejected)
+            .eligibility(),
+        RetryEligibility::EligibleAuthorizedRejected
+    );
+}
+
+#[test]
+fn w03_input_backoff_cannot_retry_post_attempt_or_contract_failures() {
+    let now = UtcMicros::try_new(200).expect("valid time");
+    let policy = RetryPolicy::InputBackoff {
+        not_before: UtcMicros::try_new(100).expect("valid time"),
+    };
+
+    assert_eq!(
+        policy
+            .evaluate(now, 0, true, ReasonCode::TransportRejected)
+            .eligibility(),
+        RetryEligibility::Never
+    );
+    assert_eq!(
+        policy
+            .evaluate(now, 0, false, ReasonCode::FinalizerCasConflict)
+            .eligibility(),
+        RetryEligibility::Never
+    );
+    assert_eq!(
+        policy
+            .evaluate(now, 0, false, ReasonCode::InputSourceUnready)
+            .eligibility(),
+        RetryEligibility::EligibleInputRetry
+    );
+}
+
+#[test]
+fn w03_no_data_disabled_and_uncertain_have_distinct_completion() {
+    use super::delivery::verified_terminal_fixture;
+    use super::policy::{disabled_fixture, policy_fixture, verified_empty_fixture};
+
+    let policy = policy_fixture(
+        NoDataPolicy::CloseVerifiedOccurrence,
+        DisabledPolicy::CloseDisabledOccurrence,
+        CursorPolicy::AcceptedBoundOnly,
+        RetryPolicy::Never,
+    );
+
+    let no_data = evaluate_completion(
+        &policy,
+        CompletionFact::VerifiedNoData(verified_empty_fixture()),
+    )
+    .expect("valid no-data decision");
+    assert_eq!(no_data.schedule(), ScheduleDirective::CloseVerifiedNoData);
+    assert_eq!(no_data.cursor(), CursorDirective::Never);
+
+    let disabled = evaluate_completion(
+        &policy,
+        CompletionFact::ExplicitDisabled(disabled_fixture(ReasonCode::PolicyDisabled)),
+    )
+    .expect("valid disabled decision");
+    assert_eq!(
+        disabled.schedule(),
+        ScheduleDirective::CloseExplicitDisabled
+    );
+    assert_eq!(disabled.cursor(), CursorDirective::Never);
+
+    let uncertain_delivery = DeliveryResult::from_verified_terminal(verified_terminal_fixture(
+        TerminalDisposition::Uncertain,
+    ));
+    let uncertain = evaluate_completion(&policy, CompletionFact::Delivery(&uncertain_delivery))
+        .expect("valid uncertain decision");
+    assert_eq!(uncertain.schedule(), ScheduleDirective::KeepOpen);
+    assert_eq!(uncertain.cursor(), CursorDirective::Never);
+    assert_eq!(uncertain.retry().eligibility(), RetryEligibility::Never);
+    assert_eq!(
+        uncertain.manual(),
+        ManualDirective::QuarantineThenVerifiedManual
+    );
+}
+
+#[test]
+fn w03_strong_terminal_matrix_separates_schedule_cursor_retry_and_manual() {
+    use std::num::NonZeroU32;
+
+    use super::delivery::verified_terminal_fixture;
+    use super::policy::{fixture_policy_options, try_policy_fixture};
+
+    let accepted_policy = try_policy_fixture(fixture_policy_options()).expect("valid policy");
+    assert_eq!(
+        accepted_policy
+            .completion_owner()
+            .completion_owner()
+            .as_str(),
+        "fixture-owner"
+    );
+    assert_eq!(
+        accepted_policy.completion_owner().unit_id().as_str(),
+        "MU-fixture"
+    );
+    let accepted_delivery = DeliveryResult::from_verified_terminal(verified_terminal_fixture(
+        TerminalDisposition::Accepted,
+    ));
+    let accepted = evaluate_completion(
+        &accepted_policy,
+        CompletionFact::Delivery(&accepted_delivery),
+    )
+    .expect("accepted terminal is allowed");
+    assert_eq!(accepted.schedule(), ScheduleDirective::CloseOnAccepted);
+    assert_eq!(accepted.cursor(), CursorDirective::AdvanceAccepted);
+    assert_eq!(accepted.retry().eligibility(), RetryEligibility::Never);
+    assert_eq!(accepted.manual(), ManualDirective::None);
+
+    let manual_delivery = DeliveryResult::from_verified_terminal(verified_terminal_fixture(
+        TerminalDisposition::ManualConfirmedAccepted,
+    ));
+    let manual = evaluate_completion(&accepted_policy, CompletionFact::Delivery(&manual_delivery))
+        .expect("manual accepted terminal is allowed");
+    assert_eq!(manual.schedule(), ScheduleDirective::CloseOnAccepted);
+    assert_eq!(manual.cursor(), CursorDirective::AdvanceManualAccepted);
+
+    let mut accepted_only = fixture_policy_options();
+    accepted_only.advance_event = AdvanceEvent::AcceptedBound;
+    let accepted_only = try_policy_fixture(accepted_only).expect("valid accepted-only policy");
+    let manual = evaluate_completion(&accepted_only, CompletionFact::Delivery(&manual_delivery))
+        .expect("manual terminal remains observable");
+    assert_eq!(manual.schedule(), ScheduleDirective::CloseOnAccepted);
+    assert_eq!(manual.cursor(), CursorDirective::Never);
+
+    let not_delivered = DeliveryResult::from_verified_terminal(verified_terminal_fixture(
+        TerminalDisposition::ManualConfirmedNotDelivered,
+    ));
+    let not_delivered =
+        evaluate_completion(&accepted_policy, CompletionFact::Delivery(&not_delivered))
+            .expect("manual not-delivered terminal is allowed");
+    assert_eq!(not_delivered.schedule(), ScheduleDirective::KeepOpen);
+    assert_eq!(not_delivered.cursor(), CursorDirective::Never);
+
+    let mut rejected_options = fixture_policy_options();
+    rejected_options.retry_policy = RetryPolicy::AuthorizedRejected {
+        not_before: UtcMicros::try_new(200).expect("valid time"),
+        max_attempts: NonZeroU32::new(2).expect("nonzero attempts"),
+    };
+    let rejected_policy = try_policy_fixture(rejected_options).expect("valid rejected policy");
+    let rejected_delivery = DeliveryResult::from_verified_terminal(verified_terminal_fixture(
+        TerminalDisposition::Rejected,
+    ));
+    let rejected = evaluate_completion(
+        &rejected_policy,
+        CompletionFact::Delivery(&rejected_delivery),
+    )
+    .expect("rejected terminal is allowed");
+    assert_eq!(rejected.schedule(), ScheduleDirective::KeepOpen);
+    assert_eq!(rejected.cursor(), CursorDirective::Never);
+    assert_eq!(
+        rejected.retry().eligibility(),
+        RetryEligibility::RejectedAuthorizationRequired
+    );
+}
+
+#[test]
+fn w03_compatibility_results_require_observation_policy_and_never_complete() {
+    use super::policy::{fixture_policy_options, try_policy_fixture};
+
+    let evidence = compatibility_evidence(
+        &["feishu"],
+        &["feishu"],
+        &[("feishu", WeakOutcomeKind::Accepted)],
+    )
+    .expect("valid compatibility evidence");
+    let delivery = DeliveryResult::best_effort_accepted(evidence).expect("valid weak result");
+
+    let bound = try_policy_fixture(fixture_policy_options()).expect("valid bound policy");
+    assert!(evaluate_completion(&bound, CompletionFact::Delivery(&delivery)).is_err());
+
+    let mut observation = fixture_policy_options();
+    observation.cursor_policy = CursorPolicy::Never;
+    observation.allowed_authority.clear();
+    observation.finalizer_kind = FinalizerKind::CompatibilityObservation;
+    observation.close_all_schedule_branches = false;
+    let observation = try_policy_fixture(observation).expect("valid observation policy");
+    let directive = evaluate_completion(&observation, CompletionFact::Delivery(&delivery))
+        .expect("compatibility observation is allowed");
+    assert_eq!(directive.schedule(), ScheduleDirective::KeepOpen);
+    assert_eq!(directive.cursor(), CursorDirective::Never);
+    assert_eq!(directive.retry().eligibility(), RetryEligibility::Never);
+    assert_eq!(directive.manual(), ManualDirective::None);
+}
+
+#[test]
+fn w03_policy_registration_rejects_owner_cursor_authority_conflicts() {
+    use super::policy::{fixture_policy_options, try_policy_fixture};
+
+    let mut owner_mismatch = fixture_policy_options();
+    owner_mismatch.catalog_completion_owner = "other-owner";
+    assert!(try_policy_fixture(owner_mismatch).is_err());
+
+    let mut bound_without_cursor = fixture_policy_options();
+    bound_without_cursor.cursor_policy = CursorPolicy::Never;
+    assert!(try_policy_fixture(bound_without_cursor).is_err());
+
+    let mut bound_without_authority = fixture_policy_options();
+    bound_without_authority.allowed_authority.clear();
+    assert!(try_policy_fixture(bound_without_authority).is_err());
+
+    let mut duplicate_authority = fixture_policy_options();
+    duplicate_authority.allowed_authority = vec![
+        AuthorityClass::GenericCounted,
+        AuthorityClass::GenericCounted,
+    ];
+    assert!(try_policy_fixture(duplicate_authority).is_err());
+
+    let mut observation_with_authority = fixture_policy_options();
+    observation_with_authority.cursor_policy = CursorPolicy::Never;
+    observation_with_authority.finalizer_kind = FinalizerKind::CompatibilityObservation;
+    assert!(try_policy_fixture(observation_with_authority).is_err());
+}
+
+#[test]
+fn w03_non_terminal_facts_keep_cursor_closed_and_preserve_typed_retry() {
+    use super::policy::{fixture_policy_options, try_policy_fixture};
+
+    let mut options = fixture_policy_options();
+    options.retry_policy = RetryPolicy::InputBackoff {
+        not_before: UtcMicros::try_new(200).expect("valid time"),
+    };
+    let policy = try_policy_fixture(options).expect("valid input policy");
+
+    let blocked = evaluate_completion(
+        &policy,
+        CompletionFact::BlockedOnInput {
+            reason: ReasonCode::InputSourceUnavailable,
+            retry_after: Some(UtcMicros::try_new(250).expect("valid time")),
+        },
+    )
+    .expect("valid blocked input");
+    assert_eq!(blocked.schedule(), ScheduleDirective::KeepOpen);
+    assert_eq!(blocked.cursor(), CursorDirective::Never);
+    assert_eq!(
+        blocked.retry().eligibility(),
+        RetryEligibility::NotBefore(UtcMicros::try_new(250).expect("valid time"))
+    );
+
+    let suppressed = evaluate_completion(
+        &policy,
+        CompletionFact::Suppressed {
+            reason: ReasonCode::PolicyCooldownActive,
+            eligible_after: Some(UtcMicros::try_new(300).expect("valid time")),
+        },
+    )
+    .expect("valid suppression");
+    assert_eq!(
+        suppressed.schedule(),
+        ScheduleDirective::CloseSuppressedOccurrence
+    );
+    assert_eq!(suppressed.cursor(), CursorDirective::Never);
+    assert_eq!(
+        suppressed.retry().eligibility(),
+        RetryEligibility::NotBefore(UtcMicros::try_new(300).expect("valid time"))
+    );
+
+    let retryable = evaluate_completion(
+        &policy,
+        CompletionFact::RetryableFailure {
+            reason: ReasonCode::InputSourceUnready,
+            retry_after: None,
+        },
+    )
+    .expect("valid retryable preparation failure");
+    assert_eq!(retryable.schedule(), ScheduleDirective::KeepOpen);
+    assert_eq!(retryable.cursor(), CursorDirective::Never);
+    assert_eq!(
+        retryable.retry().eligibility(),
+        RetryEligibility::NotBefore(UtcMicros::try_new(200).expect("valid time"))
+    );
+
+    let permanent = evaluate_completion(
+        &policy,
+        CompletionFact::PermanentFailure {
+            reason: ReasonCode::InputNamespaceViolation,
+        },
+    )
+    .expect("valid permanent failure");
+    assert_eq!(permanent.schedule(), ScheduleDirective::KeepOpen);
+    assert_eq!(permanent.cursor(), CursorDirective::Never);
+    assert_eq!(permanent.retry().eligibility(), RetryEligibility::Never);
+
+    let delivery_blocked = DeliveryResult::blocked(ReasonCode::FinalizerBindingMismatch);
+    let delivery_blocked =
+        evaluate_completion(&policy, CompletionFact::Delivery(&delivery_blocked))
+            .expect("valid blocked delivery");
+    assert_eq!(delivery_blocked.schedule(), ScheduleDirective::KeepOpen);
+    assert_eq!(delivery_blocked.cursor(), CursorDirective::Never);
+    assert_eq!(
+        delivery_blocked.retry().eligibility(),
+        RetryEligibility::Never
     );
 }
