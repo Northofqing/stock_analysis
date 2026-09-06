@@ -216,19 +216,19 @@ pub(super) fn attest_connection(
         .map_err(|_| FoundationMigrationError::AttestationFailed {
             check: "query_only",
         })?;
-    if query_count(&connection, "PRAGMA query_only", "query_only")? != 1 {
+    if query_count(connection, "PRAGMA query_only", "query_only")? != 1 {
         return Err(FoundationMigrationError::AttestationFailed {
             check: "query_only",
         });
     }
 
     let header_count = query_count(
-        &connection,
+        connection,
         "SELECT count(*) FROM push_foundation_schema WHERE version=1 AND description='push-foundation-v1' AND schema_signature='dd5f49a1f4e02ee1d585793cc2eff9c8b98b087b2ffd267f40c873c83960ecdd'",
         "schema_header",
     )?;
     let total_header_count = query_count(
-        &connection,
+        connection,
         "SELECT count(*) FROM push_foundation_schema",
         "schema_header_count",
     )?;
@@ -239,7 +239,7 @@ pub(super) fn attest_connection(
     }
 
     let registry_count = query_count(
-        &connection,
+        connection,
         "SELECT count(*) FROM push_foundation_objects",
         "managed_object_count",
     )?;
@@ -250,7 +250,7 @@ pub(super) fn attest_connection(
     }
 
     let matching_objects = query_count(
-        &connection,
+        connection,
         "SELECT count(*) FROM push_foundation_objects r JOIN sqlite_master s ON s.name=r.name AND s.type=r.object_type AND CAST(s.sql AS BLOB)=CAST(r.definition AS BLOB)",
         "managed_object_definitions",
     )?;
@@ -261,7 +261,7 @@ pub(super) fn attest_connection(
     }
 
     let unregistered_attached = query_count(
-        &connection,
+        connection,
         "SELECT count(*) FROM sqlite_master s WHERE s.sql IS NOT NULL AND s.type IN ('index','trigger') AND s.name NOT LIKE 'sqlite_autoindex_%' AND s.tbl_name IN (SELECT name FROM push_foundation_objects WHERE object_type='table') AND NOT EXISTS(SELECT 1 FROM push_foundation_objects r WHERE r.name=s.name AND r.object_type=s.type)",
         "unregistered_attached_objects",
     )?;

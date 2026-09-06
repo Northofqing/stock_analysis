@@ -734,7 +734,7 @@ impl TransitionReceipt {
 pub enum TransitionOutcome {
     Applied(TransitionReceipt),
     AlreadyCommitted(TransitionReceipt),
-    Conflict { current: IntentSnapshot },
+    Conflict { current: Box<IntentSnapshot> },
 }
 
 impl TransitionOutcome {
@@ -981,7 +981,9 @@ impl BusinessIntentStore {
             return if existing.matches_command(command, &current) {
                 Ok(TransitionOutcome::AlreadyCommitted(existing))
             } else {
-                Ok(TransitionOutcome::Conflict { current })
+                Ok(TransitionOutcome::Conflict {
+                    current: Box::new(current),
+                })
             };
         }
 
@@ -1000,7 +1002,9 @@ impl BusinessIntentStore {
                 .map_err(|_| IntentStoreError::StorageFailed {
                     operation: "rollback_transition_conflict",
                 })?;
-            return Ok(TransitionOutcome::Conflict { current });
+            return Ok(TransitionOutcome::Conflict {
+                current: Box::new(current),
+            });
         }
         if command.occurred_at < current.updated_at {
             transaction
@@ -1064,7 +1068,9 @@ impl BusinessIntentStore {
             let current = self
                 .inspect(&command.intent_id)?
                 .ok_or(IntentStoreError::IntentMissing)?;
-            return Ok(TransitionOutcome::Conflict { current });
+            return Ok(TransitionOutcome::Conflict {
+                current: Box::new(current),
+            });
         }
         if fault == Some("after_transition_cas") {
             transaction
