@@ -80,13 +80,13 @@ prepare(RunContext) -> PreparedFacts -> project() -> JobDecision
 
 **接口：** `ArchitectureDocs::RfcInputs.validate(root)` 返回稳定错误码字符串数组；CLI 为 `check-rfc-inputs.rb --root ROOT`，成功 exit 0、内容失败 exit 1、参数失败 exit 2，永不写输入。
 
-- [ ] 在 `.gitignore` 精确放行八份输入、本批计划、manifest、RFC、SQL、WBS 和结果文件，不放开整个 `docs/`。
-- [ ] 复制前校验原工作区八份输入的路径、普通文件身份、字节数和 SHA；机械导入后逐项验证相同。不得以换行规范化、format 或重新生成替代原字节。
-- [ ] manifest 顶层固定 `schema_version:1`、`status:"PROVISIONAL"`、`source_workspace:"root-worktree-snapshot"`、`captured_date:"2026-09-06"`、`inputs`，不得保存机器绝对路径。每项固定 `id/path/bytes/sha256/role/authority/conflicts`；HTML 的 authority 明确为 derived visual snapshot，67-kind 的冲突明确为 non-baseline evidence。
-- [ ] 先用公开 CLI 写 RED 测试：成功、缺失、字节变化、尺寸变化、重复 id/path、非法状态/schema、绝对/越界路径、普通文件被 symlink 替代、未知参数。
-- [ ] 实现最小 validator；读取前 realpath containment，拒绝目录和链接；使用二进制字节算哈希。
-- [ ] 运行 `ruby scripts/architecture-docs/test/rfc_inputs_test.rb`、`ruby scripts/architecture-docs/check-rfc-inputs.rb --root .`、两个导入 Ruby 文件的 `ruby -c`、`git diff --check`；全部通过。
-- [ ] 独立规格复核八项路径/尺寸/SHA/角色和 65/67 裁决；独立质量复核 CLI 退出码、路径安全和测试真实性。修复后提交 `docs: freeze batch 3 RFC inputs`。
+- [x] 在 `.gitignore` 精确放行八份输入、本批计划、manifest、RFC、SQL、WBS 和结果文件，不放开整个 `docs/`。
+- [x] 复制前校验原工作区八份输入的路径、普通文件身份、字节数和 SHA；机械导入后逐项验证相同。不得以换行规范化、format 或重新生成替代原字节。
+- [x] manifest 顶层固定 `schema_version:1`、`status:"PROVISIONAL"`、`source_workspace:"root-worktree-snapshot"`、`captured_date:"2026-09-06"`、`inputs`，不得保存机器绝对路径。每项固定 `id/path/bytes/sha256/role/authority/conflicts`；HTML 的 authority 明确为 derived visual snapshot，67-kind 的冲突明确为 non-baseline evidence。
+- [x] 先用公开 CLI 写 RED 测试：成功、缺失、字节变化、尺寸变化、重复 id/path、非法状态/schema、绝对/越界路径、普通文件被 symlink 替代、未知参数。
+- [x] 实现最小 validator；读取前 realpath containment，拒绝目录和链接；使用二进制字节算哈希。
+- [x] 运行输入与来源测试、真实 CLI、五个 Ruby 语法检查和 hand-authored diff check；全部通过。八份不可变输入原有 11 处 blank-at-EOL 由 size/SHA 管理，全 staged diff 仅用命令级 `core.whitespace=-blank-at-eol` 检查且不改 Git 配置。
+- [x] 独立规格/质量复核八项路径/尺寸/SHA/角色、65/67 裁决、CLI 和路径安全；最终 Critical/Important/Minor 均为 0。提交 `bb3eccd`（`docs: freeze batch 3 RFC inputs`）。
 
 ## Task 2：RFC 领域合同、应用结果与 ReasonCode
 
