@@ -1,7 +1,15 @@
 //! Application-level push contracts. This module is pure and has no runtime wiring.
 
+mod delivery;
 mod identity;
 
+pub use delivery::{
+    classify_durable_state, AttemptId, AuthorityClass, ChannelId, CompatId,
+    CompatibilityEvidenceRef, CompletionEligibility, DecisionId, DeliveryAuthority, DeliveryResult,
+    DeliveryResultView, DurableSchemaVersion, DurableStateProjection, ReasonCode, TemplateId,
+    TemplateVersion, TerminalDisposition, TerminalRefId, VerifiedTerminalRef, WeakOutcome,
+    WeakOutcomeKind,
+};
 pub use identity::{
     derive_intent_id, derive_occurrence_id, derive_schedule_occurrence_id, AudienceId,
     BusinessDate, CalendarId, CompletionOwnerId, IntentId, IntentIdentityMaterial, Namespace,
@@ -23,6 +31,12 @@ pub enum PushJobError {
     InvalidSha256 { field: &'static str },
     #[error("UTC microseconds must be non-negative")]
     InvalidUtcMicros,
+    #[error("invalid compatibility evidence: {0}")]
+    InvalidCompatibilityEvidence(&'static str),
+    #[error("invalid delivery result: {0}")]
+    InvalidDeliveryResult(&'static str),
+    #[error("invalid reason code: {0}")]
+    InvalidReasonCode(String),
 }
 
 pub type Result<T> = std::result::Result<T, PushJobError>;
