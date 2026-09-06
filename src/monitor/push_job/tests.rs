@@ -920,3 +920,117 @@ fn w03_non_terminal_facts_keep_cursor_closed_and_preserve_typed_retry() {
         RetryEligibility::Never
     );
 }
+
+#[test]
+fn w04_run_context_golden_hash_is_stable() {
+    use super::context::{context_fixture, run_context_preimage_fixture, ContextFixtureCase};
+    use super::{PhaseEpic, TriggerView};
+
+    let context =
+        context_fixture(ContextFixtureCase::ValidScheduled).expect("valid catalog-bound context");
+
+    assert_eq!(context.schema_version(), 1);
+    assert_eq!(context.run_id().as_str(), "run-20260907-090500");
+    assert_eq!(context.unit_id().as_str(), "MU-auction");
+    assert_eq!(context.namespace(), &Namespace::Production);
+    assert_eq!(context.business_date().as_str(), "2026-09-07");
+    assert_eq!(context.calendar_date().as_str(), "2026-09-07");
+    assert_eq!(context.phase(), PhaseEpic::Auction);
+    assert!(matches!(
+        context.trigger(),
+        TriggerView::Scheduled { schedule_id } if schedule_id.as_str() == "auction-main"
+    ));
+    assert_eq!(
+        context.occurrence().as_str(),
+        "d5881448142d550c9e73bd4c7d61ed8da16587a6beee0f6dced16c5420b11e0d"
+    );
+    assert_eq!(
+        context.captured_business_time().get(),
+        1_788_743_100_000_000
+    );
+    assert_eq!(context.activation_generation(), 7);
+    assert_eq!(
+        context.build_commit().as_str(),
+        "0123456789abcdef0123456789abcdef01234567"
+    );
+    assert_eq!(context.catalog_sha256(), &digest('c'));
+    assert_eq!(
+        context.source_contract_version().as_str(),
+        "auction-source-v2"
+    );
+    assert_eq!(context.template_version().as_str(), "auction-card-v3");
+
+    let expected = concat!(
+        "RunContext/v1\0{",
+        "\"activation_generation\":7,",
+        "\"build_commit\":\"0123456789abcdef0123456789abcdef01234567\",",
+        "\"business_date\":\"2026-09-07\",",
+        "\"calendar_date\":\"2026-09-07\",",
+        "\"captured_business_time\":1788743100000000,",
+        "\"catalog_sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",",
+        "\"namespace\":{\"kind\":\"Production\",\"run_id\":null},",
+        "\"occurrence\":\"d5881448142d550c9e73bd4c7d61ed8da16587a6beee0f6dced16c5420b11e0d\",",
+        "\"phase\":\"Auction\",",
+        "\"run_id\":\"run-20260907-090500\",",
+        "\"schema_version\":1,",
+        "\"source_contract_version\":\"auction-source-v2\",",
+        "\"template_version\":\"auction-card-v3\",",
+        "\"trigger\":{\"kind\":\"Scheduled\",\"schedule_id\":\"auction-main\"},",
+        "\"unit_id\":\"MU-auction\"}"
+    );
+    assert_eq!(run_context_preimage_fixture(&context), expected.as_bytes());
+    assert_eq!(
+        context.canonical_sha256().as_str(),
+        "ced27f93ce01baa5c775beef415f73fda5b065727ee9d246c91ba9807d7276b8"
+    );
+}
+
+#[test]
+fn w04_run_context_exposes_only_the_captured_trigger_branch() {
+    use super::context::{context_fixture, ContextFixtureCase};
+    use super::TriggerView;
+
+    let event = context_fixture(ContextFixtureCase::ValidEvent).expect("valid event context");
+    assert!(matches!(
+        event.trigger(),
+        TriggerView::Event {
+            producer_id,
+            source_ref,
+        } if producer_id.as_str() == "auction-event"
+            && source_ref.source_ref_id().as_str() == "source-event-1"
+            && source_ref.source_contract_id().as_str() == "auction-source"
+    ));
+
+    let manual = context_fixture(ContextFixtureCase::ValidManual).expect("valid manual context");
+    assert!(matches!(
+        manual.trigger(),
+        TriggerView::Manual {
+            command_id,
+            authenticated_operator_ref,
+        } if command_id.as_str() == "command-1"
+            && authenticated_operator_ref.as_str() == "operator-session-1"
+    ));
+}
+
+#[test]
+fn w04_run_context_rejects_invalid_values_and_catalog_mismatches() {
+    use super::context::{context_fixture, ContextFixtureCase};
+    use super::{CalendarDate, GitSha40};
+
+    assert!(CalendarDate::parse("2026-9-7").is_err());
+    assert!(GitSha40::parse("ABCDEF0123456789ABCDEF0123456789ABCDEF01").is_err());
+    assert!(GitSha40::parse("0123").is_err());
+
+    for case in [
+        ContextFixtureCase::WrongSchedule,
+        ContextFixtureCase::WrongEventProducer,
+        ContextFixtureCase::WrongEventSourceContract,
+        ContextFixtureCase::WrongOccurrenceFamily,
+        ContextFixtureCase::WrongTestNamespaceRun,
+    ] {
+        assert!(
+            context_fixture(case).is_err(),
+            "case {case:?} must fail closed"
+        );
+    }
+}
