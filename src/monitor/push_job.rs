@@ -1,6 +1,7 @@
 //! Application-level push contracts. This module is pure and has no runtime wiring.
 
 mod canonical;
+mod catalog;
 mod context;
 mod delivery;
 mod facts;
@@ -11,6 +12,11 @@ mod projection;
 pub use context::{
     AuthenticatedOperatorRef, CalendarDate, CommandId, GitSha40, PhaseEpic, RunContext, ScheduleId,
     Trigger, TriggerView,
+};
+
+pub use catalog::{
+    CatalogEntity, CatalogKindRegistration, CatalogProducerRegistration, CatalogStatus,
+    CatalogUnitRegistration, MachineCatalog, MachineCatalogError, MachineCatalogStatus,
 };
 
 pub use delivery::{
