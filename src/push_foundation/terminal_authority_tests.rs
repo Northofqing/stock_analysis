@@ -8,9 +8,10 @@ use crate::monitor::push_job::{
 };
 
 use super::terminal_authority::{
-    terminal_binding_preimage_for_test, terminal_binding_sha256, verify_terminal,
-    AuthorityDescriptor, AuthorityQuery, AuthorityQueryFailure, AuthorityTerminalRecord,
-    TerminalAuthorityError, TerminalAuthorityPort, TerminalTemplateBinding,
+    reverify_for_finalization, terminal_binding_preimage_for_test, terminal_binding_sha256,
+    verify_terminal, AuthorityDescriptor, AuthorityQuery, AuthorityQueryFailure,
+    AuthorityTerminalRecord, TerminalAuthorityError, TerminalAuthorityPort,
+    TerminalTemplateBinding,
 };
 use super::{
     BusinessIntentStore, FoundationSchemaMigration, InitialIntentDraft, InitialIntentIdentity,
@@ -414,4 +415,106 @@ fn w09_missing_pending_unavailable_and_disallowed_authority_fail_closed() {
         ),
         Err(TerminalAuthorityError::AuthorityNotAllowed)
     ));
+}
+
+#[test]
+fn w09_finalization_requeries_authority_and_returns_only_the_fresh_reference() {
+    let fixture = fixture();
+    let authority = FakeAuthority::terminal(fixture.record);
+    let first_verified_at = UtcMicros::try_new(1_788_743_101_000_000).unwrap();
+    let final_verified_at = UtcMicros::try_new(1_788_743_102_000_000).unwrap();
+    let prior = verify_terminal(
+        &fixture.snapshot,
+        &fixture.template,
+        &fixture.policy,
+        &authority,
+        first_verified_at,
+    )
+    .unwrap();
+
+    let finalization = reverify_for_finalization(
+        &prior,
+        &fixture.snapshot,
+        &fixture.template,
+        &fixture.policy,
+        &authority,
+        final_verified_at,
+    )
+    .unwrap();
+
+    assert_eq!(authority.calls.get(), 2);
+    assert_eq!(
+        finalization.verified_terminal().verified_at(),
+        final_verified_at
+    );
+    assert_eq!(
+        finalization.verified_terminal().binding_sha256(),
+        prior.binding_sha256()
+    );
+    let consumed = finalization.into_verified_terminal();
+    assert_eq!(consumed.verified_at(), final_verified_at);
+}
+
+#[test]
+fn w09_finalization_rejects_authority_drift_after_the_initial_verification() {
+    let fixture = fixture();
+    let authority = FakeAuthority::terminal(fixture.record.clone());
+    let prior = verify_terminal(
+        &fixture.snapshot,
+        &fixture.template,
+        &fixture.policy,
+        &authority,
+        UtcMicros::try_new(1_788_743_101_000_000).unwrap(),
+    )
+    .unwrap();
+
+    let mut changed = fixture.record;
+    changed.ref_id = TerminalRefId::try_new("disposition-replaced".to_owned()).unwrap();
+    changed.binding_sha256 = terminal_binding_sha256(&changed);
+    *authority.result.borrow_mut() = Ok(AuthorityQuery::Terminal(changed));
+
+    assert!(matches!(
+        reverify_for_finalization(
+            &prior,
+            &fixture.snapshot,
+            &fixture.template,
+            &fixture.policy,
+            &authority,
+            UtcMicros::try_new(1_788_743_102_000_000).unwrap(),
+        ),
+        Err(TerminalAuthorityError::PriorReferenceChanged)
+    ));
+    assert_eq!(authority.calls.get(), 2);
+}
+
+#[test]
+fn w09_finalization_repeats_full_binding_validation_and_fails_closed() {
+    let fixture = fixture();
+    let authority = FakeAuthority::terminal(fixture.record.clone());
+    let prior = verify_terminal(
+        &fixture.snapshot,
+        &fixture.template,
+        &fixture.policy,
+        &authority,
+        UtcMicros::try_new(1_788_743_101_000_000).unwrap(),
+    )
+    .unwrap();
+
+    let mut changed = fixture.record;
+    changed.subject = SubjectId::entity("600000.SH".to_owned()).unwrap();
+    changed.binding_sha256 = terminal_binding_sha256(&changed);
+    *authority.result.borrow_mut() = Ok(AuthorityQuery::Terminal(changed));
+
+    assert!(matches!(
+        reverify_for_finalization(
+            &prior,
+            &fixture.snapshot,
+            &fixture.template,
+            &fixture.policy,
+            &authority,
+            UtcMicros::try_new(1_788_743_102_000_000).unwrap(),
+        ),
+        Err(TerminalAuthorityError::BindingMismatch { field: "subject" })
+    ));
+    assert_eq!(authority.calls.get(), 2);
 }
