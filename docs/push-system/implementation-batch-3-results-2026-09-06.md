@@ -1,6 +1,6 @@
-# 第三批 RFC/SQL/WBS 交接候选结果（2026-09-06）
+# 第三批 RFC/SQL/WBS 规格完成结果（2026-09-06）
 
-状态：`PROVISIONAL`；**wave3 已修、最终 Quality 限定复审待定**。这是实现者交接候选状态；round2 整批 Spec PASS（0/0/0）、Quality FAIL（0/1/0），本波修复该唯一 Important。Task 1--5 及修复波 1 的限定双轴 PASS、自动 GREEN 均不代替最终 Quality 复审，第三批未宣告完成。
+状态：`PROVISIONAL`；**第三批 RFC/SQL/WBS 规格与机器合同完成最终独立审查**。Controller 确认 FINAL SPEC PASS（Critical/Important/Minor=0/0/0，`288e8b2..9b11a5a`）及 wave3 FINAL SCOPED QUALITY PASS（0/0/0，`9b11a5a..dd9f188`）；原所有 findings 已关闭。完成范围仅为本批规格交付，不是系统改造、发布或运行时完成。
 
 本批把每条推送的身份、完成权威、跨库恢复、调度/readiness、shadow/activation/operator、保留期和逐 Unit 工期变成可失败的机器合同。它帮助实施者识别合同缺项、语义倒退和数值漂移，仍不证明线上推送问题已修复。
 
@@ -15,7 +15,7 @@
 | Task 3 持久化协议 | `5713b38` / `f226d0f` / `d763d5f` | 首轮 4 Important、1 Minor：非发送事实、SHA 身份、reason/edge 绑定、旧 schema 兼容与 NUL 字节漏洞；复审以 19 项/675 assertions 定点证据关闭，PASS/PASS，剩余 0/0/0。 |
 | Task 4 调度与运维 | `824da74` / `507512a` / `246b931` | 首轮 1 Important：occurrence 无独立版本 CAS 模型；补 version、转换请求、零行无副作用和提交证据合同后，限定复审 PASS/PASS，剩余 0/0/0。 |
 | Task 5 精确 WBS | `846fa1b` / `edbb509` / `d45dada` | 首轮 1 Important、2 Minor：CLI-chain 未获晋级授权、Float 舍入、非法 ID 诊断不稳定；修复后限定复审 PASS/PASS，剩余 0/0/0。CLI-chain 保持未排序，等待单独产品裁决。 |
-| Task 6 候选验证 | checker `4a7ff33eb4136b6008359bb95428b1b5d062762f`；本交接候选另行提交 | checker 补齐四项 strict 发布原因码和 catalog 显式模式；最终独立 Spec/Quality 审查待 Controller 执行，最终审查及完成提交勾选保留未完成。 |
+| Task 6 最终收口 | checker `4a7ff33eb4136b6008359bb95428b1b5d062762f`；候选 `dd9f188`；本最终状态提交 | checker 补齐四项 strict 发布原因码和 catalog 显式模式；最终独立 SPEC / wave3 SCOPED QUALITY 均 PASS、0/0/0，精确范围见上文；计划最后三项随本提交完成。 |
 
 Task 6 原始候选的产品范围为七个路径：本结果、README、第三批计划、`rfc_spec.rb`、`rfc_spec_test.rb`、`check-catalog.rb`、`catalog_test.rb`。计划先补列漏记的四个 checker/test 路径；先提交 checker，再从该 clean HEAD fresh 验证，最后仅更新交接文档和候选状态。该原始候选没有修改 RFC 正文、WBS、SQL、catalog/source/input、Rust/Cargo、HTML、CI/workflow、模板或 assets；后续修复波的独立范围见下文，不能把历史七文件限制误作整批当前范围。
 
@@ -32,7 +32,7 @@ README 来源相对链接错误，交接结果的计数与 SHA 也需刷新。�
 | 修复波 1 | `77091b32b4850c80f3a9eb4dae2cc00f33ddfebc`；RFC、SQL、RFC validator/test | NotDelivered 与原 decision/authority/audit/CAS 绑定、成功 activation reason、四级 milestone、外部兼容、55 行 trace。Controller 交接的限定复审为 Spec PASS / Quality PASS；不是整批 PASS。 |
 | 修复波 2 | `ec7025a2db4a35869995786fb6bb7a8cc5c62aa1`；validator/test 与 README | 原 Quality I1 的执行参数白名单和来源链接；README 不再复制过期测试计数。 |
 | 波 2 补充窄合同 | `3695997fded6334d386a7077fceedbaaacc57fcb`；validator/test | Controller 抽查后区分 job/step：固定 runner、拒绝继承/环境/超时与无效 job 覆盖；之后从该 clean HEAD 完整 fresh 验证。 |
-| 修复波 3 | `e35800a0b8a6d89fed0ff08fff3d4696d520a7fe`；validator/test | round2 的唯一 Quality Important：缺失/无效 trigger 等不可调度 envelope 仍被接受。改为 Psych AST 字面键、单文档/唯一键、窄顶层与简单事件合同；最终 Quality 限定复审待定。 |
+| 修复波 3 | `e35800a0b8a6d89fed0ff08fff3d4696d520a7fe`；validator/test | round2 的唯一 Quality Important：缺失/无效 trigger 等不可调度 envelope 仍被接受。改为 Psych AST 字面键、单文档/唯一键、窄顶层与简单事件合同；wave3 FINAL SCOPED QUALITY PASS（0/0/0），范围 `9b11a5a..dd9f188`。 |
 
 波 1 新增 NotDelivered 是业务终态，不改 durable 的 14 态，不推进游标、不授权重发，
 不算 Accepted/ProductionVerified 成功；仍保留 failure gate/指标及严格保留义务。
@@ -45,7 +45,7 @@ Verified 四级均未达到；文档 Implementation-Ready 与 runtime 四级分�
 所有反例走公开 CLI，缺 runner、job shell/uses、三层 env、timeout/container 等均可见拒绝。
 旧 echo/here-doc 等负例补上合法 runner，避免用缺 runner 的旁路失败掩盖原命令判断。
 
-round2 独立整批结论为 **Spec PASS（Critical/Important/Minor=0/0/0） / Quality FAIL（0/1/0）**。
+round2 历史独立整批结论为 **Spec PASS（Critical/Important/Minor=0/0/0） / Quality FAIL（0/1/0）**；其唯一 Important 经 wave3 修复与最终限定复审已关闭，不覆盖或抹去原失败记录。
 波 3 公开 CLI 首轮 RED 为 **27/140/22 failures**；初次 CI/strict GREEN 为 **67/485**。
 另补 YAML 1.1 `if: yes` / `continue-on-error: no` 字面歧义的真实 RED **2/8/2 failures**；
 最终定向 GREEN **69/497**，零失败/错误/跳过。所有既有 CI 形状正负 fixtures 均补真实
@@ -77,9 +77,9 @@ round2 独立整批结论为 **Spec PASS（Critical/Important/Minor=0/0/0） / Q
 | SQL | `4bac8e58caa2f5d2362137b5e96dd087649044f45484a1284dbd7e1fd7baa953` |
 | RFC | `36cd4d9e4db275ffd6eef5f3920feac0516acd52da5bbf166ab2236c67872ba8` |
 
-## 从 clean checker HEAD fresh 验证
+## 修复波 3 从 clean checker HEAD fresh 验证
 
-验证根为隔离 worktree `push-reliability-20260905`，HEAD=`e35800a0b8a6d89fed0ff08fff3d4696d520a7fe`；先提交代码再验证，开始及全部内容验证结束时 `git status --short` 均为空。下面五个入口分别运行，未复用 Task 5、Task 6 或修复波 1/2 的旧计数，未运行旧 archive-writing 测试。
+验证根为隔离 worktree `push-reliability-20260905`，HEAD=`e35800a0b8a6d89fed0ff08fff3d4696d520a7fe`；先提交代码再验证，开始及全部内容验证结束时 `git status --short` 均为空。下面五个入口分别运行，未复用 Task 5、Task 6 或修复波 1/2 的旧计数，未运行旧 archive-writing 测试。**418/5023 全部来自该 clean `e35800a`；本最终状态提交未重跑五套测试，下列历史 fresh 证据不得冒称状态提交后重跑。**
 
 | 完整命令 | runs | assertions | failures | errors | skips | exit |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -147,7 +147,7 @@ wave3_dbdir=$(mktemp -d /private/tmp/final-wave3-ddl.XXXXXX)
 | `test_activation_is_versioned_and_journal_is_an_independent_append_only_fact` | 非法 activation 跳转拒绝；新 generation 回滚，journal/manifest 不可改写。 |
 | `test_raw_sqlite_cli_guards_do_not_repair_or_change_incompatible_databases`、`test_sql_guard_oracles_detect_real_weakened_schema_mutants` | 原始 CLI 对不兼容 schema fail closed；真正移除 guard 的 schema mutant 使对应行为断言失败。 |
 
-语法命令为 `ruby -c FILE`，逐个覆盖 `scripts/architecture-docs/*.rb`、`scripts/architecture-docs/test/*_test.rb` 及两份导入 Ruby 快照，共 19 文件，全部 Syntax OK/exit 0。`JSON.parse(File.binread(path), decimal_class: BigDecimal)` 逐个解析 `docs/push-system/*.json` 共 5 文件，全部成功。本波 `git diff --check 9b11a5a..HEAD` 通过；whole-batch 的冻结输入尾空格例外另见下文，不声称全批 diff-check 通过。
+语法命令为 `ruby -c FILE`，逐个覆盖 `scripts/architecture-docs/*.rb`、`scripts/architecture-docs/test/*_test.rb` 及两份导入 Ruby 快照，共 19 文件，全部 Syntax OK/exit 0。`JSON.parse(File.binread(path), decimal_class: BigDecimal)` 逐个解析 `docs/push-system/*.json` 共 5 文件，全部成功。修复波 3 `git diff --check 9b11a5a..dd9f188` 通过；whole-batch 的冻结输入尾空格例外另见下文，不声称全批 diff-check 通过。
 
 另用 Ruby 标准库 `json/digest/bigdecimal` 只读复算：JSON 数值直接转精确 Rational，每行按 `(O+4M+P)/6`、半入两位检查；逐行求和、20% 汇总缓冲、依赖 DAG 递归最长路径及首批 rank 1--3 分别重算，SHA 用 `Digest::SHA256.file` 读取。没有修改 JSON 或调用 renderer 写模式。
 
@@ -165,10 +165,10 @@ wave3_dbdir=$(mktemp -d /private/tmp/final-wave3-ddl.XXXXXX)
 
 ## 工作区与样本保护
 
-隔离区执行 `git diff --exit-code 07781bf386aafdf202851ae928efee8920387058 HEAD -- src Cargo.toml Cargo.lock`：exit 0、零 diff。修复波 3 相对 `9b11a5a01b921bf8aac5374426a28fbe6da08bd4` 的最终产品范围精确为 rfc_spec.rb、rfc_spec_test.rb 和本 results 三文件；本波未修改 SQL/RFC 正文、WBS、冻结输入、Rust/Cargo、HTML、workflow 或生产状态。
+隔离区执行 `git diff --exit-code 07781bf386aafdf202851ae928efee8920387058 HEAD -- src Cargo.toml Cargo.lock`：exit 0、零 diff。修复波 3 在 `9b11a5a01b921bf8aac5374426a28fbe6da08bd4..dd9f188970c8f7d4452f9dd0561746d01461ea70` 的产品范围精确为 rfc_spec.rb、rfc_spec_test.rb 和本 results 三文件；本波未修改 SQL/RFC 正文、WBS、冻结输入、Rust/Cargo、HTML、workflow 或生产状态。
 
-本波 `git diff --check 9b11a5a01b921bf8aac5374426a28fbe6da08bd4..HEAD` 返回 0。
-`git diff --check 288e8b2..HEAD` 返回 **2**，仅下列不可变输入的 **11 处既有 trailing whitespace**：
+修复波 3 `git diff --check 9b11a5a01b921bf8aac5374426a28fbe6da08bd4..dd9f188970c8f7d4452f9dd0561746d01461ea70` 返回 0。
+修复波 3 执行 `git diff --check 288e8b2..dd9f188` 返回 **2**，仅下列不可变输入的 **11 处既有 trailing whitespace**：
 
 - `docs/Project_Architecture_Blueprint.md`：3、4、5、6、7、1093、1094 行。
 - `docs/push-system/comprehensive-reanalysis-2026-09-05.md`：3、4、5、6 行。
@@ -199,6 +199,12 @@ wave3_dbdir=$(mktemp -d /private/tmp/final-wave3-ddl.XXXXXX)
 - 蓝图 §24/§25 未去拟议化；通用 offline HTML builder、RFC HTML、统一 `check.rb` 与 CI 接线未交付。
 - 未部署，没有 `TransportAccepted`、用户已读、交易结果或收益改善证明；没有 provider/LLM/message/order 调用。
 - PaperBuy/Watchdog 仍是原混乱工作树排除项；原工作区 160 conflicts 未解决。
-- Task 1--5 与修复波 1 定点独立复审已通过；round2 整批 Spec PASS、Quality FAIL（唯一 Important）已如实记录。wave3 已修并有 fresh 证据，最终 Quality 限定复审待 Controller。不得据限定 PASS 或自动测试将第三批标为完成。
+- Task 1--5 与修复波 1 定点独立复审已通过；round2 Quality 的唯一 Important 已由 wave3 修复，最终 SPEC / SCOPED QUALITY 均 0/0/0、原 findings 全部关闭。第三批规格完成不提升 `PROVISIONAL`，不等于文档 Implementation-Ready 或任一 runtime milestone。
 
-本提交仅刷新 RFC CI 限定复审候选，使用 `docs: refresh RFC CI re-review candidate`。Controller 返回最终独立 Quality 结论后，才可按明确授权更新最终状态与计划；本波不写完成提交、不修改计划勾选。未 merge、未 push、未 deploy，保留隔离 worktree。
+## 最终状态提交与验证边界
+
+本最终状态提交为 **`docs: complete push RFC and WBS batch`**，唯一父提交 `dd9f188970c8f7d4452f9dd0561746d01461ea70`；本段随该提交记录自身，不把未来或候选提交当成已执行证据。提交只修改 README、本 results 和第三批计划三份文档，Task 6 最后三项随本提交勾选完成；提交 SHA 由 Git 历史和 ignored `final-status-report.md` 记录，不在自身内容中制造循环哈希。
+
+Controller 给出的最终审查边界分别是 `288e8b2..9b11a5a` 的 FINAL SPEC PASS 与 `9b11a5a..dd9f188` 的 wave3 FINAL SCOPED QUALITY PASS，均 0/0/0；本状态文档更新不冒称又做了整批独立复审。此轮限定验证为 README 本地链接、RFC draft、WBS freshness、RFC strict 四码、clean 提交后的 catalog strict 两项 provisional、`git diff --check dd9f188..HEAD` 与 Rust/Cargo 零差异；执行结果记录于收口报告。未重跑五套完整测试、未重新读取任何生产/data/保护样本，418/5023 仍只属于 clean `e35800a`。
+
+严格 4+2 发布阻断及上列未交付边界继续存在；whole-batch 冻结输入的 11 处既有尾空格披露保留，不声称全批 diff-check 通过。未 merge、未 push、未 deploy，保留隔离 worktree。

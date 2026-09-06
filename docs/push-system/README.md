@@ -2,7 +2,7 @@
 
 状态：`PROVISIONAL`。本批输入冻结日期为 `2026-09-06`。源码接线、历史统计、原工作区文档和拟议设计必须分开阅读；它们不等于部署证明、远端 `TransportAccepted` 或用户已读。
 
-第三批 RFC/SQL/WBS 仍为交接候选。[第三批交接结果](implementation-batch-3-results-2026-09-06.md) 记录 clean HEAD 的 fresh 测试、六条内容门禁、临时 SQLite 证据及已知审查发现的修复进度。最终整批复审待 Controller 执行，不能据此提升发布状态。
+第三批规格完成：RFC/SQL/WBS 规格与机器合同已通过最终独立审查，原审查 findings 全部关闭；这不是推送系统改造完成。[第三批交接结果](implementation-batch-3-results-2026-09-06.md) 记录 FINAL SPEC PASS（0/0/0）、wave3 FINAL SCOPED QUALITY PASS（0/0/0）的精确范围，以及 clean `e35800a` 的 418 runs / 5023 assertions 和临时 SQLite 证据。最终状态提交未重跑五套测试，规格完成不提升 `PROVISIONAL` 发布状态。
 
 ## 事实边界与阅读顺序
 
@@ -10,7 +10,7 @@
 2. [65-kind 能力目录](push-capability-catalog.md)、[机器目录](push-capability-catalog.v1.json) 和 [源码证据 manifest](push-evidence-manifest.v1.json) 记录隔离分支在 Rust 基线 `07781bf386aafdf202851ae928efee8920387058` 的源码接线。
 3. [RFC 输入 manifest](rfc-input-manifest.v1.json) 冻结下列八份原工作区输入的原始字节、尺寸、SHA-256、角色与冲突。冻结不提升其事实权限。
 4. [实施 RFC](push-system-implementation-rfc.md) 定义身份、应用结果、完成权威、跨库恢复、调度/readiness、shadow/activation/operator、保留期与验收合同；[独立 SQLite CLI 规格](push-system-foundation.v1.sql) 与 RFC 嵌入逐字节一致，仅在临时数据库验证。
-5. [WBS 机器事实源](push-system-wbs.v1.json) 定义重建的 W01--W21、52 Unit 估算/依赖/门禁，RFC 内只保留生成摘要。828.99h 基线、994.79h 缓冲后工时及条件日历场景是可复算估算，不是承诺日期。[第三批实施计划](implementation-batch-3-rfc-wbs-2026-09-06.md) 和交接结果保留最终独立审查待办。
+5. [WBS 机器事实源](push-system-wbs.v1.json) 定义重建的 W01--W21、52 Unit 估算/依赖/门禁，RFC 内只保留生成摘要。828.99h 基线、994.79h 缓冲后工时及条件日历场景是可复算估算，不是承诺日期。[第三批实施计划](implementation-batch-3-rfc-wbs-2026-09-06.md) 和交接结果记录最终独立审查结论与本批明确不交付的边界。
 
 严格 RFC 门禁仍返回 `rfc_status_provisional`、`wbs_status_provisional`、`rfc_html_missing`、`ci_rfc_gate_missing`；显式 `check-catalog.rb --root . --check` 仍返回 catalog/manifest 两项 provisional。W01--W21 运行时未实现，52 Unit 未迁移、未 shadow/live promote；Rust、生产 DB schema、配置、模板及业务行为未改。蓝图 §24/§25 去拟议化、通用离线 HTML builder、RFC HTML 与统一 checker/CI 接线未交付。未部署，无真实接收、用户已读或交易收益证明；PaperBuy/Watchdog 仍为原混乱工作树排除项，160 个冲突未解决。
 

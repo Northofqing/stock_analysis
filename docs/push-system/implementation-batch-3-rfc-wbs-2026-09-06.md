@@ -2,6 +2,8 @@
 
 > 执行要求：使用 `subagent-driven-development`，每个任务依次经历实现、规格复核、质量复核和提交。勾选完成只表示第三批文档规格交付，不表示运行时已改造、生产已晋级或用户已收到消息。
 
+最终状态：第三批 RFC/SQL/WBS 规格与机器合同完成，仍为 `PROVISIONAL`。Controller 确认 FINAL SPEC PASS（0/0/0，`288e8b2..9b11a5a`）及 wave3 FINAL SCOPED QUALITY PASS（0/0/0，`9b11a5a..dd9f188`），原 findings 全部关闭。完整测试 418/5023 来自 clean `e35800a`，不是本最终状态提交后重跑；发布层 4+2 阻断及下文“本批明确不交付”全部保留。
+
 **目标：** 把已批准的 108 项裁决、当前架构蓝图、最近五日生产证据和第二批 65-kind/102-producer/52-Unit 目录收敛为一份可执行实施 RFC；精确定义类型、SQLite DDL、状态转换、跨库崩溃恢复、运行门禁、52 个原子迁移单元的估算/依赖/晋级顺序。
 
 **架构：** RFC 是拟议实现的规范说明；独立 SQL 是可执行存储合同；WBS JSON 是估算和依赖的唯一机器事实源；Markdown 中的 WBS 摘要由 JSON 确定性生成。RFC 不复制现有 durable receipt，也不制造跨业务库与 durable 库的假原子事务：业务库保存 intent 和仅追加 transition，durable 库保存交付决定/attempt/receipt，finalizer 只消费重新校验的终态引用。
@@ -223,9 +225,9 @@ Git 历史和当前纳管文档只保留“旧 W01--W21 合计 98--142 小时”
 - [x] 运行全部本批 Ruby 文件 `ruby -c`、JSON parse、WBS 计数/依赖/总数、`git diff --check`。
 - [x] `check-rfc --check` 明确检查发布层并使用稳定原因码：`rfc_status_provisional`、`wbs_status_provisional`、`rfc_html_missing`、`ci_rfc_gate_missing`；对应负例进入测试。现阶段 strict 只允许这些发布层原因码；`check-catalog --check` 只允许既有 catalog/manifest 两个 PROVISIONAL。任何内容、SHA、coverage、SQL、WBS 或 freshness 错误均不得归入预期失败。
 - [x] 比较 `src/**/*.rs`、Cargo.toml、Cargo.lock 相对 `07781bf` 为零差异；比较原工作区 160 unmerged 数量和既有保护样本指纹不变。
-- [ ] 最终独立 Spec 审查逐条核 Q1--Q108、硬化计划任务 2 和本计划验收；最终独立 Quality 审查接口深度、跨库恢复、SQL、WBS/周期和测试。所有 Critical/Important 必须关闭；Minor 必须修复或在结果中明确接受及成本。
-- [ ] README 只把第三批标成“RFC/WBS 规格完成”；结果文档必须列出运行时未改、HTML/CI/蓝图拆分未做、52 Unit 未迁移、未部署/未真实接收。
-- [ ] 提交 `docs: complete push RFC and WBS batch`。不 merge、不 push、不 deploy，不删除隔离 worktree。
+- [x] 最终独立 Spec 审查逐条核 Q1--Q108、硬化计划任务 2 和本计划验收；最终独立 Quality 审查接口深度、跨库恢复、SQL、WBS/周期和测试。Controller 确认上述最终审查范围均 0/0/0，原所有 findings 已关闭。
+- [x] README 只把第三批标成“RFC/WBS 规格完成”；结果文档列出运行时未改、HTML/CI/蓝图拆分未做、52 Unit 未迁移、未部署/未真实接收。
+- [x] 提交 `docs: complete push RFC and WBS batch`（本最终状态提交）。不 merge、不 push、不 deploy，不删除隔离 worktree。
 
 ## 第三批完成定义
 
