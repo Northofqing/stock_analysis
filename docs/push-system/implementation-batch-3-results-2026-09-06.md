@@ -1,6 +1,6 @@
 # 第三批 RFC/SQL/WBS 交接候选结果（2026-09-06）
 
-状态：`PROVISIONAL`；**所有已知发现已修、最终整批复审待定**。这是实现者交接候选状态；Task 1--5 及修复波 1 的限定双轴 PASS 不代替 Controller 的最终整批 Spec/Quality 复审，第三批未宣告完成。
+状态：`PROVISIONAL`；**wave3 已修、最终 Quality 限定复审待定**。这是实现者交接候选状态；round2 整批 Spec PASS（0/0/0）、Quality FAIL（0/1/0），本波修复该唯一 Important。Task 1--5 及修复波 1 的限定双轴 PASS、自动 GREEN 均不代替最终 Quality 复审，第三批未宣告完成。
 
 本批把每条推送的身份、完成权威、跨库恢复、调度/readiness、shadow/activation/operator、保留期和逐 Unit 工期变成可失败的机器合同。它帮助实施者识别合同缺项、语义倒退和数值漂移，仍不证明线上推送问题已修复。
 
@@ -32,6 +32,7 @@ README 来源相对链接错误，交接结果的计数与 SHA 也需刷新。�
 | 修复波 1 | `77091b32b4850c80f3a9eb4dae2cc00f33ddfebc`；RFC、SQL、RFC validator/test | NotDelivered 与原 decision/authority/audit/CAS 绑定、成功 activation reason、四级 milestone、外部兼容、55 行 trace。Controller 交接的限定复审为 Spec PASS / Quality PASS；不是整批 PASS。 |
 | 修复波 2 | `ec7025a2db4a35869995786fb6bb7a8cc5c62aa1`；validator/test 与 README | 原 Quality I1 的执行参数白名单和来源链接；README 不再复制过期测试计数。 |
 | 波 2 补充窄合同 | `3695997fded6334d386a7077fceedbaaacc57fcb`；validator/test | Controller 抽查后区分 job/step：固定 runner、拒绝继承/环境/超时与无效 job 覆盖；之后从该 clean HEAD 完整 fresh 验证。 |
+| 修复波 3 | `e35800a0b8a6d89fed0ff08fff3d4696d520a7fe`；validator/test | round2 的唯一 Quality Important：缺失/无效 trigger 等不可调度 envelope 仍被接受。改为 Psych AST 字面键、单文档/唯一键、窄顶层与简单事件合同；最终 Quality 限定复审待定。 |
 
 波 1 新增 NotDelivered 是业务终态，不改 durable 的 14 态，不推进游标、不授权重发，
 不算 Accepted/ProductionVerified 成功；仍保留 failure gate/指标及严格保留义务。
@@ -43,6 +44,12 @@ Verified 四级均未达到；文档 Implementation-Ready 与 runtime 四级分�
 补充窄合同另行 RED **11/44/11 failures**；最终 CI/strict 定向 GREEN **40/301**。
 所有反例走公开 CLI，缺 runner、job shell/uses、三层 env、timeout/container 等均可见拒绝。
 旧 echo/here-doc 等负例补上合法 runner，避免用缺 runner 的旁路失败掩盖原命令判断。
+
+round2 独立整批结论为 **Spec PASS（Critical/Important/Minor=0/0/0） / Quality FAIL（0/1/0）**。
+波 3 公开 CLI 首轮 RED 为 **27/140/22 failures**；初次 CI/strict GREEN 为 **67/485**。
+另补 YAML 1.1 `if: yes` / `continue-on-error: no` 字面歧义的真实 RED **2/8/2 failures**；
+最终定向 GREEN **69/497**，零失败/错误/跳过。所有既有 CI 形状正负 fixtures 均补真实
+`on: push`，避免缺 trigger 掩盖 echo/here-doc/job-step 旧反例；最小/bash/sh 正例仍走公开 CLI。
 
 ## 输入与规格制品
 
@@ -72,16 +79,16 @@ Verified 四级均未达到；文档 Implementation-Ready 与 runtime 四级分�
 
 ## 从 clean checker HEAD fresh 验证
 
-验证根为隔离 worktree `push-reliability-20260905`，HEAD=`3695997fded6334d386a7077fceedbaaacc57fcb`；先提交代码再验证，开始及全部内容验证结束时 `git status --short` 均为空。下面五个入口分别运行，未复用 Task 5、Task 6 或修复波 1 的旧计数，未运行旧 archive-writing 测试。
+验证根为隔离 worktree `push-reliability-20260905`，HEAD=`e35800a0b8a6d89fed0ff08fff3d4696d520a7fe`；先提交代码再验证，开始及全部内容验证结束时 `git status --short` 均为空。下面五个入口分别运行，未复用 Task 5、Task 6 或修复波 1/2 的旧计数，未运行旧 archive-writing 测试。
 
 | 完整命令 | runs | assertions | failures | errors | skips | exit |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `ruby scripts/architecture-docs/test/rfc_inputs_test.rb` | 12 | 238 | 0 | 0 | 0 | 0 |
 | `ruby scripts/architecture-docs/test/source_catalog_test.rb` | 12 | 110 | 0 | 0 | 0 | 0 |
 | `ruby scripts/architecture-docs/test/catalog_test.rb` | 33 | 393 | 0 | 0 | 0 | 0 |
-| `ruby scripts/architecture-docs/test/rfc_spec_test.rb` | 266 | 3677 | 0 | 0 | 0 | 0 |
+| `ruby scripts/architecture-docs/test/rfc_spec_test.rb` | 295 | 3873 | 0 | 0 | 0 | 0 |
 | `ruby scripts/architecture-docs/test/wbs_test.rb` | 66 | 409 | 0 | 0 | 0 | 0 |
-| 合计 | **389** | **4827** | **0** | **0** | **0** | 全部 0 |
+| 合计 | **418** | **5023** | **0** | **0** | **0** | 全部 0 |
 
 | 完整命令 | fresh 结果 | exit |
 | --- | --- | ---: |
@@ -110,7 +117,7 @@ provisional path=docs/push-system/push-capability-catalog.v1.json
 provisional path=docs/push-system/push-evidence-manifest.v1.json
 ```
 
-RFC HTML 只检查已批准目标 `docs/push-system/push-system-implementation-rfc.html` 的存在与合法普通文件边界；目录、路径组件链接、悬空链接不算交付，不发明 HTML freshness。CI v1 解析 `.github/workflows/ci.yml`，仅接受窄静态合同：候选 job 的 runner 必须精确为非表达式 `ubuntu-latest`；job 仅允许 name/runs-on/if/continue-on-error/steps，step 仅允许 name/id/run/if/continue-on-error/shell。job/step 的 if 只能 absent 或布尔 true，continue-on-error 只能 absent 或布尔 false；step shell 只能 absent/bash/sh。workflow defaults/env、job uses/shell/working-directory/defaults/env/container/timeout 及 step env/timeout/working-directory 等覆盖均拒绝。run 仍必须是独立 `ruby scripts/architecture-docs/check.rb --check`，可用单命令 block scalar。注释、prose、echo、其他 checker、here-document 或无效 uses/run 不算门禁。该合同不解析通用 Actions 执行语义，不证明远端工作流已运行或已通过。本批没有创建统一 checker 或修改 workflow，也没有执行 GitHub Actions。
+RFC HTML 只检查已批准目标 `docs/push-system/push-system-implementation-rfc.html` 的存在与合法普通文件边界；目录、路径组件链接、悬空链接不算交付，不发明 HTML freshness。CI v1 先以 Psych AST 检查 `.github/workflows/ci.yml`：仅单一 mapping 文档，顶层只允许 name/on/jobs，`on` 与 jobs 各恰好一次；所有层级 mapping 键不得重复。可选 name 必须是非空字符串，job ID 为合法标识。`on` 必须是字面 on 键（可加引号），literal true 不能替代它；trigger 仅支持 push/pull_request/workflow_dispatch 的非空标量或无重复序列，不支持 mapping 条件、空/NULL、表达式、未知事件或多文档。然后加载 job/step 值，仅接受窄静态合同：候选 job 的 runner 必须精确为非表达式 `ubuntu-latest`；job 仅允许 name/runs-on/if/continue-on-error/steps，step 仅允许 name/id/run/if/continue-on-error/shell。job/step 的 if 只能 absent 或 plain 字面布尔 true，continue-on-error 只能 absent 或 plain 字面布尔 false（拒绝 YAML 1.1 的 yes/no 同义词）；step shell 只能 absent/bash/sh。workflow defaults/env、job uses/shell/working-directory/defaults/env/container/timeout 及 step env/timeout/working-directory 等覆盖均拒绝。run 仍必须是独立 `ruby scripts/architecture-docs/check.rb --check`，可用单命令 block scalar。注释、prose、echo、其他 checker、here-document 或无效 uses/run 不算门禁。该合同不解析通用 Actions 执行语义，不证明远端工作流已运行或已通过。本批没有创建统一 checker 或修改 workflow，也没有执行 GitHub Actions。
 
 内容错误保留原原因码并排在发布原因码之前，不被过滤、改名或归入预期失败；公开 CLI 回归直接证明 `rfc_counts_invalid` 可与四个 blocker 同时返回。draft 不追加上述四码。catalog 的 `--draft|--check` 互斥，重复模式/未知参数 exit 2；无 mode 的既有 strict 行为保留兼容。
 
@@ -118,14 +125,14 @@ Task 6 的真实 TDD 记录：RFC 四码测试 RED 为 1 run / 2 assertions / 1 
 
 ## SQLite、语法和数值复算
 
-fresh DDL 使用 Ruby 标准库 `Dir.mktmpdir('final-wave2-ddl')` 创建全新临时目录，`Open3.capture3('/usr/bin/sqlite3', db, stdin_data: sql)` 两次执行均 exit 0，未额外传 `-bail`；它与下面原始重定向调用等价，未打开任何现存或 `data/**` 数据库：
+fresh DDL 使用 Ruby 标准库 `Dir.mktmpdir('final-wave3-ddl')` 创建全新临时目录，`Open3.capture3('/usr/bin/sqlite3', db, stdin_data: sql)` 两次执行均 exit 0，未额外传 `-bail`；它与下面原始重定向调用等价，未打开任何现存或 `data/**` 数据库：
 
 ```sh
 set -e
-wave2_dbdir=$(mktemp -d /private/tmp/final-wave2-ddl.XXXXXX)
-/usr/bin/sqlite3 "$wave2_dbdir/foundation.sqlite3" < docs/push-system/push-system-foundation.v1.sql
-/usr/bin/sqlite3 "$wave2_dbdir/foundation.sqlite3" < docs/push-system/push-system-foundation.v1.sql
-/usr/bin/sqlite3 "$wave2_dbdir/foundation.sqlite3" 'PRAGMA foreign_keys=ON; PRAGMA foreign_keys; PRAGMA integrity_check; SELECT count(*) FROM push_foundation_objects; SELECT type,count(*) FROM sqlite_master GROUP BY type; PRAGMA foreign_key_check;'
+wave3_dbdir=$(mktemp -d /private/tmp/final-wave3-ddl.XXXXXX)
+/usr/bin/sqlite3 "$wave3_dbdir/foundation.sqlite3" < docs/push-system/push-system-foundation.v1.sql
+/usr/bin/sqlite3 "$wave3_dbdir/foundation.sqlite3" < docs/push-system/push-system-foundation.v1.sql
+/usr/bin/sqlite3 "$wave3_dbdir/foundation.sqlite3" 'PRAGMA foreign_keys=ON; PRAGMA foreign_keys; PRAGMA integrity_check; SELECT count(*) FROM push_foundation_objects; SELECT type,count(*) FROM sqlite_master GROUP BY type; PRAGMA foreign_key_check;'
 ```
 
 输出：foreign_keys=`1`，integrity_check=`ok`，`push_foundation_objects` 登记数=`25`；sqlite_master 总计 table=6、index=11、trigger=18；foreign_key_check 无违规行。fresh RFC 全套测试还实际执行以下 SQLite 公开事务/约束证据，不以 DDL 关键词存在代替行为：
@@ -140,7 +147,7 @@ wave2_dbdir=$(mktemp -d /private/tmp/final-wave2-ddl.XXXXXX)
 | `test_activation_is_versioned_and_journal_is_an_independent_append_only_fact` | 非法 activation 跳转拒绝；新 generation 回滚，journal/manifest 不可改写。 |
 | `test_raw_sqlite_cli_guards_do_not_repair_or_change_incompatible_databases`、`test_sql_guard_oracles_detect_real_weakened_schema_mutants` | 原始 CLI 对不兼容 schema fail closed；真正移除 guard 的 schema mutant 使对应行为断言失败。 |
 
-语法命令为 `ruby -c FILE`，逐个覆盖 `scripts/architecture-docs/*.rb`、`scripts/architecture-docs/test/*_test.rb` 及两份导入 Ruby 快照，共 19 文件，全部 Syntax OK/exit 0。`JSON.parse(File.binread(path), decimal_class: BigDecimal)` 逐个解析 `docs/push-system/*.json` 共 5 文件，全部成功。本波 `git diff --check 77091b3..HEAD` 通过；whole-batch 的冻结输入尾空格例外另见下文，不声称全批 diff-check 通过。
+语法命令为 `ruby -c FILE`，逐个覆盖 `scripts/architecture-docs/*.rb`、`scripts/architecture-docs/test/*_test.rb` 及两份导入 Ruby 快照，共 19 文件，全部 Syntax OK/exit 0。`JSON.parse(File.binread(path), decimal_class: BigDecimal)` 逐个解析 `docs/push-system/*.json` 共 5 文件，全部成功。本波 `git diff --check 9b11a5a..HEAD` 通过；whole-batch 的冻结输入尾空格例外另见下文，不声称全批 diff-check 通过。
 
 另用 Ruby 标准库 `json/digest/bigdecimal` 只读复算：JSON 数值直接转精确 Rational，每行按 `(O+4M+P)/6`、半入两位检查；逐行求和、20% 汇总缓冲、依赖 DAG 递归最长路径及首批 rank 1--3 分别重算，SHA 用 `Digest::SHA256.file` 读取。没有修改 JSON 或调用 renderer 写模式。
 
@@ -158,9 +165,9 @@ wave2_dbdir=$(mktemp -d /private/tmp/final-wave2-ddl.XXXXXX)
 
 ## 工作区与样本保护
 
-隔离区执行 `git diff --exit-code 07781bf386aafdf202851ae928efee8920387058 HEAD -- src Cargo.toml Cargo.lock`：exit 0、零 diff。修复波 2 相对 `77091b32b4850c80f3a9eb4dae2cc00f33ddfebc` 的最终产品范围精确为 rfc_spec.rb、rfc_spec_test.rb、README 和本 results 四文件；本波未修改 SQL/RFC 正文、WBS、冻结输入、Rust/Cargo、HTML、workflow 或生产状态。
+隔离区执行 `git diff --exit-code 07781bf386aafdf202851ae928efee8920387058 HEAD -- src Cargo.toml Cargo.lock`：exit 0、零 diff。修复波 3 相对 `9b11a5a01b921bf8aac5374426a28fbe6da08bd4` 的最终产品范围精确为 rfc_spec.rb、rfc_spec_test.rb 和本 results 三文件；本波未修改 SQL/RFC 正文、WBS、冻结输入、Rust/Cargo、HTML、workflow 或生产状态。
 
-本波 `git diff --check 77091b32b4850c80f3a9eb4dae2cc00f33ddfebc..HEAD` 返回 0。
+本波 `git diff --check 9b11a5a01b921bf8aac5374426a28fbe6da08bd4..HEAD` 返回 0。
 `git diff --check 288e8b2..HEAD` 返回 **2**，仅下列不可变输入的 **11 处既有 trailing whitespace**：
 
 - `docs/Project_Architecture_Blueprint.md`：3、4、5、6、7、1093、1094 行。
@@ -170,18 +177,20 @@ wave2_dbdir=$(mktemp -d /private/tmp/final-wave2-ddl.XXXXXX)
 未放宽仓库规则，也未声称 whole-batch diff-check 通过。输入门禁逐项验证其原 SHA，
 本波新改文件正常通过 diff-check。
 
-原 root 工作区只读执行 `git diff --name-only --diff-filter=U | sort -u | wc -l`，前后均为 **160**；`git diff --binary HEAD -- src tests Cargo.toml Cargo.lock | shasum -a 256` 前后均为 `3b0f746129bcdd108680af75da354fe087c00f300416483fdcab01705b48064e`。没有暂存、解决或修改原工作区。
+以下 root/样本记录仅保留 **修复波 2 历史证据**；本波未重新读取 root 工作树或任何 data/reports 保护样本，不能把旧 SHA 当本波 fresh 核对。
 
-以下四份样本只读取 SHA，开始与结束一致；其中 root `data/g5b/2026-08-31.jsonl` 经 Controller 对该精确路径特别授权，只读取原始字节 SHA，未解析内容、枚举 data 或连接数据库；这是样本完整性核对，不是生产查询：
+修复波 2 在原 root 工作区只读执行 `git diff --name-only --diff-filter=U | sort -u | wc -l`，前后均为 **160**；`git diff --binary HEAD -- src tests Cargo.toml Cargo.lock | shasum -a 256` 前后均为 `3b0f746129bcdd108680af75da354fe087c00f300416483fdcab01705b48064e`。没有暂存、解决或修改原工作区。
 
-| 工作区 / 样本 | 前后相同 SHA-256 |
+修复波 2 对以下四份样本只读取 SHA，当时开始与结束一致；其中 root `data/g5b/2026-08-31.jsonl` 经 Controller 对该精确路径特别授权，只读取原始字节 SHA，未解析内容、枚举 data 或连接数据库；这是样本完整性核对，不是生产查询：
+
+| 工作区 / 样本 | 修复波 2 前后相同 SHA-256（本波未重读） |
 | --- | --- |
 | root `reports/alerts/20260831.jsonl` | `6639c0eb6bc236970952881f8753537840c65d6841b5556157c0d584c618f5c9` |
 | root `data/g5b/2026-08-31.jsonl` | `cd5f702d1947fa1fc86af39aae22694e1867b3121068e0b8cb649fad4e6c0914` |
 | 隔离区 `reports/alerts/20260905.jsonl` | `7b065405571d49bb898ec997cf7fe92d43e68c5dbbfe6b3d4f9de0b32aee5470` |
 | 隔离区 `reports/alerts/20260905.md` | `69265ebc6172a80cbf47cb2beade4420f10186e72915da32d170386dc2427519` |
 
-本次稳定性不撤销首批开发样本曾被改坏的事故结论，不能把当前不变误写为历史上从未受损。
+修复波 2 的稳定性记录不撤销首批开发样本曾被改坏的事故结论；本波未重读，不对当前样本完整性作新结论，更不能写成历史上从未受损。
 
 ## 未完成边界与下一次交接
 
@@ -190,6 +199,6 @@ wave2_dbdir=$(mktemp -d /private/tmp/final-wave2-ddl.XXXXXX)
 - 蓝图 §24/§25 未去拟议化；通用 offline HTML builder、RFC HTML、统一 `check.rb` 与 CI 接线未交付。
 - 未部署，没有 `TransportAccepted`、用户已读、交易结果或收益改善证明；没有 provider/LLM/message/order 调用。
 - PaperBuy/Watchdog 仍是原混乱工作树排除项；原工作区 160 conflicts 未解决。
-- Task 1--5 与修复波 1 定点独立复审已通过；首轮整批已知发现均有修复和 fresh 证据，但最终整批复审仍待 Controller。不得据限定 PASS 或自动测试将第三批标为完成。
+- Task 1--5 与修复波 1 定点独立复审已通过；round2 整批 Spec PASS、Quality FAIL（唯一 Important）已如实记录。wave3 已修并有 fresh 证据，最终 Quality 限定复审待 Controller。不得据限定 PASS 或自动测试将第三批标为完成。
 
-本提交仅刷新最终整批复审候选，使用 `docs: refresh push RFC final review candidate`。Controller 返回整批独立 Spec/Quality 结论后，才可按明确授权更新最终状态与计划；本波不写完成提交、不修改计划勾选。未 merge、未 push、未 deploy，保留隔离 worktree。
+本提交仅刷新 RFC CI 限定复审候选，使用 `docs: refresh RFC CI re-review candidate`。Controller 返回最终独立 Quality 结论后，才可按明确授权更新最终状态与计划；本波不写完成提交、不修改计划勾选。未 merge、未 push、未 deploy，保留隔离 worktree。
