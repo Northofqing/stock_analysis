@@ -2,8 +2,8 @@
 
 状态：**PROVISIONAL**。版本：`push-system-rfc-v1`。本文定义 PROPOSED 应用合同，
 不代表运行时代码已经实现、部署或取得远端回执。Task2 仅交付领域类型、应用结果、
-源码映射和 ReasonCode；DDL/恢复、运行门禁、WBS 分别属于 Task3/4/5，本文不宣称
-这些后续任务已经完成。[Q:56] [Q:61] [Q:69] [Q:108]
+源码映射和 ReasonCode；Task3 增补 DDL/恢复设计，运行门禁与 WBS 仍属于 Task4/5，
+本文不宣称这些合同已实现、部署或通过独立复审。[Q:56] [Q:61] [Q:69] [Q:108]
 
 ## 元数据
 
@@ -503,6 +503,12 @@ operator/告警适配器及测试。规范化材料是精确 ASCII 代码，不�
 | operator.unauthorized | 认证身份不具备已批准权限 | 拒绝请求并审计拒绝 | [Q:101] [Q:47] |
 | operator.evidence_invalid | 人工证据缺失、无效或披露过多 | 拒绝人工处置 | [Q:101] [Q:55] |
 | operator.resolution_conflict | 人工 expected_version 或绑定冲突 | ResolutionRequired，不盲目覆盖 | [Q:101] [Q:87] |
+| intent.created | 冻结事实形成新稳定 intent | 只提交业务 outbox，不意味着已发送 | [Q:76] [Q:101] |
+| intent.no_data | 经过验证的来源明确为空且策略允许 | 保留空证据，仅独立 schedule 提案 | [Q:85] [Q:86] [Q:101] |
+| intent.dispatch_claimed | lease 与版本 CAS 成功 | 进入或维持等待 authority，不解释为接受 | [Q:90] [Q:101] |
+| intent.authority_verified | 私有 authority 重查精确绑定且策略允许 | 仅形成最终化资格，不提前宣布业务完成 | [Q:78] [Q:101] |
+| finalizer.completed | 单一业务事务完成事实与事件共同提交 | 提交后确认，丢失确认只幂等重查 | [Q:97] [Q:101] |
+| activation.applied | 已认证操作员执行批准代且 journal 提交 | 记录已执行事实，仍须与期望和实际 owner 审计一致 | [Q:98] [Q:99] [Q:101] |
 
 ## 适配器一致性合同（PROPOSED）
 
@@ -539,3 +545,500 @@ RFC 校验不代表部署、运行时迁移、回执或 WBS 工期已验收。
 本校验器检查冻结 catalog/evidence 字节及引用成员关系；真实 Rust 符号字节新鲜度
 由 `check-catalog.rb --root ROOT --draft` 与来源门禁独立验证，两者不能相互替代，
 也不重新查询生产状态。[Q:5] [Q:42] [Q:69] [Q:92] [Q:105]
+
+## 业务持久化范围与 SQL 字节合同（PROPOSED）
+
+Task3 在本文增加可执行的 SQLite 设计与恢复规范，仍不代表运行时实现、生产迁移、
+部署或发送已验证。唯一 DDL 来源为同目录 `push-system-foundation.v1.sql`；
+下方嵌入由原始文件逐字节复制，SHA 位于区域外。校验器只读核对文件、唯一 marker、
+唯一 SQL fence 与 SHA，不执行不受信任 SQL；可执行性和约束由公开 SQLite 临时库
+测试独立验证，不能用哈希一致替代行为测试。[Q:69] [Q:76] [Q:97]
+
+所有业务连接必须在事务外启用 `foreign_keys=ON`、`recursive_triggers=ON`。
+`push_foundation_schema.version=1` 是可查询版本；重复执行只补不存在对象并幂等
+观察版本行，不清表、不覆盖、不修改既有行。本文件不是已有 schema 的修复器或
+生产迁移器；已有对象不符合 v1 时必须阻断，未来变更另行批准迁移。[Q:79] [Q:82]
+
+`push_intents` 同时是业务意图与事务 outbox，不另造第三套回执。先按
+`IdentityRule::PreparedPushIntent` 规范化生成稳定身份，使用普通 INSERT；冲突时
+回滚并只读比较身份及全部不可变材料，完全一致只幂等观察。相同身份的 payload、
+rendered、evidence、template 或 source-contract 哈希漂移不得 UPDATE/REPLACE；
+保留原材料与冲突证据，重读版本后 CAS 到 `ResolutionRequired` 并阻断该 Unit
+晋级。不得把任一材料哈希加回身份，也不得换 decision ID 逃逸。版本冲突同样先
+回滚、重读、隔离；若数据库不可写，外层门禁持续阻断直到隔离持久化成功。
+已完成行后来冲突也可隔离，但不得撤回既有游标或重发。[Q:77] [Q:89] [Q:97]
+
+初始版本为零，只可插入 `PendingDispatch/NoData/Disabled`；创建事实本身即 outbox，
+不伪造一次发送事件。`NoData` 仅来自经过验证的空事实，`Disabled` 仅来自明确
+禁用；二者按 Task2 CompletionPolicy 独立提出 schedule 关闭，均不推进通知游标。
+`ResolutionRequired` 禁止自动解封，只允许记录 lease/处置观察的同态版本推进，
+或在已认证人工处置清除冲突、原身份精确终态重验和策略允许后以新版本 CAS
+恢复到 `AwaitingFinalizer`；后者仍须步骤五重验并走步骤六，不授权再次发送。
+表内 `SameState` 是保持当前状态的规则
+标识，不是数据库枚举。Received/Accepted/Rejected/Uncertain 均不是业务状态。
+[Q:28] [Q:75] [Q:85] [Q:86]
+
+每次状态/lease 更新必须带 `WHERE intent_id=? AND version=? AND
+lease_generation=?`，派发/最终化还要匹配 owner、有效 until 与预期状态；
+设置 `previous_state=state, version=version+1` 并在同库追加事件。首次 claim
+或过期接管增加 generation；其他 owner 的未过期 lease 不可抢占。时间由可信
+捕获业务时钟提供，SQL 不把调用方随意填写的时间当身份认证。释放只允许当前
+owner 带 generation/version CAS；过期接管仍须查询原 durable attempt，不能把
+lease 到期解释为发送许可。[Q:76] [Q:90]
+
+`push_intent_transitions` 仅存引用身份和 binding hash，不存回执正文。
+`event_id` 是规范化域 `IntentTransitionV1` 下
+`(intent_id,expected_version,result_version)` 的稳定 SHA-256；第一事件的
+`previous_sha256=NULL`，后续必须等于同 intent 前一版本事件的 canonical hash。
+canonical hash 使用 Task2 规范化，包含事件除自身 hash 外的所有持久字段；
+应用必须重算核验，SQLite 仅约束格式、版本链与当前 intent 的前态/结果态匹配，
+不宣称能在标准 SQLite 中验证 SHA 运算或 authority。只有进入 Completed 的事件
+可且必须带 terminal_ref_id 和 terminal_binding_sha256；它们不是可重用回执。
+[Q:78] [Q:87] [Q:97]
+
+所有 `*_sha256` 是 64 位小写十六进制，`build_commit` 是 40 位；这些格式检查
+不是内容真实性证明。时间是非负 i64 UTC 微秒，业务日期必须是真实 YYYY-MM-DD；
+lease owner/until 成对可空，首代前驱与首事件前驱可空，其余 NULL 条件由 DDL
+约束。`ReasonCode` 只允许 Task2 的九个命名空间，规范表逐项指定语义；
+扩展成功动作代码见已有注册表，诊断文案不能驱动转换。[Q:79] [Q:97] [Q:101]
+
+`push_activation_manifests` 是不可变期望状态，每代绑定 build/Git、catalog、两个
+schema、template、source-contract、证据、批准身份/时间、窗口和物理 owner；
+manifest 的 canonical SHA 由应用重算验证。下一代以旧 generation 和前驱身份
+为 CAS 条件 INSERT，唯一约束处理竞争。`push_promotion_journal` 是独立已执行
+事实，稳定事件身份使用 `PromotionV1(unit_id,generation)` 的 SHA-256，前驱和
+canonical 规则同上；manifest FK 绑定全部版本哈希，不复制另一套版本真相。
+批准/执行者须先经外部认证和授权，SQL 非空 actor 或与批准者相等不构成认证。
+[Q:79] [Q:80] [Q:81] [Q:98] [Q:99]
+
+正常操作顺序为批准新 manifest、本地准备、排空/切换内存 owner、追加执行 journal；
+外部/内存 owner 切换与 SQLite 并不原子。任意中断或提交确认丢失必须先阻断就绪，
+重查 journal、manifest 与实际 owner，审计一致才确认执行。不得在缺 journal 时
+把期望状态当已执行，也不按日志自动激活。一个未执行代必须先协调，禁止跳代。
+回滚写新 generation 指向同 Unit 的兼容历史目标并恢复 owner；只允许逻辑回滚
+或 Foundation 兼容 N-1，禁止删除未决数据、改历史或破坏性降 schema。[Q:80]
+[Q:82] [Q:98] [Q:99]
+
+CURRENT 对照仅证明已有专用 authority，绝不证明上述业务表已接线：
+`schedule_occurrence_identity`（src/bin/monitor/p01.rs:322）、
+`run_p01_compensation_once`（同文件:1462）共享 P01 occurrence；
+`begin_attempt`（src/durable_delivery/coordinator.rs:4793）、
+`recover_one_expired_attempt`（同文件:5233）、
+`reacquire_rejected`（同文件:4736）是冻结恢复证据。
+通用、P01、N02 必须沿 Task2 适配器合同重查各自 authority；本业务 schema 不以
+PushKind 或 count 值替代专用 owner。[Q:16] [Q:27] [unit:MU-p01]
+[unit:MU-news-flash-aggregate] [producer:p01-scheduled] [producer:p01-compensation]
+[producer:news-flash-aggregate] [evidence:p01-identity] [evidence:p01-compensate]
+[evidence:startup-begin-attempt] [evidence:startup-expired-attempt] [evidence:startup-reacquire]
+
+## 业务 outbox 字节恢复合同（PROPOSED）
+
+步骤一必须在同一行提交首次 PreparedPush 规范化快照与首次 render 原始字节，
+不能只保存不可逆的 hash 后在重启重新构造。prepared_push_bytes 保存按 Task2
+规则序列化的 PreparedPush（其中外部原始字节以 SHA/长度编码），rendered_bytes
+独立保存其首次原始输出；payload_sha256 对前者求 SHA，rendered_sha256 对后者
+求 SHA。重启先解析快照、重算并比对全部关联材料/身份/绑定与原始字节长度，
+任一不一致隔离到 ResolutionRequired，不再次 provider/LLM/render。
+SQLite 只约束 BLOB、非空与 immutable，不能原生证明 SHA 与内容一致；这些应用
+重算与恢复器仍是 PROPOSED。保存的是发送输入，不是回执或新 authority。[Q:33]
+[Q:72] [Q:76] [Q:89] [unit:MU-p01] [producer:p01-scheduled] [evidence:p01-once]
+
+| 规则 | 材料 | 规范值 | 依据 |
+| --- | --- | --- | --- |
+| prepared_snapshot | prepared_push_bytes | 首次 PreparedPush 规范化字节不可变保存 | [Q:33] [Q:76] [Q:89] |
+| first_render | rendered_bytes | 首次 render 原始字节不可变保存 | [Q:72] [Q:76] [Q:89] |
+| content_binding | payload_sha256,rendered_sha256 | 应用重算 SHA 与长度并核对快照绑定；SQLite 仅检查格式 | [Q:76] [Q:89] |
+| restart_reuse | prepared_push_bytes,rendered_bytes | 只读取原字节；禁止重新 provider/LLM/render | [Q:33] [Q:72] [Q:76] |
+| drift | SameIntent | 保留原字节并隔离 ResolutionRequired；禁止 UPDATE/REPLACE 覆盖 | [Q:77] [Q:89] |
+
+## 业务意图转换（PROPOSED）
+
+本表中的首次派发与恢复，均须遵守前一节的不可变字节合同。[Q:76] [Q:89]
+
+本表为可解析的 v1 规范；标识和值均参与精确校验。[Q:75] [Q:76] [Q:77] [Q:89] [Q:97]
+
+| 起点 | 终点 | 发起者 | 前置条件 | 持久副作用 | 禁止副作用 | ReasonCode | 依据 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| None | PendingDispatch | 应用 | 已冻结事实与稳定身份 | 插入版本零 intent/outbox | 派发先于提交 | intent.created | [Q:75] [Q:76] [Q:77] [Q:89] [Q:97] |
+| None | NoData | 应用 | 已验证为空且策略允许 | 插入版本零并保留空证据 | 伪造终态引用或推进通知游标 | intent.no_data | [Q:75] [Q:76] [Q:77] [Q:89] [Q:97] |
+| None | Disabled | 应用 | 显式禁用且策略允许 | 插入版本零禁用事实 | 把未就绪当禁用或推进通知游标 | policy.disabled | [Q:75] [Q:76] [Q:77] [Q:89] [Q:97] |
+| PendingDispatch | AwaitingAuthority | dispatcher | 有效 lease 与 expected-version CAS | 同库 CAS 并追加事件 | 先发后存或新建逃逸身份 | intent.dispatch_claimed | [Q:75] [Q:76] [Q:77] [Q:89] [Q:97] |
+| PendingDispatch | NoData | 应用 | 冻结空证据与策略及版本 CAS | 同库 CAS 并追加事件 | 把来源错误当空或推进通知游标 | intent.no_data | [Q:75] [Q:76] [Q:77] [Q:89] [Q:97] |
+| PendingDispatch | Disabled | 应用 | 显式禁用及版本 CAS | 同库 CAS 并追加事件 | 清除待处理事实或推进通知游标 | policy.disabled | [Q:75] [Q:76] [Q:77] [Q:89] [Q:97] |
+| AwaitingAuthority | AwaitingFinalizer | authority 适配器 | 私有重查精确绑定且策略允许 | 同库 CAS 并追加事件 | 仅凭日志或结果枚举晋级 | intent.authority_verified | [Q:75] [Q:76] [Q:77] [Q:89] [Q:97] |
+| AwaitingFinalizer | Completed | finalizer | 再次精确绑定且策略允许及版本 CAS | 同一事务执行完成事实 CAS 与事件 | 跨库原子性或跳过事件 | finalizer.completed | [Q:75] [Q:76] [Q:77] [Q:89] [Q:97] |
+| PendingDispatch/AwaitingAuthority/AwaitingFinalizer/Completed/NoData/Disabled | ResolutionRequired | 应用或 finalizer | 材料或版本冲突并以重读版本 CAS | 保留原材料与终态历史并阻断 Unit 晋级 | 覆盖材料或撤销既有游标 | intent.payload_conflict/intent.expected_version_conflict/finalizer.cas_conflict | [Q:75] [Q:76] [Q:77] [Q:89] [Q:97] |
+| AwaitingAuthority/AwaitingFinalizer | ResolutionRequired | 私有 authority 适配器 | 未知或人工不投递处置经重查且版本 CAS | 隔离并保留原 decision 与处置证据 | 自动重发或自动推进通知游标 | transport.uncertain/operator.resolution_conflict | [Q:78] [Q:87] [Q:97] |
+| ResolutionRequired | AwaitingFinalizer | 已认证操作员与私有 authority 适配器 | 处置清除冲突且原身份精确接受绑定与策略及版本 CAS | 保留处置证据并只恢复最终化资格 | 自动解封或再次发送 | intent.authority_verified | [Q:77] [Q:78] [Q:87] [Q:97] |
+| PendingDispatch/AwaitingAuthority/AwaitingFinalizer/ResolutionRequired | SameState | lease 管理者 | owner/until/generation 与版本 CAS | 版本加一并追加事件 | 抢占未过期外来 lease | intent.lease_held/intent.dispatch_claimed | [Q:75] [Q:76] [Q:77] [Q:89] [Q:97] |
+
+## 激活转换（PROPOSED）
+
+本表为可解析的 v1 规范；标识和值均参与精确校验。[Q:79] [Q:80] [Q:81] [Q:82] [Q:98] [Q:99]
+
+| 起点 | 终点 | 发起者 | 前置条件 | 持久副作用 | 禁止副作用 | ReasonCode | 依据 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| None | Disabled | 已认证操作员 | 批准身份与初始 generation=1 | 新 manifest 与 Initialize journal | 仅凭 manifest 宣称执行 | activation.applied | [Q:79] [Q:80] [Q:81] [Q:82] [Q:98] [Q:99] |
+| Disabled | Shadow | 已认证操作员 | 全部版本绑定与 generation CAS | 新 manifest 与 EnterShadow journal | shadow 外部副作用 | activation.applied | [Q:79] [Q:80] [Q:81] [Q:82] [Q:98] [Q:99] |
+| Shadow | Active | 已认证操作员 | 证据通过且无 ResolutionRequired 与 generation CAS | 新 manifest 与 Activate journal | 双物理 owner 或自动批准 | activation.applied | [Q:79] [Q:80] [Q:81] [Q:82] [Q:98] [Q:99] |
+| Active | Draining | 已认证操作员 | generation CAS 与停止新增派发 | 新 manifest 与 Drain journal | 删除未决事实或中断恢复 | activation.applied | [Q:79] [Q:80] [Q:81] [Q:82] [Q:98] [Q:99] |
+| Draining | Disabled | 已认证操作员 | 排空证据与 generation CAS | 新 manifest 与 Disable journal | 把未决状态当已完成 | activation.applied | [Q:79] [Q:80] [Q:81] [Q:82] [Q:98] [Q:99] |
+| Disabled/Shadow/Active/Draining | RollbackTarget | 已认证操作员 | 新 generation CAS 与同 Unit 兼容历史目标 | 新 manifest 与 Rollback journal 恢复目标 owner | 改写历史或破坏性 schema 回滚 | activation.applied | [Q:79] [Q:80] [Q:81] [Q:82] [Q:98] [Q:99] |
+
+## 权威处置与最终化资格（PROPOSED）
+
+本表为可解析的 v1 规范；标识和值均参与精确校验。[Q:78] [Q:86] [Q:87]
+
+| 起点 | 终点 | 发起者 | 前置条件 | 持久副作用 | 禁止副作用 | ReasonCode | 依据 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Accepted | AwaitingFinalizer | 私有 authority 适配器 | 终态已封存且 TerminalBinding 与 CompletionPolicy 均通过 | 仅记录完成提案后进入步骤六 | 把远端接受当业务完成 | intent.authority_verified | [Q:78] [Q:86] [Q:87] |
+| ManualConfirmedAccepted | AwaitingFinalizer | 私有 authority 适配器 | 精确绑定且 AcceptedOrManualBound 策略允许 | 独立人工接受指标与完成提案 | 伪装 TransportAccepted | intent.authority_verified | [Q:78] [Q:86] [Q:87] |
+| AlreadyTerminal | DispositionDependent | 私有 authority 适配器 | 重查 TerminalBinding 并逐处置执行终态完成合同 | 仅允许 Accepted 或合法人工接受进入步骤六 | 全处置推进或省略绑定 | intent.authority_verified | [Q:78] [Q:86] [Q:87] |
+| AcceptedAuditPending/AcceptedTaskTransitionPending | AwaitingAuthority | 恢复器 | authority 尚未封存 | 仅恢复审计与 authority 内部转换 | 重发或业务最终化 | finalizer.terminal_ref_invalid | [Q:78] [Q:86] [Q:87] |
+| Rejected | AwaitingAuthority | dispatcher | 当前显式重试授权及原 decision 与 lease CAS | 仅授权时申请新 attempt | 盲重试或推进游标 | transport.rejected | [Q:78] [Q:86] [Q:87] |
+| Uncertain | ResolutionRequired | 恢复器 | 权威不确定性已确认 | 隔离并等待已认证人工解析 | 自动重发或自动清理 | transport.uncertain | [Q:78] [Q:86] [Q:87] |
+| ManualConfirmedNotDelivered | ResolutionRequired | 私有 authority 适配器 | 精确绑定与已认证处置 | 仅保存不投递处置事实 | 推进游标或自动改写为接受 | operator.resolution_conflict | [Q:78] [Q:86] [Q:87] |
+| COMPAT/Blocked | AwaitingAuthority | 应用 | 无强 authority 终态 | 仅保留弱证据或阻塞诊断 | 构造 VerifiedTerminalRef 或权威完成 | finalizer.terminal_ref_invalid | [Q:78] [Q:86] [Q:87] |
+
+## 跨库恢复顺序（PROPOSED）
+
+本表为可解析的 v1 规范；标识和值均参与精确校验。[Q:76] [Q:78] [Q:90] [Q:97]
+
+| 步骤 | 执行者 | 幂等键 | 已提交可见事实 | 重启扫描 | 下一合法动作 | 禁止行为 | 依据 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 业务应用 | intent_id | 业务 intent/outbox 本地提交 | 按稳定身份查询是否已存在 | 比较不可变材料并取得 lease | 派发先于提交或跨库事务 | [Q:76] [Q:78] [Q:90] [Q:97] |
+| 2 | dispatcher | durable_decision_id | durable reserve/claim | 按原 decision 查询 reservation 与 lease | 确认未尝试且满足 fencing 后进入步骤三 | 外来 lease 抢占或新建身份 | [Q:76] [Q:78] [Q:90] [Q:97] |
+| 3 | authority | durable_decision_id+attempt_id | durable attempt 先于外部尝试记录 | 查询 attempt 与不确定状态 | 仅已有合法 attempt 执行一次或进入恢复 | 在途未知结果盲重发 | [Q:76] [Q:78] [Q:90] [Q:97] |
+| 4 | authority | durable_decision_id+attempt_id | durable terminal 本地提交并封存 | 查询原 terminal 及未封存审计 | 封存后进入步骤五 | 以 sink attempt 或审计日志冒充终态 | [Q:76] [Q:78] [Q:90] [Q:97] |
+| 5 | 私有 authority 适配器 | IdentityRule::TerminalBinding | 只读重验不产生新投递事实 | 从原 authority 再查引用与绑定 | 资格允许才进入步骤六 | 复制回执或跨事务复用未重验引用 | [Q:76] [Q:78] [Q:90] [Q:97] |
+| 6 | finalizer | intent_id+expected_version+event_id | 一个业务事务的 CAS 与 transition 共同提交 | 查业务状态版本和稳定事件 | 失败整体回滚并重查；成功进入步骤七 | CAS 零行追加或事件失败仍提交 | [Q:76] [Q:78] [Q:90] [Q:97] |
+| 7 | 业务应用 | intent_id+result_version | 提交后的确认与独立完成指标 | 查询既有 Completed 和事件 | 幂等返回既有完成事实 | 丢失确认导致二次发送或完成 | [Q:76] [Q:78] [Q:90] [Q:97] |
+
+## 故障与提交确认矩阵（PROPOSED）
+
+本表为可解析的 v1 规范；标识和值均参与精确校验。[Q:76] [Q:82] [Q:88] [Q:90] [Q:100]
+
+| 故障标识 | 已提交事实 | 恢复扫描 | 重发许可 | 幂等键 | 目标状态 | ReasonCode | 依据 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| before_intent_commit | 无新业务事实 | 按 intent_id 重算后查库 | 仅首次且完整门禁通过 | intent_id | PendingDispatch | intent.created | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| after_intent_commit | intent/outbox | 扫描未完成 intent | 查询 durable 后仅允许首次 | intent_id+durable_decision_id | PendingDispatch | intent.created | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| before_claim | intent/outbox | 按原 decision 查询 reservation | 仅确认无 attempt 后首次 | durable_decision_id | AwaitingAuthority | intent.dispatch_claimed | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| after_claim | reservation | 查询 claim 与有效 lease | 仅确认未尝试且 lease 有效 | durable_decision_id | AwaitingAuthority | intent.dispatch_claimed | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| before_attempt | reservation | 查询是否已记录 attempt | 仅确认未尝试且 lease 有效 | durable_decision_id+attempt_id | AwaitingAuthority | intent.dispatch_claimed | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| after_attempt | attempt 可能已外发 | 查询原 attempt 并协调未知结果 | 否 | durable_decision_id+attempt_id | ResolutionRequired | transport.uncertain | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| before_terminal_commit | attempt 或待封存审计 | 恢复原 authority 并查询未知结果 | 否 | durable_decision_id+attempt_id | AwaitingAuthority/ResolutionRequired | transport.uncertain | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| after_terminal_commit | durable terminal；确认可能丢失 | 查询原 terminal 并重新验证绑定 | 否 | IdentityRule::TerminalBinding | AwaitingFinalizer | intent.authority_verified | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| before_reverify | durable terminal | 私有 authority 重查绑定与资格 | 否 | IdentityRule::TerminalBinding | AwaitingFinalizer | intent.authority_verified | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| after_reverify | durable terminal；引用仅在内存 | 重新查询而非恢复内存引用 | 否 | IdentityRule::TerminalBinding | AwaitingFinalizer | finalizer.terminal_ref_invalid | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| after_business_cas | 旧业务提交事实；CAS 尚未提交 | 事务恢复回滚后查状态版本 | 否 | intent_id+expected_version+event_id | AwaitingFinalizer | finalizer.transition_append_failed | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| after_transition_append | 旧业务提交事实；事件尚未提交 | 事务恢复回滚后查状态与事件 | 否 | intent_id+expected_version+event_id | AwaitingFinalizer | finalizer.transition_append_failed | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| after_business_commit | Completed 与事件；确认可能丢失 | 查既有终态及稳定事件并幂等确认 | 否 | intent_id+result_version+event_id | Completed | finalizer.completed | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| sqlite_busy | 最后一次提交事实 | 有界退避后查两库原身份 | 不得仅因 busy 重发 | intent_id+durable_decision_id | SameState | intent.lease_held | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| foreign_lease | 其他 owner 的有效 lease | 等 lease 到期并重新读 generation | 否 | intent_id+lease_generation+version | SameState | intent.lease_held | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| expired_lease | 过期 lease 与原 decision | generation 与版本 CAS 后查询 durable | 仅查询证明确未尝试或有显式拒绝重试授权 | intent_id+lease_generation+version | SameState | intent.dispatch_claimed | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| accepted_audit_pending | Accepted 的未封存审计 | 仅修复 authority 审计和内部转换 | 否 | durable_decision_id+attempt_id | AwaitingAuthority | finalizer.terminal_ref_invalid | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| rejected_retry | 已封存 Rejected | 重新核对当前显式授权与 lease | 仅显式授权产生新 attempt | durable_decision_id+new_attempt_id | AwaitingAuthority | transport.rejected | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| uncertain | 权威未知结果 | 隔离并等待已认证人工解析 | 否 | durable_decision_id+attempt_id | ResolutionRequired | transport.uncertain | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| payload_drift | 原身份及不可变材料 | 重读并 CAS 隔离；保留冲突证据 | 否 | intent_id | ResolutionRequired | intent.payload_conflict | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| expected_version_conflict | 获胜者提交事实 | 回滚本事务并重读 CAS 隔离 | 否 | intent_id+expected_version | ResolutionRequired | intent.expected_version_conflict | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| terminal_ref_invalid | 原 durable 与业务事实 | 私有 authority 重新核验 | 否 | IdentityRule::TerminalBinding | AwaitingAuthority/AwaitingFinalizer | finalizer.terminal_ref_invalid | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| business_finalization_failure | 原 durable terminal 与旧业务事实 | 整体回滚后重查；只重做最终化 | 否 | intent_id+expected_version+event_id | AwaitingFinalizer | finalizer.transition_append_failed | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| activation_rollback | 历史 manifest 与已执行 journal | 核对最新已执行 generation 与兼容目标 | 回滚本身不授权发送 | unit_id+new_generation | RollbackTarget | activation.applied | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| promotion_commit_ack_lost | 新 generation journal 可能已提交 | 按 Unit/generation 查询而非再执行切换 | 否 | unit_id+generation+event_id | ExistingExecutedState | activation.generation_conflict | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+| manifest_without_journal | 新期望 manifest；尚无执行事实 | 比较 manifest 与 journal 并阻断就绪 | 否 | unit_id+generation | Blocked | activation.manifest_mismatch | [Q:76] [Q:82] [Q:88] [Q:90] [Q:100] |
+
+## 最终化事务与恢复边界（PROPOSED）
+
+跨库顺序表的七步是有序本地提交，不存在业务 SQLite 与 durable SQLite 的共同
+原子事务。步骤二至四由现有 authority 负责 reserve、fencing、attempt、审计和终态；
+任何 audit pending 均不能提前进入业务最终化。步骤五每次从私有 authority 重查
+精确引用及 CompletionPolicy，步骤六失败重试前再次重查，禁止复用未验证快照。
+`AlreadyTerminal` 是处置容器而不是接受凭证；人工接受使用独立指标，不记成
+TransportAccepted。schedule 关闭、通知游标推进分别按策略写事实，不能互相代替。
+[Q:76] [Q:78] [Q:86] [Q:87]
+
+步骤六必须使用一个业务连接的 `BEGIN IMMEDIATE` 事务包装：
+先执行绑定 owner/lease/generation/expected-version 的 CAS，立即读取 affected rows；
+零行执行 ROLLBACK、禁止追加事件，并重新查询原事件/状态区分提交确认丢失和真实
+冲突。只有一行时才追加稳定 transition 与本库完成 owner 所需事实；所有步骤成功
+才 COMMIT。若完成 owner 不在该业务库，不能把该 Unit 宣称已经原子迁移，必须在
+后续原子 Unit 切片解决边界，Task3 不虚构跨库游标事务。[Q:16] [Q:76] [Q:97]
+
+任意 SQL 错误（包括 CHECK、FK、UNIQUE、trigger、busy、COMMIT 错误）都必须终止
+当前事务并 ROLLBACK，禁止捕获语句错误后仍提交 CAS。保护 trigger 使用
+RAISE(ROLLBACK)，但 SQLite 通用 CHECK/UNIQUE 的默认 ABORT 只回滚该语句，
+所以不能把 DDL 自身误宣称为完整事务包装器。临时测试采用独立 sqlite3
+`-batch -bail` 连接：错误即退出并关闭连接，使整个未提交事务回滚；
+分别验证 CAS 成功、零行零事件、事件绑定/格式/重复身份失败时旧状态版本不变。
+运行时事务包装器尚未实现，不以此文档测试宣称部署。[Q:76] [Q:97] [Q:100]
+
+步骤七确认丢失时重启只读取已存在的 Completed 和事件并返回原完成结果，不再
+执行完成副作用。步骤四确认丢失同理先查既有 durable terminal；无论丢哪一库的
+确认，都不得通过新 decision/intent 身份再次发送。只有当前明确授权的 Rejected
+才能申请新 attempt；在途未知、Uncertain、Accepted 审计未封存都不得盲重发。
+ResolutionRequired、非终态及相关证据不得自动清理，按最严格保留类别处理。
+[Q:76] [Q:85] [Q:88] [Q:90] [Q:100]
+
+本任务测试只连接新建临时 SQLite，不复制 data/** 或现存库，不调用 provider、
+LLM、发送或订单。SQL 行为测试不是进程级 durable 故障注入，不证明生产两个库
+的真实恢复；故障矩阵是后续 Unit 实现必须执行的合同。运行门禁、WBS、HTML/CI
+发布仍留在 Task4/5/6，本 RFC 持续 PROVISIONAL。[Q:42] [Q:69] [Q:100] [Q:105]
+
+## 规范 DDL 原始嵌入（PROPOSED）
+
+独立 SQL 文件是唯一事实源；本节只复制原始字节，不维护手写变体。[Q:76] [Q:97]
+
+SQL SHA-256：709aae9d09f7ea3ccee692c10eef6851de7b6573fa2cbe44e94f01ed8c434bca
+
+<!-- RFC-SQL-BEGIN -->
+```sql
+-- PROPOSED：仅用于新建临时数据库验证；不是生产迁移器。
+-- 每个业务连接必须再次启用外键与递归 trigger；时间均为非负 UTC 微秒。
+PRAGMA foreign_keys=ON;
+PRAGMA recursive_triggers=ON;
+BEGIN IMMEDIATE;
+
+CREATE TABLE IF NOT EXISTS push_foundation_schema (
+  version INTEGER PRIMARY KEY CHECK(version=1),
+  description TEXT NOT NULL CHECK(description='push-foundation-v1')
+);
+INSERT INTO push_foundation_schema(version,description)
+SELECT 1,'push-foundation-v1' WHERE NOT EXISTS (SELECT 1 FROM push_foundation_schema);
+
+CREATE TABLE IF NOT EXISTS push_intents (
+  intent_id TEXT NOT NULL CHECK(length(intent_id) BETWEEN 1 AND 512) PRIMARY KEY,
+  namespace TEXT NOT NULL CHECK(length(namespace) BETWEEN 1 AND 512),
+  unit_id TEXT NOT NULL CHECK(length(unit_id) BETWEEN 1 AND 512),
+  occurrence_family TEXT NOT NULL CHECK(length(occurrence_family) BETWEEN 1 AND 512),
+  occurrence_key TEXT NOT NULL CHECK(length(occurrence_key) BETWEEN 1 AND 512),
+  completion_owner TEXT NOT NULL CHECK(length(completion_owner) BETWEEN 1 AND 512),
+  source_contract_id TEXT NOT NULL CHECK(length(source_contract_id) BETWEEN 1 AND 512),
+  subject TEXT NOT NULL CHECK(length(subject) BETWEEN 1 AND 512),
+  audience TEXT NOT NULL CHECK(length(audience) BETWEEN 1 AND 512),
+  durable_decision_id TEXT NOT NULL CHECK(length(durable_decision_id) BETWEEN 1 AND 512),
+  business_date TEXT NOT NULL CHECK(length(business_date)=10 AND business_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' AND date(business_date,'+0 days') IS business_date),
+  prepared_push_bytes BLOB NOT NULL CHECK(typeof(prepared_push_bytes)='blob' AND length(prepared_push_bytes)>0),
+  rendered_bytes BLOB NOT NULL CHECK(typeof(rendered_bytes)='blob' AND length(rendered_bytes)>0),
+  payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256)=64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'),
+  rendered_sha256 TEXT NOT NULL CHECK(length(rendered_sha256)=64 AND rendered_sha256 NOT GLOB '*[^0-9a-f]*'),
+  evidence_sha256 TEXT NOT NULL CHECK(length(evidence_sha256)=64 AND evidence_sha256 NOT GLOB '*[^0-9a-f]*'),
+  template_sha256 TEXT NOT NULL CHECK(length(template_sha256)=64 AND template_sha256 NOT GLOB '*[^0-9a-f]*'),
+  source_contract_sha256 TEXT NOT NULL CHECK(length(source_contract_sha256)=64 AND source_contract_sha256 NOT GLOB '*[^0-9a-f]*'),
+  state TEXT NOT NULL CHECK(state IN ('PendingDispatch','AwaitingAuthority','AwaitingFinalizer','Completed','NoData','Disabled','ResolutionRequired')),
+  previous_state TEXT CHECK(previous_state IS NULL OR previous_state IN ('PendingDispatch','AwaitingAuthority','AwaitingFinalizer','Completed','NoData','Disabled','ResolutionRequired')),
+  reason TEXT NOT NULL CHECK(length(reason) BETWEEN 3 AND 96 AND reason NOT GLOB '*[^a-z0-9_.]*' AND substr(reason,1,instr(reason,'.')-1) IN ('schedule','input','policy','intent','transport','finalizer','activation','shadow','operator') AND substr(reason,instr(reason,'.')+1) GLOB '[a-z]*' AND instr(substr(reason,instr(reason,'.')+1),'.')=0),
+  lease_owner TEXT CHECK(lease_owner IS NULL OR length(lease_owner) BETWEEN 1 AND 512),
+  lease_until INTEGER CHECK(lease_until IS NULL OR (typeof(lease_until)='integer' AND lease_until>=0)),
+  lease_generation INTEGER NOT NULL DEFAULT 0 CHECK(typeof(lease_generation)='integer' AND lease_generation>=0),
+  version INTEGER NOT NULL DEFAULT 0 CHECK(typeof(version)='integer' AND version>=0),
+  created_at INTEGER NOT NULL CHECK(typeof(created_at)='integer' AND created_at>=0),
+  updated_at INTEGER NOT NULL CHECK(typeof(updated_at)='integer' AND updated_at>=0),
+  CHECK(updated_at>=created_at),
+  CHECK((lease_owner IS NULL)=(lease_until IS NULL)),
+  UNIQUE(namespace,unit_id,completion_owner,source_contract_id,business_date,occurrence_family,occurrence_key,subject,audience),
+  UNIQUE(namespace,durable_decision_id)
+);
+CREATE INDEX IF NOT EXISTS push_intents_recovery ON push_intents(state,lease_until,unit_id);
+CREATE TRIGGER IF NOT EXISTS push_intents_insert_guard
+BEFORE INSERT ON push_intents
+WHEN EXISTS(SELECT 1 FROM push_intents WHERE intent_id=NEW.intent_id)
+  OR NEW.version<>0 OR NEW.previous_state IS NOT NULL OR NEW.state NOT IN ('PendingDispatch','NoData','Disabled') OR NEW.lease_generation<>0 OR NEW.lease_owner IS NOT NULL
+BEGIN
+  SELECT RAISE(ROLLBACK, 'intent.insert_conflict');
+END;
+CREATE TRIGGER IF NOT EXISTS push_intents_immutable
+BEFORE UPDATE ON push_intents
+WHEN NEW.intent_id IS NOT OLD.intent_id OR
+  NEW.namespace IS NOT OLD.namespace OR
+  NEW.unit_id IS NOT OLD.unit_id OR
+  NEW.occurrence_family IS NOT OLD.occurrence_family OR
+  NEW.occurrence_key IS NOT OLD.occurrence_key OR
+  NEW.completion_owner IS NOT OLD.completion_owner OR
+  NEW.source_contract_id IS NOT OLD.source_contract_id OR
+  NEW.subject IS NOT OLD.subject OR
+  NEW.audience IS NOT OLD.audience OR
+  NEW.durable_decision_id IS NOT OLD.durable_decision_id OR
+  NEW.business_date IS NOT OLD.business_date OR
+  NEW.created_at IS NOT OLD.created_at OR
+  NEW.prepared_push_bytes IS NOT OLD.prepared_push_bytes OR
+  NEW.rendered_bytes IS NOT OLD.rendered_bytes OR
+  NEW.payload_sha256 IS NOT OLD.payload_sha256 OR
+  NEW.rendered_sha256 IS NOT OLD.rendered_sha256 OR
+  NEW.evidence_sha256 IS NOT OLD.evidence_sha256 OR
+  NEW.template_sha256 IS NOT OLD.template_sha256 OR
+  NEW.source_contract_sha256 IS NOT OLD.source_contract_sha256
+BEGIN
+  SELECT RAISE(ROLLBACK, 'intent.immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS push_intents_delete
+BEFORE DELETE ON push_intents
+BEGIN
+  SELECT RAISE(ROLLBACK, 'intent.delete_forbidden');
+END;
+CREATE TRIGGER IF NOT EXISTS push_intents_cas
+BEFORE UPDATE ON push_intents
+WHEN NEW.version<>OLD.version+1 OR NEW.previous_state IS NOT OLD.state OR NEW.updated_at<OLD.updated_at
+  OR NEW.lease_generation<OLD.lease_generation OR NEW.lease_generation>OLD.lease_generation+1
+  OR (NEW.lease_owner IS NOT OLD.lease_owner AND NEW.lease_owner IS NOT NULL AND NEW.lease_generation<>OLD.lease_generation+1)
+  OR (NEW.lease_owner IS NOT OLD.lease_owner AND NEW.lease_owner IS NOT NULL AND OLD.lease_owner IS NOT NULL AND NEW.updated_at<OLD.lease_until)
+  OR NOT (
+    (NEW.state=OLD.state AND OLD.state IN ('PendingDispatch','AwaitingAuthority','AwaitingFinalizer','ResolutionRequired'))
+    OR (OLD.state='PendingDispatch' AND NEW.state IN ('AwaitingAuthority','NoData','Disabled','ResolutionRequired'))
+    OR (OLD.state='AwaitingAuthority' AND NEW.state IN ('AwaitingFinalizer','ResolutionRequired'))
+    OR (OLD.state='AwaitingFinalizer' AND NEW.state IN ('Completed','ResolutionRequired'))
+    OR (OLD.state='ResolutionRequired' AND NEW.state='AwaitingFinalizer')
+    OR (OLD.state IN ('Completed','NoData','Disabled') AND NEW.state='ResolutionRequired')
+  )
+BEGIN
+  SELECT RAISE(ROLLBACK, 'intent.cas_or_edge_invalid');
+END;
+
+CREATE TABLE IF NOT EXISTS push_intent_transitions (
+  event_id TEXT NOT NULL CHECK(length(event_id) BETWEEN 1 AND 512) PRIMARY KEY,
+  intent_id TEXT NOT NULL CHECK(length(intent_id) BETWEEN 1 AND 512) REFERENCES push_intents(intent_id),
+  from_state TEXT NOT NULL CHECK(from_state IN ('PendingDispatch','AwaitingAuthority','AwaitingFinalizer','Completed','NoData','Disabled','ResolutionRequired')),
+  to_state TEXT NOT NULL CHECK(to_state IN ('PendingDispatch','AwaitingAuthority','AwaitingFinalizer','Completed','NoData','Disabled','ResolutionRequired')),
+  expected_version INTEGER NOT NULL CHECK(typeof(expected_version)='integer' AND expected_version>=0),
+  result_version INTEGER NOT NULL CHECK(typeof(result_version)='integer' AND result_version=expected_version+1),
+  previous_sha256 TEXT CHECK(previous_sha256 IS NULL OR (length(previous_sha256)=64 AND previous_sha256 NOT GLOB '*[^0-9a-f]*')),
+  canonical_sha256 TEXT NOT NULL CHECK(length(canonical_sha256)=64 AND canonical_sha256 NOT GLOB '*[^0-9a-f]*'),
+  actor TEXT NOT NULL CHECK(length(actor) BETWEEN 1 AND 512),
+  reason TEXT NOT NULL CHECK(length(reason) BETWEEN 3 AND 96 AND reason NOT GLOB '*[^a-z0-9_.]*' AND substr(reason,1,instr(reason,'.')-1) IN ('schedule','input','policy','intent','transport','finalizer','activation','shadow','operator') AND substr(reason,instr(reason,'.')+1) GLOB '[a-z]*' AND instr(substr(reason,instr(reason,'.')+1),'.')=0),
+  terminal_ref_id TEXT CHECK(terminal_ref_id IS NULL OR length(terminal_ref_id) BETWEEN 1 AND 512),
+  terminal_binding_sha256 TEXT CHECK(terminal_binding_sha256 IS NULL OR (length(terminal_binding_sha256)=64 AND terminal_binding_sha256 NOT GLOB '*[^0-9a-f]*')),
+  occurred_at INTEGER NOT NULL CHECK(typeof(occurred_at)='integer' AND occurred_at>=0),
+  CHECK((terminal_ref_id IS NULL)=(terminal_binding_sha256 IS NULL)),
+  CHECK((to_state='Completed')=(terminal_ref_id IS NOT NULL)),
+  CHECK((result_version=1)=(previous_sha256 IS NULL)),
+  UNIQUE(intent_id,result_version)
+);
+CREATE TRIGGER IF NOT EXISTS push_intent_transitions_binding
+BEFORE INSERT ON push_intent_transitions
+WHEN EXISTS(SELECT 1 FROM push_intent_transitions WHERE event_id=NEW.event_id)
+  OR NOT EXISTS(SELECT 1 FROM push_intents i WHERE i.intent_id=NEW.intent_id AND i.state=NEW.to_state AND i.previous_state=NEW.from_state AND i.version=NEW.result_version AND i.updated_at<=NEW.occurred_at)
+  OR (NEW.result_version>1 AND NOT EXISTS(SELECT 1 FROM push_intent_transitions p WHERE p.intent_id=NEW.intent_id AND p.result_version=NEW.expected_version AND p.to_state=NEW.from_state AND p.canonical_sha256=NEW.previous_sha256))
+BEGIN
+  SELECT RAISE(ROLLBACK, 'intent.transition_binding_invalid');
+END;
+CREATE TRIGGER IF NOT EXISTS push_intent_transitions_update
+BEFORE UPDATE ON push_intent_transitions
+BEGIN
+  SELECT RAISE(ROLLBACK, 'intent.append_only');
+END;
+CREATE TRIGGER IF NOT EXISTS push_intent_transitions_delete
+BEFORE DELETE ON push_intent_transitions
+BEGIN
+  SELECT RAISE(ROLLBACK, 'intent.append_only');
+END;
+
+CREATE TABLE IF NOT EXISTS push_activation_manifests (
+  manifest_sha256 TEXT NOT NULL CHECK(length(manifest_sha256)=64 AND manifest_sha256 NOT GLOB '*[^0-9a-f]*') PRIMARY KEY,
+  unit_id TEXT NOT NULL CHECK(length(unit_id) BETWEEN 1 AND 512),
+  generation INTEGER NOT NULL CHECK(typeof(generation)='integer' AND generation>=1),
+  previous_manifest_sha256 TEXT CHECK(previous_manifest_sha256 IS NULL OR (length(previous_manifest_sha256)=64 AND previous_manifest_sha256 NOT GLOB '*[^0-9a-f]*')) REFERENCES push_activation_manifests(manifest_sha256),
+  desired_state TEXT NOT NULL CHECK(desired_state IN ('Disabled','Shadow','Active','Draining')),
+  physical_owner TEXT NOT NULL CHECK(length(physical_owner) BETWEEN 1 AND 512),
+  build_commit TEXT NOT NULL CHECK(length(build_commit)=40 AND build_commit NOT GLOB '*[^0-9a-f]*'),
+  build_sha256 TEXT NOT NULL CHECK(length(build_sha256)=64 AND build_sha256 NOT GLOB '*[^0-9a-f]*'),
+  catalog_sha256 TEXT NOT NULL CHECK(length(catalog_sha256)=64 AND catalog_sha256 NOT GLOB '*[^0-9a-f]*'),
+  business_schema_sha256 TEXT NOT NULL CHECK(length(business_schema_sha256)=64 AND business_schema_sha256 NOT GLOB '*[^0-9a-f]*'),
+  durable_schema_sha256 TEXT NOT NULL CHECK(length(durable_schema_sha256)=64 AND durable_schema_sha256 NOT GLOB '*[^0-9a-f]*'),
+  template_sha256 TEXT NOT NULL CHECK(length(template_sha256)=64 AND template_sha256 NOT GLOB '*[^0-9a-f]*'),
+  source_contract_sha256 TEXT NOT NULL CHECK(length(source_contract_sha256)=64 AND source_contract_sha256 NOT GLOB '*[^0-9a-f]*'),
+  evidence_sha256 TEXT NOT NULL CHECK(length(evidence_sha256)=64 AND evidence_sha256 NOT GLOB '*[^0-9a-f]*'),
+  approved_by TEXT NOT NULL CHECK(length(approved_by) BETWEEN 1 AND 512),
+  approved_at INTEGER NOT NULL CHECK(typeof(approved_at)='integer' AND approved_at>=0),
+  window_start INTEGER NOT NULL CHECK(typeof(window_start)='integer' AND window_start>=0),
+  window_end INTEGER NOT NULL CHECK(typeof(window_end)='integer' AND window_end>=0),
+  rollback_target_sha256 TEXT CHECK(rollback_target_sha256 IS NULL OR (length(rollback_target_sha256)=64 AND rollback_target_sha256 NOT GLOB '*[^0-9a-f]*')) REFERENCES push_activation_manifests(manifest_sha256),
+  created_at INTEGER NOT NULL CHECK(typeof(created_at)='integer' AND created_at>=0),
+  CHECK(window_end>window_start AND approved_at<=created_at),
+  CHECK((generation=1)=(previous_manifest_sha256 IS NULL)),
+  UNIQUE(unit_id,generation)
+);
+CREATE TRIGGER IF NOT EXISTS push_activation_manifests_chain
+BEFORE INSERT ON push_activation_manifests
+WHEN EXISTS(SELECT 1 FROM push_activation_manifests WHERE manifest_sha256=NEW.manifest_sha256)
+  OR NEW.generation<>COALESCE((SELECT MAX(generation)+1 FROM push_activation_manifests WHERE unit_id=NEW.unit_id),1)
+  OR (NEW.generation=1 AND (NEW.desired_state<>'Disabled' OR NEW.rollback_target_sha256 IS NOT NULL))
+  OR (NEW.generation>1 AND NOT EXISTS(SELECT 1 FROM push_activation_manifests p WHERE p.unit_id=NEW.unit_id AND p.generation=NEW.generation-1 AND p.manifest_sha256=NEW.previous_manifest_sha256))
+  OR (NEW.generation>1 AND NEW.rollback_target_sha256 IS NULL AND NOT EXISTS(
+    SELECT 1 FROM push_activation_manifests p WHERE p.manifest_sha256=NEW.previous_manifest_sha256 AND (
+      (p.desired_state='Disabled' AND NEW.desired_state='Shadow') OR (p.desired_state='Shadow' AND NEW.desired_state='Active')
+      OR (p.desired_state='Active' AND NEW.desired_state='Draining') OR (p.desired_state='Draining' AND NEW.desired_state='Disabled'))))
+  OR (NEW.rollback_target_sha256 IS NOT NULL AND NOT EXISTS(SELECT 1 FROM push_activation_manifests r WHERE r.manifest_sha256=NEW.rollback_target_sha256 AND r.unit_id=NEW.unit_id AND r.generation<NEW.generation AND r.desired_state=NEW.desired_state AND r.physical_owner=NEW.physical_owner))
+BEGIN
+  SELECT RAISE(ROLLBACK, 'activation.generation_or_edge_invalid');
+END;
+CREATE TRIGGER IF NOT EXISTS push_activation_manifests_update
+BEFORE UPDATE ON push_activation_manifests
+BEGIN
+  SELECT RAISE(ROLLBACK, 'activation.history_immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS push_activation_manifests_delete
+BEFORE DELETE ON push_activation_manifests
+BEGIN
+  SELECT RAISE(ROLLBACK, 'activation.history_immutable');
+END;
+
+CREATE TABLE IF NOT EXISTS push_promotion_journal (
+  event_id TEXT NOT NULL CHECK(length(event_id) BETWEEN 1 AND 512) PRIMARY KEY,
+  unit_id TEXT NOT NULL CHECK(length(unit_id) BETWEEN 1 AND 512),
+  generation INTEGER NOT NULL CHECK(typeof(generation)='integer' AND generation>=1),
+  from_manifest_sha256 TEXT CHECK(from_manifest_sha256 IS NULL OR (length(from_manifest_sha256)=64 AND from_manifest_sha256 NOT GLOB '*[^0-9a-f]*')) REFERENCES push_activation_manifests(manifest_sha256),
+  to_manifest_sha256 TEXT NOT NULL CHECK(length(to_manifest_sha256)=64 AND to_manifest_sha256 NOT GLOB '*[^0-9a-f]*') REFERENCES push_activation_manifests(manifest_sha256),
+  actor TEXT NOT NULL CHECK(length(actor) BETWEEN 1 AND 512),
+  action TEXT NOT NULL CHECK(action IN ('Initialize','EnterShadow','Activate','Drain','Disable','Rollback')),
+  reason TEXT NOT NULL CHECK(length(reason) BETWEEN 3 AND 96 AND reason NOT GLOB '*[^a-z0-9_.]*' AND substr(reason,1,instr(reason,'.')-1) IN ('schedule','input','policy','intent','transport','finalizer','activation','shadow','operator') AND substr(reason,instr(reason,'.')+1) GLOB '[a-z]*' AND instr(substr(reason,instr(reason,'.')+1),'.')=0),
+  window_start INTEGER NOT NULL CHECK(typeof(window_start)='integer' AND window_start>=0),
+  window_end INTEGER NOT NULL CHECK(typeof(window_end)='integer' AND window_end>=0),
+  evidence_sha256 TEXT NOT NULL CHECK(length(evidence_sha256)=64 AND evidence_sha256 NOT GLOB '*[^0-9a-f]*'),
+  rollback_target_sha256 TEXT CHECK(rollback_target_sha256 IS NULL OR (length(rollback_target_sha256)=64 AND rollback_target_sha256 NOT GLOB '*[^0-9a-f]*')) REFERENCES push_activation_manifests(manifest_sha256),
+  previous_sha256 TEXT CHECK(previous_sha256 IS NULL OR (length(previous_sha256)=64 AND previous_sha256 NOT GLOB '*[^0-9a-f]*')),
+  canonical_sha256 TEXT NOT NULL CHECK(length(canonical_sha256)=64 AND canonical_sha256 NOT GLOB '*[^0-9a-f]*'),
+  occurred_at INTEGER NOT NULL CHECK(typeof(occurred_at)='integer' AND occurred_at>=0),
+  CHECK(window_end>window_start AND occurred_at>=window_start AND occurred_at<window_end),
+  CHECK((generation=1)=(from_manifest_sha256 IS NULL)),
+  CHECK((generation=1)=(previous_sha256 IS NULL)),
+  CHECK((action='Rollback')=(rollback_target_sha256 IS NOT NULL)),
+  UNIQUE(unit_id,generation)
+);
+CREATE TRIGGER IF NOT EXISTS push_promotion_journal_binding
+BEFORE INSERT ON push_promotion_journal
+WHEN EXISTS(SELECT 1 FROM push_promotion_journal WHERE event_id=NEW.event_id)
+  OR NEW.generation<>COALESCE((SELECT MAX(generation)+1 FROM push_promotion_journal WHERE unit_id=NEW.unit_id),1)
+  OR NOT EXISTS(SELECT 1 FROM push_activation_manifests m WHERE m.manifest_sha256=NEW.to_manifest_sha256 AND m.unit_id=NEW.unit_id AND m.generation=NEW.generation AND m.previous_manifest_sha256 IS NEW.from_manifest_sha256 AND m.rollback_target_sha256 IS NEW.rollback_target_sha256 AND m.window_start=NEW.window_start AND m.window_end=NEW.window_end AND m.evidence_sha256=NEW.evidence_sha256 AND m.approved_by=NEW.actor AND m.approved_at<=NEW.occurred_at AND (
+    (NEW.action='Initialize' AND m.generation=1 AND m.desired_state='Disabled')
+    OR (NEW.action='EnterShadow' AND m.generation>1 AND m.desired_state='Shadow' AND m.rollback_target_sha256 IS NULL)
+    OR (NEW.action='Activate' AND m.desired_state='Active' AND m.rollback_target_sha256 IS NULL)
+    OR (NEW.action='Drain' AND m.desired_state='Draining' AND m.rollback_target_sha256 IS NULL)
+    OR (NEW.action='Disable' AND m.generation>1 AND m.desired_state='Disabled' AND m.rollback_target_sha256 IS NULL)
+    OR (NEW.action='Rollback' AND m.rollback_target_sha256 IS NOT NULL)))
+  OR (NEW.generation>1 AND NOT EXISTS(SELECT 1 FROM push_promotion_journal p WHERE p.unit_id=NEW.unit_id AND p.generation=NEW.generation-1 AND p.to_manifest_sha256=NEW.from_manifest_sha256 AND p.canonical_sha256=NEW.previous_sha256))
+BEGIN
+  SELECT RAISE(ROLLBACK, 'activation.journal_binding_invalid');
+END;
+CREATE TRIGGER IF NOT EXISTS push_promotion_journal_update
+BEFORE UPDATE ON push_promotion_journal
+BEGIN
+  SELECT RAISE(ROLLBACK, 'activation.append_only');
+END;
+CREATE TRIGGER IF NOT EXISTS push_promotion_journal_delete
+BEFORE DELETE ON push_promotion_journal
+BEGIN
+  SELECT RAISE(ROLLBACK, 'activation.append_only');
+END;
+CREATE TRIGGER IF NOT EXISTS push_foundation_schema_update
+BEFORE UPDATE ON push_foundation_schema
+BEGIN
+  SELECT RAISE(ROLLBACK, 'activation.manifest_mismatch');
+END;
+CREATE TRIGGER IF NOT EXISTS push_foundation_schema_delete
+BEFORE DELETE ON push_foundation_schema
+BEGIN
+  SELECT RAISE(ROLLBACK, 'activation.manifest_mismatch');
+END;
+
+COMMIT;
+```
+<!-- RFC-SQL-END -->

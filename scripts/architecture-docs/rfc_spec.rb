@@ -8,6 +8,7 @@ require_relative 'rfc_inputs'
 module ArchitectureDocs
   module RfcSpec
     RFC_PATH = 'docs/push-system/push-system-implementation-rfc.md'
+    SQL_PATH = 'docs/push-system/push-system-foundation.v1.sql'
     BASELINE = '07781bf386aafdf202851ae928efee8920387058'
     DEPENDENCIES = {
       'input_manifest_sha256' => ['rfc-input-manifest.v1.json', '6a74428f1cc18cc1b0800ab86be19e3d8afdaafd0107d7656a2d3a5857f18aab'],
@@ -273,6 +274,108 @@ module ArchitectureDocs
         error: 'rfc_adapter_contract_invalid'
       }
     }.freeze
+    PERSISTENCE_CONTRACTS = {
+      '业务 outbox 字节恢复合同（PROPOSED）' => {
+        header: %w[规则 材料 规范值 依据],
+        rows: [
+          ['prepared_snapshot','prepared_push_bytes','首次 PreparedPush 规范化字节不可变保存'],
+          ['first_render','rendered_bytes','首次 render 原始字节不可变保存'],
+          ['content_binding','payload_sha256,rendered_sha256','应用重算 SHA 与长度并核对快照绑定；SQLite 仅检查格式'],
+          ['restart_reuse','prepared_push_bytes,rendered_bytes','只读取原字节；禁止重新 provider/LLM/render'],
+          ['drift','SameIntent','保留原字节并隔离 ResolutionRequired；禁止 UPDATE/REPLACE 覆盖']
+        ],
+        error: 'rfc_outbox_bytes_invalid'
+      },
+      "业务意图转换（PROPOSED）" => {
+        header: ["起点","终点","发起者","前置条件","持久副作用","禁止副作用","ReasonCode","依据"],
+        rows: [
+          ["None","PendingDispatch","应用","已冻结事实与稳定身份","插入版本零 intent/outbox","派发先于提交","intent.created"],
+          ["None","NoData","应用","已验证为空且策略允许","插入版本零并保留空证据","伪造终态引用或推进通知游标","intent.no_data"],
+          ["None","Disabled","应用","显式禁用且策略允许","插入版本零禁用事实","把未就绪当禁用或推进通知游标","policy.disabled"],
+          ["PendingDispatch","AwaitingAuthority","dispatcher","有效 lease 与 expected-version CAS","同库 CAS 并追加事件","先发后存或新建逃逸身份","intent.dispatch_claimed"],
+          ["PendingDispatch","NoData","应用","冻结空证据与策略及版本 CAS","同库 CAS 并追加事件","把来源错误当空或推进通知游标","intent.no_data"],
+          ["PendingDispatch","Disabled","应用","显式禁用及版本 CAS","同库 CAS 并追加事件","清除待处理事实或推进通知游标","policy.disabled"],
+          ["AwaitingAuthority","AwaitingFinalizer","authority 适配器","私有重查精确绑定且策略允许","同库 CAS 并追加事件","仅凭日志或结果枚举晋级","intent.authority_verified"],
+          ["AwaitingFinalizer","Completed","finalizer","再次精确绑定且策略允许及版本 CAS","同一事务执行完成事实 CAS 与事件","跨库原子性或跳过事件","finalizer.completed"],
+          ["PendingDispatch/AwaitingAuthority/AwaitingFinalizer/Completed/NoData/Disabled","ResolutionRequired","应用或 finalizer","材料或版本冲突并以重读版本 CAS","保留原材料与终态历史并阻断 Unit 晋级","覆盖材料或撤销既有游标","intent.payload_conflict/intent.expected_version_conflict/finalizer.cas_conflict"],
+          ["AwaitingAuthority/AwaitingFinalizer","ResolutionRequired","私有 authority 适配器","未知或人工不投递处置经重查且版本 CAS","隔离并保留原 decision 与处置证据","自动重发或自动推进通知游标","transport.uncertain/operator.resolution_conflict"],
+          ["ResolutionRequired","AwaitingFinalizer","已认证操作员与私有 authority 适配器","处置清除冲突且原身份精确接受绑定与策略及版本 CAS","保留处置证据并只恢复最终化资格","自动解封或再次发送","intent.authority_verified"],
+          ["PendingDispatch/AwaitingAuthority/AwaitingFinalizer/ResolutionRequired","SameState","lease 管理者","owner/until/generation 与版本 CAS","版本加一并追加事件","抢占未过期外来 lease","intent.lease_held/intent.dispatch_claimed"]
+        ],
+        error: 'rfc_business_protocol_invalid'
+      },
+      "激活转换（PROPOSED）" => {
+        header: ["起点","终点","发起者","前置条件","持久副作用","禁止副作用","ReasonCode","依据"],
+        rows: [
+          ["None","Disabled","已认证操作员","批准身份与初始 generation=1","新 manifest 与 Initialize journal","仅凭 manifest 宣称执行","activation.applied"],
+          ["Disabled","Shadow","已认证操作员","全部版本绑定与 generation CAS","新 manifest 与 EnterShadow journal","shadow 外部副作用","activation.applied"],
+          ["Shadow","Active","已认证操作员","证据通过且无 ResolutionRequired 与 generation CAS","新 manifest 与 Activate journal","双物理 owner 或自动批准","activation.applied"],
+          ["Active","Draining","已认证操作员","generation CAS 与停止新增派发","新 manifest 与 Drain journal","删除未决事实或中断恢复","activation.applied"],
+          ["Draining","Disabled","已认证操作员","排空证据与 generation CAS","新 manifest 与 Disable journal","把未决状态当已完成","activation.applied"],
+          ["Disabled/Shadow/Active/Draining","RollbackTarget","已认证操作员","新 generation CAS 与同 Unit 兼容历史目标","新 manifest 与 Rollback journal 恢复目标 owner","改写历史或破坏性 schema 回滚","activation.applied"]
+        ],
+        error: 'rfc_activation_protocol_invalid'
+      },
+      "权威处置与最终化资格（PROPOSED）" => {
+        header: ["起点","终点","发起者","前置条件","持久副作用","禁止副作用","ReasonCode","依据"],
+        rows: [
+          ["Accepted","AwaitingFinalizer","私有 authority 适配器","终态已封存且 TerminalBinding 与 CompletionPolicy 均通过","仅记录完成提案后进入步骤六","把远端接受当业务完成","intent.authority_verified"],
+          ["ManualConfirmedAccepted","AwaitingFinalizer","私有 authority 适配器","精确绑定且 AcceptedOrManualBound 策略允许","独立人工接受指标与完成提案","伪装 TransportAccepted","intent.authority_verified"],
+          ["AlreadyTerminal","DispositionDependent","私有 authority 适配器","重查 TerminalBinding 并逐处置执行终态完成合同","仅允许 Accepted 或合法人工接受进入步骤六","全处置推进或省略绑定","intent.authority_verified"],
+          ["AcceptedAuditPending/AcceptedTaskTransitionPending","AwaitingAuthority","恢复器","authority 尚未封存","仅恢复审计与 authority 内部转换","重发或业务最终化","finalizer.terminal_ref_invalid"],
+          ["Rejected","AwaitingAuthority","dispatcher","当前显式重试授权及原 decision 与 lease CAS","仅授权时申请新 attempt","盲重试或推进游标","transport.rejected"],
+          ["Uncertain","ResolutionRequired","恢复器","权威不确定性已确认","隔离并等待已认证人工解析","自动重发或自动清理","transport.uncertain"],
+          ["ManualConfirmedNotDelivered","ResolutionRequired","私有 authority 适配器","精确绑定与已认证处置","仅保存不投递处置事实","推进游标或自动改写为接受","operator.resolution_conflict"],
+          ["COMPAT/Blocked","AwaitingAuthority","应用","无强 authority 终态","仅保留弱证据或阻塞诊断","构造 VerifiedTerminalRef 或权威完成","finalizer.terminal_ref_invalid"]
+        ],
+        error: 'rfc_authority_protocol_invalid'
+      },
+      "跨库恢复顺序（PROPOSED）" => {
+        header: ["步骤","执行者","幂等键","已提交可见事实","重启扫描","下一合法动作","禁止行为","依据"],
+        rows: [
+          ["1","业务应用","intent_id","业务 intent/outbox 本地提交","按稳定身份查询是否已存在","比较不可变材料并取得 lease","派发先于提交或跨库事务"],
+          ["2","dispatcher","durable_decision_id","durable reserve/claim","按原 decision 查询 reservation 与 lease","确认未尝试且满足 fencing 后进入步骤三","外来 lease 抢占或新建身份"],
+          ["3","authority","durable_decision_id+attempt_id","durable attempt 先于外部尝试记录","查询 attempt 与不确定状态","仅已有合法 attempt 执行一次或进入恢复","在途未知结果盲重发"],
+          ["4","authority","durable_decision_id+attempt_id","durable terminal 本地提交并封存","查询原 terminal 及未封存审计","封存后进入步骤五","以 sink attempt 或审计日志冒充终态"],
+          ["5","私有 authority 适配器","IdentityRule::TerminalBinding","只读重验不产生新投递事实","从原 authority 再查引用与绑定","资格允许才进入步骤六","复制回执或跨事务复用未重验引用"],
+          ["6","finalizer","intent_id+expected_version+event_id","一个业务事务的 CAS 与 transition 共同提交","查业务状态版本和稳定事件","失败整体回滚并重查；成功进入步骤七","CAS 零行追加或事件失败仍提交"],
+          ["7","业务应用","intent_id+result_version","提交后的确认与独立完成指标","查询既有 Completed 和事件","幂等返回既有完成事实","丢失确认导致二次发送或完成"]
+        ],
+        error: 'rfc_cross_database_protocol_invalid'
+      },
+      "故障与提交确认矩阵（PROPOSED）" => {
+        header: ["故障标识","已提交事实","恢复扫描","重发许可","幂等键","目标状态","ReasonCode","依据"],
+        rows: [
+          ["before_intent_commit","无新业务事实","按 intent_id 重算后查库","仅首次且完整门禁通过","intent_id","PendingDispatch","intent.created"],
+          ["after_intent_commit","intent/outbox","扫描未完成 intent","查询 durable 后仅允许首次","intent_id+durable_decision_id","PendingDispatch","intent.created"],
+          ["before_claim","intent/outbox","按原 decision 查询 reservation","仅确认无 attempt 后首次","durable_decision_id","AwaitingAuthority","intent.dispatch_claimed"],
+          ["after_claim","reservation","查询 claim 与有效 lease","仅确认未尝试且 lease 有效","durable_decision_id","AwaitingAuthority","intent.dispatch_claimed"],
+          ["before_attempt","reservation","查询是否已记录 attempt","仅确认未尝试且 lease 有效","durable_decision_id+attempt_id","AwaitingAuthority","intent.dispatch_claimed"],
+          ["after_attempt","attempt 可能已外发","查询原 attempt 并协调未知结果","否","durable_decision_id+attempt_id","ResolutionRequired","transport.uncertain"],
+          ["before_terminal_commit","attempt 或待封存审计","恢复原 authority 并查询未知结果","否","durable_decision_id+attempt_id","AwaitingAuthority/ResolutionRequired","transport.uncertain"],
+          ["after_terminal_commit","durable terminal；确认可能丢失","查询原 terminal 并重新验证绑定","否","IdentityRule::TerminalBinding","AwaitingFinalizer","intent.authority_verified"],
+          ["before_reverify","durable terminal","私有 authority 重查绑定与资格","否","IdentityRule::TerminalBinding","AwaitingFinalizer","intent.authority_verified"],
+          ["after_reverify","durable terminal；引用仅在内存","重新查询而非恢复内存引用","否","IdentityRule::TerminalBinding","AwaitingFinalizer","finalizer.terminal_ref_invalid"],
+          ["after_business_cas","旧业务提交事实；CAS 尚未提交","事务恢复回滚后查状态版本","否","intent_id+expected_version+event_id","AwaitingFinalizer","finalizer.transition_append_failed"],
+          ["after_transition_append","旧业务提交事实；事件尚未提交","事务恢复回滚后查状态与事件","否","intent_id+expected_version+event_id","AwaitingFinalizer","finalizer.transition_append_failed"],
+          ["after_business_commit","Completed 与事件；确认可能丢失","查既有终态及稳定事件并幂等确认","否","intent_id+result_version+event_id","Completed","finalizer.completed"],
+          ["sqlite_busy","最后一次提交事实","有界退避后查两库原身份","不得仅因 busy 重发","intent_id+durable_decision_id","SameState","intent.lease_held"],
+          ["foreign_lease","其他 owner 的有效 lease","等 lease 到期并重新读 generation","否","intent_id+lease_generation+version","SameState","intent.lease_held"],
+          ["expired_lease","过期 lease 与原 decision","generation 与版本 CAS 后查询 durable","仅查询证明确未尝试或有显式拒绝重试授权","intent_id+lease_generation+version","SameState","intent.dispatch_claimed"],
+          ["accepted_audit_pending","Accepted 的未封存审计","仅修复 authority 审计和内部转换","否","durable_decision_id+attempt_id","AwaitingAuthority","finalizer.terminal_ref_invalid"],
+          ["rejected_retry","已封存 Rejected","重新核对当前显式授权与 lease","仅显式授权产生新 attempt","durable_decision_id+new_attempt_id","AwaitingAuthority","transport.rejected"],
+          ["uncertain","权威未知结果","隔离并等待已认证人工解析","否","durable_decision_id+attempt_id","ResolutionRequired","transport.uncertain"],
+          ["payload_drift","原身份及不可变材料","重读并 CAS 隔离；保留冲突证据","否","intent_id","ResolutionRequired","intent.payload_conflict"],
+          ["expected_version_conflict","获胜者提交事实","回滚本事务并重读 CAS 隔离","否","intent_id+expected_version","ResolutionRequired","intent.expected_version_conflict"],
+          ["terminal_ref_invalid","原 durable 与业务事实","私有 authority 重新核验","否","IdentityRule::TerminalBinding","AwaitingAuthority/AwaitingFinalizer","finalizer.terminal_ref_invalid"],
+          ["business_finalization_failure","原 durable terminal 与旧业务事实","整体回滚后重查；只重做最终化","否","intent_id+expected_version+event_id","AwaitingFinalizer","finalizer.transition_append_failed"],
+          ["activation_rollback","历史 manifest 与已执行 journal","核对最新已执行 generation 与兼容目标","回滚本身不授权发送","unit_id+new_generation","RollbackTarget","activation.applied"],
+          ["promotion_commit_ack_lost","新 generation journal 可能已提交","按 Unit/generation 查询而非再执行切换","否","unit_id+generation+event_id","ExistingExecutedState","activation.generation_conflict"],
+          ["manifest_without_journal","新期望 manifest；尚无执行事实","比较 manifest 与 journal 并阻断就绪","否","unit_id+generation","Blocked","activation.manifest_mismatch"]
+        ],
+        error: 'rfc_fault_matrix_invalid'
+      },
+    }.freeze
     CANONICAL_EXCEPTIONS = {
       'PreparedFacts' => {'canonical_facts' => '外部原始字节', 'facts_sha256' => '派生且排除自身'},
       'SemanticProjection' => {'canonical_bytes' => '派生且排除自身', 'sha256' => '派生且排除自身'},
@@ -314,6 +417,7 @@ module ArchitectureDocs
       statuses = catalog['kinds'].group_by { |kind| kind['status'] }.transform_values(&:length)
       errors << 'rfc_catalog_statuses_invalid' unless statuses == STATUSES
       errors.concat(contract_errors(text, catalog, evidence, documents['decisions_sha256']))
+      errors.concat(sql_errors(root, text))
       errors << 'rfc_status_provisional' if strict
       errors.uniq
     rescue Invalid => error
@@ -334,7 +438,9 @@ module ArchitectureDocs
         errors << "rfc_section_duplicate name=#{name}" if sections.key?(name)
         sections[name] = body
       end
-      required = (REQUIRED_SECTIONS + SEMANTIC_CONTRACTS.keys + TYPE_FIELDS.keys.map { |name| "类型：#{name}（PROPOSED）" }).uniq
+      required = (REQUIRED_SECTIONS + SEMANTIC_CONTRACTS.keys + PERSISTENCE_CONTRACTS.keys +
+                  ['业务持久化范围与 SQL 字节合同（PROPOSED）', '最终化事务与恢复边界（PROPOSED）', '规范 DDL 原始嵌入（PROPOSED）'] +
+                  TYPE_FIELDS.keys.map { |name| "类型：#{name}（PROPOSED）" }).uniq
       required.each do |name|
         errors << "rfc_section_missing name=#{name}" unless sections.key?(name)
       end
@@ -380,7 +486,7 @@ module ArchitectureDocs
 
     def semantic_contract_errors(sections)
       errors = []
-      SEMANTIC_CONTRACTS.each do |name, profile|
+      SEMANTIC_CONTRACTS.merge(PERSISTENCE_CONTRACTS).each do |name, profile|
         rows = section_table(sections, name, profile[:header], errors).map { |row| row[0...-1] }
         errors << profile[:error] unless rows.sort == profile[:rows].sort
       end
@@ -456,6 +562,15 @@ module ArchitectureDocs
         end
       end
       errors << 'rfc_reason_coverage_invalid' unless (REASONS - reasons).empty?
+      PERSISTENCE_CONTRACTS.each_value do |profile|
+        column = profile[:header].index('ReasonCode')
+        next unless column
+        profile[:rows].each do |row|
+          row[column].split('/').each do |code|
+            errors << "rfc_persistence_reason_missing code=#{code}" unless reasons.include?(code)
+          end
+        end
+      end
       errors
     end
 
@@ -489,6 +604,29 @@ module ArchitectureDocs
           true
         end
       end
+    end
+
+    # 只读字节门禁；不执行文档中的 SQL、SQLite 点命令或外部文件引用。
+    # 真实 DDL 行为由临时 SQLite 测试承担，不能用两份自洽文本代替约束验证。
+    def sql_errors(root, text)
+      sql = read_document(root, SQL_PATH)
+      begin_marker = '<!-- RFC-SQL-BEGIN -->'
+      end_marker = '<!-- RFC-SQL-END -->'
+      unless text.scan('RFC-SQL-BEGIN').length == 1 && text.scan('RFC-SQL-END').length == 1 &&
+             text.scan(/^```sql[^\n]*$/i).length == 1
+        return ['rfc_sql_region_invalid']
+      end
+      region = text.match(/#{Regexp.escape(begin_marker)}(.*?)#{Regexp.escape(end_marker)}/m)
+      body = region && region[1].match(/\A\n```sql\n(.*)```\n\z/m)
+      return ['rfc_sql_region_invalid'] unless body && !body[1].include?('```')
+      errors = []
+      errors << 'rfc_sql_bytes_mismatch' unless body[1].b == sql.b
+      outside = text.sub(region[0], '')
+      hashes = outside.scan(/^SQL SHA-256：([a-f0-9]{64})$/).flatten
+      unless hashes.length == 1 && outside.scan('SQL SHA-256：').length == 1 && hashes[0] == Digest::SHA256.hexdigest(sql)
+        errors << 'rfc_sql_hash_invalid'
+      end
+      errors
     end
 
     def metadata_errors(metadata)
