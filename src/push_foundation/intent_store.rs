@@ -263,6 +263,26 @@ fn nonterminal_edge_allowed(from: IntentState, to: IntentState, reason: ReasonCo
     )
 }
 
+fn persisted_edge_reason_allowed(from: IntentState, to: IntentState, reason: ReasonCode) -> bool {
+    nonterminal_edge_allowed(from, to, reason)
+        || matches!(
+            (from, to, reason),
+            (
+                IntentState::AwaitingAuthority | IntentState::ResolutionRequired,
+                IntentState::AwaitingFinalizer,
+                ReasonCode::IntentAuthorityVerified
+            ) | (
+                IntentState::AwaitingFinalizer,
+                IntentState::Completed,
+                ReasonCode::FinalizerCompleted
+            ) | (
+                IntentState::AwaitingAuthority | IntentState::ResolutionRequired,
+                IntentState::NotDelivered,
+                ReasonCode::OperatorNotDelivered
+            )
+        )
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InitialIntentIdentity {
     namespace: Namespace,
@@ -471,39 +491,6 @@ impl InitialIntentDraft {
     pub fn intent_id(&self) -> &IntentId {
         &self.intent_id
     }
-
-    fn initial_snapshot(&self) -> IntentSnapshot {
-        IntentSnapshot {
-            intent_id: self.intent_id.as_str().to_owned(),
-            decision_kind: self.decision_kind,
-            namespace: self.namespace.clone(),
-            unit_id: self.unit_id.clone(),
-            occurrence_family: self.occurrence_family.clone(),
-            occurrence_key: self.occurrence_key.clone(),
-            completion_owner: self.completion_owner.clone(),
-            source_contract_id: self.source_contract_id.clone(),
-            subject: self.subject.clone(),
-            audience: self.audience.clone(),
-            durable_decision_id: self.durable_decision_id.clone(),
-            business_date: self.business_date.clone(),
-            prepared_push_bytes: self.prepared_push_bytes.clone(),
-            rendered_bytes: self.rendered_bytes.clone(),
-            payload_sha256: self.payload_sha256.clone(),
-            rendered_sha256: self.rendered_sha256.clone(),
-            evidence_sha256: self.evidence_sha256.clone(),
-            template_sha256: self.template_sha256.clone(),
-            source_contract_sha256: self.source_contract_sha256.clone(),
-            state: self.state,
-            previous_state: None,
-            reason: self.reason,
-            lease_owner: None,
-            lease_until: None,
-            lease_generation: 0,
-            version: 0,
-            created_at: self.created_at,
-            updated_at: self.created_at,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -583,6 +570,29 @@ impl IntentSnapshot {
     }
     pub fn lease_until(&self) -> Option<UtcMicros> {
         self.lease_until
+    }
+
+    fn immutable_matches(&self, draft: &InitialIntentDraft) -> bool {
+        self.intent_id == draft.intent_id.as_str()
+            && self.decision_kind == draft.decision_kind
+            && self.namespace == draft.namespace
+            && self.unit_id == draft.unit_id
+            && self.occurrence_family == draft.occurrence_family
+            && self.occurrence_key == draft.occurrence_key
+            && self.completion_owner == draft.completion_owner
+            && self.source_contract_id == draft.source_contract_id
+            && self.subject == draft.subject
+            && self.audience == draft.audience
+            && self.durable_decision_id == draft.durable_decision_id
+            && self.business_date == draft.business_date
+            && self.prepared_push_bytes == draft.prepared_push_bytes
+            && self.rendered_bytes == draft.rendered_bytes
+            && self.payload_sha256 == draft.payload_sha256
+            && self.rendered_sha256 == draft.rendered_sha256
+            && self.evidence_sha256 == draft.evidence_sha256
+            && self.template_sha256 == draft.template_sha256
+            && self.source_contract_sha256 == draft.source_contract_sha256
+            && self.created_at == draft.created_at
     }
 }
 
@@ -689,8 +699,8 @@ impl TransitionReceipt {
         receipt
     }
 
-    fn matches_command(&self, command: &IntentTransitionCommand) -> bool {
-        self.intent_id == command.intent_id.as_str()
+    fn matches_command(&self, command: &IntentTransitionCommand, current: &IntentSnapshot) -> bool {
+        let event_matches = self.intent_id == command.intent_id.as_str()
             && self.from_state == command.from_state
             && self.to_state == command.to_state
             && self.expected_version == command.expected_version
@@ -703,7 +713,20 @@ impl TransitionReceipt {
             && self.operator_audit_ref.is_none()
             && self.operator_audit_sha256.is_none()
             && self.terminal_ref_id.is_none()
-            && self.terminal_binding_sha256.is_none()
+            && self.terminal_binding_sha256.is_none();
+        if !event_matches || current.version != self.result_version {
+            return event_matches;
+        }
+        match &command.lease_action {
+            LeaseAction::Preserve => true,
+            LeaseAction::Acquire { owner, until } => {
+                current.lease_owner.as_deref() == Some(owner.as_str())
+                    && current.lease_until == Some(*until)
+            }
+            LeaseAction::Release { .. } => {
+                current.lease_owner.is_none() && current.lease_until.is_none()
+            }
+        }
     }
 }
 
@@ -812,7 +835,6 @@ impl BusinessIntentStore {
         draft: &InitialIntentDraft,
         fault: Option<&'static str>,
     ) -> Result<InitialIntentOutcome, IntentStoreError> {
-        let expected = draft.initial_snapshot();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -820,12 +842,14 @@ impl BusinessIntentStore {
                 operation: "begin_initial",
             })?;
         if let Some(existing) = query_intent(&transaction, draft.intent_id.as_str())? {
+            let chain_result = query_transition_chain(&transaction, &existing);
             transaction
                 .rollback()
                 .map_err(|_| IntentStoreError::StorageFailed {
                     operation: "rollback_initial_read",
                 })?;
-            return if existing == expected {
+            chain_result?;
+            return if existing.immutable_matches(draft) {
                 Ok(InitialIntentOutcome::ExistingIdentical(existing))
             } else {
                 Err(IntentStoreError::ImmutableConflict {
@@ -885,11 +909,20 @@ impl BusinessIntentStore {
                 })?;
             return Err(injected_fault("before_initial_commit"));
         }
-        transaction
-            .commit()
-            .map_err(|_| IntentStoreError::StorageFailed {
-                operation: "commit_initial",
-            })?;
+        if transaction.commit().is_err() {
+            return match self.inspect(&draft.intent_id)? {
+                Some(existing) if existing.immutable_matches(draft) => {
+                    query_transition_chain(&self.connection, &existing)?;
+                    Ok(InitialIntentOutcome::ExistingIdentical(existing))
+                }
+                Some(_) => Err(IntentStoreError::ImmutableConflict {
+                    intent_id: draft.intent_id.as_str().to_owned(),
+                }),
+                None => Err(IntentStoreError::StorageFailed {
+                    operation: "commit_initial",
+                }),
+            };
+        }
         if fault == Some("after_initial_commit_ack_lost") {
             return Err(injected_fault("after_initial_commit_ack_lost"));
         }
@@ -899,11 +932,12 @@ impl BusinessIntentStore {
                 .ok_or(IntentStoreError::IntegrityFailed {
                     check: "initial_post_commit_missing",
                 })?;
-        if persisted != expected {
+        if !persisted.immutable_matches(draft) {
             return Err(IntentStoreError::IntegrityFailed {
                 check: "initial_post_commit_mismatch",
             });
         }
+        query_transition_chain(&self.connection, &persisted)?;
         Ok(InitialIntentOutcome::Inserted(persisted))
     }
 
@@ -943,7 +977,8 @@ impl BusinessIntentStore {
             let current = self
                 .inspect(&command.intent_id)?
                 .ok_or(IntentStoreError::IntentMissing)?;
-            return if existing.matches_command(command) {
+            query_transition_chain(&self.connection, &current)?;
+            return if existing.matches_command(command, &current) {
                 Ok(TransitionOutcome::AlreadyCommitted(existing))
             } else {
                 Ok(TransitionOutcome::Conflict { current })
@@ -980,6 +1015,20 @@ impl BusinessIntentStore {
         let previous_sha256 = chain.last().map(|event| event.canonical_sha256.clone());
         let proposed = TransitionReceipt::from_command(command, previous_sha256);
         let (lease_owner, lease_until, lease_generation) = apply_lease_action(&current, command)?;
+        if command.to_state == IntentState::AwaitingAuthority
+            && command.reason == ReasonCode::IntentDispatchClaimed
+            && (lease_owner.is_none()
+                || lease_until.is_none_or(|until| until <= command.occurred_at.get()))
+        {
+            transaction
+                .rollback()
+                .map_err(|_| IntentStoreError::StorageFailed {
+                    operation: "rollback_missing_dispatch_lease",
+                })?;
+            return Err(IntentStoreError::InvalidTransition {
+                check: "dispatch_requires_active_lease",
+            });
+        }
         let affected = transaction
             .execute(
                 "UPDATE push_intents SET \
@@ -1037,7 +1086,11 @@ impl BusinessIntentStore {
         }
         if transaction.commit().is_err() {
             if let Some(existing) = query_transition(&self.connection, event_id.as_str())? {
-                if existing.matches_command(command) {
+                let current = self
+                    .inspect(&command.intent_id)?
+                    .ok_or(IntentStoreError::IntentMissing)?;
+                if existing.matches_command(command, &current) {
+                    query_transition_chain(&self.connection, &current)?;
                     return Ok(TransitionOutcome::AlreadyCommitted(existing));
                 }
             }
@@ -1332,7 +1385,9 @@ fn query_transition(
     let Some(raw) = raw else {
         return Ok(None);
     };
-    validate_transition_text("persisted_transition_actor", raw.8.clone())?;
+    if validate_transition_text("persisted_transition_actor", raw.8.clone()).is_err() {
+        return Err(integrity("persisted_transition_actor"));
+    }
     let receipt = TransitionReceipt {
         event_id: parse_digest("event_id", &raw.0)?,
         intent_id: raw.1,
@@ -1357,6 +1412,7 @@ fn query_transition(
 }
 
 fn verify_transition(receipt: &TransitionReceipt) -> Result<(), IntentStoreError> {
+    parse_digest("transition_intent_id", &receipt.intent_id)?;
     if receipt.result_version != receipt.expected_version + 1 {
         return Err(integrity("transition_version_step"));
     }
@@ -1373,6 +1429,44 @@ fn verify_transition(receipt: &TransitionReceipt) -> Result<(), IntentStoreError
     }
     if transition_canonical_sha256(receipt) != receipt.canonical_sha256 {
         return Err(integrity("transition_canonical_sha256"));
+    }
+    if !persisted_edge_reason_allowed(receipt.from_state, receipt.to_state, receipt.reason) {
+        return Err(integrity("transition_edge_reason"));
+    }
+    let terminal = matches!(
+        receipt.to_state,
+        IntentState::Completed | IntentState::NotDelivered
+    );
+    if terminal != receipt.terminal_ref_id.is_some()
+        || terminal != receipt.terminal_binding_sha256.is_some()
+        || terminal != receipt.terminal_disposition.is_some()
+    {
+        return Err(integrity("transition_terminal_group"));
+    }
+    if receipt.to_state == IntentState::Completed {
+        if !matches!(
+            receipt.terminal_disposition.as_deref(),
+            Some("Accepted" | "ManualConfirmedAccepted")
+        ) || receipt.terminal_decision_id.is_some()
+            || receipt.operator_audit_ref.is_some()
+            || receipt.operator_audit_sha256.is_some()
+        {
+            return Err(integrity("completed_terminal_group"));
+        }
+    } else if receipt.to_state == IntentState::NotDelivered {
+        if receipt.terminal_disposition.as_deref() != Some("ManualConfirmedNotDelivered")
+            || receipt.reason != ReasonCode::OperatorNotDelivered
+            || receipt.terminal_decision_id.is_none()
+            || receipt.operator_audit_ref.is_none()
+            || receipt.operator_audit_sha256.is_none()
+        {
+            return Err(integrity("not_delivered_terminal_group"));
+        }
+    } else if receipt.terminal_decision_id.is_some()
+        || receipt.operator_audit_ref.is_some()
+        || receipt.operator_audit_sha256.is_some()
+    {
+        return Err(integrity("nonterminal_terminal_group"));
     }
     Ok(())
 }
@@ -1412,19 +1506,58 @@ fn query_transition_chain(
             || event.previous_sha256.as_ref() != expected_previous
             || chain
                 .last()
+                .is_some_and(|previous| event.occurred_at < previous.occurred_at)
+            || chain
+                .last()
                 .is_some_and(|previous| previous.to_state != event.from_state)
         {
             return Err(integrity("transition_chain_continuity"));
+        }
+        if event.to_state == IntentState::NotDelivered {
+            let no_authority_acceptance = !chain.iter().any(|previous| {
+                matches!(
+                    previous.to_state,
+                    IntentState::AwaitingFinalizer | IntentState::Completed
+                )
+            });
+            let eligible_origin = event.from_state == IntentState::AwaitingAuthority
+                || (event.from_state == IntentState::ResolutionRequired
+                    && chain
+                        .iter()
+                        .rev()
+                        .find(|previous| {
+                            previous.to_state == IntentState::ResolutionRequired
+                                && previous.from_state != IntentState::ResolutionRequired
+                        })
+                        .is_some_and(|previous| {
+                            previous.from_state == IntentState::AwaitingAuthority
+                                && previous.reason == ReasonCode::TransportUncertain
+                        }));
+            if !no_authority_acceptance || !eligible_origin {
+                return Err(integrity("not_delivered_history"));
+            }
         }
         chain.push(event);
     }
     if chain.len() as u64 != current.version {
         return Err(integrity("intent_version_transition_count"));
     }
+    let initial_state = match current.decision_kind {
+        InitialDecisionKind::Ready => IntentState::PendingDispatch,
+        InitialDecisionKind::NoData => IntentState::NoData,
+        InitialDecisionKind::Disabled => IntentState::Disabled,
+    };
+    if chain
+        .first()
+        .is_some_and(|first| first.from_state != initial_state)
+    {
+        return Err(integrity("transition_chain_initial_state"));
+    }
     if let Some(last) = chain.last() {
         if last.to_state != current.state
             || Some(last.from_state) != current.previous_state
             || last.reason != current.reason
+            || last.occurred_at != current.updated_at
         {
             return Err(integrity("intent_transition_head_binding"));
         }
@@ -1599,6 +1732,30 @@ fn verify_snapshot(snapshot: &IntentSnapshot) -> Result<(), IntentStoreError> {
     }
     if snapshot.updated_at < snapshot.created_at {
         return Err(integrity("intent_time_order"));
+    }
+    if snapshot.lease_owner.is_some() != snapshot.lease_until.is_some() {
+        return Err(integrity("intent_lease_pair"));
+    }
+    if snapshot.lease_generation > snapshot.version {
+        return Err(integrity("intent_lease_generation"));
+    }
+    if snapshot.version == 0 {
+        let (initial_state, initial_reason) = match snapshot.decision_kind {
+            InitialDecisionKind::Ready => (IntentState::PendingDispatch, ReasonCode::IntentCreated),
+            InitialDecisionKind::NoData => (IntentState::NoData, ReasonCode::IntentNoData),
+            InitialDecisionKind::Disabled => (IntentState::Disabled, ReasonCode::PolicyDisabled),
+        };
+        if snapshot.state != initial_state
+            || snapshot.reason != initial_reason
+            || snapshot.previous_state.is_some()
+            || snapshot.lease_owner.is_some()
+            || snapshot.lease_generation != 0
+            || snapshot.updated_at != snapshot.created_at
+        {
+            return Err(integrity("initial_intent_state"));
+        }
+    } else if snapshot.previous_state.is_none() {
+        return Err(integrity("transitioned_previous_state"));
     }
     Ok(())
 }

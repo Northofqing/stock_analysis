@@ -674,6 +674,34 @@ fn w08_transition_versions_and_previous_hash_form_one_exact_chain() {
         first_receipt.event_id().as_str(),
         w08_sha256(event_preimage.as_bytes())
     );
+    let canonical_preimage = format!(
+        concat!(
+            "IntentTransitionV1\0{{",
+            "\"actor\":\"dispatcher-1\",",
+            "\"event_id\":\"{}\",",
+            "\"expected_version\":0,",
+            "\"from_state\":\"PendingDispatch\",",
+            "\"intent_id\":\"{}\",",
+            "\"occurred_at\":1788743100001000,",
+            "\"operator_audit_ref\":null,",
+            "\"operator_audit_sha256\":null,",
+            "\"previous_sha256\":null,",
+            "\"reason\":\"intent.dispatch_claimed\",",
+            "\"result_version\":1,",
+            "\"terminal_binding_sha256\":null,",
+            "\"terminal_decision_id\":null,",
+            "\"terminal_disposition\":null,",
+            "\"terminal_ref_id\":null,",
+            "\"to_state\":\"AwaitingAuthority\"",
+            "}}"
+        ),
+        first_receipt.event_id().as_str(),
+        draft.intent_id().as_str(),
+    );
+    assert_eq!(
+        first_receipt.canonical_sha256().as_str(),
+        w08_sha256(canonical_preimage.as_bytes())
+    );
     assert_eq!(first_receipt.expected_version(), 0);
     assert_eq!(first_receipt.result_version(), 1);
     assert_eq!(first_receipt.previous_sha256(), None);
@@ -829,6 +857,27 @@ fn w08_initial_commit_boundaries_recover_without_duplicate_outbox() {
 }
 
 #[test]
+fn w08_initial_retry_after_transition_compares_only_immutable_material() {
+    let (_root, database) = w08_database();
+    let draft = w08_ready_draft();
+    let mut store = BusinessIntentStore::open(&database).unwrap();
+    store.record_initial(&draft).unwrap();
+    store
+        .apply_nonterminal_transition(&w08_dispatch_claim(&draft))
+        .unwrap();
+
+    let retry = store.record_initial(&draft).unwrap();
+    assert!(matches!(retry, InitialIntentOutcome::ExistingIdentical(_)));
+    assert_eq!(
+        retry.snapshot().state(),
+        super::IntentState::AwaitingAuthority
+    );
+    assert_eq!(retry.snapshot().version(), 1);
+    assert_eq!(store.intent_count().unwrap(), 1);
+    assert_eq!(store.transition_count(draft.intent_id()).unwrap(), 1);
+}
+
+#[test]
 fn w08_schema_keeps_transition_rows_append_only() {
     let (_root, database) = w08_database();
     let draft = w08_ready_draft();
@@ -864,4 +913,178 @@ fn w08_schema_keeps_transition_rows_append_only() {
         .unwrap();
     assert_eq!(exact.0, receipt.actor());
     assert_eq!(exact.1, receipt.canonical_sha256().as_str());
+}
+
+#[test]
+fn w08_dispatch_transition_requires_a_persisted_future_lease() {
+    let (_root, database) = w08_database();
+    let draft = w08_ready_draft();
+    let mut store = BusinessIntentStore::open(&database).unwrap();
+    let original = store.record_initial(&draft).unwrap().snapshot().clone();
+    let without_lease = IntentTransitionCommand::try_new(
+        draft.intent_id().clone(),
+        super::IntentState::PendingDispatch,
+        super::IntentState::AwaitingAuthority,
+        0,
+        w08_actor("dispatcher-1"),
+        crate::monitor::push_job::ReasonCode::IntentDispatchClaimed,
+        UtcMicros::try_new(1_788_743_100_001_000).unwrap(),
+        LeaseAction::Preserve,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        store.apply_nonterminal_transition(&without_lease),
+        Err(IntentStoreError::InvalidTransition {
+            check: "dispatch_requires_active_lease"
+        })
+    ));
+    assert_eq!(store.inspect(draft.intent_id()).unwrap().unwrap(), original);
+    assert_eq!(store.transition_count(draft.intent_id()).unwrap(), 0);
+}
+
+#[test]
+fn w08_existing_head_event_rejects_a_retry_with_different_lease_material() {
+    let (_root, database) = w08_database();
+    let draft = w08_ready_draft();
+    let mut store = BusinessIntentStore::open(&database).unwrap();
+    store.record_initial(&draft).unwrap();
+    let original = w08_dispatch_claim(&draft);
+    store.apply_nonterminal_transition(&original).unwrap();
+    let changed_lease = IntentTransitionCommand::try_new(
+        draft.intent_id().clone(),
+        super::IntentState::PendingDispatch,
+        super::IntentState::AwaitingAuthority,
+        0,
+        w08_actor("dispatcher-1"),
+        crate::monitor::push_job::ReasonCode::IntentDispatchClaimed,
+        UtcMicros::try_new(1_788_743_100_001_000).unwrap(),
+        LeaseAction::Acquire {
+            owner: LeaseOwnerId::try_new("dispatcher-1".to_owned()).unwrap(),
+            until: UtcMicros::try_new(1_788_743_160_000_001).unwrap(),
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(
+        store.apply_nonterminal_transition(&changed_lease).unwrap(),
+        TransitionOutcome::Conflict { .. }
+    ));
+    assert_eq!(store.transition_count(draft.intent_id()).unwrap(), 1);
+}
+
+#[test]
+fn w08_existing_event_fast_path_still_revalidates_the_complete_chain() {
+    let (_root, database) = w08_database();
+    let draft = w08_ready_draft();
+    let mut store = BusinessIntentStore::open(&database).unwrap();
+    store.record_initial(&draft).unwrap();
+    let first_command = w08_dispatch_claim(&draft);
+    store.apply_nonterminal_transition(&first_command).unwrap();
+    let second_command = IntentTransitionCommand::try_new(
+        draft.intent_id().clone(),
+        super::IntentState::AwaitingAuthority,
+        super::IntentState::ResolutionRequired,
+        1,
+        w08_actor("authority-recovery-1"),
+        crate::monitor::push_job::ReasonCode::TransportUncertain,
+        UtcMicros::try_new(1_788_743_100_002_000).unwrap(),
+        LeaseAction::Preserve,
+    )
+    .unwrap();
+    store.apply_nonterminal_transition(&second_command).unwrap();
+
+    let tamper = Connection::open(&database).unwrap();
+    tamper
+        .execute_batch(
+            "DROP TRIGGER push_intents_cas; \
+             UPDATE push_intents SET version=3 WHERE intent_id IN (SELECT intent_id FROM push_intents);",
+        )
+        .unwrap();
+    drop(tamper);
+
+    assert!(matches!(
+        store.record_initial(&draft),
+        Err(IntentStoreError::IntegrityFailed {
+            check: "intent_version_transition_count"
+        })
+    ));
+    assert!(matches!(
+        store.apply_nonterminal_transition(&first_command),
+        Err(IntentStoreError::IntegrityFailed {
+            check: "intent_version_transition_count"
+        })
+    ));
+    assert_eq!(store.transition_count(draft.intent_id()).unwrap(), 2);
+}
+
+#[test]
+fn w08_chain_read_rejects_a_hash_valid_but_semantically_invalid_edge() {
+    let (_root, database) = w08_database();
+    let draft = w08_ready_draft();
+    let mut store = BusinessIntentStore::open(&database).unwrap();
+    store.record_initial(&draft).unwrap();
+    let receipt = store
+        .apply_nonterminal_transition(&w08_dispatch_claim(&draft))
+        .unwrap()
+        .receipt()
+        .unwrap()
+        .clone();
+    let invalid_preimage = format!(
+        concat!(
+            "IntentTransitionV1\0{{",
+            "\"actor\":\"dispatcher-1\",",
+            "\"event_id\":\"{}\",",
+            "\"expected_version\":0,",
+            "\"from_state\":\"PendingDispatch\",",
+            "\"intent_id\":\"{}\",",
+            "\"occurred_at\":1788743100001000,",
+            "\"operator_audit_ref\":null,",
+            "\"operator_audit_sha256\":null,",
+            "\"previous_sha256\":null,",
+            "\"reason\":\"intent.lease_held\",",
+            "\"result_version\":1,",
+            "\"terminal_binding_sha256\":null,",
+            "\"terminal_decision_id\":null,",
+            "\"terminal_disposition\":null,",
+            "\"terminal_ref_id\":null,",
+            "\"to_state\":\"AwaitingAuthority\"",
+            "}}"
+        ),
+        receipt.event_id().as_str(),
+        draft.intent_id().as_str(),
+    );
+    let invalid_sha256 = w08_sha256(invalid_preimage.as_bytes());
+
+    let tamper = Connection::open(&database).unwrap();
+    tamper
+        .execute_batch(
+            "DROP TRIGGER push_intent_transitions_update; \
+             DROP TRIGGER push_intents_cas;",
+        )
+        .unwrap();
+    tamper
+        .execute(
+            "UPDATE push_intent_transitions SET reason=?,canonical_sha256=? WHERE event_id=?",
+            rusqlite::params![
+                "intent.lease_held",
+                invalid_sha256,
+                receipt.event_id().as_str()
+            ],
+        )
+        .unwrap();
+    tamper
+        .execute(
+            "UPDATE push_intents SET reason='intent.lease_held' WHERE intent_id=?",
+            [draft.intent_id().as_str()],
+        )
+        .unwrap();
+    drop(tamper);
+
+    assert!(matches!(
+        store.inspect_transition_chain(draft.intent_id()),
+        Err(IntentStoreError::IntegrityFailed {
+            check: "transition_edge_reason"
+        })
+    ));
 }
