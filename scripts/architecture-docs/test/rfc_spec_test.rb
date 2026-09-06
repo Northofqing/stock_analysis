@@ -53,13 +53,13 @@ class RfcSpecTest < Minitest::Test
     [
       "# ruby scripts/architecture-docs/check.rb --check\njobs: {}\n",
       "description: ruby scripts/architecture-docs/check.rb --check\n",
-      "jobs:\n  docs:\n    steps:\n      - name: ruby scripts/architecture-docs/check.rb --check\n        run: echo skipped\n",
-      "jobs:\n  docs:\n    steps:\n      - run: echo ruby scripts/architecture-docs/check.rb --check\n",
-      "jobs:\n  docs:\n    steps:\n      - run: ruby scripts/architecture-docs/check-rfc.rb --check\n",
-      "jobs:\n  docs:\n    steps:\n      - run: |\n          cat <<'TEXT'\n          ruby scripts/architecture-docs/check.rb --check\n          TEXT\n",
+      "jobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - name: ruby scripts/architecture-docs/check.rb --check\n        run: echo skipped\n",
+      "jobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ruby scripts/architecture-docs/check.rb --check\n",
+      "jobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ruby scripts/architecture-docs/check-rfc.rb --check\n",
+      "jobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          cat <<'TEXT'\n          ruby scripts/architecture-docs/check.rb --check\n          TEXT\n",
       "jobs: [broken\n",
-      "jobs:\n  docs:\n    steps:\n      - uses: actions/checkout@v4\n        run: ruby scripts/architecture-docs/check.rb --check\n",
-      "jobs:\n  docs:\n    steps:\n      - if: false\n        run: ruby scripts/architecture-docs/check.rb --check\n"
+      "jobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        run: ruby scripts/architecture-docs/check.rb --check\n",
+      "jobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - if: false\n        run: ruby scripts/architecture-docs/check.rb --check\n"
     ].each do |workflow|
       with_fixture do |root|
         FileUtils.mkdir_p(File.join(root, '.github/workflows'))
@@ -115,6 +115,31 @@ class RfcSpecTest < Minitest::Test
     end
   end
 
+  {
+    'missing_runner'=>proc { |text| text.sub("    runs-on: ubuntu-latest\n", '') },
+    'expression_runner'=>proc { |text| text.sub('runs-on: ubuntu-latest', "runs-on: '${{ matrix.os }}'") },
+    'unsupported_runner'=>proc { |text| text.sub('runs-on: ubuntu-latest', 'runs-on: self-hosted') },
+    'job_shell'=>proc { |text| text.sub("    steps:\n", "    shell: bash\n    steps:\n") },
+    'job_uses'=>proc { |text| text.sub("    steps:\n", "    uses: other/workflow.yml\n    steps:\n") },
+    'job_env'=>proc { |text| text.sub("    steps:\n", "    env:\n      PATH: /tmp\n    steps:\n") },
+    'workflow_env'=>proc { |text| "env:\n  PATH: /tmp\n" + text },
+    'step_env'=>proc { |text| text + "        env:\n          PATH: /tmp\n" },
+    'step_timeout'=>proc { |text| text + "        timeout-minutes: 0\n" },
+    'job_timeout'=>proc { |text| text.sub("    steps:\n", "    timeout-minutes: 0\n    steps:\n") },
+    'job_container'=>proc { |text| text.sub("    steps:\n", "    container: busybox\n    steps:\n") }
+  }.each do |name, mutation|
+    define_method("test_wave2_narrow_execution_rejects_#{name}") do
+      with_fixture do |root|
+        workflow = "jobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ruby scripts/architecture-docs/check.rb --check\n"
+        changed = mutation.call(workflow)
+        refute_equal workflow, changed
+        FileUtils.mkdir_p(File.join(root, '.github/workflows'))
+        File.write(File.join(root, '.github/workflows/ci.yml'), changed)
+        assert_cli_error(root, 'ci_rfc_gate_missing', '--check')
+      end
+    end
+  end
+
   def test_wave2_ci_execution_accepts_minimal_bash_sh_and_explicit_safe_booleans
     [nil, 'bash', 'sh'].each do |shell|
       with_fixture do |root|
@@ -137,7 +162,7 @@ class RfcSpecTest < Minitest::Test
         path = File.join(root, relative)
         FileUtils.mkdir_p(File.dirname(path))
         saved = path + '.saved'
-        File.write(saved, "jobs:\n  docs:\n    steps:\n      - run: ruby scripts/architecture-docs/check.rb --check\n")
+        File.write(saved, "jobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ruby scripts/architecture-docs/check.rb --check\n")
         File.symlink(saved, path)
         assert_cli_error(root, reason, '--check')
         File.unlink(path)

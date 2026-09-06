@@ -850,10 +850,10 @@ module ArchitectureDocs
       return false unless workflow.is_a?(Hash) && workflow['jobs'].is_a?(Hash)
       # v1 不解析继承 defaults：任何 workflow/job defaults 均需另行扩展合同。
       # 这里只证明保守的本地执行形状，不等于远端 Actions 已运行或通过。
-      return false if workflow.key?('defaults')
+      return false if workflow.key?('defaults') || workflow.key?('env')
       workflow['jobs'].values.any? do |job|
-        ci_execution_options?(job) && job['steps'].is_a?(Array) && job['steps'].any? do |step|
-          ci_execution_options?(step) && !step.key?('uses') && step['run'].is_a?(String) &&
+        ci_gate_job?(job) && job['steps'].any? do |step|
+          ci_gate_step?(step) && step['run'].is_a?(String) &&
             step['run'].strip == 'ruby scripts/architecture-docs/check.rb --check'
         end
       end
@@ -861,12 +861,20 @@ module ArchitectureDocs
       false
     end
 
-    def ci_execution_options?(scope)
+    def ci_gate_job?(job)
+      job.is_a?(Hash) && (job.keys - %w[name runs-on if continue-on-error steps]).empty? &&
+        job['runs-on'] == 'ubuntu-latest' && job['steps'].is_a?(Array) && ci_gate_condition?(job)
+    end
+
+    def ci_gate_step?(step)
+      step.is_a?(Hash) && (step.keys - %w[name id run if continue-on-error shell]).empty? &&
+        (!step.key?('shell') || %w[bash sh].include?(step['shell'])) && ci_gate_condition?(step)
+    end
+
+    def ci_gate_condition?(scope)
       scope.is_a?(Hash) &&
         (!scope.key?('if') || scope['if'].equal?(true)) &&
-        (!scope.key?('continue-on-error') || scope['continue-on-error'].equal?(false)) &&
-        (!scope.key?('shell') || %w[bash sh].include?(scope['shell'])) &&
-        !scope.key?('defaults') && !scope.key?('working-directory')
+        (!scope.key?('continue-on-error') || scope['continue-on-error'].equal?(false))
     end
 
     def content_errors(root)
