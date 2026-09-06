@@ -14,6 +14,30 @@ CHECK_CATALOG = File.expand_path('../check-catalog.rb', __dir__)
 RENDER_CATALOG = File.expand_path('../render-catalog.rb', __dir__)
 
 class CatalogTest < Minitest::Test
+  def test_explicit_check_preserves_strict_default_and_modes_are_exclusive
+    with_fixture do |root|
+      git(root, 'add', '.')
+      git(root, '-c', 'user.name=Catalog Test', '-c', 'user.email=catalog@example.invalid', 'commit', '-qm', 'freeze documents')
+      expected = ['provisional path=docs/push-system/push-capability-catalog.v1.json',
+                  'provisional path=docs/push-system/push-evidence-manifest.v1.json']
+      out, err, result = cli(root, '--check')
+      assert_equal 1, result.exitstatus, out + err
+      assert_equal expected, out.lines.map(&:strip).reject { |line| line.start_with?('NOT CHECKED') }
+      assert_empty err
+      legacy, legacy_err, legacy_result = Open3.capture3(RbConfig.ruby, CHECK_CATALOG, '--root', root)
+      assert_equal out, legacy
+      assert_equal result.exitstatus, legacy_result.exitstatus
+      assert_empty legacy_err
+      [%w[--draft --check], %w[--check --draft], %w[--draft --draft],
+       %w[--check --check], %w[--unknown], %w[--check extra]].each do |options|
+        out, err, result = cli(root, *options)
+        assert_equal 2, result.exitstatus, out + err
+        assert_empty out
+        assert_includes err, 'Usage: check-catalog.rb'
+      end
+    end
+  end
+
   def test_draft_accepts_a_valid_isolated_git_fixture
     with_fixture do |root|
       out, err, result = cli(root)

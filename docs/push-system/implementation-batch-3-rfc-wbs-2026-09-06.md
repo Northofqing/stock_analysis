@@ -210,6 +210,12 @@ Git 历史和当前纳管文档只保留“旧 W01--W21 合计 98--142 小时”
 - 新增：`docs/push-system/implementation-batch-3-results-2026-09-06.md`
 - 修改：`docs/push-system/README.md`
 - 修改：`docs/push-system/implementation-batch-3-rfc-wbs-2026-09-06.md`
+- 修改：`scripts/architecture-docs/rfc_spec.rb`
+- 修改：`scripts/architecture-docs/test/rfc_spec_test.rb`
+- 修改：`scripts/architecture-docs/check-catalog.rb`
+- 修改：`scripts/architecture-docs/test/catalog_test.rb`
+
+补列四个 checker/test 路径以闭合本任务既有的 strict 原因码与显式 `check-catalog --check` 验收。先提交最小门禁及测试，从该干净 HEAD fresh 验证后提交交接候选；独立整批审查由 Controller 执行，通过后才更新最终勾选并提交最终完成记录。
 
 - [ ] 从干净 HEAD fresh 运行所有 `scripts/architecture-docs/test/*_test.rb`；记录 test/assertion 数和退出码，不引用旧输出。
 - [ ] fresh 运行 `check-rfc-inputs`、`check-sources`、`check-catalog --draft`、`check-rfc --draft`、`render-catalog --check`、`render-wbs --check`；内容门禁全部通过。

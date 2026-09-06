@@ -17,6 +17,84 @@ class RfcSpecTest < Minitest::Test
   DEPENDENCIES = %w[rfc-input-manifest.v1.json push-capability-catalog.v1.json
                     push-evidence-manifest.v1.json grill-decisions-2026-09-02.md].freeze
 
+  def test_strict_reports_exact_release_blockers_and_preserves_content_errors
+    with_fixture do |root|
+      expected = %w[rfc_status_provisional wbs_status_provisional rfc_html_missing ci_rfc_gate_missing]
+      out, err, result = Open3.capture3(RbConfig.ruby, CLI, '--root', root, '--check')
+      assert_equal 1, result.exitstatus, out + err
+      assert_equal expected, out.lines.map(&:strip)
+      assert_empty err
+      change_metadata(root) { |m| m['counts']['kinds'] = 64 }
+      out, err, result = Open3.capture3(RbConfig.ruby, CLI, '--root', root, '--check')
+      assert_equal 1, result.exitstatus, out + err
+      assert_equal ['rfc_counts_invalid'] + expected, out.lines.map(&:strip)
+      assert_empty err
+    end
+  end
+
+  def test_strict_release_artifacts_accept_regular_html_and_a_real_ci_run_step
+    with_fixture do |root|
+      File.write(File.join(root, 'docs/push-system/push-system-implementation-rfc.html'), '<html></html>')
+      FileUtils.mkdir_p(File.join(root, '.github/workflows'))
+      File.write(File.join(root, '.github/workflows/ci.yml'), "jobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          ruby scripts/architecture-docs/check.rb --check\n")
+      2.times do
+        out, err, result = Open3.capture3(RbConfig.ruby, CLI, '--root', root, '--check')
+        assert_equal 1, result.exitstatus, out + err
+        assert_equal %w[rfc_status_provisional wbs_status_provisional], out.lines.map(&:strip)
+        assert_empty err
+      end
+      out, err, result = Open3.capture3(RbConfig.ruby, CLI, '--root', root, '--draft')
+      assert_equal 0, result.exitstatus, out + err
+      assert_equal "rfc_spec_valid\n", out
+    end
+  end
+
+  def test_strict_ci_rejects_comments_prose_other_commands_and_invalid_yaml
+    [
+      "# ruby scripts/architecture-docs/check.rb --check\njobs: {}\n",
+      "description: ruby scripts/architecture-docs/check.rb --check\n",
+      "jobs:\n  docs:\n    steps:\n      - name: ruby scripts/architecture-docs/check.rb --check\n        run: echo skipped\n",
+      "jobs:\n  docs:\n    steps:\n      - run: echo ruby scripts/architecture-docs/check.rb --check\n",
+      "jobs:\n  docs:\n    steps:\n      - run: ruby scripts/architecture-docs/check-rfc.rb --check\n",
+      "jobs:\n  docs:\n    steps:\n      - run: |\n          cat <<'TEXT'\n          ruby scripts/architecture-docs/check.rb --check\n          TEXT\n",
+      "jobs: [broken\n",
+      "jobs:\n  docs:\n    steps:\n      - uses: actions/checkout@v4\n        run: ruby scripts/architecture-docs/check.rb --check\n",
+      "jobs:\n  docs:\n    steps:\n      - if: false\n        run: ruby scripts/architecture-docs/check.rb --check\n"
+    ].each do |workflow|
+      with_fixture do |root|
+        FileUtils.mkdir_p(File.join(root, '.github/workflows'))
+        File.write(File.join(root, '.github/workflows/ci.yml'), workflow)
+        assert_cli_error(root, 'ci_rfc_gate_missing', '--check')
+      end
+    end
+  end
+
+  def test_strict_release_artifacts_reject_directories_and_symlink_paths
+    {'docs/push-system/push-system-implementation-rfc.html' => 'rfc_html_missing',
+     '.github/workflows/ci.yml' => 'ci_rfc_gate_missing'}.each do |relative, reason|
+      with_fixture do |root|
+        path = File.join(root, relative)
+        FileUtils.mkdir_p(File.dirname(path))
+        saved = path + '.saved'
+        File.write(saved, "jobs:\n  docs:\n    steps:\n      - run: ruby scripts/architecture-docs/check.rb --check\n")
+        File.symlink(saved, path)
+        assert_cli_error(root, reason, '--check')
+        File.unlink(path)
+        File.symlink(path + '.missing', path)
+        assert_cli_error(root, reason, '--check')
+        File.unlink(path)
+        Dir.mkdir(path)
+        assert_cli_error(root, reason, '--check')
+        Dir.rmdir(path)
+        File.rename(saved, path)
+        parent = File.dirname(path)
+        File.rename(parent, parent + '.saved')
+        File.symlink(parent + '.saved', parent)
+        assert_cli_error(root, reason, '--check')
+      end
+    end
+  end
+
   def test_public_cli_accepts_the_frozen_domain_contract_in_draft
     out, err, result = Open3.capture3(RbConfig.ruby, CLI, '--root', ROOT, '--draft')
     assert_equal 0, result.exitstatus, out + err

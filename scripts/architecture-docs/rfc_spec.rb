@@ -3,6 +3,7 @@
 require 'json'
 require 'digest'
 require 'pathname'
+require 'yaml'
 require_relative 'rfc_inputs'
 require_relative 'wbs'
 
@@ -766,6 +767,38 @@ module ArchitectureDocs
     module_function
 
     def validate(root, strict: false)
+      errors = content_errors(root)
+      if strict && File.directory?(root)
+        root = File.realpath(root)
+        errors.concat(%w[rfc_status_provisional wbs_status_provisional])
+        errors << 'rfc_html_missing' unless release_document(root, 'docs/push-system/push-system-implementation-rfc.html')
+        errors << 'ci_rfc_gate_missing' unless ci_rfc_gate?(root)
+      end
+      errors.uniq
+    end
+
+    def release_document(root, path)
+      read_document(root, path)
+    rescue Invalid, SystemCallError, ArgumentError
+      nil
+    end
+
+    def ci_rfc_gate?(root)
+      bytes = release_document(root, '.github/workflows/ci.yml')
+      return false unless bytes
+      workflow = YAML.safe_load(bytes)
+      return false unless workflow.is_a?(Hash) && workflow['jobs'].is_a?(Hash)
+      workflow['jobs'].values.any? do |job|
+        job.is_a?(Hash) && job['if'] != false && job['steps'].is_a?(Array) && job['steps'].any? do |step|
+          step.is_a?(Hash) && !step.key?('uses') && step['if'] != false && step['run'].is_a?(String) &&
+            step['run'].strip == 'ruby scripts/architecture-docs/check.rb --check'
+        end
+      end
+    rescue Psych::Exception, ArgumentError
+      false
+    end
+
+    def content_errors(root)
       root = File.expand_path(root)
       return ['rfc_root_missing'] unless File.exist?(root)
       return ['rfc_root_invalid'] unless File.directory?(root)
@@ -795,8 +828,6 @@ module ArchitectureDocs
       errors.concat(contract_errors(text, catalog, evidence, documents['decisions_sha256']))
       errors.concat(sql_errors(root, text))
       errors.concat(Wbs.validate(root))
-      errors << 'rfc_status_provisional' if strict
-      errors << 'wbs_status_provisional' if strict
       errors.uniq
     rescue Invalid => error
       [error.message]
