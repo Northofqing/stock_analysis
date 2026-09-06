@@ -191,6 +191,51 @@ class CatalogTest < Minitest::Test
     end
   end
 
+  def test_impl_item_locator_rejects_return_position_opaque_types
+    [
+      ["fn factory() -> impl std::fmt::Debug { 42 }\n", 'std::fmt::Debug', 1],
+      ["trait Foo {}\nimpl Foo for () {}\nfn make() -> impl Foo { () }\n", 'Foo', 3]
+    ].each do |source, symbol, line|
+      with_fixture do |root|
+        add_code_evidence(root, source, symbol, 'rust_impl', line, line)
+        out, err, result = cli(root)
+        assert_equal 1, result.exitstatus, out + err
+        assert_includes out + err, "symbol_missing symbol=#{symbol}"
+      end
+    end
+  end
+
+  def test_impl_item_locator_rejects_raw_identifiers_and_type_or_expression_positions
+    [
+      ["fn build() { let _ = r#impl::Foo {}; }\n", '::Foo'],
+      ["type Alias = impl std::fmt::Debug;\n", 'std::fmt::Debug'],
+      ["fn consume(value: impl std::fmt::Debug) {}\n", 'std::fmt::Debug'],
+      ["fn build() { invoke!(impl Foo {}); }\n", 'Foo']
+    ].each do |source, symbol|
+      with_fixture do |root|
+        add_code_evidence(root, source, symbol, 'rust_impl', 1, 1)
+        out, err, result = cli(root)
+        assert_equal 1, result.exitstatus, out + err
+        assert_includes out + err, "symbol_missing symbol=#{symbol}"
+      end
+    end
+  end
+
+  def test_impl_item_locator_accepts_item_boundaries_and_balanced_attributes
+    [
+      ["struct Foo; impl Foo {}\n", 'Foo'],
+      ["struct Foo {} impl Foo {}\n", 'Foo'],
+      ["mod nested { #[cfg(all())] #[doc = r#\" ] impl Fake {} \"#] unsafe impl<T> Trait for Foo<T> where T: Send {} }\n", '<T> Trait for Foo<T> where T: Send'],
+      ["#[cfg_attr(feature = \"x\", custom([one, two]))] impl Foo {}\n", 'Foo']
+    ].each do |source, symbol|
+      with_fixture do |root|
+        add_code_evidence(root, source, symbol, 'rust_impl', 1, 1)
+        out, err, result = cli(root)
+        assert_equal 0, result.exitstatus, out + err
+      end
+    end
+  end
+
   def test_strict_dirty_and_provisional_never_hide_actual_drift
     with_fixture do |root|
       out, err, result = Open3.capture3(RbConfig.ruby, CHECK_CATALOG, '--root', root)

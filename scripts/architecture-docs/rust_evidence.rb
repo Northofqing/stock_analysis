@@ -75,6 +75,7 @@ module ArchitectureDocs
         masked.to_enum(:scan, /\bimpl\b/n).each do
           declaration = Regexp.last_match
           offset = masked.index('impl', declaration.begin(0))
+          next unless impl_item_boundary?(masked, offset)
           opening = body_opening(masked, offset)
           next unless opening
           header = masked.byteslice(offset + 4, opening - offset - 4).split.join(' ')
@@ -119,6 +120,32 @@ module ArchitectureDocs
 
       identifier = symbol.dup.force_encoding(Encoding::UTF_8)
       identifier.valid_encoding? && identifier.match?(/\A(?:r#)?[_\p{XID_Start}][\p{XID_Continue}]*\z/)
+    end
+
+    def impl_item_boundary?(masked, offset)
+      # A return/type-position `impl Trait` or `r#impl` is not an impl item.
+      # Work only on masked bytes so comment/string punctuation cannot supply
+      # a boundary. Outer attributes may contain nested bracket token trees.
+      prefix = masked.byteslice(0, offset).rstrip
+      prefix = prefix.sub(/\bunsafe\z/n, '').rstrip
+      while prefix.end_with?(']')
+        depth = 1
+        cursor = prefix.bytesize - 2
+        while cursor >= 0 && depth > 0
+          depth += 1 if prefix.getbyte(cursor) == 93
+          depth -= 1 if prefix.getbyte(cursor) == 91
+          cursor -= 1
+        end
+        return false unless depth.zero?
+
+        # cursor is just before the matching '['; require an attribute marker,
+        # not an arbitrary preceding array/index expression.
+        cursor -= 1 if cursor >= 0 && prefix.getbyte(cursor) == 33
+        return false unless cursor >= 0 && prefix.getbyte(cursor) == 35
+
+        prefix = prefix.byteslice(0, cursor).rstrip
+      end
+      prefix.empty? || [59, 123, 125].include?(prefix.getbyte(prefix.bytesize - 1))
     end
 
     def body_opening(masked, offset)
