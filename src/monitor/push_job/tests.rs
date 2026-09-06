@@ -2209,3 +2209,117 @@ fn w05_no_data_ready_and_suppressed_cannot_cross_fact_boundaries() {
         })
     ));
 }
+
+#[test]
+fn w06_bundled_catalog_has_exact_authority_header_counts_and_statuses() {
+    let catalog = super::MachineCatalog::bundled().expect("bundled catalog must be valid");
+
+    assert_eq!(catalog.schema_version(), 1);
+    assert_eq!(catalog.status(), super::MachineCatalogStatus::Provisional);
+    assert_eq!(
+        catalog.baseline_commit().as_str(),
+        "07781bf386aafdf202851ae928efee8920387058"
+    );
+    assert_eq!(catalog.enum_evidence_id(), "push-kind");
+    assert_eq!(
+        catalog.catalog_sha256().as_str(),
+        "0aa6a2fd87ee9c235073cad3beef44229437f3fe62987b0db510ad36a93aace3"
+    );
+    assert_eq!(catalog.kinds().len(), 65);
+    assert_eq!(catalog.producers().len(), 102);
+    assert_eq!(catalog.units().len(), 52);
+
+    for kind in super::MonitorKind::ALL {
+        assert_eq!(
+            catalog
+                .kind(kind)
+                .expect("all enum kinds registered")
+                .kind(),
+            kind
+        );
+    }
+
+    let status_count = |status| {
+        catalog
+            .kinds()
+            .iter()
+            .filter(|entry| entry.status() == status)
+            .count()
+    };
+    assert_eq!(status_count(super::CatalogStatus::Active), 36);
+    assert_eq!(status_count(super::CatalogStatus::Inactive), 22);
+    assert_eq!(status_count(super::CatalogStatus::Starved), 5);
+    assert_eq!(status_count(super::CatalogStatus::OptIn), 2);
+}
+
+#[test]
+fn w06_catalog_queries_preserve_enum_and_external_producer_registrations() {
+    let catalog = super::MachineCatalog::bundled().unwrap();
+    let enum_bound = catalog
+        .producers()
+        .iter()
+        .filter(|producer| producer.monitor_kind().is_some())
+        .count();
+    let external = catalog.enum_external_producers().collect::<Vec<_>>();
+    assert_eq!(enum_bound, 92);
+    assert_eq!(external.len(), 10);
+    assert!(external
+        .iter()
+        .all(|producer| producer.monitor_kind().is_none()));
+    assert_eq!(
+        external
+            .iter()
+            .map(|producer| producer.id().as_str())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            "chain-post-close-timer",
+            "chain-preopen-timer",
+            "cli-chain",
+            "cli-replay-force",
+            "cli-single-default",
+            "cli-single-lhb",
+            "cli-single-schedule",
+            "cli-summary-default",
+            "cli-summary-lhb",
+            "cli-summary-schedule",
+        ])
+    );
+
+    let p01_id = ProducerId::try_new("p01-scheduled".to_owned()).unwrap();
+    let p01 = catalog.producer(&p01_id).expect("P01 producer registered");
+    assert_eq!(p01.monitor_kind(), Some(super::MonitorKind::PreopenNewsHot));
+    assert_eq!(p01.phase_epics(), &[super::PhaseEpic::Preopen]);
+    assert_eq!(p01.occurrence_family().as_str(), "p01:{business_date}");
+    assert_eq!(p01.unit_id().as_str(), "MU-p01");
+    assert_eq!(
+        catalog.unit_for_producer(&p01_id).unwrap().id().as_str(),
+        "MU-p01"
+    );
+    assert_eq!(
+        catalog
+            .producers_for_kind(super::MonitorKind::PreopenNewsHot)
+            .iter()
+            .filter(|producer| producer.id() == &p01_id)
+            .count(),
+        1
+    );
+
+    let external_id = ProducerId::try_new("chain-preopen-timer".to_owned()).unwrap();
+    let chain = catalog
+        .producer(&external_id)
+        .expect("enum-external chain timer remains registered");
+    assert_eq!(chain.monitor_kind(), None);
+    assert_eq!(chain.phase_epics(), &[super::PhaseEpic::Preopen]);
+    assert_eq!(
+        chain.occurrence_family().as_str(),
+        "calendar date / 09:05≤t<09:15 / latest completed business date"
+    );
+    assert_eq!(
+        chain.completion_owner().as_str(),
+        "monitor_loop::CHAIN_PREOPEN_LAST[calendar_date]"
+    );
+    assert_eq!(chain.unit_id().as_str(), "MU-chain-preopen");
+    let chain_unit = catalog.unit_for_producer(&external_id).unwrap();
+    assert_eq!(chain_unit.id().as_str(), "MU-chain-preopen");
+    assert_eq!(catalog.producers_for_unit(chain_unit.id()), vec![chain]);
+}
