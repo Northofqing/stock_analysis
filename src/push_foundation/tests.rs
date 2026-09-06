@@ -9,8 +9,10 @@ use crate::monitor::push_job::{
 };
 
 use super::{
-    BusinessIntentStore, FoundationMigrationError, FoundationSchemaMigration, InitialDecisionKind,
-    InitialIntentDraft, InitialIntentIdentity, InitialIntentOutcome, IntentStoreError,
+    BusinessIntentStore, FoundationMigrationError, FoundationSchemaMigration, InitialCommitFault,
+    InitialDecisionKind, InitialIntentDraft, InitialIntentIdentity, InitialIntentOutcome,
+    IntentStoreError, IntentTransitionCommand, LeaseAction, LeaseOwnerId, TransitionActor,
+    TransitionFault, TransitionOutcome,
 };
 
 #[test]
@@ -613,4 +615,253 @@ fn w08_initial_retry_is_idempotent_and_immutable_drift_never_overwrites() {
     ));
     assert_eq!(store.inspect(draft.intent_id()).unwrap().unwrap(), original);
     assert_eq!(store.intent_count().unwrap(), 1);
+}
+
+fn w08_ready_draft() -> InitialIntentDraft {
+    InitialIntentDraft::ready(
+        w08_identity("000001.SZ"),
+        &crate::monitor::push_job::w08_prepared_push_fixture(),
+        w08_digest('e'),
+        w08_digest('f'),
+        UtcMicros::try_new(1_788_743_100_000_000).unwrap(),
+    )
+    .unwrap()
+}
+
+fn w08_actor(value: &str) -> TransitionActor {
+    TransitionActor::try_new(value.to_owned()).unwrap()
+}
+
+fn w08_dispatch_claim(draft: &InitialIntentDraft) -> IntentTransitionCommand {
+    IntentTransitionCommand::try_new(
+        draft.intent_id().clone(),
+        super::IntentState::PendingDispatch,
+        super::IntentState::AwaitingAuthority,
+        0,
+        w08_actor("dispatcher-1"),
+        crate::monitor::push_job::ReasonCode::IntentDispatchClaimed,
+        UtcMicros::try_new(1_788_743_100_001_000).unwrap(),
+        LeaseAction::Acquire {
+            owner: LeaseOwnerId::try_new("dispatcher-1".to_owned()).unwrap(),
+            until: UtcMicros::try_new(1_788_743_160_000_000).unwrap(),
+        },
+    )
+    .unwrap()
+}
+
+fn w08_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    hex::encode(Sha256::digest(bytes))
+}
+
+#[test]
+fn w08_transition_versions_and_previous_hash_form_one_exact_chain() {
+    let (_root, database) = w08_database();
+    let draft = w08_ready_draft();
+    let mut store = BusinessIntentStore::open(&database).unwrap();
+    store.record_initial(&draft).unwrap();
+
+    let first_command = w08_dispatch_claim(&draft);
+    let first = store.apply_nonterminal_transition(&first_command).unwrap();
+    let first_receipt = first.receipt().expect("first transition receipt").clone();
+    assert!(matches!(first, TransitionOutcome::Applied(_)));
+    let event_preimage = format!(
+        "IntentTransitionV1\0{{\"expected_version\":0,\"intent_id\":\"{}\",\"result_version\":1}}",
+        draft.intent_id().as_str()
+    );
+    assert_eq!(
+        first_receipt.event_id().as_str(),
+        w08_sha256(event_preimage.as_bytes())
+    );
+    assert_eq!(first_receipt.expected_version(), 0);
+    assert_eq!(first_receipt.result_version(), 1);
+    assert_eq!(first_receipt.previous_sha256(), None);
+
+    let second_command = IntentTransitionCommand::try_new(
+        draft.intent_id().clone(),
+        super::IntentState::AwaitingAuthority,
+        super::IntentState::ResolutionRequired,
+        1,
+        w08_actor("authority-recovery-1"),
+        crate::monitor::push_job::ReasonCode::TransportUncertain,
+        UtcMicros::try_new(1_788_743_100_002_000).unwrap(),
+        LeaseAction::Preserve,
+    )
+    .unwrap();
+    let second = store.apply_nonterminal_transition(&second_command).unwrap();
+    let second_receipt = second.receipt().unwrap().clone();
+    assert_eq!(second_receipt.expected_version(), 1);
+    assert_eq!(second_receipt.result_version(), 2);
+    assert_eq!(
+        second_receipt.previous_sha256(),
+        Some(first_receipt.canonical_sha256())
+    );
+
+    let third_command = IntentTransitionCommand::try_new(
+        draft.intent_id().clone(),
+        super::IntentState::ResolutionRequired,
+        super::IntentState::ResolutionRequired,
+        2,
+        w08_actor("reconciler-1"),
+        crate::monitor::push_job::ReasonCode::IntentLeaseHeld,
+        UtcMicros::try_new(1_788_743_100_003_000).unwrap(),
+        LeaseAction::Preserve,
+    )
+    .unwrap();
+    let third = store.apply_nonterminal_transition(&third_command).unwrap();
+    let third_receipt = third.receipt().unwrap().clone();
+    assert_eq!(third_receipt.result_version(), 3);
+    assert_eq!(
+        third_receipt.previous_sha256(),
+        Some(second_receipt.canonical_sha256())
+    );
+
+    let chain = store.inspect_transition_chain(draft.intent_id()).unwrap();
+    assert_eq!(chain, vec![first_receipt, second_receipt, third_receipt]);
+    let current = store.inspect(draft.intent_id()).unwrap().unwrap();
+    assert_eq!(current.version(), 3);
+    assert_eq!(current.state(), super::IntentState::ResolutionRequired);
+    assert_eq!(
+        current.previous_state(),
+        Some(super::IntentState::ResolutionRequired)
+    );
+    assert_eq!(current.lease_owner(), Some("dispatcher-1"));
+}
+
+#[test]
+fn w08_stale_or_competing_transition_is_zero_write_and_preserves_winner() {
+    let (_root, database) = w08_database();
+    let draft = w08_ready_draft();
+    let mut store = BusinessIntentStore::open(&database).unwrap();
+    store.record_initial(&draft).unwrap();
+    let winner = w08_dispatch_claim(&draft);
+    let winner_receipt = store
+        .apply_nonterminal_transition(&winner)
+        .unwrap()
+        .receipt()
+        .unwrap()
+        .clone();
+    let competing = IntentTransitionCommand::try_new(
+        draft.intent_id().clone(),
+        super::IntentState::PendingDispatch,
+        super::IntentState::NoData,
+        0,
+        w08_actor("producer-2"),
+        crate::monitor::push_job::ReasonCode::IntentNoData,
+        UtcMicros::try_new(1_788_743_100_001_001).unwrap(),
+        LeaseAction::Preserve,
+    )
+    .unwrap();
+
+    let outcome = store.apply_nonterminal_transition(&competing).unwrap();
+    assert!(matches!(outcome, TransitionOutcome::Conflict { .. }));
+    assert_eq!(store.transition_count(draft.intent_id()).unwrap(), 1);
+    assert_eq!(
+        store.inspect_transition_chain(draft.intent_id()).unwrap(),
+        vec![winner_receipt]
+    );
+    let current = store.inspect(draft.intent_id()).unwrap().unwrap();
+    assert_eq!(current.state(), super::IntentState::AwaitingAuthority);
+    assert!(current.prepared_push_bytes().is_some());
+}
+
+#[test]
+fn w08_transaction_faults_before_commit_roll_back_cas_and_append_together() {
+    for fault in [TransitionFault::AfterCas, TransitionFault::AfterAppend] {
+        let (_root, database) = w08_database();
+        let draft = w08_ready_draft();
+        let mut store = BusinessIntentStore::open(&database).unwrap();
+        let original = store.record_initial(&draft).unwrap().snapshot().clone();
+        let command = w08_dispatch_claim(&draft);
+
+        assert!(matches!(
+            store.apply_nonterminal_transition_with_fault(&command, fault),
+            Err(IntentStoreError::InjectedFault { .. })
+        ));
+        assert_eq!(store.inspect(draft.intent_id()).unwrap().unwrap(), original);
+        assert_eq!(store.transition_count(draft.intent_id()).unwrap(), 0);
+    }
+}
+
+#[test]
+fn w08_commit_ack_loss_is_recovered_by_exact_event_without_second_write() {
+    let (_root, database) = w08_database();
+    let draft = w08_ready_draft();
+    let mut store = BusinessIntentStore::open(&database).unwrap();
+    store.record_initial(&draft).unwrap();
+    let command = w08_dispatch_claim(&draft);
+
+    assert!(matches!(
+        store
+            .apply_nonterminal_transition_with_fault(&command, TransitionFault::AfterCommitAckLost),
+        Err(IntentStoreError::InjectedFault { .. })
+    ));
+    assert_eq!(store.transition_count(draft.intent_id()).unwrap(), 1);
+    let retry = store.apply_nonterminal_transition(&command).unwrap();
+    assert!(matches!(retry, TransitionOutcome::AlreadyCommitted(_)));
+    assert_eq!(store.transition_count(draft.intent_id()).unwrap(), 1);
+    assert_eq!(
+        store.inspect(draft.intent_id()).unwrap().unwrap().version(),
+        1
+    );
+}
+
+#[test]
+fn w08_initial_commit_boundaries_recover_without_duplicate_outbox() {
+    let (_root, database) = w08_database();
+    let draft = w08_ready_draft();
+    let mut store = BusinessIntentStore::open(&database).unwrap();
+    assert!(matches!(
+        store.record_initial_with_fault(&draft, InitialCommitFault::BeforeCommit),
+        Err(IntentStoreError::InjectedFault { .. })
+    ));
+    assert_eq!(store.intent_count().unwrap(), 0);
+
+    assert!(matches!(
+        store.record_initial_with_fault(&draft, InitialCommitFault::AfterCommitAckLost),
+        Err(IntentStoreError::InjectedFault { .. })
+    ));
+    assert_eq!(store.intent_count().unwrap(), 1);
+    let retry = store.record_initial(&draft).unwrap();
+    assert!(matches!(retry, InitialIntentOutcome::ExistingIdentical(_)));
+    assert_eq!(store.intent_count().unwrap(), 1);
+}
+
+#[test]
+fn w08_schema_keeps_transition_rows_append_only() {
+    let (_root, database) = w08_database();
+    let draft = w08_ready_draft();
+    let mut store = BusinessIntentStore::open(&database).unwrap();
+    store.record_initial(&draft).unwrap();
+    let receipt = store
+        .apply_nonterminal_transition(&w08_dispatch_claim(&draft))
+        .unwrap()
+        .receipt()
+        .unwrap()
+        .clone();
+    drop(store);
+
+    let connection = Connection::open(&database).unwrap();
+    assert!(connection
+        .execute(
+            "UPDATE push_intent_transitions SET actor='tampered' WHERE event_id=?",
+            [receipt.event_id().as_str()],
+        )
+        .is_err());
+    assert!(connection
+        .execute(
+            "DELETE FROM push_intent_transitions WHERE event_id=?",
+            [receipt.event_id().as_str()],
+        )
+        .is_err());
+    let exact: (String, String) = connection
+        .query_row(
+            "SELECT actor,canonical_sha256 FROM push_intent_transitions WHERE event_id=?",
+            [receipt.event_id().as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(exact.0, receipt.actor());
+    assert_eq!(exact.1, receipt.canonical_sha256().as_str());
 }
