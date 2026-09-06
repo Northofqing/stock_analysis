@@ -1516,6 +1516,56 @@ fn w05_semantic_input() -> super::SemanticInput {
 }
 
 #[test]
+fn w08_prepared_push_snapshot_is_exact_and_hash_bound() {
+    let push = super::w08_prepared_push_fixture();
+    let snapshot = push.canonical_snapshot_bytes();
+    let expected = format!(
+        concat!(
+            "PreparedPush/v1\0{{",
+            "\"decision_id\":\"{}\",",
+            "\"intent_id\":\"{}\",",
+            "\"occurrence\":\"{}\",",
+            "\"prepared_facts_sha256\":\"{}\",",
+            "\"rendered_bytes\":{{\"length\":24,\"sha256\":\"{}\"}},",
+            "\"rendered_sha256\":\"{}\",",
+            "\"run_context_sha256\":\"{}\",",
+            "\"semantic_projection_sha256\":\"{}\",",
+            "\"source_binding\":{{",
+            "\"evidence_fingerprint\":\"{}\",",
+            "\"source_contract_id\":\"auction-source\",",
+            "\"source_contract_version\":\"auction-source-v2\",",
+            "\"source_refs\":[{{",
+            "\"content_sha256\":\"{}\",",
+            "\"external_id\":\"external-1\",",
+            "\"provider\":\"fixture-provider\",",
+            "\"source_contract_id\":\"auction-source\",",
+            "\"source_ref_id\":\"source-1\"",
+            "}}]}},",
+            "\"subject\":{{\"kind\":\"Entity\",\"value\":\"000001.SZ\"}},",
+            "\"unit_id\":\"MU-auction\"",
+            "}}"
+        ),
+        push.decision_id().as_str(),
+        push.intent_id().as_str(),
+        push.occurrence().as_str(),
+        push.prepared_facts_sha256().as_str(),
+        push.rendered_sha256().as_str(),
+        push.rendered_sha256().as_str(),
+        push.run_context_sha256().as_str(),
+        push.semantic_projection_sha256().as_str(),
+        push.source_binding().evidence_fingerprint().as_str(),
+        "a".repeat(64),
+    );
+
+    assert_eq!(snapshot.as_bytes(), expected.as_bytes());
+    assert_eq!(snapshot.sha256().as_str().len(), 64);
+    assert!(!snapshot
+        .as_bytes()
+        .windows(24)
+        .any(|bytes| { bytes == b"first render  \nline two" }));
+}
+
+#[test]
 fn w05_monitor_kind_is_the_exact_catalog_closed_set() {
     use std::collections::BTreeSet;
 

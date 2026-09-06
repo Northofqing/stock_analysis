@@ -2,7 +2,16 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
-use super::{FoundationMigrationError, FoundationSchemaMigration};
+use crate::monitor::push_job::{
+    AudienceId, BusinessDate, CompletionOwnerId, Namespace, OccurrenceFamily,
+    OccurrenceIdentityMaterial, OccurrenceKey, Sha256Digest, SourceContractId, SubjectId, UnitId,
+    UtcMicros,
+};
+
+use super::{
+    BusinessIntentStore, FoundationMigrationError, FoundationSchemaMigration, InitialDecisionKind,
+    InitialIntentDraft, InitialIntentIdentity, InitialIntentOutcome, IntentStoreError,
+};
 
 #[test]
 fn w07_bundled_migration_has_exact_authority_metadata() {
@@ -452,4 +461,156 @@ fn w07_migration_rejects_symbolic_link_parent_directory() {
         Err(FoundationMigrationError::DatabaseParentSymlink)
     ));
     assert!(!real_parent.path().join("business.sqlite3").exists());
+}
+
+fn w08_digest(byte: char) -> Sha256Digest {
+    Sha256Digest::parse("w08 fixture", &byte.to_string().repeat(64)).unwrap()
+}
+
+fn w08_identity(subject: &str) -> InitialIntentIdentity {
+    InitialIntentIdentity::new(
+        Namespace::Production,
+        UnitId::try_new("MU-auction".to_owned()).unwrap(),
+        OccurrenceIdentityMaterial::new(
+            BusinessDate::parse("2026-09-07").unwrap(),
+            OccurrenceFamily::try_new("auction-session".to_owned()).unwrap(),
+            OccurrenceKey::try_new("main".to_owned()).unwrap(),
+        ),
+        CompletionOwnerId::try_new("owner-auction".to_owned()).unwrap(),
+        SourceContractId::try_new("auction-source".to_owned()).unwrap(),
+        SubjectId::entity(subject.to_owned()).unwrap(),
+        AudienceId::try_new("portfolio-owner".to_owned()).unwrap(),
+    )
+}
+
+fn w08_database() -> (tempfile::TempDir, std::path::PathBuf) {
+    let root = tempfile::tempdir().unwrap();
+    let database = root.path().join("business.sqlite3");
+    FoundationSchemaMigration::bundled()
+        .unwrap()
+        .apply_to(&database)
+        .unwrap();
+    (root, database)
+}
+
+#[test]
+fn w08_ready_outbox_persists_exact_snapshot_render_and_computed_hashes() {
+    let (_root, database) = w08_database();
+    let prepared = crate::monitor::push_job::w08_prepared_push_fixture();
+    let draft = InitialIntentDraft::ready(
+        w08_identity("000001.SZ"),
+        &prepared,
+        w08_digest('e'),
+        w08_digest('f'),
+        UtcMicros::try_new(1_788_743_100_000_000).unwrap(),
+    )
+    .unwrap();
+    let expected_snapshot = prepared.canonical_snapshot_bytes();
+    let expected_render = prepared.replay_rendered_bytes().to_vec();
+    let mut store = BusinessIntentStore::open(&database).unwrap();
+
+    let outcome = store.record_initial(&draft).unwrap();
+    let snapshot = match outcome {
+        InitialIntentOutcome::Inserted(snapshot) => snapshot,
+        other => panic!("expected inserted outbox, got {other:?}"),
+    };
+
+    assert_eq!(snapshot.decision_kind(), InitialDecisionKind::Ready);
+    assert_eq!(snapshot.state().as_str(), "PendingDispatch");
+    assert_eq!(snapshot.reason().as_str(), "intent.created");
+    assert_eq!(snapshot.version(), 0);
+    assert_eq!(snapshot.lease_generation(), 0);
+    assert_eq!(
+        snapshot.prepared_push_bytes(),
+        Some(expected_snapshot.as_bytes())
+    );
+    assert_eq!(snapshot.rendered_bytes(), Some(expected_render.as_slice()));
+    assert_eq!(snapshot.payload_sha256(), Some(expected_snapshot.sha256()));
+    assert_eq!(snapshot.rendered_sha256(), Some(prepared.rendered_sha256()));
+    assert_eq!(snapshot.namespace(), "Production");
+    assert_eq!(snapshot.subject(), "Entity:000001.SZ");
+}
+
+#[test]
+fn w08_non_sending_initial_rows_keep_the_entire_payload_group_null() {
+    let (_root, database) = w08_database();
+    let at = UtcMicros::try_new(1_788_743_100_000_000).unwrap();
+    let no_data = InitialIntentDraft::no_data(
+        w08_identity("000002.SZ"),
+        w08_digest('a'),
+        w08_digest('e'),
+        w08_digest('f'),
+        at,
+    );
+    let disabled = InitialIntentDraft::disabled(
+        w08_identity("000003.SZ"),
+        w08_digest('b'),
+        w08_digest('e'),
+        w08_digest('f'),
+        at,
+    );
+    let mut store = BusinessIntentStore::open(&database).unwrap();
+
+    for (draft, kind, state, reason) in [
+        (
+            no_data,
+            InitialDecisionKind::NoData,
+            "NoData",
+            "intent.no_data",
+        ),
+        (
+            disabled,
+            InitialDecisionKind::Disabled,
+            "Disabled",
+            "policy.disabled",
+        ),
+    ] {
+        let snapshot = match store.record_initial(&draft).unwrap() {
+            InitialIntentOutcome::Inserted(snapshot) => snapshot,
+            other => panic!("expected inserted non-send row, got {other:?}"),
+        };
+        assert_eq!(snapshot.decision_kind(), kind);
+        assert_eq!(snapshot.state().as_str(), state);
+        assert_eq!(snapshot.reason().as_str(), reason);
+        assert_eq!(snapshot.prepared_push_bytes(), None);
+        assert_eq!(snapshot.rendered_bytes(), None);
+        assert_eq!(snapshot.payload_sha256(), None);
+        assert_eq!(snapshot.rendered_sha256(), None);
+    }
+}
+
+#[test]
+fn w08_initial_retry_is_idempotent_and_immutable_drift_never_overwrites() {
+    let (_root, database) = w08_database();
+    let prepared = crate::monitor::push_job::w08_prepared_push_fixture();
+    let draft = InitialIntentDraft::ready(
+        w08_identity("000001.SZ"),
+        &prepared,
+        w08_digest('e'),
+        w08_digest('f'),
+        UtcMicros::try_new(1_788_743_100_000_000).unwrap(),
+    )
+    .unwrap();
+    let drift = InitialIntentDraft::ready(
+        w08_identity("000001.SZ"),
+        &prepared,
+        w08_digest('d'),
+        w08_digest('f'),
+        UtcMicros::try_new(1_788_743_100_000_000).unwrap(),
+    )
+    .unwrap();
+    let mut store = BusinessIntentStore::open(&database).unwrap();
+
+    let inserted = store.record_initial(&draft).unwrap();
+    let original = inserted.snapshot().clone();
+    let retry = store.record_initial(&draft).unwrap();
+    assert!(matches!(retry, InitialIntentOutcome::ExistingIdentical(_)));
+    assert_eq!(retry.snapshot(), &original);
+
+    assert!(matches!(
+        store.record_initial(&drift),
+        Err(IntentStoreError::ImmutableConflict { .. })
+    ));
+    assert_eq!(store.inspect(draft.intent_id()).unwrap().unwrap(), original);
+    assert_eq!(store.intent_count().unwrap(), 1);
 }
