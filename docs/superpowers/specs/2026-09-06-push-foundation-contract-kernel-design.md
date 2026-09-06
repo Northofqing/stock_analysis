@@ -1,6 +1,6 @@
 # 推送 Foundation W01--W03 合同内核设计
 
-**状态：** 用户已批准推荐方案；进入实施计划，尚未实现、接线、部署或晋级。
+**状态：** W01--W03 已实现并完成切片级验证；未接线、部署或晋级。全仓既有 fmt/Clippy 与 durable 并行隔离基线例外记录在实现结果文档中，完整 W04--W21/52 Unit 目标仍未完成。
 
 **决策日期：** 2026-09-06
 
@@ -23,12 +23,12 @@
 
 | 结论 | 权威依据 | 当前源码/运行证据 |
 | --- | --- | --- |
-| application seam 位于 durable coordinator 之前 | `docs/Project_Architecture_Blueprint.md` §24.11--§24.13 | 蓝图建议 `src/monitor/push_job.rs`；当前 coordinator 只拥有物理投递 authority |
+| application seam 位于 durable coordinator 之前 | `docs/Project_Architecture_Blueprint.md` §24.11--§24.13 | 已实现 `src/monitor/push_job.rs`；当前 coordinator 继续只拥有物理投递 authority |
 | `DeliveryResult` 不是新的 durable 状态 | RFC “durable 状态与应用投影” | `src/durable_delivery/model.rs::DecisionState` 当前恰有十四态 |
-| strong result 只能来自精确 authority 绑定 | RFC `VerifiedTerminalRef`、终态完成合同 | 当前 `AuthoritativeSinkResult` 已区分 Accepted/Rejected/Uncertain，但 application completion 仍未统一 |
+| strong result 只能来自精确 authority 绑定 | RFC `VerifiedTerminalRef`、终态完成合同 | 已定义无 public 构造器的 `VerifiedTerminalRef`；真实 requery/binding 构造继续留给 W09 |
 | compatibility observation 不能证明 durable accepted | RFC `CompatibilityEvidenceRef` 与 W02 acceptance | 2026-09-06 22:41 的运行观察有一条 `data_mode pushed=1` 和 push log，但同窗 durable attempt/result 均为 0 |
-| occurrence 不受 generation/restart 影响 | RFC `ScheduleOccurrence` identity；W01 acceptance | 现有代码尚无统一 application occurrence 类型 |
-| NoData/Disabled/Uncertain 必须分流 | RFC “业务完成分支”；W03 acceptance | 当前多路径仍存在 bool/日志/弱 analytics 结果，不能作为统一 completion authority |
+| occurrence 不受 generation/restart 影响 | RFC `ScheduleOccurrence` identity；W01 acceptance | `OccurrenceId`、`ScheduleOccurrenceId`、`IntentId` 已按 canonical-v1 实现并有 golden vector |
+| NoData/Disabled/Uncertain 必须分流 | RFC “业务完成分支”；W03 acceptance | `evaluate_completion` 已返回四个正交指令；现有 producer 尚未接线，旧 bool/日志/弱 analytics 仍不能作为 authority |
 
 本设计引用的权威文件为：
 
