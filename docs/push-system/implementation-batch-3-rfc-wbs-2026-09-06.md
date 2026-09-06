@@ -99,16 +99,16 @@ prepare(RunContext) -> PreparedFacts -> project() -> JobDecision
 
 **接口：** `ArchitectureDocs::RfcSpec.validate(root)` 返回稳定错误数组；`check-rfc.rb --root ROOT --draft|--check` 为只读。`--draft` 只豁免 PROVISIONAL/未发布状态，不豁免类型、枚举、映射、交叉引用或哈希缺失。
 
-- [ ] 先写 RFC 导航、规范词义、范围/非目标、Foundation→Unit→tail cleanup 拓扑，以及 CURRENT/PROPOSED/PROVISIONAL 的边界。
-- [ ] 精确定义字段、构造不变量和所有 variant：`RunContext`、`PreparedFacts`、`SemanticProjection`、`PreparedPush`、`JobDecision`、`VerifiedTerminalRef`、`CompatibilityEvidenceRef`、`DeliveryResult`、`CompletionPolicy`、`ReasonCode`。
-- [ ] `DeliveryResult` 的强 authority 分支固定为 `TransportAccepted(VerifiedTerminalRef)`、`TransportRejected(VerifiedTerminalRef)`、`TransportUncertain(VerifiedTerminalRef)`、`AlreadyTerminal(VerifiedTerminalRef)`；COMPAT/弱通道分支固定为 `BestEffortAccepted(CompatibilityEvidenceRef)`、`PartiallyAccepted(CompatibilityEvidenceRef)`、`NoChannelConfigured(ReasonCode)`、`AllChannelsFailed(CompatibilityEvidenceRef)`，另有 `Blocked(ReasonCode)`。COMPAT 分支绝不能伪装 TransportAccepted 或推进 authoritative completion；业务 Completed/NoData/Disabled 由 finalizer proposal 表达，不混入 transport 结果。
-- [ ] 定义现有 26 个 monitor kind 到 23 个 durable kind（含 `DailyReport` sub-kind）的逐项映射，并机械核对映射全集；其余 39 个 monitor kind 没有直接映射，每个必须按 catalog 状态选择 adapter+intent/finalizer、保持 INACTIVE，或保留 STARVED/OPT-IN 门禁，不能一概写成已接入或都要激活。
-- [ ] `CompletionPolicy` 至少包含 owner、advance event、NoData、Disabled、retry、uncertain/manual、already-terminal 和 finalizer kind；每个分支给出允许输入、业务转换和禁止副作用。
-- [ ] ReasonCode 使用稳定 namespace（`schedule.*`、`input.*`、`policy.*`、`intent.*`、`transport.*`、`finalizer.*`、`activation.*`、`shadow.*`、`operator.*`）；说明文字不得驱动状态机。
-- [ ] 定义 P01/N02 专用 adapter 的一致性要求、PreparedFacts 单次取数、shadow 零副作用、payload drift 进入 ResolutionRequired。
-- [ ] validator 先 RED 覆盖缺章节、缺类型/variant、缺 COMPAT 分支或允许其推进 authoritative completion、重复 ReasonCode、未命名空间、26→23/剩余39及14/65/52 数量断言漂移、引用不存在的 evidence/Unit、出现未决占位词。随后实现 GREEN。
-- [ ] 运行 RFC 测试、输入测试、现有 source/catalog 测试、两个真实 CLI draft 和 `git diff --check`；全部内容门禁通过。
-- [ ] 独立规格复核 Q61/Q69/Q72--Q75/Q78/Q85--Q89/Q101 及现有 Rust 类型映射；独立质量复核深模块接口、单一真相和 validator 反例。修复后提交 `docs: specify push application contracts`。
+- [x] 先写 RFC 导航、规范词义、范围/非目标、Foundation→Unit→tail cleanup 拓扑，以及 CURRENT/PROPOSED/PROVISIONAL 的边界。
+- [x] 精确定义字段、构造不变量和所有 variant：`RunContext`、`PreparedFacts`、`SemanticProjection`、`PreparedPush`、`JobDecision`、`VerifiedTerminalRef`、`CompatibilityEvidenceRef`、`DeliveryResult`、`CompletionPolicy`、`ReasonCode`。
+- [x] `DeliveryResult` 的强 authority 分支固定为 `TransportAccepted(VerifiedTerminalRef)`、`TransportRejected(VerifiedTerminalRef)`、`TransportUncertain(VerifiedTerminalRef)`、`AlreadyTerminal(VerifiedTerminalRef)`；COMPAT/弱通道分支固定为 `BestEffortAccepted(CompatibilityEvidenceRef)`、`PartiallyAccepted(CompatibilityEvidenceRef)`、`NoChannelConfigured(ReasonCode)`、`AllChannelsFailed(CompatibilityEvidenceRef)`，另有 `Blocked(ReasonCode)`。COMPAT 分支绝不能伪装 TransportAccepted 或推进 authoritative completion；业务 Completed/NoData/Disabled 由 finalizer proposal 表达，不混入 transport 结果。
+- [x] 定义现有 26 个 monitor kind 到 23 个 durable kind（含 `DailyReport` sub-kind）的逐项映射，并机械核对映射全集；其余 39 个 monitor kind 没有直接映射，每个必须按 catalog 状态选择 adapter+intent/finalizer、保持 INACTIVE，或保留 STARVED/OPT-IN 门禁，不能一概写成已接入或都要激活。
+- [x] `CompletionPolicy` 至少包含 owner、advance event、NoData、Disabled、retry、uncertain/manual、already-terminal 和 finalizer kind；每个分支给出允许输入、业务转换和禁止副作用。
+- [x] ReasonCode 使用稳定 namespace（`schedule.*`、`input.*`、`policy.*`、`intent.*`、`transport.*`、`finalizer.*`、`activation.*`、`shadow.*`、`operator.*`）；说明文字不得驱动状态机。
+- [x] 定义 P01/N02 专用 adapter 的一致性要求、PreparedFacts 单次取数、shadow 零副作用、payload drift 进入 ResolutionRequired。
+- [x] validator 先 RED 覆盖缺章节、缺类型/variant、缺 COMPAT 分支或允许其推进 authoritative completion、重复 ReasonCode、未命名空间、26→23/剩余39及14/65/52 数量断言漂移、引用不存在的 evidence/Unit、出现未决占位词。随后实现 GREEN。
+- [x] 运行 RFC 测试、输入测试、现有 source/catalog 测试、两个真实 CLI draft 和 `git diff --check`；全部内容门禁通过。
+- [x] 独立规格复核 Q61/Q69/Q72--Q75/Q78/Q85--Q89/Q101 及现有 Rust 类型映射；独立质量复核深模块接口、单一真相和 validator 反例。修复后提交 `docs: specify push application contracts`。
 
 ## Task 3：SQLite DDL、状态机、跨库顺序与崩溃恢复
 
