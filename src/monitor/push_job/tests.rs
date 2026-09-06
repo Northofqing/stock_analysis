@@ -2563,3 +2563,125 @@ fn w06_catalog_rejects_duplicate_owner_and_duplicate_or_empty_members() {
         }) if id == "p01-scheduled"
     ));
 }
+
+#[test]
+fn w06_catalog_rejects_unknown_duplicate_and_orphan_registrations() {
+    assert!(matches!(
+        w06_mutated_catalog(|catalog| {
+            catalog["kinds"][0]["kind"] = serde_json::json!("UnknownKind");
+        }),
+        Err(super::MachineCatalogError::InvalidValue {
+            entity: super::CatalogEntity::Kind,
+            field: "kind",
+        })
+    ));
+    assert!(matches!(
+        w06_mutated_catalog(|catalog| {
+            let duplicate = catalog["kinds"][0]["kind"].clone();
+            catalog["kinds"][1]["kind"] = duplicate;
+        }),
+        Err(super::MachineCatalogError::DuplicateId {
+            entity: super::CatalogEntity::Kind,
+            ..
+        })
+    ));
+    assert!(matches!(
+        w06_mutated_catalog(|catalog| {
+            let duplicate = catalog["producers"][0]["id"].clone();
+            catalog["producers"][1]["id"] = duplicate;
+        }),
+        Err(super::MachineCatalogError::DuplicateId {
+            entity: super::CatalogEntity::Producer,
+            ..
+        })
+    ));
+    assert!(matches!(
+        w06_mutated_catalog(|catalog| {
+            let duplicate = catalog["migration_units"][0]["id"].clone();
+            catalog["migration_units"][1]["id"] = duplicate;
+        }),
+        Err(super::MachineCatalogError::DuplicateId {
+            entity: super::CatalogEntity::Unit,
+            ..
+        })
+    ));
+    assert!(matches!(
+        w06_mutated_catalog(|catalog| {
+            let producer = catalog["producers"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|producer| producer["id"] == "p01-scheduled")
+                .unwrap();
+            producer["migration_unit_id"] = serde_json::json!("MU-missing");
+        }),
+        Err(super::MachineCatalogError::RelationshipMismatch {
+            relation: super::CatalogRelation::ProducerUnit,
+            ref id,
+        }) if id == "p01-scheduled"
+    ));
+    assert!(matches!(
+        w06_mutated_catalog(|catalog| {
+            catalog["producers"][0]["phase_epics"] = serde_json::json!(["休市"]);
+        }),
+        Err(super::MachineCatalogError::InvalidValue {
+            entity: super::CatalogEntity::Producer,
+            field: "phase",
+        })
+    ));
+    assert!(matches!(
+        w06_mutated_catalog(|catalog| {
+            catalog["kinds"][0]["status"] = serde_json::json!("UNKNOWN");
+        }),
+        Err(super::MachineCatalogError::InvalidValue {
+            entity: super::CatalogEntity::Kind,
+            field: "status",
+        })
+    ));
+}
+
+#[test]
+fn w06_catalog_rejects_duplicate_kind_and_unit_members_and_empty_unit_sets() {
+    assert!(matches!(
+        w06_mutated_catalog(|catalog| {
+            let kind = catalog["kinds"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|kind| !kind["producer_ids"].as_array().unwrap().is_empty())
+                .unwrap();
+            let duplicate = kind["producer_ids"][0].clone();
+            kind["producer_ids"].as_array_mut().unwrap().push(duplicate);
+        }),
+        Err(super::MachineCatalogError::DuplicateMember {
+            entity: super::CatalogEntity::Kind,
+            field: "producer_ids",
+            ..
+        })
+    ));
+    assert!(matches!(
+        w06_mutated_catalog(|catalog| {
+            let unit = &mut catalog["migration_units"][0];
+            let duplicate = unit["occurrence_families"][0].clone();
+            unit["occurrence_families"]
+                .as_array_mut()
+                .unwrap()
+                .push(duplicate);
+        }),
+        Err(super::MachineCatalogError::DuplicateMember {
+            entity: super::CatalogEntity::Unit,
+            field: "occurrence_families",
+            ..
+        })
+    ));
+    assert!(matches!(
+        w06_mutated_catalog(|catalog| {
+            catalog["migration_units"][0]["phase_epics"] = serde_json::json!([]);
+        }),
+        Err(super::MachineCatalogError::EmptyMembers {
+            entity: super::CatalogEntity::Unit,
+            field: "phase_epics",
+            ..
+        })
+    ));
+}

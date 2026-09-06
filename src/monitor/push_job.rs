@@ -15,8 +15,9 @@ pub use context::{
 };
 
 pub use catalog::{
-    CatalogEntity, CatalogKindRegistration, CatalogProducerRegistration, CatalogStatus,
-    CatalogUnitRegistration, MachineCatalog, MachineCatalogError, MachineCatalogStatus,
+    CatalogEntity, CatalogKindRegistration, CatalogProducerRegistration, CatalogRelation,
+    CatalogStatus, CatalogUnitRegistration, MachineCatalog, MachineCatalogError,
+    MachineCatalogStatus,
 };
 
 pub use delivery::{

@@ -1,6 +1,6 @@
 //! W06 exact-byte, typed machine catalog registry. Activation and production wiring start later.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -18,6 +18,7 @@ const BUNDLED_CATALOG_SHA256: &str =
 const EXPECTED_KIND_COUNT: usize = 65;
 const EXPECTED_PRODUCER_COUNT: usize = 102;
 const EXPECTED_UNIT_COUNT: usize = 52;
+const EXPECTED_ENUM_EXTERNAL_PRODUCER_COUNT: usize = 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MachineCatalogStatus {
@@ -34,9 +35,21 @@ pub enum CatalogStatus {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CatalogEntity {
+    Header,
     Kind,
     Producer,
     Unit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CatalogRelation {
+    KindProducer,
+    ProducerUnit,
+    UnitProducer,
+    CompletionOwner,
+    OccurrenceFamilies,
+    PhaseEpics,
+    DuplicateCompletionOwner,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -58,6 +71,18 @@ pub enum MachineCatalogError {
         expected: usize,
         actual: usize,
     },
+    #[error(
+        "machine catalog status count mismatch for {status:?}: expected {expected}, got {actual}"
+    )]
+    StatusCountMismatch {
+        status: CatalogStatus,
+        expected: usize,
+        actual: usize,
+    },
+    #[error(
+        "machine catalog enum-external producer count mismatch: expected {expected}, got {actual}"
+    )]
+    EnumExternalCountMismatch { expected: usize, actual: usize },
     #[error("invalid machine catalog {field} for {entity:?}")]
     InvalidValue {
         entity: CatalogEntity,
@@ -67,6 +92,23 @@ pub enum MachineCatalogError {
     DuplicateId { entity: CatalogEntity, id: String },
     #[error("producer {producer_id} has {actual} monitor kinds; expected zero or one")]
     ProducerKindCardinality { producer_id: String, actual: usize },
+    #[error("empty {field} registration for {entity:?} {id}")]
+    EmptyMembers {
+        entity: CatalogEntity,
+        field: &'static str,
+        id: String,
+    },
+    #[error("duplicate member in {field} registration for {entity:?} {id}")]
+    DuplicateMember {
+        entity: CatalogEntity,
+        field: &'static str,
+        id: String,
+    },
+    #[error("machine catalog relationship mismatch {relation:?} at {id}")]
+    RelationshipMismatch {
+        relation: CatalogRelation,
+        id: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -179,8 +221,13 @@ pub struct MachineCatalog {
 
 impl MachineCatalog {
     pub fn bundled() -> Result<Self, MachineCatalogError> {
-        let expected = Sha256Digest::parse("catalog_sha256", BUNDLED_CATALOG_SHA256)
-            .expect("bundled catalog SHA constant is valid");
+        let expected =
+            Sha256Digest::parse("catalog_sha256", BUNDLED_CATALOG_SHA256).map_err(|_| {
+                MachineCatalogError::InvalidValue {
+                    entity: CatalogEntity::Header,
+                    field: "bundled_catalog_sha256",
+                }
+            })?;
         Self::parse_v1_exact(BUNDLED_CATALOG_BYTES, &expected)
     }
 
@@ -223,14 +270,14 @@ impl MachineCatalog {
 
         let baseline_commit = GitSha40::parse(&raw.baseline_commit).map_err(|_| {
             MachineCatalogError::InvalidValue {
-                entity: CatalogEntity::Kind,
+                entity: CatalogEntity::Header,
                 field: "baseline_commit",
             }
         })?;
         let enum_evidence_id =
             validate_text("enum_evidence_id", raw.enum_evidence_id).map_err(|_| {
                 MachineCatalogError::InvalidValue {
-                    entity: CatalogEntity::Kind,
+                    entity: CatalogEntity::Header,
                     field: "enum_evidence_id",
                 }
             })?;
@@ -272,7 +319,7 @@ impl MachineCatalog {
                 .map(|(index, entry)| (entry.id.clone(), entry.id.as_str().to_owned(), index)),
         )?;
 
-        Ok(Self {
+        let catalog = Self {
             schema_version: raw.schema_version,
             status: MachineCatalogStatus::Provisional,
             baseline_commit,
@@ -284,7 +331,9 @@ impl MachineCatalog {
             kind_index,
             producer_index,
             unit_index,
-        })
+        };
+        catalog.validate_closure()?;
+        Ok(catalog)
     }
 
     pub fn schema_version(&self) -> u32 {
@@ -359,6 +408,213 @@ impl MachineCatalog {
         self.producer(id)
             .and_then(|producer| self.unit(&producer.unit_id))
     }
+
+    fn validate_closure(&self) -> Result<(), MachineCatalogError> {
+        self.validate_status_counts()?;
+
+        let external_count = self
+            .producers
+            .iter()
+            .filter(|producer| producer.monitor_kind.is_none())
+            .count();
+        if external_count != EXPECTED_ENUM_EXTERNAL_PRODUCER_COUNT {
+            return Err(MachineCatalogError::EnumExternalCountMismatch {
+                expected: EXPECTED_ENUM_EXTERNAL_PRODUCER_COUNT,
+                actual: external_count,
+            });
+        }
+
+        for kind in &self.kinds {
+            validate_members(
+                CatalogEntity::Kind,
+                kind.kind.as_str(),
+                "producer_ids",
+                &kind.producer_ids,
+                false,
+            )?;
+        }
+        for producer in &self.producers {
+            validate_members(
+                CatalogEntity::Producer,
+                producer.id.as_str(),
+                "phase_epics",
+                &producer.phase_epics,
+                true,
+            )?;
+        }
+        for unit in &self.units {
+            validate_members(
+                CatalogEntity::Unit,
+                unit.id.as_str(),
+                "producer_ids",
+                &unit.producer_ids,
+                true,
+            )?;
+            validate_members(
+                CatalogEntity::Unit,
+                unit.id.as_str(),
+                "occurrence_families",
+                &unit.occurrence_families,
+                true,
+            )?;
+            validate_members(
+                CatalogEntity::Unit,
+                unit.id.as_str(),
+                "phase_epics",
+                &unit.phase_epics,
+                true,
+            )?;
+        }
+
+        self.validate_completion_owner_uniqueness()?;
+        self.validate_kind_producer_closure()?;
+        self.validate_unit_producer_closure()?;
+        self.validate_unit_material()?;
+        Ok(())
+    }
+
+    fn validate_status_counts(&self) -> Result<(), MachineCatalogError> {
+        for (status, expected) in [
+            (CatalogStatus::Active, 36),
+            (CatalogStatus::Inactive, 22),
+            (CatalogStatus::Starved, 5),
+            (CatalogStatus::OptIn, 2),
+        ] {
+            let actual = self
+                .kinds
+                .iter()
+                .filter(|kind| kind.status == status)
+                .count();
+            if actual != expected {
+                return Err(MachineCatalogError::StatusCountMismatch {
+                    status,
+                    expected,
+                    actual,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_completion_owner_uniqueness(&self) -> Result<(), MachineCatalogError> {
+        let mut owner_units = BTreeMap::new();
+        for unit in &self.units {
+            if owner_units
+                .insert(unit.completion_owner.clone(), unit.id.clone())
+                .is_some()
+            {
+                return Err(MachineCatalogError::RelationshipMismatch {
+                    relation: CatalogRelation::DuplicateCompletionOwner,
+                    id: unit.id.as_str().to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_kind_producer_closure(&self) -> Result<(), MachineCatalogError> {
+        for expected_kind in MonitorKind::ALL {
+            let kind = self.kind(expected_kind).ok_or_else(|| {
+                MachineCatalogError::RelationshipMismatch {
+                    relation: CatalogRelation::KindProducer,
+                    id: expected_kind.as_str().to_owned(),
+                }
+            })?;
+            let registered = kind.producer_ids.iter().collect::<BTreeSet<_>>();
+            let reverse = self
+                .producers
+                .iter()
+                .filter(|producer| producer.monitor_kind == Some(expected_kind))
+                .map(|producer| &producer.id)
+                .collect::<BTreeSet<_>>();
+            if registered != reverse {
+                return Err(MachineCatalogError::RelationshipMismatch {
+                    relation: CatalogRelation::KindProducer,
+                    id: expected_kind.as_str().to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_unit_producer_closure(&self) -> Result<(), MachineCatalogError> {
+        for producer in &self.producers {
+            if self.unit(&producer.unit_id).is_none() {
+                return Err(MachineCatalogError::RelationshipMismatch {
+                    relation: CatalogRelation::ProducerUnit,
+                    id: producer.id.as_str().to_owned(),
+                });
+            }
+        }
+
+        for unit in &self.units {
+            let registered = unit.producer_ids.iter().collect::<BTreeSet<_>>();
+            let reverse = self
+                .producers
+                .iter()
+                .filter(|producer| producer.unit_id == unit.id)
+                .map(|producer| &producer.id)
+                .collect::<BTreeSet<_>>();
+            if registered != reverse {
+                return Err(MachineCatalogError::RelationshipMismatch {
+                    relation: CatalogRelation::UnitProducer,
+                    id: unit.id.as_str().to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_unit_material(&self) -> Result<(), MachineCatalogError> {
+        for unit in &self.units {
+            let producers = unit
+                .producer_ids
+                .iter()
+                .map(|id| {
+                    self.producer(id)
+                        .ok_or_else(|| MachineCatalogError::RelationshipMismatch {
+                            relation: CatalogRelation::UnitProducer,
+                            id: unit.id.as_str().to_owned(),
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            if producers
+                .iter()
+                .any(|producer| producer.completion_owner != unit.completion_owner)
+            {
+                return Err(MachineCatalogError::RelationshipMismatch {
+                    relation: CatalogRelation::CompletionOwner,
+                    id: unit.id.as_str().to_owned(),
+                });
+            }
+
+            let registered_families = unit.occurrence_families.iter().collect::<BTreeSet<_>>();
+            let producer_families = producers
+                .iter()
+                .map(|producer| &producer.occurrence_family)
+                .collect::<BTreeSet<_>>();
+            if registered_families != producer_families {
+                return Err(MachineCatalogError::RelationshipMismatch {
+                    relation: CatalogRelation::OccurrenceFamilies,
+                    id: unit.id.as_str().to_owned(),
+                });
+            }
+
+            let registered_phases = unit.phase_epics.iter().collect::<BTreeSet<_>>();
+            let producer_phases = producers
+                .iter()
+                .flat_map(|producer| producer.phase_epics.iter())
+                .collect::<BTreeSet<_>>();
+            if registered_phases != producer_phases {
+                return Err(MachineCatalogError::RelationshipMismatch {
+                    relation: CatalogRelation::PhaseEpics,
+                    id: unit.id.as_str().to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 fn digest(bytes: &[u8]) -> Sha256Digest {
@@ -376,6 +632,30 @@ fn validate_count(
             entity,
             expected,
             actual,
+        });
+    }
+    Ok(())
+}
+
+fn validate_members<T: Ord>(
+    entity: CatalogEntity,
+    id: &str,
+    field: &'static str,
+    values: &[T],
+    require_nonempty: bool,
+) -> Result<(), MachineCatalogError> {
+    if require_nonempty && values.is_empty() {
+        return Err(MachineCatalogError::EmptyMembers {
+            entity,
+            field,
+            id: id.to_owned(),
+        });
+    }
+    if values.iter().collect::<BTreeSet<_>>().len() != values.len() {
+        return Err(MachineCatalogError::DuplicateMember {
+            entity,
+            field,
+            id: id.to_owned(),
         });
     }
     Ok(())
