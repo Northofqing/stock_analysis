@@ -3,12 +3,12 @@ use super::{
     evaluate_completion, AdvanceEvent, AudienceId, AuthorityClass, BusinessDate, CalendarId,
     ChannelId, CompatId, CompatibilityEvidenceRef, CompletionEligibility, CompletionFact,
     CompletionOwnerId, CursorDirective, CursorPolicy, DeliveryAuthority, DeliveryResult,
-    DeliveryResultView, DisabledPolicy, DurableStateProjection, FinalizerKind,
+    DeliveryResultView, DisabledPolicy, DurableStateProjection, ExternalId, FinalizerKind,
     IntentIdentityMaterial, ManualDirective, Namespace, NoDataPolicy, OccurrenceFamily,
     OccurrenceIdentityMaterial, OccurrenceKey, ProducerId, ReasonCode, RetryEligibility,
     RetryPolicy, RunId, ScheduleDirective, ScheduleOccurrenceIdentityMaterial, ScheduleOrTriggerId,
-    Sha256Digest, SourceContractId, SourceContractVersion, SubjectId, TerminalDisposition, UnitId,
-    UtcMicros, WeakOutcome, WeakOutcomeKind,
+    Sha256Digest, SourceContractId, SourceContractVersion, SourceProvider, SourceRef, SourceRefId,
+    SubjectId, TerminalDisposition, UnitId, UtcMicros, WeakOutcome, WeakOutcomeKind,
 };
 
 fn occurrence_material() -> OccurrenceIdentityMaterial {
@@ -1033,4 +1033,392 @@ fn w04_run_context_rejects_invalid_values_and_catalog_mismatches() {
             "case {case:?} must fail closed"
         );
     }
+}
+
+fn w04_source_ref(id: &str, contract: &str, content: char) -> SourceRef {
+    SourceRef::new(
+        SourceRefId::try_new(id.to_owned()).expect("valid source ref id"),
+        SourceProvider::try_new("fixture-provider".to_owned()).expect("valid provider"),
+        ExternalId::try_new(format!("external-{id}")).expect("valid external id"),
+        SourceContractId::try_new(contract.to_owned()).expect("valid source contract"),
+        digest(content),
+    )
+}
+
+fn w04_model_ref(model: &str, output: char) -> super::ModelOutputRef {
+    super::ModelOutputRef::new(
+        super::ModelId::try_new(model.to_owned()).expect("valid model"),
+        super::ModelVersion::try_new("2026-09".to_owned()).expect("valid model version"),
+        digest('1'),
+        digest(output),
+        super::ProtectedRef::try_new(format!("vault://model/{model}/{output}"))
+            .expect("valid protected ref"),
+    )
+}
+
+fn w04_present_facts(
+    source_contract_id: &str,
+    source_contract_version: &str,
+    source_refs: Vec<SourceRef>,
+    source_times: Vec<super::SourceTime>,
+    model_output_refs: Vec<super::ModelOutputRef>,
+) -> super::Result<super::CapturedFacts> {
+    super::CapturedFacts::try_new(
+        SourceContractId::try_new(source_contract_id.to_owned())?,
+        SourceContractVersion::try_new(source_contract_version.to_owned())?,
+        source_refs,
+        super::ExactBytes::new(br#"{"items":[{"code":"000001.SZ"}]}"#.to_vec()),
+        source_times,
+        super::FactsPresence::Present,
+        model_output_refs,
+    )
+}
+
+#[test]
+fn w04_exact_bytes_hash_the_original_payload_without_rewriting() {
+    use super::ExactBytes;
+
+    let compact = ExactBytes::new(br#"{"a":1}"#.to_vec());
+    let spaced = ExactBytes::new(br#"{ "a": 1 }"#.to_vec());
+    assert_eq!(compact.as_bytes(), br#"{"a":1}"#);
+    assert_eq!(spaced.as_bytes(), br#"{ "a": 1 }"#);
+    assert_ne!(compact.sha256(), spaced.sha256());
+
+    let non_utf8 = ExactBytes::new(vec![0xff, 0x00, 0x41]);
+    assert_eq!(non_utf8.as_bytes(), &[0xff, 0x00, 0x41]);
+    assert_eq!(non_utf8.len(), 3);
+    assert_eq!(
+        non_utf8.sha256().as_str(),
+        "0fa3e62511779f0398b77cad37b3cc4763bb96253b91fcd61500f8a979ad9920"
+    );
+}
+
+#[test]
+fn w04_source_times_are_total_ordered_and_preserve_unknown() {
+    use super::{SourceRefId, SourceTime};
+
+    let one = w04_source_ref("source-1", "auction-source", 'a');
+    let two = w04_source_ref("source-2", "auction-source", 'b');
+    let at = UtcMicros::try_new(1_788_743_100_000_001).expect("valid observed time");
+    let valid = w04_present_facts(
+        "auction-source",
+        "auction-source-v2",
+        vec![one.clone(), two.clone()],
+        vec![
+            SourceTime::new(one.source_ref_id().clone(), Some(at)),
+            SourceTime::new(two.source_ref_id().clone(), None),
+        ],
+        Vec::new(),
+    )
+    .expect("total ordered source times");
+    assert_eq!(valid.provider_observed_at()[0].observed_at(), Some(at));
+    assert_eq!(valid.provider_observed_at()[1].observed_at(), None);
+
+    let malformed = [
+        vec![SourceTime::new(one.source_ref_id().clone(), Some(at))],
+        vec![
+            SourceTime::new(two.source_ref_id().clone(), None),
+            SourceTime::new(one.source_ref_id().clone(), Some(at)),
+        ],
+        vec![
+            SourceTime::new(one.source_ref_id().clone(), Some(at)),
+            SourceTime::new(
+                SourceRefId::try_new("unknown-source".to_owned()).expect("valid id"),
+                None,
+            ),
+        ],
+    ];
+    for source_times in malformed {
+        assert!(w04_present_facts(
+            "auction-source",
+            "auction-source-v2",
+            vec![one.clone(), two.clone()],
+            source_times,
+            Vec::new(),
+        )
+        .is_err());
+    }
+}
+
+#[test]
+fn w04_source_and_model_references_are_ordered_unique_and_frozen() {
+    use super::facts::capture_fixture;
+    use super::SourceTime;
+
+    let one = w04_source_ref("source-1", "auction-source", 'a');
+    let two = w04_source_ref("source-2", "auction-source", 'b');
+    let first_model = w04_model_ref("model-a", '2');
+    let second_model = w04_model_ref("model-b", '3');
+
+    assert!(w04_present_facts(
+        "auction-source",
+        "auction-source-v2",
+        vec![one.clone(), one.clone()],
+        vec![
+            SourceTime::new(one.source_ref_id().clone(), None),
+            SourceTime::new(one.source_ref_id().clone(), None),
+        ],
+        Vec::new(),
+    )
+    .is_err());
+    assert!(w04_present_facts(
+        "auction-source",
+        "auction-source-v2",
+        vec![one.clone()],
+        vec![SourceTime::new(one.source_ref_id().clone(), None)],
+        vec![first_model.clone(), first_model.clone()],
+    )
+    .is_err());
+
+    let mut capture = capture_fixture().expect("valid capture capability");
+    let snapshot = capture
+        .capture_once(|_| {
+            Ok(w04_present_facts(
+                "auction-source",
+                "auction-source-v2",
+                vec![two.clone(), one.clone()],
+                vec![
+                    SourceTime::new(two.source_ref_id().clone(), None),
+                    SourceTime::new(one.source_ref_id().clone(), None),
+                ],
+                vec![second_model.clone(), first_model.clone()],
+            )
+            .expect("valid captured facts"))
+        })
+        .expect("first capture succeeds");
+    let facts = snapshot.facts();
+    assert_eq!(facts.source_refs(), &[two, one]);
+    assert_eq!(facts.model_output_refs(), &[second_model, first_model]);
+    assert_eq!(facts.source_contract_id().as_str(), "auction-source");
+    assert_eq!(
+        facts.source_contract_version().as_str(),
+        "auction-source-v2"
+    );
+    assert_eq!(
+        facts.run_context_sha256(),
+        &capture.context().canonical_sha256()
+    );
+    assert_eq!(facts.facts_sha256(), facts.canonical_facts().sha256());
+    assert!(!facts.verified_empty());
+}
+
+#[test]
+fn w04_capture_rejects_source_contract_id_and_version_drift() {
+    use super::facts::capture_fixture;
+    use super::SourceTime;
+
+    for (source_contract_id, source_contract_version) in [
+        ("other-source", "auction-source-v2"),
+        ("auction-source", "auction-source-v3"),
+    ] {
+        let source = w04_source_ref("source-1", source_contract_id, 'a');
+        let mut capture = capture_fixture().expect("valid capture capability");
+        let result = capture.capture_once(|_| {
+            Ok(w04_present_facts(
+                source_contract_id,
+                source_contract_version,
+                vec![source.clone()],
+                vec![SourceTime::new(source.source_ref_id().clone(), None)],
+                Vec::new(),
+            )
+            .expect("locally consistent facts"))
+        });
+        assert!(matches!(
+            result,
+            Err(super::PreparationError::InvalidCapturedFacts(_))
+        ));
+        assert_eq!(capture.state(), super::CaptureStateView::Failed);
+    }
+}
+
+#[test]
+fn w04_verified_empty_requires_evidence_bound_to_context_and_source() {
+    use super::facts::capture_fixture;
+    use super::{CapturedFacts, ExactBytes, FactsPresence, SourceTime};
+
+    let mut capture = capture_fixture().expect("valid capture capability");
+    let wrong_occurrence = derive_occurrence_id(&occurrence_material());
+    let wrong_evidence = super::VerifiedEmptyEvidenceRef::try_new(
+        wrong_occurrence,
+        SourceContractId::try_new("auction-source".to_owned()).expect("valid source"),
+        digest('e'),
+        UtcMicros::try_new(1_788_743_100_000_002).expect("valid verified time"),
+    );
+    let source = w04_source_ref("source-empty", "auction-source", 'e');
+    let result = capture.capture_once(|_| {
+        Ok(CapturedFacts::try_new(
+            SourceContractId::try_new("auction-source".to_owned()).expect("valid source"),
+            SourceContractVersion::try_new("auction-source-v2".to_owned())
+                .expect("valid source version"),
+            vec![source.clone()],
+            ExactBytes::new(br#"{"items":[]}"#.to_vec()),
+            vec![SourceTime::new(source.source_ref_id().clone(), None)],
+            FactsPresence::VerifiedEmpty(wrong_evidence),
+            Vec::new(),
+        )
+        .expect("locally consistent empty facts"))
+    });
+    assert!(matches!(
+        result,
+        Err(super::PreparationError::InvalidCapturedFacts(_))
+    ));
+
+    let mut capture = capture_fixture().expect("valid capture capability");
+    let source = w04_source_ref("source-empty", "auction-source", 'e');
+    let snapshot = capture
+        .capture_once(|context| {
+            let evidence = super::VerifiedEmptyEvidenceRef::try_new(
+                context.occurrence().clone(),
+                SourceContractId::try_new("auction-source".to_owned()).expect("valid source"),
+                digest('e'),
+                UtcMicros::try_new(1_788_743_100_000_002).expect("valid verified time"),
+            );
+            Ok(CapturedFacts::try_new(
+                SourceContractId::try_new("auction-source".to_owned()).expect("valid source"),
+                SourceContractVersion::try_new("auction-source-v2".to_owned())
+                    .expect("valid source version"),
+                vec![source.clone()],
+                ExactBytes::new(br#"{"items":[]}"#.to_vec()),
+                vec![SourceTime::new(source.source_ref_id().clone(), None)],
+                FactsPresence::VerifiedEmpty(evidence),
+                Vec::new(),
+            )
+            .expect("valid verified empty facts"))
+        })
+        .expect("bound verified empty succeeds");
+    assert!(snapshot.facts().verified_empty());
+}
+
+#[test]
+fn w04_active_and_shadow_share_the_same_immutable_snapshot() {
+    use super::facts::capture_fixture;
+    use super::SourceTime;
+
+    let source = w04_source_ref("source-1", "auction-source", 'a');
+    let model = w04_model_ref("model-a", '2');
+    let mut capture = capture_fixture().expect("valid capture capability");
+    let active = capture
+        .capture_once(|_| {
+            Ok(w04_present_facts(
+                "auction-source",
+                "auction-source-v2",
+                vec![source.clone()],
+                vec![SourceTime::new(source.source_ref_id().clone(), None)],
+                vec![model.clone()],
+            )
+            .expect("valid facts"))
+        })
+        .expect("first capture succeeds");
+    let shadow = active.clone();
+    assert!(active.shares_instance_with(&shadow));
+    assert_eq!(active.facts().model_output_refs(), &[model]);
+    assert_eq!(shadow.facts().model_output_refs(), &[model]);
+}
+
+#[test]
+fn w04_second_capture_is_rejected_before_the_external_call() {
+    use std::cell::Cell;
+
+    use super::facts::capture_fixture;
+    use super::SourceTime;
+
+    let calls = Cell::new(0_u64);
+    let source = w04_source_ref("source-1", "auction-source", 'a');
+    let mut capture = capture_fixture().expect("valid capture capability");
+    capture
+        .capture_once(|_| {
+            calls.set(calls.get() + 1);
+            Ok(w04_present_facts(
+                "auction-source",
+                "auction-source-v2",
+                vec![source.clone()],
+                vec![SourceTime::new(source.source_ref_id().clone(), None)],
+                Vec::new(),
+            )
+            .expect("valid facts"))
+        })
+        .expect("first capture succeeds");
+    let second = capture.capture_once(|_| {
+        calls.set(calls.get() + 1);
+        panic!("second external acquisition must not be called")
+    });
+    assert!(matches!(
+        second,
+        Err(super::PreparationError::AlreadyAttempted {
+            state: super::CaptureStateView::Sealed,
+        })
+    ));
+    assert_eq!(calls.get(), 1);
+    assert_eq!(capture.attempt_count(), 1);
+    assert_eq!(capture.rejected_count(), 1);
+    assert_eq!(capture.state(), super::CaptureStateView::Sealed);
+}
+
+#[test]
+fn w04_failed_capture_is_single_use_and_preserves_the_typed_reason() {
+    use std::cell::Cell;
+
+    use super::facts::capture_fixture;
+
+    let calls = Cell::new(0_u64);
+    let mut capture = capture_fixture().expect("valid capture capability");
+    let first = capture.capture_once(|_| {
+        calls.set(calls.get() + 1);
+        Err(super::PreparationError::AcquisitionFailed {
+            reason: ReasonCode::InputSourceUnavailable,
+        })
+    });
+    assert!(matches!(
+        first,
+        Err(super::PreparationError::AcquisitionFailed {
+            reason: ReasonCode::InputSourceUnavailable,
+        })
+    ));
+    let second = capture.capture_once(|_| {
+        calls.set(calls.get() + 1);
+        panic!("failed capture must not call the provider again")
+    });
+    assert!(matches!(
+        second,
+        Err(super::PreparationError::AlreadyAttempted {
+            state: super::CaptureStateView::Failed,
+        })
+    ));
+    assert_eq!(calls.get(), 1);
+    assert_eq!(capture.attempt_count(), 1);
+    assert_eq!(capture.rejected_count(), 1);
+}
+
+#[test]
+fn w04_capture_unwind_does_not_reopen_the_capability() {
+    use std::cell::Cell;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    use super::facts::capture_fixture;
+
+    let calls = Cell::new(0_u64);
+    let mut capture = capture_fixture().expect("valid capture capability");
+    let unwind = catch_unwind(AssertUnwindSafe(|| {
+        let _: std::result::Result<super::PreparedFactsSnapshot, super::PreparationError> = capture
+            .capture_once(|_| {
+                calls.set(calls.get() + 1);
+                panic!("fixture acquisition panic")
+            });
+    }));
+    assert!(unwind.is_err());
+    assert_eq!(capture.state(), super::CaptureStateView::Capturing);
+
+    let second = capture.capture_once(|_| {
+        calls.set(calls.get() + 1);
+        panic!("capture must stay closed after unwind")
+    });
+    assert!(matches!(
+        second,
+        Err(super::PreparationError::AlreadyAttempted {
+            state: super::CaptureStateView::Capturing,
+        })
+    ));
+    assert_eq!(calls.get(), 1);
+    assert_eq!(capture.attempt_count(), 1);
+    assert_eq!(capture.rejected_count(), 1);
 }
