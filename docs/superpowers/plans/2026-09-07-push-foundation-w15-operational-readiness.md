@@ -1,6 +1,6 @@
 # 推送 Foundation W15 运行就绪实施计划
 
-**状态：** W14 已收尾，当前执行 Task 1 的证据/存储合同核对；W15 代码尚未实现。
+**状态：** Task 1 设计已提交 `ec930f8`；Task 2 纯判级/显式失败证据/候选快照/重建已提交至 `a1ca363`，Task 4A 纯计数提交 `c040072`。W15 23/23、Foundation 126/126 通过；相邻 push_job 52/52 的代码未受本轮影响。原因/依赖角色修复 `1b30629` 已通过独立复审；codec 独立审查进行中。Task 3 正在实现独立 schema/open 和无环 recovery 材料，认证恢复、权威 probe 与调度联结尚未完成，W15 未完成。逐项证据见 `docs/push-system/implementation-w15-results-2026-09-07.md`。
 
 **目标：** 交付 Core/Producer/Occurrence 三个范围的就绪判定、可查询的不可变运行快照、绑定前后快照及依赖版本的恢复事件，以及只读部署探针。按 WBS 执行完整 W15，不将单次 source availability 等同于全部就绪能力。
 
@@ -17,6 +17,8 @@
 - 旧 BR-246 设计与 `src/bin/monitor/main.rs` 的 diagnostics/readiness loop 已存在，W15 应保留 resident liveness 与数据 readiness 的区别。旧设计文档仍标待复核；具体已实现行为以源码和测试为准。
 
 ## Task 1：冻结证据、存储和计数合同
+
+设计产出：`docs/superpowers/specs/2026-09-07-push-foundation-w15-operational-readiness-design.md`。选择独立 operational SQLite，W07 SQL 保持不变；pure assessment 与 attested snapshot 分开，snapshot/recovery 使用无环 hash 和事务 head CAS。
 
 检查 `src/monitor/push_job/{catalog,context,facts,canonical}.rs`、`src/push_foundation/{migration,intent_store,reconciler,phase_scheduler}.rs` 和既有 readiness diagnostics 的实际边界。
 
@@ -51,6 +53,8 @@
 
 ## Task 3：持久快照与恢复事件闭环
 
+并行边界：Task 3A 在 `readiness_store_schema.rs` 实现独立 schema/namespace 验证和显式初始化、只读/写入打开；主代理在 `readiness_recovery.rs` 实现无环事件/快照材料后集成 `readiness_store.rs`。schema 连接与候选事件都不是认证权限，不替代本任务的真实原子提交与恢复验收。
+
 按 Task 1 冻结的存储方案新增 `readiness_store.rs` 及测试（路径可在设计中细化），使用真实隔离存储验证：
 
 - 首次 Pending 事件、snapshot 与查询指针原子提交；
@@ -65,6 +69,8 @@
 
 ## Task 4：只读 health/readiness/deploy projection
 
+并行切片 Task 4A：先在 `readiness_probe.rs` 实现纯候选 catalog inventory，覆盖 kind/producer/枚举外 producer 三个分母、INACTIVE/conditional 和 typed 缺项去重；最终接入 Task 3 已验证快照后才能成为权威部署投影。该切片不替代下面的完整验收。子代理仅编辑本模块及其测试；主代理维护领域接口、模块注册、Cargo 调度与提交。
+
 以同一已验证 snapshot 实现查询和机器可读部署输出；如需要独立 CLI，新增显式数据路径的 `src/bin/push_readiness_probe.rs`，不修改 monitor 启动流程。最终文件名在 Task 1 冻结。
 
 输出 snapshot hash、build、generation、状态/原因、受影响 ID、恢复事件和 RFC 要求的计数；清楚区分 kind 与 producer 分母。CLI 的 readiness 退出码按状态判定，liveness 单独输出。错误、缺失或损坏 snapshot 不能默认为 Ready。
@@ -72,6 +78,8 @@
 验证查询前后存储内容不变、不能调用 provider/sink/转换，并证明 CLI、health 与 readiness 对同一 snapshot 的结果一致。ProducerUnready 的 operational alert 作为可消费的独立事实输出；不新增旁路通知发送。
 
 ## Task 5：W11/W14 与来源恢复的联结
+
+已完成只读接口核对（尚未实现联结）：W11 `scheduler_barrier` 只证明固定点遍历完成，不携带 namespace/Unit/generation 等身份；W14 当前没有显式的 input block/recovered proposal 入口；W15 `OccurrenceId` 与 W14 `ScheduleOccurrenceId` 不能比较字符串后视作同一身份。实现需窄化的 schedule identity 绑定视图、保留有效延期窗口的两条受控提案入口，以及经 store 重查的 before/after recovery 关联；不得把 hydrate 用作绕过状态转换的入口。
 
 在同 crate 的 orchestration seam 绑定 W11 恢复完成报告、当前 readiness scope 和 W14 schedule。仅已核验匹配的 ReadyGate 可为新工作提供控制面资格；生产数据仍需实际消费时复验。
 

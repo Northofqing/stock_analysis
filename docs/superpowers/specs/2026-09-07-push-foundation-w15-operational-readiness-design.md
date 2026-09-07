@@ -29,7 +29,11 @@
 文件规划：
 
 - `src/push_foundation/operational_readiness.rs`：类型、注册校验、三范围判级和纯 assessment。
+- `src/push_foundation/readiness_snapshot.rs`：候选快照的规范化身份、完整证据引用绑定与 Debug 脱敏；单独成文件以免把编码细节混入分类器。候选值不是 attested snapshot。
+- `src/push_foundation/readiness_snapshot_codec.rs`：从持久化 canonical bytes 重建候选材料并重新判级，核对完整重新编码字节；不能仅相信行内 status 或由调用者重算的哈希。
 - `src/push_foundation/readiness_store.rs`：schema、证据复验、snapshot/recovery 原子追加、只读重查。
+- `src/push_foundation/readiness_store_schema.rs`：独立 SQLite 的 schema/header/namespace 与显式初始化、只读/写入打开；不提供认证或投递权限。
+- `src/push_foundation/readiness_recovery.rs`：无环 recovery identity 与 before/after snapshot 材料；认证来源仍由 store 的实际 reader 复验，候选事件不是恢复许可。
 - `src/push_foundation/readiness_probe.rs`：来自同一 snapshot 的 health/deployment/CLI 投影。
 - `src/bin/push_readiness_probe.rs`：显式路径的只读命令；不启动 monitor、不进行 provider 调用。
 - 各模块对应 `_tests.rs`；内部模块仅在 `push_foundation/mod.rs` 注册，最终仅导出 probe 必需的只读接口。
@@ -46,6 +50,8 @@ catalog + 当前注册/部署合同 + 已核验的依赖证据
 ```
 
 纯 assessment 的构造和测试不能铸造 attested snapshot；后者只能由存储提交后的精确重查生成。类型命名保持这一区别，避免把可构造的 bool/diagnostic report 提升成权威。
+
+纯判级保留实际 scope、catalog SHA、启用 producer、依赖声明和正/负观察，按稳定键排序；Ready 时受影响集合虽为空，也不能丢掉被评估范围。明确失败观察保留原 ReasonCode 和证据哈希，拒绝把成功、NoData 或无关投递结果登记成依赖不可用。候选快照在编码前要求每条观察与 evidence ref 的依赖角色、来源、版本、哈希一一匹配；缺失/重复/多余引用拒绝。此检查只证明内部绑定一致，不证明外部来源真实或 recovery 已发生，认证与 event 前后 join 仍由存储负责。
 
 ## 4. scope 与依赖合同
 
@@ -80,6 +86,8 @@ Readiness 只控制是否可以考虑新工作；消费者仍复验当次数据�
 ## 6. 快照、证据与恢复
 
 Snapshot 实现 RFC 全部字段；canonical hash 使用已有 `CanonicalValue`/`canonical_digest` 规则并排除自身 ID。依赖/受影响集合按稳定键排序且拒绝重复，输入 evidence 的角色与版本精确绑定。查询必须核验 schema、canonical bytes/hash、head join 和恢复链，不能只 SELECT status。
+
+重建候选材料时先核验 domain/字节哈希，再解析闭集字段、用当前精确 catalog 重新执行 assessment 和 evidence 绑定，最后要求重新编码字节完全相同。这样即使篡改者同时重算 status 所在行的哈希，也不能把缺依赖事实改写成 Ready；重复字段、额外字段、非规范序列和派生状态漂移同样不能被解析器静默丢弃。此流程仍不认证外部 evidence 或 recovery，store 的只读复验与 join 不可省略。
 
 每个 evidence ref 包含类型、protected URI、SHA、source ID/version。Debug/错误/probe 只输出稳定 ID、类型、版本、hash，不暴露 URI 正文或内容。注册 authority 通过现有 immutable audit/本地 authority 验证结果复验引用；字符串 actor 或自报 success 不能签发恢复。实现时只开放经验证 reader 的 attestation 构造，测试替身限制在测试 seam，不产生生产授权。
 
