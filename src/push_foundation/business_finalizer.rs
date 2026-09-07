@@ -222,9 +222,8 @@ impl NotDeliveredPreparationRequest {
         actor: TransitionActor,
         fence: FinalizerFence,
         verified_at: UtcMicros,
-    ) -> Self {
+    ) -> Result<Self, BusinessFinalizerError> {
         Self::build(intent_id, expected_version, actor, fence, verified_at, None)
-            .expect("test fixture request must be valid")
     }
 
     fn build(
@@ -321,14 +320,19 @@ pub(crate) enum BusinessFinalizerError {
     Store(#[from] IntentStoreError),
     #[error(transparent)]
     Terminal(#[from] TerminalAuthorityError),
+    #[error("terminal authority became invalid during finalization")]
+    TerminalInvalid {
+        source: TerminalAuthorityError,
+        receipt: TransitionReceipt,
+    },
     #[error("invalid finalizer request: {check}")]
     InvalidRequest { check: &'static str },
     #[error("business intent is not in an accepted-finalizer source state")]
     InvalidSourceState,
     #[error("business finalizer lease fence does not match the current intent")]
     FenceMismatch,
-    #[error("business intent version changed before finalization")]
-    BusinessCasConflict,
+    #[error("business finalizer conflict could not be isolated in one CAS attempt")]
+    ConflictUnresolved { current: Box<IntentSnapshot> },
     #[error("terminal disposition cannot enter the accepted finalizer")]
     DispositionNotCompletable { actual: TerminalDisposition },
     #[error("completion policy rejected the verified terminal")]
@@ -367,7 +371,9 @@ pub(crate) fn prepare_accepted_finalization(
         return Ok(AcceptedPreparationOutcome::AlreadyFinalized(receipt));
     }
     if current.version() != request.expected_version {
-        return Err(BusinessFinalizerError::BusinessCasConflict);
+        return Err(BusinessFinalizerError::ConflictUnresolved {
+            current: Box::new(current),
+        });
     }
     match current.state() {
         IntentState::AwaitingAuthority | IntentState::AwaitingFinalizer => {
@@ -388,7 +394,21 @@ pub(crate) fn prepare_accepted_finalization(
         return Err(BusinessFinalizerError::FenceMismatch);
     }
 
-    let prior = verify_terminal(&current, template, policy, authority, request.verified_at)?;
+    let prior = match verify_terminal(&current, template, policy, authority, request.verified_at) {
+        Ok(prior) => prior,
+        Err(source) if current.state() == IntentState::AwaitingFinalizer => {
+            return Err(record_terminal_invalid(
+                store,
+                &request.intent_id,
+                current.version(),
+                &request.actor,
+                request.occurred_at,
+                &request.fence,
+                source,
+            ));
+        }
+        Err(source) => return Err(source.into()),
+    };
     require_accepted_disposition(prior.terminal_disposition())?;
     let _ = accepted_directive(policy, &prior)?;
 
@@ -408,8 +428,8 @@ pub(crate) fn prepare_accepted_finalization(
             TransitionOutcome::Applied(receipt) | TransitionOutcome::AlreadyCommitted(receipt) => {
                 receipt.result_version()
             }
-            TransitionOutcome::Conflict { .. } => {
-                return Err(BusinessFinalizerError::BusinessCasConflict)
+            TransitionOutcome::Conflict { current } => {
+                return Err(BusinessFinalizerError::ConflictUnresolved { current })
             }
         }
     };
@@ -447,7 +467,9 @@ pub(crate) fn prepare_not_delivered_finalization(
         return Ok(NotDeliveredPreparationOutcome::AlreadyFinalized(receipt));
     }
     if current.version() != request.expected_version {
-        return Err(BusinessFinalizerError::BusinessCasConflict);
+        return Err(BusinessFinalizerError::ConflictUnresolved {
+            current: Box::new(current),
+        });
     }
     if !not_delivered_history_eligible(&current, &chain) {
         return Err(BusinessFinalizerError::NotDeliveredHistoryIneligible);
@@ -520,7 +542,9 @@ pub(crate) fn commit_not_delivered_finalization(
             let directive = not_delivered_directive(policy, &pending.prior)?;
             return Ok(NotDeliveredFinalizationOutcome::AlreadyCommitted { receipt, directive });
         }
-        return Err(BusinessFinalizerError::BusinessCasConflict);
+        return Err(BusinessFinalizerError::ConflictUnresolved {
+            current: Box::new(current),
+        });
     }
     if !not_delivered_history_eligible(&current, &chain) {
         return Err(BusinessFinalizerError::NotDeliveredHistoryIneligible);
@@ -580,7 +604,9 @@ fn isolate_not_delivered_conflict(
     occurred_at: UtcMicros,
 ) -> Result<NotDeliveredFinalizationOutcome, BusinessFinalizerError> {
     if !matches!(current.state(), IntentState::AwaitingAuthority) {
-        return Err(BusinessFinalizerError::BusinessCasConflict);
+        return Err(BusinessFinalizerError::ConflictUnresolved {
+            current: Box::new(current.clone()),
+        });
     }
     match store.apply_finalizer_conflict(
         &pending.intent_id,
@@ -591,7 +617,9 @@ fn isolate_not_delivered_conflict(
         TransitionOutcome::Applied(receipt) | TransitionOutcome::AlreadyCommitted(receipt) => {
             Ok(NotDeliveredFinalizationOutcome::ResolutionRequired { receipt })
         }
-        TransitionOutcome::Conflict { .. } => Err(BusinessFinalizerError::BusinessCasConflict),
+        TransitionOutcome::Conflict { current } => {
+            Err(BusinessFinalizerError::ConflictUnresolved { current })
+        }
     }
 }
 
@@ -686,6 +714,11 @@ fn commit_accepted_finalization_inner(
             occurred_at,
         );
     }
+    if current.state() == IntentState::ResolutionRequired {
+        return Err(BusinessFinalizerError::ConflictUnresolved {
+            current: Box::new(current),
+        });
+    }
     if current.state() != IntentState::AwaitingFinalizer {
         return Err(BusinessFinalizerError::InvalidSourceState);
     }
@@ -702,14 +735,27 @@ fn commit_accepted_finalization_inner(
         return Err(BusinessFinalizerError::FenceMismatch);
     }
 
-    let fresh = reverify_for_finalization(
+    let fresh = match reverify_for_finalization(
         &pending.prior,
         &current,
         template,
         policy,
         authority,
         verified_at,
-    )?;
+    ) {
+        Ok(fresh) => fresh,
+        Err(source) => {
+            return Err(record_terminal_invalid(
+                store,
+                &pending.intent_id,
+                current.version(),
+                &pending.actor,
+                occurred_at,
+                &pending.fence,
+                source,
+            ));
+        }
+    };
     require_accepted_disposition(fresh.verified_terminal().terminal_disposition())?;
     let directive = accepted_directive(policy, fresh.verified_terminal())?;
     let transition = match mode {
@@ -762,7 +808,39 @@ fn isolate_finalizer_conflict(
         TransitionOutcome::Applied(receipt) | TransitionOutcome::AlreadyCommitted(receipt) => {
             Ok(AcceptedFinalizationOutcome::ResolutionRequired { receipt })
         }
-        TransitionOutcome::Conflict { .. } => Err(BusinessFinalizerError::BusinessCasConflict),
+        TransitionOutcome::Conflict { current } => {
+            Err(BusinessFinalizerError::ConflictUnresolved { current })
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_terminal_invalid(
+    store: &mut BusinessIntentStore,
+    intent_id: &IntentId,
+    expected_version: u64,
+    actor: &TransitionActor,
+    occurred_at: UtcMicros,
+    fence: &FinalizerFence,
+    source: TerminalAuthorityError,
+) -> BusinessFinalizerError {
+    match store.apply_terminal_ref_invalid(
+        intent_id,
+        expected_version,
+        actor,
+        occurred_at,
+        &fence.owner,
+        fence.generation,
+        fence.until,
+    ) {
+        Ok(TransitionOutcome::Applied(receipt))
+        | Ok(TransitionOutcome::AlreadyCommitted(receipt)) => {
+            BusinessFinalizerError::TerminalInvalid { source, receipt }
+        }
+        Ok(TransitionOutcome::Conflict { current }) => {
+            BusinessFinalizerError::ConflictUnresolved { current }
+        }
+        Err(error) => BusinessFinalizerError::Store(error),
     }
 }
 

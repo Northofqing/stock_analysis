@@ -843,7 +843,8 @@ fn w10_not_delivered_rejects_missing_or_replayed_audit_before_authority_query() 
         TransitionActor::try_new("operator-1".to_owned()).unwrap(),
         fence(&awaiting),
         micros(QUALIFY_VERIFIED_AT),
-    );
+    )
+    .unwrap();
     assert!(matches!(
         prepare_not_delivered_finalization(
             &mut store,
@@ -1064,6 +1065,36 @@ fn w10_failed_final_requery_appends_nonterminal_invalid_evidence() {
     let current = store.inspect(&fixture.record.intent_id).unwrap().unwrap();
     assert_eq!(current.state(), IntentState::AwaitingFinalizer);
     assert_eq!(current.version(), qualified.version() + 1);
+}
+
+#[test]
+fn w10_failed_recovery_prepare_also_appends_terminal_invalid_evidence() {
+    let fixture = fixture();
+    let authority = FakeAuthority::terminal(fixture.record.clone());
+    let mut store = BusinessIntentStore::open(&fixture.database).unwrap();
+    let awaiting = dispatch(&fixture, &mut store);
+    let pending = prepare_pending(&mut store, &fixture, &authority, &awaiting);
+    drop(pending);
+    let qualified = store.inspect(&fixture.record.intent_id).unwrap().unwrap();
+    *authority.result.borrow_mut() = Ok(AuthorityQuery::Missing);
+
+    let receipt = match prepare_accepted_finalization(
+        &mut store,
+        request(&qualified, fixture.record.intent_id.clone()),
+        &fixture.template,
+        &fixture.policy,
+        &authority,
+    ) {
+        Err(BusinessFinalizerError::TerminalInvalid {
+            source: TerminalAuthorityError::TerminalMissing,
+            receipt,
+        }) => receipt,
+        other => panic!("expected recovery terminal-invalid result, got {other:?}"),
+    };
+    assert_eq!(authority.calls.get(), 2);
+    assert_eq!(receipt.from_state(), IntentState::AwaitingFinalizer);
+    assert_eq!(receipt.to_state(), IntentState::AwaitingFinalizer);
+    assert_eq!(receipt.reason(), ReasonCode::FinalizerTerminalRefInvalid);
 }
 
 #[test]

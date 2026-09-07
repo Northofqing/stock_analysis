@@ -1213,6 +1213,36 @@ impl BusinessIntentStore {
         self.apply_transition_inner(&command, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_terminal_ref_invalid(
+        &mut self,
+        intent_id: &IntentId,
+        expected_version: u64,
+        actor: &TransitionActor,
+        occurred_at: UtcMicros,
+        fence_owner: &LeaseOwnerId,
+        fence_generation: u64,
+        fence_until: UtcMicros,
+    ) -> Result<TransitionOutcome, IntentStoreError> {
+        let command = StoreTransitionCommand {
+            intent_id: intent_id.clone(),
+            from_state: IntentState::AwaitingFinalizer,
+            to_state: IntentState::AwaitingFinalizer,
+            expected_version,
+            actor: actor.clone(),
+            reason: ReasonCode::FinalizerTerminalRefInvalid,
+            occurred_at,
+            lease_action: LeaseAction::Preserve,
+            required_fence: Some(ExpectedLeaseFence {
+                owner: fence_owner.as_str().to_owned(),
+                generation: fence_generation,
+                until: fence_until,
+            }),
+            terminal: TerminalTransitionFields::default(),
+        };
+        self.apply_transition_inner(&command, None)
+    }
+
     pub(crate) fn apply_accepted_finalization(
         &mut self,
         terminal: FinalizationTerminalRef,
