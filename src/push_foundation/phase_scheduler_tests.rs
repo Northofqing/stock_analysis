@@ -296,6 +296,44 @@ fn w14_recover_persisted_only_never_creates_new_work() {
 }
 
 #[test]
+fn w14_recover_persisted_only_never_promotes_existing_unprepared_work() {
+    let schedule = schedule(CatchUpPolicy::RecoverPersistedOnly);
+    let barrier = w14_recovery_barrier_fixture();
+    for status in [
+        ScheduleStatus::Expected,
+        ScheduleStatus::Eligible,
+        ScheduleStatus::BlockedOnInput,
+    ] {
+        let current = hydrated(
+            &schedule,
+            status,
+            2,
+            ReasonCode::InputSourceUnavailable,
+            None,
+        );
+        for observed_at in [WINDOW_START + 2, WINDOW_END] {
+            let observation = MarketObservation::trading_day(
+                BusinessDate::parse("2026-09-07").expect("TEST_CODE original date"),
+                micros(observed_at),
+            );
+            let expected = ScheduleStep::RecoveryOnly {
+                occurrence_id: current.occurrence_id().clone(),
+            };
+            assert_eq!(
+                PhaseScheduler::tick(&schedule, Some(&current), &observation)
+                    .expect("TEST_CODE only persisted intent recovery is permitted"),
+                expected
+            );
+            assert_eq!(
+                PhaseScheduler::startup_catch_up(&barrier, &schedule, Some(&current), &observation)
+                    .expect("TEST_CODE catch-up does not authorize preparation"),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
 fn w14_new_occurrence_is_created_expected_then_proposed_eligible() {
     let schedule = schedule(CatchUpPolicy::SameBusinessDayBeforeDeadline);
     let observation = MarketObservation::trading_day(
@@ -513,6 +551,133 @@ fn w14_deferred_occurrence_resumes_in_next_half_open_session_without_new_identit
     assert_eq!(eligible.from_status(), ScheduleStatus::Deferred);
     assert_eq!(eligible.to_status(), ScheduleStatus::Eligible);
     assert_eq!(eligible.occurrence_id(), occurrence.occurrence_id());
+
+    let resumed = deferred
+        .apply_proposal(&eligible)
+        .expect("TEST_CODE persist recovered eligibility");
+    let barrier = w14_recovery_barrier_fixture();
+    for observed_at in [next_window.start().get(), next_window.end().get() - 1] {
+        let observation = MarketObservation::trading_day(
+            BusinessDate::parse("2026-09-07").expect("TEST_CODE original date"),
+            micros(observed_at),
+        );
+        let expected = ScheduleStep::NoChange {
+            occurrence_id: occurrence.occurrence_id().clone(),
+            status: ScheduleStatus::Eligible,
+            version: 2,
+            reason: ReasonCode::ScheduleWindowOpen,
+        };
+        assert_eq!(
+            PhaseScheduler::tick(&schedule, Some(&resumed), &observation)
+                .expect("TEST_CODE next window remains eligible across ticks"),
+            expected
+        );
+        assert_eq!(
+            PhaseScheduler::startup_catch_up(&barrier, &schedule, Some(&resumed), &observation)
+                .expect("TEST_CODE restart preserves recovered window"),
+            expected
+        );
+    }
+    assert_eq!(resumed.next_eligible(), Some(&next));
+    assert_eq!(
+        resumed.apply_proposal(&eligible),
+        Err(PhaseSchedulerError::TransitionBindingMismatch)
+    );
+    let non_trading = MarketObservation::non_trading_day(
+        BusinessDate::parse("2026-09-07").expect("TEST_CODE original date"),
+        next_window.start(),
+    );
+    assert!(matches!(
+        PhaseScheduler::tick(&schedule, Some(&deferred), &non_trading)
+            .expect("TEST_CODE no non-trading deferred recovery"),
+        ScheduleStep::NoChange {
+            status: ScheduleStatus::Deferred,
+            reason: ReasonCode::ScheduleNotTradingDay,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn w14_next_session_and_proposal_cannot_be_grafted_to_another_window_with_the_same_id() {
+    let original = schedule(CatchUpPolicy::DeferToNextEligibleSession);
+    let next = NextEligibleSessionRef::try_new(
+        &original,
+        BusinessDate::parse("2026-09-08").expect("TEST_CODE next date"),
+        ScheduleWindow::try_new(
+            micros(WINDOW_END + 86_400_000_000),
+            micros(WINDOW_END + 86_400_900_000),
+        )
+        .expect("TEST_CODE next window"),
+    )
+    .expect("TEST_CODE next reference for original schedule");
+    let shifted = PhaseSchedule::try_bind(
+        &MachineCatalog::bundled().expect("TEST_CODE bundled catalog"),
+        p01_identity(),
+        PhaseEpic::Preopen,
+        ScheduleWindow::try_new(
+            micros(WINDOW_END + 172_800_000_000),
+            micros(WINDOW_END + 172_800_900_000),
+        )
+        .expect("TEST_CODE shifted schedule window"),
+        CatchUpPolicy::DeferToNextEligibleSession,
+    )
+    .expect("TEST_CODE same identity with another schedule window");
+    assert_eq!(original.occurrence_id(), shifted.occurrence_id());
+    assert_eq!(
+        ScheduleOccurrenceSnapshot::try_hydrate(
+            shifted.clone(),
+            ScheduleStatus::Deferred,
+            1,
+            ReasonCode::ScheduleDeferred,
+            micros(WINDOW_START),
+            micros(WINDOW_END),
+            Some(next.clone())
+        ),
+        Err(PhaseSchedulerError::InvalidNextEligibleSession)
+    );
+
+    let current = created(&shifted, WINDOW_START);
+    let at_end = MarketObservation::trading_day(
+        BusinessDate::parse("2026-09-07").expect("TEST_CODE original date"),
+        shifted.window().end(),
+    )
+    .with_next_eligible(next.clone());
+    assert_eq!(
+        PhaseScheduler::tick(&shifted, Some(&current), &at_end),
+        Err(PhaseSchedulerError::InvalidNextEligibleSession)
+    );
+
+    let original_current = created(&original, WINDOW_START);
+    let original_end = MarketObservation::trading_day(
+        BusinessDate::parse("2026-09-07").expect("TEST_CODE original date"),
+        micros(WINDOW_END),
+    )
+    .with_next_eligible(next);
+    let proposal = match PhaseScheduler::tick(&original, Some(&original_current), &original_end)
+        .expect("TEST_CODE original schedule can defer")
+    {
+        ScheduleStep::TransitionProposal(proposal) => proposal,
+        other => panic!("TEST_CODE expected defer proposal, got {other:?}"),
+    };
+    assert_eq!(
+        current.apply_proposal(&proposal),
+        Err(PhaseSchedulerError::TransitionBindingMismatch)
+    );
+}
+
+#[test]
+fn w14_transition_rejects_time_before_the_current_snapshot_update() {
+    let schedule = schedule(CatchUpPolicy::SameBusinessDayBeforeDeadline);
+    let current = created(&schedule, WINDOW_START + 5);
+    let rewound = MarketObservation::trading_day(
+        BusinessDate::parse("2026-09-07").expect("TEST_CODE original date"),
+        micros(WINDOW_START + 1),
+    );
+    assert_eq!(
+        PhaseScheduler::tick(&schedule, Some(&current), &rewound),
+        Err(PhaseSchedulerError::TransitionBindingMismatch)
+    );
 }
 
 #[test]
