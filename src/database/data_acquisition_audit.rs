@@ -43,7 +43,74 @@ impl DataAcquisitionAuditReceipt {
     }
 }
 
-#[derive(Debug, QueryableByName, Serialize)]
+/// Complete BR-159 facts validated from the connection's snapshot, not a W15 attestation.
+///
+/// The caller still has to authenticate the connection's source and bind its
+/// namespace, business date, source contract/version and readiness scope. This
+/// does not certify the commit state of an enclosing caller-owned transaction.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct VerifiedAcquisitionAudit {
+    receipt: DataAcquisitionAuditReceipt,
+    audit: PersistedAcquisitionAudit,
+}
+
+impl std::fmt::Debug for VerifiedAcquisitionAudit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VerifiedAcquisitionAudit")
+            .field("audit_id", &self.receipt.audit_id)
+            .field("record_hash", &self.receipt.record_hash)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl VerifiedAcquisitionAudit {
+    pub(crate) fn receipt(&self) -> &DataAcquisitionAuditReceipt {
+        &self.receipt
+    }
+
+    /// Explicit access to protected raw fields; do not log or publish this view.
+    /// Outcomes and timestamps retain BR-159 semantics, not W15 interpretations.
+    pub(crate) fn record(&self) -> DataAcquisitionAuditRecord<'_> {
+        self.audit.record()
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("acquisition audit facts could not be verified")]
+pub(crate) struct AcquisitionAuditReadError;
+
+/// Read both audit tables in one DEFERRED transaction and reuse the existing
+/// complete-chain/receipt verifier. No database opening, initialization,
+/// migration, checkpoint, or observation interpretation occurs here.
+///
+/// A source-owned, side-effect-safe opener is a separate prerequisite. This
+/// function cannot certify the identity or configuration of an arbitrary connection.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn read_verified_acquisition_audit(
+    connection: &mut SqliteConnection,
+    receipt: &DataAcquisitionAuditReceipt,
+) -> Result<VerifiedAcquisitionAudit, AcquisitionAuditReadError> {
+    connection
+        .transaction::<_, diesel::result::Error, _>(|connection| {
+            let audits = load_audit_rows(connection)?;
+            let chain = load_chain_rows(connection)?;
+            let audit = audits
+                .iter()
+                .find(|audit| audit.id == receipt.audit_id)
+                .ok_or_else(|| audit_error("acquisition audit record missing"))?;
+            verify_data_acquisition_receipt_snapshot(&audits, &chain, receipt, &audit.record())?;
+            Ok(VerifiedAcquisitionAudit {
+                receipt: receipt.clone(),
+                audit: audit.clone(),
+            })
+        })
+        .map_err(|_| AcquisitionAuditReadError)
+}
+
+#[derive(Clone, Debug, QueryableByName, Serialize)]
 struct PersistedAcquisitionAudit {
     #[diesel(sql_type = BigInt)]
     id: i64,
@@ -77,6 +144,26 @@ struct PersistedAcquisitionAudit {
     retryable: i32,
     #[diesel(sql_type = Text)]
     created_at: String,
+}
+
+impl PersistedAcquisitionAudit {
+    fn record(&self) -> DataAcquisitionAuditRecord<'_> {
+        DataAcquisitionAuditRecord {
+            capability: &self.capability,
+            provider: &self.provider,
+            source: &self.source,
+            request_hash: &self.request_hash,
+            source_at: self.source_at.as_deref(),
+            observed_at: &self.observed_at,
+            batch_id: self.batch_id.as_deref(),
+            outcome: &self.outcome,
+            request_count: self.request_count,
+            accepted_count: self.accepted_count,
+            rejected_count: self.rejected_count,
+            reason_code: &self.reason_code,
+            retryable: self.retryable != 0,
+        }
+    }
 }
 
 #[derive(Debug, QueryableByName)]
@@ -539,6 +626,21 @@ mod tests {
         count: i64,
     }
 
+    fn audit_directory_bytes(
+        root: &std::path::Path,
+    ) -> std::collections::BTreeMap<std::ffi::OsString, Vec<u8>> {
+        std::fs::read_dir(root)
+            .expect("TEST_CODE directory")
+            .map(|entry| {
+                let entry = entry.expect("TEST_CODE file entry");
+                (
+                    entry.file_name(),
+                    std::fs::read(entry.path()).expect("TEST_CODE bytes"),
+                )
+            })
+            .collect()
+    }
+
     fn connection() -> SqliteConnection {
         let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
         create_schema(&mut conn).expect("acquisition audit schema");
@@ -560,6 +662,223 @@ mod tests {
             rejected_count: 0,
             reason_code: "TEST_CODE_ok",
             retryable: false,
+        }
+    }
+
+    #[test]
+    fn w15_acquisition_reader_reopens_verified_empty_facts_without_writes() {
+        let root = tempfile::tempdir().expect("TEST_CODE audit root");
+        let database = root
+            .path()
+            .canonicalize()
+            .expect("TEST_CODE canonical root")
+            .join("acquisition.sqlite3");
+        let path = database.to_str().expect("TEST_CODE UTF-8 fixture path");
+        let mut expected = record("verified_empty", Some("TEST_CODE_SECRET_batch"));
+        expected.source = "TEST_CODE_SECRET_source";
+        let receipt = {
+            let mut writer = SqliteConnection::establish(path).expect("TEST_CODE fixture writer");
+            create_schema(&mut writer).expect("TEST_CODE fixture schema");
+            writer
+                .immediate_transaction::<_, diesel::result::Error, _>(|conn| {
+                    insert_acquisition_audit_query(conn, &expected)
+                })
+                .expect("TEST_CODE append fixture")
+        };
+        let before = audit_directory_bytes(root.path());
+        let verified = {
+            let mut reader = SqliteConnection::establish(&format!("file:{path}?mode=ro"))
+                .expect("TEST_CODE explicit readonly connection");
+            diesel::sql_query("PRAGMA query_only=ON")
+                .execute(&mut reader)
+                .expect("TEST_CODE query-only connection");
+            read_verified_acquisition_audit(&mut reader, &receipt)
+                .expect("TEST_CODE query original audited facts")
+        };
+        assert_eq!(verified.receipt(), &receipt);
+        let actual = verified.record();
+        assert_eq!(actual.capability, expected.capability);
+        assert_eq!(actual.provider, expected.provider);
+        assert_eq!(actual.source, expected.source);
+        assert_eq!(actual.request_hash, expected.request_hash);
+        assert_eq!(actual.source_at, expected.source_at);
+        assert_eq!(actual.observed_at, expected.observed_at);
+        assert_eq!(actual.batch_id, expected.batch_id);
+        assert_eq!(actual.outcome, "verified_empty");
+        assert_eq!(actual.request_count, 1);
+        assert_eq!(actual.accepted_count, 0);
+        assert_eq!(actual.rejected_count, 0);
+        assert_eq!(actual.reason_code, expected.reason_code);
+        assert!(!actual.retryable);
+        assert!(!format!("{verified:?}").contains("TEST_CODE_SECRET"));
+        assert_eq!(audit_directory_bytes(root.path()), before);
+    }
+
+    #[test]
+    fn w15_acquisition_reader_preserves_all_raw_outcomes_and_exact_receipts() {
+        let mut conn = connection();
+        for outcome in [
+            "available",
+            "verified_empty",
+            "invalid_request",
+            "unavailable",
+            "stale",
+            "partial",
+            "conflict",
+            "unsupported",
+        ] {
+            let has_batch = matches!(outcome, "available" | "verified_empty");
+            let mut expected = record(outcome, has_batch.then_some("TEST_CODE_verified_batch"));
+            expected.retryable = !has_batch;
+            let receipt = conn
+                .immediate_transaction::<_, diesel::result::Error, _>(|conn| {
+                    insert_acquisition_audit_query(conn, &expected)
+                })
+                .expect("TEST_CODE append outcome");
+            let verified = read_verified_acquisition_audit(&mut conn, &receipt)
+                .expect("TEST_CODE preserve original outcome");
+            let actual = verified.record();
+            assert_eq!(verified.receipt(), &receipt);
+            assert_eq!(actual.outcome, outcome);
+            assert_eq!(actual.batch_id, expected.batch_id);
+            assert_eq!(actual.accepted_count, i64::from(outcome == "available"));
+            assert_eq!(actual.retryable, !has_batch);
+        }
+    }
+
+    #[test]
+    fn w15_acquisition_reader_rejects_every_receipt_field_drift_with_closed_errors() {
+        let mut conn = connection();
+        let first = conn
+            .immediate_transaction::<_, diesel::result::Error, _>(|conn| {
+                insert_acquisition_audit_query(conn, &record("available", Some("TEST_CODE_first")))
+            })
+            .expect("TEST_CODE first receipt");
+        let receipt = conn
+            .immediate_transaction::<_, diesel::result::Error, _>(|conn| {
+                insert_acquisition_audit_query(conn, &record("unavailable", None))
+            })
+            .expect("TEST_CODE second receipt");
+        for field in ["id", "hash", "previous", "current"] {
+            let mut altered = receipt.clone();
+            match field {
+                "id" => altered.audit_id += 100,
+                "hash" => altered.record_hash = "a".repeat(64),
+                "previous" => altered.previous_outcome = Some("TEST_CODE_SECRET_previous".into()),
+                "current" => altered.current_outcome = "TEST_CODE_SECRET_current".into(),
+                _ => unreachable!("TEST_CODE fixed cases"),
+            }
+            let error = read_verified_acquisition_audit(&mut conn, &altered)
+                .expect_err("TEST_CODE receipt drift cannot certify facts");
+            assert_eq!(error, AcquisitionAuditReadError);
+            assert_eq!(
+                error.to_string(),
+                "acquisition audit facts could not be verified"
+            );
+            assert!(!format!("{error:?}").contains("TEST_CODE_SECRET"));
+        }
+        assert_eq!(
+            read_verified_acquisition_audit(&mut conn, &receipt)
+                .expect("TEST_CODE current receipt remains valid")
+                .receipt(),
+            &receipt
+        );
+        assert_eq!(
+            read_verified_acquisition_audit(&mut conn, &first)
+                .expect("TEST_CODE historical receipt remains valid")
+                .record()
+                .outcome,
+            "available"
+        );
+        let mut missing_schema =
+            SqliteConnection::establish(":memory:").expect("TEST_CODE empty db");
+        diesel::sql_query("PRAGMA query_only=ON")
+            .execute(&mut missing_schema)
+            .expect("TEST_CODE query only");
+        assert_eq!(
+            read_verified_acquisition_audit(&mut missing_schema, &receipt)
+                .expect_err("TEST_CODE cannot initialize missing schema"),
+            AcquisitionAuditReadError
+        );
+    }
+
+    #[test]
+    fn w15_acquisition_reader_rejects_middle_audit_or_chain_damage_without_repair() {
+        #[derive(QueryableByName)]
+        struct TriggerDefinition {
+            #[diesel(sql_type = Text)]
+            sql: String,
+        }
+        for damage in ["audit", "chain"] {
+            let root = tempfile::tempdir().expect("TEST_CODE corruption root");
+            let database = root
+                .path()
+                .canonicalize()
+                .expect("TEST_CODE canonical root")
+                .join("acquisition.sqlite3");
+            let path = database.to_str().expect("TEST_CODE fixture path");
+            let receipts = {
+                let mut conn = SqliteConnection::establish(path).expect("TEST_CODE fixture writer");
+                create_schema(&mut conn).expect("TEST_CODE schema");
+                let mut receipts = Vec::new();
+                for outcome in ["available", "unavailable", "verified_empty"] {
+                    receipts.push(
+                        conn.immediate_transaction::<_, diesel::result::Error, _>(|conn| {
+                            insert_acquisition_audit_query(
+                                conn,
+                                &record(outcome, Some("TEST_CODE_batch")),
+                            )
+                        })
+                        .expect("TEST_CODE append history"),
+                    );
+                }
+                let (trigger_name, drop_sql, tamper_sql) = if damage == "audit" {
+                    ("trg_data_acquisition_audit_no_update",
+                     "DROP TRIGGER trg_data_acquisition_audit_no_update",
+                     "UPDATE data_acquisition_audit SET source='TEST_CODE_SECRET_damage' WHERE id=?")
+                } else {
+                    ("trg_data_acquisition_audit_chain_no_update",
+                     "DROP TRIGGER trg_data_acquisition_audit_chain_no_update",
+                     "UPDATE data_acquisition_audit_chain SET previous_hash='TEST_CODE_SECRET_damage' WHERE acquisition_audit_id=?")
+                };
+                let original = diesel::sql_query(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+                )
+                .bind::<Text, _>(trigger_name)
+                .get_result::<TriggerDefinition>(&mut conn)
+                .expect("TEST_CODE save immutable trigger");
+                diesel::sql_query(drop_sql)
+                    .execute(&mut conn)
+                    .expect("TEST_CODE drop selected trigger");
+                assert_eq!(
+                    diesel::sql_query(tamper_sql)
+                        .bind::<BigInt, _>(receipts[1].audit_id)
+                        .execute(&mut conn)
+                        .expect("TEST_CODE damage middle history"),
+                    1
+                );
+                diesel::sql_query(original.sql)
+                    .execute(&mut conn)
+                    .expect("TEST_CODE restore original trigger");
+                receipts
+            };
+            let damaged = audit_directory_bytes(root.path());
+            {
+                let mut conn = SqliteConnection::establish(&format!("file:{path}?mode=ro"))
+                    .expect("TEST_CODE readonly connection");
+                diesel::sql_query("PRAGMA query_only=ON")
+                    .execute(&mut conn)
+                    .expect("TEST_CODE query only");
+                for receipt in receipts {
+                    assert_eq!(
+                        read_verified_acquisition_audit(&mut conn, &receipt).expect_err(
+                            "TEST_CODE complete chain damage rejects even old receipts"
+                        ),
+                        AcquisitionAuditReadError
+                    );
+                }
+            }
+            assert_eq!(audit_directory_bytes(root.path()), damaged);
         }
     }
 
