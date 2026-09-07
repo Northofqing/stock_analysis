@@ -235,7 +235,7 @@ pub(crate) fn reconcile_startup(
     bindings: &dyn RecoveryBindingsPort,
 ) -> Result<StartupRecoveryReport, RecoveryError> {
     let mut entries = BTreeMap::new();
-    let mut transition_count = 0;
+    let mut transition_count: usize = 0;
 
     for iteration in 1..=config.max_iterations {
         let mut cursor = None;
