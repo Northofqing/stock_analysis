@@ -1,4 +1,8 @@
+use std::collections::BTreeMap;
+use std::path::Path;
+
 use crate::monitor::push_job::{MachineCatalog, ProducerId, UnitId, UtcMicros};
+use rusqlite::{params, Connection};
 
 use super::operational_readiness::{DependencyKind, ReadinessScope, ReadinessStatus};
 use super::readiness_recovery::{
@@ -9,8 +13,20 @@ use super::readiness_store::{
     ReadinessAppendFault, ReadinessRecordStore, ReadinessStoreError, ReadinessStreamId,
 };
 use super::readiness_store_schema::{
-    initialize_database, with_write_transaction, ReadinessSchemaError,
+    initialize_database, with_read_only, with_write_transaction, ReadinessSchemaError,
 };
+
+fn directory_bytes(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    std::fs::read_dir(root)
+        .expect("TEST_CODE read store directory")
+        .map(|entry| {
+            let entry = entry.expect("TEST_CODE store directory entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let bytes = std::fs::read(entry.path()).expect("TEST_CODE store artifact bytes");
+            (name, bytes)
+        })
+        .collect()
+}
 
 #[test]
 fn w15_store_reopens_the_same_pending_snapshot_event_and_head() {
@@ -62,9 +78,9 @@ fn w15_store_reopens_the_same_pending_snapshot_event_and_head() {
 #[test]
 fn w15_store_rolls_back_event_snapshot_and_head_at_each_write_boundary() {
     for fault in [
-        ReadinessAppendFault::AfterEvent,
-        ReadinessAppendFault::AfterSnapshot,
-        ReadinessAppendFault::AfterHead,
+        ReadinessAppendFault::Event,
+        ReadinessAppendFault::Snapshot,
+        ReadinessAppendFault::Head,
     ] {
         let root = tempfile::tempdir().expect("TEST_CODE atomic store root");
         let database = root
@@ -125,6 +141,116 @@ fn w15_store_rolls_back_event_snapshot_and_head_at_each_write_boundary() {
             first
         );
     }
+}
+
+#[test]
+fn w15_store_rejects_middle_event_corruption_without_repair_or_sidecar_files() {
+    let root = tempfile::tempdir().expect("TEST_CODE middle corruption root");
+    let database = root
+        .path()
+        .canonicalize()
+        .expect("TEST_CODE canonical root")
+        .join("readiness.sqlite3");
+    let catalog = MachineCatalog::bundled().expect("TEST_CODE catalog");
+    let namespace = context(100).namespace;
+    initialize_database(&database, &namespace).expect("TEST_CODE initialize");
+    let (assessment, evidence) = assessed(&ReadinessScope::Core, Some(DependencyKind::Schema));
+    let first = CandidateReadinessRecord::try_new(
+        None,
+        context(100),
+        assessment.clone(),
+        evidence.clone(),
+        vec![],
+    )
+    .expect("TEST_CODE first pending");
+    let second = CandidateReadinessRecord::try_new(
+        Some(first.snapshot()),
+        context(200),
+        assessment.clone(),
+        evidence.clone(),
+        vec![],
+    )
+    .expect("TEST_CODE second pending");
+    let third = CandidateReadinessRecord::try_new(
+        Some(second.snapshot()),
+        context(300),
+        assessment.clone(),
+        evidence.clone(),
+        vec![],
+    )
+    .expect("TEST_CODE third pending");
+    let fourth = CandidateReadinessRecord::try_new(
+        Some(third.snapshot()),
+        context(400),
+        assessment,
+        evidence,
+        vec![],
+    )
+    .expect("TEST_CODE fourth candidate");
+    let store = ReadinessRecordStore::at(&database, &namespace, &catalog);
+    let first_committed = store.append(None, &first).expect("TEST_CODE commit first");
+    let second_committed = store
+        .append(Some(&first_committed), &second)
+        .expect("TEST_CODE commit second");
+    let third_committed = store
+        .append(Some(&second_committed), &third)
+        .expect("TEST_CODE commit third");
+
+    {
+        let connection = Connection::open(&database).expect("TEST_CODE fault connection");
+        let trigger_sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master \
+                 WHERE type='trigger' \
+                   AND name='operational_readiness_recovery_event_no_update'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("TEST_CODE preserve exact event trigger");
+        connection
+            .execute_batch("DROP TRIGGER operational_readiness_recovery_event_no_update;")
+            .expect("TEST_CODE disable event update guard");
+        connection
+            .execute(
+                "UPDATE operational_readiness_recovery_event \
+                 SET canonical_bytes=?1 WHERE event_id=?2",
+                params![
+                    b"TEST_CODE-corrupt-event".as_slice(),
+                    second.snapshot().recovery_event_id().as_str()
+                ],
+            )
+            .expect("TEST_CODE corrupt middle event bytes");
+        connection
+            .execute_batch(&trigger_sql)
+            .expect("TEST_CODE restore exact event trigger");
+    }
+
+    with_read_only(
+        &database,
+        &namespace,
+        |_| Ok::<(), ReadinessSchemaError>(()),
+    )
+    .expect("TEST_CODE restored schema remains valid");
+    let damaged_directory = directory_bytes(root.path());
+    let stream = ReadinessStreamId::for_snapshot(third.snapshot());
+
+    assert!(matches!(
+        store.load_head(&stream),
+        Err(ReadinessStoreError::Event(_))
+    ));
+    assert!(matches!(
+        store.load_record(second.snapshot().snapshot_id()),
+        Err(ReadinessStoreError::Event(_))
+    ));
+    assert!(matches!(
+        store.append(Some(&third_committed), &fourth),
+        Err(ReadinessStoreError::Event(_))
+    ));
+    assert_eq!(
+        directory_bytes(root.path()),
+        damaged_directory,
+        "TEST_CODE rejected operations neither repair nor create sidecar files"
+    );
 }
 
 #[test]

@@ -46,7 +46,7 @@ pub(super) fn lock_main_file_and_read_header(
     let result = unsafe {
         ffi::sqlite3_file_control(
             connection.handle(),
-            b"main\0".as_ptr().cast(),
+            c"main".as_ptr(),
             ffi::SQLITE_FCNTL_FILE_POINTER,
             (&mut file as *mut *mut ffi::sqlite3_file).cast::<c_void>(),
         )
