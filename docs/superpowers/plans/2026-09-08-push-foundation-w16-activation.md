@@ -1,6 +1,6 @@
 # W16 activation 完整实施计划
 
-日期：2026-09-08。状态：T1 完整读取链路 `1c16380` 已通过限定独立审查；14项测试、196项相邻回归和目标Clippy通过。B 的Shadow范围已澄清，实际生产身份、owner认证/准入与执行仍未完成。设计：[W16 activation 设计](../specs/2026-09-08-push-foundation-w16-activation-design.md)；证据：[W16 实施结果](../../push-system/implementation-w16-results-2026-09-08.md)。完整 W16 未完成。
+日期：2026-09-08。状态：完整读取 `1c16380`、内部事务/原始准入投影 `10f7e03` 及测试补充 `5a78dd6` 已通过限定独立审查；合批221项与修正后事务专项18项通过，目标Clippy零诊断。B/C工程合同已定；真实生产身份、准入认证、当前fence及owner执行仍未完成。设计：[W16 activation 设计](../specs/2026-09-08-push-foundation-w16-activation-design.md)；证据：[W16 实施结果](../../push-system/implementation-w16-results-2026-09-08.md)。完整 W16 未完成。
 
 ## 范围与执行约定
 

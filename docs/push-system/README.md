@@ -5,8 +5,8 @@
 ## 当前开发入口（2026-09-08）
 
 - [W15 实施结果](implementation-w15-results-2026-09-07.md) §10–12：依赖候选合同、实际 occurrence 读取和采集事务适配器已通过限定验证/审查，完整来源认证、运行查询及调度联结尚未完成。
-- [W16 实施结果](implementation-w16-results-2026-09-08.md)：激活记录读取已提交，14项限定测试与196项相邻回归通过，独立审查 Approved；身份/owner/配额/实际切换仍按 [实施计划](../superpowers/plans/2026-09-08-push-foundation-w16-activation.md) 交付，不能按只读结果标 W16 完成。
-- [W16 合同裁决](activation-contract-decisions-2026-09-08.md)：澄清 shadow actor 无 owner 与保留旧推送的关系；当前 fence、排空与回滚仍需真实实现证明，不是生产批准。
+- [W16 实施结果](implementation-w16-results-2026-09-08.md)：完整读取、内部CAS/跨Unit日配额事务及原始准入投影已实现并通过限定审查；合批221项通过，审查补充后事务专项18项通过。真实身份/可信日历/共同fence/实际切换仍按 [实施计划](../superpowers/plans/2026-09-08-push-foundation-w16-activation.md) 交付，不能按内部引擎标W16完成。
+- [W16 合同裁决](activation-contract-decisions-2026-09-08.md)：澄清 shadow actor 与旧推送关系，固定外部批准包、同事务写入和paused确认顺序；真实监督器及恢复接线仍需实现证明，不是生产批准。
 
 以下第三批状态是 **2026-09-06 的历史交接快照**，其中“W01--W21 运行时未实现”等描述不代表上述后续实现进度；原始输入/权限边界仍有效。
 

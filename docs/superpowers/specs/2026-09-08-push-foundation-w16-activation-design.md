@@ -1,6 +1,6 @@
 # W16 activation、部署认证与 owner fence 设计
 
-日期：2026-09-08。状态：T1 完整只读链路 `1c16380` 已通过限定验证/独立审查，B 的Shadow范围已澄清；其余认证/执行仍未完成或按 needs-context 保留，未认证部署，未执行生产操作。配套计划：[W16 可执行计划](../plans/2026-09-08-push-foundation-w16-activation.md)；当前证据：[W16 实施结果](../../push-system/implementation-w16-results-2026-09-08.md)。
+日期：2026-09-08。状态：完整读取 `1c16380`、内部事务/原始准入投影 `10f7e03` 和测试补充 `5a78dd6` 已通过限定验证/独立审查；B/C工程合同已定，真实认证、当前fence及owner执行仍未完成。没有认证部署或执行生产操作。配套计划：[W16 可执行计划](../plans/2026-09-08-push-foundation-w16-activation.md)；当前证据：[W16 实施结果](../../push-system/implementation-w16-results-2026-09-08.md)。
 
 ## 目标、依据与范围
 

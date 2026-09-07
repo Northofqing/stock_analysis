@@ -37,11 +37,36 @@ T1 实现通过自有安全只读事务读取完整 manifest/journal、校验内
 
 外部部署真实性、实际 owner 权限、生产source配置与整个W16仍未验证，是明确的后续范围。monitor/config/Cargo/冻结SQL及蓝图两份输入相对原始BASE无差异；未以静态检查推断生产运行健康。
 
+## 新增限定实现：事务写入与准入历史投影
+
+源码 `10f7e03`，原始 BASE `06a6633`。主控与一个实现 agent 分文件并行，完成内部事务引擎、原始准入投影及其接线；不是公开生产 writer、真实操作批准或整个 T3/T4 完成。
+
+- `activation_transaction.rs::apply_activation_candidate` 持有同一 `BEGIN IMMEDIATE`，重验全 Unit 完整历史、未协调末代、generation 和候选全部持久字段；全 Unit 当日 `Activate/Rollback` 任一记录阻止新的普通 Activate。同 owner 文本不豁免 Activate，Rollback 不限额但留下阻止随后晋级的记录。
+- 同事务依次写 manifest、调用内部 paused-owner 确认边界、写 journal，再重读全链、复核窗口/时间并提交。无效候选在 owner 调用前拒绝；持锁后和提交前检查过去/未来时间及回拨。真实认证/时钟/监督器实现仍未提供，测试边界不等于它们已交付。
+- `activation_store.rs::inspect_activation_transaction` 复用同一读取、schema、字段和链校验，公开 rollback-only reader 不改为写入口。`AlreadyRecorded` 只比较两表全部字段；独立 command_id 和日历区间不在冻结两表中，T2/T5 仍必须验证外部持久批准包，不能以行相同冒充完整请求或 Ready。
+- `activation_owner.rs::project_owner_admission` 区分初始 Disabled/Shadow 的待认证原批准范围、正式排空后的关闭状态和精确历史目标回滚；检查完整历史中的 owner 保留规则，保留目标路径上每次 rollback 的批准引用。当前元组使用新代，不返回旧 token；None、未登记和待协调不能授予权限。
+
+第三次合批验证 session22963：`cargo test --lib push_foundation:: -- --test-threads=1` exit0，**221 passed / 0 failed / 2 helper ignored**，28.43s，compile2m27s、43项既有 warning。其中17项事务测试、8项准入测试与原196项均通过；两个helper由父测试实际执行，新三组真实进程竞争合计执行6次子helper，均通过。包括真实第二连接 SHARED 锁导致 COMMIT BUSY、无自动再次 owner 调用、关闭连接后公开 T1 读回无半条记录的反例。
+
+首轮63433因新测试辅助函数被同名变量遮蔽产生3个E0618，0项测试执行；第二轮70996为219 passed/1 failed/2 helper ignored，失败是Pending先进入准入投影而被归类为InvalidHistory。原agent修正优先级，未放宽预期；第三轮才全绿。helper也改为显式ignore、父进程指定执行及有界启动等待，没有把无断言返回算作业务通过。
+
+Clippy75692 exit0，1m24s；当前完整fingerprint为163项有位置既有warning，Foundation/采集审计目标零诊断。六精确Rust文件格式和diff检查通过；冻结SQL、八份输入、monitor/config/Cargo均未改。
+
+独立范围审查要求补“真实等待写锁期间批准过期”的反例，同批完善进程锁竞争握手、同日额度已占用后的连续Rollback覆盖。修正提交 `5a78dd6` 只改测试文件，生产逻辑不变：
+
+- 真实 SQLite BUSY 回调确认 contender 正在竞争写锁，随后推进受控测试时钟到批准窗口终点，释放锁后必须拒绝、只进行一次锁后检查、pause调用为0且历史为空。
+- 等待方子进程通过实际 BUSY marker 握手；父进程观察后才释放Rollback，不再用100ms睡眠猜测已经发生竞争。
+- 同日Activate先占额度，两次连续同日Rollback均成功，随后另一个Unit的Activate仍被拒绝。
+
+session40241：`cargo test --lib push_foundation::activation_transaction_tests -- --test-threads=1` exit0，**18 passed / 0 failed / 1 helper ignored**，4.93s，compile2m26s、43项既有warning；三组进程的6次helper实际执行均通过。未改的生产/准入代码和原相邻回归沿用22963，未改lib的Clippy沿用75692，没有把两次不同范围命令冒充一次新的全仓测试。
+
+限定复核 `10f7e03..5a78dd6`：三项全部ADDRESSED，新Critical/Important/Minor均无；最终 **Spec Approved / Code quality Approved**。批准范围仅内部事务引擎、原始准入投影与本批测试，不是整个T3/T4、真实身份或生产owner接管。
+
 ## 完整剩余范围
 
 - T2：真实操作员/部署/source package/日历和批准验证；生产平台及根配置尚未给定。
-- T3：同一 IMMEDIATE 事务内 generation CAS、全 Unit 日配额与 manifest/journal 写入。
-- T4/T5：legacy/new 四类 actor 的共同当前 fence、真实监督器和旧 binary 撤权、准入历史投影、非原子切换/恢复/rollback。
+- T3：内部同事务引擎已实现；真实认证 opener、可信业务日及外部批准包精确请求绑定、T5协调接线仍待。
+- T4/T5：原始准入投影已实现；legacy/new 四类 actor 的共同当前 fence、真实监督器和旧 binary 撤权、批准范围认证、非原子切换/恢复/rollback仍待。
 - T6/T7：W15 全 Unit 部署集合及显式版本消费、同快照查询/启动、操作员入口和完整门禁。
 - W15 真正来源上下文/认证/恢复及调度联结，W17–W21，52个 Unit 的纵向迁移与真实发布证据仍未完成。
 
