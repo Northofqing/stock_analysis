@@ -1,6 +1,6 @@
 # 推送 Foundation W15 运行就绪实施计划
 
-**状态：** Task 1 设计已提交 `ec930f8`；Task 2 纯判级/显式失败证据/候选快照/重建已提交至 `a1ca363`，Task 4A 纯计数提交 `c040072`。W15 23/23、Foundation 126/126 通过；相邻 push_job 52/52 的代码未受本轮影响。原因/依赖角色修复 `1b30629` 已通过独立复审；codec 独立审查进行中。Task 3 正在实现独立 schema/open 和无环 recovery 材料，认证恢复、权威 probe 与调度联结尚未完成，W15 未完成。逐项证据见 `docs/push-system/implementation-w15-results-2026-09-07.md`。
+**状态：** Task 1 设计已提交 `ec930f8`；Task 2 候选判级/快照/重建及补测已提交至 `6f255c0`，Task 4A 纯计数 `c040072`。原因/依赖角色修复与 snapshot codec 补测均已独立复审通过。Task 3 的无环 recovery 材料与 event 重读已实现，后者在 `7617763` 补测后独立复审通过；schema/open 第一轮修复 `b6f5c99` 有 W15 47/47、Foundation 150/150 证据，但两个连接/模式竞态仍未闭合，第二轮先补确定性反例。完整原子 store、来源认证、权威 probe 与调度联结尚未交付，W15 未完成。逐项证据见 `docs/push-system/implementation-w15-results-2026-09-07.md`。
 
 **目标：** 交付 Core/Producer/Occurrence 三个范围的就绪判定、可查询的不可变运行快照、绑定前后快照及依赖版本的恢复事件，以及只读部署探针。按 WBS 执行完整 W15，不将单次 source availability 等同于全部就绪能力。
 
@@ -53,7 +53,7 @@
 
 ## Task 3：持久快照与恢复事件闭环
 
-并行边界：Task 3A 在 `readiness_store_schema.rs` 实现独立 schema/namespace 验证和显式初始化、只读/写入打开；主代理在 `readiness_recovery.rs` 实现无环事件/快照材料后集成 `readiness_store.rs`。schema 连接与候选事件都不是认证权限，不替代本任务的真实原子提交与恢复验收。
+并行边界：Task 3A 在 `readiness_store_schema.rs` 实现独立 schema/namespace 验证和显式初始化、只读/写入打开；主代理在 `readiness_recovery.rs` 实现无环事件/快照材料、在 `readiness_recovery_codec.rs` 校验重读关联后集成 `readiness_store.rs`。schema 连接与候选事件都不是认证权限，不替代本任务的真实原子提交与恢复验收。
 
 按 Task 1 冻结的存储方案新增 `readiness_store.rs` 及测试（路径可在设计中细化），使用真实隔离存储验证：
 

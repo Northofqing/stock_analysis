@@ -24,6 +24,8 @@
 
 新库不保存 prepared/rendered/receipt/source 正文，不形成另一套投递 authority。producer 接线、生产路径和初始化操作留到获准的部署流程。
 
+只读文件副作用边界补充：operational v1 使用 rollback-journal 文件格式；WAL/未知版本在 SQLite 查询前拒绝，不自动转换、checkpoint 或用 immutable=1 忽略未合并事实。原因是 SQLite 的 READ_ONLY WAL 打开仍可能在可写目录创建 `-wal`/`-shm`（[官方 WAL §5](https://www.sqlite.org/wal.html#read_only_databases)）；[文件头读写版本](https://www.sqlite.org/fileformat.html#file_format_version_numbers) 可在查询前识别。初始化必须原子取得缺失目标的创建所有权，防止竞争空文件被接管。上述为零副作用/文件所有权合同的实现要求，目前审查修复待完成。
+
 ## 3. 模块与小接口
 
 文件规划：
@@ -34,6 +36,7 @@
 - `src/push_foundation/readiness_store.rs`：schema、证据复验、snapshot/recovery 原子追加、只读重查。
 - `src/push_foundation/readiness_store_schema.rs`：独立 SQLite 的 schema/header/namespace 与显式初始化、只读/写入打开；不提供认证或投递权限。
 - `src/push_foundation/readiness_recovery.rs`：无环 recovery identity 与 before/after snapshot 材料；认证来源仍由 store 的实际 reader 复验，候选事件不是恢复许可。
+- `src/push_foundation/readiness_recovery_codec.rs`：从事件正文与两端候选快照重建 identity、实际依赖差异及恢复声明，逐字节核对全部关联；不认证外部来源。
 - `src/push_foundation/readiness_probe.rs`：来自同一 snapshot 的 health/deployment/CLI 投影。
 - `src/bin/push_readiness_probe.rs`：显式路径的只读命令；不启动 monitor、不进行 provider 调用。
 - 各模块对应 `_tests.rs`；内部模块仅在 `push_foundation/mod.rs` 注册，最终仅导出 probe 必需的只读接口。
