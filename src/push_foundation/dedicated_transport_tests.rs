@@ -1,22 +1,23 @@
 use std::cell::RefCell;
 
 use crate::durable_delivery::{
-    DeliveryEnvelope, DeliverySubKind, FoundationTerminalDisposition, P01DedicatedTerminalQuery,
-    P01DedicatedTerminalRecord, PushKind,
+    DecisionState, DeliveryEnvelope, DeliverySubKind, FoundationTerminalDisposition,
+    P01DedicatedTerminalQuery, P01DedicatedTerminalRecord, PushKind,
 };
 use crate::monitor::push_job::{
     raw_digest, w09_completion_policy_fixture, AudienceId, AuthorityClass, BusinessDate, ChannelId,
-    CompletionOwnerId, DeliveryResultView, Namespace, OccurrenceFamily, OccurrenceIdentityMaterial,
-    OccurrenceKey, SourceContractId, SubjectId, TemplateId, TemplateVersion, UnitId, UtcMicros,
+    CompletionEligibility, CompletionOwnerId, CompletionPolicy, DeliveryResultView, Namespace,
+    OccurrenceFamily, OccurrenceIdentityMaterial, OccurrenceKey, Sha256Digest, SourceContractId,
+    SubjectId, TemplateId, TemplateVersion, UnitId, UtcMicros,
 };
 
 use super::dedicated_transport::{
-    verify_p01_dedicated, DedicatedConformanceRoute, DedicatedSourceFailure,
-    P01DedicatedTerminalSource,
+    verify_p01_dedicated, DedicatedConformanceError, DedicatedConformanceRoute,
+    DedicatedSourceFailure, P01DedicatedTerminalSource,
 };
 use super::{
     BusinessIntentStore, FoundationSchemaMigration, InitialIntentDraft, InitialIntentIdentity,
-    InitialIntentOutcome, TerminalTemplateBinding,
+    InitialIntentOutcome, IntentSnapshot, TerminalTemplateBinding,
 };
 
 struct FakeP01Source {
@@ -36,8 +37,21 @@ impl P01DedicatedTerminalSource for FakeP01Source {
     }
 }
 
-#[test]
-fn w13_p01_dedicated_maps_exact_accepted_through_w09() {
+struct P01Case {
+    _root: tempfile::TempDir,
+    snapshot: IntentSnapshot,
+    template: TerminalTemplateBinding,
+    route: DedicatedConformanceRoute,
+    policy: CompletionPolicy,
+    terminal: P01DedicatedTerminalRecord,
+    evidence_sha256: Sha256Digest,
+}
+
+fn p01_case() -> P01Case {
+    p01_case_for("MU-p01", SubjectId::Global)
+}
+
+fn p01_case_for(unit_id: &str, subject: SubjectId) -> P01Case {
     let root = tempfile::tempdir().expect("create W13 P01 store");
     let database = root.path().join("business.sqlite3");
     FoundationSchemaMigration::bundled()
@@ -50,7 +64,7 @@ fn w13_p01_dedicated_maps_exact_accepted_through_w09() {
     );
     let identity = InitialIntentIdentity::new(
         Namespace::Production,
-        UnitId::try_new("MU-p01".to_owned()).expect("unit"),
+        UnitId::try_new(unit_id.to_owned()).expect("unit"),
         OccurrenceIdentityMaterial::new(
             BusinessDate::parse("2026-08-18").expect("business date"),
             OccurrenceFamily::try_new("p01-business-date".to_owned()).expect("family"),
@@ -58,7 +72,7 @@ fn w13_p01_dedicated_maps_exact_accepted_through_w09() {
         ),
         CompletionOwnerId::try_new("p01-business-date-once".to_owned()).expect("owner"),
         SourceContractId::try_new("p01-source".to_owned()).expect("source contract"),
-        SubjectId::Global,
+        subject,
         AudienceId::try_new("portfolio-owner".to_owned()).expect("audience"),
     );
     let rendered = b"TEST_CODE_W13_P01_RENDERED".to_vec();
@@ -117,29 +131,55 @@ fn w13_p01_dedicated_maps_exact_accepted_through_w09() {
         ref_id: "TEST_CODE_W13_P01_DISPOSITION".to_owned(),
         attempt_id: Some("TEST_CODE_W13_P01_ATTEMPT".to_owned()),
         disposition: FoundationTerminalDisposition::Accepted,
+        accepted_channel: Some("TEST_CODE_W13_P01_CHANNEL".to_owned()),
         evidence_bytes,
         evidence_sha256: evidence_sha256.as_str().to_owned(),
         durable_schema_version: crate::durable_delivery::DURABLE_SCHEMA_VERSION,
     };
-    let source = FakeP01Source {
-        result: P01DedicatedTerminalQuery::Terminal(Box::new(terminal)),
-        queried_dates: RefCell::new(Vec::new()),
-    };
     let route = DedicatedConformanceRoute::try_new(
-        template,
+        template.clone(),
         ChannelId::try_new("TEST_CODE_W13_P01_CHANNEL".to_owned()).expect("channel"),
     )
     .expect("valid P01 route");
     let policy = w09_completion_policy_fixture(
-        "MU-p01",
+        Box::leak(unit_id.to_owned().into_boxed_str()),
         "p01-business-date-once",
         vec![AuthorityClass::P01Dedicated],
     );
 
+    P01Case {
+        _root: root,
+        snapshot,
+        template,
+        route,
+        policy,
+        terminal,
+        evidence_sha256,
+    }
+}
+
+fn source_for(result: P01DedicatedTerminalQuery) -> FakeP01Source {
+    FakeP01Source {
+        result,
+        queried_dates: RefCell::new(Vec::new()),
+    }
+}
+
+#[test]
+fn w13_p01_dedicated_maps_exact_accepted_through_w09() {
+    let case = p01_case();
+    let attested = case
+        .snapshot
+        .attested_ready_binding()
+        .expect("attested P01 Ready binding");
+    let source = source_for(P01DedicatedTerminalQuery::Terminal(Box::new(
+        case.terminal.clone(),
+    )));
+
     let result = verify_p01_dedicated(
-        &snapshot,
-        &route,
-        &policy,
+        &case.snapshot,
+        &case.route,
+        &case.policy,
         &source,
         UtcMicros::try_new(1_787_027_401_000_000).expect("verified at"),
     )
@@ -153,5 +193,207 @@ fn w13_p01_dedicated_maps_exact_accepted_through_w09() {
     assert_eq!(verified.decision_id(), &attested.decision_id);
     assert_eq!(verified.intent_id(), &attested.intent_id);
     assert_eq!(verified.occurrence(), &attested.occurrence);
-    assert_eq!(verified.evidence_sha256(), &evidence_sha256);
+    assert_eq!(verified.evidence_sha256(), &case.evidence_sha256);
+}
+
+#[test]
+fn w13_p01_dedicated_preserves_dispositions_and_pending_states() {
+    for (disposition, expected) in [
+        (FoundationTerminalDisposition::Accepted, "accepted"),
+        (FoundationTerminalDisposition::Rejected, "rejected"),
+        (FoundationTerminalDisposition::Uncertain, "uncertain"),
+        (FoundationTerminalDisposition::ManualAccepted, "manual"),
+        (FoundationTerminalDisposition::ManualNotDelivered, "manual"),
+    ] {
+        let case = p01_case();
+        let mut terminal = case.terminal.clone();
+        terminal.disposition = disposition;
+        if disposition != FoundationTerminalDisposition::Accepted {
+            terminal.evidence_bytes = format!("TEST_CODE_W13_P01_{disposition:?}").into_bytes();
+            terminal.evidence_sha256 = raw_digest(&terminal.evidence_bytes).as_str().to_owned();
+            terminal.accepted_channel = None;
+        }
+        let source = source_for(P01DedicatedTerminalQuery::Terminal(Box::new(terminal)));
+        let result = verify_p01_dedicated(
+            &case.snapshot,
+            &case.route,
+            &case.policy,
+            &source,
+            UtcMicros::try_new(1_787_027_401_000_000).expect("verified at"),
+        )
+        .expect("map P01 terminal disposition");
+        match (expected, result.view()) {
+            ("accepted", DeliveryResultView::TransportAccepted(_))
+            | ("rejected", DeliveryResultView::TransportRejected(_))
+            | ("uncertain", DeliveryResultView::TransportUncertain(_))
+            | ("manual", DeliveryResultView::AlreadyTerminal(_)) => {}
+            (_, observed) => panic!("unexpected P01 disposition view: {observed:?}"),
+        }
+        if matches!(expected, "rejected" | "uncertain") {
+            assert_eq!(
+                result.completion_eligibility(),
+                CompletionEligibility::Never
+            );
+        }
+    }
+
+    let case = p01_case();
+    let missing = source_for(P01DedicatedTerminalQuery::Missing);
+    assert_eq!(
+        verify_p01_dedicated(
+            &case.snapshot,
+            &case.route,
+            &case.policy,
+            &missing,
+            UtcMicros::try_new(1_787_027_401_000_000).unwrap(),
+        ),
+        Err(DedicatedConformanceError::TerminalMissing)
+    );
+    let pending = source_for(P01DedicatedTerminalQuery::PendingSeal {
+        state: DecisionState::Reserved,
+    });
+    assert_eq!(
+        verify_p01_dedicated(
+            &case.snapshot,
+            &case.route,
+            &case.policy,
+            &pending,
+            UtcMicros::try_new(1_787_027_401_000_000).unwrap(),
+        ),
+        Err(DedicatedConformanceError::TerminalPendingSeal)
+    );
+}
+
+#[test]
+fn w13_p01_manual_accepted_optional_receipt_channel_is_exact() {
+    let case = p01_case();
+    let mut terminal = case.terminal.clone();
+    terminal.disposition = FoundationTerminalDisposition::ManualAccepted;
+    terminal.evidence_bytes = b"TEST_CODE_W13_P01_MANUAL_ACCEPTED".to_vec();
+    terminal.evidence_sha256 = raw_digest(&terminal.evidence_bytes).as_str().to_owned();
+    terminal.accepted_channel = Some("TEST_CODE_W13_WRONG_CHANNEL".to_owned());
+    let source = source_for(P01DedicatedTerminalQuery::Terminal(Box::new(terminal)));
+
+    assert_eq!(
+        verify_p01_dedicated(
+            &case.snapshot,
+            &case.route,
+            &case.policy,
+            &source,
+            UtcMicros::try_new(1_787_027_401_000_000).unwrap(),
+        ),
+        Err(DedicatedConformanceError::P01ChannelMismatch)
+    );
+}
+
+#[test]
+fn w13_p01_dedicated_fails_closed_on_binding_corruption() {
+    let case = p01_case();
+    let mut corrupt = case.terminal.clone();
+    corrupt.legacy_decision_identity = "TEST_CODE_W13_WRONG_DECISION".to_owned();
+    let source = source_for(P01DedicatedTerminalQuery::Terminal(Box::new(corrupt)));
+    assert!(verify_p01_dedicated(
+        &case.snapshot,
+        &case.route,
+        &case.policy,
+        &source,
+        UtcMicros::try_new(1_787_027_401_000_000).unwrap(),
+    )
+    .is_err());
+
+    let case = p01_case();
+    let mut corrupt = case.terminal.clone();
+    corrupt.envelope_sha256 = "0".repeat(64);
+    let source = source_for(P01DedicatedTerminalQuery::Terminal(Box::new(corrupt)));
+    assert!(verify_p01_dedicated(
+        &case.snapshot,
+        &case.route,
+        &case.policy,
+        &source,
+        UtcMicros::try_new(1_787_027_401_000_000).unwrap(),
+    )
+    .is_err());
+
+    for source_binding in [
+        serde_json::json!({
+            "render_mode": "Scheduled",
+            "schema_version": "P01_SOURCE_BINDING_V2"
+        }),
+        serde_json::json!({
+            "render_mode": "Replay",
+            "schema_version": "P01_SOURCE_BINDING_V1"
+        }),
+        serde_json::json!({
+            "extra": true,
+            "render_mode": "Scheduled",
+            "schema_version": "P01_SOURCE_BINDING_V1"
+        }),
+    ] {
+        let case = p01_case();
+        let mut corrupt = case.terminal.clone();
+        let mut envelope: DeliveryEnvelope =
+            serde_json::from_slice(&corrupt.envelope_canonical).expect("parse P01 envelope");
+        envelope.replace_source_binding_preserving_identity(
+            serde_json::to_vec(&source_binding).expect("serialize corrupt source binding"),
+        );
+        corrupt.envelope_canonical = envelope.canonical_bytes().expect("canonical envelope");
+        corrupt.envelope_sha256 = envelope.canonical_sha256().expect("envelope SHA");
+        let source = source_for(P01DedicatedTerminalQuery::Terminal(Box::new(corrupt)));
+        assert!(verify_p01_dedicated(
+            &case.snapshot,
+            &case.route,
+            &case.policy,
+            &source,
+            UtcMicros::try_new(1_787_027_401_000_000).unwrap(),
+        )
+        .is_err());
+    }
+
+    for (unit, subject) in [
+        ("MU-not-p01", SubjectId::Global),
+        (
+            "MU-p01",
+            SubjectId::entity("TEST_CODE_W13_ENTITY".to_owned()).expect("entity"),
+        ),
+    ] {
+        let case = p01_case_for(unit, subject);
+        let source = source_for(P01DedicatedTerminalQuery::Terminal(Box::new(
+            case.terminal.clone(),
+        )));
+        assert!(verify_p01_dedicated(
+            &case.snapshot,
+            &case.route,
+            &case.policy,
+            &source,
+            UtcMicros::try_new(1_787_027_401_000_000).unwrap(),
+        )
+        .is_err());
+    }
+
+    let wrong_template = TerminalTemplateBinding::new(
+        TemplateId::try_new("not_p01".to_owned()).expect("template"),
+        TemplateVersion::try_new("not_p01_v1".to_owned()).expect("version"),
+    );
+    assert_eq!(
+        DedicatedConformanceRoute::try_new(
+            wrong_template,
+            ChannelId::try_new("TEST_CODE_W13_P01_CHANNEL".to_owned()).unwrap(),
+        ),
+        Err(DedicatedConformanceError::InvalidRoute)
+    );
+
+    let case = p01_case();
+    let mut corrupt = case.terminal.clone();
+    corrupt.attempt_id = None;
+    let source = source_for(P01DedicatedTerminalQuery::Terminal(Box::new(corrupt)));
+    assert_eq!(
+        verify_p01_dedicated(
+            &case.snapshot,
+            &case.route,
+            &case.policy,
+            &source,
+            UtcMicros::try_new(1_787_027_401_000_000).unwrap(),
+        ),
+        Err(DedicatedConformanceError::InvalidP01Disposition)
+    );
 }
