@@ -7798,3 +7798,120 @@ fn w12_foundation_binding_owns_application_decision_and_exact_cross_fields() {
     )
     .is_err());
 }
+
+fn w12_foundation_envelope(label: &str) -> DeliveryEnvelope {
+    let mut candidate = envelope(
+        label,
+        PushKind::HoldingEvent,
+        DeliverySubKind::None,
+        "2026-07-30",
+        false,
+    );
+    candidate.source_evidence_fingerprint =
+        sha256_hex(format!("TEST_CODE_W12_SOURCE_{label}").as_bytes());
+    candidate.schedule_occurrence_identity =
+        sha256_hex(format!("TEST_CODE_W12_OCCURRENCE_{label}").as_bytes());
+    candidate.delivery_subject_hash =
+        sha256_hex(format!("TEST_CODE_W12_SUBJECT_{label}").as_bytes());
+    let binding = FoundationDeliveryBinding::try_new(
+        format!("Test:TEST_CODE_W12_RUN_{label}"),
+        sha256_hex(format!("TEST_CODE_W12_DECISION_{label}").as_bytes()),
+        sha256_hex(format!("TEST_CODE_W12_INTENT_{label}").as_bytes()),
+        "MU-W12-generic".to_owned(),
+        candidate.schedule_occurrence_identity.clone(),
+        candidate.business_date.clone(),
+        "Global".to_owned(),
+        candidate.delivery_subject_hash.clone(),
+        format!("TEST_CODE_W12_AUDIENCE_{label}"),
+        candidate.push_kind.stable_template_id().to_owned(),
+        "v1".to_owned(),
+        candidate.rendered_content_sha256.clone(),
+        candidate.source_evidence_fingerprint.clone(),
+        "TEST_CODE_CHANNEL".to_owned(),
+    )
+    .expect("valid W12 foundation binding");
+    candidate
+        .with_foundation_binding(binding)
+        .expect("foundation-bound envelope")
+}
+
+#[test]
+fn w12_terminal_read_model_distinguishes_missing_pending_and_accepted() {
+    let fixture = Fixture::new("W12_TERMINAL_READ");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("TERMINAL_READ");
+
+    assert_eq!(
+        fixture
+            .coordinator
+            .inspect_foundation_terminal(&candidate.decision_identity)
+            .expect("missing query"),
+        FoundationTerminalQuery::Missing
+    );
+    prepare_reserved(&fixture, &candidate, &append);
+    assert!(matches!(
+        fixture
+            .coordinator
+            .inspect_foundation_terminal(&candidate.decision_identity)
+            .expect("pending query"),
+        FoundationTerminalQuery::PendingSeal {
+            state: DecisionState::Reserved
+        }
+    ));
+
+    let sink = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(now())));
+    let sinks: Vec<AuthoritativeSink> = vec![sink.clone()];
+    fixture
+        .coordinator
+        .resume_deliverable(&candidate.decision_identity, &sinks, now())
+        .expect("record W12 accepted result");
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::Delivered,
+        &candidate.decision_identity,
+    );
+    let terminal = match fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .expect("accepted terminal query")
+    {
+        FoundationTerminalQuery::Terminal(record) => record,
+        other => panic!("expected W12 terminal record, got {other:?}"),
+    };
+
+    assert_eq!(
+        terminal.disposition(),
+        FoundationTerminalDisposition::Accepted
+    );
+    assert_eq!(terminal.attempt_id().is_some(), true);
+    assert_eq!(terminal.required_channel(), "TEST_CODE_CHANNEL");
+    assert_eq!(
+        sha256_hex(terminal.evidence_bytes()),
+        terminal.evidence_sha256()
+    );
+    assert_eq!(terminal.durable_schema_version(), 9);
+    assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
+    let exact: serde_json::Value =
+        serde_json::from_slice(terminal.evidence_bytes()).expect("exact typed result JSON");
+    assert_eq!(exact["kind"], "Accepted");
+    assert_eq!(exact["receipt"]["channel"], "TEST_CODE_CHANNEL");
+    assert!(!format!("{terminal:?}").contains("TEST_CODE_MESSAGE"));
+}
+
+#[test]
+fn w12_terminal_read_model_rejects_legacy_unbound_authority() {
+    let fixture = Fixture::new("W12_LEGACY_AUTHORITY");
+    let append = MemoryAppendPort::default();
+    let candidate = establish_authoritative_delivered_projection(
+        &fixture,
+        "W12_LEGACY_AUTHORITY",
+        &append,
+        false,
+    );
+
+    assert!(fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .is_err());
+}
