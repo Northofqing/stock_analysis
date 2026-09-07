@@ -274,8 +274,8 @@ pub(crate) enum AcceptedPreparationOutcome {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum NotDeliveredPreparationOutcome {
-    Pending(PendingNotDeliveredFinalization),
-    AlreadyFinalized(TransitionReceipt),
+    Pending(Box<PendingNotDeliveredFinalization>),
+    AlreadyFinalized(Box<TransitionReceipt>),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -323,7 +323,7 @@ pub(crate) enum BusinessFinalizerError {
     #[error("terminal authority became invalid during finalization")]
     TerminalInvalid {
         source: TerminalAuthorityError,
-        receipt: TransitionReceipt,
+        receipt: Box<TransitionReceipt>,
     },
     #[error("invalid finalizer request: {check}")]
     InvalidRequest { check: &'static str },
@@ -464,7 +464,9 @@ pub(crate) fn prepare_not_delivered_finalization(
             .ok_or(IntentStoreError::IntegrityFailed {
                 check: "not_delivered_head_event",
             })?;
-        return Ok(NotDeliveredPreparationOutcome::AlreadyFinalized(receipt));
+        return Ok(NotDeliveredPreparationOutcome::AlreadyFinalized(Box::new(
+            receipt,
+        )));
     }
     if current.version() != request.expected_version {
         return Err(BusinessFinalizerError::ConflictUnresolved {
@@ -491,7 +493,7 @@ pub(crate) fn prepare_not_delivered_finalization(
     }
     let _ = not_delivered_directive(policy, &prior)?;
 
-    Ok(NotDeliveredPreparationOutcome::Pending(
+    Ok(NotDeliveredPreparationOutcome::Pending(Box::new(
         PendingNotDeliveredFinalization {
             prior,
             intent_id: request.intent_id,
@@ -501,13 +503,13 @@ pub(crate) fn prepare_not_delivered_finalization(
             fence: request.fence,
             audit,
         },
-    ))
+    )))
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn commit_not_delivered_finalization(
     store: &mut BusinessIntentStore,
-    pending: PendingNotDeliveredFinalization,
+    pending: Box<PendingNotDeliveredFinalization>,
     template: &TerminalTemplateBinding,
     policy: &CompletionPolicy,
     authority: &dyn TerminalAuthorityPort,
@@ -835,7 +837,10 @@ fn record_terminal_invalid(
     ) {
         Ok(TransitionOutcome::Applied(receipt))
         | Ok(TransitionOutcome::AlreadyCommitted(receipt)) => {
-            BusinessFinalizerError::TerminalInvalid { source, receipt }
+            BusinessFinalizerError::TerminalInvalid {
+                source,
+                receipt: Box::new(receipt),
+            }
         }
         Ok(TransitionOutcome::Conflict { current }) => {
             BusinessFinalizerError::ConflictUnresolved { current }

@@ -1175,6 +1175,7 @@ impl BusinessIntentStore {
         self.apply_transition_inner(&StoreTransitionCommand::from(command), Some(fault.point()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply_authority_qualification(
         &mut self,
         terminal: &VerifiedTerminalRef,
@@ -1243,6 +1244,7 @@ impl BusinessIntentStore {
         self.apply_transition_inner(&command, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply_accepted_finalization(
         &mut self,
         terminal: FinalizationTerminalRef,
