@@ -3,8 +3,9 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use crate::monitor::push_job::{
-    derive_schedule_occurrence_id, BusinessDate, MachineCatalog, PhaseEpic, ReasonCode,
-    ScheduleOccurrenceId, ScheduleOccurrenceIdentityMaterial, UtcMicros,
+    derive_schedule_occurrence_id, BusinessDate, CompletionDirective, MachineCatalog, PhaseEpic,
+    ReasonCode, ScheduleDirective, ScheduleOccurrenceId, ScheduleOccurrenceIdentityMaterial,
+    UtcMicros,
 };
 
 use super::reconciler::StartupRecoveryBarrier;
@@ -65,6 +66,38 @@ impl ScheduleWindow {
         } else {
             WindowPosition::Expired
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NextEligibleSessionRef {
+    occurrence_id: ScheduleOccurrenceId,
+    business_date: BusinessDate,
+    window: ScheduleWindow,
+}
+
+impl NextEligibleSessionRef {
+    pub(crate) fn try_new(
+        schedule: &PhaseSchedule,
+        business_date: BusinessDate,
+        window: ScheduleWindow,
+    ) -> Result<Self, PhaseSchedulerError> {
+        if &business_date <= schedule.business_date() || window.start < schedule.window.end {
+            return Err(PhaseSchedulerError::InvalidNextEligibleSession);
+        }
+        Ok(Self {
+            occurrence_id: schedule.occurrence_id.clone(),
+            business_date,
+            window,
+        })
+    }
+
+    pub(crate) fn business_date(&self) -> &BusinessDate {
+        &self.business_date
+    }
+
+    pub(crate) fn window(&self) -> ScheduleWindow {
+        self.window
     }
 }
 
@@ -140,6 +173,7 @@ pub(crate) struct MarketObservation {
     business_date: BusinessDate,
     observed_at: UtcMicros,
     trading_day: bool,
+    next_eligible: Option<NextEligibleSessionRef>,
 }
 
 impl MarketObservation {
@@ -148,6 +182,7 @@ impl MarketObservation {
             business_date,
             observed_at,
             trading_day: true,
+            next_eligible: None,
         }
     }
 
@@ -156,7 +191,13 @@ impl MarketObservation {
             business_date,
             observed_at,
             trading_day: false,
+            next_eligible: None,
         }
+    }
+
+    pub(crate) fn with_next_eligible(mut self, next: NextEligibleSessionRef) -> Self {
+        self.next_eligible = Some(next);
+        self
     }
 }
 
@@ -168,6 +209,7 @@ pub(crate) struct ScheduleOccurrenceSnapshot {
     reason: ReasonCode,
     created_at: UtcMicros,
     updated_at: UtcMicros,
+    next_eligible: Option<NextEligibleSessionRef>,
 }
 
 impl ScheduleOccurrenceSnapshot {
@@ -179,7 +221,52 @@ impl ScheduleOccurrenceSnapshot {
             reason,
             created_at: observed_at,
             updated_at: observed_at,
+            next_eligible: None,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_hydrate(
+        schedule: PhaseSchedule,
+        status: ScheduleStatus,
+        version: u64,
+        reason: ReasonCode,
+        created_at: UtcMicros,
+        updated_at: UtcMicros,
+        next_eligible: Option<NextEligibleSessionRef>,
+    ) -> Result<Self, PhaseSchedulerError> {
+        if updated_at < created_at {
+            return Err(PhaseSchedulerError::InvalidSnapshot {
+                check: "updated_at_before_created_at",
+            });
+        }
+        match (status, next_eligible.as_ref()) {
+            (ScheduleStatus::Deferred, None) => {
+                return Err(PhaseSchedulerError::NextEligibleSessionRequired);
+            }
+            (ScheduleStatus::Deferred, Some(next))
+                if next.occurrence_id != schedule.occurrence_id =>
+            {
+                return Err(PhaseSchedulerError::InvalidSnapshot {
+                    check: "next_eligible_occurrence_mismatch",
+                });
+            }
+            (ScheduleStatus::Deferred, Some(_)) | (_, None) => {}
+            (_, Some(_)) => {
+                return Err(PhaseSchedulerError::InvalidSnapshot {
+                    check: "next_eligible_on_non_deferred",
+                });
+            }
+        }
+        Ok(Self {
+            schedule,
+            status,
+            version,
+            reason,
+            created_at,
+            updated_at,
+            next_eligible,
+        })
     }
 
     pub(crate) fn occurrence_id(&self) -> &ScheduleOccurrenceId {
@@ -209,6 +296,49 @@ impl ScheduleOccurrenceSnapshot {
     pub(crate) fn updated_at(&self) -> UtcMicros {
         self.updated_at
     }
+
+    pub(crate) fn next_eligible(&self) -> Option<&NextEligibleSessionRef> {
+        self.next_eligible.as_ref()
+    }
+
+    pub(crate) fn apply_proposal(
+        &self,
+        proposal: &ScheduleTransitionProposal,
+    ) -> Result<Self, PhaseSchedulerError> {
+        let expected_result_version = self
+            .version
+            .checked_add(1)
+            .ok_or(PhaseSchedulerError::VersionOverflow)?;
+        if proposal.occurrence_id != self.schedule.occurrence_id
+            || proposal.from_status != self.status
+            || proposal.expected_version != self.version
+            || proposal.result_version != expected_result_version
+            || proposal.observed_at < self.updated_at
+        {
+            return Err(PhaseSchedulerError::TransitionBindingMismatch);
+        }
+        match (proposal.to_status, proposal.next_eligible.as_ref()) {
+            (ScheduleStatus::Deferred, None) => {
+                return Err(PhaseSchedulerError::NextEligibleSessionRequired);
+            }
+            (ScheduleStatus::Deferred, Some(next))
+                if next.occurrence_id != self.schedule.occurrence_id =>
+            {
+                return Err(PhaseSchedulerError::TransitionBindingMismatch);
+            }
+            (ScheduleStatus::Deferred, Some(_)) | (_, None) => {}
+            (_, Some(_)) => return Err(PhaseSchedulerError::TransitionBindingMismatch),
+        }
+        Ok(Self {
+            schedule: self.schedule.clone(),
+            status: proposal.to_status,
+            version: proposal.result_version,
+            reason: proposal.reason,
+            created_at: self.created_at,
+            updated_at: proposal.observed_at,
+            next_eligible: proposal.next_eligible.clone(),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -220,6 +350,7 @@ pub(crate) struct ScheduleTransitionProposal {
     result_version: u64,
     reason: ReasonCode,
     observed_at: UtcMicros,
+    next_eligible: Option<NextEligibleSessionRef>,
 }
 
 impl ScheduleTransitionProposal {
@@ -228,6 +359,7 @@ impl ScheduleTransitionProposal {
         to_status: ScheduleStatus,
         reason: ReasonCode,
         observed_at: UtcMicros,
+        next_eligible: Option<NextEligibleSessionRef>,
     ) -> Result<Self, PhaseSchedulerError> {
         let result_version = current
             .version
@@ -241,6 +373,7 @@ impl ScheduleTransitionProposal {
             result_version,
             reason,
             observed_at,
+            next_eligible,
         })
     }
 
@@ -270,6 +403,10 @@ impl ScheduleTransitionProposal {
 
     pub(crate) fn observed_at(&self) -> UtcMicros {
         self.observed_at
+    }
+
+    pub(crate) fn next_eligible(&self) -> Option<&NextEligibleSessionRef> {
+        self.next_eligible.as_ref()
     }
 }
 
@@ -305,6 +442,16 @@ pub(crate) enum PhaseSchedulerError {
     OccurrenceBindingMismatch,
     #[error("schedule occurrence version overflow")]
     VersionOverflow,
+    #[error("next eligible session must be later and bound to the same occurrence")]
+    InvalidNextEligibleSession,
+    #[error("deferred schedule occurrence requires a next eligible session")]
+    NextEligibleSessionRequired,
+    #[error("invalid schedule occurrence snapshot: {check}")]
+    InvalidSnapshot { check: &'static str },
+    #[error("schedule transition proposal does not match the current occurrence")]
+    TransitionBindingMismatch,
+    #[error("schedule lifecycle transition is not allowed")]
+    InvalidLifecycleTransition,
 }
 
 pub(crate) struct PhaseScheduler;
@@ -325,6 +472,32 @@ impl PhaseScheduler {
         observation: &MarketObservation,
     ) -> Result<ScheduleStep, PhaseSchedulerError> {
         Self::evaluate(schedule, current, observation)
+    }
+
+    pub(crate) fn completion(
+        current: &ScheduleOccurrenceSnapshot,
+        directive: CompletionDirective,
+        observed_at: UtcMicros,
+    ) -> Result<ScheduleStep, PhaseSchedulerError> {
+        if current.status == ScheduleStatus::Closed {
+            return Ok(Self::no_change(
+                current,
+                ReasonCode::ScheduleOccurrenceClosed,
+            ));
+        }
+        if directive.schedule() == ScheduleDirective::KeepOpen {
+            return Ok(Self::no_change(current, current.reason));
+        }
+        if current.status != ScheduleStatus::Prepared {
+            return Err(PhaseSchedulerError::InvalidLifecycleTransition);
+        }
+        Self::propose(
+            current,
+            ScheduleStatus::Closed,
+            ReasonCode::ScheduleOccurrenceClosed,
+            observed_at,
+            None,
+        )
     }
 
     fn evaluate(
@@ -365,6 +538,40 @@ impl PhaseScheduler {
         current: &ScheduleOccurrenceSnapshot,
         observation: &MarketObservation,
     ) -> Result<ScheduleStep, PhaseSchedulerError> {
+        if current.status == ScheduleStatus::Closed {
+            return Ok(Self::no_change(
+                current,
+                ReasonCode::ScheduleOccurrenceClosed,
+            ));
+        }
+        if current.status == ScheduleStatus::Missed {
+            return Ok(Self::no_change(current, ReasonCode::ScheduleWindowExpired));
+        }
+        if current.status == ScheduleStatus::Prepared {
+            return Ok(Self::no_change(current, current.reason));
+        }
+        if current.status == ScheduleStatus::Deferred {
+            let next = current
+                .next_eligible
+                .as_ref()
+                .ok_or(PhaseSchedulerError::NextEligibleSessionRequired)?;
+            return match next.window.position(observation.observed_at) {
+                WindowPosition::Before => {
+                    Ok(Self::no_change(current, ReasonCode::ScheduleWindowNotOpen))
+                }
+                WindowPosition::Open => Self::propose(
+                    current,
+                    ScheduleStatus::Eligible,
+                    ReasonCode::ScheduleWindowOpen,
+                    observation.observed_at,
+                    None,
+                ),
+                WindowPosition::Expired => {
+                    Ok(Self::no_change(current, ReasonCode::ScheduleDeferred))
+                }
+            };
+        }
+
         let position = current.schedule.window.position(observation.observed_at);
         match (current.status, position) {
             (ScheduleStatus::Expected, WindowPosition::Open) => Self::propose(
@@ -372,21 +579,14 @@ impl PhaseScheduler {
                 ScheduleStatus::Eligible,
                 ReasonCode::ScheduleWindowOpen,
                 observation.observed_at,
+                None,
             ),
-            (ScheduleStatus::Expected, WindowPosition::Expired)
-                if matches!(
-                    current.schedule.catch_up_policy,
-                    CatchUpPolicy::ExpireWithoutCatchUp
-                        | CatchUpPolicy::SameBusinessDayBeforeDeadline
-                ) =>
-            {
-                Self::propose(
-                    current,
-                    ScheduleStatus::Missed,
-                    ReasonCode::ScheduleWindowExpired,
-                    observation.observed_at,
-                )
-            }
+            (
+                ScheduleStatus::Expected
+                | ScheduleStatus::Eligible
+                | ScheduleStatus::BlockedOnInput,
+                WindowPosition::Expired,
+            ) => Self::propose_expired(current, observation),
             _ => Ok(Self::no_change(
                 current,
                 match position {
@@ -403,9 +603,46 @@ impl PhaseScheduler {
         to_status: ScheduleStatus,
         reason: ReasonCode,
         observed_at: UtcMicros,
+        next_eligible: Option<NextEligibleSessionRef>,
     ) -> Result<ScheduleStep, PhaseSchedulerError> {
-        ScheduleTransitionProposal::try_new(current, to_status, reason, observed_at)
+        ScheduleTransitionProposal::try_new(current, to_status, reason, observed_at, next_eligible)
             .map(ScheduleStep::TransitionProposal)
+    }
+
+    fn propose_expired(
+        current: &ScheduleOccurrenceSnapshot,
+        observation: &MarketObservation,
+    ) -> Result<ScheduleStep, PhaseSchedulerError> {
+        match current.schedule.catch_up_policy {
+            CatchUpPolicy::ExpireWithoutCatchUp | CatchUpPolicy::SameBusinessDayBeforeDeadline => {
+                Self::propose(
+                    current,
+                    ScheduleStatus::Missed,
+                    ReasonCode::ScheduleWindowExpired,
+                    observation.observed_at,
+                    None,
+                )
+            }
+            CatchUpPolicy::DeferToNextEligibleSession => {
+                let next = observation
+                    .next_eligible
+                    .clone()
+                    .ok_or(PhaseSchedulerError::NextEligibleSessionRequired)?;
+                if next.occurrence_id != current.schedule.occurrence_id {
+                    return Err(PhaseSchedulerError::InvalidNextEligibleSession);
+                }
+                Self::propose(
+                    current,
+                    ScheduleStatus::Deferred,
+                    ReasonCode::ScheduleDeferred,
+                    observation.observed_at,
+                    Some(next),
+                )
+            }
+            CatchUpPolicy::RecoverPersistedOnly => Ok(ScheduleStep::RecoveryOnly {
+                occurrence_id: current.schedule.occurrence_id.clone(),
+            }),
+        }
     }
 
     fn no_change(current: &ScheduleOccurrenceSnapshot, reason: ReasonCode) -> ScheduleStep {

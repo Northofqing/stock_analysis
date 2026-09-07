@@ -433,6 +433,8 @@ fn w14_deferred_occurrence_resumes_in_next_half_open_session_without_new_identit
         next_window,
     )
     .expect("TEST_CODE next session reference");
+    assert_eq!(next.business_date().as_str(), "2026-09-08");
+    assert_eq!(next.window(), next_window);
     let expired = MarketObservation::trading_day(
         BusinessDate::parse("2026-09-07").expect("TEST_CODE original date"),
         micros(WINDOW_END),
@@ -453,6 +455,7 @@ fn w14_deferred_occurrence_resumes_in_next_half_open_session_without_new_identit
     assert_eq!(deferred.status(), ScheduleStatus::Deferred);
     assert_eq!(deferred.occurrence_id(), occurrence.occurrence_id());
     assert_eq!(deferred.business_date().as_str(), "2026-09-07");
+    assert_eq!(deferred.next_eligible(), Some(&next));
 
     let before_next = MarketObservation::trading_day(
         BusinessDate::parse("2026-09-07").expect("TEST_CODE original date"),
