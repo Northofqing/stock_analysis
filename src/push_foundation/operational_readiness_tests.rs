@@ -6,7 +6,8 @@ use crate::monitor::push_job::{
 
 use super::operational_readiness::{
     DependencyFailure, DependencyKind, DependencyObservation, DependencyRequirement,
-    ReadinessAssessment, ReadinessExitDisposition, ReadinessScope, ReadinessStage, ReadinessStatus,
+    ReadinessAssessment, ReadinessError, ReadinessExitDisposition, ReadinessScope, ReadinessStage,
+    ReadinessStatus,
 };
 
 fn producer(value: &str) -> ProducerId {
@@ -234,4 +235,245 @@ fn w15_missing_evidence_is_classified_by_scope_and_preserves_independent_produce
     .expect("TEST_CODE occurrence cannot hide its missing producer contract");
     assert_eq!(missing_contract.status(), ReadinessStatus::ProducerUnready);
     assert!(!missing_contract.deployment_ready());
+}
+
+#[test]
+fn w15_missing_occurrence_input_declaration_is_a_contract_gap_not_a_transient_blocker() {
+    let catalog = MachineCatalog::bundled().expect("TEST_CODE catalog");
+    let declared = producer_requirements();
+    let assessment = ReadinessAssessment::evaluate(
+        &catalog,
+        &occurrence_scope(),
+        &[producer("p01-scheduled")],
+        ReadinessStage::Running,
+        &declared,
+        &available(&declared),
+    )
+    .expect("TEST_CODE missing input declaration is observable");
+    assert_eq!(assessment.status(), ReadinessStatus::ProducerUnready);
+    assert!(!assessment.deployment_ready());
+    assert_eq!(
+        assessment.failures(),
+        &[(
+            DependencyKind::OccurrenceInput,
+            DependencyFailure::MissingDeclaration
+        )]
+    );
+}
+
+#[test]
+fn w15_dependency_source_version_and_declaration_mismatches_never_report_ready() {
+    let catalog = MachineCatalog::bundled().expect("TEST_CODE catalog");
+    let enabled = [producer("p01-scheduled")];
+    let declared = producer_requirements();
+    for (replacement_id, replacement_version, expected_failure) in [
+        (
+            declared[1].contract_id.clone(),
+            SourceContractVersion::try_new("v2".into()).expect("TEST_CODE version"),
+            DependencyFailure::VersionMismatch,
+        ),
+        (
+            SourceContractId::try_new("TEST_CODE-foreign-source".into()).expect("TEST_CODE source"),
+            declared[1].version.clone(),
+            DependencyFailure::ContractMismatch,
+        ),
+    ] {
+        let mut observed = available(&declared);
+        observed[1] = DependencyObservation::Available {
+            kind: DependencyKind::SourceContract,
+            contract_id: replacement_id,
+            version: replacement_version,
+            evidence_sha256: Sha256Digest::parse("TEST_CODE evidence", &"a".repeat(64))
+                .expect("TEST_CODE digest"),
+        };
+        let assessment = ReadinessAssessment::evaluate(
+            &catalog,
+            &p01_scope(),
+            &enabled,
+            ReadinessStage::Running,
+            &declared,
+            &observed,
+        )
+        .expect("TEST_CODE invalid dependency assessment");
+        assert_eq!(assessment.status(), ReadinessStatus::ProducerUnready);
+        assert_eq!(
+            assessment.failures(),
+            &[(DependencyKind::SourceContract, expected_failure)]
+        );
+    }
+    let empty = ReadinessAssessment::evaluate(
+        &catalog,
+        &ReadinessScope::Core,
+        &enabled,
+        ReadinessStage::Startup,
+        &[],
+        &[],
+    )
+    .expect("TEST_CODE no declarations is not vacuous readiness");
+    assert_eq!(empty.status(), ReadinessStatus::CoreUnready);
+    assert_eq!(empty.failures().len(), 6);
+
+    let mut missing = declared.clone();
+    missing.remove(1);
+    let assessment = ReadinessAssessment::evaluate(
+        &catalog,
+        &p01_scope(),
+        &enabled,
+        ReadinessStage::Running,
+        &missing,
+        &available(&missing),
+    )
+    .expect("TEST_CODE missing source declaration");
+    assert_eq!(assessment.status(), ReadinessStatus::ProducerUnready);
+    assert_eq!(
+        assessment.failures(),
+        &[(
+            DependencyKind::SourceContract,
+            DependencyFailure::MissingDeclaration
+        )]
+    );
+}
+
+#[test]
+fn w15_invalid_scope_and_ambiguous_dependency_sets_are_rejected_before_assessment() {
+    let catalog = MachineCatalog::bundled().expect("TEST_CODE catalog");
+    let p01 = producer("p01-scheduled");
+    let declared = producer_requirements();
+    let observed = available(&declared);
+    for (scope, enabled, check) in [
+        (
+            p01_scope(),
+            vec![p01.clone(), p01.clone()],
+            "duplicate_enabled_producer",
+        ),
+        (
+            p01_scope(),
+            vec![producer("TEST_CODE-unknown")],
+            "unknown_enabled_producer",
+        ),
+        (
+            p01_scope(),
+            vec![producer("news-announcement")],
+            "scope_producer_not_enabled",
+        ),
+        (
+            ReadinessScope::Producer {
+                unit_id: unit("MU-announcement"),
+                producer_id: p01.clone(),
+            },
+            vec![p01.clone()],
+            "producer_unit_mismatch",
+        ),
+        (
+            ReadinessScope::Producer {
+                unit_id: unit("MU-p01"),
+                producer_id: producer("TEST_CODE-unknown"),
+            },
+            vec![p01.clone()],
+            "unknown_scope_producer",
+        ),
+    ] {
+        assert_eq!(
+            ReadinessAssessment::evaluate(
+                &catalog,
+                &scope,
+                &enabled,
+                ReadinessStage::Running,
+                &declared,
+                &observed
+            ),
+            Err(ReadinessError::InvalidScope { check })
+        );
+    }
+    let mut duplicated = declared.clone();
+    duplicated.push(declared[0].clone());
+    assert_eq!(
+        ReadinessAssessment::evaluate(
+            &catalog,
+            &p01_scope(),
+            &[p01.clone()],
+            ReadinessStage::Running,
+            &duplicated,
+            &observed
+        ),
+        Err(ReadinessError::InvalidDependencySet {
+            check: "duplicate_declaration",
+            kind: DependencyKind::ProducerBinding,
+        })
+    );
+    let mut duplicated = observed.clone();
+    duplicated.push(observed[0].clone());
+    assert_eq!(
+        ReadinessAssessment::evaluate(
+            &catalog,
+            &p01_scope(),
+            &[p01.clone()],
+            ReadinessStage::Running,
+            &declared,
+            &duplicated
+        ),
+        Err(ReadinessError::InvalidDependencySet {
+            check: "duplicate_observation",
+            kind: DependencyKind::ProducerBinding,
+        })
+    );
+    assert_eq!(
+        ReadinessAssessment::evaluate(
+            &catalog,
+            &ReadinessScope::Core,
+            &[p01.clone()],
+            ReadinessStage::Running,
+            &declared,
+            &observed
+        ),
+        Err(ReadinessError::InvalidDependencySet {
+            check: "unexpected_declaration",
+            kind: DependencyKind::ProducerBinding,
+        })
+    );
+    assert_eq!(
+        ReadinessAssessment::evaluate(
+            &catalog,
+            &p01_scope(),
+            &[p01],
+            ReadinessStage::Running,
+            &[],
+            &observed
+        ),
+        Err(ReadinessError::InvalidDependencySet {
+            check: "undeclared_observation",
+            kind: DependencyKind::ProducerBinding,
+        })
+    );
+}
+
+#[test]
+fn w15_assessment_is_replayable_under_dependency_and_producer_reordering() {
+    let catalog = MachineCatalog::bundled().expect("TEST_CODE catalog");
+    let mut enabled = vec![producer("p01-scheduled"), producer("news-announcement")];
+    let mut declared = core_requirements();
+    let mut observed = available(&declared);
+    observed.pop();
+    let original = ReadinessAssessment::evaluate(
+        &catalog,
+        &ReadinessScope::Core,
+        &enabled,
+        ReadinessStage::Running,
+        &declared,
+        &observed,
+    )
+    .expect("TEST_CODE original assessment");
+    enabled.reverse();
+    declared.reverse();
+    observed.reverse();
+    let reordered = ReadinessAssessment::evaluate(
+        &catalog,
+        &ReadinessScope::Core,
+        &enabled,
+        ReadinessStage::Running,
+        &declared,
+        &observed,
+    )
+    .expect("TEST_CODE same logical observations");
+    assert_eq!(original, reordered);
 }
