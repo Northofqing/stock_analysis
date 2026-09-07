@@ -150,6 +150,12 @@ pub(crate) struct StartupRecoveryReport {
     entries: Vec<RecoveryEntry>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StartupRecoveryBarrier {
+    _iterations: usize,
+    _transition_count: usize,
+}
+
 impl StartupRecoveryReport {
     pub(crate) fn iterations(&self) -> usize {
         self.iterations
@@ -168,6 +174,23 @@ impl StartupRecoveryReport {
             .iter()
             .find(|entry| entry.intent_id == intent_id)
     }
+
+    pub(crate) fn scheduler_barrier(&self) -> StartupRecoveryBarrier {
+        StartupRecoveryBarrier {
+            _iterations: self.iterations,
+            _transition_count: self.transition_count,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn w14_recovery_barrier_fixture() -> StartupRecoveryBarrier {
+    StartupRecoveryReport {
+        iterations: 1,
+        transition_count: 0,
+        entries: Vec::new(),
+    }
+    .scheduler_barrier()
 }
 
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]

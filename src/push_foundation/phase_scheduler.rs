@@ -7,6 +7,8 @@ use crate::monitor::push_job::{
     ScheduleOccurrenceId, ScheduleOccurrenceIdentityMaterial, UtcMicros,
 };
 
+use super::reconciler::StartupRecoveryBarrier;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CatchUpPolicy {
     ExpireWithoutCatchUp,
@@ -179,6 +181,96 @@ impl ScheduleOccurrenceSnapshot {
             updated_at: observed_at,
         }
     }
+
+    pub(crate) fn occurrence_id(&self) -> &ScheduleOccurrenceId {
+        &self.schedule.occurrence_id
+    }
+
+    pub(crate) fn business_date(&self) -> &BusinessDate {
+        self.schedule.business_date()
+    }
+
+    pub(crate) fn status(&self) -> ScheduleStatus {
+        self.status
+    }
+
+    pub(crate) fn version(&self) -> u64 {
+        self.version
+    }
+
+    pub(crate) fn reason(&self) -> ReasonCode {
+        self.reason
+    }
+
+    pub(crate) fn created_at(&self) -> UtcMicros {
+        self.created_at
+    }
+
+    pub(crate) fn updated_at(&self) -> UtcMicros {
+        self.updated_at
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ScheduleTransitionProposal {
+    occurrence_id: ScheduleOccurrenceId,
+    from_status: ScheduleStatus,
+    to_status: ScheduleStatus,
+    expected_version: u64,
+    result_version: u64,
+    reason: ReasonCode,
+    observed_at: UtcMicros,
+}
+
+impl ScheduleTransitionProposal {
+    fn try_new(
+        current: &ScheduleOccurrenceSnapshot,
+        to_status: ScheduleStatus,
+        reason: ReasonCode,
+        observed_at: UtcMicros,
+    ) -> Result<Self, PhaseSchedulerError> {
+        let result_version = current
+            .version
+            .checked_add(1)
+            .ok_or(PhaseSchedulerError::VersionOverflow)?;
+        Ok(Self {
+            occurrence_id: current.schedule.occurrence_id.clone(),
+            from_status: current.status,
+            to_status,
+            expected_version: current.version,
+            result_version,
+            reason,
+            observed_at,
+        })
+    }
+
+    pub(crate) fn occurrence_id(&self) -> &ScheduleOccurrenceId {
+        &self.occurrence_id
+    }
+
+    pub(crate) fn from_status(&self) -> ScheduleStatus {
+        self.from_status
+    }
+
+    pub(crate) fn to_status(&self) -> ScheduleStatus {
+        self.to_status
+    }
+
+    pub(crate) fn expected_version(&self) -> u64 {
+        self.expected_version
+    }
+
+    pub(crate) fn result_version(&self) -> u64 {
+        self.result_version
+    }
+
+    pub(crate) fn reason(&self) -> ReasonCode {
+        self.reason
+    }
+
+    pub(crate) fn observed_at(&self) -> UtcMicros {
+        self.observed_at
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -190,6 +282,7 @@ pub(crate) enum ScheduleStep {
     RecoveryOnly {
         occurrence_id: ScheduleOccurrenceId,
     },
+    TransitionProposal(ScheduleTransitionProposal),
     NoChange {
         occurrence_id: ScheduleOccurrenceId,
         status: ScheduleStatus,
@@ -208,6 +301,10 @@ pub(crate) enum PhaseSchedulerError {
     CatalogMismatch { field: &'static str },
     #[error("market observation business date does not match the schedule")]
     BusinessDateMismatch,
+    #[error("current occurrence does not match the registered schedule")]
+    OccurrenceBindingMismatch,
+    #[error("schedule occurrence version overflow")]
+    VersionOverflow,
 }
 
 pub(crate) struct PhaseScheduler;
@@ -218,16 +315,31 @@ impl PhaseScheduler {
         current: Option<&ScheduleOccurrenceSnapshot>,
         observation: &MarketObservation,
     ) -> Result<ScheduleStep, PhaseSchedulerError> {
+        Self::evaluate(schedule, current, observation)
+    }
+
+    pub(crate) fn startup_catch_up(
+        _recovery_barrier: &StartupRecoveryBarrier,
+        schedule: &PhaseSchedule,
+        current: Option<&ScheduleOccurrenceSnapshot>,
+        observation: &MarketObservation,
+    ) -> Result<ScheduleStep, PhaseSchedulerError> {
+        Self::evaluate(schedule, current, observation)
+    }
+
+    fn evaluate(
+        schedule: &PhaseSchedule,
+        current: Option<&ScheduleOccurrenceSnapshot>,
+        observation: &MarketObservation,
+    ) -> Result<ScheduleStep, PhaseSchedulerError> {
         if &observation.business_date != schedule.business_date() {
             return Err(PhaseSchedulerError::BusinessDateMismatch);
         }
         if let Some(current) = current {
-            return Ok(ScheduleStep::NoChange {
-                occurrence_id: current.schedule.occurrence_id.clone(),
-                status: current.status,
-                version: current.version,
-                reason: current.reason,
-            });
+            if &current.schedule != schedule {
+                return Err(PhaseSchedulerError::OccurrenceBindingMismatch);
+            }
+            return Self::evaluate_current(current, observation);
         }
         if !observation.trading_day {
             return Ok(ScheduleStep::NoOccurrence {
@@ -247,5 +359,61 @@ impl PhaseScheduler {
         Ok(ScheduleStep::CreateExpected(
             ScheduleOccurrenceSnapshot::expected(schedule, reason, observation.observed_at),
         ))
+    }
+
+    fn evaluate_current(
+        current: &ScheduleOccurrenceSnapshot,
+        observation: &MarketObservation,
+    ) -> Result<ScheduleStep, PhaseSchedulerError> {
+        let position = current.schedule.window.position(observation.observed_at);
+        match (current.status, position) {
+            (ScheduleStatus::Expected, WindowPosition::Open) => Self::propose(
+                current,
+                ScheduleStatus::Eligible,
+                ReasonCode::ScheduleWindowOpen,
+                observation.observed_at,
+            ),
+            (ScheduleStatus::Expected, WindowPosition::Expired)
+                if matches!(
+                    current.schedule.catch_up_policy,
+                    CatchUpPolicy::ExpireWithoutCatchUp
+                        | CatchUpPolicy::SameBusinessDayBeforeDeadline
+                ) =>
+            {
+                Self::propose(
+                    current,
+                    ScheduleStatus::Missed,
+                    ReasonCode::ScheduleWindowExpired,
+                    observation.observed_at,
+                )
+            }
+            _ => Ok(Self::no_change(
+                current,
+                match position {
+                    WindowPosition::Before => ReasonCode::ScheduleWindowNotOpen,
+                    WindowPosition::Open => current.reason,
+                    WindowPosition::Expired => current.reason,
+                },
+            )),
+        }
+    }
+
+    fn propose(
+        current: &ScheduleOccurrenceSnapshot,
+        to_status: ScheduleStatus,
+        reason: ReasonCode,
+        observed_at: UtcMicros,
+    ) -> Result<ScheduleStep, PhaseSchedulerError> {
+        ScheduleTransitionProposal::try_new(current, to_status, reason, observed_at)
+            .map(ScheduleStep::TransitionProposal)
+    }
+
+    fn no_change(current: &ScheduleOccurrenceSnapshot, reason: ReasonCode) -> ScheduleStep {
+        ScheduleStep::NoChange {
+            occurrence_id: current.schedule.occurrence_id.clone(),
+            status: current.status,
+            version: current.version,
+            reason,
+        }
     }
 }
