@@ -599,6 +599,139 @@ fn w14_deferred_occurrence_resumes_in_next_half_open_session_without_new_identit
 }
 
 #[test]
+fn w14_repeated_deferral_advances_sessions_and_rejects_reused_or_overlapping_windows() {
+    let schedule = schedule(CatchUpPolicy::DeferToNextEligibleSession);
+    let observation = |at| {
+        MarketObservation::trading_day(
+            BusinessDate::parse("2026-09-07").expect("TEST_CODE original date"),
+            micros(at),
+        )
+    };
+    let next_ref = |date, start, end| {
+        NextEligibleSessionRef::try_new(
+            &schedule,
+            BusinessDate::parse(date).expect("TEST_CODE session date"),
+            ScheduleWindow::try_new(micros(start), micros(end)).expect("TEST_CODE session window"),
+        )
+        .expect("TEST_CODE next reference")
+    };
+    let advance = |current: &ScheduleOccurrenceSnapshot, observation: &MarketObservation| {
+        match PhaseScheduler::tick(&schedule, Some(current), observation)
+            .expect("TEST_CODE valid lifecycle step")
+        {
+            ScheduleStep::TransitionProposal(proposal) => current
+                .apply_proposal(&proposal)
+                .expect("TEST_CODE apply lifecycle step"),
+            other => panic!("TEST_CODE expected transition, got {other:?}"),
+        }
+    };
+    let second_start = WINDOW_END + 86_400_000_000;
+    let second_end = second_start + 900_000_000;
+    let second = next_ref("2026-09-08", second_start, second_end);
+    let initial = created(&schedule, WINDOW_START);
+    let deferred = advance(
+        &initial,
+        &observation(WINDOW_END).with_next_eligible(second.clone()),
+    );
+    let resumed = advance(&deferred, &observation(second_start));
+    assert_eq!(resumed.version(), 2);
+    assert_eq!(
+        PhaseScheduler::tick(&schedule, Some(&resumed), &observation(second_end)),
+        Err(PhaseSchedulerError::NextEligibleSessionRequired)
+    );
+    for invalid in [
+        second,
+        next_ref("2026-09-09", second_end - 1, second_end + 900_000_000),
+        next_ref("2026-09-08", second_end, second_end + 900_000_000),
+    ] {
+        assert_eq!(
+            PhaseScheduler::tick(
+                &schedule,
+                Some(&resumed),
+                &observation(second_end).with_next_eligible(invalid)
+            ),
+            Err(PhaseSchedulerError::InvalidNextEligibleSession)
+        );
+    }
+    let third_start = second_end + 86_400_000_000;
+    let third = next_ref("2026-09-09", third_start, third_start + 900_000_000);
+    let deferred_again = advance(
+        &resumed,
+        &observation(second_end).with_next_eligible(third.clone()),
+    );
+    assert_eq!(deferred_again.status(), ScheduleStatus::Deferred);
+    assert_eq!(deferred_again.version(), 3);
+    let resumed_again = advance(&deferred_again, &observation(third_start));
+    assert_eq!(resumed_again.status(), ScheduleStatus::Eligible);
+    assert_eq!(resumed_again.version(), 4);
+    assert_eq!(resumed_again.occurrence_id(), initial.occurrence_id());
+    assert_eq!(resumed_again.business_date().as_str(), "2026-09-07");
+    assert_eq!(resumed_again.next_eligible(), Some(&third));
+    assert!(matches!(
+        PhaseScheduler::tick(
+            &schedule,
+            Some(&resumed_again),
+            &observation(third_start + 1)
+        )
+        .expect("TEST_CODE third session remains eligible"),
+        ScheduleStep::NoChange {
+            status: ScheduleStatus::Eligible,
+            version: 4,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn w14_missed_is_sealed_and_close_rejects_unprepared_occurrences() {
+    let schedule = schedule(CatchUpPolicy::ExpireWithoutCatchUp);
+    let initial = created(&schedule, WINDOW_START);
+    assert_eq!(
+        PhaseScheduler::completion(&initial, close_directive(), micros(WINDOW_END)),
+        Err(PhaseSchedulerError::InvalidLifecycleTransition)
+    );
+    let expired = MarketObservation::trading_day(
+        BusinessDate::parse("2026-09-07").expect("TEST_CODE original date"),
+        micros(WINDOW_END),
+    );
+    let missed = match PhaseScheduler::tick(&schedule, Some(&initial), &expired)
+        .expect("TEST_CODE expiration proposal")
+    {
+        ScheduleStep::TransitionProposal(proposal) => initial
+            .apply_proposal(&proposal)
+            .expect("TEST_CODE apply expiration"),
+        other => panic!("TEST_CODE expected Missed proposal, got {other:?}"),
+    };
+    let barrier = w14_recovery_barrier_fixture();
+    for at in [WINDOW_START - 1, WINDOW_START, WINDOW_END + 1] {
+        let observation = MarketObservation::trading_day(
+            BusinessDate::parse("2026-09-07").expect("TEST_CODE original date"),
+            micros(at),
+        );
+        let expected = ScheduleStep::NoChange {
+            occurrence_id: initial.occurrence_id().clone(),
+            status: ScheduleStatus::Missed,
+            version: 1,
+            reason: ReasonCode::ScheduleWindowExpired,
+        };
+        assert_eq!(
+            PhaseScheduler::tick(&schedule, Some(&missed), &observation)
+                .expect("TEST_CODE sealed missed tick"),
+            expected
+        );
+        assert_eq!(
+            PhaseScheduler::startup_catch_up(&barrier, &schedule, Some(&missed), &observation)
+                .expect("TEST_CODE sealed missed recovery"),
+            expected
+        );
+    }
+    assert_eq!(
+        PhaseScheduler::completion(&missed, close_directive(), micros(WINDOW_END + 1)),
+        Err(PhaseSchedulerError::InvalidLifecycleTransition)
+    );
+}
+
+#[test]
 fn w14_next_session_and_proposal_cannot_be_grafted_to_another_window_with_the_same_id() {
     let original = schedule(CatchUpPolicy::DeferToNextEligibleSession);
     let next = NextEligibleSessionRef::try_new(

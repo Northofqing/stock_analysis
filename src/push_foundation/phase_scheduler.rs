@@ -82,14 +82,24 @@ impl NextEligibleSessionRef {
         business_date: BusinessDate,
         window: ScheduleWindow,
     ) -> Result<Self, PhaseSchedulerError> {
-        if &business_date <= schedule.business_date() || window.start < schedule.window.end {
-            return Err(PhaseSchedulerError::InvalidNextEligibleSession);
-        }
-        Ok(Self {
+        let next = Self {
             occurrence_id: schedule.occurrence_id.clone(),
             business_date,
             window,
-        })
+        };
+        next.validate_for(schedule)?;
+        Ok(next)
+    }
+
+    fn validate_for(&self, schedule: &PhaseSchedule) -> Result<(), PhaseSchedulerError> {
+        if self.occurrence_id != schedule.occurrence_id
+            || schedule.catch_up_policy != CatchUpPolicy::DeferToNextEligibleSession
+            || &self.business_date <= schedule.business_date()
+            || self.window.start < schedule.window.end
+        {
+            return Err(PhaseSchedulerError::InvalidNextEligibleSession);
+        }
+        Ok(())
     }
 
     pub(crate) fn business_date(&self) -> &BusinessDate {
@@ -240,24 +250,7 @@ impl ScheduleOccurrenceSnapshot {
                 check: "updated_at_before_created_at",
             });
         }
-        match (status, next_eligible.as_ref()) {
-            (ScheduleStatus::Deferred, None) => {
-                return Err(PhaseSchedulerError::NextEligibleSessionRequired);
-            }
-            (ScheduleStatus::Deferred, Some(next))
-                if next.occurrence_id != schedule.occurrence_id =>
-            {
-                return Err(PhaseSchedulerError::InvalidSnapshot {
-                    check: "next_eligible_occurrence_mismatch",
-                });
-            }
-            (ScheduleStatus::Deferred, Some(_)) | (_, None) => {}
-            (_, Some(_)) => {
-                return Err(PhaseSchedulerError::InvalidSnapshot {
-                    check: "next_eligible_on_non_deferred",
-                });
-            }
-        }
+        Self::validate_session(&schedule, status, next_eligible.as_ref())?;
         Ok(Self {
             schedule,
             status,
@@ -301,6 +294,29 @@ impl ScheduleOccurrenceSnapshot {
         self.next_eligible.as_ref()
     }
 
+    fn validate_session(
+        schedule: &PhaseSchedule,
+        status: ScheduleStatus,
+        next: Option<&NextEligibleSessionRef>,
+    ) -> Result<(), PhaseSchedulerError> {
+        match (status, next) {
+            (ScheduleStatus::Deferred, None) => {
+                Err(PhaseSchedulerError::NextEligibleSessionRequired)
+            }
+            (ScheduleStatus::Expected, Some(_)) => Err(PhaseSchedulerError::InvalidSnapshot {
+                check: "next_eligible_on_expected",
+            }),
+            (_, Some(next)) => next.validate_for(schedule),
+            (_, None) => Ok(()),
+        }
+    }
+
+    fn effective_window(&self) -> ScheduleWindow {
+        self.next_eligible
+            .as_ref()
+            .map_or(self.schedule.window, |next| next.window)
+    }
+
     pub(crate) fn apply_proposal(
         &self,
         proposal: &ScheduleTransitionProposal,
@@ -310,6 +326,8 @@ impl ScheduleOccurrenceSnapshot {
             .checked_add(1)
             .ok_or(PhaseSchedulerError::VersionOverflow)?;
         if proposal.occurrence_id != self.schedule.occurrence_id
+            || proposal.source_schedule != self.schedule
+            || proposal.source_next_eligible != self.next_eligible
             || proposal.from_status != self.status
             || proposal.expected_version != self.version
             || proposal.result_version != expected_result_version
@@ -317,33 +335,23 @@ impl ScheduleOccurrenceSnapshot {
         {
             return Err(PhaseSchedulerError::TransitionBindingMismatch);
         }
-        match (proposal.to_status, proposal.next_eligible.as_ref()) {
-            (ScheduleStatus::Deferred, None) => {
-                return Err(PhaseSchedulerError::NextEligibleSessionRequired);
-            }
-            (ScheduleStatus::Deferred, Some(next))
-                if next.occurrence_id != self.schedule.occurrence_id =>
-            {
-                return Err(PhaseSchedulerError::TransitionBindingMismatch);
-            }
-            (ScheduleStatus::Deferred, Some(_)) | (_, None) => {}
-            (_, Some(_)) => return Err(PhaseSchedulerError::TransitionBindingMismatch),
-        }
-        Ok(Self {
-            schedule: self.schedule.clone(),
-            status: proposal.to_status,
-            version: proposal.result_version,
-            reason: proposal.reason,
-            created_at: self.created_at,
-            updated_at: proposal.observed_at,
-            next_eligible: proposal.next_eligible.clone(),
-        })
+        Self::try_hydrate(
+            self.schedule.clone(),
+            proposal.to_status,
+            proposal.result_version,
+            proposal.reason,
+            self.created_at,
+            proposal.observed_at,
+            proposal.next_eligible.clone(),
+        )
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ScheduleTransitionProposal {
     occurrence_id: ScheduleOccurrenceId,
+    source_schedule: PhaseSchedule,
+    source_next_eligible: Option<NextEligibleSessionRef>,
     from_status: ScheduleStatus,
     to_status: ScheduleStatus,
     expected_version: u64,
@@ -361,12 +369,24 @@ impl ScheduleTransitionProposal {
         observed_at: UtcMicros,
         next_eligible: Option<NextEligibleSessionRef>,
     ) -> Result<Self, PhaseSchedulerError> {
+        if observed_at < current.updated_at {
+            return Err(PhaseSchedulerError::TransitionBindingMismatch);
+        }
+        // A recovered occurrence keeps the authority's session through subsequent states.
+        let next_eligible = next_eligible.or_else(|| current.next_eligible.clone());
+        ScheduleOccurrenceSnapshot::validate_session(
+            &current.schedule,
+            to_status,
+            next_eligible.as_ref(),
+        )?;
         let result_version = current
             .version
             .checked_add(1)
             .ok_or(PhaseSchedulerError::VersionOverflow)?;
         Ok(Self {
             occurrence_id: current.schedule.occurrence_id.clone(),
+            source_schedule: current.schedule.clone(),
+            source_next_eligible: current.next_eligible.clone(),
             from_status: current.status,
             to_status,
             expected_version: current.version,
@@ -474,6 +494,8 @@ impl PhaseScheduler {
         Self::evaluate(schedule, current, observation)
     }
 
+    /// Evaluates a W03 policy result; this is not a bound authorization to close in storage.
+    /// The business adapter must verify the target occurrence, completion evidence and fence.
     pub(crate) fn completion(
         current: &ScheduleOccurrenceSnapshot,
         directive: CompletionDirective,
@@ -553,6 +575,11 @@ impl PhaseScheduler {
         if !observation.trading_day {
             return Ok(Self::no_change(current, ReasonCode::ScheduleNotTradingDay));
         }
+        if current.schedule.catch_up_policy == CatchUpPolicy::RecoverPersistedOnly {
+            return Ok(ScheduleStep::RecoveryOnly {
+                occurrence_id: current.schedule.occurrence_id.clone(),
+            });
+        }
         if current.status == ScheduleStatus::Deferred {
             let next = current
                 .next_eligible
@@ -575,7 +602,7 @@ impl PhaseScheduler {
             };
         }
 
-        let position = current.schedule.window.position(observation.observed_at);
+        let position = current.effective_window().position(observation.observed_at);
         match (current.status, position) {
             (ScheduleStatus::Expected, WindowPosition::Open) => Self::propose(
                 current,
@@ -631,7 +658,11 @@ impl PhaseScheduler {
                     .next_eligible
                     .clone()
                     .ok_or(PhaseSchedulerError::NextEligibleSessionRequired)?;
-                if next.occurrence_id != current.schedule.occurrence_id {
+                next.validate_for(&current.schedule)?;
+                if current.next_eligible.as_ref().is_some_and(|previous| {
+                    next.business_date <= previous.business_date
+                        || next.window.start < previous.window.end
+                }) {
                     return Err(PhaseSchedulerError::InvalidNextEligibleSession);
                 }
                 Self::propose(
