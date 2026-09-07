@@ -9,6 +9,7 @@ mod operational_readiness;
 mod phase_scheduler;
 mod readiness_probe;
 mod readiness_snapshot;
+mod readiness_snapshot_codec;
 mod reconciler;
 mod terminal_authority;
 
@@ -36,6 +37,8 @@ mod phase_scheduler_tests;
 mod readiness_probe_tests;
 #[cfg(test)]
 mod readiness_snapshot_tests;
+#[cfg(test)]
+mod readiness_snapshot_codec_tests;
 #[cfg(test)]
 mod reconciler_tests;
 #[cfg(test)]
