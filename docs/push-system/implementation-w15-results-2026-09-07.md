@@ -2,7 +2,7 @@
 
 ## 1. 当前结论
 
-W15 未完成，尚未接入生产。已交付候选判级、规范快照/重建及完整目录计数；独立持久化与认证恢复、实际部署探针、W11/W14 联结还在开发。生产 monitor 未启动、观察、替换或接线；开发限于 `codex/push-reliability-20260905` 隔离工作区。
+W15 未完成，尚未接入生产。已交付候选判级、规范快照/重建、完整目录计数，以及通过独立审查的候选记录原子存储；真实来源认证与认证恢复、实际部署探针、W11/W14 联结仍未交付。生产 monitor 未启动、观察、替换或接线；开发限于 `codex/push-reliability-20260905` 隔离工作区。
 
 完整目标仍为正式 WBS 的 W01--W21 与 52 个迁移单元。局部测试通过不能证明逐推送迁移、发送效果、当前生产健康或上线完成。
 
@@ -20,8 +20,12 @@ W15 未完成，尚未接入生产。已交付候选判级、规范快照/重建
 | 6f255c0 | 补齐错来源/错版本、14 种合法 unavailable 原因、30 项 typed mutation | W15 40/40（codec 7/7），独立 scoped 复审 Spec/quality PASS |
 | bde6719 / 7617763 | 恢复事件按两端快照重新构造，核验全部派生内容与规范字节；补合法角色错绑反例 | event codec 4/4；Spec/quality 独立复审通过 |
 | b6f5c99 | 原子认领初始化文件、核对路径身份；SQLite 查询前拒绝静态 WAL/未知/损坏文件头 | W15 47/47、Foundation 150/150；复审发现两项竞态未闭合，进入第二轮 |
+| 64047dd | owned-file 镜像初始化、受控 SQLite 事务与实际句柄锁/头核验；候选 store 首条重启查询 | W15 53/53、Foundation 156/156；初始化 finding 关闭，模式稳定残留由下述第三轮关闭 |
+| 81878ce | 原子回滚、历史重放、回复丢失后重查、显式恢复链、head 损坏拒绝、并发 CAS | store 六项实际通过；Task 3D 独立 Spec/quality PASS，一项中间链损坏覆盖 Minor 待补强 |
+| 3fe1e62 | 移除 existing 主库普通文件头预读；独立进程锁竞争与严格子测试结果校验 | W15 59 passed/0 failed/1 ignored；schema 第三轮 Spec/quality PASS，两个原 Important 均关闭 |
+| 1a4ee8e | 中间链损坏使 head/历史查询/追加全部拒绝且无文件副作用；清理两项新增 lint | Foundation 163 passed/0 failed/1 ignored（含 W15 60 项、store 7 项通过）；Minor 独立复审关闭，Clippy 目标零诊断 |
 
-当前 `b6f5c99` 的完整 Foundation 命令：`cargo test --lib push_foundation:: -- --test-threads=1`，session 71160，exit 0，150 passed/0 failed，测试执行 9.25s。对应 W15 命令 `cargo test --lib w15_ -- --test-threads=1`，session 99470，exit 0，47 passed/0 failed，3.26s。编译为既有 43 条 warning，不是零告警；独立评审未关闭前不将切片标记验收完成。
+历史 `b6f5c99` 的完整 Foundation 命令：`cargo test --lib push_foundation:: -- --test-threads=1`，session 71160，exit 0，150 passed/0 failed，测试执行 9.25s。对应 W15 命令 `cargo test --lib w15_ -- --test-threads=1`，session 99470，exit 0，47 passed/0 failed，3.26s。编译为既有 43 条 warning，不是零告警；各轮结果只覆盖当时对应源码，最新结果见 §8。
 
 相邻 `push_job` 命令 session 56855：52 passed/0 failed，1.76s。以上不是全仓测试、完整 W15 或生产验收。
 
@@ -34,7 +38,7 @@ codec 原审查的两项测试缺口均已修复：错来源/错版本及合法 
 | 任务 | 当前缺口 | 完成证据要求 |
 | --- | --- | --- |
 | Task 2 | 预期 authority、版本化 NotRequired、已知 occurrence 真实性 | 实际 reader 校验与失败反例，不接受自由 bool |
-| Task 3 | 候选 recovery/event 重读通过评审；schema 复审两项竞态仍开放，完整 store/认证恢复未完成 | 真实 SQLite 原子快照+事件+head CAS，重启、损坏、并发、确认丢失重查 |
+| Task 3 | 候选 recovery/event codec、schema/open 与候选 store 均已通过限定范围独立评审及补强；真实来源认证与认证恢复仍缺 | 完成实际 evidence reader 与提交后认证重查才能发布权威快照；明确底层提交确认异常的处理，不以成功回复被丢弃替代全部 I/O 故障验收 |
 | Task 4 | 当前只有纯计数，不是实际 probe | 同一已验证快照的 health/readiness/CLI；只读零副作用与损坏拒绝 |
 | Task 5 | 只读接口审计完成，代码联结未完成 | 身份/版本/恢复来源精确绑定，输入阻断与有效窗口内恢复，过期/终态不重开 |
 | Task 6 | 只有部分切片审查 | 完整 W15 双轴评审、目标与相邻回归、check/clippy/rustdoc、probe 与文档验证 |
@@ -43,7 +47,7 @@ W11 barrier 只证明固定点遍历完成，不含跨库身份。W14 当前没�
 
 ## 4. 下一步和并行边界
 
-主代理统一维护接口、Cargo 调度、集成与文档；一个实现子代理负责独立 schema/open 文件，另一只读代理复核 codec。先形成完整事件与快照材料，再集成持久事务和真实证据 reader。候选哈希、SQLite 连接或自由构造的恢复引用都不能升级为执行许可。
+主代理统一维护接口、Cargo 调度、集成与文档；schema/open 原代理与主代理 store 开发已并行交付，随后由两名只读代理分别审查，未共同编辑文件。一个实现子代理已补齐链损坏测试和两项新 lint，主代理同步完成 docs 与验证。后续继续按独立文件分工，复用有效证据、仅复审改动及未关闭问题；编译测试保持一个队列。候选哈希、SQLite 连接或自由构造的恢复引用都不能升级为执行许可。
 
 本轮采用 planning-with-files 保留可恢复记录；subagent-driven-development 将独立 schema 与核心事件材料分开，避免共享文件并发修改。拆分不减少完整 W15 的验收目标。
 
@@ -72,3 +76,40 @@ schema 第一轮修复后 session 99470 W15 47/47，71160 Foundation 150/150；�
 静态检查 session 73045：clippy exit 0、1m14s，完整制品核对 163 条有位置 warning、Foundation 目标零诊断；不是 strict 全仓零告警。rustdoc session 92421：16 passed/4 ignored、3.74s。完整 Task 3 仍需实际事务、重启查询与真实证据认证。
 
 实际 reader 接线预检确认：现有 `DatabaseManager::init` 会设置 WAL 并运行迁移，不能为只读 probe 初始化全局数据库；retained readonly snapshot 的实现包含 checkpoint，不能只凭名称推断零文件写入。后续须在指定、已验证来源上接只读认证能力，不能用任意 URI 文件或自报 bool 填补 authority 缺口。
+
+## 7. 第二轮实测修订（进行中）
+
+新增竞态反例后 session 46660 为 W15 **48 passed/1 failed**，不是继续全绿。初始化 ABA 反例及 reader 模式竞争在实际链接的 Apple SQLite 3.51.0 上通过；只有 writer 拒绝断言失败，不能把两个静态风险都称为本机已复现。
+
+最小诊断 session 89176：初始化 ABA 1/1，拒绝于 `enable_foreign_keys`，owned/competitor 文件均为 0 bytes。session 54797：模式竞争 0/1，reader 拒绝于 `schema_objects` 且目录字节不变；writer 返回成功且目录发生变化，确认存在实际缺口。错误分类定位了拒绝阶段，不声称取得底层 SQLite errno 或证明其他实现平台安全。
+
+并行只读诊断还发现原 proposed raw lock guard 不能仅靠存活保证锁连续；首次 schema prepare 可能结束内部读事务。第二轮采用内存镜像写入 owned File、PRIVATECACHE/EXCLUSIVE locking mode 与受控事务，实际锁竞争和失败退出仍待验证。主代理并行新增首次 Pending 的存储/重启 tracer，完整原子存储仍在开发；无生产接线。
+
+第二轮实现与存储首 tracer 已提交 `64047dd`。联合 `cargo test --lib w15_ -- --test-threads=1` session 77786 exit 0，**53 passed/0 failed**、3.86s；编译 2m18s、43 warnings。`cargo test --lib push_foundation:: -- --test-threads=1` session 44217 exit 0，**156 passed/0 failed**、9.96s。新锁竞争/释放、真实 hot-journal 拒绝、初始化 owned-file 和首条 Pending 的重启/head 查询均通过。schema 第二轮独立 scoped 复审进行中；存储后续事务故障、CAS/并发、确认丢失、损坏、真实来源认证仍未验收，不把该数字当完整 W15。
+
+本次 Cargo.toml 仅给原 rusqlite 0.31 增加 `serialize` feature，Cargo.lock 未变；相对 W15 起点 `src/bin/monitor`、`src/notification`、`config`、`migrations` 仍无源码差异。没有查询生产运行情况，不据此推断现有推送健康。
+
+独立复审 `b6f5c99..64047dd` 已结束：初始化所有权 finding 关闭；模式稳定 finding 仍有一项 Important 残留——普通文件描述符的关闭可能取消同进程其他 SQLite 连接的 POSIX 锁（[SQLite 官方 §2.2](https://www.sqlite.org/howtocorrupt.html#posix_advisory_locks_canceled_by_a_separate_thread_doing_close_)）。现有同进程竞争测试不足以证明跨进程保护，第三轮由原代理补独立新进程反例并移除既有库的普通文件头预读；这是静态残留，未声称在本机已复现。
+
+存储故障 tracer：29554 因缺少测试故障入口得到编译期 RED；实现测试专用入口后 58569 exit 0，store **2/2**、0.61s。真实事务在 event、snapshot、head 三个写入点分别中断，均保留旧 head/历史、拒绝查询新记录，并能完整重试。提交后回复丢失、实际并发、恢复链和其他损坏覆盖仍在补齐，不把本结果称为完整 store 验收。
+
+## 8. 并行收口与第三轮结果
+
+`81878ce` 将 store 覆盖补到六项，联合 session 56464 为 **59 passed/0 failed/1 ignored**、10.68s。回复丢失覆盖是丢弃已成功提交的返回值，再重建 store 精确重查/重试；不是底层 COMMIT I/O 错误模拟。该运行还加入独立新进程锁竞争，但修复前也 GREEN，且初版 child 拒绝分类较宽；只能记为本机未复现，不能声称取得 POSIX 失锁 RED。
+
+`3fe1e62` 结构性移除了 existing 主库普通文件预读/关闭，实际 SQLite 句柄的 `xRead` 成为唯一文件头读取路径；child 仅允许 BUSY/LOCKED 作为锁拒绝，父测试要求子进程确实运行一项测试并通过。session 31849 `cargo test --lib w15_ -- --test-threads=1` exit 0，**59 passed/0 failed/1 ignored**、11.26s；ignored 是由父测试显式启动的 helper，不是跳过该锁验收。WAL/畸形文件/部分 schema/hot-journal 零副作用拒绝均在本轮通过。
+
+两条独立审查同时结束：schema `64047dd..3fe1e62` 第三轮确认残留 finding 已关闭，Spec/quality PASS、无新增问题；store `935e6f7..81878ce` Spec/quality PASS、无 Critical/Important。store 仅有中间链实际落库损坏覆盖的 Minor，当前补强不改认证边界。
+
+最新静态检查 session 49886 `cargo clippy --lib --message-format=json` exit 0、1m25s，但并非零新增：完整 fingerprint 诊断为 **165** 条有位置 warning，其中目标新增 2 条（SQLite 手工 C 字符串、故障点枚举重复 After 前缀）。当前正在修正；此前 163 项基线不得冒充这版代码的结果。Foundation 最新完整 156/156 属于 `64047dd`，后续 store/第三轮修改需更新相邻回归证据。没有运行或观察生产 monitor，也未接线。
+
+### 本批最终验证（代码 `1a4ee8e`）
+
+上段 pending 项现已关闭：中间链损坏补强和两项 lint 修正由独立实现代理完成，限定复审 `3fe1e62..1a4ee8e` Spec/quality PASS，原 Minor ADDRESSED、无新增问题。测试先精确恢复不可变 trigger 并证明 schema 合法，再要求三种 store 操作返回事件 codec 错误；不是把打不开数据库当损坏检查通过。
+
+- `cargo test --lib push_foundation:: -- --test-threads=1`，session 67731，exit 0：**163 passed/0 failed/1 ignored**，17.50s，编译 2m17s、43 项既有 lib-test warning。实际输出中 W15 60 项通过、store 7 项通过；ignored child helper 由父测试显式执行。
+- `cargo clippy --lib --message-format=json`，session 83430，exit 0、1m22s。对应 `stock_analysis-5cb12cc6a07580ac/output-lib-stock_analysis` 完整诊断经 `jq` 核验 **163** 条有位置 warning、Foundation 目标诊断为空；两项新增告警已消除，仍不是 strict 全仓零告警。
+- 相邻 `cargo test --lib monitor::push_job -- --test-threads=1`，session 51815，exit 0：**52 passed/0 failed**、1.77s，43 项既有 lib-test warning。
+- 五个本批 Rust 文件使用 `rustfmt --edition 2021 --check` 通过，`git diff --check` 通过。相对 W15 起点，monitor/notification/config/Cargo.lock/migrations 源码 diff 仍为空；Cargo.toml 保留已验证的 rusqlite serialize feature。
+
+本批仅完成候选持久化与连接安全切片；真实认证、权威查询、实际 probe/CLI 和 W11/W14 联结未交付。完整 W01--W21/52 Unit 目标继续保持进行中，没有把测试数量或 scoped 审查通过当整体交付。

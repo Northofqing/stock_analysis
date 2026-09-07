@@ -1,6 +1,6 @@
 # W15 运行就绪快照与恢复事件设计
 
-**状态：** 接口与存储方向已确定，开始实现；各切片以测试结果登记完成，当前不代表生产就绪已接入。
+**状态：** 候选判级、snapshot/event codec、目录计数、独立 schema 与候选原子 store 已实现并通过限定范围独立评审。真实来源认证、权威 probe 和 W11/W14 联结尚未实现，当前不代表完整 W15 或生产就绪已接入；最新验证见 W15 中文实现记录。
 
 ## 1. 目标与已有约束
 
@@ -24,7 +24,15 @@
 
 新库不保存 prepared/rendered/receipt/source 正文，不形成另一套投递 authority。producer 接线、生产路径和初始化操作留到获准的部署流程。
 
-只读文件副作用边界补充：operational v1 使用 rollback-journal 文件格式；WAL/未知版本在 SQLite 查询前拒绝，不自动转换、checkpoint 或用 immutable=1 忽略未合并事实。原因是 SQLite 的 READ_ONLY WAL 打开仍可能在可写目录创建 `-wal`/`-shm`（[官方 WAL §5](https://www.sqlite.org/wal.html#read_only_databases)）；[文件头读写版本](https://www.sqlite.org/fileformat.html#file_format_version_numbers) 可在查询前识别。初始化必须原子取得缺失目标的创建所有权，防止竞争空文件被接管。上述为零副作用/文件所有权合同的实现要求，目前审查修复待完成。
+只读文件副作用边界补充：operational v1 使用 rollback-journal 文件格式；WAL/未知版本在 SQLite 查询前拒绝，不自动转换、checkpoint 或用 immutable=1 忽略未合并事实。原因是 SQLite 的 READ_ONLY WAL 打开仍可能在可写目录创建 `-wal`/`-shm`（[官方 WAL §5](https://www.sqlite.org/wal.html#read_only_databases)）；[文件头读写版本](https://www.sqlite.org/fileformat.html#file_format_version_numbers) 可在查询前识别。初始化必须原子取得缺失目标的创建所有权，防止竞争空文件被接管。上述零副作用/文件所有权要求已在 `64047dd` / `3fe1e62` 后通过对应测试与独立限定复审，不产生来源认证权限。
+
+第二轮接口裁决（已实现并验证）：首次初始化不再让 SQLite 按目标路径写 DDL，而是在内存库建立、验证原 schema/header，再把完整序列化镜像经 `create_new` 返回的同一个 `File` 写入并同步。文件身份由实际持有句柄保证，不以内容哈希替代；若路径在写入期间漂移，不能接管替换者。仅增加 rusqlite 的 `serialize` feature（本地 0.31 实现依赖 modern_sqlite/bundled_bindings，无新增 crate，也不强制 bundled SQLite）；实际库链接与运行已通过 Cargo 测试，不以命令行 sqlite3 版本替代证据。
+
+existing reader/writer 的 interface 收窄为受控事务操作，不向调用者返回可长期持有的裸 Connection。内部通过 SQLite 公开的 [sqlite3_file 方法](https://www.sqlite.org/c3ref/io_methods.html) 从实际句柄取得 SHARED lock 并读文件头，在进入可能产生副作用的 schema 查询前验证 rollback 格式；锁必须连续覆盖到同一连接的受控事务，不能在检查与读取间释放。新连接强制 PRIVATECACHE，并在 schema prepare 前设置和验证 [main.locking_mode=EXCLUSIVE](https://www.sqlite.org/pragma.html#pragma_locking_mode)，使首次 schema prepare 内部读事务结束后仍保留读锁；不能仅凭 raw guard 对象存活假定锁连续。SQL 前拒绝可释放原始锁，进入 SQL 后不提前 xUnlock，由事务结束和连接关闭管理。读取 callback 只在事务中运行，写入 callback 使用 IMMEDIATE 事务；安全生命周期、失败释放和错误脱敏集中在这一 module。未来 store 只使用此 seam，不重新打开路径、结束事务或改变 journal/query_only。可以用窄私有 helper 管理公开 FFI，禁止猜测 unixFile 内存布局、改全局 VFS、在可变原库使用 immutable/nolock 或用独立普通文件锁替代 SQLite 锁。
+
+代价：原 schema/open 返回 Connection 的内部接口和测试需调整，增加公开 SQLite FFI 的生命周期验证及 serialize 链接验证；尚无生产接线或其他生产消费者，不改变用户推送语义。若任一步不能证明零副作用和锁连续性，应失败关闭并报告，不能把“查完才发现变化”当作预防写入。schema/open 仍不产生来源认证或恢复许可。
+
+第三轮锁规则修订（`3fe1e62` 已通过实测与限定复审）：existing 主库文件头统一通过实际 sqlite3_file 的 xRead 读取，不额外使用普通 File::open/read/close。普通 close 可能取消同进程其他 SQLite 连接的 POSIX 锁，因此“双重检查”会破坏持锁保证；测试在连接存活时也不能直接读取主库字节，并须用独立进程竞争验证。保留路径/存在性、NOFOLLOW/PRIVATECACHE、EXCLUSIVE 和全部未知文件拒绝规则。修复前本机反例也通过，不能声称本机复现；关闭依据是危险路径移除及收紧后的独立进程断言通过。此修订不重开已关闭的初始化 owned-file finding，也不授权全局 VFS 替换或生产操作。
 
 ## 3. 模块与小接口
 
@@ -99,6 +107,8 @@ Snapshot 实现 RFC 全部字段；canonical hash 使用已有 `CanonicalValue`/
 为避免循环 hash：先根据前 snapshot ID、context、依赖变更和认证来源材料派生 recovery_event_id；snapshot 将该 ID 纳入 hash；event 正文最后绑定 before/after snapshot hash 并另存完整 event SHA。重查同时验证 event identity、正文 SHA 和两个 snapshot 引用，不允许借“ID 不包含 after hash”偷换 after snapshot。
 
 同一事务写 event、snapshot、head；head 版本经 checked add。重复提交读取同一事实；陈旧 head、输入漂移、写失败整体回滚。提交确认未知先重查，不能盲目追加。通过重新打开真实临时 SQLite 验证跨重启行为。
+
+持久集成切片的 StoredReadinessRecord 仅包含已重建的 CandidateReadinessRecord 和已核验链版本，不构造 AttestedReadinessSnapshot。stream 身份与 recovery continuity 一致，包含 namespace、业务日、build、generation、manifest、catalog、scope 和启用 producer 集合；capture time、依赖观察和 stage 不作为新 stream。查询迭代重建完整前序链，拒绝循环、断链、跨 stream 和 head 版本漂移。外部来源认证仍须在权威发布前完成，不能把数据库落库与字节一致误称为证据来源可信。
 
 ## 7. probe 与计数
 
