@@ -228,7 +228,6 @@ fn request<'a>(
         policy,
         sink,
         append,
-        1,
         micros(1_788_743_102_000_000),
         micros(1_788_743_103_000_000),
     )
@@ -248,7 +247,7 @@ fn w12_generic_transport_dispatches_once_and_requeries_exact_w09_terminal() {
     let adapter = GenericTransportAuthorityAdapter::new(durable.coordinator());
 
     let first = adapter
-        .dispatch(request(
+        .dispatch_required_channel(request(
             &claimed,
             &route,
             &fence,
@@ -257,7 +256,8 @@ fn w12_generic_transport_dispatches_once_and_requeries_exact_w09_terminal() {
             &append,
         ))
         .expect("first W12 dispatch");
-    let first_terminal = match first.view() {
+    assert_eq!(first.channel(), route.required_channel());
+    let first_terminal = match first.result().view() {
         DeliveryResultView::TransportAccepted(terminal) => terminal,
         other => panic!("expected accepted W12 result, got {other:?}"),
     };

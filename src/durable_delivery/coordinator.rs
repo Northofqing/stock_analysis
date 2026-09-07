@@ -6079,12 +6079,17 @@ fn build_foundation_terminal_record(
     let (terminal_disposition, attempt_id, evidence_bytes, evidence_sha256) =
         match (stored.state, disposition.disposition.as_str()) {
             (DecisionState::Delivered, "Accepted") => {
-                validate_authoritative_accepted_delivery_evidence(
+                let (_, receipt) = validate_authoritative_accepted_delivery_evidence(
                     connection,
                     stored,
                     envelope,
                     &disposition,
                 )?;
+                if receipt.channel != binding.required_channel() {
+                    return Err(DurableDeliveryError::PolicyMismatch(
+                        "foundation accepted receipt required-channel mismatch".to_owned(),
+                    ));
+                }
                 let attempt_id = disposition.attempt_identity.clone().ok_or_else(|| {
                     DurableDeliveryError::PolicyMismatch(
                         "foundation accepted authority attempt is missing".to_owned(),
@@ -6116,6 +6121,20 @@ fn build_foundation_terminal_record(
                     return Err(DurableDeliveryError::PolicyMismatch(
                         "foundation manual acceptance disposition binding mismatch".to_owned(),
                     ));
+                }
+                if let Some(receipt_canonical) = &manual.receipt_canonical {
+                    let receipt: super::model::TypedReceipt =
+                        serde_json::from_slice(receipt_canonical).map_err(|error| {
+                            DurableDeliveryError::PolicyMismatch(format!(
+                                "foundation manual acceptance receipt is invalid: {error}"
+                            ))
+                        })?;
+                    if receipt.channel != binding.required_channel() {
+                        return Err(DurableDeliveryError::PolicyMismatch(
+                            "foundation manual acceptance receipt required-channel mismatch"
+                                .to_owned(),
+                        ));
+                    }
                 }
                 validate_current_disposition_canonical(
                     stored,

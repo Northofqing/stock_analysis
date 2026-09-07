@@ -130,7 +130,6 @@ pub(crate) struct GenericDispatchRequest<'a> {
     completion_policy: &'a CompletionPolicy,
     sink: AuthoritativeSink,
     append_port: &'a dyn ImmutableAppendPort,
-    daily_budget_capacity: usize,
     dispatched_at: UtcMicros,
     verified_at: UtcMicros,
 }
@@ -144,7 +143,6 @@ impl<'a> GenericDispatchRequest<'a> {
         completion_policy: &'a CompletionPolicy,
         sink: AuthoritativeSink,
         append_port: &'a dyn ImmutableAppendPort,
-        daily_budget_capacity: usize,
         dispatched_at: UtcMicros,
         verified_at: UtcMicros,
     ) -> Self {
@@ -155,7 +153,6 @@ impl<'a> GenericDispatchRequest<'a> {
             completion_policy,
             sink,
             append_port,
-            daily_budget_capacity,
             dispatched_at,
             verified_at,
         }
@@ -201,7 +198,7 @@ impl<'a> GenericTransportAuthorityAdapter<'a> {
             inner: request.sink,
         });
         self.coordinator
-            .prepare(&envelope, request.daily_budget_capacity, dispatched_at)
+            .prepare(&envelope, 1, dispatched_at)
             .map_err(|_| GenericTransportError::DurableFailure)?;
         self.coordinator
             .resume_deliverable(&decision_identity, &[required_sink], dispatched_at)
@@ -220,6 +217,15 @@ impl<'a> GenericTransportAuthorityAdapter<'a> {
         )
         .map_err(|_| GenericTransportError::TerminalVerificationFailed)?;
         Ok(verified.into_delivery_result())
+    }
+
+    pub(crate) fn dispatch_required_channel(
+        &self,
+        request: GenericDispatchRequest<'_>,
+    ) -> Result<RequiredChannelObservation, GenericTransportError> {
+        let channel = request.route.required_channel().clone();
+        let result = self.dispatch(request)?;
+        Ok(RequiredChannelObservation { channel, result })
     }
 }
 
@@ -495,8 +501,17 @@ pub(crate) struct RequiredChannelObservation {
 }
 
 impl RequiredChannelObservation {
+    #[cfg(test)]
     pub(crate) fn new(channel: ChannelId, result: DeliveryResult) -> Self {
         Self { channel, result }
+    }
+
+    pub(crate) fn channel(&self) -> &ChannelId {
+        &self.channel
+    }
+
+    pub(crate) fn result(&self) -> &DeliveryResult {
+        &self.result
     }
 }
 
