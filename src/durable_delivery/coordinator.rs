@@ -6,11 +6,12 @@ use super::model::{
     FoundationTerminalDisposition, FoundationTerminalQuery, FoundationTerminalRecord,
     ImmutableAppendPort, ManualAcceptedDeliveryAuditEvidence, ManualDisposition,
     ManualResolutionAuthorizationCanonical, ManualResolutionCommand, PolicyRow, PrepareOutcome,
-    ReconcileSummary, Result, ResumeOutcome, ReviewTerminalReplayAttempt,
-    ReviewTerminalReplayCompletion, ReviewTerminalReplayCompletionCanonical,
-    ReviewTerminalReplayCompletionState, ReviewTerminalReplayInput,
-    ReviewTerminalReplayStartCanonical, ScheduleHydration, ScheduleHydrationState,
-    TaskTransitionCanonical, WindowMode, DAILY_BUDGET_LIMIT, MANUAL_ACCEPTED_DELIVERY_AUDIT_DOMAIN,
+    ReconcileSummary, RejectedSinkResultCanonical, Result, ResumeOutcome,
+    ReviewTerminalReplayAttempt, ReviewTerminalReplayCompletion,
+    ReviewTerminalReplayCompletionCanonical, ReviewTerminalReplayCompletionState,
+    ReviewTerminalReplayInput, ReviewTerminalReplayStartCanonical, ScheduleHydration,
+    ScheduleHydrationState, TaskTransitionCanonical, UncertainSinkResultCanonical, WindowMode,
+    DAILY_BUDGET_LIMIT, MANUAL_ACCEPTED_DELIVERY_AUDIT_DOMAIN,
 };
 use super::schema::{
     configure_attested_connection, initialize_schema, load_policy, materialize_wal_capability,
@@ -426,6 +427,48 @@ struct StoredAcceptedSinkEvidence {
     frozen_delivery_audit_canonical: Option<Vec<u8>>,
     frozen_delivery_audit_sha256: Option<String>,
     delivery_audit_ref: Option<String>,
+    attempt_state: String,
+}
+
+#[derive(Clone, Debug)]
+struct StoredNonacceptedSinkEvidence {
+    result_event_identity: String,
+    observed_at: String,
+    fence_token: i64,
+    authoritative_for_state: bool,
+    late_after_fence: bool,
+    authority_audit_identity: String,
+    late_receipt_audit_identity: Option<String>,
+    canonical: Vec<u8>,
+    sha256: String,
+    channel: Option<String>,
+    provider: Option<String>,
+    message_id: Option<String>,
+    platform_message_id: Option<String>,
+    accepted_at: Option<String>,
+    latency_ms: Option<i64>,
+    frozen_delivery_audit_canonical: Option<Vec<u8>>,
+    frozen_delivery_audit_sha256: Option<String>,
+    delivery_audit_ref: Option<String>,
+    attempt_state: String,
+}
+
+#[derive(Clone, Debug)]
+struct StoredManualRejectedEvidence {
+    resolution_identity: String,
+    attempt_identity: String,
+    operator_identity: String,
+    reason: String,
+    evidence_canonical: Vec<u8>,
+    evidence_sha256: String,
+    receipt_canonical: Option<Vec<u8>>,
+    frozen_delivery_audit_canonical: Option<Vec<u8>>,
+    frozen_delivery_audit_sha256: Option<String>,
+    immutable_audit_ref: String,
+    accepted_audit_identity: Option<String>,
+    accepted_audit_append_state: Option<String>,
+    accepted_audit_ref: Option<String>,
+    resolved_at: String,
     attempt_state: String,
 }
 
@@ -2870,52 +2913,19 @@ impl DurableDeliveryCoordinator {
                 ));
             }
 
-            if stored.state != DecisionState::Delivered {
+            if !matches!(
+                stored.state,
+                DecisionState::Delivered
+                    | DecisionState::RejectedDurable
+                    | DecisionState::UncertainManualReview
+                    | DecisionState::ManualResolvedRejected
+            ) {
                 return Ok(FoundationTerminalQuery::PendingSeal {
                     state: stored.state,
                 });
             }
-            let disposition = load_current_disposition_evidence(connection, &stored)?;
-            if disposition.disposition != "Accepted" {
-                return Err(DurableDeliveryError::PolicyMismatch(format!(
-                    "foundation Delivered authority disposition {} is not yet supported",
-                    disposition.disposition
-                )));
-            }
-            validate_authoritative_accepted_delivery_evidence(
-                connection,
-                &stored,
-                &envelope,
-                &disposition,
-            )?;
-            let attempt_id = disposition.attempt_identity.clone().ok_or_else(|| {
-                DurableDeliveryError::PolicyMismatch(
-                    "foundation accepted authority attempt is missing".to_owned(),
-                )
-            })?;
-            let (evidence_bytes, evidence_sha256): (Vec<u8>, String) = connection.query_row(
-                "SELECT result_canonical,result_sha256 FROM sink_results \
-                     WHERE decision_identity=?1 AND attempt_identity=?2 \
-                       AND authoritative_for_state=1 AND result_kind='Accepted'",
-                params![stored.decision_identity.as_str(), attempt_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            if sha256_hex(&evidence_bytes) != evidence_sha256 {
-                return Err(DurableDeliveryError::PolicyMismatch(
-                    "foundation accepted authority evidence hash mismatch".to_owned(),
-                ));
-            }
-            Ok(FoundationTerminalQuery::Terminal(Box::new(
-                FoundationTerminalRecord {
-                    binding,
-                    ref_id: disposition.disposition_identity,
-                    attempt_id: Some(attempt_id),
-                    disposition: FoundationTerminalDisposition::Accepted,
-                    evidence_bytes,
-                    evidence_sha256,
-                    durable_schema_version: SCHEMA_VERSION,
-                },
-            )))
+            let record = build_foundation_terminal_record(connection, &stored, &envelope, binding)?;
+            Ok(FoundationTerminalQuery::Terminal(Box::new(record)))
         })
     }
 
@@ -6056,6 +6066,482 @@ impl DurableDeliveryCoordinator {
     }
 }
 
+fn build_foundation_terminal_record(
+    connection: &Connection,
+    stored: &StoredDecision,
+    envelope: &DeliveryEnvelope,
+    binding: super::model::FoundationDeliveryBinding,
+) -> Result<FoundationTerminalRecord> {
+    let disposition = load_current_disposition_evidence(connection, stored)?;
+    let (terminal_disposition, attempt_id, evidence_bytes, evidence_sha256) =
+        match (stored.state, disposition.disposition.as_str()) {
+            (DecisionState::Delivered, "Accepted") => {
+                validate_authoritative_accepted_delivery_evidence(
+                    connection,
+                    stored,
+                    envelope,
+                    &disposition,
+                )?;
+                let attempt_id = disposition.attempt_identity.clone().ok_or_else(|| {
+                    DurableDeliveryError::PolicyMismatch(
+                        "foundation accepted authority attempt is missing".to_owned(),
+                    )
+                })?;
+                let (canonical, sha256) = load_exact_terminal_sink_result(
+                    connection,
+                    &stored.decision_identity,
+                    &attempt_id,
+                    "Accepted",
+                )?;
+                (
+                    FoundationTerminalDisposition::Accepted,
+                    Some(attempt_id),
+                    canonical,
+                    sha256,
+                )
+            }
+            (DecisionState::Delivered, "ManualAccepted") => {
+                let manual = load_and_validate_manual_accepted_delivery_evidence(
+                    connection,
+                    &stored.decision_identity,
+                )?;
+                if disposition.resolution_identity.as_deref()
+                    != Some(manual.resolution_identity.as_str())
+                    || disposition.attempt_identity.is_some()
+                    || disposition.denial_identity.is_some()
+                {
+                    return Err(DurableDeliveryError::PolicyMismatch(
+                        "foundation manual acceptance disposition binding mismatch".to_owned(),
+                    ));
+                }
+                validate_current_disposition_canonical(
+                    stored,
+                    envelope,
+                    &disposition,
+                    &manual.acceptance_evidence_sha256,
+                    false,
+                    false,
+                )?;
+                (
+                    FoundationTerminalDisposition::ManualAccepted,
+                    Some(manual.attempt_identity),
+                    manual.canonical,
+                    manual.sha256,
+                )
+            }
+            (DecisionState::RejectedDurable, "Rejected")
+                if disposition.attempt_identity.is_some() =>
+            {
+                let attempt_id = disposition.attempt_identity.clone().ok_or_else(|| {
+                    DurableDeliveryError::PolicyMismatch(
+                        "foundation rejected authority attempt is missing".to_owned(),
+                    )
+                })?;
+                let (canonical, sha256) = validate_authoritative_nonaccepted_delivery_evidence(
+                    connection,
+                    stored,
+                    envelope,
+                    &disposition,
+                    "Rejected",
+                )?;
+                (
+                    FoundationTerminalDisposition::Rejected,
+                    Some(attempt_id),
+                    canonical,
+                    sha256,
+                )
+            }
+            (DecisionState::RejectedDurable, "Rejected")
+                if disposition.denial_identity.is_some() =>
+            {
+                let payload = DeliveryDispositionCanonical::parse_exact(
+                    &disposition.canonical,
+                    "foundation pre-attempt rejection disposition",
+                )?;
+                if payload.attempt_identity.is_some()
+                    || payload.resolution_identity.is_some()
+                    || payload.denial_identity.is_none()
+                    || payload.retry_authorized
+                    || payload.manual_action_required
+                {
+                    return Err(DurableDeliveryError::PolicyMismatch(
+                        "foundation pre-attempt rejection source binding mismatch".to_owned(),
+                    ));
+                }
+                validate_current_disposition_canonical(
+                    stored,
+                    envelope,
+                    &disposition,
+                    &payload.evidence_sha256,
+                    false,
+                    false,
+                )?;
+                (
+                    FoundationTerminalDisposition::Rejected,
+                    None,
+                    disposition.canonical.clone(),
+                    disposition.sha256.clone(),
+                )
+            }
+            (DecisionState::UncertainManualReview, "Uncertain") => {
+                let attempt_id = disposition.attempt_identity.clone().ok_or_else(|| {
+                    DurableDeliveryError::PolicyMismatch(
+                        "foundation uncertain authority attempt is missing".to_owned(),
+                    )
+                })?;
+                let (canonical, sha256) = validate_authoritative_nonaccepted_delivery_evidence(
+                    connection,
+                    stored,
+                    envelope,
+                    &disposition,
+                    "Uncertain",
+                )?;
+                (
+                    FoundationTerminalDisposition::Uncertain,
+                    Some(attempt_id),
+                    canonical,
+                    sha256,
+                )
+            }
+            (DecisionState::ManualResolvedRejected, "ManualRejected") => {
+                let (attempt_id, canonical, sha256) = validate_manual_rejected_delivery_evidence(
+                    connection,
+                    stored,
+                    envelope,
+                    &disposition,
+                )?;
+                (
+                    FoundationTerminalDisposition::ManualNotDelivered,
+                    Some(attempt_id),
+                    canonical,
+                    sha256,
+                )
+            }
+            (state, observed) => {
+                return Err(DurableDeliveryError::PolicyMismatch(format!(
+                    "foundation terminal state/disposition binding is invalid: {state}/{observed}"
+                )))
+            }
+        };
+    if sha256_hex(&evidence_bytes) != evidence_sha256 {
+        return Err(DurableDeliveryError::PolicyMismatch(
+            "foundation terminal evidence hash mismatch".to_owned(),
+        ));
+    }
+    Ok(FoundationTerminalRecord {
+        binding,
+        ref_id: disposition.disposition_identity,
+        attempt_id,
+        disposition: terminal_disposition,
+        evidence_bytes,
+        evidence_sha256,
+        durable_schema_version: SCHEMA_VERSION,
+    })
+}
+
+fn load_exact_terminal_sink_result(
+    connection: &Connection,
+    decision_identity: &str,
+    attempt_identity: &str,
+    result_kind: &str,
+) -> Result<(Vec<u8>, String)> {
+    let rows = {
+        let mut statement = connection.prepare(
+            "SELECT result_canonical,result_sha256 FROM sink_results \
+             WHERE decision_identity=?1 AND attempt_identity=?2 \
+               AND authoritative_for_state=1 AND result_kind=?3",
+        )?;
+        let mapped = statement.query_map(
+            params![decision_identity, attempt_identity, result_kind],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        mapped.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    if rows.len() != 1 {
+        return Err(DurableDeliveryError::PolicyMismatch(format!(
+            "foundation terminal requires exactly one authoritative {result_kind} result, observed {}",
+            rows.len()
+        )));
+    }
+    rows.into_iter().next().ok_or_else(|| {
+        DurableDeliveryError::PolicyMismatch(
+            "foundation terminal authoritative result disappeared".to_owned(),
+        )
+    })
+}
+
+fn validate_authoritative_nonaccepted_delivery_evidence(
+    connection: &Connection,
+    stored: &StoredDecision,
+    envelope: &DeliveryEnvelope,
+    disposition: &StoredDispositionEvidence,
+    expected_kind: &str,
+) -> Result<(Vec<u8>, String)> {
+    let attempt_identity = disposition.attempt_identity.as_deref().ok_or_else(|| {
+        DurableDeliveryError::PolicyMismatch(format!(
+            "authoritative {expected_kind} disposition has no attempt identity"
+        ))
+    })?;
+    let rows = {
+        let mut statement = connection.prepare(
+            "SELECT s.result_event_identity,s.observed_at,s.fence_token,
+                    s.authoritative_for_state,s.late_after_fence,
+                    s.authority_audit_identity,s.late_receipt_audit_identity,
+                    s.result_canonical,s.result_sha256,
+                    s.channel,s.provider,s.message_id,s.platform_message_id,
+                    s.accepted_at,s.latency_ms,
+                    s.frozen_delivery_audit_canonical,s.frozen_delivery_audit_sha256,
+                    s.delivery_audit_ref,a.state
+             FROM sink_results s
+             JOIN delivery_attempts a
+               ON a.attempt_identity=s.attempt_identity
+              AND a.decision_identity=s.decision_identity
+              AND a.fence_token=s.fence_token
+             WHERE s.decision_identity=?1 AND s.attempt_identity=?2
+               AND s.authoritative_for_state=1 AND s.result_kind=?3",
+        )?;
+        let mapped = statement.query_map(
+            params![stored.decision_identity, attempt_identity, expected_kind],
+            |row| {
+                Ok(StoredNonacceptedSinkEvidence {
+                    result_event_identity: row.get(0)?,
+                    observed_at: row.get(1)?,
+                    fence_token: row.get(2)?,
+                    authoritative_for_state: row.get::<_, i64>(3)? == 1,
+                    late_after_fence: row.get::<_, i64>(4)? == 1,
+                    authority_audit_identity: row.get(5)?,
+                    late_receipt_audit_identity: row.get(6)?,
+                    canonical: row.get(7)?,
+                    sha256: row.get(8)?,
+                    channel: row.get(9)?,
+                    provider: row.get(10)?,
+                    message_id: row.get(11)?,
+                    platform_message_id: row.get(12)?,
+                    accepted_at: row.get(13)?,
+                    latency_ms: row.get(14)?,
+                    frozen_delivery_audit_canonical: row.get(15)?,
+                    frozen_delivery_audit_sha256: row.get(16)?,
+                    delivery_audit_ref: row.get(17)?,
+                    attempt_state: row.get(18)?,
+                })
+            },
+        )?;
+        mapped.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    if rows.len() != 1 {
+        return Err(DurableDeliveryError::PolicyMismatch(format!(
+            "foundation terminal requires exactly one authoritative {expected_kind} evidence join, observed {}",
+            rows.len()
+        )));
+    }
+    let sink = rows.into_iter().next().ok_or_else(|| {
+        DurableDeliveryError::PolicyMismatch(
+            "foundation terminal nonaccepted result disappeared".to_owned(),
+        )
+    })?;
+    if stored.current_attempt_identity.as_deref() != Some(attempt_identity)
+        || disposition.resolution_identity.is_some()
+        || disposition.denial_identity.is_some()
+        || !sink.authoritative_for_state
+        || sink.late_after_fence
+        || sink.late_receipt_audit_identity.is_some()
+        || !has_non_ascii_whitespace(&sink.authority_audit_identity)
+        || sink.attempt_state != expected_kind
+        || stored.fence_generation != sink.fence_token
+        || sink.channel.is_some()
+        || sink.provider.is_some()
+        || sink.message_id.is_some()
+        || sink.platform_message_id.is_some()
+        || sink.accepted_at.is_some()
+        || sink.latency_ms.is_some()
+        || sink.frozen_delivery_audit_canonical.is_some()
+        || sink.frozen_delivery_audit_sha256.is_some()
+        || sink.delivery_audit_ref.is_some()
+    {
+        return Err(DurableDeliveryError::PolicyMismatch(format!(
+            "authoritative {expected_kind} current attempt binding mismatch"
+        )));
+    }
+    parse_timestamp(&sink.observed_at)?;
+    if sha256_hex(&sink.canonical) != sink.sha256 {
+        return Err(DurableDeliveryError::PolicyMismatch(format!(
+            "authoritative {expected_kind} result canonical hash mismatch"
+        )));
+    }
+    let (created_at, retry_authorized, manual_action_required) = match expected_kind {
+        "Rejected" => {
+            let payload = RejectedSinkResultCanonical::parse_exact(&sink.canonical)?;
+            if payload.kind != "Rejected"
+                || payload.rejection.reason_code.trim().is_empty()
+                || payload.rejection.evidence.is_empty()
+            {
+                return Err(DurableDeliveryError::PolicyMismatch(
+                    "authoritative rejected typed evidence is invalid".to_owned(),
+                ));
+            }
+            (
+                timestamp(payload.rejection.observed_at),
+                payload.rejection.retry_authorized,
+                false,
+            )
+        }
+        "Uncertain" => {
+            let payload = UncertainSinkResultCanonical::parse_exact(&sink.canonical)?;
+            if payload.kind != "Uncertain"
+                || payload.uncertainty.reason_code.trim().is_empty()
+                || payload.uncertainty.evidence.is_empty()
+            {
+                return Err(DurableDeliveryError::PolicyMismatch(
+                    "authoritative uncertain typed evidence is invalid".to_owned(),
+                ));
+            }
+            (timestamp(payload.uncertainty.observed_at), false, true)
+        }
+        other => {
+            return Err(DurableDeliveryError::PolicyMismatch(format!(
+                "unsupported foundation nonaccepted terminal kind {other}"
+            )))
+        }
+    };
+    let disposition_payload = validate_current_disposition_canonical(
+        stored,
+        envelope,
+        disposition,
+        &sink.sha256,
+        retry_authorized,
+        manual_action_required,
+    )?;
+    if disposition_payload.attempt_identity.as_deref() != Some(attempt_identity)
+        || disposition_payload.created_at != created_at
+    {
+        return Err(DurableDeliveryError::PolicyMismatch(format!(
+            "authoritative {expected_kind} disposition/result timestamp binding mismatch"
+        )));
+    }
+    let expected_result_identity = stable_identity(
+        "delivery-sink-result-v1",
+        &[
+            attempt_identity,
+            &sink.fence_token.to_string(),
+            expected_kind,
+            &sink.sha256,
+        ],
+    );
+    if sink.result_event_identity != expected_result_identity {
+        return Err(DurableDeliveryError::PolicyMismatch(format!(
+            "authoritative {expected_kind} result identity mismatch"
+        )));
+    }
+    Ok((sink.canonical, sink.sha256))
+}
+
+fn validate_manual_rejected_delivery_evidence(
+    connection: &Connection,
+    stored: &StoredDecision,
+    envelope: &DeliveryEnvelope,
+    disposition: &StoredDispositionEvidence,
+) -> Result<(String, Vec<u8>, String)> {
+    let evidence = connection
+        .query_row(
+            "SELECT m.resolution_identity,m.attempt_identity,m.operator_identity,m.reason,
+                    m.evidence_canonical,m.evidence_sha256,m.receipt_canonical,
+                    m.frozen_delivery_audit_canonical,m.frozen_delivery_audit_sha256,
+                    m.immutable_audit_ref,m.accepted_audit_identity,
+                    m.accepted_audit_append_state,m.accepted_audit_ref,m.resolved_at,a.state
+             FROM manual_resolutions m
+             JOIN delivery_attempts a
+               ON a.attempt_identity=m.attempt_identity
+              AND a.decision_identity=m.decision_identity
+             WHERE m.decision_identity=?1 AND m.disposition='Rejected'",
+            [stored.decision_identity.as_str()],
+            |row| {
+                Ok(StoredManualRejectedEvidence {
+                    resolution_identity: row.get(0)?,
+                    attempt_identity: row.get(1)?,
+                    operator_identity: row.get(2)?,
+                    reason: row.get(3)?,
+                    evidence_canonical: row.get(4)?,
+                    evidence_sha256: row.get(5)?,
+                    receipt_canonical: row.get(6)?,
+                    frozen_delivery_audit_canonical: row.get(7)?,
+                    frozen_delivery_audit_sha256: row.get(8)?,
+                    immutable_audit_ref: row.get(9)?,
+                    accepted_audit_identity: row.get(10)?,
+                    accepted_audit_append_state: row.get(11)?,
+                    accepted_audit_ref: row.get(12)?,
+                    resolved_at: row.get(13)?,
+                    attempt_state: row.get(14)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            DurableDeliveryError::PolicyMismatch(
+                "foundation manual rejection evidence is missing".to_owned(),
+            )
+        })?;
+    if stored.current_attempt_identity.as_deref() != Some(evidence.attempt_identity.as_str())
+        || disposition.attempt_identity.is_some()
+        || disposition.denial_identity.is_some()
+        || disposition.resolution_identity.as_deref() != Some(evidence.resolution_identity.as_str())
+        || evidence.attempt_state != "Uncertain"
+        || evidence.operator_identity.trim().is_empty()
+        || evidence.reason.trim().is_empty()
+        || evidence.evidence_canonical.is_empty()
+        || sha256_hex(&evidence.evidence_canonical) != evidence.evidence_sha256
+        || !has_non_ascii_whitespace(&evidence.immutable_audit_ref)
+        || evidence.receipt_canonical.is_some()
+        || evidence.frozen_delivery_audit_canonical.is_some()
+        || evidence.frozen_delivery_audit_sha256.is_some()
+        || evidence.accepted_audit_identity.is_some()
+        || evidence.accepted_audit_append_state.is_some()
+        || evidence.accepted_audit_ref.is_some()
+    {
+        return Err(DurableDeliveryError::PolicyMismatch(
+            "foundation manual rejection exact source binding mismatch".to_owned(),
+        ));
+    }
+    parse_timestamp(&evidence.resolved_at)?;
+    let expected_resolution_identity = stable_identity(
+        "delivery-manual-resolution-v1",
+        &[
+            &stored.decision_identity,
+            "Rejected",
+            &evidence.operator_identity,
+            &evidence.evidence_sha256,
+        ],
+    );
+    if evidence.resolution_identity != expected_resolution_identity {
+        return Err(DurableDeliveryError::PolicyMismatch(
+            "foundation manual rejection resolution identity mismatch".to_owned(),
+        ));
+    }
+    validate_current_disposition_canonical(
+        stored,
+        envelope,
+        disposition,
+        &evidence.evidence_sha256,
+        false,
+        false,
+    )?;
+    let authorization = ManualResolutionAuthorizationCanonical {
+        resolution_identity: evidence.resolution_identity,
+        decision_identity: stored.decision_identity.clone(),
+        disposition: "Rejected".to_owned(),
+        operator_identity: evidence.operator_identity,
+        reason: evidence.reason,
+        evidence_sha256: evidence.evidence_sha256,
+        resolved_at: evidence.resolved_at,
+    }
+    .canonical_bytes()?;
+    let authorization_sha256 = sha256_hex(&authorization);
+    Ok((
+        evidence.attempt_identity,
+        authorization,
+        authorization_sha256,
+    ))
+}
+
 fn validate_delivered_transition_evidence(
     transaction: &Transaction<'_>,
     stored: &StoredDecision,
@@ -6111,6 +6597,8 @@ fn validate_delivered_transition_evidence(
                 &envelope,
                 &disposition,
                 &manual.acceptance_evidence_sha256,
+                false,
+                false,
             )?
         }
         other => {
@@ -6181,6 +6669,8 @@ fn validate_current_disposition_canonical(
     envelope: &DeliveryEnvelope,
     disposition: &StoredDispositionEvidence,
     expected_evidence_sha256: &str,
+    expected_retry_authorized: bool,
+    expected_manual_action_required: bool,
 ) -> Result<DeliveryDispositionCanonical> {
     if disposition.disposition_identity
         != stored
@@ -6237,9 +6727,9 @@ fn validate_current_disposition_canonical(
         && payload.resolution_identity == disposition.resolution_identity
         && payload.disposition == disposition.disposition
         && payload.evidence_sha256 == expected_evidence_sha256
-        && !payload.retry_authorized
-        && !stored.retry_authorized
-        && !payload.manual_action_required
+        && payload.retry_authorized == expected_retry_authorized
+        && stored.retry_authorized == expected_retry_authorized
+        && payload.manual_action_required == expected_manual_action_required
         && payload.created_at == disposition.created_at;
     if !exact_binding {
         return Err(DurableDeliveryError::PolicyMismatch(
@@ -6475,8 +6965,14 @@ fn validate_authoritative_accepted_delivery_evidence(
             "authoritative accepted result receipt/column exact binding mismatch".to_owned(),
         ));
     }
-    let disposition_payload =
-        validate_current_disposition_canonical(stored, envelope, disposition, &sink.sha256)?;
+    let disposition_payload = validate_current_disposition_canonical(
+        stored,
+        envelope,
+        disposition,
+        &sink.sha256,
+        false,
+        false,
+    )?;
     if disposition_payload.attempt_identity.as_deref() != Some(attempt_identity)
         || disposition_payload.created_at != accepted_at
     {

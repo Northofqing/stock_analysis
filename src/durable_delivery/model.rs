@@ -1302,6 +1302,84 @@ impl AcceptedSinkResultCanonical {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct RejectedSinkResultCanonical {
+    pub(crate) kind: String,
+    pub(crate) rejection: TypedRejection,
+}
+
+impl RejectedSinkResultCanonical {
+    pub(crate) fn parse_exact(canonical: &[u8]) -> Result<Self> {
+        let value = parse_exact_canonical_value(canonical, "authoritative rejected sink result")?;
+        require_exact_object_fields(
+            &value,
+            "authoritative rejected sink result",
+            &["kind", "rejection"],
+        )?;
+        let rejection = value.get("rejection").ok_or_else(|| {
+            DurableDeliveryError::PolicyMismatch(
+                "authoritative rejected sink result rejection is missing".to_owned(),
+            )
+        })?;
+        require_exact_object_fields(
+            rejection,
+            "authoritative rejected evidence",
+            &["reason_code", "evidence", "retry_authorized", "observed_at"],
+        )?;
+        let payload: Self = serde_json::from_value(value).map_err(|error| {
+            DurableDeliveryError::PolicyMismatch(format!(
+                "authoritative rejected sink result canonical payload is invalid: {error}"
+            ))
+        })?;
+        validate_typed_canonical_reencode(
+            canonical,
+            "authoritative rejected sink result",
+            &payload,
+        )?;
+        Ok(payload)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UncertainSinkResultCanonical {
+    pub(crate) kind: String,
+    pub(crate) uncertainty: TypedUncertainty,
+}
+
+impl UncertainSinkResultCanonical {
+    pub(crate) fn parse_exact(canonical: &[u8]) -> Result<Self> {
+        let value = parse_exact_canonical_value(canonical, "authoritative uncertain sink result")?;
+        require_exact_object_fields(
+            &value,
+            "authoritative uncertain sink result",
+            &["kind", "uncertainty"],
+        )?;
+        let uncertainty = value.get("uncertainty").ok_or_else(|| {
+            DurableDeliveryError::PolicyMismatch(
+                "authoritative uncertain sink result uncertainty is missing".to_owned(),
+            )
+        })?;
+        require_exact_object_fields(
+            uncertainty,
+            "authoritative uncertainty evidence",
+            &["reason_code", "evidence", "observed_at"],
+        )?;
+        let payload: Self = serde_json::from_value(value).map_err(|error| {
+            DurableDeliveryError::PolicyMismatch(format!(
+                "authoritative uncertain sink result canonical payload is invalid: {error}"
+            ))
+        })?;
+        validate_typed_canonical_reencode(
+            canonical,
+            "authoritative uncertain sink result",
+            &payload,
+        )?;
+        Ok(payload)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ManualResolutionAuthorizationCanonical {
     pub(crate) resolution_identity: String,
     pub(crate) decision_identity: String,
