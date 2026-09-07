@@ -1,6 +1,6 @@
 # W16 activation 完整实施计划
 
-日期：2026-09-08。状态：完整读取 `1c16380`、内部事务/原始准入投影 `10f7e03` 及测试补充 `5a78dd6` 已通过限定独立审查；合批221项与修正后事务专项18项通过，目标Clippy零诊断。B/C工程合同已定；真实生产身份、准入认证、当前fence及owner执行仍未完成。设计：[W16 activation 设计](../specs/2026-09-08-push-foundation-w16-activation-design.md)；证据：[W16 实施结果](../../push-system/implementation-w16-results-2026-09-08.md)。完整 W16 未完成。
+日期：2026-09-08。状态：完整读取 `1c16380`、内部事务/原始准入投影 `10f7e03`、测试补充 `5a78dd6`，以及Unix/FD真实观察与日历声明绑定 `9722979` 已通过限定独立审查。最新合批244项、修正后身份专项8项、相邻日历2项通过，目标Clippy零诊断。B/C工程合同已定；生产身份根/批准真实性、当前fence及owner执行仍未完成。设计：[W16 activation 设计](../specs/2026-09-08-push-foundation-w16-activation-design.md)；证据：[W16 实施结果](../../push-system/implementation-w16-results-2026-09-08.md)。完整 W16 未完成。
 
 ## 范围与执行约定
 
@@ -53,6 +53,8 @@ cargo test --lib push_foundation::activation_facts_tests -- --test-threads=1
 必须打印实际测试数量大于零且通过；精确确认 inspector 前后 DB bytes/sidecar 不变。T1 没有 provider/sink 执行端口，不能以未接入的计数器自证零调用；此处验收采用实际文件字节/目录断言和读取调用链审查，不声称测量了外部端口计数。完整W16/T7及W17的真实副作用端口计数要求保留，不因该证据措辞纠正而删除。T1 完成报告明确“不含认证、写入、配额、owner 接管”。
 
 ## Task 2 — T2 认证部署 inspector 与操作批准
+
+实施状态（9722979）：已交付真实Unix内核身份、持有FD的制品完整性观察、原始批准声明约束和日历/全catalog Unit集合声明join，限定审查通过。catalog目前没有CalendarId字段，期望映射仍由待认证部署包提供；代码没有默认认证映射。生产规范身份、受保护root opener/ACL、真实部署/source、可信时钟、批准持久/撤销/防重放仍未完成，不能将原始观察或Test策略升级为本Task整体验收。
 
 依赖 T1 与 needs-context A/E 已决部分。新建 `activation_authorization.rs`、`activation_deployment.rs`、`activation_authorization_tests.rs`、`activation_deployment_tests.rs`；声明变更由本任务串行接管 `mod.rs`。`src/auth/operator.rs` 只在确定平台后增加能返回真实认证主体的专用路径，保留现有 monitor auth 行为；W16 不使用可跳过的 `Result<()>` 作证明。平台信任配置文件的实际路径在 T0 确认后登记，不能预造仓库内 production allowlist 为权威。
 

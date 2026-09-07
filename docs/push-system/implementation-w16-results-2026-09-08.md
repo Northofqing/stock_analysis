@@ -6,7 +6,7 @@
 
 `e7bf3d5` 将 RFC 与机器校验器的 Shadow owner=None 限定到新 shadow actor，保留 Unit 实际 incumbent；初始 Disabled 与排空后 Disabled 的准入从不可变已执行历史和真实批准推导，不新增状态表，不复用旧 token。
 
-依据及矩阵见 [合同裁决](activation-contract-decisions-2026-09-08.md)。原 Q13/Q17 和八份输入字节保留；真实身份、准入投影和执行许可仍需实现。
+依据及矩阵见 [合同裁决](activation-contract-decisions-2026-09-08.md)。原 Q13/Q17 和八份输入字节保留；原始准入投影见后文，真实身份及执行许可仍需实现。
 
 - 公共 CLI 回归先失败再通过：1 run / 11 assertions，全绿，接受正确 scope 后突变回旧 whole-Unit scope 并验证拒绝。
 - `ruby scripts/architecture-docs/test/rfc_spec_test.rb`：session79925，exit0，296 runs / 3884 assertions，0 failures / errors / skips，165.568s。
@@ -62,9 +62,27 @@ session40241：`cargo test --lib push_foundation::activation_transaction_tests -
 
 限定复核 `10f7e03..5a78dd6`：三项全部ADDRESSED，新Critical/Important/Minor均无；最终 **Spec Approved / Code quality Approved**。批准范围仅内部事务引擎、原始准入投影与本批测试，不是整个T3/T4、真实身份或生产owner接管。
 
+## 已完成限定实现：真实身份/制品观察与日历声明绑定
+
+源码 `9722979`，原始 BASE `c1aee09`。身份适配 agent 与主控按文件并行，本批增加四个模块文件及一个窄日历读取接口，尚不提供生产认证或实际 owner 切换。
+
+- `activation_authorization.rs::observe_unix_peer` 从实际 Unix 连接查询内核 UID/GID/PID，字段私有、不可克隆、绑定连接借用生命周期，Debug 隐去原身份。它不是 PAM 人类认证，也不证明监督器实例。
+- 原始批准声明逐项比对 command、namespace、Unit、action、generation、目标 manifest、evidence、窗口、approval ID 与策略版本；检查角色/范围、撤销及独立 Rollback 权限。唯一可创建策略来自测试编译下的临时 listener，拒绝 Production；同 UID 的两个连接不能满足 DualControl。生产根未配置始终拒绝，原始声明相等不授权执行，approval ID 不证明跨重启防重放。
+- `activation_deployment.rs` 保持同一个 File 描述符，用实际 metadata 和有界 bytes/hash 观察、重验文件；路径替换不会使它改读新路径，字节/权限变化会拒绝。原始 FD 不证明来自受保护根，尚不验证祖先目录/ACL 或运行中 binary；自洽克隆不能因此成为可信来源。
+- 日历声明精确连接 namespace、catalog、全部52个已登记 Unit、CalendarId、不可变日历摘要与上海时区。从显式 UTC 微秒计算上海自然日 `[00:00,次日00:00)`；普通 Activate 休市拒绝，Rollback 使用覆盖年内的实际当日，不映射到下一交易日。覆盖年外、缺/重/额外 Unit、错日历/namespace、过期/回拨/跨日或锁后上下文改变均拒绝。
+- `calendar.rs::verified_a_share_calendar_authority_hash` 仅增加不可变的覆盖日摘要读取，允许休市日取得同一 authority；原 replay 空日期范围仍拒绝，未改内嵌 CSV 或现有日期语义。catalog 尚无 CalendarId 字段，期望映射来自待认证的部署声明，代码未虚构默认批准映射。
+
+首轮合批 `cargo test --lib push_foundation:: -- --test-threads=1`，session63832，exit0：**244 passed / 0 failed / 2 helper ignored**，28.34s，编译2m24s。包括新增22项（8身份/14部署日历）与原222项；两个helper由父测试实际执行。44项warning中43既有，一个为非Unix错误分支在Unix未使用；原agent改为一致平台cfg。
+
+修正后session97782身份专项 **8/8**，0.01s、编译2m24s，仅43项既有warning；未改的部署和相邻代码复用63832结果。session92155运行不可变calendar后续交易日两项，**2/2**，0.00s、缓存1.72s。六文件定向格式检查通过。
+
+Clippy session60834 exit0、1m22s；完整JSON流在pipefail下汇总，build-finished success=true，163项有位置既有warning，Foundation/calendar/采集审计目标零诊断。不是根据截断日志推断没有新增问题。
+
+固定 `c1aee09..9722979` 六文件限定独立审查 **Spec compliant / Code quality Approved**，Critical/Important均无。非阻塞Minor：authorization中的 `std::fmt` 导入仅Unix使用，非Unix编译可能告警，随下次平台适配处理；本轮未执行非Unix构建。原始UID/FD/日历检查不是生产身份、受保护根、运行binary或防重放证明，完整T2仍未完成。
+
 ## 完整剩余范围
 
-- T2：真实操作员/部署/source package/日历和批准验证；生产平台及根配置尚未给定。
+- T2：本批仅完成真实内核/FD观察、批准声明约束和原始日历join；生产规范操作员、受保护根/opener/ACL、实际部署/source package、可信时钟和批准持久/撤销/防重放仍待，生产平台及根配置尚未给定。
 - T3：内部同事务引擎已实现；真实认证 opener、可信业务日及外部批准包精确请求绑定、T5协调接线仍待。
 - T4/T5：原始准入投影已实现；legacy/new 四类 actor 的共同当前 fence、真实监督器和旧 binary 撤权、批准范围认证、非原子切换/恢复/rollback仍待。
 - T6/T7：W15 全 Unit 部署集合及显式版本消费、同快照查询/启动、操作员入口和完整门禁。
