@@ -1,6 +1,6 @@
 use crate::monitor::push_job::{
-    CursorDirective, IntentId, ReasonCode, RetryEligibility, ScheduleDirective, Sha256Digest,
-    TerminalDisposition, TerminalRefId, UtcMicros,
+    CursorDirective, DecisionId, IntentId, ReasonCode, RetryEligibility, ScheduleDirective,
+    Sha256Digest, TerminalDisposition, TerminalRefId, UtcMicros,
 };
 
 use super::business_finalizer::{
@@ -747,6 +747,88 @@ fn w10_not_delivered_allows_only_the_latest_uncertain_resolution_origin() {
 }
 
 #[test]
+fn w10_duplicate_not_delivered_returns_one_terminal_event_without_a_third_requery() {
+    let fixture = not_delivered_fixture();
+    let authority = FakeAuthority::terminal(fixture.record.clone());
+    let mut store = BusinessIntentStore::open(&fixture.database).unwrap();
+    let awaiting = dispatch(&fixture, &mut store);
+    let build_request = || {
+        NotDeliveredPreparationRequest::new(
+            fixture.record.intent_id.clone(),
+            awaiting.version(),
+            TransitionActor::try_new("operator-1".to_owned()).unwrap(),
+            fence(&awaiting),
+            micros(QUALIFY_VERIFIED_AT),
+            audit(&fixture, &awaiting, digest('2')),
+        )
+        .unwrap()
+    };
+    let first = match prepare_not_delivered_finalization(
+        &mut store,
+        build_request(),
+        &fixture.template,
+        &fixture.policy,
+        &authority,
+    )
+    .unwrap()
+    {
+        NotDeliveredPreparationOutcome::Pending(pending) => pending,
+        other => panic!("expected first pending not-delivered, got {other:?}"),
+    };
+    let second = match prepare_not_delivered_finalization(
+        &mut store,
+        build_request(),
+        &fixture.template,
+        &fixture.policy,
+        &authority,
+    )
+    .unwrap()
+    {
+        NotDeliveredPreparationOutcome::Pending(pending) => pending,
+        other => panic!("expected second pending not-delivered, got {other:?}"),
+    };
+    let first_receipt = match commit_not_delivered_finalization(
+        &mut store,
+        first,
+        &fixture.template,
+        &fixture.policy,
+        &authority,
+        micros(FINAL_VERIFIED_AT),
+        micros(FINAL_AT),
+    )
+    .unwrap()
+    {
+        NotDeliveredFinalizationOutcome::Applied { receipt, .. } => receipt,
+        other => panic!("expected applied not-delivered, got {other:?}"),
+    };
+    let second_receipt = match commit_not_delivered_finalization(
+        &mut store,
+        second,
+        &fixture.template,
+        &fixture.policy,
+        &authority,
+        micros(FINAL_VERIFIED_AT),
+        micros(FINAL_AT),
+    )
+    .unwrap()
+    {
+        NotDeliveredFinalizationOutcome::AlreadyCommitted { receipt, .. } => receipt,
+        other => panic!("expected idempotent not-delivered, got {other:?}"),
+    };
+    assert_eq!(first_receipt, second_receipt);
+    assert_eq!(authority.calls.get(), 3);
+    assert_eq!(
+        store
+            .inspect_transition_chain(&fixture.record.intent_id)
+            .unwrap()
+            .iter()
+            .filter(|event| event.to_state() == IntentState::NotDelivered)
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn w10_not_delivered_rejects_missing_or_replayed_audit_before_authority_query() {
     let fixture = not_delivered_fixture();
     let authority = FakeAuthority::terminal(fixture.record.clone());
@@ -786,6 +868,34 @@ fn w10_not_delivered_rejects_missing_or_replayed_audit_before_authority_query() 
         fence(&awaiting),
         micros(QUALIFY_VERIFIED_AT),
         replayed,
+    )
+    .unwrap();
+    assert!(matches!(
+        prepare_not_delivered_finalization(
+            &mut store,
+            request,
+            &fixture.template,
+            &fixture.policy,
+            &authority,
+        ),
+        Err(BusinessFinalizerError::OperatorAuditMismatch)
+    ));
+
+    let wrong_decision = VerifiedOperatorAuditRef::for_test(
+        fixture.record.intent_id.clone(),
+        DecisionId::try_new("0".repeat(64)).unwrap(),
+        awaiting.version(),
+        "operator-audit-wrong-decision".to_owned(),
+        digest('4'),
+    )
+    .unwrap();
+    let request = NotDeliveredPreparationRequest::new(
+        fixture.record.intent_id.clone(),
+        awaiting.version(),
+        TransitionActor::try_new("operator-1".to_owned()).unwrap(),
+        fence(&awaiting),
+        micros(QUALIFY_VERIFIED_AT),
+        wrong_decision,
     )
     .unwrap();
     assert!(matches!(
@@ -846,7 +956,42 @@ fn w10_not_delivered_rejects_accepted_history_and_wrong_disposition_without_writ
         Err(BusinessFinalizerError::NotDeliveredHistoryIneligible)
     ));
     assert_eq!(not_delivered_authority.calls.get(), 0);
-    drop(accepted_pending);
+
+    let completed_fence = fence(&qualified);
+    commit_accepted_finalization(
+        &mut store,
+        accepted_pending,
+        &accepted_fixture.template,
+        &accepted_fixture.policy,
+        &accepted_authority,
+        micros(FINAL_VERIFIED_AT),
+        micros(FINAL_AT),
+    )
+    .unwrap();
+    let completed = store
+        .inspect(&accepted_fixture.record.intent_id)
+        .unwrap()
+        .unwrap();
+    let request = NotDeliveredPreparationRequest::new(
+        accepted_fixture.record.intent_id.clone(),
+        completed.version(),
+        TransitionActor::try_new("operator-1".to_owned()).unwrap(),
+        completed_fence,
+        micros(FINAL_AT),
+        audit(&accepted_fixture, &completed, digest('3')),
+    )
+    .unwrap();
+    assert!(matches!(
+        prepare_not_delivered_finalization(
+            &mut store,
+            request,
+            &accepted_fixture.template,
+            &accepted_fixture.policy,
+            &not_delivered_authority,
+        ),
+        Err(BusinessFinalizerError::NotDeliveredHistoryIneligible)
+    ));
+    assert_eq!(not_delivered_authority.calls.get(), 0);
 
     let other_fixture = fixture();
     let authority = FakeAuthority::terminal(other_fixture.record.clone());
