@@ -3,8 +3,12 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Read;
 use std::path::Path;
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
@@ -15,6 +19,11 @@ use super::migration::validate_database_path;
 
 const SCHEMA_VERSION: i64 = 1;
 const NAMESPACE_DOMAIN: &str = "OperationalReadinessNamespace/v1";
+const SQLITE_HEADER_LEN: usize = 100;
+const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+const SQLITE_WRITE_VERSION_OFFSET: usize = 18;
+const SQLITE_READ_VERSION_OFFSET: usize = 19;
+const ROLLBACK_JOURNAL_VERSION: u8 = 1;
 const DDL: &str = r#"
 CREATE TABLE operational_readiness_schema(
     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -136,6 +145,45 @@ pub(crate) fn initialize_database(
     path: &Path,
     namespace: &Namespace,
 ) -> Result<(), ReadinessSchemaError> {
+    initialize_database_inner(path, namespace, || {}, || {})
+}
+
+#[cfg(test)]
+pub(super) fn initialize_database_with_before_create_hook<F>(
+    path: &Path,
+    namespace: &Namespace,
+    before_create: F,
+) -> Result<(), ReadinessSchemaError>
+where
+    F: FnOnce(),
+{
+    initialize_database_inner(path, namespace, before_create, || {})
+}
+
+#[cfg(test)]
+pub(super) fn initialize_database_with_creation_hooks<F, G>(
+    path: &Path,
+    namespace: &Namespace,
+    before_create: F,
+    after_create: G,
+) -> Result<(), ReadinessSchemaError>
+where
+    F: FnOnce(),
+    G: FnOnce(),
+{
+    initialize_database_inner(path, namespace, before_create, after_create)
+}
+
+fn initialize_database_inner<F, G>(
+    path: &Path,
+    namespace: &Namespace,
+    before_create: F,
+    after_create: G,
+) -> Result<(), ReadinessSchemaError>
+where
+    F: FnOnce(),
+    G: FnOnce(),
+{
     validate_path(path)?;
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_file() => return open_writer(path, namespace).map(drop),
@@ -152,14 +200,26 @@ pub(crate) fn initialize_database(
         }
     }
 
+    before_create();
+    let owned_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|_| ReadinessSchemaError::InitializationFailed {
+            check: "claim_new_target",
+        })?;
+    let owned_identity = owned_file_identity(&owned_file)?;
+    after_create();
+    verify_owned_target(path, owned_identity)?;
     let mut connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(|_| ReadinessSchemaError::DatabaseOpenFailed)?;
+    verify_owned_target(path, owned_identity)?;
     enable_and_verify_foreign_keys(&connection)?;
     require_empty_database(&connection)?;
 
@@ -189,6 +249,8 @@ pub(crate) fn initialize_database(
             check: "commit_schema",
         })?;
 
+    verify_owned_target(path, owned_identity)?;
+    validate_rollback_journal_header(path)?;
     validate_schema(&connection, namespace)
 }
 
@@ -197,6 +259,7 @@ pub(crate) fn open_read_only(
     namespace: &Namespace,
 ) -> Result<Connection, ReadinessSchemaError> {
     validate_existing_path(path)?;
+    validate_rollback_journal_header(path)?;
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -219,6 +282,7 @@ pub(crate) fn open_writer(
     namespace: &Namespace,
 ) -> Result<Connection, ReadinessSchemaError> {
     validate_existing_path(path)?;
+    validate_rollback_journal_header(path)?;
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -251,6 +315,82 @@ fn validate_existing_path(path: &Path) -> Result<(), ReadinessSchemaError> {
             check: "target_metadata",
         }),
     }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn owned_file_identity(file: &File) -> Result<FileIdentity, ReadinessSchemaError> {
+    let metadata = file
+        .metadata()
+        .map_err(|_| ReadinessSchemaError::InitializationFailed {
+            check: "owned_target_metadata",
+        })?;
+    Ok(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(unix)]
+fn verify_owned_target(path: &Path, expected: FileIdentity) -> Result<(), ReadinessSchemaError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|_| ReadinessSchemaError::InitializationFailed {
+            check: "owned_target_identity",
+        })?;
+    let actual = FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() || actual != expected {
+        return Err(ReadinessSchemaError::InitializationFailed {
+            check: "owned_target_identity",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+#[derive(Clone, Copy, Debug)]
+struct FileIdentity;
+
+#[cfg(not(unix))]
+fn owned_file_identity(_file: &File) -> Result<FileIdentity, ReadinessSchemaError> {
+    Err(ReadinessSchemaError::InitializationFailed {
+        check: "owned_target_identity_unsupported",
+    })
+}
+
+#[cfg(not(unix))]
+fn verify_owned_target(_path: &Path, _expected: FileIdentity) -> Result<(), ReadinessSchemaError> {
+    Err(ReadinessSchemaError::InitializationFailed {
+        check: "owned_target_identity_unsupported",
+    })
+}
+
+fn validate_rollback_journal_header(path: &Path) -> Result<(), ReadinessSchemaError> {
+    let mut file = File::open(path).map_err(|_| ReadinessSchemaError::ValidationFailed {
+        check: "database_header",
+    })?;
+    let mut header = [0_u8; SQLITE_HEADER_LEN];
+    file.read_exact(&mut header)
+        .map_err(|_| ReadinessSchemaError::ValidationFailed {
+            check: "database_header",
+        })?;
+    if &header[..SQLITE_MAGIC.len()] != SQLITE_MAGIC
+        || header[SQLITE_WRITE_VERSION_OFFSET] != ROLLBACK_JOURNAL_VERSION
+        || header[SQLITE_READ_VERSION_OFFSET] != ROLLBACK_JOURNAL_VERSION
+    {
+        return Err(ReadinessSchemaError::ValidationFailed {
+            check: "database_header",
+        });
+    }
+    Ok(())
 }
 
 fn enable_and_verify_foreign_keys(connection: &Connection) -> Result<(), ReadinessSchemaError> {

@@ -1,11 +1,19 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::io::{Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::{symlink, MetadataExt};
 
 use crate::monitor::push_job::{canonical_digest, namespace_value, Namespace, RunId};
 use rusqlite::{params, Connection};
 
-use super::readiness_store_schema::{initialize_database, open_read_only, open_writer};
+use super::readiness_store_schema::{
+    initialize_database, initialize_database_with_before_create_hook,
+    initialize_database_with_creation_hooks, open_read_only, open_writer,
+};
 
 fn namespace() -> Namespace {
     Namespace::test(RunId::try_new("TEST_CODE-w15-store".to_owned()).expect("TEST_CODE namespace"))
@@ -24,6 +32,18 @@ fn initialized_database(name: &str) -> (tempfile::TempDir, PathBuf, Namespace) {
     let namespace = namespace();
     initialize_database(&database, &namespace).expect("TEST_CODE explicit initialization");
     (root, database, namespace)
+}
+
+fn directory_bytes(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    fs::read_dir(root)
+        .expect("TEST_CODE read database directory")
+        .map(|entry| {
+            let entry = entry.expect("TEST_CODE database directory entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let bytes = fs::read(entry.path()).expect("TEST_CODE database artifact bytes");
+            (name, bytes)
+        })
+        .collect()
 }
 
 fn insert_linked_pair(connection: &mut Connection) {
@@ -65,6 +85,9 @@ fn w15_explicit_initialization_is_idempotent_and_namespace_bound() {
 
     initialize_database(&database, &namespace).expect("TEST_CODE explicit initialization");
     let initialized_bytes = fs::read(&database).expect("TEST_CODE initialized database bytes");
+    assert!(initialized_bytes.len() >= 100);
+    assert_eq!(&initialized_bytes[..16], b"SQLite format 3\0");
+    assert_eq!((initialized_bytes[18], initialized_bytes[19]), (1, 1));
 
     let connection = open_read_only(&database, &namespace).expect("TEST_CODE read-only open");
     let header: (i64, String, String) = connection
@@ -395,4 +418,153 @@ fn w15_errors_do_not_disclose_protected_database_paths() {
         assert!(!format!("{error}").contains(secret));
         assert!(!format!("{error:?}").contains(secret));
     }
+}
+
+#[test]
+fn w15_initializer_never_takes_over_a_target_created_after_missing_check() {
+    let root = tempfile::tempdir().expect("TEST_CODE create race root");
+    let database = database_path(&root, "raced.sqlite3");
+    #[cfg(unix)]
+    let mut competitor_inode = None;
+
+    let result = initialize_database_with_before_create_hook(&database, &namespace(), || {
+        let competitor = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&database)
+            .expect("TEST_CODE competitor atomically creates target");
+        #[cfg(unix)]
+        {
+            competitor_inode = Some(
+                competitor
+                    .metadata()
+                    .expect("TEST_CODE competitor metadata")
+                    .ino(),
+            );
+        }
+        drop(competitor);
+    });
+
+    assert!(result.is_err());
+    assert_eq!(
+        fs::read(&database).expect("TEST_CODE competitor file remains"),
+        Vec::<u8>::new()
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(&database)
+            .expect("TEST_CODE raced target metadata")
+            .ino(),
+        competitor_inode.expect("TEST_CODE competitor inode")
+    );
+
+    #[cfg(unix)]
+    {
+        let link = database.with_file_name("raced-link.sqlite3");
+        let competitor_target = database.with_file_name("competitor-owned.sqlite3");
+        fs::write(&competitor_target, b"competitor-owned")
+            .expect("TEST_CODE competitor target contents");
+        let result = initialize_database_with_before_create_hook(&link, &namespace(), || {
+            symlink(&competitor_target, &link).expect("TEST_CODE competitor creates symlink");
+        });
+
+        assert!(result.is_err());
+        assert!(fs::symlink_metadata(&link)
+            .expect("TEST_CODE raced symlink metadata")
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read_link(&link).expect("TEST_CODE raced symlink target"),
+            competitor_target
+        );
+        assert_eq!(
+            fs::read(&competitor_target).expect("TEST_CODE competitor contents remain"),
+            b"competitor-owned"
+        );
+    }
+
+    let replaced = database.with_file_name("replaced-after-claim.sqlite3");
+    let claimed = database.with_file_name("claimed-by-initializer.sqlite3");
+    let result = initialize_database_with_creation_hooks(
+        &replaced,
+        &namespace(),
+        || {},
+        || {
+            fs::rename(&replaced, &claimed).expect("TEST_CODE preserve claimed inode");
+            fs::write(&replaced, b"competitor replacement")
+                .expect("TEST_CODE competitor replaces claimed path");
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        fs::read(&claimed).expect("TEST_CODE originally claimed file remains"),
+        Vec::<u8>::new()
+    );
+    assert_eq!(
+        fs::read(&replaced).expect("TEST_CODE competitor replacement remains"),
+        b"competitor replacement"
+    );
+}
+
+#[test]
+fn w15_wal_database_is_rejected_before_read_or_write_open_side_effects() {
+    let (root, database, namespace) = initialized_database("wal.sqlite3");
+    let connection = Connection::open(&database).expect("TEST_CODE WAL fault injection");
+    let journal_mode: String = connection
+        .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+        .expect("TEST_CODE enable WAL");
+    assert_eq!(journal_mode, "wal");
+    connection
+        .execute_batch("PRAGMA wal_autocheckpoint=0; PRAGMA user_version=7;")
+        .expect("TEST_CODE create WAL transaction");
+    drop(connection);
+
+    let header = fs::read(&database).expect("TEST_CODE WAL database header");
+    assert!(header.len() >= 100);
+    assert_eq!(&header[..16], b"SQLite format 3\0");
+    assert_eq!((header[18], header[19]), (2, 2));
+    let before_reader = directory_bytes(root.path());
+
+    let reader = open_read_only(&database, &namespace);
+    let after_reader = directory_bytes(root.path());
+    let reader_rejected = reader.is_err();
+    drop(reader);
+    assert!(reader_rejected);
+    assert_eq!(after_reader, before_reader);
+
+    let before_writer = directory_bytes(root.path());
+    let writer = open_writer(&database, &namespace);
+    let after_writer = directory_bytes(root.path());
+    let writer_rejected = writer.is_err();
+    drop(writer);
+    assert!(writer_rejected);
+    assert_eq!(after_writer, before_writer);
+}
+
+#[test]
+fn w15_malformed_or_unknown_sqlite_header_is_rejected_without_side_effects() {
+    let (root, database, namespace) = initialized_database("unknown-header.sqlite3");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(&database)
+        .expect("TEST_CODE open header fault injection");
+    file.seek(SeekFrom::Start(18))
+        .expect("TEST_CODE seek journal format");
+    file.write_all(&[3, 3])
+        .expect("TEST_CODE write unknown journal format");
+    file.sync_all().expect("TEST_CODE sync unknown header");
+    drop(file);
+    let before_unknown = directory_bytes(root.path());
+
+    assert!(open_read_only(&database, &namespace).is_err());
+    assert!(open_writer(&database, &namespace).is_err());
+    assert_eq!(directory_bytes(root.path()), before_unknown);
+
+    let malformed = database.with_file_name("malformed-header.sqlite3");
+    fs::write(&malformed, b"SQLite format 3\0").expect("TEST_CODE write truncated SQLite header");
+    let before_malformed = directory_bytes(root.path());
+    assert!(open_read_only(&malformed, &namespace).is_err());
+    assert!(open_writer(&malformed, &namespace).is_err());
+    assert_eq!(directory_bytes(root.path()), before_malformed);
 }

@@ -150,6 +150,7 @@ impl CandidateReadinessRecord {
     pub(crate) fn event_sha256(&self) -> &Sha256Digest {
         &self.event_sha256
     }
+    /// Protected persistence bytes; may contain protected URIs and must never enter errors or probes.
     pub(crate) fn event_bytes(&self) -> Vec<u8> {
         self.event_bytes.clone()
     }
