@@ -448,6 +448,7 @@ fn w12_required_channel_results_are_ordered_exact_and_all_accepted_only() {
         RequiredChannelClassification::AllRequiredAccepted
     );
     assert_eq!(results.ordered_channels(), required.as_slice());
+    assert_eq!(results.ordered_results().len(), 2);
     assert_eq!(
         results.completion_eligibility(),
         CompletionEligibility::PolicyBound

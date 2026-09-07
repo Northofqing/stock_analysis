@@ -2,7 +2,7 @@
 
 #![cfg_attr(not(test), allow(dead_code))]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -15,9 +15,10 @@ use crate::durable_delivery::{
 };
 use crate::monitor::push_job::{
     canonical_digest, raw_digest, subject_value, AttemptId, AudienceId, AuthorityClass,
-    BusinessDate, ChannelId, CompletionPolicy, DecisionId, DeliveryResult, DurableSchemaVersion,
-    IntentId, Namespace, OccurrenceId, RunId, Sha256Digest, SubjectId, TemplateId, TemplateVersion,
-    TerminalDisposition, TerminalRefId, UnitId, UtcMicros,
+    BusinessDate, ChannelId, CompletionEligibility, CompletionPolicy, DecisionId, DeliveryResult,
+    DeliveryResultView, DurableSchemaVersion, IntentId, Namespace, OccurrenceId, RunId,
+    Sha256Digest, SubjectId, TemplateId, TemplateVersion, TerminalDisposition, TerminalRefId,
+    UnitId, UtcMicros,
 };
 
 use super::terminal_authority::{
@@ -463,4 +464,159 @@ fn parse_subject(value: &str) -> Result<SubjectId, AuthorityQueryFailure> {
     }
     let entity = value.strip_prefix("Entity:").ok_or(AuthorityQueryFailure)?;
     SubjectId::entity(entity.to_owned()).map_err(|_| AuthorityQueryFailure)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RequiredChannelClassification {
+    AllRequiredAccepted,
+    PartialRequiredChannels,
+    RejectedRequiredChannels,
+    UncertainRequiredChannels,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum RequiredChannelError {
+    #[error("required channels must not be empty")]
+    RequiredChannelsEmpty,
+    #[error("required channels must be unique")]
+    DuplicateRequiredChannel,
+    #[error("one channel has more than one result")]
+    DuplicateObservation,
+    #[error("observed channels do not exactly match required channels")]
+    ChannelSetMismatch,
+    #[error("required-channel aggregation accepts only strong terminal authority")]
+    StrongAuthorityRequired,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RequiredChannelObservation {
+    channel: ChannelId,
+    result: DeliveryResult,
+}
+
+impl RequiredChannelObservation {
+    pub(crate) fn new(channel: ChannelId, result: DeliveryResult) -> Self {
+        Self { channel, result }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RequiredChannelResults {
+    ordered_channels: Vec<ChannelId>,
+    ordered_results: Vec<DeliveryResult>,
+    classification: RequiredChannelClassification,
+}
+
+impl RequiredChannelResults {
+    pub(crate) fn try_classify(
+        required_channels: Vec<ChannelId>,
+        observations: Vec<RequiredChannelObservation>,
+    ) -> Result<Self, RequiredChannelError> {
+        if required_channels.is_empty() {
+            return Err(RequiredChannelError::RequiredChannelsEmpty);
+        }
+        let required_set = required_channels
+            .iter()
+            .map(ChannelId::as_str)
+            .collect::<BTreeSet<_>>();
+        if required_set.len() != required_channels.len() {
+            return Err(RequiredChannelError::DuplicateRequiredChannel);
+        }
+        let mut observed = BTreeMap::new();
+        for observation in observations {
+            if observed
+                .insert(observation.channel.as_str().to_owned(), observation.result)
+                .is_some()
+            {
+                return Err(RequiredChannelError::DuplicateObservation);
+            }
+        }
+        let observed_set = observed.keys().map(String::as_str).collect::<BTreeSet<_>>();
+        if observed_set != required_set {
+            return Err(RequiredChannelError::ChannelSetMismatch);
+        }
+
+        let mut accepted_count = 0usize;
+        let mut has_uncertain = false;
+        let mut ordered_results = Vec::with_capacity(required_channels.len());
+        for required in &required_channels {
+            let result = observed
+                .remove(required.as_str())
+                .ok_or(RequiredChannelError::ChannelSetMismatch)?;
+            match classify_strong_channel_result(&result)? {
+                StrongChannelStatus::Accepted => accepted_count = accepted_count.saturating_add(1),
+                StrongChannelStatus::Rejected => {}
+                StrongChannelStatus::Uncertain => has_uncertain = true,
+            }
+            ordered_results.push(result);
+        }
+        let classification = if has_uncertain {
+            RequiredChannelClassification::UncertainRequiredChannels
+        } else if accepted_count == required_channels.len() {
+            RequiredChannelClassification::AllRequiredAccepted
+        } else if accepted_count > 0 {
+            RequiredChannelClassification::PartialRequiredChannels
+        } else {
+            RequiredChannelClassification::RejectedRequiredChannels
+        };
+        Ok(Self {
+            ordered_channels: required_channels,
+            ordered_results,
+            classification,
+        })
+    }
+
+    pub(crate) fn classification(&self) -> RequiredChannelClassification {
+        self.classification
+    }
+
+    pub(crate) fn ordered_channels(&self) -> &[ChannelId] {
+        &self.ordered_channels
+    }
+
+    pub(crate) fn ordered_results(&self) -> &[DeliveryResult] {
+        &self.ordered_results
+    }
+
+    pub(crate) fn completion_eligibility(&self) -> CompletionEligibility {
+        match self.classification {
+            RequiredChannelClassification::AllRequiredAccepted => {
+                CompletionEligibility::PolicyBound
+            }
+            RequiredChannelClassification::PartialRequiredChannels
+            | RequiredChannelClassification::RejectedRequiredChannels
+            | RequiredChannelClassification::UncertainRequiredChannels => {
+                CompletionEligibility::Never
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StrongChannelStatus {
+    Accepted,
+    Rejected,
+    Uncertain,
+}
+
+fn classify_strong_channel_result(
+    result: &DeliveryResult,
+) -> Result<StrongChannelStatus, RequiredChannelError> {
+    match result.view() {
+        DeliveryResultView::TransportAccepted(_) => Ok(StrongChannelStatus::Accepted),
+        DeliveryResultView::TransportRejected(_) => Ok(StrongChannelStatus::Rejected),
+        DeliveryResultView::TransportUncertain(_) => Ok(StrongChannelStatus::Uncertain),
+        DeliveryResultView::AlreadyTerminal(terminal) => match terminal.terminal_disposition() {
+            TerminalDisposition::ManualConfirmedAccepted => Ok(StrongChannelStatus::Accepted),
+            TerminalDisposition::ManualConfirmedNotDelivered => Ok(StrongChannelStatus::Rejected),
+            TerminalDisposition::Accepted
+            | TerminalDisposition::Rejected
+            | TerminalDisposition::Uncertain => Err(RequiredChannelError::StrongAuthorityRequired),
+        },
+        DeliveryResultView::BestEffortAccepted(_)
+        | DeliveryResultView::PartiallyAccepted(_)
+        | DeliveryResultView::NoChannelConfigured(_)
+        | DeliveryResultView::AllChannelsFailed(_)
+        | DeliveryResultView::Blocked(_) => Err(RequiredChannelError::StrongAuthorityRequired),
+    }
 }
