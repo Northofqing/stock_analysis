@@ -8141,3 +8141,79 @@ fn w12_terminal_read_model_fails_closed_on_corrupt_disposition_join() {
         .inspect_foundation_terminal(&candidate.decision_identity)
         .is_err());
 }
+
+#[test]
+fn w12_terminal_read_model_rejects_accepted_receipt_for_wrong_required_channel() {
+    let fixture = Fixture::new("W12_ACCEPTED_CHANNEL_MISMATCH");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("ACCEPTED_CHANNEL_MISMATCH");
+    prepare_reserved(&fixture, &candidate, &append);
+    let mut wrong_receipt = receipt(now());
+    wrong_receipt.channel = "TEST_CODE_WRONG_CHANNEL".to_owned();
+    let sink = StaticSink::new(AuthoritativeSinkResult::Accepted(wrong_receipt));
+    let sinks: Vec<AuthoritativeSink> = vec![sink];
+    fixture
+        .coordinator
+        .resume_deliverable(&candidate.decision_identity, &sinks, now())
+        .expect("record mismatched accepted receipt");
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::Delivered,
+        &candidate.decision_identity,
+    );
+
+    assert!(fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .is_err());
+}
+
+#[test]
+fn w12_terminal_read_model_rejects_manual_receipt_for_wrong_required_channel() {
+    let fixture = Fixture::new("W12_MANUAL_CHANNEL_MISMATCH");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("MANUAL_CHANNEL_MISMATCH");
+    prepare_reserved(&fixture, &candidate, &append);
+    let uncertain_sink = StaticSink::new(AuthoritativeSinkResult::Uncertain(uncertainty(now())));
+    let uncertain_sinks: Vec<AuthoritativeSink> = vec![uncertain_sink];
+    fixture
+        .coordinator
+        .resume_deliverable(&candidate.decision_identity, &uncertain_sinks, now())
+        .expect("record uncertainty before mismatched manual receipt");
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::UncertainManualReview,
+        &candidate.decision_identity,
+    );
+    let mut wrong_receipt = receipt(now());
+    wrong_receipt.channel = "TEST_CODE_WRONG_CHANNEL".to_owned();
+    fixture
+        .coordinator
+        .resolve_uncertain(
+            &ManualResolutionCommand {
+                decision_identity: candidate.decision_identity.clone(),
+                disposition: ManualDisposition::Accepted {
+                    receipt: Some(wrong_receipt),
+                },
+                operator_identity: "TEST_CODE_W12_OPERATOR".to_owned(),
+                reason: "TEST_CODE_W12_CONFIRMED_DELIVERED".to_owned(),
+                external_evidence: b"TEST_CODE_W12_MANUAL_ACCEPTANCE_EVIDENCE".to_vec(),
+                resolved_at: now(),
+            },
+            &append,
+        )
+        .expect("record mismatched manual receipt");
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::Delivered,
+        &candidate.decision_identity,
+    );
+
+    assert!(fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .is_err());
+}
