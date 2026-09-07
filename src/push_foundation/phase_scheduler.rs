@@ -550,6 +550,9 @@ impl PhaseScheduler {
         if current.status == ScheduleStatus::Prepared {
             return Ok(Self::no_change(current, current.reason));
         }
+        if !observation.trading_day {
+            return Ok(Self::no_change(current, ReasonCode::ScheduleNotTradingDay));
+        }
         if current.status == ScheduleStatus::Deferred {
             let next = current
                 .next_eligible

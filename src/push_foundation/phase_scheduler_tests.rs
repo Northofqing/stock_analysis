@@ -249,6 +249,35 @@ fn w14_non_trading_day_does_not_create_an_occurrence() {
 }
 
 #[test]
+fn w14_non_trading_authority_preserves_existing_occurrences_without_eligibility() {
+    let schedule = schedule(CatchUpPolicy::SameBusinessDayBeforeDeadline);
+    let current = created(&schedule, WINDOW_START);
+    let barrier = w14_recovery_barrier_fixture();
+    for observed_at in [WINDOW_START + 1, WINDOW_END] {
+        let observation = MarketObservation::non_trading_day(
+            BusinessDate::parse("2026-09-07").expect("TEST_CODE original date"),
+            micros(observed_at),
+        );
+        let expected = ScheduleStep::NoChange {
+            occurrence_id: current.occurrence_id().clone(),
+            status: ScheduleStatus::Expected,
+            version: 0,
+            reason: ReasonCode::ScheduleNotTradingDay,
+        };
+        assert_eq!(
+            PhaseScheduler::tick(&schedule, Some(&current), &observation)
+                .expect("TEST_CODE preserve existing non-trading fact"),
+            expected,
+        );
+        assert_eq!(
+            PhaseScheduler::startup_catch_up(&barrier, &schedule, Some(&current), &observation)
+                .expect("TEST_CODE non-trading recovery does not authorize new work"),
+            expected,
+        );
+    }
+}
+
+#[test]
 fn w14_recover_persisted_only_never_creates_new_work() {
     let schedule = schedule(CatchUpPolicy::RecoverPersistedOnly);
     let observation = MarketObservation::trading_day(
