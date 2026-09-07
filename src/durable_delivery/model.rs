@@ -1155,6 +1155,48 @@ pub(crate) enum FoundationTerminalQuery {
     Terminal(Box<FoundationTerminalRecord>),
 }
 
+/// Exact read model for the legacy P01 BusinessDateOnce authority.
+///
+/// The reader deliberately exposes the frozen envelope rather than accepting
+/// an envelope from its caller.  W13 can therefore bind the existing P01
+/// decision to one application intent without acquiring send/retry authority.
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct P01DedicatedTerminalRecord {
+    pub(crate) legacy_decision_identity: String,
+    pub(crate) envelope_canonical: Vec<u8>,
+    pub(crate) envelope_sha256: String,
+    pub(crate) ref_id: String,
+    pub(crate) attempt_id: Option<String>,
+    pub(crate) disposition: FoundationTerminalDisposition,
+    pub(crate) evidence_bytes: Vec<u8>,
+    pub(crate) evidence_sha256: String,
+    pub(crate) durable_schema_version: i64,
+}
+
+impl fmt::Debug for P01DedicatedTerminalRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("P01DedicatedTerminalRecord")
+            .field("legacy_decision_identity", &self.legacy_decision_identity)
+            .field("envelope_len", &self.envelope_canonical.len())
+            .field("envelope_sha256", &self.envelope_sha256)
+            .field("ref_id", &self.ref_id)
+            .field("attempt_id", &self.attempt_id)
+            .field("disposition", &self.disposition)
+            .field("evidence_len", &self.evidence_bytes.len())
+            .field("evidence_sha256", &self.evidence_sha256)
+            .field("durable_schema_version", &self.durable_schema_version)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum P01DedicatedTerminalQuery {
+    Missing,
+    PendingSeal { state: DecisionState },
+    Terminal(Box<P01DedicatedTerminalRecord>),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TypedReceipt {

@@ -4368,9 +4368,18 @@ fn w13_p01_same_day_query_ignores_render_mode_but_reuses_one_claim() {
         P01DedicatedTerminalQuery::Terminal(record) => record,
         other => panic!("expected exact P01 terminal, got {other:?}"),
     };
-    assert_eq!(terminal.legacy_decision_identity, scheduled.decision_identity);
-    assert_eq!(terminal.envelope_canonical, scheduled.canonical_bytes().unwrap());
-    assert_eq!(terminal.disposition, FoundationTerminalDisposition::Accepted);
+    assert_eq!(
+        terminal.legacy_decision_identity,
+        scheduled.decision_identity
+    );
+    assert_eq!(
+        terminal.envelope_canonical,
+        scheduled.canonical_bytes().unwrap()
+    );
+    assert_eq!(
+        terminal.disposition,
+        FoundationTerminalDisposition::Accepted
+    );
     assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
 }
 

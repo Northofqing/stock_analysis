@@ -5,13 +5,14 @@ use super::model::{
     DeliveryDispositionCanonical, DeliveryEnvelope, DurableDeliveryError,
     FoundationTerminalDisposition, FoundationTerminalQuery, FoundationTerminalRecord,
     ImmutableAppendPort, ManualAcceptedDeliveryAuditEvidence, ManualDisposition,
-    ManualResolutionAuthorizationCanonical, ManualResolutionCommand, PolicyRow, PrepareOutcome,
-    ReconcileSummary, RejectedSinkResultCanonical, Result, ResumeOutcome,
-    ReviewTerminalReplayAttempt, ReviewTerminalReplayCompletion,
-    ReviewTerminalReplayCompletionCanonical, ReviewTerminalReplayCompletionState,
-    ReviewTerminalReplayInput, ReviewTerminalReplayStartCanonical, ScheduleHydration,
-    ScheduleHydrationState, TaskTransitionCanonical, UncertainSinkResultCanonical, WindowMode,
-    DAILY_BUDGET_LIMIT, MANUAL_ACCEPTED_DELIVERY_AUDIT_DOMAIN,
+    ManualResolutionAuthorizationCanonical, ManualResolutionCommand, P01DedicatedTerminalQuery,
+    P01DedicatedTerminalRecord, PolicyRow, PrepareOutcome, ReconcileSummary,
+    RejectedSinkResultCanonical, Result, ResumeOutcome, ReviewTerminalReplayAttempt,
+    ReviewTerminalReplayCompletion, ReviewTerminalReplayCompletionCanonical,
+    ReviewTerminalReplayCompletionState, ReviewTerminalReplayInput,
+    ReviewTerminalReplayStartCanonical, ScheduleHydration, ScheduleHydrationState,
+    TaskTransitionCanonical, UncertainSinkResultCanonical, WindowMode, DAILY_BUDGET_LIMIT,
+    MANUAL_ACCEPTED_DELIVERY_AUDIT_DOMAIN,
 };
 use super::schema::{
     configure_attested_connection, initialize_schema, load_policy, materialize_wal_capability,
@@ -2926,6 +2927,96 @@ impl DurableDeliveryCoordinator {
             }
             let record = build_foundation_terminal_record(connection, &stored, &envelope, binding)?;
             Ok(FoundationTerminalQuery::Terminal(Box::new(record)))
+        })
+    }
+
+    /// Requery the sole legacy P01 BusinessDateOnce owner for one business
+    /// date.  Render mode is intentionally absent from this interface: both
+    /// scheduled and compensation entrypoints own the same durable claim.
+    pub(crate) fn inspect_p01_dedicated_terminal(
+        &self,
+        business_date: &str,
+    ) -> Result<P01DedicatedTerminalQuery> {
+        super::model::validate_business_date(business_date)?;
+        let occurrence_identity = format!("p01:{business_date}");
+        self.with_connection(|connection| {
+            let claimed = connection
+                .query_row(
+                    "SELECT decision_identity,policy_version
+                     FROM business_date_once_claims
+                     WHERE business_date=?1 AND push_kind=?2
+                       AND sub_kind=?3 AND scope_key='GLOBAL'",
+                    params![
+                        business_date,
+                        super::model::PushKind::PreopenNewsHot.as_str(),
+                        super::model::DeliverySubKind::None.as_str(),
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()?;
+            let Some((legacy_decision_identity, claim_policy_version)) = claimed else {
+                return Ok(P01DedicatedTerminalQuery::Missing);
+            };
+            let stored =
+                load_decision(connection, &legacy_decision_identity)?.ok_or_else(|| {
+                    DurableDeliveryError::DecisionNotFound(legacy_decision_identity.clone())
+                })?;
+            if sha256_hex(&stored.envelope_canonical) != stored.envelope_sha256 {
+                return Err(DurableDeliveryError::PolicyMismatch(
+                    "P01 dedicated authority envelope hash mismatch".to_owned(),
+                ));
+            }
+            let envelope = parse_envelope(&stored.envelope_canonical)?;
+            if envelope.canonical_bytes()? != stored.envelope_canonical
+                || envelope.foundation_binding().is_some()
+                || envelope.decision_identity != legacy_decision_identity
+                || envelope.business_date != business_date
+                || envelope.push_kind != super::model::PushKind::PreopenNewsHot
+                || envelope.sub_kind != super::model::DeliverySubKind::None
+                || envelope.cooldown_scope != super::model::CooldownScope::Global
+                || envelope.scope_key != "GLOBAL"
+                || envelope.schedule_occurrence_identity != occurrence_identity
+                || envelope.policy_version != claim_policy_version
+            {
+                return Err(DurableDeliveryError::PolicyMismatch(
+                    "P01 dedicated authority claim/envelope binding mismatch".to_owned(),
+                ));
+            }
+            p01_source_binding_mode(
+                super::model::PushKind::PreopenNewsHot,
+                &envelope.source_binding_canonical,
+            )?
+            .ok_or_else(|| {
+                DurableDeliveryError::PolicyMismatch(
+                    "P01 dedicated authority source mode is missing".to_owned(),
+                )
+            })?;
+
+            if !matches!(
+                stored.state,
+                DecisionState::Delivered
+                    | DecisionState::RejectedDurable
+                    | DecisionState::UncertainManualReview
+                    | DecisionState::ManualResolvedRejected
+            ) {
+                return Ok(P01DedicatedTerminalQuery::PendingSeal {
+                    state: stored.state,
+                });
+            }
+            let terminal = build_validated_terminal_evidence(connection, &stored, &envelope, None)?;
+            Ok(P01DedicatedTerminalQuery::Terminal(Box::new(
+                P01DedicatedTerminalRecord {
+                    legacy_decision_identity,
+                    envelope_canonical: stored.envelope_canonical,
+                    envelope_sha256: stored.envelope_sha256,
+                    ref_id: terminal.ref_id,
+                    attempt_id: terminal.attempt_id,
+                    disposition: terminal.disposition,
+                    evidence_bytes: terminal.evidence_bytes,
+                    evidence_sha256: terminal.evidence_sha256,
+                    durable_schema_version: SCHEMA_VERSION,
+                },
+            )))
         })
     }
 
@@ -6075,6 +6166,37 @@ fn build_foundation_terminal_record(
     envelope: &DeliveryEnvelope,
     binding: super::model::FoundationDeliveryBinding,
 ) -> Result<FoundationTerminalRecord> {
+    let terminal = build_validated_terminal_evidence(
+        connection,
+        stored,
+        envelope,
+        Some(binding.required_channel()),
+    )?;
+    Ok(FoundationTerminalRecord {
+        binding,
+        ref_id: terminal.ref_id,
+        attempt_id: terminal.attempt_id,
+        disposition: terminal.disposition,
+        evidence_bytes: terminal.evidence_bytes,
+        evidence_sha256: terminal.evidence_sha256,
+        durable_schema_version: SCHEMA_VERSION,
+    })
+}
+
+struct ValidatedTerminalEvidence {
+    ref_id: String,
+    attempt_id: Option<String>,
+    disposition: FoundationTerminalDisposition,
+    evidence_bytes: Vec<u8>,
+    evidence_sha256: String,
+}
+
+fn build_validated_terminal_evidence(
+    connection: &Connection,
+    stored: &StoredDecision,
+    envelope: &DeliveryEnvelope,
+    required_channel: Option<&str>,
+) -> Result<ValidatedTerminalEvidence> {
     let disposition = load_current_disposition_evidence(connection, stored)?;
     let (terminal_disposition, attempt_id, evidence_bytes, evidence_sha256) =
         match (stored.state, disposition.disposition.as_str()) {
@@ -6085,7 +6207,7 @@ fn build_foundation_terminal_record(
                     envelope,
                     &disposition,
                 )?;
-                if receipt.channel != binding.required_channel() {
+                if required_channel.is_some_and(|required| receipt.channel != required) {
                     return Err(DurableDeliveryError::PolicyMismatch(
                         "foundation accepted receipt required-channel mismatch".to_owned(),
                     ));
@@ -6129,7 +6251,7 @@ fn build_foundation_terminal_record(
                                 "foundation manual acceptance receipt is invalid: {error}"
                             ))
                         })?;
-                    if receipt.channel != binding.required_channel() {
+                    if required_channel.is_some_and(|required| receipt.channel != required) {
                         return Err(DurableDeliveryError::PolicyMismatch(
                             "foundation manual acceptance receipt required-channel mismatch"
                                 .to_owned(),
@@ -6250,14 +6372,12 @@ fn build_foundation_terminal_record(
             "foundation terminal evidence hash mismatch".to_owned(),
         ));
     }
-    Ok(FoundationTerminalRecord {
-        binding,
+    Ok(ValidatedTerminalEvidence {
         ref_id: disposition.disposition_identity,
         attempt_id,
         disposition: terminal_disposition,
         evidence_bytes,
         evidence_sha256,
-        durable_schema_version: SCHEMA_VERSION,
     })
 }
 

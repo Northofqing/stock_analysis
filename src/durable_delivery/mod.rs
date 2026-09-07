@@ -25,7 +25,7 @@ pub use model::{
 };
 pub(crate) use model::{
     FoundationDeliveryBinding, FoundationTerminalDisposition, FoundationTerminalQuery,
-    FoundationTerminalRecord,
+    FoundationTerminalRecord, P01DedicatedTerminalQuery,
 };
 pub(crate) use schema::SCHEMA_VERSION as DURABLE_SCHEMA_VERSION;
 
