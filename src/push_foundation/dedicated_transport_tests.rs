@@ -5,10 +5,9 @@ use crate::durable_delivery::{
     P01DedicatedTerminalRecord, PushKind,
 };
 use crate::monitor::push_job::{
-    raw_digest, w09_completion_policy_fixture, AudienceId, AuthorityClass, BusinessDate,
-    ChannelId, CompletionOwnerId, DeliveryResultView, Namespace, OccurrenceFamily,
-    OccurrenceIdentityMaterial, OccurrenceKey, SourceContractId, SubjectId, TemplateId,
-    TemplateVersion, UnitId, UtcMicros,
+    raw_digest, w09_completion_policy_fixture, AudienceId, AuthorityClass, BusinessDate, ChannelId,
+    CompletionOwnerId, DeliveryResultView, Namespace, OccurrenceFamily, OccurrenceIdentityMaterial,
+    OccurrenceKey, SourceContractId, SubjectId, TemplateId, TemplateVersion, UnitId, UtcMicros,
 };
 
 use super::dedicated_transport::{
