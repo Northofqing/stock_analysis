@@ -429,7 +429,9 @@ fn validate_shared_dependencies(
     if actual.keys().copied().collect::<BTreeSet<_>>() != expected {
         return Err(ActivationDeploymentSetError::SharedDependenciesRejected);
     }
-    Ok(actual.into_values().collect())
+    let mut validated = actual.into_values().collect::<Vec<_>>();
+    validated.sort_by_key(|dependency| dependency.kind.as_str());
+    Ok(validated)
 }
 
 fn validate_source_keys(
@@ -655,13 +657,28 @@ pub(super) fn deployment_set_codec_fixture() -> Vec<u8> {
             .expect("TEST_CODE golden authority"),
         utc_offset_seconds: 28_800,
     };
-    let dependency = SharedDependencyDeclaration::new(
-        DependencyKind::Schema,
-        SourceContractId::try_new("golden-schema".to_owned()).expect("TEST_CODE golden contract"),
-        SourceContractVersion::try_new("v7".to_owned()).expect("TEST_CODE golden version"),
-        Sha256Digest::parse("TEST_CODE golden dependency", &"c".repeat(64))
-            .expect("TEST_CODE golden dependency"),
-    );
+    let dependency = |kind, id: &str, version: &str, sha: char| {
+        SharedDependencyDeclaration::new(
+            kind,
+            SourceContractId::try_new(id.to_owned()).expect("TEST_CODE golden contract"),
+            SourceContractVersion::try_new(version.to_owned()).expect("TEST_CODE golden version"),
+            Sha256Digest::parse("TEST_CODE golden dependency", &sha.to_string().repeat(64))
+                .expect("TEST_CODE golden dependency"),
+        )
+    };
+    let dependencies = vec![
+        dependency(DependencyKind::Audit, "golden-audit", "v1", '1'),
+        dependency(DependencyKind::Durable, "golden-durable", "v2", '2'),
+        dependency(DependencyKind::Manifest, "golden-manifest", "v3", '3'),
+        dependency(DependencyKind::Namespace, "golden-namespace", "v4", '4'),
+        dependency(DependencyKind::Schema, "golden-schema", "v5", '5'),
+        dependency(
+            DependencyKind::TypedAuthority,
+            "golden-typed-authority",
+            "v6",
+            '6',
+        ),
+    ];
     let units = vec![
         UnitDeploymentObservation::CaughtUp {
             unit_id: UnitId::try_new("unit-a".to_owned()).expect("TEST_CODE golden unit"),
@@ -696,7 +713,7 @@ pub(super) fn deployment_set_codec_fixture() -> Vec<u8> {
             &calendar,
             &[ProducerId::try_new("producer-a".to_owned()).expect("TEST_CODE golden producer")],
             &[UnitId::try_new("unit-b".to_owned()).expect("TEST_CODE golden recovery")],
-            &[dependency],
+            &dependencies,
             &units,
         ),
     )

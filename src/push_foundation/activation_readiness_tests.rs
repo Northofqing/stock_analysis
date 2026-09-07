@@ -281,6 +281,48 @@ fn dependencies(seed: char) -> Vec<SharedDependencyDeclaration> {
     .collect()
 }
 
+fn dependencies_replacing(
+    replaced: DependencyKind,
+    contract_id: &str,
+    version: &str,
+    sha256: Sha256Digest,
+) -> Vec<SharedDependencyDeclaration> {
+    [
+        DependencyKind::Namespace,
+        DependencyKind::Durable,
+        DependencyKind::Audit,
+        DependencyKind::TypedAuthority,
+        DependencyKind::Schema,
+        DependencyKind::Manifest,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, kind)| {
+        let baseline_sha =
+            digest(char::from_u32(u32::from('1') + index as u32).expect("TEST_CODE digest char"));
+        if kind == replaced {
+            SharedDependencyDeclaration::new(
+                kind,
+                SourceContractId::try_new(contract_id.to_owned())
+                    .expect("TEST_CODE replacement dependency id"),
+                SourceContractVersion::try_new(version.to_owned())
+                    .expect("TEST_CODE replacement dependency version"),
+                sha256.clone(),
+            )
+        } else {
+            SharedDependencyDeclaration::new(
+                kind,
+                SourceContractId::try_new(format!("TEST_CODE-{}", kind.as_str()))
+                    .expect("TEST_CODE dependency id"),
+                SourceContractVersion::try_new("v1".to_owned())
+                    .expect("TEST_CODE dependency version"),
+                baseline_sha,
+            )
+        }
+    })
+    .collect()
+}
+
 fn source_packages(
     namespace: &Namespace,
     bindings: &[CurrentBinding],
@@ -334,8 +376,20 @@ fn deployment_set_v1_has_independent_literal_golden_bytes_and_sha256() {
         "\"enabled_producers\":[\"producer-a\"],",
         "\"namespace\":{\"kind\":\"Test\",\"run_id\":\"golden-run\"},",
         "\"recovery_units\":[\"unit-b\"],\"schema_version\":1,",
-        "\"shared_dependencies\":[{\"contract_id\":\"golden-schema\",\"contract_version\":\"v7\",",
-        "\"dependency_kind\":\"Schema\",\"sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}],",
+        "\"shared_dependencies\":[",
+        "{\"contract_id\":\"golden-audit\",\"contract_version\":\"v1\",\"dependency_kind\":\"Audit\",",
+        "\"sha256\":\"1111111111111111111111111111111111111111111111111111111111111111\"},",
+        "{\"contract_id\":\"golden-durable\",\"contract_version\":\"v2\",\"dependency_kind\":\"Durable\",",
+        "\"sha256\":\"2222222222222222222222222222222222222222222222222222222222222222\"},",
+        "{\"contract_id\":\"golden-manifest\",\"contract_version\":\"v3\",\"dependency_kind\":\"Manifest\",",
+        "\"sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\"},",
+        "{\"contract_id\":\"golden-namespace\",\"contract_version\":\"v4\",\"dependency_kind\":\"Namespace\",",
+        "\"sha256\":\"4444444444444444444444444444444444444444444444444444444444444444\"},",
+        "{\"contract_id\":\"golden-schema\",\"contract_version\":\"v5\",\"dependency_kind\":\"Schema\",",
+        "\"sha256\":\"5555555555555555555555555555555555555555555555555555555555555555\"},",
+        "{\"contract_id\":\"golden-typed-authority\",\"contract_version\":\"v6\",",
+        "\"dependency_kind\":\"TypedAuthority\",",
+        "\"sha256\":\"6666666666666666666666666666666666666666666666666666666666666666\"}],",
         "\"units\":[{\"activation_status\":\"CaughtUp\",",
         "\"build_commit\":\"1111111111111111111111111111111111111111\",",
         "\"build_sha256\":\"2222222222222222222222222222222222222222222222222222222222222222\",",
@@ -356,8 +410,26 @@ fn deployment_set_v1_has_independent_literal_golden_bytes_and_sha256() {
     assert_eq!(actual, expected);
     assert_eq!(
         crate::monitor::push_job::raw_digest(expected).as_str(),
-        "f540c46d24311d901196a141bfa9903bea5274e9437a916190bc9829e11dfada"
+        "262ba7b18630b804732f2123d8f1a95acdf254e84b50f3693e31d8a6031359eb"
     );
+    let expected_text = std::str::from_utf8(expected).expect("TEST_CODE golden UTF-8");
+    for (original, replacement) in [
+        (
+            "\"physical_owner\":\"protected-owner\"",
+            "\"physical_owner\":\"changed-owner\"",
+        ),
+        (
+            "\"build_commit\":\"1111111111111111111111111111111111111111\"",
+            "\"build_commit\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+        ),
+    ] {
+        let changed = expected_text.replacen(original, replacement, 1);
+        assert_ne!(
+            crate::monitor::push_job::raw_digest(changed.as_bytes()).as_str(),
+            "262ba7b18630b804732f2123d8f1a95acdf254e84b50f3693e31d8a6031359eb",
+            "TEST_CODE {original} participates in deployment identity"
+        );
+    }
 }
 
 #[test]
@@ -398,6 +470,25 @@ fn full_catalog_real_read_preserves_two_current_generations_and_explicit_null_ro
     );
     let bytes = std::str::from_utf8(set.canonical_bytes()).expect("TEST_CODE canonical UTF-8");
     assert!(bytes.starts_with("ActivationDeploymentSet/v1\0{"));
+    let dependency_positions = [
+        "Audit",
+        "Durable",
+        "Manifest",
+        "Namespace",
+        "Schema",
+        "TypedAuthority",
+    ]
+    .map(|kind| {
+        let needle = format!("\"dependency_kind\":\"{kind}\"");
+        assert_eq!(bytes.matches(&needle).count(), 1, "TEST_CODE Core {kind}");
+        bytes.find(&needle).expect("TEST_CODE Core dependency")
+    });
+    assert!(
+        dependency_positions
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]),
+        "TEST_CODE Core dependencies use DependencyKind text order"
+    );
     assert_eq!(
         bytes
             .matches("\"activation_status\":\"Unregistered\"")
@@ -460,6 +551,25 @@ fn ordering_is_stable_and_configuration_or_dependency_changes_identity() {
     assert_eq!(baseline.canonical_bytes(), reordered.canonical_bytes());
     assert_eq!(baseline.sha256(), reordered.sha256());
 
+    let namespace = namespace();
+    let mut dependency_input_reordered = dependencies('1');
+    dependency_input_reordered.reverse();
+    let reordered_dependencies = read_activation_deployment_set(
+        &database,
+        &bindings[0].unit_id,
+        ActivationDeploymentSetRequest::new(
+            namespace.clone(),
+            calendar(&namespace),
+            observed_at(),
+            vec![p0.clone(), p1.clone()],
+            vec![bindings[0].unit_id.clone(), bindings[1].unit_id.clone()],
+            source_packages(&namespace, &bindings),
+            dependency_input_reordered,
+        ),
+    )
+    .expect("TEST_CODE dependency input order");
+    assert_eq!(baseline.sha256(), reordered_dependencies.sha256());
+
     let changed_configuration = read_activation_deployment_set(
         &database,
         &bindings[0].unit_id,
@@ -472,20 +582,106 @@ fn ordering_is_stable_and_configuration_or_dependency_changes_identity() {
     .expect("TEST_CODE changed configuration");
     assert_ne!(baseline.sha256(), changed_configuration.sha256());
 
+    for (label, changed_dependencies) in [
+        (
+            "contract_id",
+            dependencies_replacing(
+                DependencyKind::Schema,
+                "TEST_CODE-changed-Schema",
+                "v1",
+                digest('5'),
+            ),
+        ),
+        (
+            "contract_version",
+            dependencies_replacing(
+                DependencyKind::Schema,
+                "TEST_CODE-Schema",
+                "v2",
+                digest('5'),
+            ),
+        ),
+        (
+            "sha256",
+            dependencies_replacing(
+                DependencyKind::Schema,
+                "TEST_CODE-Schema",
+                "v1",
+                digest('a'),
+            ),
+        ),
+    ] {
+        let changed = read_activation_deployment_set(
+            &database,
+            &bindings[0].unit_id,
+            ActivationDeploymentSetRequest::new(
+                namespace.clone(),
+                calendar(&namespace),
+                observed_at(),
+                vec![p0.clone(), p1.clone()],
+                vec![bindings[0].unit_id.clone(), bindings[1].unit_id.clone()],
+                source_packages(&namespace, &bindings),
+                changed_dependencies,
+            ),
+        )
+        .expect("TEST_CODE changed dependency");
+        assert_ne!(baseline.sha256(), changed.sha256(), "TEST_CODE {label}");
+    }
+}
+
+#[test]
+fn calendar_id_changes_identity_but_covered_observation_time_does_not() {
+    let (_root, database, bindings) = two_unit_database("calendar-identity.sqlite3");
     let namespace = namespace();
-    let changed_dependencies = ActivationDeploymentSetRequest::new(
-        namespace.clone(),
-        calendar(&namespace),
-        observed_at(),
-        vec![p0, p1],
-        vec![bindings[0].unit_id.clone(), bindings[1].unit_id.clone()],
-        source_packages(&namespace, &bindings),
-        dependencies('2'),
-    );
-    let changed_dependencies =
-        read_activation_deployment_set(&database, &bindings[0].unit_id, changed_dependencies)
-            .expect("TEST_CODE changed dependencies");
-    assert_ne!(baseline.sha256(), changed_dependencies.sha256());
+    let baseline = read_activation_deployment_set(
+        &database,
+        &bindings[0].unit_id,
+        ActivationDeploymentSetRequest::new(
+            namespace.clone(),
+            calendar(&namespace),
+            observed_at(),
+            vec![],
+            vec![],
+            source_packages(&namespace, &bindings),
+            dependencies('1'),
+        ),
+    )
+    .expect("TEST_CODE baseline calendar");
+
+    let observed_later = read_activation_deployment_set(
+        &database,
+        &bindings[0].unit_id,
+        ActivationDeploymentSetRequest::new(
+            namespace.clone(),
+            calendar(&namespace),
+            observed_at() + 1,
+            vec![],
+            vec![],
+            source_packages(&namespace, &bindings),
+            dependencies('1'),
+        ),
+    )
+    .expect("TEST_CODE covered later observation");
+    assert_eq!(baseline.sha256(), observed_later.sha256());
+
+    let mut changed_calendar = calendar(&namespace);
+    changed_calendar.calendar_id = CalendarId::try_new("changed-test-sse-calendar".to_owned())
+        .expect("TEST_CODE changed calendar");
+    let changed_calendar = read_activation_deployment_set(
+        &database,
+        &bindings[0].unit_id,
+        ActivationDeploymentSetRequest::new(
+            namespace.clone(),
+            changed_calendar,
+            observed_at(),
+            vec![],
+            vec![],
+            source_packages(&namespace, &bindings),
+            dependencies('1'),
+        ),
+    )
+    .expect("TEST_CODE changed calendar id");
+    assert_ne!(baseline.sha256(), changed_calendar.sha256());
 }
 
 #[test]
@@ -610,6 +806,38 @@ fn pending_anywhere_and_every_source_join_mismatch_fail_closed() {
             &pending,
             &pending_unit,
             request(&[pending_binding], vec![], vec![])
+        ),
+        Err(ActivationDeploymentSetError::PendingUnit)
+    );
+
+    let (_unselected_root, unselected_pending, unselected_bindings) =
+        two_unit_database("unselected-pending.sqlite3");
+    let connection = Connection::open(&unselected_pending).expect("TEST_CODE pending mutation");
+    let delete_guard: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name='push_promotion_journal_delete'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("TEST_CODE delete guard");
+    connection
+        .execute_batch("DROP TRIGGER push_promotion_journal_delete;")
+        .expect("TEST_CODE remove delete guard");
+    connection
+        .execute(
+            "DELETE FROM push_promotion_journal WHERE unit_id=?1",
+            params![unselected_bindings[1].unit_id.as_str()],
+        )
+        .expect("TEST_CODE make unselected unit pending");
+    connection
+        .execute_batch(&delete_guard)
+        .expect("TEST_CODE restore delete guard");
+    drop(connection);
+    assert_eq!(
+        read_activation_deployment_set(
+            &unselected_pending,
+            &unselected_bindings[0].unit_id,
+            request(&unselected_bindings, vec![], vec![])
         ),
         Err(ActivationDeploymentSetError::PendingUnit)
     );
@@ -827,15 +1055,15 @@ fn reread_rejects_configuration_unit_and_cross_database_drift() {
 
     let next = append_generation(
         &database,
-        &bindings[0].unit_id,
-        3,
-        Some(&bindings[0]),
-        DesiredActivationState::Active,
-        PromotionAction::Activate,
+        &bindings[1].unit_id,
+        2,
+        Some(&bindings[1]),
+        DesiredActivationState::Shadow,
+        PromotionAction::EnterShadow,
         'd',
         '4',
     );
-    bindings[0] = next;
+    bindings[1] = next;
     assert_eq!(
         reread_activation_deployment_set(
             &original,
