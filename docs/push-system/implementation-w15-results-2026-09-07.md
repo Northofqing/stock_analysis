@@ -156,7 +156,7 @@ Task3E 独立审查保留一项非阻塞清理建议：仅测试调用的错误�
 
 ## 11. 来源与部署的后续接线顺序
 
-下一段已开始 Task3H：在 database 模块给既有 BR159 完整链/receipt 验证增加 rusqlite 事务行加载适配器，与 Diesel reader 共用规则，不跨驱动重开路径。该适配器自身不打开文件、不改变事务生命周期，也不认证源 schema/注册；完整来源读取仍须外层安全 opener、实际 schema 与上下文绑定。
+Task3H 已完成限定实现与审查，最终证据见 §12：在 database 模块给既有 BR159 完整链/receipt 验证增加 rusqlite 事务行加载适配器，与 Diesel reader 共用规则，不跨驱动重开路径。该适配器自身不打开文件、不改变事务生命周期，也不认证源 schema/注册；完整来源读取仍须外层安全 opener、实际 schema 与上下文绑定。
 
 接线设计核对发现两项必须解决的前置条件：
 
@@ -166,3 +166,16 @@ Task3E 独立审查保留一项非阻塞清理建议：仅测试调用的错误�
 因此接下来的顺序是：共享 reader 与真实闭集合同注册 → W16 的实际部署/批准/manifest/journal/owner 读取验证基础 → 来源 context 绑定与 W15 认证存储/恢复 → 同快照 probe 和 W11/W14 联结。W16 读取基础不以 W15 Ready 为前提，执行阶段再重验 fence，避免相互等待。仅有路径、approved_by 字符串或合法 hash 不替代真实认证。
 
 完整目标仍为 W01--W21、52个迁移单元及真实发布门禁。W15整体、W16--W21、逐Unit迁移与上线验收均未完成；本批未启动、观察或替换生产monitor。
+
+## 12. 采集审计事务适配器完成（2026-09-08）
+
+`a538925` 仅修改 `src/database/data_acquisition_audit.rs`。调用者持有的 rusqlite 事务与原 Diesel reader 共用固定投影及原 receipt/全链/hash 验证内核，严格保留整数、可空文本、原始 created_at；入口不自行 open、BEGIN、COMMIT、ROLLBACK 或设置 pragma。
+
+- session82943：`cargo test --lib database::data_acquisition_audit:: -- --test-threads=1`，exit0，**13 passed/0 failed/0 ignored**，测试0.13s、编译2m18s；43项既有 warning。
+- session13184：`cargo clippy --lib --message-format=json`，exit0、1m25s。完整诊断核对163项有位置既有 warning，Foundation及采集审计目标零诊断；定向 rustfmt 与 diff 检查通过。
+- 新增5条测试并扩展既有中段损坏测试：真实跨驱动已提交行、8种 outcome、4类 receipt 漂移、audit/chain 中段损坏、19个投影字段逐一错误 SQLite 类型、两张表分别缺失、调用者事务生命周期与只读目录字节不变。
+- `w15_acquisition_transaction_review` 在原始 `595f605..a538925` 范围独立审查：Spec compliant / quality Approved，无 Critical/Important。告警背景列为已归因非阻塞项。
+
+审查不能从差异证明的外层提交、schema/source 所有权及 W15 authority，均不在本适配器声明的证明范围，仍明确列为后续来源拥有者和部署验证器的必要验收，未据此签发 Ready。
+
+下一条完整开发链按 [W16 实施计划](../superpowers/plans/2026-09-08-push-foundation-w16-activation.md) 推进：先同一只读事务加载全 Unit 的实际 manifest/journal、重算内容及完整链、区分未登记/待协调/持久一致，再接外部认证与当前 owner。读取一致不等于部署认证或允许发送；真实平台信任根、Shadow/legacy 共同授权等未决项保留。没有启动监控或生产操作。

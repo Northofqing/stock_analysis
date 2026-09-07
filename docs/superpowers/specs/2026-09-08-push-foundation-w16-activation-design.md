@@ -1,6 +1,6 @@
 # W16 activation、部署认证与 owner fence 设计
 
-日期：2026-09-08。状态：设计提案；未实现，未认证部署，未执行生产操作。配套计划：[W16 可执行计划](../plans/2026-09-08-push-foundation-w16-activation.md)。
+日期：2026-09-08。状态：读取内容合同已明确，T1 开始实施；其余授权提案按 needs-context 保留，未认证部署，未执行生产操作。配套计划：[W16 可执行计划](../plans/2026-09-08-push-foundation-w16-activation.md)。
 
 ## 目标、依据与范围
 
@@ -54,7 +54,9 @@ journal 逐列纳入 canonical，排除自身 `canonical_sha256`：`event_id,uni
 
 **needs-context B（未闭合的 Shadow owner 合同）**：冻结 DDL 的 `physical_owner` 是非空 TEXT，RFC Shadow 的物理 owner 为 None，但 common_fence 又要求 legacy/new actor 精确匹配当前 manifest 的 owner。如果当前 manifest 写 `None`，继续工作的 legacy owner 无法满足该等式；仅另加部署登记并不能解决这一矛盾。蓝图 1502 的“默认状态不改变任何 physical owner”及 1537/1568 的唯一 live owner 约束同时必须满足，不能为迁就 None 而停掉原生产 owner，也不能绕过 legacy 当前 fence。`None` 保留值只是一种待评估编码，尚非可执行投影。主控需明确 Shadow 无 owner 指 shadow actor 还是整个 Unit，以及 legacy 的唯一当前执行事实如何满足共同 fence；本设计不自行修改 RFC，不凭另一份 owner 登记授予发送。T4 的 Shadow/legacy 联合授权须等待该合同闭合，其余拒绝和隔离能力可先实现。
 
-manifest/journal canonical domain 应在实施前搜索冻结 Task2 合同并使用唯一既有定义；若尚未冻结则明确增加 `ActivationManifestV1` / `PromotionJournalV1` domain 及 golden vectors，不从 SQL 自行猜 schema version 列。本文没有宣称这两个 domain 已被规范采用。
+读取编码裁决（2026-09-08）：核对现有冻结 Task2/RFC 与 canonical 实现后，稳定身份沿用 `PromotionV1`；新增内容 domain 为 `ActivationManifestV1` / `PromotionJournalV1`。三者均使用现有 canonical-v1：domain、单个 NUL、按列名键排序且无空白的 JSON object，文本按既有 canonical 转义，非负整数为 JSON 数字，可空列显式 null。manifest 含除自身 hash 外全部19列；journal 含除自身 canonical hash 外全部14列，包含稳定 event_id；`PromotionV1` 身份只含 generation 和 unit_id。独立 golden bytes 验证这些精确字段/编码，不新增 SQL schema version。成本是未来编码变化必须换 domain，不能同名改写历史。
+
+T1 对 physical_owner 保留严格原始 TEXT，不解释 `None` 是否授予 legacy 执行权；输出不是部署认证或 current fence。它可先完整验证全 Unit 历史并区分未登记、持久跟齐和末代待协调。缺失不是 Disabled，两个以上未执行代拒绝。当前 catalog 用于 Unit ID 注册关系，不据此宣称历史版本 SHA 等于当前已安装制品；历史到当前版本兼容和真实 owner 认证仍由后续任务交付。这解除的是读取任务的前置等待，没有解除 needs-context B 的联合授权限制。
 
 ## 事务、真实 owner 与受控重启
 

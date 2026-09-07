@@ -1,6 +1,6 @@
 # 推送 Foundation W15 运行就绪实施计划
 
-**状态：** 当前源码至 `595f605`：Task2B 的预期 authority/版本化 NotRequired/v2 候选与 Task3G 的只读持久 occurrence 已完成限定独立 Spec/quality 审查，无 Critical/Important。此前候选 store、COMMIT 异常重查与 BR159 原始 reader 的已关闭审查不重派。最新完整 Foundation session10760为182 passed/0 failed/1 helper ignored；Clippy43386为163项既有告警、目标零诊断。当前 Task3H 增加共用验证内核的采集审计事务适配器；可信来源/采集上下文和 W16 部署绑定、认证恢复、同快照 probe 及 W11/W14 联结仍待。W15 尚未完成，逐项证据见 `docs/push-system/implementation-w15-results-2026-09-07.md` §10–11。
+**状态：** Task2B `595f605`、Task3G `ac8a28b` 和 Task3H `a538925` 均已完成限定独立 Spec/quality 审查，无 Critical/Important。Task3H 交付共用原验证内核的采集审计事务适配器，最终相邻回归13/13；Clippy13184为163项既有告警、目标零诊断。182项 Foundation 证据仍对应2B/3G，不冒充3H之后的全仓复验。已关闭切片不重派；可信来源/采集上下文和 W16 部署绑定、认证恢复、同快照 probe 及 W11/W14 联结仍待。W15 尚未完成，逐项证据见 `docs/push-system/implementation-w15-results-2026-09-07.md` §10–12；W16 按独立计划推进无循环依赖的完整读取链路。
 
 **目标：** 交付 Core/Producer/Occurrence 三个范围的就绪判定、可查询的不可变运行快照、绑定前后快照及依赖版本的恢复事件，以及只读部署探针。按 WBS 执行完整 W15，不将单次 source availability 等同于全部就绪能力。
 

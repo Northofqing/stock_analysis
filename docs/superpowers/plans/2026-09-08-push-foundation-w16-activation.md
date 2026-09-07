@@ -1,6 +1,6 @@
 # W16 activation 完整实施计划
 
-日期：2026-09-08。状态：待实施，关键外部选择 needs-context。设计：[W16 activation 设计](../specs/2026-09-08-push-foundation-w16-activation-design.md)。本文件不是执行记录。
+日期：2026-09-08。状态：T1 读取合同已明确，进入实施；生产身份和共同 owner 授权仍 needs-context，完整 W16 未完成。设计：[W16 activation 设计](../specs/2026-09-08-push-foundation-w16-activation-design.md)。实际命令结果另记实施报告。
 
 ## 范围与执行约定
 
@@ -10,7 +10,7 @@
 
 依赖顺序：T0 冻结必要合同；T1 完整只读事实可独立完成；T2 认证部署使 T1 输出成为可认证来源；T3 完成事务写入引擎；T4 完成跨进程共同 fence 与 paused owner；T5 把 T2/T3/T4 合成真实 apply/reconcile/rollback；T6 在 T1/T2 的基础并行推进 W15 全范围消费，并与 T5 联调；T7 收口监控/CLI 与验收。T3 可先使用测试身份，但不得公开“已认证”构造器。T4/T5 未完成时 T1–T3 只能称基础切片。
 
-## T0 — 冻结认证、owner 投影和版本化合同
+## Task 0 — T0 冻结认证、owner 投影和版本化合同
 
 结果：不写实现也能明确正确执行者、数据语义和验收预期。主控读取设计 needs-context A–E 并记录结论；开发授权不需要再次批准，但真实平台/身份发行方、DualControl 外部策略不能靠程序猜测。
 
@@ -28,9 +28,17 @@ rg -n 'push_activation_manifests|push_promotion_journal' docs/push-system/push-s
 
 验收：上述每个选择有“已确定/needs-context + 证据 + 影响任务”，没有假设外部根已配置。反例：允许 env 中非空 operator 成为 approver、为 Shadow 改 SQL 允许 NULL、先插成功 journal 后切 owner，均应否决。
 
-## T1 — 完整 manifest/journal 只读 inspector
+## Task 1 — T1 完整 manifest/journal 只读 inspector
 
-依赖 T0 中编码/owner 语义；不等 W15 Ready 或生产配置。新建 `src/push_foundation/activation.rs`、`activation_facts.rs`、`activation_codec.rs`、`activation_store.rs`、`activation_facts_tests.rs`；编辑 `src/push_foundation/mod.rs` 声明（本任务唯一 owner）。复用 `monitor::push_job` canonical 与 MachineCatalog；调用既有 `with_rollback_read_only` 和内嵌 Foundation schema 验证，必要时只调整可见性，不重写 VFS 锁算法。
+依赖 T0 中编码语义；T1 的 owner 仅是经完整性校验的原始 TEXT，不签发 legacy/shadow/new 许可，因此 owner 授权投影未决不阻止本读取任务。新建 `src/push_foundation/activation.rs`、`activation_facts.rs`、`activation_codec.rs`、`activation_store.rs`、`activation_facts_tests.rs`；编辑 `src/push_foundation/mod.rs` 声明（本任务唯一 owner）。复用 `monitor::push_job` canonical 与 MachineCatalog；调用既有 `with_rollback_read_only` 和内嵌 Foundation schema 验证，必要时只调整可见性，不重写 VFS 锁算法。
+
+T0 读取裁决（2026-09-08）：现有冻结合同只有稳定身份 `PromotionV1`，尚无两种内容 domain；本任务采用 `ActivationManifestV1` 和 `PromotionJournalV1`。编码一律复用 canonical-v1 的 `domain + NUL + 按键排序、无空白 JSON object`。字段名为冻结 SQL 原列名；manifest 纳入除 `manifest_sha256` 外全部19列，journal 纳入除 `canonical_sha256` 外全部14列（包括 event_id）。可空字段显式 null，时间/代数为非负整数，稳定事件身份 `PromotionV1` 恰含 generation 和 unit_id。独立固定 golden bytes 验证三种 domain，不以被测 codec 生成期待值。未改变冻结 DDL 或当前 W15 v2。
+
+只读输出为明确非授权的 RawActivationFacts：覆盖 bundled catalog 全部 Unit，每个 Unit 显式区分未登记、已登记且 journal 跟齐、仅有一个待协调末代；保留完整 manifest/journal 供后续事务/认证验证复用。缺任何 Unit 不能自动解释为 Disabled；孤立首代可以是待协调，不是已执行；manifest 比 journal 多两代或以上违反禁止跳代而拒绝。全库校验在选择指定 Unit 之前完成，另一个 Unit 的损坏也不能被过滤绕过。不接收 caller 自报可信 catalog/hash/owner；若当前模块边界必须内传 catalog，公开入口自行加载 bundled catalog。
+
+本任务只核验内容和持久关联：历史 catalog/build/schema 等 SHA 只核对原值、格式及 manifest/journal 的精确绑定，不把历史 catalog hash 强制等于当前 catalog hash，也不声称已认证实际制品。是否兼容当前部署属于 T2/T5；新 raw 对象不得命名 VerifiedDeployment、ReadyGate 或提供执行许可。错误闭合并脱敏，不回显数据库路径、批准者或版本材料；普通 inspect 结果保留后续验证所需原始事实，Debug 只展示安全摘要。
+
+执行边界：仅上述隔离 worktree，apply_patch 编辑；不得启动/观察 monitor、打开真实 DB 或读取 .env，不跑 provider/sink/PAM。主控负责唯一 Cargo 队列、Git 和独立审查；实现代理不得运行 Cargo/Git、不得派子代理。完成实现与全部反例后一次冻结文件交主控运行本任务测试，再运行相邻 Foundation；不是要求为每个字段重新编译的 TDD 任务。无需新增通用 registry、可配置 verifier 或改 Cargo/冻结 SQL。若测试组织超出单测试文件承载能力，先报告具体拆分建议，不能静默扩大文件范围。
 
 通过一个 inspector interface 加载全部 Unit 的完整链及指定 Unit 的期望/已执行差异，逐列类型检查、canonical SHA、`PromotionV1` 身份、前驱、所有版本/FK 等式、action/reason/窗口、rollback 目标、不可变 schema/triggers。产生 `RawActivationFacts` 一类明确非认证输出。缺 journal 返回待协调；缺 Unit 行不自动填 Disabled；错误/损坏不返回空集合。读路径不打开写连接、不迁移数据库。
 
@@ -44,7 +52,7 @@ cargo test --lib push_foundation::activation_facts_tests -- --test-threads=1
 
 必须打印实际测试数量大于零且通过；精确确认 inspector 前后 DB bytes/sidecar 不变、零副作用计数。T1 完成报告明确“不含认证、写入、配额、owner 接管”。
 
-## T2 — 认证部署 inspector 与操作批准
+## Task 2 — T2 认证部署 inspector 与操作批准
 
 依赖 T1 与 needs-context A/E 已决部分。新建 `activation_authorization.rs`、`activation_deployment.rs`、`activation_authorization_tests.rs`、`activation_deployment_tests.rs`；声明变更由本任务串行接管 `mod.rs`。`src/auth/operator.rs` 只在确定平台后增加能返回真实认证主体的专用路径，保留现有 monitor auth 行为；W16 不使用可跳过的 `Result<()>` 作证明。平台信任配置文件的实际路径在 T0 确认后登记，不能预造仓库内 production allowlist 为权威。
 
@@ -61,7 +69,7 @@ cargo test --lib push_foundation::activation_deployment_tests -- --test-threads=
 
 验收：`inspect` 已认证期望/执行/实物三者并清楚返回不一致；未开 owner 或发消息。外部配置未定则明确 T2 生产 adapter needs-context，其他子项可交付。
 
-## T3 — 同事务 CAS、跨 Unit 配额与 append-only 写入
+## Task 3 — T3 同事务 CAS、跨 Unit 配额与 append-only 写入
 
 依赖 T1、T2 的批准与日历合同；owner 接口可先由测试 harness 实现。本任务接管 `activation_store.rs`，新建 `activation_transaction_tests.rs`。不编辑冻结 Foundation SQL，不复用 rollback-only reader 做写入。写连接对已认证 activation DB 打开并验证 schema，显式 `BEGIN IMMEDIATE`，重验 expected generation、前驱与 pending 代，再查询全 Unit journal、写 manifest/journal、提交。
 
@@ -75,7 +83,7 @@ cargo test --lib push_foundation::activation_transaction_tests -- --test-threads
 
 验收同时记录独立进程竞争案例，不能仅单线程顺序测试或 `Mutex` 下验证。写入后调用 T1 inspector 独立重算完整链。
 
-## T4 — 四类 actor 的共同 fence 与真实 owner adapter
+## Task 4 — T4 四类 actor 的共同 fence 与真实 owner adapter
 
 依赖 T2 认证部署，T0/C supervisor 平台选择；Shadow/legacy 联合许可另依赖 T0/B owner 等式矛盾的裁决。新建 `activation_owner.rs`、`activation_fence.rs`、`activation_fence_tests.rs`；新建 `src/bin/monitor/activation_runtime.rs` 和其本地测试 module（真实路径均为新建）。编辑已有 `src/bin/monitor/main.rs` 注册受监督生命周期；接管 `phase_scheduler.rs`、`generic_transport.rs`、`dedicated_transport.rs`、`business_finalizer.rs`、`reconciler.rs` 的共同执行 seam。`intent_store.rs` 仅在使当前执行许可覆盖业务事务确有必要时修改，保留 lease/version 原义。common module 的公开可见性变更串行交接 `mod.rs`。
 
@@ -92,7 +100,7 @@ cargo test --bin monitor activation_runtime_tests -- --test-threads=1
 
 验收：真实平台 adapter 在隔离 harness 可运行，只有 trait/fake 不算完成。catalog 全 52 Unit 的 actor 映射有覆盖状态；W16 共用执行 seam 全接线，具体 Unit 未迁移路径显式拒绝晋级并交其后续 cutover，不把一条 demo 当全局证明。
 
-## T5 — apply、非原子中断协调与 rollback 纵向闭环
+## Task 5 — T5 apply、非原子中断协调与 rollback 纵向闭环
 
 依赖 T2/T3/T4。新建 `activation_execution.rs`、`activation_execution_tests.rs`；串行接管 `activation.rs` 对外 interface、`activation_store.rs` 的事务组合及 `activation_runtime.rs` 的 owner 安装/重查。独立控制面操作存储 adapter 实际位置随 T0/C 确定；不得向冻结 promotion journal 写 Pending/失败伪事件。
 
@@ -108,7 +116,7 @@ cargo test --lib push_foundation::activation_execution_tests -- --test-threads=1
 
 验收：对所有中断点可精确分类持久/实际 owner 状态并安全重查；完成协调前没有 current authority。测试“进程结束”而非仅 Result::Err 返回，确认控制面恢复线索跨重启存在。
 
-## T6 — W15 全 Unit 部署集合与只读消费接线
+## Task 6 — T6 W15 全 Unit 部署集合与只读消费接线
 
 依赖 T1/T2，新增集合 domain 文档选择 T0/D；执行联调再依赖 T5。新建 `src/push_foundation/activation_readiness.rs`、`activation_readiness_tests.rs`；串行接管 `readiness_snapshot.rs`、`readiness_snapshot_codec.rs`、`readiness_recovery.rs`、`readiness_recovery_codec.rs`、`readiness_store.rs`、`readiness_probe.rs`、`operational_readiness.rs` 及相关既有 tests。基线 595f605 已使用 snapshot/material v2；保留该版本语义，新增集合建议使用 snapshot/material v3 及独立 deployment-set/v1。冻结 recovery event/schema 和 Foundation SQL 保持不变；只有实际不兼容证明及专项审查才能提出额外版本修订，不重写已闭合锁算法。
 
@@ -127,7 +135,7 @@ cargo test --lib push_foundation::readiness_probe_tests -- --test-threads=1
 
 验收：health/readiness/CLI 指向同一新集合版（建议 v3）snapshot，公开完整集合 hash/逐 Unit 代，不输出伪 scalar Core generation。上述 codec/probe 定向命令同时验证现有 v2 候选兼容、v1 拒绝、新集合版本和 recovery/stream 显式分派；记录各版本测试数与结果。跨库非原子读取通过版本重查拒绝漂移，不宣称全库原子。
 
-## T7 — 操作员 wire、默认关闭启动与整体验收
+## Task 7 — T7 操作员 wire、默认关闭启动与整体验收
 
 依赖 T5/T6；接管 `activation.rs`，新建 `activation_operator.rs`、`activation_operator_tests.rs`；monitor 入口由本任务接管 `src/bin/monitor/main.rs`、`activation_runtime.rs`。若独立 binary 比 monitor 子命令更适配，需明确新建 `src/bin/push_activation.rs`、登记 `Cargo.toml` 并在文档固定命令；默认推荐 monitor 中只读/准备入口与授权执行 interface，避免预先假造已存在命令。
 
