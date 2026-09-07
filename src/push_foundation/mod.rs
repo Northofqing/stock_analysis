@@ -7,6 +7,7 @@ mod intent_store;
 mod migration;
 mod operational_readiness;
 mod phase_scheduler;
+mod readiness_probe;
 mod readiness_snapshot;
 mod reconciler;
 mod terminal_authority;
@@ -31,6 +32,8 @@ mod generic_transport_tests;
 mod operational_readiness_tests;
 #[cfg(test)]
 mod phase_scheduler_tests;
+#[cfg(test)]
+mod readiness_probe_tests;
 #[cfg(test)]
 mod readiness_snapshot_tests;
 #[cfg(test)]
