@@ -288,10 +288,20 @@ impl NewsFlashWindow {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct NewsFlashWindowTerminalRecord {
     pub(crate) attempt: EventEnvelope,
     pub(crate) terminal: EventEnvelope,
+}
+
+impl std::fmt::Debug for NewsFlashWindowTerminalRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NewsFlashWindowTerminalRecord")
+            .field("attempt_envelope_id", &self.attempt.id)
+            .field("terminal_envelope_id", &self.terminal.id)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2285,6 +2295,62 @@ mod delivery_observation_tests {
                 Err(NewsFlashReconcileError::InvalidChain(_))
                     | Err(NewsFlashReconcileError::RecordConflict(_))
             ));
+        }
+    }
+
+    #[test]
+    fn w13_n02_window_terminal_debug_redacts_authoritative_payloads() {
+        let fixture = dispatcher::TestAuditNamespace::new("W13_N02_DEBUG_REDACTION");
+        let dispatcher = fixture.dispatcher();
+        let business_date = chrono::NaiveDate::from_ymd_opt(2026, 8, 18).unwrap();
+        let observed_at =
+            chrono::DateTime::parse_from_rfc3339("2026-08-18T09:30:01+08:00").unwrap();
+        let attempt =
+            persist_news_flash_attempt_with(&dispatcher, w13_n02_attempt_input(1, observed_at))
+                .unwrap();
+        let terminal = persist_news_flash_terminal_with(
+            &dispatcher,
+            &attempt,
+            NewsFlashTerminalAuditInput {
+                disposition: NewsFlashTerminalDisposition::Accepted {
+                    remote_receipt: envelope::NewsFlashRemoteReceipt {
+                        channel: "TEST_CODE_W13_N02_CHANNEL".to_owned(),
+                        provider: "TEST_CODE_W13_N02_SECRET_PROVIDER".to_owned(),
+                        message_id: "TEST_CODE_W13_N02_SECRET_MESSAGE".to_owned(),
+                        platform_message_id: "TEST_CODE_W13_N02_SECRET_PLATFORM".to_owned(),
+                        accepted_at: observed_at + chrono::Duration::seconds(1),
+                        latency_ms: 1,
+                    },
+                },
+                observed_at: observed_at + chrono::Duration::seconds(1),
+                latency_ms: 1,
+            },
+        )
+        .unwrap();
+        let terminal_id = match terminal {
+            NewsFlashTerminalReceipt::Accepted(receipt) => {
+                receipt.terminal_envelope_id().to_owned()
+            }
+            other => panic!("expected Accepted, got {other:?}"),
+        };
+
+        let query = requery_news_flash_window_terminal_with(
+            &dispatcher,
+            business_date,
+            NewsFlashWindow::H0930,
+        )
+        .unwrap();
+        let debug = format!("{query:?}");
+
+        assert!(debug.contains(attempt.envelope_id()));
+        assert!(debug.contains(&terminal_id));
+        for secret in [
+            "TEST_CODE_W13_N02_SECRET_PROVIDER",
+            "TEST_CODE_W13_N02_SECRET_MESSAGE",
+            "TEST_CODE_W13_N02_SECRET_PLATFORM",
+            "TEST_CODE_W13_N02_EVENT",
+        ] {
+            assert!(!debug.contains(secret), "Debug leaked {secret}: {debug}");
         }
     }
 
