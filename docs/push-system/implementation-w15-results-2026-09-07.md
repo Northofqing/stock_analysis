@@ -113,3 +113,28 @@ schema 第一轮修复后 session 99470 W15 47/47，71160 Foundation 150/150；�
 - 五个本批 Rust 文件使用 `rustfmt --edition 2021 --check` 通过，`git diff --check` 通过。相对 W15 起点，monitor/notification/config/Cargo.lock/migrations 源码 diff 仍为空；Cargo.toml 保留已验证的 rusqlite serialize feature。
 
 本批仅完成候选持久化与连接安全切片；真实认证、权威查询、实际 probe/CLI 和 W11/W14 联结未交付。完整 W01--W21/52 Unit 目标继续保持进行中，没有把测试数量或 scoped 审查通过当整体交付。
+
+## 9. 真实来源接线与提交确认异常（继续开发）
+
+限定源码审计确认 BR-159 的真实 audit 没有 namespace、权威业务日和 SourceContractId/version；`provider_state_changed` 仅按 capability+provider 查询前态，不能独立签发某个 W15 scope 的恢复。MachineCatalog 只证明其实际登记的关系，RunContext 派生 ID 不证明 occurrence 已落库，终局投递 authority 也不证明当前输入能力。详细字段/函数证据留在本计划的 `task-3-authority-reader-findings.md`。
+
+当前并行两条明确验收：Task 3E 在 COMMIT 确认异常后结束原写连接并完整重查同一候选，无法确认则返回明确未确认错误，不自动追加；Task 3F 在 database 模块复用 BR-159 原算法，从同一读事务取真实 audit/chain 并返回受保护原始字段，不接收调用方自报 observation，不创建数据库或初始化 Manager。3F 仍不证明 source identity、namespace/date/version 或外层事务提交状态，不能用于发布 W15 Ready；真实注册与来源绑定尚待接入。
+
+首联合 RED session 68192：exit101，缺新reader函数 E0425 和确认丢失故障入口 E0599，两项均为编译期缺口。最小实现后 session 70694：**61 passed/1 failed/1 ignored**，11.06s，编译2m32s/43 warnings；审计原样只读查询与自动确认重查两个首tracer都通过，唯一失败是旧并发测试未允许新的 CommitUnconfirmed 错误分类。该断言已按合同调整并保留最多单winner、无部分写入和显式重试断言，尚待联合复验。
+
+真实 deferred-FK COMMIT 拒绝测试及原始audit八outcome/错receipt/中间链损坏测试已追加。session 56313 exit101，仅缺 deferred-FK 测试入口 E0599；该结果不证明已模拟真实提交期故障，需看后续运行结果。
+
+### 本批实现与最终门禁
+
+- `f1fcb15`：真实 BR-159 audit/chain 原始事实只读查询，保留八种 outcome；四条新测试覆盖原字段、receipt 漂移和实际中段损坏。限定独立 Spec/quality 审查 Approved，无 Critical/Important；仅证明当前连接快照的完整性，不证明来源身份或外层事务已提交。
+- `6fac7c7`：仅在 COMMIT 确认异常时关闭原写连接，再完整重查同一候选；未证实即返回脱敏 `CommitUnconfirmed`，不自动再次追加。真实 deferred-FK COMMIT 拒绝、提交后丢确认模拟、重查损坏/不可达与原有并发/回滚断言均通过。限定独立 Spec/quality 审查 Approved、无 Critical/Important，尚不按完整 Task3 交付。
+- session 89676 曾为 67 passed/1 failed/1 ignored：唯一失败是测试将 Display 与 Debug 的大小写约定混用，原实现代理只修正该断言；不是生产 COMMIT 行为失败。
+- 最终 Foundation session 67896，`cargo test --lib push_foundation:: -- --test-threads=1`，exit 0：**167 passed/0 failed/1 ignored**，18.19s，编译 2m27s；ignored child helper 由父测试显式执行。
+- 采集审计相邻回归 session 98657，`cargo test --lib database::data_acquisition_audit:: -- --test-threads=1`，exit 0：**8 passed/0 failed**（旧4+新4），0.06s，缓存编译 1.80s。以上 lib-test 输出仍为 43 项既有 warning。
+- Clippy session 8984，`cargo clippy --lib --message-format=json`，exit 0、1m23s；本次完整 fingerprint 经 jq 核验 **163** 条有位置 warning，Foundation 与采集审计文件均零诊断。三个本批 Rust 文件定向 rustfmt --check、git diff --check 通过；没有把非 strict 门禁称作全仓零告警。
+
+提交异常验证区分了“真实 SQLite deferred-FK COMMIT 拒绝”和“真实提交后模拟确认丢失”；没有强制模拟 fsync、磁盘耗尽或 VFS 故障，不能夸大覆盖。完整 W15 仍缺可信 source descriptor/opener、版本化 NotRequired、KnownOccurrence、认证发布与恢复、权威 probe/CLI、W11/W14 联结和整体门禁。
+
+用户要求继续提速后，按 subagent-driven-development 的任务边界让独立审查与统一验证交叠，复用未变化代码的有效证据，并集中更新同批文档；不通过重复开 agent、并发争抢 Cargo 或删减真实验收来声称提速。完整 W01--W21/52 Unit 目标不变，生产 monitor 与真实业务库仍未操作。
+
+Task3E 独立审查保留一项非阻塞清理建议：仅测试调用的错误构造 helper 和两个私有 fault 变体尚未加条件编译，但实际注入入口已为 cfg(test)，不存在生产可调用故障口。记录为下次修改该文件时顺带清理，不为此重开已通过的事务行为审查；43/163 项既有告警背景继续如实保留。

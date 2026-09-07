@@ -1,6 +1,6 @@
 # 推送 Foundation W15 运行就绪实施计划
 
-**状态：** Task 1 设计已提交 `ec930f8`；Task 2 候选判级/快照/重建及补测已提交至 `6f255c0`，Task 4A 纯计数 `c040072`。原因/依赖角色修复与 snapshot codec 补测均已独立复审通过。Task 3 的 recovery/event codec、schema/open 与候选 store 已通过限定范围独立 Spec/quality 评审（至 `1a4ee8e`）；schema 两项 Important 和 store 的损坏链覆盖 Minor 均关闭。最新 Foundation 163 passed/0 failed/1 child-helper ignored，其中 W15 60 项通过；Clippy 回到既有 163 项、目标零诊断。下一步是真实来源认证与认证恢复，再接权威 probe 和调度联结；W15 尚未完成。逐项证据见 `docs/push-system/implementation-w15-results-2026-09-07.md`。
+**状态：** Task 1 设计已提交 `ec930f8`；Task 2 候选判级/快照/重建及补测已提交至 `6f255c0`，Task 4A 纯计数 `c040072`；已关闭切片的独立审查不重复派发。Task 3 recovery/event codec、schema/open 与候选 store 已完成限定评审及补强（至 `1a4ee8e`）。新增 `f1fcb15` 的真实 BR-159 原始事实 reader、`6fac7c7` 的 COMMIT 异常精确重查均已通过限定独立 Spec/quality 审查，无 Critical/Important；非阻塞清理项在实现记录中保留。最新 Foundation 167 passed/0 failed/1 child-helper ignored、采集审计新旧 8/8；Clippy 163 项既有告警，Foundation/采集审计目标零诊断。下一步是真实来源认证与认证恢复，再接权威 probe 和调度联结；W15 尚未完成。逐项证据见 `docs/push-system/implementation-w15-results-2026-09-07.md`。
 
 **目标：** 交付 Core/Producer/Occurrence 三个范围的就绪判定、可查询的不可变运行快照、绑定前后快照及依赖版本的恢复事件，以及只读部署探针。按 WBS 执行完整 W15，不将单次 source availability 等同于全部就绪能力。
 

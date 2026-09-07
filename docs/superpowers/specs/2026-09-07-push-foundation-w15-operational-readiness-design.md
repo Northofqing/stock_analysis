@@ -102,11 +102,17 @@ Snapshot 实现 RFC 全部字段；canonical hash 使用已有 `CanonicalValue`/
 
 每个 evidence ref 包含类型、protected URI、SHA、source ID/version。Debug/错误/probe 只输出稳定 ID、类型、版本、hash，不暴露 URI 正文或内容。注册 authority 通过现有 immutable audit/本地 authority 验证结果复验引用；字符串 actor 或自报 success 不能签发恢复。实现时只开放经验证 reader 的 attestation 构造，测试替身限制在测试 seam，不产生生产授权。
 
+实际 reader 接线裁决：现有 BR-159 acquisition audit 只能证明完整持久原始事实；其记录缺 namespace、authority business_date、SourceContractId/version 和 W15 scope/部署上下文，`schema_version=1` 不能代替合同版本，按 capability+provider 派生的 previous_outcome 也不能独立证明特定 scope 恢复。先在 database 模块复用现有全链/receipt 算法，接受显式现有连接、同一 DEFERRED 事务返回私有构造的原始审计事实，不接受调用者自称的 expected observation，不通过全局 DatabaseManager 初始化取得连接。此入口没有 opener 或来源身份认证；最终必须由受信 source descriptor 与 typed 版本化解释将原始 outcome/时间等绑定到 W15，不能把 receipt SHA 或任意 URI 文件当来源证明。`verified_empty` 保留原义，不直接推导依赖不可用或业务 NoData 完成。
+
+KnownOccurrence 后续从真实持久 intent 与 transition chain 的同一只读快照取得，再与 catalog 的 producer/Unit/family/owner 精确关联；须包含 Ready、NoData、Disabled 等合法持久 intent，不用仅支持 Ready 的 binding 接口或 RunContext 派生 ID 替代存在性。其余 Core/Producer 角色及版本化 NotRequired 仍需真实 typed 注册/部署 authority，不用 terminal accepted 或 schema receipt 兜底认证。
+
 首次记录追加 ReadyObserved 或 Pending 事件；恢复须有显式且经认证的 capability/version 变化，重新评估通过后追加对应 CoreDependenciesRestored / ProducerContractRestored / InputEvidenceRestored。只有时间流逝、重复 tick、空 Vec 或未经验证的日志变化不构成恢复。
 
 为避免循环 hash：先根据前 snapshot ID、context、依赖变更和认证来源材料派生 recovery_event_id；snapshot 将该 ID 纳入 hash；event 正文最后绑定 before/after snapshot hash 并另存完整 event SHA。重查同时验证 event identity、正文 SHA 和两个 snapshot 引用，不允许借“ID 不包含 after hash”偷换 after snapshot。
 
 同一事务写 event、snapshot、head；head 版本经 checked add。重复提交读取同一事实；陈旧 head、输入漂移、写失败整体回滚。提交确认未知先重查，不能盲目追加。通过重新打开真实临时 SQLite 验证跨重启行为。
+
+提交确认异常的实现边界：仅 COMMIT 阶段异常在原事务及连接结束后触发完整 `load_record(snapshot_id)` 重查；候选全部材料精确相同才返回原持久 receipt。无记录、损坏、查询失败或材料漂移都只能报告“未确认”，不能把错误解释成未落库，也不能自动再次追加。成功快路径和明确的提交前错误不额外查询。验证须区分真实 SQLite COMMIT 拒绝、成功提交后的确认丢失模拟与尚未覆盖的底层 I/O 故障，不能相互冒充。
 
 持久集成切片的 StoredReadinessRecord 仅包含已重建的 CandidateReadinessRecord 和已核验链版本，不构造 AttestedReadinessSnapshot。stream 身份与 recovery continuity 一致，包含 namespace、业务日、build、generation、manifest、catalog、scope 和启用 producer 集合；capture time、依赖观察和 stage 不作为新 stream。查询迭代重建完整前序链，拒绝循环、断链、跨 stream 和 head 版本漂移。外部来源认证仍须在权威发布前完成，不能把数据库落库与字节一致误称为证据来源可信。
 
