@@ -65,6 +65,28 @@ pub(crate) enum DependencyKind {
     OccurrenceInput,
 }
 
+impl DependencyKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Namespace => "Namespace",
+            Self::Durable => "Durable",
+            Self::Audit => "Audit",
+            Self::TypedAuthority => "TypedAuthority",
+            Self::Schema => "Schema",
+            Self::Manifest => "Manifest",
+            Self::ProducerBinding => "ProducerBinding",
+            Self::SourceContract => "SourceContract",
+            Self::ScheduleOrTrigger => "ScheduleOrTrigger",
+            Self::Presentation => "Presentation",
+            Self::DurablePolicy => "DurablePolicy",
+            Self::ReceiptStrength => "ReceiptStrength",
+            Self::FeatureGate => "FeatureGate",
+            Self::CompletionPolicy => "CompletionPolicy",
+            Self::OccurrenceInput => "OccurrenceInput",
+        }
+    }
+}
+
 const CORE_DEPENDENCIES: &[DependencyKind] = &[
     DependencyKind::Namespace,
     DependencyKind::Durable,
@@ -113,6 +135,31 @@ impl DependencyObservation {
     pub(crate) fn kind(&self) -> DependencyKind {
         match self {
             Self::Available { kind, .. } | Self::Unavailable { kind, .. } => *kind,
+        }
+    }
+
+    pub(crate) fn contract_id(&self) -> &SourceContractId {
+        match self {
+            Self::Available { contract_id, .. } | Self::Unavailable { contract_id, .. } => {
+                contract_id
+            }
+        }
+    }
+
+    pub(crate) fn version(&self) -> &SourceContractVersion {
+        match self {
+            Self::Available { version, .. } | Self::Unavailable { version, .. } => version,
+        }
+    }
+
+    pub(crate) fn evidence_sha256(&self) -> &Sha256Digest {
+        match self {
+            Self::Available {
+                evidence_sha256, ..
+            }
+            | Self::Unavailable {
+                evidence_sha256, ..
+            } => evidence_sha256,
         }
     }
 
@@ -195,6 +242,10 @@ pub(crate) enum ReadinessError {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReadinessAssessment {
+    scope: ReadinessScope,
+    catalog_sha256: Sha256Digest,
+    enabled_producers: Vec<ProducerId>,
+    requirements: Vec<DependencyRequirement>,
     status: ReadinessStatus,
     stage: ReadinessStage,
     affected_unit_ids: Vec<UnitId>,
@@ -281,6 +332,15 @@ impl ReadinessAssessment {
             (units, producers)
         };
         Ok(Self {
+            scope: scope.clone(),
+            catalog_sha256: catalog.catalog_sha256().clone(),
+            enabled_producers: enabled_producers
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            requirements: declarations.into_values().cloned().collect(),
             status,
             stage,
             affected_unit_ids,
@@ -292,6 +352,26 @@ impl ReadinessAssessment {
 
     pub(crate) fn status(&self) -> ReadinessStatus {
         self.status
+    }
+
+    pub(crate) fn scope(&self) -> &ReadinessScope {
+        &self.scope
+    }
+
+    pub(crate) fn catalog_sha256(&self) -> &Sha256Digest {
+        &self.catalog_sha256
+    }
+
+    pub(crate) fn enabled_producers(&self) -> &[ProducerId] {
+        &self.enabled_producers
+    }
+
+    pub(crate) fn requirements(&self) -> &[DependencyRequirement] {
+        &self.requirements
+    }
+
+    pub(crate) fn stage(&self) -> ReadinessStage {
+        self.stage
     }
 
     pub(crate) fn reason(&self) -> ReasonCode {
