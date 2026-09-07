@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
@@ -25,6 +25,20 @@ const UNIT_A: &str = "MU-p01";
 const UNIT_B: &str = "MU-d01";
 const DAY: u64 = 1_000_000;
 const DAY_LENGTH: u64 = 86_400_000_000;
+
+static SQLITE_BUSY_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+fn record_sqlite_busy(_attempt: i32) -> bool {
+    SQLITE_BUSY_CALLBACKS.fetch_add(1, Ordering::SeqCst);
+    true
+}
+
+fn record_process_sqlite_busy(_attempt: i32) -> bool {
+    if let Ok(marker) = std::env::var("ACTIVATION_PROCESS_BUSY_MARKER") {
+        let _ = fs::write(marker, b"busy");
+    }
+    true
+}
 
 fn unit(value: &str) -> UnitId {
     UnitId::try_new(value.to_owned()).expect("TEST_CODE unit")
@@ -228,6 +242,30 @@ impl ActivationOwnerCoordinator for HarnessCoordinator {
     ) -> Result<(), ActivationOwnerCoordinationError> {
         self.pause_calls.fetch_add(1, Ordering::SeqCst);
         self.pause_result
+    }
+}
+
+struct SharedClockCoordinator {
+    now: Arc<AtomicU64>,
+    validation_calls: Arc<AtomicUsize>,
+    pause_calls: Arc<AtomicUsize>,
+}
+
+impl ActivationOwnerCoordinator for SharedClockCoordinator {
+    fn revalidate_approval_and_time(
+        &mut self,
+        _candidate: &ActivationApplyCandidate,
+    ) -> Result<u64, ActivationOwnerCoordinationError> {
+        self.validation_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.now.load(Ordering::SeqCst))
+    }
+
+    fn confirm_target_owner_paused(
+        &mut self,
+        _candidate: &ActivationApplyCandidate,
+    ) -> Result<(), ActivationOwnerCoordinationError> {
+        self.pause_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -533,7 +571,6 @@ fn rollback_is_unlimited_but_blocks_a_later_activate_in_its_business_day() {
     );
     apply(&database, &a2);
 
-    let next_day = DAY + DAY_LENGTH;
     let rollback = candidate(
         UNIT_A,
         DesiredActivationState::Shadow,
@@ -542,12 +579,28 @@ fn rollback_is_unlimited_but_blocks_a_later_activate_in_its_business_day() {
         Some(&a2.manifest),
         Some(&a2.journal),
         Some(&a1.manifest),
-        next_day,
-        next_day + 100,
+        DAY,
+        DAY + 400,
     );
     assert_eq!(apply(&database, &rollback), ActivationApplyOutcome::Applied);
 
-    let b0 = initial_candidate(UNIT_B, next_day, next_day + 200);
+    let second_rollback = candidate(
+        UNIT_A,
+        DesiredActivationState::Disabled,
+        PromotionAction::Rollback,
+        "owner-legacy",
+        Some(&rollback.manifest),
+        Some(&rollback.journal),
+        Some(&a0.manifest),
+        DAY,
+        DAY + 500,
+    );
+    assert_eq!(
+        apply(&database, &second_rollback),
+        ActivationApplyOutcome::Applied
+    );
+
+    let b0 = initial_candidate(UNIT_B, DAY, DAY + 600);
     apply(&database, &b0);
     let b1 = candidate(
         UNIT_B,
@@ -557,8 +610,8 @@ fn rollback_is_unlimited_but_blocks_a_later_activate_in_its_business_day() {
         Some(&b0.manifest),
         Some(&b0.journal),
         None,
-        next_day,
-        next_day + 300,
+        DAY,
+        DAY + 700,
     );
     apply(&database, &b1);
     let b2 = candidate(
@@ -569,8 +622,8 @@ fn rollback_is_unlimited_but_blocks_a_later_activate_in_its_business_day() {
         Some(&b1.manifest),
         Some(&b1.journal),
         None,
-        next_day,
-        next_day + 400,
+        DAY,
+        DAY + 800,
     );
     let mut connection = open_test_connection(&database);
     let mut coordinator = HarnessCoordinator::allowing(b2.journal.occurred_at());
@@ -802,6 +855,56 @@ fn database_lock_never_falls_back_to_an_unlocked_write_path() {
 }
 
 #[test]
+fn approval_expiring_during_observed_sqlite_lock_wait_is_rejected_after_lock() {
+    let (_root, database) = initialized_database("lock-wait-expiry.sqlite");
+    let mut blocker = open_test_connection(&database);
+    let blocker_transaction = blocker
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .expect("TEST_CODE blocker transaction");
+
+    let candidate = initial_candidate(UNIT_A, DAY, DAY + 100);
+    let now = Arc::new(AtomicU64::new(candidate.journal.occurred_at()));
+    let validation_calls = Arc::new(AtomicUsize::new(0));
+    let pause_calls = Arc::new(AtomicUsize::new(0));
+    SQLITE_BUSY_CALLBACKS.store(0, Ordering::SeqCst);
+    let contender_database = database.clone();
+    let contender_candidate = candidate.clone();
+    let contender_now = now.clone();
+    let contender_validations = validation_calls.clone();
+    let contender_pauses = pause_calls.clone();
+    let contender = thread::spawn(move || {
+        let mut connection = open_test_connection(&contender_database);
+        connection
+            .busy_handler(Some(record_sqlite_busy))
+            .expect("TEST_CODE observable SQLite busy handler");
+        let mut coordinator = SharedClockCoordinator {
+            now: contender_now,
+            validation_calls: contender_validations,
+            pause_calls: contender_pauses,
+        };
+        apply_activation_candidate(&mut connection, &contender_candidate, &mut coordinator)
+    });
+
+    wait_for_busy_callback();
+    assert_eq!(validation_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(pause_calls.load(Ordering::SeqCst), 0);
+    now.store(candidate.manifest.window_end(), Ordering::SeqCst);
+    blocker_transaction
+        .rollback()
+        .expect("TEST_CODE release blocker after expiry");
+
+    assert_eq!(
+        contender.join().expect("TEST_CODE waiting contender"),
+        Err(ActivationTransactionError::OwnerCoordination(
+            ActivationOwnerCoordinationError::ApprovalRejected
+        ))
+    );
+    assert_eq!(validation_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(pause_calls.load(Ordering::SeqCst), 0);
+    assert_empty(&database);
+}
+
+#[test]
 fn real_commit_busy_is_uncertain_without_retry_and_leaves_no_half_history() {
     let (_root, database) = initialized_database("commit-busy.sqlite");
     let mut reader = open_test_connection(&database);
@@ -899,8 +1002,15 @@ fn independent_processes_race_the_same_sqlite_generation() {
     let start = database.with_extension("start");
     let first_result = database.with_extension("first.result");
     let second_result = database.with_extension("second.result");
-    let mut first = spawn_competitor(&database, &start, &first_result, "same-unit", "first");
-    let mut second = spawn_competitor(&database, &start, &second_result, "same-unit", "second");
+    let mut first = spawn_competitor(&database, &start, &first_result, "same-unit", "first", None);
+    let mut second = spawn_competitor(
+        &database,
+        &start,
+        &second_result,
+        "same-unit",
+        "second",
+        None,
+    );
     thread::sleep(Duration::from_millis(100));
     fs::write(&start, b"go").expect("TEST_CODE process barrier");
     assert!(first.wait().expect("TEST_CODE first child").success());
@@ -936,8 +1046,8 @@ fn independent_processes_race_the_cross_unit_daily_quota() {
     let start = database.with_extension("start");
     let first_result = database.with_extension("first.result");
     let second_result = database.with_extension("second.result");
-    let mut first = spawn_competitor(&database, &start, &first_result, "cross-unit", "a");
-    let mut second = spawn_competitor(&database, &start, &second_result, "cross-unit", "b");
+    let mut first = spawn_competitor(&database, &start, &first_result, "cross-unit", "a", None);
+    let mut second = spawn_competitor(&database, &start, &second_result, "cross-unit", "b", None);
     thread::sleep(Duration::from_millis(100));
     fs::write(&start, b"go").expect("TEST_CODE process barrier");
     assert!(first.wait().expect("TEST_CODE first child").success());
@@ -975,6 +1085,7 @@ fn rollback_holding_the_process_lock_blocks_the_waiting_activate() {
     let start = database.with_extension("start");
     let locked = database.with_extension("locked");
     let release = database.with_extension("release");
+    let activate_busy = database.with_extension("activate.busy");
     let rollback_result = database.with_extension("rollback.result");
     let activate_result = database.with_extension("activate.result");
     fs::write(&start, b"go").expect("TEST_CODE start rollback");
@@ -994,8 +1105,9 @@ fn rollback_holding_the_process_lock_blocks_the_waiting_activate() {
         &activate_result,
         "rollback-activate",
         "activate",
+        Some(&activate_busy),
     );
-    thread::sleep(Duration::from_millis(100));
+    wait_for_file(&activate_busy);
     fs::write(&release, b"commit").expect("TEST_CODE release rollback");
     assert!(rollback.wait().expect("TEST_CODE rollback child").success());
     assert!(activate.wait().expect("TEST_CODE activate child").success());
@@ -1015,9 +1127,11 @@ fn spawn_competitor(
     result: &Path,
     scenario: &str,
     role: &str,
+    busy_marker: Option<&Path>,
 ) -> std::process::Child {
     let executable = std::env::current_exe().expect("TEST_CODE current test executable");
-    Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .arg("--exact")
         .arg(
             "push_foundation::activation_transaction_tests::\
@@ -1029,9 +1143,11 @@ fn spawn_competitor(
         .env("ACTIVATION_PROCESS_START", start)
         .env("ACTIVATION_PROCESS_RESULT", result)
         .env("ACTIVATION_PROCESS_SCENARIO", scenario)
-        .env("ACTIVATION_PROCESS_ROLE", role)
-        .spawn()
-        .expect("TEST_CODE child process")
+        .env("ACTIVATION_PROCESS_ROLE", role);
+    if let Some(marker) = busy_marker {
+        command.env("ACTIVATION_PROCESS_BUSY_MARKER", marker);
+    }
+    command.spawn().expect("TEST_CODE child process")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1076,6 +1192,16 @@ fn wait_for_file(path: &Path) {
         thread::sleep(Duration::from_millis(5));
     }
     panic!("TEST_CODE child did not acquire SQLite lock");
+}
+
+fn wait_for_busy_callback() {
+    for _ in 0..1_000 {
+        if SQLITE_BUSY_CALLBACKS.load(Ordering::SeqCst) != 0 {
+            return;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    panic!("TEST_CODE contender did not observe SQLite busy");
 }
 
 struct ProcessCoordinator {
@@ -1149,6 +1275,11 @@ fn activation_process_competitor_helper() {
         .zip(std::env::var("ACTIVATION_PROCESS_RELEASE").ok())
         .map(|(locked, release)| (PathBuf::from(locked), PathBuf::from(release)));
     let mut connection = open_test_connection(Path::new(&database));
+    if std::env::var_os("ACTIVATION_PROCESS_BUSY_MARKER").is_some() {
+        connection
+            .busy_handler(Some(record_process_sqlite_busy))
+            .expect("TEST_CODE process SQLite busy handler");
+    }
     let mut coordinator = ProcessCoordinator {
         inner: HarnessCoordinator::allowing(candidate.journal.occurred_at()),
         lock_barrier,
