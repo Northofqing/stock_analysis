@@ -15,7 +15,7 @@ use super::readiness_snapshot::{
     ReadinessEvidenceKind, ReadinessEvidenceRef, ReadinessSnapshotContext,
 };
 
-fn assessed(
+pub(super) fn assessed(
     scope: &ReadinessScope,
     blocked: Option<DependencyKind>,
 ) -> (ReadinessAssessment, Vec<ReadinessEvidenceRef>) {
@@ -98,7 +98,7 @@ fn assessed(
     (assessment, evidence)
 }
 
-fn context(captured_at: i64) -> ReadinessSnapshotContext {
+pub(super) fn context(captured_at: i64) -> ReadinessSnapshotContext {
     ReadinessSnapshotContext {
         namespace: Namespace::test(
             RunId::try_new("TEST_CODE-w15-recovery".to_owned()).expect("TEST_CODE namespace"),

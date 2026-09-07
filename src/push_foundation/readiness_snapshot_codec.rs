@@ -184,7 +184,7 @@ fn decode_dependencies(
     Ok((requirements, observations))
 }
 
-fn decode_evidence(value: &Value) -> Result<ReadinessEvidenceRef, ReadinessDecodeError> {
+pub(super) fn decode_evidence(value: &Value) -> Result<ReadinessEvidenceRef, ReadinessDecodeError> {
     let dependency_kind = dependency_kind(string_field(value, "dependency_kind")?)?;
     let kind = match string_field(value, "kind")? {
         "AuthorityArtifact" => ReadinessEvidenceKind::AuthorityArtifact,
