@@ -54,7 +54,7 @@ T1 只证明冻结 DDL 的内容/链/关联，保留原始 owner，不签发准�
 
 配额仍使用现有全 Unit `Activate/Rollback` 查询，不因 owner 字符串相同而私自豁免。无 Activate 的 shadow/无 owner 变化部署不消耗名额。如果某个 conformance Unit 需要“同 owner 的 Activate 也免名额”，必须先明确该操作分类与 Q36/现有查询的衔接，不能用更容易通过的查询替换冻结规则。
 
-多 Unit snapshot/material v3 的精确字段及 stream 版本尚未交付。下述 C 决定确定事务顺序，但实际认证和监督器 adapter 仍待，不宣称 W16/W15 或52个 Unit 已完成。
+多 Unit集合的精确字段和版本选择见新增[部署集合合同](activation-deployment-set-contract-2026-09-08.md)：独立set v1、后续snapshot/material v3和stream v2，保留当前v2/stream v1。集合读取正在实现，完整snapshot/recovery版本分派仍未交付。下述 C 决定确定事务顺序，但实际认证和监督器 adapter 仍待，不宣称 W16/W15 或52个 Unit 已完成。
 
 ## 决定三：先批准与同事务写入的衔接
 

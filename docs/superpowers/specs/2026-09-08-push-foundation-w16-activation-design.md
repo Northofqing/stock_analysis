@@ -104,9 +104,11 @@ rollback 始终生成 N+1，不降低 generation；目标为同 Unit 兼容历�
 
 当前 `ReadinessSnapshotContext` 只有一份 `activation_generation/manifest_sha256/build_commit`；`ReadinessStreamId::for_snapshot` 用这些 scalar 分流。Core 评估的 producer 集却可跨 Unit。因此仅改调用者选最大代、某一 Unit、hash 填入 manifest 字段或只评一个 Unit 均不满足 RFC。
 
-当前已审阅基线 595f605 是 `OperationalReadinessSnapshot/v2` 与 `OperationalReadinessMaterial/v2`；decoder 要求 schema_version=2，legacy v1 按当前策略拒绝。保留现有 v2 候选 bytes/哈希/字段语义，不把部署集合塞进同名 v2 domain。若集合改变 snapshot/material，建议分别采用新 `OperationalReadinessSnapshot/v3` 与 `OperationalReadinessMaterial/v3`；集合自身使用独立 `ActivationDeploymentSet/v1` domain。以上新 domain 待 T0 冻结，不表示已实现。
+当前已审阅基线 595f605 是 `OperationalReadinessSnapshot/v2` 与 `OperationalReadinessMaterial/v2`；decoder 要求 schema_version=2，legacy v1 按当前策略拒绝。保留现有 v2 候选 bytes/哈希/字段语义，不把部署集合塞进同名 v2 domain。[部署集合合同](../../push-system/activation-deployment-set-contract-2026-09-08.md)已确定新 `OperationalReadinessSnapshot/v3`、`OperationalReadinessMaterial/v3` 和独立 `ActivationDeploymentSet/v1` domain，以及集合的精确编码。版本名已确定不表示消费者已支持；v3具体wire、store/probe消费和跨stream恢复仍待实现验收。
 
 集合以 UnitId 稳定排序，精确成员包括 `(unit_id,generation,manifest_sha256,journal_event_id,journal_sha256,physical_owner,build_commit,build_sha256,source_binding_sha256)`；绑定 namespace、catalog hash、认证配置的启用 producer/Unit 集、仍有恢复责任的 Unit、日历版本及共享依赖版本，独立派生 `deployment_set_sha256`。该 hash 不冒充任意单 Unit manifest。
+
+T6A原始候选集合已实施至`e0cdd0d`并通过限定复核，具体字段、未登记null及Core6文本排序按[集合合同](../../push-system/activation-deployment-set-contract-2026-09-08.md)。它比较来源/配置声明，不把声明认证为真；下面的真实认证、跨库消费、v3和执行许可要求没有因此完成。
 
 加载时从同一 activation DB 事务读取全部登记 Unit 的状态，认证启用集合与 catalog 的闭合；Inactive/Disabled/Shadow 必须显式登记状态和来源，不把缺行当批准 Disabled。Core 覆盖全启用 Unit 及共享前提；未启用但有 persisted pending 的 Unit 加入恢复覆盖，不因此启用新工作。每个 Producer/Occurrence join 到所属 Unit 的精确 entry。跨 activation/source/readiness 库不宣称原子快照：读前/提交后比较认证集合和来源版本，任何相关 generation/配置漂移拒绝认证该 snapshot 并重评；执行仍需当前 fence。
 
@@ -114,7 +116,7 @@ rollback 始终生成 N+1，不降低 generation；目标为同 Unit 兼容历�
 
 新 probe/health/CLI 共享同一集合版（建议 v3）snapshot，输出集合 hash 和逐 Unit 代，不输出伪全局 generation。现有 v2 可以按既有候选合同读取，不能自动升级为全局认证 Ready；本文不承诺 v1 可 inspect。store 优先保留当前 schema、历史 bytes/hash 和明确版本 codec dispatch；变更 schema 必须另有实际不兼容证据与审查。不得改冻结 Foundation DDL 来塞 readiness 列。
 
-**needs-context D（合同兼容）**：主控批准新增集合 snapshot/material domain（建议 v3）、独立 deployment-set/v1 与 stream 版本分派，以及 RFC snapshot/output、蓝图“单一 manifest”=部署集合的文档澄清；已审阅 v2 与拒绝 v1 的基线保持不变。W15 snapshot/recovery/probe/stream 与认证接线属于实际缺口，任务并行推进不代表 W15 Ready 已成立。reader 现只接受 rollback 模式，生产 BR159 默认 WAL；推荐先给 activation 存储明确 rollback 配置，BR159 单独交付 WAL 一致读或来源认证导出（不得复制主文件遗漏 WAL），由来源工作项落地。无法认证的 source 持续不就绪。
+**D（版本选择已定，消费合同/实现尚待）**：新增[部署集合合同](../../push-system/activation-deployment-set-contract-2026-09-08.md)确定独立`ActivationDeploymentSet/v1`、后续snapshot/material v3及`OperationalReadinessStream/v2`，固定集合完整字段；旧v2候选与stream v1、legacy snapshot v1拒绝保持不变。具体v3 wire、recovery跨stream显式衔接、RFC输出和新蓝图视图仍待T6接线，不改原冻结输入。W15 snapshot/recovery/probe/stream 与认证接线属于实际缺口，任务并行推进不代表 W15 Ready 已成立。reader 现只接受 rollback 模式，生产 BR159 默认 WAL；推荐先给 activation 存储明确 rollback 配置，BR159 单独交付 WAL 一致读或来源认证导出（不得复制主文件遗漏 WAL），由来源工作项落地。无法认证的 source 持续不就绪。
 
 ## 操作员 wire 与拒绝语义
 

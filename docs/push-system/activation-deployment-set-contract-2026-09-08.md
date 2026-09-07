@@ -1,6 +1,6 @@
 # W16 全 Unit 部署集合合同
 
-日期：2026-09-08。状态：本文集合编码与版本选择为已接受的工程决定，实施/实际认证尚未完成，不授予生产批准。依据为[W16设计](../superpowers/specs/2026-09-08-push-foundation-w16-activation-design.md)的全范围消费要求和[合同裁决](activation-contract-decisions-2026-09-08.md)；不改变八份冻结输入、Foundation SQL 或已经持久化的旧版本。
+日期：2026-09-08。状态：本文集合编码与版本选择为已接受的工程决定；全catalog原始候选构造/读取/重读已实施至`e0cdd0d`并通过限定复核，见[实施结果](implementation-w16-results-2026-09-08.md)。v3消费者与实际认证尚未完成，不授予生产批准。依据为[W16设计](../superpowers/specs/2026-09-08-push-foundation-w16-activation-design.md)的全范围消费要求和[合同裁决](activation-contract-decisions-2026-09-08.md)；不改变八份冻结输入、Foundation SQL 或已经持久化的旧版本。
 
 ## 背景、决定与代价
 
