@@ -114,9 +114,13 @@ fn w15_store_rolls_back_event_snapshot_and_head_at_each_write_boundary() {
         .expect("TEST_CODE second pending");
         let stream = ReadinessStreamId::for_snapshot(before.snapshot());
 
-        assert!(store
-            .append_with_fault(Some(&first), &after, fault)
-            .is_err());
+        assert_eq!(
+            store.append_with_fault(Some(&first), &after, fault),
+            Err(ReadinessStoreError::Storage {
+                operation: "injected_before_commit"
+            }),
+            "TEST_CODE pre-commit callback errors remain unchanged"
+        );
         let reopened = ReadinessRecordStore::at(&database, &namespace, &catalog);
         assert_eq!(
             reopened
@@ -344,6 +348,242 @@ fn w15_store_replays_old_commits_after_response_loss_without_advancing_the_head(
 }
 
 #[test]
+fn w15_store_rechecks_exact_committed_record_when_commit_confirmation_is_lost() {
+    let root = tempfile::tempdir().expect("TEST_CODE commit confirmation root");
+    let database = root
+        .path()
+        .canonicalize()
+        .expect("TEST_CODE canonical root")
+        .join("readiness.sqlite3");
+    let catalog = MachineCatalog::bundled().expect("TEST_CODE catalog");
+    let namespace = context(100).namespace;
+    initialize_database(&database, &namespace).expect("TEST_CODE initialize");
+    let store = ReadinessRecordStore::at(&database, &namespace, &catalog);
+    let (assessment, evidence) = assessed(&ReadinessScope::Core, Some(DependencyKind::Schema));
+    let before = CandidateReadinessRecord::try_new(
+        None,
+        context(100),
+        assessment.clone(),
+        evidence.clone(),
+        vec![],
+    )
+    .expect("TEST_CODE first pending");
+    let first = store.append(None, &before).expect("TEST_CODE first commit");
+    let after = CandidateReadinessRecord::try_new(
+        Some(before.snapshot()),
+        context(200),
+        assessment,
+        evidence,
+        vec![],
+    )
+    .expect("TEST_CODE second pending");
+
+    // This is a lost-confirmation simulation after a real durable commit, not a
+    // claim that SQLite produced an I/O failure. It must use the same
+    // commit-error classification and exact-record recheck as a real failure.
+    let recovered = store
+        .append_with_fault(
+            Some(&first),
+            &after,
+            ReadinessAppendFault::CommitConfirmationLost,
+        )
+        .expect("TEST_CODE exact committed fact resolves lost confirmation");
+
+    assert_eq!(recovered.version(), 2);
+    assert_eq!(recovered.candidate(), &after);
+    let reopened = ReadinessRecordStore::at(&database, &namespace, &catalog);
+    assert_eq!(
+        reopened
+            .load_record(after.snapshot().snapshot_id())
+            .expect("TEST_CODE reopened exact record"),
+        recovered
+    );
+    assert_eq!(
+        reopened
+            .load_head(&ReadinessStreamId::for_snapshot(after.snapshot()))
+            .expect("TEST_CODE reopened head"),
+        Some(recovered.clone())
+    );
+    assert_eq!(
+        reopened
+            .append(Some(&first), &after)
+            .expect("TEST_CODE exact historical replay"),
+        recovered,
+        "TEST_CODE lost confirmation must not create a second event or advance the head"
+    );
+}
+
+#[test]
+fn w15_store_fails_closed_after_a_real_deferred_foreign_key_commit_rejection() {
+    let root = tempfile::tempdir().expect("TEST_CODE deferred foreign key root");
+    let database = root
+        .path()
+        .canonicalize()
+        .expect("TEST_CODE canonical root")
+        .join("readiness.sqlite3");
+    let catalog = MachineCatalog::bundled().expect("TEST_CODE catalog");
+    let namespace = context(100).namespace;
+    initialize_database(&database, &namespace).expect("TEST_CODE initialize");
+    let store = ReadinessRecordStore::at(&database, &namespace, &catalog);
+    let (assessment, evidence) = assessed(&ReadinessScope::Core, Some(DependencyKind::Schema));
+    let before = CandidateReadinessRecord::try_new(
+        None,
+        context(100),
+        assessment.clone(),
+        evidence.clone(),
+        vec![],
+    )
+    .expect("TEST_CODE first pending");
+    let first = store.append(None, &before).expect("TEST_CODE first commit");
+    let after = CandidateReadinessRecord::try_new(
+        Some(before.snapshot()),
+        context(200),
+        assessment,
+        evidence,
+        vec![],
+    )
+    .expect("TEST_CODE second pending");
+    let stream = ReadinessStreamId::for_snapshot(after.snapshot());
+
+    // The test-only checkpoint executes a valid INSERT whose deferred foreign
+    // key is unresolved. Reaching CommitUnconfirmed proves INSERT succeeded and
+    // SQLite rejected the real transaction COMMIT, not the statement itself.
+    assert_eq!(
+        store.append_with_fault(
+            Some(&first),
+            &after,
+            ReadinessAppendFault::DeferredForeignKeyCommitRejected,
+        ),
+        Err(ReadinessStoreError::CommitUnconfirmed)
+    );
+    assert_eq!(
+        store
+            .load_head(&stream)
+            .expect("TEST_CODE rejected commit preserves head"),
+        Some(first.clone())
+    );
+    assert_eq!(
+        store.load_record(after.snapshot().snapshot_id()),
+        Err(ReadinessStoreError::RecordMissing)
+    );
+    assert_eq!(
+        store
+            .load_record(before.snapshot().snapshot_id())
+            .expect("TEST_CODE rejected commit preserves history"),
+        first
+    );
+
+    let retried = store
+        .append(Some(&first), &after)
+        .expect("TEST_CODE explicit exact retry after unconfirmed commit");
+    assert_eq!(retried.version(), 2);
+    assert_eq!(retried.candidate(), &after);
+    assert_eq!(
+        store
+            .load_head(&stream)
+            .expect("TEST_CODE explicit retry becomes head"),
+        Some(retried)
+    );
+}
+
+#[test]
+fn w15_store_does_not_confirm_a_lost_commit_when_exact_recheck_is_corrupt() {
+    let root = tempfile::tempdir().expect("TEST_CODE corrupt recheck root");
+    let database = root
+        .path()
+        .canonicalize()
+        .expect("TEST_CODE canonical root")
+        .join("readiness.sqlite3");
+    let catalog = MachineCatalog::bundled().expect("TEST_CODE catalog");
+    let namespace = context(100).namespace;
+    initialize_database(&database, &namespace).expect("TEST_CODE initialize");
+    let store = ReadinessRecordStore::at(&database, &namespace, &catalog);
+    let (assessment, evidence) = assessed(&ReadinessScope::Core, Some(DependencyKind::Schema));
+    let candidate =
+        CandidateReadinessRecord::try_new(None, context(100), assessment, evidence, vec![])
+            .expect("TEST_CODE pending");
+    let protected_detail = "file:///TEST_CODE-secret/readiness.sqlite3?sql=SELECT-canonical_bytes";
+
+    let error = store
+        .append_with_lost_confirmation_hook(None, &candidate, || {
+            let connection = Connection::open(&database).expect("TEST_CODE corruption connection");
+            let trigger_sql: String = connection
+                .query_row(
+                    "SELECT sql FROM sqlite_master \
+                     WHERE type='trigger' \
+                       AND name='operational_readiness_snapshot_no_update'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("TEST_CODE preserve snapshot trigger");
+            connection
+                .execute_batch("DROP TRIGGER operational_readiness_snapshot_no_update;")
+                .expect("TEST_CODE disable snapshot update guard");
+            connection
+                .execute(
+                    "UPDATE operational_readiness_snapshot \
+                     SET canonical_bytes=?1 WHERE snapshot_id=?2",
+                    params![
+                        protected_detail.as_bytes(),
+                        candidate.snapshot().snapshot_id().as_str()
+                    ],
+                )
+                .expect("TEST_CODE corrupt exact committed snapshot");
+            connection
+                .execute_batch(&trigger_sql)
+                .expect("TEST_CODE restore exact snapshot trigger");
+        })
+        .expect_err("TEST_CODE corrupt exact recheck cannot confirm commit");
+
+    assert_eq!(error, ReadinessStoreError::CommitUnconfirmed);
+    let display = format!("{error}");
+    let debug = format!("{error:?}");
+    assert!(display.contains("unconfirmed"));
+    assert!(debug.contains("CommitUnconfirmed"));
+    for rendered in [display, debug] {
+        assert!(!rendered.contains(protected_detail));
+        assert!(!rendered.contains("SELECT"));
+        assert!(!rendered.contains("canonical_bytes"));
+    }
+}
+
+#[test]
+fn w15_store_does_not_confirm_a_lost_commit_when_exact_recheck_fails() {
+    let root = tempfile::tempdir().expect("TEST_CODE failed recheck root");
+    let database = root
+        .path()
+        .canonicalize()
+        .expect("TEST_CODE canonical root")
+        .join("readiness.sqlite3");
+    let unavailable = root.path().join("TEST_CODE-hidden-readiness.sqlite3");
+    let catalog = MachineCatalog::bundled().expect("TEST_CODE catalog");
+    let namespace = context(100).namespace;
+    initialize_database(&database, &namespace).expect("TEST_CODE initialize");
+    let store = ReadinessRecordStore::at(&database, &namespace, &catalog);
+    let (assessment, evidence) = assessed(&ReadinessScope::Core, Some(DependencyKind::Schema));
+    let candidate =
+        CandidateReadinessRecord::try_new(None, context(100), assessment, evidence, vec![])
+            .expect("TEST_CODE pending");
+
+    let error = store
+        .append_with_lost_confirmation_hook(None, &candidate, || {
+            std::fs::rename(&database, &unavailable)
+                .expect("TEST_CODE hide committed database before exact recheck");
+        })
+        .expect_err("TEST_CODE failed exact recheck cannot confirm commit");
+    assert_eq!(error, ReadinessStoreError::CommitUnconfirmed);
+
+    std::fs::rename(&unavailable, &database).expect("TEST_CODE restore committed database");
+    assert_eq!(
+        store
+            .load_record(candidate.snapshot().snapshot_id())
+            .expect("TEST_CODE committed fact remains after recheck failure")
+            .candidate(),
+        &candidate
+    );
+}
+
+#[test]
 fn w15_store_reopens_an_explicit_producer_recovery_with_both_ends_intact() {
     let root = tempfile::tempdir().expect("TEST_CODE recovery store root");
     let database = root
@@ -529,9 +769,10 @@ fn w15_store_concurrent_successors_cannot_both_commit_the_same_head_version() {
             matches!(
                 error,
                 ReadinessStoreError::HeadConflict
+                    | ReadinessStoreError::CommitUnconfirmed
                     | ReadinessStoreError::Schema(
                         ReadinessSchemaError::ConnectionSafeguardFailed {
-                            check: "begin_write_transaction" | "commit_transaction"
+                            check: "begin_write_transaction"
                         }
                     )
                     | ReadinessStoreError::Schema(ReadinessSchemaError::ValidationFailed {

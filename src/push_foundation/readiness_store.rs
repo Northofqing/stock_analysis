@@ -91,6 +91,8 @@ pub(crate) enum ReadinessStoreError {
     Corrupt { check: &'static str },
     #[error("readiness storage operation failed: {operation}")]
     Storage { operation: &'static str },
+    #[error("readiness append commit outcome is unconfirmed")]
+    CommitUnconfirmed,
 }
 
 /// Explicit borrowed configuration; construction performs no I/O or initialization.
@@ -106,6 +108,8 @@ pub(super) enum ReadinessAppendFault {
     Event,
     Snapshot,
     Head,
+    CommitConfirmationLost,
+    DeferredForeignKeyCommitRejected,
 }
 
 impl<'a> ReadinessRecordStore<'a> {
@@ -154,7 +158,7 @@ impl<'a> ReadinessRecordStore<'a> {
         expected: Option<&StoredReadinessRecord>,
         candidate: &CandidateReadinessRecord,
     ) -> Result<StoredReadinessRecord, ReadinessStoreError> {
-        self.append_inner(expected, candidate, |_| Ok(()))
+        self.append_inner(expected, candidate, |_, _| Ok(()), || Ok(()))
     }
 
     #[cfg(test)]
@@ -164,21 +168,72 @@ impl<'a> ReadinessRecordStore<'a> {
         candidate: &CandidateReadinessRecord,
         fault: ReadinessAppendFault,
     ) -> Result<StoredReadinessRecord, ReadinessStoreError> {
-        self.append_inner(expected, candidate, |boundary| {
-            if boundary == fault {
-                Err(storage("injected_before_commit"))
-            } else {
-                Ok(())
-            }
-        })
+        self.append_inner(
+            expected,
+            candidate,
+            |connection, boundary| {
+                if fault == ReadinessAppendFault::DeferredForeignKeyCommitRejected
+                    && boundary == ReadinessAppendFault::Head
+                {
+                    let inserted = connection
+                        .execute(
+                            "INSERT INTO operational_readiness_snapshot(snapshot_id,event_id,canonical_bytes) VALUES(?1,?2,?3)",
+                            params![
+                                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                                "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                                b"TEST_CODE deferred foreign key".as_slice(),
+                            ],
+                        )
+                        .map_err(|_| storage("inject_deferred_foreign_key"))?;
+                    if inserted != 1 {
+                        return Err(storage("inject_deferred_foreign_key"));
+                    }
+                    Ok(())
+                } else if boundary == fault {
+                    Err(storage("injected_before_commit"))
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                if fault == ReadinessAppendFault::CommitConfirmationLost {
+                    Err(commit_transaction_error())
+                } else {
+                    Ok(())
+                }
+            },
+        )
     }
 
-    fn append_inner(
+    #[cfg(test)]
+    pub(super) fn append_with_lost_confirmation_hook(
         &self,
         expected: Option<&StoredReadinessRecord>,
         candidate: &CandidateReadinessRecord,
-        mut checkpoint: impl FnMut(ReadinessAppendFault) -> Result<(), ReadinessStoreError>,
+        after_commit: impl FnOnce(),
     ) -> Result<StoredReadinessRecord, ReadinessStoreError> {
+        self.append_inner(
+            expected,
+            candidate,
+            |_, _| Ok(()),
+            || {
+                after_commit();
+                Err(commit_transaction_error())
+            },
+        )
+    }
+
+    fn append_inner<F, G>(
+        &self,
+        expected: Option<&StoredReadinessRecord>,
+        candidate: &CandidateReadinessRecord,
+        mut checkpoint: F,
+        after_commit: G,
+    ) -> Result<StoredReadinessRecord, ReadinessStoreError>
+    where
+        F: FnMut(&Connection, ReadinessAppendFault) -> Result<(), ReadinessStoreError>,
+        G: FnOnce() -> Result<(), ReadinessStoreError>,
+    {
         let snapshot = candidate.snapshot();
         if &snapshot.context().namespace != self.namespace {
             return Err(ReadinessStoreError::NamespaceMismatch);
@@ -190,7 +245,7 @@ impl<'a> ReadinessRecordStore<'a> {
             &snapshot.canonical_bytes(),
         )?;
         let stream = ReadinessStreamId::for_snapshot(snapshot);
-        with_write_transaction(self.path, self.namespace, |connection| {
+        let mut outcome = with_write_transaction(self.path, self.namespace, |connection| {
             let chain = self.head_chain(connection, &stream)?.unwrap_or_default();
             if let Some(previous_commit) = chain
                 .iter()
@@ -227,12 +282,12 @@ impl<'a> ReadinessRecordStore<'a> {
                 "INSERT INTO operational_readiness_recovery_event(event_id,event_sha256,before_snapshot_id,after_snapshot_id,canonical_bytes) VALUES(?1,?2,?3,?4,?5)",
                 params![snapshot.recovery_event_id().as_str(), candidate.event_sha256().as_str(), candidate.before_snapshot_id().map(|id| id.as_str()), snapshot.snapshot_id().as_str(), candidate.event_bytes()],
             ).map_err(|_| storage("insert_event"))?;
-            checkpoint(ReadinessAppendFault::Event)?;
+            checkpoint(connection, ReadinessAppendFault::Event)?;
             connection.execute(
                 "INSERT INTO operational_readiness_snapshot(snapshot_id,event_id,canonical_bytes) VALUES(?1,?2,?3)",
                 params![snapshot.snapshot_id().as_str(), snapshot.recovery_event_id().as_str(), snapshot.canonical_bytes()],
             ).map_err(|_| storage("insert_snapshot"))?;
-            checkpoint(ReadinessAppendFault::Snapshot)?;
+            checkpoint(connection, ReadinessAppendFault::Snapshot)?;
             let changed = if let Some(current) = current {
                 connection.execute(
                     "UPDATE operational_readiness_head SET version=?1,snapshot_id=?2,event_id=?3 WHERE scope_key=?4 AND version=?5 AND snapshot_id=?6 AND event_id=?7",
@@ -247,11 +302,33 @@ impl<'a> ReadinessRecordStore<'a> {
             if changed != 1 {
                 return Err(ReadinessStoreError::HeadConflict);
             }
-            checkpoint(ReadinessAppendFault::Head)?;
+            checkpoint(connection, ReadinessAppendFault::Head)?;
             self.head_chain(connection, &stream)?
                 .and_then(|chain| chain.last().cloned())
                 .ok_or(corrupt("head_after_append"))
-        })
+        });
+        if outcome.is_ok() {
+            if let Err(error) = after_commit() {
+                outcome = Err(error);
+            }
+        }
+        self.resolve_commit_confirmation(candidate, outcome)
+    }
+
+    fn resolve_commit_confirmation(
+        &self,
+        candidate: &CandidateReadinessRecord,
+        outcome: Result<StoredReadinessRecord, ReadinessStoreError>,
+    ) -> Result<StoredReadinessRecord, ReadinessStoreError> {
+        match outcome {
+            Err(ReadinessStoreError::Schema(ReadinessSchemaError::ConnectionSafeguardFailed {
+                check: "commit_transaction",
+            })) => match self.load_record(candidate.snapshot().snapshot_id()) {
+                Ok(committed) if committed.candidate() == candidate => Ok(committed),
+                _ => Err(ReadinessStoreError::CommitUnconfirmed),
+            },
+            other => other,
+        }
     }
 
     fn head_chain(
@@ -354,6 +431,11 @@ fn corrupt(check: &'static str) -> ReadinessStoreError {
 }
 fn storage(operation: &'static str) -> ReadinessStoreError {
     ReadinessStoreError::Storage { operation }
+}
+fn commit_transaction_error() -> ReadinessStoreError {
+    ReadinessStoreError::Schema(ReadinessSchemaError::ConnectionSafeguardFailed {
+        check: "commit_transaction",
+    })
 }
 fn string(value: &str) -> CanonicalValue {
     CanonicalValue::String(value.to_owned())
