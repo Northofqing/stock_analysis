@@ -3,6 +3,7 @@
 mod business_finalizer;
 mod intent_store;
 mod migration;
+mod reconciler;
 mod terminal_authority;
 
 pub use intent_store::{
@@ -17,6 +18,8 @@ pub use terminal_authority::TerminalTemplateBinding;
 
 #[cfg(test)]
 mod business_finalizer_tests;
+#[cfg(test)]
+mod reconciler_tests;
 #[cfg(test)]
 mod terminal_authority_tests;
 #[cfg(test)]
