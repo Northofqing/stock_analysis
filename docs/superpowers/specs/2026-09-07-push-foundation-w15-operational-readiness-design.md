@@ -78,6 +78,8 @@ catalog + 当前注册/部署合同 + 已核验的依赖证据
 
 声明由显式 typed 注册提供，不能从 W06 自然语言解析。暂不适用的依赖也必须有带版本和依据的明确 NotRequired 声明，不能通过漏掉角色来得到 Ready。Core/Producer 的 required 角色闭集由 evaluator 检查。
 
+候选合同补齐裁决：依赖声明显式保存 expected_authority 与 Required/NotRequired 用途；NotRequired 的声明与观察都绑定同一 basis SHA、source ID/version，且只能由 AuthorityArtifact 类别支持，不能拿一次采集审计推断不适用。用途或依据错配失败关闭，所有观察的实际 evidence kind 都须匹配预期类别。新增语义采用 OperationalReadinessSnapshot/v2 与 schema_version=2，旧候选 v1 明确拒绝，不默认补 authority 或自动迁移。当前 W15 没有生产接线，该升级不修改 operational SQLite schema、recovery event v1 或冻结 W07。此规则仍仅约束候选，最终真实 reader 必须校验版本化声明的实际来源和依据。
+
 启用 producer 集合只描述待评估范围，不是 activation 授权。它必须是 W06 已知 producer 的去重集合；受影响 Unit/producer 集合由 evaluator 推导，不信任调用方手填。无 producer 的 Inactive 元数据不创建执行项；Starved/OptIn 的原批准边界保留，评估不能自动启用它们。
 
 ## 5. 判级与退出
@@ -105,6 +107,8 @@ Snapshot 实现 RFC 全部字段；canonical hash 使用已有 `CanonicalValue`/
 实际 reader 接线裁决：现有 BR-159 acquisition audit 只能证明完整持久原始事实；其记录缺 namespace、authority business_date、SourceContractId/version 和 W15 scope/部署上下文，`schema_version=1` 不能代替合同版本，按 capability+provider 派生的 previous_outcome 也不能独立证明特定 scope 恢复。先在 database 模块复用现有全链/receipt 算法，接受显式现有连接、同一 DEFERRED 事务返回私有构造的原始审计事实，不接受调用者自称的 expected observation，不通过全局 DatabaseManager 初始化取得连接。此入口没有 opener 或来源身份认证；最终必须由受信 source descriptor 与 typed 版本化解释将原始 outcome/时间等绑定到 W15，不能把 receipt SHA 或任意 URI 文件当来源证明。`verified_empty` 保留原义，不直接推导依赖不可用或业务 NoData 完成。
 
 KnownOccurrence 后续从真实持久 intent 与 transition chain 的同一只读快照取得，再与 catalog 的 producer/Unit/family/owner 精确关联；须包含 Ready、NoData、Disabled 等合法持久 intent，不用仅支持 Ready 的 binding 接口或 RunContext 派生 ID 替代存在性。其余 Core/Producer 角色及版本化 NotRequired 仍需真实 typed 注册/部署 authority，不用 terminal accepted 或 schema receipt 兜底认证。
+
+该读取入口拥有自己的只读事务与连接，不接受外层未提交连接；复用 operational 的 rollback-only 锁/文件头/事务内核，但分别校验自身 schema。Foundation schema 除 registry/sqlite_master 自洽外，还必须与已核 SHA 的内嵌冻结 DDL 在内存产生的 25 个定义精确一致；真实库不执行 DDL/迁移。持久 intent 没有 producer 字段，因此返回的 producer 只能证明所选 catalog 关系吻合，不能宣称它是原始写入者；同样不能以显式路径代替部署/source version 注册。该事实对象仍须在上层与受信 source descriptor 精确绑定才成为 KnownOccurrence authority。
 
 首次记录追加 ReadyObserved 或 Pending 事件；恢复须有显式且经认证的 capability/version 变化，重新评估通过后追加对应 CoreDependenciesRestored / ProducerContractRestored / InputEvidenceRestored。只有时间流逝、重复 tick、空 Vec 或未经验证的日志变化不构成恢复。
 

@@ -37,7 +37,7 @@ codec 原审查的两项测试缺口均已修复：错来源/错版本及合法 
 
 | 任务 | 当前缺口 | 完成证据要求 |
 | --- | --- | --- |
-| Task 2 | 预期 authority、版本化 NotRequired、已知 occurrence 真实性 | 实际 reader 校验与失败反例，不接受自由 bool |
+| Task 2 | expected authority、版本化 NotRequired 和 v2 候选已通过限定审查；持久 occurrence reader 已验收，但仍缺 source/deployment 绑定 | 实际 reader 校验与失败反例，不接受自由 bool；不能以候选或显式路径替代来源认证 |
 | Task 3 | 候选 recovery/event codec、schema/open 与候选 store 均已通过限定范围独立评审及补强；真实来源认证与认证恢复仍缺 | 完成实际 evidence reader 与提交后认证重查才能发布权威快照；明确底层提交确认异常的处理，不以成功回复被丢弃替代全部 I/O 故障验收 |
 | Task 4 | 当前只有纯计数，不是实际 probe | 同一已验证快照的 health/readiness/CLI；只读零副作用与损坏拒绝 |
 | Task 5 | 只读接口审计完成，代码联结未完成 | 身份/版本/恢复来源精确绑定，输入阻断与有效窗口内恢复，过期/终态不重开 |
@@ -138,3 +138,31 @@ schema 第一轮修复后 session 99470 W15 47/47，71160 Foundation 150/150；�
 用户要求继续提速后，按 subagent-driven-development 的任务边界让独立审查与统一验证交叠，复用未变化代码的有效证据，并集中更新同批文档；不通过重复开 agent、并发争抢 Cargo 或删减真实验收来声称提速。完整 W01--W21/52 Unit 目标不变，生产 monitor 与真实业务库仍未操作。
 
 Task3E 独立审查保留一项非阻塞清理建议：仅测试调用的错误构造 helper 和两个私有 fault 变体尚未加条件编译，但实际注入入口已为 cfg(test)，不存在生产可调用故障口。记录为下次修改该文件时顺带清理，不为此重开已通过的事务行为审查；43/163 项既有告警背景继续如实保留。
+
+## 10. 显式依赖合同与持久 occurrence（2026-09-08）
+
+本节更新 §9 的历史剩余清单，不修改其历史测试结论。两条实现按独立文件并行，统一验证：
+
+- `595f605`：声明新增预期 authority 和 Required/NotRequired；不适用声明与观察精确绑定依据、source ID 和版本，只允许 AuthorityArtifact 支持。不允许用同 SHA 的错误证据类别替代。候选格式升级为 v2，严格拒绝旧 v1、缺字段及重算 hash 后的派生状态漂移；不修改 operational schema、recovery event v1 或冻结 W07。限定独立 Spec/quality Approved，无 Critical/Important。
+- `ac8a28b`：通过自有只读事务读取真实 intent 和完整转换链，复用 bundled catalog 验证 Unit/family/owner，支持 Ready、NoData、Disabled。schema 与实际内嵌冻结 DDL 的 25 对象定义逐字节比较，参考仅在内存生成。8 条真实 SQLite 测试覆盖错绑、未持久身份、中段损坏、自洽但非内嵌 schema、缺文件和 WAL；独立 Spec/quality Approved，无 Critical/Important。
+- `cargo test --lib push_foundation:: -- --test-threads=1`，session10760，exit0：**182 passed/0 failed/1 helper ignored**，19.21s，编译2m21s；helper由父测试显式调用。全部新反例与原共享 schema/锁/hot-journal/store 回归通过。lib-test 仍有43项既有warnings。
+- `cargo clippy --lib --message-format=json`，session43386，exit0、1m21s；完整制品诊断核对163项有位置既有warnings，Foundation/采集审计目标零诊断。定向 rustfmt 与 `git diff --check` 通过；相对4ce4a4f，monitor/notification/config/Cargo/冻结DDL无改动。
+
+本批 TDD 区分实际失败：63225/20721 为缺模块/字段的编译期 RED；72590/13330 的 occurrence 测试拒绝于 DatabaseOpenFailed，修复测试临时目录为 canonical 路径，没有放宽生产 NOFOLLOW 规则。13330 的 v2 domain 是另一条实际运行期 RED；64739 为71/0/1的首 tracer GREEN，而非本批完整门禁，最终结果以上述10760为准。
+
+持久 occurrence 没有 producer 列，结果中的 producer 只证明所选 catalog 关系吻合，不证明原始写入者。指定文件的持久完整性也不证明它属于当前 source version/build/generation。仍不能签发权威快照或 ReadyGate。
+
+审查的跨任务证据由主控核对：缺声明非就绪仍由 operational_readiness_tests.rs:464/:488 的实际断言覆盖并在10760通过；operational DDL原文未改，recovery生产文件与冻结W07相对4ce4a4f无差异，旧store/recovery测试通过。真实版本化来源/basis认证仍列为后续集成验收，不由Task3G冒充完成。两个reviewer的Minor均为已登记43/163既有告警背景，没有新增阻塞finding。
+
+## 11. 来源与部署的后续接线顺序
+
+下一段已开始 Task3H：在 database 模块给既有 BR159 完整链/receipt 验证增加 rusqlite 事务行加载适配器，与 Diesel reader 共用规则，不跨驱动重开路径。该适配器自身不打开文件、不改变事务生命周期，也不认证源 schema/注册；完整来源读取仍须外层安全 opener、实际 schema 与上下文绑定。
+
+接线设计核对发现两项必须解决的前置条件：
+
+1. `src/data_gateway/grpc_source.rs:1445` / `:1583` 的 opening 请求摘要没有采集时的 namespace、权威业务日或部署代。需要由实际采集流程产生绑定 audit ID/record hash 与这些上下文的不可变事实；不能向旧行倒填一个 descriptor 就称其已被认证。
+2. RFC 的 manifest/generation 是逐 Unit，而当前 W15 context 只有一份 manifest/generation。全局 Core 不能取最大代、任选 Unit 或缩为单 Unit。该集合合同须在 W16 衔接时明确实现并验证，当前尚未解决。
+
+因此接下来的顺序是：共享 reader 与真实闭集合同注册 → W16 的实际部署/批准/manifest/journal/owner 读取验证基础 → 来源 context 绑定与 W15 认证存储/恢复 → 同快照 probe 和 W11/W14 联结。W16 读取基础不以 W15 Ready 为前提，执行阶段再重验 fence，避免相互等待。仅有路径、approved_by 字符串或合法 hash 不替代真实认证。
+
+完整目标仍为 W01--W21、52个迁移单元及真实发布门禁。W15整体、W16--W21、逐Unit迁移与上线验收均未完成；本批未启动、观察或替换生产monitor。
