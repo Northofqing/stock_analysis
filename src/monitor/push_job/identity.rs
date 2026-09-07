@@ -238,6 +238,38 @@ impl ScheduleOccurrenceIdentityMaterial {
             source_contract_id,
         }
     }
+
+    pub fn namespace(&self) -> &Namespace {
+        &self.namespace
+    }
+
+    pub fn unit_id(&self) -> &UnitId {
+        &self.unit_id
+    }
+
+    pub fn producer_id(&self) -> &ProducerId {
+        &self.producer_id
+    }
+
+    pub fn schedule_or_trigger_id(&self) -> &ScheduleOrTriggerId {
+        &self.schedule_or_trigger_id
+    }
+
+    pub fn calendar_id(&self) -> &CalendarId {
+        &self.calendar_id
+    }
+
+    pub fn occurrence(&self) -> &OccurrenceIdentityMaterial {
+        &self.occurrence
+    }
+
+    pub fn completion_owner(&self) -> &CompletionOwnerId {
+        &self.completion_owner
+    }
+
+    pub fn source_contract_id(&self) -> &SourceContractId {
+        &self.source_contract_id
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
