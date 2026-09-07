@@ -1,6 +1,6 @@
 # 推送 Foundation W11 Reconciler、Lease/Fence 与启动恢复设计
 
-**状态：** 已依据 WBS、RFC、蓝图和 W08--W10 实现边界冻结，待 tracer-bullet TDD、双轴评审与 fresh 门禁。
+**状态：** 已实现并通过 tracer-bullet TDD、双轴评审与 fresh 门禁；保持零生产接线。
 
 **决策日期：** 2026-09-07
 
@@ -78,7 +78,7 @@ RecoveryBindingsPort
 
 claim 仍是同库一个事务内的 same-state CAS + append，reason=`intent.dispatch_claimed`，lease action=`Acquire`。SQL 的 `WHERE` 除 intent/state/version/generation 外继续匹配旧 owner/until；竞争者获胜时返回 current 并重新分类，不能拿旧 snapshot 生成 fence。
 
-新 `RecoveryFence` 是不可 Clone 的本轮能力，绑定 intent ID、owner、generation、until 和 claim 后 version。W11 只把它传给 W10 或受控 store 方法，不公开 raw SQL，也不把 lease 到期解释为发送许可。
+实现没有再造第二套 lease 类型：W11 从已验真的当前 snapshot 读取 intent ID、owner、generation、until 和 version，按值构造 W10 的 crate-private `FinalizerFence`，或把同一组精确材料交给受控 store 方法。所有写入仍在事务临界区复核完整 fence；模块不公开 raw SQL，也不把 lease 到期解释为发送许可。
 
 ## 5. 各状态恢复规则
 

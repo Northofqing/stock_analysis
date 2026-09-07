@@ -1,5 +1,7 @@
 # Push Foundation W11 实施计划
 
+**状态：** 已完成。代码、评审修复与 fresh 验证结果见 `docs/push-system/implementation-w11-results-2026-09-07.md`。
+
 **目标：** 以 tracer-bullet TDD 实现全业务日 startup reconciler、exact lease/fence 接管、W09/W10 强终态恢复和 Uncertain 零重发隔离；保持零生产接线。
 
 ## Task 1：冻结设计与恢复边界
