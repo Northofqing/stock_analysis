@@ -6,8 +6,9 @@ use crate::monitor::push_job::{
 
 use super::phase_scheduler::{
     CatchUpPolicy, MarketObservation, PhaseSchedule, PhaseScheduler, PhaseSchedulerError,
-    ScheduleStep, ScheduleWindow, WindowPosition,
+    ScheduleStatus, ScheduleStep, ScheduleWindow, WindowPosition,
 };
+use super::reconciler::w14_recovery_barrier_fixture;
 
 const WINDOW_START: i64 = 1_788_739_200_000_000;
 const WINDOW_END: i64 = 1_788_740_100_000_000;
@@ -207,5 +208,121 @@ fn w14_recover_persisted_only_never_creates_new_work() {
         ScheduleStep::RecoveryOnly {
             occurrence_id: schedule.occurrence_id().clone(),
         }
+    );
+}
+
+#[test]
+fn w14_new_occurrence_is_created_expected_then_proposed_eligible() {
+    let schedule = schedule(CatchUpPolicy::SameBusinessDayBeforeDeadline);
+    let observation = MarketObservation::trading_day(
+        BusinessDate::parse("2026-09-07").expect("TEST_CODE valid date"),
+        micros(WINDOW_START),
+    );
+
+    let created = match PhaseScheduler::tick(&schedule, None, &observation)
+        .expect("TEST_CODE create Expected")
+    {
+        ScheduleStep::CreateExpected(snapshot) => snapshot,
+        other => panic!("TEST_CODE expected creation, got {other:?}"),
+    };
+    assert_eq!(created.occurrence_id(), schedule.occurrence_id());
+    assert_eq!(created.business_date().as_str(), "2026-09-07");
+    assert_eq!(created.status(), ScheduleStatus::Expected);
+    assert_eq!(created.version(), 0);
+    assert_eq!(
+        created.reason(),
+        crate::monitor::push_job::ReasonCode::ScheduleWindowOpen
+    );
+    assert_eq!(created.created_at(), micros(WINDOW_START));
+    assert_eq!(created.updated_at(), micros(WINDOW_START));
+
+    let proposal = match PhaseScheduler::tick(&schedule, Some(&created), &observation)
+        .expect("TEST_CODE propose eligibility")
+    {
+        ScheduleStep::TransitionProposal(proposal) => proposal,
+        other => panic!("TEST_CODE expected transition, got {other:?}"),
+    };
+    assert_eq!(proposal.occurrence_id(), schedule.occurrence_id());
+    assert_eq!(proposal.from_status(), ScheduleStatus::Expected);
+    assert_eq!(proposal.to_status(), ScheduleStatus::Eligible);
+    assert_eq!(proposal.expected_version(), 0);
+    assert_eq!(proposal.result_version(), 1);
+    assert_eq!(
+        proposal.reason(),
+        crate::monitor::push_job::ReasonCode::ScheduleWindowOpen
+    );
+    assert_eq!(proposal.observed_at(), micros(WINDOW_START));
+}
+
+#[test]
+fn w14_normal_tick_and_startup_catch_up_are_exactly_replayable() {
+    let schedule = schedule(CatchUpPolicy::SameBusinessDayBeforeDeadline);
+    let observation = MarketObservation::trading_day(
+        BusinessDate::parse("2026-09-07").expect("TEST_CODE valid date"),
+        micros(WINDOW_START + 1),
+    );
+    let barrier = w14_recovery_barrier_fixture();
+
+    let normal_create =
+        PhaseScheduler::tick(&schedule, None, &observation).expect("TEST_CODE normal creation");
+    let catch_up_create = PhaseScheduler::startup_catch_up(&barrier, &schedule, None, &observation)
+        .expect("TEST_CODE catch-up creation");
+    assert_eq!(normal_create, catch_up_create);
+
+    let created = match normal_create {
+        ScheduleStep::CreateExpected(snapshot) => snapshot,
+        other => panic!("TEST_CODE expected creation, got {other:?}"),
+    };
+    let normal_transition = PhaseScheduler::tick(&schedule, Some(&created), &observation)
+        .expect("TEST_CODE normal transition");
+    let catch_up_transition =
+        PhaseScheduler::startup_catch_up(&barrier, &schedule, Some(&created), &observation)
+            .expect("TEST_CODE catch-up transition");
+    assert_eq!(normal_transition, catch_up_transition);
+    assert!(matches!(
+        normal_transition,
+        ScheduleStep::TransitionProposal(_)
+    ));
+}
+
+#[test]
+fn w14_late_catch_up_keeps_original_business_date_and_rejects_date_drift() {
+    let schedule = schedule(CatchUpPolicy::SameBusinessDayBeforeDeadline);
+    let initial = MarketObservation::trading_day(
+        BusinessDate::parse("2026-09-07").expect("TEST_CODE valid original date"),
+        micros(WINDOW_START),
+    );
+    let created = match PhaseScheduler::tick(&schedule, None, &initial)
+        .expect("TEST_CODE create original occurrence")
+    {
+        ScheduleStep::CreateExpected(snapshot) => snapshot,
+        other => panic!("TEST_CODE expected creation, got {other:?}"),
+    };
+    let barrier = w14_recovery_barrier_fixture();
+    let late = MarketObservation::trading_day(
+        BusinessDate::parse("2026-09-07").expect("TEST_CODE original business date"),
+        micros(WINDOW_END + 86_400_000_000),
+    );
+
+    let first = PhaseScheduler::startup_catch_up(&barrier, &schedule, Some(&created), &late)
+        .expect("TEST_CODE late catch-up");
+    let replay = PhaseScheduler::startup_catch_up(&barrier, &schedule, Some(&created), &late)
+        .expect("TEST_CODE deterministic replay");
+    assert_eq!(first, replay);
+    let proposal = match first {
+        ScheduleStep::TransitionProposal(proposal) => proposal,
+        other => panic!("TEST_CODE expected Missed proposal, got {other:?}"),
+    };
+    assert_eq!(proposal.occurrence_id(), schedule.occurrence_id());
+    assert_eq!(proposal.to_status(), ScheduleStatus::Missed);
+    assert_eq!(created.business_date().as_str(), "2026-09-07");
+
+    let drifted = MarketObservation::trading_day(
+        BusinessDate::parse("2026-09-08").expect("TEST_CODE different business date"),
+        micros(WINDOW_END + 86_400_000_000),
+    );
+    assert_eq!(
+        PhaseScheduler::startup_catch_up(&barrier, &schedule, Some(&created), &drifted),
+        Err(PhaseSchedulerError::BusinessDateMismatch)
     );
 }
