@@ -8142,6 +8142,118 @@ fn w12_terminal_read_model_fails_closed_on_corrupt_disposition_join() {
         .is_err());
 }
 
+fn w12_accepted_terminal_fixture(label: &str) -> (Fixture, DeliveryEnvelope) {
+    let fixture = Fixture::new(label);
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope(label);
+    prepare_reserved(&fixture, &candidate, &append);
+    let sink = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(now())));
+    let sinks: Vec<AuthoritativeSink> = vec![sink];
+    fixture
+        .coordinator
+        .resume_deliverable(&candidate.decision_identity, &sinks, now())
+        .expect("record W12 accepted result before corruption");
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::Delivered,
+        &candidate.decision_identity,
+    );
+    let terminal = w12_terminal_record(&fixture, &candidate.decision_identity);
+    assert_eq!(
+        terminal.disposition(),
+        FoundationTerminalDisposition::Accepted
+    );
+    (fixture, candidate)
+}
+
+#[test]
+fn w12_terminal_read_model_fails_closed_on_every_authority_join_corruption() {
+    let (envelope_fixture, envelope) = w12_accepted_terminal_fixture("W12_CORRUPT_ENVELOPE");
+    {
+        let connection = Connection::open(&envelope_fixture.database_path)
+            .expect("open envelope corruption connection");
+        connection
+            .execute_batch("DROP TRIGGER immutable_decision_envelope_update;")
+            .expect("drop TEST_CODE immutable envelope trigger");
+        connection
+            .execute(
+                "UPDATE delivery_decisions SET envelope_sha256=?1 WHERE decision_identity=?2",
+                params![
+                    sha256_hex(b"TEST_CODE_W12_CORRUPT_ENVELOPE"),
+                    envelope.decision_identity
+                ],
+            )
+            .expect("inject TEST_CODE envelope corruption");
+    }
+    assert!(envelope_fixture
+        .coordinator
+        .inspect_foundation_terminal(&envelope.decision_identity)
+        .is_err());
+
+    let (result_fixture, result) = w12_accepted_terminal_fixture("W12_CORRUPT_RESULT");
+    {
+        let connection = Connection::open(&result_fixture.database_path)
+            .expect("open result corruption connection");
+        connection
+            .execute_batch("DROP TRIGGER immutable_sink_result_update;")
+            .expect("drop TEST_CODE immutable result trigger");
+        connection
+            .execute(
+                "UPDATE sink_results SET result_sha256=?1 WHERE decision_identity=?2",
+                params![
+                    sha256_hex(b"TEST_CODE_W12_CORRUPT_RESULT"),
+                    result.decision_identity
+                ],
+            )
+            .expect("inject TEST_CODE result corruption");
+    }
+    assert!(result_fixture
+        .coordinator
+        .inspect_foundation_terminal(&result.decision_identity)
+        .is_err());
+
+    let (audit_fixture, audit) = w12_accepted_terminal_fixture("W12_CORRUPT_AUDIT");
+    {
+        let connection = Connection::open(&audit_fixture.database_path)
+            .expect("open audit corruption connection");
+        connection
+            .execute_batch("DROP TRIGGER immutable_sink_result_update;")
+            .expect("drop TEST_CODE immutable audit trigger");
+        connection
+            .execute(
+                "UPDATE sink_results SET frozen_delivery_audit_sha256=?1 \
+                 WHERE decision_identity=?2",
+                params![
+                    sha256_hex(b"TEST_CODE_W12_CORRUPT_AUDIT"),
+                    audit.decision_identity
+                ],
+            )
+            .expect("inject TEST_CODE delivery audit corruption");
+    }
+    assert!(audit_fixture
+        .coordinator
+        .inspect_foundation_terminal(&audit.decision_identity)
+        .is_err());
+
+    let (attempt_fixture, attempt) = w12_accepted_terminal_fixture("W12_CORRUPT_ATTEMPT");
+    {
+        let connection = Connection::open(&attempt_fixture.database_path)
+            .expect("open attempt corruption connection");
+        connection
+            .execute(
+                "UPDATE delivery_attempts SET fence_token=fence_token+1000 \
+                 WHERE decision_identity=?1",
+                params![attempt.decision_identity],
+            )
+            .expect("inject TEST_CODE attempt/fence corruption");
+    }
+    assert!(attempt_fixture
+        .coordinator
+        .inspect_foundation_terminal(&attempt.decision_identity)
+        .is_err());
+}
+
 #[test]
 fn w12_terminal_read_model_rejects_accepted_receipt_for_wrong_required_channel() {
     let fixture = Fixture::new("W12_ACCEPTED_CHANNEL_MISMATCH");
