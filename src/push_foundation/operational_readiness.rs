@@ -100,12 +100,19 @@ pub(crate) enum DependencyObservation {
         version: SourceContractVersion,
         evidence_sha256: Sha256Digest,
     },
+    Unavailable {
+        kind: DependencyKind,
+        contract_id: SourceContractId,
+        version: SourceContractVersion,
+        evidence_sha256: Sha256Digest,
+        reason: ReasonCode,
+    },
 }
 
 impl DependencyObservation {
     pub(crate) fn kind(&self) -> DependencyKind {
         match self {
-            Self::Available { kind, .. } => *kind,
+            Self::Available { kind, .. } | Self::Unavailable { kind, .. } => *kind,
         }
     }
 
@@ -115,16 +122,54 @@ impl DependencyObservation {
                 contract_id,
                 version,
                 ..
+            }
+            | Self::Unavailable {
+                contract_id,
+                version,
+                ..
             } => {
                 if contract_id != &requirement.contract_id {
                     Some(DependencyFailure::ContractMismatch)
                 } else if version != &requirement.version {
                     Some(DependencyFailure::VersionMismatch)
                 } else {
-                    None
+                    match self {
+                        Self::Available { .. } => None,
+                        Self::Unavailable { reason, .. } => {
+                            Some(DependencyFailure::Unavailable { reason: *reason })
+                        }
+                    }
                 }
             }
         }
+    }
+
+    fn validate(&self) -> Result<(), ReadinessError> {
+        if let Self::Unavailable { kind, reason, .. } = self {
+            if !matches!(
+                reason,
+                ReasonCode::InputSourceUnavailable
+                    | ReasonCode::InputSourceUnready
+                    | ReasonCode::InputEvidenceInvalid
+                    | ReasonCode::InputNoVerifiedBatch
+                    | ReasonCode::InputAccountSnapshotMissing
+                    | ReasonCode::InputNamespaceViolation
+                    | ReasonCode::ActivationCoreUnready
+                    | ReasonCode::ActivationProducerUnready
+                    | ReasonCode::ActivationManifestMismatch
+                    | ReasonCode::ActivationGenerationConflict
+                    | ReasonCode::ActivationOwnerConflict
+                    | ReasonCode::PolicyDisabled
+                    | ReasonCode::PolicyStarved
+                    | ReasonCode::PolicyOptInDisabled
+            ) {
+                return Err(ReadinessError::InvalidDependencySet {
+                    check: "invalid_unavailable_reason",
+                    kind: *kind,
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -134,6 +179,7 @@ pub(crate) enum DependencyFailure {
     MissingEvidence,
     ContractMismatch,
     VersionMismatch,
+    Unavailable { reason: ReasonCode },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -154,6 +200,7 @@ pub(crate) struct ReadinessAssessment {
     affected_unit_ids: Vec<UnitId>,
     affected_producer_ids: Vec<ProducerId>,
     failures: Vec<(DependencyKind, DependencyFailure)>,
+    observations: Vec<DependencyObservation>,
 }
 
 impl ReadinessAssessment {
@@ -184,6 +231,7 @@ impl ReadinessAssessment {
         }
         let mut evidence = BTreeMap::new();
         for observation in observations {
+            observation.validate()?;
             let kind = observation.kind();
             if !declarations.contains_key(&kind) {
                 return Err(ReadinessError::InvalidDependencySet {
@@ -238,6 +286,7 @@ impl ReadinessAssessment {
             affected_unit_ids,
             affected_producer_ids,
             failures,
+            observations: evidence.into_values().cloned().collect(),
         })
     }
 
@@ -291,6 +340,9 @@ impl ReadinessAssessment {
     }
     pub(crate) fn failures(&self) -> &[(DependencyKind, DependencyFailure)] {
         &self.failures
+    }
+    pub(crate) fn observations(&self) -> &[DependencyObservation] {
+        &self.observations
     }
 }
 

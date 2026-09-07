@@ -477,3 +477,70 @@ fn w15_assessment_is_replayable_under_dependency_and_producer_reordering() {
     .expect("TEST_CODE same logical observations");
     assert_eq!(original, reordered);
 }
+
+#[test]
+fn w15_explicit_unavailable_evidence_retains_failure_reason_without_becoming_no_data() {
+    let catalog = MachineCatalog::bundled().expect("TEST_CODE catalog");
+    let mut declared = producer_requirements();
+    let input = requirements(&[DependencyKind::OccurrenceInput]).remove(0);
+    declared.push(input.clone());
+    let mut observed = available(&declared);
+    observed.pop();
+    let failed = DependencyObservation::Unavailable {
+        kind: input.kind,
+        contract_id: input.contract_id.clone(),
+        version: input.version.clone(),
+        evidence_sha256: Sha256Digest::parse("TEST_CODE failed evidence", &"b".repeat(64))
+            .expect("TEST_CODE digest"),
+        reason: ReasonCode::InputSourceUnready,
+    };
+    observed.push(failed.clone());
+    let blocked = ReadinessAssessment::evaluate(
+        &catalog,
+        &occurrence_scope(),
+        &[producer("p01-scheduled")],
+        ReadinessStage::Running,
+        &declared,
+        &observed,
+    )
+    .expect("TEST_CODE explicit input failure");
+    assert_eq!(blocked.status(), ReadinessStatus::BlockedOnInput);
+    assert!(blocked.deployment_ready());
+    assert_eq!(
+        blocked.failures(),
+        &[(
+            DependencyKind::OccurrenceInput,
+            DependencyFailure::Unavailable {
+                reason: ReasonCode::InputSourceUnready
+            }
+        )]
+    );
+    assert!(blocked.observations().contains(&failed));
+
+    for reason in [ReasonCode::ActivationReady, ReasonCode::IntentNoData] {
+        let mut invalid = observed.clone();
+        invalid.pop();
+        invalid.push(DependencyObservation::Unavailable {
+            kind: input.kind,
+            contract_id: input.contract_id.clone(),
+            version: input.version.clone(),
+            evidence_sha256: Sha256Digest::parse("TEST_CODE invalid reason", &"c".repeat(64))
+                .expect("TEST_CODE digest"),
+            reason,
+        });
+        assert_eq!(
+            ReadinessAssessment::evaluate(
+                &catalog,
+                &occurrence_scope(),
+                &[producer("p01-scheduled")],
+                ReadinessStage::Running,
+                &declared,
+                &invalid,
+            ),
+            Err(ReadinessError::InvalidDependencySet {
+                check: "invalid_unavailable_reason",
+                kind: DependencyKind::OccurrenceInput
+            })
+        );
+    }
+}
