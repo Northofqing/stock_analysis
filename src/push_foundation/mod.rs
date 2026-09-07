@@ -12,6 +12,8 @@ mod readiness_recovery;
 mod readiness_recovery_codec;
 mod readiness_snapshot;
 mod readiness_snapshot_codec;
+mod readiness_sqlite_io;
+mod readiness_store;
 mod readiness_store_schema;
 mod reconciler;
 mod terminal_authority;
@@ -46,6 +48,8 @@ mod readiness_recovery_codec_tests;
 mod readiness_snapshot_tests;
 #[cfg(test)]
 mod readiness_snapshot_codec_tests;
+#[cfg(test)]
+mod readiness_store_tests;
 #[cfg(test)]
 mod readiness_store_schema_tests;
 #[cfg(test)]

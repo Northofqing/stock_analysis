@@ -4,22 +4,25 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+use rusqlite::{
+    params, Connection, DatabaseName, OpenFlags, OptionalExtension, Transaction,
+    TransactionBehavior,
+};
 use sha2::{Digest, Sha256};
 
 use crate::monitor::push_job::{canonical_digest, namespace_value, Namespace};
 
 use super::migration::validate_database_path;
+use super::readiness_sqlite_io::{lock_main_file_and_read_header, SQLITE_HEADER_LEN};
 
 const SCHEMA_VERSION: i64 = 1;
 const NAMESPACE_DOMAIN: &str = "OperationalReadinessNamespace/v1";
-const SQLITE_HEADER_LEN: usize = 100;
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 const SQLITE_WRITE_VERSION_OFFSET: usize = 18;
 const SQLITE_READ_VERSION_OFFSET: usize = 19;
@@ -145,7 +148,7 @@ pub(crate) fn initialize_database(
     path: &Path,
     namespace: &Namespace,
 ) -> Result<(), ReadinessSchemaError> {
-    initialize_database_inner(path, namespace, || {}, || {})
+    initialize_database_inner(path, namespace, || {}, || {}, || {}, || {})
 }
 
 #[cfg(test)]
@@ -157,7 +160,7 @@ pub(super) fn initialize_database_with_before_create_hook<F>(
 where
     F: FnOnce(),
 {
-    initialize_database_inner(path, namespace, before_create, || {})
+    initialize_database_inner(path, namespace, before_create, || {}, || {}, || {})
 }
 
 #[cfg(test)]
@@ -171,22 +174,49 @@ where
     F: FnOnce(),
     G: FnOnce(),
 {
-    initialize_database_inner(path, namespace, before_create, after_create)
+    initialize_database_inner(path, namespace, before_create, after_create, || {}, || {})
 }
 
-fn initialize_database_inner<F, G>(
+#[cfg(test)]
+pub(super) fn initialize_database_with_connection_open_hooks<F, G>(
     path: &Path,
     namespace: &Namespace,
-    before_create: F,
-    after_create: G,
+    before_connection_open: F,
+    after_connection_open: G,
 ) -> Result<(), ReadinessSchemaError>
 where
     F: FnOnce(),
     G: FnOnce(),
 {
+    initialize_database_inner(
+        path,
+        namespace,
+        || {},
+        || {},
+        before_connection_open,
+        after_connection_open,
+    )
+}
+
+fn initialize_database_inner<F, G, H, I>(
+    path: &Path,
+    namespace: &Namespace,
+    before_create: F,
+    after_create: G,
+    before_connection_open: H,
+    after_connection_open: I,
+) -> Result<(), ReadinessSchemaError>
+where
+    F: FnOnce(),
+    G: FnOnce(),
+    H: FnOnce(),
+    I: FnOnce(),
+{
     validate_path(path)?;
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() => return open_writer(path, namespace).map(drop),
+        Ok(metadata) if metadata.is_file() => {
+            return with_write_transaction(path, namespace, |_| Ok::<(), ReadinessSchemaError>(()))
+        }
         Ok(_) => {
             return Err(ReadinessSchemaError::InvalidDatabasePath {
                 check: "target_regular_file",
@@ -200,8 +230,9 @@ where
         }
     }
 
+    let image = build_database_image(namespace)?;
     before_create();
-    let owned_file = OpenOptions::new()
+    let mut owned_file = OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
@@ -212,87 +243,132 @@ where
     let owned_identity = owned_file_identity(&owned_file)?;
     after_create();
     verify_owned_target(path, owned_identity)?;
-    let mut connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )
-    .map_err(|_| ReadinessSchemaError::DatabaseOpenFailed)?;
+    before_connection_open();
+    owned_file
+        .write_all(&image)
+        .map_err(|_| ReadinessSchemaError::InitializationFailed {
+            check: "write_owned_image",
+        })?;
+    owned_file
+        .sync_all()
+        .map_err(|_| ReadinessSchemaError::InitializationFailed {
+            check: "sync_owned_image",
+        })?;
+    after_connection_open();
     verify_owned_target(path, owned_identity)?;
-    enable_and_verify_foreign_keys(&connection)?;
-    require_empty_database(&connection)?;
-
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|_| ReadinessSchemaError::InitializationFailed {
-            check: "begin_transaction",
-        })?;
-    transaction
-        .execute_batch(DDL)
-        .map_err(|_| ReadinessSchemaError::InitializationFailed {
-            check: "create_schema",
-        })?;
-    transaction
-        .execute(
-            "INSERT INTO operational_readiness_schema(\
-                 singleton,schema_version,ddl_sha256,namespace_sha256\
-             ) VALUES(1,?1,?2,?3)",
-            params![SCHEMA_VERSION, ddl_sha256(), namespace_sha256(namespace)],
-        )
-        .map_err(|_| ReadinessSchemaError::InitializationFailed {
-            check: "write_schema_header",
-        })?;
-    transaction
-        .commit()
-        .map_err(|_| ReadinessSchemaError::InitializationFailed {
-            check: "commit_schema",
-        })?;
-
-    verify_owned_target(path, owned_identity)?;
-    validate_rollback_journal_header(path)?;
-    validate_schema(&connection, namespace)
+    validate_rollback_journal_header_bytes(&image)
 }
 
-pub(crate) fn open_read_only(
+pub(crate) fn with_read_only<T, E, F>(
     path: &Path,
     namespace: &Namespace,
-) -> Result<Connection, ReadinessSchemaError> {
-    validate_existing_path(path)?;
-    validate_rollback_journal_header(path)?;
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )
-    .map_err(|_| ReadinessSchemaError::DatabaseOpenFailed)?;
-    connection
-        .execute_batch("PRAGMA query_only=ON;")
-        .map_err(|_| ReadinessSchemaError::ConnectionSafeguardFailed {
-            check: "enable_query_only",
-        })?;
-    require_pragma(&connection, "PRAGMA query_only", 1, "query_only")?;
-    validate_schema(&connection, namespace)?;
-    Ok(connection)
+    operation: F,
+) -> Result<T, E>
+where
+    E: From<ReadinessSchemaError>,
+    F: for<'transaction> FnOnce(&Transaction<'transaction>) -> Result<T, E>,
+{
+    with_read_only_inner(path, namespace, || {}, || {}, operation)
 }
 
-pub(crate) fn open_writer(
+#[cfg(test)]
+pub(super) fn with_read_only_hooks<T, E, F, G, H>(
     path: &Path,
     namespace: &Namespace,
-) -> Result<Connection, ReadinessSchemaError> {
-    validate_existing_path(path)?;
-    validate_rollback_journal_header(path)?;
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )
-    .map_err(|_| ReadinessSchemaError::DatabaseOpenFailed)?;
-    enable_and_verify_foreign_keys(&connection)?;
-    validate_schema(&connection, namespace)?;
-    Ok(connection)
+    after_header: G,
+    after_shared_lock: H,
+    operation: F,
+) -> Result<T, E>
+where
+    E: From<ReadinessSchemaError>,
+    F: for<'transaction> FnOnce(&Transaction<'transaction>) -> Result<T, E>,
+    G: FnOnce(),
+    H: FnOnce(),
+{
+    with_read_only_inner(path, namespace, after_header, after_shared_lock, operation)
+}
+
+fn with_read_only_inner<T, E, F, G, H>(
+    path: &Path,
+    namespace: &Namespace,
+    after_header: G,
+    after_shared_lock: H,
+    operation: F,
+) -> Result<T, E>
+where
+    E: From<ReadinessSchemaError>,
+    F: for<'transaction> FnOnce(&Transaction<'transaction>) -> Result<T, E>,
+    G: FnOnce(),
+    H: FnOnce(),
+{
+    let connection =
+        open_prechecked_connection(path, OpenFlags::SQLITE_OPEN_READ_ONLY, after_header, true)
+            .map_err(E::from)?;
+    let (file_lock, header) = lock_main_file_and_read_header(&connection)
+        .map_err(|check| E::from(ReadinessSchemaError::ValidationFailed { check }))?;
+    validate_rollback_journal_header_bytes(&header).map_err(E::from)?;
+    after_shared_lock();
+    file_lock.handoff_to_connection();
+    let transaction = Transaction::new_unchecked(&connection, TransactionBehavior::Deferred)
+        .map_err(|_| E::from(transaction_error("begin_read_transaction")))?;
+    validate_schema(&transaction, namespace).map_err(E::from)?;
+    finish_transaction(transaction, operation)
+}
+
+pub(crate) fn with_write_transaction<T, E, F>(
+    path: &Path,
+    namespace: &Namespace,
+    operation: F,
+) -> Result<T, E>
+where
+    E: From<ReadinessSchemaError>,
+    F: for<'transaction> FnOnce(&Transaction<'transaction>) -> Result<T, E>,
+{
+    with_write_transaction_inner(path, namespace, || {}, || {}, operation)
+}
+
+#[cfg(test)]
+pub(super) fn with_write_transaction_hooks<T, E, F, G, H>(
+    path: &Path,
+    namespace: &Namespace,
+    after_header: G,
+    after_shared_lock: H,
+    operation: F,
+) -> Result<T, E>
+where
+    E: From<ReadinessSchemaError>,
+    F: for<'transaction> FnOnce(&Transaction<'transaction>) -> Result<T, E>,
+    G: FnOnce(),
+    H: FnOnce(),
+{
+    with_write_transaction_inner(path, namespace, after_header, after_shared_lock, operation)
+}
+
+fn with_write_transaction_inner<T, E, F, G, H>(
+    path: &Path,
+    namespace: &Namespace,
+    after_header: G,
+    after_shared_lock: H,
+    operation: F,
+) -> Result<T, E>
+where
+    E: From<ReadinessSchemaError>,
+    F: for<'transaction> FnOnce(&Transaction<'transaction>) -> Result<T, E>,
+    G: FnOnce(),
+    H: FnOnce(),
+{
+    let connection =
+        open_prechecked_connection(path, OpenFlags::SQLITE_OPEN_READ_WRITE, after_header, false)
+            .map_err(E::from)?;
+    let (file_lock, header) = lock_main_file_and_read_header(&connection)
+        .map_err(|check| E::from(ReadinessSchemaError::ValidationFailed { check }))?;
+    validate_rollback_journal_header_bytes(&header).map_err(E::from)?;
+    after_shared_lock();
+    file_lock.handoff_to_connection();
+    let transaction = Transaction::new_unchecked(&connection, TransactionBehavior::Immediate)
+        .map_err(|_| E::from(transaction_error("begin_write_transaction")))?;
+    validate_schema(&transaction, namespace).map_err(E::from)?;
+    finish_transaction(transaction, operation)
 }
 
 fn validate_path(path: &Path) -> Result<(), ReadinessSchemaError> {
@@ -314,6 +390,116 @@ fn validate_existing_path(path: &Path) -> Result<(), ReadinessSchemaError> {
         Err(_) => Err(ReadinessSchemaError::InvalidDatabasePath {
             check: "target_metadata",
         }),
+    }
+}
+
+fn build_database_image(namespace: &Namespace) -> Result<Vec<u8>, ReadinessSchemaError> {
+    let mut connection =
+        Connection::open_in_memory().map_err(|_| ReadinessSchemaError::InitializationFailed {
+            check: "open_image_database",
+        })?;
+    enable_and_verify_foreign_keys(&connection)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| ReadinessSchemaError::InitializationFailed {
+            check: "begin_image_transaction",
+        })?;
+    transaction
+        .execute_batch(DDL)
+        .map_err(|_| ReadinessSchemaError::InitializationFailed {
+            check: "create_image_schema",
+        })?;
+    transaction
+        .execute(
+            "INSERT INTO operational_readiness_schema(\
+                 singleton,schema_version,ddl_sha256,namespace_sha256\
+             ) VALUES(1,?1,?2,?3)",
+            params![SCHEMA_VERSION, ddl_sha256(), namespace_sha256(namespace)],
+        )
+        .map_err(|_| ReadinessSchemaError::InitializationFailed {
+            check: "write_image_header",
+        })?;
+    transaction
+        .commit()
+        .map_err(|_| ReadinessSchemaError::InitializationFailed {
+            check: "commit_image_schema",
+        })?;
+    validate_schema(&connection, namespace)?;
+    let image = connection
+        .serialize(DatabaseName::Main)
+        .map_err(|_| ReadinessSchemaError::InitializationFailed {
+            check: "serialize_image",
+        })?
+        .to_vec();
+    validate_rollback_journal_header_bytes(&image)?;
+    Ok(image)
+}
+
+fn open_prechecked_connection<F>(
+    path: &Path,
+    access: OpenFlags,
+    after_header: F,
+    read_only: bool,
+) -> Result<Connection, ReadinessSchemaError>
+where
+    F: FnOnce(),
+{
+    validate_existing_path(path)?;
+    validate_rollback_journal_header(path)?;
+    after_header();
+    let connection = Connection::open_with_flags(
+        path,
+        access
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW
+            | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE,
+    )
+    .map_err(|_| ReadinessSchemaError::DatabaseOpenFailed)?;
+    let locking_mode: String = connection
+        .query_row("PRAGMA main.locking_mode=EXCLUSIVE", [], |row| row.get(0))
+        .map_err(|_| ReadinessSchemaError::ConnectionSafeguardFailed {
+            check: "locking_mode",
+        })?;
+    if locking_mode != "exclusive" {
+        return Err(ReadinessSchemaError::ConnectionSafeguardFailed {
+            check: "locking_mode",
+        });
+    }
+    if read_only {
+        connection
+            .execute_batch("PRAGMA query_only=ON;")
+            .map_err(|_| ReadinessSchemaError::ConnectionSafeguardFailed {
+                check: "enable_query_only",
+            })?;
+        require_pragma(&connection, "PRAGMA query_only", 1, "query_only")?;
+    } else {
+        enable_and_verify_foreign_keys(&connection)?;
+    }
+    Ok(connection)
+}
+
+fn transaction_error(check: &'static str) -> ReadinessSchemaError {
+    ReadinessSchemaError::ConnectionSafeguardFailed { check }
+}
+
+fn finish_transaction<T, E, F>(transaction: Transaction<'_>, operation: F) -> Result<T, E>
+where
+    E: From<ReadinessSchemaError>,
+    F: for<'connection> FnOnce(&Transaction<'connection>) -> Result<T, E>,
+{
+    match operation(&transaction) {
+        Ok(value) => {
+            transaction
+                .commit()
+                .map_err(|_| E::from(transaction_error("commit_transaction")))?;
+            Ok(value)
+        }
+        Err(error) => {
+            transaction
+                .rollback()
+                .map_err(|_| E::from(transaction_error("rollback_transaction")))?;
+            Err(error)
+        }
     }
 }
 
@@ -382,7 +568,12 @@ fn validate_rollback_journal_header(path: &Path) -> Result<(), ReadinessSchemaEr
         .map_err(|_| ReadinessSchemaError::ValidationFailed {
             check: "database_header",
         })?;
-    if &header[..SQLITE_MAGIC.len()] != SQLITE_MAGIC
+    validate_rollback_journal_header_bytes(&header)
+}
+
+fn validate_rollback_journal_header_bytes(header: &[u8]) -> Result<(), ReadinessSchemaError> {
+    if header.len() < SQLITE_HEADER_LEN
+        || &header[..SQLITE_MAGIC.len()] != SQLITE_MAGIC
         || header[SQLITE_WRITE_VERSION_OFFSET] != ROLLBACK_JOURNAL_VERSION
         || header[SQLITE_READ_VERSION_OFFSET] != ROLLBACK_JOURNAL_VERSION
     {
@@ -413,26 +604,6 @@ fn require_pragma(
         .map_err(|_| ReadinessSchemaError::ConnectionSafeguardFailed { check })?;
     if actual != expected {
         return Err(ReadinessSchemaError::ConnectionSafeguardFailed { check });
-    }
-    Ok(())
-}
-
-fn require_empty_database(connection: &Connection) -> Result<(), ReadinessSchemaError> {
-    let object = connection
-        .query_row(
-            "SELECT 1 FROM sqlite_master \
-             WHERE substr(name,1,7)<>'sqlite_' LIMIT 1",
-            [],
-            |_| Ok(()),
-        )
-        .optional()
-        .map_err(|_| ReadinessSchemaError::InitializationFailed {
-            check: "inspect_existing_objects",
-        })?;
-    if object.is_some() {
-        return Err(ReadinessSchemaError::InitializationFailed {
-            check: "database_not_empty",
-        });
     }
     Ok(())
 }

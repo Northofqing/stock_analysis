@@ -44,7 +44,7 @@ once_cell = "1.19"
 regex = "1.10"
 lazy_static = "1.4"
 diesel = { version = "2.3.5", features = ["sqlite", "r2d2", "chrono"] }
-rusqlite = { version = "0.31", features = ["chrono", "functions"] }
+rusqlite = { version = "0.31", features = ["chrono", "functions", "serialize"] }
 lettre = { version = "0.11.19", features = ["smtp-transport", "sendmail-transport", "builder", "tokio1-native-tls"] }
 clap = { version = "4.5.54", features = ["derive"] }
 plotters = "0.3"

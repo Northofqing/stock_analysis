@@ -404,7 +404,7 @@ fn string(value: &str) -> CanonicalValue {
     CanonicalValue::String(value.to_owned())
 }
 
-fn scope_value(scope: &ReadinessScope) -> CanonicalValue {
+pub(super) fn scope_value(scope: &ReadinessScope) -> CanonicalValue {
     let mut fields = BTreeMap::new();
     match scope {
         ReadinessScope::Core => {
