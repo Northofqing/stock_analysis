@@ -607,7 +607,7 @@ module ArchitectureDocs
         rows: [
           ["common_fence","LegacyAndNewSchedulerProducerDispatcherFinalizer","unit_id,generation,manifest_sha256,physical_owner"],
           ["authorization","EveryActor","CurrentGateAndFenceRequired"],
-          ["Shadow","PhysicalOwner","None"],
+          ["Shadow","ShadowActorPhysicalOwner","None"],
           ["Active","NewOccurrence","ManifestOwnerOnly"],
           ["Draining","NewOccurrenceAndPrepare","ForbiddenPreserveAuthorityFinalizerReconcilerQuarantine"],
           ["Disabled","PersistedFacts","PreserveAndFenceOldOwnerAgainstResend"],

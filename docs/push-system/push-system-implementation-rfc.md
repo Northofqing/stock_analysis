@@ -1056,7 +1056,7 @@ BlockedOnInput 默认不使全局 deployment readiness 失败，前提是不存�
 | --- | --- | --- | --- |
 | common_fence | LegacyAndNewSchedulerProducerDispatcherFinalizer | unit_id,generation,manifest_sha256,physical_owner | [Q:13] [Q:79] |
 | authorization | EveryActor | CurrentGateAndFenceRequired | [Q:98] |
-| Shadow | PhysicalOwner | None | [Q:13] |
+| Shadow | ShadowActorPhysicalOwner | None | [Q:13] |
 | Active | NewOccurrence | ManifestOwnerOnly | [Q:31] |
 | Draining | NewOccurrenceAndPrepare | ForbiddenPreserveAuthorityFinalizerReconcilerQuarantine | [Q:18] |
 | Disabled | PersistedFacts | PreserveAndFenceOldOwnerAgainstResend | [Q:82] |
@@ -1070,6 +1070,23 @@ BlockedOnInput 默认不使全局 deployment readiness 失败，前提是不存�
 | quota_query | AllUnitsPromotionJournalOccurredAt | RejectAnyActivateOrRollbackInBusinessDateInterval | [Q:36] [Q:99] |
 | quota_apply | SameImmediateTransaction | RevalidateGenerationThenAppendManifestAndJournalCommit | [Q:80] [Q:81] |
 | quota_authority | MemoryLockOrLogs | NeverSufficient | [Q:98] |
+
+2026-09-08 所有权范围澄清：Q13 的 shadow 是**新路径**，不是整个 Unit 无 owner。
+初始 Disabled 通过已认证批准证据登记实际既有 owner，保持它原本获准的生产范围；
+进入 Shadow 不变更该 owner 或生产准入，新路径仅共享 facts 做纯比较。
+旧/新副作用 actor 均使用当前代的同一 common_fence；不能另设 legacy 权限真相，
+也不能继续用旧代 token。`physical_owner` 保存实际负责身份，None 不能授予任何 actor 权限。
+
+Disabled 的准入不是仅由状态名推导：Initialize 的既有生产范围来自受认证证据；
+EnterShadow 保留前代准入；Activate 在当前批准与 fence 下授予目标范围；Drain/Disable
+关闭新 occurrence 和 prepare、保留当前负责人的恢复职责。因此排空后的 Disabled 或
+其后 Shadow 不会自动重启 legacy。Rollback 仍写新代，按精确历史目标推导其 owner
+及原准入范围，并要求本次批准明确授权恢复该范围；旧目标、日志和 actor 字符串均不续权。
+这只是从不可变已执行历史派生准入，不新增状态表/可变标记，不改变冻结 DDL。
+未登记、缺 journal、来源/实物未认证、确无 owner 或未覆盖旧 binary fence 时不授予权限。
+只有真正无既有生产和恢复责任的 Unit 才可经批准表达无 owner；有 pending 不能据此丢弃恢复职责。
+依据、替代方案与待实现证明见 [W16 合同裁决](activation-contract-decisions-2026-09-08.md)。
+[Q:13] [Q:17] [Q:18] [Q:24] [Q:31] [Q:52] [Q:80] [Q:98] [Q:99]
 
 旧缓存、旧 binary、非空 actor 或 manifest 单独存在均不授权发送。物理 owner 变化必须先 fence 旧 actor，审计最新 generation/journal 后才能授予新 owner；不能以重启创建逃逸 identity。Draining 的原稳定 intent 由当前执行 fence 保护的恢复职责继续处理，外部 Accepted 不可撤销，Uncertain 不盲重发。每日名额是全体 Unit 共用的交易日约束：activation DB 用 `BEGIN IMMEDIATE` 串行，按 catalog 绑定的交易日历 authority business-date 所对应 UTC 半开区间查询全部 Unit 的 journal `occurred_at`，任何 `Activate` 或当日 `Rollback` 都拒绝后续 promote；再重验 generation，写 manifest+journal 并提交同一事务。rollback 不受名额限制但写入新 generation/journal。不能靠内存锁或日志；现有 DDL 已有 occurred_at，区间及 calendar/version 必须绑定批准证据，不能改用 receipt 或本机日期。现有 SQL 的逐 Unit generation 约束不足以单独证明这个跨 Unit 上限；运行时实现必须另交验证证据。
 

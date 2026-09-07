@@ -2,6 +2,16 @@
 
 状态：`PROVISIONAL`。本批输入冻结日期为 `2026-09-06`。源码接线、历史统计、原工作区文档和拟议设计必须分开阅读；它们不等于部署证明、远端 `TransportAccepted` 或用户已读。
 
+## 当前开发入口（2026-09-08）
+
+- [W15 实施结果](implementation-w15-results-2026-09-07.md) §10–12：依赖候选合同、实际 occurrence 读取和采集事务适配器已通过限定验证/审查，完整来源认证、运行查询及调度联结尚未完成。
+- [W16 实施计划](../superpowers/plans/2026-09-08-push-foundation-w16-activation.md)：完整激活记录读取链路正在实现；身份/owner/配额/实际切换仍逐项交付，不能按只读结果标 W16 完成。
+- [W16 合同裁决](activation-contract-decisions-2026-09-08.md)：澄清 shadow actor 无 owner 与保留旧推送的关系；当前 fence、排空与回滚仍需真实实现证明，不是生产批准。
+
+以下第三批状态是 **2026-09-06 的历史交接快照**，其中“W01--W21 运行时未实现”等描述不代表上述后续实现进度；原始输入/权限边界仍有效。
+
+## 第三批历史交接
+
 第三批规格完成：RFC/SQL/WBS 规格与机器合同已通过最终独立审查，原审查 findings 全部关闭；这不是推送系统改造完成。[第三批交接结果](implementation-batch-3-results-2026-09-06.md) 记录 FINAL SPEC PASS（0/0/0）、wave3 FINAL SCOPED QUALITY PASS（0/0/0）的精确范围，以及 clean `e35800a` 的 418 runs / 5023 assertions 和临时 SQLite 证据。最终状态提交未重跑五套测试，规格完成不提升 `PROVISIONAL` 发布状态。
 
 ## 事实边界与阅读顺序

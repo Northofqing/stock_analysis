@@ -259,6 +259,24 @@ class RfcSpecTest < Minitest::Test
     end
   end
 
+  def test_shadow_owner_rule_applies_to_shadow_actor_not_entire_unit
+    with_fixture do |root|
+      path = File.join(root, RFC)
+      text = File.read(path)
+      pattern = /^\| Shadow \| (?:PhysicalOwner|ShadowActorPhysicalOwner) \| None \| \[Q:13\] \|$/
+      assert_equal 1, text.scan(pattern).length
+      scoped = '| Shadow | ShadowActorPhysicalOwner | None | [Q:13] |'
+      File.write(path, text.sub(pattern, scoped))
+      out, err, result = Open3.capture3(RbConfig.ruby, CLI, '--root', root, '--draft')
+      assert_equal 0, result.exitstatus, out + err
+      assert_equal "rfc_spec_valid\n", out
+      assert_empty err
+
+      change_text(root) { |document| document.sub(scoped, '| Shadow | PhysicalOwner | None | [Q:13] |') }
+      assert_cli_error(root, 'rfc_activation_operations_invalid')
+    end
+  end
+
   # 只突变唯一规范表；每个反例先证明原表和目标存在，排除重复章节造成的假绿。
   rollout_mutations = [
     ['调度身份', 'rfc_schedule_identity_invalid', 'ScheduleOccurrence', 'source_contract_id |', 'source_contract_id,activation_generation |'],

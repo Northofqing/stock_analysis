@@ -52,11 +52,11 @@ journal 逐列纳入 canonical，排除自身 `canonical_sha256`：`event_id,uni
 
 首代仅 Disabled；普通边仅 Disabled→Shadow→Active→Draining→Disabled。rollback 用新代指向兼容旧目标。journal 比 manifest 少一代为待协调，不能视为已执行、跳过或自动补成功。缺代、额外 journal、非法边、伪 hash、旧 schema/trigger 被替换均拒绝认证。
 
-**needs-context B（未闭合的 Shadow owner 合同）**：冻结 DDL 的 `physical_owner` 是非空 TEXT，RFC Shadow 的物理 owner 为 None，但 common_fence 又要求 legacy/new actor 精确匹配当前 manifest 的 owner。如果当前 manifest 写 `None`，继续工作的 legacy owner 无法满足该等式；仅另加部署登记并不能解决这一矛盾。蓝图 1502 的“默认状态不改变任何 physical owner”及 1537/1568 的唯一 live owner 约束同时必须满足，不能为迁就 None 而停掉原生产 owner，也不能绕过 legacy 当前 fence。`None` 保留值只是一种待评估编码，尚非可执行投影。主控需明确 Shadow 无 owner 指 shadow actor 还是整个 Unit，以及 legacy 的唯一当前执行事实如何满足共同 fence；本设计不自行修改 RFC，不凭另一份 owner 登记授予发送。T4 的 Shadow/legacy 联合授权须等待该合同闭合，其余拒绝和隔离能力可先实现。
+**B 已澄清（2026-09-08，尚待执行实现）**：原 Q13 的 shadow 指新路径，Q17 要求 Foundation 保留既有 owner；RFC 曾扩大为整个 Unit None，现已改为 ShadowActorPhysicalOwner。初始 Disabled/Shadow 的 manifest 保存经批准认证的实际 incumbent，legacy 在当前同一 fence 下继续原范围；新 shadow 无副作用权限。排空后的 Disabled/Shadow 保持关闭，Rollback 按精确旧目标与本次显式批准在新代恢复相应范围。准入从不可变已执行历史派生，不新增状态/权限库。完整矩阵、证据和代价见 [W16 合同裁决](../../push-system/activation-contract-decisions-2026-09-08.md)。该澄清解除文字矛盾，不证明实际 incumbent、旧 binary 的 fence 或认证 adapter 已实现；None 文本始终不授予 actor 权限。
 
 读取编码裁决（2026-09-08）：核对现有冻结 Task2/RFC 与 canonical 实现后，稳定身份沿用 `PromotionV1`；新增内容 domain 为 `ActivationManifestV1` / `PromotionJournalV1`。三者均使用现有 canonical-v1：domain、单个 NUL、按列名键排序且无空白的 JSON object，文本按既有 canonical 转义，非负整数为 JSON 数字，可空列显式 null。manifest 含除自身 hash 外全部19列；journal 含除自身 canonical hash 外全部14列，包含稳定 event_id；`PromotionV1` 身份只含 generation 和 unit_id。独立 golden bytes 验证这些精确字段/编码，不新增 SQL schema version。成本是未来编码变化必须换 domain，不能同名改写历史。
 
-T1 对 physical_owner 保留严格原始 TEXT，不解释 `None` 是否授予 legacy 执行权；输出不是部署认证或 current fence。它可先完整验证全 Unit 历史并区分未登记、持久跟齐和末代待协调。缺失不是 Disabled，两个以上未执行代拒绝。当前 catalog 用于 Unit ID 注册关系，不据此宣称历史版本 SHA 等于当前已安装制品；历史到当前版本兼容和真实 owner 认证仍由后续任务交付。这解除的是读取任务的前置等待，没有解除 needs-context B 的联合授权限制。
+T1 对 physical_owner 保留严格原始 TEXT，不解释执行准入；输出不是部署认证或 current fence。它可先完整验证全 Unit 历史并区分未登记、持久跟齐和末代待协调。缺失不是 Disabled，两个以上未执行代拒绝。当前 catalog 用于 Unit ID 注册关系，不据此宣称历史版本 SHA 等于当前已安装制品；历史到当前版本兼容和真实 owner 认证仍由后续任务交付。B 的准入投影由 T2/T4/T5 强制，不由 T1 raw 对象冒充完成。
 
 ## 事务、真实 owner 与受控重启
 
@@ -83,7 +83,7 @@ T1 对 physical_owner 保留严格原始 TEXT，不解释 `None` 是否授予 le
 | Dispatcher | 真实 transport attempt 紧前及许可存续期间 | 拒绝旧 owner/旧代；已发 Uncertain 交原 decision 恢复 |
 | Finalizer | business completion/cursor 事务紧前 | 只允许当前恢复职责、原稳定 intent/terminal binding，旧 owner 不重写完成 |
 
-Active 仅 manifest owner 获得新发生工作资格。shadow 执行路径无发送/写业务/推进 cursor 权限，用计数拒绝 capability 证明零副作用，可多 Unit 并行；整个 Unit 在 Shadow 期间的 legacy 当前授权仍是 needs-context B，不能把这句话解释为已有解决方案。Foundation 默认 Disabled 关闭新框架的 scheduler/producer/dispatch；蓝图要求原 physical owner 保持不变，其 legacy fence 同样须纳入 B 的裁决。正式执行 Draining→Disabled 则按已批准合同关闭该 Unit 新工作、保留持久 pending、Accepted、Uncertain 与其恢复。Draining 禁止新增 occurrence 和 prepare，但保留 authority 查询、finalizer、reconciler、隔离。恢复职责单独按当前执行 fence 委派，不用旧 owner token 续权，不以“没有新 owner”删除责任。Disable 必须有排空证据；不可把未决状态当终结来通过转换。
+Active 仅 manifest owner 获得新发生工作资格。shadow 执行路径无发送/写业务/推进 cursor 权限，用计数拒绝 capability 证明零副作用，可多 Unit 并行；legacy 的准入按 B 的不可变历史投影与实际认证取得。Foundation 初始 Disabled 关闭新框架的 scheduler/producer/dispatch，保留证据确认的 incumbent 原范围，但不绕过当前 fence。正式执行 Draining→Disabled 则关闭该 Unit 新工作、保留持久 pending、Accepted、Uncertain 与其恢复；其后进入 Shadow 也不自动开启 legacy。Draining 禁止新增 occurrence 和 prepare，但保留 authority 查询、finalizer、reconciler、隔离。恢复职责单独按当前执行 fence 委派，不用旧 owner token 续权，不以“没有新 owner”删除责任。Disable 必须有排空证据；不可把未决状态当终结来通过转换。
 
 W16 基础阶段把共用 actor seam 与 monitor/CLI 入口接好且保持关闭默认；Unit 特有 legacy adapter 未覆盖时，该 Unit 的 promotion eligibility 必须拒绝，不能让测试一个 Unit 的 fence 冒充 52 Unit 实际接线。每个后续 Unit cutover 提供完整四类 actor 映射及无旁路证据。
 
@@ -126,4 +126,4 @@ W16 实现 inspect/promote/rollback 及 activation 协调，既存 intent 的 re
 
 ## 可证明的完成条件
 
-配套计划每个任务提供独立反例、精确文件 ownership 与验证命令。测试仅临时目录、Test namespace、合成库与本地可控进程，不读取真实 `.env`/`data/**`、不调用 provider/真实 PAM/消息渠道，不执行 production approve/apply。完整 W16 必须同时通过两进程 CAS/配额竞争、四类旧/新 actor 撤权、owner 切换每个故障点、全 Unit context 漂移、rollback 原 pending 保留，以及所选真实平台 adapter 的隔离验证。外部信任根尚未配置、Shadow/legacy 合同未闭合、仅 facts reader 通过、未完成四类 actor seam 或新集合版（建议 v3）全范围接线时，报告相应未完成项，不能升级为 W16 Ready/生产认证。版本验收须保持当前 v2 候选语义和 legacy v1 拒绝策略。
+配套计划每个任务提供独立反例、精确文件 ownership 与验证命令。测试仅临时目录、Test namespace、合成库与本地可控进程，不读取真实 `.env`/`data/**`、不调用 provider/真实 PAM/消息渠道，不执行 production approve/apply。完整 W16 必须同时通过两进程 CAS/配额竞争、四类旧/新 actor 撤权、owner 切换每个故障点、全 Unit context 漂移、rollback 原 pending 保留，以及所选真实平台 adapter 的隔离验证。外部信任根尚未配置、Shadow/legacy 准入尚未实现、仅 facts reader 通过、未完成四类 actor seam 或新集合版（建议 v3）全范围接线时，报告相应未完成项，不能升级为 W16 Ready/生产认证。版本验收须保持当前 v2 候选语义和 legacy v1 拒绝策略。

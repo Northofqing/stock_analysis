@@ -14,7 +14,7 @@
 
 结果：不写实现也能明确正确执行者、数据语义和验收预期。主控读取设计 needs-context A–E 并记录结论；开发授权不需要再次批准，但真实平台/身份发行方、DualControl 外部策略不能靠程序猜测。
 
-文件 ownership：本设计及本计划；后续实施时仅按主控裁决编辑 `docs/push-system/push-system-implementation-rfc.md` 和 `docs/Project_Architecture_Blueprint.md` 的相关段，不改冻结 SQL。先在冻结 Task2 输入中定位 canonical manifest/journal domain；不存在则冻结 domain + golden vectors。Shadow `physical_owner=None` 与 legacy actor 匹配 manifest owner 的 common_fence 存在未闭合矛盾：另存 owner 登记不足以解开等式。须同时满足蓝图 1502 默认 owner 不变、1537/1568 唯一 live owner，明确 Shadow/legacy 真实授权合同后才能交付联合许可；不能自行更改 RFC。另决定 paused owner 是否足够构成已切换事实、外部持久批准包与同事务写入含义、无 owner 变化 release 如何合法表达。
+文件 ownership：本设计及本计划；新的裁决放入 `docs/push-system/`，后续按裁决修改 RFC 的相关合同，不改冻结 SQL。`docs/Project_Architecture_Blueprint.md` / `.html` 属于 RFC 输入 manifest 的八份不可变输入，禁止改写原快照；后续蓝图纳管通过独立任务产生新视图。读取编码及 B 的 Shadow 范围已依据原 Q13/Q17 澄清，见 [W16 合同裁决](../../push-system/activation-contract-decisions-2026-09-08.md)：新 shadow 无 owner，Unit 保留实际负责人，初始/排空后准入从已执行历史投影，当前 fence 仍一致。T2/T4/T5 必须实现真实认证及投影，不能只凭文档或 raw facts 授权。另决定 paused owner 是否足够构成已切换事实、外部持久批准包与同事务写入含义、无 owner 变化 release 如何合法表达。
 
 开放选择：推荐平台受保护 supervisor + 强制 PAM/服务身份 allowlist（设计 A）；推荐外部批准包、事务内 paused 安装/journal、提交后重查开门（C，尚未获得生产批准）；推荐新增 W15 集合 snapshot/material v3 与独立 deployment-set/v1（D），保留当前 595f605 的 v2 候选语义及 legacy v1 拒绝策略；推荐 DualControl preparer≠approver 且 approver 执行（E）。若外部策略不同，标 needs-context 并只暂停相关 adapter，继续纯验证/隔离任务。不得默认“Verified struct 存在”已解决这些选择。
 
@@ -85,11 +85,11 @@ cargo test --lib push_foundation::activation_transaction_tests -- --test-threads
 
 ## Task 4 — T4 四类 actor 的共同 fence 与真实 owner adapter
 
-依赖 T2 认证部署，T0/C supervisor 平台选择；Shadow/legacy 联合许可另依赖 T0/B owner 等式矛盾的裁决。新建 `activation_owner.rs`、`activation_fence.rs`、`activation_fence_tests.rs`；新建 `src/bin/monitor/activation_runtime.rs` 和其本地测试 module（真实路径均为新建）。编辑已有 `src/bin/monitor/main.rs` 注册受监督生命周期；接管 `phase_scheduler.rs`、`generic_transport.rs`、`dedicated_transport.rs`、`business_finalizer.rs`、`reconciler.rs` 的共同执行 seam。`intent_store.rs` 仅在使当前执行许可覆盖业务事务确有必要时修改，保留 lease/version 原义。common module 的公开可见性变更串行交接 `mod.rs`。
+依赖 T2 认证部署，T0/C supervisor 平台选择；Shadow/legacy 联合许可按已澄清的 B 实现，并测试初始/排空后/回滚准入矩阵。新建 `activation_owner.rs`、`activation_fence.rs`、`activation_fence_tests.rs`；新建 `src/bin/monitor/activation_runtime.rs` 和其本地测试 module（真实路径均为新建）。编辑已有 `src/bin/monitor/main.rs` 注册受监督生命周期；接管 `phase_scheduler.rs`、`generic_transport.rs`、`dedicated_transport.rs`、`business_finalizer.rs`、`reconciler.rs` 的共同执行 seam。`intent_store.rs` 仅在使当前执行许可覆盖业务事务确有必要时修改，保留 lease/version 原义。common module 的公开可见性变更串行交接 `mod.rs`。
 
 实现完整 `(unit,generation,manifest,owner)` 当前检查与撤销共享的执行许可；跨进程的 quiesce/inspect/install-paused/resume 由认证 supervisor 驱动。旧进程确认死亡/撤权、在途许可结束后才能切换；进程身份需防 PID 复用。未适配旧 binary 不允许混跑。日志、旧 token、重启新 run_id 不可授予权限。
 
-四类 actor 均放在实际副作用前，不能只在 scheduler 入口检查：scheduler 创建 occurrence；producer 外部采集/prepare/intent；dispatcher 真实 transport；finalizer business completion/cursor。保留 recovery-only capability：正式 Draining/Disabled 转换关闭该 Unit 新工作，原 pending 查询/finalize/reconcile/quarantine 继续；shadow 执行路径拒绝 provider 重取、LLM、业务/durable 写、sink/order/cursor。Foundation 默认 Disabled 只关闭新框架路径，不得改变原 physical owner；其 legacy 当前 fence 和 Shadow live owner 的共同授权由 T0/B 明确，未决时仅交付拒绝/隔离实现，不宣称完整联合许可通过。
+四类 actor 均放在实际副作用前，不能只在 scheduler 入口检查：scheduler 创建 occurrence；producer 外部采集/prepare/intent；dispatcher 真实 transport；finalizer business completion/cursor。保留 recovery-only capability：正式 Draining/Disabled 转换关闭该 Unit 新工作，原 pending 查询/finalize/reconcile/quarantine 继续；shadow 执行路径拒绝 provider 重取、LLM、业务/durable 写、sink/order/cursor。Foundation 初始 Disabled 只关闭新框架路径，批准证据确认的 legacy 保留原范围且必须使用当前 fence；排空后的 Disabled/Shadow 仍关闭。Rollback 恢复目标准入须本次明确批准、新代、兼容和撤权证明。B 的矩阵每行均需行为证据，未实现实际 incumbent 认证和共同 fence 时不宣称联合许可通过。
 
 每个 legacy/new actor × 四种状态 × stale/current fence 是行为测试矩阵；使 actor 在检查后、动作前挂起，另一进程请求切换，验证切换必须等待或拒绝旧动作，不能发生 TOCTOU 双 owner。进程 crash、signal acknowledgement 丢失、owner 查询超时、旧 binary 重启均保持 gate 关闭。测试本地子进程、临时 IPC/DB、计数拒绝 sink，不运行真实 monitor。
 
@@ -153,7 +153,7 @@ cargo clippy --lib --bin monitor --no-deps
 
 执行前逐个检查新增测试只使用 tempfile/Test namespace/拒绝外部效果 adapter；所有测试命令必须报告非零测试数。格式检查仅覆盖上面明确的新文件；实际修改的既有文件按精确路径补充定向 rustfmt，复用主控已有格式基线记录，避免全仓无关格式噪声。只安排上面一次目标 Clippy，复用主控已记录 warning 基线，核对本次相关增量，不要求修复无关历史告警。必要编译验证由以上测试覆盖，不额外运行真实 monitor、生产 DB 或传输命令。若已有 broad suite 有非隔离案例，仅运行可证明隔离的相关模块并明确未运行范围；不能打开真实网络来令测试变绿。
 
-文档 ownership：更新 RFC、蓝图 §24.15/owner 章节、W16 完成证据及 W15 缺口状态；只在真实满足后更新 WBS 实施状态，不改正式依赖。提交可核验的零 provider/LLM/sink/order/真实 DB 计数、崩溃/竞争测试结果和仍 needs-context 项。完整 W16 工程实现与真实生产配置/Unit Production Verified 分别报告。
+文档 ownership：更新 RFC、独立蓝图衔接说明、W16 完成证据及 W15 缺口状态；不改八份冻结输入原文，只在真实满足后更新 WBS 实施状态，不改正式依赖。提交可核验的零 provider/LLM/sink/order/真实 DB 计数、崩溃/竞争测试结果和仍 needs-context 项。完整 W16 工程实现与真实生产配置/Unit Production Verified 分别报告。
 
 ## 规则到任务追踪
 
@@ -164,7 +164,7 @@ cargo clippy --lib --bin monitor --no-deps
 | RFC 753–762 六合法边、新 generation rollback | T1/T3/T5 | 跳代、同态边、改历史、跨 Unit 目标 |
 | 冻结两表与 triggers：逐代唯一、FK/action/reason/时间/不可变 | T1/T3 | 缺 trigger、错前驱、缺 journal 假成功 |
 | RFC 1057–1063 四类 actor common/current fence | T4/T5 | 检查后切换竞态、旧 binary/缓存重启逃逸 |
-| Shadow 无 owner、默认 physical owner 不变、唯一 live owner、共同 fence | T0/B 裁决后 T4/T7 | None 无法匹配 legacy owner 却授予执行、shadow 重取/写库 |
+| Shadow actor 无 owner、默认 Unit owner 不变、唯一 live owner、共同 fence | B 已澄清；T2/T4/T5/T7 实现 | 整个 Unit None 导致旧推送停止、旧代 token、排空后重开 legacy、shadow 重取/写库 |
 | Draining/Disabled 保留恢复、原稳定 identity | T4/T5 | 停止 finalizer、丢 pending、Uncertain 盲重发 |
 | RFC 1064–1080 全 Unit 日额、BEGIN IMMEDIATE、日历 UTC 区间 | T2/T3/T5 | 不同 Unit 并发同日 promote、rollback 后再 promote |
 | RFC 637–643 非原子切换/确认丢失重查/禁止跳代 | T0/T5 | 预写成功 journal、未知 owner 仍 Ready |
