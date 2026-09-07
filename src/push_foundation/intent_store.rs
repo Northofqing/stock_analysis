@@ -1,5 +1,11 @@
 //! Attested business-intent storage. This module selects no default database and has no sink.
 
+#[path = "readiness_occurrence.rs"]
+pub(crate) mod readiness_occurrence;
+#[cfg(test)]
+#[path = "readiness_occurrence_tests.rs"]
+mod readiness_occurrence_tests;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;

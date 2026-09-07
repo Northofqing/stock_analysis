@@ -279,6 +279,53 @@ pub(super) fn attest_connection(
     })
 }
 
+/// Anchor the actual registry to the bundled artifact, not only to its own live definitions.
+/// Call within the same read transaction as the facts being certified. No file is migrated.
+pub(super) fn attest_bundled_connection(
+    connection: &Connection,
+) -> Result<MigrationReceipt, FoundationMigrationError> {
+    let migration = FoundationSchemaMigration::bundled()?;
+    let receipt = attest_connection(connection, migration.ddl_sha256())?;
+    let rejected = || FoundationMigrationError::AttestationFailed {
+        check: "bundled_object_definitions",
+    };
+    // The exact artifact has one CLI command. Its SHA was checked above; never interpret
+    // caller-provided SQL, and never strip arbitrary dot commands from a different script.
+    let sql = DDL_BYTES.strip_prefix(b".bail on\n").ok_or_else(rejected)?;
+    let sql = std::str::from_utf8(sql).map_err(|_| rejected())?;
+    let reference = Connection::open_in_memory().map_err(|_| rejected())?;
+    reference
+        .execute_batch("PRAGMA temp_store=MEMORY;")
+        .map_err(|_| rejected())?;
+    reference.execute_batch(sql).map_err(|_| rejected())?;
+    let expected = registered_definitions(&reference)?;
+    if expected.len() != MANAGED_OBJECT_COUNT || registered_definitions(connection)? != expected {
+        return Err(rejected());
+    }
+    Ok(receipt)
+}
+
+type RegisteredDefinition = (String, String, Vec<u8>);
+
+fn registered_definitions(
+    connection: &Connection,
+) -> Result<Vec<RegisteredDefinition>, FoundationMigrationError> {
+    let rejected = || FoundationMigrationError::AttestationFailed {
+        check: "bundled_object_definitions",
+    };
+    let mut statement = connection
+        .prepare(
+            "SELECT name,object_type,CAST(definition AS BLOB) \
+             FROM push_foundation_objects ORDER BY name",
+        )
+        .map_err(|_| rejected())?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .map_err(|_| rejected())?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|_| rejected())
+}
+
 fn query_count(
     connection: &Connection,
     sql: &'static str,

@@ -301,6 +301,34 @@ where
     G: FnOnce(),
     H: FnOnce(),
 {
+    with_rollback_read_only_inner(path, after_header, after_shared_lock, |transaction| {
+        validate_schema(transaction, namespace).map_err(E::from)?;
+        operation(transaction)
+    })
+}
+
+/// Read an existing rollback-format database through the same locked, query-only transaction.
+/// The caller must validate its own schema and domain identity inside `operation`.
+pub(crate) fn with_rollback_read_only<T, E, F>(path: &Path, operation: F) -> Result<T, E>
+where
+    E: From<ReadinessSchemaError>,
+    F: for<'transaction> FnOnce(&Transaction<'transaction>) -> Result<T, E>,
+{
+    with_rollback_read_only_inner(path, || {}, || {}, operation)
+}
+
+fn with_rollback_read_only_inner<T, E, F, G, H>(
+    path: &Path,
+    after_header: G,
+    after_shared_lock: H,
+    operation: F,
+) -> Result<T, E>
+where
+    E: From<ReadinessSchemaError>,
+    F: for<'transaction> FnOnce(&Transaction<'transaction>) -> Result<T, E>,
+    G: FnOnce(),
+    H: FnOnce(),
+{
     let connection =
         open_prechecked_connection(path, OpenFlags::SQLITE_OPEN_READ_ONLY, after_header, true)
             .map_err(E::from)?;
@@ -311,7 +339,6 @@ where
     file_lock.handoff_to_connection();
     let transaction = Transaction::new_unchecked(&connection, TransactionBehavior::Deferred)
         .map_err(|_| E::from(transaction_error("begin_read_transaction")))?;
-    validate_schema(&transaction, namespace).map_err(E::from)?;
     finish_transaction(transaction, operation)
 }
 
