@@ -8,7 +8,7 @@ use chrono::{TimeZone, Utc};
 use crate::durable_delivery::{
     AuthoritativeDeliveryRequest, AuthoritativeSink, AuthoritativeSinkPort,
     AuthoritativeSinkResult, CoordinatorConfig, DeliverySubKind, DurableDeliveryCoordinator,
-    ImmutableAppendPort, PushKind, TypedReceipt,
+    ImmutableAppendPort, PushKind, TypedReceipt, TypedRejection,
 };
 use crate::monitor::push_job::{
     ChannelId, CompatId, CompatibilityEvidenceRef, CompletionEligibility, DeliveryResult,
@@ -213,6 +213,18 @@ fn receipt(channel: &str) -> TypedReceipt {
     }
 }
 
+fn retryable_rejection() -> TypedRejection {
+    TypedRejection {
+        reason_code: "TEST_CODE_W12_RETRYABLE_REJECTION".to_owned(),
+        evidence: b"TEST_CODE_W12_REJECTION_EVIDENCE".to_vec(),
+        retry_authorized: true,
+        observed_at: Utc
+            .with_ymd_and_hms(2026, 9, 7, 8, 0, 0)
+            .single()
+            .expect("rejected at"),
+    }
+}
+
 fn request<'a>(
     snapshot: &'a IntentSnapshot,
     route: &'a GenericTransportRoute,
@@ -377,6 +389,72 @@ fn w12_generic_transport_rejects_stale_business_lease_before_sink() {
             sink.clone(),
             &append,
         )),
+        Err(GenericTransportError::BusinessLeaseMismatch)
+    );
+    assert_eq!(sink.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn w12_generic_transport_never_reopens_retryable_rejection_on_replay() {
+    let (business, claimed) = claimed_snapshot();
+    let durable = DurableFixture::new("RETRYABLE_REJECTION_REPLAY");
+    let route = route(business.template.clone());
+    let fence = fence(&claimed);
+    let append = MemoryAppend::default();
+    let sink = ChannelSink::new(
+        "TEST_CODE_W12_CHANNEL",
+        AuthoritativeSinkResult::Rejected(retryable_rejection()),
+    );
+    let adapter = GenericTransportAuthorityAdapter::new(durable.coordinator());
+
+    for replay in 0..2 {
+        let result = adapter
+            .dispatch(request(
+                &claimed,
+                &route,
+                &fence,
+                &business.policy,
+                sink.clone(),
+                &append,
+            ))
+            .unwrap_or_else(|error| panic!("W12 rejection replay {replay}: {error}"));
+        assert!(matches!(
+            result.view(),
+            DeliveryResultView::TransportRejected(_)
+        ));
+    }
+    assert_eq!(
+        sink.calls.load(Ordering::SeqCst),
+        1,
+        "a durable retryable rejection still requires a separate explicit retry authority"
+    );
+}
+
+#[test]
+fn w12_generic_transport_rejects_verification_after_business_lease_before_sink() {
+    let (business, claimed) = claimed_snapshot();
+    let durable = DurableFixture::new("EXPIRED_BEFORE_VERIFICATION");
+    let route = route(business.template.clone());
+    let fence = fence(&claimed);
+    let append = MemoryAppend::default();
+    let sink = ChannelSink::new(
+        "TEST_CODE_W12_CHANNEL",
+        AuthoritativeSinkResult::Accepted(receipt("TEST_CODE_W12_CHANNEL")),
+    );
+    let adapter = GenericTransportAuthorityAdapter::new(durable.coordinator());
+    let expired_request = GenericDispatchRequest::new(
+        &claimed,
+        &route,
+        &fence,
+        &business.policy,
+        sink.clone(),
+        &append,
+        micros(1_788_743_102_000_000),
+        micros(1_788_743_401_000_000),
+    );
+
+    assert_eq!(
+        adapter.dispatch(expired_request),
         Err(GenericTransportError::BusinessLeaseMismatch)
     );
     assert_eq!(sink.calls.load(Ordering::SeqCst), 0);
