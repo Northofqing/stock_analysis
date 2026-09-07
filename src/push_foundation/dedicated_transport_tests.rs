@@ -10,7 +10,7 @@ use crate::event::envelope::{
 };
 use crate::event::{
     EventEnvelope, NewsFlashWindow, NewsFlashWindowTerminalQuery, NewsFlashWindowTerminalRecord,
-    PushDeliveryEvent,
+    PushDeliveryEvent, PushRecord,
 };
 use crate::monitor::push_job::{
     raw_digest, w09_completion_policy_fixture, AudienceId, AuthorityClass, BusinessDate, ChannelId,
@@ -609,6 +609,7 @@ struct FakeN02Source {
     result: NewsFlashWindowTerminalQuery,
     queried: RefCell<Vec<(String, NewsFlashWindow)>>,
     n01_quota_probe: u32,
+    unavailable: bool,
 }
 
 impl N02DedicatedTerminalSource for FakeN02Source {
@@ -620,6 +621,9 @@ impl N02DedicatedTerminalSource for FakeN02Source {
         self.queried
             .borrow_mut()
             .push((business_date.as_str().to_owned(), window));
+        if self.unavailable {
+            return Err(DedicatedSourceFailure);
+        }
         Ok(self.result.clone())
     }
 }
@@ -661,6 +665,7 @@ fn n02_case() -> N02Case {
         AudienceId::try_new("portfolio-owner".to_owned()).expect("audience"),
     );
     let rendered = b"TEST_CODE_W13_N02_RENDERED".to_vec();
+    let rendered_len = rendered.len();
     let render_sha256 = raw_digest(&rendered);
     let draft = InitialIntentDraft::ready_for_recovery_test(
         identity,
@@ -702,7 +707,7 @@ fn n02_case() -> N02Case {
         "news_flash_aggregated_v1".to_owned(),
         "window:09:30".to_owned(),
         channel.clone(),
-        27,
+        rendered_len,
         chrono::NaiveDate::from_ymd_opt(2026, 8, 18).expect("date"),
         reservation_sha256.clone(),
         sources.clone(),
@@ -734,7 +739,7 @@ fn n02_case() -> N02Case {
         "news_flash_aggregated_v1".to_owned(),
         "window:09:30".to_owned(),
         channel.clone(),
-        27,
+        rendered_len,
         3,
         chrono::NaiveDate::from_ymd_opt(2026, 8, 18).expect("date"),
         reservation_sha256,
@@ -795,7 +800,86 @@ fn n02_source(case: &N02Case, n01_quota_probe: u32) -> FakeN02Source {
         result: NewsFlashWindowTerminalQuery::Terminal(Box::new(case.terminal.clone())),
         queried: RefCell::new(Vec::new()),
         n01_quota_probe,
+        unavailable: false,
     }
+}
+
+fn replace_n02_terminal_stage(case: &mut N02Case, stage: NewsFlashTransactionStage) {
+    let attempt = PushRecord::try_from_authoritative(&case.terminal.attempt)
+        .expect("read canonical N02 attempt");
+    let attempt_observed_at = attempt
+        .news_flash_attempt_observed_at
+        .expect("attempt observed at");
+    let terminal_observed_at =
+        chrono::DateTime::parse_from_rfc3339("2026-08-18T09:30:04+08:00").expect("terminal time");
+    let remote_receipt =
+        (stage == NewsFlashTransactionStage::Accepted).then(|| NewsFlashRemoteReceipt {
+            channel: attempt.channel.clone(),
+            provider: "TEST_CODE_W13_N02_SINK_PROVIDER".to_owned(),
+            message_id: "TEST_CODE_W13_N02_MESSAGE".to_owned(),
+            platform_message_id: "TEST_CODE_W13_N02_PLATFORM".to_owned(),
+            accepted_at: case.receipt_accepted_at,
+            latency_ms: 2,
+        });
+    let (reason_code, transport_evidence_sha256) = match stage {
+        NewsFlashTransactionStage::Accepted => (None, None),
+        NewsFlashTransactionStage::DefinitivelyRejected => (
+            Some("TEST_CODE_W13_N02_REJECTED".to_owned()),
+            Some("b".repeat(64)),
+        ),
+        NewsFlashTransactionStage::Uncertain => {
+            (Some("TEST_CODE_W13_N02_UNCERTAIN".to_owned()), None)
+        }
+        NewsFlashTransactionStage::SinkAttempt => {
+            panic!("terminal fixture requires terminal stage")
+        }
+    };
+    let terminal_event = PushDeliveryEvent::new_news_flash_terminal(
+        stage,
+        attempt.kind,
+        attempt
+            .news_flash_decision_key
+            .expect("attempt decision key"),
+        attempt.channel,
+        attempt.rendered_len,
+        3,
+        attempt
+            .news_flash_business_date
+            .expect("attempt business date"),
+        attempt
+            .news_flash_reservation_sha256
+            .expect("attempt reservation"),
+        attempt.news_flash_sources.expect("attempt sources"),
+        attempt
+            .news_flash_evidence_sha256
+            .expect("attempt evidence SHA"),
+        attempt
+            .news_flash_render_sha256
+            .expect("attempt render SHA"),
+        attempt.news_flash_attempt_ordinal.expect("attempt ordinal"),
+        attempt_observed_at,
+        attempt
+            .news_flash_sink_attempt_identity
+            .expect("attempt identity"),
+        attempt.news_flash_sink_attempt_sha256.expect("attempt SHA"),
+        case.terminal.attempt.id.clone(),
+        remote_receipt,
+        terminal_observed_at,
+        reason_code,
+        transport_evidence_sha256,
+    );
+    case.terminal.terminal = EventEnvelope::from_event(
+        &terminal_event,
+        terminal_event
+            .news_flash_join_sha256
+            .clone()
+            .expect("terminal join"),
+        "TEST_CODE_W13_N02_TERMINAL_TRACE".to_owned(),
+        terminal_observed_at.with_timezone(&chrono::Local),
+    )
+    .expect("valid replacement terminal");
+    case.exact_terminal_bytes =
+        serde_json::to_vec(&case.terminal.terminal).expect("replacement terminal bytes");
 }
 
 #[test]
@@ -865,4 +949,192 @@ fn w13_n02_is_independent_from_n01_event_and_quota_observations() {
     };
     assert_eq!(first.binding_sha256(), second.binding_sha256());
     assert_eq!(first.evidence_sha256(), second.evidence_sha256());
+}
+
+#[test]
+fn w13_n02_dedicated_preserves_rejected_uncertain_and_open_states() {
+    for (stage, expected) in [
+        (NewsFlashTransactionStage::DefinitivelyRejected, "rejected"),
+        (NewsFlashTransactionStage::Uncertain, "uncertain"),
+    ] {
+        let mut case = n02_case();
+        replace_n02_terminal_stage(&mut case, stage);
+        let source = n02_source(&case, 0);
+        let result = verify_n02_dedicated(
+            &case.snapshot,
+            NewsFlashWindow::H0930,
+            &case.route,
+            &case.policy,
+            &source,
+            UtcMicros::try_new(1_787_027_405_000_000).expect("verified at"),
+        )
+        .expect("verify N02 non-Accepted terminal");
+        match (expected, result.view()) {
+            ("rejected", DeliveryResultView::TransportRejected(_))
+            | ("uncertain", DeliveryResultView::TransportUncertain(_)) => {}
+            (_, observed) => panic!("unexpected N02 disposition: {observed:?}"),
+        }
+        assert_eq!(
+            result.completion_eligibility(),
+            CompletionEligibility::Never
+        );
+    }
+
+    let case = n02_case();
+    for result in [
+        NewsFlashWindowTerminalQuery::Missing,
+        NewsFlashWindowTerminalQuery::PendingSeal,
+    ] {
+        let source = FakeN02Source {
+            result,
+            queried: RefCell::new(Vec::new()),
+            n01_quota_probe: 0,
+            unavailable: false,
+        };
+        assert!(matches!(
+            verify_n02_dedicated(
+                &case.snapshot,
+                NewsFlashWindow::H0930,
+                &case.route,
+                &case.policy,
+                &source,
+                UtcMicros::try_new(1_787_027_405_000_000).expect("verified at"),
+            ),
+            Err(DedicatedConformanceError::TerminalMissing)
+                | Err(DedicatedConformanceError::TerminalPendingSeal)
+        ));
+    }
+    let unavailable = FakeN02Source {
+        result: NewsFlashWindowTerminalQuery::Missing,
+        queried: RefCell::new(Vec::new()),
+        n01_quota_probe: 0,
+        unavailable: true,
+    };
+    assert_eq!(
+        verify_n02_dedicated(
+            &case.snapshot,
+            NewsFlashWindow::H0930,
+            &case.route,
+            &case.policy,
+            &unavailable,
+            UtcMicros::try_new(1_787_027_405_000_000).expect("verified at"),
+        ),
+        Err(DedicatedConformanceError::SourceUnavailable)
+    );
+}
+
+#[test]
+fn w13_n02_dedicated_fails_closed_on_exact_binding_corruption() {
+    let case = n02_case();
+    let wrong_window = n02_source(&case, 0);
+    assert!(verify_n02_dedicated(
+        &case.snapshot,
+        NewsFlashWindow::H1130,
+        &case.route,
+        &case.policy,
+        &wrong_window,
+        UtcMicros::try_new(1_787_027_405_000_000).expect("verified at"),
+    )
+    .is_err());
+
+    let wrong_channel_route = DedicatedConformanceRoute::try_new(
+        TerminalTemplateBinding::new(
+            TemplateId::try_new("news_flash_aggregated_v1".to_owned()).expect("template id"),
+            TemplateVersion::try_new("news_flash_aggregated_v1".to_owned())
+                .expect("template version"),
+        ),
+        ChannelId::try_new("TEST_CODE_W13_N02_WRONG_CHANNEL".to_owned()).expect("wrong channel"),
+    )
+    .expect("valid N02 route shape");
+    let source = n02_source(&case, 0);
+    assert!(verify_n02_dedicated(
+        &case.snapshot,
+        NewsFlashWindow::H0930,
+        &wrong_channel_route,
+        &case.policy,
+        &source,
+        UtcMicros::try_new(1_787_027_405_000_000).expect("verified at"),
+    )
+    .is_err());
+
+    for field in [
+        "audit_schema_version",
+        "kind",
+        "news_flash_business_date",
+        "news_flash_decision_key",
+        "news_flash_reservation_sha256",
+        "news_flash_attempt_ordinal",
+        "news_flash_attempt_observed_at",
+        "news_flash_sink_attempt_identity",
+        "news_flash_sink_attempt_sha256",
+        "news_flash_attempt_envelope_id",
+        "news_flash_evidence_sha256",
+        "news_flash_render_sha256",
+        "rendered_len",
+        "channel",
+        "news_flash_remote_receipt",
+    ] {
+        let case = n02_case();
+        let mut corrupt = case.terminal.clone();
+        corrupt.terminal.payload[field] = match field {
+            "audit_schema_version" | "news_flash_attempt_ordinal" | "rendered_len" => {
+                serde_json::json!(99)
+            }
+            "news_flash_remote_receipt" => serde_json::json!({
+                "accepted_at": "2026-08-18T09:30:03+08:00",
+                "channel": "TEST_CODE_W13_N02_WRONG_CHANNEL",
+                "latency_ms": 2,
+                "message_id": "TEST_CODE_W13_N02_MESSAGE",
+                "platform_message_id": "TEST_CODE_W13_N02_PLATFORM",
+                "provider": "TEST_CODE_W13_N02_SINK_PROVIDER"
+            }),
+            _ => serde_json::json!("TEST_CODE_W13_N02_CORRUPT"),
+        };
+        let source = FakeN02Source {
+            result: NewsFlashWindowTerminalQuery::Terminal(Box::new(corrupt)),
+            queried: RefCell::new(Vec::new()),
+            n01_quota_probe: 0,
+            unavailable: false,
+        };
+        assert!(
+            verify_n02_dedicated(
+                &case.snapshot,
+                NewsFlashWindow::H0930,
+                &case.route,
+                &case.policy,
+                &source,
+                UtcMicros::try_new(1_787_027_405_000_000).expect("verified at"),
+            )
+            .is_err(),
+            "corrupt field must fail closed: {field}"
+        );
+    }
+
+    let case = n02_case();
+    let mut alternate = case.terminal.clone();
+    alternate.terminal.trace_id = "TEST_CODE_W13_N02_OTHER_TERMINAL_TRACE".to_owned();
+    let alternate_bytes = serde_json::to_vec(&alternate.terminal).expect("alternate exact bytes");
+    let source = FakeN02Source {
+        result: NewsFlashWindowTerminalQuery::Terminal(Box::new(alternate)),
+        queried: RefCell::new(Vec::new()),
+        n01_quota_probe: 0,
+        unavailable: false,
+    };
+    let result = verify_n02_dedicated(
+        &case.snapshot,
+        NewsFlashWindow::H0930,
+        &case.route,
+        &case.policy,
+        &source,
+        UtcMicros::try_new(1_787_027_405_000_000).expect("verified at"),
+    )
+    .expect("valid alternate exact terminal envelope");
+    let DeliveryResultView::TransportAccepted(verified) = result.view() else {
+        panic!("expected alternate N02 Accepted");
+    };
+    assert_eq!(verified.evidence_sha256(), &raw_digest(&alternate_bytes));
+    assert_ne!(
+        verified.evidence_sha256(),
+        &raw_digest(&case.exact_terminal_bytes)
+    );
 }

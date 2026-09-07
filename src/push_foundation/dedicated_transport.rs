@@ -9,6 +9,13 @@ use crate::durable_delivery::{
     FoundationTerminalDisposition, P01DedicatedTerminalQuery, P01DedicatedTerminalRecord, PushKind,
     TypedReceipt,
 };
+use crate::event::envelope::{
+    news_flash_evidence_sha256, NewsFlashTransactionStage, NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION,
+};
+use crate::event::{
+    requery_news_flash_window_terminal_with, AuditDispatcher, EventEnvelope, NewsFlashWindow,
+    NewsFlashWindowTerminalQuery, NewsFlashWindowTerminalRecord, PushRecord,
+};
 use crate::monitor::push_job::{
     raw_digest, AttemptId, AuthorityClass, BusinessDate, ChannelId, CompletionPolicy, DecisionId,
     DeliveryResult, DurableSchemaVersion, Sha256Digest, SubjectId, TerminalDisposition,
@@ -25,6 +32,9 @@ use super::IntentSnapshot;
 const P01_UNIT_ID: &str = "MU-p01";
 const P01_TEMPLATE_ID: &str = "preopen_news_hot_v1";
 const P01_SOURCE_BINDING_SCHEMA: &str = "P01_SOURCE_BINDING_V1";
+const N02_UNIT_ID: &str = "MU-news-flash-aggregate";
+const N02_TEMPLATE_ID: &str = "news_flash_aggregated_v1";
+const N02_DURABLE_SCHEMA_VERSION: &str = "news-flash-authority-v5";
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum DedicatedConformanceError {
@@ -46,12 +56,25 @@ pub(crate) enum DedicatedConformanceError {
     InvalidP01Disposition,
     #[error("P01 dedicated accepted receipt channel is invalid")]
     P01ChannelMismatch,
+    #[error("N02 dedicated authority does not match field {field}")]
+    N02BindingMismatch { field: &'static str },
+    #[error("N02 dedicated terminal disposition is invalid")]
+    InvalidN02Disposition,
+    #[error("N02 dedicated accepted receipt channel is invalid")]
+    N02ChannelMismatch,
     #[error("W09 terminal authority verification failed")]
     TerminalVerificationFailed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DedicatedSpecialty {
+    P01,
+    N02,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DedicatedConformanceRoute {
+    specialty: DedicatedSpecialty,
     template: TerminalTemplateBinding,
     required_channel: ChannelId,
 }
@@ -61,10 +84,13 @@ impl DedicatedConformanceRoute {
         template: TerminalTemplateBinding,
         required_channel: ChannelId,
     ) -> Result<Self, DedicatedConformanceError> {
-        if template.template_id().as_str() != P01_TEMPLATE_ID {
-            return Err(DedicatedConformanceError::InvalidRoute);
-        }
+        let specialty = match template.template_id().as_str() {
+            P01_TEMPLATE_ID => DedicatedSpecialty::P01,
+            N02_TEMPLATE_ID => DedicatedSpecialty::N02,
+            _ => return Err(DedicatedConformanceError::InvalidRoute),
+        };
         Ok(Self {
+            specialty,
             template,
             required_channel,
         })
@@ -81,12 +107,33 @@ pub(crate) trait P01DedicatedTerminalSource {
     ) -> Result<P01DedicatedTerminalQuery, DedicatedSourceFailure>;
 }
 
+pub(crate) trait N02DedicatedTerminalSource {
+    fn requery_n02(
+        &self,
+        business_date: &BusinessDate,
+        window: NewsFlashWindow,
+    ) -> Result<NewsFlashWindowTerminalQuery, DedicatedSourceFailure>;
+}
+
 impl P01DedicatedTerminalSource for DurableDeliveryCoordinator {
     fn requery_p01(
         &self,
         business_date: &BusinessDate,
     ) -> Result<P01DedicatedTerminalQuery, DedicatedSourceFailure> {
         self.inspect_p01_dedicated_terminal(business_date.as_str())
+            .map_err(|_| DedicatedSourceFailure)
+    }
+}
+
+impl N02DedicatedTerminalSource for AuditDispatcher {
+    fn requery_n02(
+        &self,
+        business_date: &BusinessDate,
+        window: NewsFlashWindow,
+    ) -> Result<NewsFlashWindowTerminalQuery, DedicatedSourceFailure> {
+        let business_date = chrono::NaiveDate::parse_from_str(business_date.as_str(), "%Y-%m-%d")
+            .map_err(|_| DedicatedSourceFailure)?;
+        requery_news_flash_window_terminal_with(self, business_date, window)
             .map_err(|_| DedicatedSourceFailure)
     }
 }
@@ -107,7 +154,9 @@ pub(crate) fn verify_p01_dedicated(
     if attested.subject != SubjectId::Global {
         return Err(DedicatedConformanceError::P01BindingMismatch { field: "subject" });
     }
-    if route.template.template_id().as_str() != P01_TEMPLATE_ID {
+    if route.specialty != DedicatedSpecialty::P01
+        || route.template.template_id().as_str() != P01_TEMPLATE_ID
+    {
         return Err(DedicatedConformanceError::InvalidRoute);
     }
 
@@ -128,6 +177,251 @@ pub(crate) fn verify_p01_dedicated(
     let verified = verify_terminal(snapshot, &route.template, policy, &authority, verified_at)
         .map_err(|_| DedicatedConformanceError::TerminalVerificationFailed)?;
     Ok(verified.into_delivery_result())
+}
+
+pub(crate) fn verify_n02_dedicated(
+    snapshot: &IntentSnapshot,
+    window: NewsFlashWindow,
+    route: &DedicatedConformanceRoute,
+    policy: &CompletionPolicy,
+    source: &dyn N02DedicatedTerminalSource,
+    verified_at: UtcMicros,
+) -> Result<DeliveryResult, DedicatedConformanceError> {
+    let attested = snapshot
+        .attested_ready_binding()
+        .map_err(|_| DedicatedConformanceError::InvalidBusinessIntent)?;
+    if attested.unit_id.as_str() != N02_UNIT_ID {
+        return Err(DedicatedConformanceError::N02BindingMismatch { field: "unit_id" });
+    }
+    if attested.subject != SubjectId::Global {
+        return Err(DedicatedConformanceError::N02BindingMismatch { field: "subject" });
+    }
+    if route.specialty != DedicatedSpecialty::N02
+        || route.template.template_id().as_str() != N02_TEMPLATE_ID
+    {
+        return Err(DedicatedConformanceError::InvalidRoute);
+    }
+    let rendered_len = snapshot
+        .rendered_bytes()
+        .ok_or(DedicatedConformanceError::InvalidBusinessIntent)?
+        .len();
+
+    let source_record = match source
+        .requery_n02(&attested.business_date, window)
+        .map_err(|_| DedicatedConformanceError::SourceUnavailable)?
+    {
+        NewsFlashWindowTerminalQuery::Missing => {
+            return Err(DedicatedConformanceError::TerminalMissing)
+        }
+        NewsFlashWindowTerminalQuery::PendingSeal => {
+            return Err(DedicatedConformanceError::TerminalPendingSeal)
+        }
+        NewsFlashWindowTerminalQuery::Terminal(record) => *record,
+    };
+    let mapped = map_n02_terminal(&attested, rendered_len, window, route, source_record)?;
+    let authority = FixedDedicatedAuthority::new(mapped);
+    let verified = verify_terminal(snapshot, &route.template, policy, &authority, verified_at)
+        .map_err(|_| DedicatedConformanceError::TerminalVerificationFailed)?;
+    Ok(verified.into_delivery_result())
+}
+
+fn map_n02_terminal(
+    attested: &super::intent_store::AttestedReadyIntent,
+    rendered_len: usize,
+    window: NewsFlashWindow,
+    route: &DedicatedConformanceRoute,
+    source: NewsFlashWindowTerminalRecord,
+) -> Result<AuthorityTerminalRecord, DedicatedConformanceError> {
+    let attempt_bytes = canonical_n02_envelope(&source.attempt)?;
+    let terminal_bytes = canonical_n02_envelope(&source.terminal)?;
+    let attempt = PushRecord::try_from_authoritative(&source.attempt).map_err(|_| {
+        DedicatedConformanceError::N02BindingMismatch {
+            field: "attempt_envelope",
+        }
+    })?;
+    let terminal = PushRecord::try_from_authoritative(&source.terminal).map_err(|_| {
+        DedicatedConformanceError::N02BindingMismatch {
+            field: "terminal_envelope",
+        }
+    })?;
+    check_n02(
+        "audit_schema_version",
+        attempt.audit_schema_version == Some(NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION)
+            && terminal.audit_schema_version == Some(NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION),
+    )?;
+    check_n02(
+        "kind",
+        attempt.kind == N02_TEMPLATE_ID && terminal.kind == N02_TEMPLATE_ID,
+    )?;
+    let expected_date =
+        chrono::NaiveDate::parse_from_str(attested.business_date.as_str(), "%Y-%m-%d")
+            .map_err(|_| DedicatedConformanceError::InvalidBusinessIntent)?;
+    let expected_key = window.decision_key();
+    check_n02(
+        "business_date",
+        attempt.news_flash_business_date == Some(expected_date)
+            && terminal.news_flash_business_date == Some(expected_date),
+    )?;
+    check_n02(
+        "decision_key",
+        attempt.news_flash_decision_key.as_deref() == Some(expected_key.as_str())
+            && terminal.news_flash_decision_key.as_deref() == Some(expected_key.as_str()),
+    )?;
+    check_n02(
+        "attempt_stage",
+        attempt.news_flash_transaction_stage.as_deref()
+            == Some(NewsFlashTransactionStage::SinkAttempt.as_str()),
+    )?;
+    let terminal_stage = terminal
+        .news_flash_transaction_stage
+        .as_deref()
+        .and_then(NewsFlashTransactionStage::parse)
+        .ok_or(DedicatedConformanceError::InvalidN02Disposition)?;
+    if terminal_stage == NewsFlashTransactionStage::SinkAttempt {
+        return Err(DedicatedConformanceError::InvalidN02Disposition);
+    }
+    check_n02(
+        "reservation_sha256",
+        attempt.news_flash_reservation_sha256 == terminal.news_flash_reservation_sha256,
+    )?;
+    check_n02(
+        "attempt_ordinal",
+        attempt.news_flash_attempt_ordinal == terminal.news_flash_attempt_ordinal,
+    )?;
+    check_n02(
+        "attempt_observed_at",
+        attempt.news_flash_attempt_observed_at == terminal.news_flash_attempt_observed_at,
+    )?;
+    check_n02(
+        "sink_attempt_identity",
+        attempt.news_flash_sink_attempt_identity == terminal.news_flash_sink_attempt_identity,
+    )?;
+    check_n02(
+        "sink_attempt_sha256",
+        attempt.news_flash_sink_attempt_sha256 == terminal.news_flash_sink_attempt_sha256,
+    )?;
+    check_n02(
+        "attempt_envelope_id",
+        terminal.news_flash_attempt_envelope_id.as_deref() == Some(source.attempt.id.as_str()),
+    )?;
+    check_n02(
+        "ordered_sources",
+        attempt.news_flash_sources == terminal.news_flash_sources,
+    )?;
+    let sources = terminal.news_flash_sources.as_deref().ok_or(
+        DedicatedConformanceError::N02BindingMismatch {
+            field: "ordered_sources",
+        },
+    )?;
+    check_n02(
+        "source_evidence_sha256",
+        terminal.news_flash_evidence_sha256.as_deref()
+            == Some(news_flash_evidence_sha256(sources).as_str())
+            && attempt.news_flash_evidence_sha256 == terminal.news_flash_evidence_sha256,
+    )?;
+    check_n02(
+        "render_sha256",
+        attempt.news_flash_render_sha256 == terminal.news_flash_render_sha256
+            && terminal.news_flash_render_sha256.as_deref()
+                == Some(attested.rendered_sha256.as_str()),
+    )?;
+    check_n02(
+        "rendered_len",
+        attempt.rendered_len == rendered_len && terminal.rendered_len == rendered_len,
+    )?;
+    check_n02(
+        "channel",
+        attempt.channel == terminal.channel && terminal.channel == route.required_channel.as_str(),
+    )?;
+
+    let terminal_disposition = match terminal_stage {
+        NewsFlashTransactionStage::Accepted => {
+            let receipt = terminal
+                .news_flash_remote_receipt
+                .as_ref()
+                .ok_or(DedicatedConformanceError::InvalidN02Disposition)?;
+            if receipt.channel != route.required_channel.as_str()
+                || receipt.channel != attempt.channel
+            {
+                return Err(DedicatedConformanceError::N02ChannelMismatch);
+            }
+            TerminalDisposition::Accepted
+        }
+        NewsFlashTransactionStage::DefinitivelyRejected => TerminalDisposition::Rejected,
+        NewsFlashTransactionStage::Uncertain => TerminalDisposition::Uncertain,
+        NewsFlashTransactionStage::SinkAttempt => {
+            return Err(DedicatedConformanceError::InvalidN02Disposition)
+        }
+    };
+    let evidence_sha256 = raw_digest(&terminal_bytes);
+    let durable_schema_version =
+        DurableSchemaVersion::try_new(N02_DURABLE_SCHEMA_VERSION.to_owned()).map_err(|_| {
+            DedicatedConformanceError::N02BindingMismatch {
+                field: "durable_schema_version",
+            }
+        })?;
+    let mut mapped = AuthorityTerminalRecord {
+        ref_id: TerminalRefId::try_new(source.terminal.id)
+            .map_err(|_| DedicatedConformanceError::N02BindingMismatch { field: "ref_id" })?,
+        authority_class: AuthorityClass::N02Dedicated,
+        namespace: attested.namespace.clone(),
+        decision_id: attested.decision_id.clone(),
+        attempt_binding: AuthorityAttemptBinding::Attempt(
+            AttemptId::try_new(source.attempt.id).map_err(|_| {
+                DedicatedConformanceError::N02BindingMismatch {
+                    field: "attempt_envelope_id",
+                }
+            })?,
+        ),
+        intent_id: attested.intent_id.clone(),
+        unit_id: attested.unit_id.clone(),
+        occurrence: attested.occurrence.clone(),
+        business_date: attested.business_date.clone(),
+        subject: attested.subject.clone(),
+        audience: attested.audience.clone(),
+        template_id: route.template.template_id().clone(),
+        template_version: route.template.template_version().clone(),
+        rendered_sha256: attested.rendered_sha256.clone(),
+        terminal_disposition,
+        evidence_bytes: terminal_bytes,
+        evidence_sha256,
+        durable_schema_version,
+        binding_sha256: raw_digest(b"N02 terminal binding pending"),
+    };
+    mapped.binding_sha256 = terminal_binding_sha256(&mapped);
+    drop(attempt_bytes);
+    Ok(mapped)
+}
+
+fn canonical_n02_envelope(envelope: &EventEnvelope) -> Result<Vec<u8>, DedicatedConformanceError> {
+    let bytes = serde_json::to_vec(envelope).map_err(|_| {
+        DedicatedConformanceError::N02BindingMismatch {
+            field: "envelope_canonical",
+        }
+    })?;
+    let decoded: EventEnvelope = serde_json::from_slice(&bytes).map_err(|_| {
+        DedicatedConformanceError::N02BindingMismatch {
+            field: "envelope_canonical",
+        }
+    })?;
+    let canonical = serde_json::to_vec(&decoded).map_err(|_| {
+        DedicatedConformanceError::N02BindingMismatch {
+            field: "envelope_canonical",
+        }
+    })?;
+    if canonical != bytes {
+        return Err(DedicatedConformanceError::N02BindingMismatch {
+            field: "envelope_canonical",
+        });
+    }
+    Ok(bytes)
+}
+
+fn check_n02(field: &'static str, valid: bool) -> Result<(), DedicatedConformanceError> {
+    if !valid {
+        return Err(DedicatedConformanceError::N02BindingMismatch { field });
+    }
+    Ok(())
 }
 
 fn map_p01_terminal(
@@ -354,7 +648,7 @@ impl FixedDedicatedAuthority {
     fn new(record: AuthorityTerminalRecord) -> Self {
         Self {
             descriptor: AuthorityDescriptor {
-                authority_class: AuthorityClass::P01Dedicated,
+                authority_class: record.authority_class,
                 durable_schema_version: record.durable_schema_version.clone(),
             },
             record,
