@@ -5,6 +5,7 @@ mod dedicated_transport;
 mod generic_transport;
 mod intent_store;
 mod migration;
+mod operational_readiness;
 mod phase_scheduler;
 mod reconciler;
 mod terminal_authority;
@@ -25,6 +26,8 @@ mod business_finalizer_tests;
 mod dedicated_transport_tests;
 #[cfg(test)]
 mod generic_transport_tests;
+#[cfg(test)]
+mod operational_readiness_tests;
 #[cfg(test)]
 mod phase_scheduler_tests;
 #[cfg(test)]
