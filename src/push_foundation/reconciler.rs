@@ -4,13 +4,18 @@
 
 use std::collections::BTreeMap;
 
-use crate::monitor::push_job::{CompletionPolicy, UtcMicros};
+use crate::monitor::push_job::{CompletionPolicy, ReasonCode, TerminalDisposition, UtcMicros};
+
+use super::business_finalizer::{
+    commit_accepted_finalization, prepare_accepted_finalization, AcceptedFinalizationOutcome,
+    AcceptedPreparationOutcome, AcceptedPreparationRequest, BusinessFinalizerError, FinalizerFence,
+};
 
 use super::intent_store::{
     AttestedReadyIntent, BusinessIntentStore, IntentSnapshot, IntentState, IntentStoreError,
     LeaseOwnerId, RecoveryCursor, TransitionActor, TransitionOutcome,
 };
-use super::terminal_authority::{TerminalAuthorityPort, TerminalTemplateBinding};
+use super::terminal_authority::{verify_terminal, TerminalAuthorityPort, TerminalTemplateBinding};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum RecoveryBindingError {
@@ -169,6 +174,8 @@ pub(crate) enum RecoveryError {
     Store(#[from] IntentStoreError),
     #[error(transparent)]
     Binding(#[from] RecoveryBindingError),
+    #[error(transparent)]
+    Finalizer(#[from] BusinessFinalizerError),
     #[error("invalid recovery configuration: {check}")]
     InvalidConfig { check: &'static str },
     #[error("startup recovery exceeded its fixed-point iteration limit")]
@@ -244,8 +251,8 @@ fn reconcile_one(
         IntentState::PendingDispatch => Ok((current, RecoveryBoundary::DispatchPending, applied)),
         IntentState::AwaitingAuthority | IntentState::AwaitingFinalizer => {
             let intent = current.attested_ready_binding()?;
-            let _ = bindings.resolve(&intent)?;
-            Ok((current, RecoveryBoundary::AuthorityBlocked, applied))
+            let resolved = bindings.resolve(&intent)?;
+            reconcile_authority(store, current, config, resolved, applied)
         }
         IntentState::ResolutionRequired => {
             Ok((current, RecoveryBoundary::ManualResolutionRequired, applied))
@@ -255,6 +262,270 @@ fn reconcile_one(
         }
         .into()),
     }
+}
+
+fn reconcile_authority(
+    store: &mut BusinessIntentStore,
+    current: IntentSnapshot,
+    config: &RecoveryConfig,
+    bindings: RecoveryBindings<'_>,
+    applied_before_authority: usize,
+) -> Result<(IntentSnapshot, RecoveryBoundary, usize), RecoveryError> {
+    let intent = current.attested_ready_binding()?;
+    let lease_until = current
+        .lease_until()
+        .ok_or(IntentStoreError::IntegrityFailed {
+            check: "recovery_authority_lease_until",
+        })?;
+    if current.lease_owner() != Some(config.owner.as_str())
+        || current.lease_generation() == 0
+        || lease_until <= config.now
+    {
+        return Err(IntentStoreError::IntegrityFailed {
+            check: "recovery_authority_fence",
+        }
+        .into());
+    }
+
+    // W10 records an invalid terminal reference while already AwaitingFinalizer. Re-querying a
+    // still-invalid reference must remain read-only or every fixed-point pass would append again.
+    if current.reason() == ReasonCode::FinalizerTerminalRefInvalid
+        && verify_terminal(
+            &current,
+            bindings.template,
+            bindings.policy,
+            bindings.authority,
+            config.now,
+        )
+        .is_err()
+    {
+        return Ok((
+            current,
+            RecoveryBoundary::AuthorityBlocked,
+            applied_before_authority,
+        ));
+    }
+
+    let request = AcceptedPreparationRequest::new(
+        intent.intent_id.clone(),
+        current.version(),
+        config.actor.clone(),
+        FinalizerFence::new(
+            config.owner.clone(),
+            current.lease_generation(),
+            lease_until,
+        ),
+        config.now,
+        config.now,
+    )?;
+    match prepare_accepted_finalization(
+        store,
+        request,
+        bindings.template,
+        bindings.policy,
+        bindings.authority,
+    ) {
+        Ok(AcceptedPreparationOutcome::Pending(pending)) => {
+            let outcome = commit_accepted_finalization(
+                store,
+                pending,
+                bindings.template,
+                bindings.policy,
+                bindings.authority,
+                config.now,
+                config.now,
+            )?;
+            let persisted = store
+                .inspect(&intent.intent_id)?
+                .ok_or(IntentStoreError::IntentMissing)?;
+            let boundary = match outcome {
+                AcceptedFinalizationOutcome::Applied { .. }
+                | AcceptedFinalizationOutcome::AlreadyCommitted { .. } => {
+                    RecoveryBoundary::Finalized
+                }
+                AcceptedFinalizationOutcome::ResolutionRequired { .. } => {
+                    RecoveryBoundary::ManualResolutionRequired
+                }
+            };
+            let applied = applied_before_authority + version_delta(&current, &persisted)?;
+            Ok((persisted, boundary, applied))
+        }
+        Ok(AcceptedPreparationOutcome::AlreadyFinalized(_)) => {
+            let persisted = store
+                .inspect(&intent.intent_id)?
+                .ok_or(IntentStoreError::IntentMissing)?;
+            let applied = applied_before_authority + version_delta(&current, &persisted)?;
+            Ok((persisted, RecoveryBoundary::Finalized, applied))
+        }
+        Err(BusinessFinalizerError::DispositionNotCompletable { actual }) => {
+            reconcile_nonaccepted_disposition(
+                store,
+                current,
+                actual,
+                config,
+                applied_before_authority,
+            )
+        }
+        Err(BusinessFinalizerError::Terminal(_)) => {
+            record_authority_blocker(store, current, config, applied_before_authority)
+        }
+        Err(BusinessFinalizerError::TerminalInvalid { .. }) => {
+            let persisted = store
+                .inspect(&intent.intent_id)?
+                .ok_or(IntentStoreError::IntentMissing)?;
+            let applied = applied_before_authority + version_delta(&current, &persisted)?;
+            Ok((persisted, RecoveryBoundary::AuthorityBlocked, applied))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn reconcile_nonaccepted_disposition(
+    store: &mut BusinessIntentStore,
+    current: IntentSnapshot,
+    disposition: TerminalDisposition,
+    config: &RecoveryConfig,
+    applied_before_authority: usize,
+) -> Result<(IntentSnapshot, RecoveryBoundary, usize), RecoveryError> {
+    match (current.state(), disposition) {
+        (IntentState::AwaitingAuthority, TerminalDisposition::Rejected) => {
+            if current.reason() == ReasonCode::TransportRejected {
+                return Ok((
+                    current,
+                    RecoveryBoundary::RejectedAuthorizationRequired,
+                    applied_before_authority,
+                ));
+            }
+            apply_recovery_observation(
+                store,
+                current,
+                IntentState::AwaitingAuthority,
+                ReasonCode::TransportRejected,
+                RecoveryBoundary::RejectedAuthorizationRequired,
+                config,
+                applied_before_authority,
+            )
+        }
+        (
+            IntentState::AwaitingAuthority | IntentState::AwaitingFinalizer,
+            TerminalDisposition::Uncertain,
+        ) => apply_recovery_observation(
+            store,
+            current,
+            IntentState::ResolutionRequired,
+            ReasonCode::TransportUncertain,
+            RecoveryBoundary::ManualResolutionRequired,
+            config,
+            applied_before_authority,
+        ),
+        (IntentState::AwaitingAuthority, TerminalDisposition::ManualConfirmedNotDelivered) => Ok((
+            current,
+            RecoveryBoundary::OperatorAuditRequired,
+            applied_before_authority,
+        )),
+        (IntentState::AwaitingFinalizer, TerminalDisposition::Rejected)
+        | (IntentState::AwaitingFinalizer, TerminalDisposition::ManualConfirmedNotDelivered) => {
+            apply_recovery_observation(
+                store,
+                current,
+                IntentState::ResolutionRequired,
+                ReasonCode::OperatorResolutionConflict,
+                RecoveryBoundary::ManualResolutionRequired,
+                config,
+                applied_before_authority,
+            )
+        }
+        (_, TerminalDisposition::Accepted | TerminalDisposition::ManualConfirmedAccepted) => {
+            Err(IntentStoreError::IntegrityFailed {
+                check: "accepted_disposition_rejected_by_finalizer",
+            }
+            .into())
+        }
+        _ => Err(IntentStoreError::IntegrityFailed {
+            check: "nonaccepted_recovery_source_state",
+        }
+        .into()),
+    }
+}
+
+fn record_authority_blocker(
+    store: &mut BusinessIntentStore,
+    current: IntentSnapshot,
+    config: &RecoveryConfig,
+    applied_before_authority: usize,
+) -> Result<(IntentSnapshot, RecoveryBoundary, usize), RecoveryError> {
+    if current.reason() == ReasonCode::FinalizerTerminalRefInvalid {
+        return Ok((
+            current,
+            RecoveryBoundary::AuthorityBlocked,
+            applied_before_authority,
+        ));
+    }
+    apply_recovery_observation(
+        store,
+        current.clone(),
+        current.state(),
+        ReasonCode::FinalizerTerminalRefInvalid,
+        RecoveryBoundary::AuthorityBlocked,
+        config,
+        applied_before_authority,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_recovery_observation(
+    store: &mut BusinessIntentStore,
+    current: IntentSnapshot,
+    to_state: IntentState,
+    reason: ReasonCode,
+    boundary: RecoveryBoundary,
+    config: &RecoveryConfig,
+    applied_before_observation: usize,
+) -> Result<(IntentSnapshot, RecoveryBoundary, usize), RecoveryError> {
+    let intent = current.attested_ready_binding()?;
+    let fence_until = current
+        .lease_until()
+        .ok_or(IntentStoreError::IntegrityFailed {
+            check: "recovery_observation_lease_until",
+        })?;
+    let transition = store.apply_recovery_observation(
+        &current,
+        to_state,
+        reason,
+        &config.actor,
+        config.now,
+        &config.owner,
+        current.lease_generation(),
+        fence_until,
+    )?;
+    match transition {
+        TransitionOutcome::Applied(_) | TransitionOutcome::AlreadyCommitted(_) => {
+            let persisted = store
+                .inspect(&intent.intent_id)?
+                .ok_or(IntentStoreError::IntentMissing)?;
+            let applied = applied_before_observation + version_delta(&current, &persisted)?;
+            Ok((persisted, boundary, applied))
+        }
+        TransitionOutcome::Conflict { current } => {
+            Ok((*current, boundary, applied_before_observation))
+        }
+    }
+}
+
+fn version_delta(before: &IntentSnapshot, after: &IntentSnapshot) -> Result<usize, RecoveryError> {
+    let delta =
+        after
+            .version()
+            .checked_sub(before.version())
+            .ok_or(IntentStoreError::IntegrityFailed {
+                check: "recovery_version_regression",
+            })?;
+    usize::try_from(delta).map_err(|_| {
+        IntentStoreError::IntegrityFailed {
+            check: "recovery_transition_count_overflow",
+        }
+        .into()
+    })
 }
 
 enum LeaseRecovery {

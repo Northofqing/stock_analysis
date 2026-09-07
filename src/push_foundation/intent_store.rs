@@ -1196,6 +1196,59 @@ impl BusinessIntentStore {
         self.apply_transition_inner(&command, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_recovery_observation(
+        &mut self,
+        current: &IntentSnapshot,
+        to_state: IntentState,
+        reason: ReasonCode,
+        actor: &TransitionActor,
+        occurred_at: UtcMicros,
+        fence_owner: &LeaseOwnerId,
+        fence_generation: u64,
+        fence_until: UtcMicros,
+    ) -> Result<TransitionOutcome, IntentStoreError> {
+        let allowed = matches!(
+            (current.state, to_state, reason),
+            (
+                IntentState::AwaitingAuthority,
+                IntentState::AwaitingAuthority,
+                ReasonCode::TransportRejected | ReasonCode::FinalizerTerminalRefInvalid
+            ) | (
+                IntentState::AwaitingFinalizer,
+                IntentState::AwaitingFinalizer,
+                ReasonCode::FinalizerTerminalRefInvalid
+            ) | (
+                IntentState::AwaitingAuthority | IntentState::AwaitingFinalizer,
+                IntentState::ResolutionRequired,
+                ReasonCode::TransportUncertain | ReasonCode::OperatorResolutionConflict
+            )
+        );
+        if !allowed {
+            return Err(IntentStoreError::InvalidTransition {
+                check: "recovery_observation_edge",
+            });
+        }
+        let intent = current.attested_ready_binding()?;
+        let command = StoreTransitionCommand {
+            intent_id: intent.intent_id,
+            from_state: current.state,
+            to_state,
+            expected_version: current.version,
+            actor: actor.clone(),
+            reason,
+            occurred_at,
+            lease_action: LeaseAction::Preserve,
+            required_fence: Some(ExpectedLeaseFence {
+                owner: fence_owner.as_str().to_owned(),
+                generation: fence_generation,
+                until: fence_until,
+            }),
+            terminal: TerminalTransitionFields::default(),
+        };
+        self.apply_transition_inner(&command, None)
+    }
+
     #[cfg(test)]
     pub(crate) fn record_initial_with_fault(
         &mut self,
