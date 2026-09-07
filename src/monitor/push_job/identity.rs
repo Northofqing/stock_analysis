@@ -142,6 +142,10 @@ impl OccurrenceId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub(crate) fn from_digest(digest: &Sha256Digest) -> Self {
+        Self(digest.as_str().to_owned())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -159,6 +163,10 @@ pub struct IntentId(String);
 impl IntentId {
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub(crate) fn from_digest(digest: &Sha256Digest) -> Self {
+        Self(digest.as_str().to_owned())
     }
 }
 

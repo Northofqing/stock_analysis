@@ -27,6 +27,7 @@ pub(crate) use model::{
     FoundationDeliveryBinding, FoundationTerminalDisposition, FoundationTerminalQuery,
     FoundationTerminalRecord,
 };
+pub(crate) use schema::SCHEMA_VERSION as DURABLE_SCHEMA_VERSION;
 
 #[cfg(test)]
 mod tests;

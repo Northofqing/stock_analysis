@@ -5022,7 +5022,10 @@ impl DurableDeliveryCoordinator {
                     attempt_identity,
                     fence_token,
                     push_kind: envelope.push_kind,
-                    stable_template_id: envelope.push_kind.stable_template_id().to_owned(),
+                    stable_template_id: match envelope.foundation_binding() {
+                        Some(binding) => binding.template_id().to_owned(),
+                        None => envelope.push_kind.stable_template_id().to_owned(),
+                    },
                     rendered_content: envelope.rendered_content,
                     rendered_content_sha256: envelope.rendered_content_sha256,
                 },

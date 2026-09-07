@@ -629,6 +629,7 @@ pub(crate) struct AttestedReadyIntent {
     pub(crate) audience: AudienceId,
     pub(crate) template_sha256: Sha256Digest,
     pub(crate) rendered_sha256: Sha256Digest,
+    pub(crate) source_evidence_fingerprint: Sha256Digest,
 }
 
 impl IntentSnapshot {
@@ -732,6 +733,7 @@ impl IntentSnapshot {
             audience,
             template_sha256: self.template_sha256.clone(),
             rendered_sha256,
+            source_evidence_fingerprint: self.evidence_sha256.clone(),
         })
     }
 
