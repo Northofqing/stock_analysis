@@ -7915,3 +7915,229 @@ fn w12_terminal_read_model_rejects_legacy_unbound_authority() {
         .inspect_foundation_terminal(&candidate.decision_identity)
         .is_err());
 }
+
+fn w12_terminal_record(
+    fixture: &Fixture,
+    decision_identity: &str,
+) -> Box<FoundationTerminalRecord> {
+    match fixture
+        .coordinator
+        .inspect_foundation_terminal(decision_identity)
+        .expect("W12 terminal query")
+    {
+        FoundationTerminalQuery::Terminal(record) => record,
+        other => panic!("expected W12 terminal record, got {other:?}"),
+    }
+}
+
+#[test]
+fn w12_terminal_read_model_preserves_all_durable_terminal_dispositions() {
+    let rejected_fixture = Fixture::new("W12_REJECTED_TERMINAL");
+    let rejected_append = MemoryAppendPort::default();
+    let rejected = w12_foundation_envelope("REJECTED_TERMINAL");
+    prepare_reserved(&rejected_fixture, &rejected, &rejected_append);
+    let rejected_sink = StaticSink::new(AuthoritativeSinkResult::Rejected(rejection(now(), false)));
+    let rejected_sinks: Vec<AuthoritativeSink> = vec![rejected_sink];
+    rejected_fixture
+        .coordinator
+        .resume_deliverable(&rejected.decision_identity, &rejected_sinks, now())
+        .expect("record W12 rejection");
+    reconcile_terminal(
+        &rejected_fixture,
+        &rejected_append,
+        DecisionState::RejectedDurable,
+        &rejected.decision_identity,
+    );
+    let rejected_terminal = w12_terminal_record(&rejected_fixture, &rejected.decision_identity);
+    assert_eq!(
+        rejected_terminal.disposition(),
+        FoundationTerminalDisposition::Rejected
+    );
+    assert!(rejected_terminal.attempt_id().is_some());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(rejected_terminal.evidence_bytes())
+            .expect("typed rejection")["kind"],
+        "Rejected"
+    );
+
+    let denial_fixture = Fixture::new("W12_DENIAL_TERMINAL");
+    let denial_append = MemoryAppendPort::default();
+    let denial = w12_foundation_envelope("DENIAL_TERMINAL");
+    denial_fixture
+        .coordinator
+        .prepare(&denial, 0, now())
+        .expect("record W12 pre-attempt denial");
+    reconcile_terminal(
+        &denial_fixture,
+        &denial_append,
+        DecisionState::RejectedDurable,
+        &denial.decision_identity,
+    );
+    let denial_terminal = w12_terminal_record(&denial_fixture, &denial.decision_identity);
+    assert_eq!(
+        denial_terminal.disposition(),
+        FoundationTerminalDisposition::Rejected
+    );
+    assert!(denial_terminal.attempt_id().is_none());
+
+    let uncertain_fixture = Fixture::new("W12_UNCERTAIN_TERMINAL");
+    let uncertain_append = MemoryAppendPort::default();
+    let uncertain = w12_foundation_envelope("UNCERTAIN_TERMINAL");
+    prepare_reserved(&uncertain_fixture, &uncertain, &uncertain_append);
+    let uncertain_sink = StaticSink::new(AuthoritativeSinkResult::Uncertain(uncertainty(now())));
+    let uncertain_sinks: Vec<AuthoritativeSink> = vec![uncertain_sink];
+    uncertain_fixture
+        .coordinator
+        .resume_deliverable(&uncertain.decision_identity, &uncertain_sinks, now())
+        .expect("record W12 uncertainty");
+    reconcile_terminal(
+        &uncertain_fixture,
+        &uncertain_append,
+        DecisionState::UncertainManualReview,
+        &uncertain.decision_identity,
+    );
+    let uncertain_terminal = w12_terminal_record(&uncertain_fixture, &uncertain.decision_identity);
+    assert_eq!(
+        uncertain_terminal.disposition(),
+        FoundationTerminalDisposition::Uncertain
+    );
+    assert!(uncertain_terminal.attempt_id().is_some());
+
+    let manual_rejected_fixture = Fixture::new("W12_MANUAL_REJECTED_TERMINAL");
+    let manual_rejected_append = MemoryAppendPort::default();
+    let manual_rejected = w12_foundation_envelope("MANUAL_REJECTED_TERMINAL");
+    prepare_reserved(
+        &manual_rejected_fixture,
+        &manual_rejected,
+        &manual_rejected_append,
+    );
+    let uncertain_sink = StaticSink::new(AuthoritativeSinkResult::Uncertain(uncertainty(now())));
+    let uncertain_sinks: Vec<AuthoritativeSink> = vec![uncertain_sink];
+    manual_rejected_fixture
+        .coordinator
+        .resume_deliverable(&manual_rejected.decision_identity, &uncertain_sinks, now())
+        .expect("record uncertainty before manual rejection");
+    reconcile_terminal(
+        &manual_rejected_fixture,
+        &manual_rejected_append,
+        DecisionState::UncertainManualReview,
+        &manual_rejected.decision_identity,
+    );
+    manual_rejected_fixture
+        .coordinator
+        .resolve_uncertain(
+            &ManualResolutionCommand {
+                decision_identity: manual_rejected.decision_identity.clone(),
+                disposition: ManualDisposition::Rejected,
+                operator_identity: "TEST_CODE_W12_OPERATOR".to_owned(),
+                reason: "TEST_CODE_W12_CONFIRMED_NOT_DELIVERED".to_owned(),
+                external_evidence: b"TEST_CODE_W12_MANUAL_REJECTION_EVIDENCE".to_vec(),
+                resolved_at: now(),
+            },
+            &manual_rejected_append,
+        )
+        .expect("record W12 manual rejection");
+    reconcile_terminal(
+        &manual_rejected_fixture,
+        &manual_rejected_append,
+        DecisionState::ManualResolvedRejected,
+        &manual_rejected.decision_identity,
+    );
+    let manual_rejected_terminal =
+        w12_terminal_record(&manual_rejected_fixture, &manual_rejected.decision_identity);
+    assert_eq!(
+        manual_rejected_terminal.disposition(),
+        FoundationTerminalDisposition::ManualNotDelivered
+    );
+    assert!(manual_rejected_terminal.attempt_id().is_some());
+
+    let manual_accepted_fixture = Fixture::new("W12_MANUAL_ACCEPTED_TERMINAL");
+    let manual_accepted_append = MemoryAppendPort::default();
+    let manual_accepted = w12_foundation_envelope("MANUAL_ACCEPTED_TERMINAL");
+    prepare_reserved(
+        &manual_accepted_fixture,
+        &manual_accepted,
+        &manual_accepted_append,
+    );
+    let uncertain_sink = StaticSink::new(AuthoritativeSinkResult::Uncertain(uncertainty(now())));
+    let uncertain_sinks: Vec<AuthoritativeSink> = vec![uncertain_sink];
+    manual_accepted_fixture
+        .coordinator
+        .resume_deliverable(&manual_accepted.decision_identity, &uncertain_sinks, now())
+        .expect("record uncertainty before manual acceptance");
+    reconcile_terminal(
+        &manual_accepted_fixture,
+        &manual_accepted_append,
+        DecisionState::UncertainManualReview,
+        &manual_accepted.decision_identity,
+    );
+    manual_accepted_fixture
+        .coordinator
+        .resolve_uncertain(
+            &ManualResolutionCommand {
+                decision_identity: manual_accepted.decision_identity.clone(),
+                disposition: ManualDisposition::Accepted {
+                    receipt: Some(receipt(now())),
+                },
+                operator_identity: "TEST_CODE_W12_OPERATOR".to_owned(),
+                reason: "TEST_CODE_W12_CONFIRMED_DELIVERED".to_owned(),
+                external_evidence: b"TEST_CODE_W12_MANUAL_ACCEPTANCE_EVIDENCE".to_vec(),
+                resolved_at: now(),
+            },
+            &manual_accepted_append,
+        )
+        .expect("record W12 manual acceptance");
+    reconcile_terminal(
+        &manual_accepted_fixture,
+        &manual_accepted_append,
+        DecisionState::Delivered,
+        &manual_accepted.decision_identity,
+    );
+    let manual_accepted_terminal =
+        w12_terminal_record(&manual_accepted_fixture, &manual_accepted.decision_identity);
+    assert_eq!(
+        manual_accepted_terminal.disposition(),
+        FoundationTerminalDisposition::ManualAccepted
+    );
+    assert!(manual_accepted_terminal.attempt_id().is_some());
+}
+
+#[test]
+fn w12_terminal_read_model_fails_closed_on_corrupt_disposition_join() {
+    let fixture = Fixture::new("W12_CORRUPT_TERMINAL");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("CORRUPT_TERMINAL");
+    prepare_reserved(&fixture, &candidate, &append);
+    let sink = StaticSink::new(AuthoritativeSinkResult::Rejected(rejection(now(), false)));
+    let sinks: Vec<AuthoritativeSink> = vec![sink];
+    fixture
+        .coordinator
+        .resume_deliverable(&candidate.decision_identity, &sinks, now())
+        .expect("record W12 rejection before corruption");
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::RejectedDurable,
+        &candidate.decision_identity,
+    );
+
+    let connection = Connection::open(&fixture.database_path).expect("open corruption connection");
+    connection
+        .execute_batch("DROP TRIGGER immutable_disposition_payload_update;")
+        .expect("drop TEST_CODE immutable trigger");
+    connection
+        .execute(
+            "UPDATE delivery_disposition_payloads SET disposition_sha256=?1 \
+             WHERE decision_identity=?2",
+            params![
+                sha256_hex(b"TEST_CODE_W12_CORRUPT"),
+                candidate.decision_identity
+            ],
+        )
+        .expect("inject TEST_CODE disposition corruption");
+
+    assert!(fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .is_err());
+}
