@@ -697,8 +697,32 @@ impl FoundationDeliveryBinding {
         &self.application_decision_id
     }
 
+    pub(crate) fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
     pub(crate) fn intent_id(&self) -> &str {
         &self.intent_id
+    }
+
+    pub(crate) fn unit_id(&self) -> &str {
+        &self.unit_id
+    }
+
+    pub(crate) fn occurrence_id(&self) -> &str {
+        &self.occurrence_id
+    }
+
+    pub(crate) fn business_date(&self) -> &str {
+        &self.business_date
+    }
+
+    pub(crate) fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    pub(crate) fn audience(&self) -> &str {
+        &self.audience
     }
 
     pub(crate) fn required_channel(&self) -> &str {
@@ -711,6 +735,10 @@ impl FoundationDeliveryBinding {
 
     pub(crate) fn template_id(&self) -> &str {
         &self.template_id
+    }
+
+    pub(crate) fn template_version(&self) -> &str {
+        &self.template_version
     }
 
     pub(crate) fn canonical_sha256(&self) -> Result<String> {
@@ -1055,6 +1083,74 @@ impl fmt::Display for DecisionState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FoundationTerminalDisposition {
+    Accepted,
+    Rejected,
+    Uncertain,
+    ManualAccepted,
+    ManualNotDelivered,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct FoundationTerminalRecord {
+    pub(crate) binding: FoundationDeliveryBinding,
+    pub(crate) ref_id: String,
+    pub(crate) attempt_id: Option<String>,
+    pub(crate) disposition: FoundationTerminalDisposition,
+    pub(crate) evidence_bytes: Vec<u8>,
+    pub(crate) evidence_sha256: String,
+    pub(crate) durable_schema_version: i64,
+}
+
+impl FoundationTerminalRecord {
+    pub(crate) fn disposition(&self) -> FoundationTerminalDisposition {
+        self.disposition
+    }
+
+    pub(crate) fn attempt_id(&self) -> Option<&str> {
+        self.attempt_id.as_deref()
+    }
+
+    pub(crate) fn required_channel(&self) -> &str {
+        self.binding.required_channel()
+    }
+
+    pub(crate) fn evidence_bytes(&self) -> &[u8] {
+        &self.evidence_bytes
+    }
+
+    pub(crate) fn evidence_sha256(&self) -> &str {
+        &self.evidence_sha256
+    }
+
+    pub(crate) fn durable_schema_version(&self) -> i64 {
+        self.durable_schema_version
+    }
+}
+
+impl fmt::Debug for FoundationTerminalRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FoundationTerminalRecord")
+            .field("decision_id", &self.binding.application_decision_id)
+            .field("ref_id", &self.ref_id)
+            .field("attempt_id", &self.attempt_id)
+            .field("disposition", &self.disposition)
+            .field("evidence_len", &self.evidence_bytes.len())
+            .field("evidence_sha256", &self.evidence_sha256)
+            .field("durable_schema_version", &self.durable_schema_version)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FoundationTerminalQuery {
+    Missing,
+    PendingSeal { state: DecisionState },
+    Terminal(Box<FoundationTerminalRecord>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -10,7 +10,6 @@ mod model;
 mod schema;
 
 pub use coordinator::DurableDeliveryCoordinator;
-pub(crate) use model::FoundationDeliveryBinding;
 pub use model::{
     compiled_policy_catalog, AuthoritativeDeliveryRequest, AuthoritativeSink,
     AuthoritativeSinkPort, AuthoritativeSinkResult, AuthorityWatermark,
@@ -23,6 +22,10 @@ pub use model::{
     ReviewTerminalReplayInput, ReviewTerminalReplayStartCanonical, ScheduleHydration,
     ScheduleHydrationState, StoreEnvironment, TaskBinding, TypedReceipt, TypedRejection,
     TypedUncertainty, WindowMode, DAILY_BUDGET_LIMIT, ENVELOPE_VERSION, POLICY_VERSION,
+};
+pub(crate) use model::{
+    FoundationDeliveryBinding, FoundationTerminalDisposition, FoundationTerminalQuery,
+    FoundationTerminalRecord,
 };
 
 #[cfg(test)]

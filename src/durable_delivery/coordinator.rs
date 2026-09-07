@@ -2,14 +2,15 @@ use super::model::{
     compiled_policy_catalog, has_non_ascii_whitespace, sha256_hex, stable_identity,
     AcceptedSinkResultCanonical, AuthoritativeDeliveryRequest, AuthoritativeSink,
     AuthoritativeSinkResult, AuthorityWatermark, CoordinatorConfig, DecisionState,
-    DeliveryDispositionCanonical, DeliveryEnvelope, DurableDeliveryError, ImmutableAppendPort,
-    ManualAcceptedDeliveryAuditEvidence, ManualDisposition, ManualResolutionAuthorizationCanonical,
-    ManualResolutionCommand, PolicyRow, PrepareOutcome, ReconcileSummary, Result, ResumeOutcome,
-    ReviewTerminalReplayAttempt, ReviewTerminalReplayCompletion,
-    ReviewTerminalReplayCompletionCanonical, ReviewTerminalReplayCompletionState,
-    ReviewTerminalReplayInput, ReviewTerminalReplayStartCanonical, ScheduleHydration,
-    ScheduleHydrationState, TaskTransitionCanonical, WindowMode, DAILY_BUDGET_LIMIT,
-    MANUAL_ACCEPTED_DELIVERY_AUDIT_DOMAIN,
+    DeliveryDispositionCanonical, DeliveryEnvelope, DurableDeliveryError,
+    FoundationTerminalDisposition, FoundationTerminalQuery, FoundationTerminalRecord,
+    ImmutableAppendPort, ManualAcceptedDeliveryAuditEvidence, ManualDisposition,
+    ManualResolutionAuthorizationCanonical, ManualResolutionCommand, PolicyRow, PrepareOutcome,
+    ReconcileSummary, Result, ResumeOutcome, ReviewTerminalReplayAttempt,
+    ReviewTerminalReplayCompletion, ReviewTerminalReplayCompletionCanonical,
+    ReviewTerminalReplayCompletionState, ReviewTerminalReplayInput,
+    ReviewTerminalReplayStartCanonical, ScheduleHydration, ScheduleHydrationState,
+    TaskTransitionCanonical, WindowMode, DAILY_BUDGET_LIMIT, MANUAL_ACCEPTED_DELIVERY_AUDIT_DOMAIN,
 };
 use super::schema::{
     configure_attested_connection, initialize_schema, load_policy, materialize_wal_capability,
@@ -2836,6 +2837,85 @@ impl DurableDeliveryCoordinator {
             load_decision(connection, decision_identity)?
                 .map(|stored| stored.state)
                 .ok_or_else(|| DurableDeliveryError::DecisionNotFound(decision_identity.to_owned()))
+        })
+    }
+
+    pub(crate) fn inspect_foundation_terminal(
+        &self,
+        decision_identity: &str,
+    ) -> Result<FoundationTerminalQuery> {
+        self.with_connection(|connection| {
+            let Some(stored) = load_decision(connection, decision_identity)? else {
+                return Ok(FoundationTerminalQuery::Missing);
+            };
+            if sha256_hex(&stored.envelope_canonical) != stored.envelope_sha256 {
+                return Err(DurableDeliveryError::PolicyMismatch(
+                    "foundation authority envelope hash mismatch".to_owned(),
+                ));
+            }
+            let envelope = parse_envelope(&stored.envelope_canonical)?;
+            if envelope.canonical_bytes()? != stored.envelope_canonical {
+                return Err(DurableDeliveryError::PolicyMismatch(
+                    "foundation authority envelope bytes are not canonical".to_owned(),
+                ));
+            }
+            let binding = envelope.foundation_binding().cloned().ok_or_else(|| {
+                DurableDeliveryError::PolicyMismatch(
+                    "foundation authority binding is missing".to_owned(),
+                )
+            })?;
+            if binding.application_decision_id() != stored.decision_identity {
+                return Err(DurableDeliveryError::PolicyMismatch(
+                    "foundation authority decision binding mismatch".to_owned(),
+                ));
+            }
+
+            if stored.state != DecisionState::Delivered {
+                return Ok(FoundationTerminalQuery::PendingSeal {
+                    state: stored.state,
+                });
+            }
+            let disposition = load_current_disposition_evidence(connection, &stored)?;
+            if disposition.disposition != "Accepted" {
+                return Err(DurableDeliveryError::PolicyMismatch(format!(
+                    "foundation Delivered authority disposition {} is not yet supported",
+                    disposition.disposition
+                )));
+            }
+            validate_authoritative_accepted_delivery_evidence(
+                connection,
+                &stored,
+                &envelope,
+                &disposition,
+            )?;
+            let attempt_id = disposition.attempt_identity.clone().ok_or_else(|| {
+                DurableDeliveryError::PolicyMismatch(
+                    "foundation accepted authority attempt is missing".to_owned(),
+                )
+            })?;
+            let (evidence_bytes, evidence_sha256): (Vec<u8>, String) = connection.query_row(
+                "SELECT result_canonical,result_sha256 FROM sink_results \
+                     WHERE decision_identity=?1 AND attempt_identity=?2 \
+                       AND authoritative_for_state=1 AND result_kind='Accepted'",
+                params![stored.decision_identity.as_str(), attempt_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if sha256_hex(&evidence_bytes) != evidence_sha256 {
+                return Err(DurableDeliveryError::PolicyMismatch(
+                    "foundation accepted authority evidence hash mismatch".to_owned(),
+                ));
+            }
+            Ok(FoundationTerminalQuery::Terminal(Box::new(
+                FoundationTerminalRecord {
+                    binding,
+                    ref_id: disposition.disposition_identity,
+                    attempt_id: Some(attempt_id),
+                    disposition: FoundationTerminalDisposition::Accepted,
+                    evidence_bytes,
+                    evidence_sha256,
+                    durable_schema_version: SCHEMA_VERSION,
+                },
+            )))
         })
     }
 
