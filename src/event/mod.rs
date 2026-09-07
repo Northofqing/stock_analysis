@@ -253,6 +253,54 @@ pub enum NewsFlashReconcileError {
     RecordConflict(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NewsFlashWindow {
+    H0930,
+    H1130,
+    H1300,
+    H1500,
+}
+
+impl NewsFlashWindow {
+    pub(crate) fn parse(label: &str) -> Result<Self, NewsFlashReconcileError> {
+        match label {
+            "09:30" => Ok(Self::H0930),
+            "11:30" => Ok(Self::H1130),
+            "13:00" => Ok(Self::H1300),
+            "15:00" => Ok(Self::H1500),
+            _ => Err(NewsFlashReconcileError::RecordConflict(format!(
+                "unsupported aggregate window {label}"
+            ))),
+        }
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::H0930 => "09:30",
+            Self::H1130 => "11:30",
+            Self::H1300 => "13:00",
+            Self::H1500 => "15:00",
+        }
+    }
+
+    pub(crate) fn decision_key(self) -> String {
+        format!("window:{}", self.label())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NewsFlashWindowTerminalRecord {
+    pub(crate) attempt: EventEnvelope,
+    pub(crate) terminal: EventEnvelope,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum NewsFlashWindowTerminalQuery {
+    Missing,
+    PendingSeal,
+    Terminal(Box<NewsFlashWindowTerminalRecord>),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewsFlashAuthoritySnapshot {
     business_date: chrono::NaiveDate,
@@ -914,6 +962,219 @@ pub fn reconcile_news_flash_business_date(
     reconcile_news_flash_business_date_with(dispatcher.as_ref(), business_date)
 }
 
+pub(crate) fn requery_news_flash_window_terminal_with(
+    dispatcher: &AuditDispatcher,
+    business_date: chrono::NaiveDate,
+    window: NewsFlashWindow,
+) -> Result<NewsFlashWindowTerminalQuery, NewsFlashReconcileError> {
+    use chrono::Datelike;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TerminalState {
+        Accepted,
+        DefinitivelyRejected,
+        Uncertain,
+    }
+
+    struct AttemptState {
+        envelope: EventEnvelope,
+        record: PushRecord,
+        terminal: Option<(EventEnvelope, TerminalState)>,
+    }
+
+    let envelopes = dispatcher
+        .read_authoritative_year(business_date.year())
+        .map_err(NewsFlashReconcileError::InvalidChain)?;
+    let target_key = window.decision_key();
+    let mut attempts = std::collections::BTreeMap::<String, AttemptState>::new();
+    let mut attempt_order = Vec::<String>::new();
+    let mut reservation: Option<String> = None;
+
+    for envelope in envelopes {
+        if envelope
+            .payload
+            .get("audit_schema_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(u64::from(
+                envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION,
+            ))
+        {
+            continue;
+        }
+        let record = PushRecord::try_from_authoritative(&envelope)
+            .map_err(|error| NewsFlashReconcileError::InvalidChain(error.to_string()))?;
+        if record.audit_schema_version != Some(envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION) {
+            return Err(NewsFlashReconcileError::RecordConflict(
+                "NewsFlash delivery audit schema mismatch".into(),
+            ));
+        }
+        let Some(stage) = record
+            .news_flash_transaction_stage
+            .as_deref()
+            .and_then(envelope::NewsFlashTransactionStage::parse)
+        else {
+            continue;
+        };
+        if record.kind != "news_flash_aggregated_v1" {
+            continue;
+        }
+        let record_key = record.news_flash_decision_key.as_deref().ok_or_else(|| {
+            NewsFlashReconcileError::RecordConflict("decision key missing".into())
+        })?;
+        accepted_window_label(record_key)?;
+        let record_date = record.news_flash_business_date.ok_or_else(|| {
+            NewsFlashReconcileError::RecordConflict("business date missing".into())
+        })?;
+        let targets_window = record_date == business_date && record_key == target_key;
+
+        match stage {
+            envelope::NewsFlashTransactionStage::SinkAttempt => {
+                if !targets_window {
+                    continue;
+                }
+                let current_reservation = record
+                    .news_flash_reservation_sha256
+                    .as_deref()
+                    .ok_or_else(|| {
+                        NewsFlashReconcileError::RecordConflict("reservation hash missing".into())
+                    })?;
+                if reservation
+                    .as_deref()
+                    .is_some_and(|expected| expected != current_reservation)
+                {
+                    return Err(NewsFlashReconcileError::RecordConflict(
+                        "window attempts use different reservations".into(),
+                    ));
+                }
+                reservation.get_or_insert_with(|| current_reservation.to_owned());
+                let ordinal = record.news_flash_attempt_ordinal.ok_or_else(|| {
+                    NewsFlashReconcileError::RecordConflict("attempt ordinal missing".into())
+                })?;
+                if ordinal == 0 {
+                    return Err(NewsFlashReconcileError::RecordConflict(
+                        "attempt ordinal must be positive".into(),
+                    ));
+                }
+                if let Some(previous_id) = attempt_order.last() {
+                    let previous = attempts.get(previous_id).ok_or_else(|| {
+                        NewsFlashReconcileError::RecordConflict(
+                            "prior window attempt disappeared".into(),
+                        )
+                    })?;
+                    let previous_ordinal =
+                        previous.record.news_flash_attempt_ordinal.ok_or_else(|| {
+                            NewsFlashReconcileError::RecordConflict(
+                                "prior attempt ordinal missing".into(),
+                            )
+                        })?;
+                    if ordinal <= previous_ordinal {
+                        return Err(NewsFlashReconcileError::RecordConflict(
+                            "window attempt ordinal must increase strictly".into(),
+                        ));
+                    }
+                    if !matches!(
+                        previous.terminal.as_ref().map(|(_, state)| *state),
+                        Some(TerminalState::DefinitivelyRejected)
+                    ) {
+                        return Err(NewsFlashReconcileError::RecordConflict(
+                            "only a definitively rejected attempt may open a later attempt".into(),
+                        ));
+                    }
+                }
+                let attempt_id = envelope.id.clone();
+                if attempts
+                    .insert(
+                        attempt_id.clone(),
+                        AttemptState {
+                            envelope,
+                            record,
+                            terminal: None,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(NewsFlashReconcileError::RecordConflict(
+                        "duplicate sink attempt envelope".into(),
+                    ));
+                }
+                attempt_order.push(attempt_id);
+            }
+            envelope::NewsFlashTransactionStage::Accepted
+            | envelope::NewsFlashTransactionStage::DefinitivelyRejected
+            | envelope::NewsFlashTransactionStage::Uncertain => {
+                let attempt_id = record
+                    .news_flash_attempt_envelope_id
+                    .as_deref()
+                    .ok_or_else(|| {
+                        NewsFlashReconcileError::RecordConflict(
+                            "terminal attempt envelope missing".into(),
+                        )
+                    })?;
+                if !targets_window && !attempts.contains_key(attempt_id) {
+                    continue;
+                }
+                let attempt = attempts.get_mut(attempt_id).ok_or_else(|| {
+                    NewsFlashReconcileError::RecordConflict(format!(
+                        "terminal precedes or lacks sink attempt {attempt_id}"
+                    ))
+                })?;
+                validate_terminal_attempt_binding(&attempt.record, &record)?;
+                let terminal_state = match stage {
+                    envelope::NewsFlashTransactionStage::Accepted => TerminalState::Accepted,
+                    envelope::NewsFlashTransactionStage::DefinitivelyRejected => {
+                        TerminalState::DefinitivelyRejected
+                    }
+                    envelope::NewsFlashTransactionStage::Uncertain => TerminalState::Uncertain,
+                    envelope::NewsFlashTransactionStage::SinkAttempt => {
+                        return Err(NewsFlashReconcileError::RecordConflict(
+                            "sink attempt entered terminal branch".into(),
+                        ))
+                    }
+                };
+                if attempt
+                    .terminal
+                    .replace((envelope, terminal_state))
+                    .is_some()
+                {
+                    return Err(NewsFlashReconcileError::RecordConflict(format!(
+                        "multiple terminal records for attempt {attempt_id}"
+                    )));
+                }
+            }
+        }
+    }
+
+    let Some(latest_id) = attempt_order.last() else {
+        return Ok(NewsFlashWindowTerminalQuery::Missing);
+    };
+    let accepted_count = attempt_order
+        .iter()
+        .filter(|attempt_id| {
+            attempts
+                .get(*attempt_id)
+                .and_then(|attempt| attempt.terminal.as_ref())
+                .is_some_and(|(_, state)| *state == TerminalState::Accepted)
+        })
+        .count();
+    if accepted_count > 1 {
+        return Err(NewsFlashReconcileError::RecordConflict(
+            "window has multiple Accepted terminals".into(),
+        ));
+    }
+    let latest = attempts.get(latest_id).ok_or_else(|| {
+        NewsFlashReconcileError::RecordConflict("latest window attempt disappeared".into())
+    })?;
+    let Some((terminal, _)) = &latest.terminal else {
+        return Ok(NewsFlashWindowTerminalQuery::PendingSeal);
+    };
+    Ok(NewsFlashWindowTerminalQuery::Terminal(Box::new(
+        NewsFlashWindowTerminalRecord {
+            attempt: latest.envelope.clone(),
+            terminal: terminal.clone(),
+        },
+    )))
+}
+
 fn reconcile_news_flash_business_date_with(
     dispatcher: &AuditDispatcher,
     business_date: chrono::NaiveDate,
@@ -1102,12 +1363,7 @@ fn accepted_window_label(decision_key: &str) -> Result<String, NewsFlashReconcil
             "aggregate decision key must use window:<label>".into(),
         )
     })?;
-    if !matches!(label, "09:30" | "11:30" | "13:00" | "15:00") {
-        return Err(NewsFlashReconcileError::RecordConflict(format!(
-            "unsupported aggregate window {label}"
-        )));
-    }
-    Ok(label.to_owned())
+    Ok(NewsFlashWindow::parse(label)?.label().to_owned())
 }
 
 fn validate_terminal_attempt_binding(
@@ -1861,6 +2117,14 @@ mod delivery_observation_tests {
             Some("Accepted")
         );
         assert_eq!(terminal.news_flash_attempt_ordinal, Some(2));
+        assert!(matches!(
+            requery_news_flash_window_terminal_with(
+                &dispatcher,
+                business_date,
+                NewsFlashWindow::H1130,
+            ),
+            Ok(NewsFlashWindowTerminalQuery::Missing)
+        ));
 
         let forbidden = persist_news_flash_attempt_with(
             &dispatcher,
@@ -1876,6 +2140,152 @@ mod delivery_observation_tests {
             ),
             Err(NewsFlashReconcileError::RecordConflict(_))
         ));
+
+        for (label, first_ordinal, second_ordinal) in [
+            ("W13_N02_DUP_ORDINAL", 1, 1),
+            ("W13_N02_ROLLBACK_ORDINAL", 2, 1),
+        ] {
+            let fixture = dispatcher::TestAuditNamespace::new(label);
+            let dispatcher = fixture.dispatcher();
+            let first = persist_news_flash_attempt_with(
+                &dispatcher,
+                w13_n02_attempt_input(first_ordinal, observed_at),
+            )
+            .unwrap();
+            persist_news_flash_terminal_with(
+                &dispatcher,
+                &first,
+                NewsFlashTerminalAuditInput {
+                    disposition: NewsFlashTerminalDisposition::DefinitivelyRejected {
+                        reason_code: "TEST_CODE_W13_N02_REJECTED".to_owned(),
+                        transport_evidence_sha256: "f".repeat(64),
+                    },
+                    observed_at: observed_at + chrono::Duration::seconds(1),
+                    latency_ms: 1,
+                },
+            )
+            .unwrap();
+            persist_news_flash_attempt_with(
+                &dispatcher,
+                w13_n02_attempt_input(second_ordinal, observed_at + chrono::Duration::seconds(2)),
+            )
+            .unwrap();
+            assert!(matches!(
+                requery_news_flash_window_terminal_with(
+                    &dispatcher,
+                    business_date,
+                    NewsFlashWindow::H0930,
+                ),
+                Err(NewsFlashReconcileError::RecordConflict(_))
+            ));
+        }
+
+        let missing_fixture = dispatcher::TestAuditNamespace::new("W13_N02_TERMINAL_NO_ATTEMPT");
+        let missing_dispatcher = missing_fixture.dispatcher();
+        let missing_input = w13_n02_attempt_input(1, observed_at);
+        let missing_event = PushDeliveryEvent::new_news_flash_attempt(
+            missing_input.push_kind.clone(),
+            missing_input.decision_key.clone(),
+            missing_input.channel.clone(),
+            missing_input.rendered_len,
+            missing_input.business_date,
+            missing_input.reservation_sha256.clone(),
+            missing_input.sources.clone(),
+            missing_input.evidence_sha256.clone(),
+            missing_input.render_sha256.clone(),
+            missing_input.attempt_ordinal,
+            missing_input.observed_at,
+        );
+        let missing_attempt = NewsFlashAttemptReceipt {
+            envelope_id: missing_event.news_flash_join_sha256.clone().unwrap(),
+            persisted_at: chrono::Local::now(),
+            input: missing_input,
+            sink_attempt_identity: missing_event
+                .news_flash_sink_attempt_identity
+                .clone()
+                .unwrap(),
+            sink_attempt_sha256: missing_event
+                .news_flash_sink_attempt_sha256
+                .clone()
+                .unwrap(),
+        };
+        persist_news_flash_terminal_with(
+            &missing_dispatcher,
+            &missing_attempt,
+            NewsFlashTerminalAuditInput {
+                disposition: NewsFlashTerminalDisposition::DefinitivelyRejected {
+                    reason_code: "TEST_CODE_W13_N02_REJECTED".to_owned(),
+                    transport_evidence_sha256: "4".repeat(64),
+                },
+                observed_at: observed_at + chrono::Duration::seconds(1),
+                latency_ms: 1,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            requery_news_flash_window_terminal_with(
+                &missing_dispatcher,
+                business_date,
+                NewsFlashWindow::H0930,
+            ),
+            Err(NewsFlashReconcileError::RecordConflict(_))
+        ));
+
+        for (label, terminal_date, terminal_key) in [
+            (
+                "W13_N02_CROSS_DATE",
+                chrono::NaiveDate::from_ymd_opt(2026, 8, 19).unwrap(),
+                "window:09:30",
+            ),
+            ("W13_N02_CROSS_WINDOW", business_date, "window:11:30"),
+        ] {
+            let fixture = dispatcher::TestAuditNamespace::new(label);
+            let dispatcher = fixture.dispatcher();
+            let attempt =
+                persist_news_flash_attempt_with(&dispatcher, w13_n02_attempt_input(1, observed_at))
+                    .unwrap();
+            persist_news_flash_terminal_with(
+                &dispatcher,
+                &attempt,
+                NewsFlashTerminalAuditInput {
+                    disposition: NewsFlashTerminalDisposition::DefinitivelyRejected {
+                        reason_code: "TEST_CODE_W13_N02_REJECTED".to_owned(),
+                        transport_evidence_sha256: "e".repeat(64),
+                    },
+                    observed_at: observed_at + chrono::Duration::seconds(1),
+                    latency_ms: 1,
+                },
+            )
+            .unwrap();
+            let path = fixture
+                .audit_path()
+                .join(format!("{}.jsonl", attempt.persisted_at().format("%Y")));
+            let content = std::fs::read_to_string(&path).unwrap();
+            let mut lines = content
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            lines[1]["envelope"]["payload"]["news_flash_business_date"] =
+                serde_json::to_value(terminal_date).unwrap();
+            lines[1]["envelope"]["payload"]["news_flash_decision_key"] =
+                serde_json::Value::String(terminal_key.to_owned());
+            let corrupted = lines
+                .into_iter()
+                .map(|line| serde_json::to_string(&line).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            std::fs::write(path, corrupted).unwrap();
+            assert!(matches!(
+                requery_news_flash_window_terminal_with(
+                    &dispatcher,
+                    business_date,
+                    NewsFlashWindow::H0930,
+                ),
+                Err(NewsFlashReconcileError::InvalidChain(_))
+                    | Err(NewsFlashReconcileError::RecordConflict(_))
+            ));
+        }
     }
 
     #[test]
