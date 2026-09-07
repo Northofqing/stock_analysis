@@ -365,7 +365,7 @@ fn w14_new_occurrence_is_created_expected_then_proposed_eligible() {
         other => panic!("TEST_CODE expected transition, got {other:?}"),
     };
     assert_eq!(proposal.occurrence_id(), schedule.occurrence_id());
-    assert_eq!(proposal.from_status(), ScheduleStatus::Expected);
+    assert_eq!(proposal.expected_status(), ScheduleStatus::Expected);
     assert_eq!(proposal.to_status(), ScheduleStatus::Eligible);
     assert_eq!(proposal.expected_version(), 0);
     assert_eq!(proposal.result_version(), 1);
@@ -548,7 +548,7 @@ fn w14_deferred_occurrence_resumes_in_next_half_open_session_without_new_identit
         ScheduleStep::TransitionProposal(proposal) => proposal,
         other => panic!("TEST_CODE expected Eligible proposal, got {other:?}"),
     };
-    assert_eq!(eligible.from_status(), ScheduleStatus::Deferred);
+    assert_eq!(eligible.expected_status(), ScheduleStatus::Deferred);
     assert_eq!(eligible.to_status(), ScheduleStatus::Eligible);
     assert_eq!(eligible.occurrence_id(), occurrence.occurrence_id());
 
@@ -884,7 +884,7 @@ fn w14_completion_closes_prepared_once_and_closed_never_reopens() {
         ScheduleStep::TransitionProposal(proposal) => proposal,
         other => panic!("TEST_CODE expected close proposal, got {other:?}"),
     };
-    assert_eq!(close.from_status(), ScheduleStatus::Prepared);
+    assert_eq!(close.expected_status(), ScheduleStatus::Prepared);
     assert_eq!(close.to_status(), ScheduleStatus::Closed);
     assert_eq!(close.reason(), ReasonCode::ScheduleOccurrenceClosed);
     let closed = prepared

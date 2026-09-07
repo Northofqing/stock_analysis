@@ -401,7 +401,7 @@ impl ScheduleTransitionProposal {
         &self.occurrence_id
     }
 
-    pub(crate) fn from_status(&self) -> ScheduleStatus {
+    pub(crate) fn expected_status(&self) -> ScheduleStatus {
         self.from_status
     }
 
