@@ -1,6 +1,6 @@
 # 推送 Foundation W14 PhaseScheduler 实施计划
 
-**状态：** 待执行。
+**状态：** Task 1--5 完成。实现与评审修复到 `b2e92ca`；W14 18/18、Foundation 103/103、push_job 52/52、rustdoc 与普通编译/Clippy 通过。strict Clippy/catalog 既有例外见结果文档，不宣称生产已迁移。
 
 **目标：** 以 TDD 实现半开窗口、原业务日 catch-up、W11 启动屏障、W03 completion close 和 closed 不可重开的 crate-private 调度模块；保持零 production wiring。
 
@@ -106,6 +106,10 @@ Expected: 新接口不存在或行为测试失败，形成真实 RED。
 - closed/replay 是否在竞争或损坏快照下 fail closed。
 
 任何发现先写回归 RED，再修复并独立提交。
+
+2026-09-07 并行只读评审发现：Deferred 恢复后连续 tick 丢失下一窗口；RecoverPersistedOnly 对已有非终态限制不完整；next-session ref 可被同 identity 不同窗口重用。主线另发现非交易日只保护无 occurrence 分支。四项均须补行为反例和修复证据；completion 的纯策略提案与未来持久关闭授权须在结果中分清。
+
+上述问题已修复，另补提案时间回退检查；回归为 `4fc3571` RED（12 passed / 4 failed）→`ff5f1d3` GREEN，非交易日独立修复为 `5f5bca6`。连续第三窗口和 Missed 封口补测通过；`b2e92ca` 消除访问器命名告警，最终 Foundation 103/103 已重验。
 
 ## Task 5：fresh gates、中文结果与收口
 

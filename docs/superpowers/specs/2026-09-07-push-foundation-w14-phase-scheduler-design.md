@@ -1,6 +1,6 @@
 # 推送 Foundation W14 PhaseScheduler 与 occurrence catch-up 设计
 
-**状态：** 设计冻结，待 TDD 实现与 fresh 验证。
+**状态：** 已实现并完成双轴评审修复，最终代码提交 `b2e92ca`；W14 18/18、Foundation 103/103 通过。完整证据与既有门禁例外见 `docs/push-system/implementation-w14-results-2026-09-07.md`。
 
 **决策日期：** 2026-09-07（Asia/Shanghai）
 
@@ -92,7 +92,7 @@ W14 时间判定负责以下边：
 
 `Eligible → Prepared` 属于 future physical owner 在持久 prepared intent 后提交；`Expected|Eligible → BlockedOnInput` 与 `BlockedOnInput → Eligible` 的来源恢复细分属于 W15。W14 类型允许持久适配器 hydrate 这些状态，但不伪造对应 evidence。
 
-`Closed` 与 `Missed` 没有任何出边。尤其 `Closed` 在正常 tick、启动 catch-up、时钟回拨和窗口变化输入下都只能返回 `NoChange(schedule.occurrence_closed)`。
+`Closed` 与 `Missed` 没有任何出边。同一合法绑定下，`Closed` 在正常 tick、启动 catch-up 和时钟回拨中均返回 `NoChange(schedule.occurrence_closed)`；调用方改换 business date 或 schedule/window binding 时拒绝输入，同样不产生重开提案。
 
 ### 4.4 `PhaseSchedule`
 
@@ -107,11 +107,12 @@ W14 时间判定负责以下边：
 
 ### 4.5 `ScheduleOccurrenceSnapshot`
 
-快照保存 schedule、派生的 `ScheduleOccurrenceId`、status、version、reason、created/updated time，以及 Deferred 时唯一允许存在的 next-session ref。
+快照保存 schedule、派生的 `ScheduleOccurrenceId`、status、version、reason、created/updated time，以及延期后保留的 next-session ref。
 
 - ID 每次 hydrate 都从 W01 identity 重算；
 - `updated_at >= created_at`；
-- `Deferred` 必须有 next-session ref，其他状态禁止携带；
+- `Deferred` 必须有 next-session ref；恢复为 `Eligible` 后及后续状态继续保留，用该引用的半开窗口判断资格，`Expected` 禁止携带；
+- next-session ref 必须相对接收方 schedule 重验身份、策略、业务日和窗口；不能仅凭不包含窗口的 occurrence ID 接纳；
 - 新建恒为 `Expected/version=0`；
 - transition 的 result version 使用 checked add；
 - wall-clock、normal/catch-up origin、generation、build、payload/evidence hash 都不进入 ID。
@@ -127,14 +128,20 @@ proposal 绑定：
 - observed time；
 - Deferred 所需 next-session ref。
 
+提案还须保留完整输入 schedule/session binding，应用时重验，防止同 identity 不同窗口或策略的提案互换。恢复窗口引用在 `Deferred→Eligible` 后不能清空，否则下一次 tick 会误用原已过期窗口。
+
 它是不可直接写库的纯提案，不是 RFC 最终 `ScheduleOccurrenceTransitionRequest`。W16 仍须加入并在提交临界区重验 `expected_generation + ActivationFence`；各 Unit 持久适配器仍须用 exact ID/from/version CAS，在同一业务事务写状态与 append-only evidence。这个命名阻止调用方把未带 fence 的对象误当生产写权限。
+
+`CompletionDirective` 是 W03 的无 occurrence 身份纯策略结果；W14 completion 只判断状态边并形成提案。它不能证明该策略结果属于目标 occurrence；未来业务库 adapter 必须重验 BoundScheduleCloseProposal 的目标、完成证据、策略与 fence。当前接口与测试不证明生产关闭已获授权。W11 marker 也只证明其来源报告已完成本次恢复遍历，不证明其他库、Unit 或进程已全局恢复。
 
 ## 5. 调度判定矩阵
 
 | 当前事实 | 时间/策略 | 结果 | 原因 |
 | --- | --- | --- | --- |
 | 无 occurrence；authority 判非交易日 | 任意 | `NoOccurrence` | `schedule.not_trading_day` |
+| 已有未准备非终态；authority 判非交易日 | 任意 | 保留 ID/status/version 的 `NoChange` | `schedule.not_trading_day` |
 | 无 occurrence；`RecoverPersistedOnly` | 任意 | `RecoveryOnly`，不得创建 | 不补造新 identity |
+| 已有未准备非终态；`RecoverPersistedOnly` | 任意 | `RecoveryOnly`，不得取得新工作资格 | 原 intent/decision 恢复专用 |
 | 无 occurrence；有效交易日 | 任意窗口位置 | `CreateExpected(version=0)` | 保存原业务日身份 |
 | Expected；窗口前 | `now < start` | `NoChange` | `schedule.window_not_open` |
 | Expected；窗口内 | `start <= now < end` | `Expected→Eligible` proposal | `schedule.window_open` |
@@ -170,7 +177,7 @@ proposal 绑定：
 - identity 的 producer/Unit/owner/family/phase 与 W06 catalog 不一致；
 - observation 的 target business date 与 schedule 原 business date 不一致；
 - current snapshot 的 ID/schedule 与请求不一致；
-- Deferred 缺 next-session ref，或非 Deferred 携带该 ref；
+- Deferred 缺 next-session ref，或 Expected 携带该 ref；
 - next-session window 非法或不晚于原窗口；
 - version 溢出；
 - completion close 试图从 Prepared 之外的非终态出发。
@@ -187,6 +194,7 @@ proposal 绑定：
 6. catch-up 发生在后续 wall clock 时仍保存原 business date；observation 误换业务日拒绝。
 7. Expire/SameDay 在 end 时进入 Missed；end 前 1 微秒仍 eligible。
 8. Defer 保存 next-session ref，并在其半开窗口内 `Deferred→Eligible`，identity 不变。
+   恢复后的连续 tick/catch-up 继续使用该窗口；再次延期必须链接业务日更晚且不重叠的新 session，旧引用和重叠窗口拒绝。
 9. Prepared 不因窗口结束变 Missed；W03 close directive 才能提案 Closed。
 10. Closed 在 normal/catch-up/时钟回拨下均无 proposal；Missed 也无出边。
 11. current ID/version/status/next ref 损坏及 version overflow fail closed。
