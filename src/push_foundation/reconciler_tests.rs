@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use crate::monitor::push_job::{
     AudienceId, BusinessDate, CompletionOwnerId, Namespace, OccurrenceFamily,
@@ -13,7 +13,7 @@ use super::business_finalizer::{
 use super::intent_store::AttestedReadyIntent;
 use super::reconciler::{
     reconcile_startup, RecoveryBindingError, RecoveryBindings, RecoveryBindingsPort,
-    RecoveryBoundary, RecoveryConfig,
+    RecoveryBoundary, RecoveryConfig, RecoveryError,
 };
 use super::terminal_authority::{
     terminal_binding_sha256, AuthorityAttemptBinding, AuthorityQuery, AuthorityQueryFailure,
@@ -61,32 +61,41 @@ impl RecoveryFixture {
         occurrence_key: &str,
         created_at: i64,
     ) -> IntentSnapshot {
-        let identity = InitialIntentIdentity::new(
-            Namespace::Production,
-            UnitId::try_new("MU-auction".to_owned()).unwrap(),
-            OccurrenceIdentityMaterial::new(
-                BusinessDate::parse(business_date).unwrap(),
-                OccurrenceFamily::try_new("auction-session".to_owned()).unwrap(),
-                OccurrenceKey::try_new(occurrence_key.to_owned()).unwrap(),
-            ),
-            CompletionOwnerId::try_new("owner-auction".to_owned()).unwrap(),
-            SourceContractId::try_new("auction-source".to_owned()).unwrap(),
-            SubjectId::entity(format!("{occurrence_key}.SZ")).unwrap(),
-            AudienceId::try_new("portfolio-owner".to_owned()).unwrap(),
-        );
-        let draft = InitialIntentDraft::ready_for_recovery_test(
-            identity,
-            format!("prepared:{business_date}:{occurrence_key}").into_bytes(),
-            format!("rendered:{business_date}:{occurrence_key}").into_bytes(),
-            digest('e'),
-            digest('f'),
-            micros(created_at),
-        )
-        .unwrap();
-        let intent_id = draft.intent_id().clone();
-        self.store.record_initial(&draft).unwrap();
-        self.store.inspect(&intent_id).unwrap().unwrap()
+        insert_ready_into_store(&mut self.store, business_date, occurrence_key, created_at)
     }
+}
+
+fn insert_ready_into_store(
+    store: &mut BusinessIntentStore,
+    business_date: &str,
+    occurrence_key: &str,
+    created_at: i64,
+) -> IntentSnapshot {
+    let identity = InitialIntentIdentity::new(
+        Namespace::Production,
+        UnitId::try_new("MU-auction".to_owned()).unwrap(),
+        OccurrenceIdentityMaterial::new(
+            BusinessDate::parse(business_date).unwrap(),
+            OccurrenceFamily::try_new("auction-session".to_owned()).unwrap(),
+            OccurrenceKey::try_new(occurrence_key.to_owned()).unwrap(),
+        ),
+        CompletionOwnerId::try_new("owner-auction".to_owned()).unwrap(),
+        SourceContractId::try_new("auction-source".to_owned()).unwrap(),
+        SubjectId::entity(format!("{occurrence_key}.SZ")).unwrap(),
+        AudienceId::try_new("portfolio-owner".to_owned()).unwrap(),
+    );
+    let draft = InitialIntentDraft::ready_for_recovery_test(
+        identity,
+        format!("prepared:{business_date}:{occurrence_key}").into_bytes(),
+        format!("rendered:{business_date}:{occurrence_key}").into_bytes(),
+        digest('e'),
+        digest('f'),
+        micros(created_at),
+    )
+    .unwrap();
+    let intent_id = draft.intent_id().clone();
+    store.record_initial(&draft).unwrap();
+    store.inspect(&intent_id).unwrap().unwrap()
 }
 
 struct NoBindings {
@@ -186,6 +195,53 @@ impl RecoveryBindingsPort for StaticBindings<'_> {
         self.calls.set(self.calls.get() + 1);
         assert_eq!(intent.unit_id, self.fixture.record.unit_id);
         assert_eq!(intent.intent_id, self.fixture.record.intent_id);
+        Ok(RecoveryBindings::new(
+            &self.fixture.template,
+            &self.fixture.policy,
+            self.authority,
+        ))
+    }
+}
+
+struct RenewFenceOnceBindings<'a> {
+    fixture: &'a Fixture,
+    authority: &'a FakeAuthority,
+    competitor: RefCell<BusinessIntentStore>,
+    owner: LeaseOwnerId,
+    renewed_until: UtcMicros,
+    renewed_at: UtcMicros,
+    calls: Cell<usize>,
+}
+
+impl RecoveryBindingsPort for RenewFenceOnceBindings<'_> {
+    fn resolve<'a>(
+        &'a self,
+        intent: &AttestedReadyIntent,
+    ) -> Result<RecoveryBindings<'a>, RecoveryBindingError> {
+        let call = self.calls.get();
+        self.calls.set(call + 1);
+        if call == 0 {
+            let mut competitor = self.competitor.borrow_mut();
+            let current = competitor
+                .inspect(&intent.intent_id)
+                .unwrap()
+                .expect("competitor sees the recovery intent");
+            let command = IntentTransitionCommand::try_new(
+                intent.intent_id.clone(),
+                current.state(),
+                current.state(),
+                current.version(),
+                TransitionActor::try_new("same-owner-winner".to_owned()).unwrap(),
+                ReasonCode::IntentDispatchClaimed,
+                self.renewed_at,
+                LeaseAction::Acquire {
+                    owner: self.owner.clone(),
+                    until: self.renewed_until,
+                },
+            )
+            .unwrap();
+            competitor.apply_nonterminal_transition(&command).unwrap();
+        }
         Ok(RecoveryBindings::new(
             &self.fixture.template,
             &self.fixture.policy,
@@ -619,4 +675,256 @@ fn w11_authority_blocker_appends_only_one_event_before_fixed_point() {
             2
         );
     }
+}
+
+#[test]
+fn w11_keyset_scan_retains_mixed_date_boundaries_while_an_intent_completes() {
+    let fixture = terminal_fixture();
+    let authority = FakeAuthority::terminal(fixture.record.clone());
+    let bindings = StaticBindings::new(&fixture, &authority);
+    let mut store = BusinessIntentStore::open(&fixture.database).unwrap();
+    let older = insert_ready_into_store(
+        &mut store,
+        "2026-09-01",
+        "older-pending",
+        1_788_600_000_000_000,
+    );
+    let newer = insert_ready_into_store(
+        &mut store,
+        "2026-09-08",
+        "newer-pending",
+        1_788_743_100_000_001,
+    );
+    let (dispatch_at, recovery_at, lease_until) = authority_times();
+    dispatch_terminal_fixture(
+        &fixture,
+        &mut store,
+        "mixed-recovery",
+        dispatch_at,
+        lease_until,
+    );
+
+    let report = reconcile_startup(
+        &mut store,
+        &config_at("mixed-recovery", 1, recovery_at, lease_until, 8),
+        &bindings,
+    )
+    .expect("keyset scan survives state removal and reaches a fixed point");
+
+    assert_eq!(report.iterations(), 2);
+    assert_eq!(report.transition_count(), 4);
+    assert_eq!(report.entries().len(), 3);
+    assert_eq!(
+        report
+            .entries()
+            .iter()
+            .map(|entry| (entry.business_date(), entry.boundary()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("2026-09-01", RecoveryBoundary::DispatchPending),
+            ("2026-09-07", RecoveryBoundary::Finalized),
+            ("2026-09-08", RecoveryBoundary::DispatchPending),
+        ]
+    );
+    assert_eq!(authority.calls.get(), 2);
+    assert_eq!(bindings.calls.get(), 1);
+    for pending in [&older, &newer] {
+        assert_eq!(
+            store
+                .inspect(&pending.attested_ready_binding().unwrap().intent_id)
+                .unwrap()
+                .unwrap()
+                .state(),
+            IntentState::PendingDispatch
+        );
+    }
+    let debug = format!("{report:?}");
+    assert!(!debug.contains("prepared:"));
+    assert!(!debug.contains("rendered:"));
+    assert!(!debug.contains("000001.SZ"));
+}
+
+#[test]
+fn w11_same_owner_fence_renewal_is_reread_before_authority_use() {
+    let fixture = terminal_fixture();
+    let authority = FakeAuthority::terminal(fixture.record.clone());
+    let mut store = BusinessIntentStore::open(&fixture.database).unwrap();
+    let (dispatch_at, recovery_at, lease_until) = authority_times();
+    let awaiting = dispatch_terminal_fixture(
+        &fixture,
+        &mut store,
+        "race-recovery",
+        dispatch_at,
+        lease_until,
+    );
+    let renewed_until = micros(lease_until + 10_000);
+    let bindings = RenewFenceOnceBindings {
+        fixture: &fixture,
+        authority: &authority,
+        competitor: RefCell::new(BusinessIntentStore::open(&fixture.database).unwrap()),
+        owner: LeaseOwnerId::try_new("race-recovery".to_owned()).unwrap(),
+        renewed_until,
+        renewed_at: micros(recovery_at),
+        calls: Cell::new(0),
+    };
+
+    let report = reconcile_startup(
+        &mut store,
+        &config_at("race-recovery", 1, recovery_at, lease_until, 8),
+        &bindings,
+    )
+    .expect("a stale in-memory fence is reread and reevaluated");
+
+    let current = store.inspect(&fixture.record.intent_id).unwrap().unwrap();
+    assert_eq!(current.state(), IntentState::Completed);
+    assert_eq!(current.version(), awaiting.version() + 3);
+    assert_eq!(current.lease_generation(), awaiting.lease_generation() + 1);
+    assert_eq!(current.lease_owner(), None);
+    assert_eq!(bindings.calls.get(), 2);
+    assert_eq!(
+        authority.calls.get(),
+        2,
+        "the stale fence performs no query"
+    );
+    assert_eq!(report.iterations(), 3);
+    assert_eq!(
+        report.transition_count(),
+        2,
+        "the competing write is not ours"
+    );
+    assert_eq!(
+        report.entry(current.intent_id()).unwrap().boundary(),
+        RecoveryBoundary::Finalized
+    );
+}
+
+#[test]
+fn w11_progress_at_iteration_cap_fails_closed_instead_of_claiming_fixed_point() {
+    let mut fixture = terminal_fixture();
+    fixture.record.terminal_disposition = TerminalDisposition::Rejected;
+    fixture.record.binding_sha256 = terminal_binding_sha256(&fixture.record);
+    let authority = FakeAuthority::terminal(fixture.record.clone());
+    let bindings = StaticBindings::new(&fixture, &authority);
+    let mut store = BusinessIntentStore::open(&fixture.database).unwrap();
+    let (dispatch_at, recovery_at, lease_until) = authority_times();
+    dispatch_terminal_fixture(
+        &fixture,
+        &mut store,
+        "capped-recovery",
+        dispatch_at,
+        lease_until,
+    );
+
+    let error = reconcile_startup(
+        &mut store,
+        &config_at("capped-recovery", 1, recovery_at, lease_until, 1),
+        &bindings,
+    )
+    .expect_err("progress without a confirming pass must fail the startup gate");
+
+    assert_eq!(error, RecoveryError::IterationLimitExceeded);
+    let current = store.inspect(&fixture.record.intent_id).unwrap().unwrap();
+    assert_eq!(current.reason(), ReasonCode::TransportRejected);
+    assert_eq!(authority.calls.get(), 1);
+    assert_eq!(
+        store
+            .inspect_transition_chain(&fixture.record.intent_id)
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn w11_repeated_startups_do_not_extend_stable_blocker_or_resolution_chains() {
+    let mut rejected_fixture = terminal_fixture();
+    rejected_fixture.record.terminal_disposition = TerminalDisposition::Rejected;
+    rejected_fixture.record.binding_sha256 = terminal_binding_sha256(&rejected_fixture.record);
+    let rejected_authority = FakeAuthority::terminal(rejected_fixture.record.clone());
+    let rejected_bindings = StaticBindings::new(&rejected_fixture, &rejected_authority);
+    let mut rejected_store = BusinessIntentStore::open(&rejected_fixture.database).unwrap();
+    let (dispatch_at, recovery_at, lease_until) = authority_times();
+    dispatch_terminal_fixture(
+        &rejected_fixture,
+        &mut rejected_store,
+        "repeat-rejected",
+        dispatch_at,
+        lease_until,
+    );
+    let repeated_config = config_at("repeat-rejected", 1, recovery_at, lease_until, 8);
+    reconcile_startup(&mut rejected_store, &repeated_config, &rejected_bindings).unwrap();
+    let rejected_chain_len = rejected_store
+        .inspect_transition_chain(&rejected_fixture.record.intent_id)
+        .unwrap()
+        .len();
+    let second =
+        reconcile_startup(&mut rejected_store, &repeated_config, &rejected_bindings).unwrap();
+    assert_eq!(second.transition_count(), 0);
+    assert_eq!(
+        rejected_store
+            .inspect_transition_chain(&rejected_fixture.record.intent_id)
+            .unwrap()
+            .len(),
+        rejected_chain_len
+    );
+
+    let blocked_fixture = terminal_fixture();
+    let blocked_authority = FakeAuthority::terminal(blocked_fixture.record.clone());
+    *blocked_authority.result.borrow_mut() = Ok(AuthorityQuery::Missing);
+    let blocked_bindings = StaticBindings::new(&blocked_fixture, &blocked_authority);
+    let mut blocked_store = BusinessIntentStore::open(&blocked_fixture.database).unwrap();
+    dispatch_terminal_fixture(
+        &blocked_fixture,
+        &mut blocked_store,
+        "repeat-blocked",
+        dispatch_at,
+        lease_until,
+    );
+    let blocked_config = config_at("repeat-blocked", 1, recovery_at, lease_until, 8);
+    reconcile_startup(&mut blocked_store, &blocked_config, &blocked_bindings).unwrap();
+    let blocked_chain_len = blocked_store
+        .inspect_transition_chain(&blocked_fixture.record.intent_id)
+        .unwrap()
+        .len();
+    let second = reconcile_startup(&mut blocked_store, &blocked_config, &blocked_bindings).unwrap();
+    assert_eq!(second.transition_count(), 0);
+    assert_eq!(
+        blocked_store
+            .inspect_transition_chain(&blocked_fixture.record.intent_id)
+            .unwrap()
+            .len(),
+        blocked_chain_len
+    );
+
+    let mut uncertain_fixture = terminal_fixture();
+    uncertain_fixture.record.terminal_disposition = TerminalDisposition::Uncertain;
+    uncertain_fixture.record.binding_sha256 = terminal_binding_sha256(&uncertain_fixture.record);
+    let uncertain_authority = FakeAuthority::terminal(uncertain_fixture.record.clone());
+    let uncertain_bindings = StaticBindings::new(&uncertain_fixture, &uncertain_authority);
+    let mut uncertain_store = BusinessIntentStore::open(&uncertain_fixture.database).unwrap();
+    dispatch_terminal_fixture(
+        &uncertain_fixture,
+        &mut uncertain_store,
+        "repeat-uncertain",
+        dispatch_at,
+        lease_until,
+    );
+    let uncertain_config = config_at("repeat-uncertain", 1, recovery_at, lease_until, 8);
+    reconcile_startup(&mut uncertain_store, &uncertain_config, &uncertain_bindings).unwrap();
+    let uncertain_calls = uncertain_authority.calls.get();
+    let uncertain_chain_len = uncertain_store
+        .inspect_transition_chain(&uncertain_fixture.record.intent_id)
+        .unwrap()
+        .len();
+    let second =
+        reconcile_startup(&mut uncertain_store, &uncertain_config, &uncertain_bindings).unwrap();
+    assert_eq!(second.transition_count(), 0);
+    assert_eq!(uncertain_authority.calls.get(), uncertain_calls);
+    assert_eq!(
+        uncertain_store
+            .inspect_transition_chain(&uncertain_fixture.record.intent_id)
+            .unwrap()
+            .len(),
+        uncertain_chain_len
+    );
 }
