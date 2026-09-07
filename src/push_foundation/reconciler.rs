@@ -15,7 +15,9 @@ use super::intent_store::{
     AttestedReadyIntent, BusinessIntentStore, IntentSnapshot, IntentState, IntentStoreError,
     LeaseOwnerId, RecoveryCursor, TransitionActor, TransitionOutcome,
 };
-use super::terminal_authority::{verify_terminal, TerminalAuthorityPort, TerminalTemplateBinding};
+use super::terminal_authority::{
+    verify_terminal, TerminalAuthorityError, TerminalAuthorityPort, TerminalTemplateBinding,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum RecoveryBindingError {
@@ -174,12 +176,57 @@ pub(crate) enum RecoveryError {
     Store(#[from] IntentStoreError),
     #[error(transparent)]
     Binding(#[from] RecoveryBindingError),
-    #[error(transparent)]
-    Finalizer(#[from] BusinessFinalizerError),
+    #[error("business finalization failed during recovery: {check}")]
+    Finalizer { check: &'static str },
     #[error("invalid recovery configuration: {check}")]
     InvalidConfig { check: &'static str },
     #[error("startup recovery exceeded its fixed-point iteration limit")]
     IterationLimitExceeded,
+}
+
+impl From<BusinessFinalizerError> for RecoveryError {
+    fn from(error: BusinessFinalizerError) -> Self {
+        match error {
+            BusinessFinalizerError::Store(error) => Self::Store(error),
+            BusinessFinalizerError::InvalidRequest { check } => Self::Finalizer { check },
+            BusinessFinalizerError::Terminal(_) => Self::Finalizer {
+                check: "terminal_authority",
+            },
+            BusinessFinalizerError::TerminalInvalid { .. } => Self::Finalizer {
+                check: "terminal_invalid",
+            },
+            BusinessFinalizerError::InvalidSourceState => Self::Finalizer {
+                check: "invalid_source_state",
+            },
+            BusinessFinalizerError::FenceMismatch => Self::Finalizer {
+                check: "fence_mismatch",
+            },
+            BusinessFinalizerError::ConflictUnresolved { .. } => Self::Finalizer {
+                check: "conflict_unresolved",
+            },
+            BusinessFinalizerError::DispositionNotCompletable { .. } => Self::Finalizer {
+                check: "disposition_not_completable",
+            },
+            BusinessFinalizerError::PolicyRejected => Self::Finalizer {
+                check: "policy_rejected",
+            },
+            BusinessFinalizerError::ResolutionClearanceRequired => Self::Finalizer {
+                check: "resolution_clearance_required",
+            },
+            BusinessFinalizerError::ResolutionClearanceMismatch => Self::Finalizer {
+                check: "resolution_clearance_mismatch",
+            },
+            BusinessFinalizerError::OperatorAuditRequired => Self::Finalizer {
+                check: "operator_audit_required",
+            },
+            BusinessFinalizerError::OperatorAuditMismatch => Self::Finalizer {
+                check: "operator_audit_mismatch",
+            },
+            BusinessFinalizerError::NotDeliveredHistoryIneligible => Self::Finalizer {
+                check: "not_delivered_history_ineligible",
+            },
+        }
+    }
 }
 
 pub(crate) fn reconcile_startup(
@@ -257,10 +304,10 @@ fn reconcile_one(
         IntentState::ResolutionRequired => {
             Ok((current, RecoveryBoundary::ManualResolutionRequired, applied))
         }
-        _ => Err(IntentStoreError::IntegrityFailed {
-            check: "recovery_candidate_terminal_state",
-        }
-        .into()),
+        IntentState::Completed
+        | IntentState::NotDelivered
+        | IntentState::NoData
+        | IntentState::Disabled => Ok((current, RecoveryBoundary::Finalized, applied)),
     }
 }
 
@@ -326,7 +373,7 @@ fn reconcile_authority(
         bindings.authority,
     ) {
         Ok(AcceptedPreparationOutcome::Pending(pending)) => {
-            let outcome = commit_accepted_finalization(
+            let outcome = match commit_accepted_finalization(
                 store,
                 pending,
                 bindings.template,
@@ -334,7 +381,51 @@ fn reconcile_authority(
                 bindings.authority,
                 config.now,
                 config.now,
-            )?;
+            ) {
+                Ok(outcome) => outcome,
+                Err(BusinessFinalizerError::ConflictUnresolved { current }) => {
+                    return Ok(competing_snapshot_boundary(
+                        *current,
+                        config,
+                        applied_before_authority,
+                    ));
+                }
+                Err(BusinessFinalizerError::TerminalInvalid {
+                    source: TerminalAuthorityError::PriorReferenceChanged,
+                    ..
+                }) => {
+                    let persisted = store
+                        .inspect(&intent.intent_id)?
+                        .ok_or(IntentStoreError::IntentMissing)?;
+                    let applied = applied_before_authority + version_delta(&current, &persisted)?;
+                    return apply_recovery_observation(
+                        store,
+                        persisted,
+                        IntentState::ResolutionRequired,
+                        ReasonCode::OperatorResolutionConflict,
+                        RecoveryBoundary::ManualResolutionRequired,
+                        config,
+                        applied,
+                    );
+                }
+                Err(BusinessFinalizerError::TerminalInvalid { .. }) => {
+                    let persisted = store
+                        .inspect(&intent.intent_id)?
+                        .ok_or(IntentStoreError::IntentMissing)?;
+                    let applied = applied_before_authority + version_delta(&current, &persisted)?;
+                    return Ok((persisted, RecoveryBoundary::AuthorityBlocked, applied));
+                }
+                Err(BusinessFinalizerError::DispositionNotCompletable { actual }) => {
+                    let persisted = store
+                        .inspect(&intent.intent_id)?
+                        .ok_or(IntentStoreError::IntentMissing)?;
+                    let applied = applied_before_authority + version_delta(&current, &persisted)?;
+                    return reconcile_nonaccepted_disposition(
+                        store, persisted, actual, config, applied,
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            };
             let persisted = store
                 .inspect(&intent.intent_id)?
                 .ok_or(IntentStoreError::IntentMissing)?;
@@ -376,6 +467,9 @@ fn reconcile_authority(
             let applied = applied_before_authority + version_delta(&current, &persisted)?;
             Ok((persisted, RecoveryBoundary::AuthorityBlocked, applied))
         }
+        Err(BusinessFinalizerError::ConflictUnresolved { current }) => Ok(
+            competing_snapshot_boundary(*current, config, applied_before_authority),
+        ),
         Err(error) => Err(error.into()),
     }
 }
@@ -506,10 +600,39 @@ fn apply_recovery_observation(
             let applied = applied_before_observation + version_delta(&current, &persisted)?;
             Ok((persisted, boundary, applied))
         }
-        TransitionOutcome::Conflict { current } => {
-            Ok((*current, boundary, applied_before_observation))
-        }
+        TransitionOutcome::Conflict { current } => Ok(competing_snapshot_boundary(
+            *current,
+            config,
+            applied_before_observation,
+        )),
     }
+}
+
+fn competing_snapshot_boundary(
+    current: IntentSnapshot,
+    config: &RecoveryConfig,
+    applied_before_conflict: usize,
+) -> (IntentSnapshot, RecoveryBoundary, usize) {
+    let boundary = match current.state() {
+        IntentState::PendingDispatch => RecoveryBoundary::DispatchPending,
+        IntentState::AwaitingAuthority | IntentState::AwaitingFinalizer => {
+            if current
+                .lease_until()
+                .is_some_and(|until| until > config.now)
+                && current.lease_owner() != Some(config.owner.as_str())
+            {
+                RecoveryBoundary::LiveForeignLease
+            } else {
+                RecoveryBoundary::AuthorityBlocked
+            }
+        }
+        IntentState::ResolutionRequired => RecoveryBoundary::ManualResolutionRequired,
+        IntentState::Completed
+        | IntentState::NotDelivered
+        | IntentState::NoData
+        | IntentState::Disabled => RecoveryBoundary::Finalized,
+    };
+    (current, boundary, applied_before_conflict)
 }
 
 fn version_delta(before: &IntentSnapshot, after: &IntentSnapshot) -> Result<usize, RecoveryError> {

@@ -1,7 +1,8 @@
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 
 use crate::monitor::push_job::{
-    AudienceId, BusinessDate, CompletionOwnerId, Namespace, OccurrenceFamily,
+    AudienceId, BusinessDate, CompletionOwnerId, DecisionId, Namespace, OccurrenceFamily,
     OccurrenceIdentityMaterial, OccurrenceKey, ReasonCode, Sha256Digest, SourceContractId,
     SubjectId, TerminalDisposition, UnitId, UtcMicros,
 };
@@ -16,7 +17,8 @@ use super::reconciler::{
     RecoveryBoundary, RecoveryConfig, RecoveryError,
 };
 use super::terminal_authority::{
-    terminal_binding_sha256, AuthorityAttemptBinding, AuthorityQuery, AuthorityQueryFailure,
+    terminal_binding_sha256, AuthorityAttemptBinding, AuthorityDescriptor, AuthorityQuery,
+    AuthorityQueryFailure, TerminalAuthorityPort,
 };
 use super::terminal_authority_tests::{fixture as terminal_fixture, FakeAuthority, Fixture};
 use super::{
@@ -173,17 +175,56 @@ fn acquire(
 
 struct StaticBindings<'a> {
     fixture: &'a Fixture,
-    authority: &'a FakeAuthority,
+    authority: &'a dyn TerminalAuthorityPort,
     calls: Cell<usize>,
 }
 
 impl<'a> StaticBindings<'a> {
-    fn new(fixture: &'a Fixture, authority: &'a FakeAuthority) -> Self {
+    fn new(fixture: &'a Fixture, authority: &'a dyn TerminalAuthorityPort) -> Self {
         Self {
             fixture,
             authority,
             calls: Cell::new(0),
         }
+    }
+}
+
+struct SequenceAuthority {
+    descriptor: AuthorityDescriptor,
+    results: RefCell<VecDeque<Result<AuthorityQuery, AuthorityQueryFailure>>>,
+    fallback: Result<AuthorityQuery, AuthorityQueryFailure>,
+    calls: Cell<usize>,
+}
+
+impl SequenceAuthority {
+    fn new(
+        descriptor: AuthorityDescriptor,
+        results: Vec<Result<AuthorityQuery, AuthorityQueryFailure>>,
+        fallback: Result<AuthorityQuery, AuthorityQueryFailure>,
+    ) -> Self {
+        Self {
+            descriptor,
+            results: RefCell::new(results.into()),
+            fallback,
+            calls: Cell::new(0),
+        }
+    }
+}
+
+impl TerminalAuthorityPort for SequenceAuthority {
+    fn descriptor(&self) -> &AuthorityDescriptor {
+        &self.descriptor
+    }
+
+    fn requery_terminal(
+        &self,
+        _decision_id: &DecisionId,
+    ) -> Result<AuthorityQuery, AuthorityQueryFailure> {
+        self.calls.set(self.calls.get() + 1);
+        self.results
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or_else(|| self.fallback.clone())
     }
 }
 
@@ -927,4 +968,98 @@ fn w11_repeated_startups_do_not_extend_stable_blocker_or_resolution_chains() {
             .len(),
         uncertain_chain_len
     );
+}
+
+#[test]
+fn w11_second_authority_query_failure_is_persisted_and_stabilizes() {
+    let fixture = terminal_fixture();
+    let descriptor = FakeAuthority::terminal(fixture.record.clone()).descriptor;
+    let authority = SequenceAuthority::new(
+        descriptor,
+        vec![
+            Ok(AuthorityQuery::Terminal(Box::new(fixture.record.clone()))),
+            Ok(AuthorityQuery::Missing),
+        ],
+        Ok(AuthorityQuery::Missing),
+    );
+    let bindings = StaticBindings::new(&fixture, &authority);
+    let mut store = BusinessIntentStore::open(&fixture.database).unwrap();
+    let (dispatch_at, recovery_at, lease_until) = authority_times();
+    let awaiting = dispatch_terminal_fixture(
+        &fixture,
+        &mut store,
+        "second-query-failure",
+        dispatch_at,
+        lease_until,
+    );
+
+    let report = reconcile_startup(
+        &mut store,
+        &config_at("second-query-failure", 1, recovery_at, lease_until, 8),
+        &bindings,
+    )
+    .expect("the failed final query remains a recoverable persisted boundary");
+
+    let current = store.inspect(&fixture.record.intent_id).unwrap().unwrap();
+    assert_eq!(current.state(), IntentState::AwaitingFinalizer);
+    assert_eq!(current.reason(), ReasonCode::FinalizerTerminalRefInvalid);
+    assert_eq!(current.version(), awaiting.version() + 2);
+    assert_eq!(report.transition_count(), 2);
+    assert_eq!(authority.calls.get(), 3);
+    assert_eq!(
+        report.entry(current.intent_id()).unwrap().boundary(),
+        RecoveryBoundary::AuthorityBlocked
+    );
+}
+
+#[test]
+fn w11_second_query_disposition_drift_is_isolated_without_completion() {
+    for disposition in [
+        TerminalDisposition::Rejected,
+        TerminalDisposition::Uncertain,
+    ] {
+        let fixture = terminal_fixture();
+        let descriptor = FakeAuthority::terminal(fixture.record.clone()).descriptor;
+        let accepted = fixture.record.clone();
+        let mut drifted = fixture.record.clone();
+        drifted.terminal_disposition = disposition;
+        drifted.binding_sha256 = terminal_binding_sha256(&drifted);
+        let authority = SequenceAuthority::new(
+            descriptor,
+            vec![
+                Ok(AuthorityQuery::Terminal(Box::new(accepted))),
+                Ok(AuthorityQuery::Terminal(Box::new(drifted.clone()))),
+            ],
+            Ok(AuthorityQuery::Terminal(Box::new(drifted))),
+        );
+        let bindings = StaticBindings::new(&fixture, &authority);
+        let mut store = BusinessIntentStore::open(&fixture.database).unwrap();
+        let (dispatch_at, recovery_at, lease_until) = authority_times();
+        let awaiting = dispatch_terminal_fixture(
+            &fixture,
+            &mut store,
+            "second-query-drift",
+            dispatch_at,
+            lease_until,
+        );
+
+        let report = reconcile_startup(
+            &mut store,
+            &config_at("second-query-drift", 1, recovery_at, lease_until, 8),
+            &bindings,
+        )
+        .expect("a changed strong disposition is isolated");
+
+        let current = store.inspect(&fixture.record.intent_id).unwrap().unwrap();
+        assert_eq!(current.state(), IntentState::ResolutionRequired);
+        assert_eq!(current.version(), awaiting.version() + 3);
+        assert_eq!(current.reason(), ReasonCode::OperatorResolutionConflict);
+        assert_eq!(report.transition_count(), 3);
+        assert_eq!(authority.calls.get(), 2);
+        assert_eq!(
+            report.entry(current.intent_id()).unwrap().boundary(),
+            RecoveryBoundary::ManualResolutionRequired
+        );
+        assert_ne!(current.reason(), ReasonCode::FinalizerCompleted);
+    }
 }
