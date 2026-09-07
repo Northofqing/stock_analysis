@@ -250,7 +250,11 @@ pub(crate) fn reconcile_startup(
                 let before_version = candidate.version();
                 let (current, boundary, applied) =
                     reconcile_one(store, candidate, config, bindings)?;
-                transition_count += applied;
+                transition_count = transition_count.checked_add(applied).ok_or(
+                    IntentStoreError::IntegrityFailed {
+                        check: "recovery_transition_count_overflow",
+                    },
+                )?;
                 made_progress |= current.version() > before_version;
                 entries.insert(
                     (
