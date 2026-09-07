@@ -4380,6 +4380,10 @@ fn w13_p01_same_day_query_ignores_render_mode_but_reuses_one_claim() {
         terminal.disposition,
         FoundationTerminalDisposition::Accepted
     );
+    assert_eq!(
+        terminal.accepted_channel.as_deref(),
+        Some("TEST_CODE_CHANNEL")
+    );
     assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
 }
 

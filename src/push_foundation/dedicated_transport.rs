@@ -135,6 +135,11 @@ fn map_p01_terminal(
     route: &DedicatedConformanceRoute,
     source: P01DedicatedTerminalRecord,
 ) -> Result<AuthorityTerminalRecord, DedicatedConformanceError> {
+    if source.durable_schema_version != crate::durable_delivery::DURABLE_SCHEMA_VERSION {
+        return Err(DedicatedConformanceError::P01BindingMismatch {
+            field: "durable_schema_version",
+        });
+    }
     if raw_digest(&source.envelope_canonical).as_str() != source.envelope_sha256 {
         return Err(DedicatedConformanceError::P01BindingMismatch {
             field: "envelope_sha256",
@@ -196,8 +201,29 @@ fn map_p01_terminal(
         });
     }
     let attempt_binding = map_attempt_binding(source.attempt_id.as_deref(), source.disposition)?;
-    if source.disposition == FoundationTerminalDisposition::Accepted {
-        validate_accepted_channel(&source.evidence_bytes, &route.required_channel)?;
+    match source.disposition {
+        FoundationTerminalDisposition::Accepted => {
+            if source.accepted_channel.as_deref() != Some(route.required_channel.as_str()) {
+                return Err(DedicatedConformanceError::P01ChannelMismatch);
+            }
+            validate_accepted_channel(&source.evidence_bytes, &route.required_channel)?;
+        }
+        FoundationTerminalDisposition::ManualAccepted => {
+            if source
+                .accepted_channel
+                .as_deref()
+                .is_some_and(|channel| channel != route.required_channel.as_str())
+            {
+                return Err(DedicatedConformanceError::P01ChannelMismatch);
+            }
+        }
+        FoundationTerminalDisposition::Rejected
+        | FoundationTerminalDisposition::Uncertain
+        | FoundationTerminalDisposition::ManualNotDelivered => {
+            if source.accepted_channel.is_some() {
+                return Err(DedicatedConformanceError::InvalidP01Disposition);
+            }
+        }
     }
     let terminal_disposition = map_disposition(source.disposition);
     let evidence_sha256 = Sha256Digest::parse("P01 terminal evidence", &source.evidence_sha256)

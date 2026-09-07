@@ -165,6 +165,15 @@ fn source_for(result: P01DedicatedTerminalQuery) -> FakeP01Source {
     }
 }
 
+fn replace_terminal_envelope(
+    terminal: &mut P01DedicatedTerminalRecord,
+    envelope: &DeliveryEnvelope,
+) {
+    terminal.legacy_decision_identity = envelope.decision_identity.clone();
+    terminal.envelope_canonical = envelope.canonical_bytes().expect("canonical replacement");
+    terminal.envelope_sha256 = envelope.canonical_sha256().expect("replacement SHA");
+}
+
 #[test]
 fn w13_p01_dedicated_maps_exact_accepted_through_w09() {
     let case = p01_case();
@@ -302,6 +311,138 @@ fn w13_p01_dedicated_fails_closed_on_binding_corruption() {
     .is_err());
 
     let case = p01_case();
+    let attested = case.snapshot.attested_ready_binding().unwrap();
+    let source_binding = serde_json::to_vec(&serde_json::json!({
+        "render_mode": "Scheduled",
+        "schema_version": "P01_SOURCE_BINDING_V1",
+    }))
+    .unwrap();
+    let rendered = case.snapshot.rendered_bytes().unwrap().to_vec();
+    let mismatched_envelopes = [
+        DeliveryEnvelope::new(
+            "2026-08-19",
+            PushKind::PreopenNewsHot,
+            DeliverySubKind::None,
+            "GLOBAL",
+            "p01:2026-08-19",
+            attested.source_evidence_fingerprint.as_str(),
+            source_binding.clone(),
+            "TEST_CODE_W13_P01_GLOBAL_SUBJECT",
+            rendered.clone(),
+            false,
+            None,
+        )
+        .unwrap(),
+        DeliveryEnvelope::new(
+            "2026-08-18",
+            PushKind::PreopenNewsHot,
+            DeliverySubKind::None,
+            "GLOBAL",
+            "p01:TEST_CODE_WRONG_OCCURRENCE",
+            attested.source_evidence_fingerprint.as_str(),
+            source_binding.clone(),
+            "TEST_CODE_W13_P01_GLOBAL_SUBJECT",
+            rendered.clone(),
+            false,
+            None,
+        )
+        .unwrap(),
+        DeliveryEnvelope::new(
+            "2026-08-18",
+            PushKind::HoldingEvent,
+            DeliverySubKind::None,
+            "GLOBAL",
+            "p01:2026-08-18",
+            attested.source_evidence_fingerprint.as_str(),
+            source_binding.clone(),
+            "TEST_CODE_W13_P01_GLOBAL_SUBJECT",
+            rendered.clone(),
+            false,
+            None,
+        )
+        .unwrap(),
+        DeliveryEnvelope::new(
+            "2026-08-18",
+            PushKind::PreopenNewsHot,
+            DeliverySubKind::None,
+            "GLOBAL",
+            "p01:2026-08-18",
+            "TEST_CODE_W13_WRONG_SOURCE_FINGERPRINT",
+            source_binding.clone(),
+            "TEST_CODE_W13_P01_GLOBAL_SUBJECT",
+            rendered.clone(),
+            false,
+            None,
+        )
+        .unwrap(),
+        DeliveryEnvelope::new(
+            "2026-08-18",
+            PushKind::PreopenNewsHot,
+            DeliverySubKind::None,
+            "GLOBAL",
+            "p01:2026-08-18",
+            attested.source_evidence_fingerprint.as_str(),
+            source_binding.clone(),
+            "TEST_CODE_W13_P01_GLOBAL_SUBJECT",
+            b"TEST_CODE_W13_WRONG_RENDER".to_vec(),
+            false,
+            None,
+        )
+        .unwrap(),
+    ];
+    for envelope in mismatched_envelopes {
+        let mut corrupt = case.terminal.clone();
+        replace_terminal_envelope(&mut corrupt, &envelope);
+        let source = source_for(P01DedicatedTerminalQuery::Terminal(Box::new(corrupt)));
+        assert!(verify_p01_dedicated(
+            &case.snapshot,
+            &case.route,
+            &case.policy,
+            &source,
+            UtcMicros::try_new(1_787_027_401_000_000).unwrap(),
+        )
+        .is_err());
+    }
+
+    for mutate in ["sub_kind", "scope"] {
+        let mut corrupt = case.terminal.clone();
+        let mut envelope: DeliveryEnvelope =
+            serde_json::from_slice(&corrupt.envelope_canonical).unwrap();
+        match mutate {
+            "sub_kind" => envelope.sub_kind = DeliverySubKind::FactorIC,
+            "scope" => {
+                envelope.cooldown_scope = crate::durable_delivery::CooldownScope::PerTicket;
+                envelope.scope_key = "TEST_CODE_W13_WRONG_SCOPE".to_owned();
+            }
+            _ => unreachable!(),
+        }
+        corrupt.envelope_canonical = serde_json::to_vec(&envelope).unwrap();
+        corrupt.envelope_sha256 = raw_digest(&corrupt.envelope_canonical).as_str().to_owned();
+        let source = source_for(P01DedicatedTerminalQuery::Terminal(Box::new(corrupt)));
+        assert!(verify_p01_dedicated(
+            &case.snapshot,
+            &case.route,
+            &case.policy,
+            &source,
+            UtcMicros::try_new(1_787_027_401_000_000).unwrap(),
+        )
+        .is_err());
+    }
+
+    let mut corrupt = case.terminal.clone();
+    corrupt.envelope_canonical.push(b' ');
+    corrupt.envelope_sha256 = raw_digest(&corrupt.envelope_canonical).as_str().to_owned();
+    let source = source_for(P01DedicatedTerminalQuery::Terminal(Box::new(corrupt)));
+    assert!(verify_p01_dedicated(
+        &case.snapshot,
+        &case.route,
+        &case.policy,
+        &source,
+        UtcMicros::try_new(1_787_027_401_000_000).unwrap(),
+    )
+    .is_err());
+
+    let case = p01_case();
     let mut corrupt = case.terminal.clone();
     corrupt.envelope_sha256 = "0".repeat(64);
     let source = source_for(P01DedicatedTerminalQuery::Terminal(Box::new(corrupt)));
@@ -382,6 +523,25 @@ fn w13_p01_dedicated_fails_closed_on_binding_corruption() {
         Err(DedicatedConformanceError::InvalidRoute)
     );
 
+    let wrong_channel_route = DedicatedConformanceRoute::try_new(
+        case.template.clone(),
+        ChannelId::try_new("TEST_CODE_W13_WRONG_CHANNEL".to_owned()).unwrap(),
+    )
+    .unwrap();
+    let source = source_for(P01DedicatedTerminalQuery::Terminal(Box::new(
+        case.terminal.clone(),
+    )));
+    assert_eq!(
+        verify_p01_dedicated(
+            &case.snapshot,
+            &wrong_channel_route,
+            &case.policy,
+            &source,
+            UtcMicros::try_new(1_787_027_401_000_000).unwrap(),
+        ),
+        Err(DedicatedConformanceError::P01ChannelMismatch)
+    );
+
     let case = p01_case();
     let mut corrupt = case.terminal.clone();
     corrupt.attempt_id = None;
@@ -396,4 +556,42 @@ fn w13_p01_dedicated_fails_closed_on_binding_corruption() {
         ),
         Err(DedicatedConformanceError::InvalidP01Disposition)
     );
+
+    let mut corrupt = case.terminal.clone();
+    corrupt.disposition = FoundationTerminalDisposition::Rejected;
+    let source = source_for(P01DedicatedTerminalQuery::Terminal(Box::new(corrupt)));
+    assert_eq!(
+        verify_p01_dedicated(
+            &case.snapshot,
+            &case.route,
+            &case.policy,
+            &source,
+            UtcMicros::try_new(1_787_027_401_000_000).unwrap(),
+        ),
+        Err(DedicatedConformanceError::InvalidP01Disposition)
+    );
+
+    let mut corrupt = case.terminal.clone();
+    corrupt.evidence_sha256 = "0".repeat(64);
+    let source = source_for(P01DedicatedTerminalQuery::Terminal(Box::new(corrupt)));
+    assert!(verify_p01_dedicated(
+        &case.snapshot,
+        &case.route,
+        &case.policy,
+        &source,
+        UtcMicros::try_new(1_787_027_401_000_000).unwrap(),
+    )
+    .is_err());
+
+    let mut corrupt = case.terminal.clone();
+    corrupt.durable_schema_version += 1;
+    let source = source_for(P01DedicatedTerminalQuery::Terminal(Box::new(corrupt)));
+    assert!(verify_p01_dedicated(
+        &case.snapshot,
+        &case.route,
+        &case.policy,
+        &source,
+        UtcMicros::try_new(1_787_027_401_000_000).unwrap(),
+    )
+    .is_err());
 }

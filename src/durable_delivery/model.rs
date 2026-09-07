@@ -1168,6 +1168,7 @@ pub(crate) struct P01DedicatedTerminalRecord {
     pub(crate) ref_id: String,
     pub(crate) attempt_id: Option<String>,
     pub(crate) disposition: FoundationTerminalDisposition,
+    pub(crate) accepted_channel: Option<String>,
     pub(crate) evidence_bytes: Vec<u8>,
     pub(crate) evidence_sha256: String,
     pub(crate) durable_schema_version: i64,
@@ -1183,6 +1184,7 @@ impl fmt::Debug for P01DedicatedTerminalRecord {
             .field("ref_id", &self.ref_id)
             .field("attempt_id", &self.attempt_id)
             .field("disposition", &self.disposition)
+            .field("accepted_channel", &self.accepted_channel)
             .field("evidence_len", &self.evidence_bytes.len())
             .field("evidence_sha256", &self.evidence_sha256)
             .field("durable_schema_version", &self.durable_schema_version)

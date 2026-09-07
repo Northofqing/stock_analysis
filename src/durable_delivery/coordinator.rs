@@ -3012,6 +3012,7 @@ impl DurableDeliveryCoordinator {
                     ref_id: terminal.ref_id,
                     attempt_id: terminal.attempt_id,
                     disposition: terminal.disposition,
+                    accepted_channel: terminal.accepted_channel,
                     evidence_bytes: terminal.evidence_bytes,
                     evidence_sha256: terminal.evidence_sha256,
                     durable_schema_version: SCHEMA_VERSION,
@@ -6187,6 +6188,7 @@ struct ValidatedTerminalEvidence {
     ref_id: String,
     attempt_id: Option<String>,
     disposition: FoundationTerminalDisposition,
+    accepted_channel: Option<String>,
     evidence_bytes: Vec<u8>,
     evidence_sha256: String,
 }
@@ -6198,7 +6200,7 @@ fn build_validated_terminal_evidence(
     required_channel: Option<&str>,
 ) -> Result<ValidatedTerminalEvidence> {
     let disposition = load_current_disposition_evidence(connection, stored)?;
-    let (terminal_disposition, attempt_id, evidence_bytes, evidence_sha256) =
+    let (terminal_disposition, attempt_id, accepted_channel, evidence_bytes, evidence_sha256) =
         match (stored.state, disposition.disposition.as_str()) {
             (DecisionState::Delivered, "Accepted") => {
                 let (_, receipt) = validate_authoritative_accepted_delivery_evidence(
@@ -6226,6 +6228,7 @@ fn build_validated_terminal_evidence(
                 (
                     FoundationTerminalDisposition::Accepted,
                     Some(attempt_id),
+                    Some(receipt.channel),
                     canonical,
                     sha256,
                 )
@@ -6244,7 +6247,7 @@ fn build_validated_terminal_evidence(
                         "foundation manual acceptance disposition binding mismatch".to_owned(),
                     ));
                 }
-                if let Some(receipt_canonical) = &manual.receipt_canonical {
+                let accepted_channel = if let Some(receipt_canonical) = &manual.receipt_canonical {
                     let receipt: super::model::TypedReceipt =
                         serde_json::from_slice(receipt_canonical).map_err(|error| {
                             DurableDeliveryError::PolicyMismatch(format!(
@@ -6257,7 +6260,10 @@ fn build_validated_terminal_evidence(
                                 .to_owned(),
                         ));
                     }
-                }
+                    Some(receipt.channel)
+                } else {
+                    None
+                };
                 validate_current_disposition_canonical(
                     stored,
                     envelope,
@@ -6269,6 +6275,7 @@ fn build_validated_terminal_evidence(
                 (
                     FoundationTerminalDisposition::ManualAccepted,
                     Some(manual.attempt_identity),
+                    accepted_channel,
                     manual.canonical,
                     manual.sha256,
                 )
@@ -6291,6 +6298,7 @@ fn build_validated_terminal_evidence(
                 (
                     FoundationTerminalDisposition::Rejected,
                     Some(attempt_id),
+                    None,
                     canonical,
                     sha256,
                 )
@@ -6323,6 +6331,7 @@ fn build_validated_terminal_evidence(
                 (
                     FoundationTerminalDisposition::Rejected,
                     None,
+                    None,
                     disposition.canonical.clone(),
                     disposition.sha256.clone(),
                 )
@@ -6343,6 +6352,7 @@ fn build_validated_terminal_evidence(
                 (
                     FoundationTerminalDisposition::Uncertain,
                     Some(attempt_id),
+                    None,
                     canonical,
                     sha256,
                 )
@@ -6357,6 +6367,7 @@ fn build_validated_terminal_evidence(
                 (
                     FoundationTerminalDisposition::ManualNotDelivered,
                     Some(attempt_id),
+                    None,
                     canonical,
                     sha256,
                 )
@@ -6376,6 +6387,7 @@ fn build_validated_terminal_evidence(
         ref_id: disposition.disposition_identity,
         attempt_id,
         disposition: terminal_disposition,
+        accepted_channel,
         evidence_bytes,
         evidence_sha256,
     })
