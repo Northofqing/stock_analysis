@@ -4311,6 +4311,70 @@ fn p01_policy_is_global_business_date_once_and_budget_exempt() {
 }
 
 #[test]
+fn w13_p01_same_day_query_ignores_render_mode_but_reuses_one_claim() {
+    let fixture = Fixture::new("W13_P01_SAME_DAY_KEY");
+    let append = MemoryAppendPort::default();
+    let p01_envelope = |mode: &str, label: &str| {
+        DeliveryEnvelope::new(
+            "2026-08-18",
+            PushKind::PreopenNewsHot,
+            DeliverySubKind::None,
+            "GLOBAL",
+            "p01:2026-08-18",
+            format!("TEST_CODE_W13_P01_EVIDENCE_{label}"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": "P01_SOURCE_BINDING_V1",
+                "render_mode": mode,
+            }))
+            .expect("serialize W13 P01 source binding"),
+            "TEST_CODE_W13_P01_GLOBAL_SUBJECT",
+            format!("TEST_CODE_W13_P01_RENDERED_{label}").into_bytes(),
+            false,
+            None,
+        )
+        .expect("valid W13 P01 envelope")
+    };
+    let scheduled = p01_envelope("Scheduled", "SCHEDULED");
+    prepare_reserved(&fixture, &scheduled, &append);
+    let sink = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(now())));
+    let sinks: Vec<AuthoritativeSink> = vec![sink.clone()];
+    fixture
+        .coordinator
+        .resume_deliverable(&scheduled.decision_identity, &sinks, now())
+        .expect("deliver scheduled P01 authority");
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::Delivered,
+        &scheduled.decision_identity,
+    );
+
+    let compensation = p01_envelope("Compensation", "COMPENSATION");
+    let conflict = fixture
+        .coordinator
+        .prepare(&compensation, 1, now() + chrono::Duration::seconds(1))
+        .expect("same-day compensation remains the same P01 claim");
+    assert_eq!(conflict.sink_calls, 0);
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM business_date_once_claims"),
+        1
+    );
+
+    let terminal = match fixture
+        .coordinator
+        .inspect_p01_dedicated_terminal("2026-08-18")
+        .expect("inspect exact P01 dedicated authority")
+    {
+        P01DedicatedTerminalQuery::Terminal(record) => record,
+        other => panic!("expected exact P01 terminal, got {other:?}"),
+    };
+    assert_eq!(terminal.legacy_decision_identity, scheduled.decision_identity);
+    assert_eq!(terminal.envelope_canonical, scheduled.canonical_bytes().unwrap());
+    assert_eq!(terminal.disposition, FoundationTerminalDisposition::Accepted);
+    assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn p01_business_date_once_claim_inspection_is_read_only_without_task_binding() {
     let fixture = Fixture::new("P01_GENERIC_CLAIM_INSPECT");
     let append = MemoryAppendPort::default();
