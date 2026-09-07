@@ -100,6 +100,14 @@ pub(crate) struct ReadinessRecordStore<'a> {
     catalog: &'a MachineCatalog,
 }
 
+/// Write checkpoints; the only callable fault-injection entry is test-only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ReadinessAppendFault {
+    AfterEvent,
+    AfterSnapshot,
+    AfterHead,
+}
+
 impl<'a> ReadinessRecordStore<'a> {
     pub(crate) fn at(
         path: &'a Path,
@@ -145,6 +153,31 @@ impl<'a> ReadinessRecordStore<'a> {
         &self,
         expected: Option<&StoredReadinessRecord>,
         candidate: &CandidateReadinessRecord,
+    ) -> Result<StoredReadinessRecord, ReadinessStoreError> {
+        self.append_inner(expected, candidate, |_| Ok(()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn append_with_fault(
+        &self,
+        expected: Option<&StoredReadinessRecord>,
+        candidate: &CandidateReadinessRecord,
+        fault: ReadinessAppendFault,
+    ) -> Result<StoredReadinessRecord, ReadinessStoreError> {
+        self.append_inner(expected, candidate, |boundary| {
+            if boundary == fault {
+                Err(storage("injected_before_commit"))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn append_inner(
+        &self,
+        expected: Option<&StoredReadinessRecord>,
+        candidate: &CandidateReadinessRecord,
+        mut checkpoint: impl FnMut(ReadinessAppendFault) -> Result<(), ReadinessStoreError>,
     ) -> Result<StoredReadinessRecord, ReadinessStoreError> {
         let snapshot = candidate.snapshot();
         if &snapshot.context().namespace != self.namespace {
@@ -194,10 +227,12 @@ impl<'a> ReadinessRecordStore<'a> {
                 "INSERT INTO operational_readiness_recovery_event(event_id,event_sha256,before_snapshot_id,after_snapshot_id,canonical_bytes) VALUES(?1,?2,?3,?4,?5)",
                 params![snapshot.recovery_event_id().as_str(), candidate.event_sha256().as_str(), candidate.before_snapshot_id().map(|id| id.as_str()), snapshot.snapshot_id().as_str(), candidate.event_bytes()],
             ).map_err(|_| storage("insert_event"))?;
+            checkpoint(ReadinessAppendFault::AfterEvent)?;
             connection.execute(
                 "INSERT INTO operational_readiness_snapshot(snapshot_id,event_id,canonical_bytes) VALUES(?1,?2,?3)",
                 params![snapshot.snapshot_id().as_str(), snapshot.recovery_event_id().as_str(), snapshot.canonical_bytes()],
             ).map_err(|_| storage("insert_snapshot"))?;
+            checkpoint(ReadinessAppendFault::AfterSnapshot)?;
             let changed = if let Some(current) = current {
                 connection.execute(
                     "UPDATE operational_readiness_head SET version=?1,snapshot_id=?2,event_id=?3 WHERE scope_key=?4 AND version=?5 AND snapshot_id=?6 AND event_id=?7",
@@ -212,6 +247,7 @@ impl<'a> ReadinessRecordStore<'a> {
             if changed != 1 {
                 return Err(ReadinessStoreError::HeadConflict);
             }
+            checkpoint(ReadinessAppendFault::AfterHead)?;
             self.head_chain(connection, &stream)?
                 .and_then(|chain| chain.last().cloned())
                 .ok_or(corrupt("head_after_append"))
