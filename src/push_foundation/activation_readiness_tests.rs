@@ -406,30 +406,43 @@ fn deployment_set_v1_has_independent_literal_golden_bytes_and_sha256() {
         "\"source_binding_sha256\":null,\"unit_id\":\"unit-b\"}]}"
     )
     .as_bytes();
-    let actual = deployment_set_codec_fixture();
+    let actual = deployment_set_codec_fixture(
+        "protected-owner",
+        "1111111111111111111111111111111111111111",
+    );
     assert_eq!(actual, expected);
     assert_eq!(
         crate::monitor::push_job::raw_digest(expected).as_str(),
         "262ba7b18630b804732f2123d8f1a95acdf254e84b50f3693e31d8a6031359eb"
     );
     let expected_text = std::str::from_utf8(expected).expect("TEST_CODE golden UTF-8");
-    for (original, replacement) in [
-        (
-            "\"physical_owner\":\"protected-owner\"",
-            "\"physical_owner\":\"changed-owner\"",
-        ),
-        (
-            "\"build_commit\":\"1111111111111111111111111111111111111111\"",
-            "\"build_commit\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
-        ),
-    ] {
-        let changed = expected_text.replacen(original, replacement, 1);
-        assert_ne!(
-            crate::monitor::push_job::raw_digest(changed.as_bytes()).as_str(),
-            "262ba7b18630b804732f2123d8f1a95acdf254e84b50f3693e31d8a6031359eb",
-            "TEST_CODE {original} participates in deployment identity"
-        );
-    }
+    let changed_owner_expected = expected_text.replacen(
+        "\"physical_owner\":\"protected-owner\"",
+        "\"physical_owner\":\"changed-owner\"",
+        1,
+    );
+    let changed_owner_actual =
+        deployment_set_codec_fixture("changed-owner", "1111111111111111111111111111111111111111");
+    assert_eq!(changed_owner_actual, changed_owner_expected.as_bytes());
+    assert_ne!(
+        crate::monitor::push_job::raw_digest(&changed_owner_actual).as_str(),
+        "262ba7b18630b804732f2123d8f1a95acdf254e84b50f3693e31d8a6031359eb"
+    );
+
+    let changed_commit_expected = expected_text.replacen(
+        "\"build_commit\":\"1111111111111111111111111111111111111111\"",
+        "\"build_commit\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+        1,
+    );
+    let changed_commit_actual = deployment_set_codec_fixture(
+        "protected-owner",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    assert_eq!(changed_commit_actual, changed_commit_expected.as_bytes());
+    assert_ne!(
+        crate::monitor::push_job::raw_digest(&changed_commit_actual).as_str(),
+        "262ba7b18630b804732f2123d8f1a95acdf254e84b50f3693e31d8a6031359eb"
+    );
 }
 
 #[test]

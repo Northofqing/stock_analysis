@@ -644,7 +644,7 @@ fn string(value: &str) -> CanonicalValue {
 /// Fixed codec sample for a literal golden test. It bypasses set construction deliberately so the
 /// wire contract can be pinned independently of catalog and database fixture churn.
 #[cfg(test)]
-pub(super) fn deployment_set_codec_fixture() -> Vec<u8> {
+pub(super) fn deployment_set_codec_fixture(physical_owner: &str, build_commit: &str) -> Vec<u8> {
     use crate::monitor::push_job::RunId;
 
     let test_namespace = Namespace::test(
@@ -690,8 +690,8 @@ pub(super) fn deployment_set_codec_fixture() -> Vec<u8> {
             journal_sha256: Sha256Digest::parse("TEST_CODE golden journal", &"f".repeat(64))
                 .expect("TEST_CODE golden journal"),
             desired_state: DesiredActivationState::Shadow,
-            physical_owner: "protected-owner".to_owned(),
-            build_commit: "1".repeat(40),
+            physical_owner: physical_owner.to_owned(),
+            build_commit: build_commit.to_owned(),
             build_sha256: Sha256Digest::parse("TEST_CODE golden build", &"2".repeat(64))
                 .expect("TEST_CODE golden build"),
             source_binding_sha256: Sha256Digest::parse(
