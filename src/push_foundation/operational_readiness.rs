@@ -512,7 +512,7 @@ impl ReadinessAssessment {
     }
 }
 
-fn required_kinds(scope: &ReadinessScope) -> BTreeSet<DependencyKind> {
+pub(super) fn required_kinds(scope: &ReadinessScope) -> BTreeSet<DependencyKind> {
     match scope {
         ReadinessScope::Core => CORE_DEPENDENCIES.iter().copied().collect(),
         ReadinessScope::Producer { .. } => PRODUCER_DEPENDENCIES.iter().copied().collect(),

@@ -88,33 +88,12 @@ pub(super) fn observe_activation_business_day(
     approval_window: UtcMicrosRange,
 ) -> Result<ObservedActivationBusinessDay, ActivationDeploymentError> {
     validate_window(observed_at, approval_window)?;
-    if &claims.namespace != scope.namespace
-        || &claims.catalog_sha256 != catalog.catalog_sha256()
-        || &claims.calendar_id != scope.calendar_id
-        || claims.utc_offset_seconds != SHANGHAI_OFFSET_SECONDS
-    {
+    if &claims.namespace != scope.namespace || &claims.calendar_id != scope.calendar_id {
         return Err(ActivationDeploymentError::CalendarBindingMismatch);
     }
-    let mut units = claims.catalog_units.clone();
-    units.sort();
-    if units.len() != catalog.units().len()
-        || units.windows(2).any(|pair| pair[0] == pair[1])
-        || units.iter().any(|unit| catalog.unit(unit).is_none())
-        || catalog.unit(scope.unit_id).is_none()
-    {
+    let (date, units) = validate_activation_calendar_declaration(catalog, claims, observed_at)?;
+    if catalog.unit(scope.unit_id).is_none() {
         return Err(ActivationDeploymentError::UnitCoverageMismatch);
-    }
-    let timestamp =
-        i64::try_from(observed_at).map_err(|_| ActivationDeploymentError::InvalidTime)?;
-    let utc = DateTime::<Utc>::from_timestamp_micros(timestamp)
-        .ok_or(ActivationDeploymentError::InvalidTime)?;
-    let timezone = FixedOffset::east_opt(SHANGHAI_OFFSET_SECONDS)
-        .ok_or(ActivationDeploymentError::InvalidTime)?;
-    let date = utc.with_timezone(&timezone).date_naive();
-    let authority = verified_a_share_calendar_authority_hash(date)
-        .map_err(|_| ActivationDeploymentError::CalendarUnavailable)?;
-    if authority != claims.authority_sha256.as_str() {
-        return Err(ActivationDeploymentError::CalendarBindingMismatch);
     }
     if scope.action == PromotionAction::Activate
         && !verified_a_share_trading_day(date)
@@ -124,6 +103,8 @@ pub(super) fn observe_activation_business_day(
     }
     let next_date = date
         .succ_opt()
+        .ok_or(ActivationDeploymentError::InvalidTime)?;
+    let timezone = FixedOffset::east_opt(SHANGHAI_OFFSET_SECONDS)
         .ok_or(ActivationDeploymentError::InvalidTime)?;
     let midnight = |day: chrono::NaiveDate| {
         let local = day
@@ -153,6 +134,43 @@ pub(super) fn observe_activation_business_day(
         approval_window,
         observed_at,
     })
+}
+
+/// Check an untrusted full-catalog calendar declaration without implying a promotion action.
+///
+/// Closure days are valid raw deployment observations. Callers which authorize an ordinary
+/// activation must separately apply the trading-day rule in `observe_activation_business_day`.
+pub(super) fn validate_activation_calendar_declaration(
+    catalog: &MachineCatalog,
+    claims: &ActivationCalendarClaims,
+    observed_at: u64,
+) -> Result<(chrono::NaiveDate, Vec<UnitId>), ActivationDeploymentError> {
+    if &claims.catalog_sha256 != catalog.catalog_sha256()
+        || claims.utc_offset_seconds != SHANGHAI_OFFSET_SECONDS
+    {
+        return Err(ActivationDeploymentError::CalendarBindingMismatch);
+    }
+    let mut units = claims.catalog_units.clone();
+    units.sort();
+    if units.len() != catalog.units().len()
+        || units.windows(2).any(|pair| pair[0] == pair[1])
+        || units.iter().any(|unit| catalog.unit(unit).is_none())
+    {
+        return Err(ActivationDeploymentError::UnitCoverageMismatch);
+    }
+    let timestamp =
+        i64::try_from(observed_at).map_err(|_| ActivationDeploymentError::InvalidTime)?;
+    let utc = DateTime::<Utc>::from_timestamp_micros(timestamp)
+        .ok_or(ActivationDeploymentError::InvalidTime)?;
+    let timezone = FixedOffset::east_opt(SHANGHAI_OFFSET_SECONDS)
+        .ok_or(ActivationDeploymentError::InvalidTime)?;
+    let date = utc.with_timezone(&timezone).date_naive();
+    let authority = verified_a_share_calendar_authority_hash(date)
+        .map_err(|_| ActivationDeploymentError::CalendarUnavailable)?;
+    if authority != claims.authority_sha256.as_str() {
+        return Err(ActivationDeploymentError::CalendarBindingMismatch);
+    }
+    Ok((date, units))
 }
 
 /// Re-observe after waiting for a lock. A new business day requires a new approved command.

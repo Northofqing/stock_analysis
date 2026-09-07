@@ -6,6 +6,7 @@ mod activation_codec;
 mod activation_deployment;
 mod activation_facts;
 mod activation_owner;
+mod activation_readiness;
 mod activation_store;
 mod activation_transaction;
 mod business_finalizer;
@@ -49,6 +50,8 @@ mod activation_deployment_tests;
 mod activation_facts_tests;
 #[cfg(test)]
 mod activation_owner_tests;
+#[cfg(test)]
+mod activation_readiness_tests;
 #[cfg(test)]
 mod activation_transaction_tests;
 #[cfg(test)]
