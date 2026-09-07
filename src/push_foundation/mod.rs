@@ -1,7 +1,9 @@
 //! Additive push-foundation persistence. No production database is selected or migrated here.
 
 mod activation;
+mod activation_authorization;
 mod activation_codec;
+mod activation_deployment;
 mod activation_facts;
 mod activation_owner;
 mod activation_store;
@@ -39,6 +41,10 @@ pub(crate) use intent_store::{InitialCommitFault, TransitionFault};
 pub use migration::{FoundationMigrationError, FoundationSchemaMigration, MigrationReceipt};
 pub use terminal_authority::TerminalTemplateBinding;
 
+#[cfg(test)]
+mod activation_authorization_tests;
+#[cfg(test)]
+mod activation_deployment_tests;
 #[cfg(test)]
 mod activation_facts_tests;
 #[cfg(test)]

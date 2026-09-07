@@ -432,6 +432,20 @@ pub fn verified_a_share_trading_day(date: NaiveDate) -> Result<bool, String> {
     )
 }
 
+/// Immutable authority for a covered natural day, including exchange closures.
+///
+/// This proves calendar coverage, not that the day is open for trading. Emergency activation
+/// rollback needs the actual natural day's quota interval even when replay has no trading dates.
+pub(crate) fn verified_a_share_calendar_authority_hash(
+    date: NaiveDate,
+) -> Result<&'static str, String> {
+    verified_a_share_trading_day(date)?;
+    VERIFIED_TRADING_CALENDAR
+        .as_ref()
+        .map(|calendar| calendar.authority_hash.as_str())
+        .map_err(std::clone::Clone::clone)
+}
+
 /// Resolve the preceding A-share trading day using only the immutable,
 /// fail-closed exchange-calendar authority.
 pub fn verified_prev_a_share_trading_day(from: NaiveDate) -> Result<NaiveDate, String> {
