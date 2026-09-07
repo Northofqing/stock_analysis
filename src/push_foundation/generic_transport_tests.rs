@@ -11,14 +11,18 @@ use crate::durable_delivery::{
     ImmutableAppendPort, PushKind, TypedReceipt,
 };
 use crate::monitor::push_job::{
-    ChannelId, DeliveryResultView, ReasonCode, TerminalDisposition, UtcMicros,
+    ChannelId, CompatId, CompatibilityEvidenceRef, CompletionEligibility, DeliveryResult,
+    DeliveryResultView, ReasonCode, TerminalDisposition, UtcMicros, WeakOutcome, WeakOutcomeKind,
 };
 
 use super::generic_transport::{
     GenericDispatchFence, GenericDispatchRequest, GenericTransportAuthorityAdapter,
-    GenericTransportError, GenericTransportRoute,
+    GenericTransportError, GenericTransportRoute, RequiredChannelClassification,
+    RequiredChannelError, RequiredChannelObservation, RequiredChannelResults,
 };
+use super::terminal_authority::{terminal_binding_sha256, verify_terminal};
 use super::terminal_authority_tests::fixture;
+use super::terminal_authority_tests::FakeAuthority;
 use super::{
     BusinessIntentStore, IntentSnapshot, IntentState, IntentTransitionCommand, LeaseAction,
     LeaseOwnerId, TransitionActor,
@@ -376,4 +380,217 @@ fn w12_generic_transport_rejects_stale_business_lease_before_sink() {
         Err(GenericTransportError::BusinessLeaseMismatch)
     );
     assert_eq!(sink.calls.load(Ordering::SeqCst), 0);
+}
+
+fn strong_result(disposition: TerminalDisposition) -> DeliveryResult {
+    let fixture = fixture();
+    let mut record = fixture.record;
+    record.terminal_disposition = disposition;
+    record.binding_sha256 = terminal_binding_sha256(&record);
+    let authority = FakeAuthority::terminal(record);
+    verify_terminal(
+        &fixture.snapshot,
+        &fixture.template,
+        &fixture.policy,
+        &authority,
+        micros(1_788_743_103_000_000),
+    )
+    .expect("verified strong result")
+    .into_delivery_result()
+}
+
+fn compat_accepted_result() -> DeliveryResult {
+    let fixture = fixture();
+    let channel = ChannelId::try_new("TEST_CODE_COMPAT_CHANNEL".to_owned()).expect("channel");
+    let evidence = CompatibilityEvidenceRef::try_new(
+        CompatId::try_new("TEST_CODE_COMPAT".to_owned()).expect("compat id"),
+        fixture.record.intent_id,
+        fixture.record.unit_id,
+        fixture.record.occurrence,
+        vec![channel.clone()],
+        vec![channel.clone()],
+        vec![WeakOutcome::new(
+            channel,
+            WeakOutcomeKind::Accepted,
+            crate::monitor::push_job::raw_digest(b"TEST_CODE_COMPAT_EVIDENCE"),
+        )],
+        crate::monitor::push_job::raw_digest(b"TEST_CODE_COMPAT_EVIDENCE"),
+        micros(1_788_743_103_000_000),
+    )
+    .expect("compat evidence");
+    DeliveryResult::best_effort_accepted(evidence).expect("compat accepted")
+}
+
+fn channel(value: &str) -> ChannelId {
+    ChannelId::try_new(value.to_owned()).expect("required channel")
+}
+
+#[test]
+fn w12_required_channel_results_are_ordered_exact_and_all_accepted_only() {
+    let required = vec![channel("TEST_CODE_SMS"), channel("TEST_CODE_WECHAT")];
+    let results = RequiredChannelResults::try_classify(
+        required.clone(),
+        vec![
+            RequiredChannelObservation::new(
+                channel("TEST_CODE_WECHAT"),
+                strong_result(TerminalDisposition::ManualConfirmedAccepted),
+            ),
+            RequiredChannelObservation::new(
+                channel("TEST_CODE_SMS"),
+                strong_result(TerminalDisposition::Accepted),
+            ),
+        ],
+    )
+    .expect("all required channels accepted");
+
+    assert_eq!(
+        results.classification(),
+        RequiredChannelClassification::AllRequiredAccepted
+    );
+    assert_eq!(results.ordered_channels(), required.as_slice());
+    assert_eq!(
+        results.completion_eligibility(),
+        CompletionEligibility::PolicyBound
+    );
+}
+
+#[test]
+fn w12_required_channel_results_reject_missing_duplicate_extra_and_compat() {
+    let required = vec![channel("TEST_CODE_SMS"), channel("TEST_CODE_WECHAT")];
+    assert_eq!(
+        RequiredChannelResults::try_classify(Vec::new(), Vec::new()),
+        Err(RequiredChannelError::RequiredChannelsEmpty)
+    );
+    assert_eq!(
+        RequiredChannelResults::try_classify(
+            vec![channel("TEST_CODE_SMS"), channel("TEST_CODE_SMS")],
+            Vec::new(),
+        ),
+        Err(RequiredChannelError::DuplicateRequiredChannel)
+    );
+    assert_eq!(
+        RequiredChannelResults::try_classify(
+            required.clone(),
+            vec![RequiredChannelObservation::new(
+                channel("TEST_CODE_SMS"),
+                strong_result(TerminalDisposition::Accepted),
+            )],
+        ),
+        Err(RequiredChannelError::ChannelSetMismatch)
+    );
+    assert_eq!(
+        RequiredChannelResults::try_classify(
+            required.clone(),
+            vec![
+                RequiredChannelObservation::new(
+                    channel("TEST_CODE_SMS"),
+                    strong_result(TerminalDisposition::Accepted),
+                ),
+                RequiredChannelObservation::new(
+                    channel("TEST_CODE_SMS"),
+                    strong_result(TerminalDisposition::Accepted),
+                ),
+            ],
+        ),
+        Err(RequiredChannelError::DuplicateObservation)
+    );
+    assert_eq!(
+        RequiredChannelResults::try_classify(
+            required.clone(),
+            vec![
+                RequiredChannelObservation::new(
+                    channel("TEST_CODE_SMS"),
+                    strong_result(TerminalDisposition::Accepted),
+                ),
+                RequiredChannelObservation::new(
+                    channel("TEST_CODE_EXTRA"),
+                    strong_result(TerminalDisposition::Accepted),
+                ),
+            ],
+        ),
+        Err(RequiredChannelError::ChannelSetMismatch)
+    );
+    assert_eq!(
+        RequiredChannelResults::try_classify(
+            vec![channel("TEST_CODE_COMPAT_CHANNEL")],
+            vec![RequiredChannelObservation::new(
+                channel("TEST_CODE_COMPAT_CHANNEL"),
+                compat_accepted_result(),
+            )],
+        ),
+        Err(RequiredChannelError::StrongAuthorityRequired)
+    );
+}
+
+#[test]
+fn w12_required_channel_partial_rejected_and_uncertain_never_complete() {
+    let required = vec![channel("TEST_CODE_SMS"), channel("TEST_CODE_WECHAT")];
+    let partial = RequiredChannelResults::try_classify(
+        required.clone(),
+        vec![
+            RequiredChannelObservation::new(
+                channel("TEST_CODE_SMS"),
+                strong_result(TerminalDisposition::Accepted),
+            ),
+            RequiredChannelObservation::new(
+                channel("TEST_CODE_WECHAT"),
+                strong_result(TerminalDisposition::Rejected),
+            ),
+        ],
+    )
+    .expect("strong partial results");
+    assert_eq!(
+        partial.classification(),
+        RequiredChannelClassification::PartialRequiredChannels
+    );
+    assert_eq!(
+        partial.completion_eligibility(),
+        CompletionEligibility::Never
+    );
+
+    let rejected = RequiredChannelResults::try_classify(
+        required.clone(),
+        vec![
+            RequiredChannelObservation::new(
+                channel("TEST_CODE_SMS"),
+                strong_result(TerminalDisposition::Rejected),
+            ),
+            RequiredChannelObservation::new(
+                channel("TEST_CODE_WECHAT"),
+                strong_result(TerminalDisposition::ManualConfirmedNotDelivered),
+            ),
+        ],
+    )
+    .expect("strong rejected results");
+    assert_eq!(
+        rejected.classification(),
+        RequiredChannelClassification::RejectedRequiredChannels
+    );
+    assert_eq!(
+        rejected.completion_eligibility(),
+        CompletionEligibility::Never
+    );
+
+    let uncertain = RequiredChannelResults::try_classify(
+        required,
+        vec![
+            RequiredChannelObservation::new(
+                channel("TEST_CODE_SMS"),
+                strong_result(TerminalDisposition::Accepted),
+            ),
+            RequiredChannelObservation::new(
+                channel("TEST_CODE_WECHAT"),
+                strong_result(TerminalDisposition::Uncertain),
+            ),
+        ],
+    )
+    .expect("strong uncertain results");
+    assert_eq!(
+        uncertain.classification(),
+        RequiredChannelClassification::UncertainRequiredChannels
+    );
+    assert_eq!(
+        uncertain.completion_eligibility(),
+        CompletionEligibility::Never
+    );
 }
