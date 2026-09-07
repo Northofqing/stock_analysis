@@ -168,18 +168,19 @@ conformance adapter 重新解析并验证 legacy envelope，然后检查：
 
 它不包含 N01 event ID、critical threshold、accepted-event set、committed count、pending count 或 daily quota。N02 source port 也不暴露修改这些值的方法。
 
-N02 exact reader 返回一个窗口的 `Missing | PendingSeal | Terminal`：
+N02 exact reader 返回一个窗口的 `Missing | PendingSeal | Terminal`。同一 reservation 允许在明确 Rejected 后以递增 `attempt_ordinal` 重试，但每个 attempt 只能有一个终态，Uncertain 不得自动打开下一 attempt：
 
 - 没有 SinkAttempt：Missing；
-- 有 attempt、无 terminal：PendingSeal；
-- 唯一 attempt+唯一 terminal：Terminal；
-- 多个 Accepted、terminal 无 attempt、同 attempt 多终态、链损坏或跨窗口混用：查询失败。
+- 最新 attempt 无 terminal：PendingSeal；
+- 恰好一个 Accepted：以该 Accepted 为不可撤销 Terminal，较早 Rejected 不改变 accepted-window；
+- 尚无 Accepted 且最新 attempt 为 DefinitivelyRejected/Uncertain：映射相应 Terminal；
+- 多个 Accepted、terminal 无 attempt、同 attempt 多终态、Rejected 后 ordinal 未递增、Uncertain 后出现新 attempt、链损坏或跨窗口混用：查询失败。
 
 adapter 对 exact `EventEnvelope`/`PushRecord` 重新验证：
 
 1. audit schema 必须为 NewsFlash v5 authoritative schema；
 2. kind 固定 `news_flash_aggregated_v1`，decision key 固定 `window:{HH:MM}`；
-3. business date/window、reservation identity、attempt ordinal、attempt envelope ID、attempt identity/SHA 完全相同；
+3. business date/window、reservation identity、attempt ordinal、attempt envelope ID、attempt identity/SHA 完全相同；多 attempt 必须属于同一 reservation，并保持严格递增 ordinal；
 4. ordered sources 重新计算为 evidence SHA；render SHA 与 Ready intent 精确一致；
 5. template ID 固定 `news_flash_aggregated_v1`，Foundation Unit 固定 `MU-news-flash-aggregate`，subject 固定 Global；
 6. Accepted typed remote receipt 的 channel 等于 attempt channel和 required channel；receipt `accepted_at` 只表示 transport acceptance，绝不替代 source `published_at/observed_at`；
@@ -240,7 +241,7 @@ source record 通过专用校验后，adapter 才构造私有 `AuthorityTerminal
 2. exact attempt+Accepted terminal 映射 TransportAccepted，receipt bytes 保留。
 3. N01 accepted-event/quota 的不同状态不能改变同一 N02 query/result，source port 调用也没有 quota 参数。
 4. window、decision key、reservation、ordinal、attempt join、evidence、render、channel、receipt time 任一漂移失败。
-5. Missing、Pending、DefinitivelyRejected、Uncertain 完整映射；多 terminal 和无 attempt 失败关闭。
+5. Missing、Pending、DefinitivelyRejected、Uncertain 及 Rejected→更高 ordinal→Accepted 完整映射；多 Accepted、同 attempt 多 terminal、Uncertain 后重试和无 attempt 失败关闭。
 
 ### 相邻回归
 
