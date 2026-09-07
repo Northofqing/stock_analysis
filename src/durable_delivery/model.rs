@@ -741,6 +741,7 @@ impl FoundationDeliveryBinding {
         &self.template_version
     }
 
+    #[cfg(test)]
     pub(crate) fn canonical_sha256(&self) -> Result<String> {
         Ok(sha256_hex(&serde_json::to_vec(self)?))
     }
@@ -1114,6 +1115,7 @@ impl FoundationTerminalRecord {
         self.attempt_id.as_deref()
     }
 
+    #[cfg(test)]
     pub(crate) fn required_channel(&self) -> &str {
         self.binding.required_channel()
     }
