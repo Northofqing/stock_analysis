@@ -336,21 +336,24 @@ fn reconcile_authority(
 
     // W10 records an invalid terminal reference while already AwaitingFinalizer. Re-querying a
     // still-invalid reference must remain read-only or every fixed-point pass would append again.
-    if current.reason() == ReasonCode::FinalizerTerminalRefInvalid
-        && verify_terminal(
+    if current.reason() == ReasonCode::FinalizerTerminalRefInvalid {
+        match verify_terminal(
             &current,
             bindings.template,
             bindings.policy,
             bindings.authority,
             config.now,
-        )
-        .is_err()
-    {
-        return Ok((
-            current,
-            RecoveryBoundary::AuthorityBlocked,
-            applied_before_authority,
-        ));
+        ) {
+            Err(source) if recoverable_authority_blocker(&source) => {
+                return Ok((
+                    current,
+                    RecoveryBoundary::AuthorityBlocked,
+                    applied_before_authority,
+                ));
+            }
+            Err(source) => return Err(BusinessFinalizerError::Terminal(source).into()),
+            Ok(_) => {}
+        }
     }
 
     let request = AcceptedPreparationRequest::new(
@@ -457,8 +460,11 @@ fn reconcile_authority(
                 applied_before_authority,
             )
         }
-        Err(BusinessFinalizerError::Terminal(_)) => {
+        Err(BusinessFinalizerError::Terminal(source)) if recoverable_authority_blocker(&source) => {
             record_authority_blocker(store, current, config, applied_before_authority)
+        }
+        Err(BusinessFinalizerError::Terminal(source)) => {
+            Err(BusinessFinalizerError::Terminal(source).into())
         }
         Err(BusinessFinalizerError::TerminalInvalid { .. }) => {
             let persisted = store
@@ -472,6 +478,16 @@ fn reconcile_authority(
         ),
         Err(error) => Err(error.into()),
     }
+}
+
+fn recoverable_authority_blocker(error: &TerminalAuthorityError) -> bool {
+    !matches!(
+        error,
+        TerminalAuthorityError::IntentSnapshotInvalid
+            | TerminalAuthorityError::TemplateBindingMismatch
+            | TerminalAuthorityError::CompletionPolicyMismatch { .. }
+            | TerminalAuthorityError::AuthorityNotAllowed
+    )
 }
 
 fn reconcile_nonaccepted_disposition(

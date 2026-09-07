@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use crate::monitor::push_job::{
     AudienceId, BusinessDate, CompletionOwnerId, DecisionId, Namespace, OccurrenceFamily,
     OccurrenceIdentityMaterial, OccurrenceKey, ReasonCode, Sha256Digest, SourceContractId,
-    SubjectId, TerminalDisposition, UnitId, UtcMicros,
+    SubjectId, TemplateId, TemplateVersion, TerminalDisposition, UnitId, UtcMicros,
 };
 
 use super::business_finalizer::{
@@ -18,7 +18,7 @@ use super::reconciler::{
 };
 use super::terminal_authority::{
     terminal_binding_sha256, AuthorityAttemptBinding, AuthorityDescriptor, AuthorityQuery,
-    AuthorityQueryFailure, TerminalAuthorityPort,
+    AuthorityQueryFailure, TerminalAuthorityPort, TerminalTemplateBinding,
 };
 use super::terminal_authority_tests::{fixture as terminal_fixture, FakeAuthority, Fixture};
 use super::{
@@ -228,6 +228,25 @@ impl TerminalAuthorityPort for SequenceAuthority {
     }
 }
 
+struct MismatchedTemplateBindings<'a> {
+    template: TerminalTemplateBinding,
+    fixture: &'a Fixture,
+    authority: &'a dyn TerminalAuthorityPort,
+}
+
+impl RecoveryBindingsPort for MismatchedTemplateBindings<'_> {
+    fn resolve<'a>(
+        &'a self,
+        _intent: &AttestedReadyIntent,
+    ) -> Result<RecoveryBindings<'a>, RecoveryBindingError> {
+        Ok(RecoveryBindings::new(
+            &self.template,
+            &self.fixture.policy,
+            self.authority,
+        ))
+    }
+}
+
 impl RecoveryBindingsPort for StaticBindings<'_> {
     fn resolve<'a>(
         &'a self,
@@ -327,9 +346,27 @@ fn authority_times() -> (i64, i64, i64) {
 #[test]
 fn w11_scans_every_business_date_with_keyset_pages_and_never_dispatches() {
     let mut fixture = RecoveryFixture::new();
+    let terminal = fixture.insert_ready("2026-08-30", "terminal", CREATED_AT - 1);
     let oldest = fixture.insert_ready("2026-08-31", "000001", CREATED_AT);
     let middle = fixture.insert_ready("2026-09-03", "000002", CREATED_AT + 1);
     let newest = fixture.insert_ready("2026-09-07", "000003", CREATED_AT + 2);
+    let terminal_intent = terminal.attested_ready_binding().unwrap().intent_id;
+    fixture
+        .store
+        .apply_nonterminal_transition(
+            &IntentTransitionCommand::try_new(
+                terminal_intent.clone(),
+                IntentState::PendingDispatch,
+                IntentState::NoData,
+                terminal.version(),
+                TransitionActor::try_new("terminal-winner".to_owned()).unwrap(),
+                ReasonCode::IntentNoData,
+                micros(CREATED_AT),
+                LeaseAction::Preserve,
+            )
+            .unwrap(),
+        )
+        .unwrap();
     let bindings = NoBindings::new();
 
     let report = reconcile_startup(&mut fixture.store, &config("recovery-1", 1), &bindings)
@@ -338,6 +375,9 @@ fn w11_scans_every_business_date_with_keyset_pages_and_never_dispatches() {
     assert_eq!(report.iterations(), 2);
     assert_eq!(report.transition_count(), 3);
     assert_eq!(report.entries().len(), 3);
+    let oldest_entry = report.entry(oldest.intent_id()).unwrap();
+    assert_eq!(oldest_entry.state(), IntentState::PendingDispatch);
+    assert_eq!(oldest_entry.version(), oldest.version() + 1);
     assert_eq!(
         report
             .entries()
@@ -366,6 +406,16 @@ fn w11_scans_every_business_date_with_keyset_pages_and_never_dispatches() {
         bindings.calls.get(),
         0,
         "PendingDispatch never queries authority"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .inspect(&terminal_intent)
+            .unwrap()
+            .unwrap()
+            .state(),
+        IntentState::NoData,
+        "terminal intents are excluded from recovery scans"
     );
     for original in [&oldest, &middle, &newest] {
         let current = fixture
@@ -1062,4 +1112,56 @@ fn w11_second_query_disposition_drift_is_isolated_without_completion() {
         );
         assert_ne!(current.reason(), ReasonCode::FinalizerCompleted);
     }
+}
+
+#[test]
+fn w11_registered_template_mismatch_fails_startup_without_query_or_write() {
+    let fixture = terminal_fixture();
+    let authority = FakeAuthority::terminal(fixture.record.clone());
+    let bindings = MismatchedTemplateBindings {
+        template: TerminalTemplateBinding::new(
+            TemplateId::try_new("wrong-template".to_owned()).unwrap(),
+            TemplateVersion::try_new("wrong-v1".to_owned()).unwrap(),
+        ),
+        fixture: &fixture,
+        authority: &authority,
+    };
+    let mut store = BusinessIntentStore::open(&fixture.database).unwrap();
+    let (dispatch_at, recovery_at, lease_until) = authority_times();
+    let awaiting = dispatch_terminal_fixture(
+        &fixture,
+        &mut store,
+        "mismatched-template",
+        dispatch_at,
+        lease_until,
+    );
+
+    let error = reconcile_startup(
+        &mut store,
+        &config_at("mismatched-template", 1, recovery_at, lease_until, 8),
+        &bindings,
+    )
+    .expect_err("registered template drift must fail the startup gate");
+
+    assert_eq!(
+        error,
+        RecoveryError::Finalizer {
+            check: "terminal_authority"
+        }
+    );
+    assert_eq!(
+        store.inspect(&fixture.record.intent_id).unwrap().unwrap(),
+        awaiting
+    );
+    assert_eq!(authority.calls.get(), 0);
+    assert_eq!(
+        store
+            .inspect_transition_chain(&fixture.record.intent_id)
+            .unwrap()
+            .len(),
+        1
+    );
+    let debug = format!("{error:?}");
+    assert!(!debug.contains("PreparedPush/v1"));
+    assert!(!debug.contains("000001.SZ"));
 }
