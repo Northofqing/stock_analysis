@@ -7679,3 +7679,114 @@ fn cooldown_projection_events_are_append_only() {
         ]
     );
 }
+
+#[test]
+fn w12_legacy_envelope_keeps_exact_identity_and_canonical_bytes() {
+    let legacy = envelope(
+        "W12_LEGACY_GOLDEN",
+        PushKind::HoldingEvent,
+        DeliverySubKind::None,
+        "2026-07-30",
+        false,
+    );
+    let canonical = legacy
+        .canonical_bytes()
+        .expect("canonical legacy envelope");
+
+    assert_eq!(
+        legacy.decision_identity,
+        "fd2b10332c1a463dcd5e9fc74e85f388e695bd27679ba61b45878691f5803056"
+    );
+    assert_eq!(
+        sha256_hex(&canonical),
+        "5e431e42aa9db00e7a548d490fea575b8c8ba8f882d22d4ceb9ac1843f4fe32f"
+    );
+    assert!(!canonical
+        .windows(b"foundation_binding".len())
+        .any(|window| window == b"foundation_binding"));
+    assert!(legacy.foundation_binding().is_none());
+}
+
+#[test]
+fn w12_foundation_binding_owns_application_decision_and_exact_cross_fields() {
+    let mut candidate = envelope(
+        "W12_FOUNDATION",
+        PushKind::HoldingEvent,
+        DeliverySubKind::None,
+        "2026-07-30",
+        false,
+    );
+    candidate.source_evidence_fingerprint =
+        sha256_hex(b"TEST_CODE_W12_FOUNDATION_SOURCE_EVIDENCE");
+    let application_decision_id = sha256_hex(b"TEST_CODE_W12_APPLICATION_DECISION");
+    let binding = FoundationDeliveryBinding::try_new(
+        "Test:TEST_CODE_W12_RUN".to_owned(),
+        application_decision_id.clone(),
+        sha256_hex(b"TEST_CODE_W12_INTENT"),
+        "MU-W12-generic".to_owned(),
+        candidate.schedule_occurrence_identity.clone(),
+        candidate.business_date.clone(),
+        "Global".to_owned(),
+        candidate.delivery_subject_hash.clone(),
+        "TEST_CODE_W12_AUDIENCE".to_owned(),
+        candidate.push_kind.stable_template_id().to_owned(),
+        "v1".to_owned(),
+        candidate.rendered_content_sha256.clone(),
+        candidate.source_evidence_fingerprint.clone(),
+        "TEST_CODE_CHANNEL".to_owned(),
+    )
+    .expect("valid W12 foundation binding");
+
+    let bound = candidate
+        .clone()
+        .with_foundation_binding(binding)
+        .expect("bind foundation decision");
+    let persisted = bound.foundation_binding().expect("foundation binding");
+
+    assert_eq!(bound.decision_identity, application_decision_id);
+    assert_eq!(persisted.intent_id(), sha256_hex(b"TEST_CODE_W12_INTENT"));
+    assert_eq!(persisted.required_channel(), "TEST_CODE_CHANNEL");
+    assert_eq!(persisted.rendered_sha256(), candidate.rendered_content_sha256);
+    assert_eq!(persisted.canonical_sha256().len(), 64);
+    assert!(bound
+        .canonical_bytes()
+        .expect("foundation canonical envelope")
+        .windows(b"foundation_binding".len())
+        .any(|window| window == b"foundation_binding"));
+
+    let wrong_date = FoundationDeliveryBinding::try_new(
+        "Test:TEST_CODE_W12_RUN".to_owned(),
+        sha256_hex(b"TEST_CODE_W12_APPLICATION_DECISION_BAD_DATE"),
+        sha256_hex(b"TEST_CODE_W12_INTENT"),
+        "MU-W12-generic".to_owned(),
+        candidate.schedule_occurrence_identity.clone(),
+        "2026-07-31".to_owned(),
+        "Global".to_owned(),
+        candidate.delivery_subject_hash.clone(),
+        "TEST_CODE_W12_AUDIENCE".to_owned(),
+        candidate.push_kind.stable_template_id().to_owned(),
+        "v1".to_owned(),
+        candidate.rendered_content_sha256.clone(),
+        candidate.source_evidence_fingerprint.clone(),
+        "TEST_CODE_CHANNEL".to_owned(),
+    )
+    .expect("individually valid binding");
+    assert!(candidate.with_foundation_binding(wrong_date).is_err());
+    assert!(FoundationDeliveryBinding::try_new(
+        "Test:TEST_CODE_W12_RUN".to_owned(),
+        sha256_hex(b"TEST_CODE_W12_APPLICATION_DECISION_BAD_CHANNEL"),
+        sha256_hex(b"TEST_CODE_W12_INTENT"),
+        "MU-W12-generic".to_owned(),
+        "TEST_CODE_OCCURRENCE".to_owned(),
+        "2026-07-30".to_owned(),
+        "Global".to_owned(),
+        "TEST_CODE_SUBJECT_HASH".to_owned(),
+        "TEST_CODE_W12_AUDIENCE".to_owned(),
+        "holding_event_v1".to_owned(),
+        "v1".to_owned(),
+        sha256_hex(b"TEST_CODE_RENDERED"),
+        sha256_hex(b"TEST_CODE_SOURCE"),
+        " bad-channel ".to_owned(),
+    )
+    .is_err());
+}
