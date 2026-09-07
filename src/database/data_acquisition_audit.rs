@@ -9,6 +9,13 @@ use super::DatabaseManager;
 
 const AUDIT_SCHEMA_VERSION: i32 = 1;
 const AUDIT_CHAIN_GENESIS: &str = "BR159_DATA_ACQUISITION_AUDIT_GENESIS_V1";
+const LOAD_AUDIT_ROWS_SQL: &str =
+    "SELECT id, schema_version, capability, provider, source, request_hash,
+            source_at, observed_at, batch_id, outcome, request_count,
+            accepted_count, rejected_count, reason_code, retryable, created_at
+     FROM data_acquisition_audit ORDER BY id ASC";
+const LOAD_CHAIN_ROWS_SQL: &str = "SELECT acquisition_audit_id, previous_hash, record_hash
+     FROM data_acquisition_audit_chain ORDER BY acquisition_audit_id ASC";
 
 #[derive(Debug, Clone)]
 pub struct DataAcquisitionAuditRecord<'a> {
@@ -97,17 +104,44 @@ pub(crate) fn read_verified_acquisition_audit(
         .transaction::<_, diesel::result::Error, _>(|connection| {
             let audits = load_audit_rows(connection)?;
             let chain = load_chain_rows(connection)?;
-            let audit = audits
-                .iter()
-                .find(|audit| audit.id == receipt.audit_id)
-                .ok_or_else(|| audit_error("acquisition audit record missing"))?;
-            verify_data_acquisition_receipt_snapshot(&audits, &chain, receipt, &audit.record())?;
-            Ok(VerifiedAcquisitionAudit {
-                receipt: receipt.clone(),
-                audit: audit.clone(),
-            })
+            verify_loaded_acquisition(audits, chain, receipt)
         })
         .map_err(|_| AcquisitionAuditReadError)
+}
+
+/// Load BR-159 facts through a source-owner supplied transaction.
+///
+/// Before calling, the source owner must safely open the database and verify
+/// its schema, registration, and source identity. This adapter neither opens a
+/// connection nor changes pragmas, and the caller retains responsibility for
+/// ending the transaction and closing the connection. A successful return does
+/// not certify that the enclosing transaction's facts have been committed.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn read_acquisition_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    receipt: &DataAcquisitionAuditReceipt,
+) -> Result<VerifiedAcquisitionAudit, AcquisitionAuditReadError> {
+    let audits =
+        load_audit_rows_in_transaction(transaction).map_err(|_| AcquisitionAuditReadError)?;
+    let chain =
+        load_chain_rows_in_transaction(transaction).map_err(|_| AcquisitionAuditReadError)?;
+    verify_loaded_acquisition(audits, chain, receipt).map_err(|_| AcquisitionAuditReadError)
+}
+
+fn verify_loaded_acquisition(
+    audits: Vec<PersistedAcquisitionAudit>,
+    chain: Vec<AuditChainRow>,
+    receipt: &DataAcquisitionAuditReceipt,
+) -> diesel::QueryResult<VerifiedAcquisitionAudit> {
+    let audit = audits
+        .iter()
+        .find(|audit| audit.id == receipt.audit_id)
+        .ok_or_else(|| audit_error("acquisition audit record missing"))?;
+    verify_data_acquisition_receipt_snapshot(&audits, &chain, receipt, &audit.record())?;
+    Ok(VerifiedAcquisitionAudit {
+        receipt: receipt.clone(),
+        audit: audit.clone(),
+    })
 }
 
 #[derive(Clone, Debug, QueryableByName, Serialize)]
@@ -246,21 +280,52 @@ fn validate_record(record: &DataAcquisitionAuditRecord<'_>) -> Result<(), String
 fn load_audit_rows(
     conn: &mut SqliteConnection,
 ) -> diesel::QueryResult<Vec<PersistedAcquisitionAudit>> {
-    diesel::sql_query(
-        "SELECT id, schema_version, capability, provider, source, request_hash,
-                source_at, observed_at, batch_id, outcome, request_count,
-                accepted_count, rejected_count, reason_code, retryable, created_at
-         FROM data_acquisition_audit ORDER BY id ASC",
-    )
-    .load(conn)
+    diesel::sql_query(LOAD_AUDIT_ROWS_SQL).load(conn)
 }
 
 fn load_chain_rows(conn: &mut SqliteConnection) -> diesel::QueryResult<Vec<AuditChainRow>> {
-    diesel::sql_query(
-        "SELECT acquisition_audit_id, previous_hash, record_hash
-         FROM data_acquisition_audit_chain ORDER BY acquisition_audit_id ASC",
-    )
-    .load(conn)
+    diesel::sql_query(LOAD_CHAIN_ROWS_SQL).load(conn)
+}
+
+fn load_audit_rows_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<Vec<PersistedAcquisitionAudit>> {
+    let mut statement = transaction.prepare(LOAD_AUDIT_ROWS_SQL)?;
+    let rows = statement.query_map([], |row| {
+        Ok(PersistedAcquisitionAudit {
+            id: row.get(0)?,
+            schema_version: row.get(1)?,
+            capability: row.get(2)?,
+            provider: row.get(3)?,
+            source: row.get(4)?,
+            request_hash: row.get(5)?,
+            source_at: row.get(6)?,
+            observed_at: row.get(7)?,
+            batch_id: row.get(8)?,
+            outcome: row.get(9)?,
+            request_count: row.get(10)?,
+            accepted_count: row.get(11)?,
+            rejected_count: row.get(12)?,
+            reason_code: row.get(13)?,
+            retryable: row.get(14)?,
+            created_at: row.get(15)?,
+        })
+    })?;
+    rows.collect()
+}
+
+fn load_chain_rows_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<Vec<AuditChainRow>> {
+    let mut statement = transaction.prepare(LOAD_CHAIN_ROWS_SQL)?;
+    let rows = statement.query_map([], |row| {
+        Ok(AuditChainRow {
+            acquisition_audit_id: row.get(0)?,
+            previous_hash: row.get(1)?,
+            record_hash: row.get(2)?,
+        })
+    })?;
+    rows.collect()
 }
 
 fn load_audit_tail(
@@ -665,6 +730,145 @@ mod tests {
         }
     }
 
+    fn read_with_rusqlite(
+        database: &std::path::Path,
+        receipt: &DataAcquisitionAuditReceipt,
+    ) -> VerifiedAcquisitionAudit {
+        let mut reader = rusqlite::Connection::open_with_flags(
+            database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("TEST_CODE explicit readonly connection");
+        reader
+            .execute_batch("PRAGMA query_only=ON;")
+            .expect("TEST_CODE query-only connection");
+        let transaction = reader
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .expect("TEST_CODE begin caller-owned deferred transaction");
+        assert!(!transaction.is_autocommit());
+        let verified = read_acquisition_in_transaction(&transaction, receipt)
+            .expect("TEST_CODE read acquisition through caller transaction");
+        assert!(!transaction.is_autocommit());
+        transaction
+            .rollback()
+            .expect("TEST_CODE caller ends deferred transaction");
+        assert!(reader.is_autocommit());
+        verified
+    }
+
+    fn assert_record_matches(
+        actual: DataAcquisitionAuditRecord<'_>,
+        expected: &DataAcquisitionAuditRecord<'_>,
+    ) {
+        assert_eq!(actual.capability, expected.capability);
+        assert_eq!(actual.provider, expected.provider);
+        assert_eq!(actual.source, expected.source);
+        assert_eq!(actual.request_hash, expected.request_hash);
+        assert_eq!(actual.source_at, expected.source_at);
+        assert_eq!(actual.observed_at, expected.observed_at);
+        assert_eq!(actual.batch_id, expected.batch_id);
+        assert_eq!(actual.outcome, expected.outcome);
+        assert_eq!(actual.request_count, expected.request_count);
+        assert_eq!(actual.accepted_count, expected.accepted_count);
+        assert_eq!(actual.rejected_count, expected.rejected_count);
+        assert_eq!(actual.reason_code, expected.reason_code);
+        assert_eq!(actual.retryable, expected.retryable);
+    }
+
+    fn assert_persisted_audits_match(
+        actual: &PersistedAcquisitionAudit,
+        expected: &PersistedAcquisitionAudit,
+    ) {
+        assert_eq!(actual.id, expected.id);
+        assert_eq!(actual.schema_version, expected.schema_version);
+        assert_eq!(actual.capability, expected.capability);
+        assert_eq!(actual.provider, expected.provider);
+        assert_eq!(actual.source, expected.source);
+        assert_eq!(actual.request_hash, expected.request_hash);
+        assert_eq!(actual.source_at, expected.source_at);
+        assert_eq!(actual.observed_at, expected.observed_at);
+        assert_eq!(actual.batch_id, expected.batch_id);
+        assert_eq!(actual.outcome, expected.outcome);
+        assert_eq!(actual.request_count, expected.request_count);
+        assert_eq!(actual.accepted_count, expected.accepted_count);
+        assert_eq!(actual.rejected_count, expected.rejected_count);
+        assert_eq!(actual.reason_code, expected.reason_code);
+        assert_eq!(actual.retryable, expected.retryable);
+        assert_eq!(actual.created_at, expected.created_at);
+    }
+
+    fn assert_closed_read_error(error: AcquisitionAuditReadError) {
+        assert_eq!(error, AcquisitionAuditReadError);
+        assert_eq!(
+            error.to_string(),
+            "acquisition audit facts could not be verified"
+        );
+        assert!(!format!("{error:?}").contains("TEST_CODE_SECRET"));
+    }
+
+    fn create_loose_acquisition_tables(connection: &rusqlite::Connection) {
+        connection
+            .execute_batch(
+                "CREATE TABLE data_acquisition_audit (
+                    id, schema_version, capability, provider, source, request_hash,
+                    source_at, observed_at, batch_id, outcome, request_count,
+                    accepted_count, rejected_count, reason_code, retryable, created_at
+                );
+                CREATE TABLE data_acquisition_audit_chain (
+                    acquisition_audit_id, previous_hash, record_hash
+                );",
+            )
+            .expect("TEST_CODE create loose acquisition tables");
+    }
+
+    fn insert_loose_acquisition_fixture(
+        connection: &rusqlite::Connection,
+    ) -> DataAcquisitionAuditReceipt {
+        let receipt = DataAcquisitionAuditReceipt {
+            audit_id: 1,
+            record_hash: "a".repeat(64),
+            previous_outcome: None,
+            current_outcome: "verified_empty".into(),
+        };
+        connection
+            .execute(
+                "INSERT INTO data_acquisition_audit (
+                    id, schema_version, capability, provider, source, request_hash,
+                    source_at, observed_at, batch_id, outcome, request_count,
+                    accepted_count, rejected_count, reason_code, retryable, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                           ?12, ?13, ?14, ?15, ?16)",
+                rusqlite::params![
+                    1_i64,
+                    1_i32,
+                    "TEST_CODE_capability",
+                    "TEST_CODE_provider",
+                    "TEST_CODE_source",
+                    "a".repeat(64),
+                    Option::<String>::None,
+                    "2099-01-02T10:00:00+08:00",
+                    "TEST_CODE_batch",
+                    "verified_empty",
+                    1_i64,
+                    0_i64,
+                    0_i64,
+                    "TEST_CODE_reason",
+                    0_i32,
+                    "2099-01-02T02:00:00.000Z",
+                ],
+            )
+            .expect("TEST_CODE insert loose acquisition row");
+        connection
+            .execute(
+                "INSERT INTO data_acquisition_audit_chain (
+                    acquisition_audit_id, previous_hash, record_hash
+                 ) VALUES (?1, ?2, ?3)",
+                rusqlite::params![receipt.audit_id, AUDIT_CHAIN_GENESIS, &receipt.record_hash],
+            )
+            .expect("TEST_CODE insert loose chain row");
+        receipt
+    }
+
     #[test]
     fn w15_acquisition_reader_reopens_verified_empty_facts_without_writes() {
         let root = tempfile::tempdir().expect("TEST_CODE audit root");
@@ -712,6 +916,258 @@ mod tests {
         assert!(!actual.retryable);
         assert!(!format!("{verified:?}").contains("TEST_CODE_SECRET"));
         assert_eq!(audit_directory_bytes(root.path()), before);
+    }
+
+    #[test]
+    fn w15_rusqlite_transaction_reader_reopens_verified_empty_facts_without_writes() {
+        let root = tempfile::tempdir().expect("TEST_CODE audit root");
+        let database = root
+            .path()
+            .canonicalize()
+            .expect("TEST_CODE canonical root")
+            .join("acquisition.sqlite3");
+        let path = database.to_str().expect("TEST_CODE UTF-8 fixture path");
+        let mut expected = record("verified_empty", Some("TEST_CODE_SECRET_batch"));
+        expected.source = "TEST_CODE_SECRET_source";
+        let (receipt, expected_audit) = {
+            let mut writer = SqliteConnection::establish(path).expect("TEST_CODE fixture writer");
+            create_schema(&mut writer).expect("TEST_CODE fixture schema");
+            let receipt = writer
+                .immediate_transaction::<_, diesel::result::Error, _>(|conn| {
+                    insert_acquisition_audit_query(conn, &expected)
+                })
+                .expect("TEST_CODE append fixture");
+            let expected_audit = load_audit_rows(&mut writer)
+                .expect("TEST_CODE load Diesel fixture")
+                .pop()
+                .expect("TEST_CODE inserted audit");
+            (receipt, expected_audit)
+        };
+        let before = audit_directory_bytes(root.path());
+        let verified = {
+            let mut reader = rusqlite::Connection::open_with_flags(
+                &database,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .expect("TEST_CODE explicit readonly connection");
+            reader
+                .execute_batch("PRAGMA query_only=ON;")
+                .expect("TEST_CODE query-only connection");
+            assert_eq!(
+                reader
+                    .query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
+                    .expect("TEST_CODE verify query-only connection"),
+                1
+            );
+            let transaction = reader
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+                .expect("TEST_CODE begin caller-owned deferred transaction");
+            assert!(!transaction.is_autocommit());
+            let verified = read_acquisition_in_transaction(&transaction, &receipt)
+                .expect("TEST_CODE query original audited facts");
+            assert!(!transaction.is_autocommit());
+            transaction
+                .rollback()
+                .expect("TEST_CODE caller ends deferred transaction");
+            assert!(reader.is_autocommit());
+            verified
+        };
+        assert_eq!(verified.receipt(), &receipt);
+        assert_persisted_audits_match(&verified.audit, &expected_audit);
+        assert!(!format!("{verified:?}").contains("TEST_CODE_SECRET"));
+        assert_eq!(audit_directory_bytes(root.path()), before);
+    }
+
+    #[test]
+    fn w15_rusqlite_and_diesel_readers_preserve_all_outcomes_and_raw_facts() {
+        let root = tempfile::tempdir().expect("TEST_CODE outcome root");
+        let database = root
+            .path()
+            .canonicalize()
+            .expect("TEST_CODE canonical root")
+            .join("acquisition.sqlite3");
+        let path = database.to_str().expect("TEST_CODE UTF-8 fixture path");
+        let mut writer = SqliteConnection::establish(path).expect("TEST_CODE fixture writer");
+        create_schema(&mut writer).expect("TEST_CODE fixture schema");
+
+        for (index, outcome) in [
+            "available",
+            "verified_empty",
+            "invalid_request",
+            "unavailable",
+            "stale",
+            "partial",
+            "conflict",
+            "unsupported",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let has_required_batch = matches!(outcome, "available" | "verified_empty");
+            let mut expected = record(
+                outcome,
+                (has_required_batch || index % 3 == 0).then_some("TEST_CODE_verified_batch"),
+            );
+            expected.source_at = (index % 2 == 0).then_some("2099-01-02");
+            expected.request_count = index as i64 + 10;
+            expected.accepted_count = index as i64;
+            expected.rejected_count = index as i64 + 20;
+            expected.retryable = index % 2 == 1;
+            let receipt = writer
+                .immediate_transaction::<_, diesel::result::Error, _>(|conn| {
+                    insert_acquisition_audit_query(conn, &expected)
+                })
+                .expect("TEST_CODE append outcome");
+
+            let diesel = read_verified_acquisition_audit(&mut writer, &receipt)
+                .expect("TEST_CODE Diesel reader preserves outcome");
+            let sqlite = read_with_rusqlite(&database, &receipt);
+            assert_eq!(diesel.receipt(), &receipt);
+            assert_eq!(sqlite.receipt(), &receipt);
+            assert_record_matches(diesel.record(), &expected);
+            assert_record_matches(sqlite.record(), &expected);
+            assert_persisted_audits_match(&sqlite.audit, &diesel.audit);
+        }
+    }
+
+    #[test]
+    fn w15_rusqlite_reader_rejects_every_receipt_field_drift_and_leaves_transaction_open() {
+        let root = tempfile::tempdir().expect("TEST_CODE receipt root");
+        let database = root
+            .path()
+            .canonicalize()
+            .expect("TEST_CODE canonical root")
+            .join("acquisition.sqlite3");
+        let path = database.to_str().expect("TEST_CODE UTF-8 fixture path");
+        let receipt = {
+            let mut writer = SqliteConnection::establish(path).expect("TEST_CODE fixture writer");
+            create_schema(&mut writer).expect("TEST_CODE fixture schema");
+            writer
+                .immediate_transaction::<_, diesel::result::Error, _>(|conn| {
+                    insert_acquisition_audit_query(
+                        conn,
+                        &record("verified_empty", Some("TEST_CODE_batch")),
+                    )
+                })
+                .expect("TEST_CODE append fixture")
+        };
+        let mut reader = rusqlite::Connection::open_with_flags(
+            &database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("TEST_CODE readonly connection");
+        reader
+            .execute_batch("PRAGMA query_only=ON;")
+            .expect("TEST_CODE query-only connection");
+        let transaction = reader
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .expect("TEST_CODE begin caller-owned transaction");
+        for field in ["id", "hash", "previous", "current"] {
+            let mut altered = receipt.clone();
+            match field {
+                "id" => altered.audit_id += 100,
+                "hash" => altered.record_hash = "TEST_CODE_SECRET_hash".into(),
+                "previous" => altered.previous_outcome = Some("TEST_CODE_SECRET_previous".into()),
+                "current" => altered.current_outcome = "TEST_CODE_SECRET_current".into(),
+                _ => unreachable!("TEST_CODE fixed cases"),
+            }
+            let error = read_acquisition_in_transaction(&transaction, &altered)
+                .expect_err("TEST_CODE receipt drift cannot certify facts");
+            assert_closed_read_error(error);
+            assert!(!transaction.is_autocommit());
+        }
+        assert_eq!(
+            read_acquisition_in_transaction(&transaction, &receipt)
+                .expect("TEST_CODE transaction remains usable")
+                .receipt(),
+            &receipt
+        );
+        assert!(!transaction.is_autocommit());
+        transaction
+            .rollback()
+            .expect("TEST_CODE caller ends failed-read transaction");
+        assert!(reader.is_autocommit());
+    }
+
+    #[test]
+    fn w15_rusqlite_reader_rejects_invalid_sqlite_type_for_every_projected_field() {
+        for (table, column) in [
+            ("data_acquisition_audit", "id"),
+            ("data_acquisition_audit", "schema_version"),
+            ("data_acquisition_audit", "capability"),
+            ("data_acquisition_audit", "provider"),
+            ("data_acquisition_audit", "source"),
+            ("data_acquisition_audit", "request_hash"),
+            ("data_acquisition_audit", "source_at"),
+            ("data_acquisition_audit", "observed_at"),
+            ("data_acquisition_audit", "batch_id"),
+            ("data_acquisition_audit", "outcome"),
+            ("data_acquisition_audit", "request_count"),
+            ("data_acquisition_audit", "accepted_count"),
+            ("data_acquisition_audit", "rejected_count"),
+            ("data_acquisition_audit", "reason_code"),
+            ("data_acquisition_audit", "retryable"),
+            ("data_acquisition_audit", "created_at"),
+            ("data_acquisition_audit_chain", "acquisition_audit_id"),
+            ("data_acquisition_audit_chain", "previous_hash"),
+            ("data_acquisition_audit_chain", "record_hash"),
+        ] {
+            let mut connection =
+                rusqlite::Connection::open_in_memory().expect("TEST_CODE in-memory sqlite");
+            create_loose_acquisition_tables(&connection);
+            let receipt = insert_loose_acquisition_fixture(&connection);
+            connection
+                .execute(
+                    &format!("UPDATE {table} SET {column}=?1"),
+                    rusqlite::params![vec![0_u8, 159_u8]],
+                )
+                .expect("TEST_CODE replace projected field with BLOB");
+            connection
+                .execute_batch("PRAGMA query_only=ON;")
+                .expect("TEST_CODE query-only malformed fixture");
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+                .expect("TEST_CODE caller-owned malformed transaction");
+            assert_closed_read_error(
+                read_acquisition_in_transaction(&transaction, &receipt)
+                    .expect_err("TEST_CODE invalid projected type cannot verify"),
+            );
+            assert!(!transaction.is_autocommit(), "TEST_CODE {table}.{column}");
+            transaction
+                .rollback()
+                .expect("TEST_CODE caller ends malformed transaction");
+            assert!(connection.is_autocommit());
+        }
+    }
+
+    #[test]
+    fn w15_rusqlite_reader_rejects_each_missing_required_table_without_ending_transaction() {
+        let receipt = DataAcquisitionAuditReceipt {
+            audit_id: 1,
+            record_hash: "a".repeat(64),
+            previous_outcome: None,
+            current_outcome: "verified_empty".into(),
+        };
+        for table in ["data_acquisition_audit", "data_acquisition_audit_chain"] {
+            let mut connection =
+                rusqlite::Connection::open_in_memory().expect("TEST_CODE in-memory sqlite");
+            create_loose_acquisition_tables(&connection);
+            connection
+                .execute_batch(&format!("DROP TABLE {table}; PRAGMA query_only=ON;"))
+                .expect("TEST_CODE remove required table");
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+                .expect("TEST_CODE caller-owned missing-table transaction");
+            assert_closed_read_error(
+                read_acquisition_in_transaction(&transaction, &receipt)
+                    .expect_err("TEST_CODE missing table cannot verify"),
+            );
+            assert!(!transaction.is_autocommit(), "TEST_CODE missing {table}");
+            transaction
+                .rollback()
+                .expect("TEST_CODE caller ends missing-table transaction");
+            assert!(connection.is_autocommit());
+        }
     }
 
     #[test]
@@ -869,14 +1325,38 @@ mod tests {
                 diesel::sql_query("PRAGMA query_only=ON")
                     .execute(&mut conn)
                     .expect("TEST_CODE query only");
-                for receipt in receipts {
+                for receipt in &receipts {
                     assert_eq!(
-                        read_verified_acquisition_audit(&mut conn, &receipt).expect_err(
+                        read_verified_acquisition_audit(&mut conn, receipt).expect_err(
                             "TEST_CODE complete chain damage rejects even old receipts"
                         ),
                         AcquisitionAuditReadError
                     );
                 }
+            }
+            {
+                let mut conn = rusqlite::Connection::open_with_flags(
+                    &database,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .expect("TEST_CODE rusqlite readonly connection");
+                conn.execute_batch("PRAGMA query_only=ON;")
+                    .expect("TEST_CODE rusqlite query only");
+                let transaction = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+                    .expect("TEST_CODE caller-owned damaged transaction");
+                for receipt in &receipts {
+                    assert_closed_read_error(
+                        read_acquisition_in_transaction(&transaction, receipt).expect_err(
+                            "TEST_CODE rusqlite complete chain damage rejects every receipt",
+                        ),
+                    );
+                    assert!(!transaction.is_autocommit());
+                }
+                transaction
+                    .rollback()
+                    .expect("TEST_CODE caller ends damaged transaction");
+                assert!(conn.is_autocommit());
             }
             assert_eq!(audit_directory_bytes(root.path()), damaged);
         }
