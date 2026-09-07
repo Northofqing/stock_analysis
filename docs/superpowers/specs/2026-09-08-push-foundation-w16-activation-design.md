@@ -1,6 +1,6 @@
 # W16 activation、部署认证与 owner fence 设计
 
-日期：2026-09-08。状态：读取内容合同已明确，T1 开始实施；其余授权提案按 needs-context 保留，未认证部署，未执行生产操作。配套计划：[W16 可执行计划](../plans/2026-09-08-push-foundation-w16-activation.md)。
+日期：2026-09-08。状态：T1 完整只读链路 `1c16380` 已通过限定验证/独立审查，B 的Shadow范围已澄清；其余认证/执行仍未完成或按 needs-context 保留，未认证部署，未执行生产操作。配套计划：[W16 可执行计划](../plans/2026-09-08-push-foundation-w16-activation.md)；当前证据：[W16 实施结果](../../push-system/implementation-w16-results-2026-09-08.md)。
 
 ## 目标、依据与范围
 
@@ -10,9 +10,9 @@
 
 开发授权覆盖实现与隔离验证；RFC 操作员合同明确 Codex 只准备证据与命令，不能成为生产批准者或执行者。本文不授予生产 DB、真实消息、部署切换权限，也不填造外部批准。Foundation 可以实现完整能力且默认关闭；52 Unit 的真实接管与六门禁证据仍逐 Unit 验收。
 
-## 已知事实与可复用 interface
+## 设计初稿基线事实与可复用 interface
 
-复用 `.superpowers/sdd/2026-09-07-push-foundation-w15-operational-readiness/task-3-source-registration-proposal.md` 的来源接线证据，不重新审计已闭合 W15 锁、codec、store。
+下表记录设计初稿 `36a4be2` 时的可复用基础，不把当时缺口误报为当前状态。复用已记录的 W15 来源接线证据，不重新审计已闭合锁、codec、store；后续真实交付以实施结果为准。
 
 | 当前真实位置 | 能复用的能力 | 当前不具备的能力 |
 | --- | --- | --- |
@@ -27,7 +27,7 @@
 | `src/auth/operator.rs::require_monitor_operator_auth` | opt-in PAM 密码认证流程 | 默认可跳过且只返回 `Result<()>`，不能据此认定已认证/已授权 |
 | `src/calendar.rs::verified_a_share_trading_day` 等 | 已验证日历数据路径 | 请求自报日期不是认证的 UTC 配额区间 |
 
-`src/push_foundation/mod.rs` 当前没有 activation module，也未发现可复用的完整 W16 operator control plane。`AuthenticatedOperatorRef` 是文字值合同，不是身份提供方认证结果。新 interface 均为下述待实现设计。
+初稿基线时 `src/push_foundation/mod.rs` 没有 activation module；`1c16380` 已新增 raw activation 读取模块，但尚无完整 W16 operator control plane。`AuthenticatedOperatorRef` 是文字值合同，不是身份提供方认证结果。下述授权/执行 interface 仍为待实现设计，不能因原始读取入口已存在而推断已认证。
 
 ## Module 与信任根
 

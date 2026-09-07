@@ -1,6 +1,6 @@
 # W16 activation 完整实施计划
 
-日期：2026-09-08。状态：T1 读取合同已明确，进入实施；生产身份和共同 owner 授权仍 needs-context，完整 W16 未完成。设计：[W16 activation 设计](../specs/2026-09-08-push-foundation-w16-activation-design.md)。实际命令结果另记实施报告。
+日期：2026-09-08。状态：T1 完整读取链路 `1c16380` 已通过限定独立审查；14项测试、196项相邻回归和目标Clippy通过。B 的Shadow范围已澄清，实际生产身份、owner认证/准入与执行仍未完成。设计：[W16 activation 设计](../specs/2026-09-08-push-foundation-w16-activation-design.md)；证据：[W16 实施结果](../../push-system/implementation-w16-results-2026-09-08.md)。完整 W16 未完成。
 
 ## 范围与执行约定
 
@@ -50,7 +50,7 @@ T0 读取裁决（2026-09-08）：现有冻结合同只有稳定身份 `Promotio
 cargo test --lib push_foundation::activation_facts_tests -- --test-threads=1
 ```
 
-必须打印实际测试数量大于零且通过；精确确认 inspector 前后 DB bytes/sidecar 不变、零副作用计数。T1 完成报告明确“不含认证、写入、配额、owner 接管”。
+必须打印实际测试数量大于零且通过；精确确认 inspector 前后 DB bytes/sidecar 不变。T1 没有 provider/sink 执行端口，不能以未接入的计数器自证零调用；此处验收采用实际文件字节/目录断言和读取调用链审查，不声称测量了外部端口计数。完整W16/T7及W17的真实副作用端口计数要求保留，不因该证据措辞纠正而删除。T1 完成报告明确“不含认证、写入、配额、owner 接管”。
 
 ## Task 2 — T2 认证部署 inspector 与操作批准
 
@@ -176,4 +176,4 @@ cargo clippy --lib --bin monitor --no-deps
 
 ## 完成声明边界
 
-验收证据必须同时覆盖完整读写、真实选定平台的认证与 owner adapter、共同 fence、事务配额、非原子中断和 rollback、新集合版（建议 v3）全 Unit 消费以及 operator wire；保持现有 v2 候选语义、legacy v1 拒绝和冻结 event/schema，验证 recovery/stream 版本分派。测试成功不授予生产批准；外部信任根/配置未配置可报告“工程实现通过，生产认证未就绪”，但 Shadow/legacy 等式未裁决、平台 adapter 尚未实现、只读切片或全 Unit 接线缺失时不能报告完整 W16 已实现。计划中的生产权限边界来源为 RFC 操作员合同，不是重复请求已有开发授权。
+验收证据必须同时覆盖完整读写、真实选定平台的认证与 owner adapter、共同 fence、事务配额、非原子中断和 rollback、新集合版（建议 v3）全 Unit 消费以及 operator wire；保持现有 v2 候选语义、legacy v1 拒绝和冻结 event/schema，验证 recovery/stream 版本分派。测试成功不授予生产批准；外部信任根/配置未配置可报告“工程实现通过，生产认证未就绪”，但 Shadow/legacy 准入尚未实现、平台 adapter 尚未实现、只读切片或全 Unit 接线缺失时不能报告完整 W16 已实现。计划中的生产权限边界来源为 RFC 操作员合同，不是重复请求已有开发授权。
