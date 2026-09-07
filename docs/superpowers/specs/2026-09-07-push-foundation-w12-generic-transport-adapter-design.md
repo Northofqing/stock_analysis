@@ -1,6 +1,6 @@
 # 推送 Foundation W12 通用 Transport Authority Adapter 设计
 
-**状态：** 边界冻结，待 tracer-bullet TDD；保持零生产接线。
+**状态：** 已按 tracer-bullet TDD 实现并完成双轴评审；保持零生产接线。实现与 fresh 证据见 `docs/push-system/implementation-w12-results-2026-09-07.md`。
 
 **决策日期：** 2026-09-07
 

@@ -2,6 +2,8 @@
 
 > 按 W12 设计以小提交执行 RED -> GREEN；保留历史 durable envelope 字节和十四态，不接生产 caller。
 
+**状态：** Task 1--7 已完成；fresh 验证与剩余边界记录于 `docs/push-system/implementation-w12-results-2026-09-07.md`。
+
 ## Task 1：冻结设计与基线
 
 - 提交 W12 设计与本计划。
