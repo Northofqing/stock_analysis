@@ -10,6 +10,7 @@ mod model;
 mod schema;
 
 pub use coordinator::DurableDeliveryCoordinator;
+pub(crate) use model::FoundationDeliveryBinding;
 pub use model::{
     compiled_policy_catalog, AuthoritativeDeliveryRequest, AuthoritativeSink,
     AuthoritativeSinkPort, AuthoritativeSinkResult, AuthorityWatermark,

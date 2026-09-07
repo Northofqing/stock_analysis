@@ -7689,9 +7689,7 @@ fn w12_legacy_envelope_keeps_exact_identity_and_canonical_bytes() {
         "2026-07-30",
         false,
     );
-    let canonical = legacy
-        .canonical_bytes()
-        .expect("canonical legacy envelope");
+    let canonical = legacy.canonical_bytes().expect("canonical legacy envelope");
 
     assert_eq!(
         legacy.decision_identity,
@@ -7716,8 +7714,9 @@ fn w12_foundation_binding_owns_application_decision_and_exact_cross_fields() {
         "2026-07-30",
         false,
     );
-    candidate.source_evidence_fingerprint =
-        sha256_hex(b"TEST_CODE_W12_FOUNDATION_SOURCE_EVIDENCE");
+    candidate.source_evidence_fingerprint = sha256_hex(b"TEST_CODE_W12_FOUNDATION_SOURCE_EVIDENCE");
+    candidate.schedule_occurrence_identity = sha256_hex(b"TEST_CODE_W12_OCCURRENCE");
+    candidate.delivery_subject_hash = sha256_hex(b"TEST_CODE_W12_SUBJECT");
     let application_decision_id = sha256_hex(b"TEST_CODE_W12_APPLICATION_DECISION");
     let binding = FoundationDeliveryBinding::try_new(
         "Test:TEST_CODE_W12_RUN".to_owned(),
@@ -7746,8 +7745,17 @@ fn w12_foundation_binding_owns_application_decision_and_exact_cross_fields() {
     assert_eq!(bound.decision_identity, application_decision_id);
     assert_eq!(persisted.intent_id(), sha256_hex(b"TEST_CODE_W12_INTENT"));
     assert_eq!(persisted.required_channel(), "TEST_CODE_CHANNEL");
-    assert_eq!(persisted.rendered_sha256(), candidate.rendered_content_sha256);
-    assert_eq!(persisted.canonical_sha256().len(), 64);
+    assert_eq!(
+        persisted.rendered_sha256(),
+        candidate.rendered_content_sha256
+    );
+    assert_eq!(
+        persisted
+            .canonical_sha256()
+            .expect("foundation binding canonical SHA")
+            .len(),
+        64
+    );
     assert!(bound
         .canonical_bytes()
         .expect("foundation canonical envelope")
@@ -7777,10 +7785,10 @@ fn w12_foundation_binding_owns_application_decision_and_exact_cross_fields() {
         sha256_hex(b"TEST_CODE_W12_APPLICATION_DECISION_BAD_CHANNEL"),
         sha256_hex(b"TEST_CODE_W12_INTENT"),
         "MU-W12-generic".to_owned(),
-        "TEST_CODE_OCCURRENCE".to_owned(),
+        sha256_hex(b"TEST_CODE_OCCURRENCE"),
         "2026-07-30".to_owned(),
         "Global".to_owned(),
-        "TEST_CODE_SUBJECT_HASH".to_owned(),
+        sha256_hex(b"TEST_CODE_SUBJECT_HASH"),
         "TEST_CODE_W12_AUDIENCE".to_owned(),
         "holding_event_v1".to_owned(),
         "v1".to_owned(),

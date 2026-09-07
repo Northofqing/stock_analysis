@@ -570,6 +570,166 @@ impl TaskBinding {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FoundationDeliveryBinding {
+    schema_version: i64,
+    namespace: String,
+    application_decision_id: String,
+    intent_id: String,
+    unit_id: String,
+    occurrence_id: String,
+    business_date: String,
+    subject: String,
+    delivery_subject_hash: String,
+    audience: String,
+    template_id: String,
+    template_version: String,
+    rendered_sha256: String,
+    source_evidence_fingerprint: String,
+    required_channel: String,
+}
+
+impl FoundationDeliveryBinding {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new(
+        namespace: String,
+        application_decision_id: String,
+        intent_id: String,
+        unit_id: String,
+        occurrence_id: String,
+        business_date: String,
+        subject: String,
+        delivery_subject_hash: String,
+        audience: String,
+        template_id: String,
+        template_version: String,
+        rendered_sha256: String,
+        source_evidence_fingerprint: String,
+        required_channel: String,
+    ) -> Result<Self> {
+        let binding = Self {
+            schema_version: 1,
+            namespace,
+            application_decision_id,
+            intent_id,
+            unit_id,
+            occurrence_id,
+            business_date,
+            subject,
+            delivery_subject_hash,
+            audience,
+            template_id,
+            template_version,
+            rendered_sha256,
+            source_evidence_fingerprint,
+            required_channel,
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != 1 {
+            return Err(DurableDeliveryError::InvalidEnvelope(
+                "foundation delivery binding schema version is invalid".to_owned(),
+            ));
+        }
+        for (field, value) in [
+            ("namespace", self.namespace.as_str()),
+            ("unit_id", self.unit_id.as_str()),
+            ("subject", self.subject.as_str()),
+            ("audience", self.audience.as_str()),
+            ("template_id", self.template_id.as_str()),
+            ("template_version", self.template_version.as_str()),
+            ("required_channel", self.required_channel.as_str()),
+        ] {
+            if !valid_foundation_text(value) {
+                return Err(DurableDeliveryError::InvalidEnvelope(format!(
+                    "foundation delivery binding field {field} is invalid"
+                )));
+            }
+        }
+        validate_business_date(&self.business_date)?;
+        for (field, value) in [
+            (
+                "application_decision_id",
+                self.application_decision_id.as_str(),
+            ),
+            ("intent_id", self.intent_id.as_str()),
+            ("occurrence_id", self.occurrence_id.as_str()),
+            ("delivery_subject_hash", self.delivery_subject_hash.as_str()),
+            ("rendered_sha256", self.rendered_sha256.as_str()),
+            (
+                "source_evidence_fingerprint",
+                self.source_evidence_fingerprint.as_str(),
+            ),
+        ] {
+            if !is_lower_sha256_hex(value) {
+                return Err(DurableDeliveryError::InvalidEnvelope(format!(
+                    "foundation delivery binding field {field} is not lowercase SHA-256"
+                )));
+            }
+        }
+        if self.namespace != "Production"
+            && self
+                .namespace
+                .strip_prefix("Test:")
+                .is_none_or(|run_id| !valid_foundation_text(run_id))
+        {
+            return Err(DurableDeliveryError::InvalidEnvelope(
+                "foundation delivery binding namespace is invalid".to_owned(),
+            ));
+        }
+        if self.subject != "Global"
+            && self
+                .subject
+                .strip_prefix("Entity:")
+                .is_none_or(|entity| !valid_foundation_text(entity))
+        {
+            return Err(DurableDeliveryError::InvalidEnvelope(
+                "foundation delivery binding subject is invalid".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn application_decision_id(&self) -> &str {
+        &self.application_decision_id
+    }
+
+    pub(crate) fn intent_id(&self) -> &str {
+        &self.intent_id
+    }
+
+    pub(crate) fn required_channel(&self) -> &str {
+        &self.required_channel
+    }
+
+    pub(crate) fn rendered_sha256(&self) -> &str {
+        &self.rendered_sha256
+    }
+
+    pub(crate) fn template_id(&self) -> &str {
+        &self.template_id
+    }
+
+    pub(crate) fn canonical_sha256(&self) -> Result<String> {
+        Ok(sha256_hex(&serde_json::to_vec(self)?))
+    }
+}
+
+fn valid_foundation_text(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 512 && value.trim() == value && !value.contains('\0')
+}
+
+fn is_lower_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DeliveryEnvelope {
     pub envelope_version: i64,
     pub decision_identity: String,
@@ -591,6 +751,8 @@ pub struct DeliveryEnvelope {
     pub provider_as_of: Option<String>,
     pub original_batch_ids: Vec<String>,
     pub task_binding: Option<TaskBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    foundation_binding: Option<FoundationDeliveryBinding>,
 }
 
 #[derive(Serialize)]
@@ -686,6 +848,7 @@ impl DeliveryEnvelope {
             provider_as_of: None,
             original_batch_ids: Vec::new(),
             task_binding,
+            foundation_binding: None,
         })
     }
 
@@ -709,6 +872,21 @@ impl DeliveryEnvelope {
 
     pub fn canonical_sha256(&self) -> Result<String> {
         Ok(sha256_hex(&self.canonical_bytes()?))
+    }
+
+    pub(crate) fn with_foundation_binding(
+        mut self,
+        binding: FoundationDeliveryBinding,
+    ) -> Result<Self> {
+        binding.validate()?;
+        self.decision_identity = binding.application_decision_id.clone();
+        self.foundation_binding = Some(binding);
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub(crate) fn foundation_binding(&self) -> Option<&FoundationDeliveryBinding> {
+        self.foundation_binding.as_ref()
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -761,20 +939,35 @@ impl DeliveryEnvelope {
                 ));
             }
         }
-        let material = DecisionIdentityMaterial {
-            domain: "durable-delivery-decision-v1",
-            policy_version: self.policy_version,
-            business_date: &self.business_date,
-            push_kind: self.push_kind,
-            sub_kind: self.sub_kind,
-            cooldown_scope: self.cooldown_scope,
-            scope_key: &self.scope_key,
-            schedule_occurrence_identity: &self.schedule_occurrence_identity,
-            source_evidence_fingerprint: &self.source_evidence_fingerprint,
-            delivery_subject_hash: &self.delivery_subject_hash,
-            rendered_content_sha256: &self.rendered_content_sha256,
+        let expected = if let Some(binding) = &self.foundation_binding {
+            binding.validate()?;
+            if binding.business_date != self.business_date
+                || binding.occurrence_id != self.schedule_occurrence_identity
+                || binding.delivery_subject_hash != self.delivery_subject_hash
+                || binding.rendered_sha256 != self.rendered_content_sha256
+                || binding.source_evidence_fingerprint != self.source_evidence_fingerprint
+            {
+                return Err(DurableDeliveryError::InvalidEnvelope(
+                    "foundation delivery binding does not match envelope fields".to_owned(),
+                ));
+            }
+            binding.application_decision_id.clone()
+        } else {
+            let material = DecisionIdentityMaterial {
+                domain: "durable-delivery-decision-v1",
+                policy_version: self.policy_version,
+                business_date: &self.business_date,
+                push_kind: self.push_kind,
+                sub_kind: self.sub_kind,
+                cooldown_scope: self.cooldown_scope,
+                scope_key: &self.scope_key,
+                schedule_occurrence_identity: &self.schedule_occurrence_identity,
+                source_evidence_fingerprint: &self.source_evidence_fingerprint,
+                delivery_subject_hash: &self.delivery_subject_hash,
+                rendered_content_sha256: &self.rendered_content_sha256,
+            };
+            sha256_hex(&serde_json::to_vec(&material)?)
         };
-        let expected = sha256_hex(&serde_json::to_vec(&material)?);
         if expected != self.decision_identity {
             return Err(DurableDeliveryError::InvalidEnvelope(
                 "decision identity does not match canonical evidence".to_owned(),
