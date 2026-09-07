@@ -291,6 +291,14 @@ fn w15_event_reload_rederives_changes_and_rejects_claim_drift_and_foreign_previo
             serde_json::json!("DataAcquisitionAudit"),
             invalid_claim("after_evidence_mismatch"),
         ),
+        (
+            "/recovery_claims/0/evidence/dependency_kind",
+            serde_json::json!("Manifest"),
+            InvalidRecovery(ReadinessRecoveryError::InvalidClaims {
+                check: "unexpected_dependency",
+                kind: DependencyKind::Manifest,
+            }),
+        ),
     ];
     for (path, value, expected) in cases {
         let mut body = original.clone();
