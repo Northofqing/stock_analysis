@@ -8,7 +8,7 @@ use chrono::{TimeZone, Utc};
 use crate::durable_delivery::{
     AuthoritativeDeliveryRequest, AuthoritativeSink, AuthoritativeSinkPort,
     AuthoritativeSinkResult, CoordinatorConfig, DeliverySubKind, DurableDeliveryCoordinator,
-    ImmutableAppendPort, PushKind, TypedReceipt, TypedRejection,
+    FoundationTerminalQuery, ImmutableAppendPort, PushKind, TypedReceipt, TypedRejection,
 };
 use crate::monitor::push_job::{
     ChannelId, CompatId, CompatibilityEvidenceRef, CompletionEligibility, DeliveryResult,
@@ -334,9 +334,11 @@ fn w12_generic_transport_records_wrong_receipt_channel_as_uncertain() {
     let route = route(business.template.clone());
     let fence = fence(&claimed);
     let append = MemoryAppend::default();
+    let wrong_receipt = receipt("TEST_CODE_WRONG_CHANNEL");
+    let exact_wrong_receipt = serde_json::to_vec(&wrong_receipt).expect("exact wrong receipt");
     let sink = ChannelSink::new(
         "TEST_CODE_W12_CHANNEL",
-        AuthoritativeSinkResult::Accepted(receipt("TEST_CODE_WRONG_CHANNEL")),
+        AuthoritativeSinkResult::Accepted(wrong_receipt),
     );
     let adapter = GenericTransportAuthorityAdapter::new(durable.coordinator());
 
@@ -360,6 +362,25 @@ fn w12_generic_transport_records_wrong_receipt_channel_as_uncertain() {
     );
     assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
     assert!(result.requires_manual_quarantine());
+
+    let decision_id = claimed
+        .attested_ready_binding()
+        .expect("attested W12 decision")
+        .decision_id;
+    let durable_terminal = match durable
+        .coordinator()
+        .inspect_foundation_terminal(decision_id.as_str())
+        .expect("inspect wrong-channel terminal")
+    {
+        FoundationTerminalQuery::Terminal(record) => record,
+        other => panic!("expected wrong-channel durable terminal, got {other:?}"),
+    };
+    let exact_result: serde_json::Value = serde_json::from_slice(durable_terminal.evidence_bytes())
+        .expect("typed uncertainty result bytes");
+    let preserved_receipt: Vec<u8> =
+        serde_json::from_value(exact_result["uncertainty"]["evidence"].clone())
+            .expect("preserved wrong receipt bytes");
+    assert_eq!(preserved_receipt, exact_wrong_receipt);
 }
 
 #[test]
