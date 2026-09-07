@@ -808,6 +808,18 @@ impl TransitionReceipt {
         self.terminal_binding_sha256.as_ref()
     }
 
+    pub fn terminal_decision_id(&self) -> Option<&str> {
+        self.terminal_decision_id.as_deref()
+    }
+
+    pub fn operator_audit_ref(&self) -> Option<&str> {
+        self.operator_audit_ref.as_deref()
+    }
+
+    pub fn operator_audit_sha256(&self) -> Option<&Sha256Digest> {
+        self.operator_audit_sha256.as_ref()
+    }
+
     pub(crate) fn matches_accepted_completion(
         &self,
         terminal: &VerifiedTerminalRef,
@@ -828,6 +840,35 @@ impl TransitionReceipt {
             && self.terminal_decision_id.is_none()
             && self.operator_audit_ref.is_none()
             && self.operator_audit_sha256.is_none()
+            && self.terminal_ref_id.as_deref() == Some(terminal.ref_id().as_str())
+            && self.terminal_binding_sha256.as_ref() == Some(terminal.binding_sha256())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn matches_not_delivered_completion(
+        &self,
+        terminal: &VerifiedTerminalRef,
+        expected_version: u64,
+        actor: &TransitionActor,
+        occurred_at: UtcMicros,
+        operator_audit_ref: &str,
+        operator_audit_sha256: &Sha256Digest,
+    ) -> bool {
+        self.intent_id == terminal.intent_id().as_str()
+            && matches!(
+                self.from_state,
+                IntentState::AwaitingAuthority | IntentState::ResolutionRequired
+            )
+            && self.to_state == IntentState::NotDelivered
+            && self.expected_version == expected_version
+            && expected_version.checked_add(1) == Some(self.result_version)
+            && self.actor == actor.as_str()
+            && self.reason == ReasonCode::OperatorNotDelivered
+            && self.occurred_at == occurred_at
+            && self.terminal_disposition.as_deref() == Some("ManualConfirmedNotDelivered")
+            && self.terminal_decision_id.as_deref() == Some(terminal.decision_id().as_str())
+            && self.operator_audit_ref.as_deref() == Some(operator_audit_ref)
+            && self.operator_audit_sha256.as_ref() == Some(operator_audit_sha256)
             && self.terminal_ref_id.as_deref() == Some(terminal.ref_id().as_str())
             && self.terminal_binding_sha256.as_ref() == Some(terminal.binding_sha256())
     }
@@ -1137,6 +1178,7 @@ impl BusinessIntentStore {
     pub(crate) fn apply_authority_qualification(
         &mut self,
         terminal: &VerifiedTerminalRef,
+        from_state: IntentState,
         expected_version: u64,
         actor: &TransitionActor,
         occurred_at: UtcMicros,
@@ -1144,9 +1186,17 @@ impl BusinessIntentStore {
         fence_generation: u64,
         fence_until: UtcMicros,
     ) -> Result<TransitionOutcome, IntentStoreError> {
+        if !matches!(
+            from_state,
+            IntentState::AwaitingAuthority | IntentState::ResolutionRequired
+        ) {
+            return Err(IntentStoreError::InvalidTransition {
+                check: "authority_qualification_source_state",
+            });
+        }
         let command = StoreTransitionCommand {
             intent_id: terminal.intent_id().clone(),
-            from_state: IntentState::AwaitingAuthority,
+            from_state,
             to_state: IntentState::AwaitingFinalizer,
             expected_version,
             actor: actor.clone(),
@@ -1185,6 +1235,71 @@ impl BusinessIntentStore {
         self.apply_transition_inner(&command, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_not_delivered_finalization(
+        &mut self,
+        terminal: FinalizationTerminalRef,
+        from_state: IntentState,
+        expected_version: u64,
+        actor: &TransitionActor,
+        occurred_at: UtcMicros,
+        fence_owner: &LeaseOwnerId,
+        fence_generation: u64,
+        fence_until: UtcMicros,
+        operator_audit_ref: &str,
+        operator_audit_sha256: &Sha256Digest,
+    ) -> Result<TransitionOutcome, IntentStoreError> {
+        let verified = terminal.verified_terminal();
+        if verified.terminal_disposition() != TerminalDisposition::ManualConfirmedNotDelivered {
+            return Err(IntentStoreError::InvalidTransition {
+                check: "not_delivered_finalizer_disposition",
+            });
+        }
+        if !matches!(
+            from_state,
+            IntentState::AwaitingAuthority | IntentState::ResolutionRequired
+        ) {
+            return Err(IntentStoreError::InvalidTransition {
+                check: "not_delivered_finalizer_source_state",
+            });
+        }
+        if operator_audit_ref.is_empty()
+            || operator_audit_ref.len() > 512
+            || operator_audit_ref.contains('\0')
+            || operator_audit_ref.trim() != operator_audit_ref
+        {
+            return Err(IntentStoreError::InvalidTransition {
+                check: "operator_audit_ref",
+            });
+        }
+        let command = StoreTransitionCommand {
+            intent_id: verified.intent_id().clone(),
+            from_state,
+            to_state: IntentState::NotDelivered,
+            expected_version,
+            actor: actor.clone(),
+            reason: ReasonCode::OperatorNotDelivered,
+            occurred_at,
+            lease_action: LeaseAction::Release {
+                owner: fence_owner.clone(),
+            },
+            required_fence: Some(ExpectedLeaseFence {
+                owner: fence_owner.as_str().to_owned(),
+                generation: fence_generation,
+                until: fence_until,
+            }),
+            terminal: TerminalTransitionFields {
+                terminal_disposition: Some("ManualConfirmedNotDelivered".to_owned()),
+                terminal_decision_id: Some(verified.decision_id().as_str().to_owned()),
+                operator_audit_ref: Some(operator_audit_ref.to_owned()),
+                operator_audit_sha256: Some(operator_audit_sha256.clone()),
+                terminal_ref_id: Some(verified.ref_id().as_str().to_owned()),
+                terminal_binding_sha256: Some(verified.binding_sha256().clone()),
+            },
+        };
+        self.apply_transition_inner(&command, None)
+    }
+
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply_accepted_finalization_with_fault(
@@ -1219,7 +1334,9 @@ impl BusinessIntentStore {
     ) -> Result<TransitionOutcome, IntentStoreError> {
         if !matches!(
             current.state,
-            IntentState::AwaitingFinalizer | IntentState::Completed
+            IntentState::AwaitingAuthority
+                | IntentState::AwaitingFinalizer
+                | IntentState::Completed
         ) {
             return Err(IntentStoreError::InvalidTransition {
                 check: "finalizer_conflict_source_state",

@@ -3,8 +3,8 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use crate::monitor::push_job::{
-    evaluate_completion, CompletionDirective, CompletionFact, CompletionPolicy, IntentId,
-    TerminalDisposition, UtcMicros, VerifiedTerminalRef,
+    evaluate_completion, CompletionDirective, CompletionFact, CompletionPolicy, DecisionId,
+    IntentId, Sha256Digest, TerminalDisposition, UtcMicros, VerifiedTerminalRef,
 };
 
 #[cfg(test)]
@@ -23,6 +23,36 @@ pub(crate) struct FinalizerFence {
     owner: LeaseOwnerId,
     generation: u64,
     until: UtcMicros,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedResolutionClearance {
+    intent_id: IntentId,
+    resolution_version: u64,
+    conflict_event_sha256: Sha256Digest,
+}
+
+impl VerifiedResolutionClearance {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        intent_id: IntentId,
+        resolution_version: u64,
+        conflict_event_sha256: Sha256Digest,
+    ) -> Self {
+        Self {
+            intent_id,
+            resolution_version,
+            conflict_event_sha256,
+        }
+    }
+
+    fn matches(&self, current: &IntentSnapshot, chain: &[TransitionReceipt]) -> bool {
+        current.state() == IntentState::ResolutionRequired
+            && self.intent_id.as_str() == current.intent_id()
+            && self.resolution_version == current.version()
+            && chain.last().map(TransitionReceipt::canonical_sha256)
+                == Some(&self.conflict_event_sha256)
+    }
 }
 
 impl FinalizerFence {
@@ -50,6 +80,7 @@ pub(crate) struct AcceptedPreparationRequest {
     fence: FinalizerFence,
     verified_at: UtcMicros,
     occurred_at: UtcMicros,
+    resolution_clearance: Option<VerifiedResolutionClearance>,
 }
 
 impl AcceptedPreparationRequest {
@@ -84,7 +115,16 @@ impl AcceptedPreparationRequest {
             fence,
             verified_at,
             occurred_at,
+            resolution_clearance: None,
         })
+    }
+
+    pub(crate) fn with_resolution_clearance(
+        mut self,
+        clearance: VerifiedResolutionClearance,
+    ) -> Self {
+        self.resolution_clearance = Some(clearance);
+        self
     }
 }
 
@@ -98,13 +138,164 @@ pub(crate) struct PendingAcceptedFinalization {
 }
 
 #[derive(Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedOperatorAuditRef {
+    intent_id: IntentId,
+    decision_id: DecisionId,
+    expected_version: u64,
+    audit_ref: String,
+    audit_sha256: Sha256Digest,
+}
+
+impl VerifiedOperatorAuditRef {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        intent_id: IntentId,
+        decision_id: DecisionId,
+        expected_version: u64,
+        audit_ref: String,
+        audit_sha256: Sha256Digest,
+    ) -> Result<Self, BusinessFinalizerError> {
+        if audit_ref.is_empty()
+            || audit_ref.len() > 512
+            || audit_ref.contains('\0')
+            || audit_ref.trim() != audit_ref
+        {
+            return Err(BusinessFinalizerError::InvalidRequest {
+                check: "operator_audit_ref",
+            });
+        }
+        Ok(Self {
+            intent_id,
+            decision_id,
+            expected_version,
+            audit_ref,
+            audit_sha256,
+        })
+    }
+
+    fn matches_snapshot(&self, current: &IntentSnapshot) -> Result<bool, IntentStoreError> {
+        let attested = current.attested_ready_binding()?;
+        Ok(self.intent_id.as_str() == current.intent_id()
+            && self.intent_id == attested.intent_id
+            && self.decision_id == attested.decision_id
+            && self.expected_version == current.version())
+    }
+
+    fn matches_terminal(&self, terminal: &VerifiedTerminalRef) -> bool {
+        self.intent_id == *terminal.intent_id() && self.decision_id == *terminal.decision_id()
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct NotDeliveredPreparationRequest {
+    intent_id: IntentId,
+    expected_version: u64,
+    actor: TransitionActor,
+    fence: FinalizerFence,
+    verified_at: UtcMicros,
+    audit: Option<VerifiedOperatorAuditRef>,
+}
+
+impl NotDeliveredPreparationRequest {
+    pub(crate) fn new(
+        intent_id: IntentId,
+        expected_version: u64,
+        actor: TransitionActor,
+        fence: FinalizerFence,
+        verified_at: UtcMicros,
+        audit: VerifiedOperatorAuditRef,
+    ) -> Result<Self, BusinessFinalizerError> {
+        Self::build(
+            intent_id,
+            expected_version,
+            actor,
+            fence,
+            verified_at,
+            Some(audit),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn without_audit_for_test(
+        intent_id: IntentId,
+        expected_version: u64,
+        actor: TransitionActor,
+        fence: FinalizerFence,
+        verified_at: UtcMicros,
+    ) -> Self {
+        Self::build(intent_id, expected_version, actor, fence, verified_at, None)
+            .expect("test fixture request must be valid")
+    }
+
+    fn build(
+        intent_id: IntentId,
+        expected_version: u64,
+        actor: TransitionActor,
+        fence: FinalizerFence,
+        verified_at: UtcMicros,
+        audit: Option<VerifiedOperatorAuditRef>,
+    ) -> Result<Self, BusinessFinalizerError> {
+        if expected_version >= i64::MAX as u64 {
+            return Err(BusinessFinalizerError::InvalidRequest {
+                check: "version_overflow",
+            });
+        }
+        if fence.generation == 0 || fence.until <= verified_at {
+            return Err(BusinessFinalizerError::InvalidRequest {
+                check: "inactive_finalizer_fence",
+            });
+        }
+        Ok(Self {
+            intent_id,
+            expected_version,
+            actor,
+            fence,
+            verified_at,
+            audit,
+        })
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct PendingNotDeliveredFinalization {
+    prior: VerifiedTerminalRef,
+    intent_id: IntentId,
+    source_state: IntentState,
+    expected_version: u64,
+    actor: TransitionActor,
+    fence: FinalizerFence,
+    audit: VerifiedOperatorAuditRef,
+}
+
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) enum AcceptedPreparationOutcome {
     Pending(PendingAcceptedFinalization),
     AlreadyFinalized(TransitionReceipt),
 }
 
 #[derive(Debug, Eq, PartialEq)]
+pub(crate) enum NotDeliveredPreparationOutcome {
+    Pending(PendingNotDeliveredFinalization),
+    AlreadyFinalized(TransitionReceipt),
+}
+
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) enum AcceptedFinalizationOutcome {
+    Applied {
+        receipt: TransitionReceipt,
+        directive: CompletionDirective,
+    },
+    AlreadyCommitted {
+        receipt: TransitionReceipt,
+        directive: CompletionDirective,
+    },
+    ResolutionRequired {
+        receipt: TransitionReceipt,
+    },
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum NotDeliveredFinalizationOutcome {
     Applied {
         receipt: TransitionReceipt,
         directive: CompletionDirective,
@@ -142,6 +333,16 @@ pub(crate) enum BusinessFinalizerError {
     DispositionNotCompletable { actual: TerminalDisposition },
     #[error("completion policy rejected the verified terminal")]
     PolicyRejected,
+    #[error("resolution recovery requires an authenticated clearance capability")]
+    ResolutionClearanceRequired,
+    #[error("resolution clearance does not bind the current conflict")]
+    ResolutionClearanceMismatch,
+    #[error("manual not-delivered finalization requires an authenticated operator audit")]
+    OperatorAuditRequired,
+    #[error("operator audit does not bind the current intent decision and version")]
+    OperatorAuditMismatch,
+    #[error("intent history is not eligible for manual not-delivered finalization")]
+    NotDeliveredHistoryIneligible,
 }
 
 pub(crate) fn prepare_accepted_finalization(
@@ -168,11 +369,20 @@ pub(crate) fn prepare_accepted_finalization(
     if current.version() != request.expected_version {
         return Err(BusinessFinalizerError::BusinessCasConflict);
     }
-    if !matches!(
-        current.state(),
-        IntentState::AwaitingAuthority | IntentState::AwaitingFinalizer
-    ) {
-        return Err(BusinessFinalizerError::InvalidSourceState);
+    match current.state() {
+        IntentState::AwaitingAuthority | IntentState::AwaitingFinalizer => {
+            if request.resolution_clearance.is_some() {
+                return Err(BusinessFinalizerError::ResolutionClearanceMismatch);
+            }
+        }
+        IntentState::ResolutionRequired => match request.resolution_clearance.as_ref() {
+            None => return Err(BusinessFinalizerError::ResolutionClearanceRequired),
+            Some(clearance) if !clearance.matches(&current, &chain) => {
+                return Err(BusinessFinalizerError::ResolutionClearanceMismatch)
+            }
+            Some(_) => {}
+        },
+        _ => return Err(BusinessFinalizerError::InvalidSourceState),
     }
     if !request.fence.matches(&current, request.occurred_at) {
         return Err(BusinessFinalizerError::FenceMismatch);
@@ -187,6 +397,7 @@ pub(crate) fn prepare_accepted_finalization(
     } else {
         match store.apply_authority_qualification(
             &prior,
+            current.state(),
             current.version(),
             &request.actor,
             request.occurred_at,
@@ -212,6 +423,176 @@ pub(crate) fn prepare_accepted_finalization(
             fence: request.fence,
         },
     ))
+}
+
+pub(crate) fn prepare_not_delivered_finalization(
+    store: &mut BusinessIntentStore,
+    request: NotDeliveredPreparationRequest,
+    template: &TerminalTemplateBinding,
+    policy: &CompletionPolicy,
+    authority: &dyn TerminalAuthorityPort,
+) -> Result<NotDeliveredPreparationOutcome, BusinessFinalizerError> {
+    let current = store
+        .inspect(&request.intent_id)?
+        .ok_or(IntentStoreError::IntentMissing)?;
+    let chain = store.inspect_transition_chain(&request.intent_id)?;
+    if current.state() == IntentState::NotDelivered {
+        let receipt = chain
+            .last()
+            .filter(|event| event.to_state() == IntentState::NotDelivered)
+            .cloned()
+            .ok_or(IntentStoreError::IntegrityFailed {
+                check: "not_delivered_head_event",
+            })?;
+        return Ok(NotDeliveredPreparationOutcome::AlreadyFinalized(receipt));
+    }
+    if current.version() != request.expected_version {
+        return Err(BusinessFinalizerError::BusinessCasConflict);
+    }
+    if !not_delivered_history_eligible(&current, &chain) {
+        return Err(BusinessFinalizerError::NotDeliveredHistoryIneligible);
+    }
+    if !request.fence.matches(&current, request.verified_at) {
+        return Err(BusinessFinalizerError::FenceMismatch);
+    }
+    let audit = request
+        .audit
+        .ok_or(BusinessFinalizerError::OperatorAuditRequired)?;
+    if !audit.matches_snapshot(&current)? {
+        return Err(BusinessFinalizerError::OperatorAuditMismatch);
+    }
+
+    let prior = verify_terminal(&current, template, policy, authority, request.verified_at)?;
+    require_not_delivered_disposition(prior.terminal_disposition())?;
+    if !audit.matches_terminal(&prior) {
+        return Err(BusinessFinalizerError::OperatorAuditMismatch);
+    }
+    let _ = not_delivered_directive(policy, &prior)?;
+
+    Ok(NotDeliveredPreparationOutcome::Pending(
+        PendingNotDeliveredFinalization {
+            prior,
+            intent_id: request.intent_id,
+            source_state: current.state(),
+            expected_version: current.version(),
+            actor: request.actor,
+            fence: request.fence,
+            audit,
+        },
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn commit_not_delivered_finalization(
+    store: &mut BusinessIntentStore,
+    pending: PendingNotDeliveredFinalization,
+    template: &TerminalTemplateBinding,
+    policy: &CompletionPolicy,
+    authority: &dyn TerminalAuthorityPort,
+    verified_at: UtcMicros,
+    occurred_at: UtcMicros,
+) -> Result<NotDeliveredFinalizationOutcome, BusinessFinalizerError> {
+    if verified_at > occurred_at {
+        return Err(BusinessFinalizerError::InvalidRequest {
+            check: "verification_after_transition",
+        });
+    }
+    let current = store
+        .inspect(&pending.intent_id)?
+        .ok_or(IntentStoreError::IntentMissing)?;
+    let chain = store.inspect_transition_chain(&pending.intent_id)?;
+    if current.state() == IntentState::NotDelivered {
+        let receipt = chain
+            .last()
+            .filter(|event| event.to_state() == IntentState::NotDelivered)
+            .cloned()
+            .ok_or(IntentStoreError::IntegrityFailed {
+                check: "not_delivered_head_event",
+            })?;
+        if receipt.matches_not_delivered_completion(
+            &pending.prior,
+            pending.expected_version,
+            &pending.actor,
+            occurred_at,
+            &pending.audit.audit_ref,
+            &pending.audit.audit_sha256,
+        ) {
+            let directive = not_delivered_directive(policy, &pending.prior)?;
+            return Ok(NotDeliveredFinalizationOutcome::AlreadyCommitted { receipt, directive });
+        }
+        return Err(BusinessFinalizerError::BusinessCasConflict);
+    }
+    if !not_delivered_history_eligible(&current, &chain) {
+        return Err(BusinessFinalizerError::NotDeliveredHistoryIneligible);
+    }
+    if current.state() != pending.source_state || current.version() != pending.expected_version {
+        return isolate_not_delivered_conflict(store, &current, &pending, occurred_at);
+    }
+    if !pending.fence.matches(&current, occurred_at) {
+        return Err(BusinessFinalizerError::FenceMismatch);
+    }
+    if !pending.audit.matches_snapshot(&current)? {
+        return Err(BusinessFinalizerError::OperatorAuditMismatch);
+    }
+
+    let fresh = reverify_for_finalization(
+        &pending.prior,
+        &current,
+        template,
+        policy,
+        authority,
+        verified_at,
+    )?;
+    require_not_delivered_disposition(fresh.verified_terminal().terminal_disposition())?;
+    if !pending.audit.matches_terminal(fresh.verified_terminal()) {
+        return Err(BusinessFinalizerError::OperatorAuditMismatch);
+    }
+    let directive = not_delivered_directive(policy, fresh.verified_terminal())?;
+    let transition = store.apply_not_delivered_finalization(
+        fresh,
+        current.state(),
+        current.version(),
+        &pending.actor,
+        occurred_at,
+        &pending.fence.owner,
+        pending.fence.generation,
+        pending.fence.until,
+        &pending.audit.audit_ref,
+        &pending.audit.audit_sha256,
+    )?;
+    match transition {
+        TransitionOutcome::Applied(receipt) => {
+            Ok(NotDeliveredFinalizationOutcome::Applied { receipt, directive })
+        }
+        TransitionOutcome::AlreadyCommitted(receipt) => {
+            Ok(NotDeliveredFinalizationOutcome::AlreadyCommitted { receipt, directive })
+        }
+        TransitionOutcome::Conflict { current } => {
+            isolate_not_delivered_conflict(store, &current, &pending, occurred_at)
+        }
+    }
+}
+
+fn isolate_not_delivered_conflict(
+    store: &mut BusinessIntentStore,
+    current: &IntentSnapshot,
+    pending: &PendingNotDeliveredFinalization,
+    occurred_at: UtcMicros,
+) -> Result<NotDeliveredFinalizationOutcome, BusinessFinalizerError> {
+    if !matches!(current.state(), IntentState::AwaitingAuthority) {
+        return Err(BusinessFinalizerError::BusinessCasConflict);
+    }
+    match store.apply_finalizer_conflict(
+        &pending.intent_id,
+        current,
+        &pending.actor,
+        occurred_at,
+    )? {
+        TransitionOutcome::Applied(receipt) | TransitionOutcome::AlreadyCommitted(receipt) => {
+            Ok(NotDeliveredFinalizationOutcome::ResolutionRequired { receipt })
+        }
+        TransitionOutcome::Conflict { .. } => Err(BusinessFinalizerError::BusinessCasConflict),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -399,7 +780,53 @@ fn require_accepted_disposition(
     })
 }
 
+fn require_not_delivered_disposition(
+    disposition: TerminalDisposition,
+) -> Result<(), BusinessFinalizerError> {
+    if disposition == TerminalDisposition::ManualConfirmedNotDelivered {
+        return Ok(());
+    }
+    Err(BusinessFinalizerError::DispositionNotCompletable {
+        actual: disposition,
+    })
+}
+
+fn not_delivered_history_eligible(current: &IntentSnapshot, chain: &[TransitionReceipt]) -> bool {
+    if chain.iter().any(|event| {
+        matches!(
+            event.to_state(),
+            IntentState::AwaitingFinalizer | IntentState::Completed
+        )
+    }) {
+        return false;
+    }
+    match current.state() {
+        IntentState::AwaitingAuthority => true,
+        IntentState::ResolutionRequired => chain
+            .iter()
+            .rev()
+            .find(|event| {
+                event.to_state() == IntentState::ResolutionRequired
+                    && event.from_state() != IntentState::ResolutionRequired
+            })
+            .is_some_and(|event| {
+                event.from_state() == IntentState::AwaitingAuthority
+                    && event.reason() == crate::monitor::push_job::ReasonCode::TransportUncertain
+            }),
+        _ => false,
+    }
+}
+
 fn accepted_directive(
+    policy: &CompletionPolicy,
+    terminal: &VerifiedTerminalRef,
+) -> Result<CompletionDirective, BusinessFinalizerError> {
+    let result = terminal.clone().into_delivery_result();
+    evaluate_completion(policy, CompletionFact::Delivery(&result))
+        .map_err(|_| BusinessFinalizerError::PolicyRejected)
+}
+
+fn not_delivered_directive(
     policy: &CompletionPolicy,
     terminal: &VerifiedTerminalRef,
 ) -> Result<CompletionDirective, BusinessFinalizerError> {
