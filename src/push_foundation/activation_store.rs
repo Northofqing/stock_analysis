@@ -46,15 +46,27 @@ pub fn inspect_raw_activation_facts(
     database: &Path,
     selected_unit: &UnitId,
 ) -> Result<RawActivationFacts, ActivationInspectError> {
-    let catalog = MachineCatalog::bundled().map_err(|_| ActivationInspectError::CatalogRejected)?;
     with_rollback_read_only(database, |transaction| {
-        attest_bundled_connection(transaction)
-            .map_err(|_| ActivationInspectError::SchemaRejected)?;
-        validate_foreign_keys(transaction)?;
-        let manifests = read_manifests(transaction)?;
-        let journal = read_journal(transaction)?;
-        assemble_facts(&catalog, manifests, journal, selected_unit)
+        inspect_activation_transaction(transaction, selected_unit)
     })
+}
+
+/// Recompute the complete activation history using the caller's existing transaction.
+///
+/// This is the single parsing, schema-attestation, and chain-validation kernel shared by the
+/// public rollback-only reader and the internal activation writer. Schema attestation deliberately
+/// leaves the connection in `query_only` mode; a writer must explicitly restore its already
+/// authenticated writable connection before attempting any mutation.
+pub(super) fn inspect_activation_transaction(
+    transaction: &Transaction<'_>,
+    selected_unit: &UnitId,
+) -> Result<RawActivationFacts, ActivationInspectError> {
+    let catalog = MachineCatalog::bundled().map_err(|_| ActivationInspectError::CatalogRejected)?;
+    attest_bundled_connection(transaction).map_err(|_| ActivationInspectError::SchemaRejected)?;
+    validate_foreign_keys(transaction)?;
+    let manifests = read_manifests(transaction)?;
+    let journal = read_journal(transaction)?;
+    assemble_facts(&catalog, manifests, journal, selected_unit)
 }
 
 #[derive(Debug)]
@@ -222,9 +234,7 @@ fn parse_manifest(row: ManifestRow) -> Result<ActivationManifest, ActivationInsp
         rollback_target_sha256: optional_digest(row.rollback_target_sha256.as_deref())?,
         created_at: nonnegative(row.created_at)?,
     };
-    if manifest.window_end <= manifest.window_start || manifest.approved_at > manifest.created_at {
-        return Err(ActivationInspectError::InvalidFacts);
-    }
+    validate_manifest_value(&manifest)?;
     Ok(manifest)
 }
 
@@ -246,6 +256,31 @@ fn parse_journal_entry(row: JournalRow) -> Result<PromotionJournalEntry, Activat
         canonical_sha256: digest(&row.canonical_sha256)?,
         occurred_at: nonnegative(row.occurred_at)?,
     };
+    validate_journal_value(&entry)?;
+    Ok(entry)
+}
+
+/// Validate typed values which normally enter this module through the SQLite row parser.
+/// Internal writers use the same checks because their candidate structs have not been parsed.
+pub(super) fn validate_manifest_value(
+    manifest: &ActivationManifest,
+) -> Result<(), ActivationInspectError> {
+    validate_unit_value(&manifest.unit_id)?;
+    validate_bounded_text(&manifest.physical_owner)?;
+    validate_bounded_text(&manifest.approved_by)?;
+    if manifest.window_end <= manifest.window_start || manifest.approved_at > manifest.created_at {
+        return Err(ActivationInspectError::InvalidFacts);
+    }
+    Ok(())
+}
+
+/// Validate typed journal values using the same scalar rules as the SQLite row parser.
+pub(super) fn validate_journal_value(
+    entry: &PromotionJournalEntry,
+) -> Result<(), ActivationInspectError> {
+    validate_unit_value(&entry.unit_id)?;
+    validate_bounded_text(&entry.actor)?;
+    validate_bounded_text(&entry.reason)?;
     if entry.window_end <= entry.window_start
         || entry.occurred_at < entry.window_start
         || entry.occurred_at >= entry.window_end
@@ -253,7 +288,7 @@ fn parse_journal_entry(row: JournalRow) -> Result<PromotionJournalEntry, Activat
     {
         return Err(ActivationInspectError::InvalidFacts);
     }
-    Ok(entry)
+    Ok(())
 }
 
 fn assemble_facts(
@@ -311,7 +346,9 @@ fn assemble_facts(
     })
 }
 
-fn validate_manifest_chain(chain: &[ActivationManifest]) -> Result<(), ActivationInspectError> {
+pub(super) fn validate_manifest_chain(
+    chain: &[ActivationManifest],
+) -> Result<(), ActivationInspectError> {
     for (index, manifest) in chain.iter().enumerate() {
         let expected_generation = index as u64 + 1;
         if manifest.generation != expected_generation
@@ -354,7 +391,7 @@ fn validate_manifest_chain(chain: &[ActivationManifest]) -> Result<(), Activatio
     Ok(())
 }
 
-fn validate_journal_chain(
+pub(super) fn validate_journal_chain(
     manifests: &[ActivationManifest],
     journal: &[PromotionJournalEntry],
 ) -> Result<(), ActivationInspectError> {
@@ -449,11 +486,24 @@ fn unit_id(value: String) -> Result<UnitId, ActivationInspectError> {
 }
 
 fn bounded_text(value: String) -> Result<String, ActivationInspectError> {
+    validate_bounded_text(&value)?;
+    Ok(value)
+}
+
+fn validate_unit_value(value: &UnitId) -> Result<(), ActivationInspectError> {
+    if value.as_str().contains('\0') {
+        Err(ActivationInspectError::InvalidFacts)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_bounded_text(value: &str) -> Result<(), ActivationInspectError> {
     let character_count = value.chars().count();
     if character_count == 0 || character_count > 512 || value.contains('\0') {
         Err(ActivationInspectError::InvalidFacts)
     } else {
-        Ok(value)
+        Ok(())
     }
 }
 

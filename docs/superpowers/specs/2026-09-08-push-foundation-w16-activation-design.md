@@ -70,7 +70,7 @@ T1 对 physical_owner 保留严格原始 TEXT，不解释执行准入；输出�
 
 步骤 2 排空不持长时间数据库事务；步骤 3–4 为单写者短事务，且锁内的 owner 安装只操作已经预装并 paused 的实例。配额跨日时重新取得 authority 区间、窗口及批准；不能沿用请求发生日或本机日期。rollback 任意时刻可越过日名额限制，仍走新代 CAS 和同事务 journal，且当日后续 promote 会被它阻断。shadow/无 owner 变化部署不消耗晋级名额；冻结状态机没有 Active→Active 普通边，不能伪造这种 journal。若无 owner 变化的真实 release 也要求新 manifest，需明确使用合法现有边或另行规范设计。
 
-**needs-context C（规范衔接）**：RFC 637 起先批准 manifest、1073 起同事务写 manifest+journal，蓝图要求重启。上面用“先外部持久批准包，事务内插入 manifest + paused owner 切换 + journal”的解释同时满足两者；需主控确认它是否符合先批准的含义，并选实际 supervisor 跨进程持久协调存储/恢复 interface。若要求先把批准 manifest 独立提交进 activation DB，则不能再声称新 manifest 与 journal 同事务插入，必须显式修订规范，不能暗改 DDL 或以预写成功 journal 规避。
+**C 工程协议已裁定（实际 adapter 仍待）**：RFC 637 起先批准 manifest、1073 起同事务写 manifest+journal，蓝图要求重启。采用“先外部持久批准包，事务内插入 manifest + 有界 paused owner 确认 + journal”的解释；批准包不是先提交的 activation 表行或成功 journal。详见 [合同裁决决定三](../../push-system/activation-contract-decisions-2026-09-08.md)。真实 supervisor 跨进程持久协调存储/恢复 interface、生产认证根仍待接线，不能因事务测试通过就宣称真实 owner 已切换。冻结 DDL 不变。
 
 ## 当前 fence 与状态职责
 

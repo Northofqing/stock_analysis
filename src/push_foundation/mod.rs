@@ -3,7 +3,9 @@
 mod activation;
 mod activation_codec;
 mod activation_facts;
+mod activation_owner;
 mod activation_store;
+mod activation_transaction;
 mod business_finalizer;
 mod dedicated_transport;
 mod generic_transport;
@@ -39,6 +41,10 @@ pub use terminal_authority::TerminalTemplateBinding;
 
 #[cfg(test)]
 mod activation_facts_tests;
+#[cfg(test)]
+mod activation_owner_tests;
+#[cfg(test)]
+mod activation_transaction_tests;
 #[cfg(test)]
 mod business_finalizer_tests;
 #[cfg(test)]

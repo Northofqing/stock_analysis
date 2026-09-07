@@ -1,6 +1,6 @@
 # W16 激活合同裁决
 
-日期：2026-09-08。状态：下述读取编码、Shadow 范围澄清为已确定的工程合同；真实授权、owner adapter 和线上接管尚未实现或批准。本文是新增裁决，不改写原始问答、冻结 SQL 或八份输入快照。
+日期：2026-09-08。状态：下述读取编码、Shadow 范围澄清及批准/事务顺序为已确定的工程合同；真实授权、owner adapter 和线上接管尚未实现或批准。本文是新增裁决，不改写原始问答、冻结 SQL 或八份输入快照。
 
 ## 背景和依据
 
@@ -54,4 +54,14 @@ T1 只证明冻结 DDL 的内容/链/关联，保留原始 owner，不签发准�
 
 配额仍使用现有全 Unit `Activate/Rollback` 查询，不因 owner 字符串相同而私自豁免。无 Activate 的 shadow/无 owner 变化部署不消耗名额。如果某个 conformance Unit 需要“同 owner 的 Activate 也免名额”，必须先明确该操作分类与 Q36/现有查询的衔接，不能用更容易通过的查询替换冻结规则。
 
-外部批准包、paused owner 与同事务 journal 的执行协议尚待真实 adapter 设计闭合；多 Unit snapshot/material v3 的精确字段及 stream 版本也尚未交付。本裁决只解除 Shadow 范围的文字矛盾和 T1 编码缺口，不宣称 W16/W15 或52个 Unit 已完成。
+多 Unit snapshot/material v3 的精确字段及 stream 版本尚未交付。下述 C 决定确定事务顺序，但实际认证和监督器 adapter 仍待，不宣称 W16/W15 或52个 Unit 已完成。
+
+## 决定三：先批准与同事务写入的衔接
+
+RFC 的“先批准新 manifest”指独立控制面持久保存精确 manifest 字节及批准包，不是先提交 activation 表行，更不是预写成功 journal。准备制品、关闭旧入口和等待在途动作结束均在 SQLite 写锁外完成。
+
+同一 `BEGIN IMMEDIATE` 中重新认证命令/时间、核验完整历史和 generation、查询全 Unit 当日 `Activate/Rollback`，然后依次 INSERT manifest、确认目标 owner 已安装且 paused、INSERT 成功 journal、COMMIT。锁内只允许有期限的已准备实例确认，不允许长期排空。发生任一步错误不得留下半条成功历史；数据库回滚不能解释为外部 owner 已恢复。
+
+COMMIT 后仍须新连接核对精确 manifest/journal，并由真实监督器确认实际 owner、批准和 gate，才能签发当前执行许可。提交确认丢失不得重试推进代数或再次切换；相同命令重查只证明持久事实存在，不自动证明 owner 正确或 Ready。不同字段的“相同命令”必须拒绝。
+
+收益是同时满足先批准、同事务 CAS/日额和已执行 journal 三项约束；代价是实际监督器必须提供有界 paused 确认及跨进程持久协调，认证/时钟/真实 opener 也必须接线。当前先开发内部事务引擎，不暴露生产 writer、不自造认证类型；真实 adapter 和完整 T3/T5 验收仍保留。冻结 DDL 不变。

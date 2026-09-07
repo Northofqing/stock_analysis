@@ -16,7 +16,7 @@
 
 文件 ownership：本设计及本计划；新的裁决放入 `docs/push-system/`，后续按裁决修改 RFC 的相关合同，不改冻结 SQL。`docs/Project_Architecture_Blueprint.md` / `.html` 属于 RFC 输入 manifest 的八份不可变输入，禁止改写原快照；后续蓝图纳管通过独立任务产生新视图。读取编码及 B 的 Shadow 范围已依据原 Q13/Q17 澄清，见 [W16 合同裁决](../../push-system/activation-contract-decisions-2026-09-08.md)：新 shadow 无 owner，Unit 保留实际负责人，初始/排空后准入从已执行历史投影，当前 fence 仍一致。T2/T4/T5 必须实现真实认证及投影，不能只凭文档或 raw facts 授权。另决定 paused owner 是否足够构成已切换事实、外部持久批准包与同事务写入含义、无 owner 变化 release 如何合法表达。
 
-开放选择：推荐平台受保护 supervisor + 强制 PAM/服务身份 allowlist（设计 A）；推荐外部批准包、事务内 paused 安装/journal、提交后重查开门（C，尚未获得生产批准）；推荐新增 W15 集合 snapshot/material v3 与独立 deployment-set/v1（D），保留当前 595f605 的 v2 候选语义及 legacy v1 拒绝策略；推荐 DualControl preparer≠approver 且 approver 执行（E）。若外部策略不同，标 needs-context 并只暂停相关 adapter，继续纯验证/隔离任务。不得默认“Verified struct 存在”已解决这些选择。
+开放选择：推荐平台受保护 supervisor + 强制 PAM/服务身份 allowlist（设计 A）；C 的外部批准包、事务内 paused 确认/journal、提交后重查顺序已按合同裁决决定三确定，实际 adapter/生产批准未完成；推荐新增 W15 集合 snapshot/material v3 与独立 deployment-set/v1（D），保留当前 595f605 的 v2 候选语义及 legacy v1 拒绝策略；推荐 DualControl preparer≠approver 且 approver 执行（E）。若外部策略不同，标 needs-context 并只暂停相关 adapter，继续纯验证/隔离任务。不得默认“Verified struct 存在”已解决这些选择。
 
 只读核验命令：
 
@@ -70,6 +70,8 @@ cargo test --lib push_foundation::activation_deployment_tests -- --test-threads=
 验收：`inspect` 已认证期望/执行/实物三者并清楚返回不一致；未开 owner 或发消息。外部配置未定则明确 T2 生产 adapter needs-context，其他子项可交付。
 
 ## Task 3 — T3 同事务 CAS、跨 Unit 配额与 append-only 写入
+
+执行顺序说明（2026-09-08）：C 协议已按合同裁决决定三固定；先实现内部事务引擎和真实 SQLite 竞争反例，T2 认证 opener/可信日历及 T5 真实 owner adapter 接线仍是完整 T3 交付的前置。事务实现放新 `activation_transaction.rs`，`activation_store.rs` 仅提取共用同事务读取；内部候选/trait 不对外开放，不命名或冒充真实认证结果。准入投影可独立按 B 先实现，不能据此标整个 T4 完成。
 
 依赖 T1、T2 的批准与日历合同；owner 接口可先由测试 harness 实现。本任务接管 `activation_store.rs`，新建 `activation_transaction_tests.rs`。不编辑冻结 Foundation SQL，不复用 rollback-only reader 做写入。写连接对已认证 activation DB 打开并验证 schema，显式 `BEGIN IMMEDIATE`，重验 expected generation、前驱与 pending 代，再查询全 Unit journal、写 manifest/journal、提交。
 
