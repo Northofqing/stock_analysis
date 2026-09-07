@@ -217,9 +217,10 @@ impl ReadinessAssessment {
             match scope {
                 ReadinessScope::Core => ReadinessStatus::CoreUnready,
                 ReadinessScope::Occurrence { .. }
-                    if failures
-                        .iter()
-                        .all(|(kind, _)| *kind == DependencyKind::OccurrenceInput) =>
+                    if failures.iter().all(|(kind, failure)| {
+                        *kind == DependencyKind::OccurrenceInput
+                            && *failure != DependencyFailure::MissingDeclaration
+                    }) =>
                 {
                     ReadinessStatus::BlockedOnInput
                 }
