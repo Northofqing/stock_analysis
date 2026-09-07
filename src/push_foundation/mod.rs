@@ -1,6 +1,7 @@
 //! Additive push-foundation persistence. No production database is selected or migrated here.
 
 mod business_finalizer;
+mod generic_transport;
 mod intent_store;
 mod migration;
 mod reconciler;
@@ -18,6 +19,8 @@ pub use terminal_authority::TerminalTemplateBinding;
 
 #[cfg(test)]
 mod business_finalizer_tests;
+#[cfg(test)]
+mod generic_transport_tests;
 #[cfg(test)]
 mod reconciler_tests;
 #[cfg(test)]
