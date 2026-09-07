@@ -176,10 +176,14 @@ impl<'a> GenericTransportAuthorityAdapter<'a> {
             .snapshot
             .attested_ready_binding()
             .map_err(|_| GenericTransportError::InvalidBusinessIntent)?;
+        if request.verified_at < request.dispatched_at {
+            return Err(GenericTransportError::InvalidTimestamp);
+        }
         if request.snapshot.state() != IntentState::AwaitingAuthority
             || !request
                 .fence
                 .matches(request.snapshot, request.dispatched_at)
+            || request.fence.until <= request.verified_at
         {
             return Err(GenericTransportError::BusinessLeaseMismatch);
         }
@@ -200,9 +204,20 @@ impl<'a> GenericTransportAuthorityAdapter<'a> {
         self.coordinator
             .prepare(&envelope, 1, dispatched_at)
             .map_err(|_| GenericTransportError::DurableFailure)?;
-        self.coordinator
-            .resume_deliverable(&decision_identity, &[required_sink], dispatched_at)
-            .map_err(|_| GenericTransportError::DurableFailure)?;
+        let already_terminal = match self
+            .coordinator
+            .inspect_foundation_terminal(&decision_identity)
+            .map_err(|_| GenericTransportError::DurableFailure)?
+        {
+            FoundationTerminalQuery::Terminal(_) => true,
+            FoundationTerminalQuery::PendingSeal { .. } => false,
+            FoundationTerminalQuery::Missing => return Err(GenericTransportError::DurableFailure),
+        };
+        if !already_terminal {
+            self.coordinator
+                .resume_deliverable(&decision_identity, &[required_sink], dispatched_at)
+                .map_err(|_| GenericTransportError::DurableFailure)?;
+        }
         self.coordinator
             .reconcile_all_pending(request.append_port, dispatched_at)
             .map_err(|_| GenericTransportError::DurableFailure)?;
