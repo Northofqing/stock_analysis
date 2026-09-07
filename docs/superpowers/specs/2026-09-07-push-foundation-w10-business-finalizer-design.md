@@ -1,6 +1,6 @@
 # 推送 Foundation W10 通用 Finalizer 与业务 CAS 设计
 
-**状态：** 已冻结设计，待 TDD 实现、双轴评审与 fresh 门禁。W10 只实现 foundation business intent 的终态编排、CAS、append、冲突隔离和提交确认恢复；不接生产 authority、不迁移任何 Unit 的领域通知游标。
+**状态：** 已按冻结设计完成 TDD 实现、双轴评审修复与 fresh 门禁；实现证据见 `docs/push-system/implementation-w10-results-2026-09-07.md`。W10 只实现 foundation business intent 的终态编排、CAS、append、冲突隔离和提交确认恢复；未接生产 authority、未迁移任何 Unit 的领域通知游标。
 
 **决策日期：** 2026-09-07
 
