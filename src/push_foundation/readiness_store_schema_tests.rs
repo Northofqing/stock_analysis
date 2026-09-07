@@ -1,14 +1,19 @@
 use std::collections::BTreeMap;
+use std::env;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::{symlink, MetadataExt};
 
 use crate::monitor::push_job::{canonical_digest, namespace_value, Namespace, RunId};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, ErrorCode, OpenFlags};
 
 use super::readiness_store_schema::{
     initialize_database, initialize_database_with_before_create_hook,
@@ -50,6 +55,38 @@ fn directory_bytes(root: &Path) -> BTreeMap<String, Vec<u8>> {
 
 fn schema_error(check: &'static str) -> ReadinessSchemaError {
     ReadinessSchemaError::ValidationFailed { check }
+}
+
+const LOCK_CHILD_DATABASE_ENV: &str = "TEST_CODE_W15_LOCK_CHILD_DATABASE";
+const LOCK_CHILD_REJECTED: &str = "TEST_CODE_W15_LOCK_CHILD_REJECTED";
+const LOCK_CHILD_SWITCHED: &str = "TEST_CODE_W15_LOCK_CHILD_SWITCHED";
+
+fn wait_for_child(mut child: Child, timeout: Duration) -> Result<Output, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|error| format!("TEST_CODE collect child output: {error}"));
+            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let kill = child.kill();
+                let wait = child.wait_with_output();
+                return Err(format!(
+                    "TEST_CODE child timed out; kill={kill:?}; wait={wait:?}"
+                ));
+            }
+            Err(error) => {
+                let kill = child.kill();
+                let wait = child.wait_with_output();
+                return Err(format!(
+                    "TEST_CODE poll child: {error}; kill={kill:?}; wait={wait:?}"
+                ));
+            }
+        }
+    }
 }
 
 fn insert_linked_pair(connection: &Connection) {
@@ -786,29 +823,178 @@ fn w15_journal_mode_change_after_header_check_is_rejected_before_sqlite_side_eff
 #[test]
 fn w15_controlled_reader_lock_blocks_wal_until_callback_returns() {
     let (root, database, namespace) = initialized_database("reader-lock.sqlite3");
+    let before = directory_bytes(root.path());
     with_read_only_hooks(
         &database,
         &namespace,
         || {},
         || {
-            let before = directory_bytes(root.path());
             let racer = Connection::open(&database).expect("TEST_CODE competing SQLite connection");
             let switch =
                 racer.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0));
             let switched_to_wal = matches!(switch.as_deref(), Ok("wal"));
             drop(racer);
             assert!(!switched_to_wal, "SHARED lock must block WAL transition");
-            assert_eq!(directory_bytes(root.path()), before);
         },
         |_| Ok::<(), ReadinessSchemaError>(()),
     )
     .expect("TEST_CODE controlled reader callback");
+    assert_eq!(directory_bytes(root.path()), before);
 
     let released = Connection::open(&database).expect("TEST_CODE post-reader SQLite connection");
     let mode: String = released
         .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
         .expect("TEST_CODE WAL succeeds after reader closes");
     assert_eq!(mode, "wal");
+}
+
+#[test]
+#[ignore = "TEST_CODE helper is launched explicitly by the POSIX lock regression"]
+fn w15_posix_lock_child_attempts_wal() {
+    let database = PathBuf::from(
+        env::var_os(LOCK_CHILD_DATABASE_ENV)
+            .expect("TEST_CODE child requires an explicit temporary database path"),
+    );
+    assert!(
+        database.is_absolute(),
+        "TEST_CODE child database path must be absolute"
+    );
+    let connection = Connection::open_with_flags(
+        &database,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE,
+    )
+    .expect("TEST_CODE child opens the existing temporary database");
+    connection
+        .busy_timeout(Duration::ZERO)
+        .expect("TEST_CODE child disables busy waiting");
+
+    match connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0)) {
+        Ok(mode) if mode.eq_ignore_ascii_case("wal") => println!("{LOCK_CHILD_SWITCHED}"),
+        Err(error)
+            if matches!(
+                error.sqlite_error_code(),
+                Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+            ) =>
+        {
+            println!("{LOCK_CHILD_REJECTED}")
+        }
+        Ok(mode) => panic!("TEST_CODE child returned unexpected journal mode {mode:?}"),
+        Err(error) => panic!("TEST_CODE child returned non-lock SQLite error: {error}"),
+    }
+}
+
+#[test]
+fn w15_same_process_preflight_close_cannot_cancel_live_sqlite_lock() {
+    let (root, database, namespace) = initialized_database("posix-close-lock.sqlite3");
+    let executable = env::current_exe().expect("TEST_CODE resolve current test executable");
+    let before = directory_bytes(root.path());
+
+    let (reader_locked_sender, reader_locked_receiver) = mpsc::sync_channel(0);
+    let (release_reader_sender, release_reader_receiver) = mpsc::sync_channel(0);
+    let reader_database = database.clone();
+    let reader_namespace = namespace.clone();
+    let reader = thread::spawn(move || {
+        with_read_only_hooks(
+            &reader_database,
+            &reader_namespace,
+            || {},
+            || {
+                reader_locked_sender
+                    .send(())
+                    .expect("TEST_CODE announce live SQLite SHARED lock");
+                release_reader_receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("TEST_CODE bounded reader release");
+            },
+            |_| Ok::<(), ReadinessSchemaError>(()),
+        )
+    });
+    if let Err(error) = reader_locked_receiver.recv_timeout(Duration::from_secs(5)) {
+        let _ = release_reader_sender.send(());
+        let reader_result = reader.join();
+        panic!("TEST_CODE reader did not reach SHARED lock: {error}; join={reader_result:?}");
+    }
+
+    let (preflight_done_sender, preflight_done_receiver) = mpsc::sync_channel(0);
+    let (release_preflight_sender, release_preflight_receiver) = mpsc::sync_channel(0);
+    let preflight_database = database.clone();
+    let preflight_namespace = namespace.clone();
+    let preflight = thread::spawn(move || {
+        with_read_only_hooks(
+            &preflight_database,
+            &preflight_namespace,
+            || {
+                preflight_done_sender
+                    .send(())
+                    .expect("TEST_CODE announce second readiness preflight");
+                release_preflight_receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("TEST_CODE bounded preflight release");
+            },
+            || {},
+            |_| Ok::<(), ReadinessSchemaError>(()),
+        )
+    });
+    if let Err(error) = preflight_done_receiver.recv_timeout(Duration::from_secs(5)) {
+        let _ = release_reader_sender.send(());
+        let _ = release_preflight_sender.send(());
+        let reader_result = reader.join();
+        let preflight_result = preflight.join();
+        panic!(
+            "TEST_CODE second readiness call did not finish preflight: {error}; reader={reader_result:?}; preflight={preflight_result:?}"
+        );
+    }
+
+    let child_result = Command::new(executable)
+        .arg("push_foundation::readiness_store_schema_tests::w15_posix_lock_child_attempts_wal")
+        .arg("--exact")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .arg("--test-threads=1")
+        .env(LOCK_CHILD_DATABASE_ENV, &database)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("TEST_CODE spawn lock child: {error}"))
+        .and_then(|child| wait_for_child(child, Duration::from_secs(5)));
+
+    let _ = release_reader_sender.send(());
+    let reader_result = reader.join();
+    let _ = release_preflight_sender.send(());
+    let preflight_result = preflight.join();
+    let after = directory_bytes(root.path());
+
+    let output = child_result.expect("TEST_CODE bounded child execution");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "TEST_CODE child helper failed: stdout={stdout:?}; stderr={stderr:?}"
+    );
+    assert!(
+        stdout.contains("running 1 test") && stdout.contains("1 passed"),
+        "TEST_CODE child must execute exactly one ignored helper test: stdout={stdout:?}"
+    );
+    let child_rejected = stdout.contains(LOCK_CHILD_REJECTED);
+    let child_switched = stdout.contains(LOCK_CHILD_SWITCHED);
+    assert_ne!(
+        child_rejected, child_switched,
+        "TEST_CODE child must report exactly one outcome: stdout={stdout:?}"
+    );
+    assert!(
+        child_rejected,
+        "independent process switched WAL after a same-process readiness preflight closed its ordinary file descriptor: stdout={stdout:?}"
+    );
+    assert!(reader_result.expect("TEST_CODE join locked reader").is_ok());
+    assert!(preflight_result
+        .expect("TEST_CODE join second readiness call")
+        .is_ok());
+    assert_eq!(
+        after, before,
+        "TEST_CODE lock competition must leave database artifacts unchanged"
+    );
 }
 
 #[test]

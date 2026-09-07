@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 
 #[cfg(unix)]
@@ -445,7 +445,6 @@ where
     F: FnOnce(),
 {
     validate_existing_path(path)?;
-    validate_rollback_journal_header(path)?;
     after_header();
     let connection = Connection::open_with_flags(
         path,
@@ -557,18 +556,6 @@ fn verify_owned_target(_path: &Path, _expected: FileIdentity) -> Result<(), Read
     Err(ReadinessSchemaError::InitializationFailed {
         check: "owned_target_identity_unsupported",
     })
-}
-
-fn validate_rollback_journal_header(path: &Path) -> Result<(), ReadinessSchemaError> {
-    let mut file = File::open(path).map_err(|_| ReadinessSchemaError::ValidationFailed {
-        check: "database_header",
-    })?;
-    let mut header = [0_u8; SQLITE_HEADER_LEN];
-    file.read_exact(&mut header)
-        .map_err(|_| ReadinessSchemaError::ValidationFailed {
-            check: "database_header",
-        })?;
-    validate_rollback_journal_header_bytes(&header)
 }
 
 fn validate_rollback_journal_header_bytes(header: &[u8]) -> Result<(), ReadinessSchemaError> {
