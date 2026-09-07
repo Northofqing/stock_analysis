@@ -5,8 +5,8 @@ use crate::monitor::push_job::{
 };
 
 use super::operational_readiness::{
-    DependencyKind, DependencyObservation, DependencyRequirement, ReadinessAssessment,
-    ReadinessScope, ReadinessStage,
+    DependencyApplicability, DependencyKind, DependencyObservation, DependencyRequirement,
+    ReadinessAssessment, ReadinessScope, ReadinessStage,
 };
 use super::readiness_recovery::{
     CandidateReadinessRecord, CandidateRecoveryClaim, ReadinessRecoveryError, ReadinessRecoveryKind,
@@ -54,6 +54,8 @@ pub(super) fn assessed(
             kind,
             contract_id: contract_id.clone(),
             version: version.clone(),
+            expected_authority: ReadinessEvidenceKind::AuthorityArtifact,
+            applicability: DependencyApplicability::Required,
         });
         observations.push(if is_blocked {
             DependencyObservation::Unavailable {

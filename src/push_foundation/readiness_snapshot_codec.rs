@@ -11,15 +11,15 @@ use crate::monitor::push_job::{
 };
 
 use super::operational_readiness::{
-    DependencyKind, DependencyObservation, DependencyRequirement, ReadinessAssessment,
-    ReadinessError, ReadinessScope, ReadinessStage,
+    DependencyApplicability, DependencyKind, DependencyObservation, DependencyRequirement,
+    ReadinessAssessment, ReadinessError, ReadinessScope, ReadinessStage,
 };
 use super::readiness_snapshot::{
     CandidateReadinessSnapshot, ReadinessEvidenceKind, ReadinessEvidenceRef,
     ReadinessRecoveryEventId, ReadinessSnapshotContext, ReadinessSnapshotError,
 };
 
-const DOMAIN_PREFIX: &[u8] = b"OperationalReadinessSnapshot/v1\0";
+const DOMAIN_PREFIX: &[u8] = b"OperationalReadinessSnapshot/v2\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum ReadinessDecodeError {
@@ -55,7 +55,7 @@ pub(crate) fn decode_readiness_snapshot(
         .ok_or(ReadinessDecodeError::InvalidDomain)?;
     let record: Value =
         serde_json::from_slice(json).map_err(|_| ReadinessDecodeError::InvalidJson)?;
-    if unsigned_field(&record, "schema_version")? != 1 {
+    if unsigned_field(&record, "schema_version")? != 2 {
         return Err(ReadinessDecodeError::UnsupportedSchemaVersion);
     }
     let captured_at = i64::try_from(unsigned_field(&record, "captured_at")?)
@@ -155,6 +155,8 @@ fn decode_dependencies(
             kind,
             contract_id: contract_id(value, "contract_id")?,
             version: contract_version(value, "version")?,
+            expected_authority: evidence_kind(value, "expected_authority")?,
+            applicability: decode_applicability(field(value, "applicability")?)?,
         });
         let observed = field(value, "observation")?;
         if observed.is_null() {
@@ -178,6 +180,13 @@ fn decode_dependencies(
                 reason: ReasonCode::try_from(string_field(observed, "reason")?)
                     .map_err(|_| invalid("reason"))?,
             },
+            "NotRequired" => DependencyObservation::NotRequired {
+                kind,
+                contract_id,
+                version,
+                evidence_sha256,
+                basis_sha256: digest_field(observed, "basis_sha256")?,
+            },
             _ => return Err(invalid("observation_status")),
         });
     }
@@ -186,11 +195,7 @@ fn decode_dependencies(
 
 pub(super) fn decode_evidence(value: &Value) -> Result<ReadinessEvidenceRef, ReadinessDecodeError> {
     let dependency_kind = dependency_kind(string_field(value, "dependency_kind")?)?;
-    let kind = match string_field(value, "kind")? {
-        "AuthorityArtifact" => ReadinessEvidenceKind::AuthorityArtifact,
-        "DataAcquisitionAudit" => ReadinessEvidenceKind::DataAcquisitionAudit,
-        _ => return Err(invalid("evidence_kind")),
-    };
+    let kind = evidence_kind(value, "kind")?;
     let protected_uri = ProtectedRef::try_new(string_field(value, "protected_uri")?.to_owned())
         .map_err(|_| invalid("protected_uri"))?;
     Ok(ReadinessEvidenceRef::new(
@@ -203,9 +208,32 @@ pub(super) fn decode_evidence(value: &Value) -> Result<ReadinessEvidenceRef, Rea
     ))
 }
 
+fn decode_applicability(value: &Value) -> Result<DependencyApplicability, ReadinessDecodeError> {
+    match string_field(value, "mode")? {
+        "Required" if field(value, "basis_sha256")?.is_null() => {
+            Ok(DependencyApplicability::Required)
+        }
+        "NotRequired" => Ok(DependencyApplicability::NotRequired {
+            basis_sha256: digest_field(value, "basis_sha256")?,
+        }),
+        _ => Err(invalid("applicability")),
+    }
+}
+
+fn evidence_kind(
+    value: &Value,
+    key: &'static str,
+) -> Result<ReadinessEvidenceKind, ReadinessDecodeError> {
+    match string_field(value, key)? {
+        "AuthorityArtifact" => Ok(ReadinessEvidenceKind::AuthorityArtifact),
+        "DataAcquisitionAudit" => Ok(ReadinessEvidenceKind::DataAcquisitionAudit),
+        _ => Err(invalid(if key == "kind" { "evidence_kind" } else { key })),
+    }
+}
+
 fn dependency_kind(value: &str) -> Result<DependencyKind, ReadinessDecodeError> {
     use DependencyKind::*;
-    // Frozen v1 vocabulary: unknown future roles require an explicit schema/codec change.
+    // Frozen v2 vocabulary: unknown future roles require an explicit schema/codec change.
     [
         Namespace,
         Durable,

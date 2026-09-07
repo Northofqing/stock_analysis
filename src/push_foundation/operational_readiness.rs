@@ -65,6 +65,27 @@ pub(crate) enum DependencyKind {
     OccurrenceInput,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReadinessEvidenceKind {
+    AuthorityArtifact,
+    DataAcquisitionAudit,
+}
+
+impl ReadinessEvidenceKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthorityArtifact => "AuthorityArtifact",
+            Self::DataAcquisitionAudit => "DataAcquisitionAudit",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DependencyApplicability {
+    Required,
+    NotRequired { basis_sha256: Sha256Digest },
+}
+
 impl DependencyKind {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -111,6 +132,8 @@ pub(crate) struct DependencyRequirement {
     pub(crate) kind: DependencyKind,
     pub(crate) contract_id: SourceContractId,
     pub(crate) version: SourceContractVersion,
+    pub(crate) expected_authority: ReadinessEvidenceKind,
+    pub(crate) applicability: DependencyApplicability,
 }
 
 /// Candidate observations must be independently attested before any snapshot can be published.
@@ -129,26 +152,37 @@ pub(crate) enum DependencyObservation {
         evidence_sha256: Sha256Digest,
         reason: ReasonCode,
     },
+    NotRequired {
+        kind: DependencyKind,
+        contract_id: SourceContractId,
+        version: SourceContractVersion,
+        evidence_sha256: Sha256Digest,
+        basis_sha256: Sha256Digest,
+    },
 }
 
 impl DependencyObservation {
     pub(crate) fn kind(&self) -> DependencyKind {
         match self {
-            Self::Available { kind, .. } | Self::Unavailable { kind, .. } => *kind,
+            Self::Available { kind, .. }
+            | Self::Unavailable { kind, .. }
+            | Self::NotRequired { kind, .. } => *kind,
         }
     }
 
     pub(crate) fn contract_id(&self) -> &SourceContractId {
         match self {
-            Self::Available { contract_id, .. } | Self::Unavailable { contract_id, .. } => {
-                contract_id
-            }
+            Self::Available { contract_id, .. }
+            | Self::Unavailable { contract_id, .. }
+            | Self::NotRequired { contract_id, .. } => contract_id,
         }
     }
 
     pub(crate) fn version(&self) -> &SourceContractVersion {
         match self {
-            Self::Available { version, .. } | Self::Unavailable { version, .. } => version,
+            Self::Available { version, .. }
+            | Self::Unavailable { version, .. }
+            | Self::NotRequired { version, .. } => version,
         }
     }
 
@@ -158,6 +192,9 @@ impl DependencyObservation {
                 evidence_sha256, ..
             }
             | Self::Unavailable {
+                evidence_sha256, ..
+            }
+            | Self::NotRequired {
                 evidence_sha256, ..
             } => evidence_sha256,
         }
@@ -174,17 +211,32 @@ impl DependencyObservation {
                 contract_id,
                 version,
                 ..
+            }
+            | Self::NotRequired {
+                contract_id,
+                version,
+                ..
             } => {
                 if contract_id != &requirement.contract_id {
                     Some(DependencyFailure::ContractMismatch)
                 } else if version != &requirement.version {
                     Some(DependencyFailure::VersionMismatch)
                 } else {
-                    match self {
-                        Self::Available { .. } => None,
-                        Self::Unavailable { reason, .. } => {
+                    match (&requirement.applicability, self) {
+                        (DependencyApplicability::Required, Self::Available { .. }) => None,
+                        (DependencyApplicability::Required, Self::Unavailable { reason, .. }) => {
                             Some(DependencyFailure::Unavailable { reason: *reason })
                         }
+                        (
+                            DependencyApplicability::NotRequired {
+                                basis_sha256: expected_basis,
+                            },
+                            Self::NotRequired {
+                                basis_sha256: actual_basis,
+                                ..
+                            },
+                        ) if expected_basis == actual_basis => None,
+                        _ => Some(DependencyFailure::ApplicabilityMismatch),
                     }
                 }
             }
@@ -249,6 +301,7 @@ pub(crate) enum DependencyFailure {
     MissingEvidence,
     ContractMismatch,
     VersionMismatch,
+    ApplicabilityMismatch,
     Unavailable { reason: ReasonCode },
 }
 
@@ -299,6 +352,16 @@ impl ReadinessAssessment {
             if declarations.insert(requirement.kind, requirement).is_some() {
                 return Err(ReadinessError::InvalidDependencySet {
                     check: "duplicate_declaration",
+                    kind: requirement.kind,
+                });
+            }
+            if matches!(
+                &requirement.applicability,
+                DependencyApplicability::NotRequired { .. }
+            ) && requirement.expected_authority != ReadinessEvidenceKind::AuthorityArtifact
+            {
+                return Err(ReadinessError::InvalidDependencySet {
+                    check: "not_required_requires_authority_artifact",
                     kind: requirement.kind,
                 });
             }

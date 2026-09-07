@@ -4,8 +4,8 @@ use crate::monitor::push_job::{
 };
 
 use super::operational_readiness::{
-    DependencyKind, DependencyObservation, DependencyRequirement, ReadinessAssessment,
-    ReadinessScope, ReadinessStage, ReadinessStatus,
+    DependencyApplicability, DependencyKind, DependencyObservation, DependencyRequirement,
+    ReadinessAssessment, ReadinessScope, ReadinessStage, ReadinessStatus,
 };
 use super::readiness_snapshot::{
     CandidateReadinessSnapshot, ReadinessEvidenceKind, ReadinessEvidenceRef,
@@ -52,6 +52,8 @@ fn core_facts() -> (
             kind,
             contract_id: contract_id.clone(),
             version: version.clone(),
+            expected_authority: ReadinessEvidenceKind::AuthorityArtifact,
+            applicability: DependencyApplicability::Required,
         });
         observations.push(DependencyObservation::Available {
             kind,
@@ -102,7 +104,7 @@ fn w15_snapshot_binds_context_dependency_evidence_and_recovery_without_debug_lea
     let bytes = snapshot.canonical_bytes();
     let fields: serde_json::Value = serde_json::from_slice(
         bytes
-            .strip_prefix(b"OperationalReadinessSnapshot/v1\0")
+            .strip_prefix(b"OperationalReadinessSnapshot/v2\0")
             .expect("TEST_CODE canonical domain"),
     )
     .expect("TEST_CODE canonical JSON");
@@ -261,6 +263,168 @@ fn w15_snapshot_rejects_missing_duplicate_extra_and_cross_bound_evidence_refs() 
 }
 
 #[test]
+fn w15_snapshot_rejects_wrong_authority_for_available_unavailable_and_not_required() {
+    let catalog = MachineCatalog::bundled().expect("TEST_CODE catalog");
+    let build = |requirements: Vec<DependencyRequirement>,
+                 observations: Vec<DependencyObservation>,
+                 evidence: Vec<ReadinessEvidenceRef>| {
+        let assessment = ReadinessAssessment::evaluate(
+            &catalog,
+            &ReadinessScope::Core,
+            &[],
+            ReadinessStage::Running,
+            &requirements,
+            &observations,
+        )
+        .expect("TEST_CODE assessed evidence kind mismatch");
+        CandidateReadinessSnapshot::try_new(
+            context(),
+            assessment,
+            ReadinessRecoveryEventId::from_digest(digest('b')),
+            evidence,
+        )
+    };
+
+    let (requirements, observations, mut evidence) = core_facts();
+    evidence[0] = ReadinessEvidenceRef::new(
+        DependencyKind::Namespace,
+        ReadinessEvidenceKind::DataAcquisitionAudit,
+        ProtectedRef::try_new("vault://TEST_CODE-SECRET/wrong-available".to_owned())
+            .expect("TEST_CODE URI"),
+        digest('a'),
+        requirements[0].contract_id.clone(),
+        requirements[0].version.clone(),
+    );
+    assert_eq!(
+        build(requirements, observations, evidence),
+        Err(ReadinessSnapshotError::InvalidEvidenceSet {
+            check: "observation_evidence_mismatch",
+            kind: DependencyKind::Namespace,
+        })
+    );
+
+    let (requirements, mut observations, mut evidence) = core_facts();
+    observations[5] = DependencyObservation::Unavailable {
+        kind: DependencyKind::Manifest,
+        contract_id: requirements[5].contract_id.clone(),
+        version: requirements[5].version.clone(),
+        evidence_sha256: digest('a'),
+        reason: crate::monitor::push_job::ReasonCode::ActivationCoreUnready,
+    };
+    evidence[5] = ReadinessEvidenceRef::new(
+        DependencyKind::Manifest,
+        ReadinessEvidenceKind::DataAcquisitionAudit,
+        ProtectedRef::try_new("vault://TEST_CODE-SECRET/wrong-unavailable".to_owned())
+            .expect("TEST_CODE URI"),
+        digest('a'),
+        requirements[5].contract_id.clone(),
+        requirements[5].version.clone(),
+    );
+    assert_eq!(
+        build(requirements, observations, evidence),
+        Err(ReadinessSnapshotError::InvalidEvidenceSet {
+            check: "observation_evidence_mismatch",
+            kind: DependencyKind::Manifest,
+        })
+    );
+
+    let (mut requirements, mut observations, mut evidence) = core_facts();
+    let basis_sha256 = digest('f');
+    requirements[4].applicability = DependencyApplicability::NotRequired {
+        basis_sha256: basis_sha256.clone(),
+    };
+    observations[4] = DependencyObservation::NotRequired {
+        kind: DependencyKind::Schema,
+        contract_id: requirements[4].contract_id.clone(),
+        version: requirements[4].version.clone(),
+        evidence_sha256: digest('a'),
+        basis_sha256,
+    };
+    evidence[4] = ReadinessEvidenceRef::new(
+        DependencyKind::Schema,
+        ReadinessEvidenceKind::DataAcquisitionAudit,
+        ProtectedRef::try_new("vault://TEST_CODE-SECRET/wrong-not-required".to_owned())
+            .expect("TEST_CODE URI"),
+        digest('a'),
+        requirements[4].contract_id.clone(),
+        requirements[4].version.clone(),
+    );
+    assert_eq!(
+        build(requirements, observations, evidence),
+        Err(ReadinessSnapshotError::InvalidEvidenceSet {
+            check: "observation_evidence_mismatch",
+            kind: DependencyKind::Schema,
+        })
+    );
+}
+
+#[test]
+fn w15_snapshot_identity_binds_expected_authority_applicability_and_basis() {
+    let catalog = MachineCatalog::bundled().expect("TEST_CODE catalog");
+    let build = |requirements: Vec<DependencyRequirement>,
+                 observations: Vec<DependencyObservation>,
+                 evidence: Vec<ReadinessEvidenceRef>| {
+        let assessment = ReadinessAssessment::evaluate(
+            &catalog,
+            &ReadinessScope::Core,
+            &[],
+            ReadinessStage::Running,
+            &requirements,
+            &observations,
+        )
+        .expect("TEST_CODE identity assessment");
+        CandidateReadinessSnapshot::try_new(
+            context(),
+            assessment,
+            ReadinessRecoveryEventId::from_digest(digest('b')),
+            evidence,
+        )
+        .expect("TEST_CODE identity candidate")
+    };
+    let (requirements, observations, evidence) = core_facts();
+    let original = build(requirements.clone(), observations.clone(), evidence.clone());
+
+    let mut authority_requirements = requirements.clone();
+    authority_requirements[0].expected_authority = ReadinessEvidenceKind::DataAcquisitionAudit;
+    let mut authority_evidence = evidence.clone();
+    authority_evidence[0] = ReadinessEvidenceRef::new(
+        DependencyKind::Namespace,
+        ReadinessEvidenceKind::DataAcquisitionAudit,
+        ProtectedRef::try_new("vault://TEST_CODE-SECRET/Namespace".to_owned())
+            .expect("TEST_CODE URI"),
+        digest('a'),
+        authority_requirements[0].contract_id.clone(),
+        authority_requirements[0].version.clone(),
+    );
+    let changed_authority = build(
+        authority_requirements,
+        observations.clone(),
+        authority_evidence,
+    );
+    assert_ne!(original.snapshot_id(), changed_authority.snapshot_id());
+
+    let not_required = |basis_sha256: Sha256Digest| {
+        let mut changed_requirements = requirements.clone();
+        changed_requirements[0].applicability = DependencyApplicability::NotRequired {
+            basis_sha256: basis_sha256.clone(),
+        };
+        let mut changed_observations = observations.clone();
+        changed_observations[0] = DependencyObservation::NotRequired {
+            kind: DependencyKind::Namespace,
+            contract_id: changed_requirements[0].contract_id.clone(),
+            version: changed_requirements[0].version.clone(),
+            evidence_sha256: digest('a'),
+            basis_sha256,
+        };
+        build(changed_requirements, changed_observations, evidence.clone())
+    };
+    let first_basis = not_required(digest('e'));
+    let second_basis = not_required(digest('f'));
+    assert_ne!(original.snapshot_id(), first_basis.snapshot_id());
+    assert_ne!(first_basis.snapshot_id(), second_basis.snapshot_id());
+}
+
+#[test]
 fn w15_snapshot_preserves_non_ready_gaps_and_actual_mismatched_versions() {
     let catalog = MachineCatalog::bundled().expect("TEST_CODE catalog");
     let (requirements, mut observations, mut evidence) = core_facts();
@@ -323,7 +487,7 @@ fn w15_snapshot_preserves_non_ready_gaps_and_actual_mismatched_versions() {
     let bytes = snapshot.canonical_bytes();
     let fields: serde_json::Value = serde_json::from_slice(
         bytes
-            .strip_prefix(b"OperationalReadinessSnapshot/v1\0")
+            .strip_prefix(b"OperationalReadinessSnapshot/v2\0")
             .expect("TEST_CODE domain"),
     )
     .expect("TEST_CODE JSON");

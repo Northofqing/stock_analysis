@@ -5,8 +5,9 @@ use crate::monitor::push_job::{
 };
 
 use super::operational_readiness::{
-    DependencyFailure, DependencyKind, DependencyObservation, DependencyRequirement,
-    ReadinessAssessment, ReadinessError, ReadinessScope, ReadinessStage, ReadinessStatus,
+    DependencyApplicability, DependencyFailure, DependencyKind, DependencyObservation,
+    DependencyRequirement, ReadinessAssessment, ReadinessError, ReadinessScope, ReadinessStage,
+    ReadinessStatus,
 };
 use super::readiness_snapshot::{
     CandidateReadinessSnapshot, ReadinessEvidenceKind, ReadinessEvidenceRef,
@@ -52,12 +53,12 @@ fn negative_snapshot(catalog: &MachineCatalog) -> CandidateReadinessSnapshot {
 fn rewrite_fields(bytes: &[u8], edit: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
     let mut fields: serde_json::Value = serde_json::from_slice(
         bytes
-            .strip_prefix(b"OperationalReadinessSnapshot/v1\0")
+            .strip_prefix(b"OperationalReadinessSnapshot/v2\0")
             .expect("TEST_CODE domain"),
     )
     .expect("TEST_CODE JSON");
     edit(&mut fields);
-    let mut rewritten = b"OperationalReadinessSnapshot/v1\0".to_vec();
+    let mut rewritten = b"OperationalReadinessSnapshot/v2\0".to_vec();
     rewritten.extend(serde_json::to_vec(&fields).expect("TEST_CODE encode edited JSON"));
     rewritten
 }
@@ -163,6 +164,12 @@ fn assessed_snapshot_with_override(
             kind,
             contract_id: contract_id.clone(),
             version: version.clone(),
+            expected_authority: if matches!(kind, SourceContract | OccurrenceInput) {
+                ReadinessEvidenceKind::DataAcquisitionAudit
+            } else {
+                ReadinessEvidenceKind::AuthorityArtifact
+            },
+            applicability: DependencyApplicability::Required,
         });
         let (observed_contract_id, observed_version, unavailable_reason) =
             match observation_override {
@@ -237,6 +244,90 @@ fn producer_scope() -> ReadinessScope {
         unit_id: UnitId::try_new("MU-p01".to_owned()).expect("TEST_CODE unit"),
         producer_id: ProducerId::try_new("p01-scheduled".to_owned()).expect("TEST_CODE producer"),
     }
+}
+
+fn not_required_snapshot(
+    catalog: &MachineCatalog,
+    basis_sha256: Sha256Digest,
+) -> CandidateReadinessSnapshot {
+    let baseline = assessed_snapshot(catalog, producer_scope(), ReadinessStage::Running, false);
+    let mut requirements = baseline.assessment().requirements().to_vec();
+    let requirement = requirements
+        .iter_mut()
+        .find(|required| required.kind == DependencyKind::Presentation)
+        .expect("TEST_CODE presentation requirement");
+    requirement.expected_authority = ReadinessEvidenceKind::AuthorityArtifact;
+    requirement.applicability = DependencyApplicability::NotRequired {
+        basis_sha256: basis_sha256.clone(),
+    };
+    let mut observations = baseline.assessment().observations().to_vec();
+    let observation = observations
+        .iter_mut()
+        .find(|observed| observed.kind() == DependencyKind::Presentation)
+        .expect("TEST_CODE presentation observation");
+    let contract_id = observation.contract_id().clone();
+    let version = observation.version().clone();
+    let evidence_sha256 = observation.evidence_sha256().clone();
+    *observation = DependencyObservation::NotRequired {
+        kind: DependencyKind::Presentation,
+        contract_id,
+        version,
+        evidence_sha256,
+        basis_sha256: basis_sha256.clone(),
+    };
+    let assessment = ReadinessAssessment::evaluate(
+        catalog,
+        &producer_scope(),
+        baseline.assessment().enabled_producers(),
+        ReadinessStage::Running,
+        &requirements,
+        &observations,
+    )
+    .expect("TEST_CODE matching versioned NotRequired assessment");
+    CandidateReadinessSnapshot::try_new(
+        baseline.context().clone(),
+        assessment,
+        baseline.recovery_event_id().clone(),
+        baseline.evidence_refs().to_vec(),
+    )
+    .expect("TEST_CODE NotRequired candidate")
+}
+
+#[test]
+fn w15_not_required_v2_roundtrip_preserves_expected_authority_and_bases() {
+    let catalog = MachineCatalog::bundled().expect("TEST_CODE catalog");
+    let basis_sha256 = raw_digest(b"TEST_CODE versioned NotRequired basis");
+    let snapshot = not_required_snapshot(&catalog, basis_sha256.clone());
+    let bytes = snapshot.canonical_bytes();
+    let fields: serde_json::Value = serde_json::from_slice(
+        bytes
+            .strip_prefix(b"OperationalReadinessSnapshot/v2\0")
+            .expect("TEST_CODE v2 domain"),
+    )
+    .expect("TEST_CODE canonical JSON");
+    assert_eq!(fields["schema_version"], 2);
+    let dependency = fields["dependency_refs"]
+        .as_array()
+        .expect("TEST_CODE dependencies")
+        .iter()
+        .find(|dependency| dependency["kind"] == "Presentation")
+        .expect("TEST_CODE presentation dependency");
+    assert_eq!(dependency["expected_authority"], "AuthorityArtifact");
+    assert_eq!(dependency["applicability"]["mode"], "NotRequired");
+    assert_eq!(
+        dependency["applicability"]["basis_sha256"],
+        basis_sha256.as_str()
+    );
+    assert_eq!(dependency["observation"]["status"], "NotRequired");
+    assert_eq!(
+        dependency["observation"]["basis_sha256"],
+        basis_sha256.as_str()
+    );
+    assert_eq!(
+        decode_readiness_snapshot(&catalog, snapshot.snapshot_id(), &bytes)
+            .expect("TEST_CODE exact v2 reload"),
+        snapshot
+    );
 }
 
 fn occurrence_scope(catalog: &MachineCatalog) -> ReadinessScope {
@@ -522,7 +613,7 @@ fn w15_snapshot_reload_rejects_noncanonical_bytes_extra_fields_and_invalid_schem
         assert_eq!(error, ReadinessDecodeError::InconsistentSnapshot);
         assert!(!format!("{error:?} {error}").contains("TEST_CODE-SECRET"));
     }
-    let version = rewrite_fields(&bytes, |fields| fields["schema_version"] = 2.into());
+    let version = rewrite_fields(&bytes, |fields| fields["schema_version"] = 1.into());
     assert_eq!(
         decode_readiness_snapshot(&catalog, &raw_digest(&version), &version),
         Err(ReadinessDecodeError::UnsupportedSchemaVersion)
@@ -533,7 +624,7 @@ fn w15_snapshot_reload_rejects_noncanonical_bytes_extra_fields_and_invalid_schem
             ReadinessDecodeError::InvalidDomain,
         ),
         (
-            b"OperationalReadinessSnapshot/v1\0{".to_vec(),
+            b"OperationalReadinessSnapshot/v2\0{".to_vec(),
             ReadinessDecodeError::InvalidJson,
         ),
     ] {
@@ -542,6 +633,160 @@ fn w15_snapshot_reload_rejects_noncanonical_bytes_extra_fields_and_invalid_schem
             Err(expected)
         );
     }
+}
+
+#[test]
+fn w15_snapshot_v2_rejects_v1_missing_unknown_and_nested_noncanonical_contracts() {
+    let catalog = MachineCatalog::bundled().expect("TEST_CODE catalog");
+    let snapshot =
+        not_required_snapshot(&catalog, raw_digest(b"TEST_CODE strict NotRequired basis"));
+    let bytes = snapshot.canonical_bytes();
+    let mut v1 = bytes.clone();
+    v1[.."OperationalReadinessSnapshot/v2".len()]
+        .copy_from_slice(b"OperationalReadinessSnapshot/v1");
+    assert_eq!(
+        decode_readiness_snapshot(&catalog, &raw_digest(&v1), &v1),
+        Err(ReadinessDecodeError::InvalidDomain)
+    );
+
+    let missing_expected_authority = rewrite_fields(&bytes, |fields| {
+        fields["dependency_refs"][0]
+            .as_object_mut()
+            .expect("TEST_CODE dependency")
+            .remove("expected_authority");
+    });
+    assert_eq!(
+        decode_readiness_snapshot(
+            &catalog,
+            &raw_digest(&missing_expected_authority),
+            &missing_expected_authority,
+        ),
+        Err(ReadinessDecodeError::InvalidField {
+            field: "expected_authority"
+        })
+    );
+
+    let missing_applicability = rewrite_fields(&bytes, |fields| {
+        fields["dependency_refs"][0]
+            .as_object_mut()
+            .expect("TEST_CODE dependency")
+            .remove("applicability");
+    });
+    assert_eq!(
+        decode_readiness_snapshot(
+            &catalog,
+            &raw_digest(&missing_applicability),
+            &missing_applicability,
+        ),
+        Err(ReadinessDecodeError::InvalidField {
+            field: "applicability"
+        })
+    );
+
+    let missing_basis = rewrite_fields(&bytes, |fields| {
+        let dependency = fields["dependency_refs"]
+            .as_array_mut()
+            .expect("TEST_CODE dependencies")
+            .iter_mut()
+            .find(|dependency| dependency["kind"] == "Presentation")
+            .expect("TEST_CODE presentation dependency");
+        dependency["applicability"]
+            .as_object_mut()
+            .expect("TEST_CODE applicability")
+            .remove("basis_sha256");
+    });
+    assert_eq!(
+        decode_readiness_snapshot(&catalog, &raw_digest(&missing_basis), &missing_basis),
+        Err(ReadinessDecodeError::InvalidField {
+            field: "basis_sha256"
+        })
+    );
+
+    let missing_observation_basis = rewrite_fields(&bytes, |fields| {
+        let dependency = fields["dependency_refs"]
+            .as_array_mut()
+            .expect("TEST_CODE dependencies")
+            .iter_mut()
+            .find(|dependency| dependency["kind"] == "Presentation")
+            .expect("TEST_CODE presentation dependency");
+        dependency["observation"]
+            .as_object_mut()
+            .expect("TEST_CODE observation")
+            .remove("basis_sha256");
+    });
+    assert_eq!(
+        decode_readiness_snapshot(
+            &catalog,
+            &raw_digest(&missing_observation_basis),
+            &missing_observation_basis,
+        ),
+        Err(ReadinessDecodeError::InvalidField {
+            field: "basis_sha256"
+        })
+    );
+
+    let unknown_mode = rewrite_fields(&bytes, |fields| {
+        let dependency = fields["dependency_refs"]
+            .as_array_mut()
+            .expect("TEST_CODE dependencies")
+            .iter_mut()
+            .find(|dependency| dependency["kind"] == "Presentation")
+            .expect("TEST_CODE presentation dependency");
+        dependency["applicability"]["mode"] = "Unknown".into();
+    });
+    assert_eq!(
+        decode_readiness_snapshot(&catalog, &raw_digest(&unknown_mode), &unknown_mode),
+        Err(ReadinessDecodeError::InvalidField {
+            field: "applicability"
+        })
+    );
+
+    let nested_extra = rewrite_fields(&bytes, |fields| {
+        fields["dependency_refs"][0]["applicability"]["extra"] = true.into();
+    });
+    assert_eq!(
+        decode_readiness_snapshot(&catalog, &raw_digest(&nested_extra), &nested_extra),
+        Err(ReadinessDecodeError::InconsistentSnapshot)
+    );
+    let duplicate = String::from_utf8(bytes.clone())
+        .expect("TEST_CODE UTF8")
+        .replacen(
+            "\"expected_authority\":\"AuthorityArtifact\"",
+            "\"expected_authority\":\"AuthorityArtifact\",\"expected_authority\":\"AuthorityArtifact\"",
+            1,
+        )
+        .into_bytes();
+    assert_eq!(
+        decode_readiness_snapshot(&catalog, &raw_digest(&duplicate), &duplicate),
+        Err(ReadinessDecodeError::InconsistentSnapshot)
+    );
+}
+
+#[test]
+fn w15_snapshot_v2_rejects_old_hash_and_rehashed_inconsistent_new_contract_fields() {
+    let catalog = MachineCatalog::bundled().expect("TEST_CODE catalog");
+    let snapshot = not_required_snapshot(
+        &catalog,
+        raw_digest(b"TEST_CODE original NotRequired basis"),
+    );
+    let bytes = snapshot.canonical_bytes();
+    let changed = rewrite_fields(&bytes, |fields| {
+        let dependency = fields["dependency_refs"]
+            .as_array_mut()
+            .expect("TEST_CODE dependencies")
+            .iter_mut()
+            .find(|dependency| dependency["kind"] == "Presentation")
+            .expect("TEST_CODE presentation dependency");
+        dependency["applicability"]["basis_sha256"] = "f".repeat(64).into();
+    });
+    assert_eq!(
+        decode_readiness_snapshot(&catalog, snapshot.snapshot_id(), &changed),
+        Err(ReadinessDecodeError::DigestMismatch)
+    );
+    assert_eq!(
+        decode_readiness_snapshot(&catalog, &raw_digest(&changed), &changed),
+        Err(ReadinessDecodeError::InconsistentSnapshot)
+    );
 }
 
 #[test]

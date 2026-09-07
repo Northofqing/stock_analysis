@@ -11,11 +11,13 @@ use crate::monitor::push_job::{
 };
 
 use super::operational_readiness::{
-    DependencyFailure, DependencyKind, DependencyObservation, ReadinessAssessment,
-    ReadinessExitDisposition, ReadinessScope, ReadinessStage, ReadinessStatus,
+    DependencyApplicability, DependencyFailure, DependencyKind, DependencyObservation,
+    ReadinessAssessment, ReadinessExitDisposition, ReadinessScope, ReadinessStage, ReadinessStatus,
 };
 
-const SNAPSHOT_DOMAIN: &str = "OperationalReadinessSnapshot/v1";
+pub(crate) use super::operational_readiness::ReadinessEvidenceKind;
+
+const SNAPSHOT_DOMAIN: &str = "OperationalReadinessSnapshot/v2";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReadinessSnapshotContext {
@@ -38,21 +40,6 @@ impl ReadinessRecoveryEventId {
 
     pub(crate) fn as_str(&self) -> &str {
         self.0.as_str()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ReadinessEvidenceKind {
-    AuthorityArtifact,
-    DataAcquisitionAudit,
-}
-
-impl ReadinessEvidenceKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::AuthorityArtifact => "AuthorityArtifact",
-            Self::DataAcquisitionAudit => "DataAcquisitionAudit",
-        }
     }
 }
 
@@ -103,8 +90,13 @@ impl ReadinessEvidenceRef {
         }
     }
 
-    fn matches(&self, observation: &DependencyObservation) -> bool {
+    fn matches(
+        &self,
+        observation: &DependencyObservation,
+        expected_authority: ReadinessEvidenceKind,
+    ) -> bool {
         self.dependency_kind == observation.kind()
+            && self.kind == expected_authority
             && &self.sha256 == observation.evidence_sha256()
             && &self.source_contract_id == observation.contract_id()
             && &self.source_contract_version == observation.version()
@@ -211,13 +203,21 @@ pub(super) fn normalize_snapshot_evidence(
     }
     for observation in assessment.observations() {
         let kind = observation.kind();
+        let requirement = assessment
+            .requirements()
+            .iter()
+            .find(|requirement| requirement.kind == kind)
+            .ok_or(ReadinessSnapshotError::InvalidEvidenceSet {
+                check: "missing_requirement_for_observation",
+                kind,
+            })?;
         let evidence = by_kind
             .get(&kind)
             .ok_or(ReadinessSnapshotError::InvalidEvidenceSet {
                 check: "missing_evidence_ref",
                 kind,
             })?;
-        if !evidence.matches(observation) {
+        if !evidence.matches(observation, requirement.expected_authority) {
             return Err(ReadinessSnapshotError::InvalidEvidenceSet {
                 check: "observation_evidence_mismatch",
                 kind,
@@ -257,7 +257,7 @@ pub(super) fn snapshot_material_digest(
     evidence: &[ReadinessEvidenceRef],
 ) -> Sha256Digest {
     canonical_digest(
-        "OperationalReadinessMaterial/v1",
+        "OperationalReadinessMaterial/v2",
         &snapshot_material_fields(context, assessment, evidence),
     )
 }
@@ -281,6 +281,14 @@ fn snapshot_material_fields(
                 ("contract_id", string(requirement.contract_id.as_str())),
                 ("version", string(requirement.version.as_str())),
                 (
+                    "expected_authority",
+                    string(requirement.expected_authority.as_str()),
+                ),
+                (
+                    "applicability",
+                    applicability_value(&requirement.applicability),
+                ),
+                (
                     "observation",
                     observations
                         .get(&requirement.kind)
@@ -291,7 +299,7 @@ fn snapshot_material_fields(
         })
         .collect();
     BTreeMap::from([
-        ("schema_version", CanonicalValue::Unsigned(1)),
+        ("schema_version", CanonicalValue::Unsigned(2)),
         ("namespace", namespace_value(&context.namespace)),
         ("business_date", string(context.business_date.as_str())),
         ("build_commit", string(context.build_commit.as_str())),
@@ -433,15 +441,23 @@ pub(super) fn scope_value(scope: &ReadinessScope) -> CanonicalValue {
 }
 
 pub(super) fn observation_value(observation: &DependencyObservation) -> CanonicalValue {
-    let (status, reason) = match observation {
-        DependencyObservation::Available { .. } => ("Available", CanonicalValue::Null),
-        DependencyObservation::Unavailable { reason, .. } => {
-            ("Unavailable", string(reason.as_str()))
+    let (status, reason, basis_sha256) = match observation {
+        DependencyObservation::Available { .. } => {
+            ("Available", CanonicalValue::Null, CanonicalValue::Null)
         }
+        DependencyObservation::Unavailable { reason, .. } => {
+            ("Unavailable", string(reason.as_str()), CanonicalValue::Null)
+        }
+        DependencyObservation::NotRequired { basis_sha256, .. } => (
+            "NotRequired",
+            CanonicalValue::Null,
+            string(basis_sha256.as_str()),
+        ),
     };
     CanonicalValue::Object(BTreeMap::from([
         ("status", string(status)),
         ("reason", reason),
+        ("basis_sha256", basis_sha256),
         ("contract_id", string(observation.contract_id().as_str())),
         ("version", string(observation.version().as_str())),
         (
@@ -451,12 +467,26 @@ pub(super) fn observation_value(observation: &DependencyObservation) -> Canonica
     ]))
 }
 
+fn applicability_value(applicability: &DependencyApplicability) -> CanonicalValue {
+    let (mode, basis_sha256) = match applicability {
+        DependencyApplicability::Required => ("Required", CanonicalValue::Null),
+        DependencyApplicability::NotRequired { basis_sha256 } => {
+            ("NotRequired", string(basis_sha256.as_str()))
+        }
+    };
+    CanonicalValue::Object(BTreeMap::from([
+        ("mode", string(mode)),
+        ("basis_sha256", basis_sha256),
+    ]))
+}
+
 fn failure_value(kind: DependencyKind, failure: DependencyFailure) -> CanonicalValue {
     let (failure, reason) = match failure {
         DependencyFailure::MissingDeclaration => ("MissingDeclaration", CanonicalValue::Null),
         DependencyFailure::MissingEvidence => ("MissingEvidence", CanonicalValue::Null),
         DependencyFailure::ContractMismatch => ("ContractMismatch", CanonicalValue::Null),
         DependencyFailure::VersionMismatch => ("VersionMismatch", CanonicalValue::Null),
+        DependencyFailure::ApplicabilityMismatch => ("ApplicabilityMismatch", CanonicalValue::Null),
         DependencyFailure::Unavailable { reason } => ("Unavailable", string(reason.as_str())),
     };
     CanonicalValue::Object(BTreeMap::from([

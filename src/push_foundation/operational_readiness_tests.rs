@@ -5,9 +5,9 @@ use crate::monitor::push_job::{
 };
 
 use super::operational_readiness::{
-    DependencyFailure, DependencyKind, DependencyObservation, DependencyRequirement,
-    ReadinessAssessment, ReadinessError, ReadinessExitDisposition, ReadinessScope, ReadinessStage,
-    ReadinessStatus,
+    DependencyApplicability, DependencyFailure, DependencyKind, DependencyObservation,
+    DependencyRequirement, ReadinessAssessment, ReadinessError, ReadinessEvidenceKind,
+    ReadinessExitDisposition, ReadinessScope, ReadinessStage, ReadinessStatus,
 };
 
 fn producer(value: &str) -> ProducerId {
@@ -27,6 +27,8 @@ fn requirements(kinds: &[DependencyKind]) -> Vec<DependencyRequirement> {
                 .expect("TEST_CODE contract ID"),
             version: SourceContractVersion::try_new("v1".to_owned())
                 .expect("TEST_CODE contract version"),
+            expected_authority: ReadinessEvidenceKind::AuthorityArtifact,
+            applicability: DependencyApplicability::Required,
         })
         .collect()
 }
@@ -124,6 +126,188 @@ fn occurrence_scope() -> ReadinessScope {
             OccurrenceKey::try_new("p01:2026-09-07".to_owned()).expect("TEST_CODE occurrence key"),
         )),
     }
+}
+
+#[test]
+fn w15_matching_versioned_not_required_authority_basis_is_ready() {
+    let catalog = MachineCatalog::bundled().expect("TEST_CODE catalog");
+    let mut declared = producer_requirements();
+    let presentation = declared
+        .iter_mut()
+        .find(|required| required.kind == DependencyKind::Presentation)
+        .expect("TEST_CODE presentation requirement");
+    let basis_sha256 = Sha256Digest::parse("TEST_CODE NotRequired basis", &"b".repeat(64))
+        .expect("TEST_CODE digest");
+    presentation.expected_authority = ReadinessEvidenceKind::AuthorityArtifact;
+    presentation.applicability = DependencyApplicability::NotRequired {
+        basis_sha256: basis_sha256.clone(),
+    };
+
+    let mut observed = available(&declared);
+    let presentation = declared
+        .iter()
+        .find(|required| required.kind == DependencyKind::Presentation)
+        .expect("TEST_CODE presentation requirement");
+    let observation = observed
+        .iter_mut()
+        .find(|observation| observation.kind() == DependencyKind::Presentation)
+        .expect("TEST_CODE presentation observation");
+    *observation = DependencyObservation::NotRequired {
+        kind: presentation.kind,
+        contract_id: presentation.contract_id.clone(),
+        version: presentation.version.clone(),
+        evidence_sha256: Sha256Digest::parse("TEST_CODE NotRequired evidence", &"c".repeat(64))
+            .expect("TEST_CODE digest"),
+        basis_sha256,
+    };
+
+    let assessment = ReadinessAssessment::evaluate(
+        &catalog,
+        &p01_scope(),
+        &[producer("p01-scheduled")],
+        ReadinessStage::Running,
+        &declared,
+        &observed,
+    )
+    .expect("TEST_CODE matching NotRequired authority basis");
+    assert_eq!(assessment.status(), ReadinessStatus::Ready);
+    assert!(assessment.failures().is_empty());
+}
+
+#[test]
+fn w15_not_required_misuse_and_drift_fail_closed_with_precedence() {
+    let catalog = MachineCatalog::bundled().expect("TEST_CODE catalog");
+    let baseline = producer_requirements();
+    let index = baseline
+        .iter()
+        .position(|required| required.kind == DependencyKind::Presentation)
+        .expect("TEST_CODE presentation requirement");
+    let presentation = baseline[index].clone();
+    let expected_basis =
+        Sha256Digest::parse("TEST_CODE expected basis", &"1".repeat(64)).expect("TEST_CODE digest");
+    let other_basis =
+        Sha256Digest::parse("TEST_CODE other basis", &"2".repeat(64)).expect("TEST_CODE digest");
+    let evidence_sha256 =
+        Sha256Digest::parse("TEST_CODE evidence", &"3".repeat(64)).expect("TEST_CODE digest");
+    let other_contract = SourceContractId::try_new("TEST_CODE-other-presentation".to_owned())
+        .expect("TEST_CODE contract");
+    let other_version = SourceContractVersion::try_new("v2".to_owned()).expect("TEST_CODE version");
+    let not_required = |contract_id, version, basis_sha256| DependencyObservation::NotRequired {
+        kind: DependencyKind::Presentation,
+        contract_id,
+        version,
+        evidence_sha256: evidence_sha256.clone(),
+        basis_sha256,
+    };
+    let cases = vec![
+        (
+            DependencyApplicability::Required,
+            not_required(
+                presentation.contract_id.clone(),
+                presentation.version.clone(),
+                expected_basis.clone(),
+            ),
+            DependencyFailure::ApplicabilityMismatch,
+        ),
+        (
+            DependencyApplicability::NotRequired {
+                basis_sha256: expected_basis.clone(),
+            },
+            DependencyObservation::Available {
+                kind: DependencyKind::Presentation,
+                contract_id: presentation.contract_id.clone(),
+                version: presentation.version.clone(),
+                evidence_sha256: evidence_sha256.clone(),
+            },
+            DependencyFailure::ApplicabilityMismatch,
+        ),
+        (
+            DependencyApplicability::NotRequired {
+                basis_sha256: expected_basis.clone(),
+            },
+            DependencyObservation::Unavailable {
+                kind: DependencyKind::Presentation,
+                contract_id: presentation.contract_id.clone(),
+                version: presentation.version.clone(),
+                evidence_sha256: evidence_sha256.clone(),
+                reason: ReasonCode::ActivationProducerUnready,
+            },
+            DependencyFailure::ApplicabilityMismatch,
+        ),
+        (
+            DependencyApplicability::NotRequired {
+                basis_sha256: expected_basis.clone(),
+            },
+            not_required(
+                presentation.contract_id.clone(),
+                presentation.version.clone(),
+                other_basis,
+            ),
+            DependencyFailure::ApplicabilityMismatch,
+        ),
+        (
+            DependencyApplicability::NotRequired {
+                basis_sha256: expected_basis.clone(),
+            },
+            not_required(
+                other_contract,
+                presentation.version.clone(),
+                expected_basis.clone(),
+            ),
+            DependencyFailure::ContractMismatch,
+        ),
+        (
+            DependencyApplicability::NotRequired {
+                basis_sha256: expected_basis.clone(),
+            },
+            not_required(
+                presentation.contract_id.clone(),
+                other_version,
+                expected_basis.clone(),
+            ),
+            DependencyFailure::VersionMismatch,
+        ),
+    ];
+    for (applicability, replacement, expected_failure) in cases {
+        let mut declared = baseline.clone();
+        declared[index].applicability = applicability;
+        let mut observed = available(&declared);
+        observed[index] = replacement;
+        let assessment = ReadinessAssessment::evaluate(
+            &catalog,
+            &p01_scope(),
+            &[producer("p01-scheduled")],
+            ReadinessStage::Running,
+            &declared,
+            &observed,
+        )
+        .expect("TEST_CODE misuse is an assessed failure");
+        assert_eq!(assessment.status(), ReadinessStatus::ProducerUnready);
+        assert_eq!(
+            assessment.failures(),
+            &[(DependencyKind::Presentation, expected_failure)]
+        );
+    }
+
+    let mut invalid = baseline;
+    invalid[index].expected_authority = ReadinessEvidenceKind::DataAcquisitionAudit;
+    invalid[index].applicability = DependencyApplicability::NotRequired {
+        basis_sha256: expected_basis,
+    };
+    assert_eq!(
+        ReadinessAssessment::evaluate(
+            &catalog,
+            &p01_scope(),
+            &[producer("p01-scheduled")],
+            ReadinessStage::Running,
+            &invalid,
+            &available(&invalid),
+        ),
+        Err(ReadinessError::InvalidDependencySet {
+            check: "not_required_requires_authority_artifact",
+            kind: DependencyKind::Presentation,
+        })
+    );
 }
 
 #[test]
