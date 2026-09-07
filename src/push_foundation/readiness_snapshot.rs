@@ -81,6 +81,10 @@ impl fmt::Debug for ReadinessEvidenceRef {
 }
 
 impl ReadinessEvidenceRef {
+    pub(super) fn dependency_kind(&self) -> DependencyKind {
+        self.dependency_kind
+    }
+
     pub(crate) fn new(
         dependency_kind: DependencyKind,
         kind: ReadinessEvidenceKind,
@@ -106,7 +110,7 @@ impl ReadinessEvidenceRef {
             && &self.source_contract_version == observation.version()
     }
 
-    fn canonical_value(&self) -> CanonicalValue {
+    pub(super) fn canonical_value(&self) -> CanonicalValue {
         CanonicalValue::Object(BTreeMap::from([
             ("dependency_kind", string(self.dependency_kind.as_str())),
             ("kind", string(self.kind.as_str())),
@@ -149,45 +153,7 @@ impl CandidateReadinessSnapshot {
         recovery_event_id: ReadinessRecoveryEventId,
         evidence_refs: Vec<ReadinessEvidenceRef>,
     ) -> Result<Self, ReadinessSnapshotError> {
-        let mut by_kind = BTreeMap::new();
-        for evidence in evidence_refs {
-            let kind = evidence.dependency_kind;
-            if by_kind.insert(kind, evidence).is_some() {
-                return Err(ReadinessSnapshotError::InvalidEvidenceSet {
-                    check: "duplicate_evidence",
-                    kind,
-                });
-            }
-        }
-        for observation in assessment.observations() {
-            let kind = observation.kind();
-            let evidence =
-                by_kind
-                    .get(&kind)
-                    .ok_or(ReadinessSnapshotError::InvalidEvidenceSet {
-                        check: "missing_evidence_ref",
-                        kind,
-                    })?;
-            if !evidence.matches(observation) {
-                return Err(ReadinessSnapshotError::InvalidEvidenceSet {
-                    check: "observation_evidence_mismatch",
-                    kind,
-                });
-            }
-        }
-        for kind in by_kind.keys() {
-            if !assessment
-                .observations()
-                .iter()
-                .any(|observation| observation.kind() == *kind)
-            {
-                return Err(ReadinessSnapshotError::InvalidEvidenceSet {
-                    check: "unobserved_evidence",
-                    kind: *kind,
-                });
-            }
-        }
-        let evidence_refs: Vec<_> = by_kind.into_values().collect();
+        let evidence_refs = normalize_snapshot_evidence(&assessment, evidence_refs)?;
         let fields = snapshot_fields(&context, &assessment, &recovery_event_id, &evidence_refs);
         let snapshot_id = canonical_digest(SNAPSHOT_DOMAIN, &fields);
         Ok(Self {
@@ -211,6 +177,9 @@ impl CandidateReadinessSnapshot {
     pub(crate) fn recovery_event_id(&self) -> &ReadinessRecoveryEventId {
         &self.recovery_event_id
     }
+    pub(super) fn evidence_refs(&self) -> &[ReadinessEvidenceRef] {
+        &self.evidence_refs
+    }
 
     /// Protected persistence bytes; never include these in errors or probe output.
     pub(crate) fn canonical_bytes(&self) -> Vec<u8> {
@@ -226,10 +195,76 @@ impl CandidateReadinessSnapshot {
     }
 }
 
+pub(super) fn normalize_snapshot_evidence(
+    assessment: &ReadinessAssessment,
+    evidence_refs: Vec<ReadinessEvidenceRef>,
+) -> Result<Vec<ReadinessEvidenceRef>, ReadinessSnapshotError> {
+    let mut by_kind = BTreeMap::new();
+    for evidence in evidence_refs {
+        let kind = evidence.dependency_kind;
+        if by_kind.insert(kind, evidence).is_some() {
+            return Err(ReadinessSnapshotError::InvalidEvidenceSet {
+                check: "duplicate_evidence",
+                kind,
+            });
+        }
+    }
+    for observation in assessment.observations() {
+        let kind = observation.kind();
+        let evidence = by_kind
+            .get(&kind)
+            .ok_or(ReadinessSnapshotError::InvalidEvidenceSet {
+                check: "missing_evidence_ref",
+                kind,
+            })?;
+        if !evidence.matches(observation) {
+            return Err(ReadinessSnapshotError::InvalidEvidenceSet {
+                check: "observation_evidence_mismatch",
+                kind,
+            });
+        }
+    }
+    for kind in by_kind.keys() {
+        if !assessment
+            .observations()
+            .iter()
+            .any(|observation| observation.kind() == *kind)
+        {
+            return Err(ReadinessSnapshotError::InvalidEvidenceSet {
+                check: "unobserved_evidence",
+                kind: *kind,
+            });
+        }
+    }
+    Ok(by_kind.into_values().collect())
+}
+
 fn snapshot_fields(
     context: &ReadinessSnapshotContext,
     assessment: &ReadinessAssessment,
     event: &ReadinessRecoveryEventId,
+    evidence: &[ReadinessEvidenceRef],
+) -> BTreeMap<&'static str, CanonicalValue> {
+    let mut fields = snapshot_material_fields(context, assessment, evidence);
+    fields.insert("recovery_event_id", string(event.as_str()));
+    fields
+}
+
+/// Hash the full after-material before an event ID exists, without a circular reference.
+pub(super) fn snapshot_material_digest(
+    context: &ReadinessSnapshotContext,
+    assessment: &ReadinessAssessment,
+    evidence: &[ReadinessEvidenceRef],
+) -> Sha256Digest {
+    canonical_digest(
+        "OperationalReadinessMaterial/v1",
+        &snapshot_material_fields(context, assessment, evidence),
+    )
+}
+
+fn snapshot_material_fields(
+    context: &ReadinessSnapshotContext,
+    assessment: &ReadinessAssessment,
     evidence: &[ReadinessEvidenceRef],
 ) -> BTreeMap<&'static str, CanonicalValue> {
     let observations: BTreeMap<_, _> = assessment
@@ -332,7 +367,6 @@ fn snapshot_fields(
                     .collect(),
             ),
         ),
-        ("recovery_event_id", string(event.as_str())),
         (
             "evidence_refs",
             CanonicalValue::Array(
@@ -398,7 +432,7 @@ fn scope_value(scope: &ReadinessScope) -> CanonicalValue {
     CanonicalValue::Object(fields)
 }
 
-fn observation_value(observation: &DependencyObservation) -> CanonicalValue {
+pub(super) fn observation_value(observation: &DependencyObservation) -> CanonicalValue {
     let (status, reason) = match observation {
         DependencyObservation::Available { .. } => ("Available", CanonicalValue::Null),
         DependencyObservation::Unavailable { reason, .. } => {

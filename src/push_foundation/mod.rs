@@ -8,8 +8,10 @@ mod migration;
 mod operational_readiness;
 mod phase_scheduler;
 mod readiness_probe;
+mod readiness_recovery;
 mod readiness_snapshot;
 mod readiness_snapshot_codec;
+mod readiness_store_schema;
 mod reconciler;
 mod terminal_authority;
 
@@ -36,9 +38,13 @@ mod phase_scheduler_tests;
 #[cfg(test)]
 mod readiness_probe_tests;
 #[cfg(test)]
+mod readiness_recovery_tests;
+#[cfg(test)]
 mod readiness_snapshot_tests;
 #[cfg(test)]
 mod readiness_snapshot_codec_tests;
+#[cfg(test)]
+mod readiness_store_schema_tests;
 #[cfg(test)]
 mod reconciler_tests;
 #[cfg(test)]
