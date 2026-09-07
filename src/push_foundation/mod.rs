@@ -1,5 +1,9 @@
 //! Additive push-foundation persistence. No production database is selected or migrated here.
 
+mod activation;
+mod activation_codec;
+mod activation_facts;
+mod activation_store;
 mod business_finalizer;
 mod dedicated_transport;
 mod generic_transport;
@@ -18,6 +22,11 @@ mod readiness_store_schema;
 mod reconciler;
 mod terminal_authority;
 
+pub use activation::{
+    ActivationManifest, DesiredActivationState, PromotionAction, PromotionJournalEntry,
+};
+pub use activation_facts::{ActivationReconciliation, RawActivationFacts, UnitActivationFacts};
+pub use activation_store::{inspect_raw_activation_facts, ActivationInspectError};
 pub use intent_store::{
     BusinessIntentStore, InitialDecisionKind, InitialIntentDraft, InitialIntentIdentity,
     InitialIntentOutcome, IntentSnapshot, IntentState, IntentStoreError, IntentTransitionCommand,
@@ -28,6 +37,8 @@ pub(crate) use intent_store::{InitialCommitFault, TransitionFault};
 pub use migration::{FoundationMigrationError, FoundationSchemaMigration, MigrationReceipt};
 pub use terminal_authority::TerminalTemplateBinding;
 
+#[cfg(test)]
+mod activation_facts_tests;
 #[cfg(test)]
 mod business_finalizer_tests;
 #[cfg(test)]
@@ -41,17 +52,17 @@ mod phase_scheduler_tests;
 #[cfg(test)]
 mod readiness_probe_tests;
 #[cfg(test)]
-mod readiness_recovery_tests;
-#[cfg(test)]
 mod readiness_recovery_codec_tests;
 #[cfg(test)]
-mod readiness_snapshot_tests;
+mod readiness_recovery_tests;
 #[cfg(test)]
 mod readiness_snapshot_codec_tests;
 #[cfg(test)]
-mod readiness_store_tests;
+mod readiness_snapshot_tests;
 #[cfg(test)]
 mod readiness_store_schema_tests;
+#[cfg(test)]
+mod readiness_store_tests;
 #[cfg(test)]
 mod reconciler_tests;
 #[cfg(test)]
