@@ -12,7 +12,9 @@ use super::business_finalizer::{
     NotDeliveredPreparationRequest, PendingAcceptedFinalization, VerifiedOperatorAuditRef,
     VerifiedResolutionClearance,
 };
-use super::terminal_authority::{terminal_binding_sha256, AuthorityAttemptBinding};
+use super::terminal_authority::{
+    terminal_binding_sha256, AuthorityAttemptBinding, AuthorityQuery, TerminalAuthorityError,
+};
 use super::terminal_authority_tests::{digest, fixture, FakeAuthority, Fixture};
 use super::{
     BusinessIntentStore, IntentSnapshot, IntentState, IntentStoreError, IntentTransitionCommand,
@@ -1026,5 +1028,89 @@ fn w10_not_delivered_rejects_accepted_history_and_wrong_disposition_without_writ
             .unwrap()
             .state(),
         IntentState::AwaitingAuthority
+    );
+}
+
+#[test]
+fn w10_failed_final_requery_appends_nonterminal_invalid_evidence() {
+    let fixture = fixture();
+    let authority = FakeAuthority::terminal(fixture.record.clone());
+    let mut store = BusinessIntentStore::open(&fixture.database).unwrap();
+    let awaiting = dispatch(&fixture, &mut store);
+    let pending = prepare_pending(&mut store, &fixture, &authority, &awaiting);
+    let qualified = store.inspect(&fixture.record.intent_id).unwrap().unwrap();
+    *authority.result.borrow_mut() = Ok(AuthorityQuery::PendingSeal);
+
+    let receipt = match commit_accepted_finalization(
+        &mut store,
+        pending,
+        &fixture.template,
+        &fixture.policy,
+        &authority,
+        micros(FINAL_VERIFIED_AT),
+        micros(FINAL_AT),
+    ) {
+        Err(BusinessFinalizerError::TerminalInvalid {
+            source: TerminalAuthorityError::TerminalPendingSeal,
+            receipt,
+        }) => receipt,
+        other => panic!("expected persisted terminal-invalid result, got {other:?}"),
+    };
+    assert_eq!(authority.calls.get(), 2);
+    assert_eq!(receipt.from_state(), IntentState::AwaitingFinalizer);
+    assert_eq!(receipt.to_state(), IntentState::AwaitingFinalizer);
+    assert_eq!(receipt.reason(), ReasonCode::FinalizerTerminalRefInvalid);
+    assert_eq!(receipt.terminal_disposition(), None);
+    let current = store.inspect(&fixture.record.intent_id).unwrap().unwrap();
+    assert_eq!(current.state(), IntentState::AwaitingFinalizer);
+    assert_eq!(current.version(), qualified.version() + 1);
+}
+
+#[test]
+fn w10_existing_resolution_is_reported_without_another_isolation_write() {
+    let fixture = fixture();
+    let authority = FakeAuthority::terminal(fixture.record.clone());
+    let mut store = BusinessIntentStore::open(&fixture.database).unwrap();
+    let awaiting = dispatch(&fixture, &mut store);
+    let pending = prepare_pending(&mut store, &fixture, &authority, &awaiting);
+    let qualified = store.inspect(&fixture.record.intent_id).unwrap().unwrap();
+    let isolate = IntentTransitionCommand::try_new(
+        fixture.record.intent_id.clone(),
+        IntentState::AwaitingFinalizer,
+        IntentState::ResolutionRequired,
+        qualified.version(),
+        TransitionActor::try_new("operator-2".to_owned()).unwrap(),
+        ReasonCode::OperatorResolutionConflict,
+        micros(FINAL_VERIFIED_AT),
+        LeaseAction::Preserve,
+    )
+    .unwrap();
+    store.apply_nonterminal_transition(&isolate).unwrap();
+    let isolated = store.inspect(&fixture.record.intent_id).unwrap().unwrap();
+    let chain_len = store
+        .inspect_transition_chain(&fixture.record.intent_id)
+        .unwrap()
+        .len();
+
+    assert!(matches!(
+        commit_accepted_finalization(
+            &mut store,
+            pending,
+            &fixture.template,
+            &fixture.policy,
+            &authority,
+            micros(FINAL_VERIFIED_AT),
+            micros(FINAL_AT),
+        ),
+        Err(BusinessFinalizerError::ConflictUnresolved { current })
+            if *current == isolated
+    ));
+    assert_eq!(authority.calls.get(), 1);
+    assert_eq!(
+        store
+            .inspect_transition_chain(&fixture.record.intent_id)
+            .unwrap()
+            .len(),
+        chain_len
     );
 }
