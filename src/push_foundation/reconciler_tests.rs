@@ -32,7 +32,6 @@ fn digest(byte: char) -> Sha256Digest {
 
 struct RecoveryFixture {
     _root: tempfile::TempDir,
-    database: std::path::PathBuf,
     store: BusinessIntentStore,
 }
 
@@ -45,11 +44,7 @@ impl RecoveryFixture {
             .apply_to(&database)
             .unwrap();
         let store = BusinessIntentStore::open(&database).unwrap();
-        Self {
-            _root: root,
-            database,
-            store,
-        }
+        Self { _root: root, store }
     }
 
     fn insert_ready(

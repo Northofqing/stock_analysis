@@ -458,6 +458,38 @@ impl InitialIntentDraft {
         ))
     }
 
+    #[cfg(test)]
+    pub(crate) fn ready_for_recovery_test(
+        identity: InitialIntentIdentity,
+        prepared_push_bytes: Vec<u8>,
+        rendered_bytes: Vec<u8>,
+        template_sha256: Sha256Digest,
+        source_contract_sha256: Sha256Digest,
+        created_at: UtcMicros,
+    ) -> Result<Self, IntentStoreError> {
+        if prepared_push_bytes.is_empty() || rendered_bytes.is_empty() {
+            return Err(IntentStoreError::InvalidInitialIntent {
+                check: "recovery_fixture_payload",
+            });
+        }
+        let payload_sha256 = raw_digest(&prepared_push_bytes);
+        let rendered_sha256 = raw_digest(&rendered_bytes);
+        Ok(Self::from_identity(
+            identity,
+            InitialDecisionKind::Ready,
+            Some(prepared_push_bytes),
+            Some(rendered_bytes),
+            Some(payload_sha256.clone()),
+            Some(rendered_sha256),
+            payload_sha256,
+            template_sha256,
+            source_contract_sha256,
+            IntentState::PendingDispatch,
+            ReasonCode::IntentCreated,
+            created_at,
+        ))
+    }
+
     pub fn no_data(
         identity: InitialIntentIdentity,
         evidence_sha256: Sha256Digest,
@@ -609,6 +641,9 @@ impl IntentSnapshot {
     pub fn namespace(&self) -> &str {
         &self.namespace
     }
+    pub fn business_date(&self) -> &str {
+        &self.business_date
+    }
     pub fn subject(&self) -> &str {
         &self.subject
     }
@@ -721,6 +756,21 @@ impl IntentSnapshot {
             && self.template_sha256 == draft.template_sha256
             && self.source_contract_sha256 == draft.source_contract_sha256
             && self.created_at == draft.created_at
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RecoveryCursor {
+    business_date: String,
+    intent_id: String,
+}
+
+impl RecoveryCursor {
+    pub(crate) fn after(snapshot: &IntentSnapshot) -> Self {
+        Self {
+            business_date: snapshot.business_date.clone(),
+            intent_id: snapshot.intent_id.clone(),
+        }
     }
 }
 
@@ -1033,6 +1083,117 @@ impl BusinessIntentStore {
         draft: &InitialIntentDraft,
     ) -> Result<InitialIntentOutcome, IntentStoreError> {
         self.record_initial_inner(draft, None)
+    }
+
+    pub(crate) fn scan_recovery_page(
+        &self,
+        after: Option<&RecoveryCursor>,
+        limit: usize,
+    ) -> Result<Vec<IntentSnapshot>, IntentStoreError> {
+        if !(1..=1_000).contains(&limit) {
+            return Err(IntentStoreError::InvalidTransition {
+                check: "recovery_page_size",
+            });
+        }
+        let limit = i64::try_from(limit).map_err(|_| IntentStoreError::InvalidTransition {
+            check: "recovery_page_size",
+        })?;
+        let after_business_date = after.map(|cursor| cursor.business_date.as_str());
+        let after_intent_id = after.map(|cursor| cursor.intent_id.as_str());
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT intent_id FROM push_intents \
+                 WHERE state IN ('PendingDispatch','AwaitingAuthority','AwaitingFinalizer','ResolutionRequired') \
+                   AND (?1 IS NULL OR business_date>?1 OR (business_date=?1 AND intent_id>?2)) \
+                 ORDER BY business_date ASC,intent_id ASC LIMIT ?3",
+            )
+            .map_err(|_| IntentStoreError::StorageFailed {
+                operation: "prepare_recovery_scan",
+            })?;
+        let rows = statement
+            .query_map(
+                params![after_business_date, after_intent_id, limit],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|_| IntentStoreError::StorageFailed {
+                operation: "query_recovery_scan",
+            })?;
+        let intent_ids = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|_| {
+            IntentStoreError::StorageFailed {
+                operation: "read_recovery_scan",
+            }
+        })?;
+        drop(statement);
+
+        let mut snapshots = Vec::with_capacity(intent_ids.len());
+        for intent_id in intent_ids {
+            let snapshot = query_intent(&self.connection, &intent_id)?
+                .ok_or_else(|| integrity("recovery_scan_missing_intent"))?;
+            if !matches!(
+                snapshot.state,
+                IntentState::PendingDispatch
+                    | IntentState::AwaitingAuthority
+                    | IntentState::AwaitingFinalizer
+                    | IntentState::ResolutionRequired
+            ) {
+                return Err(integrity("recovery_scan_state_changed"));
+            }
+            query_transition_chain(&self.connection, &snapshot)?;
+            snapshots.push(snapshot);
+        }
+        Ok(snapshots)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn claim_recovery_lease(
+        &mut self,
+        current: &IntentSnapshot,
+        owner: &LeaseOwnerId,
+        until: UtcMicros,
+        actor: &TransitionActor,
+        occurred_at: UtcMicros,
+    ) -> Result<TransitionOutcome, IntentStoreError> {
+        if !matches!(
+            current.state,
+            IntentState::PendingDispatch
+                | IntentState::AwaitingAuthority
+                | IntentState::AwaitingFinalizer
+        ) {
+            return Err(IntentStoreError::InvalidTransition {
+                check: "recovery_lease_state",
+            });
+        }
+        if until <= occurred_at {
+            return Err(IntentStoreError::InvalidTransition {
+                check: "recovery_lease_until",
+            });
+        }
+        if current
+            .lease_until
+            .is_some_and(|existing_until| existing_until > occurred_at)
+        {
+            return Err(IntentStoreError::InvalidTransition {
+                check: "recovery_lease_not_expired",
+            });
+        }
+        let intent = current.attested_ready_binding()?;
+        let command = StoreTransitionCommand {
+            intent_id: intent.intent_id,
+            from_state: current.state,
+            to_state: current.state,
+            expected_version: current.version,
+            actor: actor.clone(),
+            reason: ReasonCode::IntentDispatchClaimed,
+            occurred_at,
+            lease_action: LeaseAction::Acquire {
+                owner: owner.clone(),
+                until,
+            },
+            required_fence: None,
+            terminal: TerminalTransitionFields::default(),
+        };
+        self.apply_transition_inner(&command, None)
     }
 
     #[cfg(test)]
