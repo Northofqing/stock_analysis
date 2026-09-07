@@ -193,31 +193,54 @@ impl DependencyObservation {
 
     fn validate(&self) -> Result<(), ReadinessError> {
         if let Self::Unavailable { kind, reason, .. } = self {
-            if !matches!(
-                reason,
-                ReasonCode::InputSourceUnavailable
-                    | ReasonCode::InputSourceUnready
-                    | ReasonCode::InputEvidenceInvalid
-                    | ReasonCode::InputNoVerifiedBatch
-                    | ReasonCode::InputAccountSnapshotMissing
-                    | ReasonCode::InputNamespaceViolation
-                    | ReasonCode::ActivationCoreUnready
-                    | ReasonCode::ActivationProducerUnready
-                    | ReasonCode::ActivationManifestMismatch
-                    | ReasonCode::ActivationGenerationConflict
-                    | ReasonCode::ActivationOwnerConflict
-                    | ReasonCode::PolicyDisabled
-                    | ReasonCode::PolicyStarved
-                    | ReasonCode::PolicyOptInDisabled
-            ) {
-                return Err(ReadinessError::InvalidDependencySet {
-                    check: "invalid_unavailable_reason",
-                    kind: *kind,
-                });
+            match unavailable_reason_allows_kind(*reason, *kind) {
+                Some(true) => {}
+                Some(false) => {
+                    return Err(ReadinessError::InvalidDependencySet {
+                        check: "incompatible_unavailable_reason",
+                        kind: *kind,
+                    });
+                }
+                None => {
+                    return Err(ReadinessError::InvalidDependencySet {
+                        check: "invalid_unavailable_reason",
+                        kind: *kind,
+                    });
+                }
             }
         }
         Ok(())
     }
+}
+
+fn unavailable_reason_allows_kind(reason: ReasonCode, kind: DependencyKind) -> Option<bool> {
+    let allowed = match reason {
+        ReasonCode::ActivationCoreUnready => CORE_DEPENDENCIES.contains(&kind),
+        ReasonCode::ActivationProducerUnready => PRODUCER_DEPENDENCIES.contains(&kind),
+        ReasonCode::ActivationManifestMismatch | ReasonCode::ActivationGenerationConflict => {
+            kind == DependencyKind::Manifest
+        }
+        ReasonCode::ActivationOwnerConflict => kind == DependencyKind::ProducerBinding,
+        ReasonCode::PolicyDisabled
+        | ReasonCode::PolicyStarved
+        | ReasonCode::PolicyOptInDisabled => kind == DependencyKind::FeatureGate,
+        ReasonCode::InputSourceUnavailable
+        | ReasonCode::InputSourceUnready
+        | ReasonCode::InputNoVerifiedBatch
+        | ReasonCode::InputAccountSnapshotMissing => matches!(
+            kind,
+            DependencyKind::SourceContract | DependencyKind::OccurrenceInput
+        ),
+        ReasonCode::InputNamespaceViolation => matches!(
+            kind,
+            DependencyKind::Namespace
+                | DependencyKind::SourceContract
+                | DependencyKind::OccurrenceInput
+        ),
+        ReasonCode::InputEvidenceInvalid => true,
+        _ => return None,
+    };
+    Some(allowed)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

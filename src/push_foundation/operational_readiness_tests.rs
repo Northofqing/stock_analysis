@@ -68,6 +68,45 @@ fn available(requirements: &[DependencyRequirement]) -> Vec<DependencyObservatio
         .collect()
 }
 
+fn assess_unavailable(
+    kind: DependencyKind,
+    reason: ReasonCode,
+) -> Result<ReadinessAssessment, ReadinessError> {
+    let catalog = MachineCatalog::bundled().expect("TEST_CODE catalog");
+    let core = core_requirements();
+    let (scope, declared) = if core.iter().any(|required| required.kind == kind) {
+        (ReadinessScope::Core, core)
+    } else if kind == DependencyKind::OccurrenceInput {
+        let mut occurrence = producer_requirements();
+        occurrence.extend(requirements(&[DependencyKind::OccurrenceInput]));
+        (occurrence_scope(), occurrence)
+    } else {
+        (p01_scope(), producer_requirements())
+    };
+    let index = declared
+        .iter()
+        .position(|required| required.kind == kind)
+        .expect("TEST_CODE declared dependency kind");
+    let required = declared[index].clone();
+    let mut observed = available(&declared);
+    observed[index] = DependencyObservation::Unavailable {
+        kind,
+        contract_id: required.contract_id,
+        version: required.version,
+        evidence_sha256: Sha256Digest::parse("TEST_CODE unavailable evidence", &"d".repeat(64))
+            .expect("TEST_CODE digest"),
+        reason,
+    };
+    ReadinessAssessment::evaluate(
+        &catalog,
+        &scope,
+        &[producer("p01-scheduled")],
+        ReadinessStage::Running,
+        &declared,
+        &observed,
+    )
+}
+
 fn p01_scope() -> ReadinessScope {
     ReadinessScope::Producer {
         unit_id: unit("MU-p01"),
@@ -517,7 +556,15 @@ fn w15_explicit_unavailable_evidence_retains_failure_reason_without_becoming_no_
     );
     assert!(blocked.observations().contains(&failed));
 
-    for reason in [ReasonCode::ActivationReady, ReasonCode::IntentNoData] {
+    for reason in [
+        ReasonCode::ActivationReady,
+        ReasonCode::IntentNoData,
+        ReasonCode::InputSourceRecovered,
+        ReasonCode::TransportRejected,
+        ReasonCode::FinalizerCasConflict,
+        ReasonCode::FinalizerCompleted,
+        ReasonCode::ActivationApplied,
+    ] {
         let mut invalid = observed.clone();
         invalid.pop();
         invalid.push(DependencyObservation::Unavailable {
@@ -541,6 +588,171 @@ fn w15_explicit_unavailable_evidence_retains_failure_reason_without_becoming_no_
                 check: "invalid_unavailable_reason",
                 kind: DependencyKind::OccurrenceInput
             })
+        );
+    }
+}
+
+#[test]
+fn w15_unavailable_reason_must_match_the_dependency_role() {
+    for (kind, reason) in [
+        (
+            DependencyKind::OccurrenceInput,
+            ReasonCode::ActivationCoreUnready,
+        ),
+        (
+            DependencyKind::OccurrenceInput,
+            ReasonCode::ActivationProducerUnready,
+        ),
+        (
+            DependencyKind::Schema,
+            ReasonCode::ActivationManifestMismatch,
+        ),
+        (
+            DependencyKind::Namespace,
+            ReasonCode::ActivationGenerationConflict,
+        ),
+        (
+            DependencyKind::SourceContract,
+            ReasonCode::ActivationOwnerConflict,
+        ),
+        (DependencyKind::ProducerBinding, ReasonCode::PolicyDisabled),
+        (
+            DependencyKind::FeatureGate,
+            ReasonCode::InputSourceUnavailable,
+        ),
+        (DependencyKind::Durable, ReasonCode::InputNamespaceViolation),
+    ] {
+        assert_eq!(
+            assess_unavailable(kind, reason),
+            Err(ReadinessError::InvalidDependencySet {
+                check: "incompatible_unavailable_reason",
+                kind,
+            })
+        );
+    }
+}
+
+#[test]
+fn w15_compatible_unavailable_reasons_preserve_role_classification() {
+    let core_kinds: Vec<_> = core_requirements()
+        .into_iter()
+        .map(|required| required.kind)
+        .collect();
+    let producer_kinds: Vec<_> = producer_requirements()
+        .into_iter()
+        .map(|required| required.kind)
+        .collect();
+    let mut accepted = Vec::new();
+    accepted.extend(core_kinds.iter().copied().map(|kind| {
+        (
+            kind,
+            ReasonCode::ActivationCoreUnready,
+            ReadinessStatus::CoreUnready,
+        )
+    }));
+    accepted.extend(producer_kinds.iter().copied().map(|kind| {
+        (
+            kind,
+            ReasonCode::ActivationProducerUnready,
+            ReadinessStatus::ProducerUnready,
+        )
+    }));
+    accepted.extend([
+        (
+            DependencyKind::Manifest,
+            ReasonCode::ActivationManifestMismatch,
+            ReadinessStatus::CoreUnready,
+        ),
+        (
+            DependencyKind::Manifest,
+            ReasonCode::ActivationGenerationConflict,
+            ReadinessStatus::CoreUnready,
+        ),
+        (
+            DependencyKind::ProducerBinding,
+            ReasonCode::ActivationOwnerConflict,
+            ReadinessStatus::ProducerUnready,
+        ),
+        (
+            DependencyKind::FeatureGate,
+            ReasonCode::PolicyDisabled,
+            ReadinessStatus::ProducerUnready,
+        ),
+        (
+            DependencyKind::FeatureGate,
+            ReasonCode::PolicyStarved,
+            ReadinessStatus::ProducerUnready,
+        ),
+        (
+            DependencyKind::FeatureGate,
+            ReasonCode::PolicyOptInDisabled,
+            ReadinessStatus::ProducerUnready,
+        ),
+    ]);
+    for reason in [
+        ReasonCode::InputSourceUnavailable,
+        ReasonCode::InputSourceUnready,
+        ReasonCode::InputNoVerifiedBatch,
+        ReasonCode::InputAccountSnapshotMissing,
+    ] {
+        accepted.extend([
+            (
+                DependencyKind::SourceContract,
+                reason,
+                ReadinessStatus::ProducerUnready,
+            ),
+            (
+                DependencyKind::OccurrenceInput,
+                reason,
+                ReadinessStatus::BlockedOnInput,
+            ),
+        ]);
+    }
+    accepted.extend([
+        (
+            DependencyKind::Namespace,
+            ReasonCode::InputNamespaceViolation,
+            ReadinessStatus::CoreUnready,
+        ),
+        (
+            DependencyKind::SourceContract,
+            ReasonCode::InputNamespaceViolation,
+            ReadinessStatus::ProducerUnready,
+        ),
+        (
+            DependencyKind::OccurrenceInput,
+            ReasonCode::InputNamespaceViolation,
+            ReadinessStatus::BlockedOnInput,
+        ),
+    ]);
+    let all_kinds = core_kinds
+        .iter()
+        .copied()
+        .chain(producer_kinds.iter().copied())
+        .chain([DependencyKind::OccurrenceInput]);
+    accepted.extend(all_kinds.map(|kind| {
+        let status = if kind == DependencyKind::OccurrenceInput {
+            ReadinessStatus::BlockedOnInput
+        } else if core_kinds.contains(&kind) {
+            ReadinessStatus::CoreUnready
+        } else {
+            ReadinessStatus::ProducerUnready
+        };
+        (kind, ReasonCode::InputEvidenceInvalid, status)
+    }));
+
+    for (kind, reason, status) in accepted {
+        let assessment = assess_unavailable(kind, reason).expect("TEST_CODE compatible reason");
+        assert_eq!(assessment.status(), status, "{kind:?} {reason:?}");
+        assert_eq!(
+            assessment.deployment_ready(),
+            status == ReadinessStatus::BlockedOnInput,
+            "{kind:?} {reason:?}"
+        );
+        assert_eq!(
+            assessment.failures(),
+            &[(kind, DependencyFailure::Unavailable { reason })],
+            "{kind:?} {reason:?}"
         );
     }
 }
