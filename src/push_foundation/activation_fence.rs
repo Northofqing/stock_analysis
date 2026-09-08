@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
+use super::activation_business_effect::{BusinessEffect, BusinessRecoveryResult};
 use super::activation_fence_store::{CompletionFault, OperationStore};
 use super::activation_generic_effect::{GenericEffect, GenericEffectResult};
 use super::intent_store::{BusinessIntentStore, InitialIntentDraft};
@@ -132,6 +133,19 @@ pub(super) struct InitialIntentResult {
 pub(super) enum EffectResult {
     InitialIntent(InitialIntentResult),
     Generic(GenericEffectResult),
+    BusinessRecovery(Box<BusinessRecoveryResult>),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BusinessResultWire {
+    kind: BusinessResultKind,
+    result: Box<BusinessRecoveryResult>,
+}
+
+#[derive(Serialize, Deserialize)]
+enum BusinessResultKind {
+    BusinessRecovery,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -155,6 +169,11 @@ impl Serialize for EffectResult {
                 result: result.clone(),
             }
             .serialize(serializer),
+            Self::BusinessRecovery(result) => BusinessResultWire {
+                kind: BusinessResultKind::BusinessRecovery,
+                result: result.clone(),
+            }
+            .serialize(serializer),
         }
     }
 }
@@ -162,7 +181,11 @@ impl Serialize for EffectResult {
 impl<'de> Deserialize<'de> for EffectResult {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = serde_json::Value::deserialize(deserializer)?;
-        if value.get("kind").is_some() {
+        if value.get("kind").and_then(serde_json::Value::as_str) == Some("BusinessRecovery") {
+            serde_json::from_value::<BusinessResultWire>(value)
+                .map(|wire| Self::BusinessRecovery(wire.result))
+                .map_err(serde::de::Error::custom)
+        } else if value.get("kind").is_some() {
             serde_json::from_value::<GenericResultWire>(value)
                 .map(|wire| Self::Generic(wire.result))
                 .map_err(serde::de::Error::custom)
@@ -179,6 +202,7 @@ impl EffectResult {
         match self {
             Self::InitialIntent(_) => true,
             Self::Generic(result) => result.is_resolved(),
+            Self::BusinessRecovery(result) => result.is_resolved(),
         }
     }
 
@@ -195,6 +219,7 @@ impl EffectResult {
                 Ok(())
             }
             Self::Generic(result) => result.validate(request),
+            Self::BusinessRecovery(result) => result.validate(request),
         }
     }
 
@@ -202,7 +227,7 @@ impl EffectResult {
     pub(super) fn as_initial(&self) -> &InitialIntentResult {
         match self {
             Self::InitialIntent(result) => result,
-            Self::Generic(_) => panic!("expected initial result"),
+            Self::Generic(_) | Self::BusinessRecovery(_) => panic!("expected initial result"),
         }
     }
 }
@@ -354,6 +379,7 @@ enum FixedEffect {
     InitialIntent(Box<InitialIntentEffect>),
     GenericDispatch(GenericEffect),
     GenericReconcile(GenericEffect),
+    BusinessRecovery(Box<BusinessEffect>),
 }
 
 impl FixedEffect {
@@ -373,6 +399,13 @@ impl FixedEffect {
                 effect.kind().action(),
                 effect.kind().class(),
             ),
+            Self::BusinessRecovery(effect) => (
+                "business-reconcile",
+                effect.digest(),
+                "Finalizer",
+                "ReconcileBusiness",
+                WorkClass::Recovery,
+            ),
         }
     }
     fn execute(&self, context: &ExecutionContext) -> Result<EffectResult, FenceError> {
@@ -381,6 +414,10 @@ impl FixedEffect {
             Self::GenericDispatch(effect) | Self::GenericReconcile(effect) => {
                 effect.execute(context).map(EffectResult::Generic)
             }
+            Self::BusinessRecovery(effect) => effect
+                .execute(context)
+                .map(Box::new)
+                .map(EffectResult::BusinessRecovery),
         }
     }
 }
@@ -406,6 +443,87 @@ pub(super) struct ExecutionContext {
 }
 
 impl ExecutionContext {
+    pub(super) fn authorize_business(&self, digest: &str, scope: &Scope) -> Result<(), FenceError> {
+        let state = self.state.lock().map_err(|_| FenceError::Store)?;
+        if &self.request.scope != scope
+            || self.request.effect_id != "business-reconcile"
+            || self.request.effect_sha256 != digest
+            || self.request.actor != "Finalizer"
+            || self.request.action != "ReconcileBusiness"
+            || self.request.work_class != WorkClass::Recovery
+            || !state.active.contains(&self.request.operation_id)
+            || state.confirmation_blocked
+            || !matches!(
+                state.store.query(&self.request)?,
+                Some(OperationFact {
+                    state: OperationState::Running,
+                    ..
+                })
+            )
+        {
+            return Err(FenceError::EffectMismatch);
+        }
+        Ok(())
+    }
+
+    pub(super) fn operation_binding(&self) -> String {
+        self.request.digest()
+    }
+
+    #[cfg(test)]
+    pub(super) fn business_commit_ack_lost(&self) -> bool {
+        self.hooks.business_commit_ack_lost
+    }
+
+    #[cfg(test)]
+    pub(super) fn pending_source_binding(&self) -> Result<Option<String>, FenceError> {
+        let Some(operation) = &self.hooks.business_pending_source_operation else {
+            return Ok(None);
+        };
+        if operation == &self.request.operation_id {
+            return Err(FenceError::EffectMismatch);
+        }
+        let mut source = self.request.clone();
+        source.operation_id = operation.clone();
+        let state = self.state.lock().map_err(|_| FenceError::Store)?;
+        if !state.active.contains(operation)
+            || !matches!(
+                state.store.query(&source)?,
+                Some(OperationFact {
+                    state: OperationState::Running,
+                    ..
+                })
+            )
+        {
+            return Err(FenceError::EffectMismatch);
+        }
+        Ok(Some(source.digest()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn business_requery_pause(&self) -> Result<(), FenceError> {
+        use std::io::{Read, Write};
+        if let Some(path) = &self.hooks.business_requery_pause_socket {
+            let mut stream =
+                std::os::unix::net::UnixStream::connect(path).map_err(|_| FenceError::Protocol)?;
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+                .map_err(|_| FenceError::Protocol)?;
+            stream
+                .set_write_timeout(Some(std::time::Duration::from_secs(20)))
+                .map_err(|_| FenceError::Protocol)?;
+            stream.write_all(b"P").map_err(|_| FenceError::Protocol)?;
+            let mut ack = [0];
+            stream
+                .read_exact(&mut ack)
+                .map_err(|_| FenceError::Protocol)?;
+            if ack != *b"G" {
+                return Err(FenceError::Protocol);
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn authorize_generic(
         &self,
         effect: &GenericEffect,
@@ -576,6 +694,12 @@ impl EffectBroker {
             || request.actor != actor
             || request.action != action
             || request.work_class != class
+            || (id == "business-reconcile"
+                && !self.clients.iter().any(|client| {
+                    client.client == request.client
+                        && client.incarnation == request.client_incarnation
+                        && !client.supervisor
+                }))
         {
             return Err(FenceError::EffectMismatch);
         }
@@ -779,6 +903,34 @@ impl EffectBroker {
     }
 
     #[cfg(test)]
+    pub(super) fn test_business_fixture(
+        control: &Path,
+        scope: Scope,
+        epoch: String,
+        fixture: super::activation_business_effect::BusinessEffectFixture,
+        clients: Vec<TestClient>,
+        hooks: TestHooks,
+    ) -> Result<Self, FenceError> {
+        let effect = BusinessEffect::bind_fixture(&scope, fixture)?;
+        Self::test_bound_fixture(
+            control,
+            scope,
+            epoch,
+            BTreeMap::from([(
+                "business-reconcile".into(),
+                Arc::new(FixedEffect::BusinessRecovery(Box::new(effect))),
+            )]),
+            clients,
+            hooks,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_business_request(&self, operation: &str) -> EffectRequest {
+        self.test_effect_request(operation, "business-reconcile")
+    }
+
+    #[cfg(test)]
     pub(super) fn test_request(&self, operation: &str) -> EffectRequest {
         self.test_effect_request(operation, "initial-intent")
     }
@@ -819,6 +971,8 @@ impl EffectBroker {
 #[cfg(test)]
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(super) struct TestHooks {
+    pub(super) business_pending_source_operation: Option<String>,
+    pub(super) business_requery_pause_socket: Option<PathBuf>,
     pub(super) pause_socket: Option<PathBuf>,
     pub(super) registration_failure: bool,
     pub(super) effect_started_failure: bool,

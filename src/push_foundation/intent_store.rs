@@ -918,11 +918,13 @@ impl IntentSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) struct RecoveryCursor {
     business_date: String,
     intent_id: String,
 }
 
+#[cfg(test)]
 impl RecoveryCursor {
     pub(crate) fn after(snapshot: &IntentSnapshot) -> Self {
         Self {
@@ -1192,6 +1194,11 @@ pub struct BusinessIntentStore {
 }
 
 impl BusinessIntentStore {
+    #[cfg(unix)]
+    pub(super) fn activation_database_path(&self) -> Option<&str> {
+        self.connection.path()
+    }
+
     pub fn open(database: &Path) -> Result<Self, IntentStoreError> {
         validate_database_path(database)?;
         match fs::symlink_metadata(database) {
@@ -1260,6 +1267,7 @@ impl BusinessIntentStore {
         Ok(raw_digest(&bytes).as_str().to_owned())
     }
 
+    #[cfg(test)]
     pub(crate) fn scan_recovery_page(
         &self,
         after: Option<&RecoveryCursor>,

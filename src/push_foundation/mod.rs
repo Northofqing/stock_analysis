@@ -2,6 +2,8 @@
 
 mod activation;
 mod activation_authorization;
+#[cfg(unix)]
+mod activation_business_effect;
 mod activation_codec;
 mod activation_deployment;
 mod activation_facts;
@@ -52,6 +54,8 @@ pub use terminal_authority::TerminalTemplateBinding;
 
 #[cfg(test)]
 mod activation_authorization_tests;
+#[cfg(all(test, unix))]
+mod activation_business_process_tests;
 #[cfg(test)]
 mod activation_deployment_tests;
 #[cfg(test)]

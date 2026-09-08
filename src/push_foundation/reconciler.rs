@@ -4,16 +4,20 @@
 
 use std::collections::BTreeMap;
 
-use crate::monitor::push_job::{CompletionPolicy, ReasonCode, TerminalDisposition, UtcMicros};
-
-use super::business_finalizer::{
-    commit_accepted_finalization, prepare_accepted_finalization, AcceptedFinalizationOutcome,
-    AcceptedPreparationOutcome, AcceptedPreparationRequest, BusinessFinalizerError, FinalizerFence,
+use crate::monitor::push_job::{
+    CanonicalValue, CompletionPolicy, ReasonCode, TerminalDisposition, UtcMicros,
 };
 
+use super::business_finalizer::{
+    AcceptedFinalizationOutcome, AcceptedPreparationOutcome, AcceptedPreparationRequest,
+    BusinessFinalizerError, FinalizerExecution, FinalizerFence,
+};
+
+#[cfg(test)]
+use super::intent_store::RecoveryCursor;
 use super::intent_store::{
     AttestedReadyIntent, BusinessIntentStore, IntentSnapshot, IntentState, IntentStoreError,
-    LeaseOwnerId, RecoveryCursor, TransitionActor, TransitionOutcome,
+    LeaseOwnerId, TransitionActor, TransitionOutcome,
 };
 use super::terminal_authority::{
     verify_terminal, TerminalAuthorityError, TerminalAuthorityPort, TerminalTemplateBinding,
@@ -63,6 +67,23 @@ pub(crate) struct RecoveryConfig {
 }
 
 impl RecoveryConfig {
+    pub(super) fn activation_fields(&self) -> BTreeMap<&'static str, CanonicalValue> {
+        BTreeMap::from([
+            ("owner", CanonicalValue::String(self.owner.as_str().into())),
+            ("actor", CanonicalValue::String(self.actor.as_str().into())),
+            ("now", CanonicalValue::String(self.now.get().to_string())),
+            (
+                "lease_until",
+                CanonicalValue::String(self.lease_until.get().to_string()),
+            ),
+            ("page_size", CanonicalValue::Unsigned(self.page_size as u64)),
+            (
+                "max_iterations",
+                CanonicalValue::Unsigned(self.max_iterations as u64),
+            ),
+        ])
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
         owner: LeaseOwnerId,
@@ -252,6 +273,7 @@ impl From<BusinessFinalizerError> for RecoveryError {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn reconcile_startup(
     store: &mut BusinessIntentStore,
     config: &RecoveryConfig,
@@ -271,8 +293,13 @@ pub(crate) fn reconcile_startup(
             cursor = page.last().map(RecoveryCursor::after);
             for candidate in page {
                 let before_version = candidate.version();
-                let (current, boundary, applied) =
-                    reconcile_one(store, candidate, config, bindings)?;
+                let (current, boundary, applied) = reconcile_one(
+                    store,
+                    candidate,
+                    config,
+                    bindings,
+                    &FinalizerExecution::Legacy,
+                )?;
                 transition_count = transition_count.checked_add(applied).ok_or(
                     IntentStoreError::IntegrityFailed {
                         check: "recovery_transition_count_overflow",
@@ -306,11 +333,54 @@ pub(crate) fn reconcile_startup(
     Err(RecoveryError::IterationLimitExceeded)
 }
 
+#[cfg(unix)]
+pub(super) fn reconcile_current(
+    execution: &super::activation_business_effect::BusinessExecution<'_>,
+    store: &mut BusinessIntentStore,
+    candidate: IntentSnapshot,
+    config: &RecoveryConfig,
+    bindings: &dyn RecoveryBindingsPort,
+) -> Result<RecoveryEntry, RecoveryError> {
+    execution
+        .check(store, candidate.intent_id())
+        .map_err(|_| RecoveryError::Finalizer {
+            check: "activation_context",
+        })?;
+    // Startup's scan excludes terminal rows. A precise restart registration may include one;
+    // its completed lease must stay released while the worker independently confirms it.
+    let (current, boundary, _) = if matches!(
+        candidate.state(),
+        IntentState::Completed
+            | IntentState::NotDelivered
+            | IntentState::NoData
+            | IntentState::Disabled
+    ) {
+        (candidate, RecoveryBoundary::Finalized, 0)
+    } else {
+        reconcile_one(
+            store,
+            candidate,
+            config,
+            bindings,
+            &FinalizerExecution::Current(execution),
+        )?
+    };
+    Ok(RecoveryEntry {
+        business_date: current.business_date().into(),
+        intent_id: current.intent_id().into(),
+        state: current.state(),
+        version: current.version(),
+        lease_generation: current.lease_generation(),
+        boundary,
+    })
+}
+
 fn reconcile_one(
     store: &mut BusinessIntentStore,
     candidate: IntentSnapshot,
     config: &RecoveryConfig,
     bindings: &dyn RecoveryBindingsPort,
+    execution: &FinalizerExecution<'_>,
 ) -> Result<(IntentSnapshot, RecoveryBoundary, usize), RecoveryError> {
     if candidate.state() == IntentState::ResolutionRequired {
         return Ok((candidate, RecoveryBoundary::ManualResolutionRequired, 0));
@@ -326,7 +396,7 @@ fn reconcile_one(
         IntentState::AwaitingAuthority | IntentState::AwaitingFinalizer => {
             let intent = current.attested_ready_binding()?;
             let resolved = bindings.resolve(&intent)?;
-            reconcile_authority(store, current, config, resolved, applied)
+            reconcile_authority(store, current, config, resolved, applied, execution)
         }
         IntentState::ResolutionRequired => {
             Ok((current, RecoveryBoundary::ManualResolutionRequired, applied))
@@ -344,6 +414,7 @@ fn reconcile_authority(
     config: &RecoveryConfig,
     bindings: RecoveryBindings<'_>,
     applied_before_authority: usize,
+    execution: &FinalizerExecution<'_>,
 ) -> Result<(IntentSnapshot, RecoveryBoundary, usize), RecoveryError> {
     let intent = current.attested_ready_binding()?;
     let lease_until = current
@@ -395,7 +466,7 @@ fn reconcile_authority(
         config.now,
         config.now,
     )?;
-    match prepare_accepted_finalization(
+    match execution.prepare_accepted(
         store,
         request,
         bindings.template,
@@ -403,7 +474,7 @@ fn reconcile_authority(
         bindings.authority,
     ) {
         Ok(AcceptedPreparationOutcome::Pending(pending)) => {
-            let outcome = match commit_accepted_finalization(
+            let outcome = match execution.commit_accepted(
                 store,
                 pending,
                 bindings.template,

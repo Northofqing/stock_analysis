@@ -107,6 +107,10 @@ fn completion_bytes(request: &EffectRequest, fact: &OperationFact) -> Result<Vec
             fields.extend(result.canonical_fields());
             "ActivationGenericTransportWorkerCompletion/v1"
         }
+        EffectResult::BusinessRecovery(result) => {
+            fields.insert("result", CanonicalValue::Object(result.canonical_fields()));
+            "ActivationBusinessRecoveryWorkerCompletion/v1"
+        }
     };
     Ok(canonical_preimage(domain, &fields))
 }

@@ -130,7 +130,8 @@ impl AcceptedPreparationRequest {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct PendingAcceptedFinalization {
-    prior: VerifiedTerminalRef,
+    activation_operation: Option<String>,
+    prior: Box<VerifiedTerminalRef>,
     intent_id: IntentId,
     qualified_version: u64,
     actor: TransitionActor,
@@ -257,6 +258,7 @@ impl NotDeliveredPreparationRequest {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct PendingNotDeliveredFinalization {
+    activation_operation: Option<String>,
     prior: VerifiedTerminalRef,
     intent_id: IntentId,
     source_state: IntentState,
@@ -349,7 +351,187 @@ pub(crate) enum BusinessFinalizerError {
     NotDeliveredHistoryIneligible,
 }
 
+/// Borrowed from one running worker; pending values contain no reusable permit.
+pub(super) enum FinalizerExecution<'a> {
+    #[cfg(unix)]
+    Current(&'a super::activation_business_effect::BusinessExecution<'a>),
+    #[cfg(test)]
+    Legacy,
+    #[cfg(not(unix))]
+    Denied(std::marker::PhantomData<&'a ()>),
+}
+
+impl FinalizerExecution<'_> {
+    fn check(
+        &self,
+        store: &BusinessIntentStore,
+        intent: &IntentId,
+    ) -> Result<Option<String>, BusinessFinalizerError> {
+        match self {
+            #[cfg(unix)]
+            Self::Current(execution) => {
+                execution
+                    .check(store, intent.as_str())
+                    .map_err(|_| BusinessFinalizerError::FenceMismatch)?;
+                Ok(Some(execution.operation_binding()))
+            }
+            #[cfg(test)]
+            Self::Legacy => Ok(None),
+            #[cfg(not(unix))]
+            Self::Denied(_) => Err(BusinessFinalizerError::FenceMismatch),
+        }
+    }
+
+    pub(super) fn prepare_accepted(
+        &self,
+        store: &mut BusinessIntentStore,
+        request: AcceptedPreparationRequest,
+        template: &TerminalTemplateBinding,
+        policy: &CompletionPolicy,
+        authority: &dyn TerminalAuthorityPort,
+    ) -> Result<AcceptedPreparationOutcome, BusinessFinalizerError> {
+        let operation = self.check(store, &request.intent_id)?;
+        let mut outcome =
+            prepare_accepted_finalization_inner(store, request, template, policy, authority)?;
+        if let AcceptedPreparationOutcome::Pending(pending) = &mut outcome {
+            pending.activation_operation = operation;
+            #[cfg(all(test, unix))]
+            if let Self::Current(execution) = self {
+                if let Some(source) = execution
+                    .pending_source_binding()
+                    .map_err(|_| BusinessFinalizerError::FenceMismatch)?
+                {
+                    pending.activation_operation = Some(source);
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn commit_accepted(
+        &self,
+        store: &mut BusinessIntentStore,
+        pending: PendingAcceptedFinalization,
+        template: &TerminalTemplateBinding,
+        policy: &CompletionPolicy,
+        authority: &dyn TerminalAuthorityPort,
+        verified_at: UtcMicros,
+        occurred_at: UtcMicros,
+    ) -> Result<AcceptedFinalizationOutcome, BusinessFinalizerError> {
+        let operation = self.check(store, &pending.intent_id)?;
+        if operation != pending.activation_operation {
+            return Err(BusinessFinalizerError::FenceMismatch);
+        }
+        let mode = FinalizerStoreMode::Normal;
+        #[cfg(all(test, unix))]
+        let mode = if matches!(self, Self::Current(execution) if execution.business_commit_ack_lost())
+        {
+            FinalizerStoreMode::Fault(FinalizerFault::AfterCommitAckLost)
+        } else {
+            mode
+        };
+        commit_accepted_finalization_inner(
+            store,
+            pending,
+            template,
+            policy,
+            authority,
+            verified_at,
+            occurred_at,
+            mode,
+        )
+    }
+
+    pub(super) fn prepare_not_delivered(
+        &self,
+        store: &mut BusinessIntentStore,
+        request: NotDeliveredPreparationRequest,
+        template: &TerminalTemplateBinding,
+        policy: &CompletionPolicy,
+        authority: &dyn TerminalAuthorityPort,
+    ) -> Result<NotDeliveredPreparationOutcome, BusinessFinalizerError> {
+        let operation = self.check(store, &request.intent_id)?;
+        let mut outcome =
+            prepare_not_delivered_finalization_inner(store, request, template, policy, authority)?;
+        if let NotDeliveredPreparationOutcome::Pending(pending) = &mut outcome {
+            pending.activation_operation = operation;
+        }
+        Ok(outcome)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn commit_not_delivered(
+        &self,
+        store: &mut BusinessIntentStore,
+        pending: Box<PendingNotDeliveredFinalization>,
+        template: &TerminalTemplateBinding,
+        policy: &CompletionPolicy,
+        authority: &dyn TerminalAuthorityPort,
+        verified_at: UtcMicros,
+        occurred_at: UtcMicros,
+    ) -> Result<NotDeliveredFinalizationOutcome, BusinessFinalizerError> {
+        let operation = self.check(store, &pending.intent_id)?;
+        if operation != pending.activation_operation {
+            return Err(BusinessFinalizerError::FenceMismatch);
+        }
+        commit_not_delivered_finalization_inner(
+            store,
+            pending,
+            template,
+            policy,
+            authority,
+            verified_at,
+            occurred_at,
+        )
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn prepare_accepted_finalization(
+    store: &mut BusinessIntentStore,
+    request: AcceptedPreparationRequest,
+    template: &TerminalTemplateBinding,
+    policy: &CompletionPolicy,
+    authority: &dyn TerminalAuthorityPort,
+) -> Result<AcceptedPreparationOutcome, BusinessFinalizerError> {
+    prepare_accepted_finalization_inner(store, request, template, policy, authority)
+}
+
+#[cfg(test)]
+pub(crate) fn prepare_not_delivered_finalization(
+    store: &mut BusinessIntentStore,
+    request: NotDeliveredPreparationRequest,
+    template: &TerminalTemplateBinding,
+    policy: &CompletionPolicy,
+    authority: &dyn TerminalAuthorityPort,
+) -> Result<NotDeliveredPreparationOutcome, BusinessFinalizerError> {
+    prepare_not_delivered_finalization_inner(store, request, template, policy, authority)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn commit_not_delivered_finalization(
+    store: &mut BusinessIntentStore,
+    pending: Box<PendingNotDeliveredFinalization>,
+    template: &TerminalTemplateBinding,
+    policy: &CompletionPolicy,
+    authority: &dyn TerminalAuthorityPort,
+    verified_at: UtcMicros,
+    occurred_at: UtcMicros,
+) -> Result<NotDeliveredFinalizationOutcome, BusinessFinalizerError> {
+    commit_not_delivered_finalization_inner(
+        store,
+        pending,
+        template,
+        policy,
+        authority,
+        verified_at,
+        occurred_at,
+    )
+}
+
+fn prepare_accepted_finalization_inner(
     store: &mut BusinessIntentStore,
     request: AcceptedPreparationRequest,
     template: &TerminalTemplateBinding,
@@ -436,7 +618,8 @@ pub(crate) fn prepare_accepted_finalization(
 
     Ok(AcceptedPreparationOutcome::Pending(
         PendingAcceptedFinalization {
-            prior,
+            activation_operation: None,
+            prior: Box::new(prior),
             intent_id: request.intent_id,
             qualified_version,
             actor: request.actor,
@@ -445,7 +628,7 @@ pub(crate) fn prepare_accepted_finalization(
     ))
 }
 
-pub(crate) fn prepare_not_delivered_finalization(
+fn prepare_not_delivered_finalization_inner(
     store: &mut BusinessIntentStore,
     request: NotDeliveredPreparationRequest,
     template: &TerminalTemplateBinding,
@@ -495,6 +678,7 @@ pub(crate) fn prepare_not_delivered_finalization(
 
     Ok(NotDeliveredPreparationOutcome::Pending(Box::new(
         PendingNotDeliveredFinalization {
+            activation_operation: None,
             prior,
             intent_id: request.intent_id,
             source_state: current.state(),
@@ -507,7 +691,7 @@ pub(crate) fn prepare_not_delivered_finalization(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn commit_not_delivered_finalization(
+fn commit_not_delivered_finalization_inner(
     store: &mut BusinessIntentStore,
     pending: Box<PendingNotDeliveredFinalization>,
     template: &TerminalTemplateBinding,
@@ -626,6 +810,7 @@ fn isolate_not_delivered_conflict(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn commit_accepted_finalization(
     store: &mut BusinessIntentStore,
     pending: PendingAcceptedFinalization,

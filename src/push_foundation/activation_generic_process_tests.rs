@@ -25,13 +25,13 @@ use crate::durable_delivery::{
 };
 use crate::monitor::push_job::{raw_digest, UtcMicros};
 
-const BOUND: Duration = Duration::from_secs(12);
+pub(super) const BOUND: Duration = Duration::from_secs(12);
 const HELPER: &str = "push_foundation::activation_generic_process_tests::w16_generic_process_child";
 const DISPATCHED: i64 = 1_788_743_102_000_000;
 const VERIFIED: i64 = 1_788_743_103_000_000;
 
 #[derive(Clone, Serialize, Deserialize)]
-enum Role {
+pub(super) enum Role {
     Broker {
         epoch: String,
         hooks: TestHooks,
@@ -41,6 +41,7 @@ enum Role {
         fail_append: bool,
     },
     Requester(Envelope),
+    BusinessBroker(super::activation_business_process_tests::BusinessRole),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -53,15 +54,15 @@ struct ChildInput {
 }
 
 #[derive(Serialize, Deserialize)]
-struct RegisteredRequests {
-    dispatch: EffectRequest,
-    recovery: EffectRequest,
+pub(super) struct RegisteredRequests {
+    pub(super) dispatch: EffectRequest,
+    pub(super) recovery: EffectRequest,
 }
 
-struct OwnedChild(Child);
+pub(super) struct OwnedChild(Child);
 
 impl OwnedChild {
-    fn stop(&mut self) {
+    pub(super) fn stop(&mut self) {
         if self.0.try_wait().unwrap().is_none() {
             self.0.kill().expect("kill only retained TEST_CODE Child");
         }
@@ -78,7 +79,7 @@ impl Drop for OwnedChild {
     }
 }
 
-fn identity(supervisor: bool) -> ClientIdentity {
+pub(super) fn identity(supervisor: bool) -> ClientIdentity {
     ClientIdentity {
         client: if supervisor { "supervisor" } else { "producer" }.into(),
         incarnation: if supervisor {
@@ -96,7 +97,7 @@ fn identity(supervisor: bool) -> ClientIdentity {
     }
 }
 
-fn durable_path(test_code: &str) -> PathBuf {
+pub(super) fn durable_path(test_code: &str) -> PathBuf {
     assert!(test_code.starts_with("TEST_CODE_GENERIC_PROCESS_"));
     assert_eq!(Path::new(test_code).components().count(), 1);
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -105,15 +106,15 @@ fn durable_path(test_code: &str) -> PathBuf {
         .join("durable_delivery.sqlite3")
 }
 
-struct Fixture {
-    root: tempfile::TempDir,
+pub(super) struct Fixture {
+    pub(super) root: tempfile::TempDir,
     durable_root: tempfile::TempDir,
     sequence: usize,
     pause_append: bool,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let root = tempfile::Builder::new()
             .prefix("TEST_CODE_GENERIC_")
             .tempdir_in("/private/tmp")
@@ -136,7 +137,7 @@ impl Fixture {
         }
     }
 
-    fn test_code(&self) -> &str {
+    pub(super) fn test_code(&self) -> &str {
         self.durable_root
             .path()
             .file_name()
@@ -145,7 +146,7 @@ impl Fixture {
             .unwrap()
     }
 
-    fn spawn(&mut self, socket: &Path, role: Role) -> (OwnedChild, UnixListener) {
+    pub(super) fn spawn(&mut self, socket: &Path, role: Role) -> (OwnedChild, UnixListener) {
         self.sequence += 1;
         let signal = self
             .root
@@ -177,7 +178,7 @@ impl Fixture {
         (child, listener)
     }
 
-    async fn broker(
+    pub(super) async fn broker(
         &mut self,
         epoch: &str,
         hooks: TestHooks,
@@ -213,7 +214,7 @@ impl Fixture {
         (child, socket, requests)
     }
 
-    fn rows(&self, database: &Path, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    pub(super) fn rows(&self, database: &Path, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
         let connection = rusqlite::Connection::open_with_flags(
             database,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -232,7 +233,7 @@ impl Fixture {
             .unwrap()
     }
 
-    fn count(&self, database: &Path, table: &str) -> i64 {
+    pub(super) fn count(&self, database: &Path, table: &str) -> i64 {
         assert!(matches!(
             table,
             "sink_calls"
@@ -248,7 +249,7 @@ impl Fixture {
         }
     }
 
-    fn assert_single_attempt_and_sink(&self, result_count: i64) {
+    pub(super) fn assert_single_attempt_and_sink(&self, result_count: i64) {
         assert_eq!(
             self.count(&self.root.path().join("ports.sqlite3"), "sink_calls"),
             1
@@ -398,7 +399,7 @@ impl ImmutableAppendPort for LocalAppend {
     }
 }
 
-async fn request(socket: &Path, command: Command) -> Reply {
+pub(super) async fn request(socket: &Path, command: Command) -> Reply {
     let supervisor = matches!(command, Command::Quiesce { .. });
     EffectClient::request(
         socket,
@@ -411,14 +412,14 @@ async fn request(socket: &Path, command: Command) -> Reply {
     .unwrap()
 }
 
-fn fact(reply: Reply) -> OperationFact {
+pub(super) fn fact(reply: Reply) -> OperationFact {
     match reply {
         Reply::Operation(Some(fact)) => fact,
         other => panic!("expected actual operation, got {other:?}"),
     }
 }
 
-async fn settled(socket: &Path, operation: &EffectRequest) -> OperationFact {
+pub(super) async fn settled(socket: &Path, operation: &EffectRequest) -> OperationFact {
     tokio::time::timeout(BOUND, async {
         loop {
             let observed = fact(
@@ -440,7 +441,11 @@ async fn settled(socket: &Path, operation: &EffectRequest) -> OperationFact {
     .expect("bounded query of same executing operation")
 }
 
-async fn close(socket: &Path, operation: &EffectRequest, class: WorkClass) -> ScopeStatus {
+pub(super) async fn close(
+    socket: &Path,
+    operation: &EffectRequest,
+    class: WorkClass,
+) -> ScopeStatus {
     match request(
         socket,
         Command::Quiesce {
@@ -469,7 +474,7 @@ async fn actual_sink_pause(listener: &UnixListener) -> UnixStream {
 }
 
 #[test]
-#[ignore = "explicitly spawned by w16_generic_process sink/append/recovery parent tests"]
+#[ignore = "explicitly spawned by Generic and business-recovery process parent tests"]
 fn w16_generic_process_child() {
     let input: ChildInput = serde_json::from_reader(std::io::stdin()).unwrap();
     assert_eq!(input.root.parent(), Some(Path::new("/private/tmp")));
@@ -585,6 +590,16 @@ fn w16_generic_process_child() {
                         .unwrap();
                     drop(signal);
                     Arc::new(broker).serve(listener).await.unwrap();
+                }
+                Role::BusinessBroker(role) => {
+                    super::activation_business_process_tests::run_broker(
+                        &input.root,
+                        &input.test_code,
+                        &input.socket,
+                        &input.signal,
+                        role,
+                    )
+                    .await;
                 }
                 Role::Requester(envelope) => {
                     let mut stream =

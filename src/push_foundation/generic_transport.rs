@@ -127,6 +127,10 @@ impl GenericTransportRoute {
     pub(super) fn template_sha256(&self) -> &Sha256Digest {
         self.template.sha256()
     }
+
+    pub(super) fn template(&self) -> &TerminalTemplateBinding {
+        &self.template
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
