@@ -39,6 +39,7 @@ pub mod sector_monitor;
 mod statistics;
 
 pub use async_overview::{generate_market_overview_text_blocking, get_market_overview_blocking};
+pub use limit_up::{LimitUpNameShardObservation, LimitUpObservation, LimitUpObservationStatus};
 
 impl MarketAnalyzer {
     /// 主要指数代码

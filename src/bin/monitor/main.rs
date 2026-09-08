@@ -9703,7 +9703,9 @@ async fn monitor_loop() {
                         let limit_pool_date = chrono::Local::now().date_naive();
                         let auction_hhmm = chrono::Local::now().format("%H:%M:%S").to_string();
                         let notified_at_tick_start = auction_vol_notified.clone();
-                        let (limit_stocks, auction_snapshot) =
+                        // 保留完整tick（含原始来源观察），供P-02与后续持仓检测借用。
+                        // 不在这里拆走两个投影字段后丢弃同次采集的证据。
+                        let auction_tick_data =
                             match tokio::task::spawn_blocking(move || -> Result<_, String> {
                                 push_templates::load_auction_volume_tick_real(
                                     &auction_hhmm,
@@ -9713,32 +9715,38 @@ async fn monitor_loop() {
                             })
                             .await
                             {
-                                Ok(Ok(tick_data)) => {
-                                    let snapshot = match tick_data.snapshot {
-                                        Ok(snapshot) => Some(snapshot),
-                                        Err(error) => {
-                                            log::info!("[竞价][P-02] 本批次不发送: {}", error);
-                                            None
-                                        }
-                                    };
-                                    (tick_data.limit_stocks, snapshot)
-                                }
+                                Ok(Ok(tick_data)) => Some(tick_data),
                                 Ok(Err(error)) => {
                                     log::error!("[竞价] 涨停池批次拒绝: {}", error);
-                                    (Vec::new(), None)
+                                    None
                                 }
                                 Err(error) => {
                                     log::error!("[竞价] 涨停池后台任务失败: {}", error);
-                                    (Vec::new(), None)
+                                    None
                                 }
                             };
+
+                        let limit_stocks = auction_tick_data
+                            .as_ref()
+                            .map(|tick| tick.limit_stocks.as_slice())
+                            .unwrap_or_default();
+                        let auction_snapshot =
+                            auction_tick_data
+                                .as_ref()
+                                .and_then(|tick| match &tick.snapshot {
+                                    Ok(snapshot) => Some(snapshot),
+                                    Err(error) => {
+                                        log::info!("[竞价][P-02] 本批次不发送: {}", error);
+                                        None
+                                    }
+                                });
 
                         if let Some(snapshot) = auction_snapshot {
                             // v37: 升级到 v12 §14.1 P-02 模板。渲染、入池与通知游标
                             // 都消费本 tick 唯一一次涨停池采集所得的同一选中批次。
                             let banner = current_banner_for("P-02 auction volume");
                             push_templates::dispatch_auction_volume_daily(
-                                &snapshot,
+                                snapshot,
                                 banner.as_ref(),
                                 &mut auction_vol_notified,
                             )

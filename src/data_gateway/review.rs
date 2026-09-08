@@ -155,6 +155,62 @@ impl<T> fmt::Display for GatewayBatch<T> {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct AuditedGatewayBatch<T> {
+    batch: GatewayBatch<T>,
+    request_hash: String,
+    receipt: crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt,
+}
+
+impl<T> AuditedGatewayBatch<T> {
+    pub(super) fn new(
+        batch: GatewayBatch<T>,
+        request_hash: String,
+        receipt: crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt,
+    ) -> Self {
+        Self {
+            batch,
+            request_hash,
+            receipt,
+        }
+    }
+
+    pub(crate) fn batch(&self) -> &GatewayBatch<T> {
+        &self.batch
+    }
+
+    pub(crate) fn request_hash(&self) -> &str {
+        &self.request_hash
+    }
+
+    pub(crate) fn receipt(
+        &self,
+    ) -> &crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt {
+        &self.receipt
+    }
+
+    pub(crate) fn into_batch(self) -> GatewayBatch<T> {
+        self.batch
+    }
+}
+
+impl<T> fmt::Debug for AuditedGatewayBatch<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuditedGatewayBatch")
+            .field(
+                "status",
+                &if self.batch.is_verified_empty() {
+                    "verified_empty"
+                } else {
+                    "available"
+                },
+            )
+            .field("record_count", &self.batch.records().len())
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AuditedBenchmarkBatch {
     pub batch: GatewayBatch<crate::data_gateway::BenchmarkBar>,
@@ -679,27 +735,26 @@ impl ReviewDataGateway {
         &self,
         trading_date: NaiveDate,
     ) -> Result<GatewayBatch<LimitPoolEntry>, GatewayError> {
+        self.current_upper_limit_pool_observation(trading_date)
+            .map(AuditedGatewayBatch::into_batch)
+    }
+
+    pub(crate) fn current_upper_limit_pool_observation(
+        &self,
+        trading_date: NaiveDate,
+    ) -> Result<AuditedGatewayBatch<LimitPoolEntry>, GatewayError> {
         const CAPABILITY: &str = "BR-213-UpperLimitPool";
-        let request_hash = limit_pool_acquisition_request_hash(
-            CAPABILITY,
-            LimitPoolAcquisitionProfile::LocalBridgeV1,
-            trading_date,
-        )?;
         // BR-238: the synchronous P-01 consumer keeps one interface while the
         // bridge owns its runtime-safe blocking implementation. A configured
         // bridge failure is terminal for this attempt; never fall back to a
         // library provider after transport/schema/evidence failure.
-        match super::grpc_source::bridge_for("LimitPools") {
-            Ok(bridge) => {
-                let result = bridge
-                    .limit_pools(trading_date)
-                    .and_then(|batch| admit_current_upper_limit_pool(batch, trading_date));
-                return audit_routed_gateway_result(CAPABILITY, &request_hash, result);
-            }
-            Err(error) => {
-                return audit_routed_gateway_result(CAPABILITY, &request_hash, Err(error));
-            }
-        }
+        let result = match super::grpc_source::bridge_for("LimitPools") {
+            Ok(bridge) => bridge.limit_pools(trading_date),
+            Err(error) => Err(error),
+        };
+        retain_current_upper_limit_pool_observation(trading_date, result, |request_hash, result| {
+            audit_routed_gateway_result_with_receipt(CAPABILITY, request_hash, result)
+        })
     }
 
     /// Library-only server seam for LocalBridge `LimitPools`.
@@ -724,6 +779,46 @@ impl ReviewDataGateway {
             ),
         ))
     }
+}
+
+fn retain_current_upper_limit_pool_observation<Audit>(
+    trading_date: NaiveDate,
+    result: Result<GatewayBatch<LimitPoolEntry>, GatewayError>,
+    audit: Audit,
+) -> Result<AuditedGatewayBatch<LimitPoolEntry>, GatewayError>
+where
+    Audit: FnOnce(
+        &str,
+        Result<GatewayBatch<LimitPoolEntry>, GatewayError>,
+    ) -> Result<
+        (
+            GatewayBatch<LimitPoolEntry>,
+            crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt,
+        ),
+        GatewayError,
+    >,
+{
+    const CAPABILITY: &str = "BR-213-UpperLimitPool";
+    let request_hash = limit_pool_acquisition_request_hash(
+        CAPABILITY,
+        LimitPoolAcquisitionProfile::LocalBridgeV1,
+        trading_date,
+    )?;
+    let result = result.and_then(|batch| admit_current_upper_limit_pool(batch, trading_date));
+    let (batch, receipt) = audit(&request_hash, result)?;
+    Ok(AuditedGatewayBatch::new(batch, request_hash, receipt))
+}
+
+#[cfg(test)]
+pub(crate) fn current_upper_limit_pool_observation_in(
+    database: &crate::database::DatabaseManager,
+    trading_date: NaiveDate,
+    result: Result<GatewayBatch<LimitPoolEntry>, GatewayError>,
+) -> Result<AuditedGatewayBatch<LimitPoolEntry>, GatewayError> {
+    const CAPABILITY: &str = "BR-213-UpperLimitPool";
+    retain_current_upper_limit_pool_observation(trading_date, result, |request_hash, result| {
+        audit_routed_gateway_result_with_receipt_in(database, CAPABILITY, request_hash, result)
+    })
 }
 
 /// Re-admit the LocalBridge projection at the synchronous consumer seam. The
@@ -813,18 +908,28 @@ fn admit_current_upper_limit_pool(
     Ok(batch)
 }
 
-/// Persist the exact BR-213 two-batch join before the plain display projection
-/// can escape the analyzer. The hash preimage binds every source identity and
-/// timestamp from both admitted batches, the caller-owned trading date, and the
-/// projected record count; the BR-159 chain makes the binding tamper-evident.
+/// Persist the exact BR-213 pool/name-shard join before the plain display
+/// projection can escape the analyzer. The hash preimage binds every source
+/// identity and timestamp from all admitted batches, the caller-owned trading
+/// date, and the projected record count; the BR-159 chain makes the binding
+/// tamper-evident.
 pub(crate) fn audit_limit_up_projection(
     trading_date: NaiveDate,
     limit_pool: &BatchEvidence,
     names: &[BatchEvidence],
     record_count: usize,
 ) -> Result<crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt, GatewayError> {
+    audit_limit_up_projection_in(None, trading_date, limit_pool, names, record_count)
+}
+
+pub(crate) fn audit_limit_up_projection_in(
+    explicit_database: Option<&crate::database::DatabaseManager>,
+    trading_date: NaiveDate,
+    limit_pool: &BatchEvidence,
+    names: &[BatchEvidence],
+    record_count: usize,
+) -> Result<crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt, GatewayError> {
     use crate::database::data_acquisition_audit::DataAcquisitionAuditRecord;
-    use crate::database::DatabaseManager;
 
     const CAPABILITY: &str = "BR-213-UpperLimitProjection";
     let accepted_count = i64::try_from(record_count).map_err(|_| {
@@ -858,15 +963,20 @@ pub(crate) fn audit_limit_up_projection(
         reason_code: "exact_batch_join_accepted",
         retryable: false,
     };
-    let database = DatabaseManager::try_get().ok_or_else(|| {
-        GatewayError::audit_failure(
-            CAPABILITY,
-            ProviderId::Custom,
-            "exact_batch_join_accepted",
-            "database is not initialized",
-        )
-    })?;
-    database.record_data_acquisition(&record).map_err(|error| {
+    let append = match explicit_database {
+        Some(database) => database.record_data_acquisition(&record),
+        None => crate::database::DatabaseManager::try_get()
+            .ok_or_else(|| {
+                GatewayError::audit_failure(
+                    CAPABILITY,
+                    ProviderId::Custom,
+                    "exact_batch_join_accepted",
+                    "database is not initialized",
+                )
+            })?
+            .record_data_acquisition(&record),
+    };
+    append.map_err(|error| {
         GatewayError::audit_failure(
             CAPABILITY,
             ProviderId::Custom,
@@ -1301,6 +1411,24 @@ pub(super) fn audit_gateway_result_with_receipt<T>(
         .map_err(GatewayAuditFailure::into_error)
 }
 
+#[cfg(test)]
+pub(super) fn audit_gateway_result_with_receipt_in<T>(
+    database: &crate::database::DatabaseManager,
+    capability: &'static str,
+    provider: ProviderId,
+    request_hash: &str,
+    result: Result<GatewayBatch<T>, GatewayError>,
+) -> Result<
+    (
+        GatewayBatch<T>,
+        crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt,
+    ),
+    GatewayError,
+> {
+    audit_gateway_result_with_receipt_state_in(database, capability, provider, request_hash, result)
+        .map_err(GatewayAuditFailure::into_error)
+}
+
 pub(super) fn audit_gateway_result<T>(
     capability: &'static str,
     provider: ProviderId,
@@ -1321,6 +1449,44 @@ pub(super) fn audit_routed_gateway_result<T>(
         Err(error) => error.provider.unwrap_or(ProviderId::Custom),
     };
     audit_gateway_result(capability, provider, request_hash, result)
+}
+
+fn audit_routed_gateway_result_with_receipt<T>(
+    capability: &'static str,
+    request_hash: &str,
+    result: Result<GatewayBatch<T>, GatewayError>,
+) -> Result<
+    (
+        GatewayBatch<T>,
+        crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt,
+    ),
+    GatewayError,
+> {
+    let provider = match &result {
+        Ok(batch) => batch.evidence().provider,
+        Err(error) => error.provider.unwrap_or(ProviderId::Custom),
+    };
+    audit_gateway_result_with_receipt(capability, provider, request_hash, result)
+}
+
+#[cfg(test)]
+fn audit_routed_gateway_result_with_receipt_in<T>(
+    database: &crate::database::DatabaseManager,
+    capability: &'static str,
+    request_hash: &str,
+    result: Result<GatewayBatch<T>, GatewayError>,
+) -> Result<
+    (
+        GatewayBatch<T>,
+        crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt,
+    ),
+    GatewayError,
+> {
+    let provider = match &result {
+        Ok(batch) => batch.evidence().provider,
+        Err(error) => error.provider.unwrap_or(ProviderId::Custom),
+    };
+    audit_gateway_result_with_receipt_in(database, capability, provider, request_hash, result)
 }
 
 pub(super) async fn audit_blocking_join_failure<T: Send + 'static>(

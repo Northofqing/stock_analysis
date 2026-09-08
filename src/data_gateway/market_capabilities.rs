@@ -8,7 +8,10 @@ use crate::market_domain::ProviderId;
 
 use chrono::{DateTime, NaiveDate, Utc};
 
-use super::review::{acquisition_request_hash, audit_gateway_result, GatewayBatch, GatewayError};
+use super::review::{
+    acquisition_request_hash, audit_gateway_result, audit_gateway_result_with_receipt,
+    AuditedGatewayBatch, GatewayBatch, GatewayError,
+};
 
 const MINUTE_CAPABILITY: &str = "MarketMinuteData";
 const ORDER_BOOK_CAPABILITY: &str = "MarketOrderBooks";
@@ -293,37 +296,186 @@ impl MarketCapabilitiesGateway {
         &self,
         codes: &[String],
     ) -> Result<GatewayBatch<MarketSecurityIdentity>, GatewayError> {
+        self.security_identities_observation(codes)
+            .await
+            .map(AuditedGatewayBatch::into_batch)
+    }
+
+    pub(crate) async fn security_identities_observation(
+        &self,
+        codes: &[String],
+    ) -> Result<AuditedGatewayBatch<MarketSecurityIdentity>, GatewayError> {
         let storage_codes = codes.to_vec();
-        let request_hash =
-            acquisition_request_hash(SECURITY_IDENTITY_CAPABILITY, storage_codes.join(","));
         // BR-238: identity is a narrow projection of the authenticated
         // ExternalV1 SecurityMetadata contract. A configured bridge failure is
         // audited and returned; it never falls back to a different provider.
-        match super::grpc_source::bridge_for("SecurityMetadata") {
-            Ok(bridge) => {
-                let result = bridge.security_identities_async(&storage_codes).await;
-                let audit_provider = match &result {
-                    Ok(batch) => batch.evidence().provider,
-                    Err(error) => error.provider().unwrap_or(ProviderId::Custom),
-                };
-                return audit_gateway_result(
-                    SECURITY_IDENTITY_CAPABILITY,
-                    audit_provider,
-                    &request_hash,
-                    result,
-                );
-            }
-            Err(error) => {
-                let audit_provider = error.provider().unwrap_or(ProviderId::Custom);
-                return audit_gateway_result(
-                    SECURITY_IDENTITY_CAPABILITY,
-                    audit_provider,
-                    &request_hash,
-                    Err(error),
-                );
-            }
-        }
-        // no-feature builds have no library transport. Without the bridge,
+        // No-feature builds have no library transport. Without the bridge,
         // fail explicitly rather than fabricating an identity.
+        let result = match super::grpc_source::bridge_for("SecurityMetadata") {
+            Ok(bridge) => bridge.security_identities_async(&storage_codes).await,
+            Err(error) => Err(error),
+        };
+        retain_security_identities_observation(&storage_codes, result, |provider, hash, result| {
+            audit_gateway_result_with_receipt(SECURITY_IDENTITY_CAPABILITY, provider, hash, result)
+        })
+    }
+}
+
+fn retain_security_identities_observation<Audit>(
+    codes: &[String],
+    result: Result<GatewayBatch<MarketSecurityIdentity>, GatewayError>,
+    audit: Audit,
+) -> Result<AuditedGatewayBatch<MarketSecurityIdentity>, GatewayError>
+where
+    Audit: FnOnce(
+        ProviderId,
+        &str,
+        Result<GatewayBatch<MarketSecurityIdentity>, GatewayError>,
+    ) -> Result<
+        (
+            GatewayBatch<MarketSecurityIdentity>,
+            crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt,
+        ),
+        GatewayError,
+    >,
+{
+    let request_hash = acquisition_request_hash(SECURITY_IDENTITY_CAPABILITY, codes.join(","));
+    let audit_provider = security_identity_audit_provider(&result);
+    let (batch, receipt) = audit(audit_provider, &request_hash, result)?;
+    Ok(AuditedGatewayBatch::new(batch, request_hash, receipt))
+}
+
+fn security_identity_audit_provider(
+    result: &Result<GatewayBatch<MarketSecurityIdentity>, GatewayError>,
+) -> ProviderId {
+    match result {
+        Ok(batch) => batch.evidence().provider,
+        Err(error) => error.provider().unwrap_or(ProviderId::Custom),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn security_identities_observation_in(
+    database: &crate::database::DatabaseManager,
+    codes: &[String],
+    result: Result<GatewayBatch<MarketSecurityIdentity>, GatewayError>,
+) -> Result<AuditedGatewayBatch<MarketSecurityIdentity>, GatewayError> {
+    retain_security_identities_observation(codes, result, |provider, hash, result| {
+        super::review::audit_gateway_result_with_receipt_in(
+            database,
+            SECURITY_IDENTITY_CAPABILITY,
+            provider,
+            hash,
+            result,
+        )
+    })
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+    use crate::data_gateway::BatchEvidence;
+    use crate::database::attribution_reports::{
+        AttributionDatabaseAccess, AttributionDatabaseSession,
+    };
+    use diesel::prelude::*;
+    use diesel::sql_types::{BigInt, Text};
+
+    #[derive(QueryableByName)]
+    struct IdentityAuditRow {
+        #[diesel(sql_type = BigInt)]
+        id: i64,
+        #[diesel(sql_type = Text)]
+        provider: String,
+        #[diesel(sql_type = Text)]
+        request_hash: String,
+        #[diesel(sql_type = Text)]
+        record_hash: String,
+    }
+
+    #[test]
+    fn br221_observation_identity_retains_exact_request_provider_and_compatibility_projection() {
+        let file = tempfile::NamedTempFile::new().expect("TEST_CODE identity audit database");
+        let session =
+            AttributionDatabaseSession::open(file.path(), AttributionDatabaseAccess::AppendOnly)
+                .expect("TEST_CODE identity append-only database");
+        let database = session.database();
+        let codes = vec!["TEST_CODE_600001".to_owned(), "TEST_CODE_600002".to_owned()];
+        let source_at = DateTime::parse_from_rfc3339("2099-01-02T10:00:00+08:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        let observed_at = DateTime::parse_from_rfc3339("2099-01-02T10:00:01+08:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        let expected_batch = GatewayBatch::Available {
+            records: codes
+                .iter()
+                .map(|code| MarketSecurityIdentity {
+                    code: code.clone(),
+                    name: format!("Name {code}"),
+                    is_st: false,
+                    source_at: source_at + chrono::Duration::seconds(3),
+                    observed_at,
+                    provider: ProviderId::Sina,
+                    batch_id: "TEST_CODE_identity_retention".to_owned(),
+                })
+                .collect(),
+            evidence: BatchEvidence {
+                provider: ProviderId::Sina,
+                source: "TEST_CODE identity provider".to_owned(),
+                source_at: Some("2099-01-02T10:00:00+08:00".to_owned()),
+                observed_at: "2099-01-02T10:00:01+08:00".to_owned(),
+                batch_id: "TEST_CODE_identity_retention".to_owned(),
+            },
+        };
+
+        let observed =
+            security_identities_observation_in(database, &codes, Ok(expected_batch.clone()))
+                .expect("TEST_CODE audited identity observation");
+        let expected_request_hash =
+            "cefec6bc3c228366e37eb3445afeaa17f60b56a0e5b2b795a4296ddea2e6400e";
+        assert_eq!(observed.batch(), &expected_batch);
+        assert_eq!(observed.request_hash(), expected_request_hash);
+
+        let mut connection = database.get_conn().expect("TEST_CODE audit connection");
+        let row = diesel::sql_query(
+            "SELECT audit.id,audit.provider,audit.request_hash,chain.record_hash \
+             FROM data_acquisition_audit AS audit \
+             JOIN data_acquisition_audit_chain AS chain \
+               ON chain.acquisition_audit_id=audit.id \
+             WHERE audit.capability='SecurityIdentity'",
+        )
+        .get_result::<IdentityAuditRow>(&mut connection)
+        .expect("TEST_CODE identity audit row");
+        assert_eq!(row.provider, "Sina");
+        assert_eq!(row.request_hash, expected_request_hash);
+        assert_eq!(row.id, observed.receipt().audit_id);
+        assert_eq!(row.record_hash, observed.receipt().record_hash);
+        let before_projection = diesel::sql_query(
+            "SELECT audit.id,audit.provider,audit.request_hash,chain.record_hash \
+             FROM data_acquisition_audit AS audit \
+             JOIN data_acquisition_audit_chain AS chain \
+               ON chain.acquisition_audit_id=audit.id \
+             WHERE audit.capability='SecurityIdentity'",
+        )
+        .load::<IdentityAuditRow>(&mut connection)
+        .expect("TEST_CODE identity audit rows")
+        .len();
+        drop(connection);
+
+        let compatible_batch = observed.into_batch();
+        assert_eq!(compatible_batch, expected_batch);
+        let mut connection = database.get_conn().expect("TEST_CODE audit connection");
+        let after_projection = diesel::sql_query(
+            "SELECT audit.id,audit.provider,audit.request_hash,chain.record_hash \
+             FROM data_acquisition_audit AS audit \
+             JOIN data_acquisition_audit_chain AS chain \
+               ON chain.acquisition_audit_id=audit.id \
+             WHERE audit.capability='SecurityIdentity'",
+        )
+        .load::<IdentityAuditRow>(&mut connection)
+        .expect("TEST_CODE identity audit rows")
+        .len();
+        assert_eq!(after_projection, before_projection);
     }
 }

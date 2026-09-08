@@ -6024,6 +6024,17 @@ pub fn prepare_auction_volume_snapshot(
 pub struct AuctionVolumeTickData {
     pub limit_stocks: Vec<stock_analysis::market_data::TopStock>,
     pub snapshot: Result<AuctionVolumeSnapshot, String>,
+    source_observation: Option<stock_analysis::market_analyzer::LimitUpObservation>,
+}
+
+impl AuctionVolumeTickData {
+    /// The real loader retains the exact audited acquisition used for both
+    /// projections. Pure algorithm seams deliberately return `None`.
+    pub fn source_observation(
+        &self,
+    ) -> Option<&stock_analysis::market_analyzer::LimitUpObservation> {
+        self.source_observation.as_ref()
+    }
 }
 
 fn load_auction_volume_tick_with<Loader>(
@@ -6040,6 +6051,7 @@ where
     Ok(AuctionVolumeTickData {
         limit_stocks,
         snapshot,
+        source_observation: None,
     })
 }
 
@@ -6054,10 +6066,15 @@ pub fn load_auction_volume_tick_real(
         Ok(a) => a,
         Err(error) => return Err(format!("竞价量能 analyzer 初始化失败: {error}")),
     };
-    load_auction_volume_tick_with(hhmm, trading_date, notified, |date| {
-        analyzer
-            .get_limit_up_stocks(date)
-            .map_err(|error| format!("竞价量能涨停列表获取失败: {error}"))
+    let source_observation = analyzer
+        .get_limit_up_observation(trading_date)
+        .map_err(|error| format!("竞价量能涨停列表获取失败: {error}"))?;
+    let limit_stocks = source_observation.stocks().to_vec();
+    let snapshot = prepare_auction_volume_snapshot(hhmm, &limit_stocks, notified);
+    Ok(AuctionVolumeTickData {
+        limit_stocks,
+        snapshot,
+        source_observation: Some(source_observation),
     })
 }
 
@@ -18255,6 +18272,7 @@ mod tests {
         )
         .expect("one source call should retain raw stocks");
 
+        assert!(tick_data.source_observation().is_none());
         assert_eq!(
             tick_data
                 .limit_stocks
