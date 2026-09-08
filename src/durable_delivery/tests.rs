@@ -9005,6 +9005,89 @@ fn w19_recovered_uncertain_allows_a_real_intervening_conflict_audit() {
 }
 
 #[test]
+fn w19_recovered_uncertain_rejects_skipped_intervening_audit() {
+    let fixture = Fixture::new("W19_RECOVERED_UNCERTAIN_SKIPPED_CONFLICT");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("W19_RECOVERED_UNCERTAIN_SKIPPED_CONFLICT");
+    prepare_reserved(&fixture, &candidate, &append);
+    fixture
+        .coordinator
+        .begin_attempt(&candidate.decision_identity, 1, now())
+        .expect("begin real recovery attempt")
+        .expect("real recovery attempt created");
+    let mut conflicting = candidate.clone();
+    conflicting.replace_content_preserving_identity(
+        b"TEST_CODE_W19_SKIPPED_INTERVENING_CONFLICTING_BODY".to_vec(),
+    );
+    assert!(matches!(
+        fixture
+            .coordinator
+            .prepare(&conflicting, 1, now() + chrono::Duration::seconds(1)),
+        Err(DurableDeliveryError::DecisionIdentityConflict { .. })
+    ));
+    fixture
+        .coordinator
+        .reconcile_all_pending(&append, now() + chrono::Duration::seconds(121))
+        .expect("seal recovery after real intervening conflict audit");
+    assert_eq!(
+        fixture.query_i64(
+            "SELECT COUNT(*) FROM immutable_audit_outbox fence
+             JOIN immutable_audit_outbox conflict
+               ON conflict.audit_identity=fence.predecessor_audit_identity
+             WHERE fence.decision_identity=conflict.decision_identity
+               AND fence.audit_kind='FenceRevoked'
+               AND conflict.audit_kind='DecisionIdentityConflict'
+               AND conflict.predecessor_audit_identity IS NOT NULL"
+        ),
+        1,
+        "the real conflict must initially be the fence predecessor"
+    );
+
+    let connection = Connection::open(&fixture.database_path)
+        .expect("open isolated W19 skipped-conflict corruption database");
+    connection
+        .execute_batch("DROP TRIGGER immutable_outbox_payload_update;")
+        .expect("remove isolated audit payload guard");
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE immutable_audit_outbox
+                 SET predecessor_audit_identity=(
+                   SELECT conflict.predecessor_audit_identity
+                   FROM immutable_audit_outbox conflict
+                   WHERE conflict.decision_identity=?1
+                     AND conflict.audit_kind='DecisionIdentityConflict')
+                 WHERE decision_identity=?1 AND audit_kind='FenceRevoked'",
+                [candidate.decision_identity.as_str()],
+            )
+            .expect("skip the real intervening conflict in the isolated fence chain"),
+        1
+    );
+    drop(connection);
+    assert_eq!(
+        fixture.query_i64(
+            "SELECT COUNT(*) FROM immutable_audit_outbox fence
+             JOIN immutable_audit_outbox conflict
+               ON conflict.decision_identity=fence.decision_identity
+              AND conflict.audit_kind='DecisionIdentityConflict'
+              AND conflict.predecessor_audit_identity=fence.predecessor_audit_identity
+             WHERE fence.audit_kind='FenceRevoked'
+               AND fence.audit_identity<>conflict.audit_identity"
+        ),
+        1,
+        "the tampered fence and skipped conflict must be distinct successors of one predecessor"
+    );
+
+    let error = fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .expect_err("a skipped intervening audit must be rejected");
+    assert!(matches!(error, DurableDeliveryError::PolicyMismatch(_)));
+    assert!(!error.to_string().contains("TEST_CODE"));
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+}
+
+#[test]
 fn w19_recovered_uncertain_accepts_recovery_from_real_rejected_genesis_retry() {
     struct PanicAfterAttemptSink;
     impl AuthoritativeSinkPort for PanicAfterAttemptSink {

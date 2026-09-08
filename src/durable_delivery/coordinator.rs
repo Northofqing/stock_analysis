@@ -6797,6 +6797,22 @@ fn validate_recovery_fence_predecessor_chain(
     fence: &StoredRecoveryAttemptEvidence,
     classification: &StoredRecoveryAttemptEvidence,
 ) -> Result<()> {
+    let ambiguous_predecessors: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM (
+           SELECT predecessor_audit_identity
+           FROM immutable_audit_outbox
+           WHERE decision_identity=?1 AND predecessor_audit_identity IS NOT NULL
+           GROUP BY predecessor_audit_identity
+           HAVING COUNT(*) > 1
+         )",
+        [decision_identity],
+        |row| row.get(0),
+    )?;
+    if ambiguous_predecessors != 0 {
+        return Err(DurableDeliveryError::PolicyMismatch(
+            "foundation recovered uncertainty audit predecessor chain is ambiguous".to_owned(),
+        ));
+    }
     let mut predecessor = fence.audit_predecessor_identity.clone().ok_or_else(|| {
         DurableDeliveryError::PolicyMismatch(
             "foundation recovered uncertainty fence audit predecessor is missing".to_owned(),
