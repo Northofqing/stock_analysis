@@ -5,10 +5,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::business_finalizer::{
-    commit_accepted_finalization, prepare_accepted_finalization, AcceptedPreparationOutcome,
-    AcceptedPreparationRequest, FinalizerFence,
+    commit_accepted_finalization, commit_not_delivered_finalization, prepare_accepted_finalization,
+    prepare_not_delivered_finalization, AcceptedPreparationOutcome, AcceptedPreparationRequest,
+    FinalizerFence, NotDeliveredPreparationOutcome, NotDeliveredPreparationRequest,
+    VerifiedOperatorAuditRef,
 };
 use super::dedicated_transport::DedicatedConformanceRoute;
+use super::finalization_metrics::{FinalizationMetricsBinding, FinalizationMetricsSource};
 use super::finalization_sla::*;
 use super::generic_transport::{
     build_foundation_envelope, GenericTerminalAuthorityAdapter, GenericTransportRoute,
@@ -37,9 +40,9 @@ use crate::monitor::push_job::{
 };
 use chrono::{DateTime, Utc};
 
-const ACCEPTED: i64 = 1_787_020_203_123_456;
+pub(super) const ACCEPTED: i64 = 1_787_020_203_123_456;
 const CHANNEL: &str = "TEST_CODE_W19_CHANNEL";
-fn micros(value: i64) -> UtcMicros {
+pub(super) fn micros(value: i64) -> UtcMicros {
     UtcMicros::try_new(value).unwrap()
 }
 fn utc(value: i64) -> DateTime<Utc> {
@@ -83,7 +86,7 @@ impl AuthoritativeSinkPort for Sink {
         self.result.clone()
     }
 }
-fn accepted_result(at: i64) -> AuthoritativeSinkResult {
+pub(super) fn accepted_result(at: i64) -> AuthoritativeSinkResult {
     AuthoritativeSinkResult::Accepted(TypedReceipt {
         channel: CHANNEL.to_owned(),
         provider: "TEST_CODE_W19_PROVIDER".to_owned(),
@@ -94,7 +97,24 @@ fn accepted_result(at: i64) -> AuthoritativeSinkResult {
     })
 }
 
-struct Case {
+pub(super) fn rejected_result(at: i64) -> AuthoritativeSinkResult {
+    AuthoritativeSinkResult::Rejected(TypedRejection {
+        reason_code: "TEST_CODE_W19_REJECTED".to_owned(),
+        evidence: b"TEST_CODE_W19_REJECTION".to_vec(),
+        retry_authorized: false,
+        observed_at: utc(at),
+    })
+}
+
+pub(super) fn uncertain_result(at: i64) -> AuthoritativeSinkResult {
+    AuthoritativeSinkResult::Uncertain(TypedUncertainty {
+        reason_code: "TEST_CODE_W19_UNCERTAIN".to_owned(),
+        evidence: b"TEST_CODE_W19_UNCERTAINTY".to_vec(),
+        observed_at: utc(at),
+    })
+}
+
+pub(super) struct Case {
     store: BusinessIntentStore,
     durable: Option<DurableDeliveryCoordinator>,
     audit: Option<AuditDispatcher>,
@@ -115,16 +135,33 @@ struct Case {
     append: Append,
     sink: Arc<Sink>,
 }
+
+pub(super) struct AddedGenericIntent {
+    pub(super) intent: IntentId,
+    legacy_decision: String,
+}
+
 impl Case {
-    fn new(class: AuthorityClass, result: AuthoritativeSinkResult, seal: bool) -> Self {
+    pub(super) fn new(class: AuthorityClass, result: AuthoritativeSinkResult, seal: bool) -> Self {
         Self::variant(class, result, seal, InitialDecisionKind::Ready, None)
     }
-    fn variant(
+    pub(super) fn variant(
         class: AuthorityClass,
         result: AuthoritativeSinkResult,
         seal: bool,
         kind: InitialDecisionKind,
         family_override: Option<&str>,
+    ) -> Self {
+        Self::variant_occurrence(class, result, seal, kind, family_override, None)
+    }
+
+    pub(super) fn variant_occurrence(
+        class: AuthorityClass,
+        result: AuthoritativeSinkResult,
+        seal: bool,
+        kind: InitialDecisionKind,
+        family_override: Option<&str>,
+        key_override: Option<&str>,
     ) -> Self {
         std::fs::create_dir_all("data/test").unwrap();
         let root = tempfile::Builder::new()
@@ -179,7 +216,7 @@ impl Case {
             OccurrenceIdentityMaterial::new(
                 BusinessDate::parse("2026-08-18").unwrap(),
                 OccurrenceFamily::try_new(family_override.unwrap_or(family).to_owned()).unwrap(),
-                OccurrenceKey::try_new(key.to_owned()).unwrap(),
+                OccurrenceKey::try_new(key_override.unwrap_or(key).to_owned()).unwrap(),
             ),
             CompletionOwnerId::try_new(owner.to_owned()).unwrap(),
             SourceContractId::try_new("w19-source".to_owned()).unwrap(),
@@ -313,7 +350,7 @@ impl Case {
         ))
         .unwrap()
     }
-    fn restart(&mut self) {
+    pub(super) fn restart(&mut self) {
         if self.durable.take().is_some() {
             self.durable = Some(self.open_durable());
         }
@@ -322,7 +359,7 @@ impl Case {
         }
         self.store = BusinessIntentStore::open(&self.business_path).unwrap();
     }
-    fn query(
+    pub(super) fn query(
         &self,
         observed: i64,
         cycle: Duration,
@@ -356,16 +393,437 @@ impl Case {
             },
         )
     }
-    fn rows(&self) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
+    pub(super) fn rows(&self) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
         let mut result = database_rows(&self.business_path);
         if self.durable.is_some() {
             result.extend(database_rows(&self.durable_path));
         }
         result
     }
-    fn audit_bytes(&self) -> Vec<Vec<u8>> {
-        let mut paths: Vec<_> = std::fs::read_dir(self.root.path().join("event_audit"))
+
+    pub(super) fn effect_counts(&self) -> (usize, usize) {
+        (
+            self.append.calls.load(Ordering::SeqCst),
+            self.sink.calls.load(Ordering::SeqCst),
+        )
+    }
+
+    pub(super) fn store(&self) -> &BusinessIntentStore {
+        &self.store
+    }
+
+    pub(super) fn namespace(&self) -> &Namespace {
+        &self.namespace
+    }
+
+    pub(super) fn metrics_binding(&self) -> FinalizationMetricsBinding<'_> {
+        let source = match self.class {
+            AuthorityClass::GenericCounted => FinalizationMetricsSource::Generic {
+                source: self.durable.as_ref().unwrap(),
+                required_channel: &self.channel,
+            },
+            AuthorityClass::P01Dedicated => FinalizationMetricsSource::P01 {
+                source: self.durable.as_ref().unwrap(),
+                route: self.dedicated.as_ref().unwrap(),
+            },
+            AuthorityClass::N02Dedicated => FinalizationMetricsSource::N02 {
+                source: self.audit.as_ref().unwrap(),
+                route: self.dedicated.as_ref().unwrap(),
+            },
+        };
+        FinalizationMetricsBinding {
+            unit: &self.unit,
+            template: &self.template,
+            policy: &self.policy,
+            source,
+        }
+    }
+
+    pub(super) fn inventory_draft(
+        &self,
+        namespace: Namespace,
+        kind: InitialDecisionKind,
+        business_date: &str,
+        occurrence_key: &str,
+    ) -> InitialIntentDraft {
+        self.inventory_draft_with_template(
+            namespace,
+            kind,
+            business_date,
+            occurrence_key,
+            &self.template,
+        )
+    }
+
+    pub(super) fn inventory_draft_with_template(
+        &self,
+        namespace: Namespace,
+        kind: InitialDecisionKind,
+        business_date: &str,
+        occurrence_key: &str,
+        template: &TerminalTemplateBinding,
+    ) -> InitialIntentDraft {
+        let identity = InitialIntentIdentity::new(
+            namespace,
+            self.unit.clone(),
+            OccurrenceIdentityMaterial::new(
+                BusinessDate::parse(business_date).unwrap(),
+                OccurrenceFamily::try_new("auction-session".to_owned()).unwrap(),
+                OccurrenceKey::try_new(occurrence_key.to_owned()).unwrap(),
+            ),
+            CompletionOwnerId::try_new("owner-auction".to_owned()).unwrap(),
+            SourceContractId::try_new("w19-source".to_owned()).unwrap(),
+            SubjectId::Global,
+            AudienceId::try_new("test-owner".to_owned()).unwrap(),
+        );
+        match kind {
+            InitialDecisionKind::Ready => InitialIntentDraft::ready_for_recovery_test(
+                identity,
+                b"SECRET_TEST_PREPARED".to_vec(),
+                b"SECRET_TEST_RENDERED".to_vec(),
+                template.sha256().clone(),
+                raw_digest(b"TEST_CODE_W19_CONTRACT"),
+                micros(ACCEPTED - 10_000_000),
+            )
+            .unwrap(),
+            InitialDecisionKind::NoData => InitialIntentDraft::no_data(
+                identity,
+                raw_digest(b"evidence"),
+                template.sha256().clone(),
+                raw_digest(b"TEST_CODE_W19_CONTRACT"),
+                micros(ACCEPTED - 10_000_000),
+            ),
+            InitialDecisionKind::Disabled => InitialIntentDraft::disabled(
+                identity,
+                raw_digest(b"evidence"),
+                template.sha256().clone(),
+                raw_digest(b"TEST_CODE_W19_CONTRACT"),
+                micros(ACCEPTED - 10_000_000),
+            ),
+        }
+    }
+
+    pub(super) fn add_inventory_intent(
+        &mut self,
+        namespace: Namespace,
+        kind: InitialDecisionKind,
+        business_date: &str,
+        occurrence_key: &str,
+    ) -> IntentId {
+        let draft = self.inventory_draft(namespace, kind, business_date, occurrence_key);
+        let intent = draft.intent_id().clone();
+        self.store.record_initial(&draft).unwrap();
+        intent
+    }
+
+    pub(super) fn add_inventory_draft(&mut self, draft: &InitialIntentDraft) -> IntentId {
+        let intent = draft.intent_id().clone();
+        self.store.record_initial(draft).unwrap();
+        intent
+    }
+
+    pub(super) fn add_generic_authority_intent(
+        &mut self,
+        result: AuthoritativeSinkResult,
+        seal: bool,
+        business_date: &str,
+        occurrence_key: &str,
+    ) -> AddedGenericIntent {
+        assert_eq!(self.class, AuthorityClass::GenericCounted);
+        let draft = self.inventory_draft(
+            self.namespace.clone(),
+            InitialDecisionKind::Ready,
+            business_date,
+            occurrence_key,
+        );
+        let intent = draft.intent_id().clone();
+        let snapshot = self
+            .store
+            .record_initial(&draft)
             .unwrap()
+            .snapshot()
+            .clone();
+        let attested = snapshot.attested_ready_binding().unwrap();
+        let route = GenericTransportRoute::try_new(
+            PushKind::HoldingEvent,
+            DeliverySubKind::None,
+            "GLOBAL".to_owned(),
+            self.channel.clone(),
+            self.template.clone(),
+        )
+        .unwrap();
+        let envelope = build_foundation_envelope(&snapshot, &attested, &route).unwrap();
+        let legacy_decision = envelope.decision_identity.clone();
+        let coordinator = self.durable.as_ref().unwrap();
+        coordinator
+            .prepare(&envelope, 1, utc(ACCEPTED - 2_000_000))
+            .unwrap();
+        coordinator
+            .reconcile_all_pending(&self.append, utc(ACCEPTED - 1_000_000))
+            .unwrap();
+        let sink: Arc<Sink> = Arc::new(Sink {
+            result,
+            calls: AtomicUsize::new(0),
+        });
+        let sinks: Vec<AuthoritativeSink> = vec![sink];
+        coordinator
+            .resume_deliverable(
+                &envelope.decision_identity,
+                &sinks,
+                utc(ACCEPTED + 1_000_000),
+            )
+            .unwrap();
+        if seal {
+            coordinator
+                .reconcile_all_pending(&self.append, utc(ACCEPTED + 2_000_000))
+                .unwrap();
+        }
+        AddedGenericIntent {
+            intent,
+            legacy_decision,
+        }
+    }
+
+    fn claim_inventory_intent(&mut self, intent: &IntentId, at: i64) -> IntentSnapshot {
+        let current = self.store.inspect(intent).unwrap().unwrap();
+        self.store
+            .apply_nonterminal_transition(
+                &IntentTransitionCommand::try_new(
+                    intent.clone(),
+                    IntentState::PendingDispatch,
+                    IntentState::AwaitingAuthority,
+                    current.version(),
+                    TransitionActor::try_new("w19-inventory-finalizer".to_owned()).unwrap(),
+                    ReasonCode::IntentDispatchClaimed,
+                    micros(at),
+                    LeaseAction::Acquire {
+                        owner: LeaseOwnerId::try_new("w19-inventory-finalizer".to_owned()).unwrap(),
+                        until: micros(at + 1_000_000_000),
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        self.store.inspect(intent).unwrap().unwrap()
+    }
+
+    pub(super) fn complete_added_accepted(&mut self, added: &AddedGenericIntent, at: i64) {
+        let claimed = self.claim_inventory_intent(&added.intent, ACCEPTED - 5_000_000);
+        let authority =
+            GenericTerminalAuthorityAdapter::try_new(self.durable.as_ref().unwrap()).unwrap();
+        let request = AcceptedPreparationRequest::new(
+            added.intent.clone(),
+            claimed.version(),
+            TransitionActor::try_new("w19-inventory-finalizer".to_owned()).unwrap(),
+            FinalizerFence::new(
+                LeaseOwnerId::try_new("w19-inventory-finalizer".to_owned()).unwrap(),
+                claimed.lease_generation(),
+                claimed.lease_until().unwrap(),
+            ),
+            micros(at - 2),
+            micros(at - 1),
+        )
+        .unwrap();
+        let pending = match prepare_accepted_finalization(
+            &mut self.store,
+            request,
+            &self.template,
+            &self.policy,
+            &authority,
+        )
+        .unwrap()
+        {
+            AcceptedPreparationOutcome::Pending(pending) => pending,
+            other => panic!("unexpected {other:?}"),
+        };
+        commit_accepted_finalization(
+            &mut self.store,
+            pending,
+            &self.template,
+            &self.policy,
+            &authority,
+            micros(at),
+            micros(at),
+        )
+        .unwrap();
+    }
+
+    pub(super) fn complete_added_not_delivered(&mut self, added: &AddedGenericIntent, at: i64) {
+        let coordinator = self.durable.as_ref().unwrap();
+        coordinator
+            .resolve_uncertain(
+                &ManualResolutionCommand {
+                    decision_identity: added.legacy_decision.clone(),
+                    disposition: ManualDisposition::Rejected,
+                    operator_identity: "TEST_CODE_W19_OPERATOR_0123456789".to_owned(),
+                    reason: "TEST_CODE_W19_INVENTORY_RESOLUTION".to_owned(),
+                    external_evidence: b"TEST_CODE_W19_MANUAL_EVIDENCE".to_vec(),
+                    resolved_at: utc(at - 10_000_000),
+                },
+                &self.append,
+            )
+            .unwrap();
+        coordinator
+            .reconcile_all_pending(&self.append, utc(at - 9_000_000))
+            .unwrap();
+        let claimed = self.claim_inventory_intent(&added.intent, ACCEPTED - 5_000_000);
+        let attested = claimed.attested_ready_binding().unwrap();
+        let authority =
+            GenericTerminalAuthorityAdapter::try_new(self.durable.as_ref().unwrap()).unwrap();
+        let actor = TransitionActor::try_new("w19-inventory-finalizer".to_owned()).unwrap();
+        let fence = FinalizerFence::new(
+            LeaseOwnerId::try_new("w19-inventory-finalizer".to_owned()).unwrap(),
+            claimed.lease_generation(),
+            claimed.lease_until().unwrap(),
+        );
+        let audit = VerifiedOperatorAuditRef::for_test(
+            added.intent.clone(),
+            attested.decision_id,
+            claimed.version(),
+            "TEST_CODE_W19_OPERATOR_AUDIT".to_owned(),
+            raw_digest(b"TEST_CODE_W19_OPERATOR_AUDIT"),
+        )
+        .unwrap();
+        let request = NotDeliveredPreparationRequest::new(
+            added.intent.clone(),
+            claimed.version(),
+            actor,
+            fence,
+            micros(at),
+            audit,
+        )
+        .unwrap();
+        let pending = match prepare_not_delivered_finalization(
+            &mut self.store,
+            request,
+            &self.template,
+            &self.policy,
+            &authority,
+        )
+        .unwrap()
+        {
+            NotDeliveredPreparationOutcome::Pending(pending) => pending,
+            other => panic!("expected pending NotDelivered, got {other:?}"),
+        };
+        commit_not_delivered_finalization(
+            &mut self.store,
+            pending,
+            &self.template,
+            &self.policy,
+            &authority,
+            micros(at + 1),
+            micros(at + 2),
+        )
+        .unwrap();
+    }
+
+    pub(super) fn require_added_resolution_after_completed(
+        &mut self,
+        added: &AddedGenericIntent,
+        at: i64,
+    ) {
+        let current = self.store.inspect(&added.intent).unwrap().unwrap();
+        assert_eq!(current.state(), IntentState::Completed);
+        self.store
+            .apply_nonterminal_transition(
+                &IntentTransitionCommand::try_new(
+                    added.intent.clone(),
+                    IntentState::Completed,
+                    IntentState::ResolutionRequired,
+                    current.version(),
+                    TransitionActor::try_new("w19-inventory-conflict".to_owned()).unwrap(),
+                    ReasonCode::FinalizerCasConflict,
+                    micros(at),
+                    LeaseAction::Preserve,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+
+    pub(super) fn business_path(&self) -> &Path {
+        &self.business_path
+    }
+
+    pub(super) fn corrupt_first_transition_hash(&self) {
+        self.mutate_without_table_triggers("push_intent_transitions", |connection| {
+            connection
+                .execute(
+                    "UPDATE push_intent_transitions SET canonical_sha256=? WHERE result_version=1",
+                    ["a".repeat(64)],
+                )
+                .unwrap();
+        });
+    }
+
+    pub(super) fn corrupt_persisted_intent_identity(&self) {
+        self.mutate_without_table_triggers("push_intents", |connection| {
+            connection
+                .execute(
+                    "UPDATE push_intents SET durable_decision_id='TEST_CODE_INVALID_DECISION'",
+                    [],
+                )
+                .unwrap();
+        });
+    }
+
+    fn mutate_without_table_triggers(
+        &self,
+        table: &str,
+        mutate: impl FnOnce(&rusqlite::Connection),
+    ) {
+        let connection = rusqlite::Connection::open(&self.business_path).unwrap();
+        let triggers = connection
+            .prepare(
+                "SELECT name,sql FROM sqlite_master \
+                 WHERE type='trigger' AND tbl_name=?1 ORDER BY name",
+            )
+            .unwrap()
+            .query_map([table], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for (name, _) in &triggers {
+            connection
+                .execute_batch(&format!("DROP TRIGGER \"{}\"", name.replace('"', "\"\"")))
+                .unwrap();
+        }
+        mutate(&connection);
+        for (_, sql) in triggers {
+            connection.execute_batch(&sql).unwrap();
+        }
+    }
+
+    pub(super) fn resolve_manual(&self, accepted: bool) {
+        let coordinator = self.durable.as_ref().unwrap();
+        coordinator
+            .resolve_uncertain(
+                &ManualResolutionCommand {
+                    decision_identity: self.legacy_decision.clone().unwrap(),
+                    disposition: if accepted {
+                        ManualDisposition::Accepted { receipt: None }
+                    } else {
+                        ManualDisposition::Rejected
+                    },
+                    operator_identity: "TEST_CODE_W19_OPERATOR_0123456789".to_owned(),
+                    reason: "TEST_CODE_W19_EXPLICIT_RESOLUTION".to_owned(),
+                    external_evidence: b"TEST_CODE_W19_MANUAL_EVIDENCE".to_vec(),
+                    resolved_at: utc(ACCEPTED + 10_000_000),
+                },
+                &self.append,
+            )
+            .unwrap();
+        coordinator
+            .reconcile_all_pending(&self.append, utc(ACCEPTED + 11_000_000))
+            .unwrap();
+    }
+    pub(super) fn audit_bytes(&self) -> Vec<Vec<u8>> {
+        let Ok(entries) = std::fs::read_dir(self.root.path().join("event_audit")) else {
+            return Vec::new();
+        };
+        let mut paths: Vec<_> = entries
             .map(|entry| entry.unwrap().path())
             .filter(|path| path.is_file())
             .collect();
@@ -374,6 +832,37 @@ impl Case {
             .iter()
             .map(|path| std::fs::read(path).unwrap())
             .collect()
+    }
+
+    pub(super) fn audit_directory_snapshot(&self) -> Vec<(String, Vec<u8>)> {
+        let Ok(entries) = std::fs::read_dir(self.root.path().join("event_audit")) else {
+            return Vec::new();
+        };
+        let mut paths: Vec<_> = entries
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_file())
+            .collect();
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|path| {
+                (
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                    std::fs::read(path).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    pub(super) fn retain_audit_lock_outside_authority(&self, year: i32) -> PathBuf {
+        let source = self
+            .root
+            .path()
+            .join("event_audit")
+            .join(format!("{year}.lock"));
+        let retained = self.root.path().join(format!("{year}.lock.retained"));
+        std::fs::rename(source, &retained).unwrap();
+        retained
     }
     fn write_n02(&self, seal: bool) {
         let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 18).unwrap();
@@ -460,7 +949,7 @@ impl Case {
         .unwrap();
         audit.append_exact_news_flash_authority(&terminal).unwrap();
     }
-    fn claim(&mut self) -> IntentSnapshot {
+    pub(super) fn claim(&mut self) -> IntentSnapshot {
         self.store
             .apply_nonterminal_transition(
                 &IntentTransitionCommand::try_new(
@@ -481,7 +970,7 @@ impl Case {
             .unwrap();
         self.store.inspect(&self.intent).unwrap().unwrap()
     }
-    fn complete(&mut self, at: i64) {
+    pub(super) fn complete(&mut self, at: i64) {
         let claimed = self.claim();
         let authority =
             GenericTerminalAuthorityAdapter::try_new(self.durable.as_ref().unwrap()).unwrap();
@@ -520,6 +1009,129 @@ impl Case {
             micros(at),
         )
         .unwrap();
+    }
+
+    pub(super) fn qualify_accepted(&mut self, at: i64) {
+        let claimed = self.claim();
+        let authority =
+            GenericTerminalAuthorityAdapter::try_new(self.durable.as_ref().unwrap()).unwrap();
+        let request = AcceptedPreparationRequest::new(
+            self.intent.clone(),
+            claimed.version(),
+            TransitionActor::try_new("w19-finalizer".to_owned()).unwrap(),
+            FinalizerFence::new(
+                LeaseOwnerId::try_new("w19-finalizer".to_owned()).unwrap(),
+                claimed.lease_generation(),
+                claimed.lease_until().unwrap(),
+            ),
+            micros(at),
+            micros(at + 1),
+        )
+        .unwrap();
+        assert!(matches!(
+            prepare_accepted_finalization(
+                &mut self.store,
+                request,
+                &self.template,
+                &self.policy,
+                &authority,
+            )
+            .unwrap(),
+            AcceptedPreparationOutcome::Pending(_)
+        ));
+    }
+
+    pub(super) fn complete_not_delivered(&mut self, at: i64) {
+        self.resolve_manual(false);
+        let claimed = self.claim();
+        let attested = claimed.attested_ready_binding().unwrap();
+        let authority =
+            GenericTerminalAuthorityAdapter::try_new(self.durable.as_ref().unwrap()).unwrap();
+        let actor = TransitionActor::try_new("w19-finalizer".to_owned()).unwrap();
+        let fence = FinalizerFence::new(
+            LeaseOwnerId::try_new("w19-finalizer".to_owned()).unwrap(),
+            claimed.lease_generation(),
+            claimed.lease_until().unwrap(),
+        );
+        let audit = VerifiedOperatorAuditRef::for_test(
+            self.intent.clone(),
+            attested.decision_id,
+            claimed.version(),
+            "TEST_CODE_W19_OPERATOR_AUDIT".to_owned(),
+            raw_digest(b"TEST_CODE_W19_OPERATOR_AUDIT"),
+        )
+        .unwrap();
+        let request = NotDeliveredPreparationRequest::new(
+            self.intent.clone(),
+            claimed.version(),
+            actor,
+            fence,
+            micros(at),
+            audit,
+        )
+        .unwrap();
+        let pending = match prepare_not_delivered_finalization(
+            &mut self.store,
+            request,
+            &self.template,
+            &self.policy,
+            &authority,
+        )
+        .unwrap()
+        {
+            NotDeliveredPreparationOutcome::Pending(pending) => pending,
+            other => panic!("expected pending NotDelivered, got {other:?}"),
+        };
+        commit_not_delivered_finalization(
+            &mut self.store,
+            pending,
+            &self.template,
+            &self.policy,
+            &authority,
+            micros(at + 1),
+            micros(at + 2),
+        )
+        .unwrap();
+    }
+
+    pub(super) fn require_resolution_after_completed(&mut self, at: i64) {
+        let current = self.store.inspect(&self.intent).unwrap().unwrap();
+        assert_eq!(current.state(), IntentState::Completed);
+        self.store
+            .apply_nonterminal_transition(
+                &IntentTransitionCommand::try_new(
+                    self.intent.clone(),
+                    IntentState::Completed,
+                    IntentState::ResolutionRequired,
+                    current.version(),
+                    TransitionActor::try_new("w19-post-completion-conflict".to_owned()).unwrap(),
+                    ReasonCode::FinalizerCasConflict,
+                    micros(at),
+                    LeaseAction::Preserve,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+
+    pub(super) fn transition_ready_to_no_data(&mut self, at: i64) {
+        let current = self.store.inspect(&self.intent).unwrap().unwrap();
+        assert_eq!(current.state(), IntentState::PendingDispatch);
+        self.store
+            .apply_nonterminal_transition(
+                &IntentTransitionCommand::try_new(
+                    self.intent.clone(),
+                    IntentState::PendingDispatch,
+                    IntentState::NoData,
+                    current.version(),
+                    TransitionActor::try_new("w19-source-refresh".to_owned()).unwrap(),
+                    ReasonCode::IntentNoData,
+                    micros(at),
+                    LeaseAction::Preserve,
+                )
+                .unwrap(),
+            )
+            .unwrap();
     }
 }
 
@@ -1158,22 +1770,7 @@ fn corrupt_persisted_transition_chain_is_rejected_without_exposing_sql() {
         true,
     );
     case.complete(ACCEPTED + 10_000_000);
-    let connection = rusqlite::Connection::open(&case.business_path).unwrap();
-    let triggers = connection.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='push_intent_transitions'").unwrap().query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
-    for trigger in triggers {
-        connection
-            .execute_batch(&format!(
-                "DROP TRIGGER \"{}\"",
-                trigger.replace('"', "\"\"")
-            ))
-            .unwrap();
-    }
-    connection
-        .execute(
-            "UPDATE push_intent_transitions SET canonical_sha256=? WHERE result_version=1",
-            ["a".repeat(64)],
-        )
-        .unwrap();
+    case.corrupt_first_transition_hash();
     let error = case
         .query(ACCEPTED + 100_000_000, Duration::from_secs(30))
         .unwrap_err();

@@ -1212,6 +1212,71 @@ pub struct BusinessIntentStore {
     connection: Connection,
 }
 
+/// A snapshot and its complete, verified transition chain from one store read.
+/// The fields are deliberately private: callers cannot assemble an SLA proof
+/// from separately read or caller-provided values.
+pub(crate) struct PersistedIntentRead {
+    snapshot: IntentSnapshot,
+    chain: Vec<TransitionReceipt>,
+}
+
+impl PersistedIntentRead {
+    pub(super) fn snapshot(&self) -> &IntentSnapshot {
+        &self.snapshot
+    }
+
+    pub(super) fn chain(&self) -> &[TransitionReceipt] {
+        &self.chain
+    }
+
+    pub(crate) fn unit_id(&self) -> &str {
+        self.snapshot.unit_id()
+    }
+
+    pub(crate) fn state(&self) -> IntentState {
+        self.snapshot.state()
+    }
+
+    pub(crate) fn occurrence_family(&self) -> &str {
+        &self.snapshot.occurrence_family
+    }
+
+    pub(crate) fn occurrence_key(&self) -> &str {
+        &self.snapshot.occurrence_key
+    }
+
+    pub(crate) fn template_sha256(&self) -> &str {
+        self.snapshot.template_sha256.as_str()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InventoryItemFailure {
+    SnapshotInvalid,
+    TransitionChainInvalid,
+}
+
+pub(crate) enum NamespaceInventoryItem<'a> {
+    Verified(&'a PersistedIntentRead),
+    Invalid(InventoryItemFailure),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NamespaceInventoryRead {
+    total: u64,
+    checked: u64,
+}
+
+impl NamespaceInventoryRead {
+    pub(crate) fn total(self) -> u64 {
+        self.total
+    }
+
+    pub(crate) fn checked(self) -> u64 {
+        self.checked
+    }
+}
+
 impl BusinessIntentStore {
     #[cfg(unix)]
     pub(super) fn activation_database_path(&self) -> Option<&str> {
@@ -2002,7 +2067,7 @@ impl BusinessIntentStore {
     pub(crate) fn inspect_with_transition_chain(
         &self,
         intent_id: &IntentId,
-    ) -> Result<(IntentSnapshot, Vec<TransitionReceipt>), IntentStoreError> {
+    ) -> Result<PersistedIntentRead, IntentStoreError> {
         let transaction =
             rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)
                 .map_err(|_| IntentStoreError::StorageFailed {
@@ -2016,7 +2081,141 @@ impl BusinessIntentStore {
             .map_err(|_| IntentStoreError::StorageFailed {
                 operation: "end_sla_read",
             })?;
-        Ok((snapshot, chain))
+        Ok(PersistedIntentRead { snapshot, chain })
+    }
+
+    /// Enumerates every state and business date in one namespace from one
+    /// source-owned deferred snapshot. The visitor receives one result for
+    /// every safely enumerated row and must aggregate it before returning.
+    pub(crate) fn scan_namespace_inventory(
+        &self,
+        namespace: &Namespace,
+        page_size: usize,
+        max_intents: usize,
+        mut visit: impl FnMut(NamespaceInventoryItem<'_>),
+    ) -> Result<NamespaceInventoryRead, IntentStoreError> {
+        if !(1..=1_000).contains(&page_size) {
+            return Err(IntentStoreError::InvalidTransition {
+                check: "inventory_page_size",
+            });
+        }
+        if !(1..=100_000).contains(&max_intents) {
+            return Err(IntentStoreError::InvalidTransition {
+                check: "inventory_max_intents",
+            });
+        }
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)
+                .map_err(|_| IntentStoreError::StorageFailed {
+                operation: "begin_inventory_read",
+            })?;
+        let read_result = (|| {
+            let namespace = namespace_storage(namespace);
+            let total_raw: i64 = transaction
+                .query_row(
+                    "SELECT count(*) FROM push_intents WHERE namespace=?1",
+                    [&namespace],
+                    |row| row.get(0),
+                )
+                .map_err(|_| IntentStoreError::StorageFailed {
+                    operation: "count_inventory",
+                })?;
+            let total =
+                u64::try_from(total_raw).map_err(|_| IntentStoreError::IntegrityFailed {
+                    check: "inventory_count",
+                })?;
+            let budget = total.min(max_intents as u64);
+            let mut checked = 0_u64;
+            let mut after_business_date: Option<String> = None;
+            let mut after_intent_id: Option<String> = None;
+
+            while checked < budget {
+                let remaining = usize::try_from(budget - checked).map_err(|_| {
+                    IntentStoreError::IntegrityFailed {
+                        check: "inventory_remaining",
+                    }
+                })?;
+                let limit = i64::try_from(page_size.min(remaining)).map_err(|_| {
+                    IntentStoreError::InvalidTransition {
+                        check: "inventory_page_size",
+                    }
+                })?;
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT business_date,intent_id FROM push_intents \
+                         WHERE namespace=?1 \
+                           AND (?2 IS NULL OR business_date>?2 \
+                                OR (business_date=?2 AND intent_id>?3)) \
+                         ORDER BY business_date ASC,intent_id ASC LIMIT ?4",
+                    )
+                    .map_err(|_| IntentStoreError::StorageFailed {
+                        operation: "prepare_inventory_page",
+                    })?;
+                let rows = statement
+                    .query_map(
+                        params![
+                            namespace,
+                            after_business_date.as_deref(),
+                            after_intent_id.as_deref(),
+                            limit
+                        ],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .map_err(|_| IntentStoreError::StorageFailed {
+                        operation: "query_inventory_page",
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(|_| IntentStoreError::StorageFailed {
+                        operation: "read_inventory_page",
+                    })?;
+                drop(statement);
+                if rows.is_empty() {
+                    return Err(IntentStoreError::IntegrityFailed {
+                        check: "inventory_page_short",
+                    });
+                }
+
+                for (business_date, intent_id) in rows {
+                    after_business_date = Some(business_date);
+                    after_intent_id = Some(intent_id.clone());
+                    let snapshot = match query_intent(&transaction, &intent_id) {
+                        Ok(Some(snapshot)) => snapshot,
+                        Ok(None) | Err(IntentStoreError::IntegrityFailed { .. }) => {
+                            visit(NamespaceInventoryItem::Invalid(
+                                InventoryItemFailure::SnapshotInvalid,
+                            ));
+                            checked += 1;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let chain = match query_transition_chain(&transaction, &snapshot) {
+                        Ok(chain) => chain,
+                        Err(IntentStoreError::IntegrityFailed { .. }) => {
+                            visit(NamespaceInventoryItem::Invalid(
+                                InventoryItemFailure::TransitionChainInvalid,
+                            ));
+                            checked += 1;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let proof = PersistedIntentRead { snapshot, chain };
+                    visit(NamespaceInventoryItem::Verified(&proof));
+                    checked += 1;
+                }
+            }
+            Ok(NamespaceInventoryRead { total, checked })
+        })();
+        let rollback_result = transaction
+            .rollback()
+            .map_err(|_| IntentStoreError::StorageFailed {
+                operation: "end_inventory_read",
+            });
+        match read_result {
+            Err(error) => Err(error),
+            Ok(read) => rollback_result.map(|()| read),
+        }
     }
 
     #[cfg(test)]

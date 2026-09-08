@@ -20,6 +20,7 @@ use super::dedicated_transport::{
     DedicatedConformanceRoute,
 };
 use super::generic_transport::GenericTerminalAuthorityAdapter;
+use super::intent_store::PersistedIntentRead;
 use super::terminal_authority::{
     verify_terminal, AuthorityDescriptor, AuthorityQuery, AuthorityQueryFailure,
     AuthorityTerminalRecord, TerminalAuthorityPort, TerminalTemplateBinding,
@@ -92,6 +93,16 @@ pub(crate) struct FinalizationSlaQuery<'a> {
     pub(crate) namespace: &'a Namespace,
     pub(crate) unit: &'a UnitId,
     pub(crate) intent: &'a IntentId,
+    pub(crate) template: &'a TerminalTemplateBinding,
+    pub(crate) policy: &'a CompletionPolicy,
+    pub(crate) route: FinalizationSlaRoute<'a>,
+    pub(crate) observed_at: UtcMicros,
+    pub(crate) reconcile_cycle: Duration,
+}
+
+pub(crate) struct PersistedFinalizationSlaQuery<'a> {
+    pub(crate) namespace: &'a Namespace,
+    pub(crate) unit: &'a UnitId,
     pub(crate) template: &'a TerminalTemplateBinding,
     pub(crate) policy: &'a CompletionPolicy,
     pub(crate) route: FinalizationSlaRoute<'a>,
@@ -224,6 +235,17 @@ impl FinalizationSlaReport {
             None
         }
     }
+
+    pub(crate) fn pending_accepted_age(&self) -> Option<Duration> {
+        if self.business_state == IntentState::Completed
+            || self.status == FinalizationSlaStatus::ClockUncertain
+        {
+            return None;
+        }
+        let accepted_at = self.accepted_at?;
+        let micros = self.observed_at.get().checked_sub(accepted_at.get())?;
+        u64::try_from(micros).ok().map(Duration::from_micros)
+    }
 }
 
 struct CapturedAuthority {
@@ -249,10 +271,44 @@ pub(crate) fn inspect_finalization_sla(
     store: &BusinessIntentStore,
     query: FinalizationSlaQuery<'_>,
 ) -> Result<FinalizationSlaReport, FinalizationSlaError> {
-    let two_cycle_target = checked_target(query.reconcile_cycle)?;
-    let (snapshot, chain) = store
+    checked_target(query.reconcile_cycle)?;
+    let persisted = store
         .inspect_with_transition_chain(query.intent)
         .map_err(|_| FinalizationSlaError::BusinessInvalid)?;
+    if persisted.snapshot().intent_id() != query.intent.as_str() {
+        return Err(FinalizationSlaError::RouteMismatch);
+    }
+    inspect_persisted_finalization_sla(
+        &persisted,
+        PersistedFinalizationSlaQuery {
+            namespace: query.namespace,
+            unit: query.unit,
+            template: query.template,
+            policy: query.policy,
+            route: query.route,
+            observed_at: query.observed_at,
+            reconcile_cycle: query.reconcile_cycle,
+        },
+    )
+}
+
+pub(crate) fn persisted_n02_window(
+    persisted: &PersistedIntentRead,
+) -> Result<NewsFlashWindow, FinalizationSlaError> {
+    if persisted.occurrence_family() != "news-flash-window" {
+        return Err(FinalizationSlaError::UnsupportedOccurrenceRoute);
+    }
+    NewsFlashWindow::parse(persisted.occurrence_key())
+        .map_err(|_| FinalizationSlaError::UnsupportedOccurrenceRoute)
+}
+
+pub(crate) fn inspect_persisted_finalization_sla(
+    persisted: &PersistedIntentRead,
+    query: PersistedFinalizationSlaQuery<'_>,
+) -> Result<FinalizationSlaReport, FinalizationSlaError> {
+    let two_cycle_target = checked_target(query.reconcile_cycle)?;
+    let snapshot = persisted.snapshot();
+    let chain = persisted.chain();
     let expected_namespace = match query.namespace {
         Namespace::Production => "Production".to_owned(),
         Namespace::Test { run_id } => format!("Test:{}", run_id.as_str()),
@@ -319,14 +375,14 @@ pub(crate) fn inspect_finalization_sla(
         }
         return Ok(report);
     }
-    let record = match query.route.read(&snapshot)? {
+    let record = match query.route.read(snapshot)? {
         AuthorityQuery::Missing => {
             report.status = FinalizationSlaStatus::Missing;
-            return Ok(unavailable_report(report, &chain, clock_before_business));
+            return Ok(unavailable_report(report, chain, clock_before_business));
         }
         AuthorityQuery::PendingSeal => {
             report.status = FinalizationSlaStatus::PendingSeal;
-            return Ok(unavailable_report(report, &chain, clock_before_business));
+            return Ok(unavailable_report(report, chain, clock_before_business));
         }
         AuthorityQuery::Terminal(record) => *record,
     };
@@ -338,7 +394,7 @@ pub(crate) fn inspect_finalization_sla(
         record,
     };
     let terminal = verify_terminal(
-        &snapshot,
+        snapshot,
         query.template,
         query.policy,
         &captured,
@@ -350,7 +406,7 @@ pub(crate) fn inspect_finalization_sla(
     report.evidence_sha256 = Some(terminal.evidence_sha256().clone());
     report.binding_sha256 = Some(terminal.binding_sha256().clone());
     let mut conflict = false;
-    for event in &chain {
+    for event in chain {
         // Both terminal business edges carry immutable authority material.
         // NotDelivered history must not silently accept a different terminal.
         if matches!(

@@ -21,6 +21,7 @@ mod activation_store;
 mod activation_transaction;
 mod business_finalizer;
 mod dedicated_transport;
+pub(crate) mod finalization_metrics;
 pub(crate) mod finalization_sla;
 mod generic_transport;
 mod intent_store;
@@ -79,6 +80,8 @@ mod activation_transaction_tests;
 mod business_finalizer_tests;
 #[cfg(test)]
 mod dedicated_transport_tests;
+#[cfg(test)]
+mod finalization_metrics_tests;
 #[cfg(test)]
 mod finalization_sla_tests;
 #[cfg(test)]

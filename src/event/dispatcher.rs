@@ -785,8 +785,8 @@ impl AuditDispatcher {
 
     /// Read one year's authoritative envelopes under the same retained-root,
     /// full-chain and cross-process lock used by append. This never creates or
-    /// writes the JSONL authority; the lock file is the existing coordination
-    /// seam shared with writers.
+    /// writes the JSONL authority; the retained lock file must already exist
+    /// and is the coordination seam shared with writers.
     pub(crate) fn read_authoritative_year(&self, year: i32) -> Result<Vec<EventEnvelope>, String> {
         use fs2::FileExt;
 
@@ -797,7 +797,7 @@ impl AuditDispatcher {
         capability.validate_complete_chain()?;
         let lock_name = format!("{year}.lock");
         let (lock, lock_identity) =
-            open_or_create_audit_file(capability, OsStr::new(&lock_name), false)?;
+            open_existing_audit_file(capability, OsStr::new(&lock_name), false)?;
         FileExt::lock_exclusive(&lock)
             .map_err(|error| format!("lock NewsFlash reconcile {lock_name}: {error}"))?;
         capability.validate_complete_chain()?;
