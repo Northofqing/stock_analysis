@@ -76,14 +76,47 @@ fn user_confirmed_account_note() -> Option<String> {
     ))
 }
 
-fn account_status_note() -> String {
-    if let Some(note) = closing_valuation_note() {
+trait BannerExternalNoteSource {
+    fn closing_valuation_note(&self) -> Option<String>;
+    fn user_confirmed_account_note(&self) -> Option<String>;
+}
+
+struct LiveBannerExternalNoteSource;
+
+impl BannerExternalNoteSource for LiveBannerExternalNoteSource {
+    fn closing_valuation_note(&self) -> Option<String> {
+        closing_valuation_note()
+    }
+
+    fn user_confirmed_account_note(&self) -> Option<String> {
+        user_confirmed_account_note()
+    }
+}
+
+fn account_status_note_from_values(
+    closing_valuation: Option<&str>,
+    user_confirmed_account: Option<&str>,
+) -> String {
+    if let Some(note) = closing_valuation {
         return format!("实时账户未接入；{note}");
     }
-    if let Some(note) = user_confirmed_account_note() {
+    if let Some(note) = user_confirmed_account {
         return format!("实时账户未接入；{note}；收盘估值不可用");
     }
     "实时账户未接入；用户确认账户摘要不可用".to_string()
+}
+
+fn account_status_note() -> String {
+    let source = LiveBannerExternalNoteSource;
+    let closing_valuation = source.closing_valuation_note();
+    let user_confirmed_account = closing_valuation
+        .is_none()
+        .then(|| source.user_confirmed_account_note())
+        .flatten();
+    account_status_note_from_values(
+        closing_valuation.as_deref(),
+        user_confirmed_account.as_deref(),
+    )
 }
 
 use stock_analysis::trading::paper_trade::{self, Direction, PaperSignal};
@@ -161,6 +194,26 @@ impl fmt::Display for DataMode {
     }
 }
 
+#[derive(Clone)]
+struct CapturedBanner {
+    rendered: String,
+}
+
+impl CapturedBanner {
+    fn render(&self) -> &str {
+        &self.rendered
+    }
+}
+
+impl fmt::Debug for CapturedBanner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CapturedBanner")
+            .field("rendered_bytes", &self.rendered.len())
+            .finish()
+    }
+}
+
 /// v12 §14.0 全局横幅入参
 ///
 /// `total_pos` 仓位成数 (0~10). `today_pnl` 日盈亏百分比 (已带正负号).
@@ -197,6 +250,22 @@ impl BannerCtx {
     /// 第 1 行: `[icon mode | 仓位N成 | 日盈亏+/-X.X% | 数据DataMode]`
     /// 第 2 行 (可选): `[⚠️ {data_missing_note}]` — 仅 Degraded/Unsafe 时出现
     pub fn render(&self) -> String {
+        self.capture().render().to_string()
+    }
+
+    fn capture(&self) -> CapturedBanner {
+        self.capture_with_external_notes(&LiveBannerExternalNoteSource)
+    }
+
+    fn capture_with_external_notes(
+        &self,
+        source: &impl BannerExternalNoteSource,
+    ) -> CapturedBanner {
+        let closing_valuation = source.closing_valuation_note();
+        let user_confirmed_account = (!self.account_metrics_complete
+            && closing_valuation.is_none())
+        .then(|| source.user_confirmed_account_note())
+        .flatten();
         let position = if !self.account_metrics_complete && self.total_pos.is_some() {
             "仓位已确认".to_string()
         } else {
@@ -219,7 +288,12 @@ impl BannerCtx {
             pnl,
             self.data_mode.label(),
         );
-        let account_note = (!self.account_metrics_complete).then_some(account_status_note());
+        let account_note = (!self.account_metrics_complete).then(|| {
+            account_status_note_from_values(
+                closing_valuation.as_deref(),
+                user_confirmed_account.as_deref(),
+            )
+        });
         let rendered = match (self.data_missing_note.as_deref(), account_note) {
             (Some(note), _) if !note.is_empty() && self.data_mode != DataMode::Full => {
                 format!("{}\n[⚠️ {}: 本条不含承接判断]", line1, note)
@@ -227,9 +301,11 @@ impl BannerCtx {
             (_, Some(note)) => format!("{}\n[ℹ️ {}]", line1, note),
             _ => line1,
         };
-        closing_valuation_note().map_or(rendered.clone(), |note| {
-            format!("{}\n[ℹ️ {}]", rendered, note)
-        })
+        CapturedBanner {
+            rendered: closing_valuation.map_or(rendered.clone(), |note| {
+                format!("{}\n[ℹ️ {}]", rendered, note)
+            }),
+        }
     }
 }
 
@@ -959,6 +1035,17 @@ pub struct PaperTradeParams<'a> {
 /// v12 §14.1 T-11 AuctionVolume 模板渲染 — 字段顺序严格对齐 docs/architecture/v13-push-templates.md
 pub fn render_auction_volume(
     banner: &BannerCtx,
+    hhmm: &str,
+    items: &[AuctionItem<'_>],
+    sentiment: &str,
+    watch_status: &str,
+) -> String {
+    let captured_banner = banner.capture();
+    render_auction_volume_from_captured(&captured_banner, hhmm, items, sentiment, watch_status)
+}
+
+fn render_auction_volume_from_captured(
+    banner: &CapturedBanner,
     hhmm: &str,
     items: &[AuctionItem<'_>],
     sentiment: &str,
@@ -5974,6 +6061,114 @@ pub fn load_auction_volume_tick_real(
     })
 }
 
+struct PreparedAuctionVolumeDispatch {
+    message: String,
+    records: Vec<stock_analysis::signal::push_recorder::PushRecordMeta>,
+    notified_codes: std::collections::HashSet<String>,
+}
+
+impl PreparedAuctionVolumeDispatch {
+    fn message(&self) -> &str {
+        &self.message
+    }
+
+    fn records(&self) -> &[stock_analysis::signal::push_recorder::PushRecordMeta] {
+        &self.records
+    }
+
+    fn notified_codes(&self) -> &std::collections::HashSet<String> {
+        &self.notified_codes
+    }
+}
+
+impl fmt::Debug for PreparedAuctionVolumeDispatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedAuctionVolumeDispatch")
+            .field("message_bytes", &self.message.len())
+            .field("record_count", &self.records.len())
+            .field("notified_code_count", &self.notified_codes.len())
+            .finish()
+    }
+}
+
+impl PartialEq for PreparedAuctionVolumeDispatch {
+    fn eq(&self, other: &Self) -> bool {
+        self.message == other.message
+            && self.notified_codes == other.notified_codes
+            && self.records.len() == other.records.len()
+            && self
+                .records
+                .iter()
+                .zip(&other.records)
+                .all(|(left, right)| {
+                    left.code == right.code
+                        && left.name == right.name
+                        && left.push_kind == right.push_kind
+                        && left.push_price.to_bits() == right.push_price.to_bits()
+                        && left.metric_json == right.metric_json
+                        && left.source == right.source
+                })
+    }
+}
+
+fn prepare_auction_volume_dispatch(
+    snapshot: &AuctionVolumeSnapshot,
+    banner: &CapturedBanner,
+) -> PreparedAuctionVolumeDispatch {
+    let auction_items: Vec<AuctionItem<'_>> = snapshot
+        .items
+        .iter()
+        .map(|(name, code, gap_pct, volume_ratio, _price)| AuctionItem {
+            name,
+            code,
+            gap_pct: *gap_pct,
+            vol_ratio: *volume_ratio,
+            tag: "",
+        })
+        .collect();
+    let message = render_auction_volume_from_captured(
+        banner,
+        &snapshot.hhmm,
+        &auction_items,
+        &snapshot.sentiment,
+        &snapshot.watch_status,
+    );
+    let records = snapshot
+        .items
+        .iter()
+        .map(|(name, code, gap_pct, volume_ratio, price)| {
+            let metric_json = truncate_metric_json(
+                serde_json::json!({
+                    "vol_ratio": volume_ratio,
+                    "price_chg_pct": gap_pct,
+                    "push_subkind": "AuctionVolume",
+                })
+                .to_string(),
+            );
+            stock_analysis::signal::push_recorder::PushRecordMeta {
+                code: code.clone(),
+                name: name.clone(),
+                push_kind: "P-02".to_string(),
+                push_price: *price,
+                metric_json,
+                source: "preopen".to_string(),
+            }
+        })
+        .collect();
+    let notified_codes = snapshot
+        .items
+        .iter()
+        .map(|(_, code, _, _, _)| code.clone())
+        .collect();
+
+    PreparedAuctionVolumeDispatch {
+        message,
+        records,
+        notified_codes,
+    }
+}
+
 async fn dispatch_auction_volume_snapshot_with<Sink, SinkFuture, Recorder>(
     snapshot: &AuctionVolumeSnapshot,
     banner: Option<&BannerCtx>,
@@ -5992,56 +6187,27 @@ where
         return false;
     };
 
-    // 构造 AuctionItem refs
-    let auction_items: Vec<AuctionItem<'_>> = snapshot
-        .items
-        .iter()
-        .map(|(n, c, g, v, _p)| AuctionItem {
-            name: n,
-            code: c,
-            gap_pct: *g,
-            vol_ratio: *v,
-            tag: "", // 简化: 不填 tag
-        })
-        .collect();
-    let text = render_auction_volume(
-        banner,
-        &snapshot.hhmm,
-        &auction_items,
-        &snapshot.sentiment,
-        &snapshot.watch_status,
-    );
-    let result = sink(text).await;
+    let captured_banner = banner.capture();
+    let prepared = prepare_auction_volume_dispatch(snapshot, &captured_banner);
+    let result = sink(prepared.message().to_string()).await;
     log_dispatcher_attempt("P-02", result, snapshot.items.len(), "");
     if !result {
         return false;
     }
 
-    for (n, c, g, v, p) in &snapshot.items {
-        let metric_json = truncate_metric_json(
-            serde_json::json!({
-                "vol_ratio": v,
-                "price_chg_pct": g,
-                "push_subkind": "AuctionVolume",
-            })
-            .to_string(),
-        );
-        if let Err(error) = recorder(&stock_analysis::signal::push_recorder::PushRecordMeta {
-            code: c.clone(),
-            name: n.clone(),
-            push_kind: "P-02".to_string(),
-            push_price: *p,
-            metric_json,
-            source: "preopen".to_string(),
-        }) {
-            let reason = format!("P-02 pushed_stocks audit failed for {c}: {error}");
+    for record in prepared.records() {
+        if let Err(error) = recorder(record) {
+            let reason = format!(
+                "P-02 pushed_stocks audit failed for {}: {error}",
+                record.code
+            );
             log::error!("{reason}");
             log_dispatcher_attempt("P-02", false, snapshot.items.len(), &reason);
             return false;
         }
     }
 
-    notified.extend(snapshot.items.iter().map(|(_, code, _, _, _)| code.clone()));
+    notified.extend(prepared.notified_codes().iter().cloned());
     true
 }
 
@@ -17130,12 +17296,225 @@ mod tests {
         }
     }
 
+    struct NoBannerExternalNotes;
+
+    impl BannerExternalNoteSource for NoBannerExternalNotes {
+        fn closing_valuation_note(&self) -> Option<String> {
+            None
+        }
+
+        fn user_confirmed_account_note(&self) -> Option<String> {
+            None
+        }
+    }
+
+    fn captured_banner_normal() -> CapturedBanner {
+        banner_normal().capture_with_external_notes(&NoBannerExternalNotes)
+    }
+
     // ---- §14.0 横幅 ----
 
     #[test]
     fn banner_normal_full_format() {
         let b = banner_normal();
         assert_eq!(b.render(), "[🟢 Normal | 仓位5成 | 日盈亏+0.3% | 数据Full]");
+    }
+
+    #[test]
+    fn banner_capture_complete_account_does_not_read_user_summary() {
+        use std::cell::Cell;
+
+        struct CountingExternalNotes<'a> {
+            user_summary_reads: &'a Cell<usize>,
+        }
+
+        impl BannerExternalNoteSource for CountingExternalNotes<'_> {
+            fn closing_valuation_note(&self) -> Option<String> {
+                None
+            }
+
+            fn user_confirmed_account_note(&self) -> Option<String> {
+                self.user_summary_reads
+                    .set(self.user_summary_reads.get() + 1);
+                None
+            }
+        }
+
+        let user_summary_reads = Cell::new(0);
+        let captured = banner_normal().capture_with_external_notes(&CountingExternalNotes {
+            user_summary_reads: &user_summary_reads,
+        });
+
+        assert_eq!(
+            captured.render(),
+            "[🟢 Normal | 仓位5成 | 日盈亏+0.3% | 数据Full]"
+        );
+        assert_eq!(user_summary_reads.get(), 0);
+    }
+
+    #[test]
+    fn banner_capture_reads_closing_note_once_and_skips_user_summary() {
+        use std::cell::Cell;
+
+        struct CountingExternalNotes<'a> {
+            closing_reads: &'a Cell<usize>,
+            user_summary_reads: &'a Cell<usize>,
+        }
+
+        impl BannerExternalNoteSource for CountingExternalNotes<'_> {
+            fn closing_valuation_note(&self) -> Option<String> {
+                self.closing_reads.set(self.closing_reads.get() + 1);
+                Some("TEST_CLOSING".to_string())
+            }
+
+            fn user_confirmed_account_note(&self) -> Option<String> {
+                self.user_summary_reads
+                    .set(self.user_summary_reads.get() + 1);
+                None
+            }
+        }
+
+        let closing_reads = Cell::new(0);
+        let user_summary_reads = Cell::new(0);
+        let banner = BannerCtx {
+            account_mode: AccountMode::ReduceOnly,
+            total_pos: None,
+            today_pnl: None,
+            account_metrics_complete: false,
+            data_mode: DataMode::Full,
+            data_missing_note: None,
+        };
+        let captured = banner.capture_with_external_notes(&CountingExternalNotes {
+            closing_reads: &closing_reads,
+            user_summary_reads: &user_summary_reads,
+        });
+
+        assert_eq!(
+            captured.render(),
+            "[🟡 ReduceOnly | 仓位缺失 | 日盈亏缺失 | 数据Full]\n\
+             [ℹ️ 实时账户未接入；TEST_CLOSING]\n\
+             [ℹ️ TEST_CLOSING]"
+        );
+        assert_eq!(closing_reads.get(), 1);
+        assert_eq!(user_summary_reads.get(), 0);
+    }
+
+    #[test]
+    fn banner_capture_is_frozen_after_external_notes_change() {
+        use std::cell::{Cell, RefCell};
+
+        struct MutableExternalNotes<'a> {
+            closing: &'a RefCell<Option<String>>,
+            user_summary: &'a RefCell<Option<String>>,
+            closing_reads: &'a Cell<usize>,
+            user_summary_reads: &'a Cell<usize>,
+        }
+
+        impl BannerExternalNoteSource for MutableExternalNotes<'_> {
+            fn closing_valuation_note(&self) -> Option<String> {
+                self.closing_reads.set(self.closing_reads.get() + 1);
+                self.closing.borrow().clone()
+            }
+
+            fn user_confirmed_account_note(&self) -> Option<String> {
+                self.user_summary_reads
+                    .set(self.user_summary_reads.get() + 1);
+                self.user_summary.borrow().clone()
+            }
+        }
+
+        let closing = RefCell::new(None);
+        let user_summary = RefCell::new(Some("FIRST_ACCOUNT_NOTE".to_string()));
+        let closing_reads = Cell::new(0);
+        let user_summary_reads = Cell::new(0);
+        let source = MutableExternalNotes {
+            closing: &closing,
+            user_summary: &user_summary,
+            closing_reads: &closing_reads,
+            user_summary_reads: &user_summary_reads,
+        };
+        let banner = BannerCtx {
+            account_mode: AccountMode::Frozen,
+            total_pos: Some(7),
+            today_pnl: Some(-2.45),
+            account_metrics_complete: false,
+            data_mode: DataMode::Full,
+            data_missing_note: None,
+        };
+        let captured = banner.capture_with_external_notes(&source);
+        let expected = "[🔴 Frozen | 仓位已确认 | 日盈亏已确认 | 数据Full]\n\
+                        [ℹ️ 实时账户未接入；FIRST_ACCOUNT_NOTE；收盘估值不可用]";
+
+        assert_eq!(captured.render(), expected);
+        assert_eq!(closing_reads.get(), 1);
+        assert_eq!(user_summary_reads.get(), 1);
+
+        closing.replace(Some("SECOND_CLOSING_NOTE".to_string()));
+        user_summary.replace(Some("SECOND_ACCOUNT_NOTE".to_string()));
+        assert_eq!(captured.render(), expected);
+        assert_eq!(captured.render(), expected);
+        assert_eq!(closing_reads.get(), 1);
+        assert_eq!(user_summary_reads.get(), 1);
+
+        let debug = format!("{captured:?}");
+        assert!(!debug.contains("FIRST_ACCOUNT_NOTE"));
+        assert!(!debug.contains(expected));
+    }
+
+    #[test]
+    fn banner_capture_preserves_full_degraded_and_unsafe_note_priority() {
+        struct FixedExternalNotes {
+            closing: Option<String>,
+            user_summary: Option<String>,
+        }
+
+        impl BannerExternalNoteSource for FixedExternalNotes {
+            fn closing_valuation_note(&self) -> Option<String> {
+                self.closing.clone()
+            }
+
+            fn user_confirmed_account_note(&self) -> Option<String> {
+                self.user_summary.clone()
+            }
+        }
+
+        let incomplete = BannerCtx {
+            account_mode: AccountMode::ReduceOnly,
+            total_pos: None,
+            today_pnl: None,
+            account_metrics_complete: false,
+            data_mode: DataMode::Full,
+            data_missing_note: None,
+        };
+        let without_closing = FixedExternalNotes {
+            closing: None,
+            user_summary: Some("TEST_ACCOUNT".to_string()),
+        };
+        assert_eq!(
+            incomplete
+                .capture_with_external_notes(&without_closing)
+                .render(),
+            "[🟡 ReduceOnly | 仓位缺失 | 日盈亏缺失 | 数据Full]\n\
+             [ℹ️ 实时账户未接入；TEST_ACCOUNT；收盘估值不可用]"
+        );
+
+        for data_mode in [DataMode::Degraded, DataMode::Unsafe] {
+            let banner = BannerCtx {
+                data_mode,
+                data_missing_note: Some("TEST_DATA_MISSING".to_string()),
+                ..incomplete.clone()
+            };
+            assert_eq!(
+                banner
+                    .capture_with_external_notes(&without_closing)
+                    .render(),
+                format!(
+                    "[🟡 ReduceOnly | 仓位缺失 | 日盈亏缺失 | 数据{}]\n\
+                     [⚠️ TEST_DATA_MISSING: 本条不含承接判断]",
+                    data_mode.label()
+                )
+            );
+        }
     }
 
     #[test]
@@ -17630,6 +18009,114 @@ mod tests {
         assert_eq!(selected_codes, vec!["VALID"]);
     }
 
+    #[test]
+    fn auction_volume_p02_preparation_contains_exact_message_records_and_codes() {
+        let snapshot = prepare_auction_volume_snapshot(
+            "09:25:00",
+            &[
+                p02_stock("SECOND", 2.5, 20.25, Some(2.3)),
+                p02_stock("FIRST", 1.4, 10.5, Some(4.5)),
+            ],
+            &std::collections::HashSet::new(),
+        )
+        .expect("valid selected snapshot");
+        let prepared = prepare_auction_volume_dispatch(&snapshot, &captured_banner_normal());
+
+        assert_eq!(
+            prepared.message(),
+            concat!(
+                "[🟢 Normal | 仓位5成 | 日盈亏+0.3% | 数据Full]\n",
+                "🌅 竞价热点量能 Top2（09:25:00）\n",
+                "  股票FIRST(FIRST) 高开+1.4% 量比4.5 []\n",
+                "  股票SECOND(SECOND) 高开+2.5% 量比2.3 []\n",
+                "情绪判读: 强承接, 观察池今日9:25 集合竞价结果, 关注开盘承接\n",
+                "辅助建议, 非下单指令",
+            )
+        );
+        assert_eq!(prepared.records().len(), 2);
+        let first = &prepared.records()[0];
+        assert_eq!(first.code, "FIRST");
+        assert_eq!(first.name, "股票FIRST");
+        assert_eq!(first.push_price, 10.5);
+        assert_eq!(
+            first.metric_json,
+            r#"{"price_chg_pct":1.4,"push_subkind":"AuctionVolume","vol_ratio":4.5}"#
+        );
+        assert_eq!(first.push_kind, "P-02");
+        assert_eq!(first.source, "preopen");
+
+        let second = &prepared.records()[1];
+        assert_eq!(second.code, "SECOND");
+        assert_eq!(second.name, "股票SECOND");
+        assert_eq!(second.push_price, 20.25);
+        assert_eq!(
+            second.metric_json,
+            r#"{"price_chg_pct":2.5,"push_subkind":"AuctionVolume","vol_ratio":2.3}"#
+        );
+        assert_eq!(second.push_kind, "P-02");
+        assert_eq!(second.source, "preopen");
+        assert_eq!(
+            prepared.notified_codes(),
+            &std::collections::HashSet::from(["FIRST".to_string(), "SECOND".to_string()])
+        );
+
+        let debug = format!("{prepared:?}");
+        assert!(!debug.contains("竞价热点量能"));
+        assert!(!debug.contains("FIRST"));
+        assert!(!debug.contains("price_chg_pct"));
+    }
+
+    #[test]
+    fn auction_volume_p02_preparation_comparison_detects_price_metric_and_code_changes() {
+        let prepare = |code: &str, price: f64, change_pct: f64, volume_ratio: f64| {
+            let snapshot = prepare_auction_volume_snapshot(
+                "09:25:00",
+                &[p02_stock(code, change_pct, price, Some(volume_ratio))],
+                &std::collections::HashSet::new(),
+            )
+            .expect("valid one-row snapshot");
+            prepare_auction_volume_dispatch(&snapshot, &captured_banner_normal())
+        };
+
+        let baseline = prepare("COMPARE", 10.0, 1.51, 4.01);
+        let price_changed = prepare("COMPARE", 20.0, 1.51, 4.01);
+        assert_eq!(baseline.message(), price_changed.message());
+        assert_ne!(baseline, price_changed);
+
+        let metric_changed = prepare("COMPARE", 10.0, 1.52, 4.02);
+        assert_eq!(baseline.message(), metric_changed.message());
+        assert_ne!(
+            baseline.records()[0].metric_json,
+            metric_changed.records()[0].metric_json
+        );
+        assert_ne!(baseline, metric_changed);
+
+        let mut code_changed = prepare("COMPARE", 10.0, 1.51, 4.01);
+        assert_eq!(baseline.message(), code_changed.message());
+        assert_eq!(baseline.records()[0].code, code_changed.records()[0].code);
+        assert_eq!(baseline.records()[0].name, code_changed.records()[0].name);
+        assert_eq!(
+            baseline.records()[0].push_price.to_bits(),
+            code_changed.records()[0].push_price.to_bits()
+        );
+        assert_eq!(
+            baseline.records()[0].metric_json,
+            code_changed.records()[0].metric_json
+        );
+        assert_eq!(
+            baseline.records()[0].push_kind,
+            code_changed.records()[0].push_kind
+        );
+        assert_eq!(
+            baseline.records()[0].source,
+            code_changed.records()[0].source
+        );
+        code_changed.notified_codes.clear();
+        code_changed.notified_codes.insert("OTHER".to_string());
+        assert_ne!(baseline.notified_codes(), code_changed.notified_codes());
+        assert_ne!(baseline, code_changed);
+    }
+
     #[tokio::test]
     async fn auction_volume_p02_filters_notified_before_stable_top10() {
         let mut stocks = vec![
@@ -17823,6 +18310,7 @@ mod tests {
         let mut records = Vec::new();
         let mut notified = std::collections::HashSet::new();
         let banner = BannerCtx::test_default();
+        let expected = prepare_auction_volume_dispatch(&snapshot, &banner.capture());
 
         let delivered = dispatch_auction_volume_snapshot_with(
             &snapshot,
@@ -17842,15 +18330,16 @@ mod tests {
         assert!(delivered);
         assert_eq!(calls.get(), 1, "dispatcher must not fetch a second batch");
         assert_eq!(messages.len(), 1);
-        assert!(messages[0].contains("股票BATCH_FIRST(BATCH_FIRST) 高开+2.5% 量比6.0"));
+        assert_eq!(messages[0], expected.message());
         assert!(!messages[0].contains("BATCH_SECOND"));
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].code, "BATCH_FIRST");
+        assert_eq!(records[0].name, "股票BATCH_FIRST");
         assert_eq!(records[0].push_price, 12.34);
-        assert_eq!(
-            notified,
-            std::collections::HashSet::from(["BATCH_FIRST".to_string()])
-        );
+        assert_eq!(records[0].metric_json, expected.records()[0].metric_json);
+        assert_eq!(records[0].push_kind, "P-02");
+        assert_eq!(records[0].source, "preopen");
+        assert_eq!(&notified, expected.notified_codes());
     }
 
     #[tokio::test]
@@ -17962,6 +18451,35 @@ mod tests {
         assert!(s.contains("B(TEST_CODE_600000) 高开+2.1% 量比3.2 [观察池]"));
         assert!(s.contains("情绪判读: 强承接, 观察池今日可操作"));
         assert!(s.contains("辅助建议, 非下单指令"));
+    }
+
+    #[test]
+    fn t11_public_renderer_matches_frozen_banner_pure_renderer() {
+        let banner = banner_normal();
+        let captured = banner.capture();
+        let items = [AuctionItem {
+            name: "共享渲染",
+            code: "TEST_CODE_000001",
+            gap_pct: 3.4,
+            vol_ratio: 5.6,
+            tag: "TEST_TAG",
+        }];
+
+        let public = render_auction_volume(&banner, "09:25", &items, "强承接", "可操作");
+        let frozen =
+            render_auction_volume_from_captured(&captured, "09:25", &items, "强承接", "可操作");
+
+        assert_eq!(public, frozen);
+        assert_eq!(
+            frozen,
+            concat!(
+                "[🟢 Normal | 仓位5成 | 日盈亏+0.3% | 数据Full]\n",
+                "🌅 竞价热点量能 Top1（09:25）\n",
+                "  共享渲染(TEST_CODE_000001) 高开+3.4% 量比5.6 [TEST_TAG]\n",
+                "情绪判读: 强承接, 观察池今日可操作\n",
+                "辅助建议, 非下单指令",
+            )
+        );
     }
 
     // ---- T-12 尾盘决策 ----

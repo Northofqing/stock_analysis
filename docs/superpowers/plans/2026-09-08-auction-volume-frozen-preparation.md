@@ -1,6 +1,6 @@
 # P-02 冻结横幅与完整业务提案
 
-日期：2026-09-08。状态：待实施。原始BASE `0d84d850ab2c8daff441da6f9bf8e6cf4d091280`。
+日期：2026-09-08。状态：实施中，最终合批验证与独立审查待完成。原始BASE `0d84d850ab2c8daff441da6f9bf8e6cf4d091280`。
 
 ## 目标与依据
 
@@ -44,10 +44,10 @@
 
 之后按真实行为逐步补齐：完整/不完整账户、closing说明有/无、Degraded/Unsafe/Full文案优先级；捕获后更换外部说明而重复渲染字节不变；同P-02快照精确消息/record/code集合，price-only变化文本可同而业务结果不同；metric/code变化和稳定同量比次序；生产dispatcher实际使用结果及sink/record失败不推进。所有外部读取/发送/record替身只放在现有effect seam，不能用手造最终成功report代替实际业务计算。
 
-保留原7项P02、1项T11、5项blocking_market_data验证；Banner共享路径改变需纳入同模块全部Banner相关测试和有明确黄金输出的相邻模板用例，具体函数由实施报告列出，父线统一组成一次最终过滤合批，非每次修改重跑全bin。必要时完整push_templates测试组作为受影响范围；所有计数以真实终态为准。
+保留原7项P02、1项T11、5项blocking_market_data验证；Banner共享路径改变需纳入同模块纯Banner相关测试和有明确黄金输出的相邻模板用例，具体函数由实施报告列出，父线统一组成一次最终过滤合批，非每次修改重跑全bin。定向源码核对发现整个push_templates::tests还含固定test_data/test.db初始化与显式可选真实sink E2E，因此本批不用整个组或宽泛banner子串；使用下列完整模块前缀，新增测试统一banner_/auction_volume_p02_前缀。需补充其他受影响测试时先核对其副作用；所有计数以真实终态为准。
 
 ```sh
-env CARGO_PROFILE_TEST_INCREMENTAL=true cargo test --bin monitor -- --test-threads=1 push_templates::tests:: blocking_market_data::tests::
+env DISPATCHER_LOG_DIR=/private/tmp/p02-frozen-dispatcher.BLBDjv CARGO_PROFILE_TEST_INCREMENTAL=true cargo test --bin monitor -- --test-threads=1 push_templates::tests::auction_volume_p02_ push_templates::tests::banner_ push_templates::tests::incomplete_banner_ push_templates::tests::confirmed_snapshot_banner_ push_templates::tests::br134_ push_templates::tests::t0 push_templates::tests::t10_ push_templates::tests::t11_ push_templates::tests::t12_ blocking_market_data::tests:: push_templates::tests::p02_preparation_rejects_non_finite_and_non_positive_market_values
 cargo clippy --bin monitor --no-deps --message-format=json
 git diff --check
 ruby scripts/architecture-docs/check-rfc-inputs.rb --root .
