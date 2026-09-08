@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 
 use crate::durable_delivery::{
     AuthoritativeDeliveryRequest, AuthoritativeSink, AuthoritativeSinkPort,
@@ -63,6 +63,43 @@ impl DurableFixture {
 
     fn coordinator(&self) -> &Arc<DurableDeliveryCoordinator> {
         self.coordinator.as_ref().expect("live W12 coordinator")
+    }
+
+    fn decision_rows(&self, decision_identity: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let connection =
+            rusqlite::Connection::open(&self.database_path).expect("isolated snapshot");
+        let mut rows = Vec::new();
+        for table in [
+            "delivery_decisions",
+            "delivery_attempts",
+            "delivery_attempt_events",
+            "delivery_state_events",
+            "immutable_audit_outbox",
+            "sink_results",
+            "delivery_disposition_payloads",
+            "task_transition_payloads",
+            "daily_budget_reservations",
+            "cooldown_reservations",
+        ] {
+            let mut statement = connection
+                .prepare(&format!(
+                    "SELECT * FROM {table} WHERE decision_identity=?1 ORDER BY rowid"
+                ))
+                .expect("snapshot decision facts");
+            let columns = statement.column_count();
+            rows.extend(
+                statement
+                    .query_map([decision_identity], |row| {
+                        (0..columns)
+                            .map(|index| row.get(index))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })
+                    .expect("read facts")
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .expect("collect facts"),
+            );
+        }
+        rows
     }
 }
 
@@ -231,7 +268,7 @@ fn request<'a>(
     fence: &'a GenericDispatchFence,
     policy: &'a crate::monitor::push_job::CompletionPolicy,
     sink: AuthoritativeSink,
-    append: &'a MemoryAppend,
+    append: &'a dyn ImmutableAppendPort,
 ) -> GenericDispatchRequest<'a> {
     GenericDispatchRequest::new(
         snapshot,
@@ -298,6 +335,221 @@ fn w12_generic_transport_dispatches_once_and_requeries_exact_w09_terminal() {
     assert_eq!(replay_terminal.binding_sha256(), &first_binding);
     assert_eq!(replay_terminal.evidence_sha256(), &first_evidence);
     assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn w16_generic_dispatch_leaves_another_pending_decision_unchanged() {
+    let (business, claimed) = claimed_snapshot();
+    let durable = DurableFixture::new("W16_RECOVERY_ISOLATION");
+    let route = route(business.template.clone());
+    let fence = fence(&claimed);
+    let append = MemoryAppend::default();
+    let at =
+        DateTime::<Utc>::from_timestamp_micros(1_788_743_102_000_000).expect("dispatch timestamp");
+    let other = crate::durable_delivery::DeliveryEnvelope::new(
+        "2026-07-30",
+        PushKind::HoldingEvent,
+        DeliverySubKind::None,
+        "GLOBAL",
+        "TEST_CODE_W16_OTHER_OCCURRENCE",
+        "TEST_CODE_W16_OTHER_EVIDENCE",
+        b"TEST_CODE_W16_OTHER_SOURCE".to_vec(),
+        "TEST_CODE_W16_OTHER_SUBJECT",
+        b"TEST_CODE_W16_OTHER_BODY".to_vec(),
+        false,
+        None,
+    )
+    .expect("other isolated decision");
+    let before = durable
+        .coordinator()
+        .prepare(&other, 0, at)
+        .expect("freeze another decision's pending denial");
+    assert_eq!(
+        before.state,
+        crate::durable_delivery::DecisionState::RejectedAuditPending
+    );
+    assert!(append
+        .records
+        .lock()
+        .expect("append observations")
+        .is_empty());
+    let other_facts = durable.decision_rows(&other.decision_identity);
+    let sink = ChannelSink::new(
+        "TEST_CODE_W12_CHANNEL",
+        AuthoritativeSinkResult::Accepted(receipt("TEST_CODE_W12_CHANNEL")),
+    );
+
+    let result = GenericTransportAuthorityAdapter::new(durable.coordinator())
+        .dispatch(request(
+            &claimed,
+            &route,
+            &fence,
+            &business.policy,
+            sink.clone(),
+            &append,
+        ))
+        .expect("target generic dispatch");
+
+    assert!(matches!(
+        result.view(),
+        DeliveryResultView::TransportAccepted(_)
+    ));
+    assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        durable
+            .coordinator()
+            .decision_state(&other.decision_identity)
+            .expect("query other decision after target dispatch"),
+        before.state,
+        "dispatch must not seal another decision's pending audit or payload"
+    );
+    assert_eq!(durable.decision_rows(&other.decision_identity), other_facts);
+    let records = append.records.lock().expect("frozen append observations");
+    assert!(!records.is_empty(), "target evidence was appended");
+    assert!(
+        records.values().all(|(_, bytes, _)| {
+            !String::from_utf8_lossy(bytes).contains(&other.decision_identity)
+        }),
+        "only target frozen bytes may reach the append port"
+    );
+    let first_records = records.clone();
+    drop(records);
+    let replay = GenericTransportAuthorityAdapter::new(durable.coordinator())
+        .dispatch(request(
+            &claimed,
+            &route,
+            &fence,
+            &business.policy,
+            sink.clone(),
+            &append,
+        ))
+        .expect("requery exact target terminal");
+    assert_eq!(result, replay);
+    assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *append.records.lock().expect("replayed bytes"),
+        first_records
+    );
+    assert_eq!(durable.decision_rows(&other.decision_identity), other_facts);
+    durable
+        .coordinator()
+        .reconcile_all_pending(&append, at)
+        .expect("global recovery remains available");
+    assert_eq!(
+        durable
+            .coordinator()
+            .decision_state(&other.decision_identity)
+            .expect("global result"),
+        crate::durable_delivery::DecisionState::RejectedDurable
+    );
+}
+
+#[test]
+fn w16_generic_dispatch_append_failure_and_retry_leave_other_decision_unchanged() {
+    struct FailFirstAcknowledgement {
+        append: MemoryAppend,
+        calls: AtomicUsize,
+    }
+    impl ImmutableAppendPort for FailFirstAcknowledgement {
+        fn append_exact(
+            &self,
+            kind: &str,
+            identity: &str,
+            bytes: &[u8],
+            sha256: &str,
+        ) -> crate::durable_delivery::Result<String> {
+            let reference = self.append.append_exact(kind, identity, bytes, sha256)?;
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(crate::durable_delivery::DurableDeliveryError::Io(
+                    std::io::Error::other("TEST_CODE_W16_LOST_APPEND_ACK"),
+                ));
+            }
+            Ok(reference)
+        }
+    }
+    let (business, claimed) = claimed_snapshot();
+    let durable = DurableFixture::new("W16_APPEND_FAILURE");
+    let route = route(business.template.clone());
+    let fence = fence(&claimed);
+    let at = DateTime::<Utc>::from_timestamp_micros(1_788_743_102_000_000).expect("timestamp");
+    let other = crate::durable_delivery::DeliveryEnvelope::new(
+        "2026-07-30",
+        PushKind::HoldingEvent,
+        DeliverySubKind::None,
+        "GLOBAL",
+        "TEST_CODE_W16_FAILURE_OTHER_OCCURRENCE",
+        "TEST_CODE_W16_FAILURE_OTHER_EVIDENCE",
+        b"TEST_CODE_W16_FAILURE_OTHER_SOURCE".to_vec(),
+        "TEST_CODE_W16_FAILURE_OTHER_SUBJECT",
+        b"TEST_CODE_W16_FAILURE_OTHER_BODY".to_vec(),
+        false,
+        None,
+    )
+    .expect("other envelope");
+    durable
+        .coordinator()
+        .prepare(&other, 0, at)
+        .expect("other pending denial");
+    let before = durable.decision_rows(&other.decision_identity);
+    let append = FailFirstAcknowledgement {
+        append: MemoryAppend::default(),
+        calls: AtomicUsize::new(0),
+    };
+    let sink = ChannelSink::new(
+        "TEST_CODE_W12_CHANNEL",
+        AuthoritativeSinkResult::Accepted(receipt("TEST_CODE_W12_CHANNEL")),
+    );
+    let adapter = GenericTransportAuthorityAdapter::new(durable.coordinator());
+    assert_eq!(
+        adapter.dispatch(request(
+            &claimed,
+            &route,
+            &fence,
+            &business.policy,
+            sink.clone(),
+            &append
+        )),
+        Err(GenericTransportError::DurableFailure)
+    );
+    assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(durable.decision_rows(&other.decision_identity), before);
+    let first_records = append
+        .append
+        .records
+        .lock()
+        .expect("lost acknowledgement bytes")
+        .clone();
+    assert_eq!(first_records.len(), 1);
+    assert!(first_records
+        .values()
+        .all(|(_, bytes, _)| !String::from_utf8_lossy(bytes).contains(&other.decision_identity)));
+    let result = adapter
+        .dispatch(request(
+            &claimed,
+            &route,
+            &fence,
+            &business.policy,
+            sink.clone(),
+            &append,
+        ))
+        .expect("retry seals target without resend");
+    assert!(matches!(
+        result.view(),
+        DeliveryResultView::TransportAccepted(_)
+    ));
+    assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(durable.decision_rows(&other.decision_identity), before);
+    let final_records = append
+        .append
+        .records
+        .lock()
+        .expect("replayed immutable bytes");
+    for (identity, record) in first_records {
+        assert_eq!(final_records.get(&identity), Some(&record));
+    }
+    assert!(final_records
+        .values()
+        .all(|(_, bytes, _)| !String::from_utf8_lossy(bytes).contains(&other.decision_identity)));
 }
 
 #[test]

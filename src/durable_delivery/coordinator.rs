@@ -3,16 +3,16 @@ use super::model::{
     AcceptedSinkResultCanonical, AuthoritativeDeliveryRequest, AuthoritativeSink,
     AuthoritativeSinkResult, AuthorityWatermark, CoordinatorConfig, DecisionState,
     DeliveryDispositionCanonical, DeliveryEnvelope, DurableDeliveryError,
-    FoundationTerminalDisposition, FoundationTerminalQuery, FoundationTerminalRecord,
-    ImmutableAppendPort, ManualAcceptedDeliveryAuditEvidence, ManualDisposition,
-    ManualResolutionAuthorizationCanonical, ManualResolutionCommand, P01DedicatedTerminalQuery,
-    P01DedicatedTerminalRecord, PolicyRow, PrepareOutcome, ReconcileSummary,
-    RejectedSinkResultCanonical, Result, ResumeOutcome, ReviewTerminalReplayAttempt,
-    ReviewTerminalReplayCompletion, ReviewTerminalReplayCompletionCanonical,
-    ReviewTerminalReplayCompletionState, ReviewTerminalReplayInput,
-    ReviewTerminalReplayStartCanonical, ScheduleHydration, ScheduleHydrationState,
-    TaskTransitionCanonical, UncertainSinkResultCanonical, WindowMode, DAILY_BUDGET_LIMIT,
-    MANUAL_ACCEPTED_DELIVERY_AUDIT_DOMAIN,
+    FoundationDeliveryBinding, FoundationTerminalDisposition, FoundationTerminalQuery,
+    FoundationTerminalRecord, ImmutableAppendPort, ManualAcceptedDeliveryAuditEvidence,
+    ManualDisposition, ManualResolutionAuthorizationCanonical, ManualResolutionCommand,
+    P01DedicatedTerminalQuery, P01DedicatedTerminalRecord, PolicyRow, PrepareOutcome,
+    ReconcileSummary, RejectedSinkResultCanonical, Result, ResumeOutcome,
+    ReviewTerminalReplayAttempt, ReviewTerminalReplayCompletion,
+    ReviewTerminalReplayCompletionCanonical, ReviewTerminalReplayCompletionState,
+    ReviewTerminalReplayInput, ReviewTerminalReplayStartCanonical, ScheduleHydration,
+    ScheduleHydrationState, TaskTransitionCanonical, UncertainSinkResultCanonical, WindowMode,
+    DAILY_BUDGET_LIMIT, MANUAL_ACCEPTED_DELIVERY_AUDIT_DOMAIN,
 };
 use super::schema::{
     configure_attested_connection, initialize_schema, load_policy, materialize_wal_capability,
@@ -494,6 +494,21 @@ struct PendingAppend {
     canonical: Vec<u8>,
     sha256: String,
     decision_identity: String,
+}
+
+#[derive(Clone, Copy)]
+enum ReconcileScope<'a> {
+    Global,
+    Decision(&'a str),
+}
+
+impl<'a> ReconcileScope<'a> {
+    fn decision_identity(self) -> Option<&'a str> {
+        match self {
+            Self::Global => None,
+            Self::Decision(identity) => Some(identity),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3919,24 +3934,69 @@ impl DurableDeliveryCoordinator {
         append_port: &dyn ImmutableAppendPort,
         now: DateTime<Utc>,
     ) -> Result<ReconcileSummary> {
+        self.reconcile_pending(ReconcileScope::Global, append_port, now)
+    }
+
+    /// Recovers only the persisted decision matching the complete expected binding.
+    /// This narrows recovery effects; it does not authenticate an activation fence.
+    pub(crate) fn reconcile_foundation_decision(
+        &self,
+        decision_identity: &str,
+        expected_binding: &FoundationDeliveryBinding,
+        append_port: &dyn ImmutableAppendPort,
+        now: DateTime<Utc>,
+    ) -> Result<ReconcileSummary> {
+        self.with_connection(|connection| {
+            let stored = load_decision(connection, decision_identity)?.ok_or_else(|| {
+                DurableDeliveryError::DecisionNotFound(decision_identity.to_owned())
+            })?;
+            if sha256_hex(&stored.envelope_canonical) != stored.envelope_sha256 {
+                return Err(DurableDeliveryError::PolicyMismatch(
+                    "foundation recovery envelope hash mismatch".to_owned(),
+                ));
+            }
+            let envelope = parse_envelope(&stored.envelope_canonical)?;
+            if envelope.canonical_bytes()? != stored.envelope_canonical
+                || envelope.decision_identity != decision_identity
+                || envelope.foundation_binding() != Some(expected_binding)
+            {
+                return Err(DurableDeliveryError::PolicyMismatch(
+                    "foundation recovery envelope or binding mismatch".to_owned(),
+                ));
+            }
+            Ok(())
+        })?;
+        self.reconcile_pending(
+            ReconcileScope::Decision(decision_identity),
+            append_port,
+            now,
+        )
+    }
+
+    fn reconcile_pending(
+        &self,
+        scope: ReconcileScope<'_>,
+        append_port: &dyn ImmutableAppendPort,
+        now: DateTime<Utc>,
+    ) -> Result<ReconcileSummary> {
         let mut progress_count = 0usize;
         loop {
             let mut progressed = false;
-            while self.recover_one_expired_attempt(now)? {
+            while self.recover_one_expired_attempt(scope, now)? {
                 progress_count += 1;
                 progressed = true;
             }
-            while self.append_one_audit(append_port)? {
+            while self.append_one_audit(scope, append_port)? {
                 progress_count += 1;
                 progressed = true;
             }
-            if self.has_blocked_audit_predecessor()? {
+            if self.has_blocked_audit_predecessor(scope)? {
                 return Err(DurableDeliveryError::AuditPredecessorBlocked);
             }
-            while self.progress_one_pending_payload(append_port, now)? {
+            while self.progress_one_pending_payload(scope, append_port, now)? {
                 progress_count += 1;
                 progressed = true;
-                while self.append_one_audit(append_port)? {
+                while self.append_one_audit(scope, append_port)? {
                     progress_count += 1;
                 }
             }
@@ -3944,7 +4004,7 @@ impl DurableDeliveryCoordinator {
                 break;
             }
         }
-        self.build_reconcile_summary(progress_count, now)
+        self.build_reconcile_summary(scope, progress_count, now)
     }
 
     pub fn resolve_uncertain(
@@ -5415,7 +5475,11 @@ impl DurableDeliveryCoordinator {
         })
     }
 
-    fn recover_one_expired_attempt(&self, now: DateTime<Utc>) -> Result<bool> {
+    fn recover_one_expired_attempt(
+        &self,
+        scope: ReconcileScope<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
         self.with_immediate_transaction(|transaction| {
             let candidate: Option<(String, String, i64, String)> = transaction
                 .query_row(
@@ -5426,8 +5490,9 @@ impl DurableDeliveryCoordinator {
                   AND d.current_attempt_identity=a.attempt_identity
                  WHERE a.state='AttemptInFlight' AND d.state='AttemptInFlight'
                    AND a.lease_expires_at<=?1
+                   AND (?2 IS NULL OR d.decision_identity=?2)
                  ORDER BY d.business_date,d.decision_identity LIMIT 1",
-                    [timestamp(now)],
+                    params![timestamp(now), scope.decision_identity()],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()?;
@@ -5523,7 +5588,11 @@ impl DurableDeliveryCoordinator {
         })
     }
 
-    fn append_one_audit(&self, append_port: &dyn ImmutableAppendPort) -> Result<bool> {
+    fn append_one_audit(
+        &self,
+        scope: ReconcileScope<'_>,
+        append_port: &dyn ImmutableAppendPort,
+    ) -> Result<bool> {
         let pending = self.with_connection(|connection| {
             Ok(connection
                 .query_row(
@@ -5534,10 +5603,11 @@ impl DurableDeliveryCoordinator {
                      LEFT JOIN immutable_audit_outbox predecessor
                        ON predecessor.audit_identity=o.predecessor_audit_identity
                      WHERE o.append_state='Pending'
+                       AND (?1 IS NULL OR o.decision_identity=?1)
                        AND (o.predecessor_audit_identity IS NULL
                             OR predecessor.append_state='Appended')
                      ORDER BY d.business_date,d.decision_identity,o.rowid LIMIT 1",
-                    [],
+                    [scope.decision_identity()],
                     |row| {
                         Ok(PendingAppend {
                             record_kind: row.get(0)?,
@@ -5581,11 +5651,12 @@ impl DurableDeliveryCoordinator {
         Ok(true)
     }
 
-    fn has_blocked_audit_predecessor(&self) -> Result<bool> {
+    fn has_blocked_audit_predecessor(&self, scope: ReconcileScope<'_>) -> Result<bool> {
         self.with_connection(|connection| {
             let pending: i64 = connection.query_row(
-                "SELECT COUNT(*) FROM immutable_audit_outbox WHERE append_state='Pending'",
-                [],
+                "SELECT COUNT(*) FROM immutable_audit_outbox WHERE append_state='Pending'
+                   AND (?1 IS NULL OR decision_identity=?1)",
+                [scope.decision_identity()],
                 |row| row.get(0),
             )?;
             if pending == 0 {
@@ -5597,9 +5668,10 @@ impl DurableDeliveryCoordinator {
              LEFT JOIN immutable_audit_outbox predecessor
                ON predecessor.audit_identity=o.predecessor_audit_identity
              WHERE o.append_state='Pending'
+               AND (?1 IS NULL OR o.decision_identity=?1)
                AND (o.predecessor_audit_identity IS NULL
                     OR predecessor.append_state='Appended')",
-                [],
+                [scope.decision_identity()],
                 |row| row.get(0),
             )?;
             Ok(ready == 0)
@@ -5608,6 +5680,7 @@ impl DurableDeliveryCoordinator {
 
     fn progress_one_pending_payload(
         &self,
+        scope: ReconcileScope<'_>,
         append_port: &dyn ImmutableAppendPort,
         now: DateTime<Utc>,
     ) -> Result<bool> {
@@ -5619,10 +5692,11 @@ impl DurableDeliveryCoordinator {
                    'RejectedAuditPending','RejectedTaskTransitionPending',
                    'UncertainAuditPending','UncertainTaskTransitionPending',
                    'ManualRejectedAuditPending','ManualRejectedTaskTransitionPending')
+                   AND (?1 IS NULL OR decision_identity=?1)
                  ORDER BY business_date,decision_identity LIMIT 1",
             )?;
             Ok(statement
-                .query_row([], |row| row.get::<_, String>(0))
+                .query_row([scope.decision_identity()], |row| row.get::<_, String>(0))
                 .optional()?)
         })?;
         let Some(decision_identity) = candidate else {
@@ -6049,6 +6123,7 @@ impl DurableDeliveryCoordinator {
 
     fn build_reconcile_summary(
         &self,
+        scope: ReconcileScope<'_>,
         progress_count: usize,
         now: DateTime<Utc>,
     ) -> Result<ReconcileSummary> {
@@ -6063,9 +6138,10 @@ impl DurableDeliveryCoordinator {
                  FROM delivery_decisions d
                  LEFT JOIN delivery_attempts a
                    ON a.attempt_identity=d.current_attempt_identity
+                 WHERE (?1 IS NULL OR d.decision_identity=?1)
                  ORDER BY d.business_date,d.decision_identity",
             )?;
-            let rows = statement.query_map([], |row| {
+            let rows = statement.query_map([scope.decision_identity()], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -6112,11 +6188,12 @@ impl DurableDeliveryCoordinator {
                  FROM task_transition_payloads t
                  JOIN delivery_decisions d ON d.decision_identity=t.decision_identity
                  WHERE t.append_state='Appended'
+                   AND (?1 IS NULL OR t.decision_identity=?1)
                    AND d.state IN ('Delivered','RejectedDurable','UncertainManualReview',
                                    'ManualResolvedRejected')
                  ORDER BY d.business_date,d.decision_identity,t.transition_identity",
             )?;
-            let rows = statement.query_map([], |row| {
+            let rows = statement.query_map([scope.decision_identity()], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, Vec<u8>>(1)?,

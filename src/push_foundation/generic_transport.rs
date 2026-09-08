@@ -219,7 +219,14 @@ impl<'a> GenericTransportAuthorityAdapter<'a> {
                 .map_err(|_| GenericTransportError::DurableFailure)?;
         }
         self.coordinator
-            .reconcile_all_pending(request.append_port, dispatched_at)
+            .reconcile_foundation_decision(
+                &decision_identity,
+                envelope
+                    .foundation_binding()
+                    .ok_or(GenericTransportError::InvalidBusinessIntent)?,
+                request.append_port,
+                dispatched_at,
+            )
             .map_err(|_| GenericTransportError::DurableFailure)?;
 
         let authority = GenericTerminalAuthorityAdapter::try_new(self.coordinator)?;
