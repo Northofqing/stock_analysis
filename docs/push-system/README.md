@@ -8,7 +8,7 @@
 - [W16 实施结果](implementation-w16-results-2026-09-08.md)：已有跨进程broker接入真实initial写入、Generic发送与只恢复；最新T4D将精确业务恢复/finalizer写入接入同一worker许可（源码`4c07aaa`、测试修正`667ee4a`）。修正后受影响合批104项通过，含4个真实进程父测试，目标Clippy零诊断，限定复核全部关闭；未变邻域保留此前498项通过证据，不冒称修正后全量重跑。生产身份/受保护根、完整四actor共同fence、实际切换、具体Unit cursor及全Unit消费仍按[实施计划](../superpowers/plans/2026-09-08-push-foundation-w16-activation.md)交付，不能按基础切片标W16完成。
 - [W16 合同裁决](activation-contract-decisions-2026-09-08.md)：澄清 shadow actor 与旧推送关系，固定外部批准包、同事务写入和paused确认顺序；真实监督器及恢复接线仍需实现证明，不是生产批准。
 - [全 Unit 部署集合合同](activation-deployment-set-contract-2026-09-08.md)：全52Unit候选集合构造、真实读取、重读漂移和范围投影已实现至`e0cdd0d`，11项专项及最终golden1项通过，限定复核关闭排序缺陷。后续snapshot/material v3、stream v2消费与实际认证仍未交付，详见[实施结果](implementation-w16-results-2026-09-08.md)。
-- [P-02 同批数据绑定实施计划](../superpowers/plans/2026-09-08-auction-volume-batch-binding.md)：正在修真实集合竞价调用链的重复采集、选票/消息/入池/通知set错位和无效数值问题。此项是已批准Unit的业务接线准备，不是新owner启用、完整Foundation PreparedFacts或整个Unit迁移完成；生产monitor不替换。
+- [P-02 同批数据修复结果](implementation-auction-volume-results-2026-09-08.md)：源码`0dda4cc`将选票、消息、入池和通知set绑定到一次采集的选中快照，同时保留持仓检测使用的完整原始列表。13项相关测试通过，最终静态检查在本次两份改动文件零诊断，独立规格/质量审查通过，无待修问题；[实施计划](../superpowers/plans/2026-09-08-auction-volume-batch-binding.md)的完整Unit迁移边界保持不变，生产monitor不替换。
 
 以下第三批状态是 **2026-09-06 的历史交接快照**，其中“W01--W21 运行时未实现”等描述不代表上述后续实现进度；原始输入/权限边界仍有效。
 

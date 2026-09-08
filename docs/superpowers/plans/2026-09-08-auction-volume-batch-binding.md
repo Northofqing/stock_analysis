@@ -2,6 +2,8 @@
 
 日期：2026-09-08。本计划属于总目标 W01–W21 / 52 Migration Unit 的真实业务接线准备，完成后仍须继续 W16 全 actor/认证、W17–W21、全部 Unit 和生产门禁，不替代或缩小它们。T4D 已在源码4c07aaa、修正667ee4a通过104项相关测试、生产Clippy目标零及限定独立复核；不重做该片。
 
+实施状态：Task 1 已完成，源码 `0dda4cc`，最终13项相关测试通过、bin Clippy本次目标零诊断，固定 `118d87c..0dda4cc` 独立Spec/quality审查通过且无待修问题。[中文结果与取舍](../../push-system/implementation-auction-volume-results-2026-09-08.md)记录共享raw修正、完整证据和剩余迁移范围；不重派已完成故障修复，不提升整个Unit状态。
+
 ## 权威合同与当前事实
 
 - `docs/push-system/push-system-implementation-rfc.md:1607–1615` 与 `push-system-wbs.v1.json` 的 `MU-auction-volume-owner`：外层new_items与dispatcher snapshot.items须同批绑定；逐票有限正价格/量比，失败不得insert通知set。WBS明确“先修PreparedFacts”。
