@@ -5870,49 +5870,49 @@ pub struct AuctionVolumeSnapshot {
     pub watch_status: String,                        // 观察状态描述
 }
 
-/// v37: 加载 P-02 快照 - 复用 limit_up_stocks
-pub fn load_auction_volume_snapshot_real(
+/// 从一次涨停池采集构造 P-02 快照。
+///
+/// `notified` 必须是本次 tick 开始时的通知集合；返回的 `items` 是后续渲染、
+/// 入池与通知游标推进共同使用的不可变选中批次。
+pub fn prepare_auction_volume_snapshot(
     hhmm: &str,
-    trading_date: chrono::NaiveDate,
+    limit_stocks: &[stock_analysis::market_data::TopStock],
+    notified: &std::collections::HashSet<String>,
 ) -> Result<AuctionVolumeSnapshot, String> {
-    use stock_analysis::market_analyzer::MarketAnalyzer;
-    let analyzer = match MarketAnalyzer::new(None) {
-        Ok(a) => a,
-        Err(error) => return Err(format!("竞价量能 analyzer 初始化失败: {error}")),
-    };
-    let limit_stocks = match analyzer.get_limit_up_stocks(trading_date) {
-        Ok(s) => s,
-        Err(error) => return Err(format!("竞价量能涨停列表获取失败: {error}")),
-    };
     if limit_stocks.is_empty() {
         return Err("竞价量能涨停列表为空".to_string());
     }
-    // 按量比降序, 取前 10
-    let mut sorted = limit_stocks.clone();
-    sorted.sort_by(|a, b| {
-        b.volume_ratio
-            .partial_cmp(&a.volume_ratio)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let items: Vec<(String, String, f64, f64, f64)> = sorted
+
+    // 排除无效及已通知票后再排序、取 Top10；稳定排序保留相同量比的输入次序。
+    let mut eligible: Vec<_> = limit_stocks
         .iter()
+        .filter_map(|stock| {
+            let ratio = stock.volume_ratio?;
+            (!notified.contains(&stock.code)
+                && stock.change_pct.is_finite()
+                && stock.price.is_finite()
+                && stock.price > 0.0
+                && ratio.is_finite()
+                && ratio > 0.0)
+                .then_some((stock, ratio))
+        })
+        .collect();
+    eligible.sort_by(|(_, a_ratio), (_, b_ratio)| b_ratio.total_cmp(a_ratio));
+    let items: Vec<(String, String, f64, f64, f64)> = eligible
+        .into_iter()
         .take(10)
-        .filter_map(|s| {
-            let Some(volume_ratio) = s.volume_ratio else {
-                log::warn!("[P-02] {}({}) 量比缺失，跳过竞价量能快照", s.name, s.code);
-                return None;
-            };
-            Some((
-                s.name.clone(),
-                s.code.clone(),
-                s.change_pct,
+        .map(|(stock, volume_ratio)| {
+            (
+                stock.name.clone(),
+                stock.code.clone(),
+                stock.change_pct,
                 volume_ratio,
-                s.price,
-            ))
+                stock.price,
+            )
         })
         .collect();
     if items.is_empty() {
-        return Err("竞价热点无具备真实量比的有效行".to_string());
+        return Err("竞价热点无有限正价格/量比且有限涨跌幅的有效行".to_string());
     }
 
     // sentiment: 平均量比 >= 3 强承接, >= 1 一般, < 1 弱承接
@@ -5933,23 +5933,65 @@ pub fn load_auction_volume_snapshot_real(
     })
 }
 
-/// v37: P-02 dispatcher
-pub async fn dispatch_auction_volume_daily(hhmm: &str, banner: &BannerCtx) -> bool {
-    let hhmm_owned = hhmm.to_string();
-    let trading_date = chrono::Local::now().date_naive();
-    let snapshot = match crate::blocking_market_data::run_blocking_market_data(
-        "P-02 auction volume snapshot",
-        move || load_auction_volume_snapshot_real(&hhmm_owned, trading_date),
-    )
-    .await
-    {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            log_dispatcher_attempt("P-02", false, 0, &error);
-            log::warn!("[P-02] 竞价量能快照不可用: {}", error);
-            return false;
-        }
+#[derive(Debug)]
+pub struct AuctionVolumeTickData {
+    pub limit_stocks: Vec<stock_analysis::market_data::TopStock>,
+    pub snapshot: Result<AuctionVolumeSnapshot, String>,
+}
+
+fn load_auction_volume_tick_with<Loader>(
+    hhmm: &str,
+    trading_date: chrono::NaiveDate,
+    notified: &std::collections::HashSet<String>,
+    mut loader: Loader,
+) -> Result<AuctionVolumeTickData, String>
+where
+    Loader: FnMut(chrono::NaiveDate) -> Result<Vec<stock_analysis::market_data::TopStock>, String>,
+{
+    let limit_stocks = loader(trading_date)?;
+    let snapshot = prepare_auction_volume_snapshot(hhmm, &limit_stocks, notified);
+    Ok(AuctionVolumeTickData {
+        limit_stocks,
+        snapshot,
+    })
+}
+
+/// v37: 一次加载 Auction 分支共享的涨停池，并从同一 Vec 准备 P-02 快照。
+pub fn load_auction_volume_tick_real(
+    hhmm: &str,
+    trading_date: chrono::NaiveDate,
+    notified: &std::collections::HashSet<String>,
+) -> Result<AuctionVolumeTickData, String> {
+    use stock_analysis::market_analyzer::MarketAnalyzer;
+    let analyzer = match MarketAnalyzer::new(None) {
+        Ok(a) => a,
+        Err(error) => return Err(format!("竞价量能 analyzer 初始化失败: {error}")),
     };
+    load_auction_volume_tick_with(hhmm, trading_date, notified, |date| {
+        analyzer
+            .get_limit_up_stocks(date)
+            .map_err(|error| format!("竞价量能涨停列表获取失败: {error}"))
+    })
+}
+
+async fn dispatch_auction_volume_snapshot_with<Sink, SinkFuture, Recorder>(
+    snapshot: &AuctionVolumeSnapshot,
+    banner: Option<&BannerCtx>,
+    notified: &mut std::collections::HashSet<String>,
+    sink: Sink,
+    mut recorder: Recorder,
+) -> bool
+where
+    Sink: FnOnce(String) -> SinkFuture,
+    SinkFuture: std::future::Future<Output = bool>,
+    Recorder: FnMut(&stock_analysis::signal::push_recorder::PushRecordMeta) -> Result<(), String>,
+{
+    let Some(banner) = banner else {
+        log_dispatcher_attempt("P-02", false, snapshot.items.len(), "banner unavailable");
+        log::warn!("[竞价][P-02] banner unavailable; retain retry eligibility");
+        return false;
+    };
+
     // 构造 AuctionItem refs
     let auction_items: Vec<AuctionItem<'_>> = snapshot
         .items
@@ -5969,51 +6011,65 @@ pub async fn dispatch_auction_volume_daily(hhmm: &str, banner: &BannerCtx) -> bo
         &snapshot.sentiment,
         &snapshot.watch_status,
     );
-    let result = dispatch_registered_outcome!(
-        "T-11-auction-volume",
-        crate::notify::PushKind::AuctionVolume,
-        "auction_volume_dispatcher",
-        "render_auction_volume",
-        "",
-        Some(banner),
-        text
-    )
-    .is_pushed();
+    let result = sink(text).await;
     log_dispatcher_attempt("P-02", result, snapshot.items.len(), "");
-    // review fix Issue #6: P-02 推送成功后入 pushed_stocks 票池 (R3)
-    // 红线 2.2: price <= 0 (缺数据) 的票不入池, 不造价格
-    if result {
-        for (n, c, g, v, p) in &snapshot.items {
-            if *p <= 0.0 {
-                log::warn!("[P-02] {}({}) 无真实价格, 跳过入池 (红线 2.2)", n, c);
-                continue;
-            }
-            let metric_json = truncate_metric_json(
-                serde_json::json!({
-                    "vol_ratio": v,
-                    "price_chg_pct": g,
-                    "push_subkind": "AuctionVolume",
-                })
-                .to_string(),
-            );
-            if let Err(error) = stock_analysis::signal::push_recorder::record(
-                &stock_analysis::signal::push_recorder::PushRecordMeta {
-                    code: c.clone(),
-                    name: n.clone(),
-                    push_kind: "P-02".to_string(),
-                    push_price: *p,
-                    metric_json,
-                    source: "preopen".to_string(),
-                },
-            ) {
-                let reason = format!("P-02 pushed_stocks audit failed for {c}: {error}");
-                log::error!("{reason}");
-                log_dispatcher_attempt("P-02", false, snapshot.items.len(), &reason);
-                return false;
-            }
+    if !result {
+        return false;
+    }
+
+    for (n, c, g, v, p) in &snapshot.items {
+        let metric_json = truncate_metric_json(
+            serde_json::json!({
+                "vol_ratio": v,
+                "price_chg_pct": g,
+                "push_subkind": "AuctionVolume",
+            })
+            .to_string(),
+        );
+        if let Err(error) = recorder(&stock_analysis::signal::push_recorder::PushRecordMeta {
+            code: c.clone(),
+            name: n.clone(),
+            push_kind: "P-02".to_string(),
+            push_price: *p,
+            metric_json,
+            source: "preopen".to_string(),
+        }) {
+            let reason = format!("P-02 pushed_stocks audit failed for {c}: {error}");
+            log::error!("{reason}");
+            log_dispatcher_attempt("P-02", false, snapshot.items.len(), &reason);
+            return false;
         }
     }
-    result
+
+    notified.extend(snapshot.items.iter().map(|(_, code, _, _, _)| code.clone()));
+    true
+}
+
+/// v37: P-02 dispatcher。调用方提供一次真实采集所得的不可变选中批次。
+pub async fn dispatch_auction_volume_daily(
+    snapshot: &AuctionVolumeSnapshot,
+    banner: Option<&BannerCtx>,
+    notified: &mut std::collections::HashSet<String>,
+) -> bool {
+    dispatch_auction_volume_snapshot_with(
+        snapshot,
+        banner,
+        notified,
+        |text| async move {
+            dispatch_registered_outcome!(
+                "T-11-auction-volume",
+                crate::notify::PushKind::AuctionVolume,
+                "auction_volume_dispatcher",
+                "render_auction_volume",
+                "",
+                banner,
+                text
+            )
+            .is_pushed()
+        },
+        |meta| stock_analysis::signal::push_recorder::record(meta).map(|_| ()),
+    )
+    .await
 }
 
 // A-10 名单快照装载已迁至 lib (src/review/catalyst_review.rs) — backfill 工具与
@@ -17528,6 +17584,359 @@ mod tests {
     }
 
     // ---- T-11 竞价异动 ----
+
+    fn p02_stock(
+        code: &str,
+        change_pct: f64,
+        price: f64,
+        volume_ratio: Option<f64>,
+    ) -> stock_analysis::market_data::TopStock {
+        stock_analysis::market_data::TopStock {
+            code: code.to_string(),
+            name: format!("股票{code}"),
+            change_pct,
+            price,
+            volume_ratio,
+            main_net_yi: None,
+        }
+    }
+
+    #[test]
+    fn p02_preparation_rejects_non_finite_and_non_positive_market_values() {
+        let stocks = vec![
+            p02_stock("VALID", 1.5, 10.0, Some(2.0)),
+            p02_stock("RATIO_MISSING", 1.0, 10.0, None),
+            p02_stock("RATIO_NAN", 1.0, 10.0, Some(f64::NAN)),
+            p02_stock("RATIO_INF", 1.0, 10.0, Some(f64::INFINITY)),
+            p02_stock("RATIO_ZERO", 1.0, 10.0, Some(0.0)),
+            p02_stock("RATIO_NEG", 1.0, 10.0, Some(-1.0)),
+            p02_stock("PRICE_NAN", 1.0, f64::NAN, Some(3.0)),
+            p02_stock("PRICE_INF", 1.0, f64::INFINITY, Some(3.0)),
+            p02_stock("PRICE_ZERO", 1.0, 0.0, Some(3.0)),
+            p02_stock("PRICE_NEG", 1.0, -1.0, Some(3.0)),
+            p02_stock("CHANGE_NAN", f64::NAN, 10.0, Some(3.0)),
+            p02_stock("CHANGE_INF", f64::INFINITY, 10.0, Some(3.0)),
+        ];
+
+        let snapshot =
+            prepare_auction_volume_snapshot("09:20:30", &stocks, &std::collections::HashSet::new())
+                .expect("the valid row should produce a snapshot");
+        let selected_codes: Vec<&str> = snapshot
+            .items
+            .iter()
+            .map(|(_, code, _, _, _)| code.as_str())
+            .collect();
+
+        assert_eq!(selected_codes, vec!["VALID"]);
+    }
+
+    #[tokio::test]
+    async fn auction_volume_p02_filters_notified_before_stable_top10() {
+        let mut stocks = vec![
+            p02_stock("NOTIFIED", 9.0, 99.0, Some(100.0)),
+            p02_stock("EQUAL_A", 1.1, 11.1, Some(9.0)),
+            p02_stock("EQUAL_B", 1.2, 12.2, Some(9.0)),
+        ];
+        for index in 0..8 {
+            stocks.push(p02_stock(
+                &format!("NEXT_{index}"),
+                index as f64,
+                20.0 + index as f64,
+                Some(8.0 - index as f64),
+            ));
+        }
+        stocks.push(p02_stock("LOW", 0.1, 9.9, Some(0.5)));
+        let notified = std::collections::HashSet::from(["NOTIFIED".to_string()]);
+
+        let snapshot = prepare_auction_volume_snapshot("09:21:00", &stocks, &notified)
+            .expect("ten eligible unnotified rows");
+        let selected_codes: Vec<_> = snapshot
+            .items
+            .iter()
+            .map(|(_, code, _, _, _)| code.as_str())
+            .collect();
+
+        assert_eq!(
+            selected_codes,
+            vec![
+                "EQUAL_A", "EQUAL_B", "NEXT_0", "NEXT_1", "NEXT_2", "NEXT_3", "NEXT_4", "NEXT_5",
+                "NEXT_6", "NEXT_7"
+            ]
+        );
+        assert_eq!(
+            snapshot.items[0],
+            (
+                "股票EQUAL_A".to_string(),
+                "EQUAL_A".to_string(),
+                1.1,
+                9.0,
+                11.1,
+            )
+        );
+
+        let mut messages = Vec::new();
+        let mut records = Vec::new();
+        let mut cursor = notified.clone();
+        let banner = BannerCtx::test_default();
+        let delivered = dispatch_auction_volume_snapshot_with(
+            &snapshot,
+            Some(&banner),
+            &mut cursor,
+            |text| {
+                messages.push(text);
+                std::future::ready(true)
+            },
+            |meta| {
+                records.push(meta.clone());
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(delivered);
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("竞价热点量能 Top10（09:21:00）"));
+        assert!(messages[0].contains("股票EQUAL_A(EQUAL_A) 高开+1.1% 量比9.0"));
+        assert!(messages[0].contains("股票EQUAL_B(EQUAL_B) 高开+1.2% 量比9.0"));
+        assert!(!messages[0].contains("NOTIFIED"));
+        assert!(!messages[0].contains("LOW"));
+        assert_eq!(
+            records
+                .iter()
+                .map(|meta| meta.code.as_str())
+                .collect::<Vec<_>>(),
+            selected_codes
+        );
+        assert_eq!(cursor.len(), 11);
+        assert!(cursor.contains("NOTIFIED"));
+        for code in selected_codes {
+            assert!(cursor.contains(code));
+        }
+    }
+
+    #[test]
+    fn auction_volume_p02_rejects_empty_and_all_invalid_batches() {
+        let notified = std::collections::HashSet::new();
+        assert!(prepare_auction_volume_snapshot("09:22:00", &[], &notified).is_err());
+        assert!(prepare_auction_volume_snapshot(
+            "09:22:00",
+            &[
+                p02_stock("MISSING", 1.0, 10.0, None),
+                p02_stock("BAD_PRICE", 1.0, 0.0, Some(2.0)),
+            ],
+            &notified,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn auction_volume_p02_source_failure_does_not_prepare_snapshot() {
+        let calls = std::cell::Cell::new(0);
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 8).expect("fixed trading date");
+        let notified = std::collections::HashSet::from(["ALREADY_NOTIFIED".to_string()]);
+        let result = load_auction_volume_tick_with("09:23:00", date, &notified, |_| {
+            calls.set(calls.get() + 1);
+            Err("provider unavailable".to_string())
+        });
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(result.unwrap_err(), "provider unavailable");
+        assert_eq!(
+            notified,
+            std::collections::HashSet::from(["ALREADY_NOTIFIED".to_string()])
+        );
+    }
+
+    #[test]
+    fn auction_volume_p02_preparation_preserves_shared_raw_stocks() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 8).expect("fixed trading date");
+        let raw = vec![
+            stock_analysis::market_data::TopStock {
+                main_net_yi: Some(1.25),
+                ..p02_stock("HOLDING_RAW", 4.0, 15.0, None)
+            },
+            stock_analysis::market_data::TopStock {
+                main_net_yi: Some(2.5),
+                ..p02_stock("P02_VALID", 2.0, 12.0, Some(5.0))
+            },
+        ];
+        let tick_data = load_auction_volume_tick_with(
+            "09:23:30",
+            date,
+            &std::collections::HashSet::new(),
+            |_| Ok(raw.clone()),
+        )
+        .expect("one source call should retain raw stocks");
+
+        assert_eq!(
+            tick_data
+                .limit_stocks
+                .iter()
+                .map(|stock| stock.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["HOLDING_RAW", "P02_VALID"]
+        );
+        assert_eq!(tick_data.limit_stocks[0].main_net_yi, Some(1.25));
+        let snapshot = tick_data.snapshot.expect("one P-02-valid row");
+        assert_eq!(
+            snapshot
+                .items
+                .iter()
+                .map(|(_, code, _, _, _)| code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["P02_VALID"]
+        );
+
+        let all_notified =
+            std::collections::HashSet::from(["HOLDING_RAW".to_string(), "P02_VALID".to_string()]);
+        let tick_data =
+            load_auction_volume_tick_with("09:23:30", date, &all_notified, |_| Ok(raw.clone()))
+                .expect("P-02 emptiness must not discard shared raw stocks");
+        assert_eq!(tick_data.limit_stocks.len(), 2);
+        assert!(tick_data.snapshot.is_err());
+    }
+
+    #[tokio::test]
+    async fn auction_volume_p02_uses_one_source_batch_for_message_records_and_cursor() {
+        let calls = std::cell::Cell::new(0);
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 8).expect("fixed trading date");
+        let tick_data = load_auction_volume_tick_with(
+            "09:24:00",
+            date,
+            &std::collections::HashSet::new(),
+            |_| {
+                calls.set(calls.get() + 1);
+                let stock = if calls.get() == 1 {
+                    p02_stock("BATCH_FIRST", 2.5, 12.34, Some(6.0))
+                } else {
+                    p02_stock("BATCH_SECOND", 8.8, 88.88, Some(9.0))
+                };
+                Ok(vec![stock])
+            },
+        )
+        .expect("first source batch is valid");
+        assert_eq!(tick_data.limit_stocks[0].code, "BATCH_FIRST");
+        let snapshot = tick_data
+            .snapshot
+            .expect("first batch prepares P-02 snapshot");
+        let mut messages = Vec::new();
+        let mut records = Vec::new();
+        let mut notified = std::collections::HashSet::new();
+        let banner = BannerCtx::test_default();
+
+        let delivered = dispatch_auction_volume_snapshot_with(
+            &snapshot,
+            Some(&banner),
+            &mut notified,
+            |text| {
+                messages.push(text);
+                std::future::ready(true)
+            },
+            |meta| {
+                records.push(meta.clone());
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(delivered);
+        assert_eq!(calls.get(), 1, "dispatcher must not fetch a second batch");
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("股票BATCH_FIRST(BATCH_FIRST) 高开+2.5% 量比6.0"));
+        assert!(!messages[0].contains("BATCH_SECOND"));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].code, "BATCH_FIRST");
+        assert_eq!(records[0].push_price, 12.34);
+        assert_eq!(
+            notified,
+            std::collections::HashSet::from(["BATCH_FIRST".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn auction_volume_p02_failures_do_not_advance_cursor() {
+        let snapshot = prepare_auction_volume_snapshot(
+            "09:24:30",
+            &[
+                p02_stock("FIRST", 1.0, 10.0, Some(3.0)),
+                p02_stock("SECOND", 2.0, 20.0, Some(2.0)),
+            ],
+            &std::collections::HashSet::new(),
+        )
+        .expect("valid two-row snapshot");
+        let banner = BannerCtx::test_default();
+
+        let mut missing_banner_sink = Vec::new();
+        let mut missing_banner_records = Vec::new();
+        let mut missing_banner_cursor = std::collections::HashSet::new();
+        let missing_banner = dispatch_auction_volume_snapshot_with(
+            &snapshot,
+            None,
+            &mut missing_banner_cursor,
+            |text| {
+                missing_banner_sink.push(text);
+                std::future::ready(true)
+            },
+            |meta| {
+                missing_banner_records.push(meta.clone());
+                Ok(())
+            },
+        )
+        .await;
+        assert!(!missing_banner);
+        assert!(missing_banner_sink.is_empty());
+        assert!(missing_banner_records.is_empty());
+        assert!(missing_banner_cursor.is_empty());
+
+        let mut failed_sink_output = Vec::new();
+        let mut failed_sink_records = Vec::new();
+        let mut failed_sink_cursor = std::collections::HashSet::new();
+        let sink_failed = dispatch_auction_volume_snapshot_with(
+            &snapshot,
+            Some(&banner),
+            &mut failed_sink_cursor,
+            |text| {
+                failed_sink_output.push(text);
+                std::future::ready(false)
+            },
+            |meta| {
+                failed_sink_records.push(meta.clone());
+                Ok(())
+            },
+        )
+        .await;
+        assert!(!sink_failed);
+        assert_eq!(failed_sink_output.len(), 1);
+        assert!(failed_sink_records.is_empty());
+        assert!(failed_sink_cursor.is_empty());
+
+        let mut partial_records = Vec::new();
+        let mut recorder_failure_cursor = std::collections::HashSet::new();
+        let recorder_failed = dispatch_auction_volume_snapshot_with(
+            &snapshot,
+            Some(&banner),
+            &mut recorder_failure_cursor,
+            |_| std::future::ready(true),
+            |meta| {
+                partial_records.push(meta.clone());
+                if partial_records.len() == 2 {
+                    Err("second record rejected".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await;
+        assert!(!recorder_failed);
+        assert_eq!(
+            partial_records
+                .iter()
+                .map(|meta| meta.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["FIRST", "SECOND"]
+        );
+        assert!(recorder_failure_cursor.is_empty());
+    }
 
     #[test]
     fn t11_auction_volume() {

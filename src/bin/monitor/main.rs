@@ -9701,76 +9701,48 @@ async fn monitor_loop() {
                         log::info!("[竞价] 9:20-9:25 量能扫描...");
 
                         let limit_pool_date = chrono::Local::now().date_naive();
-                        let limit_stocks =
+                        let auction_hhmm = chrono::Local::now().format("%H:%M:%S").to_string();
+                        let notified_at_tick_start = auction_vol_notified.clone();
+                        let (limit_stocks, auction_snapshot) =
                             match tokio::task::spawn_blocking(move || -> Result<_, String> {
-                                let analyzer =
-                                    stock_analysis::market_analyzer::MarketAnalyzer::new(None)
-                                        .map_err(|error| {
-                                            format!("初始化涨停池数据源失败: {error:#}")
-                                        })?;
-                                analyzer
-                                    .get_limit_up_stocks(limit_pool_date)
-                                    .map_err(|error| format!("获取涨停池失败: {error:#}"))
+                                push_templates::load_auction_volume_tick_real(
+                                    &auction_hhmm,
+                                    limit_pool_date,
+                                    &notified_at_tick_start,
+                                )
                             })
                             .await
                             {
-                                Ok(Ok(stocks)) => stocks,
+                                Ok(Ok(tick_data)) => {
+                                    let snapshot = match tick_data.snapshot {
+                                        Ok(snapshot) => Some(snapshot),
+                                        Err(error) => {
+                                            log::info!("[竞价][P-02] 本批次不发送: {}", error);
+                                            None
+                                        }
+                                    };
+                                    (tick_data.limit_stocks, snapshot)
+                                }
                                 Ok(Err(error)) => {
                                     log::error!("[竞价] 涨停池批次拒绝: {}", error);
-                                    Vec::new()
+                                    (Vec::new(), None)
                                 }
                                 Err(error) => {
                                     log::error!("[竞价] 涨停池后台任务失败: {}", error);
-                                    Vec::new()
+                                    (Vec::new(), None)
                                 }
                             };
 
-                        if !limit_stocks.is_empty() {
-                            // 按量比降序，取量比最高的前10（量能高代表竞价封板意愿强）
-
-                            let mut sorted = limit_stocks.clone();
-
-                            sorted.sort_by(|a, b| {
-                                b.volume_ratio
-                                    .partial_cmp(&a.volume_ratio)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                            });
-
-                            let new_items: Vec<_> = sorted
-                                .iter()
-                                .filter(|s| !auction_vol_notified.contains(&s.code))
-                                .take(10)
-                                .collect();
-
-                            if !new_items.is_empty() {
-                                // v37: 升级到 v12 §14.1 P-02 模板
-
-                                //   之前: lines.join + PushKind::AuctionVolume (v19 格式)
-
-                                //   现在: dispatch_auction_volume_daily + render_auction_volume
-
-                                //   模板: 🌅 竞价热点量能 TopN (banner + 强承接/一般/弱承接)
-
-                                let ts = chrono::Local::now().format("%H:%M:%S").to_string();
-
-                                if let Some(banner) = current_banner_for("P-02 auction volume") {
-                                    let delivered =
-                                        push_templates::dispatch_auction_volume_daily(&ts, &banner)
-                                            .await;
-                                    // Only seal identities after a confirmed
-                                    // sink outcome; failed banner/sink attempts
-                                    // remain eligible during the auction window.
-                                    if delivered {
-                                        for s in &new_items {
-                                            auction_vol_notified.insert(s.code.clone());
-                                        }
-                                    }
-                                } else {
-                                    log::warn!(
-                                        "[竞价][P-02] banner unavailable; retain retry eligibility"
-                                    );
-                                }
-                            }
+                        if let Some(snapshot) = auction_snapshot {
+                            // v37: 升级到 v12 §14.1 P-02 模板。渲染、入池与通知游标
+                            // 都消费本 tick 唯一一次涨停池采集所得的同一选中批次。
+                            let banner = current_banner_for("P-02 auction volume");
+                            push_templates::dispatch_auction_volume_daily(
+                                &snapshot,
+                                banner.as_ref(),
+                                &mut auction_vol_notified,
+                            )
+                            .await;
                         }
 
                         // BR-223: 9:20-9:25 竞价优选重推恢复 (A-02 AuctionRepush)。
