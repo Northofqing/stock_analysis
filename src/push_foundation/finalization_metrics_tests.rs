@@ -752,6 +752,27 @@ fn completed_latency_is_separate_from_current_pending_accepted_age() {
 }
 
 #[test]
+fn completed_business_conflict_keeps_current_accepted_backlog_age() {
+    let mut case = Case::new(
+        AuthorityClass::GenericCounted,
+        accepted_result(ACCEPTED),
+        true,
+    );
+    case.complete_with_historical_terminal_mismatch("ref");
+    let report = inspect_case(&case, 1, 1).unwrap();
+    assert_eq!(report.business_states().completed(), 1);
+    assert_eq!(report.sla_statuses().conflict(), 1);
+    assert_eq!(report.sla_statuses().completed(), 0);
+    assert_eq!(report.dispositions().accepted(), 1);
+    assert_eq!(report.requires_block(), 1);
+    assert_eq!(report.max_completed_latency(), None);
+    assert_eq!(
+        report.max_pending_accepted_age(),
+        Some(Duration::from_secs(400))
+    );
+}
+
+#[test]
 fn clock_uncertain_rows_are_counted_without_valid_latency_samples() {
     let case = Case::new(
         AuthorityClass::GenericCounted,

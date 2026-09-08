@@ -237,9 +237,10 @@ impl FinalizationSlaReport {
     }
 
     pub(crate) fn pending_accepted_age(&self) -> Option<Duration> {
-        if self.business_state == IntentState::Completed
-            || self.status == FinalizationSlaStatus::ClockUncertain
-        {
+        if matches!(
+            self.status,
+            FinalizationSlaStatus::Completed | FinalizationSlaStatus::ClockUncertain
+        ) {
             return None;
         }
         let accepted_at = self.accepted_at?;

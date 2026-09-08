@@ -1011,6 +1011,76 @@ impl Case {
         .unwrap();
     }
 
+    pub(super) fn complete_with_historical_terminal_mismatch(&mut self, mismatch: &str) {
+        use super::terminal_authority::{
+            terminal_binding_sha256, AuthorityQuery, TerminalAuthorityPort,
+        };
+        use super::terminal_authority_tests::FakeAuthority;
+        use crate::monitor::push_job::{TerminalDisposition, TerminalRefId};
+
+        let claimed = self.claim();
+        let adapter =
+            GenericTerminalAuthorityAdapter::try_new(self.durable.as_ref().unwrap()).unwrap();
+        let decision = self.snapshot.attested_ready_binding().unwrap().decision_id;
+        let mut record = match adapter.requery_terminal(&decision).unwrap() {
+            AuthorityQuery::Terminal(record) => *record,
+            other => panic!("unexpected {other:?}"),
+        };
+        match mismatch {
+            "ref" => {
+                record.ref_id =
+                    TerminalRefId::try_new("TEST_CODE_DIFFERENT_TERMINAL".to_owned()).unwrap();
+            }
+            "binding" => {
+                record.evidence_bytes.push(b' ');
+                record.evidence_sha256 = raw_digest(&record.evidence_bytes);
+            }
+            "disposition" => {
+                record.terminal_disposition = TerminalDisposition::ManualConfirmedAccepted;
+            }
+            _ => unreachable!(),
+        }
+        record.binding_sha256 = terminal_binding_sha256(&record);
+        let descriptor = adapter.descriptor().clone();
+        let mut conflicting = FakeAuthority::terminal(record);
+        conflicting.descriptor = descriptor;
+        let request = AcceptedPreparationRequest::new(
+            self.intent.clone(),
+            claimed.version(),
+            TransitionActor::try_new("w19-finalizer".to_owned()).unwrap(),
+            FinalizerFence::new(
+                LeaseOwnerId::try_new("w19-finalizer".to_owned()).unwrap(),
+                claimed.lease_generation(),
+                claimed.lease_until().unwrap(),
+            ),
+            micros(ACCEPTED + 1),
+            micros(ACCEPTED + 2),
+        )
+        .unwrap();
+        let pending = match prepare_accepted_finalization(
+            &mut self.store,
+            request,
+            &self.template,
+            &self.policy,
+            &conflicting,
+        )
+        .unwrap()
+        {
+            AcceptedPreparationOutcome::Pending(pending) => pending,
+            other => panic!("unexpected {other:?}"),
+        };
+        commit_accepted_finalization(
+            &mut self.store,
+            pending,
+            &self.template,
+            &self.policy,
+            &conflicting,
+            micros(ACCEPTED + 3),
+            micros(ACCEPTED + 4),
+        )
+        .unwrap();
+    }
+
     pub(super) fn qualify_accepted(&mut self, at: i64) {
         let claimed = self.claim();
         let authority =
@@ -1681,78 +1751,13 @@ fn real_manual_authority_results_never_supply_transport_accepted_latency() {
 
 #[test]
 fn actual_completed_chain_must_match_current_exact_terminal_reference() {
-    use super::terminal_authority::{
-        terminal_binding_sha256, AuthorityQuery, TerminalAuthorityPort,
-    };
-    use super::terminal_authority_tests::FakeAuthority;
-    use crate::monitor::push_job::{TerminalDisposition, TerminalRefId};
     for mismatch in ["ref", "binding", "disposition"] {
         let mut case = Case::new(
             AuthorityClass::GenericCounted,
             accepted_result(ACCEPTED),
             true,
         );
-        let claimed = case.claim();
-        let adapter =
-            GenericTerminalAuthorityAdapter::try_new(case.durable.as_ref().unwrap()).unwrap();
-        let decision = case.snapshot.attested_ready_binding().unwrap().decision_id;
-        let mut record = match adapter.requery_terminal(&decision).unwrap() {
-            AuthorityQuery::Terminal(record) => *record,
-            other => panic!("unexpected {other:?}"),
-        };
-        match mismatch {
-            "ref" => {
-                record.ref_id =
-                    TerminalRefId::try_new("TEST_CODE_DIFFERENT_TERMINAL".to_owned()).unwrap()
-            }
-            "binding" => {
-                record.evidence_bytes.push(b' ');
-                record.evidence_sha256 = raw_digest(&record.evidence_bytes);
-            }
-            "disposition" => {
-                record.terminal_disposition = TerminalDisposition::ManualConfirmedAccepted
-            }
-            _ => unreachable!(),
-        }
-        record.binding_sha256 = terminal_binding_sha256(&record);
-        let descriptor = adapter.descriptor().clone();
-        let mut conflicting = FakeAuthority::terminal(record);
-        conflicting.descriptor = descriptor;
-        let request = AcceptedPreparationRequest::new(
-            case.intent.clone(),
-            claimed.version(),
-            TransitionActor::try_new("w19-finalizer".to_owned()).unwrap(),
-            FinalizerFence::new(
-                LeaseOwnerId::try_new("w19-finalizer".to_owned()).unwrap(),
-                claimed.lease_generation(),
-                claimed.lease_until().unwrap(),
-            ),
-            micros(ACCEPTED + 1),
-            micros(ACCEPTED + 2),
-        )
-        .unwrap();
-        let pending = match prepare_accepted_finalization(
-            &mut case.store,
-            request,
-            &case.template,
-            &case.policy,
-            &conflicting,
-        )
-        .unwrap()
-        {
-            AcceptedPreparationOutcome::Pending(pending) => pending,
-            other => panic!("unexpected {other:?}"),
-        };
-        commit_accepted_finalization(
-            &mut case.store,
-            pending,
-            &case.template,
-            &case.policy,
-            &conflicting,
-            micros(ACCEPTED + 3),
-            micros(ACCEPTED + 4),
-        )
-        .unwrap();
+        case.complete_with_historical_terminal_mismatch(mismatch);
         assert_eq!(
             case.query(ACCEPTED + 100_000_000, Duration::from_secs(30))
                 .unwrap()
