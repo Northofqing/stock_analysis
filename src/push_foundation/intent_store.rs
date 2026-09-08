@@ -588,6 +588,71 @@ impl InitialIntentDraft {
     pub fn intent_id(&self) -> &IntentId {
         &self.intent_id
     }
+
+    /// Read-only binding for the fixed activation effect. This exposes no raw draft constructor.
+    pub(super) fn activation_binding(&self) -> (&str, &str, Vec<u8>) {
+        let mut fields = BTreeMap::new();
+        for (key, value) in [
+            ("intent_id", self.intent_id.as_str()),
+            ("decision_kind", self.decision_kind.as_str()),
+            ("namespace", &self.namespace),
+            ("unit", &self.unit_id),
+            ("occurrence_family", &self.occurrence_family),
+            ("occurrence_key", &self.occurrence_key),
+            ("completion_owner", &self.completion_owner),
+            ("source_contract_id", &self.source_contract_id),
+            ("subject", &self.subject),
+            ("audience", &self.audience),
+            ("decision_id", &self.durable_decision_id),
+            ("business_date", &self.business_date),
+            ("evidence_sha256", self.evidence_sha256.as_str()),
+            ("template_sha256", self.template_sha256.as_str()),
+            (
+                "source_contract_sha256",
+                self.source_contract_sha256.as_str(),
+            ),
+            ("state", self.state.as_str()),
+            ("reason", self.reason.as_str()),
+        ] {
+            fields.insert(key, CanonicalValue::String(value.to_owned()));
+        }
+        for (key, bytes) in [
+            ("prepared_push_bytes", self.prepared_push_bytes.as_deref()),
+            ("rendered_bytes", self.rendered_bytes.as_deref()),
+        ] {
+            fields.insert(
+                key,
+                bytes.map_or(CanonicalValue::Null, |bytes| {
+                    CanonicalValue::Array(
+                        bytes
+                            .iter()
+                            .map(|v| CanonicalValue::Unsigned(u64::from(*v)))
+                            .collect(),
+                    )
+                }),
+            );
+        }
+        for (key, digest) in [
+            ("payload_sha256", &self.payload_sha256),
+            ("rendered_sha256", &self.rendered_sha256),
+        ] {
+            fields.insert(
+                key,
+                digest.as_ref().map_or(CanonicalValue::Null, |v| {
+                    CanonicalValue::String(v.as_str().to_owned())
+                }),
+            );
+        }
+        fields.insert(
+            "created_at",
+            CanonicalValue::String(self.created_at.get().to_string()),
+        );
+        (
+            &self.namespace,
+            &self.unit_id,
+            canonical_preimage("ActivationInitialIntent/v1", &fields),
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1091,6 +1156,23 @@ impl BusinessIntentStore {
         draft: &InitialIntentDraft,
     ) -> Result<InitialIntentOutcome, IntentStoreError> {
         self.record_initial_inner(draft, None)
+    }
+
+    /// Exact initial-content digest after attesting the immutable draft and transition chain.
+    /// Initial insertion is version zero with an empty chain; it creates no transition event.
+    pub(super) fn inspect_activation_initial(
+        &self,
+        draft: &InitialIntentDraft,
+    ) -> Result<String, IntentStoreError> {
+        let snapshot = self
+            .inspect(draft.intent_id())?
+            .ok_or(IntentStoreError::IntentMissing)?;
+        if !snapshot.immutable_matches(draft) {
+            return Err(integrity("activation_initial_binding"));
+        }
+        self.inspect_transition_chain(draft.intent_id())?;
+        let (_, _, bytes) = draft.activation_binding();
+        Ok(raw_digest(&bytes).as_str().to_owned())
     }
 
     pub(crate) fn scan_recovery_page(

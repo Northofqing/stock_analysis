@@ -5,6 +5,12 @@ mod activation_authorization;
 mod activation_codec;
 mod activation_deployment;
 mod activation_facts;
+#[cfg(unix)]
+mod activation_fence;
+#[cfg(unix)]
+mod activation_fence_ipc;
+#[cfg(unix)]
+mod activation_fence_store;
 mod activation_owner;
 mod activation_readiness;
 mod activation_store;
@@ -48,6 +54,10 @@ mod activation_authorization_tests;
 mod activation_deployment_tests;
 #[cfg(test)]
 mod activation_facts_tests;
+#[cfg(all(test, unix))]
+mod activation_fence_process_tests;
+#[cfg(all(test, unix))]
+mod activation_fence_tests;
 #[cfg(test)]
 mod activation_owner_tests;
 #[cfg(test)]
