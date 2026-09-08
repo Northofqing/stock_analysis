@@ -1,6 +1,6 @@
 use super::coordinator::{
     install_compound_commit_rollback_test_fault, install_database_bootstrap_test_hook,
-    install_process_descriptor_snapshot_test_fault, DatabaseBootstrapTestPhase,
+    install_process_descriptor_snapshot_test_fault, AttemptLease, DatabaseBootstrapTestPhase,
     DatabaseOperationTestPhase, DeliveredPrecommitTestFault, OpenFileDescriptionProof,
     OperationPostvalidationTestFault, ProcessDescriptorSnapshotTestFault,
 };
@@ -7912,6 +7912,53 @@ fn w12_foundation_envelope(label: &str) -> DeliveryEnvelope {
         .expect("foundation-bound envelope")
 }
 
+fn w19_p01_recovery_envelope(label: &str) -> DeliveryEnvelope {
+    DeliveryEnvelope::new(
+        "2026-08-18",
+        PushKind::PreopenNewsHot,
+        DeliverySubKind::None,
+        "GLOBAL",
+        "p01:2026-08-18",
+        format!("TEST_CODE_W19_P01_SOURCE_{label}"),
+        br#"{"render_mode":"Scheduled","schema_version":"P01_SOURCE_BINDING_V1"}"#.to_vec(),
+        format!("TEST_CODE_W19_P01_SUBJECT_{label}"),
+        format!("TEST_CODE_W19_P01_RENDERED_{label}").into_bytes(),
+        false,
+        None,
+    )
+    .expect("valid W19 P01 recovery envelope")
+}
+
+fn w19_recover_uncertain_candidate(
+    fixture: &Fixture,
+    append: &MemoryAppendPort,
+    candidate: &DeliveryEnvelope,
+) -> (AttemptLease, DateTime<Utc>) {
+    prepare_reserved(fixture, candidate, append);
+    let attempt = fixture
+        .coordinator
+        .begin_attempt(&candidate.decision_identity, 1, now())
+        .expect("begin real W19 recovery attempt")
+        .expect("W19 recovery attempt created");
+    let recovered_at = now() + chrono::Duration::seconds(121);
+    let summary = fixture
+        .coordinator
+        .reconcile_all_pending(append, recovered_at)
+        .expect("expire, classify and seal W19 recovery attempt");
+    assert!(summary.progress_count > 0);
+    assert_eq!(summary.provider_calls, 0);
+    assert_eq!(summary.sink_calls, 0);
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+    assert_eq!(
+        fixture
+            .coordinator
+            .decision_state(&candidate.decision_identity)
+            .expect("read recovered decision state"),
+        DecisionState::UncertainManualReview
+    );
+    (attempt, recovered_at)
+}
+
 #[test]
 fn w12_terminal_read_model_distinguishes_missing_pending_and_accepted() {
     let fixture = Fixture::new("W12_TERMINAL_READ");
@@ -8524,6 +8571,361 @@ fn w12_terminal_record(
         FoundationTerminalQuery::Terminal(record) => record,
         other => panic!("expected W12 terminal record, got {other:?}"),
     }
+}
+
+#[test]
+fn w19_recovered_uncertain_terminal_is_readable_after_expiry() {
+    let fixture = Fixture::new("W19_RECOVERED_UNCERTAIN_READ");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("W19_RECOVERED_UNCERTAIN_READ");
+    prepare_reserved(&fixture, &candidate, &append);
+    let attempt = fixture
+        .coordinator
+        .begin_attempt(&candidate.decision_identity, 1, now())
+        .expect("begin real W19 recovery attempt")
+        .expect("W19 recovery attempt created");
+    let recovered_at = now() + chrono::Duration::seconds(121);
+
+    let summary = fixture
+        .coordinator
+        .reconcile_all_pending(&append, recovered_at)
+        .expect("expire, classify and seal the W19 recovery attempt");
+    assert!(summary.progress_count > 0);
+    assert_eq!(summary.provider_calls, 0);
+    assert_eq!(summary.sink_calls, 0);
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+    assert_eq!(
+        fixture
+            .coordinator
+            .decision_state(&candidate.decision_identity)
+            .expect("read recovered decision state"),
+        DecisionState::UncertainManualReview
+    );
+
+    let terminal = match fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .expect("sealed recovery classification is a readable terminal")
+    {
+        FoundationTerminalQuery::Terminal(record) => record,
+        other => panic!("expected recovered W19 terminal, got {other:?}"),
+    };
+    assert_eq!(
+        terminal.disposition(),
+        FoundationTerminalDisposition::Uncertain
+    );
+    assert_eq!(
+        terminal.attempt_id(),
+        Some(attempt.attempt_identity.as_str())
+    );
+    assert_eq!(
+        sha256_hex(terminal.evidence_bytes()),
+        terminal.evidence_sha256()
+    );
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+}
+
+#[test]
+fn w19_recovered_uncertain_p01_terminal_uses_the_same_real_recovery_evidence() {
+    let fixture = Fixture::new("W19_RECOVERED_UNCERTAIN_P01");
+    let append = MemoryAppendPort::default();
+    let candidate = w19_p01_recovery_envelope("P01");
+    let (attempt, _) = w19_recover_uncertain_candidate(&fixture, &append, &candidate);
+
+    let terminal = match fixture
+        .coordinator
+        .inspect_p01_dedicated_terminal("2026-08-18")
+        .expect("read recovered P01 authority")
+    {
+        P01DedicatedTerminalQuery::Terminal(record) => record,
+        other => panic!("expected recovered P01 terminal, got {other:?}"),
+    };
+    assert_eq!(
+        terminal.legacy_decision_identity,
+        candidate.decision_identity
+    );
+    assert_eq!(
+        terminal.disposition,
+        FoundationTerminalDisposition::Uncertain
+    );
+    assert_eq!(
+        terminal.attempt_id.as_deref(),
+        Some(attempt.attempt_identity.as_str())
+    );
+    assert_eq!(
+        sha256_hex(&terminal.evidence_bytes),
+        terminal.evidence_sha256
+    );
+    assert!(terminal.accepted_channel.is_none());
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+}
+
+#[test]
+fn w19_recovered_uncertain_late_nonauthoritative_result_and_restart_remain_read_only() {
+    let fixture = Fixture::new("W19_RECOVERED_UNCERTAIN_LATE_RESTART");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("W19_RECOVERED_UNCERTAIN_LATE_RESTART");
+    let (attempt, recovered_at) = w19_recover_uncertain_candidate(&fixture, &append, &candidate);
+    let before_late = match fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .expect("read recovery before late result")
+    {
+        FoundationTerminalQuery::Terminal(record) => record,
+        other => panic!("expected recovered terminal before late result, got {other:?}"),
+    };
+
+    fixture
+        .coordinator
+        .record_sink_result(
+            &attempt.attempt_identity,
+            attempt.fence_token,
+            AuthoritativeSinkResult::Accepted(receipt(recovered_at)),
+            recovered_at,
+        )
+        .expect("persist a real late non-authoritative result");
+    fixture
+        .coordinator
+        .reconcile_all_pending(&append, recovered_at)
+        .expect("seal late-result audits");
+    assert_eq!(
+        fixture.query_i64(
+            "SELECT COUNT(*) FROM sink_results
+             WHERE decision_identity=(SELECT decision_identity FROM delivery_decisions LIMIT 1)
+               AND authoritative_for_state=0 AND late_after_fence=1"
+        ),
+        1
+    );
+
+    let facts_before_reads = w16_recovery_facts(&fixture, Some(&candidate.decision_identity));
+    let append_before_reads = append.records.lock().expect("append records").clone();
+    let after_late = match fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .expect("late non-authoritative result cannot replace recovery")
+    {
+        FoundationTerminalQuery::Terminal(record) => record,
+        other => panic!("expected recovered terminal after late result, got {other:?}"),
+    };
+    let restarted = fixture.second_coordinator("W19_RECOVERED_UNCERTAIN_RESTART");
+    let after_restart = match restarted
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .expect("read same recovery after restart")
+    {
+        FoundationTerminalQuery::Terminal(record) => record,
+        other => panic!("expected recovered terminal after restart, got {other:?}"),
+    };
+    assert_eq!(after_late, before_late);
+    assert_eq!(after_restart, before_late);
+    assert_eq!(
+        restarted
+            .decision_state(&candidate.decision_identity)
+            .expect("restarted recovery state"),
+        DecisionState::UncertainManualReview
+    );
+    assert_eq!(
+        w16_recovery_facts(&fixture, Some(&candidate.decision_identity)),
+        facts_before_reads
+    );
+    assert_eq!(
+        *append.records.lock().expect("unchanged append records"),
+        append_before_reads
+    );
+}
+
+#[test]
+fn w19_recovered_uncertain_pending_audit_remains_pending_seal() {
+    let fixture = Fixture::new("W19_RECOVERED_UNCERTAIN_PENDING_SEAL");
+    let initial_append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("W19_RECOVERED_UNCERTAIN_PENDING_SEAL");
+    prepare_reserved(&fixture, &candidate, &initial_append);
+    fixture
+        .coordinator
+        .begin_attempt(&candidate.decision_identity, 1, now())
+        .expect("begin pending-seal recovery attempt")
+        .expect("pending-seal attempt created");
+    let empty_ref = EmptyAppendPort::new("FenceRevoked");
+    assert!(matches!(
+        fixture.coordinator.reconcile_all_pending(
+            &empty_ref,
+            now() + chrono::Duration::seconds(121)
+        ),
+        Err(DurableDeliveryError::PolicyMismatch(reason))
+            if reason.contains("immutable append returned an empty reference")
+    ));
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+    assert!(matches!(
+        fixture
+            .coordinator
+            .inspect_foundation_terminal(&candidate.decision_identity)
+            .expect("unsealed recovery remains readable as pending"),
+        FoundationTerminalQuery::PendingSeal {
+            state: DecisionState::UncertainAuditPending
+        }
+    ));
+}
+
+#[test]
+fn w19_recovered_uncertain_rejects_missing_duplicate_wrong_binding_tamper_and_overflow() {
+    for corruption in [
+        "missing",
+        "duplicate",
+        "wrong-audit-binding",
+        "tampered-canonical",
+        "disposition-reference",
+        "fence-overflow",
+    ] {
+        let fixture = Fixture::new(&format!("W19_RECOVERED_UNCERTAIN_{corruption}"));
+        let append = MemoryAppendPort::default();
+        let candidate = w12_foundation_envelope(&format!("W19_RECOVERED_{corruption}"));
+        w19_recover_uncertain_candidate(&fixture, &append, &candidate);
+        let connection = Connection::open(&fixture.database_path)
+            .expect("open isolated W19 recovery corruption database");
+        match corruption {
+            "missing" => {
+                connection
+                    .execute_batch("DROP TRIGGER immutable_attempt_event_delete;")
+                    .expect("remove isolated event delete guard");
+                assert_eq!(
+                    connection
+                        .execute(
+                            "DELETE FROM delivery_attempt_events
+                             WHERE decision_identity=?1 AND event_kind='RecoveryClassified'",
+                            [candidate.decision_identity.as_str()],
+                        )
+                        .expect("remove one isolated recovery event"),
+                    1
+                );
+            }
+            "duplicate" => {
+                connection
+                    .execute_batch("DROP TRIGGER immutable_attempt_event_update;")
+                    .expect("remove isolated event update guard");
+                assert_eq!(
+                    connection
+                        .execute(
+                            "UPDATE delivery_attempt_events SET event_kind='FenceRevoked'
+                             WHERE decision_identity=?1 AND event_kind='RecoveryClassified'",
+                            [candidate.decision_identity.as_str()],
+                        )
+                        .expect("duplicate isolated recovery kind"),
+                    1
+                );
+            }
+            "wrong-audit-binding" => {
+                connection
+                    .execute_batch("DROP TRIGGER immutable_outbox_payload_update;")
+                    .expect("remove isolated audit update guard");
+                assert_eq!(
+                    connection
+                        .execute(
+                            "UPDATE immutable_audit_outbox SET audit_kind='FenceRevoked'
+                             WHERE decision_identity=?1 AND audit_kind='RecoveryClassified'",
+                            [candidate.decision_identity.as_str()],
+                        )
+                        .expect("rebind isolated recovery audit"),
+                    1
+                );
+            }
+            "tampered-canonical" => {
+                connection
+                    .execute_batch("DROP TRIGGER immutable_attempt_event_update;")
+                    .expect("remove isolated event update guard");
+                assert_eq!(
+                    connection
+                        .execute(
+                            "UPDATE delivery_attempt_events SET event_canonical=x'7b7d'
+                             WHERE decision_identity=?1 AND event_kind='FenceRevoked'",
+                            [candidate.decision_identity.as_str()],
+                        )
+                        .expect("tamper isolated recovery canonical"),
+                    1
+                );
+            }
+            "disposition-reference" => {
+                connection
+                    .execute_batch("DROP TRIGGER immutable_disposition_payload_update;")
+                    .expect("remove isolated disposition update guard");
+                assert_eq!(
+                    connection
+                        .execute(
+                            "UPDATE delivery_disposition_payloads SET disposition_sha256=?1
+                             WHERE decision_identity=?2",
+                            params![
+                                sha256_hex(b"TEST_CODE_W19_WRONG_DISPOSITION_REFERENCE"),
+                                candidate.decision_identity
+                            ],
+                        )
+                        .expect("tamper isolated recovery disposition reference"),
+                    1
+                );
+            }
+            "fence-overflow" => {
+                assert_eq!(
+                    connection
+                        .execute(
+                            "UPDATE delivery_attempts SET fence_token=9223372036854775807
+                             WHERE decision_identity=?1",
+                            [candidate.decision_identity.as_str()],
+                        )
+                        .expect("inject isolated fence overflow"),
+                    1
+                );
+            }
+            _ => unreachable!(),
+        }
+        drop(connection);
+
+        let error = fixture
+            .coordinator
+            .inspect_foundation_terminal(&candidate.decision_identity)
+            .expect_err("corrupt recovery evidence must be rejected");
+        assert!(matches!(error, DurableDeliveryError::PolicyMismatch(_)));
+        assert!(!error.to_string().contains("TEST_CODE"));
+        assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+    }
+}
+
+#[test]
+fn w19_recovered_uncertain_rejects_any_authoritative_sink_conflict() {
+    let fixture = Fixture::new("W19_RECOVERED_UNCERTAIN_AUTHORITY_CONFLICT");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("W19_RECOVERED_UNCERTAIN_AUTHORITY_CONFLICT");
+    let (attempt, recovered_at) = w19_recover_uncertain_candidate(&fixture, &append, &candidate);
+    fixture
+        .coordinator
+        .record_sink_result(
+            &attempt.attempt_identity,
+            attempt.fence_token,
+            AuthoritativeSinkResult::Accepted(receipt(recovered_at)),
+            recovered_at,
+        )
+        .expect("persist actual late Accepted before isolated authority corruption");
+    let connection = Connection::open(&fixture.database_path)
+        .expect("open isolated W19 authoritative conflict database");
+    connection
+        .execute_batch("DROP TRIGGER immutable_sink_result_update;")
+        .expect("remove isolated sink immutability guard");
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE sink_results
+                 SET authoritative_for_state=1,late_after_fence=0,late_receipt_audit_identity=NULL
+                 WHERE decision_identity=?1 AND result_kind='Accepted'",
+                [candidate.decision_identity.as_str()],
+            )
+            .expect("inject isolated authoritative Accepted conflict"),
+        1
+    );
+    drop(connection);
+
+    assert!(matches!(
+        fixture
+            .coordinator
+            .inspect_foundation_terminal(&candidate.decision_identity),
+        Err(DurableDeliveryError::PolicyMismatch(reason))
+            if reason == "foundation uncertain terminal has conflicting authoritative sources"
+    ));
 }
 
 #[test]

@@ -36,7 +36,7 @@ use crate::monitor::push_job::{
     raw_digest, w09_completion_policy_fixture, AudienceId, AuthorityClass, BusinessDate, ChannelId,
     CompletionOwnerId, CompletionPolicy, IntentId, Namespace, OccurrenceFamily,
     OccurrenceIdentityMaterial, OccurrenceKey, ReasonCode, RunId, SourceContractId, SubjectId,
-    TemplateId, TemplateVersion, UnitId, UtcMicros,
+    TemplateId, TemplateVersion, TerminalDisposition, UnitId, UtcMicros,
 };
 use chrono::{DateTime, Utc};
 
@@ -162,6 +162,42 @@ impl Case {
         kind: InitialDecisionKind,
         family_override: Option<&str>,
         key_override: Option<&str>,
+    ) -> Self {
+        Self::variant_occurrence_with_recovery(
+            class,
+            result,
+            seal,
+            kind,
+            family_override,
+            key_override,
+            false,
+        )
+    }
+
+    pub(super) fn recovered_uncertain(class: AuthorityClass) -> Self {
+        assert!(matches!(
+            class,
+            AuthorityClass::GenericCounted | AuthorityClass::P01Dedicated
+        ));
+        Self::variant_occurrence_with_recovery(
+            class,
+            uncertain_result(ACCEPTED),
+            true,
+            InitialDecisionKind::Ready,
+            None,
+            None,
+            true,
+        )
+    }
+
+    fn variant_occurrence_with_recovery(
+        class: AuthorityClass,
+        result: AuthoritativeSinkResult,
+        seal: bool,
+        kind: InitialDecisionKind,
+        family_override: Option<&str>,
+        key_override: Option<&str>,
+        recover_expired_attempt: bool,
     ) -> Self {
         std::fs::create_dir_all("data/test").unwrap();
         let root = tempfile::Builder::new()
@@ -320,24 +356,37 @@ impl Case {
             };
             case.legacy_decision = Some(envelope.decision_identity.clone());
             let coordinator = case.durable.as_ref().unwrap();
+            let (prepared_at, initially_sealed_at) = if recover_expired_attempt {
+                (ACCEPTED - 123_000_000, ACCEPTED - 122_000_000)
+            } else {
+                (ACCEPTED - 2_000_000, ACCEPTED - 1_000_000)
+            };
+            coordinator.prepare(&envelope, 1, utc(prepared_at)).unwrap();
             coordinator
-                .prepare(&envelope, 1, utc(ACCEPTED - 2_000_000))
+                .reconcile_all_pending(&case.append, utc(initially_sealed_at))
                 .unwrap();
-            coordinator
-                .reconcile_all_pending(&case.append, utc(ACCEPTED - 1_000_000))
-                .unwrap();
-            let sinks: Vec<AuthoritativeSink> = vec![case.sink.clone()];
-            coordinator
-                .resume_deliverable(
-                    &envelope.decision_identity,
-                    &sinks,
-                    utc(ACCEPTED + 1_000_000),
-                )
-                .unwrap();
-            if seal {
+            if recover_expired_attempt {
                 coordinator
-                    .reconcile_all_pending(&case.append, utc(ACCEPTED + 2_000_000))
+                    .begin_attempt(&envelope.decision_identity, 1, utc(ACCEPTED - 121_000_000))
+                    .unwrap()
+                    .expect("real recovery attempt");
+                coordinator
+                    .reconcile_all_pending(&case.append, utc(ACCEPTED))
                     .unwrap();
+            } else {
+                let sinks: Vec<AuthoritativeSink> = vec![case.sink.clone()];
+                coordinator
+                    .resume_deliverable(
+                        &envelope.decision_identity,
+                        &sinks,
+                        utc(ACCEPTED + 1_000_000),
+                    )
+                    .unwrap();
+                if seal {
+                    coordinator
+                        .reconcile_all_pending(&case.append, utc(ACCEPTED + 2_000_000))
+                        .unwrap();
+                }
             }
         }
         case
@@ -1385,6 +1434,43 @@ fn rejected_and_uncertain_real_sources_are_not_transport_accepted_samples() {
         assert_eq!(report.status(), status);
         assert_eq!(report.accepted_at(), None);
         assert_eq!(report.elapsed(), None);
+    }
+}
+
+#[test]
+fn recovered_uncertain_generic_and_p01_routes_are_not_accepted_samples() {
+    for class in [AuthorityClass::GenericCounted, AuthorityClass::P01Dedicated] {
+        let mut case = Case::recovered_uncertain(class);
+        let before = case.rows();
+        let effects_before = case.effect_counts();
+        assert_eq!(effects_before.1, 0, "recovery must not call a sink");
+
+        let first = case
+            .query(ACCEPTED + 400_000_000, Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(first.status(), FinalizationSlaStatus::Uncertain);
+        assert_eq!(first.business_state(), IntentState::PendingDispatch);
+        assert_eq!(first.authority(), class);
+        assert_eq!(first.disposition(), Some(TerminalDisposition::Uncertain));
+        assert_eq!(first.accepted_at(), None);
+        assert_eq!(first.completed_at(), None);
+        assert_eq!(first.elapsed(), None);
+        assert_eq!(first.target_exceeded(), None);
+        assert_eq!(first.hard_limit_reached(), None);
+        assert!(!first.requires_block());
+        assert!(first.terminal_ref_sha256().is_some());
+        assert!(first.evidence_sha256().is_some());
+        assert!(first.binding_sha256().is_some());
+        assert_eq!(before, case.rows());
+        assert_eq!(effects_before, case.effect_counts());
+
+        case.restart();
+        let second = case
+            .query(ACCEPTED + 400_000_000, Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(second, first);
+        assert_eq!(before, case.rows());
+        assert_eq!(effects_before, case.effect_counts());
     }
 }
 

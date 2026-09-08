@@ -78,6 +78,42 @@ fn actual_generic_p01_and_n02_sources_enter_inventory_metrics_without_writes() {
 }
 
 #[test]
+fn recovered_uncertain_generic_and_p01_inventory_counts_real_disposition_without_acceptance() {
+    for class in [AuthorityClass::GenericCounted, AuthorityClass::P01Dedicated] {
+        let mut case = Case::recovered_uncertain(class);
+        let before = case.rows();
+        let effects_before = case.effect_counts();
+        assert_eq!(effects_before.1, 0, "recovery must not call a sink");
+
+        let first = inspect_case(&case, 1, 1).unwrap();
+        assert_eq!(first.inventory_total(), 1);
+        assert_eq!(first.checked(), 1);
+        assert_eq!(first.unchecked(), 0);
+        assert_eq!(first.coverage(), InventoryCoverage::Complete);
+        assert_eq!(first.business_states().pending_dispatch(), 1);
+        assert_eq!(first.sla_statuses().uncertain(), 1);
+        assert_eq!(first.sla_statuses().awaiting_finalization(), 0);
+        assert_eq!(first.sla_statuses().completed(), 0);
+        assert_eq!(first.dispositions().uncertain(), 1);
+        assert_eq!(first.dispositions().accepted(), 0);
+        assert_eq!(first.errors().total(), 0);
+        assert_eq!(first.target_exceeded(), 0);
+        assert_eq!(first.hard_limit_reached(), 0);
+        assert_eq!(first.requires_block(), 0);
+        assert_eq!(first.max_completed_latency(), None);
+        assert_eq!(first.max_pending_accepted_age(), None);
+        assert_eq!(before, case.rows());
+        assert_eq!(effects_before, case.effect_counts());
+
+        case.restart();
+        let second = inspect_case(&case, 1, 1).unwrap();
+        assert_eq!(second, first);
+        assert_eq!(before, case.rows());
+        assert_eq!(effects_before, case.effect_counts());
+    }
+}
+
+#[test]
 fn n02_cold_read_rejects_missing_retained_lock_without_creating_files() {
     let single = Case::new(
         AuthorityClass::N02Dedicated,
