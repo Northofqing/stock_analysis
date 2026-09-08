@@ -18331,6 +18331,7 @@ mod tests {
         assert_eq!(calls.get(), 1, "dispatcher must not fetch a second batch");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0], expected.message());
+        assert!(messages[0].contains("股票BATCH_FIRST(BATCH_FIRST) 高开+2.5% 量比6.0"));
         assert!(!messages[0].contains("BATCH_SECOND"));
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].code, "BATCH_FIRST");
@@ -18340,6 +18341,10 @@ mod tests {
         assert_eq!(records[0].push_kind, "P-02");
         assert_eq!(records[0].source, "preopen");
         assert_eq!(&notified, expected.notified_codes());
+        assert_eq!(
+            notified,
+            std::collections::HashSet::from(["BATCH_FIRST".to_string()])
+        );
     }
 
     #[tokio::test]
