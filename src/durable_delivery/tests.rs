@@ -10,7 +10,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
 use std::ops::Deref;
 use std::os::fd::AsRawFd;
@@ -706,7 +706,7 @@ fn downgrade_replay_schema_v4_for_test(connection: &mut Connection, replay_prese
                      'BusinessDateOnceClaimed','DecisionIdentityConflict',
                      'ScheduleHydrationApplied')),
                    predecessor_audit_identity TEXT
-                     REFERENCES immutable_audit_outbox_v4_historical(audit_identity),
+                     REFERENCES immutable_audit_outbox(audit_identity),
                    audit_canonical BLOB NOT NULL,
                    audit_sha256 TEXT NOT NULL,
                    append_state TEXT NOT NULL CHECK(append_state IN ('Pending','Appended')),
@@ -745,6 +745,261 @@ fn downgrade_replay_schema_v4_for_test(connection: &mut Connection, replay_prese
     connection
         .pragma_update(None, "foreign_keys", "ON")
         .expect("enable FK enforcement for historical v4 migration");
+}
+
+fn real_v4_upgrade_target_snapshot(
+    connection: &Connection,
+    decision_identity: &str,
+) -> BTreeMap<String, Vec<Vec<rusqlite::types::Value>>> {
+    [
+        ("delivery_decisions", "decision_identity"),
+        ("daily_budget_reservations", "budget_reservation_identity"),
+        ("cooldown_reservations", "cooldown_reservation_identity"),
+        ("delivery_attempts", "attempt_identity"),
+        ("delivery_state_events", "state_event_identity"),
+        ("delivery_attempt_events", "attempt_event_identity"),
+        ("daily_budget_reservation_events", "event_identity"),
+        ("cooldown_reservation_events", "event_identity"),
+        ("immutable_audit_outbox", "audit_identity"),
+        ("sink_results", "result_event_identity"),
+        ("delivery_disposition_payloads", "disposition_identity"),
+        ("task_transition_payloads", "transition_identity"),
+    ]
+    .into_iter()
+    .map(|(table, stable_order)| {
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT * FROM {table} WHERE decision_identity=?1 ORDER BY {stable_order}"
+            ))
+            .unwrap_or_else(|error| panic!("prepare target snapshot for {table}: {error}"));
+        let column_count = statement.column_count();
+        let rows = statement
+            .query_map([decision_identity], |row| {
+                (0..column_count)
+                    .map(|index| row.get(index))
+                    .collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()
+            })
+            .unwrap_or_else(|error| panic!("query target snapshot for {table}: {error}"))
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap_or_else(|error| panic!("collect target snapshot for {table}: {error}"));
+        (table.to_owned(), rows)
+    })
+    .collect()
+}
+
+fn audit_v4_upgrade_rowid_snapshot(connection: &Connection) -> BTreeMap<String, i64> {
+    let mut statement = connection
+        .prepare(
+            "SELECT audit_identity,rowid
+             FROM immutable_audit_outbox
+             ORDER BY audit_identity",
+        )
+        .expect("prepare immutable-audit rowid snapshot");
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query immutable-audit rowid snapshot")
+        .collect::<rusqlite::Result<BTreeMap<_, _>>>()
+        .expect("collect immutable-audit rowid snapshot")
+}
+
+fn audit_v4_upgrade_database_snapshot(
+    connection: &Connection,
+) -> (
+    i64,
+    Vec<(String, String, String)>,
+    BTreeMap<String, Vec<Vec<String>>>,
+    BTreeMap<String, i64>,
+) {
+    let version = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .expect("read historical schema version snapshot");
+    let tables = {
+        let mut statement = connection
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type='table' AND name NOT LIKE 'sqlite_%'
+                 ORDER BY name",
+            )
+            .expect("prepare historical authority table list");
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query historical authority table list")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect historical authority table list")
+    };
+    let rows = tables
+        .into_iter()
+        .map(|table| {
+            let contents = authority_table_rows(connection, &table);
+            (table, contents)
+        })
+        .collect();
+    let manifest = {
+        let mut statement = connection
+            .prepare(
+                "SELECT type,name,COALESCE(sql,'')
+                 FROM sqlite_master
+                 WHERE name NOT LIKE 'sqlite_autoindex_%'
+                 ORDER BY type,name",
+            )
+            .expect("prepare raw historical schema manifest");
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("query raw historical schema manifest")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect raw historical schema manifest")
+    };
+    (
+        version,
+        manifest,
+        rows,
+        audit_v4_upgrade_rowid_snapshot(connection),
+    )
+}
+
+fn real_audit_logical_tail(connection: &Connection, decision_identity: &str) -> (String, usize) {
+    let mut statement = connection
+        .prepare(
+            "SELECT audit_identity,predecessor_audit_identity,audit_canonical,audit_sha256
+             FROM immutable_audit_outbox
+             WHERE decision_identity=?1
+             ORDER BY audit_identity",
+        )
+        .expect("prepare real audit chain");
+    let links = statement
+        .query_map([decision_identity], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .expect("query real audit chain")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect real audit chain");
+    assert!(!links.is_empty(), "real decision must have an audit chain");
+    let identities = links
+        .iter()
+        .map(|(identity, _, _, _)| identity.clone())
+        .collect::<BTreeSet<_>>();
+    let predecessors = links
+        .iter()
+        .filter_map(|(_, predecessor, _, _)| predecessor.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        links
+            .iter()
+            .filter(|(_, predecessor, _, _)| predecessor.is_none())
+            .count(),
+        1,
+        "the real pre-upgrade audit chain must have one root"
+    );
+    for (identity, predecessor, canonical, digest) in &links {
+        assert_eq!(
+            sha256_hex(canonical),
+            *digest,
+            "audit {identity} must retain its exact canonical-byte digest"
+        );
+        if let Some(predecessor) = predecessor {
+            assert!(
+                identities.contains(predecessor),
+                "audit {identity} must reference this decision's real chain"
+            );
+        }
+    }
+    let tails = identities
+        .difference(&predecessors)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        tails.len(),
+        1,
+        "the real pre-upgrade chain must have one tail"
+    );
+    let tail = tails[0].clone();
+    let by_identity = links
+        .iter()
+        .map(|(identity, predecessor, _, _)| (identity.as_str(), predecessor.as_deref()))
+        .collect::<BTreeMap<_, _>>();
+    let mut visited = BTreeSet::new();
+    let mut cursor = Some(tail.as_str());
+    while let Some(identity) = cursor {
+        assert!(visited.insert(identity), "real audit chain must be acyclic");
+        cursor = *by_identity
+            .get(identity)
+            .expect("every predecessor must resolve in the real decision chain");
+    }
+    assert_eq!(
+        visited.len(),
+        links.len(),
+        "the independently traversed real chain must include every target audit"
+    );
+    (tail, links.len())
+}
+
+fn foreign_key_violation_details(connection: &Connection) -> Vec<String> {
+    let violations = {
+        let mut statement = connection
+            .prepare(
+                "SELECT \"table\",rowid,parent,fkid
+                 FROM pragma_foreign_key_check
+                 ORDER BY \"table\",rowid,parent,fkid",
+            )
+            .expect("prepare exact foreign-key violation rows");
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .expect("query exact foreign-key violation rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect exact foreign-key violation rows")
+    };
+    violations
+        .into_iter()
+        .map(|(table, rowid, reported_parent, fkid)| {
+            let declared_links = {
+                let mut statement = connection
+                    .prepare(
+                        "SELECT id,seq,\"table\",\"from\",\"to\",on_update,on_delete,\"match\"
+                         FROM pragma_foreign_key_list(?1)
+                         WHERE id=?2
+                         ORDER BY seq",
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("prepare declared foreign key for {table}/{fkid}: {error}")
+                    });
+                statement
+                    .query_map(params![table.as_str(), fkid], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, String>(7)?,
+                        ))
+                    })
+                    .unwrap_or_else(|error| {
+                        panic!("query declared foreign key for {table}/{fkid}: {error}")
+                    })
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap_or_else(|error| {
+                        panic!("collect declared foreign key for {table}/{fkid}: {error}")
+                    })
+            };
+            format!(
+                "table={table} rowid={rowid:?} reported_parent={reported_parent} fkid={fkid} declared={declared_links:?}"
+            )
+        })
+        .collect()
 }
 
 #[cfg(unix)]
@@ -2412,6 +2667,765 @@ fn br194_schema_v5_migration_matrix_is_repeatable_and_rejects_newer_versions() {
         Err(DurableDeliveryError::InvalidConfiguration(reason))
             if reason.contains("newer than supported")
     ));
+}
+
+#[test]
+fn audit_v4_upgrade_formal_open_rejects_missing_predecessor_and_rolls_back() {
+    let mut fixture = Fixture::new("AUDIT_V4_UPGRADE_MISSING_PREDECESSOR");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("AUDIT_V4_UPGRADE_MISSING_PREDECESSOR");
+    prepare_reserved(&fixture, &candidate, &append);
+    let test_code = fixture
+        .database_path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str())
+        .expect("isolated missing-predecessor TEST_CODE root")
+        .to_owned();
+    let config = CoordinatorConfig::test(
+        &fixture.database_path,
+        &test_code,
+        "TEST_CODE_V4_MISSING_PREDECESSOR_OWNER_0123456789ABCDEF",
+    );
+    let coordinator = fixture
+        .coordinator
+        .take()
+        .expect("take coordinator before corrupt historical shaping");
+    assert_eq!(Arc::strong_count(&coordinator), 1);
+    drop(coordinator);
+
+    let mut historical = Connection::open(&fixture.database_path)
+        .expect("open isolated missing-predecessor historical database");
+    downgrade_replay_schema_v4_for_test(&mut historical, false);
+    historical
+        .pragma_update(None, "foreign_keys", "OFF")
+        .expect("disable FK only while constructing missing-predecessor history");
+    assert_eq!(
+        historical
+            .execute(
+                "UPDATE immutable_audit_outbox
+                    SET predecessor_audit_identity='TEST_CODE_V4_MISSING_PREDECESSOR'
+                  WHERE audit_identity='TEST_CODE_V4_AUDIT_CHILD'",
+                [],
+            )
+            .expect("construct one missing historical predecessor"),
+        1
+    );
+    historical
+        .pragma_update(None, "foreign_keys", "ON")
+        .expect("restore FK enforcement before formal open");
+    let violations_before = foreign_key_violation_details(&historical);
+    assert_eq!(violations_before.len(), 1);
+    assert!(violations_before[0].contains("table=immutable_audit_outbox"));
+    assert!(violations_before[0].contains("reported_parent=immutable_audit_outbox"));
+    let before = audit_v4_upgrade_database_snapshot(&historical);
+    assert_eq!(before.0, 4);
+    drop(historical);
+
+    let error = match DurableDeliveryCoordinator::open(config) {
+        Ok(_) => panic!("formal open must reject a missing historical predecessor"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        DurableDeliveryError::InvalidConfiguration(reason)
+            if reason.contains("foreign-key violation")
+    ));
+
+    let rolled_back = Connection::open(&fixture.database_path)
+        .expect("inspect formal-open missing-predecessor rollback");
+    rolled_back
+        .pragma_update(None, "foreign_keys", "ON")
+        .expect("enforce FK while inspecting missing-predecessor rollback");
+    assert_eq!(
+        audit_v4_upgrade_database_snapshot(&rolled_back),
+        before,
+        "formal-open failure must preserve v4, raw DDL, every typed row, and every audit rowid"
+    );
+    assert_eq!(
+        foreign_key_violation_details(&rolled_back),
+        violations_before
+    );
+}
+
+#[test]
+fn audit_v4_upgrade_formal_open_rejects_non_outbox_foreign_key_and_rolls_back() {
+    let mut fixture = Fixture::new("AUDIT_V4_UPGRADE_NON_OUTBOX_FOREIGN_KEY");
+    let append = MemoryAppendPort::default();
+    let candidate = envelope(
+        "AUDIT_V4_UPGRADE_NON_OUTBOX_FOREIGN_KEY",
+        PushKind::HoldingPlan,
+        DeliverySubKind::None,
+        "2026-07-30",
+        false,
+    );
+    prepare_reserved(&fixture, &candidate, &append);
+    let test_code = fixture
+        .database_path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str())
+        .expect("isolated non-outbox TEST_CODE root")
+        .to_owned();
+    let config = CoordinatorConfig::test(
+        &fixture.database_path,
+        &test_code,
+        "TEST_CODE_V4_NON_OUTBOX_OWNER_0123456789ABCDEF",
+    );
+    let coordinator = fixture
+        .coordinator
+        .take()
+        .expect("take coordinator before corrupt non-outbox historical shaping");
+    assert_eq!(Arc::strong_count(&coordinator), 1);
+    drop(coordinator);
+
+    let mut historical = Connection::open(&fixture.database_path)
+        .expect("open isolated non-outbox historical database");
+    downgrade_replay_schema_v4_for_test(&mut historical, false);
+    assert_eq!(
+        historical
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM cooldown_heads head
+                 JOIN cooldown_reservations reservation
+                   ON reservation.cooldown_reservation_identity=
+                      head.current_reservation_identity
+                 WHERE reservation.decision_identity=?1",
+                [candidate.decision_identity.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("verify the real Rolling policy API created one cooldown head"),
+        1
+    );
+    historical
+        .pragma_update(None, "foreign_keys", "OFF")
+        .expect("disable FK only while constructing non-outbox corrupt history");
+    assert_eq!(
+        historical
+            .execute(
+                "UPDATE cooldown_heads
+                    SET current_reservation_identity='TEST_CODE_V4_MISSING_COOLDOWN_RESERVATION'
+                  WHERE current_reservation_identity=(
+                    SELECT current_cooldown_reservation_identity
+                    FROM delivery_decisions WHERE decision_identity=?1
+                  )",
+                [candidate.decision_identity.as_str()],
+            )
+            .expect("construct one non-outbox historical FK violation"),
+        1
+    );
+    historical
+        .pragma_update(None, "foreign_keys", "ON")
+        .expect("restore FK enforcement before formal non-outbox open");
+    let violations_before = foreign_key_violation_details(&historical);
+    assert_eq!(violations_before.len(), 1);
+    assert!(violations_before[0].contains("table=cooldown_heads"));
+    assert!(violations_before[0].contains("reported_parent=cooldown_reservations"));
+    let before = audit_v4_upgrade_database_snapshot(&historical);
+    assert_eq!(before.0, 4);
+    drop(historical);
+
+    let error = match DurableDeliveryCoordinator::open(config) {
+        Ok(_) => panic!("formal open must reject a non-outbox historical FK violation"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        DurableDeliveryError::InvalidConfiguration(reason)
+            if reason.contains("foreign-key violation")
+    ));
+
+    let rolled_back =
+        Connection::open(&fixture.database_path).expect("inspect formal-open non-outbox rollback");
+    rolled_back
+        .pragma_update(None, "foreign_keys", "ON")
+        .expect("enforce FK while inspecting non-outbox rollback");
+    assert_eq!(
+        audit_v4_upgrade_database_snapshot(&rolled_back),
+        before,
+        "formal-open failure must preserve v4, raw DDL, every typed row, and every audit rowid"
+    );
+    assert_eq!(
+        foreign_key_violation_details(&rolled_back),
+        violations_before
+    );
+}
+
+#[test]
+fn audit_v4_upgrade_defer_reset_does_not_hide_later_commit_violation() {
+    let mut connection =
+        Connection::open_in_memory().expect("open isolated deferred-FK migration database");
+    initialize_test_schema(&mut connection).expect("materialize reference schema");
+    downgrade_replay_schema_v4_for_test(&mut connection, false);
+    let before = audit_v4_upgrade_database_snapshot(&connection);
+    assert_eq!(before.0, 4);
+    assert!(foreign_key_violation_details(&connection).is_empty());
+
+    let transaction = connection
+        .transaction()
+        .expect("begin direct schema migration transaction");
+    super::schema::initialize_schema(&transaction)
+        .expect("migrate valid v4 history and reset only its stale deferred counter");
+    assert_eq!(
+        transaction
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .expect("read migrated version inside transaction"),
+        super::schema::SCHEMA_VERSION
+    );
+    assert_eq!(
+        transaction
+            .pragma_query_value(None, "foreign_keys", |row| row.get::<_, i64>(0))
+            .expect("verify FK enforcement stays enabled"),
+        1
+    );
+    assert_eq!(
+        transaction
+            .pragma_query_value(None, "defer_foreign_keys", |row| row.get::<_, i64>(0))
+            .expect("verify migration restores deferred enforcement"),
+        1
+    );
+    assert!(foreign_key_violation_details(&transaction).is_empty());
+
+    let canonical = br#"{"reason":"TEST_CODE_POST_RESET_DEFERRED_FK"}"#;
+    let digest = sha256_hex(canonical);
+    transaction
+        .execute(
+            "INSERT INTO immutable_audit_outbox(
+               audit_identity,decision_identity,attempt_identity,audit_kind,
+               predecessor_audit_identity,audit_canonical,audit_sha256,
+               append_state,immutable_audit_ref,created_at
+             ) VALUES(
+               'TEST_CODE_POST_RESET_DEFERRED_AUDIT','TEST_CODE_V4_DECISION',NULL,
+               'DecisionIdentityConflict','TEST_CODE_POST_RESET_MISSING_PREDECESSOR',
+               ?1,?2,'Pending',NULL,'2026-07-29T22:00:00Z'
+             )",
+            params![canonical.as_slice(), digest],
+        )
+        .expect("defer a new real FK violation after the guarded counter reset");
+    let deferred_violations = foreign_key_violation_details(&transaction);
+    assert_eq!(deferred_violations.len(), 1);
+    assert!(deferred_violations[0].contains("table=immutable_audit_outbox"));
+    assert!(deferred_violations[0].contains("reported_parent=immutable_audit_outbox"));
+
+    let commit_error = transaction
+        .execute_batch("COMMIT")
+        .expect_err("new deferred FK violation must still reject COMMIT");
+    assert!(matches!(
+        commit_error,
+        rusqlite::Error::SqliteFailure(error, _)
+            if error.extended_code == 787
+    ));
+    assert!(
+        !transaction.is_autocommit(),
+        "failed deferred-FK COMMIT must leave the transaction open for rollback"
+    );
+    transaction
+        .execute_batch("ROLLBACK")
+        .expect("roll back the rejected post-reset migration transaction");
+    drop(transaction);
+
+    assert_eq!(
+        audit_v4_upgrade_database_snapshot(&connection),
+        before,
+        "rejected post-reset COMMIT must restore v4, raw DDL, every typed row, and every audit rowid"
+    );
+    assert!(foreign_key_violation_details(&connection).is_empty());
+}
+
+#[test]
+fn audit_logical_tail_recovers_after_real_v4_upgrade() {
+    const FIXED_OWNER: &str = "TEST_CODE_REAL_V4_UPGRADE_OWNER_0123456789ABCDEF";
+    const HEARTBEAT_SAMPLE_BOUND: i64 = 16;
+
+    let mut fixture = Fixture::new("AUDIT_LOGICAL_TAIL_REAL_V4_UPGRADE");
+    let test_code = fixture
+        .database_path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str())
+        .expect("isolated TEST_CODE root")
+        .to_owned();
+    let coordinator_config =
+        CoordinatorConfig::test(&fixture.database_path, &test_code, FIXED_OWNER);
+    let bootstrap = fixture
+        .coordinator
+        .take()
+        .expect("take bootstrap coordinator before fixed-owner reopen");
+    assert_eq!(
+        Arc::strong_count(&bootstrap),
+        1,
+        "the fixed-owner reopen must not retain a hidden coordinator Arc"
+    );
+    drop(bootstrap);
+    fixture.coordinator = FixtureCoordinator(Some(Arc::new(
+        DurableDeliveryCoordinator::open(coordinator_config.clone())
+            .expect("reopen isolated coordinator with a deterministic owner"),
+    )));
+
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("AUDIT_LOGICAL_TAIL_REAL_V4_UPGRADE");
+    prepare_reserved(&fixture, &candidate, &append);
+    let attempt = fixture
+        .coordinator
+        .begin_attempt(&candidate.decision_identity, 1, now())
+        .expect("begin real Foundation-bound attempt")
+        .expect("real Foundation-bound attempt lease");
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+
+    let mut ordering_witness = None;
+    for offset_seconds in 1..=HEARTBEAT_SAMPLE_BOUND {
+        let heartbeat_at = now() + chrono::Duration::seconds(offset_seconds);
+        assert!(fixture
+            .coordinator
+            .heartbeat_attempt(
+                &candidate.decision_identity,
+                &attempt.attempt_identity,
+                attempt.fence_token,
+                heartbeat_at.clone(),
+            )
+            .expect("extend the real in-flight attempt with a fixed heartbeat sample"));
+        let connection = Connection::open(&fixture.database_path)
+            .expect("inspect bounded real heartbeat sample");
+        let (logical_tail, chain_len) =
+            real_audit_logical_tail(&connection, &candidate.decision_identity);
+        let migration_sorted_tail: String = connection
+            .query_row(
+                "SELECT audit_identity
+                 FROM immutable_audit_outbox
+                 WHERE decision_identity=?1
+                 ORDER BY
+                   CASE WHEN predecessor_audit_identity IS NULL THEN 0 ELSE 1 END ASC,
+                   predecessor_audit_identity ASC,
+                   audit_identity ASC
+                 LIMIT 1 OFFSET (
+                   SELECT COUNT(*) - 1 FROM immutable_audit_outbox
+                   WHERE decision_identity=?1
+                 )",
+                [candidate.decision_identity.as_str()],
+                |row| row.get(0),
+            )
+            .expect("derive the historical migration's target physical tail");
+        if migration_sorted_tail != logical_tail {
+            ordering_witness = Some((
+                heartbeat_at,
+                offset_seconds,
+                chain_len,
+                logical_tail,
+                migration_sorted_tail,
+            ));
+            break;
+        }
+    }
+    let (
+        last_heartbeat_at,
+        heartbeat_sample_count,
+        chain_len,
+        pre_upgrade_logical_tail,
+        migration_sorted_physical_tail,
+    ) = ordering_witness.unwrap_or_else(|| {
+        panic!(
+            "the fixed {HEARTBEAT_SAMPLE_BOUND}-heartbeat real API sample must expose a v4 migration ordering witness"
+        )
+    });
+    assert!(heartbeat_sample_count <= HEARTBEAT_SAMPLE_BOUND);
+    assert!(
+        chain_len > 2,
+        "the real audit witness must be a longer chain"
+    );
+    assert_ne!(
+        migration_sorted_physical_tail, pre_upgrade_logical_tail,
+        "the bounded real API sample must witness that the legacy migration sort would select the wrong target tail"
+    );
+
+    let pre_upgrade_reconcile = fixture
+        .coordinator
+        .reconcile_foundation_decision(
+            &candidate.decision_identity,
+            candidate
+                .foundation_binding()
+                .expect("complete Foundation binding"),
+            &append,
+            last_heartbeat_at.clone(),
+        )
+        .expect("append the real heartbeat chain without expiring its lease");
+    assert!(pre_upgrade_reconcile.progress_count > 0);
+    assert_eq!(pre_upgrade_reconcile.provider_calls, 0);
+    assert_eq!(pre_upgrade_reconcile.sink_calls, 0);
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+
+    let old_coordinator = fixture
+        .coordinator
+        .take()
+        .expect("take every old coordinator Arc before downgrade");
+    assert_eq!(
+        Arc::strong_count(&old_coordinator),
+        1,
+        "the formal upgrade must not overlap an old coordinator Arc"
+    );
+    drop(old_coordinator);
+
+    let mut historical = Connection::open(&fixture.database_path)
+        .expect("open isolated database for historical v4 shaping");
+    let (stable_logical_tail, stable_chain_len) =
+        real_audit_logical_tail(&historical, &candidate.decision_identity);
+    assert_eq!(stable_logical_tail, pre_upgrade_logical_tail);
+    assert_eq!(stable_chain_len, chain_len);
+    let target_before_downgrade =
+        real_v4_upgrade_target_snapshot(&historical, &candidate.decision_identity);
+    assert_eq!(
+        historical
+            .query_row(
+                "SELECT COUNT(*) FROM immutable_audit_outbox
+                 WHERE decision_identity=?1 AND append_state!='Appended'",
+                [candidate.decision_identity.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("verify the original real chain is durably appended before upgrade"),
+        0
+    );
+    let replay_references_before: (i64, i64) = historical
+        .query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM review_terminal_replay_attempts
+                 WHERE decision_identity=?1),
+               (SELECT COUNT(*) FROM review_terminal_replay_completions
+                 WHERE decision_identity=?1)",
+            [candidate.decision_identity.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("prove target has no replay authority before historical shaping");
+    assert_eq!(replay_references_before, (0, 0));
+    let physical_tail_before_downgrade: String = historical
+        .query_row(
+            "SELECT audit_identity FROM immutable_audit_outbox
+             WHERE decision_identity=?1 ORDER BY rowid DESC LIMIT 1",
+            [candidate.decision_identity.as_str()],
+            |row| row.get(0),
+        )
+        .expect("read target physical tail before historical shaping");
+    assert_eq!(physical_tail_before_downgrade, pre_upgrade_logical_tail);
+
+    downgrade_replay_schema_v4_for_test(&mut historical, false);
+    assert_eq!(
+        historical
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .expect("read exact historical schema version"),
+        4
+    );
+    assert_eq!(
+        historical
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name LIKE 'review_terminal_replay_%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("prove replay tables are absent from the historical shape"),
+        0
+    );
+    assert_eq!(
+        historical
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_list('immutable_audit_outbox')
+                 WHERE \"table\"='immutable_audit_outbox'
+                   AND \"from\"='predecessor_audit_identity'
+                   AND \"to\"='audit_identity'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("verify the historical shape retains its exact final-name self-FK"),
+        1
+    );
+    let historical_foreign_key_violations = foreign_key_violation_details(&historical);
+    assert!(
+        historical_foreign_key_violations.is_empty(),
+        "historical v4 shape must preserve every original FK before formal upgrade: {historical_foreign_key_violations:#?}"
+    );
+    assert_eq!(
+        real_v4_upgrade_target_snapshot(&historical, &candidate.decision_identity),
+        target_before_downgrade,
+        "historical table shaping may add its isolated Delivered sample but must preserve every target byte and reference"
+    );
+    let outbox_rowids_before_upgrade = audit_v4_upgrade_rowid_snapshot(&historical);
+    assert_eq!(
+        historical
+            .query_row(
+                "SELECT COUNT(*) FROM delivery_decisions
+                 WHERE decision_identity='TEST_CODE_V4_DECISION' AND state='Delivered'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("identify the helper's isolated synthetic Delivered sample"),
+        1
+    );
+    drop(historical);
+
+    let schema_sql_reached = Arc::new(AtomicUsize::new(0));
+    let schema_sql_reached_by_hook = schema_sql_reached.clone();
+    let _schema_sql_hook = install_database_bootstrap_test_hook(
+        DatabaseBootstrapTestPhase::AfterSchemaSqlBeforeCommitValidation,
+        move || {
+            schema_sql_reached_by_hook.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .expect("install read-only formal-upgrade schema checkpoint");
+    let formally_upgraded =
+        DurableDeliveryCoordinator::open(coordinator_config).unwrap_or_else(|error| {
+            panic!(
+                "formal v4-to-current open failed; after_schema_sql_hook_reached={}: {error}",
+                schema_sql_reached.load(Ordering::SeqCst)
+            )
+        });
+    assert_eq!(
+        schema_sql_reached.load(Ordering::SeqCst),
+        1,
+        "formal upgrade must pass all schema SQL before committing"
+    );
+    fixture.coordinator = FixtureCoordinator(Some(Arc::new(formally_upgraded)));
+    let upgraded = Connection::open(&fixture.database_path)
+        .expect("inspect the formally upgraded isolated database");
+    upgraded
+        .pragma_update(None, "foreign_keys", "ON")
+        .expect("enable FK enforcement on the independent upgrade inspector");
+    assert_eq!(
+        upgraded
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .expect("read formally upgraded schema version"),
+        super::schema::SCHEMA_VERSION
+    );
+    assert_eq!(
+        upgraded
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("check formal upgrade foreign keys"),
+        0
+    );
+    assert_eq!(
+        upgraded
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_list('immutable_audit_outbox')
+                 WHERE \"table\"='immutable_audit_outbox'
+                   AND \"from\"='predecessor_audit_identity'
+                   AND \"to\"='audit_identity'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("check formal upgrade predecessor self-FK"),
+        1
+    );
+    assert_eq!(
+        real_v4_upgrade_target_snapshot(&upgraded, &candidate.decision_identity),
+        target_before_downgrade,
+        "formal v4-to-current upgrade must preserve exact target authority rows"
+    );
+    assert_eq!(
+        audit_v4_upgrade_rowid_snapshot(&upgraded),
+        outbox_rowids_before_upgrade,
+        "formal v4-to-current upgrade must preserve every historical audit identity-to-rowid mapping"
+    );
+    let replay_references_after: (i64, i64) = upgraded
+        .query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM review_terminal_replay_attempts
+                 WHERE decision_identity=?1),
+               (SELECT COUNT(*) FROM review_terminal_replay_completions
+                 WHERE decision_identity=?1)",
+            [candidate.decision_identity.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("prove formal upgrade did not synthesize target replay authority");
+    assert_eq!(replay_references_after, (0, 0));
+    let actual_upgraded_physical_tail: String = upgraded
+        .query_row(
+            "SELECT audit_identity FROM immutable_audit_outbox
+             WHERE decision_identity=?1 ORDER BY rowid DESC LIMIT 1",
+            [candidate.decision_identity.as_str()],
+            |row| row.get(0),
+        )
+        .expect("read actual target physical tail after formal v4 upgrade");
+    assert_eq!(
+        actual_upgraded_physical_tail, pre_upgrade_logical_tail,
+        "the upgraded physical append tail must remain the unique pre-upgrade logical tail"
+    );
+    drop(upgraded);
+
+    let recovered_at = last_heartbeat_at + chrono::Duration::seconds(121);
+    let recovery = fixture
+        .coordinator
+        .reconcile_foundation_decision(
+            &candidate.decision_identity,
+            candidate
+                .foundation_binding()
+                .expect("exact recovery binding"),
+            &append,
+            recovered_at.clone(),
+        )
+        .expect("recover the single real expired Foundation attempt after formal upgrade");
+    assert!(recovery.progress_count > 0);
+    assert_eq!(recovery.provider_calls, 0);
+    assert_eq!(recovery.sink_calls, 0);
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+    assert_eq!(
+        fixture
+            .coordinator
+            .decision_state(&candidate.decision_identity)
+            .expect("read upgraded recovery state"),
+        DecisionState::UncertainManualReview
+    );
+
+    let terminal_after_recovery = fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity);
+    let recovery_connection =
+        Connection::open(&fixture.database_path).expect("inspect the recovered upgraded target");
+    let fence_rows = recovery_connection
+        .query_row(
+            "SELECT COUNT(*),MIN(predecessor_audit_identity)
+             FROM immutable_audit_outbox
+             WHERE decision_identity=?1 AND attempt_identity=?2
+               AND audit_kind='FenceRevoked'",
+            params![
+                candidate.decision_identity.as_str(),
+                attempt.attempt_identity.as_str()
+            ],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .expect("read the real recovered FenceRevoked audit predecessor");
+    assert_eq!(
+        fence_rows.0, 1,
+        "single recovery must write one fence audit"
+    );
+    assert_eq!(
+        fence_rows.1.as_deref(),
+        Some(pre_upgrade_logical_tail.as_str()),
+        "the real post-upgrade recovery must append to the preserved unique logical tail"
+    );
+    let terminal = match terminal_after_recovery
+        .expect("real upgraded recovery must remain readable through the terminal inspector")
+    {
+        FoundationTerminalQuery::Terminal(record) => record,
+        other => panic!("expected upgraded recovered terminal, got {other:?}"),
+    };
+    assert_eq!(
+        terminal.disposition(),
+        FoundationTerminalDisposition::Uncertain
+    );
+    assert_eq!(
+        terminal.attempt_id(),
+        Some(attempt.attempt_identity.as_str())
+    );
+    assert_eq!(
+        terminal.durable_schema_version(),
+        super::schema::SCHEMA_VERSION
+    );
+    assert_eq!(
+        sha256_hex(terminal.evidence_bytes()),
+        terminal.evidence_sha256()
+    );
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+    assert_eq!(
+        recovery_connection
+            .query_row(
+                "SELECT COUNT(*) FROM delivery_decisions
+                 WHERE decision_identity='TEST_CODE_V4_DECISION' AND state='Delivered'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("verify scoped recovery isolates the helper's synthetic decision"),
+        1
+    );
+    let target_audit_count_after_recovery = recovery_connection
+        .query_row(
+            "SELECT COUNT(*) FROM immutable_audit_outbox WHERE decision_identity=?1",
+            [candidate.decision_identity.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("count target audit rows after first recovery");
+    let recovery_facts = w16_recovery_facts(&fixture, Some(&candidate.decision_identity));
+    let append_records = append
+        .records
+        .lock()
+        .expect("read immutable append observations after first recovery")
+        .clone();
+    drop(recovery_connection);
+
+    let duplicate_recovery = fixture
+        .coordinator
+        .reconcile_foundation_decision(
+            &candidate.decision_identity,
+            candidate
+                .foundation_binding()
+                .expect("duplicate recovery binding"),
+            &append,
+            recovered_at + chrono::Duration::seconds(1),
+        )
+        .expect("repeat completed upgraded recovery");
+    assert_eq!(duplicate_recovery.progress_count, 0);
+    assert_eq!(duplicate_recovery.provider_calls, 0);
+    assert_eq!(duplicate_recovery.sink_calls, 0);
+    assert_eq!(
+        w16_recovery_facts(&fixture, Some(&candidate.decision_identity)),
+        recovery_facts,
+        "duplicate recovery must not alter target authority"
+    );
+    assert_eq!(
+        *append
+            .records
+            .lock()
+            .expect("read immutable append observations after duplicate recovery"),
+        append_records,
+        "duplicate recovery must not append a second audit"
+    );
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+
+    let completed_coordinator = fixture
+        .coordinator
+        .take()
+        .expect("take completed coordinator before restart");
+    assert_eq!(
+        Arc::strong_count(&completed_coordinator),
+        1,
+        "restart must release the only coordinator Arc"
+    );
+    drop(completed_coordinator);
+    let restarted = fixture.second_coordinator("AUDIT_V4_UPGRADE_RESTART");
+    let restarted_terminal = match restarted
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .expect("read upgraded terminal after coordinator restart")
+    {
+        FoundationTerminalQuery::Terminal(record) => record,
+        other => panic!("expected restarted upgraded terminal, got {other:?}"),
+    };
+    assert_eq!(restarted_terminal, terminal);
+    let restarted_connection = Connection::open(&fixture.database_path)
+        .expect("inspect restarted upgraded target without coordinator mutation");
+    assert_eq!(
+        restarted_connection
+            .query_row(
+                "SELECT COUNT(*) FROM immutable_audit_outbox WHERE decision_identity=?1",
+                [candidate.decision_identity.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count target audit rows after restart read"),
+        target_audit_count_after_recovery
+    );
+    assert_eq!(
+        w16_recovery_facts(&fixture, Some(&candidate.decision_identity)),
+        recovery_facts,
+        "restart terminal inspection must not alter target authority"
+    );
+    assert_eq!(
+        *append
+            .records
+            .lock()
+            .expect("read immutable append observations after restart"),
+        append_records
+    );
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+    drop(restarted_connection);
+    fixture.coordinator = FixtureCoordinator(Some(restarted));
 }
 
 #[test]
