@@ -351,15 +351,33 @@ pub(crate) fn inspect_finalization_sla(
     report.binding_sha256 = Some(terminal.binding_sha256().clone());
     let mut conflict = false;
     for event in &chain {
-        if event.to_state() == IntentState::Completed {
+        // Both terminal business edges carry immutable authority material.
+        // NotDelivered history must not silently accept a different terminal.
+        if matches!(
+            event.to_state(),
+            IntentState::Completed | IntentState::NotDelivered
+        ) {
             if event.terminal_ref_id() != Some(terminal.ref_id().as_str())
                 || event.terminal_binding_sha256() != Some(terminal.binding_sha256())
                 || event.terminal_disposition() != Some(terminal.terminal_disposition())
+                || event
+                    .terminal_decision_id()
+                    .is_some_and(|decision| decision != terminal.decision_id().as_str())
             {
                 conflict = true;
-            } else {
+            } else if event.to_state() == IntentState::Completed {
                 report.completed_at = report.completed_at.or(Some(event.occurred_at()));
             }
+        }
+        // The existing finalizer admits AwaitingFinalizer only after verifying
+        // an accepted disposition. Later ResolutionRequired does not erase it.
+        if event.to_state() == IntentState::AwaitingFinalizer
+            && !matches!(
+                terminal.terminal_disposition(),
+                TerminalDisposition::Accepted | TerminalDisposition::ManualConfirmedAccepted
+            )
+        {
+            conflict = true;
         }
     }
     report.status = match terminal.terminal_disposition() {
@@ -432,13 +450,14 @@ fn unavailable_report(
     chain: &[super::TransitionReceipt],
     clock_before_business: bool,
 ) -> FinalizationSlaReport {
-    if chain
-        .iter()
-        .any(|event| event.to_state() == IntentState::Completed)
-    {
+    if chain.iter().any(|event| {
+        matches!(
+            event.to_state(),
+            IntentState::AwaitingFinalizer | IntentState::Completed | IntentState::NotDelivered
+        )
+    }) {
         report.status = FinalizationSlaStatus::Conflict;
-    }
-    if report.business_state == IntentState::ResolutionRequired {
+    } else if report.business_state == IntentState::ResolutionRequired {
         report.status = FinalizationSlaStatus::ResolutionRequired;
     }
     if clock_before_business {

@@ -1180,3 +1180,350 @@ fn corrupt_persisted_transition_chain_is_rejected_without_exposing_sql() {
     assert_eq!(error, FinalizationSlaError::BusinessInvalid);
     assert!(!format!("{error:?} {error}").contains(case.business_path.to_str().unwrap()));
 }
+
+#[test]
+fn noncompleted_history_must_be_consistent_with_current_persisted_authority() {
+    use super::business_finalizer::{
+        commit_not_delivered_finalization, prepare_not_delivered_finalization,
+        NotDeliveredPreparationOutcome, NotDeliveredPreparationRequest, VerifiedOperatorAuditRef,
+    };
+    use super::terminal_authority::{
+        terminal_binding_sha256, AuthorityQuery, TerminalAuthorityPort,
+    };
+    use super::terminal_authority_tests::FakeAuthority;
+    use crate::monitor::push_job::{TerminalDisposition, TerminalRefId};
+
+    // This sealed seed supplies only the external historical-authority fixture
+    // when today's actual reader has no terminal. All observations below query
+    // concrete coordinators; none use FakeAuthority as the SLA source.
+    let seed = Case::new(
+        AuthorityClass::GenericCounted,
+        accepted_result(ACCEPTED),
+        true,
+    );
+    let seed_adapter =
+        GenericTerminalAuthorityAdapter::try_new(seed.durable.as_ref().unwrap()).unwrap();
+    let seed_decision = seed.snapshot.attested_ready_binding().unwrap().decision_id;
+    let seed_record = match seed_adapter.requery_terminal(&seed_decision).unwrap() {
+        AuthorityQuery::Terminal(record) => *record,
+        other => panic!("expected sealed seed, got {other:?}"),
+    };
+    let empty = Case::variant(
+        AuthorityClass::GenericCounted,
+        accepted_result(ACCEPTED),
+        true,
+        InitialDecisionKind::NoData,
+        None,
+    );
+    let mut failures = Vec::new();
+    for (history, source, mismatch, expected) in [
+        (
+            "not-delivered",
+            "manual-not-delivered",
+            "none",
+            FinalizationSlaStatus::ManualNotDelivered,
+        ),
+        (
+            "not-delivered",
+            "manual-not-delivered",
+            "ref",
+            FinalizationSlaStatus::Conflict,
+        ),
+        (
+            "not-delivered",
+            "manual-not-delivered",
+            "binding",
+            FinalizationSlaStatus::Conflict,
+        ),
+        (
+            "not-delivered",
+            "uncertain",
+            "none",
+            FinalizationSlaStatus::Conflict,
+        ),
+        (
+            "not-delivered",
+            "missing",
+            "none",
+            FinalizationSlaStatus::Conflict,
+        ),
+        (
+            "not-delivered",
+            "pending-seal",
+            "none",
+            FinalizationSlaStatus::Conflict,
+        ),
+        (
+            "qualified",
+            "accepted",
+            "none",
+            FinalizationSlaStatus::AwaitingFinalization,
+        ),
+        (
+            "qualified",
+            "manual-accepted",
+            "none",
+            FinalizationSlaStatus::ManualAccepted,
+        ),
+        (
+            "qualified",
+            "rejected",
+            "none",
+            FinalizationSlaStatus::Conflict,
+        ),
+        (
+            "qualified",
+            "uncertain",
+            "none",
+            FinalizationSlaStatus::Conflict,
+        ),
+        (
+            "qualified",
+            "manual-not-delivered",
+            "none",
+            FinalizationSlaStatus::Conflict,
+        ),
+        (
+            "qualified",
+            "missing",
+            "none",
+            FinalizationSlaStatus::Conflict,
+        ),
+        (
+            "qualified",
+            "pending-seal",
+            "none",
+            FinalizationSlaStatus::Conflict,
+        ),
+        (
+            "resolution-after-qualified",
+            "accepted",
+            "none",
+            FinalizationSlaStatus::ResolutionRequired,
+        ),
+        (
+            "resolution-after-qualified",
+            "rejected",
+            "none",
+            FinalizationSlaStatus::Conflict,
+        ),
+        (
+            "resolution-after-qualified",
+            "missing",
+            "none",
+            FinalizationSlaStatus::Conflict,
+        ),
+        (
+            "resolution-after-qualified",
+            "pending-seal",
+            "none",
+            FinalizationSlaStatus::Conflict,
+        ),
+    ] {
+        let result = match source {
+            "rejected" => AuthoritativeSinkResult::Rejected(TypedRejection {
+                reason_code: "TEST_CODE_W19_REJECTED".to_owned(),
+                evidence: b"TEST_CODE_W19_REJECTION".to_vec(),
+                retry_authorized: false,
+                observed_at: utc(ACCEPTED),
+            }),
+            "uncertain" | "manual-accepted" | "manual-not-delivered" => {
+                AuthoritativeSinkResult::Uncertain(TypedUncertainty {
+                    reason_code: "TEST_CODE_W19_UNCERTAIN".to_owned(),
+                    evidence: b"TEST_CODE_W19_UNCERTAINTY".to_vec(),
+                    observed_at: utc(ACCEPTED),
+                })
+            }
+            _ => accepted_result(ACCEPTED),
+        };
+        let mut case = Case::new(
+            AuthorityClass::GenericCounted,
+            result,
+            source != "pending-seal",
+        );
+        if matches!(source, "manual-accepted" | "manual-not-delivered") {
+            let coordinator = case.durable.as_ref().unwrap();
+            coordinator
+                .resolve_uncertain(
+                    &ManualResolutionCommand {
+                        decision_identity: case.legacy_decision.clone().unwrap(),
+                        disposition: if source == "manual-accepted" {
+                            ManualDisposition::Accepted { receipt: None }
+                        } else {
+                            ManualDisposition::Rejected
+                        },
+                        operator_identity: "TEST_CODE_W19_OPERATOR_0123456789".to_owned(),
+                        reason: "TEST_CODE_W19_HISTORY_RECONCILIATION".to_owned(),
+                        external_evidence: b"TEST_CODE_W19_MANUAL_EVIDENCE".to_vec(),
+                        resolved_at: utc(ACCEPTED + 10_000_000),
+                    },
+                    &case.append,
+                )
+                .unwrap();
+            coordinator
+                .reconcile_all_pending(&case.append, utc(ACCEPTED + 11_000_000))
+                .unwrap();
+        }
+        let claimed = case.claim();
+        let attested = claimed.attested_ready_binding().unwrap();
+        let adapter =
+            GenericTerminalAuthorityAdapter::try_new(case.durable.as_ref().unwrap()).unwrap();
+        let mut historical = match adapter.requery_terminal(&attested.decision_id).unwrap() {
+            AuthorityQuery::Terminal(record) => *record,
+            AuthorityQuery::PendingSeal => {
+                let mut record = seed_record.clone();
+                record.namespace = attested.namespace.clone();
+                record.intent_id = attested.intent_id.clone();
+                record.decision_id = attested.decision_id.clone();
+                record
+            }
+            other => panic!("unexpected fixture source {other:?}"),
+        };
+        historical.terminal_disposition = if history == "not-delivered" {
+            TerminalDisposition::ManualConfirmedNotDelivered
+        } else if source == "manual-accepted" {
+            TerminalDisposition::ManualConfirmedAccepted
+        } else {
+            TerminalDisposition::Accepted
+        };
+        match mismatch {
+            "ref" => {
+                historical.ref_id =
+                    TerminalRefId::try_new("TEST_CODE_W19_PRIOR_NOT_DELIVERED".to_owned()).unwrap()
+            }
+            "binding" => {
+                historical.evidence_bytes.push(b' ');
+                historical.evidence_sha256 = raw_digest(&historical.evidence_bytes);
+            }
+            _ => {}
+        }
+        historical.binding_sha256 = terminal_binding_sha256(&historical);
+        let mut history_authority = FakeAuthority::terminal(historical);
+        history_authority.descriptor = adapter.descriptor().clone();
+        let actor = TransitionActor::try_new("w19-finalizer".to_owned()).unwrap();
+        let fence = FinalizerFence::new(
+            LeaseOwnerId::try_new("w19-finalizer".to_owned()).unwrap(),
+            claimed.lease_generation(),
+            claimed.lease_until().unwrap(),
+        );
+        if history == "not-delivered" {
+            let audit = VerifiedOperatorAuditRef::for_test(
+                case.intent.clone(),
+                attested.decision_id,
+                claimed.version(),
+                "TEST_CODE_W19_OPERATOR_AUDIT".to_owned(),
+                raw_digest(b"TEST_CODE_W19_OPERATOR_AUDIT"),
+            )
+            .unwrap();
+            let request = NotDeliveredPreparationRequest::new(
+                case.intent.clone(),
+                claimed.version(),
+                actor,
+                fence,
+                micros(ACCEPTED + 20_000_000),
+                audit,
+            )
+            .unwrap();
+            let pending = match prepare_not_delivered_finalization(
+                &mut case.store,
+                request,
+                &case.template,
+                &case.policy,
+                &history_authority,
+            )
+            .unwrap()
+            {
+                NotDeliveredPreparationOutcome::Pending(pending) => pending,
+                other => panic!("expected pending NotDelivered, got {other:?}"),
+            };
+            commit_not_delivered_finalization(
+                &mut case.store,
+                pending,
+                &case.template,
+                &case.policy,
+                &history_authority,
+                micros(ACCEPTED + 21_000_000),
+                micros(ACCEPTED + 22_000_000),
+            )
+            .unwrap();
+        } else {
+            let request = AcceptedPreparationRequest::new(
+                case.intent.clone(),
+                claimed.version(),
+                actor,
+                fence,
+                micros(ACCEPTED + 20_000_000),
+                micros(ACCEPTED + 21_000_000),
+            )
+            .unwrap();
+            assert!(matches!(
+                prepare_accepted_finalization(
+                    &mut case.store,
+                    request,
+                    &case.template,
+                    &case.policy,
+                    &history_authority
+                )
+                .unwrap(),
+                AcceptedPreparationOutcome::Pending(_)
+            ));
+            if history == "resolution-after-qualified" {
+                let qualified = case.store.inspect(&case.intent).unwrap().unwrap();
+                case.store
+                    .apply_nonterminal_transition(
+                        &IntentTransitionCommand::try_new(
+                            case.intent.clone(),
+                            IntentState::AwaitingFinalizer,
+                            IntentState::ResolutionRequired,
+                            qualified.version(),
+                            TransitionActor::try_new("w19-conflict".to_owned()).unwrap(),
+                            ReasonCode::FinalizerCasConflict,
+                            micros(ACCEPTED + 22_000_000),
+                            LeaseAction::Preserve,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
+        }
+        case.restart();
+        let before = case.rows();
+        let sink_calls = case.sink.calls.load(Ordering::SeqCst);
+        let append_calls = case.append.calls.load(Ordering::SeqCst);
+        let report = if source == "missing" {
+            inspect_finalization_sla(
+                &case.store,
+                FinalizationSlaQuery {
+                    namespace: &case.namespace,
+                    unit: &case.unit,
+                    intent: &case.intent,
+                    template: &case.template,
+                    policy: &case.policy,
+                    route: FinalizationSlaRoute::Generic {
+                        source: empty.durable.as_ref().unwrap(),
+                        required_channel: &case.channel,
+                    },
+                    observed_at: micros(ACCEPTED + 400_000_000),
+                    reconcile_cycle: Duration::from_secs(30),
+                },
+            )
+            .unwrap()
+        } else {
+            case.query(ACCEPTED + 400_000_000, Duration::from_secs(30))
+                .unwrap()
+        };
+        assert_eq!(before, case.rows());
+        assert_eq!(sink_calls, case.sink.calls.load(Ordering::SeqCst));
+        assert_eq!(append_calls, case.append.calls.load(Ordering::SeqCst));
+        if report.status() != expected {
+            failures.push(format!(
+                "{history}/{source}/{mismatch}: expected {expected:?}, observed {:?}",
+                report.status()
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "persisted non-Completed history conflicts were not rejected: {failures:#?}"
+    );
+}
