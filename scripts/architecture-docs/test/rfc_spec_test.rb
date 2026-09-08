@@ -69,6 +69,83 @@ class RfcSpecTest < Minitest::Test
     end
   end
 
+  def test_ci_mapping_recognizes_existing_workflow_without_changing_its_triggers
+    original = File.read(File.join(ROOT, '.github/workflows/ci.yml'))
+    marker = "      - name: Format\n"
+    assert_includes original, marker
+    workflow = original.sub(marker,
+      "      - name: Check architecture documents\n" \
+      "        run: ruby scripts/architecture-docs/check.rb --check\n\n" + marker)
+    refute_equal original, workflow
+    with_fixture do |root|
+      FileUtils.mkdir_p(File.join(root, '.github/workflows'))
+      File.write(File.join(root, '.github/workflows/ci.yml'), workflow)
+      out, err, status = Open3.capture3(RbConfig.ruby, CLI, '--root', root, '--check')
+      assert_equal 1, status.exitstatus, out + err
+      assert_equal %w[rfc_status_provisional wbs_status_provisional rfc_html_missing], out.lines.map(&:strip)
+      assert_empty err
+    end
+    assert_equal original, File.read(File.join(ROOT, '.github/workflows/ci.yml'))
+  end
+
+  def test_ci_mapping_accepts_empty_configuration_and_literal_branch_filters
+    [
+      "on:\n  push:",
+      "on:\n  pull_request: {}\n  workflow_dispatch: null",
+      "'on':\n  push: ~\n  pull_request: Null\n  workflow_dispatch: NULL",
+      "on:\n  push:\n    branches: [main, master]",
+      "on:\n  pull_request:\n    branches: ['release/**', main]",
+      "on:\n  push:\n    branches: ['123', 'on']"
+    ].each do |trigger|
+      with_fixture do |root|
+        FileUtils.mkdir_p(File.join(root, '.github/workflows'))
+        workflow = trigger + "\njobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ruby scripts/architecture-docs/check.rb --check\n"
+        File.write(File.join(root, '.github/workflows/ci.yml'), workflow)
+        out, err, status = Open3.capture3(RbConfig.ruby, CLI, '--root', root, '--check')
+        assert_equal 1, status.exitstatus, out + err
+        assert_equal %w[rfc_status_provisional wbs_status_provisional rfc_html_missing], out.lines.map(&:strip)
+        assert_empty err
+      end
+    end
+  end
+
+  {
+    'unknown_event' => "on:\n  schedule:",
+    'duplicate_event' => "on:\n  push:\n  push:",
+    'quoted_empty_config' => "on:\n  push: ''",
+    'quoted_null_config' => "on:\n  push: 'null'",
+    'false_config' => "on:\n  push: false",
+    'sequence_config' => "on:\n  push: []",
+    'unknown_filter' => "on:\n  push:\n    mystery: [main]",
+    'dispatch_branch_filter' => "on:\n  workflow_dispatch:\n    branches: [main]",
+    'scalar_branches' => "on:\n  push:\n    branches: main",
+    'empty_branches' => "on:\n  push:\n    branches: []",
+    'null_branch' => "on:\n  push:\n    branches: [null]",
+    'numeric_branch' => "on:\n  push:\n    branches: [123]",
+    'boolean_branch' => "on:\n  push:\n    branches: [on]",
+    'empty_branch' => "on:\n  push:\n    branches: ['']",
+    'expression_branch' => "on:\n  push:\n    branches: ['${{ github.ref_name }}']",
+    'nested_branch' => "on:\n  push:\n    branches: [[main]]",
+    'duplicate_branch' => "on:\n  push:\n    branches: [main, main]",
+    'only_negative_branch' => "on:\n  push:\n    branches: ['!main']",
+    'cancelled_literal_branches' => "on:\n  push:\n    branches: [main, '!main']",
+    'cancelled_all_branches' => "on:\n  push:\n    branches: ['**', '!**']",
+    'mixed_positive_and_negative_filters' => "on:\n  pull_request:\n    branches: ['release/**', '!release/private/**']",
+    'duplicate_filter' => "on:\n  push:\n    branches: [main]\n    branches: [master]",
+    'tagged_mapping' => "on: !!map\n  push:",
+    'tagged_branch' => "on:\n  push:\n    branches: [!!str main]",
+    'alias_config' => "on:\n  push: &filter {}\n  pull_request: *filter"
+  }.each do |name, trigger|
+    define_method("test_ci_mapping_rejects_#{name}") do
+      with_fixture do |root|
+        FileUtils.mkdir_p(File.join(root, '.github/workflows'))
+        workflow = trigger + "\njobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ruby scripts/architecture-docs/check.rb --check\n"
+        File.write(File.join(root, '.github/workflows/ci.yml'), workflow)
+        assert_cli_error(root, 'ci_rfc_gate_missing', '--check')
+      end
+    end
+  end
+
   ci_execution_bypasses = {
     'job_expression_false'=>['job', "if: '${{ false }}'"],
     'step_expression_false'=>['step', "if: '${{ false }}'"],
@@ -166,7 +243,7 @@ class RfcSpecTest < Minitest::Test
     'null_sequence_event'=>proc { |text| text.sub('on: push', 'on: [push, null]') },
     'nested_sequence'=>proc { |text| text.sub('on: push', 'on: [push, [pull_request]]') },
     'duplicate_sequence_event'=>proc { |text| text.sub('on: push', 'on: [push, push]') },
-    'mapping_trigger'=>proc { |text| text.sub('on: push', "on:\n  push:") },
+    'empty_mapping_trigger'=>proc { |text| text.sub('on: push', 'on: {}') },
     'unknown_top_key'=>proc { |text| "unknown: true\n" + text },
     'top_timeout'=>proc { |text| "timeout-minutes: 0\n" + text },
     'top_env'=>proc { |text| "env: {}\n" + text },

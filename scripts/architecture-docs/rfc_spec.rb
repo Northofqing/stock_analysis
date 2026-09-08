@@ -872,10 +872,39 @@ module ArchitectureDocs
       return false unless (fields.keys - %w[name on jobs]).empty? && fields.key?('on') && fields.key?('jobs')
       return false unless fields['jobs'].is_a?(Psych::Nodes::Mapping)
       trigger = fields['on']
+      return ci_mapping_trigger?(trigger) if trigger.is_a?(Psych::Nodes::Mapping)
       events = trigger.is_a?(Psych::Nodes::Sequence) ? trigger.children : [trigger]
       return false if events.empty?
       return false unless events.all? { |event| event.is_a?(Psych::Nodes::Scalar) && event.tag.nil? && %w[push pull_request workflow_dispatch].include?(event.value) }
       events.map(&:value).uniq.length == events.length
+    end
+
+    # 现有仓库使用映射式 pull_request 和 push.branches；仅识别明确支持的
+    # 空配置及正向字面 branches 列表。排除组合与未知过滤器不获得 CI gate 证明。
+    def ci_mapping_trigger?(trigger)
+      return false unless trigger.tag.nil? && !trigger.children.empty?
+      trigger.children.each_slice(2).all? do |event, config|
+        next false unless event.is_a?(Psych::Nodes::Scalar) && event.tag.nil? &&
+                          %w[push pull_request workflow_dispatch].include?(event.value)
+        if config.is_a?(Psych::Nodes::Scalar)
+          next config.tag.nil? && config.plain && ['', '~', 'null', 'Null', 'NULL'].include?(config.value)
+        end
+        next false unless config.is_a?(Psych::Nodes::Mapping) && config.tag.nil?
+        next true if config.children.empty?
+        next false unless %w[push pull_request].include?(event.value) && config.children.length == 2
+        key, branches = config.children
+        next false unless key.value == 'branches' && branches.is_a?(Psych::Nodes::Sequence) &&
+                          branches.tag.nil? && !branches.children.empty?
+        values = branches.children
+        next false unless values.all? do |value|
+          value.is_a?(Psych::Nodes::Scalar) && value.tag.nil? &&
+            !value.value.strip.empty? && !value.value.match?(/\s|\$\{\{/) &&
+            !value.value.start_with?('!') &&
+            (!value.plain || YAML.safe_load(value.value).is_a?(String))
+        end
+        names = values.map(&:value)
+        names.uniq.length == names.length
+      end
     end
 
     def ci_unique_yaml_keys?(root)
