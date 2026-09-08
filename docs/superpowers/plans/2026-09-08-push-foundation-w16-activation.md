@@ -89,6 +89,8 @@ cargo test --lib push_foundation::activation_transaction_tests -- --test-threads
 
 ## Task 4 — T4 四类 actor 的共同 fence 与真实 owner adapter
 
+实施进度：T4R实际Generic恢复隔离已在`ea2e6df`通过Foundation+durable合批391项及限定独立审查，原跨decision副作用已关闭。当前T4B开发真实Unix broker/client、broker持有typed effect寿命、独立持久operation及一个真实initial-intent写入adapter；这不是完整四actor、平台旧binary资源撤权、生产认证或52Unit迁移完成。保留以下整体验收要求。
+
 实际seam补充（f87e2b8核查）：phase_scheduler仅纯proposal，dedicated_transport仅terminal查询，不可把包装它们算作实际创建/发送覆盖。generic dispatch内部`reconcile_all_pending`跨Unit，因此本任务还需在`src/durable_delivery/coordinator.rs`提供精确作用范围的恢复入口，保留原审计链顺序；不能用单Unit许可包住全局恢复。finalizer的准备/冲突/错误记录也有写入，需一并覆盖。monitor启动reconciliation可发送，超时review worker可继续运行，gate必须早于这些启动/手工路径，abort/join外层任务不构成排空。下述文件ownership据此扩展到coordinator的精确恢复seam，除此不做无关重构。
 
 下一隔离实现采用broker拥有typed effect生命周期，客户端断连/超时不释放仍在执行的许可；稳定operation ID用于精确查回。broker重启默认关闭，未确认旧executor/后代及资源访问结束时不宣布Drained。真实子进程、实际fixture持久写入及原intent seam验证通过之前，不能以Mutex、UID/PID、EOF、TTL或客户端Release算跨进程撤权证据。该补充是实施要求，不是已经完成的broker。
