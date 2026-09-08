@@ -94,6 +94,19 @@ Clippy session60834 exit0、1m22s；完整JSON流在pipefail下汇总，build-fi
 
 旧T1读取/schema及W15 v2/v1/recovery/store未改，80948中244项既有测试通过的证据保留；不是把不同范围运行合称一次新的全Foundation结果。来源声明真实性、生产owner和跨库原子性均未由此证明。
 
+## 已完成限定实现：实际 Generic dispatch 恢复隔离
+
+源码 `ea2e6df`，原始 BASE `e0cdd0d`。单次 Generic dispatch 现在只恢复自己构造并 prepare 的 Foundation decision；进入恢复前核验持久 envelope 的摘要、合法性、精确 canonical bytes、稳定 decision 身份与完整15字段 binding。过期 attempt、audit 候选及前驱阻塞、payload、summary 和 hydration 均在选取候选前限定 decision。公开全局恢复入口保留，二者复用同一恢复循环；跨 decision 的未追加前驱只能阻塞，不能扩大恢复范围。
+
+真实回归43234先证明旧dispatch在目标发送成功后，把另一decision从 `RejectedAuditPending` 改为 `RejectedDurable`；该轮后续append断言未执行，不冒称已验证。修复后首轮69400为19 passed/1 failed，唯一失败是测试试图UPDATE冻结前驱，被既有不可变trigger拒绝。原agent改为在INSERT时冻结依赖，未修改或绕过trigger；此失败保留为夹具问题记录。
+
+- 最终合批命令：`env CARGO_PROFILE_TEST_INCREMENTAL=true cargo test --lib -- --test-threads=1 durable_delivery:: push_foundation::`。80937 exit0，**391 passed / 0 failed / 2 helper ignored**，68.91s；两个helper由父测试显式执行。编译49.01s、43项既有warning。
+- 六项新增回归均执行通过：实际dispatch及终态重查仅一次sink；append确认丢失后精确重试不重发；其他decision的attempt/fence/audit/payload/预约不变且summary/hydration不混入；只撤销目标过期attempt；15字段逐项错配、缺记录和legacy无绑定拒绝且零事实变更；跨decision审计前驱阻塞与后续全局恢复。
+- 最终production libClippy54385 exit0，1m29s，完整JSON成功；163项既有有位置warning，Foundation及`durable_delivery/coordinator.rs`目标零诊断。其后只改测试夹具，生产代码未变。四文件定向rustfmt和diff检查通过。
+- 固定 `e0cdd0d..ea2e6df` 限定独立审查 **Spec compliant / Code quality Approved**；无新增Critical/Important/Minor。审查额外核验持久envelope不可更新、decision不可删除，以及各helper后续修改沿已选decision或唯一payload身份执行，无待补验阻塞项。
+
+这是恢复副作用隔离，不是activation认证、broker排空、真实owner撤权或整个W16完成。未改冻结SQL、旧canonical、monitor启动路径和生产配置，未操作生产monitor/真实DB/provider/sink/PAM。
+
 ## 完整剩余范围
 
 ### T4 实际接线核查（证据基线 f87e2b8，尚无执行实现）
