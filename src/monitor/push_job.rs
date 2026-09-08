@@ -8,6 +8,7 @@ mod facts;
 mod identity;
 mod policy;
 mod projection;
+mod shadow;
 
 pub(crate) use canonical::{canonical_digest, canonical_preimage, raw_digest, CanonicalValue};
 pub(crate) use identity::{namespace_value, subject_value};
@@ -55,6 +56,11 @@ pub use projection::{
     DecisionProjector, JobDecision, JobDecisionView, MonitorKind, PreparedPush,
     PreparedPushComparison, ProjectionError, ReadyPreparation, RenderStateView, SemanticInput,
     SemanticProjection, Severity, SourceBinding, SubKind, SubKindValue, Suppression,
+};
+pub use shadow::{
+    execute_shadow, ShadowCallbackFailure, ShadowDeniedEffects, ShadowDiagnostics,
+    ShadowDifference, ShadowEffect, ShadowEffectCounts, ShadowEffectDenied, ShadowInvalidBinding,
+    ShadowObservation, ShadowPath, ShadowPathStatus, ShadowReport,
 };
 
 #[cfg(test)]
@@ -109,5 +115,7 @@ pub enum PushJobError {
 
 pub type Result<T> = std::result::Result<T, PushJobError>;
 
+#[cfg(test)]
+mod shadow_tests;
 #[cfg(test)]
 mod tests;

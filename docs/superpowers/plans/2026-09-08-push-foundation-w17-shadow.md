@@ -24,7 +24,8 @@ W15/W16 的真实来源认证仍缺生产身份/受保护根配置。2026-09-08 
 ### 文件与接口
 
 - 新增 `src/monitor/push_job/shadow.rs`：执行、比较、私有报告构造及拒绝能力。实现保持单一职责；必要时将实际拒绝端口实现放入新 `shadow_effects.rs`，不得为尚未出现的扩展再分层。
-- 新增 `src/monitor/push_job/shadow_tests.rs`：通过实际执行接口测试。允许复用现有 `context::capture_fixture` / `projection::projector_fixture` 等 cfg(test) 构造器；不修改其业务合同。
+- 新增 `src/monitor/push_job/shadow_tests.rs`：通过实际执行接口测试。允许复用现有 `facts::capture_fixture` / `context::capture_capability_fixture` / `projection::projector_fixture` 等 cfg(test) 构造器；不修改其业务合同。
+- 允许实现代理在 `context.rs` 的 cfg(test) `ContextFixtureCase` / `context_fixture_parts` 中补充其他 Unit、其他 occurrence、其他 captured_business_time 的三个合法夹具变体，以执行真实错配反例；现有夹具输出与生产结构可见性/构造权限不变。
 - 父代理在 `src/monitor/push_job.rs` 注册模块及最小必要导出；具体导出名由实现代理在报告给出。优先小接口隐藏完整比较规则；不暴露可清零计数器或伪造通过报告的构造器。
 - 可只读参考 `facts.rs:568–587`、`projection.rs:264–427,713–821,879–1110`、`policy.rs:781–827` 和现有 W04/W05 测试。不得修改既有领域字节格式、扩大 JobDecision 构造权限或添加测试专用生产后门。
 

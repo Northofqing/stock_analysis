@@ -484,6 +484,9 @@ pub(super) enum ContextFixtureCase {
     ValidScheduled,
     ValidEvent,
     ValidManual,
+    ValidOtherUnit,
+    ValidOtherOccurrence,
+    ValidOtherCapturedTime,
     WrongSchedule,
     WrongEventProducer,
     WrongEventSourceContract,
@@ -546,7 +549,14 @@ fn context_fixture_parts(case: ContextFixtureCase) -> Result<(RunContextFactory,
 
     let factory = RunContextFactory::new(CatalogRunBinding {
         namespace,
-        unit_id: UnitId::try_new("MU-auction".to_owned())?,
+        unit_id: UnitId::try_new(
+            if matches!(case, ContextFixtureCase::ValidOtherUnit) {
+                "MU-other"
+            } else {
+                "MU-auction"
+            }
+            .to_owned(),
+        )?,
         trigger: registered_trigger,
         occurrence_family: OccurrenceFamily::try_new("auction-session".to_owned())?,
         activation_generation: 7,
@@ -566,9 +576,22 @@ fn context_fixture_parts(case: ContextFixtureCase) -> Result<(RunContextFactory,
             occurrence: OccurrenceIdentityMaterial::new(
                 BusinessDate::parse("2026-09-07")?,
                 occurrence_family,
-                super::OccurrenceKey::try_new("main".to_owned())?,
+                super::OccurrenceKey::try_new(
+                    if matches!(case, ContextFixtureCase::ValidOtherOccurrence) {
+                        "other"
+                    } else {
+                        "main"
+                    }
+                    .to_owned(),
+                )?,
             ),
-            captured_business_time: UtcMicros::try_new(1_788_743_100_000_000)?,
+            captured_business_time: UtcMicros::try_new(
+                if matches!(case, ContextFixtureCase::ValidOtherCapturedTime) {
+                    1_788_743_100_000_001
+                } else {
+                    1_788_743_100_000_000
+                },
+            )?,
         },
     ))
 }
