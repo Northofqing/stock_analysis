@@ -704,6 +704,25 @@ pub(crate) struct AttestedReadyIntent {
 }
 
 impl IntentSnapshot {
+    pub(crate) fn unit_id(&self) -> &str {
+        &self.unit_id
+    }
+    pub(crate) fn decision_id(&self) -> &str {
+        &self.durable_decision_id
+    }
+    pub(crate) fn updated_at(&self) -> UtcMicros {
+        self.updated_at
+    }
+    pub(crate) fn sla_route_matches(&self, template: &Sha256Digest, owner: &str) -> bool {
+        &self.template_sha256 == template && self.completion_owner == owner
+    }
+    pub(crate) fn sla_n02_window_matches(&self, window: &str) -> bool {
+        self.occurrence_family == "news-flash-window" && self.occurrence_key == window
+    }
+    pub(crate) fn sla_n02_occurrence_supported(&self) -> bool {
+        self.occurrence_family == "news-flash-window"
+    }
+
     /// Complete immutable and lease/version material for the broker's fixed effect.
     pub(super) fn activation_snapshot_fields(&self) -> BTreeMap<&'static str, CanonicalValue> {
         let mut fields = BTreeMap::new();
@@ -1976,6 +1995,28 @@ impl BusinessIntentStore {
             .inspect(intent_id)?
             .ok_or(IntentStoreError::IntentMissing)?;
         query_transition_chain(&self.connection, &current)
+    }
+
+    /// One source-owned, deferred read transaction; nesting fails without touching
+    /// a caller's transaction. No opener, PRAGMA, lease, or business mutation.
+    pub(crate) fn inspect_with_transition_chain(
+        &self,
+        intent_id: &IntentId,
+    ) -> Result<(IntentSnapshot, Vec<TransitionReceipt>), IntentStoreError> {
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)
+                .map_err(|_| IntentStoreError::StorageFailed {
+                operation: "begin_sla_read",
+            })?;
+        let snapshot = query_intent(&transaction, intent_id.as_str())?
+            .ok_or(IntentStoreError::IntentMissing)?;
+        let chain = query_transition_chain(&transaction, &snapshot)?;
+        transaction
+            .rollback()
+            .map_err(|_| IntentStoreError::StorageFailed {
+                operation: "end_sla_read",
+            })?;
+        Ok((snapshot, chain))
     }
 
     #[cfg(test)]

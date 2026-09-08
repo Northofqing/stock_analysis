@@ -362,7 +362,7 @@ impl<'a> GenericTransportAuthorityAdapter<'a> {
     }
 }
 
-fn build_foundation_envelope(
+pub(super) fn build_foundation_envelope(
     snapshot: &IntentSnapshot,
     attested: &super::intent_store::AttestedReadyIntent,
     route: &GenericTransportRoute,

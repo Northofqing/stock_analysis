@@ -40,6 +40,8 @@
 7. 报告私有构造、字段只读，包含 namespace/Unit/intent/decision、当前业务状态、version/head、authority类别/状态、相关不可变证据引用或hash、原始接受/完成/观察时间和阈值事实；不能把调用方预置的成功布尔作为权威。Debug/Error不得泄漏正文、持仓、模型内容、webhook/key、任意数据库错误、路径或远端回执 message_id。稳定 reason 使用现有 FinalizerDeadlineExceeded / TerminalRefInvalid 等适用闭集；不要修改全局 ReasonCode 注册。
 8. 查询前后不改变业务/durable/audit行、不获取恢复lease、不调用sink/append/finalizer。允许已存在 source-owned 连接管理自己的只读事务；不为观察新建生产库、不checkpoint/复制WAL主文件。完整保留期与清理资格稍后单独实现，本任务不删除任何证据。
 
+实施核查补充（不关闭全量生产范围）：全 src/RFC/WBS 中只在旧 N02 测试找到 `news-flash-window` / `key=window.label()` 约定，没有生产 occurrence 注册证据。本查询局部显式支持该约定：其他 family 返回 UnsupportedOccurrenceRoute，支持 family 的错 key 返回 RouteMismatch。不得以调用方自由声明的 family/key/window 映射证明同一 intent；不得把未知约定当数据损坏。正式 N02 producer 身份构造、生产注册和全部合法路由接线仍是完整迁移待办。`FinalizerDeadlineExceeded` 同时覆盖超过两周期目标与达到硬上限的延迟事实，两周期目标本身不等于硬阻断。
+
 ### 测试与检查
 
 使用隔离 Test namespace 和唯一临时数据库/审计目录，不读取真实数据。将实际已有 writer/terminal reader/finalizer 作为 fixture 建立已提交记录，断言观察前后全表/append计数不变并保留原sink调用次数。覆盖：

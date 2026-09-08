@@ -80,6 +80,19 @@ pub(crate) struct DedicatedConformanceRoute {
 }
 
 impl DedicatedConformanceRoute {
+    pub(crate) fn matches_sla_route(
+        &self,
+        class: AuthorityClass,
+        template: &TerminalTemplateBinding,
+    ) -> bool {
+        self.template == *template
+            && matches!(
+                (self.specialty, class),
+                (DedicatedSpecialty::P01, AuthorityClass::P01Dedicated)
+                    | (DedicatedSpecialty::N02, AuthorityClass::N02Dedicated)
+            )
+    }
+
     pub(crate) fn try_new(
         template: TerminalTemplateBinding,
         required_channel: ChannelId,
@@ -145,6 +158,18 @@ pub(crate) fn verify_p01_dedicated(
     source: &dyn P01DedicatedTerminalSource,
     verified_at: UtcMicros,
 ) -> Result<DeliveryResult, DedicatedConformanceError> {
+    let mapped = inspect_p01_dedicated(snapshot, route, source)?;
+    let authority = FixedDedicatedAuthority::new(mapped);
+    let verified = verify_terminal(snapshot, &route.template, policy, &authority, verified_at)
+        .map_err(|_| DedicatedConformanceError::TerminalVerificationFailed)?;
+    Ok(verified.into_delivery_result())
+}
+
+pub(crate) fn inspect_p01_dedicated(
+    snapshot: &IntentSnapshot,
+    route: &DedicatedConformanceRoute,
+    source: &dyn P01DedicatedTerminalSource,
+) -> Result<AuthorityTerminalRecord, DedicatedConformanceError> {
     let attested = snapshot
         .attested_ready_binding()
         .map_err(|_| DedicatedConformanceError::InvalidBusinessIntent)?;
@@ -172,11 +197,7 @@ pub(crate) fn verify_p01_dedicated(
         }
         P01DedicatedTerminalQuery::Terminal(record) => *record,
     };
-    let mapped = map_p01_terminal(&attested, route, source_record)?;
-    let authority = FixedDedicatedAuthority::new(mapped);
-    let verified = verify_terminal(snapshot, &route.template, policy, &authority, verified_at)
-        .map_err(|_| DedicatedConformanceError::TerminalVerificationFailed)?;
-    Ok(verified.into_delivery_result())
+    map_p01_terminal(&attested, route, source_record)
 }
 
 pub(crate) fn verify_n02_dedicated(
@@ -187,6 +208,19 @@ pub(crate) fn verify_n02_dedicated(
     source: &dyn N02DedicatedTerminalSource,
     verified_at: UtcMicros,
 ) -> Result<DeliveryResult, DedicatedConformanceError> {
+    let mapped = inspect_n02_dedicated(snapshot, window, route, source)?;
+    let authority = FixedDedicatedAuthority::new(mapped);
+    let verified = verify_terminal(snapshot, &route.template, policy, &authority, verified_at)
+        .map_err(|_| DedicatedConformanceError::TerminalVerificationFailed)?;
+    Ok(verified.into_delivery_result())
+}
+
+pub(crate) fn inspect_n02_dedicated(
+    snapshot: &IntentSnapshot,
+    window: NewsFlashWindow,
+    route: &DedicatedConformanceRoute,
+    source: &dyn N02DedicatedTerminalSource,
+) -> Result<AuthorityTerminalRecord, DedicatedConformanceError> {
     let attested = snapshot
         .attested_ready_binding()
         .map_err(|_| DedicatedConformanceError::InvalidBusinessIntent)?;
@@ -218,11 +252,7 @@ pub(crate) fn verify_n02_dedicated(
         }
         NewsFlashWindowTerminalQuery::Terminal(record) => *record,
     };
-    let mapped = map_n02_terminal(&attested, rendered_len, window, route, source_record)?;
-    let authority = FixedDedicatedAuthority::new(mapped);
-    let verified = verify_terminal(snapshot, &route.template, policy, &authority, verified_at)
-        .map_err(|_| DedicatedConformanceError::TerminalVerificationFailed)?;
-    Ok(verified.into_delivery_result())
+    map_n02_terminal(&attested, rendered_len, window, route, source_record)
 }
 
 fn map_n02_terminal(
