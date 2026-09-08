@@ -387,17 +387,51 @@ async fn registered_business_lease_drift_rejects_at_actual_worker_seam() {
     let broker = fixture.broker("first", TestHooks::default());
     let request = broker.test_generic_request("one", WorkClass::NewWork);
     let before = fixture.counts();
-    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
-    connection
-        .execute(
-            "UPDATE push_intents SET lease_generation=lease_generation+1",
-            [],
-        )
-        .unwrap();
+    let (bound, _, _, _) = claimed_fixture_at(&fixture.database, &fixture.code);
+    let intent_id = bound.attested_ready_binding().unwrap().intent_id;
+    let mut store = BusinessIntentStore::open(&fixture.database).unwrap();
+    let chain_before = store.inspect_transition_chain(&intent_id).unwrap();
+    let renewed_until = micros(1_788_743_500_000_000);
+    let renewal = IntentTransitionCommand::try_new(
+        intent_id.clone(),
+        bound.state(),
+        bound.state(),
+        bound.version(),
+        TransitionActor::try_new("same-owner-renewal".into()).unwrap(),
+        ReasonCode::IntentDispatchClaimed,
+        micros(1_788_743_101_500_000),
+        LeaseAction::Acquire {
+            owner: LeaseOwnerId::try_new(bound.lease_owner().unwrap().into()).unwrap(),
+            until: renewed_until,
+        },
+    )
+    .unwrap();
+    store.apply_nonterminal_transition(&renewal).unwrap();
+    let renewed = store.inspect(&intent_id).unwrap().unwrap();
+    assert_eq!(renewed.state(), bound.state());
+    assert_eq!(renewed.lease_owner(), bound.lease_owner());
+    assert_eq!(renewed.version(), bound.version() + 1);
+    assert_eq!(renewed.lease_generation(), bound.lease_generation() + 1);
+    assert_eq!(renewed.lease_until(), Some(renewed_until));
+    assert_ne!(renewed, bound);
+    assert_eq!(
+        store.inspect_transition_chain(&intent_id).unwrap().len(),
+        chain_before.len() + 1
+    );
+    renewed.attested_ready_binding().unwrap();
     broker.execute_current(request.clone()).unwrap();
     assert_eq!(
         finish(&broker, &request).await.state,
         OperationState::Unresolved
+    );
+    assert_eq!(
+        store.inspect(&intent_id).unwrap().unwrap(),
+        renewed,
+        "refused worker does not rewrite the renewed business intent"
+    );
+    assert_eq!(
+        store.inspect_transition_chain(&intent_id).unwrap().len(),
+        chain_before.len() + 1
     );
     assert_eq!(fixture.counts(), before);
     assert_eq!(fixture.sink.calls.load(Ordering::SeqCst), 0);

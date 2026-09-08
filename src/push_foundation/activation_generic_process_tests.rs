@@ -36,6 +36,7 @@ enum Role {
         epoch: String,
         hooks: TestHooks,
         pause: bool,
+        pause_append: bool,
         uncertain: bool,
         fail_append: bool,
     },
@@ -108,6 +109,7 @@ struct Fixture {
     root: tempfile::TempDir,
     durable_root: tempfile::TempDir,
     sequence: usize,
+    pause_append: bool,
 }
 
 impl Fixture {
@@ -130,6 +132,7 @@ impl Fixture {
             root,
             durable_root,
             sequence: 0,
+            pause_append: false,
         }
     }
 
@@ -189,6 +192,7 @@ impl Fixture {
                 epoch: epoch.into(),
                 hooks,
                 pause,
+                pause_append: self.pause_append,
                 uncertain,
                 fail_append,
             },
@@ -345,6 +349,8 @@ impl AuthoritativeSinkPort for LocalSink {
 struct LocalAppend {
     database: PathBuf,
     fail_once: AtomicBool,
+    pause: Option<PathBuf>,
+    pause_once: AtomicBool,
 }
 
 impl ImmutableAppendPort for LocalAppend {
@@ -355,6 +361,19 @@ impl ImmutableAppendPort for LocalAppend {
         bytes: &[u8],
         digest: &str,
     ) -> crate::durable_delivery::Result<String> {
+        if self.pause_once.swap(false, Ordering::SeqCst) {
+            if let Some(path) = &self.pause {
+                let mut stream = std::os::unix::net::UnixStream::connect(path).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
+                stream.set_write_timeout(Some(BOUND)).unwrap();
+                stream.write_all(b"A").unwrap();
+                let mut ack = [0];
+                stream.read_exact(&mut ack).unwrap();
+                assert_eq!(ack, *b"G");
+            }
+        }
         if self.fail_once.swap(false, Ordering::SeqCst) {
             return Err(DurableDeliveryError::ImmutableAppendConflict(
                 "TEST_CODE_INJECTED_APPEND_FAILURE".into(),
@@ -450,7 +469,7 @@ async fn actual_sink_pause(listener: &UnixListener) -> UnixStream {
 }
 
 #[test]
-#[ignore = "explicitly spawned by w16_generic_process parent tests"]
+#[ignore = "explicitly spawned by w16_generic_process sink/append/recovery parent tests"]
 fn w16_generic_process_child() {
     let input: ChildInput = serde_json::from_reader(std::io::stdin()).unwrap();
     assert_eq!(input.root.parent(), Some(Path::new("/private/tmp")));
@@ -473,6 +492,7 @@ fn w16_generic_process_child() {
                     epoch,
                     hooks,
                     pause,
+                    pause_append,
                     uncertain,
                     fail_append,
                 } => {
@@ -497,6 +517,8 @@ fn w16_generic_process_child() {
                     let append_port = Arc::new(LocalAppend {
                         database: ports,
                         fail_once: AtomicBool::new(fail_append),
+                        pause: pause_append.then(|| input.root.join("append.sock")),
+                        pause_once: AtomicBool::new(pause_append),
                     });
                     let scope = Scope {
                         namespace: format!("Test:{}", input.test_code),
@@ -693,6 +715,111 @@ async fn w16_generic_process_client_death_retains_sink_worker_and_confirmed_rest
         assert!(!status.new_work_open && !status.recovery_open && status.drained);
         fixture.assert_single_attempt_and_sink(1);
     }
+}
+
+#[tokio::test]
+async fn w16_generic_process_append_in_progress_retains_worker_after_client_death() {
+    let mut fixture = Fixture::new();
+    fixture.pause_append = true;
+    let append_pause = UnixListener::bind(fixture.root.path().join("append.sock")).unwrap();
+    let (_broker, socket, registered) = fixture
+        .broker("first", TestHooks::default(), false, false, false)
+        .await;
+    let dispatch = registered.dispatch;
+    let (mut requester, _lifetime) = fixture.spawn(
+        &socket,
+        Role::Requester(Envelope {
+            identity: identity(false),
+            command: Command::ExecuteCurrent {
+                request: dispatch.clone(),
+                wait: true,
+            },
+        }),
+    );
+    let mut release = tokio::time::timeout(BOUND, async {
+        let (mut stream, _) = append_pause.accept().await.unwrap();
+        let mut marker = [0];
+        stream.read_exact(&mut marker).await.unwrap();
+        assert_eq!(marker, *b"A");
+        stream
+    })
+    .await
+    .expect("actual append_exact reached after durable sink result");
+    fixture.assert_single_attempt_and_sink(1);
+    let durable = durable_path(fixture.test_code());
+    let attempts = fixture.rows(&durable, "SELECT * FROM delivery_attempts");
+    let sink_sql = "SELECT result_event_identity,decision_identity,attempt_identity,result_canonical,result_sha256 FROM sink_results";
+    let sink_results = fixture.rows(&durable, sink_sql);
+    let ports = fixture.root.path().join("ports.sqlite3");
+    let control = fixture.root.path().join("control.sqlite3");
+    assert_eq!(fixture.count(&ports, "appended"), 0);
+    assert_eq!(fixture.count(&control, "effect_worker_completions"), 0);
+    let status = close(&socket, &dispatch, WorkClass::NewWork).await;
+    assert!(!status.new_work_open && status.recovery_open && !status.drained);
+    assert_eq!(status.unresolved, 1);
+    assert!(requester.0.try_wait().unwrap().is_none());
+    requester.stop();
+    let status = close(&socket, &dispatch, WorkClass::Recovery).await;
+    assert!(!status.new_work_open && !status.recovery_open && !status.drained);
+    assert_eq!(status.unresolved, 1);
+    assert_eq!(
+        fact(
+            request(
+                &socket,
+                Command::QueryOperation {
+                    request: dispatch.clone(),
+                    wait: false
+                }
+            )
+            .await
+        )
+        .state,
+        OperationState::Running
+    );
+    assert_eq!(fixture.count(&control, "effect_worker_completions"), 0);
+    assert_eq!(fixture.count(&ports, "appended"), 0);
+    fixture.assert_single_attempt_and_sink(1);
+
+    release.write_all(b"G").await.unwrap();
+    let completed = settled(&socket, &dispatch).await;
+    assert_eq!(completed.state, OperationState::Succeeded);
+    assert!(matches!(completed.result, Some(EffectResult::Generic(_))));
+    assert!(fixture.count(&ports, "appended") > 0);
+    assert_eq!(fixture.count(&control, "effect_worker_completions"), 1);
+    assert!(close(&socket, &dispatch, WorkClass::Recovery).await.drained);
+    assert_eq!(
+        fact(
+            request(
+                &socket,
+                Command::QueryOperation {
+                    request: dispatch.clone(),
+                    wait: true
+                }
+            )
+            .await
+        ),
+        completed
+    );
+    assert_eq!(
+        fact(
+            request(
+                &socket,
+                Command::ExecuteCurrent {
+                    request: dispatch,
+                    wait: true
+                }
+            )
+            .await
+        ),
+        completed
+    );
+    assert_eq!(fixture.count(&control, "effect_worker_completions"), 1);
+    fixture.assert_single_attempt_and_sink(1);
+    assert_eq!(
+        fixture.rows(&durable, "SELECT * FROM delivery_attempts"),
+        attempts
+    );
+    assert_eq!(fixture.rows(&durable, sink_sql), sink_results);
 }
 
 #[tokio::test]
