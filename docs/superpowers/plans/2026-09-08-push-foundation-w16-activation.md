@@ -97,6 +97,8 @@ cargo test --lib push_foundation::activation_transaction_tests -- --test-threads
 
 接线前置实施片T4R：先让实际generic dispatch仅恢复本次精确Foundation decision及完整binding，保留单独全局startup恢复。共用恢复算法的attempt、audit、payload和summary/hydration选择均传递范围，不能只过滤最外层结果；遇到范围外未追加前驱时拒绝而不扩大权限。以旧dispatch改变另一decision持久状态的真实隔离回归为RED，再验证目标终结、其他decision不变和全局恢复仍有效。此片消除已确认的跨范围副作用，不替代随后broker/current权限、owner撤销与52Unit映射。
 
+T4C已限定完成（BASE `ad2b257`，源码`0b70f4d`、测试修正`81683f4`）：已有broker注册闭集GenericDispatch与GenericReconcile，分别归NewWork/Recovery；前者覆盖实际prepare、attempt、sink、receipt、精确恢复和完成证明，后者不prepare/resume/send。现有无许可Generic入口仅保留测试可见，实际runtime入口要求私有worker执行context。原initial结果/完成证明v1不变，新Generic独立结果分派与完成证明domain；策略完整绑定新增`ActivationCompletionPolicy/v1`。最终18项行为测试（12同进程、6真实父进程）、production Clippy目标零和限定复核通过；未改模块保留此前481项通过证据，不称修正后新全量测试。原Unresolved operation后续协调仍待；生产monitor未变，完整dispatcher/四actor/52Unit迁移尚未完成，不重派此片。
+
 依赖 T2 认证部署，T0/C supervisor 平台选择；Shadow/legacy 联合许可按已澄清的 B 实现，并测试初始/排空后/回滚准入矩阵。新建 `activation_owner.rs`、`activation_fence.rs`、`activation_fence_tests.rs`；新建 `src/bin/monitor/activation_runtime.rs` 和其本地测试 module（真实路径均为新建）。编辑已有 `src/bin/monitor/main.rs` 注册受监督生命周期；接管 `phase_scheduler.rs`、`generic_transport.rs`、`dedicated_transport.rs`、`business_finalizer.rs`、`reconciler.rs` 的共同执行 seam。`intent_store.rs` 仅在使当前执行许可覆盖业务事务确有必要时修改，保留 lease/version 原义。common module 的公开可见性变更串行交接 `mod.rs`。
 
 实现完整 `(unit,generation,manifest,owner)` 当前检查与撤销共享的执行许可；跨进程的 quiesce/inspect/install-paused/resume 由认证 supervisor 驱动。旧进程确认死亡/撤权、在途许可结束后才能切换；进程身份需防 PID 复用。未适配旧 binary 不允许混跑。日志、旧 token、重启新 run_id 不可授予权限。

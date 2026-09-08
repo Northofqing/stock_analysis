@@ -132,9 +132,23 @@ T4B源码`31d834c`、确认窗口修正`c607730`，原始BASE`5df44c1`，修正B
 
 这里只交付initial-intent adapter和broker寿命控制；生产ACL、旧binary直达资源撤权、完整四actor和52Unit映射仍未交付。
 
+## 已验证：真实 Generic 发送与只恢复接线（T4C）
+
+从`ad2b257`继续，把broker的私有执行context贯穿真实Generic prepare/attempt/sink/receipt及精确恢复；不是仅在消息入口包一个检查。DispatchGeneric归NewWork，ReconcileGeneric归Recovery且不prepare/resume/send；Uncertain与未确认结果仍阻断排空。原initial结果/完成证明v1保留，新Generic单独分派，冻结SQL不改。
+
+源码`0b70f4d`交付14个Rust文件，测试修正`81683f4`仅改两个测试文件。新增策略编码`ActivationCompletionPolicy/v1`覆盖全部14个顶层字段，allowed_authority和schedule_close_policy按文本排序，retry显式null；namespace可参数化的Ready fixture仅测试可见，不改原Production fixture语义。Generic结果采用严格独立形状，完成证明使用`ActivationGenericTransportWorkerCompletion/v1`，不改原initial结果或证明字节。
+
+- 首轮合批54674：Foundation、durable_delivery、push_job实际执行为481通过、1失败、4个父测试显式启动的helper忽略；编译2m32s、运行81.75s。唯一失败是测试直接修改租约代数，被冻结trigger拒绝；该失败发生在目标行为断言之前，不能算防漂移已验证。
+- 修正后5949：`env CARGO_PROFILE_TEST_INCREMENTAL=true cargo test --lib -- --test-threads=1 push_foundation::activation_generic_effect_tests:: push_foundation::activation_generic_process_tests::`，exit0，**18通过、0失败、1个父测试显式启动的helper忽略**；编译1m05s、运行7.62s。包含12项同进程及6项真实父进程测试。租约漂移改用合法续租，并独立重读版本/代数/有效期和transition链；没有禁用trigger或改业务状态机。
+- 真实进程验证覆盖客户端死亡后仍执行、broker崩溃与重启、最终结果确认读失败、证明ack丢失、Uncertain不重发，以及发送结果已经持久而实际append仍在途时不提前排空。append暂停期间关闭两类gate、实际kill/wait请求者，operation仍Running且无完成证明；释放后精确查回完成，attempt和sink仍各一次。
+- 最终生产Clippy37610：exit0，1m29s，完整JSON成功、本次Foundation/coordinator/push_job目标诊断为空，163项有位置warning为既有基线；测试另有43项既有warning。生产源码在该验证后未变，仅修改cfg(test)文件，因此复用生产静态证据，不冒称修正后全量重跑481项。
+- 独立初审提出上述失败夹具和实际append在途证据两项Important；固定`0b70f4d..81683f4`限定复核全部**ADDRESSED**，无新增问题，fix round1 Approved。
+
+只关闭本片broker-owned Generic发送/只恢复adapter。后续Recovery成功不会改写原Unresolved operation，原范围仍阻断排空，需另行认证的控制面协调。成功构造仍限Test fixture；生产认证、完整monitor接线、其他actor、具体Unit cursor和52Unit迁移均未因此完成。
+
 ## 完整剩余范围
 
-### T4 实际接线核查（证据基线 f87e2b8，尚无执行实现）
+### T4 实际接线核查（历史基线 f87e2b8，后续交付以上文为准）
 
 只读核查确认不能仅在表面入口增加一个检查。以下是后续必须覆盖的真实位置，未运行monitor或进程实验：
 
@@ -146,7 +160,7 @@ T4B源码`31d834c`、确认窗口修正`c607730`，原始BASE`5df44c1`，修正B
 | `business_finalizer.rs:418,809,829`、`reconciler.rs:628` | 准备、冲突、错误和恢复租约均可能写库 | 每个写入分支都在当前许可内，嵌套恢复复用同一个scope，不只包成功完成分支 |
 | `monitor/main.rs:4958,5829` | 启动恢复可发送；超时的review worker可继续执行 | 启动/手工入口先关门；跟踪真实effect/worker结束，外层abort/join不是排空证明 |
 
-因此下一隔离broker应拥有typed effect及许可生命周期，客户端断连后仍保持在途状态；以实际Child/资源约束和稳定operation ID查回，重启默认关闭。旧binary可绕过broker直接访问sink/DB时仍不能批准接管，需真实监督器与权限撤销证据。这是下一实现要求，不是新增生产保护已生效。
+T4B/T4C已在隔离环境交付broker持有typed effect及许可生命周期、客户端断连保持在途、稳定operation查回和重启默认关闭。上表的Generic全局恢复问题已由T4R精确范围修复，initial写入由T4B、Generic发送由T4C接入；scheduler、真实采集、专用发送、finalizer/cursor与monitor仍须继续接线。旧binary可绕过broker直接访问sink/DB时仍不能批准接管，需真实监督器与权限撤销证据，不是生产保护已经生效。
 
 - T2：本批仅完成真实内核/FD观察、批准声明约束和原始日历join；生产规范操作员、受保护根/opener/ACL、实际部署/source package、可信时钟和批准持久/撤销/防重放仍待，生产平台及根配置尚未给定。
 - T3：内部同事务引擎已实现；真实认证 opener、可信业务日及外部批准包精确请求绑定、T5协调接线仍待。
