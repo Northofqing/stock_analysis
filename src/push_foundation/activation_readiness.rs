@@ -22,6 +22,9 @@ use super::activation_facts::{ActivationReconciliation, RawActivationFacts};
 use super::activation_store::inspect_raw_activation_facts;
 use super::operational_readiness::{required_kinds, DependencyKind, ReadinessScope};
 
+#[path = "activation_readiness_codec.rs"]
+mod codec;
+
 const DEPLOYMENT_SET_DOMAIN: &str = "ActivationDeploymentSet/v1";
 const DEPLOYMENT_SET_SCHEMA_VERSION: u64 = 1;
 
@@ -190,12 +193,44 @@ impl fmt::Debug for ActivationDeploymentSet {
 }
 
 impl ActivationDeploymentSet {
+    pub(super) fn namespace(&self) -> &Namespace {
+        &self.namespace
+    }
+
+    pub(super) fn catalog_sha256(&self) -> &Sha256Digest {
+        &self.catalog_sha256
+    }
+
+    pub(super) fn enabled_producers(&self) -> &[ProducerId] {
+        &self.enabled_producers
+    }
+
+    pub(super) fn recovery_units(&self) -> &[UnitId] {
+        &self.recovery_units
+    }
+
+    pub(super) fn shared_dependencies(&self) -> &[SharedDependencyDeclaration] {
+        &self.shared_dependencies
+    }
+
     pub(super) fn sha256(&self) -> &Sha256Digest {
         &self.deployment_set_sha256
     }
 
     pub(super) fn canonical_bytes(&self) -> &[u8] {
         &self.canonical_bytes
+    }
+
+    pub(super) fn canonical_value(&self) -> CanonicalValue {
+        CanonicalValue::Object(deployment_set_fields(
+            &self.namespace,
+            &self.catalog_sha256,
+            &self.calendar,
+            &self.enabled_producers,
+            &self.recovery_units,
+            &self.shared_dependencies,
+            &self.units,
+        ))
     }
 
     pub(super) fn unit_generations(&self) -> Vec<(&UnitId, Option<u64>)> {
@@ -251,6 +286,24 @@ impl ActivationDeploymentSet {
     }
 }
 
+impl SharedDependencyDeclaration {
+    pub(super) fn kind(&self) -> DependencyKind {
+        self.kind
+    }
+
+    pub(super) fn contract_id(&self) -> &SourceContractId {
+        &self.contract_id
+    }
+
+    pub(super) fn contract_version(&self) -> &SourceContractVersion {
+        &self.contract_version
+    }
+
+    pub(super) fn sha256(&self) -> &Sha256Digest {
+        &self.sha256
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(super) enum ActivationDeploymentSetError {
     #[error("bundled deployment catalog is unavailable")]
@@ -273,6 +326,23 @@ pub(super) enum ActivationDeploymentSetError {
     DeploymentChanged,
     #[error("readiness scope is not enabled by this deployment")]
     ScopeRejected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(super) enum ActivationDeploymentSetDecodeError {
+    #[error("activation deployment set field is invalid: {field}")]
+    InvalidField { field: &'static str },
+    #[error("activation deployment set bytes are noncanonical or disagree with their digest")]
+    InconsistentSet,
+    #[error(transparent)]
+    InvalidSet(#[from] ActivationDeploymentSetError),
+}
+
+pub(super) fn decode_activation_deployment_set(
+    value: &serde_json::Value,
+    expected_sha256: &Sha256Digest,
+) -> Result<ActivationDeploymentSet, ActivationDeploymentSetDecodeError> {
+    codec::decode_activation_deployment_set(value, expected_sha256)
 }
 
 /// Read the complete raw activation history once and assemble a full-catalog candidate.
@@ -359,6 +429,102 @@ pub(super) fn construct_activation_deployment_set(
     Ok(ActivationDeploymentSet {
         namespace: request.namespace,
         catalog_sha256: catalog.catalog_sha256().clone(),
+        calendar,
+        enabled_producers,
+        recovery_units,
+        shared_dependencies,
+        units,
+        canonical_bytes,
+        deployment_set_sha256,
+    })
+}
+
+/// Restore a persisted candidate after the codec has parsed every typed field.
+/// This validates only the closed deployment-set contract; it does not re-authenticate its source.
+#[allow(clippy::too_many_arguments)]
+fn restore_activation_deployment_set(
+    namespace: Namespace,
+    catalog_sha256: Sha256Digest,
+    calendar: CalendarDeclaration,
+    enabled_producers: Vec<ProducerId>,
+    recovery_units: Vec<UnitId>,
+    shared_dependencies: Vec<SharedDependencyDeclaration>,
+    mut units: Vec<UnitDeploymentObservation>,
+) -> Result<ActivationDeploymentSet, ActivationDeploymentSetError> {
+    let catalog =
+        MachineCatalog::bundled().map_err(|_| ActivationDeploymentSetError::CatalogRejected)?;
+    if &catalog_sha256 != catalog.catalog_sha256() {
+        return Err(ActivationDeploymentSetError::CatalogRejected);
+    }
+    if calendar.utc_offset_seconds != 28_800 {
+        return Err(ActivationDeploymentSetError::CalendarRejected);
+    }
+    let enabled_producers = validate_enabled_producers(&catalog, enabled_producers)?;
+    let recovery_units = validate_recovery_units(&catalog, recovery_units)?;
+    let shared_dependencies = validate_shared_dependencies(shared_dependencies)?;
+    units.sort_by(|left, right| left.unit_id().cmp(right.unit_id()));
+    let actual = units
+        .iter()
+        .map(UnitDeploymentObservation::unit_id)
+        .collect::<BTreeSet<_>>();
+    let expected = catalog
+        .units()
+        .iter()
+        .map(|unit| unit.id())
+        .collect::<BTreeSet<_>>();
+    if actual.len() != units.len() || actual != expected {
+        return Err(ActivationDeploymentSetError::UnitCoverageRejected);
+    }
+    let registered = units
+        .iter()
+        .map(|unit| (unit.unit_id(), unit.is_registered()))
+        .collect::<BTreeMap<_, _>>();
+    for producer_id in &enabled_producers {
+        let unit_id = catalog
+            .producer(producer_id)
+            .ok_or(ActivationDeploymentSetError::ConfigurationRejected)?
+            .unit_id();
+        if registered.get(unit_id) != Some(&true) {
+            return Err(ActivationDeploymentSetError::ConfigurationRejected);
+        }
+    }
+    if recovery_units
+        .iter()
+        .any(|unit_id| registered.get(unit_id) != Some(&true))
+    {
+        return Err(ActivationDeploymentSetError::ConfigurationRejected);
+    }
+    for unit in &units {
+        if let UnitDeploymentObservation::CaughtUp {
+            generation,
+            physical_owner,
+            ..
+        } = unit
+        {
+            let owner_chars = physical_owner.chars().count();
+            if *generation == 0
+                || owner_chars == 0
+                || owner_chars > 512
+                || physical_owner.contains('\0')
+            {
+                return Err(ActivationDeploymentSetError::ActivationFactsRejected);
+            }
+        }
+    }
+    let fields = deployment_set_fields(
+        &namespace,
+        &catalog_sha256,
+        &calendar,
+        &enabled_producers,
+        &recovery_units,
+        &shared_dependencies,
+        &units,
+    );
+    let canonical_bytes = canonical_preimage(DEPLOYMENT_SET_DOMAIN, &fields);
+    let deployment_set_sha256 = raw_digest(&canonical_bytes);
+    Ok(ActivationDeploymentSet {
+        namespace,
+        catalog_sha256,
         calendar,
         enabled_producers,
         recovery_units,
@@ -717,4 +883,60 @@ pub(super) fn deployment_set_codec_fixture(physical_owner: &str, build_commit: &
             &units,
         ),
     )
+}
+
+/// Full-catalog, structurally valid candidate used only by v3 codec golden tests.
+#[cfg(test)]
+pub(super) fn full_deployment_set_codec_fixture() -> ActivationDeploymentSet {
+    use crate::monitor::push_job::RunId;
+
+    let catalog = MachineCatalog::bundled().expect("TEST_CODE bundled catalog");
+    let dependencies = [
+        DependencyKind::Namespace,
+        DependencyKind::Durable,
+        DependencyKind::Audit,
+        DependencyKind::TypedAuthority,
+        DependencyKind::Schema,
+        DependencyKind::Manifest,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, kind)| {
+        SharedDependencyDeclaration::new(
+            kind,
+            SourceContractId::try_new(format!("TEST_CODE-golden-{}", kind.as_str()))
+                .expect("TEST_CODE contract"),
+            SourceContractVersion::try_new("v1".to_owned()).expect("TEST_CODE version"),
+            Sha256Digest::parse(
+                "TEST_CODE dependency hash",
+                &format!("{:x}", index + 1).repeat(64),
+            )
+            .expect("TEST_CODE dependency hash"),
+        )
+    })
+    .collect();
+    restore_activation_deployment_set(
+        Namespace::test(
+            RunId::try_new("TEST_CODE-w16-v3-golden".to_owned()).expect("TEST_CODE namespace"),
+        ),
+        catalog.catalog_sha256().clone(),
+        CalendarDeclaration {
+            calendar_id: CalendarId::try_new("TEST_CODE-golden-calendar".to_owned())
+                .expect("TEST_CODE calendar"),
+            authority_sha256: Sha256Digest::parse("TEST_CODE authority", &"c".repeat(64))
+                .expect("TEST_CODE authority"),
+            utc_offset_seconds: 28_800,
+        },
+        vec![],
+        vec![],
+        dependencies,
+        catalog
+            .units()
+            .iter()
+            .map(|registration| UnitDeploymentObservation::Unregistered {
+                unit_id: registration.id().clone(),
+            })
+            .collect(),
+    )
+    .expect("TEST_CODE valid full deployment set")
 }

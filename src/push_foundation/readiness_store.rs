@@ -13,7 +13,9 @@ use crate::monitor::push_job::{
 
 use super::readiness_recovery::CandidateReadinessRecord;
 use super::readiness_recovery_codec::{decode_readiness_record, ReadinessRecordDecodeError};
-use super::readiness_snapshot::{scope_value, CandidateReadinessSnapshot};
+use super::readiness_snapshot::{
+    scope_value, CandidateReadinessSnapshot, ReadinessSnapshotVersionedContext,
+};
 use super::readiness_snapshot_codec::{decode_readiness_snapshot, ReadinessDecodeError};
 use super::readiness_store_schema::{with_read_only, with_write_transaction, ReadinessSchemaError};
 
@@ -23,36 +25,50 @@ pub(crate) struct ReadinessStreamId(Sha256Digest);
 
 impl ReadinessStreamId {
     pub(crate) fn for_snapshot(snapshot: &CandidateReadinessSnapshot) -> Self {
-        let context = snapshot.context();
+        let context = snapshot.versioned_context();
         let assessment = snapshot.assessment();
-        Self(canonical_digest(
-            "OperationalReadinessStream/v1",
-            &BTreeMap::from([
-                ("namespace", namespace_value(&context.namespace)),
-                ("business_date", string(context.business_date.as_str())),
-                ("build_commit", string(context.build_commit.as_str())),
-                (
+        let mut fields = BTreeMap::from([
+            ("namespace", namespace_value(context.namespace())),
+            ("business_date", string(context.business_date().as_str())),
+            (
+                "catalog_sha256",
+                string(assessment.catalog_sha256().as_str()),
+            ),
+            ("scope", scope_value(assessment.scope())),
+            (
+                "enabled_producers",
+                CanonicalValue::Array(
+                    assessment
+                        .enabled_producers()
+                        .iter()
+                        .map(|id| string(id.as_str()))
+                        .collect(),
+                ),
+            ),
+        ]);
+        let domain = match context {
+            ReadinessSnapshotVersionedContext::V2(context) => {
+                fields.insert("build_commit", string(context.build_commit.as_str()));
+                fields.insert(
                     "generation",
                     CanonicalValue::Unsigned(context.activation_generation),
-                ),
-                ("manifest_sha256", string(context.manifest_sha256.as_str())),
-                (
-                    "catalog_sha256",
-                    string(assessment.catalog_sha256().as_str()),
-                ),
-                ("scope", scope_value(assessment.scope())),
-                (
-                    "enabled_producers",
-                    CanonicalValue::Array(
-                        assessment
-                            .enabled_producers()
-                            .iter()
-                            .map(|id| string(id.as_str()))
-                            .collect(),
-                    ),
-                ),
-            ]),
-        ))
+                );
+                fields.insert("manifest_sha256", string(context.manifest_sha256.as_str()));
+                "OperationalReadinessStream/v1"
+            }
+            ReadinessSnapshotVersionedContext::V3(context) => {
+                fields.insert(
+                    "deployment_set_sha256",
+                    string(context.deployment_set().sha256().as_str()),
+                );
+                "OperationalReadinessStream/v2"
+            }
+        };
+        Self(canonical_digest(domain, &fields))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_str()
     }
 }
 
@@ -235,7 +251,7 @@ impl<'a> ReadinessRecordStore<'a> {
         G: FnOnce() -> Result<(), ReadinessStoreError>,
     {
         let snapshot = candidate.snapshot();
-        if &snapshot.context().namespace != self.namespace {
+        if snapshot.namespace() != self.namespace {
             return Err(ReadinessStoreError::NamespaceMismatch);
         }
         // Re-evaluate against this store's exact catalog before accepting a candidate from a caller.
@@ -375,7 +391,7 @@ impl<'a> ReadinessRecordStore<'a> {
                 }),
             ).optional().map_err(|_| corrupt("record_row"))?.ok_or(ReadinessStoreError::RecordMissing)?;
             let snapshot = decode_readiness_snapshot(self.catalog, &id, &row.snapshot_bytes)?;
-            if &snapshot.context().namespace != self.namespace {
+            if snapshot.namespace() != self.namespace {
                 return Err(ReadinessStoreError::NamespaceMismatch);
             }
             if snapshot.recovery_event_id().as_str() != row.event_id

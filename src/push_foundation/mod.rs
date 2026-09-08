@@ -85,6 +85,8 @@ mod operational_readiness_tests;
 #[cfg(test)]
 mod phase_scheduler_tests;
 #[cfg(test)]
+mod readiness_deployment_set_tests;
+#[cfg(test)]
 mod readiness_probe_tests;
 #[cfg(test)]
 mod readiness_recovery_codec_tests;

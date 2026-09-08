@@ -10,16 +10,22 @@ use crate::monitor::push_job::{
     UtcMicros,
 };
 
+use super::activation_readiness::{
+    decode_activation_deployment_set, ActivationDeploymentSetDecodeError,
+    ActivationDeploymentSetError,
+};
 use super::operational_readiness::{
     DependencyApplicability, DependencyKind, DependencyObservation, DependencyRequirement,
     ReadinessAssessment, ReadinessError, ReadinessScope, ReadinessStage,
 };
 use super::readiness_snapshot::{
-    CandidateReadinessSnapshot, ReadinessEvidenceKind, ReadinessEvidenceRef,
-    ReadinessRecoveryEventId, ReadinessSnapshotContext, ReadinessSnapshotError,
+    CandidateReadinessSnapshot, ReadinessDeploymentSetContext, ReadinessEvidenceKind,
+    ReadinessEvidenceRef, ReadinessRecoveryEventId, ReadinessSnapshotContext,
+    ReadinessSnapshotError,
 };
 
-const DOMAIN_PREFIX: &[u8] = b"OperationalReadinessSnapshot/v2\0";
+const V2_DOMAIN_PREFIX: &[u8] = b"OperationalReadinessSnapshot/v2\0";
+const V3_DOMAIN_PREFIX: &[u8] = b"OperationalReadinessSnapshot/v3\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum ReadinessDecodeError {
@@ -39,6 +45,16 @@ pub(crate) enum ReadinessDecodeError {
     InvalidAssessment(#[from] ReadinessError),
     #[error(transparent)]
     InvalidEvidence(#[from] ReadinessSnapshotError),
+    #[error("readiness deployment set field is invalid: {field}")]
+    InvalidDeploymentSetField { field: &'static str },
+    #[error("readiness deployment set is invalid: {check}")]
+    InvalidDeploymentSet { check: &'static str },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotWireVersion {
+    V2,
+    V3,
 }
 
 /// Recompute all derived fields. Never hydrate persisted Ready/affected sets as trusted facts.
@@ -50,26 +66,28 @@ pub(crate) fn decode_readiness_snapshot(
     if &raw_digest(bytes) != expected_id {
         return Err(ReadinessDecodeError::DigestMismatch);
     }
-    let json = bytes
-        .strip_prefix(DOMAIN_PREFIX)
-        .ok_or(ReadinessDecodeError::InvalidDomain)?;
+    let (version, json) = if let Some(json) = bytes.strip_prefix(V2_DOMAIN_PREFIX) {
+        (SnapshotWireVersion::V2, json)
+    } else if let Some(json) = bytes.strip_prefix(V3_DOMAIN_PREFIX) {
+        (SnapshotWireVersion::V3, json)
+    } else {
+        return Err(ReadinessDecodeError::InvalidDomain);
+    };
     let record: Value =
         serde_json::from_slice(json).map_err(|_| ReadinessDecodeError::InvalidJson)?;
-    if unsigned_field(&record, "schema_version")? != 2 {
+    let expected_schema = match version {
+        SnapshotWireVersion::V2 => 2,
+        SnapshotWireVersion::V3 => 3,
+    };
+    if unsigned_field(&record, "schema_version")? != expected_schema {
         return Err(ReadinessDecodeError::UnsupportedSchemaVersion);
     }
     let captured_at = i64::try_from(unsigned_field(&record, "captured_at")?)
         .map_err(|_| invalid("captured_at"))?;
-    let context = ReadinessSnapshotContext {
-        namespace: decode_namespace(field(&record, "namespace")?)?,
-        business_date: BusinessDate::parse(string_field(&record, "business_date")?)
-            .map_err(|_| invalid("business_date"))?,
-        build_commit: GitSha40::parse(string_field(&record, "build_commit")?)
-            .map_err(|_| invalid("build_commit"))?,
-        activation_generation: unsigned_field(&record, "activation_generation")?,
-        manifest_sha256: digest_field(&record, "manifest_sha256")?,
-        captured_at: UtcMicros::try_new(captured_at).map_err(|_| invalid("captured_at"))?,
-    };
+    let namespace = decode_namespace(field(&record, "namespace")?)?;
+    let business_date = BusinessDate::parse(string_field(&record, "business_date")?)
+        .map_err(|_| invalid("business_date"))?;
+    let captured_at = UtcMicros::try_new(captured_at).map_err(|_| invalid("captured_at"))?;
     let scope = decode_scope(field(&record, "scope")?)?;
     let stage = match string_field(&record, "stage")? {
         "Startup" => ReadinessStage::Startup,
@@ -85,21 +103,71 @@ pub(crate) fn decode_readiness_snapshot(
         .collect::<Result<_, _>>()?;
     let (requirements, observations) =
         decode_dependencies(array_field(&record, "dependency_refs")?)?;
-    let assessment = ReadinessAssessment::evaluate(
-        catalog,
-        &scope,
-        &enabled,
-        stage,
-        &requirements,
-        &observations,
-    )?;
+    let deployment_set = match version {
+        SnapshotWireVersion::V2 => None,
+        SnapshotWireVersion::V3 => {
+            let value = field(&record, "deployment_set")?;
+            if !value.is_object() {
+                return Err(invalid("deployment_set"));
+            }
+            let set = decode_activation_deployment_set(
+                value,
+                &digest_field(&record, "deployment_set_sha256")?,
+            )
+            .map_err(deployment_set_error)?;
+            if set.namespace() != &namespace || set.enabled_producers() != enabled {
+                return Err(ReadinessDecodeError::InconsistentSnapshot);
+            }
+            Some(set)
+        }
+    };
+    let assessment = match &deployment_set {
+        None => ReadinessAssessment::evaluate(
+            catalog,
+            &scope,
+            &enabled,
+            stage,
+            &requirements,
+            &observations,
+        )?,
+        Some(set) => ReadinessAssessment::evaluate_for_deployment_set(
+            catalog,
+            set,
+            &scope,
+            stage,
+            &requirements,
+            &observations,
+        )?,
+    };
     let evidence = array_field(&record, "evidence_refs")?
         .iter()
         .map(decode_evidence)
         .collect::<Result<Vec<_>, _>>()?;
     let event_id =
         ReadinessRecoveryEventId::from_digest(digest_field(&record, "recovery_event_id")?);
-    let rebuilt = CandidateReadinessSnapshot::try_new(context, assessment, event_id, evidence)?;
+    let rebuilt = match deployment_set {
+        None => CandidateReadinessSnapshot::try_new(
+            ReadinessSnapshotContext {
+                namespace,
+                business_date,
+                build_commit: GitSha40::parse(string_field(&record, "build_commit")?)
+                    .map_err(|_| invalid("build_commit"))?,
+                activation_generation: unsigned_field(&record, "activation_generation")?,
+                manifest_sha256: digest_field(&record, "manifest_sha256")?,
+                captured_at,
+            },
+            assessment,
+            event_id,
+            evidence,
+        )?,
+        Some(set) => CandidateReadinessSnapshot::try_new_v3(
+            catalog,
+            ReadinessDeploymentSetContext::new(business_date, captured_at, set),
+            assessment,
+            event_id,
+            evidence,
+        )?,
+    };
 
     // This also rejects ignored/duplicate keys, order/format drift, foreign catalog bindings,
     // tampered derived fields, and source material the parser would otherwise discard.
@@ -295,4 +363,26 @@ fn contract_version(
 
 fn invalid(field: &'static str) -> ReadinessDecodeError {
     ReadinessDecodeError::InvalidField { field }
+}
+
+fn deployment_set_error(error: ActivationDeploymentSetDecodeError) -> ReadinessDecodeError {
+    let check = match error {
+        ActivationDeploymentSetDecodeError::InvalidField { field } => {
+            return ReadinessDecodeError::InvalidDeploymentSetField { field };
+        }
+        ActivationDeploymentSetDecodeError::InconsistentSet => "digest_or_canonical",
+        ActivationDeploymentSetDecodeError::InvalidSet(error) => match error {
+            ActivationDeploymentSetError::CatalogRejected => "catalog",
+            ActivationDeploymentSetError::ActivationFactsRejected => "activation_facts",
+            ActivationDeploymentSetError::UnitCoverageRejected => "unit_coverage",
+            ActivationDeploymentSetError::PendingUnit => "pending_unit",
+            ActivationDeploymentSetError::ConfigurationRejected => "configuration",
+            ActivationDeploymentSetError::CalendarRejected => "calendar",
+            ActivationDeploymentSetError::SourceDeclarationRejected => "source_declaration",
+            ActivationDeploymentSetError::SharedDependenciesRejected => "shared_dependencies",
+            ActivationDeploymentSetError::DeploymentChanged => "deployment_changed",
+            ActivationDeploymentSetError::ScopeRejected => "scope",
+        },
+    };
+    ReadinessDecodeError::InvalidDeploymentSet { check }
 }

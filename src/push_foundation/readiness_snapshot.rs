@@ -10,6 +10,7 @@ use crate::monitor::push_job::{
     Namespace, ProtectedRef, Sha256Digest, SourceContractId, SourceContractVersion, UtcMicros,
 };
 
+use super::activation_readiness::ActivationDeploymentSet;
 use super::operational_readiness::{
     DependencyApplicability, DependencyFailure, DependencyKind, DependencyObservation,
     ReadinessAssessment, ReadinessExitDisposition, ReadinessScope, ReadinessStage, ReadinessStatus,
@@ -17,7 +18,10 @@ use super::operational_readiness::{
 
 pub(crate) use super::operational_readiness::ReadinessEvidenceKind;
 
-const SNAPSHOT_DOMAIN: &str = "OperationalReadinessSnapshot/v2";
+const SNAPSHOT_V2_DOMAIN: &str = "OperationalReadinessSnapshot/v2";
+const SNAPSHOT_V3_DOMAIN: &str = "OperationalReadinessSnapshot/v3";
+const MATERIAL_V2_DOMAIN: &str = "OperationalReadinessMaterial/v2";
+const MATERIAL_V3_DOMAIN: &str = "OperationalReadinessMaterial/v3";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReadinessSnapshotContext {
@@ -27,6 +31,60 @@ pub(crate) struct ReadinessSnapshotContext {
     pub(crate) activation_generation: u64,
     pub(crate) manifest_sha256: Sha256Digest,
     pub(crate) captured_at: UtcMicros,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ReadinessDeploymentSetContext {
+    business_date: BusinessDate,
+    captured_at: UtcMicros,
+    deployment_set: ActivationDeploymentSet,
+}
+
+impl ReadinessDeploymentSetContext {
+    pub(super) fn new(
+        business_date: BusinessDate,
+        captured_at: UtcMicros,
+        deployment_set: ActivationDeploymentSet,
+    ) -> Self {
+        Self {
+            business_date,
+            captured_at,
+            deployment_set,
+        }
+    }
+
+    pub(super) fn deployment_set(&self) -> &ActivationDeploymentSet {
+        &self.deployment_set
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum ReadinessSnapshotVersionedContext {
+    V2(ReadinessSnapshotContext),
+    V3(ReadinessDeploymentSetContext),
+}
+
+impl ReadinessSnapshotVersionedContext {
+    pub(super) fn namespace(&self) -> &Namespace {
+        match self {
+            Self::V2(context) => &context.namespace,
+            Self::V3(context) => context.deployment_set.namespace(),
+        }
+    }
+
+    pub(super) fn business_date(&self) -> &BusinessDate {
+        match self {
+            Self::V2(context) => &context.business_date,
+            Self::V3(context) => &context.business_date,
+        }
+    }
+
+    pub(super) fn captured_at(&self) -> UtcMicros {
+        match self {
+            Self::V2(context) => context.captured_at,
+            Self::V3(context) => context.captured_at,
+        }
+    }
 }
 
 /// A candidate reference only. The store must verify the event and both snapshot joins.
@@ -127,27 +185,80 @@ pub(crate) enum ReadinessSnapshotError {
         check: &'static str,
         kind: DependencyKind,
     },
+    #[error("readiness assessment does not match its deployment set")]
+    DeploymentSetAssessmentMismatch,
+    #[error("readiness deployment-set construction requires an exact catalog")]
+    DeploymentSetCatalogRequired,
+    #[error(transparent)]
+    InvalidAssessment(#[from] super::operational_readiness::ReadinessError),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CandidateReadinessSnapshot {
     snapshot_id: Sha256Digest,
-    context: ReadinessSnapshotContext,
+    context: ReadinessSnapshotVersionedContext,
     assessment: ReadinessAssessment,
     recovery_event_id: ReadinessRecoveryEventId,
     evidence_refs: Vec<ReadinessEvidenceRef>,
 }
 
 impl CandidateReadinessSnapshot {
+    /// Preserve the frozen scalar v2 construction interface for existing callers and fixtures.
     pub(crate) fn try_new(
         context: ReadinessSnapshotContext,
         assessment: ReadinessAssessment,
         recovery_event_id: ReadinessRecoveryEventId,
         evidence_refs: Vec<ReadinessEvidenceRef>,
     ) -> Result<Self, ReadinessSnapshotError> {
+        Self::try_new_versioned(
+            None,
+            ReadinessSnapshotVersionedContext::V2(context),
+            assessment,
+            recovery_event_id,
+            evidence_refs,
+        )
+    }
+
+    pub(super) fn try_new_v3(
+        catalog: &crate::monitor::push_job::MachineCatalog,
+        context: ReadinessDeploymentSetContext,
+        assessment: ReadinessAssessment,
+        recovery_event_id: ReadinessRecoveryEventId,
+        evidence_refs: Vec<ReadinessEvidenceRef>,
+    ) -> Result<Self, ReadinessSnapshotError> {
+        Self::try_new_versioned(
+            Some(catalog),
+            ReadinessSnapshotVersionedContext::V3(context),
+            assessment,
+            recovery_event_id,
+            evidence_refs,
+        )
+    }
+
+    pub(super) fn try_new_versioned(
+        catalog: Option<&crate::monitor::push_job::MachineCatalog>,
+        context: ReadinessSnapshotVersionedContext,
+        assessment: ReadinessAssessment,
+        recovery_event_id: ReadinessRecoveryEventId,
+        evidence_refs: Vec<ReadinessEvidenceRef>,
+    ) -> Result<Self, ReadinessSnapshotError> {
+        if let ReadinessSnapshotVersionedContext::V3(context) = &context {
+            let catalog = catalog.ok_or(ReadinessSnapshotError::DeploymentSetCatalogRequired)?;
+            let reevaluated = ReadinessAssessment::evaluate_for_deployment_set(
+                catalog,
+                &context.deployment_set,
+                assessment.scope(),
+                assessment.stage(),
+                assessment.requirements(),
+                assessment.observations(),
+            )?;
+            if reevaluated != assessment {
+                return Err(ReadinessSnapshotError::DeploymentSetAssessmentMismatch);
+            }
+        }
         let evidence_refs = normalize_snapshot_evidence(&assessment, evidence_refs)?;
         let fields = snapshot_fields(&context, &assessment, &recovery_event_id, &evidence_refs);
-        let snapshot_id = canonical_digest(SNAPSHOT_DOMAIN, &fields);
+        let snapshot_id = canonical_digest(snapshot_domain(&context), &fields);
         Ok(Self {
             snapshot_id,
             context,
@@ -160,8 +271,26 @@ impl CandidateReadinessSnapshot {
     pub(crate) fn snapshot_id(&self) -> &Sha256Digest {
         &self.snapshot_id
     }
-    pub(crate) fn context(&self) -> &ReadinessSnapshotContext {
+    pub(super) fn versioned_context(&self) -> &ReadinessSnapshotVersionedContext {
         &self.context
+    }
+    pub(crate) fn legacy_context(&self) -> Option<&ReadinessSnapshotContext> {
+        match &self.context {
+            ReadinessSnapshotVersionedContext::V2(context) => Some(context),
+            ReadinessSnapshotVersionedContext::V3(_) => None,
+        }
+    }
+    pub(crate) fn namespace(&self) -> &Namespace {
+        self.context.namespace()
+    }
+    pub(crate) fn captured_at(&self) -> UtcMicros {
+        self.context.captured_at()
+    }
+    pub(super) fn deployment_set(&self) -> Option<&ActivationDeploymentSet> {
+        match &self.context {
+            ReadinessSnapshotVersionedContext::V2(_) => None,
+            ReadinessSnapshotVersionedContext::V3(context) => Some(&context.deployment_set),
+        }
     }
     pub(crate) fn assessment(&self) -> &ReadinessAssessment {
         &self.assessment
@@ -176,7 +305,7 @@ impl CandidateReadinessSnapshot {
     /// Protected persistence bytes; never include these in errors or probe output.
     pub(crate) fn canonical_bytes(&self) -> Vec<u8> {
         canonical_preimage(
-            SNAPSHOT_DOMAIN,
+            snapshot_domain(&self.context),
             &snapshot_fields(
                 &self.context,
                 &self.assessment,
@@ -240,7 +369,7 @@ pub(super) fn normalize_snapshot_evidence(
 }
 
 fn snapshot_fields(
-    context: &ReadinessSnapshotContext,
+    context: &ReadinessSnapshotVersionedContext,
     assessment: &ReadinessAssessment,
     event: &ReadinessRecoveryEventId,
     evidence: &[ReadinessEvidenceRef],
@@ -252,18 +381,18 @@ fn snapshot_fields(
 
 /// Hash the full after-material before an event ID exists, without a circular reference.
 pub(super) fn snapshot_material_digest(
-    context: &ReadinessSnapshotContext,
+    context: &ReadinessSnapshotVersionedContext,
     assessment: &ReadinessAssessment,
     evidence: &[ReadinessEvidenceRef],
 ) -> Sha256Digest {
     canonical_digest(
-        "OperationalReadinessMaterial/v2",
+        material_domain(context),
         &snapshot_material_fields(context, assessment, evidence),
     )
 }
 
 fn snapshot_material_fields(
-    context: &ReadinessSnapshotContext,
+    context: &ReadinessSnapshotVersionedContext,
     assessment: &ReadinessAssessment,
     evidence: &[ReadinessEvidenceRef],
 ) -> BTreeMap<&'static str, CanonicalValue> {
@@ -298,23 +427,23 @@ fn snapshot_material_fields(
             ]))
         })
         .collect();
-    BTreeMap::from([
-        ("schema_version", CanonicalValue::Unsigned(2)),
-        ("namespace", namespace_value(&context.namespace)),
-        ("business_date", string(context.business_date.as_str())),
-        ("build_commit", string(context.build_commit.as_str())),
+    let mut fields = BTreeMap::from([
         (
-            "activation_generation",
-            CanonicalValue::Unsigned(context.activation_generation),
+            "schema_version",
+            CanonicalValue::Unsigned(match context {
+                ReadinessSnapshotVersionedContext::V2(_) => 2,
+                ReadinessSnapshotVersionedContext::V3(_) => 3,
+            }),
         ),
-        ("manifest_sha256", string(context.manifest_sha256.as_str())),
+        ("namespace", namespace_value(context.namespace())),
+        ("business_date", string(context.business_date().as_str())),
         (
             "catalog_sha256",
             string(assessment.catalog_sha256().as_str()),
         ),
         (
             "captured_at",
-            CanonicalValue::Unsigned(context.captured_at.get() as u64),
+            CanonicalValue::Unsigned(context.captured_at().get() as u64),
         ),
         ("scope", scope_value(assessment.scope())),
         (
@@ -405,7 +534,39 @@ fn snapshot_material_fields(
                 }
             }),
         ),
-    ])
+    ]);
+    match context {
+        ReadinessSnapshotVersionedContext::V2(context) => {
+            fields.insert("build_commit", string(context.build_commit.as_str()));
+            fields.insert(
+                "activation_generation",
+                CanonicalValue::Unsigned(context.activation_generation),
+            );
+            fields.insert("manifest_sha256", string(context.manifest_sha256.as_str()));
+        }
+        ReadinessSnapshotVersionedContext::V3(context) => {
+            fields.insert("deployment_set", context.deployment_set.canonical_value());
+            fields.insert(
+                "deployment_set_sha256",
+                string(context.deployment_set.sha256().as_str()),
+            );
+        }
+    }
+    fields
+}
+
+fn snapshot_domain(context: &ReadinessSnapshotVersionedContext) -> &'static str {
+    match context {
+        ReadinessSnapshotVersionedContext::V2(_) => SNAPSHOT_V2_DOMAIN,
+        ReadinessSnapshotVersionedContext::V3(_) => SNAPSHOT_V3_DOMAIN,
+    }
+}
+
+fn material_domain(context: &ReadinessSnapshotVersionedContext) -> &'static str {
+    match context {
+        ReadinessSnapshotVersionedContext::V2(_) => MATERIAL_V2_DOMAIN,
+        ReadinessSnapshotVersionedContext::V3(_) => MATERIAL_V3_DOMAIN,
+    }
 }
 
 fn string(value: &str) -> CanonicalValue {

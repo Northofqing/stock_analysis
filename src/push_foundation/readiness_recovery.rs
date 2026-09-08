@@ -6,7 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::monitor::push_job::{
-    canonical_digest, canonical_preimage, raw_digest, CanonicalValue, Sha256Digest, UtcMicros,
+    canonical_digest, canonical_preimage, raw_digest, CanonicalValue, MachineCatalog, Sha256Digest,
+    UtcMicros,
 };
 
 use super::operational_readiness::{
@@ -14,8 +15,9 @@ use super::operational_readiness::{
 };
 use super::readiness_snapshot::{
     normalize_snapshot_evidence, observation_value, snapshot_material_digest,
-    CandidateReadinessSnapshot, ReadinessEvidenceRef, ReadinessRecoveryEventId,
-    ReadinessSnapshotContext, ReadinessSnapshotError,
+    CandidateReadinessSnapshot, ReadinessDeploymentSetContext, ReadinessEvidenceRef,
+    ReadinessRecoveryEventId, ReadinessSnapshotContext, ReadinessSnapshotError,
+    ReadinessSnapshotVersionedContext,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,9 +89,46 @@ impl fmt::Debug for CandidateReadinessRecord {
 }
 
 impl CandidateReadinessRecord {
+    /// Preserve the frozen scalar v2 construction interface for existing callers and fixtures.
     pub(crate) fn try_new(
         before: Option<&CandidateReadinessSnapshot>,
         context: ReadinessSnapshotContext,
+        assessment: ReadinessAssessment,
+        evidence: Vec<ReadinessEvidenceRef>,
+        claims: Vec<CandidateRecoveryClaim>,
+    ) -> Result<Self, ReadinessRecoveryError> {
+        Self::try_new_versioned(
+            None,
+            before,
+            ReadinessSnapshotVersionedContext::V2(context),
+            assessment,
+            evidence,
+            claims,
+        )
+    }
+
+    pub(super) fn try_new_v3(
+        catalog: &MachineCatalog,
+        before: Option<&CandidateReadinessSnapshot>,
+        context: ReadinessDeploymentSetContext,
+        assessment: ReadinessAssessment,
+        evidence: Vec<ReadinessEvidenceRef>,
+        claims: Vec<CandidateRecoveryClaim>,
+    ) -> Result<Self, ReadinessRecoveryError> {
+        Self::try_new_versioned(
+            Some(catalog),
+            before,
+            ReadinessSnapshotVersionedContext::V3(context),
+            assessment,
+            evidence,
+            claims,
+        )
+    }
+
+    pub(super) fn try_new_versioned(
+        catalog: Option<&MachineCatalog>,
+        before: Option<&CandidateReadinessSnapshot>,
+        context: ReadinessSnapshotVersionedContext,
         assessment: ReadinessAssessment,
         evidence: Vec<ReadinessEvidenceRef>,
         claims: Vec<CandidateRecoveryClaim>,
@@ -124,8 +163,13 @@ impl CandidateReadinessRecord {
             "OperationalReadinessRecoveryIdentity/v1",
             &fields,
         ));
-        let snapshot =
-            CandidateReadinessSnapshot::try_new(context, assessment, event_id.clone(), evidence)?;
+        let snapshot = CandidateReadinessSnapshot::try_new_versioned(
+            catalog,
+            context,
+            assessment,
+            event_id.clone(),
+            evidence,
+        )?;
         fields.insert("event_id", string(event_id.as_str()));
         fields.insert("after_snapshot_id", string(snapshot.snapshot_id().as_str()));
         let event_bytes = canonical_preimage("OperationalReadinessRecoveryEvent/v1", &fields);
@@ -158,7 +202,7 @@ impl CandidateReadinessRecord {
 
 fn classify_claims(
     before: Option<&CandidateReadinessSnapshot>,
-    context: &ReadinessSnapshotContext,
+    context: &ReadinessSnapshotVersionedContext,
     assessment: &ReadinessAssessment,
     evidence: &[ReadinessEvidenceRef],
     claims: Vec<CandidateRecoveryClaim>,
@@ -199,9 +243,7 @@ fn classify_claims(
         if !evidence.contains(&claim.evidence) {
             return Err(invalid("after_evidence_mismatch"));
         }
-        if claim.observed_at < before.context().captured_at
-            || claim.observed_at > context.captured_at
-        {
+        if claim.observed_at < before.captured_at() || claim.observed_at > context.captured_at() {
             return Err(invalid("observation_time"));
         }
         if by_kind.insert(kind, claim).is_some() {
@@ -306,22 +348,35 @@ fn requirement_value(value: Option<&DependencyRequirement>) -> CanonicalValue {
 
 fn validate_continuity(
     before: &CandidateReadinessSnapshot,
-    after: &ReadinessSnapshotContext,
+    after: &ReadinessSnapshotVersionedContext,
     assessment: &ReadinessAssessment,
 ) -> Result<(), ReadinessRecoveryError> {
-    let prior = before.context();
-    if prior.namespace != after.namespace
-        || prior.business_date != after.business_date
-        || prior.build_commit != after.build_commit
-        || prior.activation_generation != after.activation_generation
-        || prior.manifest_sha256 != after.manifest_sha256
+    let prior = before.versioned_context();
+    let version_identity_matches = match (prior, after) {
+        (
+            ReadinessSnapshotVersionedContext::V2(prior),
+            ReadinessSnapshotVersionedContext::V2(after),
+        ) => {
+            prior.build_commit == after.build_commit
+                && prior.activation_generation == after.activation_generation
+                && prior.manifest_sha256 == after.manifest_sha256
+        }
+        (
+            ReadinessSnapshotVersionedContext::V3(prior),
+            ReadinessSnapshotVersionedContext::V3(after),
+        ) => prior.deployment_set() == after.deployment_set(),
+        _ => false,
+    };
+    if !version_identity_matches
+        || prior.namespace() != after.namespace()
+        || prior.business_date() != after.business_date()
         || before.assessment().catalog_sha256() != assessment.catalog_sha256()
         || before.assessment().scope() != assessment.scope()
         || before.assessment().enabled_producers() != assessment.enabled_producers()
     {
         return Err(ReadinessRecoveryError::ContextMismatch);
     }
-    if after.captured_at < prior.captured_at {
+    if after.captured_at() < prior.captured_at() {
         return Err(ReadinessRecoveryError::TimeRegression);
     }
     Ok(())

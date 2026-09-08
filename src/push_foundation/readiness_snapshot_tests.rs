@@ -97,7 +97,7 @@ fn w15_snapshot_binds_context_dependency_evidence_and_recovery_without_debug_lea
     )
     .expect("TEST_CODE candidate snapshot");
     assert_eq!(snapshot.assessment().status(), ReadinessStatus::Ready);
-    assert_eq!(snapshot.context(), &context());
+    assert_eq!(snapshot.legacy_context(), Some(&context()));
     assert_eq!(snapshot.recovery_event_id(), &event);
     assert!(!format!("{snapshot:?}").contains("TEST_CODE-SECRET"));
     assert!(!format!("{evidence:?}").contains("TEST_CODE-SECRET"));

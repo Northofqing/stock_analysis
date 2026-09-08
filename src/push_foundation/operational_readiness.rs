@@ -9,6 +9,8 @@ use crate::monitor::push_job::{
     SourceContractVersion, UnitId,
 };
 
+use super::activation_readiness::ActivationDeploymentSet;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ReadinessScope {
     Core,
@@ -436,6 +438,42 @@ impl ReadinessAssessment {
         })
     }
 
+    /// Evaluate against the complete deployment-set closure. This is still a candidate
+    /// assessment: the deployment set and evidence require independent authentication.
+    pub(super) fn evaluate_for_deployment_set(
+        catalog: &MachineCatalog,
+        deployment_set: &ActivationDeploymentSet,
+        scope: &ReadinessScope,
+        stage: ReadinessStage,
+        requirements: &[DependencyRequirement],
+        observations: &[DependencyObservation],
+    ) -> Result<Self, ReadinessError> {
+        if deployment_set.catalog_sha256() != catalog.catalog_sha256() {
+            return Err(ReadinessError::InvalidScope {
+                check: "deployment_set_catalog_mismatch",
+            });
+        }
+        let units =
+            deployment_set
+                .unit_ids_for_scope(scope)
+                .map_err(|_| ReadinessError::InvalidScope {
+                    check: "deployment_set_scope_mismatch",
+                })?;
+        validate_deployment_dependencies(deployment_set, scope, requirements, observations)?;
+        let mut assessed = Self::evaluate(
+            catalog,
+            scope,
+            deployment_set.enabled_producers(),
+            stage,
+            requirements,
+            observations,
+        )?;
+        if *scope == ReadinessScope::Core && assessed.status != ReadinessStatus::Ready {
+            assessed.affected_unit_ids = units;
+        }
+        Ok(assessed)
+    }
+
     pub(crate) fn status(&self) -> ReadinessStatus {
         self.status
     }
@@ -510,6 +548,70 @@ impl ReadinessAssessment {
     pub(crate) fn observations(&self) -> &[DependencyObservation] {
         &self.observations
     }
+}
+
+fn validate_deployment_dependencies(
+    deployment_set: &ActivationDeploymentSet,
+    scope: &ReadinessScope,
+    requirements: &[DependencyRequirement],
+    observations: &[DependencyObservation],
+) -> Result<(), ReadinessError> {
+    if *scope != ReadinessScope::Core {
+        return Ok(());
+    }
+    let declarations = deployment_set
+        .shared_dependencies()
+        .iter()
+        .map(|dependency| (dependency.kind(), dependency))
+        .collect::<BTreeMap<_, _>>();
+    for requirement in requirements {
+        let Some(declaration) = declarations.get(&requirement.kind) else {
+            return Err(ReadinessError::InvalidDependencySet {
+                check: "deployment_set_missing_dependency",
+                kind: requirement.kind,
+            });
+        };
+        if declaration.contract_id() != &requirement.contract_id {
+            return Err(ReadinessError::InvalidDependencySet {
+                check: "deployment_set_contract_mismatch",
+                kind: requirement.kind,
+            });
+        }
+        if declaration.contract_version() != &requirement.version {
+            return Err(ReadinessError::InvalidDependencySet {
+                check: "deployment_set_version_mismatch",
+                kind: requirement.kind,
+            });
+        }
+    }
+    for observation in observations {
+        let kind = observation.kind();
+        let Some(declaration) = declarations.get(&kind) else {
+            return Err(ReadinessError::InvalidDependencySet {
+                check: "deployment_set_missing_observation_dependency",
+                kind,
+            });
+        };
+        if declaration.contract_id() != observation.contract_id() {
+            return Err(ReadinessError::InvalidDependencySet {
+                check: "deployment_set_observation_contract_mismatch",
+                kind,
+            });
+        }
+        if declaration.contract_version() != observation.version() {
+            return Err(ReadinessError::InvalidDependencySet {
+                check: "deployment_set_observation_version_mismatch",
+                kind,
+            });
+        }
+        if declaration.sha256() != observation.evidence_sha256() {
+            return Err(ReadinessError::InvalidDependencySet {
+                check: "deployment_set_observation_hash_mismatch",
+                kind,
+            });
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn required_kinds(scope: &ReadinessScope) -> BTreeSet<DependencyKind> {

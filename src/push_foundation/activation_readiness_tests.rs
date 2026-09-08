@@ -62,8 +62,8 @@ fn initialized_database(name: &str) -> (tempfile::TempDir, PathBuf) {
 }
 
 #[derive(Clone)]
-struct CurrentBinding {
-    unit_id: UnitId,
+pub(super) struct CurrentBinding {
+    pub(super) unit_id: UnitId,
     generation: u64,
     manifest_sha256: Sha256Digest,
     journal_sha256: Sha256Digest,
@@ -71,7 +71,7 @@ struct CurrentBinding {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn append_generation(
+pub(super) fn append_generation(
     database: &Path,
     unit_id: &UnitId,
     generation: u64,
@@ -198,7 +198,7 @@ fn append_generation(
     }
 }
 
-fn two_unit_database(name: &str) -> (tempfile::TempDir, PathBuf, Vec<CurrentBinding>) {
+pub(super) fn two_unit_database(name: &str) -> (tempfile::TempDir, PathBuf, Vec<CurrentBinding>) {
     let (root, database) = initialized_database(name);
     let catalog = MachineCatalog::bundled().expect("TEST_CODE catalog");
     let shadow_unit = catalog.units()[0].id();
@@ -341,7 +341,7 @@ fn source_packages(
         .collect()
 }
 
-fn request(
+pub(super) fn request(
     bindings: &[CurrentBinding],
     enabled_producers: Vec<ProducerId>,
     recovery_units: Vec<UnitId>,
@@ -358,7 +358,7 @@ fn request(
     )
 }
 
-fn first_producer(unit_id: &UnitId) -> ProducerId {
+pub(super) fn first_producer(unit_id: &UnitId) -> ProducerId {
     MachineCatalog::bundled()
         .expect("TEST_CODE catalog")
         .producers_for_unit(unit_id)[0]

@@ -285,7 +285,10 @@ fn not_required_snapshot(
     )
     .expect("TEST_CODE matching versioned NotRequired assessment");
     CandidateReadinessSnapshot::try_new(
-        baseline.context().clone(),
+        baseline
+            .legacy_context()
+            .expect("TEST_CODE v2 context")
+            .clone(),
         assessment,
         baseline.recovery_event_id().clone(),
         baseline.evidence_refs().to_vec(),

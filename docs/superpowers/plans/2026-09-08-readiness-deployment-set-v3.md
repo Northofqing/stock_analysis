@@ -35,7 +35,7 @@
 ### 行为验收
 
 - 实际临时activation库两个Unit不同generation/build构造全52条集合，进入v3快照、recovery record、现有store追加及重开后加载；包含未启用但负恢复责任的Disabled Unit。
-- v3 snapshot/material/stream独立固定golden字节或摘要（期待值不能由被测encoder产出）；旧v2全部既有golden原文不改。v2和v3在同一临时readiness库共存，互不覆盖head或串接恢复历史。
+- v3 snapshot/material/stream独立固定golden字节或摘要（期待值不能由被测encoder产出）；旧v2已有字段/解码期待不改，新增独立v2 snapshot/material/stream字面兼容基准，不能只用往返解码证明旧字节保持。主控已按固定BASE旧字段合同和独立Ruby SHA计算样本，具体输入/JSON/摘要在本计划SDD的 `task-1-v2-golden.md`；该样本仍需实际Rust测试匹配，不冒称已经运行旧binary。v2和v3在同一临时readiness库共存，互不覆盖head或串接恢复历史。
 - 集合字段/成员/启用集/恢复责任/日历/共享依赖变体、错hash、遗漏/重复/额外Unit、旧scalar夹带、未知域/schema、重复JSON键均有拒绝或身份变化证据。
 - 同集合时间前进属于同stream；版本/任一Unit generation变更的predecessor拒绝；显式新stream genesis不携带旧恢复claim、不覆写旧Pending；不就绪→就绪缺claim拒绝、有效claim沿同stream成功。
 - 实际store覆盖错误namespace、外来expected head、重复append、确认丢失重查和持久链伪造cross-stream拒绝；不只测试内存等式或未使用的mock。

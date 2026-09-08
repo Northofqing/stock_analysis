@@ -4,7 +4,7 @@
 
 use serde_json::Value;
 
-use crate::monitor::push_job::{raw_digest, Sha256Digest, UtcMicros};
+use crate::monitor::push_job::{raw_digest, MachineCatalog, Sha256Digest, UtcMicros};
 
 use super::readiness_recovery::{
     CandidateReadinessRecord, CandidateRecoveryClaim, ReadinessRecoveryError,
@@ -28,6 +28,8 @@ pub(crate) enum ReadinessRecordDecodeError {
     UnsupportedSchemaVersion,
     #[error("readiness event is noncanonical or disagrees with its snapshot joins")]
     InconsistentRecord,
+    #[error("readiness event deployment catalog is unavailable")]
+    CatalogUnavailable,
     #[error(transparent)]
     InvalidEvidence(#[from] ReadinessDecodeError),
     #[error(transparent)]
@@ -67,9 +69,18 @@ pub(crate) fn decode_readiness_record(
         .iter()
         .map(decode_claim)
         .collect::<Result<Vec<_>, _>>()?;
-    let rebuilt = CandidateReadinessRecord::try_new(
+    let catalog = if after.deployment_set().is_some() {
+        Some(
+            MachineCatalog::bundled()
+                .map_err(|_| ReadinessRecordDecodeError::CatalogUnavailable)?,
+        )
+    } else {
+        None
+    };
+    let rebuilt = CandidateReadinessRecord::try_new_versioned(
+        catalog.as_ref(),
         before,
-        after.context().clone(),
+        after.versioned_context().clone(),
         after.assessment().clone(),
         after.evidence_refs().to_vec(),
         claims,
