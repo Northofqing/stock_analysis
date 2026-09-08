@@ -259,6 +259,11 @@ impl Case {
             SubjectId::Global,
             AudienceId::try_new("test-owner".to_owned()).unwrap(),
         );
+        let business_created_at = if recover_expired_attempt {
+            ACCEPTED - 124_000_000
+        } else {
+            ACCEPTED - 10_000_000
+        };
         let draft = match kind {
             InitialDecisionKind::Ready => InitialIntentDraft::ready_for_recovery_test(
                 identity,
@@ -266,7 +271,7 @@ impl Case {
                 b"SECRET_TEST_RENDERED".to_vec(),
                 template.sha256().clone(),
                 raw_digest(b"TEST_CODE_W19_CONTRACT"),
-                micros(ACCEPTED - 10_000_000),
+                micros(business_created_at),
             )
             .unwrap(),
             InitialDecisionKind::NoData => InitialIntentDraft::no_data(
@@ -274,14 +279,14 @@ impl Case {
                 raw_digest(b"evidence"),
                 template.sha256().clone(),
                 raw_digest(b"TEST_CODE_W19_CONTRACT"),
-                micros(ACCEPTED - 10_000_000),
+                micros(business_created_at),
             ),
             InitialDecisionKind::Disabled => InitialIntentDraft::disabled(
                 identity,
                 raw_digest(b"evidence"),
                 template.sha256().clone(),
                 raw_digest(b"TEST_CODE_W19_CONTRACT"),
-                micros(ACCEPTED - 10_000_000),
+                micros(business_created_at),
             ),
         };
         let intent = draft.intent_id().clone();
@@ -366,8 +371,13 @@ impl Case {
                 .reconcile_all_pending(&case.append, utc(initially_sealed_at))
                 .unwrap();
             if recover_expired_attempt {
+                let attempt_started_at = ACCEPTED - 121_000_000;
+                assert!(business_created_at < prepared_at);
+                assert!(prepared_at < initially_sealed_at);
+                assert!(initially_sealed_at < attempt_started_at);
+                assert!(attempt_started_at + 120_000_000 < ACCEPTED);
                 coordinator
-                    .begin_attempt(&envelope.decision_identity, 1, utc(ACCEPTED - 121_000_000))
+                    .begin_attempt(&envelope.decision_identity, 1, utc(attempt_started_at))
                     .unwrap()
                     .expect("real recovery attempt");
                 coordinator

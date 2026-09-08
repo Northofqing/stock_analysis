@@ -8887,6 +8887,254 @@ fn w19_recovered_uncertain_rejects_missing_duplicate_wrong_binding_tamper_and_ov
 }
 
 #[test]
+fn w19_recovered_uncertain_rejects_broken_fence_audit_predecessor() {
+    let fixture = Fixture::new("W19_RECOVERED_UNCERTAIN_FENCE_PREDECESSOR");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("W19_RECOVERED_UNCERTAIN_FENCE_PREDECESSOR");
+    w19_recover_uncertain_candidate(&fixture, &append, &candidate);
+    let connection = Connection::open(&fixture.database_path)
+        .expect("open isolated W19 fence predecessor corruption database");
+    connection
+        .execute_batch("DROP TRIGGER immutable_outbox_payload_update;")
+        .expect("remove isolated audit immutability guard");
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE immutable_audit_outbox SET predecessor_audit_identity=audit_identity
+                 WHERE decision_identity=?1 AND audit_kind='FenceRevoked'",
+                [candidate.decision_identity.as_str()],
+            )
+            .expect("inject isolated FenceRevoked predecessor self-loop"),
+        1
+    );
+    drop(connection);
+
+    let error = fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .expect_err("FenceRevoked audit predecessor self-loop must be rejected");
+    assert!(matches!(error, DurableDeliveryError::PolicyMismatch(_)));
+    assert!(!error.to_string().contains("TEST_CODE"));
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+}
+
+#[test]
+fn w19_recovered_uncertain_logical_predecessor_chain_ignores_physical_rowid_order() {
+    let fixture = Fixture::new("W19_RECOVERED_UNCERTAIN_ROWID_REORDER");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("W19_RECOVERED_UNCERTAIN_ROWID_REORDER");
+    w19_recover_uncertain_candidate(&fixture, &append, &candidate);
+    let before = fixture
+        .query_strings("SELECT audit_identity FROM immutable_audit_outbox ORDER BY rowid ASC");
+    let expected_terminal = fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .expect("read terminal before physical rowid reorder");
+    let connection =
+        Connection::open(&fixture.database_path).expect("open isolated W19 rowid reorder database");
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE immutable_audit_outbox SET rowid=-rowid WHERE decision_identity=?1",
+                [candidate.decision_identity.as_str()],
+            )
+            .expect("reverse isolated audit physical rowids"),
+        before.len()
+    );
+    drop(connection);
+    let after = fixture
+        .query_strings("SELECT audit_identity FROM immutable_audit_outbox ORDER BY rowid ASC");
+    let mut reversed = before;
+    reversed.reverse();
+    assert_eq!(
+        after, reversed,
+        "the physical row order must actually change"
+    );
+
+    let actual_terminal = fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .expect("logical predecessor chain survives physical rowid reorder");
+    assert_eq!(actual_terminal, expected_terminal);
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+}
+
+#[test]
+fn w19_recovered_uncertain_allows_a_real_intervening_conflict_audit() {
+    let fixture = Fixture::new("W19_RECOVERED_UNCERTAIN_INTERVENING_CONFLICT");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("W19_RECOVERED_UNCERTAIN_INTERVENING_CONFLICT");
+    prepare_reserved(&fixture, &candidate, &append);
+    fixture
+        .coordinator
+        .begin_attempt(&candidate.decision_identity, 1, now())
+        .expect("begin real recovery attempt")
+        .expect("real recovery attempt created");
+    let mut conflicting = candidate.clone();
+    conflicting.replace_content_preserving_identity(
+        b"TEST_CODE_W19_INTERVENING_CONFLICTING_BODY".to_vec(),
+    );
+    assert!(matches!(
+        fixture
+            .coordinator
+            .prepare(&conflicting, 1, now() + chrono::Duration::seconds(1)),
+        Err(DurableDeliveryError::DecisionIdentityConflict { .. })
+    ));
+    fixture
+        .coordinator
+        .reconcile_all_pending(&append, now() + chrono::Duration::seconds(121))
+        .expect("seal recovery after real intervening conflict audit");
+    assert_eq!(
+        fixture.query_i64(
+            "SELECT COUNT(*) FROM immutable_audit_outbox fence
+             JOIN immutable_audit_outbox conflict
+               ON conflict.audit_identity=fence.predecessor_audit_identity
+             WHERE fence.audit_kind='FenceRevoked'
+               AND conflict.audit_kind='DecisionIdentityConflict'"
+        ),
+        1
+    );
+
+    let terminal = fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .expect("logical recovery chain accepts real intervening conflict audit");
+    assert!(matches!(terminal, FoundationTerminalQuery::Terminal(record)
+        if record.disposition() == FoundationTerminalDisposition::Uncertain));
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+}
+
+#[test]
+fn w19_recovered_uncertain_accepts_recovery_from_real_rejected_genesis_retry() {
+    struct PanicAfterAttemptSink;
+    impl AuthoritativeSinkPort for PanicAfterAttemptSink {
+        fn sink_identity(&self) -> &str {
+            "TEST_CODE_W19_PANIC_AFTER_ATTEMPT_SINK"
+        }
+
+        fn deliver(&self, _: &AuthoritativeDeliveryRequest) -> AuthoritativeSinkResult {
+            panic!("TEST_CODE_W19_SIMULATED_PROCESS_EXIT_AFTER_ATTEMPT")
+        }
+    }
+
+    let fixture = Fixture::new("W19_RECOVERED_UNCERTAIN_REJECTED_GENESIS");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("W19_RECOVERED_UNCERTAIN_REJECTED_GENESIS");
+    let denied = fixture
+        .coordinator
+        .prepare(&candidate, 0, now())
+        .expect("prepare real rejected genesis");
+    assert_eq!(denied.state, DecisionState::RejectedAuditPending);
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::RejectedDurable,
+        &candidate.decision_identity,
+    );
+    fixture
+        .coordinator
+        .authorize_rejected_retry(&candidate.decision_identity)
+        .expect("authorize real rejected decision retry");
+
+    let attempt_started_at = now() + chrono::Duration::seconds(10);
+    let recovered_at = attempt_started_at + chrono::Duration::seconds(121);
+    let panic_sink: AuthoritativeSink = Arc::new(PanicAfterAttemptSink);
+    let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fixture.coordinator.resume_deliverable(
+            &candidate.decision_identity,
+            &[panic_sink],
+            attempt_started_at,
+        )
+    }));
+    assert!(interrupted.is_err());
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_attempts"),
+        1
+    );
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+
+    let summary = fixture
+        .coordinator
+        .reconcile_all_pending(&append, recovered_at)
+        .expect("recover the expired authorized retry");
+    assert!(summary.progress_count > 0);
+    assert_eq!(summary.sink_calls, 0);
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+    let recovered = fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .expect("rejected-genesis retry recovery is readable");
+    assert!(
+        matches!(recovered, FoundationTerminalQuery::Terminal(record)
+        if record.disposition() == FoundationTerminalDisposition::Uncertain)
+    );
+}
+
+#[test]
+fn w19_recovered_uncertain_rejects_truncated_wrong_decision_or_unsealed_predecessor() {
+    for corruption in ["truncated", "wrong-decision", "unsealed"] {
+        let fixture = Fixture::new(&format!("W19_RECOVERED_UNCERTAIN_PREDECESSOR_{corruption}"));
+        let append = MemoryAppendPort::default();
+        let candidate =
+            w12_foundation_envelope(&format!("W19_RECOVERED_UNCERTAIN_PREDECESSOR_{corruption}"));
+        w19_recover_uncertain_candidate(&fixture, &append, &candidate);
+        let other = (corruption == "wrong-decision").then(|| {
+            let other = envelope(
+                "W19_RECOVERED_UNCERTAIN_OTHER_DECISION",
+                PushKind::CandidateTriggered,
+                DeliverySubKind::None,
+                "2026-07-30",
+                false,
+            );
+            fixture
+                .coordinator
+                .prepare(&other, 1, now())
+                .expect("prepare isolated other decision");
+            other
+        });
+        let connection = Connection::open(&fixture.database_path)
+            .expect("open isolated W19 predecessor corruption database");
+        connection
+            .execute_batch("DROP TRIGGER immutable_outbox_payload_update;")
+            .expect("remove isolated audit payload guard");
+        let changed = match corruption {
+            "truncated" => connection.execute(
+                "UPDATE immutable_audit_outbox SET predecessor_audit_identity=NULL
+                 WHERE decision_identity=?1 AND audit_kind='LeaseGranted'",
+                [candidate.decision_identity.as_str()],
+            ),
+            "wrong-decision" => connection.execute(
+                "UPDATE immutable_audit_outbox SET decision_identity=?1
+                 WHERE audit_identity=(
+                   SELECT predecessor_audit_identity FROM immutable_audit_outbox
+                   WHERE decision_identity=?2 AND audit_kind='FenceRevoked')",
+                params![
+                    other.as_ref().expect("other decision").decision_identity,
+                    candidate.decision_identity
+                ],
+            ),
+            "unsealed" => connection.execute(
+                "UPDATE immutable_audit_outbox SET append_state='Pending',immutable_audit_ref=NULL
+                 WHERE decision_identity=?1 AND audit_kind='LeaseGranted'",
+                [candidate.decision_identity.as_str()],
+            ),
+            _ => unreachable!(),
+        }
+        .expect("inject isolated predecessor corruption");
+        assert_eq!(changed, 1);
+        drop(connection);
+
+        let error = fixture
+            .coordinator
+            .inspect_foundation_terminal(&candidate.decision_identity)
+            .expect_err("broken logical predecessor chain must be rejected");
+        assert!(matches!(error, DurableDeliveryError::PolicyMismatch(_)));
+        assert!(!error.to_string().contains("TEST_CODE"));
+        assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+    }
+}
+
+#[test]
 fn w19_recovered_uncertain_rejects_any_authoritative_sink_conflict() {
     let fixture = Fixture::new("W19_RECOVERED_UNCERTAIN_AUTHORITY_CONFLICT");
     let append = MemoryAppendPort::default();

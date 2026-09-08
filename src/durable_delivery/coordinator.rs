@@ -473,6 +473,20 @@ struct StoredRecoveryAttemptEvidence {
 }
 
 #[derive(Clone, Debug)]
+struct StoredAuditChainNode {
+    audit_identity: String,
+    decision_identity: String,
+    attempt_identity: Option<String>,
+    audit_kind: String,
+    predecessor_audit_identity: Option<String>,
+    canonical: Vec<u8>,
+    sha256: String,
+    append_state: String,
+    immutable_audit_ref: Option<String>,
+    created_at: String,
+}
+
+#[derive(Clone, Debug)]
 struct StoredManualRejectedEvidence {
     resolution_identity: String,
     attempt_identity: String,
@@ -6719,6 +6733,13 @@ fn validate_recovered_uncertain_delivery_evidence(
         attempt_identity,
         &fence_revoked_at,
     )?;
+    validate_recovery_fence_predecessor_chain(
+        connection,
+        &stored.decision_identity,
+        attempt_identity,
+        fence,
+        classification,
+    )?;
     if classification.audit_predecessor_identity.as_deref() != Some(fence.audit_identity.as_str()) {
         return Err(DurableDeliveryError::PolicyMismatch(
             "foundation recovered uncertainty audit chain mismatch".to_owned(),
@@ -6767,6 +6788,255 @@ fn validate_recovered_uncertain_delivery_evidence(
         ));
     }
     Ok((fence.canonical.clone(), fence.sha256.clone()))
+}
+
+fn validate_recovery_fence_predecessor_chain(
+    connection: &Connection,
+    decision_identity: &str,
+    attempt_identity: &str,
+    fence: &StoredRecoveryAttemptEvidence,
+    classification: &StoredRecoveryAttemptEvidence,
+) -> Result<()> {
+    let mut predecessor = fence.audit_predecessor_identity.clone().ok_or_else(|| {
+        DurableDeliveryError::PolicyMismatch(
+            "foundation recovered uncertainty fence audit predecessor is missing".to_owned(),
+        )
+    })?;
+    let mut seen = BTreeSet::from([
+        fence.audit_identity.clone(),
+        classification.audit_identity.clone(),
+    ]);
+    parse_timestamp(fence.audit_created_at.as_deref().ok_or_else(|| {
+        DurableDeliveryError::PolicyMismatch(
+            "foundation recovered uncertainty fence audit time is missing".to_owned(),
+        )
+    })?)?;
+    let mut current_attempt_lease_granted = false;
+    loop {
+        if !seen.insert(predecessor.clone()) {
+            return Err(DurableDeliveryError::PolicyMismatch(
+                "foundation recovered uncertainty audit predecessor cycle".to_owned(),
+            ));
+        }
+        let node = load_sealed_audit_chain_node(connection, &predecessor)?;
+        parse_timestamp(&node.created_at)?;
+        if node.decision_identity != decision_identity {
+            return Err(DurableDeliveryError::PolicyMismatch(
+                "foundation recovered uncertainty audit predecessor binding mismatch".to_owned(),
+            ));
+        }
+        if node.attempt_identity.as_deref() == Some(attempt_identity)
+            && matches!(node.audit_kind.as_str(), "LeaseGranted" | "LeaseHeartbeat")
+        {
+            validate_attempt_event_for_audit(connection, &node)?;
+            current_attempt_lease_granted |= node.audit_kind == "LeaseGranted";
+        }
+        let Some(next) = node.predecessor_audit_identity else {
+            validate_prepare_genesis_audit(connection, &node, decision_identity)?;
+            break;
+        };
+        predecessor = next;
+    }
+    if !current_attempt_lease_granted {
+        return Err(DurableDeliveryError::PolicyMismatch(
+            "foundation recovered uncertainty current attempt lease evidence is missing".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn load_sealed_audit_chain_node(
+    connection: &Connection,
+    audit_identity: &str,
+) -> Result<StoredAuditChainNode> {
+    let node = connection
+        .query_row(
+            "SELECT audit_identity,decision_identity,attempt_identity,audit_kind,
+                    predecessor_audit_identity,audit_canonical,audit_sha256,
+                    append_state,immutable_audit_ref,created_at
+             FROM immutable_audit_outbox WHERE audit_identity=?1",
+            [audit_identity],
+            |row| {
+                Ok(StoredAuditChainNode {
+                    audit_identity: row.get(0)?,
+                    decision_identity: row.get(1)?,
+                    attempt_identity: row.get(2)?,
+                    audit_kind: row.get(3)?,
+                    predecessor_audit_identity: row.get(4)?,
+                    canonical: row.get(5)?,
+                    sha256: row.get(6)?,
+                    append_state: row.get(7)?,
+                    immutable_audit_ref: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            DurableDeliveryError::PolicyMismatch(
+                "foundation recovered uncertainty audit predecessor is missing".to_owned(),
+            )
+        })?;
+    let expected_identity = stable_identity(
+        "delivery-critical-audit-v1",
+        &[
+            &node.decision_identity,
+            node.attempt_identity.as_deref().unwrap_or("NONE"),
+            &node.audit_kind,
+            &node.sha256,
+        ],
+    );
+    if !AUDIT_KINDS.contains(&node.audit_kind.as_str())
+        || sha256_hex(&node.canonical) != node.sha256
+        || node.audit_identity != expected_identity
+        || node.append_state != "Appended"
+        || node
+            .immutable_audit_ref
+            .as_deref()
+            .is_none_or(|value| !has_non_ascii_whitespace(value))
+    {
+        return Err(DurableDeliveryError::PolicyMismatch(
+            "foundation recovered uncertainty audit predecessor is not sealed".to_owned(),
+        ));
+    }
+    Ok(node)
+}
+
+fn validate_attempt_event_for_audit(
+    connection: &Connection,
+    audit: &StoredAuditChainNode,
+) -> Result<()> {
+    let rows = {
+        let mut statement = connection.prepare(
+            "SELECT attempt_event_identity,attempt_identity,decision_identity,event_kind,
+                    event_canonical,event_sha256
+             FROM delivery_attempt_events WHERE audit_identity=?1",
+        )?;
+        let mapped = statement.query_map([audit.audit_identity.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        mapped.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    if rows.len() != 1 {
+        return Err(DurableDeliveryError::PolicyMismatch(
+            "foundation recovered uncertainty fence predecessor event is missing".to_owned(),
+        ));
+    }
+    let (event_identity, attempt_identity, decision_identity, kind, canonical, sha256) = &rows[0];
+    let expected_event_identity = stable_identity(
+        "delivery-attempt-event-v1",
+        &[attempt_identity, kind, sha256, &audit.audit_identity],
+    );
+    if Some(attempt_identity.as_str()) != audit.attempt_identity.as_deref()
+        || decision_identity != &audit.decision_identity
+        || kind != &audit.audit_kind
+        || canonical != &audit.canonical
+        || sha256 != &audit.sha256
+        || event_identity != &expected_event_identity
+    {
+        return Err(DurableDeliveryError::PolicyMismatch(
+            "foundation recovered uncertainty fence predecessor event mismatch".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_prepare_genesis_audit(
+    connection: &Connection,
+    audit: &StoredAuditChainNode,
+    decision_identity: &str,
+) -> Result<()> {
+    let rows = {
+        let mut statement = connection.prepare(
+            "SELECT state_event_identity,from_state,to_state,actor,operator_identity,
+                    evidence_canonical,evidence_sha256
+             FROM delivery_state_events
+             WHERE audit_identity=?1 AND decision_identity=?2",
+        )?;
+        let mapped =
+            statement.query_map(params![audit.audit_identity, decision_identity], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })?;
+        mapped.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    if rows.len() != 1 {
+        return Err(DurableDeliveryError::PolicyMismatch(
+            "foundation recovered uncertainty prepare genesis is missing".to_owned(),
+        ));
+    }
+    let (event_identity, from_state, to_state, actor, operator, evidence, evidence_sha256) =
+        &rows[0];
+    let (genesis_state, reservation_generation) = match to_state.as_str() {
+        "Reserved" => (DecisionState::Reserved, 1),
+        "RejectedAuditPending" => (DecisionState::RejectedAuditPending, 0),
+        _ => {
+            return Err(DurableDeliveryError::PolicyMismatch(
+                "foundation recovered uncertainty prepare genesis state is invalid".to_owned(),
+            ))
+        }
+    };
+    let envelope_sha256: String = connection.query_row(
+        "SELECT envelope_sha256 FROM delivery_decisions WHERE decision_identity=?1",
+        [decision_identity],
+        |row| row.get(0),
+    )?;
+    let expected_evidence = canonical_json(&json!({
+        "envelope_sha256": envelope_sha256,
+        "reservation_generation": reservation_generation,
+    }))?;
+    let expected_event_identity = stable_identity(
+        "delivery-state-event-v1",
+        &[
+            decision_identity,
+            "NONE",
+            genesis_state.as_str(),
+            "prepare",
+            evidence_sha256,
+        ],
+    );
+    let expected_audit_canonical = canonical_json(&json!({
+        "state_event_identity": event_identity,
+        "decision_identity": decision_identity,
+        "from_state": Option::<DecisionState>::None,
+        "to_state": genesis_state,
+        "actor": "prepare",
+        "operator_identity_hash": Option::<String>::None,
+        "evidence_sha256": evidence_sha256,
+        "occurred_at": audit.created_at,
+    }))?;
+    let actual_evidence_sha256 = sha256_hex(evidence);
+    if audit.audit_kind != "DecisionStateChanged"
+        || audit.attempt_identity.is_some()
+        || from_state.is_some()
+        || to_state != genesis_state.as_str()
+        || actor != "prepare"
+        || operator.is_some()
+        || evidence != &expected_evidence
+        || actual_evidence_sha256 != evidence_sha256.as_str()
+        || event_identity != &expected_event_identity
+        || audit.canonical != expected_audit_canonical
+        || audit.sha256 != sha256_hex(&expected_audit_canonical)
+    {
+        return Err(DurableDeliveryError::PolicyMismatch(
+            "foundation recovered uncertainty prepare genesis mismatch".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_recovery_attempt_event(
