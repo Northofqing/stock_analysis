@@ -11,6 +11,8 @@ mod activation_fence;
 mod activation_fence_ipc;
 #[cfg(unix)]
 mod activation_fence_store;
+#[cfg(unix)]
+mod activation_generic_effect;
 mod activation_owner;
 mod activation_readiness;
 mod activation_store;
@@ -58,6 +60,10 @@ mod activation_facts_tests;
 mod activation_fence_process_tests;
 #[cfg(all(test, unix))]
 mod activation_fence_tests;
+#[cfg(all(test, unix))]
+mod activation_generic_effect_tests;
+#[cfg(all(test, unix))]
+mod activation_generic_process_tests;
 #[cfg(test)]
 mod activation_owner_tests;
 #[cfg(test)]

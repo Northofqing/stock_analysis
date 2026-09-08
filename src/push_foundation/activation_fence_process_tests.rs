@@ -525,6 +525,7 @@ async fn w16_effect_process_client_death_keeps_worker_and_quiesce_pending_until_
     assert_eq!(fact.state, OperationState::Succeeded);
     let receipt = fixture.assert_one_exact_intent();
     let result = fact.result.as_ref().unwrap();
+    let result = result.as_initial();
     assert_eq!(result.intent_id, draft().intent_id().as_str());
     assert_eq!(result.initial_intent_sha256, receipt);
     assert_eq!(result.effect_sha256, request.effect_sha256);
@@ -884,7 +885,12 @@ async fn w16_effect_process_confirmed_completion_survives_restart_including_publ
         assert_eq!(original.state, OperationState::Succeeded);
         let receipt = fixture.assert_one_exact_intent();
         assert_eq!(
-            original.result.as_ref().unwrap().initial_intent_sha256,
+            original
+                .result
+                .as_ref()
+                .unwrap()
+                .as_initial()
+                .initial_intent_sha256,
             receipt
         );
         broker.stop();

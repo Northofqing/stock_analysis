@@ -1225,6 +1225,11 @@ pub(super) fn projector_fixture(context: &RunContext) -> Result<DecisionProjecto
 
 #[cfg(test)]
 pub(crate) fn w08_prepared_push_fixture() -> PreparedPush {
+    w08_prepared_push_fixture_for_namespace(Namespace::Production)
+}
+
+#[cfg(test)]
+pub(crate) fn w08_prepared_push_fixture_for_namespace(namespace: Namespace) -> PreparedPush {
     let source_contract_id = SourceContractId::try_new("auction-source".to_owned()).unwrap();
     let occurrence = super::derive_occurrence_id(&super::OccurrenceIdentityMaterial::new(
         super::BusinessDate::parse("2026-09-07").unwrap(),
@@ -1233,7 +1238,7 @@ pub(crate) fn w08_prepared_push_fixture() -> PreparedPush {
     ));
     let subject = SubjectId::entity("000001.SZ".to_owned()).unwrap();
     let intent_id = derive_intent_id(&IntentIdentityMaterial::new(
-        Namespace::Production,
+        namespace,
         UnitId::try_new("MU-auction".to_owned()).unwrap(),
         CompletionOwnerId::try_new("owner-auction".to_owned()).unwrap(),
         source_contract_id.clone(),

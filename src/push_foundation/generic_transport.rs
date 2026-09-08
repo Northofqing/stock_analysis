@@ -58,6 +58,39 @@ pub(crate) struct GenericTransportRoute {
 }
 
 impl GenericTransportRoute {
+    pub(super) fn activation_fields(
+        &self,
+    ) -> BTreeMap<&'static str, crate::monitor::push_job::CanonicalValue> {
+        use crate::monitor::push_job::CanonicalValue;
+        BTreeMap::from([
+            (
+                "push_kind",
+                CanonicalValue::String(self.push_kind.as_str().into()),
+            ),
+            (
+                "sub_kind",
+                CanonicalValue::String(self.sub_kind.as_str().into()),
+            ),
+            ("scope_key", CanonicalValue::String(self.scope_key.clone())),
+            (
+                "required_channel",
+                CanonicalValue::String(self.required_channel.as_str().into()),
+            ),
+            (
+                "template_id",
+                CanonicalValue::String(self.template.template_id().as_str().into()),
+            ),
+            (
+                "template_version",
+                CanonicalValue::String(self.template.template_version().as_str().into()),
+            ),
+            (
+                "template_sha256",
+                CanonicalValue::String(self.template.sha256().as_str().into()),
+            ),
+        ])
+    }
+
     pub(crate) fn try_new(
         push_kind: PushKind,
         sub_kind: DeliverySubKind,
@@ -90,6 +123,10 @@ impl GenericTransportRoute {
     pub(crate) fn required_channel(&self) -> &ChannelId {
         &self.required_channel
     }
+
+    pub(super) fn template_sha256(&self) -> &Sha256Digest {
+        self.template.sha256()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,6 +137,20 @@ pub(crate) struct GenericDispatchFence {
 }
 
 impl GenericDispatchFence {
+    pub(super) fn activation_fields(
+        &self,
+    ) -> BTreeMap<&'static str, crate::monitor::push_job::CanonicalValue> {
+        use crate::monitor::push_job::CanonicalValue;
+        BTreeMap::from([
+            ("owner", CanonicalValue::String(self.owner.as_str().into())),
+            ("generation", CanonicalValue::Unsigned(self.generation)),
+            (
+                "until",
+                CanonicalValue::String(self.until.get().to_string()),
+            ),
+        ])
+    }
+
     pub(crate) fn try_new(
         owner: LeaseOwnerId,
         generation: u64,
@@ -115,7 +166,7 @@ impl GenericDispatchFence {
         })
     }
 
-    fn matches(&self, snapshot: &IntentSnapshot, dispatched_at: UtcMicros) -> bool {
+    pub(super) fn matches(&self, snapshot: &IntentSnapshot, dispatched_at: UtcMicros) -> bool {
         snapshot.lease_owner() == Some(self.owner.as_str())
             && snapshot.lease_generation() == self.generation
             && snapshot.lease_until() == Some(self.until)
@@ -168,7 +219,55 @@ impl<'a> GenericTransportAuthorityAdapter<'a> {
         Self { coordinator }
     }
 
+    #[cfg(test)]
     pub(crate) fn dispatch(
+        &self,
+        request: GenericDispatchRequest<'_>,
+    ) -> Result<DeliveryResult, GenericTransportError> {
+        self.dispatch_impl(request)
+    }
+
+    /// Only the broker worker can construct this context. Revalidation joins the actual
+    /// coordinator, current business snapshot and all fixed ports before the first write.
+    #[cfg(unix)]
+    pub(super) fn execute_current(
+        &self,
+        context: &super::activation_fence::ExecutionContext,
+        effect: &super::activation_generic_effect::GenericEffect,
+    ) -> Result<DeliveryResult, GenericTransportError> {
+        effect
+            .validate_runtime(context, self.coordinator)
+            .map_err(|_| GenericTransportError::InvalidBusinessIntent)?;
+        let request = effect.dispatch_request();
+        match effect.kind() {
+            super::activation_generic_effect::GenericEffectKind::Dispatch => {
+                self.dispatch_impl(request)
+            }
+            super::activation_generic_effect::GenericEffectKind::Reconcile => {
+                let attested = request
+                    .snapshot
+                    .attested_ready_binding()
+                    .map_err(|_| GenericTransportError::InvalidBusinessIntent)?;
+                let envelope =
+                    build_foundation_envelope(request.snapshot, &attested, request.route)?;
+                let at = DateTime::<Utc>::from_timestamp_micros(request.dispatched_at.get())
+                    .ok_or(GenericTransportError::InvalidTimestamp)?;
+                self.coordinator
+                    .reconcile_foundation_decision(
+                        &envelope.decision_identity,
+                        envelope
+                            .foundation_binding()
+                            .ok_or(GenericTransportError::InvalidBusinessIntent)?,
+                        request.append_port,
+                        at,
+                    )
+                    .map_err(|_| GenericTransportError::DurableFailure)?;
+                self.verify_result(&request)
+            }
+        }
+    }
+
+    fn dispatch_impl(
         &self,
         request: GenericDispatchRequest<'_>,
     ) -> Result<DeliveryResult, GenericTransportError> {
@@ -199,7 +298,7 @@ impl<'a> GenericTransportAuthorityAdapter<'a> {
         let decision_identity = envelope.decision_identity.clone();
         let required_sink: AuthoritativeSink = Arc::new(RequiredChannelSink {
             required_channel: request.route.required_channel().as_str().to_owned(),
-            inner: request.sink,
+            inner: Arc::clone(&request.sink),
         });
         self.coordinator
             .prepare(&envelope, 1, dispatched_at)
@@ -229,6 +328,13 @@ impl<'a> GenericTransportAuthorityAdapter<'a> {
             )
             .map_err(|_| GenericTransportError::DurableFailure)?;
 
+        self.verify_result(&request)
+    }
+
+    fn verify_result(
+        &self,
+        request: &GenericDispatchRequest<'_>,
+    ) -> Result<DeliveryResult, GenericTransportError> {
         let authority = GenericTerminalAuthorityAdapter::try_new(self.coordinator)?;
         let verified = verify_terminal(
             request.snapshot,
@@ -241,6 +347,7 @@ impl<'a> GenericTransportAuthorityAdapter<'a> {
         Ok(verified.into_delivery_result())
     }
 
+    #[cfg(test)]
     pub(crate) fn dispatch_required_channel(
         &self,
         request: GenericDispatchRequest<'_>,

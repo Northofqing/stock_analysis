@@ -195,6 +195,7 @@ async fn exact_initial_commit_and_replay_survive_closed_scope() {
     assert_eq!(snapshot.namespace(), fixture_scope().namespace);
     assert_eq!(snapshot.version(), 0);
     assert_eq!(snapshot.lease_generation(), 0);
+    let result = result.as_initial();
     assert_eq!(result.intent_id, draft.intent_id().as_str());
     assert_eq!(
         result.initial_intent_sha256,

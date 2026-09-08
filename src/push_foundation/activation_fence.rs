@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use super::activation_fence_store::{CompletionFault, OperationStore};
+use super::activation_generic_effect::{GenericEffect, GenericEffectResult};
 use super::intent_store::{BusinessIntentStore, InitialIntentDraft};
 use crate::monitor::push_job::{canonical_preimage, raw_digest, CanonicalValue};
 
@@ -47,7 +48,7 @@ pub(super) struct Scope {
 }
 
 impl Scope {
-    fn canonical_fields(&self) -> BTreeMap<&'static str, CanonicalValue> {
+    pub(super) fn canonical_fields(&self) -> BTreeMap<&'static str, CanonicalValue> {
         let mut fields = BTreeMap::new();
         for (key, value) in [
             ("namespace", &self.namespace),
@@ -118,10 +119,92 @@ impl EffectRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct EffectResult {
+#[serde(deny_unknown_fields)]
+pub(super) struct InitialIntentResult {
     pub(super) intent_id: String,
     pub(super) initial_intent_sha256: String,
     pub(super) effect_sha256: String,
+}
+
+/// Initial results retain their original untagged object bytes. Generic is explicitly tagged;
+/// decoding chooses exactly one strict schema, never serde's permissive untagged fallback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum EffectResult {
+    InitialIntent(InitialIntentResult),
+    Generic(GenericEffectResult),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GenericResultWire {
+    kind: GenericResultKind,
+    result: GenericEffectResult,
+}
+
+#[derive(Serialize, Deserialize)]
+enum GenericResultKind {
+    GenericTransport,
+}
+
+impl Serialize for EffectResult {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::InitialIntent(result) => result.serialize(serializer),
+            Self::Generic(result) => GenericResultWire {
+                kind: GenericResultKind::GenericTransport,
+                result: result.clone(),
+            }
+            .serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for EffectResult {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.get("kind").is_some() {
+            serde_json::from_value::<GenericResultWire>(value)
+                .map(|wire| Self::Generic(wire.result))
+                .map_err(serde::de::Error::custom)
+        } else {
+            serde_json::from_value::<InitialIntentResult>(value)
+                .map(Self::InitialIntent)
+                .map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+impl EffectResult {
+    pub(super) fn is_resolved(&self) -> bool {
+        match self {
+            Self::InitialIntent(_) => true,
+            Self::Generic(result) => result.is_resolved(),
+        }
+    }
+
+    pub(super) fn validate(&self, request: &EffectRequest) -> Result<(), FenceError> {
+        match self {
+            Self::InitialIntent(result) => {
+                if request.actor != "Producer"
+                    || request.action != "RecordInitial"
+                    || request.work_class != WorkClass::NewWork
+                    || result.effect_sha256 != request.effect_sha256
+                {
+                    return Err(FenceError::Store);
+                }
+                Ok(())
+            }
+            Self::Generic(result) => result.validate(request),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn as_initial(&self) -> &InitialIntentResult {
+        match self {
+            Self::InitialIntent(result) => result,
+            Self::Generic(_) => panic!("expected initial result"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,11 +325,11 @@ impl InitialIntentEffect {
         let receipt = store
             .inspect_activation_initial(&self.draft)
             .map_err(|_| FenceError::Store)?;
-        Ok(EffectResult {
+        Ok(EffectResult::InitialIntent(InitialIntentResult {
             intent_id: self.draft.intent_id().as_str().to_owned(),
             initial_intent_sha256: receipt,
             effect_sha256: self.digest.clone(),
-        })
+        }))
     }
 }
 
@@ -267,10 +350,45 @@ struct State {
     active: BTreeSet<String>,
 }
 
+enum FixedEffect {
+    InitialIntent(Box<InitialIntentEffect>),
+    GenericDispatch(GenericEffect),
+    GenericReconcile(GenericEffect),
+}
+
+impl FixedEffect {
+    fn identity(&self) -> (&str, &str, &str, &str, WorkClass) {
+        match self {
+            Self::InitialIntent(effect) => (
+                &effect.id,
+                &effect.digest,
+                "Producer",
+                "RecordInitial",
+                WorkClass::NewWork,
+            ),
+            Self::GenericDispatch(effect) | Self::GenericReconcile(effect) => (
+                effect.kind().id(),
+                effect.digest(),
+                "Dispatcher",
+                effect.kind().action(),
+                effect.kind().class(),
+            ),
+        }
+    }
+    fn execute(&self, context: &ExecutionContext) -> Result<EffectResult, FenceError> {
+        match self {
+            Self::InitialIntent(effect) => effect.execute(context),
+            Self::GenericDispatch(effect) | Self::GenericReconcile(effect) => {
+                effect.execute(context).map(EffectResult::Generic)
+            }
+        }
+    }
+}
+
 pub(super) struct EffectBroker {
     scope: Scope,
     epoch: String,
-    effect: Arc<InitialIntentEffect>,
+    effects: BTreeMap<String, Arc<FixedEffect>>,
     clients: Vec<ClientRegistration>,
     state: Arc<Mutex<State>>,
     changed: Arc<tokio::sync::Notify>,
@@ -279,7 +397,7 @@ pub(super) struct EffectBroker {
 }
 
 // No Clone and no Drop/Release semantics: only run() can record worker completion.
-struct ExecutionContext {
+pub(super) struct ExecutionContext {
     request: EffectRequest,
     state: Arc<Mutex<State>>,
     changed: Arc<tokio::sync::Notify>,
@@ -288,7 +406,36 @@ struct ExecutionContext {
 }
 
 impl ExecutionContext {
-    fn before_effect(&self) -> Result<(), FenceError> {
+    pub(super) fn authorize_generic(
+        &self,
+        effect: &GenericEffect,
+        scope: &Scope,
+    ) -> Result<(), FenceError> {
+        let state = self.state.lock().map_err(|_| FenceError::Store)?;
+        if &self.request.scope != scope
+            || self.request.effect_id != effect.kind().id()
+            || self.request.effect_sha256 != effect.digest()
+            || self.request.actor != "Dispatcher"
+            || self.request.action != effect.kind().action()
+            || self.request.work_class != effect.kind().class()
+            || !state.active.contains(&self.request.operation_id)
+            || state.confirmation_blocked
+            || !matches!(
+                state.store.query(&self.request)?,
+                Some(OperationFact {
+                    state: OperationState::Running,
+                    ..
+                })
+            )
+        {
+            return Err(FenceError::EffectMismatch);
+        }
+        // Quiesce closes admission, but an admitted worker retains its exact execution
+        // scope until effect + proof completion. It does not borrow a re-openable token.
+        Ok(())
+    }
+
+    pub(super) fn before_effect(&self) -> Result<(), FenceError> {
         #[cfg(test)]
         {
             use std::io::{Read, Write};
@@ -314,11 +461,11 @@ impl ExecutionContext {
         Ok(())
     }
 
-    fn run(self, effect: Arc<InitialIntentEffect>) {
+    fn run(self, effect: Arc<FixedEffect>) {
         let result = effect.execute(&self);
         let fact = OperationFact {
             original_epoch: self.request.broker_epoch.clone(),
-            state: if result.is_ok() {
+            state: if result.as_ref().is_ok_and(EffectResult::is_resolved) {
                 OperationState::Succeeded
             } else {
                 OperationState::Unresolved
@@ -409,16 +556,26 @@ impl EffectBroker {
         if request.scope != self.scope || request.broker_epoch != self.epoch {
             return Err(FenceError::Stale);
         }
-        if !state.new_work_open || state.confirmation_blocked {
+        if state.confirmation_blocked
+            || !match request.work_class {
+                WorkClass::NewWork => state.new_work_open,
+                WorkClass::Recovery => state.recovery_open,
+            }
+        {
             return Err(FenceError::Closed);
         }
+        let effect = self
+            .effects
+            .get(&request.effect_id)
+            .ok_or(FenceError::EffectMismatch)?;
+        let (id, digest, actor, action, class) = effect.identity();
         if request.operation_id.is_empty()
             || request.operation_id.len() > 512
-            || request.effect_id != self.effect.id
-            || request.effect_sha256 != self.effect.digest
-            || request.actor != "Producer"
-            || request.action != "RecordInitial"
-            || request.work_class != WorkClass::NewWork
+            || request.effect_id != id
+            || request.effect_sha256 != digest
+            || request.actor != actor
+            || request.action != action
+            || request.work_class != class
         {
             return Err(FenceError::EffectMismatch);
         }
@@ -436,10 +593,10 @@ impl EffectBroker {
             #[cfg(test)]
             hooks: self.hooks.clone(),
         };
-        let effect = Arc::clone(&self.effect);
+        let effect = Arc::clone(effect);
         // Registration, gate checks and worker ownership share this one linearization point.
         if std::thread::Builder::new()
-            .name("activation-initial-intent".into())
+            .name("activation-fixed-effect".into())
             .spawn(move || context.run(effect))
             .is_err()
         {
@@ -543,12 +700,51 @@ impl EffectBroker {
         if !scope.namespace.starts_with("Test:") {
             return Err(FenceError::ProductionRefused);
         }
-        let effect = Arc::new(InitialIntentEffect::bind(
-            "initial-intent".into(),
-            database,
-            draft,
-            &scope,
-        )?);
+        let effect = Arc::new(FixedEffect::InitialIntent(Box::new(
+            InitialIntentEffect::bind("initial-intent".into(), database, draft, &scope)?,
+        )));
+        Self::test_bound_fixture(
+            control,
+            scope,
+            epoch,
+            BTreeMap::from([("initial-intent".into(), effect)]),
+            clients,
+            hooks,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_generic_fixture(
+        control: &Path,
+        scope: Scope,
+        epoch: String,
+        fixture: super::activation_generic_effect::GenericEffectFixture,
+        clients: Vec<TestClient>,
+        hooks: TestHooks,
+    ) -> Result<Self, FenceError> {
+        let [dispatch, reconcile] = GenericEffect::bind_fixture(&scope, fixture)?;
+        let effects = BTreeMap::from([
+            (
+                "generic-dispatch".into(),
+                Arc::new(FixedEffect::GenericDispatch(dispatch)),
+            ),
+            (
+                "generic-reconcile".into(),
+                Arc::new(FixedEffect::GenericReconcile(reconcile)),
+            ),
+        ]);
+        Self::test_bound_fixture(control, scope, epoch, effects, clients, hooks)
+    }
+
+    #[cfg(test)]
+    fn test_bound_fixture(
+        control: &Path,
+        scope: Scope,
+        epoch: String,
+        effects: BTreeMap<String, Arc<FixedEffect>>,
+        clients: Vec<TestClient>,
+        hooks: TestHooks,
+    ) -> Result<Self, FenceError> {
         let store = OperationStore::open(control, &epoch)?;
         let fresh = store.fresh;
         if hooks.registration_failure {
@@ -568,7 +764,7 @@ impl EffectBroker {
         Ok(Self {
             scope,
             epoch,
-            effect,
+            effects,
             clients,
             state: Arc::new(Mutex::new(State {
                 store,
@@ -584,17 +780,38 @@ impl EffectBroker {
 
     #[cfg(test)]
     pub(super) fn test_request(&self, operation: &str) -> EffectRequest {
+        self.test_effect_request(operation, "initial-intent")
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_generic_request(&self, operation: &str, class: WorkClass) -> EffectRequest {
+        self.test_effect_request(
+            operation,
+            match class {
+                WorkClass::NewWork => "generic-dispatch",
+                WorkClass::Recovery => "generic-reconcile",
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn test_effect_request(&self, operation: &str, effect_id: &str) -> EffectRequest {
+        let (id, digest, actor, action, class) = self
+            .effects
+            .get(effect_id)
+            .expect("registered fixture effect")
+            .identity();
         EffectRequest {
             scope: self.scope.clone(),
             broker_epoch: self.epoch.clone(),
             client: "producer".into(),
             client_incarnation: "client-one".into(),
-            actor: "Producer".into(),
-            action: "RecordInitial".into(),
-            work_class: WorkClass::NewWork,
+            actor: actor.into(),
+            action: action.into(),
+            work_class: class,
             operation_id: operation.into(),
-            effect_id: self.effect.id.clone(),
-            effect_sha256: self.effect.digest.clone(),
+            effect_id: id.into(),
+            effect_sha256: digest.into(),
         }
     }
 }

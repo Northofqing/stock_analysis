@@ -540,6 +540,145 @@ impl CompletionPolicy {
     pub(crate) fn allows_authority(&self, authority: AuthorityClass) -> bool {
         self.allowed_authority.contains(&authority)
     }
+
+    /// Immutable effect identity only: this encoding does not grant activation authority.
+    pub(crate) fn activation_binding_bytes(&self) -> Vec<u8> {
+        use super::canonical::{canonical_preimage, CanonicalValue};
+        use std::collections::BTreeMap;
+        let text = |value: &str| CanonicalValue::String(value.to_owned());
+        let sorted_text = |mut values: Vec<&str>| {
+            values.sort_unstable();
+            CanonicalValue::Array(values.into_iter().map(text).collect())
+        };
+        let (retry_kind, not_before, max_attempts) = match self.retry_policy {
+            RetryPolicy::Never => ("Never", CanonicalValue::Null, CanonicalValue::Null),
+            RetryPolicy::InputBackoff { not_before } => (
+                "InputBackoff",
+                CanonicalValue::Unsigned(not_before.get() as u64),
+                CanonicalValue::Null,
+            ),
+            RetryPolicy::AuthorizedRejected {
+                not_before,
+                max_attempts,
+            } => (
+                "AuthorizedRejected",
+                CanonicalValue::Unsigned(not_before.get() as u64),
+                CanonicalValue::Unsigned(u64::from(max_attempts.get())),
+            ),
+        };
+        let fields = BTreeMap::from([
+            ("id", text(self.id.as_str())),
+            ("version", text(self.version.as_str())),
+            (
+                "completion_owner",
+                CanonicalValue::Object(BTreeMap::from([
+                    ("unit_id", text(self.completion_owner.unit_id().as_str())),
+                    (
+                        "completion_owner",
+                        text(self.completion_owner.completion_owner().as_str()),
+                    ),
+                    (
+                        "catalog_sha256",
+                        text(self.completion_owner.catalog_sha256().as_str()),
+                    ),
+                ])),
+            ),
+            (
+                "advance_event",
+                text(match self.advance_event {
+                    AdvanceEvent::AcceptedBound => "AcceptedBound",
+                    AdvanceEvent::AcceptedOrManualBound => "AcceptedOrManualBound",
+                }),
+            ),
+            (
+                "schedule_close_policy",
+                sorted_text(
+                    self.schedule_close_policy
+                        .branches
+                        .iter()
+                        .map(|branch| match branch {
+                            ScheduleCloseBranch::OnAccepted => "OnAccepted",
+                            ScheduleCloseBranch::VerifiedNoData => "VerifiedNoData",
+                            ScheduleCloseBranch::ExplicitDisabled => "ExplicitDisabled",
+                            ScheduleCloseBranch::SuppressedOccurrence => "SuppressedOccurrence",
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "notification_cursor_policy",
+                text(match self.notification_cursor_policy {
+                    CursorPolicy::AcceptedBoundOnly => "AcceptedBoundOnly",
+                    CursorPolicy::Never => "Never",
+                }),
+            ),
+            (
+                "no_data_policy",
+                text(match self.no_data_policy {
+                    NoDataPolicy::KeepOpen => "KeepOpen",
+                    NoDataPolicy::CloseVerifiedOccurrence => "CloseVerifiedOccurrence",
+                }),
+            ),
+            (
+                "disabled_policy",
+                text(match self.disabled_policy {
+                    DisabledPolicy::KeepOpen => "KeepOpen",
+                    DisabledPolicy::CloseDisabledOccurrence => "CloseDisabledOccurrence",
+                }),
+            ),
+            (
+                "retry_policy",
+                CanonicalValue::Object(BTreeMap::from([
+                    ("kind", text(retry_kind)),
+                    ("not_before", not_before),
+                    ("max_attempts", max_attempts),
+                ])),
+            ),
+            (
+                "uncertain_manual_policy",
+                text(match self.uncertain_manual_policy {
+                    UncertainPolicy::QuarantineThenVerifiedManual => "QuarantineThenVerifiedManual",
+                }),
+            ),
+            (
+                "already_terminal_policy",
+                text(match self.already_terminal_policy {
+                    AlreadyTerminalPolicy::RequeryExactBinding => "RequeryExactBinding",
+                }),
+            ),
+            (
+                "allowed_authority",
+                sorted_text(
+                    self.allowed_authority
+                        .iter()
+                        .map(|authority| match authority {
+                            AuthorityClass::GenericCounted => "GenericCounted",
+                            AuthorityClass::P01Dedicated => "P01Dedicated",
+                            AuthorityClass::N02Dedicated => "N02Dedicated",
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "finalizer_kind",
+                text(match self.finalizer_kind {
+                    FinalizerKind::BoundCursor => "BoundCursor",
+                    FinalizerKind::ScheduleOnly => "ScheduleOnly",
+                    FinalizerKind::CompatibilityObservation => "CompatibilityObservation",
+                }),
+            ),
+            (
+                "retention_class",
+                text(match self.retention_class {
+                    RetentionClass::Migration => "Migration",
+                    RetentionClass::Regulatory => "Regulatory",
+                    RetentionClass::Model => "Model",
+                    RetentionClass::Trading => "Trading",
+                }),
+            ),
+        ]);
+        canonical_preimage("ActivationCompletionPolicy/v1", &fields)
+    }
 }
 
 // Called by the W06-gated registration path and directly exercised by W03 tests.
@@ -1097,4 +1236,95 @@ pub(super) fn disabled_fixture(reason: ReasonCode) -> &'static DisabledEvidenceR
             .expect("fixture disabled digest"),
         observed_at: UtcMicros::try_new(1_788_705_600_000_000).expect("fixture observed time"),
     }))
+}
+
+#[cfg(test)]
+mod activation_binding_tests {
+    use super::*;
+
+    #[test]
+    fn w16_policy_binding_has_literal_golden_and_covers_all_fields() {
+        let policy = try_policy_fixture(fixture_policy_options()).unwrap();
+        let golden = concat!(
+            "ActivationCompletionPolicy/v1\0{",
+            "\"advance_event\":\"AcceptedOrManualBound\",",
+            "\"allowed_authority\":[\"GenericCounted\"],",
+            "\"already_terminal_policy\":\"RequeryExactBinding\",",
+            "\"completion_owner\":{\"catalog_sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",",
+            "\"completion_owner\":\"fixture-owner\",\"unit_id\":\"MU-fixture\"},",
+            "\"disabled_policy\":\"CloseDisabledOccurrence\",\"finalizer_kind\":\"BoundCursor\",",
+            "\"id\":\"fixture-policy\",\"no_data_policy\":\"CloseVerifiedOccurrence\",",
+            "\"notification_cursor_policy\":\"AcceptedBoundOnly\",\"retention_class\":\"Trading\",",
+            "\"retry_policy\":{\"kind\":\"Never\",\"max_attempts\":null,\"not_before\":null},",
+            "\"schedule_close_policy\":[\"ExplicitDisabled\",\"OnAccepted\",\"SuppressedOccurrence\",\"VerifiedNoData\"],",
+            "\"uncertain_manual_policy\":\"QuarantineThenVerifiedManual\",\"version\":\"v1\"}"
+        );
+        assert_eq!(policy.activation_binding_bytes(), golden.as_bytes());
+        let changes: &[fn(&mut CompletionPolicy)] = &[
+            |p| p.id = CompletionPolicyId::try_new("changed".into()).unwrap(),
+            |p| p.version = CompletionPolicyVersion::try_new("v2".into()).unwrap(),
+            |p| p.completion_owner.unit_id = UnitId::try_new("MU-other".into()).unwrap(),
+            |p| {
+                p.completion_owner.completion_owner =
+                    CompletionOwnerId::try_new("other".into()).unwrap()
+            },
+            |p| p.completion_owner.catalog_sha256 = Sha256Digest::from_bytes([1; 32]),
+            |p| p.advance_event = AdvanceEvent::AcceptedBound,
+            |p| p.schedule_close_policy = ScheduleClosePolicy::none(),
+            |p| p.notification_cursor_policy = CursorPolicy::Never,
+            |p| p.no_data_policy = NoDataPolicy::KeepOpen,
+            |p| p.disabled_policy = DisabledPolicy::KeepOpen,
+            |p| {
+                p.retry_policy = RetryPolicy::InputBackoff {
+                    not_before: UtcMicros::try_new(1).unwrap(),
+                }
+            },
+            |p| p.allowed_authority = vec![AuthorityClass::N02Dedicated],
+            |p| p.finalizer_kind = FinalizerKind::ScheduleOnly,
+            |p| p.retention_class = RetentionClass::Model,
+        ];
+        for (index, change) in changes.iter().enumerate() {
+            let mut changed = policy.clone();
+            change(&mut changed);
+            assert_ne!(
+                changed.activation_binding_bytes(),
+                golden.as_bytes(),
+                "field {index}"
+            );
+        }
+        // The two remaining policy enums have only one variant; the literal golden binds both.
+        let mut retry = policy.clone();
+        retry.retry_policy = RetryPolicy::AuthorizedRejected {
+            not_before: UtcMicros::try_new(1).unwrap(),
+            max_attempts: NonZeroU32::new(2).unwrap(),
+        };
+        let initial_retry = retry.activation_binding_bytes();
+        for (time, attempts) in [(2, 2), (1, 3)] {
+            retry.retry_policy = RetryPolicy::AuthorizedRejected {
+                not_before: UtcMicros::try_new(time).unwrap(),
+                max_attempts: NonZeroU32::new(attempts).unwrap(),
+            };
+            assert_ne!(retry.activation_binding_bytes(), initial_retry);
+        }
+    }
+
+    #[test]
+    fn w16_policy_authority_set_uses_text_order_not_registration_order() {
+        let mut options = fixture_policy_options();
+        options.allowed_authority = vec![
+            AuthorityClass::P01Dedicated,
+            AuthorityClass::GenericCounted,
+            AuthorityClass::N02Dedicated,
+        ];
+        let mut policy = try_policy_fixture(options).unwrap();
+        let before = policy.activation_binding_bytes();
+        policy.allowed_authority.reverse();
+        assert_eq!(policy.activation_binding_bytes(), before);
+        let json: serde_json::Value =
+            serde_json::from_slice(before.splitn(2, |byte| *byte == 0).nth(1).unwrap()).unwrap();
+        assert_eq!(
+            json["allowed_authority"],
+            serde_json::json!(["GenericCounted", "N02Dedicated", "P01Dedicated"])
+        );
+    }
 }

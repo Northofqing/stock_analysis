@@ -11,7 +11,9 @@ use crate::monitor::push_job::{canonical_preimage, raw_digest, CanonicalValue};
 use fs2::FileExt;
 use rusqlite::{params, Connection, OptionalExtension};
 
-use super::activation_fence::{EffectRequest, FenceError, OperationFact, OperationState, Scope};
+use super::activation_fence::{
+    EffectRequest, EffectResult, FenceError, OperationFact, OperationState, Scope,
+};
 
 pub(super) struct OperationStore {
     connection: Connection,
@@ -69,7 +71,11 @@ fn completion_bytes(request: &EffectRequest, fact: &OperationFact) -> Result<Vec
         return Err(FenceError::Store);
     }
     let result = fact.result.as_ref().ok_or(FenceError::Store)?;
-    let fields = std::collections::BTreeMap::from([
+    result.validate(request)?;
+    if !result.is_resolved() {
+        return Err(FenceError::Store);
+    }
+    let mut fields = std::collections::BTreeMap::from([
         (
             "operation_id",
             CanonicalValue::String(request.operation_id.clone()),
@@ -80,23 +86,29 @@ fn completion_bytes(request: &EffectRequest, fact: &OperationFact) -> Result<Vec
             CanonicalValue::String(fact.original_epoch.clone()),
         ),
         ("state", CanonicalValue::String("Succeeded".into())),
-        (
-            "intent_id",
-            CanonicalValue::String(result.intent_id.clone()),
-        ),
-        (
-            "initial_intent_sha256",
-            CanonicalValue::String(result.initial_intent_sha256.clone()),
-        ),
-        (
-            "effect_sha256",
-            CanonicalValue::String(result.effect_sha256.clone()),
-        ),
     ]);
-    Ok(canonical_preimage(
-        "ActivationEffectWorkerCompletion/v1",
-        &fields,
-    ))
+    let domain = match result {
+        EffectResult::InitialIntent(result) => {
+            fields.insert(
+                "intent_id",
+                CanonicalValue::String(result.intent_id.clone()),
+            );
+            fields.insert(
+                "initial_intent_sha256",
+                CanonicalValue::String(result.initial_intent_sha256.clone()),
+            );
+            fields.insert(
+                "effect_sha256",
+                CanonicalValue::String(result.effect_sha256.clone()),
+            );
+            "ActivationEffectWorkerCompletion/v1"
+        }
+        EffectResult::Generic(result) => {
+            fields.extend(result.canonical_fields());
+            "ActivationGenericTransportWorkerCompletion/v1"
+        }
+    };
+    Ok(canonical_preimage(domain, &fields))
 }
 
 /// Parent aliases resolve before selecting the stable sibling lock path; symlinks and
@@ -327,10 +339,16 @@ impl OperationStore {
             "Succeeded" => OperationState::Succeeded,
             _ => return Err(FenceError::Store),
         };
-        let result = result
+        let result: Option<EffectResult> = result
             .map(|v| serde_json::from_str(&v).map_err(|_| FenceError::Store))
             .transpose()?;
-        if (state == OperationState::Succeeded) != result.is_some() {
+        if let Some(result) = &result {
+            result.validate(request)?;
+        }
+        if (state == OperationState::Succeeded)
+            != result.as_ref().is_some_and(EffectResult::is_resolved)
+            || (state == OperationState::Running && result.is_some())
+        {
             return Err(FenceError::Store);
         }
         Ok(Some(OperationFact {

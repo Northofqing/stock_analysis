@@ -704,6 +704,91 @@ pub(crate) struct AttestedReadyIntent {
 }
 
 impl IntentSnapshot {
+    /// Complete immutable and lease/version material for the broker's fixed effect.
+    pub(super) fn activation_snapshot_fields(&self) -> BTreeMap<&'static str, CanonicalValue> {
+        let mut fields = BTreeMap::new();
+        for (key, value) in [
+            ("intent_id", self.intent_id.as_str()),
+            ("decision_kind", self.decision_kind.as_str()),
+            ("namespace", self.namespace.as_str()),
+            ("unit_id", self.unit_id.as_str()),
+            ("occurrence_family", self.occurrence_family.as_str()),
+            ("occurrence_key", self.occurrence_key.as_str()),
+            ("completion_owner", self.completion_owner.as_str()),
+            ("source_contract_id", self.source_contract_id.as_str()),
+            ("subject", self.subject.as_str()),
+            ("audience", self.audience.as_str()),
+            ("decision_id", self.durable_decision_id.as_str()),
+            ("business_date", self.business_date.as_str()),
+            ("evidence_sha256", self.evidence_sha256.as_str()),
+            ("template_sha256", self.template_sha256.as_str()),
+            (
+                "source_contract_sha256",
+                self.source_contract_sha256.as_str(),
+            ),
+            ("state", self.state.as_str()),
+            ("reason", self.reason.as_str()),
+        ] {
+            fields.insert(key, CanonicalValue::String(value.to_owned()));
+        }
+        for (key, bytes) in [
+            ("prepared_push_bytes", self.prepared_push_bytes.as_deref()),
+            ("rendered_bytes", self.rendered_bytes.as_deref()),
+        ] {
+            fields.insert(
+                key,
+                bytes.map_or(CanonicalValue::Null, |bytes| {
+                    CanonicalValue::Array(
+                        bytes
+                            .iter()
+                            .map(|v| CanonicalValue::Unsigned(u64::from(*v)))
+                            .collect(),
+                    )
+                }),
+            );
+        }
+        for (key, value) in [
+            (
+                "payload_sha256",
+                self.payload_sha256.as_ref().map(Sha256Digest::as_str),
+            ),
+            (
+                "rendered_sha256",
+                self.rendered_sha256.as_ref().map(Sha256Digest::as_str),
+            ),
+            (
+                "previous_state",
+                self.previous_state.map(IntentState::as_str),
+            ),
+            ("lease_owner", self.lease_owner.as_deref()),
+        ] {
+            fields.insert(
+                key,
+                value.map_or(CanonicalValue::Null, |value| {
+                    CanonicalValue::String(value.to_owned())
+                }),
+            );
+        }
+        fields.insert(
+            "lease_until",
+            self.lease_until.map_or(CanonicalValue::Null, |v| {
+                CanonicalValue::String(v.get().to_string())
+            }),
+        );
+        for (key, value) in [
+            ("created_at", self.created_at),
+            ("updated_at", self.updated_at),
+        ] {
+            fields.insert(key, CanonicalValue::String(value.get().to_string()));
+        }
+        fields.insert("version", CanonicalValue::Unsigned(self.version));
+        fields.insert(
+            "lease_generation",
+            CanonicalValue::Unsigned(self.lease_generation),
+        );
+        fields
+    }
+
     pub fn intent_id(&self) -> &str {
         &self.intent_id
     }

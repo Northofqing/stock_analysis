@@ -2306,6 +2306,33 @@ impl Drop for DurableDeliveryCoordinator {
 }
 
 impl DurableDeliveryCoordinator {
+    /// Read-only projection of the already pinned main object and validated environment.
+    /// No connection or descriptor escapes the attested operation boundary.
+    pub(crate) fn activation_storage_binding(&self) -> Result<(String, u64, u64, String, String)> {
+        self.with_connection(|_| {
+            let identity = self.database_binding()?.objects[0].identity;
+            let environment = match &self.config.environment {
+                super::model::StoreEnvironment::Production => "Production".to_owned(),
+                super::model::StoreEnvironment::Test { test_code } => format!("Test:{test_code}"),
+            };
+            Ok((
+                self.config
+                    .repository_relative_database_path()?
+                    .to_str()
+                    .ok_or_else(|| {
+                        DurableDeliveryError::InvalidConfiguration(
+                            "non UTF-8 activation store path".into(),
+                        )
+                    })?
+                    .to_owned(),
+                identity.device,
+                identity.inode,
+                environment,
+                self.config.owner_instance_identity.clone(),
+            ))
+        })
+    }
+
     fn connection_handle(&self) -> Result<&Arc<Mutex<Connection>>> {
         self.connection.as_ref().ok_or_else(|| {
             DurableDeliveryError::IsolationViolation(
