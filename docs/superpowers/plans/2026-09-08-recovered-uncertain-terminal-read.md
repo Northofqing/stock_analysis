@@ -1,6 +1,6 @@
 # 恢复分类 Uncertain 的真实终态读取修复
 
-日期：2026-09-08。状态：待实施。原始BASE `3cca5cc9a0bc9239d8900585593ade6a492af4fa`。前批来源观察保留已完成，不重做。
+日期：2026-09-08。状态：**本计划Task 1已完成**。原始BASE `3cca5cc9a0bc9239d8900585593ade6a492af4fa`；初版a2429b3、修复fb55d32/61e9d16。最终55项回归、Clippy及限定复审通过；见[中文实施结果](../../push-system/implementation-recovered-uncertain-read-2026-09-08.md)。完整W19和整体迁移/发布目标仍未完成。前批来源观察保留不重做。
 
 ## 目标与已经核实的缺口
 
