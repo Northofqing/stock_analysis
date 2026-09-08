@@ -330,7 +330,7 @@ async fn quiesce(socket: &Path, request: &EffectRequest, class: WorkClass) -> Sc
 }
 
 #[test]
-#[ignore = "explicitly spawned by the four w16_effect_process_* parent tests"]
+#[ignore = "explicitly spawned by the six w16_effect_process_* parent tests"]
 fn w16_effect_process_child() {
     let input: ChildInput = serde_json::from_reader(std::io::stdin()).unwrap();
     assert_eq!(input.root.parent(), Some(Path::new("/private/tmp")));
@@ -755,4 +755,175 @@ async fn w16_effect_process_commit_ack_loss_preserves_actual_intent_without_reex
     let status = quiesce(&next_socket, &next, WorkClass::Recovery).await;
     assert!(!status.drained);
     assert_eq!(status.unresolved, 1);
+}
+
+#[tokio::test]
+async fn w16_effect_process_final_result_read_failure_stays_unresolved_after_kill_and_restart() {
+    let mut fixture = Fixture::new();
+    let (mut broker, socket, request) = fixture
+        .broker(
+            "result-read-lost",
+            1,
+            TestHooks {
+                final_result_read_failure: true,
+                ..TestHooks::default()
+            },
+        )
+        .await;
+    let original = operation(
+        fixture
+            .child_request(
+                &socket,
+                Command::ExecuteCurrent {
+                    request: request.clone(),
+                    wait: true,
+                },
+                false,
+            )
+            .await,
+    );
+    assert_eq!(original.state, OperationState::Unresolved);
+    assert!(original.result.is_none());
+    let receipt = fixture.assert_one_exact_intent();
+    let connection = rusqlite::Connection::open_with_flags(
+        &fixture.control,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let stored: (String, Option<String>) = connection
+        .query_row(
+            "SELECT state,result_json FROM effect_operations WHERE operation_id=?1",
+            [&request.operation_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        stored.0, "Succeeded",
+        "TEST_CODE final UPDATE really committed before failed confirmation read"
+    );
+    assert!(stored.1.is_some());
+    let proofs: u64 = connection
+        .query_row("SELECT count(*) FROM effect_worker_completions", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(proofs, 0);
+    drop(connection);
+    assert!(!quiesce(&socket, &request, WorkClass::NewWork).await.drained);
+    assert!(
+        !quiesce(&socket, &request, WorkClass::Recovery)
+            .await
+            .drained
+    );
+    broker.stop(); // Own, kill and wait the real broker, not an EOF/PID inference.
+    let (_replacement, next_socket, next) = fixture
+        .broker("after-result-read-loss", 2, TestHooks::default())
+        .await;
+    assert_eq!(
+        operation(
+            fixture
+                .child_request(
+                    &next_socket,
+                    Command::QueryOperation {
+                        request: request.clone(),
+                        wait: false
+                    },
+                    false
+                )
+                .await
+        ),
+        original
+    );
+    assert_eq!(
+        operation(
+            fixture
+                .child_request(
+                    &next_socket,
+                    Command::ExecuteCurrent {
+                        request: request.clone(),
+                        wait: true
+                    },
+                    false
+                )
+                .await
+        ),
+        original
+    );
+    assert_eq!(fixture.assert_one_exact_intent(), receipt);
+    let status = quiesce(&next_socket, &next, WorkClass::Recovery).await;
+    assert!(!status.drained && !status.new_work_open && !status.recovery_open);
+    assert_eq!(status.unresolved, 1);
+}
+
+#[tokio::test]
+async fn w16_effect_process_confirmed_completion_survives_restart_including_publication_ack_loss() {
+    for completion_write_ack_lost in [false, true] {
+        let mut fixture = Fixture::new();
+        let (mut broker, socket, request) = fixture
+            .broker(
+                "confirmed",
+                1,
+                TestHooks {
+                    completion_write_ack_lost,
+                    ..TestHooks::default()
+                },
+            )
+            .await;
+        let original = operation(
+            fixture
+                .child_request(
+                    &socket,
+                    Command::ExecuteCurrent {
+                        request: request.clone(),
+                        wait: true,
+                    },
+                    false,
+                )
+                .await,
+        );
+        assert_eq!(original.state, OperationState::Succeeded);
+        let receipt = fixture.assert_one_exact_intent();
+        assert_eq!(
+            original.result.as_ref().unwrap().initial_intent_sha256,
+            receipt
+        );
+        broker.stop();
+        let (_replacement, next_socket, next) = fixture
+            .broker("after-confirmed", 2, TestHooks::default())
+            .await;
+        assert_eq!(
+            operation(
+                fixture
+                    .child_request(
+                        &next_socket,
+                        Command::QueryOperation {
+                            request: request.clone(),
+                            wait: false
+                        },
+                        false
+                    )
+                    .await
+            ),
+            original
+        );
+        assert_eq!(
+            operation(
+                fixture
+                    .child_request(
+                        &next_socket,
+                        Command::ExecuteCurrent {
+                            request: request.clone(),
+                            wait: true
+                        },
+                        false
+                    )
+                    .await
+            ),
+            original
+        );
+        assert_eq!(fixture.assert_one_exact_intent(), receipt);
+        let status = quiesce(&next_socket, &next, WorkClass::Recovery).await;
+        assert!(!status.new_work_open && !status.recovery_open && status.drained);
+        assert_eq!(status.unresolved, 0);
+    }
 }

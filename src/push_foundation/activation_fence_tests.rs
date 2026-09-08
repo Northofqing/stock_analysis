@@ -451,6 +451,13 @@ async fn failures_after_admission_preserve_durable_unresolved_and_never_replay()
             },
             1,
         ),
+        (
+            TestHooks {
+                final_result_read_failure: true,
+                ..TestHooks::default()
+            },
+            1,
+        ),
     ] {
         let f = Fixture::start(hooks);
         let request = f.broker.test_request("uncertain");
@@ -486,6 +493,87 @@ async fn failures_after_admission_preserve_durable_unresolved_and_never_replay()
         let candidate:String=connection.query_row("SELECT candidate_result_json FROM effect_operations WHERE operation_id='uncertain'",[],|r|r.get(0)).unwrap();
         assert!(!candidate.is_empty());
     }
+}
+
+#[tokio::test]
+async fn final_result_read_failure_has_real_committed_result_but_no_worker_proof() {
+    let f = Fixture::start(TestHooks {
+        final_result_read_failure: true,
+        ..TestHooks::default()
+    });
+    let request = f.broker.test_request("final-result-unconfirmed");
+    let reply = f.execute(request.clone()).await;
+    assert!(matches!(
+        &reply,
+        Reply::Operation(Some(OperationFact {
+            state: OperationState::Unresolved,
+            result: None,
+            ..
+        }))
+    ));
+    let connection = rusqlite::Connection::open(&f.control).unwrap();
+    let stored: (String, Option<String>) = connection
+        .query_row(
+            "SELECT state,result_json FROM effect_operations WHERE operation_id=?1",
+            [&request.operation_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        stored.0, "Succeeded",
+        "the actual final result UPDATE committed"
+    );
+    assert!(stored.1.is_some());
+    let proofs: u64 = connection
+        .query_row("SELECT count(*) FROM effect_worker_completions", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        proofs, 0,
+        "failed result read cannot construct a completion attestation"
+    );
+    assert_eq!(f.execute(request).await, reply);
+    assert_eq!(f.business_count(), 1);
+    assert!(!f.close(WorkClass::NewWork).await.drained);
+    assert!(!f.close(WorkClass::Recovery).await.drained);
+}
+
+#[tokio::test]
+async fn completion_publication_ack_loss_is_resolved_by_exact_prior_fact_attestation() {
+    let f = Fixture::start(TestHooks {
+        completion_write_ack_lost: true,
+        ..TestHooks::default()
+    });
+    let request = f.broker.test_request("completion-ack-lost");
+    let reply = f.execute(request.clone()).await;
+    assert!(matches!(
+        &reply,
+        Reply::Operation(Some(OperationFact {
+            state: OperationState::Succeeded,
+            ..
+        }))
+    ));
+    assert_eq!(f.execute(request).await, reply);
+    let connection = rusqlite::Connection::open(&f.control).unwrap();
+    let proofs: u64 = connection
+        .query_row("SELECT count(*) FROM effect_worker_completions", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(proofs, 1);
+    assert!(connection
+        .execute(
+            "UPDATE effect_worker_completions SET original_epoch='forged'",
+            []
+        )
+        .is_err());
+    assert!(connection
+        .execute("DELETE FROM effect_worker_completions", [])
+        .is_err());
+    assert_eq!(f.business_count(), 1);
+    f.close(WorkClass::NewWork).await;
+    assert!(f.close(WorkClass::Recovery).await.drained);
 }
 
 #[tokio::test]

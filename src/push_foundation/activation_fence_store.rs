@@ -7,6 +7,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::Duration;
 
+use crate::monitor::push_job::{canonical_preimage, raw_digest, CanonicalValue};
 use fs2::FileExt;
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -27,6 +28,75 @@ struct LockIdentity {
     canonical_database_path: String,
     database_device: u64,
     database_inode: u64,
+}
+
+struct StoredOperationRow {
+    request_bytes: Vec<u8>,
+    request_sha256: String,
+    request_json: String,
+    original_epoch: String,
+    state: String,
+    result_json: Option<String>,
+}
+
+struct StoredCompletionRow {
+    request_sha256: String,
+    original_epoch: String,
+    bytes: Vec<u8>,
+    sha256: String,
+}
+
+/// Constructed only after the completed effect's final result was exactly read back.
+/// Publishing records those already-observed facts, not acknowledgment of this publication.
+struct VerifiedWorkerCompletion {
+    operation_id: String,
+    request_sha256: String,
+    original_epoch: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum CompletionFault {
+    None,
+    #[cfg(test)]
+    FinalResultReadFailure,
+    #[cfg(test)]
+    CompletionWriteAckLost,
+}
+
+fn completion_bytes(request: &EffectRequest, fact: &OperationFact) -> Result<Vec<u8>, FenceError> {
+    if fact.state != OperationState::Succeeded || fact.original_epoch != request.broker_epoch {
+        return Err(FenceError::Store);
+    }
+    let result = fact.result.as_ref().ok_or(FenceError::Store)?;
+    let fields = std::collections::BTreeMap::from([
+        (
+            "operation_id",
+            CanonicalValue::String(request.operation_id.clone()),
+        ),
+        ("request_sha256", CanonicalValue::String(request.digest())),
+        (
+            "original_epoch",
+            CanonicalValue::String(fact.original_epoch.clone()),
+        ),
+        ("state", CanonicalValue::String("Succeeded".into())),
+        (
+            "intent_id",
+            CanonicalValue::String(result.intent_id.clone()),
+        ),
+        (
+            "initial_intent_sha256",
+            CanonicalValue::String(result.initial_intent_sha256.clone()),
+        ),
+        (
+            "effect_sha256",
+            CanonicalValue::String(result.effect_sha256.clone()),
+        ),
+    ]);
+    Ok(canonical_preimage(
+        "ActivationEffectWorkerCompletion/v1",
+        &fields,
+    ))
 }
 
 /// Parent aliases resolve before selecting the stable sibling lock path; symlinks and
@@ -129,7 +199,15 @@ impl OperationStore {
                  request_sha256 TEXT NOT NULL, request_json TEXT NOT NULL,
                  original_epoch TEXT NOT NULL, scope_json TEXT NOT NULL,
                  state TEXT NOT NULL CHECK(state IN ('Running','Succeeded','Unresolved')),
-                 result_json TEXT, candidate_result_json TEXT);",
+                 result_json TEXT, candidate_result_json TEXT);
+             CREATE TABLE IF NOT EXISTS effect_worker_completions (
+                 operation_id TEXT PRIMARY KEY, request_sha256 TEXT NOT NULL,
+                 original_epoch TEXT NOT NULL, completion_bytes BLOB NOT NULL,
+                 completion_sha256 TEXT NOT NULL);
+             CREATE TRIGGER IF NOT EXISTS effect_worker_completions_immutable
+                 BEFORE UPDATE ON effect_worker_completions BEGIN SELECT RAISE(ABORT,'immutable worker completion'); END;
+             CREATE TRIGGER IF NOT EXISTS effect_worker_completions_no_delete
+                 BEFORE DELETE ON effect_worker_completions BEGIN SELECT RAISE(ABORT,'immutable worker completion'); END;",
             )
             .map_err(|_| FenceError::Store)?;
         let path_text = canonical.to_str().ok_or(FenceError::Store)?;
@@ -159,26 +237,77 @@ impl OperationStore {
         // Process death ends this in-process worker, but does not resolve a possibly committed effect.
         connection
             .execute(
-                "UPDATE effect_operations SET state='Unresolved' WHERE state='Running'",
+                "UPDATE effect_operations SET state='Unresolved',result_json=NULL WHERE state='Running'
+                 OR (state='Succeeded' AND NOT EXISTS(SELECT 1 FROM effect_worker_completions c WHERE c.operation_id=effect_operations.operation_id))",
                 [],
             )
             .map_err(|_| FenceError::Store)?;
-        Ok(Self {
+        let store = Self {
             connection,
             _ownership: ownership,
             fresh: epochs == 0,
-        })
+        };
+        // Presence alone is insufficient. Refuse startup if a surviving terminal row's
+        // completion bytes do not exactly attest its request, epoch and completed result.
+        {
+            let mut statement = store
+                .connection
+                .prepare("SELECT request_json FROM effect_operations WHERE state='Succeeded'")
+                .map_err(|_| FenceError::Store)?;
+            let rows = statement
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|_| FenceError::Store)?;
+            for row in rows {
+                let request: EffectRequest =
+                    serde_json::from_str(&row.map_err(|_| FenceError::Store)?)
+                        .map_err(|_| FenceError::Store)?;
+                if !matches!(
+                    store.query(&request)?,
+                    Some(OperationFact {
+                        state: OperationState::Succeeded,
+                        ..
+                    })
+                ) {
+                    return Err(FenceError::Store);
+                }
+            }
+        }
+        Ok(store)
     }
 
     pub(super) fn query(
         &self,
         request: &EffectRequest,
     ) -> Result<Option<OperationFact>, FenceError> {
-        let row: Option<(Vec<u8>, String, String, String, String, Option<String>)> = self.connection.query_row(
+        let Some(mut fact) = self.recorded_result(request)? else {
+            return Ok(None);
+        };
+        if fact.state == OperationState::Succeeded && !self.has_completion(request, &fact)? {
+            fact.state = OperationState::Unresolved;
+            fact.result = None;
+        }
+        Ok(Some(fact))
+    }
+
+    fn recorded_result(
+        &self,
+        request: &EffectRequest,
+    ) -> Result<Option<OperationFact>, FenceError> {
+        let row: Option<StoredOperationRow> = self.connection.query_row(
             "SELECT request_bytes,request_sha256,request_json,original_epoch,state,result_json FROM effect_operations WHERE operation_id=?1",
-            [&request.operation_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))
+            [&request.operation_id], |r| Ok(StoredOperationRow {
+                request_bytes:r.get(0)?,request_sha256:r.get(1)?,request_json:r.get(2)?,
+                original_epoch:r.get(3)?,state:r.get(4)?,result_json:r.get(5)? }))
             .optional().map_err(|_| FenceError::Store)?;
-        let Some((bytes, digest, json, epoch, state, result)) = row else {
+        let Some(StoredOperationRow {
+            request_bytes: bytes,
+            request_sha256: digest,
+            request_json: json,
+            original_epoch: epoch,
+            state,
+            result_json: result,
+        }) = row
+        else {
             return Ok(None);
         };
         let persisted: EffectRequest =
@@ -258,6 +387,7 @@ impl OperationStore {
         &self,
         request: &EffectRequest,
         fact: &OperationFact,
+        fault: CompletionFault,
     ) -> Result<(), FenceError> {
         let state = match fact.state {
             OperationState::Succeeded => "Succeeded",
@@ -273,10 +403,97 @@ impl OperationStore {
         let rows = self.connection.execute(
             "UPDATE effect_operations SET state=?2,result_json=?3 WHERE operation_id=?1 AND state='Running' AND request_sha256=?4",
             params![request.operation_id,state,result,request.digest()]).map_err(|_| FenceError::Store)?;
-        if rows != 1 || self.query(request)?.as_ref() != Some(fact) {
+        if rows != 1 {
             return Err(FenceError::Store);
         }
-        Ok(())
+        #[cfg(test)]
+        if matches!(fault, CompletionFault::FinalResultReadFailure) {
+            // The real final UPDATE above committed. Fail its confirmation read deterministically
+            // inside SQLite, without changing the stored request/result or the normal query path.
+            return self.connection.query_row(
+                "SELECT fixture_absent_confirmation_column FROM effect_operations WHERE operation_id=?1",
+                [&request.operation_id], |_| Ok(())).map_err(|_| FenceError::Store);
+        }
+        if self.recorded_result(request)?.as_ref() != Some(fact) {
+            return Err(FenceError::Store);
+        }
+        if fact.state == OperationState::Unresolved {
+            return Ok(());
+        }
+        let verified = VerifiedWorkerCompletion {
+            operation_id: request.operation_id.clone(),
+            request_sha256: request.digest(),
+            original_epoch: fact.original_epoch.clone(),
+            bytes: completion_bytes(request, fact)?,
+        };
+        self.publish_completion(verified, request, fact, fault)
+    }
+
+    fn publish_completion(
+        &self,
+        verified: VerifiedWorkerCompletion,
+        request: &EffectRequest,
+        fact: &OperationFact,
+        fault: CompletionFault,
+    ) -> Result<(), FenceError> {
+        let written = self.connection.execute(
+            "INSERT OR IGNORE INTO effect_worker_completions VALUES(?1,?2,?3,?4,?5)",
+            params![
+                verified.operation_id,
+                verified.request_sha256,
+                verified.original_epoch,
+                verified.bytes,
+                raw_digest(&verified.bytes).as_str()
+            ],
+        );
+        #[cfg(test)]
+        let written = if matches!(fault, CompletionFault::CompletionWriteAckLost) {
+            // Actual proof publication happened; discard only its write acknowledgment.
+            written.map_err(|_| FenceError::Store)?;
+            Err(rusqlite::Error::InvalidQuery)
+        } else {
+            written
+        };
+        #[cfg(not(test))]
+        let _ = fault;
+        // Whether the write returned success or an ambiguous error, an exact durable proof
+        // resolves publication. Its validity comes from the PRECEDING result read, so there
+        // is no recursive requirement to record acknowledgment of the proof's own write.
+        let _ = written;
+        if self.has_completion(request, fact)? {
+            Ok(())
+        } else {
+            Err(FenceError::Store)
+        }
+    }
+
+    fn has_completion(
+        &self,
+        request: &EffectRequest,
+        fact: &OperationFact,
+    ) -> Result<bool, FenceError> {
+        let expected = completion_bytes(request, fact)?;
+        let row: Option<StoredCompletionRow> = self.connection.query_row(
+            "SELECT request_sha256,original_epoch,completion_bytes,completion_sha256 FROM effect_worker_completions WHERE operation_id=?1",
+            [&request.operation_id], |r| Ok(StoredCompletionRow {request_sha256:r.get(0)?,original_epoch:r.get(1)?,bytes:r.get(2)?,sha256:r.get(3)?}))
+            .optional().map_err(|_| FenceError::Store)?;
+        let Some(StoredCompletionRow {
+            request_sha256: request_sha,
+            original_epoch: epoch,
+            bytes,
+            sha256: digest,
+        }) = row
+        else {
+            return Ok(false);
+        };
+        if request_sha != request.digest()
+            || epoch != fact.original_epoch
+            || bytes != expected
+            || digest != raw_digest(&bytes).as_str()
+        {
+            return Err(FenceError::Store);
+        }
+        Ok(true)
     }
 
     pub(super) fn unresolved(&self, scope: &Scope) -> Result<u64, FenceError> {
@@ -284,9 +501,7 @@ impl OperationStore {
         // with a new tuple must not hide it by selecting only the new generation's empty rows.
         let mut statement = self
             .connection
-            .prepare(
-                "SELECT scope_json,request_json FROM effect_operations WHERE state!='Succeeded'",
-            )
+            .prepare("SELECT scope_json,request_json FROM effect_operations")
             .map_err(|_| FenceError::Store)?;
         let rows = statement
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
@@ -297,10 +512,14 @@ impl OperationStore {
             let old: Scope = serde_json::from_str(&scope_json).map_err(|_| FenceError::Store)?;
             let request: EffectRequest =
                 serde_json::from_str(&request_json).map_err(|_| FenceError::Store)?;
-            if request.scope != old || self.query(&request)?.is_none() {
+            let fact = self.query(&request)?.ok_or(FenceError::Store)?;
+            if request.scope != old {
                 return Err(FenceError::Store);
             }
-            if old.namespace == scope.namespace && old.unit == scope.unit {
+            if old.namespace == scope.namespace
+                && old.unit == scope.unit
+                && fact.state != OperationState::Succeeded
+            {
                 count += 1;
             }
         }

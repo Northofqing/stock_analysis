@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use super::activation_fence_store::OperationStore;
+use super::activation_fence_store::{CompletionFault, OperationStore};
 use super::intent_store::{BusinessIntentStore, InitialIntentDraft};
 use crate::monitor::push_job::{canonical_preimage, raw_digest, CanonicalValue};
 
@@ -344,7 +344,16 @@ impl ExecutionContext {
             self.changed.notify_waiters();
             return;
         }
-        if state.store.finish(&self.request, &fact).is_err() {
+        let fault = CompletionFault::None;
+        #[cfg(test)]
+        let fault = if self.hooks.final_result_read_failure {
+            CompletionFault::FinalResultReadFailure
+        } else if self.hooks.completion_write_ack_lost {
+            CompletionFault::CompletionWriteAckLost
+        } else {
+            fault
+        };
+        if state.store.finish(&self.request, &fact, fault).is_err() {
             state.confirmation_blocked = true;
             state.new_work_open = false;
             state.recovery_open = false;
@@ -597,6 +606,8 @@ pub(super) struct TestHooks {
     pub(super) registration_failure: bool,
     pub(super) effect_started_failure: bool,
     pub(super) result_confirmation_lost: bool,
+    pub(super) final_result_read_failure: bool,
+    pub(super) completion_write_ack_lost: bool,
     pub(super) business_commit_ack_lost: bool,
 }
 
