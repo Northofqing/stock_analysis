@@ -716,6 +716,22 @@ async fn result_schema_requires_every_field_rejects_mixed_shapes_and_proof_tampe
     )
     .unwrap();
     let (proof, sha): (Vec<u8>, String) = db.query_row("SELECT completion_bytes,completion_sha256 FROM effect_worker_completions WHERE operation_id='one'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    let immutable_trigger: String = db.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='effect_worker_completions_immutable'",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert!(
+        db.execute(
+            "UPDATE effect_worker_completions SET completion_bytes=? WHERE operation_id='one'",
+            [&proof],
+        )
+        .is_err(),
+        "the fixture initially enforces immutable completion proofs"
+    );
+    // Explicit corruption injection into this test's private control database only.
+    // Preserve and restore the exact guard; Foundation business DDL is never altered.
+    db.execute_batch("DROP TRIGGER effect_worker_completions_immutable")
+        .unwrap();
     for domain in [
         "ActivationEffectWorkerCompletion/v1",
         "ActivationGenericTransportWorkerCompletion/v1",
@@ -733,6 +749,10 @@ async fn result_schema_requires_every_field_rejects_mixed_shapes_and_proof_tampe
         ));
     }
     db.execute("UPDATE effect_worker_completions SET completion_bytes=?,completion_sha256=? WHERE operation_id='one'", rusqlite::params![proof, sha]).unwrap();
+    db.execute_batch(&immutable_trigger).unwrap();
+    assert!(db.execute(
+        "UPDATE effect_worker_completions SET completion_bytes=completion_bytes WHERE operation_id='one'", [],
+    ).is_err(), "the exact immutable guard is restored after corruption injection");
     assert_eq!(broker.query_operation(&request).unwrap(), Some(fact));
 }
 
@@ -852,12 +872,31 @@ fn effect_has_independent_full_literal_golden_and_actual_encoder_variants() {
 fn add_pending(fixture: &Fixture) -> IntentSnapshot {
     use super::super::{InitialIntentDraft, InitialIntentIdentity};
     use crate::monitor::push_job::{
-        w08_prepared_push_fixture_for_namespace, AudienceId, BusinessDate, CompletionOwnerId,
-        Namespace, OccurrenceFamily, OccurrenceIdentityMaterial, OccurrenceKey, RunId,
-        SourceContractId, SubjectId, UnitId,
+        w08_prepared_push_fixture_for_namespace, w16_prepared_push_fixture_for_identity,
+        AudienceId, BusinessDate, CompletionOwnerId, Namespace, OccurrenceFamily,
+        OccurrenceIdentityMaterial, OccurrenceKey, RunId, SourceContractId, SubjectId, UnitId,
     };
     let namespace = Namespace::test(RunId::try_new(fixture.code.clone()).unwrap());
-    let prepared = w08_prepared_push_fixture_for_namespace(namespace.clone());
+    let original = w08_prepared_push_fixture_for_namespace(namespace.clone());
+    let explicit_default = w16_prepared_push_fixture_for_identity(
+        namespace.clone(),
+        OccurrenceKey::try_new("main".into()).unwrap(),
+        SubjectId::entity("000001.SZ".into()).unwrap(),
+    );
+    assert_eq!(
+        original.canonical_snapshot_bytes(),
+        explicit_default.canonical_snapshot_bytes(),
+        "the existing fixture preserves its exact PreparedPush bytes"
+    );
+    assert_eq!(original.rendered_bytes(), explicit_default.rendered_bytes());
+    let occurrence_key = OccurrenceKey::try_new("other-pending".into()).unwrap();
+    let subject = SubjectId::entity("000002.SZ".into()).unwrap();
+    let prepared = w16_prepared_push_fixture_for_identity(
+        namespace.clone(),
+        occurrence_key.clone(),
+        subject.clone(),
+    );
+    assert_ne!(prepared.intent_id(), original.intent_id());
     let draft = InitialIntentDraft::ready(
         InitialIntentIdentity::new(
             namespace,
@@ -865,11 +904,11 @@ fn add_pending(fixture: &Fixture) -> IntentSnapshot {
             OccurrenceIdentityMaterial::new(
                 BusinessDate::parse("2026-09-07").unwrap(),
                 OccurrenceFamily::try_new("auction-session".into()).unwrap(),
-                OccurrenceKey::try_new("other-pending".into()).unwrap(),
+                occurrence_key,
             ),
             CompletionOwnerId::try_new("owner-auction".into()).unwrap(),
             SourceContractId::try_new("auction-source".into()).unwrap(),
-            SubjectId::entity("000002.SZ".into()).unwrap(),
+            subject,
             AudienceId::try_new("portfolio-owner".into()).unwrap(),
         ),
         &prepared,

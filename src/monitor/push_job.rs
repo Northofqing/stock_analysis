@@ -61,7 +61,10 @@ pub use projection::{
 pub(crate) use policy::w09_completion_policy_fixture;
 pub(crate) use projection::derive_decision_id;
 #[cfg(test)]
-pub(crate) use projection::{w08_prepared_push_fixture, w08_prepared_push_fixture_for_namespace};
+pub(crate) use projection::{
+    w08_prepared_push_fixture, w08_prepared_push_fixture_for_namespace,
+    w16_prepared_push_fixture_for_identity,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum PushJobError {

@@ -1230,13 +1230,25 @@ pub(crate) fn w08_prepared_push_fixture() -> PreparedPush {
 
 #[cfg(test)]
 pub(crate) fn w08_prepared_push_fixture_for_namespace(namespace: Namespace) -> PreparedPush {
+    w16_prepared_push_fixture_for_identity(
+        namespace,
+        super::OccurrenceKey::try_new("main".to_owned()).unwrap(),
+        SubjectId::entity("000001.SZ".to_owned()).unwrap(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn w16_prepared_push_fixture_for_identity(
+    namespace: Namespace,
+    occurrence_key: super::OccurrenceKey,
+    subject: SubjectId,
+) -> PreparedPush {
     let source_contract_id = SourceContractId::try_new("auction-source".to_owned()).unwrap();
     let occurrence = super::derive_occurrence_id(&super::OccurrenceIdentityMaterial::new(
         super::BusinessDate::parse("2026-09-07").unwrap(),
         super::OccurrenceFamily::try_new("auction-session".to_owned()).unwrap(),
-        super::OccurrenceKey::try_new("main".to_owned()).unwrap(),
+        occurrence_key,
     ));
-    let subject = SubjectId::entity("000001.SZ".to_owned()).unwrap();
     let intent_id = derive_intent_id(&IntentIdentityMaterial::new(
         namespace,
         UnitId::try_new("MU-auction".to_owned()).unwrap(),

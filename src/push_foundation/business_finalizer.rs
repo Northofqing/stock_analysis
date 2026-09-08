@@ -506,7 +506,7 @@ pub(crate) fn prepare_not_delivered_finalization(
     policy: &CompletionPolicy,
     authority: &dyn TerminalAuthorityPort,
 ) -> Result<NotDeliveredPreparationOutcome, BusinessFinalizerError> {
-    prepare_not_delivered_finalization_inner(store, request, template, policy, authority)
+    FinalizerExecution::Legacy.prepare_not_delivered(store, request, template, policy, authority)
 }
 
 #[cfg(test)]
@@ -520,7 +520,7 @@ pub(crate) fn commit_not_delivered_finalization(
     verified_at: UtcMicros,
     occurred_at: UtcMicros,
 ) -> Result<NotDeliveredFinalizationOutcome, BusinessFinalizerError> {
-    commit_not_delivered_finalization_inner(
+    FinalizerExecution::Legacy.commit_not_delivered(
         store,
         pending,
         template,
