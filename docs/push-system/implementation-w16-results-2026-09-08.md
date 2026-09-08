@@ -146,6 +146,21 @@ T4B源码`31d834c`、确认窗口修正`c607730`，原始BASE`5df44c1`，修正B
 
 只关闭本片broker-owned Generic发送/只恢复adapter。后续Recovery成功不会改写原Unresolved operation，原范围仍阻断排空，需另行认证的控制面协调。成功构造仍限Test fixture；生产认证、完整monitor接线、其他actor、具体Unit cursor和52Unit迁移均未因此完成。
 
+## 已验证：业务恢复与 finalizer（T4D）
+
+从`351fcb6`继续单intent业务恢复纵向接线：实际Generic发送形成terminal后，由broker拥有的Recovery覆盖业务lease、qualification、finalizer准备/提交/错误隔离，再独立查询完整snapshot/transition链。无许可全库startup和finalizer仅保留测试入口；真实新入口需要同一worker的借用许可，不允许pending对象跨operation当权限。已完成的精确终态只读确认，不重取lease。
+
+源码`4c07aaa`、测试修正`667ee4a`，原始BASE`351fcb6`，已通过限定独立审查。进程测试复用已有Generic fixture/Child/IPC/local sink，比较业务恢复前后真实attempt/sink/append行，并独立从SQL28字段重算结果snapshot摘要、完整transition链及完成证明字节。
+
+- 闭集`Finalizer/ReconcileBusiness/Recovery`覆盖一个精确intent的实际恢复及错误写入，不扫描其他intent、不持发送端口。原Initial/Generic结果和证明字节保留；新业务结果使用独立domain，完成证明嵌套业务结果，保留外层operation状态。
+- 四个真实进程父测试覆盖五个案例：qualification已落库时请求者死亡仍保留在途责任，正常与证明ack丢失的成功重启，broker死亡重启未决，最终结果确认读取失败，以及Uncertain保持人工责任；恢复不新增sink/attempt/append。
+- 首轮97701：498 passed / 3 failed / 4父调用helpers ignored，compile2m11s、runtime93.50s。三个失败分别是第二intent夹具身份不匹配（两项）与证明篡改夹具被不可变trigger拦截；未到目标断言，不算通过。修正仅cfg(test)，未放宽业务绑定或冻结Foundation SQL。
+- 最终72273：`env CARGO_PROFILE_TEST_INCREMENTAL=true cargo test --lib -- --test-threads=1 push_foundation::activation_business_effect:: push_foundation::activation_business_process_tests:: push_foundation::business_finalizer_tests:: push_foundation::tests::w08_ monitor::push_job::`，exit0，**104 passed / 0 failed / 0 ignored**，compile1m15s、runtime16.78s，43旧warning。包含14项同进程、4项真实进程、18项W10、14项W08和54项push_job；三个原失败均明确通过。未改邻域复用97701中的498项通过证据，不冒称修正后重新全跑。
+- 最终production libClippy58197：exit0，1m25s，163项既有定位warning，Foundation/coordinator/push_job目标诊断为空。四个修正路径定向格式与diff检查通过。
+- 独立限定复核`4c07aaa..667ee4a`：两项Important和同文件Minor全部**ADDRESSED**，无新增breakage，Spec compliant / Task quality Approved。额外精查确认篡改证明的拒绝来自bytes/hash不匹配，不是夹具临时缺trigger导致的前置拒绝。
+
+仅本片业务恢复接线完成。原Unresolved operation不自动升级；完整人工批准、Unit特有cursor、真实scheduler/producer、专用发送、全库startup/monitor与生产身份仍未接通，不据此标完整T4/W16/52Unit完成。
+
 ## 完整剩余范围
 
 ### T4 实际接线核查（历史基线 f87e2b8，后续交付以上文为准）
@@ -160,7 +175,7 @@ T4B源码`31d834c`、确认窗口修正`c607730`，原始BASE`5df44c1`，修正B
 | `business_finalizer.rs:418,809,829`、`reconciler.rs:628` | 准备、冲突、错误和恢复租约均可能写库 | 每个写入分支都在当前许可内，嵌套恢复复用同一个scope，不只包成功完成分支 |
 | `monitor/main.rs:4958,5829` | 启动恢复可发送；超时的review worker可继续执行 | 启动/手工入口先关门；跟踪真实effect/worker结束，外层abort/join不是排空证明 |
 
-T4B/T4C已在隔离环境交付broker持有typed effect及许可生命周期、客户端断连保持在途、稳定operation查回和重启默认关闭。上表的Generic全局恢复问题已由T4R精确范围修复，initial写入由T4B、Generic发送由T4C接入；scheduler、真实采集、专用发送、finalizer/cursor与monitor仍须继续接线。旧binary可绕过broker直接访问sink/DB时仍不能批准接管，需真实监督器与权限撤销证据，不是生产保护已经生效。
+T4B/T4C/T4D已在隔离环境交付broker持有typed effect及许可生命周期、客户端断连保持在途、稳定operation查回和重启默认关闭。上表的Generic全局恢复问题已由T4R精确范围修复，initial写入由T4B、Generic发送由T4C、精确业务恢复/finalizer由T4D接入；scheduler、真实采集、专用发送、Unit特有cursor与monitor仍须继续接线。旧binary可绕过broker直接访问sink/DB时仍不能批准接管，需真实监督器与权限撤销证据，不是生产保护已经生效。
 
 - T2：本批仅完成真实内核/FD观察、批准声明约束和原始日历join；生产规范操作员、受保护根/opener/ACL、实际部署/source package、可信时钟和批准持久/撤销/防重放仍待，生产平台及根配置尚未给定。
 - T3：内部同事务引擎已实现；真实认证 opener、可信业务日及外部批准包精确请求绑定、T5协调接线仍待。

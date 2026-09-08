@@ -99,6 +99,8 @@ cargo test --lib push_foundation::activation_transaction_tests -- --test-threads
 
 T4C已限定完成（BASE `ad2b257`，源码`0b70f4d`、测试修正`81683f4`）：已有broker注册闭集GenericDispatch与GenericReconcile，分别归NewWork/Recovery；前者覆盖实际prepare、attempt、sink、receipt、精确恢复和完成证明，后者不prepare/resume/send。现有无许可Generic入口仅保留测试可见，实际runtime入口要求私有worker执行context。原initial结果/完成证明v1不变，新Generic独立结果分派与完成证明domain；策略完整绑定新增`ActivationCompletionPolicy/v1`。最终18项行为测试（12同进程、6真实父进程）、production Clippy目标零和限定复核通过；未改模块保留此前481项通过证据，不称修正后新全量测试。原Unresolved operation后续协调仍待；生产monitor未变，完整dispatcher/四actor/52Unit迁移尚未完成，不重派此片。
 
+T4D已限定完成（BASE `351fcb6`，源码`4c07aaa`、测试修正`667ee4a`）：broker固定的`Finalizer/ReconcileBusiness/Recovery`覆盖一个精确intent的实际lease、qualification、finalizer准备/提交/错误隔离及独立读回；不调用全库startup恢复、不拥有发送端口，也不从单项结果签发全局scheduler barrier。复用W10/W11算法，原无许可入口限测试，嵌套调用借用同worker且pending不续权。新业务恢复effect/result/证明独立domain，证明内业务结果嵌套，保留operation状态。实际Generic发送后再执行恢复，四个真实进程父测试覆盖请求者/broker死亡、确认失败、正常及证明ack丢失重启、Uncertain与零重发。最终受影响合批104/0/0、production Clippy目标零及原审查者限定复核全部通过；未变邻域保留此前498项通过证据。具体Unit cursor、专用发送、完整startup/monitor及生产认证仍待，不重派T4D或缩小整体验收。
+
 依赖 T2 认证部署，T0/C supervisor 平台选择；Shadow/legacy 联合许可按已澄清的 B 实现，并测试初始/排空后/回滚准入矩阵。新建 `activation_owner.rs`、`activation_fence.rs`、`activation_fence_tests.rs`；新建 `src/bin/monitor/activation_runtime.rs` 和其本地测试 module（真实路径均为新建）。编辑已有 `src/bin/monitor/main.rs` 注册受监督生命周期；接管 `phase_scheduler.rs`、`generic_transport.rs`、`dedicated_transport.rs`、`business_finalizer.rs`、`reconciler.rs` 的共同执行 seam。`intent_store.rs` 仅在使当前执行许可覆盖业务事务确有必要时修改，保留 lease/version 原义。common module 的公开可见性变更串行交接 `mod.rs`。
 
 实现完整 `(unit,generation,manifest,owner)` 当前检查与撤销共享的执行许可；跨进程的 quiesce/inspect/install-paused/resume 由认证 supervisor 驱动。旧进程确认死亡/撤权、在途许可结束后才能切换；进程身份需防 PID 复用。未适配旧 binary 不允许混跑。日志、旧 token、重启新 run_id 不可授予权限。
