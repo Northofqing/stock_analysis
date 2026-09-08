@@ -161,6 +161,26 @@ T4B源码`31d834c`、确认窗口修正`c607730`，原始BASE`5df44c1`，修正B
 
 仅本片业务恢复接线完成。原Unresolved operation不自动升级；完整人工批准、Unit特有cursor、真实scheduler/producer、专用发送、全库startup/monitor与生产身份仍未接通，不据此标完整T4/W16/52Unit完成。
 
+## 已验证并审查通过：集合版快照与恢复存储（T6 持久消费部分）
+
+源码`4a3ef37`，原始BASE`69f04ba`，落实[集合版实施计划](../superpowers/plans/2026-09-08-readiness-deployment-set-v3.md)。这次把全52Unit候选集合贯穿既有snapshot→recovery record→SQLite store调用链，不新增第二套writer或修改冻结schema。独立审查结论为Spec compliant / Task quality Approved；这里只关闭持久消费部分，不代表完整T6、W16或生产就绪。
+
+| 已落地行为 | 源码与验证证据 |
+| --- | --- |
+| 显式区分单代v2与集合版v3，不造Core统一generation/build/manifest | `readiness_snapshot.rs`的封闭版本上下文；v3内嵌完整`ActivationDeploymentSet/v1`对象和独立集合摘要。专用固定golden同时核对v2 snapshot/material/stream和v3集合/snapshot/material/stream，期待值由独立Ruby协议样本计算。 |
+| 集合持久解码拒绝遗漏、重复、未知Unit及非法配置 | 私有`activation_readiness_codec.rs`＋`activation_readiness.rs`恢复验证；完整52条、Unregistered显式null、注册责任、枚举/摘要/日历/六项共享依赖约束及最终重编码比较。专用codec反例通过。 |
+| Core故障覆盖仍负恢复责任的Unit，不错误开启新producer | `operational_readiness.rs::evaluate_for_deployment_set`从集合精确派生enabled和scope；非Ready时affected Unit包含recovery_units，Ready保持空affected。真实临时activation库包含两个不同generation/build的Unit及Disabled恢复Unit。 |
+| 旧历史不改写，新旧stream不错误拼接 | `readiness_recovery.rs::validate_continuity`拒绝跨版本/集合前驱；恢复仍要求完整显式claim。`readiness_store.rs::for_snapshot`保持旧stream/v1，集合版使用stream/v2且绑定完整集合hash。 |
+| 真实持久链可重开、幂等、确认丢失重查并拒绝伪造 | `readiness_deployment_set_tests.rs`通过现有store测试v2/v3同库共存、旧Pending保留、外来expected head拒绝、有效恢复和持久跨stream前驱伪造拒绝；不是只测试内存等式。 |
+
+验证历程保留失败：68322首轮8模块合批为**60 passed / 2 failed / 0 ignored**，compile4m02s、runtime29.33s。两个新存储测试均在首条append返回`Schema(DatabaseOpenFailed)`：夹具直接使用macOS临时路径，未像既有store测试一样先canonicalize父目录。修正只规范临时fixture路径，保留生产`SQLITE_OPEN_NOFOLLOW`、锁和SQL安全合同；另移除本批无消费者的getter，不使用allow掩盖新增warning。
+
+- 修正后74903：`env CARGO_PROFILE_TEST_INCREMENTAL=true cargo test --lib -- --test-threads=1 push_foundation::readiness_deployment_set_tests::`，exit0，**5 passed / 0 failed / 0 ignored**，3252 filtered、compile1m01s、runtime7.41s。两个原失败均进入并通过实际存储断言，包含全部5个新模块测试；43项测试warning在未改data_gateway位置。旧7模块57项保留首轮有效通过证据，不冒称修正后又全跑62项。
+- 最终production libClippy6684：exit0、1m38s、`build-finished success=true`；163项有位置warning为未改位置，Foundation目标诊断为空。stdout/stderr交错破坏一条展示JSON，通过同次编译fingerprint核对完整163项，未为日志交错重跑构建，不称全仓零告警。
+- 主控13个精确Rust路径`rustfmt --check --edition 2021 --config skip_children=true`及`git diff --check`均exit0。固定`69f04ba..4a3ef37`独立审查通过，Critical/Important均0；两项Minor保留：新版requirement/observation版本冲突分支需直接反例（当前该测试仅变contract ID/hash），以及全库既有warning噪声。前者随下一次T6评估接线补齐，后者交最终全分支审查，不删除或隐藏。
+
+运行成本与边界：固定空依赖样本v2快照1211字节，完整52条集合的v3样本16337字节；两者代表不同版本样本，不是生产平均大小。完整集合使每条历史记录可自足重建，代价是更大存储量，后续保留期不能自动删除未决记录。结构自洽不等于认证：实际来源/部署身份、跨库提交前后重查、同快照query/health/CLI、受认证跨stream恢复协调和N/N−1回退门禁仍须继续交付。没有启动、监控或替换生产monitor，没有真实库/owner变更。
+
 ## 完整剩余范围
 
 ### T4 实际接线核查（历史基线 f87e2b8，后续交付以上文为准）
@@ -180,7 +200,7 @@ T4B/T4C/T4D已在隔离环境交付broker持有typed effect及许可生命周期
 - T2：本批仅完成真实内核/FD观察、批准声明约束和原始日历join；生产规范操作员、受保护根/opener/ACL、实际部署/source package、可信时钟和批准持久/撤销/防重放仍待，生产平台及根配置尚未给定。
 - T3：内部同事务引擎已实现；真实认证 opener、可信业务日及外部批准包精确请求绑定、T5协调接线仍待。
 - T4/T5：原始准入投影已实现；legacy/new 四类 actor 的共同当前 fence、真实监督器和旧 binary 撤权、批准范围认证、非原子切换/恢复/rollback仍待。
-- T6/T7：全52Unit原始候选集合已实现；v3 snapshot/material、stream v2与恢复衔接、真实来源/部署认证、同快照查询/启动、操作员入口和完整门禁仍待。
+- T6/T7：全52Unit候选集合、v3 snapshot/material、stream v2及既有恢复/store链已实现并通过限定验证/独立审查；真实来源/部署认证、跨库重查、受认证跨stream恢复协调、同快照查询/启动、操作员入口和完整门禁未完成。
 - W15 真正来源上下文/认证/恢复及调度联结，W17–W21，52个 Unit 的纵向迁移与真实发布证据仍未完成。
 
 开发和测试均隔离于 worktree/临时库；本轮没有启动、观察、替换生产 monitor，没有调用真实 provider/sink/PAM，也未进行 owner 晋级或真实库修改。
