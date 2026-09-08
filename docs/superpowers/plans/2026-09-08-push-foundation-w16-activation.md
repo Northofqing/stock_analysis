@@ -89,7 +89,7 @@ cargo test --lib push_foundation::activation_transaction_tests -- --test-threads
 
 ## Task 4 — T4 四类 actor 的共同 fence 与真实 owner adapter
 
-实施进度：T4R实际Generic恢复隔离已在`ea2e6df`通过Foundation+durable合批391项及限定独立审查，原跨decision副作用已关闭。当前T4B开发真实Unix broker/client、broker持有typed effect寿命、独立持久operation及一个真实initial-intent写入adapter；这不是完整四actor、平台旧binary资源撤权、生产认证或52Unit迁移完成。保留以下整体验收要求。
+实施进度：T4R实际Generic恢复隔离已在`ea2e6df`通过限定独立审查，原跨decision副作用已关闭。T4B已交付真实Unix broker/client、broker持有typed effect寿命、独立持久operation与worker完成证明、一个真实initial-intent写入adapter（`31d834c`、修正`c607730`）；修正后20项行为测试（含6个真实进程父测试）、目标Clippy与限定复核通过。未改旧模块保留此前407项邻域证据；不是完整四actor、平台旧binary资源撤权、生产认证或52Unit迁移完成。保留以下整体验收要求，不重派已闭合T4R/T4B。
 
 实际seam补充（f87e2b8核查）：phase_scheduler仅纯proposal，dedicated_transport仅terminal查询，不可把包装它们算作实际创建/发送覆盖。generic dispatch内部`reconcile_all_pending`跨Unit，因此本任务还需在`src/durable_delivery/coordinator.rs`提供精确作用范围的恢复入口，保留原审计链顺序；不能用单Unit许可包住全局恢复。finalizer的准备/冲突/错误记录也有写入，需一并覆盖。monitor启动reconciliation可发送，超时review worker可继续运行，gate必须早于这些启动/手工路径，abort/join外层任务不构成排空。下述文件ownership据此扩展到coordinator的精确恢复seam，除此不做无关重构。
 

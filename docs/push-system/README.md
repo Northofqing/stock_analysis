@@ -5,7 +5,7 @@
 ## 当前开发入口（2026-09-08）
 
 - [W15 实施结果](implementation-w15-results-2026-09-07.md) §10–12：依赖候选合同、实际 occurrence 读取和采集事务适配器已通过限定验证/审查，完整来源认证、运行查询及调度联结尚未完成。
-- [W16 实施结果](implementation-w16-results-2026-09-08.md)：完整读取、内部CAS/日配额、原始准入投影、Unix/制品FD与日历观察、部署候选集合，以及实际Generic恢复隔离均已通过各自限定审查。恢复隔离源码`ea2e6df`，最新Foundation+durable合批391项通过、2个父测试执行helper，目标Clippy零诊断。当前开发跨进程broker/执行寿命与真实intent写入adapter；生产身份/受保护根、完整四actor共同fence、实际切换及全Unit消费仍按[实施计划](../superpowers/plans/2026-09-08-push-foundation-w16-activation.md)交付，不能按基础切片标W16完成。
+- [W16 实施结果](implementation-w16-results-2026-09-08.md)：完整读取、内部CAS/日配额、原始准入投影、Unix/制品FD与日历观察、部署候选集合、实际Generic恢复隔离，以及跨进程broker/真实initial-intent写入均已通过各自限定审查。broker源码`31d834c`、确认窗口修正`c607730`，修正后20项通过（含6个真实进程父测试）、目标Clippy零诊断；未改旧模块保留此前407项邻域证据。生产身份/受保护根、完整四actor共同fence、实际切换及全Unit消费仍按[实施计划](../superpowers/plans/2026-09-08-push-foundation-w16-activation.md)交付，不能按基础切片标W16完成。
 - [W16 合同裁决](activation-contract-decisions-2026-09-08.md)：澄清 shadow actor 与旧推送关系，固定外部批准包、同事务写入和paused确认顺序；真实监督器及恢复接线仍需实现证明，不是生产批准。
 - [全 Unit 部署集合合同](activation-deployment-set-contract-2026-09-08.md)：全52Unit候选集合构造、真实读取、重读漂移和范围投影已实现至`e0cdd0d`，11项专项及最终golden1项通过，限定复核关闭排序缺陷。后续snapshot/material v3、stream v2消费与实际认证仍未交付，详见[实施结果](implementation-w16-results-2026-09-08.md)。
 

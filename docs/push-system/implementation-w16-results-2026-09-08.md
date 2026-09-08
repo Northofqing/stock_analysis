@@ -107,6 +107,31 @@ Clippy session60834 exit0、1m22s；完整JSON流在pipefail下汇总，build-fi
 
 这是恢复副作用隔离，不是activation认证、broker排空、真实owner撤权或整个W16完成。未改冻结SQL、旧canonical、monitor启动路径和生产配置，未操作生产monitor/真实DB/provider/sink/PAM。
 
+## 已完成限定实现：跨进程 broker 与真实初始 intent 写入
+
+T4B源码`31d834c`、确认窗口修正`c607730`，原始BASE`5df44c1`，修正BASE`31d834c`；本片通过实际测试、目标静态检查及独立限定复核，不等于生产保护已生效。新增真实Unix请求/查询协议、broker持有的执行worker、独立持久operation记录，并调用既有`BusinessIntentStore::record_initial`事务和精确结果查回。客户端断连/超时不释放执行责任；重启默认关闭，原代未决操作保留。测试材料仅限临时Test数据库，生产构造仍拒绝。
+
+验证记录：30823因测试错误引用未直接依赖的`libc`而编译失败，0项测试；已改用既有Unix内核身份观察。3690编译2m53s后得到1 passed / 12 failed / 1 helper ignored，测试4.33s，多项失败集中于控制库初始化。58079精确诊断测试在0.28s内失败，明确是`bootstrap_pragmas_and_schema`返回SQLite `DatabaseBusy`（`database is locked`），不是后续身份比对失败；该轮编译1m30s。
+
+修复采用同目录持久`<control-name>.broker.lock`承载broker独占FD，SQLite文件保留自身事务锁和FULL/DELETE语义；锁文件绑定数据库canonical path/device/inode，不自动删除重建。代价是每个控制库多一个必须受保护的持久文件。53043首次初始化专项通过，实际SQLite事务与独立owner锁同时工作；复制/改名/复用epoch、路径别名和双broker竞争反例随后也通过。
+
+12478初始化修复后为8 passed / 7 failed / 1 helper ignored，暴露初始查回错误要求一条transition。既有W08初始插入只有1条intent、version和lease_generation均为0、transition为空；错误断言的0/1是transition数量，前面的intent=1已通过。现已保留原事务和冻结SQL，改为校验完整不可变intent与既有chain，再返回`initial_intent_sha256`；不伪造初始event或提高业务version。
+
+- 1599：`env CARGO_PROFILE_TEST_INCREMENTAL=true cargo test --lib -- --test-threads=1 push_foundation::activation_fence_tests:: push_foundation::activation_fence_process_tests::`，exit0，**16 passed / 0 failed / 1 helper ignored**，5.66s，编译1m40s。12项同进程测试与4项真实父进程测试全部执行；辅助child由父测试显式启动。
+- 90363：`env CARGO_PROFILE_TEST_INCREMENTAL=true cargo test --lib -- --test-threads=1 durable_delivery:: push_foundation::`，exit0，**407 passed / 0 failed / 3 helper ignored**，83.91s，缓存编译1.83s。三个helper均由父测试执行；43项既有warning，不称全仓零告警。
+- 真实进程反例覆盖：客户端死亡后worker继续、quiesce阻止新请求但不提前排空、broker死亡后新代默认关闭并保留旧未决、第二broker不能取得同一控制库、业务提交确认丢失不重复执行。原W08事务与lease/version相邻语义保留。
+- 七个精确Rust路径格式和diff检查通过。Clippy27598 exit0、1m45s，完整JSON成功；164项有位置warning中163项既有，新增1项为控制库行类型过复杂，与确认窗口同文件修复。
+
+首轮独立审查`5df44c1..31d834c`要求修复最终结果UPDATE已提交、精确查回失败只保留内存blocked的窗口；原407项通过未覆盖该窗口。`c607730`现已持久区分结果与worker完成证明：真实effect结束且精确读回结果后才构造私有、不可Clone的证明。独立控制库`effect_worker_completions`保存`ActivationEffectWorkerCompletion/v1`，绑定operation ID、完整request摘要、原epoch及精确结果，并禁止UPDATE/DELETE；query、未决计数、重启均要求证明与结果完整匹配。缺证明结果重启仍未决，证明损坏拒绝启动。证明记录发布前已完成的事实，其自身写入ack丢失通过精确重查解决，不重新执行effect、不循环补造确认。
+
+- 修正后55372：同一两个fence模块命令exit0，**20 passed / 0 failed / 1 helper ignored**，6.87s，编译3m00s，43项既有warning。14项同进程与6项真实父进程测试通过；新增反例先断言最终UPDATE真的持久写了Succeeded且证明为0，再实际kill/wait broker并重启，原请求始终未决、不排空、不重复创建intent。正常已确认结果及证明写ack丢失也分别验证真实重启后精确成功。
+- 最终Clippy25879 exit0，2m33s，完整JSON `build-finished success=true`、目标诊断空，163项有位置warning均为既有基线。四个修正文件格式及diff检查通过。
+- 固定修正`31d834c..c607730`独立限定复核：Important与同文件Minor均**ADDRESSED**，无新增Critical/Important/Minor、无范围外遗留；本片审查收口。未改业务事务、intent_store、旧相邻模块，沿用90363对应的相邻证据，未将它冒称修正后又跑了一次全Foundation。
+
+额外存储成本为每个控制库一个持久锁文件，以及每个已确认operation一条不可变完成证明。它们只约束本片受保护控制库中的协作broker，不证明生产目录ACL、旧binary资源撤权或来源真实性。
+
+这里只交付initial-intent adapter和broker寿命控制；生产ACL、旧binary直达资源撤权、完整四actor和52Unit映射仍未交付。
+
 ## 完整剩余范围
 
 ### T4 实际接线核查（证据基线 f87e2b8，尚无执行实现）
