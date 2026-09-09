@@ -279,6 +279,52 @@ class ArchitectureDocsBuildTest < Minitest::Test
     end
   end
 
+  def test_source_template_asset_and_output_parent_symlinks_are_rejected_without_writes
+    with_fixture do |root, _markdown|
+      directory = File.join(root, 'docs/push-system')
+      saved = replace_directory_with_symlink(directory)
+
+      # The source and frozen-input manifest share this parent. The manifest is
+      # checked first, so its rejection proves traversal stopped before source
+      # or output processing and no output was created through the link.
+      assert_cli_failure(root, 'manifest_path_invalid', 'rfc', '--draft')
+      refute File.exist?(File.join(saved, 'push-system-implementation-rfc.html'))
+    end
+
+    with_fixture do |root, _markdown|
+      assert_successful_build(root)
+      directory = File.join(root, 'docs/push-system')
+      saved = replace_directory_with_symlink(directory)
+      output = File.join(saved, 'push-system-implementation-rfc.html')
+      before = [File.binread(output), File.mtime(output)]
+
+      # Output has the same fixed parent as the source and manifest. A second
+      # formal CLI case verifies an existing output is not touched.
+      assert_cli_failure(root, 'manifest_path_invalid', 'rfc', '--draft')
+      assert_equal before, [File.binread(output), File.mtime(output)]
+    end
+
+    with_fixture do |root, _markdown|
+      assert_successful_build(root)
+      output = output_path(root)
+      before = [File.binread(output), File.mtime(output)]
+      replace_directory_with_symlink(File.join(root, 'scripts/architecture-docs/templates'))
+
+      assert_cli_failure(root, 'html_template_path_invalid', 'rfc', '--draft')
+      assert_equal before, [File.binread(output), File.mtime(output)]
+    end
+
+    with_fixture do |root, _markdown|
+      assert_successful_build(root)
+      output = output_path(root)
+      before = [File.binread(output), File.mtime(output)]
+      replace_directory_with_symlink(File.join(root, 'scripts/architecture-docs/assets'))
+
+      assert_cli_failure(root, 'mermaid_manifest_path_invalid', 'rfc', '--draft')
+      assert_equal before, [File.binread(output), File.mtime(output)]
+    end
+  end
+
   def test_output_rejects_symlinks_hardlinks_and_non_files_without_touching_targets
     with_fixture do |root, _markdown|
       target = File.join(root, 'unrelated')
@@ -358,6 +404,36 @@ class ArchitectureDocsBuildTest < Minitest::Test
       assert_includes rendered, '&lt;div onclick=&quot;bad()&quot;&gt;raw&lt;/div&gt;'
       assert_includes rendered, '~~unsupported stays visible~~'
       refute_includes rendered, 'specification comment must not render'
+    end
+  end
+
+  def test_inline_code_protects_comment_markers_and_unclosed_comments_stay_literal
+    markdown = <<~'MARKDOWN'
+      # Comment and code boundaries
+
+      before `<!--` after
+      next line
+
+      cross `left <!--
+      right` done
+
+      double ``one ` <!-- two`` after
+
+      visible <!-- closed comment --> suffix
+
+      unclosed <!-- literal marker
+      following line remains
+    MARKDOWN
+    with_fixture(markdown: markdown) do |root, _source|
+      assert_successful_build(root)
+      rendered = document_body(File.binread(output_path(root)).force_encoding(Encoding::UTF_8))
+
+      assert_includes rendered, "before <code>&lt;!--</code> after\nnext line"
+      assert_includes rendered, "cross <code>left &lt;!--\nright</code> done"
+      assert_includes rendered, 'double <code>one ` &lt;!-- two</code> after'
+      assert_includes rendered, 'visible  suffix'
+      refute_includes rendered, 'closed comment'
+      assert_includes rendered, "unclosed &lt;!-- literal marker\nfollowing line remains"
     end
   end
 
@@ -466,6 +542,14 @@ class ArchitectureDocsBuildTest < Minitest::Test
       assert_includes html, '<style>'
       assert_includes html, '<script>'
       assert_includes html, 'mermaid.initialize'
+      assert_includes html, "secure: ['secure', 'securityLevel', 'startOnLoad', 'maxTextSize', 'suppressErrorRendering', 'maxEdges', 'htmlLabels', 'flowchart']"
+      assert_includes html, "source.replace(/\\bxlink:href\\s*=/gi, 'href=')"
+      assert_includes html, "new DOMParser().parseFromString(normalized, 'image/svg+xml')"
+      assert_includes html, "querySelectorAll('script,img,image,foreignObject,iframe,object,embed')"
+      assert_includes html, "querySelectorAll('a').forEach(anchor => anchor.replaceWith"
+      assert_includes html, "['href', 'xlink:href', 'src', 'target'].includes(name)"
+      assert_operator html.index('const safeSvg = sanitizeMermaidSvg(rendered.svg)'), :<,
+                      html.index('target.innerHTML = safeSvg')
       assert_includes html, '@media print'
       assert_includes html, 'beforeprint'
       assert_includes html, 'requestFullscreen'
@@ -633,6 +717,13 @@ class ArchitectureDocsBuildTest < Minitest::Test
     return article[1] if article
 
     html.match(%r{<body>(.*?)<span>}m)[1]
+  end
+
+  def replace_directory_with_symlink(directory)
+    saved = directory + '.saved'
+    File.rename(directory, saved)
+    File.symlink(saved, directory)
+    saved
   end
 
   def asset_path(root, name)

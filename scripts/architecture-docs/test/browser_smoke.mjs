@@ -198,6 +198,18 @@ async function checkDiagrams(cdp, sessionId, url) {
     const figures = Array.from(document.querySelectorAll('.diagram'));
     const rendered = figures.filter(figure => figure.dataset.diagramState === 'rendered');
     const failed = figures.filter(figure => figure.dataset.diagramState === 'error');
+    const malicious = figures.find(figure => figure.querySelector('.mermaid-source code')?.textContent.includes('MALICIOUS_MERMAID_PROBE'));
+    const maliciousRender = malicious?.querySelector('.mermaid-render');
+    const executableNodes = maliciousRender?.querySelectorAll('script,img,image,foreignObject,iframe,object,embed').length ?? -1;
+    const unsafeAttributes = maliciousRender ? Array.from(maliciousRender.querySelectorAll('*')).flatMap(element => {
+      return Array.from(element.attributes).filter(attribute => {
+        const name = attribute.name.toLowerCase();
+        if (name.startsWith('on')) return true;
+        if (!['href', 'src', 'xlink:href'].includes(name)) return false;
+        const value = attribute.value.trim().toLowerCase();
+        return ['http:', 'https:', 'javascript:', 'data:text/html'].some(prefix => value.startsWith(prefix));
+      }).map(attribute => attribute.name + '=' + attribute.value);
+    }) : ['malicious-diagram-missing'];
     const sourcePreserved = figures.every(figure => figure.querySelector('.mermaid-source code')?.textContent.trim().length > 0);
     const sourceVisible = figures.every(figure => getComputedStyle(figure.querySelector('.mermaid-source')).display !== 'none');
     const svgCount = rendered.filter(figure => figure.querySelector('.mermaid-render svg')).length;
@@ -207,14 +219,51 @@ async function checkDiagrams(cdp, sessionId, url) {
     zoomFigure?.querySelector('[data-diagram-zoom="in"]').click();
     const afterZoom = zoomFigure?.style.getPropertyValue('--diagram-scale');
     const fullscreenControls = figures.filter(figure => figure.querySelector('[data-diagram-fullscreen]')).length;
-    return { total: figures.length, rendered: rendered.length, failed: failed.length, sourcePreserved, sourceVisible, svgCount, readableFailure, beforeZoom, afterZoom, fullscreenControls };
+    return {
+      total: figures.length,
+      rendered: rendered.length,
+      failed: failed.length,
+      sourcePreserved,
+      sourceVisible,
+      svgCount,
+      readableFailure,
+      beforeZoom,
+      afterZoom,
+      fullscreenControls,
+      maliciousRendered: malicious?.dataset.diagramState === 'rendered' && Boolean(maliciousRender?.querySelector('svg')),
+      executableNodes,
+      unsafeAttributes
+    };
   })()`);
-  assert(diagrams.total >= 4, 'diagram_fixture_incomplete');
-  assert(diagrams.rendered >= 3 && diagrams.svgCount === diagrams.rendered, 'diagram_svg_render_failed');
+  assert(diagrams.total >= 5, 'diagram_fixture_incomplete');
+  assert(diagrams.rendered >= 4 && diagrams.svgCount === diagrams.rendered, 'diagram_svg_render_failed');
   assert(diagrams.failed >= 1 && diagrams.readableFailure, 'diagram_failure_fallback_invalid');
   assert(diagrams.sourcePreserved && diagrams.sourceVisible, 'diagram_source_not_preserved');
   assert(diagrams.beforeZoom !== diagrams.afterZoom, 'diagram_zoom_failed');
   assert(diagrams.fullscreenControls === diagrams.total, 'diagram_fullscreen_control_missing');
+  assert(diagrams.maliciousRendered, 'malicious_mermaid_render_failed');
+  assert(diagrams.executableNodes === 0, 'malicious_mermaid_executable_node_created');
+  assert(diagrams.unsafeAttributes.length === 0, `malicious_mermaid_unsafe_attributes=${JSON.stringify(diagrams.unsafeAttributes)}`);
+
+  const maliciousClick = await evaluate(cdp, sessionId, `(async () => {
+    const figure = Array.from(document.querySelectorAll('.diagram')).find(item => item.querySelector('.mermaid-source code')?.textContent.includes('MALICIOUS_MERMAID_PROBE'));
+    const nodes = Array.from(figure?.querySelectorAll('.mermaid-render g.node') || []).filter(node => {
+      const text = node.textContent.toLocaleLowerCase();
+      return text.includes('callback probe') || text.includes('link probe');
+    });
+    nodes.forEach(node => node.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window })));
+    await new Promise(resolve => setTimeout(resolve, 200));
+    return {
+      clickedNodes: nodes.length,
+      callbackExecuted: globalThis.mermaidClickExecuted === true,
+      htmlExecuted: globalThis.mermaidHtmlExecuted === true,
+      location: location.href
+    };
+  })()`, { userGesture: true });
+  assert(maliciousClick.clickedNodes >= 2, 'malicious_mermaid_probe_nodes_missing');
+  assert(!maliciousClick.callbackExecuted, 'malicious_mermaid_callback_executed');
+  assert(!maliciousClick.htmlExecuted, 'malicious_mermaid_html_executed');
+  assert(maliciousClick.location === url, 'malicious_mermaid_navigation_occurred');
 
   const fullscreen = await evaluate(cdp, sessionId, `(async () => {
     const figure = Array.from(document.querySelectorAll('.diagram')).find(item => item.dataset.diagramState === 'rendered');
@@ -276,6 +325,13 @@ async function main() {
     await cdp.send('Network.setBlockedURLs', { urls: ['http://*', 'https://*'] }, sessionId);
 
     const rfc = await checkRfc(cdp, sessionId, options.rfc);
+    await cdp.send('Page.addScriptToEvaluateOnNewDocument', {
+      source: `
+        globalThis.mermaidClickExecuted = false;
+        globalThis.mermaidHtmlExecuted = false;
+        globalThis.mermaidClickProbe = () => { globalThis.mermaidClickExecuted = true; };
+      `
+    }, sessionId);
     const diagrams = await checkDiagrams(cdp, sessionId, options.diagram);
     assert(
       networkAttempts.length === 0,

@@ -60,39 +60,54 @@ module ArchitectureDocs
       def visible_lines(markdown)
         lines = markdown.split("\n", -1).map { |line| line.end_with?("\r") ? line[0...-1] : line }
         in_fence = false
-        in_comment = false
-        lines.map do |line|
+        visible = []
+        prose = []
+        lines.each do |line|
           if line.match?(/\A\s*```/)
+            visible.concat(strip_closed_comments(prose))
+            prose = []
             in_fence = !in_fence
-            next line
+            visible << line
+          elsif in_fence
+            visible << line
+          else
+            prose << line
           end
-          next line if in_fence
-
-          visible = +''
-          cursor = 0
-          loop do
-            if in_comment
-              closing = line.index('-->', cursor)
-              if closing
-                in_comment = false
-                cursor = closing + 3
-              else
-                break
-              end
-            else
-              opening = line.index('<!--', cursor)
-              if opening
-                visible << line[cursor...opening]
-                in_comment = true
-                cursor = opening + 4
-              else
-                visible << line[cursor..-1].to_s
-                break
-              end
-            end
-          end
-          visible.rstrip
         end
+        visible.concat(strip_closed_comments(prose))
+        visible
+      end
+
+      def strip_closed_comments(lines)
+        text = lines.join("\n")
+        output = +''
+        code_ticks = nil
+        index = 0
+        while index < text.length
+          if text[index] == '`'
+            run = text[index..-1][/\A`+/].length
+            if code_ticks == run
+              code_ticks = nil
+            elsif code_ticks.nil?
+              code_ticks = run
+            end
+            output << ('`' * run)
+            index += run
+          elsif code_ticks.nil? && text[index, 4] == '<!--'
+            closing = text.index('-->', index + 4)
+            unless closing
+              output << text[index..-1]
+              break
+            else
+              output << text[index..(closing + 2)].scan("\n").join
+              index = closing + 3
+            end
+          else
+            output << text[index]
+            index += 1
+          end
+        end
+        output.split("\n", -1)
       end
 
       def fence_start(line)

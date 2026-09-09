@@ -148,12 +148,35 @@
       searchStatus.textContent = query ? `${matches} 个标题` : '';
     });
 
+    const sanitizeMermaidSvg = source => {
+      // Mermaid emits xlink:href without an xmlns:xlink declaration for link
+      // directives. Normalize the inert string before XML parsing; href is
+      // removed below before the SVG can enter the live document.
+      const normalized = source.replace(/\bxlink:href\s*=/gi, 'href=');
+      const parsed = new DOMParser().parseFromString(normalized, 'image/svg+xml');
+      if (parsed.querySelector('parsererror') || parsed.documentElement.localName !== 'svg') {
+        throw new Error('invalid Mermaid SVG');
+      }
+      parsed.querySelectorAll('script,img,image,foreignObject,iframe,object,embed').forEach(node => node.remove());
+      parsed.querySelectorAll('a').forEach(anchor => anchor.replaceWith(...Array.from(anchor.childNodes)));
+      parsed.querySelectorAll('*').forEach(element => {
+        Array.from(element.attributes).forEach(attribute => {
+          const name = attribute.name.toLowerCase();
+          if (name.startsWith('on') || ['href', 'xlink:href', 'src', 'target'].includes(name)) {
+            element.removeAttribute(attribute.name);
+          }
+        });
+      });
+      return new XMLSerializer().serializeToString(parsed.documentElement);
+    };
+
     const renderDiagrams = async () => {
       const figures = Array.from(document.querySelectorAll('.diagram'));
       if (figures.length === 0) return;
       mermaid.initialize({
         startOnLoad: false,
         securityLevel: 'strict',
+        secure: ['secure', 'securityLevel', 'startOnLoad', 'maxTextSize', 'suppressErrorRendering', 'maxEdges', 'htmlLabels', 'flowchart'],
         htmlLabels: false,
         flowchart: { htmlLabels: false },
         sequence: { useMaxWidth: true }
@@ -163,7 +186,8 @@
         const target = figure.querySelector('.mermaid-render');
         try {
           const rendered = await mermaid.render(`offline-mermaid-${index + 1}`, source);
-          target.innerHTML = rendered.svg;
+          const safeSvg = sanitizeMermaidSvg(rendered.svg);
+          target.innerHTML = safeSvg;
           figure.dataset.diagramState = 'rendered';
         } catch (_error) {
           target.textContent = '图表渲染失败；原始图源保留如下。';
