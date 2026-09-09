@@ -77,12 +77,16 @@ module ArchitectureDocs
       end
       entry = manifest['evidence'].find { |evidence| evidence['id'] == catalog['enum_evidence_id'] }
       if entry && entry['kind'] == 'rust_enum' && (safe = SourceCatalog.safe_path(root, entry['path'])) && File.file?(safe)
-        source = current_sources[entry['path']] ||= File.binread(safe)
-        view = current_views[entry['path']] ||= RustEvidence.view(source)
-        item = view.locate(entry['symbol'], entry['kind'])
-        actual = RustEvidence.enum_variants(item)
-        expected = catalog['kinds'].map { |kind| kind['kind'] }
-        errors << 'enum_coverage_mismatch' unless actual.sort == expected.sort && actual.uniq == actual
+        begin
+          source = current_sources[entry['path']] ||= File.binread(safe)
+          view = current_views[entry['path']] ||= RustEvidence.view(source)
+          item = view.locate(entry['symbol'], entry['kind'])
+          actual = RustEvidence.enum_variants(item)
+          expected = catalog['kinds'].map { |kind| kind['kind'] }
+          errors << 'enum_coverage_mismatch' unless actual.sort == expected.sort && actual.uniq == actual
+        rescue RustEvidence::Invalid => error
+          errors << "#{error.message} id=#{entry['id']}"
+        end
       else
         errors << 'enum_evidence_missing'
       end

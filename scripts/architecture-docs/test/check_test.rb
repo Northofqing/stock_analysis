@@ -81,6 +81,35 @@ class DocumentCheckTest < Minitest::Test
     end
   end
 
+  def test_broken_enum_keeps_stable_id_and_independent_strict_errors
+    DocumentCheckFixture.with_fixture do |root|
+      catalog = read_json(root, 'docs/push-system/push-capability-catalog.v1.json')
+      manifest = read_json(root, 'docs/push-system/push-evidence-manifest.v1.json')
+      entry = manifest['evidence'].find { |item| item['id'] == catalog['enum_evidence_id'] }
+      source = File.join(root, entry.fetch('path'))
+      before = File.binread(source)
+      after = before.sub('pub enum PushKind'.b, 'pub struct PushKind'.b)
+      refute_equal before, after
+      File.binwrite(source, after)
+
+      rfc = File.join(root, 'docs/push-system/push-system-implementation-rfc.md')
+      rfc_before = File.binread(rfc)
+      rfc_after = rfc_before.sub('"counts": {"kinds": 65'.b, '"counts": {"kinds": 64'.b)
+      refute_equal rfc_before, rfc_after
+      File.binwrite(rfc, rfc_after)
+
+      out, err, status = run_check(root, '--check')
+      assert_equal 1, status.exitstatus, out + err
+      assert_includes out, "symbol_missing symbol=PushKind id=#{entry.fetch('id')}"
+      refute_includes out.lines.map(&:strip), 'symbol_missing symbol=PushKind'
+      assert_includes out, 'worktree_dirty'
+      assert_includes out, 'rfc_counts_invalid'
+      assert_includes out, 'html_stale target=rfc'
+      refute_includes out + err, 'Traceback'
+      assert_empty err
+    end
+  end
+
   def test_wbs_requires_all_foundation_rows
     DocumentCheckFixture.with_fixture do |root|
       wbs = read_json(root, 'docs/push-system/push-system-wbs.v1.json')
@@ -230,7 +259,7 @@ class DocumentCheckTest < Minitest::Test
   end
 
   def test_cli_requires_exactly_one_mode_and_rejects_nonliteral_options
-    [%w[], %w[--unknown], %w[--dra], %w[--draft --check], %w[--check --check],
+    [%w[], %w[--unknown], %w[--dra], %w[-h], %w[--draft --check], %w[--check --check],
      %w[--draft --root one --root two], %w[--draft extra], %w[--help --draft]].each do |arguments|
       out, err, status = Open3.capture3(RbConfig.ruby, CLI, *arguments)
 
@@ -239,12 +268,22 @@ class DocumentCheckTest < Minitest::Test
       assert_includes err, 'Usage: check.rb'
     end
 
-    [%w[--help], %w[-h]].each do |arguments|
+    [%w[--help]].each do |arguments|
       out, err, status = Open3.capture3(RbConfig.ruby, CLI, *arguments)
 
       assert_equal 0, status.exitstatus, out + err
       assert_includes out, 'Usage: check.rb'
       assert_empty err
+    end
+  end
+
+  def test_root_rejects_missing_and_option_shaped_values
+    [%w[--draft --root], %w[--draft --root --check], %w[--draft --root --help]].each do |arguments|
+      out, err, status = Open3.capture3(RbConfig.ruby, CLI, *arguments)
+
+      assert_equal 2, status.exitstatus, "#{arguments.inspect}: #{out}#{err}"
+      assert_empty out
+      assert_includes err, 'Usage: check.rb'
     end
   end
 

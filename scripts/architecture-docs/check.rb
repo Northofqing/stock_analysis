@@ -19,7 +19,7 @@ def usage_error
   exit 2
 end
 
-if ARGV == ['--help'] || ARGV == ['-h']
+if ARGV == ['--help']
   puts USAGE
   exit 0
 end
@@ -34,7 +34,7 @@ until arguments.empty?
     usage_error if mode
     mode = argument == '--draft' ? :draft : :check
   when '--root'
-    usage_error if root_argument || arguments.empty?
+    usage_error if root_argument || arguments.empty? || arguments.first.start_with?('-')
     root_argument = arguments.shift
   else
     usage_error
