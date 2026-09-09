@@ -1,6 +1,6 @@
 # 当前架构蓝图与第二离线HTML目标
 
-日期：2026-09-09。状态：Task1继续编写；前置[强制当前源码审计](2026-09-09-current-source-audit.md)Task2已在047b4ab修复Unit摘要并通过真实树与独立审查，来源SHA采用该最终版本。额外七份已跟踪设计资料也已实际读完，九份固定source catalog身份不扩张。当前蓝图及第二HTML尚未验收，候选分析不替代机器目录。
+日期：2026-09-09；更新：2026-09-10。状态：Task1已在c1e24d0完成，独立Spec/Quality Approved、C0/I0/M1；18节完整蓝图、65/102/52精确投影、来源与链接验收通过。M1及父线发现的一处链接显示问题交Task2批内收口，第二HTML尚未实现。前置[强制当前源码审计](2026-09-09-current-source-audit.md)最终身份采用047b4ab；九份固定来源与七份额外Git资料分域不变。当前状态见[实施记录](../../push-system/implementation-current-blueprint-2026-09-10.md)。
 
 目标：落实原文档硬化计划的当前蓝图、两份HTML、兼容入口和统一新鲜度门禁。保留八份冻结输入和九份设计来源的原字节，以新路径记录真实当前架构；当前事实、代码已实现但未生产接线、未来RFC合同和历史材料分开。
 
@@ -44,6 +44,8 @@ Task1只按此格式写入实际最终材料；Task2再实现对应验证及正�
 ## Task 2: 第二target、兼容命令与实际离线验收
 
 修改 `scripts/architecture-docs/html_builder.rb`、`build.rb`、`check.rb`、`test/build_test.rb`、`test/check_test.rb`及 `browser_smoke.mjs`；只在真实fixture需要时扩展现有support helper，不复制整套HTML/校验实现。为避免每个来源字段反例都重复全项目验证，允许把现有`test/catalog_test.rb`中的最小真实Git/current构造机械抽取为唯一`test/support/catalog_fixture.rb`供原测试与新HTML测试复用；不改其合同，不mock正式Catalog，以相关fixture/B→C/current反例定向复验，完整项目fixture及实际树验收仍保留。新增 `scripts/render-architecture-blueprint-html.rb` 薄兼容命令及新蓝图HTML，必要时重生成既有RFC HTML以匹配新的实现fingerprint。原模板/renderer/资产非必要不改。
+
+批内承接Task1两处小修：当前新MD的v19.1行将“五交易日完整验证闭环”改为“原设计的5日收益验证闭环”（原文没有定义交易日口径）；旧A.1覆盖行的链接标签去掉src/lib.rs两侧反引号，保留原文件及#L1833目标，使既有renderer生成真实链接。只改这两处新MD内容，不修改冻结来源、不扩展通用inline parser；Task2报告记录新MD SHA，并在实际HTML中验证A.1链接存在。Task1的ab3422d2摘要仅是本Task开始前版本，不能沿用为修改后的HTML源字节证明。
 
 1. 以封闭的 `rfc` / `blueprint` 目标表替代builder内硬编码source/output。保持 `HtmlBuilder.build(root,target,check:)`、`check(root,target)` 公共接口；所有metadata、错误target和路径检查取自同一目标定义。未知target失败，不增加任意路径或插件入口。
 2. RFC前置继续冻结输入检查；blueprint生成/检查在任何输出写入前必须调用正式 `Catalog.validate(root, strict: false)` 的强制历史/current校验，并校验蓝图声明的current来源身份/原字节SHA与实际材料一致。不得解析 `.planning` 候选JSON来替代正式目录，也不得接受正文声明旧pin而current JSON已演进的陈旧蓝图。

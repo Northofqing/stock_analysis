@@ -1,6 +1,6 @@
 # 旧库升级与恢复审计接续：实施记录
 
-日期：2026-09-08；更新：2026-09-09。状态：本批迁移修复完成，67项测试、静态检查及独立规格/质量审查通过。隔离分支基线 `1868b3f`，源码提交 `77cc3bc568f8502ea9a06a7e03439b1a2eb65b3d`；以下测试针对自有 TEST_CODE 数据库，没有迁移生产数据库或操作生产 monitor。
+日期：2026-09-08；更新：2026-09-10。状态：本批迁移修复完成，67项测试、静态检查及独立规格/质量审查通过。隔离分支基线 `1868b3f`，源码提交 `77cc3bc568f8502ea9a06a7e03439b1a2eb65b3d`；以下测试针对自有 TEST_CODE 数据库，没有迁移生产数据库或操作生产 monitor。
 
 ## 发现与证据
 
@@ -45,5 +45,19 @@
 **已经被旧迁移重排的 v5–v9 库仍需独立兼容处理**：完整单链可从原前驱关系推导逻辑尾；多个独立合法链段缺少原始追加顺序时，不能凭当前版本、hash、timestamp或任意rowid恢复权威。该问题仍属于完整目标，未用本批未来升级修复替代。
 
 2026-09-09只读预检补充：不能用“已有多段照常封口，后续新增审计一律拒绝”作为完整兼容方案。[W16正例](../../src/durable_delivery/tests.rs#L9524)要求global恢复最终到RejectedDurable，而[恢复最终化](../../src/durable_delivery/coordinator.rs#L5772)经[transition_for_reconcile](../../src/durable_delivery/coordinator.rs#L6145)仍到[record_state_transition](../../src/durable_delivery/coordinator.rs#L8450)，需要新增DecisionStateChanged审计；在enqueue处统一拒绝多段会破坏该正例。这个预检建议已撤回，未实现到代码。后续必须同时解决不猜旧重排顺序、合法多段完整恢复与可信顺序/迁移来源；当前尚无已验证兼容方案，不以较容易通过的拒绝行为替代完整目标。以上为源码路径核对，未运行测试、开库或验证生产备份。
+
+### 追加存储能提供的顺序证据
+
+2026-09-10进一步只读核对了当前 append 实现及直接消费者，源码仍为 `aef7972965f610ed418049593dfff1d55341772e`，未读取实际审计文件或生产数据库。这不是旧 v5–v9 兼容修复或运行验收。
+
+| 证据层 | 当前代码能保证什么 | 尚不能据此推导什么 |
+| --- | --- | --- |
+| 存储记录 | [StoredAppendRecord](../../src/event/durable_delivery_append.rs#L176)保存 kind、identity、canonical 字节/摘要、previous_hash 和 record_hash；[追加路径](../../src/event/durable_delivery_append.rs#L389)从全局尾计算新记录 | 没有独立 decision/ordinal 字段；全局物理链不能直接当每 decision 的业务前驱链 |
+| 具体 append 实现 | [共同收尾](../../src/event/durable_delivery_append.rs#L451)同步文件/目录、复核绑定并读回目标；[逐行检查](../../src/event/durable_delivery_append.rs#L546)核对当前文件的链、唯一 identity 与摘要 | 校验现存文件自洽不等于证明历史未被完整截尾或重写；SHA-256 链本身不是外部认证的历史完整性证明 |
+| Port 与 DB 引用 | [ImmutableAppendPort](../../src/durable_delivery/model.rs#L1596)只返回 String；[coordinator](../../src/durable_delivery/coordinator.rs#L5686)只要求非空并 CAS 写入；[落库校验](../../src/durable_delivery/coordinator.rs#L9207)检查状态/非空引用一致性 | 数据库里一段非空文本本身不证明记录确实存在、顺序正确或已被该具体实现读回；不能将接口返回类型误称为顺序 receipt |
+| 引用和 decision 关联 | [audit_ref](../../src/event/durable_delivery_append.rs#L1147)是 record hash 的字符串引用；[enqueue_audit](../../src/durable_delivery/coordinator.rs#L8596)的 audit identity 纳入 decision、attempt、kind 和 canonical hash | 当前接口没有执行 append 记录与 outbox 的联合顺序验证；即使未来逐项核对这些字段，也不自动证明全部历史记录完整 |
+| 读取接口 | [生产私有扫描](../../src/event/durable_delivery_append.rs#L546)仅返回 tail 与目标记录；[枚举 helper](../../src/event/durable_delivery_append.rs#L1086)仅 cfg(test) | 当前公开 Port/恢复消费者没有读取、枚举并消费经验证全局顺序的能力；不是“底层完全不能读文件” |
+
+下一步兼容设计必须区分现存链自洽、可信历史完整性、record 与 decision 的绑定、以及尚未 append 的 Pending 记录。完整可信的历史文件可能提供额外顺序依据，但本轮没有获得或验证此类外部材料；不能认定它们不存在，也不能仅靠现有非空引用恢复旧顺序。合法跨 decision 恢复及最终化新增审计的正向合同仍须保留。
 
 完整 W15/W16/W17/W19、52 Unit迁移及发布门禁、离线蓝图/HTML/checker/实际CI等继续按[当前证据入口](README.md)推进。实施顺序与限制见[本批计划](../superpowers/plans/2026-09-08-durable-audit-logical-tail.md)。
