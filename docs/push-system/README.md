@@ -4,6 +4,7 @@
 
 ## 当前开发入口（更新至2026-09-09）
 
+- [RFC 离线HTML构建](implementation-offline-rfc-html-2026-09-09.md)：最终源码ca1b581；23项测试/676条断言通过，独立限定复审Approved，原3项及段落边界回归均关闭。实际浏览器4图成功/1图回退、点击与注入阻断、全屏和页面0外部请求通过；[离线页面](push-system-implementation-rfc.html)已纳管。保留官方发行JS原字节及30条空白告警，不覆盖八份冻结输入，不代表双份HTML/统一checker/CI或当前证据目录已完成。
 - [旧库升级与恢复审计接续](implementation-durable-upgrade-2026-09-08.md)：源码77cc3bc；正式升级/提交、原rowid与数据保持、正确接续/终态、重复恢复/实例重开及坏FK完整回滚，最终67项合批、静态检查及独立规格/质量审查通过。已被旧迁移重排的v5–v9库保留独立兼容任务，不代表全部审计兼容或全项目完成。
 - [恢复分类不确定投递读取修复](implementation-recovered-uncertain-read-2026-09-08.md)：源码a2429b3、修复fb55d32/61e9d16；真实过期恢复贯通Generic/P01及SLA/指标。自环与跳链均实际RED后修复，最终55项/静态检查/限定复审通过；无盲重发或状态提升，不等于完整Q39/W19完成。
 - [CI 映射式触发识别修复](implementation-ci-mapping-trigger-2026-09-08.md)：源码80d0fb2；95项定向测试、614条断言通过，独立复审已关闭排除项取消全部正向匹配漏洞；识别当前真实CI触发格式，不改CI配置，也不代表HTML/统一checker/实际CI已交付。
