@@ -18,11 +18,29 @@ module ArchitectureDocs
     module_function
 
     def validate(root, strict: true)
+      errors = SourceCatalog.validate(root)
+      errors.concat(validate_pair(root, strict: strict, current: false))
+      errors.concat(validate_pair(root, strict: strict, current: true))
+      if strict
+        status, success = git(root, 'status', '--porcelain', '--untracked-files=all')
+        errors << 'git_status_failed' unless success
+        errors << 'worktree_dirty' unless status.empty?
+      end
+      errors.uniq
+    end
+
+    def validate_pair(root, strict:, current:)
+      pair = current ? 'current' : 'historical'
+      pair_errors(root, strict: strict, current: current).map { |error| "#{error} pair=#{pair}" }
+    end
+
+    def pair_errors(root, strict:, current:)
       root = File.realpath(File.expand_path(root))
       return ['push_root_invalid'] unless File.directory?(root)
-      errors = SourceCatalog.validate(root)
-      documents = [CATALOG_PATH, MANIFEST_PATH].map do |path|
-        safe = SourceCatalog.safe_path(root, path)
+      errors = []
+      paths = current ? [CurrentAudit::CATALOG_PATH, CurrentAudit::MANIFEST_PATH] : [CATALOG_PATH, MANIFEST_PATH]
+      documents = paths.map do |path|
+        safe = regular_path(root, path)
         unless safe
           errors << "push_path_invalid path=#{path}"
           next nil
@@ -43,13 +61,15 @@ module ArchitectureDocs
       end
       catalog, manifest = documents
       structure = schema_errors(catalog, manifest)
+      structure.concat(CurrentAudit.schema_errors(catalog, manifest)) if current && structure.empty?
       errors.concat(structure)
       return errors unless structure.empty?
-      errors.concat(reference_errors(catalog, manifest))
-      errors.concat(git_errors(root, catalog, manifest))
+      errors.concat(current ? CurrentAudit.reference_errors(root, catalog, manifest) : reference_errors(catalog, manifest))
+      errors.concat(git_errors(root, catalog, manifest, workspace: current))
+      return errors unless current
       current_sources = {}
       manifest['files'].each do |file|
-        safe = SourceCatalog.safe_path(root, file['path'])
+        safe = regular_path(root, file['path'])
         unless safe && File.file?(safe)
           errors << "file_path_invalid path=#{file['path']}"
           next
@@ -61,7 +81,7 @@ module ArchitectureDocs
       current_views = {}
       manifest['evidence'].each do |evidence|
         begin
-          safe = SourceCatalog.safe_path(root, evidence['path'])
+          safe = regular_path(root, evidence['path'])
           unless safe && File.file?(safe)
             errors << "evidence_path_invalid id=#{evidence['id']}"
             next
@@ -89,11 +109,6 @@ module ArchitectureDocs
         end
       else
         errors << 'enum_evidence_missing'
-      end
-      if strict
-        status, success = git(root, 'status', '--porcelain', '--untracked-files=all')
-        errors << 'git_status_failed' unless success
-        errors << 'worktree_dirty' unless status.empty?
       end
       errors.uniq
     rescue RustEvidence::Invalid => error
@@ -186,6 +201,15 @@ module ArchitectureDocs
         !value.include?('\\') && value.split('/').none? { |part| ['..', '.', ''].include?(part) }
     end
 
+    def regular_path(root, relative)
+      safe = SourceCatalog.safe_path(root, relative)
+      expected = File.join(root, relative)
+      return nil unless safe == expected && !File.symlink?(expected)
+      return nil if File.exist?(safe) && (!File.file?(safe) || File.stat(safe).nlink != 1)
+
+      safe
+    end
+
     def reference_errors(catalog, manifest)
       errors = []
       [['kind', catalog['kinds'], 'kind'], ['producer', catalog['producers'], 'id'],
@@ -247,7 +271,7 @@ module ArchitectureDocs
     end
 
     def git(root, *args)
-      out, _err, status = Open3.capture3('git', '-C', root, *args)
+      out, _err, status = Open3.capture3({ 'GIT_OPTIONAL_LOCKS' => '0' }, 'git', '-C', root, *args)
       [out, status.success?]
     end
 
@@ -353,7 +377,7 @@ module ArchitectureDocs
       parse_git_batch(objects, output.b)
     end
 
-    def git_errors(root, catalog, manifest)
+    def git_errors(root, catalog, manifest, workspace: true)
       errors = []
       baseline = manifest['baseline_commit']
       errors << 'baseline_mismatch' unless baseline == catalog['baseline_commit']
@@ -375,14 +399,14 @@ module ArchitectureDocs
         end
         if code_path?(path)
           baseline_paths << path
-          baseline_objects[path] = fields[2] if fields[1] == 'blob'
+          baseline_objects[path] = fields[2] if fields[1] == 'blob' && %w[100644 100755].include?(fields[0])
         end
       end
       baseline_paths.sort!
       current_paths = Dir.glob(File.join(root, 'src/**/*.rs'), File::FNM_DOTMATCH).select { |path| File.file?(path) }.map { |path| path.delete_prefix(root + '/') }
       %w[Cargo.toml Cargo.lock].each { |path| current_paths << path if File.file?(File.join(root, path)) }
       frozen_paths = manifest['files'].map { |file| file['path'] }.sort
-      errors << 'file_set_mismatch' unless baseline_paths == frozen_paths && current_paths.sort == frozen_paths
+      errors << 'file_set_mismatch' unless baseline_paths == frozen_paths && (!workspace || current_paths.sort == frozen_paths)
       requested = manifest['files'].map { |file| baseline_objects[file['path']] }.compact
       blobs = git_blobs(root, requested)
       baseline_bytes = {}
@@ -412,9 +436,23 @@ module ArchitectureDocs
           errors << "#{error.message} origin=baseline id=#{entry['id']}"
         end
       end
+      entry = manifest['evidence'].find { |item| item['id'] == catalog['enum_evidence_id'] }
+      if entry && entry['kind'] == 'rust_enum' && baseline_bytes[entry['path']]
+        begin
+          view = baseline_views[entry['path']] ||= RustEvidence.view(baseline_bytes[entry['path']])
+          actual = RustEvidence.enum_variants(view.locate(entry['symbol'], entry['kind']))
+          errors << 'enum_coverage_mismatch origin=baseline' unless actual.sort == catalog['kinds'].map { |kind| kind['kind'] }.sort && actual.uniq == actual
+        rescue RustEvidence::Invalid => error
+          errors << "#{error.message} origin=baseline id=#{entry['id']}"
+        end
+      else
+        errors << 'enum_evidence_missing origin=baseline'
+      end
       errors
     rescue GitBatchInvalid => error
       errors + [error.message]
     end
   end
 end
+
+require_relative 'current_audit'

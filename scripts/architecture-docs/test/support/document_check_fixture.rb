@@ -9,6 +9,7 @@ require 'tmpdir'
 module DocumentCheckFixture
   SOURCE_ROOT = File.expand_path('../../../..', __dir__)
   BASELINE = '07781bf386aafdf202851ae928efee8920387058'
+  CURRENT_BASELINE = 'aef7972965f610ed418049593dfff1d55341772e'
 
   module_function
 
@@ -25,15 +26,18 @@ module DocumentCheckFixture
     @fixture_template = Dir.mktmpdir('document-check-template-')
     at_exit { FileUtils.remove_entry(@fixture_template) if @fixture_template && File.exist?(@fixture_template) }
     clone(SOURCE_ROOT, @fixture_template, no_checkout: true)
-    git(@fixture_template, 'checkout', '-q', '--detach', BASELINE)
+    git(@fixture_template, 'checkout', '-q', '--detach', CURRENT_BASELINE)
+    git(@fixture_template, 'merge-base', '--is-ancestor', BASELINE, CURRENT_BASELINE)
     overlay_current_documents(@fixture_template)
     run_ruby(@fixture_template, 'scripts/architecture-docs/render-catalog.rb', '--root', @fixture_template, '--write')
+    run_ruby(@fixture_template, 'scripts/architecture-docs/render-catalog.rb', '--root', @fixture_template, '--current', '--write')
     run_ruby(@fixture_template, 'scripts/architecture-docs/build.rb', 'rfc', '--root', @fixture_template, '--draft')
     git(@fixture_template, 'add', '-f', 'docs', 'scripts/architecture-docs',
         'design-source-catalog.v1.json', '.github/workflows/ci.yml')
     git(@fixture_template, '-c', 'user.name=Document Check Test', '-c', 'user.email=document-check@example.invalid',
         'commit', '-qm', 'historical code aligned document fixture')
     %w[docs/push-system/push-capability-catalog.md
+       docs/push-system/push-current-capability-catalog.md
        docs/push-system/push-system-implementation-rfc.html
        scripts/architecture-docs/assets/mermaid.min.js].each do |path|
       git(@fixture_template, 'ls-files', '--error-unmatch', path)
@@ -62,6 +66,8 @@ module DocumentCheckFixture
     document_paths = [
       'docs/push-system/push-capability-catalog.v1.json',
       'docs/push-system/push-evidence-manifest.v1.json',
+      'docs/push-system/push-current-capability-catalog.v1.json',
+      'docs/push-system/push-current-evidence-manifest.v1.json',
       'docs/push-system/push-system-implementation-rfc.md',
       'docs/push-system/push-system-foundation.v1.sql',
       'docs/push-system/push-system-wbs.v1.json',
@@ -73,7 +79,7 @@ module DocumentCheckFixture
     document_paths.uniq.each { |path| copy_path(root, path) }
 
     FileUtils.rm_rf(File.join(root, 'scripts/architecture-docs'))
-    %w[build.rb catalog.rb check.rb html_builder.rb markdown_renderer.rb render-catalog.rb
+    %w[build.rb catalog.rb current_audit.rb check.rb html_builder.rb markdown_renderer.rb render-catalog.rb
        rfc_inputs.rb rfc_spec.rb rust_evidence.rb source_catalog.rb wbs.rb].each do |name|
       copy_path(root, File.join('scripts/architecture-docs', name))
     end

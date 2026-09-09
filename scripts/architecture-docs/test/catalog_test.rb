@@ -14,6 +14,285 @@ CHECK_CATALOG = File.expand_path('../check-catalog.rb', __dir__)
 RENDER_CATALOG = File.expand_path('../render-catalog.rb', __dir__)
 
 class CatalogTest < Minitest::Test
+  def test_renderer_reports_missing_root_and_parent_without_backtrace
+    Dir.mktmpdir('renderer-missing-') do |root|
+      [root, File.join(root, 'missing')].each do |target|
+        out, err, status = Open3.capture3(RbConfig.ruby, RENDER_CATALOG, '--root', target, '--current', '--check')
+        assert_equal 1, status.exitstatus, out + err
+        assert_includes out, 'push_document_missing'
+        assert_empty err
+      end
+    end
+  end
+
+  def test_current_nonancestor_and_missing_source_are_rejected
+    with_fixture do |root|
+      original = git(root, 'rev-parse', 'HEAD')
+      git(root, 'switch', '--orphan', 'unrelated-current')
+      File.binwrite(File.join(root, 'unrelated.txt'), "unrelated\n")
+      git(root, 'add', 'unrelated.txt')
+      git(root, '-c', 'user.name=Catalog Test', '-c', 'user.email=catalog@example.invalid', 'commit', '-qm', 'unrelated current')
+      other = git(root, 'rev-parse', 'HEAD')
+      git(root, 'switch', '--detach', original)
+      %w[push-current-capability-catalog.v1.json push-current-evidence-manifest.v1.json].each do |name|
+        mutate(root, name) { |document| document['baseline_commit'] = other }
+      end
+      bind_current(root)
+      out, err, status = cli(root)
+      assert_equal 1, status.exitstatus, out + err
+      assert_includes out, "baseline_not_ancestor commit=#{other} pair=current"
+      assert_empty err
+    end
+    with_fixture do |root|
+      File.delete(File.join(root, 'src/notify.rs'))
+      out, err, status = cli(root)
+      assert_equal 1, status.exitstatus, out + err
+      assert_includes out, 'file_path_invalid path=src/notify.rs pair=current'
+      assert_includes out, 'evidence_path_invalid id=enum pair=current'
+      assert_empty err
+    end
+  end
+
+  def test_architecture_only_evidence_is_not_a_business_producer
+    with_fixture do |root|
+      File.binwrite(File.join(root, 'src/notify.rs'), "pub enum PushKind {\n    One,\n}\nfn library() {}\n")
+      git(root, 'add', 'src/notify.rs')
+      git(root, '-c', 'user.name=Catalog Test', '-c', 'user.email=catalog@example.invalid', 'commit', '-qm', 'library')
+      install_current(root)
+      mutate(root, 'push-current-capability-catalog.v1.json') do |catalog|
+        catalog['architecture'] = [{ 'id' => 'library', 'evidence_ids' => ['library'],
+          'supporting_files' => ['src/notify.rs'], 'boundary' => 'Declaration only; no production caller or migration promotion.' }]
+      end
+      mutate(root, 'push-current-evidence-manifest.v1.json') do |manifest|
+        manifest['files'][0]['architecture_ids'] = ['library']
+        manifest['evidence'] << { 'id' => 'library', 'path' => 'src/notify.rs', 'symbol' => 'library', 'kind' => 'rust_fn',
+          'symbol_sha256' => Digest::SHA256.hexdigest("fn library() {}\n"), 'start_line' => 4, 'end_line' => 4,
+          'audit_domains' => ['architecture'], 'dependencies' => [] }
+      end
+      bind_current(root)
+      out, err, status = cli(root)
+      assert_equal 0, status.exitstatus, out + err
+      catalog = JSON.parse(File.binread(File.join(root, 'docs/push-system/push-current-capability-catalog.v1.json')))
+      assert_empty catalog['producers']
+      assert_empty catalog['migration_units']
+      assert_equal 'INACTIVE', catalog['kinds'][0]['status']
+    end
+  end
+
+  def test_standalone_strict_check_preserves_index_after_source_stat_change
+    with_fixture do |root|
+      git(root, 'add', '.')
+      git(root, '-c', 'user.name=Catalog Test', '-c', 'user.email=catalog@example.invalid', 'commit', '-qm', 'tracked audit fixture')
+      source = File.join(root, 'src/notify.rs')
+      later = Time.now + 10
+      File.utime(later, later, source)
+      index = File.join(root, '.git/index')
+      before = [Digest::SHA256.file(index).hexdigest, File.stat(index).mtime.to_r]
+      out, err, status = cli(root, '--check')
+      assert_equal 1, status.exitstatus, out + err
+      refute_includes out, 'worktree_dirty'
+      assert_equal before, [Digest::SHA256.file(index).hexdigest, File.stat(index).mtime.to_r]
+    end
+  end
+
+  def test_current_paths_and_json_shapes_fail_without_backtraces
+    [nil, [], 42, {}, { 'schema_version' => 1, 'status' => 'PROVISIONAL', 'role' => 'current-source-audit', 'bindings' => [] }].each do |value|
+      with_fixture do |root|
+        json(root, 'docs/push-system/push-current-evidence-manifest.v1.json', value)
+        out, err, status = cli(root)
+        assert_equal 1, status.exitstatus, out + err
+        assert_includes out, 'pair=current'
+        assert_empty err
+      end
+    end
+    %w[push-current-capability-catalog.v1.json push-current-evidence-manifest.v1.json].each do |name|
+      with_fixture do |root|
+        path = File.join(root, 'docs/push-system', name)
+        File.binwrite(path, '{')
+        out, err, status = cli(root)
+        assert_equal 1, status.exitstatus, out + err
+        assert_includes out, "push_json_invalid path=docs/push-system/#{name}"
+      end
+    end
+    [:symlink, :link].each do |link_type|
+      %w[docs/push-system/push-current-capability-catalog.v1.json docs/push-system/push-current-evidence-manifest.v1.json src/notify.rs].each do |relative|
+        with_fixture do |root|
+          path = File.join(root, relative)
+          saved = path + '.saved'
+          File.rename(path, saved)
+          File.public_send(link_type, saved, path)
+          out, err, status = cli(root)
+          assert_equal 1, status.exitstatus, out + err
+          assert_includes out, relative.start_with?('src/') ? 'file_path_invalid' : 'push_path_invalid'
+          assert_empty err
+        end
+      end
+    end
+  end
+
+  def test_current_integrity_failures_and_pair_origins_are_independent
+    cases = {
+      'file_sha_mismatch' => proc { |m| m['files'][0]['sha256'] = '0' * 64 },
+      'symbol_sha_mismatch' => proc { |m| m['evidence'][0]['symbol_sha256'] = '0' * 64 },
+      'symbol_lines_mismatch' => proc { |m| m['evidence'][0]['start_line'] = 2 },
+      'symbol_missing' => proc { |m| m['evidence'][0]['symbol'] = 'missing' },
+      'file_set_mismatch' => proc { |m| m['files'] = [] },
+      'baseline_commit_invalid' => proc { |m| m['baseline_commit'] = '0' * 40 },
+      'baseline_mismatch' => proc { |m| m['baseline_commit'] = 'a' * 40 },
+      'current_bindings_mismatch' => proc { |m| m['bindings'][0]['path'] = 'docs/other.json' },
+      'duplicate_locator' => proc { |m| m['evidence'] << m['evidence'][0].merge('id' => 'duplicate') }
+    }
+    cases.each do |code, mutation|
+      with_fixture do |root|
+        mutate(root, 'push-current-evidence-manifest.v1.json', &mutation)
+        out, err, status = cli(root)
+        assert_equal 1, status.exitstatus, out + err
+        assert out.lines.any? { |line| line.start_with?(code) && line.include?('pair=current') }, out
+        assert_empty err
+      end
+    end
+    with_fixture do |root|
+      %w[push-evidence-manifest.v1.json push-current-evidence-manifest.v1.json].each do |name|
+        mutate(root, name) { |m| m['evidence'][0]['symbol_sha256'] = '0' * 64 }
+      end
+      out, err, status = cli(root)
+      assert_equal 1, status.exitstatus, out + err
+      assert_includes out, 'symbol_sha_mismatch origin=baseline id=enum pair=historical'
+      assert_includes out, 'symbol_sha_mismatch origin=baseline id=enum pair=current'
+    end
+  end
+
+  def test_supporting_file_requires_its_own_architecture_reference
+    with_fixture do |root|
+      mutate(root, 'push-current-evidence-manifest.v1.json') { |m| m['files'][0]['architecture_ids'] = ['removed-group'] }
+      out, err, status = cli(root)
+      assert_equal 1, status.exitstatus, out + err
+      assert_includes out, 'architecture_file_ownership_mismatch path=src/notify.rs'
+    end
+  end
+
+  def test_current_original_byte_bindings_reject_whitespace_and_schema_damage_does_not_hide_other_pair
+    %w[push-capability-catalog.v1.json push-evidence-manifest.v1.json push-current-capability-catalog.v1.json].each do |name|
+      with_fixture do |root|
+        path = File.join(root, 'docs/push-system', name)
+        File.open(path, 'ab') { |file| file.write("\n ") }
+        out, err, status = cli(root)
+        assert_equal 1, status.exitstatus, out + err
+        assert_includes out, "binding_sha_mismatch path=docs/push-system/#{name} pair=current"
+      end
+    end
+    with_fixture do |root|
+      File.binwrite(File.join(root, 'docs/push-system/push-capability-catalog.v1.json'), '{')
+      mutate(root, 'push-current-evidence-manifest.v1.json') { |m| m['evidence'][0]['symbol_sha256'] = '0' * 64 }
+      out, err, status = cli(root)
+      assert_equal 1, status.exitstatus, out + err
+      assert_includes out, 'push_json_invalid path=docs/push-system/push-capability-catalog.v1.json'
+      assert_includes out, 'symbol_sha_mismatch id=enum pair=current'
+      assert_empty err
+    end
+  end
+
+  def test_current_pin_survives_docs_commits_and_cannot_promote_identities
+    with_fixture do |root|
+      git(root, 'add', '.')
+      git(root, '-c', 'user.name=Catalog Test', '-c', 'user.email=catalog@example.invalid', 'commit', '-qm', 'docs only')
+      out, err, status = cli(root)
+      assert_equal 0, status.exitstatus, out + err
+      mutate(root, 'push-current-capability-catalog.v1.json') { |c| c['kinds'][0]['status'] = 'STARVED' }
+      bind_current(root)
+      out, err, status = cli(root)
+      assert_equal 1, status.exitstatus, out + err
+      assert_includes out, 'current_identity_mismatch collection=kinds'
+    end
+  end
+
+  def test_current_renderer_uses_fixed_separate_output
+    with_fixture do |root|
+      out, err, result = Open3.capture3(RbConfig.ruby, RENDER_CATALOG, '--root', root, '--current', '--write')
+      assert_equal 0, result.exitstatus, out + err
+      path = File.join(root, 'docs/push-system/push-current-capability-catalog.md')
+      assert_includes File.read(path), '当前源码审计'
+      assert_includes File.read(path), '历史实施规范'
+      refute File.exist?(File.join(root, 'docs/push-system/push-capability-catalog.md'))
+    end
+  end
+
+  def test_current_architecture_and_business_dependency_closures_are_independent
+    with_fixture do |root|
+      add_producer(root)
+      File.binwrite(File.join(root, 'src/notify.rs'), "pub enum PushKind {\n    One,\n}\nfn helper() {}\n")
+      git(root, 'add', 'src/notify.rs')
+      git(root, '-c', 'user.name=Catalog Test', '-c', 'user.email=catalog@example.invalid', 'commit', '-qm', 'helper')
+      install_current(root)
+      mutate(root, 'push-current-evidence-manifest.v1.json') do |manifest|
+        manifest['files'][0]['architecture_ids'] = ['library']
+        manifest['evidence'][0]['dependencies'] = [{ 'evidence_id' => 'helper', 'description' => 'fixture enum depends on helper' }]
+        manifest['evidence'] << { 'id' => 'helper', 'path' => 'src/notify.rs', 'symbol' => 'helper', 'kind' => 'rust_fn',
+          'symbol_sha256' => Digest::SHA256.hexdigest("fn helper() {}\n"), 'start_line' => 4, 'end_line' => 4,
+          'audit_domains' => %w[business architecture], 'dependencies' => [] }
+      end
+      mutate(root, 'push-current-capability-catalog.v1.json') do |catalog|
+        catalog['architecture'] = [{ 'id' => 'library', 'evidence_ids' => ['helper'],
+          'supporting_files' => ['src/notify.rs'], 'boundary' => 'helper declaration only; no production caller' }]
+      end
+      bind_current(root)
+      out, err, result = cli(root)
+      assert_equal 1, result.exitstatus, out + err
+      assert_includes out, 'evidence_dependency_missing'
+      assert_includes out, 'evidence_unreferenced id=helper'
+      mutate(root, 'push-current-capability-catalog.v1.json') do |catalog|
+        catalog['kinds'][0]['evidence_ids'] << 'helper'
+        producer = catalog['producers'][0]
+        producer['evidence_ids'] << 'helper'
+        %w[trigger source authority policy].each { |field| producer[field]['evidence_ids'] << 'helper' }
+      end
+      bind_current(root)
+      out, err, result = cli(root)
+      assert_equal 0, result.exitstatus, out + err
+      original = File.binread(File.join(root, 'docs/push-system/push-current-capability-catalog.v1.json'))
+      {
+        'architecture_reference_missing' => proc { |c| c['architecture'][0]['evidence_ids'] << 'missing' },
+        'architecture_evidence_unreferenced' => proc { |c| c['architecture'] = [] },
+        'architecture_file_incomplete' => proc { |c| c['architecture'][0]['supporting_files'] = ['src/other.rs'] },
+        'architecture_file_missing' => proc { |c| c['architecture'][0]['supporting_files'] << 'src/other.rs' },
+        'duplicate_architecture' => proc { |c| c['architecture'] << c['architecture'][0].dup },
+        'evidence_dependency_missing' => proc { |c| c['producers'][0]['source']['evidence_ids'].delete('helper') },
+        'producer_evidence_incomplete' => proc { |c| c['producers'][0]['evidence_ids'].delete('helper') }
+      }.each do |code, mutation|
+        File.binwrite(File.join(root, 'docs/push-system/push-current-capability-catalog.v1.json'), original)
+        mutate(root, 'push-current-capability-catalog.v1.json', &mutation)
+        bind_current(root)
+        out, err, result = cli(root)
+        assert_equal 1, result.exitstatus, out + err
+        assert_includes out, code
+      end
+    end
+  end
+
+  def test_historical_b_and_mandatory_current_c_validate_together
+    with_fixture do |root|
+      source = "// current C\npub enum PushKind {\n    One,\n}\n"
+      File.binwrite(File.join(root, 'src/notify.rs'), source)
+      git(root, 'add', 'src/notify.rs')
+      git(root, '-c', 'user.name=Catalog Test', '-c', 'user.email=catalog@example.invalid',
+          'commit', '-qm', 'current C')
+      install_current(root)
+      out, err, result = cli(root)
+      assert_equal 0, result.exitstatus, out + err
+      %w[push-current-capability-catalog.v1.json push-current-evidence-manifest.v1.json].each do |name|
+        path = File.join(root, 'docs/push-system', name)
+        bytes = File.binread(path)
+        FileUtils.rm(path)
+        %w[--draft --check].each do |mode|
+          out, err, result = cli(root, mode)
+          assert_equal 1, result.exitstatus, out + err
+          assert_includes out, "push_document_missing path=docs/push-system/#{name}"
+        end
+        File.binwrite(path, bytes)
+      end
+    end
+  end
+
   def test_source_bound_view_locates_multiple_symbols_with_original_crlf_bytes
     source = [
       "// fn send() { ignored }\r\n",
@@ -79,6 +358,7 @@ class CatalogTest < Minitest::Test
         catalog['baseline_commit'] = baseline
         catalog['kinds'][0]['evidence_ids'] << 'send'
       end
+      install_current(root)
 
       out, err, result = cli(root)
       assert_equal 0, result.exitstatus, out + err
@@ -101,7 +381,7 @@ class CatalogTest < Minitest::Test
         manifest['files'] << { 'path' => path, 'sha256' => Digest::SHA256.hexdigest(bytes) }
       end
       mutate(root, 'push-capability-catalog.v1.json') { |catalog| catalog['baseline_commit'] = baseline }
-
+      install_current(root)
       out, err, result = cli(root)
       assert_equal 0, result.exitstatus, out + err
       assert_includes out, 'push_catalog_valid'
@@ -156,8 +436,10 @@ class CatalogTest < Minitest::Test
     with_fixture do |root|
       git(root, 'add', '.')
       git(root, '-c', 'user.name=Catalog Test', '-c', 'user.email=catalog@example.invalid', 'commit', '-qm', 'freeze documents')
-      expected = ['provisional path=docs/push-system/push-capability-catalog.v1.json',
-                  'provisional path=docs/push-system/push-evidence-manifest.v1.json']
+      expected = ['provisional path=docs/push-system/push-capability-catalog.v1.json pair=historical',
+                  'provisional path=docs/push-system/push-evidence-manifest.v1.json pair=historical',
+                  'provisional path=docs/push-system/push-current-capability-catalog.v1.json pair=current',
+                  'provisional path=docs/push-system/push-current-evidence-manifest.v1.json pair=current']
       out, err, result = cli(root, '--check')
       assert_equal 1, result.exitstatus, out + err
       assert_equal expected, out.lines.map(&:strip).reject { |line| line.start_with?('NOT CHECKED') }
@@ -713,6 +995,40 @@ class CatalogTest < Minitest::Test
 
   private
 
+  def install_current(root, locate: true)
+    catalog = JSON.parse(File.binread(File.join(root, ArchitectureDocs::Catalog::CATALOG_PATH)))
+    manifest = JSON.parse(File.binread(File.join(root, ArchitectureDocs::Catalog::MANIFEST_PATH)))
+    [catalog, manifest].each do |document|
+      document['baseline_commit'] = git(root, 'rev-parse', 'HEAD')
+      document['role'] = 'current-source-audit'
+    end
+    catalog['architecture'] = []
+    manifest['files'].each do |file|
+      file['sha256'] = Digest::SHA256.file(File.join(root, file['path'])).hexdigest
+      file['architecture_ids'] = []
+    end
+    manifest['evidence'].each do |entry|
+      if locate
+        located = ArchitectureDocs::RustEvidence.locate(File.binread(File.join(root, entry['path'])), entry['symbol'], entry['kind'])
+        %w[symbol_sha256 start_line end_line].each { |field| entry[field] = located[field] }
+      end
+      entry['audit_domains'] = ['business']
+      entry['dependencies'] = []
+    end
+    json(root, 'docs/push-system/push-current-capability-catalog.v1.json', catalog)
+    manifest['bindings'] = [ArchitectureDocs::Catalog::CATALOG_PATH, ArchitectureDocs::Catalog::MANIFEST_PATH,
+                            'docs/push-system/push-current-capability-catalog.v1.json'].map do |path|
+      { 'path' => path, 'sha256' => Digest::SHA256.file(File.join(root, path)).hexdigest }
+    end
+    json(root, 'docs/push-system/push-current-evidence-manifest.v1.json', manifest)
+  end
+
+  def bind_current(root)
+    mutate(root, 'push-current-evidence-manifest.v1.json') do |manifest|
+      manifest['bindings'].each { |entry| entry['sha256'] = Digest::SHA256.file(File.join(root, entry['path'])).hexdigest }
+    end
+  end
+
   def add_producer(root)
     mutate(root, 'push-capability-catalog.v1.json') do |catalog|
       catalog['kinds'][0]['status'] = 'ACTIVE'
@@ -727,6 +1043,7 @@ class CatalogTest < Minitest::Test
       catalog['migration_units'] = [{ 'id' => 'unit-one', 'producer_ids' => ['one'], 'completion_owner' => 'last_one/day',
                                      'occurrence_families' => ['one/day'], 'phase_epics' => ['盘中'], 'note' => '同状态同范围' }]
     end
+    install_current(root)
   end
 
   def add_code_evidence(root, source, symbol, kind, first, last)
@@ -745,6 +1062,7 @@ class CatalogTest < Minitest::Test
       catalog['baseline_commit'] = baseline
       catalog['kinds'][0]['evidence_ids'] << 'send'
     end
+    install_current(root, locate: false)
   end
 
   def mutate(root, filename)
@@ -804,6 +1122,7 @@ class CatalogTest < Minitest::Test
           { 'kind' => 'Watchdog', 'reason' => '仅原混合工作树存在，本分支未移入' }
         ]
       })
+      install_current(root)
       yield root
     end
   end

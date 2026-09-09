@@ -8,11 +8,6 @@ require_relative 'rfc_inputs'
 require_relative 'rfc_spec'
 
 USAGE = 'Usage: check.rb --draft|--check [--root ROOT]'
-CATALOG_RELEASE_ERRORS = [
-  "provisional path=#{ArchitectureDocs::Catalog::CATALOG_PATH}",
-  "provisional path=#{ArchitectureDocs::Catalog::MANIFEST_PATH}",
-  'worktree_dirty'
-].freeze
 
 def usage_error
   warn USAGE
@@ -68,26 +63,28 @@ errors = ArchitectureDocs::RfcInputs.validate(root)
 catalog_errors = ArchitectureDocs::Catalog.validate(root, strict: strict)
 errors.concat(catalog_errors)
 
-catalog_content_errors = catalog_errors.reject { |error| CATALOG_RELEASE_ERRORS.include?(error) }
-if catalog_content_errors.empty?
-  pair = [ArchitectureDocs::Catalog::CATALOG_PATH, ArchitectureDocs::Catalog::MANIFEST_PATH].map do |path|
+[[ArchitectureDocs::Catalog, 'historical', 'docs/push-system/push-capability-catalog.md'],
+ [ArchitectureDocs::CurrentAudit, 'current', ArchitectureDocs::CurrentAudit::MARKDOWN_PATH]].each do |domain, origin, markdown_path|
+  content_errors = catalog_errors.select { |error| error.end_with?("pair=#{origin}") && !error.start_with?('provisional ') }
+  next unless content_errors.empty?
+
+  pair = [domain::CATALOG_PATH, domain::MANIFEST_PATH].map do |path|
     checked, problem = ArchitectureDocs::RfcInputs.checked_path(root, path)
     if problem || File.stat(checked).nlink != 1
-      errors << "push_path_invalid path=#{path}"
+      errors << "push_path_invalid path=#{path} pair=#{origin}"
       nil
     else
       JSON.parse(File.binread(checked))
     end
   end
   if pair.all?
-    markdown_path = 'docs/push-system/push-capability-catalog.md'
     checked, problem = ArchitectureDocs::RfcInputs.checked_path(root, markdown_path)
     if problem == 'missing'
-      errors << 'markdown_missing'
+      errors << "markdown_missing pair=#{origin}"
     elsif problem || File.stat(checked).nlink != 1
-      errors << 'markdown_path_invalid'
-    elsif File.binread(checked) != ArchitectureDocs::Catalog.render(*pair).b
-      errors << 'markdown_stale'
+      errors << "markdown_path_invalid pair=#{origin}"
+    elsif File.binread(checked) != domain.render(*pair).b
+      errors << "markdown_stale pair=#{origin}"
     end
   end
 end

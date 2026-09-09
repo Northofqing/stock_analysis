@@ -9,10 +9,88 @@ require 'open3'
 require 'rbconfig'
 require 'tmpdir'
 require_relative 'support/document_check_fixture'
+require_relative '../rfc_spec'
 
 class DocumentCheckTest < Minitest::Test
   ROOT = File.expand_path('../../..', __dir__)
   CLI = File.join(ROOT, 'scripts/architecture-docs/check.rb')
+
+  def test_current_presence_and_source_drift_are_mandatory_in_both_modes
+    DocumentCheckFixture.with_fixture do |root|
+      path = File.join(root, 'docs/push-system/push-current-evidence-manifest.v1.json')
+      bytes = File.binread(path)
+      File.delete(path)
+      File.binwrite(File.join(root, 'docs/push-system/push-capability-catalog.md'), 'stale historical')
+      %w[--draft --check].each do |mode|
+        out, err, status = run_check(root, mode)
+        assert_equal 1, status.exitstatus, out + err
+        assert_includes out, 'push_document_missing path=docs/push-system/push-current-evidence-manifest.v1.json pair=current'
+        assert_includes out, 'markdown_stale pair=historical'
+        assert_empty err
+      end
+      File.binwrite(path, bytes)
+      File.open(File.join(root, 'Cargo.toml'), 'ab') { |file| file.write("\n# current drift\n") }
+      %w[--draft --check].each do |mode|
+        out, err, status = run_check(root, mode)
+        assert_equal 1, status.exitstatus, out + err
+        assert_includes out, 'file_sha_mismatch path=Cargo.toml pair=current'
+        assert_includes out, 'markdown_stale pair=historical'
+        assert_empty err
+      end
+    end
+  end
+
+  def test_current_material_does_not_replace_rfc_or_wbs_historical_identity
+    DocumentCheckFixture.with_fixture do |root|
+      assert_empty ArchitectureDocs::RfcSpec.validate(root, strict: false)
+      assert_empty ArchitectureDocs::Wbs.validate(root)
+      rfc_path = File.join(root, ArchitectureDocs::RfcSpec::RFC_PATH)
+      original = File.binread(rfc_path)
+      changed = original.sub(ArchitectureDocs::RfcSpec::BASELINE, DocumentCheckFixture::CURRENT_BASELINE)
+      changed = changed.sub(ArchitectureDocs::RfcSpec::DEPENDENCIES['catalog_sha256'][1],
+                            Digest::SHA256.file(File.join(root, 'docs/push-system/push-current-capability-catalog.v1.json')).hexdigest)
+      refute_equal original, changed
+      File.binwrite(rfc_path, changed)
+      errors = ArchitectureDocs::RfcSpec.validate(root, strict: false)
+      assert errors.any? { |error| error.start_with?('rfc_baseline_invalid') }, errors.inspect
+      assert errors.any? { |error| error.start_with?('rfc_metadata_hash_invalid field=catalog_sha256') }, errors.inspect
+      File.binwrite(rfc_path, original)
+      catalog = read_json(root, ArchitectureDocs::Wbs::CATALOG)
+      catalog['migration_units'][0]['note'] += ' changed snapshot'
+      write_json(root, ArchitectureDocs::Wbs::CATALOG, catalog)
+      wbs = read_json(root, ArchitectureDocs::Wbs::PATH)
+      wbs['catalog_sha256'] = Digest::SHA256.file(File.join(root, ArchitectureDocs::Wbs::CATALOG)).hexdigest
+      write_json(root, ArchitectureDocs::Wbs::PATH, wbs)
+      errors = ArchitectureDocs::Wbs.validate(root)
+      refute_includes errors, 'wbs_catalog_sha_mismatch'
+      assert errors.any? { |error| error.start_with?('wbs_catalog_unit_sha_mismatch') }, errors.inspect
+    end
+  end
+
+  def test_current_markdown_is_independent_of_historical_content_failure
+    DocumentCheckFixture.with_fixture do |root|
+      File.binwrite(File.join(root, 'docs/push-system/push-current-capability-catalog.md'), 'stale current')
+      %w[--draft --check].each do |mode|
+        out, err, status = run_check(root, mode)
+        assert_equal 1, status.exitstatus, out + err
+        assert_includes out, 'markdown_stale pair=current'
+      end
+      # Historical semantic damage is rebound only to isolate the two content domains.
+      historical = 'docs/push-system/push-capability-catalog.v1.json'
+      catalog = read_json(root, historical)
+      catalog['kinds'][0]['evidence_ids'] << 'unknown-history'
+      write_json(root, historical, catalog)
+      manifest_path = 'docs/push-system/push-current-evidence-manifest.v1.json'
+      manifest = read_json(root, manifest_path)
+      manifest['bindings'].find { |entry| entry['path'] == historical }['sha256'] = Digest::SHA256.file(File.join(root, historical)).hexdigest
+      write_json(root, manifest_path, manifest)
+      out, err, status = run_check(root, '--draft')
+      assert_equal 1, status.exitstatus, out + err
+      assert_includes out, 'evidence_reference_missing id=unknown-history pair=historical'
+      assert_includes out, 'markdown_stale pair=current'
+      assert_empty err
+    end
+  end
 
   def test_draft_runs_all_real_components_for_historical_code_aligned_fixture
     DocumentCheckFixture.with_fixture do |root|
@@ -72,7 +150,7 @@ class DocumentCheckTest < Minitest::Test
       assert_includes out, "source_sha_mismatch path=#{source_path}"
       assert_includes out, 'symbol_sha_mismatch id=a10-source'
       assert_includes out, 'symbol_lines_mismatch id=account-hook'
-      assert_includes out, 'symbol_missing symbol=document_check_missing_symbol id=account-plan'
+      assert_includes out, 'symbol_missing symbol=document_check_missing_symbol origin=baseline id=account-plan pair=historical'
       assert_includes out, 'approved_question_missing question=7'
       assert_includes out, 'input_sha_mismatch id=architecture-blueprint-markdown'
       assert_equal 1, out.lines.count { |line| line.start_with?('input_sha_mismatch id=architecture-blueprint-markdown') }
@@ -238,7 +316,7 @@ class DocumentCheckTest < Minitest::Test
 
       out, err, status = run_check(root, '--check')
       assert_equal 1, status.exitstatus, out + err
-      assert_equal (strict_release_errors + ['markdown_stale']).sort, error_lines(out).sort
+      assert_equal (strict_release_errors + ['markdown_stale pair=historical']).sort, error_lines(out).sort
       assert_empty err
       assert_equal before, snapshot(root)
     end
@@ -345,8 +423,10 @@ class DocumentCheckTest < Minitest::Test
   end
 
   def strict_release_errors
-    ['provisional path=docs/push-system/push-capability-catalog.v1.json',
-     'provisional path=docs/push-system/push-evidence-manifest.v1.json',
+    ['provisional path=docs/push-system/push-capability-catalog.v1.json pair=historical',
+     'provisional path=docs/push-system/push-evidence-manifest.v1.json pair=historical',
+     'provisional path=docs/push-system/push-current-capability-catalog.v1.json pair=current',
+     'provisional path=docs/push-system/push-current-evidence-manifest.v1.json pair=current',
      'rfc_status_provisional', 'wbs_status_provisional']
   end
 

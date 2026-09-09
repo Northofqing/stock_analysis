@@ -6,8 +6,10 @@ require_relative 'catalog'
 
 root = nil
 modes = []
+current = false
 parser = OptionParser.new do |options|
-  options.banner = 'Usage: render-catalog.rb --root ROOT (--check | --write)'
+  options.banner = 'Usage: render-catalog.rb --root ROOT [--current] (--check | --write)'
+  options.on('--current') { current = true }
   options.on('--root ROOT') { |value| root = value }
   options.on('--check') { modes << :check }
   options.on('--write') { modes << :write }
@@ -25,21 +27,26 @@ end
 
 errors = ArchitectureDocs::Catalog.validate(root, strict: false)
 puts 'NOT CHECKED：完整RFC/WBS/离线HTML/CI/运行时Foundation/部署/真实接收。'
+begin
+  root = File.realpath(File.expand_path(root))
+  relative = current ? ArchitectureDocs::CurrentAudit::MARKDOWN_PATH : 'docs/push-system/push-capability-catalog.md'
+  path = ArchitectureDocs::SourceCatalog.safe_path(root, relative)
+  expected_path = File.join(root, relative)
+  unless !File.symlink?(expected_path) && path == expected_path && File.realpath(File.dirname(path)) == File.dirname(path) &&
+         (!File.exist?(path) || (File.file?(path) && File.stat(path).nlink == 1))
+    errors << 'markdown_path_invalid'
+  end
+rescue SystemCallError
+  errors << 'markdown_path_invalid'
+end
 unless errors.empty?
   puts errors
   exit 1
 end
-root = File.realpath(File.expand_path(root))
-path = ArchitectureDocs::SourceCatalog.safe_path(root, 'docs/push-system/push-capability-catalog.md')
-expected_path = File.join(root, 'docs/push-system/push-capability-catalog.md')
-unless !File.symlink?(expected_path) && path == expected_path && File.realpath(File.dirname(path)) == File.dirname(path) &&
-       (!File.exist?(path) || (File.file?(path) && File.stat(path).nlink == 1))
-  puts 'markdown_path_invalid'
-  exit 1
-end
-catalog = JSON.parse(File.binread(File.join(root, ArchitectureDocs::Catalog::CATALOG_PATH)))
-manifest = JSON.parse(File.binread(File.join(root, ArchitectureDocs::Catalog::MANIFEST_PATH)))
-text = ArchitectureDocs::Catalog.render(catalog, manifest)
+domain = current ? ArchitectureDocs::CurrentAudit : ArchitectureDocs::Catalog
+catalog = JSON.parse(File.binread(File.join(root, domain::CATALOG_PATH)))
+manifest = JSON.parse(File.binread(File.join(root, domain::MANIFEST_PATH)))
+text = domain.render(catalog, manifest)
 if modes.first == :write
   File.binwrite(path, text)
   puts 'markdown_written'
