@@ -93,6 +93,12 @@ module ArchitectureDocs
             end
             output << ('`' * run)
             index += run
+          elsif text[index] == "\n"
+            line_end = text.index("\n", index + 1) || text.length
+            next_line = text[(index + 1)...line_end]
+            code_ticks = nil if code_ticks && next_line.strip.empty?
+            output << "\n"
+            index += 1
           elsif code_ticks.nil? && text[index, 4] == '<!--'
             closing = text.index('-->', index + 4)
             unless closing

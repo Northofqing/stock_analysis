@@ -437,6 +437,50 @@ class ArchitectureDocsBuildTest < Minitest::Test
     end
   end
 
+  def test_code_span_state_resets_at_blank_paragraph_boundaries_without_breaking_comments
+    markdown = [
+      '# Paragraph boundaries',
+      '',
+      'first `unclosed code marker',
+      '',
+      '<!-- hidden after empty line -->',
+      'visible after empty line',
+      '',
+      'second `unclosed code marker',
+      " \t ",
+      '<!-- hidden after whitespace line -->',
+      'visible after whitespace line',
+      '',
+      'same paragraph `left <!--',
+      'right` remains code',
+      '',
+      'before <!-- spanning comment',
+      '',
+      'still hidden --> after',
+      '',
+      'unclosed <!-- literal comment marker',
+      'following literal line'
+    ].join("\n") + "\n"
+
+    with_fixture(markdown: markdown) do |root, _source|
+      assert_successful_build(root)
+      rendered = document_body(File.binread(output_path(root)).force_encoding(Encoding::UTF_8))
+
+      assert_includes rendered, 'first `unclosed code marker'
+      assert_includes rendered, 'visible after empty line'
+      refute_includes rendered, 'hidden after empty line'
+      assert_includes rendered, 'second `unclosed code marker'
+      assert_includes rendered, 'visible after whitespace line'
+      refute_includes rendered, 'hidden after whitespace line'
+      assert_includes rendered, "same paragraph <code>left &lt;!--\nright</code> remains code"
+      assert_includes rendered, 'before '
+      assert_includes rendered, ' after'
+      refute_includes rendered, 'spanning comment'
+      refute_includes rendered, 'still hidden'
+      assert_includes rendered, "unclosed &lt;!-- literal comment marker\nfollowing literal line"
+    end
+  end
+
   def test_tables_fences_and_isolated_table_shaped_lines_preserve_content
     markdown = <<~'MARKDOWN'
       # Structured
