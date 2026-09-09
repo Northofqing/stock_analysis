@@ -2,6 +2,8 @@
 
 日期：2026-09-09。状态：PROVISIONAL；当前源码核对基线为 `aef7972965f610ed418049593dfff1d55341772e`，历史目录基线为 `07781bf386aafdf202851ae928efee8920387058`。本记录是当前代码审计的增量分析，不是新机器目录已发布、Unit已晋级或生产已验证的证明。
 
+时点说明：本文保留工具7a150b2时期的调查与待办，以下“尚未实现/107项未消除”不是最新状态。后续强制current审计已在c2e33a2及修复ff94eca实现、通过实际draft和限定复审；最终制品、SHA与未完成范围见[当前实施记录](implementation-current-source-audit-2026-09-09.md)。
+
 ## 为什么不能原地刷新旧目录
 
 旧目录不只是一份展示文件：RFC元数据及校验器固定其SHA，WBS固定整体SHA与各Unit快照，运行时注册表也通过 `include_bytes!` 和精确SHA绑定它。只更新旧JSON会破坏这些合同。因此保留历史原字节，后续追加独立的当前审计版本；不把审计版本自动升级为运行时或RFC权威。
@@ -11,7 +13,7 @@
 | 规范RFC | [RFC元数据](push-system-implementation-rfc.md#元数据)、[rfc_spec.rb](../../scripts/architecture-docs/rfc_spec.rb#L14)：历史baseline与两份JSON的固定SHA |
 | WBS | [wbs.rb](../../scripts/architecture-docs/wbs.rb#L91)：整体catalog SHA；第160–166行逐Unit快照 |
 | 运行时MachineCatalog | [catalog.rs](../../src/monitor/push_job/catalog.rs#L14)：固定文件、SHA、65 kinds / 102 producers / 52 Units；[既有精确测试](../../src/monitor/push_job/tests.rs#L2263) |
-| 现有Catalog校验 | 工具源码7a150b2：[catalog.rb](../../scripts/architecture-docs/catalog.rb#L50)核对当前字节/符号；[git_errors](../../scripts/architecture-docs/catalog.rb#L356)同时核对历史Git tree。批量读取及错误聚合修复不改变旧快照与当前树不一致时失败的规则 |
+| 调查时Catalog校验 | 历史工具身份`scripts/architecture-docs/catalog.rb@7a150b2:50`核对当前字节/符号，`@7a150b2:356 git_errors`同时核对历史Git tree；这些是该版本行号，不链接到后来已变更的当前行。该时点尚未交付历史/current分层，后续接口见[当前实施记录](implementation-current-source-audit-2026-09-09.md) |
 | 八份冻结来源 | [rfc_inputs.rb](../../scripts/architecture-docs/rfc_inputs.rb#L9)与[rfc-input-manifest.v1.json](rfc-input-manifest.v1.json)：这是另一条历史来源链，不因新增当前审计而解冻 |
 
 ## 107条错误的真实构成
@@ -82,7 +84,7 @@
 
 现有locator只支持 `rust_fn/rust_enum/rust_impl/rust_mod`；trait/struct/pub use不在该合同内，外置 `mod name;` 也没有可定位主体。新架构证据须有独立的非迁移引用域；把它们硬塞进旧producer关系既会误导业务含义，也绕不开旧Catalog对未引用evidence的拒绝。callee SHA不证明caller、cfg可达性、对象实例化或生产数据库选择。
 
-## 尚未闭合的工作
+## 调查时点尚未闭合的工作
 
 - 46个新增生产文件已有分组及代表性声明定位；正式current格式中的架构引用域、supporting文件闭包和业务关系仍待实现/验证，不能只把79个新文件SHA写入manifest就宣称全部语义已审计。
 - current机器目录及其与历史版本的绑定、完整文件/符号/枚举/引用验证尚未实现；107项既有错误尚未消除。

@@ -1,6 +1,6 @@
 # 历史规范与强制当前源码审计分层
 
-日期：2026-09-09。状态：待前置统一checker源码验收后实施；本文不是current目录或当前draft已通过的证明。
+日期：2026-09-09。状态：本计划Task已完成本地验收及独立审查；初版c2e33a2、最终修复ff94eca。修复后真实树draft0，strict1仅保留七项发布条件，610项只读证明通过；唯一I1已在限定复审关闭，Quality Approved。前置checker最终7a150b2已验收，本Task实施BASE为6e58f1e2d79bd183451c96d0dbfc9ab1db9f20f3。首条B→C真实fixture在产品修改前RED；完整结果见[实施记录](../../push-system/implementation-current-source-audit-2026-09-09.md)。本文的计划要求本身不作为测试、发布或全目标完成证明。
 
 目标：履行已批准Q59/Q64/Q65/Q66/Q91/Q92/Q93/Q95/Q105，以独立机器审计版本准确覆盖当前源码，同时保持RFC、WBS和运行时注册表原有规范身份。不能通过关闭旧目录的当前检查而留下没有current检查的空窗。
 
