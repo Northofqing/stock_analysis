@@ -10571,7 +10571,7 @@
     {
       "id": "MU-auction-volume",
       "completion_owner": "monitor_loop.auction_vol_notified[session,code]；独立 L4(auction_volume,空 code,空 sub_kind)",
-      "note": "外层选股 set 在 dispatcher true 后 insert；两次数据读取与推送 recorder 并非原子完成。",
+      "note": "P-02外层只采集一次；dispatcher消费同一snapshot生成消息、逐票records与notified_codes，sink返回true且全部recorder成功后由dispatcher内部推进通知集合。部分逐票写失败不回滚，消息发送、入池与集合推进不是原子事务；bool不证明TransportAccepted或业务终态，Unit未晋级。",
       "producer_ids": [
         "auction-volume"
       ],

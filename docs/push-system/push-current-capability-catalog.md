@@ -1747,7 +1747,7 @@ completion owner：L4(virtual_watch,空 code,空 sub_kind)；共享 monitor_loop
 - MU-announcement：news-announcement；owner news_dedup.key=annroute:{observed_date}:{source}:{external_id}；独立 L4(announcement,source_fact_event_id,空 sub_kind)。公告 claim 与 L4 两层不原子；正常失败释放认领，未发现 crash receipt 恢复。
 - MU-attribution-daily：attribution-daily；owner monitor_loop::ATTRIBUTION_LAST_RUN[calendar_date]。仅该外层日期门；cooldown_secs=None，经 dedup_cooldown 保持 None，L4 reserve/commit 不读写冷却，不造 L4 owner。
 - MU-auction-candidates：auction-repush、candidate-board、candidate-invalidated；owner monitor_loop.post_close_candidates_notified[session]；candidate_board_snapshot[{date}].jsonl 最末 code 集（双层非原子推进链）。A02/主卡共享同一双 bool 外门；失效子推由主卡同一快照推进。三 kind 的 L4/模板键各自独立，此 Unit 保留实际共享推进链，不声称存在共同原子 receipt。
-- MU-auction-volume：auction-volume；owner monitor_loop.auction_vol_notified[session,code]；独立 L4(auction_volume,空 code,空 sub_kind)。外层选股 set 在 dispatcher true 后 insert；两次数据读取与推送 recorder 并非原子完成。
+- MU-auction-volume：auction-volume；owner monitor_loop.auction_vol_notified[session,code]；独立 L4(auction_volume,空 code,空 sub_kind)。P-02外层只采集一次；dispatcher消费同一snapshot生成消息、逐票records与notified_codes，sink返回true且全部recorder成功后由dispatcher内部推进通知集合。部分逐票写失败不回滚，消息发送、入池与集合推进不是原子事务；bool不证明TransportAccepted或业务终态，Unit未晋级。
 - MU-block-confirm：block-confirm-side-route；owner COOLDOWN_TABLE(BlockTradeIntradayConfirm,code)；L4(block_trade_intraday_confirm,code,空 sub_kind)。非ReviewTask side route，逐票两层300s冷却；无交易记录/业务日期durable identity或批次日门。
 - MU-chain-post-close：chain-post-close-timer；owner monitor_loop::CHAIN_POST_LAST[calendar_date]。独立static日期门；与另一timer/CLI无共同durable通知cursor。业务日和封口calendar date不同。
 - MU-chain-preopen：chain-preopen-timer；owner monitor_loop::CHAIN_PREOPEN_LAST[calendar_date]。独立static日期门；与另一timer/CLI无共同durable通知cursor。业务日和封口calendar date不同。
@@ -2063,7 +2063,7 @@ Rust 符号按词法声明定位；impl 使用去掉 impl 和左花括号后的�
 
 - docs/push-system/push-capability-catalog.v1.json：0aa6a2fd87ee9c235073cad3beef44229437f3fe62987b0db510ad36a93aace3
 - docs/push-system/push-evidence-manifest.v1.json：54dc705961da7a6deb458009d2125ee612257d82bad3c14b65d25642e09b64fa
-- docs/push-system/push-current-capability-catalog.v1.json：5880d9ccd00cb8fd405ac539f5d140d485f30463bc196429db0e0a20e7992fdf
+- docs/push-system/push-current-capability-catalog.v1.json：b3c04218e3548f80c026db905e3d0ac2eed59d7ce24efeefa8e69a20b417de93
 
 ## 非迁移架构证据
 
