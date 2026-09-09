@@ -7,7 +7,25 @@ module ArchitectureDocs
   # line endings and offsets; hashes always cover the original complete lines.
   module RustEvidence
     class Invalid < StandardError; end
+
+    class View
+      def initialize(source)
+        @source = source.b.dup.freeze
+        @masked = nil
+      end
+
+      def locate(symbol, kind)
+        keyword = RustEvidence.validate_locator(symbol, kind)
+        @masked ||= RustEvidence.mask(@source)
+        RustEvidence.locate_masked(@source, @masked, symbol, kind, keyword)
+      end
+    end
+
     module_function
+
+    def view(source)
+      View.new(source)
+    end
 
     def mask(source)
       bytes = source.b
@@ -63,12 +81,21 @@ module ArchitectureDocs
     end
 
     def locate(source, symbol, kind)
+      keyword = validate_locator(symbol, kind)
+      source = source.b
+      locate_masked(source, mask(source), symbol, kind, keyword)
+    end
+
+    def validate_locator(symbol, kind)
       keyword = { 'rust_fn' => 'fn', 'rust_enum' => 'enum', 'rust_impl' => 'impl', 'rust_mod' => 'mod' }[kind]
       raise Invalid, "evidence_kind_invalid kind=#{kind}" unless keyword
       if kind != 'rust_impl' && !identifier?(symbol)
         raise Invalid, "symbol_identifier_invalid symbol=#{symbol}"
       end
-      masked = mask(source)
+      keyword
+    end
+
+    def locate_masked(source, masked, symbol, kind, keyword)
       matches = []
       if kind == 'rust_impl'
         # Rust items may follow another item or an opening module brace inline.
@@ -108,7 +135,7 @@ module ArchitectureDocs
       line_end = masked.index("\n", cursor)
       line_end = line_end ? line_end + 1 : masked.bytesize
       {
-        'symbol_sha256' => Digest::SHA256.hexdigest(source.b.byteslice(line_start, line_end - line_start)),
+        'symbol_sha256' => Digest::SHA256.hexdigest(source.byteslice(line_start, line_end - line_start)),
         'start_line' => masked.byteslice(0, line_start).count("\n") + 1,
         'end_line' => masked.byteslice(0, cursor).count("\n") + 1,
         'body' => masked.byteslice(opening + 1, cursor - opening - 2)

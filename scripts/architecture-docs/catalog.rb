@@ -7,6 +7,8 @@ require_relative 'rust_evidence'
 
 module ArchitectureDocs
   module Catalog
+    class GitBatchInvalid < StandardError; end
+
     CATALOG_PATH = 'docs/push-system/push-capability-catalog.v1.json'
     MANIFEST_PATH = 'docs/push-system/push-evidence-manifest.v1.json'
     PHASES = %w[盘前 集合竞价 盘中 盘后].freeze
@@ -45,6 +47,7 @@ module ArchitectureDocs
       return errors unless structure.empty?
       errors.concat(reference_errors(catalog, manifest))
       errors.concat(git_errors(root, catalog, manifest))
+      current_sources = {}
       manifest['files'].each do |file|
         safe = SourceCatalog.safe_path(root, file['path'])
         unless safe && File.file?(safe)
@@ -52,8 +55,10 @@ module ArchitectureDocs
           next
         end
         bytes = File.binread(safe)
+        current_sources[file['path']] = bytes
         errors << "file_sha_mismatch path=#{file['path']}" unless Digest::SHA256.hexdigest(bytes) == file['sha256']
       end
+      current_views = {}
       manifest['evidence'].each do |evidence|
         begin
           safe = SourceCatalog.safe_path(root, evidence['path'])
@@ -61,7 +66,9 @@ module ArchitectureDocs
             errors << "evidence_path_invalid id=#{evidence['id']}"
             next
           end
-          located = RustEvidence.locate(File.binread(safe), evidence['symbol'], evidence['kind'])
+          source = current_sources[evidence['path']] ||= File.binread(safe)
+          view = current_views[evidence['path']] ||= RustEvidence.view(source)
+          located = view.locate(evidence['symbol'], evidence['kind'])
           errors << "symbol_sha_mismatch id=#{evidence['id']}" unless located['symbol_sha256'] == evidence['symbol_sha256']
           errors << "symbol_lines_mismatch id=#{evidence['id']}" unless %w[start_line end_line].all? { |field| located[field] == evidence[field] }
         rescue RustEvidence::Invalid => error
@@ -70,7 +77,9 @@ module ArchitectureDocs
       end
       entry = manifest['evidence'].find { |evidence| evidence['id'] == catalog['enum_evidence_id'] }
       if entry && entry['kind'] == 'rust_enum' && (safe = SourceCatalog.safe_path(root, entry['path'])) && File.file?(safe)
-        item = RustEvidence.locate(File.binread(safe), entry['symbol'], entry['kind'])
+        source = current_sources[entry['path']] ||= File.binread(safe)
+        view = current_views[entry['path']] ||= RustEvidence.view(source)
+        item = view.locate(entry['symbol'], entry['kind'])
         actual = RustEvidence.enum_variants(item)
         expected = catalog['kinds'].map { |kind| kind['kind'] }
         errors << 'enum_coverage_mismatch' unless actual.sort == expected.sort && actual.uniq == actual
@@ -300,6 +309,46 @@ module ArchitectureDocs
       (path.start_with?('src/') && path.end_with?('.rs')) || %w[Cargo.toml Cargo.lock].include?(path)
     end
 
+    def parse_git_batch(objects, output)
+      offset = 0
+      blobs = {}
+      objects.each do |expected|
+        line_end = output.index("\n", offset)
+        raise GitBatchInvalid, 'baseline_batch_truncated' unless line_end
+
+        header = output.byteslice(offset, line_end - offset)
+        object, type, length = header.split(' ', -1)
+        unless object && object.match?(/\A[0-9a-f]{40}(?:[0-9a-f]{24})?\z/) && type && length &&
+               header.split(' ', -1).length == 3
+          raise GitBatchInvalid, 'baseline_batch_header_invalid'
+        end
+        raise GitBatchInvalid, 'baseline_batch_object_mismatch' unless object == expected
+        raise GitBatchInvalid, 'baseline_batch_type_invalid' unless type == 'blob'
+        raise GitBatchInvalid, 'baseline_batch_length_invalid' unless length.match?(/\A(?:0|[1-9][0-9]*)\z/)
+
+        size = length.to_i
+        body_start = line_end + 1
+        body_end = body_start + size
+        raise GitBatchInvalid, 'baseline_batch_truncated' if body_end >= output.bytesize
+        raise GitBatchInvalid, 'baseline_batch_terminator_invalid' unless output.getbyte(body_end) == 10
+
+        blobs[object] = output.byteslice(body_start, size)
+        offset = body_end + 1
+      end
+      raise GitBatchInvalid, 'baseline_batch_extra' unless offset == output.bytesize
+
+      blobs
+    end
+
+    def git_blobs(root, objects)
+      objects = objects.uniq
+      input = objects.empty? ? ''.b : (objects.join("\n") + "\n").b
+      output, _error, status = Open3.capture3('git', '-C', root, 'cat-file', '--batch', stdin_data: input)
+      raise GitBatchInvalid, 'baseline_batch_failed' unless status.success?
+
+      parse_git_batch(objects, output.b)
+    end
+
     def git_errors(root, catalog, manifest)
       errors = []
       baseline = manifest['baseline_commit']
@@ -310,23 +359,40 @@ module ArchitectureDocs
       end
       _output, ancestor = git(root, 'merge-base', '--is-ancestor', baseline, 'HEAD')
       errors << "baseline_not_ancestor commit=#{baseline}" unless ancestor
-      tree, success = git(root, 'ls-tree', '-r', '--name-only', '-z', baseline)
+      tree, success = git(root, 'ls-tree', '-r', '-z', baseline)
       return errors + ['baseline_tree_failed'] unless success
-      baseline_paths = tree.split("\0").select { |path| code_path?(path) }.sort
+      baseline_objects = {}
+      baseline_paths = []
+      tree.split("\0").reject(&:empty?).each do |entry|
+        metadata, path = entry.split("\t", 2)
+        fields = metadata && metadata.split(' ', 3)
+        unless path && fields && fields.length == 3 && fields[2].match?(/\A[0-9a-f]{40}(?:[0-9a-f]{24})?\z/)
+          return errors + ['baseline_tree_invalid']
+        end
+        if code_path?(path)
+          baseline_paths << path
+          baseline_objects[path] = fields[2] if fields[1] == 'blob'
+        end
+      end
+      baseline_paths.sort!
       current_paths = Dir.glob(File.join(root, 'src/**/*.rs'), File::FNM_DOTMATCH).select { |path| File.file?(path) }.map { |path| path.delete_prefix(root + '/') }
       %w[Cargo.toml Cargo.lock].each { |path| current_paths << path if File.file?(File.join(root, path)) }
       frozen_paths = manifest['files'].map { |file| file['path'] }.sort
       errors << 'file_set_mismatch' unless baseline_paths == frozen_paths && current_paths.sort == frozen_paths
+      requested = manifest['files'].map { |file| baseline_objects[file['path']] }.compact
+      blobs = git_blobs(root, requested)
       baseline_bytes = {}
       manifest['files'].each do |file|
-        bytes, found = git(root, 'show', "#{baseline}:#{file['path']}")
-        unless found
+        object = baseline_objects[file['path']]
+        unless object
           errors << "baseline_file_missing path=#{file['path']}"
           next
         end
+        bytes = blobs.fetch(object)
         baseline_bytes[file['path']] = bytes
         errors << "file_sha_mismatch origin=baseline path=#{file['path']}" unless Digest::SHA256.hexdigest(bytes) == file['sha256']
       end
+      baseline_views = {}
       manifest['evidence'].each do |entry|
         bytes = baseline_bytes[entry['path']]
         unless bytes
@@ -334,7 +400,8 @@ module ArchitectureDocs
           next
         end
         begin
-          located = RustEvidence.locate(bytes, entry['symbol'], entry['kind'])
+          view = baseline_views[entry['path']] ||= RustEvidence.view(bytes)
+          located = view.locate(entry['symbol'], entry['kind'])
           errors << "symbol_sha_mismatch origin=baseline id=#{entry['id']}" unless located['symbol_sha256'] == entry['symbol_sha256']
           errors << "symbol_lines_mismatch origin=baseline id=#{entry['id']}" unless %w[start_line end_line].all? { |field| located[field] == entry[field] }
         rescue RustEvidence::Invalid => error
@@ -342,6 +409,8 @@ module ArchitectureDocs
         end
       end
       errors
+    rescue GitBatchInvalid => error
+      errors + [error.message]
     end
   end
 end

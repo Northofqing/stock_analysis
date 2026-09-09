@@ -14,6 +14,144 @@ CHECK_CATALOG = File.expand_path('../check-catalog.rb', __dir__)
 RENDER_CATALOG = File.expand_path('../render-catalog.rb', __dir__)
 
 class CatalogTest < Minitest::Test
+  def test_source_bound_view_locates_multiple_symbols_with_original_crlf_bytes
+    source = [
+      "// fn send() { ignored }\r\n",
+      "pub enum Café { One, Two }\r\n",
+      "fn send() { let value = \"}\"; }\r\n",
+      "mod nested { fn inside() {} }\r\n",
+      "impl Thing { fn method(&self) {} }\r\n"
+    ].join.b
+    view = ArchitectureDocs::RustEvidence.view(source)
+
+    [['Café', 'rust_enum', 2], ['send', 'rust_fn', 3], ['nested', 'rust_mod', 4],
+     ['Thing', 'rust_impl', 5]].each do |symbol, kind, line|
+      located = view.locate(symbol, kind)
+      assert_equal line, located['start_line']
+      assert_equal line, located['end_line']
+      assert_equal Digest::SHA256.hexdigest(source.lines[line - 1]), located['symbol_sha256']
+    end
+    source.replace("fn replaced() {}\n")
+    assert_equal 3, view.locate('send', 'rust_fn')['start_line']
+  end
+
+  def test_git_batch_parser_validates_every_blob_frame
+    object = 'a' * 40
+    valid = object + " blob 3\nabc\n"
+    assert_equal({ object => 'abc'.b }, ArchitectureDocs::Catalog.parse_git_batch([object], valid.b))
+    missing = assert_raises(ArchitectureDocs::Catalog::GitBatchInvalid) do
+      ArchitectureDocs::Catalog.parse_git_batch([object], ''.b)
+    end
+    assert_equal 'baseline_batch_truncated', missing.message
+
+    failures = {
+      'baseline_batch_truncated' => object + " blob 4\nabc",
+      'baseline_batch_type_invalid' => object + " tree 3\nabc\n",
+      'baseline_batch_object_mismatch' => ('b' * 40) + " blob 3\nabc\n",
+      'baseline_batch_terminator_invalid' => object + " blob 3\nabcX",
+      'baseline_batch_extra' => valid + 'extra'
+    }
+    failures.each do |message, bytes|
+      error = assert_raises(ArchitectureDocs::Catalog::GitBatchInvalid) do
+        ArchitectureDocs::Catalog.parse_git_batch([object], bytes.b)
+      end
+      assert_equal message, error.message
+    end
+  end
+
+  def test_catalog_cli_reuses_one_source_view_for_multiple_symbols
+    with_fixture do |root|
+      source = "pub enum PushKind {\n    One,\n}\nfn send() {}\n"
+      File.binwrite(File.join(root, 'src/notify.rs'), source)
+      git(root, 'add', 'src/notify.rs')
+      git(root, '-c', 'user.name=Catalog Test', '-c', 'user.email=catalog@example.invalid',
+          'commit', '-qm', 'add second symbol')
+      baseline = git(root, 'rev-parse', 'HEAD')
+      mutate(root, 'push-evidence-manifest.v1.json') do |manifest|
+        manifest['baseline_commit'] = baseline
+        manifest['files'][0]['sha256'] = Digest::SHA256.hexdigest(source)
+        manifest['evidence'] << {
+          'id' => 'send', 'path' => 'src/notify.rs', 'symbol' => 'send', 'kind' => 'rust_fn',
+          'symbol_sha256' => Digest::SHA256.hexdigest("fn send() {}\n"), 'start_line' => 4, 'end_line' => 4
+        }
+      end
+      mutate(root, 'push-capability-catalog.v1.json') do |catalog|
+        catalog['baseline_commit'] = baseline
+        catalog['kinds'][0]['evidence_ids'] << 'send'
+      end
+
+      out, err, result = cli(root)
+      assert_equal 0, result.exitstatus, out + err
+      assert_includes out, 'push_catalog_valid'
+      assert_empty err
+    end
+  end
+
+  def test_git_batch_reads_real_blob_paths_with_spaces_and_newlines
+    with_fixture do |root|
+      path = "src/odd name\nfile.rs"
+      bytes = "fn odd_path() {}\n"
+      File.binwrite(File.join(root, path), bytes)
+      git(root, 'add', path)
+      git(root, '-c', 'user.name=Catalog Test', '-c', 'user.email=catalog@example.invalid',
+          'commit', '-qm', 'add unusual path')
+      baseline = git(root, 'rev-parse', 'HEAD')
+      mutate(root, 'push-evidence-manifest.v1.json') do |manifest|
+        manifest['baseline_commit'] = baseline
+        manifest['files'] << { 'path' => path, 'sha256' => Digest::SHA256.hexdigest(bytes) }
+      end
+      mutate(root, 'push-capability-catalog.v1.json') { |catalog| catalog['baseline_commit'] = baseline }
+
+      out, err, result = cli(root)
+      assert_equal 0, result.exitstatus, out + err
+      assert_includes out, 'push_catalog_valid'
+      assert_empty err
+    end
+  end
+
+  def test_non_blob_code_path_cannot_disappear_from_baseline_file_set
+    with_fixture do |root|
+      commit = git(root, 'rev-parse', 'HEAD')
+      git(root, 'update-index', '--add', '--cacheinfo', "160000,#{commit},src/linked.rs")
+      git(root, '-c', 'user.name=Catalog Test', '-c', 'user.email=catalog@example.invalid',
+          'commit', '-qm', 'add code-shaped gitlink')
+      baseline = git(root, 'rev-parse', 'HEAD')
+      mutate(root, 'push-evidence-manifest.v1.json') { |manifest| manifest['baseline_commit'] = baseline }
+      mutate(root, 'push-capability-catalog.v1.json') { |catalog| catalog['baseline_commit'] = baseline }
+
+      out, err, result = cli(root)
+      assert_equal 1, result.exitstatus, out + err
+      assert_includes out, 'file_set_mismatch'
+      assert_empty err
+    end
+  end
+
+  def test_baseline_and_current_source_damage_remain_distinguishable
+    with_fixture do |root|
+      source_path = File.join(root, 'src/notify.rs')
+      correct = File.binread(source_path)
+      File.binwrite(source_path, correct.sub('One', 'Broken'))
+      git(root, 'add', 'src/notify.rs')
+      git(root, '-c', 'user.name=Catalog Test', '-c', 'user.email=catalog@example.invalid',
+          'commit', '-qm', 'damaged baseline')
+      damaged_baseline = git(root, 'rev-parse', 'HEAD')
+      File.binwrite(source_path, correct)
+      git(root, 'add', 'src/notify.rs')
+      git(root, '-c', 'user.name=Catalog Test', '-c', 'user.email=catalog@example.invalid',
+          'commit', '-qm', 'restore current source')
+      mutate(root, 'push-evidence-manifest.v1.json') { |manifest| manifest['baseline_commit'] = damaged_baseline }
+      mutate(root, 'push-capability-catalog.v1.json') { |catalog| catalog['baseline_commit'] = damaged_baseline }
+
+      out, err, result = cli(root)
+      assert_equal 1, result.exitstatus, out + err
+      assert_includes out, 'file_sha_mismatch origin=baseline path=src/notify.rs'
+      assert_includes out, 'symbol_sha_mismatch origin=baseline id=enum'
+      refute_includes out, "file_sha_mismatch path=src/notify.rs\n"
+      refute_includes out, "symbol_sha_mismatch id=enum\n"
+      assert_empty err
+    end
+  end
+
   def test_explicit_check_preserves_strict_default_and_modes_are_exclusive
     with_fixture do |root|
       git(root, 'add', '.')
