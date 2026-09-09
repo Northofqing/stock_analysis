@@ -1,6 +1,8 @@
 # 历史规范与强制当前源码审计：实施记录
 
-日期：2026-09-09。状态：本批当前源码审计已完成本地验收和独立规格/质量审查；修复轮Spec通过、Quality Approved。全部current材料保持PROVISIONAL，strict仍有真实发布阻断，本记录不批准生产切换或Unit晋级。
+日期：2026-09-09。状态：Task1及后续Task2均已完成本地验收与独立审查，当前制品为047b4ab；两次不同层级的摘要遗漏及修复证据分别保留。全部current材料保持PROVISIONAL，strict仍有真实发布阻断，本记录不批准生产切换或Unit晋级。
+
+后续发现更新：蓝图核对指出MU-auction-volume.note仍有旧“外层insert/两次数据读取”，该行未被ff94eca的kind修复触及。新增[计划Task2](../superpowers/plans/2026-09-09-current-source-audit.md#task-2-修正当前migrationunit竞价摘要的残余历史语义)已在047b4ab修正，正式生成、真实树及独立Spec/Quality均通过；下游蓝图现在可以使用最终SHA继续。以下Task1证据保留原时点，顶部材料表已更新至Task2当前字节，不能混用两个版本的SHA。
 
 实施依据：[已批准实施计划](../superpowers/plans/2026-09-09-current-source-audit.md)。唯一开发树为 `.worktrees/push-reliability-20260905`，分支 `codex/push-reliability-20260905`；Task BASE为`6e58f1e2d79bd183451c96d0dbfc9ab1db9f20f3`，初版源码提交为`c2e33a2508761835288c0a421d874ecb9dbdf358`（10文件，20604行新增/51行删除，主要为机器JSON/生成目录），最终摘要修复为`ff94eca98961d63d13691658fe5fb2d9a088fc56`（仅三份current制品，4行新增/4行删除）。不能把Rust/Cargo源码pin当本Task提交。
 
@@ -16,9 +18,9 @@
 
 | 制品 | 角色 / SHA-256 |
 | --- | --- |
-| [当前机器目录](push-current-capability-catalog.v1.json) | current-source-audit；`5880d9ccd00cb8fd405ac539f5d140d485f30463bc196429db0e0a20e7992fdf` |
-| [当前源码manifest](push-current-evidence-manifest.v1.json) | current-source-audit；`6864b39bfddd70e37853a83b27c0d528adcda64735680e498783ea9b24d9a600` |
-| [当前四时段目录](push-current-capability-catalog.md) | 派生Markdown；`273fd3cc528cb10b7cb94306a6a02b53d2b724c4fde85424656246b3a4601350` |
+| [当前机器目录](push-current-capability-catalog.v1.json) | current-source-audit；`b3c04218e3548f80c026db905e3d0ac2eed59d7ce24efeefa8e69a20b417de93` |
+| [当前源码manifest](push-current-evidence-manifest.v1.json) | current-source-audit；`309319f13b599d400f72f9b17ac607e5f6aaa9f8e9ee9c24511f02629d34f13c` |
+| [当前四时段目录](push-current-capability-catalog.md) | 派生Markdown；`e4d12fa44a7da92e79a0229e69581e2d6d90cbea9ddf78d1bc3d14b326352303` |
 | [历史机器目录](push-capability-catalog.v1.json) | 原字节保持；`0aa6a2fd87ee9c235073cad3beef44229437f3fe62987b0db510ad36a93aace3` |
 | [历史源码manifest](push-evidence-manifest.v1.json) | 原字节保持；`54dc705961da7a6deb458009d2125ee612257d82bad3c14b65d25642e09b64fa` |
 
@@ -62,11 +64,21 @@ Ruby环境为2.6.10，Git为2.50.1。本批没有运行Cargo、生产CLI、monit
 | `ruby scripts/architecture-docs/check.rb --draft --root .` | exit0，28.340874秒；`architecture_docs_valid html_targets=rfc`，stderr为空 |
 | `ruby scripts/architecture-docs/check.rb --check --root .` | exit1，28.595672秒；仅历史/current四项provisional、RFC/WBS两项provisional和提交前worktree_dirty，stderr为空 |
 | 只读证明 | 610项相关源码/测试/模板/资产/冻结输入/current制品及Git index的SHA、尺寸、mtime前后相同；changed_files为空 |
-| 原字节边界 | Rust/Cargo相对aef7972、全部历史冻结材料相对Task BASE的限定diff均为空；current三制品SHA与上表一致 |
+| 原字节边界 | Rust/Cargo相对aef7972、全部历史冻结材料相对Task1 BASE的限定diff均为空；该时点三制品SHA保存在fix1-current-tree-verification.json，不与顶部Task2当前表混用 |
 
 严格模式仍失败是有效发布阻断，不是内容错误；未过滤或修改状态。前置checker 7a150b2的107/112内容漂移已不再出现在这次实际树结果中。初版记录保留在本Task `current-tree-verification.json`；修复后的核心结果、610项摘要、三制品与索引快照保存在 `fix1-current-tree-verification.json`，逐checker文件快照明细保留在92625终端输出。这不是远端CI、生产数据或完整运行时验收。
 
 独立初审覆盖6e58f1e..c2e33a2，结论C0/I1/M0；唯一I1为上述kind摘要遗漏。原实施者修复后，原审查者仅复核c2e33a2..ff94eca：I1 ADDRESSED、无新增问题，Spec通过、Quality Approved。初审无法仅从diff确认的实际树和冻结边界由上述父线证据闭合；生产caller否定结论仍限定既有审计范围，不扩张为包外不存在。报告分别保留在 `review-verdict.md` 与 `fix1-review-verdict.md`。本Task通过不等于整个项目完成。
+
+## Task2：Unit层残余说明纠正
+
+Task2 BASE=`b531b51fdee7040303fa9a21538e6012445bcac9`，SOURCE=`047b4ab0ac1133a828efe2052eb60a541611e335`。仅三份current制品4行新增/4行删除；[Unit摘要](push-current-capability-catalog.v1.json#L10574)明确同一snapshot、dispatcher内部推进通知集合，并保留非原子/部分写失败不回滚/bool不证明接收。依据为[main一次采集与调用](../../src/bin/monitor/main.rs#L9705)、[prepare](../../src/bin/monitor/push_templates.rs#L6132)、[execute](../../src/bin/monitor/push_templates.rs#L6189)。历史Unit身份/owner/occurrence/phase不变。
+
+实施者用真实BASE对象逐项比较，证明解析内容仅Unit.note与catalog原字节绑定改变；正式locator对应四声明、65/102/52计数、renderer生成及单独--current --check通过，限定diff检查通过。生成和检查最初在同一shell执行，整体exit0、两个成功输出均保留，后续单独check亦exit0；不伪造当时未单独捕获的第一个进程退出码。工具/测试/Rust/Cargo/历史JSON限定diff为空，未为中文文案增加validator或重跑未变套件。准确命令及输出保留task-2-report.md。
+
+父线session34566已终态wrapper0：draft exit0/41.405351秒，strict exit1/39.326052秒，仅历史/current四项provisional、RFC/WBS两项provisional与提交前dirty；610项SHA/尺寸/mtime和索引不变，源码pin与冻结材料diff为空。完整输出保留task2-current-tree-verification.json；其implementation_task_base是Task2 BASE，harness原task_base字段仍表示冻结材料6e58f1e基线。当前三SHA与顶部表一致。
+
+独立审查范围固定b531b51..047b4ab，仅本Task三制品：Spec符合、Quality Approved，Critical/Important/Minor均无。审查者实际核对main→snapshot→prepare→execute及真实sink的is_pushed来源；父线自己的终态34566闭合其无法独立重跑的快照/严格模式要求。完整结论保留task-2-review.md。Task2已关闭，不重审整个Task1或运行时，不把这项完成扩张为全目标完成。
 
 ## 使用与剩余工作
 

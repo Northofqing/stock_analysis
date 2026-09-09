@@ -217,8 +217,10 @@ Foundation的[冻结SQL](push-system-foundation.v1.sql#L5)仍自述PROPOSED/仅�
 
 ## v18/v19：实际来源与旧蓝图转述分开
 
-[Q58](grill-decisions-2026-09-02.md#L76)批准纳管九份来源，[固定来源目录](../../design-source-catalog.v1.json#L10)逐份保存原始SHA、自声明版本/状态与裁决。当前隔离树实际九份为v18.1–v18.5、v19推送模板目录及v19.0–v19.2；本次以实际文件列表与目录核对，不从旧蓝图章节标题推断还有原文。
+[Q58](grill-decisions-2026-09-02.md#L76)批准纳管九份来源，[固定来源目录](../../design-source-catalog.v1.json#L10)逐份保存原始SHA、自声明版本/状态与裁决。这九份为v18.1–v18.5、v19推送模板目录及v19.0–v19.2；它们不是隔离树全部已跟踪设计文件。
 
-旧蓝图另提及[v18.0系列](../Project_Architecture_Blueprint.md#L1668)及[v19.3](../Project_Architecture_Blueprint.md#L1746)，但当前隔离树这两个来源目录没有对应独立原文，也没有其README入口。新版可以保留“旧蓝图历史转述，独立原文未纳管”的覆盖说明，不能虚构已阅读这些原文、其当前SHA或不存在的文件链接；这不代表用户其它工作树或包外资料不存在。
+纠正b531b51中的文件不存在结论：此前使用默认rg --files，被忽略规则隐藏了已跟踪文件。随后在同一b531b51执行git ls-files docs/v18.x docs/v19.x，实际列出16份：固定九份之外另有v18.0四篇、v19.3与两个README；git check-ignore --no-index对两个代表路径也确认会被忽略规则命中。“固定catalog外”不等于“文件不存在/未被Git跟踪”，此前否定结论撤回。
+
+旧蓝图提及的[v18.0系列](../Project_Architecture_Blueprint.md#L1668)及[v19.3](../Project_Architecture_Blueprint.md#L1746)可按实际已跟踪原文读取并记录当前文件证据；但不能将其悄悄加入九份冻结source catalog，或把源码分析提升成新增批准设计。新蓝图应将九份固定来源、额外七份已跟踪资料和原文未核对的历史转述分开；只有实际读过才声明原文覆盖。
 
 [v18.2–v18.5来源记录](../../design-source-catalog.v1.json#L23)的目录名与自声明v20.x/v20.0有明确冲突；[v19模板记录](../../design-source-catalog.v1.json#L75)是历史57-kind快照；[v19.0记录](../../design-source-catalog.v1.json#L86)保留退役规则指针冲突。新蓝图须逐份说明实际吸收、仍为设计及当前证据不足之处，不能仅改版本标签或沿用历史统计。冻结source catalog原有supersession指针保持，不借本次新版蓝图反写历史来源裁决。

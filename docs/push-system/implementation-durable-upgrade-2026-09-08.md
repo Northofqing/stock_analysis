@@ -44,4 +44,6 @@
 
 **已经被旧迁移重排的 v5–v9 库仍需独立兼容处理**：完整单链可从原前驱关系推导逻辑尾；多个独立合法链段缺少原始追加顺序时，不能凭当前版本、hash、timestamp或任意rowid恢复权威。该问题仍属于完整目标，未用本批未来升级修复替代。
 
+2026-09-09只读预检补充：不能用“已有多段照常封口，后续新增审计一律拒绝”作为完整兼容方案。[W16正例](../../src/durable_delivery/tests.rs#L9524)要求global恢复最终到RejectedDurable，而[恢复最终化](../../src/durable_delivery/coordinator.rs#L5772)经[transition_for_reconcile](../../src/durable_delivery/coordinator.rs#L6145)仍到[record_state_transition](../../src/durable_delivery/coordinator.rs#L8450)，需要新增DecisionStateChanged审计；在enqueue处统一拒绝多段会破坏该正例。这个预检建议已撤回，未实现到代码。后续必须同时解决不猜旧重排顺序、合法多段完整恢复与可信顺序/迁移来源；当前尚无已验证兼容方案，不以较容易通过的拒绝行为替代完整目标。以上为源码路径核对，未运行测试、开库或验证生产备份。
+
 完整 W15/W16/W17/W19、52 Unit迁移及发布门禁、离线蓝图/HTML/checker/实际CI等继续按[当前证据入口](README.md)推进。实施顺序与限制见[本批计划](../superpowers/plans/2026-09-08-durable-audit-logical-tail.md)。

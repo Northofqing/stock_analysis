@@ -1,6 +1,6 @@
 # 当前架构蓝图与第二离线HTML目标
 
-日期：2026-09-09。状态：准备，尚未实施。前置[强制当前源码审计](2026-09-09-current-source-audit.md)已于ff94eca完成本地验收及限定复审；本计划消费该最终正式材料，不把候选分析当作机器目录。
+日期：2026-09-09。状态：Task1继续编写；前置[强制当前源码审计](2026-09-09-current-source-audit.md)Task2已在047b4ab修复Unit摘要并通过真实树与独立审查，来源SHA采用该最终版本。额外七份已跟踪设计资料也已实际读完，九份固定source catalog身份不扩张。当前蓝图及第二HTML尚未验收，候选分析不替代机器目录。
 
 目标：落实原文档硬化计划的当前蓝图、两份HTML、兼容入口和统一新鲜度门禁。保留八份冻结输入和九份设计来源的原字节，以新路径记录真实当前架构；当前事实、代码已实现但未生产接线、未来RFC合同和历史材料分开。
 
@@ -24,14 +24,14 @@
 4. 使用已完成594个全仓Rust文件/445884物理行、62公开模块等静态核对，和548项push manifest区分；28 binary/41 integration targets只能称静态候选，除非实际另获metadata证据。Foundation库模块不能标成monitor已启用，生产拒绝和测试绑定保留。
 5. 四时段业务目录必须覆盖前置正式current材料中的全部65 kinds、102 producers、52 Units及enum外路径，以引用/表格说明触发、输入、完成权威、失败处理和现存问题。身份/owner/phase/status与已验收材料一致；代表性架构evidence不是业务迁移证书。复杂关系优先小型图/表，不逐行堆重复叙述。
 6. 认证默认关闭、CLI与daemon差异、monitor固定DB身份、TOML仅启动加载、LocalBridge token、未证明的文件权限、metrics原型、CI遗留e2e引用、建议启动顺序与实际调用顺序，采用已完成核对的准确边界。不通过写文档替代修复遗留代码或认证交付。
-7. v18/v19用当前来源覆盖和实际吸收证据说明；逐份覆盖固定source catalog的九份实际原文。旧蓝图另提及但当前隔离树未纳管的v18.0系列、v19.3与相关README只能列为旧蓝图历史转述，不能虚构已读原文、SHA或文件链接。未来DDL、状态协议、排期、人力基线等链接规范RFC/WBS，不重新发明或平移为当前合同。代码推断的决策须标为推断，不新建或冒称正式批准ADR。
+7. v18/v19用当前来源覆盖和实际吸收证据说明；逐份覆盖固定source catalog的九份原文。git ls-files已确认另有v18.0四篇、v19.3和两个README，共16份已跟踪文件；对额外七份也读取并记录各自Git基线/文件证据和实际吸收边界，但不得将它们加入九份冻结source catalog或升级为新批准来源。撤回此前“隔离树没有这些文件”的错误前提；未读的原文只能标未核对，不得虚构覆盖。未来DDL、状态协议、排期、人力基线等链接规范RFC/WBS，不重新发明或平移为当前合同。代码推断的决策须标为推断，不新建或冒称正式批准ADR。
 8. 主线静态验证所有新增相对链接、具体源码锚点/行界、当前JSON SHA/身份/数量和旧章节覆盖；独立审查核对重要调用边与状态标签。没有当前机器材料或某架构面未核对时，本Task不得完成。
 
 完成边界：一份有完整覆盖说明、可定位证据且不覆盖旧输入的当前Markdown；尚不代表第二HTML、两目标checker或远端CI通过。
 
 ### 固定来源身份格式
 
-当前审计最终ff94eca的字段为schema_version/status/role/baseline_commit，路径与原字节绑定已确定；已完成的审查修复只改业务摘要，不改变这个接口。因此Task1与Task2共用以下封闭格式，不另创可扩展metadata系统：
+当前审计最终047b4ab的字段为schema_version/status/role/baseline_commit，路径与原字节绑定已确定；已完成的两次摘要修复不改变这个接口。因此Task1与Task2共用以下封闭格式，不另创可扩展metadata系统：
 
 - 新蓝图首行为唯一文档H1，紧接空行和一个顶层、无缩进的`architecture-source-v1`围栏；其内容为单一JSON对象，结束围栏之后才进入解释正文。不是普通叙述中的示例块，不解析任意路径或运行JSON内容。
 - 顶层字段恰为`schema_version`、`status`、`role`、`baseline_commit`、`catalog`、`manifest`。前三值分别为数字1、PROVISIONAL、current-source-audit；baseline_commit为两份实际current JSON共有的源码pin。
@@ -43,7 +43,7 @@ Task1只按此格式写入实际最终材料；Task2再实现对应验证及正�
 
 ## Task 2: 第二target、兼容命令与实际离线验收
 
-修改 `scripts/architecture-docs/html_builder.rb`、`build.rb`、`check.rb`、`test/build_test.rb`、`test/check_test.rb`及 `browser_smoke.mjs`；只在真实fixture需要时扩展现有support helper，不复制整套HTML/校验实现。新增 `scripts/render-architecture-blueprint-html.rb` 薄兼容命令及新蓝图HTML，必要时重生成既有RFC HTML以匹配新的实现fingerprint。原模板/renderer/资产非必要不改。
+修改 `scripts/architecture-docs/html_builder.rb`、`build.rb`、`check.rb`、`test/build_test.rb`、`test/check_test.rb`及 `browser_smoke.mjs`；只在真实fixture需要时扩展现有support helper，不复制整套HTML/校验实现。为避免每个来源字段反例都重复全项目验证，允许把现有`test/catalog_test.rb`中的最小真实Git/current构造机械抽取为唯一`test/support/catalog_fixture.rb`供原测试与新HTML测试复用；不改其合同，不mock正式Catalog，以相关fixture/B→C/current反例定向复验，完整项目fixture及实际树验收仍保留。新增 `scripts/render-architecture-blueprint-html.rb` 薄兼容命令及新蓝图HTML，必要时重生成既有RFC HTML以匹配新的实现fingerprint。原模板/renderer/资产非必要不改。
 
 1. 以封闭的 `rfc` / `blueprint` 目标表替代builder内硬编码source/output。保持 `HtmlBuilder.build(root,target,check:)`、`check(root,target)` 公共接口；所有metadata、错误target和路径检查取自同一目标定义。未知target失败，不增加任意路径或插件入口。
 2. RFC前置继续冻结输入检查；blueprint生成/检查在任何输出写入前必须调用正式 `Catalog.validate(root, strict: false)` 的强制历史/current校验，并校验蓝图声明的current来源身份/原字节SHA与实际材料一致。不得解析 `.planning` 候选JSON来替代正式目录，也不得接受正文声明旧pin而current JSON已演进的陈旧蓝图。
@@ -62,4 +62,4 @@ Task1只按此格式写入实际最终材料；Task2再实现对应验证及正�
 
 ## 依赖与回滚
 
-前置current审计 → Task1当前蓝图 → Task2双目标实现/派生产物/实际验收。来源字段已依据实际交付schema固定，具体SHA取已验收ff94eca制品（完整值见前置实施记录）；不为不存在的API写实现。路径、权限和覆盖范围已明确，无需仅因文件命名等待用户。回滚以本批代码与派生产物一致的反向提交进行，不覆盖/删除冻结输入或生产状态，不把回滚扩大为远端Git操作。
+前置current审计 → Task1当前蓝图 → Task2双目标实现/派生产物/实际验收。来源字段已依据实际交付schema固定，具体SHA取已验收047b4ab制品（完整值见前置实施记录）；不为不存在的API写实现。路径、权限和覆盖范围已明确，无需仅因文件命名等待用户。回滚以本批代码与派生产物一致的反向提交进行，不覆盖/删除冻结输入或生产状态，不把回滚扩大为远端Git操作。

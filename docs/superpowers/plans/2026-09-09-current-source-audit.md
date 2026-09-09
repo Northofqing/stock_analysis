@@ -1,6 +1,6 @@
 # 历史规范与强制当前源码审计分层
 
-日期：2026-09-09。状态：本计划Task已完成本地验收及独立审查；初版c2e33a2、最终修复ff94eca。修复后真实树draft0，strict1仅保留七项发布条件，610项只读证明通过；唯一I1已在限定复审关闭，Quality Approved。前置checker最终7a150b2已验收，本Task实施BASE为6e58f1e2d79bd183451c96d0dbfc9ab1db9f20f3。首条B→C真实fixture在产品修改前RED；完整结果见[实施记录](../../push-system/implementation-current-source-audit-2026-09-09.md)。本文的计划要求本身不作为测试、发布或全目标完成证明。
+日期：2026-09-09。状态：Task1已验收至ff94eca；后续Unit摘要遗漏由Task2在047b4ab纠正并通过独立Spec/Quality，两个Task均完成。Task2实际draft0、strict1仅七项发布条件，610项只读证明；原Task1测试及I1记录保留。前置checker最终7a150b2已验收，Task1 BASE为6e58f1e2d79bd183451c96d0dbfc9ab1db9f20f3，Task2 BASE为b531b51fdee7040303fa9a21538e6012445bcac9。首条B→C真实fixture在产品修改前RED；完整结果见[实施记录](../../push-system/implementation-current-source-audit-2026-09-09.md)。计划要求本身不作为发布或全目标完成证明。
 
 目标：履行已批准Q59/Q64/Q65/Q66/Q91/Q92/Q93/Q95/Q105，以独立机器审计版本准确覆盖当前源码，同时保持RFC、WBS和运行时注册表原有规范身份。不能通过关闭旧目录的当前检查而留下没有current检查的空窗。
 
@@ -56,6 +56,18 @@
 21. 实施者完成受影响Catalog/checker套件、renderer定向回归、RFC/WBS历史兼容定向测试、Ruby语法和限定diff检查，并记录准确命令/终态与TDD证据。源码冻结后父线复用同版结果，不重复跑同套件。
 22. 父线必须在真实隔离树运行 `ruby scripts/architecture-docs/check.rb --draft` 与 `--check`，记录内容错误清零或具体失败；另验证历史冻结输入及Rust/Cargo与本Task基线原字节未改。仅历史对齐fixture通过不满足该项。
 23. 对固定Task BASE..SOURCE做一次独立Spec/Quality审查；修复经原实施者及定向复审。父线在docs/push-system记录current材料hash、源commit、真实命令/错误、语义边界和剩余项，并更新README；不以本Task完成关闭全目标。
+
+## Task 2: 修正当前MigrationUnit竞价摘要的残余历史语义
+
+新增依据：后续蓝图实施者发现current catalog第10574行的MU-auction-volume.note仍为“外层选股 set 在 dispatcher true 后 insert；两次数据读取与推送 recorder 并非原子完成。”主线重新读取main.rs:9698–9762及push_templates.rs:6132–6245，确认当前只采集一次、通知集合由dispatcher内部在sink和全部records成功后推进；这是Task1的kind摘要修复未涉及的Unit层遗漏。主线另完整提取52个Unit.note核对已知八项源码变化，本次明确需修此项；这不是所有未变业务链重新审查通过的声明。
+
+1. 只修改docs/push-system/push-current-capability-catalog.v1.json中MU-auction-volume.note，替换为：“P-02外层只采集一次；dispatcher消费同一snapshot生成消息、逐票records与notified_codes，sink返回true且全部recorder成功后由dispatcher内部推进通知集合。部分逐票写失败不回滚，消息发送、入池与集合推进不是原子事务；bool不证明TransportAccepted或业务终态，Unit未晋级。”
+2. 同步docs/push-system/push-current-evidence-manifest.v1.json对current catalog的原字节SHA绑定，并使用正式render-catalog.rb --current --write重新生成docs/push-system/push-current-capability-catalog.md。不得手改生成区，不改任何工具、测试、Rust/Cargo、历史JSON、冻结来源或current其它字段；owner/occurrence/phase/id与65/102/52身份保持。
+3. 修复前保留该note与main→prepare→execute的实际证据；用真实Task BASE Git对象与修复后JSON逐项比较，证明仅该note及对应catalog绑定改变。正式--current --check必须通过，限定diff无空白问题，记录三SHA。这里是文档语义纠正，不为固定中文句子新增产品validator或制造运行时TDD记录；不重跑未改套件。
+4. 一个新鲜实施者只写三制品及task-2-report.md，父线在蓝图写入者明确冻结后才派发，Git由父线精确处理。父线在最终冻结材料上复用实际树双模式/610项只读harness，保存独立task2证据，不覆盖Task1记录；strict仍只允许原真实发布条件。
+5. 对Task2 BASE..SOURCE执行独立限定Spec/Quality审查；开放问题按修复流程处理。不重审或改写原ff94eca限定复审结论，它只覆盖kind修复差异。父线同步中文实施记录、导航及后续蓝图实际SHA，再恢复蓝图写入。整个项目与第二HTML仍未完成。
+
+完成边界：上述残余Unit语义已与当前实际接线一致、原字节绑定/派生/真实门禁及独立审查通过，不能用机器检查通过代替语义证据。
 
 ## 后续依赖与边界
 

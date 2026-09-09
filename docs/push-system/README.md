@@ -4,8 +4,11 @@
 
 ## 当前开发入口（更新至2026-09-09）
 
+最新进度：后续蓝图发现的MU-auction-volume旧摘要已由当前审计Task2在047b4ab修正；真实draft0、strict仅七项发布条件、610项只读与独立Spec/Quality均通过，新增问题已关闭。新版蓝图将使用最终SHA继续，不混用下方Task1的ff94eca身份。另撤回“v18/v19实际仅九份文件”的结论：Git跟踪16份，其中九份属于固定source catalog，另七份已完整读取并单列原文证据，不扩张冻结来源权威。
+
 - [统一文档门禁实施记录](implementation-unified-document-checker-2026-09-09.md)：最终源码7a150b2，限定复审Approved；enum失败漏strict/无ID重复错误、root参数及额外别名全部关闭。修复后定向2/65、1/17、3/28通过；实际draft107/strict112和598项只读证明重新取得。首次TDD过程例外及初审描述更正均保留，不冒称当前draft或远端CI通过。合同见[计划](../superpowers/plans/2026-09-09-unified-document-checker.md)。
 - [强制当前源码审计实施记录](implementation-current-source-audit-2026-09-09.md)：初版c2e33a2、最终修复ff94eca；历史/current两层同批接通，548文件/250声明、65 kinds/102 producers/52 Units身份保持。Catalog整套48/620及最终定向通过；checker原20例有1个测试预期错误，修正后单例10断言通过。独立初审发现的集合竞价摘要遗漏已修复，限定复审Approved、无开放问题。修复后真实draft0、strict仍为6项provisional+提交前dirty，610项只读证明通过；仅此审计Task完成，不代表发布或迁移完成。[计划](../superpowers/plans/2026-09-09-current-source-audit.md)保留全部合同。
+- [当前Unit摘要后续修复](implementation-current-source-audit-2026-09-09.md#task2unit层残余说明纠正)：047b4ab仅改三current制品4+/4-，修复主循环/dispatcher内部推进与双次采集旧文案；独立Spec/Quality通过，原字节绑定/正式派生和实际树验收齐全。此条为最终current制品入口，历史规范不变。
 - [当前蓝图与双目标HTML计划](../superpowers/plans/2026-09-09-current-blueprint-offline-html.md)：下一依赖批，覆盖完整项目架构面、current来源身份、第二target/wrapper和实际离线浏览器验收；新路径不覆盖冻结蓝图，计划不是第二HTML已实现。
 - [当前代码审计增量](current-code-audit-delta-2026-09-09.md)：固定aef7972；107条原始漂移已归类，新增79文件含46生产/33测试，9+29候选已作为后续正式current审计输入。最终current材料见上方ff94eca实施记录，原增量文档保留其调查时点和范围，不改旧RFC/WBS/runtime目录。
 - [当前蓝图规模、调用链与运行边界核对](current-blueprint-inventory-2026-09-09.md)：全仓594个Rust文件/445884行、62个公开顶层模块，与push审计548项口径分开；补核认证/DB/配置/CI、CLI与数据平面、两套Foundation存储、依赖与测试证据边界。四时段主归属按规范10/6/21/28计数，不沿用旧蓝图小标题。targets仅静态候选，无metadata或生产验证，不代表新版蓝图/第二HTML已完成。
