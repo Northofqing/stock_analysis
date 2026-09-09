@@ -133,7 +133,7 @@
         "auction-projection-audit",
         "auction-security-retain"
       ],
-      "note": "外层new_items与dispatcher快照独立读取；true才封外层code set，不证明两批相等。 当前P-02使用snapshot与冻结dispatch提案；来源观察与生产认证分开，旧bool语义及部分记录失败缺口保留。"
+      "note": "当前P-02一次采集，并从同一snapshot准备消息、逐票records和notified_codes；sink成功且全部记录成功后才推进通知集合。逐票写入仍非原子，部分记录失败不回滚已写记录；bool不是typed终态或TransportAccepted证明。来源观察与生产认证分开，不据此晋级Unit。"
     },
     {
       "kind": "VirtualWatch",
