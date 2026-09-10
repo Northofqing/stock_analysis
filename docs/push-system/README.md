@@ -13,17 +13,20 @@
 - [当前Unit摘要后续修复](implementation-current-source-audit-2026-09-09.md#task2-unit层残余说明纠正)：047b4ab仅改三current制品4+/4-，修复主循环/dispatcher内部推进与双次采集旧文案；独立Spec/Quality通过，原字节绑定/正式派生和实际树验收齐全。此条为最终current制品入口，历史规范不变。
 - [当前蓝图与双目标HTML计划](../superpowers/plans/2026-09-09-current-blueprint-offline-html.md)：两Task、实际产物及最终收尾均已完成，独立审查和限定复审通过；新路径不覆盖冻结蓝图。
 - [W15当前记录查询实施记录](implementation-readiness-current-query-2026-09-10.md)：初版c737110、孤立分支修复14def95；修复后8项query/12项store及格式/Clippy通过，独立初审质量Approved、限定复审问题关闭。本内部任务完成，初版过程证据与activation直测Minor仍保留。复用v3/store/完整集合重读，拒绝历史head与查询期间漂移；仅内部候选入口，不冒充同一认证快照的最终消费者。[计划](../superpowers/plans/2026-09-10-readiness-current-record-query.md)保留完整认证接线目标。
-- [W18操作员请求入口计划](../superpowers/plans/2026-09-10-operator-request-intake.md)：已依据RFC和现有身份/canonical代码准备，尚未派发实现；补齐严格wire、typed target和精确命令身份，不把原始操作员引用解析为认证。真实批准、独立审计、执行/响应与生产配置仍是必要后续，不以parser代替完整控制面。
+- [W18操作员请求入口实施记录](implementation-operator-request-intake-2026-09-10.md)：初版409dbaf、最终9f35ab1；修复后16项定向测试/格式通过，Clippy退出0但保留29条dead_code Minor，限定复审两项关闭且无新重要问题，本输入Task完成。严格wire和命令身份不认证原始引用；真实批准、独立审计、执行/响应仍必需。[计划](../superpowers/plans/2026-09-10-operator-request-intake.md)保留完整后续目标。
 - [当前代码审计增量](current-code-audit-delta-2026-09-09.md)：固定aef7972；107条原始漂移已归类，新增79文件含46生产/33测试，9+29候选已作为后续正式current审计输入。最终current材料见上方047b4ab后续修复，原增量文档保留其调查时点和范围，不改旧RFC/WBS/runtime目录。
 - [当前蓝图规模、调用链与运行边界核对](current-blueprint-inventory-2026-09-09.md)：全仓594个Rust文件/445884行、62个公开顶层模块，与push审计548项口径分开；补核认证/DB/配置/CI、CLI与数据平面、两套Foundation存储、依赖与测试证据边界。四时段主归属按规范10/6/21/28计数，不沿用旧蓝图小标题。targets仅静态候选，无metadata或生产验证，不代表新版蓝图/第二HTML已完成。
 - [RFC 离线HTML构建](implementation-offline-rfc-html-2026-09-09.md)：最终源码ca1b581；23项测试/676条断言通过，独立限定复审Approved，原3项及段落边界回归均关闭。实际浏览器4图成功/1图回退、点击与注入阻断、全屏和页面0外部请求通过；[离线页面](push-system-implementation-rfc.html)已纳管。保留官方发行JS原字节及30条空白告警，不覆盖八份冻结输入，不代表双份HTML/统一checker/CI或当前证据目录已完成。
 - [旧库升级与恢复审计接续](implementation-durable-upgrade-2026-09-08.md)：源码77cc3bc；正式升级/提交、原rowid与数据保持、正确接续/终态、重复恢复/实例重开及坏FK完整回滚，最终67项合批、静态检查及独立规格/质量审查通过。已被旧迁移重排的v5–v9库保留独立兼容任务，不代表全部审计兼容或全项目完成。
 - [恢复分类不确定投递读取修复](implementation-recovered-uncertain-read-2026-09-08.md)：源码a2429b3、修复fb55d32/61e9d16；真实过期恢复贯通Generic/P01及SLA/指标。自环与跳链均实际RED后修复，最终55项/静态检查/限定复审通过；无盲重发或状态提升，不等于完整Q39/W19完成。
 - [CI 映射式触发识别修复](implementation-ci-mapping-trigger-2026-09-08.md)：源码80d0fb2；95项定向测试、614条断言通过，独立复审已关闭排除项取消全部正向匹配漏洞；识别当前真实CI触发格式，不改CI配置，也不代表HTML/统一checker/实际CI已交付。
-- [52个迁移单元的当前完成证据](remaining-migration-evidence-2026-09-08.md)：区分目录覆盖、6个已核对旧业务入口、46个本次未逐链核对单元与完整迁移认证；不以注册表或测试数量计算迁移完成率。
+- [52个迁移单元的当前完成证据](remaining-migration-evidence-2026-09-08.md)：2026-09-10补充后，7个Unit可指出实际旧业务入口，45个尚未逐链追完；原6/46历史口径保留，不以注册表、调用链或测试数计算迁移完成率。
+- [集合竞价候选单元调用链](auction-candidates-call-chain-2026-09-10.md)：源码409dbaf；A-02/P-05分时成功与同轮双bool外门不匹配，P-05在主卡发送前推进快照并忽略失效通知结果。仅源码反例与后续接线约束，不是生产复现或已修复，不扩大当前P-02量能诊断任务。
 - [P-02 来源观察保留实施记录](implementation-auction-source-observation-2026-09-08.md)：本计划完成，20项lib与51项monitor回归、Clippy及独立评审通过。实际采集/名称分片/审计回执保留到竞价tick消费，旧投影兼容；非空池缺量比不称VerifiedEmpty，不增加量比来源或生产权限，不等于完整W17完成。
 - [P-02 冻结业务准备实施记录](implementation-auction-frozen-preparation-2026-09-08.md)：源码`eeb2ddc`、测试修复`74954fe`；一次横幅捕获、完整消息/逐票记录/通知集合提案已被实际dispatcher消费。修复后51项测试、静态检查及限定复审通过；没有补造量比来源，不代表完整W17迁移或上线完成。
 - [P-02 量比与来源证据核对](auction-source-evidence-gaps-2026-09-08.md)：现行规则禁止跨批补量比，MarketStatistics同名字段尚无完整竞价合同；区分可先行的真实证据保留工程与需要产品/提供方确认的接源条件，不改变生产来源。
+- [P-02 真实业务影子接线前置](p02-shadow-integration-handoff-2026-09-10.md)：按当前源码核对已完成的观察、冻结提案与影子内核；下一步须比较消息/逐票记录/通知集合，并让dispatcher消费同一旧提案。可信注册、完整业务adapter与八端口接线尚未交付，不重复开发来源保留、不把缺量比当VerifiedEmpty。
+- [P-02 选集拒绝诊断计划](../superpowers/plans/2026-09-10-auction-selection-diagnostics.md)：准备中，等待唯一实现/Cargo队列交接；让真实selector/tick保留空源、缺字段、有效行已通知的结构化事实，成功选票/文案/写库/通知集合规则不变。仅补影子接线的必要输入事实，不补量比、不签发领域完成或生产权限。
 - [W19 全量库存指标实施记录](implementation-w19-inventory-results-2026-09-08.md)：源码8094ffc、修复c10ec78；覆盖指定namespace全部业务日/状态、真实来源SLA、错误分母与扫描预算。N02缺lock冷读与Completed+Conflict漏等待年龄两个反例先RED再修复，最终107项测试/静态检查/限定复审通过。readiness/晋级消费者、完整留存与安全审计仍待，不将库存指标当生产健康许可。
 - [W19 持久化最终化延迟检查结果](implementation-w19-results-2026-09-08.md)：初版27967be、修复6f8713c；通过Generic/P01/N02实际持久化reader与同事务业务全链读取，使用原始接受时间计算两周期目标/五分钟硬上限，保留人工、未决和冲突状态。审查发现的历史终态/资格遗漏先实际复现13种矛盾再修复，最终78项测试通过、本批静态零诊断，限定复审全部关闭；仅N02明确支持的局部occurrence约定，不代表生产注册。完整W19的指标汇总、留存与安全审计及生产消费仍待。
 - [W17 影子执行内核结果](implementation-w17-results-2026-09-08.md)：源码`89128f3`，一次采集共用context/facts，精确比较真实决策/语义/渲染字节/完成提案；八类拒绝端口先计数再拒绝。17项新测试和52项相邻测试全部通过，最终静态检查本批零诊断，独立Spec/Quality通过。生产业务适配、全局端口纳管及W16激活证据仍待，不代表完整W17或迁移完成。
