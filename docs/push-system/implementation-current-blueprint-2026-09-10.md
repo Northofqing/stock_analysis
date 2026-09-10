@@ -1,6 +1,6 @@
 # 当前项目架构蓝图：实施记录
 
-日期：2026-09-10。状态：Markdown Task1已完成；独立规格符合、质量Approved，Critical=0、Important=0、Minor=1。第二HTML和双目标工具尚未实现；本记录不表示全项目或生产迁移完成。
+日期：2026-09-10。状态：Markdown Task1已完成；其一项Minor及链接小修由Task2收口。Task2源码`abeabf6bda611113629ffa8b36cd8dceb55c7126`独立规格符合、质量Approved，Critical=0、Important=0、Minor=2；完整受影响测试、真实双HTML生成/门禁及新蓝图浏览器验收通过。本次交付包含两份实际HTML和中文记录；计划最终整体审查仍待，不表示全项目或生产迁移完成。
 
 ## 已交付
 
@@ -11,9 +11,9 @@
 - 九份冻结v18/v19来源与额外七份Git资料分别列原字节SHA和实际吸收边界；594个全仓Rust文件与548项push manifest分别说明。
 - 库级/测试专用/条件/未接线、默认入口与外部部署分开；未跟踪的外部proto不归入Git基线，也不以静态阅读序号冒称wire ID。
 
-## 当前版本的验证证据
+## Task1定稿版本的验证证据
 
-Markdown为1029行、190257字节，SHA-256：`ab3422d2bffbaa7a3b0ee3c25522e84fd574c06cd456a206fad6f0c7b8c46b73`。Rust/Cargo来源仍为`aef7972965f610ed418049593dfff1d55341772e`；catalog/manifest绑定采用[047b4ab最终审计材料](implementation-current-source-audit-2026-09-09.md#task2-unit层残余说明纠正)，状态保持PROVISIONAL。
+Task1提交时Markdown为1029行、190257字节，SHA-256：`ab3422d2bffbaa7a3b0ee3c25522e84fd574c06cd456a206fad6f0c7b8c46b73`；这是下方两处小修之前的版本。Rust/Cargo来源仍为`aef7972965f610ed418049593dfff1d55341772e`；catalog/manifest绑定采用[047b4ab最终审计材料](implementation-current-source-audit-2026-09-09.md#task2-unit层残余说明纠正)，状态保持PROVISIONAL。
 
 | 验证 | 实际结果 | 不覆盖什么 |
 | --- | --- | --- |
@@ -25,8 +25,44 @@ Markdown为1029行、190257字节，SHA-256：`ab3422d2bffbaa7a3b0ee3c25522e84fd
 
 私有工作底稿保留实际命令、原始终态与限定审查，不作为公开页面必需依赖。旧初稿的四项链接失败已随定稿修正；没有把初稿检查冒充最终结果，也没有为Markdown重跑未变Rust套件。
 
-## 下一批收口
+## Task2源文档增量核对
 
-Task2按[双目标计划](../superpowers/plans/2026-09-09-current-blueprint-offline-html.md)开发blueprint目标、薄兼容命令、两目标生成/只读门禁及实际离线浏览器验收；同时只修正新MD两处小问题：v19.1原文没有明确交易日，移除“五交易日”的额外解释；旧A.1链接标签中的行内反引号导致既有renderer未生成链接，去掉该标签格式并保留#L1833目标。修改后须重新记录MD/HTML源字节，不沿用上方摘要。
+开发BASE为`d78acbd899c2973feef491cfefd1859eefda02b3`。父线只读检查实际exit0：当前MD逐字节等于该BASE版本加两项批准替换，没有其他正文变化；v19.1改为“原设计的5日收益验证闭环”，旧A.1标签移除src/lib.rs两侧反引号，链接目标仍为旧蓝图#L1833。
 
-尚未取得第二HTML、双目标正反例、实际页面交互和页面零HTTP(S)尝试、远端CI或生产接收证明。旧v5–v9审计顺序兼容、完整W15–W21及52 Unit迁移等仍按[开发入口](README.md)继续；[追加存储证据](implementation-durable-upgrade-2026-09-08.md#追加存储能提供的顺序证据)只是已核查的兼容设计输入，不是运行修复。
+修改后为190259字节，SHA-256：`07d80a516332b013274caf200ef354e67e6d648babf2fd70a19aa4a75f559c85`。current两JSON仍匹配047b4ab已验收摘要；Rust/Cargo相对aef7972、冻结输入相对Task2 BASE的diff均为空。来源预检本身不证明HTML通过；后续实际完整内嵌字节和A.1链接验证见下节。
+
+## Task2双目标实际验收
+
+使用[当前蓝图HTML](../architecture/current/Project_Architecture_Blueprint.html)和重生成的[RFC HTML](push-system-implementation-rfc.html)，不覆盖旧蓝图。两份页面仍为PROVISIONAL，完整内嵌各自Markdown原字节，metadata绑定实际模板、构建实现及固定Mermaid资产。新蓝图实际HTML包含修复后的A.1链接、35个标题、33张表和6份完整原图源。
+
+| 验证 | 真实结果 |
+| --- | --- |
+| 受影响Ruby合批 | `ruby -I scripts/architecture-docs/test -e 'require File.expand_path("scripts/architecture-docs/test/build_test.rb"); require File.expand_path("scripts/architecture-docs/test/check_test.rb")'`，exit0，55 runs / 1128 assertions / 0 failures / 0 errors / 0 skips，1115.977797s |
+| 最小真实fixture抽取回归 | Catalog有效隔离树、历史B→当前C及非祖先/来源缺失三项定向，3 runs / 28 assertions，全通过；不mock或跳过Catalog |
+| 实际首次生成 | `ruby scripts/architecture-docs/build.rb --all --draft --root .`，exit0，依次写入rfc、blueprint |
+| 确定性与只读 | 重复同一生成命令、`build.rb --all --check --draft --root .`及兼容命令`ruby scripts/render-architecture-blueprint-html.rb --check --draft --root .`均exit0；bytes/mtime不变 |
+| 统一内容门禁 | `ruby scripts/architecture-docs/check.rb --draft --root .`，exit0，明确报告`html_targets=rfc,blueprint` |
+| 严格发布门禁 | `ruby scripts/architecture-docs/check.rb --check --root .`，exit1；只剩历史/current四项PROVISIONAL、RFC/WBS两项PROVISIONAL及当时的worktree_dirty，未出现内容错误；不是严格发布通过 |
+| 保护快照 | 668项文件；首次仅两份HTML改变，重复及检查阶段无保护文件变化，Git index的bytes/mtime相同；测试/browser脚本与父线记录因并行开发明确不在该快照范围内 |
+| 新蓝图实际浏览器 | 独立`--blueprint`入口exit0；35标题/33表/6图正常SVG，单次render故障仅1图可读回退、其他5图正常；搜索/主题/折叠/打印/全屏通过，页面HTTP(S)请求尝试0 |
+
+首次Ruby合批曾有一项测试自身的二进制/UTF-8比较错误，修正期望字面为`.b`后完成上表真实整批复验；没有把失败轮或定向通过冒充整批通过。当前源码没有因此修改模板、renderer或资产。
+
+| 制品 | 字节数 | SHA-256 |
+| --- | ---: | --- |
+| 当前蓝图HTML | 4075422 | `42e4b1f9e3816de126defb251ca97879ade022a977c358b510d6ee144581d076` |
+| RFC HTML | 4214805 | `3fc9aba16e079569f2037f0399c5bd7aa79969d647b1b785528e46493be4ed70` |
+
+两HTML分别相对`/dev/null`执行完整`git diff --no-index --check`，实际各exit3；各30条尾随空白诊断逐行等于原始官方Mermaid内嵌位置，没有额外诊断。仅保留既有原字节例外，不增加全局豁免，不把该结果描述为不限定范围的diff检查全绿。11份手写源码/测试的正式暂存diff检查exit0；公开文档本轮新增26个本地链接/行界/标题锚点检查无错误。
+
+Chrome/152.0.7977.83使用独立临时profile，Browser.close已返回确认且自有进程exit0。平台显示/updater日志另保留，不把“页面0请求”扩大为整个浏览器/操作系统零网络；未重跑旧RFC中未变的安全调查。浏览器关闭后再次核对两MD及两HTML摘要相等，随后才提交源码；提交不改变产物实现指纹。
+
+开发期间有一次agent命令误传workdir，执行只读git status/diff/sha/rg时进入根工作树；未执行文件修改、生成器、测试或显式Git写命令，但未设置GIT_OPTIONAL_LOCKS，不能证明根index没有被刷新。发现后停止访问，未尝试修复根树既存改动。本批全部实现、验收和提交均在隔离树内。
+
+## 后续收口
+
+Task2按[双目标计划](../superpowers/plans/2026-09-09-current-blueprint-offline-html.md)完成独立规格/质量审查；SOURCE为abeabf6，正式差异包固定d78acbd..abeabf6，仅11份源码/测试及两处新MD修订，主线实际产物证据另供审查。结论Spec符合、Quality Approved、C0/I0/M2。最小目标识别的正式RED为1 run / 2 assertions、exit1、旧target_unknown；测试装配阶段的NameError不计为行为RED。
+
+两项非阻断Minor交最终整体审查统一处理：browser usage尚未准确表达“endpoint加至少一个profile”；SHA反例仅直接覆盖catalog摘要，建议补manifest独立漂移。审查确认现有完整对象比较已拒绝manifest不匹配，不把测试粒度建议描述为当前校验绕过。
+
+尚未完成本计划最终整体审查、远端CI或生产接收证明。旧v5–v9审计顺序兼容、完整W15–W21及52 Unit迁移等仍按[开发入口](README.md)继续；[追加存储证据](implementation-durable-upgrade-2026-09-08.md#追加存储能提供的顺序证据)只是已核查的兼容设计输入，不是运行修复。

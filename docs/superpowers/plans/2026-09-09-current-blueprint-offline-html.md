@@ -1,6 +1,6 @@
 # 当前架构蓝图与第二离线HTML目标
 
-日期：2026-09-09；更新：2026-09-10。状态：Task1已在c1e24d0完成，独立Spec/Quality Approved、C0/I0/M1；18节完整蓝图、65/102/52精确投影、来源与链接验收通过。M1及父线发现的一处链接显示问题交Task2批内收口，第二HTML尚未实现。前置[强制当前源码审计](2026-09-09-current-source-audit.md)最终身份采用047b4ab；九份固定来源与七份额外Git资料分域不变。当前状态见[实施记录](../../push-system/implementation-current-blueprint-2026-09-10.md)。
+日期：2026-09-09；更新：2026-09-10。状态：Task1已在c1e24d0完成，独立Spec/Quality Approved、C0/I0/M1；18节完整蓝图、65/102/52精确投影、来源与链接验收通过。Task2源码abeabf6已收口两处MD小修，55项/1128断言、真实两HTML生成/重复/门禁及新蓝图浏览器通过；独立Spec/Quality Approved、C0/I0/M2，本次交付含实际制品，计划最终整体审查仍待。前置[强制当前源码审计](2026-09-09-current-source-audit.md)最终身份采用047b4ab；九份固定来源与七份额外Git资料分域不变。当前状态见[实施记录](../../push-system/implementation-current-blueprint-2026-09-10.md)。
 
 目标：落实原文档硬化计划的当前蓝图、两份HTML、兼容入口和统一新鲜度门禁。保留八份冻结输入和九份设计来源的原字节，以新路径记录真实当前架构；当前事实、代码已实现但未生产接线、未来RFC合同和历史材料分开。
 

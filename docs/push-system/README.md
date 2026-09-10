@@ -4,15 +4,15 @@
 
 ## 当前开发入口（更新至2026-09-10）
 
-最新进度：后续蓝图发现的MU-auction-volume旧摘要已由当前审计Task2在047b4ab修正；真实draft0、strict仅七项发布条件、610项只读与独立Spec/Quality均通过，新增问题已关闭。新版蓝图将使用最终SHA继续，不混用下方Task1的ff94eca身份。另撤回“v18/v19实际仅九份文件”的结论：Git跟踪16份，其中九份属于固定source catalog，另七份已完整读取并单列原文证据，不扩张冻结来源权威。
+当前审计基线：后续蓝图发现的MU-auction-volume旧摘要已由当前审计Task2在047b4ab修正；该批真实draft0、strict仅七项发布条件、610项只读与独立Spec/Quality均通过，新增问题已关闭。新版蓝图已消费最终SHA，不混用审计初版ff94eca身份。另撤回“v18/v19实际仅九份文件”的结论：Git跟踪16份，其中九份属于固定source catalog，另七份已完整读取并单列原文证据，不扩张冻结来源权威。
 
-2026-09-10：完整[当前架构蓝图](../architecture/current/Project_Architecture_Blueprint.md)已在c1e24d0交付Markdown，覆盖18节、65/102/52精确身份及16份设计来源，独立Spec/Quality Approved；[实施记录](implementation-current-blueprint-2026-09-10.md)区分已验证内容与两处后续小修。现在转入双HTML开发，尚无第二HTML或生产迁移完成证明。
+2026-09-10：完整[当前架构蓝图](../architecture/current/Project_Architecture_Blueprint.md)已在c1e24d0交付Markdown，覆盖18节、65/102/52精确身份及16份设计来源，独立Spec/Quality Approved。双目标源码abeabf6已通过55项/1128断言及独立规格/质量审查（C0/I0/M2）；[当前离线蓝图](../architecture/current/Project_Architecture_Blueprint.html)和[RFC离线页面](push-system-implementation-rfc.html)真实生成、重复/只读门禁及新蓝图浏览器验收通过，本次交付包含实际制品。具体摘要/命令/发布阻断见[实施记录](implementation-current-blueprint-2026-09-10.md)，计划最终整体审查仍待，不代表生产迁移完成。
 
 - [统一文档门禁实施记录](implementation-unified-document-checker-2026-09-09.md)：最终源码7a150b2，限定复审Approved；enum失败漏strict/无ID重复错误、root参数及额外别名全部关闭。修复后定向2/65、1/17、3/28通过；实际draft107/strict112和598项只读证明重新取得。首次TDD过程例外及初审描述更正均保留，不冒称当前draft或远端CI通过。合同见[计划](../superpowers/plans/2026-09-09-unified-document-checker.md)。
 - [强制当前源码审计实施记录](implementation-current-source-audit-2026-09-09.md)：初版c2e33a2、最终修复ff94eca；历史/current两层同批接通，548文件/250声明、65 kinds/102 producers/52 Units身份保持。Catalog整套48/620及最终定向通过；checker原20例有1个测试预期错误，修正后单例10断言通过。独立初审发现的集合竞价摘要遗漏已修复，限定复审Approved、无开放问题。修复后真实draft0、strict仍为6项provisional+提交前dirty，610项只读证明通过；仅此审计Task完成，不代表发布或迁移完成。[计划](../superpowers/plans/2026-09-09-current-source-audit.md)保留全部合同。
 - [当前Unit摘要后续修复](implementation-current-source-audit-2026-09-09.md#task2-unit层残余说明纠正)：047b4ab仅改三current制品4+/4-，修复主循环/dispatcher内部推进与双次采集旧文案；独立Spec/Quality通过，原字节绑定/正式派生和实际树验收齐全。此条为最终current制品入口，历史规范不变。
-- [当前蓝图与双目标HTML计划](../superpowers/plans/2026-09-09-current-blueprint-offline-html.md)：Task1当前Markdown已交付并审查；Task2继续第二target/wrapper和实际离线浏览器验收，新路径不覆盖冻结蓝图。
-- [当前代码审计增量](current-code-audit-delta-2026-09-09.md)：固定aef7972；107条原始漂移已归类，新增79文件含46生产/33测试，9+29候选已作为后续正式current审计输入。最终current材料见上方ff94eca实施记录，原增量文档保留其调查时点和范围，不改旧RFC/WBS/runtime目录。
+- [当前蓝图与双目标HTML计划](../superpowers/plans/2026-09-09-current-blueprint-offline-html.md)：Task1当前Markdown、Task2代码及本地实际产物验收已完成，两Task均通过独立审查；计划最终整体审查仍待，新路径不覆盖冻结蓝图。
+- [当前代码审计增量](current-code-audit-delta-2026-09-09.md)：固定aef7972；107条原始漂移已归类，新增79文件含46生产/33测试，9+29候选已作为后续正式current审计输入。最终current材料见上方047b4ab后续修复，原增量文档保留其调查时点和范围，不改旧RFC/WBS/runtime目录。
 - [当前蓝图规模、调用链与运行边界核对](current-blueprint-inventory-2026-09-09.md)：全仓594个Rust文件/445884行、62个公开顶层模块，与push审计548项口径分开；补核认证/DB/配置/CI、CLI与数据平面、两套Foundation存储、依赖与测试证据边界。四时段主归属按规范10/6/21/28计数，不沿用旧蓝图小标题。targets仅静态候选，无metadata或生产验证，不代表新版蓝图/第二HTML已完成。
 - [RFC 离线HTML构建](implementation-offline-rfc-html-2026-09-09.md)：最终源码ca1b581；23项测试/676条断言通过，独立限定复审Approved，原3项及段落边界回归均关闭。实际浏览器4图成功/1图回退、点击与注入阻断、全屏和页面0外部请求通过；[离线页面](push-system-implementation-rfc.html)已纳管。保留官方发行JS原字节及30条空白告警，不覆盖八份冻结输入，不代表双份HTML/统一checker/CI或当前证据目录已完成。
 - [旧库升级与恢复审计接续](implementation-durable-upgrade-2026-09-08.md)：源码77cc3bc；正式升级/提交、原rowid与数据保持、正确接续/终态、重复恢复/实例重开及坏FK完整回滚，最终67项合批、静态检查及独立规格/质量审查通过。已被旧迁移重排的v5–v9库保留独立兼容任务，不代表全部审计兼容或全项目完成。
@@ -25,7 +25,7 @@
 - [W19 全量库存指标实施记录](implementation-w19-inventory-results-2026-09-08.md)：源码8094ffc、修复c10ec78；覆盖指定namespace全部业务日/状态、真实来源SLA、错误分母与扫描预算。N02缺lock冷读与Completed+Conflict漏等待年龄两个反例先RED再修复，最终107项测试/静态检查/限定复审通过。readiness/晋级消费者、完整留存与安全审计仍待，不将库存指标当生产健康许可。
 - [W19 持久化最终化延迟检查结果](implementation-w19-results-2026-09-08.md)：初版27967be、修复6f8713c；通过Generic/P01/N02实际持久化reader与同事务业务全链读取，使用原始接受时间计算两周期目标/五分钟硬上限，保留人工、未决和冲突状态。审查发现的历史终态/资格遗漏先实际复现13种矛盾再修复，最终78项测试通过、本批静态零诊断，限定复审全部关闭；仅N02明确支持的局部occurrence约定，不代表生产注册。完整W19的指标汇总、留存与安全审计及生产消费仍待。
 - [W17 影子执行内核结果](implementation-w17-results-2026-09-08.md)：源码`89128f3`，一次采集共用context/facts，精确比较真实决策/语义/渲染字节/完成提案；八类拒绝端口先计数再拒绝。17项新测试和52项相邻测试全部通过，最终静态检查本批零诊断，独立Spec/Quality通过。生产业务适配、全局端口纳管及W16激活证据仍待，不代表完整W17或迁移完成。
-- [W15 实施结果](implementation-w15-results-2026-09-07.md) §10–12：依赖候选合同、实际 occurrence 读取和采集事务适配器已通过限定验证/审查，完整来源认证、运行查询及调度联结尚未完成。
+- [W15 实施结果](implementation-w15-results-2026-09-07.md) §10–13：依赖候选合同、实际 occurrence 读取、采集事务适配器及后续v3完整Unit集合已经存在；最新只读核对纠正“仍只有单manifest”的旧状态。完整来源认证、同一认证快照的query/probe及调度联结尚未完成。
 - [W16 实施结果](implementation-w16-results-2026-09-08.md)：已有跨进程broker接入真实initial写入、Generic发送与只恢复；最新T4D将精确业务恢复/finalizer写入接入同一worker许可（源码`4c07aaa`、测试修正`667ee4a`）。修正后受影响合批104项通过，含4个真实进程父测试，目标Clippy零诊断，限定复核全部关闭；未变邻域保留此前498项通过证据，不冒称修正后全量重跑。生产身份/受保护根、完整四actor共同fence、实际切换、具体Unit cursor及全Unit消费仍按[实施计划](../superpowers/plans/2026-09-08-push-foundation-w16-activation.md)交付，不能按基础切片标W16完成。
 - [W16 合同裁决](activation-contract-decisions-2026-09-08.md)：澄清 shadow actor 与旧推送关系，固定外部批准包、同事务写入和paused确认顺序；真实监督器及恢复接线仍需实现证明，不是生产批准。
 - [全 Unit 部署集合合同](activation-deployment-set-contract-2026-09-08.md)：全52Unit候选集合构造、真实读取、重读漂移和范围投影已实现至`e0cdd0d`，11项专项及最终golden1项通过，限定复核关闭排序缺陷。集合版持久消费后续进展见下方计划入口及[实施结果](implementation-w16-results-2026-09-08.md)，实际来源认证仍未交付。
