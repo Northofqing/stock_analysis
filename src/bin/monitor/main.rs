@@ -174,6 +174,8 @@ mod news_ai_shadow;
 
 mod health;
 
+mod holding_plan;
+
 mod webhook_alert;
 
 // 修复 Top10#3+#4 (2026-06-29 audit): 拆大文件
@@ -8311,12 +8313,14 @@ fn t0_delivery_outcomes_confirmed(outcomes: &[notify::PushOutcome]) -> bool {
 // 原 dispatch_holding_plan_daily_result 恒 capability_unavailable
 // (holding_plan_counted_binding_unavailable)。真实实现:
 //   数据源: BR-226 用户确认快照 (cost/quantity) + 统一行情
-//          (market_data::fetch_position_quotes, BR-227)。
+//          (market_data::fetch_realtime_quote_batch 精确请求快照代码)。
 //   判定规则 (v12 §14.1 简化, 与 I-04 注释一致): 现价相对成本 >+5% 减仓,
 //          <-3% 加仓, 否则持有观望。
-//   binding: occurrence = holding-plan:{date}:{code} (当日一票一推, counted
-//          去重), scope=Ticket, origin=InternalDurable (快照+行情为真实证据,
-//          不伪造批次身份)。失败保留重试资格 (定时器不前进), 成功才封口。
+//   binding: source bytes 保留同轮快照与原始行情批次来源; occurrence =
+//          holding-plan:{date}:{code}, scope=Ticket, origin=InternalDurable。
+//          来源变化只改变新 decision 的身份, 不授予重发资格。holding_plan_daily
+//          仅是周期路径的辅助过滤, 不是手动/启动路径共享的 durable 完成权威。
+//          失败保留重试资格 (定时器不前进), 成功才封口。
 // ═══════════════════════════════════════════════════════════════
 
 struct PreparedHoldingPlan {
@@ -8388,104 +8392,12 @@ struct HoldingPlanDailyRow {
 async fn prepare_holding_plan_messages(
     banner: &push_templates::BannerCtx,
 ) -> Result<Vec<PreparedHoldingPlan>, String> {
-    use sha2::{Digest, Sha256};
-    use stock_analysis::database::user_position_snapshot::latest_user_position_snapshot;
-    use stock_analysis::market_domain::{AssetClass, Exchange, InstrumentId};
-
-    let snapshot = latest_user_position_snapshot()
-        .map_err(|error| format!("持仓快照读取失败: {error}"))?
-        .ok_or_else(|| "无用户确认持仓快照 (BR-226)".to_string())?;
-    if snapshot.confirm_empty || snapshot.items.is_empty() {
-        return Ok(Vec::new()); // 空持仓 → 无受众, 静默
-    }
-    let quotes = market_data::fetch_position_quotes()
-        .map_err(|error| format!("持仓行情批次拒绝: {error}"))?;
-    let quote_map: std::collections::HashMap<String, &stock_analysis::market_data::TopStock> =
-        quotes.iter().map(|q| (q.code.clone(), q)).collect();
-
-    let business_date = chrono::Local::now().date_naive();
-    let hhmm = chrono::Local::now().format("%H:%M").to_string();
-    let mut out = Vec::new();
-    for item in &snapshot.items {
-        let Some(quote) = quote_map.get(&item.code) else {
-            log::warn!("[T-03] code={} 行情缺失, 跳过该票 (其余照常)", item.code);
-            continue;
-        };
-        if item.cost_price <= 0.0 {
-            log::warn!("[T-03] code={} 成本价非法, 跳过", item.code);
-            continue;
-        }
-        let pnl_pct = (quote.price / item.cost_price - 1.0) * 100.0;
-        let intent = if pnl_pct > 5.0 {
-            push_templates::Intent::Reduce
-        } else if pnl_pct < -3.0 {
-            push_templates::Intent::Add
-        } else {
-            push_templates::Intent::Hold
-        };
-        let reason = match intent {
-            push_templates::Intent::Reduce => {
-                format!("浮盈 {pnl_pct:.1}% 触发减仓观察 (>+5%)")
-            }
-            push_templates::Intent::Add => format!("浮亏 {pnl_pct:.1}% 触发加仓观察 (<-3%)"),
-            push_templates::Intent::Hold => format!("浮盈 {pnl_pct:.1}%, 持有观望区间"),
-            _ => unreachable!("T-03 只产出 Reduce/Add/Hold"),
-        };
-        let reasons = vec![reason];
-        let text = push_templates::render_holding_plan(
-            banner,
-            push_templates::HoldingPlanParams {
-                name: &item.name,
-                code: &item.code,
-                hhmm: &hhmm,
-                intent,
-                price: quote.price,
-                cost: item.cost_price,
-                avail: u32::try_from(item.quantity).unwrap_or(u32::MAX),
-                reduce_zone: Some((item.cost_price * 1.02, item.cost_price * 1.05)),
-                support: item.cost_price * 0.95,
-                pressure: item.cost_price * 1.10,
-                stop: item.cost_price * 0.92,
-                invalidations: &[],
-                reasons: &reasons,
-            },
-        );
-        let canonical = serde_json::json!({
-            "code": item.code,
-            "intent": intent.label(),
-            "price": quote.price,
-            "cost": item.cost_price,
-            "quantity": item.quantity,
-            "pnl_pct": pnl_pct,
-            "observed_at": chrono::Local::now().to_rfc3339(),
-        });
-        let canonical_bytes = canonical.to_string().into_bytes();
-        let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
-        let exchange = if item.code.starts_with('6') {
-            Exchange::Shanghai
-        } else {
-            Exchange::Shenzhen
-        };
-        let instrument = InstrumentId::new(exchange, item.code.clone(), AssetClass::Equity)
-            .map_err(|error| format!("instrument 构造失败 code={}: {error}", item.code))?;
-        let binding = durable_delivery_runtime::CountedDeliveryBinding::new(
-            business_date,
-            format!("holding-plan:{business_date}:{}", item.code),
-            canonical_bytes,
-            durable_delivery_runtime::CountedDeliveryScope::Ticket { instrument },
-            subject_hash,
-            durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
-            None,
-            true,
-        )
-        .map_err(|error| format!("counted binding 构造失败 code={}: {error}", item.code))?;
-        out.push(PreparedHoldingPlan {
-            code: item.code.clone(),
-            text,
-            binding,
-        });
-    }
-    Ok(out)
+    holding_plan::prepare_holding_plan_messages_with(
+        banner,
+        stock_analysis::database::user_position_snapshot::latest_user_position_snapshot,
+        market_data::fetch_realtime_quote_batch,
+        || chrono::Local::now().fixed_offset(),
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════
