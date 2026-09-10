@@ -5957,6 +5957,83 @@ pub struct AuctionVolumeSnapshot {
     pub watch_status: String,                        // 观察状态描述
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuctionVolumeRejectionCounts {
+    source_rows: usize,
+    valid_rows: usize,
+    notified_valid_rows: usize,
+    missing_volume_ratio_rows: usize,
+    invalid_volume_ratio_rows: usize,
+    invalid_price_rows: usize,
+    invalid_change_pct_rows: usize,
+}
+
+impl AuctionVolumeRejectionCounts {
+    pub fn source_rows(&self) -> usize {
+        self.source_rows
+    }
+
+    pub fn valid_rows(&self) -> usize {
+        self.valid_rows
+    }
+
+    pub fn notified_valid_rows(&self) -> usize {
+        self.notified_valid_rows
+    }
+
+    pub fn missing_volume_ratio_rows(&self) -> usize {
+        self.missing_volume_ratio_rows
+    }
+
+    pub fn invalid_volume_ratio_rows(&self) -> usize {
+        self.invalid_volume_ratio_rows
+    }
+
+    pub fn invalid_price_rows(&self) -> usize {
+        self.invalid_price_rows
+    }
+
+    pub fn invalid_change_pct_rows(&self) -> usize {
+        self.invalid_change_pct_rows
+    }
+
+    pub fn all_source_rows_valid_and_notified(&self) -> bool {
+        self.source_rows > 0
+            && self.valid_rows == self.source_rows
+            && self.notified_valid_rows == self.source_rows
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuctionVolumeSelectionError {
+    SourceRowsEmpty,
+    NoEligibleUnnotifiedRows(AuctionVolumeRejectionCounts),
+}
+
+impl fmt::Display for AuctionVolumeSelectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SourceRowsEmpty => formatter.write_str("竞价量能涨停列表为空"),
+            Self::NoEligibleUnnotifiedRows(counts) => write!(
+                formatter,
+                "竞价热点无有限正价格/量比且有限涨跌幅的有效行: \
+                 source_rows={} valid_rows={} notified_valid_rows={} \
+                 missing_volume_ratio_rows={} invalid_volume_ratio_rows={} \
+                 invalid_price_rows={} invalid_change_pct_rows={}",
+                counts.source_rows,
+                counts.valid_rows,
+                counts.notified_valid_rows,
+                counts.missing_volume_ratio_rows,
+                counts.invalid_volume_ratio_rows,
+                counts.invalid_price_rows,
+                counts.invalid_change_pct_rows,
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AuctionVolumeSelectionError {}
+
 /// 从一次涨停池采集构造 P-02 快照。
 ///
 /// `notified` 必须是本次 tick 开始时的通知集合；返回的 `items` 是后续渲染、
@@ -5965,25 +6042,52 @@ pub fn prepare_auction_volume_snapshot(
     hhmm: &str,
     limit_stocks: &[stock_analysis::market_data::TopStock],
     notified: &std::collections::HashSet<String>,
-) -> Result<AuctionVolumeSnapshot, String> {
+) -> Result<AuctionVolumeSnapshot, AuctionVolumeSelectionError> {
     if limit_stocks.is_empty() {
-        return Err("竞价量能涨停列表为空".to_string());
+        return Err(AuctionVolumeSelectionError::SourceRowsEmpty);
     }
 
     // 排除无效及已通知票后再排序、取 Top10；稳定排序保留相同量比的输入次序。
-    let mut eligible: Vec<_> = limit_stocks
-        .iter()
-        .filter_map(|stock| {
-            let ratio = stock.volume_ratio?;
-            (!notified.contains(&stock.code)
-                && stock.change_pct.is_finite()
-                && stock.price.is_finite()
-                && stock.price > 0.0
-                && ratio.is_finite()
-                && ratio > 0.0)
-                .then_some((stock, ratio))
-        })
-        .collect();
+    let mut counts = AuctionVolumeRejectionCounts {
+        source_rows: limit_stocks.len(),
+        valid_rows: 0,
+        notified_valid_rows: 0,
+        missing_volume_ratio_rows: 0,
+        invalid_volume_ratio_rows: 0,
+        invalid_price_rows: 0,
+        invalid_change_pct_rows: 0,
+    };
+    let mut eligible = Vec::new();
+    for stock in limit_stocks {
+        let ratio = match stock.volume_ratio {
+            Some(ratio) if ratio.is_finite() && ratio > 0.0 => Some(ratio),
+            Some(_) => {
+                counts.invalid_volume_ratio_rows += 1;
+                None
+            }
+            None => {
+                counts.missing_volume_ratio_rows += 1;
+                None
+            }
+        };
+        let price_is_valid = stock.price.is_finite() && stock.price > 0.0;
+        if !price_is_valid {
+            counts.invalid_price_rows += 1;
+        }
+        let change_pct_is_valid = stock.change_pct.is_finite();
+        if !change_pct_is_valid {
+            counts.invalid_change_pct_rows += 1;
+        }
+
+        if let Some(ratio) = ratio.filter(|_| price_is_valid && change_pct_is_valid) {
+            counts.valid_rows += 1;
+            if notified.contains(&stock.code) {
+                counts.notified_valid_rows += 1;
+            } else {
+                eligible.push((stock, ratio));
+            }
+        }
+    }
     eligible.sort_by(|(_, a_ratio), (_, b_ratio)| b_ratio.total_cmp(a_ratio));
     let items: Vec<(String, String, f64, f64, f64)> = eligible
         .into_iter()
@@ -5999,7 +6103,9 @@ pub fn prepare_auction_volume_snapshot(
         })
         .collect();
     if items.is_empty() {
-        return Err("竞价热点无有限正价格/量比且有限涨跌幅的有效行".to_string());
+        return Err(AuctionVolumeSelectionError::NoEligibleUnnotifiedRows(
+            counts,
+        ));
     }
 
     // sentiment: 平均量比 >= 3 强承接, >= 1 一般, < 1 弱承接
@@ -6023,7 +6129,7 @@ pub fn prepare_auction_volume_snapshot(
 #[derive(Debug)]
 pub struct AuctionVolumeTickData {
     pub limit_stocks: Vec<stock_analysis::market_data::TopStock>,
-    pub snapshot: Result<AuctionVolumeSnapshot, String>,
+    pub snapshot: Result<AuctionVolumeSnapshot, AuctionVolumeSelectionError>,
     source_observation: Option<stock_analysis::market_analyzer::LimitUpObservation>,
 }
 
@@ -17994,6 +18100,361 @@ mod tests {
             price,
             volume_ratio,
             main_net_yi: None,
+        }
+    }
+
+    #[test]
+    fn p02_selection_distinguishes_empty_source_from_missing_volume_ratios() {
+        let notified = std::collections::HashSet::new();
+        let empty_error = prepare_auction_volume_snapshot("09:20:00", &[], &notified)
+            .expect_err("an empty source must be classified explicitly");
+        assert_eq!(empty_error, AuctionVolumeSelectionError::SourceRowsEmpty);
+        assert_eq!(empty_error.to_string(), "竞价量能涨停列表为空");
+
+        let stocks = vec![
+            p02_stock("MISSING_A", 1.0, 10.0, None),
+            p02_stock("MISSING_B", -1.0, 20.0, None),
+        ];
+        let missing_error = prepare_auction_volume_snapshot("09:20:00", &stocks, &notified)
+            .expect_err("non-empty rows without volume ratios must retain rejection counts");
+        let AuctionVolumeSelectionError::NoEligibleUnnotifiedRows(counts) = &missing_error else {
+            panic!("non-empty rejected rows must carry selection counts");
+        };
+        assert_eq!(counts.source_rows(), 2);
+        assert_eq!(counts.valid_rows(), 0);
+        assert_eq!(counts.notified_valid_rows(), 0);
+        assert_eq!(counts.missing_volume_ratio_rows(), 2);
+        assert_eq!(counts.invalid_volume_ratio_rows(), 0);
+        assert_eq!(counts.invalid_price_rows(), 0);
+        assert_eq!(counts.invalid_change_pct_rows(), 0);
+        assert!(!counts.all_source_rows_valid_and_notified());
+        assert_eq!(
+            missing_error.to_string(),
+            concat!(
+                "竞价热点无有限正价格/量比且有限涨跌幅的有效行: ",
+                "source_rows=2 valid_rows=0 notified_valid_rows=0 ",
+                "missing_volume_ratio_rows=2 invalid_volume_ratio_rows=0 ",
+                "invalid_price_rows=0 invalid_change_pct_rows=0"
+            )
+        );
+    }
+
+    #[test]
+    fn p02_selection_counts_duplicate_valid_notified_rows_and_preserves_inputs() {
+        let stocks = vec![
+            p02_stock("DUPLICATE", 1.0, 10.0, Some(2.0)),
+            p02_stock("DUPLICATE", 2.0, 20.0, Some(3.0)),
+            p02_stock("OTHER", -1.0, 30.0, Some(4.0)),
+        ];
+        let original_codes = stocks
+            .iter()
+            .map(|stock| stock.code.clone())
+            .collect::<Vec<_>>();
+        let notified =
+            std::collections::HashSet::from(["DUPLICATE".to_string(), "OTHER".to_string()]);
+        let original_notified = notified.clone();
+
+        let error = prepare_auction_volume_snapshot("09:20:30", &stocks, &notified)
+            .expect_err("every valid row is already notified");
+        let AuctionVolumeSelectionError::NoEligibleUnnotifiedRows(counts) = error else {
+            panic!("non-empty rejected rows must carry selection counts");
+        };
+
+        assert_eq!(counts.source_rows(), 3);
+        assert_eq!(counts.valid_rows(), 3);
+        assert_eq!(counts.notified_valid_rows(), 3);
+        assert_eq!(counts.missing_volume_ratio_rows(), 0);
+        assert_eq!(counts.invalid_volume_ratio_rows(), 0);
+        assert_eq!(counts.invalid_price_rows(), 0);
+        assert_eq!(counts.invalid_change_pct_rows(), 0);
+        assert!(counts.all_source_rows_valid_and_notified());
+        assert_eq!(
+            stocks
+                .iter()
+                .map(|stock| stock.code.clone())
+                .collect::<Vec<_>>(),
+            original_codes
+        );
+        assert_eq!(notified, original_notified);
+    }
+
+    #[test]
+    fn p02_selection_all_notified_fact_excludes_mixed_invalid_rows() {
+        let notified = std::collections::HashSet::from([
+            "VALID".to_string(),
+            "MISSING".to_string(),
+            "BAD_PRICE".to_string(),
+        ]);
+        let mixed = vec![
+            p02_stock("VALID", 1.0, 10.0, Some(2.0)),
+            p02_stock("MISSING", 2.0, 20.0, None),
+        ];
+        let mixed_error = prepare_auction_volume_snapshot("09:21:00", &mixed, &notified)
+            .expect_err("the only valid row is notified");
+        let AuctionVolumeSelectionError::NoEligibleUnnotifiedRows(mixed_counts) = mixed_error
+        else {
+            panic!("mixed rejected rows must carry selection counts");
+        };
+        assert_eq!(mixed_counts.source_rows(), 2);
+        assert_eq!(mixed_counts.valid_rows(), 1);
+        assert_eq!(mixed_counts.notified_valid_rows(), 1);
+        assert_eq!(mixed_counts.missing_volume_ratio_rows(), 1);
+        assert_eq!(mixed_counts.invalid_volume_ratio_rows(), 0);
+        assert_eq!(mixed_counts.invalid_price_rows(), 0);
+        assert_eq!(mixed_counts.invalid_change_pct_rows(), 0);
+        assert!(!mixed_counts.all_source_rows_valid_and_notified());
+
+        let every_code_notified = vec![
+            p02_stock("VALID", -1.0, 10.0, Some(2.0)),
+            p02_stock("BAD_PRICE", 1.0, 0.0, Some(3.0)),
+        ];
+        let every_code_error =
+            prepare_auction_volume_snapshot("09:21:00", &every_code_notified, &notified)
+                .expect_err("an invalid row is not a notified valid row");
+        let AuctionVolumeSelectionError::NoEligibleUnnotifiedRows(every_code_counts) =
+            every_code_error
+        else {
+            panic!("all-code rejected rows must carry selection counts");
+        };
+        assert_eq!(every_code_counts.source_rows(), 2);
+        assert_eq!(every_code_counts.valid_rows(), 1);
+        assert_eq!(every_code_counts.notified_valid_rows(), 1);
+        assert_eq!(every_code_counts.missing_volume_ratio_rows(), 0);
+        assert_eq!(every_code_counts.invalid_volume_ratio_rows(), 0);
+        assert_eq!(every_code_counts.invalid_price_rows(), 1);
+        assert_eq!(every_code_counts.invalid_change_pct_rows(), 0);
+        assert!(!every_code_counts.all_source_rows_valid_and_notified());
+    }
+
+    #[test]
+    fn p02_selection_counts_overlapping_numeric_defects_by_source_row() {
+        let stocks = vec![
+            p02_stock("MISSING_MULTI", f64::NAN, 0.0, None),
+            p02_stock("RATIO_NAN_MULTI", f64::INFINITY, f64::NAN, Some(f64::NAN)),
+            p02_stock("RATIO_POS_INF", 0.0, f64::INFINITY, Some(f64::INFINITY)),
+            p02_stock(
+                "RATIO_NEG_INF",
+                0.0,
+                f64::NEG_INFINITY,
+                Some(f64::NEG_INFINITY),
+            ),
+            p02_stock("RATIO_ZERO", -2.0, 0.0, Some(0.0)),
+            p02_stock("RATIO_NEG", -3.0, -1.0, Some(-1.0)),
+            p02_stock("PRICE_NAN", 0.0, f64::NAN, Some(1.0)),
+            p02_stock("PRICE_POS_INF", 0.0, f64::INFINITY, Some(1.0)),
+            p02_stock("PRICE_NEG_INF", 0.0, f64::NEG_INFINITY, Some(1.0)),
+            p02_stock("CHANGE_POS_INF", f64::INFINITY, 10.0, Some(1.0)),
+            p02_stock("CHANGE_NEG_INF", f64::NEG_INFINITY, 10.0, Some(1.0)),
+            p02_stock("VALID_NEG_CHANGE", -99.0, 10.0, Some(1.0)),
+        ];
+        let notified = std::collections::HashSet::from(["VALID_NEG_CHANGE".to_string()]);
+
+        let error = prepare_auction_volume_snapshot("09:21:30", &stocks, &notified)
+            .expect_err("the finite negative-change row is valid but notified");
+        let AuctionVolumeSelectionError::NoEligibleUnnotifiedRows(counts) = error else {
+            panic!("numeric rejection must carry selection counts");
+        };
+
+        assert_eq!(counts.source_rows(), 12);
+        assert_eq!(counts.valid_rows(), 1);
+        assert_eq!(counts.notified_valid_rows(), 1);
+        assert_eq!(counts.missing_volume_ratio_rows(), 1);
+        assert_eq!(counts.invalid_volume_ratio_rows(), 5);
+        assert_eq!(counts.invalid_price_rows(), 9);
+        assert_eq!(counts.invalid_change_pct_rows(), 4);
+        assert!(!counts.all_source_rows_valid_and_notified());
+    }
+
+    #[test]
+    fn p02_selection_success_preserves_stable_top10_full_tuples_and_inputs() {
+        let mut stocks = vec![
+            p02_stock("ALREADY", 99.0, 99.0, Some(100.0)),
+            p02_stock("ALREADY", 98.0, 98.0, Some(99.0)),
+            p02_stock("MISSING", 1.0, 10.0, None),
+            p02_stock("DUP", 1.1, 11.1, Some(9.0)),
+            p02_stock("BAD_PRICE", 2.0, 0.0, Some(50.0)),
+            p02_stock("DUP", 1.2, 12.2, Some(9.0)),
+            p02_stock("EQUAL", 1.3, 13.3, Some(9.0)),
+        ];
+        for index in 0..9 {
+            stocks.push(p02_stock(
+                &format!("NEXT_{index}"),
+                index as f64,
+                20.0 + index as f64,
+                Some(8.0 - index as f64 * 0.5),
+            ));
+        }
+        let original_codes = stocks
+            .iter()
+            .map(|stock| stock.code.clone())
+            .collect::<Vec<_>>();
+        let notified = std::collections::HashSet::from(["ALREADY".to_string()]);
+        let original_notified = notified.clone();
+
+        let snapshot = prepare_auction_volume_snapshot("09:22:00", &stocks, &notified)
+            .expect("more than ten eligible rows should select a stable Top10");
+
+        assert_eq!(snapshot.hhmm, "09:22:00");
+        assert_eq!(
+            snapshot.items,
+            vec![
+                ("股票DUP".to_string(), "DUP".to_string(), 1.1, 9.0, 11.1),
+                ("股票DUP".to_string(), "DUP".to_string(), 1.2, 9.0, 12.2),
+                ("股票EQUAL".to_string(), "EQUAL".to_string(), 1.3, 9.0, 13.3),
+                (
+                    "股票NEXT_0".to_string(),
+                    "NEXT_0".to_string(),
+                    0.0,
+                    8.0,
+                    20.0,
+                ),
+                (
+                    "股票NEXT_1".to_string(),
+                    "NEXT_1".to_string(),
+                    1.0,
+                    7.5,
+                    21.0,
+                ),
+                (
+                    "股票NEXT_2".to_string(),
+                    "NEXT_2".to_string(),
+                    2.0,
+                    7.0,
+                    22.0,
+                ),
+                (
+                    "股票NEXT_3".to_string(),
+                    "NEXT_3".to_string(),
+                    3.0,
+                    6.5,
+                    23.0,
+                ),
+                (
+                    "股票NEXT_4".to_string(),
+                    "NEXT_4".to_string(),
+                    4.0,
+                    6.0,
+                    24.0,
+                ),
+                (
+                    "股票NEXT_5".to_string(),
+                    "NEXT_5".to_string(),
+                    5.0,
+                    5.5,
+                    25.0,
+                ),
+                (
+                    "股票NEXT_6".to_string(),
+                    "NEXT_6".to_string(),
+                    6.0,
+                    5.0,
+                    26.0,
+                ),
+            ]
+        );
+        assert_eq!(snapshot.sentiment, "强承接");
+        assert_eq!(snapshot.watch_status, "9:25 集合竞价结果, 关注开盘承接");
+        assert_eq!(
+            stocks
+                .iter()
+                .map(|stock| stock.code.clone())
+                .collect::<Vec<_>>(),
+            original_codes
+        );
+        assert_eq!(notified, original_notified);
+    }
+
+    #[test]
+    fn p02_selection_loader_retains_typed_failure_raw_batch_and_provider_contract() {
+        let calls = std::cell::Cell::new(0);
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 8).expect("fixed trading date");
+        let notified = std::collections::HashSet::from(["UNCHANGED".to_string()]);
+        let original_notified = notified.clone();
+        let raw = vec![p02_stock("RAW_MISSING", 1.0, 10.0, None)];
+        let tick = load_auction_volume_tick_with("09:22:30", date, &notified, |_| {
+            calls.set(calls.get() + 1);
+            Ok(raw.clone())
+        })
+        .expect("provider success returns a tick even when P-02 selection rejects it");
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(tick.limit_stocks.len(), 1);
+        assert_eq!(tick.limit_stocks[0].code, "RAW_MISSING");
+        assert!(tick.source_observation().is_none());
+        let AuctionVolumeSelectionError::NoEligibleUnnotifiedRows(counts) = tick
+            .snapshot
+            .expect_err("typed selection failure crosses tick")
+        else {
+            panic!("non-empty tick rejection must retain counts");
+        };
+        assert_eq!(counts.source_rows(), 1);
+        assert_eq!(counts.valid_rows(), 0);
+        assert_eq!(counts.notified_valid_rows(), 0);
+        assert_eq!(counts.missing_volume_ratio_rows(), 1);
+        assert_eq!(counts.invalid_volume_ratio_rows(), 0);
+        assert_eq!(counts.invalid_price_rows(), 0);
+        assert_eq!(counts.invalid_change_pct_rows(), 0);
+        assert_eq!(notified, original_notified);
+
+        let provider_error = load_auction_volume_tick_with("09:22:30", date, &notified, |_| {
+            Err("provider unavailable".to_string())
+        })
+        .expect_err("provider errors remain the loader's outer String contract");
+        assert_eq!(provider_error, "provider unavailable");
+    }
+
+    #[test]
+    fn p02_selection_display_and_debug_are_stable_safe_and_observation_free() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 8).expect("fixed trading date");
+        let empty_tick = load_auction_volume_tick_with(
+            "09:23:00",
+            date,
+            &std::collections::HashSet::new(),
+            |_| Ok(Vec::new()),
+        )
+        .expect("an empty source is a selection result within a successful pure load");
+        assert!(empty_tick.limit_stocks.is_empty());
+        assert!(empty_tick.source_observation().is_none());
+        assert_eq!(
+            empty_tick.snapshot.expect_err("empty source is rejected"),
+            AuctionVolumeSelectionError::SourceRowsEmpty
+        );
+        assert_eq!(
+            format!("{:?}", AuctionVolumeSelectionError::SourceRowsEmpty),
+            "SourceRowsEmpty"
+        );
+
+        let mut sensitive = p02_stock("SENSITIVE_CODE_600000", 1.0, 10.0, None);
+        sensitive.name = "私密股票名称".to_string();
+        let error = prepare_auction_volume_snapshot(
+            "09:23:00",
+            &[sensitive],
+            &std::collections::HashSet::new(),
+        )
+        .expect_err("missing volume ratio is rejected without leaking row data");
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        assert_eq!(
+            display,
+            concat!(
+                "竞价热点无有限正价格/量比且有限涨跌幅的有效行: ",
+                "source_rows=1 valid_rows=0 notified_valid_rows=0 ",
+                "missing_volume_ratio_rows=1 invalid_volume_ratio_rows=0 ",
+                "invalid_price_rows=0 invalid_change_pct_rows=0"
+            )
+        );
+        assert_eq!(
+            debug,
+            concat!(
+                "NoEligibleUnnotifiedRows(AuctionVolumeRejectionCounts { ",
+                "source_rows: 1, valid_rows: 0, notified_valid_rows: 0, ",
+                "missing_volume_ratio_rows: 1, invalid_volume_ratio_rows: 0, ",
+                "invalid_price_rows: 0, invalid_change_pct_rows: 0 })"
+            )
+        );
+        for secret in ["SENSITIVE_CODE_600000", "私密股票名称", "10"] {
+            assert!(!display.contains(secret));
+            assert!(!debug.contains(secret));
         }
     }
 
